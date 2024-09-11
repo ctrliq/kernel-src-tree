@@ -1,0 +1,229 @@
+KVM: Move x86 VMX's posted interrupt list_head to vcpu_vmx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 12a8eee5686ef3ea7d8db90cd664f11e4a39e349
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/12a8eee5.failed
+
+Move the seemingly generic block_vcpu_list from kvm_vcpu to vcpu_vmx, and
+rename the list and all associated variables to clarify that it tracks
+the set of vCPU that need to be poked on a posted interrupt to the wakeup
+vector.  The list is not used to track _all_ vCPUs that are blocking, and
+the term "blocked" can be misleading as it may refer to a blocking
+condition in the host or the guest, where as the PI wakeup case is
+specifically for the vCPUs that are actively blocking from within the
+guest.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20211208015236.1616697-7-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 12a8eee5686ef3ea7d8db90cd664f11e4a39e349)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/posted_intr.c
+diff --cc arch/x86/kvm/vmx/posted_intr.c
+index 359222f558f9,901eea44cf24..000000000000
+--- a/arch/x86/kvm/vmx/posted_intr.c
++++ b/arch/x86/kvm/vmx/posted_intr.c
+@@@ -11,11 -11,23 +11,23 @@@
+  #include "vmx.h"
+  
+  /*
+ - * Maintain a per-CPU list of vCPUs that need to be awakened by wakeup_handler()
+ - * when a WAKEUP_VECTOR interrupted is posted.  vCPUs are added to the list when
+ - * the vCPU is scheduled out and is blocking (e.g. in HLT) with IRQs enabled.
+ - * The vCPUs posted interrupt descriptor is updated at the same time to set its
+ - * notification vector to WAKEUP_VECTOR, so that posted interrupt from devices
+ - * wake the target vCPUs.  vCPUs are removed from the list and the notification
+ - * vector is reset when the vCPU is scheduled in.
+ + * We maintian a per-CPU linked-list of vCPU, so in wakeup_handler() we
+ + * can find which vCPU should be waken up.
+   */
+++<<<<<<< HEAD
+ +static DEFINE_PER_CPU(struct list_head, blocked_vcpu_on_cpu);
+ +static DEFINE_PER_CPU(raw_spinlock_t, blocked_vcpu_on_cpu_lock);
+++=======
++ static DEFINE_PER_CPU(struct list_head, wakeup_vcpus_on_cpu);
++ /*
++  * Protect the per-CPU list with a per-CPU spinlock to handle task migration.
++  * When a blocking vCPU is awakened _and_ migrated to a different pCPU, the
++  * ->sched_in() path will need to take the vCPU off the list of the _previous_
++  * CPU.  IRQs must be disabled when taking this lock, otherwise deadlock will
++  * occur if a wakeup IRQ arrives and attempts to acquire the lock.
++  */
++ static DEFINE_PER_CPU(raw_spinlock_t, wakeup_vcpus_on_cpu_lock);
+++>>>>>>> 12a8eee5686e (KVM: Move x86 VMX's posted interrupt list_head to vcpu_vmx)
+  
+  static inline struct pi_desc *vcpu_to_pi_desc(struct kvm_vcpu *vcpu)
+  {
+@@@ -25,7 -37,23 +37,8 @@@
+  void vmx_vcpu_pi_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	struct pi_desc old, new;
+ -	unsigned long flags;
+  	unsigned int dest;
+  
+  	/*
+@@@ -36,23 -64,34 +49,30 @@@
+  	if (!enable_apicv || !lapic_in_kernel(vcpu))
+  		return;
+  
+ -	/*
+ -	 * If the vCPU wasn't on the wakeup list and wasn't migrated, then the
+ -	 * full update can be skipped as neither the vector nor the destination
+ -	 * needs to be changed.
+ -	 */
+ -	if (pi_desc->nv != POSTED_INTR_WAKEUP_VECTOR && vcpu->cpu == cpu) {
+ -		/*
+ -		 * Clear SN if it was set due to being preempted.  Again, do
+ -		 * this even if there is no assigned device for simplicity.
+ -		 */
+ -		if (pi_test_and_clear_sn(pi_desc))
+ -			goto after_clear_sn;
+ +	/* Nothing to do if PI.SN and PI.NDST both have the desired value. */
+ +	if (!pi_test_sn(pi_desc) && vcpu->cpu == cpu)
+  		return;
+ -	}
+ -
+ -	local_irq_save(flags);
+  
+  	/*
+ -	 * If the vCPU was waiting for wakeup, remove the vCPU from the wakeup
+ -	 * list of the _previous_ pCPU, which will not be the same as the
+ -	 * current pCPU if the task was migrated.
+ +	 * If the 'nv' field is POSTED_INTR_WAKEUP_VECTOR, do not change
+ +	 * PI.NDST: pi_post_block is the one expected to change PID.NDST and the
+ +	 * wakeup handler expects the vCPU to be on the blocked_vcpu_list that
+ +	 * matches PI.NDST. Otherwise, a vcpu may not be able to be woken up
+ +	 * correctly.
+  	 */
+++<<<<<<< HEAD
+ +	if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR || vcpu->cpu == cpu) {
+ +		pi_clear_sn(pi_desc);
+ +		goto after_clear_sn;
+++=======
++ 	if (pi_desc->nv == POSTED_INTR_WAKEUP_VECTOR) {
++ 		raw_spin_lock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ 		list_del(&vmx->pi_wakeup_list);
++ 		raw_spin_unlock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
+++>>>>>>> 12a8eee5686e (KVM: Move x86 VMX's posted interrupt list_head to vcpu_vmx)
+  	}
+  
+ +	/* The full case.  Set the new destination and clear SN. */
+  	dest = cpu_physical_id(cpu);
+  	if (!x2apic_mode)
+  		dest = (dest << 8) & 0xFF00;
+@@@ -86,6 -136,47 +106,50 @@@ static bool vmx_can_use_vtd_pi(struct k
+  		irq_remapping_cap(IRQ_POSTING_CAP);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Put the vCPU on this pCPU's list of vCPUs that needs to be awakened and set
++  * WAKEUP as the notification vector in the PI descriptor.
++  */
++ static void pi_enable_wakeup_handler(struct kvm_vcpu *vcpu)
++ {
++ 	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	struct pi_desc old, new;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 
++ 	raw_spin_lock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ 	list_add_tail(&vmx->pi_wakeup_list,
++ 		      &per_cpu(wakeup_vcpus_on_cpu, vcpu->cpu));
++ 	raw_spin_unlock(&per_cpu(wakeup_vcpus_on_cpu_lock, vcpu->cpu));
++ 
++ 	WARN(pi_desc->sn, "PI descriptor SN field set before blocking");
++ 
++ 	do {
++ 		old.control = new.control = READ_ONCE(pi_desc->control);
++ 
++ 		/* set 'NV' to 'wakeup vector' */
++ 		new.nv = POSTED_INTR_WAKEUP_VECTOR;
++ 	} while (pi_try_set_control(pi_desc, old.control, new.control));
++ 
++ 	/*
++ 	 * Send a wakeup IPI to this CPU if an interrupt may have been posted
++ 	 * before the notification vector was updated, in which case the IRQ
++ 	 * will arrive on the non-wakeup vector.  An IPI is needed as calling
++ 	 * try_to_wake_up() from ->sched_out() isn't allowed (IRQs are not
++ 	 * enabled until it is safe to call try_to_wake_up() on the task being
++ 	 * scheduled out).
++ 	 */
++ 	if (pi_test_on(&new))
++ 		apic->send_IPI_self(POSTED_INTR_WAKEUP_VECTOR);
++ 
++ 	local_irq_restore(flags);
++ }
++ 
+++>>>>>>> 12a8eee5686e (KVM: Move x86 VMX's posted interrupt list_head to vcpu_vmx)
+  void vmx_vcpu_pi_put(struct kvm_vcpu *vcpu)
+  {
+  	struct pi_desc *pi_desc = vcpu_to_pi_desc(vcpu);
+* Unmerged path arch/x86/kvm/vmx/posted_intr.c
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index fa7a11f6f244..8cc750cc5d92 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6919,6 +6919,8 @@ static int vmx_create_vcpu(struct kvm_vcpu *vcpu)
+ 	BUILD_BUG_ON(offsetof(struct vcpu_vmx, vcpu) != 0);
+ 	vmx = to_vmx(vcpu);
+ 
++	INIT_LIST_HEAD(&vmx->pi_wakeup_list);
++
+ 	err = -ENOMEM;
+ 
+ 	vmx->vpid = allocate_vpid();
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index f8fc7441baea..7f2c82e7f38f 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -317,6 +317,9 @@ struct vcpu_vmx {
+ 	/* Posted interrupt descriptor */
+ 	struct pi_desc pi_desc;
+ 
++	/* Used if this vCPU is waiting for PI notification wakeup. */
++	struct list_head pi_wakeup_list;
++
+ 	/* Support for a guest hypervisor (nested VMX) */
+ 	struct nested_vmx nested;
+ 
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 4684a373546a..e75cde7e0142 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -301,8 +301,6 @@ struct kvm_vcpu {
+ 	u64 requests;
+ 	unsigned long guest_debug;
+ 
+-	struct list_head blocked_vcpu_list;
+-
+ 	struct mutex mutex;
+ 	struct kvm_run *run;
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index f7d5affa99f2..cff492e32d93 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -446,8 +446,6 @@ static void kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ #endif
+ 	kvm_async_pf_vcpu_init(vcpu);
+ 
+-	INIT_LIST_HEAD(&vcpu->blocked_vcpu_list);
+-
+ 	kvm_vcpu_set_in_spin_loop(vcpu, false);
+ 	kvm_vcpu_set_dy_eligible(vcpu, false);
+ 	vcpu->preempted = false;
