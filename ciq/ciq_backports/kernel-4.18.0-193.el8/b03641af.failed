@@ -1,0 +1,289 @@
+mm: move buddy list manipulations into helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] move buddy list manipulations into helpers (Rafael Aquini) [1620349]
+Rebuild_FUZZ: 95.45%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit b03641af680959df57c275a80ff0dc116627c7ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b03641af.failed
+
+In preparation for runtime randomization of the zone lists, take all
+(well, most of) the list_*() functions in the buddy allocator and put
+them in helper functions.  Provide a common control point for injecting
+additional behavior when freeing pages.
+
+[dan.j.williams@intel.com: fix buddy list helpers]
+  Link: http://lkml.kernel.org/r/155033679702.1773410.13041474192173212653.stgit@dwillia2-desk3.amr.corp.intel.com
+[vbabka@suse.cz: remove del_page_from_free_area() migratetype parameter]
+  Link: http://lkml.kernel.org/r/4672701b-6775-6efd-0797-b6242591419e@suse.cz
+Link: http://lkml.kernel.org/r/154899812264.3165233.5219320056406926223.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Tested-by: Tetsuo Handa <penguin-kernel@i-love.sakura.ne.jp>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Keith Busch <keith.busch@intel.com>
+	Cc: Robert Elliott <elliott@hpe.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b03641af680959df57c275a80ff0dc116627c7ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+diff --cc include/linux/mmzone.h
+index 749ff0d98490,acd6f9cb01bd..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -18,7 -18,8 +18,12 @@@
+  #include <linux/pageblock-flags.h>
+  #include <linux/page-flags-layout.h>
+  #include <linux/atomic.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/mm_types.h>
++ #include <linux/page-flags.h>
+++>>>>>>> b03641af6809 (mm: move buddy list manipulations into helpers)
+  #include <asm/page.h>
+  
+  /* Free memory management - zoned buddy allocator.  */
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index fc33f44a60f1..3db2a240c186 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -479,9 +479,6 @@ static inline void vma_set_anonymous(struct vm_area_struct *vma)
+ struct mmu_gather;
+ struct inode;
+ 
+-#define page_private(page)		((page)->private)
+-#define set_page_private(page, v)	((page)->private = (v))
+-
+ #if !defined(__HAVE_ARCH_PTE_DEVMAP) || !defined(CONFIG_TRANSPARENT_HUGEPAGE)
+ static inline int pmd_devmap(pmd_t pmd)
+ {
+diff --git a/include/linux/mm_types.h b/include/linux/mm_types.h
+index c388afe5214b..9ecfcdadceeb 100644
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@ -213,6 +213,9 @@ struct page {
+ #define PAGE_FRAG_CACHE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)
+ #define PAGE_FRAG_CACHE_MAX_ORDER	get_order(PAGE_FRAG_CACHE_MAX_SIZE)
+ 
++#define page_private(page)		((page)->private)
++#define set_page_private(page, v)	((page)->private = (v))
++
+ struct page_frag_cache {
+ 	void * va;
+ #if (PAGE_SIZE < PAGE_FRAG_CACHE_MAX_SIZE)
+* Unmerged path include/linux/mmzone.h
+diff --git a/mm/compaction.c b/mm/compaction.c
+index 7c607479de4a..44adbfa073b3 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -1359,13 +1359,13 @@ static enum compact_result __compact_finished(struct zone *zone,
+ 		bool can_steal;
+ 
+ 		/* Job done if page is free of the right migratetype */
+-		if (!list_empty(&area->free_list[migratetype]))
++		if (!free_area_empty(area, migratetype))
+ 			return COMPACT_SUCCESS;
+ 
+ #ifdef CONFIG_CMA
+ 		/* MIGRATE_MOVABLE can fallback on MIGRATE_CMA */
+ 		if (migratetype == MIGRATE_MOVABLE &&
+-			!list_empty(&area->free_list[MIGRATE_CMA]))
++			!free_area_empty(area, MIGRATE_CMA))
+ 			return COMPACT_SUCCESS;
+ #endif
+ 		/*
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index 408ce1a15e62..2e23d5054e93 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -727,12 +727,6 @@ static inline void set_page_order(struct page *page, unsigned int order)
+ 	__SetPageBuddy(page);
+ }
+ 
+-static inline void rmv_page_order(struct page *page)
+-{
+-	__ClearPageBuddy(page);
+-	set_page_private(page, 0);
+-}
+-
+ /*
+  * This function checks whether a page is free && is the buddy
+  * we can coalesce a page and its buddy if
+@@ -833,13 +827,10 @@ static inline void __free_one_page(struct page *page,
+ 		 * Our buddy is free or it is CONFIG_DEBUG_PAGEALLOC guard page,
+ 		 * merge with it and move up one order.
+ 		 */
+-		if (page_is_guard(buddy)) {
++		if (page_is_guard(buddy))
+ 			clear_page_guard(zone, buddy, order, migratetype);
+-		} else {
+-			list_del(&buddy->lru);
+-			zone->free_area[order].nr_free--;
+-			rmv_page_order(buddy);
+-		}
++		else
++			del_page_from_free_area(buddy, &zone->free_area[order]);
+ 		combined_pfn = buddy_pfn & pfn;
+ 		page = page + (combined_pfn - pfn);
+ 		pfn = combined_pfn;
+@@ -889,15 +880,13 @@ static inline void __free_one_page(struct page *page,
+ 		higher_buddy = higher_page + (buddy_pfn - combined_pfn);
+ 		if (pfn_valid_within(buddy_pfn) &&
+ 		    page_is_buddy(higher_page, higher_buddy, order + 1)) {
+-			list_add_tail(&page->lru,
+-				&zone->free_area[order].free_list[migratetype]);
+-			goto out;
++			add_to_free_area_tail(page, &zone->free_area[order],
++					      migratetype);
++			return;
+ 		}
+ 	}
+ 
+-	list_add(&page->lru, &zone->free_area[order].free_list[migratetype]);
+-out:
+-	zone->free_area[order].nr_free++;
++	add_to_free_area(page, &zone->free_area[order], migratetype);
+ }
+ 
+ /*
+@@ -1838,8 +1827,7 @@ static inline void expand(struct zone *zone, struct page *page,
+ 		if (set_page_guard(zone, &page[size], high, migratetype))
+ 			continue;
+ 
+-		list_add(&page[size].lru, &area->free_list[migratetype]);
+-		area->nr_free++;
++		add_to_free_area(&page[size], area, migratetype);
+ 		set_page_order(&page[size], high);
+ 	}
+ }
+@@ -1981,13 +1969,10 @@ struct page *__rmqueue_smallest(struct zone *zone, unsigned int order,
+ 	/* Find a page of the appropriate size in the preferred list */
+ 	for (current_order = order; current_order < MAX_ORDER; ++current_order) {
+ 		area = &(zone->free_area[current_order]);
+-		page = list_first_entry_or_null(&area->free_list[migratetype],
+-							struct page, lru);
++		page = get_page_from_free_area(area, migratetype);
+ 		if (!page)
+ 			continue;
+-		list_del(&page->lru);
+-		rmv_page_order(page);
+-		area->nr_free--;
++		del_page_from_free_area(page, area);
+ 		expand(zone, page, order, current_order, area, migratetype);
+ 		set_pcppage_migratetype(page, migratetype);
+ 		return page;
+@@ -2077,8 +2062,7 @@ static int move_freepages(struct zone *zone,
+ 		}
+ 
+ 		order = page_order(page);
+-		list_move(&page->lru,
+-			  &zone->free_area[order].free_list[migratetype]);
++		move_to_free_area(page, &zone->free_area[order], migratetype);
+ 		page += 1 << order;
+ 		pages_moved += 1 << order;
+ 	}
+@@ -2227,7 +2211,7 @@ static void steal_suitable_fallback(struct zone *zone, struct page *page,
+ 
+ single_page:
+ 	area = &zone->free_area[current_order];
+-	list_move(&page->lru, &area->free_list[start_type]);
++	move_to_free_area(page, area, start_type);
+ }
+ 
+ /*
+@@ -2251,7 +2235,7 @@ int find_suitable_fallback(struct free_area *area, unsigned int order,
+ 		if (fallback_mt == MIGRATE_TYPES)
+ 			break;
+ 
+-		if (list_empty(&area->free_list[fallback_mt]))
++		if (free_area_empty(area, fallback_mt))
+ 			continue;
+ 
+ 		if (can_steal_fallback(order, migratetype))
+@@ -2338,9 +2322,7 @@ static bool unreserve_highatomic_pageblock(const struct alloc_context *ac,
+ 		for (order = 0; order < MAX_ORDER; order++) {
+ 			struct free_area *area = &(zone->free_area[order]);
+ 
+-			page = list_first_entry_or_null(
+-					&area->free_list[MIGRATE_HIGHATOMIC],
+-					struct page, lru);
++			page = get_page_from_free_area(area, MIGRATE_HIGHATOMIC);
+ 			if (!page)
+ 				continue;
+ 
+@@ -2453,8 +2435,7 @@ __rmqueue_fallback(struct zone *zone, int order, int start_migratetype)
+ 	VM_BUG_ON(current_order == MAX_ORDER);
+ 
+ do_steal:
+-	page = list_first_entry(&area->free_list[fallback_mt],
+-							struct page, lru);
++	page = get_page_from_free_area(area, fallback_mt);
+ 
+ 	steal_suitable_fallback(zone, page, start_migratetype, can_steal);
+ 
+@@ -2881,6 +2862,7 @@ EXPORT_SYMBOL_GPL(split_page);
+ 
+ int __isolate_free_page(struct page *page, unsigned int order)
+ {
++	struct free_area *area = &page_zone(page)->free_area[order];
+ 	unsigned long watermark;
+ 	struct zone *zone;
+ 	int mt;
+@@ -2905,9 +2887,8 @@ int __isolate_free_page(struct page *page, unsigned int order)
+ 	}
+ 
+ 	/* Remove page from free list */
+-	list_del(&page->lru);
+-	zone->free_area[order].nr_free--;
+-	rmv_page_order(page);
++
++	del_page_from_free_area(page, area);
+ 
+ 	/*
+ 	 * Set the pageblock if the isolated page is at least half of a
+@@ -3201,13 +3182,13 @@ bool __zone_watermark_ok(struct zone *z, unsigned int order, unsigned long mark,
+ 			continue;
+ 
+ 		for (mt = 0; mt < MIGRATE_PCPTYPES; mt++) {
+-			if (!list_empty(&area->free_list[mt]))
++			if (!free_area_empty(area, mt))
+ 				return true;
+ 		}
+ 
+ #ifdef CONFIG_CMA
+ 		if ((alloc_flags & ALLOC_CMA) &&
+-		    !list_empty(&area->free_list[MIGRATE_CMA])) {
++		    !free_area_empty(area, MIGRATE_CMA)) {
+ 			return true;
+ 		}
+ #endif
+@@ -5059,7 +5040,7 @@ void show_free_areas(unsigned int filter, nodemask_t *nodemask)
+ 
+ 			types[order] = 0;
+ 			for (type = 0; type < MIGRATE_TYPES; type++) {
+-				if (!list_empty(&area->free_list[type]))
++				if (!free_area_empty(area, type))
+ 					types[order] |= 1 << type;
+ 			}
+ 		}
+@@ -8155,9 +8136,7 @@ __offline_isolated_pages(unsigned long start_pfn, unsigned long end_pfn)
+ 		pr_info("remove from free list %lx %d %lx\n",
+ 			pfn, 1 << order, end_pfn);
+ #endif
+-		list_del(&page->lru);
+-		rmv_page_order(page);
+-		zone->free_area[order].nr_free--;
++		del_page_from_free_area(page, &zone->free_area[order]);
+ 		for (i = 0; i < (1 << order); i++)
+ 			SetPageReserved((page+i));
+ 		pfn += (1 << order);
