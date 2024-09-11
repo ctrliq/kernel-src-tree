@@ -1,0 +1,121 @@
+perf maps: Add missing unlock to maps__insert() error case
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Cengiz Can <cengiz@kernel.wtf>
+commit 85fc95d75970ee7dd8e01904e7fb1197c275ba6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/85fc95d7.failed
+
+`tools/perf/util/map.c` has a function named `maps__insert` that
+acquires a write lock if its in multithread context.
+
+Even though this lock is released when function successfully completes,
+there's a branch that is executed when `maps_by_name == NULL` that
+returns from this function without releasing the write lock.
+
+Added an `up_write` to release the lock when this happens.
+
+Fixes: a7c2b572e217 ("perf map_groups: Auto sort maps by name, if needed")
+	Signed-off-by: Cengiz Can <cengiz@kernel.wtf>
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: http://lore.kernel.org/lkml/20200120141553.23934-1-cengiz@kernel.wtf
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 85fc95d75970ee7dd8e01904e7fb1197c275ba6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/map.c
+diff --cc tools/perf/util/map.c
+index be8418d003b5,f67960bedebb..000000000000
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@@ -516,23 -512,73 +516,71 @@@ u64 map__objdump_2mem(struct map *map, 
+  	return ip + map->reloc;
+  }
+  
+ -void maps__init(struct maps *maps, struct machine *machine)
+ +static void maps__init(struct maps *maps)
+  {
+  	maps->entries = RB_ROOT;
+ +	maps->names = RB_ROOT;
+  	init_rwsem(&maps->lock);
+ -	maps->machine = machine;
+ -	maps->last_search_by_name = NULL;
+ -	maps->nr_maps = 0;
+ -	maps->maps_by_name = NULL;
+ -	refcount_set(&maps->refcnt, 1);
+  }
+  
+ -static void __maps__free_maps_by_name(struct maps *maps)
+ +void map_groups__init(struct map_groups *mg, struct machine *machine)
+  {
+ -	/*
+ -	 * Free everything to try to do it from the rbtree in the next search
+ -	 */
+ -	zfree(&maps->maps_by_name);
+ -	maps->nr_maps_allocated = 0;
+ +	maps__init(&mg->maps);
+ +	mg->machine = machine;
+ +	refcount_set(&mg->refcnt, 1);
+  }
+  
+ -void maps__insert(struct maps *maps, struct map *map)
+ +void map_groups__insert(struct map_groups *mg, struct map *map)
+  {
+++<<<<<<< HEAD
+ +	maps__insert(&mg->maps, map);
+++=======
++ 	down_write(&maps->lock);
++ 	__maps__insert(maps, map);
++ 	++maps->nr_maps;
++ 
++ 	/*
++ 	 * If we already performed some search by name, then we need to add the just
++ 	 * inserted map and resort.
++ 	 */
++ 	if (maps->maps_by_name) {
++ 		if (maps->nr_maps > maps->nr_maps_allocated) {
++ 			int nr_allocate = maps->nr_maps * 2;
++ 			struct map **maps_by_name = realloc(maps->maps_by_name, nr_allocate * sizeof(map));
++ 
++ 			if (maps_by_name == NULL) {
++ 				__maps__free_maps_by_name(maps);
++ 				up_write(&maps->lock);
++ 				return;
++ 			}
++ 
++ 			maps->maps_by_name = maps_by_name;
++ 			maps->nr_maps_allocated = nr_allocate;
++ 		}
++ 		maps->maps_by_name[maps->nr_maps - 1] = map;
++ 		__maps__sort_by_name(maps);
++ 	}
++ 	up_write(&maps->lock);
++ }
++ 
++ static void __maps__remove(struct maps *maps, struct map *map)
++ {
++ 	rb_erase_init(&map->rb_node, &maps->entries);
++ 	map__put(map);
++ }
++ 
++ void maps__remove(struct maps *maps, struct map *map)
++ {
++ 	down_write(&maps->lock);
++ 	if (maps->last_search_by_name == map)
++ 		maps->last_search_by_name = NULL;
++ 
++ 	__maps__remove(maps, map);
++ 	--maps->nr_maps;
++ 	if (maps->maps_by_name)
++ 		__maps__free_maps_by_name(maps);
++ 	up_write(&maps->lock);
+++>>>>>>> 85fc95d75970 (perf maps: Add missing unlock to maps__insert() error case)
+  }
+  
+  static void __maps__purge(struct maps *maps)
+* Unmerged path tools/perf/util/map.c
