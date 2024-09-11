@@ -1,0 +1,313 @@
+netfilter: ctnetlink: add kernel side filtering for dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Romain Bellan <romain.bellan@wifirst.fr>
+commit cb8aa9a3affb7d23b11b11fbed41e2feaabc4b0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/cb8aa9a3.failed
+
+Conntrack dump does not support kernel side filtering (only get exists,
+but it returns only one entry. And user has to give a full valid tuple)
+
+It means that userspace has to implement filtering after receiving many
+irrelevant entries, consuming resources (conntrack table is sometimes
+very huge, much more than a routing table for example).
+
+This patch adds filtering in kernel side. To achieve this goal, we:
+
+ * Add a new CTA_FILTER netlink attributes, actually a flag list to
+   parametize filtering
+ * Convert some *nlattr_to_tuple() functions, to allow a partial parsing
+   of CTA_TUPLE_ORIG and CTA_TUPLE_REPLY (so nf_conntrack_tuple it not
+   fully set)
+
+Filtering is now possible on:
+ * IP SRC/DST values
+ * Ports for TCP and UDP flows
+ * IMCP(v6) codes types and IDs
+
+Filtering is done as an "AND" operator. For example, when flags
+PROTO_SRC_PORT, PROTO_NUM and IP_SRC are sets, only entries matching all
+values are dumped.
+
+Changes since v1:
+  Set NLM_F_DUMP_FILTERED in nlm flags if entries are filtered
+
+Changes since v2:
+  Move several constants to nf_internals.h
+  Move a fix on netlink values check in a separate patch
+  Add a check on not-supported flags
+  Return EOPNOTSUPP if CDA_FILTER is set in ctnetlink_flush_conntrack
+  (not yet implemented)
+  Code style issues
+
+Changes since v3:
+  Fix compilation warning reported by kbuild test robot
+
+Changes since v4:
+  Fix a regression introduced in v3 (returned EINVAL for valid netlink
+  messages without CTA_MARK)
+
+Changes since v5:
+  Change definition of CTA_FILTER_F_ALL
+  Fix a regression when CTA_TUPLE_ZONE is not set
+
+	Signed-off-by: Romain Bellan <romain.bellan@wifirst.fr>
+	Signed-off-by: Florent Fourcot <florent.fourcot@wifirst.fr>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit cb8aa9a3affb7d23b11b11fbed41e2feaabc4b0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_netlink.c
+diff --cc net/netfilter/nf_conntrack_netlink.c
+index 42c27d1c2011,d7bd8b1f27d5..000000000000
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@@ -1158,11 -1392,6 +1392,14 @@@ ctnetlink_parse_tuple_filter(const stru
+  	if (err < 0)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	if (l3num != NFPROTO_IPV4 && l3num != NFPROTO_IPV6)
+ +		return -EOPNOTSUPP;
+ +
+ +	if (!tb[CTA_TUPLE_IP])
+ +		return -EINVAL;
+++=======
+++>>>>>>> cb8aa9a3affb (netfilter: ctnetlink: add kernel side filtering for dump)
+  
+  	tuple->src.l3num = l3num;
+  
+diff --git a/include/net/netfilter/nf_conntrack_l4proto.h b/include/net/netfilter/nf_conntrack_l4proto.h
+index ede62339c822..851546d1efd9 100644
+--- a/include/net/netfilter/nf_conntrack_l4proto.h
++++ b/include/net/netfilter/nf_conntrack_l4proto.h
+@@ -45,7 +45,8 @@ struct nf_conntrack_l4proto {
+ 	/* Calculate tuple nlattr size */
+ 	unsigned int (*nlattr_tuple_size)(void);
+ 	int (*nlattr_to_tuple)(struct nlattr *tb[],
+-			       struct nf_conntrack_tuple *t);
++			       struct nf_conntrack_tuple *t,
++			       u_int32_t flags);
+ 	const struct nla_policy *nla_policy;
+ 
+ 	struct {
+@@ -158,7 +159,8 @@ void nf_ct_l4proto_unregister_one(const struct nf_conntrack_l4proto *proto);
+ int nf_ct_port_tuple_to_nlattr(struct sk_buff *skb,
+ 			       const struct nf_conntrack_tuple *tuple);
+ int nf_ct_port_nlattr_to_tuple(struct nlattr *tb[],
+-			       struct nf_conntrack_tuple *t);
++			       struct nf_conntrack_tuple *t,
++			       u_int32_t flags);
+ unsigned int nf_ct_port_nlattr_tuple_size(void);
+ extern const struct nla_policy nf_ct_port_nla_policy[];
+ 
+diff --git a/include/uapi/linux/netfilter/nfnetlink_conntrack.h b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+index b3f67a846ca2..d8484be72fdc 100644
+--- a/include/uapi/linux/netfilter/nfnetlink_conntrack.h
++++ b/include/uapi/linux/netfilter/nfnetlink_conntrack.h
+@@ -55,6 +55,7 @@ enum ctattr_type {
+ 	CTA_LABELS,
+ 	CTA_LABELS_MASK,
+ 	CTA_SYNPROXY,
++	CTA_FILTER,
+ 	__CTA_MAX
+ };
+ #define CTA_MAX (__CTA_MAX - 1)
+@@ -277,4 +278,12 @@ enum ctattr_expect_stats {
+ };
+ #define CTA_STATS_EXP_MAX (__CTA_STATS_EXP_MAX - 1)
+ 
++enum ctattr_filter {
++	CTA_FILTER_UNSPEC,
++	CTA_FILTER_ORIG_FLAGS,
++	CTA_FILTER_REPLY_FLAGS,
++	__CTA_FILTER_MAX
++};
++#define CTA_FILTER_MAX (__CTA_FILTER_MAX - 1)
++
+ #endif /* _IPCONNTRACK_NETLINK_H */
+diff --git a/net/netfilter/nf_conntrack_core.c b/net/netfilter/nf_conntrack_core.c
+index d262f395908a..9dea2357cfef 100644
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@ -1951,13 +1951,22 @@ const struct nla_policy nf_ct_port_nla_policy[CTA_PROTO_MAX+1] = {
+ EXPORT_SYMBOL_GPL(nf_ct_port_nla_policy);
+ 
+ int nf_ct_port_nlattr_to_tuple(struct nlattr *tb[],
+-			       struct nf_conntrack_tuple *t)
++			       struct nf_conntrack_tuple *t,
++			       u_int32_t flags)
+ {
+-	if (!tb[CTA_PROTO_SRC_PORT] || !tb[CTA_PROTO_DST_PORT])
+-		return -EINVAL;
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_SRC_PORT)) {
++		if (!tb[CTA_PROTO_SRC_PORT])
++			return -EINVAL;
++
++		t->src.u.tcp.port = nla_get_be16(tb[CTA_PROTO_SRC_PORT]);
++	}
+ 
+-	t->src.u.tcp.port = nla_get_be16(tb[CTA_PROTO_SRC_PORT]);
+-	t->dst.u.tcp.port = nla_get_be16(tb[CTA_PROTO_DST_PORT]);
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_DST_PORT)) {
++		if (!tb[CTA_PROTO_DST_PORT])
++			return -EINVAL;
++
++		t->dst.u.tcp.port = nla_get_be16(tb[CTA_PROTO_DST_PORT]);
++	}
+ 
+ 	return 0;
+ }
+* Unmerged path net/netfilter/nf_conntrack_netlink.c
+diff --git a/net/netfilter/nf_conntrack_proto_icmp.c b/net/netfilter/nf_conntrack_proto_icmp.c
+index 412e77246dce..8c98f83292d9 100644
+--- a/net/netfilter/nf_conntrack_proto_icmp.c
++++ b/net/netfilter/nf_conntrack_proto_icmp.c
+@@ -23,6 +23,8 @@
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <net/netfilter/nf_log.h>
+ 
++#include "nf_internals.h"
++
+ static const unsigned int nf_ct_icmp_timeout = 30*HZ;
+ 
+ bool icmp_pkt_to_tuple(const struct sk_buff *skb, unsigned int dataoff,
+@@ -278,20 +280,32 @@ static const struct nla_policy icmp_nla_policy[CTA_PROTO_MAX+1] = {
+ };
+ 
+ static int icmp_nlattr_to_tuple(struct nlattr *tb[],
+-				struct nf_conntrack_tuple *tuple)
++				struct nf_conntrack_tuple *tuple,
++				u_int32_t flags)
+ {
+-	if (!tb[CTA_PROTO_ICMP_TYPE] ||
+-	    !tb[CTA_PROTO_ICMP_CODE] ||
+-	    !tb[CTA_PROTO_ICMP_ID])
+-		return -EINVAL;
+-
+-	tuple->dst.u.icmp.type = nla_get_u8(tb[CTA_PROTO_ICMP_TYPE]);
+-	tuple->dst.u.icmp.code = nla_get_u8(tb[CTA_PROTO_ICMP_CODE]);
+-	tuple->src.u.icmp.id = nla_get_be16(tb[CTA_PROTO_ICMP_ID]);
+-
+-	if (tuple->dst.u.icmp.type >= sizeof(invmap) ||
+-	    !invmap[tuple->dst.u.icmp.type])
+-		return -EINVAL;
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMP_TYPE)) {
++		if (!tb[CTA_PROTO_ICMP_TYPE])
++			return -EINVAL;
++
++		tuple->dst.u.icmp.type = nla_get_u8(tb[CTA_PROTO_ICMP_TYPE]);
++		if (tuple->dst.u.icmp.type >= sizeof(invmap) ||
++		    !invmap[tuple->dst.u.icmp.type])
++			return -EINVAL;
++	}
++
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMP_CODE)) {
++		if (!tb[CTA_PROTO_ICMP_CODE])
++			return -EINVAL;
++
++		tuple->dst.u.icmp.code = nla_get_u8(tb[CTA_PROTO_ICMP_CODE]);
++	}
++
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMP_ID)) {
++		if (!tb[CTA_PROTO_ICMP_ID])
++			return -EINVAL;
++
++		tuple->src.u.icmp.id = nla_get_be16(tb[CTA_PROTO_ICMP_ID]);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/net/netfilter/nf_conntrack_proto_icmpv6.c b/net/netfilter/nf_conntrack_proto_icmpv6.c
+index 4d02573846d0..b20ffd5abc5c 100644
+--- a/net/netfilter/nf_conntrack_proto_icmpv6.c
++++ b/net/netfilter/nf_conntrack_proto_icmpv6.c
+@@ -28,6 +28,8 @@
+ #include <net/netfilter/ipv6/nf_conntrack_icmpv6.h>
+ #include <net/netfilter/nf_log.h>
+ 
++#include "nf_internals.h"
++
+ static const unsigned int nf_ct_icmpv6_timeout = 30*HZ;
+ 
+ bool icmpv6_pkt_to_tuple(const struct sk_buff *skb,
+@@ -197,21 +199,33 @@ static const struct nla_policy icmpv6_nla_policy[CTA_PROTO_MAX+1] = {
+ };
+ 
+ static int icmpv6_nlattr_to_tuple(struct nlattr *tb[],
+-				struct nf_conntrack_tuple *tuple)
++				struct nf_conntrack_tuple *tuple,
++				u_int32_t flags)
+ {
+-	if (!tb[CTA_PROTO_ICMPV6_TYPE] ||
+-	    !tb[CTA_PROTO_ICMPV6_CODE] ||
+-	    !tb[CTA_PROTO_ICMPV6_ID])
+-		return -EINVAL;
+-
+-	tuple->dst.u.icmp.type = nla_get_u8(tb[CTA_PROTO_ICMPV6_TYPE]);
+-	tuple->dst.u.icmp.code = nla_get_u8(tb[CTA_PROTO_ICMPV6_CODE]);
+-	tuple->src.u.icmp.id = nla_get_be16(tb[CTA_PROTO_ICMPV6_ID]);
+-
+-	if (tuple->dst.u.icmp.type < 128 ||
+-	    tuple->dst.u.icmp.type - 128 >= sizeof(invmap) ||
+-	    !invmap[tuple->dst.u.icmp.type - 128])
+-		return -EINVAL;
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMPV6_TYPE)) {
++		if (!tb[CTA_PROTO_ICMPV6_TYPE])
++			return -EINVAL;
++
++		tuple->dst.u.icmp.type = nla_get_u8(tb[CTA_PROTO_ICMPV6_TYPE]);
++		if (tuple->dst.u.icmp.type < 128 ||
++		    tuple->dst.u.icmp.type - 128 >= sizeof(invmap) ||
++		    !invmap[tuple->dst.u.icmp.type - 128])
++			return -EINVAL;
++	}
++
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMPV6_CODE)) {
++		if (!tb[CTA_PROTO_ICMPV6_CODE])
++			return -EINVAL;
++
++		tuple->dst.u.icmp.code = nla_get_u8(tb[CTA_PROTO_ICMPV6_CODE]);
++	}
++
++	if (flags & CTA_FILTER_FLAG(CTA_PROTO_ICMPV6_ID)) {
++		if (!tb[CTA_PROTO_ICMPV6_ID])
++			return -EINVAL;
++
++		tuple->src.u.icmp.id = nla_get_be16(tb[CTA_PROTO_ICMPV6_ID]);
++	}
+ 
+ 	return 0;
+ }
+diff --git a/net/netfilter/nf_internals.h b/net/netfilter/nf_internals.h
+index d6c43902ebd7..832ae64179f0 100644
+--- a/net/netfilter/nf_internals.h
++++ b/net/netfilter/nf_internals.h
+@@ -6,6 +6,23 @@
+ #include <linux/skbuff.h>
+ #include <linux/netdevice.h>
+ 
++/* nf_conntrack_netlink.c: applied on tuple filters */
++#define CTA_FILTER_F_CTA_IP_SRC			(1 << 0)
++#define CTA_FILTER_F_CTA_IP_DST			(1 << 1)
++#define CTA_FILTER_F_CTA_TUPLE_ZONE		(1 << 2)
++#define CTA_FILTER_F_CTA_PROTO_NUM		(1 << 3)
++#define CTA_FILTER_F_CTA_PROTO_SRC_PORT		(1 << 4)
++#define CTA_FILTER_F_CTA_PROTO_DST_PORT		(1 << 5)
++#define CTA_FILTER_F_CTA_PROTO_ICMP_TYPE	(1 << 6)
++#define CTA_FILTER_F_CTA_PROTO_ICMP_CODE	(1 << 7)
++#define CTA_FILTER_F_CTA_PROTO_ICMP_ID		(1 << 8)
++#define CTA_FILTER_F_CTA_PROTO_ICMPV6_TYPE	(1 << 9)
++#define CTA_FILTER_F_CTA_PROTO_ICMPV6_CODE	(1 << 10)
++#define CTA_FILTER_F_CTA_PROTO_ICMPV6_ID	(1 << 11)
++#define CTA_FILTER_F_MAX			(1 << 12)
++#define CTA_FILTER_F_ALL			(CTA_FILTER_F_MAX-1)
++#define CTA_FILTER_FLAG(ctattr) CTA_FILTER_F_ ## ctattr
++
+ /* nf_queue.c */
+ void nf_queue_nf_hook_drop(struct net *net);
+ 
