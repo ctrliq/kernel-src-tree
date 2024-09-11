@@ -1,0 +1,360 @@
+x86/sev-es: Allocate and map an IST stack for #VC handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] sev-es: Allocate and map an IST stack for #VC handler (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 96.36%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 02772fb9b68e6a72a5e17f994048df832fe2b15e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/02772fb9.failed
+
+Allocate and map an IST stack and an additional fall-back stack for
+the #VC handler.  The memory for the stacks is allocated only when
+SEV-ES is active.
+
+The #VC handler needs to use an IST stack because a #VC exception can be
+raised from kernel space with unsafe stack, e.g. in the SYSCALL entry
+path.
+
+Since the #VC exception can be nested, the #VC handler switches back to
+the interrupted stack when entered from kernel space. If switching back
+is not possible, the fall-back stack is used.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-43-joro@8bytes.org
+(cherry picked from commit 02772fb9b68e6a72a5e17f994048df832fe2b15e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/cpu_entry_area.h
+#	arch/x86/include/asm/page_64_types.h
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/dumpstack_64.c
+#	arch/x86/kernel/sev-es.c
+diff --cc arch/x86/include/asm/cpu_entry_area.h
+index 29c706415443,3d52b094850a..000000000000
+--- a/arch/x86/include/asm/cpu_entry_area.h
++++ b/arch/x86/include/asm/cpu_entry_area.h
+@@@ -6,6 -6,72 +6,75 @@@
+  #include <linux/percpu-defs.h>
+  #include <asm/processor.h>
+  #include <asm/intel_ds.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/pgtable_areas.h>
++ 
++ #ifdef CONFIG_X86_64
++ 
++ /* Macro to enforce the same ordering and stack sizes */
++ #define ESTACKS_MEMBERS(guardsize, optional_stack_size)		\
++ 	char	DF_stack_guard[guardsize];			\
++ 	char	DF_stack[EXCEPTION_STKSZ];			\
++ 	char	NMI_stack_guard[guardsize];			\
++ 	char	NMI_stack[EXCEPTION_STKSZ];			\
++ 	char	DB_stack_guard[guardsize];			\
++ 	char	DB_stack[EXCEPTION_STKSZ];			\
++ 	char	MCE_stack_guard[guardsize];			\
++ 	char	MCE_stack[EXCEPTION_STKSZ];			\
++ 	char	VC_stack_guard[guardsize];			\
++ 	char	VC_stack[optional_stack_size];			\
++ 	char	VC2_stack_guard[guardsize];			\
++ 	char	VC2_stack[optional_stack_size];			\
++ 	char	IST_top_guard[guardsize];			\
++ 
++ /* The exception stacks' physical storage. No guard pages required */
++ struct exception_stacks {
++ 	ESTACKS_MEMBERS(0, 0)
++ };
++ 
++ /* The effective cpu entry area mapping with guard pages. */
++ struct cea_exception_stacks {
++ 	ESTACKS_MEMBERS(PAGE_SIZE, EXCEPTION_STKSZ)
++ };
++ 
++ /*
++  * The exception stack ordering in [cea_]exception_stacks
++  */
++ enum exception_stack_ordering {
++ 	ESTACK_DF,
++ 	ESTACK_NMI,
++ 	ESTACK_DB,
++ 	ESTACK_MCE,
++ 	ESTACK_VC,
++ 	ESTACK_VC2,
++ 	N_EXCEPTION_STACKS
++ };
++ 
++ #define CEA_ESTACK_SIZE(st)					\
++ 	sizeof(((struct cea_exception_stacks *)0)->st## _stack)
++ 
++ #define CEA_ESTACK_BOT(ceastp, st)				\
++ 	((unsigned long)&(ceastp)->st## _stack)
++ 
++ #define CEA_ESTACK_TOP(ceastp, st)				\
++ 	(CEA_ESTACK_BOT(ceastp, st) + CEA_ESTACK_SIZE(st))
++ 
++ #define CEA_ESTACK_OFFS(st)					\
++ 	offsetof(struct cea_exception_stacks, st## _stack)
++ 
++ #define CEA_ESTACK_PAGES					\
++ 	(sizeof(struct cea_exception_stacks) / PAGE_SIZE)
++ 
++ #endif
++ 
++ #ifdef CONFIG_X86_32
++ struct doublefault_stack {
++ 	unsigned long stack[(PAGE_SIZE - sizeof(struct x86_hw_tss)) / sizeof(unsigned long)];
++ 	struct x86_hw_tss tss;
++ } __aligned(PAGE_SIZE);
++ #endif
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  
+  /*
+   * cpu_entry_area is a percpu region that contains things needed by the CPU
+@@@ -76,4 -142,10 +145,13 @@@ static inline struct entry_stack *cpu_e
+  	return &get_cpu_entry_area(cpu)->entry_stack_page.stack;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define __this_cpu_ist_top_va(name)					\
++ 	CEA_ESTACK_TOP(__this_cpu_read(cea_exception_stacks), name)
++ 
++ #define __this_cpu_ist_bottom_va(name)					\
++ 	CEA_ESTACK_BOT(__this_cpu_read(cea_exception_stacks), name)
++ 
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  #endif
+diff --cc arch/x86/include/asm/page_64_types.h
+index 24fbc1126554,d0c6c10c18a0..000000000000
+--- a/arch/x86/include/asm/page_64_types.h
++++ b/arch/x86/include/asm/page_64_types.h
+@@@ -24,11 -21,14 +24,22 @@@
+  #define IRQ_STACK_ORDER (2 + KASAN_STACK_ORDER)
+  #define IRQ_STACK_SIZE (PAGE_SIZE << IRQ_STACK_ORDER)
+  
+++<<<<<<< HEAD
+ +#define DOUBLEFAULT_STACK 1
+ +#define NMI_STACK 2
+ +#define DEBUG_STACK 3
+ +#define MCE_STACK 4
+ +#define N_EXCEPTION_STACKS 4  /* hw limit: 7 */
+++=======
++ /*
++  * The index for the tss.ist[] array. The hardware limit is 7 entries.
++  */
++ #define	IST_INDEX_DF		0
++ #define	IST_INDEX_NMI		1
++ #define	IST_INDEX_DB		2
++ #define	IST_INDEX_MCE		3
++ #define	IST_INDEX_VC		4
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  
+  /*
+   * Set __PAGE_OFFSET to the most negative possible address +
+diff --cc arch/x86/kernel/cpu/common.c
+index d6857fdc914b,81fba4d4a242..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -1771,9 -1813,54 +1771,56 @@@ static void setup_getcpu(int cpu
+  	d.p = 1;		/* Present */
+  	d.d = 1;		/* 32-bit */
+  
+ -	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPUNODE, &d, DESCTYPE_S);
+ +	write_gdt_entry(get_cpu_gdt_rw(cpu), GDT_ENTRY_CPU_NUMBER, &d, DESCTYPE_S);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void ucode_cpu_init(int cpu)
++ {
++ 	if (cpu)
++ 		load_ucode_ap();
++ }
++ 
++ static inline void tss_setup_ist(struct tss_struct *tss)
++ {
++ 	/* Set up the per-CPU TSS IST stacks */
++ 	tss->x86_tss.ist[IST_INDEX_DF] = __this_cpu_ist_top_va(DF);
++ 	tss->x86_tss.ist[IST_INDEX_NMI] = __this_cpu_ist_top_va(NMI);
++ 	tss->x86_tss.ist[IST_INDEX_DB] = __this_cpu_ist_top_va(DB);
++ 	tss->x86_tss.ist[IST_INDEX_MCE] = __this_cpu_ist_top_va(MCE);
++ 	/* Only mapped when SEV-ES is active */
++ 	tss->x86_tss.ist[IST_INDEX_VC] = __this_cpu_ist_top_va(VC);
++ }
++ 
++ #else /* CONFIG_X86_64 */
++ 
++ static inline void setup_getcpu(int cpu) { }
++ 
++ static inline void ucode_cpu_init(int cpu)
++ {
++ 	show_ucode_info_early();
++ }
++ 
++ static inline void tss_setup_ist(struct tss_struct *tss) { }
++ 
++ #endif /* !CONFIG_X86_64 */
++ 
++ static inline void tss_setup_io_bitmap(struct tss_struct *tss)
++ {
++ 	tss->x86_tss.io_bitmap_base = IO_BITMAP_OFFSET_INVALID;
++ 
++ #ifdef CONFIG_X86_IOPL_IOPERM
++ 	tss->io_bitmap.prev_max = 0;
++ 	tss->io_bitmap.prev_sequence = 0;
++ 	memset(tss->io_bitmap.bitmap, 0xff, sizeof(tss->io_bitmap.bitmap));
++ 	/*
++ 	 * Invalidate the extra array entry past the end of the all
++ 	 * permission bitmap as required by the hardware.
++ 	 */
++ 	tss->io_bitmap.mapall[IO_BITMAP_LONGS] = ~0UL;
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  #endif
+ -}
+  
+  /*
+   * cpu_init() initializes state that is per-CPU. Some data is already
+diff --cc arch/x86/kernel/dumpstack_64.c
+index 35a75d2d7b5a,c49cf594714b..000000000000
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@@ -16,18 -16,16 +16,28 @@@
+  #include <linux/bug.h>
+  #include <linux/nmi.h>
+  
+ -#include <asm/cpu_entry_area.h>
+  #include <asm/stacktrace.h>
+  
+++<<<<<<< HEAD
+ +static char *exception_stack_names[N_EXCEPTION_STACKS] = {
+ +		[ DOUBLEFAULT_STACK-1	]	= "#DF",
+ +		[ NMI_STACK-1		]	= "NMI",
+ +		[ DEBUG_STACK-1		]	= "#DB",
+ +		[ MCE_STACK-1		]	= "#MC",
+ +};
+ +
+ +static unsigned long exception_stack_sizes[N_EXCEPTION_STACKS] = {
+ +	[0 ... N_EXCEPTION_STACKS - 1]		= EXCEPTION_STKSZ,
+ +	[DEBUG_STACK - 1]			= DEBUG_STKSZ
+++=======
++ static const char * const exception_stack_names[] = {
++ 		[ ESTACK_DF	]	= "#DF",
++ 		[ ESTACK_NMI	]	= "NMI",
++ 		[ ESTACK_DB	]	= "#DB",
++ 		[ ESTACK_MCE	]	= "#MC",
++ 		[ ESTACK_VC	]	= "#VC",
++ 		[ ESTACK_VC2	]	= "#VC2",
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  };
+  
+  const char *stack_type_name(enum stack_type type)
+@@@ -52,31 -50,80 +62,69 @@@
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct estack_pages - Page descriptor for exception stacks
++  * @offs:	Offset from the start of the exception stack area
++  * @size:	Size of the exception stack
++  * @type:	Type to store in the stack_info struct
++  */
++ struct estack_pages {
++ 	u32	offs;
++ 	u16	size;
++ 	u16	type;
++ };
++ 
++ #define EPAGERANGE(st)							\
++ 	[PFN_DOWN(CEA_ESTACK_OFFS(st)) ...				\
++ 	 PFN_DOWN(CEA_ESTACK_OFFS(st) + CEA_ESTACK_SIZE(st) - 1)] = {	\
++ 		.offs	= CEA_ESTACK_OFFS(st),				\
++ 		.size	= CEA_ESTACK_SIZE(st),				\
++ 		.type	= STACK_TYPE_EXCEPTION + ESTACK_ ##st, }
++ 
++ /*
++  * Array of exception stack page descriptors. If the stack is larger than
++  * PAGE_SIZE, all pages covering a particular stack will have the same
++  * info. The guard pages including the not mapped DB2 stack are zeroed
++  * out.
++  */
++ static const
++ struct estack_pages estack_pages[CEA_ESTACK_PAGES] ____cacheline_aligned = {
++ 	EPAGERANGE(DF),
++ 	EPAGERANGE(NMI),
++ 	EPAGERANGE(DB),
++ 	EPAGERANGE(MCE),
++ 	EPAGERANGE(VC),
++ 	EPAGERANGE(VC2),
++ };
++ 
+++>>>>>>> 02772fb9b68e (x86/sev-es: Allocate and map an IST stack for #VC handler)
+  static bool in_exception_stack(unsigned long *stack, struct stack_info *info)
+  {
+ -	unsigned long begin, end, stk = (unsigned long)stack;
+ -	const struct estack_pages *ep;
+ +	unsigned long *begin, *end;
+  	struct pt_regs *regs;
+ -	unsigned int k;
+ +	unsigned k;
+  
+- 	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
++ 	BUILD_BUG_ON(N_EXCEPTION_STACKS != 6);
+  
+ -	begin = (unsigned long)__this_cpu_read(cea_exception_stacks);
+ -	/*
+ -	 * Handle the case where stack trace is collected _before_
+ -	 * cea_exception_stacks had been initialized.
+ -	 */
+ -	if (!begin)
+ -		return false;
+ +	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
+ +		end   = (unsigned long *)raw_cpu_ptr(&orig_ist)->ist[k];
+ +		begin = end - (exception_stack_sizes[k] / sizeof(long));
+ +		regs  = (struct pt_regs *)end - 1;
+  
+ -	end = begin + sizeof(struct cea_exception_stacks);
+ -	/* Bail if @stack is outside the exception stack area. */
+ -	if (stk < begin || stk >= end)
+ -		return false;
+ +		if (stack < begin || stack >= end)
+ +			continue;
+  
+ -	/* Calc page offset from start of exception stacks */
+ -	k = (stk - begin) >> PAGE_SHIFT;
+ -	/* Lookup the page descriptor */
+ -	ep = &estack_pages[k];
+ -	/* Guard page? */
+ -	if (!ep->size)
+ -		return false;
+ +		info->type	= STACK_TYPE_EXCEPTION + k;
+ +		info->begin	= begin;
+ +		info->end	= end;
+ +		info->next_sp	= (unsigned long *)regs->sp;
+  
+ -	begin += (unsigned long)ep->offs;
+ -	end = begin + (unsigned long)ep->size;
+ -	regs = (struct pt_regs *)end - 1;
+ +		return true;
+ +	}
+  
+ -	info->type	= ep->type;
+ -	info->begin	= (unsigned long *)begin;
+ -	info->end	= (unsigned long *)end;
+ -	info->next_sp	= (unsigned long *)regs->sp;
+ -	return true;
+ +	return false;
+  }
+  
+  static bool in_irq_stack(unsigned long *stack, struct stack_info *info)
+* Unmerged path arch/x86/kernel/sev-es.c
+* Unmerged path arch/x86/include/asm/cpu_entry_area.h
+* Unmerged path arch/x86/include/asm/page_64_types.h
+* Unmerged path arch/x86/kernel/cpu/common.c
+* Unmerged path arch/x86/kernel/dumpstack_64.c
+* Unmerged path arch/x86/kernel/sev-es.c
