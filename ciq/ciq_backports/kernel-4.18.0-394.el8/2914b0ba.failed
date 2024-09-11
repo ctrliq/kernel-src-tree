@@ -1,0 +1,108 @@
+irq_work: Optimize irq_work_single()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 2914b0ba61a9d253535e51af16c7122a8148995d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/2914b0ba.failed
+
+Trade one atomic op for a full memory barrier.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Frederic Weisbecker <frederic@kernel.org>
+(cherry picked from commit 2914b0ba61a9d253535e51af16c7122a8148995d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+#	kernel/irq_work.c
+diff --cc include/linux/irqflags.h
+index 8acc5e479416,8de0e1373de7..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -107,14 -107,14 +107,22 @@@ do {						
+  		  current->irq_config = 0;			\
+  	  } while (0)
+  
+- # define lockdep_irq_work_enter(__work)					\
++ # define lockdep_irq_work_enter(_flags)					\
+  	  do {								\
+++<<<<<<< HEAD
+ +		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
+++=======
++ 		  if (!((_flags) & IRQ_WORK_HARD_IRQ))			\
+++>>>>>>> 2914b0ba61a9 (irq_work: Optimize irq_work_single())
+  			current->irq_config = 1;			\
+  	  } while (0)
+- # define lockdep_irq_work_exit(__work)					\
++ # define lockdep_irq_work_exit(_flags)					\
+  	  do {								\
+++<<<<<<< HEAD
+ +		  if (!(atomic_read(&__work->flags) & IRQ_WORK_HARD_IRQ))\
+++=======
++ 		  if (!((_flags) & IRQ_WORK_HARD_IRQ))			\
+++>>>>>>> 2914b0ba61a9 (irq_work: Optimize irq_work_single())
+  			current->irq_config = 0;			\
+  	  } while (0)
+  
+diff --cc kernel/irq_work.c
+index fc8d175a5d09,e8da1e71583a..000000000000
+--- a/kernel/irq_work.c
++++ b/kernel/irq_work.c
+@@@ -30,10 -31,10 +30,10 @@@ static bool irq_work_claim(struct irq_w
+  {
+  	int oflags;
+  
+ -	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED | CSD_TYPE_IRQ_WORK, &work->node.a_flags);
+ +	oflags = atomic_fetch_or(IRQ_WORK_CLAIMED, &work->flags);
+  	/*
+  	 * If the work is already pending, no need to raise the IPI.
+- 	 * The pairing atomic_fetch_andnot() in irq_work_run() makes sure
++ 	 * The pairing smp_mb() in irq_work_single() makes sure
+  	 * everything we did before is visible.
+  	 */
+  	if (oflags & IRQ_WORK_PENDING)
+@@@ -130,6 -130,36 +130,39 @@@ bool irq_work_needs_cpu(void
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void irq_work_single(void *arg)
++ {
++ 	struct irq_work *work = arg;
++ 	int flags;
++ 
++ 	/*
++ 	 * Clear the PENDING bit, after this point the @work can be re-used.
++ 	 * The PENDING bit acts as a lock, and we own it, so we can clear it
++ 	 * without atomic ops.
++ 	 */
++ 	flags = atomic_read(&work->node.a_flags);
++ 	flags &= ~IRQ_WORK_PENDING;
++ 	atomic_set(&work->node.a_flags, flags);
++ 
++ 	/*
++ 	 * See irq_work_claim().
++ 	 */
++ 	smp_mb();
++ 
++ 	lockdep_irq_work_enter(flags);
++ 	work->func(work);
++ 	lockdep_irq_work_exit(flags);
++ 
++ 	/*
++ 	 * Clear the BUSY bit, if set, and return to the free state if no-one
++ 	 * else claimed it meanwhile.
++ 	 */
++ 	(void)atomic_cmpxchg(&work->node.a_flags, flags, flags & ~IRQ_WORK_BUSY);
++ }
++ 
+++>>>>>>> 2914b0ba61a9 (irq_work: Optimize irq_work_single())
+  static void irq_work_run_list(struct llist_head *list)
+  {
+  	struct irq_work *work, *tmp;
+* Unmerged path include/linux/irqflags.h
+* Unmerged path kernel/irq_work.c
