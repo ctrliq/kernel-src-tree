@@ -9623,7 +9623,7 @@ cleanup:
 	return rc;
 }
 
-static void
+void
 lpfc_els_rcv_fpin(struct lpfc_vport *vport, void *p, u32 fpin_length)
 {
 	struct lpfc_hba *phba = vport->phba;
