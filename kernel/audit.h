@@ -19,6 +19,9 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
 
+#ifndef _KERNEL_AUDIT_H_
+#define _KERNEL_AUDIT_H_
+
 #include <linux/fs.h>
 #include <linux/audit.h>
 #include <linux/skbuff.h>
@@ -348,3 +351,5 @@ extern int audit_filter(int msgtype, unsigned int listtype);
 
 extern void audit_ctl_lock(void);
 extern void audit_ctl_unlock(void);
+
+#endif
