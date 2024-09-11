@@ -1,0 +1,299 @@
+net/mlx5e: Move TC-specific code from en_main.c to en_tc.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit e2394a61d243d74ec7d0bfd4c6e25171fba54caa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e2394a61.failed
+
+As a preparation for introducing new kconfig option that controls
+compilation of all TC offloads code in mlx5, extract TC-specific code from
+en_main.c to en_tc.c. This allows easily compiling out the code by
+only including new source in make file when corresponding kconfig is
+enabled instead of adding multiple ifdef blocks to en_main.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit e2394a61d243d74ec7d0bfd4c6e25171fba54caa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index d358fdb49b84,1614b077a477..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -49,8 -50,11 +50,13 @@@
+  #include <net/ipv6_stubs.h>
+  #include "en.h"
+  #include "en_rep.h"
+++<<<<<<< HEAD
+++=======
++ #include "en/rep/tc.h"
++ #include "en/rep/neigh.h"
+++>>>>>>> e2394a61d243 (net/mlx5e: Move TC-specific code from en_main.c to en_tc.c)
+  #include "en_tc.h"
+  #include "eswitch.h"
+ -#include "esw/chains.h"
+  #include "fs_core.h"
+  #include "en/port.h"
+  #include "en/tc_tun.h"
+@@@ -4225,137 -4780,35 +4231,171 @@@ void mlx5e_tc_reoffload_flows_work(stru
+  	mutex_unlock(&rpriv->unready_flows_lock);
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+ +static bool mlx5e_restore_tunnel(struct mlx5e_priv *priv, struct sk_buff *skb,
+ +				 struct mlx5e_tc_update_priv *tc_priv,
+ +				 u32 tunnel_id)
+ +{
+ +	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ +	struct flow_dissector_key_enc_opts enc_opts = {};
+ +	struct mlx5_rep_uplink_priv *uplink_priv;
+ +	struct mlx5e_rep_priv *uplink_rpriv;
+ +	struct metadata_dst *tun_dst;
+ +	struct tunnel_match_key key;
+ +	u32 tun_id, enc_opts_id;
+ +	struct net_device *dev;
+ +	int err;
+ +
+ +	enc_opts_id = tunnel_id & ENC_OPTS_BITS_MASK;
+ +	tun_id = tunnel_id >> ENC_OPTS_BITS;
+ +
+ +	if (!tun_id)
+ +		return true;
+ +
+ +	uplink_rpriv = mlx5_eswitch_get_uplink_priv(esw, REP_ETH);
+ +	uplink_priv = &uplink_rpriv->uplink_priv;
+ +
+ +	err = mapping_find(uplink_priv->tunnel_mapping, tun_id, &key);
+ +	if (err) {
+ +		WARN_ON_ONCE(true);
+ +		netdev_dbg(priv->netdev,
+ +			   "Couldn't find tunnel for tun_id: %d, err: %d\n",
+ +			   tun_id, err);
+ +		return false;
+ +	}
+ +
+ +	if (enc_opts_id) {
+ +		err = mapping_find(uplink_priv->tunnel_enc_opts_mapping,
+ +				   enc_opts_id, &enc_opts);
+ +		if (err) {
+ +			netdev_dbg(priv->netdev,
+ +				   "Couldn't find tunnel (opts) for tun_id: %d, err: %d\n",
+ +				   enc_opts_id, err);
+ +			return false;
+ +		}
+ +	}
+ +
+ +	tun_dst = tun_rx_dst(enc_opts.len);
+ +	if (!tun_dst) {
+ +		WARN_ON_ONCE(true);
+ +		return false;
+ +	}
+ +
+ +	ip_tunnel_key_init(&tun_dst->u.tun_info.key,
+ +			   key.enc_ipv4.src, key.enc_ipv4.dst,
+ +			   key.enc_ip.tos, key.enc_ip.ttl,
+ +			   0, /* label */
+ +			   key.enc_tp.src, key.enc_tp.dst,
+ +			   key32_to_tunnel_id(key.enc_key_id.keyid),
+ +			   TUNNEL_KEY);
+ +
+ +	if (enc_opts.len)
+ +		ip_tunnel_info_opts_set(&tun_dst->u.tun_info, enc_opts.data,
+ +					enc_opts.len, enc_opts.dst_opt_type);
+ +
+ +	skb_dst_set(skb, (struct dst_entry *)tun_dst);
+ +	dev = dev_get_by_index(&init_net, key.filter_ifindex);
+ +	if (!dev) {
+ +		netdev_dbg(priv->netdev,
+ +			   "Couldn't find tunnel device with ifindex: %d\n",
+ +			   key.filter_ifindex);
+ +		return false;
+ +	}
+ +
+ +	/* Set tun_dev so we do dev_put() after datapath */
+ +	tc_priv->tun_dev = dev;
+ +
+ +	skb->dev = dev;
+ +
+ +	return true;
+ +}
+ +#endif /* CONFIG_NET_TC_SKB_EXT */
+ +
+ +bool mlx5e_tc_rep_update_skb(struct mlx5_cqe64 *cqe,
+ +			     struct sk_buff *skb,
+ +			     struct mlx5e_tc_update_priv *tc_priv)
+ +{
+ +#if IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+ +	u32 chain = 0, reg_c0, reg_c1, tunnel_id;
+ +	struct tc_skb_ext *tc_skb_ext;
+ +	struct mlx5_eswitch *esw;
+ +	struct mlx5e_priv *priv;
+ +	int tunnel_moffset;
+ +	int err;
+ +
+ +	reg_c0 = (be32_to_cpu(cqe->sop_drop_qpn) & MLX5E_TC_FLOW_ID_MASK);
+ +	if (reg_c0 == MLX5_FS_DEFAULT_FLOW_TAG)
+ +		reg_c0 = 0;
+ +	reg_c1 = be32_to_cpu(cqe->ft_metadata);
+ +
+ +	if (!reg_c0)
+ +		return true;
+ +
+ +	priv = netdev_priv(skb->dev);
+ +	esw = priv->mdev->priv.eswitch;
+ +
+ +	err = mlx5_eswitch_get_chain_for_tag(esw, reg_c0, &chain);
+ +	if (err) {
+ +		netdev_dbg(priv->netdev,
+ +			   "Couldn't find chain for chain tag: %d, err: %d\n",
+ +			   reg_c0, err);
+ +		return false;
+ +	}
+ +
+ +	if (chain) {
+ +		tc_skb_ext = skb_ext_add(skb, TC_SKB_EXT);
+ +		if (!tc_skb_ext) {
+ +			WARN_ON(1);
+ +			return false;
+ +		}
+ +
+ +		tc_skb_ext->chain = chain;
+ +	}
+ +
+ +	tunnel_moffset = mlx5e_tc_attr_to_reg_mappings[TUNNEL_TO_REG].moffset;
+ +	tunnel_id = reg_c1 >> (8 * tunnel_moffset);
+ +	return mlx5e_restore_tunnel(priv, skb, tc_priv, tunnel_id);
+ +#endif /* CONFIG_NET_TC_SKB_EXT */
+ +
+ +	return true;
+ +}
+ +
+ +void mlx5_tc_rep_post_napi_receive(struct mlx5e_tc_update_priv *tc_priv)
+ +{
+ +	if (tc_priv->tun_dev)
+ +		dev_put(tc_priv->tun_dev);
+++=======
++ static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
++ 				     struct flow_cls_offload *cls_flower,
++ 				     unsigned long flags)
++ {
++ 	switch (cls_flower->command) {
++ 	case FLOW_CLS_REPLACE:
++ 		return mlx5e_configure_flower(priv->netdev, priv, cls_flower,
++ 					      flags);
++ 	case FLOW_CLS_DESTROY:
++ 		return mlx5e_delete_flower(priv->netdev, priv, cls_flower,
++ 					   flags);
++ 	case FLOW_CLS_STATS:
++ 		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
++ 					  flags);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++ 			    void *cb_priv)
++ {
++ 	unsigned long flags = MLX5_TC_FLAG(INGRESS) | MLX5_TC_FLAG(NIC_OFFLOAD);
++ 	struct mlx5e_priv *priv = cb_priv;
++ 
++ 	switch (type) {
++ 	case TC_SETUP_CLSFLOWER:
++ 		return mlx5e_setup_tc_cls_flower(priv, type_data, flags);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
+++>>>>>>> e2394a61d243 (net/mlx5e: Move TC-specific code from en_main.c to en_tc.c)
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index 22d5efd4edec,9c59b7fe258a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@@ -114,6 -170,12 +114,15 @@@ int alloc_mod_hdr_actions(struct mlx5_c
+  			  struct mlx5e_tc_mod_hdr_acts *mod_hdr_acts);
+  void dealloc_mod_hdr_actions(struct mlx5e_tc_mod_hdr_acts *mod_hdr_acts);
+  
+++<<<<<<< HEAD
+++=======
++ struct mlx5e_tc_flow;
++ u32 mlx5e_tc_get_flow_tun_id(struct mlx5e_tc_flow *flow);
++ 
++ int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++ 			    void *cb_priv);
++ 
+++>>>>>>> e2394a61d243 (net/mlx5e: Move TC-specific code from en_main.c to en_tc.c)
+  #else /* CONFIG_MLX5_ESWITCH */
+  static inline int  mlx5e_tc_nic_init(struct mlx5e_priv *priv) { return 0; }
+  static inline void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv) {}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 41becb602ff0..51ac43776b85 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3479,41 +3479,6 @@ static int mlx5e_setup_tc_mqprio(struct mlx5e_priv *priv,
+ 	return err;
+ }
+ 
+-#ifdef CONFIG_MLX5_ESWITCH
+-static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
+-				     struct flow_cls_offload *cls_flower,
+-				     unsigned long flags)
+-{
+-	switch (cls_flower->command) {
+-	case FLOW_CLS_REPLACE:
+-		return mlx5e_configure_flower(priv->netdev, priv, cls_flower,
+-					      flags);
+-	case FLOW_CLS_DESTROY:
+-		return mlx5e_delete_flower(priv->netdev, priv, cls_flower,
+-					   flags);
+-	case FLOW_CLS_STATS:
+-		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
+-					  flags);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-
+-static int mlx5e_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
+-				   void *cb_priv)
+-{
+-	unsigned long flags = MLX5_TC_FLAG(INGRESS) | MLX5_TC_FLAG(NIC_OFFLOAD);
+-	struct mlx5e_priv *priv = cb_priv;
+-
+-	switch (type) {
+-	case TC_SETUP_CLSFLOWER:
+-		return mlx5e_setup_tc_cls_flower(priv, type_data, flags);
+-	default:
+-		return -EOPNOTSUPP;
+-	}
+-}
+-#endif
+-
+ static LIST_HEAD(mlx5e_block_cb_list);
+ 
+ static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+@@ -3522,7 +3487,6 @@ static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 
+ 	switch (type) {
+-#ifdef CONFIG_MLX5_ESWITCH
+ 	case TC_SETUP_BLOCK: {
+ 		struct flow_block_offload *f = type_data;
+ 
+@@ -3532,7 +3496,6 @@ static int mlx5e_setup_tc(struct net_device *dev, enum tc_setup_type type,
+ 						  mlx5e_setup_tc_block_cb,
+ 						  priv, priv, true);
+ 	}
+-#endif
+ 	case TC_SETUP_QDISC_MQPRIO:
+ 		return mlx5e_setup_tc_mqprio(priv, type_data);
+ 	default:
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
