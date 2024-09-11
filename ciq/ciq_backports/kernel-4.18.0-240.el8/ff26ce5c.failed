@@ -1,0 +1,395 @@
+libbpf: Add support for dynamic program attach target
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eelco Chaudron <echaudro@redhat.com>
+commit ff26ce5cd7680ebc9c5446cda013e2087decc60f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ff26ce5c.failed
+
+Currently when you want to attach a trace program to a bpf program
+the section name needs to match the tracepoint/function semantics.
+
+However the addition of the bpf_program__set_attach_target() API
+allows you to specify the tracepoint/function dynamically.
+
+The call flow would look something like this:
+
+  xdp_fd = bpf_prog_get_fd_by_id(id);
+  trace_obj = bpf_object__open_file("func.o", NULL);
+  prog = bpf_object__find_program_by_title(trace_obj,
+                                           "fentry/myfunc");
+  bpf_program__set_expected_attach_type(prog, BPF_TRACE_FENTRY);
+  bpf_program__set_attach_target(prog, xdp_fd,
+                                 "xdpfilt_blk_all");
+  bpf_object__load(trace_obj)
+
+	Signed-off-by: Eelco Chaudron <echaudro@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/158220519486.127661.7964708960649051384.stgit@xdp-tutorial
+(cherry picked from commit ff26ce5cd7680ebc9c5446cda013e2087decc60f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.c
+index 6ed9ef84b398,8f0c436d5880..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -3889,11 -4931,19 +3889,23 @@@ out
+  	return ret;
+  }
+  
+ -static int libbpf_find_attach_btf_id(struct bpf_program *prog);
+ -
+ -int bpf_program__load(struct bpf_program *prog, char *license, __u32 kern_ver)
+ +int
+ +bpf_program__load(struct bpf_program *prog,
+ +		  char *license, __u32 kern_version)
+  {
+++<<<<<<< HEAD
+ +	int err = 0, fd, i;
+++=======
++ 	int err = 0, fd, i, btf_id;
++ 
++ 	if ((prog->type == BPF_PROG_TYPE_TRACING ||
++ 	     prog->type == BPF_PROG_TYPE_EXT) && !prog->attach_btf_id) {
++ 		btf_id = libbpf_find_attach_btf_id(prog);
++ 		if (btf_id <= 0)
++ 			return btf_id;
++ 		prog->attach_btf_id = btf_id;
++ 	}
+++>>>>>>> ff26ce5cd768 (libbpf: Add support for dynamic program attach target)
+  
+  	if (prog->instances.nr < 0 || !prog->instances.fds) {
+  		if (prog->preprocessor) {
+@@@ -5202,6 -6420,248 +5214,251 @@@ int libbpf_prog_type_by_name(const cha
+  	return -ESRCH;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct bpf_map *find_struct_ops_map_by_offset(struct bpf_object *obj,
++ 						     size_t offset)
++ {
++ 	struct bpf_map *map;
++ 	size_t i;
++ 
++ 	for (i = 0; i < obj->nr_maps; i++) {
++ 		map = &obj->maps[i];
++ 		if (!bpf_map__is_struct_ops(map))
++ 			continue;
++ 		if (map->sec_offset <= offset &&
++ 		    offset - map->sec_offset < map->def.value_size)
++ 			return map;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ /* Collect the reloc from ELF and populate the st_ops->progs[] */
++ static int bpf_object__collect_struct_ops_map_reloc(struct bpf_object *obj,
++ 						    GElf_Shdr *shdr,
++ 						    Elf_Data *data)
++ {
++ 	const struct btf_member *member;
++ 	struct bpf_struct_ops *st_ops;
++ 	struct bpf_program *prog;
++ 	unsigned int shdr_idx;
++ 	const struct btf *btf;
++ 	struct bpf_map *map;
++ 	Elf_Data *symbols;
++ 	unsigned int moff;
++ 	const char *name;
++ 	__u32 member_idx;
++ 	GElf_Sym sym;
++ 	GElf_Rel rel;
++ 	int i, nrels;
++ 
++ 	symbols = obj->efile.symbols;
++ 	btf = obj->btf;
++ 	nrels = shdr->sh_size / shdr->sh_entsize;
++ 	for (i = 0; i < nrels; i++) {
++ 		if (!gelf_getrel(data, i, &rel)) {
++ 			pr_warn("struct_ops reloc: failed to get %d reloc\n", i);
++ 			return -LIBBPF_ERRNO__FORMAT;
++ 		}
++ 
++ 		if (!gelf_getsym(symbols, GELF_R_SYM(rel.r_info), &sym)) {
++ 			pr_warn("struct_ops reloc: symbol %zx not found\n",
++ 				(size_t)GELF_R_SYM(rel.r_info));
++ 			return -LIBBPF_ERRNO__FORMAT;
++ 		}
++ 
++ 		name = elf_strptr(obj->efile.elf, obj->efile.strtabidx,
++ 				  sym.st_name) ? : "<?>";
++ 		map = find_struct_ops_map_by_offset(obj, rel.r_offset);
++ 		if (!map) {
++ 			pr_warn("struct_ops reloc: cannot find map at rel.r_offset %zu\n",
++ 				(size_t)rel.r_offset);
++ 			return -EINVAL;
++ 		}
++ 
++ 		moff = rel.r_offset - map->sec_offset;
++ 		shdr_idx = sym.st_shndx;
++ 		st_ops = map->st_ops;
++ 		pr_debug("struct_ops reloc %s: for %lld value %lld shdr_idx %u rel.r_offset %zu map->sec_offset %zu name %d (\'%s\')\n",
++ 			 map->name,
++ 			 (long long)(rel.r_info >> 32),
++ 			 (long long)sym.st_value,
++ 			 shdr_idx, (size_t)rel.r_offset,
++ 			 map->sec_offset, sym.st_name, name);
++ 
++ 		if (shdr_idx >= SHN_LORESERVE) {
++ 			pr_warn("struct_ops reloc %s: rel.r_offset %zu shdr_idx %u unsupported non-static function\n",
++ 				map->name, (size_t)rel.r_offset, shdr_idx);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 
++ 		member = find_member_by_offset(st_ops->type, moff * 8);
++ 		if (!member) {
++ 			pr_warn("struct_ops reloc %s: cannot find member at moff %u\n",
++ 				map->name, moff);
++ 			return -EINVAL;
++ 		}
++ 		member_idx = member - btf_members(st_ops->type);
++ 		name = btf__name_by_offset(btf, member->name_off);
++ 
++ 		if (!resolve_func_ptr(btf, member->type, NULL)) {
++ 			pr_warn("struct_ops reloc %s: cannot relocate non func ptr %s\n",
++ 				map->name, name);
++ 			return -EINVAL;
++ 		}
++ 
++ 		prog = bpf_object__find_prog_by_idx(obj, shdr_idx);
++ 		if (!prog) {
++ 			pr_warn("struct_ops reloc %s: cannot find prog at shdr_idx %u to relocate func ptr %s\n",
++ 				map->name, shdr_idx, name);
++ 			return -EINVAL;
++ 		}
++ 
++ 		if (prog->type == BPF_PROG_TYPE_UNSPEC) {
++ 			const struct bpf_sec_def *sec_def;
++ 
++ 			sec_def = find_sec_def(prog->section_name);
++ 			if (sec_def &&
++ 			    sec_def->prog_type != BPF_PROG_TYPE_STRUCT_OPS) {
++ 				/* for pr_warn */
++ 				prog->type = sec_def->prog_type;
++ 				goto invalid_prog;
++ 			}
++ 
++ 			prog->type = BPF_PROG_TYPE_STRUCT_OPS;
++ 			prog->attach_btf_id = st_ops->type_id;
++ 			prog->expected_attach_type = member_idx;
++ 		} else if (prog->type != BPF_PROG_TYPE_STRUCT_OPS ||
++ 			   prog->attach_btf_id != st_ops->type_id ||
++ 			   prog->expected_attach_type != member_idx) {
++ 			goto invalid_prog;
++ 		}
++ 		st_ops->progs[member_idx] = prog;
++ 	}
++ 
++ 	return 0;
++ 
++ invalid_prog:
++ 	pr_warn("struct_ops reloc %s: cannot use prog %s in sec %s with type %u attach_btf_id %u expected_attach_type %u for func ptr %s\n",
++ 		map->name, prog->name, prog->section_name, prog->type,
++ 		prog->attach_btf_id, prog->expected_attach_type, name);
++ 	return -EINVAL;
++ }
++ 
++ #define BTF_TRACE_PREFIX "btf_trace_"
++ #define BTF_MAX_NAME_SIZE 128
++ 
++ static int find_btf_by_prefix_kind(const struct btf *btf, const char *prefix,
++ 				   const char *name, __u32 kind)
++ {
++ 	char btf_type_name[BTF_MAX_NAME_SIZE];
++ 	int ret;
++ 
++ 	ret = snprintf(btf_type_name, sizeof(btf_type_name),
++ 		       "%s%s", prefix, name);
++ 	/* snprintf returns the number of characters written excluding the
++ 	 * the terminating null. So, if >= BTF_MAX_NAME_SIZE are written, it
++ 	 * indicates truncation.
++ 	 */
++ 	if (ret < 0 || ret >= sizeof(btf_type_name))
++ 		return -ENAMETOOLONG;
++ 	return btf__find_by_name_kind(btf, btf_type_name, kind);
++ }
++ 
++ static inline int __find_vmlinux_btf_id(struct btf *btf, const char *name,
++ 					enum bpf_attach_type attach_type)
++ {
++ 	int err;
++ 
++ 	if (attach_type == BPF_TRACE_RAW_TP)
++ 		err = find_btf_by_prefix_kind(btf, BTF_TRACE_PREFIX, name,
++ 					      BTF_KIND_TYPEDEF);
++ 	else
++ 		err = btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
++ 
++ 	if (err <= 0)
++ 		pr_warn("%s is not found in vmlinux BTF\n", name);
++ 
++ 	return err;
++ }
++ 
++ int libbpf_find_vmlinux_btf_id(const char *name,
++ 			       enum bpf_attach_type attach_type)
++ {
++ 	struct btf *btf;
++ 
++ 	btf = libbpf_find_kernel_btf();
++ 	if (IS_ERR(btf)) {
++ 		pr_warn("vmlinux BTF is not found\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return __find_vmlinux_btf_id(btf, name, attach_type);
++ }
++ 
++ static int libbpf_find_prog_btf_id(const char *name, __u32 attach_prog_fd)
++ {
++ 	struct bpf_prog_info_linear *info_linear;
++ 	struct bpf_prog_info *info;
++ 	struct btf *btf = NULL;
++ 	int err = -EINVAL;
++ 
++ 	info_linear = bpf_program__get_prog_info_linear(attach_prog_fd, 0);
++ 	if (IS_ERR_OR_NULL(info_linear)) {
++ 		pr_warn("failed get_prog_info_linear for FD %d\n",
++ 			attach_prog_fd);
++ 		return -EINVAL;
++ 	}
++ 	info = &info_linear->info;
++ 	if (!info->btf_id) {
++ 		pr_warn("The target program doesn't have BTF\n");
++ 		goto out;
++ 	}
++ 	if (btf__get_from_id(info->btf_id, &btf)) {
++ 		pr_warn("Failed to get BTF of the program\n");
++ 		goto out;
++ 	}
++ 	err = btf__find_by_name_kind(btf, name, BTF_KIND_FUNC);
++ 	btf__free(btf);
++ 	if (err <= 0) {
++ 		pr_warn("%s is not found in prog's BTF\n", name);
++ 		goto out;
++ 	}
++ out:
++ 	free(info_linear);
++ 	return err;
++ }
++ 
++ static int libbpf_find_attach_btf_id(struct bpf_program *prog)
++ {
++ 	enum bpf_attach_type attach_type = prog->expected_attach_type;
++ 	__u32 attach_prog_fd = prog->attach_prog_fd;
++ 	const char *name = prog->section_name;
++ 	int i, err;
++ 
++ 	if (!name)
++ 		return -EINVAL;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(section_defs); i++) {
++ 		if (!section_defs[i].is_attach_btf)
++ 			continue;
++ 		if (strncmp(name, section_defs[i].sec, section_defs[i].len))
++ 			continue;
++ 		if (attach_prog_fd)
++ 			err = libbpf_find_prog_btf_id(name + section_defs[i].len,
++ 						      attach_prog_fd);
++ 		else
++ 			err = __find_vmlinux_btf_id(prog->obj->btf_vmlinux,
++ 						    name + section_defs[i].len,
++ 						    attach_type);
++ 		return err;
++ 	}
++ 	pr_warn("failed to identify btf_id based on ELF section name '%s'\n", name);
++ 	return -ESRCH;
++ }
++ 
+++>>>>>>> ff26ce5cd768 (libbpf: Add support for dynamic program attach target)
+  int libbpf_attach_type_by_name(const char *name,
+  			       enum bpf_attach_type *attach_type)
+  {
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,7b014c8cdece..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -188,9 -197,46 +188,47 @@@ LIBBPF_0.0.4 
+  		bpf_map__get_pin_path;
+  		bpf_map__is_pinned;
+  		bpf_map__set_pin_path;
+ -		bpf_object__open_file;
+ -		bpf_object__open_mem;
+ -		bpf_program__attach_trace;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+ -		bpf_program__is_tracing;
+ -		bpf_program__set_tracing;
+ +		bpf_get_link_xdp_info;
+  		bpf_program__size;
+++<<<<<<< HEAD
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		btf__find_by_name_kind;
++ 		libbpf_find_vmlinux_btf_id;
++ } LIBBPF_0.0.5;
++ 
++ LIBBPF_0.0.7 {
++ 	global:
++ 		btf_dump__emit_type_decl;
++ 		bpf_link__disconnect;
++ 		bpf_map__attach_struct_ops;
++ 		bpf_map_delete_batch;
++ 		bpf_map_lookup_and_delete_batch;
++ 		bpf_map_lookup_batch;
++ 		bpf_map_update_batch;
++ 		bpf_object__find_program_by_name;
++ 		bpf_object__attach_skeleton;
++ 		bpf_object__destroy_skeleton;
++ 		bpf_object__detach_skeleton;
++ 		bpf_object__load_skeleton;
++ 		bpf_object__open_skeleton;
++ 		bpf_probe_large_insn_limit;
++ 		bpf_prog_attach_xattr;
++ 		bpf_program__attach;
++ 		bpf_program__name;
++ 		bpf_program__is_extension;
++ 		bpf_program__is_struct_ops;
++ 		bpf_program__set_extension;
++ 		bpf_program__set_struct_ops;
++ 		btf__align_of;
++ 		libbpf_find_kernel_btf;
++ } LIBBPF_0.0.6;
++ 
++ LIBBPF_0.0.8 {
++ 	global:
++ 		bpf_program__set_attach_target;
++ } LIBBPF_0.0.7;
+++>>>>>>> ff26ce5cd768 (libbpf: Add support for dynamic program attach target)
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index e454ceec9fa2..8dee50da84d7 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -308,6 +308,10 @@ LIBBPF_API void
+ bpf_program__set_expected_attach_type(struct bpf_program *prog,
+ 				      enum bpf_attach_type type);
+ 
++LIBBPF_API int
++bpf_program__set_attach_target(struct bpf_program *prog, int attach_prog_fd,
++			       const char *attach_func_name);
++
+ LIBBPF_API bool bpf_program__is_socket_filter(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_tracepoint(const struct bpf_program *prog);
+ LIBBPF_API bool bpf_program__is_raw_tracepoint(const struct bpf_program *prog);
+* Unmerged path tools/lib/bpf/libbpf.map
