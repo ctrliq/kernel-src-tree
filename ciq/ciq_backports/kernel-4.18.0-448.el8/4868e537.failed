@@ -1,0 +1,383 @@
+ceph: wait for the first reply of inflight async unlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Xiubo Li <xiubli@redhat.com>
+commit 4868e537fa867f82e38e37429d61d7bb8357d79b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4868e537.failed
+
+In async unlink case the kclient won't wait for the first reply
+from MDS and just drop all the links and unhash the dentry and then
+succeeds immediately.
+
+For any new create/link/rename,etc requests followed by using the
+same file names we must wait for the first reply of the inflight
+unlink request, or the MDS possibly will fail these following
+requests with -EEXIST if the inflight async unlink request was
+delayed for some reasons.
+
+And the worst case is that for the none async openc request it will
+successfully open the file if the CDentry hasn't been unlinked yet,
+but later the previous delayed async unlink request will remove the
+CDenty. That means the just created file is possiblly deleted later
+by accident.
+
+We need to wait for the inflight async unlink requests to finish
+when creating new files/directories by using the same file names.
+
+Link: https://tracker.ceph.com/issues/55332
+	Signed-off-by: Xiubo Li <xiubli@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 4868e537fa867f82e38e37429d61d7bb8357d79b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+#	fs/ceph/super.h
+diff --cc fs/ceph/file.c
+index 11352195bf50,0f3424dc618b..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -531,6 -569,10 +531,13 @@@ static void ceph_async_create_cb(struc
+  		char *path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
+  						  &base, 0);
+  
+++<<<<<<< HEAD
+++=======
++ 		pr_warn("async create failure path=(%llx)%s result=%d!\n",
++ 			base, IS_ERR(path) ? "<<bad>>" : path, result);
++ 		ceph_mdsc_free_path(path, pathlen);
++ 
+++>>>>>>> 4868e537fa86 (ceph: wait for the first reply of inflight async unlink)
+  		ceph_dir_clear_complete(req->r_parent);
+  		if (!d_unhashed(dentry))
+  			d_drop(dentry);
+diff --cc fs/ceph/super.h
+index e363a1bbd4c8,59469253592b..000000000000
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@@ -17,6 -17,9 +17,12 @@@
+  #include <linux/posix_acl.h>
+  #include <linux/refcount.h>
+  #include <linux/security.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/netfs.h>
++ #include <linux/fscache.h>
++ #include <linux/hashtable.h>
+++>>>>>>> 4868e537fa86 (ceph: wait for the first reply of inflight async unlink)
+  
+  #include <linux/ceph/libceph.h>
+  
+@@@ -98,8 -97,11 +104,10 @@@ struct ceph_mount_options 
+  	char *mds_namespace;  /* default NULL */
+  	char *server_path;    /* default NULL (means "/") */
+  	char *fscache_uniq;   /* default NULL */
+ -	char *mon_addr;
+  };
+  
++ #define CEPH_ASYNC_CREATE_CONFLICT_BITS 8
++ 
+  struct ceph_fs_client {
+  	struct super_block *sb;
+  
+diff --git a/fs/ceph/dir.c b/fs/ceph/dir.c
+index fbcf2ca4c874..2e1d98cb8607 100644
+--- a/fs/ceph/dir.c
++++ b/fs/ceph/dir.c
+@@ -847,6 +847,10 @@ static int ceph_mknod(struct inode *dir, struct dentry *dentry,
+ 	if (ceph_snap(dir) != CEPH_NOSNAP)
+ 		return -EROFS;
+ 
++	err = ceph_wait_on_conflict_unlink(dentry);
++	if (err)
++		return err;
++
+ 	if (ceph_quota_is_max_files_exceeded(dir)) {
+ 		err = -EDQUOT;
+ 		goto out;
+@@ -909,6 +913,10 @@ static int ceph_symlink(struct inode *dir, struct dentry *dentry,
+ 	if (ceph_snap(dir) != CEPH_NOSNAP)
+ 		return -EROFS;
+ 
++	err = ceph_wait_on_conflict_unlink(dentry);
++	if (err)
++		return err;
++
+ 	if (ceph_quota_is_max_files_exceeded(dir)) {
+ 		err = -EDQUOT;
+ 		goto out;
+@@ -958,9 +966,13 @@ static int ceph_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 	struct ceph_mds_client *mdsc = ceph_sb_to_mdsc(dir->i_sb);
+ 	struct ceph_mds_request *req;
+ 	struct ceph_acl_sec_ctx as_ctx = {};
+-	int err = -EROFS;
++	int err;
+ 	int op;
+ 
++	err = ceph_wait_on_conflict_unlink(dentry);
++	if (err)
++		return err;
++
+ 	if (ceph_snap(dir) == CEPH_SNAPDIR) {
+ 		/* mkdir .snap/foo is a MKSNAP */
+ 		op = CEPH_MDS_OP_MKSNAP;
+@@ -970,6 +982,7 @@ static int ceph_mkdir(struct inode *dir, struct dentry *dentry, umode_t mode)
+ 		dout("mkdir dir %p dn %p mode 0%ho\n", dir, dentry, mode);
+ 		op = CEPH_MDS_OP_MKDIR;
+ 	} else {
++		err = -EROFS;
+ 		goto out;
+ 	}
+ 
+@@ -1027,6 +1040,10 @@ static int ceph_link(struct dentry *old_dentry, struct inode *dir,
+ 	struct ceph_mds_request *req;
+ 	int err;
+ 
++	err = ceph_wait_on_conflict_unlink(dentry);
++	if (err)
++		return err;
++
+ 	if (ceph_snap(dir) != CEPH_NOSNAP)
+ 		return -EROFS;
+ 
+@@ -1061,9 +1078,27 @@ static int ceph_link(struct dentry *old_dentry, struct inode *dir,
+ static void ceph_async_unlink_cb(struct ceph_mds_client *mdsc,
+ 				 struct ceph_mds_request *req)
+ {
++	struct dentry *dentry = req->r_dentry;
++	struct ceph_fs_client *fsc = ceph_sb_to_client(dentry->d_sb);
++	struct ceph_dentry_info *di = ceph_dentry(dentry);
+ 	int result = req->r_err ? req->r_err :
+ 			le32_to_cpu(req->r_reply_info.head->result);
+ 
++	if (!test_bit(CEPH_DENTRY_ASYNC_UNLINK_BIT, &di->flags))
++		pr_warn("%s dentry %p:%pd async unlink bit is not set\n",
++			__func__, dentry, dentry);
++
++	spin_lock(&fsc->async_unlink_conflict_lock);
++	hash_del_rcu(&di->hnode);
++	spin_unlock(&fsc->async_unlink_conflict_lock);
++
++	spin_lock(&dentry->d_lock);
++	di->flags &= ~CEPH_DENTRY_ASYNC_UNLINK;
++	wake_up_bit(&di->flags, CEPH_DENTRY_ASYNC_UNLINK_BIT);
++	spin_unlock(&dentry->d_lock);
++
++	synchronize_rcu();
++
+ 	if (result == -EJUKEBOX)
+ 		goto out;
+ 
+@@ -1071,7 +1106,7 @@ static void ceph_async_unlink_cb(struct ceph_mds_client *mdsc,
+ 	if (result) {
+ 		int pathlen = 0;
+ 		u64 base = 0;
+-		char *path = ceph_mdsc_build_path(req->r_dentry, &pathlen,
++		char *path = ceph_mdsc_build_path(dentry, &pathlen,
+ 						  &base, 0);
+ 
+ 		/* mark error on parent + clear complete */
+@@ -1079,13 +1114,13 @@ static void ceph_async_unlink_cb(struct ceph_mds_client *mdsc,
+ 		ceph_dir_clear_complete(req->r_parent);
+ 
+ 		/* drop the dentry -- we don't know its status */
+-		if (!d_unhashed(req->r_dentry))
+-			d_drop(req->r_dentry);
++		if (!d_unhashed(dentry))
++			d_drop(dentry);
+ 
+ 		/* mark inode itself for an error (since metadata is bogus) */
+ 		mapping_set_error(req->r_old_inode->i_mapping, result);
+ 
+-		pr_warn("ceph: async unlink failure path=(%llx)%s result=%d!\n",
++		pr_warn("async unlink failure path=(%llx)%s result=%d!\n",
+ 			base, IS_ERR(path) ? "<<bad>>" : path, result);
+ 		ceph_mdsc_free_path(path, pathlen);
+ 	}
+@@ -1170,6 +1205,8 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 
+ 	if (try_async && op == CEPH_MDS_OP_UNLINK &&
+ 	    (req->r_dir_caps = get_caps_for_async_unlink(dir, dentry))) {
++		struct ceph_dentry_info *di = ceph_dentry(dentry);
++
+ 		dout("async unlink on %llu/%.*s caps=%s", ceph_ino(dir),
+ 		     dentry->d_name.len, dentry->d_name.name,
+ 		     ceph_cap_string(req->r_dir_caps));
+@@ -1177,6 +1214,16 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 		req->r_callback = ceph_async_unlink_cb;
+ 		req->r_old_inode = d_inode(dentry);
+ 		ihold(req->r_old_inode);
++
++		spin_lock(&dentry->d_lock);
++		di->flags |= CEPH_DENTRY_ASYNC_UNLINK;
++		spin_unlock(&dentry->d_lock);
++
++		spin_lock(&fsc->async_unlink_conflict_lock);
++		hash_add_rcu(fsc->async_unlink_conflict, &di->hnode,
++			     dentry->d_name.hash);
++		spin_unlock(&fsc->async_unlink_conflict_lock);
++
+ 		err = ceph_mdsc_submit_request(mdsc, dir, req);
+ 		if (!err) {
+ 			/*
+@@ -1185,10 +1232,20 @@ static int ceph_unlink(struct inode *dir, struct dentry *dentry)
+ 			 */
+ 			drop_nlink(inode);
+ 			d_delete(dentry);
+-		} else if (err == -EJUKEBOX) {
+-			try_async = false;
+-			ceph_mdsc_put_request(req);
+-			goto retry;
++		} else {
++			spin_lock(&fsc->async_unlink_conflict_lock);
++			hash_del_rcu(&di->hnode);
++			spin_unlock(&fsc->async_unlink_conflict_lock);
++
++			spin_lock(&dentry->d_lock);
++			di->flags &= ~CEPH_DENTRY_ASYNC_UNLINK;
++			spin_unlock(&dentry->d_lock);
++
++			if (err == -EJUKEBOX) {
++				try_async = false;
++				ceph_mdsc_put_request(req);
++				goto retry;
++			}
+ 		}
+ 	} else {
+ 		set_bit(CEPH_MDS_R_PARENT_LOCKED, &req->r_req_flags);
+@@ -1227,6 +1284,10 @@ static int ceph_rename(struct inode *old_dir, struct dentry *old_dentry,
+ 	    (!ceph_quota_is_same_realm(old_dir, new_dir)))
+ 		return -EXDEV;
+ 
++	err = ceph_wait_on_conflict_unlink(new_dentry);
++	if (err)
++		return err;
++
+ 	dout("rename dir %p dentry %p to dir %p dentry %p\n",
+ 	     old_dir, old_dentry, new_dir, new_dentry);
+ 	req = ceph_mdsc_create_request(mdsc, op, USE_AUTH_MDS);
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/mds_client.c b/fs/ceph/mds_client.c
+index 051da0178045..9b43904a2d97 100644
+--- a/fs/ceph/mds_client.c
++++ b/fs/ceph/mds_client.c
+@@ -456,7 +456,7 @@ static int ceph_parse_deleg_inos(void **p, void *end,
+ 				dout("added delegated inode 0x%llx\n",
+ 				     start - 1);
+ 			} else if (err == -EBUSY) {
+-				pr_warn("ceph: MDS delegated inode 0x%llx more than once.\n",
++				pr_warn("MDS delegated inode 0x%llx more than once.\n",
+ 					start - 1);
+ 			} else {
+ 				return err;
+@@ -631,6 +631,79 @@ static void destroy_reply_info(struct ceph_mds_reply_info_parsed *info)
+ 	free_pages((unsigned long)info->dir_entries, get_order(info->dir_buf_size));
+ }
+ 
++/*
++ * In async unlink case the kclient won't wait for the first reply
++ * from MDS and just drop all the links and unhash the dentry and then
++ * succeeds immediately.
++ *
++ * For any new create/link/rename,etc requests followed by using the
++ * same file names we must wait for the first reply of the inflight
++ * unlink request, or the MDS possibly will fail these following
++ * requests with -EEXIST if the inflight async unlink request was
++ * delayed for some reasons.
++ *
++ * And the worst case is that for the none async openc request it will
++ * successfully open the file if the CDentry hasn't been unlinked yet,
++ * but later the previous delayed async unlink request will remove the
++ * CDenty. That means the just created file is possiblly deleted later
++ * by accident.
++ *
++ * We need to wait for the inflight async unlink requests to finish
++ * when creating new files/directories by using the same file names.
++ */
++int ceph_wait_on_conflict_unlink(struct dentry *dentry)
++{
++	struct ceph_fs_client *fsc = ceph_sb_to_client(dentry->d_sb);
++	struct dentry *pdentry = dentry->d_parent;
++	struct dentry *udentry, *found = NULL;
++	struct ceph_dentry_info *di;
++	struct qstr dname;
++	u32 hash = dentry->d_name.hash;
++	int err;
++
++	dname.name = dentry->d_name.name;
++	dname.len = dentry->d_name.len;
++
++	rcu_read_lock();
++	hash_for_each_possible_rcu(fsc->async_unlink_conflict, di,
++				   hnode, hash) {
++		udentry = di->dentry;
++
++		spin_lock(&udentry->d_lock);
++		if (udentry->d_name.hash != hash)
++			goto next;
++		if (unlikely(udentry->d_parent != pdentry))
++			goto next;
++		if (!hash_hashed(&di->hnode))
++			goto next;
++
++		if (!test_bit(CEPH_DENTRY_ASYNC_UNLINK_BIT, &di->flags))
++			pr_warn("%s dentry %p:%pd async unlink bit is not set\n",
++				__func__, dentry, dentry);
++
++		if (!d_same_name(udentry, pdentry, &dname))
++			goto next;
++
++		spin_unlock(&udentry->d_lock);
++		found = dget(udentry);
++		break;
++next:
++		spin_unlock(&udentry->d_lock);
++	}
++	rcu_read_unlock();
++
++	if (likely(!found))
++		return 0;
++
++	dout("%s dentry %p:%pd conflict with old %p:%pd\n", __func__,
++	     dentry, dentry, found, found);
++
++	err = wait_on_bit(&di->flags, CEPH_DENTRY_ASYNC_UNLINK_BIT,
++			  TASK_KILLABLE);
++	dput(found);
++	return err;
++}
++
+ 
+ /*
+  * sessions
+diff --git a/fs/ceph/mds_client.h b/fs/ceph/mds_client.h
+index 97c7f7bfa55f..b965b65c26e4 100644
+--- a/fs/ceph/mds_client.h
++++ b/fs/ceph/mds_client.h
+@@ -575,6 +575,7 @@ static inline int ceph_wait_on_async_create(struct inode *inode)
+ 			   TASK_INTERRUPTIBLE);
+ }
+ 
++extern int ceph_wait_on_conflict_unlink(struct dentry *dentry);
+ extern u64 ceph_get_deleg_ino(struct ceph_mds_session *session);
+ extern int ceph_restore_deleg_ino(struct ceph_mds_session *session, u64 ino);
+ #endif
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index 812c0fe37372..1d2aa99a86e6 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -748,6 +748,9 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
+ 	if (!fsc->cap_wq)
+ 		goto fail_inode_wq;
+ 
++	hash_init(fsc->async_unlink_conflict);
++	spin_lock_init(&fsc->async_unlink_conflict_lock);
++
+ 	spin_lock(&ceph_fsc_lock);
+ 	list_add_tail(&fsc->metric_wakeup, &ceph_fsc_list);
+ 	spin_unlock(&ceph_fsc_lock);
+* Unmerged path fs/ceph/super.h
