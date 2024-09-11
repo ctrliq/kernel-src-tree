@@ -507,6 +507,9 @@ nfsd3_proc_readdir(struct svc_rqst *rqstp)
 		resp->offset = NULL;
 	}
 
+	/* Recycle only pages that were part of the reply */
+	rqstp->rq_next_page = resp->xdr.page_ptr + 1;
+
 	return rpc_success;
 }
 
@@ -571,6 +574,9 @@ nfsd3_proc_readdirplus(struct svc_rqst *rqstp)
 		}
 		resp->offset = NULL;
 	}
+
+	/* Recycle only pages that were part of the reply */
+	rqstp->rq_next_page = resp->xdr.page_ptr + 1;
 
 out:
 	return rpc_success;
