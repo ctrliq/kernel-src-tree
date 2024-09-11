@@ -1,0 +1,172 @@
+KVM: x86: use kvm_complete_insn_gp in emulating RDMSR/WRMSR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 8b474427cbeea05850fb32da65cc95eebcbad089
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8b474427.failed
+
+Simplify the four functions that handle {kernel,user} {rd,wr}msr, there
+is still some repetition between the two instances of rdmsr but the
+whole business of calling kvm_inject_gp and kvm_skip_emulated_instruction
+can be unified nicely.
+
+Because complete_emulated_wrmsr now becomes essentially a call to
+kvm_complete_insn_gp, remove complete_emulated_msr.
+
+	Reviewed-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8b474427cbeea05850fb32da65cc95eebcbad089)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 730d1d266de6,5c5a6aa8696d..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1591,22 -1634,92 +1591,98 @@@ int kvm_set_msr(struct kvm_vcpu *vcpu, 
+  }
+  EXPORT_SYMBOL_GPL(kvm_set_msr);
+  
+++<<<<<<< HEAD
+++=======
++ static int complete_emulated_rdmsr(struct kvm_vcpu *vcpu)
++ {
++ 	int err = vcpu->run->msr.error;
++ 	if (!err) {
++ 		kvm_rax_write(vcpu, (u32)vcpu->run->msr.data);
++ 		kvm_rdx_write(vcpu, vcpu->run->msr.data >> 32);
++ 	}
++ 
++ 	return kvm_complete_insn_gp(vcpu, err);
++ }
++ 
++ static int complete_emulated_wrmsr(struct kvm_vcpu *vcpu)
++ {
++ 	return kvm_complete_insn_gp(vcpu, vcpu->run->msr.error);
++ }
++ 
++ static u64 kvm_msr_reason(int r)
++ {
++ 	switch (r) {
++ 	case KVM_MSR_RET_INVALID:
++ 		return KVM_MSR_EXIT_REASON_UNKNOWN;
++ 	case KVM_MSR_RET_FILTERED:
++ 		return KVM_MSR_EXIT_REASON_FILTER;
++ 	default:
++ 		return KVM_MSR_EXIT_REASON_INVAL;
++ 	}
++ }
++ 
++ static int kvm_msr_user_space(struct kvm_vcpu *vcpu, u32 index,
++ 			      u32 exit_reason, u64 data,
++ 			      int (*completion)(struct kvm_vcpu *vcpu),
++ 			      int r)
++ {
++ 	u64 msr_reason = kvm_msr_reason(r);
++ 
++ 	/* Check if the user wanted to know about this MSR fault */
++ 	if (!(vcpu->kvm->arch.user_space_msr_mask & msr_reason))
++ 		return 0;
++ 
++ 	vcpu->run->exit_reason = exit_reason;
++ 	vcpu->run->msr.error = 0;
++ 	memset(vcpu->run->msr.pad, 0, sizeof(vcpu->run->msr.pad));
++ 	vcpu->run->msr.reason = msr_reason;
++ 	vcpu->run->msr.index = index;
++ 	vcpu->run->msr.data = data;
++ 	vcpu->arch.complete_userspace_io = completion;
++ 
++ 	return 1;
++ }
++ 
++ static int kvm_get_msr_user_space(struct kvm_vcpu *vcpu, u32 index, int r)
++ {
++ 	return kvm_msr_user_space(vcpu, index, KVM_EXIT_X86_RDMSR, 0,
++ 				   complete_emulated_rdmsr, r);
++ }
++ 
++ static int kvm_set_msr_user_space(struct kvm_vcpu *vcpu, u32 index, u64 data, int r)
++ {
++ 	return kvm_msr_user_space(vcpu, index, KVM_EXIT_X86_WRMSR, data,
++ 				   complete_emulated_wrmsr, r);
++ }
++ 
+++>>>>>>> 8b474427cbee (KVM: x86: use kvm_complete_insn_gp in emulating RDMSR/WRMSR)
+  int kvm_emulate_rdmsr(struct kvm_vcpu *vcpu)
+  {
+  	u32 ecx = kvm_rcx_read(vcpu);
+  	u64 data;
+ -	int r;
+  
+++<<<<<<< HEAD
+ +	if (kvm_get_msr(vcpu, ecx, &data)) {
+- 		trace_kvm_msr_read_ex(ecx);
+- 		kvm_inject_gp(vcpu, 0);
+- 		return 1;
+++=======
++ 	r = kvm_get_msr(vcpu, ecx, &data);
++ 
++ 	/* MSR read failed? See if we should ask user space */
++ 	if (r && kvm_get_msr_user_space(vcpu, ecx, r)) {
++ 		/* Bounce to user space */
++ 		return 0;
+  	}
+  
+- 	trace_kvm_msr_read(ecx, data);
++ 	if (!r) {
++ 		trace_kvm_msr_read(ecx, data);
++ 
++ 		kvm_rax_write(vcpu, data & -1u);
++ 		kvm_rdx_write(vcpu, (data >> 32) & -1u);
++ 	} else {
+++>>>>>>> 8b474427cbee (KVM: x86: use kvm_complete_insn_gp in emulating RDMSR/WRMSR)
++ 		trace_kvm_msr_read_ex(ecx);
++ 	}
+  
+- 	kvm_rax_write(vcpu, data & -1u);
+- 	kvm_rdx_write(vcpu, (data >> 32) & -1u);
+- 	return kvm_skip_emulated_instruction(vcpu);
++ 	return kvm_complete_insn_gp(vcpu, r);
+  }
+  EXPORT_SYMBOL_GPL(kvm_emulate_rdmsr);
+  
+@@@ -1614,15 -1727,25 +1690,28 @@@ int kvm_emulate_wrmsr(struct kvm_vcpu *
+  {
+  	u32 ecx = kvm_rcx_read(vcpu);
+  	u64 data = kvm_read_edx_eax(vcpu);
+ -	int r;
+  
+++<<<<<<< HEAD
+ +	if (kvm_set_msr(vcpu, ecx, data)) {
+++=======
++ 	r = kvm_set_msr(vcpu, ecx, data);
++ 
++ 	/* MSR write failed? See if we should ask user space */
++ 	if (r && kvm_set_msr_user_space(vcpu, ecx, data, r))
++ 		/* Bounce to user space */
++ 		return 0;
++ 
++ 	/* Signal all other negative errors to userspace */
++ 	if (r < 0)
++ 		return r;
++ 
++ 	if (!r)
++ 		trace_kvm_msr_write(ecx, data);
++ 	else
+++>>>>>>> 8b474427cbee (KVM: x86: use kvm_complete_insn_gp in emulating RDMSR/WRMSR)
+  		trace_kvm_msr_write_ex(ecx, data);
+- 		kvm_inject_gp(vcpu, 0);
+- 		return 1;
+- 	}
+  
+- 	trace_kvm_msr_write(ecx, data);
+- 	return kvm_skip_emulated_instruction(vcpu);
++ 	return kvm_complete_insn_gp(vcpu, r);
+  }
+  EXPORT_SYMBOL_GPL(kvm_emulate_wrmsr);
+  
+* Unmerged path arch/x86/kvm/x86.c
