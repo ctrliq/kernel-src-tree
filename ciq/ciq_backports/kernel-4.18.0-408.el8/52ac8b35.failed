@@ -1,0 +1,261 @@
+KVM: Block memslot updates across range_start() and range_end()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 52ac8b358b0cb7e91c966225fca61be5d1c984bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/52ac8b35.failed
+
+We would like to avoid taking mmu_lock for .invalidate_range_{start,end}()
+notifications that are unrelated to KVM.  Because mmu_notifier_count
+must be modified while holding mmu_lock for write, and must always
+be paired across start->end to stay balanced, lock elision must
+happen in both or none.  Therefore, in preparation for this change,
+this patch prevents memslot updates across range_start() and range_end().
+
+Note, technically flag-only memslot updates could be allowed in parallel,
+but stalling a memslot update for a relatively short amount of time is
+not a scalability issue, and this is all more than complex enough.
+
+A long note on the locking: a previous version of the patch used an rwsem
+to block the memslot update while the MMU notifier run, but this resulted
+in the following deadlock involving the pseudo-lock tagged as
+"mmu_notifier_invalidate_range_start".
+
+   ======================================================
+   WARNING: possible circular locking dependency detected
+   5.12.0-rc3+ #6 Tainted: G           OE
+   ------------------------------------------------------
+   qemu-system-x86/3069 is trying to acquire lock:
+   ffffffff9c775ca0 (mmu_notifier_invalidate_range_start){+.+.}-{0:0}, at: __mmu_notifier_invalidate_range_end+0x5/0x190
+
+   but task is already holding lock:
+   ffffaff7410a9160 (&kvm->mmu_notifier_slots_lock){.+.+}-{3:3}, at: kvm_mmu_notifier_invalidate_range_start+0x36d/0x4f0 [kvm]
+
+   which lock already depends on the new lock.
+
+This corresponds to the following MMU notifier logic:
+
+    invalidate_range_start
+      take pseudo lock
+      down_read()           (*)
+      release pseudo lock
+    invalidate_range_end
+      take pseudo lock      (**)
+      up_read()
+      release pseudo lock
+
+At point (*) we take the mmu_notifiers_slots_lock inside the pseudo lock;
+at point (**) we take the pseudo lock inside the mmu_notifiers_slots_lock.
+
+This could cause a deadlock (ignoring for a second that the pseudo lock
+is not a lock):
+
+- invalidate_range_start waits on down_read(), because the rwsem is
+held by install_new_memslots
+
+- install_new_memslots waits on down_write(), because the rwsem is
+held till (another) invalidate_range_end finishes
+
+- invalidate_range_end sits waits on the pseudo lock, held by
+invalidate_range_start.
+
+Removing the fairness of the rwsem breaks the cycle (in lockdep terms,
+it would change the *shared* rwsem readers into *shared recursive*
+readers), so open-code the wait using a readers count and a
+spinlock.  This also allows handling blockable and non-blockable
+critical section in the same way.
+
+Losing the rwsem fairness does theoretically allow MMU notifiers to
+block install_new_memslots forever.  Note that mm/mmu_notifier.c's own
+retry scheme in mmu_interval_read_begin also uses wait/wake_up
+and is likewise not fair.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 52ac8b358b0cb7e91c966225fca61be5d1c984bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,8f9024d65866..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -493,35 -604,16 +493,33 @@@ static void kvm_mmu_notifier_change_pte
+  	trace_kvm_set_spte_hva(address);
+  
+  	/*
+- 	 * .change_pte() must be surrounded by .invalidate_range_{start,end}(),
+- 	 * and so always runs with an elevated notifier count.  This obviates
+- 	 * the need to bump the sequence count.
++ 	 * .change_pte() must be surrounded by .invalidate_range_{start,end}().
+  	 */
+- 	WARN_ON_ONCE(!kvm->mmu_notifier_count);
++ 	WARN_ON_ONCE(!READ_ONCE(kvm->mn_active_invalidate_count));
+  
+ -	kvm_handle_hva_range(mn, address, address + 1, pte, kvm_set_spte_gfn);
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +
+ +	KVM_MMU_LOCK(kvm);
+ +
+ +	if (kvm_set_spte_hva(kvm, address, pte))
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+ -static void kvm_inc_notifier_count(struct kvm *kvm, unsigned long start,
+ -				   unsigned long end)
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+  {
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int need_tlb_flush = 0, idx;
+ +
+ +	trace_kvm_unmap_hva_range(range->start, range->end);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+  	/*
+  	 * The count increase must become visible at unlock time as no
+  	 * spte can be established without taking the mmu_lock and
+@@@ -546,23 -638,44 +544,48 @@@
+  		kvm->mmu_notifier_range_end =
+  			max(kvm->mmu_notifier_range_end, end);
+  	}
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+ +	/* we've to flush the tlb before the pages can be freed */
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+ -static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ -					const struct mmu_notifier_range *range)
+ +static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long end)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ -	const struct kvm_hva_range hva_range = {
+ -		.start		= range->start,
+ -		.end		= range->end,
+ -		.pte		= __pte(0),
+ -		.handler	= kvm_unmap_gfn_range,
+ -		.on_lock	= kvm_inc_notifier_count,
+ -		.flush_on_ret	= true,
+ -		.may_block	= mmu_notifier_range_blockable(range),
+ -	};
+  
+++<<<<<<< HEAD
+ +	KVM_MMU_LOCK(kvm);
+++=======
++ 	trace_kvm_unmap_hva_range(range->start, range->end);
++ 
++ 	/*
++ 	 * Prevent memslot modification between range_start() and range_end()
++ 	 * so that conditionally locking provides the same result in both
++ 	 * functions.  Without that guarantee, the mmu_notifier_count
++ 	 * adjustments will be imbalanced.
++ 	 *
++ 	 * Pairs with the decrement in range_end().
++ 	 */
++ 	spin_lock(&kvm->mn_invalidate_lock);
++ 	kvm->mn_active_invalidate_count++;
++ 	spin_unlock(&kvm->mn_invalidate_lock);
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	return 0;
++ }
++ 
++ static void kvm_dec_notifier_count(struct kvm *kvm, unsigned long start,
++ 				   unsigned long end)
++ {
+++>>>>>>> 52ac8b358b0c (KVM: Block memslot updates across range_start() and range_end())
+  	/*
+  	 * This sequence increase will notify the kvm page fault that
+  	 * the page that is going to be mapped in the spte could have
+@@@ -576,7 -689,36 +599,40 @@@
+  	 * in conjunction with the smp_rmb in mmu_notifier_retry().
+  	 */
+  	kvm->mmu_notifier_count--;
+++<<<<<<< HEAD
+ +	KVM_MMU_UNLOCK(kvm);
+++=======
++ }
++ 
++ static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= (void *)kvm_null_fn,
++ 		.on_lock	= kvm_dec_notifier_count,
++ 		.flush_on_ret	= false,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
++ 	bool wake;
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
+++>>>>>>> 52ac8b358b0c (KVM: Block memslot updates across range_start() and range_end())
++ 
++ 	/* Pairs with the increment in range_start(). */
++ 	spin_lock(&kvm->mn_invalidate_lock);
++ 	wake = (--kvm->mn_active_invalidate_count == 0);
++ 	spin_unlock(&kvm->mn_invalidate_lock);
++ 
++ 	/*
++ 	 * There can only be one waiter, since the wait happens under
++ 	 * slots_lock.
++ 	 */
++ 	if (wake)
++ 		rcuwait_wake_up(&kvm->mn_memslots_update_rcuwait);
+  
+  	BUG_ON(kvm->mmu_notifier_count < 0);
+  }
+diff --git a/Documentation/virt/kvm/locking.rst b/Documentation/virt/kvm/locking.rst
+index 35eca377543d..8138201efb09 100644
+--- a/Documentation/virt/kvm/locking.rst
++++ b/Documentation/virt/kvm/locking.rst
+@@ -21,6 +21,12 @@ The acquisition orders for mutexes are as follows:
+   can be taken inside a kvm->srcu read-side critical section,
+   while kvm->slots_lock cannot.
+ 
++- kvm->mn_active_invalidate_count ensures that pairs of
++  invalidate_range_start() and invalidate_range_end() callbacks
++  use the same memslots array.  kvm->slots_lock and kvm->slots_arch_lock
++  are taken on the waiting side in install_new_memslots, so MMU notifiers
++  must not take either kvm->slots_lock or kvm->slots_arch_lock.
++
+ On x86:
+ 
+ - vcpu->mutex is taken outside kvm->arch.hyperv.hv_lock
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 20157fe0daad..898ebee95447 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -507,6 +507,11 @@ struct kvm {
+ 	struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
+ 	struct kvm_vcpu *vcpus[KVM_MAX_VCPUS];
+ 
++	/* Used to wait for completion of MMU notifiers.  */
++	spinlock_t mn_invalidate_lock;
++	unsigned long mn_active_invalidate_count;
++	struct rcuwait mn_memslots_update_rcuwait;
++
+ 	/*
+ 	 * created_vcpus is protected by kvm->lock, and is incremented
+ 	 * at the beginning of KVM_CREATE_VCPU.  online_vcpus is only
+* Unmerged path virt/kvm/kvm_main.c
