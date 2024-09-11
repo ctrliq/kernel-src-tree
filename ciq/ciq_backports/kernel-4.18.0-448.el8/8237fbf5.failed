@@ -1,0 +1,214 @@
+xfs: clean up and simplify xfs_dialloc()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Dave Chinner <dchinner@redhat.com>
+commit 8237fbf53d6fd2a3a248fc2a8608e047ef22316c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/8237fbf5.failed
+
+Because it's a mess.
+
+	Signed-off-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+
+(cherry picked from commit 8237fbf53d6fd2a3a248fc2a8608e047ef22316c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_ialloc.c
+diff --cc fs/xfs/libxfs/xfs_ialloc.c
+index 1e69b4d32727,63a1b6d422cc..000000000000
+--- a/fs/xfs/libxfs/xfs_ialloc.c
++++ b/fs/xfs/libxfs/xfs_ialloc.c
+@@@ -1590,36 -1594,153 +1594,154 @@@ xfs_ialloc_next_ag
+  	return agno;
+  }
+  
++ static bool
++ xfs_dialloc_good_ag(
++ 	struct xfs_trans	*tp,
++ 	struct xfs_perag	*pag,
++ 	umode_t			mode,
++ 	int			flags,
++ 	bool			ok_alloc)
++ {
++ 	struct xfs_mount	*mp = tp->t_mountp;
++ 	xfs_extlen_t		ineed;
++ 	xfs_extlen_t		longest = 0;
++ 	int			needspace;
++ 	int			error;
++ 
++ 	if (!pag->pagi_inodeok)
++ 		return false;
++ 
++ 	if (!pag->pagi_init) {
++ 		error = xfs_ialloc_pagi_init(mp, tp, pag->pag_agno);
++ 		if (error)
++ 			return false;
++ 	}
++ 
++ 	if (pag->pagi_freecount)
++ 		return true;
++ 	if (!ok_alloc)
++ 		return false;
++ 
++ 	if (!pag->pagf_init) {
++ 		error = xfs_alloc_pagf_init(mp, tp, pag->pag_agno, flags);
++ 		if (error)
++ 			return false;
++ 	}
++ 
++ 	/*
++ 	 * Check that there is enough free space for the file plus a chunk of
++ 	 * inodes if we need to allocate some. If this is the first pass across
++ 	 * the AGs, take into account the potential space needed for alignment
++ 	 * of inode chunks when checking the longest contiguous free space in
++ 	 * the AG - this prevents us from getting ENOSPC because we have free
++ 	 * space larger than ialloc_blks but alignment constraints prevent us
++ 	 * from using it.
++ 	 *
++ 	 * If we can't find an AG with space for full alignment slack to be
++ 	 * taken into account, we must be near ENOSPC in all AGs.  Hence we
++ 	 * don't include alignment for the second pass and so if we fail
++ 	 * allocation due to alignment issues then it is most likely a real
++ 	 * ENOSPC condition.
++ 	 *
++ 	 * XXX(dgc): this calculation is now bogus thanks to the per-ag
++ 	 * reservations that xfs_alloc_fix_freelist() now does via
++ 	 * xfs_alloc_space_available(). When the AG fills up, pagf_freeblks will
++ 	 * be more than large enough for the check below to succeed, but
++ 	 * xfs_alloc_space_available() will fail because of the non-zero
++ 	 * metadata reservation and hence we won't actually be able to allocate
++ 	 * more inodes in this AG. We do soooo much unnecessary work near ENOSPC
++ 	 * because of this.
++ 	 */
++ 	ineed = M_IGEO(mp)->ialloc_min_blks;
++ 	if (flags && ineed > 1)
++ 		ineed += M_IGEO(mp)->cluster_align;
++ 	longest = pag->pagf_longest;
++ 	if (!longest)
++ 		longest = pag->pagf_flcount > 0;
++ 	needspace = S_ISDIR(mode) || S_ISREG(mode) || S_ISLNK(mode);
++ 
++ 	if (pag->pagf_freeblks < needspace + ineed || longest < ineed)
++ 		return false;
++ 	return true;
++ }
++ 
++ static int
++ xfs_dialloc_try_ag(
++ 	struct xfs_trans	**tpp,
++ 	struct xfs_perag	*pag,
++ 	xfs_ino_t		parent,
++ 	xfs_ino_t		*new_ino,
++ 	bool			ok_alloc)
++ {
++ 	struct xfs_buf		*agbp;
++ 	xfs_ino_t		ino;
++ 	int			error;
++ 
++ 	/*
++ 	 * Then read in the AGI buffer and recheck with the AGI buffer
++ 	 * lock held.
++ 	 */
++ 	error = xfs_ialloc_read_agi(pag->pag_mount, *tpp, pag->pag_agno, &agbp);
++ 	if (error)
++ 		return error;
++ 
++ 	if (!pag->pagi_freecount) {
++ 		if (!ok_alloc) {
++ 			error = -EAGAIN;
++ 			goto out_release;
++ 		}
++ 
++ 		error = xfs_ialloc_ag_alloc(*tpp, agbp, pag);
++ 		if (error < 0)
++ 			goto out_release;
++ 
++ 		/*
++ 		 * We successfully allocated space for an inode cluster in this
++ 		 * AG.  Roll the transaction so that we can allocate one of the
++ 		 * new inodes.
++ 		 */
++ 		ASSERT(pag->pagi_freecount > 0);
++ 		error = xfs_dialloc_roll(tpp, agbp);
++ 		if (error)
++ 			goto out_release;
++ 	}
++ 
++ 	/* Allocate an inode in the found AG */
++ 	error = xfs_dialloc_ag(*tpp, agbp, pag, parent, &ino);
++ 	if (!error)
++ 		*new_ino = ino;
++ 	return error;
++ 
++ out_release:
++ 	xfs_trans_brelse(*tpp, agbp);
++ 	return error;
++ }
++ 
+  /*
+-  * Select and prepare an AG for inode allocation.
++  * Allocate an on-disk inode.
+   *
+   * Mode is used to tell whether the new inode is a directory and hence where to
+-  * locate it.
+-  *
+-  * This function will ensure that the selected AG has free inodes available to
+-  * allocate from. The selected AGI will be returned locked to the caller, and it
+-  * will allocate more free inodes if required. If no free inodes are found or
+-  * can be allocated, -ENOSPC be returned.
++  * locate it. The on-disk inode that is allocated will be returned in @new_ino
++  * on success, otherwise an error will be set to indicate the failure (e.g.
++  * -ENOSPC).
+   */
+  int
+ -xfs_dialloc(
+ +xfs_dialloc_select_ag(
+  	struct xfs_trans	**tpp,
+  	xfs_ino_t		parent,
+  	umode_t			mode,
+ -	xfs_ino_t		*new_ino)
+ +	struct xfs_buf		**IO_agbp)
+  {
+  	struct xfs_mount	*mp = (*tpp)->t_mountp;
+- 	struct xfs_buf		*agbp;
+  	xfs_agnumber_t		agno;
+ -	int			error = 0;
+ +	int			error;
+  	xfs_agnumber_t		start_agno;
+  	struct xfs_perag	*pag;
+  	struct xfs_ino_geometry	*igeo = M_IGEO(mp);
+- 	bool			okalloc = true;
+- 	int			needspace;
++ 	bool			ok_alloc = true;
+  	int			flags;
+ -	xfs_ino_t		ino;
+ +
+ +	*IO_agbp = NULL;
+  
+  	/*
+  	 * Directories, symlinks, and regular files frequently allocate at least
+@@@ -1761,12 -1801,10 +1802,18 @@@
+  		xfs_perag_put(pag);
+  	}
+  
++ 	if (!error)
++ 		*new_ino = ino;
+  	xfs_perag_put(pag);
+++<<<<<<< HEAD
+ +	return error ? error : -ENOSPC;
+ +found_ag:
+ +	xfs_perag_put(pag);
+ +	*IO_agbp = agbp;
+ +	return 0;
+++=======
++ 	return error;
+++>>>>>>> 8237fbf53d6f (xfs: clean up and simplify xfs_dialloc())
+  }
+  
+  /*
+* Unmerged path fs/xfs/libxfs/xfs_ialloc.c
