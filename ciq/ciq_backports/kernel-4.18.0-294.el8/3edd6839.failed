@@ -1,0 +1,147 @@
+KVM: x86: Add a capability for GUEST_MAXPHYADDR < HOST_MAXPHYADDR support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mohammed Gamal <mgamal@redhat.com>
+commit 3edd68399dc155b80335244c8c2673eaa652931a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3edd6839.failed
+
+This patch adds a new capability KVM_CAP_SMALLER_MAXPHYADDR which
+allows userspace to query if the underlying architecture would
+support GUEST_MAXPHYADDR < HOST_MAXPHYADDR and hence act accordingly
+(e.g. qemu can decide if it should warn for -cpu ..,phys-bits=X)
+
+The complications in this patch are due to unexpected (but documented)
+behaviour we see with NPF vmexit handling in AMD processor.  If
+SVM is modified to add guest physical address checks in the NPF
+and guest #PF paths, we see the followning error multiple times in
+the 'access' test in kvm-unit-tests:
+
+            test pte.p pte.36 pde.p: FAIL: pte 2000021 expected 2000001
+            Dump mapping: address: 0x123400000000
+            ------L4: 24c3027
+            ------L3: 24c4027
+            ------L2: 24c5021
+            ------L1: 1002000021
+
+This is because the PTE's accessed bit is set by the CPU hardware before
+the NPF vmexit. This is handled completely by hardware and cannot be fixed
+in software.
+
+Therefore, availability of the new capability depends on a boolean variable
+allow_smaller_maxphyaddr which is set individually by VMX and SVM init
+routines. On VMX it's always set to true, on SVM it's only set to true
+when NPT is not enabled.
+
+CC: Tom Lendacky <thomas.lendacky@amd.com>
+CC: Babu Moger <babu.moger@amd.com>
+	Signed-off-by: Mohammed Gamal <mgamal@redhat.com>
+Message-Id: <20200710154811.418214-10-mgamal@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3edd68399dc155b80335244c8c2673eaa652931a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,2c73dcfb3dbb..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1030,6 -1031,10 +1030,13 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
++ #define KVM_CAP_SMALLER_MAXPHYADDR 185
++ 
+++>>>>>>> 3edd68399dc1 (KVM: x86: Add a capability for GUEST_MAXPHYADDR < HOST_MAXPHYADDR support)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 0e409c018b9e..58e75261fe50 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1270,7 +1270,7 @@ struct kvm_arch_async_pf {
+ };
+ 
+ extern u64 __read_mostly host_efer;
+-
++extern bool __read_mostly allow_smaller_maxphyaddr;
+ extern struct kvm_x86_ops kvm_x86_ops;
+ 
+ #define __KVM_HAVE_ARCH_VM_ALLOC
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 499f0d55d7de..a664918ede14 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -927,6 +927,21 @@ static __init int svm_hardware_setup(void)
+ 
+ 	svm_set_cpu_caps();
+ 
++	/*
++	 * It seems that on AMD processors PTE's accessed bit is
++	 * being set by the CPU hardware before the NPF vmexit.
++	 * This is not expected behaviour and our tests fail because
++	 * of it.
++	 * A workaround here is to disable support for
++	 * GUEST_MAXPHYADDR < HOST_MAXPHYADDR if NPT is enabled.
++	 * In this case userspace can know if there is support using
++	 * KVM_CAP_SMALLER_MAXPHYADDR extension and decide how to handle
++	 * it
++	 * If future AMD CPU models change the behaviour described above,
++	 * this variable can be changed accordingly
++	 */
++	allow_smaller_maxphyaddr = !npt_enabled;
++
+ 	return 0;
+ 
+ err:
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 9079423a207f..7a368ae7695a 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -8247,6 +8247,13 @@ static int __init vmx_init(void)
+ #endif
+ 	vmx_check_vmcs12_offsets();
+ 
++	/*
++	 * Intel processors don't have problems with
++	 * GUEST_MAXPHYADDR < HOST_MAXPHYADDR so enable
++	 * it for VMX by default
++	 */
++	allow_smaller_maxphyaddr = true;
++
+ 	return 0;
+ }
+ module_init(vmx_init);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index dd845aec780b..addfa2d48906 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -187,6 +187,9 @@ static struct kvm_shared_msrs __percpu *shared_msrs;
+ u64 __read_mostly host_efer;
+ EXPORT_SYMBOL_GPL(host_efer);
+ 
++bool __read_mostly allow_smaller_maxphyaddr;
++EXPORT_SYMBOL_GPL(allow_smaller_maxphyaddr);
++
+ static u64 __read_mostly host_xss;
+ u64 __read_mostly supported_xss;
+ EXPORT_SYMBOL_GPL(supported_xss);
+@@ -3524,6 +3527,9 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_HYPERV_ENLIGHTENED_VMCS:
+ 		r = kvm_x86_ops.nested_ops->enable_evmcs != NULL;
+ 		break;
++	case KVM_CAP_SMALLER_MAXPHYADDR:
++		r = (int) allow_smaller_maxphyaddr;
++		break;
+ 	default:
+ 		break;
+ 	}
+* Unmerged path include/uapi/linux/kvm.h
