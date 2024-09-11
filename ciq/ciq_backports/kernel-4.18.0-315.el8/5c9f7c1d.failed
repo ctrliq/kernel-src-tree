@@ -1,0 +1,196 @@
+ipv4: Add helpers for neigh lookup for nexthop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author David Ahern <dsahern@gmail.com>
+commit 5c9f7c1dfc2e0776551ef1ceb335187c6698d1ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5c9f7c1d.failed
+
+A common theme in the output path is looking up a neigh entry for a
+nexthop, either the gateway in an rtable or a fallback to the daddr
+in the skb:
+
+        nexthop = (__force u32)rt_nexthop(rt, ip_hdr(skb)->daddr);
+        neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+        if (unlikely(!neigh))
+                neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
+
+To allow the nexthop to be an IPv6 address we need to consider the
+family of the nexthop and then call __ipv{4,6}_neigh_lookup_noref based
+on it.
+
+To make this simpler, add a ip_neigh_gw4 helper similar to ip_neigh_gw6
+added in an earlier patch which handles:
+
+        neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+        if (unlikely(!neigh))
+                neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
+
+And then add a second one, ip_neigh_for_gw, that calls either
+ip_neigh_gw4 or ip_neigh_gw6 based on the address family of the gateway.
+
+Update the output paths in the VRF driver and core v4 code to use
+ip_neigh_for_gw simplifying the family based lookup and making both
+ready for a v6 nexthop.
+
+ipv4_neigh_lookup has a different need - the potential to resolve a
+passed in address in addition to any gateway in the rtable or skb. Since
+this is a one-off, add ip_neigh_gw4 and ip_neigh_gw6 diectly. The
+difference between __neigh_create used by the helpers and neigh_create
+called by ipv4_neigh_lookup is taking a refcount, so add rcu_read_lock_bh
+and bump the refcnt on the neigh entry.
+
+	Signed-off-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5c9f7c1dfc2e0776551ef1ceb335187c6698d1ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vrf.c
+#	net/ipv4/ip_output.c
+#	net/ipv4/route.c
+diff --cc drivers/net/vrf.c
+index 01ce04ebfb00,18d752ae554f..000000000000
+--- a/drivers/net/vrf.c
++++ b/drivers/net/vrf.c
+@@@ -585,13 -572,11 +585,15 @@@ static int vrf_finish_output(struct ne
+  
+  	rcu_read_lock_bh();
+  
+- 	nexthop = (__force u32)rt_nexthop(rt, ip_hdr(skb)->daddr);
+- 	neigh = __ipv4_neigh_lookup_noref(dev, nexthop);
+- 	if (unlikely(!neigh))
+- 		neigh = __neigh_create(&arp_tbl, &nexthop, dev, false);
++ 	neigh = ip_neigh_for_gw(rt, skb, &is_v6gw);
+  	if (!IS_ERR(neigh)) {
+  		sock_confirm_neigh(skb, neigh);
+++<<<<<<< HEAD
+ +		ret = neigh_output(neigh, skb);
+++=======
++ 		/* if crossing protocols, can not use the cached header */
++ 		ret = neigh_output(neigh, skb, is_v6gw);
+++>>>>>>> 5c9f7c1dfc2e (ipv4: Add helpers for neigh lookup for nexthop)
+  		rcu_read_unlock_bh();
+  		return ret;
+  	}
+diff --cc net/ipv4/ip_output.c
+index 3535b3351db2,4e42c1974ba2..000000000000
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@@ -227,8 -223,8 +224,13 @@@ static int ip_finish_output2(struct ne
+  		int res;
+  
+  		sock_confirm_neigh(skb, neigh);
+++<<<<<<< HEAD
+ +		res = neigh_output(neigh, skb);
+ +
+++=======
++ 		/* if crossing protocols, can not use the cached header */
++ 		res = neigh_output(neigh, skb, is_v6gw);
+++>>>>>>> 5c9f7c1dfc2e (ipv4: Add helpers for neigh lookup for nexthop)
+  		rcu_read_unlock_bh();
+  		return res;
+  	}
+diff --cc net/ipv4/route.c
+index 9d511f6cabe2,32ecb4c1c7e3..000000000000
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@@ -435,21 -434,29 +435,40 @@@ static struct neighbour *ipv4_neigh_loo
+  					   struct sk_buff *skb,
+  					   const void *daddr)
+  {
+ -	const struct rtable *rt = container_of(dst, struct rtable, dst);
+  	struct net_device *dev = dst->dev;
+++<<<<<<< HEAD
+ +	const __be32 *pkey = daddr;
+ +	const struct rtable *rt;
+ +	struct neighbour *n;
+ +
+ +	rt = (const struct rtable *) dst;
+ +	if (rt->rt_gateway)
+ +		pkey = (const __be32 *) &rt->rt_gateway;
+ +	else if (skb)
+ +		pkey = &ip_hdr(skb)->daddr;
+++=======
++ 	struct neighbour *n;
++ 
++ 	rcu_read_lock_bh();
+++>>>>>>> 5c9f7c1dfc2e (ipv4: Add helpers for neigh lookup for nexthop)
++ 
++ 	if (likely(rt->rt_gw_family == AF_INET)) {
++ 		n = ip_neigh_gw4(dev, rt->rt_gw4);
++ 	} else if (rt->rt_gw_family == AF_INET6) {
++ 		n = ip_neigh_gw6(dev, &rt->rt_gw6);
++         } else {
++ 		__be32 pkey;
++ 
++ 		pkey = skb ? ip_hdr(skb)->daddr : *((__be32 *) daddr);
++ 		n = ip_neigh_gw4(dev, pkey);
++ 	}
++ 
++ 	if (n && !refcount_inc_not_zero(&n->refcnt))
++ 		n = NULL;
++ 
++ 	rcu_read_unlock_bh();
+  
+- 	n = __ipv4_neigh_lookup(dev, *(__force u32 *)pkey);
+- 	if (n)
+- 		return n;
+- 	return neigh_create(&arp_tbl, pkey, dev);
++ 	return n;
+  }
+  
+  static void ipv4_confirm_neigh(const struct dst_entry *dst, const void *daddr)
+* Unmerged path drivers/net/vrf.c
+diff --git a/include/net/route.h b/include/net/route.h
+index e7bb9f7a567b..d92b9982c711 100644
+--- a/include/net/route.h
++++ b/include/net/route.h
+@@ -29,6 +29,8 @@
+ #include <net/flow.h>
+ #include <net/inet_sock.h>
+ #include <net/ip_fib.h>
++#include <net/arp.h>
++#include <net/ndisc.h>
+ #include <linux/in_route.h>
+ #include <linux/rtnetlink.h>
+ #include <linux/rcupdate.h>
+@@ -358,4 +360,34 @@ static inline int ip4_dst_hoplimit(const struct dst_entry *dst)
+ 	return hoplimit;
+ }
+ 
++static inline struct neighbour *ip_neigh_gw4(struct net_device *dev,
++					     __be32 daddr)
++{
++	struct neighbour *neigh;
++
++	neigh = __ipv4_neigh_lookup_noref(dev, daddr);
++	if (unlikely(!neigh))
++		neigh = __neigh_create(&arp_tbl, &daddr, dev, false);
++
++	return neigh;
++}
++
++static inline struct neighbour *ip_neigh_for_gw(struct rtable *rt,
++						struct sk_buff *skb,
++						bool *is_v6gw)
++{
++	struct net_device *dev = rt->dst.dev;
++	struct neighbour *neigh;
++
++	if (likely(rt->rt_gw_family == AF_INET)) {
++		neigh = ip_neigh_gw4(dev, rt->rt_gw4);
++	} else if (rt->rt_gw_family == AF_INET6) {
++		neigh = ip_neigh_gw6(dev, &rt->rt_gw6);
++		*is_v6gw = true;
++	} else {
++		neigh = ip_neigh_gw4(dev, ip_hdr(skb)->daddr);
++	}
++	return neigh;
++}
++
+ #endif	/* _ROUTE_H */
+* Unmerged path net/ipv4/ip_output.c
+* Unmerged path net/ipv4/route.c
