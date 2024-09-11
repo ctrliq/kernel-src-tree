@@ -1,0 +1,135 @@
+io_uring: punt final io_ring_ctx wait-and-free to workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 85faa7b8346ebef0606d2d0df6d3f8c76acb3654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/85faa7b8.failed
+
+We can't reliably wait in io_ring_ctx_wait_and_kill(), since the
+task_works list isn't ordered (in fact it's LIFO ordered). We could
+either fix this with a separate task_works list for io_uring work, or
+just punt the wait-and-free to async context. This ensures that
+task_work that comes in while we're shutting down is processed
+correctly. If we don't go async, we could have work past the fput()
+work for the ring that depends on work that won't be executed until
+after we're done with the wait-and-free. But as this operation is
+blocking, it'll never get a chance to run.
+
+This was reproduced with hundreds of thousands of sockets running
+memcached, haven't been able to reproduce this synthetically.
+
+	Reported-by: Dan Melnic <dmm@fb.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 85faa7b8346ebef0606d2d0df6d3f8c76acb3654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,5190bfb6a665..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -277,22 -319,15 +277,26 @@@ struct io_ring_ctx 
+  		 * manipulate the list, hence no extra locking is needed there.
+  		 */
+  		struct list_head	poll_list;
+ -		struct hlist_head	*cancel_hash;
+ -		unsigned		cancel_hash_bits;
+ -		bool			poll_multi_file;
+ -
+ -		spinlock_t		inflight_lock;
+ -		struct list_head	inflight_list;
+ +		struct list_head	cancel_list;
+  	} ____cacheline_aligned_in_smp;
+  
+++<<<<<<< HEAD
+ +	struct async_list	pending_async[2];
+ +
+ +#if defined(CONFIG_UNIX)
+ +	struct socket		*ring_sock;
+ +#endif
+ +};
+ +
+ +struct sqe_submit {
+ +	const struct io_uring_sqe	*sqe;
+ +	u32				sequence;
+ +	bool				has_user;
+ +	bool				needs_lock;
+ +	bool				needs_fixed_file;
+++=======
++ 	struct work_struct		exit_work;
+++>>>>>>> 85faa7b8346e (io_uring: punt final io_ring_ctx wait-and-free to workqueue)
+  };
+  
+  /*
+@@@ -3565,16 -7262,58 +3569,51 @@@ static int io_uring_fasync(int fd, stru
+  	return fasync_helper(fd, file, on, &ctx->cq_fasync);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int io_remove_personalities(int id, void *p, void *data)
++ {
++ 	struct io_ring_ctx *ctx = data;
++ 	const struct cred *cred;
++ 
++ 	cred = idr_remove(&ctx->personality_idr, id);
++ 	if (cred)
++ 		put_cred(cred);
++ 	return 0;
++ }
++ 
++ static void io_ring_exit_work(struct work_struct *work)
++ {
++ 	struct io_ring_ctx *ctx;
++ 
++ 	ctx = container_of(work, struct io_ring_ctx, exit_work);
++ 	if (ctx->rings)
++ 		io_cqring_overflow_flush(ctx, true);
++ 
++ 	wait_for_completion(&ctx->completions[0]);
++ 	io_ring_ctx_free(ctx);
++ }
++ 
+++>>>>>>> 85faa7b8346e (io_uring: punt final io_ring_ctx wait-and-free to workqueue)
+  static void io_ring_ctx_wait_and_kill(struct io_ring_ctx *ctx)
+  {
+  	mutex_lock(&ctx->uring_lock);
+  	percpu_ref_kill(&ctx->refs);
+  	mutex_unlock(&ctx->uring_lock);
+  
+ -	/*
+ -	 * Wait for sq thread to idle, if we have one. It won't spin on new
+ -	 * work after we've killed the ctx ref above. This is important to do
+ -	 * before we cancel existing commands, as the thread could otherwise
+ -	 * be queueing new work post that. If that's work we need to cancel,
+ -	 * it could cause shutdown to hang.
+ -	 */
+ -	while (ctx->sqo_thread && !wq_has_sleeper(&ctx->sqo_wait))
+ -		cpu_relax();
+ -
+ -	io_kill_timeouts(ctx);
+  	io_poll_remove_all(ctx);
+ -
+ -	if (ctx->io_wq)
+ -		io_wq_cancel_all(ctx->io_wq);
+ -
+  	io_iopoll_reap_events(ctx);
+++<<<<<<< HEAD
+ +	wait_for_completion(&ctx->ctx_done);
+ +	io_ring_ctx_free(ctx);
+++=======
++ 	/* if we failed setting up the ctx, we might not have any rings */
++ 	if (ctx->rings)
++ 		io_cqring_overflow_flush(ctx, true);
++ 	idr_for_each(&ctx->personality_idr, io_remove_personalities, ctx);
++ 	INIT_WORK(&ctx->exit_work, io_ring_exit_work);
++ 	queue_work(system_wq, &ctx->exit_work);
+++>>>>>>> 85faa7b8346e (io_uring: punt final io_ring_ctx wait-and-free to workqueue)
+  }
+  
+  static int io_uring_release(struct inode *inode, struct file *file)
+* Unmerged path fs/io_uring.c
