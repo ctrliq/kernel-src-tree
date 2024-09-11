@@ -62,7 +62,7 @@ extern struct pci_ecam_ops iproc_pcie_paxcv2_ecam_ops; /* iProc PAXCv2 */
 extern struct pci_ecam_ops tegra194_pcie_ops; /* Tegra194 PCIe */
 #endif
 
-#ifdef CONFIG_PCI_HOST_COMMON
+#if IS_ENABLED(CONFIG_PCI_HOST_COMMON)
 /* for DT-based PCI controllers that support ECAM */
 int pci_host_common_probe(struct platform_device *pdev,
 			  const struct pci_ecam_ops *ops);
