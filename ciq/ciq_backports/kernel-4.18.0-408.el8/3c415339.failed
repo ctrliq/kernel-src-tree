@@ -1,0 +1,159 @@
+bnxt_en: implement firmware live patching
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Edwin Peer <edwin.peer@broadcom.com>
+commit 3c4153394e2c749b415947b86eb560114ec0f64d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3c415339.failed
+
+Live patches are activated by using the 'limit no_reset' option when
+performing a devlink dev reload fw_activate operation. These packages
+must first be installed on the device in the usual way. For example,
+via devlink dev flash or ethtool -f.
+
+The devlink device info has also been enhanced to render stored and
+running live patch versions.
+
+	Signed-off-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3c4153394e2c749b415947b86eb560114ec0f64d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index e28d93fa06db,c04ea83188e2..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -7483,6 -7488,10 +7483,13 @@@ static int __bnxt_hwrm_func_qcaps(struc
+  		bp->fw_cap |= BNXT_FW_CAP_EXT_HW_STATS_SUPPORTED;
+  	if (BNXT_PF(bp) && (flags_ext & FUNC_QCAPS_RESP_FLAGS_EXT_PTP_PPS_SUPPORTED))
+  		bp->fw_cap |= BNXT_FW_CAP_PTP_PPS;
+++<<<<<<< HEAD
+++=======
++ 	if (BNXT_PF(bp) && (flags_ext & FUNC_QCAPS_RESP_FLAGS_EXT_HOT_RESET_IF_SUPPORT))
++ 		bp->fw_cap |= BNXT_FW_CAP_HOT_RESET_IF;
++ 	if (BNXT_PF(bp) && (flags_ext & FUNC_QCAPS_RESP_FLAGS_EXT_FW_LIVEPATCH_SUPPORTED))
++ 		bp->fw_cap |= BNXT_FW_CAP_LIVEPATCH;
+++>>>>>>> 3c4153394e2c (bnxt_en: implement firmware live patching)
+  
+  	bp->tx_push_thresh = 0;
+  	if ((flags & FUNC_QCAPS_RESP_FLAGS_PUSH_MODE_SUPPORTED) &&
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index d875469f72ce,4007b2ac8ca4..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -327,6 -476,37 +432,40 @@@ static int bnxt_dl_reload_down(struct d
+  		bp->ctx = NULL;
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case DEVLINK_RELOAD_ACTION_FW_ACTIVATE: {
++ 		if (limit == DEVLINK_RELOAD_LIMIT_NO_RESET)
++ 			return bnxt_dl_livepatch_activate(bp, extack);
++ 		if (~bp->fw_cap & BNXT_FW_CAP_HOT_RESET) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Device not capable, requires reboot");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		if (!bnxt_hwrm_reset_permitted(bp)) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Reset denied by firmware, it may be inhibited by remote driver");
++ 			return -EPERM;
++ 		}
++ 		rtnl_lock();
++ 		if (bp->dev->reg_state == NETREG_UNREGISTERED) {
++ 			rtnl_unlock();
++ 			return -ENODEV;
++ 		}
++ 		if (netif_running(bp->dev))
++ 			set_bit(BNXT_STATE_FW_ACTIVATE, &bp->state);
++ 		rc = bnxt_hwrm_firmware_reset(bp->dev,
++ 					      FW_RESET_REQ_EMBEDDED_PROC_TYPE_CHIP,
++ 					      FW_RESET_REQ_SELFRST_STATUS_SELFRSTASAP,
++ 					      FW_RESET_REQ_FLAGS_RESET_GRACEFUL |
++ 					      FW_RESET_REQ_FLAGS_FW_ACTIVATION);
++ 		if (rc) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Failed to activate firmware");
++ 			clear_bit(BNXT_STATE_FW_ACTIVATE, &bp->state);
++ 			rtnl_unlock();
++ 		}
++ 		break;
++ 	}
+++>>>>>>> 3c4153394e2c (bnxt_en: implement firmware live patching)
+  	default:
+  		rc = -EOPNOTSUPP;
+  	}
+@@@ -355,6 -535,37 +494,40 @@@ static int bnxt_dl_reload_up(struct dev
+  		}
+  		break;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	case DEVLINK_RELOAD_ACTION_FW_ACTIVATE: {
++ 		unsigned long start = jiffies;
++ 		unsigned long timeout = start + BNXT_DFLT_FW_RST_MAX_DSECS * HZ / 10;
++ 
++ 		if (limit == DEVLINK_RELOAD_LIMIT_NO_RESET)
++ 			break;
++ 		if (bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY)
++ 			timeout = start + bp->fw_health->normal_func_wait_dsecs * HZ / 10;
++ 		if (!netif_running(bp->dev))
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "Device is closed, not waiting for reset notice that will never come");
++ 		rtnl_unlock();
++ 		while (test_bit(BNXT_STATE_FW_ACTIVATE, &bp->state)) {
++ 			if (time_after(jiffies, timeout)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "Activation incomplete");
++ 				rc = -ETIMEDOUT;
++ 				break;
++ 			}
++ 			if (test_bit(BNXT_STATE_ABORT_ERR, &bp->state)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "Activation aborted");
++ 				rc = -ENODEV;
++ 				break;
++ 			}
++ 			msleep(50);
++ 		}
++ 		rtnl_lock();
++ 		if (!rc)
++ 			*actions_performed |= BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT);
++ 		clear_bit(BNXT_STATE_FW_ACTIVATE, &bp->state);
++ 		break;
++ 	}
+++>>>>>>> 3c4153394e2c (bnxt_en: implement firmware live patching)
+  	default:
+  		return -EOPNOTSUPP;
+  	}
+@@@ -381,7 -592,9 +554,13 @@@ static const struct devlink_ops bnxt_dl
+  #endif /* CONFIG_BNXT_SRIOV */
+  	.info_get	  = bnxt_dl_info_get,
+  	.flash_update	  = bnxt_dl_flash_update,
+++<<<<<<< HEAD
+ +	.reload_actions	  = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT),
+++=======
++ 	.reload_actions	  = BIT(DEVLINK_RELOAD_ACTION_DRIVER_REINIT) |
++ 			    BIT(DEVLINK_RELOAD_ACTION_FW_ACTIVATE),
++ 	.reload_limits	  = BIT(DEVLINK_RELOAD_LIMIT_NO_RESET),
+++>>>>>>> 3c4153394e2c (bnxt_en: implement firmware live patching)
+  	.reload_down	  = bnxt_dl_reload_down,
+  	.reload_up	  = bnxt_dl_reload_up,
+  };
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.h b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index b07518619795..76b12adc99d1 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@ -1924,6 +1924,7 @@ struct bnxt {
+ 	#define BNXT_FW_CAP_VLAN_RX_STRIP		0x01000000
+ 	#define BNXT_FW_CAP_VLAN_TX_INSERT		0x02000000
+ 	#define BNXT_FW_CAP_EXT_HW_STATS_SUPPORTED	0x04000000
++	#define BNXT_FW_CAP_LIVEPATCH			0x08000000
+ 	#define BNXT_FW_CAP_PTP_PPS			0x10000000
+ 	#define BNXT_FW_CAP_RING_MONITOR		0x40000000
+ 	#define BNXT_FW_CAP_DBG_QCAPS			0x80000000
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
