@@ -1,0 +1,655 @@
+mm: page cache: store only head pages in i_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 5fd4ca2d84b249f0858ce28cf637cf25b61a398f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5fd4ca2d.failed
+
+Transparent Huge Pages are currently stored in i_pages as pointers to
+consecutive subpages.  This patch changes that to storing consecutive
+pointers to the head page in preparation for storing huge pages more
+efficiently in i_pages.
+
+Large parts of this are "inspired" by Kirill's patch
+https://lore.kernel.org/lkml/20170126115819.58875-2-kirill.shutemov@linux.intel.com/
+
+[willy@infradead.org: fix swapcache pages]
+  Link: http://lkml.kernel.org/r/20190324155441.GF10344@bombadil.infradead.org
+[kirill@shutemov.name: hugetlb stores pages in page cache differently]
+  Link: http://lkml.kernel.org/r/20190404134553.vuvhgmghlkiw2hgl@kshutemo-mobl1
+Link: http://lkml.kernel.org/r/20190307153051.18815-1-willy@infradead.org
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Acked-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Kirill Shutemov <kirill@shutemov.name>
+Reviewed-and-tested-by: Song Liu <songliubraving@fb.com>
+	Tested-by: William Kucharski <william.kucharski@oracle.com>
+	Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+	Tested-by: Qian Cai <cai@lca.pw>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Song Liu <liu.song.a23@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 5fd4ca2d84b249f0858ce28cf637cf25b61a398f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/khugepaged.c
+#	mm/migrate.c
+#	mm/swap_state.c
+diff --cc mm/khugepaged.c
+index 9b4e03006b98,7ba7a1e4fa79..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -1378,47 -1328,59 +1378,70 @@@ static void collapse_file(struct mm_str
+  		goto out;
+  	}
+  
+ -	/* This will be less messy when we use multi-index entries */
+ -	do {
+ -		xas_lock_irq(&xas);
+ -		xas_create_range(&xas);
+ -		if (!xas_error(&xas))
+ -			break;
+ -		xas_unlock_irq(&xas);
+ -		if (!xas_nomem(&xas, GFP_KERNEL)) {
+ -			mem_cgroup_cancel_charge(new_page, memcg, true);
+ -			result = SCAN_FAIL;
+ -			goto out;
+ -		}
+ -	} while (1);
+ -
+ -	__SetPageLocked(new_page);
+ -	__SetPageSwapBacked(new_page);
+  	new_page->index = start;
+  	new_page->mapping = mapping;
+ +	__SetPageSwapBacked(new_page);
+ +	__SetPageLocked(new_page);
+ +	BUG_ON(!page_ref_freeze(new_page, 1));
+ +
+  
+  	/*
+ -	 * At this point the new_page is locked and not up-to-date.
+ -	 * It's safe to insert it into the page cache, because nobody would
+ -	 * be able to map it or use it in another way until we unlock it.
+ +	 * At this point the new_page is 'frozen' (page_count() is zero), locked
+ +	 * and not up-to-date. It's safe to insert it into radix tree, because
+ +	 * nobody would be able to map it or use it in other way until we
+ +	 * unfreeze it.
+  	 */
+  
+ -	xas_set(&xas, start);
+ -	for (index = start; index < end; index++) {
+ -		struct page *page = xas_next(&xas);
+ +	index = start;
+ +	xa_lock_irq(&mapping->i_pages);
+ +	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+ +		int n = min(iter.index, end) - index;
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * Handle holes in the radix tree: charge it from shmem and
+ +		 * insert relevant subpage of new_page into the radix-tree.
+ +		 */
+ +		if (n && !shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			break;
+ +		}
+ +		nr_none += n;
+ +		for (; index < min(iter.index, end); index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+++=======
++ 		VM_BUG_ON(index != xas.xa_index);
++ 		if (!page) {
++ 			/*
++ 			 * Stop if extent has been truncated or hole-punched,
++ 			 * and is now completely empty.
++ 			 */
++ 			if (index == start) {
++ 				if (!xas_next_entry(&xas, end - 1)) {
++ 					result = SCAN_TRUNCATED;
++ 					goto xa_locked;
++ 				}
++ 				xas_set(&xas, index);
++ 			}
++ 			if (!shmem_charge(mapping->host, 1)) {
++ 				result = SCAN_FAIL;
++ 				goto xa_locked;
++ 			}
++ 			xas_store(&xas, new_page);
++ 			nr_none++;
++ 			continue;
+++>>>>>>> 5fd4ca2d84b2 (mm: page cache: store only head pages in i_pages)
+  		}
+  
+ +		/* We are done. */
+ +		if (index >= end)
+ +			break;
+ +
+ +		page = radix_tree_deref_slot_protected(slot,
+ +				&mapping->i_pages.xa_lock);
+  		if (xa_is_value(page) || !PageUptodate(page)) {
+ -			xas_unlock_irq(&xas);
+ +			xa_unlock_irq(&mapping->i_pages);
+  			/* swap in or instantiate fallocated page */
+  			if (shmem_getpage(mapping->host, index, &page,
+  						SGP_NOHUGE)) {
+@@@ -1488,19 -1450,8 +1511,23 @@@
+  		list_add_tail(&page->lru, &pagelist);
+  
+  		/* Finally, replace with the new page. */
+++<<<<<<< HEAD
+ +		radix_tree_replace_slot(&mapping->i_pages, slot,
+ +				new_page + (index % HPAGE_PMD_NR));
+ +
+ +		slot = radix_tree_iter_resume(slot, &iter);
+ +		index++;
+++=======
++ 		xas_store(&xas, new_page);
+++>>>>>>> 5fd4ca2d84b2 (mm: page cache: store only head pages in i_pages)
+  		continue;
+ +out_lru:
+ +		xa_unlock_irq(&mapping->i_pages);
+ +		putback_lru_page(page);
+ +out_isolate_failed:
+ +		unlock_page(page);
+ +		put_page(page);
+ +		goto tree_unlocked;
+  out_unlock:
+  		unlock_page(page);
+  		put_page(page);
+diff --cc mm/migrate.c
+index 5628f1102c6a,a1770403ff7f..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -527,16 -457,13 +527,21 @@@ int migrate_page_move_mapping(struct ad
+  		SetPageDirty(newpage);
+  	}
+  
+ -	xas_store(&xas, newpage);
+ +	radix_tree_replace_slot(&mapping->i_pages, pslot, newpage);
+  	if (PageTransHuge(page)) {
+  		int i;
+ +		int index = page_index(page);
+  
+  		for (i = 1; i < HPAGE_PMD_NR; i++) {
+++<<<<<<< HEAD
+ +			pslot = radix_tree_lookup_slot(&mapping->i_pages,
+ +						       index + i);
+ +			radix_tree_replace_slot(&mapping->i_pages, pslot,
+ +						newpage + i);
+++=======
++ 			xas_next(&xas);
++ 			xas_store(&xas, newpage);
+++>>>>>>> 5fd4ca2d84b2 (mm: page cache: store only head pages in i_pages)
+  		}
+  	}
+  
+diff --cc mm/swap_state.c
+index e2aded84261e,eb714165afd2..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -123,16 -124,17 +123,30 @@@ int __add_to_swap_cache(struct page *pa
+  	page_ref_add(page, nr);
+  	SetPageSwapCache(page);
+  
+++<<<<<<< HEAD
+ +	address_space = swap_address_space(entry);
+ +	xa_lock_irq(&address_space->i_pages);
+ +	for (i = 0; i < nr; i++) {
+ +		set_page_private(page + i, entry.val + i);
+ +		error = radix_tree_insert(&address_space->i_pages,
+ +					  idx + i, page + i);
+ +		if (unlikely(error))
+ +			break;
+ +	}
+ +	if (likely(!error)) {
+++=======
++ 	do {
++ 		xas_lock_irq(&xas);
++ 		xas_create_range(&xas);
++ 		if (xas_error(&xas))
++ 			goto unlock;
++ 		for (i = 0; i < nr; i++) {
++ 			VM_BUG_ON_PAGE(xas.xa_index != idx + i, page);
++ 			set_page_private(page + i, entry.val + i);
++ 			xas_store(&xas, page);
++ 			xas_next(&xas);
++ 		}
+++>>>>>>> 5fd4ca2d84b2 (mm: page cache: store only head pages in i_pages)
+  		address_space->nrpages += nr;
+  		__mod_node_page_state(page_pgdat(page), NR_FILE_PAGES, nr);
+  		ADD_CACHE_INFO(add_total, nr);
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index aa04b06417e2..0dc54a5b93c5 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -332,6 +332,19 @@ static inline struct page *grab_cache_page_nowait(struct address_space *mapping,
+ 			mapping_gfp_mask(mapping));
+ }
+ 
++static inline struct page *find_subpage(struct page *page, pgoff_t offset)
++{
++	unsigned long mask;
++
++	if (PageHuge(page))
++		return page;
++
++	VM_BUG_ON_PAGE(PageTail(page), page);
++
++	mask = (1UL << compound_order(page)) - 1;
++	return page + (offset & mask);
++}
++
+ struct page *find_get_entry(struct address_space *mapping, pgoff_t offset);
+ struct page *find_lock_entry(struct address_space *mapping, pgoff_t offset);
+ unsigned find_get_entries(struct address_space *mapping, pgoff_t start,
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 20e5a7c67c1c..c7ad57f3ae2b 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -281,11 +281,11 @@ EXPORT_SYMBOL(delete_from_page_cache);
+  * @pvec: pagevec with pages to delete
+  *
+  * The function walks over mapping->i_pages and removes pages passed in @pvec
+- * from the mapping. The function expects @pvec to be sorted by page index.
++ * from the mapping. The function expects @pvec to be sorted by page index
++ * and is optimised for it to be dense.
+  * It tolerates holes in @pvec (mapping entries at those indices are not
+  * modified). The function expects only THP head pages to be present in the
+- * @pvec and takes care to delete all corresponding tail pages from the
+- * mapping as well.
++ * @pvec.
+  *
+  * The function expects the i_pages lock to be held.
+  */
+@@ -294,40 +294,44 @@ static void page_cache_delete_batch(struct address_space *mapping,
+ {
+ 	XA_STATE(xas, &mapping->i_pages, pvec->pages[0]->index);
+ 	int total_pages = 0;
+-	int i = 0, tail_pages = 0;
++	int i = 0;
+ 	struct page *page;
+ 
+ 	mapping_set_update(&xas, mapping);
+ 	xas_for_each(&xas, page, ULONG_MAX) {
+-		if (i >= pagevec_count(pvec) && !tail_pages)
++		if (i >= pagevec_count(pvec))
+ 			break;
++
++		/* A swap/dax/shadow entry got inserted? Skip it. */
+ 		if (xa_is_value(page))
+ 			continue;
+-		if (!tail_pages) {
+-			/*
+-			 * Some page got inserted in our range? Skip it. We
+-			 * have our pages locked so they are protected from
+-			 * being removed.
+-			 */
+-			if (page != pvec->pages[i]) {
+-				VM_BUG_ON_PAGE(page->index >
+-						pvec->pages[i]->index, page);
+-				continue;
+-			}
+-			WARN_ON_ONCE(!PageLocked(page));
+-			if (PageTransHuge(page) && !PageHuge(page))
+-				tail_pages = HPAGE_PMD_NR - 1;
++		/*
++		 * A page got inserted in our range? Skip it. We have our
++		 * pages locked so they are protected from being removed.
++		 * If we see a page whose index is higher than ours, it
++		 * means our page has been removed, which shouldn't be
++		 * possible because we're holding the PageLock.
++		 */
++		if (page != pvec->pages[i]) {
++			VM_BUG_ON_PAGE(page->index > pvec->pages[i]->index,
++					page);
++			continue;
++		}
++
++		WARN_ON_ONCE(!PageLocked(page));
++
++		if (page->index == xas.xa_index)
+ 			page->mapping = NULL;
+-			/*
+-			 * Leave page->index set: truncation lookup relies
+-			 * upon it
+-			 */
++		/* Leave page->index set: truncation lookup relies on it */
++
++		/*
++		 * Move to the next page in the vector if this is a regular
++		 * page or the index is of the last sub-page of this compound
++		 * page.
++		 */
++		if (page->index + (1UL << compound_order(page)) - 1 ==
++				xas.xa_index)
+ 			i++;
+-		} else {
+-			VM_BUG_ON_PAGE(page->index + HPAGE_PMD_NR - tail_pages
+-					!= pvec->pages[i]->index, page);
+-			tail_pages--;
+-		}
+ 		xas_store(&xas, NULL);
+ 		total_pages++;
+ 	}
+@@ -1489,7 +1493,7 @@ EXPORT_SYMBOL(page_cache_prev_miss);
+ struct page *find_get_entry(struct address_space *mapping, pgoff_t offset)
+ {
+ 	XA_STATE(xas, &mapping->i_pages, offset);
+-	struct page *head, *page;
++	struct page *page;
+ 
+ 	rcu_read_lock();
+ repeat:
+@@ -1504,25 +1508,19 @@ struct page *find_get_entry(struct address_space *mapping, pgoff_t offset)
+ 	if (!page || xa_is_value(page))
+ 		goto out;
+ 
+-	head = compound_head(page);
+-	if (!page_cache_get_speculative(head))
++	if (!page_cache_get_speculative(page))
+ 		goto repeat;
+ 
+-	/* The page was split under us? */
+-	if (compound_head(page) != head) {
+-		put_page(head);
+-		goto repeat;
+-	}
+-
+ 	/*
+-	 * Has the page moved?
++	 * Has the page moved or been split?
+ 	 * This is part of the lockless pagecache protocol. See
+ 	 * include/linux/pagemap.h for details.
+ 	 */
+ 	if (unlikely(page != xas_reload(&xas))) {
+-		put_page(head);
++		put_page(page);
+ 		goto repeat;
+ 	}
++	page = find_subpage(page, offset);
+ out:
+ 	rcu_read_unlock();
+ 
+@@ -1693,7 +1691,6 @@ unsigned find_get_entries(struct address_space *mapping,
+ 
+ 	rcu_read_lock();
+ 	xas_for_each(&xas, page, ULONG_MAX) {
+-		struct page *head;
+ 		if (xas_retry(&xas, page))
+ 			continue;
+ 		/*
+@@ -1704,17 +1701,13 @@ unsigned find_get_entries(struct address_space *mapping,
+ 		if (xa_is_value(page))
+ 			goto export;
+ 
+-		head = compound_head(page);
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto retry;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto put_page;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto put_page;
++		page = find_subpage(page, xas.xa_index);
+ 
+ export:
+ 		indices[ret] = xas.xa_index;
+@@ -1723,7 +1716,7 @@ unsigned find_get_entries(struct address_space *mapping,
+ 			break;
+ 		continue;
+ put_page:
+-		put_page(head);
++		put_page(page);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -1765,33 +1758,27 @@ unsigned find_get_pages_range(struct address_space *mapping, pgoff_t *start,
+ 
+ 	rcu_read_lock();
+ 	xas_for_each(&xas, page, end) {
+-		struct page *head;
+ 		if (xas_retry(&xas, page))
+ 			continue;
+ 		/* Skip over shadow, swap and DAX entries */
+ 		if (xa_is_value(page))
+ 			continue;
+ 
+-		head = compound_head(page);
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto retry;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto put_page;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto put_page;
+ 
+-		pages[ret] = page;
++		pages[ret] = find_subpage(page, xas.xa_index);
+ 		if (++ret == nr_pages) {
+ 			*start = page->index + 1;
+ 			goto out;
+ 		}
+ 		continue;
+ put_page:
+-		put_page(head);
++		put_page(page);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -1836,7 +1823,6 @@ unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t index,
+ 
+ 	rcu_read_lock();
+ 	for (page = xas_load(&xas); page; page = xas_next(&xas)) {
+-		struct page *head;
+ 		if (xas_retry(&xas, page))
+ 			continue;
+ 		/*
+@@ -1846,24 +1832,19 @@ unsigned find_get_pages_contig(struct address_space *mapping, pgoff_t index,
+ 		if (xa_is_value(page))
+ 			break;
+ 
+-		head = compound_head(page);
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto retry;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto put_page;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto put_page;
+ 
+-		pages[ret] = page;
++		pages[ret] = find_subpage(page, xas.xa_index);
+ 		if (++ret == nr_pages)
+ 			break;
+ 		continue;
+ put_page:
+-		put_page(head);
++		put_page(page);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -1897,7 +1878,6 @@ unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
+ 
+ 	rcu_read_lock();
+ 	xas_for_each_marked(&xas, page, end, tag) {
+-		struct page *head;
+ 		if (xas_retry(&xas, page))
+ 			continue;
+ 		/*
+@@ -1908,26 +1888,21 @@ unsigned find_get_pages_range_tag(struct address_space *mapping, pgoff_t *index,
+ 		if (xa_is_value(page))
+ 			continue;
+ 
+-		head = compound_head(page);
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto retry;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto put_page;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto put_page;
+ 
+-		pages[ret] = page;
++		pages[ret] = find_subpage(page, xas.xa_index);
+ 		if (++ret == nr_pages) {
+ 			*index = page->index + 1;
+ 			goto out;
+ 		}
+ 		continue;
+ put_page:
+-		put_page(head);
++		put_page(page);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -1974,7 +1949,6 @@ unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
+ 
+ 	rcu_read_lock();
+ 	xas_for_each_marked(&xas, page, ULONG_MAX, tag) {
+-		struct page *head;
+ 		if (xas_retry(&xas, page))
+ 			continue;
+ 		/*
+@@ -1985,17 +1959,13 @@ unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
+ 		if (xa_is_value(page))
+ 			goto export;
+ 
+-		head = compound_head(page);
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto retry;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto put_page;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto put_page;
++		page = find_subpage(page, xas.xa_index);
+ 
+ export:
+ 		indices[ret] = xas.xa_index;
+@@ -2004,7 +1974,7 @@ unsigned find_get_entries_tag(struct address_space *mapping, pgoff_t start,
+ 			break;
+ 		continue;
+ put_page:
+-		put_page(head);
++		put_page(page);
+ retry:
+ 		xas_reset(&xas);
+ 	}
+@@ -2617,7 +2587,7 @@ void filemap_map_pages(struct vm_fault *vmf,
+ 	pgoff_t last_pgoff = start_pgoff;
+ 	unsigned long max_idx;
+ 	XA_STATE(xas, &mapping->i_pages, start_pgoff);
+-	struct page *head, *page;
++	struct page *page;
+ 
+ 	rcu_read_lock();
+ 	xas_for_each(&xas, page, end_pgoff) {
+@@ -2626,24 +2596,19 @@ void filemap_map_pages(struct vm_fault *vmf,
+ 		if (xa_is_value(page))
+ 			goto next;
+ 
+-		head = compound_head(page);
+-
+ 		/*
+ 		 * Check for a locked page first, as a speculative
+ 		 * reference may adversely influence page migration.
+ 		 */
+-		if (PageLocked(head))
++		if (PageLocked(page))
+ 			goto next;
+-		if (!page_cache_get_speculative(head))
++		if (!page_cache_get_speculative(page))
+ 			goto next;
+ 
+-		/* The page was split under us? */
+-		if (compound_head(page) != head)
+-			goto skip;
+-
+-		/* Has the page moved? */
++		/* Has the page moved or been split? */
+ 		if (unlikely(page != xas_reload(&xas)))
+ 			goto skip;
++		page = find_subpage(page, xas.xa_index);
+ 
+ 		if (!PageUptodate(page) ||
+ 				PageReadahead(page) ||
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 1a8b06fb94ac..25abd1f79ef7 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -2513,6 +2513,9 @@ static void __split_huge_page(struct page *page, struct list_head *list,
+ 			if (IS_ENABLED(CONFIG_SHMEM) && PageSwapBacked(head))
+ 				shmem_uncharge(head->mapping->host, 1);
+ 			put_page(head + i);
++		} else if (!PageAnon(page)) {
++			__xa_store(&head->mapping->i_pages, head[i].index,
++					head + i, 0);
+ 		}
+ 	}
+ 
+* Unmerged path mm/khugepaged.c
+diff --git a/mm/memfd.c b/mm/memfd.c
+index 97264c79d2cd..66d263b804e1 100644
+--- a/mm/memfd.c
++++ b/mm/memfd.c
+@@ -39,6 +39,7 @@ static void memfd_tag_pins(struct xa_state *xas)
+ 	xas_for_each(xas, page, ULONG_MAX) {
+ 		if (xa_is_value(page))
+ 			continue;
++		page = find_subpage(page, xas->xa_index);
+ 		if (page_count(page) - page_mapcount(page) > 1)
+ 			xas_set_mark(xas, MEMFD_TAG_PINNED);
+ 
+@@ -88,6 +89,7 @@ static int memfd_wait_for_pins(struct address_space *mapping)
+ 			bool clear = true;
+ 			if (xa_is_value(page))
+ 				continue;
++			page = find_subpage(page, xas.xa_index);
+ 			if (page_count(page) - page_mapcount(page) != 1) {
+ 				/*
+ 				 * On the last scan, we clean up all those tags
+* Unmerged path mm/migrate.c
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 1b4f8fc6c563..806b2eb42f7f 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -625,7 +625,7 @@ static int shmem_add_to_page_cache(struct page *page,
+ 		if (xas_error(&xas))
+ 			goto unlock;
+ next:
+-		xas_store(&xas, page + i);
++		xas_store(&xas, page);
+ 		if (++i < nr) {
+ 			xas_next(&xas);
+ 			goto next;
+* Unmerged path mm/swap_state.c
