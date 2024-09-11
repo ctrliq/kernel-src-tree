@@ -1,0 +1,160 @@
+iommu/arm-smmu-v3: Share process page tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jean-Philippe Brucker <jean-philippe@linaro.org>
+commit 3f1ce8e85ee06dbe6a8b2e037e9b35f6b32e9ab3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3f1ce8e8.failed
+
+With Shared Virtual Addressing (SVA), we need to mirror CPU TTBR, TCR,
+MAIR and ASIDs in SMMU contexts. Each SMMU has a single ASID space split
+into two sets, shared and private. Shared ASIDs correspond to those
+obtained from the arch ASID allocator, and private ASIDs are used for
+"classic" map/unmap DMA.
+
+A possible conflict happens when trying to use a shared ASID that has
+already been allocated for private use by the SMMU driver. This will be
+addressed in a later patch by replacing the private ASID. At the
+moment we return -EBUSY.
+
+Each mm_struct shared with the SMMU will have a single context
+descriptor. Add a refcount to keep track of this. It will be protected
+by the global SVA lock.
+
+Introduce a new arm-smmu-v3-sva.c file and the CONFIG_ARM_SMMU_V3_SVA
+option to let users opt in SVA support.
+
+	Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Link: https://lore.kernel.org/r/20200918101852.582559-9-jean-philippe@linaro.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 3f1ce8e85ee06dbe6a8b2e037e9b35f6b32e9ab3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-v3-sva.c
+#	drivers/iommu/arm/arm-smmu-v3/Makefile
+#	drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+* Unmerged path drivers/iommu/arm-smmu-v3-sva.c
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/Makefile
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+diff --git a/drivers/iommu/Kconfig b/drivers/iommu/Kconfig
+index c4e3804df1cd..9c69858546d5 100644
+--- a/drivers/iommu/Kconfig
++++ b/drivers/iommu/Kconfig
+@@ -272,6 +272,16 @@ config ARM_SMMU_V3
+ 	  Say Y here if your system includes an IOMMU device implementing
+ 	  the ARM SMMUv3 architecture.
+ 
++config ARM_SMMU_V3_SVA
++	bool "Shared Virtual Addressing support for the ARM SMMUv3"
++	depends on ARM_SMMU_V3
++	help
++	  Support for sharing process address spaces with devices using the
++	  SMMUv3.
++
++	  Say Y here if your system supports SVA extensions such as PCIe PASID
++	  and PRI.
++
+ config S390_IOMMU
+ 	def_bool y if S390 && PCI
+ 	depends on S390 && PCI
+* Unmerged path drivers/iommu/arm-smmu-v3-sva.c
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index 50b45eab7d93..35aa245af25b 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -732,7 +732,8 @@ struct arm_smmu_option_prop {
+ 	const char *prop;
+ };
+ 
+-static DEFINE_XARRAY_ALLOC1(asid_xa);
++DEFINE_XARRAY_ALLOC1(arm_smmu_asid_xa);
++DEFINE_MUTEX(arm_smmu_asid_lock);
+ 
+ static struct arm_smmu_option_prop arm_smmu_options[] = {
+ 	{ ARM_SMMU_OPT_SKIP_PREFETCH, "hisilicon,broken-prefetch-cmd" },
+@@ -1666,7 +1667,8 @@ static int arm_smmu_write_ctx_desc(struct arm_smmu_domain *smmu_domain,
+ #ifdef __BIG_ENDIAN
+ 			CTXDESC_CD_0_ENDI |
+ #endif
+-			CTXDESC_CD_0_R | CTXDESC_CD_0_A | CTXDESC_CD_0_ASET |
++			CTXDESC_CD_0_R | CTXDESC_CD_0_A |
++			(cd->mm ? 0 : CTXDESC_CD_0_ASET) |
+ 			CTXDESC_CD_0_AA64 |
+ 			FIELD_PREP(CTXDESC_CD_0_ASID, cd->asid) |
+ 			CTXDESC_CD_0_V;
+@@ -1770,12 +1772,20 @@ static void arm_smmu_free_cd_tables(struct arm_smmu_domain *smmu_domain)
+ 	cdcfg->cdtab = NULL;
+ }
+ 
+-static void arm_smmu_free_asid(struct arm_smmu_ctx_desc *cd)
++bool arm_smmu_free_asid(struct arm_smmu_ctx_desc *cd)
+ {
++	bool free;
++	struct arm_smmu_ctx_desc *old_cd;
++
+ 	if (!cd->asid)
+-		return;
++		return false;
+ 
+-	xa_erase(&asid_xa, cd->asid);
++	free = refcount_dec_and_test(&cd->refs);
++	if (free) {
++		old_cd = xa_erase(&arm_smmu_asid_xa, cd->asid);
++		WARN_ON(old_cd != cd);
++	}
++	return free;
+ }
+ 
+ /* Stream table manipulation functions */
+@@ -2463,9 +2473,12 @@ static void arm_smmu_domain_free(struct iommu_domain *domain)
+ 	if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
+ 		struct arm_smmu_s1_cfg *cfg = &smmu_domain->s1_cfg;
+ 
++		/* Prevent SVA from touching the CD while we're freeing it */
++		mutex_lock(&arm_smmu_asid_lock);
+ 		if (cfg->cdcfg.cdtab)
+ 			arm_smmu_free_cd_tables(smmu_domain);
+ 		arm_smmu_free_asid(&cfg->cd);
++		mutex_unlock(&arm_smmu_asid_lock);
+ 	} else {
+ 		struct arm_smmu_s2_cfg *cfg = &smmu_domain->s2_cfg;
+ 		if (cfg->vmid)
+@@ -2485,10 +2498,14 @@ static int arm_smmu_domain_finalise_s1(struct arm_smmu_domain *smmu_domain,
+ 	struct arm_smmu_s1_cfg *cfg = &smmu_domain->s1_cfg;
+ 	typeof(&pgtbl_cfg->arm_lpae_s1_cfg.tcr) tcr = &pgtbl_cfg->arm_lpae_s1_cfg.tcr;
+ 
+-	ret = xa_alloc(&asid_xa, &asid, &cfg->cd,
++	refcount_set(&cfg->cd.refs, 1);
++
++	/* Prevent SVA from modifying the ASID until it is written to the CD */
++	mutex_lock(&arm_smmu_asid_lock);
++	ret = xa_alloc(&arm_smmu_asid_xa, &asid, &cfg->cd,
+ 		       XA_LIMIT(1, (1 << smmu->asid_bits) - 1), GFP_KERNEL);
+ 	if (ret)
+-		return ret;
++		goto out_unlock;
+ 
+ 	cfg->s1cdmax = master->ssid_bits;
+ 
+@@ -2516,12 +2533,15 @@ static int arm_smmu_domain_finalise_s1(struct arm_smmu_domain *smmu_domain,
+ 	if (ret)
+ 		goto out_free_cd_tables;
+ 
++	mutex_unlock(&arm_smmu_asid_lock);
+ 	return 0;
+ 
+ out_free_cd_tables:
+ 	arm_smmu_free_cd_tables(smmu_domain);
+ out_free_asid:
+ 	arm_smmu_free_asid(&cfg->cd);
++out_unlock:
++	mutex_unlock(&arm_smmu_asid_lock);
+ 	return ret;
+ }
+ 
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/Makefile
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
