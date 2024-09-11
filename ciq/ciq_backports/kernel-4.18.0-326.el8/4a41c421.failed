@@ -1,0 +1,143 @@
+ibmvnic: serialize access to work queue on remove
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Sukadev Bhattiprolu <sukadev@linux.ibm.com>
+commit 4a41c421f3676fdeea91733cf434dcf319c4c351
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/4a41c421.failed
+
+The work queue is used to queue reset requests like CHANGE-PARAM or
+FAILOVER resets for the worker thread. When the adapter is being removed
+the adapter state is set to VNIC_REMOVING and the work queue is flushed
+so no new work is added. However the check for adapter being removed is
+racy in that the adapter can go into REMOVING state just after we check
+and we might end up adding work just as it is being flushed (or after).
+
+The ->rwi_lock is already being used to serialize queue/dequeue work.
+Extend its usage ensure there is no race when scheduling/flushing work.
+
+Fixes: 6954a9e4192b ("ibmvnic: Flush existing work items before device removal")
+	Signed-off-by: Sukadev Bhattiprolu <sukadev@linux.ibm.com>
+	Cc:Uwe Kleine-König <uwe@kleine-koenig.org>
+	Cc:Saeed Mahameed <saeed@kernel.org>
+	Reviewed-by: Dany Madden <drt@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4a41c421f3676fdeea91733cf434dcf319c4c351)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.h
+diff --cc drivers/net/ethernet/ibm/ibmvnic.h
+index 249a049abb14,72fea3b1c87d..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.h
++++ b/drivers/net/ethernet/ibm/ibmvnic.h
+@@@ -1092,12 -1080,10 +1092,17 @@@ struct ibmvnic_adapter 
+  
+  	struct tasklet_struct tasklet;
+  	enum vnic_state state;
+ +	/* Used for serializatin of state field */
+ +	spinlock_t state_lock;
+  	enum ibmvnic_reset_reason reset_reason;
+++<<<<<<< HEAD
+++=======
++ 	/* when taking both state and rwi locks, take state lock first */
++ 	spinlock_t rwi_lock;
+++>>>>>>> 4a41c421f367 (ibmvnic: serialize access to work queue on remove)
+  	struct list_head rwi_list;
+ +	/* Used for serialization of rwi_list */
+ +	spinlock_t rwi_lock;
+  	struct work_struct ibmvnic_reset;
+  	struct delayed_work ibmvnic_delayed_reset;
+  	unsigned long resetting;
+@@@ -1111,4 -1097,9 +1116,12 @@@
+  
+  	struct ibmvnic_tunables desired;
+  	struct ibmvnic_tunables fallback;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Used for serialization of state field. When taking both state
++ 	 * and rwi locks, take state lock first.
++ 	 */
++ 	spinlock_t state_lock;
+++>>>>>>> 4a41c421f367 (ibmvnic: serialize access to work queue on remove)
+  };
+diff --git a/drivers/net/ethernet/ibm/ibmvnic.c b/drivers/net/ethernet/ibm/ibmvnic.c
+index 56abdab40c9e..2206f8483162 100644
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@ -2392,6 +2392,8 @@ static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ 	unsigned long flags;
+ 	int ret;
+ 
++	spin_lock_irqsave(&adapter->rwi_lock, flags);
++
+ 	/*
+ 	 * If failover is pending don't schedule any other reset.
+ 	 * Instead let the failover complete. If there is already a
+@@ -2413,14 +2415,11 @@ static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ 		goto err;
+ 	}
+ 
+-	spin_lock_irqsave(&adapter->rwi_lock, flags);
+-
+ 	list_for_each(entry, &adapter->rwi_list) {
+ 		tmp = list_entry(entry, struct ibmvnic_rwi, list);
+ 		if (tmp->reset_reason == reason) {
+ 			netdev_dbg(netdev, "Skipping matching reset, reason=%d\n",
+ 				   reason);
+-			spin_unlock_irqrestore(&adapter->rwi_lock, flags);
+ 			ret = EBUSY;
+ 			goto err;
+ 		}
+@@ -2428,8 +2427,6 @@ static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ 
+ 	rwi = kzalloc(sizeof(*rwi), GFP_ATOMIC);
+ 	if (!rwi) {
+-		spin_unlock_irqrestore(&adapter->rwi_lock, flags);
+-		ibmvnic_close(netdev);
+ 		ret = ENOMEM;
+ 		goto err;
+ 	}
+@@ -2442,12 +2439,17 @@ static int ibmvnic_reset(struct ibmvnic_adapter *adapter,
+ 	}
+ 	rwi->reset_reason = reason;
+ 	list_add_tail(&rwi->list, &adapter->rwi_list);
+-	spin_unlock_irqrestore(&adapter->rwi_lock, flags);
+ 	netdev_dbg(adapter->netdev, "Scheduling reset (reason %d)\n", reason);
+ 	schedule_work(&adapter->ibmvnic_reset);
+ 
+-	return 0;
++	ret = 0;
+ err:
++	/* ibmvnic_close() below can block, so drop the lock first */
++	spin_unlock_irqrestore(&adapter->rwi_lock, flags);
++
++	if (ret == ENOMEM)
++		ibmvnic_close(netdev);
++
+ 	return -ret;
+ }
+ 
+@@ -5455,7 +5457,18 @@ static int ibmvnic_remove(struct vio_dev *dev)
+ 	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&adapter->state_lock, flags);
++
++	/* If ibmvnic_reset() is scheduling a reset, wait for it to
++	 * finish. Then, set the state to REMOVING to prevent it from
++	 * scheduling any more work and to have reset functions ignore
++	 * any resets that have already been scheduled. Drop the lock
++	 * after setting state, so __ibmvnic_reset() which is called
++	 * from the flush_work() below, can make progress.
++	 */
++	spin_lock_irqsave(&adapter->rwi_lock, flags);
+ 	adapter->state = VNIC_REMOVING;
++	spin_unlock_irqrestore(&adapter->rwi_lock, flags);
++
+ 	spin_unlock_irqrestore(&adapter->state_lock, flags);
+ 
+ 	flush_work(&adapter->ibmvnic_reset);
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.h
