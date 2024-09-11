@@ -1,0 +1,306 @@
+net_sched: convert idrinfo->lock from spinlock to a mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 95278ddaa15cfa23e4a06ee9ed7b6ee0197c500b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/95278dda.failed
+
+In commit ec3ed293e766 ("net_sched: change tcf_del_walker() to take idrinfo->lock")
+we move fl_hw_destroy_tmplt() to a workqueue to avoid blocking
+with the spinlock held. Unfortunately, this causes a lot of
+troubles here:
+
+1. tcf_chain_destroy() could be called right after we queue the work
+   but before the work runs. This is a use-after-free.
+
+2. The chain refcnt is already 0, we can't even just hold it again.
+   We can check refcnt==1 but it is ugly.
+
+3. The chain with refcnt 0 is still visible in its block, which means
+   it could be still found and used!
+
+4. The block has a refcnt too, we can't hold it without introducing a
+   proper API either.
+
+We can make it working but the end result is ugly. Instead of wasting
+time on reviewing it, let's just convert the troubling spinlock to
+a mutex, which allows us to use non-atomic allocations too.
+
+Fixes: ec3ed293e766 ("net_sched: change tcf_del_walker() to take idrinfo->lock")
+	Reported-by: Ido Schimmel <idosch@idosch.org>
+	Cc: Jamal Hadi Salim <jhs@mojatatu.com>
+	Cc: Vlad Buslov <vladbu@mellanox.com>
+	Cc: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Tested-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 95278ddaa15cfa23e4a06ee9ed7b6ee0197c500b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+diff --cc net/sched/act_api.c
+index 3b4dbb994330,55153da00278..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -99,6 -100,26 +99,29 @@@ static void tcf_idr_remove(struct tcf_i
+  	free_tcf(p);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __tcf_action_put(struct tc_action *p, bool bind)
++ {
++ 	struct tcf_idrinfo *idrinfo = p->idrinfo;
++ 
++ 	if (refcount_dec_and_mutex_lock(&p->tcfa_refcnt, &idrinfo->lock)) {
++ 		if (bind)
++ 			atomic_dec(&p->tcfa_bindcnt);
++ 		idr_remove(&idrinfo->action_idr, p->tcfa_index);
++ 		mutex_unlock(&idrinfo->lock);
++ 
++ 		tcf_action_cleanup(p);
++ 		return 1;
++ 	}
++ 
++ 	if (bind)
++ 		atomic_dec(&p->tcfa_bindcnt);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 95278ddaa15c (net_sched: convert idrinfo->lock from spinlock to a mutex)
+  int __tcf_idr_release(struct tc_action *p, bool bind, bool strict)
+  {
+  	int ret = 0;
+@@@ -295,40 -319,20 +318,48 @@@ int tcf_generic_walker(struct tc_action
+  }
+  EXPORT_SYMBOL(tcf_generic_walker);
+  
+ -int tcf_idr_search(struct tc_action_net *tn, struct tc_action **a, u32 index)
+ +static struct tc_action *tcf_idr_lookup(u32 index, struct tcf_idrinfo *idrinfo)
+  {
+ -	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+ -	struct tc_action *p;
+ +	struct tc_action *p = NULL;
+  
+- 	spin_lock(&idrinfo->lock);
++ 	mutex_lock(&idrinfo->lock);
+  	p = idr_find(&idrinfo->action_idr, index);
+++<<<<<<< HEAD
+ +	spin_unlock(&idrinfo->lock);
+++=======
++ 	if (IS_ERR(p))
++ 		p = NULL;
++ 	else if (p)
++ 		refcount_inc(&p->tcfa_refcnt);
++ 	mutex_unlock(&idrinfo->lock);
+++>>>>>>> 95278ddaa15c (net_sched: convert idrinfo->lock from spinlock to a mutex)
+ +
+ +	return p;
+ +}
+ +
+ +int tcf_idr_search(struct tc_action_net *tn, struct tc_action **a, u32 index)
+ +{
+ +	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+ +	struct tc_action *p = tcf_idr_lookup(index, idrinfo);
+  
+  	if (p) {
+ +		*a = p;
+ +		return 1;
+ +	}
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(tcf_idr_search);
+ +
+ +bool tcf_idr_check(struct tc_action_net *tn, u32 index, struct tc_action **a,
+ +		   int bind)
+ +{
+ +	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+ +	struct tc_action *p = tcf_idr_lookup(index, idrinfo);
+ +
+ +	if (index && p) {
+ +		if (bind)
+ +			p->tcfa_bindcnt++;
+ +		p->tcfa_refcnt++;
+  		*a = p;
+  		return true;
+  	}
+@@@ -355,13 -358,9 +386,13 @@@ int tcf_idr_delete_index(struct tc_acti
+  
+  			WARN_ON(p != idr_remove(&idrinfo->action_idr,
+  						p->tcfa_index));
+- 			spin_unlock(&idrinfo->lock);
++ 			mutex_unlock(&idrinfo->lock);
+  
+ -			tcf_action_cleanup(p);
+ +			if (p->ops->cleanup)
+ +				p->ops->cleanup(p);
+ +
+ +			gen_kill_estimator(&p->tcfa_rate_est);
+ +			free_tcf(p);
+  			module_put(owner);
+  			return 0;
+  		}
+@@@ -370,10 -369,9 +401,10 @@@
+  		ret = -EPERM;
+  	}
+  
+- 	spin_unlock(&idrinfo->lock);
++ 	mutex_unlock(&idrinfo->lock);
+  	return ret;
+  }
+ +EXPORT_SYMBOL(tcf_idr_delete_index);
+  
+  int tcf_idr_create(struct tc_action_net *tn, u32 index, struct nlattr *est,
+  		   struct tc_action **a, const struct tc_action_ops *ops,
+@@@ -446,12 -431,79 +477,88 @@@ void tcf_idr_insert(struct tc_action_ne
+  {
+  	struct tcf_idrinfo *idrinfo = tn->idrinfo;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&idrinfo->lock);
+ +	idr_replace(&idrinfo->action_idr, a, a->tcfa_index);
+ +	spin_unlock(&idrinfo->lock);
+ +}
+ +EXPORT_SYMBOL(tcf_idr_insert);
+ +
+++=======
++ 	mutex_lock(&idrinfo->lock);
++ 	/* Replace ERR_PTR(-EBUSY) allocated by tcf_idr_check_alloc */
++ 	WARN_ON(!IS_ERR(idr_replace(&idrinfo->action_idr, a, a->tcfa_index)));
++ 	mutex_unlock(&idrinfo->lock);
++ }
++ EXPORT_SYMBOL(tcf_idr_insert);
++ 
++ /* Cleanup idr index that was allocated but not initialized. */
++ 
++ void tcf_idr_cleanup(struct tc_action_net *tn, u32 index)
++ {
++ 	struct tcf_idrinfo *idrinfo = tn->idrinfo;
++ 
++ 	mutex_lock(&idrinfo->lock);
++ 	/* Remove ERR_PTR(-EBUSY) allocated by tcf_idr_check_alloc */
++ 	WARN_ON(!IS_ERR(idr_remove(&idrinfo->action_idr, index)));
++ 	mutex_unlock(&idrinfo->lock);
++ }
++ EXPORT_SYMBOL(tcf_idr_cleanup);
++ 
++ /* Check if action with specified index exists. If actions is found, increments
++  * its reference and bind counters, and return 1. Otherwise insert temporary
++  * error pointer (to prevent concurrent users from inserting actions with same
++  * index) and return 0.
++  */
++ 
++ int tcf_idr_check_alloc(struct tc_action_net *tn, u32 *index,
++ 			struct tc_action **a, int bind)
++ {
++ 	struct tcf_idrinfo *idrinfo = tn->idrinfo;
++ 	struct tc_action *p;
++ 	int ret;
++ 
++ again:
++ 	mutex_lock(&idrinfo->lock);
++ 	if (*index) {
++ 		p = idr_find(&idrinfo->action_idr, *index);
++ 		if (IS_ERR(p)) {
++ 			/* This means that another process allocated
++ 			 * index but did not assign the pointer yet.
++ 			 */
++ 			mutex_unlock(&idrinfo->lock);
++ 			goto again;
++ 		}
++ 
++ 		if (p) {
++ 			refcount_inc(&p->tcfa_refcnt);
++ 			if (bind)
++ 				atomic_inc(&p->tcfa_bindcnt);
++ 			*a = p;
++ 			ret = 1;
++ 		} else {
++ 			*a = NULL;
++ 			ret = idr_alloc_u32(&idrinfo->action_idr, NULL, index,
++ 					    *index, GFP_KERNEL);
++ 			if (!ret)
++ 				idr_replace(&idrinfo->action_idr,
++ 					    ERR_PTR(-EBUSY), *index);
++ 		}
++ 	} else {
++ 		*index = 1;
++ 		*a = NULL;
++ 		ret = idr_alloc_u32(&idrinfo->action_idr, NULL, index,
++ 				    UINT_MAX, GFP_KERNEL);
++ 		if (!ret)
++ 			idr_replace(&idrinfo->action_idr, ERR_PTR(-EBUSY),
++ 				    *index);
++ 	}
++ 	mutex_unlock(&idrinfo->lock);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(tcf_idr_check_alloc);
++ 
+++>>>>>>> 95278ddaa15c (net_sched: convert idrinfo->lock from spinlock to a mutex)
+  void tcf_idrinfo_destroy(const struct tc_action_ops *ops,
+  			 struct tcf_idrinfo *idrinfo)
+  {
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index b912ed75d38d..2ba6c145181f 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -12,7 +12,7 @@
+ #include <net/netns/generic.h>
+ 
+ struct tcf_idrinfo {
+-	spinlock_t	lock;
++	struct mutex	lock;
+ 	struct idr	action_idr;
+ };
+ 
+@@ -118,7 +118,7 @@ int tc_action_net_init(struct tc_action_net *tn,
+ 	if (!tn->idrinfo)
+ 		return -ENOMEM;
+ 	tn->ops = ops;
+-	spin_lock_init(&tn->idrinfo->lock);
++	mutex_init(&tn->idrinfo->lock);
+ 	idr_init(&tn->idrinfo->action_idr);
+ 	return err;
+ }
+* Unmerged path net/sched/act_api.c
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 5d7b922f3ed1..17336ef2d071 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -76,7 +76,6 @@ struct fl_flow_tmplt {
+ 	struct fl_flow_key mask;
+ 	struct flow_dissector dissector;
+ 	struct tcf_chain *chain;
+-	struct rcu_work rwork;
+ };
+ 
+ struct cls_fl_head {
+@@ -1264,20 +1263,12 @@ static void *fl_tmplt_create(struct net *net, struct tcf_chain *chain,
+ 	return ERR_PTR(err);
+ }
+ 
+-static void fl_tmplt_destroy_work(struct work_struct *work)
+-{
+-	struct fl_flow_tmplt *tmplt = container_of(to_rcu_work(work),
+-						 struct fl_flow_tmplt, rwork);
+-
+-	fl_hw_destroy_tmplt(tmplt->chain, tmplt);
+-	kfree(tmplt);
+-}
+-
+ static void fl_tmplt_destroy(void *tmplt_priv)
+ {
+ 	struct fl_flow_tmplt *tmplt = tmplt_priv;
+ 
+-	tcf_queue_work(&tmplt->rwork, fl_tmplt_destroy_work);
++	fl_hw_destroy_tmplt(tmplt->chain, tmplt);
++	kfree(tmplt);
+ }
+ 
+ static int fl_dump_key_val(struct sk_buff *skb,
