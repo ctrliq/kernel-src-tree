@@ -148,6 +148,9 @@ OPTIONS
 		  When showing BPF programs, show file names of pinned
 		  programs.
 
+	-m, --mapcompat
+		  Allow loading maps with unknown map definitions.
+
 EXAMPLES
 ========
 **# bpftool prog show**
