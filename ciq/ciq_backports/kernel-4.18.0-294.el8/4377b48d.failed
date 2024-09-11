@@ -1,0 +1,151 @@
+block: remove hd_struct_kill
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4377b48da6da44360cc76cd3e0562dbb47dd4904
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4377b48d.failed
+
+The function has a single caller, so just open code it.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4377b48da6da44360cc76cd3e0562dbb47dd4904)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+diff --cc block/blk.h
+index 5c44b4751a29,204963bb03e8..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -342,10 -375,106 +342,87 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+ -void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
+ -			int rw);
+ -void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
+ -			int rw);
+ -void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+ -struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
+ -
+ -int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
+ -void blk_free_devt(dev_t devt);
+ -void blk_invalidate_devt(dev_t devt);
+ -char *disk_name(struct gendisk *hd, int partno, char *buf);
+ -#define ADDPART_FLAG_NONE	0
+ -#define ADDPART_FLAG_RAID	1
+ -#define ADDPART_FLAG_WHOLEDISK	2
+ -void delete_partition(struct gendisk *disk, struct hd_struct *part);
+ -int bdev_add_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int bdev_del_partition(struct block_device *bdev, int partno);
+ -int bdev_resize_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int disk_expand_part_tbl(struct gendisk *disk, int target);
+ -int hd_ref_init(struct hd_struct *part);
+ -
+ -static inline void hd_struct_get(struct hd_struct *part)
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+  {
+ -	percpu_ref_get(&part->ref);
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline int hd_struct_try_get(struct hd_struct *part)
++ {
++ 	return percpu_ref_tryget_live(&part->ref);
++ }
++ 
++ static inline void hd_struct_put(struct hd_struct *part)
++ {
++ 	percpu_ref_put(&part->ref);
++ }
++ 
++ static inline void hd_free_part(struct hd_struct *part)
++ {
++ 	free_part_stats(part);
++ 	kfree(part->info);
++ 	percpu_ref_exit(&part->ref);
++ }
++ 
++ /*
++  * Any access of part->nr_sects which is not protected by partition
++  * bd_mutex or gendisk bdev bd_mutex, should be done using this
++  * accessor function.
++  *
++  * Code written along the lines of i_size_read() and i_size_write().
++  * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
++  * on.
++  */
++ static inline sector_t part_nr_sects_read(struct hd_struct *part)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	sector_t nr_sects;
++ 	unsigned seq;
++ 	do {
++ 		seq = read_seqcount_begin(&part->nr_sects_seq);
++ 		nr_sects = part->nr_sects;
++ 	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
++ 	return nr_sects;
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	sector_t nr_sects;
++ 
++ 	preempt_disable();
++ 	nr_sects = part->nr_sects;
++ 	preempt_enable();
++ 	return nr_sects;
++ #else
++ 	return part->nr_sects;
++ #endif
++ }
++ 
++ /*
++  * Should be called with mutex lock held (typically bd_mutex) of partition
++  * to provide mutual exlusion among writers otherwise seqcount might be
++  * left in wrong state leaving the readers spinning infinitely.
++  */
++ static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	write_seqcount_begin(&part->nr_sects_seq);
++ 	part->nr_sects = size;
++ 	write_seqcount_end(&part->nr_sects_seq);
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	preempt_disable();
++ 	part->nr_sects = size;
++ 	preempt_enable();
++ #else
++ 	part->nr_sects = size;
++ #endif
++ }
++ 
++ struct request_queue *__blk_alloc_queue(int node_id);
++ 
++ int __bio_add_pc_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset,
++ 		bool *same_page);
++ 
+++>>>>>>> 4377b48da6da (block: remove hd_struct_kill)
+  #endif /* BLK_INTERNAL_H */
+* Unmerged path block/blk.h
+diff --git a/block/partition-generic.c b/block/partition-generic.c
+index 459e9684cfbb..4268d353c9ba 100644
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@ -288,7 +288,7 @@ void delete_partition(struct gendisk *disk, int partno)
+ 	 * "in-use" until we really free the gendisk.
+ 	 */
+ 	blk_invalidate_devt(part_devt(part));
+-	hd_struct_kill(part);
++	percpu_ref_kill(&part->ref);
+ }
+ 
+ static ssize_t whole_disk_show(struct device *dev,
