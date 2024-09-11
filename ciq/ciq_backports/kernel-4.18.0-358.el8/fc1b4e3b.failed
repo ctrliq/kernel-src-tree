@@ -1,0 +1,150 @@
+mptcp: add mibs for stale subflows processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit fc1b4e3b6274379a1ed398e19b850561ccd765db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/fc1b4e3b.failed
+
+This allows monitoring exceptional events like
+active backup scenarios.
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit fc1b4e3b6274379a1ed398e19b850561ccd765db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/pm_netlink.c
+index 41d1ed7a0e8c,ac0aa6faacfa..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -891,6 -900,43 +891,46 @@@ static const struct nla_policy mptcp_pm
+  	[MPTCP_PM_ATTR_SUBFLOWS]	= { .type	= NLA_U32,	},
+  };
+  
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_nl_subflow_chk_stale(const struct mptcp_sock *msk, struct sock *ssk)
++ {
++ 	struct mptcp_subflow_context *iter, *subflow = mptcp_subflow_ctx(ssk);
++ 	struct sock *sk = (struct sock *)msk;
++ 	unsigned int active_max_loss_cnt;
++ 	struct net *net = sock_net(sk);
++ 	unsigned int stale_loss_cnt;
++ 	bool slow;
++ 
++ 	stale_loss_cnt = mptcp_stale_loss_cnt(net);
++ 	if (subflow->stale || !stale_loss_cnt || subflow->stale_count <= stale_loss_cnt)
++ 		return;
++ 
++ 	/* look for another available subflow not in loss state */
++ 	active_max_loss_cnt = max_t(int, stale_loss_cnt - 1, 1);
++ 	mptcp_for_each_subflow(msk, iter) {
++ 		if (iter != subflow && mptcp_subflow_active(iter) &&
++ 		    iter->stale_count < active_max_loss_cnt) {
++ 			/* we have some alternatives, try to mark this subflow as idle ...*/
++ 			slow = lock_sock_fast(ssk);
++ 			if (!tcp_rtx_and_write_queues_empty(ssk)) {
++ 				subflow->stale = 1;
++ 				__mptcp_retransmit_pending_data(sk);
++ 				MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_SUBFLOWSTALE);
++ 			}
++ 			unlock_sock_fast(ssk, slow);
++ 
++ 			/* always try to push the pending data regarless of re-injections:
++ 			 * we can possibly use backup subflows now, and subflow selection
++ 			 * is cheap under the msk socket lock
++ 			 */
++ 			__mptcp_push_pending(sk, 0);
++ 			return;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> fc1b4e3b6274 (mptcp: add mibs for stale subflows processing)
+  static int mptcp_pm_family_to_addr(int family)
+  {
+  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+diff --cc net/mptcp/protocol.c
+index 11b37cc5a34e,22214a58d892..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1374,6 -1391,28 +1374,31 @@@ struct subflow_send_info 
+  	u64 ratio;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ void mptcp_subflow_set_active(struct mptcp_subflow_context *subflow)
++ {
++ 	if (!subflow->stale)
++ 		return;
++ 
++ 	subflow->stale = 0;
++ 	MPTCP_INC_STATS(sock_net(mptcp_subflow_tcp_sock(subflow)), MPTCP_MIB_SUBFLOWRECOVER);
++ }
++ 
++ bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++ {
++ 	if (unlikely(subflow->stale)) {
++ 		u32 rcv_tstamp = READ_ONCE(tcp_sk(mptcp_subflow_tcp_sock(subflow))->rcv_tstamp);
++ 
++ 		if (subflow->stale_rcv_tstamp == rcv_tstamp)
++ 			return false;
++ 
++ 		mptcp_subflow_set_active(subflow);
++ 	}
++ 	return __mptcp_subflow_active(subflow);
++ }
++ 
+++>>>>>>> fc1b4e3b6274 (mptcp: add mibs for stale subflows processing)
+  /* implement the mptcp packet scheduler;
+   * returns the subflow that will transmit the next DSS
+   * additionally updates the rtx timeout
+diff --git a/net/mptcp/mib.c b/net/mptcp/mib.c
+index 645a320068a3..e74b5b8ac80d 100644
+--- a/net/mptcp/mib.c
++++ b/net/mptcp/mib.c
+@@ -43,6 +43,8 @@ static const struct snmp_mib mptcp_snmp_list[] = {
+ 	SNMP_MIB_ITEM("MPPrioTx", MPTCP_MIB_MPPRIOTX),
+ 	SNMP_MIB_ITEM("MPPrioRx", MPTCP_MIB_MPPRIORX),
+ 	SNMP_MIB_ITEM("RcvPruned", MPTCP_MIB_RCVPRUNED),
++	SNMP_MIB_ITEM("SubflowStale", MPTCP_MIB_SUBFLOWSTALE),
++	SNMP_MIB_ITEM("SubflowRecover", MPTCP_MIB_SUBFLOWRECOVER),
+ 	SNMP_MIB_SENTINEL
+ };
+ 
+diff --git a/net/mptcp/mib.h b/net/mptcp/mib.h
+index f456fba6a8d5..1867f47d3763 100644
+--- a/net/mptcp/mib.h
++++ b/net/mptcp/mib.h
+@@ -36,6 +36,8 @@ enum linux_mptcp_mib_field {
+ 	MPTCP_MIB_MPPRIOTX,		/* Transmit a MP_PRIO */
+ 	MPTCP_MIB_MPPRIORX,		/* Received a MP_PRIO */
+ 	MPTCP_MIB_RCVPRUNED,		/* Incoming packet dropped due to memory limit */
++	MPTCP_MIB_SUBFLOWSTALE,		/* Subflows entered 'stale' status */
++	MPTCP_MIB_SUBFLOWRECOVER,	/* Subflows returned to active status after being stale */
+ 	__MPTCP_MIB_MAX
+ };
+ 
+diff --git a/net/mptcp/pm.c b/net/mptcp/pm.c
+index f42945077607..152c52804a80 100644
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@ -10,6 +10,8 @@
+ #include <net/mptcp.h>
+ #include "protocol.h"
+ 
++#include "mib.h"
++
+ /* path manager command handlers */
+ 
+ int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.c
