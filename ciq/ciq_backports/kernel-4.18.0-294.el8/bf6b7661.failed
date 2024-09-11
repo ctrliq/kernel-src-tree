@@ -1,0 +1,167 @@
+powerpc/book3s64/radix: Add kernel command line option to disable radix GTSE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit bf6b7661f41615c0815fce0a3f27acb5fc005470
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bf6b7661.failed
+
+This adds a kernel command line option that can be used to disable GTSE support.
+Disabling GTSE implies kernel will make hcalls to invalidate TLB entries.
+
+This was done so that we can do VM migration between configs that enable/disable
+GTSE support via hypervisor. To migrate a VM from a system that supports
+GTSE to a system that doesn't, we can boot the guest with
+radix_hcall_invalidate=on, thereby forcing the guest to use hcalls for TLB
+invalidates.
+
+The check for hcall availability is done in pSeries_setup_arch so that
+the panic message appears on the console. This should only happen on
+a hypervisor that doesn't force the guest to hash translation even
+though it can't handle the radix GTSE=0 request via CAS. With
+radix_hcall_invalidate=on if the hypervisor doesn't support hcall_rpt_invalidate
+hcall it should force the LPAR to hash translation.
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Tested-by: Bharata B Rao <bharata@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200727085908.420806-1-aneesh.kumar@linux.ibm.com
+(cherry picked from commit bf6b7661f41615c0815fce0a3f27acb5fc005470)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/powerpc/mm/init_64.c
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index 364acc6154e5,3ab61cd0f89c..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -876,6 -896,14 +876,17 @@@
+  	disable_radix	[PPC]
+  			Disable RADIX MMU mode on POWER9
+  
+++<<<<<<< HEAD
+++=======
++ 	radix_hcall_invalidate=on  [PPC/PSERIES]
++ 			Disable RADIX GTSE feature and use hcall for TLB
++ 			invalidate.
++ 
++ 	disable_tlbie	[PPC]
++ 			Disable TLBIE instruction. Currently does not work
++ 			with KVM, with HASH MMU, or with coherent accelerators.
++ 
+++>>>>>>> bf6b7661f416 (powerpc/book3s64/radix: Add kernel command line option to disable radix GTSE)
+  	disable_cpu_apicid= [X86,APIC,SMP]
+  			Format: <int>
+  			The number of initial APIC ID for the
+diff --cc arch/powerpc/mm/init_64.c
+index 65fda3632456,4ae5fc0ceb30..000000000000
+--- a/arch/powerpc/mm/init_64.c
++++ b/arch/powerpc/mm/init_64.c
+@@@ -397,8 -406,9 +397,14 @@@ static void __init early_check_vec5(voi
+  		}
+  		if (!(vec5[OV5_INDX(OV5_RADIX_GTSE)] &
+  						OV5_FEAT(OV5_RADIX_GTSE))) {
+++<<<<<<< HEAD
+ +			pr_warn("WARNING: Hypervisor doesn't support RADIX with GTSE\n");
+ +		}
+++=======
++ 			cur_cpu_spec->mmu_features &= ~MMU_FTR_GTSE;
++ 		} else
++ 			cur_cpu_spec->mmu_features |= MMU_FTR_GTSE;
+++>>>>>>> bf6b7661f416 (powerpc/book3s64/radix: Add kernel command line option to disable radix GTSE)
+  		/* Do radix anyway - the hypervisor said we had to */
+  		cur_cpu_spec->mmu_features |= MMU_FTR_TYPE_RADIX;
+  	} else if (mmu_supported == OV5_FEAT(OV5_MMU_HASH)) {
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+diff --git a/arch/powerpc/include/asm/firmware.h b/arch/powerpc/include/asm/firmware.h
+index e4d42953c9b6..16949167d566 100644
+--- a/arch/powerpc/include/asm/firmware.h
++++ b/arch/powerpc/include/asm/firmware.h
+@@ -57,6 +57,7 @@
+ #define FW_FEATURE_PAPR_SCM 	ASM_CONST(0x0000002000000000)
+ #define FW_FEATURE_ULTRAVISOR	ASM_CONST(0x0000004000000000)
+ #define FW_FEATURE_STUFF_TCE	ASM_CONST(0x0000008000000000)
++#define FW_FEATURE_RPT_INVALIDATE ASM_CONST(0x0000010000000000)
+ 
+ #ifndef __ASSEMBLY__
+ 
+@@ -76,7 +77,8 @@ enum {
+ 		FW_FEATURE_TYPE1_AFFINITY | FW_FEATURE_PRRN |
+ 		FW_FEATURE_HPT_RESIZE | FW_FEATURE_DRMEM_V2 |
+ 		FW_FEATURE_DRC_INFO | FW_FEATURE_BLOCK_REMOVE |
+-		FW_FEATURE_PAPR_SCM | FW_FEATURE_ULTRAVISOR,
++		FW_FEATURE_PAPR_SCM | FW_FEATURE_ULTRAVISOR |
++		FW_FEATURE_RPT_INVALIDATE,
+ 	FW_FEATURE_PSERIES_ALWAYS = 0,
+ 	FW_FEATURE_POWERNV_POSSIBLE = FW_FEATURE_OPAL | FW_FEATURE_ULTRAVISOR,
+ 	FW_FEATURE_POWERNV_ALWAYS = 0,
+diff --git a/arch/powerpc/kernel/prom_init.c b/arch/powerpc/kernel/prom_init.c
+index 0998949cc414..31fe7f7a072b 100644
+--- a/arch/powerpc/kernel/prom_init.c
++++ b/arch/powerpc/kernel/prom_init.c
+@@ -176,6 +176,7 @@ static unsigned long __prombss prom_tce_alloc_end;
+ 
+ #ifdef CONFIG_PPC_PSERIES
+ static bool __prombss prom_radix_disable;
++static bool __prombss prom_radix_gtse_disable;
+ static bool __prombss prom_xive_disable;
+ #endif
+ 
+@@ -818,6 +819,12 @@ static void __init early_cmdline_parse(void)
+ 	if (prom_radix_disable)
+ 		prom_debug("Radix disabled from cmdline\n");
+ 
++	opt = prom_strstr(prom_cmd_line, "radix_hcall_invalidate=on");
++	if (opt) {
++		prom_radix_gtse_disable = true;
++		prom_debug("Radix GTSE disabled from cmdline\n");
++	}
++
+ 	opt = prom_strstr(prom_cmd_line, "xive=off");
+ 	if (opt) {
+ 		prom_xive_disable = true;
+@@ -1272,10 +1279,8 @@ static void __init prom_parse_platform_support(u8 index, u8 val,
+ 		prom_parse_mmu_model(val & OV5_FEAT(OV5_MMU_SUPPORT), support);
+ 		break;
+ 	case OV5_INDX(OV5_RADIX_GTSE): /* Radix Extensions */
+-		if (val & OV5_FEAT(OV5_RADIX_GTSE)) {
+-			prom_debug("Radix - GTSE supported\n");
+-			support->radix_gtse = true;
+-		}
++		if (val & OV5_FEAT(OV5_RADIX_GTSE))
++			support->radix_gtse = !prom_radix_gtse_disable;
+ 		break;
+ 	case OV5_INDX(OV5_XIVE_SUPPORT): /* Interrupt mode */
+ 		prom_parse_xive_model(val & OV5_FEAT(OV5_XIVE_SUPPORT),
+* Unmerged path arch/powerpc/mm/init_64.c
+diff --git a/arch/powerpc/platforms/pseries/firmware.c b/arch/powerpc/platforms/pseries/firmware.c
+index f0086cd92f15..38803900bac2 100644
+--- a/arch/powerpc/platforms/pseries/firmware.c
++++ b/arch/powerpc/platforms/pseries/firmware.c
+@@ -69,6 +69,7 @@ hypertas_fw_features_table[] = {
+ 	{FW_FEATURE_HPT_RESIZE,		"hcall-hpt-resize"},
+ 	{FW_FEATURE_BLOCK_REMOVE,	"hcall-block-remove"},
+ 	{FW_FEATURE_PAPR_SCM,		"hcall-scm"},
++	{FW_FEATURE_RPT_INVALIDATE,	"hcall-rpt-invalidate"},
+ };
+ 
+ /* Build up the firmware features bitmask using the contents of
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index ddef63bc6c74..49f251ee2825 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -737,6 +737,11 @@ static void __init pSeries_setup_arch(void)
+ 	smp_init_pseries();
+ 
+ 
++	if (radix_enabled() && !mmu_has_feature(MMU_FTR_GTSE))
++		if (!firmware_has_feature(FW_FEATURE_RPT_INVALIDATE))
++			panic("BUG: Radix support requires either GTSE or RPT_INVALIDATE\n");
++
++
+ 	/* openpic global configuration register (64-bit format). */
+ 	/* openpic Interrupt Source Unit pointer (64-bit format). */
+ 	/* python0 facility area (mmio) (64-bit format) REAL address. */
