@@ -1,0 +1,824 @@
+PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 5861381d486601430cccf64849bd0a226154bc0d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5861381d.failed
+
+The current handling of MSR_IA32_ENERGY_PERF_BIAS in the kernel is
+problematic, because it may cause changes made by user space to that
+MSR (with the help of the x86_energy_perf_policy tool, for example)
+to be lost every time a CPU goes offline and then back online as well
+as during system-wide power management transitions into sleep states
+and back into the working state.
+
+The first problem is that if the current EPB value for a CPU going
+online is 0 ('performance'), the kernel will change it to 6 ('normal')
+regardless of whether or not this is the first bring-up of that CPU.
+That also happens during system-wide resume from sleep states
+(including, but not limited to, hibernation).  However, the EPB may
+have been adjusted by user space this way and the kernel should not
+blindly override that setting.
+
+The second problem is that if the platform firmware resets the EPB
+values for any CPUs during system-wide resume from a sleep state,
+the kernel will not restore their previous EPB values that may
+have been set by user space before the preceding system-wide
+suspend transition.  Again, that behavior may at least be confusing
+from the user space perspective.
+
+In order to address these issues, rework the handling of
+MSR_IA32_ENERGY_PERF_BIAS so that the EPB value is saved on CPU
+offline and restored on CPU online as well as (for the boot CPU)
+during the syscore stages of system-wide suspend and resume
+transitions, respectively.
+
+However, retain the policy by which the EPB is set to 6 ('normal')
+on the first bring-up of each CPU if its initial value is 0, based
+on the observation that 0 may mean 'not initialized' just as well as
+'performance' in that case.
+
+While at it, move the MSR_IA32_ENERGY_PERF_BIAS handling code into
+a separate file and document it in Documentation/admin-guide.
+
+Fixes: abe48b108247 (x86, intel, power: Initialize MSR_IA32_ENERGY_PERF_BIAS)
+Fixes: b51ef52df71c (x86/cpu: Restore MSR_IA32_ENERGY_PERF_BIAS after resume)
+	Reported-by: Thomas Renninger <trenn@suse.de>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Acked-by: Borislav Petkov <bp@suse.de>
+	Acked-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 5861381d486601430cccf64849bd0a226154bc0d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/pm/working-state.rst
+#	arch/x86/kernel/cpu/Makefile
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/cpu/intel.c
+#	include/linux/cpuhotplug.h
+diff --cc Documentation/admin-guide/pm/working-state.rst
+index cdfe68575dbb,beb004d3632b..000000000000
+--- a/Documentation/admin-guide/pm/working-state.rst
++++ b/Documentation/admin-guide/pm/working-state.rst
+@@@ -8,7 -6,6 +8,11 @@@ Working-State Power Managemen
+     :maxdepth: 2
+  
+     cpuidle
+ +   intel_idle
+     cpufreq
+     intel_pstate
+++<<<<<<< HEAD
+ +   intel-speed-select
+++=======
++    intel_epb
+++>>>>>>> 5861381d4866 (PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling)
+diff --cc arch/x86/kernel/cpu/Makefile
+index cf642382ed51,1796d2bdcaaa..000000000000
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@@ -32,9 -28,9 +32,13 @@@ obj-y			+= umwait.
+  obj-$(CONFIG_PROC_FS)	+= proc.o
+  obj-$(CONFIG_X86_FEATURE_NAMES) += capflags.o powerflags.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_IA32_FEAT_CTL) += feat_ctl.o
+ +obj-$(CONFIG_CPU_SUP_INTEL)		+= intel.o intel_pconfig.o tsx.o
+++=======
++ obj-$(CONFIG_CPU_SUP_INTEL)		+= intel.o intel_pconfig.o intel_epb.o
+++>>>>>>> 5861381d4866 (PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling)
+  obj-$(CONFIG_CPU_SUP_AMD)		+= amd.o
+ -obj-$(CONFIG_CPU_SUP_HYGON)		+= hygon.o
+  obj-$(CONFIG_CPU_SUP_CYRIX_32)		+= cyrix.o
+  obj-$(CONFIG_CPU_SUP_CENTAUR)		+= centaur.o
+  obj-$(CONFIG_CPU_SUP_TRANSMETA_32)	+= transmeta.o
+diff --cc arch/x86/kernel/cpu/common.c
+index 375d82321a80,5e37dfa4d9df..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -2057,22 -1801,68 +2057,87 @@@ void cpu_init(void
+  	load_fixmap_gdt(cpu);
+  }
+  
+++<<<<<<< HEAD
+ +static void bsp_resume(void)
+ +{
+ +	if (this_cpu->c_bsp_resume)
+ +		this_cpu->c_bsp_resume(&boot_cpu_data);
+ +}
+ +
+ +static struct syscore_ops cpu_syscore_ops = {
+ +	.resume		= bsp_resume,
+ +};
+ +
+ +static int __init init_cpu_syscore(void)
+ +{
+ +	register_syscore_ops(&cpu_syscore_ops);
+ +	return 0;
+ +}
+ +core_initcall(init_cpu_syscore);
+++=======
++ #else
++ 
++ void cpu_init(void)
++ {
++ 	int cpu = smp_processor_id();
++ 	struct task_struct *curr = current;
++ 	struct tss_struct *t = &per_cpu(cpu_tss_rw, cpu);
++ 
++ 	wait_for_master_cpu(cpu);
++ 
++ 	/*
++ 	 * Initialize the CR4 shadow before doing anything that could
++ 	 * try to read it.
++ 	 */
++ 	cr4_init_shadow();
++ 
++ 	show_ucode_info_early();
++ 
++ 	pr_info("Initializing CPU#%d\n", cpu);
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_VME) ||
++ 	    boot_cpu_has(X86_FEATURE_TSC) ||
++ 	    boot_cpu_has(X86_FEATURE_DE))
++ 		cr4_clear_bits(X86_CR4_VME|X86_CR4_PVI|X86_CR4_TSD|X86_CR4_DE);
++ 
++ 	load_current_idt();
++ 	switch_to_new_gdt(cpu);
++ 
++ 	/*
++ 	 * Set up and load the per-CPU TSS and LDT
++ 	 */
++ 	mmgrab(&init_mm);
++ 	curr->active_mm = &init_mm;
++ 	BUG_ON(curr->mm);
++ 	initialize_tlbstate_and_flush();
++ 	enter_lazy_tlb(&init_mm, curr);
++ 
++ 	/*
++ 	 * Initialize the TSS.  sp0 points to the entry trampoline stack
++ 	 * regardless of what task is running.
++ 	 */
++ 	set_tss_desc(cpu, &get_cpu_entry_area(cpu)->tss.x86_tss);
++ 	load_TR_desc();
++ 	load_sp0((unsigned long)(cpu_entry_stack(cpu) + 1));
++ 
++ 	load_mm_ldt(&init_mm);
++ 
++ 	t->x86_tss.io_bitmap_base = IO_BITMAP_OFFSET;
++ 
++ #ifdef CONFIG_DOUBLEFAULT
++ 	/* Set up doublefault TSS pointer in the GDT */
++ 	__set_tss_desc(cpu, GDT_ENTRY_DOUBLEFAULT_TSS, &doublefault_tss);
++ #endif
++ 
++ 	clear_all_debug_regs();
++ 	dbg_restore_debug_regs();
++ 
++ 	fpu__init_cpu();
++ 
++ 	load_fixmap_gdt(cpu);
++ }
++ #endif
+++>>>>>>> 5861381d4866 (PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling)
+  
+  /*
+   * The microcode loader calls this upon late microcode load to recheck features,
+diff --cc arch/x86/kernel/cpu/intel.c
+index aad189b91b66,f17c1a714779..000000000000
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@@ -781,22 -733,7 +751,20 @@@ static void init_intel(struct cpuinfo_x
+  	if (cpu_has(c, X86_FEATURE_TME))
+  		detect_tme(c);
+  
+- 	init_intel_energy_perf(c);
+- 
+  	init_intel_misc_features(c);
+ +
+ +	if (tsx_ctrl_state == TSX_CTRL_ENABLE)
+ +		tsx_enable();
+ +	else if (tsx_ctrl_state == TSX_CTRL_DISABLE)
+ +		tsx_disable();
+ +	else if (tsx_ctrl_state == TSX_CTRL_RTM_ALWAYS_ABORT)
+ +		/* See comment over that function for more details. */
+ +		tsx_clear_cpuid();
+ +
+ +	split_lock_init();
+ +	bus_lock_init();
+ +
+ +	intel_init_thermal(c);
+  }
+  
+  #ifdef CONFIG_X86_32
+@@@ -1053,413 -990,8 +1021,415 @@@ static const struct cpu_dev intel_cpu_d
+  #endif
+  	.c_detect_tlb	= intel_detect_tlb,
+  	.c_early_init   = early_init_intel,
+ +	.c_bsp_init	= bsp_init_intel,
+  	.c_init		= init_intel,
+- 	.c_bsp_resume	= intel_bsp_resume,
+  	.c_x86_vendor	= X86_VENDOR_INTEL,
+  };
+  
+  cpu_dev_register(intel_cpu_dev);
+++<<<<<<< HEAD
+ +
+ +#undef pr_fmt
+ +#define pr_fmt(fmt) "x86/split lock detection: " fmt
+ +
+ +static const struct {
+ +	const char			*option;
+ +	enum split_lock_detect_state	state;
+ +} sld_options[] = {
+ +	{ "off",	sld_off   },
+ +	{ "warn",	sld_warn  },
+ +	{ "fatal",	sld_fatal },
+ +	{ "ratelimit:", sld_ratelimit },
+ +};
+ +
+ +static struct ratelimit_state bld_ratelimit;
+ +
+ +static inline bool match_option(const char *arg, int arglen, const char *opt)
+ +{
+ +	int len = strlen(opt), ratelimit;
+ +
+ +	if (strncmp(arg, opt, len))
+ +		return false;
+ +
+ +	/*
+ +	 * Min ratelimit is 1 bus lock/sec.
+ +	 * Max ratelimit is 1000 bus locks/sec.
+ +	 */
+ +	if (sscanf(arg, "ratelimit:%d", &ratelimit) == 1 &&
+ +	    ratelimit > 0 && ratelimit <= 1000) {
+ +		ratelimit_state_init(&bld_ratelimit, HZ, ratelimit);
+ +		ratelimit_set_flags(&bld_ratelimit, RATELIMIT_MSG_ON_RELEASE);
+ +		return true;
+ +	}
+ +
+ +	return len == arglen;
+ +}
+ +
+ +static bool split_lock_verify_msr(bool on)
+ +{
+ +	u64 ctrl, tmp;
+ +
+ +	if (rdmsrl_safe(MSR_TEST_CTRL, &ctrl))
+ +		return false;
+ +	if (on)
+ +		ctrl |= MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
+ +	else
+ +		ctrl &= ~MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
+ +	if (wrmsrl_safe(MSR_TEST_CTRL, ctrl))
+ +		return false;
+ +	rdmsrl(MSR_TEST_CTRL, tmp);
+ +	return ctrl == tmp;
+ +}
+ +
+ +static void __init sld_state_setup(void)
+ +{
+ +	enum split_lock_detect_state state = sld_off;
+ +	char arg[20];
+ +	int i, ret;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT) &&
+ +	    !boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT))
+ +		return;
+ +
+ +	ret = cmdline_find_option(boot_command_line, "split_lock_detect",
+ +				  arg, sizeof(arg));
+ +	if (ret >= 0) {
+ +		for (i = 0; i < ARRAY_SIZE(sld_options); i++) {
+ +			if (match_option(arg, ret, sld_options[i].option)) {
+ +				state = sld_options[i].state;
+ +				break;
+ +			}
+ +		}
+ +	}
+ +
+ +	if (state == sld_ratelimit) {
+ +		pr_info("#DB: system wide bus lock rate limit is not implemented in RHEL8.  Defaulting to warn.\n");
+ +		state = sld_warn;
+ +	}
+ +
+ +	sld_state = state;
+ +}
+ +
+ +static void __init __split_lock_setup(void)
+ +{
+ +	if (!split_lock_verify_msr(false)) {
+ +		pr_info("MSR access failed: Disabled\n");
+ +		return;
+ +	}
+ +
+ +	rdmsrl(MSR_TEST_CTRL, msr_test_ctrl_cache);
+ +
+ +	if (!split_lock_verify_msr(sld_state != sld_off)) {
+ +		pr_info("MSR access failed: Disabled\n");
+ +		return;
+ +	}
+ +
+ +	/* Restore the MSR to its cached value. */
+ +	wrmsrl(MSR_TEST_CTRL, msr_test_ctrl_cache);
+ +
+ +	setup_force_cpu_cap(X86_FEATURE_SPLIT_LOCK_DETECT);
+ +}
+ +
+ +/*
+ + * MSR_TEST_CTRL is per core, but we treat it like a per CPU MSR. Locking
+ + * is not implemented as one thread could undo the setting of the other
+ + * thread immediately after dropping the lock anyway.
+ + */
+ +static void sld_update_msr(bool on)
+ +{
+ +	u64 test_ctrl_val = msr_test_ctrl_cache;
+ +
+ +	if (on)
+ +		test_ctrl_val |= MSR_TEST_CTRL_SPLIT_LOCK_DETECT;
+ +
+ +	wrmsrl(MSR_TEST_CTRL, test_ctrl_val);
+ +}
+ +
+ +static void split_lock_init(void)
+ +{
+ +	/*
+ +	 * #DB for bus lock handles ratelimit and #AC for split lock is
+ +	 * disabled.
+ +	 */
+ +	if (sld_state == sld_ratelimit) {
+ +		split_lock_verify_msr(false);
+ +		return;
+ +	}
+ +
+ +	if (cpu_model_supports_sld)
+ +		split_lock_verify_msr(sld_state != sld_off);
+ +}
+ +
+ +/* RHEL8 only split_lock enable/disable sysfs file */
+ +static ssize_t
+ +split_lock_detect_show(struct device *dev, struct device_attribute *attr,
+ +		       char *buf)
+ +{
+ +	return sprintf(buf, "%s\n", sld_options[sld_state].option);
+ +}
+ +
+ +static ssize_t
+ +split_lock_detect_store(struct device *dev, struct device_attribute *attr,
+ +			const char *buf, size_t count)
+ +{
+ +	if (!strncmp(buf, "off", 3)) {
+ +		sld_state = sld_off;
+ +		sld_update_msr(false);
+ +	}
+ +
+ +	if (!strncmp(buf, "warn", 4)) {
+ +		pr_info("warning about split_locks\n");
+ +		sld_state = sld_warn;
+ +		sld_update_msr(true);
+ +	}
+ +
+ +	if (!strncmp(buf, "fatal", 5)) {
+ +		pr_info("sending SIGBUS on user-space split_locks, panic on kernel split_locks\n");
+ +		sld_state = sld_fatal;
+ +		sld_update_msr(true);
+ +	}
+ +
+ +	return count;
+ +}
+ +
+ +static DEVICE_ATTR_RW(split_lock_detect);
+ +
+ +static int __init split_lock_late_init(void)
+ +{
+ +	int ret;
+ +
+ +	if (!boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
+ +		return -ENODEV;
+ +
+ +	ret = device_create_file(cpu_subsys.dev_root,
+ +				 &dev_attr_split_lock_detect);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return 0;
+ +}
+ +
+ +subsys_initcall(split_lock_late_init);
+ +
+ +void handle_kernel_split_lock(struct pt_regs *regs, long error_code)
+ +{
+ +	msr_clear_bit(MSR_TEST_CTRL,
+ +		      MSR_TEST_CTRL_SPLIT_LOCK_DETECT_BIT);
+ +
+ +	WARN((sld_state == sld_warn), "Split lock detected\n");
+ +
+ +	if (sld_state == sld_fatal)
+ +		die("Split lock detected\n", regs, error_code);
+ +}
+ +
+ +static void split_lock_warn(unsigned long ip)
+ +{
+ +	pr_warn_ratelimited("#AC: %s/%d took a split_lock trap at address: 0x%lx\n",
+ +			    current->comm, current->pid, ip);
+ +
+ +	/*
+ +	 * Disable the split lock detection for this task so it can make
+ +	 * progress and set TIF_SLD so the detection is re-enabled via
+ +	 * switch_to_sld() when the task is scheduled out.
+ +	 */
+ +	sld_update_msr(false);
+ +	set_tsk_thread_flag(current, TIF_SLD);
+ +}
+ +
+ +bool handle_guest_split_lock(unsigned long ip)
+ +{
+ +	if (sld_state == sld_warn) {
+ +		split_lock_warn(ip);
+ +		return true;
+ +	}
+ +
+ +	pr_warn_once("#AC: %s/%d %s split_lock trap at address: 0x%lx\n",
+ +		     current->comm, current->pid,
+ +		     sld_state == sld_fatal ? "fatal" : "bogus", ip);
+ +
+ +	current->thread.error_code = 0;
+ +	current->thread.trap_nr = X86_TRAP_AC;
+ +	force_sig_fault(SIGBUS, BUS_ADRALN, NULL, current);
+ +	return false;
+ +}
+ +EXPORT_SYMBOL_GPL(handle_guest_split_lock);
+ +
+ +static void bus_lock_init(void)
+ +{
+ +	u64 val;
+ +
+ +	/*
+ +	 * Warn and fatal are handled by #AC for split lock if #AC for
+ +	 * split lock is supported.
+ +	 */
+ +	if (!boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) ||
+ +	    (boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT) &&
+ +	    (sld_state == sld_warn || sld_state == sld_fatal)) ||
+ +	    sld_state == sld_off)
+ +		return;
+ +
+ +	/*
+ +	 * Enable #DB for bus lock. All bus locks are handled in #DB except
+ +	 * split locks are handled in #AC in the fatal case.
+ +	 */
+ +	rdmsrl(MSR_IA32_DEBUGCTLMSR, val);
+ +	val |= DEBUGCTLMSR_BUS_LOCK_DETECT;
+ +	wrmsrl(MSR_IA32_DEBUGCTLMSR, val);
+ +}
+ +
+ +bool handle_user_split_lock(struct pt_regs *regs, long error_code)
+ +{
+ +	if ((regs->flags & X86_EFLAGS_AC) || sld_state == sld_fatal)
+ +		return false;
+ +	if (sld_state == sld_warn)
+ +		split_lock_warn(regs->ip);
+ +	return true;
+ +}
+ +
+ +void handle_bus_lock(struct pt_regs *regs)
+ +{
+ +	switch (sld_state) {
+ +	case sld_off:
+ +		break;
+ +	case sld_ratelimit:
+ +		/* Enforce no more than bld_ratelimit bus locks/sec. */
+ +		while (!__ratelimit(&bld_ratelimit))
+ +			msleep(20);
+ +		/* Warn on the bus lock. */
+ +		fallthrough;
+ +	case sld_warn:
+ +		pr_warn_ratelimited("#DB: %s/%d took a bus_lock trap at address: 0x%lx\n",
+ +				    current->comm, current->pid, regs->ip);
+ +		break;
+ +	case sld_fatal:
+ +		force_sig_fault(SIGBUS, BUS_ADRALN, NULL, current);
+ +		break;
+ +	}
+ +}
+ +
+ +/*
+ + * This function is called only when switching between tasks with
+ + * different split-lock detection modes. It sets the MSR for the
+ + * mode of the new task. This is right most of the time, but since
+ + * the MSR is shared by hyperthreads on a physical core there can
+ + * be glitches when the two threads need different modes.
+ + */
+ +void switch_to_sld(unsigned long tifn)
+ +{
+ +	sld_update_msr(!(tifn & _TIF_SLD));
+ +}
+ +
+ +/*
+ + * Bits in the IA32_CORE_CAPABILITIES are not architectural, so they should
+ + * only be trusted if it is confirmed that a CPU model implements a
+ + * specific feature at a particular bit position.
+ + *
+ + * The possible driver data field values:
+ + *
+ + * - 0: CPU models that are known to have the per-core split-lock detection
+ + *	feature even though they do not enumerate IA32_CORE_CAPABILITIES.
+ + *
+ + * - 1: CPU models which may enumerate IA32_CORE_CAPABILITIES and if so use
+ + *      bit 5 to enumerate the per-core split-lock detection feature.
+ + */
+ +static const struct x86_cpu_id split_lock_cpu_ids[] __initconst = {
+ +	X86_MATCH_INTEL_FAM6_MODEL(ICELAKE_X,		0),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ICELAKE_L,		0),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ICELAKE_D,		0),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT,	1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT_D,	1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT_L,	1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE_L,		1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(TIGERLAKE,		1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(SAPPHIRERAPIDS_X,	1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE,		1),
+ +	X86_MATCH_INTEL_FAM6_MODEL(ALDERLAKE_L,		1),
+ +	{}
+ +};
+ +
+ +static void __init split_lock_setup(struct cpuinfo_x86 *c)
+ +{
+ +	const struct x86_cpu_id *m;
+ +	u64 ia32_core_caps;
+ +
+ +	if (boot_cpu_has(X86_FEATURE_HYPERVISOR))
+ +		return;
+ +
+ +	m = x86_match_cpu(split_lock_cpu_ids);
+ +	if (!m)
+ +		return;
+ +
+ +	switch (m->driver_data) {
+ +	case 0:
+ +		break;
+ +	case 1:
+ +		if (!cpu_has(c, X86_FEATURE_CORE_CAPABILITIES))
+ +			return;
+ +		rdmsrl(MSR_IA32_CORE_CAPS, ia32_core_caps);
+ +		if (!(ia32_core_caps & MSR_IA32_CORE_CAPS_SPLIT_LOCK_DETECT))
+ +			return;
+ +		break;
+ +	default:
+ +		return;
+ +	}
+ +
+ +	__split_lock_setup();
+ +}
+ +
+ +static void sld_state_show(void)
+ +{
+ +	if (!boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT) &&
+ +	    !boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
+ +		return;
+ +
+ +	switch (sld_state) {
+ +	case sld_off:
+ +		pr_info("disabled\n");
+ +		break;
+ +	case sld_warn:
+ +		if (boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT))
+ +			pr_info("#AC: crashing the kernel on kernel split_locks and warning on user-space split_locks\n");
+ +		else if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT))
+ +			pr_info("#DB: warning on user-space bus_locks\n");
+ +		break;
+ +	case sld_fatal:
+ +		if (boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT)) {
+ +			pr_info("#AC: crashing the kernel on kernel split_locks and sending SIGBUS on user-space split_locks\n");
+ +		} else if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT)) {
+ +			pr_info("#DB: sending SIGBUS on user-space bus_locks%s\n",
+ +				boot_cpu_has(X86_FEATURE_SPLIT_LOCK_DETECT) ?
+ +				" from non-WB" : "");
+ +		}
+ +		break;
+ +	case sld_ratelimit:
+ +		if (boot_cpu_has(X86_FEATURE_BUS_LOCK_DETECT))
+ +			pr_info("#DB: setting system wide bus lock rate limit to %u/sec\n", bld_ratelimit.burst);
+ +		break;
+ +	}
+ +}
+ +
+ +void __init sld_setup(struct cpuinfo_x86 *c)
+ +{
+ +	cpu_model_supports_sld = true;
+ +	split_lock_setup(c);
+ +	sld_state_setup();
+ +	sld_state_show();
+ +}
+ +
+ +#define X86_HYBRID_CPU_TYPE_ID_SHIFT	24
+ +
+ +/**
+ + * get_this_hybrid_cpu_type() - Get the type of this hybrid CPU
+ + *
+ + * Returns the CPU type [31:24] (i.e., Atom or Core) of a CPU in
+ + * a hybrid processor. If the processor is not hybrid, returns 0.
+ + */
+ +u8 get_this_hybrid_cpu_type(void)
+ +{
+ +	if (!cpu_feature_enabled(X86_FEATURE_HYBRID_CPU))
+ +		return 0;
+ +
+ +	return cpuid_eax(0x0000001a) >> X86_HYBRID_CPU_TYPE_ID_SHIFT;
+ +}
+++=======
+++>>>>>>> 5861381d4866 (PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling)
+diff --cc include/linux/cpuhotplug.h
+index 30bf44578fea,dbfdd0fadbef..000000000000
+--- a/include/linux/cpuhotplug.h
++++ b/include/linux/cpuhotplug.h
+@@@ -145,14 -143,11 +145,19 @@@ enum cpuhp_state 
+  	CPUHP_AP_ONLINE,
+  	CPUHP_TEARDOWN_CPU,
+  	CPUHP_AP_ONLINE_IDLE,
+ +	/*
+ +	 * kABI: Other than a offset shift of 1 in CPUHP_AP_SMPBOOT_THREADS,
+ +	 * the other CPUHP states are not changed or broken.
+ +	 */
+ +	RH_KABI_BROKEN_INSERT_ENUM(CPUHP_AP_SCHED_WAIT_EMPTY)
+  	CPUHP_AP_SMPBOOT_THREADS,
+ -	CPUHP_AP_X86_VDSO_VMA_ONLINE,
+ +	RH_KABI_BROKEN_REMOVE_ENUM(CPUHP_AP_X86_VDSO_VMA_ONLINE)
+  	CPUHP_AP_IRQ_AFFINITY_ONLINE,
+++<<<<<<< HEAD
+++=======
++ 	CPUHP_AP_ARM_MVEBU_SYNC_CLOCKS,
++ 	CPUHP_AP_X86_INTEL_EPB_ONLINE,
+++>>>>>>> 5861381d4866 (PM / arch: x86: Rework the MSR_IA32_ENERGY_PERF_BIAS handling)
+  	CPUHP_AP_PERF_ONLINE,
+  	CPUHP_AP_PERF_X86_ONLINE,
+  	CPUHP_AP_PERF_X86_UNCORE_ONLINE,
+diff --git a/Documentation/admin-guide/pm/intel_epb.rst b/Documentation/admin-guide/pm/intel_epb.rst
+new file mode 100644
+index 000000000000..e9cfa7ec5420
+--- /dev/null
++++ b/Documentation/admin-guide/pm/intel_epb.rst
+@@ -0,0 +1,6 @@
++======================================
++Intel Performance and Energy Bias Hint
++======================================
++
++.. kernel-doc:: arch/x86/kernel/cpu/intel_epb.c
++   :doc: overview
+* Unmerged path Documentation/admin-guide/pm/working-state.rst
+* Unmerged path arch/x86/kernel/cpu/Makefile
+* Unmerged path arch/x86/kernel/cpu/common.c
+diff --git a/arch/x86/kernel/cpu/cpu.h b/arch/x86/kernel/cpu/cpu.h
+index 3db1311e290a..4f56edffbfc6 100644
+--- a/arch/x86/kernel/cpu/cpu.h
++++ b/arch/x86/kernel/cpu/cpu.h
+@@ -14,7 +14,6 @@ struct cpu_dev {
+ 	void		(*c_init)(struct cpuinfo_x86 *);
+ 	void		(*c_identify)(struct cpuinfo_x86 *);
+ 	void		(*c_detect_tlb)(struct cpuinfo_x86 *);
+-	void		(*c_bsp_resume)(struct cpuinfo_x86 *);
+ 	int		c_x86_vendor;
+ #ifdef CONFIG_X86_32
+ 	/* Optional vendor specific routine to obtain the cache size. */
+* Unmerged path arch/x86/kernel/cpu/intel.c
+diff --git a/arch/x86/kernel/cpu/intel_epb.c b/arch/x86/kernel/cpu/intel_epb.c
+new file mode 100644
+index 000000000000..8d53cc88bd22
+--- /dev/null
++++ b/arch/x86/kernel/cpu/intel_epb.c
+@@ -0,0 +1,131 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Intel Performance and Energy Bias Hint support.
++ *
++ * Copyright (C) 2019 Intel Corporation
++ *
++ * Author:
++ *	Rafael J. Wysocki <rafael.j.wysocki@intel.com>
++ */
++
++#include <linux/cpuhotplug.h>
++#include <linux/kernel.h>
++#include <linux/syscore_ops.h>
++
++#include <asm/cpufeature.h>
++#include <asm/msr.h>
++
++/**
++ * DOC: overview
++ *
++ * The Performance and Energy Bias Hint (EPB) allows software to specify its
++ * preference with respect to the power-performance tradeoffs present in the
++ * processor.  Generally, the EPB is expected to be set by user space through
++ * the generic MSR interface (with the help of the x86_energy_perf_policy tool),
++ * but there are two reasons for the kernel to touch it.
++ *
++ * First, there are systems where the platform firmware resets the EPB during
++ * system-wide transitions from sleep states back into the working state
++ * effectively causing the previous EPB updates by user space to be lost.
++ * Thus the kernel needs to save the current EPB values for all CPUs during
++ * system-wide transitions to sleep states and restore them on the way back to
++ * the working state.  That can be achieved by saving EPB for secondary CPUs
++ * when they are taken offline during transitions into system sleep states and
++ * for the boot CPU in a syscore suspend operation, so that it can be restored
++ * for the boot CPU in a syscore resume operation and for the other CPUs when
++ * they are brought back online.  However, CPUs that are already offline when
++ * a system-wide PM transition is started are not taken offline again, but their
++ * EPB values may still be reset by the platform firmware during the transition,
++ * so in fact it is necessary to save the EPB of any CPU taken offline and to
++ * restore it when the given CPU goes back online at all times.
++ *
++ * Second, on many systems the initial EPB value coming from the platform
++ * firmware is 0 ('performance') and at least on some of them that is because
++ * the platform firmware does not initialize EPB at all with the assumption that
++ * the OS will do that anyway.  That sometimes is problematic, as it may cause
++ * the system battery to drain too fast, for example, so it is better to adjust
++ * it on CPU bring-up and if the initial EPB value for a given CPU is 0, the
++ * kernel changes it to 6 ('normal').
++ */
++
++static DEFINE_PER_CPU(u8, saved_epb);
++
++#define EPB_MASK	0x0fULL
++#define EPB_SAVED	0x10ULL
++
++static int intel_epb_save(void)
++{
++	u64 epb;
++
++	rdmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
++	/*
++	 * Ensure that saved_epb will always be nonzero after this write even if
++	 * the EPB value read from the MSR is 0.
++	 */
++	this_cpu_write(saved_epb, (epb & EPB_MASK) | EPB_SAVED);
++
++	return 0;
++}
++
++static void intel_epb_restore(void)
++{
++	u64 val = this_cpu_read(saved_epb);
++	u64 epb;
++
++	rdmsrl(MSR_IA32_ENERGY_PERF_BIAS, epb);
++	if (val) {
++		val &= EPB_MASK;
++	} else {
++		/*
++		 * Because intel_epb_save() has not run for the current CPU yet,
++		 * it is going online for the first time, so if its EPB value is
++		 * 0 ('performance') at this point, assume that it has not been
++		 * initialized by the platform firmware and set it to 6
++		 * ('normal').
++		 */
++		val = epb & EPB_MASK;
++		if (val == ENERGY_PERF_BIAS_PERFORMANCE) {
++			val = ENERGY_PERF_BIAS_NORMAL;
++			pr_warn_once("ENERGY_PERF_BIAS: Set to 'normal', was 'performance'\n");
++		}
++	}
++	wrmsrl(MSR_IA32_ENERGY_PERF_BIAS, (epb & ~EPB_MASK) | val);
++}
++
++static struct syscore_ops intel_epb_syscore_ops = {
++	.suspend = intel_epb_save,
++	.resume = intel_epb_restore,
++};
++
++static int intel_epb_online(unsigned int cpu)
++{
++	intel_epb_restore();
++	return 0;
++}
++
++static int intel_epb_offline(unsigned int cpu)
++{
++	return intel_epb_save();
++}
++
++static __init int intel_epb_init(void)
++{
++	int ret;
++
++	if (!boot_cpu_has(X86_FEATURE_EPB))
++		return -ENODEV;
++
++	ret = cpuhp_setup_state(CPUHP_AP_X86_INTEL_EPB_ONLINE,
++				"x86/intel/epb:online", intel_epb_online,
++				intel_epb_offline);
++	if (ret < 0)
++		goto err_out_online;
++
++	register_syscore_ops(&intel_epb_syscore_ops);
++	return 0;
++
++err_out_online:
++	cpuhp_remove_state(CPUHP_AP_X86_INTEL_EPB_ONLINE);
++	return ret;
++}
++subsys_initcall(intel_epb_init);
+* Unmerged path include/linux/cpuhotplug.h
