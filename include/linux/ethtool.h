@@ -451,4 +451,19 @@ struct ethtool_ops {
 	RH_KABI_RESERVE(31)
 	RH_KABI_SIZE_AND_EXTEND(ethtool_ops_extended)
 };
+
+struct ethtool_rx_flow_rule {
+	struct flow_rule	*rule;
+	unsigned long		priv[0];
+};
+
+struct ethtool_rx_flow_spec_input {
+	const struct ethtool_rx_flow_spec	*fs;
+	u32					rss_ctx;
+};
+
+struct ethtool_rx_flow_rule *
+ethtool_rx_flow_rule_create(const struct ethtool_rx_flow_spec_input *input);
+void ethtool_rx_flow_rule_destroy(struct ethtool_rx_flow_rule *rule);
+
 #endif /* _LINUX_ETHTOOL_H */
