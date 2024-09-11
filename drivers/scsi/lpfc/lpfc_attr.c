@@ -1277,7 +1277,7 @@ skip_wait:
  * -EBUSY,    port is not in offline state
  *      0,    successful
  */
-int
+static int
 lpfc_reset_pci_bus(struct lpfc_hba *phba)
 {
 	struct pci_dev *pdev = phba->pcidev;
@@ -1608,7 +1608,7 @@ lpfc_nport_evt_cnt_show(struct device *dev, struct device_attribute *attr,
 	return snprintf(buf, PAGE_SIZE, "%d\n", phba->nport_event_cnt);
 }
 
-int
+static int
 lpfc_set_trunking(struct lpfc_hba *phba, char *buff_out)
 {
 	LPFC_MBOXQ_t *mbox = NULL;
