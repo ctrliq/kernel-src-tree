@@ -1,0 +1,233 @@
+IB/{core,hw,umem}: set FOLL_PIN via pin_user_pages*(), fix up ODP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [infiniband] IB/{core, hw, umem}: set FOLL_PIN via pin_user_pages*(), fix up ODP (Chris von Recklinghausen) [1885412]
+Rebuild_FUZZ: 98.48%
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit dfa0a4fff11b32740c67fb0baf219702b978fc51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dfa0a4ff.failed
+
+Convert infiniband to use the new pin_user_pages*() calls.
+
+Also, revert earlier changes to Infiniband ODP that had it using
+put_user_page().  ODP is "Case 3" in
+Documentation/core-api/pin_user_pages.rst, which is to say, normal
+get_user_pages() and put_page() is the API to use there.
+
+The new pin_user_pages*() calls replace corresponding get_user_pages*()
+calls, and set the FOLL_PIN flag.  The FOLL_PIN flag requires that the
+caller must return the pages via put_user_page*() calls, but infiniband
+was already doing that as part of an earlier commit.
+
+Link: http://lkml.kernel.org/r/20200107224558.2362728-14-jhubbard@nvidia.com
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Alex Williamson <alex.williamson@redhat.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Björn Töpel <bjorn.topel@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Leon Romanovsky <leonro@mellanox.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit dfa0a4fff11b32740c67fb0baf219702b978fc51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mthca/mthca_memfree.c
+#	drivers/infiniband/hw/qib/qib_user_pages.c
+#	drivers/infiniband/hw/qib/qib_user_sdma.c
+diff --cc drivers/infiniband/hw/mthca/mthca_memfree.c
+index 99108f3dcf01,8269ab040c21..000000000000
+--- a/drivers/infiniband/hw/mthca/mthca_memfree.c
++++ b/drivers/infiniband/hw/mthca/mthca_memfree.c
+@@@ -472,7 -472,8 +472,12 @@@ int mthca_map_user_db(struct mthca_dev 
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = get_user_pages_fast(uaddr & PAGE_MASK, 1, FOLL_WRITE, pages);
+++=======
++ 	ret = pin_user_pages_fast(uaddr & PAGE_MASK, 1,
++ 				  FOLL_WRITE | FOLL_LONGTERM, pages);
+++>>>>>>> dfa0a4fff11b (IB/{core,hw,umem}: set FOLL_PIN via pin_user_pages*(), fix up ODP)
+  	if (ret < 0)
+  		goto out;
+  
+diff --cc drivers/infiniband/hw/qib/qib_user_pages.c
+index 1fad32275208,7fc4b5f81fcd..000000000000
+--- a/drivers/infiniband/hw/qib/qib_user_pages.c
++++ b/drivers/infiniband/hw/qib/qib_user_pages.c
+@@@ -131,14 -94,36 +131,29 @@@ int qib_map_page(struct pci_dev *hwdev
+  int qib_get_user_pages(unsigned long start_page, size_t num_pages,
+  		       struct page **p)
+  {
+ -	unsigned long locked, lock_limit;
+ -	size_t got;
+  	int ret;
+  
+ -	lock_limit = rlimit(RLIMIT_MEMLOCK) >> PAGE_SHIFT;
+ -	locked = atomic64_add_return(num_pages, &current->mm->pinned_vm);
+ +	down_write(&current->mm->mmap_sem);
+  
+ -	if (locked > lock_limit && !capable(CAP_IPC_LOCK)) {
+ -		ret = -ENOMEM;
+ -		goto bail;
+ -	}
+ +	ret = __qib_get_user_pages(start_page, num_pages, p);
+  
+++<<<<<<< HEAD
+ +	up_write(&current->mm->mmap_sem);
+++=======
++ 	down_read(&current->mm->mmap_sem);
++ 	for (got = 0; got < num_pages; got += ret) {
++ 		ret = pin_user_pages(start_page + got * PAGE_SIZE,
++ 				     num_pages - got,
++ 				     FOLL_LONGTERM | FOLL_WRITE | FOLL_FORCE,
++ 				     p + got, NULL);
++ 		if (ret < 0) {
++ 			up_read(&current->mm->mmap_sem);
++ 			goto bail_release;
++ 		}
++ 	}
++ 	up_read(&current->mm->mmap_sem);
+++>>>>>>> dfa0a4fff11b (IB/{core,hw,umem}: set FOLL_PIN via pin_user_pages*(), fix up ODP)
+  
+ -	return 0;
+ -bail_release:
+ -	__qib_release_user_pages(p, got, 0);
+ -bail:
+ -	atomic64_sub(num_pages, &current->mm->pinned_vm);
+  	return ret;
+  }
+  
+diff --cc drivers/infiniband/hw/qib/qib_user_sdma.c
+index a1a1ec4adffc,1a3cc2957e3a..000000000000
+--- a/drivers/infiniband/hw/qib/qib_user_sdma.c
++++ b/drivers/infiniband/hw/qib/qib_user_sdma.c
+@@@ -673,7 -670,7 +673,11 @@@ static int qib_user_sdma_pin_pages(cons
+  		else
+  			j = npages;
+  
+++<<<<<<< HEAD
+ +		ret = get_user_pages_fast(addr, j, 0, pages);
+++=======
++ 		ret = pin_user_pages_fast(addr, j, FOLL_LONGTERM, pages);
+++>>>>>>> dfa0a4fff11b (IB/{core,hw,umem}: set FOLL_PIN via pin_user_pages*(), fix up ODP)
+  		if (ret != j) {
+  			i = 0;
+  			j = ret;
+diff --git a/drivers/infiniband/core/umem.c b/drivers/infiniband/core/umem.c
+index cd3083157554..2112c8208825 100644
+--- a/drivers/infiniband/core/umem.c
++++ b/drivers/infiniband/core/umem.c
+@@ -275,7 +275,7 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
+ 	sg = umem->sg_head.sgl;
+ 
+ 	while (npages) {
+-		ret = get_user_pages_fast(cur_base,
++		ret = pin_user_pages_fast(cur_base,
+ 					  min_t(unsigned long, npages,
+ 						PAGE_SIZE /
+ 						sizeof(struct page *)),
+diff --git a/drivers/infiniband/core/umem_odp.c b/drivers/infiniband/core/umem_odp.c
+index 781298f695e4..c67130296c69 100644
+--- a/drivers/infiniband/core/umem_odp.c
++++ b/drivers/infiniband/core/umem_odp.c
+@@ -543,9 +543,8 @@ EXPORT_SYMBOL(ib_umem_odp_release);
+  * The function returns -EFAULT if the DMA mapping operation fails. It returns
+  * -EAGAIN if a concurrent invalidation prevents us from updating the page.
+  *
+- * The page is released via put_user_page even if the operation failed. For
+- * on-demand pinning, the page is released whenever it isn't stored in the
+- * umem.
++ * The page is released via put_page even if the operation failed. For on-demand
++ * pinning, the page is released whenever it isn't stored in the umem.
+  */
+ static int ib_umem_odp_map_dma_single_page(
+ 		struct ib_umem_odp *umem_odp,
+@@ -604,7 +603,7 @@ static int ib_umem_odp_map_dma_single_page(
+ 	}
+ 
+ out:
+-	put_user_page(page);
++	put_page(page);
+ 	return ret;
+ }
+ 
+@@ -714,7 +713,7 @@ int ib_umem_odp_map_dma_pages(struct ib_umem_odp *umem_odp, u64 user_virt,
+ 					ret = -EFAULT;
+ 					break;
+ 				}
+-				put_user_page(local_page_list[j]);
++				put_page(local_page_list[j]);
+ 				continue;
+ 			}
+ 
+@@ -741,8 +740,8 @@ int ib_umem_odp_map_dma_pages(struct ib_umem_odp *umem_odp, u64 user_virt,
+ 			 * ib_umem_odp_map_dma_single_page().
+ 			 */
+ 			if (npages - (j + 1) > 0)
+-				put_user_pages(&local_page_list[j+1],
+-					       npages - (j + 1));
++				release_pages(&local_page_list[j+1],
++					      npages - (j + 1));
+ 			break;
+ 		}
+ 	}
+diff --git a/drivers/infiniband/hw/hfi1/user_pages.c b/drivers/infiniband/hw/hfi1/user_pages.c
+index 469acb961fbd..9a94761765c0 100644
+--- a/drivers/infiniband/hw/hfi1/user_pages.c
++++ b/drivers/infiniband/hw/hfi1/user_pages.c
+@@ -106,7 +106,7 @@ int hfi1_acquire_user_pages(struct mm_struct *mm, unsigned long vaddr, size_t np
+ 	int ret;
+ 	unsigned int gup_flags = FOLL_LONGTERM | (writable ? FOLL_WRITE : 0);
+ 
+-	ret = get_user_pages_fast(vaddr, npages, gup_flags, pages);
++	ret = pin_user_pages_fast(vaddr, npages, gup_flags, pages);
+ 	if (ret < 0)
+ 		return ret;
+ 
+* Unmerged path drivers/infiniband/hw/mthca/mthca_memfree.c
+* Unmerged path drivers/infiniband/hw/qib/qib_user_pages.c
+* Unmerged path drivers/infiniband/hw/qib/qib_user_sdma.c
+diff --git a/drivers/infiniband/hw/usnic/usnic_uiom.c b/drivers/infiniband/hw/usnic/usnic_uiom.c
+index 62e6ffa9ad78..600896727d34 100644
+--- a/drivers/infiniband/hw/usnic/usnic_uiom.c
++++ b/drivers/infiniband/hw/usnic/usnic_uiom.c
+@@ -141,7 +141,7 @@ static int usnic_uiom_get_pages(unsigned long addr, size_t size, int writable,
+ 	ret = 0;
+ 
+ 	while (npages) {
+-		ret = get_user_pages(cur_base,
++		ret = pin_user_pages(cur_base,
+ 				     min_t(unsigned long, npages,
+ 				     PAGE_SIZE / sizeof(struct page *)),
+ 				     gup_flags | FOLL_LONGTERM,
+diff --git a/drivers/infiniband/sw/siw/siw_mem.c b/drivers/infiniband/sw/siw/siw_mem.c
+index 308ece0c55fd..c1c2587cfd8c 100644
+--- a/drivers/infiniband/sw/siw/siw_mem.c
++++ b/drivers/infiniband/sw/siw/siw_mem.c
+@@ -423,7 +423,7 @@ struct siw_umem *siw_umem_get(u64 start, u64 len, bool writable)
+ 		while (nents) {
+ 			struct page **plist = &umem->page_chunk[i].plist[got];
+ 
+-			rv = get_user_pages(first_page_va, nents,
++			rv = pin_user_pages(first_page_va, nents,
+ 					    foll_flags | FOLL_LONGTERM,
+ 					    plist, NULL);
+ 			if (rv < 0)
