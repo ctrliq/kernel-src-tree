@@ -8,6 +8,7 @@ Contents:
 
    af_xdp
    batman-adv
+   bpf_flow_dissector
    can
    dpaa2/index
    e100
