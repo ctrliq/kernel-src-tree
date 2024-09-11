@@ -149,7 +149,7 @@ void blk_timeout_work(struct work_struct *work)
  * This function requests that the block layer start recovery for the
  * request by deleting the timer and calling the q's timeout function.
  * LLDDs who implement their own error recovery MAY ignore the timeout
- * event if they generated blk_abort_req. Must hold queue lock.
+ * event if they generated blk_abort_request.
  */
 void blk_abort_request(struct request *req)
 {
