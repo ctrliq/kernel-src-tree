@@ -1,0 +1,106 @@
+driver core: Add support for linking devices during device addition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Saravana Kannan <saravanak@google.com>
+commit 5302dd7dd0b6d04c63cdce51d1e9fda9ef0be886
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5302dd7d.failed
+
+When devices are added, the bus might want to create device links to track
+functional dependencies between supplier and consumer devices. This
+tracking of supplier-consumer relationship allows optimizing device probe
+order and tracking whether all consumers of a supplier are active. The
+add_links bus callback is added to support this.
+
+However, when consumer devices are added, they might not have a supplier
+device to link to despite needing mandatory resources/functionality from
+one or more suppliers. A waiting_for_suppliers list is created to track
+such consumers and retry linking them when new devices get added.
+
+	Signed-off-by: Saravana Kannan <saravanak@google.com>
+Link: https://lore.kernel.org/r/20190731221721.187713-2-saravanak@google.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 5302dd7dd0b6d04c63cdce51d1e9fda9ef0be886)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/core.c
+diff --cc drivers/base/core.c
+index a11a4382fe7f,18e04ca1de13..000000000000
+--- a/drivers/base/core.c
++++ b/drivers/base/core.c
+@@@ -1976,8 -2198,22 +2041,27 @@@ int device_add(struct device *dev
+  
+  	kobject_uevent(&dev->kobj, KOBJ_ADD);
+  
+++<<<<<<< HEAD
+ +	if (dev->fwnode && !dev->fwnode->dev)
+ +		dev->fwnode->dev = dev;
+++=======
++ 	/*
++ 	 * Check if any of the other devices (consumers) have been waiting for
++ 	 * this device (supplier) to be added so that they can create a device
++ 	 * link to it.
++ 	 *
++ 	 * This needs to happen after device_pm_add() because device_link_add()
++ 	 * requires the supplier be registered before it's called.
++ 	 *
++ 	 * But this also needs to happe before bus_probe_device() to make sure
++ 	 * waiting consumers can link to it before the driver is bound to the
++ 	 * device and the driver sync_state callback is called for this device.
++ 	 */
++ 	device_link_check_waiting_consumers();
++ 
++ 	if (dev->bus && dev->bus->add_links && dev->bus->add_links(dev))
++ 		device_link_wait_for_supplier(dev);
+++>>>>>>> 5302dd7dd0b6 (driver core: Add support for linking devices during device addition)
+  
+  	bus_probe_device(dev);
+  	if (parent)
+* Unmerged path drivers/base/core.c
+diff --git a/include/linux/device.h b/include/linux/device.h
+index 7a77799bff7d..629e4f7f0983 100644
+--- a/include/linux/device.h
++++ b/include/linux/device.h
+@@ -81,6 +81,17 @@ extern void bus_remove_file(struct bus_type *, struct bus_attribute *);
+  *		-EPROBE_DEFER it will queue the device for deferred probing.
+  * @uevent:	Called when a device is added, removed, or a few other things
+  *		that generate uevents to add the environment variables.
++ * @add_links:	Called, perhaps multiple times per device, after a device is
++ *		added to this bus.  The function is expected to create device
++ *		links to all the suppliers of the input device that are
++ *		available at the time this function is called.  As in, the
++ *		function should NOT stop at the first failed device link if
++ *		other unlinked supplier devices are present in the system.
++ *
++ *		Return 0 if device links have been successfully created to all
++ *		the suppliers of this device.  Return an error if some of the
++ *		suppliers are not yet available and this function needs to be
++ *		reattempted in the future.
+  * @probe:	Called when a new device or driver add to this bus, and callback
+  *		the specific driver's probe to initial the matched device.
+  * @remove:	Called when a device removed from this bus.
+@@ -125,6 +136,7 @@ struct bus_type {
+ 
+ 	int (*match)(struct device *dev, struct device_driver *drv);
+ 	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
++	int (*add_links)(struct device *dev);
+ 	int (*probe)(struct device *dev);
+ 	int (*remove)(struct device *dev);
+ 	void (*shutdown)(struct device *dev);
+@@ -1029,11 +1041,13 @@ enum dl_dev_state {
+  * struct dev_links_info - Device data related to device links.
+  * @suppliers: List of links to supplier devices.
+  * @consumers: List of links to consumer devices.
++ * @needs_suppliers: Hook to global list of devices waiting for suppliers.
+  * @status: Driver status information.
+  */
+ struct dev_links_info {
+ 	struct list_head suppliers;
+ 	struct list_head consumers;
++	struct list_head needs_suppliers;
+ 	enum dl_dev_state status;
+ };
+ 
