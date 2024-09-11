@@ -1,0 +1,466 @@
+devlink: Add health set command
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 6f9d56132eb6d2603d4273cfc65bed914ec47acb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/6f9d5613.failed
+
+Add devlink health set command, in order to set configuration parameters
+for a specific reporter.
+Supported parameters are:
+- graceful_period: Time interval between auto recoveries (in msec)
+- auto_recover: Determines if the devlink shall execute recover upon
+		receiving error for the reporter
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Reviewed-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6f9d56132eb6d2603d4273cfc65bed914ec47acb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/devlink.h
+#	net/core/devlink.c
+diff --cc include/uapi/linux/devlink.h
+index 076692209a9b,49ad5a76b121..000000000000
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@@ -89,12 -89,8 +89,17 @@@ enum devlink_command 
+  	DEVLINK_CMD_REGION_DEL,
+  	DEVLINK_CMD_REGION_READ,
+  
+++<<<<<<< HEAD
+ +	DEVLINK_CMD_PORT_PARAM_GET,	/* can dump */
+ +	DEVLINK_CMD_PORT_PARAM_SET,
+ +	DEVLINK_CMD_PORT_PARAM_NEW,
+ +	DEVLINK_CMD_PORT_PARAM_DEL,
+ +
+ +	DEVLINK_CMD_INFO_GET,		/* can dump */
+++=======
++ 	DEVLINK_CMD_HEALTH_REPORTER_GET,
++ 	DEVLINK_CMD_HEALTH_REPORTER_SET,
+++>>>>>>> 6f9d56132eb6 (devlink: Add health set command)
+  
+  	/* add new commands above here */
+  	__DEVLINK_CMD_MAX,
+diff --cc net/core/devlink.c
+index 14d28d5d1c6c,a34414bf1c27..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -4368,6 -4098,395 +4368,398 @@@ nla_put_failure
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct devlink_health_reporter {
++ 	struct list_head list;
++ 	struct devlink_health_buffer **dump_buffers_array;
++ 	struct mutex dump_lock; /* lock parallel read/write from dump buffers */
++ 	struct devlink_health_buffer **diagnose_buffers_array;
++ 	struct mutex diagnose_lock; /* lock parallel read/write from diagnose buffers */
++ 	void *priv;
++ 	const struct devlink_health_reporter_ops *ops;
++ 	struct devlink *devlink;
++ 	u64 graceful_period;
++ 	bool auto_recover;
++ 	u8 health_state;
++ 	u8 dump_avail;
++ 	u64 dump_ts;
++ 	u64 error_count;
++ 	u64 recovery_count;
++ 	u64 last_recovery_ts;
++ };
++ 
++ enum devlink_health_reporter_state {
++ 	DEVLINK_HEALTH_REPORTER_STATE_HEALTHY,
++ 	DEVLINK_HEALTH_REPORTER_STATE_ERROR,
++ };
++ 
++ void *
++ devlink_health_reporter_priv(struct devlink_health_reporter *reporter)
++ {
++ 	return reporter->priv;
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_reporter_priv);
++ 
++ static struct devlink_health_reporter *
++ devlink_health_reporter_find_by_name(struct devlink *devlink,
++ 				     const char *reporter_name)
++ {
++ 	struct devlink_health_reporter *reporter;
++ 
++ 	list_for_each_entry(reporter, &devlink->reporter_list, list)
++ 		if (!strcmp(reporter->ops->name, reporter_name))
++ 			return reporter;
++ 	return NULL;
++ }
++ 
++ /**
++  *	devlink_health_reporter_create - create devlink health reporter
++  *
++  *	@devlink: devlink
++  *	@ops: ops
++  *	@graceful_period: to avoid recovery loops, in msecs
++  *	@auto_recover: auto recover when error occurs
++  *	@priv: priv
++  */
++ struct devlink_health_reporter *
++ devlink_health_reporter_create(struct devlink *devlink,
++ 			       const struct devlink_health_reporter_ops *ops,
++ 			       u64 graceful_period, bool auto_recover,
++ 			       void *priv)
++ {
++ 	struct devlink_health_reporter *reporter;
++ 
++ 	mutex_lock(&devlink->lock);
++ 	if (devlink_health_reporter_find_by_name(devlink, ops->name)) {
++ 		reporter = ERR_PTR(-EEXIST);
++ 		goto unlock;
++ 	}
++ 
++ 	if (WARN_ON(ops->dump && !ops->dump_size) ||
++ 	    WARN_ON(ops->diagnose && !ops->diagnose_size) ||
++ 	    WARN_ON(auto_recover && !ops->recover) ||
++ 	    WARN_ON(graceful_period && !ops->recover)) {
++ 		reporter = ERR_PTR(-EINVAL);
++ 		goto unlock;
++ 	}
++ 
++ 	reporter = kzalloc(sizeof(*reporter), GFP_KERNEL);
++ 	if (!reporter) {
++ 		reporter = ERR_PTR(-ENOMEM);
++ 		goto unlock;
++ 	}
++ 
++ 	if (ops->dump) {
++ 		reporter->dump_buffers_array =
++ 			devlink_health_buffers_create(ops->dump_size);
++ 		if (!reporter->dump_buffers_array) {
++ 			kfree(reporter);
++ 			reporter = ERR_PTR(-ENOMEM);
++ 			goto unlock;
++ 		}
++ 	}
++ 
++ 	if (ops->diagnose) {
++ 		reporter->diagnose_buffers_array =
++ 			devlink_health_buffers_create(ops->diagnose_size);
++ 		if (!reporter->diagnose_buffers_array) {
++ 			devlink_health_buffers_destroy(reporter->dump_buffers_array,
++ 						       DEVLINK_HEALTH_SIZE_TO_BUFFERS(ops->dump_size));
++ 			kfree(reporter);
++ 			reporter = ERR_PTR(-ENOMEM);
++ 			goto unlock;
++ 		}
++ 	}
++ 
++ 	list_add_tail(&reporter->list, &devlink->reporter_list);
++ 	mutex_init(&reporter->dump_lock);
++ 	mutex_init(&reporter->diagnose_lock);
++ 
++ 	reporter->priv = priv;
++ 	reporter->ops = ops;
++ 	reporter->devlink = devlink;
++ 	reporter->graceful_period = graceful_period;
++ 	reporter->auto_recover = auto_recover;
++ unlock:
++ 	mutex_unlock(&devlink->lock);
++ 	return reporter;
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_reporter_create);
++ 
++ /**
++  *	devlink_health_reporter_destroy - destroy devlink health reporter
++  *
++  *	@reporter: devlink health reporter to destroy
++  */
++ void
++ devlink_health_reporter_destroy(struct devlink_health_reporter *reporter)
++ {
++ 	mutex_lock(&reporter->devlink->lock);
++ 	list_del(&reporter->list);
++ 	devlink_health_buffers_destroy(reporter->dump_buffers_array,
++ 				       DEVLINK_HEALTH_SIZE_TO_BUFFERS(reporter->ops->dump_size));
++ 	devlink_health_buffers_destroy(reporter->diagnose_buffers_array,
++ 				       DEVLINK_HEALTH_SIZE_TO_BUFFERS(reporter->ops->diagnose_size));
++ 	kfree(reporter);
++ 	mutex_unlock(&reporter->devlink->lock);
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_reporter_destroy);
++ 
++ static int
++ devlink_health_reporter_recover(struct devlink_health_reporter *reporter,
++ 				void *priv_ctx)
++ {
++ 	int err;
++ 
++ 	if (!reporter->ops->recover)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = reporter->ops->recover(reporter, priv_ctx);
++ 	if (err)
++ 		return err;
++ 
++ 	reporter->recovery_count++;
++ 	reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;
++ 	reporter->last_recovery_ts = jiffies;
++ 
++ 	return 0;
++ }
++ 
++ static int devlink_health_do_dump(struct devlink_health_reporter *reporter,
++ 				  void *priv_ctx)
++ {
++ 	int err;
++ 
++ 	if (!reporter->ops->dump)
++ 		return 0;
++ 
++ 	if (reporter->dump_avail)
++ 		return 0;
++ 
++ 	devlink_health_buffers_reset(reporter->dump_buffers_array,
++ 				     DEVLINK_HEALTH_SIZE_TO_BUFFERS(reporter->ops->dump_size));
++ 	err = reporter->ops->dump(reporter, reporter->dump_buffers_array,
++ 				     DEVLINK_HEALTH_BUFFER_SIZE,
++ 				     DEVLINK_HEALTH_SIZE_TO_BUFFERS(reporter->ops->dump_size),
++ 				     priv_ctx);
++ 	if (!err) {
++ 		reporter->dump_avail = true;
++ 		reporter->dump_ts = jiffies;
++ 	}
++ 
++ 	return err;
++ }
++ 
++ int devlink_health_report(struct devlink_health_reporter *reporter,
++ 			  const char *msg, void *priv_ctx)
++ {
++ 	struct devlink *devlink = reporter->devlink;
++ 	int err = 0;
++ 
++ 	/* write a log message of the current error */
++ 	WARN_ON(!msg);
++ 	trace_devlink_health_report(devlink, reporter->ops->name, msg);
++ 	reporter->error_count++;
++ 
++ 	/* abort if the previous error wasn't recovered */
++ 	if (reporter->auto_recover &&
++ 	    (reporter->health_state != DEVLINK_HEALTH_REPORTER_STATE_HEALTHY ||
++ 	     jiffies - reporter->last_recovery_ts <
++ 	     msecs_to_jiffies(reporter->graceful_period))) {
++ 		trace_devlink_health_recover_aborted(devlink,
++ 						     reporter->ops->name,
++ 						     reporter->health_state,
++ 						     jiffies -
++ 						     reporter->last_recovery_ts);
++ 		return -ECANCELED;
++ 	}
++ 
++ 	reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
++ 
++ 	mutex_lock(&reporter->dump_lock);
++ 	/* store current dump of current error, for later analysis */
++ 	devlink_health_do_dump(reporter, priv_ctx);
++ 	mutex_unlock(&reporter->dump_lock);
++ 
++ 	if (reporter->auto_recover)
++ 		err = devlink_health_reporter_recover(reporter, priv_ctx);
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_report);
++ 
++ static struct devlink_health_reporter *
++ devlink_health_reporter_get_from_info(struct devlink *devlink,
++ 				      struct genl_info *info)
++ {
++ 	char *reporter_name;
++ 
++ 	if (!info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_NAME])
++ 		return NULL;
++ 
++ 	reporter_name =
++ 		nla_data(info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_NAME]);
++ 	return devlink_health_reporter_find_by_name(devlink, reporter_name);
++ }
++ 
++ static int
++ devlink_nl_health_reporter_fill(struct sk_buff *msg,
++ 				struct devlink *devlink,
++ 				struct devlink_health_reporter *reporter,
++ 				enum devlink_command cmd, u32 portid,
++ 				u32 seq, int flags)
++ {
++ 	struct nlattr *reporter_attr;
++ 	void *hdr;
++ 
++ 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
++ 	if (!hdr)
++ 		return -EMSGSIZE;
++ 
++ 	if (devlink_nl_put_handle(msg, devlink))
++ 		goto genlmsg_cancel;
++ 
++ 	reporter_attr = nla_nest_start(msg, DEVLINK_ATTR_HEALTH_REPORTER);
++ 	if (!reporter_attr)
++ 		goto genlmsg_cancel;
++ 	if (nla_put_string(msg, DEVLINK_ATTR_HEALTH_REPORTER_NAME,
++ 			   reporter->ops->name))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_HEALTH_REPORTER_STATE,
++ 		       reporter->health_state))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_HEALTH_REPORTER_ERR,
++ 			      reporter->error_count, DEVLINK_ATTR_PAD))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_HEALTH_REPORTER_RECOVER,
++ 			      reporter->recovery_count, DEVLINK_ATTR_PAD))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_HEALTH_REPORTER_GRACEFUL_PERIOD,
++ 			      reporter->graceful_period,
++ 			      DEVLINK_ATTR_PAD))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER,
++ 		       reporter->auto_recover))
++ 		goto reporter_nest_cancel;
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_HEALTH_REPORTER_DUMP_AVAIL,
++ 		       reporter->dump_avail))
++ 		goto reporter_nest_cancel;
++ 	if (reporter->dump_avail &&
++ 	    nla_put_u64_64bit(msg, DEVLINK_ATTR_HEALTH_REPORTER_DUMP_TS,
++ 			      jiffies_to_msecs(reporter->dump_ts),
++ 			      DEVLINK_ATTR_PAD))
++ 		goto reporter_nest_cancel;
++ 
++ 	nla_nest_end(msg, reporter_attr);
++ 	genlmsg_end(msg, hdr);
++ 	return 0;
++ 
++ reporter_nest_cancel:
++ 	nla_nest_end(msg, reporter_attr);
++ genlmsg_cancel:
++ 	genlmsg_cancel(msg, hdr);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int devlink_nl_cmd_health_reporter_get_doit(struct sk_buff *skb,
++ 						   struct genl_info *info)
++ {
++ 	struct devlink *devlink = info->user_ptr[0];
++ 	struct devlink_health_reporter *reporter;
++ 	struct sk_buff *msg;
++ 	int err;
++ 
++ 	reporter = devlink_health_reporter_get_from_info(devlink, info);
++ 	if (!reporter)
++ 		return -EINVAL;
++ 
++ 	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++ 	if (!msg)
++ 		return -ENOMEM;
++ 
++ 	err = devlink_nl_health_reporter_fill(msg, devlink, reporter,
++ 					      DEVLINK_CMD_HEALTH_REPORTER_GET,
++ 					      info->snd_portid, info->snd_seq,
++ 					      0);
++ 	if (err) {
++ 		nlmsg_free(msg);
++ 		return err;
++ 	}
++ 
++ 	return genlmsg_reply(msg, info);
++ }
++ 
++ static int
++ devlink_nl_cmd_health_reporter_get_dumpit(struct sk_buff *msg,
++ 					  struct netlink_callback *cb)
++ {
++ 	struct devlink_health_reporter *reporter;
++ 	struct devlink *devlink;
++ 	int start = cb->args[0];
++ 	int idx = 0;
++ 	int err;
++ 
++ 	mutex_lock(&devlink_mutex);
++ 	list_for_each_entry(devlink, &devlink_list, list) {
++ 		if (!net_eq(devlink_net(devlink), sock_net(msg->sk)))
++ 			continue;
++ 		mutex_lock(&devlink->lock);
++ 		list_for_each_entry(reporter, &devlink->reporter_list,
++ 				    list) {
++ 			if (idx < start) {
++ 				idx++;
++ 				continue;
++ 			}
++ 			err = devlink_nl_health_reporter_fill(msg, devlink,
++ 							      reporter,
++ 							      DEVLINK_CMD_HEALTH_REPORTER_GET,
++ 							      NETLINK_CB(cb->skb).portid,
++ 							      cb->nlh->nlmsg_seq,
++ 							      NLM_F_MULTI);
++ 			if (err) {
++ 				mutex_unlock(&devlink->lock);
++ 				goto out;
++ 			}
++ 			idx++;
++ 		}
++ 		mutex_unlock(&devlink->lock);
++ 	}
++ out:
++ 	mutex_unlock(&devlink_mutex);
++ 
++ 	cb->args[0] = idx;
++ 	return msg->len;
++ }
++ 
++ static int
++ devlink_nl_cmd_health_reporter_set_doit(struct sk_buff *skb,
++ 					struct genl_info *info)
++ {
++ 	struct devlink *devlink = info->user_ptr[0];
++ 	struct devlink_health_reporter *reporter;
++ 
++ 	reporter = devlink_health_reporter_get_from_info(devlink, info);
++ 	if (!reporter)
++ 		return -EINVAL;
++ 
++ 	if (!reporter->ops->recover &&
++ 	    (info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_GRACEFUL_PERIOD] ||
++ 	     info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER]))
++ 		return -EINVAL;
++ 
++ 	if (info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_GRACEFUL_PERIOD])
++ 		reporter->graceful_period =
++ 			nla_get_u64(info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_GRACEFUL_PERIOD]);
++ 
++ 	if (info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER])
++ 		reporter->auto_recover =
++ 			nla_get_u8(info->attrs[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER]);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 6f9d56132eb6 (devlink: Add health set command)
+  static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
+  	[DEVLINK_ATTR_BUS_NAME] = { .type = NLA_NUL_STRING },
+  	[DEVLINK_ATTR_DEV_NAME] = { .type = NLA_NUL_STRING },
+@@@ -4393,6 -4512,9 +4785,12 @@@
+  	[DEVLINK_ATTR_PARAM_VALUE_CMODE] = { .type = NLA_U8 },
+  	[DEVLINK_ATTR_REGION_NAME] = { .type = NLA_NUL_STRING },
+  	[DEVLINK_ATTR_REGION_SNAPSHOT_ID] = { .type = NLA_U32 },
+++<<<<<<< HEAD
+++=======
++ 	[DEVLINK_ATTR_HEALTH_REPORTER_NAME] = { .type = NLA_NUL_STRING },
++ 	[DEVLINK_ATTR_HEALTH_REPORTER_GRACEFUL_PERIOD] = { .type = NLA_U64 },
++ 	[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_RECOVER] = { .type = NLA_U8 },
+++>>>>>>> 6f9d56132eb6 (devlink: Add health set command)
+  };
+  
+  static const struct genl_ops devlink_nl_ops[] = {
+* Unmerged path include/uapi/linux/devlink.h
+* Unmerged path net/core/devlink.c
