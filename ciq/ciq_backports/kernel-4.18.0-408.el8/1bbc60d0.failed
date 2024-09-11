@@ -1,0 +1,191 @@
+KVM: x86/mmu: Remove MMU auditing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 1bbc60d0c7e5728aced352e528ef936ebe2344c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1bbc60d0.failed
+
+Remove mmu_audit.c and all its collateral, the auditing code has suffered
+severe bitrot, ironically partly due to shadow paging being more stable
+and thus not benefiting as much from auditing, but mostly due to TDP
+supplanting shadow paging for non-nested guests and shadowing of nested
+TDP not heavily stressing the logic that is being audited.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1bbc60d0c7e5728aced352e528ef936ebe2344c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/Kconfig
+#	arch/x86/kvm/mmu/mmu_audit.c
+#	arch/x86/kvm/mmu/paging_tmpl.h
+diff --cc arch/x86/kvm/Kconfig
+index a45c72866711,e3cbd7706136..000000000000
+--- a/arch/x86/kvm/Kconfig
++++ b/arch/x86/kvm/Kconfig
+@@@ -125,13 -126,6 +125,16 @@@ config KVM_XE
+  
+  	  If in doubt, say "N".
+  
+++<<<<<<< HEAD
+ +config KVM_MMU_AUDIT
+ +	bool "Audit KVM MMU"
+ +	depends on KVM && TRACEPOINTS
+ +	---help---
+ +	 This option adds a R/W kVM module parameter 'mmu_audit', which allows
+ +	 auditing of KVM MMU events at runtime.
+ +
+++=======
+++>>>>>>> 1bbc60d0c7e5 (KVM: x86/mmu: Remove MMU auditing)
+  config KVM_EXTERNAL_WRITE_TRACKING
+  	bool
+  
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index 55af99407e31,aa0e3c246aca..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -910,16 -900,14 +910,19 @@@ static int FNAME(page_fault)(struct kvm
+  
+  	r = RET_PF_RETRY;
+  	write_lock(&vcpu->kvm->mmu_lock);
+ -
+ -	if (is_page_fault_stale(vcpu, fault, mmu_seq))
+ +	if (!is_noslot_pfn(pfn) && mmu_notifier_retry_hva(vcpu->kvm, mmu_seq, hva))
+  		goto out_unlock;
+  
+- 	kvm_mmu_audit(vcpu, AUDIT_PRE_PAGE_FAULT);
+  	r = make_mmu_pages_available(vcpu);
+  	if (r)
+  		goto out_unlock;
+++<<<<<<< HEAD
+ +	r = FNAME(fetch)(vcpu, addr, &walker, error_code, fault->max_level, pfn,
+ +			 map_writable, fault->prefault);
+ +	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+++=======
++ 	r = FNAME(fetch)(vcpu, fault, &walker);
+++>>>>>>> 1bbc60d0c7e5 (KVM: x86/mmu: Remove MMU auditing)
+  
+  out_unlock:
+  	write_unlock(&vcpu->kvm->mmu_lock);
+* Unmerged path arch/x86/kvm/mmu/mmu_audit.c
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 1a1eb4e957f1..8180316ff7be 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -2117,10 +2117,6 @@
+ 	kvm.enable_vmware_backdoor=[KVM] Support VMware backdoor PV interface.
+ 				   Default is false (don't support).
+ 
+-	kvm.mmu_audit=	[KVM] This is a R/W parameter which allows audit
+-			KVM MMU at runtime.
+-			Default is 0 (off)
+-
+ 	kvm.nx_huge_pages=
+ 			[KVM] Controls the software workaround for the
+ 			X86_BUG_ITLB_MULTIHIT bug.
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 96ecf6f2c1a5..ad8f1b0b7584 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1116,10 +1116,6 @@ struct kvm_arch {
+ 	struct kvm_hv hyperv;
+ 	struct kvm_xen xen;
+ 
+-	#ifdef CONFIG_KVM_MMU_AUDIT
+-	int audit_point;
+-	#endif
+-
+ 	bool backwards_tsc_observed;
+ 	bool boot_vcpu_runs_old_kvmclock;
+ 	u32 bsp_vcpu_id;
+* Unmerged path arch/x86/kvm/Kconfig
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index e1bc11990a29..70afa26a572a 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -104,15 +104,6 @@ static int max_huge_page_level __read_mostly;
+ static int tdp_root_level __read_mostly;
+ static int max_tdp_level __read_mostly;
+ 
+-enum {
+-	AUDIT_PRE_PAGE_FAULT,
+-	AUDIT_POST_PAGE_FAULT,
+-	AUDIT_PRE_PTE_WRITE,
+-	AUDIT_POST_PTE_WRITE,
+-	AUDIT_PRE_SYNC,
+-	AUDIT_POST_SYNC
+-};
+-
+ #ifdef MMU_DEBUG
+ bool dbg = 0;
+ module_param(dbg, bool, 0644);
+@@ -1917,13 +1908,6 @@ static bool kvm_mmu_remote_flush_or_zap(struct kvm *kvm,
+ 	return true;
+ }
+ 
+-#ifdef CONFIG_KVM_MMU_AUDIT
+-#include "mmu_audit.c"
+-#else
+-static void kvm_mmu_audit(struct kvm_vcpu *vcpu, int point) { }
+-static void mmu_audit_disable(void) { }
+-#endif
+-
+ static bool is_obsolete_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
+ {
+ 	return sp->role.invalid ||
+@@ -3642,17 +3626,12 @@ void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu)
+ 			return;
+ 
+ 		write_lock(&vcpu->kvm->mmu_lock);
+-		kvm_mmu_audit(vcpu, AUDIT_PRE_SYNC);
+-
+ 		mmu_sync_children(vcpu, sp, true);
+-
+-		kvm_mmu_audit(vcpu, AUDIT_POST_SYNC);
+ 		write_unlock(&vcpu->kvm->mmu_lock);
+ 		return;
+ 	}
+ 
+ 	write_lock(&vcpu->kvm->mmu_lock);
+-	kvm_mmu_audit(vcpu, AUDIT_PRE_SYNC);
+ 
+ 	for (i = 0; i < 4; ++i) {
+ 		hpa_t root = vcpu->arch.mmu->pae_root[i];
+@@ -3664,7 +3643,6 @@ void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu)
+ 		}
+ 	}
+ 
+-	kvm_mmu_audit(vcpu, AUDIT_POST_SYNC);
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ 
+@@ -5188,7 +5166,6 @@ static void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 	gentry = mmu_pte_write_fetch_gpte(vcpu, &gpa, &bytes);
+ 
+ 	++vcpu->kvm->stat.mmu_pte_write;
+-	kvm_mmu_audit(vcpu, AUDIT_PRE_PTE_WRITE);
+ 
+ 	for_each_gfn_indirect_valid_sp(vcpu->kvm, sp, gfn) {
+ 		if (detect_write_misaligned(sp, gpa, bytes) ||
+@@ -5213,7 +5190,6 @@ static void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 		}
+ 	}
+ 	kvm_mmu_remote_flush_or_zap(vcpu->kvm, &invalid_list, flush);
+-	kvm_mmu_audit(vcpu, AUDIT_POST_PTE_WRITE);
+ 	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ 
+@@ -6090,7 +6066,6 @@ void kvm_mmu_module_exit(void)
+ 	mmu_destroy_caches();
+ 	percpu_counter_destroy(&kvm_total_used_mmu_pages);
+ 	unregister_shrinker(&mmu_shrinker);
+-	mmu_audit_disable();
+ }
+ 
+ /*
+* Unmerged path arch/x86/kvm/mmu/mmu_audit.c
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
