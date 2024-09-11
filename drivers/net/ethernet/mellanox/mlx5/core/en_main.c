@@ -40,6 +40,7 @@
 #include <net/page_pool.h>
 #include "eswitch.h"
 #include "en.h"
+#include "en/txrx.h"
 #include "en_tc.h"
 #include "en_rep.h"
 #include "en_accel/ipsec.h"
@@ -85,6 +86,7 @@ struct mlx5e_channel_param {
 	struct mlx5e_cq_param      tx_cq;
 	struct mlx5e_cq_param      icosq_cq;
 };
+
 
 bool mlx5e_check_fragmented_striding_rq_cap(struct mlx5_core_dev *mdev)
 {
