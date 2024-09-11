@@ -1,0 +1,216 @@
+selftests: xsk: Remove Tx synchronization resources
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+commit 99f9bcb65705dda07288b759c569d30d8a4f297c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/99f9bcb6.failed
+
+Tx thread needs to be started after the Rx side is fully initialized so
+that packets are not xmitted until xsk Rx socket is ready to be used.
+
+It can be observed that atomic variable spinning_tx is not checked from
+Rx side in any way, so thread_common_ops can be modified to only address
+the spinning_rx. This means that spinning_tx can be removed altogheter.
+
+signal_tx_condition is never utilized, so simply remove it.
+
+	Signed-off-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210329224316.17793-11-maciej.fijalkowski@intel.com
+(cherry picked from commit 99f9bcb65705dda07288b759c569d30d8a4f297c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/xdpxceiver.c
+#	tools/testing/selftests/bpf/xdpxceiver.h
+diff --cc tools/testing/selftests/bpf/xdpxceiver.c
+index 9f8d5dabf30a,9f7ee9a38752..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.c
++++ b/tools/testing/selftests/bpf/xdpxceiver.c
+@@@ -795,93 -803,85 +794,103 @@@ static void *worker_testapp_validate(vo
+  	struct ethhdr *eth_hdr = (struct ethhdr *)pkt_data;
+  	struct ifobject *ifobject = (struct ifobject *)arg;
+  	struct generic_data data;
+ -	int spinningrxctr = 0;
+  	void *bufs = NULL;
+  
+++<<<<<<< HEAD
+ +	pthread_attr_setstacksize(&attr, THREAD_STACK);
+++=======
++ 	if (!bidi_pass)
++ 		thread_common_ops(ifobject, bufs, &sync_mutex_tx);
+++>>>>>>> 99f9bcb65705 (selftests: xsk: Remove Tx synchronization resources)
+  
+ -	while (atomic_load(&spinning_rx) && spinningrxctr < SOCK_RECONF_CTR) {
+ -		spinningrxctr++;
+ -		usleep(USLEEP_MAX);
+ -	}
+ +	if (!bidi_pass) {
+ +		bufs = mmap(NULL, num_frames * XSK_UMEM__DEFAULT_FRAME_SIZE,
+ +			    PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+ +		if (bufs == MAP_FAILED)
+ +			exit_with_error(errno);
+  
+ -	for (int i = 0; i < num_frames; i++) {
+ -		/*send EOT frame */
+ -		if (i == (num_frames - 1))
+ -			data.seqnum = -1;
+ -		else
+ -			data.seqnum = i;
+ -		gen_udp_hdr(&data, ifobject, udp_hdr);
+ -		gen_ip_hdr(ifobject, ip_hdr);
+ -		gen_udp_csum(udp_hdr, ip_hdr);
+ -		gen_eth_hdr(ifobject, eth_hdr);
+ -		gen_eth_frame(ifobject->umem, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
+ +		if (strcmp(ifobject->nsname, ""))
+ +			switch_namespace(ifobject->ifdict_index);
+  	}
+  
+ -	print_verbose("Sending %d packets on interface %s\n",
+ -		      (opt_pkt_count - 1), ifobject->ifname);
+ -	tx_only_all(ifobject);
+ +	if (ifobject->fv.vector == tx) {
+ +		int spinningrxctr = 0;
+  
+ -	if (test_type != TEST_TYPE_BIDI || bidi_pass) {
+ -		xsk_socket__delete(ifobject->xsk->xsk);
+ -		(void)xsk_umem__delete(ifobject->umem->umem);
+ -	}
+ -	pthread_exit(NULL);
+ -}
+ +		if (!bidi_pass)
+ +			thread_common_ops(ifobject, bufs, &sync_mutex_tx, &spinning_tx);
+  
+ -static void *worker_testapp_validate_rx(void *arg)
+ -{
+ -	struct ifobject *ifobject = (struct ifobject *)arg;
+ -	struct pollfd fds[MAX_SOCKS] = { };
+ -	void *bufs = NULL;
+ +		while (atomic_load(&spinning_rx) && spinningrxctr < SOCK_RECONF_CTR) {
+ +			spinningrxctr++;
+ +			usleep(USLEEP_MAX);
+ +		}
+ +
+ +		print_verbose("Interface [%s] vector [Tx]\n", ifobject->ifname);
+ +		for (int i = 0; i < num_frames; i++) {
+ +			/*send EOT frame */
+ +			if (i == (num_frames - 1))
+ +				data.seqnum = -1;
+ +			else
+ +				data.seqnum = i;
+ +			gen_udp_hdr(&data, ifobject, udp_hdr);
+ +			gen_ip_hdr(ifobject, ip_hdr);
+ +			gen_udp_csum(udp_hdr, ip_hdr);
+ +			gen_eth_hdr(ifobject, eth_hdr);
+ +			gen_eth_frame(ifobject->umem, i * XSK_UMEM__DEFAULT_FRAME_SIZE);
+ +		}
+  
+++<<<<<<< HEAD
+ +		print_verbose("Sending %d packets on interface %s\n",
+ +			       (opt_pkt_count - 1), ifobject->ifname);
+ +		tx_only_all(ifobject);
+ +	} else if (ifobject->fv.vector == rx) {
+ +		struct pollfd fds[MAX_SOCKS] = { };
+ +		int ret;
+++=======
++ 	if (!bidi_pass)
++ 		thread_common_ops(ifobject, bufs, &sync_mutex_tx);
+++>>>>>>> 99f9bcb65705 (selftests: xsk: Remove Tx synchronization resources)
+  
+ -	if (stat_test_type != STAT_TEST_RX_FILL_EMPTY)
+ +		if (!bidi_pass)
+ +			thread_common_ops(ifobject, bufs, &sync_mutex_tx, &spinning_rx);
+ +
+ +		print_verbose("Interface [%s] vector [Rx]\n", ifobject->ifname);
+  		xsk_populate_fill_ring(ifobject->umem);
+  
+ -	TAILQ_INIT(&head);
+ -	if (debug_pkt_dump) {
+ -		pkt_buf = calloc(num_frames, sizeof(*pkt_buf));
+ -		if (!pkt_buf)
+ -			exit_with_error(errno);
+ -	}
+ +		TAILQ_INIT(&head);
+ +		if (debug_pkt_dump) {
+ +			pkt_buf = calloc(num_frames, sizeof(*pkt_buf));
+ +			if (!pkt_buf)
+ +				exit_with_error(errno);
+ +		}
+  
+ -	fds[0].fd = xsk_socket__fd(ifobject->xsk->xsk);
+ -	fds[0].events = POLLIN;
+ +		fds[0].fd = xsk_socket__fd(ifobject->xsk->xsk);
+ +		fds[0].events = POLLIN;
+  
+ -	pthread_mutex_lock(&sync_mutex);
+ -	pthread_cond_signal(&signal_rx_condition);
+ -	pthread_mutex_unlock(&sync_mutex);
+ +		pthread_mutex_lock(&sync_mutex);
+ +		pthread_cond_signal(&signal_rx_condition);
+ +		pthread_mutex_unlock(&sync_mutex);
+  
+ -	while (1) {
+ -		if (test_type != TEST_TYPE_STATS) {
+ +		while (1) {
+ +			if (opt_poll) {
+ +				ret = poll(fds, 1, POLL_TMOUT);
+ +				if (ret <= 0)
+ +					continue;
+ +			}
+  			rx_pkt(ifobject->xsk, fds);
+  			worker_pkt_validate();
+ -		} else {
+ -			worker_stats_validate(ifobject);
+ +
+ +			if (sigvar)
+ +				break;
+  		}
+ -		if (sigvar)
+ -			break;
+ -	}
+  
+ -	print_verbose("Received %d packets on interface %s\n",
+ -		      pkt_counter, ifobject->ifname);
+ +		print_verbose("Received %d packets on interface %s\n",
+ +			       pkt_counter, ifobject->ifname);
+  
+ -	if (test_type == TEST_TYPE_TEARDOWN)
+ -		print_verbose("Destroying socket\n");
+ +		if (opt_teardown)
+ +			print_verbose("Destroying socket\n");
+ +	}
+  
+ -	if ((test_type != TEST_TYPE_BIDI) || bidi_pass) {
+ +	if (!opt_bidi || bidi_pass) {
+  		xsk_socket__delete(ifobject->xsk->xsk);
+  		(void)xsk_umem__delete(ifobject->umem->umem);
+  	}
+diff --cc tools/testing/selftests/bpf/xdpxceiver.h
+index f66f399dfb2d,483be41229c6..000000000000
+--- a/tools/testing/selftests/bpf/xdpxceiver.h
++++ b/tools/testing/selftests/bpf/xdpxceiver.h
+@@@ -135,15 -148,9 +134,19 @@@ atomic_int spinning_rx
+  pthread_mutex_t sync_mutex;
+  pthread_mutex_t sync_mutex_tx;
+  pthread_cond_t signal_rx_condition;
+++<<<<<<< HEAD
+ +pthread_cond_t signal_tx_condition;
+ +pthread_t t0, t1, ns_thread;
+++=======
++ pthread_t t0, t1;
+++>>>>>>> 99f9bcb65705 (selftests: xsk: Remove Tx synchronization resources)
+  pthread_attr_t attr;
+  
+ +struct targs {
+ +	bool retptr;
+ +	int idx;
+ +};
+ +
+  TAILQ_HEAD(head_s, pkt) head = TAILQ_HEAD_INITIALIZER(head);
+  struct head_s *head_p;
+  struct pkt {
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.c
+* Unmerged path tools/testing/selftests/bpf/xdpxceiver.h
