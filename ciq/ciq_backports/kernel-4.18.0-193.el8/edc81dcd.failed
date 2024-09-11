@@ -1,0 +1,129 @@
+SUNRPC: Refactor xprt_transmit() to remove the reply queue code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit edc81dcd5b7f699c4049042b35c904396642032e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/edc81dcd.failed
+
+Separate out the action of adding a request to the reply queue so that the
+backchannel code can simply skip calling it altogether.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit edc81dcd5b7f699c4049042b35c904396642032e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index cc25632c1df5,2ae0a4c47d59..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -1019,25 -1074,7 +1068,29 @@@ void xprt_transmit(struct rpc_task *tas
+  			task->tk_status = -EBADMSG;
+  			return;
+  		}
+++<<<<<<< HEAD
+ +
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+++=======
++ 	}
+++>>>>>>> edc81dcd5b7f (SUNRPC: Refactor xprt_transmit() to remove the reply queue code)
+  
+  	connect_cookie = xprt->connect_cookie;
+  	status = xprt->ops->send_request(task);
+@@@ -1373,18 -1429,7 +1445,22 @@@ void xprt_release(struct rpc_task *task
+  		task->tk_ops->rpc_count_stats(task, task->tk_calldata);
+  	else if (task->tk_client)
+  		rpc_count_iostats(task, task->tk_client->cl_metrics);
+++<<<<<<< HEAD
+ +	spin_lock(&xprt->recv_lock);
+ +	if (!list_empty(&req->rq_list)) {
+ +		list_del_init(&req->rq_list);
+ +		if (xprt_is_pinned_rqst(req)) {
+ +			set_bit(RPC_TASK_MSG_PIN_WAIT, &req->rq_task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_wait_on_pinned_rqst(req);
+ +			spin_lock(&xprt->recv_lock);
+ +			clear_bit(RPC_TASK_MSG_PIN_WAIT, &req->rq_task->tk_runstate);
+ +		}
+ +	}
+ +	spin_unlock(&xprt->recv_lock);
+++=======
++ 	xprt_request_dequeue_all(task, req);
+++>>>>>>> edc81dcd5b7f (SUNRPC: Refactor xprt_transmit() to remove the reply queue code)
+  	spin_lock_bh(&xprt->transport_lock);
+  	xprt->ops->release_xprt(xprt, task);
+  	if (xprt->ops->release_request)
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index bd743c51a865..25adcda1649d 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -334,6 +334,7 @@ void			xprt_free_slot(struct rpc_xprt *xprt,
+ 				       struct rpc_rqst *req);
+ void			xprt_lock_and_alloc_slot(struct rpc_xprt *xprt, struct rpc_task *task);
+ bool			xprt_prepare_transmit(struct rpc_task *task);
++void			xprt_request_enqueue_receive(struct rpc_task *task);
+ void			xprt_transmit(struct rpc_task *task);
+ void			xprt_end_transmit(struct rpc_task *task);
+ int			xprt_adjust_timeout(struct rpc_rqst *req);
+diff --git a/net/sunrpc/backchannel_rqst.c b/net/sunrpc/backchannel_rqst.c
+index 3c15a99b9700..fa5ba6ed3197 100644
+--- a/net/sunrpc/backchannel_rqst.c
++++ b/net/sunrpc/backchannel_rqst.c
+@@ -91,7 +91,6 @@ struct rpc_rqst *xprt_alloc_bc_req(struct rpc_xprt *xprt, gfp_t gfp_flags)
+ 		return NULL;
+ 
+ 	req->rq_xprt = xprt;
+-	INIT_LIST_HEAD(&req->rq_list);
+ 	INIT_LIST_HEAD(&req->rq_bc_list);
+ 
+ 	/* Preallocate one XDR receive buffer */
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index a858366cd15d..414966273a3f 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -1962,6 +1962,11 @@ call_transmit(struct rpc_task *task)
+ 			return;
+ 		}
+ 	}
++
++	/* Add task to reply queue before transmission to avoid races */
++	if (rpc_reply_expected(task))
++		xprt_request_enqueue_receive(task);
++
+ 	if (!xprt_prepare_transmit(task))
+ 		return;
+ 	task->tk_action = call_transmit_status;
+* Unmerged path net/sunrpc/xprt.c
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index d21c49c1fa08..9442b5e9bfb7 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -37,7 +37,6 @@ static int rpcrdma_bc_setup_reqs(struct rpcrdma_xprt *r_xprt,
+ 		rqst = &req->rl_slot;
+ 
+ 		rqst->rq_xprt = xprt;
+-		INIT_LIST_HEAD(&rqst->rq_list);
+ 		INIT_LIST_HEAD(&rqst->rq_bc_list);
+ 		__set_bit(RPC_BC_PA_IN_USE, &rqst->rq_bc_pa_state);
+ 		spin_lock(&xprt->bc_pa_lock);
