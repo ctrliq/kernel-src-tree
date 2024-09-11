@@ -1,0 +1,161 @@
+scsi: sd: Allow user to configure command retries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mike Christie <michael.christie@oracle.com>
+commit 0610959fbbca62b534f1f276873fd297f76b164b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/0610959f.failed
+
+Some iSCSI targets went with the traditional "export N ports" approach and
+then allowed the initiator to multipath over them. Other targets went the
+opposite direction and export a single port, and then software on the
+target side performs load balancing and failover to other targets via an
+iSCSI specific feature or IP takover.
+
+The problem for the 2nd type of config is we quickly run out of our five
+retries and get I/O errors. In these setups we want to reduce resource use
+on the initiator side so we only wanted the one session and no
+dm-multipath.  To handle traditional multipath operations like failover we
+do IP takover on the target side. So we would have an iSCSI target running
+on node1. Some monitoring software decides it's dead or the node is
+overloaded so it starts the iSCSI target on node2. The problem is for the
+failover case where we might have the equivalent of a dm-multipath
+temporary all paths down, or we just have to try more than 5 nodes before
+finding a good one.
+
+To handle this type of issue allow the user to configure the disk cmd
+retries from -1 to the current max of 5. -1 means infinite retries and
+should be used for setups where some other setting is going to control when
+to fail. For example iSCSI has the replacement/recovery timeout and fc
+(some users have used FC with NPIV and done something similar as IP
+takover) has dev_loss_tmo/fast_io_fail which will eventually expire and
+fail I/O.
+
+Link: https://lore.kernel.org/r/1601566554-26752-3-git-send-email-michael.christie@oracle.com
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Mike Christie <michael.christie@oracle.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 0610959fbbca62b534f1f276873fd297f76b164b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.c
+diff --cc drivers/scsi/sd.c
+index f45fe25d06c5,7aa69888d062..000000000000
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@@ -797,10 -898,9 +833,10 @@@ static blk_status_t sd_setup_unmap_cmnd
+  	put_unaligned_be64(lba, &buf[8]);
+  	put_unaligned_be32(nr_blocks, &buf[16]);
+  
+- 	cmd->allowed = SD_MAX_RETRIES;
++ 	cmd->allowed = sdkp->max_retries;
+  	cmd->transfersize = data_len;
+  	rq->timeout = SD_TIMEOUT;
+ +	scsi_req(rq)->resid_len = data_len;
+  
+  	return scsi_init_io(cmd);
+  }
+@@@ -829,10 -930,9 +866,10 @@@ static blk_status_t sd_setup_write_same
+  	put_unaligned_be64(lba, &cmd->cmnd[2]);
+  	put_unaligned_be32(nr_blocks, &cmd->cmnd[10]);
+  
+- 	cmd->allowed = SD_MAX_RETRIES;
++ 	cmd->allowed = sdkp->max_retries;
+  	cmd->transfersize = data_len;
+  	rq->timeout = unmap ? SD_TIMEOUT : SD_WRITE_SAME_TIMEOUT;
+ +	scsi_req(rq)->resid_len = data_len;
+  
+  	return scsi_init_io(cmd);
+  }
+@@@ -861,10 -962,9 +899,10 @@@ static blk_status_t sd_setup_write_same
+  	put_unaligned_be32(lba, &cmd->cmnd[2]);
+  	put_unaligned_be16(nr_blocks, &cmd->cmnd[7]);
+  
+- 	cmd->allowed = SD_MAX_RETRIES;
++ 	cmd->allowed = sdkp->max_retries;
+  	cmd->transfersize = data_len;
+  	rq->timeout = unmap ? SD_TIMEOUT : SD_WRITE_SAME_TIMEOUT;
+ +	scsi_req(rq)->resid_len = data_len;
+  
+  	return scsi_init_io(cmd);
+  }
+@@@ -3391,8 -3426,58 +3432,63 @@@ static int sd_probe(struct device *dev
+  	get_device(dev);
+  	dev_set_drvdata(dev, sdkp);
+  
+++<<<<<<< HEAD
+ +	get_device(&sdkp->dev);	/* prevent release before async_schedule */
+ +	async_schedule_domain(sd_probe_async, sdkp, &scsi_sd_probe_domain);
+++=======
++ 	gd->major = sd_major((index & 0xf0) >> 4);
++ 	gd->first_minor = ((index & 0xf) << 4) | (index & 0xfff00);
++ 
++ 	gd->fops = &sd_fops;
++ 	gd->private_data = &sdkp->driver;
++ 	gd->queue = sdkp->device->request_queue;
++ 
++ 	/* defaults, until the device tells us otherwise */
++ 	sdp->sector_size = 512;
++ 	sdkp->capacity = 0;
++ 	sdkp->media_present = 1;
++ 	sdkp->write_prot = 0;
++ 	sdkp->cache_override = 0;
++ 	sdkp->WCE = 0;
++ 	sdkp->RCD = 0;
++ 	sdkp->ATO = 0;
++ 	sdkp->first_scan = 1;
++ 	sdkp->max_medium_access_timeouts = SD_MAX_MEDIUM_TIMEOUTS;
++ 
++ 	error = sd_zbc_init_disk(sdkp);
++ 	if (error)
++ 		goto out_free_index;
++ 
++ 	sd_revalidate_disk(gd);
++ 
++ 	gd->flags = GENHD_FL_EXT_DEVT;
++ 	if (sdp->removable) {
++ 		gd->flags |= GENHD_FL_REMOVABLE;
++ 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
++ 		gd->event_flags = DISK_EVENT_FLAG_POLL | DISK_EVENT_FLAG_UEVENT;
++ 	}
++ 
++ 	blk_pm_runtime_init(sdp->request_queue, dev);
++ 	if (sdp->rpm_autosuspend) {
++ 		pm_runtime_set_autosuspend_delay(dev,
++ 			sdp->host->hostt->rpm_autosuspend_delay);
++ 	}
++ 	device_add_disk(dev, gd, NULL);
++ 	if (sdkp->capacity)
++ 		sd_dif_config_host(sdkp);
++ 
++ 	sd_revalidate_disk(gd);
++ 
++ 	if (sdkp->security) {
++ 		sdkp->opal_dev = init_opal_dev(sdkp, &sd_sec_submit);
++ 		if (sdkp->opal_dev)
++ 			sd_printk(KERN_NOTICE, sdkp, "supports TCG Opal\n");
++ 	}
++ 
++ 	sd_printk(KERN_NOTICE, sdkp, "Attached SCSI %sdisk\n",
++ 		  sdp->removable ? "removable " : "");
++ 	scsi_autopm_put_device(sdp);
+++>>>>>>> 0610959fbbca (scsi: sd: Allow user to configure command retries)
+  
+  	return 0;
+  
+* Unmerged path drivers/scsi/sd.c
+diff --git a/drivers/scsi/sd.h b/drivers/scsi/sd.h
+index 73f7cc3828fe..c0dd9005b3ed 100644
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@ -94,6 +94,7 @@ struct scsi_disk {
+ #endif
+ 	atomic_t	openers;
+ 	sector_t	capacity;	/* size in logical blocks */
++	int		max_retries;
+ 	u32		max_xfer_blocks;
+ 	u32		opt_xfer_blocks;
+ 	u32		max_ws_blocks;
