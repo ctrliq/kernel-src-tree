@@ -1,0 +1,285 @@
+skbuff: introduce {,__}napi_build_skb() which reuses NAPI cache heads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Alexander Lobakin <alobakin@pm.me>
+commit f450d539c05a14c103dd174718f81bb2fe65cb4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/f450d539.failed
+
+Instead of just bulk-flushing skbuff_heads queued up through
+napi_consume_skb() or __kfree_skb_defer(), try to reuse them
+on allocation path.
+If the cache is empty on allocation, bulk-allocate the first
+16 elements, which is more efficient than per-skb allocation.
+If the cache is full on freeing, bulk-wipe the second half of
+the cache (32 elements).
+This also includes custom KASAN poisoning/unpoisoning to be
+double sure there are no use-after-free cases.
+
+To not change current behaviour, introduce a new function,
+napi_build_skb(), to optionally use a new approach later
+in drivers.
+
+Note on selected bulk size, 16:
+ - this equals to XDP_BULK_QUEUE_SIZE, DEV_MAP_BULK_SIZE
+   and especially VETH_XDP_BATCH, which is also used to
+   bulk-allocate skbuff_heads and was tested on powerful
+   setups;
+ - this also showed the best performance in the actual
+   test series (from the array of {8, 16, 32}).
+
+	Suggested-by: Edward Cree <ecree.xilinx@gmail.com> # Divide on two halves
+	Suggested-by: Eric Dumazet <edumazet@google.com>   # KASAN poisoning
+	Cc: Dmitry Vyukov <dvyukov@google.com>             # Help with KASAN
+	Cc: Paolo Abeni <pabeni@redhat.com>                # Reduced batch size
+	Signed-off-by: Alexander Lobakin <alobakin@pm.me>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f450d539c05a14c103dd174718f81bb2fe65cb4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 764873a244e5,9e1a8ded4acc..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -124,6 -119,220 +124,223 @@@ static void skb_under_panic(struct sk_b
+  	skb_panic(skb, sz, addr, __func__);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define NAPI_SKB_CACHE_SIZE	64
++ #define NAPI_SKB_CACHE_BULK	16
++ #define NAPI_SKB_CACHE_HALF	(NAPI_SKB_CACHE_SIZE / 2)
++ 
++ struct napi_alloc_cache {
++ 	struct page_frag_cache page;
++ 	unsigned int skb_count;
++ 	void *skb_cache[NAPI_SKB_CACHE_SIZE];
++ };
++ 
++ static DEFINE_PER_CPU(struct page_frag_cache, netdev_alloc_cache);
++ static DEFINE_PER_CPU(struct napi_alloc_cache, napi_alloc_cache);
++ 
++ static void *__alloc_frag_align(unsigned int fragsz, gfp_t gfp_mask,
++ 				unsigned int align_mask)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 
++ 	return page_frag_alloc_align(&nc->page, fragsz, gfp_mask, align_mask);
++ }
++ 
++ void *__napi_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
++ {
++ 	fragsz = SKB_DATA_ALIGN(fragsz);
++ 
++ 	return __alloc_frag_align(fragsz, GFP_ATOMIC, align_mask);
++ }
++ EXPORT_SYMBOL(__napi_alloc_frag_align);
++ 
++ void *__netdev_alloc_frag_align(unsigned int fragsz, unsigned int align_mask)
++ {
++ 	struct page_frag_cache *nc;
++ 	void *data;
++ 
++ 	fragsz = SKB_DATA_ALIGN(fragsz);
++ 	if (in_irq() || irqs_disabled()) {
++ 		nc = this_cpu_ptr(&netdev_alloc_cache);
++ 		data = page_frag_alloc_align(nc, fragsz, GFP_ATOMIC, align_mask);
++ 	} else {
++ 		local_bh_disable();
++ 		data = __alloc_frag_align(fragsz, GFP_ATOMIC, align_mask);
++ 		local_bh_enable();
++ 	}
++ 	return data;
++ }
++ EXPORT_SYMBOL(__netdev_alloc_frag_align);
++ 
++ static struct sk_buff *napi_skb_cache_get(void)
++ {
++ 	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
++ 	struct sk_buff *skb;
++ 
++ 	if (unlikely(!nc->skb_count))
++ 		nc->skb_count = kmem_cache_alloc_bulk(skbuff_head_cache,
++ 						      GFP_ATOMIC,
++ 						      NAPI_SKB_CACHE_BULK,
++ 						      nc->skb_cache);
++ 	if (unlikely(!nc->skb_count))
++ 		return NULL;
++ 
++ 	skb = nc->skb_cache[--nc->skb_count];
++ 	kasan_unpoison_object_data(skbuff_head_cache, skb);
++ 
++ 	return skb;
++ }
++ 
++ /* Caller must provide SKB that is memset cleared */
++ static void __build_skb_around(struct sk_buff *skb, void *data,
++ 			       unsigned int frag_size)
++ {
++ 	struct skb_shared_info *shinfo;
++ 	unsigned int size = frag_size ? : ksize(data);
++ 
++ 	size -= SKB_DATA_ALIGN(sizeof(struct skb_shared_info));
++ 
++ 	/* Assumes caller memset cleared SKB */
++ 	skb->truesize = SKB_TRUESIZE(size);
++ 	refcount_set(&skb->users, 1);
++ 	skb->head = data;
++ 	skb->data = data;
++ 	skb_reset_tail_pointer(skb);
++ 	skb->end = skb->tail + size;
++ 	skb->mac_header = (typeof(skb->mac_header))~0U;
++ 	skb->transport_header = (typeof(skb->transport_header))~0U;
++ 
++ 	/* make sure we initialize shinfo sequentially */
++ 	shinfo = skb_shinfo(skb);
++ 	memset(shinfo, 0, offsetof(struct skb_shared_info, dataref));
++ 	atomic_set(&shinfo->dataref, 1);
++ 
++ 	skb_set_kcov_handle(skb, kcov_common_handle());
++ }
++ 
++ /**
++  * __build_skb - build a network buffer
++  * @data: data buffer provided by caller
++  * @frag_size: size of data, or 0 if head was kmalloced
++  *
++  * Allocate a new &sk_buff. Caller provides space holding head and
++  * skb_shared_info. @data must have been allocated by kmalloc() only if
++  * @frag_size is 0, otherwise data should come from the page allocator
++  *  or vmalloc()
++  * The return is the new skb buffer.
++  * On a failure the return is %NULL, and @data is not freed.
++  * Notes :
++  *  Before IO, driver allocates only data buffer where NIC put incoming frame
++  *  Driver should add room at head (NET_SKB_PAD) and
++  *  MUST add room at tail (SKB_DATA_ALIGN(skb_shared_info))
++  *  After IO, driver calls build_skb(), to allocate sk_buff and populate it
++  *  before giving packet to stack.
++  *  RX rings only contains data buffers, not full skbs.
++  */
++ struct sk_buff *__build_skb(void *data, unsigned int frag_size)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	skb = kmem_cache_alloc(skbuff_head_cache, GFP_ATOMIC);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	memset(skb, 0, offsetof(struct sk_buff, tail));
++ 	__build_skb_around(skb, data, frag_size);
++ 
++ 	return skb;
++ }
++ 
++ /* build_skb() is wrapper over __build_skb(), that specifically
++  * takes care of skb->head and skb->pfmemalloc
++  * This means that if @frag_size is not zero, then @data must be backed
++  * by a page fragment, not kmalloc() or vmalloc()
++  */
++ struct sk_buff *build_skb(void *data, unsigned int frag_size)
++ {
++ 	struct sk_buff *skb = __build_skb(data, frag_size);
++ 
++ 	if (skb && frag_size) {
++ 		skb->head_frag = 1;
++ 		if (page_is_pfmemalloc(virt_to_head_page(data)))
++ 			skb->pfmemalloc = 1;
++ 	}
++ 	return skb;
++ }
++ EXPORT_SYMBOL(build_skb);
++ 
++ /**
++  * build_skb_around - build a network buffer around provided skb
++  * @skb: sk_buff provide by caller, must be memset cleared
++  * @data: data buffer provided by caller
++  * @frag_size: size of data, or 0 if head was kmalloced
++  */
++ struct sk_buff *build_skb_around(struct sk_buff *skb,
++ 				 void *data, unsigned int frag_size)
++ {
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	__build_skb_around(skb, data, frag_size);
++ 
++ 	if (frag_size) {
++ 		skb->head_frag = 1;
++ 		if (page_is_pfmemalloc(virt_to_head_page(data)))
++ 			skb->pfmemalloc = 1;
++ 	}
++ 	return skb;
++ }
++ EXPORT_SYMBOL(build_skb_around);
++ 
++ /**
++  * __napi_build_skb - build a network buffer
++  * @data: data buffer provided by caller
++  * @frag_size: size of data, or 0 if head was kmalloced
++  *
++  * Version of __build_skb() that uses NAPI percpu caches to obtain
++  * skbuff_head instead of inplace allocation.
++  *
++  * Returns a new &sk_buff on success, %NULL on allocation failure.
++  */
++ static struct sk_buff *__napi_build_skb(void *data, unsigned int frag_size)
++ {
++ 	struct sk_buff *skb;
++ 
++ 	skb = napi_skb_cache_get();
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	memset(skb, 0, offsetof(struct sk_buff, tail));
++ 	__build_skb_around(skb, data, frag_size);
++ 
++ 	return skb;
++ }
++ 
++ /**
++  * napi_build_skb - build a network buffer
++  * @data: data buffer provided by caller
++  * @frag_size: size of data, or 0 if head was kmalloced
++  *
++  * Version of __napi_build_skb() that takes care of skb->head_frag
++  * and skb->pfmemalloc when the data is a page or page fragment.
++  *
++  * Returns a new &sk_buff on success, %NULL on allocation failure.
++  */
++ struct sk_buff *napi_build_skb(void *data, unsigned int frag_size)
++ {
++ 	struct sk_buff *skb = __napi_build_skb(data, frag_size);
++ 
++ 	if (likely(skb) && frag_size) {
++ 		skb->head_frag = 1;
++ 		skb_propagate_pfmemalloc(virt_to_head_page(data), skb);
++ 	}
++ 
++ 	return skb;
++ }
++ EXPORT_SYMBOL(napi_build_skb);
++ 
+++>>>>>>> f450d539c05a (skbuff: introduce {,__}napi_build_skb() which reuses NAPI cache heads)
+  /*
+   * kmalloc_reserve is a wrapper around kmalloc_node_track_caller that tells
+   * the caller if emergency pfmemalloc reserves are being used. If it is and
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index bf8a1376dfd7..30c307e17300 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1113,6 +1113,8 @@ struct sk_buff *build_skb(void *data, unsigned int frag_size);
+ struct sk_buff *build_skb_around(struct sk_buff *skb,
+ 				 void *data, unsigned int frag_size);
+ 
++struct sk_buff *napi_build_skb(void *data, unsigned int frag_size);
++
+ /**
+  * alloc_skb - allocate a network buffer
+  * @size: size to allocate
+* Unmerged path net/core/skbuff.c
