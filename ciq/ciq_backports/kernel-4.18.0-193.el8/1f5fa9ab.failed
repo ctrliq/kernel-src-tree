@@ -1,0 +1,386 @@
+selftests/bpf: Test BPF_CGROUP_SYSCTL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit 1f5fa9ab6e2eb16ba81284280a498fe9c543a2d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1f5fa9ab.failed
+
+Add unit test for BPF_PROG_TYPE_CGROUP_SYSCTL program type.
+
+Test that program can allow/deny access.
+Test both valid and invalid accesses to ctx->write.
+
+Example of output:
+  # ./test_sysctl
+  Test case: sysctl wrong attach_type .. [PASS]
+  Test case: sysctl:read allow all .. [PASS]
+  Test case: sysctl:read deny all .. [PASS]
+  Test case: ctx:write sysctl:read read ok .. [PASS]
+  Test case: ctx:write sysctl:write read ok .. [PASS]
+  Test case: ctx:write sysctl:read write reject .. [PASS]
+  Summary: 6 PASSED, 0 FAILED
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 1f5fa9ab6e2eb16ba81284280a498fe9c543a2d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/Makefile
+diff --cc tools/testing/selftests/bpf/Makefile
+index 37b01554670e,f9d83ba7843e..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -24,22 -23,20 +24,26 @@@ TEST_GEN_PROGS = test_verifier test_ta
+  	test_align test_verifier_log test_dev_cgroup test_tcpbpf_user \
+  	test_sock test_btf test_sockmap test_lirc_mode2_user get_cgroup_id_user \
+  	test_socket_cookie test_cgroup_storage test_select_reuseport test_section_names \
+++<<<<<<< HEAD
+ +	test_netcnt test_tcpnotify_user
+++=======
++ 	test_netcnt test_tcpnotify_user test_sock_fields test_sysctl
+ -
+ -BPF_OBJ_FILES = $(patsubst %.c,%.o, $(notdir $(wildcard progs/*.c)))
+ -TEST_GEN_FILES = $(BPF_OBJ_FILES)
+ -
+ -# Also test sub-register code-gen if LLVM has eBPF v3 processor support which
+ -# contains both ALU32 and JMP32 instructions.
+ -SUBREG_CODEGEN := $(shell echo "int cal(int a) { return a > 0; }" | \
+ -			$(CLANG) -target bpf -O2 -emit-llvm -S -x c - -o - | \
+ -			$(LLC) -mattr=+alu32 -mcpu=v3 2>&1 | \
+ -			grep 'if w')
+ -ifneq ($(SUBREG_CODEGEN),)
+ -TEST_GEN_FILES += $(patsubst %.o,alu32/%.o, $(BPF_OBJ_FILES))
+ -endif
+++>>>>>>> 1f5fa9ab6e2e (selftests/bpf: Test BPF_CGROUP_SYSCTL)
+ +
+ +TEST_GEN_FILES = test_pkt_access.o test_xdp.o test_l4lb.o test_tcp_estats.o test_obj_id.o \
+ +	test_pkt_md_access.o test_xdp_redirect.o test_xdp_meta.o sockmap_parse_prog.o     \
+ +	sockmap_verdict_prog.o dev_cgroup.o sample_ret0.o test_tracepoint.o \
+ +	test_l4lb_noinline.o test_xdp_noinline.o test_stacktrace_map.o \
+ +	test_tcpnotify_kern.o \
+ +	sample_map_ret0.o test_tcpbpf_kern.o test_stacktrace_build_id.o \
+ +	sockmap_tcp_msg_prog.o connect4_prog.o connect6_prog.o test_adjust_tail.o \
+ +	test_btf_haskv.o test_btf_nokv.o test_sockmap_kern.o test_tunnel_kern.o \
+ +	test_get_stack_rawtp.o test_sockmap_kern.o test_sockhash_kern.o \
+ +	test_lwt_seg6local.o sendmsg4_prog.o sendmsg6_prog.o test_lirc_mode2_kern.o \
+ +	get_cgroup_id_kern.o socket_cookie_prog.o test_select_reuseport_kern.o \
+ +	test_skb_cgroup_id_kern.o bpf_flow.o netcnt_prog.o \
+ +	test_sk_lookup_kern.o test_xdp_vlan.o test_queue_map.o test_stack_map.o \
+ +	xdp_dummy.o test_map_in_map.o
+  
+  # Order correspond to 'make run_tests' order
+  TEST_PROGS := test_kmod.sh \
+@@@ -84,6 -92,8 +88,11 @@@ $(OUTPUT)/test_progs: trace_helpers.
+  $(OUTPUT)/get_cgroup_id_user: cgroup_helpers.c
+  $(OUTPUT)/test_cgroup_storage: cgroup_helpers.c
+  $(OUTPUT)/test_netcnt: cgroup_helpers.c
+++<<<<<<< HEAD
+++=======
++ $(OUTPUT)/test_sock_fields: cgroup_helpers.c
++ $(OUTPUT)/test_sysctl: cgroup_helpers.c
+++>>>>>>> 1f5fa9ab6e2e (selftests/bpf: Test BPF_CGROUP_SYSCTL)
+  
+  .PHONY: force
+  
+* Unmerged path tools/testing/selftests/bpf/Makefile
+diff --git a/tools/testing/selftests/bpf/test_sysctl.c b/tools/testing/selftests/bpf/test_sysctl.c
+new file mode 100644
+index 000000000000..6d0ab09789ad
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_sysctl.c
+@@ -0,0 +1,291 @@
++// SPDX-License-Identifier: GPL-2.0
++// Copyright (c) 2019 Facebook
++
++#include <fcntl.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include <linux/filter.h>
++
++#include <bpf/bpf.h>
++
++#include "bpf_rlimit.h"
++#include "bpf_util.h"
++#include "cgroup_helpers.h"
++
++#define CG_PATH			"/foo"
++#define MAX_INSNS		512
++
++char bpf_log_buf[BPF_LOG_BUF_SIZE];
++
++struct sysctl_test {
++	const char *descr;
++	struct bpf_insn	insns[MAX_INSNS];
++	enum bpf_attach_type attach_type;
++	const char *sysctl;
++	int open_flags;
++	const char *newval;
++	enum {
++		LOAD_REJECT,
++		ATTACH_REJECT,
++		OP_EPERM,
++		SUCCESS,
++	} result;
++};
++
++static struct sysctl_test tests[] = {
++	{
++		.descr = "sysctl wrong attach_type",
++		.insns = {
++			BPF_MOV64_IMM(BPF_REG_0, 1),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = 0,
++		.sysctl = "kernel/ostype",
++		.open_flags = O_RDONLY,
++		.result = ATTACH_REJECT,
++	},
++	{
++		.descr = "sysctl:read allow all",
++		.insns = {
++			BPF_MOV64_IMM(BPF_REG_0, 1),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = BPF_CGROUP_SYSCTL,
++		.sysctl = "kernel/ostype",
++		.open_flags = O_RDONLY,
++		.result = SUCCESS,
++	},
++	{
++		.descr = "sysctl:read deny all",
++		.insns = {
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = BPF_CGROUP_SYSCTL,
++		.sysctl = "kernel/ostype",
++		.open_flags = O_RDONLY,
++		.result = OP_EPERM,
++	},
++	{
++		.descr = "ctx:write sysctl:read read ok",
++		.insns = {
++			/* If (write) */
++			BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_1,
++				    offsetof(struct bpf_sysctl, write)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_7, 1, 2),
++
++			/* return DENY; */
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_JMP_A(1),
++
++			/* else return ALLOW; */
++			BPF_MOV64_IMM(BPF_REG_0, 1),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = BPF_CGROUP_SYSCTL,
++		.sysctl = "kernel/ostype",
++		.open_flags = O_RDONLY,
++		.result = SUCCESS,
++	},
++	{
++		.descr = "ctx:write sysctl:write read ok",
++		.insns = {
++			/* If (write) */
++			BPF_LDX_MEM(BPF_B, BPF_REG_7, BPF_REG_1,
++				    offsetof(struct bpf_sysctl, write)),
++			BPF_JMP_IMM(BPF_JNE, BPF_REG_7, 1, 2),
++
++			/* return DENY; */
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_JMP_A(1),
++
++			/* else return ALLOW; */
++			BPF_MOV64_IMM(BPF_REG_0, 1),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = BPF_CGROUP_SYSCTL,
++		.sysctl = "kernel/domainname",
++		.open_flags = O_WRONLY,
++		.newval = "(none)", /* same as default, should fail anyway */
++		.result = OP_EPERM,
++	},
++	{
++		.descr = "ctx:write sysctl:read write reject",
++		.insns = {
++			/* write = X */
++			BPF_MOV64_IMM(BPF_REG_0, 0),
++			BPF_STX_MEM(BPF_W, BPF_REG_1, BPF_REG_0,
++				    offsetof(struct bpf_sysctl, write)),
++			BPF_MOV64_IMM(BPF_REG_0, 1),
++			BPF_EXIT_INSN(),
++		},
++		.attach_type = BPF_CGROUP_SYSCTL,
++		.sysctl = "kernel/ostype",
++		.open_flags = O_RDONLY,
++		.result = LOAD_REJECT,
++	},
++};
++
++static size_t probe_prog_length(const struct bpf_insn *fp)
++{
++	size_t len;
++
++	for (len = MAX_INSNS - 1; len > 0; --len)
++		if (fp[len].code != 0 || fp[len].imm != 0)
++			break;
++	return len + 1;
++}
++
++static int load_sysctl_prog(struct sysctl_test *test, const char *sysctl_path)
++{
++	struct bpf_insn *prog = test->insns;
++	struct bpf_load_program_attr attr;
++	int ret;
++
++	memset(&attr, 0, sizeof(struct bpf_load_program_attr));
++	attr.prog_type = BPF_PROG_TYPE_CGROUP_SYSCTL;
++	attr.insns = prog;
++	attr.insns_cnt = probe_prog_length(attr.insns);
++	attr.license = "GPL";
++
++	ret = bpf_load_program_xattr(&attr, bpf_log_buf, BPF_LOG_BUF_SIZE);
++	if (ret < 0 && test->result != LOAD_REJECT) {
++		log_err(">>> Loading program error.\n"
++			">>> Verifier output:\n%s\n-------\n", bpf_log_buf);
++	}
++
++	return ret;
++}
++
++static int access_sysctl(const char *sysctl_path,
++			 const struct sysctl_test *test)
++{
++	int err = 0;
++	int fd;
++
++	fd = open(sysctl_path, test->open_flags | O_CLOEXEC);
++	if (fd < 0)
++		return fd;
++
++	if (test->open_flags == O_RDONLY) {
++		char buf[128];
++
++		if (read(fd, buf, sizeof(buf)) == -1)
++			goto err;
++	} else if (test->open_flags == O_WRONLY) {
++		if (!test->newval) {
++			log_err("New value for sysctl is not set");
++			goto err;
++		}
++		if (write(fd, test->newval, strlen(test->newval)) == -1)
++			goto err;
++	} else {
++		log_err("Unexpected sysctl access: neither read nor write");
++		goto err;
++	}
++
++	goto out;
++err:
++	err = -1;
++out:
++	close(fd);
++	return err;
++}
++
++static int run_test_case(int cgfd, struct sysctl_test *test)
++{
++	enum bpf_attach_type atype = test->attach_type;
++	char sysctl_path[128];
++	int progfd = -1;
++	int err = 0;
++
++	printf("Test case: %s .. ", test->descr);
++
++	snprintf(sysctl_path, sizeof(sysctl_path), "/proc/sys/%s",
++		 test->sysctl);
++
++	progfd = load_sysctl_prog(test, sysctl_path);
++	if (progfd < 0) {
++		if (test->result == LOAD_REJECT)
++			goto out;
++		else
++			goto err;
++	}
++
++	if (bpf_prog_attach(progfd, cgfd, atype, BPF_F_ALLOW_OVERRIDE) == -1) {
++		if (test->result == ATTACH_REJECT)
++			goto out;
++		else
++			goto err;
++	}
++
++	if (access_sysctl(sysctl_path, test) == -1) {
++		if (test->result == OP_EPERM && errno == EPERM)
++			goto out;
++		else
++			goto err;
++	}
++
++	if (test->result != SUCCESS) {
++		log_err("Unexpected failure");
++		goto err;
++	}
++
++	goto out;
++err:
++	err = -1;
++out:
++	/* Detaching w/o checking return code: best effort attempt. */
++	if (progfd != -1)
++		bpf_prog_detach(cgfd, atype);
++	close(progfd);
++	printf("[%s]\n", err ? "FAIL" : "PASS");
++	return err;
++}
++
++static int run_tests(int cgfd)
++{
++	int passes = 0;
++	int fails = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(tests); ++i) {
++		if (run_test_case(cgfd, &tests[i]))
++			++fails;
++		else
++			++passes;
++	}
++	printf("Summary: %d PASSED, %d FAILED\n", passes, fails);
++	return fails ? -1 : 0;
++}
++
++int main(int argc, char **argv)
++{
++	int cgfd = -1;
++	int err = 0;
++
++	if (setup_cgroup_environment())
++		goto err;
++
++	cgfd = create_and_get_cgroup(CG_PATH);
++	if (cgfd < 0)
++		goto err;
++
++	if (join_cgroup(CG_PATH))
++		goto err;
++
++	if (run_tests(cgfd))
++		goto err;
++
++	goto out;
++err:
++	err = -1;
++out:
++	close(cgfd);
++	cleanup_cgroup_environment();
++	return err;
++}
