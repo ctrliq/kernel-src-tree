@@ -1,0 +1,144 @@
+KVM: x86/mmu: Rename DEFAULT_SPTE_MMU_WRITEABLE to DEFAULT_SPTE_MMU_WRITABLE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 1ca87e015d9972f73c6b160b223ba1e0c5a9b1e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1ca87e01.failed
+
+Both "writeable" and "writable" are valid, but we should be consistent
+about which we use. DEFAULT_SPTE_MMU_WRITEABLE was the odd one out in
+the SPTE code, so rename it to DEFAULT_SPTE_MMU_WRITABLE.
+
+No functional change intended.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220125230713.1700406-1-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1ca87e015d9972f73c6b160b223ba1e0c5a9b1e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index b66e2b4a1ec3,2ab4fe6cc0c5..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -5731,28 -5804,47 +5731,52 @@@ static bool slot_rmap_write_protect(str
+  }
+  
+  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ -				      const struct kvm_memory_slot *memslot,
+ +				      struct kvm_memory_slot *memslot,
+  				      int start_level)
+  {
+ -	bool flush = false;
+ -
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ -					  start_level, KVM_MAX_HUGEPAGE_LEVEL,
+ -					  false);
+ -		write_unlock(&kvm->mmu_lock);
+ -	}
+ +	bool flush;
+  
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ +				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * We can flush all the TLBs out of the mmu lock without TLB
+ +	 * corruption since we just change the spte from writable to
+ +	 * readonly so that we only need to care the case of changing
+ +	 * spte from present to present (changing the spte from present
+ +	 * to nonpresent will flush all the TLBs immediately), in other
+ +	 * words, the only case we care is mmu_spte_update() where we
+ +	 * have checked Host-writable | MMU-writable instead of
+ +	 * PT_WRITABLE_MASK, that means it does not depend on PT_WRITABLE_MASK
+ +	 * anymore.
+++=======
++ 	 * Flush TLBs if any SPTEs had to be write-protected to ensure that
++ 	 * guest writes are reflected in the dirty bitmap before the memslot
++ 	 * update completes, i.e. before enabling dirty logging is visible to
++ 	 * userspace.
++ 	 *
++ 	 * Perform the TLB flush outside the mmu_lock to reduce the amount of
++ 	 * time the lock is held. However, this does mean that another CPU can
++ 	 * now grab mmu_lock and encounter a write-protected SPTE while CPUs
++ 	 * still have a writable mapping for the associated GFN in their TLB.
++ 	 *
++ 	 * This is safe but requires KVM to be careful when making decisions
++ 	 * based on the write-protection status of an SPTE. Specifically, KVM
++ 	 * also write-protects SPTEs to monitor changes to guest page tables
++ 	 * during shadow paging, and must guarantee no CPUs can write to those
++ 	 * page before the lock is dropped. As mentioned in the previous
++ 	 * paragraph, a write-protected SPTE is no guarantee that CPU cannot
++ 	 * perform writes. So to determine if a TLB flush is truly required, KVM
++ 	 * will clear a separate software-only bit (MMU-writable) and skip the
++ 	 * flush if-and-only-if this bit was already clear.
++ 	 *
++ 	 * See DEFAULT_SPTE_MMU_WRITABLE for more details.
+++>>>>>>> 1ca87e015d99 (KVM: x86/mmu: Rename DEFAULT_SPTE_MMU_WRITEABLE to DEFAULT_SPTE_MMU_WRITABLE)
+  	 */
+  	if (flush)
+  		kvm_arch_flush_remote_tlbs_memslot(kvm, memslot);
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/spte.c b/arch/x86/kvm/mmu/spte.c
+index 31a0e0981b05..c51a2728d879 100644
+--- a/arch/x86/kvm/mmu/spte.c
++++ b/arch/x86/kvm/mmu/spte.c
+@@ -352,8 +352,8 @@ void kvm_mmu_reset_all_pte_masks(void)
+ 	shadow_acc_track_mask	= 0;
+ 	shadow_me_mask		= sme_me_mask;
+ 
+-	shadow_host_writable_mask = DEFAULT_SPTE_HOST_WRITEABLE;
+-	shadow_mmu_writable_mask  = DEFAULT_SPTE_MMU_WRITEABLE;
++	shadow_host_writable_mask = DEFAULT_SPTE_HOST_WRITABLE;
++	shadow_mmu_writable_mask  = DEFAULT_SPTE_MMU_WRITABLE;
+ 
+ 	/*
+ 	 * Set a reserved PA bit in MMIO SPTEs to generate page faults with
+diff --git a/arch/x86/kvm/mmu/spte.h b/arch/x86/kvm/mmu/spte.h
+index c12a635ff808..f3744fc36b8f 100644
+--- a/arch/x86/kvm/mmu/spte.h
++++ b/arch/x86/kvm/mmu/spte.h
+@@ -75,7 +75,7 @@ static_assert(SPTE_TDP_AD_ENABLED_MASK == 0);
+ static_assert(!(SPTE_TDP_AD_MASK & SHADOW_ACC_TRACK_SAVED_MASK));
+ 
+ /*
+- * *_SPTE_HOST_WRITEABLE (aka Host-writable) indicates whether the host permits
++ * *_SPTE_HOST_WRITABLE (aka Host-writable) indicates whether the host permits
+  * writes to the guest page mapped by the SPTE. This bit is cleared on SPTEs
+  * that map guest pages in read-only memslots and read-only VMAs.
+  *
+@@ -83,7 +83,7 @@ static_assert(!(SPTE_TDP_AD_MASK & SHADOW_ACC_TRACK_SAVED_MASK));
+  *  - If Host-writable is clear, PT_WRITABLE_MASK must be clear.
+  *
+  *
+- * *_SPTE_MMU_WRITEABLE (aka MMU-writable) indicates whether the shadow MMU
++ * *_SPTE_MMU_WRITABLE (aka MMU-writable) indicates whether the shadow MMU
+  * allows writes to the guest page mapped by the SPTE. This bit is cleared when
+  * the guest page mapped by the SPTE contains a page table that is being
+  * monitored for shadow paging. In this case the SPTE can only be made writable
+@@ -100,8 +100,8 @@ static_assert(!(SPTE_TDP_AD_MASK & SHADOW_ACC_TRACK_SAVED_MASK));
+  */
+ 
+ /* Bits 9 and 10 are ignored by all non-EPT PTEs. */
+-#define DEFAULT_SPTE_HOST_WRITEABLE	BIT_ULL(9)
+-#define DEFAULT_SPTE_MMU_WRITEABLE	BIT_ULL(10)
++#define DEFAULT_SPTE_HOST_WRITABLE	BIT_ULL(9)
++#define DEFAULT_SPTE_MMU_WRITABLE	BIT_ULL(10)
+ 
+ /*
+  * Low ignored bits are at a premium for EPT, use high ignored bits, taking care
