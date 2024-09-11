@@ -1,0 +1,128 @@
+tipc: ignore STATE_MSG on wrong link session
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author LUU Duc Canh <canh.d.luu@dektech.com.au>
+commit d949cfedbcbab4e91590576cbace2671924ad69c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/d949cfed.failed
+
+The initial session number when a link is created is based on a random
+value, taken from struct tipc_net->random. It is then incremented for
+each link reset to avoid mixing protocol messages from different link
+sessions.
+
+However, when a bearer is reset all its links are deleted, and will
+later be re-created using the same random value as the first time.
+This means that if the link never went down between creation and
+deletion we will still sometimes have two subsequent sessions with
+the same session number. In virtual environments with potentially
+long transmission times this has turned out to be a real problem.
+
+We now fix this by randomizing the session number each time a link
+is created.
+
+With a session number size of 16 bits this gives a risk of session
+collision of 1/64k. To reduce this further, we also introduce a sanity
+check on the very first STATE message arriving at a link. If this has
+an acknowledge value differing from 0, which is logically impossible,
+we ignore the message. The final risk for session collision is hence
+reduced to 1/4G, which should be sufficient.
+
+	Signed-off-by: LUU Duc Canh <canh.d.luu@dektech.com.au>
+	Signed-off-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d949cfedbcbab4e91590576cbace2671924ad69c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index 83022e3d943e,fb886b525d95..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1486,6 -1487,47 +1486,50 @@@ tnl
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* tipc_link_validate_msg(): validate message against current link state
++  * Returns true if message should be accepted, otherwise false
++  */
++ bool tipc_link_validate_msg(struct tipc_link *l, struct tipc_msg *hdr)
++ {
++ 	u16 curr_session = l->peer_session;
++ 	u16 session = msg_session(hdr);
++ 	int mtyp = msg_type(hdr);
++ 
++ 	if (msg_user(hdr) != LINK_PROTOCOL)
++ 		return true;
++ 
++ 	switch (mtyp) {
++ 	case RESET_MSG:
++ 		if (!l->in_session)
++ 			return true;
++ 		/* Accept only RESET with new session number */
++ 		return more(session, curr_session);
++ 	case ACTIVATE_MSG:
++ 		if (!l->in_session)
++ 			return true;
++ 		/* Accept only ACTIVATE with new or current session number */
++ 		return !less(session, curr_session);
++ 	case STATE_MSG:
++ 		/* Accept only STATE with current session number */
++ 		if (!l->in_session)
++ 			return false;
++ 		if (session != curr_session)
++ 			return false;
++ 		/* Extra sanity check */
++ 		if (!link_is_up(l) && msg_ack(hdr))
++ 			return false;
++ 		if (!(l->peer_caps & TIPC_LINK_PROTO_SEQNO))
++ 			return true;
++ 		/* Accept only STATE with new sequence number */
++ 		return !less(msg_seqno(hdr), l->rcv_nxt_state);
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
+++>>>>>>> d949cfedbcba (tipc: ignore STATE_MSG on wrong link session)
+  /* tipc_link_proto_rcv(): receive link level protocol message :
+   * Note that network plane id propagates through the network, and may
+   * change at any time. The node with lowest numerical id determines
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 40b936a09ffc..d7903e7ea324 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -848,6 +848,7 @@ void tipc_node_check_dest(struct net *net, u32 addr,
+ 	bool reset = true;
+ 	char *if_name;
+ 	unsigned long intv;
++	u16 session;
+ 
+ 	*dupl_addr = false;
+ 	*respond = false;
+@@ -934,9 +935,10 @@ void tipc_node_check_dest(struct net *net, u32 addr,
+ 			goto exit;
+ 
+ 		if_name = strchr(b->name, ':') + 1;
++		get_random_bytes(&session, sizeof(u16));
+ 		if (!tipc_link_create(net, if_name, b->identity, b->tolerance,
+ 				      b->net_plane, b->mtu, b->priority,
+-				      b->window, mod(tipc_net(net)->random),
++				      b->window, session,
+ 				      tipc_own_addr(net), addr, peer_id,
+ 				      n->capabilities,
+ 				      tipc_bc_sndlink(n->net), n->bc_entry.link,
+@@ -1556,7 +1558,6 @@ static bool tipc_node_check_state(struct tipc_node *n, struct sk_buff *skb,
+ 			tipc_link_create_dummy_tnl_msg(l, xmitq);
+ 			n->failover_sent = true;
+ 		}
+-
+ 		/* If pkts arrive out of order, use lowest calculated syncpt */
+ 		if (less(syncpt, n->sync_point))
+ 			n->sync_point = syncpt;
