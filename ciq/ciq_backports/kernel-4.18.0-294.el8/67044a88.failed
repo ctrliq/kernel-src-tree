@@ -1,0 +1,159 @@
+net/mlx5e: Move TX code into functions to be used by MPWQE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit 67044a88aa0556b929cd07ba0656b101f3a6a67c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/67044a88.failed
+
+mlx5e_txwqe_complete performs some actions that can be taken to separate
+functions:
+
+1. Update the flags needed for hardware timestamping.
+
+2. Stop the TX queue if it's full.
+
+Take these actions into separate functions to be reused by the MPWQE
+code in the following commit and to maintain clear responsibilities of
+functions.
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 67044a88aa0556b929cd07ba0656b101f3a6a67c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index d2c9bb371f27,f5af35c5ecc8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -256,9 -266,85 +256,87 @@@ mlx5e_tx_wqe_inline_mode(struct mlx5e_t
+  	return mode;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mlx5e_sq_xmit_prepare(struct mlx5e_txqsq *sq, struct sk_buff *skb,
++ 				  struct mlx5e_accel_tx_state *accel,
++ 				  struct mlx5e_tx_attr *attr)
++ {
++ 	struct mlx5e_sq_stats *stats = sq->stats;
++ 
++ 	if (skb_is_gso(skb)) {
++ 		u16 ihs = mlx5e_tx_get_gso_ihs(sq, skb);
++ 
++ 		*attr = (struct mlx5e_tx_attr) {
++ 			.opcode    = MLX5_OPCODE_LSO,
++ 			.mss       = cpu_to_be16(skb_shinfo(skb)->gso_size),
++ 			.ihs       = ihs,
++ 			.num_bytes = skb->len + (skb_shinfo(skb)->gso_segs - 1) * ihs,
++ 			.headlen   = skb_headlen(skb) - ihs,
++ 		};
++ 
++ 		stats->packets += skb_shinfo(skb)->gso_segs;
++ 	} else {
++ 		u8 mode = mlx5e_tx_wqe_inline_mode(sq, skb, accel);
++ 		u16 ihs = mlx5e_calc_min_inline(mode, skb);
++ 
++ 		*attr = (struct mlx5e_tx_attr) {
++ 			.opcode    = MLX5_OPCODE_SEND,
++ 			.mss       = cpu_to_be16(0),
++ 			.ihs       = ihs,
++ 			.num_bytes = max_t(unsigned int, skb->len, ETH_ZLEN),
++ 			.headlen   = skb_headlen(skb) - ihs,
++ 		};
++ 
++ 		stats->packets++;
++ 	}
++ 
++ 	stats->bytes += attr->num_bytes;
++ }
++ 
++ static void mlx5e_sq_calc_wqe_attr(struct sk_buff *skb, const struct mlx5e_tx_attr *attr,
++ 				   struct mlx5e_tx_wqe_attr *wqe_attr)
++ {
++ 	u16 ds_cnt = MLX5E_TX_WQE_EMPTY_DS_COUNT;
++ 	u16 ds_cnt_inl = 0;
++ 
++ 	ds_cnt += !!attr->headlen + skb_shinfo(skb)->nr_frags;
++ 
++ 	if (attr->ihs) {
++ 		u16 inl = attr->ihs - INL_HDR_START_SZ;
++ 
++ 		if (skb_vlan_tag_present(skb))
++ 			inl += VLAN_HLEN;
++ 
++ 		ds_cnt_inl = DIV_ROUND_UP(inl, MLX5_SEND_WQE_DS);
++ 		ds_cnt += ds_cnt_inl;
++ 	}
++ 
++ 	*wqe_attr = (struct mlx5e_tx_wqe_attr) {
++ 		.ds_cnt     = ds_cnt,
++ 		.ds_cnt_inl = ds_cnt_inl,
++ 		.num_wqebbs = DIV_ROUND_UP(ds_cnt, MLX5_SEND_WQEBB_NUM_DS),
++ 	};
++ }
++ 
++ static void mlx5e_tx_skb_update_hwts_flags(struct sk_buff *skb)
++ {
++ 	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
++ 		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++ }
++ 
++ static void mlx5e_tx_check_stop(struct mlx5e_txqsq *sq)
++ {
++ 	if (unlikely(!mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc, sq->stop_room))) {
++ 		netif_tx_stop_queue(sq->txq);
++ 		sq->stats->stopped++;
++ 	}
++ }
++ 
+++>>>>>>> 67044a88aa05 (net/mlx5e: Move TX code into functions to be used by MPWQE)
+  static inline void
+  mlx5e_txwqe_complete(struct mlx5e_txqsq *sq, struct sk_buff *skb,
+ -		     const struct mlx5e_tx_attr *attr,
+ -		     const struct mlx5e_tx_wqe_attr *wqe_attr, u8 num_dma,
+ +		     u8 opcode, u16 ds_cnt, u8 num_wqebbs, u32 num_bytes, u8 num_dma,
+  		     struct mlx5e_tx_wqe_info *wi, struct mlx5_wqe_ctrl_seg *cseg,
+  		     bool xmit_more)
+  {
+@@@ -267,25 -353,22 +345,22 @@@
+  
+  	*wi = (struct mlx5e_tx_wqe_info) {
+  		.skb = skb,
+ -		.num_bytes = attr->num_bytes,
+ +		.num_bytes = num_bytes,
+  		.num_dma = num_dma,
+ -		.num_wqebbs = wqe_attr->num_wqebbs,
+ -		.num_fifo_pkts = 0,
+ +		.num_wqebbs = num_wqebbs,
+  	};
+  
+ -	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | attr->opcode);
+ -	cseg->qpn_ds           = cpu_to_be32((sq->sqn << 8) | wqe_attr->ds_cnt);
+ +	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | opcode);
+ +	cseg->qpn_ds           = cpu_to_be32((sq->sqn << 8) | ds_cnt);
+  
+- 	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
+- 		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
++ 	mlx5e_tx_skb_update_hwts_flags(skb);
+  
+  	sq->pc += wi->num_wqebbs;
+- 	if (unlikely(!mlx5e_wqc_has_room_for(wq, sq->cc, sq->pc, sq->stop_room))) {
+- 		netif_tx_stop_queue(sq->txq);
+- 		sq->stats->stopped++;
+- 	}
++ 
++ 	mlx5e_tx_check_stop(sq);
+  
+ -	send_doorbell = __netdev_tx_sent_queue(sq->txq, attr->num_bytes, xmit_more);
+ +	send_doorbell = __netdev_tx_sent_queue(sq->txq, num_bytes,
+ +					       xmit_more);
+  	if (send_doorbell)
+  		mlx5e_notify_hw(wq, sq->pc, sq->uar_map, cseg);
+  }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
