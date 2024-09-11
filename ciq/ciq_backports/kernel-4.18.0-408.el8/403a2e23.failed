@@ -1,0 +1,1062 @@
+dmaengine: idxd: change MSIX allocation based on per wq activation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 403a2e236538c6b479ea5bfc8b75a75540cfba6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/403a2e23.failed
+
+Change the driver where WQ interrupt is requested only when wq is being
+enabled. This new scheme set things up so that request_threaded_irq() is
+only called when a kernel wq type is being enabled. This also sets up for
+future interrupt request where different interrupt handler such as wq
+occupancy interrupt can be setup instead of the wq completion interrupt.
+
+Not calling request_irq() until the WQ actually needs an irq also prevents
+wasting of CPU irq vectors on x86 systems, which is a limited resource.
+
+idxd_flush_pending_descs() is moved to device.c since descriptor flushing
+is now part of wq disable rather than shutdown().
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/163942149487.2412839.6691222855803875848.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 403a2e236538c6b479ea5bfc8b75a75540cfba6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/device.c
+#	drivers/dma/idxd/dma.c
+#	drivers/dma/idxd/init.c
+#	drivers/dma/idxd/irq.c
+#	include/uapi/linux/idxd.h
+diff --cc drivers/dma/idxd/device.c
+index eadb0129f3b6,280b41417f41..000000000000
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@@ -19,30 -19,6 +19,33 @@@ static void idxd_device_wqs_clear_state
+  static void idxd_wq_disable_cleanup(struct idxd_wq *wq);
+  
+  /* Interrupt control bits */
+++<<<<<<< HEAD
+ +void idxd_mask_msix_vector(struct idxd_device *idxd, int vec_id)
+ +{
+ +	struct irq_data *data = irq_get_irq_data(idxd->irq_entries[vec_id].vector);
+ +
+ +	pci_msi_mask_irq(data);
+ +}
+ +
+ +void idxd_mask_msix_vectors(struct idxd_device *idxd)
+ +{
+ +	struct pci_dev *pdev = idxd->pdev;
+ +	int msixcnt = pci_msix_vec_count(pdev);
+ +	int i;
+ +
+ +	for (i = 0; i < msixcnt; i++)
+ +		idxd_mask_msix_vector(idxd, i);
+ +}
+ +
+ +void idxd_unmask_msix_vector(struct idxd_device *idxd, int vec_id)
+ +{
+ +	struct irq_data *data = irq_get_irq_data(idxd->irq_entries[vec_id].vector);
+ +
+ +	pci_msi_unmask_irq(data);
+ +}
+ +
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  void idxd_unmask_error_interrupts(struct idxd_device *idxd)
+  {
+  	union genctrl_reg genctrl;
+@@@ -571,13 -558,12 +574,18 @@@ int idxd_device_disable(struct idxd_dev
+  
+  void idxd_device_reset(struct idxd_device *idxd)
+  {
+ +	unsigned long flags;
+ +
+  	idxd_cmd_exec(idxd, IDXD_CMD_RESET_DEVICE, 0, NULL);
+ -	spin_lock(&idxd->dev_lock);
+ +	spin_lock_irqsave(&idxd->dev_lock, flags);
+  	idxd_device_clear_state(idxd);
+  	idxd->state = IDXD_DEV_DISABLED;
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(&idxd->dev_lock, flags);
+++=======
++ 	idxd_unmask_error_interrupts(idxd);
++ 	spin_unlock(&idxd->dev_lock);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  }
+  
+  void idxd_device_drain_pasid(struct idxd_device *idxd, int pasid)
+@@@ -1114,3 -1096,303 +1092,306 @@@ int idxd_device_load_config(struct idxd
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void idxd_flush_pending_descs(struct idxd_irq_entry *ie)
++ {
++ 	struct idxd_desc *desc, *itr;
++ 	struct llist_node *head;
++ 	LIST_HEAD(flist);
++ 	enum idxd_complete_type ctype;
++ 
++ 	spin_lock(&ie->list_lock);
++ 	head = llist_del_all(&ie->pending_llist);
++ 	if (head) {
++ 		llist_for_each_entry_safe(desc, itr, head, llnode)
++ 			list_add_tail(&desc->list, &ie->work_list);
++ 	}
++ 
++ 	list_for_each_entry_safe(desc, itr, &ie->work_list, list)
++ 		list_move_tail(&desc->list, &flist);
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	list_for_each_entry_safe(desc, itr, &flist, list) {
++ 		list_del(&desc->list);
++ 		ctype = desc->completion->status ? IDXD_COMPLETE_NORMAL : IDXD_COMPLETE_ABORT;
++ 		idxd_dma_complete_txd(desc, ctype, true);
++ 	}
++ }
++ 
++ static void idxd_device_set_perm_entry(struct idxd_device *idxd,
++ 				       struct idxd_irq_entry *ie)
++ {
++ 	union msix_perm mperm;
++ 
++ 	if (ie->pasid == INVALID_IOASID)
++ 		return;
++ 
++ 	mperm.bits = 0;
++ 	mperm.pasid = ie->pasid;
++ 	mperm.pasid_en = 1;
++ 	iowrite32(mperm.bits, idxd->reg_base + idxd->msix_perm_offset + ie->id * 8);
++ }
++ 
++ static void idxd_device_clear_perm_entry(struct idxd_device *idxd,
++ 					 struct idxd_irq_entry *ie)
++ {
++ 	iowrite32(0, idxd->reg_base + idxd->msix_perm_offset + ie->id * 8);
++ }
++ 
++ void idxd_wq_free_irq(struct idxd_wq *wq)
++ {
++ 	struct idxd_device *idxd = wq->idxd;
++ 	struct idxd_irq_entry *ie = &wq->ie;
++ 
++ 	synchronize_irq(ie->vector);
++ 	free_irq(ie->vector, ie);
++ 	idxd_flush_pending_descs(ie);
++ 	if (idxd->request_int_handles)
++ 		idxd_device_release_int_handle(idxd, ie->int_handle, IDXD_IRQ_MSIX);
++ 	idxd_device_clear_perm_entry(idxd, ie);
++ 	ie->vector = -1;
++ 	ie->int_handle = INVALID_INT_HANDLE;
++ 	ie->pasid = INVALID_IOASID;
++ }
++ 
++ int idxd_wq_request_irq(struct idxd_wq *wq)
++ {
++ 	struct idxd_device *idxd = wq->idxd;
++ 	struct pci_dev *pdev = idxd->pdev;
++ 	struct device *dev = &pdev->dev;
++ 	struct idxd_irq_entry *ie;
++ 	int rc;
++ 
++ 	ie = &wq->ie;
++ 	ie->vector = pci_irq_vector(pdev, ie->id);
++ 	ie->pasid = device_pasid_enabled(idxd) ? idxd->pasid : INVALID_IOASID;
++ 	idxd_device_set_perm_entry(idxd, ie);
++ 
++ 	rc = request_threaded_irq(ie->vector, NULL, idxd_wq_thread, 0, "idxd-portal", ie);
++ 	if (rc < 0) {
++ 		dev_err(dev, "Failed to request irq %d.\n", ie->vector);
++ 		goto err_irq;
++ 	}
++ 
++ 	if (idxd->request_int_handles) {
++ 		rc = idxd_device_request_int_handle(idxd, ie->id, &ie->int_handle,
++ 						    IDXD_IRQ_MSIX);
++ 		if (rc < 0)
++ 			goto err_int_handle;
++ 	} else {
++ 		ie->int_handle = ie->id;
++ 	}
++ 
++ 	return 0;
++ 
++ err_int_handle:
++ 	ie->int_handle = INVALID_INT_HANDLE;
++ 	free_irq(ie->vector, ie);
++ err_irq:
++ 	idxd_device_clear_perm_entry(idxd, ie);
++ 	ie->pasid = INVALID_IOASID;
++ 	return rc;
++ }
++ 
++ int __drv_enable_wq(struct idxd_wq *wq)
++ {
++ 	struct idxd_device *idxd = wq->idxd;
++ 	struct device *dev = &idxd->pdev->dev;
++ 	int rc = -ENXIO;
++ 
++ 	lockdep_assert_held(&wq->wq_lock);
++ 
++ 	if (idxd->state != IDXD_DEV_ENABLED) {
++ 		idxd->cmd_status = IDXD_SCMD_DEV_NOT_ENABLED;
++ 		goto err;
++ 	}
++ 
++ 	if (wq->state != IDXD_WQ_DISABLED) {
++ 		dev_dbg(dev, "wq %d already enabled.\n", wq->id);
++ 		idxd->cmd_status = IDXD_SCMD_WQ_ENABLED;
++ 		rc = -EBUSY;
++ 		goto err;
++ 	}
++ 
++ 	if (!wq->group) {
++ 		dev_dbg(dev, "wq %d not attached to group.\n", wq->id);
++ 		idxd->cmd_status = IDXD_SCMD_WQ_NO_GRP;
++ 		goto err;
++ 	}
++ 
++ 	if (strlen(wq->name) == 0) {
++ 		idxd->cmd_status = IDXD_SCMD_WQ_NO_NAME;
++ 		dev_dbg(dev, "wq %d name not set.\n", wq->id);
++ 		goto err;
++ 	}
++ 
++ 	/* Shared WQ checks */
++ 	if (wq_shared(wq)) {
++ 		if (!device_swq_supported(idxd)) {
++ 			idxd->cmd_status = IDXD_SCMD_WQ_NO_SVM;
++ 			dev_dbg(dev, "PASID not enabled and shared wq.\n");
++ 			goto err;
++ 		}
++ 		/*
++ 		 * Shared wq with the threshold set to 0 means the user
++ 		 * did not set the threshold or transitioned from a
++ 		 * dedicated wq but did not set threshold. A value
++ 		 * of 0 would effectively disable the shared wq. The
++ 		 * driver does not allow a value of 0 to be set for
++ 		 * threshold via sysfs.
++ 		 */
++ 		if (wq->threshold == 0) {
++ 			idxd->cmd_status = IDXD_SCMD_WQ_NO_THRESH;
++ 			dev_dbg(dev, "Shared wq and threshold 0.\n");
++ 			goto err;
++ 		}
++ 	}
++ 
++ 	rc = 0;
++ 	spin_lock(&idxd->dev_lock);
++ 	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
++ 		rc = idxd_device_config(idxd);
++ 	spin_unlock(&idxd->dev_lock);
++ 	if (rc < 0) {
++ 		dev_dbg(dev, "Writing wq %d config failed: %d\n", wq->id, rc);
++ 		goto err;
++ 	}
++ 
++ 	rc = idxd_wq_enable(wq);
++ 	if (rc < 0) {
++ 		dev_dbg(dev, "wq %d enabling failed: %d\n", wq->id, rc);
++ 		goto err;
++ 	}
++ 
++ 	rc = idxd_wq_map_portal(wq);
++ 	if (rc < 0) {
++ 		idxd->cmd_status = IDXD_SCMD_WQ_PORTAL_ERR;
++ 		dev_dbg(dev, "wq %d portal mapping failed: %d\n", wq->id, rc);
++ 		goto err_map_portal;
++ 	}
++ 
++ 	wq->client_count = 0;
++ 	return 0;
++ 
++ err_map_portal:
++ 	rc = idxd_wq_disable(wq, false);
++ 	if (rc < 0)
++ 		dev_dbg(dev, "wq %s disable failed\n", dev_name(wq_confdev(wq)));
++ err:
++ 	return rc;
++ }
++ 
++ int drv_enable_wq(struct idxd_wq *wq)
++ {
++ 	int rc;
++ 
++ 	mutex_lock(&wq->wq_lock);
++ 	rc = __drv_enable_wq(wq);
++ 	mutex_unlock(&wq->wq_lock);
++ 	return rc;
++ }
++ 
++ void __drv_disable_wq(struct idxd_wq *wq)
++ {
++ 	struct idxd_device *idxd = wq->idxd;
++ 	struct device *dev = &idxd->pdev->dev;
++ 
++ 	lockdep_assert_held(&wq->wq_lock);
++ 
++ 	if (idxd_wq_refcount(wq))
++ 		dev_warn(dev, "Clients has claim on wq %d: %d\n",
++ 			 wq->id, idxd_wq_refcount(wq));
++ 
++ 	idxd_wq_unmap_portal(wq);
++ 
++ 	idxd_wq_drain(wq);
++ 	idxd_wq_reset(wq);
++ 
++ 	wq->client_count = 0;
++ }
++ 
++ void drv_disable_wq(struct idxd_wq *wq)
++ {
++ 	mutex_lock(&wq->wq_lock);
++ 	__drv_disable_wq(wq);
++ 	mutex_unlock(&wq->wq_lock);
++ }
++ 
++ int idxd_device_drv_probe(struct idxd_dev *idxd_dev)
++ {
++ 	struct idxd_device *idxd = idxd_dev_to_idxd(idxd_dev);
++ 	int rc = 0;
++ 
++ 	/*
++ 	 * Device should be in disabled state for the idxd_drv to load. If it's in
++ 	 * enabled state, then the device was altered outside of driver's control.
++ 	 * If the state is in halted state, then we don't want to proceed.
++ 	 */
++ 	if (idxd->state != IDXD_DEV_DISABLED) {
++ 		idxd->cmd_status = IDXD_SCMD_DEV_ENABLED;
++ 		return -ENXIO;
++ 	}
++ 
++ 	/* Device configuration */
++ 	spin_lock(&idxd->dev_lock);
++ 	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
++ 		rc = idxd_device_config(idxd);
++ 	spin_unlock(&idxd->dev_lock);
++ 	if (rc < 0)
++ 		return -ENXIO;
++ 
++ 	/* Start device */
++ 	rc = idxd_device_enable(idxd);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	/* Setup DMA device without channels */
++ 	rc = idxd_register_dma_device(idxd);
++ 	if (rc < 0) {
++ 		idxd_device_disable(idxd);
++ 		idxd->cmd_status = IDXD_SCMD_DEV_DMA_ERR;
++ 		return rc;
++ 	}
++ 
++ 	idxd->cmd_status = 0;
++ 	return 0;
++ }
++ 
++ void idxd_device_drv_remove(struct idxd_dev *idxd_dev)
++ {
++ 	struct device *dev = &idxd_dev->conf_dev;
++ 	struct idxd_device *idxd = idxd_dev_to_idxd(idxd_dev);
++ 	int i;
++ 
++ 	for (i = 0; i < idxd->max_wqs; i++) {
++ 		struct idxd_wq *wq = idxd->wqs[i];
++ 		struct device *wq_dev = wq_confdev(wq);
++ 
++ 		if (wq->state == IDXD_WQ_DISABLED)
++ 			continue;
++ 		dev_warn(dev, "Active wq %d on disable %s.\n", i, dev_name(wq_dev));
++ 		device_release_driver(wq_dev);
++ 	}
++ 
++ 	idxd_unregister_dma_device(idxd);
++ 	idxd_device_disable(idxd);
++ 	if (test_bit(IDXD_FLAG_CONFIGURABLE, &idxd->flags))
++ 		idxd_device_reset(idxd);
++ }
++ 
++ static enum idxd_dev_type dev_types[] = {
++ 	IDXD_DEV_DSA,
++ 	IDXD_DEV_IAX,
++ 	IDXD_DEV_NONE,
++ };
++ 
++ struct idxd_device_driver idxd_drv = {
++ 	.type = dev_types,
++ 	.probe = idxd_device_drv_probe,
++ 	.remove = idxd_device_drv_remove,
++ 	.name = "idxd",
++ };
++ EXPORT_SYMBOL_GPL(idxd_drv);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+diff --cc drivers/dma/idxd/dma.c
+index 77439b645044,bfff59617d04..000000000000
+--- a/drivers/dma/idxd/dma.c
++++ b/drivers/dma/idxd/dma.c
+@@@ -260,5 -274,100 +260,103 @@@ void idxd_unregister_dma_channel(struc
+  	list_del(&chan->device_node);
+  	kfree(wq->idxd_chan);
+  	wq->idxd_chan = NULL;
+ -	put_device(wq_confdev(wq));
+ +	put_device(&wq->conf_dev);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int idxd_dmaengine_drv_probe(struct idxd_dev *idxd_dev)
++ {
++ 	struct device *dev = &idxd_dev->conf_dev;
++ 	struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
++ 	struct idxd_device *idxd = wq->idxd;
++ 	int rc;
++ 
++ 	if (idxd->state != IDXD_DEV_ENABLED)
++ 		return -ENXIO;
++ 
++ 	mutex_lock(&wq->wq_lock);
++ 	wq->type = IDXD_WQT_KERNEL;
++ 
++ 	rc = idxd_wq_request_irq(wq);
++ 	if (rc < 0) {
++ 		idxd->cmd_status = IDXD_SCMD_WQ_IRQ_ERR;
++ 		dev_dbg(dev, "WQ %d irq setup failed: %d\n", wq->id, rc);
++ 		goto err_irq;
++ 	}
++ 
++ 	rc = __drv_enable_wq(wq);
++ 	if (rc < 0) {
++ 		dev_dbg(dev, "Enable wq %d failed: %d\n", wq->id, rc);
++ 		rc = -ENXIO;
++ 		goto err;
++ 	}
++ 
++ 	rc = idxd_wq_alloc_resources(wq);
++ 	if (rc < 0) {
++ 		idxd->cmd_status = IDXD_SCMD_WQ_RES_ALLOC_ERR;
++ 		dev_dbg(dev, "WQ resource alloc failed\n");
++ 		goto err_res_alloc;
++ 	}
++ 
++ 	rc = idxd_wq_init_percpu_ref(wq);
++ 	if (rc < 0) {
++ 		idxd->cmd_status = IDXD_SCMD_PERCPU_ERR;
++ 		dev_dbg(dev, "percpu_ref setup failed\n");
++ 		goto err_ref;
++ 	}
++ 
++ 	rc = idxd_register_dma_channel(wq);
++ 	if (rc < 0) {
++ 		idxd->cmd_status = IDXD_SCMD_DMA_CHAN_ERR;
++ 		dev_dbg(dev, "Failed to register dma channel\n");
++ 		goto err_dma;
++ 	}
++ 
++ 	idxd->cmd_status = 0;
++ 	mutex_unlock(&wq->wq_lock);
++ 	return 0;
++ 
++ err_dma:
++ 	__idxd_wq_quiesce(wq);
++ 	percpu_ref_exit(&wq->wq_active);
++ err_ref:
++ 	idxd_wq_free_resources(wq);
++ err_res_alloc:
++ 	__drv_disable_wq(wq);
++ err:
++ 	idxd_wq_free_irq(wq);
++ err_irq:
++ 	wq->type = IDXD_WQT_NONE;
++ 	mutex_unlock(&wq->wq_lock);
++ 	return rc;
++ }
++ 
++ static void idxd_dmaengine_drv_remove(struct idxd_dev *idxd_dev)
++ {
++ 	struct idxd_wq *wq = idxd_dev_to_wq(idxd_dev);
++ 
++ 	mutex_lock(&wq->wq_lock);
++ 	__idxd_wq_quiesce(wq);
++ 	idxd_unregister_dma_channel(wq);
++ 	idxd_wq_free_resources(wq);
++ 	__drv_disable_wq(wq);
++ 	percpu_ref_exit(&wq->wq_active);
++ 	idxd_wq_free_irq(wq);
++ 	wq->type = IDXD_WQT_NONE;
++ 	mutex_unlock(&wq->wq_lock);
++ }
++ 
++ static enum idxd_dev_type dev_types[] = {
++ 	IDXD_DEV_WQ,
++ 	IDXD_DEV_NONE,
++ };
++ 
++ struct idxd_device_driver idxd_dmaengine_drv = {
++ 	.probe = idxd_dmaengine_drv_probe,
++ 	.remove = idxd_dmaengine_drv_remove,
++ 	.name = "dmaengine",
++ 	.type = dev_types,
++ };
++ EXPORT_SYMBOL_GPL(idxd_dmaengine_drv);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+diff --cc drivers/dma/idxd/init.c
+index b9299e45c20d,3505efb7ae71..000000000000
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@@ -88,87 -90,34 +88,110 @@@ static int idxd_setup_interrupts(struc
+  	}
+  	dev_dbg(dev, "Enabled %d msix vectors\n", msixcnt);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We implement 1 completion list per MSI-X entry except for
+ +	 * entry 0, which is for errors and others.
+ +	 */
+ +	idxd->irq_entries = kcalloc_node(msixcnt, sizeof(struct idxd_irq_entry),
+ +					 GFP_KERNEL, dev_to_node(dev));
+ +	if (!idxd->irq_entries) {
+ +		rc = -ENOMEM;
+ +		goto err_irq_entries;
+ +	}
+ +
+ +	for (i = 0; i < msixcnt; i++) {
+ +		idxd->irq_entries[i].id = i;
+ +		idxd->irq_entries[i].idxd = idxd;
+ +		idxd->irq_entries[i].vector = pci_irq_vector(pdev, i);
+ +		spin_lock_init(&idxd->irq_entries[i].list_lock);
+ +	}
+  
+ -	ie = idxd_get_ie(idxd, 0);
+ -	ie->vector = pci_irq_vector(pdev, 0);
+ -	rc = request_threaded_irq(ie->vector, NULL, idxd_misc_thread, 0, "idxd-misc", ie);
+ +	idxd_msix_perm_setup(idxd);
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+ +
+ +	irq_entry = &idxd->irq_entries[0];
+ +	rc = request_threaded_irq(irq_entry->vector, NULL, idxd_misc_thread,
+ +				  0, "idxd-misc", irq_entry);
+  	if (rc < 0) {
+  		dev_err(dev, "Failed to allocate misc interrupt.\n");
+  		goto err_misc_irq;
+  	}
+++<<<<<<< HEAD
+ +
+ +	dev_dbg(dev, "Allocated idxd-misc handler on msix vector %d\n", irq_entry->vector);
+++=======
++ 	dev_dbg(dev, "Requested idxd-misc handler on msix vector %d\n", ie->vector);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  
+ -	for (i = 0; i < idxd->max_wqs; i++) {
+ -		int msix_idx = i + 1;
+ +	/* first MSI-X entry is not for wq interrupts */
+ +	idxd->num_wq_irqs = msixcnt - 1;
+ +
+++<<<<<<< HEAD
+ +	for (i = 1; i < msixcnt; i++) {
+ +		irq_entry = &idxd->irq_entries[i];
+  
+ +		init_llist_head(&idxd->irq_entries[i].pending_llist);
+ +		INIT_LIST_HEAD(&idxd->irq_entries[i].work_list);
+ +		rc = request_threaded_irq(irq_entry->vector, NULL,
+ +					  idxd_wq_thread, 0, "idxd-portal", irq_entry);
+ +		if (rc < 0) {
+ +			dev_err(dev, "Failed to allocate irq %d.\n", irq_entry->vector);
+ +			goto err_wq_irqs;
+ +		}
+ +
+ +		dev_dbg(dev, "Allocated idxd-msix %d for vector %d\n", i, irq_entry->vector);
+ +		if (idxd->hw.cmd_cap & BIT(IDXD_CMD_REQUEST_INT_HANDLE)) {
+ +			/*
+ +			 * The MSIX vector enumeration starts at 1 with vector 0 being the
+ +			 * misc interrupt that handles non I/O completion events. The
+ +			 * interrupt handles are for IMS enumeration on guest. The misc
+ +			 * interrupt vector does not require a handle and therefore we start
+ +			 * the int_handles at index 0. Since 'i' starts at 1, the first
+ +			 * int_handles index will be 0.
+ +			 */
+ +			rc = idxd_device_request_int_handle(idxd, i, &idxd->int_handles[i - 1],
+ +							    IDXD_IRQ_MSIX);
+ +			if (rc < 0) {
+ +				free_irq(irq_entry->vector, irq_entry);
+ +				goto err_wq_irqs;
+ +			}
+ +			dev_dbg(dev, "int handle requested: %u\n", idxd->int_handles[i - 1]);
+ +		}
+++=======
++ 		ie = idxd_get_ie(idxd, msix_idx);
++ 		ie->id = msix_idx;
++ 		ie->int_handle = INVALID_INT_HANDLE;
++ 		ie->pasid = INVALID_IOASID;
++ 
++ 		spin_lock_init(&ie->list_lock);
++ 		init_llist_head(&ie->pending_llist);
++ 		INIT_LIST_HEAD(&ie->work_list);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  	}
+  
+  	idxd_unmask_error_interrupts(idxd);
+  	return 0;
+  
+++<<<<<<< HEAD
+ + err_wq_irqs:
+ +	while (--i >= 0) {
+ +		irq_entry = &idxd->irq_entries[i];
+ +		free_irq(irq_entry->vector, irq_entry);
+ +		if (i != 0)
+ +			idxd_device_release_int_handle(idxd,
+ +						       idxd->int_handles[i], IDXD_IRQ_MSIX);
+ +	}
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+   err_misc_irq:
+- 	/* Disable error interrupt generation */
+  	idxd_mask_error_interrupts(idxd);
+++<<<<<<< HEAD
+ +	idxd_msix_perm_clear(idxd);
+ + err_irq_entries:
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  	pci_free_irq_vectors(pdev);
+  	dev_err(dev, "No usable interrupts\n");
+  	return rc;
+@@@ -177,26 -126,16 +200,36 @@@
+  static void idxd_cleanup_interrupts(struct idxd_device *idxd)
+  {
+  	struct pci_dev *pdev = idxd->pdev;
+++<<<<<<< HEAD
+ +	struct idxd_irq_entry *irq_entry;
+ +	int i, msixcnt;
+++=======
++ 	struct idxd_irq_entry *ie;
++ 	int msixcnt;
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  
+  	msixcnt = pci_msix_vec_count(pdev);
+  	if (msixcnt <= 0)
+  		return;
+++<<<<<<< HEAD
+ +
+ +	irq_entry = &idxd->irq_entries[0];
+ +	free_irq(irq_entry->vector, irq_entry);
+ +
+ +	for (i = 1; i < msixcnt; i++) {
+ +
+ +		irq_entry = &idxd->irq_entries[i];
+ +		if (idxd->hw.cmd_cap & BIT(IDXD_CMD_RELEASE_INT_HANDLE))
+ +			idxd_device_release_int_handle(idxd, idxd->int_handles[i],
+ +						       IDXD_IRQ_MSIX);
+ +		free_irq(irq_entry->vector, irq_entry);
+ +	}
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  
++ 	ie = idxd_get_ie(idxd, 0);
+  	idxd_mask_error_interrupts(idxd);
++ 	free_irq(ie->vector, ie);
+  	pci_free_irq_vectors(pdev);
+  }
+  
+@@@ -687,32 -642,6 +718,35 @@@ static int idxd_pci_probe(struct pci_de
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static void idxd_flush_pending_llist(struct idxd_irq_entry *ie)
+ +{
+ +	struct idxd_desc *desc, *itr;
+ +	struct llist_node *head;
+ +
+ +	head = llist_del_all(&ie->pending_llist);
+ +	if (!head)
+ +		return;
+ +
+ +	llist_for_each_entry_safe(desc, itr, head, llnode) {
+ +		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT);
+ +		idxd_free_desc(desc->wq, desc);
+ +	}
+ +}
+ +
+ +static void idxd_flush_work_list(struct idxd_irq_entry *ie)
+ +{
+ +	struct idxd_desc *desc, *iter;
+ +
+ +	list_for_each_entry_safe(desc, iter, &ie->work_list, list) {
+ +		list_del(&desc->list);
+ +		idxd_dma_complete_txd(desc, IDXD_COMPLETE_ABORT);
+ +		idxd_free_desc(desc->wq, desc);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  void idxd_wqs_quiesce(struct idxd_device *idxd)
+  {
+  	struct idxd_wq *wq;
+@@@ -725,24 -654,6 +759,27 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void idxd_release_int_handles(struct idxd_device *idxd)
+ +{
+ +	struct device *dev = &idxd->pdev->dev;
+ +	int i, rc;
+ +
+ +	for (i = 0; i < idxd->num_wq_irqs; i++) {
+ +		if (idxd->hw.cmd_cap & BIT(IDXD_CMD_RELEASE_INT_HANDLE)) {
+ +			rc = idxd_device_release_int_handle(idxd, idxd->int_handles[i],
+ +							    IDXD_IRQ_MSIX);
+ +			if (rc < 0)
+ +				dev_warn(dev, "irq handle %d release failed\n",
+ +					 idxd->int_handles[i]);
+ +			else
+ +				dev_dbg(dev, "int handle requested: %u\n", idxd->int_handles[i]);
+ +		}
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  static void idxd_shutdown(struct pci_dev *pdev)
+  {
+  	struct idxd_device *idxd = pci_get_drvdata(pdev);
+@@@ -754,18 -664,9 +790,21 @@@
+  	if (rc)
+  		dev_err(&pdev->dev, "Disabling device failed\n");
+  
+- 	dev_dbg(&pdev->dev, "%s called\n", __func__);
+- 	idxd_mask_msix_vectors(idxd);
++ 	irq_entry = &idxd->ie;
++ 	synchronize_irq(irq_entry->vector);
+  	idxd_mask_error_interrupts(idxd);
+++<<<<<<< HEAD
+ +
+ +	for (i = 0; i < msixcnt; i++) {
+ +		irq_entry = &idxd->irq_entries[i];
+ +		synchronize_irq(irq_entry->vector);
+ +		if (i == 0)
+ +			continue;
+ +		idxd_flush_pending_llist(irq_entry);
+ +		idxd_flush_work_list(irq_entry);
+ +	}
+++=======
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  	flush_workqueue(idxd->wq);
+  }
+  
+@@@ -773,21 -674,23 +812,24 @@@ static void idxd_remove(struct pci_dev 
+  {
+  	struct idxd_device *idxd = pci_get_drvdata(pdev);
+  	struct idxd_irq_entry *irq_entry;
+- 	int msixcnt = pci_msix_vec_count(pdev);
+- 	int i;
+  
+ -	idxd_unregister_devices(idxd);
+ -	/*
+ -	 * When ->release() is called for the idxd->conf_dev, it frees all the memory related
+ -	 * to the idxd context. The driver still needs those bits in order to do the rest of
+ -	 * the cleanup. However, we do need to unbound the idxd sub-driver. So take a ref
+ -	 * on the device here to hold off the freeing while allowing the idxd sub-driver
+ -	 * to unbind.
+ -	 */
+ -	get_device(idxd_confdev(idxd));
+ -	device_unregister(idxd_confdev(idxd));
+ +	dev_dbg(&pdev->dev, "%s called\n", __func__);
+  	idxd_shutdown(pdev);
+  	if (device_pasid_enabled(idxd))
+  		idxd_disable_system_pasid(idxd);
+ +	idxd_unregister_devices(idxd);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < msixcnt; i++) {
+ +		irq_entry = &idxd->irq_entries[i];
+ +		free_irq(irq_entry->vector, irq_entry);
+ +	}
+ +	idxd_msix_perm_clear(idxd);
+ +	idxd_release_int_handles(idxd);
+++=======
++ 	irq_entry = idxd_get_ie(idxd, 0);
++ 	free_irq(irq_entry->vector, irq_entry);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  	pci_free_irq_vectors(pdev);
+  	pci_iounmap(pdev, idxd->reg_base);
+  	iommu_dev_disable_feature(&pdev->dev, IOMMU_DEV_FEAT_SVA);
+diff --cc drivers/dma/idxd/irq.c
+index 7a2cf0512501,743ead5ebc57..000000000000
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@@ -62,44 -66,160 +62,149 @@@ static void idxd_device_reinit(struct w
+  	idxd_device_clear_state(idxd);
+  }
+  
+ -/*
+ - * The function sends a drain descriptor for the interrupt handle. The drain ensures
+ - * all descriptors with this interrupt handle is flushed and the interrupt
+ - * will allow the cleanup of the outstanding descriptors.
+ - */
+ -static void idxd_int_handle_revoke_drain(struct idxd_irq_entry *ie)
+ +static void idxd_device_fault_work(struct work_struct *work)
+  {
+ -	struct idxd_wq *wq = ie_to_wq(ie);
+ -	struct idxd_device *idxd = wq->idxd;
+ -	struct device *dev = &idxd->pdev->dev;
+ -	struct dsa_hw_desc desc = {};
+ -	void __iomem *portal;
+ -	int rc;
+ -
+ -	/* Issue a simple drain operation with interrupt but no completion record */
+ -	desc.flags = IDXD_OP_FLAG_RCI;
+ -	desc.opcode = DSA_OPCODE_DRAIN;
+ -	desc.priv = 1;
+ -
+ -	if (ie->pasid != INVALID_IOASID)
+ -		desc.pasid = ie->pasid;
+ -	desc.int_handle = ie->int_handle;
+ -	portal = idxd_wq_portal_addr(wq);
+ +	struct idxd_fault *fault = container_of(work, struct idxd_fault, work);
+ +	struct idxd_irq_entry *ie;
+ +	int i;
+ +	int processed;
+ +	int irqcnt = fault->idxd->num_wq_irqs + 1;
+ +
+ +	for (i = 1; i < irqcnt; i++) {
+ +		ie = &fault->idxd->irq_entries[i];
+ +		irq_process_work_list(ie, IRQ_WORK_PROCESS_FAULT,
+ +				      &processed, fault->addr);
+ +		if (processed)
+ +			break;
+  
+ -	/*
+ -	 * The wmb() makes sure that the descriptor is all there before we
+ -	 * issue.
+ -	 */
+ -	wmb();
+ -	if (wq_dedicated(wq)) {
+ -		iosubmit_cmds512(portal, &desc, 1);
+ -	} else {
+ -		rc = idxd_enqcmds(wq, portal, &desc);
+ -		/* This should not fail unless hardware failed. */
+ -		if (rc < 0)
+ -			dev_warn(dev, "Failed to submit drain desc on wq %d\n", wq->id);
+ +		irq_process_pending_llist(ie, IRQ_WORK_PROCESS_FAULT,
+ +					  &processed, fault->addr);
+ +		if (processed)
+ +			break;
+  	}
+ +
+ +	kfree(fault);
+  }
+  
+ -static void idxd_abort_invalid_int_handle_descs(struct idxd_irq_entry *ie)
+ +static int idxd_device_schedule_fault_process(struct idxd_device *idxd,
+ +					      u64 fault_addr)
+  {
+ -	LIST_HEAD(flist);
+ -	struct idxd_desc *d, *t;
+ -	struct llist_node *head;
+ +	struct idxd_fault *fault;
+  
+ -	spin_lock(&ie->list_lock);
+ -	head = llist_del_all(&ie->pending_llist);
+ -	if (head) {
+ -		llist_for_each_entry_safe(d, t, head, llnode)
+ -			list_add_tail(&d->list, &ie->work_list);
+ -	}
+ +	fault = kmalloc(sizeof(*fault), GFP_ATOMIC);
+ +	if (!fault)
+ +		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	fault->addr = fault_addr;
+ +	fault->idxd = idxd;
+ +	INIT_WORK(&fault->work, idxd_device_fault_work);
+ +	queue_work(idxd->wq, &fault->work);
+ +	return 0;
+++=======
++ 	list_for_each_entry_safe(d, t, &ie->work_list, list) {
++ 		if (d->completion->status == DSA_COMP_INT_HANDLE_INVAL)
++ 			list_move_tail(&d->list, &flist);
++ 	}
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	list_for_each_entry_safe(d, t, &flist, list) {
++ 		list_del(&d->list);
++ 		idxd_dma_complete_txd(d, IDXD_COMPLETE_ABORT, true);
++ 	}
++ }
++ 
++ static void idxd_int_handle_revoke(struct work_struct *work)
++ {
++ 	struct idxd_int_handle_revoke *revoke =
++ 		container_of(work, struct idxd_int_handle_revoke, work);
++ 	struct idxd_device *idxd = revoke->idxd;
++ 	struct pci_dev *pdev = idxd->pdev;
++ 	struct device *dev = &pdev->dev;
++ 	int i, new_handle, rc;
++ 
++ 	if (!idxd->request_int_handles) {
++ 		kfree(revoke);
++ 		dev_warn(dev, "Unexpected int handle refresh interrupt.\n");
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * The loop attempts to acquire new interrupt handle for all interrupt
++ 	 * vectors that supports a handle. If a new interrupt handle is acquired and the
++ 	 * wq is kernel type, the driver will kill the percpu_ref to pause all
++ 	 * ongoing descriptor submissions. The interrupt handle is then changed.
++ 	 * After change, the percpu_ref is revived and all the pending submissions
++ 	 * are woken to try again. A drain is sent to for the interrupt handle
++ 	 * at the end to make sure all invalid int handle descriptors are processed.
++ 	 */
++ 	for (i = 1; i < idxd->irq_cnt; i++) {
++ 		struct idxd_irq_entry *ie = idxd_get_ie(idxd, i);
++ 		struct idxd_wq *wq = ie_to_wq(ie);
++ 
++ 		if (ie->int_handle == INVALID_INT_HANDLE)
++ 			continue;
++ 
++ 		rc = idxd_device_request_int_handle(idxd, i, &new_handle, IDXD_IRQ_MSIX);
++ 		if (rc < 0) {
++ 			dev_warn(dev, "get int handle %d failed: %d\n", i, rc);
++ 			/*
++ 			 * Failed to acquire new interrupt handle. Kill the WQ
++ 			 * and release all the pending submitters. The submitters will
++ 			 * get error return code and handle appropriately.
++ 			 */
++ 			ie->int_handle = INVALID_INT_HANDLE;
++ 			idxd_wq_quiesce(wq);
++ 			idxd_abort_invalid_int_handle_descs(ie);
++ 			continue;
++ 		}
++ 
++ 		/* No change in interrupt handle, nothing needs to be done */
++ 		if (ie->int_handle == new_handle)
++ 			continue;
++ 
++ 		if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL) {
++ 			/*
++ 			 * All the MSIX interrupts are allocated at once during probe.
++ 			 * Therefore we need to update all interrupts even if the WQ
++ 			 * isn't supporting interrupt operations.
++ 			 */
++ 			ie->int_handle = new_handle;
++ 			continue;
++ 		}
++ 
++ 		mutex_lock(&wq->wq_lock);
++ 		reinit_completion(&wq->wq_resurrect);
++ 
++ 		/* Kill percpu_ref to pause additional descriptor submissions */
++ 		percpu_ref_kill(&wq->wq_active);
++ 
++ 		/* Wait for all submitters quiesce before we change interrupt handle */
++ 		wait_for_completion(&wq->wq_dead);
++ 
++ 		ie->int_handle = new_handle;
++ 
++ 		/* Revive percpu ref and wake up all the waiting submitters */
++ 		percpu_ref_reinit(&wq->wq_active);
++ 		complete_all(&wq->wq_resurrect);
++ 		mutex_unlock(&wq->wq_lock);
++ 
++ 		/*
++ 		 * The delay here is to wait for all possible MOVDIR64B that
++ 		 * are issued before percpu_ref_kill() has happened to have
++ 		 * reached the PCIe domain before the drain is issued. The driver
++ 		 * needs to ensure that the drain descriptor issued does not pass
++ 		 * all the other issued descriptors that contain the invalid
++ 		 * interrupt handle in order to ensure that the drain descriptor
++ 		 * interrupt will allow the cleanup of all the descriptors with
++ 		 * invalid interrupt handle.
++ 		 */
++ 		if (wq_dedicated(wq))
++ 			udelay(100);
++ 		idxd_int_handle_revoke_drain(ie);
++ 	}
++ 	kfree(revoke);
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  }
+  
+  static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+diff --cc include/uapi/linux/idxd.h
+index 236d437947bc,a8f0ff75c430..000000000000
+--- a/include/uapi/linux/idxd.h
++++ b/include/uapi/linux/idxd.h
+@@@ -9,6 -9,31 +9,34 @@@
+  #include <stdint.h>
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* Driver command error status */
++ enum idxd_scmd_stat {
++ 	IDXD_SCMD_DEV_ENABLED = 0x80000010,
++ 	IDXD_SCMD_DEV_NOT_ENABLED = 0x80000020,
++ 	IDXD_SCMD_WQ_ENABLED = 0x80000021,
++ 	IDXD_SCMD_DEV_DMA_ERR = 0x80020000,
++ 	IDXD_SCMD_WQ_NO_GRP = 0x80030000,
++ 	IDXD_SCMD_WQ_NO_NAME = 0x80040000,
++ 	IDXD_SCMD_WQ_NO_SVM = 0x80050000,
++ 	IDXD_SCMD_WQ_NO_THRESH = 0x80060000,
++ 	IDXD_SCMD_WQ_PORTAL_ERR = 0x80070000,
++ 	IDXD_SCMD_WQ_RES_ALLOC_ERR = 0x80080000,
++ 	IDXD_SCMD_PERCPU_ERR = 0x80090000,
++ 	IDXD_SCMD_DMA_CHAN_ERR = 0x800a0000,
++ 	IDXD_SCMD_CDEV_ERR = 0x800b0000,
++ 	IDXD_SCMD_WQ_NO_SWQ_SUPPORT = 0x800c0000,
++ 	IDXD_SCMD_WQ_NONE_CONFIGURED = 0x800d0000,
++ 	IDXD_SCMD_WQ_NO_SIZE = 0x800e0000,
++ 	IDXD_SCMD_WQ_NO_PRIV = 0x800f0000,
++ 	IDXD_SCMD_WQ_IRQ_ERR = 0x80100000,
++ };
++ 
++ #define IDXD_SCMD_SOFTERR_MASK	0x80000000
++ #define IDXD_SCMD_SOFTERR_SHIFT	16
++ 
+++>>>>>>> 403a2e236538 (dmaengine: idxd: change MSIX allocation based on per wq activation)
+  /* Descriptor flags */
+  #define IDXD_OP_FLAG_FENCE	0x0001
+  #define IDXD_OP_FLAG_BOF	0x0002
+* Unmerged path drivers/dma/idxd/device.c
+* Unmerged path drivers/dma/idxd/dma.c
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index 03dc70e1f4d4..2852d6721d40 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -430,15 +430,10 @@ void idxd_unregister_driver(void);
+ void idxd_wqs_quiesce(struct idxd_device *idxd);
+ 
+ /* device interrupt control */
+-void idxd_msix_perm_setup(struct idxd_device *idxd);
+-void idxd_msix_perm_clear(struct idxd_device *idxd);
+ irqreturn_t idxd_misc_thread(int vec, void *data);
+ irqreturn_t idxd_wq_thread(int irq, void *data);
+ void idxd_mask_error_interrupts(struct idxd_device *idxd);
+ void idxd_unmask_error_interrupts(struct idxd_device *idxd);
+-void idxd_mask_msix_vectors(struct idxd_device *idxd);
+-void idxd_mask_msix_vector(struct idxd_device *idxd, int vec_id);
+-void idxd_unmask_msix_vector(struct idxd_device *idxd, int vec_id);
+ 
+ /* device control */
+ int idxd_device_init_reset(struct idxd_device *idxd);
+@@ -468,6 +463,8 @@ int idxd_wq_set_pasid(struct idxd_wq *wq, int pasid);
+ int idxd_wq_disable_pasid(struct idxd_wq *wq);
+ void idxd_wq_quiesce(struct idxd_wq *wq);
+ int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
++void idxd_wq_free_irq(struct idxd_wq *wq);
++int idxd_wq_request_irq(struct idxd_wq *wq);
+ 
+ /* submission */
+ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
+* Unmerged path drivers/dma/idxd/init.c
+* Unmerged path drivers/dma/idxd/irq.c
+* Unmerged path include/uapi/linux/idxd.h
