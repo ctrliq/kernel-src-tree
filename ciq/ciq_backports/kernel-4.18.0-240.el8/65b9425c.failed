@@ -1,0 +1,113 @@
+iwlwifi: rx: use new api to get band from rx mpdu
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tova Mussai <tova.mussai@intel.com>
+commit 65b9425ce9aa107f758ad0a491af5ef635567315
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/65b9425c.failed
+
+The FW introduce new API to get the band from the rx mpdu,
+use this new API.
+
+	Signed-off-by: Tova Mussai <tova.mussai@intel.com>
+	Signed-off-by: Luca Coelho <luciano.coelho@intel.com>
+(cherry picked from commit 65b9425ce9aa107f758ad0a491af5ef635567315)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+diff --cc drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+index bed89af0768f,a25712cce4ab..000000000000
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+@@@ -1409,10 -1409,10 +1409,17 @@@ static inline bool iwl_mvm_is_scan_ext_
+  			  IWL_UCODE_TLV_API_SCAN_EXT_CHAN_VER);
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool iwl_mvm_is_reduced_config_scan_supported(struct iwl_mvm *mvm)
+ +{
+ +	return fw_has_api(&mvm->fw->ucode_capa,
+ +			  IWL_UCODE_TLV_API_REDUCED_SCAN_CONFIG);
+++=======
++ static inline bool iwl_mvm_is_band_in_rx_supported(struct iwl_mvm *mvm)
++ {
++ 	return fw_has_api(&mvm->fw->ucode_capa,
++ 			   IWL_UCODE_TLV_API_BAND_IN_RX_DATA);
+++>>>>>>> 65b9425ce9aa (iwlwifi: rx: use new api to get band from rx mpdu)
+  }
+  
+  static inline bool iwl_mvm_has_new_rx_stats_api(struct iwl_mvm *mvm)
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/api/rx.h b/drivers/net/wireless/intel/iwlwifi/fw/api/rx.h
+index a93449db7bb2..88bc7733065f 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/api/rx.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/api/rx.h
+@@ -260,6 +260,11 @@ enum iwl_rx_mpdu_amsdu_info {
+ 	IWL_RX_MPDU_AMSDU_LAST_SUBFRAME		= 0x80,
+ };
+ 
++#define RX_MPDU_BAND_POS 6
++#define RX_MPDU_BAND_MASK 0xC0
++#define BAND_IN_RX_STATUS(_val) \
++	(((_val) & RX_MPDU_BAND_MASK) >> RX_MPDU_BAND_POS)
++
+ enum iwl_rx_l3_proto_values {
+ 	IWL_RX_L3_TYPE_NONE,
+ 	IWL_RX_L3_TYPE_IPV4,
+diff --git a/drivers/net/wireless/intel/iwlwifi/fw/file.h b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+index 24471d9fc3d0..1554f5fdd483 100644
+--- a/drivers/net/wireless/intel/iwlwifi/fw/file.h
++++ b/drivers/net/wireless/intel/iwlwifi/fw/file.h
+@@ -325,6 +325,8 @@ enum iwl_ucode_tlv_api {
+ 	IWL_UCODE_TLV_API_REDUCED_SCAN_CONFIG   = (__force iwl_ucode_tlv_api_t)56,
+ 	IWL_UCODE_TLV_API_ADWELL_HB_DEF_N_AP	= (__force iwl_ucode_tlv_api_t)57,
+ 	IWL_UCODE_TLV_API_SCAN_EXT_CHAN_VER	= (__force iwl_ucode_tlv_api_t)58,
++	IWL_UCODE_TLV_API_BAND_IN_RX_DATA	= (__force iwl_ucode_tlv_api_t)59,
++
+ 
+ 	NUM_IWL_UCODE_TLV_API
+ #ifdef __CHECKER__
+* Unmerged path drivers/net/wireless/intel/iwlwifi/mvm/mvm.h
+diff --git a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+index 350975ea7a1f..4f7d7dc46153 100644
+--- a/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
++++ b/drivers/net/wireless/intel/iwlwifi/mvm/rxmq.c
+@@ -1542,6 +1542,19 @@ static void iwl_mvm_decode_lsig(struct sk_buff *skb,
+ 	}
+ }
+ 
++static inline u8 iwl_mvm_nl80211_band_from_rx_msdu(u8 phy_band)
++{
++	switch (phy_band) {
++	case PHY_BAND_24:
++		return NL80211_BAND_2GHZ;
++	case PHY_BAND_5:
++		return NL80211_BAND_5GHZ;
++	default:
++		WARN_ONCE(1, "Unsupported phy band (%u)\n", phy_band);
++		return NL80211_BAND_5GHZ;
++	}
++}
++
+ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
+ 			struct iwl_rx_cmd_buffer *rxb, int queue)
+ {
+@@ -1678,8 +1691,14 @@ void iwl_mvm_rx_mpdu_mq(struct iwl_mvm *mvm, struct napi_struct *napi,
+ 	}
+ 
+ 	rx_status->device_timestamp = gp2_on_air_rise;
+-	rx_status->band = channel > 14 ? NL80211_BAND_5GHZ :
+-		NL80211_BAND_2GHZ;
++	if (iwl_mvm_is_band_in_rx_supported(mvm)) {
++		u8 band = BAND_IN_RX_STATUS(desc->mac_phy_idx);
++
++		rx_status->band = iwl_mvm_nl80211_band_from_rx_msdu(band);
++	} else {
++		rx_status->band = channel > 14 ? NL80211_BAND_5GHZ :
++			NL80211_BAND_2GHZ;
++	}
+ 	rx_status->freq = ieee80211_channel_to_frequency(channel,
+ 							 rx_status->band);
+ 	iwl_mvm_get_signal_strength(mvm, rx_status, rate_n_flags, energy_a,
