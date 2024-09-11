@@ -1,0 +1,101 @@
+nfp: bpf: support removing dead code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 9a06927e778bc4e805acc8fa03573bbf7e597cc5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9a06927e.failed
+
+Add a verifier callback to the nfp JIT to remove the instructions
+the verifier deemed to be dead.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 9a06927e778bc4e805acc8fa03573bbf7e597cc5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/bpf/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/bpf/main.h
+index a7d556b0aa53,5813c3e13ebe..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/bpf/main.h
++++ b/drivers/net/ethernet/netronome/nfp/bpf/main.h
+@@@ -243,6 -243,16 +243,19 @@@ struct nfp_bpf_reg_state 
+  #define FLAG_INSN_IS_JUMP_DST			BIT(0)
+  #define FLAG_INSN_IS_SUBPROG_START		BIT(1)
+  #define FLAG_INSN_PTR_CALLER_STACK_FRAME	BIT(2)
+++<<<<<<< HEAD
+++=======
++ /* Instruction is pointless, noop even on its own */
++ #define FLAG_INSN_SKIP_NOOP			BIT(3)
++ /* Instruction is optimized out based on preceding instructions */
++ #define FLAG_INSN_SKIP_PREC_DEPENDENT		BIT(4)
++ /* Instruction is optimized by the verifier */
++ #define FLAG_INSN_SKIP_VERIFIER_OPT		BIT(5)
++ 
++ #define FLAG_INSN_SKIP_MASK		(FLAG_INSN_SKIP_NOOP | \
++ 					 FLAG_INSN_SKIP_PREC_DEPENDENT | \
++ 					 FLAG_INSN_SKIP_VERIFIER_OPT)
+++>>>>>>> 9a06927e778b (nfp: bpf: support removing dead code)
+  
+  /**
+   * struct nfp_insn_meta - BPF instruction wrapper
+* Unmerged path drivers/net/ethernet/netronome/nfp/bpf/main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/offload.c b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index 9cec21677f2f..15dce97650a5 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@ -218,6 +218,10 @@ static int nfp_bpf_translate(struct bpf_prog *prog)
+ 	unsigned int max_instr;
+ 	int err;
+ 
++	/* We depend on dead code elimination succeeding */
++	if (prog->aux->offload->opt_failed)
++		return -EINVAL;
++
+ 	max_instr = nn_readw(nn, NFP_NET_CFG_BPF_MAX_LEN);
+ 	nfp_prog->__prog_alloc_len = max_instr * sizeof(u64);
+ 
+@@ -591,6 +595,7 @@ const struct bpf_prog_offload_ops nfp_bpf_dev_ops = {
+ 	.insn_hook	= nfp_verify_insn,
+ 	.finalize	= nfp_bpf_finalize,
+ 	.replace_insn	= nfp_bpf_opt_replace_insn,
++	.remove_insns	= nfp_bpf_opt_remove_insns,
+ 	.prepare	= nfp_bpf_verifier_prep,
+ 	.translate	= nfp_bpf_translate,
+ 	.destroy	= nfp_bpf_destroy,
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+index 32468e1b1b73..36f56eb4cbe2 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/verifier.c
+@@ -820,3 +820,27 @@ int nfp_bpf_opt_replace_insn(struct bpf_verifier_env *env, u32 off,
+ 		meta->insn.code, insn->code);
+ 	return -EINVAL;
+ }
++
++int nfp_bpf_opt_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
++{
++	struct nfp_prog *nfp_prog = env->prog->aux->offload->dev_priv;
++	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
++	struct nfp_insn_meta *meta = nfp_prog->verifier_meta;
++	unsigned int i;
++
++	meta = nfp_bpf_goto_meta(nfp_prog, meta, aux_data[off].orig_idx);
++
++	for (i = 0; i < cnt; i++) {
++		if (WARN_ON_ONCE(&meta->l == &nfp_prog->insns))
++			return -EINVAL;
++
++		/* doesn't count if it already has the flag */
++		if (meta->flags & FLAG_INSN_SKIP_VERIFIER_OPT)
++			i--;
++
++		meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
++		meta = list_next_entry(meta, l);
++	}
++
++	return 0;
++}
