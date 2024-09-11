@@ -2030,6 +2030,7 @@ static int snd_ali_resources(struct snd_ali *codec)
 		return -EBUSY;
 	}
 	codec->irq = codec->pci->irq;
+	codec->card->sync_irq = codec->irq;
 	dev_dbg(codec->card->dev, "resources allocated.\n");
 	return 0;
 }
@@ -2102,8 +2103,6 @@ static int snd_ali_create(struct snd_card *card,
 		snd_ali_free(codec);
 		return -EBUSY;
 	}
-
-	synchronize_irq(pci->irq);
 
 	codec->synth.chmap = 0;
 	codec->synth.chcnt = 0;
