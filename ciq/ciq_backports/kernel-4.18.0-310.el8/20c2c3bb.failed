@@ -1,0 +1,144 @@
+nvmet: add nvmet_req_subsys() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit 20c2c3bb83f26c42bf62cc773f96f30848ed11a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/20c2c3bb.failed
+
+Just like what we have to get the passthru ctrl from the req, add an
+helper to get the subsystem associated with the nvmet_req() instead
+of open coding the chain of structures.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 20c2c3bb83f26c42bf62cc773f96f30848ed11a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/admin-cmd.c
+#	drivers/nvme/target/core.c
+diff --cc drivers/nvme/target/admin-cmd.c
+index f16796aa8138,bc6a774f2124..000000000000
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@@ -699,14 -683,12 +699,19 @@@ static u16 nvmet_write_protect_flush_sy
+  static u16 nvmet_set_feat_write_protect(struct nvmet_req *req)
+  {
+  	u32 write_protect = le32_to_cpu(req->cmd->common.cdw11);
+++<<<<<<< HEAD
+ +	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
+ +	u16 status = NVME_SC_FEATURE_NOT_CHANGEABLE;
+++=======
++ 	struct nvmet_subsys *subsys = nvmet_req_subsys(req);
++ 	u16 status;
+++>>>>>>> 20c2c3bb83f2 (nvmet: add nvmet_req_subsys() helper)
+  
+ -	status = nvmet_req_find_ns(req);
+ -	if (status)
+ -		return status;
+ +	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->rw.nsid);
+ +	if (unlikely(!req->ns)) {
+ +		req->error_loc = offsetof(struct nvme_common_command, nsid);
+ +		return status = NVME_SC_INVALID_NS | NVME_SC_DNR;
+ +	}
+  
+  	mutex_lock(&subsys->lock);
+  	switch (write_protect) {
+@@@ -804,14 -786,13 +809,14 @@@ void nvmet_execute_set_features(struct 
+  
+  static u16 nvmet_get_feat_write_protect(struct nvmet_req *req)
+  {
+- 	struct nvmet_subsys *subsys = req->sq->ctrl->subsys;
++ 	struct nvmet_subsys *subsys = nvmet_req_subsys(req);
+  	u32 result;
+  
+ -	result = nvmet_req_find_ns(req);
+ -	if (result)
+ -		return result;
+ -
+ +	req->ns = nvmet_find_namespace(req->sq->ctrl, req->cmd->common.nsid);
+ +	if (!req->ns)  {
+ +		req->error_loc = offsetof(struct nvme_common_command, nsid);
+ +		return NVME_SC_INVALID_NS | NVME_SC_DNR;
+ +	}
+  	mutex_lock(&subsys->lock);
+  	if (req->ns->readonly == true)
+  		result = NVME_NS_WRITE_PROTECT;
+diff --cc drivers/nvme/target/core.c
+index 2c9eee9a39c8,7e3b194203a4..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -425,15 -426,18 +425,23 @@@ void nvmet_stop_keep_alive_timer(struc
+  	cancel_delayed_work_sync(&ctrl->ka_work);
+  }
+  
+ -u16 nvmet_req_find_ns(struct nvmet_req *req)
+ +struct nvmet_ns *nvmet_find_namespace(struct nvmet_ctrl *ctrl, __le32 nsid)
+  {
+ -	u32 nsid = le32_to_cpu(req->cmd->common.nsid);
+ +	struct nvmet_ns *ns;
+  
+++<<<<<<< HEAD
+ +	ns = xa_load(&ctrl->subsys->namespaces, le32_to_cpu(nsid));
+ +	if (ns)
+ +		percpu_ref_get(&ns->ref);
+++=======
++ 	req->ns = xa_load(&nvmet_req_subsys(req)->namespaces, nsid);
++ 	if (unlikely(!req->ns)) {
++ 		req->error_loc = offsetof(struct nvme_common_command, nsid);
++ 		return NVME_SC_INVALID_NS | NVME_SC_DNR;
++ 	}
+++>>>>>>> 20c2c3bb83f2 (nvmet: add nvmet_req_subsys() helper)
+  
+ -	percpu_ref_get(&req->ns->ref);
+ -	return NVME_SC_SUCCESS;
+ +	return ns;
+  }
+  
+  static void nvmet_destroy_namespace(struct percpu_ref *ref)
+* Unmerged path drivers/nvme/target/admin-cmd.c
+* Unmerged path drivers/nvme/target/core.c
+diff --git a/drivers/nvme/target/nvmet.h b/drivers/nvme/target/nvmet.h
+index 558660c454bb..045b669add8c 100644
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@ -559,6 +559,11 @@ static inline u32 nvmet_dsm_len(struct nvmet_req *req)
+ 		sizeof(struct nvme_dsm_range);
+ }
+ 
++static inline struct nvmet_subsys *nvmet_req_subsys(struct nvmet_req *req)
++{
++	return req->sq->ctrl->subsys;
++}
++
+ #ifdef CONFIG_NVME_TARGET_PASSTHRU
+ void nvmet_passthru_subsys_free(struct nvmet_subsys *subsys);
+ int nvmet_passthru_ctrl_enable(struct nvmet_subsys *subsys);
+@@ -593,7 +598,7 @@ static inline struct nvme_ctrl *nvmet_passthru_ctrl(struct nvmet_subsys *subsys)
+ static inline struct nvme_ctrl *
+ nvmet_req_passthru_ctrl(struct nvmet_req *req)
+ {
+-	return nvmet_passthru_ctrl(req->sq->ctrl->subsys);
++	return nvmet_passthru_ctrl(nvmet_req_subsys(req));
+ }
+ 
+ u16 errno_to_nvme_status(struct nvmet_req *req, int errno);
+diff --git a/drivers/nvme/target/passthru.c b/drivers/nvme/target/passthru.c
+index edcc73cab2d3..436d5fd94508 100644
+--- a/drivers/nvme/target/passthru.c
++++ b/drivers/nvme/target/passthru.c
+@@ -239,9 +239,9 @@ static void nvmet_passthru_execute_cmd(struct nvmet_req *req)
+ 		}
+ 
+ 		q = ns->queue;
+-		timeout = req->sq->ctrl->subsys->io_timeout;
++		timeout = nvmet_req_subsys(req)->io_timeout;
+ 	} else {
+-		timeout = req->sq->ctrl->subsys->admin_timeout;
++		timeout = nvmet_req_subsys(req)->admin_timeout;
+ 	}
+ 
+ 	rq = nvme_alloc_request(q, req->cmd, 0);
