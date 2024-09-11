@@ -1,0 +1,153 @@
+blk-mq: Record nr_active_requests per queue for when using shared sbitmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author John Garry <john.garry@huawei.com>
+commit bccf5e26d99c28980bd6ced474422a1b18402263
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bccf5e26.failed
+
+The per-hctx nr_active value can no longer be used to fairly assign a share
+of tag depth per request queue for when using a shared sbitmap, as it does
+not consider that the tags are shared tags over all hctx's.
+
+For this case, record the nr_active_requests per request_queue, and make
+the judgement based on that value.
+
+Co-developed-with: Kashyap Desai <kashyap.desai@broadcom.com>
+	Signed-off-by: John Garry <john.garry@huawei.com>
+	Tested-by: Don Brace<don.brace@microsemi.com> #SCSI resv cmds patches used
+	Tested-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bccf5e26d99c28980bd6ced474422a1b18402263)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq.c
+index 7330c42c292b,ffc5ad0c91b7..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1069,6 -1094,45 +1069,48 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct sbitmap_queue *bt = rq->mq_hctx->tags->bitmap_tags;
++ 	unsigned int tag_offset = rq->mq_hctx->tags->nr_reserved_tags;
++ 	int tag;
++ 
++ 	blk_mq_tag_busy(rq->mq_hctx);
++ 
++ 	if (blk_mq_tag_is_reserved(rq->mq_hctx->sched_tags, rq->internal_tag)) {
++ 		bt = rq->mq_hctx->tags->breserved_tags;
++ 		tag_offset = 0;
++ 	}
++ 
++ 	if (!hctx_may_queue(rq->mq_hctx, bt))
++ 		return false;
++ 	tag = __sbitmap_queue_get(bt);
++ 	if (tag == BLK_MQ_NO_TAG)
++ 		return false;
++ 
++ 	rq->tag = tag + tag_offset;
++ 	return true;
++ }
++ 
++ static bool blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++ 
++ 	if (rq->tag == BLK_MQ_NO_TAG && !__blk_mq_get_driver_tag(rq))
++ 		return false;
++ 
++ 	if ((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) &&
++ 			!(rq->rq_flags & RQF_MQ_INFLIGHT)) {
++ 		rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 		__blk_mq_inc_active_requests(hctx);
++ 	}
++ 	hctx->tags->rqs[rq->tag] = rq;
++ 	return true;
++ }
++ 
+++>>>>>>> bccf5e26d99c (blk-mq: Record nr_active_requests per queue for when using shared sbitmap)
+  static int blk_mq_dispatch_wake(wait_queue_entry_t *wait, unsigned mode,
+  				int flags, void *key)
+  {
+diff --cc block/blk-mq.h
+index ddd814f1bef1,25ec73078e95..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -262,4 -281,36 +284,39 @@@ static inline struct blk_plug *blk_mq_p
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * For shared tag users, we track the number of currently active users
++  * and attempt to provide a fair share of the tag depth for each of them.
++  */
++ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
++ 				  struct sbitmap_queue *bt)
++ {
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++ 		return true;
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->sb.depth == 1)
++ 		return true;
++ 
++ 	users = atomic_read(&hctx->tags->active_queues);
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->sb.depth + users - 1) / users, 4U);
++ 	return __blk_mq_active_requests(hctx) < depth;
++ }
++ 
++ 
+++>>>>>>> bccf5e26d99c (blk-mq: Record nr_active_requests per queue for when using shared sbitmap)
+  #endif
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9aabbc020a34..358414d776c9 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -516,6 +516,8 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 	q->backing_dev_info->capabilities = BDI_CAP_CGROUP_WRITEBACK;
+ 	q->node = node_id;
+ 
++	atomic_set(&q->nr_active_requests_shared_sbitmap, 0);
++
+ 	timer_setup(&q->backing_dev_info->laptop_mode_wb_timer,
+ 		    laptop_mode_timer_fn, 0);
+ 	timer_setup(&q->timeout, blk_rq_timed_out_timer, 0);
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 43b1486e0588..e7c6e88a8bb5 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -501,6 +501,8 @@ struct request_queue {
+ 	struct timer_list	timeout;
+ 	struct work_struct	timeout_work;
+ 
++	atomic_t		nr_active_requests_shared_sbitmap;
++
+ 	struct list_head	icq_list;
+ #ifdef CONFIG_BLK_CGROUP
+ 	DECLARE_BITMAP		(blkcg_pols, BLKCG_MAX_POLS);
