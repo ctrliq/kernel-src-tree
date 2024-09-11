@@ -1,0 +1,402 @@
+bpf: Introduce bpf_sysctl_get_current_value helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit 1d11b3016cec4ed9770b98e82a61708c8f4926e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1d11b301.failed
+
+Add bpf_sysctl_get_current_value() helper to copy current sysctl value
+into provided by BPF_PROG_TYPE_CGROUP_SYSCTL program buffer.
+
+It provides same string as user space can see by reading corresponding
+file in /proc/sys/, including new line, etc.
+
+Documentation for the new helper is provided in bpf.h UAPI.
+
+Since current value is kept in ctl_table->data in a parsed form,
+ctl_table->proc_handler() with write=0 is called to read that data and
+convert it to a string. Such a string can later be parsed by a program
+using helpers that will be introduced separately.
+
+Unfortunately it's not trivial to provide API to access parsed data due to
+variety of data representations (string, intvec, uintvec, ulongvec,
+custom structures, even NULL, etc). Instead it's assumed that user know
+how to handle specific sysctl they're interested in and appropriate
+helpers can be used.
+
+Since ctl_table->proc_handler() expects __user buffer, conversion to
+__user happens for kernel allocated one where the value is stored.
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 1d11b3016cec4ed9770b98e82a61708c8f4926e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/cgroup.c
+diff --cc include/linux/filter.h
+index f32b3eca5a04,f254ff92819f..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -1152,4 -1179,12 +1152,15 @@@ struct bpf_sock_ops_kern 
+  					 */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_sysctl_kern {
++ 	struct ctl_table_header *head;
++ 	struct ctl_table *table;
++ 	void *cur_val;
++ 	size_t cur_len;
++ 	int write;
++ };
++ 
+++>>>>>>> 1d11b3016cec (bpf: Introduce bpf_sysctl_get_current_value helper)
+  #endif /* __LINUX_FILTER_H__ */
+diff --cc include/uapi/linux/bpf.h
+index 6d4bc9ebe78a,063543afa359..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2463,11 -2469,78 +2463,81 @@@ union bpf_attr 
+   *
+   * struct bpf_sock *bpf_get_listener_sock(struct bpf_sock *sk)
+   *	Description
+ - *		Return a **struct bpf_sock** pointer in **TCP_LISTEN** state.
+ - *		**bpf_sk_release**\ () is unnecessary and not allowed.
+ + *		Return a **struct bpf_sock** pointer in TCP_LISTEN state.
+ + *		bpf_sk_release() is unnecessary and not allowed.
+   *	Return
+ - *		A **struct bpf_sock** pointer on success, or **NULL** in
+ + *		A **struct bpf_sock** pointer on success, or NULL in
+   *		case of failure.
+++<<<<<<< HEAD
+++=======
++  *
++  * struct bpf_sock *bpf_skc_lookup_tcp(void *ctx, struct bpf_sock_tuple *tuple, u32 tuple_size, u64 netns, u64 flags)
++  *	Description
++  *		Look for TCP socket matching *tuple*, optionally in a child
++  *		network namespace *netns*. The return value must be checked,
++  *		and if non-**NULL**, released via **bpf_sk_release**\ ().
++  *
++  *		This function is identical to bpf_sk_lookup_tcp, except that it
++  *		also returns timewait or request sockets. Use bpf_sk_fullsock
++  *		or bpf_tcp_socket to access the full structure.
++  *
++  *		This helper is available only if the kernel was compiled with
++  *		**CONFIG_NET** configuration option.
++  *	Return
++  *		Pointer to **struct bpf_sock**, or **NULL** in case of failure.
++  *		For sockets with reuseport option, the **struct bpf_sock**
++  *		result is from **reuse->socks**\ [] using the hash of the tuple.
++  *
++  * int bpf_tcp_check_syncookie(struct bpf_sock *sk, void *iph, u32 iph_len, struct tcphdr *th, u32 th_len)
++  * 	Description
++  * 		Check whether iph and th contain a valid SYN cookie ACK for
++  * 		the listening socket in sk.
++  *
++  * 		iph points to the start of the IPv4 or IPv6 header, while
++  * 		iph_len contains sizeof(struct iphdr) or sizeof(struct ip6hdr).
++  *
++  * 		th points to the start of the TCP header, while th_len contains
++  * 		sizeof(struct tcphdr).
++  *
++  * 	Return
++  * 		0 if iph and th are a valid SYN cookie ACK, or a negative error
++  * 		otherwise.
++  *
++  * int bpf_sysctl_get_name(struct bpf_sysctl *ctx, char *buf, size_t buf_len, u64 flags)
++  *	Description
++  *		Get name of sysctl in /proc/sys/ and copy it into provided by
++  *		program buffer *buf* of size *buf_len*.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *
++  *		If *flags* is zero, full name (e.g. "net/ipv4/tcp_mem") is
++  *		copied. Use **BPF_F_SYSCTL_BASE_NAME** flag to copy base name
++  *		only (e.g. "tcp_mem").
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  * int bpf_sysctl_get_current_value(struct bpf_sysctl *ctx, char *buf, size_t buf_len)
++  *	Description
++  *		Get current value of sysctl as it is presented in /proc/sys
++  *		(incl. newline, etc), and copy it as a string into provided
++  *		by program buffer *buf* of size *buf_len*.
++  *
++  *		The whole value is copied, no matter what file position user
++  *		space issued e.g. sys_read at.
++  *
++  *		The buffer is always NUL terminated, unless it's zero-sized.
++  *	Return
++  *		Number of character copied (not including the trailing NUL).
++  *
++  *		**-E2BIG** if the buffer wasn't big enough (*buf* will contain
++  *		truncated name in this case).
++  *
++  *		**-EINVAL** if current value was unavailable, e.g. because
++  *		sysctl is uninitialized and read returns -EIO for it.
+++>>>>>>> 1d11b3016cec (bpf: Introduce bpf_sysctl_get_current_value helper)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2568,7 -2641,11 +2638,15 @@@
+  	FN(sk_fullsock),		\
+  	FN(tcp_sock),			\
+  	FN(skb_ecn_set_ce),		\
+++<<<<<<< HEAD
+ +	FN(get_listener_sock),
+++=======
++ 	FN(get_listener_sock),		\
++ 	FN(skc_lookup_tcp),		\
++ 	FN(tcp_check_syncookie),	\
++ 	FN(sysctl_get_name),		\
++ 	FN(sysctl_get_current_value),
+++>>>>>>> 1d11b3016cec (bpf: Introduce bpf_sysctl_get_current_value helper)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --cc kernel/bpf/cgroup.c
+index 7d9c426bf2c7,c6b2cf29a54b..000000000000
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@@ -811,3 -771,225 +811,228 @@@ const struct bpf_verifier_ops cg_dev_ve
+  	.get_func_proto		= cgroup_dev_func_proto,
+  	.is_valid_access	= cgroup_dev_is_valid_access,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * __cgroup_bpf_run_filter_sysctl - Run a program on sysctl
++  *
++  * @head: sysctl table header
++  * @table: sysctl table
++  * @write: sysctl is being read (= 0) or written (= 1)
++  * @type: type of program to be executed
++  *
++  * Program is run when sysctl is being accessed, either read or written, and
++  * can allow or deny such access.
++  *
++  * This function will return %-EPERM if an attached program is found and
++  * returned value != 1 during execution. In all other cases 0 is returned.
++  */
++ int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++ 				   struct ctl_table *table, int write,
++ 				   enum bpf_attach_type type)
++ {
++ 	struct bpf_sysctl_kern ctx = {
++ 		.head = head,
++ 		.table = table,
++ 		.write = write,
++ 		.cur_val = NULL,
++ 		.cur_len = PAGE_SIZE,
++ 	};
++ 	struct cgroup *cgrp;
++ 	int ret;
++ 
++ 	ctx.cur_val = kmalloc_track_caller(ctx.cur_len, GFP_KERNEL);
++ 	if (ctx.cur_val) {
++ 		mm_segment_t old_fs;
++ 		loff_t pos = 0;
++ 
++ 		old_fs = get_fs();
++ 		set_fs(KERNEL_DS);
++ 		if (table->proc_handler(table, 0, (void __user *)ctx.cur_val,
++ 					&ctx.cur_len, &pos)) {
++ 			/* Let BPF program decide how to proceed. */
++ 			ctx.cur_len = 0;
++ 		}
++ 		set_fs(old_fs);
++ 	} else {
++ 		/* Let BPF program decide how to proceed. */
++ 		ctx.cur_len = 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	cgrp = task_dfl_cgroup(current);
++ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
++ 	rcu_read_unlock();
++ 
++ 	kfree(ctx.cur_val);
++ 
++ 	return ret == 1 ? 0 : -EPERM;
++ }
++ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sysctl);
++ 
++ static ssize_t sysctl_cpy_dir(const struct ctl_dir *dir, char **bufp,
++ 			      size_t *lenp)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (dir->header.parent) {
++ 		tmp_ret = sysctl_cpy_dir(dir->header.parent, bufp, lenp);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(*bufp, dir->header.ctl_table[0].procname, *lenp);
++ 	if (ret < 0)
++ 		return ret;
++ 	*bufp += ret;
++ 	*lenp -= ret;
++ 	ret += tmp_ret;
++ 
++ 	/* Avoid leading slash. */
++ 	if (!ret)
++ 		return ret;
++ 
++ 	tmp_ret = strscpy(*bufp, "/", *lenp);
++ 	if (tmp_ret < 0)
++ 		return tmp_ret;
++ 	*bufp += tmp_ret;
++ 	*lenp -= tmp_ret;
++ 
++ 	return ret + tmp_ret;
++ }
++ 
++ BPF_CALL_4(bpf_sysctl_get_name, struct bpf_sysctl_kern *, ctx, char *, buf,
++ 	   size_t, buf_len, u64, flags)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (!buf)
++ 		return -EINVAL;
++ 
++ 	if (!(flags & BPF_F_SYSCTL_BASE_NAME)) {
++ 		if (!ctx->head)
++ 			return -EINVAL;
++ 		tmp_ret = sysctl_cpy_dir(ctx->head->parent, &buf, &buf_len);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(buf, ctx->table->procname, buf_len);
++ 
++ 	return ret < 0 ? ret : tmp_ret + ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_name_proto = {
++ 	.func		= bpf_sysctl_get_name,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static int copy_sysctl_value(char *dst, size_t dst_len, char *src,
++ 			     size_t src_len)
++ {
++ 	if (!dst)
++ 		return -EINVAL;
++ 
++ 	if (!dst_len)
++ 		return -E2BIG;
++ 
++ 	if (!src || !src_len) {
++ 		memset(dst, 0, dst_len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	memcpy(dst, src, min(dst_len, src_len));
++ 
++ 	if (dst_len > src_len) {
++ 		memset(dst + src_len, '\0', dst_len - src_len);
++ 		return src_len;
++ 	}
++ 
++ 	dst[dst_len - 1] = '\0';
++ 
++ 	return -E2BIG;
++ }
++ 
++ BPF_CALL_3(bpf_sysctl_get_current_value, struct bpf_sysctl_kern *, ctx,
++ 	   char *, buf, size_t, buf_len)
++ {
++ 	return copy_sysctl_value(buf, buf_len, ctx->cur_val, ctx->cur_len);
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_current_value_proto = {
++ 	.func		= bpf_sysctl_get_current_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ sysctl_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_sysctl_get_name:
++ 		return &bpf_sysctl_get_name_proto;
++ 	case BPF_FUNC_sysctl_get_current_value:
++ 		return &bpf_sysctl_get_current_value_proto;
++ 	default:
++ 		return cgroup_base_func_proto(func_id, prog);
++ 	}
++ }
++ 
++ static bool sysctl_is_valid_access(int off, int size, enum bpf_access_type type,
++ 				   const struct bpf_prog *prog,
++ 				   struct bpf_insn_access_aux *info)
++ {
++ 	const int size_default = sizeof(__u32);
++ 
++ 	if (off < 0 || off + size > sizeof(struct bpf_sysctl) ||
++ 	    off % size || type != BPF_READ)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		bpf_ctx_record_field_size(info, size_default);
++ 		return bpf_ctx_narrow_access_ok(off, size, size_default);
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static u32 sysctl_convert_ctx_access(enum bpf_access_type type,
++ 				     const struct bpf_insn *si,
++ 				     struct bpf_insn *insn_buf,
++ 				     struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		*insn++ = BPF_LDX_MEM(
++ 			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++ 			bpf_target_off(struct bpf_sysctl_kern, write,
++ 				       FIELD_SIZEOF(struct bpf_sysctl_kern,
++ 						    write),
++ 				       target_size));
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ const struct bpf_verifier_ops cg_sysctl_verifier_ops = {
++ 	.get_func_proto		= sysctl_func_proto,
++ 	.is_valid_access	= sysctl_is_valid_access,
++ 	.convert_ctx_access	= sysctl_convert_ctx_access,
++ };
++ 
++ const struct bpf_prog_ops cg_sysctl_prog_ops = {
++ };
+++>>>>>>> 1d11b3016cec (bpf: Introduce bpf_sysctl_get_current_value helper)
+* Unmerged path include/linux/filter.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/cgroup.c
