@@ -1,0 +1,147 @@
+dax: Pass dax_dev instead of bdev to dax_writeback_mapping_range()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 3f666c56c6b8cc40a5e9002aac484b8f5b83c402
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3f666c56.failed
+
+As of now dax_writeback_mapping_range() takes "struct block_device" as a
+parameter and dax_dev is searched from bdev name. This also involves taking
+a fresh reference on dax_dev and putting that reference at the end of
+function.
+
+We are developing a new filesystem virtio-fs and using dax to access host
+page cache directly. But there is no block device. IOW, we want to make
+use of dax but want to get rid of this assumption that there is always
+a block device associated with dax_dev.
+
+So pass in "struct dax_device" as parameter instead of bdev.
+
+ext2/ext4/xfs are current users and they already have a reference on
+dax_device. So there is no need to take reference and drop reference to
+dax_device on each call of this function.
+
+	Suggested-by: Christoph Hellwig <hch@infradead.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+Link: https://lore.kernel.org/r/20200103183307.GB13350@redhat.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 3f666c56c6b8cc40a5e9002aac484b8f5b83c402)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_aops.c
+diff --cc fs/xfs/xfs_aops.c
+index 5d3503f6412a,58e937be24ce..000000000000
+--- a/fs/xfs/xfs_aops.c
++++ b/fs/xfs/xfs_aops.c
+@@@ -609,9 -583,11 +609,13 @@@ xfs_dax_writepages
+  	struct address_space	*mapping,
+  	struct writeback_control *wbc)
+  {
+ -	struct xfs_inode	*ip = XFS_I(mapping->host);
+ -
+ -	xfs_iflags_clear(ip, XFS_ITRUNCATED);
+ +	xfs_iflags_clear(XFS_I(mapping->host), XFS_ITRUNCATED);
+  	return dax_writeback_mapping_range(mapping,
+++<<<<<<< HEAD
+ +			xfs_find_bdev_for_inode(mapping->host), wbc);
+++=======
++ 			xfs_inode_buftarg(ip)->bt_daxdev, wbc);
+++>>>>>>> 3f666c56c6b8 (dax: Pass dax_dev instead of bdev to dax_writeback_mapping_range())
+  }
+  
+  STATIC sector_t
+diff --git a/fs/dax.c b/fs/dax.c
+index 0beb53b5a7e9..54ae7806acbd 100644
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@ -943,12 +943,11 @@ static int dax_writeback_one(struct xa_state *xas, struct dax_device *dax_dev,
+  * on persistent storage prior to completion of the operation.
+  */
+ int dax_writeback_mapping_range(struct address_space *mapping,
+-		struct block_device *bdev, struct writeback_control *wbc)
++		struct dax_device *dax_dev, struct writeback_control *wbc)
+ {
+ 	XA_STATE(xas, &mapping->i_pages, wbc->range_start >> PAGE_SHIFT);
+ 	struct inode *inode = mapping->host;
+ 	pgoff_t end_index = wbc->range_end >> PAGE_SHIFT;
+-	struct dax_device *dax_dev;
+ 	void *entry;
+ 	int ret = 0;
+ 	unsigned int scanned = 0;
+@@ -959,10 +958,6 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+ 	if (!mapping->nrexceptional || wbc->sync_mode != WB_SYNC_ALL)
+ 		return 0;
+ 
+-	dax_dev = dax_get_by_host(bdev->bd_disk->disk_name);
+-	if (!dax_dev)
+-		return -EIO;
+-
+ 	trace_dax_writeback_range(inode, xas.xa_index, end_index);
+ 
+ 	tag_pages_for_writeback(mapping, xas.xa_index, end_index);
+@@ -983,7 +978,6 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+ 		xas_lock_irq(&xas);
+ 	}
+ 	xas_unlock_irq(&xas);
+-	put_dax(dax_dev);
+ 	trace_dax_writeback_range_done(inode, xas.xa_index, end_index);
+ 	return ret;
+ }
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index 6189c2b96c04..0262f2485a67 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -955,8 +955,9 @@ ext2_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ static int
+ ext2_dax_writepages(struct address_space *mapping, struct writeback_control *wbc)
+ {
+-	return dax_writeback_mapping_range(mapping,
+-			mapping->host->i_sb->s_bdev, wbc);
++	struct ext2_sb_info *sbi = EXT2_SB(mapping->host->i_sb);
++
++	return dax_writeback_mapping_range(mapping, sbi->s_daxdev, wbc);
+ }
+ 
+ const struct address_space_operations ext2_aops = {
+diff --git a/fs/ext4/inode.c b/fs/ext4/inode.c
+index 8e7de233296c..1bf2ebd43113 100644
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@ -2976,7 +2976,7 @@ static int ext4_dax_writepages(struct address_space *mapping,
+ 	percpu_down_read(&sbi->s_writepages_rwsem);
+ 	trace_ext4_writepages(inode, wbc);
+ 
+-	ret = dax_writeback_mapping_range(mapping, inode->i_sb->s_bdev, wbc);
++	ret = dax_writeback_mapping_range(mapping, sbi->s_daxdev, wbc);
+ 	trace_ext4_writepages_result(inode, wbc, ret,
+ 				     nr_to_write - wbc->nr_to_write);
+ 	percpu_up_read(&sbi->s_writepages_rwsem);
+* Unmerged path fs/xfs/xfs_aops.c
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index 9bd8528bd305..d5932e47c597 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -141,7 +141,7 @@ static inline void fs_put_dax(struct dax_device *dax_dev)
+ 
+ struct dax_device *fs_dax_get_by_bdev(struct block_device *bdev);
+ int dax_writeback_mapping_range(struct address_space *mapping,
+-		struct block_device *bdev, struct writeback_control *wbc);
++		struct dax_device *dax_dev, struct writeback_control *wbc);
+ 
+ struct page *dax_layout_busy_page(struct address_space *mapping);
+ dax_entry_t dax_lock_page(struct page *page);
+@@ -180,7 +180,7 @@ static inline struct page *dax_layout_busy_page(struct address_space *mapping)
+ }
+ 
+ static inline int dax_writeback_mapping_range(struct address_space *mapping,
+-		struct block_device *bdev, struct writeback_control *wbc)
++		struct dax_device *dax_dev, struct writeback_control *wbc)
+ {
+ 	return -EOPNOTSUPP;
+ }
