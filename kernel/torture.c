@@ -97,6 +97,7 @@ bool torture_offline(int cpu, long *n_offl_attempts, long *n_offl_successes,
 {
 	unsigned long delta;
 	int ret;
+	char *s;
 	unsigned long starttime;
 
 	if (!cpu_online(cpu) || !cpu_is_hotpluggable(cpu))
@@ -112,10 +113,16 @@ bool torture_offline(int cpu, long *n_offl_attempts, long *n_offl_successes,
 	(*n_offl_attempts)++;
 	ret = cpu_down(cpu);
 	if (ret) {
+		s = "";
+		if (!rcu_inkernel_boot_has_ended() && ret == -EBUSY) {
+			// PCI probe frequently disables hotplug during boot.
+			(*n_offl_attempts)--;
+			s = " (-EBUSY forgiven during boot)";
+		}
 		if (verbose)
 			pr_alert("%s" TORTURE_FLAG
-				 "torture_onoff task: offline %d failed: errno %d\n",
-				 torture_type, cpu, ret);
+				 "torture_onoff task: offline %d failed%s: errno %d\n",
+				 torture_type, cpu, s, ret);
 	} else {
 		if (verbose > 1)
 			pr_alert("%s" TORTURE_FLAG
@@ -150,6 +157,7 @@ bool torture_online(int cpu, long *n_onl_attempts, long *n_onl_successes,
 {
 	unsigned long delta;
 	int ret;
+	char *s;
 	unsigned long starttime;
 
 	if (cpu_online(cpu) || !cpu_is_hotpluggable(cpu))
@@ -163,10 +171,16 @@ bool torture_online(int cpu, long *n_onl_attempts, long *n_onl_successes,
 	(*n_onl_attempts)++;
 	ret = cpu_up(cpu);
 	if (ret) {
+		s = "";
+		if (!rcu_inkernel_boot_has_ended() && ret == -EBUSY) {
+			// PCI probe frequently disables hotplug during boot.
+			(*n_onl_attempts)--;
+			s = " (-EBUSY forgiven during boot)";
+		}
 		if (verbose)
 			pr_alert("%s" TORTURE_FLAG
-				 "torture_onoff task: online %d failed: errno %d\n",
-				 torture_type, cpu, ret);
+				 "torture_onoff task: online %d failed%s: errno %d\n",
+				 torture_type, cpu, s, ret);
 	} else {
 		if (verbose > 1)
 			pr_alert("%s" TORTURE_FLAG
