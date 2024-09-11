@@ -1,0 +1,335 @@
+net/mlx5e: Do not ignore netdevice TX/RX queues number
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Feras Daoud <ferasda@mellanox.com>
+commit 779d986d60de51aabc3bec385f92b832089c5c01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/779d986d.failed
+
+The current design of mlx5e driver ignores the netdevice TX/RX queues
+number for netdevices that RDMA IPoIB ULP creates. Instead, the queue
+number is initialized to the maximum number that mlx5 thinks best for
+performance. As a result, ULP drivers that choose to create a netdevice
+with queue number that is less than the maximum channels mlx5 creates,
+will get a memory corruption.
+
+This fix changes the mlx5e netdev logic to respect ULP netdevices TX/RX
+queue number and use it when creating resources instead of the maximum
+channel number.
+
+Fixes: cd565b4b51e5 ("IB/IPoIB: Support acceleration options callbacks")
+	Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 779d986d60de51aabc3bec385f92b832089c5c01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+#	drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 11fe75e05d5e,c9848e333450..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -4730,9 -4738,15 +4730,20 @@@ static void mlx5e_nic_init(struct mlx5_
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+  	int err;
+  
+++<<<<<<< HEAD
+ +	priv->vxlan = mlx5_vxlan_create(mdev);
+++=======
++ 	err = mlx5e_netdev_init(netdev, priv, mdev, profile, ppriv);
++ 	if (err)
++ 		return err;
++ 
++ 	mlx5e_build_nic_params(mdev, &priv->channels.params,
++ 			       mlx5e_get_netdev_max_channels(netdev), netdev->mtu);
++ 
++ 	mlx5e_timestamp_init(priv);
+++>>>>>>> 779d986d60de (net/mlx5e: Do not ignore netdevice TX/RX queues number)
+  
+ +	mlx5e_build_nic_netdev_priv(mdev, netdev, profile, ppriv);
+  	err = mlx5e_ipsec_init(priv);
+  	if (err)
+  		mlx5_core_err(mdev, "IPSec initialization failed, %d\n", err);
+@@@ -4905,13 -4934,53 +4915,13 @@@ static const struct mlx5e_profile mlx5e
+  
+  /* mlx5e generic netdev management API (move to en_common.c) */
+  
+ -/* mlx5e_netdev_init/cleanup must be called from profile->init/cleanup callbacks */
+ -int mlx5e_netdev_init(struct net_device *netdev,
+ -		      struct mlx5e_priv *priv,
+ -		      struct mlx5_core_dev *mdev,
+ -		      const struct mlx5e_profile *profile,
+ -		      void *ppriv)
+ -{
+ -	/* priv init */
+ -	priv->mdev        = mdev;
+ -	priv->netdev      = netdev;
+ -	priv->profile     = profile;
+ -	priv->ppriv       = ppriv;
+ -	priv->msglevel    = MLX5E_MSG_LEVEL;
+ -	priv->max_opened_tc = 1;
+ -
+ -	mutex_init(&priv->state_lock);
+ -	INIT_WORK(&priv->update_carrier_work, mlx5e_update_carrier_work);
+ -	INIT_WORK(&priv->set_rx_mode_work, mlx5e_set_rx_mode_work);
+ -	INIT_WORK(&priv->tx_timeout_work, mlx5e_tx_timeout_work);
+ -	INIT_WORK(&priv->update_stats_work, mlx5e_update_stats_work);
+ -
+ -	priv->wq = create_singlethread_workqueue("mlx5e");
+ -	if (!priv->wq)
+ -		return -ENOMEM;
+ -
+ -	/* netdev init */
+ -	netif_carrier_off(netdev);
+ -
+ -#ifdef CONFIG_MLX5_EN_ARFS
+ -	netdev->rx_cpu_rmap = mdev->rmap;
+ -#endif
+ -
+ -	return 0;
+ -}
+ -
+ -void mlx5e_netdev_cleanup(struct net_device *netdev, struct mlx5e_priv *priv)
+ -{
+ -	destroy_workqueue(priv->wq);
+ -}
+ -
+  struct net_device *mlx5e_create_netdev(struct mlx5_core_dev *mdev,
+  				       const struct mlx5e_profile *profile,
++ 				       int nch,
+  				       void *ppriv)
+  {
+- 	int nch = profile->max_nch(mdev);
+  	struct net_device *netdev;
+ -	int err;
+ +	struct mlx5e_priv *priv;
+  
+  	netdev = alloc_etherdev_mqs(sizeof(struct mlx5e_priv),
+  				    nch * profile->max_tc,
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 8e3c5b4b90ab,64c2b9ea8b1e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -970,23 -1077,21 +970,24 @@@ static void mlx5e_build_rep_netdev(stru
+  	netdev->max_mtu = MLX5E_HW2SW_MTU(&priv->channels.params, max_mtu);
+  }
+  
+ -static int mlx5e_init_rep(struct mlx5_core_dev *mdev,
+ -			  struct net_device *netdev,
+ -			  const struct mlx5e_profile *profile,
+ -			  void *ppriv)
+ +static void mlx5e_init_rep(struct mlx5_core_dev *mdev,
+ +			   struct net_device *netdev,
+ +			   const struct mlx5e_profile *profile,
+ +			   void *ppriv)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(netdev);
+ -	int err;
+  
+ -	err = mlx5e_netdev_init(netdev, priv, mdev, profile, ppriv);
+ -	if (err)
+ -		return err;
+ +	priv->mdev                         = mdev;
+ +	priv->netdev                       = netdev;
+ +	priv->profile                      = profile;
+ +	priv->ppriv                        = ppriv;
+  
+ +	mutex_init(&priv->state_lock);
+ +
+ +	INIT_DELAYED_WORK(&priv->update_stats_work, mlx5e_update_stats_work);
+  
+- 	priv->channels.params.num_channels = profile->max_nch(mdev);
++ 	priv->channels.params.num_channels =
++ 				mlx5e_get_netdev_max_channels(netdev);
+  
+  	mlx5e_build_rep_params(mdev, &priv->channels.params, netdev->mtu);
+  	mlx5e_build_rep_netdev(netdev);
+@@@ -1064,10 -1234,9 +1065,13 @@@ static const struct mlx5e_profile mlx5e
+  	.init_tx		= mlx5e_init_rep_tx,
+  	.cleanup_tx		= mlx5e_cleanup_nic_tx,
+  	.update_stats           = mlx5e_rep_update_hw_counters,
+++<<<<<<< HEAD
+ +	.max_nch		= mlx5e_get_rep_max_num_channels,
+++=======
+++>>>>>>> 779d986d60de (net/mlx5e: Do not ignore netdevice TX/RX queues number)
+  	.update_carrier		= NULL,
+  	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+ -	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+ +	.rx_handlers.handle_rx_cqe_mpwqe = NULL /* Not supported */,
+  	.max_tc			= 1,
+  };
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index 0e07e0bb17d3,b59953daf8b4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@@ -704,29 -716,31 +705,44 @@@ struct net_device *mlx5_rdma_netdev_all
+  
+  destroy_ht:
+  	mlx5i_pkey_qpn_ht_cleanup(netdev);
+ -	return err;
+ +destroy_wq:
+ +	destroy_workqueue(epriv->wq);
+ +err_free_netdev:
+ +	free_netdev(netdev);
+ +
+ +	return NULL;
+  }
+ +EXPORT_SYMBOL(mlx5_rdma_netdev_alloc);
+  
+ -int mlx5_rdma_rn_get_params(struct mlx5_core_dev *mdev,
+ -			    struct ib_device *device,
+ -			    struct rdma_netdev_alloc_params *params)
+ +void mlx5_rdma_netdev_free(struct net_device *netdev)
+  {
+ -	int nch;
+ -	int rc;
+ +	struct mlx5e_priv *priv = mlx5i_epriv(netdev);
+ +	struct mlx5i_priv *ipriv = priv->ppriv;
+ +	const struct mlx5e_profile *profile = priv->profile;
+  
+ -	rc = mlx5i_check_required_hca_cap(mdev);
+ -	if (rc)
+ -		return rc;
+ +	mlx5e_detach_netdev(priv);
+ +	profile->cleanup(priv);
+ +	destroy_workqueue(priv->wq);
+  
+++<<<<<<< HEAD
+ +	if (!ipriv->sub_interface) {
+ +		mlx5i_pkey_qpn_ht_cleanup(netdev);
+ +		mlx5e_destroy_mdev_resources(priv->mdev);
+ +	}
+ +	free_netdev(netdev);
+++=======
++ 	nch = mlx5e_get_max_num_channels(mdev);
++ 
++ 	*params = (struct rdma_netdev_alloc_params){
++ 		.sizeof_priv = sizeof(struct mlx5i_priv) +
++ 			       sizeof(struct mlx5e_priv),
++ 		.txqs = nch * MLX5E_MAX_NUM_TC,
++ 		.rxqs = nch,
++ 		.param = mdev,
++ 		.initialize_rdma_netdev = mlx5_rdma_setup_rn,
++ 	};
++ 
++ 	return 0;
+++>>>>>>> 779d986d60de (net/mlx5e: Do not ignore netdevice TX/RX queues number)
+  }
+ -EXPORT_SYMBOL(mlx5_rdma_rn_get_params);
+ +EXPORT_SYMBOL(mlx5_rdma_netdev_free);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 6ddc006bb555..758d4e27725e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -172,6 +172,7 @@ static inline u16 mlx5_min_rx_wqes(int wq_type, u32 wq_size)
+ 	}
+ }
+ 
++/* Use this function to get max num channels (rxqs/txqs) only to create netdev */
+ static inline int mlx5e_get_max_num_channels(struct mlx5_core_dev *mdev)
+ {
+ 	return is_kdump_kernel() ?
+@@ -180,6 +181,13 @@ static inline int mlx5e_get_max_num_channels(struct mlx5_core_dev *mdev)
+ 		      MLX5E_MAX_NUM_CHANNELS);
+ }
+ 
++/* Use this function to get max num channels after netdev was created */
++static inline int mlx5e_get_netdev_max_channels(struct net_device *netdev)
++{
++	return min_t(unsigned int, netdev->num_rx_queues,
++		     netdev->num_tx_queues);
++}
++
+ struct mlx5e_tx_wqe {
+ 	struct mlx5_wqe_ctrl_seg ctrl;
+ 	struct mlx5_wqe_eth_seg  eth;
+@@ -844,7 +852,6 @@ struct mlx5e_profile {
+ 	void	(*disable)(struct mlx5e_priv *priv);
+ 	void	(*update_stats)(struct mlx5e_priv *priv);
+ 	void	(*update_carrier)(struct mlx5e_priv *priv);
+-	int	(*max_nch)(struct mlx5_core_dev *mdev);
+ 	struct {
+ 		mlx5e_fp_handle_rx_cqe handle_rx_cqe;
+ 		mlx5e_fp_handle_rx_cqe handle_rx_cqe_mpwqe;
+@@ -1146,7 +1153,7 @@ int mlx5e_ethtool_flash_device(struct mlx5e_priv *priv,
+ /* mlx5e generic netdev management API */
+ struct net_device*
+ mlx5e_create_netdev(struct mlx5_core_dev *mdev, const struct mlx5e_profile *profile,
+-		    void *ppriv);
++		    int nch, void *ppriv);
+ int mlx5e_attach_netdev(struct mlx5e_priv *priv);
+ void mlx5e_detach_netdev(struct mlx5e_priv *priv);
+ void mlx5e_destroy_netdev(struct mlx5e_priv *priv);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+index cde1a0bb9c4a..2ad451769564 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_ethtool.c
+@@ -310,7 +310,7 @@ static int mlx5e_set_ringparam(struct net_device *dev,
+ void mlx5e_ethtool_get_channels(struct mlx5e_priv *priv,
+ 				struct ethtool_channels *ch)
+ {
+-	ch->max_combined   = priv->profile->max_nch(priv->mdev);
++	ch->max_combined   = mlx5e_get_netdev_max_channels(priv->netdev);
+ 	ch->combined_count = priv->channels.params.num_channels;
+ }
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 4ed7d1fbbd1b..70f8bf4d00cd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -126,7 +126,7 @@ void mlx5e_grp_sw_update_stats(struct mlx5e_priv *priv)
+ 
+ 	memset(s, 0, sizeof(*s));
+ 
+-	for (i = 0; i < priv->profile->max_nch(priv->mdev); i++) {
++	for (i = 0; i < mlx5e_get_netdev_max_channels(priv->netdev); i++) {
+ 		struct mlx5e_channel_stats *channel_stats =
+ 			&priv->channel_stats[i];
+ 		struct mlx5e_rq_stats *rq_stats = &channel_stats->rq;
+@@ -1185,7 +1185,7 @@ static const struct counter_desc ch_stats_desc[] = {
+ 
+ static int mlx5e_grp_channels_get_num_stats(struct mlx5e_priv *priv)
+ {
+-	int max_nch = priv->profile->max_nch(priv->mdev);
++	int max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+ 
+ 	return (NUM_RQ_STATS * max_nch) +
+ 	       (NUM_CH_STATS * max_nch) +
+@@ -1195,7 +1195,7 @@ static int mlx5e_grp_channels_get_num_stats(struct mlx5e_priv *priv)
+ static int mlx5e_grp_channels_fill_strings(struct mlx5e_priv *priv, u8 *data,
+ 					   int idx)
+ {
+-	int max_nch = priv->profile->max_nch(priv->mdev);
++	int max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+ 	int i, j, tc;
+ 
+ 	for (i = 0; i < max_nch; i++)
+@@ -1220,7 +1220,7 @@ static int mlx5e_grp_channels_fill_strings(struct mlx5e_priv *priv, u8 *data,
+ static int mlx5e_grp_channels_fill_stats(struct mlx5e_priv *priv, u64 *data,
+ 					 int idx)
+ {
+-	int max_nch = priv->profile->max_nch(priv->mdev);
++	int max_nch = mlx5e_get_netdev_max_channels(priv->netdev);
+ 	int i, j, tc;
+ 
+ 	for (i = 0; i < max_nch; i++)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+index e3e8a5f1ac9b..ab973eac2f58 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib_vlan.c
+@@ -346,7 +346,6 @@ static const struct mlx5e_profile mlx5i_pkey_nic_profile = {
+ 	.enable		   = NULL,
+ 	.disable	   = NULL,
+ 	.update_stats	   = NULL,
+-	.max_nch	   = mlx5e_get_max_num_channels,
+ 	.rx_handlers.handle_rx_cqe       = mlx5i_handle_rx_cqe,
+ 	.rx_handlers.handle_rx_cqe_mpwqe = NULL, /* Not supported */
+ 	.max_tc		   = MLX5I_MAX_NUM_TC,
