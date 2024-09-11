@@ -1,0 +1,162 @@
+KVM: x86: Move Intel Processor Trace interrupt handler to vmx.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 33271a9e2b52e07e278a67c900d2d2afb5c55bd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/33271a9e.failed
+
+Now that all state needed for VMX's PT interrupt handler is exposed to
+vmx.c (specifically the currently running vCPU), move the handler into
+vmx.c where it belongs.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20211111020738.2512932-14-seanjc@google.com
+(cherry picked from commit 33271a9e2b52e07e278a67c900d2d2afb5c55bd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index fa9a4666a113,4e0ed2fdc2e1..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8587,50 -8469,6 +8587,53 @@@ static void kvm_timer_init(void
+  			  kvmclock_cpu_online, kvmclock_cpu_down_prep);
+  }
+  
+++<<<<<<< HEAD
+ +DEFINE_PER_CPU(struct kvm_vcpu *, current_vcpu);
+ +EXPORT_PER_CPU_SYMBOL_GPL(current_vcpu);
+ +
+ +int kvm_is_in_guest(void)
+ +{
+ +	return __this_cpu_read(current_vcpu) != NULL;
+ +}
+ +
+ +static int kvm_is_user_mode(void)
+ +{
+ +	int user_mode = 3;
+ +
+ +	if (__this_cpu_read(current_vcpu))
+ +		user_mode = static_call(kvm_x86_get_cpl)(__this_cpu_read(current_vcpu));
+ +
+ +	return user_mode != 0;
+ +}
+ +
+ +static unsigned long kvm_get_guest_ip(void)
+ +{
+ +	unsigned long ip = 0;
+ +
+ +	if (__this_cpu_read(current_vcpu))
+ +		ip = kvm_rip_read(__this_cpu_read(current_vcpu));
+ +
+ +	return ip;
+ +}
+ +
+ +static void kvm_handle_intel_pt_intr(void)
+ +{
+ +	struct kvm_vcpu *vcpu = __this_cpu_read(current_vcpu);
+ +
+ +	kvm_make_request(KVM_REQ_PMI, vcpu);
+ +	__set_bit(MSR_CORE_PERF_GLOBAL_OVF_CTRL_TRACE_TOPA_PMI_BIT,
+ +			(unsigned long *)&vcpu->arch.pmu.global_status);
+ +}
+ +
+ +static struct perf_guest_info_callbacks kvm_guest_cbs = {
+ +	.is_in_guest		= kvm_is_in_guest,
+ +	.is_user_mode		= kvm_is_user_mode,
+ +	.get_guest_ip		= kvm_get_guest_ip,
+ +	.handle_intel_pt_intr	= NULL,
+ +};
+ +
+++=======
+++>>>>>>> 33271a9e2b52 (KVM: x86: Move Intel Processor Trace interrupt handler to vmx.c)
+  #ifdef CONFIG_X86_64
+  static void pvclock_gtod_update_fn(struct work_struct *work)
+  {
+@@@ -11372,9 -11178,7 +11375,13 @@@ int kvm_arch_hardware_setup(void *opaqu
+  	memcpy(&kvm_x86_ops, ops->runtime_ops, sizeof(kvm_x86_ops));
+  	kvm_ops_static_call_update();
+  
+++<<<<<<< HEAD
+ +	if (ops->intel_pt_intr_in_guest && ops->intel_pt_intr_in_guest())
+ +		kvm_guest_cbs.handle_intel_pt_intr = kvm_handle_intel_pt_intr;
+ +	perf_register_guest_info_callbacks(&kvm_guest_cbs);
+++=======
++ 	kvm_register_perf_callbacks(ops->handle_intel_pt_intr);
+++>>>>>>> 33271a9e2b52 (KVM: x86: Move Intel Processor Trace interrupt handler to vmx.c)
+  
+  	if (!kvm_cpu_cap_has(X86_FEATURE_XSAVES))
+  		supported_xss = 0;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 4110a606df35..b4833cb172fb 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1495,7 +1495,7 @@ struct kvm_x86_init_ops {
+ 	int (*disabled_by_bios)(void);
+ 	int (*check_processor_compatibility)(void);
+ 	int (*hardware_setup)(void);
+-	bool (*intel_pt_intr_in_guest)(void);
++	unsigned int (*handle_intel_pt_intr)(void);
+ 
+ 	struct kvm_x86_ops *runtime_ops;
+ };
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index d518f34a1bf5..08a76291d7f1 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7721,6 +7721,20 @@ static struct kvm_x86_ops vmx_x86_ops __initdata = {
+ 	.vcpu_deliver_sipi_vector = kvm_vcpu_deliver_sipi_vector,
+ };
+ 
++static unsigned int vmx_handle_intel_pt_intr(void)
++{
++	struct kvm_vcpu *vcpu = kvm_get_running_vcpu();
++
++	/* '0' on failure so that the !PT case can use a RET0 static call. */
++	if (!kvm_arch_pmi_in_guest(vcpu))
++		return 0;
++
++	kvm_make_request(KVM_REQ_PMI, vcpu);
++	__set_bit(MSR_CORE_PERF_GLOBAL_OVF_CTRL_TRACE_TOPA_PMI_BIT,
++		  (unsigned long *)&vcpu->arch.pmu.global_status);
++	return 1;
++}
++
+ static __init void vmx_setup_user_return_msrs(void)
+ {
+ 
+@@ -7747,6 +7761,8 @@ static __init void vmx_setup_user_return_msrs(void)
+ 		kvm_add_user_return_msr(vmx_uret_msrs_list[i]);
+ }
+ 
++static struct kvm_x86_init_ops vmx_init_ops __initdata;
++
+ static __init int hardware_setup(void)
+ {
+ 	unsigned long host_bndcfgs;
+@@ -7905,6 +7921,10 @@ static __init int hardware_setup(void)
+ 		return -EINVAL;
+ 	if (!enable_ept || !cpu_has_vmx_intel_pt())
+ 		pt_mode = PT_MODE_SYSTEM;
++	if (pt_mode == PT_MODE_HOST_GUEST)
++		vmx_init_ops.handle_intel_pt_intr = vmx_handle_intel_pt_intr;
++	else
++		vmx_init_ops.handle_intel_pt_intr = NULL;
+ 
+ 	setup_default_sgx_lepubkeyhash();
+ 
+@@ -7930,7 +7950,7 @@ static struct kvm_x86_init_ops vmx_init_ops __initdata = {
+ 	.disabled_by_bios = vmx_disabled_by_bios,
+ 	.check_processor_compatibility = vmx_check_processor_compat,
+ 	.hardware_setup = hardware_setup,
+-	.intel_pt_intr_in_guest = vmx_pt_mode_is_host_guest,
++	.handle_intel_pt_intr = NULL,
+ 
+ 	.runtime_ops = &vmx_x86_ops,
+ };
+* Unmerged path arch/x86/kvm/x86.c
