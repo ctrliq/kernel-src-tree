@@ -1,0 +1,133 @@
+tty: use new tty_insert_flip_string_and_push_buffer() in pty_write()
+
+jira LE-1907
+cve CVE-2022-1462
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jiri Slaby <jslaby@suse.cz>
+commit a501ab75e7624d133a5a3c7ec010687c8b961d23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a501ab75.failed
+
+There is a race in pty_write(). pty_write() can be called in parallel
+with e.g. ioctl(TIOCSTI) or ioctl(TCXONC) which also inserts chars to
+the buffer. Provided, tty_flip_buffer_push() in pty_write() is called
+outside the lock, it can commit inconsistent tail. This can lead to out
+of bounds writes and other issues. See the Link below.
+
+To fix this, we have to introduce a new helper called
+tty_insert_flip_string_and_push_buffer(). It does both
+tty_insert_flip_string() and tty_flip_buffer_commit() under the port
+lock. It also calls queue_work(), but outside the lock. See
+71a174b39f10 (pty: do tty_flip_buffer_push without port->lock in
+pty_write) for the reasons.
+
+Keep the helper internal-only (in drivers' tty.h). It is not intended to
+be used widely.
+
+Link: https://seclists.org/oss-sec/2022/q2/155
+Fixes: 71a174b39f10 (pty: do tty_flip_buffer_push without port->lock in pty_write)
+	Cc: 一只狗 <chennbnbnb@gmail.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Suggested-by: Hillf Danton <hdanton@sina.com>
+	Signed-off-by: Jiri Slaby <jslaby@suse.cz>
+Link: https://lore.kernel.org/r/20220707082558.9250-2-jslaby@suse.cz
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit a501ab75e7624d133a5a3c7ec010687c8b961d23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/tty/pty.c
+#	drivers/tty/tty.h
+#	drivers/tty/tty_buffer.c
+diff --cc drivers/tty/pty.c
+index b8175c0a0538,752dab3356d7..000000000000
+--- a/drivers/tty/pty.c
++++ b/drivers/tty/pty.c
+@@@ -110,21 -111,11 +110,15 @@@ static void pty_unthrottle(struct tty_s
+  static int pty_write(struct tty_struct *tty, const unsigned char *buf, int c)
+  {
+  	struct tty_struct *to = tty->link;
+- 	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	if (tty->stopped)
+++=======
++ 	if (tty->flow.stopped || !c)
+++>>>>>>> a501ab75e762 (tty: use new tty_insert_flip_string_and_push_buffer() in pty_write())
+  		return 0;
+  
+- 	if (c > 0) {
+- 		spin_lock_irqsave(&to->port->lock, flags);
+- 		/* Stuff the data into the input queue of the other end */
+- 		c = tty_insert_flip_string(to->port, buf, c);
+- 		spin_unlock_irqrestore(&to->port->lock, flags);
+- 		/* And shovel */
+- 		if (c)
+- 			tty_flip_buffer_push(to->port);
+- 	}
+- 	return c;
++ 	return tty_insert_flip_string_and_push_buffer(to->port, buf, c);
+  }
+  
+  /**
+diff --cc drivers/tty/tty_buffer.c
+index ae3ce330200e,595d8b49c745..000000000000
+--- a/drivers/tty/tty_buffer.c
++++ b/drivers/tty/tty_buffer.c
+@@@ -553,13 -561,43 +553,49 @@@ void tty_flip_buffer_push(struct tty_po
+  EXPORT_SYMBOL(tty_flip_buffer_push);
+  
+  /**
+++<<<<<<< HEAD
+ + *	tty_buffer_init		-	prepare a tty buffer structure
+ + *	@tty: tty to initialise
+++=======
++  * tty_insert_flip_string_and_push_buffer - add characters to the tty buffer and
++  *	push
++  * @port: tty port
++  * @chars: characters
++  * @size: size
++  *
++  * The function combines tty_insert_flip_string() and tty_flip_buffer_push()
++  * with the exception of properly holding the @port->lock.
++  *
++  * To be used only internally (by pty currently).
++  *
++  * Returns: the number added.
++  */
++ int tty_insert_flip_string_and_push_buffer(struct tty_port *port,
++ 		const unsigned char *chars, size_t size)
++ {
++ 	struct tty_bufhead *buf = &port->buf;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&port->lock, flags);
++ 	size = tty_insert_flip_string(port, chars, size);
++ 	if (size)
++ 		tty_flip_buffer_commit(buf->tail);
++ 	spin_unlock_irqrestore(&port->lock, flags);
++ 
++ 	queue_work(system_unbound_wq, &buf->work);
++ 
++ 	return size;
++ }
++ 
++ /**
++  * tty_buffer_init		-	prepare a tty buffer structure
++  * @port: tty port to initialise
+++>>>>>>> a501ab75e762 (tty: use new tty_insert_flip_string_and_push_buffer() in pty_write())
+   *
+ - * Set up the initial state of the buffer management for a tty device. Must be
+ - * called before the other tty buffer functions are used.
+ + *	Set up the initial state of the buffer management for a tty device.
+ + *	Must be called before the other tty buffer functions are used.
+   */
+ +
+  void tty_buffer_init(struct tty_port *port)
+  {
+  	struct tty_bufhead *buf = &port->buf;
+* Unmerged path drivers/tty/tty.h
+* Unmerged path drivers/tty/pty.c
+* Unmerged path drivers/tty/tty.h
+* Unmerged path drivers/tty/tty_buffer.c
