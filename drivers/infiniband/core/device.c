@@ -326,6 +326,7 @@ void ib_dealloc_device(struct ib_device *device)
 	WARN_ON(!list_empty(&device->client_data_list));
 	WARN_ON(refcount_read(&device->refcount));
 	rdma_restrack_clean(device);
+	/* Balances with device_initialize */
 	put_device(&device->dev);
 }
 EXPORT_SYMBOL(ib_dealloc_device);
