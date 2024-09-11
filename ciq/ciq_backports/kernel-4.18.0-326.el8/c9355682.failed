@@ -1,0 +1,248 @@
+net/mlx5: Instantiate separate mapping objects for FDB and NIC tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Chris Mi <cmi@nvidia.com>
+commit c935568271b5b25baea65ad623f146de72570cd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c9355682.failed
+
+Currently, the u32 chain id is mapped to u16 value which is stored on
+the lower 16 bits of reg_c0 for FDB and reg_b for NIC tables. The
+mapping is internally maintained by the chains object. However, with
+the introduction of reg_c0 objects the fdb may store more than just
+the chain id on reg_c0. This is not relevant for NIC tables.
+
+Separate the chains mapping instantiation for FDB and NIC tables.
+Remove the mapping from the chains object. For FDB tables, create
+the mapping per eswitch. For NIC tables, create the mapping per tc
+table. Pass the corresponding mapping pointer when creating the
+chains object.
+
+	Signed-off-by: Chris Mi <cmi@nvidia.com>
+	Reviewed-by: Oz Shlomo <ozsh@nvidia.com>
+	Reviewed-by: Mark Bloch <mbloch@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit c935568271b5b25baea65ad623f146de72570cd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+#	drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.c
+#	drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index 586484b0079a,5bedc2c4d26f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -35,10 -37,11 +35,16 @@@ mlx5_core-$(CONFIG_MLX5_EN_RXNFC)    +
+  mlx5_core-$(CONFIG_MLX5_CORE_EN_DCB) += en_dcbnl.o en/port_buffer.o
+  mlx5_core-$(CONFIG_PCI_HYPERV_INTERFACE) += en/hv_vhca_stats.o
+  mlx5_core-$(CONFIG_MLX5_ESWITCH)     += lag_mp.o lib/geneve.o lib/port_tun.o \
+- 					en_rep.o en/rep/bond.o en/mod_hdr.o
++ 					en_rep.o en/rep/bond.o en/mod_hdr.o \
++ 					en/mapping.o
+  mlx5_core-$(CONFIG_MLX5_CLS_ACT)     += en_tc.o en/rep/tc.o en/rep/neigh.o \
+++<<<<<<< HEAD
+ +					en/mapping.o lib/fs_chains.o en/tc_tun.o \
+ +					esw/indir_table.o \
+++=======
++ 					lib/fs_chains.o en/tc_tun.o \
++ 					esw/indir_table.o en/tc_tun_encap.o \
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  					en/tc_tun_vxlan.o en/tc_tun_gre.o en/tc_tun_geneve.o \
+  					en/tc_tun_mplsoudp.o diag/en_tc_tracepoint.o
+  mlx5_core-$(CONFIG_MLX5_TC_CT)	     += en/tc_ct.o
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+index 95cfd04d2d8d,1d5ce07b83f4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+@@@ -27,6 -27,9 +27,12 @@@ struct mlx5e_tc_table 
+  
+  	struct notifier_block     netdevice_nb;
+  	struct netdev_net_notifier	netdevice_nn;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct mlx5_tc_ct_priv         *ct;
++ 	struct mapping_ctx             *mapping;
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  };
+  
+  struct mlx5e_flow_table {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+index 0664a4e01bff,9b55a5c394d0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+@@@ -635,10 -639,12 +635,14 @@@ bool mlx5e_rep_tc_update_skb(struct mlx
+  	priv = netdev_priv(skb->dev);
+  	esw = priv->mdev->priv.eswitch;
+  
+++<<<<<<< HEAD
+ +	err = mlx5_get_chain_for_tag(esw_chains(esw), reg_c0, &chain);
+++=======
++ 	err = mapping_find(esw->offloads.reg_c0_obj_pool, reg_c0, &mapped_obj);
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  	if (err) {
+  		netdev_dbg(priv->netdev,
+ -			   "Couldn't find mapped object for reg_c0: %d, err: %d\n",
+ +			   "Couldn't find chain for chain tag: %d, err: %d\n",
+  			   reg_c0, err);
+  		return false;
+  	}
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index 8d4d2686ea65,c938215c8fbc..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -5210,9 -4760,8 +5219,12 @@@ int mlx5e_tc_nic_init(struct mlx5e_pri
+  	attr.ns = MLX5_FLOW_NAMESPACE_KERNEL;
+  	attr.max_ft_sz = mlx5e_tc_nic_get_ft_size(dev);
+  	attr.max_grp_num = MLX5E_TC_TABLE_NUM_GROUPS;
+++<<<<<<< HEAD
+ +	attr.default_ft = priv->fs.vlan.ft.t;
+++=======
++ 	attr.default_ft = mlx5e_vlan_get_flowtable(priv->fs.vlan);
++ 	attr.mapping = chains_mapping;
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  
+  	tc->chains = mlx5_chains_create(dev, &attr);
+  	if (IS_ERR(tc->chains)) {
+@@@ -5233,8 -4785,11 +5245,10 @@@
+  	return 0;
+  
+  err_reg:
+ -	mlx5_tc_ct_clean(tc->ct);
+  	mlx5_chains_destroy(tc->chains);
+  err_chains:
++ 	mapping_destroy(chains_mapping);
++ err_mapping:
+  	rhashtable_destroy(&tc->ht);
+  	return err;
+  }
+@@@ -5268,6 -4823,8 +5282,11 @@@ void mlx5e_tc_nic_cleanup(struct mlx5e_
+  	}
+  	mutex_destroy(&tc->t_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	mlx5_tc_ct_clean(tc->ct);
++ 	mapping_destroy(tc->mapping);
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  	mlx5_chains_destroy(tc->chains);
+  }
+  
+@@@ -5415,7 -4992,7 +5434,11 @@@ bool mlx5e_tc_update_skb(struct mlx5_cq
+  
+  	chain_tag = reg_b & MLX5E_TC_TABLE_CHAIN_TAG_MASK;
+  
+++<<<<<<< HEAD
+ +	err = mlx5_get_chain_for_tag(nic_chains(priv), chain_tag, &chain);
+++=======
++ 	err = mapping_find(tc->mapping, chain_tag, &mapped_obj);
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  	if (err) {
+  		netdev_dbg(priv->netdev,
+  			   "Couldn't find chain for chain tag: %d, err: %d\n",
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index ff63d3681390,510e9b8b24fe..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1151,7 -1429,7 +1152,11 @@@ esw_chains_create(struct mlx5_eswitch *
+  	attr.max_ft_sz = fdb_max;
+  	attr.max_grp_num = esw->params.large_group_num;
+  	attr.default_ft = miss_fdb;
+++<<<<<<< HEAD
+ +	attr.max_restore_tag = esw_get_max_restore_tag(esw);
+++=======
++ 	attr.mapping = esw->offloads.reg_c0_obj_pool;
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  
+  	chains = mlx5_chains_create(dev, &attr);
+  	if (IS_ERR(chains)) {
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.c
+index 381325b4a863,00ef10a1a9f8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.c
+@@@ -832,14 -826,6 +826,17 @@@ mlx5_chains_init(struct mlx5_core_dev *
+  	if (err)
+  		goto init_prios_ht_err;
+  
+++<<<<<<< HEAD
+ +	mapping = mapping_create(sizeof(u32), attr->max_restore_tag,
+ +				 true);
+ +	if (IS_ERR(mapping)) {
+ +		err = PTR_ERR(mapping);
+ +		goto mapping_err;
+ +	}
+ +	chains_mapping(chains_priv) = mapping;
+ +
+++=======
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  	mutex_init(&chains_lock(chains_priv));
+  
+  	return chains_priv;
+@@@ -890,19 -878,7 +884,22 @@@ mlx5_chains_get_chain_mapping(struct ml
+  int
+  mlx5_chains_put_chain_mapping(struct mlx5_fs_chains *chains, u32 chain_mapping)
+  {
+ -	struct mapping_ctx *ctx = chains->chains_mapping;
+ +	return mapping_remove(chains_mapping(chains), chain_mapping);
+ +}
+++<<<<<<< HEAD
+ +
+ +int mlx5_get_chain_for_tag(struct mlx5_fs_chains *chains, u32 tag,
+ +			   u32 *chain)
+ +{
+ +	int err;
+  
+ -	return mapping_remove(ctx, chain_mapping);
+ +	err = mapping_find(chains_mapping(chains), tag, chain);
+ +	if (err) {
+ +		mlx5_core_warn(chains->dev, "Can't find chain for tag: %d\n", tag);
+ +		return -ENOENT;
+ +	}
+ +
+ +	return 0;
+  }
+++=======
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.h
+index 6d5be31b05dd,e96f345e7dae..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.h
+@@@ -63,9 -64,6 +63,12 @@@ struct mlx5_fs_chains 
+  mlx5_chains_create(struct mlx5_core_dev *dev, struct mlx5_chains_attr *attr);
+  void mlx5_chains_destroy(struct mlx5_fs_chains *chains);
+  
+++<<<<<<< HEAD
+ +int
+ +mlx5_get_chain_for_tag(struct mlx5_fs_chains *chains, u32 tag, u32 *chain);
+ +
+++=======
+++>>>>>>> c935568271b5 (net/mlx5: Instantiate separate mapping objects for FDB and NIC tables)
+  void
+  mlx5_chains_set_end_ft(struct mlx5_fs_chains *chains,
+  		       struct mlx5_flow_table *ft);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/fs.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 451410599bb1..ac7dd9005060 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -203,6 +203,7 @@ struct mlx5_esw_offload {
+ 	struct mlx5_flow_table *ft_offloads_restore;
+ 	struct mlx5_flow_group *restore_group;
+ 	struct mlx5_modify_hdr *restore_copy_hdr_id;
++	struct mapping_ctx *reg_c0_obj_pool;
+ 
+ 	struct mlx5_flow_table *ft_offloads;
+ 	struct mlx5_flow_group *vport_rx_group;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/lib/fs_chains.h
