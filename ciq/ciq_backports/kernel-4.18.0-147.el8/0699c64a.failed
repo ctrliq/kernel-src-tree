@@ -1,0 +1,134 @@
+x86/kvm/mmu: reset MMU context when 32-bit guest switches PAE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 0699c64a4be6e4a6137240379a1f82c752e663d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0699c64a.failed
+
+Commit 47c42e6b4192 ("KVM: x86: fix handling of role.cr4_pae and rename it
+to 'gpte_size'") introduced a regression: 32-bit PAE guests stopped
+working. The issue appears to be: when guest switches (enables) PAE we need
+to re-initialize MMU context (set context->root_level, do
+reset_rsvds_bits_mask(), ...) but init_kvm_tdp_mmu() doesn't do that
+because we threw away is_pae(vcpu) flag from mmu role. Restore it to
+kvm_mmu_extended_role (as we now don't need it in base role) to fix
+the issue.
+
+Fixes: 47c42e6b4192 ("KVM: x86: fix handling of role.cr4_pae and rename it to 'gpte_size'")
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0699c64a4be6e4a6137240379a1f82c752e663d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/mmu.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 713d2728dca5,c79abe7ca093..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -284,7 -284,25 +284,22 @@@ union kvm_mmu_page_role 
+  };
+  
+  union kvm_mmu_extended_role {
+ -/*
+ - * This structure complements kvm_mmu_page_role caching everything needed for
+ - * MMU configuration. If nothing in both these structures changed, MMU
+ - * re-configuration can be skipped. @valid bit is set on first usage so we don't
+ - * treat all-zero structure as valid data.
+ - */
+  	u32 word;
+++<<<<<<< HEAD
+++=======
++ 	struct {
++ 		unsigned int valid:1;
++ 		unsigned int execonly:1;
++ 		unsigned int cr0_pg:1;
++ 		unsigned int cr4_pae:1;
++ 		unsigned int cr4_pse:1;
++ 		unsigned int cr4_pke:1;
++ 		unsigned int cr4_smap:1;
++ 		unsigned int cr4_smep:1;
++ 		unsigned int cr4_la57:1;
++ 		unsigned int maxphyaddr:6;
++ 	};
+++>>>>>>> 0699c64a4be6 (x86/kvm/mmu: reset MMU context when 32-bit guest switches PAE)
+  };
+  
+  union kvm_mmu_role {
+diff --cc arch/x86/kvm/mmu.c
+index 81538c96463f,d9c7b45d231f..000000000000
+--- a/arch/x86/kvm/mmu.c
++++ b/arch/x86/kvm/mmu.c
+@@@ -4763,17 -4776,52 +4763,62 @@@ static void paging32E_init_context(stru
+  	paging64_init_context_common(vcpu, context, PT32E_ROOT_LEVEL);
+  }
+  
+ -static union kvm_mmu_extended_role kvm_calc_mmu_role_ext(struct kvm_vcpu *vcpu)
+ -{
+ -	union kvm_mmu_extended_role ext = {0};
+ -
+ +static union kvm_mmu_page_role
+ +kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu)
+ +{
+ +	union kvm_mmu_page_role role = {0};
+ +
+++<<<<<<< HEAD
+ +	role.guest_mode = is_guest_mode(vcpu);
+ +	role.smm = is_smm(vcpu);
+ +	role.ad_disabled = (shadow_accessed_mask == 0);
+ +	role.level = kvm_x86_ops->get_tdp_level(vcpu);
+ +	role.direct = true;
+ +	role.access = ACC_ALL;
+++=======
++ 	ext.cr0_pg = !!is_paging(vcpu);
++ 	ext.cr4_pae = !!is_pae(vcpu);
++ 	ext.cr4_smep = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMEP);
++ 	ext.cr4_smap = !!kvm_read_cr4_bits(vcpu, X86_CR4_SMAP);
++ 	ext.cr4_pse = !!is_pse(vcpu);
++ 	ext.cr4_pke = !!kvm_read_cr4_bits(vcpu, X86_CR4_PKE);
++ 	ext.cr4_la57 = !!kvm_read_cr4_bits(vcpu, X86_CR4_LA57);
++ 	ext.maxphyaddr = cpuid_maxphyaddr(vcpu);
++ 
++ 	ext.valid = 1;
++ 
++ 	return ext;
++ }
++ 
++ static union kvm_mmu_role kvm_calc_mmu_role_common(struct kvm_vcpu *vcpu,
++ 						   bool base_only)
++ {
++ 	union kvm_mmu_role role = {0};
++ 
++ 	role.base.access = ACC_ALL;
++ 	role.base.nxe = !!is_nx(vcpu);
++ 	role.base.cr0_wp = is_write_protection(vcpu);
++ 	role.base.smm = is_smm(vcpu);
++ 	role.base.guest_mode = is_guest_mode(vcpu);
++ 
++ 	if (base_only)
++ 		return role;
++ 
++ 	role.ext = kvm_calc_mmu_role_ext(vcpu);
++ 
++ 	return role;
++ }
++ 
++ static union kvm_mmu_role
++ kvm_calc_tdp_mmu_root_page_role(struct kvm_vcpu *vcpu, bool base_only)
++ {
++ 	union kvm_mmu_role role = kvm_calc_mmu_role_common(vcpu, base_only);
++ 
++ 	role.base.ad_disabled = (shadow_accessed_mask == 0);
++ 	role.base.level = kvm_x86_ops->get_tdp_level(vcpu);
++ 	role.base.direct = true;
++ 	role.base.gpte_is_8_bytes = true;
+++>>>>>>> 0699c64a4be6 (x86/kvm/mmu: reset MMU context when 32-bit guest switches PAE)
+  
+  	return role;
+  }
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/mmu.c
