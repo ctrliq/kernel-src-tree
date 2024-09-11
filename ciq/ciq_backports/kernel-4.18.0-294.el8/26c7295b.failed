@@ -1,0 +1,67 @@
+kthread: Do not preempt current task if it is going to call schedule()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Liang Chen <cl@rock-chips.com>
+commit 26c7295be0c5e6da3fa45970e9748be983175b1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/26c7295b.failed
+
+when we create a kthread with ktrhead_create_on_cpu(),the child thread
+entry is ktread.c:ktrhead() which will be preempted by the parent after
+call complete(done) while schedule() is not called yet,then the parent
+will call wait_task_inactive(child) but the child is still on the runqueue,
+so the parent will schedule_hrtimeout() for 1 jiffy,it will waste a lot of
+time,especially on startup.
+
+  parent                             child
+ktrhead_create_on_cpu()
+  wait_fo_completion(&done) -----> ktread.c:ktrhead()
+                             |----- complete(done);--wakeup and preempted by parent
+ kthread_bind() <------------|  |-> schedule();--dequeue here
+  wait_task_inactive(child)     |
+   schedule_hrtimeout(1 jiffy) -|
+
+So we hope the child just wakeup parent but not preempted by parent, and the
+child is going to call schedule() soon,then the parent will not call
+schedule_hrtimeout(1 jiffy) as the child is already dequeue.
+
+The same issue for ktrhead_park()&&kthread_parkme().
+This patch can save 120ms on rk312x startup with CONFIG_HZ=300.
+
+	Signed-off-by: Liang Chen <cl@rock-chips.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+Link: https://lkml.kernel.org/r/20200306070133.18335-2-cl@rock-chips.com
+(cherry picked from commit 26c7295be0c5e6da3fa45970e9748be983175b1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/kthread.c
+diff --cc kernel/kthread.c
+index 5c6e3c68ea09,bfbfa481be3a..000000000000
+--- a/kernel/kthread.c
++++ b/kernel/kthread.c
+@@@ -240,8 -199,15 +240,20 @@@ static void __kthread_parkme(struct kth
+  		if (!test_bit(KTHREAD_SHOULD_PARK, &self->flags))
+  			break;
+  
+++<<<<<<< HEAD
+ +		complete_all(&self->parked);
+ +		schedule();
+++=======
++ 		/*
++ 		 * Thread is going to call schedule(), do not preempt it,
++ 		 * or the caller of kthread_park() may spend more time in
++ 		 * wait_task_inactive().
++ 		 */
++ 		preempt_disable();
++ 		complete(&self->parked);
++ 		schedule_preempt_disabled();
++ 		preempt_enable();
+++>>>>>>> 26c7295be0c5 (kthread: Do not preempt current task if it is going to call schedule())
+  	}
+  	__set_current_state(TASK_RUNNING);
+  }
+* Unmerged path kernel/kthread.c
