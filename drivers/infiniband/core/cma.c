@@ -4914,6 +4914,17 @@ static void cma_process_remove(struct cma_device *cma_dev)
 	wait_for_completion(&cma_dev->comp);
 }
 
+static bool cma_supported(struct ib_device *device)
+{
+	u32 i;
+
+	rdma_for_each_port(device, i) {
+		if (rdma_cap_ib_cm(device, i) || rdma_cap_iw_cm(device, i))
+			return true;
+	}
+	return false;
+}
+
 static int cma_add_one(struct ib_device *device)
 {
 	struct rdma_id_private *to_destroy;
@@ -4922,6 +4933,9 @@ static int cma_add_one(struct ib_device *device)
 	unsigned int i;
 	unsigned long supported_gids = 0;
 	int ret;
+
+	if (!cma_supported(device))
+		return -EOPNOTSUPP;
 
 	cma_dev = kmalloc(sizeof(*cma_dev), GFP_KERNEL);
 	if (!cma_dev)
