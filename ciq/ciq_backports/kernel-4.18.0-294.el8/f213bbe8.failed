@@ -1,0 +1,146 @@
+net: stmmac: Integrate it with DesignWare XPCS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jose Abreu <Jose.Abreu@synopsys.com>
+commit f213bbe8a9d6ba1d0adf424787c02f361ea78c38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f213bbe8.failed
+
+Adds all the necessary logic so that stmmac can be used with Synopsys
+DesignWare XPCS.
+
+	Signed-off-by: Jose Abreu <Jose.Abreu@synopsys.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f213bbe8a9d6ba1d0adf424787c02f361ea78c38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 55e88ad23227,f26699d9a050..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@@ -873,12 -863,18 +873,22 @@@ static void stmmac_validate(struct phyl
+  
+  	linkmode_and(state->advertising, state->advertising, mac_supported);
+  	linkmode_andnot(state->advertising, state->advertising, mask);
++ 
++ 	/* If PCS is supported, check which modes it supports. */
++ 	stmmac_xpcs_validate(priv, &priv->hw->xpcs_args, supported, state);
+  }
+  
+ -static void stmmac_mac_pcs_get_state(struct phylink_config *config,
+ -				     struct phylink_link_state *state)
+ +static int stmmac_mac_link_state(struct phylink_config *config,
+ +				 struct phylink_link_state *state)
+  {
+++<<<<<<< HEAD
+ +	return -EOPNOTSUPP;
+++=======
++ 	struct stmmac_priv *priv = netdev_priv(to_net_dev(config->dev));
++ 
++ 	state->link = 0;
++ 	stmmac_xpcs_get_state(priv, &priv->hw->xpcs_args, state);
+++>>>>>>> f213bbe8a9d6 (net: stmmac: Integrate it with DesignWare XPCS)
+  }
+  
+  static void stmmac_mac_config(struct phylink_config *config, unsigned int mode,
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+index 8f13100e22ab,b2a707e2ef43..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+@@@ -392,7 -382,17 +392,21 @@@ int stmmac_mdio_register(struct net_dev
+  		max_addr = PHY_MAX_ADDR;
+  	}
+  
+++<<<<<<< HEAD
+ +	new_bus->reset = &stmmac_mdio_reset;
+++=======
++ 	if (mdio_bus_data->has_xpcs) {
++ 		priv->hw->xpcs = mdio_xpcs_get_ops();
++ 		if (!priv->hw->xpcs) {
++ 			err = -ENODEV;
++ 			goto bus_register_fail;
++ 		}
++ 	}
++ 
++ 	if (mdio_bus_data->needs_reset)
++ 		new_bus->reset = &stmmac_mdio_reset;
++ 
+++>>>>>>> f213bbe8a9d6 (net: stmmac: Integrate it with DesignWare XPCS)
+  	snprintf(new_bus->id, MII_BUS_ID_SIZE, "%s-%x",
+  		 new_bus->name, priv->plat->bus_id);
+  	new_bus->priv = ndev;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/Kconfig b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+index fe9e7ddadaea..95fb685d59c1 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/Kconfig
++++ b/drivers/net/ethernet/stmicro/stmmac/Kconfig
+@@ -2,6 +2,7 @@ config STMMAC_ETH
+ 	tristate "STMicroelectronics Multi-Gigabit Ethernet driver"
+ 	depends on HAS_IOMEM && HAS_DMA
+ 	select MII
++	select MDIO_XPCS
+ 	select PAGE_POOL
+ 	select PHYLINK
+ 	select CRC32
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 41eb39add60e..eca20cfa1c75 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -25,6 +25,7 @@
+ #include <linux/netdevice.h>
+ #include <linux/stmmac.h>
+ #include <linux/phy.h>
++#include <linux/mdio-xpcs.h>
+ #include <linux/module.h>
+ #if IS_ENABLED(CONFIG_VLAN_8021Q)
+ #define STMMAC_VLAN_TAG_USED
+@@ -448,6 +449,8 @@ struct mac_device_info {
+ 	const struct stmmac_hwtimestamp *ptp;
+ 	const struct stmmac_tc_ops *tc;
+ 	const struct stmmac_mmc_ops *mmc;
++	const struct mdio_xpcs_ops *xpcs;
++	struct mdio_xpcs_args xpcs_args;
+ 	struct mii_regs mii;	/* MII register Addresses */
+ 	struct mac_link link;
+ 	void __iomem *pcsr;     /* vpointer to device CSRs */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/hwif.h b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+index 59108f05df14..97bca1af282b 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/hwif.h
++++ b/drivers/net/ethernet/stmicro/stmmac/hwif.h
+@@ -524,6 +524,18 @@ struct stmmac_mmc_ops {
+ #define stmmac_mmc_read(__priv, __args...) \
+ 	stmmac_do_void_callback(__priv, mmc, read, __args)
+ 
++/* XPCS callbacks */
++#define stmmac_xpcs_validate(__priv, __args...) \
++	stmmac_do_callback(__priv, xpcs, validate, __args)
++#define stmmac_xpcs_config(__priv, __args...) \
++	stmmac_do_callback(__priv, xpcs, config, __args)
++#define stmmac_xpcs_get_state(__priv, __args...) \
++	stmmac_do_callback(__priv, xpcs, get_state, __args)
++#define stmmac_xpcs_link_up(__priv, __args...) \
++	stmmac_do_callback(__priv, xpcs, link_up, __args)
++#define stmmac_xpcs_probe(__priv, __args...) \
++	stmmac_do_callback(__priv, xpcs, probe, __args)
++
+ struct stmmac_regs_off {
+ 	u32 ptp_off;
+ 	u32 mmc_off;
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_mdio.c
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index 7bba6bd261ea..c61d06e9535f 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -93,6 +93,7 @@
+ 
+ struct stmmac_mdio_bus_data {
+ 	unsigned int phy_mask;
++	unsigned int has_xpcs;
+ 	int *irqs;
+ 	int probed_phy_irq;
+ };
