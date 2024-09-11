@@ -332,7 +332,7 @@ static unsigned long vtime_delta(struct task_struct *tsk,
 	return stime;
 }
 
-void vtime_account_system(struct task_struct *tsk)
+void vtime_account_kernel(struct task_struct *tsk)
 {
 	unsigned long stime, stime_scaled, steal_time;
 	struct cpu_accounting_data *acct = get_accounting(tsk);
@@ -356,7 +356,7 @@ void vtime_account_system(struct task_struct *tsk)
 		acct->stime_scaled += stime_scaled;
 	}
 }
-EXPORT_SYMBOL_GPL(vtime_account_system);
+EXPORT_SYMBOL_GPL(vtime_account_kernel);
 
 void vtime_account_idle(struct task_struct *tsk)
 {
@@ -370,7 +370,7 @@ void vtime_account_idle(struct task_struct *tsk)
 /*
  * Account the whole cputime accumulated in the paca
  * Must be called with interrupts disabled.
- * Assumes that vtime_account_system/idle() has been called
+ * Assumes that vtime_account_kernel/idle() has been called
  * recently (i.e. since the last entry from usermode) so that
  * get_paca()->user_time_scaled is up to date.
  */
