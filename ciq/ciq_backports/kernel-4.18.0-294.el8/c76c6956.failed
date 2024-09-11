@@ -1,0 +1,140 @@
+mptcp: call tcp_cleanup_rbuf on subflows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit c76c6956566f974bac2470bd72fc22fb923e04a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c76c6956.failed
+
+That is needed to let the subflows announce promptly when new
+space is available in the receive buffer.
+
+tcp_cleanup_rbuf() is currently a static function, drop the
+scope modifier and add a declaration in the TCP header.
+
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c76c6956566f974bac2470bd72fc22fb923e04a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tcp.h
+#	net/mptcp/protocol.c
+#	net/mptcp/subflow.c
+diff --cc include/net/tcp.h
+index d6452423770b,852f0d71dd40..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -1398,7 -1411,22 +1398,26 @@@ static inline int tcp_space(const struc
+  
+  static inline int tcp_full_space(const struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	return tcp_win_from_space(sk, sk->sk_rcvbuf);
+++=======
++ 	return tcp_win_from_space(sk, READ_ONCE(sk->sk_rcvbuf));
++ }
++ 
++ void tcp_cleanup_rbuf(struct sock *sk, int copied);
++ 
++ /* We provision sk_rcvbuf around 200% of sk_rcvlowat.
++  * If 87.5 % (7/8) of the space has been consumed, we want to override
++  * SO_RCVLOWAT constraint, since we are receiving skbs with too small
++  * len/truesize ratio.
++  */
++ static inline bool tcp_rmem_pressure(const struct sock *sk)
++ {
++ 	int rcvbuf = READ_ONCE(sk->sk_rcvbuf);
++ 	int threshold = rcvbuf - (rcvbuf >> 3);
++ 
++ 	return atomic_read(&sk->sk_rmem_alloc) > threshold;
+++>>>>>>> c76c6956566f (mptcp: call tcp_cleanup_rbuf on subflows)
+  }
+  
+  extern void tcp_openreq_init_rwin(struct request_sock *req,
+diff --cc net/mptcp/protocol.c
+index 691a71ca323f,ef0dd2f23482..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -403,16 -514,9 +403,22 @@@ static bool __mptcp_move_skbs_from_subf
+  		}
+  	} while (more_data_avail);
+  
+++<<<<<<< HEAD
+ +	*bytes = moved;
+ +
+ +	/* If the moves have caught up with the DATA_FIN sequence number
+ +	 * it's time to ack the DATA_FIN and change socket state, but
+ +	 * this is not a good place to change state. Let the workqueue
+ +	 * do it.
+ +	 */
+ +	if (mptcp_pending_data_fin(sk, NULL) &&
+ +	    schedule_work(&msk->work))
+ +		sock_hold(sk);
+++=======
++ 	*bytes += moved;
++ 	if (moved)
++ 		tcp_cleanup_rbuf(ssk, moved);
+++>>>>>>> c76c6956566f (mptcp: call tcp_cleanup_rbuf on subflows)
+  
+  	return done;
+  }
+diff --cc net/mptcp/subflow.c
+index 825e0c8e0ea5,a2ae3087e24d..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -769,16 -806,25 +769,29 @@@ validate_seq
+  	return MAPPING_OK;
+  }
+  
+ -static void mptcp_subflow_discard_data(struct sock *ssk, struct sk_buff *skb,
+ -				       unsigned int limit)
+ +static int subflow_read_actor(read_descriptor_t *desc,
+ +			      struct sk_buff *skb,
+ +			      unsigned int offset, size_t len)
+  {
+ -	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ -	bool fin = TCP_SKB_CB(skb)->tcp_flags & TCPHDR_FIN;
+ -	u32 incr;
+ +	size_t copy_len = min(desc->count, len);
+  
+ -	incr = limit >= skb->len ? skb->len + fin : limit;
+ +	desc->count -= copy_len;
+  
+++<<<<<<< HEAD
+ +	pr_debug("flushed %zu bytes, %zu left", copy_len, desc->count);
+ +	return copy_len;
+++=======
++ 	pr_debug("discarding=%d len=%d seq=%d", incr, skb->len,
++ 		 subflow->map_subflow_seq);
++ 	MPTCP_INC_STATS(sock_net(ssk), MPTCP_MIB_DUPDATA);
++ 	tcp_sk(ssk)->copied_seq += incr;
++ 	if (!before(tcp_sk(ssk)->copied_seq, TCP_SKB_CB(skb)->end_seq))
++ 		sk_eat_skb(ssk, skb);
++ 	if (mptcp_subflow_get_map_offset(subflow) >= subflow->map_data_len)
++ 		subflow->map_valid = 0;
++ 	if (incr)
++ 		tcp_cleanup_rbuf(ssk, incr);
+++>>>>>>> c76c6956566f (mptcp: call tcp_cleanup_rbuf on subflows)
+  }
+  
+  static bool subflow_check_data_avail(struct sock *ssk)
+* Unmerged path include/net/tcp.h
+diff --git a/net/ipv4/tcp.c b/net/ipv4/tcp.c
+index 073cd93d21d0..cb53fbca6620 100644
+--- a/net/ipv4/tcp.c
++++ b/net/ipv4/tcp.c
+@@ -1544,7 +1544,7 @@ static int tcp_peek_sndq(struct sock *sk, struct msghdr *msg, int len)
+  * calculation of whether or not we must ACK for the sake of
+  * a window update.
+  */
+-static void tcp_cleanup_rbuf(struct sock *sk, int copied)
++void tcp_cleanup_rbuf(struct sock *sk, int copied)
+ {
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	bool time_to_ack = false;
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/subflow.c
