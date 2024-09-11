@@ -1,0 +1,873 @@
+block: rename __bio_add_pc_page to bio_add_hw_page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit e4581105771b3523ced88f781eb2672195d217aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e4581105.failed
+
+Rename __bio_add_pc_page() to bio_add_hw_page() and explicitly pass in a
+max_sectors argument.
+
+This max_sectors argument can be used to specify constraints from the
+hardware.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+[ jth: rebased and made public for blk-map.c ]
+	Signed-off-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e4581105771b3523ced88f781eb2672195d217aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bio.c
+#	block/blk-map.c
+#	block/blk.h
+diff --cc block/bio.c
+index b2a160185268,aad0a6dad4f9..000000000000
+--- a/block/bio.c
++++ b/block/bio.c
+@@@ -745,56 -723,87 +745,123 @@@ struct bio *bio_clone_fast(struct bio *
+  }
+  EXPORT_SYMBOL(bio_clone_fast);
+  
+++<<<<<<< HEAD
+ +/**
+ + *	bio_add_pc_page	-	attempt to add page to bio
+ + *	@q: the target queue
+ + *	@bio: destination bio
+ + *	@page: page to add
+ + *	@len: vec entry length
+ + *	@offset: vec entry offset
+ + *
+ + *	Attempt to add a page to the bio_vec maplist. This can fail for a
+ + *	number of reasons, such as the bio being full or target block device
+ + *	limitations. The target block device must allow bio's up to PAGE_SIZE,
+ + *	so it is always possible to add a single page to an empty bio.
+ + *
+ + *	This should only be used by REQ_PC bios.
+ + */
+ +int bio_add_pc_page(struct request_queue *q, struct bio *bio, struct page
+ +		    *page, unsigned int len, unsigned int offset)
+++=======
++ const char *bio_devname(struct bio *bio, char *buf)
++ {
++ 	return disk_name(bio->bi_disk, bio->bi_partno, buf);
++ }
++ EXPORT_SYMBOL(bio_devname);
++ 
++ static inline bool page_is_mergeable(const struct bio_vec *bv,
++ 		struct page *page, unsigned int len, unsigned int off,
++ 		bool *same_page)
++ {
++ 	phys_addr_t vec_end_addr = page_to_phys(bv->bv_page) +
++ 		bv->bv_offset + bv->bv_len - 1;
++ 	phys_addr_t page_addr = page_to_phys(page);
++ 
++ 	if (vec_end_addr + 1 != page_addr + off)
++ 		return false;
++ 	if (xen_domain() && !xen_biovec_phys_mergeable(bv, page))
++ 		return false;
++ 
++ 	*same_page = ((vec_end_addr & PAGE_MASK) == page_addr);
++ 	if (!*same_page && pfn_to_page(PFN_DOWN(vec_end_addr)) + 1 != page)
++ 		return false;
++ 	return true;
++ }
++ 
++ /*
++  * Try to merge a page into a segment, while obeying the hardware segment
++  * size limit.  This is not for normal read/write bios, but for passthrough
++  * or Zone Append operations that we can't split.
++  */
++ static bool bio_try_merge_hw_seg(struct request_queue *q, struct bio *bio,
++ 				 struct page *page, unsigned len,
++ 				 unsigned offset, bool *same_page)
++ {
++ 	struct bio_vec *bv = &bio->bi_io_vec[bio->bi_vcnt - 1];
++ 	unsigned long mask = queue_segment_boundary(q);
++ 	phys_addr_t addr1 = page_to_phys(bv->bv_page) + bv->bv_offset;
++ 	phys_addr_t addr2 = page_to_phys(page) + offset + len - 1;
++ 
++ 	if ((addr1 | mask) != (addr2 | mask))
++ 		return false;
++ 	if (bv->bv_len + len > queue_max_segment_size(q))
++ 		return false;
++ 	return __bio_try_merge_page(bio, page, len, offset, same_page);
++ }
++ 
++ /**
++  * bio_add_hw_page - attempt to add a page to a bio with hw constraints
++  * @q: the target queue
++  * @bio: destination bio
++  * @page: page to add
++  * @len: vec entry length
++  * @offset: vec entry offset
++  * @max_sectors: maximum number of sectors that can be added
++  * @same_page: return if the segment has been merged inside the same page
++  *
++  * Add a page to a bio while respecting the hardware max_sectors, max_segment
++  * and gap limitations.
++  */
++ int bio_add_hw_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset,
++ 		unsigned int max_sectors, bool *same_page)
+++>>>>>>> e4581105771b (block: rename __bio_add_pc_page to bio_add_hw_page)
+  {
+ +	int retried_segments = 0;
+  	struct bio_vec *bvec;
+  
+- 	/*
+- 	 * cloned bio must not modify vec list
+- 	 */
+- 	if (unlikely(bio_flagged(bio, BIO_CLONED)))
++ 	if (WARN_ON_ONCE(bio_flagged(bio, BIO_CLONED)))
+  		return 0;
+  
+- 	if (((bio->bi_iter.bi_size + len) >> 9) > queue_max_hw_sectors(q))
++ 	if (((bio->bi_iter.bi_size + len) >> 9) > max_sectors)
+  		return 0;
+  
+ +	/*
+ +	 * For filesystems with a blocksize smaller than the pagesize
+ +	 * we will often be called with the same page as last time and
+ +	 * a consecutive offset.  Optimize this special case.
+ +	 */
+  	if (bio->bi_vcnt > 0) {
+++<<<<<<< HEAD
+ +		struct bio_vec *prev = &bio->bi_io_vec[bio->bi_vcnt - 1];
+ +
+ +		if (page == prev->bv_page &&
+ +		    offset == prev->bv_offset + prev->bv_len) {
+ +			prev->bv_len += len;
+ +			bio->bi_iter.bi_size += len;
+ +			goto done;
+ +		}
+++=======
++ 		if (bio_try_merge_hw_seg(q, bio, page, len, offset, same_page))
++ 			return len;
+++>>>>>>> e4581105771b (block: rename __bio_add_pc_page to bio_add_hw_page)
+  
+  		/*
+ -		 * If the queue doesn't support SG gaps and adding this segment
+ -		 * would create a gap, disallow it.
+ +		 * If the queue doesn't support SG gaps and adding this
+ +		 * offset would create a gap, disallow it.
+  		 */
+ -		bvec = &bio->bi_io_vec[bio->bi_vcnt - 1];
+ -		if (bvec_gap_to_prev(q, bvec, offset))
+ +		if (bvec_gap_to_prev(q, prev, offset))
+  			return 0;
+  	}
+  
+@@@ -810,38 -818,31 +877,62 @@@
+  	bvec->bv_len = len;
+  	bvec->bv_offset = offset;
+  	bio->bi_vcnt++;
+ +	bio->bi_phys_segments++;
+  	bio->bi_iter.bi_size += len;
+ +
+++<<<<<<< HEAD
+ +	/*
+ +	 * Perform a recount if the number of segments is greater
+ +	 * than queue_max_segments(q).
+ +	 */
+ +
+ +	while (bio->bi_phys_segments > queue_max_segments(q)) {
+ +
+ +		if (retried_segments)
+ +			goto failed;
+ +
+ +		retried_segments = 1;
+ +		blk_recount_segments(q, bio);
+ +	}
+ +
+ +	/* If we may be able to merge these biovecs, force a recount */
+ +	if (bio->bi_vcnt > 1 && biovec_phys_mergeable(q, bvec - 1, bvec))
+ +		bio_clear_flag(bio, BIO_SEG_VALID);
+ +
+ + done:
+  	return len;
+ -}
+  
+ + failed:
+ +	bvec->bv_page = NULL;
+ +	bvec->bv_len = 0;
+ +	bvec->bv_offset = 0;
+ +	bio->bi_vcnt--;
+ +	bio->bi_iter.bi_size -= len;
+ +	blk_recount_segments(q, bio);
+ +	return 0;
+++=======
++ /**
++  * bio_add_pc_page	- attempt to add page to passthrough bio
++  * @q: the target queue
++  * @bio: destination bio
++  * @page: page to add
++  * @len: vec entry length
++  * @offset: vec entry offset
++  *
++  * Attempt to add a page to the bio_vec maplist. This can fail for a
++  * number of reasons, such as the bio being full or target block device
++  * limitations. The target block device must allow bio's up to PAGE_SIZE,
++  * so it is always possible to add a single page to an empty bio.
++  *
++  * This should only be used by passthrough bios.
++  */
++ int bio_add_pc_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset)
++ {
++ 	bool same_page = false;
++ 	return bio_add_hw_page(q, bio, page, len, offset,
++ 			queue_max_hw_sectors(q), &same_page);
+++>>>>>>> e4581105771b (block: rename __bio_add_pc_page to bio_add_hw_page)
+  }
+  EXPORT_SYMBOL(bio_add_pc_page);
+  
+diff --cc block/blk-map.c
+index 4965202958ac,e3e4ac48db45..000000000000
+--- a/block/blk-map.c
++++ b/block/blk-map.c
+@@@ -11,6 -11,515 +11,518 @@@
+  
+  #include "blk.h"
+  
+++<<<<<<< HEAD
+++=======
++ struct bio_map_data {
++ 	int is_our_pages;
++ 	struct iov_iter iter;
++ 	struct iovec iov[];
++ };
++ 
++ static struct bio_map_data *bio_alloc_map_data(struct iov_iter *data,
++ 					       gfp_t gfp_mask)
++ {
++ 	struct bio_map_data *bmd;
++ 
++ 	if (data->nr_segs > UIO_MAXIOV)
++ 		return NULL;
++ 
++ 	bmd = kmalloc(struct_size(bmd, iov, data->nr_segs), gfp_mask);
++ 	if (!bmd)
++ 		return NULL;
++ 	memcpy(bmd->iov, data->iov, sizeof(struct iovec) * data->nr_segs);
++ 	bmd->iter = *data;
++ 	bmd->iter.iov = bmd->iov;
++ 	return bmd;
++ }
++ 
++ /**
++  * bio_copy_from_iter - copy all pages from iov_iter to bio
++  * @bio: The &struct bio which describes the I/O as destination
++  * @iter: iov_iter as source
++  *
++  * Copy all pages from iov_iter to bio.
++  * Returns 0 on success, or error on failure.
++  */
++ static int bio_copy_from_iter(struct bio *bio, struct iov_iter *iter)
++ {
++ 	struct bio_vec *bvec;
++ 	struct bvec_iter_all iter_all;
++ 
++ 	bio_for_each_segment_all(bvec, bio, iter_all) {
++ 		ssize_t ret;
++ 
++ 		ret = copy_page_from_iter(bvec->bv_page,
++ 					  bvec->bv_offset,
++ 					  bvec->bv_len,
++ 					  iter);
++ 
++ 		if (!iov_iter_count(iter))
++ 			break;
++ 
++ 		if (ret < bvec->bv_len)
++ 			return -EFAULT;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * bio_copy_to_iter - copy all pages from bio to iov_iter
++  * @bio: The &struct bio which describes the I/O as source
++  * @iter: iov_iter as destination
++  *
++  * Copy all pages from bio to iov_iter.
++  * Returns 0 on success, or error on failure.
++  */
++ static int bio_copy_to_iter(struct bio *bio, struct iov_iter iter)
++ {
++ 	struct bio_vec *bvec;
++ 	struct bvec_iter_all iter_all;
++ 
++ 	bio_for_each_segment_all(bvec, bio, iter_all) {
++ 		ssize_t ret;
++ 
++ 		ret = copy_page_to_iter(bvec->bv_page,
++ 					bvec->bv_offset,
++ 					bvec->bv_len,
++ 					&iter);
++ 
++ 		if (!iov_iter_count(&iter))
++ 			break;
++ 
++ 		if (ret < bvec->bv_len)
++ 			return -EFAULT;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  *	bio_uncopy_user	-	finish previously mapped bio
++  *	@bio: bio being terminated
++  *
++  *	Free pages allocated from bio_copy_user_iov() and write back data
++  *	to user space in case of a read.
++  */
++ static int bio_uncopy_user(struct bio *bio)
++ {
++ 	struct bio_map_data *bmd = bio->bi_private;
++ 	int ret = 0;
++ 
++ 	if (!bio_flagged(bio, BIO_NULL_MAPPED)) {
++ 		/*
++ 		 * if we're in a workqueue, the request is orphaned, so
++ 		 * don't copy into a random user address space, just free
++ 		 * and return -EINTR so user space doesn't expect any data.
++ 		 */
++ 		if (!current->mm)
++ 			ret = -EINTR;
++ 		else if (bio_data_dir(bio) == READ)
++ 			ret = bio_copy_to_iter(bio, bmd->iter);
++ 		if (bmd->is_our_pages)
++ 			bio_free_pages(bio);
++ 	}
++ 	kfree(bmd);
++ 	bio_put(bio);
++ 	return ret;
++ }
++ 
++ /**
++  *	bio_copy_user_iov	-	copy user data to bio
++  *	@q:		destination block queue
++  *	@map_data:	pointer to the rq_map_data holding pages (if necessary)
++  *	@iter:		iovec iterator
++  *	@gfp_mask:	memory allocation flags
++  *
++  *	Prepares and returns a bio for indirect user io, bouncing data
++  *	to/from kernel pages as necessary. Must be paired with
++  *	call bio_uncopy_user() on io completion.
++  */
++ static struct bio *bio_copy_user_iov(struct request_queue *q,
++ 		struct rq_map_data *map_data, struct iov_iter *iter,
++ 		gfp_t gfp_mask)
++ {
++ 	struct bio_map_data *bmd;
++ 	struct page *page;
++ 	struct bio *bio;
++ 	int i = 0, ret;
++ 	int nr_pages;
++ 	unsigned int len = iter->count;
++ 	unsigned int offset = map_data ? offset_in_page(map_data->offset) : 0;
++ 
++ 	bmd = bio_alloc_map_data(iter, gfp_mask);
++ 	if (!bmd)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/*
++ 	 * We need to do a deep copy of the iov_iter including the iovecs.
++ 	 * The caller provided iov might point to an on-stack or otherwise
++ 	 * shortlived one.
++ 	 */
++ 	bmd->is_our_pages = map_data ? 0 : 1;
++ 
++ 	nr_pages = DIV_ROUND_UP(offset + len, PAGE_SIZE);
++ 	if (nr_pages > BIO_MAX_PAGES)
++ 		nr_pages = BIO_MAX_PAGES;
++ 
++ 	ret = -ENOMEM;
++ 	bio = bio_kmalloc(gfp_mask, nr_pages);
++ 	if (!bio)
++ 		goto out_bmd;
++ 
++ 	ret = 0;
++ 
++ 	if (map_data) {
++ 		nr_pages = 1 << map_data->page_order;
++ 		i = map_data->offset / PAGE_SIZE;
++ 	}
++ 	while (len) {
++ 		unsigned int bytes = PAGE_SIZE;
++ 
++ 		bytes -= offset;
++ 
++ 		if (bytes > len)
++ 			bytes = len;
++ 
++ 		if (map_data) {
++ 			if (i == map_data->nr_entries * nr_pages) {
++ 				ret = -ENOMEM;
++ 				break;
++ 			}
++ 
++ 			page = map_data->pages[i / nr_pages];
++ 			page += (i % nr_pages);
++ 
++ 			i++;
++ 		} else {
++ 			page = alloc_page(q->bounce_gfp | gfp_mask);
++ 			if (!page) {
++ 				ret = -ENOMEM;
++ 				break;
++ 			}
++ 		}
++ 
++ 		if (bio_add_pc_page(q, bio, page, bytes, offset) < bytes) {
++ 			if (!map_data)
++ 				__free_page(page);
++ 			break;
++ 		}
++ 
++ 		len -= bytes;
++ 		offset = 0;
++ 	}
++ 
++ 	if (ret)
++ 		goto cleanup;
++ 
++ 	if (map_data)
++ 		map_data->offset += bio->bi_iter.bi_size;
++ 
++ 	/*
++ 	 * success
++ 	 */
++ 	if ((iov_iter_rw(iter) == WRITE &&
++ 	     (!map_data || !map_data->null_mapped)) ||
++ 	    (map_data && map_data->from_user)) {
++ 		ret = bio_copy_from_iter(bio, iter);
++ 		if (ret)
++ 			goto cleanup;
++ 	} else {
++ 		if (bmd->is_our_pages)
++ 			zero_fill_bio(bio);
++ 		iov_iter_advance(iter, bio->bi_iter.bi_size);
++ 	}
++ 
++ 	bio->bi_private = bmd;
++ 	if (map_data && map_data->null_mapped)
++ 		bio_set_flag(bio, BIO_NULL_MAPPED);
++ 	return bio;
++ cleanup:
++ 	if (!map_data)
++ 		bio_free_pages(bio);
++ 	bio_put(bio);
++ out_bmd:
++ 	kfree(bmd);
++ 	return ERR_PTR(ret);
++ }
++ 
++ /**
++  *	bio_map_user_iov - map user iovec into bio
++  *	@q:		the struct request_queue for the bio
++  *	@iter:		iovec iterator
++  *	@gfp_mask:	memory allocation flags
++  *
++  *	Map the user space address into a bio suitable for io to a block
++  *	device. Returns an error pointer in case of error.
++  */
++ static struct bio *bio_map_user_iov(struct request_queue *q,
++ 		struct iov_iter *iter, gfp_t gfp_mask)
++ {
++ 	unsigned int max_sectors = queue_max_hw_sectors(q);
++ 	int j;
++ 	struct bio *bio;
++ 	int ret;
++ 
++ 	if (!iov_iter_count(iter))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	bio = bio_kmalloc(gfp_mask, iov_iter_npages(iter, BIO_MAX_PAGES));
++ 	if (!bio)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	while (iov_iter_count(iter)) {
++ 		struct page **pages;
++ 		ssize_t bytes;
++ 		size_t offs, added = 0;
++ 		int npages;
++ 
++ 		bytes = iov_iter_get_pages_alloc(iter, &pages, LONG_MAX, &offs);
++ 		if (unlikely(bytes <= 0)) {
++ 			ret = bytes ? bytes : -EFAULT;
++ 			goto out_unmap;
++ 		}
++ 
++ 		npages = DIV_ROUND_UP(offs + bytes, PAGE_SIZE);
++ 
++ 		if (unlikely(offs & queue_dma_alignment(q))) {
++ 			ret = -EINVAL;
++ 			j = 0;
++ 		} else {
++ 			for (j = 0; j < npages; j++) {
++ 				struct page *page = pages[j];
++ 				unsigned int n = PAGE_SIZE - offs;
++ 				bool same_page = false;
++ 
++ 				if (n > bytes)
++ 					n = bytes;
++ 
++ 				if (!bio_add_hw_page(q, bio, page, n, offs,
++ 						     max_sectors, &same_page)) {
++ 					if (same_page)
++ 						put_page(page);
++ 					break;
++ 				}
++ 
++ 				added += n;
++ 				bytes -= n;
++ 				offs = 0;
++ 			}
++ 			iov_iter_advance(iter, added);
++ 		}
++ 		/*
++ 		 * release the pages we didn't map into the bio, if any
++ 		 */
++ 		while (j < npages)
++ 			put_page(pages[j++]);
++ 		kvfree(pages);
++ 		/* couldn't stuff something into bio? */
++ 		if (bytes)
++ 			break;
++ 	}
++ 
++ 	bio_set_flag(bio, BIO_USER_MAPPED);
++ 
++ 	/*
++ 	 * subtle -- if bio_map_user_iov() ended up bouncing a bio,
++ 	 * it would normally disappear when its bi_end_io is run.
++ 	 * however, we need it for the unmap, so grab an extra
++ 	 * reference to it
++ 	 */
++ 	bio_get(bio);
++ 	return bio;
++ 
++  out_unmap:
++ 	bio_release_pages(bio, false);
++ 	bio_put(bio);
++ 	return ERR_PTR(ret);
++ }
++ 
++ /**
++  *	bio_unmap_user	-	unmap a bio
++  *	@bio:		the bio being unmapped
++  *
++  *	Unmap a bio previously mapped by bio_map_user_iov(). Must be called from
++  *	process context.
++  *
++  *	bio_unmap_user() may sleep.
++  */
++ static void bio_unmap_user(struct bio *bio)
++ {
++ 	bio_release_pages(bio, bio_data_dir(bio) == READ);
++ 	bio_put(bio);
++ 	bio_put(bio);
++ }
++ 
++ static void bio_invalidate_vmalloc_pages(struct bio *bio)
++ {
++ #ifdef ARCH_HAS_FLUSH_KERNEL_DCACHE_PAGE
++ 	if (bio->bi_private && !op_is_write(bio_op(bio))) {
++ 		unsigned long i, len = 0;
++ 
++ 		for (i = 0; i < bio->bi_vcnt; i++)
++ 			len += bio->bi_io_vec[i].bv_len;
++ 		invalidate_kernel_vmap_range(bio->bi_private, len);
++ 	}
++ #endif
++ }
++ 
++ static void bio_map_kern_endio(struct bio *bio)
++ {
++ 	bio_invalidate_vmalloc_pages(bio);
++ 	bio_put(bio);
++ }
++ 
++ /**
++  *	bio_map_kern	-	map kernel address into bio
++  *	@q: the struct request_queue for the bio
++  *	@data: pointer to buffer to map
++  *	@len: length in bytes
++  *	@gfp_mask: allocation flags for bio allocation
++  *
++  *	Map the kernel address into a bio suitable for io to a block
++  *	device. Returns an error pointer in case of error.
++  */
++ static struct bio *bio_map_kern(struct request_queue *q, void *data,
++ 		unsigned int len, gfp_t gfp_mask)
++ {
++ 	unsigned long kaddr = (unsigned long)data;
++ 	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	unsigned long start = kaddr >> PAGE_SHIFT;
++ 	const int nr_pages = end - start;
++ 	bool is_vmalloc = is_vmalloc_addr(data);
++ 	struct page *page;
++ 	int offset, i;
++ 	struct bio *bio;
++ 
++ 	bio = bio_kmalloc(gfp_mask, nr_pages);
++ 	if (!bio)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (is_vmalloc) {
++ 		flush_kernel_vmap_range(data, len);
++ 		bio->bi_private = data;
++ 	}
++ 
++ 	offset = offset_in_page(kaddr);
++ 	for (i = 0; i < nr_pages; i++) {
++ 		unsigned int bytes = PAGE_SIZE - offset;
++ 
++ 		if (len <= 0)
++ 			break;
++ 
++ 		if (bytes > len)
++ 			bytes = len;
++ 
++ 		if (!is_vmalloc)
++ 			page = virt_to_page(data);
++ 		else
++ 			page = vmalloc_to_page(data);
++ 		if (bio_add_pc_page(q, bio, page, bytes,
++ 				    offset) < bytes) {
++ 			/* we don't support partial mappings */
++ 			bio_put(bio);
++ 			return ERR_PTR(-EINVAL);
++ 		}
++ 
++ 		data += bytes;
++ 		len -= bytes;
++ 		offset = 0;
++ 	}
++ 
++ 	bio->bi_end_io = bio_map_kern_endio;
++ 	return bio;
++ }
++ 
++ static void bio_copy_kern_endio(struct bio *bio)
++ {
++ 	bio_free_pages(bio);
++ 	bio_put(bio);
++ }
++ 
++ static void bio_copy_kern_endio_read(struct bio *bio)
++ {
++ 	char *p = bio->bi_private;
++ 	struct bio_vec *bvec;
++ 	struct bvec_iter_all iter_all;
++ 
++ 	bio_for_each_segment_all(bvec, bio, iter_all) {
++ 		memcpy(p, page_address(bvec->bv_page), bvec->bv_len);
++ 		p += bvec->bv_len;
++ 	}
++ 
++ 	bio_copy_kern_endio(bio);
++ }
++ 
++ /**
++  *	bio_copy_kern	-	copy kernel address into bio
++  *	@q: the struct request_queue for the bio
++  *	@data: pointer to buffer to copy
++  *	@len: length in bytes
++  *	@gfp_mask: allocation flags for bio and page allocation
++  *	@reading: data direction is READ
++  *
++  *	copy the kernel address into a bio suitable for io to a block
++  *	device. Returns an error pointer in case of error.
++  */
++ static struct bio *bio_copy_kern(struct request_queue *q, void *data,
++ 		unsigned int len, gfp_t gfp_mask, int reading)
++ {
++ 	unsigned long kaddr = (unsigned long)data;
++ 	unsigned long end = (kaddr + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
++ 	unsigned long start = kaddr >> PAGE_SHIFT;
++ 	struct bio *bio;
++ 	void *p = data;
++ 	int nr_pages = 0;
++ 
++ 	/*
++ 	 * Overflow, abort
++ 	 */
++ 	if (end < start)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	nr_pages = end - start;
++ 	bio = bio_kmalloc(gfp_mask, nr_pages);
++ 	if (!bio)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	while (len) {
++ 		struct page *page;
++ 		unsigned int bytes = PAGE_SIZE;
++ 
++ 		if (bytes > len)
++ 			bytes = len;
++ 
++ 		page = alloc_page(q->bounce_gfp | gfp_mask);
++ 		if (!page)
++ 			goto cleanup;
++ 
++ 		if (!reading)
++ 			memcpy(page_address(page), p, bytes);
++ 
++ 		if (bio_add_pc_page(q, bio, page, bytes, 0) < bytes)
++ 			break;
++ 
++ 		len -= bytes;
++ 		p += bytes;
++ 	}
++ 
++ 	if (reading) {
++ 		bio->bi_end_io = bio_copy_kern_endio_read;
++ 		bio->bi_private = data;
++ 	} else {
++ 		bio->bi_end_io = bio_copy_kern_endio;
++ 	}
++ 
++ 	return bio;
++ 
++ cleanup:
++ 	bio_free_pages(bio);
++ 	bio_put(bio);
++ 	return ERR_PTR(-ENOMEM);
++ }
++ 
+++>>>>>>> e4581105771b (block: rename __bio_add_pc_page to bio_add_hw_page)
+  /*
+   * Append a bio to a passthrough request.  Only works if the bio can be merged
+   * into the request based on the driver constraints.
+diff --cc block/blk.h
+index 3849dabe650b,e5cd350ca379..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -322,10 -355,105 +322,83 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+ -void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
+ -			int rw);
+ -void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
+ -			int rw);
+ -void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+ -struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
+ -
+ -int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
+ -void blk_free_devt(dev_t devt);
+ -void blk_invalidate_devt(dev_t devt);
+ -char *disk_name(struct gendisk *hd, int partno, char *buf);
+ -#define ADDPART_FLAG_NONE	0
+ -#define ADDPART_FLAG_RAID	1
+ -#define ADDPART_FLAG_WHOLEDISK	2
+ -void delete_partition(struct gendisk *disk, struct hd_struct *part);
+ -int bdev_add_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int bdev_del_partition(struct block_device *bdev, int partno);
+ -int bdev_resize_partition(struct block_device *bdev, int partno,
+ -		sector_t start, sector_t length);
+ -int disk_expand_part_tbl(struct gendisk *disk, int target);
+ -int hd_ref_init(struct hd_struct *part);
+ -
+ -/* no need to get/put refcount of part0 */
+ -static inline int hd_struct_try_get(struct hd_struct *part)
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+  {
+ -	if (part->partno)
+ -		return percpu_ref_tryget_live(&part->ref);
+ -	return 1;
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void hd_struct_put(struct hd_struct *part)
++ {
++ 	if (part->partno)
++ 		percpu_ref_put(&part->ref);
++ }
++ 
++ static inline void hd_free_part(struct hd_struct *part)
++ {
++ 	free_part_stats(part);
++ 	kfree(part->info);
++ 	percpu_ref_exit(&part->ref);
++ }
++ 
++ /*
++  * Any access of part->nr_sects which is not protected by partition
++  * bd_mutex or gendisk bdev bd_mutex, should be done using this
++  * accessor function.
++  *
++  * Code written along the lines of i_size_read() and i_size_write().
++  * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
++  * on.
++  */
++ static inline sector_t part_nr_sects_read(struct hd_struct *part)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	sector_t nr_sects;
++ 	unsigned seq;
++ 	do {
++ 		seq = read_seqcount_begin(&part->nr_sects_seq);
++ 		nr_sects = part->nr_sects;
++ 	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
++ 	return nr_sects;
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	sector_t nr_sects;
++ 
++ 	preempt_disable();
++ 	nr_sects = part->nr_sects;
++ 	preempt_enable();
++ 	return nr_sects;
++ #else
++ 	return part->nr_sects;
++ #endif
++ }
++ 
++ /*
++  * Should be called with mutex lock held (typically bd_mutex) of partition
++  * to provide mutual exlusion among writers otherwise seqcount might be
++  * left in wrong state leaving the readers spinning infinitely.
++  */
++ static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	write_seqcount_begin(&part->nr_sects_seq);
++ 	part->nr_sects = size;
++ 	write_seqcount_end(&part->nr_sects_seq);
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	preempt_disable();
++ 	part->nr_sects = size;
++ 	preempt_enable();
++ #else
++ 	part->nr_sects = size;
++ #endif
++ }
++ 
++ struct request_queue *__blk_alloc_queue(int node_id);
++ 
++ int bio_add_hw_page(struct request_queue *q, struct bio *bio,
++ 		struct page *page, unsigned int len, unsigned int offset,
++ 		unsigned int max_sectors, bool *same_page);
++ 
+++>>>>>>> e4581105771b (block: rename __bio_add_pc_page to bio_add_hw_page)
+  #endif /* BLK_INTERNAL_H */
+* Unmerged path block/bio.c
+* Unmerged path block/blk-map.c
+* Unmerged path block/blk.h
