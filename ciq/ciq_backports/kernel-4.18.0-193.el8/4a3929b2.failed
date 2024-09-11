@@ -1,0 +1,119 @@
+net/mlx5: E-Switch, Handle UC address change in switchdev mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Handle UC address change in switchdev mode (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 96.67%
+commit-author Bodong Wang <bodong@mellanox.com>
+commit 4a3929b223d0a13fc5920a849a2c303ccc1a1e03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4a3929b2.failed
+
+When NVME device emulation mode is enabled, more than one PFs use the
+same physical port. In this case, MPFS is required to program L2
+addresses.
+
+It used to rely on netdev set_rx_mode in switchdev mode, but driver
+later changed to not create netdev for eswitch manager once in
+switchdev mode. So, UC address event should be handled.
+
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 4a3929b223d0a13fc5920a849a2c303ccc1a1e03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index f4a0b22e3987,89f52370e770..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1685,6 -1715,38 +1685,41 @@@ static int eswitch_vport_event(struct n
+  	return NOTIFY_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5_esw_query_functions(struct mlx5_core_dev *dev, u32 *out, int outlen)
++ {
++ 	u32 in[MLX5_ST_SZ_DW(query_esw_functions_in)] = {};
++ 
++ 	MLX5_SET(query_esw_functions_in, in, opcode,
++ 		 MLX5_CMD_OP_QUERY_ESW_FUNCTIONS);
++ 
++ 	return mlx5_cmd_exec(dev, in, sizeof(in), out, outlen);
++ }
++ 
++ static void mlx5_eswitch_event_handlers_register(struct mlx5_eswitch *esw)
++ {
++ 	MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
++ 	mlx5_eq_notifier_register(esw->dev, &esw->nb);
++ 
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev)) {
++ 		MLX5_NB_INIT(&esw->esw_funcs.nb, mlx5_esw_funcs_changed_handler,
++ 			     ESW_FUNCTIONS_CHANGED);
++ 		mlx5_eq_notifier_register(esw->dev, &esw->esw_funcs.nb);
++ 	}
++ }
++ 
++ static void mlx5_eswitch_event_handlers_unregister(struct mlx5_eswitch *esw)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_OFFLOADS && mlx5_eswitch_is_funcs_handler(esw->dev))
++ 		mlx5_eq_notifier_unregister(esw->dev, &esw->esw_funcs.nb);
++ 
++ 	mlx5_eq_notifier_unregister(esw->dev, &esw->nb);
++ 
++ 	flush_workqueue(esw->work_queue);
++ }
++ 
+++>>>>>>> 4a3929b223d0 (net/mlx5: E-Switch, Handle UC address change in switchdev mode)
+  /* Public E-Switch API */
+  #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+  
+@@@ -1728,21 -1789,29 +1763,26 @@@ int mlx5_eswitch_enable_sriov(struct ml
+  	if (err)
+  		esw_warn(esw->dev, "Failed to create eswitch TSAR");
+  
+++<<<<<<< HEAD
+ +	/* Don't enable vport events when in SRIOV_OFFLOADS mode, since:
+ +	 * 1. L2 table (MPFS) is programmed by PF/VF representors netdevs set_rx_mode
+ +	 * 2. FDB/Eswitch is programmed by user space tools
+ +	 */
+ +	enabled_events = (mode == SRIOV_LEGACY) ? SRIOV_VPORT_EVENTS : 0;
+ +	for (i = 0; i <= nvfs; i++)
+ +		esw_enable_vport(esw, i, enabled_events);
+++=======
++ 	enabled_events = (mode == MLX5_ESWITCH_LEGACY) ? SRIOV_VPORT_EVENTS :
++ 		UC_ADDR_CHANGE;
+++>>>>>>> 4a3929b223d0 (net/mlx5: E-Switch, Handle UC address change in switchdev mode)
+  
+ -	/* Enable PF vport */
+ -	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_PF);
+ -	esw_enable_vport(esw, vport, enabled_events);
+ -
+ -	/* Enable ECPF vports */
+ -	if (mlx5_ecpf_vport_exists(esw->dev)) {
+ -		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
+ -		esw_enable_vport(esw, vport, enabled_events);
+ +	if (mode == SRIOV_LEGACY) {
+ +		MLX5_NB_INIT(&esw->nb, eswitch_vport_event, NIC_VPORT_CHANGE);
+ +		mlx5_eq_notifier_register(esw->dev, &esw->nb);
+  	}
+  
+ -	/* Enable VF vports */
+ -	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs)
+ -		esw_enable_vport(esw, vport, enabled_events);
+ -
+ -	mlx5_eswitch_event_handlers_register(esw);
+ -
+ -	esw_info(esw->dev, "Enable: mode(%s), nvfs(%d), active vports(%d)\n",
+ -		 mode == MLX5_ESWITCH_LEGACY ? "LEGACY" : "OFFLOADS",
+ -		 esw->esw_funcs.num_vfs, esw->enabled_vports);
+ -
+ +	esw_info(esw->dev, "SRIOV enabled: active vports(%d)\n",
+ +		 esw->enabled_vports);
+  	return 0;
+  
+  abort:
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
