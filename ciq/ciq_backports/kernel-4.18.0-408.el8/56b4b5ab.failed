@@ -1,0 +1,192 @@
+block: clone crypto and integrity data in __bio_clone_fast
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 56b4b5abcdab6daf71c5536fca2772f178590e06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/56b4b5ab.failed
+
+__bio_clone_fast should also clone integrity and crypto data, as a clone
+without those is incomplete.  Right now the only caller that can actually
+support crypto and integrity data (dm) does it manually for the one
+callchain that supports these, but we better do it properly in the core.
+
+Note that all callers except for the above mentioned one also don't need
+to handle failure at all, given that the integrity and crypto clones are
+based on mempool allocations that won't fail for sleeping allocations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+Link: https://lore.kernel.org/r/20220202160109.108149-11-hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 56b4b5abcdab6daf71c5536fca2772f178590e06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/bio.c
+#	block/blk-crypto.c
+#	drivers/md/bcache/request.c
+#	drivers/md/dm.c
+#	drivers/md/md-multipath.c
+diff --cc block/bio.c
+index df04c1ad5361,2a921875bb42..000000000000
+--- a/block/bio.c
++++ b/block/bio.c
+@@@ -693,17 -788,9 +701,23 @@@ struct bio *bio_clone_fast(struct bio *
+  	if (!b)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	__bio_clone_fast(b, bio);
+ +
+ +	if (bio_integrity(bio)) {
+ +		int ret;
+ +
+ +		ret = bio_integrity_clone(b, bio, gfp_mask);
+ +
+ +		if (ret < 0) {
+ +			bio_put(b);
+ +			return NULL;
+ +		}
+++=======
++ 	if (__bio_clone_fast(b, bio, gfp_mask < 0)) {
++ 		bio_put(b);
++ 		return NULL;
+++>>>>>>> 56b4b5abcdab (block: clone crypto and integrity data in __bio_clone_fast)
+  	}
+  
+  	return b;
+diff --cc drivers/md/bcache/request.c
+index 97707b0c54ce,574b02b94f1a..000000000000
+--- a/drivers/md/bcache/request.c
++++ b/drivers/md/bcache/request.c
+@@@ -683,8 -685,8 +683,13 @@@ static void do_bio_hook(struct search *
+  {
+  	struct bio *bio = &s->bio.bio;
+  
+++<<<<<<< HEAD
+ +	bio_init(bio, NULL, 0);
+ +	__bio_clone_fast(bio, orig_bio);
+++=======
++ 	bio_init(bio, NULL, NULL, 0, 0);
++ 	__bio_clone_fast(bio, orig_bio, GFP_NOIO);
+++>>>>>>> 56b4b5abcdab (block: clone crypto and integrity data in __bio_clone_fast)
+  	/*
+  	 * bi_end_io can be set separately somewhere else, e.g. the
+  	 * variants in,
+diff --cc drivers/md/dm.c
+index d626b645f571,0f8796159379..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -643,9 -558,15 +643,18 @@@ static struct dm_target_io *alloc_tio(s
+  		if (!clone)
+  			return NULL;
+  
+ -		tio = clone_to_tio(clone);
+ +		tio = container_of(clone, struct dm_target_io, clone);
+  		tio->inside_dm_io = false;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (__bio_clone_fast(&tio->clone, ci->bio, gfp_mask) < 0) {
++ 		if (ci->io->tio.io)
++ 			bio_put(&tio->clone);
++ 		return NULL;
++ 	}
+++>>>>>>> 56b4b5abcdab (block: clone crypto and integrity data in __bio_clone_fast)
+  
+  	tio->magic = DM_TIO_MAGIC;
+  	tio->io = ci->io;
+@@@ -1338,31 -1197,14 +1347,37 @@@ static void bio_setup_sector(struct bi
+  /*
+   * Creates a bio that consists of range of complete bvecs.
+   */
+ -static int __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti,
+ -				    sector_t sector, unsigned *len)
+ +static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+ +		     sector_t sector, unsigned len)
+  {
+++<<<<<<< HEAD
+ +	struct bio *clone = &tio->clone;
+ +
+ +	__bio_clone_fast(clone, bio);
+ +
+ +	if (bio_integrity(bio)) {
+ +		int r;
+ +
+ +		if (unlikely(!dm_target_has_integrity(tio->ti->type) &&
+ +			     !dm_target_passes_integrity(tio->ti->type))) {
+ +			DMWARN("%s: the target %s doesn't support integrity data.",
+ +				dm_device_name(tio->io->md),
+ +				tio->ti->type->name);
+ +			return -EIO;
+ +		}
+ +
+ +		r = bio_integrity_clone(clone, bio, GFP_NOIO);
+ +		if (r < 0)
+ +			return r;
+ +	}
+ +
+++=======
++ 	struct bio *bio = ci->bio, *clone;
++ 
++ 	clone = alloc_tio(ci, ti, 0, len, GFP_NOIO);
+++>>>>>>> 56b4b5abcdab (block: clone crypto and integrity data in __bio_clone_fast)
+  	bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));
+ -	clone->bi_iter.bi_size = to_bytes(*len);
+ +	clone->bi_iter.bi_size = to_bytes(len);
+  
+  	if (bio_integrity(bio))
+  		bio_integrity_trim(clone);
+diff --cc drivers/md/md-multipath.c
+index a681d2def114,010c759c741a..000000000000
+--- a/drivers/md/md-multipath.c
++++ b/drivers/md/md-multipath.c
+@@@ -129,8 -121,8 +129,13 @@@ static bool multipath_make_request(stru
+  	}
+  	multipath = conf->multipaths + mp_bh->path;
+  
+++<<<<<<< HEAD
+ +	bio_init(&mp_bh->bio, NULL, 0);
+ +	__bio_clone_fast(&mp_bh->bio, bio);
+++=======
++ 	bio_init(&mp_bh->bio, NULL, NULL, 0, 0);
++ 	__bio_clone_fast(&mp_bh->bio, bio, GFP_NOIO);
+++>>>>>>> 56b4b5abcdab (block: clone crypto and integrity data in __bio_clone_fast)
+  
+  	mp_bh->bio.bi_iter.bi_sector += multipath->rdev->data_offset;
+  	bio_set_dev(&mp_bh->bio, multipath->rdev->bdev);
+* Unmerged path block/blk-crypto.c
+diff --git a/block/bio-integrity.c b/block/bio-integrity.c
+index f7d2829c7b34..7f0ce2331972 100644
+--- a/block/bio-integrity.c
++++ b/block/bio-integrity.c
+@@ -439,7 +439,6 @@ int bio_integrity_clone(struct bio *bio, struct bio *bio_src,
+ 
+ 	return 0;
+ }
+-EXPORT_SYMBOL(bio_integrity_clone);
+ 
+ int bioset_integrity_create(struct bio_set *bs, int pool_size)
+ {
+* Unmerged path block/bio.c
+* Unmerged path block/blk-crypto.c
+* Unmerged path drivers/md/bcache/request.c
+* Unmerged path drivers/md/dm.c
+* Unmerged path drivers/md/md-multipath.c
+diff --git a/include/linux/bio.h b/include/linux/bio.h
+index 650745103063..b9d079ada3b4 100644
+--- a/include/linux/bio.h
++++ b/include/linux/bio.h
+@@ -381,7 +381,7 @@ extern int bioset_init_from_src(struct bio_set *bs, struct bio_set *src);
+ extern struct bio *bio_alloc_bioset(gfp_t, unsigned int, struct bio_set *);
+ extern void bio_put(struct bio *);
+ 
+-extern void __bio_clone_fast(struct bio *, struct bio *);
++int __bio_clone_fast(struct bio *bio, struct bio *bio_src, gfp_t gfp);
+ extern struct bio *bio_clone_fast(struct bio *, gfp_t, struct bio_set *);
+ 
+ extern struct bio_set fs_bio_set;
