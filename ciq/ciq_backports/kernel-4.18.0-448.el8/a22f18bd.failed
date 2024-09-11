@@ -1,0 +1,144 @@
+ACPI / MMC: PM: Unify fixing up device power
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit a22f18bddd824e96db839ccda75ff7e035e938ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a22f18bd.failed
+
+Introduce acpi_device_fix_up_power_extended() for fixing up power of
+a device having an ACPI companion in a manner that takes the device's
+children into account and make the MMC code use it in two places
+instead of walking the list of the device ACPI companion's children
+directly.
+
+This will help to eliminate the children list head from struct
+acpi_device as it is redundant and it is used in questionable ways
+in some places (in particular, locking is needed for walking the
+list pointed to it safely, but it is often missing).
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Acked-by: Adrian Hunter <adrian.hunter@intel.com>
+	Acked-by: Ulf Hansson <ulf.hansson@linaro.org>
+(cherry picked from commit a22f18bddd824e96db839ccda75ff7e035e938ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mmc/host/sdhci-acpi.c
+diff --cc drivers/mmc/host/sdhci-acpi.c
+index 1e58b5925a40,4cca4c90769b..000000000000
+--- a/drivers/mmc/host/sdhci-acpi.c
++++ b/drivers/mmc/host/sdhci-acpi.c
+@@@ -624,7 -775,8 +624,12 @@@ static int sdhci_acpi_probe(struct plat
+  {
+  	struct device *dev = &pdev->dev;
+  	const struct sdhci_acpi_slot *slot;
+++<<<<<<< HEAD
+ +	struct acpi_device *device, *child;
+++=======
++ 	const struct dmi_system_id *id;
++ 	struct acpi_device *device;
+++>>>>>>> a22f18bddd82 (ACPI / MMC: PM: Unify fixing up device power)
+  	struct sdhci_acpi_host *c;
+  	struct sdhci_host *host;
+  	struct resource *iomem;
+@@@ -638,18 -789,14 +643,22 @@@
+  	if (!device)
+  		return -ENODEV;
+  
+ -	id = dmi_first_match(sdhci_acpi_quirks);
+ -	if (id)
+ -		quirks = (long)id->driver_data;
+ +	hid = acpi_device_hid(device);
+ +	uid = acpi_device_uid(device);
+  
+ -	slot = sdhci_acpi_get_slot(device);
+ +	slot = sdhci_acpi_get_slot(hid, uid);
+  
+  	/* Power on the SDHCI controller and its children */
+++<<<<<<< HEAD
+ +	acpi_device_fix_up_power(device);
+ +	if (!sdhci_acpi_no_fixup_child_power(hid, uid)) {
+ +		list_for_each_entry(child, &device->children, node)
+ +			if (child->status.present && child->status.enabled)
+ +				acpi_device_fix_up_power(child);
+ +	}
+++=======
++ 	acpi_device_fix_up_power_extended(device);
+++>>>>>>> a22f18bddd82 (ACPI / MMC: PM: Unify fixing up device power)
+  
+  	if (sdhci_acpi_byt_defer(dev))
+  		return -EPROBE_DEFER;
+diff --git a/drivers/acpi/device_pm.c b/drivers/acpi/device_pm.c
+index 18fa99c3ea69..3aaff8e18c45 100644
+--- a/drivers/acpi/device_pm.c
++++ b/drivers/acpi/device_pm.c
+@@ -377,6 +377,28 @@ int acpi_device_fix_up_power(struct acpi_device *device)
+ }
+ EXPORT_SYMBOL_GPL(acpi_device_fix_up_power);
+ 
++static int fix_up_power_if_applicable(struct acpi_device *adev, void *not_used)
++{
++	if (adev->status.present && adev->status.enabled)
++		acpi_device_fix_up_power(adev);
++
++	return 0;
++}
++
++/**
++ * acpi_device_fix_up_power_extended - Force device and its children into D0.
++ * @adev: Parent device object whose power state is to be fixed up.
++ *
++ * Call acpi_device_fix_up_power() for @adev and its children so long as they
++ * are reported as present and enabled.
++ */
++void acpi_device_fix_up_power_extended(struct acpi_device *adev)
++{
++	acpi_device_fix_up_power(adev);
++	acpi_dev_for_each_child(adev, fix_up_power_if_applicable, NULL);
++}
++EXPORT_SYMBOL_GPL(acpi_device_fix_up_power_extended);
++
+ int acpi_device_update_power(struct acpi_device *device, int *state_p)
+ {
+ 	int state;
+* Unmerged path drivers/mmc/host/sdhci-acpi.c
+diff --git a/drivers/mmc/host/sdhci-pci-core.c b/drivers/mmc/host/sdhci-pci-core.c
+index 61ae48988e8d..247e9dee0ca5 100644
+--- a/drivers/mmc/host/sdhci-pci-core.c
++++ b/drivers/mmc/host/sdhci-pci-core.c
+@@ -1089,16 +1089,11 @@ static const struct sdhci_pci_fixes sdhci_intel_byt_sd = {
+ #ifdef CONFIG_ACPI
+ static void intel_mrfld_mmc_fix_up_power_slot(struct sdhci_pci_slot *slot)
+ {
+-	struct acpi_device *device, *child;
++	struct acpi_device *device;
+ 
+ 	device = ACPI_COMPANION(&slot->chip->pdev->dev);
+-	if (!device)
+-		return;
+-
+-	acpi_device_fix_up_power(device);
+-	list_for_each_entry(child, &device->children, node)
+-		if (child->status.present && child->status.enabled)
+-			acpi_device_fix_up_power(child);
++	if (device)
++		acpi_device_fix_up_power_extended(device);
+ }
+ #else
+ static inline void intel_mrfld_mmc_fix_up_power_slot(struct sdhci_pci_slot *slot) {}
+diff --git a/include/acpi/acpi_bus.h b/include/acpi/acpi_bus.h
+index c5ed6c83bb83..10615e971513 100644
+--- a/include/acpi/acpi_bus.h
++++ b/include/acpi/acpi_bus.h
+@@ -527,6 +527,7 @@ const char *acpi_power_state_string(int state);
+ int acpi_device_set_power(struct acpi_device *device, int state);
+ int acpi_bus_init_power(struct acpi_device *device);
+ int acpi_device_fix_up_power(struct acpi_device *device);
++void acpi_device_fix_up_power_extended(struct acpi_device *adev);
+ int acpi_bus_update_power(acpi_handle handle, int *state_p);
+ int acpi_device_update_power(struct acpi_device *device, int *state_p);
+ bool acpi_bus_power_manageable(acpi_handle handle);
