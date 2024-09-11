@@ -1,0 +1,1591 @@
+proc/sysctl: add shared variables for range check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matteo Croce <mcroce@redhat.com>
+commit eec4844fae7c033a0c1fc1eb3b8517aeb8b6cc49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/eec4844f.failed
+
+In the sysctl code the proc_dointvec_minmax() function is often used to
+validate the user supplied value between an allowed range.  This
+function uses the extra1 and extra2 members from struct ctl_table as
+minimum and maximum allowed value.
+
+On sysctl handler declaration, in every source file there are some
+readonly variables containing just an integer which address is assigned
+to the extra1 and extra2 members, so the sysctl range is enforced.
+
+The special values 0, 1 and INT_MAX are very often used as range
+boundary, leading duplication of variables like zero=0, one=1,
+int_max=INT_MAX in different source files:
+
+    $ git grep -E '\.extra[12].*&(zero|one|int_max)' |wc -l
+    248
+
+Add a const int array containing the most commonly used values, some
+macros to refer more easily to the correct array member, and use them
+instead of creating a local one for every object file.
+
+This is the bloat-o-meter output comparing the old and new binary
+compiled with the default Fedora config:
+
+    # scripts/bloat-o-meter -d vmlinux.o.old vmlinux.o
+    add/remove: 2/2 grow/shrink: 0/2 up/down: 24/-188 (-164)
+    Data                                         old     new   delta
+    sysctl_vals                                    -      12     +12
+    __kstrtab_sysctl_vals                          -      12     +12
+    max                                           14      10      -4
+    int_max                                       16       -     -16
+    one                                           68       -     -68
+    zero                                         128      28    -100
+    Total: Before=20583249, After=20583085, chg -0.00%
+
+[mcroce@redhat.com: tipc: remove two unused variables]
+  Link: http://lkml.kernel.org/r/20190530091952.4108-1-mcroce@redhat.com
+[akpm@linux-foundation.org: fix net/ipv6/sysctl_net_ipv6.c]
+[arnd@arndb.de: proc/sysctl: make firmware loader table conditional]
+  Link: http://lkml.kernel.org/r/20190617130014.1713870-1-arnd@arndb.de
+[akpm@linux-foundation.org: fix fs/eventpoll.c]
+Link: http://lkml.kernel.org/r/20190430180111.10688-1-mcroce@redhat.com
+	Signed-off-by: Matteo Croce <mcroce@redhat.com>
+	Signed-off-by: Arnd Bergmann <arnd@arndb.de>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Aaron Tomlin <atomlin@redhat.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit eec4844fae7c033a0c1fc1eb3b8517aeb8b6cc49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/appldata/appldata_base.c
+#	arch/s390/kernel/topology.c
+#	drivers/base/firmware_loader/fallback_table.c
+#	drivers/tty/tty_ldisc.c
+#	kernel/sysctl.c
+#	net/core/sysctl_net_core.c
+#	net/ipv4/sysctl_net_ipv4.c
+#	net/ipv6/route.c
+#	net/ipv6/sysctl_net_ipv6.c
+#	net/rxrpc/sysctl.c
+diff --cc arch/s390/appldata/appldata_base.c
+index ee6a9c387c87,aa738cad1338..000000000000
+--- a/arch/s390/appldata/appldata_base.c
++++ b/arch/s390/appldata/appldata_base.c
+@@@ -206,35 -219,26 +206,51 @@@ static in
+  appldata_timer_handler(struct ctl_table *ctl, int write,
+  			   void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+++<<<<<<< HEAD
+ +	unsigned int len;
+ +	char buf[2];
+++=======
++ 	int timer_active = appldata_timer_active;
++ 	int rc;
++ 	struct ctl_table ctl_entry = {
++ 		.procname	= ctl->procname,
++ 		.data		= &timer_active,
++ 		.maxlen		= sizeof(int),
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	};
++ 
++ 	rc = proc_douintvec_minmax(&ctl_entry, write, buffer, lenp, ppos);
++ 	if (rc < 0 || !write)
++ 		return rc;
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  
+ +	if (!*lenp || *ppos) {
+ +		*lenp = 0;
+ +		return 0;
+ +	}
+ +	if (!write) {
+ +		strncpy(buf, appldata_timer_active ? "1\n" : "0\n",
+ +			ARRAY_SIZE(buf));
+ +		len = strnlen(buf, ARRAY_SIZE(buf));
+ +		if (len > *lenp)
+ +			len = *lenp;
+ +		if (copy_to_user(buffer, buf, len))
+ +			return -EFAULT;
+ +		goto out;
+ +	}
+ +	len = *lenp;
+ +	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len))
+ +		return -EFAULT;
+  	spin_lock(&appldata_timer_lock);
+ -	if (timer_active)
+ +	if (buf[0] == '1')
+  		__appldata_vtimer_setup(APPLDATA_ADD_TIMER);
+ -	else
+ +	else if (buf[0] == '0')
+  		__appldata_vtimer_setup(APPLDATA_DEL_TIMER);
+  	spin_unlock(&appldata_timer_lock);
+ +out:
+ +	*lenp = len;
+ +	*ppos += len;
+  	return 0;
+  }
+  
+@@@ -248,29 -252,18 +264,40 @@@ static in
+  appldata_interval_handler(struct ctl_table *ctl, int write,
+  			   void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+++<<<<<<< HEAD
+ +	unsigned int len;
+ +	int interval;
+ +	char buf[16];
+++=======
++ 	int interval = appldata_interval;
++ 	int rc;
++ 	struct ctl_table ctl_entry = {
++ 		.procname	= ctl->procname,
++ 		.data		= &interval,
++ 		.maxlen		= sizeof(int),
++ 		.extra1		= SYSCTL_ONE,
++ 	};
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  
+ -	rc = proc_dointvec_minmax(&ctl_entry, write, buffer, lenp, ppos);
+ -	if (rc < 0 || !write)
+ -		return rc;
+ +	if (!*lenp || *ppos) {
+ +		*lenp = 0;
+ +		return 0;
+ +	}
+ +	if (!write) {
+ +		len = sprintf(buf, "%i\n", appldata_interval);
+ +		if (len > *lenp)
+ +			len = *lenp;
+ +		if (copy_to_user(buffer, buf, len))
+ +			return -EFAULT;
+ +		goto out;
+ +	}
+ +	len = *lenp;
+ +	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len))
+ +		return -EFAULT;
+ +	interval = 0;
+ +	sscanf(buf, "%i", &interval);
+ +	if (interval <= 0)
+ +		return -EINVAL;
+  
+  	spin_lock(&appldata_timer_lock);
+  	appldata_interval = interval;
+@@@ -293,10 -283,15 +320,20 @@@ appldata_generic_handler(struct ctl_tab
+  			   void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+  	struct appldata_ops *ops = NULL, *tmp_ops;
+ -	struct list_head *lh;
+ +	unsigned int len;
+  	int rc, found;
+++<<<<<<< HEAD
+ +	char buf[2];
+ +	struct list_head *lh;
+++=======
++ 	int active;
++ 	struct ctl_table ctl_entry = {
++ 		.data		= &active,
++ 		.maxlen		= sizeof(int),
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	};
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  
+  	found = 0;
+  	mutex_lock(&appldata_ops_mutex);
+diff --cc arch/s390/kernel/topology.c
+index 4b6e0397f66d,2db6fb405a9a..000000000000
+--- a/arch/s390/kernel/topology.c
++++ b/arch/s390/kernel/topology.c
+@@@ -579,31 -585,23 +579,46 @@@ early_param("topology", topology_setup)
+  static int topology_ctl_handler(struct ctl_table *ctl, int write,
+  				void __user *buffer, size_t *lenp, loff_t *ppos)
+  {
+ -	int enabled = topology_is_enabled();
+ +	unsigned int len;
+  	int new_mode;
+++<<<<<<< HEAD
+ +	char buf[2];
+++=======
++ 	int rc;
++ 	struct ctl_table ctl_entry = {
++ 		.procname	= ctl->procname,
++ 		.data		= &enabled,
++ 		.maxlen		= sizeof(int),
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	};
++ 
++ 	rc = proc_douintvec_minmax(&ctl_entry, write, buffer, lenp, ppos);
++ 	if (rc < 0 || !write)
++ 		return rc;
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  
+ +	if (!*lenp || *ppos) {
+ +		*lenp = 0;
+ +		return 0;
+ +	}
+ +	if (!write) {
+ +		strncpy(buf, topology_is_enabled() ? "1\n" : "0\n",
+ +			ARRAY_SIZE(buf));
+ +		len = strnlen(buf, ARRAY_SIZE(buf));
+ +		if (len > *lenp)
+ +			len = *lenp;
+ +		if (copy_to_user(buffer, buf, len))
+ +			return -EFAULT;
+ +		goto out;
+ +	}
+ +	len = *lenp;
+ +	if (copy_from_user(buf, buffer, len > sizeof(buf) ? sizeof(buf) : len))
+ +		return -EFAULT;
+ +	if (buf[0] != '0' && buf[0] != '1')
+ +		return -EINVAL;
+  	mutex_lock(&smp_cpu_state_mutex);
+ -	new_mode = topology_get_mode(enabled);
+ +	new_mode = topology_get_mode(buf[0] == '1');
+  	if (topology_mode != new_mode) {
+  		topology_mode = new_mode;
+  		topology_schedule_update();
+diff --cc drivers/base/firmware_loader/fallback_table.c
+index 7428659d8df9,ba9d30b28edc..000000000000
+--- a/drivers/base/firmware_loader/fallback_table.c
++++ b/drivers/base/firmware_loader/fallback_table.c
+@@@ -16,12 -16,6 +16,15 @@@
+   * firmware fallback configuration table
+   */
+  
+++<<<<<<< HEAD
+ +/* Module or buit-in */
+ +#ifdef CONFIG_FW_LOADER_USER_HELPER
+ +
+ +static unsigned int zero;
+ +static unsigned int one = 1;
+ +
+++=======
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  struct firmware_fallback_config fw_fallback_config = {
+  	.force_sysfs_fallback = IS_ENABLED(CONFIG_FW_LOADER_USER_HELPER_FALLBACK),
+  	.loading_timeout = 60,
+@@@ -51,5 -46,4 +55,8 @@@ struct ctl_table firmware_config_table[
+  	{ }
+  };
+  EXPORT_SYMBOL_GPL(firmware_config_table);
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  #endif
+diff --cc drivers/tty/tty_ldisc.c
+index fc4c97cae01e,4c49f53afa3e..000000000000
+--- a/drivers/tty/tty_ldisc.c
++++ b/drivers/tty/tty_ldisc.c
+@@@ -829,3 -854,39 +829,42 @@@ void tty_ldisc_deinit(struct tty_struc
+  		tty_ldisc_put(tty->ldisc);
+  	tty->ldisc = NULL;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static struct ctl_table tty_table[] = {
++ 	{
++ 		.procname	= "ldisc_autoload",
++ 		.data		= &tty_ldisc_autoload,
++ 		.maxlen		= sizeof(tty_ldisc_autoload),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ 	{ }
++ };
++ 
++ static struct ctl_table tty_dir_table[] = {
++ 	{
++ 		.procname	= "tty",
++ 		.mode		= 0555,
++ 		.child		= tty_table,
++ 	},
++ 	{ }
++ };
++ 
++ static struct ctl_table tty_root_table[] = {
++ 	{
++ 		.procname	= "dev",
++ 		.mode		= 0555,
++ 		.child		= tty_dir_table,
++ 	},
++ 	{ }
++ };
++ 
++ void tty_sysctl_init(void)
++ {
++ 	register_sysctl_table(tty_root_table);
++ }
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+diff --cc kernel/sysctl.c
+index 04c2181c0df5,078950d9605b..000000000000
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@@ -464,9 -483,20 +461,23 @@@ static struct ctl_table kern_table[] = 
+  		.maxlen		= sizeof(unsigned int),
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec_minmax,
+- 		.extra1		= &one,
++ 		.extra1		= SYSCTL_ONE,
++ 	},
++ #endif
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
++ 	{
++ 		.procname	= "sched_energy_aware",
++ 		.data		= &sysctl_sched_energy_aware,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode		= 0644,
++ 		.proc_handler	= sched_energy_aware_handler,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
+  	},
+  #endif
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  #ifdef CONFIG_PROVE_LOCKING
+  	{
+  		.procname	= "prove_locking",
+@@@ -1218,9 -1256,16 +1229,9 @@@
+  		.mode		= 0644,
+  		/* only handle a transition from default "0" to "1" */
+  		.proc_handler	= proc_dointvec_minmax,
+- 		.extra1		= &one,
+- 		.extra2		= &one,
++ 		.extra1		= SYSCTL_ONE,
++ 		.extra2		= SYSCTL_ONE,
+  	},
+ -	{
+ -		.procname	= "bpf_stats_enabled",
+ -		.data		= &bpf_stats_enabled_key.key,
+ -		.maxlen		= sizeof(bpf_stats_enabled_key),
+ -		.mode		= 0644,
+ -		.proc_handler	= proc_do_static_key,
+ -	},
+  #endif
+  #if defined(CONFIG_TREE_RCU) || defined(CONFIG_PREEMPT_RCU)
+  	{
+@@@ -1229,10 -1274,21 +1240,24 @@@
+  		.maxlen		= sizeof(sysctl_panic_on_rcu_stall),
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec_minmax,
+- 		.extra1		= &zero,
+- 		.extra2		= &one,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_STACKLEAK_RUNTIME_DISABLE
++ 	{
++ 		.procname	= "stack_erasing",
++ 		.data		= NULL,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0600,
++ 		.proc_handler	= stack_erasing_sysctl,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
+  	},
+  #endif
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{ }
+  };
+  
+@@@ -1448,9 -1504,17 +1473,20 @@@ static struct ctl_table vm_table[] = 
+  		.maxlen		= sizeof(min_free_kbytes),
+  		.mode		= 0644,
+  		.proc_handler	= min_free_kbytes_sysctl_handler,
+- 		.extra1		= &zero,
++ 		.extra1		= SYSCTL_ZERO,
++ 	},
++ 	{
+++<<<<<<< HEAD
+++=======
++ 		.procname	= "watermark_boost_factor",
++ 		.data		= &watermark_boost_factor,
++ 		.maxlen		= sizeof(watermark_boost_factor),
++ 		.mode		= 0644,
++ 		.proc_handler	= watermark_boost_factor_sysctl_handler,
++ 		.extra1		= SYSCTL_ZERO,
+  	},
+  	{
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  		.procname	= "watermark_scale_factor",
+  		.data		= &watermark_scale_factor,
+  		.maxlen		= sizeof(watermark_scale_factor),
+@@@ -1664,6 -1728,17 +1700,20 @@@
+  		.extra2		= (void *)&mmap_rnd_compat_bits_max,
+  	},
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_USERFAULTFD
++ 	{
++ 		.procname	= "unprivileged_userfaultfd",
++ 		.data		= &sysctl_unprivileged_userfaultfd,
++ 		.maxlen		= sizeof(sysctl_unprivileged_userfaultfd),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ #endif
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{ }
+  };
+  
+@@@ -1806,10 -1881,28 +1856,31 @@@ static struct ctl_table fs_table[] = 
+  		.maxlen		= sizeof(int),
+  		.mode		= 0600,
+  		.proc_handler	= proc_dointvec_minmax,
+- 		.extra1		= &zero,
+- 		.extra2		= &one,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
+  	},
+  	{
+++<<<<<<< HEAD
+++=======
++ 		.procname	= "protected_fifos",
++ 		.data		= &sysctl_protected_fifos,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0600,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= &two,
++ 	},
++ 	{
++ 		.procname	= "protected_regular",
++ 		.data		= &sysctl_protected_regular,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0600,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= &two,
++ 	},
++ 	{
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  		.procname	= "suid_dumpable",
+  		.data		= &suid_dumpable,
+  		.maxlen		= sizeof(int),
+@@@ -3281,6 -3375,43 +3352,41 @@@ int proc_doulongvec_ms_jiffies_minmax(s
+  
+  #endif /* CONFIG_PROC_SYSCTL */
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_SYSCTL)
++ int proc_do_static_key(struct ctl_table *table, int write,
++ 		       void __user *buffer, size_t *lenp,
++ 		       loff_t *ppos)
++ {
++ 	struct static_key *key = (struct static_key *)table->data;
++ 	static DEFINE_MUTEX(static_key_mutex);
++ 	int val, ret;
++ 	struct ctl_table tmp = {
++ 		.data   = &val,
++ 		.maxlen = sizeof(val),
++ 		.mode   = table->mode,
++ 		.extra1 = SYSCTL_ZERO,
++ 		.extra2 = SYSCTL_ONE,
++ 	};
++ 
++ 	if (write && !capable(CAP_SYS_ADMIN))
++ 		return -EPERM;
++ 
++ 	mutex_lock(&static_key_mutex);
++ 	val = static_key_enabled(key);
++ 	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
++ 	if (write && !ret) {
++ 		if (val)
++ 			static_key_enable(key);
++ 		else
++ 			static_key_disable(key);
++ 	}
++ 	mutex_unlock(&static_key_mutex);
++ 	return ret;
++ }
++ #endif
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  /*
+   * No sense putting this after each symbol definition, twice,
+   * exception granted :-)
+diff --cc net/core/sysctl_net_core.c
+index d67ec17f2cc8,8da5b3a54dac..000000000000
+--- a/net/core/sysctl_net_core.c
++++ b/net/core/sysctl_net_core.c
+@@@ -541,9 -548,25 +539,28 @@@ static struct ctl_table net_core_table[
+  		.maxlen		= sizeof(int),
+  		.mode		= 0644,
+  		.proc_handler	= proc_dointvec_minmax,
+- 		.extra1		= &zero,
+- 		.extra2		= &one,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.procname	= "devconf_inherit_init_net",
++ 		.data		= &sysctl_devconf_inherit_init_net,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= &two,
++ 	},
++ 	{
++ 		.procname	= "high_order_alloc_disable",
++ 		.data		= &net_high_order_alloc_disable_key.key,
++ 		.maxlen         = sizeof(net_high_order_alloc_disable_key),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_do_static_key,
++ 	},
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{ }
+  };
+  
+diff --cc net/ipv4/sysctl_net_ipv4.c
+index aa77e39cdaa4,0b980e841927..000000000000
+--- a/net/ipv4/sysctl_net_ipv4.c
++++ b/net/ipv4/sysctl_net_ipv4.c
+@@@ -605,6 -665,17 +603,20 @@@ static struct ctl_table ipv4_net_table[
+  		.mode		= 0644,
+  		.proc_handler	= ipv4_ping_group_range,
+  	},
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NET_L3_MASTER_DEV
++ 	{
++ 		.procname	= "raw_l3mdev_accept",
++ 		.data		= &init_net.ipv4.sysctl_raw_l3mdev_accept,
++ 		.maxlen		= sizeof(int),
++ 		.mode		= 0644,
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ #endif
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{
+  		.procname	= "tcp_ecn",
+  		.data		= &init_net.ipv4.sysctl_tcp_ecn,
+@@@ -951,8 -1027,8 +963,13 @@@
+  		.maxlen		= sizeof(int),
+  		.mode		= 0644,
+  		.proc_handler	= proc_fib_multipath_hash_policy,
+++<<<<<<< HEAD
+ +		.extra1		= &zero,
+ +		.extra2		= &one,
+++=======
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	},
+  #endif
+  	{
+diff --cc net/ipv6/route.c
+index ce16fcfc9697,8b0c33fb19a2..000000000000
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@@ -5294,7 -6031,7 +5294,11 @@@ int ipv6_sysctl_rtcache_flush(struct ct
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +struct ctl_table ipv6_route_table_template[] = {
+++=======
++ static struct ctl_table ipv6_route_table_template[] = {
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{
+  		.procname	=	"flush",
+  		.data		=	&init_net.ipv6.sysctl.flush_delay,
+@@@ -5365,6 -6102,15 +5369,18 @@@
+  		.mode		=	0644,
+  		.proc_handler	=	proc_dointvec_ms_jiffies,
+  	},
+++<<<<<<< HEAD
+++=======
++ 	{
++ 		.procname	=	"skip_notify_on_dev_down",
++ 		.data		=	&init_net.ipv6.sysctl.skip_notify_on_dev_down,
++ 		.maxlen		=	sizeof(int),
++ 		.mode		=	0644,
++ 		.proc_handler	=	proc_dointvec_minmax,
++ 		.extra1		=	SYSCTL_ZERO,
++ 		.extra2		=	SYSCTL_ONE,
++ 	},
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	{ }
+  };
+  
+diff --cc net/ipv6/sysctl_net_ipv6.c
+index e15cd37024fd,ec8fcfc60a27..000000000000
+--- a/net/ipv6/sysctl_net_ipv6.c
++++ b/net/ipv6/sysctl_net_ipv6.c
+@@@ -21,8 -21,7 +21,12 @@@
+  #include <net/calipso.h>
+  #endif
+  
+++<<<<<<< HEAD
+ +static int zero;
+ +static int one = 1;
+++=======
++ static int flowlabel_reflect_max = 0x7;
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  static int auto_flowlabels_min;
+  static int auto_flowlabels_max = IP6_AUTO_FLOW_LABEL_MAX;
+  
+@@@ -113,7 -112,9 +117,13 @@@ static struct ctl_table ipv6_table_temp
+  		.data		= &init_net.ipv6.sysctl.flowlabel_reflect,
+  		.maxlen		= sizeof(int),
+  		.mode		= 0644,
+++<<<<<<< HEAD
+ +		.proc_handler	= proc_dointvec,
+++=======
++ 		.proc_handler	= proc_dointvec_minmax,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= &flowlabel_reflect_max,
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  	},
+  	{
+  		.procname	= "max_dst_opts_number",
+diff --cc net/rxrpc/sysctl.c
+index 4a7af7aff37d,2bbb38161851..000000000000
+--- a/net/rxrpc/sysctl.c
++++ b/net/rxrpc/sysctl.c
+@@@ -15,8 -11,6 +15,11 @@@
+  #include "ar-internal.h"
+  
+  static struct ctl_table_header *rxrpc_sysctl_reg_table;
+++<<<<<<< HEAD
+ +static const unsigned int zero = 0;
+ +static const unsigned int one = 1;
+++=======
+++>>>>>>> eec4844fae7c (proc/sysctl: add shared variables for range check)
+  static const unsigned int four = 4;
+  static const unsigned int thirtytwo = 32;
+  static const unsigned int n_65535 = 65535;
+* Unmerged path arch/s390/appldata/appldata_base.c
+* Unmerged path arch/s390/kernel/topology.c
+diff --git a/arch/x86/entry/vdso/vdso32-setup.c b/arch/x86/entry/vdso/vdso32-setup.c
+index 42d4c89f990e..240626e7f55a 100644
+--- a/arch/x86/entry/vdso/vdso32-setup.c
++++ b/arch/x86/entry/vdso/vdso32-setup.c
+@@ -65,9 +65,6 @@ subsys_initcall(sysenter_setup);
+ /* Register vsyscall32 into the ABI table */
+ #include <linux/sysctl.h>
+ 
+-static const int zero;
+-static const int one = 1;
+-
+ static struct ctl_table abi_table2[] = {
+ 	{
+ 		.procname	= "vsyscall32",
+@@ -75,8 +72,8 @@ static struct ctl_table abi_table2[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= (int *)&zero,
+-		.extra2		= (int *)&one,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{}
+ };
+diff --git a/arch/x86/kernel/itmt.c b/arch/x86/kernel/itmt.c
+index 838cf8a32c49..1cb3ca9bba49 100644
+--- a/arch/x86/kernel/itmt.c
++++ b/arch/x86/kernel/itmt.c
+@@ -65,8 +65,6 @@ static int sched_itmt_update_handler(struct ctl_table *table, int write,
+ 	return ret;
+ }
+ 
+-static unsigned int zero;
+-static unsigned int one = 1;
+ static struct ctl_table itmt_kern_table[] = {
+ 	{
+ 		.procname	= "sched_itmt_enabled",
+@@ -74,8 +72,8 @@ static struct ctl_table itmt_kern_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= sched_itmt_update_handler,
+-		.extra1		= &zero,
+-		.extra2		= &one,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{}
+ };
+* Unmerged path drivers/base/firmware_loader/fallback_table.c
+diff --git a/drivers/gpu/drm/i915/i915_perf.c b/drivers/gpu/drm/i915/i915_perf.c
+index 8360f4f3c3ab..18ec6d4dbf75 100644
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@ -271,8 +271,6 @@
+ #define POLL_PERIOD (NSEC_PER_SEC / POLL_FREQUENCY)
+ 
+ /* for sysctl proc_dointvec_minmax of dev.i915.perf_stream_paranoid */
+-static int zero;
+-static int one = 1;
+ static u32 i915_perf_stream_paranoid = true;
+ 
+ /* The maximum exponent the hardware accepts is 63 (essentially it selects one
+@@ -3345,8 +3343,8 @@ static struct ctl_table oa_table[] = {
+ 	 .maxlen = sizeof(i915_perf_stream_paranoid),
+ 	 .mode = 0644,
+ 	 .proc_handler = proc_dointvec_minmax,
+-	 .extra1 = &zero,
+-	 .extra2 = &one,
++	 .extra1 = SYSCTL_ZERO,
++	 .extra2 = SYSCTL_ONE,
+ 	 },
+ 	{
+ 	 .procname = "oa_max_sample_rate",
+@@ -3354,7 +3352,7 @@ static struct ctl_table oa_table[] = {
+ 	 .maxlen = sizeof(i915_oa_max_sample_rate),
+ 	 .mode = 0644,
+ 	 .proc_handler = proc_dointvec_minmax,
+-	 .extra1 = &zero,
++	 .extra1 = SYSCTL_ZERO,
+ 	 .extra2 = &oa_sample_rate_hard_limit,
+ 	 },
+ 	{}
+diff --git a/drivers/hv/vmbus_drv.c b/drivers/hv/vmbus_drv.c
+index 000b53e5a17a..61443b62b40f 100644
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@ -1190,8 +1190,6 @@ static struct kmsg_dumper hv_kmsg_dumper = {
+ };
+ 
+ static struct ctl_table_header *hv_ctl_table_hdr;
+-static int zero;
+-static int one = 1;
+ 
+ /*
+  * sysctl option to allow the user to control whether kmsg data should be
+@@ -1204,8 +1202,8 @@ static struct ctl_table hv_ctl_table[] = {
+ 		.maxlen         = sizeof(int),
+ 		.mode           = 0644,
+ 		.proc_handler   = proc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &one
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE
+ 	},
+ 	{}
+ };
+* Unmerged path drivers/tty/tty_ldisc.c
+diff --git a/drivers/xen/balloon.c b/drivers/xen/balloon.c
+index 6d8524fef0bb..24c1297a3c29 100644
+--- a/drivers/xen/balloon.c
++++ b/drivers/xen/balloon.c
+@@ -76,9 +76,6 @@ static int xen_hotplug_unpopulated;
+ 
+ #ifdef CONFIG_XEN_BALLOON_MEMORY_HOTPLUG
+ 
+-static int zero;
+-static int one = 1;
+-
+ static struct ctl_table balloon_table[] = {
+ 	{
+ 		.procname	= "hotplug_unpopulated",
+@@ -86,8 +83,8 @@ static struct ctl_table balloon_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &zero,
+-		.extra2         = &one,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = SYSCTL_ONE,
+ 	},
+ 	{ }
+ };
+diff --git a/fs/eventpoll.c b/fs/eventpoll.c
+index d58736a470b2..de16c7c5422a 100644
+--- a/fs/eventpoll.c
++++ b/fs/eventpoll.c
+@@ -296,7 +296,7 @@ static LIST_HEAD(tfile_check_list);
+ 
+ #include <linux/sysctl.h>
+ 
+-static long zero;
++static long long_zero;
+ static long long_max = LONG_MAX;
+ 
+ struct ctl_table epoll_table[] = {
+@@ -306,7 +306,7 @@ struct ctl_table epoll_table[] = {
+ 		.maxlen		= sizeof(max_user_watches),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_doulongvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= &long_zero,
+ 		.extra2		= &long_max,
+ 	},
+ 	{ }
+diff --git a/fs/notify/inotify/inotify_user.c b/fs/notify/inotify/inotify_user.c
+index 54bc7a25ac49..3b1361ecfe14 100644
+--- a/fs/notify/inotify/inotify_user.c
++++ b/fs/notify/inotify/inotify_user.c
+@@ -45,8 +45,6 @@ struct kmem_cache *inotify_inode_mark_cachep __read_mostly;
+ 
+ #include <linux/sysctl.h>
+ 
+-static int zero;
+-
+ struct ctl_table inotify_table[] = {
+ 	{
+ 		.procname	= "max_user_instances",
+@@ -54,7 +52,7 @@ struct ctl_table inotify_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 	},
+ 	{
+ 		.procname	= "max_user_watches",
+@@ -62,7 +60,7 @@ struct ctl_table inotify_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 	},
+ 	{
+ 		.procname	= "max_queued_events",
+@@ -70,7 +68,7 @@ struct ctl_table inotify_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero
++		.extra1		= SYSCTL_ZERO
+ 	},
+ 	{ }
+ };
+diff --git a/fs/proc/proc_sysctl.c b/fs/proc/proc_sysctl.c
+index 89921a0d2ebb..0d233d1d6636 100644
+--- a/fs/proc/proc_sysctl.c
++++ b/fs/proc/proc_sysctl.c
+@@ -21,6 +21,10 @@ static const struct inode_operations proc_sys_inode_operations;
+ static const struct file_operations proc_sys_dir_file_operations;
+ static const struct inode_operations proc_sys_dir_operations;
+ 
++/* shared constants to be used in various sysctls */
++const int sysctl_vals[] = { 0, 1, INT_MAX };
++EXPORT_SYMBOL(sysctl_vals);
++
+ /* Support for permanently empty directories */
+ 
+ struct ctl_table sysctl_mount_point[] = {
+diff --git a/include/linux/sysctl.h b/include/linux/sysctl.h
+index b769ecfcc3bd..490f78565a02 100644
+--- a/include/linux/sysctl.h
++++ b/include/linux/sysctl.h
+@@ -37,6 +37,13 @@ struct ctl_table_root;
+ struct ctl_table_header;
+ struct ctl_dir;
+ 
++/* Keep the same order as in fs/proc/proc_sysctl.c */
++#define SYSCTL_ZERO	((void *)&sysctl_vals[0])
++#define SYSCTL_ONE	((void *)&sysctl_vals[1])
++#define SYSCTL_INT_MAX	((void *)&sysctl_vals[2])
++
++extern const int sysctl_vals[];
++
+ typedef int proc_handler (struct ctl_table *ctl, int write,
+ 			  void __user *buffer, size_t *lenp, loff_t *ppos);
+ 
+diff --git a/ipc/ipc_sysctl.c b/ipc/ipc_sysctl.c
+index 2b14ce8ce73f..affd66537e87 100644
+--- a/ipc/ipc_sysctl.c
++++ b/ipc/ipc_sysctl.c
+@@ -113,9 +113,6 @@ static int proc_ipc_sem_dointvec(struct ctl_table *table, int write,
+ #define proc_ipc_sem_dointvec	   NULL
+ #endif
+ 
+-static int zero;
+-static int one = 1;
+-static int int_max = INT_MAX;
+ int ipc_mni = IPCMNI;
+ int ipc_mni_shift = IPCMNI_SHIFT;
+ int ipc_min_cycle = RADIX_TREE_MAP_SIZE;
+@@ -141,7 +138,7 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.shm_ctlmni),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &ipc_mni,
+ 	},
+ 	{
+@@ -150,8 +147,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.shm_rmid_forced),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax_orphans,
+-		.extra1		= &zero,
+-		.extra2		= &one,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{
+ 		.procname	= "msgmax",
+@@ -159,8 +156,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.msg_ctlmax),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "msgmni",
+@@ -168,7 +165,7 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.msg_ctlmni),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &ipc_mni,
+ 	},
+ 	{
+@@ -177,8 +174,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_auto_msgmni,
+-		.extra1		= &zero,
+-		.extra2		= &one,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{
+ 		.procname	=  "msgmnb",
+@@ -186,8 +183,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.msg_ctlmnb),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "sem",
+@@ -203,8 +200,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.ids[IPC_SEM_IDS].next_id),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "msg_next_id",
+@@ -212,8 +209,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.ids[IPC_MSG_IDS].next_id),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "shm_next_id",
+@@ -221,8 +218,8 @@ static struct ctl_table ipc_kern_table[] = {
+ 		.maxlen		= sizeof(init_ipc_ns.ids[IPC_SHM_IDS].next_id),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_ipc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ #endif
+ 	{}
+diff --git a/kernel/pid_namespace.c b/kernel/pid_namespace.c
+index aa6e72fb7c08..1c13c2a70344 100644
+--- a/kernel/pid_namespace.c
++++ b/kernel/pid_namespace.c
+@@ -290,14 +290,13 @@ static int pid_ns_ctl_handler(struct ctl_table *table, int write,
+ }
+ 
+ extern int pid_max;
+-static int zero = 0;
+ static struct ctl_table pid_ns_ctl_table[] = {
+ 	{
+ 		.procname = "ns_last_pid",
+ 		.maxlen = sizeof(int),
+ 		.mode = 0666, /* permissions are checked in the handler */
+ 		.proc_handler = pid_ns_ctl_handler,
+-		.extra1 = &zero,
++		.extra1 = SYSCTL_ZERO,
+ 		.extra2 = &pid_max,
+ 	},
+ 	{ }
+* Unmerged path kernel/sysctl.c
+diff --git a/kernel/ucount.c b/kernel/ucount.c
+index 328f82eb0adb..2c10b4aa8e5f 100644
+--- a/kernel/ucount.c
++++ b/kernel/ucount.c
+@@ -52,16 +52,14 @@ static struct ctl_table_root set_root = {
+ 	.permissions = set_permissions,
+ };
+ 
+-static int zero = 0;
+-static int int_max = INT_MAX;
+ #define UCOUNT_ENTRY(name)				\
+ 	{						\
+ 		.procname	= name,			\
+ 		.maxlen		= sizeof(int),		\
+ 		.mode		= 0644,			\
+ 		.proc_handler	= proc_dointvec_minmax,	\
+-		.extra1		= &zero,		\
+-		.extra2		= &int_max,		\
++		.extra1		= SYSCTL_ZERO,		\
++		.extra2		= SYSCTL_INT_MAX,	\
+ 	}
+ static struct ctl_table user_table[] = {
+ 	UCOUNT_ENTRY("max_user_namespaces"),
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index 23d863c9f0c7..f804044522b2 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -3258,8 +3258,6 @@ void neigh_app_ns(struct neighbour *n)
+ EXPORT_SYMBOL(neigh_app_ns);
+ 
+ #ifdef CONFIG_SYSCTL
+-static int zero;
+-static int int_max = INT_MAX;
+ static int unres_qlen_max = INT_MAX / SKB_TRUESIZE(ETH_FRAME_LEN);
+ 
+ static int proc_unres_qlen(struct ctl_table *ctl, int write,
+@@ -3268,7 +3266,7 @@ static int proc_unres_qlen(struct ctl_table *ctl, int write,
+ 	int size, ret;
+ 	struct ctl_table tmp = *ctl;
+ 
+-	tmp.extra1 = &zero;
++	tmp.extra1 = SYSCTL_ZERO;
+ 	tmp.extra2 = &unres_qlen_max;
+ 	tmp.data = &size;
+ 
+@@ -3333,8 +3331,8 @@ static int neigh_proc_dointvec_zero_intmax(struct ctl_table *ctl, int write,
+ 	struct ctl_table tmp = *ctl;
+ 	int ret;
+ 
+-	tmp.extra1 = &zero;
+-	tmp.extra2 = &int_max;
++	tmp.extra1 = SYSCTL_ZERO;
++	tmp.extra2 = SYSCTL_INT_MAX;
+ 
+ 	ret = proc_dointvec_minmax(&tmp, write, buffer, lenp, ppos);
+ 	neigh_proc_update(ctl, write);
+@@ -3479,24 +3477,24 @@ static struct neigh_sysctl_table {
+ 			.procname	= "gc_thresh1",
+ 			.maxlen		= sizeof(int),
+ 			.mode		= 0644,
+-			.extra1 	= &zero,
+-			.extra2		= &int_max,
++			.extra1		= SYSCTL_ZERO,
++			.extra2		= SYSCTL_INT_MAX,
+ 			.proc_handler	= proc_dointvec_minmax,
+ 		},
+ 		[NEIGH_VAR_GC_THRESH2] = {
+ 			.procname	= "gc_thresh2",
+ 			.maxlen		= sizeof(int),
+ 			.mode		= 0644,
+-			.extra1 	= &zero,
+-			.extra2		= &int_max,
++			.extra1		= SYSCTL_ZERO,
++			.extra2		= SYSCTL_INT_MAX,
+ 			.proc_handler	= proc_dointvec_minmax,
+ 		},
+ 		[NEIGH_VAR_GC_THRESH3] = {
+ 			.procname	= "gc_thresh3",
+ 			.maxlen		= sizeof(int),
+ 			.mode		= 0644,
+-			.extra1 	= &zero,
+-			.extra2		= &int_max,
++			.extra1		= SYSCTL_ZERO,
++			.extra2		= SYSCTL_INT_MAX,
+ 			.proc_handler	= proc_dointvec_minmax,
+ 		},
+ 		{},
+* Unmerged path net/core/sysctl_net_core.c
+diff --git a/net/dccp/sysctl.c b/net/dccp/sysctl.c
+index 53731e45403c..4d6147934179 100644
+--- a/net/dccp/sysctl.c
++++ b/net/dccp/sysctl.c
+@@ -19,9 +19,7 @@
+ #endif
+ 
+ /* Boundary values */
+-static int		zero     = 0,
+-			one      = 1,
+-			u8_max   = 0xFF;
++static int		u8_max   = 0xFF;
+ static unsigned long	seqw_min = DCCPF_SEQ_WMIN,
+ 			seqw_max = 0xFFFFFFFF;		/* maximum on 32 bit */
+ 
+@@ -41,7 +39,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_rx_ccid),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &u8_max,		/* RFC 4340, 10. */
+ 	},
+ 	{
+@@ -50,7 +48,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_tx_ccid),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &u8_max,		/* RFC 4340, 10. */
+ 	},
+ 	{
+@@ -59,7 +57,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_request_retries),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
++		.extra1		= SYSCTL_ONE,
+ 		.extra2		= &u8_max,
+ 	},
+ 	{
+@@ -68,7 +66,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_retries1),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &u8_max,
+ 	},
+ 	{
+@@ -77,7 +75,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_retries2),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &u8_max,
+ 	},
+ 	{
+@@ -86,7 +84,7 @@ static struct ctl_table dccp_default_table[] = {
+ 		.maxlen		= sizeof(sysctl_dccp_tx_qlen),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 	},
+ 	{
+ 		.procname	= "sync_ratelimit",
+* Unmerged path net/ipv4/sysctl_net_ipv4.c
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 55d37d6eddc0..ff8ceffebd06 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -6422,8 +6422,6 @@ int addrconf_sysctl_disable_policy(struct ctl_table *ctl, int write,
+ }
+ 
+ static int minus_one = -1;
+-static const int zero = 0;
+-static const int one = 1;
+ static const int two_five_five = 255;
+ 
+ static const struct ctl_table addrconf_sysctl[] = {
+@@ -6440,7 +6438,7 @@ static const struct ctl_table addrconf_sysctl[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= (void *)&one,
++		.extra1		= (void *)SYSCTL_ONE,
+ 		.extra2		= (void *)&two_five_five,
+ 	},
+ 	{
+@@ -6799,7 +6797,7 @@ static const struct ctl_table addrconf_sysctl[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= (void *)&zero,
++		.extra1		= (void *)SYSCTL_ZERO,
+ 		.extra2		= (void *)&two_five_five,
+ 	},
+ 	{
+* Unmerged path net/ipv6/route.c
+* Unmerged path net/ipv6/sysctl_net_ipv6.c
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index dd6573c92d5a..b1c5e77511c1 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -36,8 +36,6 @@
+ 
+ #define MPLS_NEIGH_TABLE_UNSPEC (NEIGH_LINK_TABLE + 1)
+ 
+-static int zero = 0;
+-static int one = 1;
+ static int label_limit = (1 << 20) - 1;
+ static int ttl_max = 255;
+ 
+@@ -2600,7 +2598,7 @@ static int mpls_platform_labels(struct ctl_table *table, int write,
+ 		.data		= &platform_labels,
+ 		.maxlen		= sizeof(int),
+ 		.mode		= table->mode,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &label_limit,
+ 	};
+ 
+@@ -2629,8 +2627,8 @@ static const struct ctl_table mpls_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &one,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_ONE,
+ 	},
+ 	{
+ 		.procname	= "default_ttl",
+@@ -2638,7 +2636,7 @@ static const struct ctl_table mpls_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
++		.extra1		= SYSCTL_ONE,
+ 		.extra2		= &ttl_max,
+ 	},
+ 	{ }
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index 53ba515e24c7..e71f9fedb22a 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -1655,7 +1655,6 @@ static int ip_vs_zero_all(struct netns_ipvs *ipvs)
+ 
+ #ifdef CONFIG_SYSCTL
+ 
+-static int zero;
+ static int three = 3;
+ 
+ static int
+@@ -1864,7 +1863,7 @@ static struct ctl_table vs_vars[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &three,
+ 	},
+ 	{
+* Unmerged path net/rxrpc/sysctl.c
+diff --git a/net/sctp/sysctl.c b/net/sctp/sysctl.c
+index 47e575be7057..8afc0754608d 100644
+--- a/net/sctp/sysctl.c
++++ b/net/sctp/sysctl.c
+@@ -40,10 +40,7 @@
+ #include <net/sctp/sctp.h>
+ #include <linux/sysctl.h>
+ 
+-static int zero = 0;
+-static int one = 1;
+ static int timer_max = 86400000; /* ms in one day */
+-static int int_max = INT_MAX;
+ static int sack_timer_min = 1;
+ static int sack_timer_max = 500;
+ static int addr_scope_max = SCTP_SCOPE_POLICY_MAX;
+@@ -107,7 +104,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &one,
++		.extra1         = SYSCTL_ONE,
+ 		.extra2         = &timer_max
+ 	},
+ 	{
+@@ -116,7 +113,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_sctp_do_rto_min,
+-		.extra1         = &one,
++		.extra1         = SYSCTL_ONE,
+ 		.extra2         = &init_net.sctp.rto_max
+ 	},
+ 	{
+@@ -152,8 +149,8 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "cookie_preserve_enable",
+@@ -175,7 +172,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &one,
++		.extra1         = SYSCTL_ONE,
+ 		.extra2         = &timer_max
+ 	},
+ 	{
+@@ -193,7 +190,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &one,
++		.extra1         = SYSCTL_ONE,
+ 		.extra2         = &timer_max
+ 	},
+ 	{
+@@ -202,8 +199,8 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
+-		.extra2		= &int_max
++		.extra1		= SYSCTL_ONE,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "path_max_retrans",
+@@ -211,8 +208,8 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
+-		.extra2		= &int_max
++		.extra1		= SYSCTL_ONE,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "max_init_retransmits",
+@@ -220,8 +217,8 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &one,
+-		.extra2		= &int_max
++		.extra1		= SYSCTL_ONE,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "pf_retrans",
+@@ -229,8 +226,8 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
+-		.extra2		= &int_max
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname	= "sndbuf_policy",
+@@ -308,7 +305,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &addr_scope_max,
+ 	},
+ 	{
+@@ -317,7 +314,7 @@ static struct ctl_table sctp_net_table[] = {
+ 		.maxlen		= sizeof(int),
+ 		.mode		= 0644,
+ 		.proc_handler	= &proc_dointvec_minmax,
+-		.extra1		= &one,
++		.extra1		= SYSCTL_ONE,
+ 		.extra2		= &rwnd_scale_max,
+ 	},
+ 	{
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 834507c61e0f..79637d1f845c 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -80,7 +80,6 @@ static unsigned int min_slot_table_size = RPCRDMA_MIN_SLOT_TABLE;
+ static unsigned int max_slot_table_size = RPCRDMA_MAX_SLOT_TABLE;
+ static unsigned int min_inline_size = RPCRDMA_MIN_INLINE;
+ static unsigned int max_inline_size = RPCRDMA_MAX_INLINE;
+-static unsigned int zero;
+ static unsigned int max_padding = PAGE_SIZE;
+ static unsigned int min_memreg = RPCRDMA_BOUNCEBUFFERS;
+ static unsigned int max_memreg = RPCRDMA_LAST - 1;
+@@ -122,7 +121,7 @@ static struct ctl_table xr_tunables_table[] = {
+ 		.maxlen		= sizeof(unsigned int),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1		= &zero,
++		.extra1		= SYSCTL_ZERO,
+ 		.extra2		= &max_padding,
+ 	},
+ 	{
+diff --git a/net/tipc/sysctl.c b/net/tipc/sysctl.c
+index 9df82a573aa7..6159d327db76 100644
+--- a/net/tipc/sysctl.c
++++ b/net/tipc/sysctl.c
+@@ -38,8 +38,6 @@
+ 
+ #include <linux/sysctl.h>
+ 
+-static int zero;
+-static int one = 1;
+ static struct ctl_table_header *tipc_ctl_hdr;
+ 
+ static struct ctl_table tipc_table[] = {
+@@ -49,7 +47,7 @@ static struct ctl_table tipc_table[] = {
+ 		.maxlen		= sizeof(sysctl_tipc_rmem),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &one,
++		.extra1         = SYSCTL_ONE,
+ 	},
+ 	{
+ 		.procname	= "named_timeout",
+@@ -57,7 +55,7 @@ static struct ctl_table tipc_table[] = {
+ 		.maxlen		= sizeof(sysctl_tipc_named_timeout),
+ 		.mode		= 0644,
+ 		.proc_handler	= proc_dointvec_minmax,
+-		.extra1         = &zero,
++		.extra1         = SYSCTL_ZERO,
+ 	},
+ 	{
+ 		.procname       = "sk_filter",
+diff --git a/security/keys/sysctl.c b/security/keys/sysctl.c
+index b68faa1a5cfd..1659dc3eac91 100644
+--- a/security/keys/sysctl.c
++++ b/security/keys/sysctl.c
+@@ -13,8 +13,6 @@
+ #include <linux/sysctl.h>
+ #include "internal.h"
+ 
+-static const int zero, one = 1, max = INT_MAX;
+-
+ struct ctl_table key_sysctls[] = {
+ 	{
+ 		.procname = "maxkeys",
+@@ -22,8 +20,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &one,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ONE,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname = "maxbytes",
+@@ -31,8 +29,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &one,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ONE,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname = "root_maxkeys",
+@@ -40,8 +38,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &one,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ONE,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname = "root_maxbytes",
+@@ -49,8 +47,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &one,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ONE,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ 	{
+ 		.procname = "gc_delay",
+@@ -58,8 +56,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &zero,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ZERO,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ #ifdef CONFIG_PERSISTENT_KEYRINGS
+ 	{
+@@ -68,8 +66,8 @@ struct ctl_table key_sysctls[] = {
+ 		.maxlen = sizeof(unsigned),
+ 		.mode = 0644,
+ 		.proc_handler = proc_dointvec_minmax,
+-		.extra1 = (void *) &zero,
+-		.extra2 = (void *) &max,
++		.extra1 = (void *) SYSCTL_ZERO,
++		.extra2 = (void *) SYSCTL_INT_MAX,
+ 	},
+ #endif
+ 	{ }
+diff --git a/security/loadpin/loadpin.c b/security/loadpin/loadpin.c
+index 5fa191252c8f..d730cfb4ee28 100644
+--- a/security/loadpin/loadpin.c
++++ b/security/loadpin/loadpin.c
+@@ -49,8 +49,6 @@ static struct super_block *pinned_root;
+ static DEFINE_SPINLOCK(pinned_root_spinlock);
+ 
+ #ifdef CONFIG_SYSCTL
+-static int zero;
+-static int one = 1;
+ 
+ static struct ctl_path loadpin_sysctl_path[] = {
+ 	{ .procname = "kernel", },
+@@ -65,8 +63,8 @@ static struct ctl_table loadpin_sysctl_table[] = {
+ 		.maxlen         = sizeof(int),
+ 		.mode           = 0644,
+ 		.proc_handler   = proc_dointvec_minmax,
+-		.extra1         = &zero,
+-		.extra2         = &one,
++		.extra1         = SYSCTL_ZERO,
++		.extra2         = SYSCTL_ONE,
+ 	},
+ 	{ }
+ };
+diff --git a/security/yama/yama_lsm.c b/security/yama/yama_lsm.c
+index ffda91a4a1aa..83c4c2f094b4 100644
+--- a/security/yama/yama_lsm.c
++++ b/security/yama/yama_lsm.c
+@@ -447,7 +447,6 @@ static int yama_dointvec_minmax(struct ctl_table *table, int write,
+ 	return proc_dointvec_minmax(&table_copy, write, buffer, lenp, ppos);
+ }
+ 
+-static int zero;
+ static int max_scope = YAMA_SCOPE_NO_ATTACH;
+ 
+ struct ctl_path yama_sysctl_path[] = {
+@@ -463,7 +462,7 @@ static struct ctl_table yama_sysctl_table[] = {
+ 		.maxlen         = sizeof(int),
+ 		.mode           = 0644,
+ 		.proc_handler   = yama_dointvec_minmax,
+-		.extra1         = &zero,
++		.extra1         = SYSCTL_ZERO,
+ 		.extra2         = &max_scope,
+ 	},
+ 	{ }
