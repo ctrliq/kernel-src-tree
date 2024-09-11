@@ -1,0 +1,253 @@
+io_uring: add support for IORING_OP_CONNECT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit f8e85cf255ad57d65eeb9a9d0e59e3dec55bdd9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f8e85cf2.failed
+
+This allows an application to call connect() in an async fashion. Like
+other opcodes, we first try a non-blocking connect, then punt to async
+context if we have to.
+
+Note that we can still return -EINPROGRESS, and in that case the caller
+should use IORING_OP_POLL_ADD to do an async wait for completion of the
+connect request (just like for regular connect(2), except we can do it
+async here too).
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f8e85cf255ad57d65eeb9a9d0e59e3dec55bdd9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+#	include/uapi/linux/io_uring.h
+diff --cc fs/io_uring.c
+index 66de1d702552,02254929231b..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -475,12 -542,74 +475,31 @@@ static inline void io_queue_async_work(
+  		switch (req->submit.sqe->opcode) {
+  		case IORING_OP_WRITEV:
+  		case IORING_OP_WRITE_FIXED:
+++<<<<<<< HEAD
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+++=======
++ 			do_hashed = true;
++ 			/* fall-through */
++ 		case IORING_OP_READV:
++ 		case IORING_OP_READ_FIXED:
++ 		case IORING_OP_SENDMSG:
++ 		case IORING_OP_RECVMSG:
++ 		case IORING_OP_ACCEPT:
++ 		case IORING_OP_POLL_ADD:
++ 		case IORING_OP_CONNECT:
++ 			/*
++ 			 * We know REQ_F_ISREG is not set on some of these
++ 			 * opcodes, but this enables us to keep the check in
++ 			 * just one place.
++ 			 */
++ 			if (!(req->flags & REQ_F_ISREG))
++ 				req->work.flags |= IO_WQ_WORK_UNBOUND;
+++>>>>>>> f8e85cf255ad (io_uring: add support for IORING_OP_CONNECT)
+  			break;
+  		}
+ -		if (io_sqe_needs_user(req->submit.sqe))
+ -			req->work.flags |= IO_WQ_WORK_NEEDS_USER;
+ -	}
+ -
+ -	*link = io_prep_linked_timeout(req);
+ -	return do_hashed;
+ -}
+ -
+ -static inline void io_queue_async_work(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	struct io_kiocb *link;
+ -	bool do_hashed;
+ -
+ -	do_hashed = io_prep_async_work(req, &link);
+ -
+ -	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
+ -					req->flags);
+ -	if (!do_hashed) {
+ -		io_wq_enqueue(ctx->io_wq, &req->work);
+ -	} else {
+ -		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
+ -					file_inode(req->file));
+ -	}
+ -
+ -	if (link)
+ -		io_queue_linked_timeout(link);
+ -}
+ -
+ -static void io_kill_timeout(struct io_kiocb *req)
+ -{
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->timeout.data->timer);
+ -	if (ret != -1) {
+ -		atomic_inc(&req->ctx->cq_timeouts);
+ -		list_del_init(&req->list);
+ -		io_cqring_fill_event(req, 0);
+ -		io_put_req(req);
+  	}
+ -}
+ -
+ -static void io_kill_timeouts(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req, *tmp;
+  
+ -	spin_lock_irq(&ctx->completion_lock);
+ -	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
+ -		io_kill_timeout(req);
+ -	spin_unlock_irq(&ctx->completion_lock);
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -1620,6 -1939,82 +1639,85 @@@ static int io_recvmsg(struct io_kiocb *
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int io_accept(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 		     struct io_kiocb **nxt, bool force_nonblock)
++ {
++ #if defined(CONFIG_NET)
++ 	struct sockaddr __user *addr;
++ 	int __user *addr_len;
++ 	unsigned file_flags;
++ 	int flags, ret;
++ 
++ 	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
++ 		return -EINVAL;
++ 	if (sqe->ioprio || sqe->off || sqe->len || sqe->buf_index)
++ 		return -EINVAL;
++ 
++ 	addr = (struct sockaddr __user *) (unsigned long) READ_ONCE(sqe->addr);
++ 	addr_len = (int __user *) (unsigned long) READ_ONCE(sqe->addr2);
++ 	flags = READ_ONCE(sqe->accept_flags);
++ 	file_flags = force_nonblock ? O_NONBLOCK : 0;
++ 
++ 	ret = __sys_accept4_file(req->file, file_flags, addr, addr_len, flags);
++ 	if (ret == -EAGAIN && force_nonblock) {
++ 		req->work.flags |= IO_WQ_WORK_NEEDS_FILES;
++ 		return -EAGAIN;
++ 	}
++ 	if (ret == -ERESTARTSYS)
++ 		ret = -EINTR;
++ 	if (ret < 0 && (req->flags & REQ_F_LINK))
++ 		req->flags |= REQ_F_FAIL_LINK;
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_connect(struct io_kiocb *req, const struct io_uring_sqe *sqe,
++ 		      struct io_kiocb **nxt, bool force_nonblock)
++ {
++ #if defined(CONFIG_NET)
++ 	struct sockaddr __user *addr;
++ 	unsigned file_flags;
++ 	int addr_len, ret;
++ 
++ 	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
++ 		return -EINVAL;
++ 	if (sqe->ioprio || sqe->len || sqe->buf_index || sqe->rw_flags)
++ 		return -EINVAL;
++ 
++ 	addr = (struct sockaddr __user *) (unsigned long) READ_ONCE(sqe->addr);
++ 	addr_len = READ_ONCE(sqe->addr2);
++ 	file_flags = force_nonblock ? O_NONBLOCK : 0;
++ 
++ 	ret = __sys_connect_file(req->file, addr, addr_len, file_flags);
++ 	if (ret == -EAGAIN && force_nonblock)
++ 		return -EAGAIN;
++ 	if (ret == -ERESTARTSYS)
++ 		ret = -EINTR;
++ 	if (ret < 0 && (req->flags & REQ_F_LINK))
++ 		req->flags |= REQ_F_FAIL_LINK;
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req_find_next(req, nxt);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static inline void io_poll_remove_req(struct io_kiocb *req)
++ {
++ 	if (!RB_EMPTY_NODE(&req->rb_node)) {
++ 		rb_erase(&req->rb_node, &req->ctx->cancel_tree);
++ 		RB_CLEAR_NODE(&req->rb_node);
++ 	}
++ }
++ 
+++>>>>>>> f8e85cf255ad (io_uring: add support for IORING_OP_CONNECT)
+  static void io_poll_remove_one(struct io_kiocb *req)
+  {
+  	struct io_poll_iocb *poll = &req->poll;
+@@@ -1903,13 -2653,28 +2001,32 @@@ static int __io_submit_sqe(struct io_ri
+  		ret = io_poll_remove(req, s->sqe);
+  		break;
+  	case IORING_OP_SYNC_FILE_RANGE:
+ -		ret = io_sync_file_range(req, s->sqe, nxt, force_nonblock);
+ +		ret = io_sync_file_range(req, s->sqe, force_nonblock);
+  		break;
+  	case IORING_OP_SENDMSG:
+ -		ret = io_sendmsg(req, s->sqe, nxt, force_nonblock);
+ +		ret = io_sendmsg(req, s->sqe, force_nonblock);
+  		break;
+  	case IORING_OP_RECVMSG:
+++<<<<<<< HEAD
+ +		ret = io_recvmsg(req, s->sqe, force_nonblock);
+++=======
++ 		ret = io_recvmsg(req, s->sqe, nxt, force_nonblock);
++ 		break;
++ 	case IORING_OP_TIMEOUT:
++ 		ret = io_timeout(req, s->sqe);
++ 		break;
++ 	case IORING_OP_TIMEOUT_REMOVE:
++ 		ret = io_timeout_remove(req, s->sqe);
++ 		break;
++ 	case IORING_OP_ACCEPT:
++ 		ret = io_accept(req, s->sqe, nxt, force_nonblock);
++ 		break;
++ 	case IORING_OP_CONNECT:
++ 		ret = io_connect(req, s->sqe, nxt, force_nonblock);
++ 		break;
++ 	case IORING_OP_ASYNC_CANCEL:
++ 		ret = io_async_cancel(req, s->sqe, nxt);
+++>>>>>>> f8e85cf255ad (io_uring: add support for IORING_OP_CONNECT)
+  		break;
+  	default:
+  		ret = -EINVAL;
+diff --cc include/uapi/linux/io_uring.h
+index ee8693aec163,4637ed1d9949..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -62,6 -68,12 +62,15 @@@ struct io_uring_sqe 
+  #define IORING_OP_SYNC_FILE_RANGE	8
+  #define IORING_OP_SENDMSG	9
+  #define IORING_OP_RECVMSG	10
+++<<<<<<< HEAD
+++=======
++ #define IORING_OP_TIMEOUT	11
++ #define IORING_OP_TIMEOUT_REMOVE	12
++ #define IORING_OP_ACCEPT	13
++ #define IORING_OP_ASYNC_CANCEL	14
++ #define IORING_OP_LINK_TIMEOUT	15
++ #define IORING_OP_CONNECT	16
+++>>>>>>> f8e85cf255ad (io_uring: add support for IORING_OP_CONNECT)
+  
+  /*
+   * sqe->fsync_flags
+* Unmerged path fs/io_uring.c
+* Unmerged path include/uapi/linux/io_uring.h
