@@ -1,0 +1,131 @@
+nvdimm: simplify revalidate_disk handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 32f61d67570db036dba9e4fb2509b5343e28f627
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/32f61d67.failed
+
+The nvdimm block driver abuse revalidate_disk in a strange way, and
+totally unrelated to what other drivers do.  Simplify this by just
+calling nvdimm_revalidate_disk (which seems rather misnamed) from the
+probe routines, as the additional bdev size revalidation is pointless
+at this point, and remove the revalidate_disk methods given that
+it can only be triggered from add_disk, which is right before the
+manual calls.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Josef Bacik <josef@toxicpanda.com>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 32f61d67570db036dba9e4fb2509b5343e28f627)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/blk.c
+diff --cc drivers/nvdimm/blk.c
+index 5d23dc7e378e,22e5617b2cea..000000000000
+--- a/drivers/nvdimm/blk.c
++++ b/drivers/nvdimm/blk.c
+@@@ -234,7 -225,7 +234,11 @@@ static int nsblk_rw_bytes(struct nd_nam
+  
+  static const struct block_device_operations nd_blk_fops = {
+  	.owner = THIS_MODULE,
+++<<<<<<< HEAD
+ +	.revalidate_disk = nvdimm_revalidate_disk,
+++=======
++ 	.submit_bio =  nd_blk_submit_bio,
+++>>>>>>> 32f61d67570d (nvdimm: simplify revalidate_disk handling)
+  };
+  
+  static void nd_blk_release_queue(void *q)
+* Unmerged path drivers/nvdimm/blk.c
+diff --git a/drivers/nvdimm/btt.c b/drivers/nvdimm/btt.c
+index 68f140087244..fcdd1ce49080 100644
+--- a/drivers/nvdimm/btt.c
++++ b/drivers/nvdimm/btt.c
+@@ -1520,7 +1520,6 @@ static const struct block_device_operations btt_fops = {
+ 	.owner =		THIS_MODULE,
+ 	.rw_page =		btt_rw_page,
+ 	.getgeo =		btt_getgeo,
+-	.revalidate_disk =	nvdimm_revalidate_disk,
+ };
+ 
+ static int btt_blk_init(struct btt *btt)
+@@ -1566,7 +1565,7 @@ static int btt_blk_init(struct btt *btt)
+ 	set_capacity(btt->btt_disk, btt->nlba * btt->sector_size >> 9);
+ 	device_add_disk(&btt->nd_btt->dev, btt->btt_disk, NULL);
+ 	btt->nd_btt->size = btt->nlba * (u64)btt->sector_size;
+-	revalidate_disk(btt->btt_disk);
++	nvdimm_check_and_set_ro(btt->btt_disk);
+ 
+ 	return 0;
+ }
+diff --git a/drivers/nvdimm/bus.c b/drivers/nvdimm/bus.c
+index cb97abca1978..d72e5244b83f 100644
+--- a/drivers/nvdimm/bus.c
++++ b/drivers/nvdimm/bus.c
+@@ -630,7 +630,7 @@ int __nd_driver_register(struct nd_device_driver *nd_drv, struct module *owner,
+ }
+ EXPORT_SYMBOL(__nd_driver_register);
+ 
+-int nvdimm_revalidate_disk(struct gendisk *disk)
++void nvdimm_check_and_set_ro(struct gendisk *disk)
+ {
+ 	struct device *dev = disk_to_dev(disk)->parent;
+ 	struct nd_region *nd_region = to_nd_region(dev->parent);
+@@ -641,16 +641,13 @@ int nvdimm_revalidate_disk(struct gendisk *disk)
+ 	 * read-only if the disk is already read-only.
+ 	 */
+ 	if (disk_ro || nd_region->ro == disk_ro)
+-		return 0;
++		return;
+ 
+ 	dev_info(dev, "%s read-only, marking %s read-only\n",
+ 			dev_name(&nd_region->dev), disk->disk_name);
+ 	set_disk_ro(disk, 1);
+-
+-	return 0;
+-
+ }
+-EXPORT_SYMBOL(nvdimm_revalidate_disk);
++EXPORT_SYMBOL(nvdimm_check_and_set_ro);
+ 
+ static ssize_t modalias_show(struct device *dev, struct device_attribute *attr,
+ 		char *buf)
+diff --git a/drivers/nvdimm/nd.h b/drivers/nvdimm/nd.h
+index f875fd8bbed2..c4ece6ae6695 100644
+--- a/drivers/nvdimm/nd.h
++++ b/drivers/nvdimm/nd.h
+@@ -368,7 +368,7 @@ u64 nd_region_interleave_set_altcookie(struct nd_region *nd_region);
+ void nvdimm_bus_lock(struct device *dev);
+ void nvdimm_bus_unlock(struct device *dev);
+ bool is_nvdimm_bus_locked(struct device *dev);
+-int nvdimm_revalidate_disk(struct gendisk *disk);
++void nvdimm_check_and_set_ro(struct gendisk *disk);
+ void nvdimm_drvdata_release(struct kref *kref);
+ void put_ndd(struct nvdimm_drvdata *ndd);
+ int nd_label_reserve_dpa(struct nvdimm_drvdata *ndd);
+diff --git a/drivers/nvdimm/pmem.c b/drivers/nvdimm/pmem.c
+index 62b32d013a9c..18752df39bd6 100644
+--- a/drivers/nvdimm/pmem.c
++++ b/drivers/nvdimm/pmem.c
+@@ -290,7 +290,6 @@ __weak long __pmem_direct_access(struct pmem_device *pmem, pgoff_t pgoff,
+ static const struct block_device_operations pmem_fops = {
+ 	.owner =		THIS_MODULE,
+ 	.rw_page =		pmem_rw_page,
+-	.revalidate_disk =	nvdimm_revalidate_disk,
+ };
+ 
+ static int pmem_dax_zero_page_range(struct dax_device *dax_dev, pgoff_t pgoff,
+@@ -506,7 +505,7 @@ static int pmem_attach_disk(struct device *dev,
+ 	if (devm_add_action_or_reset(dev, pmem_release_disk, pmem))
+ 		return -ENOMEM;
+ 
+-	revalidate_disk(disk);
++	nvdimm_check_and_set_ro(disk);
+ 
+ 	pmem->bb_state = sysfs_get_dirent(disk_to_dev(disk)->kobj.sd,
+ 					  "badblocks");
