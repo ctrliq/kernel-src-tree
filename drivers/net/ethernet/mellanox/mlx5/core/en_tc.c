@@ -1050,14 +1050,16 @@ err_ft_get:
 
 static int
 mlx5e_tc_add_nic_flow(struct mlx5e_priv *priv,
-		      struct mlx5e_tc_flow_parse_attr *parse_attr,
 		      struct mlx5e_tc_flow *flow,
 		      struct netlink_ext_ack *extack)
 {
+	struct mlx5e_tc_flow_parse_attr *parse_attr;
 	struct mlx5_flow_attr *attr = flow->attr;
 	struct mlx5_core_dev *dev = priv->mdev;
 	struct mlx5_fc *counter = NULL;
 	int err;
+
+	parse_attr = attr->parse_attr;
 
 	if (flow_flag_test(flow, HAIRPIN)) {
 		err = mlx5e_hairpin_flow_add(priv, flow, parse_attr, extack);
@@ -3429,10 +3431,10 @@ static int validate_goto_chain(struct mlx5e_priv *priv,
 
 static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 				struct flow_action *flow_action,
-				struct mlx5e_tc_flow_parse_attr *parse_attr,
 				struct mlx5e_tc_flow *flow,
 				struct netlink_ext_ack *extack)
 {
+	struct mlx5e_tc_flow_parse_attr *parse_attr;
 	struct mlx5_flow_attr *attr = flow->attr;
 	struct pedit_headers_action hdrs[2] = {};
 	const struct flow_action_entry *act;
@@ -3449,8 +3451,8 @@ static int parse_tc_nic_actions(struct mlx5e_priv *priv,
 		return -EOPNOTSUPP;
 
 	nic_attr = attr->nic_attr;
-
 	nic_attr->flow_tag = MLX5_FS_DEFAULT_FLOW_TAG;
+	parse_attr = attr->parse_attr;
 
 	flow_action_for_each(i, act, flow_action) {
 		switch (act->id) {
@@ -4645,11 +4647,11 @@ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
 	if (err)
 		goto err_free;
 
-	err = parse_tc_nic_actions(priv, &rule->action, parse_attr, flow, extack);
+	err = parse_tc_nic_actions(priv, &rule->action, flow, extack);
 	if (err)
 		goto err_free;
 
-	err = mlx5e_tc_add_nic_flow(priv, parse_attr, flow, extack);
+	err = mlx5e_tc_add_nic_flow(priv, flow, extack);
 	if (err)
 		goto err_free;
 
