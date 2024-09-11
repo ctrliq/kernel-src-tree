@@ -1,0 +1,151 @@
+devlink: hold a reference to the netdevice around ethtool compat
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 1b45ff6c17f1d07c496b08dd602a4aff8fe40848
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/1b45ff6c.failed
+
+When ethtool is calling into devlink compat code make sure we have
+a reference on the netdevice on which the operation was invoked.
+
+v3: move the hold/lock logic into devlink_compat_* functions (Florian)
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1b45ff6c17f1d07c496b08dd602a4aff8fe40848)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index 697c7c3684df,ecff6e63bc4d..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -6451,55 -6428,49 +6451,71 @@@ free_msg
+  void devlink_compat_running_version(struct net_device *dev,
+  				    char *buf, size_t len)
+  {
+ +	struct devlink_port *devlink_port;
+  	struct devlink *devlink;
+  
++ 	dev_hold(dev);
++ 	rtnl_unlock();
++ 
+  	mutex_lock(&devlink_mutex);
+ -	devlink = netdev_to_devlink(dev);
+ -	if (!devlink || !devlink->ops || !devlink->ops->info_get)
+ -		goto unlock_list;
+ -
+ -	mutex_lock(&devlink->lock);
+ -	__devlink_compat_running_version(devlink, buf, len);
+ -	mutex_unlock(&devlink->lock);
+ -unlock_list:
+ +	list_for_each_entry(devlink, &devlink_list, list) {
+ +		mutex_lock(&devlink->lock);
+ +		list_for_each_entry(devlink_port, &devlink->port_list, list) {
+ +			if (devlink_port->type == DEVLINK_PORT_TYPE_ETH &&
+ +			    devlink_port->type_dev == dev) {
+ +				__devlink_compat_running_version(devlink,
+ +								 buf, len);
+ +				mutex_unlock(&devlink->lock);
+ +				goto out;
+ +			}
+ +		}
+ +		mutex_unlock(&devlink->lock);
+ +	}
+ +out:
+  	mutex_unlock(&devlink_mutex);
++ 
++ 	rtnl_lock();
++ 	dev_put(dev);
+  }
+  
+  int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
+  {
+ +	struct devlink_port *devlink_port;
+  	struct devlink *devlink;
+ -	int ret = -EOPNOTSUPP;
+  
++ 	dev_hold(dev);
++ 	rtnl_unlock();
++ 
+  	mutex_lock(&devlink_mutex);
+ -	devlink = netdev_to_devlink(dev);
+ -	if (!devlink || !devlink->ops || !devlink->ops->flash_update)
+ -		goto unlock_list;
+ +	list_for_each_entry(devlink, &devlink_list, list) {
+ +		mutex_lock(&devlink->lock);
+ +		list_for_each_entry(devlink_port, &devlink->port_list, list) {
+ +			int ret = -EOPNOTSUPP;
+  
+ -	mutex_lock(&devlink->lock);
+ -	ret = devlink->ops->flash_update(devlink, file_name, NULL, NULL);
+ -	mutex_unlock(&devlink->lock);
+ -unlock_list:
+ +			if (devlink_port->type != DEVLINK_PORT_TYPE_ETH ||
+ +			    devlink_port->type_dev != dev)
+ +				continue;
+ +
+ +			mutex_unlock(&devlink_mutex);
+ +			if (devlink->ops->flash_update)
+ +				ret = devlink->ops->flash_update(devlink,
+ +								 file_name,
+ +								 NULL, NULL);
+ +			mutex_unlock(&devlink->lock);
+ +			return ret;
+ +		}
+ +		mutex_unlock(&devlink->lock);
+ +	}
+  	mutex_unlock(&devlink_mutex);
+  
+++<<<<<<< HEAD
+ +	return -EOPNOTSUPP;
+++=======
++ 	rtnl_lock();
++ 	dev_put(dev);
++ 
++ 	return ret;
+++>>>>>>> 1b45ff6c17f1 (devlink: hold a reference to the netdevice around ethtool compat)
+  }
+  
+  static int __init devlink_init(void)
+* Unmerged path net/core/devlink.c
+diff --git a/net/core/ethtool.c b/net/core/ethtool.c
+index 3610f115016f..560294d489c0 100644
+--- a/net/core/ethtool.c
++++ b/net/core/ethtool.c
+@@ -1020,11 +1020,9 @@ static noinline_for_stack int ethtool_get_drvinfo(struct net_device *dev,
+ 	if (ops->get_eeprom_len)
+ 		info.eedump_len = ops->get_eeprom_len(dev);
+ 
+-	rtnl_unlock();
+ 	if (!info.fw_version[0])
+ 		devlink_compat_running_version(dev, info.fw_version,
+ 					       sizeof(info.fw_version));
+-	rtnl_lock();
+ 
+ 	if (copy_to_user(useraddr, &info, sizeof(info)))
+ 		return -EFAULT;
+@@ -2251,15 +2249,8 @@ static noinline_for_stack int ethtool_flash_device(struct net_device *dev,
+ 		return -EFAULT;
+ 	efl.data[ETHTOOL_FLASH_MAX_FILENAME - 1] = 0;
+ 
+-	if (!dev->ethtool_ops->flash_device) {
+-		int ret;
+-
+-		rtnl_unlock();
+-		ret = devlink_compat_flash_update(dev, efl.data);
+-		rtnl_lock();
+-
+-		return ret;
+-	}
++	if (!dev->ethtool_ops->flash_device)
++		return devlink_compat_flash_update(dev, efl.data);
+ 
+ 	return dev->ethtool_ops->flash_device(dev, &efl);
+ }
