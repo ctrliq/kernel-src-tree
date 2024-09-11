@@ -1,0 +1,121 @@
+s390/qeth: allow configuration of TX queues for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 66cddf101901a6cfcd21c840f0535e8f1c8c5186
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/66cddf10.failed
+
+Similar to the support for z/VM NICs, but we need to take extra care
+about the dedicated mcast queue:
+
+1. netdev_pick_tx() is unaware of this limitation and might select the
+   mcast txq. Catch this.
+2. require at least _two_ TX queues - one for ucast, one for mcast.
+3. when reducing the number of TX queues, there's a potential race
+   where netdev_cap_txqueue() over-rules the selected txq index and
+   falls back to index 0. This would place ucast traffic on the mcast
+   queue, and result in TX errors.
+   So for IQD, reject a reduction while the interface is running.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 66cddf101901a6cfcd21c840f0535e8f1c8c5186)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_ethtool.c
+diff --cc drivers/s390/net/qeth_ethtool.c
+index ab59bc975719,715ee0015847..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -175,6 -175,64 +175,67 @@@ static void qeth_get_channels(struct ne
+  	channels->combined_count = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qeth_set_channels(struct net_device *dev,
++ 			     struct ethtool_channels *channels)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (channels->rx_count == 0 || channels->tx_count == 0)
++ 		return -EINVAL;
++ 	if (channels->tx_count > card->qdio.no_out_queues)
++ 		return -EINVAL;
++ 
++ 	if (IS_IQD(card)) {
++ 		if (channels->tx_count < QETH_IQD_MIN_TXQ)
++ 			return -EINVAL;
++ 
++ 		/* Reject downgrade while running. It could push displaced
++ 		 * ucast flows onto txq0, which is reserved for mcast.
++ 		 */
++ 		if (netif_running(dev) &&
++ 		    channels->tx_count < dev->real_num_tx_queues)
++ 			return -EPERM;
++ 	} else {
++ 		/* OSA still uses the legacy prio-queue mechanism: */
++ 		if (!IS_VM_NIC(card))
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return netif_set_real_num_tx_queues(dev, channels->tx_count);
++ }
++ 
++ static int qeth_get_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna, void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		*(u32 *)data = priv->rx_copybreak;
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int qeth_set_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna,
++ 			    const void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		WRITE_ONCE(priv->rx_copybreak, *(u32 *)data);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
+++>>>>>>> 66cddf101901 (s390/qeth: allow configuration of TX queues for IQD devices)
+  /* Helper function to fill 'advertising' and 'supported' which are the same. */
+  /* Autoneg and full-duplex are supported and advertised unconditionally.     */
+  /* Always advertise and support all speeds up to specified, and only one     */
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index bc50c9fcba8c..953829991c06 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -6406,9 +6406,13 @@ EXPORT_SYMBOL_GPL(qeth_get_stats64);
+ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
+ 			  u8 cast_type, struct net_device *sb_dev)
+ {
++	u16 txq;
++
+ 	if (cast_type != RTN_UNICAST)
+ 		return QETH_IQD_MCAST_TXQ;
+-	return QETH_IQD_MIN_UCAST_TXQ;
++
++	txq = netdev_pick_tx(dev, skb, sb_dev);
++	return (txq == QETH_IQD_MCAST_TXQ) ? QETH_IQD_MIN_UCAST_TXQ : txq;
+ }
+ EXPORT_SYMBOL_GPL(qeth_iqd_select_queue);
+ 
+* Unmerged path drivers/s390/net/qeth_ethtool.c
