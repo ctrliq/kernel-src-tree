@@ -1,0 +1,118 @@
+blk-mq: merge the softirq vs non-softirq IPI logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit d391a7a399e46315a8adc65eb8fb5d9123b91700
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d391a7a3.failed
+
+Both the softirq path for single queue devices and the multi-queue
+completion handler share the same logic to figure out if we need an
+IPI for the completion and eventually issue it.  Merge the two
+versions into a single unified code path.
+
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d391a7a399e46315a8adc65eb8fb5d9123b91700)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 8c9d610d9153,ce772ab19188..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -573,12 -576,82 +573,85 @@@ void blk_mq_end_request(struct request 
+  }
+  EXPORT_SYMBOL(blk_mq_end_request);
+  
+- static void __blk_mq_complete_request_remote(void *data)
+++<<<<<<< HEAD
+++=======
++ /*
++  * Softirq action handler - move entries to local list and loop over them
++  * while passing them to the queue registered handler.
++  */
++ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
+  {
+- 	struct request *rq = data;
+- 	struct request_queue *q = rq->q;
++ 	struct list_head *cpu_list, local_list;
++ 
++ 	local_irq_disable();
++ 	cpu_list = this_cpu_ptr(&blk_cpu_done);
++ 	list_replace_init(cpu_list, &local_list);
++ 	local_irq_enable();
++ 
++ 	while (!list_empty(&local_list)) {
++ 		struct request *rq;
++ 
++ 		rq = list_entry(local_list.next, struct request, ipi_list);
++ 		list_del_init(&rq->ipi_list);
++ 		rq->q->mq_ops->complete(rq);
++ 	}
++ }
++ 
++ static void blk_mq_trigger_softirq(struct request *rq)
++ {
++ 	struct list_head *list;
++ 	unsigned long flags;
++ 
++ 	local_irq_save(flags);
++ 	list = this_cpu_ptr(&blk_cpu_done);
++ 	list_add_tail(&rq->ipi_list, list);
++ 
++ 	/*
++ 	 * If the list only contains our just added request, signal a raise of
++ 	 * the softirq.  If there are already entries there, someone already
++ 	 * raised the irq but it hasn't run yet.
++ 	 */
++ 	if (list->next == &rq->ipi_list)
++ 		raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ 	local_irq_restore(flags);
++ }
++ 
++ static int blk_softirq_cpu_dead(unsigned int cpu)
++ {
++ 	/*
++ 	 * If a CPU goes away, splice its entries to the current CPU
++ 	 * and trigger a run of the softirq
++ 	 */
++ 	local_irq_disable();
++ 	list_splice_init(&per_cpu(blk_cpu_done, cpu),
++ 			 this_cpu_ptr(&blk_cpu_done));
++ 	raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ 	local_irq_enable();
+  
+- 	q->mq_ops->complete(rq);
++ 	return 0;
++ }
++ 
++ static void __blk_mq_complete_request(struct request *rq)
++ {
++ 	/*
++ 	 * For most of single queue controllers, there is only one irq vector
++ 	 * for handling I/O completion, and the only irq's affinity is set
++ 	 * to all possible CPUs.  On most of ARCHs, this affinity means the irq
++ 	 * is handled on one specific CPU.
++ 	 *
++ 	 * So complete I/O requests in softirq context in case of single queue
++ 	 * devices to avoid degrading I/O performance due to irqsoff latency.
++ 	 */
++ 	if (rq->q->nr_hw_queues == 1)
++ 		blk_mq_trigger_softirq(rq);
++ 	else
++ 		rq->q->mq_ops->complete(rq);
++ }
++ 
+++>>>>>>> d391a7a399e4 (blk-mq: merge the softirq vs non-softirq IPI logic)
++ static void __blk_mq_complete_request_remote(void *data)
++ {
++ 	__blk_mq_complete_request(data);
+  }
+  
+  /**
+* Unmerged path block/blk-mq.c
