@@ -1,0 +1,375 @@
+xfrm: remove gso_segment indirection from xfrm_mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 7613b92b1ae37141704948b77e8762c5de896510
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7613b92b.failed
+
+These functions are small and we only have versions for tunnel
+and transport mode for ipv4 and ipv6 respectively.
+
+Just place the 'transport or tunnel' conditional in the protocol
+specific function instead of using an indirection.
+
+Before:
+    3226       12       0     3238   net/ipv4/esp4_offload.o
+    7004      492       0     7496   net/ipv4/ip_vti.o
+    3339       12       0     3351   net/ipv6/esp6_offload.o
+   11294      460       0    11754   net/ipv6/ip6_vti.o
+    1180       72       0     1252   net/ipv4/xfrm4_mode_beet.o
+     428       48       0      476   net/ipv4/xfrm4_mode_transport.o
+    1271       48       0     1319   net/ipv4/xfrm4_mode_tunnel.o
+    1083       60       0     1143   net/ipv6/xfrm6_mode_beet.o
+     172       48       0      220   net/ipv6/xfrm6_mode_ro.o
+     429       48       0      477   net/ipv6/xfrm6_mode_transport.o
+    1164       48       0     1212   net/ipv6/xfrm6_mode_tunnel.o
+15730428  6937008 4046908 26714344   vmlinux
+
+After:
+    3461       12       0     3473   net/ipv4/esp4_offload.o
+    7000      492       0     7492   net/ipv4/ip_vti.o
+    3574       12       0     3586   net/ipv6/esp6_offload.o
+   11295      460       0    11755   net/ipv6/ip6_vti.o
+    1180       64       0     1244   net/ipv4/xfrm4_mode_beet.o
+     171       40       0      211   net/ipv4/xfrm4_mode_transport.o
+    1163       40       0     1203   net/ipv4/xfrm4_mode_tunnel.o
+    1083       52       0     1135   net/ipv6/xfrm6_mode_beet.o
+     172       40       0      212   net/ipv6/xfrm6_mode_ro.o
+     172       40       0      212   net/ipv6/xfrm6_mode_transport.o
+    1056       40       0     1096   net/ipv6/xfrm6_mode_tunnel.o
+15730424  6937008 4046908 26714340   vmlinux
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 7613b92b1ae37141704948b77e8762c5de896510)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xfrm.h
+#	net/ipv4/xfrm4_mode_transport.c
+#	net/ipv4/xfrm4_mode_tunnel.c
+#	net/ipv6/xfrm6_mode_transport.c
+#	net/ipv6/xfrm6_mode_tunnel.c
+diff --cc include/net/xfrm.h
+index e9420a08d663,de103a6d1ef8..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -469,16 -449,6 +469,19 @@@ struct xfrm_mode 
+  	 */
+  	int (*output2)(struct xfrm_state *x,struct sk_buff *skb);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Adjust pointers into the packet and do GSO segmentation.
+ +	 */
+ +	struct sk_buff *(*gso_segment)(struct xfrm_state *x, struct sk_buff *skb, netdev_features_t features);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet when IPsec is done at layer2.
+ +	 */
+ +	void (*xmit)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+++=======
+++>>>>>>> 7613b92b1ae3 (xfrm: remove gso_segment indirection from xfrm_mode)
+  	struct xfrm_state_afinfo *afinfo;
+  	struct module *owner;
+  	u8 encap;
+diff --cc net/ipv4/xfrm4_mode_transport.c
+index 6f8cf09ff0ef,397863ea762b..000000000000
+--- a/net/ipv4/xfrm4_mode_transport.c
++++ b/net/ipv4/xfrm4_mode_transport.c
+@@@ -14,38 -14,7 +14,42 @@@
+  #include <net/xfrm.h>
+  #include <net/protocol.h>
+  
+++<<<<<<< HEAD
+ +static struct sk_buff *xfrm4_transport_gso_segment(struct xfrm_state *x,
+ +						   struct sk_buff *skb,
+ +						   netdev_features_t features)
+ +{
+ +	const struct net_offload *ops;
+ +	struct sk_buff *segs = ERR_PTR(-EINVAL);
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	skb->transport_header += x->props.header_len;
+ +	ops = rcu_dereference(inet_offloads[xo->proto]);
+ +	if (likely(ops && ops->callbacks.gso_segment))
+ +		segs = ops->callbacks.gso_segment(skb, features);
+ +
+ +	return segs;
+ +}
+ +
+ +static void xfrm4_transport_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + sizeof(struct iphdr) + x->props.header_len);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT) {
+ +		 skb_reset_transport_header(skb);
+ +		 skb->transport_header -= x->props.header_len;
+ +	}
+ +}
+ +
+ +static struct xfrm_mode xfrm4_transport_mode = {
+ +	.gso_segment = xfrm4_transport_gso_segment,
+ +	.xmit = xfrm4_transport_xmit,
+++=======
++ static struct xfrm_mode xfrm4_transport_mode = {
+++>>>>>>> 7613b92b1ae3 (xfrm: remove gso_segment indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TRANSPORT,
+  	.family = AF_INET,
+diff --cc net/ipv4/xfrm4_mode_tunnel.c
+index 823bc54b47de,b5d4ba41758e..000000000000
+--- a/net/ipv4/xfrm4_mode_tunnel.c
++++ b/net/ipv4/xfrm4_mode_tunnel.c
+@@@ -101,31 -101,9 +101,37 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static struct sk_buff *xfrm4_mode_tunnel_gso_segment(struct xfrm_state *x,
+ +						     struct sk_buff *skb,
+ +						     netdev_features_t features)
+ +{
+ +	__skb_push(skb, skb->mac_len);
+ +	return skb_mac_gso_segment(skb, features);
+ +}
+ +
+ +static void xfrm4_mode_tunnel_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT)
+ +		skb->transport_header = skb->network_header +
+ +					sizeof(struct iphdr);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + x->props.header_len);
+ +}
+ +
+ +static struct xfrm_mode xfrm4_tunnel_mode = {
+ +	.input2 = xfrm4_mode_tunnel_input,
+ +	.output2 = xfrm4_mode_tunnel_output,
+ +	.gso_segment = xfrm4_mode_tunnel_gso_segment,
+ +	.xmit = xfrm4_mode_tunnel_xmit,
+++=======
++ static struct xfrm_mode xfrm4_tunnel_mode = {
++ 	.input2 = xfrm4_mode_tunnel_input,
++ 	.output2 = xfrm4_mode_tunnel_output,
+++>>>>>>> 7613b92b1ae3 (xfrm: remove gso_segment indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TUNNEL,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+diff --cc net/ipv6/xfrm6_mode_transport.c
+index 1e7165a8481a,d90c934c2f1a..000000000000
+--- a/net/ipv6/xfrm6_mode_transport.c
++++ b/net/ipv6/xfrm6_mode_transport.c
+@@@ -15,38 -15,7 +15,42 @@@
+  #include <net/xfrm.h>
+  #include <net/protocol.h>
+  
+++<<<<<<< HEAD
+ +static struct sk_buff *xfrm4_transport_gso_segment(struct xfrm_state *x,
+ +						   struct sk_buff *skb,
+ +						   netdev_features_t features)
+ +{
+ +	const struct net_offload *ops;
+ +	struct sk_buff *segs = ERR_PTR(-EINVAL);
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	skb->transport_header += x->props.header_len;
+ +	ops = rcu_dereference(inet6_offloads[xo->proto]);
+ +	if (likely(ops && ops->callbacks.gso_segment))
+ +		segs = ops->callbacks.gso_segment(skb, features);
+ +
+ +	return segs;
+ +}
+ +
+ +static void xfrm6_transport_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + sizeof(struct ipv6hdr) + x->props.header_len);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT) {
+ +		 skb_reset_transport_header(skb);
+ +		 skb->transport_header -= x->props.header_len;
+ +	}
+ +}
+ +
+ +static struct xfrm_mode xfrm6_transport_mode = {
+ +	.gso_segment = xfrm4_transport_gso_segment,
+ +	.xmit = xfrm6_transport_xmit,
+++=======
++ static struct xfrm_mode xfrm6_transport_mode = {
+++>>>>>>> 7613b92b1ae3 (xfrm: remove gso_segment indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TRANSPORT,
+  	.family = AF_INET6,
+diff --cc net/ipv6/xfrm6_mode_tunnel.c
+index e1a129524dde,8e23a2fba617..000000000000
+--- a/net/ipv6/xfrm6_mode_tunnel.c
++++ b/net/ipv6/xfrm6_mode_tunnel.c
+@@@ -101,30 -101,10 +101,26 @@@ out
+  	return err;
+  }
+  
+- static struct sk_buff *xfrm6_mode_tunnel_gso_segment(struct xfrm_state *x,
+- 						     struct sk_buff *skb,
+- 						     netdev_features_t features)
+- {
+- 	__skb_push(skb, skb->mac_len);
+- 	return skb_mac_gso_segment(skb, features);
+- }
+  
+ +static void xfrm6_mode_tunnel_xmit(struct xfrm_state *x, struct sk_buff *skb)
+ +{
+ +	struct xfrm_offload *xo = xfrm_offload(skb);
+ +
+ +	if (xo->flags & XFRM_GSO_SEGMENT)
+ +		skb->transport_header = skb->network_header + sizeof(struct ipv6hdr);
+ +
+ +	skb_reset_mac_len(skb);
+ +	pskb_pull(skb, skb->mac_len + x->props.header_len);
+ +}
+ +
+  static struct xfrm_mode xfrm6_tunnel_mode = {
+  	.input2 = xfrm6_mode_tunnel_input,
+  	.output2 = xfrm6_mode_tunnel_output,
+++<<<<<<< HEAD
+ +	.gso_segment = xfrm6_mode_tunnel_gso_segment,
+ +	.xmit = xfrm6_mode_tunnel_xmit,
+++=======
+++>>>>>>> 7613b92b1ae3 (xfrm: remove gso_segment indirection from xfrm_mode)
+  	.owner = THIS_MODULE,
+  	.encap = XFRM_MODE_TUNNEL,
+  	.flags = XFRM_MODE_FLAG_TUNNEL,
+* Unmerged path include/net/xfrm.h
+diff --git a/net/ipv4/esp4_offload.c b/net/ipv4/esp4_offload.c
+index 27b0232dd3b1..9aa4d7a446df 100644
+--- a/net/ipv4/esp4_offload.c
++++ b/net/ipv4/esp4_offload.c
+@@ -110,6 +110,44 @@ static void esp4_gso_encap(struct xfrm_state *x, struct sk_buff *skb)
+ 	xo->proto = proto;
+ }
+ 
++static struct sk_buff *xfrm4_tunnel_gso_segment(struct xfrm_state *x,
++						struct sk_buff *skb,
++						netdev_features_t features)
++{
++	__skb_push(skb, skb->mac_len);
++	return skb_mac_gso_segment(skb, features);
++}
++
++static struct sk_buff *xfrm4_transport_gso_segment(struct xfrm_state *x,
++						   struct sk_buff *skb,
++						   netdev_features_t features)
++{
++	const struct net_offload *ops;
++	struct sk_buff *segs = ERR_PTR(-EINVAL);
++	struct xfrm_offload *xo = xfrm_offload(skb);
++
++	skb->transport_header += x->props.header_len;
++	ops = rcu_dereference(inet_offloads[xo->proto]);
++	if (likely(ops && ops->callbacks.gso_segment))
++		segs = ops->callbacks.gso_segment(skb, features);
++
++	return segs;
++}
++
++static struct sk_buff *xfrm4_outer_mode_gso_segment(struct xfrm_state *x,
++						    struct sk_buff *skb,
++						    netdev_features_t features)
++{
++	switch (x->outer_mode->encap) {
++	case XFRM_MODE_TUNNEL:
++		return xfrm4_tunnel_gso_segment(x, skb, features);
++	case XFRM_MODE_TRANSPORT:
++		return xfrm4_transport_gso_segment(x, skb, features);
++	}
++
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
+ static struct sk_buff *esp4_gso_segment(struct sk_buff *skb,
+ 				        netdev_features_t features)
+ {
+@@ -146,7 +184,7 @@ static struct sk_buff *esp4_gso_segment(struct sk_buff *skb,
+ 
+ 	xo->flags |= XFRM_GSO_SEGMENT;
+ 
+-	return x->outer_mode->gso_segment(x, skb, esp_features);
++	return xfrm4_outer_mode_gso_segment(x, skb, esp_features);
+ }
+ 
+ static int esp_input_tail(struct xfrm_state *x, struct sk_buff *skb)
+* Unmerged path net/ipv4/xfrm4_mode_transport.c
+* Unmerged path net/ipv4/xfrm4_mode_tunnel.c
+diff --git a/net/ipv6/esp6_offload.c b/net/ipv6/esp6_offload.c
+index 3810e17068ab..e6eb6989a70a 100644
+--- a/net/ipv6/esp6_offload.c
++++ b/net/ipv6/esp6_offload.c
+@@ -137,6 +137,44 @@ static void esp6_gso_encap(struct xfrm_state *x, struct sk_buff *skb)
+ 	xo->proto = proto;
+ }
+ 
++static struct sk_buff *xfrm6_tunnel_gso_segment(struct xfrm_state *x,
++						struct sk_buff *skb,
++						netdev_features_t features)
++{
++	__skb_push(skb, skb->mac_len);
++	return skb_mac_gso_segment(skb, features);
++}
++
++static struct sk_buff *xfrm6_transport_gso_segment(struct xfrm_state *x,
++						   struct sk_buff *skb,
++						   netdev_features_t features)
++{
++	const struct net_offload *ops;
++	struct sk_buff *segs = ERR_PTR(-EINVAL);
++	struct xfrm_offload *xo = xfrm_offload(skb);
++
++	skb->transport_header += x->props.header_len;
++	ops = rcu_dereference(inet6_offloads[xo->proto]);
++	if (likely(ops && ops->callbacks.gso_segment))
++		segs = ops->callbacks.gso_segment(skb, features);
++
++	return segs;
++}
++
++static struct sk_buff *xfrm6_outer_mode_gso_segment(struct xfrm_state *x,
++						    struct sk_buff *skb,
++						    netdev_features_t features)
++{
++	switch (x->outer_mode->encap) {
++	case XFRM_MODE_TUNNEL:
++		return xfrm6_tunnel_gso_segment(x, skb, features);
++	case XFRM_MODE_TRANSPORT:
++		return xfrm6_transport_gso_segment(x, skb, features);
++	}
++
++	return ERR_PTR(-EOPNOTSUPP);
++}
++
+ static struct sk_buff *esp6_gso_segment(struct sk_buff *skb,
+ 				        netdev_features_t features)
+ {
+@@ -173,7 +211,7 @@ static struct sk_buff *esp6_gso_segment(struct sk_buff *skb,
+ 
+ 	xo->flags |= XFRM_GSO_SEGMENT;
+ 
+-	return x->outer_mode->gso_segment(x, skb, esp_features);
++	return xfrm6_outer_mode_gso_segment(x, skb, esp_features);
+ }
+ 
+ static int esp6_input_tail(struct xfrm_state *x, struct sk_buff *skb)
+* Unmerged path net/ipv6/xfrm6_mode_transport.c
+* Unmerged path net/ipv6/xfrm6_mode_tunnel.c
