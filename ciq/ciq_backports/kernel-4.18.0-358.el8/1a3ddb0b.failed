@@ -1,0 +1,249 @@
+bridge: mrp: Extend br_mrp_switchdev to detect better the errors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Horatiu Vultur <horatiu.vultur@microchip.com>
+commit 1a3ddb0b751604215630ca121c090d57e8c68169
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/1a3ddb0b.failed
+
+This patch extends the br_mrp_switchdev functions to be able to have a
+better understanding what cause the issue and if the SW needs to be used
+as a backup.
+
+There are the following cases:
+- when the code is compiled without CONFIG_NET_SWITCHDEV. In this case
+  return success so the SW can continue with the protocol. Depending
+  on the function, it returns 0 or BR_MRP_SW.
+- when code is compiled with CONFIG_NET_SWITCHDEV and the driver doesn't
+  implement any MRP callbacks. In this case the HW can't run MRP so it
+  just returns -EOPNOTSUPP. So the SW will stop further to configure the
+  node.
+- when code is compiled with CONFIG_NET_SWITCHDEV and the driver fully
+  supports any MRP functionality. In this case the SW doesn't need to do
+  anything. The functions will return 0 or BR_MRP_HW.
+- when code is compiled with CONFIG_NET_SWITCHDEV and the HW can't run
+  completely the protocol but it can help the SW to run it. For
+  example, the HW can't support completely MRM role(can't detect when it
+  stops receiving MRP Test frames) but it can redirect these frames to
+  CPU. In this case it is possible to have a SW fallback. The SW will
+  try initially to call the driver with sw_backup set to false, meaning
+  that the HW should implement completely the role. If the driver returns
+  -EOPNOTSUPP, the SW will try again with sw_backup set to false,
+  meaning that the SW will detect when it stops receiving the frames but
+  it needs HW support to redirect the frames to CPU. In case the driver
+  returns 0 then the SW will continue to configure the node accordingly.
+
+	Signed-off-by: Horatiu Vultur <horatiu.vultur@microchip.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a3ddb0b751604215630ca121c090d57e8c68169)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_mrp_switchdev.c
+#	net/bridge/br_private_mrp.h
+diff --cc net/bridge/br_mrp_switchdev.c
+index 99d532ab6efa,cb54b324fa8c..000000000000
+--- a/net/bridge/br_mrp_switchdev.c
++++ b/net/bridge/br_mrp_switchdev.c
+@@@ -12,15 -36,13 +36,12 @@@ int br_mrp_switchdev_add(struct net_bri
+  		.p_port = rtnl_dereference(mrp->p_port)->dev,
+  		.s_port = rtnl_dereference(mrp->s_port)->dev,
+  		.ring_id = mrp->ring_id,
+ -		.prio = mrp->prio,
+  	};
+- 	int err;
+  
+- 	err = switchdev_port_obj_add(br->dev, &mrp_obj.obj, NULL);
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return 0;
+  
+- 	if (err && err != -EOPNOTSUPP)
+- 		return err;
+- 
+- 	return 0;
++ 	return switchdev_port_obj_add(br->dev, &mrp_obj.obj, NULL);
+  }
+  
+  int br_mrp_switchdev_del(struct net_bridge *br, struct br_mrp *mrp)
+@@@ -51,20 -70,38 +69,44 @@@ br_mrp_switchdev_set_ring_role(struct n
+  		.obj.id = SWITCHDEV_OBJ_ID_RING_ROLE_MRP,
+  		.ring_role = role,
+  		.ring_id = mrp->ring_id,
++ 		.sw_backup = false,
+  	};
++ 	enum br_mrp_hw_support support;
+  	int err;
+  
+- 	if (role == BR_MRP_RING_ROLE_DISABLED)
+- 		err = switchdev_port_obj_del(br->dev, &mrp_role.obj);
+- 	else
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return BR_MRP_SW;
++ 
++ 	support = br_mrp_switchdev_port_obj(br, &mrp_role.obj,
++ 					    role != BR_MRP_RING_ROLE_DISABLED);
++ 	if (support != BR_MRP_SW)
++ 		return support;
++ 
++ 	/* If the driver can't configure to run completely the protocol in HW,
++ 	 * then try again to configure the HW so the SW can run the protocol.
++ 	 */
++ 	mrp_role.sw_backup = true;
++ 	if (role != BR_MRP_RING_ROLE_DISABLED)
+  		err = switchdev_port_obj_add(br->dev, &mrp_role.obj, NULL);
++ 	else
++ 		err = switchdev_port_obj_del(br->dev, &mrp_role.obj);
+  
+- 	return err;
++ 	if (!err)
++ 		return BR_MRP_SW;
++ 
++ 	return BR_MRP_NONE;
+  }
+  
+++<<<<<<< HEAD
+ +int br_mrp_switchdev_send_ring_test(struct net_bridge *br,
+ +				    struct br_mrp *mrp, u32 interval,
+ +				    u8 max_miss, u32 period)
+++=======
++ enum br_mrp_hw_support
++ br_mrp_switchdev_send_ring_test(struct net_bridge *br, struct br_mrp *mrp,
++ 				u32 interval, u8 max_miss, u32 period,
++ 				bool monitor)
+++>>>>>>> 1a3ddb0b7516 (bridge: mrp: Extend br_mrp_switchdev to detect better the errors)
+  {
+  	struct switchdev_obj_ring_test_mrp test = {
+  		.obj.orig_dev = br->dev,
+@@@ -73,15 -110,13 +115,12 @@@
+  		.max_miss = max_miss,
+  		.ring_id = mrp->ring_id,
+  		.period = period,
+ -		.monitor = monitor,
+  	};
+- 	int err;
+  
+- 	if (interval == 0)
+- 		err = switchdev_port_obj_del(br->dev, &test.obj);
+- 	else
+- 		err = switchdev_port_obj_add(br->dev, &test.obj, NULL);
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return BR_MRP_SW;
+  
+- 	return err;
++ 	return br_mrp_switchdev_port_obj(br, &test.obj, interval != 0);
+  }
+  
+  int br_mrp_switchdev_set_ring_state(struct net_bridge *br,
+@@@ -156,32 -204,25 +208,33 @@@ br_mrp_switchdev_send_in_test(struct ne
+  		.in_id = mrp->in_id,
+  		.period = period,
+  	};
+- 	int err;
+  
+- 	if (interval == 0)
+- 		err = switchdev_port_obj_del(br->dev, &test.obj);
+- 	else
+- 		err = switchdev_port_obj_add(br->dev, &test.obj, NULL);
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return BR_MRP_SW;
+  
+- 	return err;
++ 	return br_mrp_switchdev_port_obj(br, &test.obj, interval != 0);
+  }
+  
+ -int br_mrp_port_switchdev_set_state(struct net_bridge_port *p, u32 state)
+ +int br_mrp_port_switchdev_set_state(struct net_bridge_port *p,
+ +				    enum br_mrp_port_state_type state)
+  {
+  	struct switchdev_attr attr = {
+  		.orig_dev = p->dev,
+ -		.id = SWITCHDEV_ATTR_ID_PORT_STP_STATE,
+ -		.u.stp_state = state,
+ +		.id = SWITCHDEV_ATTR_ID_MRP_PORT_STATE,
+ +		.u.mrp_port_state = state,
+  	};
+- 	int err;
+  
+++<<<<<<< HEAD
+ +	err = switchdev_port_attr_set(p->dev, &attr);
+ +	if (err && err != -EOPNOTSUPP)
+ +		br_warn(p->br, "error setting offload MRP state on port %u(%s)\n",
+ +			(unsigned int)p->port_no, p->dev->name);
+++=======
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return 0;
+++>>>>>>> 1a3ddb0b7516 (bridge: mrp: Extend br_mrp_switchdev to detect better the errors)
+  
+- 	return err;
++ 	return switchdev_port_attr_set(p->dev, &attr, NULL);
+  }
+  
+  int br_mrp_port_switchdev_set_role(struct net_bridge_port *p,
+@@@ -192,11 -233,9 +245,15 @@@
+  		.id = SWITCHDEV_ATTR_ID_MRP_PORT_ROLE,
+  		.u.mrp_port_role = role,
+  	};
+- 	int err;
+  
+++<<<<<<< HEAD
+ +	err = switchdev_port_attr_set(p->dev, &attr);
+ +	if (err && err != -EOPNOTSUPP)
+ +		return err;
+++=======
++ 	if (!IS_ENABLED(CONFIG_NET_SWITCHDEV))
++ 		return 0;
+++>>>>>>> 1a3ddb0b7516 (bridge: mrp: Extend br_mrp_switchdev to detect better the errors)
+  
+- 	return 0;
++ 	return switchdev_port_attr_set(p->dev, &attr, NULL);
+  }
+diff --cc net/bridge/br_private_mrp.h
+index c01588ee2685,9559aa2750fb..000000000000
+--- a/net/bridge/br_private_mrp.h
++++ b/net/bridge/br_private_mrp.h
+@@@ -60,23 -79,27 +60,34 @@@ int br_mrp_start_test(struct net_bridg
+  /* br_mrp_switchdev.c */
+  int br_mrp_switchdev_add(struct net_bridge *br, struct br_mrp *mrp);
+  int br_mrp_switchdev_del(struct net_bridge *br, struct br_mrp *mrp);
+- int br_mrp_switchdev_set_ring_role(struct net_bridge *br, struct br_mrp *mrp,
+- 				   enum br_mrp_ring_role_type role);
++ enum br_mrp_hw_support
++ br_mrp_switchdev_set_ring_role(struct net_bridge *br, struct br_mrp *mrp,
++ 			       enum br_mrp_ring_role_type role);
+  int br_mrp_switchdev_set_ring_state(struct net_bridge *br, struct br_mrp *mrp,
+  				    enum br_mrp_ring_state_type state);
+++<<<<<<< HEAD
+ +int br_mrp_switchdev_send_ring_test(struct net_bridge *br, struct br_mrp *mrp,
+ +				    u32 interval, u8 max_miss, u32 period);
+ +int br_mrp_port_switchdev_set_state(struct net_bridge_port *p,
+ +				    enum br_mrp_port_state_type state);
+++=======
++ enum br_mrp_hw_support
++ br_mrp_switchdev_send_ring_test(struct net_bridge *br, struct br_mrp *mrp,
++ 				u32 interval, u8 max_miss, u32 period,
++ 				bool monitor);
++ int br_mrp_port_switchdev_set_state(struct net_bridge_port *p, u32 state);
+++>>>>>>> 1a3ddb0b7516 (bridge: mrp: Extend br_mrp_switchdev to detect better the errors)
+  int br_mrp_port_switchdev_set_role(struct net_bridge_port *p,
+  				   enum br_mrp_port_role_type role);
+- int br_mrp_switchdev_set_in_role(struct net_bridge *br, struct br_mrp *mrp,
+- 				 u16 in_id, u32 ring_id,
+- 				 enum br_mrp_in_role_type role);
++ enum br_mrp_hw_support
++ br_mrp_switchdev_set_in_role(struct net_bridge *br, struct br_mrp *mrp,
++ 			     u16 in_id, u32 ring_id,
++ 			     enum br_mrp_in_role_type role);
+  int br_mrp_switchdev_set_in_state(struct net_bridge *br, struct br_mrp *mrp,
+  				  enum br_mrp_in_state_type state);
+- int br_mrp_switchdev_send_in_test(struct net_bridge *br, struct br_mrp *mrp,
+- 				  u32 interval, u8 max_miss, u32 period);
++ enum br_mrp_hw_support
++ br_mrp_switchdev_send_in_test(struct net_bridge *br, struct br_mrp *mrp,
++ 			      u32 interval, u8 max_miss, u32 period);
+  
+  /* br_mrp_netlink.c  */
+  int br_mrp_ring_port_open(struct net_device *dev, u8 loc);
+* Unmerged path net/bridge/br_mrp_switchdev.c
+* Unmerged path net/bridge/br_private_mrp.h
