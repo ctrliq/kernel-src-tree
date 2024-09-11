@@ -1510,7 +1510,7 @@ static void pnv_ioda_release_vf_PE(struct pci_dev *pdev)
 	}
 }
 
-void pnv_pci_sriov_disable(struct pci_dev *pdev)
+static void pnv_pci_sriov_disable(struct pci_dev *pdev)
 {
 	struct pci_bus        *bus;
 	struct pci_controller *hose;
@@ -1630,7 +1630,7 @@ static void pnv_ioda_setup_vf_PE(struct pci_dev *pdev, u16 num_vfs)
 	}
 }
 
-int pnv_pci_sriov_enable(struct pci_dev *pdev, u16 num_vfs)
+static int pnv_pci_sriov_enable(struct pci_dev *pdev, u16 num_vfs)
 {
 	struct pci_bus        *bus;
 	struct pci_controller *hose;
@@ -1745,7 +1745,7 @@ m64_failed:
 	return ret;
 }
 
-int pnv_pcibios_sriov_disable(struct pci_dev *pdev)
+static int pnv_pcibios_sriov_disable(struct pci_dev *pdev)
 {
 	pnv_pci_sriov_disable(pdev);
 
@@ -1754,7 +1754,7 @@ int pnv_pcibios_sriov_disable(struct pci_dev *pdev)
 	return 0;
 }
 
-int pnv_pcibios_sriov_enable(struct pci_dev *pdev, u16 num_vfs)
+static int pnv_pcibios_sriov_enable(struct pci_dev *pdev, u16 num_vfs)
 {
 	/* Allocate PCI data */
 	add_sriov_vf_pdns(pdev);
