@@ -1,0 +1,92 @@
+scsi: zfcp: Lift Request Queue tasklet & timer from qdio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit b3f0a1ee9e3986106869eec49b61b40abdccdcf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b3f0a1ee.failed
+
+The qdio layer currently provides its own infrastructure to scan for
+Request Queue completions & to report them to the device driver.  This
+comes with several drawbacks - having an async tasklet & timer construct in
+qdio introduces additional lifetime complexity, and makes it harder to
+integrate them with the rest of the device driver. The timeouts are also
+currently hard-coded, and can't be tweaked without affecting other qdio
+drivers (ie. qeth).
+
+But due to recent enhancements to the qdio layer, zfcp can actually take
+full control of the Request Queue completion processing. It merely needs to
+opt-out from the qdio layer mechanisms by setting the scan_threshold to 0,
+and then use qdio_inspect_queue() to scan for completions.
+
+So re-implement the tasklet & timer mechanism in zfcp, while initially
+copying the scan conditions from qdio's handle_outbound() and
+qdio_outbound_tasklet(). One minor behavioural change is that
+zfcp_qdio_send() will unconditionally reduce the timeout to 1 HZ, rather
+than leaving it at 10 Hz if it was last armed by the tasklet. This just
+makes things more consistent. Also note that we can drop a lot of the
+accumulated cruft in qdio_outbound_tasklet(), as zfcp doesn't even use PCI
+interrupt requests any longer.
+
+This also slightly touches the Response Queue processing, as
+qdio_get_next_buffers() will no longer implicitly scan for Request Queue
+completions. So complete the migration to qdio_inspect_queue() here as well
+and make the tasklet_schedule() visible.
+
+Link: https://lore.kernel.org/r/018d3ddd029f8d6ac00cf4184880288c637c4fd1.1618417667.git.bblock@linux.ibm.com
+	Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit b3f0a1ee9e3986106869eec49b61b40abdccdcf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_qdio.c
+diff --cc drivers/s390/scsi/zfcp_qdio.c
+index c6a26ab7cd7b,16a332d501e7..000000000000
+--- a/drivers/s390/scsi/zfcp_qdio.c
++++ b/drivers/s390/scsi/zfcp_qdio.c
+@@@ -520,9 -561,11 +561,16 @@@ int zfcp_qdio_setup(struct zfcp_adapte
+  
+  	spin_lock_init(&qdio->req_q_lock);
+  	spin_lock_init(&qdio->stat_lock);
+++<<<<<<< HEAD
+ +	tasklet_init(&qdio->irq_tasklet, zfcp_qdio_irq_tasklet,
+ +		     (unsigned long) qdio);
+++=======
++ 	timer_setup(&qdio->request_timer, zfcp_qdio_request_timer, 0);
++ 	tasklet_setup(&qdio->irq_tasklet, zfcp_qdio_irq_tasklet);
++ 	tasklet_setup(&qdio->request_tasklet, zfcp_qdio_request_tasklet);
+++>>>>>>> b3f0a1ee9e39 (scsi: zfcp: Lift Request Queue tasklet & timer from qdio)
+  	tasklet_disable(&qdio->irq_tasklet);
++ 	tasklet_disable(&qdio->request_tasklet);
+  
+  	adapter->qdio = qdio;
+  	return 0;
+* Unmerged path drivers/s390/scsi/zfcp_qdio.c
+diff --git a/drivers/s390/scsi/zfcp_qdio.h b/drivers/s390/scsi/zfcp_qdio.h
+index 9c1f310db155..390706867df3 100644
+--- a/drivers/s390/scsi/zfcp_qdio.h
++++ b/drivers/s390/scsi/zfcp_qdio.h
+@@ -30,6 +30,9 @@
+  * @req_q_util: used for accounting
+  * @req_q_full: queue full incidents
+  * @req_q_wq: used to wait for SBAL availability
++ * @irq_tasklet: used for QDIO interrupt processing
++ * @request_tasklet: used for Request Queue completion processing
++ * @request_timer: used to trigger the Request Queue completion processing
+  * @adapter: adapter used in conjunction with this qdio structure
+  * @max_sbale_per_sbal: qdio limit per sbal
+  * @max_sbale_per_req: qdio limit per request
+@@ -46,6 +49,8 @@ struct zfcp_qdio {
+ 	atomic_t		req_q_full;
+ 	wait_queue_head_t	req_q_wq;
+ 	struct tasklet_struct	irq_tasklet;
++	struct tasklet_struct	request_tasklet;
++	struct timer_list	request_timer;
+ 	struct zfcp_adapter	*adapter;
+ 	u16			max_sbale_per_sbal;
+ 	u16			max_sbale_per_req;
