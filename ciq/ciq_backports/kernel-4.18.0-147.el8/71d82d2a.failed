@@ -1,0 +1,222 @@
+net/mlx5e: Provide the TC filter netdev as parameter to flower callbacks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Oz Shlomo <ozsh@mellanox.com>
+commit 71d82d2a90327c9c816e65471b7859b601993f89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/71d82d2a.failed
+
+Currently the driver controls flower filters that are installed on its
+devices. However, with the introduction of the indirect block
+notifications platform the driver may receive control events for filters
+that are installed on higher level net devices (e.g. tunnel devices).
+Therefore, the driver filter control API will not be able to implicitly
+assume the filter's net device.
+
+Explicitly specify the filter's net device, no functional change
+
+	Signed-off-by: Oz Shlomo <ozsh@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 71d82d2a90327c9c816e65471b7859b601993f89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index c9ee89f4edb1,b614513df127..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -2833,17 -3101,115 +2833,113 @@@ int mlx5e_configure_flower(struct mlx5e
+  	      MLX5_FLOW_CONTEXT_ACTION_PACKET_REFORMAT))
+  		kvfree(parse_attr);
+  
+++<<<<<<< HEAD
+ +	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ +	if (err) {
+ +		mlx5e_tc_del_flow(priv, flow);
+ +		kfree(flow);
+++=======
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_add_nic_flow(struct mlx5e_priv *priv,
++ 		   struct tc_cls_flower_offload *f,
++ 		   u16 flow_flags,
++ 		   struct mlx5e_tc_flow **__flow)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct mlx5e_tc_flow_parse_attr *parse_attr;
++ 	struct mlx5e_tc_flow *flow;
++ 	int attr_size, err;
++ 
++ 	/* multi-chain not supported for NIC rules */
++ 	if (!tc_cls_can_offload_and_chain0(priv->netdev, &f->common))
++ 		return -EOPNOTSUPP;
++ 
++ 	flow_flags |= MLX5E_TC_FLOW_NIC;
++ 	attr_size  = sizeof(struct mlx5_nic_flow_attr);
++ 	err = mlx5e_alloc_flow(priv, attr_size, f, flow_flags,
++ 			       &parse_attr, &flow);
++ 	if (err)
++ 		goto out;
++ 
++ 	err = parse_tc_nic_actions(priv, f->exts, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	err = mlx5e_tc_add_nic_flow(priv, parse_attr, flow, extack);
++ 	if (err)
++ 		goto err_free;
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	kvfree(parse_attr);
++ 	*__flow = flow;
++ 
++ 	return 0;
++ 
++ err_free:
++ 	kfree(flow);
++ 	kvfree(parse_attr);
++ out:
++ 	return err;
++ }
++ 
++ static int
++ mlx5e_tc_add_flow(struct mlx5e_priv *priv,
++ 		  struct tc_cls_flower_offload *f,
++ 		  int flags,
++ 		  struct mlx5e_tc_flow **flow)
++ {
++ 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
++ 	u16 flow_flags;
++ 	int err;
++ 
++ 	get_flags(flags, &flow_flags);
++ 
++ 	if (!tc_can_offload_extack(priv->netdev, f->common.extack))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (esw && esw->mode == SRIOV_OFFLOADS)
++ 		err = mlx5e_add_fdb_flow(priv, f, flow_flags, flow);
++ 	else
++ 		err = mlx5e_add_nic_flow(priv, f, flow_flags, flow);
++ 
++ 	return err;
++ }
++ 
++ int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
++ 			   struct tc_cls_flower_offload *f, int flags)
++ {
++ 	struct netlink_ext_ack *extack = f->common.extack;
++ 	struct rhashtable *tc_ht = get_tc_ht(priv);
++ 	struct mlx5e_tc_flow *flow;
++ 	int err = 0;
++ 
++ 	flow = rhashtable_lookup_fast(tc_ht, &f->cookie, tc_ht_params);
++ 	if (flow) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "flow cookie already exists, ignoring");
++ 		netdev_warn_once(priv->netdev,
++ 				 "flow cookie %lx already exists, ignoring\n",
++ 				 f->cookie);
++ 		goto out;
+++>>>>>>> 71d82d2a9032 (net/mlx5e: Provide the TC filter netdev as parameter to flower callbacks)
+  	}
+  
+ -	err = mlx5e_tc_add_flow(priv, f, flags, &flow);
+ -	if (err)
+ -		goto out;
+ -
+ -	err = rhashtable_insert_fast(tc_ht, &flow->node, tc_ht_params);
+ -	if (err)
+ -		goto err_free;
+ -
+ -	return 0;
+ +	return err;
+  
+  err_free:
+ -	mlx5e_tc_del_flow(priv, flow);
+ +	kvfree(parse_attr);
+  	kfree(flow);
+ -out:
+  	return err;
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index f856d322cf24..326076d4aa60 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -3360,11 +3360,14 @@ static int mlx5e_setup_tc_cls_flower(struct mlx5e_priv *priv,
+ {
+ 	switch (cls_flower->command) {
+ 	case TC_CLSFLOWER_REPLACE:
+-		return mlx5e_configure_flower(priv, cls_flower, flags);
++		return mlx5e_configure_flower(priv->netdev, priv, cls_flower,
++					      flags);
+ 	case TC_CLSFLOWER_DESTROY:
+-		return mlx5e_delete_flower(priv, cls_flower, flags);
++		return mlx5e_delete_flower(priv->netdev, priv, cls_flower,
++					   flags);
+ 	case TC_CLSFLOWER_STATS:
+-		return mlx5e_stats_flower(priv, cls_flower, flags);
++		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
++					  flags);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 58cddf0a96a7..fe54507f36e6 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -912,11 +912,14 @@ mlx5e_rep_setup_tc_cls_flower(struct mlx5e_priv *priv,
+ {
+ 	switch (cls_flower->command) {
+ 	case TC_CLSFLOWER_REPLACE:
+-		return mlx5e_configure_flower(priv, cls_flower, flags);
++		return mlx5e_configure_flower(priv->netdev, priv, cls_flower,
++					      flags);
+ 	case TC_CLSFLOWER_DESTROY:
+-		return mlx5e_delete_flower(priv, cls_flower, flags);
++		return mlx5e_delete_flower(priv->netdev, priv, cls_flower,
++					   flags);
+ 	case TC_CLSFLOWER_STATS:
+-		return mlx5e_stats_flower(priv, cls_flower, flags);
++		return mlx5e_stats_flower(priv->netdev, priv, cls_flower,
++					  flags);
+ 	default:
+ 		return -EOPNOTSUPP;
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+index 378507988a32..004e679a4f53 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.h
+@@ -51,12 +51,12 @@ void mlx5e_tc_nic_cleanup(struct mlx5e_priv *priv);
+ int mlx5e_tc_esw_init(struct rhashtable *tc_ht);
+ void mlx5e_tc_esw_cleanup(struct rhashtable *tc_ht);
+ 
+-int mlx5e_configure_flower(struct mlx5e_priv *priv,
++int mlx5e_configure_flower(struct net_device *dev, struct mlx5e_priv *priv,
+ 			   struct tc_cls_flower_offload *f, int flags);
+-int mlx5e_delete_flower(struct mlx5e_priv *priv,
++int mlx5e_delete_flower(struct net_device *dev, struct mlx5e_priv *priv,
+ 			struct tc_cls_flower_offload *f, int flags);
+ 
+-int mlx5e_stats_flower(struct mlx5e_priv *priv,
++int mlx5e_stats_flower(struct net_device *dev, struct mlx5e_priv *priv,
+ 		       struct tc_cls_flower_offload *f, int flags);
+ 
+ struct mlx5e_encap_entry;
