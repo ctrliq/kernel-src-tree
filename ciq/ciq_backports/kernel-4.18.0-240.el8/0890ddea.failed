@@ -1,0 +1,462 @@
+KVM: s390: protvirt: Add SCLP interrupt handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christian Borntraeger <borntraeger@de.ibm.com>
+commit 0890ddea1a90e57114b5704cd560192c743f3d2e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0890ddea.failed
+
+The sclp interrupt is kind of special. The ultravisor polices that we
+do not inject an sclp interrupt with payload if no sccb is outstanding.
+On the other hand we have "asynchronous" event interrupts, e.g. for
+console input.
+We separate both variants into sclp interrupt and sclp event interrupt.
+The sclp interrupt is masked until a previous servc instruction has
+finished (sie exit 108).
+
+[frankja@linux.ibm.com: factoring out write_sclp]
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit 0890ddea1a90e57114b5704cd560192c743f3d2e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index 2e5b00d67d71,2881151fd773..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -2158,6 -2168,172 +2158,175 @@@ out
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_s390_cpus_from_pv(struct kvm *kvm, u16 *rcp, u16 *rrcp)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	u16 rc, rrc;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	/*
++ 	 * We ignore failures and try to destroy as many CPUs as possible.
++ 	 * At the same time we must not free the assigned resources when
++ 	 * this fails, as the ultravisor has still access to that memory.
++ 	 * So kvm_s390_pv_destroy_cpu can leave a "wanted" memory leak
++ 	 * behind.
++ 	 * We want to return the first failure rc and rrc, though.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		if (kvm_s390_pv_destroy_cpu(vcpu, &rc, &rrc) && !ret) {
++ 			*rcp = rc;
++ 			*rrcp = rrc;
++ 			ret = -EIO;
++ 		}
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_cpus_to_pv(struct kvm *kvm, u16 *rc, u16 *rrc)
++ {
++ 	int i, r = 0;
++ 	u16 dummy;
++ 
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		r = kvm_s390_pv_create_cpu(vcpu, rc, rrc);
++ 		mutex_unlock(&vcpu->mutex);
++ 		if (r)
++ 			break;
++ 	}
++ 	if (r)
++ 		kvm_s390_cpus_from_pv(kvm, &dummy, &dummy);
++ 	return r;
++ }
++ 
++ static int kvm_s390_handle_pv(struct kvm *kvm, struct kvm_pv_cmd *cmd)
++ {
++ 	int r = 0;
++ 	u16 dummy;
++ 	void __user *argp = (void __user *)cmd->data;
++ 
++ 	switch (cmd->cmd) {
++ 	case KVM_PV_ENABLE: {
++ 		r = -EINVAL;
++ 		if (kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		/*
++ 		 *  FMT 4 SIE needs esca. As we never switch back to bsca from
++ 		 *  esca, we need no cleanup in the error cases below
++ 		 */
++ 		r = sca_switch_to_extended(kvm);
++ 		if (r)
++ 			break;
++ 
++ 		down_write(&current->mm->mmap_sem);
++ 		r = gmap_mark_unmergeable();
++ 		up_write(&current->mm->mmap_sem);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_pv_init_vm(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_cpus_to_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			kvm_s390_pv_deinit_vm(kvm, &dummy, &dummy);
++ 
++ 		/* we need to block service interrupts from now on */
++ 		set_bit(IRQ_PEND_EXT_SERVICE, &kvm->arch.float_int.masked_irqs);
++ 		break;
++ 	}
++ 	case KVM_PV_DISABLE: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = kvm_s390_cpus_from_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		/*
++ 		 * If a CPU could not be destroyed, destroy VM will also fail.
++ 		 * There is no point in trying to destroy it. Instead return
++ 		 * the rc and rrc from the first CPU that failed destroying.
++ 		 */
++ 		if (r)
++ 			break;
++ 		r = kvm_s390_pv_deinit_vm(kvm, &cmd->rc, &cmd->rrc);
++ 
++ 		/* no need to block service interrupts any more */
++ 		clear_bit(IRQ_PEND_EXT_SERVICE, &kvm->arch.float_int.masked_irqs);
++ 		break;
++ 	}
++ 	case KVM_PV_SET_SEC_PARMS: {
++ 		struct kvm_s390_pv_sec_parm parms = {};
++ 		void *hdr;
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&parms, argp, sizeof(parms)))
++ 			break;
++ 
++ 		/* Currently restricted to 8KB */
++ 		r = -EINVAL;
++ 		if (parms.length > PAGE_SIZE * 2)
++ 			break;
++ 
++ 		r = -ENOMEM;
++ 		hdr = vmalloc(parms.length);
++ 		if (!hdr)
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (!copy_from_user(hdr, (void __user *)parms.origin,
++ 				    parms.length))
++ 			r = kvm_s390_pv_set_sec_parms(kvm, hdr, parms.length,
++ 						      &cmd->rc, &cmd->rrc);
++ 
++ 		vfree(hdr);
++ 		break;
++ 	}
++ 	case KVM_PV_UNPACK: {
++ 		struct kvm_s390_pv_unp unp = {};
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&unp, argp, sizeof(unp)))
++ 			break;
++ 
++ 		r = kvm_s390_pv_unpack(kvm, unp.addr, unp.size, unp.tweak,
++ 				       &cmd->rc, &cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_VERIFY: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = uv_cmd_nodata(kvm_s390_pv_get_handle(kvm),
++ 				  UVC_CMD_VERIFY_IMG, &cmd->rc, &cmd->rrc);
++ 		KVM_UV_EVENT(kvm, 3, "PROTVIRT VERIFY: rc %x rrc %x", cmd->rc,
++ 			     cmd->rrc);
++ 		break;
++ 	}
++ 	default:
++ 		r = -ENOTTY;
++ 	}
++ 	return r;
++ }
++ 
+++>>>>>>> 0890ddea1a90 (KVM: s390: protvirt: Add SCLP interrupt handling)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+diff --git a/arch/s390/include/asm/kvm_host.h b/arch/s390/include/asm/kvm_host.h
+index 8484fe1d4a23..1943ed232b5b 100644
+--- a/arch/s390/include/asm/kvm_host.h
++++ b/arch/s390/include/asm/kvm_host.h
+@@ -512,6 +512,7 @@ enum irq_types {
+ 	IRQ_PEND_PFAULT_INIT,
+ 	IRQ_PEND_EXT_HOST,
+ 	IRQ_PEND_EXT_SERVICE,
++	IRQ_PEND_EXT_SERVICE_EV,
+ 	IRQ_PEND_EXT_TIMING,
+ 	IRQ_PEND_EXT_CPU_TIMER,
+ 	IRQ_PEND_EXT_CLOCK_COMP,
+@@ -556,6 +557,7 @@ enum irq_types {
+ 			   (1UL << IRQ_PEND_EXT_TIMING)     | \
+ 			   (1UL << IRQ_PEND_EXT_HOST)       | \
+ 			   (1UL << IRQ_PEND_EXT_SERVICE)    | \
++			   (1UL << IRQ_PEND_EXT_SERVICE_EV) | \
+ 			   (1UL << IRQ_PEND_VIRTIO)         | \
+ 			   (1UL << IRQ_PEND_PFAULT_INIT)    | \
+ 			   (1UL << IRQ_PEND_PFAULT_DONE))
+@@ -576,7 +578,8 @@ enum irq_types {
+ 			      (1UL << IRQ_PEND_EXT_CLOCK_COMP) | \
+ 			      (1UL << IRQ_PEND_EXT_EMERGENCY)  | \
+ 			      (1UL << IRQ_PEND_EXT_EXTERNAL)   | \
+-			      (1UL << IRQ_PEND_EXT_SERVICE))
++			      (1UL << IRQ_PEND_EXT_SERVICE)    | \
++			      (1UL << IRQ_PEND_EXT_SERVICE_EV))
+ 
+ struct kvm_s390_interrupt_info {
+ 	struct list_head list;
+@@ -636,6 +639,7 @@ struct kvm_s390_local_interrupt {
+ 
+ struct kvm_s390_float_interrupt {
+ 	unsigned long pending_irqs;
++	unsigned long masked_irqs;
+ 	spinlock_t lock;
+ 	struct list_head lists[FIRQ_LIST_COUNT];
+ 	int counters[FIRQ_MAX_COUNT];
+diff --git a/arch/s390/kvm/intercept.c b/arch/s390/kvm/intercept.c
+index 9966c43c6035..00a79442a428 100644
+--- a/arch/s390/kvm/intercept.c
++++ b/arch/s390/kvm/intercept.c
+@@ -444,8 +444,35 @@ static int handle_operexc(struct kvm_vcpu *vcpu)
+ 	return kvm_s390_inject_program_int(vcpu, PGM_OPERATION);
+ }
+ 
++static int handle_pv_sclp(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
++
++	spin_lock(&fi->lock);
++	/*
++	 * 2 cases:
++	 * a: an sccb answering interrupt was already pending or in flight.
++	 *    As the sccb value is not known we can simply set some value to
++	 *    trigger delivery of a saved SCCB. UV will then use its saved
++	 *    copy of the SCCB value.
++	 * b: an error SCCB interrupt needs to be injected so we also inject
++	 *    a fake SCCB address. Firmware will use the proper one.
++	 * This makes sure, that both errors and real sccb returns will only
++	 * be delivered after a notification intercept (instruction has
++	 * finished) but not after others.
++	 */
++	fi->srv_signal.ext_params |= 0x43000;
++	set_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
++	clear_bit(IRQ_PEND_EXT_SERVICE, &fi->masked_irqs);
++	spin_unlock(&fi->lock);
++	return 0;
++}
++
+ static int handle_pv_notification(struct kvm_vcpu *vcpu)
+ {
++	if (vcpu->arch.sie_block->ipa == 0xb220)
++		return handle_pv_sclp(vcpu);
++
+ 	return handle_instruction(vcpu);
+ }
+ 
+diff --git a/arch/s390/kvm/interrupt.c b/arch/s390/kvm/interrupt.c
+index 239f50d2bacf..ef1c96f93961 100644
+--- a/arch/s390/kvm/interrupt.c
++++ b/arch/s390/kvm/interrupt.c
+@@ -324,8 +324,11 @@ static inline int gisa_tac_ipm_gisc(struct kvm_s390_gisa *gisa, u32 gisc)
+ 
+ static inline unsigned long pending_irqs_no_gisa(struct kvm_vcpu *vcpu)
+ {
+-	return vcpu->kvm->arch.float_int.pending_irqs |
+-		vcpu->arch.local_int.pending_irqs;
++	unsigned long pending = vcpu->kvm->arch.float_int.pending_irqs |
++				vcpu->arch.local_int.pending_irqs;
++
++	pending &= ~vcpu->kvm->arch.float_int.masked_irqs;
++	return pending;
+ }
+ 
+ static inline unsigned long pending_irqs(struct kvm_vcpu *vcpu)
+@@ -383,8 +386,10 @@ static unsigned long deliverable_irqs(struct kvm_vcpu *vcpu)
+ 		__clear_bit(IRQ_PEND_EXT_CLOCK_COMP, &active_mask);
+ 	if (!(vcpu->arch.sie_block->gcr[0] & CR0_CPU_TIMER_SUBMASK))
+ 		__clear_bit(IRQ_PEND_EXT_CPU_TIMER, &active_mask);
+-	if (!(vcpu->arch.sie_block->gcr[0] & CR0_SERVICE_SIGNAL_SUBMASK))
++	if (!(vcpu->arch.sie_block->gcr[0] & CR0_SERVICE_SIGNAL_SUBMASK)) {
+ 		__clear_bit(IRQ_PEND_EXT_SERVICE, &active_mask);
++		__clear_bit(IRQ_PEND_EXT_SERVICE_EV, &active_mask);
++	}
+ 	if (psw_mchk_disabled(vcpu))
+ 		active_mask &= ~IRQ_PEND_MCHK_MASK;
+ 	/* PV guest cpus can have a single interruption injected at a time. */
+@@ -946,20 +951,49 @@ static int __must_check __deliver_prog(struct kvm_vcpu *vcpu)
+ 	return rc ? -EFAULT : 0;
+ }
+ 
++#define SCCB_MASK 0xFFFFFFF8
++#define SCCB_EVENT_PENDING 0x3
++
++static int write_sclp(struct kvm_vcpu *vcpu, u32 parm)
++{
++	int rc;
++
++	if (kvm_s390_pv_cpu_get_handle(vcpu)) {
++		vcpu->arch.sie_block->iictl = IICTL_CODE_EXT;
++		vcpu->arch.sie_block->eic = EXT_IRQ_SERVICE_SIG;
++		vcpu->arch.sie_block->eiparams = parm;
++		return 0;
++	}
++
++	rc  = put_guest_lc(vcpu, EXT_IRQ_SERVICE_SIG, (u16 *)__LC_EXT_INT_CODE);
++	rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
++	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
++			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
++			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
++	rc |= put_guest_lc(vcpu, parm,
++			   (u32 *)__LC_EXT_PARAMS);
++
++	return rc ? -EFAULT : 0;
++}
++
+ static int __must_check __deliver_service(struct kvm_vcpu *vcpu)
+ {
+ 	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
+ 	struct kvm_s390_ext_info ext;
+-	int rc = 0;
+ 
+ 	spin_lock(&fi->lock);
+-	if (!(test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs))) {
++	if (test_bit(IRQ_PEND_EXT_SERVICE, &fi->masked_irqs) ||
++	    !(test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs))) {
+ 		spin_unlock(&fi->lock);
+ 		return 0;
+ 	}
+ 	ext = fi->srv_signal;
+ 	memset(&fi->srv_signal, 0, sizeof(ext));
+ 	clear_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs);
++	clear_bit(IRQ_PEND_EXT_SERVICE_EV, &fi->pending_irqs);
++	if (kvm_s390_pv_cpu_is_protected(vcpu))
++		set_bit(IRQ_PEND_EXT_SERVICE, &fi->masked_irqs);
+ 	spin_unlock(&fi->lock);
+ 
+ 	VCPU_EVENT(vcpu, 4, "deliver: sclp parameter 0x%x",
+@@ -968,16 +1002,31 @@ static int __must_check __deliver_service(struct kvm_vcpu *vcpu)
+ 	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_INT_SERVICE,
+ 					 ext.ext_params, 0);
+ 
+-	rc  = put_guest_lc(vcpu, EXT_IRQ_SERVICE_SIG, (u16 *)__LC_EXT_INT_CODE);
+-	rc |= put_guest_lc(vcpu, 0, (u16 *)__LC_EXT_CPU_ADDR);
+-	rc |= write_guest_lc(vcpu, __LC_EXT_OLD_PSW,
+-			     &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= read_guest_lc(vcpu, __LC_EXT_NEW_PSW,
+-			    &vcpu->arch.sie_block->gpsw, sizeof(psw_t));
+-	rc |= put_guest_lc(vcpu, ext.ext_params,
+-			   (u32 *)__LC_EXT_PARAMS);
++	return write_sclp(vcpu, ext.ext_params);
++}
+ 
+-	return rc ? -EFAULT : 0;
++static int __must_check __deliver_service_ev(struct kvm_vcpu *vcpu)
++{
++	struct kvm_s390_float_interrupt *fi = &vcpu->kvm->arch.float_int;
++	struct kvm_s390_ext_info ext;
++
++	spin_lock(&fi->lock);
++	if (!(test_bit(IRQ_PEND_EXT_SERVICE_EV, &fi->pending_irqs))) {
++		spin_unlock(&fi->lock);
++		return 0;
++	}
++	ext = fi->srv_signal;
++	/* only clear the event bit */
++	fi->srv_signal.ext_params &= ~SCCB_EVENT_PENDING;
++	clear_bit(IRQ_PEND_EXT_SERVICE_EV, &fi->pending_irqs);
++	spin_unlock(&fi->lock);
++
++	VCPU_EVENT(vcpu, 4, "%s", "deliver: sclp parameter event");
++	vcpu->stat.deliver_service_signal++;
++	trace_kvm_s390_deliver_interrupt(vcpu->vcpu_id, KVM_S390_INT_SERVICE,
++					 ext.ext_params, 0);
++
++	return write_sclp(vcpu, SCCB_EVENT_PENDING);
+ }
+ 
+ static int __must_check __deliver_pfault_done(struct kvm_vcpu *vcpu)
+@@ -1399,6 +1448,9 @@ int __must_check kvm_s390_deliver_pending_interrupts(struct kvm_vcpu *vcpu)
+ 		case IRQ_PEND_EXT_SERVICE:
+ 			rc = __deliver_service(vcpu);
+ 			break;
++		case IRQ_PEND_EXT_SERVICE_EV:
++			rc = __deliver_service_ev(vcpu);
++			break;
+ 		case IRQ_PEND_PFAULT_DONE:
+ 			rc = __deliver_pfault_done(vcpu);
+ 			break;
+@@ -1751,9 +1803,6 @@ struct kvm_s390_interrupt_info *kvm_s390_get_io_int(struct kvm *kvm,
+ 	return inti;
+ }
+ 
+-#define SCCB_MASK 0xFFFFFFF8
+-#define SCCB_EVENT_PENDING 0x3
+-
+ static int __inject_service(struct kvm *kvm,
+ 			     struct kvm_s390_interrupt_info *inti)
+ {
+@@ -1762,6 +1811,11 @@ static int __inject_service(struct kvm *kvm,
+ 	kvm->stat.inject_service_signal++;
+ 	spin_lock(&fi->lock);
+ 	fi->srv_signal.ext_params |= inti->ext.ext_params & SCCB_EVENT_PENDING;
++
++	/* We always allow events, track them separately from the sccb ints */
++	if (fi->srv_signal.ext_params & SCCB_EVENT_PENDING)
++		set_bit(IRQ_PEND_EXT_SERVICE_EV, &fi->pending_irqs);
++
+ 	/*
+ 	 * Early versions of the QEMU s390 bios will inject several
+ 	 * service interrupts after another without handling a
+@@ -2158,6 +2212,10 @@ void kvm_s390_clear_float_irqs(struct kvm *kvm)
+ 	struct kvm_s390_float_interrupt *fi = &kvm->arch.float_int;
+ 	int i;
+ 
++	mutex_lock(&kvm->lock);
++	if (!kvm_s390_pv_is_protected(kvm))
++		fi->masked_irqs = 0;
++	mutex_unlock(&kvm->lock);
+ 	spin_lock(&fi->lock);
+ 	fi->pending_irqs = 0;
+ 	memset(&fi->srv_signal, 0, sizeof(fi->srv_signal));
+@@ -2224,7 +2282,8 @@ static int get_all_floating_irqs(struct kvm *kvm, u8 __user *usrbuf, u64 len)
+ 			n++;
+ 		}
+ 	}
+-	if (test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs)) {
++	if (test_bit(IRQ_PEND_EXT_SERVICE, &fi->pending_irqs) ||
++	    test_bit(IRQ_PEND_EXT_SERVICE_EV, &fi->pending_irqs)) {
+ 		if (n == max_irqs) {
+ 			/* signal userspace to try again */
+ 			ret = -ENOMEM;
+* Unmerged path arch/s390/kvm/kvm-s390.c
