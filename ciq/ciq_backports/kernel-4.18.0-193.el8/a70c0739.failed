@@ -1,0 +1,403 @@
+RDMA: Introduce and use GID attr helper to read RoCE L2 fields
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit a70c07397fd80dfeeaead15751ab71449b548826
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a70c0739.failed
+
+Instead of RoCE drivers figuring out vlan, smac fields while working on
+QP/AH, provide a helper routine to read the L2 fields such as vlan_id and
+source mac address.
+
+This moves logic from mlx5 driver to core for wider usage for RoCE ports.
+
+This is a preparation patch to allow detaching netdev in subsequent patch.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit a70c07397fd80dfeeaead15751ab71449b548826)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --cc drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+index a7295322efbc,1d4ea135c28f..000000000000
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+@@@ -175,9 -175,10 +175,16 @@@ struct ib_ah *ocrdma_create_ah(struct i
+  	if (atomic_cmpxchg(&dev->update_sl, 1, 0))
+  		ocrdma_init_service_level(dev);
+  
+++<<<<<<< HEAD
+ +	ah = kzalloc(sizeof(*ah), GFP_ATOMIC);
+ +	if (!ah)
+ +		return ERR_PTR(-ENOMEM);
+++=======
++ 	sgid_attr = attr->grh.sgid_attr;
++ 	status = rdma_read_gid_l2_fields(sgid_attr, &vlan_tag, NULL);
++ 	if (status)
++ 		return status;
+++>>>>>>> a70c07397fd8 (RDMA: Introduce and use GID attr helper to read RoCE L2 fields)
+  
+  	status = ocrdma_alloc_av(dev, ah);
+  	if (status)
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index f50de4cb4cd9..870c448bccac 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -1281,6 +1281,61 @@ struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr)
+ 	return ndev;
+ }
+ 
++static int get_lower_dev_vlan(struct net_device *lower_dev, void *data)
++{
++	u16 *vlan_id = data;
++
++	if (is_vlan_dev(lower_dev))
++		*vlan_id = vlan_dev_vlan_id(lower_dev);
++
++	/* We are interested only in first level vlan device, so
++	 * always return 1 to stop iterating over next level devices.
++	 */
++	return 1;
++}
++
++/**
++ * rdma_read_gid_l2_fields - Read the vlan ID and source MAC address
++ *			     of a GID entry.
++ *
++ * @attr:	GID attribute pointer whose L2 fields to be read
++ * @vlan_id:	Pointer to vlan id to fill up if the GID entry has
++ *		vlan id. It is optional.
++ * @smac:	Pointer to smac to fill up for a GID entry. It is optional.
++ *
++ * rdma_read_gid_l2_fields() returns 0 on success and returns vlan id
++ * (if gid entry has vlan) and source MAC, or returns error.
++ */
++int rdma_read_gid_l2_fields(const struct ib_gid_attr *attr,
++			    u16 *vlan_id, u8 *smac)
++{
++	struct net_device *ndev;
++
++	ndev = attr->ndev;
++	if (!ndev)
++		return -EINVAL;
++
++	if (smac)
++		ether_addr_copy(smac, ndev->dev_addr);
++	if (vlan_id) {
++		*vlan_id = 0xffff;
++		if (is_vlan_dev(ndev)) {
++			*vlan_id = vlan_dev_vlan_id(ndev);
++		} else {
++			/* If the netdev is upper device and if it's lower
++			 * device is vlan device, consider vlan id of the
++			 * the lower vlan device for this gid entry.
++			 */
++			rcu_read_lock();
++			netdev_walk_all_lower_dev_rcu(attr->ndev,
++					get_lower_dev_vlan, vlan_id);
++			rcu_read_unlock();
++		}
++	}
++	return 0;
++}
++EXPORT_SYMBOL(rdma_read_gid_l2_fields);
++
+ static int config_non_roce_gid_cache(struct ib_device *device,
+ 				     u8 port, int gid_tbl_len)
+ {
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index e6f429fecf55..88de45a038b1 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -359,8 +359,9 @@ int bnxt_re_add_gid(const struct ib_gid_attr *attr, void **context)
+ 	struct bnxt_re_dev *rdev = to_bnxt_re_dev(attr->device, ibdev);
+ 	struct bnxt_qplib_sgid_tbl *sgid_tbl = &rdev->qplib_res.sgid_tbl;
+ 
+-	if ((attr->ndev) && is_vlan_dev(attr->ndev))
+-		vlan_id = vlan_dev_vlan_id(attr->ndev);
++	rc = rdma_read_gid_l2_fields(attr, &vlan_id, NULL);
++	if (rc)
++		return rc;
+ 
+ 	rc = bnxt_qplib_add_sgid(sgid_tbl, (struct bnxt_qplib_gid *)&attr->gid,
+ 				 rdev->qplib_res.netdev->dev_addr,
+@@ -1683,8 +1684,11 @@ int bnxt_re_modify_qp(struct ib_qp *ib_qp, struct ib_qp_attr *qp_attr,
+ 				qp_attr->ah_attr.roce.dmac);
+ 
+ 		sgid_attr = qp_attr->ah_attr.grh.sgid_attr;
+-		memcpy(qp->qplib_qp.smac, sgid_attr->ndev->dev_addr,
+-		       ETH_ALEN);
++		rc = rdma_read_gid_l2_fields(sgid_attr, NULL,
++					     &qp->qplib_qp.smac[0]);
++		if (rc)
++			return rc;
++
+ 		nw_type = rdma_gid_attr_network_type(sgid_attr);
+ 		switch (nw_type) {
+ 		case RDMA_NETWORK_IPV4:
+@@ -1903,8 +1907,10 @@ static int bnxt_re_build_qp1_send_v2(struct bnxt_re_qp *qp,
+ 
+ 	memset(&qp->qp1_hdr, 0, sizeof(qp->qp1_hdr));
+ 
+-	if (is_vlan_dev(sgid_attr->ndev))
+-		vlan_id = vlan_dev_vlan_id(sgid_attr->ndev);
++	rc = rdma_read_gid_l2_fields(sgid_attr, &vlan_id, NULL);
++	if (rc)
++		return rc;
++
+ 	/* Get network header type for this GID */
+ 	nw_type = rdma_gid_attr_network_type(sgid_attr);
+ 	switch (nw_type) {
+diff --git a/drivers/infiniband/hw/hns/hns_roce_ah.c b/drivers/infiniband/hw/hns/hns_roce_ah.c
+index 64e0c69b69c5..7f0177943e54 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_ah.c
++++ b/drivers/infiniband/hw/hns/hns_roce_ah.c
+@@ -51,6 +51,12 @@ struct ib_ah *hns_roce_create_ah(struct ib_pd *ibpd,
+ 	u16 vlan_tag = 0xffff;
+ 	const struct ib_global_route *grh = rdma_ah_read_grh(ah_attr);
+ 	bool vlan_en = false;
++	int ret;
++
++	gid_attr = ah_attr->grh.sgid_attr;
++	ret = rdma_read_gid_l2_fields(gid_attr, &vlan_tag, NULL);
++	if (ret)
++		return ret;
+ 
+ 	ah = kzalloc(sizeof(*ah), GFP_ATOMIC);
+ 	if (!ah)
+@@ -59,16 +65,12 @@ struct ib_ah *hns_roce_create_ah(struct ib_pd *ibpd,
+ 	/* Get mac address */
+ 	memcpy(ah->av.mac, ah_attr->roce.dmac, ETH_ALEN);
+ 
+-	gid_attr = ah_attr->grh.sgid_attr;
+-	if (is_vlan_dev(gid_attr->ndev)) {
+-		vlan_tag = vlan_dev_vlan_id(gid_attr->ndev);
++	if (vlan_tag < VLAN_CFI_MASK) {
+ 		vlan_en = true;
+-	}
+-
+-	if (vlan_tag < 0x1000)
+ 		vlan_tag |= (rdma_ah_get_sl(ah_attr) &
+ 			     HNS_ROCE_VLAN_SL_BIT_MASK) <<
+ 			     HNS_ROCE_VLAN_SL_SHIFT;
++	}
+ 
+ 	ah->av.port_pd = cpu_to_le32(to_hr_pd(ibpd)->pdn |
+ 				     (rdma_ah_get_port_num(ah_attr) <<
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 9390d30235c7..ad698cab7a82 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -3567,10 +3567,12 @@ static int hns_roce_v2_modify_qp(struct ib_qp *ibqp,
+ 
+ 		if (is_roce_protocol) {
+ 			gid_attr = attr->ah_attr.grh.sgid_attr;
+-			vlan = rdma_vlan_dev_vlan_id(gid_attr->ndev);
++			ret = rdma_read_gid_l2_fields(gid_attr, &vlan, NULL);
++			if (ret)
++				goto out;
+ 		}
+ 
+-		if (is_vlan_dev(gid_attr->ndev)) {
++		if (vlan < VLAN_CFI_MASK) {
+ 			roce_set_bit(context->byte_76_srqn_op_en,
+ 				     V2_QPC_BYTE_76_RQ_VLAN_EN_S, 1);
+ 			roce_set_bit(qpc_mask->byte_76_srqn_op_en,
+diff --git a/drivers/infiniband/hw/mlx4/ah.c b/drivers/infiniband/hw/mlx4/ah.c
+index 1672808262ba..9667523a0852 100644
+--- a/drivers/infiniband/hw/mlx4/ah.c
++++ b/drivers/infiniband/hw/mlx4/ah.c
+@@ -103,9 +103,11 @@ static struct ib_ah *create_iboe_ah(struct ib_pd *pd,
+ 	 */
+ 	gid_attr = ah_attr->grh.sgid_attr;
+ 	if (gid_attr) {
+-		if (is_vlan_dev(gid_attr->ndev))
+-			vlan_tag = vlan_dev_vlan_id(gid_attr->ndev);
+-		memcpy(ah->av.eth.s_mac, gid_attr->ndev->dev_addr, ETH_ALEN);
++		ret = rdma_read_gid_l2_fields(gid_attr, &vlan_tag,
++					      &ah->av.eth.s_mac[0]);
++		if (ret)
++			return ret;
++
+ 		ret = mlx4_ib_gid_index_to_real_index(ibdev, gid_attr);
+ 		if (ret < 0)
+ 			return ERR_PTR(ret);
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 971e9a9ebdaf..3a7d3c1d3314 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -2232,8 +2232,10 @@ static int __mlx4_ib_modify_qp(void *src, enum mlx4_ib_source_type src_type,
+ 
+ 		if (is_eth) {
+ 			gid_attr = attr->ah_attr.grh.sgid_attr;
+-			vlan = rdma_vlan_dev_vlan_id(gid_attr->ndev);
+-			memcpy(smac, gid_attr->ndev->dev_addr, ETH_ALEN);
++			err = rdma_read_gid_l2_fields(gid_attr, &vlan,
++						      &smac[0]);
++			if (err)
++				goto out;
+ 		}
+ 
+ 		if (mlx4_set_path(dev, attr, attr_mask, qp, &context->pri_path,
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 9937619aa9d5..3a26c42e163b 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -542,52 +542,22 @@ static int mlx5_query_port_roce(struct ib_device *device, u8 port_num,
+ 	return err;
+ }
+ 
+-struct mlx5_ib_vlan_info {
+-	u16 vlan_id;
+-	bool vlan;
+-};
+-
+-static int get_lower_dev_vlan(struct net_device *lower_dev, void *data)
+-{
+-	struct mlx5_ib_vlan_info *vlan_info = data;
+-
+-	if (is_vlan_dev(lower_dev)) {
+-		vlan_info->vlan = true;
+-		vlan_info->vlan_id = vlan_dev_vlan_id(lower_dev);
+-	}
+-	/* We are interested only in first level vlan device, so
+-	 * always return 1 to stop iterating over next level devices.
+-	 */
+-	return 1;
+-}
+-
+ static int set_roce_addr(struct mlx5_ib_dev *dev, u8 port_num,
+ 			 unsigned int index, const union ib_gid *gid,
+ 			 const struct ib_gid_attr *attr)
+ {
+ 	enum ib_gid_type gid_type = IB_GID_TYPE_IB;
+-	struct mlx5_ib_vlan_info vlan_info = { };
++	u16 vlan_id = 0xffff;
+ 	u8 roce_version = 0;
+ 	u8 roce_l3_type = 0;
+ 	u8 mac[ETH_ALEN];
++	int ret;
+ 
+ 	if (gid) {
+ 		gid_type = attr->gid_type;
+-		ether_addr_copy(mac, attr->ndev->dev_addr);
+-
+-		if (is_vlan_dev(attr->ndev)) {
+-			vlan_info.vlan = true;
+-			vlan_info.vlan_id = vlan_dev_vlan_id(attr->ndev);
+-		} else {
+-			/* If the netdev is upper device and if it's lower
+-			 * lower device is vlan device, consider vlan id of
+-			 * the lower vlan device for this gid entry.
+-			 */
+-			rcu_read_lock();
+-			netdev_walk_all_lower_dev_rcu(attr->ndev,
+-					get_lower_dev_vlan, &vlan_info);
+-			rcu_read_unlock();
+-		}
++		ret = rdma_read_gid_l2_fields(attr, &vlan_id, &mac[0]);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	switch (gid_type) {
+@@ -608,7 +578,7 @@ static int set_roce_addr(struct mlx5_ib_dev *dev, u8 port_num,
+ 
+ 	return mlx5_core_roce_gid_set(dev->mdev, index, roce_version,
+ 				      roce_l3_type, gid->raw, mac,
+-				      vlan_info.vlan, vlan_info.vlan_id,
++				      vlan_id < VLAN_CFI_MASK, vlan_id,
+ 				      port_num);
+ }
+ 
+* Unmerged path drivers/infiniband/hw/ocrdma/ocrdma_ah.c
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+index 7363d6e7071d..7dc480b238ae 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_hw.c
+@@ -2495,7 +2495,7 @@ static int ocrdma_set_av_params(struct ocrdma_qp *qp,
+ 	int status;
+ 	struct rdma_ah_attr *ah_attr = &attrs->ah_attr;
+ 	const struct ib_gid_attr *sgid_attr;
+-	u32 vlan_id = 0xFFFF;
++	u16 vlan_id = 0xFFFF;
+ 	u8 mac_addr[6], hdr_type;
+ 	union {
+ 		struct sockaddr     _sockaddr;
+@@ -2525,8 +2525,9 @@ static int ocrdma_set_av_params(struct ocrdma_qp *qp,
+ 	       sizeof(cmd->params.dgid));
+ 
+ 	sgid_attr = ah_attr->grh.sgid_attr;
+-	vlan_id = rdma_vlan_dev_vlan_id(sgid_attr->ndev);
+-	memcpy(mac_addr, sgid_attr->ndev->dev_addr, ETH_ALEN);
++	status = rdma_read_gid_l2_fields(sgid_attr, &vlan_id, &mac_addr[0]);
++	if (status)
++		return status;
+ 
+ 	qp->sgid_idx = grh->sgid_index;
+ 	memcpy(&cmd->params.sgid[0], &sgid_attr->gid.raw[0],
+diff --git a/drivers/infiniband/hw/qedr/qedr_roce_cm.c b/drivers/infiniband/hw/qedr/qedr_roce_cm.c
+index e1ac2fd60bb1..f5542d703ef9 100644
+--- a/drivers/infiniband/hw/qedr/qedr_roce_cm.c
++++ b/drivers/infiniband/hw/qedr/qedr_roce_cm.c
+@@ -397,14 +397,17 @@ static inline int qedr_gsi_build_header(struct qedr_dev *dev,
+ 	bool has_udp = false;
+ 	int i;
+ 
+-	send_size = 0;
+-	for (i = 0; i < swr->num_sge; ++i)
+-		send_size += swr->sg_list[i].length;
++	rc = rdma_read_gid_l2_fields(sgid_attr, &vlan_id, NULL);
++	if (rc)
++		return rc;
+ 
+-	vlan_id = rdma_vlan_dev_vlan_id(sgid_attr->ndev);
+ 	if (vlan_id < VLAN_CFI_MASK)
+ 		has_vlan = true;
+ 
++	send_size = 0;
++	for (i = 0; i < swr->num_sge; ++i)
++		send_size += swr->sg_list[i].length;
++
+ 	has_udp = (sgid_attr->gid_type == IB_GID_TYPE_ROCE_UDP_ENCAP);
+ 	if (!has_udp) {
+ 		/* RoCE v1 */
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index f963722e9c6c..d2ecae2ccef0 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -1078,10 +1078,13 @@ static inline int get_gid_info_from_table(struct ib_qp *ibqp,
+ 	enum rdma_network_type nw_type;
+ 	const struct ib_global_route *grh = rdma_ah_read_grh(&attr->ah_attr);
+ 	u32 ipv4_addr;
++	int ret;
+ 	int i;
+ 
+ 	gid_attr = grh->sgid_attr;
+-	qp_params->vlan_id = rdma_vlan_dev_vlan_id(gid_attr->ndev);
++	ret = rdma_read_gid_l2_fields(gid_attr, &qp_params->vlan_id, NULL);
++	if (ret)
++		return ret;
+ 
+ 	nw_type = rdma_gid_attr_network_type(gid_attr);
+ 	switch (nw_type) {
+diff --git a/include/rdma/ib_cache.h b/include/rdma/ib_cache.h
+index 62e990b620aa..730a65ad8c74 100644
+--- a/include/rdma/ib_cache.h
++++ b/include/rdma/ib_cache.h
+@@ -54,6 +54,9 @@ const struct ib_gid_attr *rdma_find_gid_by_filter(
+ 		       void *),
+ 	void *context);
+ 
++int rdma_read_gid_l2_fields(const struct ib_gid_attr *attr,
++			    u16 *vlan_id, u8 *smac);
++
+ /**
+  * ib_get_cached_pkey - Returns a cached PKey table entry
+  * @device: The device to query.
