@@ -1,0 +1,117 @@
+sched/deadline: Impose global limits on sched_attr::sched_period
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit b4098bfc5efb1fd7ecf40165132a1283aeea3500
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/b4098bfc.failed
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20190726161357.397880775@infradead.org
+(cherry picked from commit b4098bfc5efb1fd7ecf40165132a1283aeea3500)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched/sysctl.h
+diff --cc include/linux/sched/sysctl.h
+index 68e900f1c94c,24be30a40814..000000000000
+--- a/include/linux/sched/sysctl.h
++++ b/include/linux/sched/sysctl.h
+@@@ -55,6 -61,14 +55,17 @@@ int sched_proc_update_handler(struct ct
+  extern unsigned int sysctl_sched_rt_period;
+  extern int sysctl_sched_rt_runtime;
+  
+++<<<<<<< HEAD
+++=======
++ extern unsigned int sysctl_sched_dl_period_max;
++ extern unsigned int sysctl_sched_dl_period_min;
++ 
++ #ifdef CONFIG_UCLAMP_TASK
++ extern unsigned int sysctl_sched_uclamp_util_min;
++ extern unsigned int sysctl_sched_uclamp_util_max;
++ #endif
++ 
+++>>>>>>> b4098bfc5efb (sched/deadline: Impose global limits on sched_attr::sched_period)
+  #ifdef CONFIG_CFS_BANDWIDTH
+  extern unsigned int sysctl_sched_cfs_bandwidth_slice;
+  #endif
+* Unmerged path include/linux/sched/sysctl.h
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index d3d477e6e2c1..c4ebf2d20546 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -2666,6 +2666,14 @@ void __getparam_dl(struct task_struct *p, struct sched_attr *attr)
+ 	attr->sched_flags = dl_se->flags;
+ }
+ 
++/*
++ * Default limits for DL period; on the top end we guard against small util
++ * tasks still getting rediculous long effective runtimes, on the bottom end we
++ * guard against timer DoS.
++ */
++unsigned int sysctl_sched_dl_period_max = 1 << 22; /* ~4 seconds */
++unsigned int sysctl_sched_dl_period_min = 100;     /* 100 us */
++
+ /*
+  * This function validates the new parameters of a -deadline task.
+  * We ask for the deadline not being zero, and greater or equal
+@@ -2678,6 +2686,8 @@ void __getparam_dl(struct task_struct *p, struct sched_attr *attr)
+  */
+ bool __checkparam_dl(const struct sched_attr *attr)
+ {
++	u64 period, max, min;
++
+ 	/* special dl tasks don't actually use any parameter */
+ 	if (attr->sched_flags & SCHED_FLAG_SUGOV)
+ 		return true;
+@@ -2701,12 +2711,21 @@ bool __checkparam_dl(const struct sched_attr *attr)
+ 	    attr->sched_period & (1ULL << 63))
+ 		return false;
+ 
++	period = attr->sched_period;
++	if (!period)
++		period = attr->sched_deadline;
++
+ 	/* runtime <= deadline <= period (if period != 0) */
+-	if ((attr->sched_period != 0 &&
+-	     attr->sched_period < attr->sched_deadline) ||
++	if (period < attr->sched_deadline ||
+ 	    attr->sched_deadline < attr->sched_runtime)
+ 		return false;
+ 
++	max = (u64)READ_ONCE(sysctl_sched_dl_period_max) * NSEC_PER_USEC;
++	min = (u64)READ_ONCE(sysctl_sched_dl_period_min) * NSEC_PER_USEC;
++
++	if (period < min || period > max)
++		return false;
++
+ 	return true;
+ }
+ 
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index 24ee83338c72..2d586c268cd6 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -452,6 +452,20 @@ static struct ctl_table kern_table[] = {
+ 		.mode		= 0644,
+ 		.proc_handler	= sched_rt_handler,
+ 	},
++	{
++		.procname	= "sched_deadline_period_max_us",
++		.data		= &sysctl_sched_dl_period_max,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
++	{
++		.procname	= "sched_deadline_period_min_us",
++		.data		= &sysctl_sched_dl_period_min,
++		.maxlen		= sizeof(unsigned int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec,
++	},
+ 	{
+ 		.procname	= "sched_rr_timeslice_ms",
+ 		.data		= &sysctl_sched_rr_timeslice,
