@@ -1,0 +1,231 @@
+RDMA/umem: Add rdma_umem_for_each_dma_block()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit ebc24096c4c40017d9f9b0fddc5d69b94ad10369
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/ebc24096.failed
+
+This helper does the same as rdma_for_each_block(), except it works on a
+umem. This simplifies most of the call sites.
+
+Link: https://lore.kernel.org/r/4-v2-270386b7e60b+28f4-umem_1_jgg@nvidia.com
+	Acked-by: Miguel Ojeda <miguel.ojeda.sandonis@gmail.com>
+	Acked-by: Shiraz Saleem <shiraz.saleem@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit ebc24096c4c40017d9f9b0fddc5d69b94ad10369)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	.clang-format
+#	drivers/infiniband/hw/hns/hns_roce_alloc.c
+diff --cc .clang-format
+index aeec783c5276,311ef2c61a1b..000000000000
+--- a/.clang-format
++++ b/.clang-format
+@@@ -327,6 -413,9 +327,12 @@@ ForEachMacros
+    - 'radix_tree_for_each_slot'
+    - 'radix_tree_for_each_tagged'
+    - 'rbtree_postorder_for_each_entry_safe'
+++<<<<<<< HEAD
+++=======
++   - 'rdma_for_each_block'
++   - 'rdma_for_each_port'
++   - 'rdma_umem_for_each_dma_block'
+++>>>>>>> ebc24096c4c4 (RDMA/umem: Add rdma_umem_for_each_dma_block())
+    - 'resource_list_for_each_entry'
+    - 'resource_list_for_each_entry_safe'
+    - 'rhl_for_each_entry_rcu'
+diff --cc drivers/infiniband/hw/hns/hns_roce_alloc.c
+index 7e53a31378df,a6b23dec1adc..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_alloc.c
++++ b/drivers/infiniband/hw/hns/hns_roce_alloc.c
+@@@ -201,41 -203,83 +201,93 @@@ int hns_roce_buf_alloc(struct hns_roce_
+  						     GFP_KERNEL);
+  		if (!buf->direct.buf)
+  			return -ENOMEM;
+ -	} else {
+ -		buf_list = kcalloc(buf->npages, sizeof(*buf_list), GFP_KERNEL);
+ -		if (!buf_list)
+ -			return -ENOMEM;
+  
+ -		for (i = 0; i < buf->npages; i++) {
+ -			buf_list[i].buf = dma_alloc_coherent(dev, page_size,
+ -							     &buf_list[i].map,
+ -							     GFP_KERNEL);
+ -			if (!buf_list[i].buf)
+ -				break;
+ +		buf->direct.map = t;
+ +
+ +		while (t & ((1 << buf->page_shift) - 1)) {
+ +			--buf->page_shift;
+ +			buf->npages *= 2;
+  		}
+ +	} else {
+ +		buf->nbufs = (size + page_size - 1) / page_size;
+ +		buf->npages = buf->nbufs;
+ +		buf->page_shift = page_shift;
+ +		buf->page_list = kcalloc(buf->nbufs, sizeof(*buf->page_list),
+ +					 GFP_KERNEL);
+  
+ -		if (i != buf->npages && i > 0) {
+ -			while (i-- > 0)
+ -				dma_free_coherent(dev, page_size,
+ -						  buf_list[i].buf,
+ -						  buf_list[i].map);
+ -			kfree(buf_list);
+ +		if (!buf->page_list)
+  			return -ENOMEM;
+ +
+ +		for (i = 0; i < buf->nbufs; ++i) {
+ +			buf->page_list[i].buf = dma_alloc_coherent(dev,
+ +								   page_size,
+ +								   &t,
+ +								   GFP_KERNEL);
+ +
+ +			if (!buf->page_list[i].buf)
+ +				goto err_free;
+ +
+ +			buf->page_list[i].map = t;
+  		}
+ -		buf->page_list = buf_list;
+  	}
+ -	buf->size = size;
+  
+  	return 0;
+ -}
+  
+++<<<<<<< HEAD
+ +err_free:
+ +	hns_roce_buf_free(hr_dev, size, buf);
+ +	return -ENOMEM;
+++=======
++ int hns_roce_get_kmem_bufs(struct hns_roce_dev *hr_dev, dma_addr_t *bufs,
++ 			   int buf_cnt, int start, struct hns_roce_buf *buf)
++ {
++ 	int i, end;
++ 	int total;
++ 
++ 	end = start + buf_cnt;
++ 	if (end > buf->npages) {
++ 		dev_err(hr_dev->dev,
++ 			"Failed to check kmem bufs, end %d + %d total %d!\n",
++ 			start, buf_cnt, buf->npages);
++ 		return -EINVAL;
++ 	}
++ 
++ 	total = 0;
++ 	for (i = start; i < end; i++)
++ 		bufs[total++] = hns_roce_buf_page(buf, i);
++ 
++ 	return total;
++ }
++ 
++ int hns_roce_get_umem_bufs(struct hns_roce_dev *hr_dev, dma_addr_t *bufs,
++ 			   int buf_cnt, int start, struct ib_umem *umem,
++ 			   unsigned int page_shift)
++ {
++ 	struct ib_block_iter biter;
++ 	int total = 0;
++ 	int idx = 0;
++ 	u64 addr;
++ 
++ 	if (page_shift < HNS_HW_PAGE_SHIFT) {
++ 		dev_err(hr_dev->dev, "Failed to check umem page shift %d!\n",
++ 			page_shift);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* convert system page cnt to hw page cnt */
++ 	rdma_umem_for_each_dma_block(umem, &biter, 1 << page_shift) {
++ 		addr = rdma_block_iter_dma_address(&biter);
++ 		if (idx >= start) {
++ 			bufs[total++] = addr;
++ 			if (total >= buf_cnt)
++ 				goto done;
++ 		}
++ 		idx++;
++ 	}
++ 
++ done:
++ 	return total;
+++>>>>>>> ebc24096c4c4 (RDMA/umem: Add rdma_umem_for_each_dma_block())
+  }
+  
+  void hns_roce_cleanup_bitmap(struct hns_roce_dev *hr_dev)
+* Unmerged path .clang-format
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index d6e0078daa02..5e7b73d3d65e 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -3799,7 +3799,7 @@ static int fill_umem_pbl_tbl(struct ib_umem *umem, u64 *pbl_tbl_orig,
+ 	u64 page_size =  BIT_ULL(page_shift);
+ 	struct ib_block_iter biter;
+ 
+-	rdma_for_each_block(umem->sg_head.sgl, &biter, umem->nmap, page_size)
++	rdma_umem_for_each_dma_block(umem, &biter, page_size)
+ 		*pbl_tbl++ = rdma_block_iter_dma_address(&biter);
+ 
+ 	return pbl_tbl - pbl_tbl_orig;
+diff --git a/drivers/infiniband/hw/efa/efa_verbs.c b/drivers/infiniband/hw/efa/efa_verbs.c
+index 1910f43d1517..5af3d7c69624 100644
+--- a/drivers/infiniband/hw/efa/efa_verbs.c
++++ b/drivers/infiniband/hw/efa/efa_verbs.c
+@@ -1143,8 +1143,7 @@ static int umem_to_page_list(struct efa_dev *dev,
+ 	ibdev_dbg(&dev->ibdev, "hp_cnt[%u], pages_in_hp[%u]\n",
+ 		  hp_cnt, pages_in_hp);
+ 
+-	rdma_for_each_block(umem->sg_head.sgl, &biter, umem->nmap,
+-			    BIT(hp_shift))
++	rdma_umem_for_each_dma_block(umem, &biter, BIT(hp_shift))
+ 		page_list[hp_idx++] = rdma_block_iter_dma_address(&biter);
+ 
+ 	return 0;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_alloc.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 5b4de15bcc80..c84495727eab 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -1334,8 +1334,7 @@ static void i40iw_copy_user_pgaddrs(struct i40iw_mr *iwmr,
+ 	if (iwmr->type == IW_MEMREG_TYPE_QP)
+ 		iwpbl->qp_mr.sq_page = sg_page(region->sg_head.sgl);
+ 
+-	rdma_for_each_block(region->sg_head.sgl, &biter, region->nmap,
+-			    iwmr->page_size) {
++	rdma_umem_for_each_dma_block(region, &biter, iwmr->page_size) {
+ 		*pbl = rdma_block_iter_dma_address(&biter);
+ 		pbl = i40iw_next_pbl_addr(pbl, &pinfo, &idx);
+ 	}
+diff --git a/include/rdma/ib_umem.h b/include/rdma/ib_umem.h
+index d1c6ceb4b21f..92a9d0e6f161 100644
+--- a/include/rdma/ib_umem.h
++++ b/include/rdma/ib_umem.h
+@@ -40,6 +40,26 @@ static inline size_t ib_umem_num_pages(struct ib_umem *umem)
+ 	       PAGE_SHIFT;
+ }
+ 
++static inline void __rdma_umem_block_iter_start(struct ib_block_iter *biter,
++						struct ib_umem *umem,
++						unsigned long pgsz)
++{
++	__rdma_block_iter_start(biter, umem->sg_head.sgl, umem->nmap, pgsz);
++}
++
++/**
++ * rdma_umem_for_each_dma_block - iterate over contiguous DMA blocks of the umem
++ * @umem: umem to iterate over
++ * @pgsz: Page size to split the list into
++ *
++ * pgsz must be <= PAGE_SIZE or computed by ib_umem_find_best_pgsz(). The
++ * returned DMA blocks will be aligned to pgsz and span the range:
++ * ALIGN_DOWN(umem->address, pgsz) to ALIGN(umem->address + umem->length, pgsz)
++ */
++#define rdma_umem_for_each_dma_block(umem, biter, pgsz)                        \
++	for (__rdma_umem_block_iter_start(biter, umem, pgsz);                  \
++	     __rdma_block_iter_next(biter);)
++
+ #ifdef CONFIG_INFINIBAND_USER_MEM
+ 
+ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
