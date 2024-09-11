@@ -1,0 +1,102 @@
+KVM: Fix NULL-ptr deref after kvm_create_vm fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 8a44119a98bee4381d28f3ed1e41dfacf5c3aa6d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8a44119a.failed
+
+Reported by syzkaller:
+
+    kasan: CONFIG_KASAN_INLINE enabled
+    kasan: GPF could be caused by NULL-ptr deref or user memory access
+    general protection fault: 0000 [#1] PREEMPT SMP KASAN
+    CPU: 0 PID: 14727 Comm: syz-executor.3 Not tainted 5.4.0-rc4+ #0
+    RIP: 0010:kvm_coalesced_mmio_init+0x5d/0x110 arch/x86/kvm/../../../virt/kvm/coalesced_mmio.c:121
+    Call Trace:
+     kvm_dev_ioctl_create_vm arch/x86/kvm/../../../virt/kvm/kvm_main.c:3446 [inline]
+     kvm_dev_ioctl+0x781/0x1490 arch/x86/kvm/../../../virt/kvm/kvm_main.c:3494
+     vfs_ioctl fs/ioctl.c:46 [inline]
+     file_ioctl fs/ioctl.c:509 [inline]
+     do_vfs_ioctl+0x196/0x1150 fs/ioctl.c:696
+     ksys_ioctl+0x62/0x90 fs/ioctl.c:713
+     __do_sys_ioctl fs/ioctl.c:720 [inline]
+     __se_sys_ioctl fs/ioctl.c:718 [inline]
+     __x64_sys_ioctl+0x6e/0xb0 fs/ioctl.c:718
+     do_syscall_64+0xca/0x5d0 arch/x86/entry/common.c:290
+     entry_SYSCALL_64_after_hwframe+0x49/0xbe
+
+Commit 9121923c457d ("kvm: Allocate memslots and buses before calling kvm_arch_init_vm")
+moves memslots and buses allocations around, however, if kvm->srcu/irq_srcu fails
+initialization, NULL will be returned instead of error code, NULL will not be intercepted
+in kvm_dev_ioctl_create_vm() and be dereferenced by kvm_coalesced_mmio_init(), this patch
+fixes it.
+
+Moving the initialization is required anyway to avoid an incorrect synchronize_srcu that
+was also reported by syzkaller:
+
+ wait_for_completion+0x29c/0x440 kernel/sched/completion.c:136
+ __synchronize_srcu+0x197/0x250 kernel/rcu/srcutree.c:921
+ synchronize_srcu_expedited kernel/rcu/srcutree.c:946 [inline]
+ synchronize_srcu+0x239/0x3e8 kernel/rcu/srcutree.c:997
+ kvm_page_track_unregister_notifier+0xe7/0x130 arch/x86/kvm/page_track.c:212
+ kvm_mmu_uninit_vm+0x1e/0x30 arch/x86/kvm/mmu.c:5828
+ kvm_arch_destroy_vm+0x4a2/0x5f0 arch/x86/kvm/x86.c:9579
+ kvm_create_vm arch/x86/kvm/../../../virt/kvm/kvm_main.c:702 [inline]
+
+so do it.
+
+	Reported-by: syzbot+89a8060879fa0bd2db4f@syzkaller.appspotmail.com
+	Reported-by: syzbot+e27e7027eb2b80e44225@syzkaller.appspotmail.com
+Fixes: 9121923c457d ("kvm: Allocate memslots and buses before calling kvm_arch_init_vm")
+	Cc: Jim Mattson <jmattson@google.com>
+	Cc: Wanpeng Li <wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8a44119a98bee4381d28f3ed1e41dfacf5c3aa6d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 1f135235da01,e22ff63e5b1a..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -695,16 -680,7 +700,11 @@@ static struct kvm *kvm_create_vm(unsign
+  	INIT_HLIST_HEAD(&kvm->irq_ack_notifier_list);
+  #endif
+  
+- 	if (init_srcu_struct(&kvm->srcu))
+- 		goto out_err_no_srcu;
+- 	if (init_srcu_struct(&kvm->irq_srcu))
+- 		goto out_err_no_irq_srcu;
+- 
+  	r = kvm_init_mmu_notifier(kvm);
+ +	if (r)
+ +		goto out_err_no_mmu_notifier;
+ +
+ +	r = kvm_arch_post_init_vm(kvm);
+  	if (r)
+  		goto out_err;
+  
+@@@ -717,15 -693,6 +717,18 @@@
+  	return kvm;
+  
+  out_err:
+++<<<<<<< HEAD
+ +#if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+ +	if (kvm->mmu_notifier.ops)
+ +		mmu_notifier_unregister(&kvm->mmu_notifier, current->mm);
+ +#endif
+ +out_err_no_mmu_notifier:
+ +	cleanup_srcu_struct(&kvm->irq_srcu);
+ +out_err_no_irq_srcu:
+ +	cleanup_srcu_struct(&kvm->srcu);
+ +out_err_no_srcu:
+++=======
+++>>>>>>> 8a44119a98be (KVM: Fix NULL-ptr deref after kvm_create_vm fails)
+  	hardware_disable_all();
+  out_err_no_disable:
+  	kvm_arch_destroy_vm(kvm);
+* Unmerged path virt/kvm/kvm_main.c
