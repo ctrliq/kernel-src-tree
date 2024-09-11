@@ -1,0 +1,85 @@
+udp: Avoid post-GRO UDP checksum recalculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sean Tranchetti <stranche@codeaurora.org>
+commit f2696099c6c619aec4fe2b9691f0a81429957e65
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f2696099.failed
+
+Currently, when resegmenting an unexpected UDP GRO packet, the full UDP
+checksum will be calculated for every new SKB created by skb_segment()
+because the netdev features passed in by udp_rcv_segment() lack any
+information about checksum offload capabilities.
+
+Usually, we have no need to perform this calculation again, as
+  1) The GRO implementation guarantees that any packets making it to the
+     udp_rcv_segment() function had correct checksums, and, more
+     importantly,
+  2) Upon the successful return of udp_rcv_segment(), we immediately pull
+     the UDP header off and either queue the segment to the socket or
+     hand it off to a new protocol handler.
+
+Unless userspace has set the IP_CHECKSUM sockopt to indicate that they
+want the final checksum values, we can pass the needed netdev feature
+flags to __skb_gso_segment() to avoid checksumming each segment in
+skb_segment().
+
+Fixes: cf329aa42b66 ("udp: cope with UDP GRO packet misdirection")
+	Cc: Paolo Abeni <pabeni@redhat.com>
+	Cc: Subash Abhinov Kasiviswanathan <subashab@codeaurora.org>
+	Signed-off-by: Sean Tranchetti <stranche@codeaurora.org>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f2696099c6c619aec4fe2b9691f0a81429957e65)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/udp.h
+diff --cc include/net/udp.h
+index dff3cf1814b5,dbe030da20a1..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -450,9 -468,33 +450,40 @@@ DECLARE_STATIC_KEY_FALSE(udpv6_encap_ne
+  void udpv6_encap_enable(void);
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BPF_STREAM_PARSER
+ +struct sk_psock;
+ +struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
+ +#endif /* BPF_STREAM_PARSER */
+++=======
++ static inline struct sk_buff *udp_rcv_segment(struct sock *sk,
++ 					      struct sk_buff *skb, bool ipv4)
++ {
++ 	netdev_features_t features = NETIF_F_SG;
++ 	struct sk_buff *segs;
++ 
++ 	/* Avoid csum recalculation by skb_segment unless userspace explicitly
++ 	 * asks for the final checksum values
++ 	 */
++ 	if (!inet_get_convert_csum(sk))
++ 		features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
++ 
++ 	/* the GSO CB lays after the UDP one, no need to save and restore any
++ 	 * CB fragment
++ 	 */
++ 	segs = __skb_gso_segment(skb, features, false);
++ 	if (unlikely(IS_ERR_OR_NULL(segs))) {
++ 		int segs_nr = skb_shinfo(skb)->gso_segs;
++ 
++ 		atomic_add(segs_nr, &sk->sk_drops);
++ 		SNMP_ADD_STATS(__UDPX_MIB(sk, ipv4), UDP_MIB_INERRORS, segs_nr);
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	}
++ 
++ 	consume_skb(skb);
++ 	return segs;
++ }
+++>>>>>>> f2696099c6c6 (udp: Avoid post-GRO UDP checksum recalculation)
+  
+  #endif	/* _UDP_H */
+* Unmerged path include/net/udp.h
