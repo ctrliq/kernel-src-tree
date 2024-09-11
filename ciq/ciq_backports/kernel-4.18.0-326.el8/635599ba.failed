@@ -1,0 +1,165 @@
+selftests/bpf: Sync RCU before unloading bpf_testmod
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Andrii Nakryiko <andrii@kernel.org>
+commit 635599bace259a2c42741c3ea61bfa7be6f15556
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/635599ba.failed
+
+If some of the subtests use module BTFs through ksyms, they will cause
+bpf_prog to take a refcount on bpf_testmod module, which will prevent it from
+successfully unloading. Module's refcnt is decremented when bpf_prog is freed,
+which generally happens in RCU callback. So we need to trigger
+syncronize_rcu() in the kernel, which can be achieved nicely with
+membarrier(MEMBARRIER_CMD_SHARED) or membarrier(MEMBARRIER_CMD_GLOBAL) syscall.
+So do that in kernel_sync_rcu() and make it available to other test inside the
+test_progs. This synchronize_rcu() is called before attempting to unload
+bpf_testmod.
+
+Fixes: 9f7fa225894c ("selftests/bpf: Add bpf_testmod kernel module for testing")
+	Suggested-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Acked-by: Hao Luo <haoluo@google.com>
+Link: https://lore.kernel.org/bpf/20210112075520.4103414-5-andrii@kernel.org
+(cherry picked from commit 635599bace259a2c42741c3ea61bfa7be6f15556)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/test_progs.c
+diff --cc tools/testing/selftests/bpf/test_progs.c
+index 2d2041a176fa,213628ee721c..000000000000
+--- a/tools/testing/selftests/bpf/test_progs.c
++++ b/tools/testing/selftests/bpf/test_progs.c
+@@@ -360,6 -361,68 +361,71 @@@ err
+  	return -1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int finit_module(int fd, const char *param_values, int flags)
++ {
++ 	return syscall(__NR_finit_module, fd, param_values, flags);
++ }
++ 
++ static int delete_module(const char *name, int flags)
++ {
++ 	return syscall(__NR_delete_module, name, flags);
++ }
++ 
++ /*
++  * Trigger synchronize_rcu() in kernel.
++  */
++ int kern_sync_rcu(void)
++ {
++ 	return syscall(__NR_membarrier, MEMBARRIER_CMD_SHARED, 0, 0);
++ }
++ 
++ static void unload_bpf_testmod(void)
++ {
++ 	if (kern_sync_rcu())
++ 		fprintf(env.stderr, "Failed to trigger kernel-side RCU sync!\n");
++ 	if (delete_module("bpf_testmod", 0)) {
++ 		if (errno == ENOENT) {
++ 			if (env.verbosity > VERBOSE_NONE)
++ 				fprintf(stdout, "bpf_testmod.ko is already unloaded.\n");
++ 			return;
++ 		}
++ 		fprintf(env.stderr, "Failed to unload bpf_testmod.ko from kernel: %d\n", -errno);
++ 		exit(1);
++ 	}
++ 	if (env.verbosity > VERBOSE_NONE)
++ 		fprintf(stdout, "Successfully unloaded bpf_testmod.ko.\n");
++ }
++ 
++ static int load_bpf_testmod(void)
++ {
++ 	int fd;
++ 
++ 	/* ensure previous instance of the module is unloaded */
++ 	unload_bpf_testmod();
++ 
++ 	if (env.verbosity > VERBOSE_NONE)
++ 		fprintf(stdout, "Loading bpf_testmod.ko...\n");
++ 
++ 	fd = open("bpf_testmod.ko", O_RDONLY);
++ 	if (fd < 0) {
++ 		fprintf(env.stderr, "Can't find bpf_testmod.ko kernel module: %d\n", -errno);
++ 		return -ENOENT;
++ 	}
++ 	if (finit_module(fd, "", 0)) {
++ 		fprintf(env.stderr, "Failed to load bpf_testmod.ko into the kernel: %d\n", -errno);
++ 		close(fd);
++ 		return -EINVAL;
++ 	}
++ 	close(fd);
++ 
++ 	if (env.verbosity > VERBOSE_NONE)
++ 		fprintf(stdout, "Successfully loaded bpf_testmod.ko.\n");
++ 	return 0;
++ }
++ 
+++>>>>>>> 635599bace25 (selftests/bpf: Sync RCU before unloading bpf_testmod)
+  /* extern declarations for test funcs */
+  #define DEFINE_TEST(name) extern void test_##name(void);
+  #include <prog_tests/tests.h>
+diff --git a/tools/testing/selftests/bpf/prog_tests/btf_map_in_map.c b/tools/testing/selftests/bpf/prog_tests/btf_map_in_map.c
+index 76ebe4c250f1..eb90a6b8850d 100644
+--- a/tools/testing/selftests/bpf/prog_tests/btf_map_in_map.c
++++ b/tools/testing/selftests/bpf/prog_tests/btf_map_in_map.c
+@@ -20,39 +20,6 @@ static __u32 bpf_map_id(struct bpf_map *map)
+ 	return info.id;
+ }
+ 
+-/*
+- * Trigger synchronize_rcu() in kernel.
+- *
+- * ARRAY_OF_MAPS/HASH_OF_MAPS lookup/update operations trigger synchronize_rcu()
+- * if looking up an existing non-NULL element or updating the map with a valid
+- * inner map FD. Use this fact to trigger synchronize_rcu(): create map-in-map,
+- * create a trivial ARRAY map, update map-in-map with ARRAY inner map. Then
+- * cleanup. At the end, at least one synchronize_rcu() would be called.
+- */
+-static int kern_sync_rcu(void)
+-{
+-	int inner_map_fd, outer_map_fd, err, zero = 0;
+-
+-	inner_map_fd = bpf_create_map(BPF_MAP_TYPE_ARRAY, 4, 4, 1, 0);
+-	if (CHECK(inner_map_fd < 0, "inner_map_create", "failed %d\n", -errno))
+-		return -1;
+-
+-	outer_map_fd = bpf_create_map_in_map(BPF_MAP_TYPE_ARRAY_OF_MAPS, NULL,
+-					     sizeof(int), inner_map_fd, 1, 0);
+-	if (CHECK(outer_map_fd < 0, "outer_map_create", "failed %d\n", -errno)) {
+-		close(inner_map_fd);
+-		return -1;
+-	}
+-
+-	err = bpf_map_update_elem(outer_map_fd, &zero, &inner_map_fd, 0);
+-	if (err)
+-		err = -errno;
+-	CHECK(err, "outer_map_update", "failed %d\n", err);
+-	close(inner_map_fd);
+-	close(outer_map_fd);
+-	return err;
+-}
+-
+ static void test_lookup_update(void)
+ {
+ 	int map1_fd, map2_fd, map3_fd, map4_fd, map5_fd, map1_id, map2_id;
+* Unmerged path tools/testing/selftests/bpf/test_progs.c
+diff --git a/tools/testing/selftests/bpf/test_progs.h b/tools/testing/selftests/bpf/test_progs.h
+index 3c4402389807..c3372a4bd36a 100644
+--- a/tools/testing/selftests/bpf/test_progs.h
++++ b/tools/testing/selftests/bpf/test_progs.h
+@@ -218,6 +218,7 @@ int bpf_find_map(const char *test, struct bpf_object *obj, const char *name);
+ int compare_map_keys(int map1_fd, int map2_fd);
+ int compare_stack_ips(int smap_fd, int amap_fd, int stack_trace_len);
+ int extract_build_id(char *build_id, size_t size);
++int kern_sync_rcu(void);
+ 
+ #ifdef __x86_64__
+ #define SYS_NANOSLEEP_KPROBE_NAME "__x64_sys_nanosleep"
