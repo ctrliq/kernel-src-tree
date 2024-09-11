@@ -949,9 +949,6 @@ xfs_dir_ialloc(
 	if (error)
 		return error;
 
-	if (!agibp)
-		return -ENOSPC;
-
 	/* Allocate an inode from the selected AG */
 	error = xfs_dialloc_ag(*tpp, agibp, parent_ino, &ino);
 	if (error)
