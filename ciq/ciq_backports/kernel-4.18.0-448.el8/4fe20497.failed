@@ -1,0 +1,437 @@
+s390/pci: refresh function handle in iomap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 4fe204977096e900cb91a3298b05c794ac24f540
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4fe20497.failed
+
+The function handle of a PCI function is updated when disabling or
+enabling it as well as when the function's availability changes or it
+enters the error state.
+
+Until now this only occurred either while there is no struct pci_dev
+associated with the function yet or the function became unavailable.
+This meant that leaving a stale function handle in the iomap either
+didn't happen because there was no iomap yet or it lead to errors on PCI
+access but so would the correct disabled function handle.
+
+In the future a CLP Set PCI Function Disable/Enable cycle during PCI
+device recovery may be done while the device is bound to a driver.  In
+this case we must update the iomap associated with the now-stale
+function handle to ensure that the resulting zPCI instruction references
+an accurate function handle.
+
+Since the function handle is accessed by the PCI accessor helpers
+without locking use READ_ONCE()/WRITE_ONCE() to mark this access and
+prevent compiler optimizations that would move the load/store.
+
+With that infrastructure in place let's also properly update the
+function handle in the existing cases. This makes sure that in the
+future debugging of a zPCI function access through the handle will
+show an up to date handle reducing the chance of confusion. Also it
+makes sure we have one single place where a zPCI function handle is
+updated after initialization.
+
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 4fe204977096e900cb91a3298b05c794ac24f540)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_event.c
+diff --cc arch/s390/pci/pci.c
+index 105423d600b5,fe01ca3b33fa..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -692,71 -690,76 +720,93 @@@ void zpci_free_domain(int domain
+  
+  int zpci_enable_device(struct zpci_dev *zdev)
+  {
+ -	u32 fh = zdev->fh;
+ -	int rc = 0;
+ +	int rc;
+  
+ -	if (clp_enable_fh(zdev, &fh, ZPCI_NR_DMA_SPACES))
+ +	if (clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES)) {
+  		rc = -EIO;
+++<<<<<<< HEAD
+ +		goto out;
+ +	}
+ +
+ +	rc = zpci_dma_init_device(zdev);
+ +	if (rc)
+ +		goto out_dma;
+ +
+ +	zdev->state = ZPCI_FN_STATE_ONLINE;
+ +	return 0;
+ +
+ +out_dma:
+ +	clp_disable_fh(zdev);
+ +out:
+++=======
++ 	else
++ 		zpci_update_fh(zdev, fh);
+++>>>>>>> 4fe204977096 (s390/pci: refresh function handle in iomap)
+  	return rc;
+  }
+ +EXPORT_SYMBOL_GPL(zpci_enable_device);
+  
+  int zpci_disable_device(struct zpci_dev *zdev)
+  {
+ -	u32 fh = zdev->fh;
+ -	int cc, rc = 0;
+ +	zpci_dma_exit_device(zdev);
+ +	/*
+ +	 * The zPCI function may already be disabled by the platform, this is
+ +	 * detected in clp_disable_fh() which becomes a no-op.
+ +	 */
+ +	return clp_disable_fh(zdev) ? -EIO : 0;
+ +}
+ +EXPORT_SYMBOL_GPL(zpci_disable_device);
+  
+++<<<<<<< HEAD
+ +void zpci_remove_device(struct zpci_dev *zdev)
+ +{
+ +	struct zpci_bus *zbus = zdev->zbus;
+ +	struct pci_dev *pdev;
+ +
+ +	pdev = pci_get_slot(zbus->bus, zdev->devfn);
+ +	if (pdev) {
+ +		if (pdev->is_virtfn)
+ +			return zpci_remove_virtfn(pdev, zdev->vfn);
+ +		pci_stop_and_remove_bus_device_locked(pdev);
+++=======
++ 	cc = clp_disable_fh(zdev, &fh);
++ 	if (!cc) {
++ 		zpci_update_fh(zdev, fh);
++ 	} else if (cc == CLP_RC_SETPCIFN_ALRDY) {
++ 		pr_info("Disabling PCI function %08x had no effect as it was already disabled\n",
++ 			zdev->fid);
++ 		/* Function is already disabled - update handle */
++ 		rc = clp_refresh_fh(zdev->fid, &fh);
++ 		if (!rc) {
++ 			zpci_update_fh(zdev, fh);
++ 			rc = -EINVAL;
++ 		}
++ 	} else {
++ 		rc = -EIO;
+++>>>>>>> 4fe204977096 (s390/pci: refresh function handle in iomap)
+  	}
+ -	return rc;
+  }
+  
+ -/**
+ - * zpci_create_device() - Create a new zpci_dev and add it to the zbus
+ - * @fid: Function ID of the device to be created
+ - * @fh: Current Function Handle of the device to be created
+ - * @state: Initial state after creation either Standby or Configured
+ - *
+ - * Creates a new zpci device and adds it to its, possibly newly created, zbus
+ - * as well as zpci_list.
+ - *
+ - * Returns: the zdev on success or an error pointer otherwise
+ - */
+ -struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
+ +int zpci_create_device(struct zpci_dev *zdev)
+  {
+ -	struct zpci_dev *zdev;
+  	int rc;
+  
+ -	zpci_dbg(3, "add fid:%x, fh:%x, c:%d\n", fid, fh, state);
+ -	zdev = kzalloc(sizeof(*zdev), GFP_KERNEL);
+ -	if (!zdev)
+ -		return ERR_PTR(-ENOMEM);
+ +	kref_init(&zdev->kref);
+  
+ -	/* FID and Function Handle are the static/dynamic identifiers */
+ -	zdev->fid = fid;
+ -	zdev->fh = fh;
+ +	spin_lock(&zpci_list_lock);
+ +	list_add_tail(&zdev->entry, &zpci_list);
+ +	spin_unlock(&zpci_list_lock);
+  
+ -	/* Query function properties and update zdev */
+ -	rc = clp_query_pci_fn(zdev);
+ +	rc = zpci_init_iommu(zdev);
+  	if (rc)
+ -		goto error;
+ -	zdev->state =  state;
+ +		goto out;
+  
+ -	kref_init(&zdev->kref);
+  	mutex_init(&zdev->lock);
+ -
+ -	rc = zpci_init_iommu(zdev);
+ -	if (rc)
+ -		goto error;
+ +	if (zdev->state == ZPCI_FN_STATE_CONFIGURED) {
+ +		rc = zpci_enable_device(zdev);
+ +		if (rc)
+ +			goto out_destroy_iommu;
+ +	}
+  
+  	rc = zpci_bus_device_register(zdev, &pci_root_ops);
+  	if (rc)
+@@@ -786,6 -788,77 +836,80 @@@ bool zpci_is_device_configured(struct z
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * zpci_scan_configured_device() - Scan a freshly configured zpci_dev
++  * @zdev: The zpci_dev to be configured
++  * @fh: The general function handle supplied by the platform
++  *
++  * Given a device in the configuration state Configured, enables, scans and
++  * adds it to the common code PCI subsystem if possible. If the PCI device is
++  * parked because we can not yet create a PCI bus because we have not seen
++  * function 0, it is ignored but will be scanned once function 0 appears.
++  * If any failure occurs, the zpci_dev is left disabled.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_scan_configured_device(struct zpci_dev *zdev, u32 fh)
++ {
++ 	int rc;
++ 
++ 	zpci_update_fh(zdev, fh);
++ 	/* the PCI function will be scanned once function 0 appears */
++ 	if (!zdev->zbus->bus)
++ 		return 0;
++ 
++ 	/* For function 0 on a multi-function bus scan whole bus as we might
++ 	 * have to pick up existing functions waiting for it to allow creating
++ 	 * the PCI bus
++ 	 */
++ 	if (zdev->devfn == 0 && zdev->zbus->multifunction)
++ 		rc = zpci_bus_scan_bus(zdev->zbus);
++ 	else
++ 		rc = zpci_bus_scan_device(zdev);
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * zpci_deconfigure_device() - Deconfigure a zpci_dev
++  * @zdev: The zpci_dev to configure
++  *
++  * Deconfigure a zPCI function that is currently configured and possibly known
++  * to the common code PCI subsystem.
++  * If any failure occurs the device is left as is.
++  *
++  * Return: 0 on success, or an error code otherwise
++  */
++ int zpci_deconfigure_device(struct zpci_dev *zdev)
++ {
++ 	int rc;
++ 
++ 	if (zdev->zbus->bus)
++ 		zpci_bus_remove_device(zdev, false);
++ 
++ 	if (zdev->dma_table) {
++ 		rc = zpci_dma_exit_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	if (zdev_enabled(zdev)) {
++ 		rc = zpci_disable_device(zdev);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = sclp_pci_deconfigure(zdev->fid);
++ 	zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, rc);
++ 	if (rc)
++ 		return rc;
++ 	zdev->state = ZPCI_FN_STATE_STANDBY;
++ 
++ 	return 0;
++ }
++ 
++ /**
+++>>>>>>> 4fe204977096 (s390/pci: refresh function handle in iomap)
+   * zpci_device_reserved() - Mark device as resverved
+   * @zdev: the zpci_dev that was reserved
+   *
+diff --cc arch/s390/pci/pci_event.c
+index 7b9f548c1c3a,8df8b3210c5b..000000000000
+--- a/arch/s390/pci/pci_event.c
++++ b/arch/s390/pci/pci_event.c
+@@@ -75,6 -76,23 +75,26 @@@ void zpci_event_error(void *data
+  		__zpci_event_error(data);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void zpci_event_hard_deconfigured(struct zpci_dev *zdev, u32 fh)
++ {
++ 	zpci_update_fh(zdev, fh);
++ 	/* Give the driver a hint that the function is
++ 	 * already unusable.
++ 	 */
++ 	zpci_bus_remove_device(zdev, true);
++ 	/* Even though the device is already gone we still
++ 	 * need to free zPCI resources as part of the disable.
++ 	 */
++ 	if (zdev->dma_table)
++ 		zpci_dma_exit_device(zdev);
++ 	if (zdev_enabled(zdev))
++ 		zpci_disable_device(zdev);
++ 	zdev->state = ZPCI_FN_STATE_STANDBY;
++ }
++ 
+++>>>>>>> 4fe204977096 (s390/pci: refresh function handle in iomap)
+  static void __zpci_event_availability(struct zpci_ccdf_avail *ccdf)
+  {
+  	struct zpci_dev *zdev = get_zdev_by_fid(ccdf->fid);
+@@@ -93,70 -106,46 +113,88 @@@
+  	switch (ccdf->pec) {
+  	case 0x0301: /* Reserved|Standby -> Configured */
+  		if (!zdev) {
+ -			zdev = zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_CONFIGURED);
+ -			if (IS_ERR(zdev))
+ -				break;
+ -		} else {
+ -			/* the configuration request may be stale */
+ -			if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ -				break;
+ -			zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +			ret = clp_add_pci_device(ccdf->fid, ccdf->fh, 1);
+ +			break;
+  		}
+ -		zpci_scan_configured_device(zdev, ccdf->fh);
+ +		/* the configuration request may be stale */
+ +		if (zdev->state != ZPCI_FN_STATE_STANDBY)
+ +			break;
+ +		zdev->fh = ccdf->fh;
+ +		zdev->state = ZPCI_FN_STATE_CONFIGURED;
+ +		ret = zpci_enable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		/* the PCI function will be scanned once function 0 appears */
+ +		if (!zdev->zbus->bus)
+ +			break;
+ +
+ +		pdev = pci_scan_single_device(zdev->zbus->bus, zdev->devfn);
+ +		if (!pdev)
+ +			break;
+ +
+ +		pci_bus_add_device(pdev);
+ +		pci_lock_rescan_remove();
+ +		pci_bus_add_devices(zdev->zbus->bus);
+ +		pci_unlock_rescan_remove();
+  		break;
+  	case 0x0302: /* Reserved -> Standby */
+++<<<<<<< HEAD
+ +		if (!zdev) {
+ +			clp_add_pci_device(ccdf->fid, ccdf->fh, 0);
+ +			break;
+ +		}
+ +		zdev->fh = ccdf->fh;
+ +		break;
+ +	case 0x0303: /* Deconfiguration requested */
+ +		if (!zdev)
+ +			break;
+ +		if (pdev)
+ +			zpci_remove_device(zdev);
+ +
+ +		ret = zpci_disable_device(zdev);
+ +		if (ret)
+ +			break;
+ +
+ +		ret = sclp_pci_deconfigure(zdev->fid);
+ +		zpci_dbg(3, "deconf fid:%x, rc:%d\n", zdev->fid, ret);
+ +		if (!ret)
+ +			zdev->state = ZPCI_FN_STATE_STANDBY;
+ +
+++=======
++ 		if (!zdev)
++ 			zpci_create_device(ccdf->fid, ccdf->fh, ZPCI_FN_STATE_STANDBY);
++ 		else
++ 			zpci_update_fh(zdev, ccdf->fh);
++ 		break;
++ 	case 0x0303: /* Deconfiguration requested */
++ 		if (zdev) {
++ 			/* The event may have been queued before we confirgured
++ 			 * the device.
++ 			 */
++ 			if (zdev->state != ZPCI_FN_STATE_CONFIGURED)
++ 				break;
++ 			zpci_update_fh(zdev, ccdf->fh);
++ 			zpci_deconfigure_device(zdev);
++ 		}
+++>>>>>>> 4fe204977096 (s390/pci: refresh function handle in iomap)
+  		break;
+  	case 0x0304: /* Configured -> Standby|Reserved */
+ -		if (zdev) {
+ -			/* The event may have been queued before we confirgured
+ -			 * the device.:
+ -			 */
+ -			if (zdev->state == ZPCI_FN_STATE_CONFIGURED)
+ -				zpci_event_hard_deconfigured(zdev, ccdf->fh);
+ -			/* The 0x0304 event may immediately reserve the device */
+ -			if (!clp_get_state(zdev->fid, &state) &&
+ -			    state == ZPCI_FN_STATE_RESERVED) {
+ -				zpci_device_reserved(zdev);
+ -			}
+ +		if (!zdev)
+ +			break;
+ +		if (pdev) {
+ +			/* Give the driver a hint that the function is
+ +			 * already unusable. */
+ +			pdev->error_state = pci_channel_io_perm_failure;
+ +			zpci_remove_device(zdev);
+ +		}
+ +
+ +		zdev->fh = ccdf->fh;
+ +		zpci_disable_device(zdev);
+ +		zdev->state = ZPCI_FN_STATE_STANDBY;
+ +		if (!clp_get_state(ccdf->fid, &state) &&
+ +		    state == ZPCI_FN_STATE_RESERVED) {
+ +			zpci_device_reserved(zdev);
+  		}
+  		break;
+  	case 0x0306: /* 0x308 or 0x302 for multiple devices */
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 37481081a26c..c7218e21ea6f 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -211,6 +211,7 @@ bool zpci_is_device_configured(struct zpci_dev *zdev);
+ int zpci_register_ioat(struct zpci_dev *, u8, u64, u64, u64);
+ int zpci_unregister_ioat(struct zpci_dev *, u8);
+ void zpci_remove_reserved_devices(void);
++void zpci_update_fh(struct zpci_dev *zdev, u32 fh);
+ 
+ /* CLP */
+ int clp_scan_pci_devices(void);
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_event.c
+diff --git a/arch/s390/pci/pci_insn.c b/arch/s390/pci/pci_insn.c
+index 2e43996159f0..28d863aaafea 100644
+--- a/arch/s390/pci/pci_insn.c
++++ b/arch/s390/pci/pci_insn.c
+@@ -163,7 +163,7 @@ static inline int zpci_load_fh(u64 *data, const volatile void __iomem *addr,
+ 			       unsigned long len)
+ {
+ 	struct zpci_iomap_entry *entry = &zpci_iomap_start[ZPCI_IDX(addr)];
+-	u64 req = ZPCI_CREATE_REQ(entry->fh, entry->bar, len);
++	u64 req = ZPCI_CREATE_REQ(READ_ONCE(entry->fh), entry->bar, len);
+ 
+ 	return __zpci_load(data, req, ZPCI_OFFSET(addr));
+ }
+@@ -244,7 +244,7 @@ static inline int zpci_store_fh(const volatile void __iomem *addr, u64 data,
+ 				unsigned long len)
+ {
+ 	struct zpci_iomap_entry *entry = &zpci_iomap_start[ZPCI_IDX(addr)];
+-	u64 req = ZPCI_CREATE_REQ(entry->fh, entry->bar, len);
++	u64 req = ZPCI_CREATE_REQ(READ_ONCE(entry->fh), entry->bar, len);
+ 
+ 	return __zpci_store(data, req, ZPCI_OFFSET(addr));
+ }
