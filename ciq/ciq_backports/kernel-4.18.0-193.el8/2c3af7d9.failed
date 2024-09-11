@@ -1,0 +1,83 @@
+selftests/bpf: fix vlan handling in flow dissector program
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 2c3af7d901c61c101c02f431cfb520af9ff56ab4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2c3af7d9.failed
+
+When we tail call PROG(VLAN) from parse_eth_proto we don't need to peek
+back to handle vlan proto because we didn't adjust nhoff/thoff yet. Use
+flow_keys->n_proto, that we set in parse_eth_proto instead and
+properly increment nhoff as well.
+
+Also, always use skb->protocol and don't look at skb->vlan_present.
+skb->vlan_present indicates that vlan information is stored out-of-band
+in skb->vlan_{tci,proto} and vlan header is already pulled from skb.
+That means, skb->vlan_present == true is not relevant for BPF flow
+dissector.
+
+Add simple test cases with VLAN tagged frames:
+  * single vlan for ipv4
+  * double vlan for ipv6
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 2c3af7d901c61c101c02f431cfb520af9ff56ab4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/prog_tests/flow_dissector.c
+* Unmerged path tools/testing/selftests/bpf/prog_tests/flow_dissector.c
+diff --git a/tools/testing/selftests/bpf/bpf_flow.c b/tools/testing/selftests/bpf/bpf_flow.c
+index 284660f5aa95..f177c7a6a6c7 100644
+--- a/tools/testing/selftests/bpf/bpf_flow.c
++++ b/tools/testing/selftests/bpf/bpf_flow.c
+@@ -119,10 +119,7 @@ static __always_inline int parse_eth_proto(struct __sk_buff *skb, __be16 proto)
+ SEC("flow_dissector")
+ int _dissect(struct __sk_buff *skb)
+ {
+-	if (!skb->vlan_present)
+-		return parse_eth_proto(skb, skb->protocol);
+-	else
+-		return parse_eth_proto(skb, skb->vlan_proto);
++	return parse_eth_proto(skb, skb->protocol);
+ }
+ 
+ /* Parses on IPPROTO_* */
+@@ -336,15 +333,9 @@ PROG(VLAN)(struct __sk_buff *skb)
+ {
+ 	struct bpf_flow_keys *keys = skb->flow_keys;
+ 	struct vlan_hdr *vlan, _vlan;
+-	__be16 proto;
+-
+-	/* Peek back to see if single or double-tagging */
+-	if (bpf_skb_load_bytes(skb, keys->thoff - sizeof(proto), &proto,
+-			       sizeof(proto)))
+-		return BPF_DROP;
+ 
+ 	/* Account for double-tagging */
+-	if (proto == bpf_htons(ETH_P_8021AD)) {
++	if (keys->n_proto == bpf_htons(ETH_P_8021AD)) {
+ 		vlan = bpf_flow_dissect_get_header(skb, sizeof(*vlan), &_vlan);
+ 		if (!vlan)
+ 			return BPF_DROP;
+@@ -352,6 +343,7 @@ PROG(VLAN)(struct __sk_buff *skb)
+ 		if (vlan->h_vlan_encapsulated_proto != bpf_htons(ETH_P_8021Q))
+ 			return BPF_DROP;
+ 
++		keys->nhoff += sizeof(*vlan);
+ 		keys->thoff += sizeof(*vlan);
+ 	}
+ 
+@@ -359,6 +351,7 @@ PROG(VLAN)(struct __sk_buff *skb)
+ 	if (!vlan)
+ 		return BPF_DROP;
+ 
++	keys->nhoff += sizeof(*vlan);
+ 	keys->thoff += sizeof(*vlan);
+ 	/* Only allow 8021AD + 8021Q double tagging and no triple tagging.*/
+ 	if (vlan->h_vlan_encapsulated_proto == bpf_htons(ETH_P_8021AD) ||
+* Unmerged path tools/testing/selftests/bpf/prog_tests/flow_dissector.c
