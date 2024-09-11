@@ -1,0 +1,117 @@
+mm,thp: stats for file backed THP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Song Liu <songliubraving@fb.com>
+commit 60fbf0ab5da1c360e02b7f7d882bf1c0d8f7e32a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/60fbf0ab.failed
+
+In preparation for non-shmem THP, this patch adds a few stats and exposes
+them in /proc/meminfo, /sys/bus/node/devices/<node>/meminfo, and
+/proc/<pid>/task/<tid>/smaps.
+
+This patch is mostly a rewrite of Kirill A.  Shutemov's earlier version:
+https://lkml.kernel.org/r/20170126115819.58875-5-kirill.shutemov@linux.intel.com/
+
+Link: http://lkml.kernel.org/r/20190801184244.3169074-5-songliubraving@fb.com
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Acked-by: Rik van Riel <riel@surriel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 60fbf0ab5da1c360e02b7f7d882bf1c0d8f7e32a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/task_mmu.c
+diff --cc fs/proc/task_mmu.c
+index 7f3f589c8638,9442631fd4af..000000000000
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@@ -559,8 -589,8 +560,13 @@@ static void smaps_pmd_entry(pmd_t *pmd
+  	else if (is_zone_device_page(page))
+  		/* pass */;
+  	else
+++<<<<<<< HEAD
+ +		VM_BUG_ON_PAGE(1, page);
+ +	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd));
+++=======
++ 		mss->file_thp += HPAGE_PMD_SIZE;
++ 	smaps_account(mss, page, true, pmd_young(*pmd), pmd_dirty(*pmd), locked);
+++>>>>>>> 60fbf0ab5da1 (mm,thp: stats for file backed THP)
+  }
+  #else
+  static void smaps_pmd_entry(pmd_t *pmd, unsigned long addr,
+diff --git a/drivers/base/node.c b/drivers/base/node.c
+index a55e191a12c4..4789732734aa 100644
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@ -426,6 +426,8 @@ static ssize_t node_read_meminfo(struct device *dev,
+ 		       "Node %d AnonHugePages:  %8lu kB\n"
+ 		       "Node %d ShmemHugePages: %8lu kB\n"
+ 		       "Node %d ShmemPmdMapped: %8lu kB\n"
++		       "Node %d FileHugePages: %8lu kB\n"
++		       "Node %d FilePmdMapped: %8lu kB\n"
+ #endif
+ 			,
+ 		       nid, K(node_page_state(pgdat, NR_FILE_DIRTY)),
+@@ -451,6 +453,10 @@ static ssize_t node_read_meminfo(struct device *dev,
+ 		       nid, K(node_page_state(pgdat, NR_SHMEM_THPS) *
+ 				       HPAGE_PMD_NR),
+ 		       nid, K(node_page_state(pgdat, NR_SHMEM_PMDMAPPED) *
++				       HPAGE_PMD_NR),
++		       nid, K(node_page_state(pgdat, NR_FILE_THPS) *
++				       HPAGE_PMD_NR),
++		       nid, K(node_page_state(pgdat, NR_FILE_PMDMAPPED) *
+ 				       HPAGE_PMD_NR)
+ #endif
+ 		       );
+diff --git a/fs/proc/meminfo.c b/fs/proc/meminfo.c
+index 568d90e17c17..bac395fc11f9 100644
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@ -136,6 +136,10 @@ static int meminfo_proc_show(struct seq_file *m, void *v)
+ 		    global_node_page_state(NR_SHMEM_THPS) * HPAGE_PMD_NR);
+ 	show_val_kb(m, "ShmemPmdMapped: ",
+ 		    global_node_page_state(NR_SHMEM_PMDMAPPED) * HPAGE_PMD_NR);
++	show_val_kb(m, "FileHugePages: ",
++		    global_node_page_state(NR_FILE_THPS) * HPAGE_PMD_NR);
++	show_val_kb(m, "FilePmdMapped: ",
++		    global_node_page_state(NR_FILE_PMDMAPPED) * HPAGE_PMD_NR);
+ #endif
+ 
+ #ifdef CONFIG_CMA
+* Unmerged path fs/proc/task_mmu.c
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index ce2990f782e1..93764fc33162 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -234,6 +234,8 @@ enum node_stat_item {
+ 	NR_SHMEM,		/* shmem pages (included tmpfs/GEM pages) */
+ 	NR_SHMEM_THPS,
+ 	NR_SHMEM_PMDMAPPED,
++	NR_FILE_THPS,
++	NR_FILE_PMDMAPPED,
+ 	NR_ANON_THPS,
+ 	NR_UNSTABLE_NFS,	/* NFS unstable pages */
+ 	NR_VMSCAN_WRITE,
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 8285022e8e12..c51c70577aa3 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1157,6 +1157,8 @@ const char * const vmstat_text[] = {
+ 	"nr_shmem",
+ 	"nr_shmem_hugepages",
+ 	"nr_shmem_pmdmapped",
++	"nr_file_hugepages",
++	"nr_file_pmdmapped",
+ 	"nr_anon_transparent_hugepages",
+ 	"nr_unstable",
+ 	"nr_vmscan_write",
