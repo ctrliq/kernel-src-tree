@@ -1,0 +1,237 @@
+hwmon: (k10temp) Create common functions and macros for Zen CPU families
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Wei Huang <wei.huang2@amd.com>
+commit 1782241704239fb7215871bd670e0ae6eefe36b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/17822417.failed
+
+Many SMN thermal registers in Zen CPU families are common across different
+generations. For long-term code maintenance, it is better to rename these
+macro and function names to Zen.
+
+	Signed-off-by: Wei Huang <wei.huang2@amd.com>
+Link: https://lore.kernel.org/r/20200827054242.2347-1-wei.huang2@amd.com
+	Signed-off-by: Guenter Roeck <linux@roeck-us.net>
+(cherry picked from commit 1782241704239fb7215871bd670e0ae6eefe36b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hwmon/k10temp.c
+diff --cc drivers/hwmon/k10temp.c
+index c73c6199bfdb,f3addb97b021..000000000000
+--- a/drivers/hwmon/k10temp.c
++++ b/drivers/hwmon/k10temp.c
+@@@ -58,9 -73,25 +58,28 @@@ static DEFINE_MUTEX(nb_smu_ind_mutex)
+  #define F15H_M60H_HARDWARE_TEMP_CTRL_OFFSET	0xd8200c64
+  #define F15H_M60H_REPORTED_TEMP_CTRL_OFFSET	0xd8200ca4
+  
+- /* F17h M01h Access througn SMN */
+- #define F17H_M01H_REPORTED_TEMP_CTRL_OFFSET	0x00059800
++ /* Common for Zen CPU families (Family 17h and 18h) */
++ #define ZEN_REPORTED_TEMP_CTRL_OFFSET		0x00059800
+  
+++<<<<<<< HEAD
+++=======
++ #define ZEN_CCD_TEMP(x)				(0x00059954 + ((x) * 4))
++ #define ZEN_CCD_TEMP_VALID			BIT(11)
++ #define ZEN_CCD_TEMP_MASK			GENMASK(10, 0)
++ 
++ #define ZEN_CUR_TEMP_SHIFT			21
++ #define ZEN_CUR_TEMP_RANGE_SEL_MASK		BIT(19)
++ 
++ #define ZEN_SVI_BASE				0x0005A000
++ 
++ /* F17h thermal registers through SMN */
++ #define F17H_M01H_SVI_TEL_PLANE0		(ZEN_SVI_BASE + 0xc)
++ #define F17H_M01H_SVI_TEL_PLANE1		(ZEN_SVI_BASE + 0x10)
++ 
++ #define F17H_CFACTOR_ICORE			1000000	/* 1A / LSB	*/
++ #define F17H_CFACTOR_ISOC			250000	/* 0.25A / LSB	*/
++ 
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  struct k10temp_data {
+  	struct pci_dev *pdev;
+  	void (*read_htcreg)(struct pci_dev *pdev, u32 *regval);
+@@@ -130,7 -182,7 +149,11 @@@ static long get_raw_temp(struct k10temp
+  	long temp;
+  
+  	data->read_tempreg(data->pdev, &regval);
+++<<<<<<< HEAD
+ +	temp = (regval >> 21) * 125;
+++=======
++ 	temp = (regval >> ZEN_CUR_TEMP_SHIFT) * 125;
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  	if (regval & data->temp_adjust_mask)
+  		temp -= 49000;
+  	return temp;
+@@@ -163,10 -283,15 +186,17 @@@ static int k10temp_read(struct device *
+  			if (*val < 0)
+  				*val = 0;
+  			break;
+ -		case 1:		/* Tdie */
+ -			*val = get_raw_temp(data) - data->temp_offset;
+++<<<<<<< HEAD
+ +		case 1:		/* Tctl */
+ +			*val = get_raw_temp(data);
+  			if (*val < 0)
+  				*val = 0;
+ -			break;
+++=======
++ 		case 2 ... 9:		/* Tccd{1-8} */
++ 			amd_smn_read(amd_pci_dev_to_node_id(data->pdev),
++ 				     ZEN_CCD_TEMP(channel - 2), &regval);
++ 			*val = (regval & ZEN_CCD_TEMP_MASK) * 125 - 49000;
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  			break;
+  		default:
+  			return -EOPNOTSUPP;
+@@@ -272,6 -418,76 +302,79 @@@ static bool has_erratum_319(struct pci_
+  	       (boot_cpu_data.x86_model == 4 && boot_cpu_data.x86_stepping <= 2);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DEBUG_FS
++ 
++ static void k10temp_smn_regs_show(struct seq_file *s, struct pci_dev *pdev,
++ 				  u32 addr, int count)
++ {
++ 	u32 reg;
++ 	int i;
++ 
++ 	for (i = 0; i < count; i++) {
++ 		if (!(i & 3))
++ 			seq_printf(s, "0x%06x: ", addr + i * 4);
++ 		amd_smn_read(amd_pci_dev_to_node_id(pdev), addr + i * 4, &reg);
++ 		seq_printf(s, "%08x ", reg);
++ 		if ((i & 3) == 3)
++ 			seq_puts(s, "\n");
++ 	}
++ }
++ 
++ static int svi_show(struct seq_file *s, void *unused)
++ {
++ 	struct k10temp_data *data = s->private;
++ 
++ 	k10temp_smn_regs_show(s, data->pdev, ZEN_SVI_BASE, 32);
++ 	return 0;
++ }
++ DEFINE_SHOW_ATTRIBUTE(svi);
++ 
++ static int thm_show(struct seq_file *s, void *unused)
++ {
++ 	struct k10temp_data *data = s->private;
++ 
++ 	k10temp_smn_regs_show(s, data->pdev,
++ 			      ZEN_REPORTED_TEMP_CTRL_OFFSET, 256);
++ 	return 0;
++ }
++ DEFINE_SHOW_ATTRIBUTE(thm);
++ 
++ static void k10temp_debugfs_cleanup(void *ddir)
++ {
++ 	debugfs_remove_recursive(ddir);
++ }
++ 
++ static void k10temp_init_debugfs(struct k10temp_data *data)
++ {
++ 	struct dentry *debugfs;
++ 	char name[32];
++ 
++ 	/* Only show debugfs data for Family 17h/18h CPUs */
++ 	if (!data->is_zen)
++ 		return;
++ 
++ 	scnprintf(name, sizeof(name), "k10temp-%s", pci_name(data->pdev));
++ 
++ 	debugfs = debugfs_create_dir(name, NULL);
++ 	if (debugfs) {
++ 		debugfs_create_file("svi", 0444, debugfs, data, &svi_fops);
++ 		debugfs_create_file("thm", 0444, debugfs, data, &thm_fops);
++ 		devm_add_action_or_reset(&data->pdev->dev,
++ 					 k10temp_debugfs_cleanup, debugfs);
++ 	}
++ }
++ 
++ #else
++ 
++ static void k10temp_init_debugfs(struct k10temp_data *data)
++ {
++ }
++ 
++ #endif
++ 
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  static const struct hwmon_channel_info *k10temp_info[] = {
+  	HWMON_CHANNEL_INFO(temp,
+  			   HWMON_T_INPUT | HWMON_T_MAX |
+@@@ -292,6 -522,20 +395,23 @@@ static const struct hwmon_chip_info k10
+  	.info = k10temp_info,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static void k10temp_get_ccd_support(struct pci_dev *pdev,
++ 				    struct k10temp_data *data, int limit)
++ {
++ 	u32 regval;
++ 	int i;
++ 
++ 	for (i = 0; i < limit; i++) {
++ 		amd_smn_read(amd_pci_dev_to_node_id(pdev),
++ 			     ZEN_CCD_TEMP(i), &regval);
++ 		if (regval & ZEN_CCD_TEMP_VALID)
++ 			data->show_temp |= BIT(TCCD_BIT(i));
++ 	}
++ }
++ 
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  static int k10temp_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+  {
+  	int unreliable = has_erratum_319(pdev);
+@@@ -321,10 -566,34 +441,41 @@@
+  	     (boot_cpu_data.x86_model & 0xf0) == 0x70)) {
+  		data->read_htcreg = read_htcreg_nb_f15;
+  		data->read_tempreg = read_tempreg_nb_f15;
+++<<<<<<< HEAD
+ +	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x19) {
+ +		data->temp_adjust_mask = 0x80000;
+ +		data->read_tempreg = read_tempreg_nb_f17;
+ +		data->show_tdie = true;
+++=======
++ 	} else if (boot_cpu_data.x86 == 0x17 || boot_cpu_data.x86 == 0x18) {
++ 		data->temp_adjust_mask = ZEN_CUR_TEMP_RANGE_SEL_MASK;
++ 		data->read_tempreg = read_tempreg_nb_zen;
++ 		data->show_temp |= BIT(TDIE_BIT);	/* show Tdie */
++ 		data->is_zen = true;
++ 
++ 		switch (boot_cpu_data.x86_model) {
++ 		case 0x1:	/* Zen */
++ 		case 0x8:	/* Zen+ */
++ 		case 0x11:	/* Zen APU */
++ 		case 0x18:	/* Zen+ APU */
++ 			data->show_current = !is_threadripper() && !is_epyc();
++ 			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE0;
++ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE1;
++ 			data->cfactor[0] = F17H_CFACTOR_ICORE;
++ 			data->cfactor[1] = F17H_CFACTOR_ISOC;
++ 			k10temp_get_ccd_support(pdev, data, 4);
++ 			break;
++ 		case 0x31:	/* Zen2 Threadripper */
++ 		case 0x71:	/* Zen2 */
++ 			data->show_current = !is_threadripper() && !is_epyc();
++ 			data->cfactor[0] = F17H_CFACTOR_ICORE;
++ 			data->cfactor[1] = F17H_CFACTOR_ISOC;
++ 			data->svi_addr[0] = F17H_M01H_SVI_TEL_PLANE1;
++ 			data->svi_addr[1] = F17H_M01H_SVI_TEL_PLANE0;
++ 			k10temp_get_ccd_support(pdev, data, 8);
++ 			break;
++ 		}
+++>>>>>>> 178224170423 (hwmon: (k10temp) Create common functions and macros for Zen CPU families)
+  	} else {
+  		data->read_htcreg = read_htcreg_pci;
+  		data->read_tempreg = read_tempreg_pci;
+* Unmerged path drivers/hwmon/k10temp.c
