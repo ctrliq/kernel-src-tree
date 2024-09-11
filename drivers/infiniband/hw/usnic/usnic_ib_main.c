@@ -680,7 +680,6 @@ static int __init usnic_ib_init(void)
 out_pci_unreg:
 	pci_unregister_driver(&usnic_ib_pci_driver);
 out_umem_fini:
-	usnic_uiom_fini();
 
 	return err;
 }
@@ -691,7 +690,6 @@ static void __exit usnic_ib_destroy(void)
 	usnic_debugfs_exit();
 	usnic_transport_fini();
 	pci_unregister_driver(&usnic_ib_pci_driver);
-	usnic_uiom_fini();
 }
 
 MODULE_DESCRIPTION("Cisco VIC (usNIC) Verbs Driver");
