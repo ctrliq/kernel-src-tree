@@ -1,0 +1,257 @@
+mm/lru: introduce relock_page_lruvec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Alexander Duyck <alexander.h.duyck@linux.intel.com>
+commit 2a5e4e340b0fe0f8d402196a466887db6a270b9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/2a5e4e34.failed
+
+Add relock_page_lruvec() to replace repeated same code, no functional
+change.
+
+When testing for relock we can avoid the need for RCU locking if we simply
+compare the page pgdat and memcg pointers versus those that the lruvec is
+holding.  By doing this we can avoid the extra pointer walks and accesses
+of the memory cgroup.
+
+In addition we can avoid the checks entirely if lruvec is currently NULL.
+
+[alex.shi@linux.alibaba.com: use page_memcg()]
+  Link: https://lkml.kernel.org/r/66d8e79d-7ec6-bfbc-1c82-bf32db3ae5b7@linux.alibaba.com
+
+Link: https://lkml.kernel.org/r/1604566549-62481-19-git-send-email-alex.shi@linux.alibaba.com
+	Signed-off-by: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+	Signed-off-by: Alex Shi <alex.shi@linux.alibaba.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Chen, Rong A" <rong.a.chen@intel.com>
+	Cc: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Cc: "Huang, Ying" <ying.huang@intel.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mika Penttilä <mika.penttila@nextfour.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Cc: Yang Shi <yang.shi@linux.alibaba.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2a5e4e340b0fe0f8d402196a466887db6a270b9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/mlock.c
+#	mm/swap.c
+#	mm/vmscan.c
+diff --cc include/linux/memcontrol.h
+index da9b4f3ccbfd,ff02f831e7e1..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -1429,6 -1362,50 +1453,53 @@@ static inline struct lruvec *parent_lru
+  	return mem_cgroup_lruvec(memcg, lruvec_pgdat(lruvec));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline void unlock_page_lruvec(struct lruvec *lruvec)
++ {
++ 	spin_unlock(&lruvec->lru_lock);
++ }
++ 
++ static inline void unlock_page_lruvec_irq(struct lruvec *lruvec)
++ {
++ 	spin_unlock_irq(&lruvec->lru_lock);
++ }
++ 
++ static inline void unlock_page_lruvec_irqrestore(struct lruvec *lruvec,
++ 		unsigned long flags)
++ {
++ 	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
++ }
++ 
++ /* Don't lock again iff page's lruvec locked */
++ static inline struct lruvec *relock_page_lruvec_irq(struct page *page,
++ 		struct lruvec *locked_lruvec)
++ {
++ 	if (locked_lruvec) {
++ 		if (lruvec_holds_page_lru_lock(page, locked_lruvec))
++ 			return locked_lruvec;
++ 
++ 		unlock_page_lruvec_irq(locked_lruvec);
++ 	}
++ 
++ 	return lock_page_lruvec_irq(page);
++ }
++ 
++ /* Don't lock again iff page's lruvec locked */
++ static inline struct lruvec *relock_page_lruvec_irqsave(struct page *page,
++ 		struct lruvec *locked_lruvec, unsigned long *flags)
++ {
++ 	if (locked_lruvec) {
++ 		if (lruvec_holds_page_lru_lock(page, locked_lruvec))
++ 			return locked_lruvec;
++ 
++ 		unlock_page_lruvec_irqrestore(locked_lruvec, *flags);
++ 	}
++ 
++ 	return lock_page_lruvec_irqsave(page, flags);
++ }
++ 
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  #ifdef CONFIG_CGROUP_WRITEBACK
+  
+  struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb);
+diff --cc mm/mlock.c
+index f2110b001c21,55b3b3672977..000000000000
+--- a/mm/mlock.c
++++ b/mm/mlock.c
+@@@ -277,10 -277,7 +277,14 @@@ static void __munlock_pagevec(struct pa
+  			 * so we can spare the get_page() here.
+  			 */
+  			if (TestClearPageLRU(page)) {
+++<<<<<<< HEAD
+ +				struct lruvec *lruvec;
+ +
+ +				lruvec = mem_cgroup_page_lruvec(page,
+ +							page_pgdat(page));
+++=======
++ 				lruvec = relock_page_lruvec_irq(page, lruvec);
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  				del_page_from_lru_list(page, lruvec,
+  							page_lru(page));
+  				continue;
+diff --cc mm/swap.c
+index 2f51fb81ed79,2cca7141470c..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -213,20 -210,18 +213,32 @@@ static void pagevec_lru_move_fn(struct 
+  
+  	for (i = 0; i < pagevec_count(pvec); i++) {
+  		struct page *page = pvec->pages[i];
+++<<<<<<< HEAD
+ +		struct pglist_data *pagepgdat = page_pgdat(page);
+ +
+ +		if (pagepgdat != pgdat) {
+ +			if (pgdat)
+ +				spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+ +			pgdat = pagepgdat;
+ +			spin_lock_irqsave(&pgdat->lru_lock, flags);
+ +		}
+ +
+ +		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ +		(*move_fn)(page, lruvec, arg);
+++=======
++ 
++ 		/* block memcg migration during page moving between lru */
++ 		if (!TestClearPageLRU(page))
++ 			continue;
++ 
++ 		lruvec = relock_page_lruvec_irqsave(page, lruvec, &flags);
++ 		(*move_fn)(page, lruvec);
++ 
++ 		SetPageLRU(page);
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  	}
+ -	if (lruvec)
+ -		unlock_page_lruvec_irqrestore(lruvec, flags);
+ +	if (pgdat)
+ +		spin_unlock_irqrestore(&pgdat->lru_lock, flags);
+  	release_pages(pvec->pages, pvec->nr);
+  	pagevec_reinit(pvec);
+  }
+@@@ -868,18 -911,13 +880,27 @@@ void release_pages(struct page **pages
+  		}
+  
+  		if (PageLRU(page)) {
+++<<<<<<< HEAD
+ +			struct pglist_data *pgdat = page_pgdat(page);
+ +
+ +			if (pgdat != locked_pgdat) {
+ +				if (locked_pgdat)
+ +					spin_unlock_irqrestore(&locked_pgdat->lru_lock,
+ +									flags);
+ +				lock_batch = 0;
+ +				locked_pgdat = pgdat;
+ +				spin_lock_irqsave(&locked_pgdat->lru_lock, flags);
+ +			}
+++=======
++ 			struct lruvec *prev_lruvec = lruvec;
++ 
++ 			lruvec = relock_page_lruvec_irqsave(page, lruvec,
++ 									&flags);
++ 			if (prev_lruvec != lruvec)
++ 				lock_batch = 0;
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  
+ +			lruvec = mem_cgroup_page_lruvec(page, locked_pgdat);
+  			VM_BUG_ON_PAGE(!PageLRU(page), page);
+  			__ClearPageLRU(page);
+  			del_page_from_lru_list(page, lruvec, page_off_lru(page));
+@@@ -1013,7 -1015,20 +1034,24 @@@ static void __pagevec_lru_add_fn(struc
+   */
+  void __pagevec_lru_add(struct pagevec *pvec)
+  {
+++<<<<<<< HEAD
+ +	pagevec_lru_move_fn(pvec, __pagevec_lru_add_fn, NULL);
+++=======
++ 	int i;
++ 	struct lruvec *lruvec = NULL;
++ 	unsigned long flags = 0;
++ 
++ 	for (i = 0; i < pagevec_count(pvec); i++) {
++ 		struct page *page = pvec->pages[i];
++ 
++ 		lruvec = relock_page_lruvec_irqsave(page, lruvec, &flags);
++ 		__pagevec_lru_add_fn(page, lruvec);
++ 	}
++ 	if (lruvec)
++ 		unlock_page_lruvec_irqrestore(lruvec, flags);
++ 	release_pages(pvec->pages, pvec->nr);
++ 	pagevec_reinit(pvec);
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  }
+  
+  /**
+diff --cc mm/vmscan.c
+index 2bebcfe61497,60705ea598ee..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -4299,14 -4283,7 +4298,18 @@@ void check_move_unevictable_pages(struc
+  		if (!TestClearPageLRU(page))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		if (pagepgdat != pgdat) {
+ +			if (pgdat)
+ +				spin_unlock_irq(&pgdat->lru_lock);
+ +			pgdat = pagepgdat;
+ +			spin_lock_irq(&pgdat->lru_lock);
+ +		}
+ +		lruvec = mem_cgroup_page_lruvec(page, pgdat);
+ +
+++=======
++ 		lruvec = relock_page_lruvec_irq(page, lruvec);
+++>>>>>>> 2a5e4e340b0f (mm/lru: introduce relock_page_lruvec())
+  		if (page_evictable(page) && PageUnevictable(page)) {
+  			enum lru_list lru = page_lru_base_type(page);
+  
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/mlock.c
+* Unmerged path mm/swap.c
+* Unmerged path mm/vmscan.c
