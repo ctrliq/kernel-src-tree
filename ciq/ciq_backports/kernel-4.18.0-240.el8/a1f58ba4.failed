@@ -1,0 +1,155 @@
+io_uring: correct timeout req sequence when inserting a new entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author zhangyi (F) <yi.zhang@huawei.com>
+commit a1f58ba46f794b1168d1107befcf3d4b9f9fd453
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a1f58ba4.failed
+
+The sequence number of the timeout req (req->sequence) indicate the
+expected completion request. Because of each timeout req consume a
+sequence number, so the sequence of each timeout req on the timeout
+list shouldn't be the same. But now, we may get the same number (also
+incorrect) if we insert a new entry before the last one, such as submit
+such two timeout reqs on a new ring instance below.
+
+                    req->sequence
+ req_1 (count = 2):       2
+ req_2 (count = 1):       2
+
+Then, if we submit a nop req, req_2 will still timeout even the nop req
+finished. This patch fix this problem by adjust the sequence number of
+each reordered reqs when inserting a new entry.
+
+	Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a1f58ba46f794b1168d1107befcf3d4b9f9fd453)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index e831d5a8df98,1b46c72f8975..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1830,6 -1874,114 +1830,117 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct io_kiocb *req, *prev;
++ 	unsigned long flags;
++ 
++ 	req = container_of(timer, struct io_kiocb, timeout.timer);
++ 	ctx = req->ctx;
++ 	atomic_inc(&ctx->cq_timeouts);
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 	/*
++ 	 * Adjust the reqs sequence before the current one because it
++ 	 * will consume a slot in the cq_ring and the the cq_tail pointer
++ 	 * will be increased, otherwise other timeout reqs may return in
++ 	 * advance without waiting for enough wait_nr.
++ 	 */
++ 	prev = req;
++ 	list_for_each_entry_continue_reverse(prev, &ctx->timeout_list, list)
++ 		prev->sequence++;
++ 	list_del(&req->list);
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, -ETIME);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	io_put_req(req);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	unsigned count;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct list_head *entry;
++ 	struct timespec64 ts;
++ 	unsigned span = 0;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->timeout_flags ||
++ 	    sqe->len != 1)
++ 		return -EINVAL;
++ 
++ 	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * sqe->off holds how many events that need to occur for this
++ 	 * timeout event to be satisfied.
++ 	 */
++ 	count = READ_ONCE(sqe->off);
++ 	if (!count)
++ 		count = 1;
++ 
++ 	req->sequence = ctx->cached_sq_head + count - 1;
++ 	/* reuse it to store the count */
++ 	req->submit.sequence = count;
++ 	req->flags |= REQ_F_TIMEOUT;
++ 
++ 	/*
++ 	 * Insertion sort, ensuring the first entry in the list is always
++ 	 * the one we need first.
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_prev(entry, &ctx->timeout_list) {
++ 		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
++ 		unsigned nxt_sq_head;
++ 		long long tmp, tmp_nxt;
++ 
++ 		/*
++ 		 * Since cached_sq_head + count - 1 can overflow, use type long
++ 		 * long to store it.
++ 		 */
++ 		tmp = (long long)ctx->cached_sq_head + count - 1;
++ 		nxt_sq_head = nxt->sequence - nxt->submit.sequence + 1;
++ 		tmp_nxt = (long long)nxt_sq_head + nxt->submit.sequence - 1;
++ 
++ 		/*
++ 		 * cached_sq_head may overflow, and it will never overflow twice
++ 		 * once there is some timeout req still be valid.
++ 		 */
++ 		if (ctx->cached_sq_head < nxt_sq_head)
++ 			tmp += UINT_MAX;
++ 
++ 		if (tmp > tmp_nxt)
++ 			break;
++ 
++ 		/*
++ 		 * Sequence of reqs after the insert one and itself should
++ 		 * be adjusted because each timeout req consumes a slot.
++ 		 */
++ 		span++;
++ 		nxt->sequence++;
++ 	}
++ 	req->sequence -= span;
++ 	list_add(&req->list, entry);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 	req->timeout.timer.function = io_timeout_fn;
++ 	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts),
++ 			HRTIMER_MODE_REL);
++ 	return 0;
++ }
++ 
+++>>>>>>> a1f58ba46f79 (io_uring: correct timeout req sequence when inserting a new entry)
+  static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+  			const struct io_uring_sqe *sqe)
+  {
+* Unmerged path fs/io_uring.c
