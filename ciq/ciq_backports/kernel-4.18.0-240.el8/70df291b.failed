@@ -1,0 +1,137 @@
+mm/mmu_notifiers: do not speculatively allocate a mmu_notifier_mm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 70df291bf81ffda47ff84e6e2da4fbe21f95a861
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/70df291b.failed
+
+A prior commit e0f3c3f78da2 ("mm/mmu_notifier: init notifier if necessary")
+made an attempt at doing this, but had to be reverted as calling
+the GFP_KERNEL allocator under the i_mmap_mutex causes deadlock, see
+commit 35cfa2b0b491 ("mm/mmu_notifier: allocate mmu_notifier in advance").
+
+However, we can avoid that problem by doing the allocation only under
+the mmap_sem, which is already happening.
+
+Since all writers to mm->mmu_notifier_mm hold the write side of the
+mmap_sem reading it under that sem is deterministic and we can use that to
+decide if the allocation path is required, without speculation.
+
+The actual update to mmu_notifier_mm must still be done under the
+mm_take_all_locks() to ensure read-side coherency.
+
+Link: https://lore.kernel.org/r/20190806231548.25242-3-jgg@ziepe.ca
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 70df291bf81ffda47ff84e6e2da4fbe21f95a861)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/mmu_notifier.c
+diff --cc mm/mmu_notifier.c
+index e6c07a8c4021,696810f632ad..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -230,52 -237,32 +230,69 @@@ void __mmu_notifier_invalidate_range(st
+  EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range);
+  
+  /*
+ - * Same as mmu_notifier_register but here the caller must hold the
+ - * mmap_sem in write mode.
+ + * Must be called while holding mm->mmap_sem for either read or write.
+ + * The result is guaranteed to be valid until mm->mmap_sem is dropped.
+   */
+ -int __mmu_notifier_register(struct mmu_notifier *mn, struct mm_struct *mm)
+ +bool mm_has_blockable_invalidate_notifiers(struct mm_struct *mm)
+ +{
+ +	struct mmu_notifier *mn;
+ +	int id;
+ +	bool ret = false;
+ +
+ +	WARN_ON_ONCE(!rwsem_is_locked(&mm->mmap_sem));
+ +
+ +	if (!mm_has_notifiers(mm))
+ +		return ret;
+ +
+ +	id = srcu_read_lock(&srcu);
+ +	hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist) {
+ +		if (!mn->ops->invalidate_range &&
+ +		    !mn->ops->invalidate_range_start &&
+ +		    !mn->ops->invalidate_range_end)
+ +				continue;
+ +
+ +		if (!(mn->ops->flags & MMU_INVALIDATE_DOES_NOT_BLOCK)) {
+ +			ret = true;
+ +			break;
+ +		}
+ +	}
+ +	srcu_read_unlock(&srcu, id);
+ +	return ret;
+ +}
+ +
+ +static int do_mmu_notifier_register(struct mmu_notifier *mn,
+ +				    struct mm_struct *mm,
+ +				    int take_mmap_sem)
+  {
+- 	struct mmu_notifier_mm *mmu_notifier_mm;
++ 	struct mmu_notifier_mm *mmu_notifier_mm = NULL;
+  	int ret;
+  
+ -	lockdep_assert_held_write(&mm->mmap_sem);
+  	BUG_ON(atomic_read(&mm->mm_users) <= 0);
+  
+++<<<<<<< HEAD
+ +	ret = -ENOMEM;
+ +	mmu_notifier_mm = kmalloc(sizeof(struct mmu_notifier_mm), GFP_KERNEL);
+ +	if (unlikely(!mmu_notifier_mm))
+ +		goto out;
+++=======
++ 	if (!mm->mmu_notifier_mm) {
++ 		/*
++ 		 * kmalloc cannot be called under mm_take_all_locks(), but we
++ 		 * know that mm->mmu_notifier_mm can't change while we hold
++ 		 * the write side of the mmap_sem.
++ 		 */
++ 		mmu_notifier_mm =
++ 			kmalloc(sizeof(struct mmu_notifier_mm), GFP_KERNEL);
++ 		if (!mmu_notifier_mm)
++ 			return -ENOMEM;
++ 
++ 		INIT_HLIST_HEAD(&mmu_notifier_mm->list);
++ 		spin_lock_init(&mmu_notifier_mm->lock);
++ 	}
+++>>>>>>> 70df291bf81f (mm/mmu_notifiers: do not speculatively allocate a mmu_notifier_mm)
+  
+ +	if (take_mmap_sem)
+ +		down_write(&mm->mmap_sem);
+  	ret = mm_take_all_locks(mm);
+  	if (unlikely(ret))
+  		goto out_clean;
+@@@ -302,14 -286,14 +316,20 @@@
+  	spin_unlock(&mm->mmu_notifier_mm->lock);
+  
+  	mm_drop_all_locks(mm);
++ 	BUG_ON(atomic_read(&mm->mm_users) <= 0);
++ 	return 0;
++ 
+  out_clean:
+ +	if (take_mmap_sem)
+ +		up_write(&mm->mmap_sem);
+  	kfree(mmu_notifier_mm);
+++<<<<<<< HEAD
+ +out:
+ +	BUG_ON(atomic_read(&mm->mm_users) <= 0);
+++=======
+++>>>>>>> 70df291bf81f (mm/mmu_notifiers: do not speculatively allocate a mmu_notifier_mm)
+  	return ret;
+  }
+ -EXPORT_SYMBOL_GPL(__mmu_notifier_register);
+  
+  /*
+   * Must not hold mmap_sem nor any other VM related lock when calling
+* Unmerged path mm/mmu_notifier.c
