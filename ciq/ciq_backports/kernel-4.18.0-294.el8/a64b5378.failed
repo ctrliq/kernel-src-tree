@@ -1,0 +1,144 @@
+mm/slab: sanity-check page type when looking up cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Kees Cook <keescook@chromium.org>
+commit a64b53780ec35b77daf817210c88aa42d172c98f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a64b5378.failed
+
+This avoids any possible type confusion when looking up an object.  For
+example, if a non-slab were to be passed to kfree(), the invalid
+slab_cache pointer (i.e.  overlapped with some other value from the
+struct page union) would be used for subsequent slab manipulations that
+could lead to further memory corruption.
+
+Since the page is already in cache, adding the PageSlab() check will
+have nearly zero cost, so add a check and WARN() to virt_to_cache().
+Additionally replaces an open-coded virt_to_cache().  To support the
+failure mode this also updates all callers of virt_to_cache() and
+cache_from_obj() to handle a NULL cache pointer return value (though
+note that several already handle this case gracefully).
+
+[dan.carpenter@oracle.com: restore IRQs in kfree()]
+  Link: http://lkml.kernel.org/r/20190613065637.GE16334@mwanda
+Link: http://lkml.kernel.org/r/20190530045017.15252-3-keescook@chromium.org
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: Alexander Popov <alex.popov@linux.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a64b53780ec35b77daf817210c88aa42d172c98f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.h
+diff --cc mm/slab.h
+index 645166d1d769,739099af6cbb..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -403,29 -350,15 +403,41 @@@ static inline void memcg_link_cache(str
+  
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+++<<<<<<< HEAD
+ +static __always_inline int charge_slab_page(struct page *page,
+ +					    gfp_t gfp, int order,
+ +					    struct kmem_cache *s)
+ +{
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    1 << order);
+ +		return 0;
+ +	}
+ +
+ +	return memcg_charge_slab(page, gfp, order, s);
+ +}
+ +
+ +static __always_inline void uncharge_slab_page(struct page *page, int order,
+ +					       struct kmem_cache *s)
+ +{
+ +	if (is_root_cache(s)) {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -(1 << order));
+ +		return;
+ +	}
+ +
+ +	memcg_uncharge_slab(page, order, s);
+++=======
++ static inline struct kmem_cache *virt_to_cache(const void *obj)
++ {
++ 	struct page *page;
++ 
++ 	page = virt_to_head_page(obj);
++ 	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
++ 					__func__))
++ 		return NULL;
++ 	return page->slab_cache;
+++>>>>>>> a64b53780ec3 (mm/slab: sanity-check page type when looking up cache)
+  }
+  
+  static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+diff --git a/mm/slab.c b/mm/slab.c
+index 31552303d765..1deb9c1da71e 100644
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@ -394,12 +394,6 @@ static inline void set_store_user_dirty(struct kmem_cache *cachep) {}
+ static int slab_max_order = SLAB_MAX_ORDER_LO;
+ static bool slab_max_order_set __initdata;
+ 
+-static inline struct kmem_cache *virt_to_cache(const void *obj)
+-{
+-	struct page *page = virt_to_head_page(obj);
+-	return page->slab_cache;
+-}
+-
+ static inline void *index_to_obj(struct kmem_cache *cache, struct page *page,
+ 				 unsigned int idx)
+ {
+@@ -3763,6 +3757,8 @@ void kmem_cache_free_bulk(struct kmem_cache *orig_s, size_t size, void **p)
+ 			s = virt_to_cache(objp);
+ 		else
+ 			s = cache_from_obj(orig_s, objp);
++		if (!s)
++			continue;
+ 
+ 		debug_check_no_locks_freed(objp, s->object_size);
+ 		if (!(s->flags & SLAB_DEBUG_OBJECTS))
+@@ -3797,6 +3793,10 @@ void kfree(const void *objp)
+ 	local_irq_save(flags);
+ 	kfree_debugcheck(objp);
+ 	c = virt_to_cache(objp);
++	if (!c) {
++		local_irq_restore(flags);
++		return;
++	}
+ 	debug_check_no_locks_freed(objp, c->object_size);
+ 
+ 	debug_check_no_obj_freed(objp, c->object_size);
+@@ -4457,13 +4457,15 @@ void __check_heap_object(const void *ptr, unsigned long n, struct page *page,
+  */
+ size_t ksize(const void *objp)
+ {
++	struct kmem_cache *c;
+ 	size_t size;
+ 
+ 	BUG_ON(!objp);
+ 	if (unlikely(objp == ZERO_SIZE_PTR))
+ 		return 0;
+ 
+-	size = virt_to_cache(objp)->object_size;
++	c = virt_to_cache(objp);
++	size = c ? c->object_size : 0;
+ 	/* We assume that ksize callers could use the whole allocated area,
+ 	 * so we need to unpoison this area.
+ 	 */
+* Unmerged path mm/slab.h
