@@ -1,0 +1,154 @@
+scsi: scsi_debug: Fix cmd duration calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Douglas Gilbert <dgilbert@interlog.com>
+commit 771f712ba5b0c6a54534421db98f560526a238a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/771f712b.failed
+
+In some cases, sdebug_defer::cmpl_ts (completion timestamp) wasn't being
+properly set when REQ_HIPRI was given. Fix that and improve code to only
+call ktime_get_boottime_ns() for commands with REQ_HIPRI set as cmpl_ts is
+only used in that case.
+
+Link: https://lore.kernel.org/r/20210304014107.307625-1-dgilbert@interlog.com
+	Signed-off-by: Douglas Gilbert <dgilbert@interlog.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 771f712ba5b0c6a54534421db98f560526a238a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_debug.c
+diff --cc drivers/scsi/scsi_debug.c
+index 6b348700fb44,70165be10f00..000000000000
+--- a/drivers/scsi/scsi_debug.c
++++ b/drivers/scsi/scsi_debug.c
+@@@ -5361,9 -5365,12 +5361,10 @@@ static int schedule_resp(struct scsi_cm
+  				    struct sdebug_dev_info *),
+  			 int delta_jiff, int ndelay)
+  {
+ -	bool new_sd_dp;
+  	bool inject = false;
++ 	bool hipri = (cmnd->request->cmd_flags & REQ_HIPRI);
+  	int k, num_in_q, qdepth;
+  	unsigned long iflags;
+ -	u64 ns_from_boot = 0;
+  	struct sdebug_queue *sqp;
+  	struct sdebug_queued_cmd *sqcp;
+  	struct scsi_device *sdp;
+@@@ -5452,6 -5454,10 +5453,13 @@@
+  	if (sdebug_host_max_queue)
+  		sd_dp->hc_idx = get_tag(cmnd);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (hipri)
++ 		ns_from_boot = ktime_get_boottime_ns();
++ 
++ 	/* one of the resp_*() response functions is called here */
+++>>>>>>> 771f712ba5b0 (scsi: scsi_debug: Fix cmd duration calculation)
+  	cmnd->result = pfp ? pfp(cmnd, devip) : 0;
+  	if (cmnd->result & SDEG_RES_IMMED_MASK) {
+  		cmnd->result &= ~SDEG_RES_IMMED_MASK;
+@@@ -5489,15 -5495,49 +5497,42 @@@
+  		} else {	/* ndelay has a 4.2 second max */
+  			kt = sdebug_random ? prandom_u32_max((u32)ndelay) :
+  					     (u32)ndelay;
+ -			if (ndelay < INCLUSIVE_TIMING_MAX_NS) {
+ -				u64 d = ktime_get_boottime_ns() - ns_from_boot;
+ -
+ -				if (kt <= d) {	/* elapsed duration >= kt */
+ -					spin_lock_irqsave(&sqp->qc_lock, iflags);
+ -					sqcp->a_cmnd = NULL;
+ -					atomic_dec(&devip->num_in_q);
+ -					clear_bit(k, sqp->in_use_bm);
+ -					spin_unlock_irqrestore(&sqp->qc_lock, iflags);
+ -					if (new_sd_dp)
+ -						kfree(sd_dp);
+ -					/* call scsi_done() from this thread */
+ -					cmnd->scsi_done(cmnd);
+ -					return 0;
+ -				}
+ -				/* otherwise reduce kt by elapsed time */
+ -				kt -= d;
+ -			}
+  		}
+++<<<<<<< HEAD
+ +		if (!sd_dp->init_hrt) {
+ +			sd_dp->init_hrt = true;
+ +			sqcp->sd_dp = sd_dp;
+ +			hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC,
+ +				     HRTIMER_MODE_REL_PINNED);
+ +			sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
+ +			sd_dp->sqa_idx = sqp - sdebug_q_arr;
+ +			sd_dp->qc_idx = k;
+++=======
++ 		if (hipri) {
++ 			sd_dp->cmpl_ts = ktime_add(ns_to_ktime(ns_from_boot), kt);
++ 			spin_lock_irqsave(&sqp->qc_lock, iflags);
++ 			if (!sd_dp->init_poll) {
++ 				sd_dp->init_poll = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_POLL;
++ 			spin_unlock_irqrestore(&sqp->qc_lock, iflags);
++ 		} else {
++ 			if (!sd_dp->init_hrt) {
++ 				sd_dp->init_hrt = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				hrtimer_init(&sd_dp->hrt, CLOCK_MONOTONIC,
++ 					     HRTIMER_MODE_REL_PINNED);
++ 				sd_dp->hrt.function = sdebug_q_cmd_hrt_complete;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_HRT;
++ 			/* schedule the invocation of scsi_done() for a later time */
++ 			hrtimer_start(&sd_dp->hrt, kt, HRTIMER_MODE_REL_PINNED);
+++>>>>>>> 771f712ba5b0 (scsi: scsi_debug: Fix cmd duration calculation)
+  		}
+  		if (sdebug_statistics)
+  			sd_dp->issuing_cpu = raw_smp_processor_id();
+@@@ -5517,9 -5545,31 +5552,37 @@@
+  		if (unlikely((sdebug_opts & SDEBUG_OPT_CMD_ABORT) &&
+  			     atomic_read(&sdeb_inject_pending)))
+  			sd_dp->aborted = true;
+++<<<<<<< HEAD
+ +		schedule_work(&sd_dp->ew.work);
+ +		if (unlikely((sdebug_opts & SDEBUG_OPT_CMD_ABORT) &&
+ +			     atomic_read(&sdeb_inject_pending))) {
+++=======
++ 		if (hipri) {
++ 			sd_dp->cmpl_ts = ns_to_ktime(ns_from_boot);
++ 			spin_lock_irqsave(&sqp->qc_lock, iflags);
++ 			if (!sd_dp->init_poll) {
++ 				sd_dp->init_poll = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_POLL;
++ 			spin_unlock_irqrestore(&sqp->qc_lock, iflags);
++ 		} else {
++ 			if (!sd_dp->init_wq) {
++ 				sd_dp->init_wq = true;
++ 				sqcp->sd_dp = sd_dp;
++ 				sd_dp->sqa_idx = sqp - sdebug_q_arr;
++ 				sd_dp->qc_idx = k;
++ 				INIT_WORK(&sd_dp->ew.work, sdebug_q_cmd_wq_complete);
++ 			}
++ 			sd_dp->defer_t = SDEB_DEFER_WQ;
++ 			schedule_work(&sd_dp->ew.work);
++ 		}
++ 		if (sdebug_statistics)
++ 			sd_dp->issuing_cpu = raw_smp_processor_id();
++ 		if (unlikely(sd_dp->aborted)) {
+++>>>>>>> 771f712ba5b0 (scsi: scsi_debug: Fix cmd duration calculation)
+  			sdev_printk(KERN_INFO, sdp, "abort request tag %d\n", cmnd->request->tag);
+  			blk_abort_request(cmnd->request);
+  			atomic_set(&sdeb_inject_pending, 0);
+* Unmerged path drivers/scsi/scsi_debug.c
