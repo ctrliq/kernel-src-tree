@@ -1,0 +1,153 @@
+umd: Remove exit_umh
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric W. Biederman <ebiederm@xmission.com>
+commit 8c2f52663973e643c617663d826e2b0daa008b38
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8c2f5266.failed
+
+The bpfilter code no longer uses the umd_info.cleanup callback.  This
+callback is what exit_umh exists to call.  So remove exit_umh and all
+of it's associated booking.
+
+v1: https://lkml.kernel.org/r/87bll6dlte.fsf_-_@x220.int.ebiederm.org
+v2: https://lkml.kernel.org/r/87y2o53abg.fsf_-_@x220.int.ebiederm.org
+Link: https://lkml.kernel.org/r/20200702164140.4468-15-ebiederm@xmission.com
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Tested-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: "Eric W. Biederman" <ebiederm@xmission.com>
+(cherry picked from commit 8c2f52663973e643c617663d826e2b0daa008b38)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+diff --cc include/linux/sched.h
+index 885c71b9e14f,edb2020875ad..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -1451,8 -1511,6 +1451,11 @@@ extern struct pid *cad_pid
+  #define PF_KTHREAD		0x00200000	/* I am a kernel thread */
+  #define PF_RANDOMIZE		0x00400000	/* Randomize virtual address space */
+  #define PF_SWAPWRITE		0x00800000	/* Allowed to write to swap */
+++<<<<<<< HEAD
+ +#define PF_MEMSTALL		0x01000000	/* Stalled due to lack of memory */
+ +#define PF_UMH			0x02000000	/* I'm an Usermodehelper process */
+++=======
+++>>>>>>> 8c2f52663973 (umd: Remove exit_umh)
+  #define PF_NO_SETAFFINITY	0x04000000	/* Userland is not allowed to meddle with cpus_mask */
+  #define PF_MCE_EARLY		0x08000000      /* Early kill for mce process policy */
+  #define PF_MEMALLOC_NOCMA	0x10000000	/* All allocation request will have _GFP_MOVABLE cleared */
+* Unmerged path include/linux/sched.h
+diff --git a/include/linux/usermode_driver.h b/include/linux/usermode_driver.h
+index 45adbffb31d9..073a9e0ec07d 100644
+--- a/include/linux/usermode_driver.h
++++ b/include/linux/usermode_driver.h
+@@ -4,26 +4,10 @@
+ #include <linux/umh.h>
+ #include <linux/path.h>
+ 
+-#ifdef CONFIG_BPFILTER
+-void __exit_umh(struct task_struct *tsk);
+-
+-static inline void exit_umh(struct task_struct *tsk)
+-{
+-	if (unlikely(tsk->flags & PF_UMH))
+-		__exit_umh(tsk);
+-}
+-#else
+-static inline void exit_umh(struct task_struct *tsk)
+-{
+-}
+-#endif
+-
+ struct umd_info {
+ 	const char *driver_name;
+ 	struct file *pipe_to_umh;
+ 	struct file *pipe_from_umh;
+-	struct list_head list;
+-	void (*cleanup)(struct umd_info *info);
+ 	struct path wd;
+ 	struct pid *tgid;
+ };
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 7eb7f89f2c66..6f52dad3bca4 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -62,7 +62,6 @@
+ #include <linux/random.h>
+ #include <linux/rcuwait.h>
+ #include <linux/compat.h>
+-#include <linux/usermode_driver.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+@@ -794,8 +793,6 @@ void __noreturn do_exit(long code)
+ 	exit_task_namespaces(tsk);
+ 	exit_task_work(tsk);
+ 	exit_thread(tsk);
+-	if (group_dead)
+-		exit_umh(tsk);
+ 
+ 	/*
+ 	 * Flush inherited counters to the parent - before the parent
+diff --git a/kernel/usermode_driver.c b/kernel/usermode_driver.c
+index f77f8d7ce9e3..cd136f86f799 100644
+--- a/kernel/usermode_driver.c
++++ b/kernel/usermode_driver.c
+@@ -9,9 +9,6 @@
+ #include <linux/task_work.h>
+ #include <linux/usermode_driver.h>
+ 
+-static LIST_HEAD(umh_list);
+-static DEFINE_MUTEX(umh_list_lock);
+-
+ static struct vfsmount *blob_to_mnt(const void *data, size_t len, const char *name)
+ {
+ 	struct file_system_type *type;
+@@ -134,7 +131,6 @@ static int umd_setup(struct subprocess_info *info, struct cred *new)
+ 	umd_info->pipe_to_umh = to_umh[1];
+ 	umd_info->pipe_from_umh = from_umh[0];
+ 	umd_info->tgid = get_pid(task_tgid(current));
+-	current->flags |= PF_UMH;
+ 	return 0;
+ }
+ 
+@@ -182,11 +178,6 @@ int fork_usermode_driver(struct umd_info *info)
+ 		goto out;
+ 
+ 	err = call_usermodehelper_exec(sub_info, UMH_WAIT_EXEC);
+-	if (!err) {
+-		mutex_lock(&umh_list_lock);
+-		list_add(&info->list, &umh_list);
+-		mutex_unlock(&umh_list_lock);
+-	}
+ out:
+ 	if (argv)
+ 		argv_free(argv);
+@@ -194,23 +185,4 @@ int fork_usermode_driver(struct umd_info *info)
+ }
+ EXPORT_SYMBOL_GPL(fork_usermode_driver);
+ 
+-void __exit_umh(struct task_struct *tsk)
+-{
+-	struct umd_info *info;
+-	struct pid *tgid = task_tgid(tsk);
+-
+-	mutex_lock(&umh_list_lock);
+-	list_for_each_entry(info, &umh_list, list) {
+-		if (info->tgid == tgid) {
+-			list_del(&info->list);
+-			mutex_unlock(&umh_list_lock);
+-			goto out;
+-		}
+-	}
+-	mutex_unlock(&umh_list_lock);
+-	return;
+-out:
+-	if (info->cleanup)
+-		info->cleanup(info);
+-}
+ 
