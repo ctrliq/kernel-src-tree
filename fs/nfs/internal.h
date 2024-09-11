@@ -84,6 +84,7 @@ struct nfs_client_initdata {
 	unsigned int nconnect;
 	struct net *net;
 	const struct rpc_timeout *timeparms;
+	const struct cred *cred;
 };
 
 /*
