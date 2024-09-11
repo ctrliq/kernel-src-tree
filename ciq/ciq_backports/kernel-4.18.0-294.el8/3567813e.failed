@@ -1,0 +1,116 @@
+vfio: fix FOLL_LONGTERM use, simplify get_user_pages_remote() call
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit 3567813eae5e9b4d02dc227e2060e85abc912045
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3567813e.failed
+
+Update VFIO to take advantage of the recently loosened restriction on
+FOLL_LONGTERM with get_user_pages_remote().  Also, now it is possible to
+fix a bug: the VFIO caller is logically a FOLL_LONGTERM user, but it
+wasn't setting FOLL_LONGTERM.
+
+Also, remove an unnessary pair of calls that were releasing and
+reacquiring the mmap_sem.  There is no need to avoid holding mmap_sem
+just in order to call page_to_pfn().
+
+Also, now that the the DAX check ("if a VMA is DAX, don't allow long
+term pinning") is in the internals of get_user_pages_remote() and
+__gup_longterm_locked(), there's no need for it at the VFIO call site.  So
+remove it.
+
+Link: http://lkml.kernel.org/r/20200107224558.2362728-8-jhubbard@nvidia.com
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Tested-by: Alex Williamson <alex.williamson@redhat.com>
+	Acked-by: Alex Williamson <alex.williamson@redhat.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Suggested-by: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Jerome Glisse <jglisse@redhat.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Björn Töpel <bjorn.topel@intel.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Leon Romanovsky <leonro@mellanox.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3567813eae5e9b4d02dc227e2060e85abc912045)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vfio/vfio_iommu_type1.c
+diff --cc drivers/vfio/vfio_iommu_type1.c
+index f1a7cfd55b17,b800fc9a0251..000000000000
+--- a/drivers/vfio/vfio_iommu_type1.c
++++ b/drivers/vfio/vfio_iommu_type1.c
+@@@ -359,45 -329,24 +358,33 @@@ static int vaddr_get_pfn(struct mm_stru
+  		flags |= FOLL_WRITE;
+  
+  	down_read(&mm->mmap_sem);
+- 	if (mm == current->mm) {
+- 		ret = get_user_pages(vaddr, 1, flags | FOLL_LONGTERM, page,
+- 				     vmas);
+- 	} else {
+- 		ret = get_user_pages_remote(NULL, mm, vaddr, 1, flags, page,
+- 					    vmas, NULL);
+- 		/*
+- 		 * The lifetime of a vaddr_get_pfn() page pin is
+- 		 * userspace-controlled. In the fs-dax case this could
+- 		 * lead to indefinite stalls in filesystem operations.
+- 		 * Disallow attempts to pin fs-dax pages via this
+- 		 * interface.
+- 		 */
+- 		if (ret > 0 && vma_is_fsdax(vmas[0])) {
+- 			ret = -EOPNOTSUPP;
+- 			put_page(page[0]);
+- 		}
+- 	}
+- 	up_read(&mm->mmap_sem);
+- 
++ 	ret = get_user_pages_remote(NULL, mm, vaddr, 1, flags | FOLL_LONGTERM,
++ 				    page, NULL, NULL);
+  	if (ret == 1) {
+  		*pfn = page_to_pfn(page[0]);
+- 		return 0;
++ 		ret = 0;
++ 		goto done;
+  	}
+  
+++<<<<<<< HEAD
+ +	down_read(&mm->mmap_sem);
+ +
+ +retry:
+++=======
++ 	vaddr = untagged_addr(vaddr);
++ 
+++>>>>>>> 3567813eae5e (vfio: fix FOLL_LONGTERM use, simplify get_user_pages_remote() call)
+  	vma = find_vma_intersection(mm, vaddr, vaddr + 1);
+  
+  	if (vma && vma->vm_flags & VM_PFNMAP) {
+ -		*pfn = ((vaddr - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+ -		if (is_invalid_reserved_pfn(*pfn))
+ -			ret = 0;
+ +		ret = follow_fault_pfn(vma, mm, vaddr, pfn, prot & IOMMU_WRITE);
+ +		if (ret == -EAGAIN)
+ +			goto retry;
+ +
+ +		if (!ret && !is_invalid_reserved_pfn(*pfn))
+ +			ret = -EFAULT;
+  	}
+- 
++ done:
+  	up_read(&mm->mmap_sem);
+  	return ret;
+  }
+* Unmerged path drivers/vfio/vfio_iommu_type1.c
