@@ -1,0 +1,198 @@
+kvm: vmx: fix some -Wmissing-prototypes warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yi Wang <wang.yi59@zte.com.cn>
+commit 8997f657001d1ac5042d368a936987c87251c5ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8997f657.failed
+
+We get some warnings when building kernel with W=1:
+arch/x86/kvm/vmx/vmx.c:426:5: warning: no previous prototype for ‘kvm_fill_hv_flush_list_func’ [-Wmissing-prototypes]
+arch/x86/kvm/vmx/nested.c:58:6: warning: no previous prototype for ‘init_vmcs_shadow_fields’ [-Wmissing-prototypes]
+
+Make them static to fix this.
+
+	Signed-off-by: Yi Wang <wang.yi59@zte.com.cn>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8997f657001d1ac5042d368a936987c87251c5ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 50f4aa38b1a2,8be2abbdf63f..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -1444,125 -403,57 +1444,130 @@@ DEFINE_STATIC_KEY_FALSE(enable_evmcs)
+  static bool __read_mostly enlightened_vmcs = true;
+  module_param(enlightened_vmcs, bool, 0444);
+  
+ -/* check_ept_pointer() should be under protection of ept_pointer_lock. */
+ -static void check_ept_pointer_match(struct kvm *kvm)
+ +static inline void evmcs_write64(unsigned long field, u64 value)
+  {
+ -	struct kvm_vcpu *vcpu;
+ -	u64 tmp_eptp = INVALID_PAGE;
+ -	int i;
+ +	u16 clean_field;
+ +	int offset = get_evmcs_offset(field, &clean_field);
+  
+ -	kvm_for_each_vcpu(i, vcpu, kvm) {
+ -		if (!VALID_PAGE(tmp_eptp)) {
+ -			tmp_eptp = to_vmx(vcpu)->ept_pointer;
+ -		} else if (tmp_eptp != to_vmx(vcpu)->ept_pointer) {
+ -			to_kvm_vmx(kvm)->ept_pointers_match
+ -				= EPT_POINTERS_MISMATCH;
+ -			return;
+ -		}
+ -	}
+ +	if (offset < 0)
+ +		return;
+  
+ -	to_kvm_vmx(kvm)->ept_pointers_match = EPT_POINTERS_MATCH;
+ +	*(u64 *)((char *)current_evmcs + offset) = value;
+ +
+ +	current_evmcs->hv_clean_fields &= ~clean_field;
+  }
+  
+ -static int kvm_fill_hv_flush_list_func(struct hv_guest_mapping_flush_list *flush,
+ -		void *data)
+ +static inline void evmcs_write32(unsigned long field, u32 value)
+  {
+ -	struct kvm_tlb_range *range = data;
+ +	u16 clean_field;
+ +	int offset = get_evmcs_offset(field, &clean_field);
+ +
+ +	if (offset < 0)
+ +		return;
+  
+ -	return hyperv_fill_flush_guest_mapping_list(flush, range->start_gfn,
+ -			range->pages);
+ +	*(u32 *)((char *)current_evmcs + offset) = value;
+ +	current_evmcs->hv_clean_fields &= ~clean_field;
+  }
+  
+ -static inline int __hv_remote_flush_tlb_with_range(struct kvm *kvm,
+ -		struct kvm_vcpu *vcpu, struct kvm_tlb_range *range)
+ +static inline void evmcs_write16(unsigned long field, u16 value)
+  {
+ -	u64 ept_pointer = to_vmx(vcpu)->ept_pointer;
+ +	u16 clean_field;
+ +	int offset = get_evmcs_offset(field, &clean_field);
+ +
+ +	if (offset < 0)
+ +		return;
+ +
+ +	*(u16 *)((char *)current_evmcs + offset) = value;
+ +	current_evmcs->hv_clean_fields &= ~clean_field;
+ +}
+ +
+ +static inline u64 evmcs_read64(unsigned long field)
+ +{
+ +	int offset = get_evmcs_offset(field, NULL);
+ +
+ +	if (offset < 0)
+ +		return 0;
+ +
+ +	return *(u64 *)((char *)current_evmcs + offset);
+ +}
+ +
+ +static inline u32 evmcs_read32(unsigned long field)
+ +{
+ +	int offset = get_evmcs_offset(field, NULL);
+ +
+ +	if (offset < 0)
+ +		return 0;
+ +
+ +	return *(u32 *)((char *)current_evmcs + offset);
+ +}
+ +
+ +static inline u16 evmcs_read16(unsigned long field)
+ +{
+ +	int offset = get_evmcs_offset(field, NULL);
+ +
+ +	if (offset < 0)
+ +		return 0;
+ +
+ +	return *(u16 *)((char *)current_evmcs + offset);
+ +}
+ +
+ +static inline void evmcs_touch_msr_bitmap(void)
+ +{
+ +	if (unlikely(!current_evmcs))
+ +		return;
+ +
+ +	if (current_evmcs->hv_enlightenments_control.msr_bitmap)
+ +		current_evmcs->hv_clean_fields &=
+ +			~HV_VMX_ENLIGHTENED_CLEAN_FIELD_MSR_BITMAP;
+ +}
+ +
+ +static void evmcs_load(u64 phys_addr)
+ +{
+ +	struct hv_vp_assist_page *vp_ap =
+ +		hv_get_vp_assist_page(smp_processor_id());
+ +
+ +	vp_ap->current_nested_vmcs = phys_addr;
+ +	vp_ap->enlighten_vmentry = 1;
+ +}
+ +
+ +static void evmcs_sanitize_exec_ctrls(struct vmcs_config *vmcs_conf)
+ +{
+ +	vmcs_conf->pin_based_exec_ctrl &= ~EVMCS1_UNSUPPORTED_PINCTRL;
+ +	vmcs_conf->cpu_based_2nd_exec_ctrl &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
+ +
+ +	vmcs_conf->vmexit_ctrl &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
+ +	vmcs_conf->vmentry_ctrl &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
+  
+ -	/*
+ -	 * FLUSH_GUEST_PHYSICAL_ADDRESS_SPACE hypercall needs address
+ -	 * of the base of EPT PML4 table, strip off EPT configuration
+ -	 * information.
+ -	 */
+ -	if (range)
+ -		return hyperv_flush_guest_mapping_range(ept_pointer & PAGE_MASK,
+ -				kvm_fill_hv_flush_list_func, (void *)range);
+ -	else
+ -		return hyperv_flush_guest_mapping(ept_pointer & PAGE_MASK);
+  }
+  
+ -static int hv_remote_flush_tlb_with_range(struct kvm *kvm,
+ -		struct kvm_tlb_range *range)
+ +/* check_ept_pointer() should be under protection of ept_pointer_lock. */
+ +static void check_ept_pointer_match(struct kvm *kvm)
+  {
+  	struct kvm_vcpu *vcpu;
+ -	int ret = 0, i;
+ +	u64 tmp_eptp = INVALID_PAGE;
+ +	int i;
+ +
+ +	kvm_for_each_vcpu(i, vcpu, kvm) {
+ +		if (!VALID_PAGE(tmp_eptp)) {
+ +			tmp_eptp = to_vmx(vcpu)->ept_pointer;
+ +		} else if (tmp_eptp != to_vmx(vcpu)->ept_pointer) {
+ +			to_kvm_vmx(kvm)->ept_pointers_match
+ +				= EPT_POINTERS_MISMATCH;
+ +			return;
+ +		}
+ +	}
+ +
+ +	to_kvm_vmx(kvm)->ept_pointers_match = EPT_POINTERS_MATCH;
+ +}
+ +
+++<<<<<<< HEAD
+ +static int vmx_hv_remote_flush_tlb(struct kvm *kvm)
+++=======
+++static int kvm_fill_hv_flush_list_func(struct hv_guest_mapping_flush_list *flush,
+++		void *data)
+++>>>>>>> 8997f657001d (kvm: vmx: fix some -Wmissing-prototypes warnings)
+ +{
+ +	int ret;
+  
+  	spin_lock(&to_kvm_vmx(kvm)->ept_pointer_lock);
+  
+* Unmerged path arch/x86/kvm/vmx/nested.c
+* Unmerged path arch/x86/kvm/vmx/nested.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
