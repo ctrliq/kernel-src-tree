@@ -1,0 +1,706 @@
+net: bridge: switchdev: let drivers inform which bridge ports are offloaded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 2f5dc00f7a3ea669fd387ce79ffca92bff361550
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2f5dc00f.failed
+
+On reception of an skb, the bridge checks if it was marked as 'already
+forwarded in hardware' (checks if skb->offload_fwd_mark == 1), and if it
+is, it assigns the source hardware domain of that skb based on the
+hardware domain of the ingress port. Then during forwarding, it enforces
+that the egress port must have a different hardware domain than the
+ingress one (this is done in nbp_switchdev_allowed_egress).
+
+Non-switchdev drivers don't report any physical switch id (neither
+through devlink nor .ndo_get_port_parent_id), therefore the bridge
+assigns them a hardware domain of 0, and packets coming from them will
+always have skb->offload_fwd_mark = 0. So there aren't any restrictions.
+
+Problems appear due to the fact that DSA would like to perform software
+fallback for bonding and team interfaces that the physical switch cannot
+offload.
+
+       +-- br0 ---+
+      / /   |      \
+     / /    |       \
+    /  |    |      bond0
+   /   |    |     /    \
+ swp0 swp1 swp2 swp3 swp4
+
+There, it is desirable that the presence of swp3 and swp4 under a
+non-offloaded LAG does not preclude us from doing hardware bridging
+beteen swp0, swp1 and swp2. The bandwidth of the CPU is often times high
+enough that software bridging between {swp0,swp1,swp2} and bond0 is not
+impractical.
+
+But this creates an impossible paradox given the current way in which
+port hardware domains are assigned. When the driver receives a packet
+from swp0 (say, due to flooding), it must set skb->offload_fwd_mark to
+something.
+
+- If we set it to 0, then the bridge will forward it towards swp1, swp2
+  and bond0. But the switch has already forwarded it towards swp1 and
+  swp2 (not to bond0, remember, that isn't offloaded, so as far as the
+  switch is concerned, ports swp3 and swp4 are not looking up the FDB,
+  and the entire bond0 is a destination that is strictly behind the
+  CPU). But we don't want duplicated traffic towards swp1 and swp2, so
+  it's not ok to set skb->offload_fwd_mark = 0.
+
+- If we set it to 1, then the bridge will not forward the skb towards
+  the ports with the same switchdev mark, i.e. not to swp1, swp2 and
+  bond0. Towards swp1 and swp2 that's ok, but towards bond0? It should
+  have forwarded the skb there.
+
+So the real issue is that bond0 will be assigned the same hardware
+domain as {swp0,swp1,swp2}, because the function that assigns hardware
+domains to bridge ports, nbp_switchdev_add(), recurses through bond0's
+lower interfaces until it finds something that implements devlink (calls
+dev_get_port_parent_id with bool recurse = true). This is a problem
+because the fact that bond0 can be offloaded by swp3 and swp4 in our
+example is merely an assumption.
+
+A solution is to give the bridge explicit hints as to what hardware
+domain it should use for each port.
+
+Currently, the bridging offload is very 'silent': a driver registers a
+netdevice notifier, which is put on the netns's notifier chain, and
+which sniffs around for NETDEV_CHANGEUPPER events where the upper is a
+bridge, and the lower is an interface it knows about (one registered by
+this driver, normally). Then, from within that notifier, it does a bunch
+of stuff behind the bridge's back, without the bridge necessarily
+knowing that there's somebody offloading that port. It looks like this:
+
+     ip link set swp0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v
+        call_netdevice_notifiers
+                  |
+                  v
+       dsa_slave_netdevice_event
+                  |
+                  v
+        oh, hey! it's for me!
+                  |
+                  v
+           .port_bridge_join
+
+What we do to solve the conundrum is to be less silent, and change the
+switchdev drivers to present themselves to the bridge. Something like this:
+
+     ip link set swp0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge: Aye! I'll use this
+        call_netdevice_notifiers           ^  ppid as the
+                  |                        |  hardware domain for
+                  v                        |  this port, and zero
+       dsa_slave_netdevice_event           |  if I got nothing.
+                  |                        |
+                  v                        |
+        oh, hey! it's for me!              |
+                  |                        |
+                  v                        |
+           .port_bridge_join               |
+                  |                        |
+                  +------------------------+
+             switchdev_bridge_port_offload(swp0, swp0)
+
+Then stacked interfaces (like bond0 on top of swp3/swp4) would be
+treated differently in DSA, depending on whether we can or cannot
+offload them.
+
+The offload case:
+
+    ip link set bond0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge: Aye! I'll use this
+        call_netdevice_notifiers           ^  ppid as the
+                  |                        |  switchdev mark for
+                  v                        |        bond0.
+       dsa_slave_netdevice_event           | Coincidentally (or not),
+                  |                        | bond0 and swp0, swp1, swp2
+                  v                        | all have the same switchdev
+        hmm, it's not quite for me,        | mark now, since the ASIC
+         but my driver has already         | is able to forward towards
+           called .port_lag_join           | all these ports in hw.
+          for it, because I have           |
+      a port with dp->lag_dev == bond0.    |
+                  |                        |
+                  v                        |
+           .port_bridge_join               |
+           for swp3 and swp4               |
+                  |                        |
+                  +------------------------+
+            switchdev_bridge_port_offload(bond0, swp3)
+            switchdev_bridge_port_offload(bond0, swp4)
+
+And the non-offload case:
+
+    ip link set bond0 master br0
+                  |
+                  v
+ br_add_if() calls netdev_master_upper_dev_link()
+                  |
+                  v                    bridge waiting:
+        call_netdevice_notifiers           ^  huh, switchdev_bridge_port_offload
+                  |                        |  wasn't called, okay, I'll use a
+                  v                        |  hwdom of zero for this one.
+       dsa_slave_netdevice_event           :  Then packets received on swp0 will
+                  |                        :  not be software-forwarded towards
+                  v                        :  swp1, but they will towards bond0.
+         it's not for me, but
+       bond0 is an upper of swp3
+      and swp4, but their dp->lag_dev
+       is NULL because they couldn't
+            offload it.
+
+Basically we can draw the conclusion that the lowers of a bridge port
+can come and go, so depending on the configuration of lowers for a
+bridge port, it can dynamically toggle between offloaded and unoffloaded.
+Therefore, we need an equivalent switchdev_bridge_port_unoffload too.
+
+This patch changes the way any switchdev driver interacts with the
+bridge. From now on, everybody needs to call switchdev_bridge_port_offload
+and switchdev_bridge_port_unoffload, otherwise the bridge will treat the
+port as non-offloaded and allow software flooding to other ports from
+the same ASIC.
+
+Note that these functions lay the ground for a more complex handshake
+between switchdev drivers and the bridge in the future.
+
+For drivers that will request a replay of the switchdev objects when
+they offload and unoffload a bridge port (DSA, dpaa2-switch, ocelot), we
+place the call to switchdev_bridge_port_unoffload() strategically inside
+the NETDEV_PRECHANGEUPPER notifier's code path, and not inside
+NETDEV_CHANGEUPPER. This is because the switchdev object replay helpers
+need the netdev adjacency lists to be valid, and that is only true in
+NETDEV_PRECHANGEUPPER.
+
+	Cc: Vadym Kochan <vkochan@marvell.com>
+	Cc: Taras Chornyi <tchornyi@marvell.com>
+	Cc: Ioana Ciornei <ioana.ciornei@nxp.com>
+	Cc: Lars Povlsen <lars.povlsen@microchip.com>
+	Cc: Steen Hegelund <Steen.Hegelund@microchip.com>
+	Cc: UNGLinuxDriver@microchip.com
+	Cc: Claudiu Manoil <claudiu.manoil@nxp.com>
+	Cc: Alexandre Belloni <alexandre.belloni@bootlin.com>
+	Cc: Grygorii Strashko <grygorii.strashko@ti.com>
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Tested-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch: regression
+	Acked-by: Ioana Ciornei <ioana.ciornei@nxp.com> # dpaa2-switch
+	Tested-by: Horatiu Vultur <horatiu.vultur@microchip.com> # ocelot-switch
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 2f5dc00f7a3ea669fd387ce79ffca92bff361550)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+#	drivers/net/ethernet/marvell/prestera/prestera_main.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+#	drivers/net/ethernet/marvell/prestera/prestera_switchdev.h
+#	drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/ti/am65-cpsw-nuss.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	net/dsa/port.c
+diff --cc net/dsa/port.c
+index 2d7e01b23572,7accda066149..000000000000
+--- a/net/dsa/port.c
++++ b/net/dsa/port.c
+@@@ -103,22 -292,50 +103,62 @@@ int dsa_port_bridge_join(struct dsa_por
+  		.port = dp->index,
+  		.br = br,
+  	};
++ 	struct net_device *dev = dp->slave;
++ 	struct net_device *brport_dev;
+  	int err;
+  
+ -	/* Here the interface is already bridged. Reflect the current
+ -	 * configuration so that drivers can program their chips accordingly.
+ +	/* Here the port is already bridged. Reflect the current configuration
+ +	 * so that drivers can program their chips accordingly.
+  	 */
+  	dp->bridge_dev = br;
+  
+++<<<<<<< HEAD
+ +	err = dsa_port_notify(dp, DSA_NOTIFIER_BRIDGE_JOIN, &info);
+ +
+ +	/* The bridging is rolled back on error */
+++=======
++ 	brport_dev = dsa_port_to_bridge_port(dp);
++ 
++ 	err = dsa_broadcast(DSA_NOTIFIER_BRIDGE_JOIN, &info);
+++>>>>>>> 2f5dc00f7a3e (net: bridge: switchdev: let drivers inform which bridge ports are offloaded)
+  	if (err)
+ -		goto out_rollback;
+ +		dp->bridge_dev = NULL;
+  
+++<<<<<<< HEAD
+++	return err;
+++}
+++
+++=======
++ 	err = switchdev_bridge_port_offload(brport_dev, dev, extack);
++ 	if (err)
++ 		goto out_rollback_unbridge;
++ 
++ 	err = dsa_port_switchdev_sync(dp, extack);
++ 	if (err)
++ 		goto out_rollback_unoffload;
++ 
++ 	return 0;
++ 
++ out_rollback_unoffload:
++ 	switchdev_bridge_port_unoffload(brport_dev);
++ out_rollback_unbridge:
++ 	dsa_broadcast(DSA_NOTIFIER_BRIDGE_LEAVE, &info);
++ out_rollback:
++ 	dp->bridge_dev = NULL;
+  	return err;
+  }
+  
++ int dsa_port_pre_bridge_leave(struct dsa_port *dp, struct net_device *br,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *brport_dev = dsa_port_to_bridge_port(dp);
++ 
++ 	switchdev_bridge_port_unoffload(brport_dev);
++ 
++ 	return dsa_port_switchdev_unsync_objs(dp, br, extack);
++ }
++ 
+++>>>>>>> 2f5dc00f7a3e (net: bridge: switchdev: let drivers inform which bridge ports are offloaded)
+  void dsa_port_bridge_leave(struct dsa_port *dp, struct net_device *br)
+  {
+  	struct dsa_notifier_bridge_info info = {
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_main.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.h
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-switch.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_main.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_switchdev.h
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+index 14ce372c3f85..921205706f5c 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_switchdev.c
+@@ -335,14 +335,16 @@ mlxsw_sp_bridge_port_find(struct mlxsw_sp_bridge *bridge,
+ 
+ static struct mlxsw_sp_bridge_port *
+ mlxsw_sp_bridge_port_create(struct mlxsw_sp_bridge_device *bridge_device,
+-			    struct net_device *brport_dev)
++			    struct net_device *brport_dev,
++			    struct netlink_ext_ack *extack)
+ {
+ 	struct mlxsw_sp_bridge_port *bridge_port;
+ 	struct mlxsw_sp_port *mlxsw_sp_port;
++	int err;
+ 
+ 	bridge_port = kzalloc(sizeof(*bridge_port), GFP_KERNEL);
+ 	if (!bridge_port)
+-		return NULL;
++		return ERR_PTR(-ENOMEM);
+ 
+ 	mlxsw_sp_port = mlxsw_sp_port_dev_lower_find(brport_dev);
+ 	bridge_port->lagged = mlxsw_sp_port->lagged;
+@@ -359,12 +361,23 @@ mlxsw_sp_bridge_port_create(struct mlxsw_sp_bridge_device *bridge_device,
+ 	list_add(&bridge_port->list, &bridge_device->ports_list);
+ 	bridge_port->ref_count = 1;
+ 
++	err = switchdev_bridge_port_offload(brport_dev, mlxsw_sp_port->dev,
++					    extack);
++	if (err)
++		goto err_switchdev_offload;
++
+ 	return bridge_port;
++
++err_switchdev_offload:
++	list_del(&bridge_port->list);
++	kfree(bridge_port);
++	return ERR_PTR(err);
+ }
+ 
+ static void
+ mlxsw_sp_bridge_port_destroy(struct mlxsw_sp_bridge_port *bridge_port)
+ {
++	switchdev_bridge_port_unoffload(bridge_port->dev);
+ 	list_del(&bridge_port->list);
+ 	WARN_ON(!list_empty(&bridge_port->vlans_list));
+ 	kfree(bridge_port);
+@@ -390,9 +403,10 @@ mlxsw_sp_bridge_port_get(struct mlxsw_sp_bridge *bridge,
+ 	if (IS_ERR(bridge_device))
+ 		return ERR_CAST(bridge_device);
+ 
+-	bridge_port = mlxsw_sp_bridge_port_create(bridge_device, brport_dev);
+-	if (!bridge_port) {
+-		err = -ENOMEM;
++	bridge_port = mlxsw_sp_bridge_port_create(bridge_device, brport_dev,
++						  extack);
++	if (IS_ERR(bridge_port)) {
++		err = PTR_ERR(bridge_port);
+ 		goto err_bridge_port_create;
+ 	}
+ 
+* Unmerged path drivers/net/ethernet/microchip/sparx5/sparx5_switchdev.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+diff --git a/drivers/net/ethernet/rocker/rocker.h b/drivers/net/ethernet/rocker/rocker.h
+index 2b2e1c4f0dc3..cd3d826323aa 100644
+--- a/drivers/net/ethernet/rocker/rocker.h
++++ b/drivers/net/ethernet/rocker/rocker.h
+@@ -125,7 +125,8 @@ struct rocker_world_ops {
+ 	int (*port_obj_fdb_del)(struct rocker_port *rocker_port,
+ 				u16 vid, const unsigned char *addr);
+ 	int (*port_master_linked)(struct rocker_port *rocker_port,
+-				  struct net_device *master);
++				  struct net_device *master,
++				  struct netlink_ext_ack *extack);
+ 	int (*port_master_unlinked)(struct rocker_port *rocker_port,
+ 				    struct net_device *master);
+ 	int (*port_neigh_update)(struct rocker_port *rocker_port,
+diff --git a/drivers/net/ethernet/rocker/rocker_main.c b/drivers/net/ethernet/rocker/rocker_main.c
+index 6bf36ef15dab..ae8397aebd5a 100644
+--- a/drivers/net/ethernet/rocker/rocker_main.c
++++ b/drivers/net/ethernet/rocker/rocker_main.c
+@@ -1691,13 +1691,14 @@ rocker_world_port_fdb_del(struct rocker_port *rocker_port,
+ }
+ 
+ static int rocker_world_port_master_linked(struct rocker_port *rocker_port,
+-					   struct net_device *master)
++					   struct net_device *master,
++					   struct netlink_ext_ack *extack)
+ {
+ 	struct rocker_world_ops *wops = rocker_port->rocker->wops;
+ 
+ 	if (!wops->port_master_linked)
+ 		return -EOPNOTSUPP;
+-	return wops->port_master_linked(rocker_port, master);
++	return wops->port_master_linked(rocker_port, master, extack);
+ }
+ 
+ static int rocker_world_port_master_unlinked(struct rocker_port *rocker_port,
+@@ -3117,6 +3118,7 @@ struct rocker_port *rocker_port_dev_lower_find(struct net_device *dev,
+ static int rocker_netdevice_event(struct notifier_block *unused,
+ 				  unsigned long event, void *ptr)
+ {
++	struct netlink_ext_ack *extack = netdev_notifier_info_to_extack(ptr);
+ 	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ 	struct netdev_notifier_changeupper_info *info;
+ 	struct rocker_port *rocker_port;
+@@ -3133,7 +3135,8 @@ static int rocker_netdevice_event(struct notifier_block *unused,
+ 		rocker_port = netdev_priv(dev);
+ 		if (info->linking) {
+ 			err = rocker_world_port_master_linked(rocker_port,
+-							      info->upper_dev);
++							      info->upper_dev,
++							      extack);
+ 			if (err)
+ 				netdev_warn(dev, "failed to reflect master linked (err %d)\n",
+ 					    err);
+diff --git a/drivers/net/ethernet/rocker/rocker_ofdpa.c b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+index fa296a7c255d..9f02dcb1911f 100644
+--- a/drivers/net/ethernet/rocker/rocker_ofdpa.c
++++ b/drivers/net/ethernet/rocker/rocker_ofdpa.c
+@@ -2597,8 +2597,10 @@ static int ofdpa_port_obj_fdb_del(struct rocker_port *rocker_port,
+ }
+ 
+ static int ofdpa_port_bridge_join(struct ofdpa_port *ofdpa_port,
+-				  struct net_device *bridge)
++				  struct net_device *bridge,
++				  struct netlink_ext_ack *extack)
+ {
++	struct net_device *dev = ofdpa_port->dev;
+ 	int err;
+ 
+ 	/* Port is joining bridge, so the internal VLAN for the
+@@ -2618,13 +2620,20 @@ static int ofdpa_port_bridge_join(struct ofdpa_port *ofdpa_port,
+ 
+ 	ofdpa_port->bridge_dev = bridge;
+ 
+-	return ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
++	err = ofdpa_port_vlan_add(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
++	if (err)
++		return err;
++
++	return switchdev_bridge_port_offload(dev, dev, extack);
+ }
+ 
+ static int ofdpa_port_bridge_leave(struct ofdpa_port *ofdpa_port)
+ {
++	struct net_device *dev = ofdpa_port->dev;
+ 	int err;
+ 
++	switchdev_bridge_port_unoffload(dev);
++
+ 	err = ofdpa_port_vlan_del(ofdpa_port, OFDPA_UNTAGGED_VID, 0);
+ 	if (err)
+ 		return err;
+@@ -2663,13 +2672,14 @@ static int ofdpa_port_ovs_changed(struct ofdpa_port *ofdpa_port,
+ }
+ 
+ static int ofdpa_port_master_linked(struct rocker_port *rocker_port,
+-				    struct net_device *master)
++				    struct net_device *master,
++				    struct netlink_ext_ack *extack)
+ {
+ 	struct ofdpa_port *ofdpa_port = rocker_port->wpriv;
+ 	int err = 0;
+ 
+ 	if (netif_is_bridge_master(master))
+-		err = ofdpa_port_bridge_join(ofdpa_port, master);
++		err = ofdpa_port_bridge_join(ofdpa_port, master, extack);
+ 	else if (netif_is_ovs_master(master))
+ 		err = ofdpa_port_ovs_changed(ofdpa_port, master);
+ 	return err;
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+diff --git a/include/linux/if_bridge.h b/include/linux/if_bridge.h
+index f87c7c990fb6..dd8e7fe8d2fb 100644
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@ -200,4 +200,25 @@ static inline int br_fdb_replay(struct net_device *br_dev,
+ }
+ #endif
+ 
++#if IS_ENABLED(CONFIG_BRIDGE) && IS_ENABLED(CONFIG_NET_SWITCHDEV)
++
++int switchdev_bridge_port_offload(struct net_device *brport_dev,
++				  struct net_device *dev,
++				  struct netlink_ext_ack *extack);
++void switchdev_bridge_port_unoffload(struct net_device *brport_dev);
++
++#else
++
++static inline int switchdev_bridge_port_offload(struct net_device *brport_dev,
++						struct net_device *dev,
++						struct netlink_ext_ack *extack)
++{
++	return -EINVAL;
++}
++
++static inline void switchdev_bridge_port_unoffload(struct net_device *brport_dev)
++{
++}
++#endif
++
+ #endif
+diff --git a/net/bridge/br_if.c b/net/bridge/br_if.c
+index a835f9061163..136056a51eb8 100644
+--- a/net/bridge/br_if.c
++++ b/net/bridge/br_if.c
+@@ -353,7 +353,6 @@ static void del_nbp(struct net_bridge_port *p)
+ 	nbp_backup_clear(p);
+ 
+ 	nbp_update_port_count(br);
+-	nbp_switchdev_del(p);
+ 
+ 	netdev_upper_dev_unlink(dev, br->dev);
+ 
+@@ -648,10 +647,6 @@ int br_add_if(struct net_bridge *br, struct net_device *dev,
+ 	if (err)
+ 		goto err5;
+ 
+-	err = nbp_switchdev_add(p);
+-	if (err)
+-		goto err6;
+-
+ 	dev_disable_lro(dev);
+ 
+ 	list_add_rcu(&p->list, &br->port_list);
+@@ -689,13 +684,13 @@ int br_add_if(struct net_bridge *br, struct net_device *dev,
+ 		 */
+ 		err = dev_pre_changeaddr_notify(br->dev, dev->dev_addr, extack);
+ 		if (err)
+-			goto err7;
++			goto err6;
+ 	}
+ 
+ 	err = nbp_vlan_init(p, extack);
+ 	if (err) {
+ 		netdev_err(dev, "failed to initialize vlan filtering on this port\n");
+-		goto err7;
++		goto err6;
+ 	}
+ 
+ 	spin_lock_bh(&br->lock);
+@@ -718,14 +713,12 @@ int br_add_if(struct net_bridge *br, struct net_device *dev,
+ 
+ 	return 0;
+ 
+-err7:
++err6:
+ 	if (fdb_synced)
+ 		br_fdb_unsync_static(br, p);
+ 	list_del_rcu(&p->list);
+ 	br_fdb_delete_by_port(br, p, 0, 1);
+ 	nbp_update_port_count(br);
+-	nbp_switchdev_del(p);
+-err6:
+ 	netdev_upper_dev_unlink(dev, br->dev);
+ err5:
+ 	dev->priv_flags &= ~IFF_BRIDGE_PORT;
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 30e07225bc94..c90a815f450e 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -322,6 +322,8 @@ struct net_bridge_port {
+ 	 * hardware domain.
+ 	 */
+ 	int				hwdom;
++	int				offload_count;
++	struct netdev_phys_item_id	ppid;
+ #endif
+ 	u16				group_fwd_mask;
+ 	u16				backup_redirected_cnt;
+@@ -1478,8 +1480,6 @@ void br_switchdev_fdb_notify(struct net_bridge *br,
+ int br_switchdev_port_vlan_add(struct net_device *dev, u16 vid, u16 flags,
+ 			       struct netlink_ext_ack *extack);
+ int br_switchdev_port_vlan_del(struct net_device *dev, u16 vid);
+-int nbp_switchdev_add(struct net_bridge_port *p);
+-void nbp_switchdev_del(struct net_bridge_port *p);
+ void br_switchdev_init(struct net_bridge *br);
+ 
+ static inline void br_switchdev_frame_unmark(struct sk_buff *skb)
+@@ -1528,15 +1528,6 @@ static inline void br_switchdev_frame_unmark(struct sk_buff *skb)
+ {
+ }
+ 
+-static inline int nbp_switchdev_add(struct net_bridge_port *p)
+-{
+-	return 0;
+-}
+-
+-static inline void nbp_switchdev_del(struct net_bridge_port *p)
+-{
+-}
+-
+ static inline void br_switchdev_init(struct net_bridge *br)
+ {
+ }
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index be7535fa5f0e..8f082460675d 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -133,7 +133,7 @@ static int nbp_switchdev_hwdom_set(struct net_bridge_port *joining)
+ 
+ 	/* joining is yet to be added to the port list. */
+ 	list_for_each_entry(p, &br->port_list, list) {
+-		if (netdev_port_same_parent_id(joining->dev, p->dev)) {
++		if (netdev_phys_item_id_same(&joining->ppid, &p->ppid)) {
+ 			joining->hwdom = p->hwdom;
+ 			return 0;
+ 		}
+@@ -162,27 +162,85 @@ static void nbp_switchdev_hwdom_put(struct net_bridge_port *leaving)
+ 	clear_bit(leaving->hwdom, &br->busy_hwdoms);
+ }
+ 
+-int nbp_switchdev_add(struct net_bridge_port *p)
++static int nbp_switchdev_add(struct net_bridge_port *p,
++			     struct netdev_phys_item_id ppid,
++			     struct netlink_ext_ack *extack)
+ {
+-	struct netdev_phys_item_id ppid = { };
+-	int err;
++	if (p->offload_count) {
++		/* Prevent unsupported configurations such as a bridge port
++		 * which is a bonding interface, and the member ports are from
++		 * different hardware switches.
++		 */
++		if (!netdev_phys_item_id_same(&p->ppid, &ppid)) {
++			NL_SET_ERR_MSG_MOD(extack,
++					   "Same bridge port cannot be offloaded by two physical switches");
++			return -EBUSY;
++		}
+ 
+-	ASSERT_RTNL();
++		/* Tolerate drivers that call switchdev_bridge_port_offload()
++		 * more than once for the same bridge port, such as when the
++		 * bridge port is an offloaded bonding/team interface.
++		 */
++		p->offload_count++;
+ 
+-	err = dev_get_port_parent_id(p->dev, &ppid, true);
+-	if (err) {
+-		if (err == -EOPNOTSUPP)
+-			return 0;
+-		return err;
++		return 0;
+ 	}
+ 
++	p->ppid = ppid;
++	p->offload_count = 1;
++
+ 	return nbp_switchdev_hwdom_set(p);
+ }
+ 
+-void nbp_switchdev_del(struct net_bridge_port *p)
++static void nbp_switchdev_del(struct net_bridge_port *p)
+ {
+-	ASSERT_RTNL();
++	if (WARN_ON(!p->offload_count))
++		return;
++
++	p->offload_count--;
++
++	if (p->offload_count)
++		return;
+ 
+ 	if (p->hwdom)
+ 		nbp_switchdev_hwdom_put(p);
+ }
++
++/* Let the bridge know that this port is offloaded, so that it can assign a
++ * switchdev hardware domain to it.
++ */
++int switchdev_bridge_port_offload(struct net_device *brport_dev,
++				  struct net_device *dev,
++				  struct netlink_ext_ack *extack)
++{
++	struct netdev_phys_item_id ppid;
++	struct net_bridge_port *p;
++	int err;
++
++	ASSERT_RTNL();
++
++	p = br_port_get_rtnl(brport_dev);
++	if (!p)
++		return -ENODEV;
++
++	err = dev_get_port_parent_id(dev, &ppid, false);
++	if (err)
++		return err;
++
++	return nbp_switchdev_add(p, ppid, extack);
++}
++EXPORT_SYMBOL_GPL(switchdev_bridge_port_offload);
++
++void switchdev_bridge_port_unoffload(struct net_device *brport_dev)
++{
++	struct net_bridge_port *p;
++
++	ASSERT_RTNL();
++
++	p = br_port_get_rtnl(brport_dev);
++	if (!p)
++		return;
++
++	nbp_switchdev_del(p);
++}
++EXPORT_SYMBOL_GPL(switchdev_bridge_port_unoffload);
+* Unmerged path net/dsa/port.c
