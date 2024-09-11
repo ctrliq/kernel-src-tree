@@ -1,0 +1,169 @@
+net: introduce per-netns netdevice notifiers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] introduce per-netns netdevice notifiers (Ivan Vecera) [1818102]
+Rebuild_FUZZ: 93.98%
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit a30c7b429f2dd980202c912fcb76442364937b4d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a30c7b42.failed
+
+Often the code for example in drivers is interested in getting notifier
+call only from certain network namespace. In addition to the existing
+global netdevice notifier chain introduce per-netns chains and allow
+users to register to that. Eventually this would eliminate unnecessary
+overhead in case there are many netdevices in many network namespaces.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a30c7b429f2dd980202c912fcb76442364937b4d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/net_namespace.h
+diff --cc include/net/net_namespace.h
+index 97771896eca9,5ac2bb16d4b3..000000000000
+--- a/include/net/net_namespace.h
++++ b/include/net/net_namespace.h
+@@@ -36,7 -36,7 +36,11 @@@
+  #include <linux/ns_common.h>
+  #include <linux/idr.h>
+  #include <linux/skbuff.h>
+++<<<<<<< HEAD
+ +#include <linux/siphash.h>
+++=======
++ #include <linux/notifier.h>
+++>>>>>>> a30c7b429f2d (net: introduce per-netns netdevice notifiers)
+  
+  struct user_namespace;
+  struct proc_dir_entry;
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 4bd94d67974c..4e9bd2a3e32b 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2672,6 +2672,9 @@ const char *netdev_cmd_to_name(enum netdev_cmd cmd);
+ 
+ int register_netdevice_notifier(struct notifier_block *nb);
+ int unregister_netdevice_notifier(struct notifier_block *nb);
++int register_netdevice_notifier_net(struct net *net, struct notifier_block *nb);
++int unregister_netdevice_notifier_net(struct net *net,
++				      struct notifier_block *nb);
+ 
+ struct netdev_notifier_info {
+ 	struct net_device	*dev;
+* Unmerged path include/net/net_namespace.h
+diff --git a/net/core/dev.c b/net/core/dev.c
+index 179b0fc0269a..97ec5a46787b 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -1760,6 +1760,80 @@ int unregister_netdevice_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL(unregister_netdevice_notifier);
+ 
++/**
++ * register_netdevice_notifier_net - register a per-netns network notifier block
++ * @net: network namespace
++ * @nb: notifier
++ *
++ * Register a notifier to be called when network device events occur.
++ * The notifier passed is linked into the kernel structures and must
++ * not be reused until it has been unregistered. A negative errno code
++ * is returned on a failure.
++ *
++ * When registered all registration and up events are replayed
++ * to the new notifier to allow device to have a race free
++ * view of the network device list.
++ */
++
++int register_netdevice_notifier_net(struct net *net, struct notifier_block *nb)
++{
++	int err;
++
++	rtnl_lock();
++	err = raw_notifier_chain_register(&net->netdev_chain, nb);
++	if (err)
++		goto unlock;
++	if (dev_boot_phase)
++		goto unlock;
++
++	err = call_netdevice_register_net_notifiers(nb, net);
++	if (err)
++		goto chain_unregister;
++
++unlock:
++	rtnl_unlock();
++	return err;
++
++chain_unregister:
++	raw_notifier_chain_unregister(&netdev_chain, nb);
++	goto unlock;
++}
++EXPORT_SYMBOL(register_netdevice_notifier_net);
++
++/**
++ * unregister_netdevice_notifier_net - unregister a per-netns
++ *                                     network notifier block
++ * @net: network namespace
++ * @nb: notifier
++ *
++ * Unregister a notifier previously registered by
++ * register_netdevice_notifier(). The notifier is unlinked into the
++ * kernel structures and may then be reused. A negative errno code
++ * is returned on a failure.
++ *
++ * After unregistering unregister and down device events are synthesized
++ * for all devices on the device list to the removed notifier to remove
++ * the need for special case cleanup code.
++ */
++
++int unregister_netdevice_notifier_net(struct net *net,
++				      struct notifier_block *nb)
++{
++	int err;
++
++	rtnl_lock();
++	err = raw_notifier_chain_unregister(&net->netdev_chain, nb);
++	if (err)
++		goto unlock;
++
++	call_netdevice_unregister_net_notifiers(nb, net);
++
++unlock:
++	rtnl_unlock();
++	return err;
++}
++EXPORT_SYMBOL(unregister_netdevice_notifier_net);
++
+ /**
+  *	call_netdevice_notifiers_info - call all network notifier blocks
+  *	@val: value passed unmodified to notifier function
+@@ -1772,7 +1846,18 @@ EXPORT_SYMBOL(unregister_netdevice_notifier);
+ static int call_netdevice_notifiers_info(unsigned long val,
+ 					 struct netdev_notifier_info *info)
+ {
++	struct net *net = dev_net(info->dev);
++	int ret;
++
+ 	ASSERT_RTNL();
++
++	/* Run per-netns notifier block chain first, then run the global one.
++	 * Hopefully, one day, the global one is going to be removed after
++	 * all notifier block registrators get converted to be per-netns.
++	 */
++	ret = raw_notifier_call_chain(&net->netdev_chain, val, info);
++	if (ret & NOTIFY_STOP_MASK)
++		return ret;
+ 	return raw_notifier_call_chain(&netdev_chain, val, info);
+ }
+ 
+@@ -9713,6 +9798,8 @@ static int __net_init netdev_init(struct net *net)
+ 	if (net->dev_index_head == NULL)
+ 		goto err_idx;
+ 
++	RAW_INIT_NOTIFIER_HEAD(&net->netdev_chain);
++
+ 	return 0;
+ 
+ err_idx:
