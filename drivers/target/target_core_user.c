@@ -1936,11 +1936,6 @@ err_bitmap_alloc:
 	return ret;
 }
 
-static bool tcmu_dev_configured(struct tcmu_dev *udev)
-{
-	return udev->uio_info.uio_dev ? true : false;
-}
-
 static void tcmu_free_device(struct se_device *dev)
 {
 	struct tcmu_dev *udev = TCMU_DEV(dev);
@@ -2333,7 +2328,7 @@ static ssize_t tcmu_dev_config_store(struct config_item *item, const char *page,
 		return -EINVAL;
 
 	/* Check if device has been configured before */
-	if (tcmu_dev_configured(udev)) {
+	if (target_dev_configured(&udev->se_dev)) {
 		ret = tcmu_send_dev_config_event(udev, page);
 		if (ret) {
 			pr_err("Unable to reconfigure device\n");
@@ -2395,7 +2390,7 @@ static ssize_t tcmu_dev_size_store(struct config_item *item, const char *page,
 		return ret;
 
 	/* Check if device has been configured before */
-	if (tcmu_dev_configured(udev)) {
+	if (target_dev_configured(&udev->se_dev)) {
 		ret = tcmu_send_dev_size_event(udev, val);
 		if (ret) {
 			pr_err("Unable to reconfigure device\n");
@@ -2477,7 +2472,7 @@ static ssize_t tcmu_emulate_write_cache_store(struct config_item *item,
 		return ret;
 
 	/* Check if device has been configured before */
-	if (tcmu_dev_configured(udev)) {
+	if (target_dev_configured(&udev->se_dev)) {
 		ret = tcmu_send_emulate_write_cache(udev, val);
 		if (ret) {
 			pr_err("Unable to reconfigure device\n");
