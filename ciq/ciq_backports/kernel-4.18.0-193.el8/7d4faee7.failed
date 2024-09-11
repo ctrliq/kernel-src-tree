@@ -1,0 +1,180 @@
+s390/qeth: drop unwanted packets earlier in RX path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [s390] qeth: drop unwanted packets earlier in RX path (Philipp Rudo) [1781085]
+Rebuild_FUZZ: 94.85%
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 7d4faee7c6db9ddfb2b4de637dc6f1576f780bd7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7d4faee7.failed
+
+Packets with an unexpected HW format are currently first extracted from
+the RX buffer, passed upwards to the layer-specific driver and only then
+finally dropped.
+
+Enhance the RX path so that we can drop such packets before even
+allocating an skb. For this, add some additional logic so that when a
+packet is meant to be dropped, we can still walk along the packet's data
+chunks in the RX buffer. This allows us to extract the following
+packet(s) from the buffer.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7d4faee7c6db9ddfb2b4de637dc6f1576f780bd7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,467a9173058c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5199,7 -5108,13 +5212,17 @@@ next_packet
+  		headroom = sizeof(struct qeth_hdr);
+  		break;
+  	default:
+++<<<<<<< HEAD
+ +		break;
+++=======
++ 		if ((*hdr)->hdr.l2.id & QETH_HEADER_MASK_INVAL)
++ 			QETH_CARD_STAT_INC(card, rx_frame_errors);
++ 		else
++ 			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
++ 
++ 		/* Can't determine packet length, drop the whole buffer. */
++ 		return NULL;
+++>>>>>>> 7d4faee7c6db (s390/qeth: drop unwanted packets earlier in RX path)
+  	}
+  
+  	if (!skb_len)
+@@@ -5240,8 -5157,11 +5265,16 @@@ walk_packet
+  			if (qeth_is_last_sbale(element)) {
+  				QETH_CARD_TEXT(card, 4, "unexeob");
+  				QETH_CARD_HEX(card, 2, buffer, sizeof(void *));
+++<<<<<<< HEAD
+ +				dev_kfree_skb_any(skb);
+ +				card->stats.rx_errors++;
+++=======
++ 				if (skb) {
++ 					dev_kfree_skb_any(skb);
++ 					QETH_CARD_STAT_INC(card,
++ 							   rx_length_errors);
++ 				}
+++>>>>>>> 7d4faee7c6db (s390/qeth: drop unwanted packets earlier in RX path)
+  				return NULL;
+  			}
+  			element++;
+@@@ -5251,11 -5171,17 +5284,16 @@@
+  			offset += data_len;
+  		}
+  	}
++ 
++ 	/* This packet was skipped, go get another one: */
++ 	if (!skb)
++ 		goto next_packet;
++ 
+  	*__element = element;
+  	*__offset = offset;
+ -	if (use_rx_sg) {
+ -		QETH_CARD_STAT_INC(card, rx_sg_skbs);
+ -		QETH_CARD_STAT_ADD(card, rx_sg_frags,
+ -				   skb_shinfo(skb)->nr_frags);
+ +	if (use_rx_sg && card->options.performance_stats) {
+ +		card->perf_stats.sg_skbs_rx++;
+ +		card->perf_stats.sg_frags_rx += skb_shinfo(skb)->nr_frags;
+  	}
+  	return skb;
+  no_mem:
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 26cbbcb6463c,ae69c981650d..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -337,27 -321,17 +337,36 @@@ static int qeth_l2_process_inbound_buff
+  			qeth_rx_csum(card, skb, hdr->hdr.l2.flags[1]);
+  			len = skb->len;
+  			napi_gro_receive(&card->napi, skb);
+++<<<<<<< HEAD
+ +			break;
+ +		case QETH_HEADER_TYPE_OSN:
+ +			if (IS_OSN(card)) {
+ +				skb_push(skb, sizeof(struct qeth_hdr));
+ +				skb_copy_to_linear_data(skb, hdr,
+ +						sizeof(struct qeth_hdr));
+ +				len = skb->len;
+ +				card->osn_info.data_cb(skb);
+ +				break;
+ +			}
+ +			/* else unknown */
+ +		default:
+ +			dev_kfree_skb_any(skb);
+ +			QETH_CARD_TEXT(card, 3, "inbunkno");
+ +			QETH_DBF_HEX(CTRL, 3, hdr, sizeof(*hdr));
+ +			continue;
+++=======
++ 		} else {
++ 			skb_push(skb, sizeof(*hdr));
++ 			skb_copy_to_linear_data(skb, hdr, sizeof(*hdr));
++ 			len = skb->len;
++ 			card->osn_info.data_cb(skb);
+++>>>>>>> 7d4faee7c6db (s390/qeth: drop unwanted packets earlier in RX path)
+  		}
++ 
+  		work_done++;
+  		budget--;
+ -		QETH_CARD_STAT_INC(card, rx_packets);
+ -		QETH_CARD_STAT_ADD(card, rx_bytes, len);
+ +		card->stats.rx_packets++;
+ +		card->stats.rx_bytes += len;
+  	}
+  	return work_done;
+  }
+diff --cc drivers/s390/net/qeth_l3_main.c
+index 0e3a2d122884,3b901f3676c1..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -1379,25 -1377,17 +1378,36 @@@ static int qeth_l3_process_inbound_buff
+  			*done = 1;
+  			break;
+  		}
+- 		switch (hdr->hdr.l3.id) {
+- 		case QETH_HEADER_TYPE_LAYER3:
++ 
++ 		if (hdr->hdr.l3.id == QETH_HEADER_TYPE_LAYER3)
+  			qeth_l3_rebuild_skb(card, skb, hdr);
+++<<<<<<< HEAD
+ +			/* fall through */
+ +		case QETH_HEADER_TYPE_LAYER2: /* for HiperSockets sniffer */
+ +			skb->protocol = eth_type_trans(skb, skb->dev);
+ +			len = skb->len;
+ +			napi_gro_receive(&card->napi, skb);
+ +			break;
+ +		default:
+ +			dev_kfree_skb_any(skb);
+ +			QETH_CARD_TEXT(card, 3, "inbunkno");
+ +			QETH_DBF_HEX(CTRL, 3, hdr, sizeof(*hdr));
+ +			continue;
+ +		}
+ +		work_done++;
+ +		budget--;
+ +		card->stats.rx_packets++;
+ +		card->stats.rx_bytes += len;
+++=======
++ 
++ 		skb->protocol = eth_type_trans(skb, skb->dev);
++ 		QETH_CARD_STAT_INC(card, rx_packets);
++ 		QETH_CARD_STAT_ADD(card, rx_bytes, skb->len);
++ 
++ 		napi_gro_receive(&card->napi, skb);
++ 		work_done++;
++ 		budget--;
+++>>>>>>> 7d4faee7c6db (s390/qeth: drop unwanted packets earlier in RX path)
+  	}
+  	return work_done;
+  }
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
