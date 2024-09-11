@@ -1,0 +1,229 @@
+net/mlx5: E-Switch, Introduce per vport configuration for eswitch modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Bodong Wang <bodong@mellanox.com>
+commit c2d7712ca3852886849267d61361d5137e40ee37
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c2d7712c.failed
+
+Both legacy and offload modes require vport setup, only offload mode
+requires rep setup. Before this patch, vport and rep operations are
+separated applied to all relevant vports in different stages.
+
+Change to use per vport configuration, so that vport and rep operations
+are modularized per vport.
+
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c2d7712ca3852886849267d61361d5137e40ee37)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 43ed228c4d29,865c120f577e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -2452,27 -2421,28 +2407,33 @@@ int esw_offloads_enable(struct mlx5_esw
+  	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs)
+  		vport->info.link_state = MLX5_VPORT_ADMIN_STATE_DOWN;
+  
+- 	err = mlx5_eswitch_enable_pf_vf_vports(esw, MLX5_VPORT_UC_ADDR_CHANGE);
++ 	/* Uplink vport rep must load first. */
++ 	err = esw_offloads_load_rep(esw, MLX5_VPORT_UPLINK);
+  	if (err)
+- 		goto err_vports;
++ 		goto err_uplink;
+  
+- 	err = esw_offloads_load_all_reps(esw);
++ 	err = mlx5_eswitch_enable_pf_vf_vports(esw, MLX5_VPORT_UC_ADDR_CHANGE);
+  	if (err)
+- 		goto err_reps;
++ 		goto err_vports;
+  
+  	esw_offloads_devcom_init(esw);
+ -	mutex_init(&esw->offloads.termtbl_mutex);
+  
+  	return 0;
+  
+- err_reps:
+- 	mlx5_eswitch_disable_pf_vf_vports(esw);
+  err_vports:
+++<<<<<<< HEAD
+++=======
++ 	esw_offloads_unload_rep(esw, MLX5_VPORT_UPLINK);
++ err_uplink:
++ 	esw_set_passing_vport_metadata(esw, false);
++ err_vport_metadata:
+++>>>>>>> c2d7712ca385 (net/mlx5: E-Switch, Introduce per vport configuration for eswitch modes)
+  	esw_offloads_steering_cleanup(esw);
+  err_steering_init:
+ +	esw_set_passing_vport_metadata(esw, false);
+ +err_vport_metadata:
+  	mlx5_rdma_disable_roce(esw->dev);
+ +	mutex_destroy(&esw->offloads.termtbl_mutex);
+  	return err;
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index e71c3e6ef4cd..98a1f8805699 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@ -1799,12 +1799,14 @@ static void esw_vport_cleanup(struct mlx5_eswitch *esw, struct mlx5_vport *vport
+ 	esw_vport_cleanup_acl(esw, vport);
+ }
+ 
+-static int esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
++static int esw_enable_vport(struct mlx5_eswitch *esw, u16 vport_num,
+ 			    enum mlx5_eswitch_vport_event enabled_events)
+ {
+-	u16 vport_num = vport->vport;
++	struct mlx5_vport *vport;
+ 	int ret;
+ 
++	vport = mlx5_eswitch_get_vport(esw, vport_num);
++
+ 	mutex_lock(&esw->state_lock);
+ 	WARN_ON(vport->enabled);
+ 
+@@ -1834,10 +1836,11 @@ static int esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
+ 	return ret;
+ }
+ 
+-static void esw_disable_vport(struct mlx5_eswitch *esw,
+-			      struct mlx5_vport *vport)
++static void esw_disable_vport(struct mlx5_eswitch *esw, u16 vport_num)
+ {
+-	u16 vport_num = vport->vport;
++	struct mlx5_vport *vport;
++
++	vport = mlx5_eswitch_get_vport(esw, vport_num);
+ 
+ 	mutex_lock(&esw->state_lock);
+ 	if (!vport->enabled)
+@@ -1943,6 +1946,32 @@ static void mlx5_eswitch_clear_vf_vports_info(struct mlx5_eswitch *esw)
+ /* Public E-Switch API */
+ #define ESW_ALLOWED(esw) ((esw) && MLX5_ESWITCH_MANAGER((esw)->dev))
+ 
++static int mlx5_eswitch_load_vport(struct mlx5_eswitch *esw, u16 vport_num,
++				   enum mlx5_eswitch_vport_event enabled_events)
++{
++	int err;
++
++	err = esw_enable_vport(esw, vport_num, enabled_events);
++	if (err)
++		return err;
++
++	err = esw_offloads_load_rep(esw, vport_num);
++	if (err)
++		goto err_rep;
++
++	return err;
++
++err_rep:
++	esw_disable_vport(esw, vport_num);
++	return err;
++}
++
++static void mlx5_eswitch_unload_vport(struct mlx5_eswitch *esw, u16 vport_num)
++{
++	esw_offloads_unload_rep(esw, vport_num);
++	esw_disable_vport(esw, vport_num);
++}
++
+ /* mlx5_eswitch_enable_pf_vf_vports() enables vports of PF, ECPF and VFs
+  * whichever are present on the eswitch.
+  */
+@@ -1950,28 +1979,25 @@ int
+ mlx5_eswitch_enable_pf_vf_vports(struct mlx5_eswitch *esw,
+ 				 enum mlx5_eswitch_vport_event enabled_events)
+ {
+-	struct mlx5_vport *vport;
+ 	int num_vfs;
+ 	int ret;
+ 	int i;
+ 
+ 	/* Enable PF vport */
+-	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_PF);
+-	ret = esw_enable_vport(esw, vport, enabled_events);
++	ret = mlx5_eswitch_load_vport(esw, MLX5_VPORT_PF, enabled_events);
+ 	if (ret)
+ 		return ret;
+ 
+ 	/* Enable ECPF vport */
+ 	if (mlx5_ecpf_vport_exists(esw->dev)) {
+-		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
+-		ret = esw_enable_vport(esw, vport, enabled_events);
++		ret = mlx5_eswitch_load_vport(esw, MLX5_VPORT_ECPF, enabled_events);
+ 		if (ret)
+ 			goto ecpf_err;
+ 	}
+ 
+ 	/* Enable VF vports */
+-	mlx5_esw_for_each_vf_vport(esw, i, vport, esw->esw_funcs.num_vfs) {
+-		ret = esw_enable_vport(esw, vport, enabled_events);
++	mlx5_esw_for_each_vf_vport_num(esw, i, esw->esw_funcs.num_vfs) {
++		ret = mlx5_eswitch_load_vport(esw, i, enabled_events);
+ 		if (ret)
+ 			goto vf_err;
+ 	}
+@@ -1979,17 +2005,14 @@ mlx5_eswitch_enable_pf_vf_vports(struct mlx5_eswitch *esw,
+ 
+ vf_err:
+ 	num_vfs = i - 1;
+-	mlx5_esw_for_each_vf_vport_reverse(esw, i, vport, num_vfs)
+-		esw_disable_vport(esw, vport);
++	mlx5_esw_for_each_vf_vport_num_reverse(esw, i, num_vfs)
++		mlx5_eswitch_unload_vport(esw, i);
+ 
+-	if (mlx5_ecpf_vport_exists(esw->dev)) {
+-		vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_ECPF);
+-		esw_disable_vport(esw, vport);
+-	}
++	if (mlx5_ecpf_vport_exists(esw->dev))
++		mlx5_eswitch_unload_vport(esw, MLX5_VPORT_ECPF);
+ 
+ ecpf_err:
+-	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_PF);
+-	esw_disable_vport(esw, vport);
++	mlx5_eswitch_unload_vport(esw, MLX5_VPORT_PF);
+ 	return ret;
+ }
+ 
+@@ -1998,11 +2021,15 @@ mlx5_eswitch_enable_pf_vf_vports(struct mlx5_eswitch *esw,
+  */
+ void mlx5_eswitch_disable_pf_vf_vports(struct mlx5_eswitch *esw)
+ {
+-	struct mlx5_vport *vport;
+ 	int i;
+ 
+-	mlx5_esw_for_all_vports_reverse(esw, i, vport)
+-		esw_disable_vport(esw, vport);
++	mlx5_esw_for_each_vf_vport_num_reverse(esw, i, esw->esw_funcs.num_vfs)
++		mlx5_eswitch_unload_vport(esw, i);
++
++	if (mlx5_ecpf_vport_exists(esw->dev))
++		mlx5_eswitch_unload_vport(esw, MLX5_VPORT_ECPF);
++
++	mlx5_eswitch_unload_vport(esw, MLX5_VPORT_PF);
+ }
+ 
+ static void mlx5_eswitch_get_devlink_param(struct mlx5_eswitch *esw)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 0750ccdd712d..36adb23a311c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -650,6 +650,9 @@ esw_add_restore_rule(struct mlx5_eswitch *esw, u32 tag);
+ u32
+ esw_get_max_restore_tag(struct mlx5_eswitch *esw);
+ 
++int esw_offloads_load_rep(struct mlx5_eswitch *esw, u16 vport_num);
++void esw_offloads_unload_rep(struct mlx5_eswitch *esw, u16 vport_num);
++
+ #else  /* CONFIG_MLX5_ESWITCH */
+ /* eswitch API stubs */
+ static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
