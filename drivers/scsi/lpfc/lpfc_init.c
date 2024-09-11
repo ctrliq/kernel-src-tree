@@ -10973,14 +10973,18 @@ found_any:
  * @cpu:    cpu going offline
  * @eqlist:
  */
-static void
+static int
 lpfc_cpuhp_get_eq(struct lpfc_hba *phba, unsigned int cpu,
 		  struct list_head *eqlist)
 {
 	const struct cpumask *maskp;
 	struct lpfc_queue *eq;
-	cpumask_t tmp;
+	struct cpumask *tmp;
 	u16 idx;
+
+	tmp = kzalloc(cpumask_size(), GFP_KERNEL);
+	if (!tmp)
+		return -ENOMEM;
 
 	for (idx = 0; idx < phba->cfg_irq_chann; idx++) {
 		maskp = pci_irq_get_affinity(phba->pcidev, idx);
@@ -10991,7 +10995,7 @@ lpfc_cpuhp_get_eq(struct lpfc_hba *phba, unsigned int cpu,
 		 * then we don't need to poll the eq attached
 		 * to it.
 		 */
-		if (!cpumask_and(&tmp, maskp, cpumask_of(cpu)))
+		if (!cpumask_and(tmp, maskp, cpumask_of(cpu)))
 			continue;
 		/* get the cpus that are online and are affini-
 		 * tized to this irq vector.  If the count is
@@ -10999,8 +11003,8 @@ lpfc_cpuhp_get_eq(struct lpfc_hba *phba, unsigned int cpu,
 		 * down this vector.  Since this cpu has not
 		 * gone offline yet, we need >1.
 		 */
-		cpumask_and(&tmp, maskp, cpu_online_mask);
-		if (cpumask_weight(&tmp) > 1)
+		cpumask_and(tmp, maskp, cpu_online_mask);
+		if (cpumask_weight(tmp) > 1)
 			continue;
 
 		/* Now that we have an irq to shutdown, get the eq
@@ -11011,6 +11015,8 @@ lpfc_cpuhp_get_eq(struct lpfc_hba *phba, unsigned int cpu,
 		eq = phba->sli4_hba.hba_eq_hdl[idx].eq;
 		list_add(&eq->_poll_list, eqlist);
 	}
+	kfree(tmp);
+	return 0;
 }
 
 static void __lpfc_cpuhp_remove(struct lpfc_hba *phba)
@@ -11181,7 +11187,9 @@ static int lpfc_cpu_offline(unsigned int cpu, struct hlist_node *node)
 
 	lpfc_irq_rebalance(phba, cpu, true);
 
-	lpfc_cpuhp_get_eq(phba, cpu, &eqlist);
+	retval = lpfc_cpuhp_get_eq(phba, cpu, &eqlist);
+	if (retval)
+		return retval;
 
 	/* start polling on these eq's */
 	list_for_each_entry_safe(eq, next, &eqlist, _poll_list) {
