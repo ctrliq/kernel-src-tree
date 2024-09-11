@@ -1,0 +1,570 @@
+net/smc: first part of add link processing as SMC client
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 336ba09f2ef71b82f07c1200be0ddf4eb923d69f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/336ba09f.failed
+
+First set of functions to process an ADD_LINK LLC request as an SMC
+client. Find an alternate IB device, determine the new link group type
+and get the index for the new link. Then ready the link, map the buffers
+and send an ADD_LINK LLC response. If any error occurs, send a reject
+LLC message and terminate the processing.
+Add smc_llc_alloc_alt_link() to find a free link index for a new link,
+depending on the new link group type.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 336ba09f2ef71b82f07c1200be0ddf4eb923d69f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_core.h
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_core.h
+index fd2bbf547caf,4e00819e2db7..000000000000
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@@ -336,6 -374,15 +336,18 @@@ void smc_lgr_schedule_free_work_fast(st
+  int smc_core_init(void);
+  void smc_core_exit(void);
+  
+++<<<<<<< HEAD
+++=======
++ int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
++ 		   u8 link_idx, struct smc_init_info *ini);
++ void smcr_link_clear(struct smc_link *lnk);
++ int smcr_buf_map_lgr(struct smc_link *lnk);
++ int smcr_buf_reg_lgr(struct smc_link *lnk);
++ int smcr_link_reg_rmb(struct smc_link *link, struct smc_buf_desc *rmb_desc);
++ void smcr_link_down_cond(struct smc_link *lnk);
++ void smcr_link_down_cond_sched(struct smc_link *lnk);
++ 
+++>>>>>>> 336ba09f2ef7 (net/smc: first part of add link processing as SMC client)
+  static inline struct smc_link_group *smc_get_lgr(struct smc_link *link)
+  {
+  	return link->lgr;
+diff --cc net/smc/smc_llc.c
+index 4119cdb6b6bf,8716d8739329..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -400,159 -542,381 +401,270 @@@ static int smc_llc_send_message(struct 
+  
+  /********************************* receive ***********************************/
+  
+++<<<<<<< HEAD
+ +static void smc_llc_rx_confirm_link(struct smc_link *link,
+ +				    struct smc_llc_msg_confirm_link *llc)
+++=======
++ static int smc_llc_alloc_alt_link(struct smc_link_group *lgr,
++ 				  enum smc_lgr_type lgr_new_t)
++ {
++ 	int i;
++ 
++ 	if (lgr->type == SMC_LGR_SYMMETRIC ||
++ 	    (lgr->type != SMC_LGR_SINGLE &&
++ 	     (lgr_new_t == SMC_LGR_ASYMMETRIC_LOCAL ||
++ 	      lgr_new_t == SMC_LGR_ASYMMETRIC_PEER)))
++ 		return -EMLINK;
++ 
++ 	if (lgr_new_t == SMC_LGR_ASYMMETRIC_LOCAL ||
++ 	    lgr_new_t == SMC_LGR_ASYMMETRIC_PEER) {
++ 		for (i = SMC_LINKS_PER_LGR_MAX - 1; i >= 0; i--)
++ 			if (lgr->lnk[i].state == SMC_LNK_UNUSED)
++ 				return i;
++ 	} else {
++ 		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++)
++ 			if (lgr->lnk[i].state == SMC_LNK_UNUSED)
++ 				return i;
++ 	}
++ 	return -EMLINK;
++ }
++ 
++ /* prepare and send an add link reject response */
++ static int smc_llc_cli_add_link_reject(struct smc_llc_qentry *qentry)
++ {
++ 	qentry->msg.raw.hdr.flags |= SMC_LLC_FLAG_RESP;
++ 	qentry->msg.raw.hdr.flags |= SMC_LLC_FLAG_ADD_LNK_REJ;
++ 	qentry->msg.raw.hdr.add_link_rej_rsn = SMC_LLC_REJ_RSN_NO_ALT_PATH;
++ 	return smc_llc_send_message(qentry->link, &qentry->msg);
++ }
++ 
++ static void smc_llc_save_add_link_info(struct smc_link *link,
++ 				       struct smc_llc_msg_add_link *add_llc)
++ {
++ 	link->peer_qpn = ntoh24(add_llc->sender_qp_num);
++ 	memcpy(link->peer_gid, add_llc->sender_gid, SMC_GID_SIZE);
++ 	memcpy(link->peer_mac, add_llc->sender_mac, ETH_ALEN);
++ 	link->peer_psn = ntoh24(add_llc->initial_psn);
++ 	link->peer_mtu = add_llc->qp_mtu;
++ }
++ 
++ /* as an SMC client, process an add link request */
++ int smc_llc_cli_add_link(struct smc_link *link, struct smc_llc_qentry *qentry)
++ {
++ 	struct smc_llc_msg_add_link *llc = &qentry->msg.add_link;
++ 	enum smc_lgr_type lgr_new_t = SMC_LGR_SYMMETRIC;
++ 	struct smc_link_group *lgr = smc_get_lgr(link);
++ 	struct smc_link *lnk_new = NULL;
++ 	struct smc_init_info ini;
++ 	int lnk_idx, rc = 0;
++ 
++ 	ini.vlan_id = lgr->vlan_id;
++ 	smc_pnet_find_alt_roce(lgr, &ini, link->smcibdev);
++ 	if (!memcmp(llc->sender_gid, link->peer_gid, SMC_GID_SIZE) &&
++ 	    !memcmp(llc->sender_mac, link->peer_mac, ETH_ALEN)) {
++ 		if (!ini.ib_dev)
++ 			goto out_reject;
++ 		lgr_new_t = SMC_LGR_ASYMMETRIC_PEER;
++ 	}
++ 	if (!ini.ib_dev) {
++ 		lgr_new_t = SMC_LGR_ASYMMETRIC_LOCAL;
++ 		ini.ib_dev = link->smcibdev;
++ 		ini.ib_port = link->ibport;
++ 	}
++ 	lnk_idx = smc_llc_alloc_alt_link(lgr, lgr_new_t);
++ 	if (lnk_idx < 0)
++ 		goto out_reject;
++ 	lnk_new = &lgr->lnk[lnk_idx];
++ 	rc = smcr_link_init(lgr, lnk_new, lnk_idx, &ini);
++ 	if (rc)
++ 		goto out_reject;
++ 	smc_llc_save_add_link_info(lnk_new, llc);
++ 	lnk_new->link_id = llc->link_num;
++ 
++ 	rc = smc_ib_ready_link(lnk_new);
++ 	if (rc)
++ 		goto out_clear_lnk;
++ 
++ 	rc = smcr_buf_map_lgr(lnk_new);
++ 	if (rc)
++ 		goto out_clear_lnk;
++ 
++ 	rc = smc_llc_send_add_link(link,
++ 				   lnk_new->smcibdev->mac[ini.ib_port - 1],
++ 				   lnk_new->gid, lnk_new, SMC_LLC_RESP);
++ 	if (rc)
++ 		goto out_clear_lnk;
++ 	/* tbd: rc = smc_llc_cli_rkey_exchange(link, lnk_new); */
++ 	if (rc) {
++ 		rc = 0;
++ 		goto out_clear_lnk;
++ 	}
++ 	/* tbd: rc = smc_llc_cli_conf_link(link, &ini, lnk_new, lgr_new_t); */
++ 	if (!rc)
++ 		goto out;
++ out_clear_lnk:
++ 	smcr_link_clear(lnk_new);
++ out_reject:
++ 	smc_llc_cli_add_link_reject(qentry);
++ out:
++ 	kfree(qentry);
++ 	return rc;
++ }
++ 
++ /* worker to process an add link message */
++ static void smc_llc_add_link_work(struct work_struct *work)
+ -{
+ -	struct smc_link_group *lgr = container_of(work, struct smc_link_group,
+ -						  llc_add_link_work);
+ -
+ -	if (list_empty(&lgr->list)) {
+ -		/* link group is terminating */
+ -		smc_llc_flow_qentry_del(&lgr->llc_flow_lcl);
+ -		goto out;
+ -	}
+ -
+ -	/* tbd: call smc_llc_process_cli_add_link(lgr); */
+ -	/* tbd: call smc_llc_process_srv_add_link(lgr); */
+ -out:
+ -	smc_llc_flow_stop(lgr, &lgr->llc_flow_lcl);
+ -}
+ -
+ -static void smc_llc_rx_delete_link(struct smc_link *link,
+ -				   struct smc_llc_msg_del_link *llc)
+++>>>>>>> 336ba09f2ef7 (net/smc: first part of add link processing as SMC client)
+  {
+  	struct smc_link_group *lgr = smc_get_lgr(link);
+ +	int conf_rc;
+ +
+ +	/* RMBE eyecatchers are not supported */
+ +	if (llc->hd.flags & SMC_LLC_FLAG_NO_RMBE_EYEC)
+ +		conf_rc = 0;
+ +	else
+ +		conf_rc = ENOTSUPP;
+  
+ -	smc_lgr_forget(lgr);
+ -	if (lgr->role == SMC_SERV) {
+ -		/* client asks to delete this link, send request */
+ -		smc_llc_send_delete_link(link, 0, SMC_LLC_REQ, true,
+ -					 SMC_LLC_DEL_PROG_INIT_TERM);
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (lgr->role == SMC_SERV &&
+ +		    link->state == SMC_LNK_ACTIVATING) {
+ +			link->llc_confirm_resp_rc = conf_rc;
+ +			complete(&link->llc_confirm_resp);
+ +		}
+  	} else {
+ -		/* server requests to delete this link, send response */
+ -		smc_llc_send_delete_link(link, 0, SMC_LLC_RESP, true,
+ -					 SMC_LLC_DEL_PROG_INIT_TERM);
+ +		if (lgr->role == SMC_CLNT &&
+ +		    link->state == SMC_LNK_ACTIVATING) {
+ +			link->llc_confirm_rc = conf_rc;
+ +			link->link_id = llc->link_num;
+ +			complete(&link->llc_confirm);
+ +		}
+  	}
+ -	smcr_link_down_cond(link);
+  }
+  
+ -/* process a confirm_rkey request from peer, remote flow */
+ -static void smc_llc_rmt_conf_rkey(struct smc_link_group *lgr)
+ +static void smc_llc_rx_add_link(struct smc_link *link,
+ +				struct smc_llc_msg_add_link *llc)
+  {
+ -	struct smc_llc_msg_confirm_rkey *llc;
+ -	struct smc_llc_qentry *qentry;
+ -	struct smc_link *link;
+ -	int num_entries;
+ -	int rk_idx;
+ -	int i;
+ -
+ -	qentry = lgr->llc_flow_rmt.qentry;
+ -	llc = &qentry->msg.confirm_rkey;
+ -	link = qentry->link;
+ -
+ -	num_entries = llc->rtoken[0].num_rkeys;
+ -	/* first rkey entry is for receiving link */
+ -	rk_idx = smc_rtoken_add(link,
+ -				llc->rtoken[0].rmb_vaddr,
+ -				llc->rtoken[0].rmb_key);
+ -	if (rk_idx < 0)
+ -		goto out_err;
+ -
+ -	for (i = 1; i <= min_t(u8, num_entries, SMC_LLC_RKEYS_PER_MSG - 1); i++)
+ -		smc_rtoken_set2(lgr, rk_idx, llc->rtoken[i].link_id,
+ -				llc->rtoken[i].rmb_vaddr,
+ -				llc->rtoken[i].rmb_key);
+ -	/* max links is 3 so there is no need to support conf_rkey_cont msgs */
+ -	goto out;
+ -out_err:
+ -	llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
+ -	llc->hd.flags |= SMC_LLC_FLAG_RKEY_RETRY;
+ -out:
+ -	llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ -	smc_llc_send_message(link, &qentry->msg);
+ -	smc_llc_flow_qentry_del(&lgr->llc_flow_rmt);
+ -}
+ +	struct smc_link_group *lgr = smc_get_lgr(link);
+  
+ -/* process a delete_rkey request from peer, remote flow */
+ -static void smc_llc_rmt_delete_rkey(struct smc_link_group *lgr)
+ -{
+ -	struct smc_llc_msg_delete_rkey *llc;
+ -	struct smc_llc_qentry *qentry;
+ -	struct smc_link *link;
+ -	u8 err_mask = 0;
+ -	int i, max;
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (link->state == SMC_LNK_ACTIVATING)
+ +			complete(&link->llc_add_resp);
+ +	} else {
+ +		if (link->state == SMC_LNK_ACTIVATING) {
+ +			complete(&link->llc_add);
+ +			return;
+ +		}
+  
+ -	qentry = lgr->llc_flow_rmt.qentry;
+ -	llc = &qentry->msg.delete_rkey;
+ -	link = qentry->link;
+ +		if (lgr->role == SMC_SERV) {
+ +			smc_llc_prep_add_link(llc, link,
+ +					link->smcibdev->mac[link->ibport - 1],
+ +					link->gid, SMC_LLC_REQ);
+  
+ -	max = min_t(u8, llc->num_rkeys, SMC_LLC_DEL_RKEY_MAX);
+ -	for (i = 0; i < max; i++) {
+ -		if (smc_rtoken_delete(link, llc->rkey[i]))
+ -			err_mask |= 1 << (SMC_LLC_DEL_RKEY_MAX - 1 - i);
+ -	}
+ -	if (err_mask) {
+ -		llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
+ -		llc->err_mask = err_mask;
+ +		} else {
+ +			smc_llc_prep_add_link(llc, link,
+ +					link->smcibdev->mac[link->ibport - 1],
+ +					link->gid, SMC_LLC_RESP);
+ +		}
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+  	}
+ -	llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ -	smc_llc_send_message(link, &qentry->msg);
+ -	smc_llc_flow_qentry_del(&lgr->llc_flow_rmt);
+  }
+  
+ -/* flush the llc event queue */
+ -static void smc_llc_event_flush(struct smc_link_group *lgr)
+ +static void smc_llc_rx_delete_link(struct smc_link *link,
+ +				   struct smc_llc_msg_del_link *llc)
+  {
+ -	struct smc_llc_qentry *qentry, *q;
+ +	struct smc_link_group *lgr = smc_get_lgr(link);
+  
+ -	spin_lock_bh(&lgr->llc_event_q_lock);
+ -	list_for_each_entry_safe(qentry, q, &lgr->llc_event_q, list) {
+ -		list_del_init(&qentry->list);
+ -		kfree(qentry);
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (lgr->role == SMC_SERV)
+ +			smc_lgr_schedule_free_work_fast(lgr);
+ +	} else {
+ +		smc_lgr_forget(lgr);
+ +		smc_llc_link_deleting(link);
+ +		if (lgr->role == SMC_SERV) {
+ +			/* client asks to delete this link, send request */
+ +			smc_llc_prep_delete_link(llc, link, SMC_LLC_REQ, true);
+ +		} else {
+ +			/* server requests to delete this link, send response */
+ +			smc_llc_prep_delete_link(llc, link, SMC_LLC_RESP, true);
+ +		}
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+ +		smc_lgr_terminate_sched(lgr);
+  	}
+ -	spin_unlock_bh(&lgr->llc_event_q_lock);
+  }
+  
+ -static void smc_llc_event_handler(struct smc_llc_qentry *qentry)
+ +static void smc_llc_rx_test_link(struct smc_link *link,
+ +				 struct smc_llc_msg_test_link *llc)
+  {
+ -	union smc_llc_msg *llc = &qentry->msg;
+ -	struct smc_link *link = qentry->link;
+ -	struct smc_link_group *lgr = link->lgr;
+ -
+ -	if (!smc_link_usable(link))
+ -		goto out;
+ -
+ -	switch (llc->raw.hdr.common.type) {
+ -	case SMC_LLC_TEST_LINK:
+ -		llc->test_link.hd.flags |= SMC_LLC_FLAG_RESP;
+ -		smc_llc_send_message(link, llc);
+ -		break;
+ -	case SMC_LLC_ADD_LINK:
+ -		if (list_empty(&lgr->list))
+ -			goto out;	/* lgr is terminating */
+ -		if (lgr->role == SMC_CLNT) {
+ -			if (lgr->llc_flow_lcl.type == SMC_LLC_FLOW_ADD_LINK) {
+ -				/* a flow is waiting for this message */
+ -				smc_llc_flow_qentry_set(&lgr->llc_flow_lcl,
+ -							qentry);
+ -				wake_up_interruptible(&lgr->llc_waiter);
+ -			} else if (smc_llc_flow_start(&lgr->llc_flow_lcl,
+ -						      qentry)) {
+ -				schedule_work(&lgr->llc_add_link_work);
+ -			}
+ -		} else if (smc_llc_flow_start(&lgr->llc_flow_lcl, qentry)) {
+ -			/* as smc server, handle client suggestion */
+ -			schedule_work(&lgr->llc_add_link_work);
+ -		}
+ -		return;
+ -	case SMC_LLC_CONFIRM_LINK:
+ -		if (lgr->llc_flow_lcl.type != SMC_LLC_FLOW_NONE) {
+ -			/* a flow is waiting for this message */
+ -			smc_llc_flow_qentry_set(&lgr->llc_flow_lcl, qentry);
+ -			wake_up_interruptible(&lgr->llc_waiter);
+ -			return;
+ -		}
+ -		break;
+ -	case SMC_LLC_DELETE_LINK:
+ -		smc_llc_rx_delete_link(link, &llc->delete_link);
+ -		break;
+ -	case SMC_LLC_CONFIRM_RKEY:
+ -		/* new request from remote, assign to remote flow */
+ -		if (smc_llc_flow_start(&lgr->llc_flow_rmt, qentry)) {
+ -			/* process here, does not wait for more llc msgs */
+ -			smc_llc_rmt_conf_rkey(lgr);
+ -			smc_llc_flow_stop(lgr, &lgr->llc_flow_rmt);
+ -		}
+ -		return;
+ -	case SMC_LLC_CONFIRM_RKEY_CONT:
+ -		/* not used because max links is 3, and 3 rkeys fit into
+ -		 * one CONFIRM_RKEY message
+ -		 */
+ -		break;
+ -	case SMC_LLC_DELETE_RKEY:
+ -		/* new request from remote, assign to remote flow */
+ -		if (smc_llc_flow_start(&lgr->llc_flow_rmt, qentry)) {
+ -			/* process here, does not wait for more llc msgs */
+ -			smc_llc_rmt_delete_rkey(lgr);
+ -			smc_llc_flow_stop(lgr, &lgr->llc_flow_rmt);
+ -		}
+ -		return;
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (link->state == SMC_LNK_ACTIVE)
+ +			complete(&link->llc_testlink_resp);
+ +	} else {
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+  	}
+ -out:
+ -	kfree(qentry);
+  }
+  
+ -/* worker to process llc messages on the event queue */
+ -static void smc_llc_event_work(struct work_struct *work)
+ +static void smc_llc_rx_confirm_rkey(struct smc_link *link,
+ +				    struct smc_llc_msg_confirm_rkey *llc)
+  {
+ -	struct smc_link_group *lgr = container_of(work, struct smc_link_group,
+ -						  llc_event_work);
+ -	struct smc_llc_qentry *qentry;
+ +	int rc;
+  
+ -	if (!lgr->llc_flow_lcl.type && lgr->delayed_event) {
+ -		if (smc_link_usable(lgr->delayed_event->link)) {
+ -			smc_llc_event_handler(lgr->delayed_event);
+ -		} else {
+ -			qentry = lgr->delayed_event;
+ -			lgr->delayed_event = NULL;
+ -			kfree(qentry);
+ -		}
+ -	}
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		link->llc_confirm_rkey_rc = llc->hd.flags &
+ +					    SMC_LLC_FLAG_RKEY_NEG;
+ +		complete(&link->llc_confirm_rkey);
+ +	} else {
+ +		rc = smc_rtoken_add(link,
+ +				    llc->rtoken[0].rmb_vaddr,
+ +				    llc->rtoken[0].rmb_key);
+  
+ -again:
+ -	spin_lock_bh(&lgr->llc_event_q_lock);
+ -	if (!list_empty(&lgr->llc_event_q)) {
+ -		qentry = list_first_entry(&lgr->llc_event_q,
+ -					  struct smc_llc_qentry, list);
+ -		list_del_init(&qentry->list);
+ -		spin_unlock_bh(&lgr->llc_event_q_lock);
+ -		smc_llc_event_handler(qentry);
+ -		goto again;
+ +		/* ignore rtokens for other links, we have only one link */
+ +
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		if (rc < 0)
+ +			llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+  	}
+ -	spin_unlock_bh(&lgr->llc_event_q_lock);
+  }
+  
+ -/* process llc responses in tasklet context */
+ -static void smc_llc_rx_response(struct smc_link *link,
+ -				struct smc_llc_qentry *qentry)
+ +static void smc_llc_rx_confirm_rkey_cont(struct smc_link *link,
+ +				      struct smc_llc_msg_confirm_rkey_cont *llc)
+  {
+ -	u8 llc_type = qentry->msg.raw.hdr.common.type;
+ -
+ -	switch (llc_type) {
+ -	case SMC_LLC_TEST_LINK:
+ -		if (link->state == SMC_LNK_ACTIVE)
+ -			complete(&link->llc_testlink_resp);
+ -		break;
+ -	case SMC_LLC_ADD_LINK:
+ -	case SMC_LLC_CONFIRM_LINK:
+ -	case SMC_LLC_CONFIRM_RKEY:
+ -	case SMC_LLC_DELETE_RKEY:
+ -		/* assign responses to the local flow, we requested them */
+ -		smc_llc_flow_qentry_set(&link->lgr->llc_flow_lcl, qentry);
+ -		wake_up_interruptible(&link->lgr->llc_waiter);
+ -		return;
+ -	case SMC_LLC_DELETE_LINK:
+ -		if (link->lgr->role == SMC_SERV)
+ -			smc_lgr_schedule_free_work_fast(link->lgr);
+ -		break;
+ -	case SMC_LLC_CONFIRM_RKEY_CONT:
+ -		/* not used because max links is 3 */
+ -		break;
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		/* unused as long as we don't send this type of msg */
+ +	} else {
+ +		/* ignore rtokens for other links, we have only one link */
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+  	}
+ -	kfree(qentry);
+  }
+  
+ -static void smc_llc_enqueue(struct smc_link *link, union smc_llc_msg *llc)
+ +static void smc_llc_rx_delete_rkey(struct smc_link *link,
+ +				   struct smc_llc_msg_delete_rkey *llc)
+  {
+ -	struct smc_link_group *lgr = link->lgr;
+ -	struct smc_llc_qentry *qentry;
+ -	unsigned long flags;
+ +	u8 err_mask = 0;
+ +	int i, max;
+  
+ -	qentry = kmalloc(sizeof(*qentry), GFP_ATOMIC);
+ -	if (!qentry)
+ -		return;
+ -	qentry->link = link;
+ -	INIT_LIST_HEAD(&qentry->list);
+ -	memcpy(&qentry->msg, llc, sizeof(union smc_llc_msg));
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		link->llc_delete_rkey_rc = llc->hd.flags &
+ +					    SMC_LLC_FLAG_RKEY_NEG;
+ +		complete(&link->llc_delete_rkey);
+ +	} else {
+ +		max = min_t(u8, llc->num_rkeys, SMC_LLC_DEL_RKEY_MAX);
+ +		for (i = 0; i < max; i++) {
+ +			if (smc_rtoken_delete(link, llc->rkey[i]))
+ +				err_mask |= 1 << (SMC_LLC_DEL_RKEY_MAX - 1 - i);
+ +		}
+  
+ -	/* process responses immediately */
+ -	if (llc->raw.hdr.flags & SMC_LLC_FLAG_RESP) {
+ -		smc_llc_rx_response(link, qentry);
+ -		return;
+ -	}
+ +		if (err_mask) {
+ +			llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
+ +			llc->err_mask = err_mask;
+ +		}
+  
+ -	/* add requests to event queue */
+ -	spin_lock_irqsave(&lgr->llc_event_q_lock, flags);
+ -	list_add_tail(&qentry->list, &lgr->llc_event_q);
+ -	spin_unlock_irqrestore(&lgr->llc_event_q_lock, flags);
+ -	schedule_work(&link->lgr->llc_event_work);
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+ +	}
+  }
+  
+ -/* copy received msg and add it to the event queue */
+  static void smc_llc_rx_handler(struct ib_wc *wc, void *buf)
+  {
+  	struct smc_link *link = (struct smc_link *)wc->qp->qp_context;
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index cf74dd642f9a..b3abf892cf9d 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -302,8 +302,8 @@ static u8 smcr_next_link_id(struct smc_link_group *lgr)
+ 	return link_id;
+ }
+ 
+-static int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
+-			  u8 link_idx, struct smc_init_info *ini)
++int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
++		   u8 link_idx, struct smc_init_info *ini)
+ {
+ 	u8 rndvec[3];
+ 	int rc;
+* Unmerged path net/smc/smc_core.h
+* Unmerged path net/smc/smc_llc.c
