@@ -1,0 +1,195 @@
+dm: consolidate spinlocks in dm_io struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@kernel.org>
+commit 4d7bca13dd9a5033174b0735056c5658cb893e76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4d7bca13.failed
+
+No reason to have separate startio_lock and endio_lock given endio_lock
+could be used during submission anyway.
+
+This change leaves the dm_io struct weighing in at 256 bytes (down
+from 272 bytes, so saves a cacheline).
+
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 4d7bca13dd9a5033174b0735056c5658cb893e76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-core.h
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-core.h
+index a9c78c74b3c7,2c49aa6501b0..000000000000
+--- a/drivers/md/dm-core.h
++++ b/drivers/md/dm-core.h
+@@@ -217,8 -250,11 +217,15 @@@ struct dm_io 
+  	struct mapped_device *md;
+  	struct bio *orig_bio;
+  	blk_status_t status;
++ 	spinlock_t lock;
+  	unsigned long start_time;
+++<<<<<<< HEAD
+ +	spinlock_t endio_lock;
+++=======
++ 	void *data;
++ 	struct hlist_node node;
++ 	struct task_struct *map_task;
+++>>>>>>> 4d7bca13dd9a (dm: consolidate spinlocks in dm_io struct)
+  	struct dm_stats_aux stats_aux;
+  	/* last member of dm_target_io is 'struct bio' */
+  	struct dm_target_io tio;
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,b762a48d3fdf..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -584,15 -526,41 +584,46 @@@ static void dm_io_acct(bool end, struc
+  		bio->bi_iter.bi_size = bi_size;
+  }
+  
+ -static void __dm_start_io_acct(struct dm_io *io, struct bio *bio)
+ +static void start_io_acct(struct dm_io *io)
+  {
+ -	dm_io_acct(false, io->md, bio, io->start_time, &io->stats_aux);
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ 	/* Must account IO to DM device in terms of orig_bio */
++ 	struct bio *bio = io->orig_bio;
++ 
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 * Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO.
++ 	 */
++ 	if (!clone ||
++ 	    likely(!dm_tio_flagged(clone_to_tio(clone), DM_TIO_IS_DUPLICATE_BIO))) {
++ 		if (WARN_ON_ONCE(dm_io_flagged(io, DM_IO_ACCOUNTED)))
++ 			return;
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 	} else {
++ 		unsigned long flags;
++ 		if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 			return;
++ 		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
++ 		spin_lock_irqsave(&io->lock, flags);
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 		spin_unlock_irqrestore(&io->lock, flags);
++ 	}
++ 
++ 	__dm_start_io_acct(io, bio);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io, struct bio *bio)
++ {
++ 	dm_io_acct(true, io->md, bio, io->start_time, &io->stats_aux);
+++>>>>>>> 4d7bca13dd9a (dm: consolidate spinlocks in dm_io struct)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+@@@ -614,11 -581,12 +645,16 @@@
+  	io->status = 0;
+  	atomic_set(&io->io_count, 1);
+  	this_cpu_inc(*md->pending_io);
+ -	io->orig_bio = NULL;
+ +	io->orig_bio = bio;
+  	io->md = md;
+++<<<<<<< HEAD
+ +	spin_lock_init(&io->endio_lock);
+ +
+++=======
++ 	io->map_task = current;
++ 	spin_lock_init(&io->lock);
+++>>>>>>> 4d7bca13dd9a (dm: consolidate spinlocks in dm_io struct)
+  	io->start_time = jiffies;
+ -	io->flags = 0;
+  
+  	dm_stats_record_start(&md->stats, &io->stats_aux);
+  
+@@@ -872,66 -929,18 +908,73 @@@ static int __noflush_suspending(struct 
+   */
+  void dm_io_dec_pending(struct dm_io *io, blk_status_t error)
+  {
+ +	unsigned long flags;
+ +	blk_status_t io_error;
+ +	struct bio *bio;
+ +	struct mapped_device *md = io->md;
+ +	unsigned long start_time = 0;
+ +	struct dm_stats_aux stats_aux;
+ +
+  	/* Push-back supersedes any I/O errors */
+  	if (unlikely(error)) {
+++<<<<<<< HEAD
+ +		spin_lock_irqsave(&io->endio_lock, flags);
+ +		if (!(io->status == BLK_STS_DM_REQUEUE && __noflush_suspending(md)))
+++=======
++ 		unsigned long flags;
++ 		spin_lock_irqsave(&io->lock, flags);
++ 		if (!(io->status == BLK_STS_DM_REQUEUE &&
++ 		      __noflush_suspending(io->md)))
+++>>>>>>> 4d7bca13dd9a (dm: consolidate spinlocks in dm_io struct)
+  			io->status = error;
+- 		spin_unlock_irqrestore(&io->endio_lock, flags);
++ 		spin_unlock_irqrestore(&io->lock, flags);
+  	}
+  
+ -	if (atomic_dec_and_test(&io->io_count))
+ -		dm_io_complete(io);
+ +	if (atomic_dec_and_test(&io->io_count)) {
+ +		if (io->status == BLK_STS_DM_REQUEUE) {
+ +			/*
+ +			 * Target requested pushing back the I/O.
+ +			 */
+ +			spin_lock_irqsave(&md->deferred_lock, flags);
+ +			if (__noflush_suspending(md))
+ +				/* NOTE early return due to BLK_STS_DM_REQUEUE below */
+ +				bio_list_add_head(&md->deferred, io->orig_bio);
+ +			else
+ +				/* noflush suspend was interrupted. */
+ +				io->status = BLK_STS_IOERR;
+ +			spin_unlock_irqrestore(&md->deferred_lock, flags);
+ +		}
+ +
+ +		io_error = io->status;
+ +		bio = io->orig_bio;
+ +		start_time = io->start_time;
+ +		stats_aux = io->stats_aux;
+ +		free_io(md, io);
+ +		end_io_acct(md, bio, start_time, &stats_aux);
+ +		smp_wmb();
+ +		this_cpu_dec(*md->pending_io);
+ +
+ +		/* nudge anyone waiting on suspend queue */
+ +		if (unlikely(wq_has_sleeper(&md->wait)))
+ +			wake_up(&md->wait);
+ +
+ +		if (io_error == BLK_STS_DM_REQUEUE)
+ +			return;
+ +
+ +		if (bio_is_flush_with_data(bio)) {
+ +			/*
+ +			 * Preflush done for flush with data, reissue
+ +			 * without REQ_PREFLUSH.
+ +			 */
+ +			bio->bi_opf &= ~REQ_PREFLUSH;
+ +			queue_io(md, bio);
+ +		} else {
+ +			/* done with normal IO or empty flush */
+ +			if (io_error)
+ +				bio->bi_status = io_error;
+ +			bio_endio(bio);
+ +		}
+ +	}
+  }
+  
+  void disable_discard(struct mapped_device *md)
+* Unmerged path drivers/md/dm-core.h
+* Unmerged path drivers/md/dm.c
