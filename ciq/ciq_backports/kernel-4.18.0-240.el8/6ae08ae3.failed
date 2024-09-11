@@ -1,0 +1,381 @@
+bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 6ae08ae3dea2cfa03dd3665a3c8475c2d429ef47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6ae08ae3.failed
+
+The current bpf_probe_read() and bpf_probe_read_str() helpers are broken
+in that they assume they can be used for probing memory access for kernel
+space addresses /as well as/ user space addresses.
+
+However, plain use of probe_kernel_read() for both cases will attempt to
+always access kernel space address space given access is performed under
+KERNEL_DS and some archs in-fact have overlapping address spaces where a
+kernel pointer and user pointer would have the /same/ address value and
+therefore accessing application memory via bpf_probe_read{,_str}() would
+read garbage values.
+
+Lets fix BPF side by making use of recently added 3d7081822f7f ("uaccess:
+Add non-pagefault user-space read functions"). Unfortunately, the only way
+to fix this status quo is to add dedicated bpf_probe_read_{user,kernel}()
+and bpf_probe_read_{user,kernel}_str() helpers. The bpf_probe_read{,_str}()
+helpers are kept as-is to retain their current behavior.
+
+The two *_user() variants attempt the access always under USER_DS set, the
+two *_kernel() variants will -EFAULT when accessing user memory if the
+underlying architecture has non-overlapping address ranges, also avoiding
+throwing the kernel warning via 00c42373d397 ("x86-64: add warning for
+non-canonical user access address dereferences").
+
+Fixes: a5e8c07059d0 ("bpf: add bpf_probe_read_str helper")
+Fixes: 2541517c32be ("tracing, perf: Implement BPF programs attached to kprobes")
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/796ee46e948bc808d54891a1108435f8652c6ca4.1572649915.git.daniel@iogearbox.net
+(cherry picked from commit 6ae08ae3dea2cfa03dd3665a3c8475c2d429ef47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	kernel/trace/bpf_trace.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index f26f93a554f1,df6809a76404..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2759,6 -2725,96 +2731,99 @@@ union bpf_attr 
+   *		**-EOPNOTSUPP** kernel configuration does not enable SYN cookies
+   *
+   *		**-EPROTONOSUPPORT** IP packet version is not 4 or 6
+++<<<<<<< HEAD
+++=======
++  *
++  * int bpf_skb_output(void *ctx, struct bpf_map *map, u64 flags, void *data, u64 size)
++  * 	Description
++  * 		Write raw *data* blob into a special BPF perf event held by
++  * 		*map* of type **BPF_MAP_TYPE_PERF_EVENT_ARRAY**. This perf
++  * 		event must have the following attributes: **PERF_SAMPLE_RAW**
++  * 		as **sample_type**, **PERF_TYPE_SOFTWARE** as **type**, and
++  * 		**PERF_COUNT_SW_BPF_OUTPUT** as **config**.
++  *
++  * 		The *flags* are used to indicate the index in *map* for which
++  * 		the value must be put, masked with **BPF_F_INDEX_MASK**.
++  * 		Alternatively, *flags* can be set to **BPF_F_CURRENT_CPU**
++  * 		to indicate that the index of the current CPU core should be
++  * 		used.
++  *
++  * 		The value to write, of *size*, is passed through eBPF stack and
++  * 		pointed by *data*.
++  *
++  * 		*ctx* is a pointer to in-kernel struct sk_buff.
++  *
++  * 		This helper is similar to **bpf_perf_event_output**\ () but
++  * 		restricted to raw_tracepoint bpf programs.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_user(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Safely attempt to read *size* bytes from user space address
++  * 		*unsafe_ptr* and store the data in *dst*.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_kernel(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Safely attempt to read *size* bytes from kernel space address
++  * 		*unsafe_ptr* and store the data in *dst*.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_user_str(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Copy a NUL terminated string from an unsafe user address
++  * 		*unsafe_ptr* to *dst*. The *size* should include the
++  * 		terminating NUL byte. In case the string length is smaller than
++  * 		*size*, the target is not padded with further NUL bytes. If the
++  * 		string length is larger than *size*, just *size*-1 bytes are
++  * 		copied and the last byte is set to NUL.
++  *
++  * 		On success, the length of the copied string is returned. This
++  * 		makes this helper useful in tracing programs for reading
++  * 		strings, and more importantly to get its length at runtime. See
++  * 		the following snippet:
++  *
++  * 		::
++  *
++  * 			SEC("kprobe/sys_open")
++  * 			void bpf_sys_open(struct pt_regs *ctx)
++  * 			{
++  * 			        char buf[PATHLEN]; // PATHLEN is defined to 256
++  * 			        int res = bpf_probe_read_user_str(buf, sizeof(buf),
++  * 				                                  ctx->di);
++  *
++  * 				// Consume buf, for example push it to
++  * 				// userspace via bpf_perf_event_output(); we
++  * 				// can use res (the string length) as event
++  * 				// size, after checking its boundaries.
++  * 			}
++  *
++  * 		In comparison, using **bpf_probe_read_user()** helper here
++  * 		instead to read the string would require to estimate the length
++  * 		at compile time, and would often result in copying more memory
++  * 		than necessary.
++  *
++  * 		Another useful use case is when parsing individual process
++  * 		arguments or individual environment variables navigating
++  * 		*current*\ **->mm->arg_start** and *current*\
++  * 		**->mm->env_start**: using this helper and the return value,
++  * 		one can quickly iterate at the right offset of the memory area.
++  * 	Return
++  * 		On success, the strictly positive length of the string,
++  * 		including the trailing NUL character. On error, a negative
++  * 		value.
++  *
++  * int bpf_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Copy a NUL terminated string from an unsafe kernel address *unsafe_ptr*
++  * 		to *dst*. Same semantics as with bpf_probe_read_user_str() apply.
++  * 	Return
++  * 		On success, the strictly positive length of the string,	including
++  * 		the trailing NUL character. On error, a negative value.
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2871,7 -2927,12 +2936,16 @@@
+  	FN(sk_storage_get),		\
+  	FN(sk_storage_delete),		\
+  	FN(send_signal),		\
+++<<<<<<< HEAD
+ +	FN(tcp_gen_syncookie),
+++=======
++ 	FN(tcp_gen_syncookie),		\
++ 	FN(skb_output),			\
++ 	FN(probe_read_user),		\
++ 	FN(probe_read_kernel),		\
++ 	FN(probe_read_user_str),	\
++ 	FN(probe_read_kernel_str),
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --cc kernel/trace/bpf_trace.c
+index 733ad177b69f,ffc91d4935ac..000000000000
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@@ -141,11 -138,11 +141,15 @@@ static const struct bpf_func_proto bpf_
+  };
+  #endif
+  
+- BPF_CALL_3(bpf_probe_read, void *, dst, u32, size, const void *, unsafe_ptr)
++ BPF_CALL_3(bpf_probe_read_user, void *, dst, u32, size,
++ 	   const void __user *, unsafe_ptr)
+  {
+- 	int ret;
++ 	int ret = probe_user_read(dst, unsafe_ptr, size);
+  
+++<<<<<<< HEAD
+ +	ret = probe_kernel_read(dst, unsafe_ptr, size);
+++=======
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+  	if (unlikely(ret < 0))
+  		memset(dst, 0, size);
+  
+@@@ -581,36 -699,6 +706,39 @@@ static const struct bpf_func_proto bpf_
+  	.arg2_type      = ARG_ANYTHING,
+  };
+  
+++<<<<<<< HEAD
+ +BPF_CALL_3(bpf_probe_read_str, void *, dst, u32, size,
+ +	   const void *, unsafe_ptr)
+ +{
+ +	int ret;
+ +
+ +	/*
+ +	 * The strncpy_from_unsafe() call will likely not fill the entire
+ +	 * buffer, but that's okay in this circumstance as we're probing
+ +	 * arbitrary memory anyway similar to bpf_probe_read() and might
+ +	 * as well probe the stack. Thus, memory is explicitly cleared
+ +	 * only in error case, so that improper users ignoring return
+ +	 * code altogether don't copy garbage; otherwise length of string
+ +	 * is returned that can be used for bpf_perf_event_output() et al.
+ +	 */
+ +	ret = strncpy_from_unsafe(dst, unsafe_ptr, size);
+ +	if (unlikely(ret < 0))
+ +		memset(dst, 0, size);
+ +
+ +	return ret;
+ +}
+ +
+ +static const struct bpf_func_proto bpf_probe_read_str_proto = {
+ +	.func		= bpf_probe_read_str,
+ +	.gpl_only	= true,
+ +	.ret_type	= RET_INTEGER,
+ +	.arg1_type	= ARG_PTR_TO_UNINIT_MEM,
+ +	.arg2_type	= ARG_CONST_SIZE_OR_ZERO,
+ +	.arg3_type	= ARG_ANYTHING,
+ +};
+ +
+++=======
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+  struct send_signal_irq_work {
+  	struct irq_work irq_work;
+  	struct task_struct *task;
+diff --cc tools/include/uapi/linux/bpf.h
+index 4c50a38c7288,df6809a76404..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -2720,6 -2698,123 +2692,126 @@@ union bpf_attr 
+   *		**-EPERM** if no permission to send the *sig*.
+   *
+   *		**-EAGAIN** if bpf program can try again.
+++<<<<<<< HEAD
+++=======
++  *
++  * s64 bpf_tcp_gen_syncookie(struct bpf_sock *sk, void *iph, u32 iph_len, struct tcphdr *th, u32 th_len)
++  *	Description
++  *		Try to issue a SYN cookie for the packet with corresponding
++  *		IP/TCP headers, *iph* and *th*, on the listening socket in *sk*.
++  *
++  *		*iph* points to the start of the IPv4 or IPv6 header, while
++  *		*iph_len* contains **sizeof**\ (**struct iphdr**) or
++  *		**sizeof**\ (**struct ip6hdr**).
++  *
++  *		*th* points to the start of the TCP header, while *th_len*
++  *		contains the length of the TCP header.
++  *
++  *	Return
++  *		On success, lower 32 bits hold the generated SYN cookie in
++  *		followed by 16 bits which hold the MSS value for that cookie,
++  *		and the top 16 bits are unused.
++  *
++  *		On failure, the returned value is one of the following:
++  *
++  *		**-EINVAL** SYN cookie cannot be issued due to error
++  *
++  *		**-ENOENT** SYN cookie should not be issued (no SYN flood)
++  *
++  *		**-EOPNOTSUPP** kernel configuration does not enable SYN cookies
++  *
++  *		**-EPROTONOSUPPORT** IP packet version is not 4 or 6
++  *
++  * int bpf_skb_output(void *ctx, struct bpf_map *map, u64 flags, void *data, u64 size)
++  * 	Description
++  * 		Write raw *data* blob into a special BPF perf event held by
++  * 		*map* of type **BPF_MAP_TYPE_PERF_EVENT_ARRAY**. This perf
++  * 		event must have the following attributes: **PERF_SAMPLE_RAW**
++  * 		as **sample_type**, **PERF_TYPE_SOFTWARE** as **type**, and
++  * 		**PERF_COUNT_SW_BPF_OUTPUT** as **config**.
++  *
++  * 		The *flags* are used to indicate the index in *map* for which
++  * 		the value must be put, masked with **BPF_F_INDEX_MASK**.
++  * 		Alternatively, *flags* can be set to **BPF_F_CURRENT_CPU**
++  * 		to indicate that the index of the current CPU core should be
++  * 		used.
++  *
++  * 		The value to write, of *size*, is passed through eBPF stack and
++  * 		pointed by *data*.
++  *
++  * 		*ctx* is a pointer to in-kernel struct sk_buff.
++  *
++  * 		This helper is similar to **bpf_perf_event_output**\ () but
++  * 		restricted to raw_tracepoint bpf programs.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_user(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Safely attempt to read *size* bytes from user space address
++  * 		*unsafe_ptr* and store the data in *dst*.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_kernel(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Safely attempt to read *size* bytes from kernel space address
++  * 		*unsafe_ptr* and store the data in *dst*.
++  * 	Return
++  * 		0 on success, or a negative error in case of failure.
++  *
++  * int bpf_probe_read_user_str(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Copy a NUL terminated string from an unsafe user address
++  * 		*unsafe_ptr* to *dst*. The *size* should include the
++  * 		terminating NUL byte. In case the string length is smaller than
++  * 		*size*, the target is not padded with further NUL bytes. If the
++  * 		string length is larger than *size*, just *size*-1 bytes are
++  * 		copied and the last byte is set to NUL.
++  *
++  * 		On success, the length of the copied string is returned. This
++  * 		makes this helper useful in tracing programs for reading
++  * 		strings, and more importantly to get its length at runtime. See
++  * 		the following snippet:
++  *
++  * 		::
++  *
++  * 			SEC("kprobe/sys_open")
++  * 			void bpf_sys_open(struct pt_regs *ctx)
++  * 			{
++  * 			        char buf[PATHLEN]; // PATHLEN is defined to 256
++  * 			        int res = bpf_probe_read_user_str(buf, sizeof(buf),
++  * 				                                  ctx->di);
++  *
++  * 				// Consume buf, for example push it to
++  * 				// userspace via bpf_perf_event_output(); we
++  * 				// can use res (the string length) as event
++  * 				// size, after checking its boundaries.
++  * 			}
++  *
++  * 		In comparison, using **bpf_probe_read_user()** helper here
++  * 		instead to read the string would require to estimate the length
++  * 		at compile time, and would often result in copying more memory
++  * 		than necessary.
++  *
++  * 		Another useful use case is when parsing individual process
++  * 		arguments or individual environment variables navigating
++  * 		*current*\ **->mm->arg_start** and *current*\
++  * 		**->mm->env_start**: using this helper and the return value,
++  * 		one can quickly iterate at the right offset of the memory area.
++  * 	Return
++  * 		On success, the strictly positive length of the string,
++  * 		including the trailing NUL character. On error, a negative
++  * 		value.
++  *
++  * int bpf_probe_read_kernel_str(void *dst, u32 size, const void *unsafe_ptr)
++  * 	Description
++  * 		Copy a NUL terminated string from an unsafe kernel address *unsafe_ptr*
++  * 		to *dst*. Same semantics as with bpf_probe_read_user_str() apply.
++  * 	Return
++  * 		On success, the strictly positive length of the string,	including
++  * 		the trailing NUL character. On error, a negative value.
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+   */
+  #define __BPF_FUNC_MAPPER(FN)		\
+  	FN(unspec),			\
+@@@ -2831,7 -2926,13 +2923,17 @@@
+  	FN(strtoul),			\
+  	FN(sk_storage_get),		\
+  	FN(sk_storage_delete),		\
+++<<<<<<< HEAD
+ +	FN(send_signal),
+++=======
++ 	FN(send_signal),		\
++ 	FN(tcp_gen_syncookie),		\
++ 	FN(skb_output),			\
++ 	FN(probe_read_user),		\
++ 	FN(probe_read_kernel),		\
++ 	FN(probe_read_user_str),	\
++ 	FN(probe_read_kernel_str),
+++>>>>>>> 6ae08ae3dea2 (bpf: Add probe_read_{user, kernel} and probe_read_{user, kernel}_str helpers)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/trace/bpf_trace.c
+* Unmerged path tools/include/uapi/linux/bpf.h
