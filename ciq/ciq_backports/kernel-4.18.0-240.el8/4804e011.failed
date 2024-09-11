@@ -1,0 +1,715 @@
+perf stat: Use affinity for opening events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit 4804e0111662d7d89edf4e767a64c6f7e4778bb1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4804e011.failed
+
+Restructure the event opening in perf stat to cycle through the events
+by CPU after setting affinity to that CPU.
+
+This eliminates IPI overhead in the perf API.
+
+We have to loop through the CPU in the outter builtin-stat code instead
+of leaving that to low level functions.
+
+It has to change the weak group fallback strategy slightly.  Since we
+cannot easily undo the opens for other CPUs move the weak group retry to
+a separate loop.
+
+Before with a large test case with 94 CPUs:
+
+  % time     seconds  usecs/call     calls    errors syscall
+  ------ ----------- ----------- --------- --------- ----------------
+   42.75    4.050910          67     60046       110 perf_event_open
+
+After:
+
+   26.86    0.944396          16     58069       110 perf_event_open
+
+(the number changes slightly because the weak group retries
+work differently and the test case relies on weak groups)
+
+Committer notes:
+
+Added one of the hunks in a patch provided by Andi after I noticed that
+the "event times" 'perf test' entry was segfaulting.
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lore.kernel.org/lkml/20191121001522.180827-10-andi@firstfloor.org
+Link: http://lore.kernel.org/lkml/20191127232657.GL84886@tassilo.jf.intel.com # Fix
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 4804e0111662d7d89edf4e767a64c6f7e4778bb1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-stat.c
+#	tools/perf/util/evlist.c
+#	tools/perf/util/evlist.h
+#	tools/perf/util/evsel.c
+#	tools/perf/util/evsel.h
+#	tools/perf/util/stat.c
+#	tools/perf/util/stat.h
+diff --cc tools/perf/builtin-stat.c
+index 13e7c7e6714e,cf8516e701e2..000000000000
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@@ -63,7 -61,11 +63,8 @@@
+  #include "util/tool.h"
+  #include "util/string2.h"
+  #include "util/metricgroup.h"
+ -#include "util/synthetic-events.h"
+ -#include "util/target.h"
+ -#include "util/time-utils.h"
+  #include "util/top.h"
++ #include "util/affinity.h"
+  #include "asm/bug.h"
+  
+  #include <linux/time64.h>
+@@@ -418,6 -421,62 +419,65 @@@ static bool is_target_alive(struct targ
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum counter_recovery {
++ 	COUNTER_SKIP,
++ 	COUNTER_RETRY,
++ 	COUNTER_FATAL,
++ };
++ 
++ static enum counter_recovery stat_handle_error(struct evsel *counter)
++ {
++ 	char msg[BUFSIZ];
++ 	/*
++ 	 * PPC returns ENXIO for HW counters until 2.6.37
++ 	 * (behavior changed with commit b0a873e).
++ 	 */
++ 	if (errno == EINVAL || errno == ENOSYS ||
++ 	    errno == ENOENT || errno == EOPNOTSUPP ||
++ 	    errno == ENXIO) {
++ 		if (verbose > 0)
++ 			ui__warning("%s event is not supported by the kernel.\n",
++ 				    perf_evsel__name(counter));
++ 		counter->supported = false;
++ 		/*
++ 		 * errored is a sticky flag that means one of the counter's
++ 		 * cpu event had a problem and needs to be reexamined.
++ 		 */
++ 		counter->errored = true;
++ 
++ 		if ((counter->leader != counter) ||
++ 		    !(counter->leader->core.nr_members > 1))
++ 			return COUNTER_SKIP;
++ 	} else if (perf_evsel__fallback(counter, errno, msg, sizeof(msg))) {
++ 		if (verbose > 0)
++ 			ui__warning("%s\n", msg);
++ 		return COUNTER_RETRY;
++ 	} else if (target__has_per_thread(&target) &&
++ 		   evsel_list->core.threads &&
++ 		   evsel_list->core.threads->err_thread != -1) {
++ 		/*
++ 		 * For global --per-thread case, skip current
++ 		 * error thread.
++ 		 */
++ 		if (!thread_map__remove(evsel_list->core.threads,
++ 					evsel_list->core.threads->err_thread)) {
++ 			evsel_list->core.threads->err_thread = -1;
++ 			return COUNTER_RETRY;
++ 		}
++ 	}
++ 
++ 	perf_evsel__open_strerror(counter, &target,
++ 				  errno, msg, sizeof(msg));
++ 	ui__error("%s\n", msg);
++ 
++ 	if (child_pid != -1)
++ 		kill(child_pid, SIGTERM);
++ 	return COUNTER_FATAL;
++ }
++ 
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  static int __run_perf_stat(int argc, const char **argv, int run_idx)
+  {
+  	int interval = stat_config.interval;
+@@@ -455,61 -517,104 +518,147 @@@
+  	if (group)
+  		perf_evlist__set_leader(evsel_list);
+  
+- 	evlist__for_each_entry(evsel_list, counter) {
+- try_again:
+- 		if (create_perf_stat_counter(counter, &stat_config, &target) < 0) {
+- 
+- 			/* Weak group failed. Reset the group. */
+- 			if ((errno == EINVAL || errno == EBADF) &&
+- 			    counter->leader != counter &&
+- 			    counter->weak_group) {
+- 				counter = perf_evlist__reset_weak_group(evsel_list, counter);
+- 				goto try_again;
+- 			}
++ 	if (affinity__setup(&affinity) < 0)
++ 		return -1;
++ 
++ 	evlist__for_each_cpu (evsel_list, i, cpu) {
++ 		affinity__set(&affinity, cpu);
+  
+++<<<<<<< HEAD
+ +			/*
+ +			 * PPC returns ENXIO for HW counters until 2.6.37
+ +			 * (behavior changed with commit b0a873e).
+ +			 */
+ +			if (errno == EINVAL || errno == ENOSYS ||
+ +			    errno == ENOENT || errno == EOPNOTSUPP ||
+ +			    errno == ENXIO) {
+ +				if (verbose > 0)
+ +					ui__warning("%s event is not supported by the kernel.\n",
+ +						    perf_evsel__name(counter));
+ +				counter->supported = false;
+ +
+ +				if ((counter->leader != counter) ||
+ +				    !(counter->leader->nr_members > 1))
+ +					continue;
+ +			} else if (perf_evsel__fallback(counter, errno, msg, sizeof(msg))) {
+ +                                if (verbose > 0)
+ +                                        ui__warning("%s\n", msg);
+ +                                goto try_again;
+ +			} else if (target__has_per_thread(&target) &&
+ +				   evsel_list->threads &&
+ +				   evsel_list->threads->err_thread != -1) {
+ +				/*
+ +				 * For global --per-thread case, skip current
+ +				 * error thread.
+ +				 */
+ +				if (!thread_map__remove(evsel_list->threads,
+ +							evsel_list->threads->err_thread)) {
+ +					evsel_list->threads->err_thread = -1;
+ +					goto try_again;
+ +				}
+++=======
++ 		evlist__for_each_entry(evsel_list, counter) {
++ 			if (evsel__cpu_iter_skip(counter, cpu))
++ 				continue;
++ 			if (counter->reset_group || counter->errored)
++ 				continue;
++ try_again:
++ 			if (create_perf_stat_counter(counter, &stat_config, &target,
++ 						     counter->cpu_iter - 1) < 0) {
++ 
++ 				/*
++ 				 * Weak group failed. We cannot just undo this here
++ 				 * because earlier CPUs might be in group mode, and the kernel
++ 				 * doesn't support mixing group and non group reads. Defer
++ 				 * it to later.
++ 				 * Don't close here because we're in the wrong affinity.
++ 				 */
++ 				if ((errno == EINVAL || errno == EBADF) &&
++ 				    counter->leader != counter &&
++ 				    counter->weak_group) {
++ 					perf_evlist__reset_weak_group(evsel_list, counter, false);
++ 					assert(counter->reset_group);
++ 					second_pass = true;
++ 					continue;
++ 				}
++ 
++ 				switch (stat_handle_error(counter)) {
++ 				case COUNTER_FATAL:
++ 					return -1;
++ 				case COUNTER_RETRY:
++ 					goto try_again;
++ 				case COUNTER_SKIP:
++ 					continue;
++ 				default:
++ 					break;
++ 				}
++ 
++ 			}
++ 			counter->supported = true;
++ 		}
++ 	}
++ 
++ 	if (second_pass) {
++ 		/*
++ 		 * Now redo all the weak group after closing them,
++ 		 * and also close errored counters.
++ 		 */
++ 
++ 		evlist__for_each_cpu(evsel_list, i, cpu) {
++ 			affinity__set(&affinity, cpu);
++ 			/* First close errored or weak retry */
++ 			evlist__for_each_entry(evsel_list, counter) {
++ 				if (!counter->reset_group && !counter->errored)
++ 					continue;
++ 				if (evsel__cpu_iter_skip_no_inc(counter, cpu))
++ 					continue;
++ 				perf_evsel__close_cpu(&counter->core, counter->cpu_iter);
++ 			}
++ 			/* Now reopen weak */
++ 			evlist__for_each_entry(evsel_list, counter) {
++ 				if (!counter->reset_group && !counter->errored)
++ 					continue;
++ 				if (evsel__cpu_iter_skip(counter, cpu))
++ 					continue;
++ 				if (!counter->reset_group)
++ 					continue;
++ try_again_reset:
++ 				pr_debug2("reopening weak %s\n", perf_evsel__name(counter));
++ 				if (create_perf_stat_counter(counter, &stat_config, &target,
++ 							     counter->cpu_iter - 1) < 0) {
++ 
++ 					switch (stat_handle_error(counter)) {
++ 					case COUNTER_FATAL:
++ 						return -1;
++ 					case COUNTER_RETRY:
++ 						goto try_again_reset;
++ 					case COUNTER_SKIP:
++ 						continue;
++ 					default:
++ 						break;
++ 					}
++ 				}
++ 				counter->supported = true;
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  			}
+ +
+ +			perf_evsel__open_strerror(counter, &target,
+ +						  errno, msg, sizeof(msg));
+ +			ui__error("%s\n", msg);
+ +
+ +			if (child_pid != -1)
+ +				kill(child_pid, SIGTERM);
+ +
+ +			return -1;
+  		}
+- 		counter->supported = true;
++ 	}
++ 	affinity__cleanup(&affinity);
++ 
++ 	evlist__for_each_entry(evsel_list, counter) {
++ 		if (!counter->supported) {
++ 			perf_evsel__free_fd(&counter->core);
++ 			continue;
++ 		}
+  
+  		l = strlen(counter->unit);
+  		if (l > stat_config.unit_width)
+diff --cc tools/perf/util/evlist.c
+index 29a998d183ce,096a4ea65b1b..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -1807,10 -1635,11 +1807,16 @@@ void perf_evlist__force_leader(struct p
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +struct perf_evsel *perf_evlist__reset_weak_group(struct perf_evlist *evsel_list,
+ +						 struct perf_evsel *evsel)
+++=======
++ struct evsel *perf_evlist__reset_weak_group(struct evlist *evsel_list,
++ 						 struct evsel *evsel,
++ 						bool close)
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  {
+ -	struct evsel *c2, *leader;
+ +	struct perf_evsel *c2, *leader;
+  	bool is_open = true;
+  
+  	leader = evsel->leader;
+@@@ -1825,10 -1654,15 +1831,22 @@@
+  		if (c2 == evsel)
+  			is_open = false;
+  		if (c2->leader == leader) {
+++<<<<<<< HEAD
+ +			if (is_open)
+ +				perf_evsel__close(c2);
+ +			c2->leader = c2;
+ +			c2->nr_members = 0;
+++=======
++ 			if (is_open && close)
++ 				perf_evsel__close(&c2->core);
++ 			c2->leader = c2;
++ 			c2->core.nr_members = 0;
++ 			/*
++ 			 * Set this for all former members of the group
++ 			 * to indicate they get reopened.
++ 			 */
++ 			c2->reset_group = true;
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  		}
+  	}
+  	return leader;
+diff --cc tools/perf/util/evlist.h
+index 49354fe24d5f,f5bd5c386df1..000000000000
+--- a/tools/perf/util/evlist.h
++++ b/tools/perf/util/evlist.h
+@@@ -311,21 -332,30 +311,27 @@@ void perf_evlist__to_front(struct perf_
+   * @tmp: struct evsel temp iterator
+   */
+  #define evlist__for_each_entry_safe(evlist, tmp, evsel) \
+ -	__evlist__for_each_entry_safe(&(evlist)->core.entries, tmp, evsel)
+ -
+ -#define evlist__for_each_cpu(evlist, index, cpu)	\
+ -	evlist__cpu_iter_start(evlist);			\
+ -	perf_cpu_map__for_each_cpu (cpu, index, (evlist)->core.all_cpus)
+ -
+ -void perf_evlist__set_tracking_event(struct evlist *evlist,
+ -				     struct evsel *tracking_evsel);
+ +	__evlist__for_each_entry_safe(&(evlist)->entries, tmp, evsel)
+  
+ -void evlist__cpu_iter_start(struct evlist *evlist);
+ -bool evsel__cpu_iter_skip(struct evsel *ev, int cpu);
+ -bool evsel__cpu_iter_skip_no_inc(struct evsel *ev, int cpu);
+ +void perf_evlist__set_tracking_event(struct perf_evlist *evlist,
+ +				     struct perf_evsel *tracking_evsel);
+  
+ -struct evsel *
+ -perf_evlist__find_evsel_by_str(struct evlist *evlist, const char *str);
+ +struct perf_evsel *
+ +perf_evlist__find_evsel_by_str(struct perf_evlist *evlist, const char *str);
+  
+ -struct evsel *perf_evlist__event2evsel(struct evlist *evlist,
+ +struct perf_evsel *perf_evlist__event2evsel(struct perf_evlist *evlist,
+  					    union perf_event *event);
+  
+ -bool perf_evlist__exclude_kernel(struct evlist *evlist);
+ +bool perf_evlist__exclude_kernel(struct perf_evlist *evlist);
+  
+ -void perf_evlist__force_leader(struct evlist *evlist);
+ +void perf_evlist__force_leader(struct perf_evlist *evlist);
+  
+++<<<<<<< HEAD
+ +struct perf_evsel *perf_evlist__reset_weak_group(struct perf_evlist *evlist,
+ +						 struct perf_evsel *evsel);
+++=======
++ struct evsel *perf_evlist__reset_weak_group(struct evlist *evlist,
++ 						 struct evsel *evsel,
++ 						bool close);
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  #endif /* __PERF_EVLIST_H */
+diff --cc tools/perf/util/evsel.c
+index c59d310d3797,aa180d1df50f..000000000000
+--- a/tools/perf/util/evsel.c
++++ b/tools/perf/util/evsel.c
+@@@ -1830,8 -1587,9 +1830,14 @@@ static int perf_event_open(struct perf_
+  	return fd;
+  }
+  
+++<<<<<<< HEAD
+ +int perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
+ +		     struct thread_map *threads)
+++=======
++ static int evsel__open_cpu(struct evsel *evsel, struct perf_cpu_map *cpus,
++ 		struct perf_thread_map *threads,
++ 		int start_cpu, int end_cpu)
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  {
+  	int cpu, thread, nthreads;
+  	unsigned long flags = PERF_FLAG_FD_CLOEXEC;
+@@@ -1889,25 -1648,25 +1895,25 @@@ fallback_missing_features
+  	if (perf_missing_features.cloexec)
+  		flags &= ~(unsigned long)PERF_FLAG_FD_CLOEXEC;
+  	if (perf_missing_features.mmap2)
+ -		evsel->core.attr.mmap2 = 0;
+ +		evsel->attr.mmap2 = 0;
+  	if (perf_missing_features.exclude_guest)
+ -		evsel->core.attr.exclude_guest = evsel->core.attr.exclude_host = 0;
+ +		evsel->attr.exclude_guest = evsel->attr.exclude_host = 0;
+  	if (perf_missing_features.lbr_flags)
+ -		evsel->core.attr.branch_sample_type &= ~(PERF_SAMPLE_BRANCH_NO_FLAGS |
+ +		evsel->attr.branch_sample_type &= ~(PERF_SAMPLE_BRANCH_NO_FLAGS |
+  				     PERF_SAMPLE_BRANCH_NO_CYCLES);
+ -	if (perf_missing_features.group_read && evsel->core.attr.inherit)
+ -		evsel->core.attr.read_format &= ~(PERF_FORMAT_GROUP|PERF_FORMAT_ID);
+ +	if (perf_missing_features.group_read && evsel->attr.inherit)
+ +		evsel->attr.read_format &= ~(PERF_FORMAT_GROUP|PERF_FORMAT_ID);
+  	if (perf_missing_features.ksymbol)
+ -		evsel->core.attr.ksymbol = 0;
+ -	if (perf_missing_features.bpf)
+ -		evsel->core.attr.bpf_event = 0;
+ +		evsel->attr.ksymbol = 0;
+ +	if (perf_missing_features.bpf_event)
+ +		evsel->attr.bpf_event = 0;
+  retry_sample_id:
+  	if (perf_missing_features.sample_id_all)
+ -		evsel->core.attr.sample_id_all = 0;
+ +		evsel->attr.sample_id_all = 0;
+  
+ -	display_attr(&evsel->core.attr);
+ +	display_attr(&evsel->attr);
+  
+- 	for (cpu = 0; cpu < cpus->nr; cpu++) {
++ 	for (cpu = start_cpu; cpu < end_cpu; cpu++) {
+  
+  		for (thread = 0; thread < nthreads; thread++) {
+  			int fd, group_fd;
+@@@ -2080,29 -1844,36 +2086,51 @@@ out_close
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +void perf_evsel__close(struct perf_evsel *evsel)
+++=======
++ int evsel__open(struct evsel *evsel, struct perf_cpu_map *cpus,
++ 		struct perf_thread_map *threads)
++ {
++ 	return evsel__open_cpu(evsel, cpus, threads, 0, cpus ? cpus->nr : 1);
++ }
++ 
++ void evsel__close(struct evsel *evsel)
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  {
+ -	perf_evsel__close(&evsel->core);
+ -	perf_evsel__free_id(&evsel->core);
+ +	if (evsel->fd == NULL)
+ +		return;
+ +
+ +	perf_evsel__close_fd(evsel);
+ +	perf_evsel__free_fd(evsel);
+ +	perf_evsel__free_id(evsel);
+  }
+  
+++<<<<<<< HEAD
+ +int perf_evsel__open_per_cpu(struct perf_evsel *evsel,
+ +			     struct cpu_map *cpus)
+ +{
+ +	return perf_evsel__open(evsel, cpus, NULL);
+++=======
++ int perf_evsel__open_per_cpu(struct evsel *evsel,
++ 			     struct perf_cpu_map *cpus,
++ 			     int cpu)
++ {
++ 	if (cpu == -1)
++ 		return evsel__open_cpu(evsel, cpus, NULL, 0,
++ 					cpus ? cpus->nr : 1);
++ 
++ 	return evsel__open_cpu(evsel, cpus, NULL, cpu, cpu + 1);
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  }
+  
+ -int perf_evsel__open_per_thread(struct evsel *evsel,
+ -				struct perf_thread_map *threads)
+ +int perf_evsel__open_per_thread(struct perf_evsel *evsel,
+ +				struct thread_map *threads)
+  {
+ -	return evsel__open(evsel, NULL, threads);
+ +	return perf_evsel__open(evsel, NULL, threads);
+  }
+  
+ -static int perf_evsel__parse_id_sample(const struct evsel *evsel,
+ +static int perf_evsel__parse_id_sample(const struct perf_evsel *evsel,
+  				       const union perf_event *event,
+  				       struct perf_sample *sample)
+  {
+diff --cc tools/perf/util/evsel.h
+index 2ab992b39a4c,ca82a93960cd..000000000000
+--- a/tools/perf/util/evsel.h
++++ b/tools/perf/util/evsel.h
+@@@ -162,10 -90,14 +162,12 @@@ struct perf_evsel 
+  	bool			merged_stat;
+  	const char *		metric_expr;
+  	const char *		metric_name;
+ -	struct evsel		**metric_events;
+ -	struct evsel		*metric_leader;
+ +	struct perf_evsel	**metric_events;
+  	bool			collect_stat;
+  	bool			weak_group;
++ 	bool			reset_group;
++ 	bool			errored;
+  	bool			percore;
+ -	int			cpu_iter;
+  	const char		*pmu_name;
+  	struct {
+  		perf_evsel__sb_cb_t	*cb;
+@@@ -285,24 -214,24 +287,35 @@@ void __perf_evsel__reset_sample_bit(str
+  #define perf_evsel__reset_sample_bit(evsel, bit) \
+  	__perf_evsel__reset_sample_bit(evsel, PERF_SAMPLE_##bit)
+  
+ -void perf_evsel__set_sample_id(struct evsel *evsel,
+ +void perf_evsel__set_sample_id(struct perf_evsel *evsel,
+  			       bool use_sample_identifier);
+  
+ -int perf_evsel__set_filter(struct evsel *evsel, const char *filter);
+ -int perf_evsel__append_tp_filter(struct evsel *evsel, const char *filter);
+ -int perf_evsel__append_addr_filter(struct evsel *evsel,
+ +int perf_evsel__set_filter(struct perf_evsel *evsel, const char *filter);
+ +int perf_evsel__append_tp_filter(struct perf_evsel *evsel, const char *filter);
+ +int perf_evsel__append_addr_filter(struct perf_evsel *evsel,
+  				   const char *filter);
+ -int evsel__enable(struct evsel *evsel);
+ -int evsel__disable(struct evsel *evsel);
+ -
+ +int perf_evsel__apply_filter(struct perf_evsel *evsel, const char *filter);
+ +int perf_evsel__enable(struct perf_evsel *evsel);
+ +int perf_evsel__disable(struct perf_evsel *evsel);
+ +
+++<<<<<<< HEAD
+ +int perf_evsel__open_per_cpu(struct perf_evsel *evsel,
+ +			     struct cpu_map *cpus);
+ +int perf_evsel__open_per_thread(struct perf_evsel *evsel,
+ +				struct thread_map *threads);
+ +int perf_evsel__open(struct perf_evsel *evsel, struct cpu_map *cpus,
+ +		     struct thread_map *threads);
+ +void perf_evsel__close(struct perf_evsel *evsel);
+++=======
++ int perf_evsel__open_per_cpu(struct evsel *evsel,
++ 			     struct perf_cpu_map *cpus,
++ 			     int cpu);
++ int perf_evsel__open_per_thread(struct evsel *evsel,
++ 				struct perf_thread_map *threads);
++ int evsel__open(struct evsel *evsel, struct perf_cpu_map *cpus,
++ 		struct perf_thread_map *threads);
++ void evsel__close(struct evsel *evsel);
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  
+  struct perf_sample;
+  
+diff --cc tools/perf/util/stat.c
+index 95dac0b5d3fc,5f26137b8d60..000000000000
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@@ -438,12 -462,13 +438,13 @@@ size_t perf_event__fprintf_stat_config(
+  	return ret;
+  }
+  
+ -int create_perf_stat_counter(struct evsel *evsel,
+ +int create_perf_stat_counter(struct perf_evsel *evsel,
+  			     struct perf_stat_config *config,
+- 			     struct target *target)
++ 			     struct target *target,
++ 			     int cpu)
+  {
+ -	struct perf_event_attr *attr = &evsel->core.attr;
+ -	struct evsel *leader = evsel->leader;
+ +	struct perf_event_attr *attr = &evsel->attr;
+ +	struct perf_evsel *leader = evsel->leader;
+  
+  	attr->read_format = PERF_FORMAT_TOTAL_TIME_ENABLED |
+  			    PERF_FORMAT_TOTAL_TIME_RUNNING;
+@@@ -494,49 -519,7 +495,53 @@@
+  	}
+  
+  	if (target__has_cpu(target) && !target__has_per_thread(target))
+++<<<<<<< HEAD
+ +		return perf_evsel__open_per_cpu(evsel, perf_evsel__cpus(evsel));
+++=======
++ 		return perf_evsel__open_per_cpu(evsel, evsel__cpus(evsel), cpu);
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+ +
+ +	return perf_evsel__open_per_thread(evsel, evsel->threads);
+ +}
+ +
+ +int perf_stat_synthesize_config(struct perf_stat_config *config,
+ +				struct perf_tool *tool,
+ +				struct perf_evlist *evlist,
+ +				perf_event__handler_t process,
+ +				bool attrs)
+ +{
+ +	int err;
+  
+ -	return perf_evsel__open_per_thread(evsel, evsel->core.threads);
+ +	if (attrs) {
+ +		err = perf_event__synthesize_attrs(tool, evlist, process);
+ +		if (err < 0) {
+ +			pr_err("Couldn't synthesize attrs.\n");
+ +			return err;
+ +		}
+ +	}
+ +
+ +	err = perf_event__synthesize_extra_attr(tool, evlist, process,
+ +						attrs);
+ +
+ +	err = perf_event__synthesize_thread_map2(tool, evlist->threads,
+ +						 process, NULL);
+ +	if (err < 0) {
+ +		pr_err("Couldn't synthesize thread map.\n");
+ +		return err;
+ +	}
+ +
+ +	err = perf_event__synthesize_cpu_map(tool, evlist->cpus,
+ +					     process, NULL);
+ +	if (err < 0) {
+ +		pr_err("Couldn't synthesize thread map.\n");
+ +		return err;
+ +	}
+ +
+ +	err = perf_event__synthesize_stat_config(tool, config, process, NULL);
+ +	if (err < 0) {
+ +		pr_err("Couldn't synthesize config.\n");
+ +		return err;
+ +	}
+ +
+ +	return 0;
+  }
+diff --cc tools/perf/util/stat.h
+index 672981c1bbe8,fb990efa54a8..000000000000
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@@ -209,16 -212,12 +209,21 @@@ size_t perf_event__fprintf_stat(union p
+  size_t perf_event__fprintf_stat_round(union perf_event *event, FILE *fp);
+  size_t perf_event__fprintf_stat_config(union perf_event *event, FILE *fp);
+  
+ -int create_perf_stat_counter(struct evsel *evsel,
+ +int create_perf_stat_counter(struct perf_evsel *evsel,
+  			     struct perf_stat_config *config,
+++<<<<<<< HEAD
+ +			     struct target *target);
+ +int perf_stat_synthesize_config(struct perf_stat_config *config,
+ +				struct perf_tool *tool,
+ +				struct perf_evlist *evlist,
+ +				perf_event__handler_t process,
+ +				bool attrs);
+++=======
++ 			     struct target *target,
++ 			     int cpu);
+++>>>>>>> 4804e0111662 (perf stat: Use affinity for opening events)
+  void
+ -perf_evlist__print_counters(struct evlist *evlist,
+ +perf_evlist__print_counters(struct perf_evlist *evlist,
+  			    struct perf_stat_config *config,
+  			    struct target *_target,
+  			    struct timespec *ts,
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index 8d9bbe9f78ab..78d62ebc09fe 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -779,7 +779,7 @@ static int record__open(struct record *rec)
+ 			if ((errno == EINVAL || errno == EBADF) &&
+ 			    pos->leader != pos &&
+ 			    pos->weak_group) {
+-			        pos = perf_evlist__reset_weak_group(evlist, pos);
++			        pos = perf_evlist__reset_weak_group(evlist, pos, true);
+ 				goto try_again;
+ 			}
+ 			rc = -errno;
+* Unmerged path tools/perf/builtin-stat.c
+diff --git a/tools/perf/tests/event-times.c b/tools/perf/tests/event-times.c
+index 1a2686f1fcf0..be7482d544af 100644
+--- a/tools/perf/tests/event-times.c
++++ b/tools/perf/tests/event-times.c
+@@ -123,7 +123,7 @@ static int attach__cpu_disabled(struct perf_evlist *evlist)
+ 
+ 	evsel->attr.disabled = 1;
+ 
+-	err = perf_evsel__open_per_cpu(evsel, cpus);
++	err = perf_evsel__open_per_cpu(evsel, cpus, -1);
+ 	if (err) {
+ 		if (err == -EACCES)
+ 			return TEST_SKIP;
+@@ -150,7 +150,7 @@ static int attach__cpu_enabled(struct perf_evlist *evlist)
+ 		return -1;
+ 	}
+ 
+-	err = perf_evsel__open_per_cpu(evsel, cpus);
++	err = perf_evsel__open_per_cpu(evsel, cpus, -1);
+ 	if (err == -EACCES)
+ 		return TEST_SKIP;
+ 
+* Unmerged path tools/perf/util/evlist.c
+* Unmerged path tools/perf/util/evlist.h
+* Unmerged path tools/perf/util/evsel.c
+* Unmerged path tools/perf/util/evsel.h
+* Unmerged path tools/perf/util/stat.c
+* Unmerged path tools/perf/util/stat.h
