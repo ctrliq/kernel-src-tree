@@ -1,0 +1,169 @@
+KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 187c8833def8a191c7f01d7932eac1bd2ab84af1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/187c8833.failed
+
+Use a rw_semaphore instead of a mutex to coordinate APICv updates so that
+vCPUs responding to requests can take the lock for read and run in
+parallel.  Using a mutex forces serialization of vCPUs even though
+kvm_vcpu_update_apicv() only touches data local to that vCPU or is
+protected by a different lock, e.g. SVM's ir_list_lock.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211022004927.1448382-5-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 187c8833def8a191c7f01d7932eac1bd2ab84af1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index d3a7c899ed3f,c8530ea136aa..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1050,6 -1070,9 +1050,12 @@@ struct kvm_arch 
+  	struct kvm_apic_map __rcu *apic_map;
+  	atomic_t apic_map_dirty;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Protects apic_access_memslot_enabled and apicv_inhibit_reasons */
++ 	struct rw_semaphore apicv_update_lock;
++ 
+++>>>>>>> 187c8833def8 (KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism)
+  	bool apic_access_memslot_enabled;
+  	unsigned long apicv_inhibit_reasons;
+  
+diff --cc arch/x86/kvm/x86.c
+index 47c227e53920,0377e61b8fc0..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8509,9 -8776,11 +8509,15 @@@ bool kvm_apicv_activated(struct kvm *kv
+  }
+  EXPORT_SYMBOL_GPL(kvm_apicv_activated);
+  
+ -static void kvm_apicv_init(struct kvm *kvm)
+ +void kvm_apicv_init(struct kvm *kvm, bool enable)
+  {
+++<<<<<<< HEAD
+ +	if (enable)
+++=======
++ 	init_rwsem(&kvm->arch.apicv_update_lock);
++ 
++ 	if (enable_apicv)
+++>>>>>>> 187c8833def8 (KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism)
+  		clear_bit(APICV_INHIBIT_REASON_DISABLE,
+  			  &kvm->arch.apicv_inhibit_reasons);
+  	else
+@@@ -9152,7 -9438,15 +9158,17 @@@ void kvm_vcpu_update_apicv(struct kvm_v
+  	if (!lapic_in_kernel(vcpu))
+  		return;
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.apicv_active = kvm_apicv_activated(vcpu->kvm);
+++=======
++ 	down_read(&vcpu->kvm->arch.apicv_update_lock);
++ 
++ 	activate = kvm_apicv_activated(vcpu->kvm);
++ 	if (vcpu->arch.apicv_active == activate)
++ 		goto out;
++ 
++ 	vcpu->arch.apicv_active = activate;
+++>>>>>>> 187c8833def8 (KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism)
+  	kvm_apic_update_apicv(vcpu);
+  	static_call(kvm_x86_refresh_apicv_exec_ctrl)(vcpu);
+  
+@@@ -9164,13 -9458,18 +9180,21 @@@
+  	 */
+  	if (!vcpu->arch.apicv_active)
+  		kvm_make_request(KVM_REQ_EVENT, vcpu);
+++<<<<<<< HEAD
+++=======
++ 
++ out:
++ 	up_read(&vcpu->kvm->arch.apicv_update_lock);
+++>>>>>>> 187c8833def8 (KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism)
+  }
+  EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
+  
+ -void __kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
+ +void kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
+  {
+ -	unsigned long old, new;
+ +	unsigned long old, new, expected;
+  
++ 	lockdep_assert_held_write(&kvm->arch.apicv_update_lock);
++ 
+  	if (!kvm_x86_ops.check_apicv_inhibit_reasons ||
+  	    !static_call(kvm_x86_check_apicv_inhibit_reasons)(bit))
+  		return;
+@@@ -9189,14 -9483,34 +9213,22 @@@
+  
+  	if (!!old != !!new) {
+  		trace_kvm_apicv_update_request(activate, bit);
+ -		/*
+ -		 * Kick all vCPUs before setting apicv_inhibit_reasons to avoid
+ -		 * false positives in the sanity check WARN in svm_vcpu_run().
+ -		 * This task will wait for all vCPUs to ack the kick IRQ before
+ -		 * updating apicv_inhibit_reasons, and all other vCPUs will
+ -		 * block on acquiring apicv_update_lock so that vCPUs can't
+ -		 * redo svm_vcpu_run() without seeing the new inhibit state.
+ -		 *
+ -		 * Note, holding apicv_update_lock and taking it in the read
+ -		 * side (handling the request) also prevents other vCPUs from
+ -		 * servicing the request with a stale apicv_inhibit_reasons.
+ -		 */
+  		kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
+ -		kvm->arch.apicv_inhibit_reasons = new;
+  		if (new) {
+  			unsigned long gfn = gpa_to_gfn(APIC_DEFAULT_PHYS_BASE);
+ +
+  			kvm_zap_gfn_range(kvm, gfn, gfn+1);
+  		}
+ -	} else
+ -		kvm->arch.apicv_inhibit_reasons = new;
+ -}
+ -EXPORT_SYMBOL_GPL(__kvm_request_apicv_update);
+ +	}
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
++ {
++ 	down_write(&kvm->arch.apicv_update_lock);
++ 	__kvm_request_apicv_update(kvm, activate, bit);
++ 	up_write(&kvm->arch.apicv_update_lock);
+++>>>>>>> 187c8833def8 (KVM: x86: Use rw_semaphore for APICv lock to allow vCPU parallelism)
+  }
+  EXPORT_SYMBOL_GPL(kvm_request_apicv_update);
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/hyperv.c b/arch/x86/kvm/hyperv.c
+index 7534174bdc09..69cae05ec947 100644
+--- a/arch/x86/kvm/hyperv.c
++++ b/arch/x86/kvm/hyperv.c
+@@ -112,7 +112,7 @@ static void synic_update_vector(struct kvm_vcpu_hv_synic *synic,
+ 	if (!!auto_eoi_old == !!auto_eoi_new)
+ 		return;
+ 
+-	mutex_lock(&vcpu->kvm->arch.apicv_update_lock);
++	down_write(&vcpu->kvm->arch.apicv_update_lock);
+ 
+ 	if (auto_eoi_new)
+ 		hv->synic_auto_eoi_used++;
+@@ -123,7 +123,7 @@ static void synic_update_vector(struct kvm_vcpu_hv_synic *synic,
+ 				   !hv->synic_auto_eoi_used,
+ 				   APICV_INHIBIT_REASON_HYPERV);
+ 
+-	mutex_unlock(&vcpu->kvm->arch.apicv_update_lock);
++	up_write(&vcpu->kvm->arch.apicv_update_lock);
+ }
+ 
+ static int synic_set_sint(struct kvm_vcpu_hv_synic *synic, int sint,
+* Unmerged path arch/x86/kvm/x86.c
