@@ -13,6 +13,7 @@
 #include "branch.h"
 #include "path.h"
 #include "symbol_conf.h"
+#include "spark.h"
 
 #ifdef HAVE_LIBELF_SUPPORT
 #include <libelf.h>
@@ -128,6 +129,7 @@ struct block_info {
 	u64			end;
 	u64			cycles;
 	u64			cycles_aggr;
+	s64			cycles_spark[NUM_SPARKS];
 	int			num;
 	int			num_aggr;
 	refcount_t		refcnt;
