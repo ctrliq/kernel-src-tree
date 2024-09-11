@@ -1,0 +1,174 @@
+arm64: expose user PAC bit positions via ptrace
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [arm64] expose user PAC bit positions via ptrace (Mark Salter) [1756103]
+Rebuild_FUZZ: 91.95%
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit ec6e822d1a22d0eef1d1fa260dff751dba9a4258
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ec6e822d.failed
+
+When pointer authentication is in use, data/instruction pointers have a
+number of PAC bits inserted into them. The number and position of these
+bits depends on the configured TCR_ELx.TxSZ and whether tagging is
+enabled. ARMv8.3 allows tagging to differ for instruction and data
+pointers.
+
+For userspace debuggers to unwind the stack and/or to follow pointer
+chains, they need to be able to remove the PAC bits before attempting to
+use a pointer.
+
+This patch adds a new structure with masks describing the location of
+the PAC bits in userspace instruction and data pointers (i.e. those
+addressable via TTBR0), which userspace can query via PTRACE_GETREGSET.
+By clearing these bits from pointers (and replacing them with the value
+of bit 55), userspace can acquire the PAC-less versions.
+
+This new regset is exposed when the kernel is built with (user) pointer
+authentication support, and the address authentication feature is
+enabled. Otherwise, the regset is hidden.
+
+	Reviewed-by: Richard Henderson <richard.henderson@linaro.org>
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Kristina Martsenko <kristina.martsenko@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Ramana Radhakrishnan <ramana.radhakrishnan@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+[will: Fix to use vabits_user instead of VA_BITS and rename macro]
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit ec6e822d1a22d0eef1d1fa260dff751dba9a4258)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/pointer_auth.h
+* Unmerged path arch/arm64/include/asm/pointer_auth.h
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index e4db11f9f21d..d31403eef305 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -205,6 +205,9 @@ static inline unsigned long kaslr_offset(void)
+ 	return kimage_vaddr - KIMAGE_VADDR;
+ }
+ 
++/* the actual size of a user virtual address */
++extern u64			vabits_user;
++
+ /*
+  * Allow all memory at the discovery stage. We will clip it later.
+  */
+* Unmerged path arch/arm64/include/asm/pointer_auth.h
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 80d0ee02d1f0..6ee826229199 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -52,8 +52,6 @@
+  */
+ 
+ #define DEFAULT_MAP_WINDOW_64	(UL(1) << VA_BITS)
+-
+-extern u64 vabits_user;
+ #define TASK_SIZE_64		(UL(1) << vabits_user)
+ 
+ #ifdef CONFIG_COMPAT
+diff --git a/arch/arm64/include/uapi/asm/ptrace.h b/arch/arm64/include/uapi/asm/ptrace.h
+index a835f12fff62..22d452e4a2b1 100644
+--- a/arch/arm64/include/uapi/asm/ptrace.h
++++ b/arch/arm64/include/uapi/asm/ptrace.h
+@@ -230,6 +230,13 @@ struct user_sve_header {
+ 		  SVE_PT_SVE_OFFSET + SVE_PT_SVE_SIZE(vq, flags)	\
+ 		: SVE_PT_FPSIMD_OFFSET + SVE_PT_FPSIMD_SIZE(vq, flags))
+ 
++/* pointer authentication masks (NT_ARM_PAC_MASK) */
++
++struct user_pac_mask {
++	__u64		data_mask;
++	__u64		insn_mask;
++};
++
+ #endif /* __ASSEMBLY__ */
+ 
+ #endif /* _UAPI__ASM_PTRACE_H */
+diff --git a/arch/arm64/kernel/ptrace.c b/arch/arm64/kernel/ptrace.c
+index 844049737964..17d773483832 100644
+--- a/arch/arm64/kernel/ptrace.c
++++ b/arch/arm64/kernel/ptrace.c
+@@ -46,6 +46,7 @@
+ #include <asm/debug-monitors.h>
+ #include <asm/fpsimd.h>
+ #include <asm/pgtable.h>
++#include <asm/pointer_auth.h>
+ #include <asm/stacktrace.h>
+ #include <asm/syscall.h>
+ #include <asm/traps.h>
+@@ -956,6 +957,30 @@ static int sve_set(struct task_struct *target,
+ 
+ #endif /* CONFIG_ARM64_SVE */
+ 
++#ifdef CONFIG_ARM64_PTR_AUTH
++static int pac_mask_get(struct task_struct *target,
++			const struct user_regset *regset,
++			unsigned int pos, unsigned int count,
++			void *kbuf, void __user *ubuf)
++{
++	/*
++	 * The PAC bits can differ across data and instruction pointers
++	 * depending on TCR_EL1.TBID*, which we may make use of in future, so
++	 * we expose separate masks.
++	 */
++	unsigned long mask = ptrauth_user_pac_mask();
++	struct user_pac_mask uregs = {
++		.data_mask = mask,
++		.insn_mask = mask,
++	};
++
++	if (!system_supports_address_auth())
++		return -EINVAL;
++
++	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, &uregs, 0, -1);
++}
++#endif /* CONFIG_ARM64_PTR_AUTH */
++
+ enum aarch64_regset {
+ 	REGSET_GPR,
+ 	REGSET_FPR,
+@@ -968,6 +993,9 @@ enum aarch64_regset {
+ #ifdef CONFIG_ARM64_SVE
+ 	REGSET_SVE,
+ #endif
++#ifdef CONFIG_ARM64_PTR_AUTH
++	REGSET_PAC_MASK,
++#endif
+ };
+ 
+ static const struct user_regset aarch64_regsets[] = {
+@@ -1037,6 +1065,16 @@ static const struct user_regset aarch64_regsets[] = {
+ 		.get_size = sve_get_size,
+ 	},
+ #endif
++#ifdef CONFIG_ARM64_PTR_AUTH
++	[REGSET_PAC_MASK] = {
++		.core_note_type = NT_ARM_PAC_MASK,
++		.n = sizeof(struct user_pac_mask) / sizeof(u64),
++		.size = sizeof(u64),
++		.align = sizeof(u64),
++		.get = pac_mask_get,
++		/* this cannot be set dynamically */
++	},
++#endif
+ };
+ 
+ static const struct user_regset_view user_aarch64_view = {
+diff --git a/include/uapi/linux/elf.h b/include/uapi/linux/elf.h
+index 4e12c423b9fe..86a72898b1a1 100644
+--- a/include/uapi/linux/elf.h
++++ b/include/uapi/linux/elf.h
+@@ -420,6 +420,7 @@ typedef struct elf64_shdr {
+ #define NT_ARM_HW_WATCH	0x403		/* ARM hardware watchpoint registers */
+ #define NT_ARM_SYSTEM_CALL	0x404	/* ARM system call number */
+ #define NT_ARM_SVE	0x405		/* ARM Scalable Vector Extension registers */
++#define NT_ARM_PAC_MASK		0x406	/* ARM pointer authentication code masks */
+ #define NT_ARC_V2	0x600		/* ARCv2 accumulator/extra registers */
+ #define NT_VMCOREDD	0x700		/* Vmcore Device Dump Note */
+ 
