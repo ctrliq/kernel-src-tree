@@ -1,0 +1,227 @@
+perf trace augmented_syscalls: Do not show syscalls when none was asked for
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 8bd436b006d4493964c310606f2eb8e56680126c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8bd436b0.failed
+
+When not using augmented syscalls, i.e. not passing thru the command
+line a eBPF source or object file event that provides the
+__augmented_syscalls__ BPF_MAP_TYPE_PERF_EVENT_ARRAY, etc, as with:
+
+   perf trace -e tools/perf/examples/bpf/augmented_raw_syscalls.c
+
+or passing that augmented eBPF source/object via the trace.add_events in
+.perfconfig file, we were assuming that syscalls were asked for,
+differing from when not using augmented syscalls at all.
+
+This is confusing when using .perfconfig to hide the fact we're using
+the augmenter, i.e. using:
+
+ # perf trace -e sched:* sleep 1
+
+Will show both the scheduler tracepoints and the syscalls, where what we
+want is to show just the scheduler tracepoints.
+
+To see the scheduler tracepoints and some specific syscall strace-like
+formatting, one has to use:
+
+  # perf trace -e sched:*,nanosleep sleep 1
+
+Or, if wanting all the syscalls:
+
+  # perf trace -e sched:* --syscalls sleep 1
+
+This way 'perf trace' can be used to trace just a set of tracepoints
+while allowing for mixing with strace-like when desired, by simply
+adding to the mix the name of the syscalls to show in addition to the
+tracepoints.
+
+Fix it so that the behaviour using the eBPF based syscall augmenter is
+the same as when not using one.
+
+Testing:
+
+Before this patch, with this ~/.perfconfig:
+
+  # egrep -B1 ^[[:space:]]+add_events ~/.perfconfig
+  [trace]
+  	add_events = /home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o
+  #
+
+That points to this pre-compiled eBPF syscall augmenter:
+
+  # file /home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o
+  /home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o: ELF 64-bit LSB relocatable, eBPF, version 1 (SYSV), with debug_info, not stripped
+
+And when asking for _only_ sched:sched_switch and sched:sched_wakeup we
+were unconditionally getting all the syscalls formatted strace-like:
+
+  # perf trace -e sched:*switch,sched:*wakeup sleep 1 |& tail
+     0.633 fstat(3, 0x7fe11d030ac0)                = 0
+     0.635 mmap(NULL, 217750512, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7fe10fec5000
+     0.643 close(3)                                = 0
+     0.668 nanosleep(0x7fff649a3a90, NULL)      ...
+     0.672 sched:sched_switch:prev_comm=sleep prev_pid=4417 prev_prio=120 prev_state=S ==> next_comm=swapper/6 next_pid=0 next_prio=120
+  1000.822 sched:sched_wakeup:comm=sleep pid=4417 prio=120 target_cpu=006
+     0.668  ... [continued]: nanosleep())          = 0
+  1000.923 close(1)                                = 0
+  1000.941 close(2)                                = 0
+  1000.974 exit_group(0)                           = ?
+  #
+
+After the patch:
+
+  # perf trace -e sched:*switch,sched:*wakeup sleep 1
+     0.000 sched:sched_wakeup:comm=perf pid=5529 prio=120 target_cpu=005
+     1.186 sched:sched_switch:prev_comm=sleep prev_pid=5529 prev_prio=120 prev_state=S ==> next_comm=swapper/5 next_pid=0 next_prio=120
+  1001.573 sched:sched_wakeup:comm=sleep pid=5529 prio=120 target_cpu=005
+  #
+
+If we add the "open*" syscalls to the mix then the eBPF augmented _will_
+be used and these syscalls will be traced together with the specified
+sched tracepoints:
+
+  # cd /sys/kernel/debug/tracing/events/syscalls/
+  # ls -1d sys_enter_open*
+  sys_enter_open
+  sys_enter_openat
+  sys_enter_open_by_handle_at
+  sys_enter_open_tree
+  #
+
+  # perf trace -e open*,sched:*switch,sched:*wakeup sleep 1
+       0.000 sched:sched_wakeup:comm=perf pid=5580 prio=120 target_cpu=005
+       0.590 openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+       0.616 openat(AT_FDCWD, "/lib64/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+       0.846 openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = 3
+       0.891 sched:sched_switch:prev_comm=sleep prev_pid=5580 prev_prio=120 prev_state=S ==> next_comm=swapper/5 next_pid=0 next_prio=120
+    1001.005 sched:sched_wakeup:comm=sleep pid=5580 prio=120 target_cpu=005
+  #
+
+And as we can see, the pathnames were collected via the eBPF augmenters.
+
+If we don't specify anything it'll trace all syscalls:
+
+  # perf trace sleep 1 |& tail
+       0.299 brk(0x5597543a3000)                     = 0x5597543a3000
+       0.302 brk(NULL)                               = 0x5597543a3000
+       0.307 openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = 3
+       0.313 fstat(3, 0x7feece50cac0)                = 0
+       0.315 mmap(NULL, 217750512, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7feec13a1000
+       0.323 close(3)                                = 0
+       0.354 nanosleep(0x7ffe338856e0, NULL)         = 0
+    1000.641 close(1)                                = 0
+    1000.655 close(2)                                = 0
+    1000.673 exit_group(0)                           = ?
+  #
+
+Ditto if we don't use .perfconfig's trace.add_events but instead pass
+just the augmenter as a command line event:
+
+  # vim ~/.perfconfig
+  # egrep -B1 ^[[:space:]]+add_events ~/.perfconfig
+  # perf trace -e /home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o sleep 1 |& tail
+       0.294 brk(0x55ae08ec3000)                     = 0x55ae08ec3000
+       0.297 brk(NULL)                               = 0x55ae08ec3000
+       0.302 openat(AT_FDCWD, "/usr/lib/locale/locale-archive", O_RDONLY|O_CLOEXEC) = 3
+       0.309 fstat(3, 0x7f726488fac0)                = 0
+       0.311 mmap(NULL, 217750512, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f7257724000
+       0.319 close(3)                                = 0
+       0.347 nanosleep(0x7ffe23643a70, NULL)         = 0
+    1000.560 close(1)                                = 0
+    1000.575 close(2)                                = 0
+    1000.593 exit_group(0)                           = ?
+  #
+
+As well as that + some syscall names for strace-like formatting:
+
+  # perf trace -e socket,connect,/home/acme/git/perf/tools/perf/examples/bpf/augmented_raw_syscalls.o ssh localhost
+       0.000 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 3
+       0.021 connect(3, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       0.034 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 3
+       0.041 connect(3, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       0.163 socket(PF_LOCAL, SOCK_STREAM, 0)        = 4
+       0.185 connect(4, { .family: PF_LOCAL, path: /var/lib/sss/pipes/nss }, 110) = 0
+       0.670 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 7
+       0.684 connect(7, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       0.694 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 7
+       0.701 connect(7, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       0.994 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 5
+       1.006 connect(5, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       1.014 socket(PF_LOCAL, SOCK_STREAM|CLOEXEC|NONBLOCK, 0) = 5
+       1.022 connect(5, { .family: PF_LOCAL, path: /var/run/nscd/socket }, 110) = -1 ENOENT (No such file or directory)
+       1.068 socket(PF_INET, SOCK_STREAM, IPPROTO_TCP) = 5
+       1.087 connect(5, { .family: PF_INET, port: 22, addr: 127.0.0.1 }, 16) = 0
+      24.299 socket(PF_LOCAL, SOCK_STREAM, 0)        = 6
+      24.337 connect(6, { .family: PF_LOCAL, path: /var/run/.heim_org.h5l.kcm-socket }, 110) = 0
+      28.441 socket(PF_LOCAL, SOCK_STREAM, 0)        = 6
+      28.516 connect(6, { .family: PF_LOCAL, path: /var/run/.heim_org.h5l.kcm-socket }, 110) = 0
+  root@localhost's password:^C
+  #
+
+Everything works without augmenters:
+
+  # egrep -B1 ^[[:space:]]+add_events ~/.perfconfig
+  # perf trace sleep 1 |& tail
+       0.261 brk(0x5635068ac000)                     = 0x5635068ac000
+       0.264 brk(NULL)                               = 0x5635068ac000
+       0.268 openat(AT_FDCWD, 0xdce642a0, O_RDONLY|O_CLOEXEC) = 3
+       0.275 fstat(3, 0x7f3fdce97ac0)                = 0
+       0.277 mmap(NULL, 217750512, PROT_READ, MAP_PRIVATE, 3, 0) = 0x7f3fcfd2c000
+       0.284 close(3)                                = 0
+       0.310 nanosleep(0x7ffdaea6ecd0, NULL)         = 0
+    1000.552 close(1)                                = 0
+    1000.565 close(2)                                = 0
+    1000.580 exit_group(0)                           = ?
+  #
+
+  # perf trace -e connect ssh localhost
+       0.000 connect(3, 0x58266930, 110)             = -1 ENOENT (No such file or directory)
+       0.022 connect(3, 0x58266af0, 110)             = -1 ENOENT (No such file or directory)
+       0.150 connect(4, 0x58266b00, 110)             = 0
+       0.490 connect(7, 0x58264150, 110)             = -1 ENOENT (No such file or directory)
+       0.505 connect(7, 0x58264300, 110)             = -1 ENOENT (No such file or directory)
+       0.832 connect(5, 0x58266220, 110)             = -1 ENOENT (No such file or directory)
+       0.847 connect(5, 0x582663e0, 110)             = -1 ENOENT (No such file or directory)
+       0.899 connect(5, 0x95ba0630, 16)              = 0
+      25.619 connect(6, 0x58266360, 110)             = 0
+      40.564 connect(6, 0x58266330, 110)             = 0
+  root@localhost's password: ^C
+  #
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Brendan Gregg <brendan.d.gregg@gmail.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Luis Cláudio Gonçalves <lclaudio@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-624f6jxic04031tnt40va4dd@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 8bd436b006d4493964c310606f2eb8e56680126c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-trace.c
+diff --cc tools/perf/builtin-trace.c
+index 617d2c0f1680,6c7025370ec0..000000000000
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@@ -4398,11 -4500,6 +4488,14 @@@ init_augmented_syscall_tp
+  	if (trace.summary_only)
+  		trace.summary = trace.summary_only;
+  
+++<<<<<<< HEAD
+ +	if (!trace.trace_syscalls && !trace.trace_pgfaults &&
+ +	    trace.evlist->nr_entries == 0 /* Was --events used? */) {
+ +		trace.trace_syscalls = true;
+ +	}
+ +
+++=======
+++>>>>>>> 8bd436b006d4 (perf trace augmented_syscalls: Do not show syscalls when none was asked for)
+  	if (output_name != NULL) {
+  		err = trace__open_output(&trace, output_name);
+  		if (err < 0) {
+* Unmerged path tools/perf/builtin-trace.c
