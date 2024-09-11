@@ -217,10 +217,7 @@ void nfs_release_automount_timer(void)
 
 /**
  * nfs_do_submount - set up mountpoint when crossing a filesystem boundary
- * @dentry: parent directory
- * @fh: filehandle for new root dentry
- * @fattr: attributes for new root inode
- * @authflavor: security flavor to use when performing the mount
+ * @fc: pointer to struct nfs_fs_context
  *
  */
 struct vfsmount *nfs_do_submount(struct dentry *dentry, struct nfs_fh *fh,

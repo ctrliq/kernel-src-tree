@@ -289,7 +289,7 @@ static struct vfsmount *try_location(struct nfs_clone_mount *mountdata,
 
 /**
  * nfs_follow_referral - set up mountpoint when hitting a referral on moved error
- * @dentry: parent directory
+ * @fc: pointer to struct nfs_fs_context
  * @locations: array of NFSv4 server location information
  *
  */
