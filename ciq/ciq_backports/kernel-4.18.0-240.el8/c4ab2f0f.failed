@@ -1,0 +1,209 @@
+perf intel-pt: Add support for recording AUX area samples
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Adrian Hunter <adrian.hunter@intel.com>
+commit c4ab2f0f763da64d88cec6f20fd664f2347eca60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c4ab2f0f.failed
+
+Set up the default number of mmap pages, default sample size and default
+psb_period for AUX area sampling. Add documentation also.
+
+	Signed-off-by: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+Link: http://lore.kernel.org/lkml/20191115124225.5247-14-adrian.hunter@intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c4ab2f0f763da64d88cec6f20fd664f2347eca60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/arch/x86/util/intel-pt.c
+diff --cc tools/perf/arch/x86/util/intel-pt.c
+index 3a851647e6f4,20df442fdf36..000000000000
+--- a/tools/perf/arch/x86/util/intel-pt.c
++++ b/tools/perf/arch/x86/util/intel-pt.c
+@@@ -27,7 -17,9 +27,8 @@@
+  #include "../../util/event.h"
+  #include "../../util/evlist.h"
+  #include "../../util/evsel.h"
++ #include "../../util/evsel_config.h"
+  #include "../../util/cpumap.h"
+ -#include "../../util/mmap.h"
+  #include <subcmd/parse-options.h>
+  #include "../../util/parse-events.h"
+  #include "../../util/pmu.h"
+@@@ -554,7 -549,64 +555,68 @@@ static int intel_pt_validate_config(str
+  
+  	return intel_pt_val_config_term(intel_pt_pmu, "caps/psb_periods",
+  					"psb_period", "caps/psb_cyc",
+++<<<<<<< HEAD
+ +					evsel->attr.config);
+++=======
++ 					evsel->core.attr.config);
++ }
++ 
++ static void intel_pt_config_sample_mode(struct perf_pmu *intel_pt_pmu,
++ 					struct evsel *evsel)
++ {
++ 	struct perf_evsel_config_term *term;
++ 	u64 user_bits = 0, bits;
++ 
++ 	term = perf_evsel__get_config_term(evsel, CFG_CHG);
++ 	if (term)
++ 		user_bits = term->val.cfg_chg;
++ 
++ 	bits = perf_pmu__format_bits(&intel_pt_pmu->format, "psb_period");
++ 
++ 	/* Did user change psb_period */
++ 	if (bits & user_bits)
++ 		return;
++ 
++ 	/* Set psb_period to 0 */
++ 	evsel->core.attr.config &= ~bits;
++ }
++ 
++ static void intel_pt_min_max_sample_sz(struct evlist *evlist,
++ 				       size_t *min_sz, size_t *max_sz)
++ {
++ 	struct evsel *evsel;
++ 
++ 	evlist__for_each_entry(evlist, evsel) {
++ 		size_t sz = evsel->core.attr.aux_sample_size;
++ 
++ 		if (!sz)
++ 			continue;
++ 		if (min_sz && (sz < *min_sz || !*min_sz))
++ 			*min_sz = sz;
++ 		if (max_sz && sz > *max_sz)
++ 			*max_sz = sz;
++ 	}
++ }
++ 
++ /*
++  * Currently, there is not enough information to disambiguate different PEBS
++  * events, so only allow one.
++  */
++ static bool intel_pt_too_many_aux_output(struct evlist *evlist)
++ {
++ 	struct evsel *evsel;
++ 	int aux_output_cnt = 0;
++ 
++ 	evlist__for_each_entry(evlist, evsel)
++ 		aux_output_cnt += !!evsel->core.attr.aux_output;
++ 
++ 	if (aux_output_cnt > 1) {
++ 		pr_err(INTEL_PT_PMU_NAME " supports at most one event with aux-output\n");
++ 		return true;
++ 	}
++ 
++ 	return false;
+++>>>>>>> c4ab2f0f763d (perf intel-pt: Add support for recording AUX area samples)
+  }
+  
+  static int intel_pt_recording_options(struct auxtrace_record *itr,
+diff --git a/tools/perf/Documentation/intel-pt.txt b/tools/perf/Documentation/intel-pt.txt
+index e0d9e7dd4f17..2cf2d9e9d0da 100644
+--- a/tools/perf/Documentation/intel-pt.txt
++++ b/tools/perf/Documentation/intel-pt.txt
+@@ -434,6 +434,56 @@ pwr_evt		Enable power events.  The power events provide information about
+ 		"0" otherwise.
+ 
+ 
++AUX area sampling option
++------------------------
++
++To select Intel PT "sampling" the AUX area sampling option can be used:
++
++	--aux-sample
++
++Optionally it can be followed by the sample size in bytes e.g.
++
++	--aux-sample=8192
++
++In addition, the Intel PT event to sample must be defined e.g.
++
++	-e intel_pt//u
++
++Samples on other events will be created containing Intel PT data e.g. the
++following will create Intel PT samples on the branch-misses event, note the
++events must be grouped using {}:
++
++	perf record --aux-sample -e '{intel_pt//u,branch-misses:u}'
++
++An alternative to '--aux-sample' is to add the config term 'aux-sample-size' to
++events.  In this case, the grouping is implied e.g.
++
++	perf record -e intel_pt//u -e branch-misses/aux-sample-size=8192/u
++
++is the same as:
++
++	perf record -e '{intel_pt//u,branch-misses/aux-sample-size=8192/u}'
++
++but allows for also using an address filter e.g.:
++
++	perf record -e intel_pt//u --filter 'filter * @/bin/ls' -e branch-misses/aux-sample-size=8192/u -- ls
++
++It is important to select a sample size that is big enough to contain at least
++one PSB packet.  If not a warning will be displayed:
++
++	Intel PT sample size (%zu) may be too small for PSB period (%zu)
++
++The calculation used for that is: if sample_size <= psb_period + 256 display the
++warning.  When sampling is used, psb_period defaults to 0 (2KiB).
++
++The default sample size is 4KiB.
++
++The sample size is passed in aux_sample_size in struct perf_event_attr.  The
++sample size is limited by the maximum event size which is 64KiB.  It is
++difficult to know how big the event might be without the trace sample attached,
++but the tool validates that the sample size is not greater than 60KiB.
++
++
+ new snapshot option
+ -------------------
+ 
+@@ -487,8 +537,8 @@ their mlock limit (which defaults to 64KiB but is not multiplied by the number
+ of cpus).
+ 
+ In full-trace mode, powers of two are allowed for buffer size, with a minimum
+-size of 2 pages.  In snapshot mode, it is the same but the minimum size is
+-1 page.
++size of 2 pages.  In snapshot mode or sampling mode, it is the same but the
++minimum size is 1 page.
+ 
+ The mmap size and auxtrace mmap size are displayed if the -vv option is used e.g.
+ 
+@@ -501,12 +551,17 @@ Intel PT modes of operation
+ 
+ Intel PT can be used in 2 modes:
+ 	full-trace mode
++	sample mode
+ 	snapshot mode
+ 
+ Full-trace mode traces continuously e.g.
+ 
+ 	perf record -e intel_pt//u uname
+ 
++Sample mode attaches a Intel PT sample to other events e.g.
++
++	perf record --aux-sample -e intel_pt//u -e branch-misses:u
++
+ Snapshot mode captures the available data when a signal is sent e.g.
+ 
+ 	perf record -v -e intel_pt//u -S ./loopy 1000000000 &
+diff --git a/tools/perf/arch/x86/util/auxtrace.c b/tools/perf/arch/x86/util/auxtrace.c
+index b135af62011c..454d58f1cb1c 100644
+--- a/tools/perf/arch/x86/util/auxtrace.c
++++ b/tools/perf/arch/x86/util/auxtrace.c
+@@ -35,6 +35,8 @@ struct auxtrace_record *auxtrace_record__init_intel(struct perf_evlist *evlist,
+ 	bool found_bts = false;
+ 
+ 	intel_pt_pmu = perf_pmu__find(INTEL_PT_PMU_NAME);
++	if (intel_pt_pmu)
++		intel_pt_pmu->auxtrace = true;
+ 	intel_bts_pmu = perf_pmu__find(INTEL_BTS_PMU_NAME);
+ 
+ 	evlist__for_each_entry(evlist, evsel) {
+* Unmerged path tools/perf/arch/x86/util/intel-pt.c
