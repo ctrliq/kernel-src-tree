@@ -1,0 +1,219 @@
+vfs: teach vfs_ioc_fssetxattr_check to check extent size hints
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit ca29be753445450799958e7d2e5d797d1153389e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ca29be75.failed
+
+Move the extent size hint checks that aren't xfs-specific to the vfs.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit ca29be753445450799958e7d2e5d797d1153389e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/inode.c
+diff --cc fs/inode.c
+index ad98bee52a46,0cbce5a0a23c..000000000000
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@@ -2214,6 -2167,84 +2214,87 @@@ struct timespec64 current_time(struct i
+  		return now;
+  	}
+  
+ -	return timespec64_trunc(now, inode->i_sb->s_time_gran);
+ +	return timestamp_truncate(now, inode);
+  }
+  EXPORT_SYMBOL(current_time);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Generic function to check FS_IOC_SETFLAGS values and reject any invalid
++  * configurations.
++  *
++  * Note: the caller should be holding i_mutex, or else be sure that they have
++  * exclusive access to the inode structure.
++  */
++ int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
++ 			     unsigned int flags)
++ {
++ 	/*
++ 	 * The IMMUTABLE and APPEND_ONLY flags can only be changed by
++ 	 * the relevant capability.
++ 	 *
++ 	 * This test looks nicer. Thanks to Pauline Middelink
++ 	 */
++ 	if ((flags ^ oldflags) & (FS_APPEND_FL | FS_IMMUTABLE_FL) &&
++ 	    !capable(CAP_LINUX_IMMUTABLE))
++ 		return -EPERM;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(vfs_ioc_setflags_prepare);
++ 
++ /*
++  * Generic function to check FS_IOC_FSSETXATTR values and reject any invalid
++  * configurations.
++  *
++  * Note: the caller should be holding i_mutex, or else be sure that they have
++  * exclusive access to the inode structure.
++  */
++ int vfs_ioc_fssetxattr_check(struct inode *inode, const struct fsxattr *old_fa,
++ 			     struct fsxattr *fa)
++ {
++ 	/*
++ 	 * Can't modify an immutable/append-only file unless we have
++ 	 * appropriate permission.
++ 	 */
++ 	if ((old_fa->fsx_xflags ^ fa->fsx_xflags) &
++ 			(FS_XFLAG_IMMUTABLE | FS_XFLAG_APPEND) &&
++ 	    !capable(CAP_LINUX_IMMUTABLE))
++ 		return -EPERM;
++ 
++ 	/*
++ 	 * Project Quota ID state is only allowed to change from within the init
++ 	 * namespace. Enforce that restriction only if we are trying to change
++ 	 * the quota ID state. Everything else is allowed in user namespaces.
++ 	 */
++ 	if (current_user_ns() != &init_user_ns) {
++ 		if (old_fa->fsx_projid != fa->fsx_projid)
++ 			return -EINVAL;
++ 		if ((old_fa->fsx_xflags ^ fa->fsx_xflags) &
++ 				FS_XFLAG_PROJINHERIT)
++ 			return -EINVAL;
++ 	}
++ 
++ 	/* Check extent size hints. */
++ 	if ((fa->fsx_xflags & FS_XFLAG_EXTSIZE) && !S_ISREG(inode->i_mode))
++ 		return -EINVAL;
++ 
++ 	if ((fa->fsx_xflags & FS_XFLAG_EXTSZINHERIT) &&
++ 			!S_ISDIR(inode->i_mode))
++ 		return -EINVAL;
++ 
++ 	if ((fa->fsx_xflags & FS_XFLAG_COWEXTSIZE) &&
++ 	    !S_ISREG(inode->i_mode) && !S_ISDIR(inode->i_mode))
++ 		return -EINVAL;
++ 
++ 	/* Extent size hints of zero turn off the flags. */
++ 	if (fa->fsx_extsize == 0)
++ 		fa->fsx_xflags &= ~(FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT);
++ 	if (fa->fsx_cowextsize == 0)
++ 		fa->fsx_xflags &= ~FS_XFLAG_COWEXTSIZE;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(vfs_ioc_fssetxattr_check);
+++>>>>>>> ca29be753445 (vfs: teach vfs_ioc_fssetxattr_check to check extent size hints)
+* Unmerged path fs/inode.c
+diff --git a/fs/xfs/xfs_ioctl.c b/fs/xfs/xfs_ioctl.c
+index 44d791730753..05b050e76d9e 100644
+--- a/fs/xfs/xfs_ioctl.c
++++ b/fs/xfs/xfs_ioctl.c
+@@ -1387,39 +1387,31 @@ xfs_ioctl_setattr_check_extsize(
+ 	struct fsxattr		*fa)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
+-
+-	if ((fa->fsx_xflags & FS_XFLAG_EXTSIZE) && !S_ISREG(VFS_I(ip)->i_mode))
+-		return -EINVAL;
+-
+-	if ((fa->fsx_xflags & FS_XFLAG_EXTSZINHERIT) &&
+-	    !S_ISDIR(VFS_I(ip)->i_mode))
+-		return -EINVAL;
++	xfs_extlen_t		size;
++	xfs_fsblock_t		extsize_fsb;
+ 
+ 	if (S_ISREG(VFS_I(ip)->i_mode) && ip->i_d.di_nextents &&
+ 	    ((ip->i_d.di_extsize << mp->m_sb.sb_blocklog) != fa->fsx_extsize))
+ 		return -EINVAL;
+ 
+-	if (fa->fsx_extsize != 0) {
+-		xfs_extlen_t    size;
+-		xfs_fsblock_t   extsize_fsb;
+-
+-		extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
+-		if (extsize_fsb > MAXEXTLEN)
+-			return -EINVAL;
++	if (fa->fsx_extsize == 0)
++		return 0;
+ 
+-		if (XFS_IS_REALTIME_INODE(ip) ||
+-		    (fa->fsx_xflags & FS_XFLAG_REALTIME)) {
+-			size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
+-		} else {
+-			size = mp->m_sb.sb_blocksize;
+-			if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
+-				return -EINVAL;
+-		}
++	extsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_extsize);
++	if (extsize_fsb > MAXEXTLEN)
++		return -EINVAL;
+ 
+-		if (fa->fsx_extsize % size)
++	if (XFS_IS_REALTIME_INODE(ip) ||
++	    (fa->fsx_xflags & FS_XFLAG_REALTIME)) {
++		size = mp->m_sb.sb_rextsize << mp->m_sb.sb_blocklog;
++	} else {
++		size = mp->m_sb.sb_blocksize;
++		if (extsize_fsb > mp->m_sb.sb_agblocks / 2)
+ 			return -EINVAL;
+-	} else
+-		fa->fsx_xflags &= ~(FS_XFLAG_EXTSIZE | FS_XFLAG_EXTSZINHERIT);
++	}
++
++	if (fa->fsx_extsize % size)
++		return -EINVAL;
+ 
+ 	return 0;
+ }
+@@ -1445,6 +1437,8 @@ xfs_ioctl_setattr_check_cowextsize(
+ 	struct fsxattr		*fa)
+ {
+ 	struct xfs_mount	*mp = ip->i_mount;
++	xfs_extlen_t		size;
++	xfs_fsblock_t		cowextsize_fsb;
+ 
+ 	if (!(fa->fsx_xflags & FS_XFLAG_COWEXTSIZE))
+ 		return 0;
+@@ -1453,25 +1447,19 @@ xfs_ioctl_setattr_check_cowextsize(
+ 	    ip->i_d.di_version != 3)
+ 		return -EINVAL;
+ 
+-	if (!S_ISREG(VFS_I(ip)->i_mode) && !S_ISDIR(VFS_I(ip)->i_mode))
+-		return -EINVAL;
+-
+-	if (fa->fsx_cowextsize != 0) {
+-		xfs_extlen_t    size;
+-		xfs_fsblock_t   cowextsize_fsb;
++	if (fa->fsx_cowextsize == 0)
++		return 0;
+ 
+-		cowextsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_cowextsize);
+-		if (cowextsize_fsb > MAXEXTLEN)
+-			return -EINVAL;
++	cowextsize_fsb = XFS_B_TO_FSB(mp, fa->fsx_cowextsize);
++	if (cowextsize_fsb > MAXEXTLEN)
++		return -EINVAL;
+ 
+-		size = mp->m_sb.sb_blocksize;
+-		if (cowextsize_fsb > mp->m_sb.sb_agblocks / 2)
+-			return -EINVAL;
++	size = mp->m_sb.sb_blocksize;
++	if (cowextsize_fsb > mp->m_sb.sb_agblocks / 2)
++		return -EINVAL;
+ 
+-		if (fa->fsx_cowextsize % size)
+-			return -EINVAL;
+-	} else
+-		fa->fsx_xflags &= ~FS_XFLAG_COWEXTSIZE;
++	if (fa->fsx_cowextsize % size)
++		return -EINVAL;
+ 
+ 	return 0;
+ }
