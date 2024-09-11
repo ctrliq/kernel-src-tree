@@ -1,0 +1,361 @@
+kasan, mm: fail krealloc on freed objects
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 26a5ca7a73be31f76c291465680517cde37051ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/26a5ca7a.failed
+
+Currently, if krealloc() is called on a freed object with KASAN enabled,
+it allocates and returns a new object, but doesn't copy any memory from
+the old one as ksize() returns 0.  This makes the caller believe that
+krealloc() succeeded (KASAN report is printed though).
+
+This patch adds an accessibility check into __do_krealloc().  If the check
+fails, krealloc() returns NULL.  This check duplicates the one in ksize();
+this is fixed in the following patch.
+
+This patch also adds a KASAN-KUnit test to check krealloc() behaviour when
+it's called on a freed object.
+
+Link: https://lkml.kernel.org/r/cbcf7b02be0a1ca11de4f833f2ff0b3f2c9b00c8.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 26a5ca7a73be31f76c291465680517cde37051ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_kasan.c
+diff --cc lib/test_kasan.c
+index 5679dda37d78,e5647d147b35..000000000000
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@@ -205,7 -325,54 +205,58 @@@ static noinline void __init kmalloc_oob
+  	kfree(ptr2);
+  }
+  
+++<<<<<<< HEAD
+ +static noinline void __init kmalloc_oob_16(void)
+++=======
++ static void krealloc_more_oob(struct kunit *test)
++ {
++ 	krealloc_more_oob_helper(test, 201, 235);
++ }
++ 
++ static void krealloc_less_oob(struct kunit *test)
++ {
++ 	krealloc_less_oob_helper(test, 235, 201);
++ }
++ 
++ static void krealloc_pagealloc_more_oob(struct kunit *test)
++ {
++ 	/* page_alloc fallback in only implemented for SLUB. */
++ 	KASAN_TEST_NEEDS_CONFIG_ON(test, CONFIG_SLUB);
++ 
++ 	krealloc_more_oob_helper(test, KMALLOC_MAX_CACHE_SIZE + 201,
++ 					KMALLOC_MAX_CACHE_SIZE + 235);
++ }
++ 
++ static void krealloc_pagealloc_less_oob(struct kunit *test)
++ {
++ 	/* page_alloc fallback in only implemented for SLUB. */
++ 	KASAN_TEST_NEEDS_CONFIG_ON(test, CONFIG_SLUB);
++ 
++ 	krealloc_less_oob_helper(test, KMALLOC_MAX_CACHE_SIZE + 235,
++ 					KMALLOC_MAX_CACHE_SIZE + 201);
++ }
++ 
++ /*
++  * Check that krealloc() detects a use-after-free, returns NULL,
++  * and doesn't unpoison the freed object.
++  */
++ static void krealloc_uaf(struct kunit *test)
++ {
++ 	char *ptr1, *ptr2;
++ 	int size1 = 201;
++ 	int size2 = 235;
++ 
++ 	ptr1 = kmalloc(size1, GFP_KERNEL);
++ 	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr1);
++ 	kfree(ptr1);
++ 
++ 	KUNIT_EXPECT_KASAN_FAIL(test, ptr2 = krealloc(ptr1, size2, GFP_KERNEL));
++ 	KUNIT_ASSERT_PTR_EQ(test, (void *)ptr2, NULL);
++ 	KUNIT_EXPECT_KASAN_FAIL(test, *(volatile char *)ptr1);
++ }
++ 
++ static void kmalloc_oob_16(struct kunit *test)
+++>>>>>>> 26a5ca7a73be (kasan, mm: fail krealloc on freed objects)
+  {
+  	struct {
+  		u64 words[2];
+@@@ -808,100 -961,159 +859,154 @@@ static noinline void __init vmalloc_oob
+  	 * The MMU will catch that and crash us.
+  	 */
+  	area = vmalloc(3000);
+ -	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, area);
+ +	if (!area) {
+ +		pr_err("Allocation failed\n");
+ +		return;
+ +	}
+  
+ -	KUNIT_EXPECT_KASAN_FAIL(test, ((volatile char *)area)[3100]);
+ +	((volatile char *)area)[3100];
+  	vfree(area);
+  }
+ +#else
+ +static void __init vmalloc_oob(void) {}
+ +#endif
+  
+ -/*
+ - * Check that the assigned pointer tag falls within the [KASAN_TAG_MIN,
+ - * KASAN_TAG_KERNEL) range (note: excluding the match-all tag) for tag-based
+ - * modes.
+ - */
+ -static void match_all_not_assigned(struct kunit *test)
+ -{
+ -	char *ptr;
+ -	struct page *pages;
+ -	int i, size, order;
+ -
+ -	KASAN_TEST_NEEDS_CONFIG_OFF(test, CONFIG_KASAN_GENERIC);
+ -
+ -	for (i = 0; i < 256; i++) {
+ -		size = (get_random_int() % 1024) + 1;
+ -		ptr = kmalloc(size, GFP_KERNEL);
+ -		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+ -		KUNIT_EXPECT_GE(test, (u8)get_tag(ptr), (u8)KASAN_TAG_MIN);
+ -		KUNIT_EXPECT_LT(test, (u8)get_tag(ptr), (u8)KASAN_TAG_KERNEL);
+ -		kfree(ptr);
+ -	}
+ -
+ -	for (i = 0; i < 256; i++) {
+ -		order = (get_random_int() % 4) + 1;
+ -		pages = alloc_pages(GFP_KERNEL, order);
+ -		ptr = page_address(pages);
+ -		KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+ -		KUNIT_EXPECT_GE(test, (u8)get_tag(ptr), (u8)KASAN_TAG_MIN);
+ -		KUNIT_EXPECT_LT(test, (u8)get_tag(ptr), (u8)KASAN_TAG_KERNEL);
+ -		free_pages((unsigned long)ptr, order);
+ -	}
+ -}
+ +static struct kasan_rcu_info {
+ +	int i;
+ +	struct rcu_head rcu;
+ +} *global_rcu_ptr;
+  
+ -/* Check that 0xff works as a match-all pointer tag for tag-based modes. */
+ -static void match_all_ptr_tag(struct kunit *test)
+ +static noinline void __init kasan_rcu_reclaim(struct rcu_head *rp)
+  {
+ -	char *ptr;
+ -	u8 tag;
+ -
+ -	KASAN_TEST_NEEDS_CONFIG_OFF(test, CONFIG_KASAN_GENERIC);
+ -
+ -	ptr = kmalloc(128, GFP_KERNEL);
+ -	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+ -
+ -	/* Backup the assigned tag. */
+ -	tag = get_tag(ptr);
+ -	KUNIT_EXPECT_NE(test, tag, (u8)KASAN_TAG_KERNEL);
+ +	struct kasan_rcu_info *fp = container_of(rp,
+ +						struct kasan_rcu_info, rcu);
+  
+ -	/* Reset the tag to 0xff.*/
+ -	ptr = set_tag(ptr, KASAN_TAG_KERNEL);
+ -
+ -	/* This access shouldn't trigger a KASAN report. */
+ -	*ptr = 0;
+ -
+ -	/* Recover the pointer tag and free. */
+ -	ptr = set_tag(ptr, tag);
+ -	kfree(ptr);
+ +	kfree(fp);
+ +	fp->i = 1;
+  }
+  
+ -/* Check that there are no match-all memory tags for tag-based modes. */
+ -static void match_all_mem_tag(struct kunit *test)
+ +static noinline void __init kasan_rcu_uaf(void)
+  {
+ -	char *ptr;
+ -	int tag;
+ -
+ -	KASAN_TEST_NEEDS_CONFIG_OFF(test, CONFIG_KASAN_GENERIC);
+ +	struct kasan_rcu_info *ptr;
+  
+ -	ptr = kmalloc(128, GFP_KERNEL);
+ -	KUNIT_ASSERT_NOT_ERR_OR_NULL(test, ptr);
+ -	KUNIT_EXPECT_NE(test, (u8)get_tag(ptr), (u8)KASAN_TAG_KERNEL);
+ -
+ -	/* For each possible tag value not matching the pointer tag. */
+ -	for (tag = KASAN_TAG_MIN; tag <= KASAN_TAG_KERNEL; tag++) {
+ -		if (tag == get_tag(ptr))
+ -			continue;
+ -
+ -		/* Mark the first memory granule with the chosen memory tag. */
+ -		kasan_poison(ptr, KASAN_GRANULE_SIZE, (u8)tag);
+ -
+ -		/* This access must cause a KASAN report. */
+ -		KUNIT_EXPECT_KASAN_FAIL(test, *ptr = 0);
+ +	pr_info("use-after-free in kasan_rcu_reclaim\n");
+ +	ptr = kmalloc(sizeof(struct kasan_rcu_info), GFP_KERNEL);
+ +	if (!ptr) {
+ +		pr_err("Allocation failed\n");
+ +		return;
+  	}
+  
+ -	/* Recover the memory tag and free. */
+ -	kasan_poison(ptr, KASAN_GRANULE_SIZE, get_tag(ptr));
+ -	kfree(ptr);
+ +	global_rcu_ptr = rcu_dereference_protected(ptr, NULL);
+ +	call_rcu(&global_rcu_ptr->rcu, kasan_rcu_reclaim);
+  }
+  
+++<<<<<<< HEAD
+ +static int __init kmalloc_tests_init(void)
+ +{
+ +	/*
+ +	 * Temporarily enable multi-shot mode. Otherwise, we'd only get a
+ +	 * report for the first case.
+ +	 */
+ +	bool multishot = kasan_save_enable_multi_shot();
+++=======
++ static struct kunit_case kasan_kunit_test_cases[] = {
++ 	KUNIT_CASE(kmalloc_oob_right),
++ 	KUNIT_CASE(kmalloc_oob_left),
++ 	KUNIT_CASE(kmalloc_node_oob_right),
++ 	KUNIT_CASE(kmalloc_pagealloc_oob_right),
++ 	KUNIT_CASE(kmalloc_pagealloc_uaf),
++ 	KUNIT_CASE(kmalloc_pagealloc_invalid_free),
++ 	KUNIT_CASE(pagealloc_oob_right),
++ 	KUNIT_CASE(pagealloc_uaf),
++ 	KUNIT_CASE(kmalloc_large_oob_right),
++ 	KUNIT_CASE(krealloc_more_oob),
++ 	KUNIT_CASE(krealloc_less_oob),
++ 	KUNIT_CASE(krealloc_pagealloc_more_oob),
++ 	KUNIT_CASE(krealloc_pagealloc_less_oob),
++ 	KUNIT_CASE(krealloc_uaf),
++ 	KUNIT_CASE(kmalloc_oob_16),
++ 	KUNIT_CASE(kmalloc_uaf_16),
++ 	KUNIT_CASE(kmalloc_oob_in_memset),
++ 	KUNIT_CASE(kmalloc_oob_memset_2),
++ 	KUNIT_CASE(kmalloc_oob_memset_4),
++ 	KUNIT_CASE(kmalloc_oob_memset_8),
++ 	KUNIT_CASE(kmalloc_oob_memset_16),
++ 	KUNIT_CASE(kmalloc_memmove_invalid_size),
++ 	KUNIT_CASE(kmalloc_uaf),
++ 	KUNIT_CASE(kmalloc_uaf_memset),
++ 	KUNIT_CASE(kmalloc_uaf2),
++ 	KUNIT_CASE(kfree_via_page),
++ 	KUNIT_CASE(kfree_via_phys),
++ 	KUNIT_CASE(kmem_cache_oob),
++ 	KUNIT_CASE(kmem_cache_accounted),
++ 	KUNIT_CASE(kmem_cache_bulk),
++ 	KUNIT_CASE(kasan_global_oob),
++ 	KUNIT_CASE(kasan_stack_oob),
++ 	KUNIT_CASE(kasan_alloca_oob_left),
++ 	KUNIT_CASE(kasan_alloca_oob_right),
++ 	KUNIT_CASE(ksize_unpoisons_memory),
++ 	KUNIT_CASE(ksize_uaf),
++ 	KUNIT_CASE(kmem_cache_double_free),
++ 	KUNIT_CASE(kmem_cache_invalid_free),
++ 	KUNIT_CASE(kasan_memchr),
++ 	KUNIT_CASE(kasan_memcmp),
++ 	KUNIT_CASE(kasan_strings),
++ 	KUNIT_CASE(kasan_bitops_generic),
++ 	KUNIT_CASE(kasan_bitops_tags),
++ 	KUNIT_CASE(kmalloc_double_kzfree),
++ 	KUNIT_CASE(vmalloc_oob),
++ 	KUNIT_CASE(match_all_not_assigned),
++ 	KUNIT_CASE(match_all_ptr_tag),
++ 	KUNIT_CASE(match_all_mem_tag),
++ 	{}
++ };
+++>>>>>>> 26a5ca7a73be (kasan, mm: fail krealloc on freed objects)
+ +
+ +	kmalloc_oob_right();
+ +	kmalloc_oob_left();
+ +	kmalloc_node_oob_right();
+ +#ifdef CONFIG_SLUB
+ +	kmalloc_pagealloc_oob_right();
+ +	kmalloc_pagealloc_uaf();
+ +	kmalloc_pagealloc_invalid_free();
+ +#endif
+ +	kmalloc_large_oob_right();
+ +	kmalloc_oob_krealloc_more();
+ +	kmalloc_oob_krealloc_less();
+ +	kmalloc_oob_16();
+ +	kmalloc_oob_in_memset();
+ +	kmalloc_oob_memset_2();
+ +	kmalloc_oob_memset_4();
+ +	kmalloc_oob_memset_8();
+ +	kmalloc_oob_memset_16();
+ +	kmalloc_memmove_invalid_size();
+ +	kmalloc_uaf();
+ +	kmalloc_uaf_memset();
+ +	kmalloc_uaf2();
+ +	kfree_via_page();
+ +	kfree_via_phys();
+ +	kmem_cache_oob();
+ +	memcg_accounted_kmem_cache();
+ +	kasan_stack_oob();
+ +	kasan_global_oob();
+ +	kasan_alloca_oob_left();
+ +	kasan_alloca_oob_right();
+ +	ksize_unpoisons_memory();
+ +	copy_user_test();
+ +	kmem_cache_double_free();
+ +	kmem_cache_invalid_free();
+ +	kasan_memchr();
+ +	kasan_memcmp();
+ +	kasan_strings();
+ +	kasan_bitops();
+ +	kmalloc_double_kzfree();
+ +	vmalloc_oob();
+ +	kasan_rcu_uaf();
+  
+ -static struct kunit_suite kasan_kunit_test_suite = {
+ -	.name = "kasan",
+ -	.init = kasan_test_init,
+ -	.test_cases = kasan_kunit_test_cases,
+ -	.exit = kasan_test_exit,
+ -};
+ +	kasan_restore_multi_shot(multishot);
+  
+ -kunit_test_suite(kasan_kunit_test_suite);
+ +	return -EAGAIN;
+ +}
+  
+ +module_init(kmalloc_tests_init);
+  MODULE_LICENSE("GPL");
+* Unmerged path lib/test_kasan.c
+diff --git a/mm/slab_common.c b/mm/slab_common.c
+index b485099f723a..1efb17887a8c 100644
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@ -1173,6 +1173,9 @@ static __always_inline void *__do_krealloc(const void *p, size_t new_size,
+ 	void *ret;
+ 	size_t ks;
+ 
++	if (likely(!ZERO_OR_NULL_PTR(p)) && !kasan_check_byte(p))
++		return NULL;
++
+ 	ks = ksize(p);
+ 
+ 	if (ks >= new_size) {
