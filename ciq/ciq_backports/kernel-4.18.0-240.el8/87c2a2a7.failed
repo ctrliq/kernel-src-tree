@@ -1,0 +1,330 @@
+Bluetooth: hci_qca: Use vfree() instead of kfree()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Wei Yongjun <weiyongjun1@huawei.com>
+commit 87c2a2a7d7631d0caa956b73f9f20010b5f55681
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/87c2a2a7.failed
+
+Use vfree() instead of kfree() to free vmalloc()
+allocated data.
+
+Fixes: d841502c79e3 ("Bluetooth: hci_qca: Collect controller memory dump during SSR")
+	Signed-off-by: Wei Yongjun <weiyongjun1@huawei.com>
+	Reviewed-by: Balakrishna Godavarthi <bgodavar@codeaurora.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 87c2a2a7d7631d0caa956b73f9f20010b5f55681)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,a17260641283..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -399,6 -519,23 +399,26 @@@ static void hci_ibs_wake_retrans_timeou
+  		hci_uart_tx_wakeup(hu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hci_memdump_timeout(struct timer_list *t)
++ {
++ 	struct qca_data *qca = from_timer(qca, t, tx_idle_timer);
++ 	struct hci_uart *hu = qca->hu;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	char *memdump_buf = qca_memdump->memdump_buf_tail;
++ 
++ 	bt_dev_err(hu->hdev, "clearing allocated memory due to memdump timeout");
++ 	/* Inject hw error event to reset the device and driver. */
++ 	hci_reset_dev(hu->hdev);
++ 	vfree(memdump_buf);
++ 	kfree(qca_memdump);
++ 	qca->memdump_state = QCA_MEMDUMP_TIMEOUT;
++ 	del_timer(&qca->memdump_timer);
++ 	cancel_work_sync(&qca->ctrl_memdump_evt);
++ }
++ 
+++>>>>>>> 87c2a2a7d763 (Bluetooth: hci_qca: Use vfree() instead of kfree())
+  /* Initialize protocol */
+  static int qca_open(struct hci_uart *hu)
+  {
+@@@ -909,6 -1266,272 +929,275 @@@ static inline void host_set_baudrate(st
+  		hci_uart_set_baudrate(hu, speed);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qca_send_power_pulse(struct hci_uart *hu, bool on)
++ {
++ 	int ret;
++ 	int timeout = msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS);
++ 	u8 cmd = on ? QCA_WCN3990_POWERON_PULSE : QCA_WCN3990_POWEROFF_PULSE;
++ 
++ 	/* These power pulses are single byte command which are sent
++ 	 * at required baudrate to wcn3990. On wcn3990, we have an external
++ 	 * circuit at Tx pin which decodes the pulse sent at specific baudrate.
++ 	 * For example, wcn3990 supports RF COEX antenna for both Wi-Fi/BT
++ 	 * and also we use the same power inputs to turn on and off for
++ 	 * Wi-Fi/BT. Powering up the power sources will not enable BT, until
++ 	 * we send a power on pulse at 115200 bps. This algorithm will help to
++ 	 * save power. Disabling hardware flow control is mandatory while
++ 	 * sending power pulses to SoC.
++ 	 */
++ 	bt_dev_dbg(hu->hdev, "sending power pulse %02x to controller", cmd);
++ 
++ 	serdev_device_write_flush(hu->serdev);
++ 	hci_uart_set_flow_control(hu, true);
++ 	ret = serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));
++ 	if (ret < 0) {
++ 		bt_dev_err(hu->hdev, "failed to send power pulse %02x", cmd);
++ 		return ret;
++ 	}
++ 
++ 	serdev_device_wait_until_sent(hu->serdev, timeout);
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	/* Give to controller time to boot/shutdown */
++ 	if (on)
++ 		msleep(100);
++ 	else
++ 		msleep(10);
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int qca_get_speed(struct hci_uart *hu,
++ 				  enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		if (hu->init_speed)
++ 			speed = hu->init_speed;
++ 		else if (hu->proto->init_speed)
++ 			speed = hu->proto->init_speed;
++ 	} else {
++ 		if (hu->oper_speed)
++ 			speed = hu->oper_speed;
++ 		else if (hu->proto->oper_speed)
++ 			speed = hu->proto->oper_speed;
++ 	}
++ 
++ 	return speed;
++ }
++ 
++ static int qca_check_speeds(struct hci_uart *hu)
++ {
++ 	if (qca_is_wcn399x(qca_soc_type(hu))) {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) &&
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	} else {
++ 		if (!qca_get_speed(hu, QCA_INIT_SPEED) ||
++ 		    !qca_get_speed(hu, QCA_OPER_SPEED))
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int qca_set_speed(struct hci_uart *hu, enum qca_speed_type speed_type)
++ {
++ 	unsigned int speed, qca_baudrate;
++ 	struct qca_data *qca = hu->priv;
++ 	int ret = 0;
++ 
++ 	if (speed_type == QCA_INIT_SPEED) {
++ 		speed = qca_get_speed(hu, QCA_INIT_SPEED);
++ 		if (speed)
++ 			host_set_baudrate(hu, speed);
++ 	} else {
++ 		enum qca_btsoc_type soc_type = qca_soc_type(hu);
++ 
++ 		speed = qca_get_speed(hu, QCA_OPER_SPEED);
++ 		if (!speed)
++ 			return 0;
++ 
++ 		/* Disable flow control for wcn3990 to deassert RTS while
++ 		 * changing the baudrate of chip and host.
++ 		 */
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, true);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			reinit_completion(&qca->drop_ev_comp);
++ 			set_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 
++ 		qca_baudrate = qca_get_baudrate_value(speed);
++ 		bt_dev_dbg(hu->hdev, "Set UART speed to %d", speed);
++ 		ret = qca_set_baudrate(hu->hdev, qca_baudrate);
++ 		if (ret)
++ 			goto error;
++ 
++ 		host_set_baudrate(hu, speed);
++ 
++ error:
++ 		if (qca_is_wcn399x(soc_type))
++ 			hci_uart_set_flow_control(hu, false);
++ 
++ 		if (soc_type == QCA_WCN3990) {
++ 			/* Wait for the controller to send the vendor event
++ 			 * for the baudrate change command.
++ 			 */
++ 			if (!wait_for_completion_timeout(&qca->drop_ev_comp,
++ 						 msecs_to_jiffies(100))) {
++ 				bt_dev_err(hu->hdev,
++ 					   "Failed to change controller baudrate\n");
++ 				ret = -ETIMEDOUT;
++ 			}
++ 
++ 			clear_bit(QCA_DROP_VENDOR_EVENT, &qca->flags);
++ 		}
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int qca_send_crashbuffer(struct hci_uart *hu)
++ {
++ 	struct qca_data *qca = hu->priv;
++ 	struct sk_buff *skb;
++ 
++ 	skb = bt_skb_alloc(QCA_CRASHBYTE_PACKET_LEN, GFP_KERNEL);
++ 	if (!skb) {
++ 		bt_dev_err(hu->hdev, "Failed to allocate memory for skb packet");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	/* We forcefully crash the controller, by sending 0xfb byte for
++ 	 * 1024 times. We also might have chance of losing data, To be
++ 	 * on safer side we send 1096 bytes to the SoC.
++ 	 */
++ 	memset(skb_put(skb, QCA_CRASHBYTE_PACKET_LEN), QCA_MEMDUMP_BYTE,
++ 	       QCA_CRASHBYTE_PACKET_LEN);
++ 	hci_skb_pkt_type(skb) = HCI_COMMAND_PKT;
++ 	bt_dev_info(hu->hdev, "crash the soc to collect controller dump");
++ 	skb_queue_tail(&qca->txq, skb);
++ 	hci_uart_tx_wakeup(hu);
++ 
++ 	return 0;
++ }
++ 
++ static void qca_wait_for_dump_collection(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	struct qca_memdump_data *qca_memdump = qca->qca_memdump;
++ 	char *memdump_buf = NULL;
++ 
++ 	wait_on_bit_timeout(&qca->flags, QCA_MEMDUMP_COLLECTION,
++ 			    TASK_UNINTERRUPTIBLE, MEMDUMP_TIMEOUT_MS);
++ 
++ 	clear_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		bt_dev_err(hu->hdev, "Clearing the buffers due to timeout");
++ 		if (qca_memdump)
++ 			memdump_buf = qca_memdump->memdump_buf_tail;
++ 		vfree(memdump_buf);
++ 		kfree(qca_memdump);
++ 		qca->memdump_state = QCA_MEMDUMP_TIMEOUT;
++ 		del_timer(&qca->memdump_timer);
++ 		cancel_work_sync(&qca->ctrl_memdump_evt);
++ 	}
++ }
++ 
++ static void qca_hw_error(struct hci_dev *hdev, u8 code)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	bt_dev_info(hdev, "mem_dump_status: %d", qca->memdump_state);
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE) {
++ 		/* If hardware error event received for other than QCA
++ 		 * soc memory dump event, then we need to crash the SOC
++ 		 * and wait here for 8 seconds to get the dump packets.
++ 		 * This will block main thread to be on hold until we
++ 		 * collect dump.
++ 		 */
++ 		set_bit(QCA_MEMDUMP_COLLECTION, &qca->flags);
++ 		qca_send_crashbuffer(hu);
++ 		qca_wait_for_dump_collection(hdev);
++ 	} else if (qca->memdump_state == QCA_MEMDUMP_COLLECTING) {
++ 		/* Let us wait here until memory dump collected or
++ 		 * memory dump timer expired.
++ 		 */
++ 		bt_dev_info(hdev, "waiting for dump to complete");
++ 		qca_wait_for_dump_collection(hdev);
++ 	}
++ }
++ 
++ static void qca_cmd_timeout(struct hci_dev *hdev)
++ {
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	if (qca->memdump_state == QCA_MEMDUMP_IDLE)
++ 		qca_send_crashbuffer(hu);
++ 	else
++ 		bt_dev_info(hdev, "Dump collection is in process");
++ }
++ 
++ static int qca_wcn3990_init(struct hci_uart *hu)
++ {
++ 	struct qca_serdev *qcadev;
++ 	int ret;
++ 
++ 	/* Check for vregs status, may be hci down has turned
++ 	 * off the voltage regulator.
++ 	 */
++ 	qcadev = serdev_device_get_drvdata(hu->serdev);
++ 	if (!qcadev->bt_power->vregs_on) {
++ 		serdev_device_close(hu->serdev);
++ 		ret = qca_regulator_enable(qcadev);
++ 		if (ret)
++ 			return ret;
++ 
++ 		ret = serdev_device_open(hu->serdev);
++ 		if (ret) {
++ 			bt_dev_err(hu->hdev, "failed to open port");
++ 			return ret;
++ 		}
++ 	}
++ 
++ 	/* Forcefully enable wcn3990 to enter in to boot mode. */
++ 	host_set_baudrate(hu, 2400);
++ 	ret = qca_send_power_pulse(hu, false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	qca_set_speed(hu, QCA_INIT_SPEED);
++ 	ret = qca_send_power_pulse(hu, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Now the device is in ready state to communicate with host.
++ 	 * To sync host with device we need to reopen port.
++ 	 * Without this, we will have RTS and CTS synchronization
++ 	 * issues.
++ 	 */
++ 	serdev_device_close(hu->serdev);
++ 	ret = serdev_device_open(hu->serdev);
++ 	if (ret) {
++ 		bt_dev_err(hu->hdev, "failed to open port");
++ 		return ret;
++ 	}
++ 
++ 	hci_uart_set_flow_control(hu, false);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 87c2a2a7d763 (Bluetooth: hci_qca: Use vfree() instead of kfree())
+  static int qca_setup(struct hci_uart *hu)
+  {
+  	struct hci_dev *hdev = hu->hdev;
+* Unmerged path drivers/bluetooth/hci_qca.c
