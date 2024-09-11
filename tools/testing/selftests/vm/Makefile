@@ -38,7 +38,7 @@ TEST_GEN_FILES += va_128TBswitch
 TEST_GEN_FILES += virtual_address_range
 TEST_GEN_FILES += write_to_hugetlbfs
 
-TEST_PROGS := run_vmtests
+TEST_PROGS := run_vmtests.sh
 
 TEST_FILES := test_vmalloc.sh
 
