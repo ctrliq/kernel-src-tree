@@ -1,0 +1,119 @@
+swiotlb-xen: suppress certain init retries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jan Beulich <jbeulich@suse.com>
+commit 79ca5f778aafbd69727d577b58d913c9ce8400be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/79ca5f77.failed
+
+Only on the 2nd of the paths leading to xen_swiotlb_init()'s "error"
+label it is useful to retry the allocation; the first one did already
+iterate through all possible order values.
+
+	Signed-off-by: Jan Beulich <jbeulich@suse.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/56477481-87da-4962-9661-5e1b277efde0@suse.com
+	Signed-off-by: Juergen Gross <jgross@suse.com>
+(cherry picked from commit 79ca5f778aafbd69727d577b58d913c9ce8400be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/xen/swiotlb-xen.c
+diff --cc drivers/xen/swiotlb-xen.c
+index 8ccd85660984,6520d05e62ef..000000000000
+--- a/drivers/xen/swiotlb-xen.c
++++ b/drivers/xen/swiotlb-xen.c
+@@@ -184,32 -175,23 +184,42 @@@ retry
+  	/*
+  	 * Get IO TLB memory from any location.
+  	 */
+ +	if (early) {
+ +		start = memblock_alloc(PAGE_ALIGN(bytes),
+ +						  PAGE_SIZE);
+ +		if (!start)
+ +			panic("%s: Failed to allocate %lu bytes align=0x%lx\n",
+ +			      __func__, PAGE_ALIGN(bytes), PAGE_SIZE);
+ +	} else {
+  #define SLABS_PER_PAGE (1 << (PAGE_SHIFT - IO_TLB_SHIFT))
+  #define IO_TLB_MIN_SLABS ((1<<20) >> IO_TLB_SHIFT)
+ -	while ((SLABS_PER_PAGE << order) > IO_TLB_MIN_SLABS) {
+ -		start = (void *)xen_get_swiotlb_free_pages(order);
+ -		if (start)
+ -			break;
+ -		order--;
+ +		while ((SLABS_PER_PAGE << order) > IO_TLB_MIN_SLABS) {
+ +			start = (void *)xen_get_swiotlb_free_pages(order);
+ +			if (start)
+ +				break;
+ +			order--;
+ +		}
+ +		if (order != get_order(bytes)) {
+ +			pr_warn("Warning: only able to allocate %ld MB for software IO TLB\n",
+ +				(PAGE_SIZE << order) >> 20);
+ +			nslabs = SLABS_PER_PAGE << order;
+ +			bytes = nslabs << IO_TLB_SHIFT;
+ +		}
+  	}
+++<<<<<<< HEAD
+ +	if (!start) {
+ +		m_ret = XEN_SWIOTLB_ENOMEM;
+ +		goto error;
+++=======
++ 	if (!start)
++ 		goto exit;
++ 	if (order != get_order(bytes)) {
++ 		pr_warn("Warning: only able to allocate %ld MB for software IO TLB\n",
++ 			(PAGE_SIZE << order) >> 20);
++ 		nslabs = SLABS_PER_PAGE << order;
++ 		bytes = nslabs << IO_TLB_SHIFT;
+++>>>>>>> 79ca5f778aaf (swiotlb-xen: suppress certain init retries)
+  	}
+ -
+  	/*
+  	 * And replace that memory with pages under 4GB.
+  	 */
+@@@ -227,31 -201,21 +237,32 @@@
+  		m_ret = XEN_SWIOTLB_EFIXUP;
+  		goto error;
+  	}
+ -	rc = swiotlb_late_init_with_tbl(start, nslabs);
+ -	if (rc)
+ -		return rc;
+ -	swiotlb_set_max_segment(PAGE_SIZE);
+ -	return 0;
+ +	if (early) {
+ +		if (swiotlb_init_with_tbl(start, nslabs,
+ +			 verbose))
+ +			panic("Cannot allocate SWIOTLB buffer");
+ +		rc = 0;
+ +	} else
+ +		rc = swiotlb_late_init_with_tbl(start, nslabs);
+ +
+ +	if (!rc)
+ +		swiotlb_set_max_segment(PAGE_SIZE);
+ +
+ +	return rc;
+  error:
+  	if (repeat--) {
+ -		/* Min is 2MB */
+ -		nslabs = max(1024UL, ALIGN(nslabs >> 1, IO_TLB_SEGSIZE));
+ -		bytes = nslabs << IO_TLB_SHIFT;
+ -		pr_info("Lowering to %luMB\n", bytes >> 20);
+ +		nslabs = max(1024UL, /* Min is 2MB */
+ +					(nslabs >> 1));
+ +		pr_info("Lowering to %luMB\n",
+ +			(nslabs << IO_TLB_SHIFT) >> 20);
+  		goto retry;
+  	}
++ exit:
+  	pr_err("%s (rc:%d)\n", xen_swiotlb_error(m_ret), rc);
+ +	if (early)
+ +		panic("%s (rc:%d)", xen_swiotlb_error(m_ret), rc);
+ +	else
+ +		free_pages((unsigned long)start, order);
+  	return rc;
+  }
+  
+* Unmerged path drivers/xen/swiotlb-xen.c
