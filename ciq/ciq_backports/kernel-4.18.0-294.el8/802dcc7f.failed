@@ -1,0 +1,149 @@
+RDMA/mlx5: Support TX port affinity for VF drivers in LAG mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mark Zhang <markz@mellanox.com>
+commit 802dcc7fc5ec0932bea0f33db046cc744aecf233
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/802dcc7f.failed
+
+The mlx5 VF driver doesn't set QP tx port affinity because it doesn't know
+if the lag is active or not, since the "lag_active" works only for PF
+interfaces. In this case for VF interfaces only one lag is used which
+brings performance issue.
+
+Add a lag_tx_port_affinity CAP bit; When it is enabled and
+"num_lag_ports > 1", then driver always set QP tx affinity, regardless
+of lag state.
+
+Link: https://lore.kernel.org/r/20200527055014.355093-1-leon@kernel.org
+	Signed-off-by: Mark Zhang <markz@mellanox.com>
+	Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 802dcc7fc5ec0932bea0f33db046cc744aecf233)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 68ab87769d36,9364a7a76ac2..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -3406,26 -3617,64 +3406,78 @@@ static unsigned int get_tx_affinity(str
+  {
+  	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
+  		udata, struct mlx5_ib_ucontext, ibucontext);
+ -	u8 port_num = mlx5_core_native_port_num(dev->mdev) - 1;
+ -	atomic_t *tx_port_affinity;
+ -
+ +	unsigned int tx_port_affinity;
+ +
+++<<<<<<< HEAD
+ +	if (ucontext) {
+ +		tx_port_affinity = (unsigned int)atomic_add_return(
+ +					   1, &ucontext->tx_port_affinity) %
+ +					   MLX5_MAX_PORTS +
+ +				   1;
+++=======
++ 	if (ucontext)
++ 		tx_port_affinity = &ucontext->tx_port_affinity;
++ 	else
++ 		tx_port_affinity = &dev->port[port_num].roce.tx_port_affinity;
++ 
++ 	return (unsigned int)atomic_add_return(1, tx_port_affinity) %
++ 		MLX5_MAX_PORTS + 1;
++ }
++ 
++ static bool qp_supports_affinity(struct ib_qp *qp)
++ {
++ 	if ((qp->qp_type == IB_QPT_RC) ||
++ 	    (qp->qp_type == IB_QPT_UD) ||
++ 	    (qp->qp_type == IB_QPT_UC) ||
++ 	    (qp->qp_type == IB_QPT_RAW_PACKET) ||
++ 	    (qp->qp_type == IB_QPT_XRC_INI) ||
++ 	    (qp->qp_type == IB_QPT_XRC_TGT))
++ 		return true;
++ 	return false;
++ }
++ 
++ static unsigned int get_tx_affinity(struct ib_qp *qp,
++ 				    const struct ib_qp_attr *attr,
++ 				    int attr_mask, u8 init,
++ 				    struct ib_udata *udata)
++ {
++ 	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
++ 		udata, struct mlx5_ib_ucontext, ibucontext);
++ 	struct mlx5_ib_dev *dev = to_mdev(qp->device);
++ 	struct mlx5_ib_qp *mqp = to_mqp(qp);
++ 	struct mlx5_ib_qp_base *qp_base;
++ 	unsigned int tx_affinity;
++ 
++ 	if (!(mlx5_ib_lag_should_assign_affinity(dev) &&
++ 	      qp_supports_affinity(qp)))
++ 		return 0;
++ 
++ 	if (mqp->flags & MLX5_IB_QP_CREATE_SQPN_QP1)
++ 		tx_affinity = mqp->gsi_lag_port;
++ 	else if (init)
++ 		tx_affinity = get_tx_affinity_rr(dev, udata);
++ 	else if ((attr_mask & IB_QP_AV) && attr->xmit_slave)
++ 		tx_affinity =
++ 			mlx5_lag_get_slave_port(dev->mdev, attr->xmit_slave);
++ 	else
++ 		return 0;
++ 
++ 	qp_base = &mqp->trans_qp.base;
++ 	if (ucontext)
+++>>>>>>> 802dcc7fc5ec (RDMA/mlx5: Support TX port affinity for VF drivers in LAG mode)
+  		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x ucontext %p\n",
+ -			    tx_affinity, qp_base->mqp.qpn, ucontext);
+ -	else
+ +				tx_port_affinity, qp_base->mqp.qpn, ucontext);
+ +	} else {
+ +		tx_port_affinity =
+ +			(unsigned int)atomic_add_return(
+ +				1, &dev->port[port_num].roce.tx_port_affinity) %
+ +				MLX5_MAX_PORTS +
+ +			1;
+  		mlx5_ib_dbg(dev, "Set tx affinity 0x%x to qpn 0x%x\n",
+ -			    tx_affinity, qp_base->mqp.qpn);
+ -	return tx_affinity;
+ +				tx_port_affinity, qp_base->mqp.qpn);
+ +	}
+ +
+ +	return tx_port_affinity;
+  }
+  
+  static int __mlx5_ib_qp_set_counter(struct ib_qp *qp,
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 34cc0dc5d23d..6b40abf87786 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -1962,7 +1962,7 @@ static int mlx5_ib_alloc_ucontext(struct ib_ucontext *uctx,
+ 	context->lib_caps = req.lib_caps;
+ 	print_lib_caps(dev, context->lib_caps);
+ 
+-	if (dev->lag_active) {
++	if (mlx5_ib_lag_should_assign_affinity(dev)) {
+ 		u8 port = mlx5_core_native_port_num(dev->mdev) - 1;
+ 
+ 		atomic_set(&context->tx_port_affinity,
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 27be9a00e5a7..2a5247cfe65f 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -1542,4 +1542,11 @@ static inline bool mlx5_ib_can_use_umr(struct mlx5_ib_dev *dev,
+ 
+ int mlx5_ib_enable_driver(struct ib_device *dev);
+ int mlx5_ib_test_wc(struct mlx5_ib_dev *dev);
++
++static inline bool mlx5_ib_lag_should_assign_affinity(struct mlx5_ib_dev *dev)
++{
++	return dev->lag_active ||
++		(MLX5_CAP_GEN(dev->mdev, num_lag_ports) > 1 &&
++		 MLX5_CAP_GEN(dev->mdev, lag_tx_port_affinity));
++}
+ #endif /* MLX5_IB_H */
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
