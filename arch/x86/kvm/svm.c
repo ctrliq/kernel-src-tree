@@ -6187,6 +6187,7 @@ out:
 
 static void svm_handle_external_intr(struct kvm_vcpu *vcpu)
 {
+	kvm_before_interrupt(vcpu);
 	local_irq_enable();
 	/*
 	 * We must have an instruction with interrupts enabled, so
@@ -6194,6 +6195,7 @@ static void svm_handle_external_intr(struct kvm_vcpu *vcpu)
 	 */
 	asm("nop");
 	local_irq_disable();
+	kvm_after_interrupt(vcpu);
 }
 
 static void svm_sched_in(struct kvm_vcpu *vcpu, int cpu)
