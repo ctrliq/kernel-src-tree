@@ -1,0 +1,308 @@
+mt76: testmode: add support to send larger packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Shayne Chen <shayne.chen@mediatek.com>
+commit 2601dda8faa7685bab921d63c86f04e9e356f9ac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/2601dda8.failed
+
+Add support to send larger packet in testmode to meet requirements
+of some test cases.
+The limit of max packet size is determined based on tx rate mode setting.
+
+	Signed-off-by: Shayne Chen <shayne.chen@mediatek.com>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 2601dda8faa7685bab921d63c86f04e9e356f9ac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt76.h
+#	drivers/net/wireless/mediatek/mt76/testmode.c
+#	drivers/net/wireless/mediatek/mt76/tx.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt76.h
+index 6de0336346b9,d60a1dd8f314..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt76.h
++++ b/drivers/net/wireless/mediatek/mt76/mt76.h
+@@@ -1019,9 -1073,10 +1019,14 @@@ int mt76_testmode_cmd(struct ieee80211_
+  		      void *data, int len);
+  int mt76_testmode_dump(struct ieee80211_hw *hw, struct sk_buff *skb,
+  		       struct netlink_callback *cb, void *data, int len);
+++<<<<<<< HEAD
+ +int mt76_testmode_set_state(struct mt76_dev *dev, enum mt76_testmode_state state);
+++=======
++ int mt76_testmode_set_state(struct mt76_phy *phy, enum mt76_testmode_state state);
++ int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len);
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
+  
+ -static inline void mt76_testmode_reset(struct mt76_phy *phy, bool disable)
+ +static inline void mt76_testmode_reset(struct mt76_dev *dev, bool disable)
+  {
+  #ifdef CONFIG_NL80211_TESTMODE
+  	enum mt76_testmode_state state = MT76_TM_STATE_IDLE;
+diff --cc drivers/net/wireless/mediatek/mt76/testmode.c
+index d2ce93ee176d,001d0ba5f73e..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/testmode.c
++++ b/drivers/net/wireless/mediatek/mt76/testmode.c
+@@@ -56,39 -62,137 +56,160 @@@ void mt76_testmode_tx_pending(struct mt
+  	spin_unlock_bh(&q->lock);
+  }
+  
++ static u32
++ mt76_testmode_max_mpdu_len(struct mt76_phy *phy, u8 tx_rate_mode)
++ {
++ 	switch (tx_rate_mode) {
++ 	case MT76_TM_TX_MODE_HT:
++ 		return IEEE80211_MAX_MPDU_LEN_HT_7935;
++ 	case MT76_TM_TX_MODE_VHT:
++ 	case MT76_TM_TX_MODE_HE_SU:
++ 	case MT76_TM_TX_MODE_HE_EXT_SU:
++ 	case MT76_TM_TX_MODE_HE_TB:
++ 	case MT76_TM_TX_MODE_HE_MU:
++ 		if (phy->sband_5g.sband.vht_cap.cap &
++ 		    IEEE80211_VHT_CAP_MAX_MPDU_LENGTH_7991)
++ 			return IEEE80211_MAX_MPDU_LEN_VHT_7991;
++ 		return IEEE80211_MAX_MPDU_LEN_VHT_11454;
++ 	case MT76_TM_TX_MODE_CCK:
++ 	case MT76_TM_TX_MODE_OFDM:
++ 	default:
++ 		return IEEE80211_MAX_FRAME_LEN;
++ 	}
++ }
+  
+++<<<<<<< HEAD
+ +static int
+ +mt76_testmode_tx_init(struct mt76_dev *dev)
+ +{
+ +	struct mt76_testmode_data *td = &dev->test;
+ +	struct ieee80211_tx_info *info;
+ +	struct ieee80211_hdr *hdr;
+ +	struct sk_buff *skb;
+ +	u16 fc = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_DATA |
+ +		 IEEE80211_FCTL_FROMDS;
+ +	struct ieee80211_tx_rate *rate;
+ +	u8 max_nss = hweight8(dev->phy.antenna_mask);
+++=======
++ static void
++ mt76_testmode_free_skb(struct mt76_phy *phy)
++ {
++ 	struct mt76_testmode_data *td = &phy->test;
++ 	struct sk_buff *skb = td->tx_skb;
+  
+- 	if (td->tx_antenna_mask)
+- 		max_nss = min_t(u8, max_nss, hweight8(td->tx_antenna_mask));
+- 
+- 	skb = alloc_skb(td->tx_msdu_len, GFP_KERNEL);
+  	if (!skb)
++ 		return;
++ 
++ 	if (skb_has_frag_list(skb)) {
++ 		kfree_skb_list(skb_shinfo(skb)->frag_list);
++ 		skb_shinfo(skb)->frag_list = NULL;
++ 	}
++ 
++ 	dev_kfree_skb(skb);
++ 	td->tx_skb = NULL;
++ }
++ 
++ int mt76_testmode_alloc_skb(struct mt76_phy *phy, u32 len)
++ {
++ #define MT_TXP_MAX_LEN	4095
++ 	u16 fc = IEEE80211_FTYPE_DATA | IEEE80211_STYPE_DATA |
++ 		 IEEE80211_FCTL_FROMDS;
++ 	struct mt76_testmode_data *td = &phy->test;
++ 	bool ext_phy = phy != &phy->dev->phy;
++ 	struct sk_buff **frag_tail, *head;
++ 	struct ieee80211_tx_info *info;
++ 	struct ieee80211_hdr *hdr;
++ 	u32 max_len, head_len;
++ 	int nfrags, i;
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
++ 
++ 	max_len = mt76_testmode_max_mpdu_len(phy, td->tx_rate_mode);
++ 	if (len > max_len)
++ 		len = max_len;
++ 	else if (len < sizeof(struct ieee80211_hdr))
++ 		len = sizeof(struct ieee80211_hdr);
++ 
++ 	nfrags = len / MT_TXP_MAX_LEN;
++ 	head_len = nfrags ? MT_TXP_MAX_LEN : len;
++ 
++ 	if (len > IEEE80211_MAX_FRAME_LEN)
++ 		fc |= IEEE80211_STYPE_QOS_DATA;
++ 
++ 	head = alloc_skb(head_len, GFP_KERNEL);
++ 	if (!head)
+  		return -ENOMEM;
+  
+- 	dev_kfree_skb(td->tx_skb);
+- 	td->tx_skb = skb;
+- 	hdr = __skb_put_zero(skb, td->tx_msdu_len);
++ 	hdr = __skb_put_zero(head, head_len);
+  	hdr->frame_control = cpu_to_le16(fc);
+++<<<<<<< HEAD
+ +	memcpy(hdr->addr1, dev->macaddr, sizeof(dev->macaddr));
+ +	memcpy(hdr->addr2, dev->macaddr, sizeof(dev->macaddr));
+ +	memcpy(hdr->addr3, dev->macaddr, sizeof(dev->macaddr));
+- 
+- 	info = IEEE80211_SKB_CB(skb);
+++=======
++ 	memcpy(hdr->addr1, phy->macaddr, sizeof(phy->macaddr));
++ 	memcpy(hdr->addr2, phy->macaddr, sizeof(phy->macaddr));
++ 	memcpy(hdr->addr3, phy->macaddr, sizeof(phy->macaddr));
++ 	skb_set_queue_mapping(head, IEEE80211_AC_BE);
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
++ 
++ 	info = IEEE80211_SKB_CB(head);
+  	info->flags = IEEE80211_TX_CTL_INJECTED |
+  		      IEEE80211_TX_CTL_NO_ACK |
+  		      IEEE80211_TX_CTL_NO_PS_BUFFER;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (ext_phy)
++ 		info->hw_queue |= MT_TX_HW_QUEUE_EXT_PHY;
++ 
++ 	frag_tail = &skb_shinfo(head)->frag_list;
++ 
++ 	for (i = 0; i < nfrags; i++) {
++ 		struct sk_buff *frag;
++ 		u16 frag_len;
++ 
++ 		if (i == nfrags - 1)
++ 			frag_len = len % MT_TXP_MAX_LEN;
++ 		else
++ 			frag_len = MT_TXP_MAX_LEN;
++ 
++ 		frag = alloc_skb(frag_len, GFP_KERNEL);
++ 		if (!frag)
++ 			return -ENOMEM;
++ 
++ 		__skb_put_zero(frag, frag_len);
++ 		head->len += frag->len;
++ 		head->data_len += frag->len;
++ 
++ 		if (*frag_tail) {
++ 			(*frag_tail)->next = frag;
++ 			frag_tail = &frag;
++ 		} else {
++ 			*frag_tail = frag;
++ 		}
++ 	}
++ 
++ 	mt76_testmode_free_skb(phy);
++ 	td->tx_skb = head;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(mt76_testmode_alloc_skb);
++ 
++ static int
++ mt76_testmode_tx_init(struct mt76_phy *phy)
++ {
++ 	struct mt76_testmode_data *td = &phy->test;
++ 	struct ieee80211_tx_info *info;
++ 	struct ieee80211_tx_rate *rate;
++ 	u8 max_nss = hweight8(phy->antenna_mask);
++ 	int ret;
++ 
++ 	ret = mt76_testmode_alloc_skb(phy, td->tx_mpdu_len);
++ 	if (ret)
++ 		return ret;
++ 
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
+  	if (td->tx_rate_mode > MT76_TM_TX_MODE_VHT)
+  		goto out;
+  
+@@@ -208,14 -315,14 +330,14 @@@ mt76_testmode_param_present(struct mt76
+  }
+  
+  static void
+ -mt76_testmode_init_defaults(struct mt76_phy *phy)
+ +mt76_testmode_init_defaults(struct mt76_dev *dev)
+  {
+ -	struct mt76_testmode_data *td = &phy->test;
+ +	struct mt76_testmode_data *td = &dev->test;
+  
+- 	if (td->tx_msdu_len > 0)
++ 	if (td->tx_mpdu_len > 0)
+  		return;
+  
+- 	td->tx_msdu_len = 1024;
++ 	td->tx_mpdu_len = 1024;
+  	td->tx_count = 1;
+  	td->tx_rate_mode = MT76_TM_TX_MODE_OFDM;
+  	td->tx_rate_nss = 1;
+@@@ -358,6 -460,22 +470,25 @@@ int mt76_testmode_cmd(struct ieee80211_
+  			   &td->tx_power_control, 0, 1))
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (tb[MT76_TM_ATTR_TX_LENGTH]) {
++ 		u32 val = nla_get_u32(tb[MT76_TM_ATTR_TX_LENGTH]);
++ 
++ 		if (val > mt76_testmode_max_mpdu_len(phy, td->tx_rate_mode) ||
++ 		    val < sizeof(struct ieee80211_hdr))
++ 			goto out;
++ 
++ 		td->tx_mpdu_len = val;
++ 	}
++ 
++ 	if (tb[MT76_TM_ATTR_TX_IPG])
++ 		td->tx_ipg = nla_get_u32(tb[MT76_TM_ATTR_TX_IPG]);
++ 
++ 	if (tb[MT76_TM_ATTR_TX_TIME])
++ 		td->tx_time = nla_get_u32(tb[MT76_TM_ATTR_TX_TIME]);
++ 
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
+  	if (tb[MT76_TM_ATTR_FREQ_OFFSET])
+  		td->freq_offset = nla_get_u32(tb[MT76_TM_ATTR_FREQ_OFFSET]);
+  
+diff --cc drivers/net/wireless/mediatek/mt76/tx.c
+index 2d82e401427b,04e47259ea5f..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/tx.c
++++ b/drivers/net/wireless/mediatek/mt76/tx.c
+@@@ -202,11 -202,19 +202,17 @@@ void mt76_tx_complete_skb(struct mt76_d
+  	struct ieee80211_hw *hw;
+  	struct sk_buff_head list;
+  
+ -	mt76_tx_check_non_aql(dev, wcid_idx, skb);
+ -
+  #ifdef CONFIG_NL80211_TESTMODE
+ -	if (mt76_is_testmode_skb(dev, skb, &hw)) {
+ -		struct mt76_phy *phy = hw->priv;
+ -
+ -		if (skb == phy->test.tx_skb)
+ -			phy->test.tx_done++;
+ -		if (phy->test.tx_queued == phy->test.tx_done)
+ +	if (skb == dev->test.tx_skb) {
+ +		dev->test.tx_done++;
+ +		if (dev->test.tx_queued == dev->test.tx_done)
+  			wake_up(&dev->tx_wait);
+++<<<<<<< HEAD
+++=======
++ 
++ 		dev_kfree_skb_any(skb);
++ 		return;
+++>>>>>>> 2601dda8faa7 (mt76: testmode: add support to send larger packet)
+  	}
+  #endif
+  
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt76.h
+* Unmerged path drivers/net/wireless/mediatek/mt76/testmode.c
+diff --git a/drivers/net/wireless/mediatek/mt76/testmode.h b/drivers/net/wireless/mediatek/mt76/testmode.h
+index ba02d2eaa916..8a6df0152989 100644
+--- a/drivers/net/wireless/mediatek/mt76/testmode.h
++++ b/drivers/net/wireless/mediatek/mt76/testmode.h
+@@ -21,7 +21,7 @@
+  * @MT76_TM_ATTR_TX_COUNT: configured number of frames to send when setting
+  *	state to MT76_TM_STATE_TX_FRAMES (u32)
+  * @MT76_TM_ATTR_TX_PENDING: pending frames during MT76_TM_STATE_TX_FRAMES (u32)
+- * @MT76_TM_ATTR_TX_LENGTH: packet tx msdu length (u32)
++ * @MT76_TM_ATTR_TX_LENGTH: packet tx mpdu length (u32)
+  * @MT76_TM_ATTR_TX_RATE_MODE: packet tx mode (u8, see &enum mt76_testmode_tx_mode)
+  * @MT76_TM_ATTR_TX_RATE_NSS: packet tx number of spatial streams (u8)
+  * @MT76_TM_ATTR_TX_RATE_IDX: packet tx rate/MCS index (u8)
+* Unmerged path drivers/net/wireless/mediatek/mt76/tx.c
