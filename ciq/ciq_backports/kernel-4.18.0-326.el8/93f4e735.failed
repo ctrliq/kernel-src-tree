@@ -1,0 +1,223 @@
+mm/hmm: remove hmm_range_dma_map and hmm_range_dma_unmap
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 93f4e735b6d98ee4b7a1252d81e815a983e359f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/93f4e735.failed
+
+These two functions have never been used since they were added.
+
+Link: https://lore.kernel.org/r/20191113134528.21187-1-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 93f4e735b6d98ee4b7a1252d81e815a983e359f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hmm.h
+#	mm/hmm.c
+diff --cc include/linux/hmm.h
+index 6a8157d67186,ddf9f7144c43..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -477,22 -228,14 +477,32 @@@ void hmm_mirror_unregister(struct hmm_m
+  /*
+   * Please see Documentation/vm/hmm.rst for how to use the range API.
+   */
+++<<<<<<< HEAD
+ +int hmm_range_register(struct hmm_range *range,
+ +		       struct hmm_mirror *mirror,
+ +		       unsigned long start,
+ +		       unsigned long end,
+ +		       unsigned page_shift);
+ +void hmm_range_unregister(struct hmm_range *range);
+ +long hmm_range_snapshot(struct hmm_range *range);
+ +long hmm_range_fault(struct hmm_range *range, bool block);
+ +long hmm_range_dma_map(struct hmm_range *range,
+ +		       struct device *device,
+ +		       dma_addr_t *daddrs,
+ +		       bool block);
+ +long hmm_range_dma_unmap(struct hmm_range *range,
+ +			 struct device *device,
+ +			 dma_addr_t *daddrs,
+ +			 bool dirty);
+++=======
++ long hmm_range_fault(struct hmm_range *range, unsigned int flags);
++ #else
++ static inline long hmm_range_fault(struct hmm_range *range, unsigned int flags)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ #endif
+++>>>>>>> 93f4e735b6d9 (mm/hmm: remove hmm_range_dma_map and hmm_range_dma_unmap)
+  
+  /*
+   * HMM_RANGE_DEFAULT_TIMEOUT - default timeout (ms) when waiting for a range
+diff --cc mm/hmm.c
+index e19a0812813a,d379cb6496ae..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -1149,153 -691,3 +1149,156 @@@ long hmm_range_fault(struct hmm_range *
+  	return (hmm_vma_walk.last - range->start) >> PAGE_SHIFT;
+  }
+  EXPORT_SYMBOL(hmm_range_fault);
+++<<<<<<< HEAD
+ +
+ +/**
+ + * hmm_range_dma_map() - hmm_range_fault() and dma map page all in one.
+ + * @range: range being faulted
+ + * @device: device against to dma map page to
+ + * @daddrs: dma address of mapped pages
+ + * @block: allow blocking on fault (if true it sleeps and do not drop mmap_sem)
+ + * Return: number of pages mapped on success, -EAGAIN if mmap_sem have been
+ + *          drop and you need to try again, some other error value otherwise
+ + *
+ + * Note same usage pattern as hmm_range_fault().
+ + */
+ +long hmm_range_dma_map(struct hmm_range *range,
+ +		       struct device *device,
+ +		       dma_addr_t *daddrs,
+ +		       bool block)
+ +{
+ +	unsigned long i, npages, mapped;
+ +	long ret;
+ +
+ +	ret = hmm_range_fault(range, block);
+ +	if (ret <= 0)
+ +		return ret ? ret : -EBUSY;
+ +
+ +	npages = (range->end - range->start) >> PAGE_SHIFT;
+ +	for (i = 0, mapped = 0; i < npages; ++i) {
+ +		enum dma_data_direction dir = DMA_TO_DEVICE;
+ +		struct page *page;
+ +
+ +		/*
+ +		 * FIXME need to update DMA API to provide invalid DMA address
+ +		 * value instead of a function to test dma address value. This
+ +		 * would remove lot of dumb code duplicated accross many arch.
+ +		 *
+ +		 * For now setting it to 0 here is good enough as the pfns[]
+ +		 * value is what is use to check what is valid and what isn't.
+ +		 */
+ +		daddrs[i] = 0;
+ +
+ +		page = hmm_device_entry_to_page(range, range->pfns[i]);
+ +		if (page == NULL)
+ +			continue;
+ +
+ +		/* Check if range is being invalidated */
+ +		if (!range->valid) {
+ +			ret = -EBUSY;
+ +			goto unmap;
+ +		}
+ +
+ +		/* If it is read and write than map bi-directional. */
+ +		if (range->pfns[i] & range->flags[HMM_PFN_WRITE])
+ +			dir = DMA_BIDIRECTIONAL;
+ +
+ +		daddrs[i] = dma_map_page(device, page, 0, PAGE_SIZE, dir);
+ +		if (dma_mapping_error(device, daddrs[i])) {
+ +			ret = -EFAULT;
+ +			goto unmap;
+ +		}
+ +
+ +		mapped++;
+ +	}
+ +
+ +	return mapped;
+ +
+ +unmap:
+ +	for (npages = i, i = 0; (i < npages) && mapped; ++i) {
+ +		enum dma_data_direction dir = DMA_TO_DEVICE;
+ +		struct page *page;
+ +
+ +		page = hmm_device_entry_to_page(range, range->pfns[i]);
+ +		if (page == NULL)
+ +			continue;
+ +
+ +		if (dma_mapping_error(device, daddrs[i]))
+ +			continue;
+ +
+ +		/* If it is read and write than map bi-directional. */
+ +		if (range->pfns[i] & range->flags[HMM_PFN_WRITE])
+ +			dir = DMA_BIDIRECTIONAL;
+ +
+ +		dma_unmap_page(device, daddrs[i], PAGE_SIZE, dir);
+ +		mapped--;
+ +	}
+ +
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL(hmm_range_dma_map);
+ +
+ +/**
+ + * hmm_range_dma_unmap() - unmap range of that was map with hmm_range_dma_map()
+ + * @range: range being unmapped
+ + * @device: device against which dma map was done
+ + * @daddrs: dma address of mapped pages
+ + * @dirty: dirty page if it had the write flag set
+ + * Return: number of page unmapped on success, -EINVAL otherwise
+ + *
+ + * Note that caller MUST abide by mmu notifier or use HMM mirror and abide
+ + * to the sync_cpu_device_pagetables() callback so that it is safe here to
+ + * call set_page_dirty(). Caller must also take appropriate locks to avoid
+ + * concurrent mmu notifier or sync_cpu_device_pagetables() to make progress.
+ + */
+ +long hmm_range_dma_unmap(struct hmm_range *range,
+ +			 struct device *device,
+ +			 dma_addr_t *daddrs,
+ +			 bool dirty)
+ +{
+ +	unsigned long i, npages;
+ +	long cpages = 0;
+ +
+ +	/* Sanity check. */
+ +	if (range->end <= range->start)
+ +		return -EINVAL;
+ +	if (!daddrs)
+ +		return -EINVAL;
+ +	if (!range->pfns)
+ +		return -EINVAL;
+ +
+ +	npages = (range->end - range->start) >> PAGE_SHIFT;
+ +	for (i = 0; i < npages; ++i) {
+ +		enum dma_data_direction dir = DMA_TO_DEVICE;
+ +		struct page *page;
+ +
+ +		page = hmm_device_entry_to_page(range, range->pfns[i]);
+ +		if (page == NULL)
+ +			continue;
+ +
+ +		/* If it is read and write than map bi-directional. */
+ +		if (range->pfns[i] & range->flags[HMM_PFN_WRITE]) {
+ +			dir = DMA_BIDIRECTIONAL;
+ +
+ +			/*
+ +			 * See comments in function description on why it is
+ +			 * safe here to call set_page_dirty()
+ +			 */
+ +			if (dirty)
+ +				set_page_dirty(page);
+ +		}
+ +
+ +		/* Unmap and clear pfns/dma address */
+ +		dma_unmap_page(device, daddrs[i], PAGE_SIZE, dir);
+ +		range->pfns[i] = range->values[HMM_PFN_NONE];
+ +		/* FIXME see comments in hmm_vma_dma_map() */
+ +		daddrs[i] = 0;
+ +		cpages++;
+ +	}
+ +
+ +	return cpages;
+ +}
+ +EXPORT_SYMBOL(hmm_range_dma_unmap);
+ +#endif /* IS_ENABLED(CONFIG_HMM_MIRROR) */
+++=======
+++>>>>>>> 93f4e735b6d9 (mm/hmm: remove hmm_range_dma_map and hmm_range_dma_unmap)
+* Unmerged path include/linux/hmm.h
+* Unmerged path mm/hmm.c
