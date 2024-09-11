@@ -1,0 +1,118 @@
+KVM: x86/mmu: Drop RCU after processing each root in MMU notifier hooks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit a151aceca1e46be1defdaceea7c28108fa0ad022
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a151acec.failed
+
+Drop RCU protection after processing each root when handling MMU notifier
+hooks that aren't the "unmap" path, i.e. aren't zapping.  Temporarily
+drop RCU to let RCU do its thing between roots, and to make it clear that
+there's no special behavior that relies on holding RCU across all roots.
+
+Currently, the RCU protection is completely superficial, it's necessary
+only to make rcu_dereference() of SPTE pointers happy.  A future patch
+will rely on holding RCU as a proxy for vCPUs in the guest, e.g. to
+ensure shadow pages aren't freed before all vCPUs do a TLB flush (or
+rather, acknowledge the need for a flush), but in that case RCU needs to
+be held until the flush is complete if and only if the flush is needed
+because a shadow page may have been removed.  And except for the "unmap"
+path, MMU notifier events cannot remove SPs (don't toggle PRESENT bit,
+and can't change the PFN for a SP).
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20220226001546.360188-10-seanjc@google.com>
+	Reviewed-by: Mingwei Zhang <mizhang@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a151aceca1e46be1defdaceea7c28108fa0ad022)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index c08bb02954b0,22b0c03b673b..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1021,47 -1105,37 +1021,63 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  	return ret;
+  }
+  
+ -bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
+ -				 bool flush)
+ -{
+ -	return __kvm_tdp_mmu_zap_gfn_range(kvm, range->slot->as_id, range->start,
+ -					   range->end, range->may_block, flush);
+ -}
+ -
+ -typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
+ -			      struct kvm_gfn_range *range);
+ +typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			     unsigned long data);
+  
+ -static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
+ -						   struct kvm_gfn_range *range,
+ -						   tdp_handler_t handler)
+ +static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+ +							unsigned long start,
+ +							unsigned long end,
+ +							unsigned long data,
+ +							tdp_handler_t handler)
+  {
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	struct kvm_mmu_page *root;
+ -	struct tdp_iter iter;
+ -	bool ret = false;
+ +	int ret = 0;
+ +	int as_id;
+ +
+++<<<<<<< HEAD
+ +	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+ +		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+ +			slots = __kvm_memslots(kvm, as_id);
+ +			kvm_for_each_memslot(memslot, slots) {
+ +				unsigned long hva_start, hva_end;
+ +				gfn_t gfn_start, gfn_end;
+ +
+ +				hva_start = max(start, memslot->userspace_addr);
+ +				hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +				if (hva_start >= hva_end)
+ +					continue;
+ +				/*
+ +				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +				 */
+ +				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +				ret |= handler(kvm, memslot, root, gfn_start,
+ +					gfn_end, data);
+ +			}
+ +		}
+ +	}
+  
+++=======
++ 	/*
++ 	 * Don't support rescheduling, none of the MMU notifiers that funnel
++ 	 * into this helper allow blocking; it'd be dead, wasteful code.
++ 	 */
++ 	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
++ 		rcu_read_lock();
++ 
++ 		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
++ 			ret |= handler(kvm, &iter, range);
++ 
++ 		rcu_read_unlock();
++ 	}
++ 
+++>>>>>>> a151aceca1e4 (KVM: x86/mmu: Drop RCU after processing each root in MMU notifier hooks)
+  	return ret;
+  }
+  
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
