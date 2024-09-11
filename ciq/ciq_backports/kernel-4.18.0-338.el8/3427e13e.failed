@@ -1,0 +1,430 @@
+cxgb4/ch_ktls: ktls stats are added at port level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 3427e13e5a73068f3122abe04427d33d510a0882
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/3427e13e.failed
+
+All the ktls stats were at adapter level, but now changing it
+to port level.
+
+Fixes: 62370a4f346d ("cxgb4/chcr: Add ipv6 support and statistics")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3427e13e5a73068f3122abe04427d33d510a0882)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 640fa34b6566,5195f692f14d..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -388,7 -337,7 +388,11 @@@ void chcr_ktls_dev_del(struct net_devic
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx =
+  				chcr_get_ktls_tx_context(tls_ctx);
+  	struct chcr_ktls_info *tx_info = tx_ctx->chcr_info;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	struct sock *sk;
+++=======
++ 	struct ch_ktls_port_stats_debug *port_stats;
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+  	if (!tx_info)
+  		return;
+@@@ -418,7 -362,8 +422,12 @@@
+  				 tx_info->tid, tx_info->ip_family);
+  	}
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_connection_close);
+++=======
++ 	port_stats = &tx_info->adap->ch_ktls_stats.ktls_port[tx_info->port_id];
++ 	atomic64_inc(&port_stats->ktls_tx_connection_close);
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	kvfree(tx_info);
+  	tx_ctx->chcr_info = NULL;
+  	/* release module refcount */
+@@@ -434,12 -379,13 +443,13 @@@
+   * @direction - TX/RX crypto direction
+   * return: SUCCESS/FAILURE.
+   */
+ -static int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
+ -			     enum tls_offload_ctx_dir direction,
+ -			     struct tls_crypto_info *crypto_info,
+ -			     u32 start_offload_tcp_sn)
+ +int chcr_ktls_dev_add(struct net_device *netdev, struct sock *sk,
+ +		      enum tls_offload_ctx_dir direction,
+ +		      struct tls_crypto_info *crypto_info,
+ +		      u32 start_offload_tcp_sn)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct ch_ktls_port_stats_debug *port_stats;
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
+  	struct chcr_ktls_info *tx_info;
+  	struct dst_entry *dst;
+@@@ -453,30 -399,23 +463,36 @@@
+  
+  	pi = netdev_priv(netdev);
+  	adap = pi->adapter;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+++=======
++ 	port_stats = &adap->ch_ktls_stats.ktls_port[pi->port_id];
++ 	atomic64_inc(&port_stats->ktls_tx_connection_open);
++ 
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	if (direction == TLS_OFFLOAD_CTX_DIR_RX) {
+  		pr_err("not expecting for RX direction\n");
+ +		ret = -EINVAL;
+  		goto out;
+  	}
+ -
+ -	if (tx_ctx->chcr_info)
+ +	if (tx_ctx->chcr_info) {
+ +		ret = -EINVAL;
+  		goto out;
+ +	}
+  
+  	tx_info = kvzalloc(sizeof(*tx_info), GFP_KERNEL);
+ -	if (!tx_info)
+ +	if (!tx_info) {
+ +		ret = -ENOMEM;
+  		goto out;
+ +	}
+  
+ -	tx_info->sk = sk;
+  	spin_lock_init(&tx_info->lock);
+ +
+ +	/* clear connection state */
+ +	spin_lock(&tx_info->lock);
+ +	tx_info->connection_state = KTLS_CONN_CLOSED;
+ +	spin_unlock(&tx_info->lock);
+ +
+ +	tx_info->sk = sk;
+  	/* initialize tid and atid to -1, 0 is a also a valid id. */
+  	tx_info->tid = -1;
+  	tx_info->atid = -1;
+@@@ -540,23 -487,76 +556,57 @@@
+  	/* create a filter and call cxgb4_l2t_send to send the packet out, which
+  	 * will take care of updating l2t entry in hw if not already done.
+  	 */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_setup_connection(sk, tx_info))
+ -		goto put_module;
+ +	ret = chcr_setup_connection(sk, tx_info);
+ +	if (ret)
+ +		goto out2;
+  
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		if (tx_info->open_state == CH_KTLS_OPEN_PENDING)
+ -			tx_info->pending_close = true;
+ -		/* free the lock after the cleanup */
+ -		goto put_module;
+ +	/* Driver shouldn't be removed until any single connection exists */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -EINVAL;
+ +		goto out2;
+  	}
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+++=======
++ 	spin_unlock_bh(&tx_info->lock);
++ 
++ 	/* initialize tcb */
++ 	reinit_completion(&tx_info->completion);
++ 	/* mark it pending for hw response */
++ 	tx_info->open_state = CH_KTLS_OPEN_PENDING;
++ 
++ 	if (chcr_init_tcb_fields(tx_info))
++ 		goto free_tid;
++ 
++ 	/* Wait for reply */
++ 	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
++ 	spin_lock_bh(&tx_info->lock);
++ 	if (tx_info->open_state) {
++ 		/* need to wait for hw response, can't free tx_info yet. */
++ 		tx_info->pending_close = true;
++ 		/* free the lock after cleanup */
++ 		goto free_tid;
++ 	}
++ 	spin_unlock_bh(&tx_info->lock);
++ 
++ 	if (!cxgb4_check_l2t_valid(tx_info->l2te))
++ 		goto free_tid;
++ 
++ 	atomic64_inc(&port_stats->ktls_tx_ctx);
++ 	tx_ctx->chcr_info = tx_info;
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_open);
+  	return 0;
+ -
+ -free_tid:
+ -	chcr_ktls_mark_tcb_close(tx_info);
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	/* clear clip entry */
+ -	if (tx_info->ip_family == AF_INET6)
+ -		cxgb4_clip_release(netdev, (const u32 *)
+ -				   &sk->sk_v6_rcv_saddr,
+ -				   1);
+ -#endif
+ -	cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
+ -			 tx_info->tid, tx_info->ip_family);
+ -
+ -put_module:
+ -	/* release module refcount */
+ -	module_put(THIS_MODULE);
+ -free_l2t:
+ -	cxgb4_l2t_release(tx_info->l2te);
+ -free_tx_info:
+ -	if (tx_info->pending_close)
+ -		spin_unlock_bh(&tx_info->lock);
+ -	else
+ -		kvfree(tx_info);
+ +out2:
+ +	kvfree(tx_info);
+  out:
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_fail);
+ +	return ret;
+++=======
++ 	atomic64_inc(&port_stats->ktls_tx_connection_fail);
++ 	return -1;
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  }
+  
+  /*
+@@@ -795,7 -827,7 +848,11 @@@ static int chcr_ktls_xmit_tcb_cpls(stru
+  						 TCB_SND_UNA_RAW_V
+  						 (TCB_SND_UNA_RAW_M),
+  						 TCB_SND_UNA_RAW_V(0), 0);
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_ooo);
+++=======
++ 		atomic64_inc(&port_stats->ktls_tx_ooo);
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		cpl++;
+  	}
+  	/* update ack */
+@@@ -1826,9 -1858,11 +1883,10 @@@ out
+  }
+  
+  /* nic tls TX handler */
+ -static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
+ +int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
++ 	struct ch_ktls_port_stats_debug *port_stats;
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
+ -	struct ch_ktls_stats_debug *stats;
+  	struct tcphdr *th = tcp_hdr(skb);
+  	int data_len, qidx, ret = 0, mss;
+  	struct tls_record_info *record;
+@@@ -1878,7 -1901,8 +1936,12 @@@
+  		return NETDEV_TX_BUSY;
+  
+  	adap = tx_info->adap;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	stats = &adap->chcr_stats;
+++=======
++ 	stats = &adap->ch_ktls_stats;
++ 	port_stats = &stats->ktls_port[tx_info->port_id];
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+  	qidx = skb->queue_mapping;
+  	q = &adap->sge.ethtxq[qidx + tx_info->first_qset];
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+index f6cc46ef72b5,0273f40b85f7..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+@@@ -3492,40 -3561,30 +3496,58 @@@ static int chcr_stats_show(struct seq_f
+  	seq_puts(seq, "\nChelsio KTLS Crypto Accelerator Stats\n");
+  	seq_printf(seq, "Tx TLS offload refcount:          %20u\n",
+  		   refcount_read(&adap->chcr_ktls.ktls_refcount));
+++<<<<<<< HEAD
+ +	seq_printf(seq, "Tx HW offload contexts added:     %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_ctx));
+ +	seq_printf(seq, "Tx connection created:            %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_open));
+ +	seq_printf(seq, "Tx connection failed:             %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_fail));
+ +	seq_printf(seq, "Tx connection closed:             %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_close));
+ +	seq_printf(seq, "Packets passed for encryption :   %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_encrypted_packets));
+ +	seq_printf(seq, "Bytes passed for encryption :     %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_encrypted_bytes));
+++=======
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  	seq_printf(seq, "Tx records send:                  %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_send_records));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_send_records));
+  	seq_printf(seq, "Tx partial start of records:      %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_start_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_start_pkts));
+  	seq_printf(seq, "Tx partial middle of records:     %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_middle_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_middle_pkts));
+  	seq_printf(seq, "Tx partial end of record:         %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_end_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_end_pkts));
+  	seq_printf(seq, "Tx complete records:              %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_complete_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_complete_pkts));
+  	seq_printf(seq, "TX trim pkts :                    %20llu\n",
+++<<<<<<< HEAD
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_trimmed_pkts));
+ +	seq_printf(seq, "Tx out of order packets:          %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_ooo));
+ +	seq_printf(seq, "Tx drop pkts before HW offload:   %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_skip_no_sync_data));
+ +	seq_printf(seq, "Tx drop not synced packets:       %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_drop_no_sync_data));
+ +	seq_printf(seq, "Tx drop bypass req:               %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_drop_bypass_req));
+++=======
++ 		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_trimmed_pkts));
++ 	while (i < MAX_NPORTS) {
++ 		ktls_port = &adap->ch_ktls_stats.ktls_port[i];
++ 		seq_printf(seq, "Port %d\n", i);
++ 		seq_printf(seq, "Tx connection created:            %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_open));
++ 		seq_printf(seq, "Tx connection failed:             %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_fail));
++ 		seq_printf(seq, "Tx connection closed:             %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_close));
++ 		i++;
++ 	}
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  #endif
+ +
+  	return 0;
+  }
+  DEFINE_SHOW_ATTRIBUTE(chcr_stats);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+index 60c7efff8408,61ea3ec5c3fc..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+@@@ -120,15 -117,7 +120,19 @@@ static const char stats_strings[][ETH_G
+  	"vlan_insertions        ",
+  	"gro_packets            ",
+  	"gro_merged             ",
+++<<<<<<< HEAD
+ +};
+ +
+ +static char adapter_stats_strings[][ETH_GSTRING_LEN] = {
+ +	"db_drop                ",
+ +	"db_full                ",
+ +	"db_empty               ",
+ +	"write_coal_success     ",
+ +	"write_coal_fail        ",
+ +#ifdef CONFIG_CHELSIO_TLS_DEVICE
+++=======
++ #if  IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  	"tx_tls_encrypted_packets",
+  	"tx_tls_encrypted_bytes  ",
+  	"tx_tls_ctx              ",
+@@@ -257,15 -257,7 +269,19 @@@ struct queue_port_stats 
+  	u64 vlan_ins;
+  	u64 gro_pkts;
+  	u64 gro_merged;
+++<<<<<<< HEAD
+ +};
+ +
+ +struct adapter_stats {
+ +	u64 db_drop;
+ +	u64 db_full;
+ +	u64 db_empty;
+ +	u64 wc_success;
+ +	u64 wc_fail;
+ +#ifdef CONFIG_CHELSIO_TLS_DEVICE
+++=======
++ #if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  	u64 tx_tls_encrypted_packets;
+  	u64 tx_tls_encrypted_bytes;
+  	u64 tx_tls_ctx;
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index a963fd0b4540,b169776ab484..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@@ -361,18 -365,8 +362,23 @@@ struct cxgb4_virt_res 
+  	struct cxgb4_range ppod_edram;
+  };
+  
+++<<<<<<< HEAD
+ +struct chcr_stats_debug {
+ +	atomic_t cipher_rqst;
+ +	atomic_t digest_rqst;
+ +	atomic_t aead_rqst;
+ +	atomic_t complete;
+ +	atomic_t error;
+ +	atomic_t fallback;
+ +	atomic_t ipsec_cnt;
+ +	atomic_t tls_pdu_tx;
+ +	atomic_t tls_pdu_rx;
+ +	atomic_t tls_key;
+ +#ifdef CONFIG_CHELSIO_TLS_DEVICE
+++=======
++ #if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
++ struct ch_ktls_port_stats_debug {
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  	atomic64_t ktls_tx_connection_open;
+  	atomic64_t ktls_tx_connection_fail;
+  	atomic64_t ktls_tx_connection_close;
+@@@ -390,9 -377,37 +389,25 @@@
+  	atomic64_t ktls_tx_skip_no_sync_data;
+  	atomic64_t ktls_tx_drop_no_sync_data;
+  	atomic64_t ktls_tx_drop_bypass_req;
+++<<<<<<< HEAD
+++=======
++ };
++ 
++ struct ch_ktls_stats_debug {
++ 	struct ch_ktls_port_stats_debug ktls_port[MAX_ULD_NPORTS];
++ 	atomic64_t ktls_tx_send_records;
++ 	atomic64_t ktls_tx_end_pkts;
++ 	atomic64_t ktls_tx_start_pkts;
++ 	atomic64_t ktls_tx_middle_pkts;
++ 	atomic64_t ktls_tx_retransmit_pkts;
++ 	atomic64_t ktls_tx_complete_pkts;
++ 	atomic64_t ktls_tx_trimmed_pkts;
++ };
++ #endif
+++>>>>>>> 3427e13e5a73 (cxgb4/ch_ktls: ktls stats are added at port level)
+  
+ -struct chcr_stats_debug {
+ -	atomic_t cipher_rqst;
+ -	atomic_t digest_rqst;
+ -	atomic_t aead_rqst;
+ -	atomic_t complete;
+ -	atomic_t error;
+ -	atomic_t fallback;
+ -	atomic_t tls_pdu_tx;
+ -	atomic_t tls_pdu_rx;
+ -	atomic_t tls_key;
+ -};
+ -
+ -#if IS_ENABLED(CONFIG_CHELSIO_IPSEC_INLINE)
+ -struct ch_ipsec_stats_debug {
+ -	atomic_t ipsec_cnt;
+ -};
+  #endif
+ +};
+  
+  #define OCQ_WIN_OFFSET(pdev, vres) \
+  	(pci_resource_len((pdev), 2) - roundup_pow_of_two((vres)->ocq.size))
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_ethtool.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
