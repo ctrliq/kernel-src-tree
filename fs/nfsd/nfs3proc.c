@@ -495,17 +495,7 @@ nfsd3_proc_readdir(struct svc_rqst *rqstp)
 		count += PAGE_SIZE;
 	}
 	resp->count = count >> 2;
-	if (resp->offset) {
-		if (unlikely(resp->offset1)) {
-			/* we ended up with offset on a page boundary */
-			*resp->offset = htonl(offset >> 32);
-			*resp->offset1 = htonl(offset & 0xffffffff);
-			resp->offset1 = NULL;
-		} else {
-			xdr_encode_hyper(resp->offset, offset);
-		}
-		resp->offset = NULL;
-	}
+	nfs3svc_encode_cookie3(resp, offset);
 
 	/* Recycle only pages that were part of the reply */
 	rqstp->rq_next_page = resp->xdr.page_ptr + 1;
@@ -563,17 +553,7 @@ nfsd3_proc_readdirplus(struct svc_rqst *rqstp)
 		count += PAGE_SIZE;
 	}
 	resp->count = count >> 2;
-	if (resp->offset) {
-		if (unlikely(resp->offset1)) {
-			/* we ended up with offset on a page boundary */
-			*resp->offset = htonl(offset >> 32);
-			*resp->offset1 = htonl(offset & 0xffffffff);
-			resp->offset1 = NULL;
-		} else {
-			xdr_encode_hyper(resp->offset, offset);
-		}
-		resp->offset = NULL;
-	}
+	nfs3svc_encode_cookie3(resp, offset);
 
 	/* Recycle only pages that were part of the reply */
 	rqstp->rq_next_page = resp->xdr.page_ptr + 1;
