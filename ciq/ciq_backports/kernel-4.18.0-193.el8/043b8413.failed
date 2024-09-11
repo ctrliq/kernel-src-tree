@@ -1,0 +1,120 @@
+net: devlink: remove redundant rtnl lock assert
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] devlink: remove redundant rtnl lock assert (Marcelo Leitner) [1774694]
+Rebuild_FUZZ: 94.38%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 043b8413e8c0c0ffbf8be268eb73716e05a96064
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/043b8413.failed
+
+It is enough for caller of devlink_compat_switch_id_get() to hold the net
+device to guarantee that devlink port is not destroyed concurrently. Remove
+rtnl lock assertion and modify comment to warn user that they must hold
+either rtnl lock or reference to net device. This is necessary to
+accommodate future implementation of rtnl-unlocked TC offloads driver
+callbacks.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+(cherry picked from commit 043b8413e8c0c0ffbf8be268eb73716e05a96064)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/devlink.c
+diff --cc net/core/devlink.c
+index d12ffdf1735e,d3dbb904bf3b..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -6515,32 -6893,63 +6515,80 @@@ out
+  
+  int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
+  {
+ +	struct devlink_port *devlink_port;
+  	struct devlink *devlink;
+ -	int ret;
+  
+ -	dev_hold(dev);
+ -	rtnl_unlock();
+ +	mutex_lock(&devlink_mutex);
+ +	list_for_each_entry(devlink, &devlink_list, list) {
+ +		mutex_lock(&devlink->lock);
+ +		list_for_each_entry(devlink_port, &devlink->port_list, list) {
+ +			int ret = -EOPNOTSUPP;
+ +
+ +			if (devlink_port->type != DEVLINK_PORT_TYPE_ETH ||
+ +			    devlink_port->type_dev != dev)
+ +				continue;
+  
+ -	devlink = netdev_to_devlink(dev);
+ -	if (!devlink || !devlink->ops->flash_update) {
+ -		ret = -EOPNOTSUPP;
+ -		goto out;
+ +			mutex_unlock(&devlink_mutex);
+ +			if (devlink->ops->flash_update)
+ +				ret = devlink->ops->flash_update(devlink,
+ +								 file_name,
+ +								 NULL, NULL);
+ +			mutex_unlock(&devlink->lock);
+ +			return ret;
+ +		}
+ +		mutex_unlock(&devlink->lock);
+  	}
+ +	mutex_unlock(&devlink_mutex);
+  
+++<<<<<<< HEAD
+ +	return -EOPNOTSUPP;
+++=======
++ 	mutex_lock(&devlink->lock);
++ 	ret = devlink->ops->flash_update(devlink, file_name, NULL, NULL);
++ 	mutex_unlock(&devlink->lock);
++ 
++ out:
++ 	rtnl_lock();
++ 	dev_put(dev);
++ 
++ 	return ret;
++ }
++ 
++ int devlink_compat_phys_port_name_get(struct net_device *dev,
++ 				      char *name, size_t len)
++ {
++ 	struct devlink_port *devlink_port;
++ 
++ 	/* RTNL mutex is held here which ensures that devlink_port
++ 	 * instance cannot disappear in the middle. No need to take
++ 	 * any devlink lock as only permanent values are accessed.
++ 	 */
++ 	ASSERT_RTNL();
++ 
++ 	devlink_port = netdev_to_devlink_port(dev);
++ 	if (!devlink_port)
++ 		return -EOPNOTSUPP;
++ 
++ 	return __devlink_port_phys_port_name_get(devlink_port, name, len);
++ }
++ 
++ int devlink_compat_switch_id_get(struct net_device *dev,
++ 				 struct netdev_phys_item_id *ppid)
++ {
++ 	struct devlink_port *devlink_port;
++ 
++ 	/* Caller must hold RTNL mutex or reference to dev, which ensures that
++ 	 * devlink_port instance cannot disappear in the middle. No need to take
++ 	 * any devlink lock as only permanent values are accessed.
++ 	 */
++ 	devlink_port = netdev_to_devlink_port(dev);
++ 	if (!devlink_port || !devlink_port->attrs.switch_port)
++ 		return -EOPNOTSUPP;
++ 
++ 	memcpy(ppid, &devlink_port->attrs.switch_id, sizeof(*ppid));
++ 
++ 	return 0;
+++>>>>>>> 043b8413e8c0 (net: devlink: remove redundant rtnl lock assert)
+  }
+  
+  static int __init devlink_init(void)
+* Unmerged path net/core/devlink.c
