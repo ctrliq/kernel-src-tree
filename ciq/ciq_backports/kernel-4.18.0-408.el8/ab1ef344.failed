@@ -1,0 +1,188 @@
+KVM: selftests: Add test to verify TRIPLE_FAULT on invalid L2 guest state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit ab1ef34416a65ba11f66ae6435fcf0251cb46fd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/ab1ef344.failed
+
+Add a selftest to attempt to enter L2 with invalid guests state by
+exiting to userspace via I/O from L2, and then using KVM_SET_SREGS to set
+invalid guest state (marking TR unusable is arbitrary chosen for its
+relative simplicity).
+
+This is a regression test for a bug introduced by commit c8607e4a086f
+("KVM: x86: nVMX: don't fail nested VM entry on invalid guest state if
+!from_vmentry"), which incorrectly set vmx->fail=true when L2 had invalid
+guest state and ultimately triggered a WARN due to nested_vmx_vmexit()
+seeing vmx->fail==true while attempting to synthesize a nested VM-Exit.
+
+The is also a functional test to verify that KVM sythesizes TRIPLE_FAULT
+for L2, which is somewhat arbitrary behavior, instead of emulating L2.
+KVM should never emulate L2 due to invalid guest state, as it's
+architecturally impossible for L1 to run an L2 guest with invalid state
+as nested VM-Enter should always fail, i.e. L1 needs to do the emulation.
+Stuffing state via KVM ioctl() is a non-architctural, out-of-band case,
+hence the TRIPLE_FAULT being rather arbitrary.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211207193006.120997-5-seanjc@google.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit ab1ef34416a65ba11f66ae6435fcf0251cb46fd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 6108a977b0a4,3cb5ac5da087..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -9,9 -26,18 +9,16 @@@
+  /x86_64/sev_migrate_tests
+  /x86_64/smm_test
+  /x86_64/state_test
+ -/x86_64/svm_vmcall_test
+ -/x86_64/svm_int_ctl_test
+  /x86_64/sync_regs_test
+ -/x86_64/tsc_msrs_test
+ -/x86_64/userspace_io_test
+ -/x86_64/userspace_msr_exit_test
+  /x86_64/vmx_apic_access_test
+  /x86_64/vmx_close_while_nested_test
+++<<<<<<< HEAD
+++=======
++ /x86_64/vmx_dirty_log_test
++ /x86_64/vmx_invalid_nested_guest_state
++ /x86_64/vmx_preemption_timer_test
++ /x86_64/vmx_set_nested_state_test
+++>>>>>>> ab1ef34416a6 (KVM: selftests: Add test to verify TRIPLE_FAULT on invalid L2 guest state)
+  /x86_64/vmx_tsc_adjust_test
+  /x86_64/vmx_nested_tsc_scaling_test
+  /x86_64/xapic_ipi_test
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+diff --git a/tools/testing/selftests/kvm/Makefile b/tools/testing/selftests/kvm/Makefile
+index 89c308b6d33f..5ebf7c501f18 100644
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -62,6 +62,7 @@ TEST_GEN_PROGS_x86_64 += x86_64/userspace_msr_exit_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_apic_access_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_close_while_nested_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_dirty_log_test
++TEST_GEN_PROGS_x86_64 += x86_64/vmx_invalid_nested_guest_state
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_set_nested_state_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_tsc_adjust_test
+ TEST_GEN_PROGS_x86_64 += x86_64/vmx_nested_tsc_scaling_test
+diff --git a/tools/testing/selftests/kvm/x86_64/vmx_invalid_nested_guest_state.c b/tools/testing/selftests/kvm/x86_64/vmx_invalid_nested_guest_state.c
+new file mode 100644
+index 000000000000..489fbed4ca6f
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/vmx_invalid_nested_guest_state.c
+@@ -0,0 +1,105 @@
++// SPDX-License-Identifier: GPL-2.0-only
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++#include "vmx.h"
++
++#include <string.h>
++#include <sys/ioctl.h>
++
++#include "kselftest.h"
++
++#define VCPU_ID	0
++#define ARBITRARY_IO_PORT 0x2000
++
++static struct kvm_vm *vm;
++
++static void l2_guest_code(void)
++{
++	/*
++	 * Generate an exit to L0 userspace, i.e. main(), via I/O to an
++	 * arbitrary port.
++	 */
++	asm volatile("inb %%dx, %%al"
++		     : : [port] "d" (ARBITRARY_IO_PORT) : "rax");
++}
++
++static void l1_guest_code(struct vmx_pages *vmx_pages)
++{
++#define L2_GUEST_STACK_SIZE 64
++	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
++
++	GUEST_ASSERT(prepare_for_vmx_operation(vmx_pages));
++	GUEST_ASSERT(load_vmcs(vmx_pages));
++
++	/* Prepare the VMCS for L2 execution. */
++	prepare_vmcs(vmx_pages, l2_guest_code,
++		     &l2_guest_stack[L2_GUEST_STACK_SIZE]);
++
++	/*
++	 * L2 must be run without unrestricted guest, verify that the selftests
++	 * library hasn't enabled it.  Because KVM selftests jump directly to
++	 * 64-bit mode, unrestricted guest support isn't required.
++	 */
++	GUEST_ASSERT(!(vmreadz(CPU_BASED_VM_EXEC_CONTROL) & CPU_BASED_ACTIVATE_SECONDARY_CONTROLS) ||
++		     !(vmreadz(SECONDARY_VM_EXEC_CONTROL) & SECONDARY_EXEC_UNRESTRICTED_GUEST));
++
++	GUEST_ASSERT(!vmlaunch());
++
++	/* L2 should triple fault after main() stuffs invalid guest state. */
++	GUEST_ASSERT(vmreadz(VM_EXIT_REASON) == EXIT_REASON_TRIPLE_FAULT);
++	GUEST_DONE();
++}
++
++int main(int argc, char *argv[])
++{
++	vm_vaddr_t vmx_pages_gva;
++	struct kvm_sregs sregs;
++	struct kvm_run *run;
++	struct ucall uc;
++
++	nested_vmx_check_supported();
++
++	vm = vm_create_default(VCPU_ID, 0, (void *) l1_guest_code);
++
++	/* Allocate VMX pages and shared descriptors (vmx_pages). */
++	vcpu_alloc_vmx(vm, &vmx_pages_gva);
++	vcpu_args_set(vm, VCPU_ID, 1, vmx_pages_gva);
++
++	vcpu_run(vm, VCPU_ID);
++
++	run = vcpu_state(vm, VCPU_ID);
++
++	/*
++	 * The first exit to L0 userspace should be an I/O access from L2.
++	 * Running L1 should launch L2 without triggering an exit to userspace.
++	 */
++	TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++		    "Expected KVM_EXIT_IO, got: %u (%s)\n",
++		    run->exit_reason, exit_reason_str(run->exit_reason));
++
++	TEST_ASSERT(run->io.port == ARBITRARY_IO_PORT,
++		    "Expected IN from port %d from L2, got port %d",
++		    ARBITRARY_IO_PORT, run->io.port);
++
++	/*
++	 * Stuff invalid guest state for L2 by making TR unusuable.  The next
++	 * KVM_RUN should induce a TRIPLE_FAULT in L2 as KVM doesn't support
++	 * emulating invalid guest state for L2.
++	 */
++	memset(&sregs, 0, sizeof(sregs));
++	vcpu_sregs_get(vm, VCPU_ID, &sregs);
++	sregs.tr.unusable = 1;
++	vcpu_sregs_set(vm, VCPU_ID, &sregs);
++
++	vcpu_run(vm, VCPU_ID);
++
++	switch (get_ucall(vm, VCPU_ID, &uc)) {
++	case UCALL_DONE:
++		break;
++	case UCALL_ABORT:
++		TEST_FAIL("%s", (const char *)uc.args[0]);
++	default:
++		TEST_FAIL("Unexpected ucall: %lu", uc.cmd);
++	}
++}
