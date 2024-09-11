@@ -1,0 +1,103 @@
+iommu/arm-smmu-v3: Seize private ASID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jean-Philippe Brucker <jean-philippe@linaro.org>
+commit 3e63033675c9b1e79b14655481a8c4ecaf23821f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3e630336.failed
+
+The SMMU has a single ASID space, the union of shared and private ASID
+sets. This means that the SMMU driver competes with the arch allocator
+for ASIDs. Shared ASIDs are those of Linux processes, allocated by the
+arch, and contribute in broadcast TLB maintenance. Private ASIDs are
+allocated by the SMMU driver and used for "classic" map/unmap DMA. They
+require command-queue TLB invalidations.
+
+When we pin down an mm_context and get an ASID that is already in use by
+the SMMU, it belongs to a private context. We used to simply abort the
+bind, but this is unfair to users that would be unable to bind a few
+seemingly random processes. Try to allocate a new private ASID for the
+context, and make the old ASID shared.
+
+	Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Reviewed-by: Jonathan Cameron <Jonathan.Cameron@huawei.com>
+Link: https://lore.kernel.org/r/20200918101852.582559-10-jean-philippe@linaro.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 3e63033675c9b1e79b14655481a8c4ecaf23821f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+#	drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index 50b45eab7d93..afd3fa4082b2 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -1534,6 +1534,17 @@ static int arm_smmu_cmdq_batch_submit(struct arm_smmu_device *smmu,
+ }
+ 
+ /* Context descriptor manipulation functions */
++void arm_smmu_tlb_inv_asid(struct arm_smmu_device *smmu, u16 asid)
++{
++	struct arm_smmu_cmdq_ent cmd = {
++		.opcode = CMDQ_OP_TLBI_NH_ASID,
++		.tlbi.asid = asid,
++	};
++
++	arm_smmu_cmdq_issue_cmd(smmu, &cmd);
++	arm_smmu_cmdq_issue_sync(smmu);
++}
++
+ static void arm_smmu_sync_cd(struct arm_smmu_domain *smmu_domain,
+ 			     int ssid, bool leaf)
+ {
+@@ -1614,8 +1625,8 @@ static __le64 *arm_smmu_get_cd_ptr(struct arm_smmu_domain *smmu_domain,
+ 	return l1_desc->l2ptr + idx * CTXDESC_CD_DWORDS;
+ }
+ 
+-static int arm_smmu_write_ctx_desc(struct arm_smmu_domain *smmu_domain,
+-				   int ssid, struct arm_smmu_ctx_desc *cd)
++int arm_smmu_write_ctx_desc(struct arm_smmu_domain *smmu_domain, int ssid,
++			    struct arm_smmu_ctx_desc *cd)
+ {
+ 	/*
+ 	 * This function handles the following cases:
+@@ -2262,15 +2273,6 @@ static void arm_smmu_tlb_inv_context(void *cookie)
+ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
+ 	struct arm_smmu_cmdq_ent cmd;
+ 
+-	if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
+-		cmd.opcode	= CMDQ_OP_TLBI_NH_ASID;
+-		cmd.tlbi.asid	= smmu_domain->s1_cfg.cd.asid;
+-		cmd.tlbi.vmid	= 0;
+-	} else {
+-		cmd.opcode	= CMDQ_OP_TLBI_S12_VMALL;
+-		cmd.tlbi.vmid	= smmu_domain->s2_cfg.vmid;
+-	}
+-
+ 	/*
+ 	 * NOTE: when io-pgtable is in non-strict mode, we may get here with
+ 	 * PTEs previously cleared by unmaps on the current CPU not yet visible
+@@ -2278,8 +2280,14 @@ static void arm_smmu_tlb_inv_context(void *cookie)
+ 	 * insertion to guarantee those are observed before the TLBI. Do be
+ 	 * careful, 007.
+ 	 */
+-	arm_smmu_cmdq_issue_cmd(smmu, &cmd);
+-	arm_smmu_cmdq_issue_sync(smmu);
++	if (smmu_domain->stage == ARM_SMMU_DOMAIN_S1) {
++		arm_smmu_tlb_inv_asid(smmu, smmu_domain->s1_cfg.cd.asid);
++	} else {
++		cmd.opcode	= CMDQ_OP_TLBI_S12_VMALL;
++		cmd.tlbi.vmid	= smmu_domain->s2_cfg.vmid;
++		arm_smmu_cmdq_issue_cmd(smmu, &cmd);
++		arm_smmu_cmdq_issue_sync(smmu);
++	}
+ 	arm_smmu_atc_inv_domain(smmu_domain, 0, 0, 0);
+ }
+ 
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+* Unmerged path drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.h
