@@ -1713,6 +1713,7 @@ static void cm_format_req_event(struct cm_work *work,
 	param->retry_count = cm_req_get_retry_count(req_msg);
 	param->rnr_retry_count = cm_req_get_rnr_retry_count(req_msg);
 	param->srq = cm_req_get_srq(req_msg);
+	param->ppath_sgid_attr = cm_id_priv->av.ah_attr.grh.sgid_attr;
 	work->cm_event.private_data = &req_msg->private_data;
 }
 
@@ -3530,6 +3531,7 @@ out:
 EXPORT_SYMBOL(ib_send_cm_sidr_req);
 
 static void cm_format_sidr_req_event(struct cm_work *work,
+				     const struct cm_id_private *rx_cm_id,
 				     struct ib_cm_id *listen_id)
 {
 	struct cm_sidr_req_msg *sidr_req_msg;
@@ -3543,6 +3545,7 @@ static void cm_format_sidr_req_event(struct cm_work *work,
 	param->service_id = sidr_req_msg->service_id;
 	param->bth_pkey = cm_get_bth_pkey(work);
 	param->port = work->port->port_num;
+	param->sgid_attr = rx_cm_id->av.ah_attr.grh.sgid_attr;
 	work->cm_event.private_data = &sidr_req_msg->private_data;
 }
 
@@ -3600,7 +3603,7 @@ static int cm_sidr_req_handler(struct cm_work *work)
 	cm_id_priv->id.service_id = sidr_req_msg->service_id;
 	cm_id_priv->id.service_mask = ~cpu_to_be64(0);
 
-	cm_format_sidr_req_event(work, &cur_cm_id_priv->id);
+	cm_format_sidr_req_event(work, cm_id_priv, &cur_cm_id_priv->id);
 	cm_process_work(cm_id_priv, work);
 	cm_deref_id(cur_cm_id_priv);
 	return 0;
