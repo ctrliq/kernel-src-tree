@@ -1,0 +1,119 @@
+x86/kvm/svm: Add hardirq tracing on guest enter/exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 9fc975e9efd03e57c9599e0fc07c8b264ad8d5b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/9fc975e9.failed
+
+Entering guest mode is more or less the same as returning to user
+space. From an instrumentation point of view both leave kernel mode and the
+transition to guest or user mode reenables interrupts on the host. In user
+mode an interrupt is served directly and in guest mode it causes a VM exit
+which then handles or reinjects the interrupt.
+
+The transition from guest mode or user mode to kernel mode disables
+interrupts, which needs to be recorded in instrumentation to set the
+correct state again.
+
+This is important for e.g. latency analysis because otherwise the execution
+time in guest or user mode would be wrongly accounted as interrupt disabled
+and could trigger false positives.
+
+Add hardirq tracing to guest enter/exit functions in the same way as it
+is done in the user mode enter/exit code, respecting the RCU requirements.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+Message-Id: <20200708195321.934715094@linutronix.de>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9fc975e9efd03e57c9599e0fc07c8b264ad8d5b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/svm.c
+index c96b24a58317,23bac92f5b27..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3759,26 -3396,51 +3759,72 @@@ static fastpath_t svm_vcpu_run(struct k
+  	 * is no need to worry about the conditional branch over the wrmsr
+  	 * being speculatively taken.
+  	 */
+ -	x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
+ +	if (!static_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+ +		x86_spec_ctrl_set_guest(svm->spec_ctrl, svm->virt_spec_ctrl);
+  
+++<<<<<<< HEAD
+ +	if (sev_es_guest(vcpu->kvm)) {
+ +		__svm_sev_es_vcpu_run(vmcb_pa);
+ +	} else {
+ +		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
+++=======
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
+++>>>>>>> 9fc975e9efd0 (x86/kvm/svm: Add hardirq tracing on guest enter/exit)
+  
+ -	__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&svm->vcpu.arch.regs);
+ +		/*
+ +		 * Use a single vmcb (vmcb01 because it's always valid) for
+ +		 * context switching guest state via VMLOAD/VMSAVE, that way
+ +		 * the state doesn't need to be copied between vmcb01 and
+ +		 * vmcb02 when switching vmcbs for nested virtualization.
+ +		 */
+ +		vmload(svm->vmcb01.pa);
+ +		__svm_vcpu_run(vmcb_pa, (unsigned long *)&vcpu->arch.regs);
+ +		vmsave(svm->vmcb01.pa);
+  
+++<<<<<<< HEAD
+ +		vmload(__sme_page_pa(sd->save_area));
+ +	}
+++=======
++ #ifdef CONFIG_X86_64
++ 	wrmsrl(MSR_GS_BASE, svm->host.gs_base);
++ #else
++ 	loadsegment(fs, svm->host.fs);
++ #ifndef CONFIG_X86_32_LAZY_GS
++ 	loadsegment(gs, svm->host.gs);
++ #endif
++ #endif
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 	trace_hardirqs_off_finish();
+++>>>>>>> 9fc975e9efd0 (x86/kvm/svm: Add hardirq tracing on guest enter/exit)
+  
+  	/*
+  	 * We do not use IBRS in the kernel. If this vCPU has used the
+* Unmerged path arch/x86/kvm/svm/svm.c
