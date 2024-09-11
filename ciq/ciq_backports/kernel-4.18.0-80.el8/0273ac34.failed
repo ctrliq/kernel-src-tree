@@ -1,0 +1,91 @@
+blkcg: handle dying request_queue when associating a blkg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Dennis Zhou <dennis@kernel.org>
+commit 0273ac349f08f4ff9ef88aaaf9c9f2aa6e87d2be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0273ac34.failed
+
+Between v3 [1] and v4 [2] of the blkg association series, the
+association point moved from generic_make_request_checks(), which is
+called after the request enters the queue, to bio_set_dev(), which is when
+the bio is formed before submit_bio(). When the request_queue goes away,
+the blkgs supporting the request_queue are destroyed and then the
+q->root_blkg is set to %NULL.
+
+This patch adds a %NULL check to blkg_tryget_closest() to prevent the
+NPE caused by the above. It also adds a guard to see if the
+request_queue is dying when creating a blkg to prevent creating a blkg
+for a dead request_queue.
+
+[1] https://lore.kernel.org/lkml/20180911184137.35897-1-dennisszhou@gmail.com/
+[2] https://lore.kernel.org/lkml/20181126211946.77067-1-dennis@kernel.org/
+
+Fixes: 5cdf2e3fea5e ("blkcg: associate blkg when associating a device")
+Reported-and-tested-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Dennis Zhou <dennis@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 0273ac349f08f4ff9ef88aaaf9c9f2aa6e87d2be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk-cgroup.h
+diff --cc include/linux/blk-cgroup.h
+index 8bf2308b920c,f025fd1e22e6..000000000000
+--- a/include/linux/blk-cgroup.h
++++ b/include/linux/blk-cgroup.h
+@@@ -502,15 -497,25 +502,29 @@@ static inline void blkg_get(struct blkc
+   * This is for use when doing an RCU lookup of the blkg.  We may be in the midst
+   * of freeing this blkg, so we can only use it if the refcnt is not zero.
+   */
+ -static inline bool blkg_tryget(struct blkcg_gq *blkg)
+ +static inline struct blkcg_gq *blkg_try_get(struct blkcg_gq *blkg)
+  {
+ -	return percpu_ref_tryget(&blkg->refcnt);
+ +	if (atomic_inc_not_zero(&blkg->refcnt))
+ +		return blkg;
+ +	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * blkg_tryget_closest - try and get a blkg ref on the closet blkg
++  * @blkg: blkg to get
++  *
++  * This walks up the blkg tree to find the closest non-dying blkg and returns
++  * the blkg that it did association with as it may not be the passed in blkg.
++  */
++ static inline struct blkcg_gq *blkg_tryget_closest(struct blkcg_gq *blkg)
++ {
++ 	while (blkg && !percpu_ref_tryget(&blkg->refcnt))
++ 		blkg = blkg->parent;
+++>>>>>>> 0273ac349f08 (blkcg: handle dying request_queue when associating a blkg)
+  
+ -	return blkg;
+ -}
+ +void __blkg_release_rcu(struct rcu_head *rcu);
+  
+  /**
+   * blkg_put - put a blkg reference
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 301ed0447460..ceb0aaf71dac 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -182,6 +182,12 @@ static struct blkcg_gq *blkg_create(struct blkcg *blkcg,
+ 	WARN_ON_ONCE(!rcu_read_lock_held());
+ 	lockdep_assert_held(q->queue_lock);
+ 
++	/* request_queue is dying, do not create/recreate a blkg */
++	if (blk_queue_dying(q)) {
++		ret = -ENODEV;
++		goto err_free_blkg;
++	}
++
+ 	/* blkg holds a reference to blkcg */
+ 	if (!css_tryget_online(&blkcg->css)) {
+ 		ret = -ENODEV;
+* Unmerged path include/linux/blk-cgroup.h
