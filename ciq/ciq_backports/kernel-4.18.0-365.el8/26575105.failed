@@ -1,0 +1,145 @@
+igc: Add initial XDP support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andre Guedes <andre.guedes@intel.com>
+commit 26575105d6ed8e2a8e43bd008fc7d98b75b90d5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/26575105.failed
+
+Add the initial XDP support to the igc driver. For now, only XDP_PASS,
+XDP_DROP, XDP_ABORTED actions are supported. Upcoming patches will add
+support for the remaining XDP actions.
+
+XDP configuration helpers are defined in a new file, igc_xdp.c. These
+helpers are utilized in igc_main.c to implement the ndo_bpf callback.
+XDP-related code that belongs to the driver's hot path is landed in
+igc_main.c.
+
+By default, the driver uses Rx buffers with 2 KB size. When XDP is
+enabled, it uses larger buffers so we have enough space to accommodate
+the headroom and tailroom required by XDP infrastructure. Also, the
+driver doesn't support XDP functionality with frames that span over
+multiple buffers so jumbo frames are not allowed for now.
+
+The approach implemented follows the approach implemented in other Intel
+drivers as much as possible for the sake of consistency across the
+drivers.
+
+Quick comment regarding igc_build_skb(): this patch doesn't touch it
+because the function is never called. It seems its support is
+incomplete/in progress. The function was added by commit 0507ef8a0372b
+("igc: Add transmit and receive fastpath and interrupt handlers") but
+ring_uses_build_skb() always return False since the IGC_RING_FLAG_RX_
+BUILD_SKB_ENABLED isn't set anywhere in the driver code.
+
+This patch has been tested with the sample app "xdp1" located in
+samples/bpf/ dir.
+
+	Signed-off-by: Andre Guedes <andre.guedes@intel.com>
+	Signed-off-by: Vedang Patel <vedang.patel@intel.com>
+	Signed-off-by: Jithu Joseph <jithu.joseph@intel.com>
+	Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: Dvora Fuxbrumer <dvorax.fuxbrumer@linux.intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 26575105d6ed8e2a8e43bd008fc7d98b75b90d5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 261f28037c1a,7da31da523c8..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -16,7 -17,7 +17,11 @@@
+  #include "igc.h"
+  #include "igc_hw.h"
+  #include "igc_tsn.h"
+++<<<<<<< HEAD
+ +#include <generated/utsrelease.h>
+++=======
++ #include "igc_xdp.h"
+++>>>>>>> 26575105d6ed (igc: Add initial XDP support)
+  
+  #define DRV_SUMMARY	"Intel(R) 2.5G Ethernet Linux Driver"
+  
+diff --git a/drivers/net/ethernet/intel/igc/Makefile b/drivers/net/ethernet/intel/igc/Makefile
+index 1c3051db9085..95d1e8c490a4 100644
+--- a/drivers/net/ethernet/intel/igc/Makefile
++++ b/drivers/net/ethernet/intel/igc/Makefile
+@@ -8,4 +8,4 @@
+ obj-$(CONFIG_IGC) += igc.o
+ 
+ igc-objs := igc_main.o igc_mac.o igc_i225.o igc_base.o igc_nvm.o igc_phy.o \
+-igc_diag.o igc_ethtool.o igc_ptp.o igc_dump.o igc_tsn.o
++igc_diag.o igc_ethtool.o igc_ptp.o igc_dump.o igc_tsn.o igc_xdp.o
+diff --git a/drivers/net/ethernet/intel/igc/igc.h b/drivers/net/ethernet/intel/igc/igc.h
+index b00cd8696b6d..3a1737227222 100644
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@ -219,6 +219,8 @@ struct igc_adapter {
+ 	ktime_t ptp_reset_start; /* Reset time in clock mono */
+ 
+ 	char fw_version[32];
++
++	struct bpf_prog *xdp_prog;
+ };
+ 
+ void igc_up(struct igc_adapter *adapter);
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
+diff --git a/drivers/net/ethernet/intel/igc/igc_xdp.c b/drivers/net/ethernet/intel/igc/igc_xdp.c
+new file mode 100644
+index 000000000000..27c886a254f1
+--- /dev/null
++++ b/drivers/net/ethernet/intel/igc/igc_xdp.c
+@@ -0,0 +1,33 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020, Intel Corporation. */
++
++#include "igc.h"
++#include "igc_xdp.h"
++
++int igc_xdp_set_prog(struct igc_adapter *adapter, struct bpf_prog *prog,
++		     struct netlink_ext_ack *extack)
++{
++	struct net_device *dev = adapter->netdev;
++	bool if_running = netif_running(dev);
++	struct bpf_prog *old_prog;
++
++	if (dev->mtu > ETH_DATA_LEN) {
++		/* For now, the driver doesn't support XDP functionality with
++		 * jumbo frames so we return error.
++		 */
++		NL_SET_ERR_MSG_MOD(extack, "Jumbo frames not supported");
++		return -EOPNOTSUPP;
++	}
++
++	if (if_running)
++		igc_close(dev);
++
++	old_prog = xchg(&adapter->xdp_prog, prog);
++	if (old_prog)
++		bpf_prog_put(old_prog);
++
++	if (if_running)
++		igc_open(dev);
++
++	return 0;
++}
+diff --git a/drivers/net/ethernet/intel/igc/igc_xdp.h b/drivers/net/ethernet/intel/igc/igc_xdp.h
+new file mode 100644
+index 000000000000..8a410bcefe1a
+--- /dev/null
++++ b/drivers/net/ethernet/intel/igc/igc_xdp.h
+@@ -0,0 +1,10 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/* Copyright (c) 2020, Intel Corporation. */
++
++#ifndef _IGC_XDP_H_
++#define _IGC_XDP_H_
++
++int igc_xdp_set_prog(struct igc_adapter *adapter, struct bpf_prog *prog,
++		     struct netlink_ext_ack *extack);
++
++#endif /* _IGC_XDP_H_ */
