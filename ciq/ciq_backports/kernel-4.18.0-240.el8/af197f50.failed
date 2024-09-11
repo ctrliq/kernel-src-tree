@@ -1,0 +1,226 @@
+io_uring: enable poll retry for any file with ->read_iter / ->write_iter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit af197f50ac53fff1241598c73ca606754a3bb808
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/af197f50.failed
+
+We can have files like eventfd where it's perfectly fine to do poll
+based retry on them, right now io_file_supports_async() doesn't take
+that into account.
+
+Pass in data direction and check the f_op instead of just always needing
+an async worker.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit af197f50ac53fff1241598c73ca606754a3bb808)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,516a59db73ca..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1032,15 -2047,20 +1032,21 @@@ static bool io_file_supports_async(stru
+  	if (S_ISREG(mode) && file->f_op != &io_uring_fops)
+  		return true;
+  
+- 	return false;
++ 	if (!(file->f_mode & FMODE_NOWAIT))
++ 		return false;
++ 
++ 	if (rw == READ)
++ 		return file->f_op->read_iter != NULL;
++ 
++ 	return file->f_op->write_iter != NULL;
+  }
+  
+ -static int io_prep_rw(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ +static int io_prep_rw(struct io_kiocb *req, const struct sqe_submit *s,
+  		      bool force_nonblock)
+  {
+ +	const struct io_uring_sqe *sqe = s->sqe;
+  	struct io_ring_ctx *ctx = req->ctx;
+ -	struct kiocb *kiocb = &req->rw.kiocb;
+ +	struct kiocb *kiocb = &req->rw;
+  	unsigned ioprio;
+  	int ret;
+  
+@@@ -1363,12 -2568,24 +1369,30 @@@ static int io_read(struct io_kiocb *req
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	read_size = ret;
+ +	if (req->flags & REQ_F_LINK)
+ +		req->result = read_size;
+++=======
++ 	/* Ensure we clear previously set non-block flag */
++ 	if (!force_nonblock)
++ 		kiocb->ki_flags &= ~IOCB_NOWAIT;
++ 
++ 	req->result = 0;
++ 	io_size = ret;
++ 	if (req->flags & REQ_F_LINK_HEAD)
++ 		req->result = io_size;
++ 
++ 	/*
++ 	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++ 	 * we know to async punt it even if it was opened O_NONBLOCK
++ 	 */
++ 	if (force_nonblock && !io_file_supports_async(req->file, READ))
++ 		goto copy_iov;
+++>>>>>>> af197f50ac53 (io_uring: enable poll retry for any file with ->read_iter / ->write_iter)
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(READ, req->file, &kiocb->ki_pos, iov_count);
+ +	ret = rw_verify_area(READ, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+@@@ -1426,20 -2643,45 +1450,59 @@@ static int io_write(struct io_kiocb *re
+  	if (ret < 0)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (req->flags & REQ_F_LINK)
+ +		req->result = ret;
+++=======
++ 	io_req_map_rw(req, ret, io->rw.iov, io->rw.fast_iov, &iter);
++ 	return 0;
++ }
++ 
++ static int io_write(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct iovec inline_vecs[UIO_FASTIOV], *iovec = inline_vecs;
++ 	struct kiocb *kiocb = &req->rw.kiocb;
++ 	struct iov_iter iter;
++ 	size_t iov_count;
++ 	ssize_t ret, io_size;
++ 
++ 	ret = io_import_iovec(WRITE, req, &iovec, &iter, !force_nonblock);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/* Ensure we clear previously set non-block flag */
++ 	if (!force_nonblock)
++ 		req->rw.kiocb.ki_flags &= ~IOCB_NOWAIT;
++ 
++ 	req->result = 0;
++ 	io_size = ret;
++ 	if (req->flags & REQ_F_LINK_HEAD)
++ 		req->result = io_size;
++ 
++ 	/*
++ 	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++ 	 * we know to async punt it even if it was opened O_NONBLOCK
++ 	 */
++ 	if (force_nonblock && !io_file_supports_async(req->file, WRITE))
++ 		goto copy_iov;
++ 
++ 	/* file path doesn't support NOWAIT for non-direct_IO */
++ 	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT) &&
++ 	    (req->flags & REQ_F_ISREG))
++ 		goto copy_iov;
+++>>>>>>> af197f50ac53 (io_uring: enable poll retry for any file with ->read_iter / ->write_iter)
+  
+  	iov_count = iov_iter_count(&iter);
+ -	ret = rw_verify_area(WRITE, req->file, &kiocb->ki_pos, iov_count);
+ +
+ +	ret = -EAGAIN;
+ +	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT)) {
+ +		/* If ->needs_lock is true, we're already in async context. */
+ +		if (!s->needs_lock)
+ +			io_async_list_note(WRITE, req, iov_count);
+ +		goto out_free;
+ +	}
+ +
+ +	ret = rw_verify_area(WRITE, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+  
+@@@ -1479,6 -2736,76 +1542,79 @@@ out_free
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int io_splice_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	struct io_splice* sp = &req->splice;
++ 	unsigned int valid_flags = SPLICE_F_FD_IN_FIXED | SPLICE_F_ALL;
++ 	int ret;
++ 
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		return 0;
++ 
++ 	sp->file_in = NULL;
++ 	sp->off_in = READ_ONCE(sqe->splice_off_in);
++ 	sp->off_out = READ_ONCE(sqe->off);
++ 	sp->len = READ_ONCE(sqe->len);
++ 	sp->flags = READ_ONCE(sqe->splice_flags);
++ 
++ 	if (unlikely(sp->flags & ~valid_flags))
++ 		return -EINVAL;
++ 
++ 	ret = io_file_get(NULL, req, READ_ONCE(sqe->splice_fd_in), &sp->file_in,
++ 			  (sp->flags & SPLICE_F_FD_IN_FIXED));
++ 	if (ret)
++ 		return ret;
++ 	req->flags |= REQ_F_NEED_CLEANUP;
++ 
++ 	if (!S_ISREG(file_inode(sp->file_in)->i_mode))
++ 		req->work.flags |= IO_WQ_WORK_UNBOUND;
++ 
++ 	return 0;
++ }
++ 
++ static bool io_splice_punt(struct file *file, int rw)
++ {
++ 	if (get_pipe_info(file))
++ 		return false;
++ 	if (!io_file_supports_async(file, rw))
++ 		return true;
++ 	return !(file->f_flags & O_NONBLOCK);
++ }
++ 
++ static int io_splice(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_splice *sp = &req->splice;
++ 	struct file *in = sp->file_in;
++ 	struct file *out = sp->file_out;
++ 	unsigned int flags = sp->flags & ~SPLICE_F_FD_IN_FIXED;
++ 	loff_t *poff_in, *poff_out;
++ 	long ret;
++ 
++ 	if (force_nonblock) {
++ 		if (io_splice_punt(in, READ) || io_splice_punt(out, WRITE))
++ 			return -EAGAIN;
++ 		flags |= SPLICE_F_NONBLOCK;
++ 	}
++ 
++ 	poff_in = (sp->off_in == -1) ? NULL : &sp->off_in;
++ 	poff_out = (sp->off_out == -1) ? NULL : &sp->off_out;
++ 	ret = do_splice(in, poff_in, out, poff_out, sp->len, flags);
++ 	if (force_nonblock && ret == -EAGAIN)
++ 		return -EAGAIN;
++ 
++ 	io_put_file(req, in, (sp->flags & SPLICE_F_FD_IN_FIXED));
++ 	req->flags &= ~REQ_F_NEED_CLEANUP;
++ 
++ 	io_cqring_add_event(req, ret);
++ 	if (ret != sp->len)
++ 		req_set_fail_links(req);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
+++>>>>>>> af197f50ac53 (io_uring: enable poll retry for any file with ->read_iter / ->write_iter)
+  /*
+   * IORING_OP_NOP just posts a completion event, nothing else.
+   */
+* Unmerged path fs/io_uring.c
