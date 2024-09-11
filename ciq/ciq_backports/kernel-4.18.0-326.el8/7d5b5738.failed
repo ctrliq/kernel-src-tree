@@ -1,0 +1,356 @@
+dma-mapping: add a dma_alloc_noncontiguous API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 7d5b5738d1514e9dd8ed452660e2a4d25beb9483
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/7d5b5738.failed
+
+Add a new API that returns a potentiall virtually non-contigous sg_table
+and a DMA address.  This API is only properly implemented for dma-iommu
+and will simply return a contigious chunk as a fallback.
+
+The intent is that drivers can use this API if either:
+
+ - no kernel mapping or only temporary kernel mappings are required.
+   That is as a better replacement for DMA_ATTR_NO_KERNEL_MAPPING
+ - a kernel mapping is required for cached and DMA mapped pages, but
+   the driver also needs the pages to e.g. map them to userspace.
+   In that sense it is a replacement for some aspects of the recently
+   removed and never fully implemented DMA_ATTR_NON_CONSISTENT
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Tomasz Figa <tfiga@chromium.org>
+	Tested-by: Ricardo Ribalda <ribalda@chromium.org>
+(cherry picked from commit 7d5b5738d1514e9dd8ed452660e2a4d25beb9483)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/dma-map-ops.h
+#	kernel/dma/mapping.c
+diff --cc kernel/dma/mapping.c
+index 0597cdaee492,2b06a809d0b9..000000000000
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@@ -528,6 -477,174 +528,177 @@@ void dma_free_attrs(struct device *dev
+  }
+  EXPORT_SYMBOL(dma_free_attrs);
+  
+++<<<<<<< HEAD
+++=======
++ static struct page *__dma_alloc_pages(struct device *dev, size_t size,
++ 		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 
++ 	if (WARN_ON_ONCE(!dev->coherent_dma_mask))
++ 		return NULL;
++ 	if (WARN_ON_ONCE(gfp & (__GFP_DMA | __GFP_DMA32 | __GFP_HIGHMEM)))
++ 		return NULL;
++ 
++ 	size = PAGE_ALIGN(size);
++ 	if (dma_alloc_direct(dev, ops))
++ 		return dma_direct_alloc_pages(dev, size, dma_handle, dir, gfp);
++ 	if (!ops->alloc_pages)
++ 		return NULL;
++ 	return ops->alloc_pages(dev, size, dma_handle, dir, gfp);
++ }
++ 
++ struct page *dma_alloc_pages(struct device *dev, size_t size,
++ 		dma_addr_t *dma_handle, enum dma_data_direction dir, gfp_t gfp)
++ {
++ 	struct page *page = __dma_alloc_pages(dev, size, dma_handle, dir, gfp);
++ 
++ 	if (page)
++ 		debug_dma_map_page(dev, page, 0, size, dir, *dma_handle);
++ 	return page;
++ }
++ EXPORT_SYMBOL_GPL(dma_alloc_pages);
++ 
++ static void __dma_free_pages(struct device *dev, size_t size, struct page *page,
++ 		dma_addr_t dma_handle, enum dma_data_direction dir)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 
++ 	size = PAGE_ALIGN(size);
++ 	if (dma_alloc_direct(dev, ops))
++ 		dma_direct_free_pages(dev, size, page, dma_handle, dir);
++ 	else if (ops->free_pages)
++ 		ops->free_pages(dev, size, page, dma_handle, dir);
++ }
++ 
++ void dma_free_pages(struct device *dev, size_t size, struct page *page,
++ 		dma_addr_t dma_handle, enum dma_data_direction dir)
++ {
++ 	debug_dma_unmap_page(dev, dma_handle, size, dir);
++ 	__dma_free_pages(dev, size, page, dma_handle, dir);
++ }
++ EXPORT_SYMBOL_GPL(dma_free_pages);
++ 
++ int dma_mmap_pages(struct device *dev, struct vm_area_struct *vma,
++ 		size_t size, struct page *page)
++ {
++ 	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++ 
++ 	if (vma->vm_pgoff >= count || vma_pages(vma) > count - vma->vm_pgoff)
++ 		return -ENXIO;
++ 	return remap_pfn_range(vma, vma->vm_start,
++ 			       page_to_pfn(page) + vma->vm_pgoff,
++ 			       vma_pages(vma) << PAGE_SHIFT, vma->vm_page_prot);
++ }
++ EXPORT_SYMBOL_GPL(dma_mmap_pages);
++ 
++ static struct sg_table *alloc_single_sgt(struct device *dev, size_t size,
++ 		enum dma_data_direction dir, gfp_t gfp)
++ {
++ 	struct sg_table *sgt;
++ 	struct page *page;
++ 
++ 	sgt = kmalloc(sizeof(*sgt), gfp);
++ 	if (!sgt)
++ 		return NULL;
++ 	if (sg_alloc_table(sgt, 1, gfp))
++ 		goto out_free_sgt;
++ 	page = __dma_alloc_pages(dev, size, &sgt->sgl->dma_address, dir, gfp);
++ 	if (!page)
++ 		goto out_free_table;
++ 	sg_set_page(sgt->sgl, page, PAGE_ALIGN(size), 0);
++ 	sg_dma_len(sgt->sgl) = sgt->sgl->length;
++ 	return sgt;
++ out_free_table:
++ 	sg_free_table(sgt);
++ out_free_sgt:
++ 	kfree(sgt);
++ 	return NULL;
++ }
++ 
++ struct sg_table *dma_alloc_noncontiguous(struct device *dev, size_t size,
++ 		enum dma_data_direction dir, gfp_t gfp, unsigned long attrs)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 	struct sg_table *sgt;
++ 
++ 	if (WARN_ON_ONCE(attrs & ~DMA_ATTR_ALLOC_SINGLE_PAGES))
++ 		return NULL;
++ 
++ 	if (ops && ops->alloc_noncontiguous)
++ 		sgt = ops->alloc_noncontiguous(dev, size, dir, gfp, attrs);
++ 	else
++ 		sgt = alloc_single_sgt(dev, size, dir, gfp);
++ 
++ 	if (sgt) {
++ 		sgt->nents = 1;
++ 		debug_dma_map_sg(dev, sgt->sgl, sgt->orig_nents, 1, dir);
++ 	}
++ 	return sgt;
++ }
++ EXPORT_SYMBOL_GPL(dma_alloc_noncontiguous);
++ 
++ static void free_single_sgt(struct device *dev, size_t size,
++ 		struct sg_table *sgt, enum dma_data_direction dir)
++ {
++ 	__dma_free_pages(dev, size, sg_page(sgt->sgl), sgt->sgl->dma_address,
++ 			 dir);
++ 	sg_free_table(sgt);
++ 	kfree(sgt);
++ }
++ 
++ void dma_free_noncontiguous(struct device *dev, size_t size,
++ 		struct sg_table *sgt, enum dma_data_direction dir)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 
++ 	debug_dma_unmap_sg(dev, sgt->sgl, sgt->orig_nents, dir);
++ 	if (ops && ops->free_noncontiguous)
++ 		ops->free_noncontiguous(dev, size, sgt, dir);
++ 	else
++ 		free_single_sgt(dev, size, sgt, dir);
++ }
++ EXPORT_SYMBOL_GPL(dma_free_noncontiguous);
++ 
++ void *dma_vmap_noncontiguous(struct device *dev, size_t size,
++ 		struct sg_table *sgt)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 	unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++ 
++ 	if (ops && ops->alloc_noncontiguous)
++ 		return vmap(sgt_handle(sgt)->pages, count, VM_MAP, PAGE_KERNEL);
++ 	return page_address(sg_page(sgt->sgl));
++ }
++ EXPORT_SYMBOL_GPL(dma_vmap_noncontiguous);
++ 
++ void dma_vunmap_noncontiguous(struct device *dev, void *vaddr)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 
++ 	if (ops && ops->alloc_noncontiguous)
++ 		vunmap(vaddr);
++ }
++ EXPORT_SYMBOL_GPL(dma_vunmap_noncontiguous);
++ 
++ int dma_mmap_noncontiguous(struct device *dev, struct vm_area_struct *vma,
++ 		size_t size, struct sg_table *sgt)
++ {
++ 	const struct dma_map_ops *ops = get_dma_ops(dev);
++ 
++ 	if (ops && ops->alloc_noncontiguous) {
++ 		unsigned long count = PAGE_ALIGN(size) >> PAGE_SHIFT;
++ 
++ 		if (vma->vm_pgoff >= count ||
++ 		    vma_pages(vma) > count - vma->vm_pgoff)
++ 			return -ENXIO;
++ 		return vm_map_pages(vma, sgt_handle(sgt)->pages, count);
++ 	}
++ 	return dma_mmap_pages(dev, vma, size, sg_page(sgt->sgl));
++ }
++ EXPORT_SYMBOL_GPL(dma_mmap_noncontiguous);
++ 
+++>>>>>>> 7d5b5738d151 (dma-mapping: add a dma_alloc_noncontiguous API)
+  int dma_supported(struct device *dev, u64 mask)
+  {
+  	const struct dma_map_ops *ops = get_dma_ops(dev);
+* Unmerged path include/linux/dma-map-ops.h
+diff --git a/Documentation/core-api/dma-api.rst b/Documentation/core-api/dma-api.rst
+index f7c065be590b..456045dacda7 100644
+--- a/Documentation/core-api/dma-api.rst
++++ b/Documentation/core-api/dma-api.rst
+@@ -604,6 +604,84 @@ dev, size and dma_handle and dir must all be the same as those passed into
+ dma_alloc_noncoherent().  page must be the pointer returned by
+ dma_alloc_pages().
+ 
++::
++
++	struct sg_table *
++	dma_alloc_noncontiguous(struct device *dev, size_t size,
++				enum dma_data_direction dir, gfp_t gfp,
++				unsigned long attrs);
++
++This routine allocates  <size> bytes of non-coherent and possibly non-contiguous
++memory.  It returns a pointer to struct sg_table that describes the allocated
++and DMA mapped memory, or NULL if the allocation failed. The resulting memory
++can be used for struct page mapped into a scatterlist are suitable for.
++
++The return sg_table is guaranteed to have 1 single DMA mapped segment as
++indicated by sgt->nents, but it might have multiple CPU side segments as
++indicated by sgt->orig_nents.
++
++The dir parameter specified if data is read and/or written by the device,
++see dma_map_single() for details.
++
++The gfp parameter allows the caller to specify the ``GFP_`` flags (see
++kmalloc()) for the allocation, but rejects flags used to specify a memory
++zone such as GFP_DMA or GFP_HIGHMEM.
++
++The attrs argument must be either 0 or DMA_ATTR_ALLOC_SINGLE_PAGES.
++
++Before giving the memory to the device, dma_sync_sgtable_for_device() needs
++to be called, and before reading memory written by the device,
++dma_sync_sgtable_for_cpu(), just like for streaming DMA mappings that are
++reused.
++
++::
++
++	void
++	dma_free_noncontiguous(struct device *dev, size_t size,
++			       struct sg_table *sgt,
++			       enum dma_data_direction dir)
++
++Free memory previously allocated using dma_alloc_noncontiguous().  dev, size,
++and dir must all be the same as those passed into dma_alloc_noncontiguous().
++sgt must be the pointer returned by dma_alloc_noncontiguous().
++
++::
++
++	void *
++	dma_vmap_noncontiguous(struct device *dev, size_t size,
++		struct sg_table *sgt)
++
++Return a contiguous kernel mapping for an allocation returned from
++dma_alloc_noncontiguous().  dev and size must be the same as those passed into
++dma_alloc_noncontiguous().  sgt must be the pointer returned by
++dma_alloc_noncontiguous().
++
++Once a non-contiguous allocation is mapped using this function, the
++flush_kernel_vmap_range() and invalidate_kernel_vmap_range() APIs must be used
++to manage the coherency between the kernel mapping, the device and user space
++mappings (if any).
++
++::
++
++	void
++	dma_vunmap_noncontiguous(struct device *dev, void *vaddr)
++
++Unmap a kernel mapping returned by dma_vmap_noncontiguous().  dev must be the
++same the one passed into dma_alloc_noncontiguous().  vaddr must be the pointer
++returned by dma_vmap_noncontiguous().
++
++
++::
++
++	int
++	dma_mmap_noncontiguous(struct device *dev, struct vm_area_struct *vma,
++			       size_t size, struct sg_table *sgt)
++
++Map an allocation returned from dma_alloc_noncontiguous() into a user address
++space.  dev and size must be the same as those passed into
++dma_alloc_noncontiguous().  sgt must be the pointer returned by
++dma_alloc_noncontiguous().
++
+ ::
+ 
+ 	int
+* Unmerged path include/linux/dma-map-ops.h
+diff --git a/include/linux/dma-mapping.h b/include/linux/dma-mapping.h
+index ba0c1c793dd8..1d150c96d069 100644
+--- a/include/linux/dma-mapping.h
++++ b/include/linux/dma-mapping.h
+@@ -273,6 +273,15 @@ u64 dma_get_required_mask(struct device *dev);
+ size_t dma_max_mapping_size(struct device *dev);
+ bool dma_need_sync(struct device *dev, dma_addr_t dma_addr);
+ unsigned long dma_get_merge_boundary(struct device *dev);
++struct sg_table *dma_alloc_noncontiguous(struct device *dev, size_t size,
++		enum dma_data_direction dir, gfp_t gfp, unsigned long attrs);
++void dma_free_noncontiguous(struct device *dev, size_t size,
++		struct sg_table *sgt, enum dma_data_direction dir);
++void *dma_vmap_noncontiguous(struct device *dev, size_t size,
++		struct sg_table *sgt);
++void dma_vunmap_noncontiguous(struct device *dev, void *vaddr);
++int dma_mmap_noncontiguous(struct device *dev, struct vm_area_struct *vma,
++		size_t size, struct sg_table *sgt);
+ #else /* CONFIG_HAS_DMA */
+ static inline dma_addr_t dma_map_page_attrs(struct device *dev,
+ 		struct page *page, size_t offset, size_t size,
+@@ -390,6 +399,29 @@ static inline unsigned long dma_get_merge_boundary(struct device *dev)
+ {
+ 	return 0;
+ }
++static inline struct sg_table *dma_alloc_noncontiguous(struct device *dev,
++		size_t size, enum dma_data_direction dir, gfp_t gfp,
++		unsigned long attrs)
++{
++	return NULL;
++}
++static inline void dma_free_noncontiguous(struct device *dev, size_t size,
++		struct sg_table *sgt, enum dma_data_direction dir)
++{
++}
++static inline void *dma_vmap_noncontiguous(struct device *dev, size_t size,
++		struct sg_table *sgt)
++{
++	return NULL;
++}
++static inline void dma_vunmap_noncontiguous(struct device *dev, void *vaddr)
++{
++}
++static inline int dma_mmap_noncontiguous(struct device *dev,
++		struct vm_area_struct *vma, size_t size, struct sg_table *sgt)
++{
++	return -EINVAL;
++}
+ #endif /* CONFIG_HAS_DMA */
+ 
+ static inline void *dma_alloc_noncoherent(struct device *dev, size_t size,
+* Unmerged path kernel/dma/mapping.c
