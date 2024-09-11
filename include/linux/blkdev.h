@@ -549,6 +549,7 @@ struct request_queue {
 	struct delayed_work	requeue_work;
 
 	struct mutex		sysfs_lock;
+	struct mutex		sysfs_dir_lock;
 
 	RH_KABI_REPLACE(atomic_t                mq_freeze_depth,
 			int			mq_freeze_depth)
