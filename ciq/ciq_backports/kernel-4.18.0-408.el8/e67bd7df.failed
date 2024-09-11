@@ -1,0 +1,248 @@
+KVM: selftests: nSVM: Add enlightened MSR-Bitmap selftest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit e67bd7df28a0f2193512184e24a2de4bfd77c69e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/e67bd7df.failed
+
+Introduce a new test for Hyper-V nSVM extensions (Hyper-V on KVM) and add
+a test for enlightened MSR-Bitmap feature:
+
+- Intercept access to MSR_FS_BASE in L1 and check that this works
+  with enlightened MSR-Bitmap disabled.
+- Enabled enlightened MSR-Bitmap and check that the intercept still works
+  as expected.
+- Intercept access to MSR_GS_BASE but don't clear the corresponding bit
+  from clean fields mask, KVM is supposed to skip updating MSR-Bitmap02 and
+  thus the consequent access to the MSR from L2 will not get intercepted.
+- Finally, clear the corresponding bit from clean fields mask and check
+  that access to MSR_GS_BASE is now intercepted.
+
+The test works with the assumption, that access to MSR_FS_BASE/MSR_GS_BASE
+is not intercepted for L1. If this ever becomes not true the test will
+fail as nested_svm_exit_handled_msr() always checks L1's MSR-Bitmap for
+L2 irrespective of clean fields. The behavior is correct as enlightened
+MSR-Bitmap feature is just an optimization, KVM is not obliged to ignore
+updates when the corresponding bit in clean fields stays clear.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20220203104620.277031-7-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e67bd7df28a0f2193512184e24a2de4bfd77c69e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/Makefile
+diff --cc tools/testing/selftests/kvm/Makefile
+index 89c308b6d33f,a1ce7dd40e3e..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -46,6 -51,8 +46,11 @@@ TEST_GEN_PROGS_x86_64 += x86_64/get_cpu
+  TEST_GEN_PROGS_x86_64 += x86_64/hyperv_clock
+  TEST_GEN_PROGS_x86_64 += x86_64/hyperv_cpuid
+  TEST_GEN_PROGS_x86_64 += x86_64/hyperv_features
+++<<<<<<< HEAD
+++=======
++ TEST_GEN_PROGS_x86_64 += x86_64/hyperv_svm_test
++ TEST_GEN_PROGS_x86_64 += x86_64/kvm_clock_test
+++>>>>>>> e67bd7df28a0 (KVM: selftests: nSVM: Add enlightened MSR-Bitmap selftest)
+  TEST_GEN_PROGS_x86_64 += x86_64/kvm_pv_test
+  TEST_GEN_PROGS_x86_64 += x86_64/mmio_warning_test
+  TEST_GEN_PROGS_x86_64 += x86_64/mmu_role_test
+* Unmerged path tools/testing/selftests/kvm/Makefile
+diff --git a/tools/testing/selftests/kvm/include/x86_64/svm_util.h b/tools/testing/selftests/kvm/include/x86_64/svm_util.h
+index ba049246ac39..7150bc184502 100644
+--- a/tools/testing/selftests/kvm/include/x86_64/svm_util.h
++++ b/tools/testing/selftests/kvm/include/x86_64/svm_util.h
+@@ -16,6 +16,7 @@
+ #define CPUID_SVM_BIT		2
+ #define CPUID_SVM		BIT_ULL(CPUID_SVM_BIT)
+ 
++#define SVM_EXIT_MSR		0x07c
+ #define SVM_EXIT_VMMCALL	0x081
+ 
+ struct svm_test_data {
+diff --git a/tools/testing/selftests/kvm/x86_64/hyperv_svm_test.c b/tools/testing/selftests/kvm/x86_64/hyperv_svm_test.c
+new file mode 100644
+index 000000000000..21f5ca9197da
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/hyperv_svm_test.c
+@@ -0,0 +1,175 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * KVM_GET/SET_* tests
++ *
++ * Copyright (C) 2022, Red Hat, Inc.
++ *
++ * Tests for Hyper-V extensions to SVM.
++ */
++#define _GNU_SOURCE /* for program_invocation_short_name */
++#include <fcntl.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/ioctl.h>
++#include <linux/bitmap.h>
++
++#include "test_util.h"
++
++#include "kvm_util.h"
++#include "processor.h"
++#include "svm_util.h"
++#include "hyperv.h"
++
++#define VCPU_ID		1
++#define L2_GUEST_STACK_SIZE 256
++
++struct hv_enlightenments {
++	struct __packed hv_enlightenments_control {
++		u32 nested_flush_hypercall:1;
++		u32 msr_bitmap:1;
++		u32 enlightened_npt_tlb: 1;
++		u32 reserved:29;
++	} __packed hv_enlightenments_control;
++	u32 hv_vp_id;
++	u64 hv_vm_id;
++	u64 partition_assist_page;
++	u64 reserved;
++} __packed;
++
++/*
++ * Hyper-V uses the software reserved clean bit in VMCB
++ */
++#define VMCB_HV_NESTED_ENLIGHTENMENTS (1U << 31)
++
++static inline void vmmcall(void)
++{
++	__asm__ __volatile__("vmmcall");
++}
++
++void l2_guest_code(void)
++{
++	GUEST_SYNC(3);
++	/* Exit to L1 */
++	vmmcall();
++
++	/* MSR-Bitmap tests */
++	rdmsr(MSR_FS_BASE); /* intercepted */
++	rdmsr(MSR_FS_BASE); /* intercepted */
++	rdmsr(MSR_GS_BASE); /* not intercepted */
++	vmmcall();
++	rdmsr(MSR_GS_BASE); /* intercepted */
++
++	GUEST_SYNC(5);
++
++	/* Done, exit to L1 and never come back.  */
++	vmmcall();
++}
++
++static void __attribute__((__flatten__)) guest_code(struct svm_test_data *svm)
++{
++	unsigned long l2_guest_stack[L2_GUEST_STACK_SIZE];
++	struct vmcb *vmcb = svm->vmcb;
++	struct hv_enlightenments *hve =
++		(struct hv_enlightenments *)vmcb->control.reserved_sw;
++
++	GUEST_SYNC(1);
++
++	wrmsr(HV_X64_MSR_GUEST_OS_ID, (u64)0x8100 << 48);
++
++	GUEST_ASSERT(svm->vmcb_gpa);
++	/* Prepare for L2 execution. */
++	generic_svm_setup(svm, l2_guest_code,
++			  &l2_guest_stack[L2_GUEST_STACK_SIZE]);
++
++	GUEST_SYNC(2);
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_VMMCALL);
++	GUEST_SYNC(4);
++	vmcb->save.rip += 3;
++
++	/* Intercept RDMSR 0xc0000100 */
++	vmcb->control.intercept |= 1ULL << INTERCEPT_MSR_PROT;
++	set_bit(2 * (MSR_FS_BASE & 0x1fff), svm->msr + 0x800);
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_MSR);
++	vmcb->save.rip += 2; /* rdmsr */
++
++	/* Enable enlightened MSR bitmap */
++	hve->hv_enlightenments_control.msr_bitmap = 1;
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_MSR);
++	vmcb->save.rip += 2; /* rdmsr */
++
++	/* Intercept RDMSR 0xc0000101 without telling KVM about it */
++	set_bit(2 * (MSR_GS_BASE & 0x1fff), svm->msr + 0x800);
++	/* Make sure HV_VMX_ENLIGHTENED_CLEAN_FIELD_MSR_BITMAP is set */
++	vmcb->control.clean |= VMCB_HV_NESTED_ENLIGHTENMENTS;
++	run_guest(vmcb, svm->vmcb_gpa);
++	/* Make sure we don't see SVM_EXIT_MSR here so eMSR bitmap works */
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_VMMCALL);
++	vmcb->save.rip += 3; /* vmcall */
++
++	/* Now tell KVM we've changed MSR-Bitmap */
++	vmcb->control.clean &= ~VMCB_HV_NESTED_ENLIGHTENMENTS;
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_MSR);
++	vmcb->save.rip += 2; /* rdmsr */
++
++	run_guest(vmcb, svm->vmcb_gpa);
++	GUEST_ASSERT(vmcb->control.exit_code == SVM_EXIT_VMMCALL);
++	GUEST_SYNC(6);
++
++	GUEST_DONE();
++}
++
++int main(int argc, char *argv[])
++{
++	vm_vaddr_t nested_gva = 0;
++
++	struct kvm_vm *vm;
++	struct kvm_run *run;
++	struct ucall uc;
++	int stage;
++
++	if (!nested_svm_supported()) {
++		print_skip("Nested SVM not supported");
++		exit(KSFT_SKIP);
++	}
++	/* Create VM */
++	vm = vm_create_default(VCPU_ID, 0, guest_code);
++	vcpu_set_hv_cpuid(vm, VCPU_ID);
++	run = vcpu_state(vm, VCPU_ID);
++	vcpu_alloc_svm(vm, &nested_gva);
++	vcpu_args_set(vm, VCPU_ID, 1, nested_gva);
++
++	for (stage = 1;; stage++) {
++		_vcpu_run(vm, VCPU_ID);
++		TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++			    "Stage %d: unexpected exit reason: %u (%s),\n",
++			    stage, run->exit_reason,
++			    exit_reason_str(run->exit_reason));
++
++		switch (get_ucall(vm, VCPU_ID, &uc)) {
++		case UCALL_ABORT:
++			TEST_FAIL("%s at %s:%ld", (const char *)uc.args[0],
++				  __FILE__, uc.args[1]);
++			/* NOT REACHED */
++		case UCALL_SYNC:
++			break;
++		case UCALL_DONE:
++			goto done;
++		default:
++			TEST_FAIL("Unknown ucall %lu", uc.cmd);
++		}
++
++		/* UCALL_SYNC is handled here.  */
++		TEST_ASSERT(!strcmp((const char *)uc.args[0], "hello") &&
++			    uc.args[1] == stage, "Stage %d: Unexpected register values vmexit, got %lx",
++			    stage, (ulong)uc.args[1]);
++
++	}
++
++done:
++	kvm_vm_free(vm);
++}
