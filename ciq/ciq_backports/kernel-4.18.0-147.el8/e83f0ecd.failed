@@ -1,0 +1,371 @@
+IB/uverbs: Do not pass struct ib_device to the ioctl methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit e83f0ecdc40f2c3d63ff0e7f17462a29d12684a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e83f0ecd.failed
+
+This does the same as the patch before, except for ioctl. The rules are
+the same, but for the ioctl methods the core code handles setting up the
+uobject.
+
+- Retrieve the ib_dev from the uobject->context->device. This is
+  safe under ioctl as the core has already done rdma_alloc_begin_uobject
+  and so CREATE calls are entirely protected by the rwsem.
+- Retrieve the ib_dev from uobject->object
+- Call ib_uverbs_get_ucontext()
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e83f0ecdc40f2c3d63ff0e7f17462a29d12684a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	drivers/infiniband/core/uverbs_std_types_dm.c
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/infiniband/hw/mlx5/flow.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index 03065bad8dae,f0655a84f9d9..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -335,7 -344,23 +335,27 @@@ static int uverbs_handle_method(struct 
+  	if (ret)
+  		goto cleanup;
+  
+++<<<<<<< HEAD
+ +	ret = method_spec->handler(ibdev, ufile, attr_bundle);
+++=======
++ 	/*
++ 	 * We destroy the HW object before invoking the handler, handlers do
++ 	 * not get to manipulate the HW objects.
++ 	 */
++ 	if (destroy_attr) {
++ 		ret = uobj_destroy(destroy_attr->uobject);
++ 		if (ret)
++ 			goto cleanup;
++ 	}
++ 
++ 	ret = method_spec->handler(ufile, attr_bundle);
++ 
++ 	if (destroy_attr) {
++ 		uobj_put_destroy(destroy_attr->uobject);
++ 		destroy_attr->uobject = NULL;
++ 	}
++ 
+++>>>>>>> e83f0ecdc40f (IB/uverbs: Do not pass struct ib_device to the ioctl methods)
+  cleanup:
+  	finalize_ret = uverbs_finalize_attrs(attr_bundle,
+  					     method_spec->attr_buckets,
+diff --cc drivers/infiniband/core/uverbs_std_types_dm.c
+index b11344264f4e,edc3ff7733d4..000000000000
+--- a/drivers/infiniband/core/uverbs_std_types_dm.c
++++ b/drivers/infiniband/core/uverbs_std_types_dm.c
+@@@ -66,9 -71,7 +69,13 @@@ UVERBS_HANDLER(UVERBS_METHOD_DM_ALLOC)(
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	uobj = uverbs_attr_get(attrs, UVERBS_ATTR_ALLOC_DM_HANDLE)->obj_attr.uobject;
+ +
+ +	dm = ib_dev->alloc_dm(ib_dev, file->ucontext, &attr, attrs);
+++=======
++ 	dm = ib_dev->alloc_dm(ib_dev, uobj->context, &attr, attrs);
+++>>>>>>> e83f0ecdc40f (IB/uverbs: Do not pass struct ib_device to the ioctl methods)
+  	if (IS_ERR(dm))
+  		return PTR_ERR(dm);
+  
+diff --cc include/rdma/ib_verbs.h
+index 98a9e3a75253,dea770e5b9ae..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -4132,15 -4168,8 +4132,20 @@@ ib_get_vector_affinity(struct ib_devic
+   */
+  void rdma_roce_rescan_device(struct ib_device *ibdev);
+  
+ -struct ib_ucontext *ib_uverbs_get_ucontext(struct ib_uverbs_file *ufile);
+ +struct net_device *rdma_alloc_netdev(struct ib_device *device, u8 port_num,
+ +				     enum rdma_netdev_t type, const char *name,
+ +				     unsigned char name_assign_type,
+ +				     void (*setup)(struct net_device *));
+ +
+ +int rdma_init_netdev(struct ib_device *device, u8 port_num,
+ +		     enum rdma_netdev_t type, const char *name,
+ +		     unsigned char name_assign_type,
+ +		     void (*setup)(struct net_device *),
+ +		     struct net_device *netdev);
+  
+++<<<<<<< HEAD
+++=======
++ int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
++ 			       struct uverbs_attr_bundle *attrs);
+++>>>>>>> e83f0ecdc40f (IB/uverbs: Do not pass struct ib_device to the ioctl methods)
+  #endif /* IB_VERBS_H */
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+diff --git a/drivers/infiniband/core/uverbs_std_types.c b/drivers/infiniband/core/uverbs_std_types.c
+index 06085446ffc0..bfcd1eaa03f1 100644
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -198,8 +198,7 @@ static int uverbs_hot_unplug_completion_event_file(struct ib_uobject_file *uobj_
+ 	return 0;
+ };
+ 
+-int uverbs_destroy_def_handler(struct ib_device *ib_dev,
+-			       struct ib_uverbs_file *file,
++int uverbs_destroy_def_handler(struct ib_uverbs_file *file,
+ 			       struct uverbs_attr_bundle *attrs)
+ {
+ 	return 0;
+diff --git a/drivers/infiniband/core/uverbs_std_types_counters.c b/drivers/infiniband/core/uverbs_std_types_counters.c
+index 03b182a684a6..56ced0e8ce7a 100644
+--- a/drivers/infiniband/core/uverbs_std_types_counters.c
++++ b/drivers/infiniband/core/uverbs_std_types_counters.c
+@@ -46,12 +46,13 @@ static int uverbs_free_counters(struct ib_uobject *uobject,
+ 	return counters->device->destroy_counters(counters);
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_CREATE)(struct ib_device *ib_dev,
+-							 struct ib_uverbs_file *file,
+-							 struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_CREATE)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
++	struct ib_uobject *uobj = uverbs_attr_get_uobject(
++		attrs, UVERBS_ATTR_CREATE_COUNTERS_HANDLE);
++	struct ib_device *ib_dev = uobj->context->device;
+ 	struct ib_counters *counters;
+-	struct ib_uobject *uobj;
+ 	int ret;
+ 
+ 	/*
+@@ -62,7 +63,6 @@ static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_CREATE)(struct ib_device *ib_de
+ 	if (!ib_dev->create_counters)
+ 		return -EOPNOTSUPP;
+ 
+-	uobj = uverbs_attr_get_uobject(attrs, UVERBS_ATTR_CREATE_COUNTERS_HANDLE);
+ 	counters = ib_dev->create_counters(ib_dev, attrs);
+ 	if (IS_ERR(counters)) {
+ 		ret = PTR_ERR(counters);
+@@ -80,9 +80,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_CREATE)(struct ib_device *ib_de
+ 	return ret;
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_READ)(struct ib_device *ib_dev,
+-						       struct ib_uverbs_file *file,
+-						       struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_READ)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_counters_read_attr read_attr = {};
+ 	const struct uverbs_attr *uattr;
+@@ -90,7 +89,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_READ)(struct ib_device *ib_dev,
+ 		uverbs_attr_get_obj(attrs, UVERBS_ATTR_READ_COUNTERS_HANDLE);
+ 	int ret;
+ 
+-	if (!ib_dev->read_counters)
++	if (!counters->device->read_counters)
+ 		return -EOPNOTSUPP;
+ 
+ 	if (!atomic_read(&counters->usecnt))
+@@ -108,9 +107,7 @@ static int UVERBS_HANDLER(UVERBS_METHOD_COUNTERS_READ)(struct ib_device *ib_dev,
+ 	if (!read_attr.counters_buff)
+ 		return -ENOMEM;
+ 
+-	ret = ib_dev->read_counters(counters,
+-				    &read_attr,
+-				    attrs);
++	ret = counters->device->read_counters(counters, &read_attr, attrs);
+ 	if (ret)
+ 		goto err_read;
+ 
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index 150b7c04ce15..6019ff3624f2 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -53,11 +53,13 @@ static int uverbs_free_cq(struct ib_uobject *uobject,
+ 	return ret;
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(struct ib_device *ib_dev,
+-						   struct ib_uverbs_file *file,
+-						   struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
+-	struct ib_ucq_object           *obj;
++	struct ib_ucq_object *obj = container_of(
++		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_CREATE_CQ_HANDLE),
++		typeof(*obj), uobject);
++	struct ib_device *ib_dev = obj->uobject.context->device;
+ 	struct ib_udata uhw;
+ 	int ret;
+ 	u64 user_handle;
+@@ -98,9 +100,6 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(struct ib_device *ib_dev,
+ 		goto err_event_file;
+ 	}
+ 
+-	obj = container_of(uverbs_attr_get_uobject(attrs,
+-						   UVERBS_ATTR_CREATE_CQ_HANDLE),
+-			   typeof(*obj), uobject);
+ 	obj->comp_events_reported  = 0;
+ 	obj->async_events_reported = 0;
+ 	INIT_LIST_HEAD(&obj->comp_list);
+@@ -161,9 +160,8 @@ static DECLARE_UVERBS_NAMED_METHOD(UVERBS_METHOD_CQ_CREATE,
+ 			     UA_FLAGS(UVERBS_ATTR_SPEC_F_MANDATORY)),
+ 	&uverbs_uhw_compat_in, &uverbs_uhw_compat_out);
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_CQ_DESTROY)(struct ib_device *ib_dev,
+-						    struct ib_uverbs_file *file,
+-						    struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_CQ_DESTROY)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_uobject *uobj =
+ 		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_DESTROY_CQ_HANDLE);
+* Unmerged path drivers/infiniband/core/uverbs_std_types_dm.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_flow_action.c b/drivers/infiniband/core/uverbs_std_types_flow_action.c
+index e3d282cb7bf2..10004e5f465a 100644
+--- a/drivers/infiniband/core/uverbs_std_types_flow_action.c
++++ b/drivers/infiniband/core/uverbs_std_types_flow_action.c
+@@ -303,12 +303,13 @@ static int parse_flow_action_esp(struct ib_device *ib_dev,
+ 	return 0;
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE)(struct ib_device *ib_dev,
+-								struct ib_uverbs_file *file,
+-								struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
++	struct ib_uobject *uobj = uverbs_attr_get_uobject(
++		attrs, UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE);
++	struct ib_device *ib_dev = uobj->context->device;
+ 	int				  ret;
+-	struct ib_uobject		  *uobj;
+ 	struct ib_flow_action		  *action;
+ 	struct ib_flow_action_esp_attr	  esp_attr = {};
+ 
+@@ -320,8 +321,6 @@ static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE)(struct ib_device
+ 		return ret;
+ 
+ 	/* No need to check as this attribute is marked as MANDATORY */
+-	uobj = uverbs_attr_get_uobject(
+-		attrs, UVERBS_ATTR_CREATE_FLOW_ACTION_ESP_HANDLE);
+ 	action = ib_dev->create_flow_action_esp(ib_dev, &esp_attr.hdr, attrs);
+ 	if (IS_ERR(action))
+ 		return PTR_ERR(action);
+@@ -335,32 +334,28 @@ static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_CREATE)(struct ib_device
+ 	return 0;
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY)(struct ib_device *ib_dev,
+-								struct ib_uverbs_file *file,
+-								struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_FLOW_ACTION_ESP_MODIFY)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
++	struct ib_uobject *uobj = uverbs_attr_get_uobject(
++		attrs, UVERBS_ATTR_MODIFY_FLOW_ACTION_ESP_HANDLE);
++	struct ib_flow_action *action = uobj->object;
+ 	int				  ret;
+-	struct ib_uobject		  *uobj;
+-	struct ib_flow_action		  *action;
+ 	struct ib_flow_action_esp_attr	  esp_attr = {};
+ 
+-	if (!ib_dev->modify_flow_action_esp)
++	if (!action->device->modify_flow_action_esp)
+ 		return -EOPNOTSUPP;
+ 
+-	ret = parse_flow_action_esp(ib_dev, file, attrs, &esp_attr, true);
++	ret = parse_flow_action_esp(action->device, file, attrs, &esp_attr,
++				    true);
+ 	if (ret)
+ 		return ret;
+ 
+-	uobj = uverbs_attr_get_uobject(
+-		attrs, UVERBS_ATTR_MODIFY_FLOW_ACTION_ESP_HANDLE);
+-	action = uobj->object;
+-
+ 	if (action->type != IB_FLOW_ACTION_ESP)
+ 		return -EINVAL;
+ 
+-	return ib_dev->modify_flow_action_esp(action,
+-					      &esp_attr.hdr,
+-					      attrs);
++	return action->device->modify_flow_action_esp(action, &esp_attr.hdr,
++						      attrs);
+ }
+ 
+ static const struct uverbs_attr_spec uverbs_flow_action_esp_keymat[] = {
+diff --git a/drivers/infiniband/core/uverbs_std_types_mr.c b/drivers/infiniband/core/uverbs_std_types_mr.c
+index 68f7cadf088f..49d6d993f41c 100644
+--- a/drivers/infiniband/core/uverbs_std_types_mr.c
++++ b/drivers/infiniband/core/uverbs_std_types_mr.c
+@@ -39,14 +39,18 @@ static int uverbs_free_mr(struct ib_uobject *uobject,
+ 	return ib_dereg_mr((struct ib_mr *)uobject->object);
+ }
+ 
+-static int UVERBS_HANDLER(UVERBS_METHOD_DM_MR_REG)(struct ib_device *ib_dev,
+-						   struct ib_uverbs_file *file,
+-						   struct uverbs_attr_bundle *attrs)
++static int UVERBS_HANDLER(UVERBS_METHOD_DM_MR_REG)(
++	struct ib_uverbs_file *file, struct uverbs_attr_bundle *attrs)
+ {
+ 	struct ib_dm_mr_attr attr = {};
+-	struct ib_uobject *uobj;
+-	struct ib_dm *dm;
+-	struct ib_pd *pd;
++	struct ib_uobject *uobj =
++		uverbs_attr_get_uobject(attrs, UVERBS_ATTR_REG_DM_MR_HANDLE);
++	struct ib_dm *dm =
++		uverbs_attr_get_obj(attrs, UVERBS_ATTR_REG_DM_MR_DM_HANDLE);
++	struct ib_pd *pd =
++		uverbs_attr_get_obj(attrs, UVERBS_ATTR_REG_DM_MR_PD_HANDLE);
++	struct ib_device *ib_dev = pd->device;
++
+ 	struct ib_mr *mr;
+ 	int ret;
+ 
+@@ -74,12 +78,6 @@ static int UVERBS_HANDLER(UVERBS_METHOD_DM_MR_REG)(struct ib_device *ib_dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	pd = uverbs_attr_get_obj(attrs, UVERBS_ATTR_REG_DM_MR_PD_HANDLE);
+-
+-	dm = uverbs_attr_get_obj(attrs, UVERBS_ATTR_REG_DM_MR_DM_HANDLE);
+-
+-	uobj = uverbs_attr_get(attrs, UVERBS_ATTR_REG_DM_MR_HANDLE)->obj_attr.uobject;
+-
+ 	if (attr.offset > dm->length || attr.length > dm->length ||
+ 	    attr.length > dm->length - attr.offset)
+ 		return -EINVAL;
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+* Unmerged path drivers/infiniband/hw/mlx5/flow.c
+* Unmerged path include/rdma/ib_verbs.h
+diff --git a/include/rdma/uverbs_ioctl.h b/include/rdma/uverbs_ioctl.h
+index 90a4947ff548..693c2cc2f5bf 100644
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@ -137,7 +137,7 @@ struct uverbs_method_spec {
+ 	u32						flags;
+ 	size_t						num_buckets;
+ 	size_t						num_child_attrs;
+-	int (*handler)(struct ib_device *ib_dev, struct ib_uverbs_file *ufile,
++	int (*handler)(struct ib_uverbs_file *ufile,
+ 		       struct uverbs_attr_bundle *ctx);
+ 	struct uverbs_attr_spec_hash		*attr_buckets[0];
+ };
+@@ -180,7 +180,7 @@ struct uverbs_method_def {
+ 	u32				     flags;
+ 	size_t				     num_attrs;
+ 	const struct uverbs_attr_def * const (*attrs)[];
+-	int (*handler)(struct ib_device *ib_dev, struct ib_uverbs_file *ufile,
++	int (*handler)(struct ib_uverbs_file *ufile,
+ 		       struct uverbs_attr_bundle *ctx);
+ };
+ 
