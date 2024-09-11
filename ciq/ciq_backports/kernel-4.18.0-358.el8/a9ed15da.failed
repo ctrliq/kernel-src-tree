@@ -1,0 +1,255 @@
+bpf: Split cgroup_bpf_enabled per attach type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit a9ed15dae0755a0368735e0556a462d8519bdb05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a9ed15da.failed
+
+When we attach any cgroup hook, the rest (even if unused/unattached) start
+to contribute small overhead. In particular, the one we want to avoid is
+__cgroup_bpf_run_filter_skb which does two redirections to get to
+the cgroup and pushes/pulls skb.
+
+Let's split cgroup_bpf_enabled to be per-attach to make sure
+only used attach types trigger.
+
+I've dropped some existing high-level cgroup_bpf_enabled in some
+places because BPF_PROG_CGROUP_XXX_RUN macros usually have another
+cgroup_bpf_enabled check.
+
+I also had to copy-paste BPF_CGROUP_RUN_SA_PROG_LOCK for
+GETPEERNAME/GETSOCKNAME because type for cgroup_bpf_enabled[type]
+has to be constant and known at compile time.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20210115163501.805133-4-sdf@google.com
+(cherry picked from commit a9ed15dae0755a0368735e0556a462d8519bdb05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf-cgroup.h
+diff --cc include/linux/bpf-cgroup.h
+index 933c7c1808e4,0748fd87969e..000000000000
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@@ -359,12 -335,12 +361,12 @@@ int bpf_percpu_cgroup_storage_update(st
+  })
+  
+  
+ -#define BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write, buf, count, pos)  \
+ +#define BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write, buf, count, pos, nbuf)  \
+  ({									       \
+  	int __ret = 0;							       \
+- 	if (cgroup_bpf_enabled)						       \
++ 	if (cgroup_bpf_enabled(BPF_CGROUP_SYSCTL))			       \
+  		__ret = __cgroup_bpf_run_filter_sysctl(head, table, write,     \
+ -						       buf, count, pos,        \
+ +						       buf, count, pos, nbuf,  \
+  						       BPF_CGROUP_SYSCTL);     \
+  	__ret;								       \
+  })
+@@@ -393,11 -369,24 +395,32 @@@
+  				       max_optlen, retval)		       \
+  ({									       \
+  	int __ret = retval;						       \
+++<<<<<<< HEAD
+ +	if (cgroup_bpf_enabled)						       \
+ +		__ret = __cgroup_bpf_run_filter_getsockopt(sock, level,	       \
+ +							   optname, optval,    \
+ +							   optlen, max_optlen, \
+ +							   retval);	       \
+++=======
++ 	if (cgroup_bpf_enabled(BPF_CGROUP_GETSOCKOPT))			       \
++ 		if (!(sock)->sk_prot->bpf_bypass_getsockopt ||		       \
++ 		    !INDIRECT_CALL_INET_1((sock)->sk_prot->bpf_bypass_getsockopt, \
++ 					tcp_bpf_bypass_getsockopt,	       \
++ 					level, optname))		       \
++ 			__ret = __cgroup_bpf_run_filter_getsockopt(	       \
++ 				sock, level, optname, optval, optlen,	       \
++ 				max_optlen, retval);			       \
++ 	__ret;								       \
++ })
++ 
++ #define BPF_CGROUP_RUN_PROG_GETSOCKOPT_KERN(sock, level, optname, optval,      \
++ 					    optlen, retval)		       \
++ ({									       \
++ 	int __ret = retval;						       \
++ 	if (cgroup_bpf_enabled(BPF_CGROUP_GETSOCKOPT))			       \
++ 		__ret = __cgroup_bpf_run_filter_getsockopt_kern(	       \
++ 			sock, level, optname, optval, optlen, retval);	       \
+++>>>>>>> a9ed15dae075 (bpf: Split cgroup_bpf_enabled per attach type)
+  	__ret;								       \
+  })
+  
+* Unmerged path include/linux/bpf-cgroup.h
+diff --git a/kernel/bpf/cgroup.c b/kernel/bpf/cgroup.c
+index ce0faf3f36f0..c27e8de269c4 100644
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@ -22,7 +22,7 @@
+ 
+ #include "../cgroup/cgroup-internal.h"
+ 
+-DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
++DEFINE_STATIC_KEY_ARRAY_FALSE(cgroup_bpf_enabled_key, MAX_BPF_ATTACH_TYPE);
+ EXPORT_SYMBOL(cgroup_bpf_enabled_key);
+ 
+ void cgroup_bpf_offline(struct cgroup *cgrp)
+@@ -131,7 +131,7 @@ static void cgroup_bpf_release(struct work_struct *work)
+ 			if (pl->link)
+ 				bpf_cgroup_link_auto_detach(pl->link);
+ 			kfree(pl);
+-			static_branch_dec(&cgroup_bpf_enabled_key);
++			static_branch_dec(&cgroup_bpf_enabled_key[type]);
+ 		}
+ 		old_array = rcu_dereference_protected(
+ 				cgrp->bpf.effective[type],
+@@ -503,7 +503,7 @@ int __cgroup_bpf_attach(struct cgroup *cgrp,
+ 	if (old_prog)
+ 		bpf_prog_put(old_prog);
+ 	else
+-		static_branch_inc(&cgroup_bpf_enabled_key);
++		static_branch_inc(&cgroup_bpf_enabled_key[type]);
+ 	bpf_cgroup_storages_link(new_storage, cgrp, type);
+ 	return 0;
+ 
+@@ -702,7 +702,7 @@ int __cgroup_bpf_detach(struct cgroup *cgrp, struct bpf_prog *prog,
+ 		cgrp->bpf.flags[type] = 0;
+ 	if (old_prog)
+ 		bpf_prog_put(old_prog);
+-	static_branch_dec(&cgroup_bpf_enabled_key);
++	static_branch_dec(&cgroup_bpf_enabled_key[type]);
+ 	return 0;
+ 
+ cleanup:
+@@ -1375,8 +1375,7 @@ int __cgroup_bpf_run_filter_setsockopt(struct sock *sk, int *level,
+ 	 * attached to the hook so we don't waste time allocating
+ 	 * memory and locking the socket.
+ 	 */
+-	if (!cgroup_bpf_enabled ||
+-	    __cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_SETSOCKOPT))
++	if (__cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_SETSOCKOPT))
+ 		return 0;
+ 
+ 	/* Allocate a bit more than the initial user buffer for
+@@ -1472,8 +1471,7 @@ int __cgroup_bpf_run_filter_getsockopt(struct sock *sk, int level,
+ 	 * attached to the hook so we don't waste time allocating
+ 	 * memory and locking the socket.
+ 	 */
+-	if (!cgroup_bpf_enabled ||
+-	    __cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_GETSOCKOPT))
++	if (__cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_GETSOCKOPT))
+ 		return retval;
+ 
+ 	ctx.optlen = max_optlen;
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 5a9841d1d62a..66f6f838b991 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -782,18 +782,19 @@ int inet_getname(struct socket *sock, struct sockaddr *uaddr,
+ 			return -ENOTCONN;
+ 		sin->sin_port = inet->inet_dport;
+ 		sin->sin_addr.s_addr = inet->inet_daddr;
++		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
++					    BPF_CGROUP_INET4_GETPEERNAME,
++					    NULL);
+ 	} else {
+ 		__be32 addr = inet->inet_rcv_saddr;
+ 		if (!addr)
+ 			addr = inet->inet_saddr;
+ 		sin->sin_port = inet->inet_sport;
+ 		sin->sin_addr.s_addr = addr;
+-	}
+-	if (cgroup_bpf_enabled)
+ 		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
+-					    peer ? BPF_CGROUP_INET4_GETPEERNAME :
+-						   BPF_CGROUP_INET4_GETSOCKNAME,
++					    BPF_CGROUP_INET4_GETSOCKNAME,
+ 					    NULL);
++	}
+ 	memset(sin->sin_zero, 0, sizeof(sin->sin_zero));
+ 	return sizeof(*sin);
+ }
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 605c9b662662..affbf2c0b83f 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1157,7 +1157,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		rcu_read_unlock();
+ 	}
+ 
+-	if (cgroup_bpf_enabled && !connected) {
++	if (cgroup_bpf_enabled(BPF_CGROUP_UDP4_SENDMSG) && !connected) {
+ 		err = BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk,
+ 					    (struct sockaddr *)usin, &ipc.addr);
+ 		if (err)
+@@ -1874,9 +1874,8 @@ int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int noblock,
+ 		memset(sin->sin_zero, 0, sizeof(sin->sin_zero));
+ 		*addr_len = sizeof(*sin);
+ 
+-		if (cgroup_bpf_enabled)
+-			BPF_CGROUP_RUN_PROG_UDP4_RECVMSG_LOCK(sk,
+-							(struct sockaddr *)sin);
++		BPF_CGROUP_RUN_PROG_UDP4_RECVMSG_LOCK(sk,
++						      (struct sockaddr *)sin);
+ 	}
+ 
+ 	if (udp_sk(sk)->gro_enabled)
+diff --git a/net/ipv6/af_inet6.c b/net/ipv6/af_inet6.c
+index d1db0cec2205..d6a3c1eee7e5 100644
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@ -537,18 +537,19 @@ int inet6_getname(struct socket *sock, struct sockaddr *uaddr,
+ 		sin->sin6_addr = sk->sk_v6_daddr;
+ 		if (np->sndflow)
+ 			sin->sin6_flowinfo = np->flow_label;
++		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
++					    BPF_CGROUP_INET6_GETPEERNAME,
++					    NULL);
+ 	} else {
+ 		if (ipv6_addr_any(&sk->sk_v6_rcv_saddr))
+ 			sin->sin6_addr = np->saddr;
+ 		else
+ 			sin->sin6_addr = sk->sk_v6_rcv_saddr;
+ 		sin->sin6_port = inet->inet_sport;
+-	}
+-	if (cgroup_bpf_enabled)
+ 		BPF_CGROUP_RUN_SA_PROG_LOCK(sk, (struct sockaddr *)sin,
+-					    peer ? BPF_CGROUP_INET6_GETPEERNAME :
+-						   BPF_CGROUP_INET6_GETSOCKNAME,
++					    BPF_CGROUP_INET6_GETSOCKNAME,
+ 					    NULL);
++	}
+ 	sin->sin6_scope_id = ipv6_iface_scope_id(&sin->sin6_addr,
+ 						 sk->sk_bound_dev_if);
+ 	return sizeof(*sin);
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index 503b6ade5eac..152672eef403 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -423,9 +423,8 @@ int udpv6_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		}
+ 		*addr_len = sizeof(*sin6);
+ 
+-		if (cgroup_bpf_enabled)
+-			BPF_CGROUP_RUN_PROG_UDP6_RECVMSG_LOCK(sk,
+-						(struct sockaddr *)sin6);
++		BPF_CGROUP_RUN_PROG_UDP6_RECVMSG_LOCK(sk,
++						      (struct sockaddr *)sin6);
+ 	}
+ 
+ 	if (udp_sk(sk)->gro_enabled)
+@@ -1496,7 +1495,7 @@ int udpv6_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		fl6.saddr = np->saddr;
+ 	fl6.fl6_sport = inet->inet_sport;
+ 
+-	if (cgroup_bpf_enabled && !connected) {
++	if (cgroup_bpf_enabled(BPF_CGROUP_UDP6_SENDMSG) && !connected) {
+ 		err = BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk,
+ 					   (struct sockaddr *)sin6, &fl6.saddr);
+ 		if (err)
