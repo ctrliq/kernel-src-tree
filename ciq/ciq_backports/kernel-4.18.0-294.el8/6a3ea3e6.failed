@@ -1,0 +1,138 @@
+x86/entry/64: Do not use RDPID in paranoid entry to accomodate KVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 6a3ea3e68b8a8a26c4aaac03432ed92269c9a14e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6a3ea3e6.failed
+
+KVM has an optmization to avoid expensive MRS read/writes on
+VMENTER/EXIT. It caches the MSR values and restores them either when
+leaving the run loop, on preemption or when going out to user space.
+
+The affected MSRs are not required for kernel context operations. This
+changed with the recently introduced mechanism to handle FSGSBASE in the
+paranoid entry code which has to retrieve the kernel GSBASE value by
+accessing per CPU memory. The mechanism needs to retrieve the CPU number
+and uses either LSL or RDPID if the processor supports it.
+
+Unfortunately RDPID uses MSR_TSC_AUX which is in the list of cached and
+lazily restored MSRs, which means between the point where the guest value
+is written and the point of restore, MSR_TSC_AUX contains a random number.
+
+If an NMI or any other exception which uses the paranoid entry path happens
+in such a context, then RDPID returns the random guest MSR_TSC_AUX value.
+
+As a consequence this reads from the wrong memory location to retrieve the
+kernel GSBASE value. Kernel GS is used to for all regular this_cpu_*()
+operations. If the GSBASE in the exception handler points to the per CPU
+memory of a different CPU then this has the obvious consequences of data
+corruption and crashes.
+
+As the paranoid entry path is the only place which accesses MSR_TSX_AUX
+(via RDPID) and the fallback via LSL is not significantly slower, remove
+the RDPID alternative from the entry path and always use LSL.
+
+The alternative would be to write MSR_TSC_AUX on every VMENTER and VMEXIT
+which would be inflicting massive overhead on that code path.
+
+[ tglx: Rewrote changelog ]
+
+Fixes: eaad981291ee3 ("x86/entry/64: Introduce the FIND_PERCPU_BASE macro")
+	Reported-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Debugged-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Suggested-by: Andy Lutomirski <luto@kernel.org>
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/r/20200821105229.18938-1-pbonzini@redhat.com
+(cherry picked from commit 6a3ea3e68b8a8a26c4aaac03432ed92269c9a14e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/calling.h
+diff --cc arch/x86/entry/calling.h
+index 7c56a2af8492,ae9b0d4615b3..000000000000
+--- a/arch/x86/entry/calling.h
++++ b/arch/x86/entry/calling.h
+@@@ -333,18 -334,62 +333,45 @@@ For 32-bit we have the following conven
+  	ALTERNATIVE "", "lfence", X86_FEATURE_FENCE_SWAPGS_KERNEL
+  .endm
+  
+ -.macro STACKLEAK_ERASE_NOCLOBBER
+ -#ifdef CONFIG_GCC_PLUGIN_STACKLEAK
+ -	PUSH_AND_CLEAR_REGS
+ -	call stackleak_erase
+ -	POP_REGS
+ -#endif
+ -.endm
+ -
+ -.macro SAVE_AND_SET_GSBASE scratch_reg:req save_reg:req
+ -	rdgsbase \save_reg
+ -	GET_PERCPU_BASE \scratch_reg
+ -	wrgsbase \scratch_reg
+ -.endm
+ -
+ -#else /* CONFIG_X86_64 */
+ -# undef		UNWIND_HINT_IRET_REGS
+ -# define	UNWIND_HINT_IRET_REGS
+ -#endif /* !CONFIG_X86_64 */
+ -
+ -.macro STACKLEAK_ERASE
+ -#ifdef CONFIG_GCC_PLUGIN_STACKLEAK
+ -	call stackleak_erase
+ -#endif
+ -.endm
+ -
+ -#ifdef CONFIG_SMP
+ +#endif /* CONFIG_X86_64 */
+  
+  /*
+ - * CPU/node NR is loaded from the limit (size) field of a special segment
+ - * descriptor entry in GDT.
+ + * This does 'call enter_from_user_mode' unless we can avoid it based on
+ + * kernel config or using the static jump infrastructure.
+   */
+ -.macro LOAD_CPU_AND_NODE_SEG_LIMIT reg:req
+ -	movq	$__CPUNODE_SEG, \reg
+ -	lsl	\reg, \reg
+ +.macro CALL_enter_from_user_mode
+ +#ifdef CONFIG_CONTEXT_TRACKING
+ +#ifdef HAVE_JUMP_LABEL
+ +	STATIC_JUMP_IF_FALSE .Lafter_call_\@, context_tracking_enabled, def=0
+ +#endif
+ +	call enter_from_user_mode
+ +.Lafter_call_\@:
+ +#endif
+  .endm
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Fetch the per-CPU GSBASE value for this processor and put it in @reg.
++  * We normally use %gs for accessing per-CPU data, but we are setting up
++  * %gs here and obviously can not use %gs itself to access per-CPU data.
++  *
++  * Do not use RDPID, because KVM loads guest's TSC_AUX on vm-entry and
++  * may not restore the host's value until the CPU returns to userspace.
++  * Thus the kernel would consume a guest's TSC_AUX if an NMI arrives
++  * while running KVM's run loop.
++  */
++ .macro GET_PERCPU_BASE reg:req
++ 	LOAD_CPU_AND_NODE_SEG_LIMIT \reg
++ 	andq	$VDSO_CPUNODE_MASK, \reg
++ 	movq	__per_cpu_offset(, \reg, 8), \reg
++ .endm
++ 
++ #else
++ 
++ .macro GET_PERCPU_BASE reg:req
++ 	movq	pcpu_unit_offsets(%rip), \reg
++ .endm
++ 
++ #endif /* CONFIG_SMP */
+++>>>>>>> 6a3ea3e68b8a (x86/entry/64: Do not use RDPID in paranoid entry to accomodate KVM)
+* Unmerged path arch/x86/entry/calling.h
