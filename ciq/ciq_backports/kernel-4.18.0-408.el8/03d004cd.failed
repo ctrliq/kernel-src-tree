@@ -1,0 +1,390 @@
+KVM: x86: Use more verbose names for mem encrypt kvm_x86_ops hooks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 03d004cd071525894fb1d5638ebaf25cd6177435
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/03d004cd.failed
+
+Use slightly more verbose names for the so called "memory encrypt",
+a.k.a. "mem enc", kvm_x86_ops hooks to bridge the gap between the current
+super short kvm_x86_ops names and SVM's more verbose, but non-conforming
+names.  This is a step toward using kvm-x86-ops.h with KVM_X86_CVM_OP()
+to fill svm_x86_ops.
+
+Opportunistically rename mem_enc_op() to mem_enc_ioctl() to better
+reflect its true nature, as it really is a full fledged ioctl() of its
+own.  Ideally, the hook would be named confidential_vm_ioctl() or so, as
+the ioctl() is a gateway to more than just memory encryption, and because
+its underlying purpose to support Confidential VMs, which can be provided
+without memory encryption, e.g. if the TCB of the guest includes the host
+kernel but not host userspace, or by isolation in hardware without
+encrypting memory.  But, diverging from KVM_MEMORY_ENCRYPT_OP even
+further is undeseriable, and short of creating alises for all related
+ioctl()s, which introduces a different flavor of divergence, KVM is stuck
+with the nomenclature.
+
+Defer renaming SVM's functions to a future commit as there are additional
+changes needed to make SVM fully conforming and to match reality (looking
+at you, svm_vm_copy_asid_from()).
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220128005208.4008533-20-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 03d004cd071525894fb1d5638ebaf25cd6177435)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm-x86-ops.h
+#	arch/x86/kvm/svm/sev.c
+diff --cc arch/x86/include/asm/kvm-x86-ops.h
+index ab393e44c1e3,9e37dc3d8863..000000000000
+--- a/arch/x86/include/asm/kvm-x86-ops.h
++++ b/arch/x86/include/asm/kvm-x86-ops.h
+@@@ -114,9 -112,11 +114,17 @@@ KVM_X86_OP(smi_allowed
+  KVM_X86_OP(enter_smm)
+  KVM_X86_OP(leave_smm)
+  KVM_X86_OP(enable_smi_window)
+++<<<<<<< HEAD
+ +KVM_X86_OP_NULL(mem_enc_op)
+ +KVM_X86_OP_NULL(mem_enc_reg_region)
+ +KVM_X86_OP_NULL(mem_enc_unreg_region)
+++=======
++ KVM_X86_OP_NULL(mem_enc_ioctl)
++ KVM_X86_OP_NULL(mem_enc_register_region)
++ KVM_X86_OP_NULL(mem_enc_unregister_region)
++ KVM_X86_OP_NULL(vm_copy_enc_context_from)
++ KVM_X86_OP_NULL(vm_move_enc_context_from)
+++>>>>>>> 03d004cd0715 (KVM: x86: Use more verbose names for mem encrypt kvm_x86_ops hooks)
+  KVM_X86_OP(get_msr_feature)
+  KVM_X86_OP(can_emulate_instruction)
+  KVM_X86_OP(apic_init_signal_blocked)
+diff --cc arch/x86/kvm/svm/sev.c
+index b0aca769f0c7,7f346ddcae0a..000000000000
+--- a/arch/x86/kvm/svm/sev.c
++++ b/arch/x86/kvm/svm/sev.c
+@@@ -1544,7 -1544,224 +1544,228 @@@ static bool is_cmd_allowed_from_mirror(
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +int svm_mem_enc_op(struct kvm *kvm, void __user *argp)
+++=======
++ static int sev_lock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 	int r = -EBUSY;
++ 
++ 	if (dst_kvm == src_kvm)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Bail if these VMs are already involved in a migration to avoid
++ 	 * deadlock between two VMs trying to migrate to/from each other.
++ 	 */
++ 	if (atomic_cmpxchg_acquire(&dst_sev->migration_in_progress, 0, 1))
++ 		return -EBUSY;
++ 
++ 	if (atomic_cmpxchg_acquire(&src_sev->migration_in_progress, 0, 1))
++ 		goto release_dst;
++ 
++ 	r = -EINTR;
++ 	if (mutex_lock_killable(&dst_kvm->lock))
++ 		goto release_src;
++ 	if (mutex_lock_killable_nested(&src_kvm->lock, SINGLE_DEPTH_NESTING))
++ 		goto unlock_dst;
++ 	return 0;
++ 
++ unlock_dst:
++ 	mutex_unlock(&dst_kvm->lock);
++ release_src:
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ release_dst:
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	return r;
++ }
++ 
++ static void sev_unlock_two_vms(struct kvm *dst_kvm, struct kvm *src_kvm)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(dst_kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev = &to_kvm_svm(src_kvm)->sev_info;
++ 
++ 	mutex_unlock(&dst_kvm->lock);
++ 	mutex_unlock(&src_kvm->lock);
++ 	atomic_set_release(&dst_sev->migration_in_progress, 0);
++ 	atomic_set_release(&src_sev->migration_in_progress, 0);
++ }
++ 
++ 
++ static int sev_lock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i, j;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		if (mutex_lock_killable(&vcpu->mutex))
++ 			goto out_unlock;
++ 	}
++ 
++ 	return 0;
++ 
++ out_unlock:
++ 	kvm_for_each_vcpu(j, vcpu, kvm) {
++ 		if (i == j)
++ 			break;
++ 
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return -EINTR;
++ }
++ 
++ static void sev_unlock_vcpus_for_migration(struct kvm *kvm)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long i;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ }
++ 
++ static void sev_migrate_from(struct kvm_sev_info *dst,
++ 			      struct kvm_sev_info *src)
++ {
++ 	dst->active = true;
++ 	dst->asid = src->asid;
++ 	dst->handle = src->handle;
++ 	dst->pages_locked = src->pages_locked;
++ 	dst->enc_context_owner = src->enc_context_owner;
++ 
++ 	src->asid = 0;
++ 	src->active = false;
++ 	src->handle = 0;
++ 	src->pages_locked = 0;
++ 	src->enc_context_owner = NULL;
++ 
++ 	list_cut_before(&dst->regions_list, &src->regions_list, &src->regions_list);
++ }
++ 
++ static int sev_es_migrate_from(struct kvm *dst, struct kvm *src)
++ {
++ 	unsigned long i;
++ 	struct kvm_vcpu *dst_vcpu, *src_vcpu;
++ 	struct vcpu_svm *dst_svm, *src_svm;
++ 
++ 	if (atomic_read(&src->online_vcpus) != atomic_read(&dst->online_vcpus))
++ 		return -EINVAL;
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		if (!src_vcpu->arch.guest_state_protected)
++ 			return -EINVAL;
++ 	}
++ 
++ 	kvm_for_each_vcpu(i, src_vcpu, src) {
++ 		src_svm = to_svm(src_vcpu);
++ 		dst_vcpu = kvm_get_vcpu(dst, i);
++ 		dst_svm = to_svm(dst_vcpu);
++ 
++ 		/*
++ 		 * Transfer VMSA and GHCB state to the destination.  Nullify and
++ 		 * clear source fields as appropriate, the state now belongs to
++ 		 * the destination.
++ 		 */
++ 		memcpy(&dst_svm->sev_es, &src_svm->sev_es, sizeof(src_svm->sev_es));
++ 		dst_svm->vmcb->control.ghcb_gpa = src_svm->vmcb->control.ghcb_gpa;
++ 		dst_svm->vmcb->control.vmsa_pa = src_svm->vmcb->control.vmsa_pa;
++ 		dst_vcpu->arch.guest_state_protected = true;
++ 
++ 		memset(&src_svm->sev_es, 0, sizeof(src_svm->sev_es));
++ 		src_svm->vmcb->control.ghcb_gpa = INVALID_PAGE;
++ 		src_svm->vmcb->control.vmsa_pa = INVALID_PAGE;
++ 		src_vcpu->arch.guest_state_protected = false;
++ 	}
++ 	to_kvm_svm(src)->sev_info.es_active = false;
++ 	to_kvm_svm(dst)->sev_info.es_active = true;
++ 
++ 	return 0;
++ }
++ 
++ int svm_vm_migrate_from(struct kvm *kvm, unsigned int source_fd)
++ {
++ 	struct kvm_sev_info *dst_sev = &to_kvm_svm(kvm)->sev_info;
++ 	struct kvm_sev_info *src_sev, *cg_cleanup_sev;
++ 	struct file *source_kvm_file;
++ 	struct kvm *source_kvm;
++ 	bool charged = false;
++ 	int ret;
++ 
++ 	source_kvm_file = fget(source_fd);
++ 	if (!file_is_kvm(source_kvm_file)) {
++ 		ret = -EBADF;
++ 		goto out_fput;
++ 	}
++ 
++ 	source_kvm = source_kvm_file->private_data;
++ 	ret = sev_lock_two_vms(kvm, source_kvm);
++ 	if (ret)
++ 		goto out_fput;
++ 
++ 	if (sev_guest(kvm) || !sev_guest(source_kvm)) {
++ 		ret = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	src_sev = &to_kvm_svm(source_kvm)->sev_info;
++ 
++ 	/*
++ 	 * VMs mirroring src's encryption context rely on it to keep the
++ 	 * ASID allocated, but below we are clearing src_sev->asid.
++ 	 */
++ 	if (src_sev->num_mirrored_vms) {
++ 		ret = -EBUSY;
++ 		goto out_unlock;
++ 	}
++ 
++ 	dst_sev->misc_cg = get_current_misc_cg();
++ 	cg_cleanup_sev = dst_sev;
++ 	if (dst_sev->misc_cg != src_sev->misc_cg) {
++ 		ret = sev_misc_cg_try_charge(dst_sev);
++ 		if (ret)
++ 			goto out_dst_cgroup;
++ 		charged = true;
++ 	}
++ 
++ 	ret = sev_lock_vcpus_for_migration(kvm);
++ 	if (ret)
++ 		goto out_dst_cgroup;
++ 	ret = sev_lock_vcpus_for_migration(source_kvm);
++ 	if (ret)
++ 		goto out_dst_vcpu;
++ 
++ 	if (sev_es_guest(source_kvm)) {
++ 		ret = sev_es_migrate_from(kvm, source_kvm);
++ 		if (ret)
++ 			goto out_source_vcpu;
++ 	}
++ 	sev_migrate_from(dst_sev, src_sev);
++ 	kvm_vm_dead(source_kvm);
++ 	cg_cleanup_sev = src_sev;
++ 	ret = 0;
++ 
++ out_source_vcpu:
++ 	sev_unlock_vcpus_for_migration(source_kvm);
++ out_dst_vcpu:
++ 	sev_unlock_vcpus_for_migration(kvm);
++ out_dst_cgroup:
++ 	/* Operates on the source on success, on the destination on failure.  */
++ 	if (charged)
++ 		sev_misc_cg_uncharge(cg_cleanup_sev);
++ 	put_misc_cg(cg_cleanup_sev->misc_cg);
++ 	cg_cleanup_sev->misc_cg = NULL;
++ out_unlock:
++ 	sev_unlock_two_vms(kvm, source_kvm);
++ out_fput:
++ 	if (source_kvm_file)
++ 		fput(source_kvm_file);
++ 	return ret;
++ }
++ 
++ int svm_mem_enc_ioctl(struct kvm *kvm, void __user *argp)
+++>>>>>>> 03d004cd0715 (KVM: x86: Use more verbose names for mem encrypt kvm_x86_ops hooks)
+  {
+  	struct kvm_sev_cmd sev_cmd;
+  	int r;
+* Unmerged path arch/x86/include/asm/kvm-x86-ops.h
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 96ecf6f2c1a5..1a3639d0918d 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1468,9 +1468,9 @@ struct kvm_x86_ops {
+ 	int (*leave_smm)(struct kvm_vcpu *vcpu, const char *smstate);
+ 	void (*enable_smi_window)(struct kvm_vcpu *vcpu);
+ 
+-	int (*mem_enc_op)(struct kvm *kvm, void __user *argp);
+-	int (*mem_enc_reg_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+-	int (*mem_enc_unreg_region)(struct kvm *kvm, struct kvm_enc_region *argp);
++	int (*mem_enc_ioctl)(struct kvm *kvm, void __user *argp);
++	int (*mem_enc_register_region)(struct kvm *kvm, struct kvm_enc_region *argp);
++	int (*mem_enc_unregister_region)(struct kvm *kvm, struct kvm_enc_region *argp);
+ 	int (*vm_copy_enc_context_from)(struct kvm *kvm, unsigned int source_fd);
+ 
+ 	int (*get_msr_feature)(struct kvm_msr_entry *entry);
+* Unmerged path arch/x86/kvm/svm/sev.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 11c1fc4d6fd4..6a7655a6d4cb 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -4564,9 +4564,9 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
+ 	.leave_smm = svm_leave_smm,
+ 	.enable_smi_window = svm_enable_smi_window,
+ 
+-	.mem_enc_op = svm_mem_enc_op,
+-	.mem_enc_reg_region = svm_register_enc_region,
+-	.mem_enc_unreg_region = svm_unregister_enc_region,
++	.mem_enc_ioctl = svm_mem_enc_ioctl,
++	.mem_enc_register_region = svm_register_enc_region,
++	.mem_enc_unregister_region = svm_unregister_enc_region,
+ 
+ 	.vm_copy_enc_context_from = svm_vm_copy_asid_from,
+ 
+diff --git a/arch/x86/kvm/svm/svm.h b/arch/x86/kvm/svm/svm.h
+index 0f269935a4ae..742e999888b5 100644
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@ -597,7 +597,7 @@ void svm_vcpu_unblocking(struct kvm_vcpu *vcpu);
+ extern unsigned int max_sev_asid;
+ 
+ void sev_vm_destroy(struct kvm *kvm);
+-int svm_mem_enc_op(struct kvm *kvm, void __user *argp);
++int svm_mem_enc_ioctl(struct kvm *kvm, void __user *argp);
+ int svm_register_enc_region(struct kvm *kvm,
+ 			    struct kvm_enc_region *range);
+ int svm_unregister_enc_region(struct kvm *kvm,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b7a417ad06ef..6e36ef268819 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -6411,8 +6411,10 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 	}
+ 	case KVM_MEMORY_ENCRYPT_OP: {
+ 		r = -ENOTTY;
+-		if (kvm_x86_ops.mem_enc_op)
+-			r = static_call(kvm_x86_mem_enc_op)(kvm, argp);
++		if (!kvm_x86_ops.mem_enc_ioctl)
++			goto out;
++
++		r = static_call(kvm_x86_mem_enc_ioctl)(kvm, argp);
+ 		break;
+ 	}
+ 	case KVM_MEMORY_ENCRYPT_REG_REGION: {
+@@ -6423,8 +6425,10 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 			goto out;
+ 
+ 		r = -ENOTTY;
+-		if (kvm_x86_ops.mem_enc_reg_region)
+-			r = static_call(kvm_x86_mem_enc_reg_region)(kvm, &region);
++		if (!kvm_x86_ops.mem_enc_register_region)
++			goto out;
++
++		r = static_call(kvm_x86_mem_enc_register_region)(kvm, &region);
+ 		break;
+ 	}
+ 	case KVM_MEMORY_ENCRYPT_UNREG_REGION: {
+@@ -6435,8 +6439,10 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 			goto out;
+ 
+ 		r = -ENOTTY;
+-		if (kvm_x86_ops.mem_enc_unreg_region)
+-			r = static_call(kvm_x86_mem_enc_unreg_region)(kvm, &region);
++		if (!kvm_x86_ops.mem_enc_unregister_region)
++			goto out;
++
++		r = static_call(kvm_x86_mem_enc_unregister_region)(kvm, &region);
+ 		break;
+ 	}
+ 	case KVM_HYPERV_EVENTFD: {
