@@ -132,13 +132,9 @@ struct switchdev_ops_extended_rh {
 /**
  * struct switchdev_ops - switchdev operations
  *
- * @switchdev_port_attr_get: Get a port attribute (see switchdev_attr).
- *
  * @switchdev_port_attr_set: Set a port attribute (see switchdev_attr).
  */
 struct switchdev_ops {
-	int	(*switchdev_port_attr_get)(struct net_device *dev,
-					   struct switchdev_attr *attr);
 	int	(*switchdev_port_attr_set)(struct net_device *dev,
 					   const struct switchdev_attr *attr,
 					   struct switchdev_trans *trans);
