@@ -1,0 +1,169 @@
+s390/pci: Improve handling of unset UID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 7a11c67a1ff9b0231eaaaa6a28294776d55b569a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7a11c67a.failed
+
+When UID checking is enabled a UID value of 0 is invalid and can not be
+set by the user. On z/VM it is however used to indicate an unset UID.
+Until now, this lead to the behavior that one PCI function could be
+attached with UID 0 after which z/VM would prohibit further attachment.
+
+Now if the user then turns off UID checking in z/VM the user could
+seemingly attach additional PCI functions that would however not show up
+in Linux as that would not be informed of the change in UID checking
+mode. This is unexpected and confusing and lead to bug reports against
+Linux.
+
+Instead now, if we encounter an unset UID value of 0 treat it as
+indicating that UID checking was turned off, switch to automatic domain
+allocation, and warn the user of the possible misconfiguration.
+
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Peter Oberparleiter <oberpar@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit 7a11c67a1ff9b0231eaaaa6a28294776d55b569a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index a6bd6f355af0,cf7485bdd7cf..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -606,73 -608,45 +606,92 @@@ void pcibios_disable_device(struct pci_
+  	zpci_debug_exit_device(zdev);
+  }
+  
+ -static int zpci_alloc_domain(struct zpci_dev *zdev)
+ +#ifdef CONFIG_HIBERNATE_CALLBACKS
+ +static int zpci_restore(struct device *dev)
+  {
+ -	spin_lock(&zpci_domain_lock);
+ -	if (zpci_num_domains_allocated > (ZPCI_NR_DEVICES - 1)) {
+ -		spin_unlock(&zpci_domain_lock);
+ -		pr_err("Adding PCI function %08x failed because the configured limit of %d is reached\n",
+ -			zdev->fid, ZPCI_NR_DEVICES);
+ -		return -ENOSPC;
+ -	}
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+ +	int ret = 0;
+ +
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		goto out;
+ +
+ +	ret = clp_enable_fh(zdev, ZPCI_NR_DMA_SPACES);
+ +	if (ret)
+ +		goto out;
+ +
+ +	zpci_map_resources(pdev);
+ +	zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ +			   (u64) zdev->dma_table);
+ +
+ +out:
+ +	return ret;
+ +}
+ +
+ +static int zpci_freeze(struct device *dev)
+ +{
+ +	struct pci_dev *pdev = to_pci_dev(dev);
+ +	struct zpci_dev *zdev = to_zpci(pdev);
+  
+ +	if (zdev->state != ZPCI_FN_STATE_ONLINE)
+ +		return 0;
+ +
+ +	zpci_unregister_ioat(zdev, 0);
+ +	zpci_unmap_resources(pdev);
+ +	return clp_disable_fh(zdev);
+ +}
+ +
+ +struct dev_pm_ops pcibios_pm_ops = {
+ +	.thaw_noirq = zpci_restore,
+ +	.freeze_noirq = zpci_freeze,
+ +	.restore_noirq = zpci_restore,
+ +	.poweroff_noirq = zpci_freeze,
+ +};
+ +#endif /* CONFIG_HIBERNATE_CALLBACKS */
+ +
+ +static int zpci_alloc_domain(struct zpci_dev *zdev)
+ +{
+  	if (zpci_unique_uid) {
+  		zdev->domain = (u16) zdev->uid;
+++<<<<<<< HEAD
+ +		if (zdev->domain >= ZPCI_NR_DEVICES)
+ +			return 0;
+ +
+ +		spin_lock(&zpci_domain_lock);
+++=======
++ 		if (zdev->domain == 0) {
++ 			pr_warn("UID checking is active but no UID is set for PCI function %08x, so automatic domain allocation is used instead\n",
++ 				zdev->fid);
++ 			update_uid_checking(false);
++ 			goto auto_allocate;
++ 		}
++ 
+++>>>>>>> 7a11c67a1ff9 (s390/pci: Improve handling of unset UID)
+  		if (test_bit(zdev->domain, zpci_domain)) {
+  			spin_unlock(&zpci_domain_lock);
+ -			pr_err("Adding PCI function %08x failed because domain %04x is already assigned\n",
+ -				zdev->fid, zdev->domain);
+  			return -EEXIST;
+  		}
+  		set_bit(zdev->domain, zpci_domain);
+  		spin_unlock(&zpci_domain_lock);
+  		return 0;
+  	}
+++<<<<<<< HEAD
+ +
+ +	spin_lock(&zpci_domain_lock);
+++=======
++ auto_allocate:
++ 	/*
++ 	 * We can always auto allocate domains below ZPCI_NR_DEVICES.
++ 	 * There is either a free domain or we have reached the maximum in
++ 	 * which case we would have bailed earlier.
++ 	 */
+++>>>>>>> 7a11c67a1ff9 (s390/pci: Improve handling of unset UID)
+  	zdev->domain = find_first_zero_bit(zpci_domain, ZPCI_NR_DEVICES);
+ +	if (zdev->domain == ZPCI_NR_DEVICES) {
+ +		spin_unlock(&zpci_domain_lock);
+ +		return -ENOSPC;
+ +	}
+  	set_bit(zdev->domain, zpci_domain);
+ -	zpci_num_domains_allocated++;
+  	spin_unlock(&zpci_domain_lock);
+  	return 0;
+  }
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index 54a96d9ffef0..c620dc141bdf 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -182,6 +182,9 @@ int clp_enable_fh(struct zpci_dev *, u8);
+ int clp_disable_fh(struct zpci_dev *);
+ int clp_get_state(u32 fid, enum zpci_state *state);
+ 
++/* UID */
++void update_uid_checking(bool new);
++
+ /* IOMMU Interface */
+ int zpci_init_iommu(struct zpci_dev *zdev);
+ void zpci_destroy_iommu(struct zpci_dev *zdev);
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_clp.c b/arch/s390/pci/pci_clp.c
+index cf08a9a5e743..d463b60a8c8e 100644
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -24,7 +24,7 @@
+ 
+ bool zpci_unique_uid;
+ 
+-static void update_uid_checking(bool new)
++void update_uid_checking(bool new)
+ {
+ 	if (zpci_unique_uid != new)
+ 		zpci_dbg(1, "uid checking:%d\n", new);
