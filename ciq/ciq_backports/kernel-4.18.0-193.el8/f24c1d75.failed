@@ -1,0 +1,236 @@
+perf tools: Introduce Zstd streaming based compression API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit f24c1d7523e6db26ec2115a308750c875927741b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f24c1d75.failed
+
+Implemented functions are based on Zstd streaming compression API.
+
+The functions are used in runtime to compress data that come from mmaped
+kernel buffer. zstd_init(), zstd_fini() are used for initialization and
+finalization to allocate and deallocate internal zstd objects.
+zstd_compress_stream_to_records() is used to convert parts of mmaped
+kernel buffer into an array of PERF_RECORD_COMPRESSED records.
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/18bf36f3-b85a-1fe2-dd83-10e0c6069568@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f24c1d7523e6db26ec2115a308750c875927741b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/Build
+diff --cc tools/perf/util/Build
+index c4cd5217b90e,6d5bbc8b589b..000000000000
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@@ -123,39 -126,41 +123,48 @@@ libperf-y += symbol-minimal.
+  endif
+  
+  ifndef CONFIG_SETNS
+ -perf-y += setns.o
+ +libperf-y += setns.o
+  endif
+  
+ -perf-$(CONFIG_DWARF) += probe-finder.o
+ -perf-$(CONFIG_DWARF) += dwarf-aux.o
+ -perf-$(CONFIG_DWARF) += dwarf-regs.o
+ +libperf-$(CONFIG_DWARF) += probe-finder.o
+ +libperf-$(CONFIG_DWARF) += dwarf-aux.o
+ +libperf-$(CONFIG_DWARF) += dwarf-regs.o
+  
+ -perf-$(CONFIG_LIBDW_DWARF_UNWIND) += unwind-libdw.o
+ -perf-$(CONFIG_LOCAL_LIBUNWIND)    += unwind-libunwind-local.o
+ -perf-$(CONFIG_LIBUNWIND)          += unwind-libunwind.o
+ -perf-$(CONFIG_LIBUNWIND_X86)      += libunwind/x86_32.o
+ -perf-$(CONFIG_LIBUNWIND_AARCH64)  += libunwind/arm64.o
+ +libperf-$(CONFIG_LIBDW_DWARF_UNWIND) += unwind-libdw.o
+ +libperf-$(CONFIG_LOCAL_LIBUNWIND)    += unwind-libunwind-local.o
+ +libperf-$(CONFIG_LIBUNWIND)          += unwind-libunwind.o
+ +libperf-$(CONFIG_LIBUNWIND_X86)      += libunwind/x86_32.o
+ +libperf-$(CONFIG_LIBUNWIND_AARCH64)  += libunwind/arm64.o
+  
+ -perf-$(CONFIG_LIBBABELTRACE) += data-convert-bt.o
+ +libperf-$(CONFIG_LIBBABELTRACE) += data-convert-bt.o
+  
+ -perf-y += scripting-engines/
+ +libperf-y += scripting-engines/
+  
+++<<<<<<< HEAD
+ +libperf-$(CONFIG_ZLIB) += zlib.o
+ +libperf-$(CONFIG_LZMA) += lzma.o
+ +libperf-y += demangle-java.o
+ +libperf-y += demangle-rust.o
+++=======
++ perf-$(CONFIG_ZLIB) += zlib.o
++ perf-$(CONFIG_LZMA) += lzma.o
++ perf-$(CONFIG_ZSTD) += zstd.o
++ 
++ perf-y += demangle-java.o
++ perf-y += demangle-rust.o
+++>>>>>>> f24c1d7523e6 (perf tools: Introduce Zstd streaming based compression API)
+  
+  ifdef CONFIG_JITDUMP
+ -perf-$(CONFIG_LIBELF) += jitdump.o
+ -perf-$(CONFIG_LIBELF) += genelf.o
+ -perf-$(CONFIG_DWARF) += genelf_debug.o
+ +libperf-$(CONFIG_LIBELF) += jitdump.o
+ +libperf-$(CONFIG_LIBELF) += genelf.o
+ +libperf-$(CONFIG_DWARF) += genelf_debug.o
+  endif
+  
+ -perf-y += perf-hooks.o
+ +libperf-y += perf-hooks.o
+  
+ -perf-$(CONFIG_LIBBPF) += bpf-event.o
+ +libperf-$(CONFIG_LIBBPF) += bpf-event.o
+  
+ -perf-$(CONFIG_CXX) += c++/
+ +libperf-$(CONFIG_CXX) += c++/
+  
+  CFLAGS_config.o   += -DETC_PERFCONFIG="BUILD_STR($(ETC_PERFCONFIG_SQ))"
+  CFLAGS_llvm-utils.o += -DPERF_INCLUDE_DIR="BUILD_STR($(perf_include_dir_SQ))"
+* Unmerged path tools/perf/util/Build
+diff --git a/tools/perf/util/compress.h b/tools/perf/util/compress.h
+index 892e92e7e7fc..1041a4fd81e2 100644
+--- a/tools/perf/util/compress.h
++++ b/tools/perf/util/compress.h
+@@ -2,6 +2,11 @@
+ #ifndef PERF_COMPRESS_H
+ #define PERF_COMPRESS_H
+ 
++#include <stdbool.h>
++#ifdef HAVE_ZSTD_SUPPORT
++#include <zstd.h>
++#endif
++
+ #ifdef HAVE_ZLIB_SUPPORT
+ int gzip_decompress_to_file(const char *input, int output_fd);
+ bool gzip_is_compressed(const char *input);
+@@ -12,4 +17,41 @@ int lzma_decompress_to_file(const char *input, int output_fd);
+ bool lzma_is_compressed(const char *input);
+ #endif
+ 
++struct zstd_data {
++#ifdef HAVE_ZSTD_SUPPORT
++	ZSTD_CStream	*cstream;
++#endif
++};
++
++#ifdef HAVE_ZSTD_SUPPORT
++
++int zstd_init(struct zstd_data *data, int level);
++int zstd_fini(struct zstd_data *data);
++
++size_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_t dst_size,
++				       void *src, size_t src_size, size_t max_record_size,
++				       size_t process_header(void *record, size_t increment));
++#else /* !HAVE_ZSTD_SUPPORT */
++
++static inline int zstd_init(struct zstd_data *data __maybe_unused, int level __maybe_unused)
++{
++	return 0;
++}
++
++static inline int zstd_fini(struct zstd_data *data __maybe_unused)
++{
++	return 0;
++}
++
++static inline
++size_t zstd_compress_stream_to_records(struct zstd_data *data __maybe_unused,
++				       void *dst __maybe_unused, size_t dst_size __maybe_unused,
++				       void *src __maybe_unused, size_t src_size __maybe_unused,
++				       size_t max_record_size __maybe_unused,
++				       size_t process_header(void *record, size_t increment) __maybe_unused)
++{
++	return 0;
++}
++#endif
++
+ #endif /* PERF_COMPRESS_H */
+diff --git a/tools/perf/util/zstd.c b/tools/perf/util/zstd.c
+new file mode 100644
+index 000000000000..359ec9a9d306
+--- /dev/null
++++ b/tools/perf/util/zstd.c
+@@ -0,0 +1,70 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <string.h>
++
++#include "util/compress.h"
++#include "util/debug.h"
++
++int zstd_init(struct zstd_data *data, int level)
++{
++	size_t ret;
++
++	data->cstream = ZSTD_createCStream();
++	if (data->cstream == NULL) {
++		pr_err("Couldn't create compression stream.\n");
++		return -1;
++	}
++
++	ret = ZSTD_initCStream(data->cstream, level);
++	if (ZSTD_isError(ret)) {
++		pr_err("Failed to initialize compression stream: %s\n", ZSTD_getErrorName(ret));
++		return -1;
++	}
++
++	return 0;
++}
++
++int zstd_fini(struct zstd_data *data)
++{
++	if (data->cstream) {
++		ZSTD_freeCStream(data->cstream);
++		data->cstream = NULL;
++	}
++
++	return 0;
++}
++
++size_t zstd_compress_stream_to_records(struct zstd_data *data, void *dst, size_t dst_size,
++				       void *src, size_t src_size, size_t max_record_size,
++				       size_t process_header(void *record, size_t increment))
++{
++	size_t ret, size, compressed = 0;
++	ZSTD_inBuffer input = { src, src_size, 0 };
++	ZSTD_outBuffer output;
++	void *record;
++
++	while (input.pos < input.size) {
++		record = dst;
++		size = process_header(record, 0);
++		compressed += size;
++		dst += size;
++		dst_size -= size;
++		output = (ZSTD_outBuffer){ dst, (dst_size > max_record_size) ?
++						max_record_size : dst_size, 0 };
++		ret = ZSTD_compressStream(data->cstream, &output, &input);
++		ZSTD_flushStream(data->cstream, &output);
++		if (ZSTD_isError(ret)) {
++			pr_err("failed to compress %ld bytes: %s\n",
++				(long)src_size, ZSTD_getErrorName(ret));
++			memcpy(dst, src, src_size);
++			return src_size;
++		}
++		size = output.pos;
++		size = process_header(record, size);
++		compressed += size;
++		dst += size;
++		dst_size -= size;
++	}
++
++	return compressed;
++}
