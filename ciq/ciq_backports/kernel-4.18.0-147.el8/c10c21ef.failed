@@ -1,0 +1,457 @@
+powerpc/vfio/iommu/kvm: Do not pin device memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit c10c21efa4bccab486c2e6a047c13dfa6cf7426c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c10c21ef.failed
+
+This new memory does not have page structs as it is not plugged to
+the host so gup() will fail anyway.
+
+This adds 2 helpers:
+- mm_iommu_newdev() to preregister the "memory device" memory so
+the rest of API can still be used;
+- mm_iommu_is_devmem() to know if the physical address is one of thise
+new regions which we must avoid unpinning of.
+
+This adds @mm to tce_page_is_contained() and iommu_tce_xchg() to test
+if the memory is device memory to avoid pfn_to_page().
+
+This adds a check for device memory in mm_iommu_ua_mark_dirty_rm() which
+does delayed pages dirtying.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reviewed-by: Paul Mackerras <paulus@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit c10c21efa4bccab486c2e6a047c13dfa6cf7426c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_64_vio.c
+diff --cc arch/powerpc/kvm/book3s_64_vio.c
+index 91c1b8e93f47,532ab79734c7..000000000000
+--- a/arch/powerpc/kvm/book3s_64_vio.c
++++ b/arch/powerpc/kvm/book3s_64_vio.c
+@@@ -569,14 -566,10 +570,19 @@@ long kvmppc_h_put_tce(struct kvm_vcpu *
+  			ret = kvmppc_tce_iommu_map(vcpu->kvm, stt, stit->tbl,
+  					entry, ua, dir);
+  
+++<<<<<<< HEAD
+ +		if (ret == H_SUCCESS)
+ +			continue;
+ +
+ +		if (ret == H_TOO_HARD)
+++=======
++ 		if (ret != H_SUCCESS) {
++ 			kvmppc_clear_tce(vcpu->kvm->mm, stit->tbl, entry);
+++>>>>>>> c10c21efa4bc (powerpc/vfio/iommu/kvm: Do not pin device memory)
+  			goto unlock_exit;
+ -		}
+ +
+ +		WARN_ON_ONCE(1);
+ +		kvmppc_clear_tce(stit->tbl, entry);
+  	}
+  
+  	kvmppc_tce_put(stt, entry, tce);
+@@@ -646,14 -655,11 +652,20 @@@ long kvmppc_h_put_tce_indirect(struct k
+  					stit->tbl, entry + i, ua,
+  					iommu_tce_direction(tce));
+  
+++<<<<<<< HEAD
+ +			if (ret == H_SUCCESS)
+ +				continue;
+ +
+ +			if (ret == H_TOO_HARD)
+++=======
++ 			if (ret != H_SUCCESS) {
++ 				kvmppc_clear_tce(vcpu->kvm->mm, stit->tbl,
++ 						entry);
+++>>>>>>> c10c21efa4bc (powerpc/vfio/iommu/kvm: Do not pin device memory)
+  				goto unlock_exit;
+ -			}
+ +
+ +			WARN_ON_ONCE(1);
+ +			kvmppc_clear_tce(stit->tbl, entry);
+  		}
+  
+  		kvmppc_tce_put(stt, entry + i, tce);
+diff --git a/arch/powerpc/include/asm/iommu.h b/arch/powerpc/include/asm/iommu.h
+index 1317e3bcabe8..b2440808e433 100644
+--- a/arch/powerpc/include/asm/iommu.h
++++ b/arch/powerpc/include/asm/iommu.h
+@@ -215,8 +215,9 @@ extern void iommu_register_group(struct iommu_table_group *table_group,
+ extern int iommu_add_device(struct device *dev);
+ extern void iommu_del_device(struct device *dev);
+ extern int __init tce_iommu_bus_notifier_init(void);
+-extern long iommu_tce_xchg(struct iommu_table *tbl, unsigned long entry,
+-		unsigned long *hpa, enum dma_data_direction *direction);
++extern long iommu_tce_xchg(struct mm_struct *mm, struct iommu_table *tbl,
++		unsigned long entry, unsigned long *hpa,
++		enum dma_data_direction *direction);
+ #else
+ static inline void iommu_register_group(struct iommu_table_group *table_group,
+ 					int pci_domain_number,
+diff --git a/arch/powerpc/include/asm/mmu_context.h b/arch/powerpc/include/asm/mmu_context.h
+index 59d4941d2abf..f5585d947f20 100644
+--- a/arch/powerpc/include/asm/mmu_context.h
++++ b/arch/powerpc/include/asm/mmu_context.h
+@@ -24,6 +24,9 @@ extern bool mm_iommu_preregistered(struct mm_struct *mm);
+ extern long mm_iommu_new(struct mm_struct *mm,
+ 		unsigned long ua, unsigned long entries,
+ 		struct mm_iommu_table_group_mem_t **pmem);
++extern long mm_iommu_newdev(struct mm_struct *mm, unsigned long ua,
++		unsigned long entries, unsigned long dev_hpa,
++		struct mm_iommu_table_group_mem_t **pmem);
+ extern long mm_iommu_put(struct mm_struct *mm,
+ 		struct mm_iommu_table_group_mem_t *mem);
+ extern void mm_iommu_init(struct mm_struct *mm);
+@@ -39,8 +42,16 @@ extern long mm_iommu_ua_to_hpa(struct mm_iommu_table_group_mem_t *mem,
+ extern long mm_iommu_ua_to_hpa_rm(struct mm_iommu_table_group_mem_t *mem,
+ 		unsigned long ua, unsigned int pageshift, unsigned long *hpa);
+ extern void mm_iommu_ua_mark_dirty_rm(struct mm_struct *mm, unsigned long ua);
++extern bool mm_iommu_is_devmem(struct mm_struct *mm, unsigned long hpa,
++		unsigned int pageshift, unsigned long *size);
+ extern long mm_iommu_mapped_inc(struct mm_iommu_table_group_mem_t *mem);
+ extern void mm_iommu_mapped_dec(struct mm_iommu_table_group_mem_t *mem);
++#else
++static inline bool mm_iommu_is_devmem(struct mm_struct *mm, unsigned long hpa,
++		unsigned int pageshift, unsigned long *size)
++{
++	return false;
++}
+ #endif
+ extern void switch_slb(struct task_struct *tsk, struct mm_struct *mm);
+ extern void set_context(unsigned long id, pgd_t *pgd);
+diff --git a/arch/powerpc/kernel/iommu.c b/arch/powerpc/kernel/iommu.c
+index 3ce4dc23d0ef..6de8799bd457 100644
+--- a/arch/powerpc/kernel/iommu.c
++++ b/arch/powerpc/kernel/iommu.c
+@@ -47,6 +47,7 @@
+ #include <asm/fadump.h>
+ #include <asm/vio.h>
+ #include <asm/tce.h>
++#include <asm/mmu_context.h>
+ 
+ #define DBG(...)
+ 
+@@ -993,15 +994,19 @@ int iommu_tce_check_gpa(unsigned long page_shift, unsigned long gpa)
+ }
+ EXPORT_SYMBOL_GPL(iommu_tce_check_gpa);
+ 
+-long iommu_tce_xchg(struct iommu_table *tbl, unsigned long entry,
+-		unsigned long *hpa, enum dma_data_direction *direction)
++long iommu_tce_xchg(struct mm_struct *mm, struct iommu_table *tbl,
++		unsigned long entry, unsigned long *hpa,
++		enum dma_data_direction *direction)
+ {
+ 	long ret;
++	unsigned long size = 0;
+ 
+ 	ret = tbl->it_ops->exchange(tbl, entry, hpa, direction);
+ 
+ 	if (!ret && ((*direction == DMA_FROM_DEVICE) ||
+-			(*direction == DMA_BIDIRECTIONAL)))
++			(*direction == DMA_BIDIRECTIONAL)) &&
++			!mm_iommu_is_devmem(mm, *hpa, tbl->it_page_shift,
++					&size))
+ 		SetPageDirty(pfn_to_page(*hpa >> PAGE_SHIFT));
+ 
+ 	/* if (unlikely(ret))
+* Unmerged path arch/powerpc/kvm/book3s_64_vio.c
+diff --git a/arch/powerpc/mm/mmu_context_iommu.c b/arch/powerpc/mm/mmu_context_iommu.c
+index ce8cc69f7901..a712a650a8b6 100644
+--- a/arch/powerpc/mm/mmu_context_iommu.c
++++ b/arch/powerpc/mm/mmu_context_iommu.c
+@@ -36,6 +36,8 @@ struct mm_iommu_table_group_mem_t {
+ 	u64 ua;			/* userspace address */
+ 	u64 entries;		/* number of entries in hpas[] */
+ 	u64 *hpas;		/* vmalloc'ed */
++#define MM_IOMMU_TABLE_INVALID_HPA	((uint64_t)-1)
++	u64 dev_hpa;		/* Device memory base address */
+ };
+ 
+ static long mm_iommu_adjust_locked_vm(struct mm_struct *mm,
+@@ -126,7 +128,8 @@ static int mm_iommu_move_page_from_cma(struct page *page)
+ 	return 0;
+ }
+ 
+-long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
++static long mm_iommu_do_alloc(struct mm_struct *mm, unsigned long ua,
++		unsigned long entries, unsigned long dev_hpa,
+ 		struct mm_iommu_table_group_mem_t **pmem)
+ {
+ 	struct mm_iommu_table_group_mem_t *mem;
+@@ -150,11 +153,13 @@ long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ 
+ 	}
+ 
+-	ret = mm_iommu_adjust_locked_vm(mm, entries, true);
+-	if (ret)
+-		goto unlock_exit;
++	if (dev_hpa == MM_IOMMU_TABLE_INVALID_HPA) {
++		ret = mm_iommu_adjust_locked_vm(mm, entries, true);
++		if (ret)
++			goto unlock_exit;
+ 
+-	locked_entries = entries;
++		locked_entries = entries;
++	}
+ 
+ 	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+ 	if (!mem) {
+@@ -162,6 +167,13 @@ long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ 		goto unlock_exit;
+ 	}
+ 
++	if (dev_hpa != MM_IOMMU_TABLE_INVALID_HPA) {
++		mem->pageshift = __ffs(dev_hpa | (entries << PAGE_SHIFT));
++		mem->dev_hpa = dev_hpa;
++		goto good_exit;
++	}
++	mem->dev_hpa = MM_IOMMU_TABLE_INVALID_HPA;
++
+ 	/*
+ 	 * For a starting point for a maximum page size calculation
+ 	 * we use @ua and @entries natural alignment to allow IOMMU pages
+@@ -230,6 +242,7 @@ long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ 		mem->hpas[i] = page_to_pfn(page) << PAGE_SHIFT;
+ 	}
+ 
++good_exit:
+ 	atomic64_set(&mem->mapped, 1);
+ 	mem->used = 1;
+ 	mem->ua = ua;
+@@ -246,13 +259,31 @@ long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ 
+ 	return ret;
+ }
++
++long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
++		struct mm_iommu_table_group_mem_t **pmem)
++{
++	return mm_iommu_do_alloc(mm, ua, entries, MM_IOMMU_TABLE_INVALID_HPA,
++			pmem);
++}
+ EXPORT_SYMBOL_GPL(mm_iommu_new);
+ 
++long mm_iommu_newdev(struct mm_struct *mm, unsigned long ua,
++		unsigned long entries, unsigned long dev_hpa,
++		struct mm_iommu_table_group_mem_t **pmem)
++{
++	return mm_iommu_do_alloc(mm, ua, entries, dev_hpa, pmem);
++}
++EXPORT_SYMBOL_GPL(mm_iommu_newdev);
++
+ static void mm_iommu_unpin(struct mm_iommu_table_group_mem_t *mem)
+ {
+ 	long i;
+ 	struct page *page = NULL;
+ 
++	if (!mem->hpas)
++		return;
++
+ 	for (i = 0; i < mem->entries; ++i) {
+ 		if (!mem->hpas[i])
+ 			continue;
+@@ -294,6 +325,7 @@ static void mm_iommu_release(struct mm_iommu_table_group_mem_t *mem)
+ long mm_iommu_put(struct mm_struct *mm, struct mm_iommu_table_group_mem_t *mem)
+ {
+ 	long ret = 0;
++	unsigned long entries, dev_hpa;
+ 
+ 	mutex_lock(&mem_list_mutex);
+ 
+@@ -315,9 +347,12 @@ long mm_iommu_put(struct mm_struct *mm, struct mm_iommu_table_group_mem_t *mem)
+ 	}
+ 
+ 	/* @mapped became 0 so now mappings are disabled, release the region */
++	entries = mem->entries;
++	dev_hpa = mem->dev_hpa;
+ 	mm_iommu_release(mem);
+ 
+-	mm_iommu_adjust_locked_vm(mm, mem->entries, false);
++	if (dev_hpa == MM_IOMMU_TABLE_INVALID_HPA)
++		mm_iommu_adjust_locked_vm(mm, entries, false);
+ 
+ unlock_exit:
+ 	mutex_unlock(&mem_list_mutex);
+@@ -387,7 +422,7 @@ long mm_iommu_ua_to_hpa(struct mm_iommu_table_group_mem_t *mem,
+ 		unsigned long ua, unsigned int pageshift, unsigned long *hpa)
+ {
+ 	const long entry = (ua - mem->ua) >> PAGE_SHIFT;
+-	u64 *va = &mem->hpas[entry];
++	u64 *va;
+ 
+ 	if (entry >= mem->entries)
+ 		return -EFAULT;
+@@ -395,6 +430,12 @@ long mm_iommu_ua_to_hpa(struct mm_iommu_table_group_mem_t *mem,
+ 	if (pageshift > mem->pageshift)
+ 		return -EFAULT;
+ 
++	if (!mem->hpas) {
++		*hpa = mem->dev_hpa + (ua - mem->ua);
++		return 0;
++	}
++
++	va = &mem->hpas[entry];
+ 	*hpa = (*va & MM_IOMMU_TABLE_GROUP_PAGE_MASK) | (ua & ~PAGE_MASK);
+ 
+ 	return 0;
+@@ -405,7 +446,6 @@ long mm_iommu_ua_to_hpa_rm(struct mm_iommu_table_group_mem_t *mem,
+ 		unsigned long ua, unsigned int pageshift, unsigned long *hpa)
+ {
+ 	const long entry = (ua - mem->ua) >> PAGE_SHIFT;
+-	void *va = &mem->hpas[entry];
+ 	unsigned long *pa;
+ 
+ 	if (entry >= mem->entries)
+@@ -414,7 +454,12 @@ long mm_iommu_ua_to_hpa_rm(struct mm_iommu_table_group_mem_t *mem,
+ 	if (pageshift > mem->pageshift)
+ 		return -EFAULT;
+ 
+-	pa = (void *) vmalloc_to_phys(va);
++	if (!mem->hpas) {
++		*hpa = mem->dev_hpa + (ua - mem->ua);
++		return 0;
++	}
++
++	pa = (void *) vmalloc_to_phys(&mem->hpas[entry]);
+ 	if (!pa)
+ 		return -EFAULT;
+ 
+@@ -434,6 +479,9 @@ extern void mm_iommu_ua_mark_dirty_rm(struct mm_struct *mm, unsigned long ua)
+ 	if (!mem)
+ 		return;
+ 
++	if (mem->dev_hpa != MM_IOMMU_TABLE_INVALID_HPA)
++		return;
++
+ 	entry = (ua - mem->ua) >> PAGE_SHIFT;
+ 	va = &mem->hpas[entry];
+ 
+@@ -444,6 +492,33 @@ extern void mm_iommu_ua_mark_dirty_rm(struct mm_struct *mm, unsigned long ua)
+ 	*pa |= MM_IOMMU_TABLE_GROUP_PAGE_DIRTY;
+ }
+ 
++bool mm_iommu_is_devmem(struct mm_struct *mm, unsigned long hpa,
++		unsigned int pageshift, unsigned long *size)
++{
++	struct mm_iommu_table_group_mem_t *mem;
++	unsigned long end;
++
++	list_for_each_entry_rcu(mem, &mm->context.iommu_group_mem_list, next) {
++		if (mem->dev_hpa == MM_IOMMU_TABLE_INVALID_HPA)
++			continue;
++
++		end = mem->dev_hpa + (mem->entries << PAGE_SHIFT);
++		if ((mem->dev_hpa <= hpa) && (hpa < end)) {
++			/*
++			 * Since the IOMMU page size might be bigger than
++			 * PAGE_SIZE, the amount of preregistered memory
++			 * starting from @hpa might be smaller than 1<<pageshift
++			 * and the caller needs to distinguish this situation.
++			 */
++			*size = min(1UL << pageshift, end - hpa);
++			return true;
++		}
++	}
++
++	return false;
++}
++EXPORT_SYMBOL_GPL(mm_iommu_is_devmem);
++
+ long mm_iommu_mapped_inc(struct mm_iommu_table_group_mem_t *mem)
+ {
+ 	if (atomic64_inc_not_zero(&mem->mapped))
+diff --git a/drivers/vfio/vfio_iommu_spapr_tce.c b/drivers/vfio/vfio_iommu_spapr_tce.c
+index f12b04196b8e..51361fc7a173 100644
+--- a/drivers/vfio/vfio_iommu_spapr_tce.c
++++ b/drivers/vfio/vfio_iommu_spapr_tce.c
+@@ -222,8 +222,16 @@ static long tce_iommu_register_pages(struct tce_container *container,
+ 	return ret;
+ }
+ 
+-static bool tce_page_is_contained(struct page *page, unsigned page_shift)
++static bool tce_page_is_contained(struct mm_struct *mm, unsigned long hpa,
++		unsigned int page_shift)
+ {
++	struct page *page;
++	unsigned long size = 0;
++
++	if (mm_iommu_is_devmem(mm, hpa, page_shift, &size))
++		return size == (1UL << page_shift);
++
++	page = pfn_to_page(hpa >> PAGE_SHIFT);
+ 	/*
+ 	 * Check that the TCE table granularity is not bigger than the size of
+ 	 * a page we just found. Otherwise the hardware can get access to
+@@ -484,7 +492,8 @@ static int tce_iommu_clear(struct tce_container *container,
+ 
+ 		direction = DMA_NONE;
+ 		oldhpa = 0;
+-		ret = iommu_tce_xchg(tbl, entry, &oldhpa, &direction);
++		ret = iommu_tce_xchg(container->mm, tbl, entry, &oldhpa,
++				&direction);
+ 		if (ret)
+ 			continue;
+ 
+@@ -522,7 +531,6 @@ static long tce_iommu_build(struct tce_container *container,
+ 		enum dma_data_direction direction)
+ {
+ 	long i, ret = 0;
+-	struct page *page;
+ 	unsigned long hpa;
+ 	enum dma_data_direction dirtmp;
+ 
+@@ -533,15 +541,16 @@ static long tce_iommu_build(struct tce_container *container,
+ 		if (ret)
+ 			break;
+ 
+-		page = pfn_to_page(hpa >> PAGE_SHIFT);
+-		if (!tce_page_is_contained(page, tbl->it_page_shift)) {
++		if (!tce_page_is_contained(container->mm, hpa,
++				tbl->it_page_shift)) {
+ 			ret = -EPERM;
+ 			break;
+ 		}
+ 
+ 		hpa |= offset;
+ 		dirtmp = direction;
+-		ret = iommu_tce_xchg(tbl, entry + i, &hpa, &dirtmp);
++		ret = iommu_tce_xchg(container->mm, tbl, entry + i, &hpa,
++				&dirtmp);
+ 		if (ret) {
+ 			tce_iommu_unuse_page(container, hpa);
+ 			pr_err("iommu_tce: %s failed ioba=%lx, tce=%lx, ret=%ld\n",
+@@ -568,7 +577,6 @@ static long tce_iommu_build_v2(struct tce_container *container,
+ 		enum dma_data_direction direction)
+ {
+ 	long i, ret = 0;
+-	struct page *page;
+ 	unsigned long hpa;
+ 	enum dma_data_direction dirtmp;
+ 
+@@ -581,8 +589,8 @@ static long tce_iommu_build_v2(struct tce_container *container,
+ 		if (ret)
+ 			break;
+ 
+-		page = pfn_to_page(hpa >> PAGE_SHIFT);
+-		if (!tce_page_is_contained(page, tbl->it_page_shift)) {
++		if (!tce_page_is_contained(container->mm, hpa,
++				tbl->it_page_shift)) {
+ 			ret = -EPERM;
+ 			break;
+ 		}
+@@ -595,7 +603,8 @@ static long tce_iommu_build_v2(struct tce_container *container,
+ 		if (mm_iommu_mapped_inc(mem))
+ 			break;
+ 
+-		ret = iommu_tce_xchg(tbl, entry + i, &hpa, &dirtmp);
++		ret = iommu_tce_xchg(container->mm, tbl, entry + i, &hpa,
++				&dirtmp);
+ 		if (ret) {
+ 			/* dirtmp cannot be DMA_NONE here */
+ 			tce_iommu_unuse_page_v2(container, tbl, entry + i);
