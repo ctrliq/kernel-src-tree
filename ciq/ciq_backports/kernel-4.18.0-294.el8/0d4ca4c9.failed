@@ -1,0 +1,132 @@
+mm/kasan: add object validation in ksize()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marco Elver <elver@google.com>
+commit 0d4ca4c9bab397b525c9a4f875d31410ce4bc738
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0d4ca4c9.failed
+
+ksize() has been unconditionally unpoisoning the whole shadow memory
+region associated with an allocation.  This can lead to various undetected
+bugs, for example, double-kzfree().
+
+Specifically, kzfree() uses ksize() to determine the actual allocation
+size, and subsequently zeroes the memory.  Since ksize() used to just
+unpoison the whole shadow memory region, no invalid free was detected.
+
+This patch addresses this as follows:
+
+1. Add a check in ksize(), and only then unpoison the memory region.
+
+2. Preserve kasan_unpoison_slab() semantics by explicitly unpoisoning
+   the shadow memory region using the size obtained from __ksize().
+
+Tested:
+1. With SLAB allocator: a) normal boot without warnings; b) verified the
+   added double-kzfree() is detected.
+2. With SLUB allocator: a) normal boot without warnings; b) verified the
+   added double-kzfree() is detected.
+
+[elver@google.com: s/BUG_ON/WARN_ON_ONCE/, per Kees]
+  Link: http://lkml.kernel.org/r/20190627094445.216365-6-elver@google.com
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=199359
+Link: http://lkml.kernel.org/r/20190626142014.141844-6-elver@google.com
+	Signed-off-by: Marco Elver <elver@google.com>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0d4ca4c9bab397b525c9a4f875d31410ce4bc738)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab_common.c
+diff --cc mm/slab_common.c
+index d38e88435224,a09bb10aa026..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -1696,6 -1597,52 +1696,55 @@@ void kzfree(const void *p
+  }
+  EXPORT_SYMBOL(kzfree);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ksize - get the actual amount of memory allocated for a given object
++  * @objp: Pointer to the object
++  *
++  * kmalloc may internally round up allocations and return more memory
++  * than requested. ksize() can be used to determine the actual amount of
++  * memory allocated. The caller may use this additional memory, even though
++  * a smaller amount of memory was initially specified with the kmalloc call.
++  * The caller must guarantee that objp points to a valid object previously
++  * allocated with either kmalloc() or kmem_cache_alloc(). The object
++  * must not be freed during the duration of the call.
++  *
++  * Return: size of the actual memory used by @objp in bytes
++  */
++ size_t ksize(const void *objp)
++ {
++ 	size_t size;
++ 
++ 	if (WARN_ON_ONCE(!objp))
++ 		return 0;
++ 	/*
++ 	 * We need to check that the pointed to object is valid, and only then
++ 	 * unpoison the shadow memory below. We use __kasan_check_read(), to
++ 	 * generate a more useful report at the time ksize() is called (rather
++ 	 * than later where behaviour is undefined due to potential
++ 	 * use-after-free or double-free).
++ 	 *
++ 	 * If the pointed to memory is invalid we return 0, to avoid users of
++ 	 * ksize() writing to and potentially corrupting the memory region.
++ 	 *
++ 	 * We want to perform the check before __ksize(), to avoid potentially
++ 	 * crashing in __ksize() due to accessing invalid metadata.
++ 	 */
++ 	if (unlikely(objp == ZERO_SIZE_PTR) || !__kasan_check_read(objp, 1))
++ 		return 0;
++ 
++ 	size = __ksize(objp);
++ 	/*
++ 	 * We assume that ksize callers could use whole allocated area,
++ 	 * so we need to unpoison this area.
++ 	 */
++ 	kasan_unpoison_shadow(objp, size);
++ 	return size;
++ }
++ EXPORT_SYMBOL(ksize);
++ 
+++>>>>>>> 0d4ca4c9bab3 (mm/kasan: add object validation in ksize())
+  /* Tracepoints definitions. */
+  EXPORT_TRACEPOINT_SYMBOL(kmalloc);
+  EXPORT_TRACEPOINT_SYMBOL(kmem_cache_alloc);
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index 1e5ac58e377c..140bc29ac5bc 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -78,8 +78,11 @@ void kasan_free_shadow(const struct vm_struct *vm);
+ int kasan_add_zero_shadow(void *start, unsigned long size);
+ void kasan_remove_zero_shadow(void *start, unsigned long size);
+ 
+-size_t ksize(const void *);
+-static inline void kasan_unpoison_slab(const void *ptr) { ksize(ptr); }
++size_t __ksize(const void *);
++static inline void kasan_unpoison_slab(const void *ptr)
++{
++	kasan_unpoison_shadow(ptr, __ksize(ptr));
++}
+ size_t kasan_metadata_size(struct kmem_cache *cache);
+ 
+ bool kasan_save_enable_multi_shot(void);
+* Unmerged path mm/slab_common.c
