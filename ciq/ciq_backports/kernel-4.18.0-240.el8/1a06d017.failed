@@ -1,0 +1,287 @@
+Drivers: hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [hv] hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM (Mohammed Gamal) [1815475]
+Rebuild_FUZZ: 91.74%
+commit-author Dexuan Cui <decui@microsoft.com>
+commit 1a06d017fb3f388734ffbe5dedee6f8c3af5f2db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1a06d017.failed
+
+Before the hibernation patchset (e.g. f53335e3289f), in a Generation-2
+Linux VM on Hyper-V, the user can run "echo freeze > /sys/power/state" to
+freeze the system, i.e. Suspend-to-Idle. The user can press the keyboard
+or move the mouse to wake up the VM.
+
+With the hibernation patchset, Linux VM on Hyper-V can hibernate to disk,
+but Suspend-to-Idle is broken: when the synthetic keyboard/mouse are
+suspended, there is no way to wake up the VM.
+
+Fix the issue by not suspending and resuming the vmbus devices upon
+Suspend-to-Idle.
+
+Fixes: f53335e3289f ("Drivers: hv: vmbus: Suspend/resume the vmbus itself for hibernation")
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Michael Kelley <mikelley@microsoft.com>
+	Signed-off-by: Dexuan Cui <decui@microsoft.com>
+Link: https://lore.kernel.org/r/1586663435-36243-1-git-send-email-decui@microsoft.com
+	Signed-off-by: Wei Liu <wei.liu@kernel.org>
+(cherry picked from commit 1a06d017fb3f388734ffbe5dedee6f8c3af5f2db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hv/vmbus_drv.c
+diff --cc drivers/hv/vmbus_drv.c
+index 698977f33670,e06c6b9555cf..000000000000
+--- a/drivers/hv/vmbus_drv.c
++++ b/drivers/hv/vmbus_drv.c
+@@@ -922,6 -940,48 +922,51 @@@ static void vmbus_shutdown(struct devic
+  		drv->shutdown(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_SLEEP
++ /*
++  * vmbus_suspend - Suspend a vmbus device
++  */
++ static int vmbus_suspend(struct device *child_device)
++ {
++ 	struct hv_driver *drv;
++ 	struct hv_device *dev = device_to_hv_device(child_device);
++ 
++ 	/* The device may not be attached yet */
++ 	if (!child_device->driver)
++ 		return 0;
++ 
++ 	drv = drv_to_hv_drv(child_device->driver);
++ 	if (!drv->suspend)
++ 		return -EOPNOTSUPP;
++ 
++ 	return drv->suspend(dev);
++ }
++ 
++ /*
++  * vmbus_resume - Resume a vmbus device
++  */
++ static int vmbus_resume(struct device *child_device)
++ {
++ 	struct hv_driver *drv;
++ 	struct hv_device *dev = device_to_hv_device(child_device);
++ 
++ 	/* The device may not be attached yet */
++ 	if (!child_device->driver)
++ 		return 0;
++ 
++ 	drv = drv_to_hv_drv(child_device->driver);
++ 	if (!drv->resume)
++ 		return -EOPNOTSUPP;
++ 
++ 	return drv->resume(dev);
++ }
++ #else
++ #define vmbus_suspend NULL
++ #define vmbus_resume NULL
++ #endif /* CONFIG_PM_SLEEP */
+++>>>>>>> 1a06d017fb3f (Drivers: hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM)
+  
+  /*
+   * vmbus_device_release - Final callback release of the vmbus child device
+@@@ -937,6 -999,25 +982,28 @@@ static void vmbus_device_release(struc
+  	kfree(hv_dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Note: we must use the "noirq" ops: see the comment before vmbus_bus_pm.
++  *
++  * suspend_noirq/resume_noirq are set to NULL to support Suspend-to-Idle: we
++  * shouldn't suspend the vmbus devices upon Suspend-to-Idle, otherwise there
++  * is no way to wake up a Generation-2 VM.
++  *
++  * The other 4 ops are for hibernation.
++  */
++ 
++ static const struct dev_pm_ops vmbus_pm = {
++ 	.suspend_noirq	= NULL,
++ 	.resume_noirq	= NULL,
++ 	.freeze_noirq	= vmbus_suspend,
++ 	.thaw_noirq	= vmbus_resume,
++ 	.poweroff_noirq	= vmbus_suspend,
++ 	.restore_noirq	= vmbus_resume,
++ };
++ 
+++>>>>>>> 1a06d017fb3f (Drivers: hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM)
+  /* The one and only one */
+  static struct bus_type  hv_bus = {
+  	.name =		"vmbus",
+@@@ -2057,6 -2175,131 +2124,134 @@@ acpi_walk_err
+  	return ret_val;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_PM_SLEEP
++ static int vmbus_bus_suspend(struct device *dev)
++ {
++ 	struct vmbus_channel *channel, *sc;
++ 	unsigned long flags;
++ 
++ 	while (atomic_read(&vmbus_connection.offer_in_progress) != 0) {
++ 		/*
++ 		 * We wait here until the completion of any channel
++ 		 * offers that are currently in progress.
++ 		 */
++ 		msleep(1);
++ 	}
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		if (!is_hvsock_channel(channel))
++ 			continue;
++ 
++ 		vmbus_force_channel_rescinded(channel);
++ 	}
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	/*
++ 	 * Wait until all the sub-channels and hv_sock channels have been
++ 	 * cleaned up. Sub-channels should be destroyed upon suspend, otherwise
++ 	 * they would conflict with the new sub-channels that will be created
++ 	 * in the resume path. hv_sock channels should also be destroyed, but
++ 	 * a hv_sock channel of an established hv_sock connection can not be
++ 	 * really destroyed since it may still be referenced by the userspace
++ 	 * application, so we just force the hv_sock channel to be rescinded
++ 	 * by vmbus_force_channel_rescinded(), and the userspace application
++ 	 * will thoroughly destroy the channel after hibernation.
++ 	 *
++ 	 * Note: the counter nr_chan_close_on_suspend may never go above 0 if
++ 	 * the VM has no sub-channel and hv_sock channel, e.g. a 1-vCPU VM.
++ 	 */
++ 	if (atomic_read(&vmbus_connection.nr_chan_close_on_suspend) > 0)
++ 		wait_for_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) != 0);
++ 
++ 	mutex_lock(&vmbus_connection.channel_mutex);
++ 
++ 	list_for_each_entry(channel, &vmbus_connection.chn_list, listentry) {
++ 		/*
++ 		 * Invalidate the field. Upon resume, vmbus_onoffer() will fix
++ 		 * up the field, and the other fields (if necessary).
++ 		 */
++ 		channel->offermsg.child_relid = INVALID_RELID;
++ 
++ 		if (is_hvsock_channel(channel)) {
++ 			if (!channel->rescind) {
++ 				pr_err("hv_sock channel not rescinded!\n");
++ 				WARN_ON_ONCE(1);
++ 			}
++ 			continue;
++ 		}
++ 
++ 		spin_lock_irqsave(&channel->lock, flags);
++ 		list_for_each_entry(sc, &channel->sc_list, sc_list) {
++ 			pr_err("Sub-channel not deleted!\n");
++ 			WARN_ON_ONCE(1);
++ 		}
++ 		spin_unlock_irqrestore(&channel->lock, flags);
++ 
++ 		atomic_inc(&vmbus_connection.nr_chan_fixup_on_resume);
++ 	}
++ 
++ 	mutex_unlock(&vmbus_connection.channel_mutex);
++ 
++ 	vmbus_initiate_unload(false);
++ 
++ 	/* Reset the event for the next resume. */
++ 	reinit_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	return 0;
++ }
++ 
++ static int vmbus_bus_resume(struct device *dev)
++ {
++ 	struct vmbus_channel_msginfo *msginfo;
++ 	size_t msgsize;
++ 	int ret;
++ 
++ 	/*
++ 	 * We only use the 'vmbus_proto_version', which was in use before
++ 	 * hibernation, to re-negotiate with the host.
++ 	 */
++ 	if (!vmbus_proto_version) {
++ 		pr_err("Invalid proto version = 0x%x\n", vmbus_proto_version);
++ 		return -EINVAL;
++ 	}
++ 
++ 	msgsize = sizeof(*msginfo) +
++ 		  sizeof(struct vmbus_channel_initiate_contact);
++ 
++ 	msginfo = kzalloc(msgsize, GFP_KERNEL);
++ 
++ 	if (msginfo == NULL)
++ 		return -ENOMEM;
++ 
++ 	ret = vmbus_negotiate_version(msginfo, vmbus_proto_version);
++ 
++ 	kfree(msginfo);
++ 
++ 	if (ret != 0)
++ 		return ret;
++ 
++ 	WARN_ON(atomic_read(&vmbus_connection.nr_chan_fixup_on_resume) == 0);
++ 
++ 	vmbus_request_offers();
++ 
++ 	wait_for_completion(&vmbus_connection.ready_for_resume_event);
++ 
++ 	/* Reset the event for the next suspend. */
++ 	reinit_completion(&vmbus_connection.ready_for_suspend_event);
++ 
++ 	return 0;
++ }
++ #else
++ #define vmbus_bus_suspend NULL
++ #define vmbus_bus_resume NULL
++ #endif /* CONFIG_PM_SLEEP */
++ 
+++>>>>>>> 1a06d017fb3f (Drivers: hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM)
+  static const struct acpi_device_id vmbus_acpi_device_ids[] = {
+  	{"VMBUS", 0},
+  	{"VMBus", 0},
+@@@ -2064,6 -2307,27 +2259,30 @@@
+  };
+  MODULE_DEVICE_TABLE(acpi, vmbus_acpi_device_ids);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Note: we must use the "no_irq" ops, otherwise hibernation can not work with
++  * PCI device assignment, because "pci_dev_pm_ops" uses the "noirq" ops: in
++  * the resume path, the pci "noirq" restore op runs before "non-noirq" op (see
++  * resume_target_kernel() -> dpm_resume_start(), and hibernation_restore() ->
++  * dpm_resume_end()). This means vmbus_bus_resume() and the pci-hyperv's
++  * resume callback must also run via the "noirq" ops.
++  *
++  * Set suspend_noirq/resume_noirq to NULL for Suspend-to-Idle: see the comment
++  * earlier in this file before vmbus_pm.
++  */
++ 
++ static const struct dev_pm_ops vmbus_bus_pm = {
++ 	.suspend_noirq	= NULL,
++ 	.resume_noirq	= NULL,
++ 	.freeze_noirq	= vmbus_bus_suspend,
++ 	.thaw_noirq	= vmbus_bus_resume,
++ 	.poweroff_noirq	= vmbus_bus_suspend,
++ 	.restore_noirq	= vmbus_bus_resume
++ };
++ 
+++>>>>>>> 1a06d017fb3f (Drivers: hv: vmbus: Fix Suspend-to-Idle for Generation-2 VM)
+  static struct acpi_driver vmbus_acpi_driver = {
+  	.name = "vmbus",
+  	.ids = vmbus_acpi_device_ids,
+* Unmerged path drivers/hv/vmbus_drv.c
