@@ -1,0 +1,157 @@
+KVM: MMU: pass struct kvm_page_fault to mmu_set_spte
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit a12f43818b3f8f2d85b961493ff134c19ffcd05b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/a12f4381.failed
+
+mmu_set_spte is called for either PTE prefetching or page faults.  The
+three boolean arguments write_fault, speculative and host_writable are
+always respectively false/true/true for prefetching and coming from
+a struct kvm_page_fault for page faults.
+
+Let mmu_set_spte distinguish these two situation by accepting a
+possibly NULL struct kvm_page_fault argument.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a12f43818b3f8f2d85b961493ff134c19ffcd05b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/paging_tmpl.h
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,4b304f60cf44..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2652,41 -2674,23 +2652,51 @@@ int mmu_try_to_unsync_pages(struct kvm_
+  	return 0;
+  }
+  
+ +static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +		    unsigned int pte_access, int level,
+ +		    gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +		    bool can_unsync, bool host_writable)
+ +{
+ +	u64 spte;
+ +	struct kvm_mmu_page *sp;
+ +	int ret;
+ +
+ +	sp = sptep_to_sp(sptep);
+ +
+ +	ret = make_spte(vcpu, pte_access, level, gfn, pfn, *sptep, speculative,
+ +			can_unsync, host_writable, sp_ad_disabled(sp), &spte);
+ +
+ +	if (spte & PT_WRITABLE_MASK)
+ +		kvm_vcpu_mark_page_dirty(vcpu, gfn);
+ +
+ +	if (*sptep == spte)
+ +		ret |= SET_SPTE_SPURIOUS;
+ +	else if (mmu_spte_update(sptep, spte))
+ +		ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
+ +	return ret;
+ +}
+ +
+  static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+++<<<<<<< HEAD
+ +			unsigned int pte_access, bool write_fault, int level,
+ +			gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +			bool host_writable)
+++=======
++ 			unsigned int pte_access, gfn_t gfn,
++ 			kvm_pfn_t pfn, struct kvm_page_fault *fault)
+++>>>>>>> a12f43818b3f (KVM: MMU: pass struct kvm_page_fault to mmu_set_spte)
+  {
+ -	struct kvm_mmu_page *sp = sptep_to_sp(sptep);
+ -	int level = sp->role.level;
+  	int was_rmapped = 0;
+ +	int rmap_count;
+ +	int set_spte_ret;
+  	int ret = RET_PF_FIXED;
+  	bool flush = false;
+ -	bool wrprot;
+ -	u64 spte;
+  
++ 	/* Prefetching always gets a writable pfn.  */
++ 	bool host_writable = !fault || fault->map_writable;
++ 	bool speculative = !fault || fault->prefault;
++ 	bool write_fault = fault && fault->write;
++ 
+  	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
+  		 *sptep, write_fault, gfn);
+  
+@@@ -2782,8 -2782,8 +2792,13 @@@ static int direct_pte_prefetch_many(str
+  		return -1;
+  
+  	for (i = 0; i < ret; i++, gfn++, start++) {
+++<<<<<<< HEAD
+ +		mmu_set_spte(vcpu, start, access, false, sp->role.level, gfn,
+ +			     page_to_pfn(pages[i]), true, true);
+++=======
++ 		mmu_set_spte(vcpu, start, access, gfn,
++ 			     page_to_pfn(pages[i]), NULL);
+++>>>>>>> a12f43818b3f (KVM: MMU: pass struct kvm_page_fault to mmu_set_spte)
+  		put_page(pages[i]);
+  	}
+  
+@@@ -2996,9 -2981,11 +3011,13 @@@ static int __direct_map(struct kvm_vcp
+  			account_huge_nx_page(vcpu->kvm, sp);
+  	}
+  
+ -	if (WARN_ON_ONCE(it.level != fault->goal_level))
+ -		return -EFAULT;
+ -
+  	ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
+++<<<<<<< HEAD
+ +			   write, level, base_gfn, pfn, prefault,
+ +			   map_writable);
+++=======
++ 			   base_gfn, fault->pfn, fault);
+++>>>>>>> a12f43818b3f (KVM: MMU: pass struct kvm_page_fault to mmu_set_spte)
+  	if (ret == RET_PF_SPURIOUS)
+  		return ret;
+  
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48,8c07c42a4d73..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -578,13 -578,7 +578,17 @@@ FNAME(prefetch_gpte)(struct kvm_vcpu *v
+  	if (is_error_pfn(pfn))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * we call mmu_set_spte() with host_writable = true because
+ +	 * pte_prefetch_gfn_to_pfn always gets a writable pfn.
+ +	 */
+ +	mmu_set_spte(vcpu, spte, pte_access, false, PG_LEVEL_4K, gfn, pfn,
+ +		     true, true);
+ +
+++=======
++ 	mmu_set_spte(vcpu, spte, pte_access, gfn, pfn, NULL);
+++>>>>>>> a12f43818b3f (KVM: MMU: pass struct kvm_page_fault to mmu_set_spte)
+  	kvm_release_pfn_clean(pfn);
+  	return true;
+  }
+@@@ -766,8 -754,11 +770,16 @@@ static int FNAME(fetch)(struct kvm_vcp
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access, write_fault,
+ +			   it.level, base_gfn, pfn, prefault, map_writable);
+++=======
++ 	if (WARN_ON_ONCE(it.level != fault->goal_level))
++ 		return -EFAULT;
++ 
++ 	ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access,
++ 			   base_gfn, fault->pfn, fault);
+++>>>>>>> a12f43818b3f (KVM: MMU: pass struct kvm_page_fault to mmu_set_spte)
+  	if (ret == RET_PF_SPURIOUS)
+  		return ret;
+  
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
