@@ -1,0 +1,737 @@
+xfrm: make xfrm modes builtin
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 4c145dce26013763490df88f2473714f5bc7857d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4c145dce.failed
+
+after previous changes, xfrm_mode contains no function pointers anymore
+and all modules defining such struct contain no code except an init/exit
+functions to register the xfrm_mode struct with the xfrm core.
+
+Just place the xfrm modes core and remove the modules,
+the run-time xfrm_mode register/unregister functionality is removed.
+
+Before:
+
+    text    data     bss      dec filename
+    7523     200    2364    10087 net/xfrm/xfrm_input.o
+   40003     628     440    41071 net/xfrm/xfrm_state.o
+15730338 6937080 4046908 26714326 vmlinux
+
+    7389     200    2364    9953  net/xfrm/xfrm_input.o
+   40574     656     440   41670  net/xfrm/xfrm_state.o
+15730084 6937068 4046908 26714060 vmlinux
+
+The xfrm*_mode_{transport,tunnel,beet} modules are gone.
+
+v2: replace CONFIG_INET6_XFRM_MODE_* IS_ENABLED guards with CONFIG_IPV6
+    ones rather than removing them.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 4c145dce26013763490df88f2473714f5bc7857d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xfrm.h
+#	net/ipv4/xfrm4_mode_beet.c
+#	net/ipv4/xfrm4_mode_transport.c
+#	net/ipv4/xfrm4_mode_tunnel.c
+#	net/ipv6/xfrm6_mode_beet.c
+#	net/ipv6/xfrm6_mode_transport.c
+#	net/ipv6/xfrm6_mode_tunnel.c
+#	net/xfrm/xfrm_input.c
+#	net/xfrm/xfrm_output.c
+#	net/xfrm/xfrm_policy.c
+#	net/xfrm/xfrm_state.c
+diff --cc include/net/xfrm.h
+index e9420a08d663,4ca79cdc3460..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -443,44 -422,6 +442,47 @@@ int xfrm_register_type_offload(const st
+  int xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned short family);
+  
+  struct xfrm_mode {
+++<<<<<<< HEAD
+ +	/*
+ +	 * Remove encapsulation header.
+ +	 *
+ +	 * The IP header will be moved over the top of the encapsulation
+ +	 * header.
+ +	 *
+ +	 * On entry, the transport header shall point to where the IP header
+ +	 * should be and the network header shall be set to where the IP
+ +	 * header currently is.  skb->data shall point to the start of the
+ +	 * payload.
+ +	 */
+ +	int (*input2)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Add encapsulation header.
+ +	 *
+ +	 * On exit, the transport header will be set to the start of the
+ +	 * encapsulation header to be filled in by x->type->output and
+ +	 * the mac header will be set to the nextheader (protocol for
+ +	 * IPv4) field of the extension header directly preceding the
+ +	 * encapsulation header, or in its absence, that of the top IP
+ +	 * header.  The value of the network header will always point
+ +	 * to the top IP header while skb->data will point to the payload.
+ +	 */
+ +	int (*output2)(struct xfrm_state *x,struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet and do GSO segmentation.
+ +	 */
+ +	struct sk_buff *(*gso_segment)(struct xfrm_state *x, struct sk_buff *skb, netdev_features_t features);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet when IPsec is done at layer2.
+ +	 */
+ +	void (*xmit)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+ +	struct xfrm_state_afinfo *afinfo;
+ +	struct module *owner;
+++=======
+++>>>>>>> 4c145dce2601 (xfrm: make xfrm modes builtin)
+  	u8 encap;
+  	u8 family;
+  	u8 flags;
+diff --cc net/xfrm/xfrm_input.c
+index 1d7a1a30c2d9,b5a31c8e2088..000000000000
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@@ -200,14 -168,202 +200,20 @@@ int xfrm_parse_spi(struct sk_buff *skb
+  }
+  EXPORT_SYMBOL(xfrm_parse_spi);
+  
+ -static int xfrm4_remove_beet_encap(struct xfrm_state *x, struct sk_buff *skb)
+ -{
+ -	struct iphdr *iph;
+ -	int optlen = 0;
+ -	int err = -EINVAL;
+ -
+ -	if (unlikely(XFRM_MODE_SKB_CB(skb)->protocol == IPPROTO_BEETPH)) {
+ -		struct ip_beet_phdr *ph;
+ -		int phlen;
+ -
+ -		if (!pskb_may_pull(skb, sizeof(*ph)))
+ -			goto out;
+ -
+ -		ph = (struct ip_beet_phdr *)skb->data;
+ -
+ -		phlen = sizeof(*ph) + ph->padlen;
+ -		optlen = ph->hdrlen * 8 + (IPV4_BEET_PHMAXLEN - phlen);
+ -		if (optlen < 0 || optlen & 3 || optlen > 250)
+ -			goto out;
+ -
+ -		XFRM_MODE_SKB_CB(skb)->protocol = ph->nexthdr;
+ -
+ -		if (!pskb_may_pull(skb, phlen))
+ -			goto out;
+ -		__skb_pull(skb, phlen);
+ -	}
+ -
+ -	skb_push(skb, sizeof(*iph));
+ -	skb_reset_network_header(skb);
+ -	skb_mac_header_rebuild(skb);
+ -
+ -	xfrm4_beet_make_header(skb);
+ -
+ -	iph = ip_hdr(skb);
+ -
+ -	iph->ihl += optlen / 4;
+ -	iph->tot_len = htons(skb->len);
+ -	iph->daddr = x->sel.daddr.a4;
+ -	iph->saddr = x->sel.saddr.a4;
+ -	iph->check = 0;
+ -	iph->check = ip_fast_csum(skb_network_header(skb), iph->ihl);
+ -	err = 0;
+ -out:
+ -	return err;
+ -}
+ -
+ -static void ipip_ecn_decapsulate(struct sk_buff *skb)
+ -{
+ -	struct iphdr *inner_iph = ipip_hdr(skb);
+ -
+ -	if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
+ -		IP_ECN_set_ce(inner_iph);
+ -}
+ -
+ -static int xfrm4_remove_tunnel_encap(struct xfrm_state *x, struct sk_buff *skb)
+ -{
+ -	int err = -EINVAL;
+ -
+ -	if (XFRM_MODE_SKB_CB(skb)->protocol != IPPROTO_IPIP)
+ -		goto out;
+ -
+ -	if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+ -		goto out;
+ -
+ -	err = skb_unclone(skb, GFP_ATOMIC);
+ -	if (err)
+ -		goto out;
+ -
+ -	if (x->props.flags & XFRM_STATE_DECAP_DSCP)
+ -		ipv4_copy_dscp(XFRM_MODE_SKB_CB(skb)->tos, ipip_hdr(skb));
+ -	if (!(x->props.flags & XFRM_STATE_NOECN))
+ -		ipip_ecn_decapsulate(skb);
+ -
+ -	skb_reset_network_header(skb);
+ -	skb_mac_header_rebuild(skb);
+ -	if (skb->mac_len)
+ -		eth_hdr(skb)->h_proto = skb->protocol;
+ -
+ -	err = 0;
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -static void ipip6_ecn_decapsulate(struct sk_buff *skb)
+ -{
+ -	struct ipv6hdr *inner_iph = ipipv6_hdr(skb);
+ -
+ -	if (INET_ECN_is_ce(XFRM_MODE_SKB_CB(skb)->tos))
+ -		IP6_ECN_set_ce(skb, inner_iph);
+ -}
+ -
+ -static int xfrm6_remove_tunnel_encap(struct xfrm_state *x, struct sk_buff *skb)
+ -{
+ -	int err = -EINVAL;
+ -
+ -	if (XFRM_MODE_SKB_CB(skb)->protocol != IPPROTO_IPV6)
+ -		goto out;
+ -	if (!pskb_may_pull(skb, sizeof(struct ipv6hdr)))
+ -		goto out;
+ -
+ -	err = skb_unclone(skb, GFP_ATOMIC);
+ -	if (err)
+ -		goto out;
+ -
+ -	if (x->props.flags & XFRM_STATE_DECAP_DSCP)
+ -		ipv6_copy_dscp(ipv6_get_dsfield(ipv6_hdr(skb)),
+ -			       ipipv6_hdr(skb));
+ -	if (!(x->props.flags & XFRM_STATE_NOECN))
+ -		ipip6_ecn_decapsulate(skb);
+ -
+ -	skb_reset_network_header(skb);
+ -	skb_mac_header_rebuild(skb);
+ -	if (skb->mac_len)
+ -		eth_hdr(skb)->h_proto = skb->protocol;
+ -
+ -	err = 0;
+ -
+ -out:
+ -	return err;
+ -}
+ -
+ -static int xfrm6_remove_beet_encap(struct xfrm_state *x, struct sk_buff *skb)
+ -{
+ -	struct ipv6hdr *ip6h;
+ -	int size = sizeof(struct ipv6hdr);
+ -	int err;
+ -
+ -	err = skb_cow_head(skb, size + skb->mac_len);
+ -	if (err)
+ -		goto out;
+ -
+ -	__skb_push(skb, size);
+ -	skb_reset_network_header(skb);
+ -	skb_mac_header_rebuild(skb);
+ -
+ -	xfrm6_beet_make_header(skb);
+ -
+ -	ip6h = ipv6_hdr(skb);
+ -	ip6h->payload_len = htons(skb->len - size);
+ -	ip6h->daddr = x->sel.daddr.in6;
+ -	ip6h->saddr = x->sel.saddr.in6;
+ -	err = 0;
+ -out:
+ -	return err;
+ -}
+ -
+ -/* Remove encapsulation header.
+ - *
+ - * The IP header will be moved over the top of the encapsulation
+ - * header.
+ - *
+ - * On entry, the transport header shall point to where the IP header
+ - * should be and the network header shall be set to where the IP
+ - * header currently is.  skb->data shall point to the start of the
+ - * payload.
+ - */
+ -static int
+ -xfrm_inner_mode_encap_remove(struct xfrm_state *x,
+ -			     const struct xfrm_mode *inner_mode,
+ -			     struct sk_buff *skb)
+ -{
+ -	switch (inner_mode->encap) {
+ -	case XFRM_MODE_BEET:
+ -		if (inner_mode->family == AF_INET)
+ -			return xfrm4_remove_beet_encap(x, skb);
+ -		if (inner_mode->family == AF_INET6)
+ -			return xfrm6_remove_beet_encap(x, skb);
+ -		break;
+ -	case XFRM_MODE_TUNNEL:
+ -		if (inner_mode->family == AF_INET)
+ -			return xfrm4_remove_tunnel_encap(x, skb);
+ -		if (inner_mode->family == AF_INET6)
+ -			return xfrm6_remove_tunnel_encap(x, skb);
+ -		break;
+ -	}
+ -
+ -	WARN_ON_ONCE(1);
+ -	return -EOPNOTSUPP;
+ -}
+ -
+  static int xfrm_prepare_input(struct xfrm_state *x, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	struct xfrm_mode *inner_mode = x->inner_mode;
+ +	int err;
+++=======
++ 	const struct xfrm_mode *inner_mode = x->inner_mode;
++ 	const struct xfrm_state_afinfo *afinfo;
++ 	int err = -EAFNOSUPPORT;
+++>>>>>>> 4c145dce2601 (xfrm: make xfrm modes builtin)
+  
+ -	rcu_read_lock();
+ -	afinfo = xfrm_state_afinfo_get_rcu(x->outer_mode->family);
+ -	if (likely(afinfo))
+ -		err = afinfo->extract_input(x, skb);
+ -
+ -	if (err) {
+ -		rcu_read_unlock();
+ +	err = x->outer_mode->afinfo->extract_input(x, skb);
+ +	if (err)
+  		return err;
+ -	}
+  
+  	if (x->sel.family == AF_UNSPEC) {
+  		inner_mode = xfrm_ip2inner_mode(x, XFRM_MODE_SKB_CB(skb)->protocol);
+@@@ -291,7 -453,9 +294,8 @@@ static int xfrm_inner_mode_input(struc
+  
+  int xfrm_input(struct sk_buff *skb, int nexthdr, __be32 spi, int encap_type)
+  {
+ -	const struct xfrm_state_afinfo *afinfo;
+  	struct net *net = dev_net(skb->dev);
++ 	const struct xfrm_mode *inner_mode;
+  	int err;
+  	__be32 seq;
+  	__be32 seq_hi;
+diff --cc net/xfrm/xfrm_output.c
+index 2330abcb848d,3cb2a328a8ab..000000000000
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@@ -426,7 -618,10 +421,14 @@@ EXPORT_SYMBOL_GPL(xfrm_output)
+  
+  static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	struct xfrm_mode *inner_mode;
+++=======
++ 	const struct xfrm_state_afinfo *afinfo;
++ 	const struct xfrm_mode *inner_mode;
++ 	int err = -EAFNOSUPPORT;
++ 
+++>>>>>>> 4c145dce2601 (xfrm: make xfrm modes builtin)
+  	if (x->sel.family == AF_UNSPEC)
+  		inner_mode = xfrm_ip2inner_mode(x,
+  				xfrm_af2proto(skb_dst(skb)->ops->family));
+diff --cc net/xfrm/xfrm_policy.c
+index 2fc87b8c92c6,1a5fd2296556..000000000000
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@@ -2548,6 -2545,8 +2548,11 @@@ static struct dst_entry *xfrm_bundle_cr
+  					    const struct flowi *fl,
+  					    struct dst_entry *dst)
+  {
+++<<<<<<< HEAD
+++=======
++ 	const struct xfrm_state_afinfo *afinfo;
++ 	const struct xfrm_mode *inner_mode;
+++>>>>>>> 4c145dce2601 (xfrm: make xfrm modes builtin)
+  	struct net *net = xp_net(policy);
+  	unsigned long now = jiffies;
+  	struct net_device *dev;
+diff --cc net/xfrm/xfrm_state.c
+index b1ac3a477829,ace26f6dc790..000000000000
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@@ -330,67 -330,47 +330,108 @@@ static void xfrm_put_type_offload(cons
+  	module_put(type->owner);
+  }
+  
+- static DEFINE_SPINLOCK(xfrm_mode_lock);
+- int xfrm_register_mode(struct xfrm_mode *mode)
+- {
++ static const struct xfrm_mode xfrm4_mode_map[XFRM_MODE_MAX] = {
++ 	[XFRM_MODE_BEET] = {
++ 		.encap = XFRM_MODE_BEET,
++ 		.flags = XFRM_MODE_FLAG_TUNNEL,
++ 		.family = AF_INET,
++ 	},
++ 	[XFRM_MODE_TRANSPORT] = {
++ 		.encap = XFRM_MODE_TRANSPORT,
++ 		.family = AF_INET,
++ 	},
++ 	[XFRM_MODE_TUNNEL] = {
++ 		.encap = XFRM_MODE_TUNNEL,
++ 		.flags = XFRM_MODE_FLAG_TUNNEL,
++ 		.family = AF_INET,
++ 	},
++ };
++ 
++ static const struct xfrm_mode xfrm6_mode_map[XFRM_MODE_MAX] = {
++ 	[XFRM_MODE_BEET] = {
++ 		.encap = XFRM_MODE_BEET,
++ 		.flags = XFRM_MODE_FLAG_TUNNEL,
++ 		.family = AF_INET6,
++ 	},
++ 	[XFRM_MODE_ROUTEOPTIMIZATION] = {
++ 		.encap = XFRM_MODE_ROUTEOPTIMIZATION,
++ 		.family = AF_INET6,
++ 	},
++ 	[XFRM_MODE_TRANSPORT] = {
++ 		.encap = XFRM_MODE_TRANSPORT,
++ 		.family = AF_INET6,
++ 	},
++ 	[XFRM_MODE_TUNNEL] = {
++ 		.encap = XFRM_MODE_TUNNEL,
++ 		.flags = XFRM_MODE_FLAG_TUNNEL,
++ 		.family = AF_INET6,
++ 	},
++ };
++ 
++ static const struct xfrm_mode *xfrm_get_mode(unsigned int encap, int family)
++ {
+++<<<<<<< HEAD
+ +	struct xfrm_state_afinfo *afinfo;
+ +	struct xfrm_mode **modemap;
+ +	int err;
+ +
+ +	if (unlikely(mode->encap >= XFRM_MODE_MAX))
+ +		return -EINVAL;
+ +
+ +	afinfo = xfrm_state_get_afinfo(mode->family);
+ +	if (unlikely(afinfo == NULL))
+ +		return -EAFNOSUPPORT;
+ +
+ +	err = -EEXIST;
+ +	modemap = afinfo->mode_map;
+ +	spin_lock_bh(&xfrm_mode_lock);
+ +	if (modemap[mode->encap])
+ +		goto out;
+ +
+ +	err = -ENOENT;
+ +	if (!try_module_get(afinfo->owner))
+ +		goto out;
+ +
+ +	mode->afinfo = afinfo;
+ +	modemap[mode->encap] = mode;
+ +	err = 0;
+ +
+ +out:
+ +	spin_unlock_bh(&xfrm_mode_lock);
+ +	rcu_read_unlock();
+ +	return err;
+ +}
+ +EXPORT_SYMBOL(xfrm_register_mode);
+ +
+ +void xfrm_unregister_mode(struct xfrm_mode *mode)
+ +{
+ +	struct xfrm_state_afinfo *afinfo;
+ +	struct xfrm_mode **modemap;
+ +
+ +	afinfo = xfrm_state_get_afinfo(mode->family);
+ +	if (WARN_ON_ONCE(!afinfo))
+ +		return;
+ +
+ +	modemap = afinfo->mode_map;
+ +	spin_lock_bh(&xfrm_mode_lock);
+ +	if (likely(modemap[mode->encap] == mode)) {
+ +		modemap[mode->encap] = NULL;
+ +		module_put(mode->afinfo->owner);
+ +	}
+ +
+ +	spin_unlock_bh(&xfrm_mode_lock);
+ +	rcu_read_unlock();
+ +}
+ +EXPORT_SYMBOL(xfrm_unregister_mode);
+ +
+ +static struct xfrm_mode *xfrm_get_mode(unsigned int encap, int family)
+ +{
+ +	struct xfrm_state_afinfo *afinfo;
+ +	struct xfrm_mode *mode;
+ +	int modload_attempted = 0;
+++=======
++ 	const struct xfrm_mode *mode;
+++>>>>>>> 4c145dce2601 (xfrm: make xfrm modes builtin)
+  
+  	if (unlikely(encap >= XFRM_MODE_MAX))
+  		return NULL;
+* Unmerged path net/ipv4/xfrm4_mode_beet.c
+* Unmerged path net/ipv4/xfrm4_mode_transport.c
+* Unmerged path net/ipv4/xfrm4_mode_tunnel.c
+* Unmerged path net/ipv6/xfrm6_mode_beet.c
+* Unmerged path net/ipv6/xfrm6_mode_transport.c
+* Unmerged path net/ipv6/xfrm6_mode_tunnel.c
+* Unmerged path include/net/xfrm.h
+diff --git a/net/ipv4/Kconfig b/net/ipv4/Kconfig
+index 4ecd9798a5d3..487d0c7650f1 100644
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@ -305,7 +305,7 @@ config NET_IPVTI
+ 	depends on IPV6 || IPV6=n
+ 	select INET_TUNNEL
+ 	select NET_IP_TUNNEL
+-	depends on INET_XFRM_MODE_TUNNEL
++	select XFRM
+ 	---help---
+ 	  Tunneling means encapsulating data of one protocol type within
+ 	  another protocol and sending it over a channel that understands the
+@@ -397,33 +397,6 @@ config INET_TUNNEL
+ 	tristate
+ 	default n
+ 
+-config INET_XFRM_MODE_TRANSPORT
+-	tristate "IP: IPsec transport mode"
+-	default y
+-	select XFRM
+-	---help---
+-	  Support for IPsec transport mode.
+-
+-	  If unsure, say Y.
+-
+-config INET_XFRM_MODE_TUNNEL
+-	tristate "IP: IPsec tunnel mode"
+-	default y
+-	select XFRM
+-	---help---
+-	  Support for IPsec tunnel mode.
+-
+-	  If unsure, say Y.
+-
+-config INET_XFRM_MODE_BEET
+-	tristate "IP: IPsec BEET mode"
+-	default y
+-	select XFRM
+-	---help---
+-	  Support for IPsec BEET mode.
+-
+-	  If unsure, say Y.
+-
+ config INET_DIAG
+ 	tristate "INET: socket monitoring interface"
+ 	default y
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index c754b84dbd9d..ef1f511a5320 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -37,10 +37,7 @@ obj-$(CONFIG_INET_ESP) += esp4.o
+ obj-$(CONFIG_INET_ESP_OFFLOAD) += esp4_offload.o
+ obj-$(CONFIG_INET_IPCOMP) += ipcomp.o
+ obj-$(CONFIG_INET_XFRM_TUNNEL) += xfrm4_tunnel.o
+-obj-$(CONFIG_INET_XFRM_MODE_BEET) += xfrm4_mode_beet.o
+ obj-$(CONFIG_INET_TUNNEL) += tunnel4.o
+-obj-$(CONFIG_INET_XFRM_MODE_TRANSPORT) += xfrm4_mode_transport.o
+-obj-$(CONFIG_INET_XFRM_MODE_TUNNEL) += xfrm4_mode_tunnel.o
+ obj-$(CONFIG_IP_PNP) += ipconfig.o
+ obj-$(CONFIG_NETFILTER)	+= netfilter.o netfilter/
+ obj-$(CONFIG_INET_DIAG) += inet_diag.o 
+diff --git a/net/ipv4/ip_vti.c b/net/ipv4/ip_vti.c
+index f37a20f05d5e..68fb4a97e7cd 100644
+--- a/net/ipv4/ip_vti.c
++++ b/net/ipv4/ip_vti.c
+@@ -128,7 +128,7 @@ static int vti_rcv_cb(struct sk_buff *skb, int err)
+ 	struct net_device *dev;
+ 	struct pcpu_sw_netstats *tstats;
+ 	struct xfrm_state *x;
+-	struct xfrm_mode *inner_mode;
++	const struct xfrm_mode *inner_mode;
+ 	struct ip_tunnel *tunnel = XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip4;
+ 	u32 orig_mark = skb->mark;
+ 	int ret;
+* Unmerged path net/ipv4/xfrm4_mode_beet.c
+* Unmerged path net/ipv4/xfrm4_mode_transport.c
+* Unmerged path net/ipv4/xfrm4_mode_tunnel.c
+diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
+index b3885ca22d6f..097531219c47 100644
+--- a/net/ipv6/Kconfig
++++ b/net/ipv6/Kconfig
+@@ -135,44 +135,11 @@ config INET6_TUNNEL
+ 	tristate
+ 	default n
+ 
+-config INET6_XFRM_MODE_TRANSPORT
+-	tristate "IPv6: IPsec transport mode"
+-	default IPV6
+-	select XFRM
+-	---help---
+-	  Support for IPsec transport mode.
+-
+-	  If unsure, say Y.
+-
+-config INET6_XFRM_MODE_TUNNEL
+-	tristate "IPv6: IPsec tunnel mode"
+-	default IPV6
+-	select XFRM
+-	---help---
+-	  Support for IPsec tunnel mode.
+-
+-	  If unsure, say Y.
+-
+-config INET6_XFRM_MODE_BEET
+-	tristate "IPv6: IPsec BEET mode"
+-	default IPV6
+-	select XFRM
+-	---help---
+-	  Support for IPsec BEET mode.
+-
+-	  If unsure, say Y.
+-
+-config INET6_XFRM_MODE_ROUTEOPTIMIZATION
+-	tristate "IPv6: MIPv6 route optimization mode"
+-	select XFRM
+-	---help---
+-	  Support for MIPv6 route optimization mode.
+-
+ config IPV6_VTI
+ tristate "Virtual (secure) IPv6: tunneling"
+ 	select IPV6_TUNNEL
+ 	select NET_IP_TUNNEL
+-	depends on INET6_XFRM_MODE_TUNNEL
++	select XFRM
+ 	---help---
+ 	Tunneling means encapsulating data of one protocol type within
+ 	another protocol and sending it over a channel that understands the
+diff --git a/net/ipv6/Makefile b/net/ipv6/Makefile
+index e0026fa1261b..8ccf35514015 100644
+--- a/net/ipv6/Makefile
++++ b/net/ipv6/Makefile
+@@ -35,10 +35,6 @@ obj-$(CONFIG_INET6_ESP_OFFLOAD) += esp6_offload.o
+ obj-$(CONFIG_INET6_IPCOMP) += ipcomp6.o
+ obj-$(CONFIG_INET6_XFRM_TUNNEL) += xfrm6_tunnel.o
+ obj-$(CONFIG_INET6_TUNNEL) += tunnel6.o
+-obj-$(CONFIG_INET6_XFRM_MODE_TRANSPORT) += xfrm6_mode_transport.o
+-obj-$(CONFIG_INET6_XFRM_MODE_TUNNEL) += xfrm6_mode_tunnel.o
+-obj-$(CONFIG_INET6_XFRM_MODE_ROUTEOPTIMIZATION) += xfrm6_mode_ro.o
+-obj-$(CONFIG_INET6_XFRM_MODE_BEET) += xfrm6_mode_beet.o
+ obj-$(CONFIG_IPV6_MIP6) += mip6.o
+ obj-$(CONFIG_IPV6_ILA) += ila/
+ obj-$(CONFIG_NETFILTER)	+= netfilter/
+diff --git a/net/ipv6/ip6_vti.c b/net/ipv6/ip6_vti.c
+index 92bfc6ad7637..348d7ca5bc06 100644
+--- a/net/ipv6/ip6_vti.c
++++ b/net/ipv6/ip6_vti.c
+@@ -342,7 +342,7 @@ static int vti6_rcv_cb(struct sk_buff *skb, int err)
+ 	struct net_device *dev;
+ 	struct pcpu_sw_netstats *tstats;
+ 	struct xfrm_state *x;
+-	struct xfrm_mode *inner_mode;
++	const struct xfrm_mode *inner_mode;
+ 	struct ip6_tnl *t = XFRM_TUNNEL_SKB_CB(skb)->tunnel.ip6;
+ 	u32 orig_mark = skb->mark;
+ 	int ret;
+* Unmerged path net/ipv6/xfrm6_mode_beet.c
+diff --git a/net/ipv6/xfrm6_mode_ro.c b/net/ipv6/xfrm6_mode_ro.c
+deleted file mode 100644
+index d0a6a4dbd689..000000000000
+--- a/net/ipv6/xfrm6_mode_ro.c
++++ /dev/null
+@@ -1,55 +0,0 @@
+-/*
+- * xfrm6_mode_ro.c - Route optimization mode for IPv6.
+- *
+- * Copyright (C)2003-2006 Helsinki University of Technology
+- * Copyright (C)2003-2006 USAGI/WIDE Project
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License as published by
+- * the Free Software Foundation; either version 2 of the License, or
+- * (at your option) any later version.
+- *
+- * This program is distributed in the hope that it will be useful,
+- * but WITHOUT ANY WARRANTY; without even the implied warranty of
+- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+- * GNU General Public License for more details.
+- *
+- * You should have received a copy of the GNU General Public License
+- * along with this program; if not, see <http://www.gnu.org/licenses/>.
+- */
+-/*
+- * Authors:
+- *	Noriaki TAKAMIYA @USAGI
+- *	Masahide NAKAMURA @USAGI
+- */
+-
+-#include <linux/init.h>
+-#include <linux/kernel.h>
+-#include <linux/module.h>
+-#include <linux/skbuff.h>
+-#include <linux/spinlock.h>
+-#include <linux/stringify.h>
+-#include <linux/time.h>
+-#include <net/ipv6.h>
+-#include <net/xfrm.h>
+-
+-static struct xfrm_mode xfrm6_ro_mode = {
+-	.owner = THIS_MODULE,
+-	.encap = XFRM_MODE_ROUTEOPTIMIZATION,
+-	.family = AF_INET6,
+-};
+-
+-static int __init xfrm6_ro_init(void)
+-{
+-	return xfrm_register_mode(&xfrm6_ro_mode);
+-}
+-
+-static void __exit xfrm6_ro_exit(void)
+-{
+-	xfrm_unregister_mode(&xfrm6_ro_mode);
+-}
+-
+-module_init(xfrm6_ro_init);
+-module_exit(xfrm6_ro_exit);
+-MODULE_LICENSE("GPL");
+-MODULE_ALIAS_XFRM_MODE(AF_INET6, XFRM_MODE_ROUTEOPTIMIZATION);
+* Unmerged path net/ipv6/xfrm6_mode_transport.c
+* Unmerged path net/ipv6/xfrm6_mode_tunnel.c
+* Unmerged path net/xfrm/xfrm_input.c
+diff --git a/net/xfrm/xfrm_interface.c b/net/xfrm/xfrm_interface.c
+index 49e8ffd5b476..a9291ce973b4 100644
+--- a/net/xfrm/xfrm_interface.c
++++ b/net/xfrm/xfrm_interface.c
+@@ -199,8 +199,8 @@ static void xfrmi_scrub_packet(struct sk_buff *skb, bool xnet)
+ 
+ static int xfrmi_rcv_cb(struct sk_buff *skb, int err)
+ {
++	const struct xfrm_mode *inner_mode;
+ 	struct pcpu_sw_netstats *tstats;
+-	struct xfrm_mode *inner_mode;
+ 	struct net_device *dev;
+ 	struct xfrm_state *x;
+ 	struct xfrm_if *xi;
+* Unmerged path net/xfrm/xfrm_output.c
+* Unmerged path net/xfrm/xfrm_policy.c
+* Unmerged path net/xfrm/xfrm_state.c
+diff --git a/tools/testing/selftests/net/config b/tools/testing/selftests/net/config
+index cd3a2f1545b5..824807709d88 100644
+--- a/tools/testing/selftests/net/config
++++ b/tools/testing/selftests/net/config
+@@ -7,9 +7,7 @@ CONFIG_NET_L3_MASTER_DEV=y
+ CONFIG_IPV6=y
+ CONFIG_IPV6_MULTIPLE_TABLES=y
+ CONFIG_VETH=y
+-CONFIG_INET_XFRM_MODE_TUNNEL=y
+ CONFIG_NET_IPVTI=y
+-CONFIG_INET6_XFRM_MODE_TUNNEL=y
+ CONFIG_IPV6_VTI=y
+ CONFIG_DUMMY=y
+ CONFIG_BRIDGE=y
