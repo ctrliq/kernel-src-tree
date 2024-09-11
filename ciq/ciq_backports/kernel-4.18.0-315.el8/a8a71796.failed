@@ -1,0 +1,157 @@
+selftests/bpf: Fix stat probe in d_path test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit a8a717963fe5ecfd274eb93dd1285ee9428ffca7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/a8a71796.failed
+
+Some kernels builds might inline vfs_getattr call within fstat
+syscall code path, so fentry/vfs_getattr trampoline is not called.
+
+Add security_inode_getattr to allowlist and switch the d_path test stat
+trampoline to security_inode_getattr.
+
+Keeping dentry_open and filp_close, because they are in their own
+files, so unlikely to be inlined, but in case they are, adding
+security_file_open.
+
+Adding flags that indicate trampolines were called and failing
+the test if any of them got missed, so it's easier to identify
+the issue next time.
+
+Fixes: e4d1af4b16f8 ("selftests/bpf: Add test for d_path helper")
+	Suggested-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Jiri Olsa <jolsa@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200918112338.2618444-1-jolsa@kernel.org
+(cherry picked from commit a8a717963fe5ecfd274eb93dd1285ee9428ffca7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/bpf_trace.c
+diff --cc kernel/trace/bpf_trace.c
+index fa9081cef38b,36508f46a8db..000000000000
+--- a/kernel/trace/bpf_trace.c
++++ b/kernel/trace/bpf_trace.c
+@@@ -1086,6 -1094,59 +1086,62 @@@ static const struct bpf_func_proto bpf_
+  	.arg1_type	= ARG_ANYTHING,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ BPF_CALL_3(bpf_d_path, struct path *, path, char *, buf, u32, sz)
++ {
++ 	long len;
++ 	char *p;
++ 
++ 	if (!sz)
++ 		return 0;
++ 
++ 	p = d_path(path, buf, sz);
++ 	if (IS_ERR(p)) {
++ 		len = PTR_ERR(p);
++ 	} else {
++ 		len = buf + sz - p;
++ 		memmove(buf, p, len);
++ 	}
++ 
++ 	return len;
++ }
++ 
++ BTF_SET_START(btf_allowlist_d_path)
++ #ifdef CONFIG_SECURITY
++ BTF_ID(func, security_file_permission)
++ BTF_ID(func, security_inode_getattr)
++ BTF_ID(func, security_file_open)
++ #endif
++ #ifdef CONFIG_SECURITY_PATH
++ BTF_ID(func, security_path_truncate)
++ #endif
++ BTF_ID(func, vfs_truncate)
++ BTF_ID(func, vfs_fallocate)
++ BTF_ID(func, dentry_open)
++ BTF_ID(func, vfs_getattr)
++ BTF_ID(func, filp_close)
++ BTF_SET_END(btf_allowlist_d_path)
++ 
++ static bool bpf_d_path_allowed(const struct bpf_prog *prog)
++ {
++ 	return btf_id_set_contains(&btf_allowlist_d_path, prog->aux->attach_btf_id);
++ }
++ 
++ BTF_ID_LIST_SINGLE(bpf_d_path_btf_ids, struct, path)
++ 
++ static const struct bpf_func_proto bpf_d_path_proto = {
++ 	.func		= bpf_d_path,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_BTF_ID,
++ 	.arg1_btf_id	= &bpf_d_path_btf_ids[0],
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE_OR_ZERO,
++ 	.allowed	= bpf_d_path_allowed,
++ };
++ 
+++>>>>>>> a8a717963fe5 (selftests/bpf: Fix stat probe in d_path test)
+  const struct bpf_func_proto *
+  bpf_tracing_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+  {
+* Unmerged path kernel/trace/bpf_trace.c
+diff --git a/tools/testing/selftests/bpf/prog_tests/d_path.c b/tools/testing/selftests/bpf/prog_tests/d_path.c
+index fc12e0d445ff..0a577a248d34 100644
+--- a/tools/testing/selftests/bpf/prog_tests/d_path.c
++++ b/tools/testing/selftests/bpf/prog_tests/d_path.c
+@@ -120,6 +120,16 @@ void test_d_path(void)
+ 	if (err < 0)
+ 		goto cleanup;
+ 
++	if (CHECK(!bss->called_stat,
++		  "stat",
++		  "trampoline for security_inode_getattr was not called\n"))
++		goto cleanup;
++
++	if (CHECK(!bss->called_close,
++		  "close",
++		  "trampoline for filp_close was not called\n"))
++		goto cleanup;
++
+ 	for (int i = 0; i < MAX_FILES; i++) {
+ 		CHECK(strncmp(src.paths[i], bss->paths_stat[i], MAX_PATH_LEN),
+ 		      "check",
+diff --git a/tools/testing/selftests/bpf/progs/test_d_path.c b/tools/testing/selftests/bpf/progs/test_d_path.c
+index 61f007855649..84e1f883f97b 100644
+--- a/tools/testing/selftests/bpf/progs/test_d_path.c
++++ b/tools/testing/selftests/bpf/progs/test_d_path.c
+@@ -15,7 +15,10 @@ char paths_close[MAX_FILES][MAX_PATH_LEN] = {};
+ int rets_stat[MAX_FILES] = {};
+ int rets_close[MAX_FILES] = {};
+ 
+-SEC("fentry/vfs_getattr")
++int called_stat = 0;
++int called_close = 0;
++
++SEC("fentry/security_inode_getattr")
+ int BPF_PROG(prog_stat, struct path *path, struct kstat *stat,
+ 	     __u32 request_mask, unsigned int query_flags)
+ {
+@@ -23,6 +26,8 @@ int BPF_PROG(prog_stat, struct path *path, struct kstat *stat,
+ 	__u32 cnt = cnt_stat;
+ 	int ret;
+ 
++	called_stat = 1;
++
+ 	if (pid != my_pid)
+ 		return 0;
+ 
+@@ -42,6 +47,8 @@ int BPF_PROG(prog_close, struct file *file, void *id)
+ 	__u32 cnt = cnt_close;
+ 	int ret;
+ 
++	called_close = 1;
++
+ 	if (pid != my_pid)
+ 		return 0;
+ 
