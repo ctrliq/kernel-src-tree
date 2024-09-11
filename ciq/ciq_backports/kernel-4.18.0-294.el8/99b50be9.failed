@@ -1,0 +1,159 @@
+PCI: Treat "external-facing" devices themselves as internal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Rajat Jain <rajatja@google.com>
+commit 99b50be9d8ec9ef319cc7d5de07f4d405fac7764
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/99b50be9.failed
+
+"External-facing" devices are internal devices that expose PCIe hierarchies
+such as Thunderbolt outside the platform [1].  Previously these internal
+devices were marked as "untrusted" the same as devices downstream from
+them.
+
+Use the ACPI or DT information to identify external-facing devices, but
+only mark the devices *downstream* from them as "untrusted" [2].  The
+external-facing device itself is no longer marked as untrusted.
+
+[1] https://docs.microsoft.com/en-us/windows-hardware/drivers/pci/dsd-for-pcie-root-ports#identifying-externally-exposed-pcie-root-ports
+[2] https://lore.kernel.org/linux-pci/20200610230906.GA1528594@bjorn-Precision-5520/
+Link: https://lore.kernel.org/r/20200707224604.3737893-3-rajatja@google.com
+	Signed-off-by: Rajat Jain <rajatja@google.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 99b50be9d8ec9ef319cc7d5de07f4d405fac7764)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/pci.h
+diff --cc include/linux/pci.h
+index 9cb00f3cfca3,7a40cd5caed0..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -443,17 -431,20 +443,34 @@@ struct pci_dev 
+  	 * that. When an IOMMU is enabled they should be getting full
+  	 * mappings to make sure they cannot access arbitrary memory.
+  	 */
+++<<<<<<< HEAD
+ +	RH_KABI_FILL_HOLE(unsigned int	untrusted:1)
+ +	RH_KABI_FILL_HOLE(unsigned int	no_vf_scan:1)  /* Don't scan for VFs after IOV enablement */
+ +	RH_KABI_FILL_HOLE(unsigned int	io_window:1)	/* Bridge has I/O window */
+ +	RH_KABI_FILL_HOLE(unsigned int	pref_window:1)	/* Bridge has pref mem window */
+ +	RH_KABI_FILL_HOLE(unsigned int	pref_64_window:1)/* Pref mem window is 64-bit */
+ +#ifdef CONFIG_PCI_PRI
+ +	RH_KABI_FILL_HOLE(unsigned int  pasid_required:1) /* PRG Response PASID Required */
+ +#endif
+ +#ifdef CONFIG_PCIE_DPC
+ +	RH_KABI_FILL_HOLE(unsigned int	dpc_rp_extensions:1)
+ +#endif
+++=======
++ 	unsigned int	untrusted:1;
++ 	/*
++ 	 * Info from the platform, e.g., ACPI or device tree, may mark a
++ 	 * device as "external-facing".  An external-facing device is
++ 	 * itself internal but devices downstream from it are external.
++ 	 */
++ 	unsigned int	external_facing:1;
++ 	unsigned int	broken_intx_masking:1;	/* INTx masking can't be used */
++ 	unsigned int	io_window_1k:1;		/* Intel bridge 1K I/O windows */
++ 	unsigned int	irq_managed:1;
++ 	unsigned int	non_compliant_bars:1;	/* Broken BARs; ignore them */
++ 	unsigned int	is_probed:1;		/* Device probing in progress */
++ 	unsigned int	link_active_reporting:1;/* Device capable of reporting link active */
++ 	unsigned int	no_vf_scan:1;		/* Don't scan for VFs after IOV enablement */
+++>>>>>>> 99b50be9d8ec (PCI: Treat "external-facing" devices themselves as internal)
+  	pci_dev_flags_t dev_flags;
+  	atomic_t	enable_cnt;	/* pci_enable_device has been called */
+  
+diff --git a/drivers/iommu/intel-iommu.c b/drivers/iommu/intel-iommu.c
+index 5b3482d8e01f..a2f26ef12454 100644
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@ -4735,12 +4735,12 @@ const struct attribute_group *intel_iommu_groups[] = {
+ 	NULL,
+ };
+ 
+-static inline bool has_untrusted_dev(void)
++static inline bool has_external_pci(void)
+ {
+ 	struct pci_dev *pdev = NULL;
+ 
+ 	for_each_pci_dev(pdev)
+-		if (pdev->untrusted)
++		if (pdev->external_facing)
+ 			return true;
+ 
+ 	return false;
+@@ -4748,7 +4748,7 @@ static inline bool has_untrusted_dev(void)
+ 
+ static int __init platform_optin_force_iommu(void)
+ {
+-	if (!dmar_platform_optin() || no_platform_optin || !has_untrusted_dev())
++	if (!dmar_platform_optin() || no_platform_optin || !has_external_pci())
+ 		return 0;
+ 
+ 	if (no_iommu || dmar_disabled)
+diff --git a/drivers/pci/of.c b/drivers/pci/of.c
+index 1540397e2d09..5905247de6c3 100644
+--- a/drivers/pci/of.c
++++ b/drivers/pci/of.c
+@@ -38,7 +38,7 @@ void pci_set_bus_of_node(struct pci_bus *bus)
+ 	} else {
+ 		node = of_node_get(bus->self->dev.of_node);
+ 		if (node && of_property_read_bool(node, "external-facing"))
+-			bus->self->untrusted = true;
++			bus->self->external_facing = true;
+ 	}
+ 	bus->dev.of_node = node;
+ }
+diff --git a/drivers/pci/pci-acpi.c b/drivers/pci/pci-acpi.c
+index 404620bd2996..9d017590cf3e 100644
+--- a/drivers/pci/pci-acpi.c
++++ b/drivers/pci/pci-acpi.c
+@@ -1215,7 +1215,7 @@ static void pci_acpi_optimize_delay(struct pci_dev *pdev,
+ 	ACPI_FREE(obj);
+ }
+ 
+-static void pci_acpi_set_untrusted(struct pci_dev *dev)
++static void pci_acpi_set_external_facing(struct pci_dev *dev)
+ {
+ 	u8 val;
+ 
+@@ -1226,11 +1226,10 @@ static void pci_acpi_set_untrusted(struct pci_dev *dev)
+ 
+ 	/*
+ 	 * These root ports expose PCIe (including DMA) outside of the
+-	 * system so make sure we treat them and everything behind as
+-	 * untrusted.
++	 * system.  Everything downstream from them is external.
+ 	 */
+ 	if (val)
+-		dev->untrusted = 1;
++		dev->external_facing = 1;
+ }
+ 
+ static void pci_acpi_setup(struct device *dev)
+@@ -1242,7 +1241,7 @@ static void pci_acpi_setup(struct device *dev)
+ 		return;
+ 
+ 	pci_acpi_optimize_delay(pci_dev, adev->handle);
+-	pci_acpi_set_untrusted(pci_dev);
++	pci_acpi_set_external_facing(pci_dev);
+ 	pci_acpi_add_edr_notifier(pci_dev);
+ 
+ 	pci_acpi_add_pm_notifier(adev, pci_dev);
+diff --git a/drivers/pci/probe.c b/drivers/pci/probe.c
+index 64f4fdf70ea0..c3b185be7071 100644
+--- a/drivers/pci/probe.c
++++ b/drivers/pci/probe.c
+@@ -1562,7 +1562,7 @@ static void set_pcie_untrusted(struct pci_dev *dev)
+ 	 * untrusted as well.
+ 	 */
+ 	parent = pci_upstream_bridge(dev);
+-	if (parent && parent->untrusted)
++	if (parent && (parent->untrusted || parent->external_facing))
+ 		dev->untrusted = true;
+ }
+ 
+* Unmerged path include/linux/pci.h
