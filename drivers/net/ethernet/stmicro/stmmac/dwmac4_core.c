@@ -762,6 +762,16 @@ static void dwmac4_update_vlan_hash(struct mac_device_info *hw, u32 hash,
 	}
 }
 
+static void dwmac4_sarc_configure(void __iomem *ioaddr, int val)
+{
+	u32 value = readl(ioaddr + GMAC_CONFIG);
+
+	value &= ~GMAC_CONFIG_SARC;
+	value |= val << GMAC_CONFIG_SARC_SHIFT;
+
+	writel(value, ioaddr + GMAC_CONFIG);
+}
+
 const struct stmmac_ops dwmac4_ops = {
 	.core_init = dwmac4_core_init,
 	.set_mac = stmmac_set_mac,
@@ -793,6 +803,7 @@ const struct stmmac_ops dwmac4_ops = {
 	.set_filter = dwmac4_set_filter,
 	.set_mac_loopback = dwmac4_set_mac_loopback,
 	.update_vlan_hash = dwmac4_update_vlan_hash,
+	.sarc_configure = dwmac4_sarc_configure,
 };
 
 const struct stmmac_ops dwmac410_ops = {
@@ -826,6 +837,7 @@ const struct stmmac_ops dwmac410_ops = {
 	.set_filter = dwmac4_set_filter,
 	.set_mac_loopback = dwmac4_set_mac_loopback,
 	.update_vlan_hash = dwmac4_update_vlan_hash,
+	.sarc_configure = dwmac4_sarc_configure,
 };
 
 const struct stmmac_ops dwmac510_ops = {
@@ -864,6 +876,7 @@ const struct stmmac_ops dwmac510_ops = {
 	.flex_pps_config = dwmac5_flex_pps_config,
 	.set_mac_loopback = dwmac4_set_mac_loopback,
 	.update_vlan_hash = dwmac4_update_vlan_hash,
+	.sarc_configure = dwmac4_sarc_configure,
 };
 
 int dwmac4_setup(struct stmmac_priv *priv)
