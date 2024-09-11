@@ -1,0 +1,157 @@
+dmaengine: virt-dma: Add missing locking
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sascha Hauer <s.hauer@pengutronix.de>
+commit 51fe9cd2bd92d95fc200385187d346e293ceefc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/51fe9cd2.failed
+
+Originally freeing descriptors was split into a locked and an unlocked
+part. The locked part in vchan_get_all_descriptors() collected all
+descriptors on a separate list_head. This was done to allow iterating
+over that new list in vchan_dma_desc_free_list() without a lock held.
+
+This became broken in 13bb26ae8850 ("dmaengine: virt-dma: don't always
+free descriptor upon completion"). With this commit
+vchan_dma_desc_free_list() no longer exclusively operates on the
+separate list, but starts to put descriptors which can be reused back on
+&vc->desc_allocated. This list operation should have been locked, but
+wasn't.
+In the mean time drivers started to call vchan_dma_desc_free_list() with
+their lock held so that we now have the situation that
+vchan_dma_desc_free_list() is called locked from some drivers and
+unlocked from others.
+To clean this up we have to do two things:
+
+1. Add missing locking in vchan_dma_desc_free_list()
+2. Make sure drivers call vchan_dma_desc_free_list() unlocked
+
+This needs to be done atomically, so in this patch the locking is added
+and all drivers are fixed.
+
+	Signed-off-by: Sascha Hauer <s.hauer@pengutronix.de>
+	Reviewed-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+	Tested-by: Peter Ujfalusi <peter.ujfalusi@ti.com>
+	Reviewed-by: Green Wan <green.wan@sifive.com>
+	Tested-by: Green Wan <green.wan@sifive.com>
+Link: https://lore.kernel.org/r/20191216105328.15198-3-s.hauer@pengutronix.de
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 51fe9cd2bd92d95fc200385187d346e293ceefc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/mediatek/mtk-uart-apdma.c
+#	drivers/dma/owl-dma.c
+#	drivers/dma/sf-pdma/sf-pdma.c
+* Unmerged path drivers/dma/mediatek/mtk-uart-apdma.c
+* Unmerged path drivers/dma/owl-dma.c
+* Unmerged path drivers/dma/sf-pdma/sf-pdma.c
+diff --git a/drivers/dma/dw-axi-dmac/dw-axi-dmac-platform.c b/drivers/dma/dw-axi-dmac/dw-axi-dmac-platform.c
+index c4eb55e3011c..e4fc9e026902 100644
+--- a/drivers/dma/dw-axi-dmac/dw-axi-dmac-platform.c
++++ b/drivers/dma/dw-axi-dmac/dw-axi-dmac-platform.c
+@@ -635,14 +635,10 @@ static int dma_chan_terminate_all(struct dma_chan *dchan)
+ 
+ 	vchan_get_all_descriptors(&chan->vc, &head);
+ 
+-	/*
+-	 * As vchan_dma_desc_free_list can access to desc_allocated list
+-	 * we need to call it in vc.lock context.
+-	 */
+-	vchan_dma_desc_free_list(&chan->vc, &head);
+-
+ 	spin_unlock_irqrestore(&chan->vc.lock, flags);
+ 
++	vchan_dma_desc_free_list(&chan->vc, &head);
++
+ 	dev_vdbg(dchan2dev(dchan), "terminated: %s\n", axi_chan_name(chan));
+ 
+ 	return 0;
+* Unmerged path drivers/dma/mediatek/mtk-uart-apdma.c
+* Unmerged path drivers/dma/owl-dma.c
+diff --git a/drivers/dma/s3c24xx-dma.c b/drivers/dma/s3c24xx-dma.c
+index 7056fe7513b4..f6fbdf12fa23 100644
+--- a/drivers/dma/s3c24xx-dma.c
++++ b/drivers/dma/s3c24xx-dma.c
+@@ -522,15 +522,6 @@ static void s3c24xx_dma_start_next_txd(struct s3c24xx_dma_chan *s3cchan)
+ 	s3c24xx_dma_start_next_sg(s3cchan, txd);
+ }
+ 
+-static void s3c24xx_dma_free_txd_list(struct s3c24xx_dma_engine *s3cdma,
+-				struct s3c24xx_dma_chan *s3cchan)
+-{
+-	LIST_HEAD(head);
+-
+-	vchan_get_all_descriptors(&s3cchan->vc, &head);
+-	vchan_dma_desc_free_list(&s3cchan->vc, &head);
+-}
+-
+ /*
+  * Try to allocate a physical channel.  When successful, assign it to
+  * this virtual channel, and initiate the next descriptor.  The
+@@ -712,8 +703,9 @@ static int s3c24xx_dma_terminate_all(struct dma_chan *chan)
+ {
+ 	struct s3c24xx_dma_chan *s3cchan = to_s3c24xx_dma_chan(chan);
+ 	struct s3c24xx_dma_engine *s3cdma = s3cchan->host;
++	LIST_HEAD(head);
+ 	unsigned long flags;
+-	int ret = 0;
++	int ret;
+ 
+ 	spin_lock_irqsave(&s3cchan->vc.lock, flags);
+ 
+@@ -737,7 +729,15 @@ static int s3c24xx_dma_terminate_all(struct dma_chan *chan)
+ 	}
+ 
+ 	/* Dequeue jobs not yet fired as well */
+-	s3c24xx_dma_free_txd_list(s3cdma, s3cchan);
++
++	vchan_get_all_descriptors(&s3cchan->vc, &head);
++
++	spin_unlock_irqrestore(&s3cchan->vc.lock, flags);
++
++	vchan_dma_desc_free_list(&s3cchan->vc, &head);
++
++	return 0;
++
+ unlock:
+ 	spin_unlock_irqrestore(&s3cchan->vc.lock, flags);
+ 
+* Unmerged path drivers/dma/sf-pdma/sf-pdma.c
+diff --git a/drivers/dma/sun4i-dma.c b/drivers/dma/sun4i-dma.c
+index f4ed3f17607c..b93d98844772 100644
+--- a/drivers/dma/sun4i-dma.c
++++ b/drivers/dma/sun4i-dma.c
+@@ -889,12 +889,13 @@ static int sun4i_dma_terminate_all(struct dma_chan *chan)
+ 	}
+ 
+ 	spin_lock_irqsave(&vchan->vc.lock, flags);
+-	vchan_dma_desc_free_list(&vchan->vc, &head);
+ 	/* Clear these so the vchan is usable again */
+ 	vchan->processing = NULL;
+ 	vchan->pchan = NULL;
+ 	spin_unlock_irqrestore(&vchan->vc.lock, flags);
+ 
++	vchan_dma_desc_free_list(&vchan->vc, &head);
++
+ 	return 0;
+ }
+ 
+diff --git a/drivers/dma/virt-dma.c b/drivers/dma/virt-dma.c
+index ceabddbb09c8..942c0f04c561 100644
+--- a/drivers/dma/virt-dma.c
++++ b/drivers/dma/virt-dma.c
+@@ -118,7 +118,11 @@ void vchan_dma_desc_free_list(struct virt_dma_chan *vc, struct list_head *head)
+ 
+ 	list_for_each_entry_safe(vd, _vd, head, node) {
+ 		if (dmaengine_desc_test_reuse(&vd->tx)) {
++			unsigned long flags;
++
++			spin_lock_irqsave(&vc->lock, flags);
+ 			list_move_tail(&vd->node, &vc->desc_allocated);
++			spin_unlock_irqrestore(&vc->lock, flags);
+ 		} else {
+ 			dev_dbg(vc->chan.device->dev, "txd %p: freeing\n", vd);
+ 			list_del(&vd->node);
