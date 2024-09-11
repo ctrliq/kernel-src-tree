@@ -1,0 +1,252 @@
+x86/boot/compressed/64: Add set_page_en/decrypted() helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] boot/compressed/64: Add set_page_en/decrypted() helpers (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 96.49%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit c81d60029a1393183d2125fcb4b64831629b8864
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c81d6002.failed
+
+The functions are needed to map the GHCB for SEV-ES guests. The GHCB
+is used for communication with the hypervisor, so its content must not
+be encrypted. After the GHCB is not needed anymore it must be mapped
+encrypted again so that the running kernel image can safely re-use the
+memory.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-23-joro@8bytes.org
+(cherry picked from commit c81d60029a1393183d2125fcb4b64831629b8864)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/kaslr_64.c
+#	arch/x86/boot/compressed/misc.h
+diff --cc arch/x86/boot/compressed/kaslr_64.c
+index 9557c5a15b91,05742f641a06..000000000000
+--- a/arch/x86/boot/compressed/kaslr_64.c
++++ b/arch/x86/boot/compressed/kaslr_64.c
+@@@ -22,8 -22,12 +22,15 @@@
+  #include "misc.h"
+  
+  /* These actually do the work of building the kernel identity maps. */
+++<<<<<<< HEAD:arch/x86/boot/compressed/kaslr_64.c
+++=======
++ #include <linux/pgtable.h>
++ #include <asm/cmpxchg.h>
++ #include <asm/trap_pf.h>
++ #include <asm/trapnr.h>
+++>>>>>>> c81d60029a13 (x86/boot/compressed/64: Add set_page_en/decrypted() helpers):arch/x86/boot/compressed/ident_map_64.c
+  #include <asm/init.h>
+ +#include <asm/pgtable.h>
+  /* Use the static base for this part of the boot process */
+  #undef __PAGE_OFFSET
+  #define __PAGE_OFFSET __PAGE_OFFSET_BASE
+@@@ -151,3 -165,172 +158,175 @@@ void finalize_identity_maps(void
+  {
+  	write_cr3(top_level_pgt);
+  }
+++<<<<<<< HEAD:arch/x86/boot/compressed/kaslr_64.c
+++=======
++ 
++ static pte_t *split_large_pmd(struct x86_mapping_info *info,
++ 			      pmd_t *pmdp, unsigned long __address)
++ {
++ 	unsigned long page_flags;
++ 	unsigned long address;
++ 	pte_t *pte;
++ 	pmd_t pmd;
++ 	int i;
++ 
++ 	pte = (pte_t *)info->alloc_pgt_page(info->context);
++ 	if (!pte)
++ 		return NULL;
++ 
++ 	address     = __address & PMD_MASK;
++ 	/* No large page - clear PSE flag */
++ 	page_flags  = info->page_flag & ~_PAGE_PSE;
++ 
++ 	/* Populate the PTEs */
++ 	for (i = 0; i < PTRS_PER_PMD; i++) {
++ 		set_pte(&pte[i], __pte(address | page_flags));
++ 		address += PAGE_SIZE;
++ 	}
++ 
++ 	/*
++ 	 * Ideally we need to clear the large PMD first and do a TLB
++ 	 * flush before we write the new PMD. But the 2M range of the
++ 	 * PMD might contain the code we execute and/or the stack
++ 	 * we are on, so we can't do that. But that should be safe here
++ 	 * because we are going from large to small mappings and we are
++ 	 * also the only user of the page-table, so there is no chance
++ 	 * of a TLB multihit.
++ 	 */
++ 	pmd = __pmd((unsigned long)pte | info->kernpg_flag);
++ 	set_pmd(pmdp, pmd);
++ 	/* Flush TLB to establish the new PMD */
++ 	write_cr3(top_level_pgt);
++ 
++ 	return pte + pte_index(__address);
++ }
++ 
++ static void clflush_page(unsigned long address)
++ {
++ 	unsigned int flush_size;
++ 	char *cl, *start, *end;
++ 
++ 	/*
++ 	 * Hardcode cl-size to 64 - CPUID can't be used here because that might
++ 	 * cause another #VC exception and the GHCB is not ready to use yet.
++ 	 */
++ 	flush_size = 64;
++ 	start      = (char *)(address & PAGE_MASK);
++ 	end        = start + PAGE_SIZE;
++ 
++ 	/*
++ 	 * First make sure there are no pending writes on the cache-lines to
++ 	 * flush.
++ 	 */
++ 	asm volatile("mfence" : : : "memory");
++ 
++ 	for (cl = start; cl != end; cl += flush_size)
++ 		clflush(cl);
++ }
++ 
++ static int set_clr_page_flags(struct x86_mapping_info *info,
++ 			      unsigned long address,
++ 			      pteval_t set, pteval_t clr)
++ {
++ 	pgd_t *pgdp = (pgd_t *)top_level_pgt;
++ 	p4d_t *p4dp;
++ 	pud_t *pudp;
++ 	pmd_t *pmdp;
++ 	pte_t *ptep, pte;
++ 
++ 	/*
++ 	 * First make sure there is a PMD mapping for 'address'.
++ 	 * It should already exist, but keep things generic.
++ 	 *
++ 	 * To map the page just read from it and fault it in if there is no
++ 	 * mapping yet. add_identity_map() can't be called here because that
++ 	 * would unconditionally map the address on PMD level, destroying any
++ 	 * PTE-level mappings that might already exist. Use assembly here so
++ 	 * the access won't be optimized away.
++ 	 */
++ 	asm volatile("mov %[address], %%r9"
++ 		     :: [address] "g" (*(unsigned long *)address)
++ 		     : "r9", "memory");
++ 
++ 	/*
++ 	 * The page is mapped at least with PMD size - so skip checks and walk
++ 	 * directly to the PMD.
++ 	 */
++ 	p4dp = p4d_offset(pgdp, address);
++ 	pudp = pud_offset(p4dp, address);
++ 	pmdp = pmd_offset(pudp, address);
++ 
++ 	if (pmd_large(*pmdp))
++ 		ptep = split_large_pmd(info, pmdp, address);
++ 	else
++ 		ptep = pte_offset_kernel(pmdp, address);
++ 
++ 	if (!ptep)
++ 		return -ENOMEM;
++ 
++ 	/*
++ 	 * Changing encryption attributes of a page requires to flush it from
++ 	 * the caches.
++ 	 */
++ 	if ((set | clr) & _PAGE_ENC)
++ 		clflush_page(address);
++ 
++ 	/* Update PTE */
++ 	pte = *ptep;
++ 	pte = pte_set_flags(pte, set);
++ 	pte = pte_clear_flags(pte, clr);
++ 	set_pte(ptep, pte);
++ 
++ 	/* Flush TLB after changing encryption attribute */
++ 	write_cr3(top_level_pgt);
++ 
++ 	return 0;
++ }
++ 
++ int set_page_decrypted(unsigned long address)
++ {
++ 	return set_clr_page_flags(&mapping_info, address, 0, _PAGE_ENC);
++ }
++ 
++ int set_page_encrypted(unsigned long address)
++ {
++ 	return set_clr_page_flags(&mapping_info, address, _PAGE_ENC, 0);
++ }
++ 
++ static void do_pf_error(const char *msg, unsigned long error_code,
++ 			unsigned long address, unsigned long ip)
++ {
++ 	error_putstr(msg);
++ 
++ 	error_putstr("\nError Code: ");
++ 	error_puthex(error_code);
++ 	error_putstr("\nCR2: 0x");
++ 	error_puthex(address);
++ 	error_putstr("\nRIP relative to _head: 0x");
++ 	error_puthex(ip - (unsigned long)_head);
++ 	error_putstr("\n");
++ 
++ 	error("Stopping.\n");
++ }
++ 
++ void do_boot_page_fault(struct pt_regs *regs, unsigned long error_code)
++ {
++ 	unsigned long address = native_read_cr2() & PMD_MASK;
++ 	unsigned long end = address + PMD_SIZE;
++ 
++ 	/*
++ 	 * Check for unexpected error codes. Unexpected are:
++ 	 *	- Faults on present pages
++ 	 *	- User faults
++ 	 *	- Reserved bits set
++ 	 */
++ 	if (error_code & (X86_PF_PROT | X86_PF_USER | X86_PF_RSVD))
++ 		do_pf_error("Unexpected page-fault:", error_code, address, regs->ip);
++ 
++ 	/*
++ 	 * Error code is sane - now identity map the 2M region around
++ 	 * the faulting address.
++ 	 */
++ 	add_identity_map(address, end);
++ }
+++>>>>>>> c81d60029a13 (x86/boot/compressed/64: Add set_page_en/decrypted() helpers):arch/x86/boot/compressed/ident_map_64.c
+diff --cc arch/x86/boot/compressed/misc.h
+index d55a1ca4f95b,01c0fb3417ca..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -94,17 -98,9 +94,22 @@@ static inline void choose_random_locati
+  #endif
+  
+  #ifdef CONFIG_X86_64
+++<<<<<<< HEAD
+ +void initialize_identity_maps(void);
+ +void add_identity_map(unsigned long start, unsigned long size);
+ +void finalize_identity_maps(void);
+++=======
++ extern int set_page_decrypted(unsigned long address);
++ extern int set_page_encrypted(unsigned long address);
+++>>>>>>> c81d60029a13 (x86/boot/compressed/64: Add set_page_en/decrypted() helpers)
+  extern unsigned char _pgtable[];
+ +#else
+ +static inline void initialize_identity_maps(void)
+ +{ }
+ +static inline void add_identity_map(unsigned long start, unsigned long size)
+ +{ }
+ +static inline void finalize_identity_maps(void)
+ +{ }
+  #endif
+  
+  #ifdef CONFIG_EARLY_PRINTK
+* Unmerged path arch/x86/boot/compressed/kaslr_64.c
+* Unmerged path arch/x86/boot/compressed/misc.h
