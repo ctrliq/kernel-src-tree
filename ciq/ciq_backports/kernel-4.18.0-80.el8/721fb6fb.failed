@@ -1,0 +1,127 @@
+fsnotify: Fix busy inodes during unmount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jan Kara <jack@suse.cz>
+commit 721fb6fbfd2132164c2e8777cc837f9b2c1794dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/721fb6fb.failed
+
+Detaching of mark connector from fsnotify_put_mark() can race with
+unmounting of the filesystem like:
+
+  CPU1				CPU2
+fsnotify_put_mark()
+  spin_lock(&conn->lock);
+  ...
+  inode = fsnotify_detach_connector_from_object(conn)
+  spin_unlock(&conn->lock);
+				generic_shutdown_super()
+				  fsnotify_unmount_inodes()
+				    sees connector detached for inode
+				      -> nothing to do
+				  evict_inode()
+				    barfs on pending inode reference
+  iput(inode);
+
+Resulting in "Busy inodes after unmount" message and possible kernel
+oops. Make fsnotify_unmount_inodes() properly wait for outstanding inode
+references from detached connectors.
+
+Note that the accounting of outstanding inode references in the
+superblock can cause some cacheline contention on the counter. OTOH it
+happens only during deletion of the last notification mark from an inode
+(or during unlinking of watched inode) and that is not too bad. I have
+measured time to create & delete inotify watch 100000 times from 64
+processes in parallel (each process having its own inotify group and its
+own file on a shared superblock) on a 64 CPU machine. Average and
+standard deviation of 15 runs look like:
+
+	Avg		Stddev
+Vanilla	9.817400	0.276165
+Fixed	9.710467	0.228294
+
+So there's no statistically significant difference.
+
+Fixes: 6b3f05d24d35 ("fsnotify: Detach mark from object list when last reference is dropped")
+CC: stable@vger.kernel.org
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 721fb6fbfd2132164c2e8777cc837f9b2c1794dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/mark.c
+diff --cc fs/notify/mark.c
+index 61f4c5fa34c7,d2dd16cb5989..000000000000
+--- a/fs/notify/mark.c
++++ b/fs/notify/mark.c
+@@@ -166,20 -187,24 +167,31 @@@ static void *fsnotify_detach_connector_
+  {
+  	struct inode *inode = NULL;
+  
+++<<<<<<< HEAD
+++=======
++ 	*type = conn->type;
++ 	if (conn->type == FSNOTIFY_OBJ_TYPE_DETACHED)
++ 		return NULL;
++ 
+++>>>>>>> 721fb6fbfd21 (fsnotify: Fix busy inodes during unmount)
+  	if (conn->type == FSNOTIFY_OBJ_TYPE_INODE) {
+ -		inode = fsnotify_conn_inode(conn);
+ +		inode = conn->inode;
+ +		rcu_assign_pointer(inode->i_fsnotify_marks, NULL);
+  		inode->i_fsnotify_mask = 0;
+++<<<<<<< HEAD
+ +		conn->inode = NULL;
+ +		conn->type = FSNOTIFY_OBJ_TYPE_DETACHED;
+++=======
++ 		atomic_long_inc(&inode->i_sb->s_fsnotify_inode_refs);
+++>>>>>>> 721fb6fbfd21 (fsnotify: Fix busy inodes during unmount)
+  	} else if (conn->type == FSNOTIFY_OBJ_TYPE_VFSMOUNT) {
+ -		fsnotify_conn_mount(conn)->mnt_fsnotify_mask = 0;
+ -	} else if (conn->type == FSNOTIFY_OBJ_TYPE_SB) {
+ -		fsnotify_conn_sb(conn)->s_fsnotify_mask = 0;
+ +		rcu_assign_pointer(real_mount(conn->mnt)->mnt_fsnotify_marks,
+ +				   NULL);
+ +		real_mount(conn->mnt)->mnt_fsnotify_mask = 0;
+ +		conn->mnt = NULL;
+ +		conn->type = FSNOTIFY_OBJ_TYPE_DETACHED;
+  	}
+  
+ -	rcu_assign_pointer(*(conn->obj), NULL);
+ -	conn->obj = NULL;
+ -	conn->type = FSNOTIFY_OBJ_TYPE_DETACHED;
+ -
+  	return inode;
+  }
+  
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 6f92b9bddf6a..14b4ac5256d1 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -96,6 +96,9 @@ void fsnotify_unmount_inodes(struct super_block *sb)
+ 
+ 	if (iput_inode)
+ 		iput(iput_inode);
++	/* Wait for outstanding inode references from connectors */
++	wait_var_event(&sb->s_fsnotify_inode_refs,
++		       !atomic_long_read(&sb->s_fsnotify_inode_refs));
+ }
+ 
+ /*
+* Unmerged path fs/notify/mark.c
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 6f009fb80ab1..bd0a0f455c0e 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -1410,6 +1410,9 @@ struct super_block {
+ 	/* Number of inodes with nlink == 0 but still referenced */
+ 	atomic_long_t s_remove_count;
+ 
++	/* Pending fsnotify inode refs */
++	atomic_long_t s_fsnotify_inode_refs;
++
+ 	/* Being remounted read-only */
+ 	int s_readonly_remount;
+ 
