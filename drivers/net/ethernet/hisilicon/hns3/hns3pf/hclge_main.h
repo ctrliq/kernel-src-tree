@@ -452,6 +452,9 @@ struct hclge_dev {
 	u32 flag;
 
 	u32 pkt_buf_size; /* Total pf buf size for tx/rx */
+	u32 tx_buf_size; /* Tx buffer size for each TC */
+	u32 dv_buf_size; /* Dv buffer size for each TC */
+
 	u32 mps; /* Max packet size */
 
 	enum hclge_mta_dmac_sel_type mta_mac_sel_type;
