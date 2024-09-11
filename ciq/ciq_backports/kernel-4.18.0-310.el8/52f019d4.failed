@@ -1,0 +1,281 @@
+block: add a hard-readonly flag to struct gendisk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 52f019d43c229afd65dc11c8c1b05b6436bf6765
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/52f019d4.failed
+
+Commit 20bd1d026aac ("scsi: sd: Keep disk read-only when re-reading
+partition") addressed a long-standing problem with user read-only
+policy being overridden as a result of a device-initiated revalidate.
+The commit has since been reverted due to a regression that left some
+USB devices read-only indefinitely.
+
+To fix the underlying problems with revalidate we need to keep track
+of hardware state and user policy separately.
+
+The gendisk has been updated to reflect the current hardware state set
+by the device driver. This is done to allow returning the device to
+the hardware state once the user clears the BLKROSET flag.
+
+The resulting semantics are as follows:
+
+ - If BLKROSET sets a given partition read-only, that partition will
+   remain read-only even if the underlying storage stack initiates a
+   revalidate. However, the BLKRRPART ioctl will cause the partition
+   table to be dropped and any user policy on partitions will be lost.
+
+ - If BLKROSET has not been set, both the whole disk device and any
+   partitions will reflect the current write-protect state of the
+   underlying device.
+
+Based on a patch from Martin K. Petersen <martin.petersen@oracle.com>.
+
+	Reported-by: Oleksii Kurochko <olkuroch@cisco.com>
+Bugzilla: https://bugzilla.kernel.org/show_bug.cgi?id=201221
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 52f019d43c229afd65dc11c8c1b05b6436bf6765)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/genhd.c
+#	block/partitions/core.c
+#	include/linux/genhd.h
+diff --cc block/blk-core.c
+index c69bafa06369,08ff8ca32529..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -862,11 -692,9 +862,15 @@@ static inline bool should_fail_request(
+  
+  #endif /* CONFIG_FAIL_MAKE_REQUEST */
+  
+ -static inline bool bio_check_ro(struct bio *bio, struct block_device *part)
+ +static inline bool bio_check_ro(struct bio *bio, struct hd_struct *part)
+  {
+++<<<<<<< HEAD
+ +	const int op = bio_op(bio);
+ +
+ +	if (part->policy && op_is_write(op)) {
+++=======
++ 	if (op_is_write(bio_op(bio)) && bdev_read_only(part)) {
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  		char b[BDEVNAME_SIZE];
+  
+  		if (op_is_flush(bio->bi_opf) && !bio_sectors(bio))
+diff --cc block/genhd.c
+index 18f6483e37be,1873e4571328..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -1934,59 -1637,35 +1934,85 @@@ static void set_disk_ro_uevent(struct g
+  	kobject_uevent_env(&disk_to_dev(gd)->kobj, KOBJ_CHANGE, envp);
+  }
+  
+++<<<<<<< HEAD
+ +void set_device_ro(struct block_device *bdev, int flag)
+ +{
+ +	bdev->bd_part->policy = flag;
+ +}
+ +
+ +EXPORT_SYMBOL(set_device_ro);
+ +
+ +void set_disk_ro(struct gendisk *disk, int flag)
+ +{
+ +	struct disk_part_iter piter;
+ +	struct hd_struct *part;
+ +
+ +	if (disk->part0.policy != flag) {
+ +		set_disk_ro_uevent(disk, flag);
+ +		disk->part0.policy = flag;
+ +	}
+ +
+ +	disk_part_iter_init(&piter, disk, DISK_PITER_INCL_EMPTY);
+ +	while ((part = disk_part_iter_next(&piter)))
+ +		part->policy = flag;
+ +	disk_part_iter_exit(&piter);
+++=======
++ /**
++  * set_disk_ro - set a gendisk read-only
++  * @disk:	gendisk to operate on
++  * @ready_only:	%true to set the disk read-only, %false set the disk read/write
++  *
++  * This function is used to indicate whether a given disk device should have its
++  * read-only flag set. set_disk_ro() is typically used by device drivers to
++  * indicate whether the underlying physical device is write-protected.
++  */
++ void set_disk_ro(struct gendisk *disk, bool read_only)
++ {
++ 	if (read_only) {
++ 		if (test_and_set_bit(GD_READ_ONLY, &disk->state))
++ 			return;
++ 	} else {
++ 		if (!test_and_clear_bit(GD_READ_ONLY, &disk->state))
++ 			return;
++ 	}
++ 	set_disk_ro_uevent(disk, read_only);
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  }
+- 
+  EXPORT_SYMBOL(set_disk_ro);
+  
+  int bdev_read_only(struct block_device *bdev)
+  {
+++<<<<<<< HEAD
+ +	if (!bdev)
+ +		return 0;
+ +	return bdev->bd_part->policy;
+++=======
++ 	return bdev->bd_read_only ||
++ 		test_bit(GD_READ_ONLY, &bdev->bd_disk->state);
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  }
+ +
+  EXPORT_SYMBOL(bdev_read_only);
+  
+ +int invalidate_partition(struct gendisk *disk, int partno)
+ +{
+ +	int res = 0;
+ +	struct block_device *bdev = bdget_disk(disk, partno);
+ +	if (bdev) {
+ +		fsync_bdev(bdev);
+ +		res = __invalidate_device(bdev, true);
+ +		/*
+ +		 * Unhash the bdev inode for this device so that it gets evicted as soon
+ +		 * as last inode reference is dropped.
+ +		 */
+ +		remove_inode_hash(bdev->bd_inode);
+ +		bdput(bdev);
+ +	}
+ +	return res;
+ +}
+ +
+ +EXPORT_SYMBOL(invalidate_partition);
+ +
+  /*
+   * Disk events - monitor disk events like media change and eject request.
+   */
+diff --cc block/partitions/core.c
+index 9e97e6d9a3bd,168d5906077c..000000000000
+--- a/block/partitions/core.c
++++ b/block/partitions/core.c
+@@@ -191,8 -195,7 +191,12 @@@ static ssize_t part_start_show(struct d
+  static ssize_t part_ro_show(struct device *dev,
+  			    struct device_attribute *attr, char *buf)
+  {
+++<<<<<<< HEAD
+ +	struct hd_struct *p = dev_to_part(dev);
+ +	return sprintf(buf, "%d\n", p->policy ? 1 : 0);
+++=======
++ 	return sprintf(buf, "%d\n", bdev_read_only(dev_to_bdev(dev)));
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  }
+  
+  static ssize_t part_alignment_offset_show(struct device *dev,
+@@@ -387,39 -355,21 +391,46 @@@ static struct hd_struct *add_partition(
+  	if (ptbl->part[partno])
+  		return ERR_PTR(-EBUSY);
+  
+ -	bdev = bdev_alloc(disk, partno);
+ -	if (!bdev)
+ -		return ERR_PTR(-ENOMEM);
+ +	p = kzalloc(sizeof(*p), GFP_KERNEL);
+ +	if (!p)
+ +		return ERR_PTR(-EBUSY);
+  
+++<<<<<<< HEAD
+ +	if (!init_part_stats(p)) {
+++=======
++ 	bdev->bd_start_sect = start;
++ 	bdev_set_nr_sectors(bdev, len);
++ 
++ 	if (info) {
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  		err = -ENOMEM;
+ -		bdev->bd_meta_info = kmemdup(info, sizeof(*info), GFP_KERNEL);
+ -		if (!bdev->bd_meta_info)
+ -			goto out_bdput;
+ +		goto out_free;
+ +	}
+ +
+ +	hd_sects_seq_init(p);
+ +	pdev = part_to_dev(p);
+ +
+ +	p->start_sect = start;
+ +	p->alignment_offset =
+ +		queue_limit_alignment_offset(&disk->queue->limits, start);
+ +	p->discard_alignment =
+ +		queue_limit_discard_alignment(&disk->queue->limits, start);
+ +	p->nr_sects = len;
+ +	p->partno = partno;
+ +	p->policy = get_disk_ro(disk);
+ +
+ +	if (info) {
+ +		struct partition_meta_info *pinfo;
+ +
+ +		pinfo = kzalloc_node(sizeof(*pinfo), GFP_KERNEL, disk->node_id);
+ +		if (!pinfo) {
+ +			err = -ENOMEM;
+ +			goto out_free_stats;
+ +		}
+ +		memcpy(pinfo, info, sizeof(*info));
+ +		p->info = pinfo;
+  	}
+  
+ -	pdev = &bdev->bd_device;
+  	dname = dev_name(ddev);
+  	if (isdigit(dname[strlen(dname) - 1]))
+  		dev_set_name(pdev, "%sp%d", dname, partno);
+diff --cc include/linux/genhd.h
+index ab3e8cf6203e,a62ccbfac54b..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -208,7 -161,9 +208,13 @@@ struct gendisk 
+  	void *private_data;
+  
+  	int flags;
+++<<<<<<< HEAD
+ +	struct rw_semaphore lookup_sem;
+++=======
++ 	unsigned long state;
++ #define GD_NEED_PART_SCAN		0
++ #define GD_READ_ONLY			1
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  	struct kobject *slave_dir;
+  
+  	struct timer_rand_state *random;
+@@@ -426,15 -248,14 +432,24 @@@ static inline void add_disk_no_queue_re
+  }
+  
+  extern void del_gendisk(struct gendisk *gp);
+ +extern struct gendisk *get_gendisk(dev_t dev, int *partno);
+  extern struct block_device *bdget_disk(struct gendisk *disk, int partno);
+  
+++<<<<<<< HEAD
+ +extern void set_device_ro(struct block_device *bdev, int flag);
+ +extern void set_disk_ro(struct gendisk *disk, int flag);
+ +
+ +static inline int get_disk_ro(struct gendisk *disk)
+ +{
+ +	return disk->part0.policy;
+++=======
++ void set_disk_ro(struct gendisk *disk, bool read_only);
++ 
++ static inline int get_disk_ro(struct gendisk *disk)
++ {
++ 	return disk->part0->bd_read_only ||
++ 		test_bit(GD_READ_ONLY, &disk->state);
+++>>>>>>> 52f019d43c22 (block: add a hard-readonly flag to struct gendisk)
+  }
+  
+  extern void disk_block_events(struct gendisk *disk);
+* Unmerged path block/blk-core.c
+* Unmerged path block/genhd.c
+* Unmerged path block/partitions/core.c
+* Unmerged path include/linux/genhd.h
