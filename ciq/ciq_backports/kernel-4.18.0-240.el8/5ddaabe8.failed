@@ -1,0 +1,329 @@
+nvme: refactor command completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5ddaabe8ed713f148e3d67e99b86d99427aceb5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5ddaabe8.failed
+
+Lift all the code to decide the dispostition of a completed command
+from nvme_complete_rq and nvme_failover_req into a new helper, which
+returns an emum of the potential actions.  nvme_complete_rq then
+just switches on those and calls the proper helper for the action.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5ddaabe8ed713f148e3d67e99b86d99427aceb5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+#	drivers/nvme/host/multipath.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/core.c
+index 54bfa09c007b,9e75f6f62471..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -259,30 -257,65 +248,86 @@@ static void nvme_retry_req(struct reque
+  	blk_mq_delay_kick_requeue_list(req->q, delay);
+  }
+  
+- void nvme_complete_rq(struct request *req)
++ enum nvme_disposition {
++ 	COMPLETE,
++ 	RETRY,
++ 	FAILOVER,
++ };
++ 
++ static inline enum nvme_disposition nvme_decide_disposition(struct request *req)
++ {
++ 	if (likely(nvme_req(req)->status == 0))
++ 		return COMPLETE;
++ 
++ 	if (blk_noretry_request(req) ||
++ 	    (nvme_req(req)->status & NVME_SC_DNR) ||
++ 	    nvme_req(req)->retries >= nvme_max_retries)
++ 		return COMPLETE;
++ 
++ 	if (req->cmd_flags & REQ_NVME_MPATH) {
++ 		if (nvme_is_path_error(nvme_req(req)->status))
++ 			return FAILOVER;
++ 	}
++ 
++ 	if (blk_queue_dying(req->q))
++ 		return COMPLETE;
++ 
++ 	return RETRY;
++ }
++ 
++ static inline void nvme_end_req(struct request *req)
+  {
+ -	blk_status_t status = nvme_error_status(nvme_req(req)->status);
+ +	blk_status_t status = nvme_error_status(req);
+  
+- 	trace_nvme_complete_rq(req);
++ 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
++ 	    req_op(req) == REQ_OP_ZONE_APPEND)
++ 		req->__sector = nvme_lba_to_sect(req->q->queuedata,
++ 			le64_to_cpu(nvme_req(req)->result.u64));
+  
+++<<<<<<< HEAD
+ +	if (nvme_req(req)->ctrl->kas)
+ +		nvme_req(req)->ctrl->comp_seen = true;
+ +
+ +	if (unlikely(status != BLK_STS_OK && nvme_req_needs_retry(req))) {
+ +		if (blk_path_error(status)) {
+ +			if (req->cmd_flags & REQ_NVME_MPATH) {
+ +				nvme_failover_req(req);
+ +				return;
+ +			}
+ +			nvme_update_ana(req);
+ +		}
+ +
+ +		if (!blk_queue_dying(req->q)) {
+ +			nvme_retry_req(req);
+ +			return;
+ +		}
+ +	}
+ +	blk_mq_end_request(req, status);
+++=======
++ 	nvme_trace_bio_complete(req, status);
++ 	blk_mq_end_request(req, status);
++ }
++ 
++ void nvme_complete_rq(struct request *req)
++ {
++ 	trace_nvme_complete_rq(req);
++ 	nvme_cleanup_cmd(req);
++ 
++ 	if (nvme_req(req)->ctrl->kas)
++ 		nvme_req(req)->ctrl->comp_seen = true;
++ 
++ 	switch (nvme_decide_disposition(req)) {
++ 	case COMPLETE:
++ 		nvme_end_req(req);
++ 		return;
++ 	case RETRY:
++ 		nvme_retry_req(req);
++ 		return;
++ 	case FAILOVER:
++ 		nvme_failover_req(req);
++ 		return;
++ 	}
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  }
+  EXPORT_SYMBOL_GPL(nvme_complete_rq);
+  
+diff --cc drivers/nvme/host/multipath.c
+index 32d9f1d9cee4,d4ba736c6c89..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -64,79 -65,29 +64,102 @@@ void nvme_set_disk_name(char *disk_name
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static bool nvme_ana_error(u16 status)
+ +{
+ +	switch (status & 0x7ff) {
+ +	case NVME_SC_ANA_TRANSITION:
+ +	case NVME_SC_ANA_INACCESSIBLE:
+ +	case NVME_SC_ANA_PERSISTENT_LOSS:
+ +		return true;
+ +	}
+ +	return false;
+ +}
+ +
+ +static void __nvme_update_ana(struct nvme_ns *ns)
+ +{
+ +	if (!ns->ctrl->ana_log_buf)
+ +		return;
+ +
+ +	set_bit(NVME_NS_ANA_PENDING, &ns->flags);
+ +	queue_work(nvme_wq, &ns->ctrl->ana_work);
+ +}
+ +
+ +void nvme_update_ana(struct request *req)
+ +{
+ +	struct nvme_ns *ns = req->q->queuedata;
+ +	u16 status = nvme_req(req)->status;
+ +
+ +	if (nvme_ana_error(status))
+ +		__nvme_update_ana(ns);
+ +}
+ +
+++=======
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  void nvme_failover_req(struct request *req)
+  {
+  	struct nvme_ns *ns = req->q->queuedata;
+- 	u16 status = nvme_req(req)->status;
++ 	u16 status = nvme_req(req)->status & 0x7ff;
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(&ns->head->requeue_lock, flags);
+ +	blk_steal_bios(&ns->head->requeue_list, req);
+ +	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
+ +	blk_mq_end_request(req, 0);
+ +
+ +	if (nvme_ana_error(status)) {
+ +		/*
+ +		 * If we got back an ANA error we know the controller is alive,
+ +		 * but not ready to serve this namespaces.  The spec suggests
+ +		 * we should update our general state here, but due to the fact
+ +		 * that the admin and I/O queues are not serialized that is
+ +		 * fundamentally racy.  So instead just clear the current path,
+ +		 * mark the path as pending and kick off a re-read of the ANA
+ +		 * log page ASAP.
+ +		 */
+ +		nvme_mpath_clear_current_path(ns);
+ +		__nvme_update_ana(ns);
+ +		goto kick_requeue;
+ +	}
+ +
+ +	switch (status & 0x7ff) {
+ +	case NVME_SC_HOST_PATH_ERROR:
+ +		/*
+ +		 * Temporary transport disruption in talking to the controller.
+ +		 * Try to send on a new path.
+ +		 */
+ +		nvme_mpath_clear_current_path(ns);
+ +		break;
+ +	default:
+ +		/*
+ +		 * Reset the controller for any non-ANA error as we don't know
+ +		 * what caused the error.
+ +		 */
+ +		nvme_reset_ctrl(ns->ctrl);
+ +		break;
+ +	}
+ +
+ +kick_requeue:
+++=======
++ 	nvme_mpath_clear_current_path(ns);
++ 
++ 	/*
++ 	 * If we got back an ANA error, we know the controller is alive but not
++ 	 * ready to serve this namespace.  Kick of a re-read of the ANA
++ 	 * information page, and just try any other available path for now.
++ 	 */
++ 	if (nvme_is_ana_error(status) && ns->ctrl->ana_log_buf) {
++ 		set_bit(NVME_NS_ANA_PENDING, &ns->flags);
++ 		queue_work(nvme_wq, &ns->ctrl->ana_work);
++ 	}
++ 
++ 	spin_lock_irqsave(&ns->head->requeue_lock, flags);
++ 	blk_steal_bios(&ns->head->requeue_list, req);
++ 	spin_unlock_irqrestore(&ns->head->requeue_lock, flags);
++ 
++ 	blk_mq_end_request(req, 0);
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  	kblockd_schedule_work(&ns->head->requeue_work);
+  }
+  
+diff --cc drivers/nvme/host/nvme.h
+index 09ed30add536,4ff6fd289082..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -404,12 -499,63 +404,64 @@@ static inline int nvme_reset_subsystem(
+  	return ctrl->ops->reg_write32(ctrl, NVME_REG_NSSR, 0x4E564D65);
+  }
+  
+ -/*
+ - * Convert a 512B sector number to a device logical block number.
+ - */
+ -static inline u64 nvme_sect_to_lba(struct nvme_ns *ns, sector_t sector)
+ +static inline u64 nvme_block_nr(struct nvme_ns *ns, sector_t sector)
+  {
+ -	return sector >> (ns->lba_shift - SECTOR_SHIFT);
+ +	return (sector >> (ns->lba_shift - 9));
+  }
+  
+++<<<<<<< HEAD
+ +static inline void nvme_end_request(struct request *req, __le16 status,
+++=======
++ /*
++  * Convert a device logical block number to a 512B sector number.
++  */
++ static inline sector_t nvme_lba_to_sect(struct nvme_ns *ns, u64 lba)
++ {
++ 	return lba << (ns->lba_shift - SECTOR_SHIFT);
++ }
++ 
++ /*
++  * Convert byte length to nvme's 0-based num dwords
++  */
++ static inline u32 nvme_bytes_to_numd(size_t len)
++ {
++ 	return (len >> 2) - 1;
++ }
++ 
++ static inline bool nvme_is_ana_error(u16 status)
++ {
++ 	switch (status & 0x7ff) {
++ 	case NVME_SC_ANA_TRANSITION:
++ 	case NVME_SC_ANA_INACCESSIBLE:
++ 	case NVME_SC_ANA_PERSISTENT_LOSS:
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static inline bool nvme_is_path_error(u16 status)
++ {
++ 	switch (status & 0x7ff) {
++ 	case NVME_SC_HOST_PATH_ERROR:
++ 	case NVME_SC_HOST_ABORTED_CMD:
++ 	case NVME_SC_ANA_TRANSITION:
++ 	case NVME_SC_ANA_INACCESSIBLE:
++ 	case NVME_SC_ANA_PERSISTENT_LOSS:
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ /*
++  * Fill in the status and result information from the CQE, and then figure out
++  * if blk-mq will need to use IPI magic to complete the request, and if yes do
++  * so.  If not let the caller complete the request without an indirect function
++  * call.
++  */
++ static inline bool nvme_try_complete_req(struct request *req, __le16 status,
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  		union nvme_result result)
+  {
+  	struct nvme_request *rq = nvme_req(req);
+@@@ -505,7 -662,6 +557,10 @@@ void nvme_mpath_start_freeze(struct nvm
+  void nvme_set_disk_name(char *disk_name, struct nvme_ns *ns,
+  			struct nvme_ctrl *ctrl, int *flags);
+  void nvme_failover_req(struct request *req);
+++<<<<<<< HEAD
+ +void nvme_update_ana(struct request *req);
+++=======
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl);
+  int nvme_mpath_alloc_disk(struct nvme_ctrl *ctrl,struct nvme_ns_head *head);
+  void nvme_mpath_add_disk(struct nvme_ns *ns, struct nvme_id_ns *id);
+@@@ -545,9 -721,6 +600,12 @@@ static inline void nvme_set_disk_name(c
+  }
+  
+  static inline void nvme_failover_req(struct request *req)
+++<<<<<<< HEAD
+ +{
+ +}
+ +static inline void nvme_update_ana(struct request *req)
+++=======
+++>>>>>>> 5ddaabe8ed71 (nvme: refactor command completion)
+  {
+  }
+  static inline void nvme_kick_requeue_lists(struct nvme_ctrl *ctrl)
+* Unmerged path drivers/nvme/host/core.c
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/nvme.h
