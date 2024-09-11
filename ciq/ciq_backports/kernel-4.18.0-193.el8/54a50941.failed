@@ -1,0 +1,403 @@
+s390/qeth: stop/wake TX queues based on their fill level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 54a50941b7db8726732919daa859b931a9f496e2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/54a50941.failed
+
+Current xmit code only stops the txq after attempting to fill an
+IO buffer that hasn't been TX-completed yet. In many-connection
+scenarios, this can result in frequent rejected TX attempts, requeuing
+of skbs with NETDEV_TX_BUSY and extra overhead.
+
+Now that we have a proper 1-to-1 relation between stack-side txqs and
+our HW Queues, overhaul the stop/wake logic so that the xmit code
+stops the txq as needed.
+Given that we might map multiple skbs into a single buffer, it's crucial
+to ensure that the queue always provides an _entirely_ empty IO buffer.
+Otherwise large skbs (eg TSO) might not fit into the last available
+buffer. So whenever qeth_do_send_packet() first utilizes an _empty_
+buffer, it updates & checks the used_buffers count.
+
+This now ensures that an skb passed to qeth_xmit() can always be mapped
+into an IO buffer, so remove all of the -EBUSY roll-back handling in the
+TX path. We preserve the minimal safety-checks ("Is this IO buffer
+really available?"), just in case some nasty future bug ever attempts to
+corrupt an in-use buffer.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 54a50941b7db8726732919daa859b931a9f496e2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_ethtool.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index 3f448d239de7,fbaf434e2e34..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -472,6 -448,48 +472,51 @@@ enum qeth_out_q_states 
+         QETH_OUT_Q_LOCKED_FLUSH,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define QETH_CARD_STAT_ADD(_c, _stat, _val)	((_c)->stats._stat += (_val))
++ #define QETH_CARD_STAT_INC(_c, _stat)		QETH_CARD_STAT_ADD(_c, _stat, 1)
++ 
++ #define QETH_TXQ_STAT_ADD(_q, _stat, _val)	((_q)->stats._stat += (_val))
++ #define QETH_TXQ_STAT_INC(_q, _stat)		QETH_TXQ_STAT_ADD(_q, _stat, 1)
++ 
++ struct qeth_card_stats {
++ 	u64 rx_bufs;
++ 	u64 rx_skb_csum;
++ 	u64 rx_sg_skbs;
++ 	u64 rx_sg_frags;
++ 	u64 rx_sg_alloc_page;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 rx_packets;
++ 	u64 rx_bytes;
++ 	u64 rx_errors;
++ 	u64 rx_dropped;
++ 	u64 rx_multicast;
++ };
++ 
++ struct qeth_out_q_stats {
++ 	u64 bufs;
++ 	u64 bufs_pack;
++ 	u64 buf_elements;
++ 	u64 skbs_pack;
++ 	u64 skbs_sg;
++ 	u64 skbs_csum;
++ 	u64 skbs_tso;
++ 	u64 skbs_linearized;
++ 	u64 skbs_linearized_fail;
++ 	u64 tso_bytes;
++ 	u64 packing_mode_switch;
++ 	u64 stopped;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 tx_packets;
++ 	u64 tx_bytes;
++ 	u64 tx_errors;
++ 	u64 tx_dropped;
++ };
++ 
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  struct qeth_qdio_out_q {
+  	struct qdio_buffer *qdio_bufs[QDIO_MAX_BUFFERS_PER_Q];
+  	struct qeth_qdio_out_buffer *bufs[QDIO_MAX_BUFFERS_PER_Q];
+diff --cc drivers/s390/net/qeth_core_main.c
+index a46835f1bb76,d057ead200b5..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -3428,7 -3406,6 +3427,10 @@@ static void qeth_check_outbound_queue(s
+  			 * do_send_packet. So, we check if there is a
+  			 * packing buffer to be flushed here.
+  			 */
+++<<<<<<< HEAD
+ +			netif_stop_queue(queue->card->dev);
+++=======
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  			index = queue->next_buf_to_fill;
+  			q_was_packing = queue->do_pack;
+  			/* queue->do_pack may change */
+@@@ -3557,6 -3532,8 +3559,11 @@@ static void qeth_qdio_output_handler(st
+  	struct qeth_card *card        = (struct qeth_card *) card_ptr;
+  	struct qeth_qdio_out_q *queue = card->qdio.out_qs[__queue];
+  	struct qeth_qdio_out_buffer *buffer;
+++<<<<<<< HEAD
+++=======
++ 	struct net_device *dev = card->dev;
++ 	struct netdev_queue *txq;
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  	int i;
+  
+  	QETH_CARD_TEXT(card, 6, "qdouhdl");
+@@@ -3611,7 -3588,15 +3618,19 @@@
+  	if (card->info.type != QETH_CARD_TYPE_IQD)
+  		qeth_check_outbound_queue(queue);
+  
+++<<<<<<< HEAD
+ +	netif_wake_queue(queue->card->dev);
+++=======
++ 	if (IS_IQD(card))
++ 		__queue = qeth_iqd_translate_txq(dev, __queue);
++ 	txq = netdev_get_tx_queue(dev, __queue);
++ 	/* xmit may have observed the full-condition, but not yet stopped the
++ 	 * txq. In which case the code below won't trigger. So before returning,
++ 	 * xmit will re-check the txq's fill level and wake it up if needed.
++ 	 */
++ 	if (netif_tx_queue_stopped(txq) && !qeth_out_queue_is_full(queue))
++ 		netif_tx_wake_queue(txq);
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  }
+  
+  /**
+@@@ -3898,12 -3882,11 +3919,12 @@@ static int qeth_fill_buffer(struct qeth
+  		QETH_CARD_TEXT(queue->card, 6, "fillbfnp");
+  	} else {
+  		QETH_CARD_TEXT(queue->card, 6, "fillbfpa");
+ +		if (queue->card->options.performance_stats)
+ +			queue->card->perf_stats.skbs_sent_pack++;
+  
+ -		QETH_TXQ_STAT_INC(queue, skbs_pack);
+  		/* If the buffer still has free elements, keep using it. */
+- 		if (buf->next_element_to_fill <
+- 		    QETH_MAX_BUFFER_ELEMENTS(queue->card))
++ 		if (!flush && buf->next_element_to_fill <
++ 			      QETH_MAX_BUFFER_ELEMENTS(queue->card))
+  			return 0;
+  	}
+  
+@@@ -4014,9 -4028,11 +4066,11 @@@ int qeth_do_send_packet(struct qeth_car
+  	}
+  out:
+  	/* at this point the queue is UNLOCKED again */
+ -	if (do_pack)
+ -		QETH_TXQ_STAT_ADD(queue, bufs_pack, flush_count);
+ +	if (queue->card->options.performance_stats && do_pack)
+ +		queue->card->perf_stats.bufs_sent_pack += flush_count;
+  
++ 	if (stopped && !qeth_out_queue_is_full(queue))
++ 		netif_tx_start_queue(txq);
+  	return rc;
+  }
+  EXPORT_SYMBOL_GPL(qeth_do_send_packet);
+diff --cc drivers/s390/net/qeth_ethtool.c
+index 31474f66f6bf,4166eb29f0bd..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -9,43 -9,83 +9,99 @@@
+  #include <linux/ethtool.h>
+  #include "qeth_core.h"
+  
+ -
+ -#define QETH_TXQ_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_out_q_stats, _stat) \
+ -}
+ -
+ -#define QETH_CARD_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_card_stats, _stat) \
+ -}
+ -
+ -struct qeth_stats {
+ -	char name[ETH_GSTRING_LEN];
+ -	unsigned int offset;
+ +static struct {
+ +	const char str[ETH_GSTRING_LEN];
+ +} qeth_ethtool_stats_keys[] = {
+ +/*  0 */{"rx skbs"},
+ +	{"rx buffers"},
+ +	{"tx skbs"},
+ +	{"tx buffers"},
+ +	{"tx skbs no packing"},
+ +	{"tx buffers no packing"},
+ +	{"tx skbs packing"},
+ +	{"tx buffers packing"},
+ +	{"tx sg skbs"},
+ +	{"tx buffer elements"},
+ +/* 10 */{"rx sg skbs"},
+ +	{"rx sg frags"},
+ +	{"rx sg page allocs"},
+ +	{"tx large kbytes"},
+ +	{"tx large count"},
+ +	{"tx pk state ch n->p"},
+ +	{"tx pk state ch p->n"},
+ +	{"tx pk watermark low"},
+ +	{"tx pk watermark high"},
+ +	{"queue 0 buffer usage"},
+ +/* 20 */{"queue 1 buffer usage"},
+ +	{"queue 2 buffer usage"},
+ +	{"queue 3 buffer usage"},
+ +	{"tx csum"},
+ +	{"tx lin"},
+ +	{"tx linfail"},
+ +	{"rx csum"}
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qeth_stats txq_stats[] = {
++ 	QETH_TXQ_STAT("IO buffers", bufs),
++ 	QETH_TXQ_STAT("IO buffer elements", buf_elements),
++ 	QETH_TXQ_STAT("packed IO buffers", bufs_pack),
++ 	QETH_TXQ_STAT("skbs", tx_packets),
++ 	QETH_TXQ_STAT("packed skbs", skbs_pack),
++ 	QETH_TXQ_STAT("SG skbs", skbs_sg),
++ 	QETH_TXQ_STAT("HW csum skbs", skbs_csum),
++ 	QETH_TXQ_STAT("TSO skbs", skbs_tso),
++ 	QETH_TXQ_STAT("linearized skbs", skbs_linearized),
++ 	QETH_TXQ_STAT("linearized+error skbs", skbs_linearized_fail),
++ 	QETH_TXQ_STAT("TSO bytes", tso_bytes),
++ 	QETH_TXQ_STAT("Packing mode switches", packing_mode_switch),
++ 	QETH_TXQ_STAT("Queue stopped", stopped),
++ };
++ 
++ static const struct qeth_stats card_stats[] = {
++ 	QETH_CARD_STAT("rx0 IO buffers", rx_bufs),
++ 	QETH_CARD_STAT("rx0 HW csum skbs", rx_skb_csum),
++ 	QETH_CARD_STAT("rx0 SG skbs", rx_sg_skbs),
++ 	QETH_CARD_STAT("rx0 SG page frags", rx_sg_frags),
++ 	QETH_CARD_STAT("rx0 SG page allocs", rx_sg_alloc_page),
++ };
++ 
++ #define TXQ_STATS_LEN	ARRAY_SIZE(txq_stats)
++ #define CARD_STATS_LEN	ARRAY_SIZE(card_stats)
++ 
++ static void qeth_add_stat_data(u64 **dst, void *src,
++ 			       const struct qeth_stats stats[],
++ 			       unsigned int size)
++ {
++ 	unsigned int i;
++ 	char *stat;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		stat = (char *)src + stats[i].offset;
++ 		**dst = *(u64 *)stat;
++ 		(*dst)++;
++ 	}
++ }
++ 
++ static void qeth_add_stat_strings(u8 **data, const char *prefix,
++ 				  const struct qeth_stats stats[],
++ 				  unsigned int size)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		snprintf(*data, ETH_GSTRING_LEN, "%s%s", prefix, stats[i].name);
++ 		*data += ETH_GSTRING_LEN;
++ 	}
++ }
++ 
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  static int qeth_get_sset_count(struct net_device *dev, int stringset)
+  {
+ -	struct qeth_card *card = dev->ml_priv;
+ -
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+ -		return CARD_STATS_LEN +
+ -		       card->qdio.no_out_queues * TXQ_STATS_LEN;
+ +		return (sizeof(qeth_ethtool_stats_keys) / ETH_GSTRING_LEN);
+  	default:
+  		return -EINVAL;
+  	}
+diff --cc drivers/s390/net/qeth_l2_main.c
+index ce5ce6ebbf1e,e26a6dff286f..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -613,33 -606,24 +613,45 @@@ static netdev_tx_t qeth_l2_hard_start_x
+  	int tx_bytes = skb->len;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (card->state != CARD_STATE_UP) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+ +
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+++=======
++ 	if (IS_IQD(card))
++ 		txq = qeth_iqd_translate_txq(dev, txq);
++ 	queue = card->qdio.out_qs[txq];
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  
+  	if (IS_OSN(card))
+  		rc = qeth_l2_xmit_osn(card, skb, queue);
+  	else
+ -		rc = qeth_xmit(card, skb, queue, qeth_get_ip_version(skb),
+ -			       qeth_l2_get_cast_type(skb), qeth_l2_fill_header);
+ +		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+ +			       qeth_l2_fill_header);
+  
+  	if (!rc) {
+++<<<<<<< HEAD
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+++=======
++ 		QETH_TXQ_STAT_INC(queue, tx_packets);
++ 		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  		return NETDEV_TX_OK;
+- 	} else if (rc == -EBUSY) {
+- 		return NETDEV_TX_BUSY;
+- 	} /* else fall through */
++ 	}
+  
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +tx_drop:
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+++<<<<<<< HEAD
+ +	netif_wake_queue(dev);
+++=======
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  	return NETDEV_TX_OK;
+  }
+  
+diff --cc drivers/s390/net/qeth_l3_main.c
+index f13c93b498de,4c9394105138..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -2083,9 -2083,6 +2075,12 @@@ static netdev_tx_t qeth_l3_hard_start_x
+  	if (cast_type == RTN_BROADCAST && !card->info.broadcast_capable)
+  		goto tx_drop;
+  
+++<<<<<<< HEAD
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+ +
+++=======
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  	if (ipv == 4 || IS_IQD(card))
+  		rc = qeth_l3_xmit(card, skb, queue, ipv, cast_type);
+  	else
+@@@ -2093,18 -2090,14 +2088,24 @@@
+  			       qeth_l3_fill_header);
+  
+  	if (!rc) {
+++<<<<<<< HEAD
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+++=======
++ 		QETH_TXQ_STAT_INC(queue, tx_packets);
++ 		QETH_TXQ_STAT_ADD(queue, tx_bytes, tx_bytes);
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  		return NETDEV_TX_OK;
+- 	} else if (rc == -EBUSY) {
+- 		return NETDEV_TX_BUSY;
+- 	} /* else fall through */
++ 	}
+  
+  tx_drop:
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+++<<<<<<< HEAD
+ +	netif_wake_queue(dev);
+++=======
+++>>>>>>> 54a50941b7db (s390/qeth: stop/wake TX queues based on their fill level)
+  	return NETDEV_TX_OK;
+  }
+  
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_ethtool.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
