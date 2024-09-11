@@ -1244,6 +1244,7 @@ static int nfsd4_do_async_copy(void *data)
 	cb_copy = kzalloc(sizeof(struct nfsd4_copy), GFP_KERNEL);
 	if (!cb_copy)
 		goto out;
+	refcount_set(&cb_copy->refcount, 1);
 	memcpy(&cb_copy->cp_res, &copy->cp_res, sizeof(copy->cp_res));
 	cb_copy->cp_clp = copy->cp_clp;
 	cb_copy->nfserr = copy->nfserr;
