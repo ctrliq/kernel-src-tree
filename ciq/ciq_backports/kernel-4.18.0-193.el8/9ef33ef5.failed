@@ -1,0 +1,106 @@
+xprtrdma: Streamline rpcrdma_post_recvs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 9ef33ef5b628037b694a433f8af014a04bb38126
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9ef33ef5.failed
+
+rb_lock is contended between rpcrdma_buffer_create,
+rpcrdma_buffer_put, and rpcrdma_post_recvs.
+
+Commit e340c2d6ef2a ("xprtrdma: Reduce the doorbell rate (Receive)")
+causes rpcrdma_post_recvs to take the rb_lock repeatedly when it
+determines more Receives are needed. Streamline this code path so
+it takes the lock just once in most cases to build the Receive
+chain that is about to be posted.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 9ef33ef5b628037b694a433f8af014a04bb38126)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index a585b191fe98,3270c8ad1819..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1506,41 -1492,48 +1508,69 @@@ rpcrdma_post_recvs(struct rpcrdma_xprt 
+  	if (!temp)
+  		needed += RPCRDMA_MAX_RECV_BATCH;
+  
+- 	count = 0;
++ 	/* fast path: all needed reps can be found on the free list */
+  	wr = NULL;
++ 	spin_lock(&buf->rb_lock);
+  	while (needed) {
+++<<<<<<< HEAD
+ +		struct rpcrdma_regbuf *rb;
+ +		struct rpcrdma_rep *rep;
+ +
+ +		spin_lock(&buf->rb_lock);
+ +		rep = list_first_entry_or_null(&buf->rb_recv_bufs,
+ +					       struct rpcrdma_rep, rr_list);
+ +		if (likely(rep))
+ +			list_del(&rep->rr_list);
+ +		spin_unlock(&buf->rb_lock);
+ +		if (!rep) {
+ +			if (!rpcrdma_rep_create(r_xprt, temp))
+ +				break;
+ +			continue;
+ +		}
+ +
+ +		rb = rep->rr_rdmabuf;
+ +		if (!rpcrdma_regbuf_dma_map(r_xprt, rb)) {
+ +			rpcrdma_recv_buffer_put(rep);
+++=======
++ 		rep = list_first_entry_or_null(&buf->rb_recv_bufs,
++ 					       struct rpcrdma_rep, rr_list);
++ 		if (!rep)
+++>>>>>>> 9ef33ef5b628 (xprtrdma: Streamline rpcrdma_post_recvs)
++ 			break;
++ 
++ 		list_del(&rep->rr_list);
++ 		rep->rr_recv_wr.next = wr;
++ 		wr = &rep->rr_recv_wr;
++ 		--needed;
++ 	}
++ 	spin_unlock(&buf->rb_lock);
++ 
++ 	while (needed) {
++ 		rep = rpcrdma_rep_create(r_xprt, temp);
++ 		if (!rep)
+  			break;
+- 		}
+  
+- 		trace_xprtrdma_post_recv(rep->rr_recv_wr.wr_cqe);
+  		rep->rr_recv_wr.next = wr;
+  		wr = &rep->rr_recv_wr;
+- 		++count;
+  		--needed;
+  	}
+- 	if (!count)
++ 	if (!wr)
+  		goto out;
+  
++ 	for (i = wr; i; i = i->next) {
++ 		rep = container_of(i, struct rpcrdma_rep, rr_recv_wr);
++ 
++ 		if (!rpcrdma_regbuf_dma_map(r_xprt, rep->rr_rdmabuf))
++ 			goto release_wrs;
++ 
++ 		trace_xprtrdma_post_recv(rep->rr_recv_wr.wr_cqe);
++ 		++count;
++ 	}
++ 
+  	rc = ib_post_recv(r_xprt->rx_ia.ri_id->qp, wr,
+  			  (const struct ib_recv_wr **)&bad_wr);
++ out:
++ 	trace_xprtrdma_post_recvs(r_xprt, count, rc);
+  	if (rc) {
+  		for (wr = bad_wr; wr;) {
+  			struct rpcrdma_rep *rep;
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
