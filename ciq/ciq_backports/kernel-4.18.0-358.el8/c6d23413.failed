@@ -1,0 +1,330 @@
+mm/mmu_notifier: mmu_notifier_range_update_to_read_only() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jérôme Glisse <jglisse@redhat.com>
+commit c6d23413f81bd69935afedaf1da9d55b03febf58
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c6d23413.failed
+
+Helper to test if a range is updated to read only (it is still valid to
+read from the range).  This is useful for device driver or anyone who wish
+to optimize out update when they know that they already have the range map
+read only.
+
+Link: http://lkml.kernel.org/r/20190326164747.24405-9-jglisse@redhat.com
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Cc: Christian König <christian.koenig@amd.com>
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Jani Nikula <jani.nikula@linux.intel.com>
+	Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Cc: Jan Kara <jack@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Felix Kuehling <Felix.Kuehling@amd.com>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Ross Zwisler <zwisler@kernel.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Paolo Bonzini <pbonzini@redhat.com>
+	Cc: Radim Krcmar <rkrcmar@redhat.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Christian Koenig <christian.koenig@amd.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c6d23413f81bd69935afedaf1da9d55b03febf58)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmu_notifier.h
+#	mm/mmu_notifier.c
+diff --cc include/linux/mmu_notifier.h
+index d924803cea7c,b6c004bd9f6a..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -425,7 -259,8 +425,12 @@@ extern void __mmu_notifier_invalidate_r
+  				  bool only_end);
+  extern void __mmu_notifier_invalidate_range(struct mm_struct *mm,
+  				  unsigned long start, unsigned long end);
+++<<<<<<< HEAD
+ +extern bool mm_has_blockable_invalidate_notifiers(struct mm_struct *mm);
+++=======
++ extern bool
++ mmu_notifier_range_update_to_read_only(const struct mmu_notifier_range *range);
+++>>>>>>> c6d23413f81b (mm/mmu_notifier: mmu_notifier_range_update_to_read_only() helper)
+  
+  static inline bool
+  mmu_notifier_range_blockable(const struct mmu_notifier_range *range)
+diff --cc mm/mmu_notifier.c
+index 4361d699fa34,ee36068077b6..000000000000
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@@ -843,250 -396,12 +843,262 @@@ void mmu_notifier_unregister_no_release
+  }
+  EXPORT_SYMBOL_GPL(mmu_notifier_unregister_no_release);
+  
+++<<<<<<< HEAD
+ +static void mmu_notifier_free_rcu(struct rcu_head *rcu)
+ +{
+ +	struct mmu_notifier_rh *mn_rh = container_of(rcu, struct mmu_notifier_rh, rcu);
+ +	struct mm_struct *mm = mn_rh->mm;
+ +	struct mmu_notifier *mn = mn_rh->back_ptr;
+ +
+ +	kfree(mn_rh);
+ +	mn->ops->free_notifier(mn);
+ +	/* Pairs with the get in __mmu_notifier_register() */
+ +	mmdrop(mm);
+ +}
+ +
+ +static int __mmu_interval_notifier_insert(
+ +	struct mmu_interval_notifier *mni, struct mm_struct *mm,
+ +	struct mmu_notifier_mm *mmn_mm, unsigned long start,
+ +	unsigned long length, const struct mmu_interval_notifier_ops *ops)
+ +{
+ +	mni->mm = mm;
+ +	mni->ops = ops;
+ +	RB_CLEAR_NODE(&mni->interval_tree.rb);
+ +	mni->interval_tree.start = start;
+ +	/*
+ +	 * Note that the representation of the intervals in the interval tree
+ +	 * considers the ending point as contained in the interval.
+ +	 */
+ +	if (length == 0 ||
+ +	    check_add_overflow(start, length - 1, &mni->interval_tree.last))
+ +		return -EOVERFLOW;
+ +
+ +	/* Must call with a mmget() held */
+ +	if (WARN_ON(atomic_read(&mm->mm_users) <= 0))
+ +		return -EINVAL;
+ +
+ +	/* pairs with mmdrop in mmu_interval_notifier_remove() */
+ +	mmgrab(mm);
+ +
+ +	/*
+ +	 * If some invalidate_range_start/end region is going on in parallel
+ +	 * we don't know what VA ranges are affected, so we must assume this
+ +	 * new range is included.
+ +	 *
+ +	 * If the itree is invalidating then we are not allowed to change
+ +	 * it. Retrying until invalidation is done is tricky due to the
+ +	 * possibility for live lock, instead defer the add to
+ +	 * mn_itree_inv_end() so this algorithm is deterministic.
+ +	 *
+ +	 * In all cases the value for the mni->invalidate_seq should be
+ +	 * odd, see mmu_interval_read_begin()
+ +	 */
+ +	spin_lock(&mmn_mm->lock);
+ +	if (mmn_mm->active_invalidate_ranges) {
+ +		if (mn_itree_is_invalidating(mmn_mm))
+ +			hlist_add_head(&mni->deferred_item,
+ +				       &mmn_mm->deferred_list);
+ +		else {
+ +			mmn_mm->invalidate_seq |= 1;
+ +			interval_tree_insert(&mni->interval_tree,
+ +					     &mmn_mm->itree);
+ +		}
+ +		mni->invalidate_seq = mmn_mm->invalidate_seq;
+ +	} else {
+ +		WARN_ON(mn_itree_is_invalidating(mmn_mm));
+ +		/*
+ +		 * The starting seq for a mni not under invalidation should be
+ +		 * odd, not equal to the current invalidate_seq and
+ +		 * invalidate_seq should not 'wrap' to the new seq any time
+ +		 * soon.
+ +		 */
+ +		mni->invalidate_seq = mmn_mm->invalidate_seq - 1;
+ +		interval_tree_insert(&mni->interval_tree, &mmn_mm->itree);
+ +	}
+ +	spin_unlock(&mmn_mm->lock);
+ +	return 0;
+ +}
+ +
+ +/**
+ + * mmu_interval_notifier_insert - Insert an interval notifier
+ + * @mni: Interval notifier to register
+ + * @start: Starting virtual address to monitor
+ + * @length: Length of the range to monitor
+ + * @mm : mm_struct to attach to
+ + *
+ + * This function subscribes the interval notifier for notifications from the
+ + * mm.  Upon return the ops related to mmu_interval_notifier will be called
+ + * whenever an event that intersects with the given range occurs.
+ + *
+ + * Upon return the range_notifier may not be present in the interval tree yet.
+ + * The caller must use the normal interval notifier read flow via
+ + * mmu_interval_read_begin() to establish SPTEs for this range.
+ + */
+ +int mmu_interval_notifier_insert(struct mmu_interval_notifier *mni,
+ +				 struct mm_struct *mm, unsigned long start,
+ +				 unsigned long length,
+ +				 const struct mmu_interval_notifier_ops *ops)
+ +{
+ +	struct mmu_notifier_mm *mmn_mm;
+ +	int ret;
+ +
+ +	might_lock(&mm->mmap_lock);
+ +
+ +	mmn_mm = smp_load_acquire(&mm->mmu_notifier_mm);
+ +	if (!mmn_mm || !mmn_mm->has_itree) {
+ +		ret = mmu_notifier_register(NULL, mm);
+ +		if (ret)
+ +			return ret;
+ +		mmn_mm = mm->mmu_notifier_mm;
+ +	}
+ +	return __mmu_interval_notifier_insert(mni, mm, mmn_mm, start, length,
+ +					      ops);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert);
+ +
+ +int mmu_interval_notifier_insert_locked(
+ +	struct mmu_interval_notifier *mni, struct mm_struct *mm,
+ +	unsigned long start, unsigned long length,
+ +	const struct mmu_interval_notifier_ops *ops)
+ +{
+ +	struct mmu_notifier_mm *mmn_mm;
+ +	int ret;
+ +
+ +	mmap_assert_write_locked(mm);
+ +
+ +	mmn_mm = mm->mmu_notifier_mm;
+ +	if (!mmn_mm || !mmn_mm->has_itree) {
+ +		ret = __mmu_notifier_register(NULL, mm);
+ +		if (ret)
+ +			return ret;
+ +		mmn_mm = mm->mmu_notifier_mm;
+ +	}
+ +	return __mmu_interval_notifier_insert(mni, mm, mmn_mm, start, length,
+ +					      ops);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_interval_notifier_insert_locked);
+ +
+ +/**
+ + * mmu_interval_notifier_remove - Remove a interval notifier
+ + * @mni: Interval notifier to unregister
+ + *
+ + * This function must be paired with mmu_interval_notifier_insert(). It cannot
+ + * be called from any ops callback.
+ + *
+ + * Once this returns ops callbacks are no longer running on other CPUs and
+ + * will not be called in future.
+ + */
+ +void mmu_interval_notifier_remove(struct mmu_interval_notifier *mni)
+ +{
+ +	struct mm_struct *mm = mni->mm;
+ +	struct mmu_notifier_mm *mmn_mm = mm->mmu_notifier_mm;
+ +	unsigned long seq = 0;
+ +
+ +	might_sleep();
+ +
+ +	spin_lock(&mmn_mm->lock);
+ +	if (mn_itree_is_invalidating(mmn_mm)) {
+ +		/*
+ +		 * remove is being called after insert put this on the
+ +		 * deferred list, but before the deferred list was processed.
+ +		 */
+ +		if (RB_EMPTY_NODE(&mni->interval_tree.rb)) {
+ +			hlist_del(&mni->deferred_item);
+ +		} else {
+ +			hlist_add_head(&mni->deferred_item,
+ +				       &mmn_mm->deferred_list);
+ +			seq = mmn_mm->invalidate_seq;
+ +		}
+ +	} else {
+ +		WARN_ON(RB_EMPTY_NODE(&mni->interval_tree.rb));
+ +		interval_tree_remove(&mni->interval_tree, &mmn_mm->itree);
+ +	}
+ +	spin_unlock(&mmn_mm->lock);
+ +
+ +	/*
+ +	 * The possible sleep on progress in the invalidation requires the
+ +	 * caller not hold any locks held by invalidation callbacks.
+ +	 */
+ +	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
+ +	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+ +	if (seq)
+ +		wait_event(mmn_mm->wq,
+ +			   READ_ONCE(mmn_mm->invalidate_seq) != seq);
+ +
+ +	/* pairs with mmgrab in mmu_interval_notifier_insert() */
+ +	mmdrop(mm);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_interval_notifier_remove);
+ +
+ +/**
+ + * mmu_notifier_put - Release the reference on the notifier
+ + * @mn: The notifier to act on
+ + *
+ + * This function must be paired with each mmu_notifier_get(), it releases the
+ + * reference obtained by the get. If this is the last reference then process
+ + * to free the notifier will be run asynchronously.
+ + *
+ + * Unlike mmu_notifier_unregister() the get/put flow only calls ops->release
+ + * when the mm_struct is destroyed. Instead free_notifier is always called to
+ + * release any resources held by the user.
+ + *
+ + * As ops->release is not guaranteed to be called, the user must ensure that
+ + * all sptes are dropped, and no new sptes can be established before
+ + * mmu_notifier_put() is called.
+ + *
+ + * This function can be called from the ops->release callback, however the
+ + * caller must still ensure it is called pairwise with mmu_notifier_get().
+ + *
+ + * Modules calling this function must call mmu_notifier_synchronize() in
+ + * their __exit functions to ensure the async work is completed.
+ + */
+ +void mmu_notifier_put(struct mmu_notifier *mn)
+ +{
+ +	struct mm_struct *mm;
+ +
+ +	if (!RH_KABI_AUX(mn, mmu_notifier, mm))
+ +		return;
+ +
+ +	mm = mn->_rh->mm;
+ +	spin_lock(&mm->mmu_notifier_mm->lock);
+ +	if (WARN_ON(!mn->_rh->users) || --mn->_rh->users)
+ +		goto out_unlock;
+ +	hlist_del_init_rcu(&mn->hlist);
+ +	spin_unlock(&mm->mmu_notifier_mm->lock);
+ +
+ +	call_srcu(&srcu, &mn->_rh->rcu, mmu_notifier_free_rcu);
+ +	return;
+ +
+ +out_unlock:
+ +	spin_unlock(&mm->mmu_notifier_mm->lock);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_notifier_put);
+ +/**
+ + * mmu_notifier_synchronize - Ensure all mmu_notifiers are freed
+ + *
+ + * This function ensures that all outstanding async SRU work from
+ + * mmu_notifier_put() is completed. After it returns any mmu_notifier_ops
+ + * associated with an unused mmu_notifier will no longer be called.
+ + *
+ + * Before using the caller must ensure that all of its mmu_notifiers have been
+ + * fully released via mmu_notifier_put().
+ + *
+ + * Modules using the mmu_notifier_put() API should call this in their __exit
+ + * function to avoid module unloading races.
+ + */
+ +void mmu_notifier_synchronize(void)
+ +{
+ +	synchronize_srcu(&srcu);
+ +}
+ +EXPORT_SYMBOL_GPL(mmu_notifier_synchronize);
+++=======
++ bool
++ mmu_notifier_range_update_to_read_only(const struct mmu_notifier_range *range)
++ {
++ 	if (!range->vma || range->event != MMU_NOTIFY_PROTECTION_VMA)
++ 		return false;
++ 	/* Return true if the vma still have the read flag set. */
++ 	return range->vma->vm_flags & VM_READ;
++ }
++ EXPORT_SYMBOL_GPL(mmu_notifier_range_update_to_read_only);
+++>>>>>>> c6d23413f81b (mm/mmu_notifier: mmu_notifier_range_update_to_read_only() helper)
+* Unmerged path include/linux/mmu_notifier.h
+* Unmerged path mm/mmu_notifier.c
