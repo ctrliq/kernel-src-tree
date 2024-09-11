@@ -1842,7 +1842,7 @@ static void br_ip4_multicast_join_snoopers(struct net_bridge *br)
 	if (!in_dev)
 		return;
 
-	ip_mc_inc_group(in_dev, htonl(INADDR_ALLSNOOPERS_GROUP));
+	__ip_mc_inc_group(in_dev, htonl(INADDR_ALLSNOOPERS_GROUP), GFP_ATOMIC);
 	in_dev_put(in_dev);
 }
 
@@ -1873,7 +1873,7 @@ static void br_ip4_multicast_leave_snoopers(struct net_bridge *br)
 	if (WARN_ON(!in_dev))
 		return;
 
-	ip_mc_dec_group(in_dev, htonl(INADDR_ALLSNOOPERS_GROUP));
+	__ip_mc_dec_group(in_dev, htonl(INADDR_ALLSNOOPERS_GROUP), GFP_ATOMIC);
 	in_dev_put(in_dev);
 }
 
