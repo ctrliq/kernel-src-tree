@@ -1,0 +1,266 @@
+x86/boot/compressed/64: Add stage1 #VC handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] boot/compressed/64: Add stage1 #VC handler (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 95.45%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 29dcc60f6a19fb0aaee97bd1ae2ed8a7dc6f0cfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/29dcc60f.failed
+
+Add the first handler for #VC exceptions. At stage 1 there is no GHCB
+yet because the kernel might still be running on the EFI page table.
+
+The stage 1 handler is limited to the MSR-based protocol to talk to the
+hypervisor and can only support CPUID exit-codes, but that is enough to
+get to stage 2.
+
+ [ bp: Zap superfluous newlines after rd/wrmsr instruction mnemonics. ]
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-20-joro@8bytes.org
+(cherry picked from commit 29dcc60f6a19fb0aaee97bd1ae2ed8a7dc6f0cfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/boot/compressed/idt_64.c
+#	arch/x86/boot/compressed/idt_handlers_64.S
+#	arch/x86/boot/compressed/misc.h
+diff --cc arch/x86/boot/compressed/misc.h
+index d55a1ca4f95b,eaa8b45ebccb..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -133,4 -127,20 +133,23 @@@ int count_immovable_mem_regions(void)
+  static inline int count_immovable_mem_regions(void) { return 0; }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* ident_map_64.c */
++ #ifdef CONFIG_X86_5LEVEL
++ extern unsigned int __pgtable_l5_enabled, pgdir_shift, ptrs_per_p4d;
++ #endif
++ 
++ /* Used by PAGE_KERN* macros: */
++ extern pteval_t __default_kernel_pte_mask;
++ 
++ /* idt_64.c */
++ extern gate_desc boot_idt[BOOT_IDT_ENTRIES];
++ extern struct desc_ptr boot_idt_desc;
++ 
++ /* IDT Entry Points */
++ void boot_page_fault(void);
++ void boot_stage1_vc(void);
++ 
+++>>>>>>> 29dcc60f6a19 (x86/boot/compressed/64: Add stage1 #VC handler)
+  #endif /* BOOT_COMPRESSED_MISC_H */
+* Unmerged path arch/x86/boot/compressed/idt_64.c
+* Unmerged path arch/x86/boot/compressed/idt_handlers_64.S
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 0ae4decaece3..479e1d92f2dc 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -81,6 +81,7 @@ ifdef CONFIG_X86_64
+ 	vmlinux-objs-$(CONFIG_RANDOMIZE_BASE) += $(obj)/kaslr_64.o
+ 	vmlinux-objs-y += $(obj)/mem_encrypt.o
+ 	vmlinux-objs-y += $(obj)/pgtable_64.o
++	vmlinux-objs-$(CONFIG_AMD_MEM_ENCRYPT) += $(obj)/sev-es.o
+ endif
+ 
+ vmlinux-objs-$(CONFIG_ACPI) += $(obj)/acpi.o
+* Unmerged path arch/x86/boot/compressed/idt_64.c
+* Unmerged path arch/x86/boot/compressed/idt_handlers_64.S
+* Unmerged path arch/x86/boot/compressed/misc.h
+diff --git a/arch/x86/boot/compressed/sev-es.c b/arch/x86/boot/compressed/sev-es.c
+new file mode 100644
+index 000000000000..99c3bcd4d61f
+--- /dev/null
++++ b/arch/x86/boot/compressed/sev-es.c
+@@ -0,0 +1,45 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * AMD Encrypted Register State Support
++ *
++ * Author: Joerg Roedel <jroedel@suse.de>
++ */
++
++/*
++ * misc.h needs to be first because it knows how to include the other kernel
++ * headers in the pre-decompression code in a way that does not break
++ * compilation.
++ */
++#include "misc.h"
++
++#include <asm/sev-es.h>
++#include <asm/msr-index.h>
++#include <asm/ptrace.h>
++#include <asm/svm.h>
++
++static inline u64 sev_es_rd_ghcb_msr(void)
++{
++	unsigned long low, high;
++
++	asm volatile("rdmsr" : "=a" (low), "=d" (high) :
++			"c" (MSR_AMD64_SEV_ES_GHCB));
++
++	return ((high << 32) | low);
++}
++
++static inline void sev_es_wr_ghcb_msr(u64 val)
++{
++	u32 low, high;
++
++	low  = val & 0xffffffffUL;
++	high = val >> 32;
++
++	asm volatile("wrmsr" : : "c" (MSR_AMD64_SEV_ES_GHCB),
++			"a"(low), "d" (high) : "memory");
++}
++
++#undef __init
++#define __init
++
++/* Include code for early handlers */
++#include "../../kernel/sev-es-shared.c"
+diff --git a/arch/x86/include/asm/msr-index.h b/arch/x86/include/asm/msr-index.h
+index 7480a3dd090e..5241cb047f9f 100644
+--- a/arch/x86/include/asm/msr-index.h
++++ b/arch/x86/include/asm/msr-index.h
+@@ -445,6 +445,7 @@
+ #define MSR_AMD64_IBSBRTARGET		0xc001103b
+ #define MSR_AMD64_IBSOPDATA4		0xc001103d
+ #define MSR_AMD64_IBS_REG_COUNT_MAX	8 /* includes MSR_AMD64_IBSBRTARGET */
++#define MSR_AMD64_SEV_ES_GHCB		0xc0010130
+ #define MSR_AMD64_SEV			0xc0010131
+ #define MSR_AMD64_SEV_ENABLED_BIT	0
+ #define MSR_AMD64_SEV_ENABLED		BIT_ULL(MSR_AMD64_SEV_ENABLED_BIT)
+diff --git a/arch/x86/include/asm/sev-es.h b/arch/x86/include/asm/sev-es.h
+new file mode 100644
+index 000000000000..48a44038b5d1
+--- /dev/null
++++ b/arch/x86/include/asm/sev-es.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * AMD Encrypted Register State Support
++ *
++ * Author: Joerg Roedel <jroedel@suse.de>
++ */
++
++#ifndef __ASM_ENCRYPTED_STATE_H
++#define __ASM_ENCRYPTED_STATE_H
++
++#include <linux/types.h>
++
++#define GHCB_SEV_CPUID_REQ	0x004UL
++#define		GHCB_CPUID_REQ_EAX	0
++#define		GHCB_CPUID_REQ_EBX	1
++#define		GHCB_CPUID_REQ_ECX	2
++#define		GHCB_CPUID_REQ_EDX	3
++#define		GHCB_CPUID_REQ(fn, reg) (GHCB_SEV_CPUID_REQ | \
++					(((unsigned long)reg & 3) << 30) | \
++					(((unsigned long)fn) << 32))
++
++#define GHCB_SEV_CPUID_RESP	0x005UL
++#define GHCB_SEV_TERMINATE	0x100UL
++
++#define	GHCB_SEV_GHCB_RESP_CODE(v)	((v) & 0xfff)
++#define	VMGEXIT()			{ asm volatile("rep; vmmcall\n\r"); }
++
++void do_vc_no_ghcb(struct pt_regs *regs, unsigned long exit_code);
++
++static inline u64 lower_bits(u64 val, unsigned int bits)
++{
++	u64 mask = (1ULL << bits) - 1;
++
++	return (val & mask);
++}
++
++#endif
+diff --git a/arch/x86/include/asm/trapnr.h b/arch/x86/include/asm/trapnr.h
+index 082f45631fa9..f5d2325aa0b7 100644
+--- a/arch/x86/include/asm/trapnr.h
++++ b/arch/x86/include/asm/trapnr.h
+@@ -26,6 +26,7 @@
+ #define X86_TRAP_XF		19	/* SIMD Floating-Point Exception */
+ #define X86_TRAP_VE		20	/* Virtualization Exception */
+ #define X86_TRAP_CP		21	/* Control Protection Exception */
++#define X86_TRAP_VC		29	/* VMM Communication Exception */
+ #define X86_TRAP_IRET		32	/* IRET Exception */
+ 
+ #endif
+diff --git a/arch/x86/kernel/sev-es-shared.c b/arch/x86/kernel/sev-es-shared.c
+new file mode 100644
+index 000000000000..0bea32341afa
+--- /dev/null
++++ b/arch/x86/kernel/sev-es-shared.c
+@@ -0,0 +1,66 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * AMD Encrypted Register State Support
++ *
++ * Author: Joerg Roedel <jroedel@suse.de>
++ *
++ * This file is not compiled stand-alone. It contains code shared
++ * between the pre-decompression boot code and the running Linux kernel
++ * and is included directly into both code-bases.
++ */
++
++/*
++ * Boot VC Handler - This is the first VC handler during boot, there is no GHCB
++ * page yet, so it only supports the MSR based communication with the
++ * hypervisor and only the CPUID exit-code.
++ */
++void __init do_vc_no_ghcb(struct pt_regs *regs, unsigned long exit_code)
++{
++	unsigned int fn = lower_bits(regs->ax, 32);
++	unsigned long val;
++
++	/* Only CPUID is supported via MSR protocol */
++	if (exit_code != SVM_EXIT_CPUID)
++		goto fail;
++
++	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EAX));
++	VMGEXIT();
++	val = sev_es_rd_ghcb_msr();
++	if (GHCB_SEV_GHCB_RESP_CODE(val) != GHCB_SEV_CPUID_RESP)
++		goto fail;
++	regs->ax = val >> 32;
++
++	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EBX));
++	VMGEXIT();
++	val = sev_es_rd_ghcb_msr();
++	if (GHCB_SEV_GHCB_RESP_CODE(val) != GHCB_SEV_CPUID_RESP)
++		goto fail;
++	regs->bx = val >> 32;
++
++	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_ECX));
++	VMGEXIT();
++	val = sev_es_rd_ghcb_msr();
++	if (GHCB_SEV_GHCB_RESP_CODE(val) != GHCB_SEV_CPUID_RESP)
++		goto fail;
++	regs->cx = val >> 32;
++
++	sev_es_wr_ghcb_msr(GHCB_CPUID_REQ(fn, GHCB_CPUID_REQ_EDX));
++	VMGEXIT();
++	val = sev_es_rd_ghcb_msr();
++	if (GHCB_SEV_GHCB_RESP_CODE(val) != GHCB_SEV_CPUID_RESP)
++		goto fail;
++	regs->dx = val >> 32;
++
++	/* Skip over the CPUID two-byte opcode */
++	regs->ip += 2;
++
++	return;
++
++fail:
++	sev_es_wr_ghcb_msr(GHCB_SEV_TERMINATE);
++	VMGEXIT();
++
++	/* Shouldn't get here - if we do halt the machine */
++	while (true)
++		asm volatile("hlt\n");
++}
