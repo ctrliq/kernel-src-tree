@@ -1,0 +1,504 @@
+mptcp: move option parsing into mptcp_incoming_options()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit cfde141ea3faa30e362bbdb5c28001bbbdb0b8e0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cfde141e.failed
+
+The mptcp_options_received structure carries several per
+packet flags (mp_capable, mp_join, etc.). Such fields must
+be cleared on each packet, even on dropped ones or packet
+not carrying any MPTCP options, but the current mptcp
+code clears them only on TCP option reset.
+
+On several races/corner cases we end-up with stray bits in
+incoming options, leading to WARN_ON splats. e.g.:
+
+[  171.164906] Bad mapping: ssn=32714 map_seq=1 map_data_len=32713
+[  171.165006] WARNING: CPU: 1 PID: 5026 at net/mptcp/subflow.c:533 warn_bad_map (linux-mptcp/net/mptcp/subflow.c:533 linux-mptcp/net/mptcp/subflow.c:531)
+[  171.167632] Modules linked in: ip6_vti ip_vti ip_gre ipip sit tunnel4 ip_tunnel geneve ip6_udp_tunnel udp_tunnel macsec macvtap tap ipvlan macvlan 8021q garp mrp xfrm_interface veth netdevsim nlmon dummy team bonding vcan bridge stp llc ip6_gre gre ip6_tunnel tunnel6 tun binfmt_misc intel_rapl_msr intel_rapl_common rfkill kvm_intel kvm irqbypass crct10dif_pclmul crc32_pclmul ghash_clmulni_intel joydev virtio_balloon pcspkr i2c_piix4 sunrpc ip_tables xfs libcrc32c crc32c_intel serio_raw virtio_console ata_generic virtio_blk virtio_net net_failover failover ata_piix libata
+[  171.199464] CPU: 1 PID: 5026 Comm: repro Not tainted 5.7.0-rc1.mptcp_f227fdf5d388+ #95
+[  171.200886] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.12.0-2.fc30 04/01/2014
+[  171.202546] RIP: 0010:warn_bad_map (linux-mptcp/net/mptcp/subflow.c:533 linux-mptcp/net/mptcp/subflow.c:531)
+[  171.206537] Code: c1 ea 03 0f b6 14 02 48 89 f8 83 e0 07 83 c0 03 38 d0 7c 04 84 d2 75 1d 8b 55 3c 44 89 e6 48 c7 c7 20 51 13 95 e8 37 8b 22 fe <0f> 0b 48 83 c4 08 5b 5d 41 5c c3 89 4c 24 04 e8 db d6 94 fe 8b 4c
+[  171.220473] RSP: 0018:ffffc90000150560 EFLAGS: 00010282
+[  171.221639] RAX: 0000000000000000 RBX: 0000000000000000 RCX: 0000000000000000
+[  171.223108] RDX: 0000000000000000 RSI: 0000000000000008 RDI: fffff5200002a09e
+[  171.224388] RBP: ffff8880aa6e3c00 R08: 0000000000000001 R09: fffffbfff2ec9955
+[  171.225706] R10: ffffffff9764caa7 R11: fffffbfff2ec9954 R12: 0000000000007fca
+[  171.227211] R13: ffff8881066f4a7f R14: ffff8880aa6e3c00 R15: 0000000000000020
+[  171.228460] FS:  00007f8623719740(0000) GS:ffff88810be00000(0000) knlGS:0000000000000000
+[  171.230065] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  171.231303] CR2: 00007ffdab190a50 CR3: 00000001038ea006 CR4: 0000000000160ee0
+[  171.232586] Call Trace:
+[  171.233109]  <IRQ>
+[  171.233531] get_mapping_status (linux-mptcp/net/mptcp/subflow.c:691)
+[  171.234371] mptcp_subflow_data_available (linux-mptcp/net/mptcp/subflow.c:736 linux-mptcp/net/mptcp/subflow.c:832)
+[  171.238181] subflow_state_change (linux-mptcp/net/mptcp/subflow.c:1085 (discriminator 1))
+[  171.239066] tcp_fin (linux-mptcp/net/ipv4/tcp_input.c:4217)
+[  171.240123] tcp_data_queue (linux-mptcp/./include/linux/compiler.h:199 linux-mptcp/net/ipv4/tcp_input.c:4822)
+[  171.245083] tcp_rcv_established (linux-mptcp/./include/linux/skbuff.h:1785 linux-mptcp/./include/net/tcp.h:1774 linux-mptcp/./include/net/tcp.h:1847 linux-mptcp/net/ipv4/tcp_input.c:5238 linux-mptcp/net/ipv4/tcp_input.c:5730)
+[  171.254089] tcp_v4_rcv (linux-mptcp/./include/linux/spinlock.h:393 linux-mptcp/net/ipv4/tcp_ipv4.c:2009)
+[  171.258969] ip_protocol_deliver_rcu (linux-mptcp/net/ipv4/ip_input.c:204 (discriminator 1))
+[  171.260214] ip_local_deliver_finish (linux-mptcp/./include/linux/rcupdate.h:651 linux-mptcp/net/ipv4/ip_input.c:232)
+[  171.261389] ip_local_deliver (linux-mptcp/./include/linux/netfilter.h:307 linux-mptcp/./include/linux/netfilter.h:301 linux-mptcp/net/ipv4/ip_input.c:252)
+[  171.265884] ip_rcv (linux-mptcp/./include/linux/netfilter.h:307 linux-mptcp/./include/linux/netfilter.h:301 linux-mptcp/net/ipv4/ip_input.c:539)
+[  171.273666] process_backlog (linux-mptcp/./include/linux/rcupdate.h:651 linux-mptcp/net/core/dev.c:6135)
+[  171.275328] net_rx_action (linux-mptcp/net/core/dev.c:6572 linux-mptcp/net/core/dev.c:6640)
+[  171.280472] __do_softirq (linux-mptcp/./arch/x86/include/asm/jump_label.h:25 linux-mptcp/./include/linux/jump_label.h:200 linux-mptcp/./include/trace/events/irq.h:142 linux-mptcp/kernel/softirq.c:293)
+[  171.281379] do_softirq_own_stack (linux-mptcp/arch/x86/entry/entry_64.S:1083)
+[  171.282358]  </IRQ>
+
+We could address the issue clearing explicitly the relevant fields
+in several places - tcp_parse_option, tcp_fast_parse_options,
+possibly others.
+
+Instead we move the MPTCP option parsing into the already existing
+mptcp ingress hook, so that we need to clear the fields in a single
+place.
+
+This allows us dropping an MPTCP hook from the TCP code and
+removing the quite large mptcp_options_received from the tcp_sock
+struct. On the flip side, the MPTCP sockets will traverse the
+option space twice (in tcp_parse_option() and in
+mptcp_incoming_options(). That looks acceptable: we already
+do that for syn and 3rd ack packets, plain TCP socket will
+benefit from it, and even MPTCP sockets will experience better
+code locality, reducing the jumps between TCP and MPTCP code.
+
+v1 -> v2:
+ - rebased on current '-net' tree
+
+Fixes: 648ef4b88673 ("mptcp: Implement MPTCP receive path")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cfde141ea3faa30e362bbdb5c28001bbbdb0b8e0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/subflow.c
+diff --cc net/mptcp/subflow.c
+index b53f6143f23b,bad998529767..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -136,10 -141,16 +135,21 @@@ static void subflow_init_req(struct req
+  		return;
+  #endif
+  
+++<<<<<<< HEAD
+ +	if (rx_opt.mptcp.mp_capable && rx_opt.mptcp.mp_join)
+ +		return;
+++=======
++ 	if (mp_opt.mp_capable) {
++ 		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_MPCAPABLEPASSIVE);
++ 
++ 		if (mp_opt.mp_join)
++ 			return;
++ 	} else if (mp_opt.mp_join) {
++ 		SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINSYNRX);
++ 	}
+++>>>>>>> cfde141ea3fa (mptcp: move option parsing into mptcp_incoming_options())
+  
+- 	if (rx_opt.mptcp.mp_capable && listener->request_mptcp) {
++ 	if (mp_opt.mp_capable && listener->request_mptcp) {
+  		int err;
+  
+  		err = mptcp_token_new_request(req);
+@@@ -209,7 -220,9 +219,8 @@@ static bool subflow_thmac_valid(struct 
+  static void subflow_finish_connect(struct sock *sk, const struct sk_buff *skb)
+  {
+  	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
++ 	struct mptcp_options_received mp_opt;
+  	struct sock *parent = subflow->conn;
+ -	struct tcp_sock *tp = tcp_sk(sk);
+  
+  	subflow->icsk_af_ops->sk_rx_dst_set(sk, skb);
+  
+@@@ -218,7 -231,30 +229,34 @@@
+  		parent->sk_state_change(parent);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (subflow->conn_finished || !tcp_sk(sk)->is_mptcp)
+++=======
++ 	/* be sure no special action on any packet other than syn-ack */
++ 	if (subflow->conn_finished)
++ 		return;
++ 
++ 	subflow->conn_finished = 1;
++ 
++ 	mptcp_get_options(skb, &mp_opt);
++ 	if (subflow->request_mptcp && mp_opt.mp_capable) {
++ 		subflow->mp_capable = 1;
++ 		subflow->can_ack = 1;
++ 		subflow->remote_key = mp_opt.sndr_key;
++ 		pr_debug("subflow=%p, remote_key=%llu", subflow,
++ 			 subflow->remote_key);
++ 	} else if (subflow->request_join && mp_opt.mp_join) {
++ 		subflow->mp_join = 1;
++ 		subflow->thmac = mp_opt.thmac;
++ 		subflow->remote_nonce = mp_opt.nonce;
++ 		pr_debug("subflow=%p, thmac=%llu, remote_nonce=%u", subflow,
++ 			 subflow->thmac, subflow->remote_nonce);
++ 	} else if (subflow->request_mptcp) {
++ 		tp->is_mptcp = 0;
++ 	}
++ 
++ 	if (!tp->is_mptcp)
+++>>>>>>> cfde141ea3fa (mptcp: move option parsing into mptcp_incoming_options())
+  		return;
+  
+  	if (subflow->mp_capable) {
+@@@ -416,11 -455,12 +457,18 @@@ create_msk
+  			fallback = true;
+  	} else if (subflow_req->mp_join) {
+  		fallback_is_fatal = true;
+++<<<<<<< HEAD
+ +		opt_rx.mptcp.mp_join = 0;
+ +		mptcp_get_options(skb, &opt_rx);
+ +		if (!opt_rx.mptcp.mp_join ||
+ +		    !subflow_hmac_valid(req, &opt_rx))
+++=======
++ 		mptcp_get_options(skb, &mp_opt);
++ 		if (!mp_opt.mp_join ||
++ 		    !subflow_hmac_valid(req, &mp_opt)) {
++ 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKMAC);
+++>>>>>>> cfde141ea3fa (mptcp: move option parsing into mptcp_incoming_options())
+  			return NULL;
+ -		}
+  	}
+  
+  create_child:
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f8f500b4bc21..84ee93ea5bcd 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -87,47 +87,6 @@ struct tcp_sack_block {
+ #define TCP_SACK_SEEN     (1 << 0)   /*1 = peer is SACK capable, */
+ #define TCP_DSACK_SEEN    (1 << 2)   /*1 = DSACK was received from peer*/
+ 
+-#if IS_ENABLED(CONFIG_MPTCP)
+-struct mptcp_options_received {
+-	u64	sndr_key;
+-	u64	rcvr_key;
+-	u64	data_ack;
+-	u64	data_seq;
+-	u32	subflow_seq;
+-	u16	data_len;
+-	u16	mp_capable : 1,
+-		mp_join : 1,
+-		dss : 1,
+-		add_addr : 1,
+-		rm_addr : 1,
+-		family : 4,
+-		echo : 1,
+-		backup : 1;
+-	u32	token;
+-	u32	nonce;
+-	u64	thmac;
+-	u8	hmac[20];
+-	u8	join_id;
+-	u8	use_map:1,
+-		dsn64:1,
+-		data_fin:1,
+-		use_ack:1,
+-		ack64:1,
+-		mpc_map:1,
+-		__unused:2;
+-	u8	addr_id;
+-	u8	rm_id;
+-	union {
+-		struct in_addr	addr;
+-#if IS_ENABLED(CONFIG_MPTCP_IPV6)
+-		struct in6_addr	addr6;
+-#endif
+-	};
+-	u64	ahmac;
+-	u16	port;
+-};
+-#endif
+-
+ struct tcp_options_received {
+ /*	PAWS/RTTM data	*/
+ 	int	ts_recent_stamp;/* Time we stored ts_recent (for aging) */
+@@ -145,9 +104,6 @@ struct tcp_options_received {
+ 	u8	num_sacks;	/* Number of SACK blocks		*/
+ 	u16	user_mss;	/* mss requested by user in ioctl	*/
+ 	u16	mss_clamp;	/* Maximal mss, negotiated at connection setup */
+-#if IS_ENABLED(CONFIG_MPTCP)
+-	struct mptcp_options_received	mptcp;
+-#endif
+ };
+ 
+ static inline void tcp_clear_options(struct tcp_options_received *rx_opt)
+@@ -157,13 +113,6 @@ static inline void tcp_clear_options(struct tcp_options_received *rx_opt)
+ #if IS_ENABLED(CONFIG_SMC)
+ 	rx_opt->smc_ok = 0;
+ #endif
+-#if IS_ENABLED(CONFIG_MPTCP)
+-	rx_opt->mptcp.mp_capable = 0;
+-	rx_opt->mptcp.mp_join = 0;
+-	rx_opt->mptcp.add_addr = 0;
+-	rx_opt->mptcp.rm_addr = 0;
+-	rx_opt->mptcp.dss = 0;
+-#endif
+ }
+ 
+ /* This is the max number of SACKS that we'll generate and process. It's safe
+diff --git a/include/net/mptcp.h b/include/net/mptcp.h
+index b648fa20eec8..9cc8e58694a2 100644
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@ -66,8 +66,6 @@ static inline bool rsk_is_mptcp(const struct request_sock *req)
+ 	return tcp_rsk(req)->is_mptcp;
+ }
+ 
+-void mptcp_parse_option(const struct sk_buff *skb, const unsigned char *ptr,
+-			int opsize, struct tcp_options_received *opt_rx);
+ bool mptcp_syn_options(struct sock *sk, const struct sk_buff *skb,
+ 		       unsigned int *size, struct mptcp_out_options *opts);
+ void mptcp_rcv_synsent(struct sock *sk);
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index d7ae87932a4f..f49c9d5af965 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3936,10 +3936,6 @@ void tcp_parse_options(const struct net *net,
+ 				 */
+ 				break;
+ #endif
+-			case TCPOPT_MPTCP:
+-				mptcp_parse_option(skb, ptr, opsize, opt_rx);
+-				break;
+-
+ 			case TCPOPT_FASTOPEN:
+ 				tcp_parse_fastopen_option(
+ 					opsize - TCPOLEN_FASTOPEN_BASE,
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index 143549cac727..a97cef2f0233 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -14,10 +14,10 @@ static bool mptcp_cap_flag_sha256(u8 flags)
+ 	return (flags & MPTCP_CAP_FLAG_MASK) == MPTCP_CAP_HMAC_SHA256;
+ }
+ 
+-void mptcp_parse_option(const struct sk_buff *skb, const unsigned char *ptr,
+-			int opsize, struct tcp_options_received *opt_rx)
++static void mptcp_parse_option(const struct sk_buff *skb,
++			       const unsigned char *ptr, int opsize,
++			       struct mptcp_options_received *mp_opt)
+ {
+-	struct mptcp_options_received *mp_opt = &opt_rx->mptcp;
+ 	u8 subtype = *ptr >> 4;
+ 	int expected_opsize;
+ 	u8 version;
+@@ -281,12 +281,20 @@ void mptcp_parse_option(const struct sk_buff *skb, const unsigned char *ptr,
+ }
+ 
+ void mptcp_get_options(const struct sk_buff *skb,
+-		       struct tcp_options_received *opt_rx)
++		       struct mptcp_options_received *mp_opt)
+ {
+-	const unsigned char *ptr;
+ 	const struct tcphdr *th = tcp_hdr(skb);
+-	int length = (th->doff * 4) - sizeof(struct tcphdr);
++	const unsigned char *ptr;
++	int length;
+ 
++	/* initialize option status */
++	mp_opt->mp_capable = 0;
++	mp_opt->mp_join = 0;
++	mp_opt->add_addr = 0;
++	mp_opt->rm_addr = 0;
++	mp_opt->dss = 0;
++
++	length = (th->doff * 4) - sizeof(struct tcphdr);
+ 	ptr = (const unsigned char *)(th + 1);
+ 
+ 	while (length > 0) {
+@@ -306,7 +314,7 @@ void mptcp_get_options(const struct sk_buff *skb,
+ 			if (opsize > length)
+ 				return;	/* don't parse partial options */
+ 			if (opcode == TCPOPT_MPTCP)
+-				mptcp_parse_option(skb, ptr, opsize, opt_rx);
++				mptcp_parse_option(skb, ptr, opsize, mp_opt);
+ 			ptr += opsize - 2;
+ 			length -= opsize;
+ 		}
+@@ -817,41 +825,41 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb,
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+ 	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
+-	struct mptcp_options_received *mp_opt;
++	struct mptcp_options_received mp_opt;
+ 	struct mptcp_ext *mpext;
+ 
+-	mp_opt = &opt_rx->mptcp;
+-	if (!check_fully_established(msk, sk, subflow, skb, mp_opt))
++	mptcp_get_options(skb, &mp_opt);
++	if (!check_fully_established(msk, sk, subflow, skb, &mp_opt))
+ 		return;
+ 
+-	if (mp_opt->add_addr && add_addr_hmac_valid(msk, mp_opt)) {
++	if (mp_opt.add_addr && add_addr_hmac_valid(msk, &mp_opt)) {
+ 		struct mptcp_addr_info addr;
+ 
+-		addr.port = htons(mp_opt->port);
+-		addr.id = mp_opt->addr_id;
+-		if (mp_opt->family == MPTCP_ADDR_IPVERSION_4) {
++		addr.port = htons(mp_opt.port);
++		addr.id = mp_opt.addr_id;
++		if (mp_opt.family == MPTCP_ADDR_IPVERSION_4) {
+ 			addr.family = AF_INET;
+-			addr.addr = mp_opt->addr;
++			addr.addr = mp_opt.addr;
+ 		}
+ #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+-		else if (mp_opt->family == MPTCP_ADDR_IPVERSION_6) {
++		else if (mp_opt.family == MPTCP_ADDR_IPVERSION_6) {
+ 			addr.family = AF_INET6;
+-			addr.addr6 = mp_opt->addr6;
++			addr.addr6 = mp_opt.addr6;
+ 		}
+ #endif
+-		if (!mp_opt->echo)
++		if (!mp_opt.echo)
+ 			mptcp_pm_add_addr_received(msk, &addr);
+-		mp_opt->add_addr = 0;
++		mp_opt.add_addr = 0;
+ 	}
+ 
+-	if (!mp_opt->dss)
++	if (!mp_opt.dss)
+ 		return;
+ 
+ 	/* we can't wait for recvmsg() to update the ack_seq, otherwise
+ 	 * monodirectional flows will stuck
+ 	 */
+-	if (mp_opt->use_ack)
+-		update_una(msk, mp_opt);
++	if (mp_opt.use_ack)
++		update_una(msk, &mp_opt);
+ 
+ 	mpext = skb_ext_add(skb, SKB_EXT_MPTCP);
+ 	if (!mpext)
+@@ -859,8 +867,8 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb,
+ 
+ 	memset(mpext, 0, sizeof(*mpext));
+ 
+-	if (mp_opt->use_map) {
+-		if (mp_opt->mpc_map) {
++	if (mp_opt.use_map) {
++		if (mp_opt.mpc_map) {
+ 			/* this is an MP_CAPABLE carrying MPTCP data
+ 			 * we know this map the first chunk of data
+ 			 */
+@@ -871,12 +879,12 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb,
+ 			mpext->dsn64 = 1;
+ 			mpext->mpc_map = 1;
+ 		} else {
+-			mpext->data_seq = mp_opt->data_seq;
+-			mpext->subflow_seq = mp_opt->subflow_seq;
+-			mpext->dsn64 = mp_opt->dsn64;
+-			mpext->data_fin = mp_opt->data_fin;
++			mpext->data_seq = mp_opt.data_seq;
++			mpext->subflow_seq = mp_opt.subflow_seq;
++			mpext->dsn64 = mp_opt.dsn64;
++			mpext->data_fin = mp_opt.data_fin;
+ 		}
+-		mpext->data_len = mp_opt->data_len;
++		mpext->data_len = mp_opt.data_len;
+ 		mpext->use_map = 1;
+ 	}
+ }
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 8c825a535582..d50a666595f5 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1288,7 +1288,7 @@ static struct ipv6_pinfo *mptcp_inet6_sk(const struct sock *sk)
+ #endif
+ 
+ struct sock *mptcp_sk_clone(const struct sock *sk,
+-			    const struct tcp_options_received *opt_rx,
++			    const struct mptcp_options_received *mp_opt,
+ 			    struct request_sock *req)
+ {
+ 	struct mptcp_subflow_request_sock *subflow_req = mptcp_subflow_rsk(req);
+@@ -1327,9 +1327,9 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
+ 
+ 	msk->write_seq = subflow_req->idsn + 1;
+ 	atomic64_set(&msk->snd_una, msk->write_seq);
+-	if (opt_rx->mptcp.mp_capable) {
++	if (mp_opt->mp_capable) {
+ 		msk->can_ack = true;
+-		msk->remote_key = opt_rx->mptcp.sndr_key;
++		msk->remote_key = mp_opt->sndr_key;
+ 		mptcp_crypto_key_sha(msk->remote_key, NULL, &ack_seq);
+ 		ack_seq++;
+ 		msk->ack_seq = ack_seq;
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index 5bb07285305f..057829919f51 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -90,6 +90,45 @@
+ #define MPTCP_SEND_SPACE	1
+ #define MPTCP_WORK_RTX		2
+ 
++struct mptcp_options_received {
++	u64	sndr_key;
++	u64	rcvr_key;
++	u64	data_ack;
++	u64	data_seq;
++	u32	subflow_seq;
++	u16	data_len;
++	u16	mp_capable : 1,
++		mp_join : 1,
++		dss : 1,
++		add_addr : 1,
++		rm_addr : 1,
++		family : 4,
++		echo : 1,
++		backup : 1;
++	u32	token;
++	u32	nonce;
++	u64	thmac;
++	u8	hmac[20];
++	u8	join_id;
++	u8	use_map:1,
++		dsn64:1,
++		data_fin:1,
++		use_ack:1,
++		ack64:1,
++		mpc_map:1,
++		__unused:2;
++	u8	addr_id;
++	u8	rm_id;
++	union {
++		struct in_addr	addr;
++#if IS_ENABLED(CONFIG_MPTCP_IPV6)
++		struct in6_addr	addr6;
++#endif
++	};
++	u64	ahmac;
++	u16	port;
++};
++
+ static inline __be32 mptcp_option(u8 subopt, u8 len, u8 nib, u8 field)
+ {
+ 	return htonl((TCPOPT_MPTCP << 24) | (len << 16) | (subopt << 12) |
+@@ -330,10 +369,10 @@ int mptcp_proto_v6_init(void);
+ #endif
+ 
+ struct sock *mptcp_sk_clone(const struct sock *sk,
+-			    const struct tcp_options_received *opt_rx,
++			    const struct mptcp_options_received *mp_opt,
+ 			    struct request_sock *req);
+ void mptcp_get_options(const struct sk_buff *skb,
+-		       struct tcp_options_received *opt_rx);
++		       struct mptcp_options_received *mp_opt);
+ 
+ void mptcp_finish_connect(struct sock *sk);
+ void mptcp_data_ready(struct sock *sk, struct sock *ssk);
+* Unmerged path net/mptcp/subflow.c
