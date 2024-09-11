@@ -1,0 +1,133 @@
+bpf: fix raw_tp test run in preempt kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Song Liu <songliubraving@fb.com>
+commit 963ec27a10fa6dc700c0465e95965c0bf696a606
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/963ec27a.failed
+
+In preempt kernel, BPF_PROG_TEST_RUN on raw_tp triggers:
+
+[   35.874974] BUG: using smp_processor_id() in preemptible [00000000]
+code: new_name/87
+[   35.893983] caller is bpf_prog_test_run_raw_tp+0xd4/0x1b0
+[   35.900124] CPU: 1 PID: 87 Comm: new_name Not tainted 5.9.0-rc6-g615bd02bf #1
+[   35.907358] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996),
+BIOS 1.10.2-1ubuntu1 04/01/2014
+[   35.916941] Call Trace:
+[   35.919660]  dump_stack+0x77/0x9b
+[   35.923273]  check_preemption_disabled+0xb4/0xc0
+[   35.928376]  bpf_prog_test_run_raw_tp+0xd4/0x1b0
+[   35.933872]  ? selinux_bpf+0xd/0x70
+[   35.937532]  __do_sys_bpf+0x6bb/0x21e0
+[   35.941570]  ? find_held_lock+0x2d/0x90
+[   35.945687]  ? vfs_write+0x150/0x220
+[   35.949586]  do_syscall_64+0x2d/0x40
+[   35.953443]  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fix this by calling migrate_disable() before smp_processor_id().
+
+Fixes: 1b4d60ec162f ("bpf: Enable BPF_PROG_TEST_RUN for raw_tracepoint")
+	Reported-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 963ec27a10fa6dc700c0465e95965c0bf696a606)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bpf/test_run.c
+diff --cc net/bpf/test_run.c
+index 21ab2f2323c4,c1c30a9f76f3..000000000000
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@@ -239,6 -240,84 +239,87 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_raw_tp_test_run_info {
++ 	struct bpf_prog *prog;
++ 	void *ctx;
++ 	u32 retval;
++ };
++ 
++ static void
++ __bpf_prog_test_run_raw_tp(void *data)
++ {
++ 	struct bpf_raw_tp_test_run_info *info = data;
++ 
++ 	rcu_read_lock();
++ 	info->retval = BPF_PROG_RUN(info->prog, info->ctx);
++ 	rcu_read_unlock();
++ }
++ 
++ int bpf_prog_test_run_raw_tp(struct bpf_prog *prog,
++ 			     const union bpf_attr *kattr,
++ 			     union bpf_attr __user *uattr)
++ {
++ 	void __user *ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
++ 	__u32 ctx_size_in = kattr->test.ctx_size_in;
++ 	struct bpf_raw_tp_test_run_info info;
++ 	int cpu = kattr->test.cpu, err = 0;
++ 	int current_cpu;
++ 
++ 	/* doesn't support data_in/out, ctx_out, duration, or repeat */
++ 	if (kattr->test.data_in || kattr->test.data_out ||
++ 	    kattr->test.ctx_out || kattr->test.duration ||
++ 	    kattr->test.repeat)
++ 		return -EINVAL;
++ 
++ 	if (ctx_size_in < prog->aux->max_ctx_offset)
++ 		return -EINVAL;
++ 
++ 	if ((kattr->test.flags & BPF_F_TEST_RUN_ON_CPU) == 0 && cpu != 0)
++ 		return -EINVAL;
++ 
++ 	if (ctx_size_in) {
++ 		info.ctx = kzalloc(ctx_size_in, GFP_USER);
++ 		if (!info.ctx)
++ 			return -ENOMEM;
++ 		if (copy_from_user(info.ctx, ctx_in, ctx_size_in)) {
++ 			err = -EFAULT;
++ 			goto out;
++ 		}
++ 	} else {
++ 		info.ctx = NULL;
++ 	}
++ 
++ 	info.prog = prog;
++ 
++ 	current_cpu = get_cpu();
++ 	if ((kattr->test.flags & BPF_F_TEST_RUN_ON_CPU) == 0 ||
++ 	    cpu == current_cpu) {
++ 		__bpf_prog_test_run_raw_tp(&info);
++ 	} else if (cpu >= nr_cpu_ids || !cpu_online(cpu)) {
++ 		/* smp_call_function_single() also checks cpu_online()
++ 		 * after csd_lock(). However, since cpu is from user
++ 		 * space, let's do an extra quick check to filter out
++ 		 * invalid value before smp_call_function_single().
++ 		 */
++ 		err = -ENXIO;
++ 	} else {
++ 		err = smp_call_function_single(cpu, __bpf_prog_test_run_raw_tp,
++ 					       &info, 1);
++ 	}
++ 	put_cpu();
++ 
++ 	if (!err &&
++ 	    copy_to_user(&uattr->test.retval, &info.retval, sizeof(u32)))
++ 		err = -EFAULT;
++ 
++ out:
++ 	kfree(info.ctx);
++ 	return err;
++ }
++ 
+++>>>>>>> 963ec27a10fa (bpf: fix raw_tp test run in preempt kernel)
+  static void *bpf_ctx_init(const union bpf_attr *kattr, u32 max_size)
+  {
+  	void __user *data_in = u64_to_user_ptr(kattr->test.ctx_in);
+* Unmerged path net/bpf/test_run.c
