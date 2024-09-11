@@ -1,0 +1,107 @@
+ovl: make private mounts longterm
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit df820f8de4e481222b17f9bcee7b909ae8167529
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/df820f8d.failed
+
+Overlayfs is using clone_private_mount() to create internal mounts for
+underlying layers.  These are used for operations requiring a path, such as
+dentry_open().
+
+Since these private mounts are not in any namespace they are treated as
+short term, "detached" mounts and mntput() involves taking the global
+mount_lock, which can result in serious cacheline pingpong.
+
+Make these private mounts longterm instead, which trade the penalty on
+mntput() for a slightly longer shutdown time due to an added RCU grace
+period when putting these mounts.
+
+Introduce a new helper kern_unmount_many() that can take care of multiple
+longterm mounts with a single RCU grace period.
+
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit df820f8de4e481222b17f9bcee7b909ae8167529)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/porting.rst
+* Unmerged path Documentation/filesystems/porting.rst
+* Unmerged path Documentation/filesystems/porting.rst
+diff --git a/fs/namespace.c b/fs/namespace.c
+index d1644a44b4d3..2e3ce35ae818 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1924,6 +1924,9 @@ struct vfsmount *clone_private_mount(const struct path *path)
+ 	if (IS_ERR(new_mnt))
+ 		return ERR_CAST(new_mnt);
+ 
++	/* Longterm mount to be removed by kern_unmount*() */
++	new_mnt->mnt_ns = MNT_NS_INTERNAL;
++
+ 	return &new_mnt->mnt;
+ }
+ EXPORT_SYMBOL_GPL(clone_private_mount);
+@@ -3824,6 +3827,19 @@ void kern_unmount(struct vfsmount *mnt)
+ }
+ EXPORT_SYMBOL(kern_unmount);
+ 
++void kern_unmount_array(struct vfsmount *mnt[], unsigned int num)
++{
++	unsigned int i;
++
++	for (i = 0; i < num; i++)
++		if (mnt[i])
++			real_mount(mnt[i])->mnt_ns = NULL;
++	synchronize_rcu_expedited();
++	for (i = 0; i < num; i++)
++		mntput(mnt[i]);
++}
++EXPORT_SYMBOL(kern_unmount_array);
++
+ bool our_mnt(struct vfsmount *mnt)
+ {
+ 	return check_mnt(real_mount(mnt));
+diff --git a/fs/overlayfs/super.c b/fs/overlayfs/super.c
+index b613a73412dd..34958f433451 100644
+--- a/fs/overlayfs/super.c
++++ b/fs/overlayfs/super.c
+@@ -216,6 +216,7 @@ static void ovl_destroy_inode(struct inode *inode)
+ 
+ static void ovl_free_fs(struct ovl_fs *ofs)
+ {
++	struct vfsmount **mounts;
+ 	unsigned i;
+ 
+ 	iput(ofs->workbasedir_trap);
+@@ -229,10 +230,14 @@ static void ovl_free_fs(struct ovl_fs *ofs)
+ 	dput(ofs->workbasedir);
+ 	if (ofs->upperdir_locked)
+ 		ovl_inuse_unlock(ovl_upper_mnt(ofs)->mnt_root);
++
++	/* Hack!  Reuse ofs->layers as a vfsmount array before freeing it */
++	mounts = (struct vfsmount **) ofs->layers;
+ 	for (i = 0; i < ofs->numlayer; i++) {
+ 		iput(ofs->layers[i].trap);
+-		mntput(ofs->layers[i].mnt);
++		mounts[i] = ofs->layers[i].mnt;
+ 	}
++	kern_unmount_array(mounts, ofs->numlayer);
+ 	kfree(ofs->layers);
+ 	for (i = 0; i < ofs->numfs; i++)
+ 		free_anon_bdev(ofs->fs[i].pseudo_dev);
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index 973b247abcea..0edd81e8bea5 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -109,4 +109,6 @@ extern unsigned int sysctl_mount_max;
+ 
+ extern bool path_is_mountpoint(const struct path *path);
+ 
++extern void kern_unmount_array(struct vfsmount *mnt[], unsigned int num);
++
+ #endif /* _LINUX_MOUNT_H */
