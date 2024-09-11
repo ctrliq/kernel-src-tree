@@ -298,7 +298,6 @@ struct idxd_desc {
 #define confdev_to_wq(dev) container_of(dev, struct idxd_wq, conf_dev)
 
 extern struct bus_type dsa_bus_type;
-extern struct bus_type iax_bus_type;
 
 extern bool support_enqcmd;
 extern struct ida idxd_ida;
