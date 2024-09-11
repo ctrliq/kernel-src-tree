@@ -1,0 +1,433 @@
+ndctl/papr_scm,uapi: Add support for PAPR nvdimm specific methods
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] ndctl/papr_scm, uapi: Add support for PAPR nvdimm specific methods (Gustavo Duarte) [1782178]
+Rebuild_FUZZ: 99.24%
+commit-author Vaibhav Jain <vaibhav@linux.ibm.com>
+commit f517f7925b7b453cb83be06c268ba057b78e4792
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f517f792.failed
+
+Introduce support for PAPR NVDIMM Specific Methods (PDSM) in papr_scm
+module and add the command family NVDIMM_FAMILY_PAPR to the white list
+of NVDIMM command sets. Also advertise support for ND_CMD_CALL for the
+nvdimm command mask and implement necessary scaffolding in the module
+to handle ND_CMD_CALL ioctl and PDSM requests that we receive.
+
+The layout of the PDSM request as we expect from libnvdimm/libndctl is
+described in newly introduced uapi header 'papr_pdsm.h' which
+defines a 'struct nd_pkg_pdsm' and a maximal union named
+'nd_pdsm_payload'. These new structs together with 'struct nd_cmd_pkg'
+for a pdsm envelop thats sent by libndctl to libnvdimm and serviced by
+papr_scm in 'papr_scm_service_pdsm()'. The PDSM request is
+communicated by member 'struct nd_cmd_pkg.nd_command' together with
+other information on the pdsm payload (size-in, size-out).
+
+The patch also introduces 'struct pdsm_cmd_desc' instances of which
+are stored in an array __pdsm_cmd_descriptors[] indexed with PDSM cmd
+and corresponding access function pdsm_cmd_desc() is
+introduced. 'struct pdsm_cdm_desc' holds the service function for a
+given PDSM and corresponding payload in/out sizes.
+
+A new function papr_scm_service_pdsm() is introduced and is called from
+papr_scm_ndctl() in case of a PDSM request is received via ND_CMD_CALL
+command from libnvdimm. The function performs validation on the PDSM
+payload based on info present in corresponding PDSM descriptor and if
+valid calls the 'struct pdcm_cmd_desc.service' function to service the
+PDSM.
+
+	Signed-off-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+Link: https://lore.kernel.org/r/20200615124407.32596-6-vaibhav@linux.ibm.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit f517f7925b7b453cb83be06c268ba057b78e4792)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/papr_scm.c
+diff --cc arch/powerpc/platforms/pseries/papr_scm.c
+index ff5a5974d78e,d3bbf9940ba4..000000000000
+--- a/arch/powerpc/platforms/pseries/papr_scm.c
++++ b/arch/powerpc/platforms/pseries/papr_scm.c
+@@@ -12,16 -12,57 +12,18 @@@
+  #include <linux/libnvdimm.h>
+  #include <linux/platform_device.h>
+  #include <linux/delay.h>
+ -#include <linux/seq_buf.h>
+  
+  #include <asm/plpar_wrappers.h>
++ #include <asm/papr_pdsm.h>
+  
+  #define BIND_ANY_ADDR (~0ul)
+  
+  #define PAPR_SCM_DIMM_CMD_MASK \
+  	((1ul << ND_CMD_GET_CONFIG_SIZE) | \
+  	 (1ul << ND_CMD_GET_CONFIG_DATA) | \
+- 	 (1ul << ND_CMD_SET_CONFIG_DATA))
++ 	 (1ul << ND_CMD_SET_CONFIG_DATA) | \
++ 	 (1ul << ND_CMD_CALL))
+  
+ -/* DIMM health bitmap bitmap indicators */
+ -/* SCM device is unable to persist memory contents */
+ -#define PAPR_PMEM_UNARMED                   (1ULL << (63 - 0))
+ -/* SCM device failed to persist memory contents */
+ -#define PAPR_PMEM_SHUTDOWN_DIRTY            (1ULL << (63 - 1))
+ -/* SCM device contents are persisted from previous IPL */
+ -#define PAPR_PMEM_SHUTDOWN_CLEAN            (1ULL << (63 - 2))
+ -/* SCM device contents are not persisted from previous IPL */
+ -#define PAPR_PMEM_EMPTY                     (1ULL << (63 - 3))
+ -/* SCM device memory life remaining is critically low */
+ -#define PAPR_PMEM_HEALTH_CRITICAL           (1ULL << (63 - 4))
+ -/* SCM device will be garded off next IPL due to failure */
+ -#define PAPR_PMEM_HEALTH_FATAL              (1ULL << (63 - 5))
+ -/* SCM contents cannot persist due to current platform health status */
+ -#define PAPR_PMEM_HEALTH_UNHEALTHY          (1ULL << (63 - 6))
+ -/* SCM device is unable to persist memory contents in certain conditions */
+ -#define PAPR_PMEM_HEALTH_NON_CRITICAL       (1ULL << (63 - 7))
+ -/* SCM device is encrypted */
+ -#define PAPR_PMEM_ENCRYPTED                 (1ULL << (63 - 8))
+ -/* SCM device has been scrubbed and locked */
+ -#define PAPR_PMEM_SCRUBBED_AND_LOCKED       (1ULL << (63 - 9))
+ -
+ -/* Bits status indicators for health bitmap indicating unarmed dimm */
+ -#define PAPR_PMEM_UNARMED_MASK (PAPR_PMEM_UNARMED |		\
+ -				PAPR_PMEM_HEALTH_UNHEALTHY)
+ -
+ -/* Bits status indicators for health bitmap indicating unflushed dimm */
+ -#define PAPR_PMEM_BAD_SHUTDOWN_MASK (PAPR_PMEM_SHUTDOWN_DIRTY)
+ -
+ -/* Bits status indicators for health bitmap indicating unrestored dimm */
+ -#define PAPR_PMEM_BAD_RESTORE_MASK  (PAPR_PMEM_EMPTY)
+ -
+ -/* Bit status indicators for smart event notification */
+ -#define PAPR_PMEM_SMART_EVENT_MASK (PAPR_PMEM_HEALTH_CRITICAL | \
+ -				    PAPR_PMEM_HEALTH_FATAL |	\
+ -				    PAPR_PMEM_HEALTH_UNHEALTHY)
+ -
+ -/* private struct associated with each region */
+  struct papr_scm_priv {
+  	struct platform_device *pdev;
+  	struct device_node *dn;
+@@@ -245,17 -351,196 +247,201 @@@ static int papr_scm_meta_set(struct pap
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int papr_scm_ndctl(struct nvdimm_bus_descriptor *nd_desc, struct nvdimm *nvdimm,
+ +		unsigned int cmd, void *buf, unsigned int buf_len, int *cmd_rc)
+++=======
++ /*
++  * Do a sanity checks on the inputs args to dimm-control function and return
++  * '0' if valid. Validation of PDSM payloads happens later in
++  * papr_scm_service_pdsm.
++  */
++ static int is_cmd_valid(struct nvdimm *nvdimm, unsigned int cmd, void *buf,
++ 			unsigned int buf_len)
+  {
+- 	struct nd_cmd_get_config_size *get_size_hdr;
++ 	unsigned long cmd_mask = PAPR_SCM_DIMM_CMD_MASK;
++ 	struct nd_cmd_pkg *nd_cmd;
+  	struct papr_scm_priv *p;
+- 	int rc;
++ 	enum papr_pdsm pdsm;
+  
+  	/* Only dimm-specific calls are supported atm */
+  	if (!nvdimm)
+  		return -EINVAL;
+  
++ 	/* get the provider data from struct nvdimm */
++ 	p = nvdimm_provider_data(nvdimm);
++ 
++ 	if (!test_bit(cmd, &cmd_mask)) {
++ 		dev_dbg(&p->pdev->dev, "Unsupported cmd=%u\n", cmd);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* For CMD_CALL verify pdsm request */
++ 	if (cmd == ND_CMD_CALL) {
++ 		/* Verify the envelope and envelop size */
++ 		if (!buf ||
++ 		    buf_len < (sizeof(struct nd_cmd_pkg) + ND_PDSM_HDR_SIZE)) {
++ 			dev_dbg(&p->pdev->dev, "Invalid pkg size=%u\n",
++ 				buf_len);
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Verify that the nd_cmd_pkg.nd_family is correct */
++ 		nd_cmd = (struct nd_cmd_pkg *)buf;
++ 
++ 		if (nd_cmd->nd_family != NVDIMM_FAMILY_PAPR) {
++ 			dev_dbg(&p->pdev->dev, "Invalid pkg family=0x%llx\n",
++ 				nd_cmd->nd_family);
++ 			return -EINVAL;
++ 		}
++ 
++ 		pdsm = (enum papr_pdsm)nd_cmd->nd_command;
++ 
++ 		/* Verify if the pdsm command is valid */
++ 		if (pdsm <= PAPR_PDSM_MIN || pdsm >= PAPR_PDSM_MAX) {
++ 			dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Invalid PDSM\n",
++ 				pdsm);
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* Have enough space to hold returned 'nd_pkg_pdsm' header */
++ 		if (nd_cmd->nd_size_out < ND_PDSM_HDR_SIZE) {
++ 			dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Invalid payload\n",
++ 				pdsm);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	/* Let the command be further processed */
++ 	return 0;
++ }
++ 
++ /*
++  * 'struct pdsm_cmd_desc'
++  * Identifies supported PDSMs' expected length of in/out payloads
++  * and pdsm service function.
++  *
++  * size_in	: Size of input payload if any in the PDSM request.
++  * size_out	: Size of output payload if any in the PDSM request.
++  * service	: Service function for the PDSM request. Return semantics:
++  *		  rc < 0 : Error servicing PDSM and rc indicates the error.
++  *		  rc >=0 : Serviced successfully and 'rc' indicate number of
++  *			bytes written to payload.
++  */
++ struct pdsm_cmd_desc {
++ 	u32 size_in;
++ 	u32 size_out;
++ 	int (*service)(struct papr_scm_priv *dimm,
++ 		       union nd_pdsm_payload *payload);
++ };
++ 
++ /* Holds all supported PDSMs' command descriptors */
++ static const struct pdsm_cmd_desc __pdsm_cmd_descriptors[] = {
++ 	[PAPR_PDSM_MIN] = {
++ 		.size_in = 0,
++ 		.size_out = 0,
++ 		.service = NULL,
++ 	},
++ 	/* New PDSM command descriptors to be added below */
++ 
++ 	/* Empty */
++ 	[PAPR_PDSM_MAX] = {
++ 		.size_in = 0,
++ 		.size_out = 0,
++ 		.service = NULL,
++ 	},
++ };
++ 
++ /* Given a valid pdsm cmd return its command descriptor else return NULL */
++ static inline const struct pdsm_cmd_desc *pdsm_cmd_desc(enum papr_pdsm cmd)
++ {
++ 	if (cmd >= 0 || cmd < ARRAY_SIZE(__pdsm_cmd_descriptors))
++ 		return &__pdsm_cmd_descriptors[cmd];
++ 
++ 	return NULL;
++ }
++ 
++ /*
++  * For a given pdsm request call an appropriate service function.
++  * Returns errors if any while handling the pdsm command package.
++  */
++ static int papr_scm_service_pdsm(struct papr_scm_priv *p,
++ 				 struct nd_cmd_pkg *pkg)
++ {
++ 	/* Get the PDSM header and PDSM command */
++ 	struct nd_pkg_pdsm *pdsm_pkg = (struct nd_pkg_pdsm *)pkg->nd_payload;
++ 	enum papr_pdsm pdsm = (enum papr_pdsm)pkg->nd_command;
++ 	const struct pdsm_cmd_desc *pdsc;
++ 	int rc;
++ 
++ 	/* Fetch corresponding pdsm descriptor for validation and servicing */
++ 	pdsc = pdsm_cmd_desc(pdsm);
++ 
++ 	/* Validate pdsm descriptor */
++ 	/* Ensure that reserved fields are 0 */
++ 	if (pdsm_pkg->reserved[0] || pdsm_pkg->reserved[1]) {
++ 		dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Invalid reserved field\n",
++ 			pdsm);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* If pdsm expects some input, then ensure that the size_in matches */
++ 	if (pdsc->size_in &&
++ 	    pkg->nd_size_in != (pdsc->size_in + ND_PDSM_HDR_SIZE)) {
++ 		dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Mismatched size_in=%d\n",
++ 			pdsm, pkg->nd_size_in);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* If pdsm wants to return data, then ensure that  size_out matches */
++ 	if (pdsc->size_out &&
++ 	    pkg->nd_size_out != (pdsc->size_out + ND_PDSM_HDR_SIZE)) {
++ 		dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Mismatched size_out=%d\n",
++ 			pdsm, pkg->nd_size_out);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Service the pdsm */
++ 	if (pdsc->service) {
++ 		dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Servicing..\n", pdsm);
++ 
++ 		rc = pdsc->service(p, &pdsm_pkg->payload);
++ 
++ 		if (rc < 0) {
++ 			/* error encountered while servicing pdsm */
++ 			pdsm_pkg->cmd_status = rc;
++ 			pkg->nd_fw_size = ND_PDSM_HDR_SIZE;
++ 		} else {
++ 			/* pdsm serviced and 'rc' bytes written to payload */
++ 			pdsm_pkg->cmd_status = 0;
++ 			pkg->nd_fw_size = ND_PDSM_HDR_SIZE + rc;
++ 		}
++ 	} else {
++ 		dev_dbg(&p->pdev->dev, "PDSM[0x%x]: Unsupported PDSM request\n",
++ 			pdsm);
++ 		pdsm_pkg->cmd_status = -ENOENT;
++ 		pkg->nd_fw_size = ND_PDSM_HDR_SIZE;
++ 	}
++ 
++ 	return pdsm_pkg->cmd_status;
++ }
++ 
++ static int papr_scm_ndctl(struct nvdimm_bus_descriptor *nd_desc,
++ 			  struct nvdimm *nvdimm, unsigned int cmd, void *buf,
++ 			  unsigned int buf_len, int *cmd_rc)
+++>>>>>>> f517f7925b7b (ndctl/papr_scm,uapi: Add support for PAPR nvdimm specific methods)
++ {
++ 	struct nd_cmd_get_config_size *get_size_hdr;
++ 	struct nd_cmd_pkg *call_pkg = NULL;
++ 	struct papr_scm_priv *p;
++ 	int rc;
++ 
++ 	rc = is_cmd_valid(nvdimm, cmd, buf, buf_len);
++ 	if (rc) {
++ 		pr_debug("Invalid cmd=0x%x. Err=%d\n", cmd, rc);
++ 		return rc;
++ 	}
++ 
+  	/* Use a local variable in case cmd_rc pointer is NULL */
+  	if (!cmd_rc)
+  		cmd_rc = &rc;
+diff --git a/arch/powerpc/include/uapi/asm/papr_pdsm.h b/arch/powerpc/include/uapi/asm/papr_pdsm.h
+new file mode 100644
+index 000000000000..28115152aa4e
+--- /dev/null
++++ b/arch/powerpc/include/uapi/asm/papr_pdsm.h
+@@ -0,0 +1,95 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++/*
++ * PAPR nvDimm Specific Methods (PDSM) and structs for libndctl
++ *
++ * (C) Copyright IBM 2020
++ *
++ * Author: Vaibhav Jain <vaibhav at linux.ibm.com>
++ */
++
++#ifndef _UAPI_ASM_POWERPC_PAPR_PDSM_H_
++#define _UAPI_ASM_POWERPC_PAPR_PDSM_H_
++
++#include <linux/types.h>
++#include <linux/ndctl.h>
++
++/*
++ * PDSM Envelope:
++ *
++ * The ioctl ND_CMD_CALL exchange data between user-space and kernel via
++ * envelope which consists of 2 headers sections and payload sections as
++ * illustrated below:
++ *  +-----------------+---------------+---------------------------+
++ *  |   64-Bytes      |   8-Bytes     |       Max 184-Bytes       |
++ *  +-----------------+---------------+---------------------------+
++ *  | ND-HEADER       |  PDSM-HEADER  |      PDSM-PAYLOAD         |
++ *  +-----------------+---------------+---------------------------+
++ *  | nd_family       |               |                           |
++ *  | nd_size_out     | cmd_status    |                           |
++ *  | nd_size_in      | reserved      |     nd_pdsm_payload       |
++ *  | nd_command      | payload   --> |                           |
++ *  | nd_fw_size      |               |                           |
++ *  | nd_payload ---> |               |                           |
++ *  +---------------+-----------------+---------------------------+
++ *
++ * ND Header:
++ * This is the generic libnvdimm header described as 'struct nd_cmd_pkg'
++ * which is interpreted by libnvdimm before passed on to papr_scm. Important
++ * member fields used are:
++ * 'nd_family'		: (In) NVDIMM_FAMILY_PAPR_SCM
++ * 'nd_size_in'		: (In) PDSM-HEADER + PDSM-IN-PAYLOAD (usually 0)
++ * 'nd_size_out'        : (In) PDSM-HEADER + PDSM-RETURN-PAYLOAD
++ * 'nd_command'         : (In) One of PAPR_PDSM_XXX
++ * 'nd_fw_size'         : (Out) PDSM-HEADER + size of actual payload returned
++ *
++ * PDSM Header:
++ * This is papr-scm specific header that precedes the payload. This is defined
++ * as nd_cmd_pdsm_pkg.  Following fields aare available in this header:
++ *
++ * 'cmd_status'		: (Out) Errors if any encountered while servicing PDSM.
++ * 'reserved'		: Not used, reserved for future and should be set to 0.
++ * 'payload'            : A union of all the possible payload structs
++ *
++ * PDSM Payload:
++ *
++ * The layout of the PDSM Payload is defined by various structs shared between
++ * papr_scm and libndctl so that contents of payload can be interpreted. As such
++ * its defined as a union of all possible payload structs as
++ * 'union nd_pdsm_payload'. Based on the value of 'nd_cmd_pkg.nd_command'
++ * appropriate member of the union is accessed.
++ */
++
++/* Max payload size that we can handle */
++#define ND_PDSM_PAYLOAD_MAX_SIZE 184
++
++/* Max payload size that we can handle */
++#define ND_PDSM_HDR_SIZE \
++	(sizeof(struct nd_pkg_pdsm) - ND_PDSM_PAYLOAD_MAX_SIZE)
++
++/*
++ * Methods to be embedded in ND_CMD_CALL request. These are sent to the kernel
++ * via 'nd_cmd_pkg.nd_command' member of the ioctl struct
++ */
++enum papr_pdsm {
++	PAPR_PDSM_MIN = 0x0,
++	PAPR_PDSM_MAX,
++};
++
++/* Maximal union that can hold all possible payload types */
++union nd_pdsm_payload {
++	__u8 buf[ND_PDSM_PAYLOAD_MAX_SIZE];
++} __packed;
++
++/*
++ * PDSM-header + payload expected with ND_CMD_CALL ioctl from libnvdimm
++ * Valid member of union 'payload' is identified via 'nd_cmd_pkg.nd_command'
++ * that should always precede this struct when sent to papr_scm via CMD_CALL
++ * interface.
++ */
++struct nd_pkg_pdsm {
++	__s32 cmd_status;	/* Out: Sub-cmd status returned back */
++	__u16 reserved[2];	/* Ignored and to be set as '0' */
++	union nd_pdsm_payload payload;
++} __packed;
++
++#endif /* _UAPI_ASM_POWERPC_PAPR_PDSM_H_ */
+* Unmerged path arch/powerpc/platforms/pseries/papr_scm.c
+diff --git a/include/uapi/linux/ndctl.h b/include/uapi/linux/ndctl.h
+index de408cde3031..f24e3cfc74cc 100644
+--- a/include/uapi/linux/ndctl.h
++++ b/include/uapi/linux/ndctl.h
+@@ -254,6 +254,7 @@ struct nd_cmd_pkg {
+ #define NVDIMM_FAMILY_HPE2 2
+ #define NVDIMM_FAMILY_MSFT 3
+ #define NVDIMM_FAMILY_HYPERV 4
++#define NVDIMM_FAMILY_PAPR 5
+ 
+ #define ND_IOCTL_CALL			_IOWR(ND_IOCTL, ND_CMD_CALL,\
+ 					struct nd_cmd_pkg)
