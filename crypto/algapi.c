@@ -601,6 +601,9 @@ int crypto_init_spawn(struct crypto_spawn *spawn, struct crypto_alg *alg,
 {
 	int err = -EAGAIN;
 
+	if (WARN_ON_ONCE(inst == NULL))
+		return -EINVAL;
+
 	spawn->inst = inst;
 	spawn->mask = mask;
 
