@@ -1,0 +1,172 @@
+drm/i915/perf: Do not clear pollin for small user read buffers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ashutosh Dixit <ashutosh.dixit@intel.com>
+commit 6352219c39c04ed3f9a8d1cf93f87c21753a213e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6352219c.failed
+
+It is wrong to block the user thread in the next poll when OA data is
+already available which could not fit in the user buffer provided in
+the previous read. In several cases the exact user buffer size is not
+known. Blocking user space in poll can lead to data loss when the
+buffer size used is smaller than the available data.
+
+This change fixes this issue and allows user space to read all OA data
+even when using a buffer size smaller than the available data using
+multiple non-blocking reads rather than staying blocked in poll till
+the next timer interrupt.
+
+v2: Fix ret value for blocking reads (Umesh)
+v3: Mistake during patch send (Ashutosh)
+v4: Remove -EAGAIN from comment (Umesh)
+v5: Improve condition for clearing pollin and return (Lionel)
+v6: Improve blocking read loop and other cleanups (Lionel)
+v7: Added Cc stable
+
+Testcase: igt/perf/polling-small-buf
+	Reviewed-by: Lionel Landwerlin <lionel.g.landwerlin@intel.com>
+	Signed-off-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Cc: Umesh Nerlige Ramappa <umesh.nerlige.ramappa@intel.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Chris Wilson <chris@chris-wilson.co.uk>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200403010120.3067-1-ashutosh.dixit@intel.com
+(cherry picked from commit 6352219c39c04ed3f9a8d1cf93f87c21753a213e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_perf.c
+diff --cc drivers/gpu/drm/i915/i915_perf.c
+index 5140017f9a39,2f78b147bb2d..000000000000
+--- a/drivers/gpu/drm/i915/i915_perf.c
++++ b/drivers/gpu/drm/i915/i915_perf.c
+@@@ -2171,54 -2957,12 +2171,11 @@@ void i915_oa_init_reg_state(struct inte
+  	if (engine->class != RENDER_CLASS)
+  		return;
+  
+ -	/* perf.exclusive_stream serialised by lrc_configure_all_contexts() */
+ -	stream = READ_ONCE(engine->i915->perf.exclusive_stream);
+ -	if (stream && INTEL_GEN(stream->perf->i915) < 12)
+ -		gen8_update_reg_state_unlocked(ce, stream);
+ +	stream = engine->i915->perf.oa.exclusive_stream;
+ +	if (stream)
+ +		gen8_update_reg_state_unlocked(ce, regs, stream->oa_config);
+  }
+  
+- /**
+-  * i915_perf_read_locked - &i915_perf_stream_ops->read with error normalisation
+-  * @stream: An i915 perf stream
+-  * @file: An i915 perf stream file
+-  * @buf: destination buffer given by userspace
+-  * @count: the number of bytes userspace wants to read
+-  * @ppos: (inout) file seek position (unused)
+-  *
+-  * Besides wrapping &i915_perf_stream_ops->read this provides a common place to
+-  * ensure that if we've successfully copied any data then reporting that takes
+-  * precedence over any internal error status, so the data isn't lost.
+-  *
+-  * For example ret will be -ENOSPC whenever there is more buffered data than
+-  * can be copied to userspace, but that's only interesting if we weren't able
+-  * to copy some data because it implies the userspace buffer is too small to
+-  * receive a single record (and we never split records).
+-  *
+-  * Another case with ret == -EFAULT is more of a grey area since it would seem
+-  * like bad form for userspace to ask us to overrun its buffer, but the user
+-  * knows best:
+-  *
+-  *   http://yarchive.net/comp/linux/partial_reads_writes.html
+-  *
+-  * Returns: The number of bytes copied or a negative error code on failure.
+-  */
+- static ssize_t i915_perf_read_locked(struct i915_perf_stream *stream,
+- 				     struct file *file,
+- 				     char __user *buf,
+- 				     size_t count,
+- 				     loff_t *ppos)
+- {
+- 	/* Note we keep the offset (aka bytes read) separate from any
+- 	 * error status so that the final check for whether we return
+- 	 * the bytes read with a higher precedence than any error (see
+- 	 * comment below) doesn't need to be handled/duplicated in
+- 	 * stream->ops->read() implementations.
+- 	 */
+- 	size_t offset = 0;
+- 	int ret = stream->ops->read(stream, buf, count, &offset);
+- 
+- 	return offset ?: (ret ?: -EAGAIN);
+- }
+- 
+  /**
+   * i915_perf_read - handles read() FOP for i915 perf stream FDs
+   * @file: An i915 perf stream file
+@@@ -2243,8 -2987,9 +2200,14 @@@ static ssize_t i915_perf_read(struct fi
+  			      loff_t *ppos)
+  {
+  	struct i915_perf_stream *stream = file->private_data;
+++<<<<<<< HEAD
+ +	struct drm_i915_private *dev_priv = stream->dev_priv;
+ +	ssize_t ret;
+++=======
++ 	struct i915_perf *perf = stream->perf;
++ 	size_t offset = 0;
++ 	int ret;
+++>>>>>>> 6352219c39c0 (drm/i915/perf: Do not clear pollin for small user read buffers)
+  
+  	/* To ensure it's handled consistently we simply treat all reads of a
+  	 * disabled stream as an error. In particular it might otherwise lead
+@@@ -2266,15 -3011,14 +2229,26 @@@
+  			if (ret)
+  				return ret;
+  
+++<<<<<<< HEAD
+ +			mutex_lock(&dev_priv->perf.lock);
+ +			ret = i915_perf_read_locked(stream, file,
+ +						    buf, count, ppos);
+ +			mutex_unlock(&dev_priv->perf.lock);
+ +		} while (ret == -EAGAIN);
+ +	} else {
+ +		mutex_lock(&dev_priv->perf.lock);
+ +		ret = i915_perf_read_locked(stream, file, buf, count, ppos);
+ +		mutex_unlock(&dev_priv->perf.lock);
+++=======
++ 			mutex_lock(&perf->lock);
++ 			ret = stream->ops->read(stream, buf, count, &offset);
++ 			mutex_unlock(&perf->lock);
++ 		} while (!offset && !ret);
++ 	} else {
++ 		mutex_lock(&perf->lock);
++ 		ret = stream->ops->read(stream, buf, count, &offset);
++ 		mutex_unlock(&perf->lock);
+++>>>>>>> 6352219c39c0 (drm/i915/perf: Do not clear pollin for small user read buffers)
+  	}
+  
+  	/* We allow the poll checking to sometimes report false positive EPOLLIN
+@@@ -2284,15 -3028,15 +2258,24 @@@
+  	 * and read() returning -EAGAIN. Clearing the oa.pollin state here
+  	 * effectively ensures we back off until the next hrtimer callback
+  	 * before reporting another EPOLLIN event.
++ 	 * The exception to this is if ops->read() returned -ENOSPC which means
++ 	 * that more OA data is available than could fit in the user provided
++ 	 * buffer. In this case we want the next poll() call to not block.
+  	 */
+++<<<<<<< HEAD
+ +	if (ret >= 0 || ret == -EAGAIN) {
+ +		/* Maybe make ->pollin per-stream state if we support multiple
+ +		 * concurrent streams in the future.
+ +		 */
+ +		dev_priv->perf.oa.pollin = false;
+ +	}
+++=======
++ 	if (ret != -ENOSPC)
++ 		stream->pollin = false;
+++>>>>>>> 6352219c39c0 (drm/i915/perf: Do not clear pollin for small user read buffers)
+  
+- 	return ret;
++ 	/* Possible values for ret are 0, -EFAULT, -ENOSPC, -EIO, ... */
++ 	return offset ?: (ret ?: -EAGAIN);
+  }
+  
+  static enum hrtimer_restart oa_poll_check_timer_cb(struct hrtimer *hrtimer)
+* Unmerged path drivers/gpu/drm/i915/i915_perf.c
