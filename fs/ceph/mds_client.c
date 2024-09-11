@@ -4340,6 +4340,7 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 
 {
 	struct ceph_mds_client *mdsc;
+	int err;
 
 	mdsc = kzalloc(sizeof(struct ceph_mds_client), GFP_NOFS);
 	if (!mdsc)
@@ -4348,8 +4349,8 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	mutex_init(&mdsc->mutex);
 	mdsc->mdsmap = kzalloc(sizeof(*mdsc->mdsmap), GFP_NOFS);
 	if (!mdsc->mdsmap) {
-		kfree(mdsc);
-		return -ENOMEM;
+		err = -ENOMEM;
+		goto err_mdsc;
 	}
 
 	fsc->mdsc = mdsc;
@@ -4387,6 +4388,9 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	init_waitqueue_head(&mdsc->cap_flushing_wq);
 	INIT_WORK(&mdsc->cap_reclaim_work, ceph_cap_reclaim_work);
 	atomic_set(&mdsc->cap_reclaim_pending, 0);
+	err = ceph_metric_init(&mdsc->metric);
+	if (err)
+		goto err_mdsmap;
 
 	spin_lock_init(&mdsc->dentry_list_lock);
 	INIT_LIST_HEAD(&mdsc->dentry_leases);
@@ -4405,6 +4409,12 @@ int ceph_mdsc_init(struct ceph_fs_client *fsc)
 	strscpy(mdsc->nodename, utsname()->nodename,
 		sizeof(mdsc->nodename));
 	return 0;
+
+err_mdsmap:
+	kfree(mdsc->mdsmap);
+err_mdsc:
+	kfree(mdsc);
+	return err;
 }
 
 /*
@@ -4661,6 +4671,8 @@ void ceph_mdsc_destroy(struct ceph_fs_client *fsc)
 	ceph_msgr_flush();
 
 	ceph_mdsc_stop(mdsc);
+
+	ceph_metric_destroy(&mdsc->metric);
 
 	fsc->mdsc = NULL;
 	kfree(mdsc);
