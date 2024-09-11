@@ -196,6 +196,7 @@ static struct rdtgroup *region_find_by_minor(unsigned int minor)
 static int pseudo_lock_region_init(struct pseudo_lock_region *plr)
 {
 	struct cpu_cacheinfo *ci;
+	int ret;
 	int i;
 
 	/* Pick the first cpu we find that is associated with the cache. */
@@ -204,7 +205,8 @@ static int pseudo_lock_region_init(struct pseudo_lock_region *plr)
 	if (!cpu_online(plr->cpu)) {
 		rdt_last_cmd_printf("cpu %u associated with cache not online\n",
 				    plr->cpu);
-		return -ENODEV;
+		ret = -ENODEV;
+		goto out_region;
 	}
 
 	ci = get_cpu_cacheinfo(plr->cpu);
@@ -218,8 +220,11 @@ static int pseudo_lock_region_init(struct pseudo_lock_region *plr)
 		}
 	}
 
+	ret = -1;
 	rdt_last_cmd_puts("unable to determine cache line size\n");
-	return -1;
+out_region:
+	pseudo_lock_region_clear(plr);
+	return ret;
 }
 
 /**
@@ -293,16 +298,23 @@ static int pseudo_lock_region_alloc(struct pseudo_lock_region *plr)
 	 */
 	if (plr->size > KMALLOC_MAX_SIZE) {
 		rdt_last_cmd_puts("requested region exceeds maximum size\n");
-		return -E2BIG;
+		ret = -E2BIG;
+		goto out_region;
 	}
 
 	plr->kmem = kzalloc(plr->size, GFP_KERNEL);
 	if (!plr->kmem) {
 		rdt_last_cmd_puts("unable to allocate memory\n");
-		return -ENOMEM;
+		ret = -ENOMEM;
+		goto out_region;
 	}
 
-	return 0;
+	ret = 0;
+	goto out;
+out_region:
+	pseudo_lock_region_clear(plr);
+out:
+	return ret;
 }
 
 /**
