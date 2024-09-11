@@ -1,0 +1,136 @@
+ice: Check FDIR program status for AVF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Qi Zhang <qi.z.zhang@intel.com>
+commit d6218317e2eff8b3762f437da582ea970cde576e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/d6218317.failed
+
+Enable returning FDIR completion status by checking the
+ctrl_vsi Rx queue descriptor value.
+
+To enable returning FDIR completion status from ctrl_vsi Rx queue,
+COMP_Queue and COMP_Report of FDIR filter programming descriptor
+needs to be properly configured. After program request sent to ctrl_vsi
+Tx queue, ctrl_vsi Rx queue interrupt will be triggered and
+completion status will be returned.
+
+Driver will first issue request in ice_vc_fdir_add_fltr(), then
+pass FDIR context to the background task in interrupt service routine
+ice_vc_fdir_irq_handler() and finally deal with them in
+ice_flush_fdir_ctx(). ice_flush_fdir_ctx() will check the descriptor's
+value, fdir context, and then send back virtual channel message to VF
+by calling ice_vc_add_fdir_fltr_post(). An additional timer will be
+setup in case of hardware interrupt timeout.
+
+	Signed-off-by: Yahui Cao <yahui.cao@intel.com>
+	Signed-off-by: Brett Creeley <brett.creeley@intel.com>
+	Signed-off-by: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Signed-off-by: Qi Zhang <qi.z.zhang@intel.com>
+	Tested-by: Chen Bo <BoX.C.Chen@intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit d6218317e2eff8b3762f437da582ea970cde576e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+#	drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.h
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.h
+diff --git a/drivers/net/ethernet/intel/ice/ice.h b/drivers/net/ethernet/intel/ice/ice.h
+index 8acc2ee5160b..ffea848e6e0f 100644
+--- a/drivers/net/ethernet/intel/ice/ice.h
++++ b/drivers/net/ethernet/intel/ice/ice.h
+@@ -230,6 +230,7 @@ enum ice_state {
+ 	__ICE_VF_RESETS_DISABLED,	/* disable resets during ice_remove */
+ 	__ICE_LINK_DEFAULT_OVERRIDE_PENDING,
+ 	__ICE_PHY_INIT_COMPLETE,
++	__ICE_FD_VF_FLUSH_CTX,		/* set at FD Rx IRQ or timeout */
+ 	__ICE_STATE_NBITS		/* must be last */
+ };
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+index 6f4de1bf0fb9..a501e2b7e09e 100644
+--- a/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
++++ b/drivers/net/ethernet/intel/ice/ice_hw_autogen.h
+@@ -385,6 +385,9 @@
+ #define VSIQF_FD_CNT(_VSI)			(0x00464000 + ((_VSI) * 4))
+ #define VSIQF_FD_CNT_FD_GCNT_S			0
+ #define VSIQF_FD_CNT_FD_GCNT_M			ICE_M(0x3FFF, 0)
++#define VSIQF_FD_CNT_FD_BCNT_S			16
++#define VSIQF_FD_CNT_FD_BCNT_M			ICE_M(0x3FFF, 16)
++#define VSIQF_FD_SIZE(_VSI)			(0x00462000 + ((_VSI) * 4))
+ #define VSIQF_HKEY_MAX_INDEX			12
+ #define VSIQF_HLUT_MAX_INDEX			15
+ #define PFPM_APM				0x000B8080
+diff --git a/drivers/net/ethernet/intel/ice/ice_lan_tx_rx.h b/drivers/net/ethernet/intel/ice/ice_lan_tx_rx.h
+index 558ee29f4f2a..ad0e2df79575 100644
+--- a/drivers/net/ethernet/intel/ice/ice_lan_tx_rx.h
++++ b/drivers/net/ethernet/intel/ice/ice_lan_tx_rx.h
+@@ -138,6 +138,26 @@ struct ice_fltr_desc {
+ 			(0xFFFFFFFFULL << ICE_FXD_FLTR_QW1_FDID_S)
+ #define ICE_FXD_FLTR_QW1_FDID_ZERO	0x0ULL
+ 
++/* definition for FD filter programming status descriptor WB format */
++#define ICE_FXD_FLTR_WB_QW1_DD_S	0
++#define ICE_FXD_FLTR_WB_QW1_DD_M	(0x1ULL << ICE_FXD_FLTR_WB_QW1_DD_S)
++#define ICE_FXD_FLTR_WB_QW1_DD_YES	0x1ULL
++
++#define ICE_FXD_FLTR_WB_QW1_PROG_ID_S	1
++#define ICE_FXD_FLTR_WB_QW1_PROG_ID_M	\
++				(0x3ULL << ICE_FXD_FLTR_WB_QW1_PROG_ID_S)
++#define ICE_FXD_FLTR_WB_QW1_PROG_ADD	0x0ULL
++#define ICE_FXD_FLTR_WB_QW1_PROG_DEL	0x1ULL
++
++#define ICE_FXD_FLTR_WB_QW1_FAIL_S	4
++#define ICE_FXD_FLTR_WB_QW1_FAIL_M	(0x1ULL << ICE_FXD_FLTR_WB_QW1_FAIL_S)
++#define ICE_FXD_FLTR_WB_QW1_FAIL_YES	0x1ULL
++
++#define ICE_FXD_FLTR_WB_QW1_FAIL_PROF_S	5
++#define ICE_FXD_FLTR_WB_QW1_FAIL_PROF_M	\
++				(0x1ULL << ICE_FXD_FLTR_WB_QW1_FAIL_PROF_S)
++#define ICE_FXD_FLTR_WB_QW1_FAIL_PROF_YES	0x1ULL
++
+ struct ice_rx_ptype_decoded {
+ 	u32 ptype:10;
+ 	u32 known:1;
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index c20b499d371e..72a51161fb55 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -2087,6 +2087,7 @@ static void ice_service_task(struct work_struct *work)
+ 	ice_process_vflr_event(pf);
+ 	ice_clean_mailboxq_subtask(pf);
+ 	ice_sync_arfs_fltrs(pf);
++	ice_flush_fdir_ctx(pf);
+ 	/* Clear __ICE_SERVICE_SCHED flag to allow scheduling next event */
+ 	ice_service_task_complete(pf);
+ 
+@@ -2098,6 +2099,7 @@ static void ice_service_task(struct work_struct *work)
+ 	    test_bit(__ICE_MDD_EVENT_PENDING, pf->state) ||
+ 	    test_bit(__ICE_VFLR_EVENT_PENDING, pf->state) ||
+ 	    test_bit(__ICE_MAILBOXQ_EVENT_PENDING, pf->state) ||
++	    test_bit(__ICE_FD_VF_FLUSH_CTX, pf->state) ||
+ 	    test_bit(__ICE_ADMINQ_EVENT_PENDING, pf->state))
+ 		mod_timer(&pf->serv_tmr, jiffies);
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index c532c7202c03..7cefa39c4707 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -1120,6 +1120,11 @@ int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
+ 		dma_rmb();
+ 
+ 		if (rx_desc->wb.rxdid == FDIR_DESC_RXDID || !rx_ring->netdev) {
++			struct ice_vsi *ctrl_vsi = rx_ring->vsi;
++
++			if (rx_desc->wb.rxdid == FDIR_DESC_RXDID &&
++			    ctrl_vsi->vf_id != ICE_INVAL_VFID)
++				ice_vc_fdir_irq_handler(ctrl_vsi, rx_desc);
+ 			ice_put_rx_buf(rx_ring, NULL, 0);
+ 			cleaned_count++;
+ 			continue;
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_virtchnl_fdir.h
