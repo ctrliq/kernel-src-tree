@@ -1,0 +1,126 @@
+kernfs: use i_lock to protect concurrent inode updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Ian Kent <raven@themaw.net>
+commit 47b5c64d0ab5e7136db2b78c6ec710e0d8a5a36b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/47b5c64d.failed
+
+The inode operations .permission() and .getattr() use the kernfs node
+write lock but all that's needed is the read lock to protect against
+partial updates of these kernfs node fields which are all done under
+the write lock.
+
+And .permission() is called frequently during path walks and can cause
+quite a bit of contention between kernfs node operations and path
+walks when the number of concurrent walks is high.
+
+To change kernfs_iop_getattr() and kernfs_iop_permission() to take
+the rw sem read lock instead of the write lock an additional lock is
+needed to protect against multiple processes concurrently updating
+the inode attributes and link count in kernfs_refresh_inode().
+
+The inode i_lock seems like the sensible thing to use to protect these
+inode attribute updates so use it in kernfs_refresh_inode().
+
+The last hunk in the patch, applied to kernfs_fill_super(), is possibly
+not needed but taking the lock was present originally. I prefer to
+continue to take it to protect against a partial update of the source
+kernfs fields during the call to kernfs_refresh_inode() made by
+kernfs_get_inode().
+
+	Reviewed-by: Miklos Szeredi <mszeredi@redhat.com>
+	Signed-off-by: Ian Kent <raven@themaw.net>
+Link: https://lore.kernel.org/r/162642771474.63632.16295959115893904470.stgit@web.messagingengine.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit 47b5c64d0ab5e7136db2b78c6ec710e0d8a5a36b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/kernfs/inode.c
+#	fs/kernfs/mount.c
+diff --cc fs/kernfs/inode.c
+index 7c789d95a814,c0eae1725435..000000000000
+--- a/fs/kernfs/inode.c
++++ b/fs/kernfs/inode.c
+@@@ -188,11 -185,13 +188,21 @@@ int kernfs_iop_getattr(const struct pat
+  	struct inode *inode = d_inode(path->dentry);
+  	struct kernfs_node *kn = inode->i_private;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&kernfs_mutex);
+ +	kernfs_refresh_inode(kn, inode);
+ +	mutex_unlock(&kernfs_mutex);
+ +
+ +	generic_fillattr(inode, stat);
+++=======
++ 	down_read(&kernfs_rwsem);
++ 	spin_lock(&inode->i_lock);
++ 	kernfs_refresh_inode(kn, inode);
++ 	generic_fillattr(&init_user_ns, inode, stat);
++ 	spin_unlock(&inode->i_lock);
++ 	up_read(&kernfs_rwsem);
++ 
+++>>>>>>> 47b5c64d0ab5 (kernfs: use i_lock to protect concurrent inode updates)
+  	return 0;
+  }
+  
+@@@ -271,20 -270,25 +281,32 @@@ void kernfs_evict_inode(struct inode *i
+  	kernfs_put(kn);
+  }
+  
+ -int kernfs_iop_permission(struct user_namespace *mnt_userns,
+ -			  struct inode *inode, int mask)
+ +int kernfs_iop_permission(struct inode *inode, int mask)
+  {
+  	struct kernfs_node *kn;
++ 	int ret;
+  
+  	if (mask & MAY_NOT_BLOCK)
+  		return -ECHILD;
+  
+  	kn = inode->i_private;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&kernfs_mutex);
+ +	kernfs_refresh_inode(kn, inode);
+ +	mutex_unlock(&kernfs_mutex);
+ +
+ +	return generic_permission(inode, mask);
+++=======
++ 	down_read(&kernfs_rwsem);
++ 	spin_lock(&inode->i_lock);
++ 	kernfs_refresh_inode(kn, inode);
++ 	ret = generic_permission(&init_user_ns, inode, mask);
++ 	spin_unlock(&inode->i_lock);
++ 	up_read(&kernfs_rwsem);
++ 
++ 	return ret;
+++>>>>>>> 47b5c64d0ab5 (kernfs: use i_lock to protect concurrent inode updates)
+  }
+  
+  int kernfs_xattr_get(struct kernfs_node *kn, const char *name,
+diff --cc fs/kernfs/mount.c
+index 1f9b3956c423,f2f909d09f52..000000000000
+--- a/fs/kernfs/mount.c
++++ b/fs/kernfs/mount.c
+@@@ -232,9 -255,9 +232,15 @@@ static int kernfs_fill_super(struct sup
+  	sb->s_shrink.seeks = 0;
+  
+  	/* get root inode, initialize and unlock it */
+++<<<<<<< HEAD
+ +	mutex_lock(&kernfs_mutex);
+ +	inode = kernfs_get_inode(sb, info->root->kn);
+ +	mutex_unlock(&kernfs_mutex);
+++=======
++ 	down_read(&kernfs_rwsem);
++ 	inode = kernfs_get_inode(sb, info->root->kn);
++ 	up_read(&kernfs_rwsem);
+++>>>>>>> 47b5c64d0ab5 (kernfs: use i_lock to protect concurrent inode updates)
+  	if (!inode) {
+  		pr_debug("kernfs: could not get root inode\n");
+  		return -ENOMEM;
+* Unmerged path fs/kernfs/inode.c
+* Unmerged path fs/kernfs/mount.c
