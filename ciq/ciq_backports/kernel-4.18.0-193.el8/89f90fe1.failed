@@ -1,0 +1,193 @@
+SUNRPC: Allow calls to xprt_transmit() to drain the entire transmit queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 89f90fe1ad8bc7cde7f1859abdc392d02ee952de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/89f90fe1.failed
+
+Rather than forcing each and every RPC task to grab the socket write
+lock in order to send itself, we allow whichever task is holding the
+write lock to attempt to drain the entire transmit queue.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 89f90fe1ad8bc7cde7f1859abdc392d02ee952de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index eacde9249456,c66030c39fcd..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -998,55 -1224,56 +998,79 @@@ void xprt_end_transmit(struct rpc_task 
+  }
+  
+  /**
+-  * xprt_transmit - send an RPC request on a transport
+-  * @task: controlling RPC task
++  * xprt_request_transmit - send an RPC request on a transport
++  * @req: pointer to request to transmit
++  * @snd_task: RPC task that owns the transport lock
+   *
+-  * We have to copy the iovec because sendmsg fiddles with its contents.
++  * This performs the transmission of a single request.
++  * Note that if the request is not the same as snd_task, then it
++  * does need to be pinned.
++  * Returns '0' on success.
+   */
+- void xprt_transmit(struct rpc_task *task)
++ static int
++ xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+  {
+- 	struct rpc_rqst	*req = task->tk_rqstp;
+- 	struct rpc_xprt	*xprt = req->rq_xprt;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 	struct rpc_task *task = req->rq_task;
+  	unsigned int connect_cookie;
+ -	int is_retrans = RPC_WAS_SENT(task);
+  	int status;
+  
+  	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+  
+++<<<<<<< HEAD
+ +	if (!req->rq_reply_bytes_recvd) {
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task)) {
++ 			status = 0;
++ 			goto out_dequeue;
++ 		}
++ 		/* Verify that our message lies in the RPCSEC_GSS window */
++ 		if (rpcauth_xmit_need_reencode(task)) {
++ 			status = -EBADMSG;
++ 			goto out_dequeue;
++ 		}
++ 	}
+++>>>>>>> 89f90fe1ad8b (SUNRPC: Allow calls to xprt_transmit() to drain the entire transmit queue)
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +		/* Verify that our message lies in the RPCSEC_GSS window */
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+ +		}
+ +
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+- 	status = xprt->ops->send_request(req, task);
++ 	status = xprt->ops->send_request(req, snd_task);
+  	trace_xprt_transmit(xprt, req->rq_xid, status);
+  	if (status != 0) {
+++<<<<<<< HEAD
+ +		task->tk_status = status;
+ +		return;
+++=======
++ 		req->rq_ntrans--;
++ 		return status;
+++>>>>>>> 89f90fe1ad8b (SUNRPC: Allow calls to xprt_transmit() to drain the entire transmit queue)
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+  	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+@@@ -1064,22 -1288,51 +1088,70 @@@
+  	spin_unlock_bh(&xprt->transport_lock);
+  
+  	req->rq_connect_cookie = connect_cookie;
+++<<<<<<< HEAD
+ +	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +		/*
+ +		 * Sleep on the pending queue if we're expecting a reply.
+ +		 * The spinlock ensures atomicity between the test of
+ +		 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
+ +		 */
+ +		spin_lock(&xprt->recv_lock);
+ +		if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +			rpc_sleep_on(&xprt->pending, task, xprt_timer);
+ +			/* Wake up immediately if the connection was dropped */
+ +			if (!xprt_connected(xprt))
+ +				rpc_wake_up_queued_task_set_status(&xprt->pending,
+ +						task, -ENOTCONN);
+ +		}
+ +		spin_unlock(&xprt->recv_lock);
+ +	}
+++=======
++ out_dequeue:
++ 	xprt_request_dequeue_transmit(task);
++ 	rpc_wake_up_queued_task_set_status(&xprt->sending, task, status);
++ 	return status;
++ }
++ 
++ /**
++  * xprt_transmit - send an RPC request on a transport
++  * @task: controlling RPC task
++  *
++  * Attempts to drain the transmit queue. On exit, either the transport
++  * signalled an error that needs to be handled before transmission can
++  * resume, or @task finished transmitting, and detected that it already
++  * received a reply.
++  */
++ void
++ xprt_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *next, *req = task->tk_rqstp;
++ 	struct rpc_xprt	*xprt = req->rq_xprt;
++ 	int status;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	while (!list_empty(&xprt->xmit_queue)) {
++ 		next = list_first_entry(&xprt->xmit_queue,
++ 				struct rpc_rqst, rq_xmit);
++ 		xprt_pin_rqst(next);
++ 		spin_unlock(&xprt->queue_lock);
++ 		status = xprt_request_transmit(next, task);
++ 		if (status == -EBADMSG && next != req)
++ 			status = 0;
++ 		cond_resched();
++ 		spin_lock(&xprt->queue_lock);
++ 		xprt_unpin_rqst(next);
++ 		if (status == 0) {
++ 			if (!xprt_request_data_received(task) ||
++ 			    test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 				continue;
++ 		} else if (!test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 			rpc_wake_up_queued_task(&xprt->pending, task);
++ 		else
++ 			task->tk_status = status;
++ 		break;
++ 	}
++ 	spin_unlock(&xprt->queue_lock);
+++>>>>>>> 89f90fe1ad8b (SUNRPC: Allow calls to xprt_transmit() to drain the entire transmit queue)
+  }
+  
+  static void xprt_add_backlog(struct rpc_xprt *xprt, struct rpc_task *task)
+* Unmerged path net/sunrpc/xprt.c
