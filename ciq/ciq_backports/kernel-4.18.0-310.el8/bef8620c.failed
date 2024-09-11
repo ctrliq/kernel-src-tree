@@ -1,0 +1,288 @@
+mm: memcg: deprecate the non-hierarchical mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit bef8620cd8e0a117c1a0719604052e424eb418f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/bef8620c.failed
+
+Patch series "mm: memcg: deprecate cgroup v1 non-hierarchical mode", v1.
+
+The non-hierarchical cgroup v1 mode is a legacy of early days
+of the memory controller and doesn't bring any value today.
+However, it complicates the code and creates many edge cases
+all over the memory controller code.
+
+It's a good time to deprecate it completely. This patchset removes
+the internal logic, adjusts the user interface and updates
+the documentation. The alt patch removes some bits of the cgroup
+core code, which become obsolete.
+
+Michal Hocko said:
+  "All that we know today is that we have a warning in place to complain
+   loudly when somebody relies on use_hierarchy=0 with a deeper
+   hierarchy. For all those years we have seen _zero_ reports that would
+   describe a sensible usecase.
+
+   Moreover we (SUSE) have backported this warning into old distribution
+   kernels (since 3.0 based kernels) to extend the coverage and didn't
+   hear even for users who adopt new kernels only very slowly. The only
+   report we have seen so far was a LTP test suite which doesn't really
+   reflect any real life usecase"
+
+This patch (of 3):
+
+The non-hierarchical cgroup v1 mode is a legacy of early days of the
+memory controller and doesn't bring any value today.  However, it
+complicates the code and creates many edge cases all over the memory
+controller code.
+
+It's a good time to deprecate it completely.
+
+Functionally this patch enabled is by default for all cgroups and forbids
+switching it off.  Nothing changes if cgroup v2 is used: hierarchical mode
+was enforced from scratch.
+
+To protect the ABI memory.use_hierarchy interface is preserved with a
+limited functionality: reading always returns "1", writing of "1" passes
+silently, writing of any other value fails with -EINVAL and a warning to
+dmesg (on the first occasion).
+
+Link: https://lkml.kernel.org/r/20201110220800.929549-1-guro@fb.com
+Link: https://lkml.kernel.org/r/20201110220800.929549-2-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: David Rientjes <rientjes@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit bef8620cd8e0a117c1a0719604052e424eb418f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+diff --cc include/linux/memcontrol.h
+index da9b4f3ccbfd,dd992b81bcb7..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -293,19 -235,12 +293,22 @@@ struct mem_cgroup 
+  	struct vmpressure vmpressure;
+  
+  	/*
+ -	 * Should the OOM killer kill all belonging tasks, had it kill one?
+++<<<<<<< HEAD
+ +	 * Should the accounting and control be hierarchical, per subtree?
+  	 */
+ -	bool oom_group;
+ +	bool use_hierarchy;
+  
+  	/* protected by memcg_oom_lock */
+  	bool		oom_lock;
+ +
+ +	/*
+++=======
+++>>>>>>> bef8620cd8e0 (mm: memcg: deprecate the non-hierarchical mode)
+ +	 * Should the OOM killer kill all belonging tasks, had it kill one?
+ +	 */
+ +	RH_KABI_FILL_HOLE(bool oom_group)
+ +
+ +	/* protected by memcg_oom_lock */
+  	int		under_oom;
+  
+  	int	swappiness;
+* Unmerged path include/linux/memcontrol.h
+diff --git a/kernel/cgroup/cgroup.c b/kernel/cgroup/cgroup.c
+index 18b2b038e0aa..080c3f80bd6d 100644
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@ -290,9 +290,6 @@ bool cgroup_ssid_enabled(int ssid)
+  * - cpuset: a task can be moved into an empty cpuset, and again it takes
+  *   masks of ancestors.
+  *
+- * - memcg: use_hierarchy is on by default and the cgroup file for the flag
+- *   is not created.
+- *
+  * - blkcg: blk-throttle becomes properly hierarchical.
+  *
+  * - debug: disallowed on the default hierarchy.
+@@ -5145,8 +5142,6 @@ static struct cgroup_subsys_state *css_create(struct cgroup *cgrp,
+ 	    cgroup_parent(parent)) {
+ 		pr_warn("%s (%d) created nested cgroup for controller \"%s\" which has incomplete hierarchy support. Nested cgroups may change behavior in the future.\n",
+ 			current->comm, current->pid, ss->name);
+-		if (!strcmp(ss->name, "memory"))
+-			pr_warn("\"memory\" requires setting use_hierarchy to 1 on the root\n");
+ 		ss->warned_broken_hierarchy = true;
+ 	}
+ 
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index dd6c716de020..ba87cf525e69 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1136,12 +1136,6 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
+ 	if (prev && !reclaim)
+ 		pos = prev;
+ 
+-	if (!root->use_hierarchy && root != root_mem_cgroup) {
+-		if (prev)
+-			goto out;
+-		return root;
+-	}
+-
+ 	rcu_read_lock();
+ 
+ 	if (reclaim) {
+@@ -1221,7 +1215,6 @@ struct mem_cgroup *mem_cgroup_iter(struct mem_cgroup *root,
+ 
+ out_unlock:
+ 	rcu_read_unlock();
+-out:
+ 	if (prev && prev != root)
+ 		css_put(&prev->css);
+ 
+@@ -3424,10 +3417,7 @@ unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+ }
+ 
+ /*
+- * Test whether @memcg has children, dead or alive.  Note that this
+- * function doesn't care whether @memcg has use_hierarchy enabled and
+- * returns %true if there are child csses according to the cgroup
+- * hierarchy.  Testing use_hierarchy is the caller's responsibility.
++ * Test whether @memcg has children, dead or alive.
+  */
+ static inline bool memcg_has_children(struct mem_cgroup *memcg)
+ {
+@@ -3487,37 +3477,20 @@ static ssize_t mem_cgroup_force_empty_write(struct kernfs_open_file *of,
+ static u64 mem_cgroup_hierarchy_read(struct cgroup_subsys_state *css,
+ 				     struct cftype *cft)
+ {
+-	return mem_cgroup_from_css(css)->use_hierarchy;
++	return 1;
+ }
+ 
+ static int mem_cgroup_hierarchy_write(struct cgroup_subsys_state *css,
+ 				      struct cftype *cft, u64 val)
+ {
+-	int retval = 0;
+-	struct mem_cgroup *memcg = mem_cgroup_from_css(css);
+-	struct mem_cgroup *parent_memcg = mem_cgroup_from_css(memcg->css.parent);
+-
+-	if (memcg->use_hierarchy == val)
++	if (val == 1)
+ 		return 0;
+ 
+-	/*
+-	 * If parent's use_hierarchy is set, we can't make any modifications
+-	 * in the child subtrees. If it is unset, then the change can
+-	 * occur, provided the current cgroup has no children.
+-	 *
+-	 * For the root cgroup, parent_mem is NULL, we allow value to be
+-	 * set if there are no children.
+-	 */
+-	if ((!parent_memcg || !parent_memcg->use_hierarchy) &&
+-				(val == 1 || val == 0)) {
+-		if (!memcg_has_children(memcg))
+-			memcg->use_hierarchy = val;
+-		else
+-			retval = -EBUSY;
+-	} else
+-		retval = -EINVAL;
++	pr_warn_once("Non-hierarchical mode is deprecated. "
++		     "Please report your usecase to linux-mm@kvack.org if you "
++		     "depend on this functionality.\n");
+ 
+-	return retval;
++	return -EINVAL;
+ }
+ 
+ static unsigned long mem_cgroup_usage(struct mem_cgroup *memcg, bool swap)
+@@ -3705,8 +3678,6 @@ static void memcg_offline_kmem(struct mem_cgroup *memcg)
+ 		child = mem_cgroup_from_css(css);
+ 		BUG_ON(child->kmemcg_id != kmemcg_id);
+ 		child->kmemcg_id = parent->kmemcg_id;
+-		if (!memcg->use_hierarchy)
+-			break;
+ 	}
+ 	rcu_read_unlock();
+ 
+@@ -5296,38 +5267,22 @@ mem_cgroup_css_alloc(struct cgroup_subsys_state *parent_css)
+ 	if (parent) {
+ 		memcg->swappiness = mem_cgroup_swappiness(parent);
+ 		memcg->oom_kill_disable = parent->oom_kill_disable;
+-	}
+-	if (!parent) {
+-		page_counter_init(&memcg->memory, NULL);
+-		page_counter_init(&memcg->swap, NULL);
+-		page_counter_init(&memcg->kmem, NULL);
+-		page_counter_init(&memcg->tcpmem, NULL);
+-	} else if (parent->use_hierarchy) {
+-		memcg->use_hierarchy = true;
++
+ 		page_counter_init(&memcg->memory, &parent->memory);
+ 		page_counter_init(&memcg->swap, &parent->swap);
+ 		page_counter_init(&memcg->kmem, &parent->kmem);
+ 		page_counter_init(&memcg->tcpmem, &parent->tcpmem);
+ 	} else {
+-		page_counter_init(&memcg->memory, &root_mem_cgroup->memory);
+-		page_counter_init(&memcg->swap, &root_mem_cgroup->swap);
+-		page_counter_init(&memcg->kmem, &root_mem_cgroup->kmem);
+-		page_counter_init(&memcg->tcpmem, &root_mem_cgroup->tcpmem);
+-		/*
+-		 * Deeper hierachy with use_hierarchy == false doesn't make
+-		 * much sense so let cgroup subsystem know about this
+-		 * unfortunate state in our controller.
+-		 */
+-		if (parent != root_mem_cgroup)
+-			memory_cgrp_subsys.broken_hierarchy = true;
+-	}
++		page_counter_init(&memcg->memory, NULL);
++		page_counter_init(&memcg->swap, NULL);
++		page_counter_init(&memcg->kmem, NULL);
++		page_counter_init(&memcg->tcpmem, NULL);
+ 
+-	/* The following stuff does not apply to the root */
+-	if (!parent) {
+ 		root_mem_cgroup = memcg;
+ 		return &memcg->css;
+ 	}
+ 
++	/* The following stuff does not apply to the root */
+ 	error = memcg_online_kmem(memcg);
+ 	if (error)
+ 		goto fail;
+@@ -6182,24 +6137,6 @@ static void mem_cgroup_move_task(void)
+ }
+ #endif
+ 
+-/*
+- * Cgroup retains root cgroups across [un]mount cycles making it necessary
+- * to verify whether we're attached to the default hierarchy on each mount
+- * attempt.
+- */
+-static void mem_cgroup_bind(struct cgroup_subsys_state *root_css)
+-{
+-	/*
+-	 * use_hierarchy is forced on the default hierarchy.  cgroup core
+-	 * guarantees that @root doesn't have any children, so turning it
+-	 * on for the root memcg is enough.
+-	 */
+-	if (cgroup_subsys_on_dfl(memory_cgrp_subsys))
+-		root_mem_cgroup->use_hierarchy = true;
+-	else
+-		root_mem_cgroup->use_hierarchy = false;
+-}
+-
+ static int seq_puts_memcg_tunable(struct seq_file *m, unsigned long value)
+ {
+ 	if (value == PAGE_COUNTER_MAX)
+@@ -6501,7 +6438,6 @@ struct cgroup_subsys memory_cgrp_subsys = {
+ 	.can_attach = mem_cgroup_can_attach,
+ 	.cancel_attach = mem_cgroup_cancel_attach,
+ 	.post_attach = mem_cgroup_move_task,
+-	.bind = mem_cgroup_bind,
+ 	.dfl_cftypes = memory_files,
+ 	.legacy_cftypes = mem_cgroup_legacy_files,
+ 	.early_init = 0,
