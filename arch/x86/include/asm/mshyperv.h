@@ -51,6 +51,7 @@ typedef int (*hyperv_fill_flush_list_func)(
 #define hv_set_clocksource_vdso(val) \
 	((val).archdata.vclock_mode = VCLOCK_HVCLOCK)
 #define hv_get_raw_timer() rdtsc_ordered()
+#define hv_get_vector() HYPERVISOR_CALLBACK_VECTOR
 
 void hyperv_callback_vector(void);
 void hyperv_reenlightenment_vector(void);
