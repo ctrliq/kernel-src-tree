@@ -175,6 +175,10 @@ struct nvmet_ctrl {
 
 	struct device		*p2p_client;
 	struct radix_tree_root	p2p_ns_map;
+
+	spinlock_t		error_lock;
+	u64			err_counter;
+	struct nvme_error_slot	slots[NVMET_ERROR_LOG_SLOTS];
 };
 
 struct nvmet_subsys {
@@ -289,6 +293,8 @@ struct nvmet_req {
 
 	struct pci_dev		*p2p_dev;
 	struct device		*p2p_client;
+	u16			error_loc;
+	u64			error_slba;
 };
 
 static inline void nvmet_set_status(struct nvmet_req *req, u16 status)
