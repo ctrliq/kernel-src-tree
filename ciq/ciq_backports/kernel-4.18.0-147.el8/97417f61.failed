@@ -1,0 +1,600 @@
+net/mlx5e: Fix GRE key by controlling port tunnel entropy calculation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eli Britstein <elibr@mellanox.com>
+commit 97417f6182f80a80c9b4443f282ef707be74dade
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/97417f61.failed
+
+Flow entropy is calculated on the inner packet headers and used for
+flow distribution in processing, routing etc. For GRE-type
+encapsulations the entropy value is placed in the eight LSB of the key
+field in the GRE header as defined in NVGRE RFC 7637. For UDP based
+encapsulations the entropy value is placed in the source port of the
+UDP header.
+The hardware may support entropy calculation specifically for GRE and
+for all tunneling protocols. With commit df2ef3bff193 ("net/mlx5e: Add
+GRE protocol offloading") GRE is offloaded, but the hardware is
+configured by default to calculate flow entropy so packets transmitted
+on the wire have a wrong key. To support UDP based tunnels (i.e VXLAN),
+GRE (i.e. no flow entropy) and NVGRE (i.e. with flow entropy) the
+hardware behaviour must be controlled by the driver.
+
+Ensure port entropy calculation is enabled for offloaded VXLAN tunnels
+and disable port entropy calculation in the presence of offloaded GRE
+tunnels by monitoring the presence of entropy enabling tunnels (i.e
+VXLAN) and entropy disabing tunnels (i.e GRE).
+
+Fixes: df2ef3bff193 ("net/mlx5e: Add GRE protocol offloading")
+	Signed-off-by: Eli Britstein <elibr@mellanox.com>
+	Reviewed-by: Oz Shlomo <ozsh@mellanox.com>
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 97417f6182f80a80c9b4443f282ef707be74dade)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/Makefile
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/Makefile
+index a3c73ec6e95b,17f1a8b28c0a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/Makefile
++++ b/drivers/net/ethernet/mellanox/mlx5/core/Makefile
+@@@ -30,7 -30,7 +30,11 @@@ mlx5_core-$(CONFIG_MLX5_CORE_EN) += en_
+  mlx5_core-$(CONFIG_MLX5_EN_ARFS)     += en_arfs.o
+  mlx5_core-$(CONFIG_MLX5_EN_RXNFC)    += en_fs_ethtool.o
+  mlx5_core-$(CONFIG_MLX5_CORE_EN_DCB) += en_dcbnl.o en/port_buffer.o
+++<<<<<<< HEAD
+ +mlx5_core-$(CONFIG_MLX5_ESWITCH)     += en_rep.o en_tc.o
+++=======
++ mlx5_core-$(CONFIG_MLX5_ESWITCH)     += en_rep.o en_tc.o en/tc_tun.o lib/port_tun.o
+++>>>>>>> 97417f6182f8 (net/mlx5e: Fix GRE key by controlling port tunnel entropy calculation)
+  
+  #
+  # Core extra
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index 48489728eca3,4d033e01f6ab..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@@ -42,10 -42,12 +42,11 @@@
+  #include "en.h"
+  #include "en_rep.h"
+  #include "en_tc.h"
+ -#include "en/tc_tun.h"
+  #include "fs_core.h"
++ #include "lib/port_tun.h"
+  
+ -#define MLX5E_REP_PARAMS_DEF_LOG_SQ_SIZE \
+ -        max(0x7, MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)
+ +#define MLX5E_REP_PARAMS_LOG_SQ_SIZE \
+ +	max(0x6, MLX5E_PARAMS_MINIMUM_LOG_SQ_SIZE)
+  #define MLX5E_REP_PARAMS_DEF_NUM_CHANNELS 1
+  
+  static const char mlx5e_rep_driver_name[] = "mlx5e_rep";
+@@@ -855,9 -1080,10 +868,10 @@@ void mlx5e_rep_encap_entry_detach(struc
+  
+  	if (list_empty(&nhe->encap_list))
+  		mlx5e_rep_neigh_entry_destroy(priv, nhe);
++ 	mlx5_tun_entropy_refcount_dec(tun_entropy, e->reformat_type);
+  }
+  
+ -static int mlx5e_vf_rep_open(struct net_device *dev)
+ +static int mlx5e_rep_open(struct net_device *dev)
+  {
+  	struct mlx5e_priv *priv = netdev_priv(dev);
+  	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+@@@ -1264,87 -1569,148 +1278,111 @@@ static int mlx5e_init_rep_tx(struct mlx
+  		mlx5_core_warn(priv->mdev, "create tises failed, %d\n", err);
+  		return err;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (rpriv->rep->vport == MLX5_VPORT_UPLINK) {
++ 		uplink_priv = &rpriv->uplink_priv;
++ 
++ 		/* init shared tc flow table */
++ 		err = mlx5e_tc_esw_init(&uplink_priv->tc_ht);
++ 		if (err)
++ 			goto destroy_tises;
++ 
++ 		mlx5_init_port_tun_entropy(&uplink_priv->tun_entropy, priv->mdev);
++ 
++ 		/* init indirect block notifications */
++ 		INIT_LIST_HEAD(&uplink_priv->tc_indr_block_priv_list);
++ 		uplink_priv->netdevice_nb.notifier_call = mlx5e_nic_rep_netdevice_event;
++ 		err = register_netdevice_notifier(&uplink_priv->netdevice_nb);
++ 		if (err) {
++ 			mlx5_core_err(priv->mdev, "Failed to register netdev notifier\n");
++ 			goto tc_esw_cleanup;
++ 		}
++ 	}
++ 
+++>>>>>>> 97417f6182f8 (net/mlx5e: Fix GRE key by controlling port tunnel entropy calculation)
+  	return 0;
+ -
+ -tc_esw_cleanup:
+ -	mlx5e_tc_esw_cleanup(&uplink_priv->tc_ht);
+ -destroy_tises:
+ -	for (tc = 0; tc < priv->profile->max_tc; tc++)
+ -		mlx5e_destroy_tis(priv->mdev, priv->tisn[tc]);
+ -	return err;
+  }
+  
+ -static void mlx5e_cleanup_rep_tx(struct mlx5e_priv *priv)
+ -{
+ -	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+ -	int tc;
+ -
+ -	for (tc = 0; tc < priv->profile->max_tc; tc++)
+ -		mlx5e_destroy_tis(priv->mdev, priv->tisn[tc]);
+ -
+ -	if (rpriv->rep->vport == MLX5_VPORT_UPLINK) {
+ -		/* clean indirect TC block notifications */
+ -		unregister_netdevice_notifier(&rpriv->uplink_priv.netdevice_nb);
+ -		mlx5e_rep_indr_clean_block_privs(rpriv);
+ +static const struct mlx5e_profile mlx5e_rep_profile = {
+ +	.init			= mlx5e_init_rep,
+ +	.cleanup		= mlx5e_cleanup_rep,
+ +	.init_rx		= mlx5e_init_rep_rx,
+ +	.cleanup_rx		= mlx5e_cleanup_rep_rx,
+ +	.init_tx		= mlx5e_init_rep_tx,
+ +	.cleanup_tx		= mlx5e_cleanup_nic_tx,
+ +	.update_stats           = mlx5e_rep_update_hw_counters,
+ +	.update_carrier		= NULL,
+ +	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+ +	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+ +	.max_tc			= 1,
+ +};
+  
+ -		/* delete shared tc flow table */
+ -		mlx5e_tc_esw_cleanup(&rpriv->uplink_priv.tc_ht);
+ -	}
+ -}
+ +/* e-Switch vport representors */
+  
+ -static void mlx5e_vf_rep_enable(struct mlx5e_priv *priv)
+ +static int
+ +mlx5e_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+  {
+ -	struct net_device *netdev = priv->netdev;
+ -	struct mlx5_core_dev *mdev = priv->mdev;
+ -	u16 max_mtu;
+ +	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
+ +	struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+ +	struct mlx5_rep_uplink_priv *uplink_priv = &rpriv->uplink_priv;
+ +	int err;
+  
+ -	netdev->min_mtu = ETH_MIN_MTU;
+ -	mlx5_query_port_max_mtu(mdev, &max_mtu, 1);
+ -	netdev->max_mtu = MLX5E_HW2SW_MTU(&priv->channels.params, max_mtu);
+ -}
+ +	if (test_bit(MLX5E_STATE_OPENED, &priv->state)) {
+ +		err = mlx5e_add_sqs_fwd_rules(priv);
+ +		if (err)
+ +			return err;
+ +	}
+  
+ -static int uplink_rep_async_event(struct notifier_block *nb, unsigned long event, void *data)
+ -{
+ -	struct mlx5e_priv *priv = container_of(nb, struct mlx5e_priv, events_nb);
+ -	struct mlx5_eqe   *eqe = data;
+ +	err = mlx5e_rep_neigh_init(rpriv);
+ +	if (err)
+ +		goto err_remove_sqs;
+  
+ -	if (event != MLX5_EVENT_TYPE_PORT_CHANGE)
+ -		return NOTIFY_DONE;
+ +	/* init shared tc flow table */
+ +	err = mlx5e_tc_esw_init(&uplink_priv->tc_ht);
+ +	if (err)
+ +		goto  err_neigh_cleanup;
+  
+ -	switch (eqe->sub_type) {
+ -	case MLX5_PORT_CHANGE_SUBTYPE_DOWN:
+ -	case MLX5_PORT_CHANGE_SUBTYPE_ACTIVE:
+ -		queue_work(priv->wq, &priv->update_carrier_work);
+ -		break;
+ -	default:
+ -		return NOTIFY_DONE;
+ +	/* init indirect block notifications */
+ +	INIT_LIST_HEAD(&uplink_priv->tc_indr_block_priv_list);
+ +	uplink_priv->netdevice_nb.notifier_call = mlx5e_nic_rep_netdevice_event;
+ +	err = register_netdevice_notifier(&uplink_priv->netdevice_nb);
+ +	if (err) {
+ +		mlx5_core_err(priv->mdev, "Failed to register netdev notifier\n");
+ +		goto err_indirect_block_cleanup;
+  	}
+  
+ -	return NOTIFY_OK;
+ -}
+ -
+ -static void mlx5e_uplink_rep_enable(struct mlx5e_priv *priv)
+ -{
+ -	struct net_device *netdev = priv->netdev;
+ -	struct mlx5_core_dev *mdev = priv->mdev;
+ -	u16 max_mtu;
+ +	return 0;
+  
+ -	netdev->min_mtu = ETH_MIN_MTU;
+ -	mlx5_query_port_max_mtu(priv->mdev, &max_mtu, 1);
+ -	netdev->max_mtu = MLX5E_HW2SW_MTU(&priv->channels.params, max_mtu);
+ -	mlx5e_set_dev_port_mtu(priv);
+ -
+ -	mlx5_lag_add(mdev, netdev);
+ -	priv->events_nb.notifier_call = uplink_rep_async_event;
+ -	mlx5_notifier_register(mdev, &priv->events_nb);
+ -#ifdef CONFIG_MLX5_CORE_EN_DCB
+ -	mlx5e_dcbnl_initialize(priv);
+ -	mlx5e_dcbnl_init_app(priv);
+ -#endif
+ +err_indirect_block_cleanup:
+ +	mlx5e_tc_esw_cleanup(&uplink_priv->tc_ht);
+ +err_neigh_cleanup:
+ +	mlx5e_rep_neigh_cleanup(rpriv);
+ +err_remove_sqs:
+ +	mlx5e_remove_sqs_fwd_rules(priv);
+ +	return err;
+  }
+  
+ -static void mlx5e_uplink_rep_disable(struct mlx5e_priv *priv)
+ +static void
+ +mlx5e_nic_rep_unload(struct mlx5_eswitch_rep *rep)
+  {
+ -	struct mlx5_core_dev *mdev = priv->mdev;
+ +	struct mlx5e_rep_priv *rpriv = mlx5e_rep_to_rep_priv(rep);
+ +	struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+  
+ -#ifdef CONFIG_MLX5_CORE_EN_DCB
+ -	mlx5e_dcbnl_delete_app(priv);
+ -#endif
+ -	mlx5_notifier_unregister(mdev, &priv->events_nb);
+ -	mlx5_lag_remove(mdev);
+ -}
+ +	if (test_bit(MLX5E_STATE_OPENED, &priv->state))
+ +		mlx5e_remove_sqs_fwd_rules(priv);
+  
+ -static const struct mlx5e_profile mlx5e_vf_rep_profile = {
+ -	.init			= mlx5e_init_rep,
+ -	.cleanup		= mlx5e_cleanup_rep,
+ -	.init_rx		= mlx5e_init_rep_rx,
+ -	.cleanup_rx		= mlx5e_cleanup_rep_rx,
+ -	.init_tx		= mlx5e_init_rep_tx,
+ -	.cleanup_tx		= mlx5e_cleanup_rep_tx,
+ -	.enable		        = mlx5e_vf_rep_enable,
+ -	.update_stats           = mlx5e_vf_rep_update_hw_counters,
+ -	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+ -	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+ -	.max_tc			= 1,
+ -};
+ +	/* clean indirect TC block notifications */
+ +	unregister_netdevice_notifier(&rpriv->uplink_priv.netdevice_nb);
+ +	mlx5e_rep_indr_clean_block_privs(rpriv);
+  
+ -static const struct mlx5e_profile mlx5e_uplink_rep_profile = {
+ -	.init			= mlx5e_init_rep,
+ -	.cleanup		= mlx5e_cleanup_rep,
+ -	.init_rx		= mlx5e_init_rep_rx,
+ -	.cleanup_rx		= mlx5e_cleanup_rep_rx,
+ -	.init_tx		= mlx5e_init_rep_tx,
+ -	.cleanup_tx		= mlx5e_cleanup_rep_tx,
+ -	.enable		        = mlx5e_uplink_rep_enable,
+ -	.disable	        = mlx5e_uplink_rep_disable,
+ -	.update_stats           = mlx5e_uplink_rep_update_hw_counters,
+ -	.update_carrier	        = mlx5e_update_carrier,
+ -	.rx_handlers.handle_rx_cqe       = mlx5e_handle_rx_cqe_rep,
+ -	.rx_handlers.handle_rx_cqe_mpwqe = mlx5e_handle_rx_cqe_mpwrq,
+ -	.max_tc			= MLX5E_MAX_NUM_TC,
+ -};
+ +	/* clean uplink offloaded TC rules, delete shared tc flow table */
+ +	mlx5e_tc_esw_cleanup(&rpriv->uplink_priv.tc_ht);
+ +
+ +	mlx5e_rep_neigh_cleanup(rpriv);
+ +}
+  
+ -/* e-Switch vport representors */
+  static int
+  mlx5e_vport_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/Makefile
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index c078c6703dc7..b1339b285ef8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -37,6 +37,7 @@
+ #include <linux/rhashtable.h>
+ #include "eswitch.h"
+ #include "en.h"
++#include "lib/port_tun.h"
+ 
+ #ifdef CONFIG_MLX5_ESWITCH
+ struct mlx5e_neigh_update_table {
+@@ -71,6 +72,8 @@ struct mlx5_rep_uplink_priv {
+ 	 */
+ 	struct list_head	    tc_indr_block_priv_list;
+ 	struct notifier_block	    netdevice_nb;
++
++	struct mlx5_tun_entropy tun_entropy;
+ };
+ 
+ struct mlx5e_rep_priv {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.c b/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.c
+new file mode 100644
+index 000000000000..40f4a19b1ce1
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.c
+@@ -0,0 +1,205 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2019 Mellanox Technologies. */
++
++#include <linux/module.h>
++#include <linux/mlx5/driver.h>
++#include <linux/mlx5/port.h>
++#include <linux/mlx5/cmd.h>
++#include "mlx5_core.h"
++#include "lib/port_tun.h"
++
++struct mlx5_port_tun_entropy_flags {
++	bool force_supported, force_enabled;
++	bool calc_supported, calc_enabled;
++	bool gre_calc_supported, gre_calc_enabled;
++};
++
++static void mlx5_query_port_tun_entropy(struct mlx5_core_dev *mdev,
++					struct mlx5_port_tun_entropy_flags *entropy_flags)
++{
++	u32 out[MLX5_ST_SZ_DW(pcmr_reg)];
++	/* Default values for FW which do not support MLX5_REG_PCMR */
++	entropy_flags->force_supported = false;
++	entropy_flags->calc_supported = false;
++	entropy_flags->gre_calc_supported = false;
++	entropy_flags->force_enabled = false;
++	entropy_flags->calc_enabled = true;
++	entropy_flags->gre_calc_enabled = true;
++
++	if (!MLX5_CAP_GEN(mdev, ports_check))
++		return;
++
++	if (mlx5_query_ports_check(mdev, out, sizeof(out)))
++		return;
++
++	entropy_flags->force_supported = !!(MLX5_GET(pcmr_reg, out, entropy_force_cap));
++	entropy_flags->calc_supported = !!(MLX5_GET(pcmr_reg, out, entropy_calc_cap));
++	entropy_flags->gre_calc_supported = !!(MLX5_GET(pcmr_reg, out, entropy_gre_calc_cap));
++	entropy_flags->force_enabled = !!(MLX5_GET(pcmr_reg, out, entropy_force));
++	entropy_flags->calc_enabled = !!(MLX5_GET(pcmr_reg, out, entropy_calc));
++	entropy_flags->gre_calc_enabled = !!(MLX5_GET(pcmr_reg, out, entropy_gre_calc));
++}
++
++static int mlx5_set_port_tun_entropy_calc(struct mlx5_core_dev *mdev, u8 enable,
++					  u8 force)
++{
++	u32 in[MLX5_ST_SZ_DW(pcmr_reg)] = {0};
++	int err;
++
++	err = mlx5_query_ports_check(mdev, in, sizeof(in));
++	if (err)
++		return err;
++	MLX5_SET(pcmr_reg, in, local_port, 1);
++	MLX5_SET(pcmr_reg, in, entropy_force, force);
++	MLX5_SET(pcmr_reg, in, entropy_calc, enable);
++	return mlx5_set_ports_check(mdev, in, sizeof(in));
++}
++
++static int mlx5_set_port_gre_tun_entropy_calc(struct mlx5_core_dev *mdev,
++					      u8 enable, u8 force)
++{
++	u32 in[MLX5_ST_SZ_DW(pcmr_reg)] = {0};
++	int err;
++
++	err = mlx5_query_ports_check(mdev, in, sizeof(in));
++	if (err)
++		return err;
++	MLX5_SET(pcmr_reg, in, local_port, 1);
++	MLX5_SET(pcmr_reg, in, entropy_force, force);
++	MLX5_SET(pcmr_reg, in, entropy_gre_calc, enable);
++	return mlx5_set_ports_check(mdev, in, sizeof(in));
++}
++
++void mlx5_init_port_tun_entropy(struct mlx5_tun_entropy *tun_entropy,
++				struct mlx5_core_dev *mdev)
++{
++	struct mlx5_port_tun_entropy_flags entropy_flags;
++
++	tun_entropy->mdev = mdev;
++	mutex_init(&tun_entropy->lock);
++	mlx5_query_port_tun_entropy(mdev, &entropy_flags);
++	tun_entropy->num_enabling_entries = 0;
++	tun_entropy->num_disabling_entries = 0;
++	tun_entropy->enabled = entropy_flags.calc_enabled;
++	tun_entropy->enabled =
++		(entropy_flags.calc_supported) ?
++		entropy_flags.calc_enabled : true;
++}
++
++static int mlx5_set_entropy(struct mlx5_tun_entropy *tun_entropy,
++			    int reformat_type, bool enable)
++{
++	struct mlx5_port_tun_entropy_flags entropy_flags;
++	int err;
++
++	mlx5_query_port_tun_entropy(tun_entropy->mdev, &entropy_flags);
++	/* Tunnel entropy calculation may be controlled either on port basis
++	 * for all tunneling protocols or specifically for GRE protocol.
++	 * Prioritize GRE protocol control (if capable) over global port
++	 * configuration.
++	 */
++	if (entropy_flags.gre_calc_supported &&
++	    reformat_type == MLX5_REFORMAT_TYPE_L2_TO_NVGRE) {
++		/* Other applications may change the global FW entropy
++		 * calculations settings. Check that the current entropy value
++		 * is the negative of the updated value.
++		 */
++		if (entropy_flags.force_enabled &&
++		    enable == entropy_flags.gre_calc_enabled) {
++			mlx5_core_warn(tun_entropy->mdev,
++				       "Unexpected GRE entropy calc setting - expected %d",
++				       !entropy_flags.gre_calc_enabled);
++			return -EOPNOTSUPP;
++		}
++		err = mlx5_set_port_gre_tun_entropy_calc(tun_entropy->mdev, enable,
++							 entropy_flags.force_supported);
++		if (err)
++			return err;
++		/* if we turn on the entropy we don't need to force it anymore */
++		if (entropy_flags.force_supported && enable) {
++			err = mlx5_set_port_gre_tun_entropy_calc(tun_entropy->mdev, 1, 0);
++			if (err)
++				return err;
++		}
++	} else if (entropy_flags.calc_supported) {
++		/* Other applications may change the global FW entropy
++		 * calculations settings. Check that the current entropy value
++		 * is the negative of the updated value.
++		 */
++		if (entropy_flags.force_enabled &&
++		    enable == entropy_flags.calc_enabled) {
++			mlx5_core_warn(tun_entropy->mdev,
++				       "Unexpected entropy calc setting - expected %d",
++				       !entropy_flags.calc_enabled);
++			return -EOPNOTSUPP;
++		}
++		/* GRE requires disabling entropy calculation. if there are
++		 * enabling entries (i.e VXLAN) we cannot turn it off for them,
++		 * thus fail.
++		 */
++		if (tun_entropy->num_enabling_entries)
++			return -EOPNOTSUPP;
++		err = mlx5_set_port_tun_entropy_calc(tun_entropy->mdev, enable,
++						     entropy_flags.force_supported);
++		if (err)
++			return err;
++		tun_entropy->enabled = enable;
++		/* if we turn on the entropy we don't need to force it anymore */
++		if (entropy_flags.force_supported && enable) {
++			err = mlx5_set_port_tun_entropy_calc(tun_entropy->mdev, 1, 0);
++			if (err)
++				return err;
++		}
++	}
++
++	return 0;
++}
++
++/* the function manages the refcount for enabling/disabling tunnel types.
++ * the return value indicates if the inc is successful or not, depending on
++ * entropy capabilities and configuration.
++ */
++int mlx5_tun_entropy_refcount_inc(struct mlx5_tun_entropy *tun_entropy,
++				  int reformat_type)
++{
++	/* the default is error for unknown (non VXLAN/GRE tunnel types) */
++	int err = -EOPNOTSUPP;
++
++	mutex_lock(&tun_entropy->lock);
++	if (reformat_type == MLX5_REFORMAT_TYPE_L2_TO_VXLAN &&
++	    tun_entropy->enabled) {
++		/* in case entropy calculation is enabled for all tunneling
++		 * types, it is ok for VXLAN, so approve.
++		 * otherwise keep the error default.
++		 */
++		tun_entropy->num_enabling_entries++;
++		err = 0;
++	} else if (reformat_type == MLX5_REFORMAT_TYPE_L2_TO_NVGRE) {
++		/* turn off the entropy only for the first GRE rule.
++		 * for the next rules the entropy was already disabled
++		 * successfully.
++		 */
++		if (tun_entropy->num_disabling_entries == 0)
++			err = mlx5_set_entropy(tun_entropy, reformat_type, 0);
++		else
++			err = 0;
++		if (!err)
++			tun_entropy->num_disabling_entries++;
++	}
++	mutex_unlock(&tun_entropy->lock);
++
++	return err;
++}
++
++void mlx5_tun_entropy_refcount_dec(struct mlx5_tun_entropy *tun_entropy,
++				   int reformat_type)
++{
++	mutex_lock(&tun_entropy->lock);
++	if (reformat_type == MLX5_REFORMAT_TYPE_L2_TO_VXLAN)
++		tun_entropy->num_enabling_entries--;
++	else if (reformat_type == MLX5_REFORMAT_TYPE_L2_TO_NVGRE &&
++		 --tun_entropy->num_disabling_entries == 0)
++		mlx5_set_entropy(tun_entropy, reformat_type, 1);
++	mutex_unlock(&tun_entropy->lock);
++}
++
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.h b/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.h
+new file mode 100644
+index 000000000000..54c42a88705e
+--- /dev/null
++++ b/drivers/net/ethernet/mellanox/mlx5/core/lib/port_tun.h
+@@ -0,0 +1,24 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/* Copyright (c) 2019 Mellanox Technologies. */
++
++#ifndef __MLX5_PORT_TUN_H__
++#define __MLX5_PORT_TUN_H__
++
++#include <linux/mlx5/driver.h>
++
++struct mlx5_tun_entropy {
++	struct mlx5_core_dev *mdev;
++	u32 num_enabling_entries;
++	u32 num_disabling_entries;
++	u8  enabled;
++	struct mutex lock;	/* lock the entropy fields */
++};
++
++void mlx5_init_port_tun_entropy(struct mlx5_tun_entropy *tun_entropy,
++				struct mlx5_core_dev *mdev);
++int mlx5_tun_entropy_refcount_inc(struct mlx5_tun_entropy *tun_entropy,
++				  int reformat_type);
++void mlx5_tun_entropy_refcount_dec(struct mlx5_tun_entropy *tun_entropy,
++				   int reformat_type);
++
++#endif /* __MLX5_PORT_TUN_H__ */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/port.c b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+index 26964be40ceb..8e13ab674825 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/port.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/port.c
+@@ -870,8 +870,7 @@ int mlx5_query_port_wol(struct mlx5_core_dev *mdev, u8 *wol_mode)
+ }
+ EXPORT_SYMBOL_GPL(mlx5_query_port_wol);
+ 
+-static int mlx5_query_ports_check(struct mlx5_core_dev *mdev, u32 *out,
+-				  int outlen)
++int mlx5_query_ports_check(struct mlx5_core_dev *mdev, u32 *out, int outlen)
+ {
+ 	u32 in[MLX5_ST_SZ_DW(pcmr_reg)] = {0};
+ 
+@@ -880,7 +879,7 @@ static int mlx5_query_ports_check(struct mlx5_core_dev *mdev, u32 *out,
+ 				    outlen, MLX5_REG_PCMR, 0, 0);
+ }
+ 
+-static int mlx5_set_ports_check(struct mlx5_core_dev *mdev, u32 *in, int inlen)
++int mlx5_set_ports_check(struct mlx5_core_dev *mdev, u32 *in, int inlen)
+ {
+ 	u32 out[MLX5_ST_SZ_DW(pcmr_reg)];
+ 
+diff --git a/include/linux/mlx5/port.h b/include/linux/mlx5/port.h
+index 34aed6032f86..17f1dd828415 100644
+--- a/include/linux/mlx5/port.h
++++ b/include/linux/mlx5/port.h
+@@ -177,6 +177,8 @@ int mlx5_query_port_ets_rate_limit(struct mlx5_core_dev *mdev,
+ int mlx5_set_port_wol(struct mlx5_core_dev *mdev, u8 wol_mode);
+ int mlx5_query_port_wol(struct mlx5_core_dev *mdev, u8 *wol_mode);
+ 
++int mlx5_query_ports_check(struct mlx5_core_dev *mdev, u32 *out, int outlen);
++int mlx5_set_ports_check(struct mlx5_core_dev *mdev, u32 *in, int inlen);
+ int mlx5_set_port_fcs(struct mlx5_core_dev *mdev, u8 enable);
+ void mlx5_query_port_fcs(struct mlx5_core_dev *mdev, bool *supported,
+ 			 bool *enabled);
