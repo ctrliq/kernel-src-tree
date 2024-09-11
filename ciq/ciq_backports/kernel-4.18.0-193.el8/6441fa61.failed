@@ -1,0 +1,144 @@
+KVM: x86: avoid incorrect writes to host MSR_IA32_SPEC_CTRL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 6441fa6178f5456d1d4b512c08798888f99db185
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/6441fa61.failed
+
+If the guest is configured to have SPEC_CTRL but the host does not
+(which is a nonsensical configuration but these are not explicitly
+forbidden) then a host-initiated MSR write can write vmx->spec_ctrl
+(respectively svm->spec_ctrl) and trigger a #GP when KVM tries to
+restore the host value of the MSR.  Add a more comprehensive check
+for valid bits of SPEC_CTRL, covering host CPUID flags and,
+since we are at it and it is more correct that way, guest CPUID
+flags too.
+
+For AMD, remove the unnecessary is_guest_mode check around setting
+the MSR interception bitmap, so that the code looks the same as
+for Intel.
+
+	Cc: Jim Mattson <jmattson@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 6441fa6178f5456d1d4b512c08798888f99db185)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.h
+diff --cc arch/x86/kvm/x86.h
+index 1c6e99b8efc0,dd6e34d0a881..000000000000
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@@ -364,7 -365,8 +364,13 @@@ static inline bool kvm_pat_valid(u64 da
+  	return (data | ((data & 0x0202020202020202ull) << 1)) == data;
+  }
+  
+++<<<<<<< HEAD
+ +void kvm_load_guest_xcr0(struct kvm_vcpu *vcpu);
+ +void kvm_put_guest_xcr0(struct kvm_vcpu *vcpu);
+++=======
++ void kvm_load_guest_xsave_state(struct kvm_vcpu *vcpu);
++ void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu);
++ u64 kvm_spec_ctrl_valid_bits(struct kvm_vcpu *vcpu);
+++>>>>>>> 6441fa6178f5 (KVM: x86: avoid incorrect writes to host MSR_IA32_SPEC_CTRL)
+  
+  #endif
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index fdfad3b18949..c72d10594047 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -4290,12 +4290,10 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_SSBD))
+ 			return 1;
+ 
+-		/* The STIBP bit doesn't fault even if it's not advertised */
+-		if (data & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD))
++		if (data & ~kvm_spec_ctrl_valid_bits(vcpu))
+ 			return 1;
+ 
+ 		svm->spec_ctrl = data;
+-
+ 		if (!data)
+ 			break;
+ 
+@@ -4319,13 +4317,12 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
+ 
+ 		if (data & ~PRED_CMD_IBPB)
+ 			return 1;
+-
++		if (!boot_cpu_has(X86_FEATURE_AMD_IBPB))
++			return 1;
+ 		if (!data)
+ 			break;
+ 
+ 		wrmsrl(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
+-		if (is_guest_mode(vcpu))
+-			break;
+ 		set_msr_interception(svm->msrpm, MSR_IA32_PRED_CMD, 0, 1);
+ 		break;
+ 	case MSR_AMD64_VIRT_SPEC_CTRL:
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 1496da3f09e5..9a25556e7d43 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -1976,12 +1976,10 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 		    !guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL))
+ 			return 1;
+ 
+-		/* The STIBP bit doesn't fault even if it's not advertised */
+-		if (data & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD))
++		if (data & ~kvm_spec_ctrl_valid_bits(vcpu))
+ 			return 1;
+ 
+ 		vmx->spec_ctrl = data;
+-
+ 		if (!data)
+ 			break;
+ 
+@@ -2008,7 +2006,8 @@ static int vmx_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 
+ 		if (data & ~PRED_CMD_IBPB)
+ 			return 1;
+-
++		if (!boot_cpu_has(X86_FEATURE_SPEC_CTRL))
++			return 1;
+ 		if (!data)
+ 			break;
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b2e909cedd64..c423bbe71cb0 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10214,6 +10214,28 @@ bool kvm_arch_no_poll(struct kvm_vcpu *vcpu)
+ }
+ EXPORT_SYMBOL_GPL(kvm_arch_no_poll);
+ 
++u64 kvm_spec_ctrl_valid_bits(struct kvm_vcpu *vcpu)
++{
++	uint64_t bits = SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD;
++
++	/* The STIBP bit doesn't fault even if it's not advertised */
++	if (!guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL) &&
++	    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_IBRS))
++		bits &= ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP);
++	if (!boot_cpu_has(X86_FEATURE_SPEC_CTRL) &&
++	    !boot_cpu_has(X86_FEATURE_AMD_IBRS))
++		bits &= ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP);
++
++	if (!guest_cpuid_has(vcpu, X86_FEATURE_SPEC_CTRL_SSBD) &&
++	    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_SSBD))
++		bits &= ~SPEC_CTRL_SSBD;
++	if (!boot_cpu_has(X86_FEATURE_SPEC_CTRL_SSBD) &&
++	    !boot_cpu_has(X86_FEATURE_AMD_SSBD))
++		bits &= ~SPEC_CTRL_SSBD;
++
++	return bits;
++}
++EXPORT_SYMBOL_GPL(kvm_spec_ctrl_valid_bits);
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_exit);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(kvm_fast_mmio);
+* Unmerged path arch/x86/kvm/x86.h
