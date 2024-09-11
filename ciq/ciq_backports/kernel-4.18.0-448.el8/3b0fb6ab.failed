@@ -1,0 +1,209 @@
+fbcon: Use delayed work for cursor
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 3b0fb6ab25dda03f6077bf8fce9407bb0d4db6ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3b0fb6ab.failed
+
+Allows us to delete a bunch of hand-rolled stuff using a timer plus a
+separate work). Also to simplify the code we initialize the
+cursor_work completely when we allocate the fbcon_ops structure,
+instead of trying to cope with console re-initialization.
+
+The motiviation here is that fbcon code stops using the fb_info.queue,
+which helps with locking issues around cleanup and all that in a later
+patch.
+
+Also note that this allows us to ditch the hand-rolled work cleanup in
+fbcon_exit - we already call fbcon_del_cursor_timer, which takes care
+of everything. Plus this was racy anyway.
+
+v2:
+- Only INIT_DELAYED_WORK when kzalloc succeeded (Tetsuo)
+- Explain that we replace both the timer and a work with the combined
+  delayed_work (Javier)
+
+	Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+	Acked-by: Thomas Zimmermann <tzimmermann@suse.de>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: Claudio Suarez <cssk@net-c.es>
+	Cc: Du Cheng <ducheng2@gmail.com>
+	Cc: Thomas Zimmermann <tzimmermann@suse.de>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220405210335.3434130-7-daniel.vetter@ffwll.ch
+(cherry picked from commit 3b0fb6ab25dda03f6077bf8fce9407bb0d4db6ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 1a25ce50a9fd,759299667023..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -357,22 -348,10 +357,22 @@@ static int get_color(struct vc_data *vc
+  	return color;
+  }
+  
+ +static void fbcon_update_softback(struct vc_data *vc)
+ +{
+ +	int l = fbcon_softback_size / vc->vc_size_row;
+ +
+ +	if (l > 5)
+ +		softback_end = softback_buf + l * vc->vc_size_row;
+ +	else
+ +		/* Smaller scrollback makes no sense, and 0 would screw
+ +		   the operation totally */
+ +		softback_top = 0;
+ +}
+ +
+  static void fb_flashcursor(struct work_struct *work)
+  {
+- 	struct fb_info *info = container_of(work, struct fb_info, queue);
+- 	struct fbcon_ops *ops = info->fbcon_par;
++ 	struct fbcon_ops *ops = container_of(work, struct fbcon_ops, cursor_work.work);
++ 	struct fb_info *info;
+  	struct vc_data *vc = NULL;
+  	int c;
+  	int mode;
+@@@ -398,21 -380,15 +401,15 @@@
+  	c = scr_readw((u16 *) vc->vc_pos);
+  	mode = (!ops->cursor_flash || ops->cursor_state.enable) ?
+  		CM_ERASE : CM_DRAW;
+ -	ops->cursor(vc, info, mode, get_color(vc, info, c, 1),
+ +	ops->cursor(vc, info, mode, softback_lines, get_color(vc, info, c, 1),
+  		    get_color(vc, info, c, 0));
+  	console_unlock();
+- }
+- 
+- static void cursor_timer_handler(struct timer_list *t)
+- {
+- 	struct fbcon_ops *ops = from_timer(ops, t, cursor_timer);
+- 	struct fb_info *info = ops->info;
+  
+- 	queue_work(system_power_efficient_wq, &info->queue);
+- 	mod_timer(&ops->cursor_timer, jiffies + ops->cur_blink_jiffies);
++ 	queue_delayed_work(system_power_efficient_wq, &ops->cursor_work,
++ 			   ops->cur_blink_jiffies);
+  }
+  
+- static void fbcon_add_cursor_timer(struct fb_info *info)
++ static void fbcon_add_cursor_work(struct fb_info *info)
+  {
+  	struct fbcon_ops *ops = info->fbcon_par;
+  
+@@@ -1038,13 -990,13 +1028,13 @@@ static const char *fbcon_startup(void
+  	rows /= vc->vc_font.height;
+  	vc_resize(vc, cols, rows);
+  
+ -	pr_debug("mode:   %s\n", info->fix.id);
+ -	pr_debug("visual: %d\n", info->fix.visual);
+ -	pr_debug("res:    %dx%d-%d\n", info->var.xres,
+ -		 info->var.yres,
+ -		 info->var.bits_per_pixel);
+ +	DPRINTK("mode:   %s\n", info->fix.id);
+ +	DPRINTK("visual: %d\n", info->fix.visual);
+ +	DPRINTK("res:    %dx%d-%d\n", info->var.xres,
+ +		info->var.yres,
+ +		info->var.bits_per_pixel);
+  
+- 	fbcon_add_cursor_timer(info);
++ 	fbcon_add_cursor_work(info);
+  	return display_desc;
+  }
+  
+@@@ -1363,22 -1309,17 +1353,27 @@@ static void fbcon_cursor(struct vc_dat
+  	if (fbcon_is_inactive(vc, info) || vc->vc_deccm != 1)
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (vc->vc_cursor_type & 0x10)
+ +		fbcon_del_cursor_timer(info);
+++=======
++ 	if (vc->vc_cursor_type & CUR_SW)
++ 		fbcon_del_cursor_work(info);
+++>>>>>>> 3b0fb6ab25dd (fbcon: Use delayed work for cursor)
+  	else
+- 		fbcon_add_cursor_timer(info);
++ 		fbcon_add_cursor_work(info);
+  
+  	ops->cursor_flash = (mode == CM_ERASE) ? 0 : 1;
+ +	if (mode & CM_SOFTBACK) {
+ +		mode &= ~CM_SOFTBACK;
+ +		y = softback_lines;
+ +	} else {
+ +		if (softback_lines)
+ +			fbcon_set_origin(vc);
+ +		y = 0;
+ +	}
+  
+ -	if (!ops->cursor)
+ -		return;
+ -
+ -	ops->cursor(vc, info, mode, get_color(vc, info, c, 1),
+ +	ops->cursor(vc, info, mode, y, get_color(vc, info, c, 1),
+  		    get_color(vc, info, c, 0));
+  }
+  
+@@@ -3684,23 -3303,10 +3679,30 @@@ static void fbcon_exit(void
+  	}
+  #endif
+  
+++<<<<<<< HEAD
+ +	kvfree((void *)softback_buf);
+ +	softback_buf = 0UL;
+ +
+ +	for (i = 0; i < FB_MAX; i++) {
+ +		int pending = 0;
+ +
+ +		mapped = 0;
+ +		info = registered_fb[i];
+ +
+ +		if (info == NULL)
+ +			continue;
+ +
+ +		if (info->queue.func)
+ +			pending = cancel_work_sync(&info->queue);
+ +		DPRINTK("fbcon: %s pending work\n", (pending ? "canceled" :
+ +			"no"));
+ +
+++=======
++ 	for_each_registered_fb(i) {
++ 		mapped = 0;
++ 		info = registered_fb[i];
++ 
+++>>>>>>> 3b0fb6ab25dd (fbcon: Use delayed work for cursor)
+  		for (j = first_fb_vc; j <= last_fb_vc; j++) {
+  			if (con2fb_map[j] == i) {
+  				mapped = 1;
+* Unmerged path drivers/video/fbdev/core/fbcon.c
+diff --git a/drivers/video/fbdev/core/fbcon.h b/drivers/video/fbdev/core/fbcon.h
+index 5ee153ba977e..c53f285fde6c 100644
+--- a/drivers/video/fbdev/core/fbcon.h
++++ b/drivers/video/fbdev/core/fbcon.h
+@@ -14,11 +14,11 @@
+ #include <linux/types.h>
+ #include <linux/vt_buffer.h>
+ #include <linux/vt_kern.h>
++#include <linux/workqueue.h>
+ 
+ #include <asm/io.h>
+ 
+ #define FBCON_FLAGS_INIT         1
+-#define FBCON_FLAGS_CURSOR_TIMER 2
+ 
+    /*
+     *    This is the interface between the low-level console driver and the
+@@ -66,7 +66,7 @@ struct fbcon_ops {
+ 	int  (*update_start)(struct fb_info *info);
+ 	int  (*rotate_font)(struct fb_info *info, struct vc_data *vc);
+ 	struct fb_var_screeninfo var;  /* copy of the current fb_var_screeninfo */
+-	struct timer_list cursor_timer; /* Cursor timer */
++	struct delayed_work cursor_work; /* Cursor timer */
+ 	struct fb_cursor cursor_state;
+ 	struct fbcon_display *p;
+ 	struct fb_info *info;
