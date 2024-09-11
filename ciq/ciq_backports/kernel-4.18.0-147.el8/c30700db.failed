@@ -1,0 +1,108 @@
+dma-direct: provide generic support for uncached kernel segments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit c30700db9eaabb35e0b123301df35a6846e6b6b4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c30700db.failed
+
+A few architectures support uncached kernel segments.  In that case we get
+an uncached mapping for a given physica address by using an offset in the
+uncached segement.  Implement support for this scheme in the generic
+dma-direct code instead of duplicating it in arch hooks.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c30700db9eaabb35e0b123301df35a6846e6b6b4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/Kconfig
+diff --cc arch/Kconfig
+index f03b72644902,e8d19c3cb91f..000000000000
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@@ -240,6 -256,18 +240,21 @@@ config ARCH_HAS_FORTIFY_SOURC
+  config ARCH_HAS_SET_MEMORY
+  	bool
+  
+++<<<<<<< HEAD
+++=======
++ # Select if arch has all set_direct_map_invalid/default() functions
++ config ARCH_HAS_SET_DIRECT_MAP
++ 	bool
++ 
++ #
++ # Select if arch has an uncached kernel segment and provides the
++ # uncached_kernel_address / cached_kernel_address symbols to use it
++ #
++ config ARCH_HAS_UNCACHED_SEGMENT
++ 	select ARCH_HAS_DMA_PREP_COHERENT
++ 	bool
++ 
+++>>>>>>> c30700db9eaa (dma-direct: provide generic support for uncached kernel segments)
+  # Select if arch init_task must go in the __init_task_data section
+  config ARCH_TASK_STRUCT_ON_STACK
+         bool
+* Unmerged path arch/Kconfig
+diff --git a/include/linux/dma-noncoherent.h b/include/linux/dma-noncoherent.h
+index 69b36ed31a99..fa58ade93984 100644
+--- a/include/linux/dma-noncoherent.h
++++ b/include/linux/dma-noncoherent.h
+@@ -74,4 +74,7 @@ static inline void arch_sync_dma_for_cpu_all(struct device *dev)
+ 
+ void arch_dma_prep_coherent(struct page *page, size_t size);
+ 
++void *uncached_kernel_address(void *addr);
++void *cached_kernel_address(void *addr);
++
+ #endif /* _LINUX_DMA_NONCOHERENT_H */
+diff --git a/kernel/dma/direct.c b/kernel/dma/direct.c
+index 26bb7b9a7670..0f2e6cac8c3f 100644
+--- a/kernel/dma/direct.c
++++ b/kernel/dma/direct.c
+@@ -159,6 +159,13 @@ void *dma_direct_alloc_pages(struct device *dev, size_t size,
+ 		*dma_handle = phys_to_dma(dev, page_to_phys(page));
+ 	}
+ 	memset(ret, 0, size);
++
++	if (IS_ENABLED(CONFIG_ARCH_HAS_UNCACHED_SEGMENT) &&
++	    !dev_is_dma_coherent(dev) && !(attrs & DMA_ATTR_NON_CONSISTENT)) {
++		arch_dma_prep_coherent(page, size);
++		ret = uncached_kernel_address(ret);
++	}
++
+ 	return ret;
+ }
+ 
+@@ -174,13 +181,18 @@ void dma_direct_free_pages(struct device *dev, size_t size, void *cpu_addr,
+ 
+ 	if (force_dma_unencrypted())
+ 		set_memory_encrypted((unsigned long)cpu_addr, 1 << page_order);
++
++	if (IS_ENABLED(CONFIG_ARCH_HAS_UNCACHED_SEGMENT) &&
++	    !dev_is_dma_coherent(dev) && !(attrs & DMA_ATTR_NON_CONSISTENT))
++		cpu_addr = cached_kernel_address(cpu_addr);
+ 	__dma_direct_free_pages(dev, size, virt_to_page(cpu_addr));
+ }
+ 
+ void *dma_direct_alloc(struct device *dev, size_t size,
+ 		dma_addr_t *dma_handle, gfp_t gfp, unsigned long attrs)
+ {
+-	if (!dev_is_dma_coherent(dev))
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_UNCACHED_SEGMENT) &&
++	    !dev_is_dma_coherent(dev))
+ 		return arch_dma_alloc(dev, size, dma_handle, gfp, attrs);
+ 	return dma_direct_alloc_pages(dev, size, dma_handle, gfp, attrs);
+ }
+@@ -188,7 +200,8 @@ void *dma_direct_alloc(struct device *dev, size_t size,
+ void dma_direct_free(struct device *dev, size_t size,
+ 		void *cpu_addr, dma_addr_t dma_addr, unsigned long attrs)
+ {
+-	if (!dev_is_dma_coherent(dev))
++	if (!IS_ENABLED(CONFIG_ARCH_HAS_UNCACHED_SEGMENT) &&
++	    !dev_is_dma_coherent(dev))
+ 		arch_dma_free(dev, size, cpu_addr, dma_addr, attrs);
+ 	else
+ 		dma_direct_free_pages(dev, size, cpu_addr, dma_addr, attrs);
