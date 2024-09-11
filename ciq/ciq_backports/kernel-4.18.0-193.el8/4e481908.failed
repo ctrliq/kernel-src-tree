@@ -1,0 +1,1013 @@
+flow_offload: move tc indirect block to flow offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author wenxu <wenxu@ucloud.cn>
+commit 4e481908c51bf02457aecdedc2d80e1be22e0146
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4e481908.failed
+
+move tc indirect block to flow_offload and rename
+it to flow indirect block.The nf_tables can use the
+indr block architecture.
+
+	Signed-off-by: wenxu <wenxu@ucloud.cn>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4e481908c51bf02457aecdedc2d80e1be22e0146)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/flow_offload.h
+#	include/net/pkt_cls.h
+#	include/net/sch_generic.h
+#	net/core/flow_offload.c
+#	net/sched/cls_api.c
+diff --cc include/net/flow_offload.h
+index 2cdb83492339,46b8777ad05d..000000000000
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@@ -2,7 -2,9 +2,8 @@@
+  #define _NET_FLOW_OFFLOAD_H
+  
+  #include <linux/kernel.h>
+ -#include <linux/list.h>
+  #include <net/flow_dissector.h>
++ #include <linux/rhashtable.h>
+  
+  struct flow_match {
+  	struct flow_dissector	*dissector;
+@@@ -234,4 -262,141 +235,144 @@@ static inline void flow_stats_update(st
+  	flow_stats->lastused	= max_t(u64, flow_stats->lastused, lastused);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum flow_block_command {
++ 	FLOW_BLOCK_BIND,
++ 	FLOW_BLOCK_UNBIND,
++ };
++ 
++ enum flow_block_binder_type {
++ 	FLOW_BLOCK_BINDER_TYPE_UNSPEC,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
++ 	FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS,
++ };
++ 
++ struct flow_block {
++ 	struct list_head cb_list;
++ };
++ 
++ struct netlink_ext_ack;
++ 
++ struct flow_block_offload {
++ 	enum flow_block_command command;
++ 	enum flow_block_binder_type binder_type;
++ 	bool block_shared;
++ 	struct net *net;
++ 	struct flow_block *block;
++ 	struct list_head cb_list;
++ 	struct list_head *driver_block_list;
++ 	struct netlink_ext_ack *extack;
++ };
++ 
++ enum tc_setup_type;
++ typedef int flow_setup_cb_t(enum tc_setup_type type, void *type_data,
++ 			    void *cb_priv);
++ 
++ struct flow_block_cb {
++ 	struct list_head	driver_list;
++ 	struct list_head	list;
++ 	flow_setup_cb_t		*cb;
++ 	void			*cb_ident;
++ 	void			*cb_priv;
++ 	void			(*release)(void *cb_priv);
++ 	unsigned int		refcnt;
++ };
++ 
++ struct flow_block_cb *flow_block_cb_alloc(flow_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv));
++ void flow_block_cb_free(struct flow_block_cb *block_cb);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
++ 					   flow_setup_cb_t *cb, void *cb_ident);
++ 
++ void *flow_block_cb_priv(struct flow_block_cb *block_cb);
++ void flow_block_cb_incref(struct flow_block_cb *block_cb);
++ unsigned int flow_block_cb_decref(struct flow_block_cb *block_cb);
++ 
++ static inline void flow_block_cb_add(struct flow_block_cb *block_cb,
++ 				     struct flow_block_offload *offload)
++ {
++ 	list_add_tail(&block_cb->list, &offload->cb_list);
++ }
++ 
++ static inline void flow_block_cb_remove(struct flow_block_cb *block_cb,
++ 					struct flow_block_offload *offload)
++ {
++ 	list_move(&block_cb->list, &offload->cb_list);
++ }
++ 
++ bool flow_block_cb_is_busy(flow_setup_cb_t *cb, void *cb_ident,
++ 			   struct list_head *driver_block_list);
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_list,
++ 			       flow_setup_cb_t *cb,
++ 			       void *cb_ident, void *cb_priv, bool ingress_only);
++ 
++ enum flow_cls_command {
++ 	FLOW_CLS_REPLACE,
++ 	FLOW_CLS_DESTROY,
++ 	FLOW_CLS_STATS,
++ 	FLOW_CLS_TMPLT_CREATE,
++ 	FLOW_CLS_TMPLT_DESTROY,
++ };
++ 
++ struct flow_cls_common_offload {
++ 	u32 chain_index;
++ 	__be16 protocol;
++ 	u32 prio;
++ 	struct netlink_ext_ack *extack;
++ };
++ 
++ struct flow_cls_offload {
++ 	struct flow_cls_common_offload common;
++ 	enum flow_cls_command command;
++ 	unsigned long cookie;
++ 	struct flow_rule *rule;
++ 	struct flow_stats stats;
++ 	u32 classid;
++ };
++ 
++ static inline struct flow_rule *
++ flow_cls_offload_flow_rule(struct flow_cls_offload *flow_cmd)
++ {
++ 	return flow_cmd->rule;
++ }
++ 
++ static inline void flow_block_init(struct flow_block *flow_block)
++ {
++ 	INIT_LIST_HEAD(&flow_block->cb_list);
++ }
++ 
++ typedef int flow_indr_block_bind_cb_t(struct net_device *dev, void *cb_priv,
++ 				      enum tc_setup_type type, void *type_data);
++ 
++ typedef void flow_indr_block_ing_cmd_t(struct net_device *dev,
++ 					flow_indr_block_bind_cb_t *cb,
++ 					void *cb_priv,
++ 					enum flow_block_command command);
++ 
++ int __flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_ident);
++ 
++ void __flow_indr_block_cb_unregister(struct net_device *dev,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_ident);
++ 
++ int flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				flow_indr_block_bind_cb_t *cb, void *cb_ident);
++ 
++ void flow_indr_block_cb_unregister(struct net_device *dev,
++ 				   flow_indr_block_bind_cb_t *cb,
++ 				   void *cb_ident);
++ 
++ void flow_indr_block_call(struct net_device *dev,
++ 			  flow_indr_block_ing_cmd_t *cb,
++ 			  struct flow_block_offload *bo,
++ 			  enum flow_block_command command);
++ 
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  #endif /* _NET_FLOW_OFFLOAD_H */
+diff --cc include/net/pkt_cls.h
+index 835bbad70a4b,0790a4ed909c..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -71,35 -70,6 +71,38 @@@ static inline struct Qdisc *tcf_block_q
+  	return block->q;
+  }
+  
+++<<<<<<< HEAD
+ +void *tcf_block_cb_priv(struct tcf_block_cb *block_cb);
+ +struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
+ +					 tc_setup_cb_t *cb, void *cb_ident);
+ +void tcf_block_cb_incref(struct tcf_block_cb *block_cb);
+ +unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb);
+ +struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
+ +					     tc_setup_cb_t *cb, void *cb_ident,
+ +					     void *cb_priv,
+ +					     struct netlink_ext_ack *extack);
+ +/* RHEL: Increase the version of tcf_block_cb_register() kABI when TC subsystem
+ + * is changed in a kABI incompatible way. This includes changes to ndo_setup_tc,
+ + * inline function changes and TC struct changes. */
+ +RH_KABI_FORCE_CHANGE(1)
+ +int tcf_block_cb_register(struct tcf_block *block,
+ +			  tc_setup_cb_t *cb, void *cb_ident,
+ +			  void *cb_priv, struct netlink_ext_ack *extack);
+ +void __tcf_block_cb_unregister(struct tcf_block *block,
+ +			       struct tcf_block_cb *block_cb);
+ +void tcf_block_cb_unregister(struct tcf_block *block,
+ +			     tc_setup_cb_t *cb, void *cb_ident);
+ +int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +				tc_indr_block_bind_cb_t *cb, void *cb_ident);
+ +int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +			      tc_indr_block_bind_cb_t *cb, void *cb_ident);
+ +void __tc_indr_block_cb_unregister(struct net_device *dev,
+ +				   tc_indr_block_bind_cb_t *cb, void *cb_ident);
+ +void tc_indr_block_cb_unregister(struct net_device *dev,
+ +				 tc_indr_block_bind_cb_t *cb, void *cb_ident);
+ +
+++=======
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+  		 struct tcf_result *res, bool compat_mode);
+  
+@@@ -148,85 -128,6 +151,88 @@@ void tc_setup_cb_block_unregister(struc
+  {
+  }
+  
+++<<<<<<< HEAD
+ +static inline
+ +void *tcf_block_cb_priv(struct tcf_block_cb *block_cb)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static inline
+ +struct tcf_block_cb *tcf_block_cb_lookup(struct tcf_block *block,
+ +					 tc_setup_cb_t *cb, void *cb_ident)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static inline
+ +void tcf_block_cb_incref(struct tcf_block_cb *block_cb)
+ +{
+ +}
+ +
+ +static inline
+ +unsigned int tcf_block_cb_decref(struct tcf_block_cb *block_cb)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline
+ +struct tcf_block_cb *__tcf_block_cb_register(struct tcf_block *block,
+ +					     tc_setup_cb_t *cb, void *cb_ident,
+ +					     void *cb_priv,
+ +					     struct netlink_ext_ack *extack)
+ +{
+ +	return NULL;
+ +}
+ +
+ +static inline
+ +int tcf_block_cb_register(struct tcf_block *block,
+ +			  tc_setup_cb_t *cb, void *cb_ident,
+ +			  void *cb_priv, struct netlink_ext_ack *extack)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline
+ +void __tcf_block_cb_unregister(struct tcf_block *block,
+ +			       struct tcf_block_cb *block_cb)
+ +{
+ +}
+ +
+ +static inline
+ +void tcf_block_cb_unregister(struct tcf_block *block,
+ +			     tc_setup_cb_t *cb, void *cb_ident)
+ +{
+ +}
+ +
+ +static inline
+ +int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +				tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline
+ +int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +			      tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline
+ +void __tc_indr_block_cb_unregister(struct net_device *dev,
+ +				   tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +}
+ +
+ +static inline
+ +void tc_indr_block_cb_unregister(struct net_device *dev,
+ +				 tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +}
+ +
+++=======
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  static inline int tcf_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+  			       struct tcf_result *res, bool compat_mode)
+  {
+diff --cc include/net/sch_generic.h
+index 13911b10ed82,d9f359af0b93..000000000000
+--- a/include/net/sch_generic.h
++++ b/include/net/sch_generic.h
+@@@ -22,12 -23,6 +22,15 @@@ struct tcf_walker
+  struct module;
+  struct bpf_flow_keys;
+  
+++<<<<<<< HEAD
+ +typedef int tc_setup_cb_t(enum tc_setup_type type,
+ +			  void *type_data, void *cb_priv);
+ +
+ +typedef int tc_indr_block_bind_cb_t(struct net_device *dev, void *cb_priv,
+ +				    enum tc_setup_type type, void *type_data);
+ +
+++=======
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  struct qdisc_rate_table {
+  	struct tc_ratespec rate;
+  	u32		data[256];
+diff --cc net/core/flow_offload.c
+index f52fe0bc4017,4cc18e462d50..000000000000
+--- a/net/core/flow_offload.c
++++ b/net/core/flow_offload.c
+@@@ -164,3 -165,333 +165,336 @@@ void flow_rule_match_enc_opts(const str
+  	FLOW_DISSECTOR_MATCH(rule, FLOW_DISSECTOR_KEY_ENC_OPTS, out);
+  }
+  EXPORT_SYMBOL(flow_rule_match_enc_opts);
+++<<<<<<< HEAD
+++=======
++ 
++ struct flow_block_cb *flow_block_cb_alloc(flow_setup_cb_t *cb,
++ 					  void *cb_ident, void *cb_priv,
++ 					  void (*release)(void *cb_priv))
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	block_cb = kzalloc(sizeof(*block_cb), GFP_KERNEL);
++ 	if (!block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	block_cb->cb = cb;
++ 	block_cb->cb_ident = cb_ident;
++ 	block_cb->cb_priv = cb_priv;
++ 	block_cb->release = release;
++ 
++ 	return block_cb;
++ }
++ EXPORT_SYMBOL(flow_block_cb_alloc);
++ 
++ void flow_block_cb_free(struct flow_block_cb *block_cb)
++ {
++ 	if (block_cb->release)
++ 		block_cb->release(block_cb->cb_priv);
++ 
++ 	kfree(block_cb);
++ }
++ EXPORT_SYMBOL(flow_block_cb_free);
++ 
++ struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
++ 					   flow_setup_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, &block->cb_list, list) {
++ 		if (block_cb->cb == cb &&
++ 		    block_cb->cb_ident == cb_ident)
++ 			return block_cb;
++ 	}
++ 
++ 	return NULL;
++ }
++ EXPORT_SYMBOL(flow_block_cb_lookup);
++ 
++ void *flow_block_cb_priv(struct flow_block_cb *block_cb)
++ {
++ 	return block_cb->cb_priv;
++ }
++ EXPORT_SYMBOL(flow_block_cb_priv);
++ 
++ void flow_block_cb_incref(struct flow_block_cb *block_cb)
++ {
++ 	block_cb->refcnt++;
++ }
++ EXPORT_SYMBOL(flow_block_cb_incref);
++ 
++ unsigned int flow_block_cb_decref(struct flow_block_cb *block_cb)
++ {
++ 	return --block_cb->refcnt;
++ }
++ EXPORT_SYMBOL(flow_block_cb_decref);
++ 
++ bool flow_block_cb_is_busy(flow_setup_cb_t *cb, void *cb_ident,
++ 			   struct list_head *driver_block_list)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	list_for_each_entry(block_cb, driver_block_list, driver_list) {
++ 		if (block_cb->cb == cb &&
++ 		    block_cb->cb_ident == cb_ident)
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ EXPORT_SYMBOL(flow_block_cb_is_busy);
++ 
++ int flow_block_cb_setup_simple(struct flow_block_offload *f,
++ 			       struct list_head *driver_block_list,
++ 			       flow_setup_cb_t *cb,
++ 			       void *cb_ident, void *cb_priv,
++ 			       bool ingress_only)
++ {
++ 	struct flow_block_cb *block_cb;
++ 
++ 	if (ingress_only &&
++ 	    f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++ 		return -EOPNOTSUPP;
++ 
++ 	f->driver_block_list = driver_block_list;
++ 
++ 	switch (f->command) {
++ 	case FLOW_BLOCK_BIND:
++ 		if (flow_block_cb_is_busy(cb, cb_ident, driver_block_list))
++ 			return -EBUSY;
++ 
++ 		block_cb = flow_block_cb_alloc(cb, cb_ident, cb_priv, NULL);
++ 		if (IS_ERR(block_cb))
++ 			return PTR_ERR(block_cb);
++ 
++ 		flow_block_cb_add(block_cb, f);
++ 		list_add_tail(&block_cb->driver_list, driver_block_list);
++ 		return 0;
++ 	case FLOW_BLOCK_UNBIND:
++ 		block_cb = flow_block_cb_lookup(f->block, cb, cb_ident);
++ 		if (!block_cb)
++ 			return -ENOENT;
++ 
++ 		flow_block_cb_remove(block_cb, f);
++ 		list_del(&block_cb->driver_list);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ EXPORT_SYMBOL(flow_block_cb_setup_simple);
++ 
++ static struct rhashtable indr_setup_block_ht;
++ 
++ struct flow_indr_block_cb {
++ 	struct list_head list;
++ 	void *cb_priv;
++ 	flow_indr_block_bind_cb_t *cb;
++ 	void *cb_ident;
++ };
++ 
++ struct flow_indr_block_dev {
++ 	struct rhash_head ht_node;
++ 	struct net_device *dev;
++ 	unsigned int refcnt;
++ 	flow_indr_block_ing_cmd_t  *block_ing_cmd_cb;
++ 	struct list_head cb_list;
++ };
++ 
++ static const struct rhashtable_params flow_indr_setup_block_ht_params = {
++ 	.key_offset	= offsetof(struct flow_indr_block_dev, dev),
++ 	.head_offset	= offsetof(struct flow_indr_block_dev, ht_node),
++ 	.key_len	= sizeof(struct net_device *),
++ };
++ 
++ static struct flow_indr_block_dev *
++ flow_indr_block_dev_lookup(struct net_device *dev)
++ {
++ 	return rhashtable_lookup_fast(&indr_setup_block_ht, &dev,
++ 				      flow_indr_setup_block_ht_params);
++ }
++ 
++ static struct flow_indr_block_dev *
++ flow_indr_block_dev_get(struct net_device *dev)
++ {
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (indr_dev)
++ 		goto inc_ref;
++ 
++ 	indr_dev = kzalloc(sizeof(*indr_dev), GFP_KERNEL);
++ 	if (!indr_dev)
++ 		return NULL;
++ 
++ 	INIT_LIST_HEAD(&indr_dev->cb_list);
++ 	indr_dev->dev = dev;
++ 	if (rhashtable_insert_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 				   flow_indr_setup_block_ht_params)) {
++ 		kfree(indr_dev);
++ 		return NULL;
++ 	}
++ 
++ inc_ref:
++ 	indr_dev->refcnt++;
++ 	return indr_dev;
++ }
++ 
++ static void flow_indr_block_dev_put(struct flow_indr_block_dev *indr_dev)
++ {
++ 	if (--indr_dev->refcnt)
++ 		return;
++ 
++ 	rhashtable_remove_fast(&indr_setup_block_ht, &indr_dev->ht_node,
++ 			       flow_indr_setup_block_ht_params);
++ 	kfree(indr_dev);
++ }
++ 
++ static struct flow_indr_block_cb *
++ flow_indr_block_cb_lookup(struct flow_indr_block_dev *indr_dev,
++ 			  flow_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		if (indr_block_cb->cb == cb &&
++ 		    indr_block_cb->cb_ident == cb_ident)
++ 			return indr_block_cb;
++ 	return NULL;
++ }
++ 
++ static struct flow_indr_block_cb *
++ flow_indr_block_cb_add(struct flow_indr_block_dev *indr_dev, void *cb_priv,
++ 		       flow_indr_block_bind_cb_t *cb, void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 
++ 	indr_block_cb = flow_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (indr_block_cb)
++ 		return ERR_PTR(-EEXIST);
++ 
++ 	indr_block_cb = kzalloc(sizeof(*indr_block_cb), GFP_KERNEL);
++ 	if (!indr_block_cb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	indr_block_cb->cb_priv = cb_priv;
++ 	indr_block_cb->cb = cb;
++ 	indr_block_cb->cb_ident = cb_ident;
++ 	list_add(&indr_block_cb->list, &indr_dev->cb_list);
++ 
++ 	return indr_block_cb;
++ }
++ 
++ static void flow_indr_block_cb_del(struct flow_indr_block_cb *indr_block_cb)
++ {
++ 	list_del(&indr_block_cb->list);
++ 	kfree(indr_block_cb);
++ }
++ 
++ int __flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				  flow_indr_block_bind_cb_t *cb,
++ 				  void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 	int err;
++ 
++ 	indr_dev = flow_indr_block_dev_get(dev);
++ 	if (!indr_dev)
++ 		return -ENOMEM;
++ 
++ 	indr_block_cb = flow_indr_block_cb_add(indr_dev, cb_priv, cb, cb_ident);
++ 	err = PTR_ERR_OR_ZERO(indr_block_cb);
++ 	if (err)
++ 		goto err_dev_put;
++ 
++ 	if (indr_dev->block_ing_cmd_cb)
++ 		indr_dev->block_ing_cmd_cb(dev, indr_block_cb->cb,
++ 					   indr_block_cb->cb_priv,
++ 					   FLOW_BLOCK_BIND);
++ 
++ 	return 0;
++ 
++ err_dev_put:
++ 	flow_indr_block_dev_put(indr_dev);
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(__flow_indr_block_cb_register);
++ 
++ int flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
++ 				flow_indr_block_bind_cb_t *cb,
++ 				void *cb_ident)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = __flow_indr_block_cb_register(dev, cb_priv, cb, cb_ident);
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_cb_register);
++ 
++ void __flow_indr_block_cb_unregister(struct net_device *dev,
++ 				     flow_indr_block_bind_cb_t *cb,
++ 				     void *cb_ident)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	indr_block_cb = flow_indr_block_cb_lookup(indr_dev, cb, cb_ident);
++ 	if (!indr_block_cb)
++ 		return;
++ 
++ 	if (indr_dev->block_ing_cmd_cb)
++ 		indr_dev->block_ing_cmd_cb(dev, indr_block_cb->cb,
++ 					   indr_block_cb->cb_priv,
++ 					   FLOW_BLOCK_UNBIND);
++ 
++ 	flow_indr_block_cb_del(indr_block_cb);
++ 	flow_indr_block_dev_put(indr_dev);
++ }
++ EXPORT_SYMBOL_GPL(__flow_indr_block_cb_unregister);
++ 
++ void flow_indr_block_cb_unregister(struct net_device *dev,
++ 				   flow_indr_block_bind_cb_t *cb,
++ 				   void *cb_ident)
++ {
++ 	rtnl_lock();
++ 	__flow_indr_block_cb_unregister(dev, cb, cb_ident);
++ 	rtnl_unlock();
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_cb_unregister);
++ 
++ void flow_indr_block_call(struct net_device *dev,
++ 			  flow_indr_block_ing_cmd_t cb,
++ 			  struct flow_block_offload *bo,
++ 			  enum flow_block_command command)
++ {
++ 	struct flow_indr_block_cb *indr_block_cb;
++ 	struct flow_indr_block_dev *indr_dev;
++ 
++ 	indr_dev = flow_indr_block_dev_lookup(dev);
++ 	if (!indr_dev)
++ 		return;
++ 
++ 	indr_dev->block_ing_cmd_cb = command == FLOW_BLOCK_BIND
++ 				     ? cb : NULL;
++ 
++ 	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
++ 		indr_block_cb->cb(dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
++ 				  bo);
++ }
++ EXPORT_SYMBOL_GPL(flow_indr_block_call);
++ 
++ static int __init init_flow_indr_rhashtable(void)
++ {
++ 	return rhashtable_init(&indr_setup_block_ht,
++ 			       &flow_indr_setup_block_ht_params);
++ }
++ subsys_initcall(init_flow_indr_rhashtable);
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+diff --cc net/sched/cls_api.c
+index 081ac3d0fb50,0b0dde26783d..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -40,6 -35,9 +40,12 @@@
+  #include <net/tc_act/tc_police.h>
+  #include <net/tc_act/tc_sample.h>
+  #include <net/tc_act/tc_skbedit.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/tc_act/tc_ct.h>
++ #include <net/tc_act/tc_mpls.h>
++ #include <net/flow_offload.h>
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  
+  extern const struct nla_policy rtm_tca_policy[TCA_MAX + 1];
+  
+@@@ -570,228 -595,33 +603,255 @@@ static struct tcf_block *tc_dev_ingress
+  	return cops->tcf_block(qdisc, TC_H_MIN_INGRESS, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +static struct rhashtable indr_setup_block_ht;
+ +
+ +struct tc_indr_block_dev {
+ +	struct rhash_head ht_node;
+ +	struct net_device *dev;
+ +	unsigned int refcnt;
+ +	struct list_head cb_list;
+ +	struct tcf_block *block;
+ +};
+ +
+ +struct tc_indr_block_cb {
+ +	struct list_head list;
+ +	void *cb_priv;
+ +	tc_indr_block_bind_cb_t *cb;
+ +	void *cb_ident;
+ +};
+ +
+ +static const struct rhashtable_params tc_indr_setup_block_ht_params = {
+ +	.key_offset	= offsetof(struct tc_indr_block_dev, dev),
+ +	.head_offset	= offsetof(struct tc_indr_block_dev, ht_node),
+ +	.key_len	= sizeof(struct net_device *),
+ +};
+ +
+ +static struct tc_indr_block_dev *
+ +tc_indr_block_dev_lookup(struct net_device *dev)
+++=======
++ static void tc_indr_block_get_and_ing_cmd(struct net_device *dev,
++ 					  flow_indr_block_bind_cb_t *cb,
++ 					  void *cb_priv,
++ 					  enum flow_block_command command)
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  {
+- 	return rhashtable_lookup_fast(&indr_setup_block_ht, &dev,
+- 				      tc_indr_setup_block_ht_params);
++ 	struct tcf_block *block = tc_dev_ingress_block(dev);
++ 
++ 	tc_indr_block_ing_cmd(dev, block, cb, cb_priv, command);
+  }
+  
+++<<<<<<< HEAD
+ +static struct tc_indr_block_dev *tc_indr_block_dev_get(struct net_device *dev)
+ +{
+ +	struct tc_indr_block_dev *indr_dev;
+ +
+ +	indr_dev = tc_indr_block_dev_lookup(dev);
+ +	if (indr_dev)
+ +		goto inc_ref;
+ +
+ +	indr_dev = kzalloc(sizeof(*indr_dev), GFP_KERNEL);
+ +	if (!indr_dev)
+ +		return NULL;
+ +
+ +	INIT_LIST_HEAD(&indr_dev->cb_list);
+ +	indr_dev->dev = dev;
+ +	indr_dev->block = tc_dev_ingress_block(dev);
+ +	if (rhashtable_insert_fast(&indr_setup_block_ht, &indr_dev->ht_node,
+ +				   tc_indr_setup_block_ht_params)) {
+ +		kfree(indr_dev);
+ +		return NULL;
+ +	}
+ +
+ +inc_ref:
+ +	indr_dev->refcnt++;
+ +	return indr_dev;
+ +}
+ +
+ +static void tc_indr_block_dev_put(struct tc_indr_block_dev *indr_dev)
+ +{
+ +	if (--indr_dev->refcnt)
+ +		return;
+ +
+ +	rhashtable_remove_fast(&indr_setup_block_ht, &indr_dev->ht_node,
+ +			       tc_indr_setup_block_ht_params);
+ +	kfree(indr_dev);
+ +}
+ +
+ +static struct tc_indr_block_cb *
+ +tc_indr_block_cb_lookup(struct tc_indr_block_dev *indr_dev,
+ +			tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	struct tc_indr_block_cb *indr_block_cb;
+ +
+ +	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
+ +		if (indr_block_cb->cb == cb &&
+ +		    indr_block_cb->cb_ident == cb_ident)
+ +			return indr_block_cb;
+ +	return NULL;
+ +}
+ +
+ +static struct tc_indr_block_cb *
+ +tc_indr_block_cb_add(struct tc_indr_block_dev *indr_dev, void *cb_priv,
+ +		     tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	struct tc_indr_block_cb *indr_block_cb;
+ +
+ +	indr_block_cb = tc_indr_block_cb_lookup(indr_dev, cb, cb_ident);
+ +	if (indr_block_cb)
+ +		return ERR_PTR(-EEXIST);
+ +
+ +	indr_block_cb = kzalloc(sizeof(*indr_block_cb), GFP_KERNEL);
+ +	if (!indr_block_cb)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	indr_block_cb->cb_priv = cb_priv;
+ +	indr_block_cb->cb = cb;
+ +	indr_block_cb->cb_ident = cb_ident;
+ +	list_add(&indr_block_cb->list, &indr_dev->cb_list);
+ +
+ +	return indr_block_cb;
+ +}
+ +
+ +static void tc_indr_block_cb_del(struct tc_indr_block_cb *indr_block_cb)
+ +{
+ +	list_del(&indr_block_cb->list);
+ +	kfree(indr_block_cb);
+ +}
+ +
+ +static int tcf_block_setup(struct tcf_block *block,
+ +			   struct flow_block_offload *bo);
+ +
+ +static void tc_indr_block_ing_cmd(struct tc_indr_block_dev *indr_dev,
+ +				  struct tc_indr_block_cb *indr_block_cb,
+ +				  enum tc_block_command command)
+ +{
+ +	struct tc_block_offload bo = {
+ +		.command	= command,
+ +		.binder_type	= TCF_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
+ +		.block		= indr_dev->block,
+ +	};
+ +	INIT_LIST_HEAD(&bo.cb_list);
+ +
+ +	if (!indr_dev->block)
+ +		return;
+ +
+ +	indr_block_cb->cb(indr_dev->dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
+ +			  &bo);
+ +	tcf_block_setup(indr_dev->block, &bo);
+ +}
+ +
+ +int __tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +				tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	struct tc_indr_block_cb *indr_block_cb;
+ +	struct tc_indr_block_dev *indr_dev;
+ +	int err;
+ +
+ +	indr_dev = tc_indr_block_dev_get(dev);
+ +	if (!indr_dev)
+ +		return -ENOMEM;
+ +
+ +	indr_block_cb = tc_indr_block_cb_add(indr_dev, cb_priv, cb, cb_ident);
+ +	err = PTR_ERR_OR_ZERO(indr_block_cb);
+ +	if (err)
+ +		goto err_dev_put;
+ +
+ +	tc_indr_block_ing_cmd(indr_dev, indr_block_cb, TC_BLOCK_BIND);
+ +	return 0;
+ +
+ +err_dev_put:
+ +	tc_indr_block_dev_put(indr_dev);
+ +	return err;
+ +}
+ +EXPORT_SYMBOL_GPL(__tc_indr_block_cb_register);
+ +
+ +int tc_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+ +			      tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	int err;
+ +
+ +	rtnl_lock();
+ +	err = __tc_indr_block_cb_register(dev, cb_priv, cb, cb_ident);
+ +	rtnl_unlock();
+ +
+ +	return err;
+ +}
+ +EXPORT_SYMBOL_GPL(tc_indr_block_cb_register);
+ +
+ +void __tc_indr_block_cb_unregister(struct net_device *dev,
+ +				   tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	struct tc_indr_block_cb *indr_block_cb;
+ +	struct tc_indr_block_dev *indr_dev;
+ +
+ +	indr_dev = tc_indr_block_dev_lookup(dev);
+ +	if (!indr_dev)
+ +		return;
+ +
+ +	indr_block_cb = tc_indr_block_cb_lookup(indr_dev, cb, cb_ident);
+ +	if (!indr_block_cb)
+ +		return;
+ +
+ +	/* Send unbind message if required to free any block cbs. */
+ +	tc_indr_block_ing_cmd(indr_dev, indr_block_cb, TC_BLOCK_UNBIND);
+ +	tc_indr_block_cb_del(indr_block_cb);
+ +	tc_indr_block_dev_put(indr_dev);
+ +}
+ +EXPORT_SYMBOL_GPL(__tc_indr_block_cb_unregister);
+ +
+ +void tc_indr_block_cb_unregister(struct net_device *dev,
+ +				 tc_indr_block_bind_cb_t *cb, void *cb_ident)
+ +{
+ +	rtnl_lock();
+ +	__tc_indr_block_cb_unregister(dev, cb, cb_ident);
+ +	rtnl_unlock();
+ +}
+ +EXPORT_SYMBOL_GPL(tc_indr_block_cb_unregister);
+ +
+ +static void tc_indr_block_call(struct tcf_block *block, struct net_device *dev,
+ +			       struct tcf_block_ext_info *ei,
+ +			       enum tc_block_command command,
+ +			       struct netlink_ext_ack *extack)
+ +{
+ +	struct tc_indr_block_cb *indr_block_cb;
+ +	struct tc_indr_block_dev *indr_dev;
+ +	struct tc_block_offload bo = {
+ +		.command	= command,
+ +		.binder_type	= ei->binder_type,
+ +		.block		= block,
+++=======
++ static void tc_indr_block_call(struct tcf_block *block,
++ 			       struct net_device *dev,
++ 			       struct tcf_block_ext_info *ei,
++ 			       enum flow_block_command command,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	struct flow_block_offload bo = {
++ 		.command	= command,
++ 		.binder_type	= ei->binder_type,
++ 		.net		= dev_net(dev),
++ 		.block		= &block->flow_block,
++ 		.block_shared	= tcf_block_shared(block),
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  		.extack		= extack,
+  	};
+  	INIT_LIST_HEAD(&bo.cb_list);
+  
+++<<<<<<< HEAD
+ +	indr_dev = tc_indr_block_dev_lookup(dev);
+ +	if (!indr_dev)
+ +		return;
+ +
+ +	indr_dev->block = command == TC_BLOCK_BIND ? block : NULL;
+ +
+ +	list_for_each_entry(indr_block_cb, &indr_dev->cb_list, list)
+ +		indr_block_cb->cb(dev, indr_block_cb->cb_priv, TC_SETUP_BLOCK,
+ +				  &bo);
+ +
+++=======
++ 	flow_indr_block_call(dev, tc_indr_block_get_and_ing_cmd, &bo, command);
+++>>>>>>> 4e481908c51b (flow_offload: move tc indirect block to flow offload)
+  	tcf_block_setup(block, &bo);
+  }
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+index d4d2e9fb17fa..f7d9edc6e762 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.c
+@@ -785,9 +785,9 @@ static int mlx5e_rep_indr_register_block(struct mlx5e_rep_priv *rpriv,
+ {
+ 	int err;
+ 
+-	err = __tc_indr_block_cb_register(netdev, rpriv,
+-					  mlx5e_rep_indr_setup_tc_cb,
+-					  rpriv);
++	err = __flow_indr_block_cb_register(netdev, rpriv,
++					    mlx5e_rep_indr_setup_tc_cb,
++					    rpriv);
+ 	if (err) {
+ 		struct mlx5e_priv *priv = netdev_priv(rpriv->netdev);
+ 
+@@ -800,8 +800,8 @@ static int mlx5e_rep_indr_register_block(struct mlx5e_rep_priv *rpriv,
+ static void mlx5e_rep_indr_unregister_block(struct mlx5e_rep_priv *rpriv,
+ 					    struct net_device *netdev)
+ {
+-	__tc_indr_block_cb_unregister(netdev, mlx5e_rep_indr_setup_tc_cb,
+-				      rpriv);
++	__flow_indr_block_cb_unregister(netdev, mlx5e_rep_indr_setup_tc_cb,
++					rpriv);
+ }
+ 
+ static int mlx5e_nic_rep_netdevice_event(struct notifier_block *nb,
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/offload.c b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+index bdd551f36cb7..2f505f686d1d 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@ -745,16 +745,17 @@ int nfp_flower_reg_indir_block_handler(struct nfp_app *app,
+ 		return NOTIFY_OK;
+ 
+ 	if (event == NETDEV_REGISTER) {
+-		err = __tc_indr_block_cb_register(netdev, app,
+-						  nfp_flower_indr_setup_tc_cb,
+-						  app);
++		err = __flow_indr_block_cb_register(netdev, app,
++						    nfp_flower_indr_setup_tc_cb,
++						    app);
+ 		if (err)
+ 			nfp_flower_cmsg_warn(app,
+ 					     "Indirect block reg failed - %s\n",
+ 					     netdev->name);
+ 	} else if (event == NETDEV_UNREGISTER) {
+-		__tc_indr_block_cb_unregister(netdev,
+-					      nfp_flower_indr_setup_tc_cb, app);
++		__flow_indr_block_cb_unregister(netdev,
++						nfp_flower_indr_setup_tc_cb,
++						app);
+ 	}
+ 
+ 	return NOTIFY_OK;
+* Unmerged path include/net/flow_offload.h
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path include/net/sch_generic.h
+* Unmerged path net/core/flow_offload.c
+* Unmerged path net/sched/cls_api.c
