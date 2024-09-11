@@ -1522,6 +1522,8 @@ tree_unlocked:
 		unlock_page(new_page);
 
 		*hpage = NULL;
+
+		khugepaged_pages_collapsed++;
 	} else {
 		/* Something went wrong: rollback changes to the radix-tree */
 		xa_lock_irq(&mapping->i_pages);
