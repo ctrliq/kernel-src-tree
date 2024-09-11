@@ -1,0 +1,170 @@
+x86/platform/uv: Fix copied UV5 output archtype
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mike Travis <mike.travis@hpe.com>
+commit 77c7e1bc060deab6430f1dff5922ccd3093d9776
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/77c7e1bc.failed
+
+A test shows that the output contains a space:
+    # cat /proc/sgi_uv/archtype
+    NSGI4 U/UVX
+
+Remove that embedded space by copying the "trimmed" buffer instead of the
+untrimmed input character list.  Use sizeof to remove size dependency on
+copy out length.  Increase output buffer size by one character just in case
+BIOS sends an 8 character string for archtype.
+
+Fixes: 1e61f5a95f19 ("Add and decode Arch Type in UVsystab")
+	Signed-off-by: Mike Travis <mike.travis@hpe.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Steve Wahl <steve.wahl@hpe.com>
+Link: https://lore.kernel.org/r/20201111010418.82133-1-mike.travis@hpe.com
+(cherry picked from commit 77c7e1bc060deab6430f1dff5922ccd3093d9776)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/apic/x2apic_uv_x.c
+diff --cc arch/x86/kernel/apic/x2apic_uv_x.c
+index f642f9a42a24,1b98f8c12b96..000000000000
+--- a/arch/x86/kernel/apic/x2apic_uv_x.c
++++ b/arch/x86/kernel/apic/x2apic_uv_x.c
+@@@ -50,7 -32,8 +50,12 @@@ static u64			gru_start_paddr, gru_end_p
+  static union uvh_apicid		uvh_apicid;
+  static int			uv_node_id;
+  
+++<<<<<<< HEAD
+ +/* Unpack OEM/TABLE ID's to be NULL terminated strings */
+++=======
++ /* Unpack AT/OEM/TABLE ID's to be NULL terminated strings */
++ static u8 uv_archtype[UV_AT_SIZE + 1];
+++>>>>>>> 77c7e1bc060d (x86/platform/uv: Fix copied UV5 output archtype)
+  static u8 oem_id[ACPI_OEM_ID_SIZE + 1];
+  static u8 oem_table_id[ACPI_OEM_TABLE_ID_SIZE + 1];
+  
+@@@ -312,19 -295,110 +317,111 @@@ static void __init uv_stringify(int len
+  	(void)strim(to);
+  }
+  
+ -/* Find UV arch type entry in UVsystab */
+ -static unsigned long __init early_find_archtype(struct uv_systab *st)
+ +static int __init uv_set_system_type(char *_oem_id)
+  {
+++<<<<<<< HEAD
+ +	/* Save OEM ID */
+ +	uv_stringify(sizeof(oem_id), oem_id, _oem_id);
+ +
+ +	/* Set hubless type if true */
+ +	if (strncmp(oem_id, "SGI", 3) != 0) {
+ +		if (strncmp(oem_id, "NSGI", 4) != 0)
+++=======
++ 	int i;
++ 
++ 	for (i = 0; st->entry[i].type != UV_SYSTAB_TYPE_UNUSED; i++) {
++ 		unsigned long ptr = st->entry[i].offset;
++ 
++ 		if (!ptr)
++ 			continue;
++ 		ptr += (unsigned long)st;
++ 		if (st->entry[i].type == UV_SYSTAB_TYPE_ARCH_TYPE)
++ 			return ptr;
++ 	}
++ 	return 0;
++ }
++ 
++ /* Validate UV arch type field in UVsystab */
++ static int __init decode_arch_type(unsigned long ptr)
++ {
++ 	struct uv_arch_type_entry *uv_ate = (struct uv_arch_type_entry *)ptr;
++ 	int n = strlen(uv_ate->archtype);
++ 
++ 	if (n > 0 && n < sizeof(uv_ate->archtype)) {
++ 		pr_info("UV: UVarchtype received from BIOS\n");
++ 		uv_stringify(sizeof(uv_archtype), uv_archtype, uv_ate->archtype);
++ 		return 1;
++ 	}
++ 	return 0;
++ }
++ 
++ /* Determine if UV arch type entry might exist in UVsystab */
++ static int __init early_get_arch_type(void)
++ {
++ 	unsigned long uvst_physaddr, uvst_size, ptr;
++ 	struct uv_systab *st;
++ 	u32 rev;
++ 	int ret;
++ 
++ 	uvst_physaddr = get_uv_systab_phys(0);
++ 	if (!uvst_physaddr)
++ 		return 0;
++ 
++ 	st = early_memremap_ro(uvst_physaddr, sizeof(struct uv_systab));
++ 	if (!st) {
++ 		pr_err("UV: Cannot access UVsystab, remap failed\n");
++ 		return 0;
++ 	}
++ 
++ 	rev = st->revision;
++ 	if (rev < UV_SYSTAB_VERSION_UV5) {
++ 		early_memunmap(st, sizeof(struct uv_systab));
++ 		return 0;
++ 	}
++ 
++ 	uvst_size = st->size;
++ 	early_memunmap(st, sizeof(struct uv_systab));
++ 	st = early_memremap_ro(uvst_physaddr, uvst_size);
++ 	if (!st) {
++ 		pr_err("UV: Cannot access UVarchtype, remap failed\n");
++ 		return 0;
++ 	}
++ 
++ 	ptr = early_find_archtype(st);
++ 	if (!ptr) {
++ 		early_memunmap(st, uvst_size);
++ 		return 0;
++ 	}
++ 
++ 	ret = decode_arch_type(ptr);
++ 	early_memunmap(st, uvst_size);
++ 	return ret;
++ }
++ 
++ static int __init uv_set_system_type(char *_oem_id, char *_oem_table_id)
++ {
++ 	/* Save OEM_ID passed from ACPI MADT */
++ 	uv_stringify(sizeof(oem_id), oem_id, _oem_id);
++ 
++ 	/* Check if BIOS sent us a UVarchtype */
++ 	if (!early_get_arch_type())
++ 
++ 		/* If not use OEM ID for UVarchtype */
++ 		uv_stringify(sizeof(uv_archtype), uv_archtype, oem_id);
++ 
++ 	/* Check if not hubbed */
++ 	if (strncmp(uv_archtype, "SGI", 3) != 0) {
++ 
++ 		/* (Not hubbed), check if not hubless */
++ 		if (strncmp(uv_archtype, "NSGI", 4) != 0)
++ 
++ 			/* (Not hubless), not a UV */
+++>>>>>>> 77c7e1bc060d (x86/platform/uv: Fix copied UV5 output archtype)
+  			return 0;
+  
+ -		/* Is UV hubless system */
+ -		uv_hubless_system = 0x01;
+ -
+ -		/* UV5 Hubless */
+ -		if (strncmp(uv_archtype, "NSGI5", 5) == 0)
+ -			uv_hubless_system |= 0x20;
+ -
+  		/* UV4 Hubless: CH */
+ -		else if (strncmp(uv_archtype, "NSGI4", 5) == 0)
+ -			uv_hubless_system |= 0x10;
+ +		if (strncmp(oem_id, "NSGI4", 5) == 0)
+ +			uv_hubless_system = 0x11;
+  
+  		/* UV3 Hubless: UV300/MC990X w/o hub */
+  		else
+* Unmerged path arch/x86/kernel/apic/x2apic_uv_x.c
