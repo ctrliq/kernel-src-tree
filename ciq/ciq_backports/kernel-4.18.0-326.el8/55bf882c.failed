@@ -1,0 +1,159 @@
+fanotify: fix merging marks masks with FAN_ONDIR
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit 55bf882c7f13dda8bbe624040c6d5b4fbb812d16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/55bf882c.failed
+
+Change the logic of FAN_ONDIR in two ways that are similar to the logic
+of FAN_EVENT_ON_CHILD, that was fixed in commit 54a307ba8d3c ("fanotify:
+fix logic of events on child"):
+
+1. The flag is meaningless in ignore mask
+2. The flag refers only to events in the mask of the mark where it is set
+
+This is what the fanotify_mark.2 man page says about FAN_ONDIR:
+"Without this flag, only events for files are created."  It doesn't
+say anything about setting this flag in ignore mask to stop getting
+events on directories nor can I think of any setup where this capability
+would be useful.
+
+Currently, when marks masks are merged, the FAN_ONDIR flag set in one
+mark affects the events that are set in another mark's mask and this
+behavior causes unexpected results.  For example, a user adds a mark on a
+directory with mask FAN_ATTRIB | FAN_ONDIR and a mount mark with mask
+FAN_OPEN (without FAN_ONDIR).  An opendir() of that directory (which is
+inside that mount) generates a FAN_OPEN event even though neither of the
+marks requested to get open events on directories.
+
+Link: https://lore.kernel.org/r/20200319151022.31456-10-amir73il@gmail.com
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit 55bf882c7f13dda8bbe624040c6d5b4fbb812d16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fanotify/fanotify.c
+diff --cc fs/notify/fanotify/fanotify.c
+index a8fd6b8b018f,960f4f4d9e8f..000000000000
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@@ -133,21 -191,100 +140,44 @@@ static u32 fanotify_group_event_mask(st
+  		marks_ignored_mask |= mark->ignored_mask;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (event_mask & FS_ISDIR &&
+ +	    !(marks_mask & FS_ISDIR & ~marks_ignored_mask))
+ +		return 0;
+ +
+ +	return event_mask & FANOTIFY_OUTGOING_EVENTS & marks_mask &
+ +		~marks_ignored_mask;
+++=======
++ 	test_mask = event_mask & marks_mask & ~marks_ignored_mask;
++ 
++ 	/*
++ 	 * dirent modification events (create/delete/move) do not carry the
++ 	 * child entry name/inode information. Instead, we report FAN_ONDIR
++ 	 * for mkdir/rmdir so user can differentiate them from creat/unlink.
++ 	 *
++ 	 * For backward compatibility and consistency, do not report FAN_ONDIR
++ 	 * to user in legacy fanotify mode (reporting fd) and report FAN_ONDIR
++ 	 * to user in FAN_REPORT_FID mode for all event types.
++ 	 */
++ 	if (FAN_GROUP_FLAG(group, FAN_REPORT_FID)) {
++ 		/* Do not report FAN_ONDIR without any event */
++ 		if (!(test_mask & ~FAN_ONDIR))
++ 			return 0;
++ 	} else {
++ 		user_mask &= ~FAN_ONDIR;
++ 	}
++ 
++ 	return test_mask & user_mask;
+++>>>>>>> 55bf882c7f13 (fanotify: fix merging marks masks with FAN_ONDIR)
+  }
+  
+ -static int fanotify_encode_fid(struct fanotify_event *event,
+ -			       struct inode *inode, gfp_t gfp,
+ -			       __kernel_fsid_t *fsid)
+ -{
+ -	struct fanotify_fid *fid = &event->fid;
+ -	int dwords, bytes = 0;
+ -	int err, type;
+ -
+ -	fid->ext_fh = NULL;
+ -	dwords = 0;
+ -	err = -ENOENT;
+ -	type = exportfs_encode_inode_fh(inode, NULL, &dwords, NULL);
+ -	if (!dwords)
+ -		goto out_err;
+ -
+ -	bytes = dwords << 2;
+ -	if (bytes > FANOTIFY_INLINE_FH_LEN) {
+ -		/* Treat failure to allocate fh as failure to allocate event */
+ -		err = -ENOMEM;
+ -		fid->ext_fh = kmalloc(bytes, gfp);
+ -		if (!fid->ext_fh)
+ -			goto out_err;
+ -	}
+ -
+ -	type = exportfs_encode_inode_fh(inode, fanotify_fid_fh(fid, bytes),
+ -					&dwords, NULL);
+ -	err = -EINVAL;
+ -	if (!type || type == FILEID_INVALID || bytes != dwords << 2)
+ -		goto out_err;
+ -
+ -	fid->fsid = *fsid;
+ -	event->fh_len = bytes;
+ -
+ -	return type;
+ -
+ -out_err:
+ -	pr_warn_ratelimited("fanotify: failed to encode fid (fsid=%x.%x, "
+ -			    "type=%d, bytes=%d, err=%i)\n",
+ -			    fsid->val[0], fsid->val[1], type, bytes, err);
+ -	kfree(fid->ext_fh);
+ -	fid->ext_fh = NULL;
+ -	event->fh_len = 0;
+ -
+ -	return FILEID_INVALID;
+ -}
+ -
+ -/*
+ - * The inode to use as identifier when reporting fid depends on the event.
+ - * Report the modified directory inode on dirent modification events.
+ - * Report the "victim" inode otherwise.
+ - * For example:
+ - * FS_ATTRIB reports the child inode even if reported on a watched parent.
+ - * FS_CREATE reports the modified dir inode and not the created inode.
+ - */
+ -static struct inode *fanotify_fid_inode(struct inode *to_tell, u32 event_mask,
+ -					const void *data, int data_type)
+ -{
+ -	if (event_mask & ALL_FSNOTIFY_DIRENT_EVENTS)
+ -		return to_tell;
+ -
+ -	return (struct inode *)fsnotify_data_inode(data, data_type);
+ -}
+ -
+ -struct fanotify_event *fanotify_alloc_event(struct fsnotify_group *group,
+ -					    struct inode *inode, u32 mask,
+ -					    const void *data, int data_type,
+ -					    __kernel_fsid_t *fsid)
+ +struct fanotify_event_info *fanotify_alloc_event(struct fsnotify_group *group,
+ +						 struct inode *inode, u32 mask,
+ +						 const struct path *path)
+  {
+ -	struct fanotify_event *event = NULL;
+ +	struct fanotify_event_info *event = NULL;
+  	gfp_t gfp = GFP_KERNEL_ACCOUNT;
+ -	struct inode *id = fanotify_fid_inode(inode, mask, data, data_type);
+ -	const struct path *path = fsnotify_data_path(data, data_type);
+ +	struct mem_cgroup *old_memcg;
+  
+  	/*
+  	 * For queues with unlimited length lost events are not expected and
+* Unmerged path fs/notify/fanotify/fanotify.c
