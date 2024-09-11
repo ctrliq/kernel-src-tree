@@ -1,0 +1,257 @@
+drm/i915/tc: Refactor TC-cold block/unblock helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Imre Deak <imre.deak@intel.com>
+commit d0bc677056bd9de6eb731dd8bff889a5fe36e381
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d0bc6770.failed
+
+A follow-up change will select the TC-cold blocking power domain based
+on the TypeC mode, prepare for that here.
+
+Also bring intel_tc_cold_requires_aux_pw() earlier to its logical place
+for readability.
+
+No functional change.
+
+v2: Add code comment about IOM reg accesses in TCCOLD. (Jose)
+
+	Cc: José Roberto de Souza <jose.souza@intel.com>
+	Signed-off-by: Imre Deak <imre.deak@intel.com>
+	Reviewed-by: José Roberto de Souza <jose.souza@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210929132833.2253961-4-imre.deak@intel.com
+(cherry picked from commit d0bc677056bd9de6eb731dd8bff889a5fe36e381)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_tc.c
+diff --cc drivers/gpu/drm/i915/display/intel_tc.c
+index 2cefc13535a0,69c917fce03e..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_tc.c
++++ b/drivers/gpu/drm/i915/display/intel_tc.c
+@@@ -23,28 -24,65 +23,70 @@@ static const char *tc_port_mode_name(en
+  	return names[mode];
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool intel_tc_port_in_mode(struct intel_digital_port *dig_port,
++ 				  enum tc_port_mode mode)
++ {
++ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
++ 	enum phy phy = intel_port_to_phy(i915, dig_port->base.port);
++ 
++ 	return intel_phy_is_tc(i915, phy) && dig_port->tc_mode == mode;
++ }
++ 
++ bool intel_tc_port_in_tbt_alt_mode(struct intel_digital_port *dig_port)
++ {
++ 	return intel_tc_port_in_mode(dig_port, TC_PORT_TBT_ALT);
++ }
++ 
++ bool intel_tc_port_in_dp_alt_mode(struct intel_digital_port *dig_port)
++ {
++ 	return intel_tc_port_in_mode(dig_port, TC_PORT_DP_ALT);
++ }
++ 
++ bool intel_tc_port_in_legacy_mode(struct intel_digital_port *dig_port)
++ {
++ 	return intel_tc_port_in_mode(dig_port, TC_PORT_LEGACY);
++ }
++ 
++ bool intel_tc_cold_requires_aux_pw(struct intel_digital_port *dig_port)
++ {
++ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
++ 
++ 	return (DISPLAY_VER(i915) == 11 && dig_port->tc_legacy_port) ||
++ 		IS_ALDERLAKE_P(i915);
++ }
++ 
+++>>>>>>> d0bc677056bd (drm/i915/tc: Refactor TC-cold block/unblock helpers)
+  static enum intel_display_power_domain
+- tc_cold_get_power_domain(struct intel_digital_port *dig_port)
++ tc_cold_get_power_domain(struct intel_digital_port *dig_port, enum tc_port_mode mode)
+  {
+ -	if (intel_tc_cold_requires_aux_pw(dig_port))
+ +	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+ +
+ +	if (INTEL_GEN(i915) == 11)
+  		return intel_legacy_aux_to_power_domain(dig_port->aux_ch);
+  	else
+  		return POWER_DOMAIN_TC_COLD_OFF;
+  }
+  
+  static intel_wakeref_t
+- tc_cold_block(struct intel_digital_port *dig_port)
++ tc_cold_block_in_mode(struct intel_digital_port *dig_port, enum tc_port_mode mode,
++ 		      enum intel_display_power_domain *domain)
+  {
+  	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+- 	enum intel_display_power_domain domain;
+  
+ -	if (DISPLAY_VER(i915) == 11 && !dig_port->tc_legacy_port)
+ +	if (INTEL_GEN(i915) == 11 && !dig_port->tc_legacy_port)
+  		return 0;
+  
+- 	domain = tc_cold_get_power_domain(dig_port);
+- 	return intel_display_power_get(i915, domain);
++ 	*domain = tc_cold_get_power_domain(dig_port, mode);
++ 
++ 	return intel_display_power_get(i915, *domain);
++ }
++ 
++ static intel_wakeref_t
++ tc_cold_block(struct intel_digital_port *dig_port, enum intel_display_power_domain *domain)
++ {
++ 	return tc_cold_block_in_mode(dig_port, dig_port->tc_mode, domain);
+  }
+  
+  static void
+@@@ -238,6 -276,53 +280,56 @@@ static u32 tc_port_live_status_mask(str
+  	return mask;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 adl_tc_port_live_status_mask(struct intel_digital_port *dig_port)
++ {
++ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
++ 	enum tc_port tc_port = intel_port_to_tc(i915, dig_port->base.port);
++ 	u32 isr_bit = i915->hotplug.pch_hpd[dig_port->base.hpd_pin];
++ 	struct intel_uncore *uncore = &i915->uncore;
++ 	u32 val, mask = 0;
++ 
++ 	/*
++ 	 * On ADL-P HW/FW will wake from TCCOLD to complete the read access of
++ 	 * registers in IOM. Note that this doesn't apply to PHY and FIA
++ 	 * registers.
++ 	 */
++ 	val = intel_uncore_read(uncore, TCSS_DDI_STATUS(tc_port));
++ 	if (val & TCSS_DDI_STATUS_HPD_LIVE_STATUS_ALT)
++ 		mask |= BIT(TC_PORT_DP_ALT);
++ 	if (val & TCSS_DDI_STATUS_HPD_LIVE_STATUS_TBT)
++ 		mask |= BIT(TC_PORT_TBT_ALT);
++ 
++ 	if (intel_uncore_read(uncore, SDEISR) & isr_bit)
++ 		mask |= BIT(TC_PORT_LEGACY);
++ 
++ 	/* The sink can be connected only in a single mode. */
++ 	if (!drm_WARN_ON(&i915->drm, hweight32(mask) > 1))
++ 		tc_port_fixup_legacy_flag(dig_port, mask);
++ 
++ 	return mask;
++ }
++ 
++ static u32 tc_port_live_status_mask(struct intel_digital_port *dig_port)
++ {
++ 	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
++ 
++ 	if (IS_ALDERLAKE_P(i915))
++ 		return adl_tc_port_live_status_mask(dig_port);
++ 
++ 	return icl_tc_port_live_status_mask(dig_port);
++ }
++ 
++ /*
++  * Return the PHY status complete flag indicating that display can acquire the
++  * PHY ownership. The IOM firmware sets this flag when a DP-alt or legacy sink
++  * is connected and it's ready to switch the ownership to display. The flag
++  * will be left cleared when a TBT-alt sink is connected, where the PHY is
++  * owned by the TBT subsystem and so switching the ownership to display is not
++  * required.
++  */
+++>>>>>>> d0bc677056bd (drm/i915/tc: Refactor TC-cold block/unblock helpers)
+  static bool icl_tc_phy_status_complete(struct intel_digital_port *dig_port)
+  {
+  	struct drm_i915_private *i915 = to_i915(dig_port->base.base.dev);
+@@@ -499,20 -668,22 +591,32 @@@ void intel_tc_port_sanitize(struct inte
+  	else if (encoder->base.crtc)
+  		active_links = to_intel_crtc(encoder->base.crtc)->active;
+  
+ -	drm_WARN_ON(&i915->drm, dig_port->tc_mode != TC_PORT_DISCONNECTED);
+  	if (active_links) {
+++<<<<<<< HEAD
+++=======
++ 		enum intel_display_power_domain domain;
++ 		intel_wakeref_t tc_cold_wref = tc_cold_block(dig_port, &domain);
++ 
++ 		dig_port->tc_mode = intel_tc_port_get_current_mode(dig_port);
++ 
+++>>>>>>> d0bc677056bd (drm/i915/tc: Refactor TC-cold block/unblock helpers)
+  		if (!icl_tc_phy_is_connected(dig_port))
+  			drm_dbg_kms(&i915->drm,
+  				    "Port %s: PHY disconnected with %d active link(s)\n",
+  				    dig_port->tc_port_name, active_links);
+  		intel_tc_port_link_init_refcount(dig_port, active_links);
+  
+++<<<<<<< HEAD
+ +		goto out;
+++=======
++ 		tc_cold_unblock(dig_port, domain, tc_cold_wref);
+++>>>>>>> d0bc677056bd (drm/i915/tc: Refactor TC-cold block/unblock helpers)
+  	}
+  
+ +	if (dig_port->tc_legacy_port)
+ +		icl_tc_phy_connect(dig_port, 1);
+ +
+ +out:
+  	drm_dbg_kms(&i915->drm, "Port %s: sanitize mode (%s)\n",
+  		    dig_port->tc_port_name,
+  		    tc_port_mode_name(dig_port->tc_mode));
+@@@ -565,14 -736,16 +670,15 @@@ static void __intel_tc_port_lock(struc
+  	mutex_lock(&dig_port->tc_lock);
+  
+  	if (!dig_port->tc_link_refcount) {
++ 		enum intel_display_power_domain domain;
+  		intel_wakeref_t tc_cold_wref;
+  
+- 		tc_cold_wref = tc_cold_block(dig_port);
++ 		tc_cold_wref = tc_cold_block(dig_port, &domain);
+  
+ -		if (force_disconnect || intel_tc_port_needs_reset(dig_port))
+ -			intel_tc_port_reset_mode(dig_port, required_lanes,
+ -						 force_disconnect);
+ +		if (intel_tc_port_needs_reset(dig_port))
+ +			intel_tc_port_reset_mode(dig_port, required_lanes);
+  
+- 		tc_cold_unblock(dig_port, tc_cold_wref);
++ 		tc_cold_unblock(dig_port, domain, tc_cold_wref);
+  	}
+  
+  	drm_WARN_ON(&i915->drm, dig_port->tc_lock_wakeref);
+@@@ -625,9 -817,11 +732,17 @@@ tc_has_modular_fia(struct drm_i915_priv
+  	if (!INTEL_INFO(i915)->display.has_modular_fia)
+  		return false;
+  
+++<<<<<<< HEAD
+ +	wakeref = tc_cold_block(dig_port);
+ +	val = intel_uncore_read(&i915->uncore, PORT_TX_DFLEXDPSP(FIA1));
+ +	tc_cold_unblock(dig_port, wakeref);
+++=======
++ 	mutex_lock(&dig_port->tc_lock);
++ 	wakeref = tc_cold_block(dig_port, &domain);
++ 	val = intel_uncore_read(&i915->uncore, PORT_TX_DFLEXDPSP(FIA1));
++ 	tc_cold_unblock(dig_port, domain, wakeref);
++ 	mutex_unlock(&dig_port->tc_lock);
+++>>>>>>> d0bc677056bd (drm/i915/tc: Refactor TC-cold block/unblock helpers)
+  
+  	drm_WARN_ON(&i915->drm, val == 0xffffffff);
+  
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index cc8308e725ba..0c3ffc3a54ff 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -1550,8 +1550,10 @@ struct intel_digital_port {
+ 	enum intel_display_power_domain ddi_io_power_domain;
+ 	intel_wakeref_t ddi_io_wakeref;
+ 	intel_wakeref_t aux_wakeref;
++
+ 	struct mutex tc_lock;	/* protects the TypeC port mode */
+ 	intel_wakeref_t tc_lock_wakeref;
++	enum intel_display_power_domain tc_lock_power_domain;
+ 	int tc_link_refcount;
+ 	bool tc_legacy_port:1;
+ 	char tc_port_name[8];
+* Unmerged path drivers/gpu/drm/i915/display/intel_tc.c
