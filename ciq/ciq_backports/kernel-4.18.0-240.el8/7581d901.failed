@@ -1,0 +1,145 @@
+xprtrdma: Refactor initialization of ep->rep_max_requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7581d90109cad7d7322fd90cea023c706912f4bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7581d901.failed
+
+Clean up: there is no need to keep two copies of the same value.
+Also, in subsequent patches, rpcrdma_ep_create() will be called in
+the connect worker rather than at set-up time.
+
+Minor fix: Initialize the transport's sendctx to the value based on
+the capabilities of the underlying device, not the maximum setting.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 7581d90109cad7d7322fd90cea023c706912f4bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index 522f58cb1aab,520323ddc930..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -1330,14 -1480,10 +1330,21 @@@ void rpcrdma_reply_handler(struct rpcrd
+  
+  	if (credits == 0)
+  		credits = 1;	/* don't deadlock */
+++<<<<<<< HEAD
+ +	else if (credits > buf->rb_max_requests)
+ +		credits = buf->rb_max_requests;
+ +	if (buf->rb_credits != credits) {
+ +		spin_lock_bh(&xprt->transport_lock);
+ +		buf->rb_credits = credits;
+ +		xprt->cwnd = credits << RPC_CWNDSHIFT;
+ +		spin_unlock_bh(&xprt->transport_lock);
+ +	}
+++=======
++ 	else if (credits > r_xprt->rx_ep.rep_max_requests)
++ 		credits = r_xprt->rx_ep.rep_max_requests;
++ 	if (buf->rb_credits != credits)
++ 		rpcrdma_update_cwnd(r_xprt, credits);
+++>>>>>>> 7581d90109ca (xprtrdma: Refactor initialization of ep->rep_max_requests)
+  	rpcrdma_post_recvs(r_xprt, false);
+  
+  	req = rpcr_to_rdmar(rqst);
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 70a9ee184494,766e77592cfd..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -817,8 -822,7 +818,12 @@@ static int rpcrdma_sendctxs_create(stru
+  	 * the ->send_request call to fail temporarily before too many
+  	 * Sends are posted.
+  	 */
+++<<<<<<< HEAD
+ +	i = buf->rb_max_requests + RPCRDMA_MAX_BC_REQUESTS;
+ +	dprintk("RPC:       %s: allocating %lu send_ctxs\n", __func__, i);
+++=======
++ 	i = r_xprt->rx_ep.rep_max_requests + RPCRDMA_MAX_BC_REQUESTS;
+++>>>>>>> 7581d90109ca (xprtrdma: Refactor initialization of ep->rep_max_requests)
+  	buf->rb_sc_ctxs = kcalloc(i, sizeof(sc), GFP_KERNEL);
+  	if (!buf->rb_sc_ctxs)
+  		return -ENOMEM;
+@@@ -1083,25 -1156,21 +1088,24 @@@ int rpcrdma_buffer_create(struct rpcrdm
+  	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	int i, rc;
+  
+- 	buf->rb_max_requests = r_xprt->rx_ep.rep_max_requests;
+  	buf->rb_bc_srv_max_requests = 0;
+ +	spin_lock_init(&buf->rb_mrlock);
+  	spin_lock_init(&buf->rb_lock);
+  	INIT_LIST_HEAD(&buf->rb_mrs);
+ -	INIT_LIST_HEAD(&buf->rb_all_mrs);
+ -	INIT_WORK(&buf->rb_refresh_worker, rpcrdma_mr_refresh_worker);
+ +	INIT_LIST_HEAD(&buf->rb_all);
+ +	INIT_DELAYED_WORK(&buf->rb_refresh_worker,
+ +			  rpcrdma_mr_refresh_worker);
+ +
+ +	rpcrdma_mrs_create(r_xprt);
+  
+  	INIT_LIST_HEAD(&buf->rb_send_bufs);
+  	INIT_LIST_HEAD(&buf->rb_allreqs);
+ -	INIT_LIST_HEAD(&buf->rb_all_reps);
+  
+  	rc = -ENOMEM;
+- 	for (i = 0; i < buf->rb_max_requests; i++) {
++ 	for (i = 0; i < r_xprt->rx_xprt.max_reqs; i++) {
+  		struct rpcrdma_req *req;
+  
+ -		req = rpcrdma_req_create(r_xprt, RPCRDMA_V1_DEF_INLINE_SIZE * 2,
+ +		req = rpcrdma_req_create(r_xprt, RPCRDMA_V1_DEF_INLINE_SIZE,
+  					 GFP_KERNEL);
+  		if (!req)
+  			goto out;
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index ac2053971f3a..e84f9864d0f0 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -316,7 +316,8 @@ xprt_setup_rdma(struct xprt_create *args)
+ 	if (args->addrlen > sizeof(xprt->addr))
+ 		return ERR_PTR(-EBADF);
+ 
+-	xprt = xprt_alloc(args->net, sizeof(struct rpcrdma_xprt), 0, 0);
++	xprt = xprt_alloc(args->net, sizeof(struct rpcrdma_xprt), 0,
++			  xprt_rdma_slot_table_entries);
+ 	if (!xprt)
+ 		return ERR_PTR(-ENOMEM);
+ 
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index d1df40fa184f..4da915e60a74 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -97,7 +97,7 @@ struct rpcrdma_ep {
+ 	wait_queue_head_t 	rep_connect_wait;
+ 	struct rpcrdma_connect_private	rep_cm_private;
+ 	struct rdma_conn_param	rep_remote_cma;
+-	unsigned int		rep_max_requests;	/* set by /proc */
++	unsigned int		rep_max_requests;	/* depends on device */
+ 	unsigned int		rep_inline_send;	/* negotiated */
+ 	unsigned int		rep_inline_recv;	/* negotiated */
+ 	int			rep_receive_count;
+@@ -377,7 +377,7 @@ struct rpcrdma_buffer {
+ 	struct list_head	rb_recv_bufs;
+ 	struct list_head	rb_allreqs;
+ 
+-	u32			rb_max_requests;
++	__be32			rb_max_requests;
+ 	u32			rb_credits;	/* most recent credit grant */
+ 
+ 	u32			rb_bc_srv_max_requests;
+@@ -590,7 +590,6 @@ static inline void rpcrdma_set_xdrlen(struct xdr_buf *xdr, size_t len)
+ 
+ /* RPC/RDMA module init - xprtrdma/transport.c
+  */
+-extern unsigned int xprt_rdma_slot_table_entries;
+ extern unsigned int xprt_rdma_max_inline_read;
+ extern unsigned int xprt_rdma_max_inline_write;
+ void xprt_rdma_format_addresses(struct rpc_xprt *xprt, struct sockaddr *sap);
