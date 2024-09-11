@@ -1,0 +1,153 @@
+bpf: Optimize program stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 700d4796ef59f5faf240d307839bd419e2b6bdff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/700d4796.failed
+
+Move bpf_prog_stats from prog->aux into prog to avoid one extra load
+in critical path of program execution.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210210033634.62081-2-alexei.starovoitov@gmail.com
+(cherry picked from commit 700d4796ef59f5faf240d307839bd419e2b6bdff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/filter.h
+diff --cc include/linux/bpf.h
+index da13e0f46e30,5a388955e6b6..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -881,8 -838,6 +874,11 @@@ struct bpf_prog_aux 
+  	u32 linfo_idx;
+  	u32 num_exentries;
+  	struct exception_table_entry *extable;
+++<<<<<<< HEAD
+ +	struct bpf_prog_stats __percpu *stats;
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+++=======
+++>>>>>>> 700d4796ef59 (bpf: Optimize program stats)
+  	union {
+  		struct work_struct work;
+  		struct rcu_head	rcu;
+diff --cc include/linux/filter.h
+index d0df16c403ee,cecb03c9d251..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -22,6 -21,8 +22,11 @@@
+  #include <linux/if_vlan.h>
+  #include <linux/vmalloc.h>
+  #include <linux/sockptr.h>
+++<<<<<<< HEAD
+++=======
++ #include <crypto/sha1.h>
++ #include <linux/u64_stats_sync.h>
+++>>>>>>> 700d4796ef59 (bpf: Optimize program stats)
+  
+  #include <net/sch_generic.h>
+  
+@@@ -579,15 -564,14 +590,16 @@@ struct bpf_prog 
+  	u32			len;		/* Number of filter blocks */
+  	u32			jited_len;	/* Size of jited insns in bytes */
+  	u8			tag[BPF_TAG_SIZE];
+- 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
+- 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
++ 	struct bpf_prog_stats __percpu *stats;
+  	unsigned int		(*bpf_func)(const void *ctx,
+  					    const struct bpf_insn *insn);
++ 	struct bpf_prog_aux	*aux;		/* Auxiliary fields */
++ 	struct sock_fprog_kern	*orig_prog;	/* Original BPF program */
+  	/* Instructions for interpreter */
+ -	struct sock_filter	insns[0];
+ -	struct bpf_insn		insnsi[];
+ +	union {
+ +		struct sock_filter	insns[0];
+ +		struct bpf_insn		insnsi[0];
+ +	};
+  };
+  
+  struct sk_filter {
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/filter.h
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 3853f5e27301..9c01e168d12e 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -120,8 +120,8 @@ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
+ 	if (!prog)
+ 		return NULL;
+ 
+-	prog->aux->stats = alloc_percpu_gfp(struct bpf_prog_stats, gfp_flags);
+-	if (!prog->aux->stats) {
++	prog->stats = alloc_percpu_gfp(struct bpf_prog_stats, gfp_flags);
++	if (!prog->stats) {
+ 		kfree(prog->aux);
+ 		vfree(prog);
+ 		return NULL;
+@@ -130,7 +130,7 @@ struct bpf_prog *bpf_prog_alloc(unsigned int size, gfp_t gfp_extra_flags)
+ 	for_each_possible_cpu(cpu) {
+ 		struct bpf_prog_stats *pstats;
+ 
+-		pstats = per_cpu_ptr(prog->aux->stats, cpu);
++		pstats = per_cpu_ptr(prog->stats, cpu);
+ 		u64_stats_init(&pstats->syncp);
+ 	}
+ 	return prog;
+@@ -255,10 +255,10 @@ void __bpf_prog_free(struct bpf_prog *fp)
+ 	if (fp->aux) {
+ 		mutex_destroy(&fp->aux->used_maps_mutex);
+ 		mutex_destroy(&fp->aux->dst_mutex);
+-		free_percpu(fp->aux->stats);
+ 		kfree(fp->aux->poke_tab);
+ 		kfree(fp->aux);
+ 	}
++	free_percpu(fp->stats);
+ 	vfree(fp);
+ }
+ 
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index d8cbaca28508..523a46cf842e 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1769,7 +1769,7 @@ static void bpf_prog_get_stats(const struct bpf_prog *prog,
+ 		unsigned int start;
+ 		u64 tnsecs, tcnt;
+ 
+-		st = per_cpu_ptr(prog->aux->stats, cpu);
++		st = per_cpu_ptr(prog->stats, cpu);
+ 		do {
+ 			start = u64_stats_fetch_begin_irq(&st->syncp);
+ 			tnsecs = st->nsecs;
+diff --git a/kernel/bpf/trampoline.c b/kernel/bpf/trampoline.c
+index 986dabc3d11f..659f1b20e18b 100644
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@ -520,7 +520,7 @@ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start)
+ 	     * Hence check that 'start' is not zero.
+ 	     */
+ 	    start) {
+-		stats = this_cpu_ptr(prog->aux->stats);
++		stats = this_cpu_ptr(prog->stats);
+ 		u64_stats_update_begin(&stats->syncp);
+ 		stats->cnt++;
+ 		stats->nsecs += sched_clock() - start;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index f8e409061ed6..6d0c5337f031 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -11406,7 +11406,7 @@ static int jit_subprogs(struct bpf_verifier_env *env)
+ 		/* BPF_PROG_RUN doesn't call subprogs directly,
+ 		 * hence main prog stats include the runtime of subprogs.
+ 		 * subprogs don't have IDs and not reachable via prog_get_next_id
+-		 * func[i]->aux->stats will never be accessed and stays NULL
++		 * func[i]->stats will never be accessed and stays NULL
+ 		 */
+ 		func[i] = bpf_prog_alloc_no_stats(bpf_prog_size(len), GFP_USER);
+ 		if (!func[i])
