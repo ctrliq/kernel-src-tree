@@ -461,7 +461,7 @@ static int qeth_l3_send_setrouting(struct qeth_card *card,
 static int qeth_l3_correct_routing_type(struct qeth_card *card,
 		enum qeth_routing_types *type, enum qeth_prot_versions prot)
 {
-	if (card->info.type == QETH_CARD_TYPE_IQD) {
+	if (IS_IQD(card)) {
 		switch (*type) {
 		case NO_ROUTER:
 		case PRIMARY_CONNECTOR:
@@ -848,7 +848,7 @@ static int qeth_l3_softsetup_ipv6(struct qeth_card *card)
 
 	QETH_CARD_TEXT(card, 3, "softipv6");
 
-	if (card->info.type == QETH_CARD_TYPE_IQD)
+	if (IS_IQD(card))
 		goto out;
 
 	rc = qeth_send_simple_setassparms(card, IPA_IPV6,
@@ -1375,8 +1375,7 @@ static int qeth_l3_process_inbound_buffer(struct qeth_card *card,
 		switch (hdr->hdr.l3.id) {
 		case QETH_HEADER_TYPE_LAYER3:
 			magic = *(__u16 *)skb->data;
-			if ((card->info.type == QETH_CARD_TYPE_IQD) &&
-			    (magic == ETH_P_AF_IUCV)) {
+			if (IS_IQD(card) && magic == ETH_P_AF_IUCV) {
 				len = skb->len;
 				dev_hard_header(skb, dev, ETH_P_AF_IUCV,
 						dev->dev_addr, "FAKELL", len);
@@ -1454,7 +1453,7 @@ qeth_l3_handle_promisc_mode(struct qeth_card *card)
 	     (card->info.promisc_mode == SET_PROMISC_MODE_OFF)))
 		return;
 
-	if (card->info.guestlan) {		/* Guestlan trace */
+	if (IS_VM_NIC(card)) {		/* Guestlan trace */
 		if (qeth_adp_supported(card, IPA_SETADP_SET_PROMISC_MODE))
 			qeth_setadp_promisc_mode(card);
 	} else if (card->options.sniffer &&	/* HiperSockets trace */
@@ -1554,7 +1553,7 @@ static int qeth_l3_arp_set_no_entries(struct qeth_card *card, int no_entries)
 	 * IPA_CMD_ASS_ARP_QUERY_INFO, but not IPA_CMD_ASS_ARP_SET_NO_ENTRIES;
 	 * thus we say EOPNOTSUPP for this ARP function
 	 */
-	if (card->info.guestlan)
+	if (IS_VM_NIC(card))
 		return -EOPNOTSUPP;
 	if (!qeth_is_supported(card, IPA_ARP_PROCESSING)) {
 		return -EOPNOTSUPP;
@@ -1786,7 +1785,7 @@ static int qeth_l3_arp_modify_entry(struct qeth_card *card,
 	 * IPA_CMD_ASS_ARP_QUERY_INFO, but not IPA_CMD_ASS_ARP_ADD_ENTRY;
 	 * thus we say EOPNOTSUPP for this ARP function
 	 */
-	if (card->info.guestlan)
+	if (IS_VM_NIC(card))
 		return -EOPNOTSUPP;
 	if (!qeth_is_supported(card, IPA_ARP_PROCESSING)) {
 		return -EOPNOTSUPP;
@@ -1819,7 +1818,7 @@ static int qeth_l3_arp_flush_cache(struct qeth_card *card)
 	 * IPA_CMD_ASS_ARP_QUERY_INFO, but not IPA_CMD_ASS_ARP_FLUSH_CACHE;
 	 * thus we say EOPNOTSUPP for this ARP function
 	*/
-	if (card->info.guestlan || (card->info.type == QETH_CARD_TYPE_IQD))
+	if (IS_VM_NIC(card) || IS_IQD(card))
 		return -EOPNOTSUPP;
 	if (!qeth_is_supported(card, IPA_ARP_PROCESSING)) {
 		return -EOPNOTSUPP;
@@ -2010,7 +2009,7 @@ static void qeth_l3_fill_header(struct qeth_card *card, struct qeth_hdr *hdr,
 			l3_hdr->next_hop.ipv6_addr = ipv6_hdr(skb)->daddr;
 
 		hdr->hdr.l3.flags |= QETH_HDR_IPV6;
-		if (card->info.type != QETH_CARD_TYPE_IQD)
+		if (!IS_IQD(card))
 			hdr->hdr.l3.flags |= QETH_HDR_PASSTHRU;
 	}
 	rcu_read_unlock();
@@ -2178,8 +2177,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
 	unsigned int headroom;
 	int rc;
 
-	if (card->info.type == QETH_CARD_TYPE_OSD ||
-	    card->info.type == QETH_CARD_TYPE_OSX) {
+	if (IS_OSD(card) || IS_OSX(card)) {
 		if ((card->info.link_type == QETH_LINK_TYPE_LANE_TR) ||
 		    (card->info.link_type == QETH_LINK_TYPE_HSTR)) {
 			pr_info("qeth_l3: ignoring TR device\n");
@@ -2193,7 +2191,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
 		if (!(card->info.unique_id & UNIQUE_ID_NOT_BY_CARD))
 			card->dev->dev_id = card->info.unique_id & 0xffff;
 
-		if (!card->info.guestlan) {
+		if (!IS_VM_NIC(card)) {
 			card->dev->features |= NETIF_F_SG;
 			card->dev->hw_features |= NETIF_F_TSO |
 				NETIF_F_RXCSUM | NETIF_F_IP_CSUM;
@@ -2217,7 +2215,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
 			headroom = sizeof(struct qeth_hdr_tso);
 		else
 			headroom = sizeof(struct qeth_hdr) + VLAN_HLEN;
-	} else if (card->info.type == QETH_CARD_TYPE_IQD) {
+	} else if (IS_IQD(card)) {
 		card->dev->flags |= IFF_NOARP;
 		card->dev->netdev_ops = &qeth_l3_netdev_ops;
 		headroom = sizeof(struct qeth_hdr) - ETH_HLEN;
