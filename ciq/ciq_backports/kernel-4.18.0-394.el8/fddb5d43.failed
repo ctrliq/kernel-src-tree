@@ -1,0 +1,582 @@
+open: introduce openat2(2) syscall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Aleksa Sarai <cyphar@cyphar.com>
+commit fddb5d430ad9fa91b49b1d34d0202ffe2fa0e179
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/fddb5d43.failed
+
+/* Background. */
+For a very long time, extending openat(2) with new features has been
+incredibly frustrating. This stems from the fact that openat(2) is
+possibly the most famous counter-example to the mantra "don't silently
+accept garbage from userspace" -- it doesn't check whether unknown flags
+are present[1].
+
+This means that (generally) the addition of new flags to openat(2) has
+been fraught with backwards-compatibility issues (O_TMPFILE has to be
+defined as __O_TMPFILE|O_DIRECTORY|[O_RDWR or O_WRONLY] to ensure old
+kernels gave errors, since it's insecure to silently ignore the
+flag[2]). All new security-related flags therefore have a tough road to
+being added to openat(2).
+
+Userspace also has a hard time figuring out whether a particular flag is
+supported on a particular kernel. While it is now possible with
+contemporary kernels (thanks to [3]), older kernels will expose unknown
+flag bits through fcntl(F_GETFL). Giving a clear -EINVAL during
+openat(2) time matches modern syscall designs and is far more
+fool-proof.
+
+In addition, the newly-added path resolution restriction LOOKUP flags
+(which we would like to expose to user-space) don't feel related to the
+pre-existing O_* flag set -- they affect all components of path lookup.
+We'd therefore like to add a new flag argument.
+
+Adding a new syscall allows us to finally fix the flag-ignoring problem,
+and we can make it extensible enough so that we will hopefully never
+need an openat3(2).
+
+/* Syscall Prototype. */
+  /*
+   * open_how is an extensible structure (similar in interface to
+   * clone3(2) or sched_setattr(2)). The size parameter must be set to
+   * sizeof(struct open_how), to allow for future extensions. All future
+   * extensions will be appended to open_how, with their zero value
+   * acting as a no-op default.
+   */
+  struct open_how { /* ... */ };
+
+  int openat2(int dfd, const char *pathname,
+              struct open_how *how, size_t size);
+
+/* Description. */
+The initial version of 'struct open_how' contains the following fields:
+
+  flags
+    Used to specify openat(2)-style flags. However, any unknown flag
+    bits or otherwise incorrect flag combinations (like O_PATH|O_RDWR)
+    will result in -EINVAL. In addition, this field is 64-bits wide to
+    allow for more O_ flags than currently permitted with openat(2).
+
+  mode
+    The file mode for O_CREAT or O_TMPFILE.
+
+    Must be set to zero if flags does not contain O_CREAT or O_TMPFILE.
+
+  resolve
+    Restrict path resolution (in contrast to O_* flags they affect all
+    path components). The current set of flags are as follows (at the
+    moment, all of the RESOLVE_ flags are implemented as just passing
+    the corresponding LOOKUP_ flag).
+
+    RESOLVE_NO_XDEV       => LOOKUP_NO_XDEV
+    RESOLVE_NO_SYMLINKS   => LOOKUP_NO_SYMLINKS
+    RESOLVE_NO_MAGICLINKS => LOOKUP_NO_MAGICLINKS
+    RESOLVE_BENEATH       => LOOKUP_BENEATH
+    RESOLVE_IN_ROOT       => LOOKUP_IN_ROOT
+
+open_how does not contain an embedded size field, because it is of
+little benefit (userspace can figure out the kernel open_how size at
+runtime fairly easily without it). It also only contains u64s (even
+though ->mode arguably should be a u16) to avoid having padding fields
+which are never used in the future.
+
+Note that as a result of the new how->flags handling, O_PATH|O_TMPFILE
+is no longer permitted for openat(2). As far as I can tell, this has
+always been a bug and appears to not be used by userspace (and I've not
+seen any problems on my machines by disallowing it). If it turns out
+this breaks something, we can special-case it and only permit it for
+openat(2) but not openat2(2).
+
+After input from Florian Weimer, the new open_how and flag definitions
+are inside a separate header from uapi/linux/fcntl.h, to avoid problems
+that glibc has with importing that header.
+
+/* Testing. */
+In a follow-up patch there are over 200 selftests which ensure that this
+syscall has the correct semantics and will correctly handle several
+attack scenarios.
+
+In addition, I've written a userspace library[4] which provides
+convenient wrappers around openat2(RESOLVE_IN_ROOT) (this is necessary
+because no other syscalls support RESOLVE_IN_ROOT, and thus lots of care
+must be taken when using RESOLVE_IN_ROOT'd file descriptors with other
+syscalls). During the development of this patch, I've run numerous
+verification tests using libpathrs (showing that the API is reasonably
+usable by userspace).
+
+/* Future Work. */
+Additional RESOLVE_ flags have been suggested during the review period.
+These can be easily implemented separately (such as blocking auto-mount
+during resolution).
+
+Furthermore, there are some other proposed changes to the openat(2)
+interface (the most obvious example is magic-link hardening[5]) which
+would be a good opportunity to add a way for userspace to restrict how
+O_PATH file descriptors can be re-opened.
+
+Another possible avenue of future work would be some kind of
+CHECK_FIELDS[6] flag which causes the kernel to indicate to userspace
+which openat2(2) flags and fields are supported by the current kernel
+(to avoid userspace having to go through several guesses to figure it
+out).
+
+[1]: https://lwn.net/Articles/588444/
+[2]: https://lore.kernel.org/lkml/CA+55aFyyxJL1LyXZeBsf2ypriraj5ut1XkNDsunRBqgVjZU_6Q@mail.gmail.com
+[3]: commit 629e014bb834 ("fs: completely ignore unknown open flags")
+[4]: https://sourceware.org/bugzilla/show_bug.cgi?id=17523
+[5]: https://lore.kernel.org/lkml/20190930183316.10190-2-cyphar@cyphar.com/
+[6]: https://youtu.be/ggD-eb3yPVs
+
+	Suggested-by: Christian Brauner <christian.brauner@ubuntu.com>
+	Signed-off-by: Aleksa Sarai <cyphar@cyphar.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit fddb5d430ad9fa91b49b1d34d0202ffe2fa0e179)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/alpha/kernel/syscalls/syscall.tbl
+#	arch/arm/tools/syscall.tbl
+#	arch/arm64/include/asm/unistd.h
+#	arch/arm64/include/asm/unistd32.h
+#	arch/ia64/kernel/syscalls/syscall.tbl
+#	arch/m68k/kernel/syscalls/syscall.tbl
+#	arch/microblaze/kernel/syscalls/syscall.tbl
+#	arch/mips/kernel/syscalls/syscall_n32.tbl
+#	arch/mips/kernel/syscalls/syscall_o32.tbl
+#	arch/parisc/kernel/syscalls/syscall.tbl
+#	arch/powerpc/kernel/syscalls/syscall.tbl
+#	arch/s390/kernel/syscalls/syscall.tbl
+#	arch/sh/kernel/syscalls/syscall.tbl
+#	arch/sparc/kernel/syscalls/syscall.tbl
+#	arch/x86/entry/syscalls/syscall_32.tbl
+#	arch/x86/entry/syscalls/syscall_64.tbl
+#	arch/xtensa/kernel/syscalls/syscall.tbl
+#	fs/open.c
+#	include/linux/syscalls.h
+#	include/uapi/asm-generic/unistd.h
+#	tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
+diff --cc arch/arm/tools/syscall.tbl
+index f70b0bb2dd1f,4ba54bc7e19a..000000000000
+--- a/arch/arm/tools/syscall.tbl
++++ b/arch/arm/tools/syscall.tbl
+@@@ -413,15 -413,40 +413,30 @@@
+  396	common	pkey_free		sys_pkey_free
+  397	common	statx			sys_statx
+  398	common	rseq			sys_rseq
+ -399	common	io_pgetevents		sys_io_pgetevents_time32
+ -400	common	migrate_pages		sys_migrate_pages
+ -401	common	kexec_file_load		sys_kexec_file_load
+ -# 402 is unused
+ -403	common	clock_gettime64			sys_clock_gettime
+ -404	common	clock_settime64			sys_clock_settime
+ -405	common	clock_adjtime64			sys_clock_adjtime
+ -406	common	clock_getres_time64		sys_clock_getres
+ -407	common	clock_nanosleep_time64		sys_clock_nanosleep
+ -408	common	timer_gettime64			sys_timer_gettime
+ -409	common	timer_settime64			sys_timer_settime
+ -410	common	timerfd_gettime64		sys_timerfd_gettime
+ -411	common	timerfd_settime64		sys_timerfd_settime
+ -412	common	utimensat_time64		sys_utimensat
+ -413	common	pselect6_time64			sys_pselect6
+ -414	common	ppoll_time64			sys_ppoll
+ -416	common	io_pgetevents_time64		sys_io_pgetevents
+ -417	common	recvmmsg_time64			sys_recvmmsg
+ -418	common	mq_timedsend_time64		sys_mq_timedsend
+ -419	common	mq_timedreceive_time64		sys_mq_timedreceive
+ -420	common	semtimedop_time64		sys_semtimedop
+ -421	common	rt_sigtimedwait_time64		sys_rt_sigtimedwait
+ -422	common	futex_time64			sys_futex
+ -423	common	sched_rr_get_interval_time64	sys_sched_rr_get_interval
+  424	common	pidfd_send_signal		sys_pidfd_send_signal
+++<<<<<<< HEAD
+ +425	common	io_uring_setup		sys_io_uring_setup
+ +426	common	io_uring_enter		sys_io_uring_enter
+ +427	common	io_uring_register	sys_io_uring_register
+ +428	common	open_tree		sys_open_tree
+ +429	common	move_mount		sys_move_mount
+ +430	common	fsopen			sys_fsopen
+ +431	common	fsconfig		sys_fsconfig
+ +432	common	fsmount			sys_fsmount
+ +433	common	fspick			sys_fspick
+ +436	common	close_range		sys_close_range
+ +439	common	faccessat2		sys_faccessat2
+++=======
++ 425	common	io_uring_setup			sys_io_uring_setup
++ 426	common	io_uring_enter			sys_io_uring_enter
++ 427	common	io_uring_register		sys_io_uring_register
++ 428	common	open_tree			sys_open_tree
++ 429	common	move_mount			sys_move_mount
++ 430	common	fsopen				sys_fsopen
++ 431	common	fsconfig			sys_fsconfig
++ 432	common	fsmount				sys_fsmount
++ 433	common	fspick				sys_fspick
++ 434	common	pidfd_open			sys_pidfd_open
++ 435	common	clone3				sys_clone3
++ 437	common	openat2				sys_openat2
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+diff --cc arch/arm64/include/asm/unistd.h
+index 90cf35e237bb,8aa00ccb0b96..000000000000
+--- a/arch/arm64/include/asm/unistd.h
++++ b/arch/arm64/include/asm/unistd.h
+@@@ -49,7 -38,7 +49,11 @@@
+  #define __ARM_NR_compat_set_tls		(__ARM_NR_COMPAT_BASE + 5)
+  #define __ARM_NR_COMPAT_END		(__ARM_NR_COMPAT_BASE + 0x800)
+  
+++<<<<<<< HEAD
+ +#define __NR_compat_syscalls		440
+++=======
++ #define __NR_compat_syscalls		438
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+  #endif
+  
+  #define __ARCH_WANT_SYS_CLONE
+diff --cc arch/arm64/include/asm/unistd32.h
+index 4a2dce9fb679,57f6f592d460..000000000000
+--- a/arch/arm64/include/asm/unistd32.h
++++ b/arch/arm64/include/asm/unistd32.h
+@@@ -872,10 -875,12 +872,19 @@@ __SYSCALL(__NR_fsconfig, sys_fsconfig
+  __SYSCALL(__NR_fsmount, sys_fsmount)
+  #define __NR_fspick 433
+  __SYSCALL(__NR_fspick, sys_fspick)
+++<<<<<<< HEAD
+ +#define __NR_close_range 436
+ +__SYSCALL(__NR_close_range, sys_close_range)
+ +#define __NR_faccessat2 439
+ +__SYSCALL(__NR_faccessat2, sys_faccessat2)
+++=======
++ #define __NR_pidfd_open 434
++ __SYSCALL(__NR_pidfd_open, sys_pidfd_open)
++ #define __NR_clone3 435
++ __SYSCALL(__NR_clone3, sys_clone3)
++ #define __NR_openat2 437
++ __SYSCALL(__NR_openat2, sys_openat2)
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+  
+  /*
+   * Please add new compat syscalls above this comment and update
+diff --cc arch/s390/kernel/syscalls/syscall.tbl
+index 9a7323eac367,16b571c06161..000000000000
+--- a/arch/s390/kernel/syscalls/syscall.tbl
++++ b/arch/s390/kernel/syscalls/syscall.tbl
+@@@ -417,5 -436,6 +417,11 @@@
+  431  common	fsconfig		sys_fsconfig			sys_fsconfig
+  432  common	fsmount			sys_fsmount			sys_fsmount
+  433  common	fspick			sys_fspick			sys_fspick
+++<<<<<<< HEAD
+ +436  common	close_range		sys_close_range			sys_close_range
+ +439  common	faccessat2		sys_faccessat2			sys_faccessat2
+++=======
++ 434  common	pidfd_open		sys_pidfd_open			sys_pidfd_open
++ 435  common	clone3			sys_clone3			sys_clone3
++ 437  common	openat2			sys_openat2			sys_openat2
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+diff --cc arch/x86/entry/syscalls/syscall_32.tbl
+index 566e48a016fb,d22a8b5c3fab..000000000000
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@@ -424,5 -438,6 +424,11 @@@
+  431	i386	fsconfig		sys_fsconfig			__ia32_sys_fsconfig
+  432	i386	fsmount			sys_fsmount			__ia32_sys_fsmount
+  433	i386	fspick			sys_fspick			__ia32_sys_fspick
+++<<<<<<< HEAD
+ +436	i386	close_range		sys_close_range			__ia32_sys_close_range
+ +439	i386	faccessat2		sys_faccessat2			__ia32_sys_faccessat2
+++=======
++ 434	i386	pidfd_open		sys_pidfd_open			__ia32_sys_pidfd_open
++ 435	i386	clone3			sys_clone3			__ia32_sys_clone3
++ 437	i386	openat2			sys_openat2			__ia32_sys_openat2
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+diff --cc arch/x86/entry/syscalls/syscall_64.tbl
+index fb85e5c4352a,9035647ef236..000000000000
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@@ -353,8 -355,9 +353,14 @@@
+  431	common	fsconfig		__x64_sys_fsconfig
+  432	common	fsmount			__x64_sys_fsmount
+  433	common	fspick			__x64_sys_fspick
+++<<<<<<< HEAD
+ +436	common	close_range		__x64_sys_close_range
+ +439	common	faccessat2		__x64_sys_faccessat2
+++=======
++ 434	common	pidfd_open		__x64_sys_pidfd_open
++ 435	common	clone3			__x64_sys_clone3/ptregs
++ 437	common	openat2			__x64_sys_openat2
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+  
+  #
+  # x32-specific system call numbers start at 512 to avoid cache impact
+diff --cc fs/open.c
+index d6677a68e98d,8cdb2b675867..000000000000
+--- a/fs/open.c
++++ b/fs/open.c
+@@@ -967,8 -955,29 +967,33 @@@ struct file *open_with_fake_path(const 
+  }
+  EXPORT_SYMBOL(open_with_fake_path);
+  
+++<<<<<<< HEAD
+ +inline int build_open_flags(int flags, umode_t mode, struct open_flags *op)
+++=======
++ #define WILL_CREATE(flags)	(flags & (O_CREAT | __O_TMPFILE))
++ #define O_PATH_FLAGS		(O_DIRECTORY | O_NOFOLLOW | O_PATH | O_CLOEXEC)
++ 
++ static inline struct open_how build_open_how(int flags, umode_t mode)
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
++ {
++ 	struct open_how how = {
++ 		.flags = flags & VALID_OPEN_FLAGS,
++ 		.mode = mode & S_IALLUGO,
++ 	};
++ 
++ 	/* O_PATH beats everything else. */
++ 	if (how.flags & O_PATH)
++ 		how.flags &= O_PATH_FLAGS;
++ 	/* Modes should only be set for create-like flags. */
++ 	if (!WILL_CREATE(how.flags))
++ 		how.mode = 0;
++ 	return how;
++ }
++ 
++ static inline int build_open_flags(const struct open_how *how,
++ 				   struct open_flags *op)
+  {
++ 	int flags = how->flags;
+  	int lookup_flags = 0;
+  	int acc_mode = ACC_MODE(flags);
+  
+diff --cc include/linux/syscalls.h
+index 73aa03c6a978,cd9f27cbc567..000000000000
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@@ -70,6 -68,8 +70,11 @@@ struct sigaltstack
+  struct rseq;
+  union bpf_attr;
+  struct io_uring_params;
+++<<<<<<< HEAD
+++=======
++ struct clone_args;
++ struct open_how;
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+  
+  #include <linux/types.h>
+  #include <linux/aio_abi.h>
+@@@ -431,9 -440,9 +436,11 @@@ asmlinkage long sys_fchownat(int dfd, c
+  asmlinkage long sys_fchown(unsigned int fd, uid_t user, gid_t group);
+  asmlinkage long sys_openat(int dfd, const char __user *filename, int flags,
+  			   umode_t mode);
++ asmlinkage long sys_openat2(int dfd, const char __user *filename,
++ 			    struct open_how *how, size_t size);
+  asmlinkage long sys_close(unsigned int fd);
+ +asmlinkage long sys_close_range(unsigned int fd, unsigned int max_fd,
+ +				unsigned int flags);
+  asmlinkage long sys_vhangup(void);
+  
+  /* fs/pipe.c */
+diff --cc include/uapi/asm-generic/unistd.h
+index bac2ad467986,d4122c091472..000000000000
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@@ -792,13 -844,18 +792,20 @@@ __SYSCALL(__NR_fsconfig, sys_fsconfig
+  __SYSCALL(__NR_fsmount, sys_fsmount)
+  #define __NR_fspick 433
+  __SYSCALL(__NR_fspick, sys_fspick)
+ -#define __NR_pidfd_open 434
+ -__SYSCALL(__NR_pidfd_open, sys_pidfd_open)
+ -#ifdef __ARCH_WANT_SYS_CLONE3
+ -#define __NR_clone3 435
+ -__SYSCALL(__NR_clone3, sys_clone3)
+ -#endif
+ +#define __NR_close_range 436
+ +__SYSCALL(__NR_close_range, sys_close_range)
+ +#define __NR_faccessat2 439
+ +__SYSCALL(__NR_faccessat2, sys_faccessat2)
+  
++ #define __NR_openat2 437
++ __SYSCALL(__NR_openat2, sys_openat2)
++ 
+  #undef __NR_syscalls
+++<<<<<<< HEAD
+ +#define __NR_syscalls 440
+++=======
++ #define __NR_syscalls 438
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall)
+  
+  /*
+   * 32 bit systems traditionally used different
+diff --cc tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
+index 91649690b52f,42a72d010050..000000000000
+--- a/tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
++++ b/tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
+@@@ -350,9 -350,4 +350,13 @@@
+  433	n64	fspick				sys_fspick
+  434	n64	pidfd_open			sys_pidfd_open
+  435	n64	clone3				__sys_clone3
+++<<<<<<< HEAD:tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
+ +436	n64	close_range			sys_close_range
+  437	n64	openat2				sys_openat2
+ +438	n64	pidfd_getfd			sys_pidfd_getfd
+ +439	n64	faccessat2			sys_faccessat2
+ +440	n64	process_madvise			sys_process_madvise
+ +441	n64	epoll_pwait2			sys_epoll_pwait2
+++=======
+++437	n64	openat2				sys_openat2
+++>>>>>>> fddb5d430ad9 (open: introduce openat2(2) syscall):arch/mips/kernel/syscalls/syscall_n64.tbl
+* Unmerged path arch/alpha/kernel/syscalls/syscall.tbl
+* Unmerged path arch/ia64/kernel/syscalls/syscall.tbl
+* Unmerged path arch/m68k/kernel/syscalls/syscall.tbl
+* Unmerged path arch/microblaze/kernel/syscalls/syscall.tbl
+* Unmerged path arch/mips/kernel/syscalls/syscall_n32.tbl
+* Unmerged path arch/mips/kernel/syscalls/syscall_o32.tbl
+* Unmerged path arch/parisc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/powerpc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/sh/kernel/syscalls/syscall.tbl
+* Unmerged path arch/sparc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/xtensa/kernel/syscalls/syscall.tbl
+diff --git a/CREDITS b/CREDITS
+index 989cda91c427..7c2067a01413 100644
+--- a/CREDITS
++++ b/CREDITS
+@@ -3276,7 +3276,9 @@ S: France
+ N: Aleksa Sarai
+ E: cyphar@cyphar.com
+ W: https://www.cyphar.com/
+-D: `pids` cgroup subsystem
++D: /sys/fs/cgroup/pids
++D: openat2(2)
++S: Sydney, Australia
+ 
+ N: Dipankar Sarma
+ E: dipankar@in.ibm.com
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 9af1bc4f9a3c..a4fd38e1b4dc 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -5692,6 +5692,7 @@ S:	Maintained
+ F:	fs/*
+ F:	include/linux/fs.h
+ F:	include/uapi/linux/fs.h
++F:	include/uapi/linux/openat2.h
+ 
+ FINTEK F75375S HARDWARE MONITOR AND FAN CONTROLLER DRIVER
+ M:	Riku Voipio <riku.voipio@iki.fi>
+* Unmerged path arch/alpha/kernel/syscalls/syscall.tbl
+* Unmerged path arch/arm/tools/syscall.tbl
+* Unmerged path arch/arm64/include/asm/unistd.h
+* Unmerged path arch/arm64/include/asm/unistd32.h
+* Unmerged path arch/ia64/kernel/syscalls/syscall.tbl
+* Unmerged path arch/m68k/kernel/syscalls/syscall.tbl
+* Unmerged path arch/microblaze/kernel/syscalls/syscall.tbl
+* Unmerged path arch/mips/kernel/syscalls/syscall_n32.tbl
+* Unmerged path arch/mips/kernel/syscalls/syscall_o32.tbl
+* Unmerged path arch/parisc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/powerpc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/s390/kernel/syscalls/syscall.tbl
+* Unmerged path arch/sh/kernel/syscalls/syscall.tbl
+* Unmerged path arch/sparc/kernel/syscalls/syscall.tbl
+* Unmerged path arch/x86/entry/syscalls/syscall_32.tbl
+* Unmerged path arch/x86/entry/syscalls/syscall_64.tbl
+* Unmerged path arch/xtensa/kernel/syscalls/syscall.tbl
+* Unmerged path fs/open.c
+diff --git a/include/linux/fcntl.h b/include/linux/fcntl.h
+index 27dc7a60693e..8d0159145673 100644
+--- a/include/linux/fcntl.h
++++ b/include/linux/fcntl.h
+@@ -2,15 +2,29 @@
+ #ifndef _LINUX_FCNTL_H
+ #define _LINUX_FCNTL_H
+ 
++#include <linux/stat.h>
+ #include <uapi/linux/fcntl.h>
+ 
+-/* list of all valid flags for the open/openat flags argument: */
++/* List of all valid flags for the open/openat flags argument: */
+ #define VALID_OPEN_FLAGS \
+ 	(O_RDONLY | O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | \
+ 	 O_APPEND | O_NDELAY | O_NONBLOCK | O_NDELAY | __O_SYNC | O_DSYNC | \
+ 	 FASYNC	| O_DIRECT | O_LARGEFILE | O_DIRECTORY | O_NOFOLLOW | \
+ 	 O_NOATIME | O_CLOEXEC | O_PATH | __O_TMPFILE)
+ 
++/* List of all valid flags for the how->upgrade_mask argument: */
++#define VALID_UPGRADE_FLAGS \
++	(UPGRADE_NOWRITE | UPGRADE_NOREAD)
++
++/* List of all valid flags for the how->resolve argument: */
++#define VALID_RESOLVE_FLAGS \
++	(RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | \
++	 RESOLVE_BENEATH | RESOLVE_IN_ROOT)
++
++/* List of all open_how "versions". */
++#define OPEN_HOW_SIZE_VER0	24 /* sizeof first published struct */
++#define OPEN_HOW_SIZE_LATEST	OPEN_HOW_SIZE_VER0
++
+ #ifndef force_o_largefile
+ #define force_o_largefile() (BITS_PER_LONG != 32)
+ #endif
+* Unmerged path include/linux/syscalls.h
+* Unmerged path include/uapi/asm-generic/unistd.h
+diff --git a/include/uapi/linux/fcntl.h b/include/uapi/linux/fcntl.h
+index 83ddb5151505..7968dede2eab 100644
+--- a/include/uapi/linux/fcntl.h
++++ b/include/uapi/linux/fcntl.h
+@@ -3,6 +3,7 @@
+ #define _UAPI_LINUX_FCNTL_H
+ 
+ #include <asm/fcntl.h>
++#include <linux/openat2.h>
+ 
+ #define F_SETLEASE	(F_LINUX_SPECIFIC_BASE + 0)
+ #define F_GETLEASE	(F_LINUX_SPECIFIC_BASE + 1)
+@@ -109,5 +110,4 @@
+ 
+ #define AT_RECURSIVE		0x8000	/* Apply to the entire subtree */
+ 
+-
+ #endif /* _UAPI_LINUX_FCNTL_H */
+diff --git a/include/uapi/linux/openat2.h b/include/uapi/linux/openat2.h
+new file mode 100644
+index 000000000000..58b1eb711360
+--- /dev/null
++++ b/include/uapi/linux/openat2.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 WITH Linux-syscall-note */
++#ifndef _UAPI_LINUX_OPENAT2_H
++#define _UAPI_LINUX_OPENAT2_H
++
++#include <linux/types.h>
++
++/*
++ * Arguments for how openat2(2) should open the target path. If only @flags and
++ * @mode are non-zero, then openat2(2) operates very similarly to openat(2).
++ *
++ * However, unlike openat(2), unknown or invalid bits in @flags result in
++ * -EINVAL rather than being silently ignored. @mode must be zero unless one of
++ * {O_CREAT, O_TMPFILE} are set.
++ *
++ * @flags: O_* flags.
++ * @mode: O_CREAT/O_TMPFILE file mode.
++ * @resolve: RESOLVE_* flags.
++ */
++struct open_how {
++	__u64 flags;
++	__u64 mode;
++	__u64 resolve;
++};
++
++/* how->resolve flags for openat2(2). */
++#define RESOLVE_NO_XDEV		0x01 /* Block mount-point crossings
++					(includes bind-mounts). */
++#define RESOLVE_NO_MAGICLINKS	0x02 /* Block traversal through procfs-style
++					"magic-links". */
++#define RESOLVE_NO_SYMLINKS	0x04 /* Block traversal through all symlinks
++					(implies OEXT_NO_MAGICLINKS) */
++#define RESOLVE_BENEATH		0x08 /* Block "lexical" trickery like
++					"..", symlinks, and absolute
++					paths which escape the dirfd. */
++#define RESOLVE_IN_ROOT		0x10 /* Make all jumps to "/" and ".."
++					be scoped inside the dirfd
++					(similar to chroot(2)). */
++
++#endif /* _UAPI_LINUX_OPENAT2_H */
+* Unmerged path tools/perf/arch/mips/entry/syscalls/syscall_n64.tbl
