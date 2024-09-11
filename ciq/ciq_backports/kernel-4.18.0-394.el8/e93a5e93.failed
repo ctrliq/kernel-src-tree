@@ -1,0 +1,122 @@
+NFSv4: Add support for application leases underpinned by a delegation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit e93a5e9306a576011f03011b492d4fbaa274477b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/e93a5e93.failed
+
+If the NFSv4 client already holds a delegation for a file, then we can
+support application leases (i.e. fcntl(fd, F_SETLEASE,...)) because the
+underlying delegation guarantees that the file is not being modified on
+the server by another client in a way that might conflict with the lease
+guarantees.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit e93a5e9306a576011f03011b492d4fbaa274477b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/nfs4_fs.h
+diff --cc fs/nfs/nfs4_fs.h
+index 72ee4f81460e,ba78df4b13d9..000000000000
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@@ -316,7 -316,15 +316,19 @@@ extern int nfs4_set_rw_stateid(nfs4_sta
+  		const struct nfs_open_context *ctx,
+  		const struct nfs_lock_context *l_ctx,
+  		fmode_t fmode);
+- 
+++<<<<<<< HEAD
+++
+++=======
++ extern int nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
++ 			     struct nfs_fattr *fattr, struct nfs4_label *label,
++ 			     struct inode *inode);
++ extern int update_open_stateid(struct nfs4_state *state,
++ 				const nfs4_stateid *open_stateid,
++ 				const nfs4_stateid *deleg_stateid,
++ 				fmode_t fmode);
++ extern int nfs4_proc_setlease(struct file *file, long arg,
++ 			      struct file_lock **lease, void **priv);
+++>>>>>>> e93a5e9306a5 (NFSv4: Add support for application leases underpinned by a delegation)
+  extern int nfs4_proc_get_lease_time(struct nfs_client *clp,
+  		struct nfs_fsinfo *fsinfo);
+  extern void nfs4_update_changeattr(struct inode *dir,
+* Unmerged path fs/nfs/nfs4_fs.h
+diff --git a/fs/nfs/nfs4file.c b/fs/nfs/nfs4file.c
+index 0438c84fad10..cf17c1e91f76 100644
+--- a/fs/nfs/nfs4file.c
++++ b/fs/nfs/nfs4file.c
+@@ -272,6 +272,12 @@ static loff_t nfs42_remap_file_range(struct file *src_file, loff_t src_off,
+ }
+ #endif /* CONFIG_NFS_V4_2 */
+ 
++static int nfs4_setlease(struct file *file, long arg, struct file_lock **lease,
++			 void **priv)
++{
++	return nfs4_proc_setlease(file, arg, lease, priv);
++}
++
+ const struct file_operations nfs4_file_operations = {
+ 	.read_iter	= nfs_file_read,
+ 	.write_iter	= nfs_file_write,
+@@ -285,7 +291,7 @@ const struct file_operations nfs4_file_operations = {
+ 	.splice_read	= generic_file_splice_read,
+ 	.splice_write	= iter_file_splice_write,
+ 	.check_flags	= nfs_check_flags,
+-	.setlease	= simple_nosetlease,
++	.setlease	= nfs4_setlease,
+ #ifdef CONFIG_NFS_V4_2
+ 	.copy_file_range = nfs4_copy_file_range,
+ 	.llseek		= nfs4_file_llseek,
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 2b64b461b599..138a5714424c 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -7389,6 +7389,43 @@ nfs4_proc_lock(struct file *filp, int cmd, struct file_lock *request)
+ 	return nfs4_retry_setlk(state, cmd, request);
+ }
+ 
++static int nfs4_delete_lease(struct file *file, void **priv)
++{
++	return generic_setlease(file, F_UNLCK, NULL, priv);
++}
++
++static int nfs4_add_lease(struct file *file, long arg, struct file_lock **lease,
++			  void **priv)
++{
++	struct inode *inode = file_inode(file);
++	fmode_t type = arg == F_RDLCK ? FMODE_READ : FMODE_WRITE;
++	int ret;
++
++	/* No delegation, no lease */
++	if (!nfs4_have_delegation(inode, type))
++		return -ENOLCK;
++	ret = generic_setlease(file, arg, lease, priv);
++	if (ret || nfs4_have_delegation(inode, type))
++		return ret;
++	/* We raced with a delegation return */
++	nfs4_delete_lease(file, priv);
++	return -ENOLCK;
++}
++
++int nfs4_proc_setlease(struct file *file, long arg, struct file_lock **lease,
++		       void **priv)
++{
++	switch (arg) {
++	case F_RDLCK:
++	case F_WRLCK:
++		return nfs4_add_lease(file, arg, lease, priv);
++	case F_UNLCK:
++		return nfs4_delete_lease(file, priv);
++	default:
++		return -EINVAL;
++	}
++}
++
+ int nfs4_lock_delegation_recall(struct file_lock *fl, struct nfs4_state *state, const nfs4_stateid *stateid)
+ {
+ 	struct nfs_server *server = NFS_SERVER(state->inode);
