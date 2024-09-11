@@ -1,0 +1,164 @@
+io_uring: reduce/pack size of io_ring_ctx
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 206aefde4f886fdeb3b6339aacab3a85fb74cb7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/206aefde.failed
+
+With the recent flurry of additions and changes to io_uring, the
+layout of io_ring_ctx has become a bit stale. We're right now at
+704 bytes in size on my x86-64 build, or 11 cachelines. This
+patch does two things:
+
+- We have to completion structs embedded, that we only use for
+  quiesce of the ctx (or shutdown) and for sqthread init cases.
+  That 2x32 bytes right there, let's dynamically allocate them.
+
+- Reorder the struct a bit with an eye on cachelines, use cases,
+  and holes.
+
+With this patch, we're down to 512 bytes, or 8 cachelines.
+
+	Reviewed-by: Jackie Liu <liuyun01@kylinos.cn>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 206aefde4f886fdeb3b6339aacab3a85fb74cb7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,710eb27bf379..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -222,28 -203,24 +222,38 @@@ struct io_ring_ctx 
+  		unsigned		sq_entries;
+  		unsigned		sq_mask;
+  		unsigned		sq_thread_idle;
+++<<<<<<< HEAD
+++=======
++ 		unsigned		cached_sq_dropped;
++ 		atomic_t		cached_cq_overflow;
+++>>>>>>> 206aefde4f88 (io_uring: reduce/pack size of io_ring_ctx)
+  		struct io_uring_sqe	*sq_sqes;
+  
+  		struct list_head	defer_list;
+ -		struct list_head	timeout_list;
+ -		struct list_head	cq_overflow_list;
+ -
+ -		wait_queue_head_t	inflight_wait;
+  	} ____cacheline_aligned_in_smp;
+  
++ 	struct io_rings	*rings;
++ 
+  	/* IO offload */
+ -	struct io_wq		*io_wq;
+ +	struct workqueue_struct	*sqo_wq[2];
+  	struct task_struct	*sqo_thread;	/* if using sq thread polling */
+  	struct mm_struct	*sqo_mm;
+  	wait_queue_head_t	sqo_wait;
+++<<<<<<< HEAD
+ +	struct completion	sqo_thread_started;
+ +
+ +	struct {
+ +		/* CQ ring */
+ +		struct io_cq_ring	*cq_ring;
+ +		unsigned		cached_cq_tail;
+ +		unsigned		cq_entries;
+ +		unsigned		cq_mask;
+ +		struct wait_queue_head	cq_wait;
+ +		struct fasync_struct	*cq_fasync;
+ +		struct eventfd_ctx	*cq_ev_fd;
+ +	} ____cacheline_aligned_in_smp;
+++=======
+++>>>>>>> 206aefde4f88 (io_uring: reduce/pack size of io_ring_ctx)
+  
+  	/*
+  	 * If used, fixed file set. Writers must ensure that ->refs is dead,
+@@@ -277,13 -269,10 +302,16 @@@
+  		 */
+  		struct list_head	poll_list;
+  		struct list_head	cancel_list;
+ -
+ -		spinlock_t		inflight_lock;
+ -		struct list_head	inflight_list;
+  	} ____cacheline_aligned_in_smp;
+++<<<<<<< HEAD
+ +
+ +	struct async_list	pending_async[2];
+ +
+ +#if defined(CONFIG_UNIX)
+ +	struct socket		*ring_sock;
+ +#endif
+++=======
+++>>>>>>> 206aefde4f88 (io_uring: reduce/pack size of io_ring_ctx)
+  };
+  
+  struct sqe_submit {
+@@@ -411,22 -418,33 +441,32 @@@ static struct io_ring_ctx *io_ring_ctx_
+  
+  	ctx->flags = p->flags;
+  	init_waitqueue_head(&ctx->cq_wait);
+++<<<<<<< HEAD
+ +	init_completion(&ctx->ctx_done);
+ +	init_completion(&ctx->sqo_thread_started);
+++=======
++ 	INIT_LIST_HEAD(&ctx->cq_overflow_list);
++ 	init_completion(&ctx->completions[0]);
++ 	init_completion(&ctx->completions[1]);
+++>>>>>>> 206aefde4f88 (io_uring: reduce/pack size of io_ring_ctx)
+  	mutex_init(&ctx->uring_lock);
+  	init_waitqueue_head(&ctx->wait);
+ +	for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
+ +		spin_lock_init(&ctx->pending_async[i].lock);
+ +		INIT_LIST_HEAD(&ctx->pending_async[i].list);
+ +		atomic_set(&ctx->pending_async[i].cnt, 0);
+ +	}
+  	spin_lock_init(&ctx->completion_lock);
+  	INIT_LIST_HEAD(&ctx->poll_list);
+  	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
++ err:
++ 	kfree(ctx->completions);
++ 	kfree(ctx);
++ 	return NULL;
+  }
+  
+ -static inline bool __io_sequence_defer(struct io_ring_ctx *ctx,
+ -				       struct io_kiocb *req)
+ -{
+ -	return req->sequence != ctx->cached_cq_tail + ctx->cached_sq_dropped
+ -					+ atomic_read(&ctx->cached_cq_overflow);
+ -}
+ -
+  static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+  				     struct io_kiocb *req)
+  {
+@@@ -3549,9 -4151,15 +3590,14 @@@ static void io_ring_ctx_wait_and_kill(s
+  	percpu_ref_kill(&ctx->refs);
+  	mutex_unlock(&ctx->uring_lock);
+  
+ -	io_kill_timeouts(ctx);
+  	io_poll_remove_all(ctx);
+ -
+ -	if (ctx->io_wq)
+ -		io_wq_cancel_all(ctx->io_wq);
+ -
+  	io_iopoll_reap_events(ctx);
+++<<<<<<< HEAD
+ +	wait_for_completion(&ctx->ctx_done);
+++=======
++ 	io_cqring_overflow_flush(ctx, true);
++ 	wait_for_completion(&ctx->completions[0]);
+++>>>>>>> 206aefde4f88 (io_uring: reduce/pack size of io_ring_ctx)
+  	io_ring_ctx_free(ctx);
+  }
+  
+* Unmerged path fs/io_uring.c
