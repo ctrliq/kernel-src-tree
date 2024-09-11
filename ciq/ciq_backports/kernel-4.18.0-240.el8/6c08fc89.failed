@@ -1,0 +1,143 @@
+Bluetooth: Fix refcount use-after-free issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Manish Mandlik <mmandlik@google.com>
+commit 6c08fc896b60893c5d673764b0668015d76df462
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6c08fc89.failed
+
+There is no lock preventing both l2cap_sock_release() and
+chan->ops->close() from running at the same time.
+
+If we consider Thread A running l2cap_chan_timeout() and Thread B running
+l2cap_sock_release(), expected behavior is:
+  A::l2cap_chan_timeout()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  A::l2cap_chan_timeout()->l2cap_sock_close_cb()->l2cap_sock_kill()
+  B::l2cap_sock_release()->sock_orphan()
+  B::l2cap_sock_release()->l2cap_sock_kill()
+
+where,
+sock_orphan() clears "sk->sk_socket" and l2cap_sock_teardown_cb() marks
+socket as SOCK_ZAPPED.
+
+In l2cap_sock_kill(), there is an "if-statement" that checks if both
+sock_orphan() and sock_teardown() has been run i.e. sk->sk_socket is NULL
+and socket is marked as SOCK_ZAPPED. Socket is killed if the condition is
+satisfied.
+
+In the race condition, following occurs:
+  A::l2cap_chan_timeout()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  B::l2cap_sock_release()->sock_orphan()
+  B::l2cap_sock_release()->l2cap_sock_kill()
+  A::l2cap_chan_timeout()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+In this scenario, "if-statement" is true in both B::l2cap_sock_kill() and
+A::l2cap_sock_kill() and we hit "refcount: underflow; use-after-free" bug.
+
+Similar condition occurs at other places where teardown/sock_kill is
+happening:
+  l2cap_disconnect_rsp()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_disconnect_rsp()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_conn_del()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_conn_del()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_disconnect_req()->l2cap_chan_del()->l2cap_sock_teardown_cb()
+  l2cap_disconnect_req()->l2cap_sock_close_cb()->l2cap_sock_kill()
+
+  l2cap_sock_cleanup_listen()->l2cap_chan_close()->l2cap_sock_teardown_cb()
+  l2cap_sock_cleanup_listen()->l2cap_sock_kill()
+
+Protect teardown/sock_kill and orphan/sock_kill by adding hold_lock on
+l2cap channel to ensure that the socket is killed only after marked as
+zapped and orphan.
+
+	Signed-off-by: Manish Mandlik <mmandlik@google.com>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 6c08fc896b60893c5d673764b0668015d76df462)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/l2cap_core.c
+diff --cc net/bluetooth/l2cap_core.c
+index 0af7b0845017,dd2021270b8a..000000000000
+--- a/net/bluetooth/l2cap_core.c
++++ b/net/bluetooth/l2cap_core.c
+@@@ -4367,14 -4453,21 +4370,25 @@@ static inline int l2cap_disconnect_rsp(
+  		return 0;
+  	}
+  
++ 	l2cap_chan_hold(chan);
+  	l2cap_chan_lock(chan);
+  
+++<<<<<<< HEAD
+ +	l2cap_chan_hold(chan);
+- 	l2cap_chan_del(chan, 0);
+++=======
++ 	if (chan->state != BT_DISCONN) {
++ 		l2cap_chan_unlock(chan);
++ 		l2cap_chan_put(chan);
++ 		mutex_unlock(&conn->chan_lock);
++ 		return 0;
++ 	}
+  
+- 	l2cap_chan_unlock(chan);
+++>>>>>>> 6c08fc896b60 (Bluetooth: Fix refcount use-after-free issue)
++ 	l2cap_chan_del(chan, 0);
+  
+  	chan->ops->close(chan);
++ 
++ 	l2cap_chan_unlock(chan);
+  	l2cap_chan_put(chan);
+  
+  	mutex_unlock(&conn->chan_lock);
+* Unmerged path net/bluetooth/l2cap_core.c
+diff --git a/net/bluetooth/l2cap_sock.c b/net/bluetooth/l2cap_sock.c
+index 686bdc6b35b0..50df3ab510f0 100644
+--- a/net/bluetooth/l2cap_sock.c
++++ b/net/bluetooth/l2cap_sock.c
+@@ -1039,7 +1039,7 @@ static int l2cap_sock_recvmsg(struct socket *sock, struct msghdr *msg,
+ }
+ 
+ /* Kill socket (only if zapped and orphan)
+- * Must be called on unlocked socket.
++ * Must be called on unlocked socket, with l2cap channel lock.
+  */
+ static void l2cap_sock_kill(struct sock *sk)
+ {
+@@ -1200,8 +1200,15 @@ static int l2cap_sock_release(struct socket *sock)
+ 
+ 	err = l2cap_sock_shutdown(sock, 2);
+ 
++	l2cap_chan_hold(l2cap_pi(sk)->chan);
++	l2cap_chan_lock(l2cap_pi(sk)->chan);
++
+ 	sock_orphan(sk);
+ 	l2cap_sock_kill(sk);
++
++	l2cap_chan_unlock(l2cap_pi(sk)->chan);
++	l2cap_chan_put(l2cap_pi(sk)->chan);
++
+ 	return err;
+ }
+ 
+@@ -1219,12 +1226,15 @@ static void l2cap_sock_cleanup_listen(struct sock *parent)
+ 		BT_DBG("child chan %p state %s", chan,
+ 		       state_to_string(chan->state));
+ 
++		l2cap_chan_hold(chan);
+ 		l2cap_chan_lock(chan);
++
+ 		__clear_chan_timer(chan);
+ 		l2cap_chan_close(chan, ECONNRESET);
+-		l2cap_chan_unlock(chan);
+-
+ 		l2cap_sock_kill(sk);
++
++		l2cap_chan_unlock(chan);
++		l2cap_chan_put(chan);
+ 	}
+ }
+ 
