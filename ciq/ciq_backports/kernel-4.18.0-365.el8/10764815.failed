@@ -1,0 +1,139 @@
+md: add io accounting for raid0 and raid5
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Guoqing Jiang <jgq516@gmail.com>
+commit 10764815ff4728d2c57da677cd5d3dd6f446cf5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/10764815.failed
+
+We introduce a new bioset (io_acct_set) for raid0 and raid5 since they
+don't own clone infrastructure to accounting io. And the bioset is added
+to mddev instead of to raid0 and raid5 layer, because with this way, we
+can put common functions to md.h and reuse them in raid0 and raid5.
+
+Also struct md_io_acct is added accordingly which includes io start_time,
+the origin bio and cloned bio. Then we can call bio_{start,end}_io_acct
+to get related io status.
+
+	Signed-off-by: Guoqing Jiang <jiangguoqing@kylinos.cn>
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 10764815ff4728d2c57da677cd5d3dd6f446cf5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 20d98e2f9902,843e13666e3f..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -6038,8 -5998,7 +6046,12 @@@ int md_run(struct mddev *mddev
+  			blk_queue_flag_set(QUEUE_FLAG_NONROT, mddev->queue);
+  		else
+  			blk_queue_flag_clear(QUEUE_FLAG_NONROT, mddev->queue);
+++<<<<<<< HEAD
+ +		mddev->queue->backing_dev_info->congested_data = mddev;
+ +		mddev->queue->backing_dev_info->congested_fn = md_congested;
+++=======
++ 		blk_queue_flag_set(QUEUE_FLAG_IO_STAT, mddev->queue);
+++>>>>>>> 10764815ff47 (md: add io accounting for raid0 and raid5)
+  	}
+  	if (pers->sync_request) {
+  		if (mddev->kobj.sd &&
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index 8a3e43d85458..d1bf4dc4a311 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -494,6 +494,7 @@ struct mddev {
+ 	struct bio_set			sync_set; /* for sync operations like
+ 						   * metadata and bitmap writes
+ 						   */
++	struct bio_set			io_acct_set; /* for raid0 and raid5 io accounting */
+ 
+ 	/* Generic flush handling.
+ 	 * The last to finish preflush schedules a worker to submit
+@@ -693,6 +694,12 @@ struct md_thread {
+ 	void			*private;
+ };
+ 
++struct md_io_acct {
++	struct bio *orig_bio;
++	unsigned long start_time;
++	struct bio bio_clone;
++};
++
+ #define THREAD_WAKEUP  0
+ 
+ static inline void safe_put_page(struct page *p)
+@@ -724,6 +731,7 @@ extern void md_error(struct mddev *mddev, struct md_rdev *rdev);
+ extern void md_finish_reshape(struct mddev *mddev);
+ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
+ 			struct bio *bio, sector_t start, sector_t size);
++void md_account_bio(struct mddev *mddev, struct bio **bio);
+ 
+ extern int mddev_congested(struct mddev *mddev, int bits);
+ extern bool __must_check md_flush_request(struct mddev *mddev, struct bio *bio);
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index 9359e31598fe..1c6335dd78c2 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -568,6 +568,9 @@ static bool raid0_make_request(struct mddev *mddev, struct bio *bio)
+ 		bio = split;
+ 	}
+ 
++	if (bio->bi_pool != &mddev->bio_set)
++		md_account_bio(mddev, &bio);
++
+ 	orig_sector = sector;
+ 	zone = find_zone(mddev->private, &sector);
+ 	switch (conf->layout) {
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 08041f68d898..4794467fd17f 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -5517,6 +5517,7 @@ static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
+ 	sector_t sector = raid_bio->bi_iter.bi_sector;
+ 	unsigned chunk_sects = mddev->chunk_sectors;
+ 	unsigned sectors = chunk_sects - (sector & (chunk_sects-1));
++	struct r5conf *conf = mddev->private;
+ 
+ 	if (sectors < bio_sectors(raid_bio)) {
+ 		struct r5conf *conf = mddev->private;
+@@ -5526,6 +5527,9 @@ static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
+ 		raid_bio = split;
+ 	}
+ 
++	if (raid_bio->bi_pool != &conf->bio_split)
++		md_account_bio(mddev, &raid_bio);
++
+ 	if (!raid5_read_one_chunk(mddev, raid_bio))
+ 		return raid_bio;
+ 
+@@ -5805,6 +5809,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 	DEFINE_WAIT(w);
+ 	bool do_prepare;
+ 	bool do_flush = false;
++	bool do_clone = false;
+ 
+ 	if (unlikely(bi->bi_opf & REQ_PREFLUSH)) {
+ 		int ret = log_handle_flush_request(conf, bi);
+@@ -5833,6 +5838,7 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 	if (rw == READ && mddev->degraded == 0 &&
+ 	    mddev->reshape_position == MaxSector) {
+ 		bi = chunk_aligned_read(mddev, bi);
++		do_clone = true;
+ 		if (!bi)
+ 			return true;
+ 	}
+@@ -5847,6 +5853,9 @@ static bool raid5_make_request(struct mddev *mddev, struct bio * bi)
+ 	last_sector = bio_end_sector(bi);
+ 	bi->bi_next = NULL;
+ 
++	if (!do_clone)
++		md_account_bio(mddev, &bi);
++
+ 	prepare_to_wait(&conf->wait_for_overlap, &w, TASK_UNINTERRUPTIBLE);
+ 	for (; logical_sector < last_sector; logical_sector += RAID5_STRIPE_SECTORS(conf)) {
+ 		int previous;
