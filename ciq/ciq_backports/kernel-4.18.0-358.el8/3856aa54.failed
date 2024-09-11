@@ -1,0 +1,302 @@
+powerpc/vas: Create take/drop pid and mm reference functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Haren Myneni <haren@linux.ibm.com>
+commit 3856aa542d90ed79cd5ed4cfd828b1fb04017131
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/3856aa54.failed
+
+Take pid and mm references when each window opens and drops during
+close. This functionality is needed for powerNV and pseries. So
+this patch defines the existing code as functions in common book3s
+platform vas-api.c
+
+	Signed-off-by: Haren Myneni <haren@linux.ibm.com>
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/2fa40df962250a737c804e58202924717b39e381.camel@linux.ibm.com
+
+(cherry picked from commit 3856aa542d90ed79cd5ed4cfd828b1fb04017131)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/vas.h
+#	arch/powerpc/platforms/powernv/vas-window.c
+diff --cc arch/powerpc/include/asm/vas.h
+index 6c441ad0e6ea,71cff6d6bf3a..000000000000
+--- a/arch/powerpc/include/asm/vas.h
++++ b/arch/powerpc/include/asm/vas.h
+@@@ -9,6 -5,10 +9,13 @@@
+  
+  #ifndef _ASM_POWERPC_VAS_H
+  #define _ASM_POWERPC_VAS_H
+++<<<<<<< HEAD
+++=======
++ #include <linux/sched/mm.h>
++ #include <linux/mmu_context.h>
++ #include <asm/icswx.h>
++ #include <uapi/asm/vas-api.h>
+++>>>>>>> 3856aa542d90 (powerpc/vas: Create take/drop pid and mm reference functions)
+  
+  struct vas_window;
+  
+@@@ -53,6 -53,52 +60,55 @@@ enum vas_cop_type 
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * User space VAS windows are opened by tasks and take references
++  * to pid and mm until windows are closed.
++  * Stores pid, mm, and tgid for each window.
++  */
++ struct vas_user_win_ref {
++ 	struct pid *pid;	/* PID of owner */
++ 	struct pid *tgid;	/* Thread group ID of owner */
++ 	struct mm_struct *mm;	/* Linux process mm_struct */
++ };
++ 
++ /*
++  * User space window operations used for powernv and powerVM
++  */
++ struct vas_user_win_ops {
++ 	struct vas_window * (*open_win)(int vas_id, u64 flags,
++ 				enum vas_cop_type);
++ 	u64 (*paste_addr)(struct vas_window *);
++ 	int (*close_win)(struct vas_window *);
++ };
++ 
++ static inline void put_vas_user_win_ref(struct vas_user_win_ref *ref)
++ {
++ 	/* Drop references to pid, tgid, and mm */
++ 	put_pid(ref->pid);
++ 	put_pid(ref->tgid);
++ 	if (ref->mm)
++ 		mmdrop(ref->mm);
++ }
++ 
++ static inline void vas_user_win_add_mm_context(struct vas_user_win_ref *ref)
++ {
++ 	mm_context_add_vas_window(ref->mm);
++ 	/*
++ 	 * Even a process that has no foreign real address mapping can
++ 	 * use an unpaired COPY instruction (to no real effect). Issue
++ 	 * CP_ABORT to clear any pending COPY and prevent a covert
++ 	 * channel.
++ 	 *
++ 	 * __switch_to() will issue CP_ABORT on future context switches
++ 	 * if process / thread has any open VAS window (Use
++ 	 * current->mm->context.vas_windows).
++ 	 */
++ 	asm volatile(PPC_CP_ABORT);
++ }
++ 
++ /*
+++>>>>>>> 3856aa542d90 (powerpc/vas: Create take/drop pid and mm reference functions)
+   * Receive window attributes specified by the (in-kernel) owner of window.
+   */
+  struct vas_rx_win_attr {
+@@@ -175,7 -225,9 +231,8 @@@ int vas_paste_crb(struct vas_window *wi
+   * used for others in future.
+   */
+  int vas_register_coproc_api(struct module *mod, enum vas_cop_type cop_type,
+ -			    const char *name,
+ -			    const struct vas_user_win_ops *vops);
+ +				const char *name);
+  void vas_unregister_coproc_api(void);
+  
++ int get_vas_user_win_ref(struct vas_user_win_ref *task_ref);
+  #endif /* __ASM_POWERPC_VAS_H */
+diff --cc arch/powerpc/platforms/powernv/vas-window.c
+index 5516ad56ba07,6489e29085be..000000000000
+--- a/arch/powerpc/platforms/powernv/vas-window.c
++++ b/arch/powerpc/platforms/powernv/vas-window.c
+@@@ -1069,53 -1065,11 +1069,38 @@@ struct vas_window *vas_tx_win_open(int 
+  			rc = -ENODEV;
+  			goto free_window;
+  		}
+- 
+- 		/*
+- 		 * Window opened by a child thread may not be closed when
+- 		 * it exits. So take reference to its pid and release it
+- 		 * when the window is free by parent thread.
+- 		 * Acquire a reference to the task's pid to make sure
+- 		 * pid will not be re-used - needed only for multithread
+- 		 * applications.
+- 		 */
+- 		txwin->pid = get_task_pid(current, PIDTYPE_PID);
+- 		/*
+- 		 * Acquire a reference to the task's mm.
+- 		 */
+- 		txwin->mm = get_task_mm(current);
+- 
+- 		if (!txwin->mm) {
+- 			put_pid(txwin->pid);
+- 			pr_err("VAS: pid(%d): mm_struct is not found\n",
+- 					current->pid);
+- 			rc = -EPERM;
++ 		rc = get_vas_user_win_ref(&txwin->task_ref);
++ 		if (rc)
+  			goto free_window;
+- 		}
+  
+++<<<<<<< HEAD
+ +		mmgrab(txwin->mm);
+ +		mmput(txwin->mm);
+ +		mm_context_add_vas_window(txwin->mm);
+ +		/*
+ +		 * Process closes window during exit. In the case of
+ +		 * multithread application, the child thread can open
+ +		 * window and can exit without closing it. so takes tgid
+ +		 * reference until window closed to make sure tgid is not
+ +		 * reused.
+ +		 */
+ +		txwin->tgid = find_get_pid(task_tgid_vnr(current));
+ +		/*
+ +		 * Even a process that has no foreign real address mapping can
+ +		 * use an unpaired COPY instruction (to no real effect). Issue
+ +		 * CP_ABORT to clear any pending COPY and prevent a covert
+ +		 * channel.
+ +		 *
+ +		 * __switch_to() will issue CP_ABORT on future context switches
+ +		 * if process / thread has any open VAS window (Use
+ +		 * current->mm->context.vas_windows in upstream kernel).
+ +		 * To fix kABI issue, current->mm->vas_windows will be used in RH
+ +		 * kerbnel.
+ +		 */
+ +		asm volatile(PPC_CP_ABORT);
+++=======
++ 		vas_user_win_add_mm_context(&txwin->task_ref);
+++>>>>>>> 3856aa542d90 (powerpc/vas: Create take/drop pid and mm reference functions)
+  	}
+  
+  	set_vinst_win(vinst, txwin);
+* Unmerged path arch/powerpc/include/asm/vas.h
+diff --git a/arch/powerpc/platforms/powernv/vas-api.c b/arch/powerpc/platforms/powernv/vas-api.c
+index 4312140f6776..139649382dab 100644
+--- a/arch/powerpc/platforms/powernv/vas-api.c
++++ b/arch/powerpc/platforms/powernv/vas-api.c
+@@ -55,6 +55,45 @@ static char *coproc_devnode(struct device *dev, umode_t *mode)
+ 	return kasprintf(GFP_KERNEL, "crypto/%s", dev_name(dev));
+ }
+ 
++/*
++ * Take reference to pid and mm
++ */
++int get_vas_user_win_ref(struct vas_user_win_ref *task_ref)
++{
++	/*
++	 * Window opened by a child thread may not be closed when
++	 * it exits. So take reference to its pid and release it
++	 * when the window is free by parent thread.
++	 * Acquire a reference to the task's pid to make sure
++	 * pid will not be re-used - needed only for multithread
++	 * applications.
++	 */
++	task_ref->pid = get_task_pid(current, PIDTYPE_PID);
++	/*
++	 * Acquire a reference to the task's mm.
++	 */
++	task_ref->mm = get_task_mm(current);
++	if (!task_ref->mm) {
++		put_pid(task_ref->pid);
++		pr_err("VAS: pid(%d): mm_struct is not found\n",
++				current->pid);
++		return -EPERM;
++	}
++
++	mmgrab(task_ref->mm);
++	mmput(task_ref->mm);
++	/*
++	 * Process closes window during exit. In the case of
++	 * multithread application, the child thread can open
++	 * window and can exit without closing it. So takes tgid
++	 * reference until window closed to make sure tgid is not
++	 * reused.
++	 */
++	task_ref->tgid = find_get_pid(task_tgid_vnr(current));
++
++	return 0;
++}
++
+ static int coproc_open(struct inode *inode, struct file *fp)
+ {
+ 	struct coproc_instance *cp_inst;
+diff --git a/arch/powerpc/platforms/powernv/vas-fault.c b/arch/powerpc/platforms/powernv/vas-fault.c
+index 3d21fce254b7..ac3a71ec3bd5 100644
+--- a/arch/powerpc/platforms/powernv/vas-fault.c
++++ b/arch/powerpc/platforms/powernv/vas-fault.c
+@@ -73,7 +73,7 @@ static void update_csb(struct vas_window *window,
+ 	 * NX user space windows can not be opened for task->mm=NULL
+ 	 * and faults will not be generated for kernel requests.
+ 	 */
+-	if (WARN_ON_ONCE(!window->mm || !window->user_win))
++	if (WARN_ON_ONCE(!window->task_ref.mm || !window->user_win))
+ 		return;
+ 
+ 	csb_addr = (void __user *)be64_to_cpu(crb->csb_addr);
+@@ -92,7 +92,7 @@ static void update_csb(struct vas_window *window,
+ 	csb.address = crb->stamp.nx.fault_storage_addr;
+ 	csb.flags = 0;
+ 
+-	pid = window->pid;
++	pid = window->task_ref.pid;
+ 	tsk = get_pid_task(pid, PIDTYPE_PID);
+ 	/*
+ 	 * Process closes send window after all pending NX requests are
+@@ -111,7 +111,7 @@ static void update_csb(struct vas_window *window,
+ 	 * a window and exits without closing it.
+ 	 */
+ 	if (!tsk) {
+-		pid = window->tgid;
++		pid = window->task_ref.tgid;
+ 		tsk = get_pid_task(pid, PIDTYPE_PID);
+ 		/*
+ 		 * Parent thread (tgid) will be closing window when it
+@@ -127,7 +127,7 @@ static void update_csb(struct vas_window *window,
+ 		return;
+ 	}
+ 
+-	kthread_use_mm(window->mm);
++	kthread_use_mm(window->task_ref.mm);
+ 	rc = copy_to_user(csb_addr, &csb, sizeof(csb));
+ 	/*
+ 	 * User space polls on csb.flags (first byte). So add barrier
+@@ -139,7 +139,7 @@ static void update_csb(struct vas_window *window,
+ 		smp_mb();
+ 		rc = copy_to_user(csb_addr, &csb, sizeof(u8));
+ 	}
+-	kthread_unuse_mm(window->mm);
++	kthread_unuse_mm(window->task_ref.mm);
+ 	put_task_struct(tsk);
+ 
+ 	/* Success */
+* Unmerged path arch/powerpc/platforms/powernv/vas-window.c
+diff --git a/arch/powerpc/platforms/powernv/vas.h b/arch/powerpc/platforms/powernv/vas.h
+index 27337783457b..0e3018aebcca 100644
+--- a/arch/powerpc/platforms/powernv/vas.h
++++ b/arch/powerpc/platforms/powernv/vas.h
+@@ -359,11 +359,9 @@ struct vas_window {
+ 	bool user_win;		/* True if user space window */
+ 	void *hvwc_map;		/* HV window context */
+ 	void *uwc_map;		/* OS/User window context */
+-	struct pid *pid;	/* Linux process id of owner */
+-	struct pid *tgid;	/* Thread group ID of owner */
+-	struct mm_struct *mm;	/* Linux process mm_struct */
+ 	int wcreds_max;		/* Window credits */
+ 
++	struct vas_user_win_ref task_ref;
+ 	char *dbgname;
+ 	struct dentry *dbgdir;
+ 
+@@ -445,7 +443,7 @@ extern void vas_win_paste_addr(struct vas_window *window, u64 *addr,
+ 
+ static inline int vas_window_pid(struct vas_window *window)
+ {
+-	return pid_vnr(window->pid);
++	return pid_vnr(window->task_ref.pid);
+ }
+ 
+ static inline void vas_log_write(struct vas_window *win, char *name,
