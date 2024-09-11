@@ -1,0 +1,168 @@
+perf header: Fix lock/unlock imbalances when processing BPF/BTF info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Gustavo A. R. Silva <gustavo@embeddedor.com>
+commit 14c9b31a925a9f5c647523a12e2b575b97c0aa47
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/14c9b31a.failed
+
+Fix lock/unlock imbalances by refactoring the code a bit and adding
+calls to up_write() before return.
+
+	Signed-off-by: Gustavo A. R. Silva <gustavo@embeddedor.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Addresses-Coverity-ID: 1444315 ("Missing unlock")
+Addresses-Coverity-ID: 1444316 ("Missing unlock")
+Fixes: a70a1123174a ("perf bpf: Save BTF information as headers to perf.data")
+Fixes: 606f972b1361 ("perf bpf: Save bpf_prog_info information as headers to perf.data")
+Link: http://lkml.kernel.org/r/20190408173355.GA10501@embeddedor
+[ Simplified the exit path to have just one up_write() + return ]
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 14c9b31a925a9f5c647523a12e2b575b97c0aa47)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/header.c
+diff --cc tools/perf/util/header.c
+index 5b16579df3db,2d2af2ac2b1e..000000000000
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@@ -2624,6 -2545,128 +2624,131 @@@ static int process_dir_format(struct fe
+  	return do_read_u64(ff, &data->dir.version);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef HAVE_LIBBPF_SUPPORT
++ static int process_bpf_prog_info(struct feat_fd *ff, void *data __maybe_unused)
++ {
++ 	struct bpf_prog_info_linear *info_linear;
++ 	struct bpf_prog_info_node *info_node;
++ 	struct perf_env *env = &ff->ph->env;
++ 	u32 count, i;
++ 	int err = -1;
++ 
++ 	if (ff->ph->needs_swap) {
++ 		pr_warning("interpreting bpf_prog_info from systems with endianity is not yet supported\n");
++ 		return 0;
++ 	}
++ 
++ 	if (do_read_u32(ff, &count))
++ 		return -1;
++ 
++ 	down_write(&env->bpf_progs.lock);
++ 
++ 	for (i = 0; i < count; ++i) {
++ 		u32 info_len, data_len;
++ 
++ 		info_linear = NULL;
++ 		info_node = NULL;
++ 		if (do_read_u32(ff, &info_len))
++ 			goto out;
++ 		if (do_read_u32(ff, &data_len))
++ 			goto out;
++ 
++ 		if (info_len > sizeof(struct bpf_prog_info)) {
++ 			pr_warning("detected invalid bpf_prog_info\n");
++ 			goto out;
++ 		}
++ 
++ 		info_linear = malloc(sizeof(struct bpf_prog_info_linear) +
++ 				     data_len);
++ 		if (!info_linear)
++ 			goto out;
++ 		info_linear->info_len = sizeof(struct bpf_prog_info);
++ 		info_linear->data_len = data_len;
++ 		if (do_read_u64(ff, (u64 *)(&info_linear->arrays)))
++ 			goto out;
++ 		if (__do_read(ff, &info_linear->info, info_len))
++ 			goto out;
++ 		if (info_len < sizeof(struct bpf_prog_info))
++ 			memset(((void *)(&info_linear->info)) + info_len, 0,
++ 			       sizeof(struct bpf_prog_info) - info_len);
++ 
++ 		if (__do_read(ff, info_linear->data, data_len))
++ 			goto out;
++ 
++ 		info_node = malloc(sizeof(struct bpf_prog_info_node));
++ 		if (!info_node)
++ 			goto out;
++ 
++ 		/* after reading from file, translate offset to address */
++ 		bpf_program__bpil_offs_to_addr(info_linear);
++ 		info_node->info_linear = info_linear;
++ 		perf_env__insert_bpf_prog_info(env, info_node);
++ 	}
++ 
++ 	up_write(&env->bpf_progs.lock);
++ 	return 0;
++ out:
++ 	free(info_linear);
++ 	free(info_node);
++ 	up_write(&env->bpf_progs.lock);
++ 	return err;
++ }
++ #else // HAVE_LIBBPF_SUPPORT
++ static int process_bpf_prog_info(struct feat_fd *ff __maybe_unused, void *data __maybe_unused)
++ {
++ 	return 0;
++ }
++ #endif // HAVE_LIBBPF_SUPPORT
++ 
++ static int process_bpf_btf(struct feat_fd *ff, void *data __maybe_unused)
++ {
++ 	struct perf_env *env = &ff->ph->env;
++ 	struct btf_node *node = NULL;
++ 	u32 count, i;
++ 	int err = -1;
++ 
++ 	if (ff->ph->needs_swap) {
++ 		pr_warning("interpreting btf from systems with endianity is not yet supported\n");
++ 		return 0;
++ 	}
++ 
++ 	if (do_read_u32(ff, &count))
++ 		return -1;
++ 
++ 	down_write(&env->bpf_progs.lock);
++ 
++ 	for (i = 0; i < count; ++i) {
++ 		u32 id, data_size;
++ 
++ 		if (do_read_u32(ff, &id))
++ 			goto out;
++ 		if (do_read_u32(ff, &data_size))
++ 			goto out;
++ 
++ 		node = malloc(sizeof(struct btf_node) + data_size);
++ 		if (!node)
++ 			goto out;
++ 
++ 		node->id = id;
++ 		node->data_size = data_size;
++ 
++ 		if (__do_read(ff, node->data, data_size))
++ 			goto out;
++ 
++ 		perf_env__insert_btf(env, node);
++ 		node = NULL;
++ 	}
++ 
++ 	err = 0;
++ out:
++ 	up_write(&env->bpf_progs.lock);
++ 	free(node);
++ 	return err;
++ }
++ 
+++>>>>>>> 14c9b31a925a (perf header: Fix lock/unlock imbalances when processing BPF/BTF info)
+  struct feature_ops {
+  	int (*write)(struct feat_fd *ff, struct perf_evlist *evlist);
+  	void (*print)(struct feat_fd *ff, FILE *fp);
+* Unmerged path tools/perf/util/header.c
