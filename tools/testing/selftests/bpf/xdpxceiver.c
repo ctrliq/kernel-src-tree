@@ -147,7 +147,7 @@ static void *memset32_htonl(void *dest, u32 val, u32 size)
  * This function code has been taken from
  * Linux kernel include/asm-generic/checksum.h
  */
-static inline __u16 csum_fold(__u32 csum)
+static __u16 csum_fold(__u32 csum)
 {
 	u32 sum = (__force u32)csum;
 
@@ -160,7 +160,7 @@ static inline __u16 csum_fold(__u32 csum)
  * This function code has been taken from
  * Linux kernel lib/checksum.c
  */
-static inline u32 from64to32(u64 x)
+static u32 from64to32(u64 x)
 {
 	/* add up 32-bit and 32-bit for 32+c bit */
 	x = (x & 0xffffffff) + (x >> 32);
@@ -169,13 +169,11 @@ static inline u32 from64to32(u64 x)
 	return (u32)x;
 }
 
-__u32 csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u32 sum);
-
 /*
  * This function code has been taken from
  * Linux kernel lib/checksum.c
  */
-__u32 csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u32 sum)
+static __u32 csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u32 sum)
 {
 	unsigned long long s = (__force u32)sum;
 
@@ -193,13 +191,12 @@ __u32 csum_tcpudp_nofold(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u3
  * This function has been taken from
  * Linux kernel include/asm-generic/checksum.h
  */
-static inline __u16
-csum_tcpudp_magic(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u32 sum)
+static __u16 csum_tcpudp_magic(__be32 saddr, __be32 daddr, __u32 len, __u8 proto, __u32 sum)
 {
 	return csum_fold(csum_tcpudp_nofold(saddr, daddr, len, proto, sum));
 }
 
-static inline u16 udp_csum(u32 saddr, u32 daddr, u32 len, u8 proto, u16 *udp_pkt)
+static u16 udp_csum(u32 saddr, u32 daddr, u32 len, u8 proto, u16 *udp_pkt)
 {
 	u32 csum = 0;
 	u32 cnt = 0;
@@ -511,7 +508,7 @@ static void kick_tx(struct xsk_socket_info *xsk)
 	exit_with_error(errno);
 }
 
-static inline void complete_tx_only(struct xsk_socket_info *xsk, int batch_size)
+static void complete_tx_only(struct xsk_socket_info *xsk, int batch_size)
 {
 	unsigned int rcvd;
 	u32 idx;
@@ -609,7 +606,7 @@ static void tx_only(struct xsk_socket_info *xsk, u32 *frameptr, int batch_size)
 	complete_tx_only(xsk, batch_size);
 }
 
-static inline int get_batch_size(int pkt_cnt)
+static int get_batch_size(int pkt_cnt)
 {
 	if (!opt_pkt_count)
 		return BATCH_SIZE;
