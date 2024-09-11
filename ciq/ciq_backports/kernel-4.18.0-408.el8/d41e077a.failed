@@ -1,0 +1,115 @@
+dm: refactor dm_split_and_process_bio a bit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit d41e077ab6ea3c21ecd844498ff1a3a9abe3c731
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/d41e077a.failed
+
+Remove needless branching and indentation. Leaves code to catch
+malformed op_is_zone_mgmt bios (they shouldn't have a payload).
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit d41e077ab6ea3c21ecd844498ff1a3a9abe3c731)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 495368816d3f,c01bfa3b6544..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1609,11 -1406,11 +1615,15 @@@ static void init_clone_info(struct clon
+  /*
+   * Entry point to split a bio into clones and submit them to the targets.
+   */
+ -static void dm_split_and_process_bio(struct mapped_device *md,
+ -				     struct dm_table *map, struct bio *bio)
+ +static blk_qc_t __split_and_process_bio(struct mapped_device *md,
+ +					struct dm_table *map, struct bio *bio)
+  {
+  	struct clone_info ci;
+++<<<<<<< HEAD
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+++=======
++ 	struct bio *b;
+++>>>>>>> d41e077ab6ea (dm: refactor dm_split_and_process_bio a bit)
+  	int error = 0;
+  
+  	init_clone_info(&ci, md, map, bio);
+@@@ -1621,43 -1418,36 +1631,68 @@@
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+  		error = __send_empty_flush(&ci);
+  		/* dm_io_dec_pending submits any data associated with flush */
+++<<<<<<< HEAD
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+ +	}
+ +	start_io_acct(ci.io);
+++=======
++ 		goto out;
++ 	}
+++>>>>>>> d41e077ab6ea (dm: refactor dm_split_and_process_bio a bit)
++ 
++ 	error = __split_and_process_bio(&ci);
++ 	if (error || !ci.sector_count)
++ 		goto out;
+  
++ 	/*
++ 	 * Remainder must be passed to submit_bio_noacct() so it gets handled
++ 	 * *after* bios already submitted have been completely processed.
++ 	 * We take a clone of the original to store in ci.io->orig_bio to be
++ 	 * used by dm_end_io_acct() and for dm_io_dec_pending() to use for
++ 	 * completion handling.
++ 	 */
++ 	b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
++ 		      GFP_NOIO, &md->queue->bio_split);
++ 	ci.io->orig_bio = b;
++ 
++ 	bio_chain(b, bio);
++ 	trace_block_split(b, bio->bi_iter.bi_sector);
++ 	submit_bio_noacct(bio);
++ out:
++ 	dm_start_io_acct(ci.io);
+  	/* drop the extra reference count */
+  	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+* Unmerged path drivers/md/dm.c
