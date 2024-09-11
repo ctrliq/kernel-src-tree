@@ -1,0 +1,340 @@
+sock: Introduce sk->sk_prot->psock_update_sk_prot()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 8a59f9d1e3d4340659fdfee8879dc09a6f2546e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/8a59f9d1.failed
+
+Currently sockmap calls into each protocol to update the struct
+proto and replace it. This certainly won't work when the protocol
+is implemented as a module, for example, AF_UNIX.
+
+Introduce a new ops sk->sk_prot->psock_update_sk_prot(), so each
+protocol can implement its own way to replace the struct proto.
+This also helps get rid of symbol dependencies on CONFIG_INET.
+
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210331023237.41094-11-xiyou.wangcong@gmail.com
+(cherry picked from commit 8a59f9d1e3d4340659fdfee8879dc09a6f2546e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	include/net/udp.h
+diff --cc include/linux/skmsg.h
+index a85cacd89635,5e800ddc2dc6..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -100,13 -98,13 +100,18 @@@ struct sk_psock 
+  	void (*saved_unhash)(struct sock *sk);
+  	void (*saved_close)(struct sock *sk, long timeout);
+  	void (*saved_write_space)(struct sock *sk);
+++<<<<<<< HEAD
+++=======
++ 	void (*saved_data_ready)(struct sock *sk);
++ 	int  (*psock_update_sk_prot)(struct sock *sk, bool restore);
+++>>>>>>> 8a59f9d1e3d4 (sock: Introduce sk->sk_prot->psock_update_sk_prot())
+  	struct proto			*sk_proto;
+ -	struct mutex			work_mutex;
+  	struct sk_psock_work_state	work_state;
+  	struct work_struct		work;
+ -	struct rcu_work			rwork;
+ +	union {
+ +		struct rcu_head		rcu;
+ +		struct work_struct	gc;
+ +	};
+  };
+  
+  int sk_msg_alloc(struct sock *sk, struct sk_msg *msg, int len,
+@@@ -339,27 -399,9 +344,25 @@@ static inline void sk_psock_cork_free(s
+  static inline void sk_psock_restore_proto(struct sock *sk,
+  					  struct sk_psock *psock)
+  {
+++<<<<<<< HEAD
+ +	if (inet_csk_has_ulp(sk)) {
+ +		/* TLS does not have an unhash proto in SW cases, but we need
+ +		 * to ensure we stop using the sock_map unhash routine because
+ +		 * the associated psock is being removed. So use the original
+ +		 * unhash handler.
+ +		 */
+ +		WRITE_ONCE(sk->sk_prot->unhash, psock->saved_unhash);
+ +		tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
+ +	} else {
+ +		sk->sk_write_space = psock->saved_write_space;
+ +		/* Pairs with lockless read in sk_clone_lock() */
+ +		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
+ +	}
+++=======
++ 	sk->sk_prot->unhash = psock->saved_unhash;
++ 	if (psock->psock_update_sk_prot)
++ 		psock->psock_update_sk_prot(sk, true);
+++>>>>>>> 8a59f9d1e3d4 (sock: Introduce sk->sk_prot->psock_update_sk_prot())
+  }
+  
+  static inline void sk_psock_set_state(struct sk_psock *psock,
+diff --cc include/net/udp.h
+index 68246fe46f8b,df7cc1edc200..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -509,32 -515,10 +509,37 @@@ static inline struct sk_buff *udp_rcv_s
+  	return segs;
+  }
+  
+ -#ifdef CONFIG_BPF_SYSCALL
+ +static inline void udp_post_segment_fix_csum(struct sk_buff *skb)
+ +{
+ +	/* UDP-lite can't land here - no GRO */
+ +	WARN_ON_ONCE(UDP_SKB_CB(skb)->partial_cov);
+ +
+ +	/* UDP packets generated with UDP_SEGMENT and traversing:
+ +	 *
+ +	 * UDP tunnel(xmit) -> veth (segmentation) -> veth (gro) -> UDP tunnel (rx)
+ +	 *
+ +	 * can reach an UDP socket with CHECKSUM_NONE, because
+ +	 * __iptunnel_pull_header() converts CHECKSUM_PARTIAL into NONE.
+ +	 * SKB_GSO_UDP_L4 or SKB_GSO_FRAGLIST packets with no UDP tunnel will
+ +	 * have a valid checksum, as the GRO engine validates the UDP csum
+ +	 * before the aggregation and nobody strips such info in between.
+ +	 * Instead of adding another check in the tunnel fastpath, we can force
+ +	 * a valid csum after the segmentation.
+ +	 * Additionally fixup the UDP CB.
+ +	 */
+ +	UDP_SKB_CB(skb)->cscov = skb->len;
+ +	if (skb->ip_summed == CHECKSUM_NONE && !skb->csum_valid)
+ +		skb->csum_valid = 1;
+ +}
+ +
+ +#ifdef CONFIG_BPF_STREAM_PARSER
+  struct sk_psock;
+  struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
+++<<<<<<< HEAD
+ +#endif /* BPF_STREAM_PARSER */
+++=======
++ int udp_bpf_update_proto(struct sock *sk, bool restore);
++ #endif
+++>>>>>>> 8a59f9d1e3d4 (sock: Introduce sk->sk_prot->psock_update_sk_prot())
+  
+  #endif	/* _UDP_H */
+* Unmerged path include/linux/skmsg.h
+diff --git a/include/net/sock.h b/include/net/sock.h
+index efde7a4e6cf7..32ed277cf9d7 100644
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@ -1186,6 +1186,9 @@ struct proto {
+ 	void			(*unhash)(struct sock *sk);
+ 	void			(*rehash)(struct sock *sk);
+ 	int			(*get_port)(struct sock *sk, unsigned short snum);
++#ifdef CONFIG_BPF_SYSCALL
++	int			(*psock_update_sk_prot)(struct sock *sk, bool restore);
++#endif
+ 
+ 	/* Keeping track of sockets in use */
+ #ifdef CONFIG_PROC_FS
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 94a5d2fb0393..6f22e06c142f 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2195,6 +2195,7 @@ struct sk_psock;
+ 
+ #ifdef CONFIG_BPF_STREAM_PARSER
+ struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
++int tcp_bpf_update_proto(struct sock *sk, bool restore);
+ void tcp_bpf_clone(const struct sock *sk, struct sock *newsk);
+ #else
+ static inline void tcp_bpf_clone(const struct sock *sk, struct sock *newsk)
+* Unmerged path include/net/udp.h
+diff --git a/net/core/skmsg.c b/net/core/skmsg.c
+index cfa6fc7cc1e0..ed3ddf27b4d9 100644
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@ -563,11 +563,6 @@ struct sk_psock *sk_psock_init(struct sock *sk, int node)
+ 
+ 	write_lock_bh(&sk->sk_callback_lock);
+ 
+-	if (inet_csk_has_ulp(sk)) {
+-		psock = ERR_PTR(-EINVAL);
+-		goto out;
+-	}
+-
+ 	if (sk->sk_user_data) {
+ 		psock = ERR_PTR(-EBUSY);
+ 		goto out;
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index f2963865e78e..bca0b05845fd 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -183,26 +183,10 @@ static void sock_map_unref(struct sock *sk, void *link_raw)
+ 
+ static int sock_map_init_proto(struct sock *sk, struct sk_psock *psock)
+ {
+-	struct proto *prot;
+-
+-	switch (sk->sk_type) {
+-	case SOCK_STREAM:
+-		prot = tcp_bpf_get_proto(sk, psock);
+-		break;
+-
+-	case SOCK_DGRAM:
+-		prot = udp_bpf_get_proto(sk, psock);
+-		break;
+-
+-	default:
++	if (!sk->sk_prot->psock_update_sk_prot)
+ 		return -EINVAL;
+-	}
+-
+-	if (IS_ERR(prot))
+-		return PTR_ERR(prot);
+-
+-	sk_psock_update_proto(sk, psock, prot);
+-	return 0;
++	psock->psock_update_sk_prot = sk->sk_prot->psock_update_sk_prot;
++	return sk->sk_prot->psock_update_sk_prot(sk, false);
+ }
+ 
+ static struct sk_psock *sock_map_psock_get_checked(struct sock *sk)
+@@ -553,7 +537,7 @@ static bool sock_map_redirect_allowed(const struct sock *sk)
+ 
+ static bool sock_map_sk_is_suitable(const struct sock *sk)
+ {
+-	return sk_is_tcp(sk) || sk_is_udp(sk);
++	return !!sk->sk_prot->psock_update_sk_prot;
+ }
+ 
+ static bool sock_map_sk_state_allowed(const struct sock *sk)
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index bc7d2a586e18..be251f416908 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -601,20 +601,38 @@ static int tcp_bpf_assert_proto_ops(struct proto *ops)
+ 	       ops->sendpage == tcp_sendpage ? 0 : -ENOTSUPP;
+ }
+ 
+-struct proto *tcp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
++int tcp_bpf_update_proto(struct sock *sk, bool restore)
+ {
++	struct sk_psock *psock = sk_psock(sk);
+ 	int family = sk->sk_family == AF_INET6 ? TCP_BPF_IPV6 : TCP_BPF_IPV4;
+ 	int config = psock->progs.msg_parser   ? TCP_BPF_TX   : TCP_BPF_BASE;
+ 
++	if (restore) {
++		if (inet_csk_has_ulp(sk)) {
++			tcp_update_ulp(sk, psock->sk_proto, psock->saved_write_space);
++		} else {
++			sk->sk_write_space = psock->saved_write_space;
++			/* Pairs with lockless read in sk_clone_lock() */
++			WRITE_ONCE(sk->sk_prot, psock->sk_proto);
++		}
++		return 0;
++	}
++
++	if (inet_csk_has_ulp(sk))
++		return -EINVAL;
++
+ 	if (sk->sk_family == AF_INET6) {
+ 		if (tcp_bpf_assert_proto_ops(psock->sk_proto))
+-			return ERR_PTR(-EINVAL);
++			return -EINVAL;
+ 
+ 		tcp_bpf_check_v6_needs_rebuild(psock->sk_proto);
+ 	}
+ 
+-	return &tcp_bpf_prots[family][config];
++	/* Pairs with lockless read in sk_clone_lock() */
++	WRITE_ONCE(sk->sk_prot, &tcp_bpf_prots[family][config]);
++	return 0;
+ }
++EXPORT_SYMBOL_GPL(tcp_bpf_update_proto);
+ 
+ /* If a child got cloned from a listening socket that had tcp_bpf
+  * protocol callbacks installed, we need to restore the callbacks to
+diff --git a/net/ipv4/tcp_ipv4.c b/net/ipv4/tcp_ipv4.c
+index 7c2c10024482..d143beac1d72 100644
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@ -2709,6 +2709,9 @@ struct proto tcp_prot = {
+ 	.hash			= inet_hash,
+ 	.unhash			= inet_unhash,
+ 	.get_port		= inet_csk_get_port,
++#ifdef CONFIG_BPF_SYSCALL
++	.psock_update_sk_prot	= tcp_bpf_update_proto,
++#endif
+ 	.enter_memory_pressure	= tcp_enter_memory_pressure,
+ 	.leave_memory_pressure	= tcp_leave_memory_pressure,
+ 	.stream_memory_free	= tcp_stream_memory_free,
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 3afc3915031f..d34ca075c73c 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2896,6 +2896,9 @@ struct proto udp_prot = {
+ 	.unhash			= udp_lib_unhash,
+ 	.rehash			= udp_v4_rehash,
+ 	.get_port		= udp_v4_get_port,
++#ifdef CONFIG_BPF_SYSCALL
++	.psock_update_sk_prot	= udp_bpf_update_proto,
++#endif
+ 	.memory_allocated	= &udp_memory_allocated,
+ 	.sysctl_mem		= sysctl_udp_mem,
+ 	.sysctl_wmem_offset	= offsetof(struct net, ipv4.sysctl_udp_wmem_min),
+diff --git a/net/ipv4/udp_bpf.c b/net/ipv4/udp_bpf.c
+index 69c9663f9ee7..18284806995c 100644
+--- a/net/ipv4/udp_bpf.c
++++ b/net/ipv4/udp_bpf.c
+@@ -41,12 +41,23 @@ static int __init udp_bpf_v4_build_proto(void)
+ }
+ late_initcall(udp_bpf_v4_build_proto);
+ 
+-struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
++int udp_bpf_update_proto(struct sock *sk, bool restore)
+ {
+ 	int family = sk->sk_family == AF_INET ? UDP_BPF_IPV4 : UDP_BPF_IPV6;
++	struct sk_psock *psock = sk_psock(sk);
++
++	if (restore) {
++		sk->sk_write_space = psock->saved_write_space;
++		/* Pairs with lockless read in sk_clone_lock() */
++		WRITE_ONCE(sk->sk_prot, psock->sk_proto);
++		return 0;
++	}
+ 
+ 	if (sk->sk_family == AF_INET6)
+ 		udp_bpf_check_v6_needs_rebuild(psock->sk_proto);
+ 
+-	return &udp_bpf_prots[family];
++	/* Pairs with lockless read in sk_clone_lock() */
++	WRITE_ONCE(sk->sk_prot, &udp_bpf_prots[family]);
++	return 0;
+ }
++EXPORT_SYMBOL_GPL(udp_bpf_update_proto);
+diff --git a/net/ipv6/tcp_ipv6.c b/net/ipv6/tcp_ipv6.c
+index e0616d27e5eb..8a5e765d9924 100644
+--- a/net/ipv6/tcp_ipv6.c
++++ b/net/ipv6/tcp_ipv6.c
+@@ -2044,6 +2044,9 @@ struct proto tcpv6_prot = {
+ 	.hash			= inet6_hash,
+ 	.unhash			= inet_unhash,
+ 	.get_port		= inet_csk_get_port,
++#ifdef CONFIG_BPF_SYSCALL
++	.psock_update_sk_prot	= tcp_bpf_update_proto,
++#endif
+ 	.enter_memory_pressure	= tcp_enter_memory_pressure,
+ 	.leave_memory_pressure	= tcp_leave_memory_pressure,
+ 	.stream_memory_free	= tcp_stream_memory_free,
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index 03023c3052a7..7c723ebd77f7 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -1772,6 +1772,9 @@ struct proto udpv6_prot = {
+ 	.unhash			= udp_lib_unhash,
+ 	.rehash			= udp_v6_rehash,
+ 	.get_port		= udp_v6_get_port,
++#ifdef CONFIG_BPF_SYSCALL
++	.psock_update_sk_prot	= udp_bpf_update_proto,
++#endif
+ 	.memory_allocated	= &udp_memory_allocated,
+ 	.sysctl_mem		= sysctl_udp_mem,
+ 	.sysctl_wmem_offset     = offsetof(struct net, ipv4.sysctl_udp_wmem_min),
