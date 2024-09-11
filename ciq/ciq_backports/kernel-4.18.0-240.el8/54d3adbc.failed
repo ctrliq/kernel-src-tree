@@ -1,0 +1,943 @@
+ext4: save all error info in save_error_info() and drop ext4_set_errno()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit 54d3adbc29f0c7c53890da1683e629cd220d7201
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/54d3adbc.failed
+
+Using a separate function, ext4_set_errno() to set the errno is
+problematic because it doesn't do the right thing once
+s_last_error_errorcode is non-zero.  It's also less racy to set all of
+the error information all at once.  (Also, as a bonus, it shrinks code
+size slightly.)
+
+Link: https://lore.kernel.org/r/20200329020404.686965-1-tytso@mit.edu
+Fixes: 878520ac45f9 ("ext4: save the error code which triggered...")
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 54d3adbc29f0c7c53890da1683e629cd220d7201)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/balloc.c
+#	fs/ext4/block_validity.c
+#	fs/ext4/ext4_jbd2.c
+#	fs/ext4/extents.c
+#	fs/ext4/ialloc.c
+#	fs/ext4/inline.c
+#	fs/ext4/inode.c
+#	fs/ext4/mballoc.c
+#	fs/ext4/mmp.c
+#	fs/ext4/namei.c
+#	fs/ext4/super.c
+#	fs/ext4/xattr.c
+diff --cc fs/ext4/balloc.c
+index ac7224038263,0e0a4d6209c7..000000000000
+--- a/fs/ext4/balloc.c
++++ b/fs/ext4/balloc.c
+@@@ -505,10 -514,11 +505,16 @@@ int ext4_wait_block_bitmap(struct super
+  	if (!desc)
+  		return -EFSCORRUPTED;
+  	wait_on_buffer(bh);
+ -	ext4_simulate_fail_bh(sb, bh, EXT4_SIM_BBITMAP_EIO);
+  	if (!buffer_uptodate(bh)) {
+++<<<<<<< HEAD
+ +		ext4_error(sb, "Cannot read block bitmap - "
+ +			   "block_group = %u, block_bitmap = %llu",
+ +			   block_group, (unsigned long long) bh->b_blocknr);
+++=======
++ 		ext4_error_err(sb, EIO, "Cannot read block bitmap - "
++ 			       "block_group = %u, block_bitmap = %llu",
++ 			       block_group, (unsigned long long) bh->b_blocknr);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		ext4_mark_group_bitmap_corrupted(sb, block_group,
+  					EXT4_GROUP_INFO_BBITMAP_CORRUPT);
+  		return -EIO;
+diff --cc fs/ext4/block_validity.c
+index 64c1310e4364,16e9b2fda03a..000000000000
+--- a/fs/ext4/block_validity.c
++++ b/fs/ext4/block_validity.c
+@@@ -203,10 -166,13 +203,17 @@@ int ext4_data_block_valid(struct ext4_s
+  
+  	if ((start_blk <= le32_to_cpu(sbi->s_es->s_first_data_block)) ||
+  	    (start_blk + count < start_blk) ||
+- 	    (start_blk + count > ext4_blocks_count(sbi->s_es))) {
+- 		sbi->s_es->s_last_error_block = cpu_to_le64(start_blk);
++ 	    (start_blk + count > ext4_blocks_count(sbi->s_es)))
+  		return 0;
+++<<<<<<< HEAD
+ +	}
+++=======
++ 
++ 	if (system_blks == NULL)
++ 		return 1;
++ 
++ 	n = system_blks->root.rb_node;
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  	while (n) {
+  		entry = rb_entry(n, struct ext4_system_zone, node);
+  		if (start_blk + count - 1 < entry->start_blk)
+@@@ -221,6 -185,181 +226,184 @@@
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ext4_protect_reserved_inode(struct super_block *sb,
++ 				       struct ext4_system_blocks *system_blks,
++ 				       u32 ino)
++ {
++ 	struct inode *inode;
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	struct ext4_map_blocks map;
++ 	u32 i = 0, num;
++ 	int err = 0, n;
++ 
++ 	if ((ino < EXT4_ROOT_INO) ||
++ 	    (ino > le32_to_cpu(sbi->s_es->s_inodes_count)))
++ 		return -EINVAL;
++ 	inode = ext4_iget(sb, ino, EXT4_IGET_SPECIAL);
++ 	if (IS_ERR(inode))
++ 		return PTR_ERR(inode);
++ 	num = (inode->i_size + sb->s_blocksize - 1) >> sb->s_blocksize_bits;
++ 	while (i < num) {
++ 		cond_resched();
++ 		map.m_lblk = i;
++ 		map.m_len = num - i;
++ 		n = ext4_map_blocks(NULL, inode, &map, 0);
++ 		if (n < 0) {
++ 			err = n;
++ 			break;
++ 		}
++ 		if (n == 0) {
++ 			i++;
++ 		} else {
++ 			if (!ext4_data_block_valid_rcu(sbi, system_blks,
++ 						map.m_pblk, n)) {
++ 				err = -EFSCORRUPTED;
++ 				__ext4_error(sb, __func__, __LINE__, -err,
++ 					     map.m_pblk, "blocks %llu-%llu "
++ 					     "from inode %u overlap system zone",
++ 					     map.m_pblk,
++ 					     map.m_pblk + map.m_len - 1, ino);
++ 				break;
++ 			}
++ 			err = add_system_zone(system_blks, map.m_pblk, n);
++ 			if (err < 0)
++ 				break;
++ 			i += n;
++ 		}
++ 	}
++ 	iput(inode);
++ 	return err;
++ }
++ 
++ static void ext4_destroy_system_zone(struct rcu_head *rcu)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 
++ 	system_blks = container_of(rcu, struct ext4_system_blocks, rcu);
++ 	release_system_zone(system_blks);
++ 	kfree(system_blks);
++ }
++ 
++ /*
++  * Build system zone rbtree which is used for block validity checking.
++  *
++  * The update of system_blks pointer in this function is protected by
++  * sb->s_umount semaphore. However we have to be careful as we can be
++  * racing with ext4_data_block_valid() calls reading system_blks rbtree
++  * protected only by RCU. That's why we first build the rbtree and then
++  * swap it in place.
++  */
++ int ext4_setup_system_zone(struct super_block *sb)
++ {
++ 	ext4_group_t ngroups = ext4_get_groups_count(sb);
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	struct ext4_system_blocks *system_blks;
++ 	struct ext4_group_desc *gdp;
++ 	ext4_group_t i;
++ 	int flex_size = ext4_flex_bg_size(sbi);
++ 	int ret;
++ 
++ 	if (!test_opt(sb, BLOCK_VALIDITY)) {
++ 		if (sbi->system_blks)
++ 			ext4_release_system_zone(sb);
++ 		return 0;
++ 	}
++ 	if (sbi->system_blks)
++ 		return 0;
++ 
++ 	system_blks = kzalloc(sizeof(*system_blks), GFP_KERNEL);
++ 	if (!system_blks)
++ 		return -ENOMEM;
++ 
++ 	for (i=0; i < ngroups; i++) {
++ 		cond_resched();
++ 		if (ext4_bg_has_super(sb, i) &&
++ 		    ((i < 5) || ((i % flex_size) == 0)))
++ 			add_system_zone(system_blks,
++ 					ext4_group_first_block_no(sb, i),
++ 					ext4_bg_num_gdb(sb, i) + 1);
++ 		gdp = ext4_get_group_desc(sb, i, NULL);
++ 		ret = add_system_zone(system_blks,
++ 				ext4_block_bitmap(sb, gdp), 1);
++ 		if (ret)
++ 			goto err;
++ 		ret = add_system_zone(system_blks,
++ 				ext4_inode_bitmap(sb, gdp), 1);
++ 		if (ret)
++ 			goto err;
++ 		ret = add_system_zone(system_blks,
++ 				ext4_inode_table(sb, gdp),
++ 				sbi->s_itb_per_group);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 	if (ext4_has_feature_journal(sb) && sbi->s_es->s_journal_inum) {
++ 		ret = ext4_protect_reserved_inode(sb, system_blks,
++ 				le32_to_cpu(sbi->s_es->s_journal_inum));
++ 		if (ret)
++ 			goto err;
++ 	}
++ 
++ 	/*
++ 	 * System blks rbtree complete, announce it once to prevent racing
++ 	 * with ext4_data_block_valid() accessing the rbtree at the same
++ 	 * time.
++ 	 */
++ 	rcu_assign_pointer(sbi->system_blks, system_blks);
++ 
++ 	if (test_opt(sb, DEBUG))
++ 		debug_print_tree(sbi);
++ 	return 0;
++ err:
++ 	release_system_zone(system_blks);
++ 	kfree(system_blks);
++ 	return ret;
++ }
++ 
++ /*
++  * Called when the filesystem is unmounted or when remounting it with
++  * noblock_validity specified.
++  *
++  * The update of system_blks pointer in this function is protected by
++  * sb->s_umount semaphore. However we have to be careful as we can be
++  * racing with ext4_data_block_valid() calls reading system_blks rbtree
++  * protected only by RCU. So we first clear the system_blks pointer and
++  * then free the rbtree only after RCU grace period expires.
++  */
++ void ext4_release_system_zone(struct super_block *sb)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 
++ 	system_blks = rcu_dereference_protected(EXT4_SB(sb)->system_blks,
++ 					lockdep_is_held(&sb->s_umount));
++ 	rcu_assign_pointer(EXT4_SB(sb)->system_blks, NULL);
++ 
++ 	if (system_blks)
++ 		call_rcu(&system_blks->rcu, ext4_destroy_system_zone);
++ }
++ 
++ int ext4_data_block_valid(struct ext4_sb_info *sbi, ext4_fsblk_t start_blk,
++ 			  unsigned int count)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 	int ret;
++ 
++ 	/*
++ 	 * Lock the system zone to prevent it being released concurrently
++ 	 * when doing a remount which inverse current "[no]block_validity"
++ 	 * mount option.
++ 	 */
++ 	rcu_read_lock();
++ 	system_blks = rcu_dereference(sbi->system_blks);
++ 	ret = ext4_data_block_valid_rcu(sbi, system_blks, start_blk,
++ 					count);
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ 
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  int ext4_check_blockref(const char *function, unsigned int line,
+  			struct inode *inode, __le32 *p, unsigned int max)
+  {
+diff --cc fs/ext4/ext4_jbd2.c
+index ac50bd4e1f2f,7f16e1af8d5c..000000000000
+--- a/fs/ext4/ext4_jbd2.c
++++ b/fs/ext4/ext4_jbd2.c
+@@@ -58,7 -80,7 +58,11 @@@ static int ext4_journal_check_start(str
+  	 * take the FS itself readonly cleanly.
+  	 */
+  	if (journal && is_journal_aborted(journal)) {
+++<<<<<<< HEAD
+ +		ext4_abort(sb, "Detected aborted journal");
+++=======
++ 		ext4_abort(sb, -journal->j_errno, "Detected aborted journal");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		return -EROFS;
+  	}
+  	return 0;
+@@@ -234,7 -271,7 +238,11 @@@ int __ext4_forget(const char *where, un
+  	if (err) {
+  		ext4_journal_abort_handle(where, line, __func__,
+  					  bh, handle, err);
+++<<<<<<< HEAD
+ +		__ext4_abort(inode->i_sb, where, line,
+++=======
++ 		__ext4_abort(inode->i_sb, where, line, -err,
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			   "error %d when attempting revoke", err);
+  	}
+  	BUFFER_TRACE(bh, "exit");
+@@@ -303,10 -341,8 +311,15 @@@ int __ext4_handle_dirty_metadata(const 
+  				struct ext4_super_block *es;
+  
+  				es = EXT4_SB(inode->i_sb)->s_es;
+++<<<<<<< HEAD
+ +				es->s_last_error_block =
+ +					cpu_to_le64(bh->b_blocknr);
+ +				ext4_error_inode(inode, where, line,
+ +						 bh->b_blocknr,
+++=======
++ 				ext4_error_inode_err(inode, where, line,
++ 						     bh->b_blocknr, EIO,
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  					"IO error syncing itable block");
+  				err = -EIO;
+  			}
+diff --cc fs/ext4/extents.c
+index 6539026f4aad,031752cfb6f7..000000000000
+--- a/fs/ext4/extents.c
++++ b/fs/ext4/extents.c
+@@@ -483,13 -437,14 +480,24 @@@ static int __ext4_ext_check(const char 
+  	return 0;
+  
+  corrupted:
+++<<<<<<< HEAD
+ +	ext4_error_inode(inode, function, line, 0,
+ +			 "pblk %llu bad header/extent: %s - magic %x, "
+ +			 "entries %u, max %u(%u), depth %u(%u)",
+ +			 (unsigned long long) pblk, error_msg,
+ +			 le16_to_cpu(eh->eh_magic),
+ +			 le16_to_cpu(eh->eh_entries), le16_to_cpu(eh->eh_max),
+ +			 max, le16_to_cpu(eh->eh_depth), depth);
+++=======
++ 	ext4_error_inode_err(inode, function, line, 0, -err,
++ 			     "pblk %llu bad header/extent: %s - magic %x, "
++ 			     "entries %u, max %u(%u), depth %u(%u)",
++ 			     (unsigned long long) pblk, error_msg,
++ 			     le16_to_cpu(eh->eh_magic),
++ 			     le16_to_cpu(eh->eh_entries),
++ 			     le16_to_cpu(eh->eh_max),
++ 			     max, le16_to_cpu(eh->eh_depth), depth);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  	return err;
+  }
+  
+diff --cc fs/ext4/ialloc.c
+index 859abdcd1075,b420c9dc444d..000000000000
+--- a/fs/ext4/ialloc.c
++++ b/fs/ext4/ialloc.c
+@@@ -192,11 -193,12 +192,17 @@@ ext4_read_inode_bitmap(struct super_blo
+  	get_bh(bh);
+  	submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+  	wait_on_buffer(bh);
+ -	ext4_simulate_fail_bh(sb, bh, EXT4_SIM_IBITMAP_EIO);
+  	if (!buffer_uptodate(bh)) {
+  		put_bh(bh);
+++<<<<<<< HEAD
+ +		ext4_error(sb, "Cannot read inode bitmap - "
+ +			   "block_group = %u, inode_bitmap = %llu",
+ +			   block_group, bitmap_blk);
+++=======
++ 		ext4_error_err(sb, EIO, "Cannot read inode bitmap - "
++ 			       "block_group = %u, inode_bitmap = %llu",
++ 			       block_group, bitmap_blk);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		ext4_mark_group_bitmap_corrupted(sb, block_group,
+  				EXT4_GROUP_INFO_IBITMAP_CORRUPT);
+  		return ERR_PTR(-EIO);
+@@@ -1241,8 -1243,9 +1247,14 @@@ struct inode *ext4_orphan_get(struct su
+  	inode = ext4_iget(sb, ino, EXT4_IGET_NORMAL);
+  	if (IS_ERR(inode)) {
+  		err = PTR_ERR(inode);
+++<<<<<<< HEAD
+ +		ext4_error(sb, "couldn't read orphan inode %lu (err %d)",
+ +			   ino, err);
+++=======
++ 		ext4_error_err(sb, -err,
++ 			       "couldn't read orphan inode %lu (err %d)",
++ 			       ino, err);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		return inode;
+  	}
+  
+diff --cc fs/ext4/inline.c
+index acbf40518cfb,f35e289e17aa..000000000000
+--- a/fs/ext4/inline.c
++++ b/fs/ext4/inline.c
+@@@ -98,9 -98,9 +98,15 @@@ int ext4_get_max_inline_size(struct ino
+  
+  	error = ext4_get_inode_loc(inode, &iloc);
+  	if (error) {
+++<<<<<<< HEAD
+ +		ext4_error_inode(inode, __func__, __LINE__, 0,
+ +				 "can't get inode location %lu",
+ +				 inode->i_ino);
+++=======
++ 		ext4_error_inode_err(inode, __func__, __LINE__, 0, -error,
++ 				     "can't get inode location %lu",
++ 				     inode->i_ino);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		return 0;
+  	}
+  
+@@@ -1764,8 -1761,9 +1770,14 @@@ bool empty_inline_dir(struct inode *dir
+  
+  	err = ext4_get_inode_loc(dir, &iloc);
+  	if (err) {
+++<<<<<<< HEAD
+ +		EXT4_ERROR_INODE(dir, "error %d getting inode %lu block",
+ +				 err, dir->i_ino);
+++=======
++ 		EXT4_ERROR_INODE_ERR(dir, -err,
++ 				     "error %d getting inode %lu block",
++ 				     err, dir->i_ino);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		return true;
+  	}
+  
+diff --cc fs/ext4/inode.c
+index 51c2dd93f057,e416096fc081..000000000000
+--- a/fs/ext4/inode.c
++++ b/fs/ext4/inode.c
+@@@ -307,9 -269,9 +307,15 @@@ void ext4_evict_inode(struct inode *ino
+  	if (inode->i_blocks) {
+  		err = ext4_truncate(inode);
+  		if (err) {
+++<<<<<<< HEAD
+ +			ext4_error(inode->i_sb,
+ +				   "couldn't truncate inode %lu (err %d)",
+ +				   inode->i_ino, err);
+++=======
++ 			ext4_error_err(inode->i_sb, -err,
++ 				       "couldn't truncate inode %lu (err %d)",
++ 				       inode->i_ino, err);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			goto stop_handle;
+  		}
+  	}
+@@@ -2609,10 -2476,11 +2615,18 @@@ update_disksize
+  			EXT4_I(inode)->i_disksize = disksize;
+  		up_write(&EXT4_I(inode)->i_data_sem);
+  		err2 = ext4_mark_inode_dirty(handle, inode);
+++<<<<<<< HEAD
+ +		if (err2)
+ +			ext4_error(inode->i_sb,
+ +				   "Failed to mark inode %lu dirty",
+ +				   inode->i_ino);
+++=======
++ 		if (err2) {
++ 			ext4_error_err(inode->i_sb, -err2,
++ 				       "Failed to mark inode %lu dirty",
++ 				       inode->i_ino);
++ 		}
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		if (!err)
+  			err = err2;
+  	}
+@@@ -4725,9 -4376,11 +4739,14 @@@ make_io
+  		get_bh(bh);
+  		bh->b_end_io = end_buffer_read_sync;
+  		submit_bh(REQ_OP_READ, REQ_META | REQ_PRIO, bh);
+ -		blk_finish_plug(&plug);
+  		wait_on_buffer(bh);
+  		if (!buffer_uptodate(bh)) {
+++<<<<<<< HEAD
+ +			EXT4_ERROR_INODE_BLOCK(inode, block,
+++=======
++ 		simulate_eio:
++ 			ext4_error_inode_block(inode, block, EIO,
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  					       "unable to read itable block");
+  			brelse(bh);
+  			return -EIO;
+@@@ -4934,9 -4593,10 +4953,16 @@@ struct inode *__ext4_iget(struct super_
+  					      sizeof(gen));
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!ext4_inode_csum_verify(inode, raw_inode, ei)) {
+ +		ext4_error_inode(inode, function, line, 0,
+ +				 "iget: checksum invalid");
+++=======
++ 	if (!ext4_inode_csum_verify(inode, raw_inode, ei) ||
++ 	    ext4_simulate_fail(sb, EXT4_SIM_INODE_CRC)) {
++ 		ext4_error_inode_err(inode, function, line, 0, EFSBADCRC,
++ 				     "iget: checksum invalid");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		ret = -EFSBADCRC;
+  		goto bad_inode;
+  	}
+@@@ -5482,8 -5145,8 +5508,13 @@@ int ext4_write_inode(struct inode *inod
+  		if (wbc->sync_mode == WB_SYNC_ALL && !wbc->for_sync)
+  			sync_dirty_buffer(iloc.bh);
+  		if (buffer_req(iloc.bh) && !buffer_uptodate(iloc.bh)) {
+++<<<<<<< HEAD
+ +			EXT4_ERROR_INODE_BLOCK(inode, iloc.bh->b_blocknr,
+ +					 "IO error syncing inode");
+++=======
++ 			ext4_error_inode_block(inode, iloc.bh->b_blocknr, EIO,
++ 					       "IO error syncing inode");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			err = -EIO;
+  		}
+  		brelse(iloc.bh);
+diff --cc fs/ext4/mballoc.c
+index 61cb0d814798,87c85be4c12e..000000000000
+--- a/fs/ext4/mballoc.c
++++ b/fs/ext4/mballoc.c
+@@@ -3913,8 -3921,9 +3913,14 @@@ ext4_mb_discard_group_preallocations(st
+  	bitmap_bh = ext4_read_block_bitmap(sb, group);
+  	if (IS_ERR(bitmap_bh)) {
+  		err = PTR_ERR(bitmap_bh);
+++<<<<<<< HEAD
+ +		ext4_error(sb, "Error %d reading block bitmap for %u",
+ +			   err, group);
+++=======
++ 		ext4_error_err(sb, -err,
++ 			       "Error %d reading block bitmap for %u",
++ 			       err, group);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  		return 0;
+  	}
+  
+@@@ -4081,16 -4090,16 +4087,26 @@@ repeat
+  		err = ext4_mb_load_buddy_gfp(sb, group, &e4b,
+  					     GFP_NOFS|__GFP_NOFAIL);
+  		if (err) {
+++<<<<<<< HEAD
+ +			ext4_error(sb, "Error %d loading buddy information for %u",
+ +				   err, group);
+++=======
++ 			ext4_error_err(sb, -err, "Error %d loading buddy information for %u",
++ 				       err, group);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			continue;
+  		}
+  
+  		bitmap_bh = ext4_read_block_bitmap(sb, group);
+  		if (IS_ERR(bitmap_bh)) {
+  			err = PTR_ERR(bitmap_bh);
+++<<<<<<< HEAD
+ +			ext4_error(sb, "Error %d reading block bitmap for %u",
+ +					err, group);
+++=======
++ 			ext4_error_err(sb, -err, "Error %d reading block bitmap for %u",
++ 				       err, group);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			ext4_mb_unload_buddy(&e4b);
+  			continue;
+  		}
+@@@ -4343,8 -4353,8 +4359,13 @@@ ext4_mb_discard_lg_preallocations(struc
+  		err = ext4_mb_load_buddy_gfp(sb, group, &e4b,
+  					     GFP_NOFS|__GFP_NOFAIL);
+  		if (err) {
+++<<<<<<< HEAD
+ +			ext4_error(sb, "Error %d loading buddy information for %u",
+ +				   err, group);
+++=======
++ 			ext4_error_err(sb, -err, "Error %d loading buddy information for %u",
++ 				       err, group);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			continue;
+  		}
+  		ext4_lock_group(sb, group);
+diff --cc fs/ext4/mmp.c
+index 9d00e0dd2ba9,d34cb8c46655..000000000000
+--- a/fs/ext4/mmp.c
++++ b/fs/ext4/mmp.c
+@@@ -174,8 -174,10 +174,15 @@@ static int kmmpd(void *data
+  		 * (s_mmp_update_interval * 60) seconds.
+  		 */
+  		if (retval) {
+++<<<<<<< HEAD
+ +			if ((failed_writes % 60) == 0)
+ +				ext4_error(sb, "Error writing to MMP block");
+++=======
++ 			if ((failed_writes % 60) == 0) {
++ 				ext4_error_err(sb, -retval,
++ 					       "Error writing to MMP block");
++ 			}
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			failed_writes++;
+  		}
+  
+@@@ -206,8 -208,9 +213,14 @@@
+  
+  			retval = read_mmp_block(sb, &bh_check, mmp_block);
+  			if (retval) {
+++<<<<<<< HEAD
+ +				ext4_error(sb, "error reading MMP data: %d",
+ +					   retval);
+++=======
++ 				ext4_error_err(sb, -retval,
++ 					       "error reading MMP data: %d",
++ 					       retval);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  				goto exit_thread;
+  			}
+  
+@@@ -219,7 -222,7 +232,11 @@@
+  					     "Error while updating MMP info. "
+  					     "The filesystem seems to have been"
+  					     " multiply mounted.");
+++<<<<<<< HEAD
+ +				ext4_error(sb, "abort");
+++=======
++ 				ext4_error_err(sb, EBUSY, "abort");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  				put_bh(bh_check);
+  				retval = -EBUSY;
+  				goto exit_thread;
+diff --cc fs/ext4/namei.c
+index 7d2260f77f73,a8aca4772aaa..000000000000
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@@ -139,21 -156,25 +139,33 @@@ static struct buffer_head *__ext4_read_
+  	 * caller is sure it should be an index block.
+  	 */
+  	if (is_dx_block && type == INDEX) {
+ -		if (ext4_dx_csum_verify(inode, dirent) &&
+ -		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))
+ +		if (ext4_dx_csum_verify(inode, dirent))
+  			set_buffer_verified(bh);
+  		else {
+++<<<<<<< HEAD
+ +			ext4_error_inode(inode, func, line, block,
+ +					 "Directory index failed checksum");
+++=======
++ 			ext4_error_inode_err(inode, func, line, block,
++ 					     EFSBADCRC,
++ 					     "Directory index failed checksum");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			brelse(bh);
+  			return ERR_PTR(-EFSBADCRC);
+  		}
+  	}
+  	if (!is_dx_block) {
+ -		if (ext4_dirblock_csum_verify(inode, bh) &&
+ -		    !ext4_simulate_fail(inode->i_sb, EXT4_SIM_DIRBLOCK_CRC))
+ +		if (ext4_dirent_csum_verify(inode, dirent))
+  			set_buffer_verified(bh);
+  		else {
+++<<<<<<< HEAD
+ +			ext4_error_inode(inode, func, line, block,
+ +					 "Directory block failed checksum");
+++=======
++ 			ext4_error_inode_err(inode, func, line, block,
++ 					     EFSBADCRC,
++ 					     "Directory block failed checksum");
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			brelse(bh);
+  			return ERR_PTR(-EFSBADCRC);
+  		}
+@@@ -1439,8 -1532,9 +1451,14 @@@ restart
+  			goto next;
+  		wait_on_buffer(bh);
+  		if (!buffer_uptodate(bh)) {
+++<<<<<<< HEAD
+ +			EXT4_ERROR_INODE(dir, "reading directory lblock %lu",
+ +					 (unsigned long) block);
+++=======
++ 			EXT4_ERROR_INODE_ERR(dir, EIO,
++ 					     "reading directory lblock %lu",
++ 					     (unsigned long) block);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			brelse(bh);
+  			ret = ERR_PTR(-EIO);
+  			goto cleanup_and_exit;
+@@@ -1448,10 -1542,10 +1466,17 @@@
+  		if (!buffer_verified(bh) &&
+  		    !is_dx_internal_node(dir, block,
+  					 (struct ext4_dir_entry *)bh->b_data) &&
+++<<<<<<< HEAD
+ +		    !ext4_dirent_csum_verify(dir,
+ +				(struct ext4_dir_entry *)bh->b_data)) {
+ +			EXT4_ERROR_INODE(dir, "checksumming directory "
+ +					 "block %lu", (unsigned long)block);
+++=======
++ 		    !ext4_dirblock_csum_verify(dir, bh)) {
++ 			EXT4_ERROR_INODE_ERR(dir, EFSBADCRC,
++ 					     "checksumming directory "
++ 					     "block %lu", (unsigned long)block);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			brelse(bh);
+  			ret = ERR_PTR(-EFSBADCRC);
+  			goto cleanup_and_exit;
+diff --cc fs/ext4/super.c
+index 0b924fdb8e4c,1dc22825fdf7..000000000000
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@@ -366,6 -349,62 +368,65 @@@ static void __save_error_info(struct su
+  	ext4_update_tstamp(es, s_last_error_time);
+  	strncpy(es->s_last_error_func, func, sizeof(es->s_last_error_func));
+  	es->s_last_error_line = cpu_to_le32(line);
+++<<<<<<< HEAD
+++=======
++ 	es->s_last_error_ino = cpu_to_le32(ino);
++ 	es->s_last_error_block = cpu_to_le64(block);
++ 	switch (error) {
++ 	case EIO:
++ 		err = EXT4_ERR_EIO;
++ 		break;
++ 	case ENOMEM:
++ 		err = EXT4_ERR_ENOMEM;
++ 		break;
++ 	case EFSBADCRC:
++ 		err = EXT4_ERR_EFSBADCRC;
++ 		break;
++ 	case 0:
++ 	case EFSCORRUPTED:
++ 		err = EXT4_ERR_EFSCORRUPTED;
++ 		break;
++ 	case ENOSPC:
++ 		err = EXT4_ERR_ENOSPC;
++ 		break;
++ 	case ENOKEY:
++ 		err = EXT4_ERR_ENOKEY;
++ 		break;
++ 	case EROFS:
++ 		err = EXT4_ERR_EROFS;
++ 		break;
++ 	case EFBIG:
++ 		err = EXT4_ERR_EFBIG;
++ 		break;
++ 	case EEXIST:
++ 		err = EXT4_ERR_EEXIST;
++ 		break;
++ 	case ERANGE:
++ 		err = EXT4_ERR_ERANGE;
++ 		break;
++ 	case EOVERFLOW:
++ 		err = EXT4_ERR_EOVERFLOW;
++ 		break;
++ 	case EBUSY:
++ 		err = EXT4_ERR_EBUSY;
++ 		break;
++ 	case ENOTDIR:
++ 		err = EXT4_ERR_ENOTDIR;
++ 		break;
++ 	case ENOTEMPTY:
++ 		err = EXT4_ERR_ENOTEMPTY;
++ 		break;
++ 	case ESHUTDOWN:
++ 		err = EXT4_ERR_ESHUTDOWN;
++ 		break;
++ 	case EFAULT:
++ 		err = EXT4_ERR_EFAULT;
++ 		break;
++ 	default:
++ 		err = EXT4_ERR_UNKNOWN;
++ 	}
++ 	es->s_last_error_errcode = err;
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  	if (!es->s_first_error_time) {
+  		es->s_first_error_time = es->s_last_error_time;
+  		es->s_first_error_time_hi = es->s_last_error_time_hi;
+@@@ -655,7 -695,7 +716,11 @@@ void __ext4_std_error(struct super_bloc
+  		       sb->s_id, function, line, errstr);
+  	}
+  
+++<<<<<<< HEAD
+ +	save_error_info(sb, function, line);
+++=======
++ 	save_error_info(sb, -errno, 0, 0, function, line);
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  	ext4_handle_error(sb);
+  }
+  
+@@@ -989,8 -1027,9 +1050,14 @@@ static void ext4_put_super(struct super
+  		aborted = is_journal_aborted(sbi->s_journal);
+  		err = jbd2_journal_destroy(sbi->s_journal);
+  		sbi->s_journal = NULL;
+++<<<<<<< HEAD
+ +		if ((err < 0) && !aborted)
+ +			ext4_abort(sb, "Couldn't clean up the journal");
+++=======
++ 		if ((err < 0) && !aborted) {
++ 			ext4_abort(sb, -err, "Couldn't clean up the journal");
++ 		}
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  	}
+  
+  	ext4_es_unregister_shrinker(sbi);
+diff --cc fs/ext4/xattr.c
+index 894a61010ae9,21df43a25328..000000000000
+--- a/fs/ext4/xattr.c
++++ b/fs/ext4/xattr.c
+@@@ -2904,9 -2879,11 +2904,17 @@@ int ext4_xattr_delete_inode(handle_t *h
+  		bh = ext4_sb_bread(inode->i_sb, EXT4_I(inode)->i_file_acl, REQ_PRIO);
+  		if (IS_ERR(bh)) {
+  			error = PTR_ERR(bh);
+++<<<<<<< HEAD
+ +			if (error == -EIO)
+ +				EXT4_ERROR_INODE(inode, "block %llu read error",
+ +						 EXT4_I(inode)->i_file_acl);
+++=======
++ 			if (error == -EIO) {
++ 				EXT4_ERROR_INODE_ERR(inode, EIO,
++ 						     "block %llu read error",
++ 						     EXT4_I(inode)->i_file_acl);
++ 			}
+++>>>>>>> 54d3adbc29f0 (ext4: save all error info in save_error_info() and drop ext4_set_errno())
+  			bh = NULL;
+  			goto cleanup;
+  		}
+* Unmerged path fs/ext4/balloc.c
+* Unmerged path fs/ext4/block_validity.c
+diff --git a/fs/ext4/ext4.h b/fs/ext4/ext4.h
+index 3736a1f6d780..f87f725f4d1c 100644
+--- a/fs/ext4/ext4.h
++++ b/fs/ext4/ext4.h
+@@ -2577,19 +2577,19 @@ extern void ext4_mark_group_bitmap_corrupted(struct super_block *sb,
+ 					     ext4_group_t block_group,
+ 					     unsigned int flags);
+ 
+-extern __printf(4, 5)
+-void __ext4_error(struct super_block *, const char *, unsigned int,
++extern __printf(6, 7)
++void __ext4_error(struct super_block *, const char *, unsigned int, int, __u64,
+ 		  const char *, ...);
+-extern __printf(5, 6)
+-void __ext4_error_inode(struct inode *, const char *, unsigned int, ext4_fsblk_t,
+-		      const char *, ...);
++extern __printf(6, 7)
++void __ext4_error_inode(struct inode *, const char *, unsigned int,
++			ext4_fsblk_t, int, const char *, ...);
+ extern __printf(5, 6)
+ void __ext4_error_file(struct file *, const char *, unsigned int, ext4_fsblk_t,
+ 		     const char *, ...);
+ extern void __ext4_std_error(struct super_block *, const char *,
+ 			     unsigned int, int);
+-extern __printf(4, 5)
+-void __ext4_abort(struct super_block *, const char *, unsigned int,
++extern __printf(5, 6)
++void __ext4_abort(struct super_block *, const char *, unsigned int, int,
+ 		  const char *, ...);
+ extern __printf(4, 5)
+ void __ext4_warning(struct super_block *, const char *, unsigned int,
+@@ -2610,8 +2610,12 @@ void __ext4_grp_locked_error(const char *, unsigned int,
+ #define EXT4_ERROR_INODE(inode, fmt, a...) \
+ 	ext4_error_inode((inode), __func__, __LINE__, 0, (fmt), ## a)
+ 
+-#define EXT4_ERROR_INODE_BLOCK(inode, block, fmt, a...)			\
+-	ext4_error_inode((inode), __func__, __LINE__, (block), (fmt), ## a)
++#define EXT4_ERROR_INODE_ERR(inode, err, fmt, a...)			\
++	__ext4_error_inode((inode), __func__, __LINE__, 0, (err), (fmt), ## a)
++
++#define ext4_error_inode_block(inode, block, err, fmt, a...)		\
++	__ext4_error_inode((inode), __func__, __LINE__, (block), (err),	\
++			   (fmt), ## a)
+ 
+ #define EXT4_ERROR_FILE(file, block, fmt, a...)				\
+ 	ext4_error_file((file), __func__, __LINE__, (block), (fmt), ## a)
+@@ -2619,13 +2623,18 @@ void __ext4_grp_locked_error(const char *, unsigned int,
+ #ifdef CONFIG_PRINTK
+ 
+ #define ext4_error_inode(inode, func, line, block, fmt, ...)		\
+-	__ext4_error_inode(inode, func, line, block, fmt, ##__VA_ARGS__)
++	__ext4_error_inode(inode, func, line, block, 0, fmt, ##__VA_ARGS__)
++#define ext4_error_inode_err(inode, func, line, block, err, fmt, ...)	\
++	__ext4_error_inode((inode), (func), (line), (block), 		\
++			   (err), (fmt), ##__VA_ARGS__)
+ #define ext4_error_file(file, func, line, block, fmt, ...)		\
+ 	__ext4_error_file(file, func, line, block, fmt, ##__VA_ARGS__)
+ #define ext4_error(sb, fmt, ...)					\
+-	__ext4_error(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
+-#define ext4_abort(sb, fmt, ...)					\
+-	__ext4_abort(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
++	__ext4_error((sb), __func__, __LINE__, 0, 0, (fmt), ##__VA_ARGS__)
++#define ext4_error_err(sb, err, fmt, ...)				\
++	__ext4_error((sb), __func__, __LINE__, (err), 0, (fmt), ##__VA_ARGS__)
++#define ext4_abort(sb, err, fmt, ...)					\
++	__ext4_abort((sb), __func__, __LINE__, (err), (fmt), ##__VA_ARGS__)
+ #define ext4_warning(sb, fmt, ...)					\
+ 	__ext4_warning(sb, __func__, __LINE__, fmt, ##__VA_ARGS__)
+ #define ext4_warning_inode(inode, fmt, ...)				\
+@@ -2643,7 +2652,12 @@ void __ext4_grp_locked_error(const char *, unsigned int,
+ #define ext4_error_inode(inode, func, line, block, fmt, ...)		\
+ do {									\
+ 	no_printk(fmt, ##__VA_ARGS__);					\
+-	__ext4_error_inode(inode, "", 0, block, " ");			\
++	__ext4_error_inode(inode, "", 0, block, 0, " ");		\
++} while (0)
++#define ext4_error_inode_err(inode, func, line, block, err, fmt, ...)	\
++do {									\
++	no_printk(fmt, ##__VA_ARGS__);					\
++	__ext4_error_inode(inode, "", 0, block, err, " ");		\
+ } while (0)
+ #define ext4_error_file(file, func, line, block, fmt, ...)		\
+ do {									\
+@@ -2653,12 +2667,17 @@ do {									\
+ #define ext4_error(sb, fmt, ...)					\
+ do {									\
+ 	no_printk(fmt, ##__VA_ARGS__);					\
+-	__ext4_error(sb, "", 0, " ");					\
++	__ext4_error(sb, "", 0, 0, 0, " ");				\
++} while (0)
++#define ext4_error_err(sb, err, fmt, ...)				\
++do {									\
++	no_printk(fmt, ##__VA_ARGS__);					\
++	__ext4_error(sb, "", 0, err, 0, " ");				\
+ } while (0)
+-#define ext4_abort(sb, fmt, ...)					\
++#define ext4_abort(sb, err, fmt, ...)					\
+ do {									\
+ 	no_printk(fmt, ##__VA_ARGS__);					\
+-	__ext4_abort(sb, "", 0, " ");					\
++	__ext4_abort(sb, "", 0, err, " ");				\
+ } while (0)
+ #define ext4_warning(sb, fmt, ...)					\
+ do {									\
+* Unmerged path fs/ext4/ext4_jbd2.c
+* Unmerged path fs/ext4/extents.c
+* Unmerged path fs/ext4/ialloc.c
+diff --git a/fs/ext4/indirect.c b/fs/ext4/indirect.c
+index 2024d3fa5504..9f8f287550c4 100644
+--- a/fs/ext4/indirect.c
++++ b/fs/ext4/indirect.c
+@@ -1022,7 +1022,7 @@ static void ext4_free_branches(handle_t *handle, struct inode *inode,
+ 			 * (should be rare).
+ 			 */
+ 			if (!bh) {
+-				EXT4_ERROR_INODE_BLOCK(inode, nr,
++				ext4_error_inode_block(inode, nr, EIO,
+ 						       "Read failure");
+ 				continue;
+ 			}
+* Unmerged path fs/ext4/inline.c
+* Unmerged path fs/ext4/inode.c
+* Unmerged path fs/ext4/mballoc.c
+* Unmerged path fs/ext4/mmp.c
+diff --git a/fs/ext4/move_extent.c b/fs/ext4/move_extent.c
+index c7ded4e2adff..b8e2d3ffee0a 100644
+--- a/fs/ext4/move_extent.c
++++ b/fs/ext4/move_extent.c
+@@ -422,8 +422,8 @@ move_extent_per_page(struct file *o_filp, struct inode *donor_inode,
+ 					   block_len_in_page, 0, &err2);
+ 	ext4_double_up_write_data_sem(orig_inode, donor_inode);
+ 	if (replaced_count != block_len_in_page) {
+-		EXT4_ERROR_INODE_BLOCK(orig_inode, (sector_t)(orig_blk_offset),
+-				       "Unable to copy data block,"
++		ext4_error_inode_block(orig_inode, (sector_t)(orig_blk_offset),
++				       EIO, "Unable to copy data block,"
+ 				       " data will be lost.");
+ 		*err = -EIO;
+ 	}
+* Unmerged path fs/ext4/namei.c
+* Unmerged path fs/ext4/super.c
+* Unmerged path fs/ext4/xattr.c
