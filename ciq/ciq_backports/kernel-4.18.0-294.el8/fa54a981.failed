@@ -1,0 +1,104 @@
+powerpc/lib: Use patch_site to patch copy_32 functions once cache is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christophe Leroy <christophe.leroy@c-s.fr>
+commit fa54a981ea7a852c145b05c95abba11e81fc1157
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fa54a981.failed
+
+The symbol memcpy_nocache_branch defined in order to allow patching
+of memset function once cache is enabled leads to confusing reports
+by perf tool.
+
+Using the new patch_site functionality solves this issue.
+
+	Signed-off-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit fa54a981ea7a852c145b05c95abba11e81fc1157)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 792f29cc222f,1f4691ce4126..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -176,10 -146,8 +176,14 @@@ long kvmppc_h_set_xdabr(struct kvm_vcp
+  /* Patch sites */
+  extern s32 patch__call_flush_count_cache;
+  extern s32 patch__flush_count_cache_return;
+++<<<<<<< HEAD
+ +extern s32 patch__flush_link_stack_return;
+ +extern s32 patch__call_kvm_flush_link_stack;
+++=======
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
+++>>>>>>> fa54a981ea7a (powerpc/lib: Use patch_site to patch copy_32 functions once cache is enabled)
+  
+  extern long flush_count_cache;
+ +extern long kvm_flush_link_stack;
+  
+  #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+diff --git a/arch/powerpc/kernel/setup_32.c b/arch/powerpc/kernel/setup_32.c
+index 9036d0eeafa6..00e6e0a28c0e 100644
+--- a/arch/powerpc/kernel/setup_32.c
++++ b/arch/powerpc/kernel/setup_32.c
+@@ -94,11 +94,10 @@ notrace unsigned long __init early_init(unsigned long dt_ptr)
+  * We do the initial parsing of the flat device-tree and prepares
+  * for the MMU to be fully initialized.
+  */
+-extern unsigned int memset_nocache_branch; /* Insn to be replaced by NOP */
+-
+ notrace void __init machine_init(u64 dt_ptr)
+ {
+-	unsigned int *addr = &memset_nocache_branch;
++	unsigned int *addr = (unsigned int *)((unsigned long)&patch__memset_nocache +
++					       patch__memset_nocache);
+ 	unsigned long insn;
+ 
+ 	/* Configure static keys first, now that we're relocated. */
+@@ -107,7 +106,7 @@ notrace void __init machine_init(u64 dt_ptr)
+ 	/* Enable early debugging if any specified (see udbg.h) */
+ 	udbg_early_init();
+ 
+-	patch_instruction((unsigned int *)&memcpy, PPC_INST_NOP);
++	patch_instruction_site(&patch__memcpy_nocache, PPC_INST_NOP);
+ 
+ 	insn = create_cond_branch(addr, branch_target(addr), 0x820000);
+ 	patch_instruction(addr, insn);	/* replace b by bne cr0 */
+diff --git a/arch/powerpc/lib/copy_32.S b/arch/powerpc/lib/copy_32.S
+index da425bb6b369..ba66846fe973 100644
+--- a/arch/powerpc/lib/copy_32.S
++++ b/arch/powerpc/lib/copy_32.S
+@@ -13,6 +13,7 @@
+ #include <asm/errno.h>
+ #include <asm/ppc_asm.h>
+ #include <asm/export.h>
++#include <asm/code-patching-asm.h>
+ 
+ #define COPY_16_BYTES		\
+ 	lwz	r7,4(r4);	\
+@@ -107,8 +108,8 @@ _GLOBAL(memset)
+ 	 * Skip optimised bloc until cache is enabled. Will be replaced
+ 	 * by 'bne' during boot to use normal procedure if r4 is not zero
+ 	 */
+-_GLOBAL(memset_nocache_branch)
+-	b	2f
++5:	b	2f
++	patch_site	5b, patch__memset_nocache
+ 
+ 	clrlwi	r7,r6,32-LG_CACHELINE_BYTES
+ 	add	r8,r7,r5
+@@ -168,7 +169,9 @@ _GLOBAL(memmove)
+ 	/* fall through */
+ 
+ _GLOBAL(memcpy)
+-	b	generic_memcpy
++1:	b	generic_memcpy
++	patch_site	1b, patch__memcpy_nocache
++
+ 	add	r7,r3,r5		/* test if the src & dst overlap */
+ 	add	r8,r4,r5
+ 	cmplw	0,r4,r7
