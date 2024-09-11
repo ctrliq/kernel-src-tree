@@ -1,0 +1,275 @@
+s390/qeth: add TX IRQ coalescing support for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit ee1e52d1e4bb91826a2bf5c0586d5b15eb619898
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ee1e52d1.failed
+
+Since IQD devices complete (most of) their transmissions synchronously,
+they don't offer TX completion IRQs and have no HW coalescing controls.
+But we can fake the easy parts in SW, and give the user some control wrt
+to how often the TX NAPI code should be triggered to process the TX
+completions.
+
+Having per-queue controls can in particular help the dedicated mcast
+queue, as it likely benefits from different fine-tuning than what the
+ucast queues need.
+
+CC: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ee1e52d1e4bb91826a2bf5c0586d5b15eb619898)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_ethtool.c
+diff --cc drivers/s390/net/qeth_ethtool.c
+index 0bf3125280f6,ebdc03210608..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -175,6 -208,112 +208,115 @@@ static void qeth_get_channels(struct ne
+  	channels->combined_count = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int qeth_set_channels(struct net_device *dev,
++ 			     struct ethtool_channels *channels)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (channels->rx_count == 0 || channels->tx_count == 0)
++ 		return -EINVAL;
++ 	if (channels->tx_count > card->qdio.no_out_queues)
++ 		return -EINVAL;
++ 
++ 	if (IS_IQD(card)) {
++ 		if (channels->tx_count < QETH_IQD_MIN_TXQ)
++ 			return -EINVAL;
++ 
++ 		/* Reject downgrade while running. It could push displaced
++ 		 * ucast flows onto txq0, which is reserved for mcast.
++ 		 */
++ 		if (netif_running(dev) &&
++ 		    channels->tx_count < dev->real_num_tx_queues)
++ 			return -EPERM;
++ 	} else {
++ 		/* OSA still uses the legacy prio-queue mechanism: */
++ 		if (!IS_VM_NIC(card))
++ 			return -EOPNOTSUPP;
++ 	}
++ 
++ 	return qeth_set_real_num_tx_queues(card, channels->tx_count);
++ }
++ 
++ static int qeth_get_ts_info(struct net_device *dev,
++ 			    struct ethtool_ts_info *info)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (!IS_IQD(card))
++ 		return -EOPNOTSUPP;
++ 
++ 	return ethtool_op_get_ts_info(dev, info);
++ }
++ 
++ static int qeth_get_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna, void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		*(u32 *)data = priv->rx_copybreak;
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int qeth_set_tunable(struct net_device *dev,
++ 			    const struct ethtool_tunable *tuna,
++ 			    const void *data)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 
++ 	switch (tuna->id) {
++ 	case ETHTOOL_RX_COPYBREAK:
++ 		WRITE_ONCE(priv->rx_copybreak, *(u32 *)data);
++ 		return 0;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int qeth_get_per_queue_coalesce(struct net_device *dev, u32 __queue,
++ 				       struct ethtool_coalesce *coal)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 	struct qeth_qdio_out_q *queue;
++ 
++ 	if (!IS_IQD(card))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (__queue >= card->qdio.no_out_queues)
++ 		return -EINVAL;
++ 
++ 	queue = card->qdio.out_qs[__queue];
++ 
++ 	coal->tx_coalesce_usecs = queue->coalesce_usecs;
++ 	coal->tx_max_coalesced_frames = queue->max_coalesced_frames;
++ 	return 0;
++ }
++ 
++ static int qeth_set_per_queue_coalesce(struct net_device *dev, u32 queue,
++ 				       struct ethtool_coalesce *coal)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (!IS_IQD(card))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (queue >= card->qdio.no_out_queues)
++ 		return -EINVAL;
++ 
++ 	if (!coal->tx_coalesce_usecs && !coal->tx_max_coalesced_frames)
++ 		return -EINVAL;
++ 
++ 	__qeth_set_coalesce(dev, card->qdio.out_qs[queue], coal);
++ 	return 0;
++ }
++ 
+++>>>>>>> ee1e52d1e4bb (s390/qeth: add TX IRQ coalescing support for IQD devices)
+  /* Helper function to fill 'advertising' and 'supported' which are the same. */
+  /* Autoneg and full-duplex are supported and advertised unconditionally.     */
+  /* Always advertise and support all speeds up to specified, and only one     */
+@@@ -381,6 -523,12 +526,15 @@@ const struct ethtool_ops qeth_ethtool_o
+  	.get_sset_count = qeth_get_sset_count,
+  	.get_drvinfo = qeth_get_drvinfo,
+  	.get_channels = qeth_get_channels,
+++<<<<<<< HEAD
+++=======
++ 	.set_channels = qeth_set_channels,
++ 	.get_ts_info = qeth_get_ts_info,
++ 	.get_tunable = qeth_get_tunable,
++ 	.set_tunable = qeth_set_tunable,
++ 	.get_per_queue_coalesce = qeth_get_per_queue_coalesce,
++ 	.set_per_queue_coalesce = qeth_set_per_queue_coalesce,
+++>>>>>>> ee1e52d1e4bb (s390/qeth: add TX IRQ coalescing support for IQD devices)
+  	.get_link_ksettings = qeth_get_link_ksettings,
+  };
+  
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 12da8cb3c90b..0797d01d15f8 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -461,6 +461,7 @@ struct qeth_out_q_stats {
+ 	u64 packing_mode_switch;
+ 	u64 stopped;
+ 	u64 doorbell;
++	u64 coal_frames;
+ 	u64 completion_yield;
+ 	u64 completion_timer;
+ 
+@@ -471,6 +472,8 @@ struct qeth_out_q_stats {
+ 	u64 tx_dropped;
+ };
+ 
++#define QETH_TX_MAX_COALESCED_FRAMES	1
++#define QETH_TX_COALESCE_USECS		25
+ #define QETH_TX_TIMER_USECS		500
+ 
+ struct qeth_qdio_out_q {
+@@ -494,9 +497,13 @@ struct qeth_qdio_out_q {
+ 	struct napi_struct napi;
+ 	struct timer_list timer;
+ 	struct qeth_hdr *prev_hdr;
++	unsigned int coalesced_frames;
+ 	u8 bulk_start;
+ 	u8 bulk_count;
+ 	u8 bulk_max;
++
++	unsigned int coalesce_usecs;
++	unsigned int max_coalesced_frames;
+ };
+ 
+ #define qeth_for_each_output_queue(card, q, i)		\
+@@ -505,12 +512,10 @@ struct qeth_qdio_out_q {
+ 
+ #define	qeth_napi_to_out_queue(n) container_of(n, struct qeth_qdio_out_q, napi)
+ 
+-static inline void qeth_tx_arm_timer(struct qeth_qdio_out_q *queue)
++static inline void qeth_tx_arm_timer(struct qeth_qdio_out_q *queue,
++				     unsigned long usecs)
+ {
+-	if (timer_pending(&queue->timer))
+-		return;
+-	mod_timer(&queue->timer, usecs_to_jiffies(QETH_TX_TIMER_USECS) +
+-				 jiffies);
++	timer_reduce(&queue->timer, usecs_to_jiffies(usecs) + jiffies);
+ }
+ 
+ static inline bool qeth_out_queue_is_full(struct qeth_qdio_out_q *queue)
+diff --git a/drivers/s390/net/qeth_core_main.c b/drivers/s390/net/qeth_core_main.c
+index 4dd96beb4fa8..61a0d52db873 100644
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@ -2422,6 +2422,8 @@ static int qeth_alloc_qdio_queues(struct qeth_card *card)
+ 		queue->card = card;
+ 		queue->queue_no = i;
+ 		timer_setup(&queue->timer, qeth_tx_completion_timer, 0);
++		queue->coalesce_usecs = QETH_TX_COALESCE_USECS;
++		queue->max_coalesced_frames = QETH_TX_MAX_COALESCED_FRAMES;
+ 
+ 		/* give outbound qeth_qdio_buffers their qdio_buffers */
+ 		for (j = 0; j < QDIO_MAX_BUFFERS_PER_Q; ++j) {
+@@ -2779,6 +2781,7 @@ static int qeth_init_qdio_queues(struct qeth_card *card)
+ 		queue->next_buf_to_fill = 0;
+ 		queue->do_pack = 0;
+ 		queue->prev_hdr = NULL;
++		queue->coalesced_frames = 0;
+ 		queue->bulk_start = 0;
+ 		queue->bulk_count = 0;
+ 		queue->bulk_max = qeth_tx_select_bulk_max(card, queue);
+@@ -3374,6 +3377,7 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
+ 		buf = queue->bufs[bidx];
+ 		buf->buffer->element[buf->next_element_to_fill - 1].eflags |=
+ 				SBAL_EFLAGS_LAST_ENTRY;
++		queue->coalesced_frames += buf->frames;
+ 
+ 		if (queue->bufstates)
+ 			queue->bufstates[bidx].user = buf;
+@@ -3415,8 +3419,18 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
+ 		     queue->queue_no, index, count);
+ 
+ 	/* Fake the TX completion interrupt: */
+-	if (IS_IQD(card))
+-		napi_schedule(&queue->napi);
++	if (IS_IQD(card)) {
++		unsigned int frames = READ_ONCE(queue->max_coalesced_frames);
++		unsigned int usecs = READ_ONCE(queue->coalesce_usecs);
++
++		if (frames && queue->coalesced_frames >= frames) {
++			napi_schedule(&queue->napi);
++			queue->coalesced_frames = 0;
++			QETH_TXQ_STAT_INC(queue, coal_frames);
++		} else if (usecs) {
++			qeth_tx_arm_timer(queue, usecs);
++		}
++	}
+ 
+ 	if (rc) {
+ 		/* ignore temporary SIGA errors without busy condition */
+@@ -5440,7 +5454,7 @@ static int qeth_tx_poll(struct napi_struct *napi, int budget)
+ 		if (completed <= 0) {
+ 			/* Ensure we see TX completion for pending work: */
+ 			if (napi_complete_done(napi, 0))
+-				qeth_tx_arm_timer(queue);
++				qeth_tx_arm_timer(queue, QETH_TX_TIMER_USECS);
+ 			return 0;
+ 		}
+ 
+* Unmerged path drivers/s390/net/qeth_ethtool.c
