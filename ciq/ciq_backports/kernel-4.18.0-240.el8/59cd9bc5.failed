@@ -1,0 +1,210 @@
+KVM: nSVM: prepare to handle errors from enter_svm_guest_mode()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 59cd9bc5b03f0bacce9506b068fec538aa9969a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/59cd9bc5.failed
+
+Some operations in enter_svm_guest_mode() may fail, e.g. currently
+we suppress kvm_set_cr3() return value. Prepare the code to proparate
+errors.
+
+No functional change intended.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200710141157.1640173-5-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 59cd9bc5b03f0bacce9506b068fec538aa9969a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/svm.c
+index 986d068fbec8,41f791e2a013..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -6374,97 -3071,106 +6374,104 @@@ out
+  	return ret;
+  }
+  
+ -static int svm_nmi_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+ +static void svm_handle_exit_irqoff(struct kvm_vcpu *vcpu,
+ +	enum exit_fastpath_completion *exit_fastpath)
+  {
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ -	if (svm->nested.nested_run_pending)
+ -		return -EBUSY;
+ -
+ -	/* An NMI must not be injected into L2 if it's supposed to VM-Exit.  */
+ -	if (for_injection && is_guest_mode(vcpu) && nested_exit_on_nmi(svm))
+ -		return -EBUSY;
+ -
+ -	return !svm_nmi_blocked(vcpu);
+ +	if (!is_guest_mode(vcpu) &&
+ +	    to_svm(vcpu)->vmcb->control.exit_code == SVM_EXIT_MSR &&
+ +	    to_svm(vcpu)->vmcb->control.exit_info_1)
+ +		*exit_fastpath = handle_fastpath_set_msr_irqoff(vcpu);
+  }
+  
+ -static bool svm_get_nmi_mask(struct kvm_vcpu *vcpu)
+ +static void svm_sched_in(struct kvm_vcpu *vcpu, int cpu)
+  {
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ -
+ -	return !!(svm->vcpu.arch.hflags & HF_NMI_MASK);
+ +	if (pause_filter_thresh)
+ +		shrink_ple_window(vcpu);
+  }
+  
+ -static void svm_set_nmi_mask(struct kvm_vcpu *vcpu, bool masked)
+ +static inline void avic_post_state_restore(struct kvm_vcpu *vcpu)
+  {
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ +	if (avic_handle_apic_id_update(vcpu) != 0)
+ +		return;
+ +	avic_handle_dfr_update(vcpu);
+ +	avic_handle_ldr_update(vcpu);
+ +}
+  
+ -	if (masked) {
+ -		svm->vcpu.arch.hflags |= HF_NMI_MASK;
+ -		svm_set_intercept(svm, INTERCEPT_IRET);
+ -	} else {
+ -		svm->vcpu.arch.hflags &= ~HF_NMI_MASK;
+ -		svm_clr_intercept(svm, INTERCEPT_IRET);
+ -	}
+ +static void svm_setup_mce(struct kvm_vcpu *vcpu)
+ +{
+ +	/* [63:9] are reserved. */
+ +	vcpu->arch.mcg_cap &= 0x1ff;
+  }
+  
+ -bool svm_interrupt_blocked(struct kvm_vcpu *vcpu)
+ +static int svm_smi_allowed(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+ -	struct vmcb *vmcb = svm->vmcb;
+  
+ +	/* Per APM Vol.2 15.22.2 "Response to SMI" */
+  	if (!gif_set(svm))
+ -		return true;
+ -
+ -	if (is_guest_mode(vcpu)) {
+ -		/* As long as interrupts are being delivered...  */
+ -		if ((svm->nested.ctl.int_ctl & V_INTR_MASKING_MASK)
+ -		    ? !(svm->nested.hsave->save.rflags & X86_EFLAGS_IF)
+ -		    : !(kvm_get_rflags(vcpu) & X86_EFLAGS_IF))
+ -			return true;
+ +		return 0;
+  
+ -		/* ... vmexits aren't blocked by the interrupt shadow  */
+ -		if (nested_exit_on_intr(svm))
+ -			return false;
+ -	} else {
+ -		if (!(kvm_get_rflags(vcpu) & X86_EFLAGS_IF))
+ -			return true;
+ +	if (is_guest_mode(&svm->vcpu) &&
+ +	    svm->nested.intercept & (1ULL << INTERCEPT_SMI)) {
+ +		/* TODO: Might need to set exit_info_1 and exit_info_2 here */
+ +		svm->vmcb->control.exit_code = SVM_EXIT_SMI;
+ +		svm->nested.exit_required = true;
+ +		return 0;
+  	}
+  
+ -	return (vmcb->control.int_state & SVM_INTERRUPT_SHADOW_MASK);
+ +	return 1;
+  }
+  
+ -static int svm_interrupt_allowed(struct kvm_vcpu *vcpu, bool for_injection)
+ +static int svm_pre_enter_smm(struct kvm_vcpu *vcpu, char *smstate)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+ -	if (svm->nested.nested_run_pending)
+ -		return -EBUSY;
+ +	int ret;
+  
+ -	/*
+ -	 * An IRQ must not be injected into L2 if it's supposed to VM-Exit,
+ -	 * e.g. if the IRQ arrived asynchronously after checking nested events.
+ -	 */
+ -	if (for_injection && is_guest_mode(vcpu) && nested_exit_on_intr(svm))
+ -		return -EBUSY;
+ +	if (is_guest_mode(vcpu)) {
+ +		/* FED8h - SVM Guest */
+ +		put_smstate(u64, smstate, 0x7ed8, 1);
+ +		/* FEE0h - SVM Guest VMCB Physical Address */
+ +		put_smstate(u64, smstate, 0x7ee0, svm->nested.vmcb);
+ +
+ +		svm->vmcb->save.rax = vcpu->arch.regs[VCPU_REGS_RAX];
+ +		svm->vmcb->save.rsp = vcpu->arch.regs[VCPU_REGS_RSP];
+ +		svm->vmcb->save.rip = vcpu->arch.regs[VCPU_REGS_RIP];
+  
+ -	return !svm_interrupt_blocked(vcpu);
+ +		ret = nested_svm_vmexit(svm);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +	return 0;
+  }
+  
+ -static void enable_irq_window(struct kvm_vcpu *vcpu)
+ +static int svm_pre_leave_smm(struct kvm_vcpu *vcpu, const char *smstate)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+ +	struct vmcb *nested_vmcb;
+ +	struct kvm_host_map map;
+ +	u64 guest;
+ +	u64 vmcb;
+++	int ret = 0;
+  
+ -	/*
+ -	 * In case GIF=0 we can't rely on the CPU to tell us when GIF becomes
+ -	 * 1, because that's a separate STGI/VMRUN intercept.  The next time we
+ -	 * get that intercept, this function will be called again though and
+ -	 * we'll get the vintr intercept. However, if the vGIF feature is
+ -	 * enabled, the STGI interception will not occur. Enable the irq
+ -	 * window under the assumption that the hardware will set the GIF.
+ -	 */
+ -	if (vgif_enabled(svm) || gif_set(svm)) {
+ -		/*
+ -		 * IRQ window is not needed when AVIC is enabled,
+ -		 * unless we have pending ExtINT since it cannot be injected
+ -		 * via AVIC. In such case, we need to temporarily disable AVIC,
+ -		 * and fallback to injecting IRQ via V_IRQ.
+ -		 */
+ -		svm_toggle_avic_for_irq_window(vcpu, false);
+ -		svm_set_vintr(svm);
+ +	guest = GET_SMSTATE(u64, smstate, 0x7ed8);
+ +	vmcb = GET_SMSTATE(u64, smstate, 0x7ee0);
+ +
+ +	if (guest) {
+ +		if (kvm_vcpu_map(&svm->vcpu, gpa_to_gfn(vmcb), &map) == -EINVAL)
+ +			return 1;
+ +		nested_vmcb = map.hva;
+++<<<<<<< HEAD
+ +		enter_svm_guest_mode(svm, vmcb, nested_vmcb, &map);
+++=======
+++		ret = enter_svm_guest_mode(svm, vmcb, nested_vmcb);
+++		kvm_vcpu_unmap(&svm->vcpu, &map, true);
+++>>>>>>> 59cd9bc5b03f (KVM: nSVM: prepare to handle errors from enter_svm_guest_mode())
+  	}
+- 	return 0;
+++
+++	return ret;
+  }
+  
+ -static void enable_nmi_window(struct kvm_vcpu *vcpu)
+ +static int enable_smi_window(struct kvm_vcpu *vcpu)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.h
+* Unmerged path arch/x86/kvm/svm/nested.c
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
