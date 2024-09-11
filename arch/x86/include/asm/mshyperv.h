@@ -32,7 +32,6 @@ static inline u64 hv_get_register(unsigned int reg)
 #define hv_enable_vdso_clocksource() \
 	vclocks_set_used(VDSO_CLOCKMODE_HVCLOCK);
 #define hv_get_raw_timer() rdtsc_ordered()
-#define hv_get_vector() HYPERVISOR_CALLBACK_VECTOR
 
 void hyperv_callback_vector(void);
 void hyperv_reenlightenment_vector(void);
