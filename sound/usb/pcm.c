@@ -552,6 +552,7 @@ static int set_sync_endpoint(struct snd_usb_substream *subs,
 {
 	struct usb_device *dev = subs->dev;
 	struct usb_host_interface *alts;
+	struct snd_usb_audio *chip = subs->stream->chip;
 	int is_playback = subs->direction == SNDRV_PCM_STREAM_PLAYBACK;
 	unsigned int ep;
 	int err;
@@ -568,7 +569,7 @@ static int set_sync_endpoint(struct snd_usb_substream *subs,
 	if (!alts)
 		return 0;
 
-	subs->sync_endpoint = snd_usb_get_endpoint(subs->stream->chip, ep);
+	subs->sync_endpoint = snd_usb_get_endpoint(chip, ep);
 	if (!subs->sync_endpoint) {
 		if (is_playback &&
 		    (fmt->ep_attr & USB_ENDPOINT_SYNCTYPE) == USB_ENDPOINT_SYNC_NONE)
@@ -595,7 +596,7 @@ static int set_sync_endpoint(struct snd_usb_substream *subs,
 		dev_dbg(&dev->dev, "setting usb interface %d:%d\n",
 			subs->sync_endpoint->iface,
 			subs->sync_endpoint->altsetting);
-		snd_usb_set_interface_quirk(dev);
+		snd_usb_set_interface_quirk(chip);
 	}
 
 	return 0;
@@ -607,6 +608,7 @@ static int set_sync_endpoint(struct snd_usb_substream *subs,
 static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 {
 	struct usb_device *dev = subs->dev;
+	struct snd_usb_audio *chip = subs->stream->chip;
 	struct usb_host_interface *alts;
 	struct usb_interface *iface;
 	struct snd_usb_endpoint *ep;
@@ -624,7 +626,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 
 	/* shared EP with implicit fb */
 	if (fmt->implicit_fb && !subs->need_setup_fmt) {
-		ep = snd_usb_get_endpoint(subs->stream->chip, fmt->endpoint);
+		ep = snd_usb_get_endpoint(chip, fmt->endpoint);
 		if (ep && ep->use_count > 0)
 			goto add_data_ep;
 	}
@@ -649,7 +651,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 
 	/* set interface */
 	if (iface->cur_altsetting != alts) {
-		err = snd_usb_select_mode_quirk(subs, fmt);
+		err = snd_usb_select_mode_quirk(chip, fmt);
 		if (err < 0)
 			return -EIO;
 
@@ -662,7 +664,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 		}
 		dev_dbg(&dev->dev, "setting usb interface %d:%d\n",
 			fmt->iface, fmt->altsetting);
-		snd_usb_set_interface_quirk(dev);
+		snd_usb_set_interface_quirk(chip);
 	}
 
 	subs->need_setup_ep = true;
@@ -670,8 +672,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
  add_data_ep:
 	subs->interface = fmt->iface;
 	subs->altset_idx = fmt->altset_idx;
-	subs->data_endpoint = snd_usb_get_endpoint(subs->stream->chip,
-						   fmt->endpoint);
+	subs->data_endpoint = snd_usb_get_endpoint(chip, fmt->endpoint);
 	if (!subs->data_endpoint)
 		return -EINVAL;
 	subs->data_endpoint->iface = fmt->iface;
@@ -682,7 +683,7 @@ static int set_format(struct snd_usb_substream *subs, struct audioformat *fmt)
 		return err;
 
 	if (subs->need_setup_ep) {
-		err = snd_usb_init_pitch(subs->stream->chip, fmt->iface, alts, fmt);
+		err = snd_usb_init_pitch(chip, fmt->iface, alts, fmt);
 		if (err < 0)
 			return err;
 	}
