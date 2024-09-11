@@ -1,0 +1,125 @@
+KVM: x86/mmu: Mark the PAE roots as decrypted for shadow paging
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 4a98623d5d90175c0f99d185171e60807391e487
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/4a98623d.failed
+
+Set the PAE roots used as decrypted to play nice with SME when KVM is
+using shadow paging.  Explicitly skip setting the C-bit when loading
+CR3 for PAE shadow paging, even though it's completely ignored by the
+CPU.  The extra documentation is nice to have.
+
+Note, there are several subtleties at play with NPT.  In addition to
+legacy shadow paging, the PAE roots are used for SVM's NPT when either
+KVM is 32-bit (uses PAE paging) or KVM is 64-bit and shadowing 32-bit
+NPT.  However, 32-bit Linux, and thus KVM, doesn't support SME.  And
+64-bit KVM can happily set the C-bit in CR3.  This also means that
+keeping __sme_set(root) for 32-bit KVM when NPT is enabled is
+conceptually wrong, but functionally ok since SME is 64-bit only.
+Leave it as is to avoid unnecessary pollution.
+
+Fixes: d0ec49d4de90 ("kvm/x86/svm: Support Secure Memory Encryption within KVM")
+	Cc: stable@vger.kernel.org
+	Cc: Brijesh Singh <brijesh.singh@amd.com>
+	Cc: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210309224207.1218275-5-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4a98623d5d90175c0f99d185171e60807391e487)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/svm.c
+index b60ae08fb034,271196400495..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3820,15 -3907,20 +3820,29 @@@ static void svm_load_mmu_pgd(struct kvm
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  	unsigned long cr3;
+  
+++<<<<<<< HEAD
+ +	cr3 = __sme_set(root);
+ +	if (npt_enabled) {
+ +		svm->vmcb->control.nested_cr3 = cr3;
+++=======
++ 	if (npt_enabled) {
++ 		svm->vmcb->control.nested_cr3 = __sme_set(root_hpa);
+++>>>>>>> 4a98623d5d90 (KVM: x86/mmu: Mark the PAE roots as decrypted for shadow paging)
+  		vmcb_mark_dirty(svm->vmcb, VMCB_NPT);
+  
+  		/* Loading L2's CR3 is handled by enter_svm_guest_mode.  */
+  		if (!test_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail))
+  			return;
+  		cr3 = vcpu->arch.cr3;
+++<<<<<<< HEAD
+++=======
++ 	} else if (vcpu->arch.mmu->shadow_root_level >= PT64_ROOT_4LEVEL) {
++ 		cr3 = __sme_set(root_hpa) | kvm_get_active_pcid(vcpu);
++ 	} else {
++ 		/* PCID in the guest should be impossible with a 32-bit MMU. */
++ 		WARN_ON_ONCE(kvm_get_active_pcid(vcpu));
++ 		cr3 = root_hpa;
+++>>>>>>> 4a98623d5d90 (KVM: x86/mmu: Mark the PAE roots as decrypted for shadow paging)
+  	}
+  
+  	svm->vmcb->save.cr3 = cr3;
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 3d540c1cecdd..421ab0295e29 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -48,6 +48,7 @@
+ #include <asm/pat.h>
+ #include <asm/cmpxchg.h>
+ #include <asm/io.h>
++#include <asm/set_memory.h>
+ #include <asm/vmx.h>
+ #include <asm/kvm_page_track.h>
+ #include "trace.h"
+@@ -3407,7 +3408,10 @@ static int mmu_alloc_special_roots(struct kvm_vcpu *vcpu)
+ 	if (WARN_ON_ONCE(!tdp_enabled || mmu->pae_root || mmu->lm_root))
+ 		return -EIO;
+ 
+-	/* Unlike 32-bit NPT, the PDP table doesn't need to be in low mem. */
++	/*
++	 * Unlike 32-bit NPT, the PDP table doesn't need to be in low mem, and
++	 * doesn't need to be decrypted.
++	 */
+ 	pae_root = (void *)get_zeroed_page(GFP_KERNEL_ACCOUNT);
+ 	if (!pae_root)
+ 		return -ENOMEM;
+@@ -5304,6 +5308,8 @@ slot_handle_leaf(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 
+ static void free_mmu_pages(struct kvm_mmu *mmu)
+ {
++	if (!tdp_enabled && mmu->pae_root)
++		set_memory_encrypted((unsigned long)mmu->pae_root, 1);
+ 	free_page((unsigned long)mmu->pae_root);
+ 	free_page((unsigned long)mmu->lm_root);
+ }
+@@ -5338,6 +5344,20 @@ static int __kvm_mmu_create(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
+ 		return -ENOMEM;
+ 
+ 	mmu->pae_root = page_address(page);
++
++	/*
++	 * CR3 is only 32 bits when PAE paging is used, thus it's impossible to
++	 * get the CPU to treat the PDPTEs as encrypted.  Decrypt the page so
++	 * that KVM's writes and the CPU's reads get along.  Note, this is
++	 * only necessary when using shadow paging, as 64-bit NPT can get at
++	 * the C-bit even when shadowing 32-bit NPT, and SME isn't supported
++	 * by 32-bit kernels (when KVM itself uses 32-bit NPT).
++	 */
++	if (!tdp_enabled)
++		set_memory_decrypted((unsigned long)mmu->pae_root, 1);
++	else
++		WARN_ON_ONCE(shadow_me_mask);
++
+ 	for (i = 0; i < 4; ++i)
+ 		mmu->pae_root[i] = INVALID_PAE_ROOT;
+ 
+* Unmerged path arch/x86/kvm/svm/svm.c
