@@ -1,0 +1,148 @@
+block: have ->poll_fn() return number of entries polled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 85f4d4b65fdd67f1d6dc9eeb1d91923cef07eb6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/85f4d4b6.failed
+
+We currently only really support sync poll, ie poll with 1 IO in flight.
+This prepares us for supporting async poll.
+
+Note that the returned value isn't necessarily 100% accurate. If poll
+races with IRQ completion, we assume that the fact that the task is now
+runnable means we found at least one entry. In reality it could be more
+than 1, or not even 1. This is fine, the caller will just need to take
+this into account.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 85f4d4b65fdd67f1d6dc9eeb1d91923cef07eb6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index d890005b9f66,e97c0a3b2262..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -308,18 -282,11 +308,22 @@@ static inline unsigned short req_get_io
+  
+  struct blk_queue_ctx;
+  
+ +typedef void (request_fn_proc) (struct request_queue *q);
+  typedef blk_qc_t (make_request_fn) (struct request_queue *q, struct bio *bio);
+++<<<<<<< HEAD
+ +typedef bool (poll_q_fn) (struct request_queue *q, blk_qc_t);
+ +typedef int (prep_rq_fn) (struct request_queue *, struct request *);
+ +typedef void (unprep_rq_fn) (struct request_queue *, struct request *);
+++=======
++ typedef int (poll_q_fn) (struct request_queue *q, blk_qc_t);
+++>>>>>>> 85f4d4b65fdd (block: have ->poll_fn() return number of entries polled)
+  
+  struct bio_vec;
+ +typedef void (softirq_done_fn)(struct request *);
+  typedef int (dma_drain_needed_fn)(struct request *);
+ +typedef int (bsg_job_fn) (struct bsg_job *);
+ +typedef int (init_rq_fn)(struct request_queue *, struct request *, gfp_t);
+ +typedef void (exit_rq_fn)(struct request_queue *, struct request *);
+  
+  enum blk_eh_timer_return {
+  	BLK_EH_DONE,		/* drivers has completed the command */
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 52f967bfb7fc..5f46d18dcc22 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -38,7 +38,7 @@
+ #include "blk-mq-sched.h"
+ #include "blk-rq-qos.h"
+ 
+-static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
++static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie);
+ static void blk_mq_poll_stats_start(struct request_queue *q);
+ static void blk_mq_poll_stats_fn(struct blk_stat_callback *cb);
+ 
+@@ -3294,7 +3294,7 @@ static bool blk_mq_poll_hybrid_sleep(struct request_queue *q,
+ 	return true;
+ }
+ 
+-static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
++static int __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ {
+ 	struct request_queue *q = hctx->queue;
+ 	long state;
+@@ -3307,7 +3307,7 @@ static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ 	 * straight to the busy poll loop.
+ 	 */
+ 	if (blk_mq_poll_hybrid_sleep(q, hctx, rq))
+-		return true;
++		return 1;
+ 
+ 	hctx->poll_considered++;
+ 
+@@ -3321,30 +3321,30 @@ static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
+ 		if (ret > 0) {
+ 			hctx->poll_success++;
+ 			__set_current_state(TASK_RUNNING);
+-			return true;
++			return ret;
+ 		}
+ 
+ 		if (signal_pending_state(state, current))
+ 			__set_current_state(TASK_RUNNING);
+ 
+ 		if (current->state == TASK_RUNNING)
+-			return true;
++			return 1;
+ 		if (ret < 0)
+ 			break;
+ 		cpu_relax();
+ 	}
+ 
+ 	__set_current_state(TASK_RUNNING);
+-	return false;
++	return 0;
+ }
+ 
+-static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
+ {
+ 	struct blk_mq_hw_ctx *hctx;
+ 	struct request *rq;
+ 
+ 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+-		return false;
++		return 0;
+ 
+ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
+ 	if (!blk_qc_t_is_internal(cookie))
+@@ -3358,7 +3358,7 @@ static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
+ 		 * so we should be safe with just the NULL check.
+ 		 */
+ 		if (!rq)
+-			return false;
++			return 0;
+ 	}
+ 
+ 	return __blk_mq_poll(hctx, rq);
+diff --git a/drivers/nvme/host/multipath.c b/drivers/nvme/host/multipath.c
+index ff1655bfa2c9..5da713c224ef 100644
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@ -133,11 +133,11 @@ static blk_qc_t nvme_ns_head_make_request(struct request_queue *q,
+ 	return ret;
+ }
+ 
+-static bool nvme_ns_head_poll(struct request_queue *q, blk_qc_t qc)
++static int nvme_ns_head_poll(struct request_queue *q, blk_qc_t qc)
+ {
+ 	struct nvme_ns_head *head = q->queuedata;
+ 	struct nvme_ns *ns;
+-	bool found = false;
++	int found = 0;
+ 	int srcu_idx;
+ 
+ 	srcu_idx = srcu_read_lock(&head->srcu);
+* Unmerged path include/linux/blkdev.h
