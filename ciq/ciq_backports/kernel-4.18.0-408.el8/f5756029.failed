@@ -1,0 +1,122 @@
+KVM: x86: Use nr_memslot_pages to avoid traversing the memslots array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+commit f5756029eef501bcd39ecd844968e4fb3055c1bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f5756029.failed
+
+There is no point in recalculating from scratch the total number of pages
+in all memslots each time a memslot is created or deleted.  Use KVM's
+cached nr_memslot_pages to compute the default max number of MMU pages.
+
+Note that even with nr_memslot_pages capped at ULONG_MAX we can't safely
+multiply it by KVM_PERMILLE_MMU_PAGES (20) since this operation can
+possibly overflow an unsigned long variable.
+
+Write this "* 20 / 1000" operation as "/ 50" instead to avoid such
+overflow.
+
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+[sean: use common KVM field and rework changelog accordingly]
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <d14c5a24535269606675437d5602b7dac4ad8c0e.1638817640.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit f5756029eef501bcd39ecd844968e4fb3055c1bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 2fc3e9a22bc4,552ed45f133b..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -128,14 -135,7 +128,18 @@@
+  #define KVM_HPAGE_MASK(x)	(~(KVM_HPAGE_SIZE(x) - 1))
+  #define KVM_PAGES_PER_HPAGE(x)	(KVM_HPAGE_SIZE(x) / PAGE_SIZE)
+  
+++<<<<<<< HEAD
+ +static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
+ +{
+ +	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
+ +	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
+ +		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
+ +}
+ +
+ +#define KVM_PERMILLE_MMU_PAGES 20
+++=======
++ #define KVM_MEMSLOT_PAGES_TO_MMU_PAGES_RATIO 50
+++>>>>>>> f5756029eef5 (KVM: x86: Use nr_memslot_pages to avoid traversing the memslots array)
+  #define KVM_MIN_ALLOC_MMU_PAGES 64UL
+  #define KVM_MMU_HASH_SHIFT 12
+  #define KVM_NUM_MMU_PAGES (1 << KVM_MMU_HASH_SHIFT)
+@@@ -1570,10 -1589,9 +1574,9 @@@ void kvm_mmu_slot_remove_write_access(s
+  void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+  				   const struct kvm_memory_slot *memslot);
+  void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ -				   const struct kvm_memory_slot *memslot);
+ +				   struct kvm_memory_slot *memslot);
+  void kvm_mmu_zap_all(struct kvm *kvm);
+  void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen);
+- unsigned long kvm_mmu_calculate_default_mmu_pages(struct kvm *kvm);
+  void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned long kvm_nr_mmu_pages);
+  
+  int load_pdptrs(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu, unsigned long cr3);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 970fc4a0eb93..b93e0f4e3345 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6068,30 +6068,6 @@ int kvm_mmu_module_init(void)
+ 	return ret;
+ }
+ 
+-/*
+- * Calculate mmu pages needed for kvm.
+- */
+-unsigned long kvm_mmu_calculate_default_mmu_pages(struct kvm *kvm)
+-{
+-	unsigned long nr_mmu_pages;
+-	unsigned long nr_pages = 0;
+-	struct kvm_memslots *slots;
+-	struct kvm_memory_slot *memslot;
+-	int i;
+-
+-	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+-		slots = __kvm_memslots(kvm, i);
+-
+-		kvm_for_each_memslot(memslot, slots)
+-			nr_pages += memslot->npages;
+-	}
+-
+-	nr_mmu_pages = nr_pages * KVM_PERMILLE_MMU_PAGES / 1000;
+-	nr_mmu_pages = max(nr_mmu_pages, KVM_MIN_ALLOC_MMU_PAGES);
+-
+-	return nr_mmu_pages;
+-}
+-
+ void kvm_mmu_destroy(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_mmu_unload(vcpu);
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 2a332e432f3b..d09101054ba5 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11931,9 +11931,13 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 				enum kvm_mr_change change)
+ {
+ 	if (!kvm->arch.n_requested_mmu_pages &&
+-	    (change == KVM_MR_CREATE || change == KVM_MR_DELETE))
+-		kvm_mmu_change_mmu_pages(kvm,
+-				kvm_mmu_calculate_default_mmu_pages(kvm));
++	    (change == KVM_MR_CREATE || change == KVM_MR_DELETE)) {
++		unsigned long nr_mmu_pages;
++
++		nr_mmu_pages = kvm->nr_memslot_pages / KVM_MEMSLOT_PAGES_TO_MMU_PAGES_RATIO;
++		nr_mmu_pages = max(nr_mmu_pages, KVM_MIN_ALLOC_MMU_PAGES);
++		kvm_mmu_change_mmu_pages(kvm, nr_mmu_pages);
++	}
+ 
+ 	/*
+ 	 * FIXME: const-ify all uses of struct kvm_memory_slot.
