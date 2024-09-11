@@ -245,6 +245,8 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 	if (!dev)
 		return -ENOMEM;
 
+	dev->flags = (uintptr_t)device_get_match_data(&pdev->dev);
+
 	dev->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(dev->base))
 		return PTR_ERR(dev->base);
@@ -286,8 +288,6 @@ static int dw_i2c_plat_probe(struct platform_device *pdev)
 		t->bus_freq_hz = max(t->bus_freq_hz, acpi_speed);
 	else
 		t->bus_freq_hz = 400000;
-
-	dev->flags |= (uintptr_t)device_get_match_data(&pdev->dev);
 
 	if (pdev->dev.of_node)
 		dw_i2c_of_configure(pdev);
