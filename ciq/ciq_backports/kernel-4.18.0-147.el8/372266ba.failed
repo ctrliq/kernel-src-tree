@@ -1,0 +1,358 @@
+radix tree test suite: Convert tag_tagged_items to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 372266ba0267803564824b1c09f1bb7f3f3fc761
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/372266ba.failed
+
+The tag_tagged_items() function is supposed to test the page-writeback
+tagging code.  Since that has been converted to the XArray, there's
+not much point in testing the radix tree's tagging code.  This requires
+using the pthread mutex embedded in the xarray instead of an external
+lock, so remove the pthread mutexes which protect xarrays/radix trees.
+Also remove radix_tree_iter_tag_set() as this was the last user.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit 372266ba0267803564824b1c09f1bb7f3f3fc761)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/radix-tree/test.h
+diff --cc tools/testing/radix-tree/test.h
+index 92d901eacf49,100e9a456f91..000000000000
+--- a/tools/testing/radix-tree/test.h
++++ b/tools/testing/radix-tree/test.h
+@@@ -29,11 -29,10 +29,16 @@@ void item_full_scan(struct radix_tree_r
+  			unsigned long nr, int chunk);
+  void item_kill_tree(struct radix_tree_root *root);
+  
+++<<<<<<< HEAD
+ +int tag_tagged_items(struct radix_tree_root *, pthread_mutex_t *,
+ +			unsigned long start, unsigned long end, unsigned batch,
+ +			unsigned iftag, unsigned thentag);
+ +unsigned long find_item(struct radix_tree_root *, void *item);
+++=======
++ int tag_tagged_items(struct xarray *, unsigned long start, unsigned long end,
++ 		unsigned batch, xa_mark_t iftag, xa_mark_t thentag);
+++>>>>>>> 372266ba0267 (radix tree test suite: Convert tag_tagged_items to XArray)
+  
+ -void xarray_tests(void);
+  void tag_check(void);
+  void multiorder_checks(void);
+  void iteration_test(unsigned order, unsigned duration);
+diff --git a/include/linux/radix-tree.h b/include/linux/radix-tree.h
+index 8e57792d07fb..af24fa6b381a 100644
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@ -359,8 +359,6 @@ void *radix_tree_tag_clear(struct radix_tree_root *,
+ 			unsigned long index, unsigned int tag);
+ int radix_tree_tag_get(const struct radix_tree_root *,
+ 			unsigned long index, unsigned int tag);
+-void radix_tree_iter_tag_set(struct radix_tree_root *,
+-		const struct radix_tree_iter *iter, unsigned int tag);
+ void radix_tree_iter_tag_clear(struct radix_tree_root *,
+ 		const struct radix_tree_iter *iter, unsigned int tag);
+ unsigned int radix_tree_gang_lookup_tag(const struct radix_tree_root *,
+diff --git a/lib/radix-tree.c b/lib/radix-tree.c
+index a904a8ddd174..af4813881cce 100644
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@ -1454,18 +1454,6 @@ void *radix_tree_tag_set(struct radix_tree_root *root,
+ }
+ EXPORT_SYMBOL(radix_tree_tag_set);
+ 
+-/**
+- * radix_tree_iter_tag_set - set a tag on the current iterator entry
+- * @root:	radix tree root
+- * @iter:	iterator state
+- * @tag:	tag to set
+- */
+-void radix_tree_iter_tag_set(struct radix_tree_root *root,
+-			const struct radix_tree_iter *iter, unsigned int tag)
+-{
+-	node_tag_set(root, iter->node, tag, iter_offset(iter));
+-}
+-
+ static void node_tag_clear(struct radix_tree_root *root,
+ 				struct radix_tree_node *node,
+ 				unsigned int tag, unsigned int offset)
+diff --git a/tools/testing/radix-tree/iteration_check.c b/tools/testing/radix-tree/iteration_check.c
+index a92bab513701..d047327bb9ef 100644
+--- a/tools/testing/radix-tree/iteration_check.c
++++ b/tools/testing/radix-tree/iteration_check.c
+@@ -18,10 +18,9 @@
+ 
+ #define NUM_THREADS	5
+ #define MAX_IDX		100
+-#define TAG		0
+-#define NEW_TAG		1
++#define TAG		XA_MARK_0
++#define NEW_TAG		XA_MARK_1
+ 
+-static pthread_mutex_t tree_lock = PTHREAD_MUTEX_INITIALIZER;
+ static pthread_t threads[NUM_THREADS];
+ static unsigned int seeds[3];
+ static RADIX_TREE(tree, GFP_KERNEL);
+@@ -38,7 +37,7 @@ static void *add_entries_fn(void *arg)
+ 		int order;
+ 
+ 		for (pgoff = 0; pgoff < MAX_IDX; pgoff++) {
+-			pthread_mutex_lock(&tree_lock);
++			xa_lock(&tree);
+ 			for (order = max_order; order >= 0; order--) {
+ 				if (item_insert_order(&tree, pgoff, order)
+ 						== 0) {
+@@ -46,7 +45,7 @@ static void *add_entries_fn(void *arg)
+ 					break;
+ 				}
+ 			}
+-			pthread_mutex_unlock(&tree_lock);
++			xa_unlock(&tree);
+ 		}
+ 	}
+ 
+@@ -150,9 +149,9 @@ static void *remove_entries_fn(void *arg)
+ 
+ 		pgoff = rand_r(&seeds[2]) % MAX_IDX;
+ 
+-		pthread_mutex_lock(&tree_lock);
++		xa_lock(&tree);
+ 		item_delete(&tree, pgoff);
+-		pthread_mutex_unlock(&tree_lock);
++		xa_unlock(&tree);
+ 	}
+ 
+ 	rcu_unregister_thread();
+@@ -165,8 +164,7 @@ static void *tag_entries_fn(void *arg)
+ 	rcu_register_thread();
+ 
+ 	while (!test_complete) {
+-		tag_tagged_items(&tree, &tree_lock, 0, MAX_IDX, 10, TAG,
+-					NEW_TAG);
++		tag_tagged_items(&tree, 0, MAX_IDX, 10, TAG, NEW_TAG);
+ 	}
+ 	rcu_unregister_thread();
+ 	return NULL;
+diff --git a/tools/testing/radix-tree/main.c b/tools/testing/radix-tree/main.c
+index b741686e53d6..ee8971371d68 100644
+--- a/tools/testing/radix-tree/main.c
++++ b/tools/testing/radix-tree/main.c
+@@ -214,7 +214,7 @@ void copy_tag_check(void)
+ 	}
+ 
+ //	printf("\ncopying tags...\n");
+-	tagged = tag_tagged_items(&tree, NULL, start, end, ITEMS, 0, 1);
++	tagged = tag_tagged_items(&tree, start, end, ITEMS, XA_MARK_0, XA_MARK_1);
+ 
+ //	printf("checking copied tags\n");
+ 	assert(tagged == count);
+@@ -223,7 +223,7 @@ void copy_tag_check(void)
+ 	/* Copy tags in several rounds */
+ //	printf("\ncopying tags...\n");
+ 	tmp = rand() % (count / 10 + 2);
+-	tagged = tag_tagged_items(&tree, NULL, start, end, tmp, 0, 2);
++	tagged = tag_tagged_items(&tree, start, end, tmp, XA_MARK_0, XA_MARK_2);
+ 	assert(tagged == count);
+ 
+ //	printf("%lu %lu %lu\n", tagged, tmp, count);
+diff --git a/tools/testing/radix-tree/multiorder.c b/tools/testing/radix-tree/multiorder.c
+index 7bf405638b0b..ca533d72608b 100644
+--- a/tools/testing/radix-tree/multiorder.c
++++ b/tools/testing/radix-tree/multiorder.c
+@@ -60,7 +60,7 @@ static void __multiorder_tag_test(int index, int order)
+ 		assert(!radix_tree_tag_get(&tree, i, 1));
+ 	}
+ 
+-	assert(tag_tagged_items(&tree, NULL, 0, ~0UL, 10, 0, 1) == 1);
++	assert(tag_tagged_items(&tree, 0, ~0UL, 10, XA_MARK_0, XA_MARK_1) == 1);
+ 	assert(radix_tree_tag_clear(&tree, index, 0));
+ 
+ 	for_each_index(i, base, order) {
+@@ -88,7 +88,7 @@ static void __multiorder_tag_test2(unsigned order, unsigned long index2)
+ 	assert(radix_tree_tag_set(&tree, 0, 0));
+ 	assert(radix_tree_tag_set(&tree, index2, 0));
+ 
+-	assert(tag_tagged_items(&tree, NULL, 0, ~0UL, 10, 0, 1) == 2);
++	assert(tag_tagged_items(&tree, 0, ~0UL, 10, XA_MARK_0, XA_MARK_1) == 2);
+ 
+ 	item_kill_tree(&tree);
+ }
+@@ -319,8 +319,8 @@ void multiorder_tagged_iteration(void)
+ 		}
+ 	}
+ 
+-	assert(tag_tagged_items(&tree, NULL, 0, ~0UL, TAG_ENTRIES, 1, 2) ==
+-				TAG_ENTRIES);
++	assert(tag_tagged_items(&tree, 0, ~0UL, TAG_ENTRIES, XA_MARK_1,
++				XA_MARK_2) == TAG_ENTRIES);
+ 
+ 	for (j = 0; j < 256; j++) {
+ 		int mask, k;
+@@ -346,8 +346,8 @@ void multiorder_tagged_iteration(void)
+ 		}
+ 	}
+ 
+-	assert(tag_tagged_items(&tree, NULL, 1, ~0UL, MT_NUM_ENTRIES * 2, 1, 0)
+-			== TAG_ENTRIES);
++	assert(tag_tagged_items(&tree, 1, ~0UL, MT_NUM_ENTRIES * 2, XA_MARK_1,
++				XA_MARK_0) == TAG_ENTRIES);
+ 	i = 0;
+ 	radix_tree_for_each_tagged(slot, &tree, &iter, 0, 0) {
+ 		assert(iter.index == tag_index[i]);
+diff --git a/tools/testing/radix-tree/regression1.c b/tools/testing/radix-tree/regression1.c
+index b4a4a7168986..a61c7bcbc72d 100644
+--- a/tools/testing/radix-tree/regression1.c
++++ b/tools/testing/radix-tree/regression1.c
+@@ -44,7 +44,6 @@
+ #include "regression.h"
+ 
+ static RADIX_TREE(mt_tree, GFP_KERNEL);
+-static pthread_mutex_t mt_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ struct page {
+ 	pthread_mutex_t lock;
+@@ -126,29 +125,29 @@ static void *regression1_fn(void *arg)
+ 			struct page *p;
+ 
+ 			p = page_alloc(0);
+-			pthread_mutex_lock(&mt_lock);
++			xa_lock(&mt_tree);
+ 			radix_tree_insert(&mt_tree, 0, p);
+-			pthread_mutex_unlock(&mt_lock);
++			xa_unlock(&mt_tree);
+ 
+ 			p = page_alloc(1);
+-			pthread_mutex_lock(&mt_lock);
++			xa_lock(&mt_tree);
+ 			radix_tree_insert(&mt_tree, 1, p);
+-			pthread_mutex_unlock(&mt_lock);
++			xa_unlock(&mt_tree);
+ 
+-			pthread_mutex_lock(&mt_lock);
++			xa_lock(&mt_tree);
+ 			p = radix_tree_delete(&mt_tree, 1);
+ 			pthread_mutex_lock(&p->lock);
+ 			p->count--;
+ 			pthread_mutex_unlock(&p->lock);
+-			pthread_mutex_unlock(&mt_lock);
++			xa_unlock(&mt_tree);
+ 			page_free(p);
+ 
+-			pthread_mutex_lock(&mt_lock);
++			xa_lock(&mt_tree);
+ 			p = radix_tree_delete(&mt_tree, 0);
+ 			pthread_mutex_lock(&p->lock);
+ 			p->count--;
+ 			pthread_mutex_unlock(&p->lock);
+-			pthread_mutex_unlock(&mt_lock);
++			xa_unlock(&mt_tree);
+ 			page_free(p);
+ 		}
+ 	} else {
+diff --git a/tools/testing/radix-tree/regression2.c b/tools/testing/radix-tree/regression2.c
+index 424b91c77831..f2c7e640a919 100644
+--- a/tools/testing/radix-tree/regression2.c
++++ b/tools/testing/radix-tree/regression2.c
+@@ -53,9 +53,9 @@
+ #include "regression.h"
+ #include "test.h"
+ 
+-#define PAGECACHE_TAG_DIRTY     0
+-#define PAGECACHE_TAG_WRITEBACK 1
+-#define PAGECACHE_TAG_TOWRITE   2
++#define PAGECACHE_TAG_DIRTY     XA_MARK_0
++#define PAGECACHE_TAG_WRITEBACK XA_MARK_1
++#define PAGECACHE_TAG_TOWRITE   XA_MARK_2
+ 
+ static RADIX_TREE(mt_tree, GFP_KERNEL);
+ unsigned long page_count = 0;
+@@ -92,7 +92,7 @@ void regression2_test(void)
+ 	/* 1. */
+ 	start = 0;
+ 	end = max_slots - 2;
+-	tag_tagged_items(&mt_tree, NULL, start, end, 1,
++	tag_tagged_items(&mt_tree, start, end, 1,
+ 				PAGECACHE_TAG_DIRTY, PAGECACHE_TAG_TOWRITE);
+ 
+ 	/* 2. */
+diff --git a/tools/testing/radix-tree/tag_check.c b/tools/testing/radix-tree/tag_check.c
+index 543181e4847b..ec41e5d5e4da 100644
+--- a/tools/testing/radix-tree/tag_check.c
++++ b/tools/testing/radix-tree/tag_check.c
+@@ -24,7 +24,7 @@ __simple_checks(struct radix_tree_root *tree, unsigned long index, int tag)
+ 	item_tag_set(tree, index, tag);
+ 	ret = item_tag_get(tree, index, tag);
+ 	assert(ret != 0);
+-	ret = tag_tagged_items(tree, NULL, first, ~0UL, 10, tag, !tag);
++	ret = tag_tagged_items(tree, first, ~0UL, 10, tag, !tag);
+ 	assert(ret == 1);
+ 	ret = item_tag_get(tree, index, !tag);
+ 	assert(ret != 0);
+@@ -321,7 +321,7 @@ static void single_check(void)
+ 	assert(ret == 0);
+ 	verify_tag_consistency(&tree, 0);
+ 	verify_tag_consistency(&tree, 1);
+-	ret = tag_tagged_items(&tree, NULL, first, 10, 10, 0, 1);
++	ret = tag_tagged_items(&tree, first, 10, 10, XA_MARK_0, XA_MARK_1);
+ 	assert(ret == 1);
+ 	ret = radix_tree_gang_lookup_tag(&tree, (void **)items, 0, BATCH, 1);
+ 	assert(ret == 1);
+diff --git a/tools/testing/radix-tree/test.c b/tools/testing/radix-tree/test.c
+index def6015570b2..589368846687 100644
+--- a/tools/testing/radix-tree/test.c
++++ b/tools/testing/radix-tree/test.c
+@@ -176,35 +176,28 @@ void item_full_scan(struct radix_tree_root *root, unsigned long start,
+ }
+ 
+ /* Use the same pattern as tag_pages_for_writeback() in mm/page-writeback.c */
+-int tag_tagged_items(struct radix_tree_root *root, pthread_mutex_t *lock,
+-			unsigned long start, unsigned long end, unsigned batch,
+-			unsigned iftag, unsigned thentag)
++int tag_tagged_items(struct xarray *xa, unsigned long start, unsigned long end,
++		unsigned batch, xa_mark_t iftag, xa_mark_t thentag)
+ {
+-	unsigned long tagged = 0;
+-	struct radix_tree_iter iter;
+-	void **slot;
++	XA_STATE(xas, xa, start);
++	unsigned int tagged = 0;
++	struct item *item;
+ 
+ 	if (batch == 0)
+ 		batch = 1;
+ 
+-	if (lock)
+-		pthread_mutex_lock(lock);
+-	radix_tree_for_each_tagged(slot, root, &iter, start, iftag) {
+-		if (iter.index > end)
+-			break;
+-		radix_tree_iter_tag_set(root, &iter, thentag);
+-		tagged++;
+-		if ((tagged % batch) != 0)
++	xas_lock_irq(&xas);
++	xas_for_each_marked(&xas, item, end, iftag) {
++		xas_set_mark(&xas, thentag);
++		if (++tagged % batch)
+ 			continue;
+-		slot = radix_tree_iter_resume(slot, &iter);
+-		if (lock) {
+-			pthread_mutex_unlock(lock);
+-			rcu_barrier();
+-			pthread_mutex_lock(lock);
+-		}
++
++		xas_pause(&xas);
++		xas_unlock_irq(&xas);
++		rcu_barrier();
++		xas_lock_irq(&xas);
+ 	}
+-	if (lock)
+-		pthread_mutex_unlock(lock);
++	xas_unlock_irq(&xas);
+ 
+ 	return tagged;
+ }
+* Unmerged path tools/testing/radix-tree/test.h
