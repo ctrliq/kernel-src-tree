@@ -1,0 +1,119 @@
+KVM: arm64: Save the host's PtrAuth keys in non-preemptible context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit ef3e40a7ea8dbe2abd0a345032cd7d5023b9684f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ef3e40a7.failed
+
+When using the PtrAuth feature in a guest, we need to save the host's
+keys before allowing the guest to program them. For that, we dump
+them in a per-CPU data structure (the so called host context).
+
+But both call sites that do this are in preemptible context,
+which may end up in disaster should the vcpu thread get preempted
+before reentering the guest.
+
+Instead, save the keys eagerly on each vcpu_load(). This has an
+increased overhead, but is at least safe.
+
+	Cc: stable@vger.kernel.org
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit ef3e40a7ea8dbe2abd0a345032cd7d5023b9684f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/arm/arm.c
+diff --cc virt/kvm/arm/arm.c
+index c7748896c963,152049c5055d..000000000000
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@@ -343,21 -337,11 +343,29 @@@ void kvm_arch_vcpu_unblocking(struct kv
+  	preempt_enable();
+  }
+  
+++<<<<<<< HEAD:virt/kvm/arm/arm.c
+ +int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ +{
+ +	/* Force users to call KVM_ARM_VCPU_INIT */
+ +	vcpu->arch.target = -1;
+ +	bitmap_zero(vcpu->arch.features, KVM_VCPU_MAX_FEATURES);
+ +
+ +	/* Set up the timer */
+ +	kvm_timer_vcpu_init(vcpu);
+ +
+ +	kvm_pmu_vcpu_init(vcpu);
+ +
+ +	kvm_arm_reset_debug_ptr(vcpu);
+ +
+ +	return kvm_vgic_vcpu_init(vcpu);
+ +}
+++=======
++ #define __ptrauth_save_key(regs, key)						\
++ ({										\
++ 	regs[key ## KEYLO_EL1] = read_sysreg_s(SYS_ ## key ## KEYLO_EL1);	\
++ 	regs[key ## KEYHI_EL1] = read_sysreg_s(SYS_ ## key ## KEYHI_EL1);	\
++ })
+++>>>>>>> ef3e40a7ea8d (KVM: arm64: Save the host's PtrAuth keys in non-preemptible context):arch/arm64/kvm/arm.c
+  
+  void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+diff --git a/arch/arm64/include/asm/kvm_emulate.h b/arch/arm64/include/asm/kvm_emulate.h
+index 024198c2c834..7572cdf4c1f4 100644
+--- a/arch/arm64/include/asm/kvm_emulate.h
++++ b/arch/arm64/include/asm/kvm_emulate.h
+@@ -124,12 +124,6 @@ static inline void vcpu_ptrauth_disable(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.hcr_el2 &= ~(HCR_API | HCR_APK);
+ }
+ 
+-static inline void vcpu_ptrauth_setup_lazy(struct kvm_vcpu *vcpu)
+-{
+-	if (vcpu_has_ptrauth(vcpu))
+-		vcpu_ptrauth_disable(vcpu);
+-}
+-
+ static inline unsigned long vcpu_get_vsesr(struct kvm_vcpu *vcpu)
+ {
+ 	return vcpu->arch.vsesr_el2;
+diff --git a/arch/arm64/kvm/handle_exit.c b/arch/arm64/kvm/handle_exit.c
+index 516aead3c2a9..d7cfc4111334 100644
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@ -173,31 +173,16 @@ static int handle_sve(struct kvm_vcpu *vcpu, struct kvm_run *run)
+ 	return 1;
+ }
+ 
+-#define __ptrauth_save_key(regs, key)						\
+-({										\
+-	regs[key ## KEYLO_EL1] = read_sysreg_s(SYS_ ## key ## KEYLO_EL1);	\
+-	regs[key ## KEYHI_EL1] = read_sysreg_s(SYS_ ## key ## KEYHI_EL1);	\
+-})
+-
+ /*
+  * Handle the guest trying to use a ptrauth instruction, or trying to access a
+  * ptrauth register.
+  */
+ void kvm_arm_vcpu_ptrauth_trap(struct kvm_vcpu *vcpu)
+ {
+-	struct kvm_cpu_context *ctxt;
+-
+-	if (vcpu_has_ptrauth(vcpu)) {
++	if (vcpu_has_ptrauth(vcpu))
+ 		vcpu_ptrauth_enable(vcpu);
+-		ctxt = vcpu->arch.host_cpu_context;
+-		__ptrauth_save_key(ctxt->sys_regs, APIA);
+-		__ptrauth_save_key(ctxt->sys_regs, APIB);
+-		__ptrauth_save_key(ctxt->sys_regs, APDA);
+-		__ptrauth_save_key(ctxt->sys_regs, APDB);
+-		__ptrauth_save_key(ctxt->sys_regs, APGA);
+-	} else {
++	else
+ 		kvm_inject_undefined(vcpu);
+-	}
+ }
+ 
+ /*
+* Unmerged path virt/kvm/arm/arm.c
