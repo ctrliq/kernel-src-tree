@@ -1,0 +1,444 @@
+locking/lockdep: Change the range of class_idx in held_lock struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yuyang Du <duyuyang@gmail.com>
+commit 01bb6f0af992a1e6b7797d92fd31a7864872e347
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/01bb6f0a.failed
+
+held_lock->class_idx is used to point to the class of the held lock. The
+index is shifted by 1 to make index 0 mean no class, which results in class
+index shifting back and forth but is not worth doing so.
+
+The reason is: (1) there will be no "no-class" held_lock to begin with, and
+(2) index 0 seems to be used for error checking, but if something wrong
+indeed happened, the index can't be counted on to distinguish it as that
+something won't set the class_idx to 0 on purpose to tell us it is wrong.
+
+Therefore, change the index to start from 0. This saves a lot of
+back-and-forth shifts and a class slot back to lock_classes.
+
+Since index 0 is now used for lock class, we change the initial chain key to
+-1 to avoid key collision, which is due to the fact that __jhash_mix(0, 0, 0) = 0.
+Actually, the initial chain key can be any arbitrary value other than 0.
+
+In addition, a bitmap is maintained to keep track of the used lock classes,
+and we check the validity of the held lock against that bitmap.
+
+	Signed-off-by: Yuyang Du <duyuyang@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: bvanassche@acm.org
+	Cc: frederic@kernel.org
+	Cc: ming.lei@redhat.com
+	Cc: will.deacon@arm.com
+Link: https://lkml.kernel.org/r/20190506081939.74287-10-duyuyang@gmail.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 01bb6f0af992a1e6b7797d92fd31a7864872e347)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/lockdep.h
+#	kernel/locking/lockdep.c
+diff --cc include/linux/lockdep.h
+index e952b94fb5df,30a0f81aa130..000000000000
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@@ -214,12 -223,8 +214,17 @@@ struct lock_chain 
+  };
+  
+  #define MAX_LOCKDEP_KEYS_BITS		13
+++<<<<<<< HEAD
+ +/*
+ + * Subtract one because we offset hlock->class_idx by 1 in order
+ + * to make 0 mean no class. This avoids overflowing the class_idx
+ + * bitfield and hitting the BUG in hlock_class().
+ + */
+ +#define MAX_LOCKDEP_KEYS		((1UL << MAX_LOCKDEP_KEYS_BITS) - 1)
+++=======
++ #define MAX_LOCKDEP_KEYS		(1UL << MAX_LOCKDEP_KEYS_BITS)
++ #define INITIAL_CHAIN_KEY		-1
+++>>>>>>> 01bb6f0af992 (locking/lockdep: Change the range of class_idx in held_lock struct)
+  
+  struct held_lock {
+  	/*
+diff --cc kernel/locking/lockdep.c
+index 083a2ab0e8d2,3eecae315885..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -765,8 -812,195 +779,184 @@@ static bool assign_lock_key(struct lock
+  	return true;
+  }
+  
+ -#ifdef CONFIG_DEBUG_LOCKDEP
+ -
+ -/* Check whether element @e occurs in list @h */
+ -static bool in_list(struct list_head *e, struct list_head *h)
+ -{
+ -	struct list_head *f;
+ -
+ -	list_for_each(f, h) {
+ -		if (e == f)
+ -			return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+  /*
+++<<<<<<< HEAD
+ + * Initialize the lock_classes[] array elements.
+++=======
++  * Check whether entry @e occurs in any of the locks_after or locks_before
++  * lists.
++  */
++ static bool in_any_class_list(struct list_head *e)
++ {
++ 	struct lock_class *class;
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(lock_classes); i++) {
++ 		class = &lock_classes[i];
++ 		if (in_list(e, &class->locks_after) ||
++ 		    in_list(e, &class->locks_before))
++ 			return true;
++ 	}
++ 	return false;
++ }
++ 
++ static bool class_lock_list_valid(struct lock_class *c, struct list_head *h)
++ {
++ 	struct lock_list *e;
++ 
++ 	list_for_each_entry(e, h, entry) {
++ 		if (e->links_to != c) {
++ 			printk(KERN_INFO "class %s: mismatch for lock entry %ld; class %s <> %s",
++ 			       c->name ? : "(?)",
++ 			       (unsigned long)(e - list_entries),
++ 			       e->links_to && e->links_to->name ?
++ 			       e->links_to->name : "(?)",
++ 			       e->class && e->class->name ? e->class->name :
++ 			       "(?)");
++ 			return false;
++ 		}
++ 	}
++ 	return true;
++ }
++ 
++ #ifdef CONFIG_PROVE_LOCKING
++ static u16 chain_hlocks[MAX_LOCKDEP_CHAIN_HLOCKS];
++ #endif
++ 
++ static bool check_lock_chain_key(struct lock_chain *chain)
++ {
++ #ifdef CONFIG_PROVE_LOCKING
++ 	u64 chain_key = INITIAL_CHAIN_KEY;
++ 	int i;
++ 
++ 	for (i = chain->base; i < chain->base + chain->depth; i++)
++ 		chain_key = iterate_chain_key(chain_key, chain_hlocks[i]);
++ 	/*
++ 	 * The 'unsigned long long' casts avoid that a compiler warning
++ 	 * is reported when building tools/lib/lockdep.
++ 	 */
++ 	if (chain->chain_key != chain_key) {
++ 		printk(KERN_INFO "chain %lld: key %#llx <> %#llx\n",
++ 		       (unsigned long long)(chain - lock_chains),
++ 		       (unsigned long long)chain->chain_key,
++ 		       (unsigned long long)chain_key);
++ 		return false;
++ 	}
++ #endif
++ 	return true;
++ }
++ 
++ static bool in_any_zapped_class_list(struct lock_class *class)
++ {
++ 	struct pending_free *pf;
++ 	int i;
++ 
++ 	for (i = 0, pf = delayed_free.pf; i < ARRAY_SIZE(delayed_free.pf); i++, pf++) {
++ 		if (in_list(&class->lock_entry, &pf->zapped))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static bool __check_data_structures(void)
++ {
++ 	struct lock_class *class;
++ 	struct lock_chain *chain;
++ 	struct hlist_head *head;
++ 	struct lock_list *e;
++ 	int i;
++ 
++ 	/* Check whether all classes occur in a lock list. */
++ 	for (i = 0; i < ARRAY_SIZE(lock_classes); i++) {
++ 		class = &lock_classes[i];
++ 		if (!in_list(&class->lock_entry, &all_lock_classes) &&
++ 		    !in_list(&class->lock_entry, &free_lock_classes) &&
++ 		    !in_any_zapped_class_list(class)) {
++ 			printk(KERN_INFO "class %px/%s is not in any class list\n",
++ 			       class, class->name ? : "(?)");
++ 			return false;
++ 		}
++ 	}
++ 
++ 	/* Check whether all classes have valid lock lists. */
++ 	for (i = 0; i < ARRAY_SIZE(lock_classes); i++) {
++ 		class = &lock_classes[i];
++ 		if (!class_lock_list_valid(class, &class->locks_before))
++ 			return false;
++ 		if (!class_lock_list_valid(class, &class->locks_after))
++ 			return false;
++ 	}
++ 
++ 	/* Check the chain_key of all lock chains. */
++ 	for (i = 0; i < ARRAY_SIZE(chainhash_table); i++) {
++ 		head = chainhash_table + i;
++ 		hlist_for_each_entry_rcu(chain, head, entry) {
++ 			if (!check_lock_chain_key(chain))
++ 				return false;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Check whether all list entries that are in use occur in a class
++ 	 * lock list.
++ 	 */
++ 	for_each_set_bit(i, list_entries_in_use, ARRAY_SIZE(list_entries)) {
++ 		e = list_entries + i;
++ 		if (!in_any_class_list(&e->entry)) {
++ 			printk(KERN_INFO "list entry %d is not in any class list; class %s <> %s\n",
++ 			       (unsigned int)(e - list_entries),
++ 			       e->class->name ? : "(?)",
++ 			       e->links_to->name ? : "(?)");
++ 			return false;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Check whether all list entries that are not in use do not occur in
++ 	 * a class lock list.
++ 	 */
++ 	for_each_clear_bit(i, list_entries_in_use, ARRAY_SIZE(list_entries)) {
++ 		e = list_entries + i;
++ 		if (in_any_class_list(&e->entry)) {
++ 			printk(KERN_INFO "list entry %d occurs in a class list; class %s <> %s\n",
++ 			       (unsigned int)(e - list_entries),
++ 			       e->class && e->class->name ? e->class->name :
++ 			       "(?)",
++ 			       e->links_to && e->links_to->name ?
++ 			       e->links_to->name : "(?)");
++ 			return false;
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ int check_consistency = 0;
++ module_param(check_consistency, int, 0644);
++ 
++ static void check_data_structures(void)
++ {
++ 	static bool once = false;
++ 
++ 	if (check_consistency && !once) {
++ 		if (!__check_data_structures()) {
++ 			once = true;
++ 			WARN_ON(once);
++ 		}
++ 	}
++ }
++ 
++ #else /* CONFIG_DEBUG_LOCKDEP */
++ 
++ static inline void check_data_structures(void) { }
++ 
++ #endif /* CONFIG_DEBUG_LOCKDEP */
++ 
++ /*
++  * Initialize the lock_classes[] array elements, the free_lock_classes list
++  * and also the delayed_free structure.
+++>>>>>>> 01bb6f0af992 (locking/lockdep: Change the range of class_idx in held_lock struct)
+   */
+  static void init_data_structures_once(void)
+  {
+@@@ -839,7 -1149,8 +1029,12 @@@ register_lock_class(struct lockdep_map 
+  		dump_stack();
+  		return NULL;
+  	}
+++<<<<<<< HEAD
+ +	class = lock_classes + nr_lock_classes++;
+++=======
++ 	nr_lock_classes++;
++ 	__set_bit(class - lock_classes, lock_classes_in_use);
+++>>>>>>> 01bb6f0af992 (locking/lockdep: Change the range of class_idx in held_lock struct)
+  	debug_atomic_inc(nr_unused_locks);
+  	class->key = key;
+  	class->name = lock->name;
+@@@ -4291,6 -4624,82 +4488,85 @@@ void lockdep_reset(void
+  	raw_local_irq_restore(flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Remove a class from a lock chain. Must be called with the graph lock held. */
++ static void remove_class_from_lock_chain(struct pending_free *pf,
++ 					 struct lock_chain *chain,
++ 					 struct lock_class *class)
++ {
++ #ifdef CONFIG_PROVE_LOCKING
++ 	struct lock_chain *new_chain;
++ 	u64 chain_key;
++ 	int i;
++ 
++ 	for (i = chain->base; i < chain->base + chain->depth; i++) {
++ 		if (chain_hlocks[i] != class - lock_classes)
++ 			continue;
++ 		/* The code below leaks one chain_hlock[] entry. */
++ 		if (--chain->depth > 0) {
++ 			memmove(&chain_hlocks[i], &chain_hlocks[i + 1],
++ 				(chain->base + chain->depth - i) *
++ 				sizeof(chain_hlocks[0]));
++ 		}
++ 		/*
++ 		 * Each lock class occurs at most once in a lock chain so once
++ 		 * we found a match we can break out of this loop.
++ 		 */
++ 		goto recalc;
++ 	}
++ 	/* Since the chain has not been modified, return. */
++ 	return;
++ 
++ recalc:
++ 	chain_key = INITIAL_CHAIN_KEY;
++ 	for (i = chain->base; i < chain->base + chain->depth; i++)
++ 		chain_key = iterate_chain_key(chain_key, chain_hlocks[i]);
++ 	if (chain->depth && chain->chain_key == chain_key)
++ 		return;
++ 	/* Overwrite the chain key for concurrent RCU readers. */
++ 	WRITE_ONCE(chain->chain_key, chain_key);
++ 	/*
++ 	 * Note: calling hlist_del_rcu() from inside a
++ 	 * hlist_for_each_entry_rcu() loop is safe.
++ 	 */
++ 	hlist_del_rcu(&chain->entry);
++ 	__set_bit(chain - lock_chains, pf->lock_chains_being_freed);
++ 	if (chain->depth == 0)
++ 		return;
++ 	/*
++ 	 * If the modified lock chain matches an existing lock chain, drop
++ 	 * the modified lock chain.
++ 	 */
++ 	if (lookup_chain_cache(chain_key))
++ 		return;
++ 	new_chain = alloc_lock_chain();
++ 	if (WARN_ON_ONCE(!new_chain)) {
++ 		debug_locks_off();
++ 		return;
++ 	}
++ 	*new_chain = *chain;
++ 	hlist_add_head_rcu(&new_chain->entry, chainhashentry(chain_key));
++ #endif
++ }
++ 
++ /* Must be called with the graph lock held. */
++ static void remove_class_from_lock_chains(struct pending_free *pf,
++ 					  struct lock_class *class)
++ {
++ 	struct lock_chain *chain;
++ 	struct hlist_head *head;
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(chainhash_table); i++) {
++ 		head = chainhash_table + i;
++ 		hlist_for_each_entry_rcu(chain, head, entry) {
++ 			remove_class_from_lock_chain(pf, chain, class);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 01bb6f0af992 (locking/lockdep: Change the range of class_idx in held_lock struct)
+  /*
+   * Remove all references to a lock class. The caller must hold the graph lock.
+   */
+@@@ -4303,22 -4714,42 +4579,37 @@@ static void zap_class(struct lock_clas
+  	 * Remove all dependencies this lock is
+  	 * involved in:
+  	 */
+ -	for_each_set_bit(i, list_entries_in_use, ARRAY_SIZE(list_entries)) {
+ -		entry = list_entries + i;
+ +	for (i = 0, entry = list_entries; i < nr_list_entries; i++, entry++) {
+  		if (entry->class != class && entry->links_to != class)
+  			continue;
+ -		__clear_bit(i, list_entries_in_use);
+ -		nr_list_entries--;
+  		list_del_rcu(&entry->entry);
+ +		/* Clear .class and .links_to to avoid double removal. */
+ +		WRITE_ONCE(entry->class, NULL);
+ +		WRITE_ONCE(entry->links_to, NULL);
+  	}
+++<<<<<<< HEAD
+ +	/*
+ +	 * Unhash the class and remove it from the all_lock_classes list:
+ +	 */
+ +	hlist_del_rcu(&class->hash_entry);
+ +	list_del(&class->lock_entry);
+++=======
++ 	if (list_empty(&class->locks_after) &&
++ 	    list_empty(&class->locks_before)) {
++ 		list_move_tail(&class->lock_entry, &pf->zapped);
++ 		hlist_del_rcu(&class->hash_entry);
++ 		WRITE_ONCE(class->key, NULL);
++ 		WRITE_ONCE(class->name, NULL);
++ 		nr_lock_classes--;
++ 		__clear_bit(class - lock_classes, lock_classes_in_use);
++ 	} else {
++ 		WARN_ONCE(true, "%s() failed for class %s\n", __func__,
++ 			  class->name);
++ 	}
+++>>>>>>> 01bb6f0af992 (locking/lockdep: Change the range of class_idx in held_lock struct)
+  
+ -	remove_class_from_lock_chains(pf, class);
+ -}
+ -
+ -static void reinit_class(struct lock_class *class)
+ -{
+ -	void *const p = class;
+ -	const unsigned int offset = offsetof(struct lock_class, key);
+ -
+ -	WARN_ON_ONCE(!class->lock_entry.next);
+ -	WARN_ON_ONCE(!list_empty(&class->locks_after));
+ -	WARN_ON_ONCE(!list_empty(&class->locks_before));
+ -	memset(p + offset, 0, sizeof(*class) - offset);
+ -	WARN_ON_ONCE(!class->lock_entry.next);
+ -	WARN_ON_ONCE(!list_empty(&class->locks_after));
+ -	WARN_ON_ONCE(!list_empty(&class->locks_before));
+ +	RCU_INIT_POINTER(class->key, NULL);
+ +	RCU_INIT_POINTER(class->name, NULL);
+  }
+  
+  static inline int within(const void *addr, void *start, unsigned long size)
+@@@ -4455,9 -5075,12 +4746,10 @@@ void __init lockdep_info(void
+  
+  	printk(" memory used by lock dependency info: %zu kB\n",
+  	       (sizeof(lock_classes) +
++ 		sizeof(lock_classes_in_use) +
+  		sizeof(classhash_table) +
+  		sizeof(list_entries) +
+ -		sizeof(list_entries_in_use) +
+ -		sizeof(chainhash_table) +
+ -		sizeof(delayed_free)
+ +		sizeof(chainhash_table)
+  #ifdef CONFIG_PROVE_LOCKING
+  		+ sizeof(lock_cq)
+  		+ sizeof(lock_chains)
+* Unmerged path include/linux/lockdep.h
+* Unmerged path kernel/locking/lockdep.c
