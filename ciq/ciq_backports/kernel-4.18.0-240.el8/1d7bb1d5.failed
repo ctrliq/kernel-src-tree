@@ -1,0 +1,669 @@
+io_uring: add support for backlogged CQ ring
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 1d7bb1d50fb4dc141c7431cc21fdd24ffcc83c76
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1d7bb1d5.failed
+
+Currently we drop completion events, if the CQ ring is full. That's fine
+for requests with bounded completion times, but it may make it harder or
+impossible to use io_uring with networked IO where request completion
+times are generally unbounded. Or with POLL, for example, which is also
+unbounded.
+
+After this patch, we never overflow the ring, we simply store requests
+in a backlog for later flushing. This flushing is done automatically by
+the kernel. To prevent the backlog from growing indefinitely, if the
+backlog is non-empty, we apply back pressure on IO submissions. Any
+attempt to submit new IO with a non-empty backlog will get an -EBUSY
+return from the kernel. This is a signal to the application that it has
+backlogged CQ events, and that it must reap those before being allowed
+to submit more IO.
+
+Note that if we do return -EBUSY, we will have filled whatever
+backlogged events into the CQ ring first, if there's room. This means
+the application can safely reap events WITHOUT entering the kernel and
+waiting for them, they are already available in the CQ ring.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1d7bb1d50fb4dc141c7431cc21fdd24ffcc83c76)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+#	include/uapi/linux/io_uring.h
+diff --cc fs/io_uring.c
+index fca9cdc96d77,4d89a2f222bf..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -215,9 -185,20 +215,10 @@@ struct io_ring_ctx 
+  		unsigned int		flags;
+  		bool			compat;
+  		bool			account_mem;
++ 		bool			cq_overflow_flushed;
+  
+ -		/*
+ -		 * Ring buffer of indices into array of io_uring_sqe, which is
+ -		 * mmapped by the application using the IORING_OFF_SQES offset.
+ -		 *
+ -		 * This indirection could e.g. be used to assign fixed
+ -		 * io_uring_sqe entries to operations and only submit them to
+ -		 * the queue when needed.
+ -		 *
+ -		 * The kernel modifies neither the indices array nor the entries
+ -		 * array.
+ -		 */
+ -		u32			*sq_array;
+ +		/* SQ ring */
+ +		struct io_sq_ring	*sq_ring;
+  		unsigned		cached_sq_head;
+  		unsigned		sq_entries;
+  		unsigned		sq_mask;
+@@@ -225,6 -206,11 +226,13 @@@
+  		struct io_uring_sqe	*sq_sqes;
+  
+  		struct list_head	defer_list;
+++<<<<<<< HEAD
+++=======
++ 		struct list_head	timeout_list;
++ 		struct list_head	cq_overflow_list;
++ 
++ 		wait_queue_head_t	inflight_wait;
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  	} ____cacheline_aligned_in_smp;
+  
+  	/* IO offload */
+@@@ -516,44 -588,100 +525,127 @@@ static struct io_uring_cqe *io_get_cqri
+  		return NULL;
+  
+  	ctx->cached_cq_tail++;
+ -	return &rings->cqes[tail & ctx->cq_mask];
+ +	return &ring->cqes[tail & ctx->cq_mask];
+  }
+  
+++<<<<<<< HEAD
+ +static void io_cqring_fill_event(struct io_ring_ctx *ctx, u64 ki_user_data,
+ +				 long res)
+++=======
++ static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
++ {
++ 	if (waitqueue_active(&ctx->wait))
++ 		wake_up(&ctx->wait);
++ 	if (waitqueue_active(&ctx->sqo_wait))
++ 		wake_up(&ctx->sqo_wait);
++ 	if (ctx->cq_ev_fd)
++ 		eventfd_signal(ctx->cq_ev_fd, 1);
++ }
++ 
++ static void io_cqring_overflow_flush(struct io_ring_ctx *ctx, bool force)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 	struct io_uring_cqe *cqe;
++ 	struct io_kiocb *req;
++ 	unsigned long flags;
++ 	LIST_HEAD(list);
++ 
++ 	if (!force) {
++ 		if (list_empty_careful(&ctx->cq_overflow_list))
++ 			return;
++ 		if ((ctx->cached_cq_tail - READ_ONCE(rings->cq.head) ==
++ 		    rings->cq_ring_entries))
++ 			return;
++ 	}
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/* if force is set, the ring is going away. always drop after that */
++ 	if (force)
++ 		ctx->cq_overflow_flushed = true;
++ 
++ 	while (!list_empty(&ctx->cq_overflow_list)) {
++ 		cqe = io_get_cqring(ctx);
++ 		if (!cqe && !force)
++ 			break;
++ 
++ 		req = list_first_entry(&ctx->cq_overflow_list, struct io_kiocb,
++ 						list);
++ 		list_move(&req->list, &list);
++ 		if (cqe) {
++ 			WRITE_ONCE(cqe->user_data, req->user_data);
++ 			WRITE_ONCE(cqe->res, req->result);
++ 			WRITE_ONCE(cqe->flags, 0);
++ 		} else {
++ 			WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 		}
++ 	}
++ 
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	while (!list_empty(&list)) {
++ 		req = list_first_entry(&list, struct io_kiocb, list);
++ 		list_del(&req->list);
++ 		io_put_req(req, NULL);
++ 	}
++ }
++ 
++ static void io_cqring_fill_event(struct io_kiocb *req, long res)
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	struct io_uring_cqe *cqe;
+  
+ -	trace_io_uring_complete(ctx, req->user_data, res);
+ -
+  	/*
+  	 * If we can't get a cq entry, userspace overflowed the
+  	 * submission (by quite a lot). Increment the overflow count in
+  	 * the ring.
+  	 */
+  	cqe = io_get_cqring(ctx);
+++<<<<<<< HEAD
+ +	if (cqe) {
+ +		WRITE_ONCE(cqe->user_data, ki_user_data);
+ +		WRITE_ONCE(cqe->res, res);
+ +		WRITE_ONCE(cqe->flags, 0);
+ +	} else {
+ +		unsigned overflow = READ_ONCE(ctx->cq_ring->overflow);
+ +
+ +		WRITE_ONCE(ctx->cq_ring->overflow, overflow + 1);
+ +	}
+ +}
+ +
+ +static void io_cqring_ev_posted(struct io_ring_ctx *ctx)
+ +{
+ +	if (waitqueue_active(&ctx->wait))
+ +		wake_up(&ctx->wait);
+ +	if (waitqueue_active(&ctx->sqo_wait))
+ +		wake_up(&ctx->sqo_wait);
+ +	if (ctx->cq_ev_fd)
+ +		eventfd_signal(ctx->cq_ev_fd, 1);
+ +}
+ +
+ +static void io_cqring_add_event(struct io_ring_ctx *ctx, u64 user_data,
+ +				long res)
+++=======
++ 	if (likely(cqe)) {
++ 		WRITE_ONCE(cqe->user_data, req->user_data);
++ 		WRITE_ONCE(cqe->res, res);
++ 		WRITE_ONCE(cqe->flags, 0);
++ 	} else if (ctx->cq_overflow_flushed) {
++ 		WRITE_ONCE(ctx->rings->cq_overflow,
++ 				atomic_inc_return(&ctx->cached_cq_overflow));
++ 	} else {
++ 		refcount_inc(&req->refs);
++ 		req->result = res;
++ 		list_add_tail(&req->list, &ctx->cq_overflow_list);
++ 	}
++ }
++ 
++ static void io_cqring_add_event(struct io_kiocb *req, long res)
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&ctx->completion_lock, flags);
+@@@ -690,17 -897,65 +782,52 @@@ static void io_free_req(struct io_kioc
+  	__io_free_req(req);
+  }
+  
+ -/*
+ - * Drop reference to request, return next in chain (if there is one) if this
+ - * was the last reference to this request.
+ - */
+ -static struct io_kiocb *io_put_req_find_next(struct io_kiocb *req)
+ +static void io_put_req(struct io_kiocb *req)
+  {
+ -	struct io_kiocb *nxt = NULL;
+ -
+  	if (refcount_dec_and_test(&req->refs))
+ -		io_free_req(req, &nxt);
+ -
+ -	return nxt;
+ +		io_free_req(req);
+  }
+  
+ -static void io_put_req(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct io_kiocb *nxt;
++ 
++ 	nxt = io_put_req_find_next(req);
++ 	if (nxt) {
++ 		if (nxtptr)
++ 			*nxtptr = nxt;
++ 		else
++ 			io_queue_async_work(nxt->ctx, nxt);
++ 	}
++ }
++ 
++ static void io_double_put_req(struct io_kiocb *req)
++ {
++ 	/* drop both submit and complete references */
++ 	if (refcount_sub_and_test(2, &req->refs))
++ 		__io_free_req(req);
++ }
++ 
++ static unsigned io_cqring_events(struct io_ring_ctx *ctx, bool noflush)
++ {
++ 	struct io_rings *rings = ctx->rings;
++ 
++ 	/*
++ 	 * noflush == true is from the waitqueue handler, just ensure we wake
++ 	 * up the task, and the next invocation will flush the entries. We
++ 	 * cannot safely to it from here.
++ 	 */
++ 	if (noflush && !list_empty(&ctx->cq_overflow_list))
++ 		return -1U;
++ 
++ 	io_cqring_overflow_flush(ctx, false);
++ 
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  	/* See comment at the top of this file */
+  	smp_rmb();
+ -	return READ_ONCE(rings->cq.tail) - READ_ONCE(rings->cq.head);
+ -}
+ -
+ -static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	/* make sure SQ entry isn't read before tail */
+ -	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+  }
+  
+  /*
+@@@ -845,7 -1100,7 +972,11 @@@ static int __io_iopoll_check(struct io_
+  		 * If we do, we can potentially be spinning for commands that
+  		 * already triggered a CQE (eg in error).
+  		 */
+++<<<<<<< HEAD
+ +		if (io_cqring_events(ctx->cq_ring))
+++=======
++ 		if (io_cqring_events(ctx, false))
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  			break;
+  
+  		/*
+@@@ -2414,9 -2941,14 +2545,14 @@@ static int io_submit_sqes(struct io_rin
+  	struct io_submit_state state, *statep = NULL;
+  	struct io_kiocb *link = NULL;
+  	struct io_kiocb *shadow_req = NULL;
+ +	bool prev_was_link = false;
+  	int i, submitted = 0;
+ -	bool mm_fault = false;
+  
++ 	if (!list_empty(&ctx->cq_overflow_list)) {
++ 		io_cqring_overflow_flush(ctx, false);
++ 		return -EBUSY;
++ 	}
++ 
+  	if (nr > IO_PLUG_THRESHOLD) {
+  		io_submit_state_start(&state, ctx, nr);
+  		statep = &state;
+@@@ -2484,8 -3039,8 +2620,13 @@@ static int io_sq_thread(void *data
+  
+  	timeout = inflight = 0;
+  	while (!kthread_should_park()) {
+++<<<<<<< HEAD
+ +		bool all_fixed, mm_fault = false;
+ +		int i;
+++=======
++ 		unsigned int to_submit;
++ 		int ret;
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  
+  		if (inflight) {
+  			unsigned nr_events = 0;
+@@@ -2564,34 -3121,13 +2705,41 @@@
+  			}
+  			finish_wait(&ctx->sqo_wait, &wait);
+  
+ -			ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+ +			ctx->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+  		}
+  
+++<<<<<<< HEAD
+ +		i = 0;
+ +		all_fixed = true;
+ +		do {
+ +			if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+ +				all_fixed = false;
+ +
+ +			i++;
+ +			if (i == ARRAY_SIZE(sqes))
+ +				break;
+ +		} while (io_get_sqring(ctx, &sqes[i]));
+ +
+ +		/* Unless all new commands are FIXED regions, grab mm */
+ +		if (!all_fixed && !cur_mm) {
+ +			mm_fault = !mmget_not_zero(ctx->sqo_mm);
+ +			if (!mm_fault) {
+ +				use_mm(ctx->sqo_mm);
+ +				cur_mm = ctx->sqo_mm;
+ +			}
+ +		}
+ +
+ +		inflight += io_submit_sqes(ctx, sqes, i, cur_mm != NULL,
+ +						mm_fault);
+ +
+ +		/* Commit SQ ring head once we've consumed all SQEs */
+ +		io_commit_sqring(ctx);
+++=======
++ 		to_submit = min(to_submit, ctx->sq_entries);
++ 		ret = io_submit_sqes(ctx, to_submit, NULL, -1, &cur_mm, true);
++ 		if (ret > 0)
++ 			inflight += ret;
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  	}
+  
+  	set_fs(old_fs);
+@@@ -2605,78 -3141,37 +2753,106 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_ring_submit(struct io_ring_ctx *ctx, unsigned int to_submit,
+ +			  bool block_for_last)
+++=======
++ struct io_wait_queue {
++ 	struct wait_queue_entry wq;
++ 	struct io_ring_ctx *ctx;
++ 	unsigned to_wait;
++ 	unsigned nr_timeouts;
++ };
++ 
++ static inline bool io_should_wake(struct io_wait_queue *iowq, bool noflush)
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  {
+ -	struct io_ring_ctx *ctx = iowq->ctx;
+ +	struct io_submit_state state, *statep = NULL;
+ +	struct io_kiocb *link = NULL;
+ +	struct io_kiocb *shadow_req = NULL;
+ +	bool prev_was_link = false;
+ +	int i, submit = 0;
+  
+++<<<<<<< HEAD
+ +	if (to_submit > IO_PLUG_THRESHOLD) {
+ +		io_submit_state_start(&state, ctx, to_submit);
+ +		statep = &state;
+ +	}
+++=======
++ 	/*
++ 	 * Wake up if we have enough events, or if a timeout occured since we
++ 	 * started waiting. For timeouts, we always want to return to userspace,
++ 	 * regardless of event count.
++ 	 */
++ 	return io_cqring_events(ctx, noflush) >= iowq->to_wait ||
++ 			atomic_read(&ctx->cq_timeouts) != iowq->nr_timeouts;
++ }
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  
+ -static int io_wake_function(struct wait_queue_entry *curr, unsigned int mode,
+ -			    int wake_flags, void *key)
+ -{
+ -	struct io_wait_queue *iowq = container_of(curr, struct io_wait_queue,
+ -							wq);
+ +	for (i = 0; i < to_submit; i++) {
+ +		bool force_nonblock = true;
+ +		struct sqe_submit s;
+  
+++<<<<<<< HEAD
+ +		if (!io_get_sqring(ctx, &s))
+ +			break;
+++=======
++ 	/* use noflush == true, as we can't safely rely on locking context */
++ 	if (!io_should_wake(iowq, true))
++ 		return -1;
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+ +
+ +		/*
+ +		 * If previous wasn't linked and we have a linked command,
+ +		 * that's the end of the chain. Submit the previous link.
+ +		 */
+ +		if (!prev_was_link && link) {
+ +			io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +						force_nonblock);
+ +			link = NULL;
+ +			shadow_req = NULL;
+ +		}
+ +		prev_was_link = (s.sqe->flags & IOSQE_IO_LINK) != 0;
+ +
+ +		if (link && (s.sqe->flags & IOSQE_IO_DRAIN)) {
+ +			if (!shadow_req) {
+ +				shadow_req = io_get_req(ctx, NULL);
+ +				if (unlikely(!shadow_req))
+ +					goto out;
+ +				shadow_req->flags |= (REQ_F_IO_DRAIN | REQ_F_SHADOW_DRAIN);
+ +				refcount_dec(&shadow_req->refs);
+ +			}
+ +			shadow_req->sequence = s.sequence;
+ +		}
+ +
+ +out:
+ +		s.has_user = true;
+ +		s.needs_lock = false;
+ +		s.needs_fixed_file = false;
+ +		submit++;
+ +
+ +		/*
+ +		 * The caller will block for events after submit, submit the
+ +		 * last IO non-blocking. This is either the only IO it's
+ +		 * submitting, or it already submitted the previous ones. This
+ +		 * improves performance by avoiding an async punt that we don't
+ +		 * need to do.
+ +		 */
+ +		if (block_for_last && submit == to_submit)
+ +			force_nonblock = false;
+ +
+ +		io_submit_sqe(ctx, &s, statep, &link, force_nonblock);
+ +	}
+ +
+ +	if (link)
+ +		io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +					!block_for_last);
+ +	if (statep)
+ +		io_submit_state_end(statep);
+ +
+ +	io_commit_sqring(ctx);
+  
+ -	return autoremove_wake_function(curr, mode, wake_flags, key);
+ +	return submit;
+  }
+  
+  /*
+@@@ -2686,11 -3181,19 +2862,15 @@@
+  static int io_cqring_wait(struct io_ring_ctx *ctx, int min_events,
+  			  const sigset_t __user *sig, size_t sigsz)
+  {
+ -	struct io_wait_queue iowq = {
+ -		.wq = {
+ -			.private	= current,
+ -			.func		= io_wake_function,
+ -			.entry		= LIST_HEAD_INIT(iowq.wq.entry),
+ -		},
+ -		.ctx		= ctx,
+ -		.to_wait	= min_events,
+ -	};
+ -	struct io_rings *rings = ctx->rings;
+ -	int ret = 0;
+ +	struct io_cq_ring *ring = ctx->cq_ring;
+ +	sigset_t ksigmask, sigsaved;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	if (io_cqring_events(ring) >= min_events)
+++=======
++ 	if (io_cqring_events(ctx, false) >= min_events)
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  		return 0;
+  
+  	if (sig) {
+@@@ -2707,15 -3209,24 +2887,32 @@@
+  			return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = wait_event_interruptible(ctx->wait, io_cqring_events(ring) >= min_events);
+++=======
++ 	iowq.nr_timeouts = atomic_read(&ctx->cq_timeouts);
++ 	trace_io_uring_cqring_wait(ctx, min_events);
++ 	do {
++ 		prepare_to_wait_exclusive(&ctx->wait, &iowq.wq,
++ 						TASK_INTERRUPTIBLE);
++ 		if (io_should_wake(&iowq, false))
++ 			break;
++ 		schedule();
++ 		if (signal_pending(current)) {
++ 			ret = -EINTR;
++ 			break;
++ 		}
++ 	} while (1);
++ 	finish_wait(&ctx->wait, &iowq.wq);
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  
+ -	restore_saved_sigmask_unless(ret == -EINTR);
+ +	if (sig)
+ +		restore_user_sigmask(sig, &sigsaved, ret == -ERESTARTSYS);
+  
+ -	return READ_ONCE(rings->cq.head) == READ_ONCE(rings->cq.tail) ? ret : 0;
+ +	if (ret == -ERESTARTSYS)
+ +		ret = -EINTR;
+ +
+ +	return READ_ONCE(ring->r.head) == READ_ONCE(ring->r.tail) ? ret : 0;
+  }
+  
+  static void __io_sqe_files_unregister(struct io_ring_ctx *ctx)
+@@@ -3549,8 -4130,14 +3746,9 @@@ static void io_ring_ctx_wait_and_kill(s
+  	percpu_ref_kill(&ctx->refs);
+  	mutex_unlock(&ctx->uring_lock);
+  
+ -	io_kill_timeouts(ctx);
+  	io_poll_remove_all(ctx);
+ -
+ -	if (ctx->io_wq)
+ -		io_wq_cancel_all(ctx->io_wq);
+ -
+  	io_iopoll_reap_events(ctx);
++ 	io_cqring_overflow_flush(ctx, true);
+  	wait_for_completion(&ctx->ctx_done);
+  	io_ring_ctx_free(ctx);
+  }
+@@@ -3564,6 -4151,55 +3762,58 @@@ static int io_uring_release(struct inod
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void io_uring_cancel_files(struct io_ring_ctx *ctx,
++ 				  struct files_struct *files)
++ {
++ 	struct io_kiocb *req;
++ 	DEFINE_WAIT(wait);
++ 
++ 	while (!list_empty_careful(&ctx->inflight_list)) {
++ 		enum io_wq_cancel ret = IO_WQ_CANCEL_NOTFOUND;
++ 
++ 		spin_lock_irq(&ctx->inflight_lock);
++ 		list_for_each_entry(req, &ctx->inflight_list, inflight_entry) {
++ 			if (req->work.files == files) {
++ 				ret = io_wq_cancel_work(ctx->io_wq, &req->work);
++ 				break;
++ 			}
++ 		}
++ 		if (ret == IO_WQ_CANCEL_RUNNING)
++ 			prepare_to_wait(&ctx->inflight_wait, &wait,
++ 					TASK_UNINTERRUPTIBLE);
++ 
++ 		spin_unlock_irq(&ctx->inflight_lock);
++ 
++ 		/*
++ 		 * We need to keep going until we get NOTFOUND. We only cancel
++ 		 * one work at the time.
++ 		 *
++ 		 * If we get CANCEL_RUNNING, then wait for a work to complete
++ 		 * before continuing.
++ 		 */
++ 		if (ret == IO_WQ_CANCEL_OK)
++ 			continue;
++ 		else if (ret != IO_WQ_CANCEL_RUNNING)
++ 			break;
++ 		schedule();
++ 	}
++ }
++ 
++ static int io_uring_flush(struct file *file, void *data)
++ {
++ 	struct io_ring_ctx *ctx = file->private_data;
++ 
++ 	io_uring_cancel_files(ctx, data);
++ 	if (fatal_signal_pending(current) || (current->flags & PF_EXITING)) {
++ 		io_cqring_overflow_flush(ctx, true);
++ 		io_wq_cancel_all(ctx->io_wq);
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  static int io_uring_mmap(struct file *file, struct vm_area_struct *vma)
+  {
+  	loff_t offset = (loff_t) vma->vm_pgoff << PAGE_SHIFT;
+@@@ -3822,22 -4470,8 +4072,27 @@@ static int io_uring_create(unsigned ent
+  	if (ret < 0)
+  		goto err;
+  
+++<<<<<<< HEAD
+ +	memset(&p->sq_off, 0, sizeof(p->sq_off));
+ +	p->sq_off.head = offsetof(struct io_sq_ring, r.head);
+ +	p->sq_off.tail = offsetof(struct io_sq_ring, r.tail);
+ +	p->sq_off.ring_mask = offsetof(struct io_sq_ring, ring_mask);
+ +	p->sq_off.ring_entries = offsetof(struct io_sq_ring, ring_entries);
+ +	p->sq_off.flags = offsetof(struct io_sq_ring, flags);
+ +	p->sq_off.dropped = offsetof(struct io_sq_ring, dropped);
+ +	p->sq_off.array = offsetof(struct io_sq_ring, array);
+ +
+ +	memset(&p->cq_off, 0, sizeof(p->cq_off));
+ +	p->cq_off.head = offsetof(struct io_cq_ring, r.head);
+ +	p->cq_off.tail = offsetof(struct io_cq_ring, r.tail);
+ +	p->cq_off.ring_mask = offsetof(struct io_cq_ring, ring_mask);
+ +	p->cq_off.ring_entries = offsetof(struct io_cq_ring, ring_entries);
+ +	p->cq_off.overflow = offsetof(struct io_cq_ring, overflow);
+ +	p->cq_off.cqes = offsetof(struct io_cq_ring, cqes);
+++=======
++ 	p->features = IORING_FEAT_SINGLE_MMAP | IORING_FEAT_NODROP;
++ 	trace_io_uring_create(ret, ctx, p->sq_entries, p->cq_entries, p->flags);
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+  	return ret;
+  err:
+  	io_ring_ctx_wait_and_kill(ctx);
+diff --cc include/uapi/linux/io_uring.h
+index ee8693aec163,2a1569211d87..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -135,6 -152,12 +135,15 @@@ struct io_uring_params 
+  };
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * io_uring_params->features flags
++  */
++ #define IORING_FEAT_SINGLE_MMAP		(1U << 0)
++ #define IORING_FEAT_NODROP		(1U << 1)
++ 
++ /*
+++>>>>>>> 1d7bb1d50fb4 (io_uring: add support for backlogged CQ ring)
+   * io_uring_register(2) opcodes and arguments
+   */
+  #define IORING_REGISTER_BUFFERS		0
+* Unmerged path fs/io_uring.c
+* Unmerged path include/uapi/linux/io_uring.h
