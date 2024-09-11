@@ -1,0 +1,207 @@
+idr: introduce idr_for_each_entry_continue_ul()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit d39d714969cda5cbda291402c8c6b1fb1047f42e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d39d7149.failed
+
+Similarly, other callers of idr_get_next_ul() suffer the same
+overflow bug as they don't handle it properly either.
+
+Introduce idr_for_each_entry_continue_ul() to help these callers
+iterate from a given ID.
+
+cls_flower needs more care here because it still has overflow when
+does arg->cookie++, we have to fold its nested loops into one
+and remove the arg->cookie++.
+
+Fixes: 01683a146999 ("net: sched: refactor flower walk to iterate over idr")
+Fixes: 12d6066c3b29 ("net/mlx5: Add flow counters idr")
+	Reported-by: Li Shuang <shuali@redhat.com>
+	Cc: Davide Caratti <dcaratti@redhat.com>
+	Cc: Vlad Buslov <vladbu@mellanox.com>
+	Cc: Chris Mi <chrism@mellanox.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Tested-by: Davide Caratti <dcaratti@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d39d714969cda5cbda291402c8c6b1fb1047f42e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index bf30bf04d4ea,fdeede3af72e..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -470,8 -509,49 +470,52 @@@ static bool __fl_delete(struct tcf_prot
+  		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+  	else
+  		__fl_destroy_filter(f);
+ -}
+  
+++<<<<<<< HEAD
+ +	return last;
+++=======
++ static struct cls_fl_filter *__fl_get(struct cls_fl_head *head, u32 handle)
++ {
++ 	struct cls_fl_filter *f;
++ 
++ 	rcu_read_lock();
++ 	f = idr_find(&head->handle_idr, handle);
++ 	if (f && !refcount_inc_not_zero(&f->refcnt))
++ 		f = NULL;
++ 	rcu_read_unlock();
++ 
++ 	return f;
++ }
++ 
++ static int __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
++ 		       bool *last, bool rtnl_held,
++ 		       struct netlink_ext_ack *extack)
++ {
++ 	struct cls_fl_head *head = fl_head_dereference(tp);
++ 
++ 	*last = false;
++ 
++ 	spin_lock(&tp->lock);
++ 	if (f->deleted) {
++ 		spin_unlock(&tp->lock);
++ 		return -ENOENT;
++ 	}
++ 
++ 	f->deleted = true;
++ 	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
++ 			       f->mask->filter_ht_params);
++ 	idr_remove(&head->handle_idr, f->handle);
++ 	list_del_rcu(&f->list);
++ 	spin_unlock(&tp->lock);
++ 
++ 	*last = fl_mask_put(head, f->mask);
++ 	if (!tc_skip_hw(f->flags))
++ 		fl_hw_destroy_filter(tp, f, rtnl_held, extack);
++ 	tcf_unbind_filter(tp, &f->res);
++ 	__fl_put(f);
++ 
++ 	return 0;
+++>>>>>>> d39d714969cd (idr: introduce idr_for_each_entry_continue_ul())
+  }
+  
+  static void fl_destroy_sleepable(struct work_struct *work)
+@@@ -1526,21 -1674,51 +1570,37 @@@ static void fl_walk(struct tcf_proto *t
+  		    bool rtnl_held)
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+++<<<<<<< HEAD
+++=======
++ 	unsigned long id = arg->cookie, tmp;
+++>>>>>>> d39d714969cd (idr: introduce idr_for_each_entry_continue_ul())
+  	struct cls_fl_filter *f;
+  
+  	arg->count = arg->skip;
+  
+++<<<<<<< HEAD
+ +	while ((f = idr_get_next_ul(&head->handle_idr,
+ +				    &arg->cookie)) != NULL) {
+++=======
++ 	idr_for_each_entry_continue_ul(&head->handle_idr, f, tmp, id) {
++ 		/* don't return filters that are being deleted */
++ 		if (!refcount_inc_not_zero(&f->refcnt))
++ 			continue;
+++>>>>>>> d39d714969cd (idr: introduce idr_for_each_entry_continue_ul())
+  		if (arg->fn(tp, f, arg) < 0) {
+ -			__fl_put(f);
+  			arg->stop = 1;
+  			break;
+  		}
+++<<<<<<< HEAD
+ +		arg->cookie = (unsigned long)f->handle + 1;
+++=======
++ 		__fl_put(f);
+++>>>>>>> d39d714969cd (idr: introduce idr_for_each_entry_continue_ul())
+  		arg->count++;
+  	}
++ 	arg->cookie = id;
+  }
+  
+ -static struct cls_fl_filter *
+ -fl_get_next_hw_filter(struct tcf_proto *tp, struct cls_fl_filter *f, bool add)
+ -{
+ -	struct cls_fl_head *head = fl_head_dereference(tp);
+ -
+ -	spin_lock(&tp->lock);
+ -	if (list_empty(&head->hw_filters)) {
+ -		spin_unlock(&tp->lock);
+ -		return NULL;
+ -	}
+ -
+ -	if (!f)
+ -		f = list_entry(&head->hw_filters, struct cls_fl_filter,
+ -			       hw_list);
+ -	list_for_each_entry_continue(f, &head->hw_filters, hw_list) {
+ -		if (!(add && f->deleted) && refcount_inc_not_zero(&f->refcnt)) {
+ -			spin_unlock(&tp->lock);
+ -			return f;
+ -		}
+ -	}
+ -
+ -	spin_unlock(&tp->lock);
+ -	return NULL;
+ -}
+ -
+  static int fl_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
+  			void *cb_priv, struct netlink_ext_ack *extack)
+  {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c b/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+index c6c28f56aa29..b3762123a69c 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fs_counters.c
+@@ -102,13 +102,15 @@ static struct list_head *mlx5_fc_counters_lookup_next(struct mlx5_core_dev *dev,
+ 	struct mlx5_fc_stats *fc_stats = &dev->priv.fc_stats;
+ 	unsigned long next_id = (unsigned long)id + 1;
+ 	struct mlx5_fc *counter;
++	unsigned long tmp;
+ 
+ 	rcu_read_lock();
+ 	/* skip counters that are in idr, but not yet in counters list */
+-	while ((counter = idr_get_next_ul(&fc_stats->counters_idr,
+-					  &next_id)) != NULL &&
+-	       list_empty(&counter->list))
+-		next_id++;
++	idr_for_each_entry_continue_ul(&fc_stats->counters_idr,
++				       counter, tmp, next_id) {
++		if (!list_empty(&counter->list))
++			break;
++	}
+ 	rcu_read_unlock();
+ 
+ 	return counter ? &counter->list : &fc_stats->counters;
+diff --git a/include/linux/idr.h b/include/linux/idr.h
+index 805daa74ec65..a25447cc91ff 100644
+--- a/include/linux/idr.h
++++ b/include/linux/idr.h
+@@ -216,6 +216,20 @@ static inline void idr_preload_end(void)
+ 	     entry;							\
+ 	     ++id, (entry) = idr_get_next((idr), &(id)))
+ 
++/**
++ * idr_for_each_entry_continue_ul() - Continue iteration over an IDR's elements of a given type
++ * @idr: IDR handle.
++ * @entry: The type * to use as a cursor.
++ * @tmp: A temporary placeholder for ID.
++ * @id: Entry ID.
++ *
++ * Continue to iterate over entries, continuing after the current position.
++ */
++#define idr_for_each_entry_continue_ul(idr, entry, tmp, id)		\
++	for (tmp = id;							\
++	     tmp <= id && ((entry) = idr_get_next_ul(idr, &(id))) != NULL; \
++	     tmp = id, ++id)
++
+ /*
+  * IDA - ID Allocator, use when translation from id to pointer isn't necessary.
+  */
+* Unmerged path net/sched/cls_flower.c
