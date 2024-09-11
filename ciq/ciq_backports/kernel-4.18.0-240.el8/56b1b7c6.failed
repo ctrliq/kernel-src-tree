@@ -1,0 +1,139 @@
+esp6: calculate transport_header correctly when sel.family != AF_INET6
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xin Long <lucien.xin@gmail.com>
+commit 56b1b7c667fbb9ee395f7506dfef3c04571e024a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/56b1b7c6.failed
+
+In esp6_init_state() for beet mode when x->sel.family != AF_INET6:
+
+  x->props.header_len = sizeof(struct ip_esp_hdr) +
+     crypto_aead_ivsize(aead) + IPV4_BEET_PHMAXLEN +
+     (sizeof(struct ipv6hdr) - sizeof(struct iphdr))
+
+In xfrm6_beet_gso_segment() skb->transport_header is supposed to move
+to the end of the ph header for IPPROTO_BEETPH, so if x->sel.family !=
+AF_INET6 and it's IPPROTO_BEETPH, it should do:
+
+   skb->transport_header -=
+      (sizeof(struct ipv6hdr) - sizeof(struct iphdr));
+   skb->transport_header += ph->hdrlen * 8;
+
+And IPV4_BEET_PHMAXLEN is only reserved for PH header, so if
+x->sel.family != AF_INET6 and it's not IPPROTO_BEETPH, it should do:
+
+   skb->transport_header -=
+      (sizeof(struct ipv6hdr) - sizeof(struct iphdr));
+   skb->transport_header -= IPV4_BEET_PHMAXLEN;
+
+Thanks Sabrina for looking deep into this issue.
+
+Fixes: 7f9e40eb18a9 ("esp6: add gso_segment for esp6 beet mode")
+	Reported-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Xin Long <lucien.xin@gmail.com>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 56b1b7c667fbb9ee395f7506dfef3c04571e024a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/esp6_offload.c
+diff --cc net/ipv6/esp6_offload.c
+index 520d123278cc,ab0eea336c70..000000000000
+--- a/net/ipv6/esp6_offload.c
++++ b/net/ipv6/esp6_offload.c
+@@@ -142,6 -140,88 +142,91 @@@ static void esp6_gso_encap(struct xfrm_
+  	xo->proto = proto;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *xfrm6_tunnel_gso_segment(struct xfrm_state *x,
++ 						struct sk_buff *skb,
++ 						netdev_features_t features)
++ {
++ 	__skb_push(skb, skb->mac_len);
++ 	return skb_mac_gso_segment(skb, features);
++ }
++ 
++ static struct sk_buff *xfrm6_transport_gso_segment(struct xfrm_state *x,
++ 						   struct sk_buff *skb,
++ 						   netdev_features_t features)
++ {
++ 	const struct net_offload *ops;
++ 	struct sk_buff *segs = ERR_PTR(-EINVAL);
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 
++ 	skb->transport_header += x->props.header_len;
++ 	ops = rcu_dereference(inet6_offloads[xo->proto]);
++ 	if (likely(ops && ops->callbacks.gso_segment))
++ 		segs = ops->callbacks.gso_segment(skb, features);
++ 
++ 	return segs;
++ }
++ 
++ static struct sk_buff *xfrm6_beet_gso_segment(struct xfrm_state *x,
++ 					      struct sk_buff *skb,
++ 					      netdev_features_t features)
++ {
++ 	struct xfrm_offload *xo = xfrm_offload(skb);
++ 	struct sk_buff *segs = ERR_PTR(-EINVAL);
++ 	const struct net_offload *ops;
++ 	u8 proto = xo->proto;
++ 
++ 	skb->transport_header += x->props.header_len;
++ 
++ 	if (x->sel.family != AF_INET6) {
++ 		skb->transport_header -=
++ 			(sizeof(struct ipv6hdr) - sizeof(struct iphdr));
++ 
++ 		if (proto == IPPROTO_BEETPH) {
++ 			struct ip_beet_phdr *ph =
++ 				(struct ip_beet_phdr *)skb->data;
++ 
++ 			skb->transport_header += ph->hdrlen * 8;
++ 			proto = ph->nexthdr;
++ 		} else {
++ 			skb->transport_header -= IPV4_BEET_PHMAXLEN;
++ 		}
++ 
++ 		if (proto == IPPROTO_TCP)
++ 			skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV6;
++ 	} else {
++ 		__be16 frag;
++ 
++ 		skb->transport_header +=
++ 			ipv6_skip_exthdr(skb, 0, &proto, &frag);
++ 	}
++ 
++ 	__skb_pull(skb, skb_transport_offset(skb));
++ 	ops = rcu_dereference(inet6_offloads[proto]);
++ 	if (likely(ops && ops->callbacks.gso_segment))
++ 		segs = ops->callbacks.gso_segment(skb, features);
++ 
++ 	return segs;
++ }
++ 
++ static struct sk_buff *xfrm6_outer_mode_gso_segment(struct xfrm_state *x,
++ 						    struct sk_buff *skb,
++ 						    netdev_features_t features)
++ {
++ 	switch (x->outer_mode.encap) {
++ 	case XFRM_MODE_TUNNEL:
++ 		return xfrm6_tunnel_gso_segment(x, skb, features);
++ 	case XFRM_MODE_TRANSPORT:
++ 		return xfrm6_transport_gso_segment(x, skb, features);
++ 	case XFRM_MODE_BEET:
++ 		return xfrm6_beet_gso_segment(x, skb, features);
++ 	}
++ 
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ 
+++>>>>>>> 56b1b7c667fb (esp6: calculate transport_header correctly when sel.family != AF_INET6)
+  static struct sk_buff *esp6_gso_segment(struct sk_buff *skb,
+  				        netdev_features_t features)
+  {
+* Unmerged path net/ipv6/esp6_offload.c
