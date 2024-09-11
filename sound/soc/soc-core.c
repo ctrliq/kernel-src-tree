@@ -2050,7 +2050,7 @@ match:
 	}
 }
 
-static int soc_cleanup_card_resources(struct snd_soc_card *card)
+static void soc_cleanup_card_resources(struct snd_soc_card *card)
 {
 	/* free the ALSA card at first; this syncs with pending operations */
 	if (card->snd_card) {
@@ -2072,8 +2072,6 @@ static int soc_cleanup_card_resources(struct snd_soc_card *card)
 	/* remove the card */
 	if (card->remove)
 		card->remove(card);
-
-	return 0;
 }
 
 static int snd_soc_instantiate_card(struct snd_soc_card *card)
