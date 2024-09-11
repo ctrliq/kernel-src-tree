@@ -1519,7 +1519,7 @@ static int __skip_emulated_instruction(struct kvm_vcpu *vcpu)
 	/* skipping an emulated instruction also counts */
 	vmx_set_interrupt_shadow(vcpu, 0);
 
-	return EMULATE_DONE;
+	return 1;
 }
 
 static inline void skip_emulated_instruction(struct kvm_vcpu *vcpu)
@@ -4465,7 +4465,7 @@ static int handle_rmode_exception(struct kvm_vcpu *vcpu,
 	 * Cause the #SS fault with 0 error code in VM86 mode.
 	 */
 	if (((vec == GP_VECTOR) || (vec == SS_VECTOR)) && err_code == 0) {
-		if (kvm_emulate_instruction(vcpu, 0) == EMULATE_DONE) {
+		if (kvm_emulate_instruction(vcpu, 0)) {
 			if (vcpu->arch.halt_request) {
 				vcpu->arch.halt_request = 0;
 				return kvm_vcpu_halt(vcpu);
@@ -4542,8 +4542,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
 			kvm_queue_exception_e(vcpu, GP_VECTOR, error_code);
 			return 1;
 		}
-		return kvm_emulate_instruction(vcpu, EMULTYPE_VMWARE_GP) !=
-							EMULATE_USER_EXIT;
+		return kvm_emulate_instruction(vcpu, EMULTYPE_VMWARE_GP);
 	}
 
 	/*
@@ -4640,7 +4639,7 @@ static int handle_io(struct kvm_vcpu *vcpu)
 	++vcpu->stat.io_exits;
 
 	if (string)
-		return kvm_emulate_instruction(vcpu, 0) == EMULATE_DONE;
+		return kvm_emulate_instruction(vcpu, 0);
 
 	port = exit_qualification >> 16;
 	size = (exit_qualification & 7) + 1;
@@ -4714,7 +4713,7 @@ static int handle_set_cr4(struct kvm_vcpu *vcpu, unsigned long val)
 static int handle_desc(struct kvm_vcpu *vcpu)
 {
 	WARN_ON(!(vcpu->arch.cr4 & X86_CR4_UMIP));
-	return kvm_emulate_instruction(vcpu, 0) == EMULATE_DONE;
+	return kvm_emulate_instruction(vcpu, 0);
 }
 
 static int handle_cr(struct kvm_vcpu *vcpu)
@@ -4930,7 +4929,7 @@ static int handle_vmcall(struct kvm_vcpu *vcpu)
 
 static int handle_invd(struct kvm_vcpu *vcpu)
 {
-	return kvm_emulate_instruction(vcpu, 0) == EMULATE_DONE;
+	return kvm_emulate_instruction(vcpu, 0);
 }
 
 static int handle_invlpg(struct kvm_vcpu *vcpu)
@@ -4997,7 +4996,7 @@ static int handle_apic_access(struct kvm_vcpu *vcpu)
 			return kvm_skip_emulated_instruction(vcpu);
 		}
 	}
-	return kvm_emulate_instruction(vcpu, 0) == EMULATE_DONE;
+	return kvm_emulate_instruction(vcpu, 0);
 }
 
 static int handle_apic_eoi_induced(struct kvm_vcpu *vcpu)
@@ -5074,7 +5073,7 @@ static int handle_task_switch(struct kvm_vcpu *vcpu)
 	 */
 	return kvm_task_switch(vcpu, tss_selector,
 			       type == INTR_TYPE_SOFT_INTR ? idt_index : -1,
-			       reason, has_error_code, error_code) != EMULATE_USER_EXIT;
+			       reason, has_error_code, error_code);
 }
 
 static int handle_ept_violation(struct kvm_vcpu *vcpu)
@@ -5146,8 +5145,7 @@ static int handle_ept_misconfig(struct kvm_vcpu *vcpu)
 		if (!static_cpu_has(X86_FEATURE_HYPERVISOR))
 			return kvm_skip_emulated_instruction(vcpu);
 		else
-			return kvm_emulate_instruction(vcpu, EMULTYPE_SKIP) ==
-								EMULATE_DONE;
+			return kvm_emulate_instruction(vcpu, EMULTYPE_SKIP);
 	}
 
 	return kvm_mmu_page_fault(vcpu, gpa, PFERR_RSVD_MASK, NULL, 0);
@@ -5166,7 +5164,6 @@ static int handle_nmi_window(struct kvm_vcpu *vcpu)
 static int handle_invalid_guest_state(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
-	enum emulation_result err;
 	bool intr_window_requested;
 	unsigned count = 130;
 
@@ -5187,13 +5184,8 @@ static int handle_invalid_guest_state(struct kvm_vcpu *vcpu)
 		if (kvm_test_request(KVM_REQ_EVENT, vcpu))
 			return 1;
 
-		err = kvm_emulate_instruction(vcpu, 0);
-
-		if (err == EMULATE_USER_EXIT)
+		if (!kvm_emulate_instruction(vcpu, 0))
 			return 0;
-
-		if (WARN_ON_ONCE(err == EMULATE_FAIL))
-			return 1;
 
 		if (vmx->emulation_required && !vmx->rmode.vm86_active &&
 		    vcpu->arch.exception.pending) {
