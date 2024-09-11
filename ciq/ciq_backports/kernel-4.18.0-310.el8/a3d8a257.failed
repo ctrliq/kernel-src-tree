@@ -1,0 +1,310 @@
+scsi: sd_zbc: Improve zone revalidation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit a3d8a2573687bc8955986e4e011ebfe19cc71054
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/a3d8a257.failed
+
+Currently, for zoned disks, since blk_revalidate_disk_zones() requires the
+disk capacity to be set already to operate correctly, zones revalidation
+can only be done on the second revalidate scan once the gendisk capacity is
+set at the end of the first scan. As a result, if zone revalidation fails,
+there is no second chance to recover from the failure and the disk capacity
+is changed to 0, with the disk left unusable.
+
+This can be improved by shuffling around code, specifically, by moving the
+call to sd_zbc_revalidate_zones() from sd_zbc_read_zones() to the end of
+sd_revalidate_disk(), after set_capacity_revalidate_and_notify() is called
+to set the gendisk capacity. With this change, if sd_zbc_revalidate_zones()
+fails on the first scan, the second scan will call it again to recover, if
+possible.
+
+Using the new struct scsi_disk fields rev_nr_zones and rev_zone_blocks,
+sd_zbc_revalidate_zones() does actual work only if it detects a change with
+the disk zone configuration. This means that for a successful zones
+revalidation on the first scan, the second scan will not cause another
+heavy full check.
+
+While at it, remove the unecesary "extern" declaration of
+sd_zbc_read_zones().
+
+Link: https://lore.kernel.org/r/20200731054928.668547-1-damien.lemoal@wdc.com
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit a3d8a2573687bc8955986e4e011ebfe19cc71054)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.h
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd.h
+index 73f7cc3828fe,4933e7daf17d..000000000000
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@@ -69,7 -67,20 +69,24 @@@ enum 
+  	SD_ZERO_WS10_UNMAP,	/* Use WRITE SAME(10) with UNMAP */
+  };
+  
+++<<<<<<< HEAD
+ +struct scsi_disk_aux {
+++=======
++ struct scsi_disk {
++ 	struct scsi_driver *driver;	/* always &sd_template */
++ 	struct scsi_device *device;
++ 	struct device	dev;
++ 	struct gendisk	*disk;
++ 	struct opal_dev *opal_dev;
++ #ifdef CONFIG_BLK_DEV_ZONED
++ 	u32		nr_zones;
++ 	u32		rev_nr_zones;
++ 	u32		zone_blocks;
++ 	u32		rev_zone_blocks;
++ 	u32		zones_optimal_open;
++ 	u32		zones_optimal_nonseq;
++ 	u32		zones_max_open;
+++>>>>>>> a3d8a2573687 (scsi: sd_zbc: Improve zone revalidation)
+  	u32		*zones_wp_offset;
+  	spinlock_t	zones_wp_offset_lock;
+  	u32		*rev_wp_offset;
+@@@ -290,9 -215,10 +307,9 @@@ static inline int sd_is_zoned(struct sc
+  
+  #ifdef CONFIG_BLK_DEV_ZONED
+  
+ -int sd_zbc_init_disk(struct scsi_disk *sdkp);
+  void sd_zbc_release_disk(struct scsi_disk *sdkp);
+- extern int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buffer);
+- extern void sd_zbc_print_zones(struct scsi_disk *sdkp);
++ int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buffer);
++ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp);
+  blk_status_t sd_zbc_setup_zone_mgmt_cmnd(struct scsi_cmnd *cmd,
+  					 unsigned char op, bool all);
+  unsigned int sd_zbc_complete(struct scsi_cmnd *cmd, unsigned int good_bytes,
+diff --cc drivers/scsi/sd_zbc.c
+index 03ce186ae933,fee0815d7e65..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -637,91 -633,83 +637,124 @@@ static int sd_zbc_check_capacity(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int sd_zbc_init_disk(struct scsi_disk *sdkp)
+ +{
+ +	sdkp->aux->zones_wp_offset = NULL;
+ +	spin_lock_init(&sdkp->aux->zones_wp_offset_lock);
+ +	sdkp->aux->rev_wp_offset = NULL;
+ +	mutex_init(&sdkp->aux->rev_mutex);
+ +	INIT_WORK(&sdkp->aux->zone_wp_offset_work, sd_zbc_update_wp_offset_workfn);
+ +	sdkp->aux->zone_wp_update_buf = kzalloc(SD_BUF_SIZE, GFP_KERNEL);
+ +	if (!sdkp->aux->zone_wp_update_buf)
+ +		return -ENOMEM;
+ +
+ +	return 0;
+ +}
+ +
+ +void sd_zbc_release_disk(struct scsi_disk *sdkp)
+ +{
+ +	kvfree(sdkp->aux->zones_wp_offset);
+ +	sdkp->aux->zones_wp_offset = NULL;
+ +	kfree(sdkp->aux->zone_wp_update_buf);
+ +	sdkp->aux->zone_wp_update_buf = NULL;
+++=======
++ static void sd_zbc_print_zones(struct scsi_disk *sdkp)
++ {
++ 	if (!sd_is_zoned(sdkp) || !sdkp->capacity)
++ 		return;
++ 
++ 	if (sdkp->capacity & (sdkp->zone_blocks - 1))
++ 		sd_printk(KERN_NOTICE, sdkp,
++ 			  "%u zones of %u logical blocks + 1 runt zone\n",
++ 			  sdkp->nr_zones - 1,
++ 			  sdkp->zone_blocks);
++ 	else
++ 		sd_printk(KERN_NOTICE, sdkp,
++ 			  "%u zones of %u logical blocks\n",
++ 			  sdkp->nr_zones,
++ 			  sdkp->zone_blocks);
+++>>>>>>> a3d8a2573687 (scsi: sd_zbc: Improve zone revalidation)
+  }
+  
+  static void sd_zbc_revalidate_zones_cb(struct gendisk *disk)
+  {
+  	struct scsi_disk *sdkp = scsi_disk(disk);
+  
+ -	swap(sdkp->zones_wp_offset, sdkp->rev_wp_offset);
+ +	swap(sdkp->aux->zones_wp_offset, sdkp->aux->rev_wp_offset);
+  }
+  
+- static int sd_zbc_revalidate_zones(struct scsi_disk *sdkp,
+- 				   u32 zone_blocks,
+- 				   unsigned int nr_zones)
++ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
+  {
+  	struct gendisk *disk = sdkp->disk;
++ 	struct request_queue *q = disk->queue;
++ 	u32 zone_blocks = sdkp->rev_zone_blocks;
++ 	unsigned int nr_zones = sdkp->rev_nr_zones;
++ 	u32 max_append;
+  	int ret = 0;
+  
++ 	if (!sd_is_zoned(sdkp))
++ 		return 0;
++ 
+ +	/*
+ +	 * For all zoned disks, initialize zone append emulation data if not
+ +	 * already done. This is necessary also for host-aware disks used as
+ +	 * regular disks due to the presence of partitions as these partitions
+ +	 * may be deleted and the disk zoned model changed back from
+ +	 * BLK_ZONED_NONE to BLK_ZONED_HA.
+ +	 */
+ +	if (sd_is_zoned(sdkp) && !sdkp->aux->zone_wp_update_buf) {
+ +		ret = sd_zbc_init_disk(sdkp);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+  	/*
+  	 * Make sure revalidate zones are serialized to ensure exclusive
+  	 * updates of the scsi disk data.
+  	 */
+ -	mutex_lock(&sdkp->rev_mutex);
+ +	mutex_lock(&sdkp->aux->rev_mutex);
+  
+- 	/*
+- 	 * Revalidate the disk zones to update the device request queue zone
+- 	 * bitmaps and the zone write pointer offset array. Do this only once
+- 	 * the device capacity is set on the second revalidate execution for
+- 	 * disk scan or if something changed when executing a normal revalidate.
+- 	 */
+- 	if (sdkp->first_scan) {
+- 		sdkp->zone_blocks = zone_blocks;
+- 		sdkp->nr_zones = nr_zones;
+- 		goto unlock;
+- 	}
+- 
+  	if (sdkp->zone_blocks == zone_blocks &&
+  	    sdkp->nr_zones == nr_zones &&
+  	    disk->queue->nr_zones == nr_zones)
+  		goto unlock;
+  
+++<<<<<<< HEAD
+ +	sdkp->aux->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_NOIO);
+ +	if (!sdkp->aux->rev_wp_offset) {
+++=======
++ 	sdkp->zone_blocks = zone_blocks;
++ 	sdkp->nr_zones = nr_zones;
++ 	sdkp->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_NOIO);
++ 	if (!sdkp->rev_wp_offset) {
+++>>>>>>> a3d8a2573687 (scsi: sd_zbc: Improve zone revalidation)
+  		ret = -ENOMEM;
+  		goto unlock;
+  	}
+  
+  	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
+  
+ -	kvfree(sdkp->rev_wp_offset);
+ -	sdkp->rev_wp_offset = NULL;
+ +	kvfree(sdkp->aux->rev_wp_offset);
+ +	sdkp->aux->rev_wp_offset = NULL;
+  
++ 	if (ret) {
++ 		sdkp->zone_blocks = 0;
++ 		sdkp->nr_zones = 0;
++ 		sdkp->capacity = 0;
++ 		goto unlock;
++ 	}
++ 
++ 	max_append = min_t(u32, logical_to_sectors(sdkp->device, zone_blocks),
++ 			   q->limits.max_segments << (PAGE_SHIFT - 9));
++ 	max_append = min_t(u32, max_append, queue_max_hw_sectors(q));
++ 
++ 	blk_queue_max_zone_append_sectors(q, max_append);
++ 
++ 	sd_zbc_print_zones(sdkp);
++ 
+  unlock:
+ -	mutex_unlock(&sdkp->rev_mutex);
+ +	mutex_unlock(&sdkp->aux->rev_mutex);
+  
+  	return ret;
+  }
+@@@ -786,19 -759,27 +804,45 @@@ err
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void sd_zbc_print_zones(struct scsi_disk *sdkp)
+ +{
+ +	if (!sd_is_zoned(sdkp) || !sdkp->capacity)
+ +		return;
+ +
+ +	if (sdkp->capacity & (sdkp->zone_blocks - 1))
+ +		sd_printk(KERN_NOTICE, sdkp,
+ +			  "%u zones of %u logical blocks + 1 runt zone\n",
+ +			  sdkp->nr_zones - 1,
+ +			  sdkp->zone_blocks);
+ +	else
+ +		sd_printk(KERN_NOTICE, sdkp,
+ +			  "%u zones of %u logical blocks\n",
+ +			  sdkp->nr_zones,
+ +			  sdkp->zone_blocks);
+++=======
++ int sd_zbc_init_disk(struct scsi_disk *sdkp)
++ {
++ 	if (!sd_is_zoned(sdkp))
++ 		return 0;
++ 
++ 	sdkp->zones_wp_offset = NULL;
++ 	spin_lock_init(&sdkp->zones_wp_offset_lock);
++ 	sdkp->rev_wp_offset = NULL;
++ 	mutex_init(&sdkp->rev_mutex);
++ 	INIT_WORK(&sdkp->zone_wp_offset_work, sd_zbc_update_wp_offset_workfn);
++ 	sdkp->zone_wp_update_buf = kzalloc(SD_BUF_SIZE, GFP_KERNEL);
++ 	if (!sdkp->zone_wp_update_buf)
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ void sd_zbc_release_disk(struct scsi_disk *sdkp)
++ {
++ 	kvfree(sdkp->zones_wp_offset);
++ 	sdkp->zones_wp_offset = NULL;
++ 	kfree(sdkp->zone_wp_update_buf);
++ 	sdkp->zone_wp_update_buf = NULL;
+++>>>>>>> a3d8a2573687 (scsi: sd_zbc: Improve zone revalidation)
+  }
+diff --git a/drivers/scsi/sd.c b/drivers/scsi/sd.c
+index f45fe25d06c5..fd538676ec05 100644
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@ -2523,8 +2523,6 @@ sd_print_capacity(struct scsi_disk *sdkp,
+ 		sd_printk(KERN_NOTICE, sdkp,
+ 			  "%u-byte physical blocks\n",
+ 			  sdkp->physical_block_size);
+-
+-	sd_zbc_print_zones(sdkp);
+ }
+ 
+ /* called with buffer of length 512 */
+@@ -3165,6 +3163,14 @@ static int sd_revalidate_disk(struct gendisk *disk)
+ 	sd_config_write_same(sdkp);
+ 	kfree(buffer);
+ 
++	/*
++	 * For a zoned drive, revalidating the zones can be done only once
++	 * the gendisk capacity is set. So if this fails, set back the gendisk
++	 * capacity to 0.
++	 */
++	if (sd_zbc_revalidate_zones(sdkp))
++		set_capacity_revalidate_and_notify(disk, 0, false);
++
+  out:
+ 	return 0;
+ }
+* Unmerged path drivers/scsi/sd.h
+* Unmerged path drivers/scsi/sd_zbc.c
