@@ -1,0 +1,108 @@
+mac80211: use rate provided via status->rate on ieee80211_tx_status_ext for AQL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Felix Fietkau <nbd@nbd.name>
+commit 8ed37e79196033dbdb09a4eea9465af6a0e29fe9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8ed37e79.failed
+
+Since ieee80211_tx_info does not have enough room to encode HE rates, HE
+drivers use status->rate to provide rate info.
+Store it in struct sta_info and use it for AQL.
+
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/r/20200821163045.62140-1-nbd@nbd.name
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 8ed37e79196033dbdb09a4eea9465af6a0e29fe9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mac80211/airtime.c
+diff --cc net/mac80211/airtime.c
+index 9fc2968856c0,656c9a033714..000000000000
+--- a/net/mac80211/airtime.c
++++ b/net/mac80211/airtime.c
+@@@ -572,10 -620,27 +620,34 @@@ u32 ieee80211_calc_expected_tx_airtime(
+  	if (pubsta) {
+  		struct sta_info *sta = container_of(pubsta, struct sta_info,
+  						    sta);
+++<<<<<<< HEAD
+ +
+ +		return ieee80211_calc_tx_airtime_rate(hw,
+ +						      &sta->tx_stats.last_rate,
+ +						      band, len);
+++=======
++ 		struct ieee80211_tx_rate *rate = &sta->tx_stats.last_rate;
++ 		struct rate_info *ri = &sta->tx_stats.last_rate_info;
++ 		u32 airtime;
++ 
++ 		if (!(rate->flags & (IEEE80211_TX_RC_VHT_MCS |
++ 				     IEEE80211_TX_RC_MCS)))
++ 			ampdu = false;
++ 
++ 		/*
++ 		 * Assume that HT/VHT transmission on any AC except VO will
++ 		 * use aggregation. Since we don't have reliable reporting
++ 		 * of aggregation length, assume an average of 16.
++ 		 * This will not be very accurate, but much better than simply
++ 		 * assuming un-aggregated tx.
++ 		 */
++ 		airtime = ieee80211_calc_tx_airtime_rate(hw, rate, ri, band,
++ 							 ampdu ? len * 16 : len);
++ 		if (ampdu)
++ 			airtime /= 16;
++ 
++ 		return airtime;
+++>>>>>>> 8ed37e791960 (mac80211: use rate provided via status->rate on ieee80211_tx_status_ext for AQL)
+  	}
+  
+  	if (!conf)
+* Unmerged path net/mac80211/airtime.c
+diff --git a/net/mac80211/sta_info.h b/net/mac80211/sta_info.h
+index 9d398c9daa4c..8060d142e4f1 100644
+--- a/net/mac80211/sta_info.h
++++ b/net/mac80211/sta_info.h
+@@ -611,6 +611,7 @@ struct sta_info {
+ 		u64 packets[IEEE80211_NUM_ACS];
+ 		u64 bytes[IEEE80211_NUM_ACS];
+ 		struct ieee80211_tx_rate last_rate;
++		struct rate_info last_rate_info;
+ 		u64 msdu[IEEE80211_NUM_TIDS + 1];
+ 	} tx_stats;
+ 	u16 tid_seq[IEEE80211_QOS_CTL_TID_MASK + 1];
+diff --git a/net/mac80211/status.c b/net/mac80211/status.c
+index adb1d30ce06e..6de63f1d8c7b 100644
+--- a/net/mac80211/status.c
++++ b/net/mac80211/status.c
+@@ -1137,9 +1137,17 @@ void ieee80211_tx_status_ext(struct ieee80211_hw *hw,
+ 	struct ieee80211_tx_info *info = status->info;
+ 	struct ieee80211_sta *pubsta = status->sta;
+ 	struct ieee80211_supported_band *sband;
++	struct sta_info *sta;
+ 	int retry_count;
+ 	bool acked, noack_success;
+ 
++	if (pubsta) {
++		sta = container_of(pubsta, struct sta_info, sta);
++
++		if (status->rate)
++			sta->tx_stats.last_rate_info = *status->rate;
++	}
++
+ 	if (status->skb)
+ 		return __ieee80211_tx_status(hw, status);
+ 
+@@ -1154,10 +1162,6 @@ void ieee80211_tx_status_ext(struct ieee80211_hw *hw,
+ 	noack_success = !!(info->flags & IEEE80211_TX_STAT_NOACK_TRANSMITTED);
+ 
+ 	if (pubsta) {
+-		struct sta_info *sta;
+-
+-		sta = container_of(pubsta, struct sta_info, sta);
+-
+ 		if (!acked && !noack_success)
+ 			sta->status_stats.retry_failed++;
+ 		sta->status_stats.retry_count += retry_count;
