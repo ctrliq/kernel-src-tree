@@ -1,0 +1,688 @@
+libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit c3c556966de7a0d5f8c908f407c673070fcdbf2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c3c55696.failed
+
+This patch implements general and correct logic for bpf-to-bpf sub-program
+calls. Only sub-programs used (called into) from entry-point (main) BPF
+program are going to be appended at the end of main BPF program. This ensures
+that BPF verifier won't encounter any dead code due to copying unreferenced
+sub-program. This change means that each entry-point (main) BPF program might
+have a different set of sub-programs appended to it and potentially in
+different order. This has implications on how sub-program call relocations
+need to be handled, described below.
+
+All relocations are now split into two categores: data references (maps and
+global variables) and code references (sub-program calls). This distinction is
+important because data references need to be relocated just once per each BPF
+program and sub-program. These relocation are agnostic to instruction
+locations, because they are not code-relative and they are relocating against
+static targets (maps, variables with fixes offsets, etc).
+
+Sub-program RELO_CALL relocations, on the other hand, are highly-dependent on
+code position, because they are recorded as instruction-relative offset. So
+BPF sub-programs (those that do calls into other sub-programs) can't be
+relocated once, they need to be relocated each time such a sub-program is
+appended at the end of the main entry-point BPF program. As mentioned above,
+each main BPF program might have different subset and differen order of
+sub-programs, so call relocations can't be done just once. Splitting data
+reference and calls relocations as described above allows to do this
+efficiently and cleanly.
+
+bpf_object__find_program_by_name() will now ignore non-entry BPF programs.
+Previously one could have looked up '.text' fake BPF program, but the
+existence of such BPF program was always an implementation detail and you
+can't do much useful with it. Now, though, all non-entry sub-programs get
+their own BPF program with name corresponding to a function name, so there is
+no more '.text' name for BPF program. This means there is no regression,
+effectively, w.r.t.  API behavior. But this is important aspect to highlight,
+because it's going to be critical once libbpf implements static linking of BPF
+programs. Non-entry static BPF programs will be allowed to have conflicting
+names, but global and main-entry BPF program names should be unique. Just like
+with normal user-space linking process. So it's important to restrict this
+aspect right now, keep static and non-entry functions as internal
+implementation details, and not have to deal with regressions in behavior
+later.
+
+This patch leaves .BTF.ext adjustment as is until next patch.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200903203542.15944-5-andriin@fb.com
+(cherry picked from commit c3c556966de7a0d5f8c908f407c673070fcdbf2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 133c0050e689,4e32a1028379..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -225,10 -245,18 +226,18 @@@ struct bpf_program 
+  	 * in bpf_object__pin_programs easier
+  	 */
+  	char *pin_name;
+ -
+ -	/* instructions that belong to BPF program; insns[0] is located at
+ -	 * sec_insn_off instruction within its ELF section in ELF file, so
+ -	 * when mapping ELF file instruction index to the local instruction,
+ -	 * one needs to subtract sec_insn_off; and vice versa.
+ -	 */
+  	struct bpf_insn *insns;
+++<<<<<<< HEAD
+ +	size_t insns_cnt, main_prog_cnt;
+ +	enum bpf_prog_type type;
+ +	bool load;
+++=======
++ 	/* actual number of instruction in this BPF program's image; for
++ 	 * entry-point BPF programs this includes the size of main program
++ 	 * itself plus all the used sub-programs, appended at the end
++ 	 */
++ 	size_t insns_cnt;
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  
+  	struct reloc_desc *reloc_desc;
+  	int nr_reloc;
+@@@ -496,50 -538,71 +505,113 @@@ static char *__bpf_program__pin_name(st
+  	return name;
+  }
+  
+++<<<<<<< HEAD
+ +static int
+ +bpf_program__init(void *data, size_t size, char *section_name, int idx,
+ +		  struct bpf_program *prog)
+ +{
+ +	const size_t bpf_insn_sz = sizeof(struct bpf_insn);
+ +
+ +	if (size == 0 || size % bpf_insn_sz) {
+ +		pr_warn("corrupted section '%s', size: %zu\n",
+ +			section_name, size);
+++=======
++ static bool insn_is_subprog_call(const struct bpf_insn *insn)
++ {
++ 	return BPF_CLASS(insn->code) == BPF_JMP &&
++ 	       BPF_OP(insn->code) == BPF_CALL &&
++ 	       BPF_SRC(insn->code) == BPF_K &&
++ 	       insn->src_reg == BPF_PSEUDO_CALL &&
++ 	       insn->dst_reg == 0 &&
++ 	       insn->off == 0;
++ }
++ 
++ static int
++ bpf_object__init_prog(struct bpf_object *obj, struct bpf_program *prog,
++ 		      const char *name, size_t sec_idx, const char *sec_name,
++ 		      size_t sec_off, void *insn_data, size_t insn_data_sz)
++ {
++ 	int i;
++ 
++ 	if (insn_data_sz == 0 || insn_data_sz % BPF_INSN_SZ || sec_off % BPF_INSN_SZ) {
++ 		pr_warn("sec '%s': corrupted program '%s', offset %zu, size %zu\n",
++ 			sec_name, name, sec_off, insn_data_sz);
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  		return -EINVAL;
+  	}
+  
+  	memset(prog, 0, sizeof(*prog));
+++<<<<<<< HEAD
+++=======
++ 	prog->obj = obj;
++ 
++ 	prog->sec_idx = sec_idx;
++ 	prog->sec_insn_off = sec_off / BPF_INSN_SZ;
++ 	prog->sec_insn_cnt = insn_data_sz / BPF_INSN_SZ;
++ 	/* insns_cnt can later be increased by appending used subprograms */
++ 	prog->insns_cnt = prog->sec_insn_cnt;
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+ +
+ +	prog->section_name = strdup(section_name);
+ +	if (!prog->section_name) {
+ +		pr_warn("failed to alloc name for prog under section(%d) %s\n",
+ +			idx, section_name);
+ +		goto errout;
+ +	}
+  
+ +	prog->pin_name = __bpf_program__pin_name(prog);
+ +	if (!prog->pin_name) {
+ +		pr_warn("failed to alloc pin name for prog under section(%d) %s\n",
+ +			idx, section_name);
+ +		goto errout;
+ +	}
+ +
+ +	prog->insns = malloc(size);
+ +	if (!prog->insns) {
+ +		pr_warn("failed to alloc insns for prog under section %s\n",
+ +			section_name);
+ +		goto errout;
+ +	}
+ +	prog->insns_cnt = size / bpf_insn_sz;
+ +	memcpy(prog->insns, data, size);
+ +	prog->idx = idx;
+ +	prog->instances.fds = NULL;
+ +	prog->instances.nr = -1;
+  	prog->type = BPF_PROG_TYPE_UNSPEC;
+  	prog->load = true;
+  
+++<<<<<<< HEAD
+++=======
++ 	prog->instances.fds = NULL;
++ 	prog->instances.nr = -1;
++ 
++ 	prog->section_name = strdup(sec_name);
++ 	if (!prog->section_name)
++ 		goto errout;
++ 
++ 	prog->name = strdup(name);
++ 	if (!prog->name)
++ 		goto errout;
++ 
++ 	prog->pin_name = __bpf_program__pin_name(prog);
++ 	if (!prog->pin_name)
++ 		goto errout;
++ 
++ 	prog->insns = malloc(insn_data_sz);
++ 	if (!prog->insns)
++ 		goto errout;
++ 	memcpy(prog->insns, insn_data, insn_data_sz);
++ 
++ 	for (i = 0; i < prog->insns_cnt; i++) {
++ 		if (insn_is_subprog_call(&prog->insns[i])) {
++ 			obj->has_subcalls = true;
++ 			break;
++ 		}
++ 	}
++ 
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  	return 0;
+  errout:
+ -	pr_warn("sec '%s': failed to allocate memory for prog '%s'\n", sec_name, name);
+  	bpf_program__exit(prog);
+  	return -ENOMEM;
+  }
+@@@ -557,76 -620,57 +629,112 @@@ bpf_object__add_program(struct bpf_obje
+  
+  	progs = obj->programs;
+  	nr_progs = obj->nr_programs;
+ -	sec_off = 0;
+  
+ -	while (sec_off < sec_sz) {
+ -		if (elf_sym_by_sec_off(obj, sec_idx, sec_off, STT_FUNC, &sym)) {
+ -			pr_warn("sec '%s': failed to find program symbol at offset %zu\n",
+ -				sec_name, sec_off);
+ -			return -LIBBPF_ERRNO__FORMAT;
+ +	progs = libbpf_reallocarray(progs, nr_progs + 1, sizeof(progs[0]));
+ +	if (!progs) {
+ +		/*
+ +		 * In this case the original obj->programs
+ +		 * is still valid, so don't need special treat for
+ +		 * bpf_close_object().
+ +		 */
+ +		pr_warn("failed to alloc a new program under section '%s'\n",
+ +			section_name);
+ +		bpf_program__exit(&prog);
+ +		return -ENOMEM;
+ +	}
+ +
+ +	pr_debug("found program %s\n", prog.section_name);
+ +	obj->programs = progs;
+ +	obj->nr_programs = nr_progs + 1;
+ +	prog.obj = obj;
+ +	progs[nr_progs] = prog;
+ +	return 0;
+ +}
+ +
+ +static int
+ +bpf_object__init_prog_names(struct bpf_object *obj)
+ +{
+ +	Elf_Data *symbols = obj->efile.symbols;
+ +	struct bpf_program *prog;
+ +	size_t pi, si;
+ +
+ +	for (pi = 0; pi < obj->nr_programs; pi++) {
+ +		const char *name = NULL;
+ +
+ +		prog = &obj->programs[pi];
+ +
+ +		for (si = 0; si < symbols->d_size / sizeof(GElf_Sym) && !name;
+ +		     si++) {
+ +			GElf_Sym sym;
+ +
+ +			if (!gelf_getsym(symbols, si, &sym))
+ +				continue;
+ +			if (sym.st_shndx != prog->idx)
+ +				continue;
+ +			if (GELF_ST_BIND(sym.st_info) != STB_GLOBAL)
+ +				continue;
+ +
+ +			name = elf_strptr(obj->efile.elf,
+ +					  obj->efile.strtabidx,
+ +					  sym.st_name);
+ +			if (!name) {
+ +				pr_warn("failed to get sym name string for prog %s\n",
+ +					prog->section_name);
+ +				return -LIBBPF_ERRNO__LIBELF;
+ +			}
+  		}
+  
+ -		prog_sz = sym.st_size;
+ +		if (!name && prog->idx == obj->efile.text_shndx)
+ +			name = ".text";
+  
+ -		name = elf_sym_str(obj, sym.st_name);
+  		if (!name) {
+ -			pr_warn("sec '%s': failed to get symbol name for offset %zu\n",
+ -				sec_name, sec_off);
+ -			return -LIBBPF_ERRNO__FORMAT;
+ +			pr_warn("failed to find sym for prog %s\n",
+ +				prog->section_name);
+ +			return -EINVAL;
+  		}
+  
+++<<<<<<< HEAD
+ +		prog->name = strdup(name);
+ +		if (!prog->name) {
+ +			pr_warn("failed to allocate memory for prog sym %s\n",
+ +				name);
+ +			return -ENOMEM;
+ +		}
+++=======
++ 		if (sec_off + prog_sz > sec_sz) {
++ 			pr_warn("sec '%s': program at offset %zu crosses section boundary\n",
++ 				sec_name, sec_off);
++ 			return -LIBBPF_ERRNO__FORMAT;
++ 		}
++ 
++ 		pr_debug("sec '%s': found program '%s' at insn offset %zu (%zu bytes), code size %zu insns (%zu bytes)\n",
++ 			 sec_name, name, sec_off / BPF_INSN_SZ, sec_off, prog_sz / BPF_INSN_SZ, prog_sz);
++ 
++ 		progs = libbpf_reallocarray(progs, nr_progs + 1, sizeof(*progs));
++ 		if (!progs) {
++ 			/*
++ 			 * In this case the original obj->programs
++ 			 * is still valid, so don't need special treat for
++ 			 * bpf_close_object().
++ 			 */
++ 			pr_warn("sec '%s': failed to alloc memory for new program '%s'\n",
++ 				sec_name, name);
++ 			return -ENOMEM;
++ 		}
++ 		obj->programs = progs;
++ 
++ 		prog = &progs[nr_progs];
++ 
++ 		err = bpf_object__init_prog(obj, prog, name, sec_idx, sec_name,
++ 					    sec_off, data + sec_off, prog_sz);
++ 		if (err)
++ 			return err;
++ 
++ 		nr_progs++;
++ 		obj->nr_programs = nr_progs;
++ 
++ 		sec_off += prog_sz;
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  	}
+  
+  	return 0;
+@@@ -3143,8 -3337,11 +3259,10 @@@ static int bpf_program__record_reloc(st
+  	struct bpf_object *obj = prog->obj;
+  	__u32 shdr_idx = sym->st_shndx;
+  	enum libbpf_map_type type;
+ -	const char *sym_sec_name;
+  	struct bpf_map *map;
+  
++ 	reloc_desc->processed = false;
++ 
+  	/* sub-program call relocation */
+  	if (insn->code == (BPF_JMP | BPF_CALL)) {
+  		if (insn->src_reg != BPF_PSEUDO_CALL) {
+@@@ -3262,55 -3462,113 +3379,98 @@@
+  	return 0;
+  }
+  
+ -static bool prog_contains_insn(const struct bpf_program *prog, size_t insn_idx)
+ -{
+ -	return insn_idx >= prog->sec_insn_off &&
+ -	       insn_idx < prog->sec_insn_off + prog->sec_insn_cnt;
+ -}
+ -
+ -static struct bpf_program *find_prog_by_sec_insn(const struct bpf_object *obj,
+ -						 size_t sec_idx, size_t insn_idx)
+ -{
+ -	int l = 0, r = obj->nr_programs - 1, m;
+ -	struct bpf_program *prog;
+ -
+ -	while (l < r) {
+ -		m = l + (r - l + 1) / 2;
+ -		prog = &obj->programs[m];
+ -
+ -		if (prog->sec_idx < sec_idx ||
+ -		    (prog->sec_idx == sec_idx && prog->sec_insn_off <= insn_idx))
+ -			l = m;
+ -		else
+ -			r = m - 1;
+ -	}
+ -	/* matching program could be at index l, but it still might be the
+ -	 * wrong one, so we need to double check conditions for the last time
+ -	 */
+ -	prog = &obj->programs[l];
+ -	if (prog->sec_idx == sec_idx && prog_contains_insn(prog, insn_idx))
+ -		return prog;
+ -	return NULL;
+ -}
+ -
+  static int
+- bpf_program__collect_reloc(struct bpf_program *prog, GElf_Shdr *shdr,
+- 			   Elf_Data *data, struct bpf_object *obj)
++ bpf_object__collect_prog_relos(struct bpf_object *obj, GElf_Shdr *shdr, Elf_Data *data)
+  {
+  	Elf_Data *symbols = obj->efile.symbols;
+++<<<<<<< HEAD
+++=======
++ 	const char *relo_sec_name, *sec_name;
++ 	size_t sec_idx = shdr->sh_info;
++ 	struct bpf_program *prog;
++ 	struct reloc_desc *relos;
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  	int err, i, nrels;
++ 	const char *sym_name;
++ 	__u32 insn_idx;
++ 	GElf_Sym sym;
++ 	GElf_Rel rel;
+  
+ -	relo_sec_name = elf_sec_str(obj, shdr->sh_name);
+ -	sec_name = elf_sec_name(obj, elf_sec_by_idx(obj, sec_idx));
+ -	if (!relo_sec_name || !sec_name)
+ -		return -EINVAL;
+ -
+ -	pr_debug("sec '%s': collecting relocation for section(%zu) '%s'\n",
+ -		 relo_sec_name, sec_idx, sec_name);
+ +	pr_debug("collecting relocating info for: '%s'\n", prog->section_name);
+  	nrels = shdr->sh_size / shdr->sh_entsize;
+  
+- 	prog->reloc_desc = malloc(sizeof(*prog->reloc_desc) * nrels);
+- 	if (!prog->reloc_desc) {
+- 		pr_warn("failed to alloc memory in relocation\n");
+- 		return -ENOMEM;
+- 	}
+- 	prog->nr_reloc = nrels;
+- 
+  	for (i = 0; i < nrels; i++) {
+++<<<<<<< HEAD
+ +		const char *name;
+ +		__u32 insn_idx;
+ +		GElf_Sym sym;
+ +		GElf_Rel rel;
+ +
+++=======
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  		if (!gelf_getrel(data, i, &rel)) {
+ -			pr_warn("sec '%s': failed to get relo #%d\n", relo_sec_name, i);
+ +			pr_warn("relocation: failed to get %d reloc\n", i);
+  			return -LIBBPF_ERRNO__FORMAT;
+  		}
+  		if (!gelf_getsym(symbols, GELF_R_SYM(rel.r_info), &sym)) {
+ -			pr_warn("sec '%s': symbol 0x%zx not found for relo #%d\n",
+ -				relo_sec_name, (size_t)GELF_R_SYM(rel.r_info), i);
+ +			pr_warn("relocation: symbol %"PRIx64" not found\n",
+ +				GELF_R_SYM(rel.r_info));
+  			return -LIBBPF_ERRNO__FORMAT;
+  		}
+ -		if (rel.r_offset % BPF_INSN_SZ) {
+ -			pr_warn("sec '%s': invalid offset 0x%zx for relo #%d\n",
+ -				relo_sec_name, (size_t)GELF_R_SYM(rel.r_info), i);
+ +		if (rel.r_offset % sizeof(struct bpf_insn))
+  			return -LIBBPF_ERRNO__FORMAT;
+ -		}
+  
+++<<<<<<< HEAD
+ +		insn_idx = rel.r_offset / sizeof(struct bpf_insn);
+ +		name = elf_strptr(obj->efile.elf, obj->efile.strtabidx,
+ +				  sym.st_name) ? : "<?>";
+++=======
++ 		insn_idx = rel.r_offset / BPF_INSN_SZ;
++ 		/* relocations against static functions are recorded as
++ 		 * relocations against the section that contains a function;
++ 		 * in such case, symbol will be STT_SECTION and sym.st_name
++ 		 * will point to empty string (0), so fetch section name
++ 		 * instead
++ 		 */
++ 		if (GELF_ST_TYPE(sym.st_info) == STT_SECTION && sym.st_name == 0)
++ 			sym_name = elf_sec_name(obj, elf_sec_by_idx(obj, sym.st_shndx));
++ 		else
++ 			sym_name = elf_sym_str(obj, sym.st_name);
++ 		sym_name = sym_name ?: "<?";
+ -
+ -		pr_debug("sec '%s': relo #%d: insn #%u against '%s'\n",
+ -			 relo_sec_name, i, insn_idx, sym_name);
+ -
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+ +
+ +		pr_debug("relo for shdr %u, symb %zu, value %zu, type %d, bind %d, name %d (\'%s\'), insn %u\n",
+ +			 (__u32)sym.st_shndx, (size_t)GELF_R_SYM(rel.r_info),
+ +			 (size_t)sym.st_value, GELF_ST_TYPE(sym.st_info),
+ +			 GELF_ST_BIND(sym.st_info), sym.st_name, name,
+ +			 insn_idx);
+ +
+++<<<<<<< HEAD
+ +		err = bpf_program__record_reloc(prog, &prog->reloc_desc[i],
+ +						insn_idx, name, &sym, &rel);
+++=======
++ 		prog = find_prog_by_sec_insn(obj, sec_idx, insn_idx);
++ 		if (!prog) {
++ 			pr_warn("sec '%s': relo #%d: program not found in section '%s' for insn #%u\n",
++ 				relo_sec_name, i, sec_name, insn_idx);
++ 			return -LIBBPF_ERRNO__RELOC;
++ 		}
++ 
++ 		relos = libbpf_reallocarray(prog->reloc_desc,
++ 					    prog->nr_reloc + 1, sizeof(*relos));
++ 		if (!relos)
++ 			return -ENOMEM;
++ 		prog->reloc_desc = relos;
++ 
++ 		/* adjust insn_idx to local BPF program frame of reference */
++ 		insn_idx -= prog->sec_insn_off;
++ 		err = bpf_program__record_reloc(prog, &relos[prog->nr_reloc],
++ 						insn_idx, sym_name, &sym, &rel);
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  		if (err)
+  			return err;
++ 
++ 		prog->nr_reloc++;
+  	}
+  	return 0;
+  }
+@@@ -5526,68 -5803,15 +5686,76 @@@ out
+  	return err;
+  }
+  
++ /* Relocate data references within program code:
++  *  - map references;
++  *  - global variable references;
++  *  - extern references.
++  */
+  static int
+- bpf_program__reloc_text(struct bpf_program *prog, struct bpf_object *obj,
+- 			struct reloc_desc *relo)
++ bpf_object__relocate_data(struct bpf_object *obj, struct bpf_program *prog)
+  {
+++<<<<<<< HEAD
+ +	struct bpf_insn *insn, *new_insn;
+ +	struct bpf_program *text;
+ +	size_t new_cnt;
+ +	int err;
+ +
+ +	if (prog->idx != obj->efile.text_shndx && prog->main_prog_cnt == 0) {
+ +		text = bpf_object__find_prog_by_idx(obj, obj->efile.text_shndx);
+ +		if (!text) {
+ +			pr_warn("no .text section found yet relo into text exist\n");
+ +			return -LIBBPF_ERRNO__RELOC;
+ +		}
+ +		new_cnt = prog->insns_cnt + text->insns_cnt;
+ +		new_insn = libbpf_reallocarray(prog->insns, new_cnt, sizeof(*insn));
+ +		if (!new_insn) {
+ +			pr_warn("oom in prog realloc\n");
+ +			return -ENOMEM;
+ +		}
+ +		prog->insns = new_insn;
+ +
+ +		if (obj->btf_ext) {
+ +			err = bpf_program_reloc_btf_ext(prog, obj,
+ +							text->section_name,
+ +							prog->insns_cnt);
+ +			if (err)
+ +				return err;
+ +		}
+ +
+ +		memcpy(new_insn + prog->insns_cnt, text->insns,
+ +		       text->insns_cnt * sizeof(*insn));
+ +		prog->main_prog_cnt = prog->insns_cnt;
+ +		prog->insns_cnt = new_cnt;
+ +		pr_debug("added %zd insn from %s to prog %s\n",
+ +			 text->insns_cnt, text->section_name,
+ +			 prog->section_name);
+ +	}
+ +
+ +	insn = &prog->insns[relo->insn_idx];
+ +	insn->imm += relo->sym_off / 8 + prog->main_prog_cnt - relo->insn_idx;
+ +	return 0;
+ +}
+ +
+ +static int
+ +bpf_program__relocate(struct bpf_program *prog, struct bpf_object *obj)
+ +{
+ +	int i, err;
+ +
+ +	if (!prog)
+ +		return 0;
+ +
+ +	if (obj->btf_ext) {
+ +		err = bpf_program_reloc_btf_ext(prog, obj,
+ +						prog->section_name, 0);
+ +		if (err)
+ +			return err;
+ +	}
+ +
+ +	if (!prog->reloc_desc)
+ +		return 0;
+++=======
++ 	int i;
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  
+  	for (i = 0; i < prog->nr_reloc; i++) {
+  		struct reloc_desc *relo = &prog->reloc_desc[i];
+@@@ -5620,14 -5840,14 +5784,13 @@@
+  				insn[0].imm = (__u32)ext->ksym.addr;
+  				insn[1].imm = ext->ksym.addr >> 32;
+  			}
++ 			relo->processed = true;
+  			break;
+  		case RELO_CALL:
+- 			err = bpf_program__reloc_text(prog, obj, relo);
+- 			if (err)
+- 				return err;
++ 			/* will be handled as a follow up pass */
+  			break;
+  		default:
+ -			pr_warn("prog '%s': relo #%d: bad relo type %d\n",
+ -				prog->name, i, relo->type);
+ +			pr_warn("relo #%d: bad relo type %d\n", i, relo->type);
+  			return -EINVAL;
+  		}
+  	}
+@@@ -5657,27 -6114,30 +6057,39 @@@ bpf_object__relocate(struct bpf_object 
+  	 */
+  	for (i = 0; i < obj->nr_programs; i++) {
+  		prog = &obj->programs[i];
+++<<<<<<< HEAD
+ +		if (prog->idx != obj->efile.text_shndx)
+ +			continue;
+ +
+ +		err = bpf_program__relocate(prog, obj);
+++=======
++ 		err = bpf_object__relocate_data(obj, prog);
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  		if (err) {
+ -			pr_warn("prog '%s': failed to relocate data references: %d\n",
+ -				prog->name, err);
+ +			pr_warn("failed to relocate '%s'\n", prog->section_name);
+  			return err;
+  		}
+- 		break;
+  	}
+- 	/* now relocate everything but .text, which by now is relocated
+- 	 * properly, so we can copy raw sub-program instructions as is safely
++ 	/* now relocate subprogram calls and append used subprograms to main
++ 	 * programs; each copy of subprogram code needs to be relocated
++ 	 * differently for each main program, because its code location might
++ 	 * have changed
+  	 */
+  	for (i = 0; i < obj->nr_programs; i++) {
+  		prog = &obj->programs[i];
+++<<<<<<< HEAD
+ +		if (prog->idx == obj->efile.text_shndx)
+++=======
++ 		/* sub-program's sub-calls are relocated within the context of
++ 		 * its main program only
++ 		 */
++ 		if (prog_is_subprog(obj, prog))
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  			continue;
+  
+- 		err = bpf_program__relocate(prog, obj);
++ 		err = bpf_object__relocate_calls(obj, prog);
+  		if (err) {
+ -			pr_warn("prog '%s': failed to relocate calls: %d\n",
+ -				prog->name, err);
+ +			pr_warn("failed to relocate '%s'\n", prog->section_name);
+  			return err;
+  		}
+  	}
+@@@ -6085,12 -6562,6 +6515,15 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static bool bpf_program__is_function_storage(const struct bpf_program *prog,
+ +					     const struct bpf_object *obj)
+ +{
+ +	return prog->idx == obj->efile.text_shndx && obj->has_pseudo_calls;
+ +}
+ +
+++=======
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  static int
+  bpf_object__load_progs(struct bpf_object *obj, int log_level)
+  {
+@@@ -6107,11 -6578,10 +6540,11 @@@
+  
+  	for (i = 0; i < obj->nr_programs; i++) {
+  		prog = &obj->programs[i];
+- 		if (bpf_program__is_function_storage(prog, obj))
++ 		if (prog_is_subprog(obj, prog))
+  			continue;
+  		if (!prog->load) {
+ -			pr_debug("prog '%s': skipped loading\n", prog->name);
+ +			pr_debug("prog '%s'('%s'): skipped loading\n",
+ +				 prog->name, prog->section_name);
+  			continue;
+  		}
+  		prog->log_level |= log_level;
+@@@ -6172,8 -6642,7 +6605,12 @@@ __bpf_object__open(const char *path, co
+  	err = err ? : bpf_object__collect_externs(obj);
+  	err = err ? : bpf_object__finalize_btf(obj);
+  	err = err ? : bpf_object__init_maps(obj, opts);
+++<<<<<<< HEAD
+ +	err = err ? : bpf_object__init_prog_names(obj);
+ +	err = err ? : bpf_object__collect_reloc(obj);
+++=======
++ 	err = err ? : bpf_object__collect_relos(obj);
+++>>>>>>> c3c556966de7 (libbpf: Make RELO_CALL work for multi-prog sections and sub-program calls)
+  	if (err)
+  		goto out;
+  	bpf_object__elf_finish(obj);
+* Unmerged path tools/lib/bpf/libbpf.c
