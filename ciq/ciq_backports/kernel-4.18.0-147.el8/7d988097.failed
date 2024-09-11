@@ -1,0 +1,476 @@
+acpi/nfit, libnvdimm/security: Add security DSM overwrite support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 7d988097c546187ada602cc9bccd0f03d473eb8f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7d988097.failed
+
+Add support for the NVDIMM_FAMILY_INTEL "ovewrite" capability as
+described by the Intel DSM spec v1.7. This will allow triggering of
+overwrite on Intel NVDIMMs. The overwrite operation can take tens of
+minutes. When the overwrite DSM is issued successfully, the NVDIMMs will
+be unaccessible. The kernel will do backoff polling to detect when the
+overwrite process is completed. According to the DSM spec v1.7, the 128G
+NVDIMMs can take up to 15mins to perform overwrite and larger DIMMs will
+take longer.
+
+Given that overwrite puts the DIMM in an indeterminate state until it
+completes introduce the NDD_SECURITY_OVERWRITE flag to prevent other
+operations from executing when overwrite is happening. The
+NDD_WORK_PENDING flag is added to denote that there is a device reference
+on the nvdimm device for an async workqueue thread context.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 7d988097c546187ada602cc9bccd0f03d473eb8f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/nfit/intel.c
+#	drivers/nvdimm/dimm_devs.c
+#	drivers/nvdimm/nd-core.h
+#	drivers/nvdimm/security.c
+#	include/linux/libnvdimm.h
+diff --cc drivers/nvdimm/dimm_devs.c
+index 508dd405f84f,6affa270abd3..000000000000
+--- a/drivers/nvdimm/dimm_devs.c
++++ b/drivers/nvdimm/dimm_devs.c
+@@@ -370,6 -370,122 +370,125 @@@ static ssize_t available_slots_show(str
+  }
+  static DEVICE_ATTR_RO(available_slots);
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t security_show(struct device *dev,
++ 		struct device_attribute *attr, char *buf)
++ {
++ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++ 
++ 	switch (nvdimm->sec.state) {
++ 	case NVDIMM_SECURITY_DISABLED:
++ 		return sprintf(buf, "disabled\n");
++ 	case NVDIMM_SECURITY_UNLOCKED:
++ 		return sprintf(buf, "unlocked\n");
++ 	case NVDIMM_SECURITY_LOCKED:
++ 		return sprintf(buf, "locked\n");
++ 	case NVDIMM_SECURITY_FROZEN:
++ 		return sprintf(buf, "frozen\n");
++ 	case NVDIMM_SECURITY_OVERWRITE:
++ 		return sprintf(buf, "overwrite\n");
++ 	}
++ 
++ 	return -ENOTTY;
++ }
++ 
++ #define OPS						\
++ 	C( OP_FREEZE,		"freeze",	1),	\
++ 	C( OP_DISABLE,		"disable",	2),	\
++ 	C( OP_UPDATE,		"update",	3),	\
++ 	C( OP_ERASE,		"erase",	2),	\
++ 	C( OP_OVERWRITE,	"overwrite",	2)
++ #undef C
++ #define C(a, b, c) a
++ enum nvdimmsec_op_ids { OPS };
++ #undef C
++ #define C(a, b, c) { b, c }
++ static struct {
++ 	const char *name;
++ 	int args;
++ } ops[] = { OPS };
++ #undef C
++ 
++ #define SEC_CMD_SIZE 32
++ #define KEY_ID_SIZE 10
++ 
++ static ssize_t __security_store(struct device *dev, const char *buf, size_t len)
++ {
++ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++ 	ssize_t rc;
++ 	char cmd[SEC_CMD_SIZE+1], keystr[KEY_ID_SIZE+1],
++ 		nkeystr[KEY_ID_SIZE+1];
++ 	unsigned int key, newkey;
++ 	int i;
++ 
++ 	if (atomic_read(&nvdimm->busy))
++ 		return -EBUSY;
++ 
++ 	rc = sscanf(buf, "%"__stringify(SEC_CMD_SIZE)"s"
++ 			" %"__stringify(KEY_ID_SIZE)"s"
++ 			" %"__stringify(KEY_ID_SIZE)"s",
++ 			cmd, keystr, nkeystr);
++ 	if (rc < 1)
++ 		return -EINVAL;
++ 	for (i = 0; i < ARRAY_SIZE(ops); i++)
++ 		if (sysfs_streq(cmd, ops[i].name))
++ 			break;
++ 	if (i >= ARRAY_SIZE(ops))
++ 		return -EINVAL;
++ 	if (ops[i].args > 1)
++ 		rc = kstrtouint(keystr, 0, &key);
++ 	if (rc >= 0 && ops[i].args > 2)
++ 		rc = kstrtouint(nkeystr, 0, &newkey);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	if (i == OP_FREEZE) {
++ 		dev_dbg(dev, "freeze\n");
++ 		rc = nvdimm_security_freeze(nvdimm);
++ 	} else if (i == OP_DISABLE) {
++ 		dev_dbg(dev, "disable %u\n", key);
++ 		rc = nvdimm_security_disable(nvdimm, key);
++ 	} else if (i == OP_UPDATE) {
++ 		dev_dbg(dev, "update %u %u\n", key, newkey);
++ 		rc = nvdimm_security_update(nvdimm, key, newkey);
++ 	} else if (i == OP_ERASE) {
++ 		dev_dbg(dev, "erase %u\n", key);
++ 		rc = nvdimm_security_erase(nvdimm, key);
++ 	} else if (i == OP_OVERWRITE) {
++ 		dev_dbg(dev, "overwrite %u\n", key);
++ 		rc = nvdimm_security_overwrite(nvdimm, key);
++ 	} else
++ 		return -EINVAL;
++ 
++ 	if (rc == 0)
++ 		rc = len;
++ 	return rc;
++ }
++ 
++ static ssize_t security_store(struct device *dev,
++ 		struct device_attribute *attr, const char *buf, size_t len)
++ 
++ {
++ 	ssize_t rc;
++ 
++ 	/*
++ 	 * Require all userspace triggered security management to be
++ 	 * done while probing is idle and the DIMM is not in active use
++ 	 * in any region.
++ 	 */
++ 	device_lock(dev);
++ 	nvdimm_bus_lock(dev);
++ 	wait_nvdimm_bus_probe_idle(dev);
++ 	rc = __security_store(dev, buf, len);
++ 	nvdimm_bus_unlock(dev);
++ 	device_unlock(dev);
++ 
++ 	return rc;
++ }
++ static DEVICE_ATTR_RW(security);
++ 
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  static struct attribute *nvdimm_attributes[] = {
+  	&dev_attr_state.attr,
+  	&dev_attr_flags.attr,
+@@@ -378,8 -494,28 +497,29 @@@
+  	NULL,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static umode_t nvdimm_visible(struct kobject *kobj, struct attribute *a, int n)
++ {
++ 	struct device *dev = container_of(kobj, typeof(*dev), kobj);
++ 	struct nvdimm *nvdimm = to_nvdimm(dev);
++ 
++ 	if (a != &dev_attr_security.attr)
++ 		return a->mode;
++ 	if (nvdimm->sec.state < 0)
++ 		return 0;
++ 	/* Are there any state mutation ops? */
++ 	if (nvdimm->sec.ops->freeze || nvdimm->sec.ops->disable
++ 			|| nvdimm->sec.ops->change_key
++ 			|| nvdimm->sec.ops->erase
++ 			|| nvdimm->sec.ops->overwrite)
++ 		return a->mode;
++ 	return 0444;
++ }
++ 
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  struct attribute_group nvdimm_attribute_group = {
+  	.attrs = nvdimm_attributes,
+ -	.is_visible = nvdimm_visible,
+  };
+  EXPORT_SYMBOL_GPL(nvdimm_attribute_group);
+  
+@@@ -413,12 -550,59 +553,65 @@@ struct nvdimm *__nvdimm_create(struct n
+  	dev->type = &nvdimm_device_type;
+  	dev->devt = MKDEV(nvdimm_major, nvdimm->id);
+  	dev->groups = groups;
+++<<<<<<< HEAD
+++=======
++ 	nvdimm->sec.ops = sec_ops;
++ 	nvdimm->sec.overwrite_tmo = 0;
++ 	INIT_DELAYED_WORK(&nvdimm->dwork, nvdimm_security_overwrite_query);
++ 	/*
++ 	 * Security state must be initialized before device_add() for
++ 	 * attribute visibility.
++ 	 */
++ 	nvdimm->sec.state = nvdimm_security_state(nvdimm);
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  	nd_device_register(dev);
+  
+  	return nvdimm;
+  }
+  EXPORT_SYMBOL_GPL(__nvdimm_create);
+  
+++<<<<<<< HEAD
+++=======
++ int nvdimm_security_setup_events(struct nvdimm *nvdimm)
++ {
++ 	nvdimm->sec.overwrite_state = sysfs_get_dirent(nvdimm->dev.kobj.sd,
++ 			"security");
++ 	if (!nvdimm->sec.overwrite_state)
++ 		return -ENODEV;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(nvdimm_security_setup_events);
++ 
++ int nvdimm_in_overwrite(struct nvdimm *nvdimm)
++ {
++ 	return test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags);
++ }
++ EXPORT_SYMBOL_GPL(nvdimm_in_overwrite);
++ 
++ int nvdimm_security_freeze(struct nvdimm *nvdimm)
++ {
++ 	int rc;
++ 
++ 	WARN_ON_ONCE(!is_nvdimm_bus_locked(&nvdimm->dev));
++ 
++ 	if (!nvdimm->sec.ops || !nvdimm->sec.ops->freeze)
++ 		return -EOPNOTSUPP;
++ 
++ 	if (nvdimm->sec.state < 0)
++ 		return -EIO;
++ 
++ 	if (test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags)) {
++ 		dev_warn(&nvdimm->dev, "Overwrite operation in progress.\n");
++ 		return -EBUSY;
++ 	}
++ 
++ 	rc = nvdimm->sec.ops->freeze(nvdimm);
++ 	nvdimm->sec.state = nvdimm_security_state(nvdimm);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  int alias_dpa_busy(struct device *dev, void *data)
+  {
+  	resource_size_t map_end, blk_start, new;
+diff --cc drivers/nvdimm/nd-core.h
+index a5977b369651,952d688982d8..000000000000
+--- a/drivers/nvdimm/nd-core.h
++++ b/drivers/nvdimm/nd-core.h
+@@@ -42,8 -43,56 +43,61 @@@ struct nvdimm 
+  	int id, num_flush;
+  	struct resource *flush_wpq;
+  	const char *dimm_id;
+++<<<<<<< HEAD
+ +};
+ +
+++=======
++ 	struct {
++ 		const struct nvdimm_security_ops *ops;
++ 		enum nvdimm_security_state state;
++ 		unsigned int overwrite_tmo;
++ 		struct kernfs_node *overwrite_state;
++ 	} sec;
++ 	struct delayed_work dwork;
++ };
++ 
++ static inline enum nvdimm_security_state nvdimm_security_state(
++ 		struct nvdimm *nvdimm)
++ {
++ 	if (!nvdimm->sec.ops)
++ 		return -ENXIO;
++ 
++ 	return nvdimm->sec.ops->state(nvdimm);
++ }
++ int nvdimm_security_freeze(struct nvdimm *nvdimm);
++ #if IS_ENABLED(CONFIG_NVDIMM_KEYS)
++ int nvdimm_security_disable(struct nvdimm *nvdimm, unsigned int keyid);
++ int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++ 		unsigned int new_keyid);
++ int nvdimm_security_erase(struct nvdimm *nvdimm, unsigned int keyid);
++ int nvdimm_security_overwrite(struct nvdimm *nvdimm, unsigned int keyid);
++ void nvdimm_security_overwrite_query(struct work_struct *work);
++ #else
++ static inline int nvdimm_security_disable(struct nvdimm *nvdimm,
++ 		unsigned int keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_update(struct nvdimm *nvdimm, unsigned int keyid,
++ 		unsigned int new_keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_erase(struct nvdimm *nvdimm, unsigned int keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int nvdimm_security_overwrite(struct nvdimm *nvdimm,
++ 		unsigned int keyid)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline void nvdimm_security_overwrite_query(struct work_struct *work)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  /**
+   * struct blk_alloc_info - tracking info for BLK dpa scanning
+   * @nd_mapping: blk region mapping boundaries
+diff --cc include/linux/libnvdimm.h
+index c0e66496e33c,d18885304020..000000000000
+--- a/include/linux/libnvdimm.h
++++ b/include/linux/libnvdimm.h
+@@@ -155,6 -159,38 +159,41 @@@ static inline struct nd_blk_region_des
+  
+  }
+  
+++<<<<<<< HEAD
+++=======
++ enum nvdimm_security_state {
++ 	NVDIMM_SECURITY_DISABLED,
++ 	NVDIMM_SECURITY_UNLOCKED,
++ 	NVDIMM_SECURITY_LOCKED,
++ 	NVDIMM_SECURITY_FROZEN,
++ 	NVDIMM_SECURITY_OVERWRITE,
++ };
++ 
++ #define NVDIMM_PASSPHRASE_LEN		32
++ #define NVDIMM_KEY_DESC_LEN		22
++ 
++ struct nvdimm_key_data {
++ 	u8 data[NVDIMM_PASSPHRASE_LEN];
++ };
++ 
++ struct nvdimm_security_ops {
++ 	enum nvdimm_security_state (*state)(struct nvdimm *nvdimm);
++ 	int (*freeze)(struct nvdimm *nvdimm);
++ 	int (*change_key)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *old_data,
++ 			const struct nvdimm_key_data *new_data);
++ 	int (*unlock)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*disable)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*erase)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*overwrite)(struct nvdimm *nvdimm,
++ 			const struct nvdimm_key_data *key_data);
++ 	int (*query_overwrite)(struct nvdimm *nvdimm);
++ };
++ 
+++>>>>>>> 7d988097c546 (acpi/nfit, libnvdimm/security: Add security DSM overwrite support)
+  void badrange_init(struct badrange *badrange);
+  int badrange_add(struct badrange *badrange, u64 addr, u64 length);
+  void badrange_forget(struct badrange *badrange, phys_addr_t start,
+@@@ -185,9 -223,10 +224,10 @@@ static inline struct nvdimm *nvdimm_cre
+  		struct resource *flush_wpq)
+  {
+  	return __nvdimm_create(nvdimm_bus, provider_data, groups, flags,
+ -			cmd_mask, num_flush, flush_wpq, NULL, NULL);
+ +			cmd_mask, num_flush, flush_wpq, NULL);
+  }
+  
++ int nvdimm_security_setup_events(struct nvdimm *nvdimm);
+  const struct nd_cmd_desc *nd_cmd_dimm_desc(int cmd);
+  const struct nd_cmd_desc *nd_cmd_bus_desc(int cmd);
+  u32 nd_cmd_in_size(struct nvdimm *nvdimm, int cmd,
+@@@ -213,7 -252,17 +253,8 @@@ u64 nd_fletcher64(void *addr, size_t le
+  void nvdimm_flush(struct nd_region *nd_region);
+  int nvdimm_has_flush(struct nd_region *nd_region);
+  int nvdimm_has_cache(struct nd_region *nd_region);
++ int nvdimm_in_overwrite(struct nvdimm *nvdimm);
+  
+ -static inline int nvdimm_ctl(struct nvdimm *nvdimm, unsigned int cmd, void *buf,
+ -		unsigned int buf_len, int *cmd_rc)
+ -{
+ -	struct nvdimm_bus *nvdimm_bus = nvdimm_to_bus(nvdimm);
+ -	struct nvdimm_bus_descriptor *nd_desc = to_nd_desc(nvdimm_bus);
+ -
+ -	return nd_desc->ndctl(nd_desc, nvdimm, cmd, buf, buf_len, cmd_rc);
+ -}
+ -
+  #ifdef CONFIG_ARCH_HAS_PMEM_API
+  #define ARCH_MEMREMAP_PMEM MEMREMAP_WB
+  void arch_wb_cache_pmem(void *addr, size_t size);
+* Unmerged path drivers/acpi/nfit/intel.c
+* Unmerged path drivers/nvdimm/security.c
+diff --git a/drivers/acpi/nfit/core.c b/drivers/acpi/nfit/core.c
+index 3ff1f14c05c6..aad105a77fa7 100644
+--- a/drivers/acpi/nfit/core.c
++++ b/drivers/acpi/nfit/core.c
+@@ -2048,6 +2048,11 @@ static int acpi_nfit_register_dimms(struct acpi_nfit_desc *acpi_desc)
+ 		if (!nvdimm)
+ 			continue;
+ 
++		rc = nvdimm_security_setup_events(nvdimm);
++		if (rc < 0)
++			dev_warn(acpi_desc->dev,
++				"security event setup failed: %d\n", rc);
++
+ 		nfit_kernfs = sysfs_get_dirent(nvdimm_kobj(nvdimm)->sd, "nfit");
+ 		if (nfit_kernfs)
+ 			nfit_mem->flags_attr = sysfs_get_dirent(nfit_kernfs,
+* Unmerged path drivers/acpi/nfit/intel.c
+diff --git a/drivers/nvdimm/bus.c b/drivers/nvdimm/bus.c
+index 36da259ac9b5..2ddb47dfde10 100644
+--- a/drivers/nvdimm/bus.c
++++ b/drivers/nvdimm/bus.c
+@@ -387,9 +387,24 @@ static int child_unregister(struct device *dev, void *data)
+ 	 * i.e. remove classless children
+ 	 */
+ 	if (dev->class)
+-		/* pass */;
+-	else
+-		nd_device_unregister(dev, ND_SYNC);
++		return 0;
++
++	if (is_nvdimm(dev)) {
++		struct nvdimm *nvdimm = to_nvdimm(dev);
++		bool dev_put = false;
++
++		/* We are shutting down. Make state frozen artificially. */
++		nvdimm_bus_lock(dev);
++		nvdimm->sec.state = NVDIMM_SECURITY_FROZEN;
++		if (test_and_clear_bit(NDD_WORK_PENDING, &nvdimm->flags))
++			dev_put = true;
++		nvdimm_bus_unlock(dev);
++		cancel_delayed_work_sync(&nvdimm->dwork);
++		if (dev_put)
++			put_device(dev);
++	}
++	nd_device_unregister(dev, ND_SYNC);
++
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/nvdimm/dimm_devs.c
+* Unmerged path drivers/nvdimm/nd-core.h
+diff --git a/drivers/nvdimm/region_devs.c b/drivers/nvdimm/region_devs.c
+index e7377f1028ef..e2818f94f292 100644
+--- a/drivers/nvdimm/region_devs.c
++++ b/drivers/nvdimm/region_devs.c
+@@ -79,6 +79,11 @@ int nd_region_activate(struct nd_region *nd_region)
+ 		struct nd_mapping *nd_mapping = &nd_region->mapping[i];
+ 		struct nvdimm *nvdimm = nd_mapping->nvdimm;
+ 
++		if (test_bit(NDD_SECURITY_OVERWRITE, &nvdimm->flags)) {
++			nvdimm_bus_unlock(&nd_region->dev);
++			return -EBUSY;
++		}
++
+ 		/* at least one null hint slot per-dimm for the "no-hint" case */
+ 		flush_data_size += sizeof(void *);
+ 		num_flush = min_not_zero(num_flush, nvdimm->num_flush);
+* Unmerged path drivers/nvdimm/security.c
+* Unmerged path include/linux/libnvdimm.h
