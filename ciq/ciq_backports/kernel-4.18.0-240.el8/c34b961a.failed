@@ -1,0 +1,179 @@
+net/sched: act_ct: Create nf flow table per zone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] sched: act_ct: Create nf flow table per zone (Ivan Vecera) [1824071]
+Rebuild_FUZZ: 95.65%
+commit-author Paul Blakey <paulb@mellanox.com>
+commit c34b961a249211bdb08d03bdecfb31ff22eb002f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c34b961a.failed
+
+Use the NF flow tables infrastructure for CT offload.
+
+Create a nf flow table per zone.
+
+Next patches will add FT entries to this table, and do
+the software offload.
+
+	Signed-off-by: Paul Blakey <paulb@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c34b961a249211bdb08d03bdecfb31ff22eb002f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_ct.c
+diff --cc net/sched/act_ct.c
+index f67211a791ce,3321087cb93f..000000000000
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@@ -24,13 -25,116 +25,119 @@@
+  #include <uapi/linux/tc_act/tc_ct.h>
+  #include <net/tc_act/tc_ct.h>
+  
+++<<<<<<< HEAD
+ +#include <linux/netfilter/nf_nat.h>
+++=======
++ #include <net/netfilter/nf_flow_table.h>
+++>>>>>>> c34b961a2492 (net/sched: act_ct: Create nf flow table per zone)
+  #include <net/netfilter/nf_conntrack.h>
+  #include <net/netfilter/nf_conntrack_core.h>
+  #include <net/netfilter/nf_conntrack_zones.h>
+  #include <net/netfilter/nf_conntrack_helper.h>
+  #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+ -#include <uapi/linux/netfilter/nf_nat.h>
+  
++ static struct workqueue_struct *act_ct_wq;
++ static struct rhashtable zones_ht;
++ static DEFINE_SPINLOCK(zones_lock);
++ 
++ struct tcf_ct_flow_table {
++ 	struct rhash_head node; /* In zones tables */
++ 
++ 	struct rcu_work rwork;
++ 	struct nf_flowtable nf_ft;
++ 	u16 zone;
++ 	u32 ref;
++ 
++ 	bool dying;
++ };
++ 
++ static const struct rhashtable_params zones_params = {
++ 	.head_offset = offsetof(struct tcf_ct_flow_table, node),
++ 	.key_offset = offsetof(struct tcf_ct_flow_table, zone),
++ 	.key_len = sizeof_field(struct tcf_ct_flow_table, zone),
++ 	.automatic_shrinking = true,
++ };
++ 
++ static struct nf_flowtable_type flowtable_ct = {
++ 	.owner		= THIS_MODULE,
++ };
++ 
++ static int tcf_ct_flow_table_get(struct tcf_ct_params *params)
++ {
++ 	struct tcf_ct_flow_table *ct_ft;
++ 	int err = -ENOMEM;
++ 
++ 	spin_lock_bh(&zones_lock);
++ 	ct_ft = rhashtable_lookup_fast(&zones_ht, &params->zone, zones_params);
++ 	if (ct_ft)
++ 		goto take_ref;
++ 
++ 	ct_ft = kzalloc(sizeof(*ct_ft), GFP_ATOMIC);
++ 	if (!ct_ft)
++ 		goto err_alloc;
++ 
++ 	ct_ft->zone = params->zone;
++ 	err = rhashtable_insert_fast(&zones_ht, &ct_ft->node, zones_params);
++ 	if (err)
++ 		goto err_insert;
++ 
++ 	ct_ft->nf_ft.type = &flowtable_ct;
++ 	err = nf_flow_table_init(&ct_ft->nf_ft);
++ 	if (err)
++ 		goto err_init;
++ 
++ 	__module_get(THIS_MODULE);
++ take_ref:
++ 	params->ct_ft = ct_ft;
++ 	ct_ft->ref++;
++ 	spin_unlock_bh(&zones_lock);
++ 
++ 	return 0;
++ 
++ err_init:
++ 	rhashtable_remove_fast(&zones_ht, &ct_ft->node, zones_params);
++ err_insert:
++ 	kfree(ct_ft);
++ err_alloc:
++ 	spin_unlock_bh(&zones_lock);
++ 	return err;
++ }
++ 
++ static void tcf_ct_flow_table_cleanup_work(struct work_struct *work)
++ {
++ 	struct tcf_ct_flow_table *ct_ft;
++ 
++ 	ct_ft = container_of(to_rcu_work(work), struct tcf_ct_flow_table,
++ 			     rwork);
++ 	nf_flow_table_free(&ct_ft->nf_ft);
++ 	kfree(ct_ft);
++ 
++ 	module_put(THIS_MODULE);
++ }
++ 
++ static void tcf_ct_flow_table_put(struct tcf_ct_params *params)
++ {
++ 	struct tcf_ct_flow_table *ct_ft = params->ct_ft;
++ 
++ 	spin_lock_bh(&zones_lock);
++ 	if (--params->ct_ft->ref == 0) {
++ 		rhashtable_remove_fast(&zones_ht, &ct_ft->node, zones_params);
++ 		INIT_RCU_WORK(&ct_ft->rwork, tcf_ct_flow_table_cleanup_work);
++ 		queue_rcu_work(act_ct_wq, &ct_ft->rwork);
++ 	}
++ 	spin_unlock_bh(&zones_lock);
++ }
++ 
++ static int tcf_ct_flow_tables_init(void)
++ {
++ 	return rhashtable_init(&zones_ht, &zones_params);
++ }
++ 
++ static void tcf_ct_flow_tables_uninit(void)
++ {
++ 	rhashtable_destroy(&zones_ht);
++ }
++ 
+  static struct tc_action_ops act_ct_ops;
+  static unsigned int ct_net_id;
+  
+diff --git a/include/net/tc_act/tc_ct.h b/include/net/tc_act/tc_ct.h
+index a8b156402873..cf3492e2a6a4 100644
+--- a/include/net/tc_act/tc_ct.h
++++ b/include/net/tc_act/tc_ct.h
+@@ -25,6 +25,8 @@ struct tcf_ct_params {
+ 	u16 ct_action;
+ 
+ 	struct rcu_head rcu;
++
++	struct tcf_ct_flow_table *ct_ft;
+ };
+ 
+ struct tcf_ct {
+diff --git a/net/sched/Kconfig b/net/sched/Kconfig
+index 44d68f921086..5b8865ad0e75 100644
+--- a/net/sched/Kconfig
++++ b/net/sched/Kconfig
+@@ -971,7 +971,7 @@ config NET_ACT_TUNNEL_KEY
+ 
+ config NET_ACT_CT
+ 	tristate "connection tracking tc action"
+-	depends on NET_CLS_ACT && NF_CONNTRACK && NF_NAT
++	depends on NET_CLS_ACT && NF_CONNTRACK && NF_NAT && NF_FLOW_TABLE
+ 	help
+ 	  Say Y here to allow sending the packets to conntrack module.
+ 
+* Unmerged path net/sched/act_ct.c
