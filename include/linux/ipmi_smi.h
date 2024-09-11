@@ -244,13 +244,18 @@ static inline int ipmi_demangle_device_id(uint8_t netfn, uint8_t cmd,
  * is called, and the lower layer must get the interface from that
  * call.
  */
+int ipmi_register_smi(const struct ipmi_smi_handlers *handlers,
+		      void                     *send_info,
+		      struct device            *dev,
+		      unsigned char            slave_addr);
+
 int ipmi_add_smi(struct module            *owner,
 		 const struct ipmi_smi_handlers *handlers,
 		 void                     *send_info,
 		 struct device            *dev,
 		 unsigned char            slave_addr);
 
-#define ipmi_register_smi(handlers, send_info, dev, slave_addr) \
+#define ipmi_register_smi_mod(handlers, send_info, dev, slave_addr) \
 	ipmi_add_smi(THIS_MODULE, handlers, send_info, dev, slave_addr)
 
 /*

@@ -79,9 +79,10 @@ struct device_private {
 	struct klist_node knode_driver;
 	struct klist_node knode_bus;
 	struct list_head deferred_probe;
-	struct device_driver *async_driver;
 	struct device *device;
-	u8 dead:1;
+	RH_KABI_EXTEND(struct device_driver *async_driver)
+	RH_KABI_EXTEND(u8 dead:1)
+
 };
 #define to_device_private_parent(obj)	\
 	container_of(obj, struct device_private, knode_parent)

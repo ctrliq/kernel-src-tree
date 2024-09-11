@@ -297,6 +297,10 @@ struct bpf_insn_aux_data {
 		unsigned long map_state;	/* pointer/poison value for maps */
 		s32 call_imm;			/* saved imm field of call insn */
 		u32 alu_limit;			/* limit for add/sub register with pointer */
+		struct {
+			u32 map_index;		/* index into used_maps[] */
+			u32 map_off;		/* offset from value base address */
+		};
 	};
 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
 	int sanitize_stack_off; /* stack slot to be cleared */
@@ -412,5 +416,10 @@ int bpf_prog_offload_verifier_prep(struct bpf_prog *prog);
 int bpf_prog_offload_verify_insn(struct bpf_verifier_env *env,
 				 int insn_idx, int prev_insn_idx);
 int bpf_prog_offload_finalize(struct bpf_verifier_env *env);
+void
+bpf_prog_offload_replace_insn(struct bpf_verifier_env *env, u32 off,
+			      struct bpf_insn *insn);
+void
+bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
 
 #endif /* _LINUX_BPF_VERIFIER_H */

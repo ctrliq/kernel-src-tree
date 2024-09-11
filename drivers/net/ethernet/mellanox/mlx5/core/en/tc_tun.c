@@ -5,6 +5,7 @@
 #include <net/gre.h>
 #include <net/geneve.h>
 #include "en/tc_tun.h"
+#include "en_tc.h"
 
 struct mlx5e_tc_tunnel *mlx5e_get_tc_tun(struct net_device *tunnel_dev)
 {
@@ -24,10 +25,11 @@ static int get_route_and_out_devs(struct mlx5e_priv *priv,
 				  struct net_device **route_dev,
 				  struct net_device **out_dev)
 {
+	struct net_device *uplink_dev, *uplink_upper, *real_dev;
 	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
-	struct net_device *uplink_dev, *uplink_upper;
 	bool dst_is_lag_dev;
 
+	real_dev = is_vlan_dev(dev) ? vlan_dev_real_dev(dev) : dev;
 	uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
 
 	rcu_read_lock();
@@ -42,7 +44,7 @@ static int get_route_and_out_devs(struct mlx5e_priv *priv,
 
 	dst_is_lag_dev = (uplink_upper &&
 			  netif_is_lag_master(uplink_upper) &&
-			  dev == uplink_upper &&
+			  real_dev == uplink_upper &&
 			  mlx5_lag_is_sriov(priv->mdev));
 	if (uplink_upper)
 		dev_put(uplink_upper);
@@ -50,19 +52,15 @@ static int get_route_and_out_devs(struct mlx5e_priv *priv,
 	/* if the egress device isn't on the same HW e-switch or
 	 * it's a LAG device, use the uplink
 	 */
-	if (!switchdev_port_same_parent_id(priv->netdev, dev) ||
-	    dst_is_lag_dev) {
-		*route_dev = uplink_dev;
+	*route_dev = dev;
+	if (!netdev_port_same_parent_id(priv->netdev, real_dev) ||
+	    dst_is_lag_dev || is_vlan_dev(*route_dev))
+		*out_dev = uplink_dev;
+	else if (mlx5e_eswitch_rep(dev) &&
+		 mlx5e_is_valid_eswitch_fwd_dev(priv, dev))
 		*out_dev = *route_dev;
-	} else {
-		*route_dev = dev;
-		if (is_vlan_dev(*route_dev))
-			*out_dev = uplink_dev;
-		else if (mlx5e_eswitch_rep(dev))
-			*out_dev = *route_dev;
-		else
-			return -EOPNOTSUPP;
-	}
+	else
+		return -EOPNOTSUPP;
 
 	if (!(mlx5e_eswitch_rep(*out_dev) &&
 	      mlx5e_is_uplink_rep(netdev_priv(*out_dev))))
@@ -99,15 +97,19 @@ static int mlx5e_route_lookup_ipv4(struct mlx5e_priv *priv,
 	if (ret)
 		return ret;
 
-	if (mlx5_lag_is_multipath(mdev) && !rt->rt_gateway)
+	if (mlx5_lag_is_multipath(mdev) && !rt->rt_gateway) {
+		ip_rt_put(rt);
 		return -ENETUNREACH;
+	}
 #else
 	return -EOPNOTSUPP;
 #endif
 
 	ret = get_route_and_out_devs(priv, rt->dst.dev, route_dev, out_dev);
-	if (ret < 0)
+	if (ret < 0) {
+		ip_rt_put(rt);
 		return ret;
+	}
 
 	if (!(*out_ttl))
 		*out_ttl = ip4_dst_hoplimit(&rt->dst);
@@ -142,17 +144,19 @@ static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
 #if IS_ENABLED(CONFIG_INET) && IS_ENABLED(CONFIG_IPV6)
 	int ret;
 
-	ret = ipv6_stub->ipv6_dst_lookup(dev_net(mirred_dev), NULL, &dst,
-					 fl6);
-	if (ret < 0)
-		return ret;
+	dst = ipv6_stub->ipv6_dst_lookup_flow(dev_net(mirred_dev), NULL, fl6,
+					      NULL);
+	if (IS_ERR(dst))
+		return PTR_ERR(dst);
 
 	if (!(*out_ttl))
 		*out_ttl = ip6_dst_hoplimit(dst);
 
 	ret = get_route_and_out_devs(priv, dst->dev, route_dev, out_dev);
-	if (ret < 0)
+	if (ret < 0) {
+		dst_release(dst);
 		return ret;
+	}
 #else
 	return -EOPNOTSUPP;
 #endif
@@ -296,14 +300,14 @@ int mlx5e_tc_tun_create_header_ipv4(struct mlx5e_priv *priv,
 		 */
 		goto out;
 	}
-
-	err = mlx5_packet_reformat_alloc(priv->mdev,
-					 e->reformat_type,
-					 ipv4_encap_size, encap_header,
-					 MLX5_FLOW_NAMESPACE_FDB,
-					 &e->encap_id);
-	if (err)
+	e->pkt_reformat = mlx5_packet_reformat_alloc(priv->mdev,
+						     e->reformat_type,
+						     ipv4_encap_size, encap_header,
+						     MLX5_FLOW_NAMESPACE_FDB);
+	if (IS_ERR(e->pkt_reformat)) {
+		err = PTR_ERR(e->pkt_reformat);
 		goto destroy_neigh_entry;
+	}
 
 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
 	mlx5e_rep_queue_neigh_stats_work(netdev_priv(out_dev));
@@ -415,13 +419,14 @@ int mlx5e_tc_tun_create_header_ipv6(struct mlx5e_priv *priv,
 		goto out;
 	}
 
-	err = mlx5_packet_reformat_alloc(priv->mdev,
-					 e->reformat_type,
-					 ipv6_encap_size, encap_header,
-					 MLX5_FLOW_NAMESPACE_FDB,
-					 &e->encap_id);
-	if (err)
+	e->pkt_reformat = mlx5_packet_reformat_alloc(priv->mdev,
+						     e->reformat_type,
+						     ipv6_encap_size, encap_header,
+						     MLX5_FLOW_NAMESPACE_FDB);
+	if (IS_ERR(e->pkt_reformat)) {
+		err = PTR_ERR(e->pkt_reformat);
 		goto destroy_neigh_entry;
+	}
 
 	e->flags |= MLX5_ENCAP_ENTRY_VALID;
 	mlx5e_rep_queue_neigh_stats_work(netdev_priv(out_dev));
@@ -467,7 +472,7 @@ int mlx5e_tc_tun_init_encap_attr(struct net_device *tunnel_dev,
 int mlx5e_tc_tun_parse(struct net_device *filter_dev,
 		       struct mlx5e_priv *priv,
 		       struct mlx5_flow_spec *spec,
-		       struct tc_cls_flower_offload *f,
+		       struct flow_cls_offload *f,
 		       void *headers_c,
 		       void *headers_v, u8 *match_level)
 {
@@ -504,11 +509,11 @@ out:
 
 int mlx5e_tc_tun_parse_udp_ports(struct mlx5e_priv *priv,
 				 struct mlx5_flow_spec *spec,
-				 struct tc_cls_flower_offload *f,
+				 struct flow_cls_offload *f,
 				 void *headers_c,
 				 void *headers_v)
 {
-	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(f);
+	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
 	struct netlink_ext_ack *extack = f->common.extack;
 	struct flow_match_ports enc_ports;
 

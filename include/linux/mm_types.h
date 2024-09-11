@@ -27,6 +27,7 @@
 struct address_space;
 struct mem_cgroup;
 struct hmm;
+struct dev_pagemap;
 
 /*
  * Each physical page in the system has a struct page associated with
@@ -95,13 +96,13 @@ struct page {
 			 */
 			unsigned long private;
 		};
-		struct {	/* page_pool used by netstack */
+		RH_KABI_EXTEND(struct {	/* page_pool used by netstack */
 			/**
 			 * @dma_addr: might require a 64-bit value even on
 			 * 32-bit architectures.
 			 */
 			dma_addr_t dma_addr;
-		};
+		})
 		struct {	/* slab, slob and slub */
 			union {
 				struct list_head slab_list;
@@ -212,6 +213,9 @@ struct page {
 
 #define PAGE_FRAG_CACHE_MAX_SIZE	__ALIGN_MASK(32768, ~PAGE_MASK)
 #define PAGE_FRAG_CACHE_MAX_ORDER	get_order(PAGE_FRAG_CACHE_MAX_SIZE)
+
+#define page_private(page)		((page)->private)
+#define set_page_private(page, v)	((page)->private = (v))
 
 struct page_frag_cache {
 	void * va;
@@ -409,7 +413,23 @@ struct mm_struct {
 
 		unsigned long total_vm;	   /* Total pages mapped */
 		unsigned long locked_vm;   /* Pages that have PG_mlocked set */
-		atomic64_t    pinned_vm;   /* Refcount permanently increased */
+		/*
+		 * RHEL KABI NOTE: due to changes for BZ#1620349 mm_types.h is
+		 * being exposed to the vdso32 object build, thus we need the
+		 * _UNSAFE variant of RH_KABI_REPLACE in order to placate the
+		 * static assertion check embedded into the safe macro.
+		 * Although unsigned long and atomic64_t do not have a type size
+		 * match in the vdso32 object build case, it is, actually, safe
+		 * to keep the inline type replacement here as there are no
+		 * dependencies, direct or indirect, between the vdso32 code and
+		 * struct mm_struct fields. On every other compilation unit that
+		 * struct mm_struct is required, the type sizes and aligment are
+		 * a perfect match, as expected.
+		 */
+		RH_KABI_REPLACE_UNSAFE(
+		unsigned long pinned_vm,
+		atomic64_t    pinned_vm
+		)			   /* Refcount permanently increased */
 		unsigned long data_vm;	   /* VM_WRITE & ~VM_SHARED & ~VM_STACK */
 		unsigned long exec_vm;	   /* VM_EXEC & ~VM_WRITE & ~VM_STACK */
 		unsigned long stack_vm;	   /* VM_STACK */
@@ -632,7 +652,10 @@ struct vm_fault;
  *
  * Page fault handlers return a bitmask of %VM_FAULT values.
  */
-typedef __bitwise unsigned int vm_fault_t;
+RH_KABI_REPLACE_UNSAFE(
+	typedef int vm_fault_t,
+	typedef __bitwise unsigned int vm_fault_t
+)
 
 /**
  * enum vm_fault_reason - Page fault handlers return a bitmask of

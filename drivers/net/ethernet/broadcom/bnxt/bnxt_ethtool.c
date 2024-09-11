@@ -287,6 +287,9 @@ static const char * const bnxt_ring_sw_stats_str[] = {
 	BNXT_TX_STATS_PRI_ENTRY(counter, 6),		\
 	BNXT_TX_STATS_PRI_ENTRY(counter, 7)
 
+#define BNXT_PCIE_STATS_ENTRY(counter)	\
+	{ BNXT_PCIE_STATS_OFFSET(counter), __stringify(counter) }
+
 enum {
 	RX_TOTAL_DISCARDS,
 	TX_TOTAL_DISCARDS,
@@ -440,6 +443,24 @@ static const struct {
 	BNXT_TX_STATS_PRI_ENTRIES(tx_packets),
 };
 
+static const struct {
+	long offset;
+	char string[ETH_GSTRING_LEN];
+} bnxt_pcie_stats_arr[] = {
+	BNXT_PCIE_STATS_ENTRY(pcie_pl_signal_integrity),
+	BNXT_PCIE_STATS_ENTRY(pcie_dl_signal_integrity),
+	BNXT_PCIE_STATS_ENTRY(pcie_tl_signal_integrity),
+	BNXT_PCIE_STATS_ENTRY(pcie_link_integrity),
+	BNXT_PCIE_STATS_ENTRY(pcie_tx_traffic_rate),
+	BNXT_PCIE_STATS_ENTRY(pcie_rx_traffic_rate),
+	BNXT_PCIE_STATS_ENTRY(pcie_tx_dllp_statistics),
+	BNXT_PCIE_STATS_ENTRY(pcie_rx_dllp_statistics),
+	BNXT_PCIE_STATS_ENTRY(pcie_equalization_time),
+	BNXT_PCIE_STATS_ENTRY(pcie_ltssm_histogram[0]),
+	BNXT_PCIE_STATS_ENTRY(pcie_ltssm_histogram[2]),
+	BNXT_PCIE_STATS_ENTRY(pcie_recovery_histogram),
+};
+
 #define BNXT_NUM_SW_FUNC_STATS	ARRAY_SIZE(bnxt_sw_func_stats)
 #define BNXT_NUM_PORT_STATS ARRAY_SIZE(bnxt_port_stats_arr)
 #define BNXT_NUM_STATS_PRI			\
@@ -447,6 +468,7 @@ static const struct {
 	 ARRAY_SIZE(bnxt_rx_pkts_pri_arr) +	\
 	 ARRAY_SIZE(bnxt_tx_bytes_pri_arr) +	\
 	 ARRAY_SIZE(bnxt_tx_pkts_pri_arr))
+#define BNXT_NUM_PCIE_STATS ARRAY_SIZE(bnxt_pcie_stats_arr)
 
 static int bnxt_get_num_tpa_ring_stats(struct bnxt *bp)
 {
@@ -483,6 +505,9 @@ static int bnxt_get_num_stats(struct bnxt *bp)
 		if (bp->pri2cos_valid)
 			num_stats += BNXT_NUM_STATS_PRI;
 	}
+
+	if (bp->flags & BNXT_FLAG_PCIE_STATS)
+		num_stats += BNXT_NUM_PCIE_STATS;
 
 	return num_stats;
 }
@@ -588,6 +613,14 @@ skip_ring_stats:
 			}
 		}
 	}
+	if (bp->flags & BNXT_FLAG_PCIE_STATS) {
+		__le64 *pcie_stats = (__le64 *)bp->hw_pcie_stats;
+
+		for (i = 0; i < BNXT_NUM_PCIE_STATS; i++, j++) {
+			buf[j] = le64_to_cpu(*(pcie_stats +
+					       bnxt_pcie_stats_arr[i].offset));
+		}
+	}
 }
 
 static void bnxt_get_strings(struct net_device *dev, u32 stringset, u8 *buf)
@@ -669,6 +702,12 @@ skip_tpa_stats:
 					       bnxt_tx_pkts_pri_arr[i].string);
 					buf += ETH_GSTRING_LEN;
 				}
+			}
+		}
+		if (bp->flags & BNXT_FLAG_PCIE_STATS) {
+			for (i = 0; i < BNXT_NUM_PCIE_STATS; i++) {
+				strcpy(buf, bnxt_pcie_stats_arr[i].string);
+				buf += ETH_GSTRING_LEN;
 			}
 		}
 		break;
@@ -1748,6 +1787,8 @@ static int bnxt_firmware_reset(struct net_device *dev,
 	case BNXT_FW_RESET_CHIP:
 		req.embedded_proc_type = FW_RESET_REQ_EMBEDDED_PROC_TYPE_CHIP;
 		req.selfrst_status = FW_RESET_REQ_SELFRST_STATUS_SELFRSTASAP;
+		if (bp->fw_cap & BNXT_FW_CAP_HOT_RESET)
+			req.flags = FW_RESET_REQ_FLAGS_RESET_GRACEFUL;
 		break;
 	case BNXT_FW_RESET_AP:
 		req.embedded_proc_type = FW_RESET_REQ_EMBEDDED_PROC_TYPE_AP;
@@ -2944,7 +2985,8 @@ static int bnxt_reset(struct net_device *dev, u32 *flags)
 		return -EOPNOTSUPP;
 	}
 
-	if (pci_vfs_assigned(bp->pdev)) {
+	if (pci_vfs_assigned(bp->pdev) &&
+	    !(bp->fw_cap & BNXT_FW_CAP_HOT_RESET)) {
 		netdev_err(dev,
 			   "Reset not allowed when VFs are assigned to VMs\n");
 		return -EBUSY;
@@ -2957,7 +2999,9 @@ static int bnxt_reset(struct net_device *dev, u32 *flags)
 
 		rc = bnxt_firmware_reset(dev, BNXT_FW_RESET_CHIP);
 		if (!rc) {
-			netdev_info(dev, "Reset request successful. Reload driver to complete reset\n");
+			netdev_info(dev, "Reset request successful.\n");
+			if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET))
+				netdev_info(dev, "Reload driver to complete reset\n");
 			*flags = 0;
 		}
 	} else if (*flags == ETH_RESET_AP) {
@@ -3365,8 +3409,10 @@ void bnxt_ethtool_init(struct bnxt *bp)
 	struct net_device *dev = bp->dev;
 	int i, rc;
 
-	bnxt_get_pkgver(dev);
+	if (!(bp->fw_cap & BNXT_FW_CAP_PKG_VER))
+		bnxt_get_pkgver(dev);
 
+	bp->num_tests = 0;
 	if (bp->hwrm_spec_code < 0x10704 || !BNXT_SINGLE_PF(bp))
 		return;
 
@@ -3376,7 +3422,9 @@ void bnxt_ethtool_init(struct bnxt *bp)
 	if (rc)
 		goto ethtool_init_exit;
 
-	test_info = kzalloc(sizeof(*bp->test_info), GFP_KERNEL);
+	test_info = bp->test_info;
+	if (!test_info)
+		test_info = kzalloc(sizeof(*bp->test_info), GFP_KERNEL);
 	if (!test_info)
 		goto ethtool_init_exit;
 

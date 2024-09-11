@@ -8,6 +8,7 @@
 #include <linux/skbuff.h>
 #include <linux/types.h>
 #include <net/geneve.h>
+#include <net/gre.h>
 #include <net/vxlan.h>
 
 #include "../nfp_app.h"
@@ -22,6 +23,7 @@
 #define NFP_FLOWER_LAYER_CT		BIT(6)
 #define NFP_FLOWER_LAYER_VXLAN		BIT(7)
 
+#define NFP_FLOWER_LAYER2_GRE		BIT(0)
 #define NFP_FLOWER_LAYER2_GENEVE	BIT(5)
 #define NFP_FLOWER_LAYER2_GENEVE_OP	BIT(6)
 
@@ -36,6 +38,9 @@
 
 #define NFP_FL_IP_FRAG_FIRST		BIT(7)
 #define NFP_FL_IP_FRAGMENTED		BIT(6)
+
+/* GRE Tunnel flags */
+#define NFP_FL_GRE_FLAG_KEY		BIT(2)
 
 /* Compressed HW representation of TCP Flags */
 #define NFP_FL_TCP_FLAG_URG		BIT(4)
@@ -110,6 +115,7 @@
 
 enum nfp_flower_tun_type {
 	NFP_FL_TUNNEL_NONE =	0,
+	NFP_FL_TUNNEL_GRE =	1,
 	NFP_FL_TUNNEL_VXLAN =	2,
 	NFP_FL_TUNNEL_GENEVE =	4,
 };
@@ -410,6 +416,35 @@ struct nfp_flower_ipv4_udp_tun {
 	__be32 tun_id;
 };
 
+/* Flow Frame GRE TUNNEL --> Tunnel details (6W/24B)
+ * -----------------------------------------------------------------
+ *    3                   2                   1
+ *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                         ipv4_addr_src                         |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                         ipv4_addr_dst                         |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |           tun_flags           |       tos     |       ttl     |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |            Reserved           |           Ethertype           |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                              Key                              |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ * |                           Reserved                            |
+ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ */
+
+struct nfp_flower_ipv4_gre_tun {
+	struct nfp_flower_tun_ipv4 ipv4;
+	__be16 tun_flags;
+	struct nfp_flower_tun_ip_ext ip_ext;
+	__be16 reserved1;
+	__be16 ethertype;
+	__be32 tun_key;
+	__be32 reserved2;
+};
+
 struct nfp_flower_geneve_options {
 	u8 data[NFP_FL_MAX_GENEVE_OPT_KEY];
 };
@@ -446,6 +481,10 @@ enum nfp_flower_cmsg_type_port {
 	NFP_FLOWER_CMSG_TYPE_TUN_IPS =		14,
 	NFP_FLOWER_CMSG_TYPE_FLOW_STATS =	15,
 	NFP_FLOWER_CMSG_TYPE_PORT_ECHO =	16,
+	NFP_FLOWER_CMSG_TYPE_QOS_MOD =		18,
+	NFP_FLOWER_CMSG_TYPE_QOS_DEL =		19,
+	NFP_FLOWER_CMSG_TYPE_QOS_STATS =	20,
+	NFP_FLOWER_CMSG_TYPE_PRE_TUN_RULE =	21,
 	NFP_FLOWER_CMSG_TYPE_MAX =		32,
 };
 
@@ -557,6 +596,8 @@ nfp_fl_netdev_is_tunnel_type(struct net_device *netdev,
 {
 	if (netif_is_vxlan(netdev))
 		return tun_type == NFP_FL_TUNNEL_VXLAN;
+	if (netif_is_gretap(netdev))
+		return tun_type == NFP_FL_TUNNEL_GRE;
 	if (netif_is_geneve(netdev))
 		return tun_type == NFP_FL_TUNNEL_GENEVE;
 
@@ -572,6 +613,8 @@ static inline bool nfp_fl_is_netdev_to_offload(struct net_device *netdev)
 	if (netif_is_vxlan(netdev))
 		return true;
 	if (netif_is_geneve(netdev))
+		return true;
+	if (netif_is_gretap(netdev))
 		return true;
 
 	return false;

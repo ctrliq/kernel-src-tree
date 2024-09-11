@@ -5,6 +5,8 @@
 #ifndef __NET_NET_NAMESPACE_H
 #define __NET_NET_NAMESPACE_H
 
+#include <linux/rh_kabi.h>
+
 #include <linux/atomic.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
@@ -30,7 +32,7 @@
 #include <net/netns/xfrm.h>
 #include <net/netns/mpls.h>
 #include <net/netns/can.h>
-#include <net/netns/xdp.h>
+#include RH_KABI_HIDE_INCLUDE(<net/netns/xdp.h>)
 #include <linux/ns_common.h>
 #include <linux/idr.h>
 #include <linux/skbuff.h>
@@ -59,7 +61,7 @@ struct net {
 						 */
 	spinlock_t		rules_mod_lock;
 
-	u32			hash_mix;
+	RH_KABI_DEPRECATE(atomic64_t,		cookie_gen)
 
 	struct list_head	list;		/* list of network namespaces */
 	struct list_head	exit_list;	/* To linked to call pernet exit
@@ -160,9 +162,6 @@ struct net {
 #if IS_ENABLED(CONFIG_CAN)
 	struct netns_can	can;
 #endif
-#ifdef CONFIG_XDP_SOCKETS
-	struct netns_xdp	xdp;
-#endif
 	struct sock		*diag_nlsk;
 	atomic_t		fnhe_genid;
 
@@ -170,6 +169,10 @@ struct net {
 	RH_KABI_EXTEND(int	ipv4_sysctl_tcp_min_snd_mss)
 	RH_KABI_EXTEND(struct bpf_prog __rcu	*flow_dissector_prog)
 	RH_KABI_EXTEND(siphash_key_t ipv4_ip_id_key)
+	RH_KABI_EXTEND(u32	hash_mix)
+	RH_KABI_EXTEND_WITH_SIZE(struct netns_xdp xdp, 21)
+	RH_KABI_EXTEND(int	sctp_ecn_enable)
+	RH_KABI_EXTEND(struct list_head        xfrm_inexact_bins)
 } __randomize_layout;
 
 #include <linux/seq_file_net.h>

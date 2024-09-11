@@ -180,6 +180,7 @@ static int pcm_open(struct snd_pcm_substream *substream)
 	} else {
 		if (ff->substreams_counter > 0) {
 			unsigned int frames_per_period = d->events_per_period;
+			unsigned int frames_per_buffer = d->events_per_buffer;
 
 			rate = amdtp_rate_table[ff->rx_stream.sfc];
 			substream->runtime->hw.rate_min = rate;
@@ -188,6 +189,14 @@ static int pcm_open(struct snd_pcm_substream *substream)
 			err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
 					frames_per_period, frames_per_period);
+			if (err < 0) {
+				mutex_unlock(&ff->mutex);
+				goto release_lock;
+			}
+
+			err = snd_pcm_hw_constraint_minmax(substream->runtime,
+					SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+					frames_per_buffer, frames_per_buffer);
 			if (err < 0) {
 				mutex_unlock(&ff->mutex);
 				goto release_lock;
@@ -229,9 +238,11 @@ static int pcm_hw_params(struct snd_pcm_substream *substream,
 	if (substream->runtime->status->state == SNDRV_PCM_STATE_OPEN) {
 		unsigned int rate = params_rate(hw_params);
 		unsigned int frames_per_period = params_period_size(hw_params);
+		unsigned int frames_per_buffer = params_buffer_size(hw_params);
 
 		mutex_lock(&ff->mutex);
-		err = snd_ff_stream_reserve_duplex(ff, rate, frames_per_period);
+		err = snd_ff_stream_reserve_duplex(ff, rate, frames_per_period,
+						   frames_per_buffer);
 		if (err >= 0)
 			++ff->substreams_counter;
 		mutex_unlock(&ff->mutex);
@@ -330,28 +341,28 @@ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
 {
 	struct snd_ff *ff = sbstrm->private_data;
 
-	return amdtp_stream_pcm_pointer(&ff->tx_stream);
+	return amdtp_domain_stream_pcm_pointer(&ff->domain, &ff->tx_stream);
 }
 
 static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
 {
 	struct snd_ff *ff = sbstrm->private_data;
 
-	return amdtp_stream_pcm_pointer(&ff->rx_stream);
+	return amdtp_domain_stream_pcm_pointer(&ff->domain, &ff->rx_stream);
 }
 
 static int pcm_capture_ack(struct snd_pcm_substream *substream)
 {
 	struct snd_ff *ff = substream->private_data;
 
-	return amdtp_stream_pcm_ack(&ff->tx_stream);
+	return amdtp_domain_stream_pcm_ack(&ff->domain, &ff->tx_stream);
 }
 
 static int pcm_playback_ack(struct snd_pcm_substream *substream)
 {
 	struct snd_ff *ff = substream->private_data;
 
-	return amdtp_stream_pcm_ack(&ff->rx_stream);
+	return amdtp_domain_stream_pcm_ack(&ff->domain, &ff->rx_stream);
 }
 
 int snd_ff_create_pcm_devices(struct snd_ff *ff)

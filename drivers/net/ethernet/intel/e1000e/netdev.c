@@ -3820,7 +3820,6 @@ static void e1000_flush_tx_ring(struct e1000_adapter *adapter)
 	if (tx_ring->next_to_use == tx_ring->count)
 		tx_ring->next_to_use = 0;
 	ew32(TDT(0), tx_ring->next_to_use);
-	mmiowb();
 	usleep_range(200, 250);
 }
 
@@ -5583,9 +5582,8 @@ static int e1000_tx_map(struct e1000_ring *tx_ring, struct sk_buff *skb,
 	}
 
 	for (f = 0; f < nr_frags; f++) {
-		const struct skb_frag_struct *frag;
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[f];
 
-		frag = &skb_shinfo(skb)->frags[f];
 		len = skb_frag_size(frag);
 		offset = 0;
 
@@ -5917,12 +5915,6 @@ static netdev_tx_t e1000_xmit_frame(struct sk_buff *skb,
 						     tx_ring->next_to_use);
 			else
 				writel(tx_ring->next_to_use, tx_ring->tail);
-
-			/* we need this if more than one processor can write
-			 * to our tail at a time, it synchronizes IO on
-			 *IA64/Altix systems
-			 */
-			mmiowb();
 		}
 	} else {
 		dev_kfree_skb_any(skb);

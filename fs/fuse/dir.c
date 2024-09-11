@@ -14,6 +14,7 @@
 #include <linux/namei.h>
 #include <linux/slab.h>
 #include <linux/xattr.h>
+#include <linux/iversion.h>
 #include <linux/posix_acl.h>
 
 static void fuse_advise_use_readdirplus(struct inode *dir)
@@ -23,19 +24,53 @@ static void fuse_advise_use_readdirplus(struct inode *dir)
 	set_bit(FUSE_I_ADVISE_RDPLUS, &fi->state);
 }
 
+#if BITS_PER_LONG >= 64
+static inline void __fuse_dentry_settime(struct dentry *entry, u64 time)
+{
+	entry->d_fsdata = (void *) time;
+}
+
+static inline u64 fuse_dentry_time(const struct dentry *entry)
+{
+	return (u64)entry->d_fsdata;
+}
+
+#else
 union fuse_dentry {
 	u64 time;
 	struct rcu_head rcu;
 };
 
-static inline void fuse_dentry_settime(struct dentry *entry, u64 time)
+static inline void __fuse_dentry_settime(struct dentry *dentry, u64 time)
 {
-	((union fuse_dentry *) entry->d_fsdata)->time = time;
+	((union fuse_dentry *) dentry->d_fsdata)->time = time;
 }
 
-static inline u64 fuse_dentry_time(struct dentry *entry)
+static inline u64 fuse_dentry_time(const struct dentry *entry)
 {
 	return ((union fuse_dentry *) entry->d_fsdata)->time;
+}
+#endif
+
+static void fuse_dentry_settime(struct dentry *dentry, u64 time)
+{
+	struct fuse_conn *fc = get_fuse_conn_super(dentry->d_sb);
+	bool delete = !time && fc->delete_stale;
+	/*
+	 * Mess with DCACHE_OP_DELETE because dput() will be faster without it.
+	 * Don't care about races, either way it's just an optimization
+	 */
+	if ((!delete && (dentry->d_flags & DCACHE_OP_DELETE)) ||
+	    (delete && !(dentry->d_flags & DCACHE_OP_DELETE))) {
+		spin_lock(&dentry->d_lock);
+		if (!delete)
+			dentry->d_flags &= ~DCACHE_OP_DELETE;
+		else
+			dentry->d_flags |= DCACHE_OP_DELETE;
+		spin_unlock(&dentry->d_lock);
+	}
+
+	__fuse_dentry_settime(dentry, time);
 }
 
 /*
@@ -92,6 +127,12 @@ static void fuse_invalidate_attr_mask(struct inode *inode, u32 mask)
 void fuse_invalidate_attr(struct inode *inode)
 {
 	fuse_invalidate_attr_mask(inode, STATX_BASIC_STATS);
+}
+
+static void fuse_dir_changed(struct inode *dir)
+{
+	fuse_invalidate_attr(dir);
+	inode_maybe_inc_iversion(dir, false);
 }
 
 /**
@@ -235,6 +276,7 @@ invalid:
 	goto out;
 }
 
+#if BITS_PER_LONG < 64
 static int fuse_dentry_init(struct dentry *dentry)
 {
 	dentry->d_fsdata = kzalloc(sizeof(union fuse_dentry),
@@ -248,16 +290,27 @@ static void fuse_dentry_release(struct dentry *dentry)
 
 	kfree_rcu(fd, rcu);
 }
+#endif
+
+static int fuse_dentry_delete(const struct dentry *dentry)
+{
+	return time_before64(fuse_dentry_time(dentry), get_jiffies_64());
+}
 
 const struct dentry_operations fuse_dentry_operations = {
 	.d_revalidate	= fuse_dentry_revalidate,
+	.d_delete	= fuse_dentry_delete,
+#if BITS_PER_LONG < 64
 	.d_init		= fuse_dentry_init,
 	.d_release	= fuse_dentry_release,
+#endif
 };
 
 const struct dentry_operations fuse_root_dentry_operations = {
+#if BITS_PER_LONG < 64
 	.d_init		= fuse_dentry_init,
 	.d_release	= fuse_dentry_release,
+#endif
 };
 
 int fuse_valid_type(int m)
@@ -440,7 +493,7 @@ static int fuse_create_open(struct inode *dir, struct dentry *entry,
 	kfree(forget);
 	d_instantiate(entry, inode);
 	fuse_change_entry_timeout(entry, &outentry);
-	fuse_invalidate_attr(dir);
+	fuse_dir_changed(dir);
 	err = finish_open(file, entry, generic_file_open, opened);
 	if (err) {
 		fi = get_fuse_inode(inode);
@@ -548,7 +601,7 @@ static int create_new_entry(struct fuse_conn *fc, struct fuse_args *args,
 		return err;
 
 	fuse_change_entry_timeout(entry, &outarg);
-	fuse_invalidate_attr(dir);
+	fuse_dir_changed(dir);
 	return 0;
 
  out_put_forget_req:
@@ -646,7 +699,7 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
 		struct inode *inode = d_inode(entry);
 		struct fuse_inode *fi = get_fuse_inode(inode);
 
-		spin_lock(&fc->lock);
+		spin_lock(&fi->lock);
 		fi->attr_version = atomic64_inc_return(&fc->attr_version);
 		/*
 		 * If i_nlink == 0 then unlink doesn't make sense, yet this can
@@ -656,9 +709,9 @@ static int fuse_unlink(struct inode *dir, struct dentry *entry)
 		 */
 		if (inode->i_nlink > 0)
 			drop_nlink(inode);
-		spin_unlock(&fc->lock);
+		spin_unlock(&fi->lock);
 		fuse_invalidate_attr(inode);
-		fuse_invalidate_attr(dir);
+		fuse_dir_changed(dir);
 		fuse_invalidate_entry_cache(entry);
 		fuse_update_ctime(inode);
 	} else if (err == -EINTR)
@@ -680,7 +733,7 @@ static int fuse_rmdir(struct inode *dir, struct dentry *entry)
 	err = fuse_simple_request(fc, &args);
 	if (!err) {
 		clear_nlink(d_inode(entry));
-		fuse_invalidate_attr(dir);
+		fuse_dir_changed(dir);
 		fuse_invalidate_entry_cache(entry);
 	} else if (err == -EINTR)
 		fuse_invalidate_entry(entry);
@@ -719,9 +772,9 @@ static int fuse_rename_common(struct inode *olddir, struct dentry *oldent,
 			fuse_update_ctime(d_inode(newent));
 		}
 
-		fuse_invalidate_attr(olddir);
+		fuse_dir_changed(olddir);
 		if (olddir != newdir)
-			fuse_invalidate_attr(newdir);
+			fuse_dir_changed(newdir);
 
 		/* newent will end up negative */
 		if (!(flags & RENAME_EXCHANGE) && d_really_is_positive(newent)) {
@@ -800,10 +853,10 @@ static int fuse_link(struct dentry *entry, struct inode *newdir,
 	if (!err) {
 		struct fuse_inode *fi = get_fuse_inode(inode);
 
-		spin_lock(&fc->lock);
+		spin_lock(&fi->lock);
 		fi->attr_version = atomic64_inc_return(&fc->attr_version);
 		inc_nlink(inode);
-		spin_unlock(&fc->lock);
+		spin_unlock(&fi->lock);
 		fuse_invalidate_attr(inode);
 		fuse_update_ctime(inode);
 	} else if (err == -EINTR) {
@@ -959,7 +1012,7 @@ int fuse_reverse_inval_entry(struct super_block *sb, u64 parent_nodeid,
 	if (!entry)
 		goto unlock;
 
-	fuse_invalidate_attr(parent);
+	fuse_dir_changed(parent);
 	fuse_invalidate_entry(entry);
 
 	if (child_nodeid != 0 && d_really_is_positive(entry)) {
@@ -1329,15 +1382,14 @@ static void iattr_to_fattr(struct fuse_conn *fc, struct iattr *iattr,
  */
 void fuse_set_nowrite(struct inode *inode)
 {
-	struct fuse_conn *fc = get_fuse_conn(inode);
 	struct fuse_inode *fi = get_fuse_inode(inode);
 
 	BUG_ON(!inode_is_locked(inode));
 
-	spin_lock(&fc->lock);
+	spin_lock(&fi->lock);
 	BUG_ON(fi->writectr < 0);
 	fi->writectr += FUSE_NOWRITE;
-	spin_unlock(&fc->lock);
+	spin_unlock(&fi->lock);
 	wait_event(fi->page_waitq, fi->writectr == FUSE_NOWRITE);
 }
 
@@ -1358,11 +1410,11 @@ static void __fuse_release_nowrite(struct inode *inode)
 
 void fuse_release_nowrite(struct inode *inode)
 {
-	struct fuse_conn *fc = get_fuse_conn(inode);
+	struct fuse_inode *fi = get_fuse_inode(inode);
 
-	spin_lock(&fc->lock);
+	spin_lock(&fi->lock);
 	__fuse_release_nowrite(inode);
-	spin_unlock(&fc->lock);
+	spin_unlock(&fi->lock);
 }
 
 static void fuse_setattr_fill(struct fuse_conn *fc, struct fuse_args *args,
@@ -1457,8 +1509,11 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		file = NULL;
 	}
 
-	if (attr->ia_valid & ATTR_SIZE)
+	if (attr->ia_valid & ATTR_SIZE) {
+		if (WARN_ON(!S_ISREG(inode->i_mode)))
+			return -EIO;
 		is_truncate = true;
+	}
 
 	if (is_truncate) {
 		fuse_set_nowrite(inode);
@@ -1494,7 +1549,7 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		goto error;
 	}
 
-	spin_lock(&fc->lock);
+	spin_lock(&fi->lock);
 	/* the kernel maintains i_mtime locally */
 	if (trust_local_cmtime) {
 		if (attr->ia_valid & ATTR_MTIME)
@@ -1512,10 +1567,10 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
 		i_size_write(inode, outarg.attr.size);
 
 	if (is_truncate) {
-		/* NOTE: this may release/reacquire fc->lock */
+		/* NOTE: this may release/reacquire fi->lock */
 		__fuse_release_nowrite(inode);
 	}
-	spin_unlock(&fc->lock);
+	spin_unlock(&fi->lock);
 
 	/*
 	 * Only call invalidate_inode_pages2() after removing
@@ -1662,8 +1717,16 @@ void fuse_init_common(struct inode *inode)
 
 void fuse_init_dir(struct inode *inode)
 {
+	struct fuse_inode *fi = get_fuse_inode(inode);
+
 	inode->i_op = &fuse_dir_inode_operations;
 	inode->i_fop = &fuse_dir_operations;
+
+	spin_lock_init(&fi->rdc.lock);
+	fi->rdc.cached = false;
+	fi->rdc.size = 0;
+	fi->rdc.pos = 0;
+	fi->rdc.version = 0;
 }
 
 static int fuse_symlink_readpage(struct file *null, struct page *page)

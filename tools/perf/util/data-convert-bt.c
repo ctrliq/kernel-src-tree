@@ -11,6 +11,7 @@
 #include <inttypes.h>
 #include <linux/compiler.h>
 #include <linux/kernel.h>
+#include <linux/zalloc.h>
 #include <babeltrace/ctf-writer/writer.h>
 #include <babeltrace/ctf-writer/clock.h>
 #include <babeltrace/ctf-writer/stream.h>
@@ -23,7 +24,6 @@
 #include "asm/bug.h"
 #include "data-convert-bt.h"
 #include "session.h"
-#include "util.h"
 #include "debug.h"
 #include "tool.h"
 #include "evlist.h"
@@ -31,6 +31,7 @@
 #include "machine.h"
 #include "config.h"
 #include <linux/ctype.h>
+#include <linux/err.h>
 
 #define pr_N(n, fmt, ...) \
 	eprintf(n, debug_data_convert, fmt, ##__VA_ARGS__)
@@ -1354,7 +1355,7 @@ static void free_streams(struct ctf_writer *cw)
 	for (cpu = 0; cpu < cw->stream_cnt; cpu++)
 		ctf_stream__delete(cw->stream[cpu]);
 
-	free(cw->stream);
+	zfree(&cw->stream);
 }
 
 static int ctf_writer__setup_env(struct ctf_writer *cw,
@@ -1620,8 +1621,10 @@ int bt_convert__perf2ctf(const char *input, const char *path,
 	err = -1;
 	/* perf.data session */
 	session = perf_session__new(&data, 0, &c.tool);
-	if (!session)
+	if (IS_ERR(session)) {
+		err = PTR_ERR(session);
 		goto free_writer;
+	}
 
 	if (c.queue_size) {
 		ordered_events__set_alloc_size(&session->ordered_events,

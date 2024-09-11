@@ -121,7 +121,7 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
 	 */
 	ep->prsctp_enable = net->sctp.prsctp_enable;
 	ep->reconf_enable = net->sctp.reconf_enable;
-	ep->ecn_enable = net->sctp.ecn_enable;
+	ep->ecn_enable = net->sctp_ecn_enable;
 
 	/* Remember who we are attached to.  */
 	ep->base.sk = sk;
@@ -180,7 +180,7 @@ void sctp_endpoint_add_asoc(struct sctp_endpoint *ep,
 
 	/* Increment the backlog value for a TCP-style listening socket. */
 	if (sctp_style(sk, TCP) && sctp_sstate(sk, LISTENING))
-		sk->sk_ack_backlog++;
+		sk_acceptq_added(sk);
 }
 
 /* Free the endpoint structure.  Delay cleanup until

@@ -1895,11 +1895,11 @@ static int hdmi_codec_probe(struct snd_soc_component *component)
 	 * the supplier. With this setting, we can make sure that the audio
 	 * domain in display power will be always turned on before operating
 	 * on the HDMI audio codec registers.
-	 * Let's use the flag DL_FLAG_AUTOREMOVE. This can make
+	 * Let's use the flag DL_FLAG_AUTOREMOVE_CONSUMER. This can make
 	 * sure the device link is freed when the machine driver is removed.
 	 */
 	device_link_add(component->card->dev, &hdev->dev, DL_FLAG_RPM_ACTIVE |
-			DL_FLAG_AUTOREMOVE);
+			DL_FLAG_AUTOREMOVE_CONSUMER);
 	/*
 	 * hdac_device core already sets the state to active and calls
 	 * get_noresume. So enable runtime and set the device to suspend.

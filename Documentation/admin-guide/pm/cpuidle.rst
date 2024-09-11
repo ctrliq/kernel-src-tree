@@ -255,7 +255,6 @@ which the tick cannot be stopped.  If the given system is tickless, it will use
 the ``menu`` governor by default and if it is not tickless, the default
 ``CPUIdle`` governor on it will be ``ladder``.
 
-
 .. _menu-gov:
 
 The ``menu`` Governor

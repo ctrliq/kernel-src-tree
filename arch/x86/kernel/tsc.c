@@ -104,23 +104,6 @@ void __always_inline cyc2ns_read_end(void)
  *                      -johnstul@us.ibm.com "math is hard, lets go shopping!"
  */
 
-static void cyc2ns_data_init(struct cyc2ns_data *data)
-{
-	data->cyc2ns_mul = 0;
-	data->cyc2ns_shift = 0;
-	data->cyc2ns_offset = 0;
-}
-
-static void __init cyc2ns_init(int cpu)
-{
-	struct cyc2ns *c2n = &per_cpu(cyc2ns, cpu);
-
-	cyc2ns_data_init(&c2n->data[0]);
-	cyc2ns_data_init(&c2n->data[1]);
-
-	seqcount_init(&c2n->seq);
-}
-
 static __always_inline unsigned long long cycles_2_ns(unsigned long long cyc)
 {
 	struct cyc2ns_data data;
@@ -136,18 +119,11 @@ static __always_inline unsigned long long cycles_2_ns(unsigned long long cyc)
 	return ns;
 }
 
-static void set_cyc2ns_scale(unsigned long khz, int cpu, unsigned long long tsc_now)
+static void __set_cyc2ns_scale(unsigned long khz, int cpu, unsigned long long tsc_now)
 {
 	unsigned long long ns_now;
 	struct cyc2ns_data data;
 	struct cyc2ns *c2n;
-	unsigned long flags;
-
-	local_irq_save(flags);
-	sched_clock_idle_sleep_event();
-
-	if (!khz)
-		goto done;
 
 	ns_now = cycles_2_ns(tsc_now);
 
@@ -179,10 +155,52 @@ static void set_cyc2ns_scale(unsigned long khz, int cpu, unsigned long long tsc_
 	c2n->data[0] = data;
 	raw_write_seqcount_latch(&c2n->seq);
 	c2n->data[1] = data;
+}
 
-done:
+static void set_cyc2ns_scale(unsigned long khz, int cpu, unsigned long long tsc_now)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	sched_clock_idle_sleep_event();
+
+	if (khz)
+		__set_cyc2ns_scale(khz, cpu, tsc_now);
+
 	sched_clock_idle_wakeup_event();
 	local_irq_restore(flags);
+}
+
+/*
+ * Initialize cyc2ns for boot cpu
+ */
+static void __init cyc2ns_init_boot_cpu(void)
+{
+	struct cyc2ns *c2n = this_cpu_ptr(&cyc2ns);
+
+	seqcount_init(&c2n->seq);
+	__set_cyc2ns_scale(tsc_khz, smp_processor_id(), rdtsc());
+}
+
+/*
+ * Secondary CPUs do not run through tsc_init(), so set up
+ * all the scale factors for all CPUs, assuming the same
+ * speed as the bootup CPU.
+ */
+static void __init cyc2ns_init_secondary_cpus(void)
+{
+	unsigned int cpu, this_cpu = smp_processor_id();
+	struct cyc2ns *c2n = this_cpu_ptr(&cyc2ns);
+	struct cyc2ns_data *data = c2n->data;
+
+	for_each_possible_cpu(cpu) {
+		if (cpu != this_cpu) {
+			seqcount_init(&c2n->seq);
+			c2n = per_cpu_ptr(&cyc2ns, cpu);
+			c2n->data[0] = data[0];
+			c2n->data[1] = data[1];
+		}
+	}
 }
 
 /*
@@ -615,13 +633,13 @@ unsigned long native_calibrate_tsc(void)
 
 	if (crystal_khz == 0) {
 		switch (boot_cpu_data.x86_model) {
-		case INTEL_FAM6_SKYLAKE_MOBILE:
-		case INTEL_FAM6_SKYLAKE_DESKTOP:
-		case INTEL_FAM6_KABYLAKE_MOBILE:
-		case INTEL_FAM6_KABYLAKE_DESKTOP:
+		case INTEL_FAM6_SKYLAKE_L:
+		case INTEL_FAM6_SKYLAKE:
+		case INTEL_FAM6_KABYLAKE_L:
+		case INTEL_FAM6_KABYLAKE:
 			crystal_khz = 24000;	/* 24.0 MHz */
 			break;
-		case INTEL_FAM6_ATOM_GOLDMONT_X:
+		case INTEL_FAM6_ATOM_GOLDMONT_D:
 			crystal_khz = 25000;	/* 25.0 MHz */
 			break;
 		case INTEL_FAM6_ATOM_GOLDMONT:
@@ -921,12 +939,12 @@ void tsc_restore_sched_clock_state(void)
 }
 
 #ifdef CONFIG_CPU_FREQ
-/* Frequency scaling support. Adjust the TSC based timer when the cpu frequency
+/*
+ * Frequency scaling support. Adjust the TSC based timer when the CPU frequency
  * changes.
  *
- * RED-PEN: On SMP we assume all CPUs run with the same frequency.  It's
- * not that important because current Opteron setups do not support
- * scaling on SMP anyroads.
+ * NOTE: On SMP the situation is not fixable in general, so simply mark the TSC
+ * as unstable and give up in those cases.
  *
  * Should fix up last_tsc too. Currently gettimeofday in the
  * first tick after the change will be slightly wrong.
@@ -940,22 +958,22 @@ static int time_cpufreq_notifier(struct notifier_block *nb, unsigned long val,
 				void *data)
 {
 	struct cpufreq_freqs *freq = data;
-	unsigned long *lpj;
 
-	lpj = &boot_cpu_data.loops_per_jiffy;
-#ifdef CONFIG_SMP
-	if (!(freq->flags & CPUFREQ_CONST_LOOPS))
-		lpj = &cpu_data(freq->cpu).loops_per_jiffy;
-#endif
+	if (num_online_cpus() > 1) {
+		mark_tsc_unstable("cpufreq changes on SMP");
+		return 0;
+	}
 
 	if (!ref_freq) {
 		ref_freq = freq->old;
-		loops_per_jiffy_ref = *lpj;
+		loops_per_jiffy_ref = boot_cpu_data.loops_per_jiffy;
 		tsc_khz_ref = tsc_khz;
 	}
+
 	if ((val == CPUFREQ_PRECHANGE  && freq->old < freq->new) ||
-			(val == CPUFREQ_POSTCHANGE && freq->old > freq->new)) {
-		*lpj = cpufreq_scale(loops_per_jiffy_ref, ref_freq, freq->new);
+	    (val == CPUFREQ_POSTCHANGE && freq->old > freq->new)) {
+		boot_cpu_data.loops_per_jiffy =
+			cpufreq_scale(loops_per_jiffy_ref, ref_freq, freq->new);
 
 		tsc_khz = cpufreq_scale(tsc_khz_ref, ref_freq, freq->new);
 		if (!(freq->flags & CPUFREQ_CONST_LOOPS))
@@ -1376,7 +1394,7 @@ static bool __init determine_cpu_tsc_frequencies(bool early)
 	}
 
 	/*
-	 * Trust non-zero tsc_khz as authorative,
+	 * Trust non-zero tsc_khz as authoritative,
 	 * and use it to sanity check cpu_khz,
 	 * which will be off if system timer is off.
 	 */
@@ -1408,6 +1426,14 @@ static unsigned long __init get_loops_per_jiffy(void)
 	return lpj;
 }
 
+static void __init tsc_enable_sched_clock(void)
+{
+	/* Sanitize TSC ADJUST before cyc2ns gets initialized */
+	tsc_store_and_check_tsc_adjust(true);
+	cyc2ns_init_boot_cpu();
+	static_branch_enable(&__use_tsc);
+}
+
 void __init tsc_early_init(void)
 {
 	if (!boot_cpu_has(X86_FEATURE_TSC))
@@ -1418,6 +1444,8 @@ void __init tsc_early_init(void)
 	if (!determine_cpu_tsc_frequencies(true))
 		return;
 	loops_per_jiffy = get_loops_per_jiffy();
+
+	tsc_enable_sched_clock();
 }
 
 void __init tsc_init(void)
@@ -1441,24 +1469,10 @@ void __init tsc_init(void)
 			setup_clear_cpu_cap(X86_FEATURE_TSC_DEADLINE_TIMER);
 			return;
 		}
+		tsc_enable_sched_clock();
 	}
 
-	/* Sanitize TSC ADJUST before cyc2ns gets initialized */
-	tsc_store_and_check_tsc_adjust(true);
-
-	/*
-	 * Secondary CPUs do not run through tsc_init(), so set up
-	 * all the scale factors for all CPUs, assuming the same
-	 * speed as the bootup CPU. (cpufreq notifiers will fix this
-	 * up if their speed diverges)
-	 */
-	cyc = rdtsc();
-	for_each_possible_cpu(cpu) {
-		cyc2ns_init(cpu);
-		set_cyc2ns_scale(tsc_khz, cpu, cyc);
-	}
-
-	static_branch_enable(&__use_tsc);
+	cyc2ns_init_secondary_cpus();
 
 	if (!no_sched_irq_time)
 		enable_sched_clock_irqtime();

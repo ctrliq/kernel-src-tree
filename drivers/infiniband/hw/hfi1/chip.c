@@ -4101,6 +4101,7 @@ def_access_ibp_counter(rc_dupreq);
 def_access_ibp_counter(rdma_seq);
 def_access_ibp_counter(unaligned);
 def_access_ibp_counter(seq_naks);
+def_access_ibp_counter(rc_crwaits);
 
 static struct cntr_entry dev_cntrs[DEV_CNTR_LAST] = {
 [C_RCV_OVF] = RXE32_DEV_CNTR_ELEM(RcvOverflow, RCV_BUF_OVFL_CNT, CNTR_SYNTH),
@@ -5119,6 +5120,7 @@ static struct cntr_entry port_cntrs[PORT_CNTR_LAST] = {
 [C_SW_IBP_RDMA_SEQ] = SW_IBP_CNTR(RdmaSeq, rdma_seq),
 [C_SW_IBP_UNALIGNED] = SW_IBP_CNTR(Unaligned, unaligned),
 [C_SW_IBP_SEQ_NAK] = SW_IBP_CNTR(SeqNak, seq_naks),
+[C_SW_IBP_RC_CRWAITS] = SW_IBP_CNTR(RcCrWait, rc_crwaits),
 [C_SW_CPU_RC_ACKS] = CNTR_ELEM("RcAcks", 0, 0, CNTR_NORMAL,
 			       access_sw_cpu_rc_acks),
 [C_SW_CPU_RC_QACKS] = CNTR_ELEM("RcQacks", 0, 0, CNTR_NORMAL,
@@ -8368,7 +8370,6 @@ static inline void clear_recv_intr(struct hfi1_ctxtdata *rcd)
 	struct hfi1_devdata *dd = rcd->dd;
 	u32 addr = CCE_INT_CLEAR + (8 * rcd->ireg);
 
-	mmiowb();	/* make sure everything before is written */
 	write_csr(dd, addr, rcd->imask);
 	/* force the above write on the chip and get a value back */
 	(void)read_csr(dd, addr);
@@ -11807,12 +11808,10 @@ void update_usrhead(struct hfi1_ctxtdata *rcd, u32 hd, u32 updegr, u32 egrhd,
 			<< RCV_EGR_INDEX_HEAD_HEAD_SHIFT;
 		write_uctxt_csr(dd, ctxt, RCV_EGR_INDEX_HEAD, reg);
 	}
-	mmiowb();
 	reg = ((u64)rcv_intr_count << RCV_HDR_HEAD_COUNTER_SHIFT) |
 		(((u64)hd & RCV_HDR_HEAD_HEAD_MASK)
 			<< RCV_HDR_HEAD_HEAD_SHIFT);
 	write_uctxt_csr(dd, ctxt, RCV_HDR_HEAD, reg);
-	mmiowb();
 }
 
 u32 hdrqempty(struct hfi1_ctxtdata *rcd)
@@ -14696,8 +14695,8 @@ void hfi1_start_cleanup(struct hfi1_devdata *dd)
  */
 static int init_asic_data(struct hfi1_devdata *dd)
 {
-	unsigned long flags;
-	struct hfi1_devdata *tmp, *peer = NULL;
+	unsigned long index;
+	struct hfi1_devdata *peer;
 	struct hfi1_asic_data *asic_data;
 	int ret = 0;
 
@@ -14706,14 +14705,12 @@ static int init_asic_data(struct hfi1_devdata *dd)
 	if (!asic_data)
 		return -ENOMEM;
 
-	spin_lock_irqsave(&hfi1_devs_lock, flags);
+	xa_lock_irq(&hfi1_dev_table);
 	/* Find our peer device */
-	list_for_each_entry(tmp, &hfi1_dev_list, list) {
-		if ((HFI_BASE_GUID(dd) == HFI_BASE_GUID(tmp)) &&
-		    dd->unit != tmp->unit) {
-			peer = tmp;
+	xa_for_each(&hfi1_dev_table, index, peer) {
+		if ((HFI_BASE_GUID(dd) == HFI_BASE_GUID(peer)) &&
+		    dd->unit != peer->unit)
 			break;
-		}
 	}
 
 	if (peer) {
@@ -14725,7 +14722,7 @@ static int init_asic_data(struct hfi1_devdata *dd)
 		mutex_init(&dd->asic_data->asic_resource_mutex);
 	}
 	dd->asic_data->dds[dd->hfi1_id] = dd; /* self back-pointer */
-	spin_unlock_irqrestore(&hfi1_devs_lock, flags);
+	xa_unlock_irq(&hfi1_dev_table);
 
 	/* first one through - set up i2c devices */
 	if (!peer)

@@ -163,8 +163,8 @@ static int be_queue_alloc(struct be_adapter *adapter, struct be_queue_info *q,
 	q->len = len;
 	q->entry_size = entry_size;
 	mem->size = len * entry_size;
-	mem->va = dma_zalloc_coherent(&adapter->pdev->dev, mem->size, &mem->dma,
-				      GFP_KERNEL);
+	mem->va = dma_alloc_coherent(&adapter->pdev->dev, mem->size,
+				     &mem->dma, GFP_KERNEL);
 	if (!mem->va)
 		return -ENOMEM;
 	return 0;
@@ -1014,7 +1014,7 @@ static u32 be_xmit_enqueue(struct be_adapter *adapter, struct be_tx_obj *txo,
 	}
 
 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++) {
-		const struct skb_frag_struct *frag = &skb_shinfo(skb)->frags[i];
+		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
 		len = skb_frag_size(frag);
 
 		busaddr = skb_frag_dma_map(dev, frag, 0, len, DMA_TO_DEVICE);
@@ -1421,15 +1421,12 @@ static void be_tx_timeout(struct net_device *netdev)
 {
 	struct be_adapter *adapter = netdev_priv(netdev);
 	struct device *dev = &adapter->pdev->dev;
-#if 0 /* RHEL only: Disable queue dump in be_tx_timeout */
 	struct be_tx_obj *txo;
 	struct sk_buff *skb;
 	struct tcphdr *tcphdr;
 	struct udphdr *udphdr;
 	u32 *entry;
-#endif
 	int status;
-#if 0 /* RHEL only: Disable queue dump in be_tx_timeout */
 	int i, j;
 
 	for_all_tx_queues(adapter, txo, i) {
@@ -1487,7 +1484,6 @@ static void be_tx_timeout(struct net_device *netdev)
 		}
 	}
 
-#endif
 	if (lancer_chip(adapter)) {
 		dev_info(dev, "Initiating reset due to tx timeout\n");
 		dev_info(dev, "Resetting adapter\n");
@@ -2350,8 +2346,8 @@ static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 		memcpy(skb->data, start, hdr_len);
 		skb_shinfo(skb)->nr_frags = 1;
 		skb_frag_set_page(skb, 0, page_info->page);
-		skb_shinfo(skb)->frags[0].page_offset =
-					page_info->page_offset + hdr_len;
+		skb_frag_off_set(&skb_shinfo(skb)->frags[0],
+				 page_info->page_offset + hdr_len);
 		skb_frag_size_set(&skb_shinfo(skb)->frags[0],
 				  curr_frag_len - hdr_len);
 		skb->data_len = curr_frag_len - hdr_len;
@@ -2376,8 +2372,8 @@ static void skb_fill_rx_data(struct be_rx_obj *rxo, struct sk_buff *skb,
 			/* Fresh page */
 			j++;
 			skb_frag_set_page(skb, j, page_info->page);
-			skb_shinfo(skb)->frags[j].page_offset =
-							page_info->page_offset;
+			skb_frag_off_set(&skb_shinfo(skb)->frags[j],
+					 page_info->page_offset);
 			skb_frag_size_set(&skb_shinfo(skb)->frags[j], 0);
 			skb_shinfo(skb)->nr_frags++;
 		} else {
@@ -2458,8 +2454,8 @@ static void be_rx_compl_process_gro(struct be_rx_obj *rxo,
 			/* First frag or Fresh page */
 			j++;
 			skb_frag_set_page(skb, j, page_info->page);
-			skb_shinfo(skb)->frags[j].page_offset =
-							page_info->page_offset;
+			skb_frag_off_set(&skb_shinfo(skb)->frags[j],
+					 page_info->page_offset);
 			skb_frag_size_set(&skb_shinfo(skb)->frags[j], 0);
 		} else {
 			put_page(page_info->page);
@@ -5770,9 +5766,9 @@ static int be_drv_init(struct be_adapter *adapter)
 	int status = 0;
 
 	mbox_mem_alloc->size = sizeof(struct be_mcc_mailbox) + 16;
-	mbox_mem_alloc->va = dma_zalloc_coherent(dev, mbox_mem_alloc->size,
-						 &mbox_mem_alloc->dma,
-						 GFP_KERNEL);
+	mbox_mem_alloc->va = dma_alloc_coherent(dev, mbox_mem_alloc->size,
+						&mbox_mem_alloc->dma,
+						GFP_KERNEL);
 	if (!mbox_mem_alloc->va)
 		return -ENOMEM;
 
@@ -5781,8 +5777,8 @@ static int be_drv_init(struct be_adapter *adapter)
 	mbox_mem_align->dma = PTR_ALIGN(mbox_mem_alloc->dma, 16);
 
 	rx_filter->size = sizeof(struct be_cmd_req_rx_filter);
-	rx_filter->va = dma_zalloc_coherent(dev, rx_filter->size,
-					    &rx_filter->dma, GFP_KERNEL);
+	rx_filter->va = dma_alloc_coherent(dev, rx_filter->size,
+					   &rx_filter->dma, GFP_KERNEL);
 	if (!rx_filter->va) {
 		status = -ENOMEM;
 		goto free_mbox;
@@ -5796,8 +5792,8 @@ static int be_drv_init(struct be_adapter *adapter)
 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v1);
 	else
 		stats_cmd->size = sizeof(struct be_cmd_req_get_stats_v2);
-	stats_cmd->va = dma_zalloc_coherent(dev, stats_cmd->size,
-					    &stats_cmd->dma, GFP_KERNEL);
+	stats_cmd->va = dma_alloc_coherent(dev, stats_cmd->size,
+					   &stats_cmd->dma, GFP_KERNEL);
 	if (!stats_cmd->va) {
 		status = -ENOMEM;
 		goto free_rx_filter;

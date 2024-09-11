@@ -5,20 +5,12 @@
  */
 
 /*
- * RHEL8:
- * It happens that the act of including the header file <linux/delayacct.h>
- * changes the kABI signatures of functions that use page, address_map and
- * other structures. So the following macro magic is added to work around that.
- */
-#ifdef __GENKSYMS__
-#define _LINUX_DELAYACCT_H
-#endif
-
-/*
  * This file handles the generic file mmap semantics used by
  * most "normal" filesystems (but you don't /have/ to use this:
  * the NFS filesystem used to do this differently, for example)
  */
+#include <linux/rh_kabi.h>
+
 #include <linux/export.h>
 #include <linux/compiler.h>
 #include <linux/dax.h>
@@ -46,7 +38,7 @@
 #include <linux/cleancache.h>
 #include <linux/shmem_fs.h>
 #include <linux/rmap.h>
-#include <linux/delayacct.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/delayacct.h>)
 #include <linux/psi.h>
 #include "internal.h"
 
@@ -2227,7 +2219,7 @@ find_page:
 					!mapping->a_ops->is_partially_uptodate)
 				goto page_not_up_to_date;
 			/* pipes can't handle partially uptodate pages */
-			if (unlikely(iter->type & ITER_PIPE))
+			if (unlikely(iov_iter_is_pipe(iter)))
 				goto page_not_up_to_date;
 			if (!trylock_page(page))
 				goto page_not_up_to_date;

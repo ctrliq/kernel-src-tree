@@ -509,7 +509,8 @@ tcindex_change(struct net *net, struct sk_buff *in_skb,
 	if (!opt)
 		return 0;
 
-	err = nla_parse_nested(tb, TCA_TCINDEX_MAX, opt, tcindex_policy, NULL);
+	err = nla_parse_nested_deprecated(tb, TCA_TCINDEX_MAX, opt,
+					  tcindex_policy, NULL);
 	if (err < 0)
 		return err;
 
@@ -600,7 +601,7 @@ static int tcindex_dump(struct net *net, struct tcf_proto *tp, void *fh,
 		 tp, fh, skb, t, p, r);
 	pr_debug("p->perfect %p p->h %p\n", p->perfect, p->h);
 
-	nest = nla_nest_start(skb, TCA_OPTIONS);
+	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
 	if (nest == NULL)
 		goto nla_put_failure;
 
@@ -651,12 +652,17 @@ nla_put_failure:
 	return -1;
 }
 
-static void tcindex_bind_class(void *fh, u32 classid, unsigned long cl)
+static void tcindex_bind_class(void *fh, u32 classid, unsigned long cl,
+			       void *q, unsigned long base)
 {
 	struct tcindex_filter_result *r = fh;
 
-	if (r && r->res.classid == classid)
-		r->res.class = cl;
+	if (r && r->res.classid == classid) {
+		if (cl)
+			__tcf_bind_filter(q, &r->res, base);
+		else
+			__tcf_unbind_filter(q, &r->res);
+	}
 }
 
 static struct tcf_proto_ops cls_tcindex_ops __read_mostly = {

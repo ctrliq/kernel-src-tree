@@ -1594,10 +1594,8 @@ void hfi1_sc_wantpiobuf_intr(struct send_context *sc, u32 needint)
 	else
 		sc_del_credit_return_intr(sc);
 	trace_hfi1_wantpiointr(sc, needint, sc->credit_ctrl);
-	if (needint) {
-		mmiowb();
+	if (needint)
 		sc_return_credits(sc);
-	}
 }
 
 /**
@@ -2121,11 +2119,10 @@ int init_credit_return(struct hfi1_devdata *dd)
 		int bytes = TXE_NUM_CONTEXTS * sizeof(struct credit_return);
 
 		set_dev_node(&dd->pcidev->dev, i);
-		dd->cr_base[i].va = dma_zalloc_coherent(
-					&dd->pcidev->dev,
-					bytes,
-					&dd->cr_base[i].dma,
-					GFP_KERNEL);
+		dd->cr_base[i].va = dma_alloc_coherent(&dd->pcidev->dev,
+						       bytes,
+						       &dd->cr_base[i].dma,
+						       GFP_KERNEL);
 		if (!dd->cr_base[i].va) {
 			set_dev_node(&dd->pcidev->dev, dd->node);
 			dd_dev_err(dd,

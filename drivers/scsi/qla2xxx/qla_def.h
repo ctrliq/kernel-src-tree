@@ -49,6 +49,7 @@ typedef struct {
 } le_id_t;
 
 #include "qla_bsg.h"
+#include "qla_dsd.h"
 #include "qla_nx.h"
 #include "qla_nx2.h"
 #include "qla_nvme.h"
@@ -316,7 +317,8 @@ struct srb_cmd {
 	uint32_t request_sense_length;
 	uint32_t fw_sense_length;
 	uint8_t *request_sense_ptr;
-	void *ctx;
+	struct ct6_dsd *ct6_ctx;
+	struct crc_context *crc_ctx;
 };
 
 /*
@@ -453,7 +455,7 @@ struct srb_iocb {
 			struct els_logo_payload *els_logo_pyld;
 			dma_addr_t els_logo_pyld_dma;
 		} els_logo;
-		struct {
+		struct els_plogi {
 #define ELS_DCMD_PLOGI 0x3
 			uint32_t flags;
 			uint32_t els_cmd;
@@ -589,12 +591,16 @@ typedef struct srb {
 	 */
 	uint8_t cmd_type;
 	uint8_t pad[3];
-	atomic_t ref_count;
 	struct kref cmd_kref;	/* need to migrate ref_count over to this */
 	void *priv;
 	wait_queue_head_t nvme_ls_waitq;
 	struct fc_port *fcport;
 	struct scsi_qla_host *vha;
+	unsigned int start_timer:1;
+	unsigned int abort:1;
+	unsigned int aborted:1;
+	unsigned int completed:1;
+
 	uint32_t handle;
 	uint16_t flags;
 	uint16_t type;
@@ -613,14 +619,22 @@ typedef struct srb {
 		struct bsg_job *bsg_job;
 		struct srb_cmd scmd;
 	} u;
-	void (*done)(void *, int);
-	void (*free)(void *);
+	/*
+	 * Report completion status @res and call sp_put(@sp). @res is
+	 * an NVMe status code, a SCSI result (e.g. DID_OK << 16) or a
+	 * QLA_* status value.
+	 */
+	void (*done)(struct srb *sp, int res);
+	/* Stop the timer and free @sp. Only used by the FCP code. */
+	void (*free)(struct srb *sp);
+	/*
+	 * Call nvme_private->fd->done() and free @sp. Only used by the NVMe
+	 * code.
+	 */
 	void (*put_fn)(struct kref *kref);
 } srb_t;
 
 #define GET_CMD_SP(sp) (sp->u.scmd.cmd)
-#define SET_CMD_SP(sp, cmd) (sp->u.scmd.cmd = cmd)
-#define GET_CMD_CTX_SP(sp) (sp->u.scmd.ctx)
 
 #define GET_CMD_SENSE_LEN(sp) \
 	(sp->u.scmd.request_sense_length)
@@ -1396,8 +1410,8 @@ typedef struct {
 	uint16_t response_q_inpointer;
 	uint16_t request_q_length;
 	uint16_t response_q_length;
-	uint32_t request_q_address[2];
-	uint32_t response_q_address[2];
+	__le64   request_q_address __packed;
+	__le64   response_q_address __packed;
 
 	uint16_t lun_enables;
 	uint8_t  command_resource_count;
@@ -1822,12 +1836,10 @@ typedef struct {
 	uint16_t dseg_count;		/* Data segment count. */
 	uint8_t scsi_cdb[MAX_CMDSZ]; 	/* SCSI command words. */
 	uint32_t byte_count;		/* Total byte count. */
-	uint32_t dseg_0_address;	/* Data segment 0 address. */
-	uint32_t dseg_0_length;		/* Data segment 0 length. */
-	uint32_t dseg_1_address;	/* Data segment 1 address. */
-	uint32_t dseg_1_length;		/* Data segment 1 length. */
-	uint32_t dseg_2_address;	/* Data segment 2 address. */
-	uint32_t dseg_2_length;		/* Data segment 2 length. */
+	union {
+		struct dsd32 dsd32[3];
+		struct dsd64 dsd64[2];
+	};
 } cmd_entry_t;
 
 /*
@@ -1848,10 +1860,7 @@ typedef struct {
 	uint16_t dseg_count;		/* Data segment count. */
 	uint8_t scsi_cdb[MAX_CMDSZ];	/* SCSI command words. */
 	uint32_t byte_count;		/* Total byte count. */
-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
-	uint32_t dseg_0_length;		/* Data segment 0 length. */
-	uint32_t dseg_1_address[2];	/* Data segment 1 address. */
-	uint32_t dseg_1_length;		/* Data segment 1 length. */
+	struct dsd64 dsd[2];
 } cmd_a64_entry_t, request_t;
 
 /*
@@ -1864,20 +1873,7 @@ typedef struct {
 	uint8_t sys_define;		/* System defined. */
 	uint8_t entry_status;		/* Entry Status. */
 	uint32_t reserved;
-	uint32_t dseg_0_address;	/* Data segment 0 address. */
-	uint32_t dseg_0_length;		/* Data segment 0 length. */
-	uint32_t dseg_1_address;	/* Data segment 1 address. */
-	uint32_t dseg_1_length;		/* Data segment 1 length. */
-	uint32_t dseg_2_address;	/* Data segment 2 address. */
-	uint32_t dseg_2_length;		/* Data segment 2 length. */
-	uint32_t dseg_3_address;	/* Data segment 3 address. */
-	uint32_t dseg_3_length;		/* Data segment 3 length. */
-	uint32_t dseg_4_address;	/* Data segment 4 address. */
-	uint32_t dseg_4_length;		/* Data segment 4 length. */
-	uint32_t dseg_5_address;	/* Data segment 5 address. */
-	uint32_t dseg_5_length;		/* Data segment 5 length. */
-	uint32_t dseg_6_address;	/* Data segment 6 address. */
-	uint32_t dseg_6_length;		/* Data segment 6 length. */
+	struct dsd32 dsd[7];
 } cont_entry_t;
 
 /*
@@ -1889,16 +1885,7 @@ typedef struct {
 	uint8_t entry_count;		/* Entry count. */
 	uint8_t sys_define;		/* System defined. */
 	uint8_t entry_status;		/* Entry Status. */
-	uint32_t dseg_0_address[2];	/* Data segment 0 address. */
-	uint32_t dseg_0_length;		/* Data segment 0 length. */
-	uint32_t dseg_1_address[2];	/* Data segment 1 address. */
-	uint32_t dseg_1_length;		/* Data segment 1 length. */
-	uint32_t dseg_2_address	[2];	/* Data segment 2 address. */
-	uint32_t dseg_2_length;		/* Data segment 2 length. */
-	uint32_t dseg_3_address[2];	/* Data segment 3 address. */
-	uint32_t dseg_3_length;		/* Data segment 3 length. */
-	uint32_t dseg_4_address[2];	/* Data segment 4 address. */
-	uint32_t dseg_4_length;		/* Data segment 4 length. */
+	struct dsd64 dsd[5];
 } cont_a64_entry_t;
 
 #define PO_MODE_DIF_INSERT	0
@@ -1942,8 +1929,7 @@ struct crc_context {
 			uint16_t	reserved_2;
 			uint16_t	reserved_3;
 			uint32_t	reserved_4;
-			uint32_t	data_address[2];
-			uint32_t	data_length;
+			struct dsd64	data_dsd[1];
 			uint32_t	reserved_5[2];
 			uint32_t	reserved_6;
 		} nobundling;
@@ -1953,11 +1939,8 @@ struct crc_context {
 			uint16_t	reserved_1;
 			__le16	dseg_count;	/* Data segment count */
 			uint32_t	reserved_2;
-			uint32_t	data_address[2];
-			uint32_t	data_length;
-			uint32_t	dif_address[2];
-			uint32_t	dif_length;	/* Data segment 0
-							 * length */
+			struct dsd64	data_dsd[1];
+			struct dsd64	dif_dsd;
 		} bundling;
 	} u;
 
@@ -2156,10 +2139,8 @@ typedef struct {
 	uint32_t handle2;
 	uint32_t rsp_bytecount;
 	uint32_t req_bytecount;
-	uint32_t dseg_req_address[2];	/* Data segment 0 address. */
-	uint32_t dseg_req_length;	/* Data segment 0 length. */
-	uint32_t dseg_rsp_address[2];	/* Data segment 1 address. */
-	uint32_t dseg_rsp_length;	/* Data segment 1 length. */
+	struct dsd64 req_dsd;
+	struct dsd64 rsp_dsd;
 } ms_iocb_entry_t;
 
 
@@ -3119,7 +3100,7 @@ struct sns_cmd_pkt {
 		struct {
 			uint16_t buffer_length;
 			uint16_t reserved_1;
-			uint32_t buffer_address[2];
+			__le64	 buffer_address __packed;
 			uint16_t subcommand_length;
 			uint16_t reserved_2;
 			uint16_t subcommand;

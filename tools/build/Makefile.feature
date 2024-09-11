@@ -34,6 +34,8 @@ FEATURE_TESTS_BASIC :=                  \
         eventfd                         \
         fortify-source                  \
         sync-compare-and-swap           \
+        get_current_dir_name            \
+        gettid				\
         glibc                           \
         gtk2                            \
         gtk2-infobar                    \
@@ -92,7 +94,8 @@ FEATURE_TESTS_EXTRA :=                  \
          cxx                            \
          llvm                           \
          llvm-version                   \
-         clang
+         clang                          \
+         libbpf
 
 FEATURE_TESTS ?= $(FEATURE_TESTS_BASIC)
 

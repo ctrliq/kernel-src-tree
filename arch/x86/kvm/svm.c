@@ -1328,7 +1328,8 @@ static __init int svm_hardware_setup(void)
 
 	init_msrpm_offsets();
 
-	mark_tech_preview("nested virtualization", THIS_MODULE);
+	if (nested)
+		mark_tech_preview("nested virtualization", THIS_MODULE);
 
 	if (boot_cpu_has(X86_FEATURE_NX))
 		kvm_enable_efer_bits(EFER_NX);
@@ -1835,7 +1836,7 @@ static struct page **sev_pin_memory(struct kvm *kvm, unsigned long uaddr,
 		return NULL;
 
 	/* Pin the user virtual address. */
-	npinned = get_user_pages_fast(uaddr, npages, write ? FOLL_WRITE : 0, pages);
+	npinned = get_user_pages_fast(uaddr, npages, FOLL_WRITE, pages);
 	if (npinned != npages) {
 		pr_err("SEV: Failure locking %lu pages.\n", npages);
 		goto err;
@@ -1969,6 +1970,14 @@ static int avic_vm_init(struct kvm *kvm)
 	struct page *p_page;
 	struct page *l_page;
 	u32 vm_id;
+
+	static bool nested_taint_added = false;
+
+	/* RHEL-only: running as a nested hypervisor is TechPreview */
+	if (!nested_taint_added && boot_cpu_has(X86_FEATURE_HYPERVISOR)) {
+		mark_tech_preview("Running as a nested hypervisor", THIS_MODULE);
+		nested_taint_added = true;
+	}
 
 	if (!avic)
 		return 0;
@@ -2112,7 +2121,6 @@ static void svm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 	u32 dummy;
 	u32 eax = 1;
 
-	vcpu->arch.microcode_version = 0x01000065;
 	svm->spec_ctrl = 0;
 	svm->virt_spec_ctrl = 0;
 
@@ -2228,6 +2236,7 @@ static struct kvm_vcpu *svm_create_vcpu(struct kvm *kvm, unsigned int id)
 	init_vmcb(svm);
 
 	svm_init_osvw(&svm->vcpu);
+	svm->vcpu.arch.microcode_version = 0x01000065;
 
 	return &svm->vcpu;
 
@@ -4294,12 +4303,10 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 		    !guest_cpuid_has(vcpu, X86_FEATURE_AMD_SSBD))
 			return 1;
 
-		/* The STIBP bit doesn't fault even if it's not advertised */
-		if (data & ~(SPEC_CTRL_IBRS | SPEC_CTRL_STIBP | SPEC_CTRL_SSBD))
+		if (data & ~kvm_spec_ctrl_valid_bits(vcpu))
 			return 1;
 
 		svm->spec_ctrl = data;
-
 		if (!data)
 			break;
 
@@ -4323,13 +4330,12 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 
 		if (data & ~PRED_CMD_IBPB)
 			return 1;
-
+		if (!boot_cpu_has(X86_FEATURE_AMD_IBPB))
+			return 1;
 		if (!data)
 			break;
 
 		wrmsrl(MSR_IA32_PRED_CMD, PRED_CMD_IBPB);
-		if (is_guest_mode(vcpu))
-			break;
 		set_msr_interception(svm->msrpm, MSR_IA32_PRED_CMD, 0, 1);
 		break;
 	case MSR_AMD64_VIRT_SPEC_CTRL:
@@ -6007,6 +6013,11 @@ static bool svm_has_wbinvd_exit(void)
 	return true;
 }
 
+static bool svm_pku_supported(void)
+{
+	return false;
+}
+
 #define PRE_EX(exit)  { .exit_code = (exit), \
 			.stage = X86_ICPT_PRE_EXCEPT, }
 #define POST_EX(exit) { .exit_code = (exit), \
@@ -7348,6 +7359,7 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
 	.xsaves_supported = svm_xsaves_supported,
 	.umip_emulated = svm_umip_emulated,
 	.pt_supported = svm_pt_supported,
+	.pku_supported = svm_pku_supported,
 
 	.set_supported_cpuid = svm_set_supported_cpuid,
 

@@ -22,6 +22,7 @@
 #include "util/jit.h"
 #include "util/symbol.h"
 #include "util/thread.h"
+#include <linux/err.h>
 
 #include <subcmd/parse-options.h>
 
@@ -834,8 +835,8 @@ int cmd_inject(int argc, const char **argv)
 
 	data.path = inject.input_name;
 	inject.session = perf_session__new(&data, true, &inject.tool);
-	if (inject.session == NULL)
-		return -1;
+	if (IS_ERR(inject.session))
+		return PTR_ERR(inject.session);
 
 	if (zstd_init(&(inject.session->zstd_data), 0) < 0)
 		pr_warning("Decompression initialization failed.\n");

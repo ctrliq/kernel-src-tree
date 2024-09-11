@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+// SPDX-License-Identifier: ISC
 
 #include <linux/etherdevice.h>
 #include <linux/timekeeping.h>
@@ -644,7 +644,6 @@ void mt7603_wtbl_set_rates(struct mt7603_dev *dev, struct mt7603_sta *sta,
 
 			rates[i].idx--;
 		}
-
 	}
 
 	w9 &= MT_WTBL2_W9_SHORT_GI_20 | MT_WTBL2_W9_SHORT_GI_40 |
@@ -777,7 +776,7 @@ int mt7603_wtbl_set_key(struct mt7603_dev *dev, int wcid,
 
 static int
 mt7603_mac_write_txwi(struct mt7603_dev *dev, __le32 *txwi,
-		      struct sk_buff *skb, struct mt76_queue *q,
+		      struct sk_buff *skb, enum mt76_txq_id qid,
 		      struct mt76_wcid *wcid, struct ieee80211_sta *sta,
 		      int pid, struct ieee80211_key_conf *key)
 {
@@ -786,6 +785,7 @@ mt7603_mac_write_txwi(struct mt7603_dev *dev, __le32 *txwi,
 	struct ieee80211_hdr *hdr = (struct ieee80211_hdr *)skb->data;
 	struct ieee80211_bar *bar = (struct ieee80211_bar *)skb->data;
 	struct ieee80211_vif *vif = info->control.vif;
+	struct mt76_queue *q = dev->mt76.q_tx[qid].q;
 	struct mt7603_vif *mvif;
 	int wlan_idx;
 	int hdr_len = ieee80211_get_hdrlen_from_skb(skb);
@@ -800,7 +800,7 @@ mt7603_mac_write_txwi(struct mt7603_dev *dev, __le32 *txwi,
 	if (vif) {
 		mvif = (struct mt7603_vif *)vif->drv_priv;
 		vif_idx = mvif->idx;
-		if (vif_idx && q >= &dev->mt76.q_tx[MT_TXQ_BEACON])
+		if (vif_idx && qid >= MT_TXQ_BEACON)
 			vif_idx += 0x10;
 	}
 
@@ -874,7 +874,7 @@ mt7603_mac_write_txwi(struct mt7603_dev *dev, __le32 *txwi,
 	}
 
 	/* use maximum tx count for beacons and buffered multicast */
-	if (q >= &dev->mt76.q_tx[MT_TXQ_BEACON])
+	if (qid >= MT_TXQ_BEACON)
 		tx_count = 0x1f;
 
 	val = FIELD_PREP(MT_TXD3_REM_TX_COUNT, tx_count) |
@@ -905,13 +905,13 @@ mt7603_mac_write_txwi(struct mt7603_dev *dev, __le32 *txwi,
 }
 
 int mt7603_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
-			  struct sk_buff *skb, struct mt76_queue *q,
-			  struct mt76_wcid *wcid, struct ieee80211_sta *sta,
-			  u32 *tx_info)
+			  enum mt76_txq_id qid, struct mt76_wcid *wcid,
+			  struct ieee80211_sta *sta,
+			  struct mt76_tx_info *tx_info)
 {
 	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
 	struct mt7603_sta *msta = container_of(wcid, struct mt7603_sta, wcid);
-	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(tx_info->skb);
 	struct ieee80211_key_conf *key = info->control.hw_key;
 	int pid;
 
@@ -927,7 +927,7 @@ int mt7603_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 			mt7603_wtbl_set_ps(dev, msta, false);
 	}
 
-	pid = mt76_tx_status_skb_add(mdev, wcid, skb);
+	pid = mt76_tx_status_skb_add(mdev, wcid, tx_info->skb);
 
 	if (info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE) {
 		spin_lock_bh(&dev->mt76.lock);
@@ -937,7 +937,8 @@ int mt7603_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
 		spin_unlock_bh(&dev->mt76.lock);
 	}
 
-	mt7603_mac_write_txwi(dev, txwi_ptr, skb, q, wcid, sta, pid, key);
+	mt7603_mac_write_txwi(dev, txwi_ptr, tx_info->skb, qid, wcid,
+			      sta, pid, key);
 
 	return 0;
 }
@@ -1015,8 +1016,9 @@ mt7603_fill_txs(struct mt7603_dev *dev, struct mt7603_sta *sta,
 			sta->rate_probe = false;
 		}
 		spin_unlock_bh(&dev->mt76.lock);
-	} else
+	} else {
 		info->status.rates[0] = rs->rates[first_idx / 2];
+	}
 	info->status.rates[0].count = 0;
 
 	for (i = 0, idx = first_idx; count && idx <= last_idx; idx++) {
@@ -1146,8 +1148,8 @@ out:
 	rcu_read_unlock();
 }
 
-void mt7603_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue *q,
-			    struct mt76_queue_entry *e, bool flush)
+void mt7603_tx_complete_skb(struct mt76_dev *mdev, enum mt76_txq_id qid,
+			    struct mt76_queue_entry *e)
 {
 	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
 	struct sk_buff *skb = e->skb;
@@ -1157,7 +1159,7 @@ void mt7603_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue *q,
 		return;
 	}
 
-	if (q - dev->mt76.q_tx < 4)
+	if (qid < 4)
 		dev->tx_hang_check = 0;
 
 	mt76_tx_complete_skb(mdev, skb);
@@ -1270,7 +1272,7 @@ static void mt7603_dma_sched_reset(struct mt7603_dev *dev)
 
 static void mt7603_mac_watchdog_reset(struct mt7603_dev *dev)
 {
-	int beacon_int = dev->beacon_int;
+	int beacon_int = dev->mt76.beacon_int;
 	u32 mask = dev->mt76.mmio.irqmask;
 	int i;
 
@@ -1280,10 +1282,11 @@ static void mt7603_mac_watchdog_reset(struct mt7603_dev *dev)
 	/* lock/unlock all queues to ensure that no tx is pending */
 	mt76_txq_schedule_all(&dev->mt76);
 
-	tasklet_disable(&dev->tx_tasklet);
-	tasklet_disable(&dev->pre_tbtt_tasklet);
+	tasklet_disable(&dev->mt76.tx_tasklet);
+	tasklet_disable(&dev->mt76.pre_tbtt_tasklet);
 	napi_disable(&dev->mt76.napi[0]);
 	napi_disable(&dev->mt76.napi[1]);
+	napi_disable(&dev->mt76.tx_napi);
 
 	mutex_lock(&dev->mt76.mutex);
 
@@ -1327,10 +1330,11 @@ skip_dma_reset:
 	clear_bit(MT76_RESET, &dev->mt76.state);
 	mutex_unlock(&dev->mt76.mutex);
 
-	tasklet_enable(&dev->tx_tasklet);
-	tasklet_schedule(&dev->tx_tasklet);
+	tasklet_enable(&dev->mt76.tx_tasklet);
+	napi_enable(&dev->mt76.tx_napi);
+	napi_schedule(&dev->mt76.tx_napi);
 
-	tasklet_enable(&dev->pre_tbtt_tasklet);
+	tasklet_enable(&dev->mt76.pre_tbtt_tasklet);
 	mt7603_beacon_set_timer(dev, -1, beacon_int);
 
 	napi_enable(&dev->mt76.napi[0]);
@@ -1389,7 +1393,7 @@ static bool mt7603_tx_hang(struct mt7603_dev *dev)
 	int i;
 
 	for (i = 0; i < 4; i++) {
-		q = &dev->mt76.q_tx[i];
+		q = dev->mt76.q_tx[i].q;
 
 		if (!q->queued)
 			continue;
@@ -1671,7 +1675,7 @@ out:
 void mt7603_mac_work(struct work_struct *work)
 {
 	struct mt7603_dev *dev = container_of(work, struct mt7603_dev,
-					      mac_work.work);
+					      mt76.mac_work.work);
 	bool reset = false;
 
 	mt76_tx_status_check(&dev->mt76, NULL, false);
@@ -1724,6 +1728,6 @@ void mt7603_mac_work(struct work_struct *work)
 	if (reset)
 		mt7603_mac_watchdog_reset(dev);
 
-	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mac_work,
+	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mt76.mac_work,
 				     msecs_to_jiffies(MT7603_WATCHDOG_TIME));
 }

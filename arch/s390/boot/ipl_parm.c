@@ -16,6 +16,8 @@ unsigned long __bootdata(memory_end);
 int __bootdata(memory_end_set);
 int __bootdata(noexec_disabled);
 
+int kaslr_enabled __section(.data);
+
 static inline int __diag308(unsigned long subcode, void *addr)
 {
 	register unsigned long _addr asm("0") = (unsigned long)addr;
@@ -152,6 +154,7 @@ static void parse_mem_opt(void)
 	char *args;
 	int rc;
 
+	kaslr_enabled = IS_ENABLED(CONFIG_RANDOMIZE_BASE);
 	args = strcpy(command_line_buf, early_command_line);
 	while (*args) {
 		args = next_arg(args, &param, &val);
@@ -166,6 +169,9 @@ static void parse_mem_opt(void)
 			if (!rc && !enabled)
 				noexec_disabled = 1;
 		}
+
+		if (!strcmp(param, "nokaslr"))
+			kaslr_enabled = 0;
 	}
 }
 
@@ -173,9 +179,12 @@ void setup_memory_end(void)
 {
 	parse_mem_opt();
 #ifdef CONFIG_CRASH_DUMP
-	if (!OLDMEM_BASE && ipl_block_valid &&
-	    ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
-	    ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP) {
+	if (OLDMEM_BASE) {
+		kaslr_enabled = 0;
+	} else if (ipl_block_valid &&
+		   ipl_block.pb0_hdr.pbt == IPL_PBT_FCP &&
+		   ipl_block.fcp.opt == IPL_PB0_FCP_OPT_DUMP) {
+		kaslr_enabled = 0;
 		if (!sclp_early_get_hsa_size(&memory_end) && memory_end)
 			memory_end_set = 1;
 	}

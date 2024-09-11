@@ -257,7 +257,7 @@ struct pmu {
 	struct module			*module;
 	struct device			*dev;
 	const struct attribute_group	**attr_groups;
-	const struct attribute_group	**attr_update;
+	RH_KABI_BROKEN_INSERT(const struct attribute_group **attr_update)
 	const char			*name;
 	int				type;
 
@@ -413,8 +413,7 @@ struct pmu {
 	/*
 	 * Set up pmu-private data structures for an AUX area
 	 */
-	void *(*setup_aux)		(struct perf_event *event, void **pages,
-					 int nr_pages, bool overwrite);
+	RH_KABI_REPLACE(void *(*setup_aux) (int cpu, void **pages, int nr_pages, bool overwrite), void *(*setup_aux) (struct perf_event *event, void **pages, int nr_pages, bool overwrite))
 					/* optional */
 
 	/*
@@ -454,7 +453,7 @@ struct pmu {
 	 * Runs from perf_event_open(). Should return 0 for "no match"
 	 * or non-zero for "match".
 	 */
-	int (*aux_output_match)		(struct perf_event *event);
+	RH_KABI_BROKEN_INSERT(int (*aux_output_match)		(struct perf_event *event))
 					/* optional */
 
 	/*
@@ -465,7 +464,7 @@ struct pmu {
 	/*
 	 * Check period value for PERF_EVENT_IOC_PERIOD ioctl.
 	 */
-	RH_KABI_EXTEND(int (*check_period)		(struct perf_event *event, u64 value)) /* optional */
+	RH_KABI_BROKEN_INSERT(int (*check_period)		(struct perf_event *event, u64 value)) /* optional */
 };
 
 enum perf_addr_filter_action_t {
@@ -508,10 +507,12 @@ struct perf_addr_filters_head {
 	unsigned int		nr_file_filters;
 };
 
+#ifndef __GENKSYMS__
 struct perf_addr_filter_range {
 	unsigned long		start;
 	unsigned long		size;
 };
+#endif /* __GENKSYMS__ */
 
 /**
  * enum perf_event_state - the states of an event:
@@ -689,11 +690,11 @@ struct perf_event {
 	/* address range filters */
 	struct perf_addr_filters_head	addr_filters;
 	/* vma address array for file-based filders */
-	struct perf_addr_filter_range	*addr_filter_ranges;
+	RH_KABI_REPLACE(unsigned long *addr_filters_offs, struct perf_addr_filter_range	*addr_filter_ranges)
 	unsigned long			addr_filters_gen;
 
 	/* for aux_output events */
-	struct perf_event		*aux_event;
+	RH_KABI_BROKEN_INSERT(struct perf_event        *aux_event)
 
 	void (*destroy)(struct perf_event *);
 	struct rcu_head			rcu_head;
@@ -768,8 +769,8 @@ struct perf_event_context {
 	 * Set when nr_events != nr_active, except tolerant to events not
 	 * necessary to be active due to scheduling constraints, such as cgroups.
 	 */
-	int				rotate_necessary;
-	refcount_t			refcount;
+	RH_KABI_BROKEN_INSERT(int rotate_necessary)
+	RH_KABI_REPLACE(atomic_t refcount, refcount_t refcount)
 	struct task_struct		*task;
 
 	/*

@@ -1,12 +1,13 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 #ifndef _LINUX_KTHREAD_H
 #define _LINUX_KTHREAD_H
+
+#include <linux/rh_kabi.h>
+
 /* Simple interface for creating and stopping kernel threads without mess. */
 #include <linux/err.h>
 #include <linux/sched.h>
-#ifdef __GENKSYMS__
-#include <linux/cgroup.h>
-#endif
+#include RH_KABI_FAKE_INCLUDE(<linux/cgroup.h>)
 
 __printf(4, 5)
 struct task_struct *kthread_create_on_node(int (*threadfn)(void *data),

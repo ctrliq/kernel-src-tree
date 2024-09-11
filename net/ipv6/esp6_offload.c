@@ -1,10 +1,13 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * IPV6 GSO/GRO offload support
  * Linux INET implementation
  *
  * Copyright (C) 2016 secunet Security Networks AG
  * Author: Steffen Klassert <steffen.klassert@secunet.com>
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
  *
  * ESP GRO support
  */
@@ -77,6 +80,8 @@ static struct sk_buff **esp6_gro_receive(struct sk_buff **head,
 				      spi, IPPROTO_ESP, AF_INET6);
 		if (!x)
 			goto out_reset;
+
+		skb->mark = xfrm_smark_get(skb->mark, x);
 
 		skb->sp->xvec[skb->sp->len++] = x;
 		skb->sp->olen++;

@@ -910,7 +910,7 @@ int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
 	bool async_capable = ctx->async_capable;
 	unsigned char record_type = TLS_RECORD_TYPE_DATA;
-	bool is_kvec = msg->msg_iter.type & ITER_KVEC;
+	bool is_kvec = iov_iter_is_kvec(&msg->msg_iter);
 	bool eor = !(msg->msg_flags & MSG_MORE);
 	size_t try_to_copy, copied = 0;
 	struct sk_msg *msg_pl, *msg_en;
@@ -926,14 +926,8 @@ int tls_sw_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
 	if (msg->msg_flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL))
 		return -EOPNOTSUPP;
 
+	mutex_lock(&tls_ctx->tx_lock);
 	lock_sock(sk);
-
-	/* Wait till there is any pending write on socket */
-	if (unlikely(sk->sk_write_pending)) {
-		ret = wait_on_pending_writer(sk, &timeo);
-		if (unlikely(ret))
-			goto send_end;
-	}
 
 	if (unlikely(msg->msg_controllen)) {
 		ret = tls_proccess_cmsg(sk, msg, &record_type);
@@ -1121,6 +1115,7 @@ send_end:
 	ret = sk_stream_error(sk, msg->msg_flags, ret);
 
 	release_sock(sk);
+	mutex_unlock(&tls_ctx->tx_lock);
 	return copied ? copied : ret;
 }
 
@@ -1143,13 +1138,6 @@ static int tls_sw_do_sendpage(struct sock *sk, struct page *page,
 
 	eor = !(flags & (MSG_MORE | MSG_SENDPAGE_NOTLAST));
 	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
-
-	/* Wait till there is any pending write on socket */
-	if (unlikely(sk->sk_write_pending)) {
-		ret = wait_on_pending_writer(sk, &timeo);
-		if (unlikely(ret))
-			goto sendpage_end;
-	}
 
 	/* Call the sk_stream functions to manage the sndbuf mem. */
 	while (size > 0) {
@@ -1262,15 +1250,18 @@ int tls_sw_sendpage_locked(struct sock *sk, struct page *page,
 int tls_sw_sendpage(struct sock *sk, struct page *page,
 		    int offset, size_t size, int flags)
 {
+	struct tls_context *tls_ctx = tls_get_ctx(sk);
 	int ret;
 
 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
 		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
 		return -EOPNOTSUPP;
 
+	mutex_lock(&tls_ctx->tx_lock);
 	lock_sock(sk);
 	ret = tls_sw_do_sendpage(sk, page, offset, size, flags);
 	release_sock(sk);
+	mutex_unlock(&tls_ctx->tx_lock);
 	return ret;
 }
 
@@ -1532,13 +1523,12 @@ static int decrypt_skb_update(struct sock *sk, struct sk_buff *skb,
 	int pad, err = 0;
 
 	if (!ctx->decrypted) {
-#ifdef CONFIG_TLS_DEVICE
 		if (tls_ctx->rx_conf == TLS_HW) {
 			err = tls_device_decrypted(sk, skb);
 			if (err < 0)
 				return err;
 		}
-#endif
+
 		/* Still not decrypted after tls_device */
 		if (!ctx->decrypted) {
 			err = decrypt_internal(sk, skb, dest, NULL, chunk, zc,
@@ -1733,7 +1723,7 @@ int tls_sw_recvmsg(struct sock *sk,
 	bool cmsg = false;
 	int target, err = 0;
 	long timeo;
-	bool is_kvec = msg->msg_iter.type & ITER_KVEC;
+	bool is_kvec = iov_iter_is_kvec(&msg->msg_iter);
 	bool is_peek = flags & MSG_PEEK;
 	int num_async = 0;
 
@@ -2057,10 +2047,9 @@ static int tls_read_size(struct strparser *strp, struct sk_buff *skb)
 		ret = -EINVAL;
 		goto read_failure;
 	}
-#ifdef CONFIG_TLS_DEVICE
-	handle_device_resync(strp->sk, TCP_SKB_CB(skb)->seq + rxm->offset,
-			     *(u64*)tls_ctx->rx.rec_seq);
-#endif
+
+	tls_device_rx_resync_new_rec(strp->sk, data_len + TLS_HEADER_SIZE,
+				     TCP_SKB_CB(skb)->seq + rxm->offset);
 	return data_len + TLS_HEADER_SIZE;
 
 read_failure:
@@ -2215,9 +2204,11 @@ static void tx_work_handler(struct work_struct *work)
 
 	if (!test_and_clear_bit(BIT_TX_SCHEDULED, &ctx->tx_bitmask))
 		return;
+	mutex_lock(&tls_ctx->tx_lock);
 	lock_sock(sk);
 	tls_tx_records(sk, -1);
 	release_sock(sk);
+	mutex_unlock(&tls_ctx->tx_lock);
 }
 
 void tls_sw_write_space(struct sock *sk, struct tls_context *ctx)
@@ -2365,8 +2356,9 @@ int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
 		goto free_priv;
 	}
 
-	/* Sanity-check the IV size for stack allocations. */
-	if (iv_size > MAX_IV_SIZE || nonce_size > MAX_IV_SIZE) {
+	/* Sanity-check the sizes for stack allocations. */
+	if (iv_size > MAX_IV_SIZE || nonce_size > MAX_IV_SIZE ||
+	    rec_seq_size > TLS_MAX_REC_SEQ_SIZE) {
 		rc = -EINVAL;
 		goto free_priv;
 	}

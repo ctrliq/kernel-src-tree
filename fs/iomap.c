@@ -1122,20 +1122,19 @@ vm_fault_t iomap_page_mkwrite(struct vm_fault *vmf, const struct iomap_ops *ops)
 
 	lock_page(page);
 	size = i_size_read(inode);
-	if ((page->mapping != inode->i_mapping) ||
-	    (page_offset(page) > size)) {
+	offset = page_offset(page);
+	if (page->mapping != inode->i_mapping || offset > size) {
 		/* We overload EFAULT to mean page got truncated */
 		ret = -EFAULT;
 		goto out_unlock;
 	}
 
 	/* page is wholly or partially inside EOF */
-	if (((page->index + 1) << PAGE_SHIFT) > size)
+	if (offset > size - PAGE_SIZE)
 		length = offset_in_page(size);
 	else
 		length = PAGE_SIZE;
 
-	offset = page_offset(page);
 	while (length > 0) {
 		ret = iomap_apply(inode, offset, length,
 				IOMAP_WRITE | IOMAP_FAULT, ops, page,
@@ -1617,11 +1616,13 @@ static void iomap_dio_bio_end_io(struct bio *bio)
 	if (should_dirty) {
 		bio_check_pages_dirty(bio);
 	} else {
-		struct bio_vec *bvec;
-		int i;
+		if (!bio_flagged(bio, BIO_NO_PAGE_REF)) {
+			struct bio_vec *bvec;
+			int i;
 
-		bio_for_each_segment_all(bvec, bio, i)
-			put_page(bvec->bv_page);
+			bio_for_each_segment_all(bvec, bio, i)
+				put_page(bvec->bv_page);
+		}
 		bio_put(bio);
 	}
 }
@@ -1770,7 +1771,9 @@ zero_tail:
 		if (pad)
 			iomap_dio_zero(dio, iomap, pos, fs_block_size - pad);
 	}
-	return copied ? copied : ret;
+	if (copied)
+		return copied;
+	return ret;
 }
 
 static loff_t
@@ -1882,7 +1885,7 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
 		if (pos >= dio->i_size)
 			goto out_free_dio;
 
-		if (iter->type == ITER_IOVEC)
+		if (iter_is_iovec(iter) && iov_iter_rw(iter) == READ)
 			dio->flags |= IOMAP_DIO_DIRTY;
 	} else {
 		flags |= IOMAP_WRITE;
@@ -1949,8 +1952,15 @@ iomap_dio_rw(struct kiocb *iocb, struct iov_iter *iter,
 		}
 		pos += ret;
 
-		if (iov_iter_rw(iter) == READ && pos >= dio->i_size)
+		if (iov_iter_rw(iter) == READ && pos >= dio->i_size) {
+			/*
+			 * We only report that we've read data up to i_size.
+			 * Revert iter to a state corresponding to that as
+			 * some callers (such as splice code) rely on it.
+			 */
+			iov_iter_revert(iter, pos - dio->i_size);
 			break;
+		}
 	} while ((count = iov_iter_count(iter)) > 0);
 	blk_finish_plug(&plug);
 
@@ -2203,12 +2213,16 @@ iomap_bmap(struct address_space *mapping, sector_t bno,
 	struct inode *inode = mapping->host;
 	loff_t pos = bno << inode->i_blkbits;
 	unsigned blocksize = i_blocksize(inode);
+	int ret;
 
 	if (filemap_write_and_wait(mapping))
 		return 0;
 
 	bno = 0;
-	iomap_apply(inode, pos, blocksize, 0, ops, &bno, iomap_bmap_actor);
+	ret = iomap_apply(inode, pos, blocksize, 0, ops, &bno,
+			  iomap_bmap_actor);
+	if (ret)
+		return 0;
 	return bno;
 }
 EXPORT_SYMBOL_GPL(iomap_bmap);

@@ -467,7 +467,8 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 			  nla_data(upcall_info->userdata));
 
 	if (upcall_info->egress_tun_info) {
-		nla = nla_nest_start(user_skb, OVS_PACKET_ATTR_EGRESS_TUN_KEY);
+		nla = nla_nest_start_noflag(user_skb,
+					    OVS_PACKET_ATTR_EGRESS_TUN_KEY);
 		if (!nla) {
 			err = -EMSGSIZE;
 			goto out;
@@ -481,7 +482,7 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
 	}
 
 	if (upcall_info->actions_len) {
-		nla = nla_nest_start(user_skb, OVS_PACKET_ATTR_ACTIONS);
+		nla = nla_nest_start_noflag(user_skb, OVS_PACKET_ATTR_ACTIONS);
 		if (!nla) {
 			err = -EMSGSIZE;
 			goto out;
@@ -644,8 +645,8 @@ static const struct nla_policy packet_policy[OVS_PACKET_ATTR_MAX + 1] = {
 
 static const struct genl_ops dp_packet_genl_ops[] = {
 	{ .cmd = OVS_PACKET_CMD_EXECUTE,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = packet_policy,
 	  .doit = ovs_packet_cmd_execute
 	}
 };
@@ -655,6 +656,7 @@ static struct genl_family dp_packet_genl_family __ro_after_init = {
 	.name = OVS_PACKET_FAMILY,
 	.version = OVS_PACKET_VERSION,
 	.maxattr = OVS_PACKET_ATTR_MAX,
+	.policy = packet_policy,
 	.netnsok = true,
 	.parallel_ops = true,
 	.ops = dp_packet_genl_ops,
@@ -786,7 +788,7 @@ static int ovs_flow_cmd_fill_actions(const struct sw_flow *flow,
 	 * This can only fail for dump operations because the skb is always
 	 * properly sized for single flows.
 	 */
-	start = nla_nest_start(skb, OVS_FLOW_ATTR_ACTIONS);
+	start = nla_nest_start_noflag(skb, OVS_FLOW_ATTR_ACTIONS);
 	if (start) {
 		const struct sw_flow_actions *sf_acts;
 
@@ -1384,8 +1386,8 @@ static int ovs_flow_cmd_dump(struct sk_buff *skb, struct netlink_callback *cb)
 	u32 ufid_flags;
 	int err;
 
-	err = genlmsg_parse(cb->nlh, &dp_flow_genl_family, a,
-			    OVS_FLOW_ATTR_MAX, flow_policy, NULL);
+	err = genlmsg_parse_deprecated(cb->nlh, &dp_flow_genl_family, a,
+				       OVS_FLOW_ATTR_MAX, flow_policy, NULL);
 	if (err)
 		return err;
 	ufid_flags = ovs_nla_get_ufid_flags(a[OVS_FLOW_ATTR_UFID_FLAGS]);
@@ -1433,24 +1435,24 @@ static const struct nla_policy flow_policy[OVS_FLOW_ATTR_MAX + 1] = {
 
 static const struct genl_ops dp_flow_genl_ops[] = {
 	{ .cmd = OVS_FLOW_CMD_NEW,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = flow_policy,
 	  .doit = ovs_flow_cmd_new
 	},
 	{ .cmd = OVS_FLOW_CMD_DEL,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = flow_policy,
 	  .doit = ovs_flow_cmd_del
 	},
 	{ .cmd = OVS_FLOW_CMD_GET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = 0,		    /* OK for unprivileged users. */
-	  .policy = flow_policy,
 	  .doit = ovs_flow_cmd_get,
 	  .dumpit = ovs_flow_cmd_dump
 	},
 	{ .cmd = OVS_FLOW_CMD_SET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = flow_policy,
 	  .doit = ovs_flow_cmd_set,
 	},
 };
@@ -1460,6 +1462,7 @@ static struct genl_family dp_flow_genl_family __ro_after_init = {
 	.name = OVS_FLOW_FAMILY,
 	.version = OVS_FLOW_VERSION,
 	.maxattr = OVS_FLOW_ATTR_MAX,
+	.policy = flow_policy,
 	.netnsok = true,
 	.parallel_ops = true,
 	.ops = dp_flow_genl_ops,
@@ -1558,10 +1561,34 @@ static void ovs_dp_reset_user_features(struct sk_buff *skb, struct genl_info *in
 	dp->user_features = 0;
 }
 
-static void ovs_dp_change(struct datapath *dp, struct nlattr *a[])
+DEFINE_STATIC_KEY_FALSE(tc_recirc_sharing_support);
+
+static int ovs_dp_change(struct datapath *dp, struct nlattr *a[])
 {
-	if (a[OVS_DP_ATTR_USER_FEATURES])
-		dp->user_features = nla_get_u32(a[OVS_DP_ATTR_USER_FEATURES]);
+	u32 user_features = 0;
+
+	if (a[OVS_DP_ATTR_USER_FEATURES]) {
+		user_features = nla_get_u32(a[OVS_DP_ATTR_USER_FEATURES]);
+
+		if (user_features & ~(OVS_DP_F_VPORT_PIDS |
+				      OVS_DP_F_UNALIGNED |
+				      OVS_DP_F_TC_RECIRC_SHARING))
+			return -EOPNOTSUPP;
+
+#if !IS_ENABLED(CONFIG_NET_TC_SKB_EXT)
+		if (user_features & OVS_DP_F_TC_RECIRC_SHARING)
+			return -EOPNOTSUPP;
+#endif
+	}
+
+	dp->user_features = user_features;
+
+	if (dp->user_features & OVS_DP_F_TC_RECIRC_SHARING)
+		static_branch_enable(&tc_recirc_sharing_support);
+	else
+		static_branch_disable(&tc_recirc_sharing_support);
+
+	return 0;
 }
 
 static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
@@ -1623,7 +1650,9 @@ static int ovs_dp_cmd_new(struct sk_buff *skb, struct genl_info *info)
 	parms.port_no = OVSP_LOCAL;
 	parms.upcall_portids = a[OVS_DP_ATTR_UPCALL_PID];
 
-	ovs_dp_change(dp, a);
+	err = ovs_dp_change(dp, a);
+	if (err)
+		goto err_destroy_meters;
 
 	/* So far only local changes have been made, now need the lock. */
 	ovs_lock();
@@ -1749,7 +1778,9 @@ static int ovs_dp_cmd_set(struct sk_buff *skb, struct genl_info *info)
 	if (IS_ERR(dp))
 		goto err_unlock_free;
 
-	ovs_dp_change(dp, info->attrs);
+	err = ovs_dp_change(dp, info->attrs);
+	if (err)
+		goto err_unlock_free;
 
 	err = ovs_dp_cmd_fill_info(dp, reply, info->snd_portid,
 				   info->snd_seq, 0, OVS_DP_CMD_SET);
@@ -1826,24 +1857,24 @@ static const struct nla_policy datapath_policy[OVS_DP_ATTR_MAX + 1] = {
 
 static const struct genl_ops dp_datapath_genl_ops[] = {
 	{ .cmd = OVS_DP_CMD_NEW,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = datapath_policy,
 	  .doit = ovs_dp_cmd_new
 	},
 	{ .cmd = OVS_DP_CMD_DEL,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = datapath_policy,
 	  .doit = ovs_dp_cmd_del
 	},
 	{ .cmd = OVS_DP_CMD_GET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = 0,		    /* OK for unprivileged users. */
-	  .policy = datapath_policy,
 	  .doit = ovs_dp_cmd_get,
 	  .dumpit = ovs_dp_cmd_dump
 	},
 	{ .cmd = OVS_DP_CMD_SET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = datapath_policy,
 	  .doit = ovs_dp_cmd_set,
 	},
 };
@@ -1853,6 +1884,7 @@ static struct genl_family dp_datapath_genl_family __ro_after_init = {
 	.name = OVS_DATAPATH_FAMILY,
 	.version = OVS_DATAPATH_VERSION,
 	.maxattr = OVS_DP_ATTR_MAX,
+	.policy = datapath_policy,
 	.netnsok = true,
 	.parallel_ops = true,
 	.ops = dp_datapath_genl_ops,
@@ -2271,24 +2303,24 @@ static const struct nla_policy vport_policy[OVS_VPORT_ATTR_MAX + 1] = {
 
 static const struct genl_ops dp_vport_genl_ops[] = {
 	{ .cmd = OVS_VPORT_CMD_NEW,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = vport_policy,
 	  .doit = ovs_vport_cmd_new
 	},
 	{ .cmd = OVS_VPORT_CMD_DEL,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = vport_policy,
 	  .doit = ovs_vport_cmd_del
 	},
 	{ .cmd = OVS_VPORT_CMD_GET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = 0,		    /* OK for unprivileged users. */
-	  .policy = vport_policy,
 	  .doit = ovs_vport_cmd_get,
 	  .dumpit = ovs_vport_cmd_dump
 	},
 	{ .cmd = OVS_VPORT_CMD_SET,
+	  .validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
 	  .flags = GENL_UNS_ADMIN_PERM, /* Requires CAP_NET_ADMIN privilege. */
-	  .policy = vport_policy,
 	  .doit = ovs_vport_cmd_set,
 	},
 };
@@ -2298,6 +2330,7 @@ struct genl_family dp_vport_genl_family __ro_after_init = {
 	.name = OVS_VPORT_FAMILY,
 	.version = OVS_VPORT_VERSION,
 	.maxattr = OVS_VPORT_ATTR_MAX,
+	.policy = vport_policy,
 	.netnsok = true,
 	.parallel_ops = true,
 	.ops = dp_vport_genl_ops,

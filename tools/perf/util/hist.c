@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0
 #include "callchain.h"
-#include "util.h"
 #include "build-id.h"
 #include "hist.h"
 #include "map.h"
@@ -20,6 +19,7 @@
 #include <inttypes.h>
 #include <sys/param.h>
 #include <linux/time64.h>
+#include <linux/zalloc.h>
 
 static bool hists__filter_entry_by_dso(struct hists *hists,
 				       struct hist_entry *he);
@@ -376,6 +376,24 @@ void hists__delete_entries(struct hists *hists)
 	}
 }
 
+struct hist_entry *hists__get_entry(struct hists *hists, int idx)
+{
+	struct rb_node *next = rb_first_cached(&hists->entries);
+	struct hist_entry *n;
+	int i = 0;
+
+	while (next) {
+		n = rb_entry(next, struct hist_entry, rb_node);
+		if (i == idx)
+			return n;
+
+		next = rb_next(&n->rb_node);
+		i++;
+	}
+
+	return NULL;
+}
+
 /*
  * histogram, sorted on item, collects periods
  */
@@ -436,6 +454,13 @@ static int hist_entry__init(struct hist_entry *he,
 			goto err_rawdata;
 	}
 
+	if (symbol_conf.res_sample) {
+		he->res_samples = calloc(sizeof(struct res_sample),
+					symbol_conf.res_sample);
+		if (!he->res_samples)
+			goto err_srcline;
+	}
+
 	INIT_LIST_HEAD(&he->pairs.node);
 	thread__get(he->thread);
 	he->hroot_in  = RB_ROOT_CACHED;
@@ -446,14 +471,17 @@ static int hist_entry__init(struct hist_entry *he,
 
 	return 0;
 
+err_srcline:
+	zfree(&he->srcline);
+
 err_rawdata:
-	free(he->raw_data);
+	zfree(&he->raw_data);
 
 err_infos:
 	if (he->branch_info) {
 		map__put(he->branch_info->from.map);
 		map__put(he->branch_info->to.map);
-		free(he->branch_info);
+		zfree(&he->branch_info);
 	}
 	if (he->mem_info) {
 		map__put(he->mem_info->iaddr.map);
@@ -461,7 +489,7 @@ err_infos:
 	}
 err:
 	map__zput(he->ms.map);
-	free(he->stat_acc);
+	zfree(&he->stat_acc);
 	return -ENOMEM;
 }
 
@@ -605,6 +633,32 @@ out:
 	return he;
 }
 
+static unsigned random_max(unsigned high)
+{
+	unsigned thresh = -high % high;
+	for (;;) {
+		unsigned r = random();
+		if (r >= thresh)
+			return r % high;
+	}
+}
+
+static void hists__res_sample(struct hist_entry *he, struct perf_sample *sample)
+{
+	struct res_sample *r;
+	int j;
+
+	if (he->num_res < symbol_conf.res_sample) {
+		j = he->num_res++;
+	} else {
+		j = random_max(symbol_conf.res_sample);
+	}
+	r = &he->res_samples[j];
+	r->time = sample->time;
+	r->cpu = sample->cpu;
+	r->tid = sample->tid;
+}
+
 static struct hist_entry*
 __hists__add_entry(struct hists *hists,
 		   struct addr_location *al,
@@ -654,6 +708,8 @@ __hists__add_entry(struct hists *hists,
 
 	if (!hists->has_callchains && he && he->callchain_size != 0)
 		hists->has_callchains = true;
+	if (he && symbol_conf.res_sample)
+		hists__res_sample(he, sample);
 	return he;
 }
 
@@ -1191,13 +1247,17 @@ void hist_entry__delete(struct hist_entry *he)
 		mem_info__zput(he->mem_info);
 	}
 
+	if (he->block_info)
+		block_info__zput(he->block_info);
+
+	zfree(&he->res_samples);
 	zfree(&he->stat_acc);
 	free_srcline(he->srcline);
 	if (he->srcfile && he->srcfile[0])
-		free(he->srcfile);
+		zfree(&he->srcfile);
 	free_callchain(he->callchain);
-	free(he->trace_output);
-	free(he->raw_data);
+	zfree(&he->trace_output);
+	zfree(&he->raw_data);
 	ops->free(he);
 }
 
@@ -2681,10 +2741,10 @@ static void hists_evsel__exit(struct perf_evsel *evsel)
 
 	list_for_each_entry_safe(node, tmp, &hists->hpp_formats, list) {
 		perf_hpp_list__for_each_format_safe(&node->hpp, fmt, pos) {
-			list_del(&fmt->list);
+			list_del_init(&fmt->list);
 			free(fmt);
 		}
-		list_del(&node->list);
+		list_del_init(&node->list);
 		free(node);
 	}
 }

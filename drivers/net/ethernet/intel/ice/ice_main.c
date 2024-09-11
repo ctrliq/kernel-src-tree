@@ -10,8 +10,8 @@
 #include "ice_dcb_lib.h"
 
 #define DRV_VERSION_MAJOR 0
-#define DRV_VERSION_MINOR 7
-#define DRV_VERSION_BUILD 5
+#define DRV_VERSION_MINOR 8
+#define DRV_VERSION_BUILD 1
 
 #define DRV_VERSION	__stringify(DRV_VERSION_MAJOR) "." \
 			__stringify(DRV_VERSION_MINOR) "." \
@@ -3212,7 +3212,6 @@ static int __init ice_module_init(void)
 
 	pr_info("%s - version %s\n", ice_driver_string, ice_drv_ver);
 	pr_info("%s\n", ice_copyright);
-	mark_tech_preview(DRV_SUMMARY, THIS_MODULE);
 
 	ice_wq = alloc_workqueue("%s", WQ_MEM_RECLAIM, 0, KBUILD_MODNAME);
 	if (!ice_wq) {
@@ -4392,7 +4391,7 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
 		}
 	}
 
-	netdev_dbg(netdev, "changed MTU to %d\n", new_mtu);
+	netdev_info(netdev, "changed MTU to %d\n", new_mtu);
 	return 0;
 }
 

@@ -196,8 +196,8 @@ struct net_device_stats {
 
 #ifdef CONFIG_RPS
 #include <linux/static_key.h>
-extern struct static_key rps_needed;
-extern struct static_key rfs_needed;
+extern struct static_key_false rps_needed;
+extern struct static_key_false rfs_needed;
 #endif
 
 struct neighbour;
@@ -277,7 +277,7 @@ struct header_ops {
 				const unsigned char *haddr);
 	bool	(*validate)(const char *ll_header, unsigned int len);
 
-	RH_KABI_RESERVE(1)
+	RH_KABI_USE(1, __be16	(*parse_protocol)(const struct sk_buff *skb))
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 };
@@ -885,9 +885,6 @@ enum bpf_netdev_command {
 	XDP_QUERY_PROG,
 	XDP_QUERY_PROG_HW,
 	/* BPF program for offload callbacks, invoked at program load time. */
-	BPF_OFFLOAD_VERIFIER_PREP,
-	BPF_OFFLOAD_TRANSLATE,
-	BPF_OFFLOAD_DESTROY,
 	BPF_OFFLOAD_MAP_ALLOC,
 	BPF_OFFLOAD_MAP_FREE,
 	XDP_QUERY_XSK_UMEM,
@@ -913,15 +910,6 @@ struct netdev_bpf {
 			/* flags with which program was installed */
 			u32 prog_flags;
 		};
-		/* BPF_OFFLOAD_VERIFIER_PREP */
-		struct {
-			struct bpf_prog *prog;
-			const struct bpf_prog_offload_ops *ops; /* callee set */
-		} verifier;
-		/* BPF_OFFLOAD_DESTROY */
-		struct {
-			struct bpf_prog *prog;
-		} offload;
 		/* BPF_OFFLOAD_MAP_ALLOC, BPF_OFFLOAD_MAP_FREE */
 		struct {
 			struct bpf_offloaded_map *offmap;
@@ -978,9 +966,10 @@ struct tlsdev_ops {
 			    struct tls_context *ctx,
 			    enum tls_offload_ctx_dir direction);
 
-	RH_KABI_USE(1, void (*tls_dev_resync_rx)(struct net_device *netdev,
-						 struct sock *sk, u32 seq,
-						 u64 rcd_sn))
+	RH_KABI_USE(1, int (*tls_dev_resync)(struct net_device *netdev,
+					     struct sock *sk, u32 seq,
+					     u8 *rcd_sn,
+					     enum tls_offload_ctx_dir direction))
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -998,6 +987,7 @@ struct dev_ifalias {
 
 struct net_device_ops_extended_rh {
 };
+struct devlink;
 
 /*
  * This structure defines the management hooks for network devices.
@@ -1307,6 +1297,10 @@ struct net_device_ops_extended_rh {
  *	that got dropped are freed/returned via xdp_return_frame().
  *	Returns negative number, means general error invoking ndo, meaning
  *	no frames were xmit'ed and core-caller will free all frames.
+ * struct devlink_port *(*ndo_get_devlink_port)(struct net_device *dev);
+ *	Get devlink port instance associated with a given netdev.
+ *	Called with a reference on the netdevice and devlink locks only,
+ *	rtnl_lock is not held.
  */
 struct net_device_ops {
 	int			(*ndo_init)(struct net_device *dev);
@@ -1510,8 +1504,13 @@ struct net_device_ops {
 
 	RH_KABI_USE(1, int	(*ndo_get_port_parent_id)(struct net_device *dev,
 							  struct netdev_phys_item_id *ppid))
-	RH_KABI_RESERVE(2)
-	RH_KABI_RESERVE(3)
+	RH_KABI_USE(2, struct devlink_port *(*ndo_get_devlink_port)(struct net_device *dev))
+	RH_KABI_USE(3, int	(*ndo_fdb_get)(struct sk_buff *skb,
+					       struct nlattr *tb[],
+					       struct net_device *dev,
+					       const unsigned char *addr,
+					       u16 vid, u32 portid, u32 seq,
+					       struct netlink_ext_ack *extack))
 	RH_KABI_RESERVE(4)
 	RH_KABI_RESERVE(5)
 	RH_KABI_RESERVE(6)
@@ -1883,6 +1882,8 @@ struct net_device_extended_rh {
  *			switch driver and used to set the phys state of the
  *			switch port.
  *
+ *	@wol_enabled:	Wake-on-LAN is enabled
+ *
  *	FIXME: cleanup struct net_device such that network protocol info
  *	moves out.
  */
@@ -1982,6 +1983,11 @@ struct net_device {
 	unsigned char		if_port;
 	unsigned char		dma;
 
+	/* Note : dev->mtu is often read without holding a lock.
+	 * Writers usually hold RTNL.
+	 * It is recommended to use READ_ONCE() to annotate the reads,
+	 * and to use WRITE_ONCE() to annotate the writes.
+	 */
 	unsigned int		mtu;
 	unsigned int		min_mtu;
 	unsigned int		max_mtu;
@@ -2170,6 +2176,10 @@ struct net_device {
 	struct lock_class_key	*qdisc_tx_busylock;
 	struct lock_class_key	*qdisc_running_key;
 	bool			proto_down;
+	RH_KABI_FILL_HOLE(unsigned	wol_enabled:1)
+
+	/* 23 bits hole remain and... */
+	/* 4 bytes hole remain prior RH_KABI reservations below */
 
 	RH_KABI_USE(1, struct mpls_dev __rcu   *mpls_ptr)
 	RH_KABI_RESERVE(2)
@@ -3083,6 +3093,15 @@ static inline int dev_parse_header(const struct sk_buff *skb,
 	if (!dev->header_ops || !dev->header_ops->parse)
 		return 0;
 	return dev->header_ops->parse(skb, haddr);
+}
+
+static inline __be16 dev_parse_header_protocol(const struct sk_buff *skb)
+{
+	const struct net_device *dev = skb->dev;
+
+	if (!dev->header_ops || !dev->header_ops->parse_protocol)
+		return 0;
+	return dev->header_ops->parse_protocol(skb);
 }
 
 /* ll_header must have at least hard_header_len allocated */

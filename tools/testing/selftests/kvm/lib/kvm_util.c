@@ -9,6 +9,7 @@
 #include "test_util.h"
 #include "kvm_util.h"
 #include "kvm_util_internal.h"
+#include "processor.h"
 
 #include <assert.h>
 #include <sys/mman.h>
@@ -102,12 +103,13 @@ static void vm_open(struct kvm_vm *vm, int perm)
 }
 
 const char * const vm_guest_mode_string[] = {
-	"PA-bits:52, VA-bits:48, 4K pages",
-	"PA-bits:52, VA-bits:48, 64K pages",
-	"PA-bits:48, VA-bits:48, 4K pages",
-	"PA-bits:48, VA-bits:48, 64K pages",
-	"PA-bits:40, VA-bits:48, 4K pages",
-	"PA-bits:40, VA-bits:48, 64K pages",
+	"PA-bits:52,  VA-bits:48,  4K pages",
+	"PA-bits:52,  VA-bits:48, 64K pages",
+	"PA-bits:48,  VA-bits:48,  4K pages",
+	"PA-bits:48,  VA-bits:48, 64K pages",
+	"PA-bits:40,  VA-bits:48,  4K pages",
+	"PA-bits:40,  VA-bits:48, 64K pages",
+	"PA-bits:ANY, VA-bits:48,  4K pages",
 };
 _Static_assert(sizeof(vm_guest_mode_string)/sizeof(char *) == NUM_VM_MODES,
 	       "Missing new mode strings?");
@@ -134,6 +136,8 @@ _Static_assert(sizeof(vm_guest_mode_string)/sizeof(char *) == NUM_VM_MODES,
 struct kvm_vm *_vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 {
 	struct kvm_vm *vm;
+
+	DEBUG("Testing guest mode: %s\n", vm_guest_mode_string(mode));
 
 	vm = calloc(1, sizeof(*vm));
 	TEST_ASSERT(vm != NULL, "Insufficient Memory");
@@ -184,6 +188,21 @@ struct kvm_vm *_vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
 		vm->va_bits = 48;
 		vm->page_size = 0x10000;
 		vm->page_shift = 16;
+		break;
+	case VM_MODE_PXXV48_4K:
+#ifdef __x86_64__
+		kvm_get_cpu_address_width(&vm->pa_bits, &vm->va_bits);
+		TEST_ASSERT(vm->va_bits == 48, "Linear address width "
+			    "(%d bits) not supported", vm->va_bits);
+		vm->pgtable_levels = 4;
+		vm->page_size = 0x1000;
+		vm->page_shift = 12;
+		DEBUG("Guest physical address width detected: %d\n",
+		      vm->pa_bits);
+#else
+		TEST_ASSERT(false, "VM_MODE_PXXV48_4K not supported on "
+			    "non-x86 platforms");
+#endif
 		break;
 	default:
 		TEST_ASSERT(false, "Unknown guest mode, mode: 0x%x", mode);
@@ -687,7 +706,7 @@ void vm_userspace_mem_region_add(struct kvm_vm *vm,
  *   on error (e.g. currently no memory region using memslot as a KVM
  *   memory slot ID).
  */
-static struct userspace_mem_region *
+struct userspace_mem_region *
 memslot2region(struct kvm_vm *vm, uint32_t memslot)
 {
 	struct userspace_mem_region *region;
@@ -780,11 +799,10 @@ static int vcpu_mmap_sz(void)
  *
  * Return: None
  *
- * Creates and adds to the VM specified by vm and virtual CPU with
- * the ID given by vcpuid.
+ * Adds a virtual CPU to the VM specified by vm with the ID given by vcpuid.
+ * No additional VCPU setup is done.
  */
-void vm_vcpu_add(struct kvm_vm *vm, uint32_t vcpuid, int pgd_memslot,
-		 int gdt_memslot)
+void vm_vcpu_add(struct kvm_vm *vm, uint32_t vcpuid)
 {
 	struct vcpu *vcpu;
 
@@ -818,8 +836,6 @@ void vm_vcpu_add(struct kvm_vm *vm, uint32_t vcpuid, int pgd_memslot,
 		vm->vcpu_head->prev = vcpu;
 	vcpu->next = vm->vcpu_head;
 	vm->vcpu_head = vcpu;
-
-	vcpu_setup(vm, vcpuid, pgd_memslot, gdt_memslot);
 }
 
 /*
@@ -1600,4 +1616,55 @@ vm_paddr_t vm_phy_page_alloc(struct kvm_vm *vm, vm_paddr_t paddr_min,
 void *addr_gva2hva(struct kvm_vm *vm, vm_vaddr_t gva)
 {
 	return addr_gpa2hva(vm, addr_gva2gpa(vm, gva));
+}
+
+/*
+ * Is Unrestricted Guest
+ *
+ * Input Args:
+ *   vm - Virtual Machine
+ *
+ * Output Args: None
+ *
+ * Return: True if the unrestricted guest is set to 'Y', otherwise return false.
+ *
+ * Check if the unrestricted guest flag is enabled.
+ */
+bool vm_is_unrestricted_guest(struct kvm_vm *vm)
+{
+	char val = 'N';
+	size_t count;
+	FILE *f;
+
+	if (vm == NULL) {
+		/* Ensure that the KVM vendor-specific module is loaded. */
+		f = fopen(KVM_DEV_PATH, "r");
+		TEST_ASSERT(f != NULL, "Error in opening KVM dev file: %d",
+			    errno);
+		fclose(f);
+	}
+
+	f = fopen("/sys/module/kvm_intel/parameters/unrestricted_guest", "r");
+	if (f) {
+		count = fread(&val, sizeof(char), 1, f);
+		TEST_ASSERT(count == 1, "Unable to read from param file.");
+		fclose(f);
+	}
+
+	return val == 'Y';
+}
+
+unsigned int vm_get_page_size(struct kvm_vm *vm)
+{
+	return vm->page_size;
+}
+
+unsigned int vm_get_page_shift(struct kvm_vm *vm)
+{
+	return vm->page_shift;
+}
+
+unsigned int vm_get_max_gfn(struct kvm_vm *vm)
+{
+	return vm->max_gfn;
 }

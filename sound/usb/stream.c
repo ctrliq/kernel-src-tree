@@ -1,17 +1,5 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- *   This program is free software; you can redistribute it and/or modify
- *   it under the terms of the GNU General Public License as published by
- *   the Free Software Foundation; either version 2 of the License, or
- *   (at your option) any later version.
- *
- *   This program is distributed in the hope that it will be useful,
- *   but WITHOUT ANY WARRANTY; without even the implied warranty of
- *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *   GNU General Public License for more details.
- *
- *   You should have received a copy of the GNU General Public License
- *   along with this program; if not, write to the Free Software
- *   Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307 USA
  */
 
 
@@ -39,6 +27,14 @@
 #include "stream.h"
 #include "power.h"
 
+static void audioformat_free(struct audioformat *fp)
+{
+	list_del(&fp->list); /* unlink for avoiding double-free */
+	kfree(fp->rate_table);
+	kfree(fp->chmap);
+	kfree(fp);
+}
+
 /*
  * free a substream
  */
@@ -48,11 +44,8 @@ static void free_substream(struct snd_usb_substream *subs)
 
 	if (!subs->num_formats)
 		return; /* not initialized */
-	list_for_each_entry_safe(fp, n, &subs->fmt_list, list) {
-		kfree(fp->rate_table);
-		kfree(fp->chmap);
-		kfree(fp);
-	}
+	list_for_each_entry_safe(fp, n, &subs->fmt_list, list)
+		audioformat_free(fp);
 	kfree(subs->rate_list.list);
 	kfree(subs->str_pd);
 }
@@ -842,8 +835,7 @@ found_clock:
 	/* ok, let's parse further... */
 	if (snd_usb_parse_audio_format(chip, fp, format,
 					fmt, stream) < 0) {
-		kfree(fp->rate_table);
-		kfree(fp);
+		audioformat_free(fp);
 		return NULL;
 	}
 
@@ -1054,8 +1046,7 @@ found_clock:
 
 		pd = kzalloc(sizeof(*pd), GFP_KERNEL);
 		if (!pd) {
-			kfree(fp->rate_table);
-			kfree(fp);
+			audioformat_free(fp);
 			return NULL;
 		}
 		pd->pd_id = (stream == SNDRV_PCM_STREAM_PLAYBACK) ?
@@ -1074,9 +1065,7 @@ found_clock:
 		/* ok, let's parse further... */
 		if (snd_usb_parse_audio_format_v3(chip, fp, as, stream) < 0) {
 			kfree(pd);
-			kfree(fp->chmap);
-			kfree(fp->rate_table);
-			kfree(fp);
+			audioformat_free(fp);
 			return NULL;
 		}
 	}
@@ -1207,11 +1196,8 @@ static int __snd_usb_parse_audio_interface(struct snd_usb_audio *chip,
 			err = snd_usb_add_audio_stream(chip, stream, fp);
 
 		if (err < 0) {
-			list_del(&fp->list); /* unlink for avoiding double-free */
+			audioformat_free(fp);
 			kfree(pd);
-			kfree(fp->rate_table);
-			kfree(fp->chmap);
-			kfree(fp);
 			return err;
 		}
 		/* try to set the interface... */

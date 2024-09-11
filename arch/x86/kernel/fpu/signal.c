@@ -211,11 +211,11 @@ retry:
 }
 
 static inline void
-sanitize_restored_xstate(struct task_struct *tsk,
+sanitize_restored_xstate(union fpregs_state *state,
 			 struct user_i387_ia32_struct *ia32_env,
 			 u64 xfeatures, int fx_only)
 {
-	struct xregs_state *xsave = &tsk->thread.fpu.state.xsave;
+	struct xregs_state *xsave = &state->xsave;
 	struct xstate_header *header = &xsave->header;
 
 	if (use_xsave()) {
@@ -242,17 +242,18 @@ sanitize_restored_xstate(struct task_struct *tsk,
 		 */
 		xsave->i387.mxcsr &= mxcsr_feature_mask;
 
-		convert_to_fxsr(tsk, ia32_env);
+		if (ia32_env)
+			convert_to_fxsr(&state->fxsave, ia32_env);
 	}
 }
 
 /*
  * Restore the extended state if present. Otherwise, restore the FP/SSE state.
  */
-static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
 {
 	if (use_xsave()) {
-		if ((unsigned long)buf % 64 || fx_only) {
+		if (fx_only) {
 			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
 			return copy_user_to_fxregs(buf);
@@ -270,12 +271,15 @@ static inline int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_
 
 static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
 {
+	struct user_i387_ia32_struct *envp = NULL;
+	int state_size = fpu_kernel_xstate_size;
 	int ia32_fxstate = (buf != buf_fx);
 	struct task_struct *tsk = current;
 	struct fpu *fpu = &tsk->thread.fpu;
-	int state_size = fpu_kernel_xstate_size;
+	struct user_i387_ia32_struct env;
 	u64 xfeatures = 0;
 	int fx_only = 0;
+	int ret = 0;
 
 	ia32_fxstate &= (IS_ENABLED(CONFIG_X86_32) ||
 			 IS_ENABLED(CONFIG_IA32_EMULATION));
@@ -287,8 +291,6 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
 
 	if (!access_ok(buf, size))
 		return -EACCES;
-
-	fpu__initialize(fpu);
 
 	if (!static_cpu_has(X86_FEATURE_FPU))
 		return fpregs_soft_set(current, NULL,
@@ -312,78 +314,101 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
 		}
 	}
 
+	/*
+	 * The current state of the FPU registers does not matter. By setting
+	 * TIF_NEED_FPU_LOAD unconditionally it is ensured that the our xstate
+	 * is not modified on context switch and that the xstate is considered
+	 * to be loaded again on return to userland (overriding last_cpu avoids
+	 * the optimisation).
+	 */
+	set_thread_flag(TIF_NEED_FPU_LOAD);
+	__fpu_invalidate_fpregs_state(fpu);
+
+	if ((unsigned long)buf_fx % 64)
+		fx_only = 1;
+	/*
+	 * For 32-bit frames with fxstate, copy the fxstate so it can be
+	 * reconstructed later.
+	 */
 	if (ia32_fxstate) {
-		/*
-		 * For 32-bit frames with fxstate, copy the user state to the
-		 * thread's fpu state, reconstruct fxstate from the fsave
-		 * header. Validate and sanitize the copied state.
-		 */
-		struct user_i387_ia32_struct env;
-		int err = 0;
-
-		/*
-		 * Drop the current fpu which clears fpu->initialized. This ensures
-		 * that any context-switch during the copy of the new state,
-		 * avoids the intermediate state from getting restored/saved.
-		 * Thus avoiding the new restored state from getting corrupted.
-		 * We will be ready to restore/save the state only after
-		 * fpu->initialized is again set.
-		 */
-		fpu__drop(fpu);
-
-		if (using_compacted_format()) {
-			err = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
-		} else {
-			err = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
-
-			if (!err && state_size > offsetof(struct xregs_state, header))
-				err = validate_xstate_header(&fpu->state.xsave.header);
-		}
-
-		if (err || __copy_from_user(&env, buf, sizeof(env))) {
-			fpstate_init(&fpu->state);
-			trace_x86_fpu_init_state(fpu);
-			err = -1;
-		} else {
-			sanitize_restored_xstate(tsk, &env, xfeatures, fx_only);
-		}
-
-		fpu->initialized = 1;
-		preempt_disable();
-		fpu__restore(fpu);
-		preempt_enable();
-
-		return err;
+		ret = __copy_from_user(&env, buf, sizeof(env));
+		if (ret)
+			goto err_out;
+		envp = &env;
 	} else {
-		int ret;
-
 		/*
-		 * For 64-bit frames and 32-bit fsave frames, restore the user
-		 * state to the registers directly (with exceptions handled).
+		 * Attempt to restore the FPU registers directly from user
+		 * memory. For that to succeed, the user access cannot cause
+		 * page faults. If it does, fall back to the slow path below,
+		 * going through the kernel buffer with the enabled pagefault
+		 * handler.
 		 */
-		if (use_xsave()) {
-			if ((unsigned long)buf_fx % 64 || fx_only) {
-				u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
-				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
-				ret = copy_user_to_fxregs(buf_fx);
-			} else {
-				u64 init_bv = xfeatures_mask & ~xfeatures;
-				if (unlikely(init_bv))
-					copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
-				ret = copy_user_to_xregs(buf_fx, xfeatures);
-			}
-		} else if (use_fxsr()) {
-			ret = copy_user_to_fxregs(buf_fx);
-		} else
-			ret = copy_user_to_fregs(buf_fx);
-
-		if (ret) {
-			fpu__clear(fpu);
-			return -1;
+		fpregs_lock();
+		pagefault_disable();
+		ret = copy_user_to_fpregs_zeroing(buf_fx, xfeatures, fx_only);
+		pagefault_enable();
+		if (!ret) {
+			fpregs_mark_activate();
+			fpregs_unlock();
+			return 0;
 		}
+		fpregs_unlock();
 	}
 
-	return 0;
+
+	if (use_xsave() && !fx_only) {
+		u64 init_bv = xfeatures_mask & ~xfeatures;
+
+		if (using_compacted_format()) {
+			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+		} else {
+			ret = __copy_from_user(&fpu->state.xsave, buf_fx, state_size);
+
+			if (!ret && state_size > offsetof(struct xregs_state, header))
+				ret = validate_xstate_header(&fpu->state.xsave.header);
+		}
+		if (ret)
+			goto err_out;
+
+		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
+
+		fpregs_lock();
+		if (unlikely(init_bv))
+			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+		ret = copy_kernel_to_xregs_err(&fpu->state.xsave, xfeatures);
+
+	} else if (use_fxsr()) {
+		ret = __copy_from_user(&fpu->state.fxsave, buf_fx, state_size);
+		if (ret) {
+			ret = -EFAULT;
+			goto err_out;
+		}
+
+		sanitize_restored_xstate(&fpu->state, envp, xfeatures, fx_only);
+
+		fpregs_lock();
+		if (use_xsave()) {
+			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
+			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+		}
+
+		ret = copy_kernel_to_fxregs_err(&fpu->state.fxsave);
+	} else {
+		ret = __copy_from_user(&fpu->state.fsave, buf_fx, state_size);
+		if (ret)
+			goto err_out;
+
+		fpregs_lock();
+		ret = copy_kernel_to_fregs_err(&fpu->state.fsave);
+	}
+	if (!ret)
+		fpregs_mark_activate();
+	fpregs_unlock();
+
+err_out:
+	if (ret)
+		fpu__clear(fpu);
+	return ret;
 }
 
 static inline int xstate_sigframe_size(void)

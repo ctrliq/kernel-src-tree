@@ -45,6 +45,7 @@
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
 #include <linux/delayacct.h>
+#include <linux/energy_model.h>
 #include <linux/init_task.h>
 #include <linux/kprobes.h>
 #include <linux/kthread.h>
@@ -331,11 +332,12 @@ struct cfs_bandwidth {
 	u64			quota;
 	u64			runtime;
 	s64			hierarchical_quota;
-	u64			runtime_expires;
-	int			expires_seq;
+	RH_KABI_DEPRECATE(u64, runtime_expires)
+	RH_KABI_DEPRECATE(int, expires_seq)
 
-	short			idle;
-	short			period_active;
+	RH_KABI_REPLACE2(short idle, u8 idle, u8 period_active)
+	RH_KABI_REPLACE2(short period_active, u8 distribute_running, u8 slack_started)
+
 	struct hrtimer		period_timer;
 	struct hrtimer		slack_timer;
 	struct list_head	throttled_cfs_rq;
@@ -345,7 +347,7 @@ struct cfs_bandwidth {
 	int			nr_throttled;
 	u64			throttled_time;
 
-	bool                    distribute_running;
+	RH_KABI_DEPRECATE(bool, distribute_running)
 #endif
 };
 
@@ -555,8 +557,8 @@ struct cfs_rq {
 
 #ifdef CONFIG_CFS_BANDWIDTH
 	int			runtime_enabled;
-	int			expires_seq;
-	u64			runtime_expires;
+	RH_KABI_DEPRECATE(int, expires_seq)
+	RH_KABI_DEPRECATE(u64, runtime_expires)
 	s64			runtime_remaining;
 
 	u64			throttled_clock;
@@ -706,6 +708,16 @@ static inline bool sched_asym_prefer(int a, int b)
 	return arch_asym_cpu_priority(a) > arch_asym_cpu_priority(b);
 }
 
+struct perf_domain {
+	struct em_perf_domain *em_pd;
+	struct perf_domain *next;
+	struct rcu_head rcu;
+};
+
+/* Scheduling group status flags */
+#define SG_OVERLOAD		0x1 /* More than one runnable task on a CPU. */
+#define SG_OVERUTILIZED		0x2 /* One or more CPUs are over-utilized. */
+
 /*
  * We add the notion of a root-domain which will be used to define per-domain
  * variables. Each exclusive cpuset essentially defines an island domain by
@@ -721,12 +733,12 @@ struct root_domain {
 	cpumask_var_t		span;
 	cpumask_var_t		online;
 
-	/*
+        /*
 	 * Indicate pullable load on at least one CPU, e.g:
 	 * - More than one runnable task
 	 * - Running task is misfit
 	 */
-	int			overload;
+	RH_KABI_REPLACE_UNSAFE(bool overload, int overload)
 
 	/*
 	 * The bit corresponding to a CPU gets set here if such CPU has more
@@ -759,8 +771,15 @@ struct root_domain {
 
 	unsigned long		max_cpu_capacity;
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	/*
+	 * NULL-terminated list of performance domains intersecting with the
+	 * CPUs of the rd. Protected by RCU.
+	 */
+	RH_KABI_USE(1, struct perf_domain *pd)
+
+	/* Indicate one or more cpus over-utilized (tipping point) */
+	RH_KABI_USE(2, int overutilized)
+
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 };
@@ -799,6 +818,7 @@ struct rq {
 	unsigned int		nr_numa_running;
 	unsigned int		nr_preferred_running;
 #endif
+	RH_KABI_DEPRECATE(unsigned long, cpu_load[5])
 #ifdef CONFIG_NO_HZ_COMMON
 #ifdef CONFIG_SMP
 	unsigned long		last_load_update_tick;
@@ -809,6 +829,7 @@ struct rq {
 	atomic_t nohz_flags;
 #endif /* CONFIG_NO_HZ_COMMON */
 
+	RH_KABI_DEPRECATE(struct load_weight, load)
 	unsigned long		nr_load_updates;
 	u64			nr_switches;
 
@@ -838,7 +859,7 @@ struct rq {
 
 	unsigned int		clock_update_flags;
 	u64			clock;
-	u64			clock_task;
+	RH_KABI_DEPRECATE(u64, clock_task)
 
 	atomic_t		nr_iowait;
 
@@ -852,8 +873,6 @@ struct rq {
 	struct callback_head	*balance_callback;
 
 	unsigned char		idle_balance;
-
-	unsigned long		misfit_task_load;
 
 	/* For active balancing */
 	int			active_balance;
@@ -934,7 +953,12 @@ struct rq {
 #ifdef CONFIG_HAVE_SCHED_AVG_IRQ
 	RH_KABI_EXTEND(struct sched_avg	avg_irq)
 #endif
+	RH_KABI_EXTEND(unsigned long misfit_task_load)
 
+	/* Ensure that all clocks are in the same cache line */
+	RH_KABI_EXTEND(u64 clock_task ____cacheline_aligned)
+	RH_KABI_EXTEND(u64 clock_pelt)
+	RH_KABI_EXTEND(unsigned long lost_idle_time)
 };
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
@@ -1324,7 +1348,7 @@ struct sched_group_capacity {
 	 */
 	unsigned long		capacity;
 	unsigned long		min_capacity;		/* Min per-CPU capacity in group */
-	unsigned long		max_capacity;		/* Max per-CPU capacity in group */
+	RH_KABI_BROKEN_INSERT(unsigned long max_capacity)	/* Max per-CPU capacity in group */
 	unsigned long		next_update;
 	int			imbalance;		/* XXX unrelated to capacity but shared group state */
 
@@ -1791,7 +1815,7 @@ extern void init_dl_rq_bw_ratio(struct dl_rq *dl_rq);
 unsigned long to_ratio(u64 period, u64 runtime);
 
 extern void init_entity_runnable_average(struct sched_entity *se);
-extern void post_init_entity_util_avg(struct sched_entity *se);
+extern void post_init_entity_util_avg(struct task_struct *p);
 
 #ifdef CONFIG_NO_HZ_FULL
 extern bool sched_can_stop_tick(struct rq *rq);
@@ -2249,7 +2273,7 @@ unsigned long schedutil_freq_util(int cpu, unsigned long util_cfs,
 
 static inline unsigned long schedutil_energy_util(int cpu, unsigned long cfs)
 {
-	unsigned long max = arch_scale_cpu_capacity(NULL, cpu);
+	unsigned long max = arch_scale_cpu_capacity(cpu);
 
 	return schedutil_freq_util(cpu, cfs, max, ENERGY_UTIL);
 }
@@ -2313,4 +2337,14 @@ unsigned long scale_irq_capacity(unsigned long util, unsigned long irq, unsigned
 {
 	return util;
 }
+#endif
+
+#if defined(CONFIG_ENERGY_MODEL) && defined(CONFIG_CPU_FREQ_GOV_SCHEDUTIL)
+#define perf_domain_span(pd) (to_cpumask(((pd)->em_pd->cpus)))
+#else
+#define perf_domain_span(pd) NULL
+#endif
+
+#ifdef CONFIG_SMP
+extern struct static_key_false sched_energy_present;
 #endif

@@ -1,6 +1,18 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * IOMMU API for ARM architected SMMU implementations.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License version 2 as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA 02111-1307, USA.
  *
  * Copyright (C) 2013 ARM Limited
  *
@@ -30,7 +42,8 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
-#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/moduleparam.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/of_device.h>
@@ -98,6 +111,10 @@
 #define MSI_IOVA_LENGTH			0x100000
 
 static int force_stage;
+/*
+ * not really modular, but the easiest way to keep compat with existing
+ * bootargs behaviour is to continue using module_param() here.
+ */
 module_param(force_stage, int, S_IRUGO);
 MODULE_PARM_DESC(force_stage,
 	"Force SMMU mappings to be installed at a particular stage of translation. A value of '1' or '2' forces the corresponding stage. All other values are ignored (i.e. no stage is forced). Note that selecting a specific stage will disable support for nested translation.");
@@ -241,10 +258,17 @@ enum arm_smmu_domain_stage {
 	ARM_SMMU_DOMAIN_BYPASS,
 };
 
+struct arm_smmu_flush_ops {
+	struct iommu_flush_ops		tlb;
+	void (*tlb_inv_range)(unsigned long iova, size_t size, size_t granule,
+			      bool leaf, void *cookie);
+	void (*tlb_sync)(void *cookie);
+};
+
 struct arm_smmu_domain {
 	struct arm_smmu_device		*smmu;
 	struct io_pgtable_ops		*pgtbl_ops;
-	const struct iommu_gather_ops	*tlb_ops;
+	const struct arm_smmu_flush_ops	*flush_ops;
 	struct arm_smmu_cfg		cfg;
 	enum arm_smmu_domain_stage	stage;
 	bool				non_strict;
@@ -526,7 +550,7 @@ static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
  * On MMU-401 at least, the cost of firing off multiple TLBIVMIDs appears
  * almost negligible, but the benefit of getting the first one in as far ahead
  * of the sync as possible is significant, hence we don't just make this a
- * no-op and set .tlb_sync to arm_smmu_inv_context_s2() as you might think.
+ * no-op and set .tlb_sync to arm_smmu_tlb_inv_context_s2() as you might think.
  */
 static void arm_smmu_tlb_inv_vmid_nosync(unsigned long iova, size_t size,
 					 size_t granule, bool leaf, void *cookie)
@@ -540,22 +564,67 @@ static void arm_smmu_tlb_inv_vmid_nosync(unsigned long iova, size_t size,
 	writel_relaxed(smmu_domain->cfg.vmid, base + ARM_SMMU_GR0_TLBIVMID);
 }
 
-static const struct iommu_gather_ops arm_smmu_s1_tlb_ops = {
-	.tlb_flush_all	= arm_smmu_tlb_inv_context_s1,
-	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
-	.tlb_sync	= arm_smmu_tlb_sync_context,
+static void arm_smmu_tlb_inv_walk(unsigned long iova, size_t size,
+				  size_t granule, void *cookie)
+{
+	struct arm_smmu_domain *smmu_domain = cookie;
+	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
+
+	ops->tlb_inv_range(iova, size, granule, false, cookie);
+	ops->tlb_sync(cookie);
+}
+
+static void arm_smmu_tlb_inv_leaf(unsigned long iova, size_t size,
+				  size_t granule, void *cookie)
+{
+	struct arm_smmu_domain *smmu_domain = cookie;
+	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
+
+	ops->tlb_inv_range(iova, size, granule, true, cookie);
+	ops->tlb_sync(cookie);
+}
+
+static void arm_smmu_tlb_add_page(struct iommu_iotlb_gather *gather,
+				  unsigned long iova, size_t granule,
+				  void *cookie)
+{
+	struct arm_smmu_domain *smmu_domain = cookie;
+	const struct arm_smmu_flush_ops *ops = smmu_domain->flush_ops;
+
+	ops->tlb_inv_range(iova, granule, granule, true, cookie);
+}
+
+static const struct arm_smmu_flush_ops arm_smmu_s1_tlb_ops = {
+	.tlb = {
+		.tlb_flush_all	= arm_smmu_tlb_inv_context_s1,
+		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+		.tlb_add_page	= arm_smmu_tlb_add_page,
+	},
+	.tlb_inv_range		= arm_smmu_tlb_inv_range_nosync,
+	.tlb_sync		= arm_smmu_tlb_sync_context,
 };
 
-static const struct iommu_gather_ops arm_smmu_s2_tlb_ops_v2 = {
-	.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
-	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
-	.tlb_sync	= arm_smmu_tlb_sync_context,
+static const struct arm_smmu_flush_ops arm_smmu_s2_tlb_ops_v2 = {
+	.tlb = {
+		.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+		.tlb_add_page	= arm_smmu_tlb_add_page,
+	},
+	.tlb_inv_range		= arm_smmu_tlb_inv_range_nosync,
+	.tlb_sync		= arm_smmu_tlb_sync_context,
 };
 
-static const struct iommu_gather_ops arm_smmu_s2_tlb_ops_v1 = {
-	.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
-	.tlb_add_flush	= arm_smmu_tlb_inv_vmid_nosync,
-	.tlb_sync	= arm_smmu_tlb_sync_vmid,
+static const struct arm_smmu_flush_ops arm_smmu_s2_tlb_ops_v1 = {
+	.tlb = {
+		.tlb_flush_all	= arm_smmu_tlb_inv_context_s2,
+		.tlb_flush_walk	= arm_smmu_tlb_inv_walk,
+		.tlb_flush_leaf	= arm_smmu_tlb_inv_leaf,
+		.tlb_add_page	= arm_smmu_tlb_add_page,
+	},
+	.tlb_inv_range		= arm_smmu_tlb_inv_vmid_nosync,
+	.tlb_sync		= arm_smmu_tlb_sync_vmid,
 };
 
 static irqreturn_t arm_smmu_context_fault(int irq, void *dev)
@@ -835,7 +904,7 @@ static int arm_smmu_init_domain_context(struct iommu_domain *domain,
 			ias = min(ias, 32UL);
 			oas = min(oas, 32UL);
 		}
-		smmu_domain->tlb_ops = &arm_smmu_s1_tlb_ops;
+		smmu_domain->flush_ops = &arm_smmu_s1_tlb_ops;
 		break;
 	case ARM_SMMU_DOMAIN_NESTED:
 		/*
@@ -855,9 +924,9 @@ static int arm_smmu_init_domain_context(struct iommu_domain *domain,
 			oas = min(oas, 40UL);
 		}
 		if (smmu->version == ARM_SMMU_V2)
-			smmu_domain->tlb_ops = &arm_smmu_s2_tlb_ops_v2;
+			smmu_domain->flush_ops = &arm_smmu_s2_tlb_ops_v2;
 		else
-			smmu_domain->tlb_ops = &arm_smmu_s2_tlb_ops_v1;
+			smmu_domain->flush_ops = &arm_smmu_s2_tlb_ops_v1;
 		break;
 	default:
 		ret = -EINVAL;
@@ -886,7 +955,7 @@ static int arm_smmu_init_domain_context(struct iommu_domain *domain,
 		.ias		= ias,
 		.oas		= oas,
 		.coherent_walk	= smmu->features & ARM_SMMU_FEAT_COHERENT_WALK,
-		.tlb		= smmu_domain->tlb_ops,
+		.tlb		= &smmu_domain->flush_ops->tlb,
 		.iommu_dev	= smmu->dev,
 	};
 
@@ -1294,7 +1363,7 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
 }
 
 static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
-			     size_t size)
+			     size_t size, struct iommu_iotlb_gather *gather)
 {
 	struct io_pgtable_ops *ops = to_smmu_domain(domain)->pgtbl_ops;
 	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
@@ -1304,7 +1373,7 @@ static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
 		return 0;
 
 	arm_smmu_rpm_get(smmu);
-	ret = ops->unmap(ops, iova, size);
+	ret = ops->unmap(ops, iova, size, gather);
 	arm_smmu_rpm_put(smmu);
 
 	return ret;
@@ -1315,21 +1384,22 @@ static void arm_smmu_flush_iotlb_all(struct iommu_domain *domain)
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 
-	if (smmu_domain->tlb_ops) {
+	if (smmu_domain->flush_ops) {
 		arm_smmu_rpm_get(smmu);
-		smmu_domain->tlb_ops->tlb_flush_all(smmu_domain);
+		smmu_domain->flush_ops->tlb.tlb_flush_all(smmu_domain);
 		arm_smmu_rpm_put(smmu);
 	}
 }
 
-static void arm_smmu_iotlb_sync(struct iommu_domain *domain)
+static void arm_smmu_iotlb_sync(struct iommu_domain *domain,
+				struct iommu_iotlb_gather *gather)
 {
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
 
-	if (smmu_domain->tlb_ops) {
+	if (smmu_domain->flush_ops) {
 		arm_smmu_rpm_get(smmu);
-		smmu_domain->tlb_ops->tlb_sync(smmu_domain);
+		smmu_domain->flush_ops->tlb_sync(smmu_domain);
 		arm_smmu_rpm_put(smmu);
 	}
 }
@@ -2037,7 +2107,6 @@ static const struct of_device_id arm_smmu_of_match[] = {
 	{ .compatible = "qcom,smmu-v2", .data = &qcom_smmuv2 },
 	{ },
 };
-MODULE_DEVICE_TABLE(of, arm_smmu_of_match);
 
 #ifdef CONFIG_ACPI
 static int acpi_smmu_get_data(u32 model, struct arm_smmu_device *smmu)
@@ -2315,12 +2384,12 @@ static int arm_smmu_legacy_bus_init(void)
 }
 device_initcall_sync(arm_smmu_legacy_bus_init);
 
-static int arm_smmu_device_remove(struct platform_device *pdev)
+static void arm_smmu_device_shutdown(struct platform_device *pdev)
 {
 	struct arm_smmu_device *smmu = platform_get_drvdata(pdev);
 
 	if (!smmu)
-		return -ENODEV;
+		return;
 
 	if (!bitmap_empty(smmu->context_map, ARM_SMMU_MAX_CBS))
 		dev_err(&pdev->dev, "removing device with active domains!\n");
@@ -2336,13 +2405,6 @@ static int arm_smmu_device_remove(struct platform_device *pdev)
 		clk_bulk_disable(smmu->num_clks, smmu->clks);
 
 	clk_bulk_unprepare(smmu->num_clks, smmu->clks);
-
-	return 0;
-}
-
-static void arm_smmu_device_shutdown(struct platform_device *pdev)
-{
-	arm_smmu_device_remove(pdev);
 }
 
 static int __maybe_unused arm_smmu_runtime_resume(struct device *dev)
@@ -2392,15 +2454,14 @@ static const struct dev_pm_ops arm_smmu_pm_ops = {
 
 static struct platform_driver arm_smmu_driver = {
 	.driver	= {
-		.name		= "arm-smmu",
-		.of_match_table	= of_match_ptr(arm_smmu_of_match),
-		.pm		= &arm_smmu_pm_ops,
+		.name			= "arm-smmu",
+		.of_match_table		= of_match_ptr(arm_smmu_of_match),
+		.pm			= &arm_smmu_pm_ops,
+		.suppress_bind_attrs	= true,
 	},
 	.probe	= arm_smmu_device_probe,
-	.remove	= arm_smmu_device_remove,
 	.shutdown = arm_smmu_device_shutdown,
 };
-module_platform_driver(arm_smmu_driver);
 
 IOMMU_OF_DECLARE(arm_smmuv1, "arm,smmu-v1");
 IOMMU_OF_DECLARE(arm_smmuv2, "arm,smmu-v2");
@@ -2408,7 +2469,4 @@ IOMMU_OF_DECLARE(arm_mmu400, "arm,mmu-400");
 IOMMU_OF_DECLARE(arm_mmu401, "arm,mmu-401");
 IOMMU_OF_DECLARE(arm_mmu500, "arm,mmu-500");
 IOMMU_OF_DECLARE(cavium_smmuv2, "cavium,smmu-v2");
-
-MODULE_DESCRIPTION("IOMMU API for ARM architected SMMU implementations");
-MODULE_AUTHOR("Will Deacon <will.deacon@arm.com>");
-MODULE_LICENSE("GPL v2");
+builtin_platform_driver(arm_smmu_driver);

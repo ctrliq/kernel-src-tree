@@ -7,12 +7,15 @@
 #define _RDMA_RESTRACK_H_
 
 #include <linux/typecheck.h>
-#include <linux/rwsem.h>
 #include <linux/sched.h>
 #include <linux/kref.h>
 #include <linux/completion.h>
 #include <linux/sched/task.h>
 #include <uapi/rdma/rdma_netlink.h>
+#include <linux/xarray.h>
+
+struct ib_device;
+struct sk_buff;
 
 /**
  * enum rdma_restrack_type - HW objects to track
@@ -43,35 +46,13 @@ enum rdma_restrack_type {
 	 */
 	RDMA_RESTRACK_CTX,
 	/**
+	 * @RDMA_RESTRACK_COUNTER: Statistic Counter
+	 */
+	RDMA_RESTRACK_COUNTER,
+	/**
 	 * @RDMA_RESTRACK_MAX: Last entry, used for array dclarations
 	 */
 	RDMA_RESTRACK_MAX
-};
-
-#define RDMA_RESTRACK_HASH_BITS	8
-struct ib_device;
-struct rdma_restrack_entry;
-
-/**
- * struct rdma_restrack_root - main resource tracking management
- * entity, per-device
- */
-struct rdma_restrack_root {
-	/*
-	 * @rwsem: Read/write lock to protect lists
-	 */
-	struct rw_semaphore	rwsem;
-	/**
-	 * @hash: global database for all resources per-device
-	 */
-	DECLARE_HASHTABLE(hash, RDMA_RESTRACK_HASH_BITS);
-	/**
-	 * @fill_res_entry: driver-specific fill function
-	 *
-	 * Allows rdma drivers to add their own restrack attributes.
-	 */
-	int (*fill_res_entry)(struct sk_buff *msg,
-			      struct rdma_restrack_entry *entry);
 };
 
 /**
@@ -110,10 +91,6 @@ struct rdma_restrack_entry {
 	 */
 	const char		*kern_name;
 	/**
-	 * @node: hash table entry
-	 */
-	struct hlist_node	node;
-	/**
 	 * @type: various objects in restrack database
 	 */
 	enum rdma_restrack_type	type;
@@ -121,13 +98,14 @@ struct rdma_restrack_entry {
 	 * @user: user resource
 	 */
 	bool			user;
+	/**
+	 * @id: ID to expose to users
+	 */
+	u32 id;
 };
 
-void rdma_restrack_init(struct ib_device *dev);
-void rdma_restrack_clean(struct ib_device *dev);
 int rdma_restrack_count(struct ib_device *dev,
-			enum rdma_restrack_type type,
-			struct pid_namespace *ns);
+			enum rdma_restrack_type type);
 
 void rdma_restrack_kadd(struct rdma_restrack_entry *res);
 void rdma_restrack_uadd(struct rdma_restrack_entry *res);

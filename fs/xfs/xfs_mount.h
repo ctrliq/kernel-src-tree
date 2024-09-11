@@ -60,6 +60,20 @@ struct xfs_error_cfg {
 typedef struct xfs_mount {
 	struct super_block	*m_super;
 	xfs_tid_t		m_tid;		/* next unused tid for fs */
+
+	/*
+	 * Bitsets of per-fs metadata that have been checked and/or are sick.
+	 * Callers must hold m_sb_lock to access these two fields.
+	 */
+	uint8_t			m_fs_checked;
+	uint8_t			m_fs_sick;
+	/*
+	 * Bitsets of rt metadata that have been checked and/or are sick.
+	 * Callers must hold m_sb_lock to access this field.
+	 */
+	uint8_t			m_rt_checked;
+	uint8_t			m_rt_sick;
+
 	struct xfs_ail		*m_ail;		/* fs active log item list */
 
 	struct xfs_sb		m_sb;		/* copy of fs superblock */
@@ -327,13 +341,6 @@ xfs_daddr_to_agbno(struct xfs_mount *mp, xfs_daddr_t d)
 }
 
 /* per-AG block reservation data structures*/
-enum xfs_ag_resv_type {
-	XFS_AG_RESV_NONE = 0,
-	XFS_AG_RESV_AGFL,
-	XFS_AG_RESV_METADATA,
-	XFS_AG_RESV_RMAPBT,
-};
-
 struct xfs_ag_resv {
 	/* number of blocks originally reserved here */
 	xfs_extlen_t			ar_orig_reserved;
@@ -373,6 +380,15 @@ typedef struct xfs_perag {
 	xfs_agino_t	pagl_pagino;
 	xfs_agino_t	pagl_leftrec;
 	xfs_agino_t	pagl_rightrec;
+
+	/*
+	 * Bitsets of per-ag metadata that have been checked and/or are sick.
+	 * Callers should hold pag_state_lock before accessing this field.
+	 */
+	uint16_t	pag_checked;
+	uint16_t	pag_sick;
+	spinlock_t	pag_state_lock;
+
 	spinlock_t	pagb_lock;	/* lock for pagb_tree */
 	struct rb_root	pagb_tree;	/* ordered tree of busy extents */
 	unsigned int	pagb_gen;	/* generation count for pagb_tree */
@@ -401,6 +417,13 @@ typedef struct xfs_perag {
 
 	/* reference count */
 	uint8_t			pagf_refcount_level;
+
+	/*
+	 * Unlinked inode information.  This incore information reflects
+	 * data stored in the AGI, so callers must hold the AGI buffer lock
+	 * or have some other means to control concurrency.
+	 */
+	struct rhashtable	pagi_unlinked_hash;
 } xfs_perag_t;
 
 static inline struct xfs_ag_resv *

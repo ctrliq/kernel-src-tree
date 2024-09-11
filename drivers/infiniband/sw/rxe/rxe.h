@@ -65,10 +65,6 @@
  */
 #define RXE_UVERBS_ABI_VERSION		2
 
-#define RDMA_LINK_PHYS_STATE_LINK_UP	(5)
-#define RDMA_LINK_PHYS_STATE_DISABLED	(3)
-#define RDMA_LINK_PHYS_STATE_POLLING	(2)
-
 #define RXE_ROCE_V2_SPORT		(0xc000)
 
 static inline u32 rxe_crc32(struct rxe_dev *rxe,
@@ -95,17 +91,9 @@ static inline u32 rxe_crc32(struct rxe_dev *rxe,
 
 void rxe_set_mtu(struct rxe_dev *rxe, unsigned int dev_mtu);
 
-int rxe_add(struct rxe_dev *rxe, unsigned int mtu);
-void rxe_remove(struct rxe_dev *rxe);
-void rxe_remove_all(void);
+int rxe_add(struct rxe_dev *rxe, unsigned int mtu, const char *ibdev_name);
 
 void rxe_rcv(struct sk_buff *skb);
-
-static inline void rxe_dev_put(struct rxe_dev *rxe)
-{
-	kref_put(&rxe->ref_cnt, rxe_release);
-}
-struct rxe_dev *get_rxe_by_name(const char *name);
 
 /* The caller must do a matching ib_device_put(&dev->ib_dev) */
 static inline struct rxe_dev *rxe_get_dev_from_net(struct net_device *ndev)

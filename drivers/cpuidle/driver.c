@@ -252,7 +252,7 @@ static void __cpuidle_unregister_driver(struct cpuidle_driver *drv)
  * Returns 0 on success, a negative error code (returned by
  * __cpuidle_register_driver()) otherwise.
  */
-int cpuidle_register_driver(struct cpuidle_driver *drv)
+static int _cpuidle_register_driver(struct cpuidle_driver *drv, const char *governor)
 {
 	struct cpuidle_governor *gov;
 	int ret;
@@ -261,10 +261,10 @@ int cpuidle_register_driver(struct cpuidle_driver *drv)
 	ret = __cpuidle_register_driver(drv);
 	spin_unlock(&cpuidle_driver_lock);
 
-	if (!ret && !strlen(param_governor) && drv->governor &&
+	if (!ret && !strlen(param_governor) && governor &&
 	    (cpuidle_get_driver() == drv)) {
 		mutex_lock(&cpuidle_lock);
-		gov = cpuidle_find_governor(drv->governor);
+		gov = cpuidle_find_governor(governor);
 		if (gov) {
 			cpuidle_prev_governor = cpuidle_curr_governor;
 			if (cpuidle_switch_governor(gov) < 0)
@@ -275,7 +275,23 @@ int cpuidle_register_driver(struct cpuidle_driver *drv)
 
 	return ret;
 }
+
+int cpuidle_register_driver(struct cpuidle_driver *drv)
+{
+	return _cpuidle_register_driver(drv, NULL);
+}
 EXPORT_SYMBOL_GPL(cpuidle_register_driver);
+
+
+int rhel_cpuidle_register_driver_hpoll(struct cpuidle_driver *drv)
+{
+	/* only haltpoll driver should use this RHEL-only, temporary interface */
+	if (drv->name && strlen(drv->name) == 8 && strncmp(drv->name, "haltpoll", 8) == 0)
+		return _cpuidle_register_driver(drv, "haltpoll");
+
+	return -EINVAL;
+}
+EXPORT_SYMBOL_GPL(rhel_cpuidle_register_driver_hpoll);
 
 /**
  * cpuidle_unregister_driver - unregisters a driver

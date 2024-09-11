@@ -986,7 +986,7 @@ void gfs2_freeze_func(struct work_struct *work)
 		gfs2_glock_dq_uninit(&freeze_gh);
 	}
 	deactivate_super(sb);
-	clear_bit_unlock(SDF_FS_FROZEN, &sdp->sd_flags);
+	clear_bit(SDF_FS_FROZEN, &sdp->sd_flags);
 	wake_up_bit(&sdp->sd_flags, SDF_FS_FROZEN);
 	return;
 }

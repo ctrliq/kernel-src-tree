@@ -44,6 +44,7 @@
 #include "nfp_net.h"
 #include "nfp_net_sriov.h"
 #include "nfp_port.h"
+#include "crypto/crypto.h"
 
 /**
  * nfp_net_get_fw_version() - Read and parse the FW version
@@ -270,7 +271,7 @@ static void nfp_net_reconfig_wait_posted(struct nfp_net *nn)
  *
  * Return: Negative errno on error, 0 on success
  */
-static int __nfp_net_reconfig(struct nfp_net *nn, u32 update)
+int __nfp_net_reconfig(struct nfp_net *nn, u32 update)
 {
 	int ret;
 
@@ -3623,8 +3624,7 @@ const struct net_device_ops nfp_net_netdev_ops = {
 	.ndo_udp_tunnel_add	= nfp_net_add_vxlan_port,
 	.ndo_udp_tunnel_del	= nfp_net_del_vxlan_port,
 	.ndo_bpf		= nfp_net_xdp,
-	.ndo_get_port_parent_id	= nfp_port_get_port_parent_id,
-	.ndo_get_devlink	= nfp_devlink_get_devlink,
+	.ndo_get_devlink_port	= nfp_devlink_get_devlink_port,
 };
 
 /**
@@ -4031,8 +4031,13 @@ int nfp_net_init(struct nfp_net *nn)
 	if (err)
 		return err;
 
-	if (nn->dp.netdev)
+	if (nn->dp.netdev) {
 		nfp_net_netdev_init(nn);
+
+		err = nfp_net_tls_init(nn);
+		if (err)
+			return err;
+	}
 
 	nfp_net_vecs_init(nn);
 

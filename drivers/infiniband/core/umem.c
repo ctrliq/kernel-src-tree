@@ -187,15 +187,16 @@ EXPORT_SYMBOL(ib_umem_find_best_pgsz);
  * If access flags indicate ODP memory, avoid pinning. Instead, stores
  * the mm for future page fault handling in conjunction with MMU notifiers.
  *
- * @context: userspace context to pin memory for
+ * @udata: userspace context to pin memory for
  * @addr: userspace virtual address to start at
  * @size: length of region to pin
  * @access: IB_ACCESS_xxx flags for memory being pinned
  * @dmasync: flush in-flight DMA when the memory region is written
  */
-struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
+struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 			    size_t size, int access, int dmasync)
 {
+	struct ib_ucontext *context;
 	struct ib_umem *umem;
 	struct page **page_list;
 	unsigned long lock_limit;
@@ -207,6 +208,14 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
 	unsigned long dma_attrs = 0;
 	struct scatterlist *sg;
 	unsigned int gup_flags = FOLL_WRITE;
+
+	if (!udata)
+		return ERR_PTR(-EIO);
+
+	context = container_of(udata, struct uverbs_attr_bundle, driver_udata)
+			  ->context;
+	if (!context)
+		return ERR_PTR(-EIO);
 
 	if (dmasync)
 		dma_attrs |= DMA_ATTR_WRITE_BARRIER;
@@ -236,7 +245,6 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
 	umem->context    = context;
 	umem->length     = size;
 	umem->address    = addr;
-	umem->page_shift = PAGE_SHIFT;
 	umem->writable   = ib_access_writable(access);
 	umem->owning_mm = mm = current->mm;
 	mmgrab(mm);
@@ -287,10 +295,11 @@ struct ib_umem *ib_umem_get(struct ib_ucontext *context, unsigned long addr,
 
 	while (npages) {
 		down_read(&mm->mmap_sem);
-		ret = get_user_pages_longterm(cur_base,
+		ret = get_user_pages(cur_base,
 				     min_t(unsigned long, npages,
 					   PAGE_SIZE / sizeof (struct page *)),
-				     gup_flags, page_list, NULL);
+				     gup_flags | FOLL_LONGTERM,
+				     page_list, NULL);
 		if (ret < 0) {
 			up_read(&mm->mmap_sem);
 			goto umem_release;
@@ -352,6 +361,9 @@ static void __ib_umem_release_tail(struct ib_umem *umem)
  */
 void ib_umem_release(struct ib_umem *umem)
 {
+	if (!umem)
+		return;
+
 	if (umem->is_odp) {
 		ib_umem_odp_release(to_ib_umem_odp(umem));
 		__ib_umem_release_tail(umem);
@@ -367,16 +379,11 @@ EXPORT_SYMBOL(ib_umem_release);
 
 int ib_umem_page_count(struct ib_umem *umem)
 {
-	int i;
-	int n;
+	int i, n = 0;
 	struct scatterlist *sg;
 
-	if (umem->is_odp)
-		return ib_umem_num_pages(umem);
-
-	n = 0;
 	for_each_sg(umem->sg_head.sgl, sg, umem->nmap, i)
-		n += sg_dma_len(sg) >> umem->page_shift;
+		n += sg_dma_len(sg) >> PAGE_SHIFT;
 
 	return n;
 }

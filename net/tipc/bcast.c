@@ -87,9 +87,9 @@ int tipc_bcast_get_mtu(struct net *net)
 	return tipc_link_mtu(tipc_bc_sndlink(net)) - INT_H_SIZE;
 }
 
-void tipc_bcast_disable_rcast(struct net *net)
+void tipc_bcast_toggle_rcast(struct net *net, bool supp)
 {
-	tipc_bc_base(net)->rcast_support = false;
+	tipc_bc_base(net)->rcast_support = supp;
 }
 
 static void tipc_bcbase_calc_bc_threshold(struct net *net)
@@ -185,7 +185,7 @@ static void tipc_bcbase_xmit(struct net *net, struct sk_buff_head *xmitq)
 	}
 
 	/* We have to transmit across all bearers */
-	skb_queue_head_init(&_xmitq);
+	__skb_queue_head_init(&_xmitq);
 	for (bearer_id = 0; bearer_id < MAX_BEARERS; bearer_id++) {
 		if (!bb->dests[bearer_id])
 			continue;
@@ -256,7 +256,7 @@ static int tipc_bcast_xmit(struct net *net, struct sk_buff_head *pkts,
 	struct sk_buff_head xmitq;
 	int rc = 0;
 
-	skb_queue_head_init(&xmitq);
+	__skb_queue_head_init(&xmitq);
 	tipc_bcast_lock(net);
 	if (tipc_link_bc_peers(l))
 		rc = tipc_link_xmit(l, pkts, &xmitq);
@@ -286,7 +286,7 @@ static int tipc_rcast_xmit(struct net *net, struct sk_buff_head *pkts,
 	u32 dnode, selector;
 
 	selector = msg_link_selector(buf_msg(skb_peek(pkts)));
-	skb_queue_head_init(&_pkts);
+	__skb_queue_head_init(&_pkts);
 
 	list_for_each_entry_safe(dst, tmp, &dests->list, list) {
 		dnode = dst->node;
@@ -345,7 +345,7 @@ static int tipc_mcast_send_sync(struct net *net, struct sk_buff *skb,
 	msg_set_is_rcast(_hdr, !msg_is_rcast(hdr));
 	msg_set_errcode(_hdr, TIPC_ERR_NO_PORT);
 
-	skb_queue_head_init(&tmpq);
+	__skb_queue_head_init(&tmpq);
 	__skb_queue_tail(&tmpq, _skb);
 	if (method->rcast)
 		rc = tipc_bcast_xmit(net, &tmpq, &cong_link_cnt);
@@ -379,7 +379,7 @@ int tipc_mcast_xmit(struct net *net, struct sk_buff_head *pkts,
 	int rc = 0;
 
 	skb_queue_head_init(&inputq);
-	skb_queue_head_init(&localq);
+	__skb_queue_head_init(&localq);
 
 	/* Clone packets before they are consumed by next call */
 	if (dests->local && !tipc_msg_reassemble(pkts, &localq)) {

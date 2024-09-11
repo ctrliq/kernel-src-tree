@@ -81,8 +81,8 @@ struct nfs4_ff_layout_mirror {
 	u32				fh_versions_cnt;
 	struct nfs_fh			*fh_versions;
 	nfs4_stateid			stateid;
-	struct rpc_cred	__rcu		*ro_cred;
-	struct rpc_cred	__rcu		*rw_cred;
+	const struct cred __rcu		*ro_cred;
+	const struct cred __rcu		*rw_cred;
 	refcount_t			ref;
 	spinlock_t			lock;
 	unsigned long			flags;
@@ -209,16 +209,17 @@ nfs4_ff_layout_select_ds_stateid(const struct nfs4_ff_layout_mirror *mirror,
 		nfs4_stateid *stateid);
 
 struct nfs4_pnfs_ds *
-nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg, u32 ds_idx,
+nfs4_ff_layout_prepare_ds(struct pnfs_layout_segment *lseg,
+			  struct nfs4_ff_layout_mirror *mirror,
 			  bool fail_return);
 
 struct rpc_clnt *
-nfs4_ff_find_or_create_ds_client(struct pnfs_layout_segment *lseg,
-				 u32 ds_idx,
+nfs4_ff_find_or_create_ds_client(struct nfs4_ff_layout_mirror *mirror,
 				 struct nfs_client *ds_clp,
 				 struct inode *inode);
-struct rpc_cred *ff_layout_get_ds_cred(struct pnfs_layout_segment *lseg,
-				       u32 ds_idx, struct rpc_cred *mdscred);
+const struct cred *ff_layout_get_ds_cred(struct nfs4_ff_layout_mirror *mirror,
+					 const struct pnfs_layout_range *range,
+					 const struct cred *mdscred);
 bool ff_layout_avoid_mds_available_ds(struct pnfs_layout_segment *lseg);
 bool ff_layout_avoid_read_on_rw(struct pnfs_layout_segment *lseg);
 

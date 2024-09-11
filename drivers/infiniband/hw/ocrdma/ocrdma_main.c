@@ -144,6 +144,10 @@ static const struct attribute_group ocrdma_attr_group = {
 };
 
 static const struct ib_device_ops ocrdma_dev_ops = {
+	.owner = THIS_MODULE,
+	.driver_id = RDMA_DRIVER_OCRDMA,
+	.uverbs_abi_ver = OCRDMA_ABI_VERSION,
+
 	.alloc_mr = ocrdma_alloc_mr,
 	.alloc_pd = ocrdma_alloc_pd,
 	.alloc_ucontext = ocrdma_alloc_ucontext,
@@ -176,6 +180,11 @@ static const struct ib_device_ops ocrdma_dev_ops = {
 	.reg_user_mr = ocrdma_reg_user_mr,
 	.req_notify_cq = ocrdma_arm_cq,
 	.resize_cq = ocrdma_resize_cq,
+
+	INIT_RDMA_OBJ_SIZE(ib_ah, ocrdma_ah, ibah),
+	INIT_RDMA_OBJ_SIZE(ib_cq, ocrdma_cq, ibcq),
+	INIT_RDMA_OBJ_SIZE(ib_pd, ocrdma_pd, ibpd),
+	INIT_RDMA_OBJ_SIZE(ib_ucontext, ocrdma_ucontext, ibucontext),
 };
 
 static const struct ib_device_ops ocrdma_dev_srq_ops = {
@@ -184,6 +193,8 @@ static const struct ib_device_ops ocrdma_dev_srq_ops = {
 	.modify_srq = ocrdma_modify_srq,
 	.post_srq_recv = ocrdma_post_srq_recv,
 	.query_srq = ocrdma_query_srq,
+
+	INIT_RDMA_OBJ_SIZE(ib_srq, ocrdma_srq, ibsrq),
 };
 
 static int ocrdma_register_device(struct ocrdma_dev *dev)
@@ -194,8 +205,6 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
 	BUILD_BUG_ON(sizeof(OCRDMA_NODE_DESC) > IB_DEVICE_NODE_DESC_MAX);
 	memcpy(dev->ibdev.node_desc, OCRDMA_NODE_DESC,
 	       sizeof(OCRDMA_NODE_DESC));
-	dev->ibdev.owner = THIS_MODULE;
-	dev->ibdev.uverbs_abi_ver = OCRDMA_ABI_VERSION;
 	dev->ibdev.uverbs_cmd_mask =
 	    OCRDMA_UVERBS(GET_CONTEXT) |
 	    OCRDMA_UVERBS(QUERY_DEVICE) |
@@ -243,7 +252,6 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
 		ib_set_device_ops(&dev->ibdev, &ocrdma_dev_srq_ops);
 	}
 	rdma_set_device_sysfs_group(&dev->ibdev, &ocrdma_attr_group);
-	dev->ibdev.driver_id = RDMA_DRIVER_OCRDMA;
 	ret = ib_device_set_netdev(&dev->ibdev, dev->nic_info.netdev, 1);
 	if (ret)
 		return ret;

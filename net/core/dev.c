@@ -146,6 +146,7 @@
 #include <net/udp_tunnel.h>
 #include <linux/net_namespace.h>
 #include <linux/indirect_call_wrapper.h>
+#include <net/devlink.h>
 
 #include "net-sysfs.h"
 
@@ -3966,9 +3967,9 @@ EXPORT_SYMBOL(rps_sock_flow_table);
 u32 rps_cpu_mask __read_mostly;
 EXPORT_SYMBOL(rps_cpu_mask);
 
-struct static_key rps_needed __read_mostly;
+struct static_key_false rps_needed __read_mostly;
 EXPORT_SYMBOL(rps_needed);
-struct static_key rfs_needed __read_mostly;
+struct static_key_false rfs_needed __read_mostly;
 EXPORT_SYMBOL(rfs_needed);
 
 static struct rps_dev_flow *
@@ -4481,25 +4482,8 @@ static int netif_rx_internal(struct sk_buff *skb)
 
 	trace_netif_rx(skb);
 
-	if (static_branch_unlikely(&generic_xdp_needed_key)) {
-		int ret;
-
-		preempt_disable();
-		rcu_read_lock();
-		ret = do_xdp_generic(rcu_dereference(skb->dev->xdp_prog), skb);
-		rcu_read_unlock();
-		preempt_enable();
-
-		/* Consider XDP consuming the packet a success from
-		 * the netdev point of view we do not want to count
-		 * this as an error.
-		 */
-		if (ret != XDP_PASS)
-			return NET_RX_SUCCESS;
-	}
-
 #ifdef CONFIG_RPS
-	if (static_key_false(&rps_needed)) {
+	if (static_branch_unlikely(&rps_needed)) {
 		struct rps_dev_flow voidflow, *rflow = &voidflow;
 		int cpu;
 
@@ -4828,6 +4812,18 @@ another_round:
 
 	__this_cpu_inc(softnet_data.processed);
 
+	if (static_branch_unlikely(&generic_xdp_needed_key)) {
+		int ret2;
+
+		preempt_disable();
+		ret2 = do_xdp_generic(rcu_dereference(skb->dev->xdp_prog), skb);
+		preempt_enable();
+
+		if (ret2 != XDP_PASS)
+			return NET_RX_DROP;
+		skb_reset_mac_len(skb);
+	}
+
 	if (skb->protocol == cpu_to_be16(ETH_P_8021Q) ||
 	    skb->protocol == cpu_to_be16(ETH_P_8021AD)) {
 		skb = skb_vlan_untag(skb);
@@ -5046,22 +5042,9 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
 	if (skb_defer_rx_timestamp(skb))
 		return NET_RX_SUCCESS;
 
-	if (static_branch_unlikely(&generic_xdp_needed_key)) {
-		int ret;
-
-		preempt_disable();
-		rcu_read_lock();
-		ret = do_xdp_generic(rcu_dereference(skb->dev->xdp_prog), skb);
-		rcu_read_unlock();
-		preempt_enable();
-
-		if (ret != XDP_PASS)
-			return NET_RX_DROP;
-	}
-
 	rcu_read_lock();
 #ifdef CONFIG_RPS
-	if (static_key_false(&rps_needed)) {
+	if (static_branch_unlikely(&rps_needed)) {
 		struct rps_dev_flow voidflow, *rflow = &voidflow;
 		int cpu = get_rps_cpu(skb->dev, skb, &rflow);
 
@@ -5076,6 +5059,12 @@ static int netif_receive_skb_internal(struct sk_buff *skb)
 	rcu_read_unlock();
 	return ret;
 }
+
+/* RHEL: when backporting netif_receive_skb_list_internal (upstream commit
+ * 7da517a3bc52), don't forget to also backport the relevant hunks from
+ * commits dc05360fee66 and 458bf2f224f0, those commits were applied only
+ * partially. Then, remove this comment.
+ */
 
 /**
  *	netif_receive_skb - process receive buffer from network
@@ -7404,7 +7393,8 @@ int __dev_set_mtu(struct net_device *dev, int new_mtu)
 	if (ops->ndo_change_mtu)
 		return ops->ndo_change_mtu(dev, new_mtu);
 
-	dev->mtu = new_mtu;
+	/* Pairs with all the lockless reads of dev->mtu in the stack */
+	WRITE_ONCE(dev->mtu, new_mtu);
 	return 0;
 }
 EXPORT_SYMBOL(__dev_set_mtu);
@@ -7631,10 +7621,14 @@ int dev_get_phys_port_name(struct net_device *dev,
 			   char *name, size_t len)
 {
 	const struct net_device_ops *ops = dev->netdev_ops;
+	int err;
 
-	if (!ops->ndo_get_phys_port_name)
-		return -EOPNOTSUPP;
-	return ops->ndo_get_phys_port_name(dev, name, len);
+	if (ops->ndo_get_phys_port_name) {
+		err = ops->ndo_get_phys_port_name(dev, name, len);
+		if (err != -EOPNOTSUPP)
+			return err;
+	}
+	return devlink_compat_phys_port_name_get(dev, name, len);
 }
 EXPORT_SYMBOL(dev_get_phys_port_name);
 
@@ -7654,13 +7648,20 @@ int dev_get_port_parent_id(struct net_device *dev,
 	struct netdev_phys_item_id first = { };
 	struct net_device *lower_dev;
 	struct list_head *iter;
-	int err = -EOPNOTSUPP;
+	int err;
 
-	if (ops->ndo_get_port_parent_id)
-		return ops->ndo_get_port_parent_id(dev, ppid);
+	if (ops->ndo_get_port_parent_id) {
+		err = ops->ndo_get_port_parent_id(dev, ppid);
+		if (err != -EOPNOTSUPP)
+			return err;
+	}
+
+	err = devlink_compat_switch_id_get(dev, ppid);
+	if (!err || err != -EOPNOTSUPP)
+		return err;
 
 	if (!recurse)
-		return err;
+		return -EOPNOTSUPP;
 
 	netdev_for_each_lower_dev(dev, lower_dev, iter) {
 		err = dev_get_port_parent_id(lower_dev, ppid, recurse);
@@ -7794,13 +7795,15 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
 	enum bpf_netdev_command query;
 	struct bpf_prog *prog = NULL;
 	bpf_op_t bpf_op, bpf_chk;
+	bool offload;
 	int err;
 
 	ASSERT_RTNL();
 
 	rh_mark_used_feature("eBPF/xdp");
 
-	query = flags & XDP_FLAGS_HW_MODE ? XDP_QUERY_PROG_HW : XDP_QUERY_PROG;
+	offload = flags & XDP_FLAGS_HW_MODE;
+	query = offload ? XDP_QUERY_PROG_HW : XDP_QUERY_PROG;
 
 	bpf_op = bpf_chk = ops->ndo_bpf;
 	if (!bpf_op && (flags & (XDP_FLAGS_DRV_MODE | XDP_FLAGS_HW_MODE))) {
@@ -7813,8 +7816,7 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
 		bpf_chk = generic_xdp_install;
 
 	if (fd >= 0) {
-		if (__dev_xdp_query(dev, bpf_chk, XDP_QUERY_PROG) ||
-		    __dev_xdp_query(dev, bpf_chk, XDP_QUERY_PROG_HW)) {
+		if (!offload && __dev_xdp_query(dev, bpf_chk, XDP_QUERY_PROG)) {
 			NL_SET_ERR_MSG(extack, "native and generic XDP can't be active at the same time");
 			return -EEXIST;
 		}
@@ -7829,8 +7831,7 @@ int dev_change_xdp_fd(struct net_device *dev, struct netlink_ext_ack *extack,
 		if (IS_ERR(prog))
 			return PTR_ERR(prog);
 
-		if (!(flags & XDP_FLAGS_HW_MODE) &&
-		    bpf_prog_is_dev_bound(prog->aux)) {
+		if (!offload && bpf_prog_is_dev_bound(prog->aux)) {
 			NL_SET_ERR_MSG(extack, "using device-bound program without HW_MODE flag is not supported");
 			bpf_prog_put(prog);
 			return -EINVAL;

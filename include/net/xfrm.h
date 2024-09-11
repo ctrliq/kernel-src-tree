@@ -15,6 +15,7 @@
 #include <linux/audit.h>
 #include <linux/slab.h>
 #include <linux/refcount.h>
+#include <linux/rh_kabi.h>
 
 #include <net/sock.h>
 #include <net/dst.h>
@@ -141,6 +142,13 @@ struct xfrm_state_offload {
 	RH_KABI_RESERVE(4)
 };
 
+/* This is only defined to protect KABI in xfrm_state */
+struct tasklet_hrtimer {
+	struct hrtimer          timer;
+	struct tasklet_struct   tasklet;
+	enum hrtimer_restart    (*function)(struct hrtimer *);
+};
+
 /* Full description of state of transformer. */
 struct xfrm_state {
 	possible_net_t		xs_net;
@@ -227,7 +235,7 @@ struct xfrm_state {
 	struct xfrm_stats	stats;
 
 	struct xfrm_lifetime_cur curlft;
-	struct hrtimer		mtimer;
+	RH_KABI_REPLACE(struct tasklet_hrtimer mtimer, struct hrtimer mtimer)
 
 	struct xfrm_state_offload xso;
 
@@ -235,7 +243,7 @@ struct xfrm_state {
 	long		saved_tmo;
 
 	/* Last used time */
-	time64_t		lastused;
+	RH_KABI_REPLACE(unsigned long lastused, time64_t lastused)
 
 	struct page_frag xfrag;
 
@@ -609,6 +617,9 @@ struct xfrm_policy {
 	struct xfrm_tmpl       	xfrm_vec[XFRM_MAX_DEPTH];
 	struct rcu_head		rcu;
 	RH_KABI_EXTEND(u32	if_id)
+	RH_KABI_EXTEND(u32	pos)
+	RH_KABI_EXTEND(struct hlist_node	bydst_inexact_list)
+	RH_KABI_EXTEND(bool	bydst_reinsert)
 };
 
 static inline struct net *xp_net(const struct xfrm_policy *xp)
@@ -1109,6 +1120,11 @@ struct xfrm_offload {
 };
 
 struct sec_path {
+	/* RHEL: There is RHEL specific helper function __rh_skb_ext_put()
+	 * that assumes that this refcnt field is the 1st field in this
+	 * struct and its type is refcount_t. If you really need to break
+	 * this assumption please modify the mentioned function properly.
+	 */
 	refcount_t		refcnt;
 	int			len;
 	int			olen;
@@ -1116,6 +1132,11 @@ struct sec_path {
 	struct xfrm_state	*xvec[XFRM_MAX_DEPTH];
 	struct xfrm_offload	ovec[XFRM_MAX_OFFLOAD_DEPTH];
 };
+
+static_assert(offsetof(struct sec_path, refcnt) == 0,
+	      "The position of field refcnt in struct sec_path was changed. "
+	      "Please look on its declaration in " __FILE__
+	      " for more details.");
 
 static inline int secpath_exists(struct sk_buff *skb)
 {
@@ -1139,6 +1160,11 @@ void __secpath_destroy(struct sec_path *sp);
 static inline void
 secpath_put(struct sec_path *sp)
 {
+	/* RHEL: There is function __rh_skb_ext_put() defined in header
+	 * <linux/skbuff.h> that reuses the content of this function because
+	 * it cannot call it directly. If you need to modify this function
+	 * then please modify also __rh_skb_ext_put() accordingly.
+	 */
 	if (sp && refcount_dec_and_test(&sp->refcnt))
 		__secpath_destroy(sp);
 }

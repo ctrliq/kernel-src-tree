@@ -691,7 +691,7 @@ static bool khugepaged_scan_abort(int nid)
 	for (i = 0; i < MAX_NUMNODES; i++) {
 		if (!khugepaged_node_load[i])
 			continue;
-		if (node_distance(nid, i) > RECLAIM_DISTANCE)
+		if (node_distance(nid, i) > node_reclaim_distance)
 			return true;
 	}
 	return false;
@@ -880,7 +880,8 @@ static bool __collapse_huge_page_swapin(struct mm_struct *mm,
 					unsigned long address, pmd_t *pmd,
 					int referenced)
 {
-	int swapped_in = 0, ret = 0;
+	int swapped_in = 0;
+	vm_fault_t ret = 0;
 	struct vm_fault vmf = {
 		.vma = vma,
 		.address = address,

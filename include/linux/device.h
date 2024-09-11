@@ -169,8 +169,8 @@ void subsys_dev_iter_exit(struct subsys_dev_iter *iter);
 int bus_for_each_dev(struct bus_type *bus, struct device *start, void *data,
 		     int (*fn)(struct device *dev, void *data));
 struct device *bus_find_device(struct bus_type *bus, struct device *start,
-			       void *data,
-			       int (*match)(struct device *dev, void *data));
+			       const void *data,
+			       int (*match)(struct device *dev, const void *data));
 struct device *bus_find_device_by_name(struct bus_type *bus,
 				       struct device *start,
 				       const char *name);
@@ -352,6 +352,9 @@ extern int __must_check driver_for_each_device(struct device_driver *drv,
 struct device *driver_find_device(struct device_driver *drv,
 				  struct device *start, void *data,
 				  int (*match)(struct device *dev, void *data));
+
+int driver_deferred_probe_check_state(struct device *dev);
+int driver_deferred_probe_check_state_continue(struct device *dev);
 
 /**
  * struct subsys_interface - interfaces to device functions
@@ -727,6 +730,7 @@ void __iomem *devm_ioremap_resource(struct device *dev, struct resource *res);
 /* allows to add/remove a custom action to devres stack */
 int devm_add_action(struct device *dev, void (*action)(void *), void *data);
 void devm_remove_action(struct device *dev, void (*action)(void *), void *data);
+void devm_release_action(struct device *dev, void (*action)(void *), void *data);
 
 static inline int devm_add_action_or_reset(struct device *dev,
 					   void (*action)(void *), void *data)

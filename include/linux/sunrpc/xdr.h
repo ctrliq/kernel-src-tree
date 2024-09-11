@@ -18,6 +18,7 @@
 #include <asm/unaligned.h>
 #include <linux/scatterlist.h>
 
+struct bio_vec;
 struct rpc_rqst;
 
 /*
@@ -52,6 +53,7 @@ struct xdr_buf {
 	struct kvec	head[1],	/* RPC header + non-page data */
 			tail[1];	/* Appended after page data */
 
+	struct bio_vec	*bvec;
 	struct page **	pages;		/* Array of pages */
 	unsigned int	page_base,	/* Start of page data */
 			page_len,	/* Length of page data */
@@ -70,6 +72,7 @@ xdr_buf_init(struct xdr_buf *buf, void *start, size_t len)
 	buf->head[0].iov_base = start;
 	buf->head[0].iov_len = len;
 	buf->tail[0].iov_len = 0;
+	buf->pages = NULL;
 	buf->page_len = 0;
 	buf->flags = 0;
 	buf->len = 0;
@@ -84,6 +87,16 @@ xdr_buf_init(struct xdr_buf *buf, void *start, size_t len)
 #define	xdr_one		cpu_to_be32(1)
 #define	xdr_two		cpu_to_be32(2)
 
+#define	rpc_auth_null	cpu_to_be32(RPC_AUTH_NULL)
+#define	rpc_auth_unix	cpu_to_be32(RPC_AUTH_UNIX)
+#define	rpc_auth_short	cpu_to_be32(RPC_AUTH_SHORT)
+#define	rpc_auth_gss	cpu_to_be32(RPC_AUTH_GSS)
+
+#define	rpc_call	cpu_to_be32(RPC_CALL)
+#define	rpc_reply	cpu_to_be32(RPC_REPLY)
+
+#define	rpc_msg_accepted	cpu_to_be32(RPC_MSG_ACCEPTED)
+
 #define	rpc_success		cpu_to_be32(RPC_SUCCESS)
 #define	rpc_prog_unavail	cpu_to_be32(RPC_PROG_UNAVAIL)
 #define	rpc_prog_mismatch	cpu_to_be32(RPC_PROG_MISMATCH)
@@ -91,6 +104,9 @@ xdr_buf_init(struct xdr_buf *buf, void *start, size_t len)
 #define	rpc_garbage_args	cpu_to_be32(RPC_GARBAGE_ARGS)
 #define	rpc_system_err		cpu_to_be32(RPC_SYSTEM_ERR)
 #define	rpc_drop_reply		cpu_to_be32(RPC_DROP_REPLY)
+
+#define	rpc_mismatch		cpu_to_be32(RPC_MISMATCH)
+#define	rpc_auth_error		cpu_to_be32(RPC_AUTH_ERROR)
 
 #define	rpc_auth_ok		cpu_to_be32(RPC_AUTH_OK)
 #define	rpc_autherr_badcred	cpu_to_be32(RPC_AUTH_BADCRED)
@@ -100,7 +116,6 @@ xdr_buf_init(struct xdr_buf *buf, void *start, size_t len)
 #define	rpc_autherr_tooweak	cpu_to_be32(RPC_AUTH_TOOWEAK)
 #define	rpcsec_gsserr_credproblem	cpu_to_be32(RPCSEC_GSS_CREDPROBLEM)
 #define	rpcsec_gsserr_ctxproblem	cpu_to_be32(RPCSEC_GSS_CTXPROBLEM)
-#define	rpc_autherr_oldseqnum	cpu_to_be32(101)
 
 /*
  * Miscellaneous XDR helper functions
@@ -116,6 +131,9 @@ __be32 *xdr_decode_netobj(__be32 *p, struct xdr_netobj *);
 void	xdr_inline_pages(struct xdr_buf *, unsigned int,
 			 struct page **, unsigned int, unsigned int);
 void	xdr_terminate_string(struct xdr_buf *, const u32);
+size_t	xdr_buf_pagecount(struct xdr_buf *buf);
+int	xdr_alloc_bvec(struct xdr_buf *buf, gfp_t gfp);
+void	xdr_free_bvec(struct xdr_buf *buf);
 
 static inline __be32 *xdr_encode_array(__be32 *p, const void *s, unsigned int len)
 {
@@ -177,7 +195,6 @@ struct xdr_skb_reader {
 
 typedef size_t (*xdr_skb_read_actor)(struct xdr_skb_reader *desc, void *to, size_t len);
 
-size_t xdr_skb_read_bits(struct xdr_skb_reader *desc, void *to, size_t len);
 extern int csum_partial_copy_to_xdr(struct xdr_buf *, struct sk_buff *);
 
 extern int xdr_encode_word(struct xdr_buf *, unsigned int, u32);

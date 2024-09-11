@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Driver for Texas Instruments INA219, INA226 power monitor chips
  *
@@ -20,6 +19,10 @@
  *
  * Copyright (C) 2012 Lothar Felten <l-felten@ti.com>
  * Thanks to Jan Volkering
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation; version 2 of the License.
  */
 
 #include <linux/kernel.h>

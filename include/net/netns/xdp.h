@@ -5,6 +5,8 @@
 #include <linux/rculist.h>
 #include <linux/mutex.h>
 
+/* RHEL: The struct netns_xdp can be changed between releases and is not
+ * kABI stable. */
 struct netns_xdp {
 	struct mutex		lock;
 	struct hlist_head	list;

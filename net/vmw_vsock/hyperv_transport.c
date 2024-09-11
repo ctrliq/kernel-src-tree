@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Hyper-V transport for vsock
  *
@@ -6,16 +7,6 @@
  * support in the VM by introducing the new vsock transport.
  *
  * Copyright (c) 2017, Microsoft Corporation.
- *
- * This program is free software; you can redistribute it and/or modify it
- * under the terms and conditions of the GNU General Public License,
- * version 2, as published by the Free Software Foundation.
- *
- * This program is distributed in the hope it will be useful, but WITHOUT
- * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
- * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
- * more details.
- *
  */
 #include <linux/module.h>
 #include <linux/vmalloc.h>
@@ -435,7 +426,7 @@ static void hvs_open_connection(struct vmbus_channel *chan)
 
 	if (conn_from_host) {
 		new->sk_state = TCP_ESTABLISHED;
-		sk->sk_ack_backlog++;
+		sk_acceptq_added(sk);
 
 		hvs_addr_init(&vnew->local_addr, if_type);
 		hvs_remote_addr_init(&vnew->remote_addr, &vnew->local_addr);

@@ -218,8 +218,7 @@ void machine_kexec(struct kimage *kimage)
 	 * In kexec_file case, the kernel starts directly without purgatory.
 	 */
 
-	cpu_soft_restart(kimage != kexec_crash_image,
-		reboot_code_buffer_phys, kimage->head, kimage->start,
+	cpu_soft_restart(reboot_code_buffer_phys, kimage->head, kimage->start,
 #ifdef CONFIG_KEXEC_FILE
 						kimage->arch.dtb_mem);
 #else

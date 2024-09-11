@@ -242,18 +242,32 @@ int cfg80211_validate_key_settings(struct cfg80211_registered_device *rdev,
 
 	switch (params->cipher) {
 	case WLAN_CIPHER_SUITE_TKIP:
+		/* Extended Key ID can only be used with CCMP/GCMP ciphers */
+		if ((pairwise && key_idx) ||
+		    params->mode != NL80211_KEY_RX_TX)
+			return -EINVAL;
+		break;
 	case WLAN_CIPHER_SUITE_CCMP:
 	case WLAN_CIPHER_SUITE_CCMP_256:
 	case WLAN_CIPHER_SUITE_GCMP:
 	case WLAN_CIPHER_SUITE_GCMP_256:
-		/* Disallow pairwise keys with non-zero index unless it's WEP
-		 * or a vendor specific cipher (because current deployments use
-		 * pairwise WEP keys with non-zero indices and for vendor
-		 * specific ciphers this should be validated in the driver or
-		 * hardware level - but 802.11i clearly specifies to use zero)
+		/* IEEE802.11-2016 allows only 0 and - when supporting
+		 * Extended Key ID - 1 as index for pairwise keys.
+		 * @NL80211_KEY_NO_TX is only allowed for pairwise keys when
+		 * the driver supports Extended Key ID.
+		 * @NL80211_KEY_SET_TX can't be set when installing and
+		 * validating a key.
 		 */
-		if (pairwise && key_idx)
+		if ((params->mode == NL80211_KEY_NO_TX && !pairwise) ||
+		    params->mode == NL80211_KEY_SET_TX)
 			return -EINVAL;
+		if (wiphy_ext_feature_isset(&rdev->wiphy,
+					    NL80211_EXT_FEATURE_EXT_KEY_ID)) {
+			if (pairwise && (key_idx < 0 || key_idx > 1))
+				return -EINVAL;
+		} else if (pairwise && key_idx) {
+			return -EINVAL;
+		}
 		break;
 	case WLAN_CIPHER_SUITE_AES_CMAC:
 	case WLAN_CIPHER_SUITE_BIP_CMAC_256:
@@ -1035,7 +1049,7 @@ static u32 cfg80211_calculate_bitrate_ht(struct rate_info *rate)
 	return (bitrate + 50000) / 100000;
 }
 
-static u32 cfg80211_calculate_bitrate_60g(struct rate_info *rate)
+static u32 cfg80211_calculate_bitrate_dmg(struct rate_info *rate)
 {
 	static const u32 __mcs2bitrate[] = {
 		/* control PHY */
@@ -1080,6 +1094,40 @@ static u32 cfg80211_calculate_bitrate_60g(struct rate_info *rate)
 		return 0;
 
 	return __mcs2bitrate[rate->mcs];
+}
+
+static u32 cfg80211_calculate_bitrate_edmg(struct rate_info *rate)
+{
+	static const u32 __mcs2bitrate[] = {
+		/* control PHY */
+		[0] =   275,
+		/* SC PHY */
+		[1] =  3850,
+		[2] =  7700,
+		[3] =  9625,
+		[4] = 11550,
+		[5] = 12512, /* 1251.25 mbps */
+		[6] = 13475,
+		[7] = 15400,
+		[8] = 19250,
+		[9] = 23100,
+		[10] = 25025,
+		[11] = 26950,
+		[12] = 30800,
+		[13] = 38500,
+		[14] = 46200,
+		[15] = 50050,
+		[16] = 53900,
+		[17] = 57750,
+		[18] = 69300,
+		[19] = 75075,
+		[20] = 80850,
+	};
+
+	if (WARN_ON_ONCE(rate->mcs >= ARRAY_SIZE(__mcs2bitrate)))
+		return 0;
+
+	return __mcs2bitrate[rate->mcs] * rate->n_bonded_ch;
 }
 
 static u32 cfg80211_calculate_bitrate_vht(struct rate_info *rate)
@@ -1254,8 +1302,10 @@ u32 cfg80211_calculate_bitrate(struct rate_info *rate)
 {
 	if (rate->flags & RATE_INFO_FLAGS_MCS)
 		return cfg80211_calculate_bitrate_ht(rate);
-	if (rate->flags & RATE_INFO_FLAGS_60G)
-		return cfg80211_calculate_bitrate_60g(rate);
+	if (rate->flags & RATE_INFO_FLAGS_DMG)
+		return cfg80211_calculate_bitrate_dmg(rate);
+	if (rate->flags & RATE_INFO_FLAGS_EDMG)
+		return cfg80211_calculate_bitrate_edmg(rate);
 	if (rate->flags & RATE_INFO_FLAGS_VHT_MCS)
 		return cfg80211_calculate_bitrate_vht(rate);
 	if (rate->flags & RATE_INFO_FLAGS_HE_MCS)
@@ -1509,7 +1559,8 @@ bool ieee80211_chandef_to_operating_class(struct cfg80211_chan_def *chandef,
 	}
 
 	if (freq == 2484) {
-		if (chandef->width > NL80211_CHAN_WIDTH_40)
+		/* channel 14 is only for IEEE 802.11b */
+		if (chandef->width != NL80211_CHAN_WIDTH_20_NOHT)
 			return false;
 
 		*op_class = 82; /* channel 14 */

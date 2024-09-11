@@ -17,6 +17,8 @@
 #include <linux/sunrpc/gss_api.h>
 #include <linux/spinlock.h>
 
+#include <trace/events/sunrpc.h>
+
 #define RPC_CREDCACHE_DEFAULT_HASHBITS	(4)
 struct rpc_cred_cache {
 	struct hlist_head	*hashtable;
@@ -35,15 +37,18 @@ static const struct rpc_authops __rcu *auth_flavors[RPC_AUTH_MAXFLAVOR] = {
 static LIST_HEAD(cred_unused);
 static unsigned long number_cred_unused;
 
-static struct rpc_cred machine_cred = {
-	.cr_count = REFCOUNT_INIT(1),
+static struct cred machine_cred = {
+	.usage = ATOMIC_INIT(1),
+#ifdef CONFIG_DEBUG_CREDENTIALS
+	.magic = CRED_MAGIC,
+#endif
 };
 
 /*
  * Return the machine_cred pointer to be used whenever
  * the a generic machine credential is needed.
  */
-struct rpc_cred *rpc_machine_cred(void)
+const struct cred *rpc_machine_cred(void)
 {
 	return &machine_cred;
 }
@@ -686,11 +691,15 @@ rpcauth_bind_new_cred(struct rpc_task *task, int lookupflags)
 }
 
 static int
-rpcauth_bindcred(struct rpc_task *task, struct rpc_cred *cred, int flags)
+rpcauth_bindcred(struct rpc_task *task, const struct cred *cred, int flags)
 {
 	struct rpc_rqst *req = task->tk_rqstp;
 	struct rpc_cred *new = NULL;
 	int lookupflags = 0;
+	struct rpc_auth *auth = task->tk_client->cl_auth;
+	struct auth_cred acred = {
+		.cred = cred,
+	};
 
 	if (flags & RPC_TASK_ASYNC)
 		lookupflags |= RPCAUTH_LOOKUP_NEW;
@@ -698,7 +707,7 @@ rpcauth_bindcred(struct rpc_task *task, struct rpc_cred *cred, int flags)
 		/* Task must use exactly this rpc_cred */
 		new = get_rpccred(task->tk_op_cred);
 	else if (cred != NULL && cred != &machine_cred)
-		new = cred->cr_ops->crbind(task, cred, lookupflags);
+		new = auth->au_ops->lookup_cred(auth, &acred, lookupflags);
 	else if (cred == &machine_cred)
 		new = rpcauth_bind_machine_cred(task, lookupflags);
 
@@ -749,65 +758,102 @@ destroy:
 }
 EXPORT_SYMBOL_GPL(put_rpccred);
 
-__be32 *
-rpcauth_marshcred(struct rpc_task *task, __be32 *p)
+/**
+ * rpcauth_marshcred - Append RPC credential to end of @xdr
+ * @task: controlling RPC task
+ * @xdr: xdr_stream containing initial portion of RPC Call header
+ *
+ * On success, an appropriate verifier is added to @xdr, @xdr is
+ * updated to point past the verifier, and zero is returned.
+ * Otherwise, @xdr is in an undefined state and a negative errno
+ * is returned.
+ */
+int rpcauth_marshcred(struct rpc_task *task, struct xdr_stream *xdr)
 {
-	struct rpc_cred	*cred = task->tk_rqstp->rq_cred;
+	const struct rpc_credops *ops = task->tk_rqstp->rq_cred->cr_ops;
 
-	return cred->cr_ops->crmarshal(task, p);
+	return ops->crmarshal(task, xdr);
 }
 
-__be32 *
-rpcauth_checkverf(struct rpc_task *task, __be32 *p)
+/**
+ * rpcauth_wrap_req_encode - XDR encode the RPC procedure
+ * @task: controlling RPC task
+ * @xdr: stream where on-the-wire bytes are to be marshalled
+ *
+ * On success, @xdr contains the encoded and wrapped message.
+ * Otherwise, @xdr is in an undefined state.
+ */
+int rpcauth_wrap_req_encode(struct rpc_task *task, struct xdr_stream *xdr)
 {
-	struct rpc_cred	*cred = task->tk_rqstp->rq_cred;
+	kxdreproc_t encode = task->tk_msg.rpc_proc->p_encode;
 
-	return cred->cr_ops->crvalidate(task, p);
-}
-
-static void rpcauth_wrap_req_encode(kxdreproc_t encode, struct rpc_rqst *rqstp,
-				   __be32 *data, void *obj)
-{
-	struct xdr_stream xdr;
-
-	xdr_init_encode(&xdr, &rqstp->rq_snd_buf, data, rqstp);
-	encode(rqstp, &xdr, obj);
-}
-
-int
-rpcauth_wrap_req(struct rpc_task *task, kxdreproc_t encode, void *rqstp,
-		__be32 *data, void *obj)
-{
-	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
-
-	if (cred->cr_ops->crwrap_req)
-		return cred->cr_ops->crwrap_req(task, encode, rqstp, data, obj);
-	/* By default, we encode the arguments normally. */
-	rpcauth_wrap_req_encode(encode, rqstp, data, obj);
+	encode(task->tk_rqstp, xdr, task->tk_msg.rpc_argp);
 	return 0;
 }
+EXPORT_SYMBOL_GPL(rpcauth_wrap_req_encode);
 
-static int
-rpcauth_unwrap_req_decode(kxdrdproc_t decode, struct rpc_rqst *rqstp,
-			  __be32 *data, void *obj)
+/**
+ * rpcauth_wrap_req - XDR encode and wrap the RPC procedure
+ * @task: controlling RPC task
+ * @xdr: stream where on-the-wire bytes are to be marshalled
+ *
+ * On success, @xdr contains the encoded and wrapped message,
+ * and zero is returned. Otherwise, @xdr is in an undefined
+ * state and a negative errno is returned.
+ */
+int rpcauth_wrap_req(struct rpc_task *task, struct xdr_stream *xdr)
 {
-	struct xdr_stream xdr;
+	const struct rpc_credops *ops = task->tk_rqstp->rq_cred->cr_ops;
 
-	xdr_init_decode(&xdr, &rqstp->rq_rcv_buf, data, rqstp);
-	return decode(rqstp, &xdr, obj);
+	return ops->crwrap_req(task, xdr);
 }
 
+/**
+ * rpcauth_checkverf - Validate verifier in RPC Reply header
+ * @task: controlling RPC task
+ * @xdr: xdr_stream containing RPC Reply header
+ *
+ * On success, @xdr is updated to point past the verifier and
+ * zero is returned. Otherwise, @xdr is in an undefined state
+ * and a negative errno is returned.
+ */
 int
-rpcauth_unwrap_resp(struct rpc_task *task, kxdrdproc_t decode, void *rqstp,
-		__be32 *data, void *obj)
+rpcauth_checkverf(struct rpc_task *task, struct xdr_stream *xdr)
 {
-	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
+	const struct rpc_credops *ops = task->tk_rqstp->rq_cred->cr_ops;
 
-	if (cred->cr_ops->crunwrap_resp)
-		return cred->cr_ops->crunwrap_resp(task, decode, rqstp,
-						   data, obj);
-	/* By default, we decode the arguments normally. */
-	return rpcauth_unwrap_req_decode(decode, rqstp, data, obj);
+	return ops->crvalidate(task, xdr);
+}
+
+/**
+ * rpcauth_unwrap_resp_decode - Invoke XDR decode function
+ * @task: controlling RPC task
+ * @xdr: stream where the Reply message resides
+ *
+ * Returns zero on success; otherwise a negative errno is returned.
+ */
+int
+rpcauth_unwrap_resp_decode(struct rpc_task *task, struct xdr_stream *xdr)
+{
+	kxdrdproc_t decode = task->tk_msg.rpc_proc->p_decode;
+
+	return decode(task->tk_rqstp, xdr, task->tk_msg.rpc_resp);
+}
+EXPORT_SYMBOL_GPL(rpcauth_unwrap_resp_decode);
+
+/**
+ * rpcauth_unwrap_resp - Invoke unwrap and decode function for the cred
+ * @task: controlling RPC task
+ * @xdr: stream where the Reply message resides
+ *
+ * Returns zero on success; otherwise a negative errno is returned.
+ */
+int
+rpcauth_unwrap_resp(struct rpc_task *task, struct xdr_stream *xdr)
+{
+	const struct rpc_credops *ops = task->tk_rqstp->rq_cred->cr_ops;
+
+	return ops->crunwrap_resp(task, xdr);
 }
 
 bool

@@ -107,7 +107,8 @@ void snd_ff_stream_destroy_duplex(struct snd_ff *ff)
 }
 
 int snd_ff_stream_reserve_duplex(struct snd_ff *ff, unsigned int rate,
-				 unsigned int frames_per_period)
+				 unsigned int frames_per_period,
+				 unsigned int frames_per_buffer)
 {
 	unsigned int curr_rate;
 	enum snd_ff_clock_src src;
@@ -153,7 +154,7 @@ int snd_ff_stream_reserve_duplex(struct snd_ff *ff, unsigned int rate,
 			return err;
 
 		err = amdtp_domain_set_events_per_period(&ff->domain,
-							 frames_per_period);
+					frames_per_period, frames_per_buffer);
 		if (err < 0) {
 			fw_iso_resources_free(&ff->tx_resources);
 			fw_iso_resources_free(&ff->rx_resources);
@@ -183,6 +184,7 @@ int snd_ff_stream_start_duplex(struct snd_ff *ff, unsigned int rate)
 	 */
 	if (!amdtp_stream_running(&ff->rx_stream)) {
 		int spd = fw_parent_device(ff->unit)->max_speed;
+		unsigned int ir_delay_cycle;
 
 		err = ff->spec->protocol->begin_session(ff, rate);
 		if (err < 0)
@@ -198,7 +200,14 @@ int snd_ff_stream_start_duplex(struct snd_ff *ff, unsigned int rate)
 		if (err < 0)
 			goto error;
 
-		err = amdtp_domain_start(&ff->domain);
+		// The device postpones start of transmission mostly for several
+		// cycles after receiving packets firstly.
+		if (ff->spec->protocol == &snd_ff_protocol_ff800)
+			ir_delay_cycle = 800;	// = 100 msec
+		else
+			ir_delay_cycle = 16;	// = 2 msec
+
+		err = amdtp_domain_start(&ff->domain, ir_delay_cycle);
 		if (err < 0)
 			goto error;
 

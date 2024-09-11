@@ -50,6 +50,7 @@
 #include <linux/memory.h>
 #include <linux/compat.h>
 #include <linux/version.h>
+#include <linux/security.h>
 
 #include <asm/boot_data.h>
 #include <asm/ipl.h>
@@ -101,6 +102,15 @@ int __bootdata(memory_end_set);
 unsigned long __bootdata(memory_end);
 unsigned long __bootdata(max_physmem_end);
 struct mem_detect_info __bootdata(mem_detect);
+
+struct exception_table_entry *__bootdata_preserved(__start_dma_ex_table);
+struct exception_table_entry *__bootdata_preserved(__stop_dma_ex_table);
+unsigned long __bootdata_preserved(__swsusp_reset_dma);
+unsigned long __bootdata_preserved(__stext_dma);
+unsigned long __bootdata_preserved(__etext_dma);
+unsigned long __bootdata_preserved(__sdma);
+unsigned long __bootdata_preserved(__edma);
+unsigned long __bootdata_preserved(__kaslr_offset);
 
 unsigned long VMALLOC_START;
 EXPORT_SYMBOL(VMALLOC_START);
@@ -750,6 +760,7 @@ static void __init reserve_kernel(void)
 	memblock_reserve(0, HEAD_END);
 	memblock_reserve((unsigned long)_stext, PFN_PHYS(start_pfn)
 			 - (unsigned long)_stext);
+	memblock_reserve(__sdma, __edma - __sdma);
 }
 
 static void __init setup_memory(void)
@@ -1014,6 +1025,7 @@ void __init setup_arch(char **cmdline_p)
 		pr_info("Linux is running natively in 64-bit mode\n");
 
 	log_component_list();
+	init_lockdown();
 
 	/* Have one command line that is parsed and saved in /proc/cmdline */
 	/* boot_command_line has been already set up in early.c */

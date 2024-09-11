@@ -55,6 +55,7 @@
 
 #include <rdma/ib_mad.h>
 #include <rdma/ib_user_mad.h>
+#include <rdma/rdma_netlink.h>
 
 #include "core_priv.h"
 
@@ -984,6 +985,11 @@ static int ib_umad_open(struct inode *inode, struct file *filp)
 		goto out;
 	}
 
+	if (!rdma_dev_access_netns(port->ib_dev, current->nsproxy->net_ns)) {
+		ret = -EPERM;
+		goto out;
+	}
+
 	file = kzalloc(sizeof(*file), GFP_KERNEL);
 	if (!file) {
 		ret = -ENOMEM;
@@ -1077,6 +1083,11 @@ static int ib_umad_sm_open(struct inode *inode, struct file *filp)
 		}
 	}
 
+	if (!rdma_dev_access_netns(port->ib_dev, current->nsproxy->net_ns)) {
+		ret = -EPERM;
+		goto err_up_sem;
+	}
+
 	ret = ib_modify_port(port->ib_dev, port->port_num, 0, &props);
 	if (ret)
 		goto err_up_sem;
@@ -1118,11 +1129,48 @@ static const struct file_operations umad_sm_fops = {
 	.llseek	 = no_llseek,
 };
 
+static int ib_umad_get_nl_info(struct ib_device *ibdev, void *client_data,
+			       struct ib_client_nl_info *res)
+{
+	struct ib_umad_device *umad_dev = client_data;
+
+	if (!rdma_is_port_valid(ibdev, res->port))
+		return -EINVAL;
+
+	res->abi = IB_USER_MAD_ABI_VERSION;
+	res->cdev = &umad_dev->ports[res->port - rdma_start_port(ibdev)].dev;
+
+	return 0;
+}
+
 static struct ib_client umad_client = {
 	.name   = "umad",
 	.add    = ib_umad_add_one,
-	.remove = ib_umad_remove_one
+	.remove = ib_umad_remove_one,
+	.get_nl_info = ib_umad_get_nl_info,
 };
+MODULE_ALIAS_RDMA_CLIENT("umad");
+
+static int ib_issm_get_nl_info(struct ib_device *ibdev, void *client_data,
+			       struct ib_client_nl_info *res)
+{
+	struct ib_umad_device *umad_dev =
+		ib_get_client_data(ibdev, &umad_client);
+
+	if (!rdma_is_port_valid(ibdev, res->port))
+		return -EINVAL;
+
+	res->abi = IB_USER_MAD_ABI_VERSION;
+	res->cdev = &umad_dev->ports[res->port - rdma_start_port(ibdev)].sm_dev;
+
+	return 0;
+}
+
+static struct ib_client issm_client = {
+	.name = "issm",
+	.get_nl_info = ib_issm_get_nl_info,
+};
+MODULE_ALIAS_RDMA_CLIENT("issm");
 
 static ssize_t ibdev_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
@@ -1339,14 +1387,15 @@ free:
 static void ib_umad_remove_one(struct ib_device *device, void *client_data)
 {
 	struct ib_umad_device *umad_dev = client_data;
-	int i;
+	unsigned int i;
 
 	if (!umad_dev)
 		return;
 
-	for (i = 0; i <= rdma_end_port(device) - rdma_start_port(device); ++i) {
-		if (rdma_cap_ib_mad(device, i + rdma_start_port(device)))
-			ib_umad_kill_port(&umad_dev->ports[i]);
+	rdma_for_each_port (device, i) {
+		if (rdma_cap_ib_mad(device, i))
+			ib_umad_kill_port(
+				&umad_dev->ports[i - rdma_start_port(device)]);
 	}
 	/* balances kref_init() */
 	ib_umad_dev_put(umad_dev);
@@ -1380,13 +1429,17 @@ static int __init ib_umad_init(void)
 	}
 
 	ret = ib_register_client(&umad_client);
-	if (ret) {
-		pr_err("couldn't register ib_umad client\n");
+	if (ret)
 		goto out_class;
-	}
+
+	ret = ib_register_client(&issm_client);
+	if (ret)
+		goto out_client;
 
 	return 0;
 
+out_client:
+	ib_unregister_client(&umad_client);
 out_class:
 	class_unregister(&umad_class);
 
@@ -1404,6 +1457,7 @@ out:
 
 static void __exit ib_umad_cleanup(void)
 {
+	ib_unregister_client(&issm_client);
 	ib_unregister_client(&umad_client);
 	class_unregister(&umad_class);
 	unregister_chrdev_region(base_umad_dev,

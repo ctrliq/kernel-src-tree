@@ -38,6 +38,8 @@
 #include <asm/kvm_vcpu_regs.h>
 #include <asm/hyperv-tlfs.h>
 
+#define __KVM_HAVE_ARCH_VCPU_DEBUGFS
+
 #define KVM_MAX_VCPUS 384
 #define KVM_SOFT_MAX_VCPUS 384
 #define KVM_MAX_VCPU_ID 1023
@@ -313,9 +315,12 @@ struct kvm_rmap_head {
 struct kvm_mmu_page {
 	struct list_head link;
 	struct hlist_node hash_link;
+	struct list_head lpage_disallowed_link;
+
 	bool unsync;
 	u8 mmu_valid_gen;
 	bool mmio_cached;
+	bool lpage_disallowed; /* Can't be replaced by an equiv large page */
 
 	/*
 	 * The following two entries are used to key the shadow page in the
@@ -860,6 +865,7 @@ struct kvm_arch {
 	 */
 	struct list_head active_mmu_pages;
 	struct list_head zapped_obsolete_pages;
+	struct list_head lpage_disallowed_mmu_pages;
 	struct kvm_page_track_notifier_node mmu_sp_tracker;
 	struct kvm_page_track_notifier_head track_notifier_head;
 
@@ -932,6 +938,9 @@ struct kvm_arch {
 
 	bool guest_can_read_msr_platform_info;
 	bool exception_payload_enabled;
+
+	struct kvm_pmu_event_filter *pmu_event_filter;
+	struct task_struct *nx_lpage_recovery_thread;
 };
 
 struct kvm_vm_stat {
@@ -945,6 +954,7 @@ struct kvm_vm_stat {
 	ulong mmu_unsync;
 	ulong remote_tlb_flush;
 	ulong lpages;
+	ulong nx_lpage_splits;
 	ulong max_mmu_page_hash_collisions;
 };
 
@@ -1121,6 +1131,7 @@ struct kvm_x86_ops {
 	bool (*xsaves_supported)(void);
 	bool (*umip_emulated)(void);
 	bool (*pt_supported)(void);
+	bool (*pku_supported)(void);
 
 	int (*check_nested_events)(struct kvm_vcpu *vcpu, bool external_intr);
 	void (*request_immediate_exit)(struct kvm_vcpu *vcpu);
@@ -1208,6 +1219,7 @@ struct kvm_x86_ops {
 	bool (*need_emulation_on_page_fault)(struct kvm_vcpu *vcpu);
 
 	bool (*apic_init_signal_blocked)(struct kvm_vcpu *vcpu);
+	int (*enable_direct_tlbflush)(struct kvm_vcpu *vcpu);
 };
 
 struct kvm_arch_async_pf {

@@ -1850,6 +1850,16 @@ oom:
 	return 0;
 }
 
+static void packet_parse_headers(struct sk_buff *skb, struct socket *sock)
+{
+	if ((!skb->protocol || skb->protocol == htons(ETH_P_ALL)) &&
+	    sock->type == SOCK_RAW) {
+		skb_reset_mac_header(skb);
+		skb->protocol = dev_parse_header_protocol(skb);
+	}
+
+	skb_probe_transport_header(skb);
+}
 
 /*
  *	Output a raw packet to a device layer. This bypasses all the other
@@ -1971,7 +1981,7 @@ retry:
 	if (unlikely(extra_len == 4))
 		skb->no_fcs = 1;
 
-	skb_probe_transport_header(skb, 0);
+	packet_parse_headers(skb, sock);
 
 	dev_queue_xmit(skb);
 	rcu_read_unlock();
@@ -2509,7 +2519,7 @@ static int tpacket_fill_skb(struct packet_sock *po, struct sk_buff *skb,
 		len = ((to_write > len_max) ? len_max : to_write);
 	}
 
-	skb_probe_transport_header(skb, 0);
+	packet_parse_headers(skb, sock);
 
 	return tp_len;
 }
@@ -2920,7 +2930,7 @@ static int packet_snd(struct socket *sock, struct msghdr *msg, size_t len)
 		virtio_net_hdr_set_proto(skb, &vnet_hdr);
 	}
 
-	skb_probe_transport_header(skb, reserve);
+	packet_parse_headers(skb, sock);
 
 	if (unlikely(extra_len == 4))
 		skb->no_fcs = 1;

@@ -38,6 +38,7 @@
 #include "en/txrx.h"
 #include "ipoib/ipoib.h"
 #include "en_accel/en_accel.h"
+#include "en_accel/ktls.h"
 #include "lib/clock.h"
 
 static void mlx5e_dma_unmap_wqe_err(struct mlx5e_txqsq *sq, u8 num_dma)
@@ -71,12 +72,12 @@ u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
 		       select_queue_fallback_t fallback)
 {
 	struct mlx5e_priv *priv = netdev_priv(dev);
-	int channel_ix = fallback(dev, skb, NULL);
+	int txq_ix = fallback(dev, skb, NULL);
 	u16 num_channels;
 	int up = 0;
 
 	if (!netdev_get_num_tc(dev))
-		return channel_ix;
+		return txq_ix;
 
 #ifdef CONFIG_MLX5_CORE_EN_DCB
 	if (priv->dcbx_dp.trust_state == MLX5_QPTS_TRUST_DSCP)
@@ -86,14 +87,14 @@ u16 mlx5e_select_queue(struct net_device *dev, struct sk_buff *skb,
 		if (skb_vlan_tag_present(skb))
 			up = skb_vlan_tag_get_prio(skb);
 
-	/* channel_ix can be larger than num_channels since
+	/* txq_ix can be larger than num_channels since
 	 * dev->num_real_tx_queues = num_channels * num_tc
 	 */
 	num_channels = priv->channels.params.num_channels;
-	if (channel_ix >= num_channels)
-		channel_ix = reciprocal_scale(channel_ix, num_channels);
+	if (txq_ix >= num_channels)
+		txq_ix = priv->txq2sq[txq_ix]->ch_ix;
 
-	return priv->channel_tc2txq[channel_ix][up];
+	return priv->channel_tc2realtxq[txq_ix][up];
 }
 
 static inline int mlx5e_skb_l2_header_offset(struct sk_buff *skb)
@@ -120,7 +121,7 @@ static inline u16 mlx5e_calc_min_inline(enum mlx5_inline_modes mode,
 	case MLX5_INLINE_MODE_NONE:
 		return 0;
 	case MLX5_INLINE_MODE_TCP_UDP:
-		hlen = eth_get_headlen(skb->data, skb_headlen(skb));
+		hlen = eth_get_headlen(skb->dev, skb->data, skb_headlen(skb));
 		if (hlen == ETH_HLEN && !skb_vlan_tag_present(skb))
 			hlen += VLAN_HLEN;
 		break;
@@ -322,10 +323,16 @@ netdev_tx_t mlx5e_sq_xmit(struct mlx5e_txqsq *sq, struct sk_buff *skb,
 #ifdef CONFIG_MLX5_EN_IPSEC
 		struct mlx5_wqe_eth_seg cur_eth = wqe->eth;
 #endif
+#ifdef CONFIG_MLX5_EN_TLS
+		struct mlx5_wqe_ctrl_seg cur_ctrl = wqe->ctrl;
+#endif
 		mlx5e_fill_sq_frag_edge(sq, wq, pi, contig_wqebbs_room);
 		wqe = mlx5e_sq_fetch_wqe(sq, sizeof(*wqe), &pi);
 #ifdef CONFIG_MLX5_EN_IPSEC
 		wqe->eth = cur_eth;
+#endif
+#ifdef CONFIG_MLX5_EN_TLS
+		wqe->ctrl = cur_ctrl;
 #endif
 	}
 
@@ -477,6 +484,14 @@ bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
 			skb = wi->skb;
 
 			if (unlikely(!skb)) {
+#ifdef CONFIG_MLX5_EN_TLS
+				if (wi->resync_dump_frag) {
+					struct mlx5e_sq_dma *dma =
+						mlx5e_dma_get(sq, dma_fifo_cc++);
+
+					mlx5e_ktls_tx_handle_resync_dump_comp(sq, wi, dma);
+				}
+#endif
 				sqcc += wi->num_wqebbs;
 				continue;
 			}

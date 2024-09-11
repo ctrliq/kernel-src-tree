@@ -270,7 +270,7 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 					continue;
 
 				/* Shallower states are enabled, so update. */
-				dev->states_usage[entered_state].above++;
+				dev->rh_cpuidle_dev.rh_states_usage[entered_state].above++;
 				break;
 			}
 		} else if (diff > delay) {
@@ -284,7 +284,7 @@ int cpuidle_enter_state(struct cpuidle_device *dev, struct cpuidle_driver *drv,
 				 * better match for the observed idle duration.
 				 */
 				if (diff - delay >= drv->states[i].target_residency)
-					dev->states_usage[entered_state].below++;
+					dev->rh_cpuidle_dev.rh_states_usage[entered_state].below++;
 
 				break;
 			}
@@ -336,14 +336,14 @@ int cpuidle_enter(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	 * useful for consumers outside cpuidle, we rely on that the governor's
 	 * ->select() callback have decided, whether to stop the tick or not.
 	 */
-	WRITE_ONCE(dev->next_hrtimer, tick_nohz_get_next_hrtimer());
+	WRITE_ONCE(dev->rh_cpuidle_dev.next_hrtimer, tick_nohz_get_next_hrtimer());
 
 	if (cpuidle_state_is_coupled(drv, index))
 		ret = cpuidle_enter_state_coupled(dev, drv, index);
 	else
 		ret = cpuidle_enter_state(dev, drv, index);
 
-	WRITE_ONCE(dev->next_hrtimer, 0);
+	WRITE_ONCE(dev->rh_cpuidle_dev.next_hrtimer, 0);
 	return ret;
 }
 
@@ -365,6 +365,8 @@ void cpuidle_reflect(struct cpuidle_device *dev, int index)
  * cpuidle_poll_time - return amount of time to poll for,
  * governors can override dev->poll_limit_ns if necessary
  *
+ * NB: for RHEL8, dev->poll_limit_ns == dev->rh_cpuidle_dev.poll_limit_ns
+ *
  * @drv:   the cpuidle driver tied with the cpu
  * @dev:   the cpuidle device
  *
@@ -375,8 +377,8 @@ u64 cpuidle_poll_time(struct cpuidle_driver *drv,
 	int i;
 	u64 limit_ns;
 
-	if (dev->poll_limit_ns)
-		return dev->poll_limit_ns;
+	if (dev->rh_cpuidle_dev.poll_limit_ns)
+		return dev->rh_cpuidle_dev.poll_limit_ns;
 
 	limit_ns = TICK_NSEC;
 	for (i = 1; i < drv->state_count; i++) {
@@ -386,9 +388,9 @@ u64 cpuidle_poll_time(struct cpuidle_driver *drv,
 		limit_ns = (u64)drv->states[i].target_residency * NSEC_PER_USEC;
 	}
 
-	dev->poll_limit_ns = limit_ns;
+	dev->rh_cpuidle_dev.poll_limit_ns = limit_ns;
 
-	return dev->poll_limit_ns;
+	return dev->rh_cpuidle_dev.poll_limit_ns;
 }
 
 /**
@@ -555,7 +557,7 @@ static void __cpuidle_device_init(struct cpuidle_device *dev)
 {
 	memset(dev->states_usage, 0, sizeof(dev->states_usage));
 	dev->last_residency = 0;
-	dev->next_hrtimer = 0;
+	dev->rh_cpuidle_dev.next_hrtimer = 0;
 }
 
 /**
@@ -776,4 +778,5 @@ static int __init cpuidle_init(void)
 }
 
 module_param(off, int, 0444);
+module_param_string(governor, param_governor, CPUIDLE_NAME_LEN, 0444);
 core_initcall(cpuidle_init);

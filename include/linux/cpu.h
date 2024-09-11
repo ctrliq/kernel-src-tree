@@ -62,6 +62,8 @@ extern ssize_t cpu_show_mds(struct device *dev,
 extern ssize_t cpu_show_tsx_async_abort(struct device *dev,
 					struct device_attribute *attr,
 					char *buf);
+extern ssize_t cpu_show_itlb_multihit(struct device *dev,
+				      struct device_attribute *attr, char *buf);
 
 extern __printf(4, 5)
 struct device *cpu_device_create(struct device *parent, void *drvdata,
@@ -203,10 +205,12 @@ enum cpuhp_smt_control {
 extern enum cpuhp_smt_control cpu_smt_control;
 extern void cpu_smt_disable(bool force);
 extern void cpu_smt_check_topology(void);
+extern bool cpu_smt_possible(void);
 #else
 # define cpu_smt_control		(CPU_SMT_NOT_SUPPORTED)
 static inline void cpu_smt_disable(bool force) { }
 static inline void cpu_smt_check_topology(void) { }
+static inline bool cpu_smt_possible(void) { return false; }
 #endif
 
 extern bool cpu_mitigations_off(void);

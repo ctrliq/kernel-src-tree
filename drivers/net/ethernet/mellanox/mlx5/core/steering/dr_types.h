@@ -678,6 +678,7 @@ struct mlx5dr_table {
 	u32 level;
 	u32 table_type;
 	u32 table_id;
+	u32 flags;
 	struct list_head matcher_list;
 	struct mlx5dr_action *miss_action;
 	refcount_t refcount;
@@ -741,10 +742,14 @@ struct mlx5dr_action {
 			union {
 				struct mlx5dr_table *tbl;
 				struct {
-					struct mlx5_flow_table *ft;
+					struct mlx5dr_domain *dmn;
+					u32 id;
+					u32 group_id;
+					enum fs_flow_table_type type;
 					u64 rx_icm_addr;
 					u64 tx_icm_addr;
-					struct mlx5_core_dev *mdev;
+					struct mlx5dr_action **ref_actions;
+					u32 num_of_ref_actions;
 				} fw_tbl;
 			};
 		} dest_tbl;
@@ -976,9 +981,6 @@ void mlx5dr_ste_set_formatted_ste(u16 gvmi,
 void mlx5dr_ste_copy_param(u8 match_criteria,
 			   struct mlx5dr_match_param *set_param,
 			   struct mlx5dr_match_parameters *mask);
-
-void mlx5dr_crc32_init_table(void);
-u32 mlx5dr_crc32_slice8_calc(const void *input_data, size_t length);
 
 struct mlx5dr_qp {
 	struct mlx5_core_dev *mdev;

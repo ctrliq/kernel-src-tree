@@ -2,7 +2,9 @@
 #define _NET_FLOW_OFFLOAD_H
 
 #include <linux/kernel.h>
+#include <linux/list.h>
 #include <net/flow_dissector.h>
+#include <linux/rhashtable.h>
 
 struct flow_match {
 	struct flow_dissector	*dissector;
@@ -127,10 +129,15 @@ enum flow_action_id {
 	FLOW_ACTION_ADD,
 	FLOW_ACTION_CSUM,
 	FLOW_ACTION_MARK,
+	FLOW_ACTION_PTYPE,
 	FLOW_ACTION_WAKE,
 	FLOW_ACTION_QUEUE,
 	FLOW_ACTION_SAMPLE,
 	FLOW_ACTION_POLICE,
+	FLOW_ACTION_CT,
+	FLOW_ACTION_MPLS_PUSH,
+	FLOW_ACTION_MPLS_POP,
+	FLOW_ACTION_MPLS_MANGLE,
 };
 
 /* This is mirroring enum pedit_header_type definition for easy mapping between
@@ -146,8 +153,12 @@ enum flow_action_mangle_base {
 	FLOW_ACT_MANGLE_HDR_TYPE_UDP,
 };
 
+typedef void (*action_destr)(void *priv);
+
 struct flow_action_entry {
 	enum flow_action_id		id;
+	action_destr			destructor;
+	void				*destructor_priv;
 	union {
 		u32			chain_index;	/* FLOW_ACTION_GOTO */
 		struct net_device	*dev;		/* FLOW_ACTION_REDIRECT */
@@ -162,9 +173,10 @@ struct flow_action_entry {
 			u32		mask;
 			u32		val;
 		} mangle;
-		const struct ip_tunnel_info *tunnel;	/* FLOW_ACTION_TUNNEL_ENCAP */
+		struct ip_tunnel_info	*tunnel;	/* FLOW_ACTION_TUNNEL_ENCAP */
 		u32			csum_flags;	/* FLOW_ACTION_CSUM */
 		u32			mark;		/* FLOW_ACTION_MARK */
+		u16                     ptype;          /* FLOW_ACTION_PTYPE */
 		struct {				/* FLOW_ACTION_QUEUE */
 			u32		ctx;
 			u32		index;
@@ -180,6 +192,26 @@ struct flow_action_entry {
 			s64			burst;
 			u64			rate_bytes_ps;
 		} police;
+		struct {				/* FLOW_ACTION_CT */
+			int action;
+			u16 zone;
+		} ct;
+		struct {				/* FLOW_ACTION_MPLS_PUSH */
+			u32		label;
+			__be16		proto;
+			u8		tc;
+			u8		bos;
+			u8		ttl;
+		} mpls_push;
+		struct {				/* FLOW_ACTION_MPLS_POP */
+			__be16		proto;
+		} mpls_pop;
+		struct {				/* FLOW_ACTION_MPLS_MANGLE */
+			u32		label;
+			u8		tc;
+			u8		bos;
+			u8		ttl;
+		} mpls_mangle;
 	};
 };
 
@@ -233,5 +265,155 @@ static inline void flow_stats_update(struct flow_stats *flow_stats,
 	flow_stats->bytes	+= bytes;
 	flow_stats->lastused	= max_t(u64, flow_stats->lastused, lastused);
 }
+
+enum flow_block_command {
+	FLOW_BLOCK_BIND,
+	FLOW_BLOCK_UNBIND,
+};
+
+enum flow_block_binder_type {
+	FLOW_BLOCK_BINDER_TYPE_UNSPEC,
+	FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS,
+	FLOW_BLOCK_BINDER_TYPE_CLSACT_EGRESS,
+};
+
+struct flow_block {
+	struct list_head cb_list;
+};
+
+struct netlink_ext_ack;
+
+struct flow_block_offload {
+	enum flow_block_command command;
+	enum flow_block_binder_type binder_type;
+	bool block_shared;
+	bool unlocked_driver_cb;
+	struct net *net;
+	struct flow_block *block;
+	struct list_head cb_list;
+	struct list_head *driver_block_list;
+	struct netlink_ext_ack *extack;
+};
+
+enum tc_setup_type;
+typedef int flow_setup_cb_t(enum tc_setup_type type, void *type_data,
+			    void *cb_priv);
+
+struct flow_block_cb {
+	struct list_head	driver_list;
+	struct list_head	list;
+	flow_setup_cb_t		*cb;
+	void			*cb_ident;
+	void			*cb_priv;
+	void			(*release)(void *cb_priv);
+	unsigned int		refcnt;
+};
+
+struct flow_block_cb *flow_block_cb_alloc(flow_setup_cb_t *cb,
+					  void *cb_ident, void *cb_priv,
+					  void (*release)(void *cb_priv));
+void flow_block_cb_free(struct flow_block_cb *block_cb);
+
+struct flow_block_cb *flow_block_cb_lookup(struct flow_block *block,
+					   flow_setup_cb_t *cb, void *cb_ident);
+
+void *flow_block_cb_priv(struct flow_block_cb *block_cb);
+void flow_block_cb_incref(struct flow_block_cb *block_cb);
+unsigned int flow_block_cb_decref(struct flow_block_cb *block_cb);
+
+static inline void flow_block_cb_add(struct flow_block_cb *block_cb,
+				     struct flow_block_offload *offload)
+{
+	list_add_tail(&block_cb->list, &offload->cb_list);
+}
+
+static inline void flow_block_cb_remove(struct flow_block_cb *block_cb,
+					struct flow_block_offload *offload)
+{
+	list_move(&block_cb->list, &offload->cb_list);
+}
+
+bool flow_block_cb_is_busy(flow_setup_cb_t *cb, void *cb_ident,
+			   struct list_head *driver_block_list);
+
+/* RHEL: Increase the version of flow_block_cb_setup_simple() when TC subsystem
+ * is changed in a kABI incompatible way. This includes changes to ndo_setup_tc,
+ * inline function changes and TC structs changes.
+ */
+RH_KABI_FORCE_CHANGE(1)
+int flow_block_cb_setup_simple(struct flow_block_offload *f,
+			       struct list_head *driver_list,
+			       flow_setup_cb_t *cb,
+			       void *cb_ident, void *cb_priv, bool ingress_only);
+
+enum flow_cls_command {
+	FLOW_CLS_REPLACE,
+	FLOW_CLS_DESTROY,
+	FLOW_CLS_STATS,
+	FLOW_CLS_TMPLT_CREATE,
+	FLOW_CLS_TMPLT_DESTROY,
+};
+
+struct flow_cls_common_offload {
+	u32 chain_index;
+	__be16 protocol;
+	u32 prio;
+	struct netlink_ext_ack *extack;
+};
+
+struct flow_cls_offload {
+	struct flow_cls_common_offload common;
+	enum flow_cls_command command;
+	unsigned long cookie;
+	struct flow_rule *rule;
+	struct flow_stats stats;
+	u32 classid;
+};
+
+static inline struct flow_rule *
+flow_cls_offload_flow_rule(struct flow_cls_offload *flow_cmd)
+{
+	return flow_cmd->rule;
+}
+
+static inline void flow_block_init(struct flow_block *flow_block)
+{
+	INIT_LIST_HEAD(&flow_block->cb_list);
+}
+
+typedef int flow_indr_block_bind_cb_t(struct net_device *dev, void *cb_priv,
+				      enum tc_setup_type type, void *type_data);
+
+typedef void flow_indr_block_cmd_t(struct net_device *dev,
+				   flow_indr_block_bind_cb_t *cb, void *cb_priv,
+				   enum flow_block_command command);
+
+struct flow_indr_block_entry {
+	flow_indr_block_cmd_t *cb;
+	struct list_head	list;
+};
+
+void flow_indr_add_block_cb(struct flow_indr_block_entry *entry);
+
+void flow_indr_del_block_cb(struct flow_indr_block_entry *entry);
+
+int __flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+				  flow_indr_block_bind_cb_t *cb,
+				  void *cb_ident);
+
+void __flow_indr_block_cb_unregister(struct net_device *dev,
+				     flow_indr_block_bind_cb_t *cb,
+				     void *cb_ident);
+
+int flow_indr_block_cb_register(struct net_device *dev, void *cb_priv,
+				flow_indr_block_bind_cb_t *cb, void *cb_ident);
+
+void flow_indr_block_cb_unregister(struct net_device *dev,
+				   flow_indr_block_bind_cb_t *cb,
+				   void *cb_ident);
+
+void flow_indr_block_call(struct net_device *dev,
+			  struct flow_block_offload *bo,
+			  enum flow_block_command command);
 
 #endif /* _NET_FLOW_OFFLOAD_H */

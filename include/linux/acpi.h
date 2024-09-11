@@ -21,9 +21,11 @@
 #ifndef _LINUX_ACPI_H
 #define _LINUX_ACPI_H
 
+#include <linux/rh_kabi.h>
+
 #include <linux/errno.h>
 #include <linux/ioport.h>	/* for struct resource */
-#include <linux/irqdomain.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/irqdomain.h>)
 #include <linux/resource_ext.h>
 #include <linux/device.h>
 #include <linux/property.h>
@@ -351,7 +353,14 @@ struct pci_dev;
 int acpi_pci_irq_enable (struct pci_dev *dev);
 void acpi_penalize_isa_irq(int irq, int active);
 bool acpi_isa_irq_available(int irq);
+#ifdef CONFIG_PCI
 void acpi_penalize_sci_irq(int irq, int trigger, int polarity);
+#else
+static inline void acpi_penalize_sci_irq(int irq, int trigger,
+					int polarity)
+{
+}
+#endif
 void acpi_pci_irq_disable (struct pci_dev *dev);
 
 extern int ec_read(u8 addr, u8 *val);
@@ -404,9 +413,14 @@ extern bool acpi_osi_is_win8(void);
 
 #ifdef CONFIG_ACPI_NUMA
 int acpi_map_pxm_to_online_node(int pxm);
+int acpi_map_pxm_to_node(int pxm);
 int acpi_get_node(acpi_handle handle);
 #else
 static inline int acpi_map_pxm_to_online_node(int pxm)
+{
+	return 0;
+}
+static inline int acpi_map_pxm_to_node(int pxm)
 {
 	return 0;
 }

@@ -11,6 +11,7 @@
 #include <uapi/linux/mman.h> /* To get things like MAP_HUGETLB even on older libc headers */
 #include <api/fs/fs.h>
 #include <linux/perf_event.h>
+#include <linux/zalloc.h>
 #include "event.h"
 #include "debug.h"
 #include "hist.h"
@@ -68,6 +69,7 @@ static const char *perf_event__names[] = {
 	[PERF_RECORD_EVENT_UPDATE]		= "EVENT_UPDATE",
 	[PERF_RECORD_TIME_CONV]			= "TIME_CONV",
 	[PERF_RECORD_HEADER_FEATURE]		= "FEATURE",
+	[PERF_RECORD_COMPRESSED]		= "COMPRESSED",
 };
 
 static const char *perf_ns__names[] = {
@@ -854,7 +856,7 @@ free_threads:
 	free(synthesize_threads);
 free_dirent:
 	for (i = 0; i < n; i++)
-		free(dirent[i]);
+		zfree(&dirent[i]);
 	free(dirent);
 
 	return err;

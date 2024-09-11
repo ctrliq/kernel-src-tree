@@ -47,7 +47,6 @@
 #include <linux/interrupt.h>
 #include <linux/idr.h>
 #include <linux/notifier.h>
-#include <linux/refcount.h>
 
 #include <linux/mlx5/device.h>
 #include <linux/mlx5/doorbell.h>
@@ -58,7 +57,6 @@
 
 enum {
 	MLX5_BOARD_ID_LEN = 64,
-	MLX5_MAX_NAME_LEN = 16,
 };
 
 enum {
@@ -183,6 +181,11 @@ enum port_state_policy {
 	MLX5_POLICY_UP		= 1,
 	MLX5_POLICY_FOLLOW	= 2,
 	MLX5_POLICY_INVALID	= 0xffffffff
+};
+
+enum mlx5_coredev_type {
+	MLX5_COREDEV_PF,
+	MLX5_COREDEV_VF
 };
 
 struct mlx5_field_desc {
@@ -395,7 +398,7 @@ enum mlx5_res_type {
 
 struct mlx5_core_rsc_common {
 	enum mlx5_res_type	res;
-	refcount_t		refcount;
+	atomic_t		refcount;
 	struct completion	free;
 };
 
@@ -438,14 +441,18 @@ struct mlx5_core_health {
 	struct timer_list		timer;
 	u32				prev;
 	int				miss_counter;
-	bool				sick;
+	u8				synd;
+	u32				fatal_error;
+	u32				crdump_size;
 	/* wq spinlock to synchronize draining */
 	spinlock_t			wq_lock;
 	struct workqueue_struct	       *wq;
 	unsigned long			flags;
-	struct work_struct		work;
+	struct work_struct		fatal_report_work;
+	struct work_struct		report_work;
 	struct delayed_work		recover_work;
 	struct devlink_health_reporter *fw_reporter;
+	struct devlink_health_reporter *fw_fatal_reporter;
 };
 
 struct mlx5_qp_table {
@@ -467,7 +474,7 @@ struct mlx5_vf_context {
 struct mlx5_core_sriov {
 	struct mlx5_vf_context	*vfs_ctx;
 	int			num_vfs;
-	int			enabled_vfs;
+	u16			max_vfs;
 };
 
 struct mlx5_fc_pool {
@@ -502,6 +509,7 @@ struct mlx5_eswitch;
 struct mlx5_lag;
 struct mlx5_devcom;
 struct mlx5_eq_table;
+struct mlx5_irq_table;
 
 struct mlx5_rate_limit {
 	u32			rate;
@@ -524,8 +532,15 @@ struct mlx5_rl_table {
 	struct mlx5_rl_entry   *rl_entry;
 };
 
+struct mlx5_core_roce {
+	struct mlx5_flow_table *ft;
+	struct mlx5_flow_group *fg;
+	struct mlx5_flow_handle *allow_rule;
+};
+
 struct mlx5_priv {
-	char			name[MLX5_MAX_NAME_LEN];
+	/* IRQ table valid only for real pci devices PF or VF */
+	struct mlx5_irq_table   *irq_table;
 	struct mlx5_eq_table	*eq_table;
 
 	/* pages stuff */
@@ -575,7 +590,7 @@ struct mlx5_priv {
 	struct mlx5_core_sriov	sriov;
 	struct mlx5_lag		*lag;
 	struct mlx5_devcom	*devcom;
-	unsigned long		pci_dev_data;
+	struct mlx5_core_roce	roce;
 	struct mlx5_fc_stats		fc_stats;
 	struct mlx5_rl_table            rl_table;
 
@@ -584,6 +599,7 @@ struct mlx5_priv {
 };
 
 enum mlx5_device_state {
+	MLX5_DEVICE_STATE_UNINITIALIZED,
 	MLX5_DEVICE_STATE_UP,
 	MLX5_DEVICE_STATE_INTERNAL_ERROR,
 };
@@ -617,6 +633,11 @@ struct mlx5e_resources {
 	struct mlx5_sq_bfreg       bfreg;
 };
 
+enum mlx5_sw_icm_type {
+	MLX5_SW_ICM_TYPE_STEERING,
+	MLX5_SW_ICM_TYPE_HEADER_MODIFY,
+};
+
 #define MLX5_MAX_RESERVED_GIDS 8
 
 struct mlx5_rsvd_gids {
@@ -648,12 +669,17 @@ struct mlx5_clock {
 	struct mlx5_pps            pps_info;
 };
 
+struct mlx5_dm;
+struct mlx5_fw_tracer;
 struct mlx5_vxlan;
 struct mlx5_geneve;
 
-struct mlx5_fw_tracer;
+#define MLX5_LOG_SW_ICM_BLOCK_SIZE(dev) (MLX5_CAP_DEV_MEM(dev, log_sw_icm_alloc_granularity))
+#define MLX5_SW_ICM_BLOCK_SIZE(dev) (1 << MLX5_LOG_SW_ICM_BLOCK_SIZE(dev))
 
 struct mlx5_core_dev {
+	struct device *device;
+	enum mlx5_coredev_type coredev_type;
 	struct pci_dev	       *pdev;
 	/* sync pci state */
 	struct mutex		pci_status_mutex;
@@ -684,6 +710,7 @@ struct mlx5_core_dev {
 	atomic_t		num_qps;
 	u32			issi;
 	struct mlx5e_resources  mlx5e_res;
+	struct mlx5_dm          *dm;
 	struct mlx5_vxlan       *vxlan;
 	struct mlx5_geneve      *geneve;
 	struct {
@@ -696,6 +723,7 @@ struct mlx5_core_dev {
 	struct mlx5_clock        clock;
 	struct mlx5_ib_clock_info  *clock_info;
 	struct mlx5_fw_tracer   *tracer;
+	u32                      vsc_addr;
 };
 
 struct mlx5_db {
@@ -900,13 +928,13 @@ void mlx5_cmd_mbox_status(void *out, u8 *status, u32 *syndrome);
 int mlx5_core_get_caps(struct mlx5_core_dev *dev, enum mlx5_cap_type cap_type);
 int mlx5_cmd_alloc_uar(struct mlx5_core_dev *dev, u32 *uarn);
 int mlx5_cmd_free_uar(struct mlx5_core_dev *dev, u32 uarn);
+void mlx5_health_flush(struct mlx5_core_dev *dev);
 void mlx5_health_cleanup(struct mlx5_core_dev *dev);
 int mlx5_health_init(struct mlx5_core_dev *dev);
 void mlx5_start_health_poll(struct mlx5_core_dev *dev);
 void mlx5_stop_health_poll(struct mlx5_core_dev *dev, bool disable_health);
 void mlx5_drain_health_wq(struct mlx5_core_dev *dev);
 void mlx5_trigger_health_work(struct mlx5_core_dev *dev);
-void mlx5_drain_health_recovery(struct mlx5_core_dev *dev);
 int mlx5_buf_alloc_node(struct mlx5_core_dev *dev, int size,
 			struct mlx5_frag_buf *buf, int node);
 int mlx5_buf_alloc(struct mlx5_core_dev *dev,
@@ -1065,6 +1093,10 @@ int mlx5_lag_query_cong_counters(struct mlx5_core_dev *dev,
 				 size_t *offsets);
 struct mlx5_uars_page *mlx5_get_uars_page(struct mlx5_core_dev *mdev);
 void mlx5_put_uars_page(struct mlx5_core_dev *mdev, struct mlx5_uars_page *up);
+int mlx5_dm_sw_icm_alloc(struct mlx5_core_dev *dev, enum mlx5_sw_icm_type type,
+			 u64 length, u16 uid, phys_addr_t *addr, u32 *obj_id);
+int mlx5_dm_sw_icm_dealloc(struct mlx5_core_dev *dev, enum mlx5_sw_icm_type type,
+			   u64 length, u16 uid, phys_addr_t addr, u32 obj_id);
 
 #ifdef CONFIG_MLX5_CORE_IPOIB
 struct net_device *mlx5_rdma_netdev_alloc(struct mlx5_core_dev *mdev,
@@ -1089,9 +1121,9 @@ enum {
 	MLX5_PCI_DEV_IS_VF		= 1 << 0,
 };
 
-static inline int mlx5_core_is_pf(struct mlx5_core_dev *dev)
+static inline bool mlx5_core_is_pf(const struct mlx5_core_dev *dev)
 {
-	return !(dev->priv.pci_dev_data & MLX5_PCI_DEV_IS_VF);
+	return dev->coredev_type == MLX5_COREDEV_PF;
 }
 
 static inline bool mlx5_core_is_ecpf(struct mlx5_core_dev *dev)
@@ -1099,18 +1131,20 @@ static inline bool mlx5_core_is_ecpf(struct mlx5_core_dev *dev)
 	return dev->caps.embedded_cpu;
 }
 
-static inline bool mlx5_core_is_ecpf_esw_manager(struct mlx5_core_dev *dev)
+static inline bool
+mlx5_core_is_ecpf_esw_manager(const struct mlx5_core_dev *dev)
 {
 	return dev->caps.embedded_cpu && MLX5_CAP_GEN(dev, eswitch_manager);
 }
 
-#define MLX5_HOST_PF_MAX_VFS	(127u)
-static inline u16 mlx5_core_max_vfs(struct mlx5_core_dev *dev)
+static inline bool mlx5_ecpf_vport_exists(const struct mlx5_core_dev *dev)
 {
-	if (mlx5_core_is_ecpf_esw_manager(dev))
-		return MLX5_HOST_PF_MAX_VFS;
-	else
-		return pci_sriov_get_totalvfs(dev->pdev);
+	return mlx5_core_is_pf(dev) && MLX5_CAP_ESW(dev, ecpf_vport_exists);
+}
+
+static inline u16 mlx5_core_max_vfs(const struct mlx5_core_dev *dev)
+{
+	return dev->priv.sriov.max_vfs;
 }
 
 static inline int mlx5_get_gid_table_len(u16 param)

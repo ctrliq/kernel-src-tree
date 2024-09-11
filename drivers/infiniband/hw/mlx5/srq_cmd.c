@@ -86,7 +86,7 @@ struct mlx5_core_srq *mlx5_cmd_get_srq(struct mlx5_ib_dev *dev, u32 srqn)
 	xa_lock(&table->array);
 	srq = xa_load(&table->array, srqn);
 	if (srq)
-		refcount_inc(&srq->common.refcount);
+		atomic_inc(&srq->common.refcount);
 	xa_unlock(&table->array);
 
 	return srq;
@@ -592,7 +592,7 @@ int mlx5_cmd_create_srq(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
 	if (err)
 		return err;
 
-	refcount_set(&srq->common.refcount, 1);
+	atomic_set(&srq->common.refcount, 1);
 	init_completion(&srq->common.free);
 
 	err = xa_err(xa_store_irq(&table->array, srq->srqn, srq, GFP_KERNEL));
@@ -607,7 +607,7 @@ err_destroy_srq_split:
 	return err;
 }
 
-int mlx5_cmd_destroy_srq(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq)
+void mlx5_cmd_destroy_srq(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq)
 {
 	struct mlx5_srq_table *table = &dev->srq_table;
 	struct mlx5_core_srq *tmp;
@@ -615,16 +615,14 @@ int mlx5_cmd_destroy_srq(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq)
 
 	tmp = xa_erase_irq(&table->array, srq->srqn);
 	if (!tmp || tmp != srq)
-		return -EINVAL;
+		return;
 
 	err = destroy_srq_split(dev, srq);
 	if (err)
-		return err;
+		return;
 
 	mlx5_core_res_put(&srq->common);
 	wait_for_completion(&srq->common.free);
-
-	return 0;
 }
 
 int mlx5_cmd_query_srq(struct mlx5_ib_dev *dev, struct mlx5_core_srq *srq,
@@ -677,7 +675,7 @@ static int srq_event_notifier(struct notifier_block *nb,
 	xa_lock(&table->array);
 	srq = xa_load(&table->array, srqn);
 	if (srq)
-		refcount_inc(&srq->common.refcount);
+		atomic_inc(&srq->common.refcount);
 	xa_unlock(&table->array);
 
 	if (!srq)

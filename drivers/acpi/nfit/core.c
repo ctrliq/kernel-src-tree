@@ -1,6 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright(c) 2013-2015 Intel Corporation. All rights reserved.
+ *
+ * This program is free software; you can redistribute it and/or modify
+ * it under the terms of version 2 of the GNU General Public License as
+ * published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * General Public License for more details.
  */
 #include <linux/list_sort.h>
 #include <linux/libnvdimm.h>
@@ -2948,11 +2956,15 @@ static int acpi_nfit_register_region(struct acpi_nfit_desc *acpi_desc,
 	ndr_desc->res = &res;
 	ndr_desc->provider_data = nfit_spa;
 	ndr_desc->attr_groups = acpi_nfit_region_attribute_groups;
-	if (spa->flags & ACPI_NFIT_PROXIMITY_VALID)
+	if (spa->flags & ACPI_NFIT_PROXIMITY_VALID) {
 		ndr_desc->numa_node = acpi_map_pxm_to_online_node(
 						spa->proximity_domain);
-	else
+		ndr_desc->target_node = acpi_map_pxm_to_node(
+				spa->proximity_domain);
+	} else {
 		ndr_desc->numa_node = NUMA_NO_NODE;
+		ndr_desc->target_node = NUMA_NO_NODE;
+	}
 
 	/*
 	 * Persistence domain bits are hierarchical, if

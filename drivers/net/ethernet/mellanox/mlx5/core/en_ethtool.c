@@ -32,6 +32,7 @@
 
 #include "en.h"
 #include "en/port.h"
+#include "en/xsk/umem.h"
 #include "lib/clock.h"
 
 void mlx5e_ethtool_get_drvinfo(struct mlx5e_priv *priv,
@@ -217,13 +218,9 @@ static const struct pflag_desc mlx5e_priv_flags[MLX5E_NUM_PFLAGS];
 
 int mlx5e_ethtool_get_sset_count(struct mlx5e_priv *priv, int sset)
 {
-	int i, num_stats = 0;
-
 	switch (sset) {
 	case ETH_SS_STATS:
-		for (i = 0; i < mlx5e_num_stats_grps; i++)
-			num_stats += mlx5e_stats_grps[i].get_num_stats(priv);
-		return num_stats;
+		return mlx5e_stats_total_num(priv);
 	case ETH_SS_PRIV_FLAGS:
 		return MLX5E_NUM_PFLAGS;
 	case ETH_SS_TEST:
@@ -239,14 +236,6 @@ static int mlx5e_get_sset_count(struct net_device *dev, int sset)
 	struct mlx5e_priv *priv = netdev_priv(dev);
 
 	return mlx5e_ethtool_get_sset_count(priv, sset);
-}
-
-static void mlx5e_fill_stats_strings(struct mlx5e_priv *priv, u8 *data)
-{
-	int i, idx = 0;
-
-	for (i = 0; i < mlx5e_num_stats_grps; i++)
-		idx = mlx5e_stats_grps[i].fill_strings(priv, data, idx);
 }
 
 void mlx5e_ethtool_get_strings(struct mlx5e_priv *priv, u32 stringset, u8 *data)
@@ -267,7 +256,7 @@ void mlx5e_ethtool_get_strings(struct mlx5e_priv *priv, u32 stringset, u8 *data)
 		break;
 
 	case ETH_SS_STATS:
-		mlx5e_fill_stats_strings(priv, data);
+		mlx5e_stats_fill_strings(priv, data);
 		break;
 	}
 }
@@ -282,14 +271,13 @@ static void mlx5e_get_strings(struct net_device *dev, u32 stringset, u8 *data)
 void mlx5e_ethtool_get_ethtool_stats(struct mlx5e_priv *priv,
 				     struct ethtool_stats *stats, u64 *data)
 {
-	int i, idx = 0;
+	int idx = 0;
 
 	mutex_lock(&priv->state_lock);
-	mlx5e_update_stats(priv);
+	mlx5e_stats_update(priv);
 	mutex_unlock(&priv->state_lock);
 
-	for (i = 0; i < mlx5e_num_stats_grps; i++)
-		idx = mlx5e_stats_grps[i].fill_stats(priv, data, idx);
+	mlx5e_stats_fill(priv, data, idx);
 }
 
 static void mlx5e_get_ethtool_stats(struct net_device *dev,
@@ -388,8 +376,17 @@ static int mlx5e_set_ringparam(struct net_device *dev,
 void mlx5e_ethtool_get_channels(struct mlx5e_priv *priv,
 				struct ethtool_channels *ch)
 {
-	ch->max_combined   = mlx5e_get_netdev_max_channels(priv->netdev);
+	mutex_lock(&priv->state_lock);
+
+	ch->max_combined   = priv->max_nch;
 	ch->combined_count = priv->channels.params.num_channels;
+	if (priv->xsk.refcnt) {
+		/* The upper half are XSK queues. */
+		ch->max_combined *= 2;
+		ch->combined_count *= 2;
+	}
+
+	mutex_unlock(&priv->state_lock);
 }
 
 static void mlx5e_get_channels(struct net_device *dev,
@@ -403,6 +400,7 @@ static void mlx5e_get_channels(struct net_device *dev,
 int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 			       struct ethtool_channels *ch)
 {
+	struct mlx5e_params *cur_params = &priv->channels.params;
 	unsigned int count = ch->combined_count;
 	struct mlx5e_channels new_channels = {};
 	bool arfs_enabled;
@@ -414,16 +412,26 @@ int mlx5e_ethtool_set_channels(struct mlx5e_priv *priv,
 		return -EINVAL;
 	}
 
-	if (priv->channels.params.num_channels == count)
+	if (cur_params->num_channels == count)
 		return 0;
 
 	mutex_lock(&priv->state_lock);
+
+	/* Don't allow changing the number of channels if there is an active
+	 * XSK, because the numeration of the XSK and regular RQs will change.
+	 */
+	if (priv->xsk.refcnt) {
+		err = -EINVAL;
+		netdev_err(priv->netdev, "%s: AF_XDP is active, cannot change the number of channels\n",
+			   __func__);
+		goto out;
+	}
 
 	new_channels.params = priv->channels.params;
 	new_channels.params.num_channels = count;
 
 	if (!test_bit(MLX5E_STATE_OPENED, &priv->state)) {
-		priv->channels.params = new_channels.params;
+		*cur_params = new_channels.params;
 		if (!netif_is_rxfh_configured(priv->netdev))
 			mlx5e_build_default_indir_rqt(priv->rss_params.indirection_rqt,
 						      MLX5E_INDIR_RQT_SIZE, count);
@@ -466,7 +474,7 @@ static int mlx5e_set_channels(struct net_device *dev,
 int mlx5e_ethtool_get_coalesce(struct mlx5e_priv *priv,
 			       struct ethtool_coalesce *coal)
 {
-	struct net_dim_cq_moder *rx_moder, *tx_moder;
+	struct dim_cq_moder *rx_moder, *tx_moder;
 
 	if (!MLX5_CAP_GEN(priv->mdev, cq_moderation))
 		return -EOPNOTSUPP;
@@ -521,7 +529,7 @@ mlx5e_set_priv_channels_coalesce(struct mlx5e_priv *priv, struct ethtool_coalesc
 int mlx5e_ethtool_set_coalesce(struct mlx5e_priv *priv,
 			       struct ethtool_coalesce *coal)
 {
-	struct net_dim_cq_moder *rx_moder, *tx_moder;
+	struct dim_cq_moder *rx_moder, *tx_moder;
 	struct mlx5_core_dev *mdev = priv->mdev;
 	struct mlx5e_channels new_channels = {};
 	int err = 0;
@@ -1831,7 +1839,8 @@ static int set_pflag_rx_no_csum_complete(struct net_device *netdev, bool enable)
 	struct mlx5e_channel *c;
 	int i;
 
-	if (!test_bit(MLX5E_STATE_OPENED, &priv->state))
+	if (!test_bit(MLX5E_STATE_OPENED, &priv->state) ||
+	    priv->channels.params.xdp_prog)
 		return 0;
 
 	for (i = 0; i < channels->num; i++) {

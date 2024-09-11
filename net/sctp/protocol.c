@@ -1274,7 +1274,7 @@ static int __net_init sctp_defaults_init(struct net *net)
 	net->sctp.auth_enable = 0;
 
 	/* Enable ECN by default. */
-	net->sctp.ecn_enable = 1;
+	net->sctp_ecn_enable = 1;
 
 	/* Set SCOPE policy to enabled */
 	net->sctp.scope_policy = SCTP_SCOPE_POLICY_ENABLE;

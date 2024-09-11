@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/log2.h>
 #include <linux/types.h>
+#include <linux/zalloc.h>
 
 #include <opencsd/ocsd_if_types.h>
 #include <stdlib.h>
@@ -2014,7 +2015,7 @@ err_free_etm:
 err_free_metadata:
 	/* No need to check @metadata[j], free(NULL) is supported */
 	for (j = 0; j < num_cpu; j++)
-		free(metadata[j]);
+		zfree(&metadata[j]);
 	zfree(&metadata);
 err_free_traceid_list:
 	intlist__delete(traceid_list);

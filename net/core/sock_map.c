@@ -46,13 +46,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 
 	/* Make sure page count doesn't overflow. */
 	cost = (u64) stab->map.max_entries * sizeof(struct sock *);
-	if (cost >= U32_MAX - PAGE_SIZE) {
-		err = -EINVAL;
-		goto free_stab;
-	}
-
-	stab->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
-	err = bpf_map_precharge_memlock(stab->map.pages);
+	err = bpf_map_charge_init(&stab->map.memory, cost);
 	if (err)
 		goto free_stab;
 
@@ -62,6 +56,7 @@ static struct bpf_map *sock_map_alloc(union bpf_attr *attr)
 	if (stab->sks)
 		return &stab->map;
 	err = -ENOMEM;
+	bpf_map_charge_finish(&stab->map.memory);
 free_stab:
 	kfree(stab);
 	return ERR_PTR(err);
@@ -243,18 +238,21 @@ static void sock_map_free(struct bpf_map *map)
 	int i;
 
 	synchronize_rcu();
-	rcu_read_lock();
 	raw_spin_lock_bh(&stab->lock);
 	for (i = 0; i < stab->map.max_entries; i++) {
 		struct sock **psk = &stab->sks[i];
 		struct sock *sk;
 
 		sk = xchg(psk, NULL);
-		if (sk)
+		if (sk) {
+			lock_sock(sk);
+			rcu_read_lock();
 			sock_map_unref(sk, psk);
+			rcu_read_unlock();
+			release_sock(sk);
+		}
 	}
 	raw_spin_unlock_bh(&stab->lock);
-	rcu_read_unlock();
 
 	/* wait for psock readers accessing its map link */
 	synchronize_rcu();
@@ -355,7 +353,7 @@ static int sock_map_update_common(struct bpf_map *map, u32 idx,
 		return -EINVAL;
 	if (unlikely(idx >= map->max_entries))
 		return -E2BIG;
-	if (unlikely(icsk->icsk_ulp_data))
+	if (unlikely(rcu_access_pointer(icsk->icsk_ulp_data)))
 		return -EINVAL;
 
 	link = sk_psock_init_link();
@@ -870,17 +868,19 @@ static void sock_hash_free(struct bpf_map *map)
 	int i;
 
 	synchronize_rcu();
-	rcu_read_lock();
 	for (i = 0; i < htab->buckets_num; i++) {
 		bucket = sock_hash_select_bucket(htab, i);
 		raw_spin_lock_bh(&bucket->lock);
 		hlist_for_each_entry_safe(elem, node, &bucket->head, node) {
 			hlist_del_rcu(&elem->node);
+			lock_sock(elem->sk);
+			rcu_read_lock();
 			sock_map_unref(elem->sk, elem);
+			rcu_read_unlock();
+			release_sock(elem->sk);
 		}
 		raw_spin_unlock_bh(&bucket->lock);
 	}
-	rcu_read_unlock();
 
 	/* wait for psock readers accessing its map link */
 	synchronize_rcu();

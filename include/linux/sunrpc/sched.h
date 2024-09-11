@@ -26,7 +26,7 @@ struct rpc_message {
 	const struct rpc_procinfo *rpc_proc;	/* Procedure information */
 	void *			rpc_argp;	/* Arguments */
 	void *			rpc_resp;	/* Result */
-	struct rpc_cred *	rpc_cred;	/* Credentials */
+	const struct cred *	rpc_cred;	/* Credentials */
 };
 
 struct rpc_call_ops;
@@ -61,6 +61,8 @@ struct rpc_task {
 		struct work_struct	tk_work;	/* Async task work queue */
 		struct rpc_wait		tk_wait;	/* RPC wait */
 	} u;
+
+	int			tk_rpc_status;	/* Result of last RPC operation */
 
 	/*
 	 * RPC call state

@@ -68,20 +68,14 @@ static int io_queue_depth = 1024;
 module_param_cb(io_queue_depth, &io_queue_depth_ops, &io_queue_depth, 0644);
 MODULE_PARM_DESC(io_queue_depth, "set io queue depth, should >= 2");
 
-static int queue_count_set(const char *val, const struct kernel_param *kp);
-static const struct kernel_param_ops queue_count_ops = {
-	.set = queue_count_set,
-	.get = param_get_int,
-};
-
 static int write_queues;
-module_param_cb(write_queues, &queue_count_ops, &write_queues, 0644);
+module_param(write_queues, int, 0644);
 MODULE_PARM_DESC(write_queues,
 	"Number of queues to use for writes. If not set, reads and writes "
 	"will share a queue set.");
 
 static int poll_queues;
-module_param_cb(poll_queues, &queue_count_ops, &poll_queues, 0644);
+module_param(poll_queues, int, 0644);
 MODULE_PARM_DESC(poll_queues, "Number of queues to use for polled IO.");
 
 struct nvme_dev;
@@ -142,19 +136,6 @@ static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
 	ret = kstrtoint(val, 10, &n);
 	if (ret != 0 || n < 2)
 		return -EINVAL;
-
-	return param_set_int(val, kp);
-}
-
-static int queue_count_set(const char *val, const struct kernel_param *kp)
-{
-	int n, ret;
-
-	ret = kstrtoint(val, 10, &n);
-	if (ret)
-		return ret;
-	if (n > num_possible_cpus())
-		n = num_possible_cpus();
 
 	return param_set_int(val, kp);
 }
@@ -800,10 +781,7 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 		struct nvme_command *cmnd)
 {
 	struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
-	struct request_queue *q = req->q;
-	enum dma_data_direction dma_dir = rq_data_dir(req) ?
-			DMA_TO_DEVICE : DMA_FROM_DEVICE;
-	blk_status_t ret = BLK_STS_IOERR;
+	blk_status_t ret = BLK_STS_RESOURCE;
 	int nr_mapped;
 
 	if (blk_rq_payload_bytes(req) > NVME_INT_BYTES(dev) ||
@@ -815,24 +793,21 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 		iod->sg = iod->inline_sg;
 	}
 
-	iod->use_sgl = nvme_pci_use_sgls(dev, req);
-
 	sg_init_table(iod->sg, blk_rq_nr_phys_segments(req));
-	iod->nents = blk_rq_map_sg(q, req, iod->sg);
+	iod->nents = blk_rq_map_sg(req->q, req, iod->sg);
 	if (!iod->nents)
 		goto out;
 
-	ret = BLK_STS_RESOURCE;
-
 	if (is_pci_p2pdma_page(sg_page(iod->sg)))
 		nr_mapped = pci_p2pdma_map_sg(dev->dev, iod->sg, iod->nents,
-					  dma_dir);
+						rq_dma_dir(req));
 	else
 		nr_mapped = dma_map_sg_attrs(dev->dev, iod->sg, iod->nents,
-					     dma_dir,  DMA_ATTR_NO_WARN);
+						rq_dma_dir(req), DMA_ATTR_NO_WARN);
 	if (!nr_mapped)
 		goto out;
 
+	iod->use_sgl = nvme_pci_use_sgls(dev, req);
 	if (iod->use_sgl)
 		ret = nvme_pci_setup_sgls(dev, req, &cmnd->rw, nr_mapped);
 	else
@@ -843,14 +818,14 @@ static blk_status_t nvme_map_data(struct nvme_dev *dev, struct request *req,
 
 	ret = BLK_STS_IOERR;
 	if (blk_integrity_rq(req)) {
-		if (blk_rq_count_integrity_sg(q, req->bio) != 1)
+		if (blk_rq_count_integrity_sg(req->q, req->bio) != 1)
 			goto out;
 
 		sg_init_table(&iod->meta_sg, 1);
-		if (blk_rq_map_integrity_sg(q, req->bio, &iod->meta_sg) != 1)
+		if (blk_rq_map_integrity_sg(req->q, req->bio, &iod->meta_sg) != 1)
 			goto out;
 
-		if (!dma_map_sg(dev->dev, &iod->meta_sg, 1, dma_dir))
+		if (!dma_map_sg(dev->dev, &iod->meta_sg, 1, rq_dma_dir(req)))
 			goto out;
 
 		cmnd->rw.metadata = cpu_to_le64(sg_dma_address(&iod->meta_sg));

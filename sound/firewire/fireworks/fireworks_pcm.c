@@ -197,6 +197,7 @@ static int pcm_open(struct snd_pcm_substream *substream)
 	if ((clock_source != SND_EFW_CLOCK_SOURCE_INTERNAL) ||
 	    (efw->substreams_counter > 0 && d->events_per_period > 0)) {
 		unsigned int frames_per_period = d->events_per_period;
+		unsigned int frames_per_buffer = d->events_per_buffer;
 		unsigned int sampling_rate;
 
 		err = snd_efw_command_get_sampling_rate(efw, &sampling_rate);
@@ -211,6 +212,14 @@ static int pcm_open(struct snd_pcm_substream *substream)
 			err = snd_pcm_hw_constraint_minmax(substream->runtime,
 					SNDRV_PCM_HW_PARAM_PERIOD_SIZE,
 					frames_per_period, frames_per_period);
+			if (err < 0) {
+				mutex_unlock(&efw->mutex);
+				goto err_locked;
+			}
+
+			err = snd_pcm_hw_constraint_minmax(substream->runtime,
+					SNDRV_PCM_HW_PARAM_BUFFER_SIZE,
+					frames_per_buffer, frames_per_buffer);
 			if (err < 0) {
 				mutex_unlock(&efw->mutex);
 				goto err_locked;
@@ -249,10 +258,11 @@ static int pcm_hw_params(struct snd_pcm_substream *substream,
 	if (substream->runtime->status->state == SNDRV_PCM_STATE_OPEN) {
 		unsigned int rate = params_rate(hw_params);
 		unsigned int frames_per_period = params_period_size(hw_params);
+		unsigned int frames_per_buffer = params_buffer_size(hw_params);
 
 		mutex_lock(&efw->mutex);
 		err = snd_efw_stream_reserve_duplex(efw, rate,
-						    frames_per_period);
+					frames_per_period, frames_per_buffer);
 		if (err >= 0)
 			++efw->substreams_counter;
 		mutex_unlock(&efw->mutex);
@@ -338,26 +348,28 @@ static int pcm_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
 {
 	struct snd_efw *efw = sbstrm->private_data;
-	return amdtp_stream_pcm_pointer(&efw->tx_stream);
+
+	return amdtp_domain_stream_pcm_pointer(&efw->domain, &efw->tx_stream);
 }
 static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
 {
 	struct snd_efw *efw = sbstrm->private_data;
-	return amdtp_stream_pcm_pointer(&efw->rx_stream);
+
+	return amdtp_domain_stream_pcm_pointer(&efw->domain, &efw->rx_stream);
 }
 
 static int pcm_capture_ack(struct snd_pcm_substream *substream)
 {
 	struct snd_efw *efw = substream->private_data;
 
-	return amdtp_stream_pcm_ack(&efw->tx_stream);
+	return amdtp_domain_stream_pcm_ack(&efw->domain, &efw->tx_stream);
 }
 
 static int pcm_playback_ack(struct snd_pcm_substream *substream)
 {
 	struct snd_efw *efw = substream->private_data;
 
-	return amdtp_stream_pcm_ack(&efw->rx_stream);
+	return amdtp_domain_stream_pcm_ack(&efw->domain, &efw->rx_stream);
 }
 
 int snd_efw_create_pcm_devices(struct snd_efw *efw)

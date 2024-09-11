@@ -23,6 +23,7 @@ struct xlog;
 struct xlog_ticket;
 struct xlog_recover;
 struct xlog_recover_item;
+struct xlog_rec_header;
 struct xfs_buf_log_format;
 struct xfs_inode_log_format;
 struct xfs_bmbt_irec;
@@ -30,6 +31,10 @@ struct xfs_btree_cur;
 struct xfs_refcount_irec;
 struct xfs_fsmap;
 struct xfs_rmap_irec;
+struct xfs_icreate_log;
+struct xfs_owner_info;
+struct xfs_trans_res;
+struct xfs_inobt_rec_incore;
 
 DECLARE_EVENT_CLASS(xfs_attr_list_class,
 	TP_PROTO(struct xfs_attr_list_context *ctx),
@@ -3361,6 +3366,189 @@ DEFINE_TRANS_EVENT(xfs_trans_free);
 DEFINE_TRANS_EVENT(xfs_trans_roll);
 DEFINE_TRANS_EVENT(xfs_trans_add_item);
 DEFINE_TRANS_EVENT(xfs_trans_free_items);
+
+TRACE_EVENT(xfs_iunlink_update_bucket,
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, unsigned int bucket,
+		 xfs_agino_t old_ptr, xfs_agino_t new_ptr),
+	TP_ARGS(mp, agno, bucket, old_ptr, new_ptr),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(unsigned int, bucket)
+		__field(xfs_agino_t, old_ptr)
+		__field(xfs_agino_t, new_ptr)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->agno = agno;
+		__entry->bucket = bucket;
+		__entry->old_ptr = old_ptr;
+		__entry->new_ptr = new_ptr;
+	),
+	TP_printk("dev %d:%d agno %u bucket %u old 0x%x new 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->agno,
+		  __entry->bucket,
+		  __entry->old_ptr,
+		  __entry->new_ptr)
+);
+
+TRACE_EVENT(xfs_iunlink_update_dinode,
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, xfs_agino_t agino,
+		 xfs_agino_t old_ptr, xfs_agino_t new_ptr),
+	TP_ARGS(mp, agno, agino, old_ptr, new_ptr),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_agino_t, agino)
+		__field(xfs_agino_t, old_ptr)
+		__field(xfs_agino_t, new_ptr)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->agno = agno;
+		__entry->agino = agino;
+		__entry->old_ptr = old_ptr;
+		__entry->new_ptr = new_ptr;
+	),
+	TP_printk("dev %d:%d agno %u agino 0x%x old 0x%x new 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->agno,
+		  __entry->agino,
+		  __entry->old_ptr,
+		  __entry->new_ptr)
+);
+
+DECLARE_EVENT_CLASS(xfs_ag_inode_class,
+	TP_PROTO(struct xfs_inode *ip),
+	TP_ARGS(ip),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(xfs_agino_t, agino)
+	),
+	TP_fast_assign(
+		__entry->dev = VFS_I(ip)->i_sb->s_dev;
+		__entry->agno = XFS_INO_TO_AGNO(ip->i_mount, ip->i_ino);
+		__entry->agino = XFS_INO_TO_AGINO(ip->i_mount, ip->i_ino);
+	),
+	TP_printk("dev %d:%d agno %u agino %u",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->agno, __entry->agino)
+)
+
+#define DEFINE_AGINODE_EVENT(name) \
+DEFINE_EVENT(xfs_ag_inode_class, name, \
+	TP_PROTO(struct xfs_inode *ip), \
+	TP_ARGS(ip))
+DEFINE_AGINODE_EVENT(xfs_iunlink);
+DEFINE_AGINODE_EVENT(xfs_iunlink_remove);
+DEFINE_AG_EVENT(xfs_iunlink_map_prev_fallback);
+
+DECLARE_EVENT_CLASS(xfs_fs_corrupt_class,
+	TP_PROTO(struct xfs_mount *mp, unsigned int flags),
+	TP_ARGS(mp, flags),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(unsigned int, flags)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->flags = flags;
+	),
+	TP_printk("dev %d:%d flags 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->flags)
+);
+#define DEFINE_FS_CORRUPT_EVENT(name)	\
+DEFINE_EVENT(xfs_fs_corrupt_class, name,	\
+	TP_PROTO(struct xfs_mount *mp, unsigned int flags), \
+	TP_ARGS(mp, flags))
+DEFINE_FS_CORRUPT_EVENT(xfs_fs_mark_sick);
+DEFINE_FS_CORRUPT_EVENT(xfs_fs_mark_healthy);
+DEFINE_FS_CORRUPT_EVENT(xfs_fs_unfixed_corruption);
+DEFINE_FS_CORRUPT_EVENT(xfs_rt_mark_sick);
+DEFINE_FS_CORRUPT_EVENT(xfs_rt_mark_healthy);
+DEFINE_FS_CORRUPT_EVENT(xfs_rt_unfixed_corruption);
+
+DECLARE_EVENT_CLASS(xfs_ag_corrupt_class,
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, unsigned int flags),
+	TP_ARGS(mp, agno, flags),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_agnumber_t, agno)
+		__field(unsigned int, flags)
+	),
+	TP_fast_assign(
+		__entry->dev = mp->m_super->s_dev;
+		__entry->agno = agno;
+		__entry->flags = flags;
+	),
+	TP_printk("dev %d:%d agno %u flags 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->agno, __entry->flags)
+);
+#define DEFINE_AG_CORRUPT_EVENT(name)	\
+DEFINE_EVENT(xfs_ag_corrupt_class, name,	\
+	TP_PROTO(struct xfs_mount *mp, xfs_agnumber_t agno, \
+		 unsigned int flags), \
+	TP_ARGS(mp, agno, flags))
+DEFINE_AG_CORRUPT_EVENT(xfs_ag_mark_sick);
+DEFINE_AG_CORRUPT_EVENT(xfs_ag_mark_healthy);
+DEFINE_AG_CORRUPT_EVENT(xfs_ag_unfixed_corruption);
+
+DECLARE_EVENT_CLASS(xfs_inode_corrupt_class,
+	TP_PROTO(struct xfs_inode *ip, unsigned int flags),
+	TP_ARGS(ip, flags),
+	TP_STRUCT__entry(
+		__field(dev_t, dev)
+		__field(xfs_ino_t, ino)
+		__field(unsigned int, flags)
+	),
+	TP_fast_assign(
+		__entry->dev = ip->i_mount->m_super->s_dev;
+		__entry->ino = ip->i_ino;
+		__entry->flags = flags;
+	),
+	TP_printk("dev %d:%d ino 0x%llx flags 0x%x",
+		  MAJOR(__entry->dev), MINOR(__entry->dev),
+		  __entry->ino, __entry->flags)
+);
+#define DEFINE_INODE_CORRUPT_EVENT(name)	\
+DEFINE_EVENT(xfs_inode_corrupt_class, name,	\
+	TP_PROTO(struct xfs_inode *ip, unsigned int flags), \
+	TP_ARGS(ip, flags))
+DEFINE_INODE_CORRUPT_EVENT(xfs_inode_mark_sick);
+DEFINE_INODE_CORRUPT_EVENT(xfs_inode_mark_healthy);
+
+DECLARE_EVENT_CLASS(xfs_kmem_class,
+	TP_PROTO(ssize_t size, int flags, unsigned long caller_ip),
+	TP_ARGS(size, flags, caller_ip),
+	TP_STRUCT__entry(
+		__field(ssize_t, size)
+		__field(int, flags)
+		__field(unsigned long, caller_ip)
+	),
+	TP_fast_assign(
+		__entry->size = size;
+		__entry->flags = flags;
+		__entry->caller_ip = caller_ip;
+	),
+	TP_printk("size %zd flags 0x%x caller %pS",
+		  __entry->size,
+		  __entry->flags,
+		  (char *)__entry->caller_ip)
+)
+
+#define DEFINE_KMEM_EVENT(name) \
+DEFINE_EVENT(xfs_kmem_class, name, \
+	TP_PROTO(ssize_t size, int flags, unsigned long caller_ip), \
+	TP_ARGS(size, flags, caller_ip))
+DEFINE_KMEM_EVENT(kmem_alloc);
+DEFINE_KMEM_EVENT(kmem_alloc_io);
+DEFINE_KMEM_EVENT(kmem_alloc_large);
+DEFINE_KMEM_EVENT(kmem_realloc);
+DEFINE_KMEM_EVENT(kmem_zone_alloc);
 
 #endif /* _TRACE_XFS_H */
 

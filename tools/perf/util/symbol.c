@@ -26,6 +26,7 @@
 #include "header.h"
 #include "path.h"
 #include <linux/ctype.h>
+#include <linux/zalloc.h>
 
 #include <elf.h>
 #include <limits.h>
@@ -51,6 +52,7 @@ struct symbol_conf symbol_conf = {
 	.symfs			= "",
 	.event_group		= true,
 	.inline_name		= true,
+	.res_sample		= 0,
 };
 
 static enum dso_binary_type binary_type_symtab[] = {

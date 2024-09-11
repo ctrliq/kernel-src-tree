@@ -684,7 +684,7 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 	struct request *rq;
 	struct list_head *plug_list;
 
-	plug = current->plug;
+	plug = blk_mq_plug(q, bio);
 	if (!plug)
 		return false;
 
@@ -725,18 +725,6 @@ bool blk_attempt_plug_merge(struct request_queue *q, struct bio *bio,
 
 	return false;
 }
-
-void blk_init_request_from_bio(struct request *req, struct bio *bio)
-{
-	if (bio->bi_opf & REQ_RAHEAD)
-		req->cmd_flags |= REQ_FAILFAST_MASK;
-
-	req->__sector = bio->bi_iter.bi_sector;
-	req->ioprio = bio_prio(bio);
-	req->write_hint = bio->bi_write_hint;
-	blk_rq_bio_prep(req->q, req, bio);
-}
-EXPORT_SYMBOL_GPL(blk_init_request_from_bio);
 
 static void handle_bad_sector(struct bio *bio, sector_t maxsector)
 {
@@ -1488,6 +1476,7 @@ void blk_rq_bio_prep(struct request_queue *q, struct request *rq,
 
 	rq->__data_len = bio->bi_iter.bi_size;
 	rq->bio = rq->biotail = bio;
+	rq->ioprio = bio_prio(bio);
 
 	if (bio->bi_disk)
 		rq->rq_disk = bio->bi_disk;

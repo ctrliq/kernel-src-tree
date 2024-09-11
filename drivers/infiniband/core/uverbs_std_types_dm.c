@@ -35,7 +35,8 @@
 #include <rdma/uverbs_std_types.h>
 
 static int uverbs_free_dm(struct ib_uobject *uobject,
-			  enum rdma_remove_reason why)
+			  enum rdma_remove_reason why,
+			  struct uverbs_attr_bundle *attrs)
 {
 	struct ib_dm *dm = uobject->object;
 	int ret;
@@ -44,7 +45,7 @@ static int uverbs_free_dm(struct ib_uobject *uobject,
 	if (ret)
 		return ret;
 
-	return dm->device->ops.dealloc_dm(dm);
+	return dm->device->ops.dealloc_dm(dm, attrs);
 }
 
 static int UVERBS_HANDLER(UVERBS_METHOD_DM_ALLOC)(

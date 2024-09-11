@@ -21,6 +21,7 @@
 #include <linux/types.h>
 #include <linux/bitops.h>
 #include <linux/log2.h>
+#include <linux/zalloc.h>
 
 #include "cpumap.h"
 #include "color.h"
@@ -30,7 +31,6 @@
 #include "map.h"
 #include "symbol.h"
 #include "session.h"
-#include "util.h"
 #include "thread.h"
 #include "thread-stack.h"
 #include "debug.h"

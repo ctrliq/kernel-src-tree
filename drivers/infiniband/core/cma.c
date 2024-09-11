@@ -616,6 +616,9 @@ cma_validate_port(struct ib_device *device, u8 port,
 	int dev_type = dev_addr->dev_type;
 	struct net_device *ndev = NULL;
 
+	if (!rdma_dev_access_netns(device, id_priv->id.route.addr.dev_addr.net))
+		return ERR_PTR(-ENODEV);
+
 	if ((dev_type == ARPHRD_INFINIBAND) && !rdma_protocol_ib(device, port))
 		return ERR_PTR(-ENODEV);
 
@@ -660,7 +663,7 @@ static int cma_acquire_dev_by_src_ip(struct rdma_id_private *id_priv)
 	struct cma_device *cma_dev;
 	enum ib_gid_type gid_type;
 	int ret = -ENODEV;
-	u8 port;
+	unsigned int port;
 
 	if (dev_addr->dev_type != ARPHRD_INFINIBAND &&
 	    id_priv->id.ps == RDMA_PS_IPOIB)
@@ -674,8 +677,7 @@ static int cma_acquire_dev_by_src_ip(struct rdma_id_private *id_priv)
 
 	mutex_lock(&lock);
 	list_for_each_entry(cma_dev, &dev_list, list) {
-		for (port = rdma_start_port(cma_dev->device);
-		     port <= rdma_end_port(cma_dev->device); port++) {
+		rdma_for_each_port (cma_dev->device, port) {
 			gidp = rdma_protocol_roce(cma_dev->device, port) ?
 			       &iboe_gid : &gid;
 			gid_type = cma_dev->default_gid_type[port - 1];
@@ -1484,6 +1486,7 @@ static struct net_device *
 roce_get_net_dev_by_cm_event(const struct ib_cm_event *ib_event)
 {
 	const struct ib_gid_attr *sgid_attr = NULL;
+	struct net_device *ndev;
 
 	if (ib_event->event == IB_CM_REQ_RECEIVED)
 		sgid_attr = ib_event->param.req_rcvd.ppath_sgid_attr;
@@ -1492,8 +1495,15 @@ roce_get_net_dev_by_cm_event(const struct ib_cm_event *ib_event)
 
 	if (!sgid_attr)
 		return NULL;
-	dev_hold(sgid_attr->ndev);
-	return sgid_attr->ndev;
+
+	rcu_read_lock();
+	ndev = rdma_read_gid_attr_ndev_rcu(sgid_attr);
+	if (IS_ERR(ndev))
+		ndev = NULL;
+	else
+		dev_hold(ndev);
+	rcu_read_unlock();
+	return ndev;
 }
 
 static struct net_device *cma_get_net_dev(const struct ib_cm_event *ib_event,
@@ -4563,7 +4573,7 @@ static void cma_add_one(struct ib_device *device)
 	if (!cma_dev->default_roce_tos)
 		goto free_gid_type;
 
-	for (i = rdma_start_port(device); i <= rdma_end_port(device); i++) {
+	rdma_for_each_port (device, i) {
 		supported_gids = roce_gid_type_mask_support(device, i);
 		WARN_ON(!supported_gids);
 		if (supported_gids & (1 << CMA_PREFERRED_ROCE_GID_TYPE))

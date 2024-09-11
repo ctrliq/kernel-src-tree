@@ -47,6 +47,12 @@ extern struct sort_entry sort_srcline;
 extern enum sort_type sort__first_dimension;
 extern const char default_mem_sort_order[];
 
+struct res_sample {
+	u64 time;
+	int cpu;
+	int tid;
+};
+
 struct he_stat {
 	u64			period;
 	u64			period_sys;
@@ -73,6 +79,9 @@ struct hist_entry_diff {
 
 		/* HISTC_WEIGHTED_DIFF */
 		s64	wdiff;
+
+		/* PERF_HPP_DIFF__CYCLES */
+		s64	cycles;
 	};
 };
 
@@ -141,6 +150,8 @@ struct hist_entry {
 	struct block_info	*block_info;
 	void			*raw_data;
 	u32			raw_size;
+	int			num_res;
+	struct res_sample	*res_samples;
 	void			*trace_output;
 	struct perf_hpp_list	*hpp_list;
 	struct hist_entry	*parent_he;
@@ -276,6 +287,15 @@ struct sort_entry {
 			       unsigned int width);
 	int	(*se_filter)(struct hist_entry *he, int type, const void *arg);
 	u8	se_width_idx;
+};
+
+struct block_hist {
+	struct hists		block_hists;
+	struct perf_hpp_list	block_list;
+	struct perf_hpp_fmt	block_fmt;
+	int			block_idx;
+	bool			valid;
+	struct hist_entry	he;
 };
 
 extern struct sort_entry sort_thread;

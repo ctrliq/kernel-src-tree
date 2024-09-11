@@ -35,6 +35,11 @@ nfp-objs := \
 	    nfp_shared_buf.o \
 	    nic/main.o
 
+ifeq ($(CONFIG_TLS_DEVICE),y)
+nfp-objs += \
+	    crypto/tls.o
+endif
+
 ifeq ($(CONFIG_NFP_APP_FLOWER),y)
 nfp-objs += \
 	    flower/action.o \
@@ -44,7 +49,8 @@ nfp-objs += \
 	    flower/match.o \
 	    flower/metadata.o \
 	    flower/offload.o \
-	    flower/tunnel_conf.o
+	    flower/tunnel_conf.o \
+	    flower/qos_conf.o
 endif
 
 ifeq ($(CONFIG_BPF_SYSCALL),y)

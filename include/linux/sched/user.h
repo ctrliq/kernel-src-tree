@@ -14,7 +14,8 @@ struct key;
  * Some day this will be a full-fledged user tracking system..
  */
 struct user_struct {
-	refcount_t __count;	/* reference count */
+	/* reference count */
+	RH_KABI_REPLACE(atomic_t __count, refcount_t __count)
 	atomic_t processes;	/* How many processes does this user have? */
 	atomic_t sigpending;	/* How many pending signals does this user have? */
 #ifdef CONFIG_FANOTIFY

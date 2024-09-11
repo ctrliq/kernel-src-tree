@@ -348,8 +348,7 @@ static struct phy_driver dp83867_driver[] = {
 		.phy_id		= DP83867_PHY_ID,
 		.phy_id_mask	= 0xfffffff0,
 		.name		= "TI DP83867",
-		.features	= PHY_GBIT_FEATURES,
-		.flags		= PHY_HAS_INTERRUPT,
+		/* PHY_GBIT_FEATURES */
 
 		.config_init	= dp83867_config_init,
 		.soft_reset	= dp83867_phy_reset,

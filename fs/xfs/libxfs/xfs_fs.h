@@ -199,8 +199,17 @@ struct xfs_fsop_geom {
 	__u32		rtsectsize;	/* realtime sector size, bytes	*/
 	__u32		dirblocksize;	/* directory block size, bytes	*/
 	__u32		logsunit;	/* log stripe unit, bytes	*/
-	__u64		reserved[18];	/* reserved space		*/
+	uint32_t	sick;		/* o: unhealthy fs & rt metadata */
+	uint32_t	checked;	/* o: checked fs & rt metadata	*/
+	__u64		reserved[17];	/* reserved space		*/
 };
+
+#define XFS_FSOP_GEOM_SICK_COUNTERS	(1 << 0)  /* summary counters */
+#define XFS_FSOP_GEOM_SICK_UQUOTA	(1 << 1)  /* user quota */
+#define XFS_FSOP_GEOM_SICK_GQUOTA	(1 << 2)  /* group quota */
+#define XFS_FSOP_GEOM_SICK_PQUOTA	(1 << 3)  /* project quota */
+#define XFS_FSOP_GEOM_SICK_RT_BITMAP	(1 << 4)  /* realtime bitmap */
+#define XFS_FSOP_GEOM_SICK_RT_SUMMARY	(1 << 5)  /* realtime summary */
 
 /* Output for XFS_FS_COUNTS */
 typedef struct xfs_fsop_counts {
@@ -276,9 +285,21 @@ struct xfs_ag_geometry {
 	uint32_t	ag_freeblks;	/* o: free space */
 	uint32_t	ag_icount;	/* o: inodes allocated */
 	uint32_t	ag_ifree;	/* o: inodes free */
+	uint32_t	ag_sick;	/* o: sick things in ag */
+	uint32_t	ag_checked;	/* o: checked metadata in ag */
 	uint32_t	ag_reserved32;	/* o: zero */
-	uint64_t	ag_reserved[13];/* o: zero */
+	uint64_t	ag_reserved[12];/* o: zero */
 };
+#define XFS_AG_GEOM_SICK_SB	(1 << 0)  /* superblock */
+#define XFS_AG_GEOM_SICK_AGF	(1 << 1)  /* AGF header */
+#define XFS_AG_GEOM_SICK_AGFL	(1 << 2)  /* AGFL header */
+#define XFS_AG_GEOM_SICK_AGI	(1 << 3)  /* AGI header */
+#define XFS_AG_GEOM_SICK_BNOBT	(1 << 4)  /* free space by block */
+#define XFS_AG_GEOM_SICK_CNTBT	(1 << 5)  /* free space by length */
+#define XFS_AG_GEOM_SICK_INOBT	(1 << 6)  /* inode index */
+#define XFS_AG_GEOM_SICK_FINOBT	(1 << 7)  /* free inode index */
+#define XFS_AG_GEOM_SICK_RMAPBT	(1 << 8)  /* reverse mappings */
+#define XFS_AG_GEOM_SICK_REFCNTBT (1 << 9)  /* reference counts */
 
 /*
  * Structures for XFS_IOC_FSGROWFSDATA, XFS_IOC_FSGROWFSLOG & XFS_IOC_FSGROWFSRT
@@ -328,12 +349,24 @@ typedef struct xfs_bstat {
 #define	bs_projid	bs_projid_lo	/* (previously just bs_projid)	*/
 	__u16		bs_forkoff;	/* inode fork offset in bytes	*/
 	__u16		bs_projid_hi;	/* higher part of project id	*/
-	unsigned char	bs_pad[6];	/* pad space, unused		*/
+	uint16_t	bs_sick;	/* sick inode metadata		*/
+	uint16_t	bs_checked;	/* checked inode metadata	*/
+	unsigned char	bs_pad[2];	/* pad space, unused		*/
 	__u32		bs_cowextsize;	/* cow extent size		*/
 	__u32		bs_dmevmask;	/* DMIG event mask		*/
 	__u16		bs_dmstate;	/* DMIG state info		*/
 	__u16		bs_aextents;	/* attribute number of extents	*/
 } xfs_bstat_t;
+
+/* bs_sick flags */
+#define XFS_BS_SICK_INODE	(1 << 0)  /* inode core */
+#define XFS_BS_SICK_BMBTD	(1 << 1)  /* data fork */
+#define XFS_BS_SICK_BMBTA	(1 << 2)  /* attr fork */
+#define XFS_BS_SICK_BMBTC	(1 << 3)  /* cow fork */
+#define XFS_BS_SICK_DIR		(1 << 4)  /* directory */
+#define XFS_BS_SICK_XATTR	(1 << 5)  /* extended attributes */
+#define XFS_BS_SICK_SYMLINK	(1 << 6)  /* symbolic link remote target */
+#define XFS_BS_SICK_PARENT	(1 << 7)  /* parent pointers */
 
 /*
  * Project quota id helpers (previously projid was 16bit only

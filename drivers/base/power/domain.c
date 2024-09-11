@@ -22,6 +22,7 @@
 #include <linux/sched.h>
 #include <linux/suspend.h>
 #include <linux/export.h>
+#include <linux/cpu.h>
 
 #include "power.h"
 
@@ -128,6 +129,8 @@ static const struct genpd_lock_ops genpd_spin_ops = {
 #define genpd_is_irq_safe(genpd)	(genpd->flags & GENPD_FLAG_IRQ_SAFE)
 #define genpd_is_always_on(genpd)	(genpd->flags & GENPD_FLAG_ALWAYS_ON)
 #define genpd_is_active_wakeup(genpd)	(genpd->flags & GENPD_FLAG_ACTIVE_WAKEUP)
+#define genpd_is_cpu_domain(genpd)	(genpd->flags & GENPD_FLAG_CPU_DOMAIN)
+#define genpd_is_rpm_always_on(genpd)	(genpd->flags & GENPD_FLAG_RPM_ALWAYS_ON)
 
 static inline bool irq_safe_dev_in_no_sleep_domain(struct device *dev,
 		const struct generic_pm_domain *genpd)
@@ -515,7 +518,9 @@ static int genpd_power_off(struct generic_pm_domain *genpd, bool one_dev_on,
 	 * (1) The domain is configured as always on.
 	 * (2) When the domain has a subdomain being powered on.
 	 */
-	if (genpd_is_always_on(genpd) || atomic_read(&genpd->sd_count) > 0)
+	if (genpd_is_always_on(genpd) ||
+			genpd_is_rpm_always_on(genpd) ||
+			atomic_read(&genpd->sd_count) > 0)
 		return -EBUSY;
 
 	list_for_each_entry(pdd, &genpd->dev_list, list_node) {
@@ -1394,8 +1399,7 @@ EXPORT_SYMBOL_GPL(pm_genpd_syscore_poweron);
 
 #endif /* CONFIG_PM_SLEEP */
 
-static struct generic_pm_domain_data *genpd_alloc_dev_data(struct device *dev,
-					struct gpd_timing_data *td)
+static struct generic_pm_domain_data *genpd_alloc_dev_data(struct device *dev)
 {
 	struct generic_pm_domain_data *gpd_data;
 	int ret;
@@ -1409,9 +1413,6 @@ static struct generic_pm_domain_data *genpd_alloc_dev_data(struct device *dev,
 		ret = -ENOMEM;
 		goto err_put;
 	}
-
-	if (td)
-		gpd_data->td = *td;
 
 	gpd_data->base.dev = dev;
 	gpd_data->td.constraint_changed = true;
@@ -1452,8 +1453,57 @@ static void genpd_free_dev_data(struct device *dev,
 	dev_pm_put_subsys_data(dev);
 }
 
+static void genpd_update_cpumask(struct generic_pm_domain *genpd,
+				 int cpu, bool set, unsigned int depth)
+{
+	struct gpd_link *link;
+
+	if (!genpd_is_cpu_domain(genpd))
+		return;
+
+	list_for_each_entry(link, &genpd->slave_links, slave_node) {
+		struct generic_pm_domain *master = link->master;
+
+		genpd_lock_nested(master, depth + 1);
+		genpd_update_cpumask(master, cpu, set, depth + 1);
+		genpd_unlock(master);
+	}
+
+	if (set)
+		cpumask_set_cpu(cpu, genpd->cpus);
+	else
+		cpumask_clear_cpu(cpu, genpd->cpus);
+}
+
+static void genpd_set_cpumask(struct generic_pm_domain *genpd, int cpu)
+{
+	if (cpu >= 0)
+		genpd_update_cpumask(genpd, cpu, true, 0);
+}
+
+static void genpd_clear_cpumask(struct generic_pm_domain *genpd, int cpu)
+{
+	if (cpu >= 0)
+		genpd_update_cpumask(genpd, cpu, false, 0);
+}
+
+static int genpd_get_cpu(struct generic_pm_domain *genpd, struct device *dev)
+{
+	int cpu;
+
+	if (!genpd_is_cpu_domain(genpd))
+		return -1;
+
+	for_each_possible_cpu(cpu) {
+		if (get_cpu_device(cpu) == dev)
+			return cpu;
+	}
+
+	return -1;
+}
+
 static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
-			    struct gpd_timing_data *td)
+			    struct device *base_dev)
 {
 	struct generic_pm_domain_data *gpd_data;
 	int ret;
@@ -1463,9 +1513,11 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 	if (IS_ERR_OR_NULL(genpd) || IS_ERR_OR_NULL(dev))
 		return -EINVAL;
 
-	gpd_data = genpd_alloc_dev_data(dev, td);
+	gpd_data = genpd_alloc_dev_data(dev);
 	if (IS_ERR(gpd_data))
 		return PTR_ERR(gpd_data);
+
+	gpd_data->cpu = genpd_get_cpu(genpd, base_dev);
 
 	ret = genpd->attach_dev ? genpd->attach_dev(genpd, dev) : 0;
 	if (ret)
@@ -1473,6 +1525,7 @@ static int genpd_add_device(struct generic_pm_domain *genpd, struct device *dev,
 
 	genpd_lock(genpd);
 
+	genpd_set_cpumask(genpd, gpd_data->cpu);
 	dev_pm_domain_set(dev, &genpd->domain);
 
 	genpd->device_count++;
@@ -1501,7 +1554,7 @@ int pm_genpd_add_device(struct generic_pm_domain *genpd, struct device *dev)
 	int ret;
 
 	mutex_lock(&gpd_list_lock);
-	ret = genpd_add_device(genpd, dev, NULL);
+	ret = genpd_add_device(genpd, dev, dev);
 	mutex_unlock(&gpd_list_lock);
 
 	return ret;
@@ -1532,6 +1585,7 @@ static int genpd_remove_device(struct generic_pm_domain *genpd,
 	genpd->device_count--;
 	genpd->max_off_time_changed = true;
 
+	genpd_clear_cpumask(genpd, gpd_data->cpu);
 	dev_pm_domain_set(dev, NULL);
 
 	list_del_init(&pdd->list_node);
@@ -1765,16 +1819,24 @@ int pm_genpd_init(struct generic_pm_domain *genpd,
 	}
 
 	/* Always-on domains must be powered on at initialization. */
-	if (genpd_is_always_on(genpd) && !genpd_status_on(genpd))
+	if ((genpd_is_always_on(genpd) || genpd_is_rpm_always_on(genpd)) &&
+			!genpd_status_on(genpd))
 		return -EINVAL;
+
+	if (genpd_is_cpu_domain(genpd) &&
+	    !zalloc_cpumask_var(&genpd->cpus, GFP_KERNEL))
+		return -ENOMEM;
 
 	/* Use only one "off" state if there were no states declared */
 	if (genpd->state_count == 0) {
 		ret = genpd_set_default_power_state(genpd);
-		if (ret)
+		if (ret) {
+			if (genpd_is_cpu_domain(genpd))
+				free_cpumask_var(genpd->cpus);
 			return ret;
-	} else if (!gov) {
-		pr_warn("%s: no governor for states\n", genpd->name);
+		}
+	} else if (!gov && genpd->state_count > 1) {
+		pr_warn("%s : no governor for states\n", genpd->name);
 	}
 
 	device_initialize(&genpd->dev);
@@ -1818,6 +1880,8 @@ static int genpd_remove(struct generic_pm_domain *genpd)
 	list_del(&genpd->gpd_list_node);
 	genpd_unlock(genpd);
 	cancel_work_sync(&genpd->power_off_work);
+	if (genpd_is_cpu_domain(genpd))
+		free_cpumask_var(genpd->cpus);
 	if (genpd->free_states)
 		genpd->free_states(genpd->states, genpd->state_count);
 
@@ -2198,7 +2262,7 @@ int of_genpd_add_device(struct of_phandle_args *genpdspec, struct device *dev)
 		goto out;
 	}
 
-	ret = genpd_add_device(genpd, dev, NULL);
+	ret = genpd_add_device(genpd, dev, dev);
 
 out:
 	mutex_unlock(&gpd_list_lock);
@@ -2368,7 +2432,7 @@ static int __genpd_dev_pm_attach(struct device *dev, struct device *base_dev,
 
 	dev_dbg(dev, "adding to PM domain %s\n", pd->name);
 
-	ret = genpd_add_device(pd, dev, NULL);
+	ret = genpd_add_device(pd, dev, base_dev);
 	mutex_unlock(&gpd_list_lock);
 
 	if (ret < 0) {

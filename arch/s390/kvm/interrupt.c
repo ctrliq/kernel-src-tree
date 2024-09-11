@@ -1240,8 +1240,8 @@ void kvm_s390_vcpu_wakeup(struct kvm_vcpu *vcpu)
 		 * The vcpu gave up the cpu voluntarily, mark it as a good
 		 * yield-candidate.
 		 */
-		vcpu->preempted = true;
-		swake_up(&vcpu->wq);
+		vcpu->ready = true;
+		swake_up_one(&vcpu->wq);
 		vcpu->stat.halt_wakeup++;
 	}
 	/*
@@ -2393,7 +2393,7 @@ static int kvm_s390_adapter_map(struct kvm *kvm, unsigned int id, __u64 addr)
 		ret = -EFAULT;
 		goto out;
 	}
-	ret = get_user_pages_fast(map->addr, 1, 1, &map->page);
+	ret = get_user_pages_fast(map->addr, 1, FOLL_WRITE, &map->page);
 	if (ret < 0)
 		goto out;
 	BUG_ON(ret != 1);

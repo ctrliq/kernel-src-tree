@@ -275,7 +275,7 @@ static bool cpu_power_down_ok(struct dev_pm_domain *pd)
 	for_each_cpu_and(cpu, genpd->cpus, cpu_online_mask) {
 		dev = per_cpu(cpuidle_devices, cpu);
 		if (dev) {
-			next_hrtimer = READ_ONCE(dev->next_hrtimer);
+			next_hrtimer = READ_ONCE(dev->rh_cpuidle_dev.next_hrtimer);
 			if (ktime_before(next_hrtimer, domain_wakeup))
 				domain_wakeup = next_hrtimer;
 		}

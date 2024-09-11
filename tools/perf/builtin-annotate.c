@@ -8,11 +8,11 @@
  */
 #include "builtin.h"
 
-#include "util/util.h"
 #include "util/color.h"
 #include <linux/list.h>
 #include "util/cache.h"
 #include <linux/rbtree.h>
+#include <linux/zalloc.h>
 #include "util/symbol.h"
 
 #include "perf.h"
@@ -37,6 +37,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <linux/bitmap.h>
+#include <linux/err.h>
 
 struct perf_annotate {
 	struct perf_tool tool;
@@ -581,8 +582,8 @@ int cmd_annotate(int argc, const char **argv)
 	data.path = input_name;
 
 	annotate.session = perf_session__new(&data, false, &annotate.tool);
-	if (annotate.session == NULL)
-		return -1;
+	if (IS_ERR(annotate.session))
+		return PTR_ERR(annotate.session);
 
 	annotate.has_br_stack = perf_header__has_feat(&annotate.session->header,
 						      HEADER_BRANCH_STACK);

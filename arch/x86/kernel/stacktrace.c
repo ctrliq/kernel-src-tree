@@ -137,3 +137,4 @@ void arch_stack_walk_user(stack_trace_consume_fn consume_entry, void *cookie,
 	}
 }
 
+#include "rh_stacktrace.c"

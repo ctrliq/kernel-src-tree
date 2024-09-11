@@ -49,11 +49,30 @@ struct list_lru_node {
 	long nr_items;
 } ____cacheline_aligned_in_smp;
 
+/*
+ * RHEL8 NOTE:
+ * struct list_lru gets embedded into struct super_block, thus we're
+ * kABI constrained to 32 bytes in size to not break other's layout
+ * compromises. Currently, we only have a 3-byte padding hole
+ * available in this struct for any future extention:
+ *
+ * struct list_lru {
+ *	struct list_lru_node * node;                     //     0     8
+ *	struct list_head   list;                         //     8    16
+ *	int                        shrinker_id;          //    24     4
+ *	bool                       memcg_aware;          //    28     1
+ *
+ *	// size: 32, cachelines: 1, members: 4
+ *	// padding: 3
+ *	// last cacheline: 32 bytes
+ * };
+ */
 struct list_lru {
 	struct list_lru_node	*node;
 #ifdef CONFIG_MEMCG_KMEM
 	struct list_head	list;
 	RH_KABI_EXTEND(int	shrinker_id)
+	RH_KABI_EXTEND(bool	memcg_aware)
 #endif
 };
 

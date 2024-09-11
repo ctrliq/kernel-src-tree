@@ -44,7 +44,6 @@
 #include "perf.h"
 #include "builtin.h"
 #include "util/cgroup.h"
-#include "util/util.h"
 #include <subcmd/parse-options.h>
 #include "util/parse-events.h"
 #include "util/pmu.h"
@@ -68,6 +67,7 @@
 #include "asm/bug.h"
 
 #include <linux/time64.h>
+#include <linux/zalloc.h>
 #include <api/fs/fs.h>
 #include <errno.h>
 #include <signal.h>
@@ -82,6 +82,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <linux/err.h>
 
 #include <linux/ctype.h>
 
@@ -1446,9 +1447,9 @@ static int __cmd_record(int argc, const char **argv)
 	}
 
 	session = perf_session__new(data, false, NULL);
-	if (session == NULL) {
-		pr_err("Perf session creation failed.\n");
-		return -1;
+	if (IS_ERR(session)) {
+		pr_err("Perf session creation failed\n");
+		return PTR_ERR(session);
 	}
 
 	init_features(session);
@@ -1593,7 +1594,7 @@ static void runtime_stat_delete(struct perf_stat_config *config)
 	for (i = 0; i < config->stats_num; i++)
 		runtime_stat__exit(&config->stats[i]);
 
-	free(config->stats);
+	zfree(&config->stats);
 }
 
 static const char * const stat_report_usage[] = {
@@ -1645,8 +1646,8 @@ static int __cmd_report(int argc, const char **argv)
 	perf_stat.data.mode = PERF_DATA_MODE_READ;
 
 	session = perf_session__new(&perf_stat.data, false, &perf_stat.tool);
-	if (session == NULL)
-		return -1;
+	if (IS_ERR(session))
+		return PTR_ERR(session);
 
 	perf_stat.session  = session;
 	stat_config.output = stderr;
@@ -2011,7 +2012,7 @@ int cmd_stat(int argc, const char **argv)
 	perf_stat__exit_aggr_mode();
 	perf_evlist__free_stats(evsel_list);
 out:
-	free(stat_config.walltime_run);
+	zfree(&stat_config.walltime_run);
 
 	if (smi_cost && smi_reset)
 		sysfs__write_int(FREEZE_ON_SMI_PATH, 0);

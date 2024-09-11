@@ -317,6 +317,7 @@ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
 	kvm_vcpu_set_in_spin_loop(vcpu, false);
 	kvm_vcpu_set_dy_eligible(vcpu, false);
 	vcpu->preempted = false;
+	vcpu->ready = false;
 
 	r = kvm_arch_vcpu_init(vcpu);
 	if (r < 0)
@@ -627,6 +628,23 @@ static int kvm_create_vm_debugfs(struct kvm *kvm, int fd)
 	return 0;
 }
 
+/*
+ * Called after the VM is otherwise initialized, but just before adding it to
+ * the vm_list.
+ */
+int __weak kvm_arch_post_init_vm(struct kvm *kvm)
+{
+	return 0;
+}
+
+/*
+ * Called just after removing the VM from the vm_list, but before doing any
+ * other destruction.
+ */
+void __weak kvm_arch_pre_destroy_vm(struct kvm *kvm)
+{
+}
+
 static struct kvm *kvm_create_vm(unsigned long type)
 {
 	int r, i;
@@ -682,6 +700,10 @@ static struct kvm *kvm_create_vm(unsigned long type)
 
 	r = kvm_init_mmu_notifier(kvm);
 	if (r)
+		goto out_err_no_mmu_notifier;
+
+	r = kvm_arch_post_init_vm(kvm);
+	if (r)
 		goto out_err;
 
 	mutex_lock(&kvm_lock);
@@ -693,6 +715,11 @@ static struct kvm *kvm_create_vm(unsigned long type)
 	return kvm;
 
 out_err:
+#if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+	if (kvm->mmu_notifier.ops)
+		mmu_notifier_unregister(&kvm->mmu_notifier, current->mm);
+#endif
+out_err_no_mmu_notifier:
 	cleanup_srcu_struct(&kvm->irq_srcu);
 out_err_no_irq_srcu:
 	cleanup_srcu_struct(&kvm->srcu);
@@ -735,6 +762,8 @@ static void kvm_destroy_vm(struct kvm *kvm)
 	mutex_lock(&kvm_lock);
 	list_del(&kvm->vm_list);
 	mutex_unlock(&kvm_lock);
+	kvm_arch_pre_destroy_vm(kvm);
+
 	kvm_free_irq_routing(kvm);
 	for (i = 0; i < KVM_NR_BUSES; i++) {
 		struct kvm_io_bus *bus = kvm_get_bus(kvm, i);
@@ -2347,7 +2376,7 @@ void kvm_vcpu_block(struct kvm_vcpu *vcpu)
 	}
 
 	for (;;) {
-		prepare_to_swait(&vcpu->wq, &wait, TASK_INTERRUPTIBLE);
+		prepare_to_swait_exclusive(&vcpu->wq, &wait, TASK_INTERRUPTIBLE);
 
 		if (kvm_vcpu_check_block(vcpu) < 0)
 			break;
@@ -2388,7 +2417,8 @@ bool kvm_vcpu_wake_up(struct kvm_vcpu *vcpu)
 
 	wqp = kvm_arch_vcpu_wq(vcpu);
 	if (swq_has_sleeper(wqp)) {
-		swake_up(wqp);
+		swake_up_one(wqp);
+		WRITE_ONCE(vcpu->ready, true);
 		++vcpu->stat.halt_wakeup;
 		return true;
 	}
@@ -2525,13 +2555,14 @@ void kvm_vcpu_on_spin(struct kvm_vcpu *me, bool yield_to_kernel_mode)
 				continue;
 			} else if (pass && i > last_boosted_vcpu)
 				break;
-			if (!READ_ONCE(vcpu->preempted))
+			if (!READ_ONCE(vcpu->ready))
 				continue;
 			if (vcpu == me)
 				continue;
 			if (swait_active(&vcpu->wq) && !vcpu_dy_runnable(vcpu))
 				continue;
-			if (yield_to_kernel_mode && !kvm_arch_vcpu_in_kernel(vcpu))
+			if (READ_ONCE(vcpu->preempted) && yield_to_kernel_mode &&
+				!kvm_arch_vcpu_in_kernel(vcpu))
 				continue;
 			if (!kvm_vcpu_eligible_for_directed_yield(vcpu))
 				continue;
@@ -2614,30 +2645,20 @@ static int create_vcpu_fd(struct kvm_vcpu *vcpu)
 	return anon_inode_getfd(name, &kvm_vcpu_fops, vcpu, O_RDWR | O_CLOEXEC);
 }
 
-static int kvm_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
+static void kvm_create_vcpu_debugfs(struct kvm_vcpu *vcpu)
 {
+#ifdef __KVM_HAVE_ARCH_VCPU_DEBUGFS
 	char dir_name[ITOA_MAX_LEN * 2];
-	int ret;
-
-	if (!kvm_arch_has_vcpu_debugfs())
-		return 0;
 
 	if (!debugfs_initialized())
-		return 0;
+		return;
 
 	snprintf(dir_name, sizeof(dir_name), "vcpu%d", vcpu->vcpu_id);
 	vcpu->debugfs_dentry = debugfs_create_dir(dir_name,
-								vcpu->kvm->debugfs_dentry);
-	if (!vcpu->debugfs_dentry)
-		return -ENOMEM;
+						  vcpu->kvm->debugfs_dentry);
 
-	ret = kvm_arch_create_vcpu_debugfs(vcpu);
-	if (ret < 0) {
-		debugfs_remove_recursive(vcpu->debugfs_dentry);
-		return ret;
-	}
-
-	return 0;
+	kvm_arch_create_vcpu_debugfs(vcpu);
+#endif
 }
 
 /*
@@ -2672,9 +2693,7 @@ static int kvm_vm_ioctl_create_vcpu(struct kvm *kvm, u32 id)
 	if (r)
 		goto vcpu_destroy;
 
-	r = kvm_create_vcpu_debugfs(vcpu);
-	if (r)
-		goto vcpu_destroy;
+	kvm_create_vcpu_debugfs(vcpu);
 
 	mutex_lock(&kvm->lock);
 	if (kvm_get_vcpu_by_id(kvm, id)) {
@@ -3157,7 +3176,7 @@ static long kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
 	case KVM_CAP_CHECK_EXTENSION_VM:
 	case KVM_CAP_ENABLE_CAP_VM:
 #ifdef CONFIG_KVM_GENERIC_DIRTYLOG_READ_PROTECT
-	case KVM_CAP_MANUAL_DIRTY_LOG_PROTECT:
+	case KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2:
 #endif
 		return 1;
 #ifdef CONFIG_KVM_MMIO
@@ -3193,7 +3212,7 @@ static int kvm_vm_ioctl_enable_cap_generic(struct kvm *kvm,
 {
 	switch (cap->cap) {
 #ifdef CONFIG_KVM_GENERIC_DIRTYLOG_READ_PROTECT
-	case KVM_CAP_MANUAL_DIRTY_LOG_PROTECT:
+	case KVM_CAP_MANUAL_DIRTY_LOG_PROTECT2:
 		if (cap->flags || (cap->args[0] & ~1))
 			return -EINVAL;
 		kvm->manual_dirty_log_protect = cap->args[0];
@@ -4232,8 +4251,8 @@ static void kvm_sched_in(struct preempt_notifier *pn, int cpu)
 {
 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
 
-	if (vcpu->preempted)
-		vcpu->preempted = false;
+	WRITE_ONCE(vcpu->preempted, false);
+	WRITE_ONCE(vcpu->ready, false);
 
 	kvm_arch_sched_in(vcpu, cpu);
 
@@ -4245,8 +4264,10 @@ static void kvm_sched_out(struct preempt_notifier *pn,
 {
 	struct kvm_vcpu *vcpu = preempt_notifier_to_vcpu(pn);
 
-	if (current->state == TASK_RUNNING)
-		vcpu->preempted = true;
+	if (current->state == TASK_RUNNING) {
+		WRITE_ONCE(vcpu->preempted, true);
+		WRITE_ONCE(vcpu->ready, true);
+	}
 	kvm_arch_vcpu_put(vcpu);
 }
 

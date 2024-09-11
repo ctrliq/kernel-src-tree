@@ -136,8 +136,8 @@ static int em_ipt_change(struct net *net, void *data, int data_len,
 	int mdata_len, ret;
 	u8 nfproto;
 
-	ret = nla_parse(tb, TCA_EM_IPT_MAX, data, data_len, em_ipt_policy,
-			NULL);
+	ret = nla_parse_deprecated(tb, TCA_EM_IPT_MAX, data, data_len,
+				   em_ipt_policy, NULL);
 	if (ret < 0)
 		return ret;
 

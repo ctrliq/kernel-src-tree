@@ -1,6 +1,14 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /* Copyright (c) 2011-2014 PLUMgrid, http://plumgrid.com
  * Copyright (c) 2016,2017 Facebook
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of version 2 of the GNU General Public
+ * License as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+ * General Public License for more details.
  */
 #include <linux/bpf.h>
 #include <linux/btf.h>
@@ -75,6 +83,7 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 	u32 elem_size, index_mask, max_entries;
 	bool unpriv = !capable(CAP_SYS_ADMIN);
 	u64 cost, array_size, mask64;
+	struct bpf_map_memory mem;
 	struct bpf_array *array;
 
 	elem_size = round_up(attr->value_size, 8);
@@ -108,32 +117,29 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
 
 	/* make sure there is no u32 overflow later in round_up() */
 	cost = array_size;
-	if (cost >= U32_MAX - PAGE_SIZE)
-		return ERR_PTR(-ENOMEM);
-	if (percpu) {
+	if (percpu)
 		cost += (u64)attr->max_entries * elem_size * num_possible_cpus();
-		if (cost >= U32_MAX - PAGE_SIZE)
-			return ERR_PTR(-ENOMEM);
-	}
-	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
 
-	ret = bpf_map_precharge_memlock(cost);
+	ret = bpf_map_charge_init(&mem, cost);
 	if (ret < 0)
 		return ERR_PTR(ret);
 
 	/* allocate all map elements and zero-initialize them */
 	array = bpf_map_area_alloc(array_size, numa_node);
-	if (!array)
+	if (!array) {
+		bpf_map_charge_finish(&mem);
 		return ERR_PTR(-ENOMEM);
+	}
 	array->index_mask = index_mask;
 	array->map.unpriv_array = unpriv;
 
 	/* copy mandatory map attributes */
 	bpf_map_init_from_attr(&array->map, attr);
-	array->map.pages = cost;
+	bpf_map_charge_move(&array->map.memory, &mem);
 	array->elem_size = elem_size;
 
 	if (percpu && bpf_array_alloc_percpu(array)) {
+		bpf_map_charge_finish(&array->map.memory);
 		bpf_map_area_free(array);
 		return ERR_PTR(-ENOMEM);
 	}
@@ -151,6 +157,36 @@ static void *array_map_lookup_elem(struct bpf_map *map, void *key)
 		return NULL;
 
 	return array->value + array->elem_size * (index & array->index_mask);
+}
+
+static int array_map_direct_value_addr(const struct bpf_map *map, u64 *imm,
+				       u32 off)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+
+	if (map->max_entries != 1)
+		return -ENOTSUPP;
+	if (off >= map->value_size)
+		return -EINVAL;
+
+	*imm = (unsigned long)array->value;
+	return 0;
+}
+
+static int array_map_direct_value_meta(const struct bpf_map *map, u64 imm,
+				       u32 *off)
+{
+	struct bpf_array *array = container_of(map, struct bpf_array, map);
+	u64 base = (unsigned long)array->value;
+	u64 range = array->elem_size;
+
+	if (map->max_entries != 1)
+		return -ENOTSUPP;
+	if (imm < base || imm >= base + range)
+		return -ENOENT;
+
+	*off = imm - base;
+	return 0;
 }
 
 /* emit BPF instructions equivalent to C code of array_map_lookup_elem() */
@@ -425,6 +461,8 @@ const struct bpf_map_ops array_map_ops = {
 	.map_update_elem = array_map_update_elem,
 	.map_delete_elem = array_map_delete_elem,
 	.map_gen_lookup = array_map_gen_lookup,
+	.map_direct_value_addr = array_map_direct_value_addr,
+	.map_direct_value_meta = array_map_direct_value_meta,
 	.map_seq_show_elem = array_map_seq_show_elem,
 	.map_check_btf = array_map_check_btf,
 };

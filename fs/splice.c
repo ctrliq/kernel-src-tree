@@ -301,7 +301,7 @@ ssize_t generic_file_splice_read(struct file *in, loff_t *ppos,
 	struct kiocb kiocb;
 	int idx, ret;
 
-	iov_iter_pipe(&to, ITER_PIPE | READ, pipe, len);
+	iov_iter_pipe(&to, READ, pipe, len);
 	idx = to.idx;
 	init_sync_kiocb(&kiocb, in);
 	kiocb.ki_pos = *ppos;
@@ -386,7 +386,7 @@ static ssize_t default_file_splice_read(struct file *in, loff_t *ppos,
 	 */
 	offset = *ppos & ~PAGE_MASK;
 
-	iov_iter_pipe(&to, ITER_PIPE | READ, pipe, len + offset);
+	iov_iter_pipe(&to, READ, pipe, len + offset);
 
 	res = iov_iter_get_pages_alloc(&to, &pages, len + offset, &base);
 	if (res <= 0)
@@ -745,8 +745,7 @@ iter_file_splice_write(struct pipe_inode_info *pipe, struct file *out,
 			left -= this_len;
 		}
 
-		iov_iter_bvec(&from, ITER_BVEC | WRITE, array, n,
-			      sd.total_len - left);
+		iov_iter_bvec(&from, WRITE, array, n, sd.total_len - left);
 		ret = vfs_iter_write(out, &from, &sd.pos, 0);
 		if (ret <= 0)
 			break;
@@ -1359,7 +1358,7 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
 	struct iovec iovstack[UIO_FASTIOV];
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
-	long error;
+	ssize_t error;
 	struct fd f;
 	int type;
 
@@ -1370,7 +1369,7 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
 
 	error = import_iovec(type, uiov, nr_segs,
 			     ARRAY_SIZE(iovstack), &iov, &iter);
-	if (!error) {
+	if (error >= 0) {
 		error = do_vmsplice(f.file, &iter, flags);
 		kfree(iov);
 	}
@@ -1385,7 +1384,7 @@ COMPAT_SYSCALL_DEFINE4(vmsplice, int, fd, const struct compat_iovec __user *, io
 	struct iovec iovstack[UIO_FASTIOV];
 	struct iovec *iov = iovstack;
 	struct iov_iter iter;
-	long error;
+	ssize_t error;
 	struct fd f;
 	int type;
 
@@ -1396,7 +1395,7 @@ COMPAT_SYSCALL_DEFINE4(vmsplice, int, fd, const struct compat_iovec __user *, io
 
 	error = compat_import_iovec(type, iov32, nr_segs,
 			     ARRAY_SIZE(iovstack), &iov, &iter);
-	if (!error) {
+	if (error >= 0) {
 		error = do_vmsplice(f.file, &iter, flags);
 		kfree(iov);
 	}

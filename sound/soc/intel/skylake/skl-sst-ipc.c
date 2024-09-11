@@ -345,7 +345,7 @@ out:
 int skl_ipc_process_notification(struct sst_generic_ipc *ipc,
 		struct skl_ipc_header header)
 {
-	struct skl_sst *skl = container_of(ipc, struct skl_sst, ipc);
+	struct skl_dev *skl = container_of(ipc, struct skl_dev, ipc);
 
 	if (IPC_GLB_NOTIFY_MSG_TYPE(header.primary)) {
 		switch (IPC_GLB_NOTIFY_TYPE(header.primary)) {
@@ -436,7 +436,7 @@ void skl_ipc_process_reply(struct sst_generic_ipc *ipc,
 	struct ipc_message *msg;
 	u32 reply = header.primary & IPC_GLB_REPLY_STATUS_MASK;
 	u64 *ipc_header = (u64 *)(&header);
-	struct skl_sst *skl = container_of(ipc, struct skl_sst, ipc);
+	struct skl_dev *skl = container_of(ipc, struct skl_dev, ipc);
 	unsigned long flags;
 
 	spin_lock_irqsave(&ipc->dsp->spinlock, flags);
@@ -489,7 +489,7 @@ void skl_ipc_process_reply(struct sst_generic_ipc *ipc,
 irqreturn_t skl_dsp_irq_thread_handler(int irq, void *context)
 {
 	struct sst_dsp *dsp = context;
-	struct skl_sst *skl = sst_dsp_get_thread_context(dsp);
+	struct skl_dev *skl = sst_dsp_get_thread_context(dsp);
 	struct sst_generic_ipc *ipc = &skl->ipc;
 	struct skl_ipc_header header = {0};
 	u32 hipcie, hipct, hipcte;
@@ -596,7 +596,7 @@ bool skl_ipc_int_status(struct sst_dsp *ctx)
 			SKL_ADSP_REG_ADSPIS) & SKL_ADSPIS_IPC;
 }
 
-int skl_ipc_init(struct device *dev, struct skl_sst *skl)
+int skl_ipc_init(struct device *dev, struct skl_dev *skl)
 {
 	struct sst_generic_ipc *ipc;
 	int err;
@@ -969,11 +969,17 @@ int skl_ipc_set_large_config(struct sst_generic_ipc *ipc,
 EXPORT_SYMBOL_GPL(skl_ipc_set_large_config);
 
 int skl_ipc_get_large_config(struct sst_generic_ipc *ipc,
-		struct skl_ipc_large_config_msg *msg, u32 *param)
+		struct skl_ipc_large_config_msg *msg,
+		u32 **payload, size_t *bytes)
 {
 	struct skl_ipc_header header = {0};
-	struct sst_ipc_message request = {0}, reply = {0};
+	struct sst_ipc_message request, reply = {0};
+	unsigned int *buf;
 	int ret;
+
+	reply.data = kzalloc(SKL_ADSP_W1_SZ, GFP_KERNEL);
+	if (!reply.data)
+		return -ENOMEM;
 
 	header.primary = IPC_MSG_TARGET(IPC_MOD_MSG);
 	header.primary |= IPC_MSG_DIR(IPC_MSG_REQUEST);
@@ -986,12 +992,21 @@ int skl_ipc_get_large_config(struct sst_generic_ipc *ipc,
 	header.extension |= IPC_FINAL_BLOCK(1);
 	header.extension |= IPC_INITIAL_BLOCK(1);
 
-	request.header = *(u64 *)(&header);
-	reply.data = param;
-	reply.size = msg->param_data_size;
+	request.header = *(u64 *)&header;
+	request.data = *payload;
+	request.size = *bytes;
+	reply.size = SKL_ADSP_W1_SZ;
+
 	ret = sst_ipc_tx_message_wait(ipc, request, &reply);
 	if (ret < 0)
 		dev_err(ipc->dev, "ipc: get large config fail, err: %d\n", ret);
+
+	reply.size = (reply.header >> 32) & IPC_DATA_OFFSET_SZ_MASK;
+	buf = krealloc(reply.data, reply.size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+	*payload = buf;
+	*bytes = reply.size;
 
 	return ret;
 }

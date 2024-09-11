@@ -34,8 +34,10 @@
 #else
 #define f2fs_bug_on(sbi, condition)					\
 	do {								\
-		if (WARN_ON(condition))					\
+		if (unlikely(condition)) {				\
+			WARN_ON(1);					\
 			set_sbi_flag(sbi, SBI_NEED_FSCK);		\
+		}							\
 	} while (0)
 #endif
 

@@ -21,7 +21,8 @@
 #include <linux/io-pgtable.h>
 #include <linux/iommu.h>
 #include <linux/iopoll.h>
-#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/moduleparam.h>
 #include <linux/msi.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
@@ -308,6 +309,13 @@
 
 #define CMDQ_PROD_OWNED_FLAG		Q_OVERFLOW_FLAG
 
+/*
+ * This is used to size the command queue and therefore must be at least
+ * BITS_PER_LONG so that the valid_map works correctly (it relies on the
+ * total number of queue entries being a multiple of BITS_PER_LONG).
+ */
+#define CMDQ_BATCH_ENTRIES		BITS_PER_LONG
+
 #define CMDQ_0_OP			GENMASK_ULL(7, 0)
 #define CMDQ_0_SSV			(1UL << 11)
 
@@ -376,6 +384,10 @@
 #define MSI_IOVA_BASE			0x8000000
 #define MSI_IOVA_LENGTH			0x100000
 
+/*
+ * not really modular, but the easiest way to keep compat with existing
+ * bootargs behaviour is to continue using module_param_named here.
+ */
 static bool disable_bypass = 1;
 module_param_named(disable_bypass, disable_bypass, bool, S_IRUGO);
 MODULE_PARM_DESC(disable_bypass,
@@ -1943,13 +1955,6 @@ static int arm_smmu_atc_inv_domain(struct arm_smmu_domain *smmu_domain,
 }
 
 /* IO_PGTABLE API */
-static void arm_smmu_tlb_sync(void *cookie)
-{
-	struct arm_smmu_domain *smmu_domain = cookie;
-
-	arm_smmu_cmdq_issue_sync(smmu_domain->smmu);
-}
-
 static void arm_smmu_tlb_inv_context(void *cookie)
 {
 	struct arm_smmu_domain *smmu_domain = cookie;
@@ -1974,17 +1979,20 @@ static void arm_smmu_tlb_inv_context(void *cookie)
 	 */
 	arm_smmu_cmdq_issue_cmd(smmu, &cmd);
 	arm_smmu_cmdq_issue_sync(smmu);
+	arm_smmu_atc_inv_domain(smmu_domain, 0, 0, 0);
 }
 
-static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
-					  size_t granule, bool leaf, void *cookie)
+static void arm_smmu_tlb_inv_range(unsigned long iova, size_t size,
+				   size_t granule, bool leaf,
+				   struct arm_smmu_domain *smmu_domain)
 {
-	struct arm_smmu_domain *smmu_domain = cookie;
+	u64 cmds[CMDQ_BATCH_ENTRIES * CMDQ_ENT_DWORDS];
 	struct arm_smmu_device *smmu = smmu_domain->smmu;
+	unsigned long start = iova, end = iova + size;
+	int i = 0;
 	struct arm_smmu_cmdq_ent cmd = {
 		.tlbi = {
 			.leaf	= leaf,
-			.addr	= iova,
 		},
 	};
 
@@ -1999,16 +2007,54 @@ static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
 		cmd.tlbi.vmid	= smmu_domain->s2_cfg.vmid;
 	}
 
-	do {
-		arm_smmu_cmdq_issue_cmd(smmu, &cmd);
-		cmd.tlbi.addr += granule;
-	} while (size -= granule);
+	while (iova < end) {
+		if (i == CMDQ_BATCH_ENTRIES) {
+			arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, false);
+			i = 0;
+		}
+
+		cmd.tlbi.addr = iova;
+		arm_smmu_cmdq_build_cmd(&cmds[i * CMDQ_ENT_DWORDS], &cmd);
+		iova += granule;
+		i++;
+	}
+
+	arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, true);
+
+	/*
+	 * Unfortunately, this can't be leaf-only since we may have
+	 * zapped an entire table.
+	 */
+	arm_smmu_atc_inv_domain(smmu_domain, 0, start, size);
 }
 
-static const struct iommu_gather_ops arm_smmu_gather_ops = {
+static void arm_smmu_tlb_inv_page_nosync(struct iommu_iotlb_gather *gather,
+					 unsigned long iova, size_t granule,
+					 void *cookie)
+{
+	struct arm_smmu_domain *smmu_domain = cookie;
+	struct iommu_domain *domain = &smmu_domain->domain;
+
+	iommu_iotlb_gather_add_page(domain, gather, iova, granule);
+}
+
+static void arm_smmu_tlb_inv_walk(unsigned long iova, size_t size,
+				  size_t granule, void *cookie)
+{
+	arm_smmu_tlb_inv_range(iova, size, granule, false, cookie);
+}
+
+static void arm_smmu_tlb_inv_leaf(unsigned long iova, size_t size,
+				  size_t granule, void *cookie)
+{
+	arm_smmu_tlb_inv_range(iova, size, granule, true, cookie);
+}
+
+static const struct iommu_flush_ops arm_smmu_flush_ops = {
 	.tlb_flush_all	= arm_smmu_tlb_inv_context,
-	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
-	.tlb_sync	= arm_smmu_tlb_sync,
+	.tlb_flush_walk = arm_smmu_tlb_inv_walk,
+	.tlb_flush_leaf = arm_smmu_tlb_inv_leaf,
+	.tlb_add_page	= arm_smmu_tlb_inv_page_nosync,
 };
 
 /* IOMMU API */
@@ -2198,7 +2244,7 @@ static int arm_smmu_domain_finalise(struct iommu_domain *domain)
 		.ias		= ias,
 		.oas		= oas,
 		.coherent_walk	= smmu->features & ARM_SMMU_FEAT_COHERENCY,
-		.tlb		= &arm_smmu_gather_ops,
+		.tlb		= &arm_smmu_flush_ops,
 		.iommu_dev	= smmu->dev,
 	};
 
@@ -2412,21 +2458,16 @@ static int arm_smmu_map(struct iommu_domain *domain, unsigned long iova,
 	return ops->map(ops, iova, paddr, size, prot);
 }
 
-static size_t
-arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
+static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
+			     size_t size, struct iommu_iotlb_gather *gather)
 {
-	int ret;
 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
 
 	if (!ops)
 		return 0;
 
-	ret = ops->unmap(ops, iova, size);
-	if (ret && arm_smmu_atc_inv_domain(smmu_domain, 0, iova, size))
-		return 0;
-
-	return ret;
+	return ops->unmap(ops, iova, size, gather);
 }
 
 static void arm_smmu_flush_iotlb_all(struct iommu_domain *domain)
@@ -2437,12 +2478,13 @@ static void arm_smmu_flush_iotlb_all(struct iommu_domain *domain)
 		arm_smmu_tlb_inv_context(smmu_domain);
 }
 
-static void arm_smmu_iotlb_sync(struct iommu_domain *domain)
+static void arm_smmu_iotlb_sync(struct iommu_domain *domain,
+				struct iommu_iotlb_gather *gather)
 {
-	struct arm_smmu_device *smmu = to_smmu_domain(domain)->smmu;
+	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
 
-	if (smmu)
-		arm_smmu_cmdq_issue_sync(smmu);
+	arm_smmu_tlb_inv_range(gather->start, gather->end - gather->start,
+			       gather->pgsize, true, smmu_domain);
 }
 
 static phys_addr_t
@@ -3369,15 +3411,15 @@ static int arm_smmu_device_hw_probe(struct arm_smmu_device *smmu)
 	/* Queue sizes, capped to ensure natural alignment */
 	smmu->cmdq.q.llq.max_n_shift = min_t(u32, CMDQ_MAX_SZ_SHIFT,
 					     FIELD_GET(IDR1_CMDQS, reg));
-	if (smmu->cmdq.q.llq.max_n_shift < ilog2(BITS_PER_LONG)) {
+	if (smmu->cmdq.q.llq.max_n_shift <= ilog2(CMDQ_BATCH_ENTRIES)) {
 		/*
-		 * The cmdq valid_map relies on the total number of entries
-		 * being a multiple of BITS_PER_LONG. There's also no way
-		 * we can handle the weird alignment restrictions on the
-		 * base pointer for a unit-length queue.
+		 * We don't support splitting up batches, so one batch of
+		 * commands plus an extra sync needs to fit inside the command
+		 * queue. There's also no way we can handle the weird alignment
+		 * restrictions on the base pointer for a unit-length queue.
 		 */
-		dev_err(smmu->dev, "command queue size < %d entries not supported\n",
-			BITS_PER_LONG);
+		dev_err(smmu->dev, "command queue size <= %d entries not supported\n",
+			CMDQ_BATCH_ENTRIES);
 		return -ENXIO;
 	}
 
@@ -3646,39 +3688,27 @@ static int arm_smmu_device_probe(struct platform_device *pdev)
 	return 0;
 }
 
-static int arm_smmu_device_remove(struct platform_device *pdev)
+static void arm_smmu_device_shutdown(struct platform_device *pdev)
 {
 	struct arm_smmu_device *smmu = platform_get_drvdata(pdev);
 
 	arm_smmu_device_disable(smmu);
-
-	return 0;
-}
-
-static void arm_smmu_device_shutdown(struct platform_device *pdev)
-{
-	arm_smmu_device_remove(pdev);
 }
 
 static const struct of_device_id arm_smmu_of_match[] = {
 	{ .compatible = "arm,smmu-v3", },
 	{ },
 };
-MODULE_DEVICE_TABLE(of, arm_smmu_of_match);
 
 static struct platform_driver arm_smmu_driver = {
 	.driver	= {
 		.name		= "arm-smmu-v3",
 		.of_match_table	= of_match_ptr(arm_smmu_of_match),
+		.suppress_bind_attrs = true,
 	},
 	.probe	= arm_smmu_device_probe,
-	.remove	= arm_smmu_device_remove,
 	.shutdown = arm_smmu_device_shutdown,
 };
-module_platform_driver(arm_smmu_driver);
 
 IOMMU_OF_DECLARE(arm_smmuv3, "arm,smmu-v3");
-
-MODULE_DESCRIPTION("IOMMU API for ARM architected SMMUv3 implementations");
-MODULE_AUTHOR("Will Deacon <will.deacon@arm.com>");
-MODULE_LICENSE("GPL v2");
+builtin_platform_driver(arm_smmu_driver);

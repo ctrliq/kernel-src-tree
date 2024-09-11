@@ -186,20 +186,6 @@ int cxio_create_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq, int kernel)
 	return (rdev_p->t3cdev_p->ctl(rdev_p->t3cdev_p, RDMA_CQ_SETUP, &setup));
 }
 
-#ifdef notyet
-int cxio_resize_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
-{
-	struct rdma_cq_setup setup;
-	setup.id = cq->cqid;
-	setup.base_addr = (u64) (cq->dma_addr);
-	setup.size = 1UL << cq->size_log2;
-	setup.credits = setup.size;
-	setup.credit_thres = setup.size;	/* TBD: overflow recovery */
-	setup.ovfl_mode = 1;
-	return (rdev_p->t3cdev_p->ctl(rdev_p->t3cdev_p, RDMA_CQ_SETUP, &setup));
-}
-#endif
-
 static u32 get_qpid(struct cxio_rdev *rdev_p, struct cxio_ucontext *uctx)
 {
 	struct cxio_qpid_list *entry;
@@ -218,7 +204,7 @@ static u32 get_qpid(struct cxio_rdev *rdev_p, struct cxio_ucontext *uctx)
 		if (!qpid)
 			goto out;
 		for (i = qpid+1; i & rdev_p->qpmask; i++) {
-			entry = kmalloc(sizeof *entry, GFP_KERNEL);
+			entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 			if (!entry)
 				break;
 			entry->qpid = i;
@@ -236,7 +222,7 @@ static void put_qpid(struct cxio_rdev *rdev_p, u32 qpid,
 {
 	struct cxio_qpid_list *entry;
 
-	entry = kmalloc(sizeof *entry, GFP_KERNEL);
+	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
 	if (!entry)
 		return;
 	pr_debug("%s qpid 0x%x\n", __func__, qpid);
@@ -317,17 +303,15 @@ err1:
 	return -ENOMEM;
 }
 
-int cxio_destroy_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
+void cxio_destroy_cq(struct cxio_rdev *rdev_p, struct t3_cq *cq)
 {
-	int err;
-	err = cxio_hal_clear_cq_ctx(rdev_p, cq->cqid);
+	cxio_hal_clear_cq_ctx(rdev_p, cq->cqid);
 	kfree(cq->sw_queue);
 	dma_free_coherent(&(rdev_p->rnic_info.pdev->dev),
 			  (1UL << (cq->size_log2))
 			  * sizeof(struct t3_cqe) + 1, cq->queue,
 			  dma_unmap_addr(cq, mapping));
 	cxio_hal_put_cqid(rdev_p->rscp, cq->cqid);
-	return err;
 }
 
 int cxio_destroy_qp(struct cxio_rdev *rdev_p, struct t3_wq *wq,

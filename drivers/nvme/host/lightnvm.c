@@ -650,7 +650,7 @@ static struct request *nvme_nvm_alloc_request(struct request_queue *q,
 	rq->cmd_flags &= ~REQ_FAILFAST_DRIVER;
 
 	if (rqd->bio)
-		blk_init_request_from_bio(rq, rqd->bio);
+		blk_rq_append_bio(rq, &rqd->bio);
 	else
 		rq->ioprio = IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE, IOPRIO_NORM);
 
@@ -949,25 +949,22 @@ int nvme_nvm_ioctl(struct nvme_ns *ns, unsigned int cmd, unsigned long arg)
 	}
 }
 
-void nvme_nvm_update_nvm_info(struct nvme_ns *ns)
-{
-	struct nvm_dev *ndev = ns->ndev;
-	struct nvm_geo *geo = &ndev->geo;
-
-	geo->csecs = 1 << ns->lba_shift;
-	geo->sos = ns->ms;
-}
-
 int nvme_nvm_register(struct nvme_ns *ns, char *disk_name, int node)
 {
 	struct request_queue *q = ns->queue;
 	struct nvm_dev *dev;
+	struct nvm_geo *geo;
 
 	_nvme_nvm_check_size();
 
 	dev = nvm_alloc_dev(node);
 	if (!dev)
 		return -ENOMEM;
+
+	/* Note that csecs and sos will be overridden if it is a 1.2 drive. */
+	geo = &dev->geo;
+	geo->csecs = 1 << ns->lba_shift;
+	geo->sos = ns->ms;
 
 	dev->q = q;
 	memcpy(dev->name, disk_name, DISK_NAME_LEN);

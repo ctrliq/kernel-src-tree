@@ -34,6 +34,7 @@
 #include "scrub/xfs_scrub.h"
 #include "xfs_sb.h"
 #include "xfs_ag.h"
+#include "xfs_health.h"
 
 #include <linux/capability.h>
 #include <linux/cred.h>
@@ -445,7 +446,7 @@ xfs_attrmulti_attr_get(
 	if (!kbuf)
 		return -ENOMEM;
 
-	error = xfs_attr_get(XFS_I(inode), name, kbuf, (int *)len, flags);
+	error = xfs_attr_get(XFS_I(inode), name, &kbuf, (int *)len, flags);
 	if (error)
 		goto out_kfree;
 
@@ -627,7 +628,6 @@ xfs_ioc_space(
 	error = xfs_break_layouts(inode, &iolock, BREAK_UNMAP);
 	if (error)
 		goto out_unlock;
-	inode_dio_wait(inode);
 
 	switch (bf->l_whence) {
 	case 0: /*SEEK_SET*/
@@ -671,6 +671,31 @@ xfs_ioc_space(
 	    bf->l_start + bf->l_len >= inode->i_sb->s_maxbytes) {
 		error = -EINVAL;
 		goto out_unlock;
+	}
+
+	/*
+	 * Must wait for all AIO to complete before we continue as AIO can
+	 * change the file size on completion without holding any locks we
+	 * currently hold. We must do this first because AIO can update both
+	 * the on disk and in memory inode sizes, and the operations that follow
+	 * require the in-memory size to be fully up-to-date.
+	 */
+	inode_dio_wait(inode);
+
+	/*
+	 * Now that AIO and DIO has drained we can flush and (if necessary)
+	 * invalidate the cached range over the first operation we are about to
+	 * run. We include zero range here because it starts with a hole punch
+	 * over the target range.
+	 */
+	switch (cmd) {
+	case XFS_IOC_ZERO_RANGE:
+	case XFS_IOC_UNRESVSP:
+	case XFS_IOC_UNRESVSP64:
+		error = xfs_flush_unmap_range(ip, bf->l_start, bf->l_len);
+		if (error)
+			goto out_unlock;
+		break;
 	}
 
 	switch (cmd) {
@@ -795,8 +820,10 @@ xfs_ioc_fsgeometry(
 		len = sizeof(struct xfs_fsop_geom_v1);
 	else if (struct_version == 4)
 		len = sizeof(struct xfs_fsop_geom_v4);
-	else
+	else {
+		xfs_fsop_geom_health(mp, &fsgeo);
 		len = sizeof(fsgeo);
+	}
 
 	if (copy_to_user(arg, &fsgeo, len))
 		return -EFAULT;

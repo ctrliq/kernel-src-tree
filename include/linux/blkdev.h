@@ -536,7 +536,11 @@ struct request_queue {
 	unsigned int		sg_reserved_size;
 	int			node;
 #ifdef CONFIG_BLK_DEV_IO_TRACE
+#ifdef __GENKSYMS__
 	struct blk_trace	*blk_trace;
+#else
+	struct blk_trace __rcu	*blk_trace;
+#endif
 	struct mutex		blk_trace_mutex;
 #endif
 	/*
@@ -549,7 +553,6 @@ struct request_queue {
 	struct delayed_work	requeue_work;
 
 	struct mutex		sysfs_lock;
-	struct mutex		sysfs_dir_lock;
 
 	RH_KABI_REPLACE(atomic_t                mq_freeze_depth,
 			int			mq_freeze_depth)
@@ -596,6 +599,8 @@ struct request_queue {
 	 * percpu_ref_kill() and percpu_ref_reinit().
 	 */
 	RH_KABI_EXTEND(struct mutex		mq_freeze_lock)
+
+	RH_KABI_EXTEND(struct mutex		sysfs_dir_lock)
 };
 
 #define QUEUE_FLAG_STOPPED	1	/* queue is stopped */
@@ -858,7 +863,6 @@ extern void blk_unregister_queue(struct gendisk *disk);
 extern blk_qc_t generic_make_request(struct bio *bio);
 extern blk_qc_t direct_make_request(struct bio *bio);
 extern void blk_rq_init(struct request_queue *q, struct request *rq);
-extern void blk_init_request_from_bio(struct request *req, struct bio *bio);
 extern void blk_put_request(struct request *);
 extern struct request *blk_get_request(struct request_queue *, unsigned int op,
 				       blk_mq_req_flags_t flags);

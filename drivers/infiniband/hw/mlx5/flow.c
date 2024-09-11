@@ -79,7 +79,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_CREATE_FLOW)(
 	struct ib_qp *qp = NULL;
 	struct ib_uobject *uobj =
 		uverbs_attr_get_uobject(attrs, MLX5_IB_ATTR_CREATE_FLOW_HANDLE);
-	struct mlx5_ib_dev *dev = to_mdev(uobj->context->device);
+	struct mlx5_ib_dev *dev = mlx5_udata_to_mdev(&attrs->driver_udata);
 	int len, ret, i;
 	u32 counter_id = 0;
 
@@ -203,7 +203,8 @@ err_out:
 }
 
 static int flow_matcher_cleanup(struct ib_uobject *uobject,
-				enum rdma_remove_reason why)
+				enum rdma_remove_reason why,
+				struct uverbs_attr_bundle *attrs)
 {
 	struct mlx5_ib_flow_matcher *obj = uobject->object;
 	int ret;
@@ -269,7 +270,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_MATCHER_CREATE)(
 {
 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
 		attrs, MLX5_IB_ATTR_FLOW_MATCHER_CREATE_HANDLE);
-	struct mlx5_ib_dev *dev = to_mdev(uobj->context->device);
+	struct mlx5_ib_dev *dev = mlx5_udata_to_mdev(&attrs->driver_udata);
 	struct mlx5_ib_flow_matcher *obj;
 	int err;
 
@@ -321,11 +322,11 @@ void mlx5_ib_destroy_flow_action_raw(struct mlx5_ib_flow_action *maction)
 	switch (maction->flow_action_raw.sub_type) {
 	case MLX5_IB_FLOW_ACTION_MODIFY_HEADER:
 		mlx5_modify_header_dealloc(maction->flow_action_raw.dev->mdev,
-					   maction->flow_action_raw.action_id);
+					   maction->flow_action_raw.modify_hdr);
 		break;
 	case MLX5_IB_FLOW_ACTION_PACKET_REFORMAT:
 		mlx5_packet_reformat_dealloc(maction->flow_action_raw.dev->mdev,
-			maction->flow_action_raw.action_id);
+					     maction->flow_action_raw.pkt_reformat);
 		break;
 	case MLX5_IB_FLOW_ACTION_DECAP:
 		break;
@@ -351,10 +352,11 @@ mlx5_ib_create_modify_header(struct mlx5_ib_dev *dev,
 	if (!maction)
 		return ERR_PTR(-ENOMEM);
 
-	ret = mlx5_modify_header_alloc(dev->mdev, namespace, num_actions, in,
-				       &maction->flow_action_raw.action_id);
+	maction->flow_action_raw.modify_hdr =
+		mlx5_modify_header_alloc(dev->mdev, namespace, num_actions, in);
 
-	if (ret) {
+	if (IS_ERR(maction->flow_action_raw.modify_hdr)) {
+		ret = PTR_ERR(maction->flow_action_raw.modify_hdr);
 		kfree(maction);
 		return ERR_PTR(ret);
 	}
@@ -377,7 +379,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_MODIFY_HEADER)(
 {
 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
 		attrs, MLX5_IB_ATTR_CREATE_MODIFY_HEADER_HANDLE);
-	struct mlx5_ib_dev *mdev = to_mdev(uobj->context->device);
+	struct mlx5_ib_dev *mdev = mlx5_udata_to_mdev(&attrs->driver_udata);
 	enum mlx5_ib_uapi_flow_table_type ft_type;
 	struct ib_flow_action *action;
 	int num_actions;
@@ -404,7 +406,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_MODIFY_HEADER)(
 	if (IS_ERR(action))
 		return PTR_ERR(action);
 
-	uverbs_flow_action_fill_action(action, uobj, uobj->context->device,
+	uverbs_flow_action_fill_action(action, uobj, &mdev->ib_dev,
 				       IB_FLOW_ACTION_UNSPECIFIED);
 
 	return 0;
@@ -478,11 +480,13 @@ static int mlx5_ib_flow_action_create_packet_reformat_ctx(
 	if (ret)
 		return ret;
 
-	ret = mlx5_packet_reformat_alloc(dev->mdev, prm_prt, len,
-					 in, namespace,
-					 &maction->flow_action_raw.action_id);
-	if (ret)
+	maction->flow_action_raw.pkt_reformat =
+		mlx5_packet_reformat_alloc(dev->mdev, prm_prt, len,
+					   in, namespace);
+	if (IS_ERR(maction->flow_action_raw.pkt_reformat)) {
+		ret = PTR_ERR(maction->flow_action_raw.pkt_reformat);
 		return ret;
+	}
 
 	maction->flow_action_raw.sub_type =
 		MLX5_IB_FLOW_ACTION_PACKET_REFORMAT;
@@ -496,7 +500,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_PACKET_REFORMAT)(
 {
 	struct ib_uobject *uobj = uverbs_attr_get_uobject(attrs,
 		MLX5_IB_ATTR_CREATE_PACKET_REFORMAT_HANDLE);
-	struct mlx5_ib_dev *mdev = to_mdev(uobj->context->device);
+	struct mlx5_ib_dev *mdev = mlx5_udata_to_mdev(&attrs->driver_udata);
 	enum mlx5_ib_uapi_flow_action_packet_reformat_type dv_prt;
 	enum mlx5_ib_uapi_flow_table_type ft_type;
 	struct mlx5_ib_flow_action *maction;
@@ -544,8 +548,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_PACKET_REFORMAT)(
 			goto free_maction;
 	}
 
-	uverbs_flow_action_fill_action(&maction->ib_action, uobj,
-				       uobj->context->device,
+	uverbs_flow_action_fill_action(&maction->ib_action, uobj, &mdev->ib_dev,
 				       IB_FLOW_ACTION_UNSPECIFIED);
 	return 0;
 
@@ -673,15 +676,9 @@ DECLARE_UVERBS_NAMED_OBJECT(MLX5_IB_OBJECT_FLOW_MATCHER,
 			    &UVERBS_METHOD(MLX5_IB_METHOD_FLOW_MATCHER_CREATE),
 			    &UVERBS_METHOD(MLX5_IB_METHOD_FLOW_MATCHER_DESTROY));
 
-static bool flow_is_supported(struct ib_device *device)
-{
-	return !to_mdev(device)->rep;
-}
-
 const struct uapi_definition mlx5_ib_flow_defs[] = {
 	UAPI_DEF_CHAIN_OBJ_TREE_NAMED(
-		MLX5_IB_OBJECT_FLOW_MATCHER,
-		UAPI_DEF_IS_OBJ_SUPPORTED(flow_is_supported)),
+		MLX5_IB_OBJECT_FLOW_MATCHER),
 	UAPI_DEF_CHAIN_OBJ_TREE(
 		UVERBS_OBJECT_FLOW,
 		&mlx5_ib_fs),

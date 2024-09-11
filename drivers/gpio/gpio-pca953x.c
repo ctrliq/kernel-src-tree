@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  PCA953x 4/8/16/24/40 bit I/O ports
  *
@@ -6,6 +5,10 @@
  *  Copyright (C) 2007 Marvell International Ltd.
  *
  *  Derived from drivers/i2c/chips/pca9539.c
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; version 2 of the License.
  */
 
 #include <linux/acpi.h>

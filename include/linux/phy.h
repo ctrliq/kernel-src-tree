@@ -75,9 +75,8 @@ extern const int phy_10gbit_features_array[1];
 #define PHY_POLL		-1
 #define PHY_IGNORE_INTERRUPT	-2
 
-#define PHY_HAS_INTERRUPT	0x00000001
-#define PHY_IS_INTERNAL		0x00000002
-#define PHY_RST_AFTER_CLK_EN	0x00000004
+#define PHY_IS_INTERNAL		0x00000001
+#define PHY_RST_AFTER_CLK_EN	0x00000002
 #define MDIO_DEVICE_IS_PHY	0x80000000
 
 /* Interface Mode definitions */
@@ -275,8 +274,8 @@ static inline struct mii_bus *devm_mdiobus_alloc(struct device *dev)
 void devm_mdiobus_free(struct device *dev, struct mii_bus *bus);
 struct phy_device *mdiobus_scan(struct mii_bus *bus, int addr);
 
-#define PHY_INTERRUPT_DISABLED	0x0
-#define PHY_INTERRUPT_ENABLED	0x80000000
+#define PHY_INTERRUPT_DISABLED	false
+#define PHY_INTERRUPT_ENABLED	true
 
 /* PHY state machine states:
  *
@@ -313,6 +312,27 @@ struct phy_device *mdiobus_scan(struct mii_bus *bus, int addr);
  * PHY is in an error state.
  * - phy_start moves to UP
  */
+
+/* RHEL: If you change the enum in an incompatible way,
+ * increase RH_KABI_FORCE_CHANGE on phy_driver_register and
+ * phy_drivers_register.
+*/
+#ifdef __GENKSYMS__
+enum phy_state {
+	PHY_DOWN = 0,
+	PHY_STARTING,
+	PHY_READY,
+	PHY_PENDING,
+	PHY_UP,
+	PHY_AN,
+	PHY_RUNNING,
+	PHY_NOLINK,
+	PHY_FORCING,
+	PHY_CHANGELINK,
+	PHY_HALTED,
+	PHY_RESUMING
+};
+#else /* __GENKSYMS__ */
 enum phy_state {
 	PHY_DOWN = 0,
 	PHY_READY,
@@ -322,6 +342,7 @@ enum phy_state {
 	PHY_NOLINK,
 	PHY_FORCING,
 };
+#endif /* __GENKSYMS__ */
 
 /**
  * struct phy_c45_device_ids - 802.3-c45 Device Identifiers
@@ -379,7 +400,6 @@ struct phy_device {
 	unsigned is_c45:1;
 	unsigned is_internal:1;
 	unsigned is_pseudo_fixed_link:1;
-	unsigned is_gigabit_capable:1;
 	unsigned has_fixups:1;
 	unsigned suspended:1;
 	unsigned sysfs_links:1;
@@ -388,7 +408,13 @@ struct phy_device {
 	unsigned autoneg:1;
 	/* The most recently read link state */
 	unsigned link:1;
-	unsigned autoneg_complete:1;
+
+	RH_KABI_FILL_HOLE(unsigned is_gigabit_capable:1)
+	RH_KABI_FILL_HOLE(unsigned autoneg_complete:1)
+	/* Interrupts are enabled */
+	RH_KABI_FILL_HOLE(unsigned interrupts:1)
+
+	/* 20 bits hole remain */
 
 	enum phy_state state;
 
@@ -405,8 +431,8 @@ struct phy_device {
 	int pause;
 	int asym_pause;
 
-	/* Enabled Interrupts */
-	u32 interrupts;
+	/* RHEL: changed to a bit flag with the same name */
+	RH_KABI_DEPRECATE(u32, interrupts)
 
 	/* RHEL specific: fileds are deprecated.
 	 * PHY now using bitmaps declared later by RH_KABI_EXTEND macro
@@ -439,6 +465,7 @@ struct phy_device {
 	void *priv;
 
 	/* Interrupt and Polling infrastructure */
+	RH_KABI_DEPRECATE(struct work_struct, phy_queue)
 	struct delayed_work state_queue;
 
 	struct mutex lock;
@@ -449,16 +476,15 @@ struct phy_device {
 	u8 mdix;
 	u8 mdix_ctrl;
 
-	/* RHEL specific: Phy is not protected by kabi. This change
-	 * will rise kabi check warning for eth_type_trans and
-	 * ethtool_op_get_link over pointers:
-	 * net_device -> phy_device
-	 * Change will break all phy drivers and all need rebuild.
-	 * It is reason why this field could be in the middle of struct.
+	/* RHEL specific: further changes here need to be accompanied by
+	 * increasing the RH_KABI_FORCE_CHANGE version of
+	 * phy_driver[s]_register.
 	 */
-	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(supported))
-	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising))
-	RH_KABI_EXTEND(__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising))
+	RH_KABI_BROKEN_INSERT_BLOCK(
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising);
+	) /* RH_KABI_BROKEN_INSERT_BLOCK */
 
 	void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier);
 	void (*adjust_link)(struct net_device *dev);
@@ -492,17 +518,14 @@ struct phy_driver {
 	u32 phy_id;
 	char *name;
 	u32 phy_id_mask;
-	RH_KABI_DEPRECATE(u32, features)
+	RH_KABI_BROKEN_REMOVE(u32 features)
 	u32 flags;
 	const void *driver_data;
-	/* RHEL specific: Phy is not protected by kabi. This change
-	 * will rise kabi check warning for eth_type_trans and
-	 * ethtool_op_get_link over pointers:
-	 * net_device -> phy_device -> phy_driver.
-	 * Change will break all phy drivers and all need rebuild.
-	 * It is reason why this field could be in the middle of struct.
+	/* RHEL specific: further changes here need to be accompanied by
+	 * increasing the RH_KABI_FORCE_CHANGE version of
+	 * phy_driver[s]_register.
 	 */
-	RH_KABI_EXTEND(const unsigned long * const features)
+	RH_KABI_BROKEN_INSERT(const unsigned long * const features)
 
 	/*
 	 * Called to issue a PHY software reset
@@ -520,12 +543,6 @@ struct phy_driver {
 	 * up device-specific structures, if any
 	 */
 	int (*probe)(struct phy_device *phydev);
-
-	/*
-	 * Probe the hardware to determine what abilities it has.
-	 * Should only set phydev->supported.
-	 */
-	int (*get_features)(struct phy_device *phydev);
 
 	/* PHY Power Management */
 	int (*suspend)(struct phy_device *phydev);
@@ -655,6 +672,12 @@ struct phy_driver {
 			    struct ethtool_tunable *tuna,
 			    const void *data);
 	int (*set_loopback)(struct phy_device *dev, bool enable);
+
+        /*
+         * Probe the hardware to determine what abilities it has.
+         * Should only set phydev->supported.
+         */
+	RH_KABI_BROKEN_INSERT(int (*get_features)(struct phy_device *phydev))
 };
 #define to_phy_driver(d) container_of(to_mdio_common_driver(d),		\
 				      struct phy_driver, mdiodrv)
@@ -693,6 +716,7 @@ phy_lookup_setting(int speed, int duplex, const unsigned long *mask,
 size_t phy_speeds(unsigned int *speeds, size_t size,
 		  unsigned long *mask);
 void of_set_phy_supported(struct phy_device *phydev);
+void of_set_phy_eee_broken(struct phy_device *phydev);
 
 /**
  * phy_is_started - Convenience function to check whether PHY is started
@@ -1153,14 +1177,14 @@ static inline int phy_read_status(struct phy_device *phydev)
 
 void phy_driver_unregister(struct phy_driver *drv);
 void phy_drivers_unregister(struct phy_driver *drv, int n);
-/* RHEL specific: change in phy_driver breaking kabi checker but phy is
- * not protected by kabi. RH_KABI_DEPRECATED and RH_KABI_EXTEND macros
- * used in phy_driver hide checksum change and old driver loaded with new
- * kernel will crash. We need change phy_driver{s}_register
+/* RHEL specific: change in phy_driver breaking kabi checker but phy is not
+ * protected by kabi whitelist. RH_KABI_BROKEN_* macros used in phy_driver
+ * hide checksum change and old driver loaded with new kernel will crash. We
+ * need change phy_driver{s}_register
  */
-RH_KABI_FORCE_CHANGE(1)
+RH_KABI_FORCE_CHANGE(3)
 int phy_driver_register(struct phy_driver *new_driver, struct module *owner);
-RH_KABI_FORCE_CHANGE(1)
+RH_KABI_FORCE_CHANGE(3)
 int phy_drivers_register(struct phy_driver *new_driver, int n,
 			 struct module *owner);
 void phy_state_machine(struct work_struct *work);
@@ -1177,6 +1201,7 @@ void phy_request_interrupt(struct phy_device *phydev);
 void phy_print_status(struct phy_device *phydev);
 int phy_set_max_speed(struct phy_device *phydev, u32 max_speed);
 void phy_remove_link_mode(struct phy_device *phydev, u32 link_mode);
+void phy_advertise_supported(struct phy_device *phydev);
 void phy_support_sym_pause(struct phy_device *phydev);
 void phy_support_asym_pause(struct phy_device *phydev);
 void phy_set_sym_pause(struct phy_device *phydev, bool rx, bool tx,

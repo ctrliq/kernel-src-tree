@@ -13,6 +13,7 @@
 #include <linux/rcupdate.h>
 #include <linux/list.h>
 #include <linux/refcount.h>
+#include <linux/rh_kabi.h>
 
 union inet_addr {
 	__u32		all[4];
@@ -31,6 +32,8 @@ struct netpoll {
 	bool ipv6;
 	u16 local_port, remote_port;
 	u8 remote_mac[ETH_ALEN];
+
+	RH_KABI_DEPRECATE(struct work_struct, cleanup_work)
 };
 
 struct netpoll_info {

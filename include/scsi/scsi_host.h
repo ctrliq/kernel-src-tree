@@ -115,16 +115,6 @@ struct scsi_host_template {
 	int (* queuecommand)(struct Scsi_Host *, struct scsi_cmnd *);
 
 	/*
-	 * The commit_rqs function is used to trigger a hardware
-	 * doorbell after some requests have been queued with
-	 * queuecommand, when an error is encountered before sending
-	 * the request with SCMD_LAST set.
-	 *
-	 * STATUS: OPTIONAL
-	 */
-	void (*commit_rqs)(struct Scsi_Host *, u16);
-
-	/*
 	 * This is an error handling strategy routine.  You don't need to
 	 * define one of these if you don't want to - there is a default
 	 * routine that is present that should work in most cases.  For those
@@ -497,12 +487,22 @@ struct scsi_host_template {
 	unsigned int cmd_size;
 	struct scsi_host_cmd_pool *cmd_pool;
 
+	/*
+	 * The commit_rqs function is used to trigger a hardware
+	 * doorbell after some requests have been queued with
+	 * queuecommand, when an error is encountered before sending
+	 * the request with SCMD_LAST set.
+	 *
+	 * STATUS: OPTIONAL
+	 */
+	RH_KABI_USE(1, void (*commit_rqs)(struct Scsi_Host *, u16))
+
 	/* FOR RH USE ONLY
 	 *
 	 * The following padding has been inserted before ABI freeze to
 	 * allow extending the structure while preserving ABI.
 	 */
-	RH_KABI_RESERVE(1)
+
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)

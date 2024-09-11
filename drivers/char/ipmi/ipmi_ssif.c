@@ -1905,10 +1905,10 @@ static int ssif_probe(struct i2c_client *client, const struct i2c_device_id *id)
 		goto out;
 	}
 
-	rv = ipmi_register_smi(&ssif_info->handlers,
-			       ssif_info,
-			       &ssif_info->client->dev,
-			       slave_addr);
+	rv = ipmi_register_smi_mod(&ssif_info->handlers,
+			           ssif_info,
+			           &ssif_info->client->dev,
+			           slave_addr);
 	if (rv) {
 		dev_err(&ssif_info->client->dev,
 			"Unable to register device: error %d\n", rv);

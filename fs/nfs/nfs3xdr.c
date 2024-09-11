@@ -69,13 +69,13 @@
 #define NFS3_removeres_sz	(NFS3_setattrres_sz)
 #define NFS3_lookupres_sz	(1+NFS3_fh_sz+(2 * NFS3_post_op_attr_sz))
 #define NFS3_accessres_sz	(1+NFS3_post_op_attr_sz+1)
-#define NFS3_readlinkres_sz	(1+NFS3_post_op_attr_sz+1)
-#define NFS3_readres_sz		(1+NFS3_post_op_attr_sz+3)
+#define NFS3_readlinkres_sz	(1+NFS3_post_op_attr_sz+1+1)
+#define NFS3_readres_sz		(1+NFS3_post_op_attr_sz+3+1)
 #define NFS3_writeres_sz	(1+NFS3_wcc_data_sz+4)
 #define NFS3_createres_sz	(1+NFS3_fh_sz+NFS3_post_op_attr_sz+NFS3_wcc_data_sz)
 #define NFS3_renameres_sz	(1+(2 * NFS3_wcc_data_sz))
 #define NFS3_linkres_sz		(1+NFS3_post_op_attr_sz+NFS3_wcc_data_sz)
-#define NFS3_readdirres_sz	(1+NFS3_post_op_attr_sz+2)
+#define NFS3_readdirres_sz	(1+NFS3_post_op_attr_sz+2+1)
 #define NFS3_fsstatres_sz	(1+NFS3_post_op_attr_sz+13)
 #define NFS3_fsinfores_sz	(1+NFS3_post_op_attr_sz+12)
 #define NFS3_pathconfres_sz	(1+NFS3_post_op_attr_sz+6)
@@ -85,7 +85,7 @@
 #define ACL3_setaclargs_sz	(NFS3_fh_sz+1+ \
 				XDR_QUADLEN(NFS_ACL_INLINE_BUFSIZE))
 #define ACL3_getaclres_sz	(1+NFS3_post_op_attr_sz+1+ \
-				XDR_QUADLEN(NFS_ACL_INLINE_BUFSIZE))
+				XDR_QUADLEN(NFS_ACL_INLINE_BUFSIZE)+1)
 #define ACL3_setaclres_sz	(1+NFS3_post_op_attr_sz)
 
 static int nfs3_stat_to_errno(enum nfs_stat);
@@ -103,21 +103,6 @@ static const umode_t nfs_type2fmt[] = {
 	[NF3SOCK] = S_IFSOCK,
 	[NF3FIFO] = S_IFIFO,
 };
-
-/*
- * While encoding arguments, set up the reply buffer in advance to
- * receive reply data directly into the page cache.
- */
-static void prepare_reply_buffer(struct rpc_rqst *req, struct page **pages,
-				 unsigned int base, unsigned int len,
-				 unsigned int bufsize)
-{
-	struct rpc_auth	*auth = req->rq_cred->cr_auth;
-	unsigned int replen;
-
-	replen = RPC_REPHDRSIZE + auth->au_rslack + bufsize;
-	xdr_inline_pages(&req->rq_rcv_buf, replen << 2, pages, base, len);
-}
 
 /*
  * Encode/decode NFSv3 basic data types
@@ -910,8 +895,8 @@ static void nfs3_xdr_enc_readlink3args(struct rpc_rqst *req,
 	const struct nfs3_readlinkargs *args = data;
 
 	encode_nfs_fh3(xdr, args->fh);
-	prepare_reply_buffer(req, args->pages, args->pgbase,
-					args->pglen, NFS3_readlinkres_sz);
+	rpc_prepare_reply_pages(req, args->pages, args->pgbase,
+				args->pglen, NFS3_readlinkres_sz);
 }
 
 /*
@@ -943,8 +928,8 @@ static void nfs3_xdr_enc_read3args(struct rpc_rqst *req,
 	unsigned int replen = args->replen ? args->replen : NFS3_readres_sz;
 
 	encode_read3args(xdr, args);
-	prepare_reply_buffer(req, args->pages, args->pgbase,
-					args->count, replen);
+	rpc_prepare_reply_pages(req, args->pages, args->pgbase,
+				args->count, replen);
 	req->rq_rcv_buf.flags |= XDRBUF_READ;
 }
 
@@ -1236,7 +1221,7 @@ static void nfs3_xdr_enc_readdir3args(struct rpc_rqst *req,
 	const struct nfs3_readdirargs *args = data;
 
 	encode_readdir3args(xdr, args);
-	prepare_reply_buffer(req, args->pages, 0,
+	rpc_prepare_reply_pages(req, args->pages, 0,
 				args->count, NFS3_readdirres_sz);
 }
 
@@ -1278,7 +1263,7 @@ static void nfs3_xdr_enc_readdirplus3args(struct rpc_rqst *req,
 	const struct nfs3_readdirargs *args = data;
 
 	encode_readdirplus3args(xdr, args);
-	prepare_reply_buffer(req, args->pages, 0,
+	rpc_prepare_reply_pages(req, args->pages, 0,
 				args->count, NFS3_readdirres_sz);
 }
 
@@ -1323,7 +1308,7 @@ static void nfs3_xdr_enc_getacl3args(struct rpc_rqst *req,
 	encode_nfs_fh3(xdr, args->fh);
 	encode_uint32(xdr, args->mask);
 	if (args->mask & (NFS_ACL | NFS_DFACL)) {
-		prepare_reply_buffer(req, args->pages, 0,
+		rpc_prepare_reply_pages(req, args->pages, 0,
 					NFSACL_MAXPAGES << PAGE_SHIFT,
 					ACL3_getaclres_sz);
 		req->rq_rcv_buf.flags |= XDRBUF_SPARSE_PAGES;
@@ -1644,7 +1629,7 @@ static int nfs3_xdr_dec_read3res(struct rpc_rqst *req, struct xdr_stream *xdr,
 	result->op_status = status;
 	if (status != NFS3_OK)
 		goto out_status;
-	result->replen = 3 + ((xdr_stream_pos(xdr) - pos) >> 2);
+	result->replen = 4 + ((xdr_stream_pos(xdr) - pos) >> 2);
 	error = decode_read3resok(xdr, result);
 out:
 	return error;

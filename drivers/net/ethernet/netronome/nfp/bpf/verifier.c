@@ -744,6 +744,17 @@ continue_subprog:
 	goto continue_subprog;
 }
 
+static void nfp_bpf_insn_flag_zext(struct nfp_prog *nfp_prog,
+				   struct bpf_insn_aux_data *aux)
+{
+	struct nfp_insn_meta *meta;
+
+	list_for_each_entry(meta, &nfp_prog->insns, l) {
+		if (aux[meta->n].zext_dst)
+			meta->flags |= FLAG_INSN_DO_ZEXT;
+	}
+}
+
 int nfp_bpf_finalize(struct bpf_verifier_env *env)
 {
 	struct bpf_subprog_info *info;
@@ -784,6 +795,7 @@ int nfp_bpf_finalize(struct bpf_verifier_env *env)
 		return -EOPNOTSUPP;
 	}
 
+	nfp_bpf_insn_flag_zext(nfp_prog, env->insn_aux_data);
 	return 0;
 }
 
@@ -819,4 +831,28 @@ int nfp_bpf_opt_replace_insn(struct bpf_verifier_env *env, u32 off,
 	pr_vlog(env, "unsupported instruction replacement %hhx -> %hhx\n",
 		meta->insn.code, insn->code);
 	return -EINVAL;
+}
+
+int nfp_bpf_opt_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
+{
+	struct nfp_prog *nfp_prog = env->prog->aux->offload->dev_priv;
+	struct bpf_insn_aux_data *aux_data = env->insn_aux_data;
+	struct nfp_insn_meta *meta = nfp_prog->verifier_meta;
+	unsigned int i;
+
+	meta = nfp_bpf_goto_meta(nfp_prog, meta, aux_data[off].orig_idx);
+
+	for (i = 0; i < cnt; i++) {
+		if (WARN_ON_ONCE(&meta->l == &nfp_prog->insns))
+			return -EINVAL;
+
+		/* doesn't count if it already has the flag */
+		if (meta->flags & FLAG_INSN_SKIP_VERIFIER_OPT)
+			i--;
+
+		meta->flags |= FLAG_INSN_SKIP_VERIFIER_OPT;
+		meta = list_next_entry(meta, l);
+	}
+
+	return 0;
 }

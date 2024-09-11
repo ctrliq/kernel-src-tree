@@ -598,14 +598,12 @@ static void terminate_walk(struct nameidata *nd)
 		path_put(&nd->path);
 		for (i = 0; i < nd->depth; i++)
 			path_put(&nd->stack[i].link);
-		if (nd->root.mnt && !(nd->flags & LOOKUP_ROOT)) {
+		if (nd->flags & LOOKUP_ROOT_GRABBED) {
 			path_put(&nd->root);
-			nd->root.mnt = NULL;
+			nd->flags &= ~LOOKUP_ROOT_GRABBED;
 		}
 	} else {
 		nd->flags &= ~LOOKUP_RCU;
-		if (!(nd->flags & LOOKUP_ROOT))
-			nd->root.mnt = NULL;
 		rcu_read_unlock();
 	}
 	nd->depth = 0;
@@ -647,6 +645,7 @@ static bool legitimize_root(struct nameidata *nd)
 {
 	if (!nd->root.mnt || (nd->flags & LOOKUP_ROOT))
 		return true;
+	nd->flags |= LOOKUP_ROOT_GRABBED;
 	return legitimize_path(nd, &nd->root, nd->root_seq);
 }
 
@@ -680,21 +679,18 @@ static int unlazy_walk(struct nameidata *nd)
 
 	nd->flags &= ~LOOKUP_RCU;
 	if (unlikely(!legitimize_links(nd)))
-		goto out2;
-	if (unlikely(!legitimize_path(nd, &nd->path, nd->seq)))
 		goto out1;
+	if (unlikely(!legitimize_path(nd, &nd->path, nd->seq)))
+		goto out;
 	if (unlikely(!legitimize_root(nd)))
 		goto out;
 	rcu_read_unlock();
 	BUG_ON(nd->inode != parent->d_inode);
 	return 0;
 
-out2:
+out1:
 	nd->path.mnt = NULL;
 	nd->path.dentry = NULL;
-out1:
-	if (!(nd->flags & LOOKUP_ROOT))
-		nd->root.mnt = NULL;
 out:
 	rcu_read_unlock();
 	return -ECHILD;
@@ -734,21 +730,14 @@ static int unlazy_child(struct nameidata *nd, struct dentry *dentry, unsigned se
 	 */
 	if (unlikely(!lockref_get_not_dead(&dentry->d_lockref)))
 		goto out;
-	if (unlikely(read_seqcount_retry(&dentry->d_seq, seq))) {
-		rcu_read_unlock();
-		dput(dentry);
-		goto drop_root_mnt;
-	}
+	if (unlikely(read_seqcount_retry(&dentry->d_seq, seq)))
+		goto out_dput;
 	/*
 	 * Sequence counts matched. Now make sure that the root is
 	 * still valid and get it if required.
 	 */
-	if (unlikely(!legitimize_root(nd))) {
-		rcu_read_unlock();
-		dput(dentry);
-		return -ECHILD;
-	}
-
+	if (unlikely(!legitimize_root(nd)))
+		goto out_dput;
 	rcu_read_unlock();
 	return 0;
 
@@ -758,9 +747,10 @@ out1:
 	nd->path.dentry = NULL;
 out:
 	rcu_read_unlock();
-drop_root_mnt:
-	if (!(nd->flags & LOOKUP_ROOT))
-		nd->root.mnt = NULL;
+	return -ECHILD;
+out_dput:
+	rcu_read_unlock();
+	dput(dentry);
 	return -ECHILD;
 }
 
@@ -824,6 +814,7 @@ static void set_root(struct nameidata *nd)
 		} while (read_seqcount_retry(&fs->seq, seq));
 	} else {
 		get_fs_root(fs, &nd->root);
+		nd->flags |= LOOKUP_ROOT_GRABBED;
 	}
 }
 
@@ -890,8 +881,6 @@ static inline void put_link(struct nameidata *nd)
 
 int sysctl_protected_symlinks __read_mostly = 0;
 int sysctl_protected_hardlinks __read_mostly = 0;
-int sysctl_protected_fifos __read_mostly;
-int sysctl_protected_regular __read_mostly;
 
 /**
  * may_follow_link - Check symlink following for unsafe situations
@@ -1006,49 +995,6 @@ static int may_linkat(struct path *link)
 
 	audit_log_path_denied(AUDIT_ANOM_LINK, "linkat");
 	return -EPERM;
-}
-
-/**
- * may_create_in_sticky - Check whether an O_CREAT open in a sticky directory
- *			  should be allowed, or not, on files that already
- *			  exist.
- * @dir: the sticky parent directory
- * @inode: the inode of the file to open
- *
- * Block an O_CREAT open of a FIFO (or a regular file) when:
- *   - sysctl_protected_fifos (or sysctl_protected_regular) is enabled
- *   - the file already exists
- *   - we are in a sticky directory
- *   - we don't own the file
- *   - the owner of the directory doesn't own the file
- *   - the directory is world writable
- * If the sysctl_protected_fifos (or sysctl_protected_regular) is set to 2
- * the directory doesn't have to be world writable: being group writable will
- * be enough.
- *
- * Returns 0 if the open is allowed, -ve on error.
- */
-static int may_create_in_sticky(struct dentry * const dir,
-				struct inode * const inode)
-{
-	if ((!sysctl_protected_fifos && S_ISFIFO(inode->i_mode)) ||
-	    (!sysctl_protected_regular && S_ISREG(inode->i_mode)) ||
-	    likely(!(dir->d_inode->i_mode & S_ISVTX)) ||
-	    uid_eq(inode->i_uid, dir->d_inode->i_uid) ||
-	    uid_eq(current_fsuid(), inode->i_uid))
-		return 0;
-
-	if (likely(dir->d_inode->i_mode & 0002) ||
-	    (dir->d_inode->i_mode & 0020 &&
-	     ((sysctl_protected_fifos >= 2 && S_ISFIFO(inode->i_mode)) ||
-	      (sysctl_protected_regular >= 2 && S_ISREG(inode->i_mode))))) {
-		const char *operation = S_ISFIFO(inode->i_mode) ?
-					"sticky_create_fifo" :
-					"sticky_create_regular";
-		audit_log_path_denied(AUDIT_ANOM_CREAT, operation);
-		return -EACCES;
-	}
-	return 0;
 }
 
 static __always_inline
@@ -1744,8 +1690,6 @@ static int pick_link(struct nameidata *nd, struct path *link,
 				nd->flags &= ~LOOKUP_RCU;
 				nd->path.mnt = NULL;
 				nd->path.dentry = NULL;
-				if (!(nd->flags & LOOKUP_ROOT))
-					nd->root.mnt = NULL;
 				rcu_read_unlock();
 			} else if (likely(unlazy_walk(nd)) == 0)
 				error = nd_alloc_stack(nd);
@@ -3424,15 +3368,9 @@ finish_open:
 	if (error)
 		return error;
 	audit_inode(nd->name, nd->path.dentry, 0);
-	if (open_flag & O_CREAT) {
-		error = -EISDIR;
-		if (d_is_dir(nd->path.dentry))
-			goto out;
-		error = may_create_in_sticky(dir,
-					     d_backing_inode(nd->path.dentry));
-		if (unlikely(error))
-			goto out;
-	}
+	error = -EISDIR;
+	if ((open_flag & O_CREAT) && d_is_dir(nd->path.dentry))
+		goto out;
 	error = -ENOTDIR;
 	if ((nd->flags & LOOKUP_DIRECTORY) && !d_can_lookup(nd->path.dentry))
 		goto out;

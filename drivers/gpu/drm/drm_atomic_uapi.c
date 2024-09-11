@@ -490,7 +490,7 @@ drm_atomic_crtc_get_property(struct drm_crtc *crtc,
 	struct drm_mode_config *config = &dev->mode_config;
 
 	if (property == config->prop_active)
-		*val = state->active;
+		*val = drm_atomic_crtc_effectively_active(state);
 	else if (property == config->prop_mode_id)
 		*val = (state->mode_blob) ? state->mode_blob->base.id : 0;
 	else if (property == config->prop_vrr_enabled)
@@ -539,6 +539,8 @@ static int drm_atomic_plane_set_property(struct drm_plane *plane,
 
 	} else if (property == config->prop_crtc_id) {
 		struct drm_crtc *crtc = drm_crtc_find(dev, file_priv, val);
+		if (val && !crtc)
+			return -EACCES;
 		return drm_atomic_set_crtc_for_plane(state, crtc);
 	} else if (property == config->prop_crtc_x) {
 		state->crtc_x = U642I64(val);
@@ -648,28 +650,15 @@ drm_atomic_plane_get_property(struct drm_plane *plane,
 	return 0;
 }
 
-static struct drm_writeback_job *
-drm_atomic_get_writeback_job(struct drm_connector_state *conn_state)
-{
-	WARN_ON(conn_state->connector->connector_type != DRM_MODE_CONNECTOR_WRITEBACK);
-
-	if (!conn_state->writeback_job)
-		conn_state->writeback_job =
-			kzalloc(sizeof(*conn_state->writeback_job), GFP_KERNEL);
-
-	return conn_state->writeback_job;
-}
-
 static int drm_atomic_set_writeback_fb_for_connector(
 		struct drm_connector_state *conn_state,
 		struct drm_framebuffer *fb)
 {
-	struct drm_writeback_job *job =
-		drm_atomic_get_writeback_job(conn_state);
-	if (!job)
-		return -ENOMEM;
+	int ret;
 
-	drm_framebuffer_assign(&job->fb, fb);
+	ret = drm_writeback_set_fb(conn_state, fb);
+	if (ret < 0)
+		return ret;
 
 	if (fb)
 		DRM_DEBUG_ATOMIC("Set [FB:%d] for connector state %p\n",
@@ -692,6 +681,8 @@ static int drm_atomic_connector_set_property(struct drm_connector *connector,
 
 	if (property == config->prop_crtc_id) {
 		struct drm_crtc *crtc = drm_crtc_find(dev, file_priv, val);
+		if (val && !crtc)
+			return -EACCES;
 		return drm_atomic_set_crtc_for_connector(state, crtc);
 	} else if (property == config->dpms_property) {
 		/* setting DPMS property requires special handling, which
@@ -750,7 +741,7 @@ static int drm_atomic_connector_set_property(struct drm_connector *connector,
 		state->content_type = val;
 	} else if (property == connector->scaling_mode_property) {
 		state->scaling_mode = val;
-	} else if (property == connector->content_protection_property) {
+	} else if (property == config->content_protection_property) {
 		if (val == DRM_MODE_CONTENT_PROTECTION_ENABLED) {
 			DRM_DEBUG_KMS("only drivers can set CP Enabled\n");
 			return -EINVAL;
@@ -797,7 +788,10 @@ drm_atomic_connector_get_property(struct drm_connector *connector,
 	if (property == config->prop_crtc_id) {
 		*val = (state->crtc) ? state->crtc->base.id : 0;
 	} else if (property == config->dpms_property) {
-		*val = connector->dpms;
+		if (state->crtc && state->crtc->state->self_refresh_active)
+			*val = DRM_MODE_DPMS_ON;
+		else
+			*val = connector->dpms;
 	} else if (property == config->tv_select_subconnector_property) {
 		*val = state->tv.subconnector;
 	} else if (property == config->tv_left_margin_property) {
@@ -835,7 +829,7 @@ drm_atomic_connector_get_property(struct drm_connector *connector,
 	} else if (property == config->hdr_output_metadata_property) {
 		*val = state->hdr_output_metadata ?
 			state->hdr_output_metadata->base.id : 0;
-	} else if (property == connector->content_protection_property) {
+	} else if (property == config->content_protection_property) {
 		*val = state->content_protection;
 	} else if (property == config->writeback_fb_id_property) {
 		/* Writeback framebuffer is one-shot, write and forget */
@@ -1180,18 +1174,16 @@ static int prepare_signaling(struct drm_device *dev,
 
 	for_each_new_connector_in_state(state, conn, conn_state, i) {
 		struct drm_writeback_connector *wb_conn;
-		struct drm_writeback_job *job;
 		struct drm_out_fence_state *f;
 		struct dma_fence *fence;
 		s32 __user *fence_ptr;
 
+		if (!conn_state->writeback_job)
+			continue;
+
 		fence_ptr = get_out_fence_for_connector(state, conn);
 		if (!fence_ptr)
 			continue;
-
-		job = drm_atomic_get_writeback_job(conn_state);
-		if (!job)
-			return -ENOMEM;
 
 		f = krealloc(*fence_state, sizeof(**fence_state) *
 			     (*num_fences + 1), GFP_KERNEL);
@@ -1214,7 +1206,7 @@ static int prepare_signaling(struct drm_device *dev,
 			return ret;
 		}
 
-		job->out_fence = fence;
+		conn_state->writeback_job->out_fence = fence;
 	}
 
 	/*

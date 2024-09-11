@@ -257,7 +257,7 @@ cifs_reconnect_tcon(struct cifs_tcon *tcon, int smb_command)
 		if (server->tcpStatus != CifsNeedReconnect)
 			break;
 
-		if (--retries)
+		if (retries && --retries)
 			continue;
 
 		/*

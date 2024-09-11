@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: ISC */
+// SPDX-License-Identifier: ISC
 
 #include <linux/firmware.h>
 #include "mt7603.h"
@@ -54,10 +54,10 @@ __mt7603_mcu_msg_send(struct mt7603_dev *dev, struct sk_buff *skb,
 }
 
 static int
-mt7603_mcu_msg_send(struct mt7603_dev *dev, int cmd, const void *data,
+mt7603_mcu_msg_send(struct mt76_dev *mdev, int cmd, const void *data,
 		    int len, bool wait_resp)
 {
-	struct mt76_dev *mdev = &dev->mt76;
+	struct mt7603_dev *dev = container_of(mdev, struct mt7603_dev, mt76);
 	unsigned long expires = jiffies + 3 * HZ;
 	struct mt7603_mcu_rxd *rxd;
 	struct sk_buff *skb;
@@ -115,7 +115,7 @@ mt7603_mcu_init_download(struct mt7603_dev *dev, u32 addr, u32 len)
 		.mode = cpu_to_le32(BIT(31)),
 	};
 
-	return mt7603_mcu_msg_send(dev, -MCU_CMD_TARGET_ADDRESS_LEN_REQ,
+	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_TARGET_ADDRESS_LEN_REQ,
 				   &req, sizeof(req), true);
 }
 
@@ -151,18 +151,18 @@ mt7603_mcu_start_firmware(struct mt7603_dev *dev, u32 addr)
 		.addr = cpu_to_le32(addr),
 	};
 
-	return mt7603_mcu_msg_send(dev, -MCU_CMD_FW_START_REQ,
+	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_START_REQ,
 				   &req, sizeof(req), true);
 }
 
 static int
-mt7603_mcu_restart(struct mt7603_dev *dev)
+mt7603_mcu_restart(struct mt76_dev *dev)
 {
-	return mt7603_mcu_msg_send(dev, -MCU_CMD_RESTART_DL_REQ,
+	return __mt76_mcu_send_msg(dev, -MCU_CMD_RESTART_DL_REQ,
 				   NULL, 0, true);
 }
 
-int mt7603_load_firmware(struct mt7603_dev *dev)
+static int mt7603_load_firmware(struct mt7603_dev *dev)
 {
 	const struct firmware *fw;
 	const struct mt7603_fw_trailer *hdr;
@@ -263,9 +263,20 @@ out:
 	return ret;
 }
 
+int mt7603_mcu_init(struct mt7603_dev *dev)
+{
+	static const struct mt76_mcu_ops mt7603_mcu_ops = {
+		.mcu_send_msg = mt7603_mcu_msg_send,
+		.mcu_restart = mt7603_mcu_restart,
+	};
+
+	dev->mt76.mcu_ops = &mt7603_mcu_ops;
+	return mt7603_load_firmware(dev);
+}
+
 void mt7603_mcu_exit(struct mt7603_dev *dev)
 {
-	mt7603_mcu_restart(dev);
+	__mt76_mcu_restart(&dev->mt76);
 	skb_queue_purge(&dev->mt76.mmio.mcu.res_q);
 }
 
@@ -343,24 +354,34 @@ int mt7603_mcu_set_eeprom(struct mt7603_dev *dev)
 		u8 buffer_mode;
 		u8 len;
 		u8 pad[2];
-		struct req_data data[255];
-	} req = {
+	} req_hdr = {
 		.buffer_mode = 1,
 		.len = ARRAY_SIZE(req_fields) - 1,
 	};
-	u8 *eep = (u8 *)dev->mt76.eeprom.data;
-	int i;
+	const int size = 0xff * sizeof(struct req_data);
+	u8 *req, *eep = (u8 *)dev->mt76.eeprom.data;
+	int i, ret, len = sizeof(req_hdr) + size;
+	struct req_data *data;
 
-	BUILD_BUG_ON(ARRAY_SIZE(req_fields) > ARRAY_SIZE(req.data));
+	BUILD_BUG_ON(ARRAY_SIZE(req_fields) * sizeof(*data) > size);
 
+	req = kmalloc(len, GFP_KERNEL);
+	if (!req)
+		return -ENOMEM;
+
+	memcpy(req, &req_hdr, sizeof(req_hdr));
+	data = (struct req_data *)(req + sizeof(req_hdr));
+	memset(data, 0, size);
 	for (i = 0; i < ARRAY_SIZE(req_fields); i++) {
-		req.data[i].addr = cpu_to_le16(req_fields[i]);
-		req.data[i].val = eep[req_fields[i]];
-		req.data[i].pad = 0;
+		data[i].addr = cpu_to_le16(req_fields[i]);
+		data[i].val = eep[req_fields[i]];
 	}
 
-	return mt7603_mcu_msg_send(dev, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
-				   &req, sizeof(req), true);
+	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
+				  req, len, true);
+	kfree(req);
+
+	return ret;
 }
 
 static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
@@ -403,7 +424,7 @@ static int mt7603_mcu_set_tx_power(struct mt7603_dev *dev)
 	memcpy(req.temp_comp_power, eep + MT_EE_STEP_NUM_NEG_6_7,
 	       sizeof(req.temp_comp_power));
 
-	return mt7603_mcu_msg_send(dev, MCU_EXT_CMD_SET_TX_POWER_CTRL,
+	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_TX_POWER_CTRL,
 				   &req, sizeof(req), true);
 }
 
@@ -449,7 +470,7 @@ int mt7603_mcu_set_channel(struct mt7603_dev *dev)
 	for (i = 0; i < ARRAY_SIZE(req.txpower); i++)
 		req.txpower[i] = tx_power;
 
-	ret = mt7603_mcu_msg_send(dev, MCU_EXT_CMD_CHANNEL_SWITCH,
+	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_CHANNEL_SWITCH,
 				  &req, sizeof(req), true);
 	if (ret)
 		return ret;

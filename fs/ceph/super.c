@@ -142,6 +142,7 @@ enum {
 	Opt_snapdirname,
 	Opt_mds_namespace,
 	Opt_fscache_uniq,
+	Opt_recover_session,
 	Opt_last_string,
 	/* string args above */
 	Opt_dirstat,
@@ -181,6 +182,7 @@ static match_table_t fsopt_tokens = {
 	/* int args above */
 	{Opt_snapdirname, "snapdirname=%s"},
 	{Opt_mds_namespace, "mds_namespace=%s"},
+	{Opt_recover_session, "recover_session=%s"},
 	{Opt_fscache_uniq, "fsc=%s"},
 	/* string args above */
 	{Opt_dirstat, "dirstat"},
@@ -248,6 +250,17 @@ static int parse_fsopt_token(char *c, void *private)
 						GFP_KERNEL);
 		if (!fsopt->mds_namespace)
 			return -ENOMEM;
+		break;
+	case Opt_recover_session:
+		if (!strncmp(argstr[0].from, "no",
+			     argstr[0].to - argstr[0].from)) {
+			fsopt->flags &= ~CEPH_MOUNT_OPT_CLEANRECOVER;
+		} else if (!strncmp(argstr[0].from, "clean",
+				    argstr[0].to - argstr[0].from)) {
+			fsopt->flags |= CEPH_MOUNT_OPT_CLEANRECOVER;
+		} else {
+			return -EINVAL;
+		}
 		break;
 	case Opt_fscache_uniq:
 #ifdef CONFIG_CEPH_FSCACHE
@@ -571,6 +584,10 @@ static int ceph_show_options(struct seq_file *m, struct dentry *root)
 
 	if (fsopt->mds_namespace)
 		seq_show_option(m, "mds_namespace", fsopt->mds_namespace);
+
+	if (fsopt->flags & CEPH_MOUNT_OPT_CLEANRECOVER)
+		seq_show_option(m, "recover_session", "clean");
+
 	if (fsopt->wsize != CEPH_MAX_WRITE_SIZE)
 		seq_printf(m, ",wsize=%d", fsopt->wsize);
 	if (fsopt->rsize != CEPH_MAX_READ_SIZE)
@@ -659,6 +676,7 @@ static struct ceph_fs_client *create_fs_client(struct ceph_mount_options *fsopt,
 
 	fsc->sb = NULL;
 	fsc->mount_state = CEPH_MOUNT_MOUNTING;
+	fsc->filp_gen = 1;
 
 	atomic_long_set(&fsc->writeback_count, 0);
 
@@ -825,6 +843,7 @@ static void ceph_umount_begin(struct super_block *sb)
 	fsc->mount_state = CEPH_MOUNT_SHUTDOWN;
 	ceph_osdc_abort_requests(&fsc->client->osdc, -EIO);
 	ceph_mdsc_force_umount(fsc->mdsc);
+	fsc->filp_gen++; // invalidate open files
 }
 
 static int ceph_remount(struct super_block *sb, int *flags, char *data)
@@ -838,6 +857,7 @@ static const struct super_operations ceph_super_ops = {
 	.destroy_inode	= ceph_destroy_inode,
 	.write_inode    = ceph_write_inode,
 	.drop_inode	= ceph_drop_inode,
+	.evict_inode	= ceph_evict_inode,
 	.sync_fs        = ceph_sync_fs,
 	.put_super	= ceph_put_super,
 	.remount_fs	= ceph_remount,
@@ -1158,6 +1178,8 @@ int ceph_force_reconnect(struct super_block *sb)
 	ceph_reset_client_addr(fsc->client);
 
 	ceph_osdc_clear_abort_err(&fsc->client->osdc);
+
+	fsc->blacklisted = false;
 	fsc->mount_state = CEPH_MOUNT_MOUNTED;
 
 	if (sb->s_root) {

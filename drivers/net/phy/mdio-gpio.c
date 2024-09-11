@@ -166,10 +166,6 @@ static int mdio_gpio_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	if (gpiod_cansleep(bitbang->mdc) || gpiod_cansleep(bitbang->mdio) ||
-	    gpiod_cansleep(bitbang->mdo))
-		dev_warn(&pdev->dev, "Slow GPIO pins might wreak havoc into MDIO bus timing");
-
 	if (pdev->dev.of_node) {
 		bus_id = of_alias_get_id(pdev->dev.of_node, "mdio-gpio");
 		if (bus_id < 0) {

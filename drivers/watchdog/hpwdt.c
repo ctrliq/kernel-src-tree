@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-only
 /*
  *	HPE WatchDog Driver
  *	based on
@@ -6,11 +7,6 @@
  *
  *	(c) Copyright 2018 Hewlett Packard Enterprise Development LP
  *	Thomas Mingarelli <thomas.mingarelli@hpe.com>
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License
- *	version 2 as published by the Free Software Foundation
- *
  */
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
@@ -26,7 +22,7 @@
 #include <linux/watchdog.h>
 #include <asm/nmi.h>
 
-#define HPWDT_VERSION			"2.0.2"
+#define HPWDT_VERSION			"2.0.3"
 #define SECS_TO_TICKS(secs)		((secs) * 1000 / 128)
 #define TICKS_TO_SECS(ticks)		((ticks) * 128 / 1000)
 #define HPWDT_MAX_TICKS			65535
@@ -62,6 +58,11 @@ static struct watchdog_device hpwdt_dev;
 /*
  *	Watchdog operations
  */
+static int hpwdt_hw_is_running(void)
+{
+	return ioread8(hpwdt_timer_con) & 0x01;
+}
+
 static int hpwdt_start(struct watchdog_device *wdd)
 {
 	int control = 0x81 | (pretimeout ? 0x4 : 0);
@@ -318,14 +319,18 @@ static int hpwdt_init_one(struct pci_dev *dev,
 	hpwdt_timer_reg = pci_mem_addr + 0x70;
 	hpwdt_timer_con = pci_mem_addr + 0x72;
 
-	/* Make sure that timer is disabled until /dev/watchdog is opened */
-	hpwdt_stop();
+	/* Have the core update running timer until user space is ready */
+	if (hpwdt_hw_is_running()) {
+		dev_info(&dev->dev, "timer is running\n");
+		set_bit(WDOG_HW_RUNNING, &hpwdt_dev.status);
+	}
 
 	/* Initialize NMI Decoding functionality */
 	retval = hpwdt_init_nmi_decoding(dev);
 	if (retval != 0)
 		goto error_init_nmi_decoding;
 
+	watchdog_stop_on_unregister(&hpwdt_dev);
 	watchdog_set_nowayout(&hpwdt_dev, nowayout);
 	if (watchdog_init_timeout(&hpwdt_dev, soft_margin, NULL))
 		dev_warn(&dev->dev, "Invalid soft_margin: %d.\n", soft_margin);
@@ -366,9 +371,6 @@ error_pci_iomap:
 
 static void hpwdt_exit(struct pci_dev *dev)
 {
-	if (!nowayout)
-		hpwdt_stop();
-
 	watchdog_unregister_device(&hpwdt_dev);
 	hpwdt_exit_nmi_decoding();
 	pci_iounmap(dev, pci_mem_addr);

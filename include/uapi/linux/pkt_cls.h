@@ -16,8 +16,13 @@ enum {
 	TCA_ACT_STATS,
 	TCA_ACT_PAD,
 	TCA_ACT_COOKIE,
+	TCA_ACT_FLAGS,
 	__TCA_ACT_MAX
 };
+
+#define TCA_ACT_FLAGS_NO_PERCPU_STATS 1 /* Don't use percpu allocator for
+					 * actions stats.
+					 */
 
 #define TCA_ACT_MAX __TCA_ACT_MAX
 #define TCA_OLD_COMPAT (TCA_ACT_MAX+1)
@@ -104,8 +109,10 @@ enum tca_id {
 	TCA_ID_SIMP = TCA_ACT_SIMP,
 	TCA_ID_IFE = TCA_ACT_IFE,
 	TCA_ID_SAMPLE = TCA_ACT_SAMPLE,
-	/* other actions go here */
 	TCA_ID_CTINFO,
+	TCA_ID_MPLS,
+	TCA_ID_CT,
+	/* other actions go here */
 	__TCA_ID_MAX = 255
 };
 
@@ -297,7 +304,7 @@ enum {
 	TCA_FW_UNSPEC,
 	TCA_FW_CLASSID,
 	TCA_FW_POLICE,
-	TCA_FW_INDEV, /*  used by CONFIG_NET_CLS_IND */
+	TCA_FW_INDEV,
 	TCA_FW_ACT, /* used by CONFIG_NET_CLS_ACT */
 	TCA_FW_MASK,
 	__TCA_FW_MAX

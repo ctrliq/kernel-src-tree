@@ -65,6 +65,7 @@
 #define SDMA_DESCQ_CNT 2048
 #define SDMA_DESC_INTR 64
 #define INVALID_TAIL 0xffff
+#define SDMA_PAD max_t(size_t, MAX_16B_PADDING, sizeof(u32))
 
 static uint sdma_descq_cnt = SDMA_DESCQ_CNT;
 module_param(sdma_descq_cnt, uint, S_IRUGO);
@@ -1297,7 +1298,7 @@ void sdma_clean(struct hfi1_devdata *dd, size_t num_engines)
 	struct sdma_engine *sde;
 
 	if (dd->sdma_pad_dma) {
-		dma_free_coherent(&dd->pcidev->dev, 4,
+		dma_free_coherent(&dd->pcidev->dev, SDMA_PAD,
 				  (void *)dd->sdma_pad_dma,
 				  dd->sdma_pad_phys);
 		dd->sdma_pad_dma = NULL;
@@ -1467,12 +1468,9 @@ int sdma_init(struct hfi1_devdata *dd, u8 port)
 		timer_setup(&sde->err_progress_check_timer,
 			    sdma_err_progress_check, 0);
 
-		sde->descq = dma_zalloc_coherent(
-			&dd->pcidev->dev,
-			descq_cnt * sizeof(u64[2]),
-			&sde->descq_phys,
-			GFP_KERNEL
-		);
+		sde->descq = dma_alloc_coherent(&dd->pcidev->dev,
+						descq_cnt * sizeof(u64[2]),
+						&sde->descq_phys, GFP_KERNEL);
 		if (!sde->descq)
 			goto bail;
 		sde->tx_ring =
@@ -1485,24 +1483,18 @@ int sdma_init(struct hfi1_devdata *dd, u8 port)
 
 	dd->sdma_heads_size = L1_CACHE_BYTES * num_engines;
 	/* Allocate memory for DMA of head registers to memory */
-	dd->sdma_heads_dma = dma_zalloc_coherent(
-		&dd->pcidev->dev,
-		dd->sdma_heads_size,
-		&dd->sdma_heads_phys,
-		GFP_KERNEL
-	);
+	dd->sdma_heads_dma = dma_alloc_coherent(&dd->pcidev->dev,
+						dd->sdma_heads_size,
+						&dd->sdma_heads_phys,
+						GFP_KERNEL);
 	if (!dd->sdma_heads_dma) {
 		dd_dev_err(dd, "failed to allocate SendDMA head memory\n");
 		goto bail;
 	}
 
 	/* Allocate memory for pad */
-	dd->sdma_pad_dma = dma_zalloc_coherent(
-		&dd->pcidev->dev,
-		sizeof(u32),
-		&dd->sdma_pad_phys,
-		GFP_KERNEL
-	);
+	dd->sdma_pad_dma = dma_alloc_coherent(&dd->pcidev->dev, SDMA_PAD,
+					      &dd->sdma_pad_phys, GFP_KERNEL);
 	if (!dd->sdma_pad_dma) {
 		dd_dev_err(dd, "failed to allocate SendDMA pad memory\n");
 		goto bail;

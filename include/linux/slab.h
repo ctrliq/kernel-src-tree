@@ -646,7 +646,7 @@ struct memcg_cache_params {
 			struct mem_cgroup *memcg;
 			struct list_head children_node;
 			struct list_head kmem_caches_node;
-			RH_KABI_EXTEND(struct percpu_ref refcnt)
+			RH_KABI_BROKEN_INSERT(struct percpu_ref refcnt)
 
 			void (*RH_KABI_RENAME(deact_fn,
 					      work_fn))(struct kmem_cache *);

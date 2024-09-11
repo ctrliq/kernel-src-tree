@@ -390,8 +390,7 @@ struct ib_mr *rvt_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (length == 0)
 		return ERR_PTR(-EINVAL);
 
-	umem = ib_umem_get(pd->uobject->context, start, length,
-			   mr_access_flags, 0);
+	umem = ib_umem_get(udata, start, length, mr_access_flags, 0);
 	if (IS_ERR(umem))
 		return (void *)umem;
 
@@ -551,7 +550,7 @@ bool rvt_ss_has_lkey(struct rvt_sge_state *ss, u32 lkey)
  *
  * Returns 0 on success.
  */
-int rvt_dereg_mr(struct ib_mr *ibmr)
+int rvt_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct rvt_mr *mr = to_imr(ibmr);
 	int ret;
@@ -563,8 +562,7 @@ int rvt_dereg_mr(struct ib_mr *ibmr)
 	if (ret)
 		goto out;
 	rvt_deinit_mregion(&mr->mr);
-	if (mr->umem)
-		ib_umem_release(mr->umem);
+	ib_umem_release(mr->umem);
 	kfree(mr);
 out:
 	return ret;
@@ -578,9 +576,8 @@ out:
  *
  * Return: the memory region on success, otherwise return an errno.
  */
-struct ib_mr *rvt_alloc_mr(struct ib_pd *pd,
-			   enum ib_mr_type mr_type,
-			   u32 max_num_sg)
+struct ib_mr *rvt_alloc_mr(struct ib_pd *pd, enum ib_mr_type mr_type,
+			   u32 max_num_sg, struct ib_udata *udata)
 {
 	struct rvt_mr *mr;
 

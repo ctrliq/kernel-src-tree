@@ -15,6 +15,8 @@
 #include <linux/errno.h>
 #include <linux/sunrpc/xdr.h>
 #include <linux/sunrpc/msg_prot.h>
+#include <linux/bvec.h>
+#include <trace/events/sunrpc.h>
 
 /*
  * XDR functions for basic NFS types
@@ -128,6 +130,48 @@ xdr_terminate_string(struct xdr_buf *buf, const u32 len)
 }
 EXPORT_SYMBOL_GPL(xdr_terminate_string);
 
+size_t
+xdr_buf_pagecount(struct xdr_buf *buf)
+{
+	if (!buf->page_len)
+		return 0;
+	return (buf->page_base + buf->page_len + PAGE_SIZE - 1) >> PAGE_SHIFT;
+}
+
+int
+xdr_alloc_bvec(struct xdr_buf *buf, gfp_t gfp)
+{
+	size_t i, n = xdr_buf_pagecount(buf);
+
+	if (n != 0 && buf->bvec == NULL) {
+		buf->bvec = kmalloc_array(n, sizeof(buf->bvec[0]), gfp);
+		if (!buf->bvec)
+			return -ENOMEM;
+		for (i = 0; i < n; i++) {
+			buf->bvec[i].bv_page = buf->pages[i];
+			buf->bvec[i].bv_len = PAGE_SIZE;
+			buf->bvec[i].bv_offset = 0;
+		}
+	}
+	return 0;
+}
+
+void
+xdr_free_bvec(struct xdr_buf *buf)
+{
+	kfree(buf->bvec);
+	buf->bvec = NULL;
+}
+
+/**
+ * xdr_inline_pages - Prepare receive buffer for a large reply
+ * @xdr: xdr_buf into which reply will be placed
+ * @offset: expected offset where data payload will start, in bytes
+ * @pages: vector of struct page pointers
+ * @base: offset in first page where receive should start, in bytes
+ * @len: expected size of the upper layer data payload, in bytes
+ *
+ */
 void
 xdr_inline_pages(struct xdr_buf *xdr, unsigned int offset,
 		 struct page **pages, unsigned int base, unsigned int len)
@@ -145,6 +189,8 @@ xdr_inline_pages(struct xdr_buf *xdr, unsigned int offset,
 
 	tail->iov_base = buf + offset;
 	tail->iov_len = buflen - offset;
+	if ((xdr->page_len & 3) == 0)
+		tail->iov_len -= sizeof(__be32);
 
 	xdr->buflen += len;
 }
@@ -312,13 +358,15 @@ EXPORT_SYMBOL_GPL(_copy_from_pages);
  * 'len' bytes. The extra data is not lost, but is instead
  * moved into the inlined pages and/or the tail.
  */
-static void
+static unsigned int
 xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
 {
 	struct kvec *head, *tail;
 	size_t copy, offs;
 	unsigned int pglen = buf->page_len;
+	unsigned int result;
 
+	result = 0;
 	tail = buf->tail;
 	head = buf->head;
 
@@ -332,6 +380,7 @@ xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
 			copy = tail->iov_len - len;
 			memmove((char *)tail->iov_base + len,
 					tail->iov_base, copy);
+			result += copy;
 		}
 		/* Copy from the inlined pages into the tail */
 		copy = len;
@@ -342,11 +391,13 @@ xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
 			copy = 0;
 		else if (copy > tail->iov_len - offs)
 			copy = tail->iov_len - offs;
-		if (copy != 0)
+		if (copy != 0) {
 			_copy_from_pages((char *)tail->iov_base + offs,
 					buf->pages,
 					buf->page_base + pglen + offs - len,
 					copy);
+			result += copy;
+		}
 		/* Do we also need to copy data from the head into the tail ? */
 		if (len > pglen) {
 			offs = copy = len - pglen;
@@ -356,6 +407,7 @@ xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
 					(char *)head->iov_base +
 					head->iov_len - offs,
 					copy);
+			result += copy;
 		}
 	}
 	/* Now handle pages */
@@ -371,12 +423,15 @@ xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
 		_copy_to_pages(buf->pages, buf->page_base,
 				(char *)head->iov_base + head->iov_len - len,
 				copy);
+		result += copy;
 	}
 	head->iov_len -= len;
 	buf->buflen -= len;
 	/* Have we truncated the message? */
 	if (buf->len > buf->buflen)
 		buf->len = buf->buflen;
+
+	return result;
 }
 
 /**
@@ -387,14 +442,16 @@ xdr_shrink_bufhead(struct xdr_buf *buf, size_t len)
  * The extra data is not lost, but is instead moved into buf->tail.
  * Returns the actual number of bytes moved.
  */
-static void
+static unsigned int
 xdr_shrink_pagelen(struct xdr_buf *buf, size_t len)
 {
 	struct kvec *tail;
 	size_t copy;
 	unsigned int pglen = buf->page_len;
 	unsigned int tailbuf_len;
+	unsigned int result;
 
+	result = 0;
 	tail = buf->tail;
 	if (len > buf->page_len)
 		len = buf-> page_len;
@@ -412,18 +469,22 @@ xdr_shrink_pagelen(struct xdr_buf *buf, size_t len)
 		if (tail->iov_len > len) {
 			char *p = (char *)tail->iov_base + len;
 			memmove(p, tail->iov_base, tail->iov_len - len);
+			result += tail->iov_len - len;
 		} else
 			copy = tail->iov_len;
 		/* Copy from the inlined pages into the tail */
 		_copy_from_pages((char *)tail->iov_base,
 				buf->pages, buf->page_base + pglen - len,
 				copy);
+		result += copy;
 	}
 	buf->page_len -= len;
 	buf->buflen -= len;
 	/* Have we truncated the message? */
 	if (buf->len > buf->buflen)
 		buf->len = buf->buflen;
+
+	return result;
 }
 
 void
@@ -519,9 +580,9 @@ static __be32 *xdr_get_next_encode_buffer(struct xdr_stream *xdr,
 	int frag1bytes, frag2bytes;
 
 	if (nbytes > PAGE_SIZE)
-		return NULL; /* Bigger buffers require special handling */
+		goto out_overflow; /* Bigger buffers require special handling */
 	if (xdr->buf->len + nbytes > xdr->buf->buflen)
-		return NULL; /* Sorry, we're totally out of space */
+		goto out_overflow; /* Sorry, we're totally out of space */
 	frag1bytes = (xdr->end - xdr->p) << 2;
 	frag2bytes = nbytes - frag1bytes;
 	if (xdr->iov)
@@ -550,6 +611,9 @@ static __be32 *xdr_get_next_encode_buffer(struct xdr_stream *xdr,
 	xdr->buf->page_len += frag2bytes;
 	xdr->buf->len += nbytes;
 	return p;
+out_overflow:
+	trace_rpc_xdr_overflow(xdr, nbytes);
+	return NULL;
 }
 
 /**
@@ -867,20 +931,23 @@ static __be32 *xdr_copy_to_scratch(struct xdr_stream *xdr, size_t nbytes)
 	size_t cplen = (char *)xdr->end - (char *)xdr->p;
 
 	if (nbytes > xdr->scratch.iov_len)
-		return NULL;
+		goto out_overflow;
 	p = __xdr_inline_decode(xdr, cplen);
 	if (p == NULL)
 		return NULL;
 	memcpy(cpdest, p, cplen);
+	if (!xdr_set_next_buffer(xdr))
+		goto out_overflow;
 	cpdest += cplen;
 	nbytes -= cplen;
-	if (!xdr_set_next_buffer(xdr))
-		return NULL;
 	p = __xdr_inline_decode(xdr, nbytes);
 	if (p == NULL)
 		return NULL;
 	memcpy(cpdest, p, nbytes);
 	return xdr->scratch.iov_base;
+out_overflow:
+	trace_rpc_xdr_overflow(xdr, nbytes);
+	return NULL;
 }
 
 /**
@@ -897,14 +964,17 @@ __be32 * xdr_inline_decode(struct xdr_stream *xdr, size_t nbytes)
 {
 	__be32 *p;
 
-	if (nbytes == 0)
+	if (unlikely(nbytes == 0))
 		return xdr->p;
 	if (xdr->p == xdr->end && !xdr_set_next_buffer(xdr))
-		return NULL;
+		goto out_overflow;
 	p = __xdr_inline_decode(xdr, nbytes);
 	if (p != NULL)
 		return p;
 	return xdr_copy_to_scratch(xdr, nbytes);
+out_overflow:
+	trace_rpc_xdr_overflow(xdr, nbytes);
+	return NULL;
 }
 EXPORT_SYMBOL_GPL(xdr_inline_decode);
 
@@ -914,13 +984,17 @@ static unsigned int xdr_align_pages(struct xdr_stream *xdr, unsigned int len)
 	struct kvec *iov;
 	unsigned int nwords = XDR_QUADLEN(len);
 	unsigned int cur = xdr_stream_pos(xdr);
+	unsigned int copied, offset;
 
 	if (xdr->nwords == 0)
 		return 0;
+
 	/* Realign pages to current pointer position */
-	iov  = buf->head;
+	iov = buf->head;
 	if (iov->iov_len > cur) {
-		xdr_shrink_bufhead(buf, iov->iov_len - cur);
+		offset = iov->iov_len - cur;
+		copied = xdr_shrink_bufhead(buf, offset);
+		trace_rpc_xdr_alignment(xdr, offset, copied);
 		xdr->nwords = XDR_QUADLEN(buf->len - cur);
 	}
 
@@ -932,7 +1006,9 @@ static unsigned int xdr_align_pages(struct xdr_stream *xdr, unsigned int len)
 		len = buf->page_len;
 	else if (nwords < xdr->nwords) {
 		/* Truncate page data and move it into the tail */
-		xdr_shrink_pagelen(buf, buf->page_len - len);
+		offset = buf->page_len - len;
+		copied = xdr_shrink_pagelen(buf, offset);
+		trace_rpc_xdr_alignment(xdr, offset, copied);
 		xdr->nwords = XDR_QUADLEN(buf->len - cur);
 	}
 	return len;

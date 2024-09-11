@@ -30,7 +30,6 @@
 #include <linux/mdio.h>
 #include <linux/io.h>
 #include <linux/uaccess.h>
-#include <linux/of.h>
 
 MODULE_DESCRIPTION("PHY library");
 MODULE_AUTHOR("Andy Fleming");
@@ -231,26 +230,6 @@ extern struct phy_driver genphy_c45_driver;
 static LIST_HEAD(phy_fixup_list);
 static DEFINE_MUTEX(phy_fixup_lock);
 
-static bool phy_may_suspend(struct phy_device *phydev)
-{
-	struct net_device *netdev = phydev->attached_dev;
-
-	if (!netdev)
-		return true;
-
-	/* Don't suspend PHY if the attached netdev parent may wakeup.
-	 * The parent may point to a PCI device, as in tg3 driver.
-	 */
-	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
-		return false;
-
-	/* Also don't suspend PHY if the netdev itself may wakeup. This
-	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
-	 * e.g. SoC devices.
-	 */
-	return !device_may_wakeup(&netdev->dev);
-}
-
 #ifdef CONFIG_PM
 static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
 {
@@ -269,7 +248,25 @@ static bool mdio_bus_phy_may_suspend(struct phy_device *phydev)
 	if (!netdev)
 		return !phydev->suspended;
 
-	return phy_may_suspend(phydev);
+	if (netdev->wol_enabled)
+		return false;
+
+	/* As long as not all affected network drivers support the
+	 * wol_enabled flag, let's check for hints that WoL is enabled.
+	 * Don't suspend PHY if the attached netdev parent may wake up.
+	 * The parent may point to a PCI device, as in tg3 driver.
+	 */
+	if (netdev->dev.parent && device_may_wakeup(netdev->dev.parent))
+		return false;
+
+	/* Also don't suspend PHY if the netdev itself may wakeup. This
+	 * is the case for devices w/o underlaying pwr. mgmt. aware bus,
+	 * e.g. SoC devices.
+	 */
+	if (device_may_wakeup(&netdev->dev))
+		return false;
+
+	return true;
 }
 
 static int mdio_bus_phy_suspend(struct device *dev)
@@ -1395,15 +1392,13 @@ EXPORT_SYMBOL(phy_detach);
 int phy_suspend(struct phy_device *phydev)
 {
 	struct phy_driver *phydrv = to_phy_driver(phydev->mdio.dev.driver);
+	struct net_device *netdev = phydev->attached_dev;
 	struct ethtool_wolinfo wol = { .cmd = ETHTOOL_GWOL };
 	int ret = 0;
 
-	if (phydev->suspended)
-		return 0;
-
 	/* If the device has WOL enabled, we cannot suspend the PHY */
 	phy_ethtool_get_wol(phydev, &wol);
-	if (wol.wolopts || !phy_may_suspend(phydev))
+	if (wol.wolopts || (netdev && netdev->wol_enabled))
 		return -EBUSY;
 
 	if (phydev->drv && phydrv->suspend)
@@ -1788,6 +1783,14 @@ int genphy_read_status(struct phy_device *phydev)
 			if (adv < 0)
 				return adv;
 
+			if (lpagb & LPA_1000MSFAIL) {
+				if (adv & CTL1000_ENABLE_MASTER)
+					phydev_err(phydev, "Master/Slave resolution failed, maybe conflicting manual settings?\n");
+				else
+					phydev_err(phydev, "Master/Slave resolution failed\n");
+				return -ENOLINK;
+			}
+
 			mii_stat1000_mod_linkmode_lpa_t(phydev->lp_advertising,
 							lpagb);
 		}
@@ -1998,9 +2001,34 @@ EXPORT_SYMBOL(genphy_loopback);
 void phy_remove_link_mode(struct phy_device *phydev, u32 link_mode)
 {
 	linkmode_clear_bit(link_mode, phydev->supported);
-	linkmode_copy(phydev->advertising, phydev->supported);
+	phy_advertise_supported(phydev);
 }
 EXPORT_SYMBOL(phy_remove_link_mode);
+
+static void phy_copy_pause_bits(unsigned long *dst, unsigned long *src)
+{
+	linkmode_mod_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, dst,
+		linkmode_test_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, src));
+	linkmode_mod_bit(ETHTOOL_LINK_MODE_Pause_BIT, dst,
+		linkmode_test_bit(ETHTOOL_LINK_MODE_Pause_BIT, src));
+}
+
+/**
+ * phy_advertise_supported - Advertise all supported modes
+ * @phydev: target phy_device struct
+ *
+ * Description: Called to advertise all supported modes, doesn't touch
+ * pause mode advertising.
+ */
+void phy_advertise_supported(struct phy_device *phydev)
+{
+	__ETHTOOL_DECLARE_LINK_MODE_MASK(new);
+
+	linkmode_copy(new, phydev->supported);
+	phy_copy_pause_bits(new, phydev->advertising);
+	linkmode_copy(phydev->advertising, new);
+}
+EXPORT_SYMBOL(phy_advertise_supported);
 
 /**
  * phy_support_sym_pause - Enable support of symmetrical pause
@@ -2012,8 +2040,7 @@ EXPORT_SYMBOL(phy_remove_link_mode);
 void phy_support_sym_pause(struct phy_device *phydev)
 {
 	linkmode_clear_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
-	linkmode_copy(phydev->advertising, phydev->supported);
+	phy_copy_pause_bits(phydev->advertising, phydev->supported);
 }
 EXPORT_SYMBOL(phy_support_sym_pause);
 
@@ -2025,9 +2052,7 @@ EXPORT_SYMBOL(phy_support_sym_pause);
  */
 void phy_support_asym_pause(struct phy_device *phydev)
 {
-	linkmode_set_bit(ETHTOOL_LINK_MODE_Pause_BIT, phydev->supported);
-	linkmode_set_bit(ETHTOOL_LINK_MODE_Asym_Pause_BIT, phydev->supported);
-	linkmode_copy(phydev->advertising, phydev->supported);
+	phy_copy_pause_bits(phydev->advertising, phydev->supported);
 }
 EXPORT_SYMBOL(phy_support_asym_pause);
 
@@ -2119,33 +2144,6 @@ bool phy_validate_pause(struct phy_device *phydev,
 }
 EXPORT_SYMBOL(phy_validate_pause);
 
-static void of_set_phy_eee_broken(struct phy_device *phydev)
-{
-	struct device_node *node = phydev->mdio.dev.of_node;
-	u32 broken = 0;
-
-	if (!IS_ENABLED(CONFIG_OF_MDIO))
-		return;
-
-	if (!node)
-		return;
-
-	if (of_property_read_bool(node, "eee-broken-100tx"))
-		broken |= MDIO_EEE_100TX;
-	if (of_property_read_bool(node, "eee-broken-1000t"))
-		broken |= MDIO_EEE_1000T;
-	if (of_property_read_bool(node, "eee-broken-10gt"))
-		broken |= MDIO_EEE_10GT;
-	if (of_property_read_bool(node, "eee-broken-1000kx"))
-		broken |= MDIO_EEE_1000KX;
-	if (of_property_read_bool(node, "eee-broken-10gkx4"))
-		broken |= MDIO_EEE_10GKX4;
-	if (of_property_read_bool(node, "eee-broken-10gkr"))
-		broken |= MDIO_EEE_10GKR;
-
-	phydev->eee_broken_modes = broken;
-}
-
 static bool phy_drv_supports_irq(struct phy_driver *phydrv)
 {
 	return phydrv->config_intr && phydrv->ack_interrupt;
@@ -2220,7 +2218,7 @@ static int phy_probe(struct device *dev)
 		phydev->is_gigabit_capable = 1;
 
 	of_set_phy_supported(phydev);
-	linkmode_copy(phydev->advertising, phydev->supported);
+	phy_advertise_supported(phydev);
 
 	/* Get the EEE modes we want to prohibit. We will ask
 	 * the PHY stop advertising these mode later on

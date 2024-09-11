@@ -10,6 +10,7 @@
 #define pr_fmt(fmt)	"DMAR: " fmt
 
 #include <linux/bitops.h>
+#include <linux/cpufeature.h>
 #include <linux/dmar.h>
 #include <linux/intel-iommu.h>
 #include <linux/iommu.h>
@@ -124,12 +125,13 @@ int intel_pasid_alloc_table(struct device *dev)
 	struct pasid_table *pasid_table;
 	struct pasid_table_opaque data;
 	struct page *pages;
-	size_t size, count;
+	int max_pasid = 0;
 	int ret, order;
+	int size;
 
+	might_sleep();
 	info = dev->archdata.iommu;
-	if (WARN_ON(!info || !dev_is_pci(dev) ||
-		    !info->pasid_supported || info->pasid_table))
+	if (WARN_ON(!info || !dev_is_pci(dev) || info->pasid_table))
 		return -EINVAL;
 
 	/* DMA alias device already has a pasid table, use it: */
@@ -139,23 +141,27 @@ int intel_pasid_alloc_table(struct device *dev)
 	if (ret)
 		goto attach_out;
 
-	pasid_table = kzalloc(sizeof(*pasid_table), GFP_ATOMIC);
+	pasid_table = kzalloc(sizeof(*pasid_table), GFP_KERNEL);
 	if (!pasid_table)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&pasid_table->dev);
 
-	size = sizeof(struct pasid_entry);
-	count = min_t(int, pci_max_pasids(to_pci_dev(dev)), intel_pasid_max_id);
-	order = get_order(size * count);
+	if (info->pasid_supported)
+		max_pasid = min_t(int, pci_max_pasids(to_pci_dev(dev)),
+				  intel_pasid_max_id);
+
+	size = max_pasid >> (PASID_PDE_SHIFT - 3);
+	order = size ? get_order(size) : 0;
 	pages = alloc_pages_node(info->iommu->node,
-				 GFP_ATOMIC | __GFP_ZERO,
-				 order);
-	if (!pages)
+				 GFP_KERNEL | __GFP_ZERO, order);
+	if (!pages) {
+		kfree(pasid_table);
 		return -ENOMEM;
+	}
 
 	pasid_table->table = page_address(pages);
 	pasid_table->order = order;
-	pasid_table->max_pasid = count;
+	pasid_table->max_pasid = 1 << (order + PAGE_SHIFT + 3);
 
 attach_out:
 	device_attach_pasid_table(info, pasid_table);
@@ -167,10 +173,12 @@ void intel_pasid_free_table(struct device *dev)
 {
 	struct device_domain_info *info;
 	struct pasid_table *pasid_table;
+	struct pasid_dir_entry *dir;
+	struct pasid_entry *table;
+	int i, max_pde;
 
 	info = dev->archdata.iommu;
-	if (!info || !dev_is_pci(dev) ||
-	    !info->pasid_supported || !info->pasid_table)
+	if (!info || !dev_is_pci(dev) || !info->pasid_table)
 		return;
 
 	pasid_table = info->pasid_table;
@@ -178,6 +186,14 @@ void intel_pasid_free_table(struct device *dev)
 
 	if (!list_empty(&pasid_table->dev))
 		return;
+
+	/* Free scalable mode PASID directory tables: */
+	dir = pasid_table->table;
+	max_pde = pasid_table->max_pasid >> PASID_PDE_SHIFT;
+	for (i = 0; i < max_pde; i++) {
+		table = get_pasid_table_from_pde(&dir[i]);
+		free_pgtable_page(table);
+	}
 
 	free_pages((unsigned long)pasid_table->table, pasid_table->order);
 	kfree(pasid_table);
@@ -207,17 +223,37 @@ int intel_pasid_get_dev_max_id(struct device *dev)
 
 struct pasid_entry *intel_pasid_get_entry(struct device *dev, int pasid)
 {
+	struct device_domain_info *info;
 	struct pasid_table *pasid_table;
+	struct pasid_dir_entry *dir;
 	struct pasid_entry *entries;
+	int dir_index, index;
 
 	pasid_table = intel_pasid_get_table(dev);
 	if (WARN_ON(!pasid_table || pasid < 0 ||
 		    pasid >= intel_pasid_get_dev_max_id(dev)))
 		return NULL;
 
-	entries = pasid_table->table;
+	dir = pasid_table->table;
+	info = dev->archdata.iommu;
+	dir_index = pasid >> PASID_PDE_SHIFT;
+	index = pasid & PASID_PTE_MASK;
 
-	return &entries[pasid];
+	spin_lock(&pasid_lock);
+	entries = get_pasid_table_from_pde(&dir[dir_index]);
+	if (!entries) {
+		entries = alloc_pgtable_page(info->iommu->node);
+		if (!entries) {
+			spin_unlock(&pasid_lock);
+			return NULL;
+		}
+
+		WRITE_ONCE(dir[dir_index].val,
+			   (u64)virt_to_phys(entries) | PASID_PTE_PRESENT);
+	}
+	spin_unlock(&pasid_lock);
+
+	return &entries[index];
 }
 
 /*
@@ -225,10 +261,17 @@ struct pasid_entry *intel_pasid_get_entry(struct device *dev, int pasid)
  */
 static inline void pasid_clear_entry(struct pasid_entry *pe)
 {
-	WRITE_ONCE(pe->val, 0);
+	WRITE_ONCE(pe->val[0], 0);
+	WRITE_ONCE(pe->val[1], 0);
+	WRITE_ONCE(pe->val[2], 0);
+	WRITE_ONCE(pe->val[3], 0);
+	WRITE_ONCE(pe->val[4], 0);
+	WRITE_ONCE(pe->val[5], 0);
+	WRITE_ONCE(pe->val[6], 0);
+	WRITE_ONCE(pe->val[7], 0);
 }
 
-void intel_pasid_clear_entry(struct device *dev, int pasid)
+static void intel_pasid_clear_entry(struct device *dev, int pasid)
 {
 	struct pasid_entry *pe;
 
@@ -332,6 +375,26 @@ static inline void pasid_set_page_snoop(struct pasid_entry *pe, bool value)
 	pasid_set_bits(&pe->val[1], 1 << 23, value << 23);
 }
 
+/*
+ * Setup the First Level Page table Pointer field (Bit 140~191)
+ * of a scalable mode PASID entry.
+ */
+static inline void
+pasid_set_flptr(struct pasid_entry *pe, u64 value)
+{
+	pasid_set_bits(&pe->val[2], VTD_PAGE_MASK, value);
+}
+
+/*
+ * Setup the First Level Paging Mode field (Bit 130~131) of a
+ * scalable mode PASID entry.
+ */
+static inline void
+pasid_set_flpm(struct pasid_entry *pe, u64 value)
+{
+	pasid_set_bits(&pe->val[2], GENMASK_ULL(3, 2), value << 2);
+}
+
 static void
 pasid_cache_invalidation_with_pasid(struct intel_iommu *iommu,
 				    u16 did, int pasid)
@@ -400,6 +463,65 @@ void intel_pasid_tear_down_entry(struct intel_iommu *iommu,
 	/* Device IOTLB doesn't need to be flushed in caching mode. */
 	if (!cap_caching_mode(iommu->cap))
 		devtlb_invalidation_with_pasid(iommu, dev, pasid);
+}
+
+/*
+ * Set up the scalable mode pasid table entry for first only
+ * translation type.
+ */
+int intel_pasid_setup_first_level(struct intel_iommu *iommu,
+				  struct device *dev, pgd_t *pgd,
+				  int pasid, u16 did, int flags)
+{
+	struct pasid_entry *pte;
+
+	if (!ecap_flts(iommu->ecap)) {
+		pr_err("No first level translation support on %s\n",
+		       iommu->name);
+		return -EINVAL;
+	}
+
+	pte = intel_pasid_get_entry(dev, pasid);
+	if (WARN_ON(!pte))
+		return -EINVAL;
+
+	pasid_clear_entry(pte);
+
+	/* Setup the first level page table pointer: */
+	pasid_set_flptr(pte, (u64)__pa(pgd));
+	if (flags & PASID_FLAG_SUPERVISOR_MODE) {
+		if (!ecap_srs(iommu->ecap)) {
+			pr_err("No supervisor request support on %s\n",
+			       iommu->name);
+			return -EINVAL;
+		}
+		pasid_set_sre(pte);
+	}
+
+#ifdef CONFIG_X86
+	if (cpu_feature_enabled(X86_FEATURE_LA57))
+		pasid_set_flpm(pte, 1);
+#endif /* CONFIG_X86 */
+
+	pasid_set_domain_id(pte, did);
+	pasid_set_address_width(pte, iommu->agaw);
+	pasid_set_page_snoop(pte, !!ecap_smpwc(iommu->ecap));
+
+	/* Setup Present and PASID Granular Transfer Type: */
+	pasid_set_translation_type(pte, 1);
+	pasid_set_present(pte);
+
+	if (!ecap_coherent(iommu->ecap))
+		clflush_cache_range(pte, sizeof(*pte));
+
+	if (cap_caching_mode(iommu->cap)) {
+		pasid_cache_invalidation_with_pasid(iommu, did, pasid);
+		iotlb_invalidation_with_pasid(iommu, did, pasid);
+	} else {
+		iommu_flush_write_buffer(iommu);
+	}
+
+	return 0;
 }
 
 /*

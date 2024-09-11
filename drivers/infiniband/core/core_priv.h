@@ -54,15 +54,22 @@ struct pkey_index_qp_list {
 	struct list_head    qp_list;
 };
 
+extern const struct attribute_group ib_dev_attr_group;
+extern bool ib_devices_shared_netns;
+
 int ib_device_register_sysfs(struct ib_device *device);
 void ib_device_unregister_sysfs(struct ib_device *device);
 int ib_device_rename(struct ib_device *ibdev, const char *name);
+int ib_device_set_dim(struct ib_device *ibdev, u8 use_dim);
 
 typedef void (*roce_netdev_callback)(struct ib_device *device, u8 port,
 	      struct net_device *idev, void *cookie);
 
 typedef bool (*roce_netdev_filter)(struct ib_device *device, u8 port,
 				   struct net_device *idev, void *cookie);
+
+struct net_device *ib_device_get_netdev(struct ib_device *ib_dev,
+					unsigned int port);
 
 void ib_enum_roce_netdev(struct ib_device *ib_dev,
 			 roce_netdev_filter filter,
@@ -81,6 +88,15 @@ typedef int (*nldev_callback)(struct ib_device *device,
 
 int ib_enum_all_devs(nldev_callback nldev_cb, struct sk_buff *skb,
 		     struct netlink_callback *cb);
+
+struct ib_client_nl_info {
+	struct sk_buff *nl_msg;
+	struct device *cdev;
+	unsigned int port;
+	u64 abi;
+};
+int ib_get_client_nl_info(struct ib_device *ibdev, const char *client_name,
+			  struct ib_client_nl_info *res);
 
 enum ib_cache_gid_default_mode {
 	IB_CACHE_GID_DEFAULT_MODE_SET,
@@ -113,9 +129,10 @@ unsigned long roce_gid_type_mask_support(struct ib_device *ib_dev, u8 port);
 int ib_cache_setup_one(struct ib_device *device);
 void ib_cache_cleanup_one(struct ib_device *device);
 void ib_cache_release_one(struct ib_device *device);
+void ib_dispatch_event_clients(struct ib_event *event);
 
 #ifdef CONFIG_CGROUP_RDMA
-int ib_device_register_rdmacg(struct ib_device *device);
+void ib_device_register_rdmacg(struct ib_device *device);
 void ib_device_unregister_rdmacg(struct ib_device *device);
 
 int ib_rdmacg_try_charge(struct ib_rdmacg_object *cg_obj,
@@ -126,21 +143,26 @@ void ib_rdmacg_uncharge(struct ib_rdmacg_object *cg_obj,
 			struct ib_device *device,
 			enum rdmacg_resource_type resource_index);
 #else
-static inline int ib_device_register_rdmacg(struct ib_device *device)
-{ return 0; }
+static inline void ib_device_register_rdmacg(struct ib_device *device)
+{
+}
 
 static inline void ib_device_unregister_rdmacg(struct ib_device *device)
-{ }
+{
+}
 
 static inline int ib_rdmacg_try_charge(struct ib_rdmacg_object *cg_obj,
 				       struct ib_device *device,
 				       enum rdmacg_resource_type resource_index)
-{ return 0; }
+{
+	return 0;
+}
 
 static inline void ib_rdmacg_uncharge(struct ib_rdmacg_object *cg_obj,
 				      struct ib_device *device,
 				      enum rdmacg_resource_type resource_index)
-{ }
+{
+}
 #endif
 
 static inline bool rdma_is_upper_dev_rcu(struct net_device *dev,
@@ -269,7 +291,8 @@ static inline void ib_mad_agent_security_change(void)
 }
 #endif
 
-struct ib_device *ib_device_get_by_index(u32 ifindex);
+struct ib_device *ib_device_get_by_index(const struct net *net, u32 index);
+
 /* RDMA device netlink */
 void nldev_init(void);
 void nldev_exit(void);
@@ -330,4 +353,17 @@ int roce_resolve_route_from_path(struct sa_path_rec *rec,
 				 const struct ib_gid_attr *attr);
 
 struct net_device *rdma_read_gid_attr_ndev_rcu(const struct ib_gid_attr *attr);
+
+void ib_free_port_attrs(struct ib_core_device *coredev);
+int ib_setup_port_attrs(struct ib_core_device *coredev);
+
+int rdma_compatdev_set(u8 enable);
+
+int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
+				 struct kobject *kobj, struct kobj_type *ktype,
+				 const char *name);
+void ib_port_unregister_module_stat(struct kobject *kobj);
+
+int ib_device_set_netns_put(struct sk_buff *skb,
+			    struct ib_device *dev, u32 ns_fd);
 #endif /* _CORE_PRIV_H */

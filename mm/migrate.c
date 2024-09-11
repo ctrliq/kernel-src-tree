@@ -246,8 +246,6 @@ static bool remove_migration_pte(struct page *page, struct vm_area_struct *vma,
 			if (is_device_private_page(new)) {
 				entry = make_device_private_entry(new, pte_write(pte));
 				pte = swp_entry_to_pte(entry);
-			} else if (is_device_public_page(new)) {
-				pte = pte_mkdevmap(pte);
 			}
 		}
 
@@ -422,6 +420,21 @@ static inline bool buffer_migrate_lock_buffers(struct buffer_head *head,
 }
 #endif /* CONFIG_BLOCK */
 
+static int expected_page_refs(struct address_space *mapping, struct page *page)
+{
+	int expected_count = 1;
+
+	/*
+	 * Device public or private pages have an extra refcount as they are
+	 * ZONE_DEVICE pages.
+	 */
+	expected_count += is_device_private_page(page);
+	if (mapping)
+		expected_count += hpage_nr_pages(page) + page_has_private(page);
+
+	return expected_count;
+}
+
 /*
  * Replace the page in the mapping.
  *
@@ -437,15 +450,8 @@ int migrate_page_move_mapping(struct address_space *mapping,
 {
 	struct zone *oldzone, *newzone;
 	int dirty;
-	int expected_count = 1 + extra_count;
 	void **pslot;
-
-	/*
-	 * Device public or private pages have an extra refcount as they are
-	 * ZONE_DEVICE pages.
-	 */
-	expected_count += is_device_private_page(page);
-	expected_count += is_device_public_page(page);
+	int expected_count = expected_page_refs(mapping, page) + extra_count;
 
 	if (!mapping) {
 		/* Anonymous page without mapping */
@@ -469,7 +475,6 @@ int migrate_page_move_mapping(struct address_space *mapping,
 	pslot = radix_tree_lookup_slot(&mapping->i_pages,
  					page_index(page));
 
-	expected_count += hpage_nr_pages(page) + page_has_private(page);
 	if (page_count(page) != expected_count ||
 		radix_tree_deref_slot_protected(pslot,
 					&mapping->i_pages.xa_lock) != page) {
@@ -980,10 +985,7 @@ static int move_to_new_page(struct page *newpage, struct page *page,
 		if (!PageMappingFlags(page))
 			page->mapping = NULL;
 
-		if (unlikely(is_zone_device_page(newpage))) {
-			if (is_device_public_page(newpage))
-				flush_dcache_page(newpage);
-		} else
+		if (likely(!is_zone_device_page(newpage)))
 			flush_dcache_page(newpage);
 
 	}
@@ -1305,6 +1307,16 @@ static int unmap_and_move_huge_page(new_page_t get_new_page,
 		lock_page(hpage);
 	}
 
+	/*
+	 * Check for pages which are in the process of being freed.  Without
+	 * page_mapping() set, hugetlbfs specific move page routine will not
+	 * be called and we could leak usage counts for subpools.
+	 */
+	if (page_private(hpage) && !page_mapping(hpage)) {
+		rc = -EBUSY;
+		goto out_unlock;
+	}
+
 	if (PageAnon(hpage))
 		anon_vma = page_get_anon_vma(hpage);
 
@@ -1335,6 +1347,7 @@ put_anon:
 		put_new_page = NULL;
 	}
 
+out_unlock:
 	unlock_page(hpage);
 out:
 	if (rc != -EAGAIN)
@@ -2235,7 +2248,7 @@ again:
 				pfn = 0;
 				goto next;
 			}
-			page = _vm_normal_page(migrate->vma, addr, pte, true);
+			page = vm_normal_page(migrate->vma, addr, pte);
 			mpfn = migrate_pfn(pfn) | MIGRATE_PFN_MIGRATE;
 			mpfn |= pte_write(pte) ? MIGRATE_PFN_WRITE : 0;
 		}
@@ -2376,16 +2389,7 @@ static bool migrate_vma_check_page(struct page *page)
 		 * FIXME proper solution is to rework migration_entry_wait() so
 		 * it does not need to take a reference on page.
 		 */
-		if (is_device_private_page(page))
-			return true;
-
-		/*
-		 * Only allow device public page to be migrated and account for
-		 * the extra reference count imply by ZONE_DEVICE pages.
-		 */
-		if (!is_device_public_page(page))
-			return false;
-		extra++;
+		return is_device_private_page(page);
 	}
 
 	/* For file back page */
@@ -2635,11 +2639,6 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
 
 			swp_entry = make_device_private_entry(page, vma->vm_flags & VM_WRITE);
 			entry = swp_entry_to_pte(swp_entry);
-		} else if (is_device_public_page(page)) {
-			entry = pte_mkold(mk_pte(page, READ_ONCE(vma->vm_page_prot)));
-			if (vma->vm_flags & VM_WRITE)
-				entry = pte_mkwrite(pte_mkdirty(entry));
-			entry = pte_mkdevmap(entry);
 		}
 	} else {
 		entry = mk_pte(page, vma->vm_page_prot);
@@ -2757,7 +2756,7 @@ static void migrate_vma_pages(struct migrate_vma *migrate)
 					migrate->src[i] &= ~MIGRATE_PFN_MIGRATE;
 					continue;
 				}
-			} else if (!is_device_public_page(newpage)) {
+			} else {
 				/*
 				 * Other types of ZONE_DEVICE page are not
 				 * supported.

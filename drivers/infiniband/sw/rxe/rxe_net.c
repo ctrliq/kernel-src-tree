@@ -45,25 +45,6 @@
 #include "rxe_net.h"
 #include "rxe_loc.h"
 
-static LIST_HEAD(rxe_dev_list);
-static DEFINE_SPINLOCK(dev_list_lock); /* spinlock for device list */
-
-struct rxe_dev *get_rxe_by_name(const char *name)
-{
-	struct rxe_dev *rxe;
-	struct rxe_dev *found = NULL;
-
-	spin_lock_bh(&dev_list_lock);
-	list_for_each_entry(rxe, &rxe_dev_list, list) {
-		if (!strcmp(name, dev_name(&rxe->ib_dev.dev))) {
-			found = rxe;
-			break;
-		}
-	}
-	spin_unlock_bh(&dev_list_lock);
-	return found;
-}
-
 static struct rxe_recv_sockets recv_sockets;
 
 struct device *rxe_dma_device(struct rxe_dev *rxe)
@@ -136,10 +117,12 @@ static struct dst_entry *rxe_find_route6(struct net_device *ndev,
 	memcpy(&fl6.daddr, daddr, sizeof(*daddr));
 	fl6.flowi6_proto = IPPROTO_UDP;
 
-	if (unlikely(ipv6_stub->ipv6_dst_lookup(sock_net(recv_sockets.sk6->sk),
-						recv_sockets.sk6->sk, &ndst, &fl6))) {
+	ndst = ipv6_stub->ipv6_dst_lookup_flow(sock_net(recv_sockets.sk6->sk),
+					       recv_sockets.sk6->sk, &fl6,
+					       NULL);
+	if (unlikely(IS_ERR(ndst))) {
 		pr_err_ratelimited("no route to %pI6\n", daddr);
-		goto put;
+		return NULL;
 	}
 
 	if (unlikely(ndst->error)) {
@@ -542,42 +525,24 @@ enum rdma_link_layer rxe_link_layer(struct rxe_dev *rxe, unsigned int port_num)
 	return IB_LINK_LAYER_ETHERNET;
 }
 
-struct rxe_dev *rxe_net_add(struct net_device *ndev)
+int rxe_net_add(const char *ibdev_name, struct net_device *ndev)
 {
 	int err;
 	struct rxe_dev *rxe = NULL;
 
 	rxe = ib_alloc_device(rxe_dev, ib_dev);
 	if (!rxe)
-		return NULL;
+		return -ENOMEM;
 
 	rxe->ndev = ndev;
 
-	err = rxe_add(rxe, ndev->mtu);
+	err = rxe_add(rxe, ndev->mtu, ibdev_name);
 	if (err) {
 		ib_dealloc_device(&rxe->ib_dev);
-		return NULL;
+		return err;
 	}
 
-	spin_lock_bh(&dev_list_lock);
-	list_add_tail(&rxe->list, &rxe_dev_list);
-	spin_unlock_bh(&dev_list_lock);
-	return rxe;
-}
-
-void rxe_remove_all(void)
-{
-	spin_lock_bh(&dev_list_lock);
-	while (!list_empty(&rxe_dev_list)) {
-		struct rxe_dev *rxe =
-			list_first_entry(&rxe_dev_list, struct rxe_dev, list);
-
-		list_del(&rxe->list);
-		spin_unlock_bh(&dev_list_lock);
-		rxe_remove(rxe);
-		spin_lock_bh(&dev_list_lock);
-	}
-	spin_unlock_bh(&dev_list_lock);
+	return 0;
 }
 
 static void rxe_port_event(struct rxe_dev *rxe,
@@ -637,10 +602,8 @@ static int rxe_notify(struct notifier_block *not_blk,
 
 	switch (event) {
 	case NETDEV_UNREGISTER:
-		list_del(&rxe->list);
-		ib_device_put(&rxe->ib_dev);
-		rxe_remove(rxe);
-		return NOTIFY_OK;
+		ib_unregister_device_queued(&rxe->ib_dev);
+		break;
 	case NETDEV_UP:
 		rxe_port_up(rxe);
 		break;

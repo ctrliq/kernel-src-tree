@@ -211,6 +211,15 @@ void vkms_crc_work_handle(struct work_struct *work)
 		drm_crtc_add_crc_entry(crtc, true, frame_start++, &crc32);
 }
 
+static const char * const pipe_crc_sources[] = {"auto"};
+
+const char *const *vkms_get_crc_sources(struct drm_crtc *crtc,
+					size_t *count)
+{
+	*count = ARRAY_SIZE(pipe_crc_sources);
+	return pipe_crc_sources;
+}
+
 static int vkms_crc_parse_source(const char *src_name, bool *enabled)
 {
 	int ret = 0;

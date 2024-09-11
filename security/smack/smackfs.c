@@ -1,6 +1,9 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (C) 2007 Casey Schaufler <casey@schaufler-ca.com>
+ *
+ *	This program is free software; you can redistribute it and/or modify
+ *  	it under the terms of the GNU General Public License as published by
+ *	the Free Software Foundation, version 2.
  *
  * Authors:
  * 	Casey Schaufler <casey@schaufler-ca.com>
@@ -10,6 +13,7 @@
  *
  *	Karl MacMillan <kmacmillan@tresys.com>
  *	James Morris <jmorris@redhat.com>
+ *
  */
 
 #include <linux/kernel.h>

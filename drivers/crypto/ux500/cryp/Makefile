@@ -1,8 +1,7 @@
-# SPDX-License-Identifier: GPL-2.0-only
 #/*
 # * Copyright (C) ST-Ericsson SA 2010
 # * Author: shujuan.chen@stericsson.com for ST-Ericsson.
- */
+# * License terms: GNU General Public License (GPL) version 2  */
 
 ifdef CONFIG_CRYPTO_DEV_UX500_DEBUG
 CFLAGS_cryp_core.o := -DDEBUG

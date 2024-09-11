@@ -419,11 +419,6 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
 	BUG_ON(!user_mode(regs));
 }
 
-void cpu_enable_cache_maint_trap(const struct arm64_cpu_capabilities *__unused)
-{
-	config_sctlr_el1(SCTLR_EL1_UCI, 0);
-}
-
 #define __user_cache_maint(insn, address, res)			\
 	if (address >= user_addr_max()) {			\
 		res = -EFAULT;					\
@@ -484,6 +479,15 @@ static void ctr_read_handler(unsigned int esr, struct pt_regs *regs)
 {
 	int rt = ESR_ELx_SYS64_ISS_RT(esr);
 	unsigned long val = arm64_ftr_reg_user_value(&arm64_ftr_reg_ctrel0);
+
+	if (cpus_have_const_cap(ARM64_WORKAROUND_1542419)) {
+		/* Hide DIC so that we can trap the unnecessary maintenance...*/
+		val &= ~BIT(CTR_DIC_SHIFT);
+
+		/* ... and fake IminLine to reduce the number of traps. */
+		val &= ~CTR_IMINLINE_MASK;
+		val |= (PAGE_SHIFT - 2) & CTR_IMINLINE_MASK;
+	}
 
 	pt_regs_write_reg(regs, rt, val);
 
@@ -706,6 +710,10 @@ bool arm64_is_fatal_ras_serror(struct pt_regs *regs, unsigned int esr)
 		/*
 		 * The CPU can't make progress. The exception may have
 		 * been imprecise.
+		 *
+		 * Neoverse-N1 #1349291 means a non-KVM SError reported as
+		 * Unrecoverable should be treated as Uncontainable. We
+		 * call arm64_serror_panic() in both cases.
 		 */
 		return true;
 

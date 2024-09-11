@@ -21,6 +21,7 @@
 # Kselftest framework requirement - SKIP code is 4.
 ksft_skip=4
 ret=0
+policy_checks_ok=1
 
 KEY_SHA=0xdeadbeef1234567890abcdefabcdefabcdefabcd
 KEY_AES=0x0123456789abcdef0123456789012345
@@ -53,6 +54,85 @@ do_esp() {
     ip -net $ns xfrm state add src $me  dst $remote proto esp spi $spi_out enc aes $KEY_AES auth sha1 $KEY_SHA mode tunnel sel src $lnet dst $rnet
 
     do_esp_policy $ns $me $remote $lnet $rnet
+}
+
+# add policies with different netmasks, to make sure kernel carries
+# the policies contained within new netmask over when search tree is
+# re-built.
+# peer netns that are supposed to be encapsulated via esp have addresses
+# in the 10.0.1.0/24 and 10.0.2.0/24 subnets, respectively.
+#
+# Adding a policy for '10.0.1.0/23' will make it necessary to
+# alter the prefix of 10.0.1.0 subnet.
+# In case new prefix overlaps with existing node, the node and all
+# policies it carries need to be merged with the existing one(s).
+#
+# Do that here.
+do_overlap()
+{
+    local ns=$1
+
+    # adds new nodes to tree (neither network exists yet in policy database).
+    ip -net $ns xfrm policy add src 10.1.0.0/24 dst 10.0.0.0/24 dir fwd priority 200 action block
+
+    # adds a new node in the 10.0.0.0/24 tree (dst node exists).
+    ip -net $ns xfrm policy add src 10.2.0.0/24 dst 10.0.0.0/24 dir fwd priority 200 action block
+
+    # adds a 10.2.0.0/23 node, but for different dst.
+    ip -net $ns xfrm policy add src 10.2.0.0/23 dst 10.0.1.0/24 dir fwd priority 200 action block
+
+    # dst now overlaps with the 10.0.1.0/24 ESP policy in fwd.
+    # kernel must 'promote' existing one (10.0.0.0/24) to 10.0.0.0/23.
+    # But 10.0.0.0/23 also includes existing 10.0.1.0/24, so that node
+    # also has to be merged too, including source-sorted subtrees.
+    # old:
+    # 10.0.0.0/24 (node 1 in dst tree of the bin)
+    #    10.1.0.0/24 (node in src tree of dst node 1)
+    #    10.2.0.0/24 (node in src tree of dst node 1)
+    # 10.0.1.0/24 (node 2 in dst tree of the bin)
+    #    10.0.2.0/24 (node in src tree of dst node 2)
+    #    10.2.0.0/24 (node in src tree of dst node 2)
+    #
+    # The next 'policy add' adds dst '10.0.0.0/23', which means
+    # that dst node 1 and dst node 2 have to be merged including
+    # the sub-tree.  As no duplicates are allowed, policies in
+    # the two '10.0.2.0/24' are also merged.
+    #
+    # after the 'add', internal search tree should look like this:
+    # 10.0.0.0/23 (node in dst tree of bin)
+    #     10.0.2.0/24 (node in src tree of dst node)
+    #     10.1.0.0/24 (node in src tree of dst node)
+    #     10.2.0.0/24 (node in src tree of dst node)
+    #
+    # 10.0.0.0/24 and 10.0.1.0/24 nodes have been merged as 10.0.0.0/23.
+    ip -net $ns xfrm policy add src 10.1.0.0/24 dst 10.0.0.0/23 dir fwd priority 200 action block
+
+    # similar to above: add policies (with partially random address), with shrinking prefixes.
+    for p in 29 28 27;do
+      for k in $(seq 1 32); do
+       ip -net $ns xfrm policy add src 10.253.1.$((RANDOM%255))/$p dst 10.254.1.$((RANDOM%255))/$p dir fwd priority $((200+k)) action block 2>/dev/null
+      done
+    done
+}
+
+do_esp_policy_get_check() {
+    local ns=$1
+    local lnet=$2
+    local rnet=$3
+
+    ip -net $ns xfrm policy get src $lnet dst $rnet dir out > /dev/null
+    if [ $? -ne 0 ] && [ $policy_checks_ok -eq 1 ] ;then
+        policy_checks_ok=0
+        echo "FAIL: ip -net $ns xfrm policy get src $lnet dst $rnet dir out"
+        ret=1
+    fi
+
+    ip -net $ns xfrm policy get src $rnet dst $lnet dir fwd > /dev/null
+    if [ $? -ne 0 ] && [ $policy_checks_ok -eq 1 ] ;then
+        policy_checks_ok=0
+        echo "FAIL: ip -net $ns xfrm policy get src $rnet dst $lnet dir fwd"
+        ret=1
+    fi
 }
 
 do_exception() {
@@ -122,31 +202,89 @@ check_xfrm() {
 	# 1: iptables -m policy rule count != 0
 	rval=$1
 	ip=$2
-	ret=0
+	lret=0
 
 	ip netns exec ns1 ping -q -c 1 10.0.2.$ip > /dev/null
 
 	check_ipt_policy_count ns3
 	if [ $? -ne $rval ] ; then
-		ret=1
+		lret=1
 	fi
 	check_ipt_policy_count ns4
 	if [ $? -ne $rval ] ; then
-		ret=1
+		lret=1
 	fi
 
 	ip netns exec ns2 ping -q -c 1 10.0.1.$ip > /dev/null
 
 	check_ipt_policy_count ns3
 	if [ $? -ne $rval ] ; then
-		ret=1
+		lret=1
 	fi
 	check_ipt_policy_count ns4
 	if [ $? -ne $rval ] ; then
-		ret=1
+		lret=1
 	fi
 
-	return $ret
+	return $lret
+}
+
+check_exceptions()
+{
+	logpostfix="$1"
+	local lret=0
+
+	# ping to .254 should be excluded from the tunnel (exception is in place).
+	check_xfrm 0 254
+	if [ $? -ne 0 ]; then
+		echo "FAIL: expected ping to .254 to fail ($logpostfix)"
+		lret=1
+	else
+		echo "PASS: ping to .254 bypassed ipsec tunnel ($logpostfix)"
+	fi
+
+	# ping to .253 should use use ipsec due to direct policy exception.
+	check_xfrm 1 253
+	if [ $? -ne 0 ]; then
+		echo "FAIL: expected ping to .253 to use ipsec tunnel ($logpostfix)"
+		lret=1
+	else
+		echo "PASS: direct policy matches ($logpostfix)"
+	fi
+
+	# ping to .2 should use ipsec.
+	check_xfrm 1 2
+	if [ $? -ne 0 ]; then
+		echo "FAIL: expected ping to .2 to use ipsec tunnel ($logpostfix)"
+		lret=1
+	else
+		echo "PASS: policy matches ($logpostfix)"
+	fi
+
+	return $lret
+}
+
+check_hthresh_repeat()
+{
+	local log=$1
+	i=0
+
+	for i in $(seq 1 10);do
+		ip -net ns1 xfrm policy update src e000:0001::0000 dst ff01::0014:0000:0001 dir in tmpl src :: dst :: proto esp mode tunnel priority 100 action allow || break
+		ip -net ns1 xfrm policy set hthresh6 0 28 || break
+
+		ip -net ns1 xfrm policy update src e000:0001::0000 dst ff01::01 dir in tmpl src :: dst :: proto esp mode tunnel priority 100 action allow || break
+		ip -net ns1 xfrm policy set hthresh6 0 28 || break
+	done
+
+	if [ $i -ne 10 ] ;then
+		echo "FAIL: $log" 1>&2
+		ret=1
+		return 1
+	fi
+
+	echo "PASS: $log"
+	return 0
 }
 
 #check for needed privileges
@@ -237,6 +375,11 @@ do_esp ns4 dead:3::10 dead:3::1 dead:2::/64 dead:1::/64 $SPI2 $SPI1
 do_dummies4 ns3
 do_dummies6 ns4
 
+do_esp_policy_get_check ns3 10.0.1.0/24 10.0.2.0/24
+do_esp_policy_get_check ns4 10.0.2.0/24 10.0.1.0/24
+do_esp_policy_get_check ns3 dead:1::/64 dead:2::/64
+do_esp_policy_get_check ns4 dead:2::/64 dead:1::/64
+
 # ping to .254 should use ipsec, exception is not installed.
 check_xfrm 1 254
 if [ $? -ne 0 ]; then
@@ -254,31 +397,17 @@ do_exception ns4 10.0.3.10 10.0.3.1 10.0.1.253 10.0.1.240/28
 do_exception ns3 dead:3::1 dead:3::10 dead:2::fd  dead:2:f0::/96
 do_exception ns4 dead:3::10 dead:3::1 dead:1::fd  dead:1:f0::/96
 
-# ping to .254 should now be excluded from the tunnel
-check_xfrm 0 254
+check_exceptions "exceptions"
 if [ $? -ne 0 ]; then
-	echo "FAIL: expected ping to .254 to fail"
 	ret=1
-else
-	echo "PASS: ping to .254 bypassed ipsec tunnel"
 fi
 
-# ping to .253 should use use ipsec due to direct policy exception.
-check_xfrm 1 253
-if [ $? -ne 0 ]; then
-	echo "FAIL: expected ping to .253 to use ipsec tunnel"
-	ret=1
-else
-	echo "PASS: direct policy matches"
-fi
+# insert block policies with adjacent/overlapping netmasks
+do_overlap ns3
 
-# ping to .2 should use ipsec.
-check_xfrm 1 2
+check_exceptions "exceptions and block policies"
 if [ $? -ne 0 ]; then
-	echo "FAIL: expected ping to .2 to use ipsec tunnel"
 	ret=1
-else
-	echo "PASS: policy matches"
 fi
 
 for n in ns3 ns4;do
@@ -305,7 +434,9 @@ for n in ns3 ns4;do
 	ip -net $n xfrm policy set hthresh4 32 32 hthresh6 128 128
 	sleep $((RANDOM%5))
 done
-check_exceptions "exceptions and block policies after hresh change to normal"
+check_exceptions "exceptions and block policies after htresh change to normal"
+
+check_hthresh_repeat "policies with repeated htresh change"
 
 for i in 1 2 3 4;do ip netns del ns$i;done
 

@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: GPL-2.0
-#include "util.h"
 #include <api/fs/fs.h>
 #include "../perf.h"
 #include "cpumap.h"
@@ -11,6 +10,7 @@
 #include "asm/bug.h"
 
 #include <linux/ctype.h>
+#include <linux/zalloc.h>
 
 static int max_cpu_num;
 static int max_present_cpu_num;
@@ -70,6 +70,9 @@ struct cpu_map *cpu_map__read(FILE *file)
 			break;
 		if (prev >= 0) {
 			int new_max = nr_cpus + cpu - prev - 1;
+
+			WARN_ONCE(new_max >= MAX_NR_CPUS, "Perf can support %d CPUs. "
+							  "Consider raising MAX_NR_CPUS\n", MAX_NR_CPUS);
 
 			if (new_max >= max_entries) {
 				max_entries = new_max + MAX_NR_CPUS / 2;
@@ -162,6 +165,9 @@ struct cpu_map *cpu_map__new(const char *cpu_list)
 		} else {
 			end_cpu = start_cpu;
 		}
+
+		WARN_ONCE(end_cpu >= MAX_NR_CPUS, "Perf can support %d CPUs. "
+						  "Consider raising MAX_NR_CPUS\n", MAX_NR_CPUS);
 
 		for (; start_cpu <= end_cpu; start_cpu++) {
 			/* check for duplicates */

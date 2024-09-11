@@ -129,11 +129,6 @@ struct menu_device {
 	int		interval_ptr;
 };
 
-static inline int get_loadavg(unsigned long load)
-{
-	return LOAD_INT(load) * 10 + LOAD_FRAC(load) / 10;
-}
-
 static inline int which_bucket(unsigned int duration, unsigned long nr_iowaiters)
 {
 	int bucket = 0;
@@ -167,18 +162,10 @@ static inline int which_bucket(unsigned int duration, unsigned long nr_iowaiters
  * to be, the higher this multiplier, and thus the higher
  * the barrier to go to an expensive C state.
  */
-static inline int performance_multiplier(unsigned long nr_iowaiters, unsigned long load)
+static inline int performance_multiplier(unsigned long nr_iowaiters)
 {
-	int mult = 1;
-
-	/* for higher loadavg, we are more reluctant */
-
-	mult += 2 * get_loadavg(load);
-
-	/* for IO wait tasks (per cpu!) we add 5x each */
-	mult += 10 * nr_iowaiters;
-
-	return mult;
+	/* for IO wait tasks (per cpu!) we add 10x each */
+	return 1 + 10 * nr_iowaiters;
 }
 
 static DEFINE_PER_CPU(struct menu_device, menu_devices);
@@ -191,10 +178,11 @@ static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev);
  * of points is below a threshold. If it is... then use the
  * average of these 8 points as the estimated value.
  */
-static unsigned int get_typical_interval(struct menu_device *data)
+static unsigned int get_typical_interval(struct menu_device *data,
+					 unsigned int predicted_us)
 {
 	int i, divisor;
-	unsigned int max, thresh, avg;
+	unsigned int min, max, thresh, avg;
 	uint64_t sum, variance;
 
 	thresh = INT_MAX; /* Discard outliers above this value */
@@ -202,6 +190,7 @@ static unsigned int get_typical_interval(struct menu_device *data)
 again:
 
 	/* First calculate the average of past intervals */
+	min = UINT_MAX;
 	max = 0;
 	sum = 0;
 	divisor = 0;
@@ -212,8 +201,19 @@ again:
 			divisor++;
 			if (value > max)
 				max = value;
+
+			if (value < min)
+				min = value;
 		}
 	}
+
+	/*
+	 * If the result of the computation is going to be discarded anyway,
+	 * avoid the computation altogether.
+	 */
+	if (min >= predicted_us)
+		return UINT_MAX;
+
 	if (divisor == INTERVALS)
 		avg = sum >> INTERVAL_SHIFT;
 	else
@@ -282,9 +282,8 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	int i;
 	int idx;
 	unsigned int interactivity_req;
-	unsigned int expected_interval;
 	unsigned int predicted_us;
-	unsigned long nr_iowaiters, cpu_load;
+	unsigned long nr_iowaiters;
 	ktime_t delta_next;
 
 	if (data->needs_update) {
@@ -295,7 +294,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	/* determine the expected residency time, round up */
 	data->next_timer_us = ktime_to_us(tick_nohz_get_sleep_length(&delta_next));
 
-	get_iowait_load(&nr_iowaiters, &cpu_load);
+	nr_iowaiters = nr_iowait_cpu(dev->cpu);
 	data->bucket = which_bucket(data->next_timer_us, nr_iowaiters);
 
 	if (unlikely(drv->state_count <= 1 || latency_req == 0) ||
@@ -318,14 +317,10 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 	predicted_us = DIV_ROUND_CLOSEST_ULL((uint64_t)data->next_timer_us *
 					 data->correction_factor[data->bucket],
 					 RESOLUTION * DECAY);
-
-	expected_interval = get_typical_interval(data);
-	expected_interval = min(expected_interval, data->next_timer_us);
-
 	/*
 	 * Use the lowest expected idle interval to pick the idle state.
 	 */
-	predicted_us = min(predicted_us, expected_interval);
+	predicted_us = min(predicted_us, get_typical_interval(data, predicted_us));
 
 	if (tick_nohz_tick_stopped()) {
 		/*
@@ -343,7 +338,7 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 		 * Use the performance multiplier and the user-configurable
 		 * latency_req to determine the maximum exit latency.
 		 */
-		interactivity_req = predicted_us / performance_multiplier(nr_iowaiters, cpu_load);
+		interactivity_req = predicted_us / performance_multiplier(nr_iowaiters);
 		if (latency_req > interactivity_req)
 			latency_req = interactivity_req;
 	}
@@ -435,8 +430,8 @@ static int menu_select(struct cpuidle_driver *drv, struct cpuidle_device *dev,
 			 * tick, so try to correct that.
 			 */
 			for (i = idx - 1; i >= 0; i--) {
-			    if (drv->states[i].disabled ||
-			        dev->states_usage[i].disable)
+				if (drv->states[i].disabled ||
+				    dev->states_usage[i].disable)
 					continue;
 
 				idx = i;
@@ -461,7 +456,7 @@ static void menu_reflect(struct cpuidle_device *dev, int index)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
 
-	dev->last_state_idx = index;
+	dev->rh_cpuidle_dev.last_state_idx = index;
 	data->needs_update = 1;
 	data->tick_wakeup = tick_nohz_idle_got_tick();
 }
@@ -474,7 +469,7 @@ static void menu_reflect(struct cpuidle_device *dev, int index)
 static void menu_update(struct cpuidle_driver *drv, struct cpuidle_device *dev)
 {
 	struct menu_device *data = this_cpu_ptr(&menu_devices);
-	int last_idx = dev->last_state_idx;
+	int last_idx = dev->rh_cpuidle_dev.last_state_idx;
 	struct cpuidle_state *target = &drv->states[last_idx];
 	unsigned int measured_us;
 	unsigned int new_factor;

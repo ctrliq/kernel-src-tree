@@ -446,8 +446,6 @@ enum ipmi_stat_indexes {
 
 #define IPMI_IPMB_NUM_SEQ	64
 struct ipmi_smi {
-	struct module *owner;
-
 	/* What interface number are we? */
 	int intf_num;
 
@@ -608,6 +606,8 @@ struct ipmi_smi {
 	 * parameters passed by "low" level IPMI code.
 	 */
 	int run_to_completion;
+
+	RH_KABI_EXTEND(struct module *owner)
 };
 #define to_si_intf_from_dev(device) container_of(device, struct ipmi_smi, dev)
 
@@ -3515,6 +3515,19 @@ int ipmi_add_smi(struct module         *owner,
 	return rv;
 }
 EXPORT_SYMBOL(ipmi_add_smi);
+
+int ipmi_register_smi(const struct ipmi_smi_handlers *handlers,
+		      void		       *send_info,
+		      struct device            *si_dev,
+		      unsigned char            slave_addr)
+{
+	int rv;
+
+	rv = ipmi_add_smi(0, handlers, send_info, si_dev, slave_addr);
+
+	return rv;
+}
+EXPORT_SYMBOL(ipmi_register_smi);
 
 static void deliver_smi_err_response(struct ipmi_smi *intf,
 				     struct ipmi_smi_msg *msg,

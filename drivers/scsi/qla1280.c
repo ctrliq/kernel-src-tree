@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-or-later
 /******************************************************************************
 *                  QLOGIC LINUX SOFTWARE
 *
@@ -6,6 +5,16 @@
 * Copyright (C) 2000 Qlogic Corporation (www.qlogic.com)
 * Copyright (C) 2001-2004 Jes Sorensen, Wild Open Source Inc.
 * Copyright (C) 2003-2004 Christoph Hellwig
+*
+* This program is free software; you can redistribute it and/or modify it
+* under the terms of the GNU General Public License as published by the
+* Free Software Foundation; either version 2, or (at your option) any
+* later version.
+*
+* This program is distributed in the hope that it will be useful, but
+* WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+* General Public License for more details.
 *
 ******************************************************************************/
 #define QLA1280_VERSION      "3.27.1"
@@ -3005,8 +3014,6 @@ qla1280_64bit_start_scsi(struct scsi_qla_host *ha, struct srb * sp)
 	sp->flags |= SRB_SENT;
 	ha->actthreads++;
 	WRT_REG_WORD(&reg->mailbox4, ha->req_ring_index);
-	/* Enforce mmio write ordering; see comment in qla1280_isp_cmd(). */
-	mmiowb();
 
  out:
 	if (status)
@@ -3255,8 +3262,6 @@ qla1280_32bit_start_scsi(struct scsi_qla_host *ha, struct srb * sp)
 	sp->flags |= SRB_SENT;
 	ha->actthreads++;
 	WRT_REG_WORD(&reg->mailbox4, ha->req_ring_index);
-	/* Enforce mmio write ordering; see comment in qla1280_isp_cmd(). */
-	mmiowb();
 
 out:
 	if (status)
@@ -3370,7 +3375,6 @@ qla1280_isp_cmd(struct scsi_qla_host *ha)
 	 * Update request index to mailbox4 (Request Queue In).
 	 */
 	WRT_REG_WORD(&reg->mailbox4, ha->req_ring_index);
-	mmiowb();
 
 	LEAVE("qla1280_isp_cmd");
 }

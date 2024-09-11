@@ -62,10 +62,8 @@ qla2x00_sp_timeout(struct timer_list *t)
 	iocb->timeout(sp);
 }
 
-void
-qla2x00_sp_free(void *ptr)
+void qla2x00_sp_free(srb_t *sp)
 {
-	srb_t *sp = ptr;
 	struct srb_iocb *iocb = &sp->u.iocb_cmd;
 
 	del_timer(&iocb->timer);
@@ -133,9 +131,8 @@ static void qla24xx_abort_iocb_timeout(void *data)
 	sp->done(sp, QLA_OS_TIMER_EXPIRED);
 }
 
-static void qla24xx_abort_sp_done(void *ptr, int res)
+static void qla24xx_abort_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
 	struct srb_iocb *abt = &sp->u.iocb_cmd;
 
 	del_timer(&sp->u.iocb_cmd.timer);
@@ -268,10 +265,8 @@ qla2x00_async_iocb_timeout(void *data)
 	}
 }
 
-static void
-qla2x00_async_login_sp_done(void *ptr, int res)
+static void qla2x00_async_login_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
 	struct scsi_qla_host *vha = sp->vha;
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
 	struct event_arg ea;
@@ -376,11 +371,8 @@ done:
 	return rval;
 }
 
-static void
-qla2x00_async_logout_sp_done(void *ptr, int res)
+static void qla2x00_async_logout_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
-
 	sp->fcport->flags &= ~(FCF_ASYNC_SENT | FCF_ASYNC_ACTIVE);
 	sp->fcport->login_gen++;
 	qlt_logo_completion_handler(sp->fcport, res);
@@ -437,10 +429,8 @@ qla2x00_async_prlo_done(struct scsi_qla_host *vha, fc_port_t *fcport,
 	qlt_logo_completion_handler(fcport, data[0]);
 }
 
-static void
-qla2x00_async_prlo_sp_done(void *s, int res)
+static void qla2x00_async_prlo_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = (srb_t *)s;
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
 	struct scsi_qla_host *vha = sp->vha;
 
@@ -546,10 +536,8 @@ static int qla_post_els_plogi_work(struct scsi_qla_host *vha, fc_port_t *fcport)
 	return qla2x00_post_work(vha, e);
 }
 
-static void
-qla2x00_async_adisc_sp_done(void *ptr, int res)
+static void qla2x00_async_adisc_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
 	struct scsi_qla_host *vha = sp->vha;
 	struct event_arg ea;
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
@@ -903,13 +891,15 @@ static void qla24xx_handle_gnl_done_event(scsi_qla_host_t *vha,
 					conflict_fcport =
 					    qla2x00_find_fcport_by_wwpn(vha,
 						e->port_name, 0);
-					ql_dbg(ql_dbg_disc + ql_dbg_verbose,
-					    vha, 0x20e5,
-					    "%s %d %8phC post del sess\n",
-					    __func__, __LINE__,
-					    conflict_fcport->port_name);
-					qlt_schedule_sess_for_deletion
-						(conflict_fcport);
+					if (conflict_fcport) {
+						ql_dbg(ql_dbg_disc + ql_dbg_verbose,
+						    vha, 0x20e5,
+						    "%s %d %8phC post del sess\n",
+						    __func__, __LINE__,
+						    conflict_fcport->port_name);
+						qlt_schedule_sess_for_deletion
+							(conflict_fcport);
+					}
 				}
 				/*
 				 * FW already picked this loop id for
@@ -961,10 +951,8 @@ static void qla24xx_handle_gnl_done_event(scsi_qla_host_t *vha,
 	}
 } /* gnl_event */
 
-static void
-qla24xx_async_gnl_sp_done(void *s, int res)
+static void qla24xx_async_gnl_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	unsigned long flags;
 	struct fc_port *fcport = NULL, *tf;
@@ -1150,10 +1138,8 @@ int qla24xx_post_gnl_work(struct scsi_qla_host *vha, fc_port_t *fcport)
 	return qla2x00_post_work(vha, e);
 }
 
-static
-void qla24xx_async_gpdb_sp_done(void *s, int res)
+static void qla24xx_async_gpdb_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	struct qla_hw_data *ha = vha->hw;
 	fc_port_t *fcport = sp->fcport;
@@ -1195,10 +1181,8 @@ static int qla24xx_post_prli_work(struct scsi_qla_host *vha, fc_port_t *fcport)
 	return qla2x00_post_work(vha, e);
 }
 
-static void
-qla2x00_async_prli_sp_done(void *ptr, int res)
+static void qla2x00_async_prli_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
 	struct scsi_qla_host *vha = sp->vha;
 	struct srb_iocb *lio = &sp->u.iocb_cmd;
 	struct event_arg ea;
@@ -1774,10 +1758,8 @@ qla2x00_tmf_iocb_timeout(void *data)
 	complete(&tmf->u.tmf.comp);
 }
 
-static void
-qla2x00_tmf_sp_done(void *ptr, int res)
+static void qla2x00_tmf_sp_done(srb_t *sp, int res)
 {
-	srb_t *sp = ptr;
 	struct srb_iocb *tmf = &sp->u.iocb_cmd;
 
 	complete(&tmf->u.tmf.comp);
@@ -3963,10 +3945,8 @@ qla2x00_config_rings(struct scsi_qla_host *vha)
 	ha->init_cb->response_q_inpointer = cpu_to_le16(0);
 	ha->init_cb->request_q_length = cpu_to_le16(req->length);
 	ha->init_cb->response_q_length = cpu_to_le16(rsp->length);
-	ha->init_cb->request_q_address[0] = cpu_to_le32(LSD(req->dma));
-	ha->init_cb->request_q_address[1] = cpu_to_le32(MSD(req->dma));
-	ha->init_cb->response_q_address[0] = cpu_to_le32(LSD(rsp->dma));
-	ha->init_cb->response_q_address[1] = cpu_to_le32(MSD(rsp->dma));
+	put_unaligned_le64(req->dma, &ha->init_cb->request_q_address);
+	put_unaligned_le64(rsp->dma, &ha->init_cb->response_q_address);
 
 	WRT_REG_WORD(ISP_REQ_Q_IN(ha, reg), 0);
 	WRT_REG_WORD(ISP_REQ_Q_OUT(ha, reg), 0);
@@ -3993,16 +3973,13 @@ qla24xx_config_rings(struct scsi_qla_host *vha)
 	icb->response_q_inpointer = cpu_to_le16(0);
 	icb->request_q_length = cpu_to_le16(req->length);
 	icb->response_q_length = cpu_to_le16(rsp->length);
-	icb->request_q_address[0] = cpu_to_le32(LSD(req->dma));
-	icb->request_q_address[1] = cpu_to_le32(MSD(req->dma));
-	icb->response_q_address[0] = cpu_to_le32(LSD(rsp->dma));
-	icb->response_q_address[1] = cpu_to_le32(MSD(rsp->dma));
+	put_unaligned_le64(req->dma, &icb->request_q_address);
+	put_unaligned_le64(rsp->dma, &icb->response_q_address);
 
 	/* Setup ATIO queue dma pointers for target mode */
 	icb->atio_q_inpointer = cpu_to_le16(0);
 	icb->atio_q_length = cpu_to_le16(ha->tgt.atio_q_length);
-	icb->atio_q_address[0] = cpu_to_le32(LSD(ha->tgt.atio_dma));
-	icb->atio_q_address[1] = cpu_to_le32(MSD(ha->tgt.atio_dma));
+	put_unaligned_le64(ha->tgt.atio_dma, &icb->atio_q_address);
 
 	if (IS_SHADOW_REG_CAPABLE(ha))
 		icb->firmware_options_2 |= cpu_to_le32(BIT_30|BIT_29);

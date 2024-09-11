@@ -10,11 +10,14 @@ enum {
 };
 
 struct mlx5e_tc_table {
+	/* protects flow table */
+	struct mutex			t_lock;
 	struct mlx5_flow_table		*t;
 
 	struct rhashtable               ht;
 
-	DECLARE_HASHTABLE(mod_hdr_tbl, 8);
+	struct mod_hdr_tbl mod_hdr;
+	struct mutex hairpin_tbl_lock; /* protects hairpin_tbl */
 	DECLARE_HASHTABLE(hairpin_tbl, 8);
 
 	struct notifier_block     netdevice_nb;

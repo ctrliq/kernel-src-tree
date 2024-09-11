@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*:
  * Hibernate support specific for ARM64
  *
@@ -12,6 +11,8 @@
  *  https://patchwork.kernel.org/patch/96442/
  *
  * Copyright (C) 2006 Rafael J. Wysocki <rjw@sisk.pl>
+ *
+ * License terms: GNU General Public License (GPL) version 2
  */
 #define pr_fmt(x) "hibernate: " x
 #include <linux/cpu.h>

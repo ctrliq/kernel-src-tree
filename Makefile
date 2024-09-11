@@ -9,8 +9,8 @@ NAME = Merciless Moray
 # DRM backport version
 #
 RHEL_DRM_VERSION = 5
-RHEL_DRM_PATCHLEVEL = 1
-RHEL_DRM_SUBLEVEL = 21
+RHEL_DRM_PATCHLEVEL = 3
+RHEL_DRM_SUBLEVEL = 0
 
 # *DOCUMENTATION*
 # To see a list of typical targets execute "make help"
@@ -747,8 +747,6 @@ ifndef CONFIG_FUNCTION_TRACER
 KBUILD_CFLAGS	+= -fomit-frame-pointer
 endif
 endif
-
-KBUILD_CFLAGS   += $(call cc-option, -fno-var-tracking-assignments)
 
 ifdef CONFIG_DEBUG_INFO
 ifdef CONFIG_DEBUG_INFO_SPLIT

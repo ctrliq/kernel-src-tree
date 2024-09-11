@@ -987,8 +987,7 @@ struct ib_mr *hns_roce_reg_user_mr(struct ib_pd *pd, u64 start, u64 length,
 	if (!mr)
 		return ERR_PTR(-ENOMEM);
 
-	mr->umem = ib_umem_get(pd->uobject->context, start, length,
-			       access_flags, 0);
+	mr->umem = ib_umem_get(udata, start, length, access_flags, 0);
 	if (IS_ERR(mr->umem)) {
 		ret = PTR_ERR(mr->umem);
 		goto err_free;
@@ -1095,8 +1094,8 @@ int hns_roce_rereg_user_mr(struct ib_mr *ibmr, int flags, u64 start, u64 length,
 		}
 		ib_umem_release(mr->umem);
 
-		mr->umem = ib_umem_get(ibmr->uobject->context, start, length,
-				       mr_access_flags, 0);
+		mr->umem =
+			ib_umem_get(udata, start, length, mr_access_flags, 0);
 		if (IS_ERR(mr->umem)) {
 			ret = PTR_ERR(mr->umem);
 			mr->umem = NULL;
@@ -1170,20 +1169,18 @@ free_cmd_mbox:
 	return ret;
 }
 
-int hns_roce_dereg_mr(struct ib_mr *ibmr)
+int hns_roce_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
 {
 	struct hns_roce_dev *hr_dev = to_hr_dev(ibmr->device);
 	struct hns_roce_mr *mr = to_hr_mr(ibmr);
 	int ret = 0;
 
 	if (hr_dev->hw->dereg_mr) {
-		ret = hr_dev->hw->dereg_mr(hr_dev, mr);
+		ret = hr_dev->hw->dereg_mr(hr_dev, mr, udata);
 	} else {
 		hns_roce_mr_free(hr_dev, mr);
 
-		if (mr->umem)
-			ib_umem_release(mr->umem);
-
+		ib_umem_release(mr->umem);
 		kfree(mr);
 	}
 

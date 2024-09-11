@@ -20,7 +20,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <stdbool.h>
-#include "util.h"
+#include <stdlib.h>
 #include "debug.h"
 #include "dwarf-aux.h"
 #include "string2.h"

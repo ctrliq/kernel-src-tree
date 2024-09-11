@@ -212,7 +212,7 @@ static void vmx_disable_shadow_vmcs(struct vcpu_vmx *vmx)
 {
 	secondary_exec_controls_clearbit(vmx, SECONDARY_EXEC_SHADOW_VMCS);
 	vmcs_write64(VMCS_LINK_POINTER, -1ull);
-	vmx->nested.need_vmcs12_sync = false;
+	vmx->nested.need_vmcs12_to_shadow_sync = false;
 }
 
 static inline void nested_release_evmcs(struct kvm_vcpu *vcpu)
@@ -222,10 +222,8 @@ static inline void nested_release_evmcs(struct kvm_vcpu *vcpu)
 	if (!vmx->nested.hv_evmcs)
 		return;
 
-	kunmap(vmx->nested.hv_evmcs_page);
-	kvm_release_page_dirty(vmx->nested.hv_evmcs_page);
+	kvm_vcpu_unmap(vcpu, &vmx->nested.hv_evmcs_map, true);
 	vmx->nested.hv_evmcs_vmptr = -1ull;
-	vmx->nested.hv_evmcs_page = NULL;
 	vmx->nested.hv_evmcs = NULL;
 }
 
@@ -1676,7 +1674,7 @@ static int copy_vmcs12_to_enlightened(struct vcpu_vmx *vmx)
 	 * evmcs->host_gdtr_base = vmcs12->host_gdtr_base;
 	 * evmcs->host_idtr_base = vmcs12->host_idtr_base;
 	 * evmcs->host_rsp = vmcs12->host_rsp;
-	 * sync_vmcs12() doesn't read these:
+	 * sync_vmcs02_to_vmcs12() doesn't read these:
 	 * evmcs->io_bitmap_a = vmcs12->io_bitmap_a;
 	 * evmcs->io_bitmap_b = vmcs12->io_bitmap_b;
 	 * evmcs->msr_bitmap = vmcs12->msr_bitmap;
@@ -1813,15 +1811,6 @@ static int copy_vmcs12_to_enlightened(struct vcpu_vmx *vmx)
 	return 0;
 }
 
-static void nested_taint(void)
-{
-	static atomic_t tainted;
-	if (atomic_read(&tainted) || atomic_xchg(&tainted, 1))
-		return;
-
-	mark_tech_preview("nested virtualization", THIS_MODULE);
-}
-
 /*
  * This is an equivalent of the nested hypervisor executing the vmptrld
  * instruction.
@@ -1839,20 +1828,17 @@ static int nested_vmx_handle_enlightened_vmptrld(struct kvm_vcpu *vcpu,
 	if (!nested_enlightened_vmentry(vcpu, &evmcs_gpa))
 		return 1;
 
-	nested_taint();
 	if (unlikely(evmcs_gpa != vmx->nested.hv_evmcs_vmptr)) {
 		if (!vmx->nested.hv_evmcs)
 			vmx->nested.current_vmptr = -1ull;
 
 		nested_release_evmcs(vcpu);
 
-		vmx->nested.hv_evmcs_page = kvm_vcpu_gpa_to_page(
-			vcpu, evmcs_gpa);
-
-		if (unlikely(is_error_page(vmx->nested.hv_evmcs_page)))
+		if (kvm_vcpu_map(vcpu, gpa_to_gfn(evmcs_gpa),
+				 &vmx->nested.hv_evmcs_map))
 			return 0;
 
-		vmx->nested.hv_evmcs = kmap(vmx->nested.hv_evmcs_page);
+		vmx->nested.hv_evmcs = vmx->nested.hv_evmcs_map.hva;
 
 		/*
 		 * Currently, KVM only supports eVMCS version 1
@@ -1911,7 +1897,7 @@ static int nested_vmx_handle_enlightened_vmptrld(struct kvm_vcpu *vcpu,
 	return 1;
 }
 
-void nested_sync_from_vmcs12(struct kvm_vcpu *vcpu)
+void nested_sync_vmcs12_to_shadow(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
@@ -1932,7 +1918,7 @@ void nested_sync_from_vmcs12(struct kvm_vcpu *vcpu)
 		copy_vmcs12_to_shadow(vmx);
 	}
 
-	vmx->nested.need_vmcs12_sync = false;
+	vmx->nested.need_vmcs12_to_shadow_sync = false;
 }
 
 static enum hrtimer_restart vmx_preemption_timer_fn(struct hrtimer *timer)
@@ -2649,11 +2635,22 @@ static int nested_check_vm_entry_controls(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-/*
- * Checks related to Host Control Registers and MSRs
- */
-static int nested_check_host_control_regs(struct kvm_vcpu *vcpu,
-                                          struct vmcs12 *vmcs12)
+static int nested_vmx_check_controls(struct kvm_vcpu *vcpu,
+				     struct vmcs12 *vmcs12)
+{
+	if (nested_check_vm_execution_controls(vcpu, vmcs12) ||
+	    nested_check_vm_exit_controls(vcpu, vmcs12) ||
+	    nested_check_vm_entry_controls(vcpu, vmcs12))
+		return -EINVAL;
+
+	if (to_vmx(vcpu)->nested.enlightened_vmcs_enabled)
+		return nested_evmcs_check_controls(vmcs12);
+
+	return 0;
+}
+
+static int nested_vmx_check_host_state(struct kvm_vcpu *vcpu,
+				       struct vmcs12 *vmcs12)
 {
 	bool ia32e;
 
@@ -2726,20 +2723,6 @@ static int nested_check_host_control_regs(struct kvm_vcpu *vcpu,
 	return 0;
 }
 
-static int nested_vmx_check_vmentry_prereqs(struct kvm_vcpu *vcpu,
-					    struct vmcs12 *vmcs12)
-{
-	if (nested_check_vm_execution_controls(vcpu, vmcs12) ||
-	    nested_check_vm_exit_controls(vcpu, vmcs12) ||
-	    nested_check_vm_entry_controls(vcpu, vmcs12))
-		return VMXERR_ENTRY_INVALID_CONTROL_FIELD;
-
-	if (nested_check_host_control_regs(vcpu, vmcs12))
-		return VMXERR_ENTRY_INVALID_HOST_STATE_FIELD;
-
-	return 0;
-}
-
 static int nested_vmx_check_vmcs_link_ptr(struct kvm_vcpu *vcpu,
 					  struct vmcs12 *vmcs12)
 {
@@ -2778,9 +2761,9 @@ static int nested_check_guest_non_reg_state(struct vmcs12 *vmcs12)
 	return 0;
 }
 
-static int nested_vmx_check_vmentry_postreqs(struct kvm_vcpu *vcpu,
-					     struct vmcs12 *vmcs12,
-					     u32 *exit_qual)
+static int nested_vmx_check_guest_state(struct kvm_vcpu *vcpu,
+					struct vmcs12 *vmcs12,
+					u32 *exit_qual)
 {
 	bool ia32e;
 
@@ -3108,7 +3091,7 @@ int nested_vmx_enter_non_root_mode(struct kvm_vcpu *vcpu, bool from_vmentry)
 			return -1;
 		}
 
-		if (nested_vmx_check_vmentry_postreqs(vcpu, vmcs12, &exit_qual))
+		if (nested_vmx_check_guest_state(vcpu, vmcs12, &exit_qual))
 			goto vmentry_fail_vmexit;
 	}
 
@@ -3191,7 +3174,7 @@ vmentry_fail_vmexit:
 	vmcs12->vm_exit_reason = exit_reason | VMX_EXIT_REASONS_FAILED_VMENTRY;
 	vmcs12->exit_qualification = exit_qual;
 	if (enable_shadow_vmcs || vmx->nested.hv_evmcs)
-		vmx->nested.need_vmcs12_sync = true;
+		vmx->nested.need_vmcs12_to_shadow_sync = true;
 	return 1;
 }
 
@@ -3253,9 +3236,11 @@ static int nested_vmx_run(struct kvm_vcpu *vcpu, bool launch)
 			launch ? VMXERR_VMLAUNCH_NONCLEAR_VMCS
 			       : VMXERR_VMRESUME_NONLAUNCHED_VMCS);
 
-	ret = nested_vmx_check_vmentry_prereqs(vcpu, vmcs12);
-	if (ret)
-		return nested_vmx_failValid(vcpu, ret);
+	if (nested_vmx_check_controls(vcpu, vmcs12))
+		return nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_CONTROL_FIELD);
+
+	if (nested_vmx_check_host_state(vcpu, vmcs12))
+		return nested_vmx_failValid(vcpu, VMXERR_ENTRY_INVALID_HOST_STATE_FIELD);
 
 	/*
 	 * We're finally done with prerequisite checking, and can start with
@@ -3532,20 +3517,57 @@ static u32 vmx_get_preemption_timer_value(struct kvm_vcpu *vcpu)
 	return value >> VMX_MISC_EMULATED_PREEMPTION_TIMER_RATE;
 }
 
-/*
- * Update the guest state fields of vmcs12 to reflect changes that
- * occurred while L2 was running. (The "IA-32e mode guest" bit of the
- * VM-entry controls is also updated, since this is really a guest
- * state bit.)
- */
-static void sync_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+static bool is_vmcs12_ext_field(unsigned long field)
 {
-	vmcs12->guest_cr0 = vmcs12_guest_cr0(vcpu, vmcs12);
-	vmcs12->guest_cr4 = vmcs12_guest_cr4(vcpu, vmcs12);
+	switch (field) {
+	case GUEST_ES_SELECTOR:
+	case GUEST_CS_SELECTOR:
+	case GUEST_SS_SELECTOR:
+	case GUEST_DS_SELECTOR:
+	case GUEST_FS_SELECTOR:
+	case GUEST_GS_SELECTOR:
+	case GUEST_LDTR_SELECTOR:
+	case GUEST_TR_SELECTOR:
+	case GUEST_ES_LIMIT:
+	case GUEST_CS_LIMIT:
+	case GUEST_SS_LIMIT:
+	case GUEST_DS_LIMIT:
+	case GUEST_FS_LIMIT:
+	case GUEST_GS_LIMIT:
+	case GUEST_LDTR_LIMIT:
+	case GUEST_TR_LIMIT:
+	case GUEST_GDTR_LIMIT:
+	case GUEST_IDTR_LIMIT:
+	case GUEST_ES_AR_BYTES:
+	case GUEST_DS_AR_BYTES:
+	case GUEST_FS_AR_BYTES:
+	case GUEST_GS_AR_BYTES:
+	case GUEST_LDTR_AR_BYTES:
+	case GUEST_TR_AR_BYTES:
+	case GUEST_ES_BASE:
+	case GUEST_CS_BASE:
+	case GUEST_SS_BASE:
+	case GUEST_DS_BASE:
+	case GUEST_FS_BASE:
+	case GUEST_GS_BASE:
+	case GUEST_LDTR_BASE:
+	case GUEST_TR_BASE:
+	case GUEST_GDTR_BASE:
+	case GUEST_IDTR_BASE:
+	case GUEST_PENDING_DBG_EXCEPTIONS:
+	case GUEST_BNDCFGS:
+		return true;
+	default:
+		break;
+	}
 
-	vmcs12->guest_rsp = kvm_rsp_read(vcpu);
-	vmcs12->guest_rip = kvm_rip_read(vcpu);
-	vmcs12->guest_rflags = vmcs_readl(GUEST_RFLAGS);
+	return false;
+}
+
+static void sync_vmcs02_to_vmcs12_rare(struct kvm_vcpu *vcpu,
+				       struct vmcs12 *vmcs12)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
 
 	vmcs12->guest_es_selector = vmcs_read16(GUEST_ES_SELECTOR);
 	vmcs12->guest_cs_selector = vmcs_read16(GUEST_CS_SELECTOR);
@@ -3566,8 +3588,6 @@ static void sync_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
 	vmcs12->guest_gdtr_limit = vmcs_read32(GUEST_GDTR_LIMIT);
 	vmcs12->guest_idtr_limit = vmcs_read32(GUEST_IDTR_LIMIT);
 	vmcs12->guest_es_ar_bytes = vmcs_read32(GUEST_ES_AR_BYTES);
-	vmcs12->guest_cs_ar_bytes = vmcs_read32(GUEST_CS_AR_BYTES);
-	vmcs12->guest_ss_ar_bytes = vmcs_read32(GUEST_SS_AR_BYTES);
 	vmcs12->guest_ds_ar_bytes = vmcs_read32(GUEST_DS_AR_BYTES);
 	vmcs12->guest_fs_ar_bytes = vmcs_read32(GUEST_FS_AR_BYTES);
 	vmcs12->guest_gs_ar_bytes = vmcs_read32(GUEST_GS_AR_BYTES);
@@ -3583,11 +3603,69 @@ static void sync_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
 	vmcs12->guest_tr_base = vmcs_readl(GUEST_TR_BASE);
 	vmcs12->guest_gdtr_base = vmcs_readl(GUEST_GDTR_BASE);
 	vmcs12->guest_idtr_base = vmcs_readl(GUEST_IDTR_BASE);
+	vmcs12->guest_pending_dbg_exceptions =
+		vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS);
+	if (kvm_mpx_supported())
+		vmcs12->guest_bndcfgs = vmcs_read64(GUEST_BNDCFGS);
+
+	vmx->nested.need_sync_vmcs02_to_vmcs12_rare = false;
+}
+
+static void copy_vmcs02_to_vmcs12_rare(struct kvm_vcpu *vcpu,
+				       struct vmcs12 *vmcs12)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+	int cpu;
+
+	if (!vmx->nested.need_sync_vmcs02_to_vmcs12_rare)
+		return;
+
+
+	WARN_ON_ONCE(vmx->loaded_vmcs != &vmx->vmcs01);
+
+	cpu = get_cpu();
+	vmx->loaded_vmcs = &vmx->nested.vmcs02;
+	vmx_vcpu_load(&vmx->vcpu, cpu);
+
+	sync_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
+
+	vmx->loaded_vmcs = &vmx->vmcs01;
+	vmx_vcpu_load(&vmx->vcpu, cpu);
+	put_cpu();
+}
+
+/*
+ * Update the guest state fields of vmcs12 to reflect changes that
+ * occurred while L2 was running. (The "IA-32e mode guest" bit of the
+ * VM-entry controls is also updated, since this is really a guest
+ * state bit.)
+ */
+static void sync_vmcs02_to_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
+{
+	struct vcpu_vmx *vmx = to_vmx(vcpu);
+
+	if (vmx->nested.hv_evmcs)
+		sync_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
+
+	vmx->nested.need_sync_vmcs02_to_vmcs12_rare = !vmx->nested.hv_evmcs;
+
+	vmcs12->guest_cr0 = vmcs12_guest_cr0(vcpu, vmcs12);
+	vmcs12->guest_cr4 = vmcs12_guest_cr4(vcpu, vmcs12);
+
+	vmcs12->guest_rsp = kvm_rsp_read(vcpu);
+	vmcs12->guest_rip = kvm_rip_read(vcpu);
+	vmcs12->guest_rflags = vmcs_readl(GUEST_RFLAGS);
+
+	vmcs12->guest_cs_ar_bytes = vmcs_read32(GUEST_CS_AR_BYTES);
+	vmcs12->guest_ss_ar_bytes = vmcs_read32(GUEST_SS_AR_BYTES);
+
+	vmcs12->guest_sysenter_cs = vmcs_read32(GUEST_SYSENTER_CS);
+	vmcs12->guest_sysenter_esp = vmcs_readl(GUEST_SYSENTER_ESP);
+	vmcs12->guest_sysenter_eip = vmcs_readl(GUEST_SYSENTER_EIP);
 
 	vmcs12->guest_interruptibility_info =
 		vmcs_read32(GUEST_INTERRUPTIBILITY_INFO);
-	vmcs12->guest_pending_dbg_exceptions =
-		vmcs_readl(GUEST_PENDING_DBG_EXCEPTIONS);
+
 	if (vcpu->arch.mp_state == KVM_MP_STATE_HALTED)
 		vmcs12->guest_activity_state = GUEST_ACTIVITY_HLT;
 	else
@@ -3630,11 +3708,6 @@ static void sync_vmcs12(struct kvm_vcpu *vcpu, struct vmcs12 *vmcs12)
 
 	if (vmcs12->vm_exit_controls & VM_EXIT_SAVE_IA32_EFER)
 		vmcs12->guest_ia32_efer = vcpu->arch.efer;
-	vmcs12->guest_sysenter_cs = vmcs_read32(GUEST_SYSENTER_CS);
-	vmcs12->guest_sysenter_esp = vmcs_readl(GUEST_SYSENTER_ESP);
-	vmcs12->guest_sysenter_eip = vmcs_readl(GUEST_SYSENTER_EIP);
-	if (kvm_mpx_supported())
-		vmcs12->guest_bndcfgs = vmcs_read64(GUEST_BNDCFGS);
 }
 
 /*
@@ -4000,14 +4073,14 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
 		vcpu->arch.tsc_offset -= vmcs12->tsc_offset;
 
 	if (likely(!vmx->fail)) {
-		sync_vmcs12(vcpu, vmcs12);
+		sync_vmcs02_to_vmcs12(vcpu, vmcs12);
 
 		if (exit_reason != -1)
 			prepare_vmcs12(vcpu, vmcs12, exit_reason, exit_intr_info,
 				       exit_qualification);
 
 		/*
-		 * Must happen outside of sync_vmcs12() as it will
+		 * Must happen outside of sync_vmcs02_to_vmcs12() as it will
 		 * also be used to capture vmcs12 cache as part of
 		 * capturing nVMX state for snapshot (migration).
 		 *
@@ -4063,7 +4136,7 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason,
 	kvm_make_request(KVM_REQ_APIC_PAGE_RELOAD, vcpu);
 
 	if ((exit_reason != -1) && (enable_shadow_vmcs || vmx->nested.hv_evmcs))
-		vmx->nested.need_vmcs12_sync = true;
+		vmx->nested.need_vmcs12_to_shadow_sync = true;
 
 	/* in case we halted in L2 */
 	vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
@@ -4400,7 +4473,7 @@ static int handle_vmon(struct kvm_vcpu *vcpu)
 	 * Note - IA32_VMX_BASIC[48] will never be 1 for the nested case;
 	 * which replaces physical address width with 32
 	 */
-	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu)))
+	if (!page_address_valid(vcpu, vmptr))
 		return nested_vmx_failInvalid(vcpu);
 
 	if (kvm_read_guest(vcpu->kvm, vmptr, &revision, sizeof(revision)) ||
@@ -4421,6 +4494,8 @@ static inline void nested_release_vmcs12(struct kvm_vcpu *vcpu)
 
 	if (vmx->nested.current_vmptr == -1ull)
 		return;
+
+	copy_vmcs02_to_vmcs12_rare(vcpu, get_vmcs12(vcpu));
 
 	if (enable_shadow_vmcs) {
 		/* copy to memory all shadowed fields in case
@@ -4468,7 +4543,7 @@ static int handle_vmclear(struct kvm_vcpu *vcpu)
 	if (nested_vmx_get_vmptr(vcpu, &vmptr))
 		return 1;
 
-	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu)))
+	if (!page_address_valid(vcpu, vmptr))
 		return nested_vmx_failValid(vcpu,
 			VMXERR_VMCLEAR_INVALID_ADDRESS);
 
@@ -4552,6 +4627,9 @@ static int handle_vmread(struct kvm_vcpu *vcpu)
 	if (offset < 0)
 		return nested_vmx_failValid(vcpu,
 			VMXERR_UNSUPPORTED_VMCS_COMPONENT);
+
+	if (!is_guest_mode(vcpu) && is_vmcs12_ext_field(field))
+		copy_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
 
 	/* Read the field, zero-extended to a u64 field_value */
 	field_value = vmcs12_read_any(vmcs12, field, offset);
@@ -4652,9 +4730,16 @@ static int handle_vmwrite(struct kvm_vcpu *vcpu)
 		return nested_vmx_failValid(vcpu,
 			VMXERR_VMWRITE_READ_ONLY_VMCS_COMPONENT);
 
-	if (!is_guest_mode(vcpu))
+	if (!is_guest_mode(vcpu)) {
 		vmcs12 = get_vmcs12(vcpu);
-	else {
+
+		/*
+		 * Ensure vmcs12 is up-to-date before any VMWRITE that dirties
+		 * vmcs12, else we may crush a field or consume a stale value.
+		 */
+		if (!is_shadow_field_rw(field))
+			copy_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
+	} else {
 		/*
 		 * When vmcs->vmcs_link_pointer is -1ull, any VMWRITE
 		 * to shadowed-field sets the ALU flags for VMfailInvalid.
@@ -4716,7 +4801,7 @@ static void set_current_vmptr(struct vcpu_vmx *vmx, gpa_t vmptr)
 		secondary_exec_controls_setbit(vmx, SECONDARY_EXEC_SHADOW_VMCS);
 		vmcs_write64(VMCS_LINK_POINTER,
 			     __pa(vmx->vmcs01.shadow_vmcs));
-		vmx->nested.need_vmcs12_sync = true;
+		vmx->nested.need_vmcs12_to_shadow_sync = true;
 	}
 	vmx->nested.dirty_vmcs12 = true;
 }
@@ -4733,8 +4818,7 @@ static int handle_vmptrld(struct kvm_vcpu *vcpu)
 	if (nested_vmx_get_vmptr(vcpu, &vmptr))
 		return 1;
 
-	nested_taint();
-	if (!PAGE_ALIGNED(vmptr) || (vmptr >> cpuid_maxphyaddr(vcpu)))
+	if (!page_address_valid(vcpu, vmptr))
 		return nested_vmx_failValid(vcpu,
 			VMXERR_VMPTRLD_INVALID_ADDRESS);
 
@@ -5474,12 +5558,13 @@ static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
 	 * When running L2, the authoritative vmcs12 state is in the
 	 * vmcs02. When running L1, the authoritative vmcs12 state is
 	 * in the shadow or enlightened vmcs linked to vmcs01, unless
-	 * need_vmcs12_sync is set, in which case, the authoritative
+	 * need_vmcs12_to_shadow_sync is set, in which case, the authoritative
 	 * vmcs12 state is in the vmcs12 already.
 	 */
 	if (is_guest_mode(vcpu)) {
-		sync_vmcs12(vcpu, vmcs12);
-	} else if (!vmx->nested.need_vmcs12_sync) {
+		sync_vmcs02_to_vmcs12(vcpu, vmcs12);
+		sync_vmcs02_to_vmcs12_rare(vcpu, vmcs12);
+	} else if (!vmx->nested.need_vmcs12_to_shadow_sync) {
 		if (vmx->nested.hv_evmcs)
 			copy_enlightened_to_vmcs12(vmx);
 		else if (enable_shadow_vmcs)
@@ -5611,7 +5696,7 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
 		 * Sync eVMCS upon entry as we may not have
 		 * HV_X64_MSR_VP_ASSIST_PAGE set up yet.
 		 */
-		vmx->nested.need_vmcs12_sync = true;
+		vmx->nested.need_vmcs12_to_shadow_sync = true;
 	} else {
 		return -EINVAL;
 	}
@@ -5659,8 +5744,9 @@ static int vmx_set_nested_state(struct kvm_vcpu *vcpu,
 			goto error_guest_mode;
 	}
 
-	if (nested_vmx_check_vmentry_prereqs(vcpu, vmcs12) ||
-	    nested_vmx_check_vmentry_postreqs(vcpu, vmcs12, &exit_qual))
+	if (nested_vmx_check_controls(vcpu, vmcs12) ||
+	    nested_vmx_check_host_state(vcpu, vmcs12) ||
+	    nested_vmx_check_guest_state(vcpu, vmcs12, &exit_qual))
 		goto error_guest_mode;
 
 	vmx->nested.dirty_vmcs12 = true;

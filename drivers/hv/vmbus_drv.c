@@ -1,11 +1,24 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2009, Microsoft Corporation.
+ *
+ * This program is free software; you can redistribute it and/or modify it
+ * under the terms and conditions of the GNU General Public License,
+ * version 2, as published by the Free Software Foundation.
+ *
+ * This program is distributed in the hope it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ * more details.
+ *
+ * You should have received a copy of the GNU General Public License along with
+ * this program; if not, write to the Free Software Foundation, Inc., 59 Temple
+ * Place - Suite 330, Boston, MA 02111-1307 USA.
  *
  * Authors:
  *   Haiyang Zhang <haiyangz@microsoft.com>
  *   Hank Janssen  <hjanssen@microsoft.com>
  *   K. Y. Srinivasan <kys@microsoft.com>
+ *
  */
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
@@ -909,43 +922,6 @@ static void vmbus_shutdown(struct device *child_device)
 		drv->shutdown(dev);
 }
 
-/*
- * vmbus_suspend - Suspend a vmbus device
- */
-static int vmbus_suspend(struct device *child_device)
-{
-	struct hv_driver *drv;
-	struct hv_device *dev = device_to_hv_device(child_device);
-
-	/* The device may not be attached yet */
-	if (!child_device->driver)
-		return 0;
-
-	drv = drv_to_hv_drv(child_device->driver);
-	if (!drv->suspend)
-		return -EOPNOTSUPP;
-
-	return drv->suspend(dev);
-}
-
-/*
- * vmbus_resume - Resume a vmbus device
- */
-static int vmbus_resume(struct device *child_device)
-{
-	struct hv_driver *drv;
-	struct hv_device *dev = device_to_hv_device(child_device);
-
-	/* The device may not be attached yet */
-	if (!child_device->driver)
-		return 0;
-
-	drv = drv_to_hv_drv(child_device->driver);
-	if (!drv->resume)
-		return -EOPNOTSUPP;
-
-	return drv->resume(dev);
-}
 
 /*
  * vmbus_device_release - Final callback release of the vmbus child device
@@ -961,14 +937,6 @@ static void vmbus_device_release(struct device *device)
 	kfree(hv_dev);
 }
 
-/*
- * Note: we must use SET_NOIRQ_SYSTEM_SLEEP_PM_OPS rather than
- * SET_SYSTEM_SLEEP_PM_OPS: see the comment before vmbus_bus_pm.
- */
-static const struct dev_pm_ops vmbus_pm = {
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(vmbus_suspend, vmbus_resume)
-};
-
 /* The one and only one */
 static struct bus_type  hv_bus = {
 	.name =		"vmbus",
@@ -979,7 +947,6 @@ static struct bus_type  hv_bus = {
 	.uevent =		vmbus_uevent,
 	.dev_groups =		vmbus_dev_groups,
 	.drv_groups =		vmbus_drv_groups,
-	.pm =			&vmbus_pm,
 };
 
 struct onmessage_work_context {
@@ -1252,8 +1219,6 @@ static struct kmsg_dumper hv_kmsg_dumper = {
 };
 
 static struct ctl_table_header *hv_ctl_table_hdr;
-static int zero;
-static int one = 1;
 
 /*
  * sysctl option to allow the user to control whether kmsg data should be
@@ -1266,8 +1231,8 @@ static struct ctl_table hv_ctl_table[] = {
 		.maxlen         = sizeof(int),
 		.mode           = 0644,
 		.proc_handler   = proc_dointvec_minmax,
-		.extra1		= &zero,
-		.extra2		= &one
+		.extra1		= SYSCTL_ZERO,
+		.extra2		= SYSCTL_ONE
 	},
 	{}
 };
@@ -2092,70 +2057,12 @@ acpi_walk_err:
 	return ret_val;
 }
 
-static int vmbus_bus_suspend(struct device *dev)
-{
-	vmbus_initiate_unload(false);
-
-	vmbus_connection.conn_state = DISCONNECTED;
-
-	return 0;
-}
-
-static int vmbus_bus_resume(struct device *dev)
-{
-	struct vmbus_channel_msginfo *msginfo;
-	size_t msgsize;
-	int ret;
-
-	/*
-	 * We only use the 'vmbus_proto_version', which was in use before
-	 * hibernation, to re-negotiate with the host.
-	 */
-	if (vmbus_proto_version == VERSION_INVAL ||
-	    vmbus_proto_version == 0) {
-		pr_err("Invalid proto version = 0x%x\n", vmbus_proto_version);
-		return -EINVAL;
-	}
-
-	msgsize = sizeof(*msginfo) +
-		  sizeof(struct vmbus_channel_initiate_contact);
-
-	msginfo = kzalloc(msgsize, GFP_KERNEL);
-
-	if (msginfo == NULL)
-		return -ENOMEM;
-
-	ret = vmbus_negotiate_version(msginfo, vmbus_proto_version);
-
-	kfree(msginfo);
-
-	if (ret != 0)
-		return ret;
-
-	vmbus_request_offers();
-
-	return 0;
-}
-
 static const struct acpi_device_id vmbus_acpi_device_ids[] = {
 	{"VMBUS", 0},
 	{"VMBus", 0},
 	{"", 0},
 };
 MODULE_DEVICE_TABLE(acpi, vmbus_acpi_device_ids);
-
-/*
- * Note: we must use SET_NOIRQ_SYSTEM_SLEEP_PM_OPS rather than
- * SET_SYSTEM_SLEEP_PM_OPS, otherwise NIC SR-IOV can not work, because the
- * "pci_dev_pm_ops" uses the "noirq" callbacks: in the resume path, the
- * pci "noirq" restore callback runs before "non-noirq" callbacks (see
- * resume_target_kernel() -> dpm_resume_start(), and hibernation_restore() ->
- * dpm_resume_end()). This means vmbus_bus_resume() and the pci-hyperv's
- * resume callback must also run via the "noirq" callbacks.
- */
-static const struct dev_pm_ops vmbus_bus_pm = {
-	SET_NOIRQ_SYSTEM_SLEEP_PM_OPS(vmbus_bus_suspend, vmbus_bus_resume)
-};
 
 static struct acpi_driver vmbus_acpi_driver = {
 	.name = "vmbus",
@@ -2164,7 +2071,6 @@ static struct acpi_driver vmbus_acpi_driver = {
 		.add = vmbus_acpi_add,
 		.remove = vmbus_acpi_remove,
 	},
-	.drv.pm = &vmbus_bus_pm,
 };
 
 static void hv_kexec_handler(void)

@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  *  kernel/sched/cpupri.c
  *
@@ -21,6 +20,11 @@
  *  searches).  For tasks with affinity restrictions, the algorithm has a
  *  worst case complexity of O(min(102, nr_domcpus)), though the scenario that
  *  yields the worst case search is fairly contrived.
+ *
+ *  This program is free software; you can redistribute it and/or
+ *  modify it under the terms of the GNU General Public License
+ *  as published by the Free Software Foundation; version 2
+ *  of the License.
  */
 #include "sched.h"
 

@@ -261,7 +261,9 @@ static int hns_roce_query_port(struct ib_device *ib_dev, u8 port_num,
 	props->active_mtu = mtu ? min(props->max_mtu, mtu) : IB_MTU_256;
 	props->state = (netif_running(net_dev) && netif_carrier_ok(net_dev)) ?
 			IB_PORT_ACTIVE : IB_PORT_DOWN;
-	props->phys_state = (props->state == IB_PORT_ACTIVE) ? 5 : 3;
+	props->phys_state = (props->state == IB_PORT_ACTIVE) ?
+			     IB_PORT_PHYS_STATE_LINK_UP :
+			     IB_PORT_PHYS_STATE_DISABLED;
 
 	spin_unlock_irqrestore(&hr_dev->iboe.lock, flags);
 
@@ -305,22 +307,18 @@ static int hns_roce_modify_port(struct ib_device *ib_dev, u8 port_num, int mask,
 	return 0;
 }
 
-static struct ib_ucontext *hns_roce_alloc_ucontext(struct ib_device *ib_dev,
-						   struct ib_udata *udata)
+static int hns_roce_alloc_ucontext(struct ib_ucontext *uctx,
+				   struct ib_udata *udata)
 {
 	int ret = 0;
-	struct hns_roce_ucontext *context;
+	struct hns_roce_ucontext *context = to_hr_ucontext(uctx);
 	struct hns_roce_ib_alloc_ucontext_resp resp = {};
-	struct hns_roce_dev *hr_dev = to_hr_dev(ib_dev);
+	struct hns_roce_dev *hr_dev = to_hr_dev(uctx->device);
 
 	if (!hr_dev->active)
-		return ERR_PTR(-EAGAIN);
+		return -EAGAIN;
 
 	resp.qp_tab_size = hr_dev->caps.num_qps;
-
-	context = kzalloc(sizeof(*context), GFP_KERNEL);
-	if (!context)
-		return ERR_PTR(-ENOMEM);
 
 	ret = hns_roce_uar_alloc(hr_dev, &context->uar);
 	if (ret)
@@ -337,25 +335,20 @@ static struct ib_ucontext *hns_roce_alloc_ucontext(struct ib_device *ib_dev,
 	if (ret)
 		goto error_fail_copy_to_udata;
 
-	return &context->ibucontext;
+	return 0;
 
 error_fail_copy_to_udata:
 	hns_roce_uar_free(hr_dev, &context->uar);
 
 error_fail_uar_alloc:
-	kfree(context);
-
-	return ERR_PTR(ret);
+	return ret;
 }
 
-static int hns_roce_dealloc_ucontext(struct ib_ucontext *ibcontext)
+static void hns_roce_dealloc_ucontext(struct ib_ucontext *ibcontext)
 {
 	struct hns_roce_ucontext *context = to_hr_ucontext(ibcontext);
 
 	hns_roce_uar_free(to_hr_dev(ibcontext->device), &context->uar);
-	kfree(context);
-
-	return 0;
 }
 
 static void hns_roce_vma_open(struct vm_area_struct *vma)
@@ -480,6 +473,11 @@ static void hns_roce_unregister_device(struct hns_roce_dev *hr_dev)
 }
 
 static const struct ib_device_ops hns_roce_dev_ops = {
+	.owner = THIS_MODULE,
+	.driver_id = RDMA_DRIVER_HNS,
+	.uverbs_abi_ver = 1,
+	.uverbs_no_driver_id_binding = 1,
+
 	.add_gid = hns_roce_add_gid,
 	.alloc_pd = hns_roce_alloc_pd,
 	.alloc_ucontext = hns_roce_alloc_ucontext,
@@ -505,6 +503,11 @@ static const struct ib_device_ops hns_roce_dev_ops = {
 	.query_pkey = hns_roce_query_pkey,
 	.query_port = hns_roce_query_port,
 	.reg_user_mr = hns_roce_reg_user_mr,
+
+	INIT_RDMA_OBJ_SIZE(ib_ah, hns_roce_ah, ibah),
+	INIT_RDMA_OBJ_SIZE(ib_cq, hns_roce_cq, ib_cq),
+	INIT_RDMA_OBJ_SIZE(ib_pd, hns_roce_pd, ibpd),
+	INIT_RDMA_OBJ_SIZE(ib_ucontext, hns_roce_ucontext, ibucontext),
 };
 
 static const struct ib_device_ops hns_roce_dev_mr_ops = {
@@ -524,14 +527,12 @@ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
 
 	ib_dev = &hr_dev->ib_dev;
 
-	ib_dev->owner			= THIS_MODULE;
 	ib_dev->node_type		= RDMA_NODE_IB_CA;
 	ib_dev->dev.parent		= dev;
 
 	ib_dev->phys_port_cnt		= hr_dev->caps.num_ports;
 	ib_dev->local_dma_lkey		= hr_dev->caps.reserved_lkey;
 	ib_dev->num_comp_vectors	= hr_dev->caps.num_comp_vectors;
-	ib_dev->uverbs_abi_ver		= 1;
 	ib_dev->uverbs_cmd_mask		=
 		(1ULL << IB_USER_VERBS_CMD_GET_CONTEXT) |
 		(1ULL << IB_USER_VERBS_CMD_QUERY_DEVICE) |
@@ -556,8 +557,6 @@ static int hns_roce_register_device(struct hns_roce_dev *hr_dev)
 		ib_set_device_ops(ib_dev, &hns_roce_dev_mr_ops);
 	}
 
-	/* OTHERS */
-	ib_dev->driver_id = RDMA_DRIVER_HNS;
 	ib_set_device_ops(ib_dev, hr_dev->hw->hns_roce_dev_ops);
 	ib_set_device_ops(ib_dev, &hns_roce_dev_ops);
 	for (i = 0; i < hr_dev->caps.num_ports; i++) {

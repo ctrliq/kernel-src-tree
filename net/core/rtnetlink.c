@@ -634,7 +634,7 @@ static int rtnl_link_slave_info_fill(struct sk_buff *skb,
 	if (nla_put_string(skb, IFLA_INFO_SLAVE_KIND, ops->kind) < 0)
 		return -EMSGSIZE;
 	if (ops->fill_slave_info) {
-		slave_data = nla_nest_start(skb, IFLA_INFO_SLAVE_DATA);
+		slave_data = nla_nest_start_noflag(skb, IFLA_INFO_SLAVE_DATA);
 		if (!slave_data)
 			return -EMSGSIZE;
 		err = ops->fill_slave_info(skb, master_dev, dev);
@@ -666,7 +666,7 @@ static int rtnl_link_info_fill(struct sk_buff *skb,
 			return err;
 	}
 	if (ops->fill_info) {
-		data = nla_nest_start(skb, IFLA_INFO_DATA);
+		data = nla_nest_start_noflag(skb, IFLA_INFO_DATA);
 		if (data == NULL)
 			return -EMSGSIZE;
 		err = ops->fill_info(skb, dev);
@@ -686,7 +686,7 @@ static int rtnl_link_fill(struct sk_buff *skb, const struct net_device *dev)
 	struct nlattr *linkinfo;
 	int err = -EMSGSIZE;
 
-	linkinfo = nla_nest_start(skb, IFLA_LINKINFO);
+	linkinfo = nla_nest_start_noflag(skb, IFLA_LINKINFO);
 	if (linkinfo == NULL)
 		goto out;
 
@@ -755,7 +755,11 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
 	struct nlattr *mx;
 	int i, valid = 0;
 
-	mx = nla_nest_start(skb, RTA_METRICS);
+	/* nothing is dumped for dst_default_metrics, so just skip the loop */
+	if (metrics == dst_default_metrics.metrics)
+		return 0;
+
+	mx = nla_nest_start_noflag(skb, RTA_METRICS);
 	if (mx == NULL)
 		return -ENOBUFS;
 
@@ -1037,12 +1041,12 @@ static int rtnl_vf_ports_fill(struct sk_buff *skb, struct net_device *dev)
 	int vf;
 	int err;
 
-	vf_ports = nla_nest_start(skb, IFLA_VF_PORTS);
+	vf_ports = nla_nest_start_noflag(skb, IFLA_VF_PORTS);
 	if (!vf_ports)
 		return -EMSGSIZE;
 
 	for (vf = 0; vf < dev_num_vf(dev->dev.parent); vf++) {
-		vf_port = nla_nest_start(skb, IFLA_VF_PORT);
+		vf_port = nla_nest_start_noflag(skb, IFLA_VF_PORT);
 		if (!vf_port)
 			goto nla_put_failure;
 		if (nla_put_u32(skb, IFLA_PORT_VF, vf))
@@ -1071,7 +1075,7 @@ static int rtnl_port_self_fill(struct sk_buff *skb, struct net_device *dev)
 	struct nlattr *port_self;
 	int err;
 
-	port_self = nla_nest_start(skb, IFLA_PORT_SELF);
+	port_self = nla_nest_start_noflag(skb, IFLA_PORT_SELF);
 	if (!port_self)
 		return -EMSGSIZE;
 
@@ -1265,7 +1269,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
 	vf_linkstate.link_state = ivi.linkstate;
 	vf_rss_query_en.setting = ivi.rss_query_en;
 	vf_trust.setting = ivi.trusted;
-	vf = nla_nest_start(skb, IFLA_VF_INFO);
+	vf = nla_nest_start_noflag(skb, IFLA_VF_INFO);
 	if (!vf)
 		goto nla_put_vfinfo_failure;
 	if (nla_put(skb, IFLA_VF_MAC, sizeof(vf_mac), &vf_mac) ||
@@ -1285,7 +1289,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
 	    nla_put(skb, IFLA_VF_TRUST,
 		    sizeof(vf_trust), &vf_trust))
 		goto nla_put_vf_failure;
-	vfvlanlist = nla_nest_start(skb, IFLA_VF_VLAN_LIST);
+	vfvlanlist = nla_nest_start_noflag(skb, IFLA_VF_VLAN_LIST);
 	if (!vfvlanlist)
 		goto nla_put_vf_failure;
 	if (nla_put(skb, IFLA_VF_VLAN_INFO, sizeof(vf_vlan_info),
@@ -1298,7 +1302,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
 	if (dev->netdev_ops->ndo_get_vf_stats)
 		dev->netdev_ops->ndo_get_vf_stats(dev, vfs_num,
 						&vf_stats);
-	vfstats = nla_nest_start(skb, IFLA_VF_STATS);
+	vfstats = nla_nest_start_noflag(skb, IFLA_VF_STATS);
 	if (!vfstats)
 		goto nla_put_vf_failure;
 	if (nla_put_u64_64bit(skb, IFLA_VF_STATS_RX_PACKETS,
@@ -1348,7 +1352,7 @@ static noinline_for_stack int rtnl_fill_vf(struct sk_buff *skb,
 	if (!dev->netdev_ops->ndo_get_vf_config)
 		return 0;
 
-	vfinfo = nla_nest_start(skb, IFLA_VFINFO_LIST);
+	vfinfo = nla_nest_start_noflag(skb, IFLA_VFINFO_LIST);
 	if (!vfinfo)
 		return -EMSGSIZE;
 
@@ -1433,7 +1437,7 @@ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
 	int err;
 	u8 mode;
 
-	xdp = nla_nest_start(skb, IFLA_XDP);
+	xdp = nla_nest_start_noflag(skb, IFLA_XDP);
 	if (!xdp)
 		return -EMSGSIZE;
 
@@ -1565,7 +1569,7 @@ static int rtnl_fill_link_af(struct sk_buff *skb,
 	const struct rtnl_af_ops *af_ops;
 	struct nlattr *af_spec;
 
-	af_spec = nla_nest_start(skb, IFLA_AF_SPEC);
+	af_spec = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
 	if (!af_spec)
 		return -EMSGSIZE;
 
@@ -1576,7 +1580,7 @@ static int rtnl_fill_link_af(struct sk_buff *skb,
 		if (!af_ops->fill_link_af)
 			continue;
 
-		af = nla_nest_start(skb, af_ops->family);
+		af = nla_nest_start_noflag(skb, af_ops->family);
 		if (!af)
 			return -EMSGSIZE;
 
@@ -1821,8 +1825,7 @@ static const struct rtnl_link_ops *linkinfo_to_kind_ops(const struct nlattr *nla
 	const struct rtnl_link_ops *ops = NULL;
 	struct nlattr *linfo[IFLA_INFO_MAX + 1];
 
-	if (nla_parse_nested(linfo, IFLA_INFO_MAX, nla,
-			     ifla_info_policy, NULL) < 0)
+	if (nla_parse_nested_deprecated(linfo, IFLA_INFO_MAX, nla, ifla_info_policy, NULL) < 0)
 		return NULL;
 
 	if (linfo[IFLA_INFO_KIND]) {
@@ -1921,8 +1924,9 @@ static int rtnl_valid_dump_ifinfo_req(const struct nlmsghdr *nlh,
 			return -EINVAL;
 		}
 
-		return nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFLA_MAX,
-					  ifla_policy, extack);
+		return nlmsg_parse_deprecated_strict(nlh, sizeof(*ifm), tb,
+						     IFLA_MAX, ifla_policy,
+						     extack);
 	}
 
 	/* A hack to preserve kernel<->userspace interface.
@@ -1935,7 +1939,8 @@ static int rtnl_valid_dump_ifinfo_req(const struct nlmsghdr *nlh,
 	hdrlen = nlmsg_len(nlh) < sizeof(struct ifinfomsg) ?
 		 sizeof(struct rtgenmsg) : sizeof(struct ifinfomsg);
 
-	return nlmsg_parse(nlh, hdrlen, tb, IFLA_MAX, ifla_policy, extack);
+	return nlmsg_parse_deprecated(nlh, hdrlen, tb, IFLA_MAX, ifla_policy,
+				      extack);
 }
 
 static int rtnl_dump_ifinfo(struct sk_buff *skb, struct netlink_callback *cb)
@@ -2043,7 +2048,8 @@ out_err:
 int rtnl_nla_parse_ifla(struct nlattr **tb, const struct nlattr *head, int len,
 			struct netlink_ext_ack *exterr)
 {
-	return nla_parse(tb, IFLA_MAX, head, len, ifla_policy, exterr);
+	return nla_parse_deprecated(tb, IFLA_MAX, head, len, ifla_policy,
+				    exterr);
 }
 EXPORT_SYMBOL(rtnl_nla_parse_ifla);
 
@@ -2588,8 +2594,10 @@ static int do_setlink(const struct sk_buff *skb,
 				err = -EINVAL;
 				goto errout;
 			}
-			err = nla_parse_nested(vfinfo, IFLA_VF_MAX, attr,
-					       ifla_vf_policy, NULL);
+			err = nla_parse_nested_deprecated(vfinfo, IFLA_VF_MAX,
+							  attr,
+							  ifla_vf_policy,
+							  NULL);
 			if (err < 0)
 				goto errout;
 			err = do_setvfinfo(dev, vfinfo);
@@ -2616,8 +2624,10 @@ static int do_setlink(const struct sk_buff *skb,
 				err = -EINVAL;
 				goto errout;
 			}
-			err = nla_parse_nested(port, IFLA_PORT_MAX, attr,
-					       ifla_port_policy, NULL);
+			err = nla_parse_nested_deprecated(port, IFLA_PORT_MAX,
+							  attr,
+							  ifla_port_policy,
+							  NULL);
 			if (err < 0)
 				goto errout;
 			if (!port[IFLA_PORT_VF]) {
@@ -2636,9 +2646,9 @@ static int do_setlink(const struct sk_buff *skb,
 	if (tb[IFLA_PORT_SELF]) {
 		struct nlattr *port[IFLA_PORT_MAX+1];
 
-		err = nla_parse_nested(port, IFLA_PORT_MAX,
-				       tb[IFLA_PORT_SELF], ifla_port_policy,
-				       NULL);
+		err = nla_parse_nested_deprecated(port, IFLA_PORT_MAX,
+						  tb[IFLA_PORT_SELF],
+						  ifla_port_policy, NULL);
 		if (err < 0)
 			goto errout;
 
@@ -2685,8 +2695,9 @@ static int do_setlink(const struct sk_buff *skb,
 		struct nlattr *xdp[IFLA_XDP_MAX + 1];
 		u32 xdp_flags = 0;
 
-		err = nla_parse_nested(xdp, IFLA_XDP_MAX, tb[IFLA_XDP],
-				       ifla_xdp_policy, NULL);
+		err = nla_parse_nested_deprecated(xdp, IFLA_XDP_MAX,
+						  tb[IFLA_XDP],
+						  ifla_xdp_policy, NULL);
 		if (err < 0)
 			goto errout;
 
@@ -2740,8 +2751,8 @@ static int rtnl_setlink(struct sk_buff *skb, struct nlmsghdr *nlh,
 	struct nlattr *tb[IFLA_MAX+1];
 	char ifname[IFNAMSIZ];
 
-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy,
-			  extack);
+	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFLA_MAX,
+				     ifla_policy, extack);
 	if (err < 0)
 		goto errout;
 
@@ -2837,7 +2848,8 @@ static int rtnl_dellink(struct sk_buff *skb, struct nlmsghdr *nlh,
 	int err;
 	int netnsid = -1;
 
-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy, extack);
+	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFLA_MAX,
+				     ifla_policy, extack);
 	if (err < 0)
 		return err;
 
@@ -3023,7 +3035,8 @@ static int __rtnl_newlink(struct sk_buff *skb, struct nlmsghdr *nlh,
 #ifdef CONFIG_MODULES
 replay:
 #endif
-	err = nlmsg_parse(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy, extack);
+	err = nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFLA_MAX,
+				     ifla_policy, extack);
 	if (err < 0)
 		return err;
 
@@ -3057,9 +3070,9 @@ replay:
 		return err;
 
 	if (tb[IFLA_LINKINFO]) {
-		err = nla_parse_nested(linkinfo, IFLA_INFO_MAX,
-				       tb[IFLA_LINKINFO], ifla_info_policy,
-				       NULL);
+		err = nla_parse_nested_deprecated(linkinfo, IFLA_INFO_MAX,
+						  tb[IFLA_LINKINFO],
+						  ifla_info_policy, NULL);
 		if (err < 0)
 			return err;
 	} else
@@ -3079,9 +3092,9 @@ replay:
 			return -EINVAL;
 
 		if (ops->maxtype && linkinfo[IFLA_INFO_DATA]) {
-			err = nla_parse_nested(attr, ops->maxtype,
-					       linkinfo[IFLA_INFO_DATA],
-					       ops->policy, extack);
+			err = nla_parse_nested_deprecated(attr, ops->maxtype,
+							  linkinfo[IFLA_INFO_DATA],
+							  ops->policy, extack);
 			if (err < 0)
 				return err;
 			data = attr;
@@ -3100,9 +3113,11 @@ replay:
 
 		if (m_ops->slave_maxtype &&
 		    linkinfo[IFLA_INFO_SLAVE_DATA]) {
-			err = nla_parse_nested(slave_attr, m_ops->slave_maxtype,
-					       linkinfo[IFLA_INFO_SLAVE_DATA],
-					       m_ops->slave_policy, extack);
+			err = nla_parse_nested_deprecated(slave_attr,
+							  m_ops->slave_maxtype,
+							  linkinfo[IFLA_INFO_SLAVE_DATA],
+							  m_ops->slave_policy,
+							  extack);
 			if (err < 0)
 				return err;
 			slave_data = slave_attr;
@@ -3283,8 +3298,8 @@ static int rtnl_valid_getlink_req(struct sk_buff *skb,
 	}
 
 	if (!netlink_strict_get_check(skb))
-		return nlmsg_parse(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy,
-				   extack);
+		return nlmsg_parse_deprecated(nlh, sizeof(*ifm), tb, IFLA_MAX,
+					      ifla_policy, extack);
 
 	ifm = nlmsg_data(nlh);
 	if (ifm->__ifi_pad || ifm->ifi_type || ifm->ifi_flags ||
@@ -3293,8 +3308,8 @@ static int rtnl_valid_getlink_req(struct sk_buff *skb,
 		return -EINVAL;
 	}
 
-	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFLA_MAX, ifla_policy,
-				 extack);
+	err = nlmsg_parse_deprecated_strict(nlh, sizeof(*ifm), tb, IFLA_MAX,
+					    ifla_policy, extack);
 	if (err)
 		return err;
 
@@ -3399,7 +3414,7 @@ static u16 rtnl_calcit(struct sk_buff *skb, struct nlmsghdr *nlh)
 	hdrlen = nlmsg_len(nlh) < sizeof(struct ifinfomsg) ?
 		 sizeof(struct rtgenmsg) : sizeof(struct ifinfomsg);
 
-	if (nlmsg_parse(nlh, hdrlen, tb, IFLA_MAX, ifla_policy, NULL) >= 0) {
+	if (nlmsg_parse_deprecated(nlh, hdrlen, tb, IFLA_MAX, ifla_policy, NULL) >= 0) {
 		if (tb[IFLA_EXT_MASK])
 			ext_filter_mask = nla_get_u32(tb[IFLA_EXT_MASK]);
 	}
@@ -3672,7 +3687,8 @@ static int rtnl_fdb_add(struct sk_buff *skb, struct nlmsghdr *nlh,
 	u16 vid;
 	int err;
 
-	err = nlmsg_parse(nlh, sizeof(*ndm), tb, NDA_MAX, NULL, extack);
+	err = nlmsg_parse_deprecated(nlh, sizeof(*ndm), tb, NDA_MAX, NULL,
+				     extack);
 	if (err < 0)
 		return err;
 
@@ -3782,7 +3798,8 @@ static int rtnl_fdb_del(struct sk_buff *skb, struct nlmsghdr *nlh,
 	if (!netlink_capable(skb, CAP_NET_ADMIN))
 		return -EPERM;
 
-	err = nlmsg_parse(nlh, sizeof(*ndm), tb, NDA_MAX, NULL, extack);
+	err = nlmsg_parse_deprecated(nlh, sizeof(*ndm), tb, NDA_MAX, NULL,
+				     extack);
 	if (err < 0)
 		return err;
 
@@ -3931,8 +3948,8 @@ static int valid_fdb_dump_strict(const struct nlmsghdr *nlh,
 		return -EINVAL;
 	}
 
-	err = nlmsg_parse_strict(nlh, sizeof(struct ndmsg), tb, NDA_MAX,
-				 NULL, extack);
+	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct ndmsg), tb,
+					    NDA_MAX, NULL, extack);
 	if (err < 0)
 		return err;
 
@@ -3984,8 +4001,9 @@ static int valid_fdb_dump_legacy(const struct nlmsghdr *nlh,
 	     nla_attr_size(sizeof(u32)))) {
 		struct ifinfomsg *ifm;
 
-		err = nlmsg_parse(nlh, sizeof(struct ifinfomsg), tb, IFLA_MAX,
-				  ifla_policy, extack);
+		err = nlmsg_parse_deprecated(nlh, sizeof(struct ifinfomsg),
+					     tb, IFLA_MAX, ifla_policy,
+					     extack);
 		if (err < 0) {
 			return -EINVAL;
 		} else if (err == 0) {
@@ -4099,6 +4117,165 @@ out:
 	return skb->len;
 }
 
+static int valid_fdb_get_strict(const struct nlmsghdr *nlh,
+				struct nlattr **tb, u8 *ndm_flags,
+				int *br_idx, int *brport_idx, u8 **addr,
+				u16 *vid, struct netlink_ext_ack *extack)
+{
+	struct ndmsg *ndm;
+	int err, i;
+
+	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ndm))) {
+		NL_SET_ERR_MSG(extack, "Invalid header for fdb get request");
+		return -EINVAL;
+	}
+
+	ndm = nlmsg_data(nlh);
+	if (ndm->ndm_pad1  || ndm->ndm_pad2  || ndm->ndm_state ||
+	    ndm->ndm_type) {
+		NL_SET_ERR_MSG(extack, "Invalid values in header for fdb get request");
+		return -EINVAL;
+	}
+
+	if (ndm->ndm_flags & ~(NTF_MASTER | NTF_SELF)) {
+		NL_SET_ERR_MSG(extack, "Invalid flags in header for fdb get request");
+		return -EINVAL;
+	}
+
+	err = nlmsg_parse_deprecated_strict(nlh, sizeof(struct ndmsg), tb,
+					    NDA_MAX, nda_policy, extack);
+	if (err < 0)
+		return err;
+
+	*ndm_flags = ndm->ndm_flags;
+	*brport_idx = ndm->ndm_ifindex;
+	for (i = 0; i <= NDA_MAX; ++i) {
+		if (!tb[i])
+			continue;
+
+		switch (i) {
+		case NDA_MASTER:
+			*br_idx = nla_get_u32(tb[i]);
+			break;
+		case NDA_LLADDR:
+			if (nla_len(tb[i]) != ETH_ALEN) {
+				NL_SET_ERR_MSG(extack, "Invalid address in fdb get request");
+				return -EINVAL;
+			}
+			*addr = nla_data(tb[i]);
+			break;
+		case NDA_VLAN:
+			err = fdb_vid_parse(tb[i], vid, extack);
+			if (err)
+				return err;
+			break;
+		case NDA_VNI:
+			break;
+		default:
+			NL_SET_ERR_MSG(extack, "Unsupported attribute in fdb get request");
+			return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+static int rtnl_fdb_get(struct sk_buff *in_skb, struct nlmsghdr *nlh,
+			struct netlink_ext_ack *extack)
+{
+	struct net_device *dev = NULL, *br_dev = NULL;
+	const struct net_device_ops *ops = NULL;
+	struct net *net = sock_net(in_skb->sk);
+	struct nlattr *tb[NDA_MAX + 1];
+	struct sk_buff *skb;
+	int brport_idx = 0;
+	u8 ndm_flags = 0;
+	int br_idx = 0;
+	u8 *addr = NULL;
+	u16 vid = 0;
+	int err;
+
+	err = valid_fdb_get_strict(nlh, tb, &ndm_flags, &br_idx,
+				   &brport_idx, &addr, &vid, extack);
+	if (err < 0)
+		return err;
+
+	if (!addr) {
+		NL_SET_ERR_MSG(extack, "Missing lookup address for fdb get request");
+		return -EINVAL;
+	}
+
+	if (brport_idx) {
+		dev = __dev_get_by_index(net, brport_idx);
+		if (!dev) {
+			NL_SET_ERR_MSG(extack, "Unknown device ifindex");
+			return -ENODEV;
+		}
+	}
+
+	if (br_idx) {
+		if (dev) {
+			NL_SET_ERR_MSG(extack, "Master and device are mutually exclusive");
+			return -EINVAL;
+		}
+
+		br_dev = __dev_get_by_index(net, br_idx);
+		if (!br_dev) {
+			NL_SET_ERR_MSG(extack, "Invalid master ifindex");
+			return -EINVAL;
+		}
+		ops = br_dev->netdev_ops;
+	}
+
+	if (dev) {
+		if (!ndm_flags || (ndm_flags & NTF_MASTER)) {
+			if (!(dev->priv_flags & IFF_BRIDGE_PORT)) {
+				NL_SET_ERR_MSG(extack, "Device is not a bridge port");
+				return -EINVAL;
+			}
+			br_dev = netdev_master_upper_dev_get(dev);
+			if (!br_dev) {
+				NL_SET_ERR_MSG(extack, "Master of device not found");
+				return -EINVAL;
+			}
+			ops = br_dev->netdev_ops;
+		} else {
+			if (!(ndm_flags & NTF_SELF)) {
+				NL_SET_ERR_MSG(extack, "Missing NTF_SELF");
+				return -EINVAL;
+			}
+			ops = dev->netdev_ops;
+		}
+	}
+
+	if (!br_dev && !dev) {
+		NL_SET_ERR_MSG(extack, "No device specified");
+		return -ENODEV;
+	}
+
+	if (!ops || !ops->ndo_fdb_get) {
+		NL_SET_ERR_MSG(extack, "Fdb get operation not supported by device");
+		return -EOPNOTSUPP;
+	}
+
+	skb = nlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
+	if (!skb)
+		return -ENOBUFS;
+
+	if (br_dev)
+		dev = br_dev;
+	err = ops->ndo_fdb_get(skb, tb, dev, addr, vid,
+			       NETLINK_CB(in_skb).portid,
+			       nlh->nlmsg_seq, extack);
+	if (err)
+		goto out;
+
+	return rtnl_unicast(skb, net, NETLINK_CB(in_skb).portid);
+out:
+	kfree_skb(skb);
+	return err;
+}
+
 static int brport_nla_put_flag(struct sk_buff *skb, u32 flags, u32 mask,
 			       unsigned int attrnum, unsigned int flag)
 {
@@ -4147,7 +4324,7 @@ int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 	     nla_put_u32(skb, IFLA_LINK, dev_get_iflink(dev))))
 		goto nla_put_failure;
 
-	br_afspec = nla_nest_start(skb, IFLA_AF_SPEC);
+	br_afspec = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
 	if (!br_afspec)
 		goto nla_put_failure;
 
@@ -4171,7 +4348,7 @@ int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
 	}
 	nla_nest_end(skb, br_afspec);
 
-	protinfo = nla_nest_start(skb, IFLA_PROTINFO | NLA_F_NESTED);
+	protinfo = nla_nest_start(skb, IFLA_PROTINFO);
 	if (!protinfo)
 		goto nla_put_failure;
 
@@ -4228,11 +4405,14 @@ static int valid_bridge_getlink_req(const struct nlmsghdr *nlh,
 			return -EINVAL;
 		}
 
-		err = nlmsg_parse_strict(nlh, sizeof(struct ifinfomsg), tb,
-					 IFLA_MAX, ifla_policy, extack);
+		err = nlmsg_parse_deprecated_strict(nlh,
+						    sizeof(struct ifinfomsg),
+						    tb, IFLA_MAX, ifla_policy,
+						    extack);
 	} else {
-		err = nlmsg_parse(nlh, sizeof(struct ifinfomsg), tb,
-				  IFLA_MAX, ifla_policy, extack);
+		err = nlmsg_parse_deprecated(nlh, sizeof(struct ifinfomsg),
+					     tb, IFLA_MAX, ifla_policy,
+					     extack);
 	}
 	if (err < 0)
 		return err;
@@ -4652,8 +4832,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
 
 		if (ops && ops->fill_linkxstats) {
 			*idxattr = IFLA_STATS_LINK_XSTATS;
-			attr = nla_nest_start(skb,
-					      IFLA_STATS_LINK_XSTATS);
+			attr = nla_nest_start_noflag(skb,
+						     IFLA_STATS_LINK_XSTATS);
 			if (!attr)
 				goto nla_put_failure;
 
@@ -4675,8 +4855,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
 			ops = master->rtnl_link_ops;
 		if (ops && ops->fill_linkxstats) {
 			*idxattr = IFLA_STATS_LINK_XSTATS_SLAVE;
-			attr = nla_nest_start(skb,
-					      IFLA_STATS_LINK_XSTATS_SLAVE);
+			attr = nla_nest_start_noflag(skb,
+						     IFLA_STATS_LINK_XSTATS_SLAVE);
 			if (!attr)
 				goto nla_put_failure;
 
@@ -4691,7 +4871,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
 	if (stats_attr_valid(filter_mask, IFLA_STATS_LINK_OFFLOAD_XSTATS,
 			     *idxattr)) {
 		*idxattr = IFLA_STATS_LINK_OFFLOAD_XSTATS;
-		attr = nla_nest_start(skb, IFLA_STATS_LINK_OFFLOAD_XSTATS);
+		attr = nla_nest_start_noflag(skb,
+					     IFLA_STATS_LINK_OFFLOAD_XSTATS);
 		if (!attr)
 			goto nla_put_failure;
 
@@ -4710,7 +4891,7 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
 		struct rtnl_af_ops *af_ops;
 
 		*idxattr = IFLA_STATS_AF_SPEC;
-		attr = nla_nest_start(skb, IFLA_STATS_AF_SPEC);
+		attr = nla_nest_start_noflag(skb, IFLA_STATS_AF_SPEC);
 		if (!attr)
 			goto nla_put_failure;
 
@@ -4720,7 +4901,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
 				struct nlattr *af;
 				int err;
 
-				af = nla_nest_start(skb, af_ops->family);
+				af = nla_nest_start_noflag(skb,
+							   af_ops->family);
 				if (!af) {
 					rcu_read_unlock();
 					goto nla_put_failure;
@@ -5181,7 +5363,7 @@ void __init rtnetlink_init(void)
 
 	rtnl_register(PF_BRIDGE, RTM_NEWNEIGH, rtnl_fdb_add, NULL, 0);
 	rtnl_register(PF_BRIDGE, RTM_DELNEIGH, rtnl_fdb_del, NULL, 0);
-	rtnl_register(PF_BRIDGE, RTM_GETNEIGH, NULL, rtnl_fdb_dump, 0);
+	rtnl_register(PF_BRIDGE, RTM_GETNEIGH, rtnl_fdb_get, rtnl_fdb_dump, 0);
 
 	rtnl_register(PF_BRIDGE, RTM_GETLINK, NULL, rtnl_bridge_getlink, 0);
 	rtnl_register(PF_BRIDGE, RTM_DELLINK, rtnl_bridge_dellink, NULL, 0);

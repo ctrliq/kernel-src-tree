@@ -1,6 +1,6 @@
 #!/bin/sh
 
-for i in kernel-*.config; do
-	NEW=kernel-$VERSION-`echo $i | cut -d - -f2-`
-	mv $i $NEW
+for i in ${NAME}-*.config; do
+	NEW=${NAME}-${VERSION}-`echo $i | cut -d - -f2-`
+	mv ${i} ${NEW}
 done

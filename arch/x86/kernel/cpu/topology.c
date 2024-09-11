@@ -137,7 +137,8 @@ int detect_extended_topology(struct cpuinfo_x86 *c)
 
 	c->cpu_core_id = apic->phys_pkg_id(c->initial_apicid,
 				ht_mask_width) & core_select_mask;
-	c->cpu_die_id = apic->phys_pkg_id(c->initial_apicid,
+	c->cpuinfo_x86_extended_rh.cpu_die_id =
+		apic->phys_pkg_id(c->initial_apicid,
 				core_plus_mask_width) & die_select_mask;
 	c->phys_proc_id = apic->phys_pkg_id(c->initial_apicid,
 				die_plus_mask_width);

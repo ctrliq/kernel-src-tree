@@ -1017,23 +1017,24 @@ static const struct x86_cpu_id rapl_ids[] __initconst = {
 	INTEL_CPU_FAM6(IVYBRIDGE,		rapl_defaults_core),
 	INTEL_CPU_FAM6(IVYBRIDGE_X,		rapl_defaults_core),
 
-	INTEL_CPU_FAM6(HASWELL_CORE,		rapl_defaults_core),
-	INTEL_CPU_FAM6(HASWELL_ULT,		rapl_defaults_core),
-	INTEL_CPU_FAM6(HASWELL_GT3E,		rapl_defaults_core),
+	INTEL_CPU_FAM6(HASWELL,		rapl_defaults_core),
+	INTEL_CPU_FAM6(HASWELL_L,		rapl_defaults_core),
+	INTEL_CPU_FAM6(HASWELL_G,		rapl_defaults_core),
 	INTEL_CPU_FAM6(HASWELL_X,		rapl_defaults_hsw_server),
 
-	INTEL_CPU_FAM6(BROADWELL_CORE,		rapl_defaults_core),
-	INTEL_CPU_FAM6(BROADWELL_GT3E,		rapl_defaults_core),
-	INTEL_CPU_FAM6(BROADWELL_XEON_D,	rapl_defaults_core),
+	INTEL_CPU_FAM6(BROADWELL,		rapl_defaults_core),
+	INTEL_CPU_FAM6(BROADWELL_G,		rapl_defaults_core),
+	INTEL_CPU_FAM6(BROADWELL_D,	rapl_defaults_core),
 	INTEL_CPU_FAM6(BROADWELL_X,		rapl_defaults_hsw_server),
 
-	INTEL_CPU_FAM6(SKYLAKE_DESKTOP,		rapl_defaults_core),
-	INTEL_CPU_FAM6(SKYLAKE_MOBILE,		rapl_defaults_core),
+	INTEL_CPU_FAM6(SKYLAKE,		rapl_defaults_core),
+	INTEL_CPU_FAM6(SKYLAKE_L,		rapl_defaults_core),
 	INTEL_CPU_FAM6(SKYLAKE_X,		rapl_defaults_hsw_server),
-	INTEL_CPU_FAM6(KABYLAKE_MOBILE,		rapl_defaults_core),
-	INTEL_CPU_FAM6(KABYLAKE_DESKTOP,	rapl_defaults_core),
-	INTEL_CPU_FAM6(CANNONLAKE_MOBILE,	rapl_defaults_core),
-	INTEL_CPU_FAM6(ICELAKE_MOBILE,		rapl_defaults_core),
+	INTEL_CPU_FAM6(KABYLAKE_L,		rapl_defaults_core),
+	INTEL_CPU_FAM6(KABYLAKE,	rapl_defaults_core),
+	INTEL_CPU_FAM6(CANNONLAKE_L,	rapl_defaults_core),
+	INTEL_CPU_FAM6(ICELAKE_L,		rapl_defaults_core),
+	INTEL_CPU_FAM6(ICELAKE_X,		rapl_defaults_hsw_server),
 
 	INTEL_CPU_FAM6(ATOM_SILVERMONT,		rapl_defaults_byt),
 	INTEL_CPU_FAM6(ATOM_AIRMONT,		rapl_defaults_cht),
@@ -1041,8 +1042,8 @@ static const struct x86_cpu_id rapl_ids[] __initconst = {
 	INTEL_CPU_FAM6(ATOM_AIRMONT_MID,	rapl_defaults_ann),
 	INTEL_CPU_FAM6(ATOM_GOLDMONT,		rapl_defaults_core),
 	INTEL_CPU_FAM6(ATOM_GOLDMONT_PLUS,	rapl_defaults_core),
-	INTEL_CPU_FAM6(ATOM_GOLDMONT_X,		rapl_defaults_core),
-	INTEL_CPU_FAM6(ATOM_TREMONT_X,		rapl_defaults_core),
+	INTEL_CPU_FAM6(ATOM_GOLDMONT_D,		rapl_defaults_core),
+	INTEL_CPU_FAM6(ATOM_TREMONT_D,		rapl_defaults_core),
 
 	INTEL_CPU_FAM6(XEON_PHI_KNL,		rapl_defaults_hsw_server),
 	INTEL_CPU_FAM6(XEON_PHI_KNM,		rapl_defaults_hsw_server),
@@ -1337,7 +1338,8 @@ static struct rapl_package *rapl_add_package(int cpu, struct rapl_if_priv *priv)
 
 	if (topology_max_die_per_package() > 1)
 		snprintf(rp->name, PACKAGE_DOMAIN_NAME_LENGTH,
-			"package-%d-die-%d", c->phys_proc_id, c->cpu_die_id);
+			"package-%d-die-%d", c->phys_proc_id,
+			 c->cpuinfo_x86_extended_rh.cpu_die_id);
 	else
 		snprintf(rp->name, PACKAGE_DOMAIN_NAME_LENGTH, "package-%d",
 			c->phys_proc_id);
@@ -1578,7 +1580,7 @@ static void __exit rapl_exit(void)
 	powercap_unregister_control_type(rapl_msr_priv.control_type);
 }
 
-fs_initcall(rapl_init);
+module_init(rapl_init);
 module_exit(rapl_exit);
 
 MODULE_DESCRIPTION("Driver for Intel RAPL (Running Average Power Limit)");

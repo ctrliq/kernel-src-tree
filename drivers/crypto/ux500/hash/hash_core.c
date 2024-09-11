@@ -1,4 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
 /*
  * Cryptographic API.
  * Support for Nomadik hardware crypto engine.
@@ -9,6 +8,7 @@
  * Author: Berne Hebark <berne.herbark@stericsson.com> for ST-Ericsson.
  * Author: Niklas Hernaeus <niklas.hernaeus@stericsson.com> for ST-Ericsson.
  * Author: Andreas Westin <andreas.westin@stericsson.com> for ST-Ericsson.
+ * License terms: GNU General Public License (GPL) version 2
  */
 
 #define pr_fmt(fmt) "hashX hashX: " fmt

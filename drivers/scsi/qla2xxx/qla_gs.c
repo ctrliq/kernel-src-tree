@@ -45,13 +45,11 @@ qla2x00_prep_ms_iocb(scsi_qla_host_t *vha, struct ct_arg *arg)
 	ms_pkt->rsp_bytecount = cpu_to_le32(arg->rsp_size);
 	ms_pkt->req_bytecount = cpu_to_le32(arg->req_size);
 
-	ms_pkt->dseg_req_address[0] = cpu_to_le32(LSD(arg->req_dma));
-	ms_pkt->dseg_req_address[1] = cpu_to_le32(MSD(arg->req_dma));
-	ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
+	put_unaligned_le64(arg->req_dma, &ms_pkt->req_dsd.address);
+	ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
 
-	ms_pkt->dseg_rsp_address[0] = cpu_to_le32(LSD(arg->rsp_dma));
-	ms_pkt->dseg_rsp_address[1] = cpu_to_le32(MSD(arg->rsp_dma));
-	ms_pkt->dseg_rsp_length = ms_pkt->rsp_bytecount;
+	put_unaligned_le64(arg->rsp_dma, &ms_pkt->rsp_dsd.address);
+	ms_pkt->rsp_dsd.length = ms_pkt->rsp_bytecount;
 
 	vha->qla_stats.control_requests++;
 
@@ -83,13 +81,11 @@ qla24xx_prep_ms_iocb(scsi_qla_host_t *vha, struct ct_arg *arg)
 	ct_pkt->rsp_byte_count = cpu_to_le32(arg->rsp_size);
 	ct_pkt->cmd_byte_count = cpu_to_le32(arg->req_size);
 
-	ct_pkt->dseg_0_address[0] = cpu_to_le32(LSD(arg->req_dma));
-	ct_pkt->dseg_0_address[1] = cpu_to_le32(MSD(arg->req_dma));
-	ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
+	put_unaligned_le64(arg->req_dma, &ct_pkt->dsd[0].address);
+	ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
 
-	ct_pkt->dseg_1_address[0] = cpu_to_le32(LSD(arg->rsp_dma));
-	ct_pkt->dseg_1_address[1] = cpu_to_le32(MSD(arg->rsp_dma));
-	ct_pkt->dseg_1_len = ct_pkt->rsp_byte_count;
+	put_unaligned_le64(arg->rsp_dma, &ct_pkt->dsd[1].address);
+	ct_pkt->dsd[1].length = ct_pkt->rsp_byte_count;
 	ct_pkt->vp_index = vha->vp_idx;
 
 	vha->qla_stats.control_requests++;
@@ -503,9 +499,8 @@ qla2x00_gnn_id(scsi_qla_host_t *vha, sw_info_t *list)
 	return (rval);
 }
 
-static void qla2x00_async_sns_sp_done(void *s, int rc)
+static void qla2x00_async_sns_sp_done(srb_t *sp, int rc)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	struct ct_sns_pkt *ct_sns;
 	struct qla_work_evt *e;
@@ -984,8 +979,7 @@ qla2x00_prep_sns_cmd(scsi_qla_host_t *vha, uint16_t cmd, uint16_t scmd_len,
 	memset(sns_cmd, 0, sizeof(struct sns_cmd_pkt));
 	wc = data_size / 2;			/* Size in 16bit words. */
 	sns_cmd->p.cmd.buffer_length = cpu_to_le16(wc);
-	sns_cmd->p.cmd.buffer_address[0] = cpu_to_le32(LSD(ha->sns_cmd_dma));
-	sns_cmd->p.cmd.buffer_address[1] = cpu_to_le32(MSD(ha->sns_cmd_dma));
+	put_unaligned_le64(ha->sns_cmd_dma, &sns_cmd->p.cmd.buffer_address);
 	sns_cmd->p.cmd.subcommand_length = cpu_to_le16(scmd_len);
 	sns_cmd->p.cmd.subcommand = cpu_to_le16(cmd);
 	wc = (data_size - 16) / 4;		/* Size in 32bit words. */
@@ -1422,13 +1416,11 @@ qla2x00_prep_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size,
 	ms_pkt->rsp_bytecount = cpu_to_le32(rsp_size);
 	ms_pkt->req_bytecount = cpu_to_le32(req_size);
 
-	ms_pkt->dseg_req_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
-	ms_pkt->dseg_req_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
-	ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
+	put_unaligned_le64(ha->ct_sns_dma, &ms_pkt->req_dsd.address);
+	ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
 
-	ms_pkt->dseg_rsp_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
-	ms_pkt->dseg_rsp_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
-	ms_pkt->dseg_rsp_length = ms_pkt->rsp_bytecount;
+	put_unaligned_le64(ha->ct_sns_dma, &ms_pkt->rsp_dsd.address);
+	ms_pkt->rsp_dsd.length = ms_pkt->rsp_bytecount;
 
 	return ms_pkt;
 }
@@ -1460,13 +1452,11 @@ qla24xx_prep_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size,
 	ct_pkt->rsp_byte_count = cpu_to_le32(rsp_size);
 	ct_pkt->cmd_byte_count = cpu_to_le32(req_size);
 
-	ct_pkt->dseg_0_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
-	ct_pkt->dseg_0_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
-	ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
+	put_unaligned_le64(ha->ct_sns_dma, &ct_pkt->dsd[0].address);
+	ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
 
-	ct_pkt->dseg_1_address[0] = cpu_to_le32(LSD(ha->ct_sns_dma));
-	ct_pkt->dseg_1_address[1] = cpu_to_le32(MSD(ha->ct_sns_dma));
-	ct_pkt->dseg_1_len = ct_pkt->rsp_byte_count;
+	put_unaligned_le64(ha->ct_sns_dma, &ct_pkt->dsd[1].address);
+	ct_pkt->dsd[1].length = ct_pkt->rsp_byte_count;
 	ct_pkt->vp_index = vha->vp_idx;
 
 	return ct_pkt;
@@ -1481,10 +1471,10 @@ qla2x00_update_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size)
 
 	if (IS_FWI2_CAPABLE(ha)) {
 		ct_pkt->cmd_byte_count = cpu_to_le32(req_size);
-		ct_pkt->dseg_0_len = ct_pkt->cmd_byte_count;
+		ct_pkt->dsd[0].length = ct_pkt->cmd_byte_count;
 	} else {
 		ms_pkt->req_bytecount = cpu_to_le32(req_size);
-		ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
+		ms_pkt->req_dsd.length = ms_pkt->req_bytecount;
 	}
 }
 
@@ -3003,9 +2993,8 @@ void qla24xx_handle_gpsc_event(scsi_qla_host_t *vha, struct event_arg *ea)
 	qla_post_iidma_work(vha, fcport);
 }
 
-static void qla24xx_async_gpsc_sp_done(void *s, int res)
+static void qla24xx_async_gpsc_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	struct qla_hw_data *ha = vha->hw;
 	fc_port_t *fcport = sp->fcport;
@@ -3136,23 +3125,13 @@ void qla24xx_sp_unmap(scsi_qla_host_t *vha, srb_t *sp)
 
 	switch (sp->type) {
 	case SRB_ELS_DCMD:
-		if (c->u.els_plogi.els_plogi_pyld)
-			dma_free_coherent(&vha->hw->pdev->dev,
-			    c->u.els_plogi.tx_size,
-			    c->u.els_plogi.els_plogi_pyld,
-			    c->u.els_plogi.els_plogi_pyld_dma);
-
-		if (c->u.els_plogi.els_resp_pyld)
-			dma_free_coherent(&vha->hw->pdev->dev,
-			    c->u.els_plogi.rx_size,
-			    c->u.els_plogi.els_resp_pyld,
-			    c->u.els_plogi.els_resp_pyld_dma);
+		qla2x00_els_dcmd2_free(vha, &c->u.els_plogi);
 		break;
 	case SRB_CT_PTHRU_CMD:
 	default:
 		if (sp->u.iocb_cmd.u.ctarg.req) {
 			dma_free_coherent(&vha->hw->pdev->dev,
-			    sizeof(struct ct_sns_pkt),
+			    sp->u.iocb_cmd.u.ctarg.req_allocated_size,
 			    sp->u.iocb_cmd.u.ctarg.req,
 			    sp->u.iocb_cmd.u.ctarg.req_dma);
 			sp->u.iocb_cmd.u.ctarg.req = NULL;
@@ -3160,7 +3139,7 @@ void qla24xx_sp_unmap(scsi_qla_host_t *vha, srb_t *sp)
 
 		if (sp->u.iocb_cmd.u.ctarg.rsp) {
 			dma_free_coherent(&vha->hw->pdev->dev,
-			    sizeof(struct ct_sns_pkt),
+			    sp->u.iocb_cmd.u.ctarg.rsp_allocated_size,
 			    sp->u.iocb_cmd.u.ctarg.rsp,
 			    sp->u.iocb_cmd.u.ctarg.rsp_dma);
 			sp->u.iocb_cmd.u.ctarg.rsp = NULL;
@@ -3272,9 +3251,8 @@ void qla24xx_handle_gpnid_event(scsi_qla_host_t *vha, struct event_arg *ea)
 	}
 }
 
-static void qla2x00_async_gpnid_sp_done(void *s, int res)
+static void qla2x00_async_gpnid_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	struct ct_sns_req *ct_req =
 	    (struct ct_sns_req *)sp->u.iocb_cmd.u.ctarg.req;
@@ -3456,9 +3434,8 @@ void qla24xx_handle_gffid_event(scsi_qla_host_t *vha, struct event_arg *ea)
 	qla24xx_post_gnl_work(vha, fcport);
 }
 
-void qla24xx_async_gffid_sp_done(void *s, int res)
+void qla24xx_async_gffid_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	fc_port_t *fcport = sp->fcport;
 	struct ct_sns_rsp *ct_rsp;
@@ -3886,9 +3863,8 @@ static void qla2x00_find_free_fcp_nvme_slot(struct scsi_qla_host *vha,
 	}
 }
 
-static void qla2x00_async_gpnft_gnnft_sp_done(void *s, int res)
+static void qla2x00_async_gpnft_gnnft_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	struct ct_sns_req *ct_req =
 		(struct ct_sns_req *)sp->u.iocb_cmd.u.ctarg.req;
@@ -4147,7 +4123,7 @@ int qla24xx_async_gpnft(scsi_qla_host_t *vha, u8 fc4_type, srb_t *sp)
 		sp->u.iocb_cmd.u.ctarg.rsp = dma_zalloc_coherent(
 			&vha->hw->pdev->dev, rspsz,
 			&sp->u.iocb_cmd.u.ctarg.rsp_dma, GFP_KERNEL);
-		sp->u.iocb_cmd.u.ctarg.rsp_allocated_size = sizeof(struct ct_sns_pkt);
+		sp->u.iocb_cmd.u.ctarg.rsp_allocated_size = rspsz;
 		if (!sp->u.iocb_cmd.u.ctarg.rsp) {
 			ql_log(ql_log_warn, vha, 0xffff,
 			    "Failed to allocate ct_sns request.\n");
@@ -4264,9 +4240,8 @@ void qla24xx_handle_gnnid_event(scsi_qla_host_t *vha, struct event_arg *ea)
 	qla24xx_post_gnl_work(vha, ea->fcport);
 }
 
-static void qla2x00_async_gnnid_sp_done(void *s, int res)
+static void qla2x00_async_gnnid_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	fc_port_t *fcport = sp->fcport;
 	u8 *node_name = fcport->ct_desc.ct_sns->p.rsp.rsp.gnn_id.node_name;
@@ -4396,9 +4371,8 @@ void qla24xx_handle_gfpnid_event(scsi_qla_host_t *vha, struct event_arg *ea)
 	qla24xx_post_gpsc_work(vha, fcport);
 }
 
-static void qla2x00_async_gfpnid_sp_done(void *s, int res)
+static void qla2x00_async_gfpnid_sp_done(srb_t *sp, int res)
 {
-	struct srb *sp = s;
 	struct scsi_qla_host *vha = sp->vha;
 	fc_port_t *fcport = sp->fcport;
 	u8 *fpn = fcport->ct_desc.ct_sns->p.rsp.rsp.gfpn_id.port_name;
