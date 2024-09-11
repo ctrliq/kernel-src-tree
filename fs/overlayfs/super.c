@@ -1140,6 +1140,8 @@ static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 {
 	struct vfsmount *mnt = ofs->upper_mnt;
 	struct dentry *temp;
+	bool rename_whiteout;
+	bool d_type;
 	int fh_type;
 	int err;
 
@@ -1165,11 +1167,8 @@ static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	if (err < 0)
 		goto out;
 
-	/*
-	 * We allowed this configuration and don't want to break users over
-	 * kernel upgrade. So warn instead of erroring out.
-	 */
-	if (!err)
+	d_type = err;
+	if (!d_type)
 		pr_warn("upper fs needs to support d_type.\n");
 
 	/* Check if upper/work fs supports O_TMPFILE */
@@ -1186,7 +1185,8 @@ static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 	if (err < 0)
 		goto out;
 
-	if (!err)
+	rename_whiteout = err;
+	if (!rename_whiteout)
 		pr_warn("upper fs does not support RENAME_WHITEOUT.\n");
 
 	/*
@@ -1201,6 +1201,18 @@ static int ovl_make_workdir(struct super_block *sb, struct ovl_fs *ofs,
 		err = 0;
 	} else {
 		vfs_removexattr(ofs->workdir, OVL_XATTR_OPAQUE);
+	}
+
+	/*
+	 * We allowed sub-optimal upper fs configuration and don't want to break
+	 * users over kernel upgrade, but we never allowed remote upper fs, so
+	 * we can enforce strict requirements for remote upper fs.
+	 */
+	if (ovl_dentry_remote(ofs->workdir) &&
+	    (!d_type || !rename_whiteout || ofs->noxattr)) {
+		pr_err("upper fs missing required features.\n");
+		err = -EINVAL;
+		goto out;
 	}
 
 	/* Check if upper/work fs supports file handles */
