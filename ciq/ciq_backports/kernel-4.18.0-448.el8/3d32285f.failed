@@ -1,0 +1,221 @@
+kbuild: wire up the build rule of compile_commands.json to Makefile
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Masahiro Yamada <masahiroy@kernel.org>
+commit 3d32285fa99598f1885ac7022785b9c343407e62
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3d32285f.failed
+
+Currently, you need to manually run scripts/gen_compile_commands.py
+to create compile_commands.json. It parses all the .*.cmd files found
+under the specified directory.
+
+If you rebuild the kernel over again without 'make clean',
+.*.cmd files from older builds will create stale entries in
+compile_commands.json.
+
+This commit wires up the compile_commands.json rule to Makefile, and
+makes it parse only the .*.cmd files involved in the current build.
+
+Pass $(KBUILD_VMLINUX_OBJS), $(KBUILD_VMLINUX_LIBS), and modules.order
+to the script. The objects or archives linked to vmlinux are listed in
+$(KBUILD_VMLINUX_OBJS) or $(KBUILD_VMLINUX_LIBS). All the modules are
+listed in modules.order.
+
+You can create compile_commands.json from Make:
+
+  $ make -j$(nproc) CC=clang compile_commands.json
+
+You can also build vmlinux, modules, and compile_commands.json all
+together in a single command:
+
+  $ make -j$(nproc) CC=clang all compile_commands.json
+
+It works for M= builds as well. In this case, compile_commands.json
+is created in the top directory of the external module.
+
+This is convenient, but it has a drawback; the coverage of the
+compile_commands.json is reduced because only the objects linked to
+vmlinux or modules are handled. For example, the following C files are
+not included in the compile_commands.json:
+
+ - Decompressor source files (arch/*/boot/)
+ - VDSO source files
+ - C files used to generate intermediates (e.g. kernel/bounds.c)
+ - Standalone host programs
+
+I think it is fine for most developers because our main interest is
+the kernel-space code.
+
+If you want to cover all the compiled C files, please build the kernel,
+then run the script manually as you did before:
+
+  $ make clean    # if you want to remove stale .cmd files [optional]
+  $ make -j$(nproc) CC=clang
+  $ scripts/gen_compile_commands.py
+
+Here is a note for out-of-tree builds. 'make compile_commands.json'
+works with O= option, but please notice compile_commands.json is
+created in the object tree instead of the source tree.
+
+Some people may want to have compile_commands.json in the source tree
+because Clang Tools searches for it through all parent paths of the
+first input source file.
+
+However, you cannot do this for O= builds. Kbuild should never generate
+any build artifact in the source tree when O= is given because the
+source tree might be read-only. Any write attempt to the source tree
+is monitored and the violation may be reported. See the commit log of
+8ef14c2c41d9.
+
+So, the only possible way is to create compile_commands.json in the
+object tree, then specify '-p <build-path>' when you use clang-check,
+clang-tidy, etc.
+
+	Signed-off-by: Masahiro Yamada <masahiroy@kernel.org>
+	Acked-by: Nick Desaulniers <ndesaulniers@google.com>
+(cherry picked from commit 3d32285fa99598f1885ac7022785b9c343407e62)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Makefile
+diff --cc Makefile
+index d19eb4028fc8,07fd96a25a20..000000000000
+--- a/Makefile
++++ b/Makefile
+@@@ -573,7 -634,7 +573,11 @@@ endi
+  # in addition to whatever we do anyway.
+  # Just "make" or "make all" shall build modules as well
+  
+++<<<<<<< HEAD
+ +ifneq ($(filter all _all modules,$(MAKECMDGOALS)),)
+++=======
++ ifneq ($(filter all modules nsdeps %compile_commands.json,$(MAKECMDGOALS)),)
+++>>>>>>> 3d32285fa995 (kbuild: wire up the build rule of compile_commands.json to Makefile)
+    KBUILD_MODULES := 1
+  endif
+  
+@@@ -1356,16 -1469,23 +1360,22 @@@ endif # CONFIG_MODULE
+  # make distclean Remove editor backup files, patch leftover files and the like
+  
+  # Directories & files removed with 'make clean'
+++<<<<<<< HEAD
+ +CLEAN_DIRS  += $(MODVERDIR) include/ksym
+++=======
++ CLEAN_FILES += include/ksym vmlinux.symvers \
++ 	       modules.builtin modules.builtin.modinfo modules.nsdeps \
++ 	       compile_commands.json
+++>>>>>>> 3d32285fa995 (kbuild: wire up the build rule of compile_commands.json to Makefile)
+  
+  # Directories & files removed with 'make mrproper'
+ -MRPROPER_FILES += include/config include/generated          \
+ -		  arch/$(SRCARCH)/include/generated .tmp_objdiff \
+ -		  debian snap tar-install \
+ -		  .config .config.old .version \
+ -		  Module.symvers \
+ +MRPROPER_DIRS  += include/config usr/include include/generated          \
+ +		  arch/*/include/generated .tmp_objdiff
+ +MRPROPER_FILES += .config .config.old .version \
+ +		  Module.symvers tags TAGS cscope* GPATH GTAGS GRTAGS GSYMS \
+  		  signing_key.pem signing_key.priv signing_key.x509	\
+  		  x509.genkey extra_certificates signing_key.x509.keyid	\
+ -		  signing_key.x509.signer vmlinux-gdb.py \
+ -		  *.spec
+ -
+ -# Directories & files removed with 'make distclean'
+ -DISTCLEAN_FILES += tags TAGS cscope* GPATH GTAGS GRTAGS GSYMS
+ +		  signing_key.x509.signer vmlinux-gdb.py
+  
+  # clean - Delete most, but leave enough to build external modules
+  #
+@@@ -1566,23 -1703,14 +1576,32 @@@ else # KBUILD_EXTMO
+  # We are always building modules
+  KBUILD_MODULES := 1
+  
+++<<<<<<< HEAD
+ +PHONY += $(objtree)/Module.symvers
+ +$(objtree)/Module.symvers:
+ +	@test -e $(objtree)/Module.symvers || ( \
+ +	echo; \
+ +	echo "  WARNING: Symbol version dump $(objtree)/Module.symvers"; \
+ +	echo "           is missing; modules will have no dependencies and modversions."; \
+ +	echo )
+ +
+ +module-dirs := $(addprefix _module_,$(KBUILD_EXTMOD))
+ +PHONY += $(module-dirs) modules
+ +$(module-dirs): prepare $(objtree)/Module.symvers
+ +	$(Q)$(MAKE) $(build)=$(patsubst _module_%,%,$@)
+ +
+ +modules: $(module-dirs)
+ +	@$(kecho) '  Building modules, stage 2.';
+++=======
++ build-dirs := $(KBUILD_EXTMOD)
++ PHONY += modules
++ modules: $(MODORDER)
+++>>>>>>> 3d32285fa995 (kbuild: wire up the build rule of compile_commands.json to Makefile)
+  	$(Q)$(MAKE) -f $(srctree)/scripts/Makefile.modpost
+  
++ $(MODORDER): descend
++ 	@:
++ 
+  PHONY += modules_install
+  modules_install: _emodinst_ _emodinst_post
+  
+@@@ -1596,14 -1724,12 +1615,23 @@@ PHONY += _emodinst_pos
+  _emodinst_post: _emodinst_
+  	$(call cmd,depmod)
+  
+++<<<<<<< HEAD
+ +clean-dirs := $(addprefix _clean_,$(KBUILD_EXTMOD))
+ +
+ +PHONY += $(clean-dirs) clean
+ +$(clean-dirs):
+ +	$(Q)$(MAKE) $(clean)=$(patsubst _clean_%,%,$@)
+ +
+ +clean:	rm-dirs := $(MODVERDIR)
+ +clean: rm-files := $(KBUILD_EXTMOD)/Module.symvers
+++=======
++ compile_commands.json: $(extmod-prefix)compile_commands.json
++ PHONY += compile_commands.json
++ 
++ clean-dirs := $(KBUILD_EXTMOD)
++ clean: rm-files := $(KBUILD_EXTMOD)/Module.symvers $(KBUILD_EXTMOD)/modules.nsdeps \
++ 	$(KBUILD_EXTMOD)/compile_commands.json
+++>>>>>>> 3d32285fa995 (kbuild: wire up the build rule of compile_commands.json to Makefile)
+  
+  PHONY += help
+  help:
+@@@ -1647,6 -1834,27 +1675,30 @@@ quiet_cmd_tags = GEN     $
+  tags TAGS cscope gtags: FORCE
+  	$(call cmd,tags)
+  
+++<<<<<<< HEAD
+++=======
++ # Script to generate missing namespace dependencies
++ # ---------------------------------------------------------------------------
++ 
++ PHONY += nsdeps
++ nsdeps: export KBUILD_NSDEPS=1
++ nsdeps: modules
++ 	$(Q)$(CONFIG_SHELL) $(srctree)/scripts/nsdeps
++ 
++ # Clang Tooling
++ # ---------------------------------------------------------------------------
++ 
++ quiet_cmd_gen_compile_commands = GEN     $@
++       cmd_gen_compile_commands = $(PYTHON3) $< -a $(AR) -o $@ $(filter-out $<, $(real-prereqs))
++ 
++ $(extmod-prefix)compile_commands.json: scripts/gen_compile_commands.py \
++ 	$(if $(KBUILD_EXTMOD),,$(KBUILD_VMLINUX_OBJS) $(KBUILD_VMLINUX_LIBS)) \
++ 	$(if $(CONFIG_MODULES), $(MODORDER)) FORCE
++ 	$(call if_changed,gen_compile_commands)
++ 
++ targets += $(extmod-prefix)compile_commands.json
++ 
+++>>>>>>> 3d32285fa995 (kbuild: wire up the build rule of compile_commands.json to Makefile)
+  # Scripts to check various things for consistency
+  # ---------------------------------------------------------------------------
+  
+* Unmerged path Makefile
