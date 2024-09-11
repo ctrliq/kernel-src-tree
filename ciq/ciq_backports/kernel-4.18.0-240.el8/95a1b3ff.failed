@@ -1,0 +1,146 @@
+io_uring: Fix mm_fault with READ/WRITE_FIXED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 95a1b3ff9a3e4ea2f26c4e802067d58831f415db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/95a1b3ff.failed
+
+Commit fb5ccc98782f ("io_uring: Fix broken links with offloading")
+introduced a potential performance regression with unconditionally
+taking mm even for READ/WRITE_FIXED operations.
+
+Return the logic handling it back. mm-faulted requests will go through
+the generic submission path, so honoring links and drains, but will
+fail further on req->has_user check.
+
+Fixes: fb5ccc98782f ("io_uring: Fix broken links with offloading")
+	Cc: stable@vger.kernel.org # v5.4
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 95a1b3ff9a3e4ea2f26c4e802067d58831f415db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7f974c7eddcc,f9eff8f62ddb..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2406,8 -2725,8 +2406,13 @@@ static bool io_get_sqring(struct io_rin
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
+ +			  unsigned int nr, bool has_user, bool mm_fault)
+++=======
++ static int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr,
++ 			  struct mm_struct **mm)
+++>>>>>>> 95a1b3ff9a3e (io_uring: Fix mm_fault with READ/WRITE_FIXED)
+  {
+  	struct io_submit_state state, *statep = NULL;
+  	struct io_kiocb *link = NULL;
+@@@ -2421,6 -2741,19 +2427,22 @@@
+  	}
+  
+  	for (i = 0; i < nr; i++) {
+++<<<<<<< HEAD
+++=======
++ 		struct sqe_submit s;
++ 
++ 		if (!io_get_sqring(ctx, &s))
++ 			break;
++ 
++ 		if (io_sqe_needs_user(s.sqe) && !*mm) {
++ 			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
++ 			if (!mm_fault) {
++ 				use_mm(ctx->sqo_mm);
++ 				*mm = ctx->sqo_mm;
++ 			}
++ 		}
++ 
+++>>>>>>> 95a1b3ff9a3e (io_uring: Fix mm_fault with READ/WRITE_FIXED)
+  		/*
+  		 * If previous wasn't linked and we have a linked command,
+  		 * that's the end of the chain. Submit the previous link.
+@@@ -2445,16 -2777,12 +2467,25 @@@
+  		}
+  
+  out:
+++<<<<<<< HEAD
+ +		if (unlikely(mm_fault)) {
+ +			io_cqring_add_event(ctx, sqes[i].sqe->user_data,
+ +						-EFAULT);
+ +		} else {
+ +			sqes[i].has_user = has_user;
+ +			sqes[i].needs_lock = true;
+ +			sqes[i].needs_fixed_file = true;
+ +			io_submit_sqe(ctx, &sqes[i], statep, &link, true);
+ +			submitted++;
+ +		}
+++=======
++ 		s.has_user = *mm != NULL;
++ 		s.in_async = true;
++ 		s.needs_fixed_file = true;
++ 		trace_io_uring_submit_sqe(ctx, true, true);
++ 		io_submit_sqe(ctx, &s, statep, &link);
++ 		submitted++;
+++>>>>>>> 95a1b3ff9a3e (io_uring: Fix mm_fault with READ/WRITE_FIXED)
+  	}
+  
+  	if (link)
+@@@ -2482,8 -2809,7 +2513,12 @@@ static int io_sq_thread(void *data
+  
+  	timeout = inflight = 0;
+  	while (!kthread_should_park()) {
+++<<<<<<< HEAD
+ +		bool all_fixed, mm_fault = false;
+ +		int i;
+++=======
++ 		unsigned int to_submit;
+++>>>>>>> 95a1b3ff9a3e (io_uring: Fix mm_fault with READ/WRITE_FIXED)
+  
+  		if (inflight) {
+  			unsigned nr_events = 0;
+@@@ -2562,31 -2890,11 +2597,36 @@@
+  			}
+  			finish_wait(&ctx->sqo_wait, &wait);
+  
+ -			ctx->rings->sq_flags &= ~IORING_SQ_NEED_WAKEUP;
+ +			ctx->sq_ring->flags &= ~IORING_SQ_NEED_WAKEUP;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		i = 0;
+ +		all_fixed = true;
+ +		do {
+ +			if (all_fixed && io_sqe_needs_user(sqes[i].sqe))
+ +				all_fixed = false;
+ +
+ +			i++;
+ +			if (i == ARRAY_SIZE(sqes))
+ +				break;
+ +		} while (io_get_sqring(ctx, &sqes[i]));
+ +
+ +		/* Unless all new commands are FIXED regions, grab mm */
+ +		if (!all_fixed && !cur_mm) {
+ +			mm_fault = !mmget_not_zero(ctx->sqo_mm);
+ +			if (!mm_fault) {
+ +				use_mm(ctx->sqo_mm);
+ +				cur_mm = ctx->sqo_mm;
+ +			}
+  		}
+  
+ +		inflight += io_submit_sqes(ctx, sqes, i, cur_mm != NULL,
+ +						mm_fault);
+++=======
++ 		to_submit = min(to_submit, ctx->sq_entries);
++ 		inflight += io_submit_sqes(ctx, to_submit, &cur_mm);
+++>>>>>>> 95a1b3ff9a3e (io_uring: Fix mm_fault with READ/WRITE_FIXED)
+  
+  		/* Commit SQ ring head once we've consumed all SQEs */
+  		io_commit_sqring(ctx);
+* Unmerged path fs/io_uring.c
