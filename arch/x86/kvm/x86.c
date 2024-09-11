@@ -21,6 +21,7 @@
 
 #include <linux/kvm_host.h>
 #include "irq.h"
+#include "ioapic.h"
 #include "mmu.h"
 #include "i8254.h"
 #include "tss.h"

@@ -38,6 +38,7 @@
 #include <linux/jump_label.h>
 #include "kvm_cache_regs.h"
 #include "irq.h"
+#include "ioapic.h"
 #include "trace.h"
 #include "x86.h"
 #include "cpuid.h"
