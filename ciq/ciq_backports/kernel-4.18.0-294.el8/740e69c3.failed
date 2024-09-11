@@ -1,0 +1,201 @@
+libbpf: Refactor internals of BTF type index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 740e69c3c511aa207155ba993a854b5bee79cdc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/740e69c3.failed
+
+Refactor implementation of internal BTF type index to not use direct pointers.
+Instead it uses offset relative to the start of types data section. This
+allows for types data to be reallocatable, enabling implementation of
+modifiable BTF.
+
+As now getting type by ID has an extra indirection step, convert all internal
+type lookups to a new helper btf_type_id(), that returns non-const pointer to
+a type by its ID.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200926011357.2366158-2-andriin@fb.com
+(cherry picked from commit 740e69c3c511aa207155ba993a854b5bee79cdc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+diff --cc tools/lib/bpf/btf.c
+index 9ca048005e04,7c9957893ef2..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -34,13 -31,15 +34,14 @@@ struct btf 
+  		struct btf_header *hdr;
+  		void *data;
+  	};
+- 	struct btf_type **types;
++ 	__u32 *type_offs;
++ 	__u32 type_offs_cap;
+  	const char *strings;
+  	void *nohdr_data;
++ 	void *types_data;
+  	__u32 nr_types;
+- 	__u32 types_size;
+  	__u32 data_size;
+  	int fd;
+ -	int ptr_sz;
+  };
+  
+  static inline __u64 ptr_to_u64(const void *ptr)
+@@@ -48,30 -47,30 +49,35 @@@
+  	return (__u64) (unsigned long) ptr;
+  }
+  
+- static int btf_add_type(struct btf *btf, struct btf_type *t)
++ static int btf_add_type_idx_entry(struct btf *btf, __u32 type_off)
+  {
+- 	if (btf->types_size - btf->nr_types < 2) {
+- 		struct btf_type **new_types;
++ 	/* nr_types is 1-based, so N types means we need N+1-sized array */
++ 	if (btf->nr_types + 2 > btf->type_offs_cap) {
++ 		__u32 *new_offs;
+  		__u32 expand_by, new_size;
+  
+- 		if (btf->types_size == BTF_MAX_NR_TYPES)
++ 		if (btf->type_offs_cap == BTF_MAX_NR_TYPES)
+  			return -E2BIG;
+  
+- 		expand_by = max(btf->types_size >> 2, 16U);
+- 		new_size = min(BTF_MAX_NR_TYPES, btf->types_size + expand_by);
++ 		expand_by = max(btf->type_offs_cap / 4, 16U);
++ 		new_size = min(BTF_MAX_NR_TYPES, btf->type_offs_cap + expand_by);
+  
+++<<<<<<< HEAD
+ +		new_types = realloc(btf->types, sizeof(*new_types) * new_size);
+ +		if (!new_types)
+++=======
++ 		new_offs = libbpf_reallocarray(btf->type_offs, new_size, sizeof(*new_offs));
++ 		if (!new_offs)
+++>>>>>>> 740e69c3c511 (libbpf: Refactor internals of BTF type index)
+  			return -ENOMEM;
+  
+- 		if (btf->nr_types == 0)
+- 			new_types[0] = &btf_void;
++ 		new_offs[0] = UINT_MAX; /* VOID is specially handled */
+  
+- 		btf->types = new_types;
+- 		btf->types_size = new_size;
++ 		btf->type_offs = new_offs;
++ 		btf->type_offs_cap = new_size;
+  	}
+  
+- 	btf->types[++(btf->nr_types)] = t;
++ 	btf->type_offs[btf->nr_types + 1] = type_off;
+  
+  	return 0;
+  }
+@@@ -217,10 -228,73 +235,9 @@@ const struct btf_type *btf__type_by_id(
+  {
+  	if (type_id > btf->nr_types)
+  		return NULL;
+- 
+- 	return btf->types[type_id];
++ 	return btf_type_by_id((struct btf *)btf, type_id);
+  }
+  
+ -static int determine_ptr_size(const struct btf *btf)
+ -{
+ -	const struct btf_type *t;
+ -	const char *name;
+ -	int i;
+ -
+ -	for (i = 1; i <= btf->nr_types; i++) {
+ -		t = btf__type_by_id(btf, i);
+ -		if (!btf_is_int(t))
+ -			continue;
+ -
+ -		name = btf__name_by_offset(btf, t->name_off);
+ -		if (!name)
+ -			continue;
+ -
+ -		if (strcmp(name, "long int") == 0 ||
+ -		    strcmp(name, "long unsigned int") == 0) {
+ -			if (t->size != 4 && t->size != 8)
+ -				continue;
+ -			return t->size;
+ -		}
+ -	}
+ -
+ -	return -1;
+ -}
+ -
+ -static size_t btf_ptr_sz(const struct btf *btf)
+ -{
+ -	if (!btf->ptr_sz)
+ -		((struct btf *)btf)->ptr_sz = determine_ptr_size(btf);
+ -	return btf->ptr_sz < 0 ? sizeof(void *) : btf->ptr_sz;
+ -}
+ -
+ -/* Return pointer size this BTF instance assumes. The size is heuristically
+ - * determined by looking for 'long' or 'unsigned long' integer type and
+ - * recording its size in bytes. If BTF type information doesn't have any such
+ - * type, this function returns 0. In the latter case, native architecture's
+ - * pointer size is assumed, so will be either 4 or 8, depending on
+ - * architecture that libbpf was compiled for. It's possible to override
+ - * guessed value by using btf__set_pointer_size() API.
+ - */
+ -size_t btf__pointer_size(const struct btf *btf)
+ -{
+ -	if (!btf->ptr_sz)
+ -		((struct btf *)btf)->ptr_sz = determine_ptr_size(btf);
+ -
+ -	if (btf->ptr_sz < 0)
+ -		/* not enough BTF type info to guess */
+ -		return 0;
+ -
+ -	return btf->ptr_sz;
+ -}
+ -
+ -/* Override or set pointer size in bytes. Only values of 4 and 8 are
+ - * supported.
+ - */
+ -int btf__set_pointer_size(struct btf *btf, size_t ptr_sz)
+ -{
+ -	if (ptr_sz != 4 && ptr_sz != 8)
+ -		return -EINVAL;
+ -	btf->ptr_sz = ptr_sz;
+ -	return 0;
+ -}
+ -
+  static bool btf_type_is_void(const struct btf_type *t)
+  {
+  	return t == &btf_void || btf_is_fwd(t);
+@@@ -2795,16 -2961,16 +2811,24 @@@ static int btf_dedup_compact_types(stru
+  
+  	/* shrink struct btf's internal types index and update btf_header */
+  	d->btf->nr_types = next_type_id - 1;
+++<<<<<<< HEAD
+ +	d->btf->types_size = d->btf->nr_types;
+ +	d->btf->hdr->type_len = p - types_start;
+ +	new_types = realloc(d->btf->types,
+ +			    (1 + d->btf->nr_types) * sizeof(struct btf_type *));
+ +	if (!new_types)
+++=======
++ 	d->btf->type_offs_cap = d->btf->nr_types + 1;
++ 	d->btf->hdr->type_len = p - d->btf->types_data;
++ 	new_offs = libbpf_reallocarray(d->btf->type_offs, d->btf->type_offs_cap,
++ 				       sizeof(*new_offs));
++ 	if (!new_offs)
+++>>>>>>> 740e69c3c511 (libbpf: Refactor internals of BTF type index)
+  		return -ENOMEM;
+- 	d->btf->types = new_types;
++ 	d->btf->type_offs = new_offs;
+  
+  	/* make sure string section follows type information without gaps */
+- 	d->btf->hdr->str_off = p - (char *)d->btf->nohdr_data;
++ 	d->btf->hdr->str_off = p - d->btf->nohdr_data;
+  	memmove(p, d->btf->strings, d->btf->hdr->str_len);
+  	d->btf->strings = p;
+  	p += d->btf->hdr->str_len;
+* Unmerged path tools/lib/bpf/btf.c
