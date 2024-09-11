@@ -1,0 +1,131 @@
+KVM: SVM: Drop AVIC's intermediate avic_set_running() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 935a7333958e91b5d0c1b0ebc75a5cefdbb34dd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/935a7333.failed
+
+Drop avic_set_running() in favor of calling avic_vcpu_{load,put}()
+directly, and modify the block+put path to use preempt_disable/enable()
+instead of get/put_cpu(), as it doesn't actually care about the current
+pCPU associated with the vCPU.  Opportunistically add lockdep assertions
+as being preempted in avic_vcpu_put() would lead to consuming stale data,
+even though doing so _in the current code base_ would not be fatal.
+
+Add a much needed comment explaining why svm_vcpu_blocking() needs to
+unload the AVIC and update the IRTE _before_ the vCPU starts blocking.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211208015236.1616697-22-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 935a7333958e91b5d0c1b0ebc75a5cefdbb34dd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+diff --cc arch/x86/kvm/svm/avic.c
+index ea2456874260,522f859408cb..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -978,7 -978,23 +978,27 @@@ void avic_vcpu_load(struct kvm_vcpu *vc
+  	int h_physical_id = kvm_cpu_get_apicid(cpu);
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON(h_physical_id & ~AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK))
+++=======
++ 	lockdep_assert_preemption_disabled();
++ 
++ 	/*
++ 	 * Since the host physical APIC id is 8 bits,
++ 	 * we can support host APIC ID upto 255.
++ 	 */
++ 	if (WARN_ON(h_physical_id > AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK))
++ 		return;
++ 
++ 	/*
++ 	 * No need to update anything if the vCPU is blocking, i.e. if the vCPU
++ 	 * is being scheduled in after being preempted.  The CPU entries in the
++ 	 * Physical APIC table and IRTE are consumed iff IsRun{ning} is '1'.
++ 	 * If the vCPU was migrated, its new CPU value will be stuffed when the
++ 	 * vCPU unblocks.
++ 	 */
++ 	if (kvm_vcpu_is_blocking(vcpu))
+++>>>>>>> 935a7333958e (KVM: SVM: Drop AVIC's intermediate avic_set_running() helper)
+  		return;
+  
+  	entry = READ_ONCE(*(svm->avic_physical_id_cache));
+@@@ -1001,37 -1013,43 +1021,62 @@@ void avic_vcpu_put(struct kvm_vcpu *vcp
+  	u64 entry;
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
++ 	lockdep_assert_preemption_disabled();
++ 
+  	entry = READ_ONCE(*(svm->avic_physical_id_cache));
+ -
+ -	/* Nothing to do if IsRunning == '0' due to vCPU blocking. */
+ -	if (!(entry & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK))
+ -		return;
+ -
+ -	avic_update_iommu_vcpu_affinity(vcpu, -1, 0);
+ +	if (entry & AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK)
+ +		avic_update_iommu_vcpu_affinity(vcpu, -1, 0);
+  
+  	entry &= ~AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
+  	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * This function is called during VCPU halt/unhalt.
+ + */
+ +static void avic_set_running(struct kvm_vcpu *vcpu, bool is_run)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	int cpu = get_cpu();
+ +
+ +	WARN_ON(cpu != vcpu->cpu);
+ +	svm->avic_is_running = is_run;
+ +
+ +	if (kvm_vcpu_apicv_active(vcpu)) {
+ +		if (is_run)
+ +			avic_vcpu_load(vcpu, cpu);
+ +		else
+ +			avic_vcpu_put(vcpu);
+ +	}
+ +	put_cpu();
+ +}
+ +
+++=======
+++>>>>>>> 935a7333958e (KVM: SVM: Drop AVIC's intermediate avic_set_running() helper)
+  void svm_vcpu_blocking(struct kvm_vcpu *vcpu)
+  {
+- 	avic_set_running(vcpu, false);
++ 	if (!kvm_vcpu_apicv_active(vcpu))
++ 		return;
++ 
++ 	preempt_disable();
++ 
++        /*
++         * Unload the AVIC when the vCPU is about to block, _before_
++         * the vCPU actually blocks.
++         *
++         * Any IRQs that arrive before IsRunning=0 will not cause an
++         * incomplete IPI vmexit on the source, therefore vIRR will also
++         * be checked by kvm_vcpu_check_block() before blocking.  The
++         * memory barrier implicit in set_current_state orders writing
++         * IsRunning=0 before reading the vIRR.  The processor needs a
++         * matching memory barrier on interrupt delivery between writing
++         * IRR and reading IsRunning; the lack of this barrier might be
++         * the cause of errata #1235).
++         */
++ 	avic_vcpu_put(vcpu);
++ 
++ 	preempt_enable();
+  }
+  
+  void svm_vcpu_unblocking(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/svm/avic.c
