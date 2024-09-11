@@ -1,0 +1,192 @@
+rcu: Compute jiffies_till_sched_qs from other kernel parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+commit c06aed0e31008a248c1841f1b7fc80e9ee242a31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/c06aed0e.failed
+
+The jiffies_till_sched_qs value used to determine how old a grace period
+must be before RCU enlists the help of the scheduler to force a quiescent
+state on the holdout CPU.  Currently, this defaults to HZ/10 regardless of
+system size and may be set only at boot time.  This can be a problem for
+very large systems, because if the values of the jiffies_till_first_fqs
+and jiffies_till_next_fqs kernel parameters are left at their defaults,
+they are calculated to increase as the number of CPUs actually configured
+on the system increases.  Thus, on a sufficiently large system, RCU would
+enlist the help of the scheduler before the grace-period kthread had a
+chance to scan for idle CPUs, which wastes CPU time.
+
+This commit therefore allows jiffies_till_sched_qs to be set, if desired,
+but if left as default, computes is as jiffies_till_first_fqs plus twice
+jiffies_till_next_fqs, thus allowing three force-quiescent-state scans
+for idle CPUs.  This scales with the number of CPUs, providing sensible
+default values.
+
+	Signed-off-by: Paul E. McKenney <paulmck@linux.vnet.ibm.com>
+(cherry picked from commit c06aed0e31008a248c1841f1b7fc80e9ee242a31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 19ff444b5603,6bd0951a5f3a..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -1072,25 -1070,21 +1101,39 @@@ static int rcu_implicit_dynticks_qs(str
+  
+  	/*
+  	 * A CPU running for an extended time within the kernel can
+++<<<<<<< HEAD
+ +	 * delay RCU grace periods.  When the CPU is in NO_HZ_FULL mode,
+ +	 * even context-switching back and forth between a pair of
+ +	 * in-kernel CPU-bound tasks cannot advance grace periods.
+ +	 * So if the grace period is old enough, make the CPU pay attention.
+ +	 * Note that the unsynchronized assignments to the per-CPU
+ +	 * rcu_need_heavy_qs variable are safe.  Yes, setting of
+ +	 * bits can be lost, but they will be set again on the next
+ +	 * force-quiescent-state pass.  So lost bit sets do not result
+ +	 * in incorrect behavior, merely in a grace period lasting
+ +	 * a few jiffies longer than it might otherwise.  Because
+ +	 * there are at most four threads involved, and because the
+ +	 * updates are only once every few jiffies, the probability of
+ +	 * lossage (and thus of slight grace-period extension) is
+ +	 * quite low.
+ +	 */
+++=======
++ 	 * delay RCU grace periods: (1) At age jiffies_to_sched_qs,
++ 	 * set .rcu_urgent_qs, (2) At age 2*jiffies_to_sched_qs, set
++ 	 * both .rcu_need_heavy_qs and .rcu_urgent_qs.  Note that the
++ 	 * unsynchronized assignments to the per-CPU rcu_need_heavy_qs
++ 	 * variable are safe because the assignments are repeated if this
++ 	 * CPU failed to pass through a quiescent state.  This code
++ 	 * also checks .jiffies_resched in case jiffies_to_sched_qs
++ 	 * is set way high.
++ 	 */
++ 	jtsq = READ_ONCE(jiffies_to_sched_qs);
++ 	ruqp = per_cpu_ptr(&rcu_dynticks.rcu_urgent_qs, rdp->cpu);
+++>>>>>>> c06aed0e3100 (rcu: Compute jiffies_till_sched_qs from other kernel parameters)
+  	rnhqp = &per_cpu(rcu_dynticks.rcu_need_heavy_qs, rdp->cpu);
+  	if (!READ_ONCE(*rnhqp) &&
+ -	    (time_after(jiffies, rcu_state.gp_start + jtsq * 2) ||
+ -	     time_after(jiffies, rcu_state.jiffies_resched))) {
+ +	    (time_after(jiffies, rdp->rsp->gp_start + jtsq) ||
+ +	     time_after(jiffies, rdp->rsp->jiffies_resched))) {
+  		WRITE_ONCE(*rnhqp, true);
+  		/* Store rcu_need_heavy_qs before rcu_urgent_qs. */
+  		smp_store_release(ruqp, true);
+@@@ -1903,9 -1892,74 +1946,77 @@@ static void rcu_gp_fqs(struct rcu_stat
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Loop doing repeated quiescent-state forcing until the grace period ends.
++  */
++ static void rcu_gp_fqs_loop(void)
++ {
++ 	bool first_gp_fqs;
++ 	int gf;
++ 	unsigned long j;
++ 	int ret;
++ 	struct rcu_node *rnp = rcu_get_root();
++ 
++ 	first_gp_fqs = true;
++ 	j = READ_ONCE(jiffies_till_first_fqs);
++ 	ret = 0;
++ 	for (;;) {
++ 		if (!ret) {
++ 			rcu_state.jiffies_force_qs = jiffies + j;
++ 			WRITE_ONCE(rcu_state.jiffies_kick_kthreads,
++ 				   jiffies + 3 * j);
++ 		}
++ 		trace_rcu_grace_period(rcu_state.name,
++ 				       READ_ONCE(rcu_state.gp_seq),
++ 				       TPS("fqswait"));
++ 		rcu_state.gp_state = RCU_GP_WAIT_FQS;
++ 		ret = swait_event_idle_timeout_exclusive(
++ 				rcu_state.gp_wq, rcu_gp_fqs_check_wake(&gf), j);
++ 		rcu_state.gp_state = RCU_GP_DOING_FQS;
++ 		/* Locking provides needed memory barriers. */
++ 		/* If grace period done, leave loop. */
++ 		if (!READ_ONCE(rnp->qsmask) &&
++ 		    !rcu_preempt_blocked_readers_cgp(rnp))
++ 			break;
++ 		/* If time for quiescent-state forcing, do it. */
++ 		if (ULONG_CMP_GE(jiffies, rcu_state.jiffies_force_qs) ||
++ 		    (gf & RCU_GP_FLAG_FQS)) {
++ 			trace_rcu_grace_period(rcu_state.name,
++ 					       READ_ONCE(rcu_state.gp_seq),
++ 					       TPS("fqsstart"));
++ 			rcu_gp_fqs(first_gp_fqs);
++ 			first_gp_fqs = false;
++ 			trace_rcu_grace_period(rcu_state.name,
++ 					       READ_ONCE(rcu_state.gp_seq),
++ 					       TPS("fqsend"));
++ 			cond_resched_tasks_rcu_qs();
++ 			WRITE_ONCE(rcu_state.gp_activity, jiffies);
++ 			ret = 0; /* Force full wait till next FQS. */
++ 			j = READ_ONCE(jiffies_till_next_fqs);
++ 		} else {
++ 			/* Deal with stray signal. */
++ 			cond_resched_tasks_rcu_qs();
++ 			WRITE_ONCE(rcu_state.gp_activity, jiffies);
++ 			WARN_ON(signal_pending(current));
++ 			trace_rcu_grace_period(rcu_state.name,
++ 					       READ_ONCE(rcu_state.gp_seq),
++ 					       TPS("fqswaitsig"));
++ 			ret = 1; /* Keep old FQS timing. */
++ 			j = jiffies;
++ 			if (time_after(jiffies, rcu_state.jiffies_force_qs))
++ 				j = 1;
++ 			else
++ 				j = rcu_state.jiffies_force_qs - j;
++ 		}
++ 	}
++ }
++ 
++ /*
+++>>>>>>> c06aed0e3100 (rcu: Compute jiffies_till_sched_qs from other kernel parameters)
+   * Clean up after the old grace period.
+   */
+ -static void rcu_gp_cleanup(void)
+ +static void rcu_gp_cleanup(struct rcu_state *rsp)
+  {
+  	unsigned long gp_duration;
+  	bool needgp = false;
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 8059a56ef18f..8403e0ca2cc8 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -3514,7 +3514,14 @@
+ 			Set required age in jiffies for a
+ 			given grace period before RCU starts
+ 			soliciting quiescent-state help from
+-			rcu_note_context_switch().
++			rcu_note_context_switch().  If not specified, the
++			kernel will calculate a value based on the most
++			recent settings of rcutree.jiffies_till_first_fqs
++			and rcutree.jiffies_till_next_fqs.
++			This calculated value may be viewed in
++			rcutree.jiffies_to_sched_qs.  Any attempt to
++			set rcutree.jiffies_to_sched_qs will be
++			cheerfully overwritten.
+ 
+ 	rcutree.jiffies_till_first_fqs= [KNL]
+ 			Set delay from grace-period initialization to
+* Unmerged path kernel/rcu/tree.c
+diff --git a/kernel/rcu/tree_plugin.h b/kernel/rcu/tree_plugin.h
+index 05c430d4a698..06df8a1d3461 100644
+--- a/kernel/rcu/tree_plugin.h
++++ b/kernel/rcu/tree_plugin.h
+@@ -105,6 +105,8 @@ static void __init rcu_bootup_announce_oddness(void)
+ 		pr_info("\tBoot-time adjustment of first FQS scan delay to %ld jiffies.\n", jiffies_till_first_fqs);
+ 	if (jiffies_till_next_fqs != ULONG_MAX)
+ 		pr_info("\tBoot-time adjustment of subsequent FQS scan delay to %ld jiffies.\n", jiffies_till_next_fqs);
++	if (jiffies_till_sched_qs != ULONG_MAX)
++		pr_info("\tBoot-time adjustment of scheduler-enlistment delay to %ld jiffies.\n", jiffies_till_sched_qs);
+ 	if (rcu_kick_kthreads)
+ 		pr_info("\tKick kthreads if too-long grace period.\n");
+ 	if (IS_ENABLED(CONFIG_DEBUG_OBJECTS_RCU_HEAD))
