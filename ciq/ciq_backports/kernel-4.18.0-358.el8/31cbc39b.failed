@@ -1,0 +1,131 @@
+net: bridge: add option to allow activity notifications for any fdb entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+commit 31cbc39b6344916c20452e43a9171009214c409c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/31cbc39b.failed
+
+This patch adds the ability to notify about activity of any entries
+(static, permanent or ext_learn). EVPN multihoming peers need it to
+properly and efficiently handle mac sync (peer active/locally active).
+We add a new NFEA_ACTIVITY_NOTIFY attribute which is used to dump the
+current activity state and to control if static entries should be monitored
+at all. We use 2 bits - one to activate fdb entry tracking (disabled by
+default) and the second to denote that an entry is inactive. We need
+the second bit in order to avoid multiple notifications of inactivity.
+Obviously this makes no difference for dynamic entries since at the time
+of inactivity they get deleted, while the tracked non-dynamic entries get
+the inactive bit set and get a notification.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@cumulusnetworks.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 31cbc39b6344916c20452e43a9171009214c409c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/neighbour.h
+#	net/bridge/br_fdb.c
+diff --cc include/uapi/linux/neighbour.h
+index cd144e3099a3,21e569297355..000000000000
+--- a/include/uapi/linux/neighbour.h
++++ b/include/uapi/linux/neighbour.h
+@@@ -171,4 -173,26 +171,29 @@@ enum 
+  };
+  #define NDTA_MAX (__NDTA_MAX - 1)
+  
+++<<<<<<< HEAD
+++=======
++  /* FDB activity notification bits used in NFEA_ACTIVITY_NOTIFY:
++   * - FDB_NOTIFY_BIT - notify on activity/expire for any entry
++   * - FDB_NOTIFY_INACTIVE_BIT - mark as inactive to avoid multiple notifications
++   */
++ enum {
++ 	FDB_NOTIFY_BIT		= (1 << 0),
++ 	FDB_NOTIFY_INACTIVE_BIT	= (1 << 1)
++ };
++ 
++ /* embedded into NDA_FDB_EXT_ATTRS:
++  * [NDA_FDB_EXT_ATTRS] = {
++  *     [NFEA_ACTIVITY_NOTIFY]
++  *     ...
++  * }
++  */
++ enum {
++ 	NFEA_UNSPEC,
++ 	NFEA_ACTIVITY_NOTIFY,
++ 	__NFEA_MAX
++ };
++ #define NFEA_MAX (__NFEA_MAX - 1)
++ 
+++>>>>>>> 31cbc39b6344 (net: bridge: add option to allow activity notifications for any fdb entries)
+  #endif
+diff --cc net/bridge/br_fdb.c
+index d2321417063c,642deb57c064..000000000000
+--- a/net/bridge/br_fdb.c
++++ b/net/bridge/br_fdb.c
+@@@ -563,11 -565,17 +572,17 @@@ int br_fdb_insert(struct net_bridge *br
+  	return ret;
+  }
+  
++ /* returns true if the fdb was modified */
++ static bool __fdb_mark_active(struct net_bridge_fdb_entry *fdb)
++ {
++ 	return !!(test_bit(BR_FDB_NOTIFY_INACTIVE, &fdb->flags) &&
++ 		  test_and_clear_bit(BR_FDB_NOTIFY_INACTIVE, &fdb->flags));
++ }
++ 
+  void br_fdb_update(struct net_bridge *br, struct net_bridge_port *source,
+ -		   const unsigned char *addr, u16 vid, unsigned long flags)
+ +		   const unsigned char *addr, u16 vid, bool added_by_user)
+  {
+  	struct net_bridge_fdb_entry *fdb;
+- 	bool fdb_modified = false;
+  
+  	/* some users want to always flood. */
+  	if (hold_time(br) == 0)
+@@@ -599,12 -608,11 +620,17 @@@
+  					clear_bit(BR_FDB_ADDED_BY_EXT_LEARN,
+  						  &fdb->flags);
+  			}
+++<<<<<<< HEAD
+ +			if (now != fdb->updated)
+ +				fdb->updated = now;
+ +			if (unlikely(added_by_user))
+++=======
++ 
++ 			if (unlikely(test_bit(BR_FDB_ADDED_BY_USER, &flags)))
+++>>>>>>> 31cbc39b6344 (net: bridge: add option to allow activity notifications for any fdb entries)
+  				set_bit(BR_FDB_ADDED_BY_USER, &fdb->flags);
+  			if (unlikely(fdb_modified)) {
+ -				trace_br_fdb_update(br, source, addr, vid, flags);
+ +				trace_br_fdb_update(br, source, addr, vid, added_by_user);
+  				fdb_notify(br, fdb, RTM_NEWNEIGH, true);
+  			}
+  		}
+* Unmerged path include/uapi/linux/neighbour.h
+* Unmerged path net/bridge/br_fdb.c
+diff --git a/net/bridge/br_private.h b/net/bridge/br_private.h
+index 9d5819b0e232..b01bc3effdcc 100644
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@ -52,6 +52,8 @@ enum {
+ /* Path to usermode spanning tree program */
+ #define BR_STP_PROG	"/sbin/bridge-stp"
+ 
++#define BR_FDB_NOTIFY_SETTABLE_BITS (FDB_NOTIFY_BIT | FDB_NOTIFY_INACTIVE_BIT)
++
+ typedef struct bridge_id bridge_id;
+ typedef struct mac_addr mac_addr;
+ typedef __u16 port_id;
+@@ -188,6 +190,8 @@ enum {
+ 	BR_FDB_ADDED_BY_USER,
+ 	BR_FDB_ADDED_BY_EXT_LEARN,
+ 	BR_FDB_OFFLOADED,
++	BR_FDB_NOTIFY,
++	BR_FDB_NOTIFY_INACTIVE
+ };
+ 
+ struct net_bridge_fdb_key {
