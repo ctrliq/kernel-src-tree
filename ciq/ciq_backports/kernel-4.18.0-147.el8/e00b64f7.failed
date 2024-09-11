@@ -1,0 +1,1529 @@
+RDMA: Cleanup undesired pd->uobject usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+commit e00b64f7c54c4cbd88143bbd43e7c3d61a090e5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/e00b64f7.failed
+
+Drivers should be using udata to determine if a method is invoked from
+user space or kernel space. A pd does not necessarily say a different
+objects is kernel or user.
+
+Transforming the tests to use udata eliminates a large number of uobject
+references from the drivers.
+
+	Signed-off-by: Shamir Rabinovitch <shamir.rabinovitch@oracle.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e00b64f7c54c4cbd88143bbd43e7c3d61a090e5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/qp.c
+#	drivers/infiniband/hw/hns/hns_roce_qp.c
+#	drivers/infiniband/hw/hns/hns_roce_srq.c
+#	drivers/infiniband/hw/mlx5/qp.c
+#	drivers/infiniband/hw/qedr/verbs.c
+diff --cc drivers/infiniband/hw/cxgb4/qp.c
+index 6036bd5d7ecb,981ff5cfb5d1..000000000000
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@@ -2258,3 -2490,357 +2258,360 @@@ int c4iw_ib_query_qp(struct ib_qp *ibqp
+  	init_attr->sq_sig_type = qhp->sq_sig_all ? IB_SIGNAL_ALL_WR : 0;
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static void free_srq_queue(struct c4iw_srq *srq, struct c4iw_dev_ucontext *uctx,
++ 			   struct c4iw_wr_wait *wr_waitp)
++ {
++ 	struct c4iw_rdev *rdev = &srq->rhp->rdev;
++ 	struct sk_buff *skb = srq->destroy_skb;
++ 	struct t4_srq *wq = &srq->wq;
++ 	struct fw_ri_res_wr *res_wr;
++ 	struct fw_ri_res *res;
++ 	int wr_len;
++ 
++ 	wr_len = sizeof(*res_wr) + sizeof(*res);
++ 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
++ 
++ 	res_wr = (struct fw_ri_res_wr *)__skb_put(skb, wr_len);
++ 	memset(res_wr, 0, wr_len);
++ 	res_wr->op_nres = cpu_to_be32(FW_WR_OP_V(FW_RI_RES_WR) |
++ 			FW_RI_RES_WR_NRES_V(1) |
++ 			FW_WR_COMPL_F);
++ 	res_wr->len16_pkd = cpu_to_be32(DIV_ROUND_UP(wr_len, 16));
++ 	res_wr->cookie = (uintptr_t)wr_waitp;
++ 	res = res_wr->res;
++ 	res->u.srq.restype = FW_RI_RES_TYPE_SRQ;
++ 	res->u.srq.op = FW_RI_RES_OP_RESET;
++ 	res->u.srq.srqid = cpu_to_be32(srq->idx);
++ 	res->u.srq.eqid = cpu_to_be32(wq->qid);
++ 
++ 	c4iw_init_wr_wait(wr_waitp);
++ 	c4iw_ref_send_wait(rdev, skb, wr_waitp, 0, 0, __func__);
++ 
++ 	dma_free_coherent(&rdev->lldi.pdev->dev,
++ 			  wq->memsize, wq->queue,
++ 			dma_unmap_addr(wq, mapping));
++ 	c4iw_rqtpool_free(rdev, wq->rqt_hwaddr, wq->rqt_size);
++ 	kfree(wq->sw_rq);
++ 	c4iw_put_qpid(rdev, wq->qid, uctx);
++ }
++ 
++ static int alloc_srq_queue(struct c4iw_srq *srq, struct c4iw_dev_ucontext *uctx,
++ 			   struct c4iw_wr_wait *wr_waitp)
++ {
++ 	struct c4iw_rdev *rdev = &srq->rhp->rdev;
++ 	int user = (uctx != &rdev->uctx);
++ 	struct t4_srq *wq = &srq->wq;
++ 	struct fw_ri_res_wr *res_wr;
++ 	struct fw_ri_res *res;
++ 	struct sk_buff *skb;
++ 	int wr_len;
++ 	int eqsize;
++ 	int ret = -ENOMEM;
++ 
++ 	wq->qid = c4iw_get_qpid(rdev, uctx);
++ 	if (!wq->qid)
++ 		goto err;
++ 
++ 	if (!user) {
++ 		wq->sw_rq = kcalloc(wq->size, sizeof(*wq->sw_rq),
++ 				    GFP_KERNEL);
++ 		if (!wq->sw_rq)
++ 			goto err_put_qpid;
++ 		wq->pending_wrs = kcalloc(srq->wq.size,
++ 					  sizeof(*srq->wq.pending_wrs),
++ 					  GFP_KERNEL);
++ 		if (!wq->pending_wrs)
++ 			goto err_free_sw_rq;
++ 	}
++ 
++ 	wq->rqt_size = wq->size;
++ 	wq->rqt_hwaddr = c4iw_rqtpool_alloc(rdev, wq->rqt_size);
++ 	if (!wq->rqt_hwaddr)
++ 		goto err_free_pending_wrs;
++ 	wq->rqt_abs_idx = (wq->rqt_hwaddr - rdev->lldi.vr->rq.start) >>
++ 		T4_RQT_ENTRY_SHIFT;
++ 
++ 	wq->queue = dma_zalloc_coherent(&rdev->lldi.pdev->dev,
++ 				       wq->memsize, &wq->dma_addr,
++ 			GFP_KERNEL);
++ 	if (!wq->queue)
++ 		goto err_free_rqtpool;
++ 
++ 	dma_unmap_addr_set(wq, mapping, wq->dma_addr);
++ 
++ 	wq->bar2_va = c4iw_bar2_addrs(rdev, wq->qid, CXGB4_BAR2_QTYPE_EGRESS,
++ 				      &wq->bar2_qid,
++ 			user ? &wq->bar2_pa : NULL);
++ 
++ 	/*
++ 	 * User mode must have bar2 access.
++ 	 */
++ 
++ 	if (user && !wq->bar2_va) {
++ 		pr_warn(MOD "%s: srqid %u not in BAR2 range.\n",
++ 			pci_name(rdev->lldi.pdev), wq->qid);
++ 		ret = -EINVAL;
++ 		goto err_free_queue;
++ 	}
++ 
++ 	/* build fw_ri_res_wr */
++ 	wr_len = sizeof(*res_wr) + sizeof(*res);
++ 
++ 	skb = alloc_skb(wr_len, GFP_KERNEL | __GFP_NOFAIL);
++ 	if (!skb)
++ 		goto err_free_queue;
++ 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
++ 
++ 	res_wr = (struct fw_ri_res_wr *)__skb_put(skb, wr_len);
++ 	memset(res_wr, 0, wr_len);
++ 	res_wr->op_nres = cpu_to_be32(FW_WR_OP_V(FW_RI_RES_WR) |
++ 			FW_RI_RES_WR_NRES_V(1) |
++ 			FW_WR_COMPL_F);
++ 	res_wr->len16_pkd = cpu_to_be32(DIV_ROUND_UP(wr_len, 16));
++ 	res_wr->cookie = (uintptr_t)wr_waitp;
++ 	res = res_wr->res;
++ 	res->u.srq.restype = FW_RI_RES_TYPE_SRQ;
++ 	res->u.srq.op = FW_RI_RES_OP_WRITE;
++ 
++ 	/*
++ 	 * eqsize is the number of 64B entries plus the status page size.
++ 	 */
++ 	eqsize = wq->size * T4_RQ_NUM_SLOTS +
++ 		rdev->hw_queue.t4_eq_status_entries;
++ 	res->u.srq.eqid = cpu_to_be32(wq->qid);
++ 	res->u.srq.fetchszm_to_iqid =
++ 						/* no host cidx updates */
++ 		cpu_to_be32(FW_RI_RES_WR_HOSTFCMODE_V(0) |
++ 		FW_RI_RES_WR_CPRIO_V(0) |       /* don't keep in chip cache */
++ 		FW_RI_RES_WR_PCIECHN_V(0) |     /* set by uP at ri_init time */
++ 		FW_RI_RES_WR_FETCHRO_V(0));     /* relaxed_ordering */
++ 	res->u.srq.dcaen_to_eqsize =
++ 		cpu_to_be32(FW_RI_RES_WR_DCAEN_V(0) |
++ 		FW_RI_RES_WR_DCACPU_V(0) |
++ 		FW_RI_RES_WR_FBMIN_V(2) |
++ 		FW_RI_RES_WR_FBMAX_V(3) |
++ 		FW_RI_RES_WR_CIDXFTHRESHO_V(0) |
++ 		FW_RI_RES_WR_CIDXFTHRESH_V(0) |
++ 		FW_RI_RES_WR_EQSIZE_V(eqsize));
++ 	res->u.srq.eqaddr = cpu_to_be64(wq->dma_addr);
++ 	res->u.srq.srqid = cpu_to_be32(srq->idx);
++ 	res->u.srq.pdid = cpu_to_be32(srq->pdid);
++ 	res->u.srq.hwsrqsize = cpu_to_be32(wq->rqt_size);
++ 	res->u.srq.hwsrqaddr = cpu_to_be32(wq->rqt_hwaddr -
++ 			rdev->lldi.vr->rq.start);
++ 
++ 	c4iw_init_wr_wait(wr_waitp);
++ 
++ 	ret = c4iw_ref_send_wait(rdev, skb, wr_waitp, 0, wq->qid, __func__);
++ 	if (ret)
++ 		goto err_free_queue;
++ 
++ 	pr_debug("%s srq %u eqid %u pdid %u queue va %p pa 0x%llx\n"
++ 			" bar2_addr %p rqt addr 0x%x size %d\n",
++ 			__func__, srq->idx, wq->qid, srq->pdid, wq->queue,
++ 			(u64)virt_to_phys(wq->queue), wq->bar2_va,
++ 			wq->rqt_hwaddr, wq->rqt_size);
++ 
++ 	return 0;
++ err_free_queue:
++ 	dma_free_coherent(&rdev->lldi.pdev->dev,
++ 			  wq->memsize, wq->queue,
++ 			dma_unmap_addr(wq, mapping));
++ err_free_rqtpool:
++ 	c4iw_rqtpool_free(rdev, wq->rqt_hwaddr, wq->rqt_size);
++ err_free_pending_wrs:
++ 	if (!user)
++ 		kfree(wq->pending_wrs);
++ err_free_sw_rq:
++ 	if (!user)
++ 		kfree(wq->sw_rq);
++ err_put_qpid:
++ 	c4iw_put_qpid(rdev, wq->qid, uctx);
++ err:
++ 	return ret;
++ }
++ 
++ void c4iw_copy_wr_to_srq(struct t4_srq *srq, union t4_recv_wr *wqe, u8 len16)
++ {
++ 	u64 *src, *dst;
++ 
++ 	src = (u64 *)wqe;
++ 	dst = (u64 *)((u8 *)srq->queue + srq->wq_pidx * T4_EQ_ENTRY_SIZE);
++ 	while (len16) {
++ 		*dst++ = *src++;
++ 		if (dst >= (u64 *)&srq->queue[srq->size])
++ 			dst = (u64 *)srq->queue;
++ 		*dst++ = *src++;
++ 		if (dst >= (u64 *)&srq->queue[srq->size])
++ 			dst = (u64 *)srq->queue;
++ 		len16--;
++ 	}
++ }
++ 
++ struct ib_srq *c4iw_create_srq(struct ib_pd *pd, struct ib_srq_init_attr *attrs,
++ 			       struct ib_udata *udata)
++ {
++ 	struct c4iw_dev *rhp;
++ 	struct c4iw_srq *srq;
++ 	struct c4iw_pd *php;
++ 	struct c4iw_create_srq_resp uresp;
++ 	struct c4iw_ucontext *ucontext;
++ 	struct c4iw_mm_entry *srq_key_mm, *srq_db_key_mm;
++ 	int rqsize;
++ 	int ret;
++ 	int wr_len;
++ 
++ 	pr_debug("%s ib_pd %p\n", __func__, pd);
++ 
++ 	php = to_c4iw_pd(pd);
++ 	rhp = php->rhp;
++ 
++ 	if (!rhp->rdev.lldi.vr->srq.size)
++ 		return ERR_PTR(-EINVAL);
++ 	if (attrs->attr.max_wr > rhp->rdev.hw_queue.t4_max_rq_size)
++ 		return ERR_PTR(-E2BIG);
++ 	if (attrs->attr.max_sge > T4_MAX_RECV_SGE)
++ 		return ERR_PTR(-E2BIG);
++ 
++ 	/*
++ 	 * SRQ RQT and RQ must be a power of 2 and at least 16 deep.
++ 	 */
++ 	rqsize = attrs->attr.max_wr + 1;
++ 	rqsize = roundup_pow_of_two(max_t(u16, rqsize, 16));
++ 
++ 	ucontext = udata ? to_c4iw_ucontext(pd->uobject->context) : NULL;
++ 
++ 	srq = kzalloc(sizeof(*srq), GFP_KERNEL);
++ 	if (!srq)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	srq->wr_waitp = c4iw_alloc_wr_wait(GFP_KERNEL);
++ 	if (!srq->wr_waitp) {
++ 		ret = -ENOMEM;
++ 		goto err_free_srq;
++ 	}
++ 
++ 	srq->idx = c4iw_alloc_srq_idx(&rhp->rdev);
++ 	if (srq->idx < 0) {
++ 		ret = -ENOMEM;
++ 		goto err_free_wr_wait;
++ 	}
++ 
++ 	wr_len = sizeof(struct fw_ri_res_wr) + sizeof(struct fw_ri_res);
++ 	srq->destroy_skb = alloc_skb(wr_len, GFP_KERNEL);
++ 	if (!srq->destroy_skb) {
++ 		ret = -ENOMEM;
++ 		goto err_free_srq_idx;
++ 	}
++ 
++ 	srq->rhp = rhp;
++ 	srq->pdid = php->pdid;
++ 
++ 	srq->wq.size = rqsize;
++ 	srq->wq.memsize =
++ 		(rqsize + rhp->rdev.hw_queue.t4_eq_status_entries) *
++ 		sizeof(*srq->wq.queue);
++ 	if (ucontext)
++ 		srq->wq.memsize = roundup(srq->wq.memsize, PAGE_SIZE);
++ 
++ 	ret = alloc_srq_queue(srq, ucontext ? &ucontext->uctx :
++ 			&rhp->rdev.uctx, srq->wr_waitp);
++ 	if (ret)
++ 		goto err_free_skb;
++ 	attrs->attr.max_wr = rqsize - 1;
++ 
++ 	if (CHELSIO_CHIP_VERSION(rhp->rdev.lldi.adapter_type) > CHELSIO_T6)
++ 		srq->flags = T4_SRQ_LIMIT_SUPPORT;
++ 
++ 	ret = insert_handle(rhp, &rhp->qpidr, srq, srq->wq.qid);
++ 	if (ret)
++ 		goto err_free_queue;
++ 
++ 	if (udata) {
++ 		srq_key_mm = kmalloc(sizeof(*srq_key_mm), GFP_KERNEL);
++ 		if (!srq_key_mm) {
++ 			ret = -ENOMEM;
++ 			goto err_remove_handle;
++ 		}
++ 		srq_db_key_mm = kmalloc(sizeof(*srq_db_key_mm), GFP_KERNEL);
++ 		if (!srq_db_key_mm) {
++ 			ret = -ENOMEM;
++ 			goto err_free_srq_key_mm;
++ 		}
++ 		memset(&uresp, 0, sizeof(uresp));
++ 		uresp.flags = srq->flags;
++ 		uresp.qid_mask = rhp->rdev.qpmask;
++ 		uresp.srqid = srq->wq.qid;
++ 		uresp.srq_size = srq->wq.size;
++ 		uresp.srq_memsize = srq->wq.memsize;
++ 		uresp.rqt_abs_idx = srq->wq.rqt_abs_idx;
++ 		spin_lock(&ucontext->mmap_lock);
++ 		uresp.srq_key = ucontext->key;
++ 		ucontext->key += PAGE_SIZE;
++ 		uresp.srq_db_gts_key = ucontext->key;
++ 		ucontext->key += PAGE_SIZE;
++ 		spin_unlock(&ucontext->mmap_lock);
++ 		ret = ib_copy_to_udata(udata, &uresp, sizeof(uresp));
++ 		if (ret)
++ 			goto err_free_srq_db_key_mm;
++ 		srq_key_mm->key = uresp.srq_key;
++ 		srq_key_mm->addr = virt_to_phys(srq->wq.queue);
++ 		srq_key_mm->len = PAGE_ALIGN(srq->wq.memsize);
++ 		insert_mmap(ucontext, srq_key_mm);
++ 		srq_db_key_mm->key = uresp.srq_db_gts_key;
++ 		srq_db_key_mm->addr = (u64)(unsigned long)srq->wq.bar2_pa;
++ 		srq_db_key_mm->len = PAGE_SIZE;
++ 		insert_mmap(ucontext, srq_db_key_mm);
++ 	}
++ 
++ 	pr_debug("%s srq qid %u idx %u size %u memsize %lu num_entries %u\n",
++ 		 __func__, srq->wq.qid, srq->idx, srq->wq.size,
++ 			(unsigned long)srq->wq.memsize, attrs->attr.max_wr);
++ 
++ 	spin_lock_init(&srq->lock);
++ 	return &srq->ibsrq;
++ err_free_srq_db_key_mm:
++ 	kfree(srq_db_key_mm);
++ err_free_srq_key_mm:
++ 	kfree(srq_key_mm);
++ err_remove_handle:
++ 	remove_handle(rhp, &rhp->qpidr, srq->wq.qid);
++ err_free_queue:
++ 	free_srq_queue(srq, ucontext ? &ucontext->uctx : &rhp->rdev.uctx,
++ 		       srq->wr_waitp);
++ err_free_skb:
++ 	kfree_skb(srq->destroy_skb);
++ err_free_srq_idx:
++ 	c4iw_free_srq_idx(&rhp->rdev, srq->idx);
++ err_free_wr_wait:
++ 	c4iw_put_wr_wait(srq->wr_waitp);
++ err_free_srq:
++ 	kfree(srq);
++ 	return ERR_PTR(ret);
++ }
++ 
++ int c4iw_destroy_srq(struct ib_srq *ibsrq)
++ {
++ 	struct c4iw_dev *rhp;
++ 	struct c4iw_srq *srq;
++ 	struct c4iw_ucontext *ucontext;
++ 
++ 	srq = to_c4iw_srq(ibsrq);
++ 	rhp = srq->rhp;
++ 
++ 	pr_debug("%s id %d\n", __func__, srq->wq.qid);
++ 
++ 	remove_handle(rhp, &rhp->qpidr, srq->wq.qid);
++ 	ucontext = ibsrq->uobject ?
++ 		to_c4iw_ucontext(ibsrq->uobject->context) : NULL;
++ 	free_srq_queue(srq, ucontext ? &ucontext->uctx : &rhp->rdev.uctx,
++ 		       srq->wr_waitp);
++ 	c4iw_free_srq_idx(&rhp->rdev, srq->idx);
++ 	c4iw_put_wr_wait(srq->wr_waitp);
++ 	kfree(srq);
++ 	return 0;
++ }
+++>>>>>>> e00b64f7c54c (RDMA: Cleanup undesired pd->uobject usage)
+diff --cc drivers/infiniband/hw/hns/hns_roce_qp.c
+index 2805ab2ab2c5,54031c5b53fa..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@@ -280,7 -280,7 +280,11 @@@ void hns_roce_release_range_qp(struct h
+  EXPORT_SYMBOL_GPL(hns_roce_release_range_qp);
+  
+  static int hns_roce_set_rq_size(struct hns_roce_dev *hr_dev,
+++<<<<<<< HEAD
+ +				struct ib_qp_cap *cap, int is_user, int has_srq,
+++=======
++ 				struct ib_qp_cap *cap, bool is_user, int has_rq,
+++>>>>>>> e00b64f7c54c (RDMA: Cleanup undesired pd->uobject usage)
+  				struct hns_roce_qp *hr_qp)
+  {
+  	struct device *dev = hr_dev->dev;
+@@@ -556,8 -560,8 +560,13 @@@ static int hns_roce_create_qp_common(st
+  	else
+  		hr_qp->sq_signal_bits = cpu_to_le32(IB_SIGNAL_REQ_WR);
+  
+++<<<<<<< HEAD
+ +	ret = hns_roce_set_rq_size(hr_dev, &init_attr->cap, !!ib_pd->uobject,
+ +				   !!init_attr->srq, hr_qp);
+++=======
++ 	ret = hns_roce_set_rq_size(hr_dev, &init_attr->cap, udata,
++ 				   hns_roce_qp_has_rq(init_attr), hr_qp);
+++>>>>>>> e00b64f7c54c (RDMA: Cleanup undesired pd->uobject usage)
+  	if (ret) {
+  		dev_err(dev, "hns_roce_set_rq_size failed\n");
+  		goto err_out;
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index d5e714bb62f2,b26ddb147643..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -1828,25 -2059,13 +1828,32 @@@ static int create_qp_common(struct mlx5
+  		MLX5_SET(qpc, qpc, cd_slave_send, 1);
+  	if (qp->flags & MLX5_IB_QP_MANAGED_RECV)
+  		MLX5_SET(qpc, qpc, cd_slave_receive, 1);
+ -	if (qp->flags & MLX5_IB_QP_PACKET_BASED_CREDIT)
+ -		MLX5_SET(qpc, qpc, req_e2e_credit_mode, 1);
+ +
+  	if (qp->scat_cqe && is_connected(init_attr->qp_type)) {
+++<<<<<<< HEAD
+ +		int rcqe_sz;
+ +		int scqe_sz;
+ +
+ +		rcqe_sz = mlx5_ib_get_cqe_size(dev, init_attr->recv_cq);
+ +		scqe_sz = mlx5_ib_get_cqe_size(dev, init_attr->send_cq);
+ +
+ +		if (rcqe_sz == 128)
+ +			MLX5_SET(qpc, qpc, cs_res, MLX5_RES_SCAT_DATA64_CQE);
+ +		else
+ +			MLX5_SET(qpc, qpc, cs_res, MLX5_RES_SCAT_DATA32_CQE);
+ +
+ +		if (init_attr->sq_sig_type == IB_SIGNAL_ALL_WR) {
+ +			if (scqe_sz == 128)
+ +				MLX5_SET(qpc, qpc, cs_req, MLX5_REQ_SCAT_DATA64_CQE);
+ +			else
+ +				MLX5_SET(qpc, qpc, cs_req, MLX5_REQ_SCAT_DATA32_CQE);
+ +		}
+++=======
++ 		configure_responder_scat_cqe(init_attr, qpc);
++ 		configure_requester_scat_cqe(dev, init_attr,
++ 					     udata ? &ucmd : NULL,
++ 					     qpc);
+++>>>>>>> e00b64f7c54c (RDMA: Cleanup undesired pd->uobject usage)
+  	}
+  
+  	if (qp->rq.wqe_cnt) {
+diff --cc drivers/infiniband/hw/qedr/verbs.c
+index d09c648ee89a,8056121e9f69..000000000000
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@@ -1257,9 -1295,301 +1258,307 @@@ static void qedr_set_roce_db_info(struc
+  	qp->sq.db = dev->db_addr +
+  		    DB_ADDR_SHIFT(DQ_PWM_OFFSET_XCM_RDMA_SQ_PROD);
+  	qp->sq.db_data.data.icid = qp->icid + 1;
+++<<<<<<< HEAD
+ +	qp->rq.db = dev->db_addr +
+ +		    DB_ADDR_SHIFT(DQ_PWM_OFFSET_TCM_ROCE_RQ_PROD);
+ +	qp->rq.db_data.data.icid = qp->icid;
+++=======
++ 	if (!qp->srq) {
++ 		qp->rq.db = dev->db_addr +
++ 			    DB_ADDR_SHIFT(DQ_PWM_OFFSET_TCM_ROCE_RQ_PROD);
++ 		qp->rq.db_data.data.icid = qp->icid;
++ 	}
++ }
++ 
++ static int qedr_check_srq_params(struct ib_pd *ibpd, struct qedr_dev *dev,
++ 				 struct ib_srq_init_attr *attrs,
++ 				 struct ib_udata *udata)
++ {
++ 	struct qedr_device_attr *qattr = &dev->attr;
++ 
++ 	if (attrs->attr.max_wr > qattr->max_srq_wr) {
++ 		DP_ERR(dev,
++ 		       "create srq: unsupported srq_wr=0x%x requested (max_srq_wr=0x%x)\n",
++ 		       attrs->attr.max_wr, qattr->max_srq_wr);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (attrs->attr.max_sge > qattr->max_sge) {
++ 		DP_ERR(dev,
++ 		       "create srq: unsupported sge=0x%x requested (max_srq_sge=0x%x)\n",
++ 		       attrs->attr.max_sge, qattr->max_sge);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void qedr_free_srq_user_params(struct qedr_srq *srq)
++ {
++ 	qedr_free_pbl(srq->dev, &srq->usrq.pbl_info, srq->usrq.pbl_tbl);
++ 	ib_umem_release(srq->usrq.umem);
++ 	ib_umem_release(srq->prod_umem);
++ }
++ 
++ static void qedr_free_srq_kernel_params(struct qedr_srq *srq)
++ {
++ 	struct qedr_srq_hwq_info *hw_srq = &srq->hw_srq;
++ 	struct qedr_dev *dev = srq->dev;
++ 
++ 	dev->ops->common->chain_free(dev->cdev, &hw_srq->pbl);
++ 
++ 	dma_free_coherent(&dev->pdev->dev, sizeof(struct rdma_srq_producers),
++ 			  hw_srq->virt_prod_pair_addr,
++ 			  hw_srq->phy_prod_pair_addr);
++ }
++ 
++ static int qedr_init_srq_user_params(struct ib_ucontext *ib_ctx,
++ 				     struct qedr_srq *srq,
++ 				     struct qedr_create_srq_ureq *ureq,
++ 				     int access, int dmasync)
++ {
++ 	struct scatterlist *sg;
++ 	int rc;
++ 
++ 	rc = qedr_init_user_queue(ib_ctx, srq->dev, &srq->usrq, ureq->srq_addr,
++ 				  ureq->srq_len, access, dmasync, 1);
++ 	if (rc)
++ 		return rc;
++ 
++ 	srq->prod_umem = ib_umem_get(ib_ctx, ureq->prod_pair_addr,
++ 				     sizeof(struct rdma_srq_producers),
++ 				     access, dmasync);
++ 	if (IS_ERR(srq->prod_umem)) {
++ 		qedr_free_pbl(srq->dev, &srq->usrq.pbl_info, srq->usrq.pbl_tbl);
++ 		ib_umem_release(srq->usrq.umem);
++ 		DP_ERR(srq->dev,
++ 		       "create srq: failed ib_umem_get for producer, got %ld\n",
++ 		       PTR_ERR(srq->prod_umem));
++ 		return PTR_ERR(srq->prod_umem);
++ 	}
++ 
++ 	sg = srq->prod_umem->sg_head.sgl;
++ 	srq->hw_srq.phy_prod_pair_addr = sg_dma_address(sg);
++ 
++ 	return 0;
++ }
++ 
++ static int qedr_alloc_srq_kernel_params(struct qedr_srq *srq,
++ 					struct qedr_dev *dev,
++ 					struct ib_srq_init_attr *init_attr)
++ {
++ 	struct qedr_srq_hwq_info *hw_srq = &srq->hw_srq;
++ 	dma_addr_t phy_prod_pair_addr;
++ 	u32 num_elems;
++ 	void *va;
++ 	int rc;
++ 
++ 	va = dma_alloc_coherent(&dev->pdev->dev,
++ 				sizeof(struct rdma_srq_producers),
++ 				&phy_prod_pair_addr, GFP_KERNEL);
++ 	if (!va) {
++ 		DP_ERR(dev,
++ 		       "create srq: failed to allocate dma memory for producer\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	hw_srq->phy_prod_pair_addr = phy_prod_pair_addr;
++ 	hw_srq->virt_prod_pair_addr = va;
++ 
++ 	num_elems = init_attr->attr.max_wr * RDMA_MAX_SRQ_WQE_SIZE;
++ 	rc = dev->ops->common->chain_alloc(dev->cdev,
++ 					   QED_CHAIN_USE_TO_CONSUME_PRODUCE,
++ 					   QED_CHAIN_MODE_PBL,
++ 					   QED_CHAIN_CNT_TYPE_U32,
++ 					   num_elems,
++ 					   QEDR_SRQ_WQE_ELEM_SIZE,
++ 					   &hw_srq->pbl, NULL);
++ 	if (rc)
++ 		goto err0;
++ 
++ 	hw_srq->num_elems = num_elems;
++ 
++ 	return 0;
++ 
++ err0:
++ 	dma_free_coherent(&dev->pdev->dev, sizeof(struct rdma_srq_producers),
++ 			  va, phy_prod_pair_addr);
++ 	return rc;
++ }
++ 
++ static int qedr_idr_add(struct qedr_dev *dev, struct qedr_idr *qidr,
++ 			void *ptr, u32 id);
++ static void qedr_idr_remove(struct qedr_dev *dev,
++ 			    struct qedr_idr *qidr, u32 id);
++ 
++ struct ib_srq *qedr_create_srq(struct ib_pd *ibpd,
++ 			       struct ib_srq_init_attr *init_attr,
++ 			       struct ib_udata *udata)
++ {
++ 	struct qed_rdma_destroy_srq_in_params destroy_in_params;
++ 	struct qed_rdma_create_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibpd->device);
++ 	struct qed_rdma_create_srq_out_params out_params;
++ 	struct qedr_pd *pd = get_qedr_pd(ibpd);
++ 	struct qedr_create_srq_ureq ureq = {};
++ 	u64 pbl_base_addr, phy_prod_pair_addr;
++ 	struct ib_ucontext *ib_ctx = NULL;
++ 	struct qedr_srq_hwq_info *hw_srq;
++ 	u32 page_cnt, page_size;
++ 	struct qedr_srq *srq;
++ 	int rc = 0;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_QP,
++ 		 "create SRQ called from %s (pd %p)\n",
++ 		 (udata) ? "User lib" : "kernel", pd);
++ 
++ 	rc = qedr_check_srq_params(ibpd, dev, init_attr, udata);
++ 	if (rc)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	srq = kzalloc(sizeof(*srq), GFP_KERNEL);
++ 	if (!srq)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	srq->dev = dev;
++ 	hw_srq = &srq->hw_srq;
++ 	spin_lock_init(&srq->lock);
++ 
++ 	hw_srq->max_wr = init_attr->attr.max_wr;
++ 	hw_srq->max_sges = init_attr->attr.max_sge;
++ 
++ 	if (udata && ibpd->uobject && ibpd->uobject->context) {
++ 		ib_ctx = ibpd->uobject->context;
++ 
++ 		if (ib_copy_from_udata(&ureq, udata, sizeof(ureq))) {
++ 			DP_ERR(dev,
++ 			       "create srq: problem copying data from user space\n");
++ 			goto err0;
++ 		}
++ 
++ 		rc = qedr_init_srq_user_params(ib_ctx, srq, &ureq, 0, 0);
++ 		if (rc)
++ 			goto err0;
++ 
++ 		page_cnt = srq->usrq.pbl_info.num_pbes;
++ 		pbl_base_addr = srq->usrq.pbl_tbl->pa;
++ 		phy_prod_pair_addr = hw_srq->phy_prod_pair_addr;
++ 		page_size = BIT(srq->usrq.umem->page_shift);
++ 	} else {
++ 		struct qed_chain *pbl;
++ 
++ 		rc = qedr_alloc_srq_kernel_params(srq, dev, init_attr);
++ 		if (rc)
++ 			goto err0;
++ 
++ 		pbl = &hw_srq->pbl;
++ 		page_cnt = qed_chain_get_page_cnt(pbl);
++ 		pbl_base_addr = qed_chain_get_pbl_phys(pbl);
++ 		phy_prod_pair_addr = hw_srq->phy_prod_pair_addr;
++ 		page_size = QED_CHAIN_PAGE_SIZE;
++ 	}
++ 
++ 	in_params.pd_id = pd->pd_id;
++ 	in_params.pbl_base_addr = pbl_base_addr;
++ 	in_params.prod_pair_addr = phy_prod_pair_addr;
++ 	in_params.num_pages = page_cnt;
++ 	in_params.page_size = page_size;
++ 
++ 	rc = dev->ops->rdma_create_srq(dev->rdma_ctx, &in_params, &out_params);
++ 	if (rc)
++ 		goto err1;
++ 
++ 	srq->srq_id = out_params.srq_id;
++ 
++ 	if (udata) {
++ 		rc = qedr_copy_srq_uresp(dev, srq, udata);
++ 		if (rc)
++ 			goto err2;
++ 	}
++ 
++ 	rc = qedr_idr_add(dev, &dev->srqidr, srq, srq->srq_id);
++ 	if (rc)
++ 		goto err2;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "create srq: created srq with srq_id=0x%0x\n", srq->srq_id);
++ 	return &srq->ibsrq;
++ 
++ err2:
++ 	destroy_in_params.srq_id = srq->srq_id;
++ 
++ 	dev->ops->rdma_destroy_srq(dev->rdma_ctx, &destroy_in_params);
++ err1:
++ 	if (udata)
++ 		qedr_free_srq_user_params(srq);
++ 	else
++ 		qedr_free_srq_kernel_params(srq);
++ err0:
++ 	kfree(srq);
++ 
++ 	return ERR_PTR(-EFAULT);
++ }
++ 
++ int qedr_destroy_srq(struct ib_srq *ibsrq)
++ {
++ 	struct qed_rdma_destroy_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 
++ 	qedr_idr_remove(dev, &dev->srqidr, srq->srq_id);
++ 	in_params.srq_id = srq->srq_id;
++ 	dev->ops->rdma_destroy_srq(dev->rdma_ctx, &in_params);
++ 
++ 	if (ibsrq->uobject)
++ 		qedr_free_srq_user_params(srq);
++ 	else
++ 		qedr_free_srq_kernel_params(srq);
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "destroy srq: destroyed srq with srq_id=0x%0x\n",
++ 		 srq->srq_id);
++ 	kfree(srq);
++ 
++ 	return 0;
++ }
++ 
++ int qedr_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
++ 		    enum ib_srq_attr_mask attr_mask, struct ib_udata *udata)
++ {
++ 	struct qed_rdma_modify_srq_in_params in_params = {};
++ 	struct qedr_dev *dev = get_qedr_dev(ibsrq->device);
++ 	struct qedr_srq *srq = get_qedr_srq(ibsrq);
++ 	int rc;
++ 
++ 	if (attr_mask & IB_SRQ_MAX_WR) {
++ 		DP_ERR(dev,
++ 		       "modify srq: invalid attribute mask=0x%x specified for %p\n",
++ 		       attr_mask, srq);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (attr_mask & IB_SRQ_LIMIT) {
++ 		if (attr->srq_limit >= srq->hw_srq.max_wr) {
++ 			DP_ERR(dev,
++ 			       "modify srq: invalid srq_limit=0x%x (max_srq_limit=0x%x)\n",
++ 			       attr->srq_limit, srq->hw_srq.max_wr);
++ 			return -EINVAL;
++ 		}
++ 
++ 		in_params.srq_id = srq->srq_id;
++ 		in_params.wqe_limit = attr->srq_limit;
++ 		rc = dev->ops->rdma_modify_srq(dev->rdma_ctx, &in_params);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	srq->srq_limit = attr->srq_limit;
++ 
++ 	DP_DEBUG(dev, QEDR_MSG_SRQ,
++ 		 "modify srq: modified srq with srq_id=0x%0x\n", srq->srq_id);
++ 
++ 	return 0;
+++>>>>>>> e00b64f7c54c (RDMA: Cleanup undesired pd->uobject usage)
+  }
+  
+  static inline void
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_srq.c
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index 481737721b8a..47d0c6acea0c 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -699,7 +699,7 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
+ 	ah->qplib_ah.flow_label = grh->flow_label;
+ 	ah->qplib_ah.hop_limit = grh->hop_limit;
+ 	ah->qplib_ah.sl = rdma_ah_get_sl(ah_attr);
+-	if (ib_pd->uobject &&
++	if (udata &&
+ 	    !rdma_is_multicast_addr((struct in6_addr *)
+ 				    grh->dgid.raw) &&
+ 	    !rdma_link_local_addr((struct in6_addr *)
+@@ -731,7 +731,7 @@ struct ib_ah *bnxt_re_create_ah(struct ib_pd *ib_pd,
+ 	}
+ 
+ 	/* Write AVID to shared page. */
+-	if (ib_pd->uobject) {
++	if (udata) {
+ 		struct ib_ucontext *ib_uctx = ib_pd->uobject->context;
+ 		struct bnxt_re_ucontext *uctx;
+ 		unsigned long flag;
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index 68bc2f9a532f..e3451da1f0a9 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -872,7 +872,7 @@ static struct ib_qp *iwch_create_qp(struct ib_pd *pd,
+ 	 * Kernel users need more wq space for fastreg WRs which can take
+ 	 * 2 WR fragments.
+ 	 */
+-	ucontext = pd->uobject ? to_iwch_ucontext(pd->uobject->context) : NULL;
++	ucontext = udata ? to_iwch_ucontext(pd->uobject->context) : NULL;
+ 	if (!ucontext && wqsize < (rqsize + (2 * sqsize)))
+ 		wqsize = roundup_pow_of_two(rqsize +
+ 				roundup_pow_of_two(attrs->cap.max_send_wr * 2));
+* Unmerged path drivers/infiniband/hw/cxgb4/qp.c
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+index 8215dbd86969..6c56aa9eec01 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+@@ -3922,7 +3922,7 @@ int hns_roce_v1_destroy_qp(struct ib_qp *ibqp)
+ 	struct hns_roce_qp_work *qp_work;
+ 	struct hns_roce_v1_priv *priv;
+ 	struct hns_roce_cq *send_cq, *recv_cq;
+-	int is_user = !!ibqp->pd->uobject;
++	bool is_user = ibqp->uobject;
+ 	int is_timeout = 0;
+ 	int ret;
+ 
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+index 65a63170ea0b..478c180560c1 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v2.c
+@@ -3884,7 +3884,7 @@ static int hns_roce_v2_query_qp(struct ib_qp *ibqp, struct ib_qp_attr *qp_attr,
+ 
+ static int hns_roce_v2_destroy_qp_common(struct hns_roce_dev *hr_dev,
+ 					 struct hns_roce_qp *hr_qp,
+-					 int is_user)
++					 bool is_user)
+ {
+ 	struct hns_roce_cq *send_cq, *recv_cq;
+ 	struct device *dev = hr_dev->dev;
+@@ -3960,7 +3960,7 @@ static int hns_roce_v2_destroy_qp(struct ib_qp *ibqp)
+ 	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
+ 	int ret;
+ 
+-	ret = hns_roce_v2_destroy_qp_common(hr_dev, hr_qp, !!ibqp->pd->uobject);
++	ret = hns_roce_v2_destroy_qp_common(hr_dev, hr_qp, ibqp->uobject);
+ 	if (ret) {
+ 		dev_err(hr_dev->dev, "Destroy qp failed(%d)\n", ret);
+ 		return ret;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_qp.c
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_srq.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 7de5e9f6a0a6..a51d50c55b4c 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -673,28 +673,26 @@ static struct ib_qp *i40iw_create_qp(struct ib_pd *ibpd,
+ 			goto error;
+ 		}
+ 		iwqp->ctx_info.qp_compl_ctx = req.user_compl_ctx;
+-		if (ibpd->uobject && ibpd->uobject->context) {
+-			iwqp->user_mode = 1;
+-			ucontext = to_ucontext(ibpd->uobject->context);
+-
+-			if (req.user_wqe_buffers) {
+-				struct i40iw_pbl *iwpbl;
+-
+-				spin_lock_irqsave(
+-				    &ucontext->qp_reg_mem_list_lock, flags);
+-				iwpbl = i40iw_get_pbl(
+-				    (unsigned long)req.user_wqe_buffers,
+-				    &ucontext->qp_reg_mem_list);
+-				spin_unlock_irqrestore(
+-				    &ucontext->qp_reg_mem_list_lock, flags);
+-
+-				if (!iwpbl) {
+-					err_code = -ENODATA;
+-					i40iw_pr_err("no pbl info\n");
+-					goto error;
+-				}
+-				memcpy(&iwqp->iwpbl, iwpbl, sizeof(iwqp->iwpbl));
++		iwqp->user_mode = 1;
++		ucontext = to_ucontext(ibpd->uobject->context);
++
++		if (req.user_wqe_buffers) {
++			struct i40iw_pbl *iwpbl;
++
++			spin_lock_irqsave(
++			    &ucontext->qp_reg_mem_list_lock, flags);
++			iwpbl = i40iw_get_pbl(
++			    (unsigned long)req.user_wqe_buffers,
++			    &ucontext->qp_reg_mem_list);
++			spin_unlock_irqrestore(
++			    &ucontext->qp_reg_mem_list_lock, flags);
++
++			if (!iwpbl) {
++				err_code = -ENODATA;
++				i40iw_pr_err("no pbl info\n");
++				goto error;
+ 			}
++			memcpy(&iwqp->iwpbl, iwpbl, sizeof(iwqp->iwpbl));
+ 		}
+ 		err_code = i40iw_setup_virt_qp(iwdev, iwqp, &init_info);
+ 	} else {
+@@ -768,7 +766,7 @@ static struct ib_qp *i40iw_create_qp(struct ib_pd *ibpd,
+ 	iwdev->qp_table[qp_num] = iwqp;
+ 	i40iw_add_pdusecount(iwqp->iwpd);
+ 	i40iw_add_devusecount(iwdev);
+-	if (ibpd->uobject && udata) {
++	if (udata) {
+ 		memset(&uresp, 0, sizeof(uresp));
+ 		uresp.actual_sq_size = sq_size;
+ 		uresp.actual_rq_size = rq_size;
+@@ -2092,7 +2090,8 @@ static int i40iw_dereg_mr(struct ib_mr *ib_mr)
+ 		ib_umem_release(iwmr->region);
+ 
+ 	if (iwmr->type != IW_MEMREG_TYPE_MEM) {
+-		if (ibpd->uobject) {
++		/* region is released. only test for userness. */
++		if (iwmr->region) {
+ 			struct i40iw_ucontext *ucontext;
+ 
+ 			ucontext = to_ucontext(ibpd->uobject->context);
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index 4b7161b1e614..0b83544c74ff 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -323,7 +323,7 @@ static int send_wqe_overhead(enum mlx4_ib_qp_type type, u32 flags)
+ }
+ 
+ static int set_rq_size(struct mlx4_ib_dev *dev, struct ib_qp_cap *cap,
+-		       int is_user, int has_rq, struct mlx4_ib_qp *qp,
++		       bool is_user, int has_rq, struct mlx4_ib_qp *qp,
+ 		       u32 inl_recv_sz)
+ {
+ 	/* Sanity check RQ size before proceeding */
+@@ -942,7 +942,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 		qp->sq_signal_bits = cpu_to_be32(MLX4_WQE_CTRL_CQ_UPDATE);
+ 
+ 
+-	if (pd->uobject) {
++	if (udata) {
+ 		union {
+ 			struct mlx4_ib_create_qp qp;
+ 			struct mlx4_ib_create_wq wq;
+@@ -991,7 +991,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 			qp->flags |= MLX4_IB_QP_SCATTER_FCS;
+ 		}
+ 
+-		err = set_rq_size(dev, &init_attr->cap, !!pd->uobject,
++		err = set_rq_size(dev, &init_attr->cap, udata,
+ 				  qp_has_rq(init_attr), qp, qp->inl_recv_sz);
+ 		if (err)
+ 			goto err;
+@@ -1043,7 +1043,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 		}
+ 		qp->mqp.usage = MLX4_RES_USAGE_USER_VERBS;
+ 	} else {
+-		err = set_rq_size(dev, &init_attr->cap, !!pd->uobject,
++		err = set_rq_size(dev, &init_attr->cap, udata,
+ 				  qp_has_rq(init_attr), qp, 0);
+ 		if (err)
+ 			goto err;
+@@ -1189,7 +1189,7 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 	if (qp->mlx4_ib_qp_type == MLX4_IB_QPT_PROXY_GSI)
+ 		free_proxy_bufs(pd->device, qp);
+ err_wrid:
+-	if (pd->uobject) {
++	if (udata) {
+ 		if (qp_has_rq(init_attr))
+ 			mlx4_ib_db_unmap_user(to_mucontext(pd->uobject->context), &qp->db);
+ 	} else {
+@@ -1201,13 +1201,13 @@ static int create_qp_common(struct mlx4_ib_dev *dev, struct ib_pd *pd,
+ 	mlx4_mtt_cleanup(dev->dev, &qp->mtt);
+ 
+ err_buf:
+-	if (pd->uobject)
++	if (qp->umem)
+ 		ib_umem_release(qp->umem);
+ 	else
+ 		mlx4_buf_free(dev->dev, qp->buf_size, &qp->buf);
+ 
+ err_db:
+-	if (!pd->uobject && qp_has_rq(init_attr))
++	if (!udata && qp_has_rq(init_attr))
+ 		mlx4_db_free(dev->dev, &qp->db);
+ 
+ err:
+@@ -1332,7 +1332,7 @@ static void destroy_qp_rss(struct mlx4_ib_dev *dev, struct mlx4_ib_qp *qp)
+ }
+ 
+ static void destroy_qp_common(struct mlx4_ib_dev *dev, struct mlx4_ib_qp *qp,
+-			      enum mlx4_ib_source_type src, int is_user)
++			      enum mlx4_ib_source_type src, bool is_user)
+ {
+ 	struct mlx4_ib_cq *send_cq, *recv_cq;
+ 	unsigned long flags;
+@@ -1612,7 +1612,7 @@ static int _mlx4_ib_destroy_qp(struct ib_qp *qp)
+ 		struct mlx4_ib_pd *pd;
+ 
+ 		pd = get_pd(mqp);
+-		destroy_qp_common(dev, mqp, MLX4_IB_QP_SRC, !!pd->ibpd.uobject);
++		destroy_qp_common(dev, mqp, MLX4_IB_QP_SRC, qp->uobject);
+ 	}
+ 
+ 	if (is_sqp(dev, mqp))
+@@ -4044,7 +4044,7 @@ struct ib_wq *mlx4_ib_create_wq(struct ib_pd *pd,
+ 	struct mlx4_ib_create_wq ucmd;
+ 	int err, required_cmd_sz;
+ 
+-	if (!(udata && pd->uobject))
++	if (!udata)
+ 		return ERR_PTR(-EINVAL);
+ 
+ 	required_cmd_sz = offsetof(typeof(ucmd), comp_mask) +
+diff --git a/drivers/infiniband/hw/mlx4/srq.c b/drivers/infiniband/hw/mlx4/srq.c
+index ebee56cbc0e2..28c697736069 100644
+--- a/drivers/infiniband/hw/mlx4/srq.c
++++ b/drivers/infiniband/hw/mlx4/srq.c
+@@ -105,7 +105,7 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 
+ 	buf_size = srq->msrq.max * desc_size;
+ 
+-	if (pd->uobject) {
++	if (udata) {
+ 		struct mlx4_ib_create_srq ucmd;
+ 
+ 		if (ib_copy_from_udata(&ucmd, udata, sizeof ucmd)) {
+@@ -191,7 +191,7 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 	srq->msrq.event = mlx4_ib_srq_event;
+ 	srq->ibsrq.ext.xrc.srq_num = srq->msrq.srqn;
+ 
+-	if (pd->uobject)
++	if (udata)
+ 		if (ib_copy_to_udata(udata, &srq->msrq.srqn, sizeof (__u32))) {
+ 			err = -EFAULT;
+ 			goto err_wrid;
+@@ -202,7 +202,7 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 	return &srq->ibsrq;
+ 
+ err_wrid:
+-	if (pd->uobject)
++	if (udata)
+ 		mlx4_ib_db_unmap_user(to_mucontext(pd->uobject->context), &srq->db);
+ 	else
+ 		kvfree(srq->wrid);
+@@ -211,13 +211,13 @@ struct ib_srq *mlx4_ib_create_srq(struct ib_pd *pd,
+ 	mlx4_mtt_cleanup(dev->dev, &srq->mtt);
+ 
+ err_buf:
+-	if (pd->uobject)
++	if (srq->umem)
+ 		ib_umem_release(srq->umem);
+ 	else
+ 		mlx4_buf_free(dev->dev, buf_size, &srq->buf);
+ 
+ err_db:
+-	if (!pd->uobject)
++	if (!udata)
+ 		mlx4_db_free(dev->dev, &srq->db);
+ 
+ err_srq:
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
+diff --git a/drivers/infiniband/hw/mlx5/srq.c b/drivers/infiniband/hw/mlx5/srq.c
+index f5de5adc9b1a..d8731a496b63 100644
+--- a/drivers/infiniband/hw/mlx5/srq.c
++++ b/drivers/infiniband/hw/mlx5/srq.c
+@@ -286,14 +286,14 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+ 	}
+ 	in.type = init_attr->srq_type;
+ 
+-	if (pd->uobject)
++	if (udata)
+ 		err = create_srq_user(pd, srq, &in, udata, buf_size);
+ 	else
+ 		err = create_srq_kernel(dev, srq, &in, buf_size);
+ 
+ 	if (err) {
+ 		mlx5_ib_warn(dev, "create srq %s failed, err %d\n",
+-			     pd->uobject ? "user" : "kernel", err);
++			     udata ? "user" : "kernel", err);
+ 		goto err_srq;
+ 	}
+ 
+@@ -338,7 +338,7 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+ 	srq->msrq.event = mlx5_ib_srq_event;
+ 	srq->ibsrq.ext.xrc.srq_num = srq->msrq.srqn;
+ 
+-	if (pd->uobject)
++	if (udata)
+ 		if (ib_copy_to_udata(udata, &srq->msrq.srqn, sizeof(__u32))) {
+ 			mlx5_ib_dbg(dev, "copy to user failed\n");
+ 			err = -EFAULT;
+@@ -353,7 +353,7 @@ struct ib_srq *mlx5_ib_create_srq(struct ib_pd *pd,
+ 	mlx5_core_destroy_srq(dev->mdev, &srq->msrq);
+ 
+ err_usr_kern_srq:
+-	if (pd->uobject)
++	if (udata)
+ 		destroy_srq_user(pd, srq);
+ 	else
+ 		destroy_srq_kernel(dev, srq);
+diff --git a/drivers/infiniband/hw/mthca/mthca_dev.h b/drivers/infiniband/hw/mthca/mthca_dev.h
+index 5508afbf1c67..12167f455ccb 100644
+--- a/drivers/infiniband/hw/mthca/mthca_dev.h
++++ b/drivers/infiniband/hw/mthca/mthca_dev.h
+@@ -510,7 +510,8 @@ int mthca_alloc_cq_buf(struct mthca_dev *dev, struct mthca_cq_buf *buf, int nent
+ void mthca_free_cq_buf(struct mthca_dev *dev, struct mthca_cq_buf *buf, int cqe);
+ 
+ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+-		    struct ib_srq_attr *attr, struct mthca_srq *srq);
++		    struct ib_srq_attr *attr, struct mthca_srq *srq,
++		    struct ib_udata *udata);
+ void mthca_free_srq(struct mthca_dev *dev, struct mthca_srq *srq);
+ int mthca_modify_srq(struct ib_srq *ibsrq, struct ib_srq_attr *attr,
+ 		     enum ib_srq_attr_mask attr_mask, struct ib_udata *udata);
+@@ -547,7 +548,8 @@ int mthca_alloc_qp(struct mthca_dev *dev,
+ 		   enum ib_qp_type type,
+ 		   enum ib_sig_type send_policy,
+ 		   struct ib_qp_cap *cap,
+-		   struct mthca_qp *qp);
++		   struct mthca_qp *qp,
++		   struct ib_udata *udata);
+ int mthca_alloc_sqp(struct mthca_dev *dev,
+ 		    struct mthca_pd *pd,
+ 		    struct mthca_cq *send_cq,
+@@ -556,7 +558,8 @@ int mthca_alloc_sqp(struct mthca_dev *dev,
+ 		    struct ib_qp_cap *cap,
+ 		    int qpn,
+ 		    int port,
+-		    struct mthca_sqp *sqp);
++		    struct mthca_sqp *sqp,
++		    struct ib_udata *udata);
+ void mthca_free_qp(struct mthca_dev *dev, struct mthca_qp *qp);
+ int mthca_create_ah(struct mthca_dev *dev,
+ 		    struct mthca_pd *pd,
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index d45a5381165a..b2ca7cdfac57 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -455,7 +455,7 @@ static struct ib_srq *mthca_create_srq(struct ib_pd *pd,
+ 	if (!srq)
+ 		return ERR_PTR(-ENOMEM);
+ 
+-	if (pd->uobject) {
++	if (udata) {
+ 		context = to_mucontext(pd->uobject->context);
+ 
+ 		if (ib_copy_from_udata(&ucmd, udata, sizeof ucmd)) {
+@@ -475,9 +475,9 @@ static struct ib_srq *mthca_create_srq(struct ib_pd *pd,
+ 	}
+ 
+ 	err = mthca_alloc_srq(to_mdev(pd->device), to_mpd(pd),
+-			      &init_attr->attr, srq);
++			      &init_attr->attr, srq, udata);
+ 
+-	if (err && pd->uobject)
++	if (err && udata)
+ 		mthca_unmap_user_db(to_mdev(pd->device), &context->uar,
+ 				    context->db_tab, ucmd.db_index);
+ 
+@@ -537,7 +537,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
+ 		if (!qp)
+ 			return ERR_PTR(-ENOMEM);
+ 
+-		if (pd->uobject) {
++		if (udata) {
+ 			context = to_mucontext(pd->uobject->context);
+ 
+ 			if (ib_copy_from_udata(&ucmd, udata, sizeof ucmd)) {
+@@ -574,9 +574,9 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
+ 				     to_mcq(init_attr->send_cq),
+ 				     to_mcq(init_attr->recv_cq),
+ 				     init_attr->qp_type, init_attr->sq_sig_type,
+-				     &init_attr->cap, qp);
++				     &init_attr->cap, qp, udata);
+ 
+-		if (err && pd->uobject) {
++		if (err && udata) {
+ 			context = to_mucontext(pd->uobject->context);
+ 
+ 			mthca_unmap_user_db(to_mdev(pd->device),
+@@ -596,7 +596,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
+ 	case IB_QPT_GSI:
+ 	{
+ 		/* Don't allow userspace to create special QPs */
+-		if (pd->uobject)
++		if (udata)
+ 			return ERR_PTR(-EINVAL);
+ 
+ 		qp = kmalloc(sizeof (struct mthca_sqp), GFP_KERNEL);
+@@ -610,7 +610,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
+ 				      to_mcq(init_attr->recv_cq),
+ 				      init_attr->sq_sig_type, &init_attr->cap,
+ 				      qp->ibqp.qp_num, init_attr->port_num,
+-				      to_msqp(qp));
++				      to_msqp(qp), udata);
+ 		break;
+ 	}
+ 	default:
+diff --git a/drivers/infiniband/hw/mthca/mthca_qp.c b/drivers/infiniband/hw/mthca/mthca_qp.c
+index 4b0ba0660e4b..3d609c003278 100644
+--- a/drivers/infiniband/hw/mthca/mthca_qp.c
++++ b/drivers/infiniband/hw/mthca/mthca_qp.c
+@@ -981,7 +981,8 @@ static void mthca_adjust_qp_caps(struct mthca_dev *dev,
+  */
+ static int mthca_alloc_wqe_buf(struct mthca_dev *dev,
+ 			       struct mthca_pd *pd,
+-			       struct mthca_qp *qp)
++			       struct mthca_qp *qp,
++			       struct ib_udata *udata)
+ {
+ 	int size;
+ 	int err = -ENOMEM;
+@@ -1048,7 +1049,7 @@ static int mthca_alloc_wqe_buf(struct mthca_dev *dev,
+ 	 * allocate anything.  All we need is to calculate the WQE
+ 	 * sizes and the send_wqe_offset, so we're done now.
+ 	 */
+-	if (pd->ibpd.uobject)
++	if (udata)
+ 		return 0;
+ 
+ 	size = PAGE_ALIGN(qp->send_wqe_offset +
+@@ -1155,7 +1156,8 @@ static int mthca_alloc_qp_common(struct mthca_dev *dev,
+ 				 struct mthca_cq *send_cq,
+ 				 struct mthca_cq *recv_cq,
+ 				 enum ib_sig_type send_policy,
+-				 struct mthca_qp *qp)
++				 struct mthca_qp *qp,
++				 struct ib_udata *udata)
+ {
+ 	int ret;
+ 	int i;
+@@ -1178,7 +1180,7 @@ static int mthca_alloc_qp_common(struct mthca_dev *dev,
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = mthca_alloc_wqe_buf(dev, pd, qp);
++	ret = mthca_alloc_wqe_buf(dev, pd, qp, udata);
+ 	if (ret) {
+ 		mthca_unmap_memfree(dev, qp);
+ 		return ret;
+@@ -1191,7 +1193,7 @@ static int mthca_alloc_qp_common(struct mthca_dev *dev,
+ 	 * will be allocated and buffers will be initialized in
+ 	 * userspace.
+ 	 */
+-	if (pd->ibpd.uobject)
++	if (udata)
+ 		return 0;
+ 
+ 	ret = mthca_alloc_memfree(dev, qp);
+@@ -1285,7 +1287,8 @@ int mthca_alloc_qp(struct mthca_dev *dev,
+ 		   enum ib_qp_type type,
+ 		   enum ib_sig_type send_policy,
+ 		   struct ib_qp_cap *cap,
+-		   struct mthca_qp *qp)
++		   struct mthca_qp *qp,
++		   struct ib_udata *udata)
+ {
+ 	int err;
+ 
+@@ -1308,7 +1311,7 @@ int mthca_alloc_qp(struct mthca_dev *dev,
+ 	qp->port = 0;
+ 
+ 	err = mthca_alloc_qp_common(dev, pd, send_cq, recv_cq,
+-				    send_policy, qp);
++				    send_policy, qp, udata);
+ 	if (err) {
+ 		mthca_free(&dev->qp_table.alloc, qp->qpn);
+ 		return err;
+@@ -1360,7 +1363,8 @@ int mthca_alloc_sqp(struct mthca_dev *dev,
+ 		    struct ib_qp_cap *cap,
+ 		    int qpn,
+ 		    int port,
+-		    struct mthca_sqp *sqp)
++		    struct mthca_sqp *sqp,
++		    struct ib_udata *udata)
+ {
+ 	u32 mqpn = qpn * 2 + dev->qp_table.sqp_start + port - 1;
+ 	int err;
+@@ -1391,7 +1395,7 @@ int mthca_alloc_sqp(struct mthca_dev *dev,
+ 	sqp->qp.transport = MLX;
+ 
+ 	err = mthca_alloc_qp_common(dev, pd, send_cq, recv_cq,
+-				    send_policy, &sqp->qp);
++				    send_policy, &sqp->qp, udata);
+ 	if (err)
+ 		goto err_out_free;
+ 
+diff --git a/drivers/infiniband/hw/mthca/mthca_srq.c b/drivers/infiniband/hw/mthca/mthca_srq.c
+index f79732bc73b4..a3a60278c739 100644
+--- a/drivers/infiniband/hw/mthca/mthca_srq.c
++++ b/drivers/infiniband/hw/mthca/mthca_srq.c
+@@ -95,7 +95,8 @@ static inline int *wqe_to_link(void *wqe)
+ static void mthca_tavor_init_srq_context(struct mthca_dev *dev,
+ 					 struct mthca_pd *pd,
+ 					 struct mthca_srq *srq,
+-					 struct mthca_tavor_srq_context *context)
++					 struct mthca_tavor_srq_context *context,
++					 bool is_user)
+ {
+ 	memset(context, 0, sizeof *context);
+ 
+@@ -103,7 +104,7 @@ static void mthca_tavor_init_srq_context(struct mthca_dev *dev,
+ 	context->state_pd    = cpu_to_be32(pd->pd_num);
+ 	context->lkey        = cpu_to_be32(srq->mr.ibmr.lkey);
+ 
+-	if (pd->ibpd.uobject)
++	if (is_user)
+ 		context->uar =
+ 			cpu_to_be32(to_mucontext(pd->ibpd.uobject->context)->uar.index);
+ 	else
+@@ -113,7 +114,8 @@ static void mthca_tavor_init_srq_context(struct mthca_dev *dev,
+ static void mthca_arbel_init_srq_context(struct mthca_dev *dev,
+ 					 struct mthca_pd *pd,
+ 					 struct mthca_srq *srq,
+-					 struct mthca_arbel_srq_context *context)
++					 struct mthca_arbel_srq_context *context,
++					 bool is_user)
+ {
+ 	int logsize, max;
+ 
+@@ -129,7 +131,7 @@ static void mthca_arbel_init_srq_context(struct mthca_dev *dev,
+ 	context->lkey = cpu_to_be32(srq->mr.ibmr.lkey);
+ 	context->db_index = cpu_to_be32(srq->db_index);
+ 	context->logstride_usrpage = cpu_to_be32((srq->wqe_shift - 4) << 29);
+-	if (pd->ibpd.uobject)
++	if (is_user)
+ 		context->logstride_usrpage |=
+ 			cpu_to_be32(to_mucontext(pd->ibpd.uobject->context)->uar.index);
+ 	else
+@@ -145,14 +147,14 @@ static void mthca_free_srq_buf(struct mthca_dev *dev, struct mthca_srq *srq)
+ }
+ 
+ static int mthca_alloc_srq_buf(struct mthca_dev *dev, struct mthca_pd *pd,
+-			       struct mthca_srq *srq)
++			       struct mthca_srq *srq, struct ib_udata *udata)
+ {
+ 	struct mthca_data_seg *scatter;
+ 	void *wqe;
+ 	int err;
+ 	int i;
+ 
+-	if (pd->ibpd.uobject)
++	if (udata)
+ 		return 0;
+ 
+ 	srq->wrid = kmalloc_array(srq->max, sizeof(u64), GFP_KERNEL);
+@@ -197,7 +199,8 @@ static int mthca_alloc_srq_buf(struct mthca_dev *dev, struct mthca_pd *pd,
+ }
+ 
+ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+-		    struct ib_srq_attr *attr, struct mthca_srq *srq)
++		    struct ib_srq_attr *attr, struct mthca_srq *srq,
++		    struct ib_udata *udata)
+ {
+ 	struct mthca_mailbox *mailbox;
+ 	int ds;
+@@ -235,7 +238,7 @@ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+ 		if (err)
+ 			goto err_out;
+ 
+-		if (!pd->ibpd.uobject) {
++		if (!udata) {
+ 			srq->db_index = mthca_alloc_db(dev, MTHCA_DB_TYPE_SRQ,
+ 						       srq->srqn, &srq->db);
+ 			if (srq->db_index < 0) {
+@@ -251,7 +254,7 @@ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+ 		goto err_out_db;
+ 	}
+ 
+-	err = mthca_alloc_srq_buf(dev, pd, srq);
++	err = mthca_alloc_srq_buf(dev, pd, srq, udata);
+ 	if (err)
+ 		goto err_out_mailbox;
+ 
+@@ -261,9 +264,9 @@ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+ 	mutex_init(&srq->mutex);
+ 
+ 	if (mthca_is_memfree(dev))
+-		mthca_arbel_init_srq_context(dev, pd, srq, mailbox->buf);
++		mthca_arbel_init_srq_context(dev, pd, srq, mailbox->buf, udata);
+ 	else
+-		mthca_tavor_init_srq_context(dev, pd, srq, mailbox->buf);
++		mthca_tavor_init_srq_context(dev, pd, srq, mailbox->buf, udata);
+ 
+ 	err = mthca_SW2HW_SRQ(dev, mailbox, srq->srqn);
+ 
+@@ -297,14 +300,14 @@ int mthca_alloc_srq(struct mthca_dev *dev, struct mthca_pd *pd,
+ 		mthca_warn(dev, "HW2SW_SRQ failed (%d)\n", err);
+ 
+ err_out_free_buf:
+-	if (!pd->ibpd.uobject)
++	if (!udata)
+ 		mthca_free_srq_buf(dev, srq);
+ 
+ err_out_mailbox:
+ 	mthca_free_mailbox(dev, mailbox);
+ 
+ err_out_db:
+-	if (!pd->ibpd.uobject && mthca_is_memfree(dev))
++	if (!udata && mthca_is_memfree(dev))
+ 		mthca_free_db(dev, MTHCA_DB_TYPE_SRQ, srq->db_index);
+ 
+ err_out_icm:
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index 10635ebe19fe..ae230369f8e8 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -1086,7 +1086,7 @@ static struct ib_qp *nes_create_qp(struct ib_pd *ibpd,
+ 				}
+ 				if (req.user_qp_buffer)
+ 					nesqp->nesuqp_addr = req.user_qp_buffer;
+-				if ((ibpd->uobject) && (ibpd->uobject->context)) {
++				if (udata && (ibpd->uobject->context)) {
+ 					nesqp->user_mode = 1;
+ 					nes_ucontext = to_nesucontext(ibpd->uobject->context);
+ 					if (virt_wqs) {
+@@ -1277,7 +1277,7 @@ static struct ib_qp *nes_create_qp(struct ib_pd *ibpd,
+ 
+ 			nes_put_cqp_request(nesdev, cqp_request);
+ 
+-			if (ibpd->uobject) {
++			if (udata) {
+ 				uresp.mmap_sq_db_index = nesqp->mmap_sq_db_index;
+ 				uresp.mmap_rq_db_index = 0;
+ 				uresp.actual_sq_size = sq_size;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index e81a46c296b5..dded9134c9ce 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -1157,7 +1157,8 @@ static void ocrdma_del_qpn_map(struct ocrdma_dev *dev, struct ocrdma_qp *qp)
+ }
+ 
+ static int ocrdma_check_qp_params(struct ib_pd *ibpd, struct ocrdma_dev *dev,
+-				  struct ib_qp_init_attr *attrs)
++				  struct ib_qp_init_attr *attrs,
++				  struct ib_udata *udata)
+ {
+ 	if ((attrs->qp_type != IB_QPT_GSI) &&
+ 	    (attrs->qp_type != IB_QPT_RC) &&
+@@ -1205,7 +1206,7 @@ static int ocrdma_check_qp_params(struct ib_pd *ibpd, struct ocrdma_dev *dev,
+ 		return -EINVAL;
+ 	}
+ 	/* unprivileged user space cannot create special QP */
+-	if (ibpd->uobject && attrs->qp_type == IB_QPT_GSI) {
++	if (udata && attrs->qp_type == IB_QPT_GSI) {
+ 		pr_err
+ 		    ("%s(%d) Userspace can't create special QPs of type=0x%x\n",
+ 		     __func__, dev->id, attrs->qp_type);
+@@ -1362,7 +1363,7 @@ struct ib_qp *ocrdma_create_qp(struct ib_pd *ibpd,
+ 	struct ocrdma_create_qp_ureq ureq;
+ 	u16 dpp_credit_lmt, dpp_offset;
+ 
+-	status = ocrdma_check_qp_params(ibpd, dev, attrs);
++	status = ocrdma_check_qp_params(ibpd, dev, attrs, udata);
+ 	if (status)
+ 		goto gen_err;
+ 
+* Unmerged path drivers/infiniband/hw/qedr/verbs.c
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+index 014f73f3030a..146828daa77b 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+@@ -249,7 +249,7 @@ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
+ 		init_completion(&qp->free);
+ 
+ 		qp->state = IB_QPS_RESET;
+-		qp->is_kernel = !(pd->uobject && udata);
++		qp->is_kernel = !udata;
+ 
+ 		if (!qp->is_kernel) {
+ 			dev_dbg(&dev->pdev->dev,
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+index af235967a9c2..75fc910f90a7 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_srq.c
+@@ -118,7 +118,7 @@ struct ib_srq *pvrdma_create_srq(struct ib_pd *pd,
+ 	unsigned long flags;
+ 	int ret;
+ 
+-	if (!(pd->uobject && udata)) {
++	if (!udata) {
+ 		/* No support for kernel clients. */
+ 		dev_warn(&dev->pdev->dev,
+ 			 "no shared receive queue support for kernel client\n");
+diff --git a/drivers/infiniband/sw/rxe/rxe_loc.h b/drivers/infiniband/sw/rxe/rxe_loc.h
+index a675c9f2b427..01b74597b36a 100644
+--- a/drivers/infiniband/sw/rxe/rxe_loc.h
++++ b/drivers/infiniband/sw/rxe/rxe_loc.h
+@@ -157,7 +157,7 @@ int rxe_qp_chk_init(struct rxe_dev *rxe, struct ib_qp_init_attr *init);
+ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
+ 		     struct ib_qp_init_attr *init,
+ 		     struct rxe_create_qp_resp __user *uresp,
+-		     struct ib_pd *ibpd);
++		     struct ib_pd *ibpd, struct ib_udata *udata);
+ 
+ int rxe_qp_to_init(struct rxe_qp *qp, struct ib_qp_init_attr *init);
+ 
+diff --git a/drivers/infiniband/sw/rxe/rxe_qp.c b/drivers/infiniband/sw/rxe/rxe_qp.c
+index 2ca4ffe5015f..fd86fd2fbb26 100644
+--- a/drivers/infiniband/sw/rxe/rxe_qp.c
++++ b/drivers/infiniband/sw/rxe/rxe_qp.c
+@@ -336,13 +336,14 @@ static int rxe_qp_init_resp(struct rxe_dev *rxe, struct rxe_qp *qp,
+ int rxe_qp_from_init(struct rxe_dev *rxe, struct rxe_qp *qp, struct rxe_pd *pd,
+ 		     struct ib_qp_init_attr *init,
+ 		     struct rxe_create_qp_resp __user *uresp,
+-		     struct ib_pd *ibpd)
++		     struct ib_pd *ibpd,
++		     struct ib_udata *udata)
+ {
+ 	int err;
+ 	struct rxe_cq *rcq = to_rcq(init->recv_cq);
+ 	struct rxe_cq *scq = to_rcq(init->send_cq);
+ 	struct rxe_srq *srq = init->srq ? to_rsrq(init->srq) : NULL;
+-	struct ib_ucontext *context = ibpd->uobject ? ibpd->uobject->context : NULL;
++	struct ib_ucontext *context = udata ? ibpd->uobject->context : NULL;
+ 
+ 	rxe_add_ref(pd);
+ 	rxe_add_ref(rcq);
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index e4887381271b..28903d947976 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -486,7 +486,7 @@ static struct ib_qp *rxe_create_qp(struct ib_pd *ibpd,
+ 
+ 	rxe_add_index(qp);
+ 
+-	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibpd);
++	err = rxe_qp_from_init(rxe, qp, pd, init, uresp, ibpd, udata);
+ 	if (err)
+ 		goto err3;
+ 
