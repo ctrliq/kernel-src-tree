@@ -1,0 +1,235 @@
+skmsg: Move sk_redir from TCP_SKB_CB to skb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit e3526bb92a2084cdaec6cb2855bcec98b280426c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/e3526bb9.failed
+
+Currently TCP_SKB_CB() is hard-coded in skmsg code, it certainly
+does not work for any other non-TCP protocols. We can move them to
+skb ext, but it introduces a memory allocation on fast path.
+
+Fortunately, we only need to a word-size to store all the information,
+because the flags actually only contains 1 bit so can be just packed
+into the lowest bit of the "pointer", which is stored as unsigned
+long.
+
+Inside struct sk_buff, '_skb_refdst' can be reused because skb dst is
+no longer needed after ->sk_data_ready() so we can just drop it.
+
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210223184934.6054-5-xiyou.wangcong@gmail.com
+(cherry picked from commit e3526bb92a2084cdaec6cb2855bcec98b280426c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skmsg.c
+diff --cc net/core/skmsg.c
+index 9316dc9fce4f,409258367bea..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -807,10 -805,15 +813,11 @@@ int sk_psock_tls_strp_read(struct sk_ps
+  	rcu_read_lock();
+  	prog = READ_ONCE(psock->progs.skb_verdict);
+  	if (likely(prog)) {
+ -		/* We skip full set_owner_r here because if we do a SK_PASS
+ -		 * or SK_DROP we can skip skb memory accounting and use the
+ -		 * TLS context.
+ -		 */
+  		skb->sk = psock->sk;
+- 		tcp_skb_bpf_redirect_clear(skb);
++ 		skb_dst_drop(skb);
++ 		skb_bpf_redirect_clear(skb);
+  		ret = sk_psock_bpf_run(psock, prog, skb);
+- 		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
++ 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
+  		skb->sk = NULL;
+  	}
+  	sk_psock_tls_verdict_apply(skb, psock->sk, ret);
+@@@ -876,13 -894,13 +881,20 @@@ static void sk_psock_strp_read(struct s
+  		kfree_skb(skb);
+  		goto out;
+  	}
+ -	skb_set_owner_r(skb, sk);
+  	prog = READ_ONCE(psock->progs.skb_verdict);
+  	if (likely(prog)) {
+++<<<<<<< HEAD
+ +		skb->sk = sk;
+ +		tcp_skb_bpf_redirect_clear(skb);
+ +		ret = sk_psock_bpf_run(psock, prog, skb);
+ +		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+ +		skb->sk = NULL;
+++=======
++ 		skb_dst_drop(skb);
++ 		skb_bpf_redirect_clear(skb);
++ 		ret = sk_psock_bpf_run(psock, prog, skb);
++ 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
+++>>>>>>> e3526bb92a20 (skmsg: Move sk_redir from TCP_SKB_CB to skb)
+  	}
+  	sk_psock_verdict_apply(psock, skb, ret);
+  out:
+@@@ -953,13 -1014,13 +965,20 @@@ static int sk_psock_verdict_recv(read_d
+  		kfree_skb(skb);
+  		goto out;
+  	}
+ -	skb_set_owner_r(skb, sk);
+  	prog = READ_ONCE(psock->progs.skb_verdict);
+  	if (likely(prog)) {
+++<<<<<<< HEAD
+ +		skb->sk = sk;
+ +		tcp_skb_bpf_redirect_clear(skb);
+ +		ret = sk_psock_bpf_run(psock, prog, skb);
+ +		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
+ +		skb->sk = NULL;
+++=======
++ 		skb_dst_drop(skb);
++ 		skb_bpf_redirect_clear(skb);
++ 		ret = sk_psock_bpf_run(psock, prog, skb);
++ 		ret = sk_psock_map_verd(ret, skb_bpf_redirect_fetch(skb));
+++>>>>>>> e3526bb92a20 (skmsg: Move sk_redir from TCP_SKB_CB to skb)
+  	}
+  	sk_psock_verdict_apply(psock, skb, ret);
+  out:
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index ddcd8d0e7896..6c8284300823 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -753,6 +753,9 @@ struct sk_buff {
+ 			void		(*destructor)(struct sk_buff *skb);
+ 		};
+ 		struct list_head	tcp_tsorted_anchor;
++#ifdef CONFIG_NET_SOCK_MSG
++		unsigned long		_sk_redir;
++#endif
+ 	};
+ 
+ #ifdef CONFIG_XFRM
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index 98263673d9b8..3e756a9d019c 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -447,4 +447,42 @@ static inline bool sk_psock_strp_enabled(struct sk_psock *psock)
+ 		return false;
+ 	return psock->parser.enabled;
+ }
++
++#if IS_ENABLED(CONFIG_NET_SOCK_MSG)
++
++/* We only have one bit so far. */
++#define BPF_F_PTR_MASK ~(BPF_F_INGRESS)
++
++static inline bool skb_bpf_ingress(const struct sk_buff *skb)
++{
++	unsigned long sk_redir = skb->_sk_redir;
++
++	return sk_redir & BPF_F_INGRESS;
++}
++
++static inline void skb_bpf_set_ingress(struct sk_buff *skb)
++{
++	skb->_sk_redir |= BPF_F_INGRESS;
++}
++
++static inline void skb_bpf_set_redir(struct sk_buff *skb, struct sock *sk_redir,
++				     bool ingress)
++{
++	skb->_sk_redir = (unsigned long)sk_redir;
++	if (ingress)
++		skb->_sk_redir |= BPF_F_INGRESS;
++}
++
++static inline struct sock *skb_bpf_redirect_fetch(const struct sk_buff *skb)
++{
++	unsigned long sk_redir = skb->_sk_redir;
++
++	return (struct sock *)(sk_redir & BPF_F_PTR_MASK);
++}
++
++static inline void skb_bpf_redirect_clear(struct sk_buff *skb)
++{
++	skb->_sk_redir = 0;
++}
++#endif /* CONFIG_NET_SOCK_MSG */
+ #endif /* _LINUX_SKMSG_H */
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 94a5d2fb0393..e1eacad0f5a7 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -893,30 +893,11 @@ struct tcp_skb_cb {
+ 			struct inet6_skb_parm	h6;
+ #endif
+ 		} header;	/* For incoming skbs */
+-		struct {
+-			__u32 flags;
+-			struct sock *sk_redir;
+-		} bpf;
+ 	};
+ };
+ 
+ #define TCP_SKB_CB(__skb)	((struct tcp_skb_cb *)&((__skb)->cb[0]))
+ 
+-static inline bool tcp_skb_bpf_ingress(const struct sk_buff *skb)
+-{
+-	return TCP_SKB_CB(skb)->bpf.flags & BPF_F_INGRESS;
+-}
+-
+-static inline struct sock *tcp_skb_bpf_redirect_fetch(struct sk_buff *skb)
+-{
+-	return TCP_SKB_CB(skb)->bpf.sk_redir;
+-}
+-
+-static inline void tcp_skb_bpf_redirect_clear(struct sk_buff *skb)
+-{
+-	TCP_SKB_CB(skb)->bpf.sk_redir = NULL;
+-}
+-
+ extern const struct inet_connection_sock_af_ops ipv4_specific;
+ 
+ #if IS_ENABLED(CONFIG_IPV6)
+* Unmerged path net/core/skmsg.c
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index f2963865e78e..b3ece6ddd19c 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -661,7 +661,6 @@ const struct bpf_func_proto bpf_sock_map_update_proto = {
+ BPF_CALL_4(bpf_sk_redirect_map, struct sk_buff *, skb,
+ 	   struct bpf_map *, map, u32, key, u64, flags)
+ {
+-	struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+ 	struct sock *sk;
+ 
+ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
+@@ -671,8 +670,7 @@ BPF_CALL_4(bpf_sk_redirect_map, struct sk_buff *, skb,
+ 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
+ 		return SK_DROP;
+ 
+-	tcb->bpf.flags = flags;
+-	tcb->bpf.sk_redir = sk;
++	skb_bpf_set_redir(skb, sk, flags & BPF_F_INGRESS);
+ 	return SK_PASS;
+ }
+ 
+@@ -1254,7 +1252,6 @@ const struct bpf_func_proto bpf_sock_hash_update_proto = {
+ BPF_CALL_4(bpf_sk_redirect_hash, struct sk_buff *, skb,
+ 	   struct bpf_map *, map, void *, key, u64, flags)
+ {
+-	struct tcp_skb_cb *tcb = TCP_SKB_CB(skb);
+ 	struct sock *sk;
+ 
+ 	if (unlikely(flags & ~(BPF_F_INGRESS)))
+@@ -1264,8 +1261,7 @@ BPF_CALL_4(bpf_sk_redirect_hash, struct sk_buff *, skb,
+ 	if (unlikely(!sk || !sock_map_redirect_allowed(sk)))
+ 		return SK_DROP;
+ 
+-	tcb->bpf.flags = flags;
+-	tcb->bpf.sk_redir = sk;
++	skb_bpf_set_redir(skb, sk, flags & BPF_F_INGRESS);
+ 	return SK_PASS;
+ }
+ 
