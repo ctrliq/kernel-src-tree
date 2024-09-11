@@ -1,0 +1,134 @@
+memremap: provide a not device managed memremap_pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 6869b7b206595ae0e326f59719090351eb8f4f5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6869b7b2.failed
+
+The kvmppc ultravisor code wants a device private memory pool that is
+system wide and not attached to a device.  Instead of faking up one
+provide a low-level memremap_pages for it.
+
+Link: https://lore.kernel.org/r/20190818090557.17853-5-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Bharata B Rao <bharata@linux.ibm.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6869b7b206595ae0e326f59719090351eb8f4f5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memremap.c
+diff --cc mm/memremap.c
+index 2b401bc84cda,77a77704eb28..000000000000
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@@ -89,20 -94,11 +89,23 @@@ static void dev_pagemap_cleanup(struct 
+  		wait_for_completion(&pgmap->done);
+  		percpu_ref_exit(pgmap->ref);
+  	}
+ +	/*
+ +	 * Undo the pgmap ref assignment for the internal case as the
+ +	 * caller may re-enable the same pgmap.
+ +	 */
+ +	if (pgmap->ref == &pgmap->internal_ref)
+ +		pgmap->ref = NULL;
+  }
+  
+- static void devm_memremap_pages_release(void *data)
++ void memunmap_pages(struct dev_pagemap *pgmap)
+  {
+++<<<<<<< HEAD:mm/memremap.c
+ +	struct dev_pagemap *pgmap = data;
+ +	struct device *dev = pgmap->dev;
+++=======
+++>>>>>>> 6869b7b20659 (memremap: provide a not device managed memremap_pages):kernel/memremap.c
+  	struct resource *res = &pgmap->res;
+ +	struct page *first_page;
+  	unsigned long pfn;
+  	int nid;
+  
+@@@ -132,9 -124,15 +135,15 @@@
+  
+  	untrack_pfn(NULL, PHYS_PFN(res->start), resource_size(res));
+  	pgmap_array_delete(res);
+ -	WARN_ONCE(pgmap->altmap.alloc, "failed to free all reserved pages\n");
+ -	devmap_managed_enable_put();
+ +	dev_WARN_ONCE(dev, pgmap->altmap.alloc,
+ +		      "%s: failed to free all reserved pages\n", __func__);
+  }
++ EXPORT_SYMBOL_GPL(memunmap_pages);
++ 
++ static void devm_memremap_pages_release(void *data)
++ {
++ 	memunmap_pages(data);
++ }
+  
+  static void dev_pagemap_percpu_release(struct percpu_ref *ref)
+  {
+@@@ -334,8 -308,46 +321,45 @@@ void *memremap_pages(struct dev_pagema
+   err_array:
+  	dev_pagemap_kill(pgmap);
+  	dev_pagemap_cleanup(pgmap);
+ -	devmap_managed_enable_put();
+  	return ERR_PTR(error);
+  }
++ EXPORT_SYMBOL_GPL(memremap_pages);
++ 
++ /**
++  * devm_memremap_pages - remap and provide memmap backing for the given resource
++  * @dev: hosting device for @res
++  * @pgmap: pointer to a struct dev_pagemap
++  *
++  * Notes:
++  * 1/ At a minimum the res and type members of @pgmap must be initialized
++  *    by the caller before passing it to this function
++  *
++  * 2/ The altmap field may optionally be initialized, in which case
++  *    PGMAP_ALTMAP_VALID must be set in pgmap->flags.
++  *
++  * 3/ The ref field may optionally be provided, in which pgmap->ref must be
++  *    'live' on entry and will be killed and reaped at
++  *    devm_memremap_pages_release() time, or if this routine fails.
++  *
++  * 4/ res is expected to be a host memory range that could feasibly be
++  *    treated as a "System RAM" range, i.e. not a device mmio range, but
++  *    this is not enforced.
++  */
++ void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap)
++ {
++ 	int error;
++ 	void *ret;
++ 
++ 	ret = memremap_pages(pgmap, dev_to_node(dev));
++ 	if (IS_ERR(ret))
++ 		return ret;
++ 
++ 	error = devm_add_action_or_reset(dev, devm_memremap_pages_release,
++ 			pgmap);
++ 	if (error)
++ 		return ERR_PTR(error);
++ 	return ret;
++ }
+  EXPORT_SYMBOL_GPL(devm_memremap_pages);
+  
+  void devm_memunmap_pages(struct device *dev, struct dev_pagemap *pgmap)
+diff --git a/include/linux/memremap.h b/include/linux/memremap.h
+index 1154c9232ff2..f41249421a36 100644
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@ -146,6 +146,8 @@ static inline struct vmem_altmap *pgmap_altmap(struct dev_pagemap *pgmap)
+ }
+ 
+ #ifdef CONFIG_ZONE_DEVICE
++void *memremap_pages(struct dev_pagemap *pgmap, int nid);
++void memunmap_pages(struct dev_pagemap *pgmap);
+ void *devm_memremap_pages(struct device *dev, struct dev_pagemap *pgmap);
+ void devm_memunmap_pages(struct device *dev, struct dev_pagemap *pgmap);
+ struct dev_pagemap *get_dev_pagemap(unsigned long pfn,
+* Unmerged path mm/memremap.c
