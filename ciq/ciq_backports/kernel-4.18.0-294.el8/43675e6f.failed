@@ -1,0 +1,183 @@
+mm: thp: make transhuge_vma_suitable available for anonymous THP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yang Shi <yang.shi@linux.alibaba.com>
+commit 43675e6fbbeadca90c6c5031557ff95e217e6d2f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/43675e6f.failed
+
+transhuge_vma_suitable() was only available for shmem THP, but anonymous
+THP has the same check except pgoff check.  And, it will be used for THP
+eligible check in the later patch, so make it available for all kind of
+THPs.  This also helps reduce code duplication slightly.
+
+Since anonymous THP doesn't have to check pgoff, so make pgoff check
+shmem vma only.
+
+And regroup some functions in include/linux/mm.h to solve compile issue
+since transhuge_vma_suitable() needs call vma_is_anonymous() which was
+defined after huge_mm.h is included.
+
+[akpm@linux-foundation.org: fix typo]
+[yang.shi@linux.alibaba.com: v4]
+  Link: http://lkml.kernel.org/r/1563400758-124759-2-git-send-email-yang.shi@linux.alibaba.com
+Link: http://lkml.kernel.org/r/1560401041-32207-2-git-send-email-yang.shi@linux.alibaba.com
+	Signed-off-by: Yang Shi <yang.shi@linux.alibaba.com>
+	Acked-by: Hugh Dickins <hughd@google.com>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 43675e6fbbeadca90c6c5031557ff95e217e6d2f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/huge_mm.h
+diff --cc include/linux/huge_mm.h
+index 404c657a14d9,45ede62aa85b..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -152,6 -119,25 +152,28 @@@ static inline bool transparent_hugepage
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool transparent_hugepage_enabled(struct vm_area_struct *vma);
++ 
++ #define HPAGE_CACHE_INDEX_MASK (HPAGE_PMD_NR - 1)
++ 
++ static inline bool transhuge_vma_suitable(struct vm_area_struct *vma,
++ 		unsigned long haddr)
++ {
++ 	/* Don't have to check pgoff for anonymous vma */
++ 	if (!vma_is_anonymous(vma)) {
++ 		if (((vma->vm_start >> PAGE_SHIFT) & HPAGE_CACHE_INDEX_MASK) !=
++ 			(vma->vm_pgoff & HPAGE_CACHE_INDEX_MASK))
++ 			return false;
++ 	}
++ 
++ 	if (haddr < vma->vm_start || haddr + HPAGE_PMD_SIZE > vma->vm_end)
++ 		return false;
++ 	return true;
++ }
++ 
+++>>>>>>> 43675e6fbbea (mm: thp: make transhuge_vma_suitable available for anonymous THP)
+  #define transparent_hugepage_use_zero_page()				\
+  	(transparent_hugepage_flags &					\
+  	 (1<<TRANSPARENT_HUGEPAGE_USE_ZERO_PAGE_FLAG))
+@@@ -298,13 -288,14 +320,19 @@@ static inline bool transparent_hugepage
+  	return false;
+  }
+  
++ static inline bool transhuge_vma_suitable(struct vm_area_struct *vma,
++ 		unsigned long haddr)
++ {
++ 	return false;
++ }
++ 
+  static inline void prep_transhuge_page(struct page *page) {}
+  
+ +static inline bool is_transparent_hugepage(struct page *page)
+ +{
+ +	return false;
+ +}
+ +
+  #define transparent_hugepage_flags 0UL
+  
+  #define thp_get_unmapped_area	NULL
+* Unmerged path include/linux/huge_mm.h
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index ef77bd76b21c..df4df3e67881 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -485,6 +485,23 @@ static inline void vma_set_anonymous(struct vm_area_struct *vma)
+ 	vma->vm_ops = NULL;
+ }
+ 
++static inline bool vma_is_anonymous(struct vm_area_struct *vma)
++{
++	return !vma->vm_ops;
++}
++
++#ifdef CONFIG_SHMEM
++/*
++ * The vma_is_shmem is not inline because it is used only by slow
++ * paths in userfault.
++ */
++bool vma_is_shmem(struct vm_area_struct *vma);
++#else
++static inline bool vma_is_shmem(struct vm_area_struct *vma) { return false; }
++#endif
++
++int vma_is_stack_for_current(struct vm_area_struct *vma);
++
+ /* flush_tlb_range() takes a vma, not a mm, and can care about flags */
+ #define TLB_FLUSH_VMA(mm,flags) { .vm_mm = (mm), .vm_flags = (flags) }
+ 
+@@ -1495,23 +1512,6 @@ int clear_page_dirty_for_io(struct page *page);
+ 
+ int get_cmdline(struct task_struct *task, char *buffer, int buflen);
+ 
+-static inline bool vma_is_anonymous(struct vm_area_struct *vma)
+-{
+-	return !vma->vm_ops;
+-}
+-
+-#ifdef CONFIG_SHMEM
+-/*
+- * The vma_is_shmem is not inline because it is used only by slow
+- * paths in userfault.
+- */
+-bool vma_is_shmem(struct vm_area_struct *vma);
+-#else
+-static inline bool vma_is_shmem(struct vm_area_struct *vma) { return false; }
+-#endif
+-
+-int vma_is_stack_for_current(struct vm_area_struct *vma);
+-
+ extern unsigned long move_page_tables(struct vm_area_struct *vma,
+ 		unsigned long old_addr, struct vm_area_struct *new_vma,
+ 		unsigned long new_addr, unsigned long len,
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index d50d4bea43b7..d68cebb02ed0 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -675,7 +675,7 @@ vm_fault_t do_huge_pmd_anonymous_page(struct vm_fault *vmf)
+ 	struct page *page;
+ 	unsigned long haddr = vmf->address & HPAGE_PMD_MASK;
+ 
+-	if (haddr < vma->vm_start || haddr + HPAGE_PMD_SIZE > vma->vm_end)
++	if (!transhuge_vma_suitable(vma, haddr))
+ 		return VM_FAULT_FALLBACK;
+ 	if (unlikely(anon_vma_prepare(vma)))
+ 		return VM_FAULT_OOM;
+diff --git a/mm/memory.c b/mm/memory.c
+index 583eb7e0dd7f..57bef6ec672b 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3436,19 +3436,6 @@ static vm_fault_t pte_alloc_one_map(struct vm_fault *vmf)
+ }
+ 
+ #ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
+-
+-#define HPAGE_CACHE_INDEX_MASK (HPAGE_PMD_NR - 1)
+-static inline bool transhuge_vma_suitable(struct vm_area_struct *vma,
+-		unsigned long haddr)
+-{
+-	if (((vma->vm_start >> PAGE_SHIFT) & HPAGE_CACHE_INDEX_MASK) !=
+-			(vma->vm_pgoff & HPAGE_CACHE_INDEX_MASK))
+-		return false;
+-	if (haddr < vma->vm_start || haddr + HPAGE_PMD_SIZE > vma->vm_end)
+-		return false;
+-	return true;
+-}
+-
+ static void deposit_prealloc_pte(struct vm_fault *vmf)
+ {
+ 	struct vm_area_struct *vma = vmf->vma;
