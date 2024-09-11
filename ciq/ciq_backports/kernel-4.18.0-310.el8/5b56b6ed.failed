@@ -1,0 +1,323 @@
+block: refactor blkdev_get
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 5b56b6ed574b583b07da9d824c1eca6d67c1074e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/5b56b6ed.failed
+
+Move more code that is only run on the outer open but not the open of
+the underlying whole device when opening a partition into blkdev_get,
+which leads to a much easier to follow structure.
+
+This allows to simplify the disk and module refcounting so that one
+reference is held for each open, similar to what we do with normal
+file operations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5b56b6ed574b583b07da9d824c1eca6d67c1074e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+diff --cc fs/block_dev.c
+index d19c1a4a405b,0c533ac92e24..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1543,41 -1407,13 +1543,48 @@@ EXPORT_SYMBOL_GPL(bdev_disk_changed)
+   *  mutex_lock(part->bd_mutex)
+   *    mutex_lock_nested(whole->bd_mutex, 1)
+   */
+++<<<<<<< HEAD
+ +
+ +static int __blkdev_get(struct block_device *bdev, fmode_t mode, int for_part)
+ +{
+ +	struct gendisk *disk;
+ +	int ret;
+ +	int partno;
+ +	int perm = 0;
+ +	bool first_open = false;
+ +
+ +	if (mode & FMODE_READ)
+ +		perm |= MAY_READ;
+ +	if (mode & FMODE_WRITE)
+ +		perm |= MAY_WRITE;
+ +	/*
+ +	 * hooks: /n/, see "layering violations".
+ +	 */
+ +	if (!for_part) {
+ +		ret = devcgroup_inode_permission(bdev->bd_inode, perm);
+ +		if (ret != 0)
+ +			return ret;
+ +	}
+ +
+ + restart:
+ +
+ +	ret = -ENXIO;
+ +	disk = bdev_get_gendisk(bdev, &partno);
+ +	if (!disk)
+ +		goto out;
+ +
+ +	disk_block_events(disk);
+ +	mutex_lock_nested(&bdev->bd_mutex, for_part);
+++=======
++ static int __blkdev_get(struct block_device *bdev, struct gendisk *disk,
++ 		int partno, fmode_t mode)
++ {
++ 	int ret;
++ 
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  	if (!bdev->bd_openers) {
+- 		first_open = true;
+  		bdev->bd_disk = disk;
+ +		bdev->bd_queue = disk->queue;
+  		bdev->bd_contains = bdev;
+  		bdev->bd_partno = partno;
+  
+@@@ -1588,26 -1424,11 +1595,29 @@@
+  				goto out_clear;
+  
+  			ret = 0;
+- 			if (disk->fops->open) {
++ 			if (disk->fops->open)
+  				ret = disk->fops->open(bdev, mode);
+++<<<<<<< HEAD
+ +				if (ret == -ERESTARTSYS) {
+ +					/* Lost a race with 'disk' being
+ +					 * deleted, try again.
+ +					 * See md.c
+ +					 */
+ +					disk_put_part(bdev->bd_part);
+ +					bdev->bd_part = NULL;
+ +					bdev->bd_disk = NULL;
+ +					bdev->bd_queue = NULL;
+ +					mutex_unlock(&bdev->bd_mutex);
+ +					disk_unblock_events(disk);
+ +					put_disk_and_module(disk);
+ +					goto restart;
+ +				}
+ +			}
+++=======
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  
+  			if (!ret) {
+ -				bd_set_nr_sectors(bdev, get_capacity(disk));
+ +				bd_set_size(bdev,(loff_t)get_capacity(disk)<<9);
+  				set_init_blocksize(bdev);
+  			}
+  
+@@@ -1624,17 -1445,18 +1634,32 @@@
+  			if (ret)
+  				goto out_clear;
+  		} else {
+++<<<<<<< HEAD
+ +			struct block_device *whole;
+ +			whole = bdget_disk(disk, 0);
+ +			ret = -ENOMEM;
+ +			if (!whole)
+ +				goto out_clear;
+ +			BUG_ON(for_part);
+ +			ret = __blkdev_get(whole, mode, 1);
+ +			if (ret) {
+ +				bdput(whole);
+ +				goto out_clear;
+ +			}
+++=======
++ 			struct block_device *whole = bdget_disk(disk, 0);
++ 
++ 			mutex_lock_nested(&whole->bd_mutex, 1);
++ 			ret = __blkdev_get(whole, disk, 0, mode);
++ 			if (ret) {
++ 				mutex_unlock(&whole->bd_mutex);
++ 				bdput(whole);
++ 				goto out_clear;
++ 			}
++ 			whole->bd_part_count++;
++ 			mutex_unlock(&whole->bd_mutex);
++ 
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  			bdev->bd_contains = whole;
+  			bdev->bd_part = disk_get_part(disk, partno);
+  			if (!(disk->flags & GENHD_FL_UP) ||
+@@@ -1662,29 -1485,13 +1688,36 @@@
+  		}
+  	}
+  	bdev->bd_openers++;
+++<<<<<<< HEAD
+ +	if (for_part)
+ +		bdev->bd_part_count++;
+ +	mutex_unlock(&bdev->bd_mutex);
+ +	disk_unblock_events(disk);
+ +	/* only one opener holds refs to the module and disk */
+ +	if (!first_open)
+ +		put_disk_and_module(disk);
+++=======
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  	return 0;
+  
+   out_clear:
+  	disk_put_part(bdev->bd_part);
+  	bdev->bd_disk = NULL;
+  	bdev->bd_part = NULL;
+++<<<<<<< HEAD
+ +	bdev->bd_queue = NULL;
+ +	if (bdev != bdev->bd_contains)
+ +		__blkdev_put(bdev->bd_contains, mode, 1);
+ +	bdev->bd_contains = NULL;
+ + out_unlock_bdev:
+ +	mutex_unlock(&bdev->bd_mutex);
+ +	disk_unblock_events(disk);
+ +	put_disk_and_module(disk);
+ + out:
+ +
+++=======
++ 	bdev->bd_contains = NULL;
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  	return ret;
+  }
+  
+@@@ -1707,55 -1514,86 +1740,129 @@@
+   * RETURNS:
+   * 0 on success, -errno on failure.
+   */
+ -static int blkdev_get(struct block_device *bdev, fmode_t mode, void *holder)
+ +int blkdev_get(struct block_device *bdev, fmode_t mode, void *holder)
+  {
+++<<<<<<< HEAD
+ +	struct block_device *whole = NULL;
+ +	int res;
+++=======
++ 	struct block_device *claiming;
++ 	bool unblock_events = true;
++ 	struct gendisk *disk;
++ 	int perm = 0;
++ 	int partno;
++ 	int ret;
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  
+ -	if (mode & FMODE_READ)
+ -		perm |= MAY_READ;
+ -	if (mode & FMODE_WRITE)
+ -		perm |= MAY_WRITE;
+ -	ret = devcgroup_inode_permission(bdev->bd_inode, perm);
+ -	if (ret)
+ -		goto bdput;
+ +	WARN_ON_ONCE((mode & FMODE_EXCL) && !holder);
+ +
+++<<<<<<< HEAD
+ +	if ((mode & FMODE_EXCL) && holder) {
+ +		whole = bd_start_claiming(bdev, holder);
+ +		if (IS_ERR(whole)) {
+ +			bdput(bdev);
+ +			return PTR_ERR(whole);
+ +		}
+ +	}
+ +
+ +	res = __blkdev_get(bdev, mode, 0);
+ +
+ +	if (whole) {
+ +		struct gendisk *disk = whole->bd_disk;
+ +
+ +		/* finish claiming */
+ +		mutex_lock(&bdev->bd_mutex);
+ +		if (!res)
+ +			bd_finish_claiming(bdev, whole, holder);
+ +		else
+ +			bd_abort_claiming(bdev, whole, holder);
+ +		/*
+ +		 * Block event polling for write claims if requested.  Any
+ +		 * write holder makes the write_holder state stick until
+ +		 * all are released.  This is good enough and tracking
+ +		 * individual writeable reference is too fragile given the
+ +		 * way @mode is used in blkdev_get/put().
+ +		 */
+ +		if (!res && (mode & FMODE_WRITE) && !bdev->bd_write_holder &&
+ +		    (disk->flags & GENHD_FL_BLOCK_EVENTS_ON_EXCL_WRITE)) {
+ +			bdev->bd_write_holder = true;
+ +			disk_block_events(disk);
+ +		}
+ +
+ +		mutex_unlock(&bdev->bd_mutex);
+ +		bdput(whole);
+ +	}
+  
+ +	if (res)
+ +		bdput(bdev);
+ +
+ +	return res;
+++=======
++ 	/*
++ 	 * If we lost a race with 'disk' being deleted, try again.  See md.c.
++ 	 */
++ retry:
++ 	ret = -ENXIO;
++ 	disk = bdev_get_gendisk(bdev, &partno);
++ 	if (!disk)
++ 		goto bdput;
++ 
++ 	if (mode & FMODE_EXCL) {
++ 		WARN_ON_ONCE(!holder);
++ 	
++ 		ret = -ENOMEM;
++ 		claiming = bdget_disk(disk, 0);
++ 		if (!claiming)
++ 			goto put_disk;
++ 		ret = bd_prepare_to_claim(bdev, claiming, holder);
++ 		if (ret)
++ 			goto put_claiming;
++ 	}
++ 
++ 	disk_block_events(disk);
++ 
++ 	mutex_lock(&bdev->bd_mutex);
++ 	ret =__blkdev_get(bdev, disk, partno, mode);
++ 	if (!(mode & FMODE_EXCL)) {
++ 		; /* nothing to do here */
++ 	} else if (ret) {
++ 		bd_abort_claiming(bdev, claiming, holder);
++ 	} else {
++ 		bd_finish_claiming(bdev, claiming, holder);
++ 
++ 		/*
++ 		 * Block event polling for write claims if requested.  Any write
++ 		 * holder makes the write_holder state stick until all are
++ 		 * released.  This is good enough and tracking individual
++ 		 * writeable reference is too fragile given the way @mode is
++ 		 * used in blkdev_get/put().
++ 		 */
++ 		if ((mode & FMODE_WRITE) && !bdev->bd_write_holder &&
++ 		    (disk->flags & GENHD_FL_BLOCK_EVENTS_ON_EXCL_WRITE)) {
++ 			bdev->bd_write_holder = true;
++ 			unblock_events = false;
++ 		}
++ 	}
++ 	mutex_unlock(&bdev->bd_mutex);
++ 
++ 	if (unblock_events)
++ 		disk_unblock_events(disk);
++ 
++ put_claiming:
++ 	if (mode & FMODE_EXCL)
++ 		bdput(claiming);
++ put_disk:
++ 	if (ret)
++ 		put_disk_and_module(disk);
++ 	if (ret == -ERESTARTSYS)
++ 		goto retry;
++ bdput:
++ 	if (ret)
++ 		bdput(bdev);
++ 	return ret;
+++>>>>>>> 5b56b6ed574b (block: refactor blkdev_get)
+  }
+ +EXPORT_SYMBOL(blkdev_get);
+  
+  /**
+   * blkdev_get_by_path - open a block device by name
+* Unmerged path fs/block_dev.c
