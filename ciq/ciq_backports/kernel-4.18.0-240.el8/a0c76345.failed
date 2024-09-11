@@ -1,0 +1,371 @@
+devlink: disallow reload operation during device cleanup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit a0c76345e3d3dbc40c39de2e00d15a3b7eef7885
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a0c76345.failed
+
+There is a race between driver code that does setup/cleanup of device
+and devlink reload operation that in some drivers works with the same
+code. Use after free could we easily obtained by running:
+
+while true; do
+        echo 10 > /sys/bus/netdevsim/new_device
+        devlink dev reload netdevsim/netdevsim10 &
+        echo 10 > /sys/bus/netdevsim/del_device
+done
+
+Fix this by enabling reload only after setup of device is complete and
+disabling it at the beginning of the cleanup process.
+
+	Reported-by: Ido Schimmel <idosch@mellanox.com>
+Fixes: 2d8dc5bbf4e7 ("devlink: Add support for reload")
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a0c76345e3d3dbc40c39de2e00d15a3b7eef7885)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/core.c
+#	drivers/net/netdevsim/dev.c
+#	include/net/devlink.h
+#	net/core/devlink.c
+diff --cc drivers/net/ethernet/mellanox/mlxsw/core.c
+index c3f56e7ad37b,da436a6aad2f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@@ -1134,8 -1198,10 +1134,14 @@@ __mlxsw_core_bus_device_register(const 
+  	if (err)
+  		goto err_thermal_init;
+  
+++<<<<<<< HEAD
+ +	if (mlxsw_driver->params_register && !reload)
+++=======
++ 	if (mlxsw_driver->params_register) {
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  		devlink_params_publish(devlink);
++ 		devlink_reload_enable(devlink);
++ 	}
+  
+  	return 0;
+  
+diff --cc drivers/net/netdevsim/dev.c
+index 8eedf9620b5e,059711edfc61..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -845,12 -705,178 +845,185 @@@ err_port_del_all
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nsim_dev_reload_create(struct nsim_dev *nsim_dev,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	struct nsim_bus_dev *nsim_bus_dev = nsim_dev->nsim_bus_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = priv_to_devlink(nsim_dev);
++ 	nsim_dev = devlink_priv(devlink);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, extack);
++ 	if (IS_ERR(nsim_dev->fib_data))
++ 		return PTR_ERR(nsim_dev->fib_data);
++ 
++ 	nsim_devlink_param_load_driverinit_values(devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_health_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_health_exit;
++ 
++ 	return 0;
++ 
++ err_health_exit:
++ 	nsim_dev_health_exit(nsim_dev);
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ 	return err;
++ }
++ 
++ int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
++ {
++ 	struct nsim_dev *nsim_dev;
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	devlink = devlink_alloc(&nsim_dev_devlink_ops, sizeof(*nsim_dev));
++ 	if (!devlink)
++ 		return -ENOMEM;
++ 	devlink_net_set(devlink, nsim_bus_dev->initial_net);
++ 	nsim_dev = devlink_priv(devlink);
++ 	nsim_dev->nsim_bus_dev = nsim_bus_dev;
++ 	nsim_dev->switch_id.id_len = sizeof(nsim_dev->switch_id.id);
++ 	get_random_bytes(nsim_dev->switch_id.id, nsim_dev->switch_id.id_len);
++ 	INIT_LIST_HEAD(&nsim_dev->port_list);
++ 	mutex_init(&nsim_dev->port_list_lock);
++ 	nsim_dev->fw_update_status = true;
++ 	nsim_dev->max_macs = NSIM_DEV_MAX_MACS_DEFAULT;
++ 	nsim_dev->test1 = NSIM_DEV_TEST1_DEFAULT;
++ 
++ 	dev_set_drvdata(&nsim_bus_dev->dev, nsim_dev);
++ 
++ 	err = nsim_dev_resources_register(devlink);
++ 	if (err)
++ 		goto err_devlink_free;
++ 
++ 	nsim_dev->fib_data = nsim_fib_create(devlink, NULL);
++ 	if (IS_ERR(nsim_dev->fib_data)) {
++ 		err = PTR_ERR(nsim_dev->fib_data);
++ 		goto err_resources_unregister;
++ 	}
++ 
++ 	err = devlink_register(devlink, &nsim_bus_dev->dev);
++ 	if (err)
++ 		goto err_fib_destroy;
++ 
++ 	err = devlink_params_register(devlink, nsim_devlink_params,
++ 				      ARRAY_SIZE(nsim_devlink_params));
++ 	if (err)
++ 		goto err_dl_unregister;
++ 	nsim_devlink_set_params_init_values(nsim_dev, devlink);
++ 
++ 	err = nsim_dev_dummy_region_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_params_unregister;
++ 
++ 	err = nsim_dev_traps_init(devlink);
++ 	if (err)
++ 		goto err_dummy_region_exit;
++ 
++ 	err = nsim_dev_debugfs_init(nsim_dev);
++ 	if (err)
++ 		goto err_traps_exit;
++ 
++ 	err = nsim_dev_health_init(nsim_dev, devlink);
++ 	if (err)
++ 		goto err_debugfs_exit;
++ 
++ 	err = nsim_bpf_dev_init(nsim_dev);
++ 	if (err)
++ 		goto err_health_exit;
++ 
++ 	err = nsim_dev_port_add_all(nsim_dev, nsim_bus_dev->port_count);
++ 	if (err)
++ 		goto err_bpf_dev_exit;
++ 
++ 	devlink_params_publish(devlink);
++ 	devlink_reload_enable(devlink);
++ 	return 0;
++ 
++ err_bpf_dev_exit:
++ 	nsim_bpf_dev_exit(nsim_dev);
++ err_health_exit:
++ 	nsim_dev_health_exit(nsim_dev);
++ err_debugfs_exit:
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ err_traps_exit:
++ 	nsim_dev_traps_exit(devlink);
++ err_dummy_region_exit:
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ err_params_unregister:
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ err_dl_unregister:
++ 	devlink_unregister(devlink);
++ err_fib_destroy:
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ err_resources_unregister:
++ 	devlink_resources_unregister(devlink, NULL);
++ err_devlink_free:
++ 	devlink_free(devlink);
++ 	return err;
++ }
++ 
++ static void nsim_dev_reload_destroy(struct nsim_dev *nsim_dev)
++ {
++ 	struct devlink *devlink = priv_to_devlink(nsim_dev);
++ 
++ 	if (devlink_is_reload_failed(devlink))
++ 		return;
++ 	nsim_dev_port_del_all(nsim_dev);
++ 	nsim_dev_health_exit(nsim_dev);
++ 	nsim_dev_traps_exit(devlink);
++ 	nsim_dev_dummy_region_exit(nsim_dev);
++ 	mutex_destroy(&nsim_dev->port_list_lock);
++ 	nsim_fib_destroy(devlink, nsim_dev->fib_data);
++ }
++ 
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  void nsim_dev_remove(struct nsim_bus_dev *nsim_bus_dev)
+  {
+  	struct nsim_dev *nsim_dev = dev_get_drvdata(&nsim_bus_dev->dev);
+ -	struct devlink *devlink = priv_to_devlink(nsim_dev);
+  
+++<<<<<<< HEAD
+ +	nsim_dev_port_del_all(nsim_dev);
+ +	nsim_dev_destroy(nsim_dev);
+++=======
++ 	devlink_reload_disable(devlink);
++ 
++ 	nsim_dev_reload_destroy(nsim_dev);
++ 
++ 	nsim_bpf_dev_exit(nsim_dev);
++ 	nsim_dev_debugfs_exit(nsim_dev);
++ 	devlink_params_unregister(devlink, nsim_devlink_params,
++ 				  ARRAY_SIZE(nsim_devlink_params));
++ 	devlink_unregister(devlink);
++ 	devlink_resources_unregister(devlink, NULL);
++ 	devlink_free(devlink);
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  }
+  
+  static struct nsim_dev_port *
+diff --cc include/net/devlink.h
+index 1be9e4aa74a5,7891611868e4..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -42,7 -38,9 +42,13 @@@ struct devlink 
+  	struct device *dev;
+  	possible_net_t _net;
+  	struct mutex lock;
+++<<<<<<< HEAD
+ +	bool reload_failed;
+++=======
++ 	u8 reload_failed:1,
++ 	   reload_enabled:1,
++ 	   registered:1;
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  	char priv[0] __aligned(NETDEV_ALIGN);
+  };
+  
+diff --cc net/core/devlink.c
+index 81068caea3dc,2e027c9436e0..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -2708,6 -2786,26 +2708,29 @@@ bool devlink_is_reload_failed(const str
+  }
+  EXPORT_SYMBOL_GPL(devlink_is_reload_failed);
+  
+++<<<<<<< HEAD
+++=======
++ static int devlink_reload(struct devlink *devlink, struct net *dest_net,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (!devlink->reload_enabled)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = devlink->ops->reload_down(devlink, !!dest_net, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	if (dest_net && !net_eq(dest_net, devlink_net(devlink)))
++ 		devlink_reload_netns_change(devlink, dest_net);
++ 
++ 	err = devlink->ops->reload_up(devlink, extack);
++ 	devlink_reload_failed_set(devlink, !!err);
++ 	return err;
++ }
++ 
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  static int devlink_nl_cmd_reload(struct sk_buff *skb, struct genl_info *info)
+  {
+  	struct devlink *devlink = info->user_ptr[0];
+@@@ -8096,9 -8227,43 +8156,37 @@@ int devlink_compat_switch_id_get(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __net_exit devlink_pernet_pre_exit(struct net *net)
++ {
++ 	struct devlink *devlink;
++ 	int err;
++ 
++ 	/* In case network namespace is getting destroyed, reload
++ 	 * all devlink instances from this namespace into init_net.
++ 	 */
++ 	mutex_lock(&devlink_mutex);
++ 	list_for_each_entry(devlink, &devlink_list, list) {
++ 		if (net_eq(devlink_net(devlink), net)) {
++ 			if (WARN_ON(!devlink_reload_supported(devlink)))
++ 				continue;
++ 			err = devlink_reload(devlink, &init_net, NULL);
++ 			if (err && err != -EOPNOTSUPP)
++ 				pr_warn("Failed to reload devlink instance into init_net\n");
++ 		}
++ 	}
++ 	mutex_unlock(&devlink_mutex);
++ }
++ 
++ static struct pernet_operations devlink_pernet_ops __net_initdata = {
++ 	.pre_exit = devlink_pernet_pre_exit,
++ };
++ 
+++>>>>>>> a0c76345e3d3 (devlink: disallow reload operation during device cleanup)
+  static int __init devlink_init(void)
+  {
+ -	int err;
+ -
+ -	err = genl_register_family(&devlink_nl_family);
+ -	if (err)
+ -		goto out;
+ -	err = register_pernet_subsys(&devlink_pernet_ops);
+ -
+ -out:
+ -	WARN_ON(err);
+ -	return err;
+ +	return genl_register_family(&devlink_nl_family);
+  }
+  
+  subsys_initcall(devlink_init);
+diff --git a/drivers/net/ethernet/mellanox/mlx4/main.c b/drivers/net/ethernet/mellanox/mlx4/main.c
+index 5e04fc7ef5bc..d6f71f5768b9 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -3998,6 +3998,7 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 		goto err_params_unregister;
+ 
+ 	devlink_params_publish(devlink);
++	devlink_reload_enable(devlink);
+ 	pci_save_state(pdev);
+ 	return 0;
+ 
+@@ -4109,6 +4110,8 @@ static void mlx4_remove_one(struct pci_dev *pdev)
+ 	struct devlink *devlink = priv_to_devlink(priv);
+ 	int active_vfs = 0;
+ 
++	devlink_reload_disable(devlink);
++
+ 	if (mlx4_is_slave(dev))
+ 		persist->interface_state |= MLX4_INTERFACE_STATE_NOWAIT;
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/core.c
+* Unmerged path drivers/net/netdevsim/dev.c
+* Unmerged path include/net/devlink.h
+* Unmerged path net/core/devlink.c
