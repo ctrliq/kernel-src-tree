@@ -73,6 +73,7 @@ struct crypto_spawn {
 	struct crypto_instance *inst;
 	const struct crypto_type *frontend;
 	u32 mask;
+	bool dead;
 };
 
 struct crypto_queue {
