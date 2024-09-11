@@ -1,0 +1,340 @@
+netfilter: nf_tables: autoload modules from the abort path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit eb014de4fd418de1a277913cba244e47274fe392
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/eb014de4.failed
+
+This patch introduces a list of pending module requests. This new module
+list is composed of nft_module_request objects that contain the module
+name and one status field that tells if the module has been already
+loaded (the 'done' field).
+
+In the first pass, from the preparation phase, the netlink command finds
+that a module is missing on this list. Then, a module request is
+allocated and added to this list and nft_request_module() returns
+-EAGAIN. This triggers the abort path with the autoload parameter set on
+from nfnetlink, request_module() is called and the module request enters
+the 'done' state. Since the mutex is released when loading modules from
+the abort phase, the module list is zapped so this is iteration occurs
+over a local list. Therefore, the request_module() calls happen when
+object lists are in consistent state (after fulling aborting the
+transaction) and the commit list is empty.
+
+On the second pass, the netlink command will find that it already tried
+to load the module, so it does not request it again and
+nft_request_module() returns 0. Then, there is a look up to find the
+object that the command was missing. If the module was successfully
+loaded, the command proceeds normally since it finds the missing object
+in place, otherwise -ENOENT is reported to userspace.
+
+This patch also updates nfnetlink to include the reason to enter the
+abort phase, which is required for this new autoload module rationale.
+
+Fixes: ec7470b834fe ("netfilter: nf_tables: store transaction list locally while requesting module")
+	Reported-by: syzbot+29125d208b3dae9a7019@syzkaller.appspotmail.com
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit eb014de4fd418de1a277913cba244e47274fe392)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/nftables.h
+#	net/netfilter/nf_tables_api.c
+#	net/netfilter/nfnetlink.c
+diff --cc include/net/netns/nftables.h
+index 94767ea3a490,a1a8d45adb42..000000000000
+--- a/include/net/netns/nftables.h
++++ b/include/net/netns/nftables.h
+@@@ -7,6 -7,8 +7,11 @@@
+  struct netns_nftables {
+  	struct list_head	tables;
+  	struct list_head	commit_list;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head	module_list;
++ 	struct mutex		commit_mutex;
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  	unsigned int		base_seq;
+  	u8			gencursor;
+  	u8			validate_state;
+diff --cc net/netfilter/nf_tables_api.c
+index eb8b9258c93a,7e63b481cc86..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -510,34 -578,45 +510,76 @@@ __nf_tables_chain_type_lookup(const str
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Loading a module requires dropping mutex that guards the
+ + * transaction.
+ + * We first need to abort any pending transactions as once
+ + * mutex is unlocked a different client could start a new
+ + * transaction.  It must not see any 'future generation'
+ + * changes * as these changes will never happen.
+ + */
+ +#ifdef CONFIG_MODULES
+ +static int __nf_tables_abort(struct net *net);
+ +
+ +static void nft_request_module(struct net *net, const char *fmt, ...)
+ +{
+ +	char module_name[MODULE_NAME_LEN];
+ +	va_list args;
+ +	int ret;
+ +
+ +	__nf_tables_abort(net);
+ +
+ +	va_start(args, fmt);
+ +	ret = vsnprintf(module_name, MODULE_NAME_LEN, fmt, args);
+ +	va_end(args);
+ +	if (WARN(ret >= MODULE_NAME_LEN, "truncated: '%s' (len %d)", module_name, ret))
+ +		return;
+ +
+ +	nfnl_unlock(NFNL_SUBSYS_NFTABLES);
+ +	request_module("%s", module_name);
+ +	nfnl_lock(NFNL_SUBSYS_NFTABLES);
+++=======
++ struct nft_module_request {
++ 	struct list_head	list;
++ 	char			module[MODULE_NAME_LEN];
++ 	bool			done;
++ };
++ 
++ #ifdef CONFIG_MODULES
++ static int nft_request_module(struct net *net, const char *fmt, ...)
++ {
++ 	char module_name[MODULE_NAME_LEN];
++ 	struct nft_module_request *req;
++ 	va_list args;
++ 	int ret;
++ 
++ 	va_start(args, fmt);
++ 	ret = vsnprintf(module_name, MODULE_NAME_LEN, fmt, args);
++ 	va_end(args);
++ 	if (ret >= MODULE_NAME_LEN)
++ 		return 0;
++ 
++ 	list_for_each_entry(req, &net->nft.module_list, list) {
++ 		if (!strcmp(req->module, module_name)) {
++ 			if (req->done)
++ 				return 0;
++ 
++ 			/* A request to load this module already exists. */
++ 			return -EAGAIN;
++ 		}
++ 	}
++ 
++ 	req = kmalloc(sizeof(*req), GFP_KERNEL);
++ 	if (!req)
++ 		return -ENOMEM;
++ 
++ 	req->done = false;
++ 	strlcpy(req->module, module_name, MODULE_NAME_LEN);
++ 	list_add_tail(&req->list, &net->nft.module_list);
++ 
++ 	return -EAGAIN;
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  }
+  #endif
+  
+@@@ -550,12 -636,13 +592,11 @@@ nf_tables_chain_type_lookup(struct net 
+  	type = __nf_tables_chain_type_lookup(nla, family);
+  	if (type != NULL)
+  		return type;
+ -
+ -	lockdep_nfnl_nft_mutex_not_held();
+  #ifdef CONFIG_MODULES
+  	if (autoload) {
+- 		nft_request_module(net, "nft-chain-%u-%.*s", family,
+- 				   nla_len(nla), (const char *)nla_data(nla));
+- 		type = __nf_tables_chain_type_lookup(nla, family);
+- 		if (type != NULL)
++ 		if (nft_request_module(net, "nft-chain-%u-%.*s", family,
++ 				       nla_len(nla),
++ 				       (const char *)nla_data(nla)) == -EAGAIN)
+  			return ERR_PTR(-EAGAIN);
+  	}
+  #endif
+@@@ -2939,10 -3306,11 +2980,9 @@@ nft_select_set_ops(const struct nft_ct
+  	const struct nft_set_type *type;
+  	u32 flags = 0;
+  
+ -	lockdep_assert_held(&ctx->net->nft.commit_mutex);
+ -	lockdep_nfnl_nft_mutex_not_held();
+  #ifdef CONFIG_MODULES
+  	if (list_empty(&nf_tables_set_types)) {
+- 		nft_request_module(ctx->net, "nft-set");
+- 		if (!list_empty(&nf_tables_set_types))
++ 		if (nft_request_module(ctx->net, "nft-set") == -EAGAIN)
+  			return ERR_PTR(-EAGAIN);
+  	}
+  #endif
+@@@ -5158,10 -5433,10 +5198,9 @@@ nft_obj_type_get(struct net *net, u32 o
+  	if (type != NULL && try_module_get(type->owner))
+  		return type;
+  
+ -	lockdep_nfnl_nft_mutex_not_held();
+  #ifdef CONFIG_MODULES
+  	if (type == NULL) {
+- 		nft_request_module(net, "nft-obj-%u", objtype);
+- 		if (__nft_obj_type_get(objtype))
++ 		if (nft_request_module(net, "nft-obj-%u", objtype) == -EAGAIN)
+  			return ERR_PTR(-EAGAIN);
+  	}
+  #endif
+@@@ -5720,10 -6006,10 +5759,9 @@@ nft_flowtable_type_get(struct net *net
+  	if (type != NULL && try_module_get(type->owner))
+  		return type;
+  
+ -	lockdep_nfnl_nft_mutex_not_held();
+  #ifdef CONFIG_MODULES
+  	if (type == NULL) {
+- 		nft_request_module(net, "nf-flowtable-%u", family);
+- 		if (__nft_flowtable_type_get(family))
++ 		if (nft_request_module(net, "nf-flowtable-%u", family) == -EAGAIN)
+  			return ERR_PTR(-EAGAIN);
+  	}
+  #endif
+@@@ -6624,6 -7011,51 +6662,54 @@@ static void nft_chain_del(struct nft_ch
+  	list_del_rcu(&chain->list);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nf_tables_module_autoload_cleanup(struct net *net)
++ {
++ 	struct nft_module_request *req, *next;
++ 
++ 	WARN_ON_ONCE(!list_empty(&net->nft.commit_list));
++ 	list_for_each_entry_safe(req, next, &net->nft.module_list, list) {
++ 		WARN_ON_ONCE(!req->done);
++ 		list_del(&req->list);
++ 		kfree(req);
++ 	}
++ }
++ 
++ static void nf_tables_commit_release(struct net *net)
++ {
++ 	struct nft_trans *trans;
++ 
++ 	/* all side effects have to be made visible.
++ 	 * For example, if a chain named 'foo' has been deleted, a
++ 	 * new transaction must not find it anymore.
++ 	 *
++ 	 * Memory reclaim happens asynchronously from work queue
++ 	 * to prevent expensive synchronize_rcu() in commit phase.
++ 	 */
++ 	if (list_empty(&net->nft.commit_list)) {
++ 		nf_tables_module_autoload_cleanup(net);
++ 		mutex_unlock(&net->nft.commit_mutex);
++ 		return;
++ 	}
++ 
++ 	trans = list_last_entry(&net->nft.commit_list,
++ 				struct nft_trans, list);
++ 	get_net(trans->ctx.net);
++ 	WARN_ON_ONCE(trans->put_net);
++ 
++ 	trans->put_net = true;
++ 	spin_lock(&nf_tables_destroy_list_lock);
++ 	list_splice_tail_init(&net->nft.commit_list, &nf_tables_destroy_list);
++ 	spin_unlock(&nf_tables_destroy_list_lock);
++ 
++ 	nf_tables_module_autoload_cleanup(net);
++ 	mutex_unlock(&net->nft.commit_mutex);
++ 
++ 	schedule_work(&trans_destroy_work);
++ }
++ 
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+  {
+  	struct nft_trans *trans, *next;
+@@@ -6945,9 -7426,13 +7056,17 @@@ static void nf_tables_cleanup(struct ne
+  	nft_validate_state_update(net, NFT_VALIDATE_SKIP);
+  }
+  
+- static int nf_tables_abort(struct net *net, struct sk_buff *skb)
++ static int nf_tables_abort(struct net *net, struct sk_buff *skb, bool autoload)
+  {
+++<<<<<<< HEAD
+ +	return __nf_tables_abort(net);
+++=======
++ 	int ret = __nf_tables_abort(net, autoload);
++ 
++ 	mutex_unlock(&net->nft.commit_mutex);
++ 
++ 	return ret;
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  }
+  
+  static bool nf_tables_valid_genid(struct net *net, u32 genid)
+@@@ -7532,6 -8023,8 +7651,11 @@@ static int __net_init nf_tables_init_ne
+  {
+  	INIT_LIST_HEAD(&net->nft.tables);
+  	INIT_LIST_HEAD(&net->nft.commit_list);
+++<<<<<<< HEAD
+++=======
++ 	INIT_LIST_HEAD(&net->nft.module_list);
++ 	mutex_init(&net->nft.commit_mutex);
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  	net->nft.base_seq = 1;
+  	net->nft.validate_state = NFT_VALIDATE_SKIP;
+  
+@@@ -7540,11 -8033,11 +7664,11 @@@
+  
+  static void __net_exit nf_tables_exit_net(struct net *net)
+  {
+ -	mutex_lock(&net->nft.commit_mutex);
+ +	nfnl_lock(NFNL_SUBSYS_NFTABLES);
+  	if (!list_empty(&net->nft.commit_list))
+- 		__nf_tables_abort(net);
++ 		__nf_tables_abort(net, false);
+  	__nft_release_tables(net);
+ -	mutex_unlock(&net->nft.commit_mutex);
+ +	nfnl_unlock(NFNL_SUBSYS_NFTABLES);
+  	WARN_ON_ONCE(!list_empty(&net->nft.tables));
+  }
+  
+diff --cc net/netfilter/nfnetlink.c
+index 22d40a428157,99127e2d95a8..000000000000
+--- a/net/netfilter/nfnetlink.c
++++ b/net/netfilter/nfnetlink.c
+@@@ -474,13 -476,8 +474,17 @@@ ack
+  	}
+  done:
+  	if (status & NFNL_BATCH_REPLAY) {
+++<<<<<<< HEAD
+ +		const struct nfnetlink_subsystem *ss2;
+ +
+ +		ss2 = nfnl_dereference_protected(subsys_id);
+ +		if (ss2 == ss)
+ +			ss->abort(net, oskb);
+++=======
++ 		ss->abort(net, oskb, true);
+++>>>>>>> eb014de4fd41 (netfilter: nf_tables: autoload modules from the abort path)
+  		nfnl_err_reset(&err_list);
+ +		nfnl_unlock(subsys_id);
+  		kfree_skb(skb);
+  		module_put(ss->owner);
+  		goto replay;
+diff --git a/include/linux/netfilter/nfnetlink.h b/include/linux/netfilter/nfnetlink.h
+index 4a520d3304a2..cb5bae6fff91 100644
+--- a/include/linux/netfilter/nfnetlink.h
++++ b/include/linux/netfilter/nfnetlink.h
+@@ -31,7 +31,7 @@ struct nfnetlink_subsystem {
+ 	const struct nfnl_callback *cb;	/* callback for individual types */
+ 	struct module *owner;
+ 	int (*commit)(struct net *net, struct sk_buff *skb);
+-	int (*abort)(struct net *net, struct sk_buff *skb);
++	int (*abort)(struct net *net, struct sk_buff *skb, bool autoload);
+ 	void (*cleanup)(struct net *net);
+ 	bool (*valid_genid)(struct net *net, u32 genid);
+ };
+* Unmerged path include/net/netns/nftables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+* Unmerged path net/netfilter/nfnetlink.c
