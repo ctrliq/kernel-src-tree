@@ -1,0 +1,141 @@
+KVM: x86: Refactor out-of-range logic to contain the madness
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 09c7431ed31f3cc71aba2c35a6d11a742db47b2a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/09c7431e.failed
+
+Move all of the out-of-range logic into a single helper,
+get_out_of_range_cpuid_entry(), to avoid an extra lookup of CPUID.0.0
+and to provide a single location for documenting the out-of-range
+behavior.
+
+No functional change intended.
+
+	Cc: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 09c7431ed31f3cc71aba2c35a6d11a742db47b2a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+diff --cc arch/x86/kvm/cpuid.c
+index 78d6db1ce0f2,afa2062b5a79..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -995,16 -918,71 +995,55 @@@ struct kvm_cpuid_entry2 *kvm_find_cpuid
+  EXPORT_SYMBOL_GPL(kvm_find_cpuid_entry);
+  
+  /*
+ - * Intel CPUID semantics treats any query for an out-of-range leaf as if the
+ - * highest basic leaf (i.e. CPUID.0H:EAX) were requested.  AMD CPUID semantics
+ - * returns all zeroes for any undefined leaf, whether or not the leaf is in
+ - * range.  Centaur/VIA follows Intel semantics.
+ - *
+ - * A leaf is considered out-of-range if its function is higher than the maximum
+ - * supported leaf of its associated class or if its associated class does not
+ - * exist.
+ - *
+ - * There are three primary classes to be considered, with their respective
+ - * ranges described as "<base> - <top>[,<base2> - <top2>] inclusive.  A primary
+ - * class exists if a guest CPUID entry for its <base> leaf exists.  For a given
+ - * class, CPUID.<base>.EAX contains the max supported leaf for the class.
+ - *
+ - *  - Basic:      0x00000000 - 0x3fffffff, 0x50000000 - 0x7fffffff
+ - *  - Hypervisor: 0x40000000 - 0x4fffffff
+ - *  - Extended:   0x80000000 - 0xbfffffff
+ - *  - Centaur:    0xc0000000 - 0xcfffffff
+ - *
+ - * The Hypervisor class is further subdivided into sub-classes that each act as
+ - * their own indepdent class associated with a 0x100 byte range.  E.g. if Qemu
+ - * is advertising support for both HyperV and KVM, the resulting Hypervisor
+ - * CPUID sub-classes are:
+ - *
+ - *  - HyperV:     0x40000000 - 0x400000ff
+ - *  - KVM:        0x40000100 - 0x400001ff
+ + * If the basic or extended CPUID leaf requested is higher than the
+ + * maximum supported basic or extended leaf, respectively, then it is
+ + * out of range.
+   */
+- static bool cpuid_function_in_range(struct kvm_vcpu *vcpu, u32 function)
++ static struct kvm_cpuid_entry2 *
++ get_out_of_range_cpuid_entry(struct kvm_vcpu *vcpu, u32 *fn_ptr, u32 index)
+  {
+++<<<<<<< HEAD
+ +	struct kvm_cpuid_entry2 *max;
+ +
+ +	max = kvm_find_cpuid_entry(vcpu, function & 0x80000000, 0);
+ +	return max && function <= max->eax;
+++=======
++ 	struct kvm_cpuid_entry2 *basic, *class;
++ 	u32 function = *fn_ptr;
++ 
++ 	basic = kvm_find_cpuid_entry(vcpu, 0, 0);
++ 	if (!basic)
++ 		return NULL;
++ 
++ 	if (is_guest_vendor_amd(basic->ebx, basic->ecx, basic->edx) ||
++ 	    is_guest_vendor_hygon(basic->ebx, basic->ecx, basic->edx))
++ 		return NULL;
++ 
++ 	if (function >= 0x40000000 && function <= 0x4fffffff)
++ 		class = kvm_find_cpuid_entry(vcpu, function & 0xffffff00, 0);
++ 	else if (function >= 0xc0000000)
++ 		class = kvm_find_cpuid_entry(vcpu, 0xc0000000, 0);
++ 	else
++ 		class = kvm_find_cpuid_entry(vcpu, function & 0x80000000, 0);
++ 
++ 	if (class && function <= class->eax)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Leaf specific adjustments are also applied when redirecting to the
++ 	 * max basic entry, e.g. if the max basic leaf is 0xb but there is no
++ 	 * entry for CPUID.0xb.index (see below), then the output value for EDX
++ 	 * needs to be pulled from CPUID.0xb.1.
++ 	 */
++ 	*fn_ptr = basic->eax;
++ 
++ 	/*
++ 	 * The class does not exist or the requested function is out of range;
++ 	 * the effective CPUID entry is the max basic leaf.  Note, the index of
++ 	 * the original requested leaf is observed!
++ 	 */
++ 	return kvm_find_cpuid_entry(vcpu, basic->eax, index);
+++>>>>>>> 09c7431ed31f (KVM: x86: Refactor out-of-range logic to contain the madness)
+  }
+  
+  bool kvm_cpuid(struct kvm_vcpu *vcpu, u32 *eax, u32 *ebx,
+@@@ -1017,20 -994,10 +1055,27 @@@
+  
+  	entry = kvm_find_cpuid_entry(vcpu, function, index);
+  	found = entry;
+++<<<<<<< HEAD
+ +	/*
+ +	 * Intel CPUID semantics treats any query for an out-of-range
+ +	 * leaf as if the highest basic leaf (i.e. CPUID.0H:EAX) were
+ +	 * requested. AMD CPUID semantics returns all zeroes for any
+ +	 * undefined leaf, whether or not the leaf is in range.
+ +	 */
+ +	if (!entry && check_limit && !guest_cpuid_is_amd(vcpu) &&
+ +	    !cpuid_function_in_range(vcpu, function)) {
+ +		max = kvm_find_cpuid_entry(vcpu, 0, 0);
+ +		if (max) {
+ +			function = max->eax;
+ +			entry = kvm_find_cpuid_entry(vcpu, function, index);
+ +		}
+ +	}
+++=======
++ 
++ 	if (!entry && check_limit)
++ 		entry = get_out_of_range_cpuid_entry(vcpu, &function, index);
++ 
+++>>>>>>> 09c7431ed31f (KVM: x86: Refactor out-of-range logic to contain the madness)
+  	if (entry) {
+  		*eax = entry->eax;
+  		*ebx = entry->ebx;
+* Unmerged path arch/x86/kvm/cpuid.c
