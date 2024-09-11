@@ -1,0 +1,156 @@
+blk-mq: factor out a helper to reise the block softirq
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 115243f5534c7b3980cc946e00f79740fdc0e068
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/115243f5.failed
+
+Add a helper to deduplicate the logic that raises the block softirq.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 115243f5534c7b3980cc946e00f79740fdc0e068)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index c171067ef580,a261e145ddfb..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -573,6 -576,127 +573,130 @@@ void blk_mq_end_request(struct request 
+  }
+  EXPORT_SYMBOL(blk_mq_end_request);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Softirq action handler - move entries to local list and loop over them
++  * while passing them to the queue registered handler.
++  */
++ static __latent_entropy void blk_done_softirq(struct softirq_action *h)
++ {
++ 	struct list_head *cpu_list, local_list;
++ 
++ 	local_irq_disable();
++ 	cpu_list = this_cpu_ptr(&blk_cpu_done);
++ 	list_replace_init(cpu_list, &local_list);
++ 	local_irq_enable();
++ 
++ 	while (!list_empty(&local_list)) {
++ 		struct request *rq;
++ 
++ 		rq = list_entry(local_list.next, struct request, ipi_list);
++ 		list_del_init(&rq->ipi_list);
++ 		rq->q->mq_ops->complete(rq);
++ 	}
++ }
++ 
++ static void blk_mq_trigger_softirq(struct request *rq)
++ {
++ 	struct list_head *list = this_cpu_ptr(&blk_cpu_done);
++ 
++ 	list_add_tail(&rq->ipi_list, list);
++ 
++ 	/*
++ 	 * If the list only contains our just added request, signal a raise of
++ 	 * the softirq.  If there are already entries there, someone already
++ 	 * raised the irq but it hasn't run yet.
++ 	 */
++ 	if (list->next == &rq->ipi_list)
++ 		raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ }
++ 
++ #ifdef CONFIG_SMP
++ static void trigger_softirq(void *data)
++ {
++ 	blk_mq_trigger_softirq(data);
++ }
++ 
++ /*
++  * Setup and invoke a run of 'trigger_softirq' on the given cpu.
++  */
++ static int raise_blk_irq(int cpu, struct request *rq)
++ {
++ 	if (cpu_online(cpu)) {
++ 		call_single_data_t *data = &rq->csd;
++ 
++ 		data->func = trigger_softirq;
++ 		data->info = rq;
++ 		data->flags = 0;
++ 
++ 		smp_call_function_single_async(cpu, data);
++ 		return 0;
++ 	}
++ 
++ 	return 1;
++ }
++ #else /* CONFIG_SMP */
++ static int raise_blk_irq(int cpu, struct request *rq)
++ {
++ 	return 1;
++ }
++ #endif
++ 
++ static int blk_softirq_cpu_dead(unsigned int cpu)
++ {
++ 	/*
++ 	 * If a CPU goes away, splice its entries to the current CPU
++ 	 * and trigger a run of the softirq
++ 	 */
++ 	local_irq_disable();
++ 	list_splice_init(&per_cpu(blk_cpu_done, cpu),
++ 			 this_cpu_ptr(&blk_cpu_done));
++ 	raise_softirq_irqoff(BLOCK_SOFTIRQ);
++ 	local_irq_enable();
++ 
++ 	return 0;
++ }
++ 
++ static void __blk_complete_request(struct request *req)
++ {
++ 	struct request_queue *q = req->q;
++ 	int cpu, ccpu = req->mq_ctx->cpu;
++ 	unsigned long flags;
++ 	bool shared = false;
++ 
++ 	BUG_ON(!q->mq_ops->complete);
++ 
++ 	local_irq_save(flags);
++ 	cpu = smp_processor_id();
++ 
++ 	/*
++ 	 * Select completion CPU
++ 	 */
++ 	if (test_bit(QUEUE_FLAG_SAME_COMP, &q->queue_flags) && ccpu != -1) {
++ 		if (!test_bit(QUEUE_FLAG_SAME_FORCE, &q->queue_flags))
++ 			shared = cpus_share_cache(cpu, ccpu);
++ 	} else
++ 		ccpu = cpu;
++ 
++ 	/*
++ 	 * If current CPU and requested CPU share a cache, run the softirq on
++ 	 * the current CPU. One might concern this is just like
++ 	 * QUEUE_FLAG_SAME_FORCE, but actually not. blk_complete_request() is
++ 	 * running in interrupt handler, and currently I/O controller doesn't
++ 	 * support multiple interrupts, so current CPU is unique actually. This
++ 	 * avoids IPI sending from current CPU to the first CPU of a group.
++ 	 */
++ 	if (ccpu == cpu || shared) {
++ do_local:
++ 		blk_mq_trigger_softirq(req);
++ 	} else if (raise_blk_irq(ccpu, req))
++ 		goto do_local;
++ 
++ 	local_irq_restore(flags);
++ }
++ 
+++>>>>>>> 115243f5534c (blk-mq: factor out a helper to reise the block softirq)
+  static void __blk_mq_complete_request_remote(void *data)
+  {
+  	struct request *rq = data;
+* Unmerged path block/blk-mq.c
