@@ -1,0 +1,132 @@
+nvme: simplify error logic in nvme_validate_ns()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Hannes Reinecke <hare@suse.de>
+commit d95c1f4179a7f3ea8aa728ed00252a8ed0f8158f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/d95c1f41.failed
+
+We only should remove namespaces when we get fatal error back from
+the device or when the namespace IDs have changed.
+So instead of painfully masking out error numbers which might indicate
+that the error should be ignored we could use an NVME status code
+to indicated when the namespace should be removed.
+That simplifies the final logic and makes it less error-prone.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Daniel Wagner <dwagner@suse.de>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit d95c1f4179a7f3ea8aa728ed00252a8ed0f8158f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index 2fa0ae6b20cd,e084120c3453..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -1483,9 -1440,17 +1483,9 @@@ static int nvme_identify_ns(struct nvme
+  		goto out_free_id;
+  	}
+  
+- 	error = -ENODEV;
++ 	error = NVME_SC_INVALID_NS | NVME_SC_DNR;
+  	if ((*id)->ncap == 0) /* namespace not allocated or attached */
+  		goto out_free_id;
+ -
+ -	if (ctrl->vs >= NVME_VS(1, 1, 0) &&
+ -	    !memchr_inv(ids->eui64, 0, sizeof(ids->eui64)))
+ -		memcpy(ids->eui64, (*id)->eui64, sizeof(ids->eui64));
+ -	if (ctrl->vs >= NVME_VS(1, 2, 0) &&
+ -	    !memchr_inv(ids->nguid, 0, sizeof(ids->nguid)))
+ -		memcpy(ids->nguid, (*id)->nguid, sizeof(ids->nguid));
+ -
+  	return 0;
+  
+  out_free_id:
+@@@ -4142,17 -4035,73 +4142,54 @@@ static void nvme_ns_remove_by_nsid(stru
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nvme_validate_ns(struct nvme_ns *ns, struct nvme_ns_ids *ids)
++ {
++ 	struct nvme_id_ns *id;
++ 	int ret = NVME_SC_INVALID_NS | NVME_SC_DNR;
++ 
++ 	if (test_bit(NVME_NS_DEAD, &ns->flags))
++ 		goto out;
++ 
++ 	ret = nvme_identify_ns(ns->ctrl, ns->head->ns_id, ids, &id);
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = NVME_SC_INVALID_NS | NVME_SC_DNR;
++ 	if (!nvme_ns_ids_equal(&ns->head->ids, ids)) {
++ 		dev_err(ns->ctrl->device,
++ 			"identifiers changed for nsid %d\n", ns->head->ns_id);
++ 		goto out_free_id;
++ 	}
++ 
++ 	ret = nvme_update_ns_info(ns, id);
++ 
++ out_free_id:
++ 	kfree(id);
++ out:
++ 	/*
++ 	 * Only remove the namespace if we got a fatal error back from the
++ 	 * device, otherwise ignore the error and just move on.
++ 	 *
++ 	 * TODO: we should probably schedule a delayed retry here.
++ 	 */
++ 	if (ret > 0 && (ret & NVME_SC_DNR))
++ 		nvme_ns_remove(ns);
++ }
++ 
+++>>>>>>> d95c1f4179a7 (nvme: simplify error logic in nvme_validate_ns())
+  static void nvme_validate_or_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+  {
+ -	struct nvme_ns_ids ids = { };
+  	struct nvme_ns *ns;
+  
+ -	if (nvme_identify_ns_descs(ctrl, nsid, &ids))
+ -		return;
+ -
+  	ns = nvme_find_get_ns(ctrl, nsid);
+  	if (ns) {
+ -		nvme_validate_ns(ns, &ids);
+ +		if (revalidate_disk(ns->disk))
+ +			nvme_ns_remove(ns);
+  		nvme_put_ns(ns);
+ -		return;
+ -	}
+ -
+ -	switch (ids.csi) {
+ -	case NVME_CSI_NVM:
+ -		nvme_alloc_ns(ctrl, nsid, &ids);
+ -		break;
+ -	case NVME_CSI_ZNS:
+ -		if (!IS_ENABLED(CONFIG_BLK_DEV_ZONED)) {
+ -			dev_warn(ctrl->device,
+ -				"nsid %u not supported without CONFIG_BLK_DEV_ZONED\n",
+ -				nsid);
+ -			break;
+ -		}
+ -		nvme_alloc_ns(ctrl, nsid, &ids);
+ -		break;
+ -	default:
+ -		dev_warn(ctrl->device, "unknown csi %u for nsid %u\n",
+ -			ids.csi, nsid);
+ -		break;
+ -	}
+ +	} else
+ +		nvme_alloc_ns(ctrl, nsid);
+  }
+  
+  static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
+* Unmerged path drivers/nvme/host/core.c
