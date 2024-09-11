@@ -1,0 +1,157 @@
+cfg80211: fix netdev registration deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 40c575d1ec71f7a61c73ba1603a69650c130559c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/40c575d1.failed
+
+If register_netdevice() fails after having called cfg80211's
+netdev notifier (cfg80211_netdev_notifier_call) it will call
+the notifier again with UNREGISTER. This would then lock the
+wiphy mutex because we're marked as registered, which causes
+a deadlock.
+
+Fix this by separately keeping track of whether or not we're
+in the middle of registering to also skip the notifier call
+on this unregister.
+
+	Reported-by: syzbot+2ae0ca9d7737ad1a62b7@syzkaller.appspotmail.com
+Fixes: a05829a7222e ("cfg80211: avoid holding the RTNL when calling the driver")
+Link: https://lore.kernel.org/r/20210201192048.ed8bad436737.I7cae042c44b15f80919a285799a15df467e9d42d@changeid
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 40c575d1ec71f7a61c73ba1603a69650c130559c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/cfg80211.h
+#	net/wireless/core.c
+diff --cc include/net/cfg80211.h
+index adb3bb4b6816,4cdd75449d73..000000000000
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@@ -5116,6 -5298,9 +5116,12 @@@ struct cfg80211_cqm_config
+   *
+   * @wiphy: pointer to hardware description
+   * @iftype: interface type
+++<<<<<<< HEAD
+++=======
++  * @registered: is this wdev already registered with cfg80211
++  * @registering: indicates we're doing registration under wiphy lock
++  *	for the notifier
+++>>>>>>> 40c575d1ec71 (cfg80211: fix netdev registration deadlock)
+   * @list: (private) Used to collect the interfaces
+   * @netdev: (private) Used to reference back to the netdev, may be %NULL
+   * @identifier: (private) Identifier used in nl80211 to identify this
+@@@ -5199,7 -5384,7 +5205,11 @@@ struct wireless_dev 
+  
+  	struct mutex mtx;
+  
+++<<<<<<< HEAD
+ +	bool use_4addr, is_running;
+++=======
++ 	bool use_4addr, is_running, registered, registering;
+++>>>>>>> 40c575d1ec71 (cfg80211: fix netdev registration deadlock)
+  
+  	u8 address[ETH_ALEN] __aligned(sizeof(u16));
+  
+diff --cc net/wireless/core.c
+index 12d1359c5c78,a2785379df6e..000000000000
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@@ -1297,6 -1329,46 +1297,49 @@@ void cfg80211_register_wdev(struct cfg8
+  	nl80211_notify_iface(rdev, wdev, NL80211_CMD_NEW_INTERFACE);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int cfg80211_register_netdevice(struct net_device *dev)
++ {
++ 	struct wireless_dev *wdev = dev->ieee80211_ptr;
++ 	struct cfg80211_registered_device *rdev;
++ 	int ret;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (WARN_ON(!wdev))
++ 		return -EINVAL;
++ 
++ 	rdev = wiphy_to_rdev(wdev->wiphy);
++ 
++ 	lockdep_assert_held(&rdev->wiphy.mtx);
++ 
++ 	/* we'll take care of this */
++ 	wdev->registered = true;
++ 	wdev->registering = true;
++ 	ret = register_netdevice(dev);
++ 	if (ret)
++ 		goto out;
++ 
++ 	if (sysfs_create_link(&dev->dev.kobj, &rdev->wiphy.dev.kobj,
++ 			      "phy80211")) {
++ 		pr_err("failed to add phy80211 symlink to netdev!\n");
++ 		unregister_netdevice(dev);
++ 		ret = -EINVAL;
++ 		goto out;
++ 	}
++ 
++ 	cfg80211_register_wdev(rdev, wdev);
++ 	ret = 0;
++ out:
++ 	wdev->registering = false;
++ 	if (ret)
++ 		wdev->registered = false;
++ 	return ret;
++ }
++ EXPORT_SYMBOL(cfg80211_register_netdevice);
++ 
+++>>>>>>> 40c575d1ec71 (cfg80211: fix netdev registration deadlock)
+  static int cfg80211_netdev_notifier_call(struct notifier_block *nb,
+  					 unsigned long state, void *ptr)
+  {
+@@@ -1322,22 -1394,30 +1365,29 @@@
+  		cfg80211_init_wdev(wdev);
+  		break;
+  	case NETDEV_REGISTER:
+ -		if (!wdev->registered) {
+ -			wiphy_lock(&rdev->wiphy);
+ -			cfg80211_register_wdev(rdev, wdev);
+ -			wiphy_unlock(&rdev->wiphy);
+ -		}
+ -		break;
+ -	case NETDEV_UNREGISTER:
+  		/*
+ -		 * It is possible to get NETDEV_UNREGISTER multiple times,
+ -		 * so check wdev->registered.
+ +		 * NB: cannot take rdev->mtx here because this may be
+ +		 * called within code protected by it when interfaces
+ +		 * are added with nl80211.
+  		 */
+++<<<<<<< HEAD
+ +		if (sysfs_create_link(&dev->dev.kobj, &rdev->wiphy.dev.kobj,
+ +				      "phy80211")) {
+ +			pr_err("failed to add phy80211 symlink to netdev!\n");
+++=======
++ 		if (wdev->registered && !wdev->registering) {
++ 			wiphy_lock(&rdev->wiphy);
++ 			_cfg80211_unregister_wdev(wdev, false);
++ 			wiphy_unlock(&rdev->wiphy);
+++>>>>>>> 40c575d1ec71 (cfg80211: fix netdev registration deadlock)
+  		}
+ +
+ +		cfg80211_register_wdev(rdev, wdev);
+  		break;
+  	case NETDEV_GOING_DOWN:
+ -		wiphy_lock(&rdev->wiphy);
+  		cfg80211_leave(rdev, wdev);
+ -		wiphy_unlock(&rdev->wiphy);
+  		break;
+  	case NETDEV_DOWN:
+ -		wiphy_lock(&rdev->wiphy);
+  		cfg80211_update_iface_num(rdev, wdev->iftype, -1);
+  		if (rdev->scan_req && rdev->scan_req->wdev == wdev) {
+  			if (WARN_ON(!rdev->scan_req->notified &&
+* Unmerged path include/net/cfg80211.h
+* Unmerged path net/wireless/core.c
