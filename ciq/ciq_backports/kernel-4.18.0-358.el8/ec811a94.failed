@@ -1,0 +1,181 @@
+ata: start separating SATA specific code from libata-scsi.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+commit ec811a94c5bb6916d01c02dc99c8cecfa59cbb85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/ec811a94.failed
+
+Start separating SATA specific code from libata-scsi.c:
+
+* un-static ata_scsi_find_dev()
+
+* move following code to libata-sata.c:
+  - SATA only sysfs device attributes handling
+  - __ata_change_queue_depth()
+  - ata_scsi_change_queue_depth()
+
+* cover with CONFIG_SATA_HOST ifdef SATA only sysfs device
+  attributes handling code and ATA_SHT_NCQ() macro in
+  <linux/libata.h>
+
+Code size savings on m68k arch using (modified) atari_defconfig:
+
+   text    data     bss     dec     hex filename
+before:
+  20702     105     576   21383    5387 drivers/ata/libata-scsi.o
+after:
+  19137      23     576   19736    4d18 drivers/ata/libata-scsi.o
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit ec811a94c5bb6916d01c02dc99c8cecfa59cbb85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/libata-sata.c
+#	drivers/ata/libata-scsi.c
+diff --cc drivers/ata/libata-scsi.c
+index db9a9bf4bf3b,a5dfcd9e09a1..000000000000
+--- a/drivers/ata/libata-scsi.c
++++ b/drivers/ata/libata-scsi.c
+@@@ -1392,73 -1157,9 +1160,76 @@@ void ata_scsi_slave_destroy(struct scsi
+  	q->dma_drain_buffer = NULL;
+  	q->dma_drain_size = 0;
+  }
+ -EXPORT_SYMBOL_GPL(ata_scsi_slave_destroy);
+  
+  /**
+++<<<<<<< HEAD
+ + *	__ata_change_queue_depth - helper for ata_scsi_change_queue_depth
+ + *	@ap: ATA port to which the device change the queue depth
+ + *	@sdev: SCSI device to configure queue depth for
+ + *	@queue_depth: new queue depth
+ + *
+ + *	libsas and libata have different approaches for associating a sdev to
+ + *	its ata_port.
+ + *
+ + */
+ +int __ata_change_queue_depth(struct ata_port *ap, struct scsi_device *sdev,
+ +			     int queue_depth)
+ +{
+ +	struct ata_device *dev;
+ +	unsigned long flags;
+ +
+ +	if (queue_depth < 1 || queue_depth == sdev->queue_depth)
+ +		return sdev->queue_depth;
+ +
+ +	dev = ata_scsi_find_dev(ap, sdev);
+ +	if (!dev || !ata_dev_enabled(dev))
+ +		return sdev->queue_depth;
+ +
+ +	/* NCQ enabled? */
+ +	spin_lock_irqsave(ap->lock, flags);
+ +	dev->flags &= ~ATA_DFLAG_NCQ_OFF;
+ +	if (queue_depth == 1 || !ata_ncq_enabled(dev)) {
+ +		dev->flags |= ATA_DFLAG_NCQ_OFF;
+ +		queue_depth = 1;
+ +	}
+ +	spin_unlock_irqrestore(ap->lock, flags);
+ +
+ +	/* limit and apply queue depth */
+ +	queue_depth = min(queue_depth, sdev->host->can_queue);
+ +	queue_depth = min(queue_depth, ata_id_queue_depth(dev->id));
+ +	queue_depth = min(queue_depth, ATA_MAX_QUEUE);
+ +
+ +	if (sdev->queue_depth == queue_depth)
+ +		return -EINVAL;
+ +
+ +	return scsi_change_queue_depth(sdev, queue_depth);
+ +}
+ +
+ +/**
+ + *	ata_scsi_change_queue_depth - SCSI callback for queue depth config
+ + *	@sdev: SCSI device to configure queue depth for
+ + *	@queue_depth: new queue depth
+ + *
+ + *	This is libata standard hostt->change_queue_depth callback.
+ + *	SCSI will call into this callback when user tries to set queue
+ + *	depth via sysfs.
+ + *
+ + *	LOCKING:
+ + *	SCSI layer (we don't care)
+ + *
+ + *	RETURNS:
+ + *	Newly configured queue depth.
+ + */
+ +int ata_scsi_change_queue_depth(struct scsi_device *sdev, int queue_depth)
+ +{
+ +	struct ata_port *ap = ata_shost_to_port(sdev->host);
+ +
+ +	return __ata_change_queue_depth(ap, sdev, queue_depth);
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> ec811a94c5bb (ata: start separating SATA specific code from libata-scsi.c)
+   *	ata_scsi_start_stop_xlat - Translate SCSI START STOP UNIT command
+   *	@qc: Storage for translated ATA taskfile
+   *
+* Unmerged path drivers/ata/libata-sata.c
+* Unmerged path drivers/ata/libata-sata.c
+* Unmerged path drivers/ata/libata-scsi.c
+diff --git a/drivers/ata/libata.h b/drivers/ata/libata.h
+index f953cb4bb1ba..5382f7eb0ecb 100644
+--- a/drivers/ata/libata.h
++++ b/drivers/ata/libata.h
+@@ -128,6 +128,8 @@ static inline void ata_acpi_bind_dev(struct ata_device *dev) {}
+ #endif
+ 
+ /* libata-scsi.c */
++extern struct ata_device *ata_scsi_find_dev(struct ata_port *ap,
++					    const struct scsi_device *scsidev);
+ extern int ata_scsi_add_hosts(struct ata_host *host,
+ 			      struct scsi_host_template *sht);
+ extern void ata_scsi_scan_host(struct ata_port *ap, int sync);
+diff --git a/include/linux/libata.h b/include/linux/libata.h
+index ce0dc53b9adc..9fb4bccd0d02 100644
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@ -549,12 +549,14 @@ typedef int (*ata_reset_fn_t)(struct ata_link *link, unsigned int *classes,
+ 			      unsigned long deadline);
+ typedef void (*ata_postreset_fn_t)(struct ata_link *link, unsigned int *classes);
+ 
+-extern struct device_attribute dev_attr_link_power_management_policy;
+ extern struct device_attribute dev_attr_unload_heads;
++#ifdef CONFIG_SATA_HOST
++extern struct device_attribute dev_attr_link_power_management_policy;
+ extern struct device_attribute dev_attr_ncq_prio_enable;
+ extern struct device_attribute dev_attr_em_message_type;
+ extern struct device_attribute dev_attr_em_message;
+ extern struct device_attribute dev_attr_sw_activity;
++#endif
+ 
+ enum sw_activity {
+ 	OFF,
+@@ -1348,7 +1350,6 @@ extern int ata_link_nr_enabled(struct ata_link *link);
+ extern const struct ata_port_operations ata_base_port_ops;
+ extern const struct ata_port_operations sata_port_ops;
+ extern struct device_attribute *ata_common_sdev_attrs[];
+-extern struct device_attribute *ata_ncq_sdev_attrs[];
+ 
+ /*
+  * All sht initializers (BASE, PIO, BMDMA, NCQ) must be instantiated
+@@ -1376,10 +1377,14 @@ extern struct device_attribute *ata_ncq_sdev_attrs[];
+ 	__ATA_BASE_SHT(drv_name),				\
+ 	.sdev_attrs		= ata_common_sdev_attrs
+ 
++#ifdef CONFIG_SATA_HOST
++extern struct device_attribute *ata_ncq_sdev_attrs[];
++
+ #define ATA_NCQ_SHT(drv_name)					\
+ 	__ATA_BASE_SHT(drv_name),				\
+ 	.sdev_attrs		= ata_ncq_sdev_attrs,		\
+ 	.change_queue_depth	= ata_scsi_change_queue_depth
++#endif
+ 
+ /*
+  * PMP helpers
