@@ -61,9 +61,9 @@ static struct kmem_cache *qeth_qdio_outbuf_cache;
 static struct device *qeth_core_root_dev;
 static struct lock_class_key qdio_out_skb_queue_key;
 
-static void qeth_send_control_data_cb(struct qeth_card *card,
-				      struct qeth_channel *channel,
-				      struct qeth_cmd_buffer *iob);
+static void qeth_issue_next_read_cb(struct qeth_card *card,
+				    struct qeth_channel *channel,
+				    struct qeth_cmd_buffer *iob);
 static struct qeth_cmd_buffer *qeth_get_buffer(struct qeth_channel *);
 static void qeth_free_buffer_pool(struct qeth_card *);
 static int qeth_qdio_establish(struct qeth_card *);
@@ -518,7 +518,9 @@ static int __qeth_issue_next_read(struct qeth_card *card)
 				 CARD_DEVID(card));
 		return -ENOMEM;
 	}
+
 	qeth_setup_ccw(channel->ccw, CCW_CMD_READ, QETH_BUFSIZE, iob->data);
+	iob->callback = qeth_issue_next_read_cb;
 	QETH_CARD_TEXT(card, 6, "noirqpnd");
 	rc = ccw_device_start(channel->ccwdev, channel->ccw,
 			      (addr_t) iob, 0, 0);
@@ -728,7 +730,7 @@ void qeth_release_buffer(struct qeth_channel *channel,
 
 	spin_lock_irqsave(&channel->iob_lock, flags);
 	iob->state = BUF_STATE_FREE;
-	iob->callback = qeth_send_control_data_cb;
+	iob->callback = NULL;
 	if (iob->reply) {
 		qeth_put_reply(iob->reply);
 		iob->reply = NULL;
@@ -786,9 +788,9 @@ void qeth_clear_cmd_buffers(struct qeth_channel *channel)
 }
 EXPORT_SYMBOL_GPL(qeth_clear_cmd_buffers);
 
-static void qeth_send_control_data_cb(struct qeth_card *card,
-				      struct qeth_channel *channel,
-				      struct qeth_cmd_buffer *iob)
+static void qeth_issue_next_read_cb(struct qeth_card *card,
+				    struct qeth_channel *channel,
+				    struct qeth_cmd_buffer *iob)
 {
 	struct qeth_ipa_cmd *cmd = NULL;
 	struct qeth_reply *reply = NULL;
@@ -1279,7 +1281,6 @@ static int qeth_setup_channel(struct qeth_channel *channel, bool alloc_buffers)
 			break;
 		channel->iob[cnt].state = BUF_STATE_FREE;
 		channel->iob[cnt].channel = channel;
-		channel->iob[cnt].callback = qeth_send_control_data_cb;
 	}
 	if (cnt < QETH_CMD_BUFFER_NO) {
 		qeth_clean_channel(channel);
