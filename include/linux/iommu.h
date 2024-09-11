@@ -168,7 +168,6 @@ struct iommu_resv_region {
  * @map: map a physically contiguous memory region to an iommu domain
  * @unmap: unmap a physically contiguous memory region from an iommu domain
  * @flush_iotlb_all: Synchronously flush all hardware TLBs for this domain
- * @iotlb_range_add: Add a given iova range to the flush queue for this domain
  * @iotlb_sync_map: Sync mappings created recently using @map to the hardware
  * @iotlb_sync: Flush all queued ranges from the hardware TLBs and empty flush
  *            queue
@@ -204,8 +203,6 @@ struct iommu_ops {
 	size_t (*unmap)(struct iommu_domain *domain, unsigned long iova,
 		     size_t size);
 	void (*flush_iotlb_all)(struct iommu_domain *domain);
-	void (*iotlb_range_add)(struct iommu_domain *domain,
-				unsigned long iova, size_t size);
 	void (*iotlb_sync_map)(struct iommu_domain *domain);
 	void (*iotlb_sync)(struct iommu_domain *domain);
 	phys_addr_t (*iova_to_phys)(struct iommu_domain *domain, dma_addr_t iova);
@@ -366,13 +363,6 @@ static inline void iommu_flush_tlb_all(struct iommu_domain *domain)
 		domain->ops->flush_iotlb_all(domain);
 }
 
-static inline void iommu_tlb_range_add(struct iommu_domain *domain,
-				       unsigned long iova, size_t size)
-{
-	if (domain->ops->iotlb_range_add)
-		domain->ops->iotlb_range_add(domain, iova, size);
-}
-
 static inline void iommu_tlb_sync(struct iommu_domain *domain)
 {
 	if (domain->ops->iotlb_sync)
@@ -497,11 +487,6 @@ static inline size_t iommu_map_sg(struct iommu_domain *domain,
 }
 
 static inline void iommu_flush_tlb_all(struct iommu_domain *domain)
-{
-}
-
-static inline void iommu_tlb_range_add(struct iommu_domain *domain,
-				       unsigned long iova, size_t size)
 {
 }
 
