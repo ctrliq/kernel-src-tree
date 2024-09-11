@@ -1,0 +1,1151 @@
+xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 1b698fa5d8ef958007c455e316aa44c37ab3c5fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1b698fa5.failed
+
+In order to use standard 'xdp' prefix, rename convert_to_xdp_frame
+utility routine in xdp_convert_buff_to_frame and replace all the
+occurrences
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+Link: https://lore.kernel.org/bpf/6344f739be0d1a08ab2b9607584c4d5478c8c083.1590698295.git.lorenzo@kernel.org
+(cherry picked from commit 1b698fa5d8ef958007c455e316aa44c37ab3c5fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amazon/ena/ena_netdev.c
+#	drivers/net/ethernet/marvell/mvneta.c
+#	drivers/net/ethernet/socionext/netsec.c
+#	drivers/net/ethernet/ti/cpsw_priv.c
+#	drivers/net/virtio_net.c
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.c
+index c8d0e2454b88,a0af74c93971..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@@ -123,7 -150,218 +123,222 @@@ static int ena_change_mtu(struct net_de
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
+++=======
++ static int ena_xmit_common(struct net_device *dev,
++ 			   struct ena_ring *ring,
++ 			   struct ena_tx_buffer *tx_info,
++ 			   struct ena_com_tx_ctx *ena_tx_ctx,
++ 			   u16 next_to_use,
++ 			   u32 bytes)
++ {
++ 	struct ena_adapter *adapter = netdev_priv(dev);
++ 	int rc, nb_hw_desc;
++ 
++ 	if (unlikely(ena_com_is_doorbell_needed(ring->ena_com_io_sq,
++ 						ena_tx_ctx))) {
++ 		netif_dbg(adapter, tx_queued, dev,
++ 			  "llq tx max burst size of queue %d achieved, writing doorbell to send burst\n",
++ 			  ring->qid);
++ 		ena_com_write_sq_doorbell(ring->ena_com_io_sq);
++ 	}
++ 
++ 	/* prepare the packet's descriptors to dma engine */
++ 	rc = ena_com_prepare_tx(ring->ena_com_io_sq, ena_tx_ctx,
++ 				&nb_hw_desc);
++ 
++ 	/* In case there isn't enough space in the queue for the packet,
++ 	 * we simply drop it. All other failure reasons of
++ 	 * ena_com_prepare_tx() are fatal and therefore require a device reset.
++ 	 */
++ 	if (unlikely(rc)) {
++ 		netif_err(adapter, tx_queued, dev,
++ 			  "failed to prepare tx bufs\n");
++ 		u64_stats_update_begin(&ring->syncp);
++ 		ring->tx_stats.prepare_ctx_err++;
++ 		u64_stats_update_end(&ring->syncp);
++ 		if (rc != -ENOMEM) {
++ 			adapter->reset_reason =
++ 				ENA_REGS_RESET_DRIVER_INVALID_STATE;
++ 			set_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags);
++ 		}
++ 		return rc;
++ 	}
++ 
++ 	u64_stats_update_begin(&ring->syncp);
++ 	ring->tx_stats.cnt++;
++ 	ring->tx_stats.bytes += bytes;
++ 	u64_stats_update_end(&ring->syncp);
++ 
++ 	tx_info->tx_descs = nb_hw_desc;
++ 	tx_info->last_jiffies = jiffies;
++ 	tx_info->print_once = 0;
++ 
++ 	ring->next_to_use = ENA_TX_RING_IDX_NEXT(next_to_use,
++ 						 ring->ring_size);
++ 	return 0;
++ }
++ 
++ /* This is the XDP napi callback. XDP queues use a separate napi callback
++  * than Rx/Tx queues.
++  */
++ static int ena_xdp_io_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct ena_napi *ena_napi = container_of(napi, struct ena_napi, napi);
++ 	u32 xdp_work_done, xdp_budget;
++ 	struct ena_ring *xdp_ring;
++ 	int napi_comp_call = 0;
++ 	int ret;
++ 
++ 	xdp_ring = ena_napi->xdp_ring;
++ 	xdp_ring->first_interrupt = ena_napi->first_interrupt;
++ 
++ 	xdp_budget = budget;
++ 
++ 	if (!test_bit(ENA_FLAG_DEV_UP, &xdp_ring->adapter->flags) ||
++ 	    test_bit(ENA_FLAG_TRIGGER_RESET, &xdp_ring->adapter->flags)) {
++ 		napi_complete_done(napi, 0);
++ 		return 0;
++ 	}
++ 
++ 	xdp_work_done = ena_clean_xdp_irq(xdp_ring, xdp_budget);
++ 
++ 	/* If the device is about to reset or down, avoid unmask
++ 	 * the interrupt and return 0 so NAPI won't reschedule
++ 	 */
++ 	if (unlikely(!test_bit(ENA_FLAG_DEV_UP, &xdp_ring->adapter->flags))) {
++ 		napi_complete_done(napi, 0);
++ 		ret = 0;
++ 	} else if (xdp_budget > xdp_work_done) {
++ 		napi_comp_call = 1;
++ 		if (napi_complete_done(napi, xdp_work_done))
++ 			ena_unmask_interrupt(xdp_ring, NULL);
++ 		ena_update_ring_numa_node(xdp_ring, NULL);
++ 		ret = xdp_work_done;
++ 	} else {
++ 		ret = xdp_budget;
++ 	}
++ 
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.napi_comp += napi_comp_call;
++ 	xdp_ring->tx_stats.tx_poll++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 
++ 	return ret;
++ }
++ 
++ static int ena_xdp_tx_map_buff(struct ena_ring *xdp_ring,
++ 			       struct ena_tx_buffer *tx_info,
++ 			       struct xdp_buff *xdp,
++ 			       void **push_hdr,
++ 			       u32 *push_len)
++ {
++ 	struct ena_adapter *adapter = xdp_ring->adapter;
++ 	struct ena_com_buf *ena_buf;
++ 	dma_addr_t dma = 0;
++ 	u32 size;
++ 
++ 	tx_info->xdpf = xdp_convert_buff_to_frame(xdp);
++ 	size = tx_info->xdpf->len;
++ 	ena_buf = tx_info->bufs;
++ 
++ 	/* llq push buffer */
++ 	*push_len = min_t(u32, size, xdp_ring->tx_max_header_size);
++ 	*push_hdr = tx_info->xdpf->data;
++ 
++ 	if (size - *push_len > 0) {
++ 		dma = dma_map_single(xdp_ring->dev,
++ 				     *push_hdr + *push_len,
++ 				     size - *push_len,
++ 				     DMA_TO_DEVICE);
++ 		if (unlikely(dma_mapping_error(xdp_ring->dev, dma)))
++ 			goto error_report_dma_error;
++ 
++ 		tx_info->map_linear_data = 1;
++ 		tx_info->num_of_bufs = 1;
++ 	}
++ 
++ 	ena_buf->paddr = dma;
++ 	ena_buf->len = size;
++ 
++ 	return 0;
++ 
++ error_report_dma_error:
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.dma_mapping_err++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 	netdev_warn(adapter->netdev, "failed to map xdp buff\n");
++ 
++ 	xdp_return_frame_rx_napi(tx_info->xdpf);
++ 	tx_info->xdpf = NULL;
++ 	tx_info->num_of_bufs = 0;
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int ena_xdp_xmit_buff(struct net_device *dev,
++ 			     struct xdp_buff *xdp,
++ 			     int qid,
++ 			     struct ena_rx_buffer *rx_info)
++ {
++ 	struct ena_adapter *adapter = netdev_priv(dev);
++ 	struct ena_com_tx_ctx ena_tx_ctx = {0};
++ 	struct ena_tx_buffer *tx_info;
++ 	struct ena_ring *xdp_ring;
++ 	u16 next_to_use, req_id;
++ 	int rc;
++ 	void *push_hdr;
++ 	u32 push_len;
++ 
++ 	xdp_ring = &adapter->tx_ring[qid];
++ 	next_to_use = xdp_ring->next_to_use;
++ 	req_id = xdp_ring->free_ids[next_to_use];
++ 	tx_info = &xdp_ring->tx_buffer_info[req_id];
++ 	tx_info->num_of_bufs = 0;
++ 	page_ref_inc(rx_info->page);
++ 	tx_info->xdp_rx_page = rx_info->page;
++ 
++ 	rc = ena_xdp_tx_map_buff(xdp_ring, tx_info, xdp, &push_hdr, &push_len);
++ 	if (unlikely(rc))
++ 		goto error_drop_packet;
++ 
++ 	ena_tx_ctx.ena_bufs = tx_info->bufs;
++ 	ena_tx_ctx.push_header = push_hdr;
++ 	ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
++ 	ena_tx_ctx.req_id = req_id;
++ 	ena_tx_ctx.header_len = push_len;
++ 
++ 	rc = ena_xmit_common(dev,
++ 			     xdp_ring,
++ 			     tx_info,
++ 			     &ena_tx_ctx,
++ 			     next_to_use,
++ 			     xdp->data_end - xdp->data);
++ 	if (rc)
++ 		goto error_unmap_dma;
++ 	/* trigger the dma engine. ena_com_write_sq_doorbell()
++ 	 * has a mb
++ 	 */
++ 	ena_com_write_sq_doorbell(xdp_ring->ena_com_io_sq);
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.doorbells++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 
++ 	return NETDEV_TX_OK;
++ 
++ error_unmap_dma:
++ 	ena_unmap_tx_buff(xdp_ring, tx_info);
++ 	tx_info->xdpf = NULL;
++ error_drop_packet:
++ 
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static int ena_xdp_execute(struct ena_ring *rx_ring,
++ 			   struct xdp_buff *xdp,
++ 			   struct ena_rx_buffer *rx_info)
+++>>>>>>> 1b698fa5d8ef (xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame)
+  {
+  	struct bpf_prog *xdp_prog;
+  	u32 verdict = XDP_PASS;
+diff --cc drivers/net/ethernet/marvell/mvneta.c
+index f2cdc95883b4,011cd26953d9..000000000000
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@@ -1894,11 -1960,352 +1894,355 @@@ static void mvneta_rxq_drop_pkts(struc
+  	for (i = 0; i < rxq->size; i++) {
+  		struct mvneta_rx_desc *rx_desc = rxq->descs + i;
+  		void *data = rxq->buf_virt_addr[i];
+ -		if (!data || !(rx_desc->buf_phys_addr))
+ -			continue;
+  
+ -		page_pool_put_full_page(rxq->page_pool, data, false);
+ +		dma_unmap_single(pp->dev->dev.parent, rx_desc->buf_phys_addr,
+ +				 MVNETA_RX_BUF_SIZE(pp->pkt_size), DMA_FROM_DEVICE);
+ +		mvneta_frag_free(pp->frag_size, data);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (xdp_rxq_info_is_reg(&rxq->xdp_rxq))
++ 		xdp_rxq_info_unreg(&rxq->xdp_rxq);
++ 	page_pool_destroy(rxq->page_pool);
++ 	rxq->page_pool = NULL;
++ }
++ 
++ static void
++ mvneta_update_stats(struct mvneta_port *pp,
++ 		    struct mvneta_stats *ps)
++ {
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.rx_packets += ps->rx_packets;
++ 	stats->es.ps.rx_bytes += ps->rx_bytes;
++ 	/* xdp */
++ 	stats->es.ps.xdp_redirect += ps->xdp_redirect;
++ 	stats->es.ps.xdp_pass += ps->xdp_pass;
++ 	stats->es.ps.xdp_drop += ps->xdp_drop;
++ 	u64_stats_update_end(&stats->syncp);
++ }
++ 
++ static inline
++ int mvneta_rx_refill_queue(struct mvneta_port *pp, struct mvneta_rx_queue *rxq)
++ {
++ 	struct mvneta_rx_desc *rx_desc;
++ 	int curr_desc = rxq->first_to_refill;
++ 	int i;
++ 
++ 	for (i = 0; (i < rxq->refill_num) && (i < 64); i++) {
++ 		rx_desc = rxq->descs + curr_desc;
++ 		if (!(rx_desc->buf_phys_addr)) {
++ 			if (mvneta_rx_refill(pp, rx_desc, rxq, GFP_ATOMIC)) {
++ 				struct mvneta_pcpu_stats *stats;
++ 
++ 				pr_err("Can't refill queue %d. Done %d from %d\n",
++ 				       rxq->id, i, rxq->refill_num);
++ 
++ 				stats = this_cpu_ptr(pp->stats);
++ 				u64_stats_update_begin(&stats->syncp);
++ 				stats->es.refill_error++;
++ 				u64_stats_update_end(&stats->syncp);
++ 				break;
++ 			}
++ 		}
++ 		curr_desc = MVNETA_QUEUE_NEXT_DESC(rxq, curr_desc);
++ 	}
++ 	rxq->refill_num -= i;
++ 	rxq->first_to_refill = curr_desc;
++ 
++ 	return i;
++ }
++ 
++ static int
++ mvneta_xdp_submit_frame(struct mvneta_port *pp, struct mvneta_tx_queue *txq,
++ 			struct xdp_frame *xdpf, bool dma_map)
++ {
++ 	struct mvneta_tx_desc *tx_desc;
++ 	struct mvneta_tx_buf *buf;
++ 	dma_addr_t dma_addr;
++ 
++ 	if (txq->count >= txq->tx_stop_threshold)
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	tx_desc = mvneta_txq_next_desc_get(txq);
++ 
++ 	buf = &txq->buf[txq->txq_put_index];
++ 	if (dma_map) {
++ 		/* ndo_xdp_xmit */
++ 		dma_addr = dma_map_single(pp->dev->dev.parent, xdpf->data,
++ 					  xdpf->len, DMA_TO_DEVICE);
++ 		if (dma_mapping_error(pp->dev->dev.parent, dma_addr)) {
++ 			mvneta_txq_desc_put(txq);
++ 			return MVNETA_XDP_DROPPED;
++ 		}
++ 		buf->type = MVNETA_TYPE_XDP_NDO;
++ 	} else {
++ 		struct page *page = virt_to_page(xdpf->data);
++ 
++ 		dma_addr = page_pool_get_dma_addr(page) +
++ 			   sizeof(*xdpf) + xdpf->headroom;
++ 		dma_sync_single_for_device(pp->dev->dev.parent, dma_addr,
++ 					   xdpf->len, DMA_BIDIRECTIONAL);
++ 		buf->type = MVNETA_TYPE_XDP_TX;
++ 	}
++ 	buf->xdpf = xdpf;
++ 
++ 	tx_desc->command = MVNETA_TXD_FLZ_DESC;
++ 	tx_desc->buf_phys_addr = dma_addr;
++ 	tx_desc->data_size = xdpf->len;
++ 
++ 	mvneta_txq_inc_put(txq);
++ 	txq->pending++;
++ 	txq->count++;
++ 
++ 	return MVNETA_XDP_TX;
++ }
++ 
++ static int
++ mvneta_xdp_xmit_back(struct mvneta_port *pp, struct xdp_buff *xdp)
++ {
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	struct xdp_frame *xdpf;
++ 	int cpu;
++ 	u32 ret;
++ 
++ 	xdpf = xdp_convert_buff_to_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	cpu = smp_processor_id();
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	ret = mvneta_xdp_submit_frame(pp, txq, xdpf, false);
++ 	if (ret == MVNETA_XDP_TX) {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.ps.tx_bytes += xdpf->len;
++ 		stats->es.ps.tx_packets++;
++ 		stats->es.ps.xdp_tx++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	} else {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.ps.xdp_tx_err++;
++ 		u64_stats_update_end(&stats->syncp);
++ 	}
++ 	__netif_tx_unlock(nq);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvneta_xdp_xmit(struct net_device *dev, int num_frame,
++ 		struct xdp_frame **frames, u32 flags)
++ {
++ 	struct mvneta_port *pp = netdev_priv(dev);
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 	int i, nxmit_byte = 0, nxmit = num_frame;
++ 	int cpu = smp_processor_id();
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	u32 ret;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	for (i = 0; i < num_frame; i++) {
++ 		ret = mvneta_xdp_submit_frame(pp, txq, frames[i], true);
++ 		if (ret == MVNETA_XDP_TX) {
++ 			nxmit_byte += frames[i]->len;
++ 		} else {
++ 			xdp_return_frame_rx_napi(frames[i]);
++ 			nxmit--;
++ 		}
++ 	}
++ 
++ 	if (unlikely(flags & XDP_XMIT_FLUSH))
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	__netif_tx_unlock(nq);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.tx_bytes += nxmit_byte;
++ 	stats->es.ps.tx_packets += nxmit;
++ 	stats->es.ps.xdp_xmit += nxmit;
++ 	stats->es.ps.xdp_xmit_err += num_frame - nxmit;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	return nxmit;
++ }
++ 
++ static int
++ mvneta_run_xdp(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
++ 	       struct bpf_prog *prog, struct xdp_buff *xdp,
++ 	       struct mvneta_stats *stats)
++ {
++ 	unsigned int len, sync;
++ 	struct page *page;
++ 	u32 ret, act;
++ 
++ 	len = xdp->data_end - xdp->data_hard_start - pp->rx_offset_correction;
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	/* Due xdp_adjust_tail: DMA sync for_device cover max len CPU touch */
++ 	sync = xdp->data_end - xdp->data_hard_start - pp->rx_offset_correction;
++ 	sync = max(sync, len);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		stats->xdp_pass++;
++ 		return MVNETA_XDP_PASS;
++ 	case XDP_REDIRECT: {
++ 		int err;
++ 
++ 		err = xdp_do_redirect(pp->dev, xdp, prog);
++ 		if (unlikely(err)) {
++ 			ret = MVNETA_XDP_DROPPED;
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(rxq->page_pool, page, sync, true);
++ 		} else {
++ 			ret = MVNETA_XDP_REDIR;
++ 			stats->xdp_redirect++;
++ 		}
++ 		break;
++ 	}
++ 	case XDP_TX:
++ 		ret = mvneta_xdp_xmit_back(pp, xdp);
++ 		if (ret != MVNETA_XDP_TX) {
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(rxq->page_pool, page, sync, true);
++ 		}
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		/* fall through */
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(pp->dev, prog, act);
++ 		/* fall through */
++ 	case XDP_DROP:
++ 		page = virt_to_head_page(xdp->data);
++ 		page_pool_put_page(rxq->page_pool, page, sync, true);
++ 		ret = MVNETA_XDP_DROPPED;
++ 		stats->xdp_drop++;
++ 		break;
++ 	}
++ 
++ 	stats->rx_bytes += xdp->data_end - xdp->data;
++ 	stats->rx_packets++;
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvneta_swbm_rx_frame(struct mvneta_port *pp,
++ 		     struct mvneta_rx_desc *rx_desc,
++ 		     struct mvneta_rx_queue *rxq,
++ 		     struct xdp_buff *xdp,
++ 		     struct bpf_prog *xdp_prog,
++ 		     struct page *page,
++ 		     struct mvneta_stats *stats)
++ {
++ 	unsigned char *data = page_address(page);
++ 	int data_len = -MVNETA_MH_SIZE, len;
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	int ret = 0;
++ 
++ 	if (MVNETA_SKB_SIZE(rx_desc->data_size) > PAGE_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len += len;
++ 	} else {
++ 		len = rx_desc->data_size;
++ 		data_len += len - ETH_FCS_LEN;
++ 	}
++ 
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 
++ 	/* Prefetch header */
++ 	prefetch(data);
++ 
++ 	xdp->data_hard_start = data;
++ 	xdp->data = data + pp->rx_offset_correction + MVNETA_MH_SIZE;
++ 	xdp->data_end = xdp->data + data_len;
++ 	xdp_set_data_meta_invalid(xdp);
++ 
++ 	if (xdp_prog) {
++ 		ret = mvneta_run_xdp(pp, rxq, xdp_prog, xdp, stats);
++ 		if (ret)
++ 			goto out;
++ 	}
++ 
++ 	rxq->skb = build_skb(xdp->data_hard_start, PAGE_SIZE);
++ 	if (unlikely(!rxq->skb)) {
++ 		struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 		netdev_err(dev, "Can't allocate skb on queue %d\n", rxq->id);
++ 
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.skb_alloc_error++;
++ 		stats->rx_dropped++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		return -ENOMEM;
++ 	}
++ 	page_pool_release_page(rxq->page_pool, page);
++ 
++ 	skb_reserve(rxq->skb,
++ 		    xdp->data - xdp->data_hard_start);
++ 	skb_put(rxq->skb, xdp->data_end - xdp->data);
++ 	mvneta_rx_csum(pp, rx_desc->status, rxq->skb);
++ 
++ 	rxq->left_size = rx_desc->data_size - len;
++ 
++ out:
++ 	rx_desc->buf_phys_addr = 0;
++ 
++ 	return ret;
++ }
++ 
++ static void
++ mvneta_swbm_add_rx_fragment(struct mvneta_port *pp,
++ 			    struct mvneta_rx_desc *rx_desc,
++ 			    struct mvneta_rx_queue *rxq,
++ 			    struct page *page)
++ {
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	int data_len, len;
++ 
++ 	if (rxq->left_size > MVNETA_MAX_RX_BUF_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len = len;
++ 	} else {
++ 		len = rxq->left_size;
++ 		data_len = len - ETH_FCS_LEN;
++ 	}
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 	if (data_len > 0) {
++ 		/* refill descriptor with new buffer later */
++ 		skb_add_rx_frag(rxq->skb,
++ 				skb_shinfo(rxq->skb)->nr_frags,
++ 				page, pp->rx_offset_correction, data_len,
++ 				PAGE_SIZE);
++ 	}
++ 	page_pool_release_page(rxq->page_pool, page);
++ 	rx_desc->buf_phys_addr = 0;
++ 	rxq->left_size -= len;
+++>>>>>>> 1b698fa5d8ef (xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame)
+  }
+  
+  /* Main rx processing when using software buffer management */
+diff --cc drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582,328bc38848bb..000000000000
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@@ -851,6 -809,320 +851,323 @@@ static void netsec_set_tx_de(struct net
+  	dring->head = (dring->head + 1) % DESC_NUM;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The current driver only supports 1 Txq, this should run under spin_lock() */
++ static u32 netsec_xdp_queue_one(struct netsec_priv *priv,
++ 				struct xdp_frame *xdpf, bool is_ndo)
++ 
++ {
++ 	struct netsec_desc_ring *tx_ring = &priv->desc_ring[NETSEC_RING_TX];
++ 	struct page *page = virt_to_page(xdpf->data);
++ 	struct netsec_tx_pkt_ctrl tx_ctrl = {};
++ 	struct netsec_desc tx_desc;
++ 	dma_addr_t dma_handle;
++ 	u16 filled;
++ 
++ 	if (tx_ring->head >= tx_ring->tail)
++ 		filled = tx_ring->head - tx_ring->tail;
++ 	else
++ 		filled = tx_ring->head + DESC_NUM - tx_ring->tail;
++ 
++ 	if (DESC_NUM - filled <= 1)
++ 		return NETSEC_XDP_CONSUMED;
++ 
++ 	if (is_ndo) {
++ 		/* this is for ndo_xdp_xmit, the buffer needs mapping before
++ 		 * sending
++ 		 */
++ 		dma_handle = dma_map_single(priv->dev, xdpf->data, xdpf->len,
++ 					    DMA_TO_DEVICE);
++ 		if (dma_mapping_error(priv->dev, dma_handle))
++ 			return NETSEC_XDP_CONSUMED;
++ 		tx_desc.buf_type = TYPE_NETSEC_XDP_NDO;
++ 	} else {
++ 		/* This is the device Rx buffer from page_pool. No need to remap
++ 		 * just sync and send it
++ 		 */
++ 		struct netsec_desc_ring *rx_ring =
++ 			&priv->desc_ring[NETSEC_RING_RX];
++ 		enum dma_data_direction dma_dir =
++ 			page_pool_get_dma_dir(rx_ring->page_pool);
++ 
++ 		dma_handle = page_pool_get_dma_addr(page) + xdpf->headroom +
++ 			sizeof(*xdpf);
++ 		dma_sync_single_for_device(priv->dev, dma_handle, xdpf->len,
++ 					   dma_dir);
++ 		tx_desc.buf_type = TYPE_NETSEC_XDP_TX;
++ 	}
++ 
++ 	tx_desc.dma_addr = dma_handle;
++ 	tx_desc.addr = xdpf->data;
++ 	tx_desc.len = xdpf->len;
++ 
++ 	netdev_sent_queue(priv->ndev, xdpf->len);
++ 	netsec_set_tx_de(priv, tx_ring, &tx_ctrl, &tx_desc, xdpf);
++ 
++ 	return NETSEC_XDP_TX;
++ }
++ 
++ static u32 netsec_xdp_xmit_back(struct netsec_priv *priv, struct xdp_buff *xdp)
++ {
++ 	struct netsec_desc_ring *tx_ring = &priv->desc_ring[NETSEC_RING_TX];
++ 	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
++ 	u32 ret;
++ 
++ 	if (unlikely(!xdpf))
++ 		return NETSEC_XDP_CONSUMED;
++ 
++ 	spin_lock(&tx_ring->lock);
++ 	ret = netsec_xdp_queue_one(priv, xdpf, false);
++ 	spin_unlock(&tx_ring->lock);
++ 
++ 	return ret;
++ }
++ 
++ static u32 netsec_run_xdp(struct netsec_priv *priv, struct bpf_prog *prog,
++ 			  struct xdp_buff *xdp)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_RX];
++ 	unsigned int sync, len = xdp->data_end - xdp->data;
++ 	u32 ret = NETSEC_XDP_PASS;
++ 	struct page *page;
++ 	int err;
++ 	u32 act;
++ 
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	/* Due xdp_adjust_tail: DMA sync for_device cover max len CPU touch */
++ 	sync = xdp->data_end - xdp->data_hard_start - NETSEC_RXBUF_HEADROOM;
++ 	sync = max(sync, len);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		ret = NETSEC_XDP_PASS;
++ 		break;
++ 	case XDP_TX:
++ 		ret = netsec_xdp_xmit_back(priv, xdp);
++ 		if (ret != NETSEC_XDP_TX) {
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(dring->page_pool, page, sync, true);
++ 		}
++ 		break;
++ 	case XDP_REDIRECT:
++ 		err = xdp_do_redirect(priv->ndev, xdp, prog);
++ 		if (!err) {
++ 			ret = NETSEC_XDP_REDIR;
++ 		} else {
++ 			ret = NETSEC_XDP_CONSUMED;
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(dring->page_pool, page, sync, true);
++ 		}
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		/* fall through */
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(priv->ndev, prog, act);
++ 		/* fall through -- handle aborts by dropping packet */
++ 	case XDP_DROP:
++ 		ret = NETSEC_XDP_CONSUMED;
++ 		page = virt_to_head_page(xdp->data);
++ 		page_pool_put_page(dring->page_pool, page, sync, true);
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int netsec_process_rx(struct netsec_priv *priv, int budget)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_RX];
++ 	struct net_device *ndev = priv->ndev;
++ 	struct netsec_rx_pkt_info rx_info;
++ 	enum dma_data_direction dma_dir;
++ 	struct bpf_prog *xdp_prog;
++ 	struct xdp_buff xdp;
++ 	u16 xdp_xmit = 0;
++ 	u32 xdp_act = 0;
++ 	int done = 0;
++ 
++ 	xdp.rxq = &dring->xdp_rxq;
++ 	xdp.frame_sz = PAGE_SIZE;
++ 
++ 	rcu_read_lock();
++ 	xdp_prog = READ_ONCE(priv->xdp_prog);
++ 	dma_dir = page_pool_get_dma_dir(dring->page_pool);
++ 
++ 	while (done < budget) {
++ 		u16 idx = dring->tail;
++ 		struct netsec_de *de = dring->vaddr + (DESC_SZ * idx);
++ 		struct netsec_desc *desc = &dring->desc[idx];
++ 		struct page *page = virt_to_page(desc->addr);
++ 		u32 xdp_result = NETSEC_XDP_PASS;
++ 		struct sk_buff *skb = NULL;
++ 		u16 pkt_len, desc_len;
++ 		dma_addr_t dma_handle;
++ 		void *buf_addr;
++ 
++ 		if (de->attr & (1U << NETSEC_RX_PKT_OWN_FIELD)) {
++ 			/* reading the register clears the irq */
++ 			netsec_read(priv, NETSEC_REG_NRM_RX_PKTCNT);
++ 			break;
++ 		}
++ 
++ 		/* This  barrier is needed to keep us from reading
++ 		 * any other fields out of the netsec_de until we have
++ 		 * verified the descriptor has been written back
++ 		 */
++ 		dma_rmb();
++ 		done++;
++ 
++ 		pkt_len = de->buf_len_info >> 16;
++ 		rx_info.err_code = (de->attr >> NETSEC_RX_PKT_ERR_FIELD) &
++ 			NETSEC_RX_PKT_ERR_MASK;
++ 		rx_info.err_flag = (de->attr >> NETSEC_RX_PKT_ER_FIELD) & 1;
++ 		if (rx_info.err_flag) {
++ 			netif_err(priv, drv, priv->ndev,
++ 				  "%s: rx fail err(%d)\n", __func__,
++ 				  rx_info.err_code);
++ 			ndev->stats.rx_dropped++;
++ 			dring->tail = (dring->tail + 1) % DESC_NUM;
++ 			/* reuse buffer page frag */
++ 			netsec_rx_fill(priv, idx, 1);
++ 			continue;
++ 		}
++ 		rx_info.rx_cksum_result =
++ 			(de->attr >> NETSEC_RX_PKT_CO_FIELD) & 3;
++ 
++ 		/* allocate a fresh buffer and map it to the hardware.
++ 		 * This will eventually replace the old buffer in the hardware
++ 		 */
++ 		buf_addr = netsec_alloc_rx_data(priv, &dma_handle, &desc_len);
++ 
++ 		if (unlikely(!buf_addr))
++ 			break;
++ 
++ 		dma_sync_single_for_cpu(priv->dev, desc->dma_addr, pkt_len,
++ 					dma_dir);
++ 		prefetch(desc->addr);
++ 
++ 		xdp.data_hard_start = desc->addr;
++ 		xdp.data = desc->addr + NETSEC_RXBUF_HEADROOM;
++ 		xdp_set_data_meta_invalid(&xdp);
++ 		xdp.data_end = xdp.data + pkt_len;
++ 
++ 		if (xdp_prog) {
++ 			xdp_result = netsec_run_xdp(priv, xdp_prog, &xdp);
++ 			if (xdp_result != NETSEC_XDP_PASS) {
++ 				xdp_act |= xdp_result;
++ 				if (xdp_result == NETSEC_XDP_TX)
++ 					xdp_xmit++;
++ 				goto next;
++ 			}
++ 		}
++ 		skb = build_skb(desc->addr, desc->len + NETSEC_RX_BUF_NON_DATA);
++ 
++ 		if (unlikely(!skb)) {
++ 			/* If skb fails recycle_direct will either unmap and
++ 			 * free the page or refill the cache depending on the
++ 			 * cache state. Since we paid the allocation cost if
++ 			 * building an skb fails try to put the page into cache
++ 			 */
++ 			page_pool_put_page(dring->page_pool, page, pkt_len,
++ 					   true);
++ 			netif_err(priv, drv, priv->ndev,
++ 				  "rx failed to build skb\n");
++ 			break;
++ 		}
++ 		page_pool_release_page(dring->page_pool, page);
++ 
++ 		skb_reserve(skb, xdp.data - xdp.data_hard_start);
++ 		skb_put(skb, xdp.data_end - xdp.data);
++ 		skb->protocol = eth_type_trans(skb, priv->ndev);
++ 
++ 		if (priv->rx_cksum_offload_flag &&
++ 		    rx_info.rx_cksum_result == NETSEC_RX_CKSUM_OK)
++ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 
++ next:
++ 		if ((skb && napi_gro_receive(&priv->napi, skb) != GRO_DROP) ||
++ 		    xdp_result) {
++ 			ndev->stats.rx_packets++;
++ 			ndev->stats.rx_bytes += xdp.data_end - xdp.data;
++ 		}
++ 
++ 		/* Update the descriptor with fresh buffers */
++ 		desc->len = desc_len;
++ 		desc->dma_addr = dma_handle;
++ 		desc->addr = buf_addr;
++ 
++ 		netsec_rx_fill(priv, idx, 1);
++ 		dring->tail = (dring->tail + 1) % DESC_NUM;
++ 	}
++ 	netsec_finalize_xdp_rx(priv, xdp_act, xdp_xmit);
++ 
++ 	rcu_read_unlock();
++ 
++ 	return done;
++ }
++ 
++ static int netsec_napi_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct netsec_priv *priv;
++ 	int done;
++ 
++ 	priv = container_of(napi, struct netsec_priv, napi);
++ 
++ 	netsec_process_tx(priv);
++ 	done = netsec_process_rx(priv, budget);
++ 
++ 	if (done < budget && napi_complete_done(napi, done)) {
++ 		unsigned long flags;
++ 
++ 		spin_lock_irqsave(&priv->reglock, flags);
++ 		netsec_write(priv, NETSEC_REG_INTEN_SET,
++ 			     NETSEC_IRQ_RX | NETSEC_IRQ_TX);
++ 		spin_unlock_irqrestore(&priv->reglock, flags);
++ 	}
++ 
++ 	return done;
++ }
++ 
++ 
++ static int netsec_desc_used(struct netsec_desc_ring *dring)
++ {
++ 	int used;
++ 
++ 	if (dring->head >= dring->tail)
++ 		used = dring->head - dring->tail;
++ 	else
++ 		used = dring->head + DESC_NUM - dring->tail;
++ 
++ 	return used;
++ }
++ 
++ static int netsec_check_stop_tx(struct netsec_priv *priv, int used)
++ {
++ 	struct netsec_desc_ring *dring = &priv->desc_ring[NETSEC_RING_TX];
++ 
++ 	/* keep tail from touching the queue */
++ 	if (DESC_NUM - used < 2) {
++ 		netif_stop_queue(priv->ndev);
++ 
++ 		/* Make sure we read the updated value in case
++ 		 * descriptors got freed
++ 		 */
++ 		smp_rmb();
++ 
++ 		used = netsec_desc_used(dring);
++ 		if (DESC_NUM - used < 2)
++ 			return NETDEV_TX_BUSY;
++ 
++ 		netif_wake_queue(priv->ndev);
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 1b698fa5d8ef (xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame)
+  static netdev_tx_t netsec_netdev_start_xmit(struct sk_buff *skb,
+  					    struct net_device *ndev)
+  {
+diff --cc drivers/net/virtio_net.c
+index 60ab9b0a1570,ba38765dc490..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -696,11 -702,12 +696,16 @@@ static struct sk_buff *receive_small(st
+  			metasize = xdp.data - xdp.data_meta;
+  			break;
+  		case XDP_TX:
+++<<<<<<< HEAD
+ +			xdpf = convert_to_xdp_frame(&xdp);
+++=======
++ 			stats->xdp_tx++;
++ 			xdpf = xdp_convert_buff_to_frame(&xdp);
+++>>>>>>> 1b698fa5d8ef (xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame)
+  			if (unlikely(!xdpf))
+  				goto err_xdp;
+ -			err = virtnet_xdp_xmit(dev, 1, &xdpf, 0);
+ -			if (unlikely(err < 0)) {
+ +			err = __virtnet_xdp_tx_xmit(vi, xdpf);
+ +			if (unlikely(err)) {
+  				trace_xdp_exception(vi->dev, xdp_prog, act);
+  				goto err_xdp;
+  			}
+@@@ -880,11 -891,12 +885,16 @@@ static struct sk_buff *receive_mergeabl
+  			}
+  			break;
+  		case XDP_TX:
+++<<<<<<< HEAD
+ +			xdpf = convert_to_xdp_frame(&xdp);
+++=======
++ 			stats->xdp_tx++;
++ 			xdpf = xdp_convert_buff_to_frame(&xdp);
+++>>>>>>> 1b698fa5d8ef (xdp: Rename convert_to_xdp_frame in xdp_convert_buff_to_frame)
+  			if (unlikely(!xdpf))
+  				goto err_xdp;
+ -			err = virtnet_xdp_xmit(dev, 1, &xdpf, 0);
+ -			if (unlikely(err < 0)) {
+ +			err = __virtnet_xdp_tx_xmit(vi, xdpf);
+ +			if (unlikely(err)) {
+  				trace_xdp_exception(vi->dev, xdp_prog, act);
+  				if (unlikely(xdp_page != page))
+  					put_page(xdp_page);
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.c b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index f613782f2f56..f9555c847f73 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -2167,7 +2167,7 @@ static int i40e_xmit_xdp_ring(struct xdp_frame *xdpf,
+ 
+ int i40e_xmit_xdp_tx_ring(struct xdp_buff *xdp, struct i40e_ring *xdp_ring)
+ {
+-	struct xdp_frame *xdpf = convert_to_xdp_frame(xdp);
++	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
+ 
+ 	if (unlikely(!xdpf))
+ 		return I40E_XDP_CONSUMED;
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+index 1ba97172d8d0..b56aa46efa13 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx_lib.c
+@@ -259,7 +259,7 @@ int ice_xmit_xdp_ring(void *data, u16 size, struct ice_ring *xdp_ring)
+  */
+ int ice_xmit_xdp_buff(struct xdp_buff *xdp, struct ice_ring *xdp_ring)
+ {
+-	struct xdp_frame *xdpf = convert_to_xdp_frame(xdp);
++	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
+ 
+ 	if (unlikely(!xdpf))
+ 		return ICE_XDP_CONSUMED;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 78837dbcc5fb..aabf5dc7e732 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -2214,7 +2214,7 @@ static struct sk_buff *ixgbe_run_xdp(struct ixgbe_adapter *adapter,
+ 	case XDP_PASS:
+ 		break;
+ 	case XDP_TX:
+-		xdpf = convert_to_xdp_frame(xdp);
++		xdpf = xdp_convert_buff_to_frame(xdp);
+ 		if (unlikely(!xdpf)) {
+ 			result = IXGBE_XDP_CONSUMED;
+ 			break;
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+index d3c375c01c15..bc624c915745 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+@@ -107,7 +107,7 @@ static int ixgbe_run_xdp_zc(struct ixgbe_adapter *adapter,
+ 	case XDP_PASS:
+ 		break;
+ 	case XDP_TX:
+-		xdpf = convert_to_xdp_frame(xdp);
++		xdpf = xdp_convert_buff_to_frame(xdp);
+ 		if (unlikely(!xdpf)) {
+ 			result = IXGBE_XDP_CONSUMED;
+ 			break;
+* Unmerged path drivers/net/ethernet/marvell/mvneta.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index 99866395dfa6..74f0e4107abd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -64,7 +64,7 @@ mlx5e_xmit_xdp_buff(struct mlx5e_xdpsq *sq, struct mlx5e_rq *rq,
+ 	struct xdp_frame *xdpf;
+ 	dma_addr_t dma_addr;
+ 
+-	xdpf = convert_to_xdp_frame(xdp);
++	xdpf = xdp_convert_buff_to_frame(xdp);
+ 	if (unlikely(!xdpf))
+ 		return false;
+ 
+@@ -97,10 +97,10 @@ mlx5e_xmit_xdp_buff(struct mlx5e_xdpsq *sq, struct mlx5e_rq *rq,
+ 		xdpi.frame.xdpf     = xdpf;
+ 		xdpi.frame.dma_addr = dma_addr;
+ 	} else {
+-		/* Driver assumes that convert_to_xdp_frame returns an xdp_frame
+-		 * that points to the same memory region as the original
+-		 * xdp_buff. It allows to map the memory only once and to use
+-		 * the DMA_BIDIRECTIONAL mode.
++		/* Driver assumes that xdp_convert_buff_to_frame returns
++		 * an xdp_frame that points to the same memory region as
++		 * the original xdp_buff. It allows to map the memory only
++		 * once and to use the DMA_BIDIRECTIONAL mode.
+ 		 */
+ 
+ 		xdpi.mode = MLX5E_XDP_XMIT_MODE_PAGE;
+diff --git a/drivers/net/ethernet/sfc/rx.c b/drivers/net/ethernet/sfc/rx.c
+index f2fd9daac707..59a43d586967 100644
+--- a/drivers/net/ethernet/sfc/rx.c
++++ b/drivers/net/ethernet/sfc/rx.c
+@@ -321,7 +321,7 @@ static bool efx_do_xdp(struct efx_nic *efx, struct efx_channel *channel,
+ 
+ 	case XDP_TX:
+ 		/* Buffer ownership passes to tx on success. */
+-		xdpf = convert_to_xdp_frame(&xdp);
++		xdpf = xdp_convert_buff_to_frame(&xdp);
+ 		err = efx_xdp_tx_buffers(efx, 1, &xdpf, true);
+ 		if (unlikely(err != 1)) {
+ 			efx_free_rx_buffers(rx_queue, rx_buf, 1);
+* Unmerged path drivers/net/ethernet/socionext/netsec.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index 46a36a86564d..a516b69c986f 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -1374,7 +1374,7 @@ static int tun_xdp_xmit(struct net_device *dev, int n,
+ 
+ static int tun_xdp_tx(struct net_device *dev, struct xdp_buff *xdp)
+ {
+-	struct xdp_frame *frame = convert_to_xdp_frame(xdp);
++	struct xdp_frame *frame = xdp_convert_buff_to_frame(xdp);
+ 
+ 	if (unlikely(!frame))
+ 		return -EOVERFLOW;
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index f79981fcbb64..962c03f18b71 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -561,7 +561,7 @@ static void veth_xdp_flush(struct veth_rq *rq, struct veth_xdp_tx_bq *bq)
+ static int veth_xdp_tx(struct veth_rq *rq, struct xdp_buff *xdp,
+ 		       struct veth_xdp_tx_bq *bq)
+ {
+-	struct xdp_frame *frame = convert_to_xdp_frame(xdp);
++	struct xdp_frame *frame = xdp_convert_buff_to_frame(xdp);
+ 
+ 	if (unlikely(!frame))
+ 		return -EOVERFLOW;
+* Unmerged path drivers/net/virtio_net.c
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index 6368152dc76c..033db445ecf2 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -126,7 +126,7 @@ void xdp_convert_frame_to_buff(struct xdp_frame *frame, struct xdp_buff *xdp)
+ 
+ /* Convert xdp_buff to xdp_frame */
+ static inline
+-struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
++struct xdp_frame *xdp_convert_buff_to_frame(struct xdp_buff *xdp)
+ {
+ 	struct xdp_frame *xdp_frame;
+ 	int metasize;
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index ec4dcf8c3eef..9b430c75016c 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -621,7 +621,7 @@ int cpu_map_enqueue(struct bpf_cpu_map_entry *rcpu, struct xdp_buff *xdp,
+ {
+ 	struct xdp_frame *xdpf;
+ 
+-	xdpf = convert_to_xdp_frame(xdp);
++	xdpf = xdp_convert_buff_to_frame(xdp);
+ 	if (unlikely(!xdpf))
+ 		return -EOVERFLOW;
+ 
+diff --git a/kernel/bpf/devmap.c b/kernel/bpf/devmap.c
+index 2c33953067b1..0faeb4744e6b 100644
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -450,7 +450,7 @@ static inline int __xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
+ 	if (unlikely(err))
+ 		return err;
+ 
+-	xdpf = convert_to_xdp_frame(xdp);
++	xdpf = xdp_convert_buff_to_frame(xdp);
+ 	if (unlikely(!xdpf))
+ 		return -EOVERFLOW;
+ 
