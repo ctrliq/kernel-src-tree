@@ -1,0 +1,156 @@
+net: Track socket refcounts in skb_steal_sock()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joe Stringer <joe@wand.net.nz>
+commit 71489e21d720a09388b565d60ef87ae993c10528
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/71489e21.failed
+
+Refactor the UDP/TCP handlers slightly to allow skb_steal_sock() to make
+the determination of whether the socket is reference counted in the case
+where it is prefetched by earlier logic such as early_demux.
+
+	Signed-off-by: Joe Stringer <joe@wand.net.nz>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+Link: https://lore.kernel.org/bpf/20200329225342.16317-3-joe@wand.net.nz
+(cherry picked from commit 71489e21d720a09388b565d60ef87ae993c10528)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+diff --cc include/net/sock.h
+index a36bd86aaa91,f81d528845f6..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -2448,7 -2527,23 +2448,27 @@@ void sock_net_set(struct sock *sk, stru
+  	write_pnet(&sk->sk_net, net);
+  }
+  
+++<<<<<<< HEAD
+ +static inline struct sock *skb_steal_sock(struct sk_buff *skb)
+++=======
++ static inline bool
++ skb_sk_is_prefetched(struct sk_buff *skb)
++ {
++ #ifdef CONFIG_INET
++ 	return skb->destructor == sock_pfree;
++ #else
++ 	return false;
++ #endif /* CONFIG_INET */
++ }
++ 
++ /**
++  * skb_steal_sock
++  * @skb to steal the socket from
++  * @refcounted is set to true if the socket is reference-counted
++  */
++ static inline struct sock *
++ skb_steal_sock(struct sk_buff *skb, bool *refcounted)
+++>>>>>>> 71489e21d720 (net: Track socket refcounts in skb_steal_sock())
+  {
+  	if (skb->sk) {
+  		struct sock *sk = skb->sk;
+diff --git a/include/net/inet6_hashtables.h b/include/net/inet6_hashtables.h
+index 6e91e38a31da..5047e751ac18 100644
+--- a/include/net/inet6_hashtables.h
++++ b/include/net/inet6_hashtables.h
+@@ -89,9 +89,8 @@ static inline struct sock *__inet6_lookup_skb(struct inet_hashinfo *hashinfo,
+ 					      int iif, int sdif,
+ 					      bool *refcounted)
+ {
+-	struct sock *sk = skb_steal_sock(skb);
++	struct sock *sk = skb_steal_sock(skb, refcounted);
+ 
+-	*refcounted = true;
+ 	if (sk)
+ 		return sk;
+ 
+diff --git a/include/net/inet_hashtables.h b/include/net/inet_hashtables.h
+index 9141e95529e7..3d427e9b6d6e 100644
+--- a/include/net/inet_hashtables.h
++++ b/include/net/inet_hashtables.h
+@@ -366,10 +366,9 @@ static inline struct sock *__inet_lookup_skb(struct inet_hashinfo *hashinfo,
+ 					     const int sdif,
+ 					     bool *refcounted)
+ {
+-	struct sock *sk = skb_steal_sock(skb);
++	struct sock *sk = skb_steal_sock(skb, refcounted);
+ 	const struct iphdr *iph = ip_hdr(skb);
+ 
+-	*refcounted = true;
+ 	if (sk)
+ 		return sk;
+ 
+* Unmerged path include/net/sock.h
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index cd7af7c7b5cc..15f0cca0b104 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2245,6 +2245,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 	struct rtable *rt = skb_rtable(skb);
+ 	__be32 saddr, daddr;
+ 	struct net *net = dev_net(skb->dev);
++	bool refcounted;
+ 
+ 	/*
+ 	 *  Validate the packet.
+@@ -2270,7 +2271,7 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 	if (udp4_csum_init(skb, uh, proto))
+ 		goto csum_error;
+ 
+-	sk = skb_steal_sock(skb);
++	sk = skb_steal_sock(skb, &refcounted);
+ 	if (sk) {
+ 		struct dst_entry *dst = skb_dst(skb);
+ 		int ret;
+@@ -2279,7 +2280,8 @@ int __udp4_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 			udp_sk_rx_dst_set(sk, dst);
+ 
+ 		ret = udp_unicast_rcv_skb(sk, skb, uh);
+-		sock_put(sk);
++		if (refcounted)
++			sock_put(sk);
+ 		return ret;
+ 	}
+ 
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index ba34ddeeccbf..ff7c4aba4e68 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -815,6 +815,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 	struct net *net = dev_net(skb->dev);
+ 	struct udphdr *uh;
+ 	struct sock *sk;
++	bool refcounted;
+ 	u32 ulen = 0;
+ 
+ 	if (!pskb_may_pull(skb, sizeof(struct udphdr)))
+@@ -851,7 +852,7 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 		goto csum_error;
+ 
+ 	/* Check if the socket is already available, e.g. due to early demux */
+-	sk = skb_steal_sock(skb);
++	sk = skb_steal_sock(skb, &refcounted);
+ 	if (sk) {
+ 		struct dst_entry *dst = skb_dst(skb);
+ 		int ret;
+@@ -860,12 +861,14 @@ int __udp6_lib_rcv(struct sk_buff *skb, struct udp_table *udptable,
+ 			udp6_sk_rx_dst_set(sk, dst);
+ 
+ 		if (!uh->check && !udp_sk(sk)->no_check6_rx) {
+-			sock_put(sk);
++			if (refcounted)
++				sock_put(sk);
+ 			goto report_csum_error;
+ 		}
+ 
+ 		ret = udp6_unicast_rcv_skb(sk, skb, uh);
+-		sock_put(sk);
++		if (refcounted)
++			sock_put(sk);
+ 		return ret;
+ 	}
+ 
