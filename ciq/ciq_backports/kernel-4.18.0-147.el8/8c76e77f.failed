@@ -1,0 +1,102 @@
+tap: call skb_probe_transport_header after setting skb->dev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit 8c76e77f9069f10505c08e02646c3ee11ad79038
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8c76e77f.failed
+
+The BPF flow dissector expects either skb->sk or skb->dev set on
+all skbs. Delay flow dissection until after skb->dev is set.
+
+This requires calling from within an rcu read-side critical section.
+That is fine, see also the call from tun_xdp_one.
+
+Fixes: d0e13a1488ad ("flow_dissector: lookup netns by skb->sk if skb->dev is NULL")
+	Reported-by: Christian Borntraeger <borntraeger@de.ibm.com>
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8c76e77f9069f10505c08e02646c3ee11ad79038)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/tap.c
+diff --cc drivers/net/tap.c
+index 6233b18b575e,c0b52e48f0e6..000000000000
+--- a/drivers/net/tap.c
++++ b/drivers/net/tap.c
+@@@ -1146,6 -1145,68 +1146,71 @@@ static const struct file_operations tap
+  #endif
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int tap_get_user_xdp(struct tap_queue *q, struct xdp_buff *xdp)
++ {
++ 	struct tun_xdp_hdr *hdr = xdp->data_hard_start;
++ 	struct virtio_net_hdr *gso = &hdr->gso;
++ 	int buflen = hdr->buflen;
++ 	int vnet_hdr_len = 0;
++ 	struct tap_dev *tap;
++ 	struct sk_buff *skb;
++ 	int err, depth;
++ 
++ 	if (q->flags & IFF_VNET_HDR)
++ 		vnet_hdr_len = READ_ONCE(q->vnet_hdr_sz);
++ 
++ 	skb = build_skb(xdp->data_hard_start, buflen);
++ 	if (!skb) {
++ 		err = -ENOMEM;
++ 		goto err;
++ 	}
++ 
++ 	skb_reserve(skb, xdp->data - xdp->data_hard_start);
++ 	skb_put(skb, xdp->data_end - xdp->data);
++ 
++ 	skb_set_network_header(skb, ETH_HLEN);
++ 	skb_reset_mac_header(skb);
++ 	skb->protocol = eth_hdr(skb)->h_proto;
++ 
++ 	if (vnet_hdr_len) {
++ 		err = virtio_net_hdr_to_skb(skb, gso, tap_is_little_endian(q));
++ 		if (err)
++ 			goto err_kfree;
++ 	}
++ 
++ 	/* Move network header to the right position for VLAN tagged packets */
++ 	if ((skb->protocol == htons(ETH_P_8021Q) ||
++ 	     skb->protocol == htons(ETH_P_8021AD)) &&
++ 	    __vlan_get_protocol(skb, skb->protocol, &depth) != 0)
++ 		skb_set_network_header(skb, depth);
++ 
++ 	rcu_read_lock();
++ 	tap = rcu_dereference(q->tap);
++ 	if (tap) {
++ 		skb->dev = tap->dev;
++ 		skb_probe_transport_header(skb, ETH_HLEN);
++ 		dev_queue_xmit(skb);
++ 	} else {
++ 		kfree_skb(skb);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return 0;
++ 
++ err_kfree:
++ 	kfree_skb(skb);
++ err:
++ 	rcu_read_lock();
++ 		tap = rcu_dereference(q->tap);
++ 	if (tap && tap->count_tx_dropped)
++ 		tap->count_tx_dropped(tap);
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
+++>>>>>>> 8c76e77f9069 (tap: call skb_probe_transport_header after setting skb->dev)
+  static int tap_sendmsg(struct socket *sock, struct msghdr *m,
+  		       size_t total_len)
+  {
+* Unmerged path drivers/net/tap.c
