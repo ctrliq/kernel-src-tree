@@ -1,0 +1,717 @@
+io_uring: validate the full range of provided buffers for access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+commit efe68c1ca8f49e8c06afd74b699411bfbb8ba1ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/efe68c1c.failed
+
+Account for the number of provided buffers when validating the address
+range.
+
+	Signed-off-by: Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit efe68c1ca8f49e8c06afd74b699411bfbb8ba1ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 047c6a5f549f,5431b182b6b0..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1543,6 -2825,668 +1543,403 @@@ static int io_fsync(struct io_kiocb *re
+  	return 0;
+  }
+  
+ -static int io_splice_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+++<<<<<<< HEAD
+++=======
+++static int io_openat(struct io_kiocb *req, bool force_nonblock)
++ {
+ -	struct io_splice* sp = &req->splice;
+ -
+ -	sp->off_in = READ_ONCE(sqe->splice_off_in);
+ -	sp->off_out = READ_ONCE(sqe->off);
+ -	return __io_splice_prep(req, sqe);
+++	return io_openat2(req, force_nonblock);
++ }
++ 
+ -static int io_splice(struct io_kiocb *req, bool force_nonblock)
+++static int io_remove_buffers_prep(struct io_kiocb *req,
+++				  const struct io_uring_sqe *sqe)
++ {
+ -	struct io_splice *sp = &req->splice;
+ -	struct file *in = sp->file_in;
+ -	struct file *out = sp->file_out;
+ -	unsigned int flags = sp->flags & ~SPLICE_F_FD_IN_FIXED;
+ -	loff_t *poff_in, *poff_out;
+ -	long ret = 0;
+ -
+ -	if (force_nonblock)
+ -		return -EAGAIN;
+ -
+ -	poff_in = (sp->off_in == -1) ? NULL : &sp->off_in;
+ -	poff_out = (sp->off_out == -1) ? NULL : &sp->off_out;
+++	struct io_provide_buf *p = &req->pbuf;
+++	u64 tmp;
++ 
+ -	if (sp->len)
+ -		ret = do_splice(in, poff_in, out, poff_out, sp->len, flags);
+++	if (sqe->ioprio || sqe->rw_flags || sqe->addr || sqe->len || sqe->off)
+++		return -EINVAL;
++ 
+ -	io_put_file(req, in, (sp->flags & SPLICE_F_FD_IN_FIXED));
+ -	req->flags &= ~REQ_F_NEED_CLEANUP;
+++	tmp = READ_ONCE(sqe->fd);
+++	if (!tmp || tmp > USHRT_MAX)
+++		return -EINVAL;
++ 
+ -	io_cqring_add_event(req, ret);
+ -	if (ret != sp->len)
+ -		req_set_fail_links(req);
+ -	io_put_req(req);
+++	memset(p, 0, sizeof(*p));
+++	p->nbufs = tmp;
+++	p->bgid = READ_ONCE(sqe->buf_group);
++ 	return 0;
++ }
++ 
+ -/*
+ - * IORING_OP_NOP just posts a completion event, nothing else.
+ - */
+ -static int io_nop(struct io_kiocb *req)
+++static int __io_remove_buffers(struct io_ring_ctx *ctx, struct io_buffer *buf,
+++			       int bgid, unsigned nbufs)
++ {
+ -	struct io_ring_ctx *ctx = req->ctx;
+++	unsigned i = 0;
++ 
+ -	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -
+ -	io_cqring_add_event(req, 0);
+ -	io_put_req(req);
+ -	return 0;
+ -}
+ -
+ -static int io_prep_fsync(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -
+ -	if (!req->file)
+ -		return -EBADF;
+ -
+ -	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -	if (unlikely(sqe->addr || sqe->ioprio || sqe->buf_index))
+ -		return -EINVAL;
+ -
+ -	req->sync.flags = READ_ONCE(sqe->fsync_flags);
+ -	if (unlikely(req->sync.flags & ~IORING_FSYNC_DATASYNC))
+ -		return -EINVAL;
+ -
+ -	req->sync.off = READ_ONCE(sqe->off);
+ -	req->sync.len = READ_ONCE(sqe->len);
+ -	return 0;
+ -}
+ -
+ -static bool io_req_cancelled(struct io_kiocb *req)
+ -{
+ -	if (req->work.flags & IO_WQ_WORK_CANCEL) {
+ -		req_set_fail_links(req);
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void __io_fsync(struct io_kiocb *req)
+ -{
+ -	loff_t end = req->sync.off + req->sync.len;
+ -	int ret;
+ -
+ -	ret = vfs_fsync_range(req->file, req->sync.off,
+ -				end > 0 ? end : LLONG_MAX,
+ -				req->sync.flags & IORING_FSYNC_DATASYNC);
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -}
+ -
+ -static void io_fsync_finish(struct io_wq_work **workptr)
+ -{
+ -	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ -
+ -	if (io_req_cancelled(req))
+ -		return;
+ -	__io_fsync(req);
+ -	io_steal_work(req, workptr);
+ -}
+ -
+ -static int io_fsync(struct io_kiocb *req, bool force_nonblock)
+ -{
+ -	/* fsync always requires a blocking context */
+ -	if (force_nonblock) {
+ -		req->work.func = io_fsync_finish;
+ -		return -EAGAIN;
+ -	}
+ -	__io_fsync(req);
+ -	return 0;
+ -}
+ -
+ -static void __io_fallocate(struct io_kiocb *req)
+ -{
+ -	int ret;
+ -
+ -	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = req->fsize;
+ -	ret = vfs_fallocate(req->file, req->sync.mode, req->sync.off,
+ -				req->sync.len);
+ -	current->signal->rlim[RLIMIT_FSIZE].rlim_cur = RLIM_INFINITY;
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -}
+ -
+ -static void io_fallocate_finish(struct io_wq_work **workptr)
+ -{
+ -	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
+ -
+ -	if (io_req_cancelled(req))
+ -		return;
+ -	__io_fallocate(req);
+ -	io_steal_work(req, workptr);
+ -}
+ -
+ -static int io_fallocate_prep(struct io_kiocb *req,
+ -			     const struct io_uring_sqe *sqe)
+ -{
+ -	if (sqe->ioprio || sqe->buf_index || sqe->rw_flags)
+ -		return -EINVAL;
+ -	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
+ -		return -EINVAL;
+ -
+ -	req->sync.off = READ_ONCE(sqe->off);
+ -	req->sync.len = READ_ONCE(sqe->addr);
+ -	req->sync.mode = READ_ONCE(sqe->len);
+ -	req->fsize = rlimit(RLIMIT_FSIZE);
+ -	return 0;
+ -}
+ -
+ -static int io_fallocate(struct io_kiocb *req, bool force_nonblock)
+ -{
+ -	/* fallocate always requiring blocking context */
+ -	if (force_nonblock) {
+ -		req->work.func = io_fallocate_finish;
+ -		return -EAGAIN;
+ -	}
+ -
+ -	__io_fallocate(req);
+ -	return 0;
+ -}
+ -
+ -static int __io_openat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ -{
+ -	const char __user *fname;
+ -	int ret;
+ -
+ -	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
+ -		return -EINVAL;
+ -	if (unlikely(sqe->ioprio || sqe->buf_index))
+ -		return -EINVAL;
+ -	if (unlikely(req->flags & REQ_F_FIXED_FILE))
+ -		return -EBADF;
+ -
+ -	/* open.how should be already initialised */
+ -	if (!(req->open.how.flags & O_PATH) && force_o_largefile())
+ -		req->open.how.flags |= O_LARGEFILE;
+ -
+ -	req->open.dfd = READ_ONCE(sqe->fd);
+ -	fname = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ -	req->open.filename = getname(fname);
+ -	if (IS_ERR(req->open.filename)) {
+ -		ret = PTR_ERR(req->open.filename);
+ -		req->open.filename = NULL;
+ -		return ret;
+ -	}
+ -	req->open.nofile = rlimit(RLIMIT_NOFILE);
+ -	req->flags |= REQ_F_NEED_CLEANUP;
+ -	return 0;
+ -}
+ -
+ -static int io_openat_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ -{
+ -	u64 flags, mode;
+ -
+ -	if (req->flags & REQ_F_NEED_CLEANUP)
+ -		return 0;
+ -	mode = READ_ONCE(sqe->len);
+ -	flags = READ_ONCE(sqe->open_flags);
+ -	req->open.how = build_open_how(flags, mode);
+ -	return __io_openat_prep(req, sqe);
+ -}
+ -
+ -static int io_openat2_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ -{
+ -	struct open_how __user *how;
+ -	size_t len;
+ -	int ret;
+ -
+ -	if (req->flags & REQ_F_NEED_CLEANUP)
+ -		return 0;
+ -	how = u64_to_user_ptr(READ_ONCE(sqe->addr2));
+ -	len = READ_ONCE(sqe->len);
+ -	if (len < OPEN_HOW_SIZE_VER0)
+ -		return -EINVAL;
+ -
+ -	ret = copy_struct_from_user(&req->open.how, sizeof(req->open.how), how,
+ -					len);
+ -	if (ret)
+ -		return ret;
+ -
+ -	return __io_openat_prep(req, sqe);
+ -}
+ -
+ -static int io_openat2(struct io_kiocb *req, bool force_nonblock)
+ -{
+ -	struct open_flags op;
+ -	struct file *file;
+ -	int ret;
+ -
+ -	if (force_nonblock)
+ -		return -EAGAIN;
+ -
+ -	ret = build_open_flags(&req->open.how, &op);
+ -	if (ret)
+ -		goto err;
+ -
+ -	ret = __get_unused_fd_flags(req->open.how.flags, req->open.nofile);
+ -	if (ret < 0)
+ -		goto err;
+ -
+ -	file = do_filp_open(req->open.dfd, req->open.filename, &op);
+ -	if (IS_ERR(file)) {
+ -		put_unused_fd(ret);
+ -		ret = PTR_ERR(file);
+ -	} else {
+ -		fsnotify_open(file);
+ -		fd_install(ret, file);
+ -	}
+ -err:
+ -	putname(req->open.filename);
+ -	req->flags &= ~REQ_F_NEED_CLEANUP;
+ -	if (ret < 0)
+ -		req_set_fail_links(req);
+ -	io_cqring_add_event(req, ret);
+ -	io_put_req(req);
+ -	return 0;
+ -}
+ -
+ -static int io_openat(struct io_kiocb *req, bool force_nonblock)
+ -{
+ -	return io_openat2(req, force_nonblock);
+ -}
+ -
+ -static int io_remove_buffers_prep(struct io_kiocb *req,
+ -				  const struct io_uring_sqe *sqe)
+ -{
+ -	struct io_provide_buf *p = &req->pbuf;
+ -	u64 tmp;
+ -
+ -	if (sqe->ioprio || sqe->rw_flags || sqe->addr || sqe->len || sqe->off)
+ -		return -EINVAL;
+ -
+ -	tmp = READ_ONCE(sqe->fd);
+ -	if (!tmp || tmp > USHRT_MAX)
+ -		return -EINVAL;
+ -
+ -	memset(p, 0, sizeof(*p));
+ -	p->nbufs = tmp;
+ -	p->bgid = READ_ONCE(sqe->buf_group);
+ -	return 0;
+ -}
+ -
+ -static int __io_remove_buffers(struct io_ring_ctx *ctx, struct io_buffer *buf,
+ -			       int bgid, unsigned nbufs)
+ -{
+ -	unsigned i = 0;
+ -
+ -	/* shouldn't happen */
+ -	if (!nbufs)
+ -		return 0;
+++	/* shouldn't happen */
+++	if (!nbufs)
+++		return 0;
++ 
++ 	/* the head kbuf is the list itself */
++ 	while (!list_empty(&buf->list)) {
++ 		struct io_buffer *nxt;
++ 
++ 		nxt = list_first_entry(&buf->list, struct io_buffer, list);
++ 		list_del(&nxt->list);
++ 		kfree(nxt);
++ 		if (++i == nbufs)
++ 			return i;
++ 	}
++ 	i++;
++ 	kfree(buf);
++ 	idr_remove(&ctx->io_buffer_idr, bgid);
++ 
++ 	return i;
++ }
++ 
++ static int io_remove_buffers(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_provide_buf *p = &req->pbuf;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_buffer *head;
++ 	int ret = 0;
++ 
++ 	io_ring_submit_lock(ctx, !force_nonblock);
++ 
++ 	lockdep_assert_held(&ctx->uring_lock);
++ 
++ 	ret = -ENOENT;
++ 	head = idr_find(&ctx->io_buffer_idr, p->bgid);
++ 	if (head)
++ 		ret = __io_remove_buffers(ctx, head, p->bgid, p->nbufs);
++ 
++ 	io_ring_submit_lock(ctx, !force_nonblock);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
++ static int io_provide_buffers_prep(struct io_kiocb *req,
++ 				   const struct io_uring_sqe *sqe)
++ {
++ 	struct io_provide_buf *p = &req->pbuf;
++ 	u64 tmp;
++ 
++ 	if (sqe->ioprio || sqe->rw_flags)
++ 		return -EINVAL;
++ 
++ 	tmp = READ_ONCE(sqe->fd);
++ 	if (!tmp || tmp > USHRT_MAX)
++ 		return -E2BIG;
++ 	p->nbufs = tmp;
++ 	p->addr = READ_ONCE(sqe->addr);
++ 	p->len = READ_ONCE(sqe->len);
++ 
++ 	if (!access_ok(u64_to_user_ptr(p->addr), (p->len * p->nbufs)))
++ 		return -EFAULT;
++ 
++ 	p->bgid = READ_ONCE(sqe->buf_group);
++ 	tmp = READ_ONCE(sqe->off);
++ 	if (tmp > USHRT_MAX)
++ 		return -E2BIG;
++ 	p->bid = tmp;
++ 	return 0;
++ }
++ 
++ static int io_add_buffers(struct io_provide_buf *pbuf, struct io_buffer **head)
++ {
++ 	struct io_buffer *buf;
++ 	u64 addr = pbuf->addr;
++ 	int i, bid = pbuf->bid;
++ 
++ 	for (i = 0; i < pbuf->nbufs; i++) {
++ 		buf = kmalloc(sizeof(*buf), GFP_KERNEL);
++ 		if (!buf)
++ 			break;
++ 
++ 		buf->addr = addr;
++ 		buf->len = pbuf->len;
++ 		buf->bid = bid;
++ 		addr += pbuf->len;
++ 		bid++;
++ 		if (!*head) {
++ 			INIT_LIST_HEAD(&buf->list);
++ 			*head = buf;
++ 		} else {
++ 			list_add_tail(&buf->list, &(*head)->list);
++ 		}
++ 	}
++ 
++ 	return i ? i : -ENOMEM;
++ }
++ 
++ static int io_provide_buffers(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_provide_buf *p = &req->pbuf;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_buffer *head, *list;
++ 	int ret = 0;
++ 
++ 	io_ring_submit_lock(ctx, !force_nonblock);
++ 
++ 	lockdep_assert_held(&ctx->uring_lock);
++ 
++ 	list = head = idr_find(&ctx->io_buffer_idr, p->bgid);
++ 
++ 	ret = io_add_buffers(p, &head);
++ 	if (ret < 0)
++ 		goto out;
++ 
++ 	if (!list) {
++ 		ret = idr_alloc(&ctx->io_buffer_idr, head, p->bgid, p->bgid + 1,
++ 					GFP_KERNEL);
++ 		if (ret < 0) {
++ 			__io_remove_buffers(ctx, head, p->bgid, -1U);
++ 			goto out;
++ 		}
++ 	}
++ out:
++ 	io_ring_submit_unlock(ctx, !force_nonblock);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
++ static int io_epoll_ctl_prep(struct io_kiocb *req,
++ 			     const struct io_uring_sqe *sqe)
++ {
++ #if defined(CONFIG_EPOLL)
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
++ 	req->epoll.epfd = READ_ONCE(sqe->fd);
++ 	req->epoll.op = READ_ONCE(sqe->len);
++ 	req->epoll.fd = READ_ONCE(sqe->off);
++ 
++ 	if (ep_op_has_event(req->epoll.op)) {
++ 		struct epoll_event __user *ev;
++ 
++ 		ev = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 		if (copy_from_user(&req->epoll.event, ev, sizeof(*ev)))
++ 			return -EFAULT;
++ 	}
++ 
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_epoll_ctl(struct io_kiocb *req, bool force_nonblock)
++ {
++ #if defined(CONFIG_EPOLL)
++ 	struct io_epoll *ie = &req->epoll;
++ 	int ret;
++ 
++ 	ret = do_epoll_ctl(ie->epfd, ie->op, ie->fd, &ie->event, force_nonblock);
++ 	if (force_nonblock && ret == -EAGAIN)
++ 		return -EAGAIN;
++ 
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_madvise_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ #if defined(CONFIG_ADVISE_SYSCALLS) && defined(CONFIG_MMU)
++ 	if (sqe->ioprio || sqe->buf_index || sqe->off)
++ 		return -EINVAL;
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
++ 	req->madvise.addr = READ_ONCE(sqe->addr);
++ 	req->madvise.len = READ_ONCE(sqe->len);
++ 	req->madvise.advice = READ_ONCE(sqe->fadvise_advice);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_madvise(struct io_kiocb *req, bool force_nonblock)
++ {
++ #if defined(CONFIG_ADVISE_SYSCALLS) && defined(CONFIG_MMU)
++ 	struct io_madvise *ma = &req->madvise;
++ 	int ret;
++ 
++ 	if (force_nonblock)
++ 		return -EAGAIN;
++ 
++ 	ret = do_madvise(ma->addr, ma->len, ma->advice);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ #else
++ 	return -EOPNOTSUPP;
++ #endif
++ }
++ 
++ static int io_fadvise_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	if (sqe->ioprio || sqe->buf_index || sqe->addr)
++ 		return -EINVAL;
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 
++ 	req->fadvise.offset = READ_ONCE(sqe->off);
++ 	req->fadvise.len = READ_ONCE(sqe->len);
++ 	req->fadvise.advice = READ_ONCE(sqe->fadvise_advice);
++ 	return 0;
++ }
++ 
++ static int io_fadvise(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_fadvise *fa = &req->fadvise;
++ 	int ret;
++ 
++ 	if (force_nonblock) {
++ 		switch (fa->advice) {
++ 		case POSIX_FADV_NORMAL:
++ 		case POSIX_FADV_RANDOM:
++ 		case POSIX_FADV_SEQUENTIAL:
++ 			break;
++ 		default:
++ 			return -EAGAIN;
++ 		}
++ 	}
++ 
++ 	ret = vfs_fadvise(req->file, fa->offset, fa->len, fa->advice);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
++ static int io_statx_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	if (unlikely(req->ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->ioprio || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (req->flags & REQ_F_FIXED_FILE)
++ 		return -EBADF;
++ 
++ 	req->statx.dfd = READ_ONCE(sqe->fd);
++ 	req->statx.mask = READ_ONCE(sqe->len);
++ 	req->statx.filename = u64_to_user_ptr(READ_ONCE(sqe->addr));
++ 	req->statx.buffer = u64_to_user_ptr(READ_ONCE(sqe->addr2));
++ 	req->statx.flags = READ_ONCE(sqe->statx_flags);
++ 
++ 	return 0;
++ }
++ 
++ static int io_statx(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	struct io_statx *ctx = &req->statx;
++ 	int ret;
++ 
++ 	if (force_nonblock) {
++ 		/* only need file table for an actual valid fd */
++ 		if (ctx->dfd == -1 || ctx->dfd == AT_FDCWD)
++ 			req->flags |= REQ_F_NO_FILE_TABLE;
++ 		return -EAGAIN;
++ 	}
++ 
++ 	ret = do_statx(ctx->dfd, ctx->filename, ctx->flags, ctx->mask,
++ 		       ctx->buffer);
++ 
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	io_put_req(req);
++ 	return 0;
++ }
++ 
++ static int io_close_prep(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	/*
++ 	 * If we queue this for async, it must not be cancellable. That would
++ 	 * leave the 'file' in an undeterminate state.
++ 	 */
++ 	req->work.flags |= IO_WQ_WORK_NO_CANCEL;
++ 
++ 	if (unlikely(req->ctx->flags & (IORING_SETUP_IOPOLL|IORING_SETUP_SQPOLL)))
++ 		return -EINVAL;
++ 	if (sqe->ioprio || sqe->off || sqe->addr || sqe->len ||
++ 	    sqe->rw_flags || sqe->buf_index)
++ 		return -EINVAL;
++ 	if (req->flags & REQ_F_FIXED_FILE)
++ 		return -EBADF;
++ 
++ 	req->close.fd = READ_ONCE(sqe->fd);
++ 	if ((req->file && req->file->f_op == &io_uring_fops) ||
++ 	    req->close.fd == req->ctx->ring_fd)
++ 		return -EBADF;
++ 
++ 	return 0;
++ }
++ 
++ /* only called when __close_fd_get_file() is done */
++ static void __io_close_finish(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	ret = filp_close(req->close.put_file, req->work.files);
++ 	if (ret < 0)
++ 		req_set_fail_links(req);
++ 	io_cqring_add_event(req, ret);
++ 	fput(req->close.put_file);
++ 	io_put_req(req);
++ }
++ 
++ static void io_close_finish(struct io_wq_work **workptr)
++ {
++ 	struct io_kiocb *req = container_of(*workptr, struct io_kiocb, work);
++ 
++ 	/* not cancellable, don't do io_req_cancelled() */
++ 	__io_close_finish(req);
++ 	io_steal_work(req, workptr);
++ }
++ 
++ static int io_close(struct io_kiocb *req, bool force_nonblock)
++ {
++ 	int ret;
++ 
++ 	req->close.put_file = NULL;
++ 	ret = __close_fd_get_file(req->close.fd, &req->close.put_file);
++ 	if (ret < 0)
++ 		return (ret == -ENOENT) ? -EBADF : ret;
++ 
++ 	/* if the file has a flush method, be safe and punt to async */
++ 	if (req->close.put_file->f_op->flush && force_nonblock) {
++ 		/* avoid grabbing files - we don't need the files */
++ 		req->flags |= REQ_F_NO_FILE_TABLE | REQ_F_MUST_PUNT;
++ 		req->work.func = io_close_finish;
++ 		return -EAGAIN;
++ 	}
++ 
++ 	/*
++ 	 * No ->flush(), safely close from here and just punt the
++ 	 * fput() to async context.
++ 	 */
++ 	__io_close_finish(req);
++ 	return 0;
++ }
++ 
+++>>>>>>> efe68c1ca8f4 (io_uring: validate the full range of provided buffers for access)
+  static int io_prep_sfr(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+  {
+  	struct io_ring_ctx *ctx = req->ctx;
+* Unmerged path fs/io_uring.c
