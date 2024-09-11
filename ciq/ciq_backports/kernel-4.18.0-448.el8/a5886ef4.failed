@@ -1,0 +1,158 @@
+gve: Introduce per netdev `enum gve_queue_format`
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Bailey Forrest <bcf@google.com>
+commit a5886ef4f4bfc305bfd9efdf6166621b5c602fca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a5886ef4.failed
+
+The currently supported queue formats are:
+- GQI_RDA - GQI with raw DMA addressing
+- GQI_QPL - GQI with queue page list
+- DQO_RDA - DQO with raw DMA addressing
+
+The old `gve_priv.raw_addressing` value is only used for GQI_RDA, so we
+remove it in favor of just checking against GQI_RDA
+
+	Signed-off-by: Bailey Forrest <bcf@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a5886ef4f4bfc305bfd9efdf6166621b5c602fca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+#	drivers/net/ethernet/google/gve/gve_adminq.c
+#	drivers/net/ethernet/google/gve/gve_tx.c
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index ef331182e395,9cb9b8f3e66e..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -442,6 -466,9 +454,12 @@@ static inline u32 gve_rx_idx_to_ntfy(st
+   */
+  static inline u32 gve_num_tx_qpls(struct gve_priv *priv)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (priv->queue_format != GVE_GQI_QPL_FORMAT)
++ 		return 0;
++ 
+++>>>>>>> a5886ef4f4bf (gve: Introduce per netdev `enum gve_queue_format`)
+  	return priv->tx_cfg.num_queues;
+  }
+  
+diff --cc drivers/net/ethernet/google/gve/gve_adminq.c
+index 763187f38df6,9dfce9af60bc..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@@ -457,8 -457,11 +457,13 @@@ static int gve_adminq_create_tx_queue(s
+  {
+  	struct gve_tx_ring *tx = &priv->tx[queue_index];
+  	union gve_adminq_command cmd;
+ -	u32 qpl_id;
+  	int err;
+  
+++<<<<<<< HEAD
+++=======
++ 	qpl_id = priv->queue_format == GVE_GQI_RDA_FORMAT ?
++ 		 GVE_RAW_ADDRESSING_QPL_ID : tx->tx_fifo.qpl->id;
+++>>>>>>> a5886ef4f4bf (gve: Introduce per netdev `enum gve_queue_format`)
+  	memset(&cmd, 0, sizeof(cmd));
+  	cmd.opcode = cpu_to_be32(GVE_ADMINQ_CREATE_TX_QUEUE);
+  	cmd.create_tx_queue = (struct gve_adminq_create_tx_queue) {
+diff --cc drivers/net/ethernet/google/gve/gve_tx.c
+index 6559c232a86a,75930bb64eb9..000000000000
+--- a/drivers/net/ethernet/google/gve/gve_tx.c
++++ b/drivers/net/ethernet/google/gve/gve_tx.c
+@@@ -189,11 -191,16 +189,24 @@@ static int gve_tx_alloc_ring(struct gve
+  	if (!tx->desc)
+  		goto abort_with_info;
+  
+++<<<<<<< HEAD
+ +	tx->tx_fifo.qpl = gve_assign_tx_qpl(priv);
+ +
+ +	/* map Tx FIFO */
+ +	if (gve_tx_fifo_init(priv, &tx->tx_fifo))
+ +		goto abort_with_desc;
+++=======
++ 	tx->raw_addressing = priv->queue_format == GVE_GQI_RDA_FORMAT;
++ 	tx->dev = &priv->pdev->dev;
++ 	if (!tx->raw_addressing) {
++ 		tx->tx_fifo.qpl = gve_assign_tx_qpl(priv);
++ 		if (!tx->tx_fifo.qpl)
++ 			goto abort_with_desc;
++ 		/* map Tx FIFO */
++ 		if (gve_tx_fifo_init(priv, &tx->tx_fifo))
++ 			goto abort_with_qpl;
++ 	}
+++>>>>>>> a5886ef4f4bf (gve: Introduce per netdev `enum gve_queue_format`)
+  
+  	tx->q_resources =
+  		dma_alloc_coherent(hdev,
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+* Unmerged path drivers/net/ethernet/google/gve/gve_adminq.c
+diff --git a/drivers/net/ethernet/google/gve/gve_main.c b/drivers/net/ethernet/google/gve/gve_main.c
+index 676d46e093fe..1a02514ba137 100644
+--- a/drivers/net/ethernet/google/gve/gve_main.c
++++ b/drivers/net/ethernet/google/gve/gve_main.c
+@@ -1,7 +1,7 @@
+ // SPDX-License-Identifier: (GPL-2.0 OR MIT)
+ /* Google virtual Ethernet (gve) driver
+  *
+- * Copyright (C) 2015-2019 Google, Inc.
++ * Copyright (C) 2015-2021 Google, Inc.
+  */
+ 
+ #include <linux/cpumask.h>
+@@ -682,7 +682,7 @@ static int gve_alloc_qpls(struct gve_priv *priv)
+ 	int err;
+ 
+ 	/* Raw addressing means no QPLs */
+-	if (priv->raw_addressing)
++	if (priv->queue_format == GVE_GQI_RDA_FORMAT)
+ 		return 0;
+ 
+ 	priv->qpls = kvzalloc(num_qpls * sizeof(*priv->qpls), GFP_KERNEL);
+@@ -726,7 +726,7 @@ static void gve_free_qpls(struct gve_priv *priv)
+ 	int i;
+ 
+ 	/* Raw addressing means no QPLs */
+-	if (priv->raw_addressing)
++	if (priv->queue_format == GVE_GQI_RDA_FORMAT)
+ 		return;
+ 
+ 	kvfree(priv->qpl_cfg.qpl_id_map);
+@@ -1089,7 +1089,7 @@ static int gve_init_priv(struct gve_priv *priv, bool skip_describe_device)
+ 	if (skip_describe_device)
+ 		goto setup_device;
+ 
+-	priv->raw_addressing = false;
++	priv->queue_format = GVE_QUEUE_FORMAT_UNSPECIFIED;
+ 	/* Get the initial information we need from the device */
+ 	err = gve_adminq_describe_device(priv);
+ 	if (err) {
+@@ -1353,6 +1353,7 @@ static int gve_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
+ 		goto abort_with_wq;
+ 
+ 	dev_info(&pdev->dev, "GVE version %s\n", gve_version_str);
++	dev_info(&pdev->dev, "GVE queue format %d\n", (int)priv->queue_format);
+ 	gve_clear_probe_in_progress(priv);
+ 	queue_work(priv->gve_wq, &priv->service_task);
+ 	return 0;
+diff --git a/drivers/net/ethernet/google/gve/gve_rx.c b/drivers/net/ethernet/google/gve/gve_rx.c
+index af30f1e5806c..ff66e9a5a5ce 100644
+--- a/drivers/net/ethernet/google/gve/gve_rx.c
++++ b/drivers/net/ethernet/google/gve/gve_rx.c
+@@ -148,7 +148,7 @@ static int gve_rx_alloc_ring(struct gve_priv *priv, int idx)
+ 
+ 	slots = priv->rx_data_slot_cnt;
+ 	rx->mask = slots - 1;
+-	rx->data.raw_addressing = priv->raw_addressing;
++	rx->data.raw_addressing = priv->queue_format == GVE_GQI_RDA_FORMAT;
+ 
+ 	/* alloc rx data ring */
+ 	bytes = sizeof(*rx->data.data_ring) * slots;
+* Unmerged path drivers/net/ethernet/google/gve/gve_tx.c
