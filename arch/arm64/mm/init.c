@@ -454,6 +454,7 @@ void __init bootmem_init(void)
 	early_memtest(min << PAGE_SHIFT, max << PAGE_SHIFT);
 
 	max_pfn = max_low_pfn = max;
+	min_low_pfn = min;
 
 	arch_numa_init();
 	/*
