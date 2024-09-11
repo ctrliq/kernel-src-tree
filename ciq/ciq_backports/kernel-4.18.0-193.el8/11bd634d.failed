@@ -1,0 +1,239 @@
+net: sched: conditionally obtain rtnl lock in cls hw offloads API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: conditionally obtain rtnl lock in cls hw offloads API (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 11bd634da25735a3f2f12112d02661d462a76792
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/11bd634d.failed
+
+In order to remove dependency on rtnl lock from offloads code of
+classifiers, take rtnl lock conditionally before executing driver
+callbacks. Only obtain rtnl lock if block is bound to devices that require
+it.
+
+Block bind/unbind code is rtnl-locked and obtains block->cb_lock while
+holding rtnl lock. Obtain locks in same order in tc_setup_cb_*() functions
+to prevent deadlock.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 11bd634da25735a3f2f12112d02661d462a76792)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index 081ac3d0fb50,3c103cf9fd0d..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -3266,8 -3072,199 +3266,204 @@@ int tc_setup_cb_call(struct tcf_block *
+  	}
+  	return ok_count;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(tc_setup_cb_call);
+ +
+++=======
++ 
++ int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
++ 		     void *type_data, bool err_stop, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_call);
++ 
++ /* Non-destructive filter add. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offloads counter. On failure,
++  * previously offloaded filter is considered to be intact and offloads counter
++  * is not decremented.
++  */
++ 
++ int tc_setup_cb_add(struct tcf_block *block, struct tcf_proto *tp,
++ 		    enum tc_setup_type type, void *type_data, bool err_stop,
++ 		    u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags,
++ 					  ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_add);
++ 
++ /* Destructive filter replace. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offload counter. On failure,
++  * previously offloaded filter is considered to be destroyed and offload counter
++  * is decremented.
++  */
++ 
++ int tc_setup_cb_replace(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *old_flags, unsigned int *old_in_hw_count,
++ 			u32 *new_flags, unsigned int *new_in_hw_count,
++ 			bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, old_in_hw_count, old_flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, new_in_hw_count,
++ 					  new_flags, ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_replace);
++ 
++ /* Destroy filter and decrement block offload counter, if filter was previously
++  * offloaded.
++  */
++ 
++ int tc_setup_cb_destroy(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, in_hw_count, flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_destroy);
++ 
++ int tc_setup_cb_reoffload(struct tcf_block *block, struct tcf_proto *tp,
++ 			  bool add, flow_setup_cb_t *cb,
++ 			  enum tc_setup_type type, void *type_data,
++ 			  void *cb_priv, u32 *flags, unsigned int *in_hw_count)
++ {
++ 	int err = cb(type, type_data, cb_priv);
++ 
++ 	if (err) {
++ 		if (add && tc_skip_sw(*flags))
++ 			return err;
++ 	} else {
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags, 1,
++ 					  add);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_reoffload);
++ 
+++>>>>>>> 11bd634da257 (net: sched: conditionally obtain rtnl lock in cls hw offloads API)
+  int tc_setup_flow_action(struct flow_action *flow_action,
+  			 const struct tcf_exts *exts)
+  {
+* Unmerged path net/sched/cls_api.c
