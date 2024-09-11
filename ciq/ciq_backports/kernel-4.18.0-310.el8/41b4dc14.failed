@@ -1,0 +1,136 @@
+mm/gup: restrict CMA region by using allocation scope API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 41b4dc14ee807cb1bd15e67cad287534046f92dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/41b4dc14.failed
+
+We have well defined scope API to exclude CMA region.  Use it rather than
+manipulating gfp_mask manually.  With this change, we can now restore
+__GFP_MOVABLE for gfp_mask like as usual migration target allocation.  It
+would result in that the ZONE_MOVABLE is also searched by page allocator.
+For hugetlb, gfp_mask is redefined since it has a regular allocation mask
+filter for migration target.  __GPF_NOWARN is added to hugetlb gfp_mask
+filter since a new user for gfp_mask filter, gup, want to be silent when
+allocation fails.
+
+Note that this can be considered as a fix for the commit 9a4e9f3b2d73
+("mm: update get_user_pages_longterm to migrate pages allocated from CMA
+region").  However, "Fixes" tag isn't added here since it is just
+suboptimal but it doesn't cause any problem.
+
+	Suggested-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+Link: http://lkml.kernel.org/r/1596180906-8442-1-git-send-email-iamjoonsoo.kim@lge.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 41b4dc14ee807cb1bd15e67cad287534046f92dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+diff --cc include/linux/hugetlb.h
+index cd86e23fcb9f,d86c82749836..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -627,6 -694,27 +627,30 @@@ static inline bool hugepage_movable_sup
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Movability of hugepages depends on migration support. */
++ static inline gfp_t htlb_alloc_mask(struct hstate *h)
++ {
++ 	if (hugepage_movable_supported(h))
++ 		return GFP_HIGHUSER_MOVABLE;
++ 	else
++ 		return GFP_HIGHUSER;
++ }
++ 
++ static inline gfp_t htlb_modify_alloc_mask(struct hstate *h, gfp_t gfp_mask)
++ {
++ 	gfp_t modified_mask = htlb_alloc_mask(h);
++ 
++ 	/* Some callers might want to enforce node */
++ 	modified_mask |= (gfp_mask & __GFP_THISNODE);
++ 
++ 	modified_mask |= (gfp_mask & __GFP_NOWARN);
++ 
++ 	return modified_mask;
++ }
++ 
+++>>>>>>> 41b4dc14ee80 (mm/gup: restrict CMA region by using allocation scope API)
+  static inline spinlock_t *huge_pte_lockptr(struct hstate *h,
+  					   struct mm_struct *mm, pte_t *pte)
+  {
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/gup.c b/mm/gup.c
+index eb225cc5e706..e15b1cde2905 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1522,10 +1522,12 @@ static struct page *new_non_cma_page(struct page *page, unsigned long private)
+ 	 * Trying to allocate a page for migration. Ignore allocation
+ 	 * failure warnings. We don't force __GFP_THISNODE here because
+ 	 * this node here is the node where we have CMA reservation and
+-	 * in some case these nodes will have really less non movable
++	 * in some case these nodes will have really less non CMA
+ 	 * allocation memory.
++	 *
++	 * Note that CMA region is prohibited by allocation scope.
+ 	 */
+-	gfp_t gfp_mask = GFP_USER | __GFP_NOWARN;
++	gfp_t gfp_mask = GFP_USER | __GFP_MOVABLE | __GFP_NOWARN;
+ 
+ 	if (PageHighMem(page))
+ 		gfp_mask |= __GFP_HIGHMEM;
+@@ -1533,6 +1535,8 @@ static struct page *new_non_cma_page(struct page *page, unsigned long private)
+ #ifdef CONFIG_HUGETLB_PAGE
+ 	if (PageHuge(page)) {
+ 		struct hstate *h = page_hstate(page);
++
++		gfp_mask = htlb_modify_alloc_mask(h, gfp_mask);
+ 		/*
+ 		 * We don't want to dequeue from the pool because pool pages will
+ 		 * mostly be from the CMA region.
+@@ -1547,11 +1551,6 @@ static struct page *new_non_cma_page(struct page *page, unsigned long private)
+ 		 */
+ 		gfp_t thp_gfpmask = GFP_TRANSHUGE | __GFP_NOWARN;
+ 
+-		/*
+-		 * Remove the movable mask so that we don't allocate from
+-		 * CMA area again.
+-		 */
+-		thp_gfpmask &= ~__GFP_MOVABLE;
+ 		thp = __alloc_pages_node(nid, thp_gfpmask, HPAGE_PMD_ORDER);
+ 		if (!thp)
+ 			return NULL;
+@@ -1697,7 +1696,6 @@ static long __gup_longterm_locked(struct task_struct *tsk,
+ 				     vmas_tmp, NULL, gup_flags);
+ 
+ 	if (gup_flags & FOLL_LONGTERM) {
+-		memalloc_nocma_restore(flags);
+ 		if (rc < 0)
+ 			goto out;
+ 
+@@ -1710,9 +1708,10 @@ static long __gup_longterm_locked(struct task_struct *tsk,
+ 
+ 		rc = check_and_migrate_cma_pages(tsk, mm, start, rc, pages,
+ 						 vmas_tmp, gup_flags);
++out:
++		memalloc_nocma_restore(flags);
+ 	}
+ 
+-out:
+ 	if (vmas_tmp != vmas)
+ 		kfree(vmas_tmp);
+ 	return rc;
