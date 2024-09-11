@@ -1,0 +1,173 @@
+blk-mq: fix hang caused by freeze/unfreeze sequence
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Bob Liu <bob.liu@oracle.com>
+commit 7996a8b5511a72465b0b286763c2d8f412b8874a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7996a8b5.failed
+
+The following is a description of a hang in blk_mq_freeze_queue_wait().
+The hang happens on attempt to freeze a queue while another task does
+queue unfreeze.
+
+The root cause is an incorrect sequence of percpu_ref_resurrect() and
+percpu_ref_kill() and as a result those two can be swapped:
+
+ CPU#0                         CPU#1
+ ----------------              -----------------
+ q1 = blk_mq_init_queue(shared_tags)
+
+                                q2 = blk_mq_init_queue(shared_tags):
+                                  blk_mq_add_queue_tag_set(shared_tags):
+                                    blk_mq_update_tag_set_depth(shared_tags):
+				     list_for_each_entry()
+                                      blk_mq_freeze_queue(q1)
+                                       > percpu_ref_kill()
+                                       > blk_mq_freeze_queue_wait()
+
+ blk_cleanup_queue(q1)
+  blk_mq_freeze_queue(q1)
+   > percpu_ref_kill()
+                 ^^^^^^ freeze_depth can't guarantee the order
+
+                                      blk_mq_unfreeze_queue()
+                                        > percpu_ref_resurrect()
+
+   > blk_mq_freeze_queue_wait()
+                 ^^^^^^ Hang here!!!!
+
+This wrong sequence raises kernel warning:
+percpu_ref_kill_and_confirm called more than once on blk_queue_usage_counter_release!
+WARNING: CPU: 0 PID: 11854 at lib/percpu-refcount.c:336 percpu_ref_kill_and_confirm+0x99/0xb0
+
+But the most unpleasant effect is a hang of a blk_mq_freeze_queue_wait(),
+which waits for a zero of a q_usage_counter, which never happens
+because percpu-ref was reinited (instead of being killed) and stays in
+PERCPU state forever.
+
+How to reproduce:
+ - "insmod null_blk.ko shared_tags=1 nr_devices=0 queue_mode=2"
+ - cpu0: python Script.py 0; taskset the corresponding process running on cpu0
+ - cpu1: python Script.py 1; taskset the corresponding process running on cpu1
+
+ Script.py:
+ ------
+ #!/usr/bin/python3
+
+import os
+import sys
+
+while True:
+    on = "echo 1 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    off = "echo 0 > /sys/kernel/config/nullb/%s/power" % sys.argv[1]
+    os.system(on)
+    os.system(off)
+------
+
+This bug was first reported and fixed by Roman, previous discussion:
+[1] Message id: 1443287365-4244-7-git-send-email-akinobu.mita@gmail.com
+[2] Message id: 1443563240-29306-6-git-send-email-tj@kernel.org
+[3] https://patchwork.kernel.org/patch/9268199/
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Roman Pen <roman.penyaev@profitbricks.com>
+	Signed-off-by: Bob Liu <bob.liu@oracle.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7996a8b5511a72465b0b286763c2d8f412b8874a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index e4cfc3fbcfc4,592669bcc536..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -550,7 -535,14 +550,18 @@@ struct request_queue 
+  
+  	struct mutex		sysfs_lock;
+  
+++<<<<<<< HEAD
+ +	atomic_t		mq_freeze_depth;
+++=======
++ 	/*
++ 	 * for reusing dead hctx instance in case of updating
++ 	 * nr_hw_queues
++ 	 */
++ 	struct list_head	unused_hctx_list;
++ 	spinlock_t		unused_hctx_lock;
++ 
++ 	int			mq_freeze_depth;
+++>>>>>>> 7996a8b5511a (blk-mq: fix hang caused by freeze/unfreeze sequence)
+  
+  #if defined(CONFIG_BLK_DEV_BSG)
+  	struct bsg_class_device bsg_dev;
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 8f49bf9e070f..5f02317f955d 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -396,7 +396,7 @@ int blk_queue_enter(struct request_queue *q, blk_mq_req_flags_t flags)
+ 		smp_rmb();
+ 
+ 		wait_event(q->mq_freeze_wq,
+-			   (atomic_read(&q->mq_freeze_depth) == 0 &&
++			   (!q->mq_freeze_depth &&
+ 			    (pm || (blk_pm_request_resume(q),
+ 				    !blk_queue_pm_only(q)))) ||
+ 			   blk_queue_dying(q));
+@@ -483,6 +483,7 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 	spin_lock_init(&q->queue_lock);
+ 
+ 	init_waitqueue_head(&q->mq_freeze_wq);
++	mutex_init(&q->mq_freeze_lock);
+ 
+ 	/*
+ 	 * Init percpu_ref in atomic mode so that it's faster to shutdown.
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 6eaec7025d6a..fb2c50408849 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -143,13 +143,14 @@ void blk_mq_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 
+ void blk_freeze_queue_start(struct request_queue *q)
+ {
+-	int freeze_depth;
+-
+-	freeze_depth = atomic_inc_return(&q->mq_freeze_depth);
+-	if (freeze_depth == 1) {
++	mutex_lock(&q->mq_freeze_lock);
++	if (++q->mq_freeze_depth == 1) {
+ 		percpu_ref_kill(&q->q_usage_counter);
++		mutex_unlock(&q->mq_freeze_lock);
+ 		if (queue_is_mq(q))
+ 			blk_mq_run_hw_queues(q, false);
++	} else {
++		mutex_unlock(&q->mq_freeze_lock);
+ 	}
+ }
+ EXPORT_SYMBOL_GPL(blk_freeze_queue_start);
+@@ -198,14 +199,14 @@ EXPORT_SYMBOL_GPL(blk_mq_freeze_queue);
+ 
+ void blk_mq_unfreeze_queue(struct request_queue *q)
+ {
+-	int freeze_depth;
+-
+-	freeze_depth = atomic_dec_return(&q->mq_freeze_depth);
+-	WARN_ON_ONCE(freeze_depth < 0);
+-	if (!freeze_depth) {
++	mutex_lock(&q->mq_freeze_lock);
++	q->mq_freeze_depth--;
++	WARN_ON_ONCE(q->mq_freeze_depth < 0);
++	if (!q->mq_freeze_depth) {
+ 		percpu_ref_resurrect(&q->q_usage_counter);
+ 		wake_up_all(&q->mq_freeze_wq);
+ 	}
++	mutex_unlock(&q->mq_freeze_lock);
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_unfreeze_queue);
+ 
+* Unmerged path include/linux/blkdev.h
