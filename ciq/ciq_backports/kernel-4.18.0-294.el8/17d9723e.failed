@@ -1,0 +1,201 @@
+s390/qeth: remove HARDSETUP state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 17d9723e69d44491d04289213006fea1647bd0a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/17d9723e.failed
+
+qeth_l?_stop_card() is _never_ called while in HARDSETUP state, and
+there's no other usage of the card state that relies on the
+DOWN -> HARDSETUP -> SOFTSETUP transition.
+
+As related cleanup, remove the check in qeth_realloc_buffer_pool() as it
+is already done by the callers.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 17d9723e69d44491d04289213006fea1647bd0a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index 8d2f8c3a9271,9639938581f5..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -275,60 -243,18 +275,69 @@@ static int qeth_alloc_buffer_pool(struc
+  	return 0;
+  }
+  
+ -int qeth_realloc_buffer_pool(struct qeth_card *card, int bufcnt)
+ +int qeth_resize_buffer_pool(struct qeth_card *card, unsigned int count)
+  {
+ +	unsigned int buf_elements = QETH_MAX_BUFFER_ELEMENTS(card);
+ +	struct qeth_qdio_buffer_pool *pool = &card->qdio.init_pool;
+ +	struct qeth_buffer_pool_entry *entry, *tmp;
+ +	int delta = count - pool->buf_count;
+ +	LIST_HEAD(entries);
+ +
+  	QETH_CARD_TEXT(card, 2, "realcbp");
+  
+++<<<<<<< HEAD
+ +	if (card->state != CARD_STATE_DOWN)
+ +		return -EPERM;
+ +
+ +	/* Defer until queue is allocated: */
+ +	if (!card->qdio.in_q)
+ +		goto out;
+ +
+ +	/* Remove entries from the pool: */
+ +	while (delta < 0) {
+ +		entry = list_first_entry(&pool->entry_list,
+ +					 struct qeth_buffer_pool_entry,
+ +					 init_list);
+ +		list_del(&entry->init_list);
+ +		qeth_free_pool_entry(entry);
+ +
+ +		delta++;
+ +	}
+ +
+ +	/* Allocate additional entries: */
+ +	while (delta > 0) {
+ +		entry = qeth_alloc_pool_entry(buf_elements);
+ +		if (!entry) {
+ +			list_for_each_entry_safe(entry, tmp, &entries,
+ +						 init_list) {
+ +				list_del(&entry->init_list);
+ +				qeth_free_pool_entry(entry);
+ +			}
+ +
+ +			return -ENOMEM;
+ +		}
+ +
+ +		list_add(&entry->init_list, &entries);
+ +
+ +		delta--;
+ +	}
+ +
+ +	list_splice(&entries, &pool->entry_list);
+ +
+ +out:
+ +	card->qdio.in_buf_pool.buf_count = count;
+ +	pool->buf_count = count;
+ +	return 0;
+++=======
++ 	/* TODO: steel/add buffers from/to a running card's buffer pool (?) */
++ 	qeth_clear_working_pool_list(card);
++ 	qeth_free_buffer_pool(card);
++ 	card->qdio.in_buf_pool.buf_count = bufcnt;
++ 	card->qdio.init_pool.buf_count = bufcnt;
++ 	return qeth_alloc_buffer_pool(card);
+++>>>>>>> 17d9723e69d4 (s390/qeth: remove HARDSETUP state)
+  }
+ -EXPORT_SYMBOL_GPL(qeth_realloc_buffer_pool);
+ +EXPORT_SYMBOL_GPL(qeth_resize_buffer_pool);
+  
+  static void qeth_free_qdio_queue(struct qeth_qdio_q *q)
+  {
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index 16a2bb86acb6..d2e0b8318a06 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -559,7 +559,6 @@ enum qeth_channel_states {
+  */
+ enum qeth_card_states {
+ 	CARD_STATE_DOWN,
+-	CARD_STATE_HARDSETUP,
+ 	CARD_STATE_SOFTSETUP,
+ };
+ 
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_core_sys.c b/drivers/s390/net/qeth_core_sys.c
+index 7ef18a920886..78cae61bc924 100644
+--- a/drivers/s390/net/qeth_core_sys.c
++++ b/drivers/s390/net/qeth_core_sys.c
+@@ -24,8 +24,6 @@ static ssize_t qeth_dev_state_show(struct device *dev,
+ 	switch (card->state) {
+ 	case CARD_STATE_DOWN:
+ 		return sprintf(buf, "DOWN\n");
+-	case CARD_STATE_HARDSETUP:
+-		return sprintf(buf, "HARDSETUP\n");
+ 	case CARD_STATE_SOFTSETUP:
+ 		if (card->dev->flags & IFF_UP)
+ 			return sprintf(buf, "UP (LAN %s)\n",
+diff --git a/drivers/s390/net/qeth_l2_main.c b/drivers/s390/net/qeth_l2_main.c
+index de6b495d1d80..2e566a56d4df 100644
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -284,9 +284,6 @@ static void qeth_l2_stop_card(struct qeth_card *card)
+ 
+ 	if (card->state == CARD_STATE_SOFTSETUP) {
+ 		qeth_clear_ipacmd_list(card);
+-		card->state = CARD_STATE_HARDSETUP;
+-	}
+-	if (card->state == CARD_STATE_HARDSETUP) {
+ 		qeth_drain_output_queues(card);
+ 		cancel_delayed_work_sync(&card->buffer_reclaim_work);
+ 		card->state = CARD_STATE_DOWN;
+@@ -822,7 +819,6 @@ static int qeth_l2_set_online(struct ccwgroup_device *gdev)
+ 	qeth_trace_features(card);
+ 	qeth_l2_trace_features(card);
+ 
+-	card->state = CARD_STATE_HARDSETUP;
+ 	qeth_print_status_message(card);
+ 
+ 	/* softsetup */
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index d915059832ae..8296583d62ec 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -903,7 +903,7 @@ static int qeth_l3_start_ipa_broadcast(struct qeth_card *card)
+ 	return rc;
+ }
+ 
+-static int qeth_l3_start_ipassists(struct qeth_card *card)
++static void qeth_l3_start_ipassists(struct qeth_card *card)
+ {
+ 	QETH_CARD_TEXT(card, 3, "strtipas");
+ 
+@@ -913,7 +913,6 @@ static int qeth_l3_start_ipassists(struct qeth_card *card)
+ 	qeth_l3_start_ipa_multicast(card);		/* go on*/
+ 	qeth_l3_start_ipa_ipv6(card);		/* go on*/
+ 	qeth_l3_start_ipa_broadcast(card);		/* go on*/
+-	return 0;
+ }
+ 
+ static int qeth_l3_iqd_read_initial_mac_cb(struct qeth_card *card,
+@@ -1270,9 +1269,6 @@ static void qeth_l3_stop_card(struct qeth_card *card)
+ 	if (card->state == CARD_STATE_SOFTSETUP) {
+ 		qeth_l3_clear_ip_htable(card, 1);
+ 		qeth_clear_ipacmd_list(card);
+-		card->state = CARD_STATE_HARDSETUP;
+-	}
+-	if (card->state == CARD_STATE_HARDSETUP) {
+ 		qeth_drain_output_queues(card);
+ 		cancel_delayed_work_sync(&card->buffer_reclaim_work);
+ 		card->state = CARD_STATE_DOWN;
+@@ -2167,7 +2163,6 @@ static int qeth_l3_set_online(struct ccwgroup_device *gdev)
+ 		goto out_remove;
+ 	}
+ 
+-	card->state = CARD_STATE_HARDSETUP;
+ 	qeth_print_status_message(card);
+ 
+ 	/* softsetup */
+@@ -2177,11 +2172,8 @@ static int qeth_l3_set_online(struct ccwgroup_device *gdev)
+ 	if (rc)
+ 		QETH_CARD_TEXT_(card, 2, "2err%04x", rc);
+ 	if (!card->options.sniffer) {
+-		rc = qeth_l3_start_ipassists(card);
+-		if (rc) {
+-			QETH_CARD_TEXT_(card, 2, "3err%d", rc);
+-			goto out_remove;
+-		}
++		qeth_l3_start_ipassists(card);
++
+ 		rc = qeth_l3_setrouting_v4(card);
+ 		if (rc)
+ 			QETH_CARD_TEXT_(card, 2, "4err%04x", rc);
