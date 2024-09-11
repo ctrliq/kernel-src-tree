@@ -5006,7 +5006,6 @@ static void rtl_remove_one(struct pci_dev *pdev)
 	netif_napi_del(&tp->napi);
 
 	unregister_netdev(dev);
-	mdiobus_unregister(tp->phydev->mdio.bus);
 
 	rtl_release_firmware(tp);
 
