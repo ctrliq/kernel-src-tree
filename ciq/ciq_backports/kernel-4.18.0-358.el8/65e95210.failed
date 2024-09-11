@@ -1,0 +1,409 @@
+x86/fpu: Rename xfeatures_mask_user() to xfeatures_mask_uabi()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 65e952102122bf89f0e4f1bebf8664e32587aaed
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/65e95210.failed
+
+Rename it so it's clear that this is about user ABI features which can
+differ from the feature set which the kernel saves and restores because the
+kernel handles e.g. PKRU differently. But the user ABI (ptrace, signal
+frame) expects it to be there.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.211585137@linutronix.de
+(cherry picked from commit 65e952102122bf89f0e4f1bebf8664e32587aaed)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/core.c
+#	arch/x86/kernel/fpu/signal.c
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/core.c
+index d86fb6c58479,12437383ff79..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -376,18 -394,25 +376,31 @@@ static void fpu__clear(struct fpu *fpu
+  		return;
+  	}
+  
+ -	/*
+ -	 * Ensure that current's supervisor states are loaded into their
+ -	 * corresponding registers.
+ -	 */
+ -	if (xfeatures_mask_supervisor() &&
+ -	    !fpregs_state_valid(fpu, smp_processor_id())) {
+ -		os_xrstor(&fpu->state.xsave, xfeatures_mask_supervisor());
+ +	fpregs_lock();
+ +
+ +	if (user_only) {
+ +		if (!fpregs_state_valid(fpu, smp_processor_id()) &&
+ +		    xfeatures_mask_supervisor())
+ +			copy_kernel_to_xregs(&fpu->state.xsave,
+ +					     xfeatures_mask_supervisor());
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_user());
+ +	} else {
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_all);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Reset user states in registers. */
++ 	restore_fpregs_from_init_fpstate(xfeatures_mask_uabi());
++ 
++ 	/*
++ 	 * Now all FPU registers have their desired values.  Inform the FPU
++ 	 * state machine that current's FPU registers are in the hardware
++ 	 * registers. The memory image does not need to be updated because
++ 	 * any operation relying on it has to save the registers first when
++ 	 * current's FPU is marked active.
++ 	 */
+++>>>>>>> 65e952102122 (x86/fpu: Rename xfeatures_mask_user() to xfeatures_mask_uabi())
+  	fpregs_mark_activate();
+  	fpregs_unlock();
+  }
+diff --cc arch/x86/kernel/fpu/signal.c
+index 2f834b9f7092,a42bc9d0b1cc..000000000000
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@@ -256,14 -257,14 +256,14 @@@ static int copy_user_to_fpregs_zeroing(
+  
+  	if (use_xsave()) {
+  		if (fx_only) {
+- 			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
++ 			init_bv = xfeatures_mask_uabi() & ~XFEATURE_MASK_FPSSE;
+  
+ -			r = fxrstor_from_user_sigframe(buf);
+ +			r = copy_user_to_fxregs(buf);
+  			if (!r)
+ -				os_xrstor(&init_fpstate.xsave, init_bv);
+ +				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+  			return r;
+  		} else {
+- 			init_bv = xfeatures_mask_user() & ~xbv;
++ 			init_bv = xfeatures_mask_uabi() & ~xbv;
+  
+  			r = xrstor_from_user_sigframe(buf, xbv);
+  			if (!r && unlikely(init_bv))
+@@@ -418,9 -420,9 +418,9 @@@ static int __fpu__restore_sig(void __us
+  	fpregs_unlock();
+  
+  	if (use_xsave() && !fx_only) {
+- 		u64 init_bv = xfeatures_mask_user() & ~user_xfeatures;
++ 		u64 init_bv = xfeatures_mask_uabi() & ~user_xfeatures;
+  
+ -		ret = copy_sigframe_from_user_to_xstate(&fpu->state.xsave, buf_fx);
+ +		ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+  		if (ret)
+  			goto out;
+  
+@@@ -452,11 -454,11 +452,16 @@@
+  		if (use_xsave()) {
+  			u64 init_bv;
+  
+++<<<<<<< HEAD
+ +			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
+ +			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+++=======
++ 			init_bv = xfeatures_mask_uabi() & ~XFEATURE_MASK_FPSSE;
++ 			os_xrstor(&init_fpstate.xsave, init_bv);
+++>>>>>>> 65e952102122 (x86/fpu: Rename xfeatures_mask_user() to xfeatures_mask_uabi())
+  		}
+  
+ -		ret = fxrstor_safe(&fpu->state.fxsave);
+ +		ret = copy_kernel_to_fxregs_err(&fpu->state.fxsave);
+  	} else {
+  		ret = __copy_from_user(&fpu->state.fsave, buf_fx, state_size);
+  		if (ret)
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 4641d3145e59,c513596f8ec9..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -846,9 -835,9 +846,9 @@@ void fpu__resume_cpu(void
+  	 * Restore IA32_XSS. The same CPUID bit enumerates support
+  	 * of XSAVES and MSR_IA32_XSS.
+  	 */
+- 	if (boot_cpu_has(X86_FEATURE_XSAVES)) {
++ 	if (cpu_feature_enabled(X86_FEATURE_XSAVES)) {
+  		wrmsrl(MSR_IA32_XSS, xfeatures_mask_supervisor()  |
+ -				     xfeatures_mask_independent());
+ +				     xfeatures_mask_dynamic());
+  	}
+  }
+  
+@@@ -994,128 -953,125 +994,183 @@@ int arch_set_user_pkey_access(struct ta
+  }
+  #endif /* ! CONFIG_ARCH_HAS_PKEYS */
+  
+ -static void copy_feature(bool from_xstate, struct membuf *to, void *xstate,
+ -			 void *init_xstate, unsigned int size)
+ +/*
+ + * Weird legacy quirk: SSE and YMM states store information in the
+ + * MXCSR and MXCSR_FLAGS fields of the FP area. That means if the FP
+ + * area is marked as unused in the xfeatures header, we need to copy
+ + * MXCSR and MXCSR_FLAGS if either SSE or YMM are in use.
+ + */
+ +static inline bool xfeatures_mxcsr_quirk(u64 xfeatures)
+  {
+ -	membuf_write(to, from_xstate ? xstate : init_xstate, size);
+ +	if (!(xfeatures & (XFEATURE_MASK_SSE|XFEATURE_MASK_YMM)))
+ +		return false;
+ +
+ +	if (xfeatures & XFEATURE_MASK_FP)
+ +		return false;
+ +
+ +	return true;
+  }
+  
+ -/**
+ - * copy_xstate_to_uabi_buf - Copy kernel saved xstate to a UABI buffer
+ - * @to:		membuf descriptor
+ - * @xsave:	The kernel xstate buffer to copy from
+ - * @copy_mode:	The requested copy mode
+ - *
+ - * Converts from kernel XSAVE or XSAVES compacted format to UABI conforming
+ - * format, i.e. from the kernel internal hardware dependent storage format
+ - * to the requested @mode. UABI XSTATE is always uncompacted!
+ +static void fill_gap(unsigned to, void **kbuf, unsigned *pos, unsigned *count)
+ +{
+ +	if (*pos < to) {
+ +		unsigned size = to - *pos;
+ +
+ +		if (size > *count)
+ +			size = *count;
+ +		memcpy(*kbuf, (void *)&init_fpstate.xsave + *pos, size);
+ +		*kbuf += size;
+ +		*pos += size;
+ +		*count -= size;
+ +	}
+ +}
+ +
+ +static void copy_part(unsigned offset, unsigned size, void *from,
+ +			void **kbuf, unsigned *pos, unsigned *count)
+ +{
+ +	fill_gap(offset, kbuf, pos, count);
+ +	if (size > *count)
+ +		size = *count;
+ +	if (size) {
+ +		memcpy(*kbuf, from, size);
+ +		*kbuf += size;
+ +		*pos += size;
+ +		*count -= size;
+ +	}
+ +}
+ +
+ +/*
+ + * Convert from kernel XSAVES compacted format to standard format and copy
+ + * to a kernel-space ptrace buffer.
+   *
+ - * It supports partial copy but @to.pos always starts from zero.
+ + * It supports partial copy but pos always starts from zero. This is called
+ + * from xstateregs_get() and there we check the CPU has XSAVES.
+   */
+ -void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
+ -			     enum xstate_copy_mode copy_mode)
+ +int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset_start, unsigned int size_total)
+  {
+ -	const unsigned int off_mxcsr = offsetof(struct fxregs_state, mxcsr);
+ -	struct xregs_state *xinit = &init_fpstate.xsave;
+  	struct xstate_header header;
+ -	unsigned int zerofrom;
+ +	const unsigned off_mxcsr = offsetof(struct fxregs_state, mxcsr);
+ +	unsigned count = size_total;
+  	int i;
+  
+ -	header.xfeatures = xsave->header.xfeatures;
+ +	/*
+ +	 * Currently copy_regset_to_user() starts from pos 0:
+ +	 */
+ +	if (unlikely(offset_start != 0))
+ +		return -EFAULT;
+  
+ +	/*
+ +	 * The destination is a ptrace buffer; we put in only user xstates:
+ +	 */
+ +	memset(&header, 0, sizeof(header));
+ +	header.xfeatures = xsave->header.xfeatures;
+ +	header.xfeatures &= xfeatures_mask_user();
+ +
+++<<<<<<< HEAD
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(0, off_mxcsr,
+ +			  &xsave->i387, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM))
+ +		copy_part(off_mxcsr, MXCSR_AND_FLAGS_SIZE,
+ +			  &xsave->i387.mxcsr, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(offsetof(struct fxregs_state, st_space), 128,
+ +			  &xsave->i387.st_space, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_SSE)
+ +		copy_part(xstate_offsets[XFEATURE_SSE], 256,
+ +			  &xsave->i387.xmm_space, &kbuf, &offset_start, &count);
+ +	/*
+ +	 * Fill xsave->i387.sw_reserved value for ptrace frame:
+ +	 */
+ +	copy_part(offsetof(struct fxregs_state, sw_reserved), 48,
+ +		  xstate_fx_sw_bytes, &kbuf, &offset_start, &count);
+ +	/*
+ +	 * Copy xregs_state->header:
+ +	 */
+ +	copy_part(offsetof(struct xregs_state, header), sizeof(header),
+ +		  &header, &kbuf, &offset_start, &count);
+++=======
++ 	/* Mask out the feature bits depending on copy mode */
++ 	switch (copy_mode) {
++ 	case XSTATE_COPY_FP:
++ 		header.xfeatures &= XFEATURE_MASK_FP;
++ 		break;
++ 
++ 	case XSTATE_COPY_FX:
++ 		header.xfeatures &= XFEATURE_MASK_FP | XFEATURE_MASK_SSE;
++ 		break;
++ 
++ 	case XSTATE_COPY_XSAVE:
++ 		header.xfeatures &= xfeatures_mask_uabi();
++ 		break;
++ 	}
++ 
++ 	/* Copy FP state up to MXCSR */
++ 	copy_feature(header.xfeatures & XFEATURE_MASK_FP, &to, &xsave->i387,
++ 		     &xinit->i387, off_mxcsr);
++ 
++ 	/* Copy MXCSR when SSE or YMM are set in the feature mask */
++ 	copy_feature(header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM),
++ 		     &to, &xsave->i387.mxcsr, &xinit->i387.mxcsr,
++ 		     MXCSR_AND_FLAGS_SIZE);
++ 
++ 	/* Copy the remaining FP state */
++ 	copy_feature(header.xfeatures & XFEATURE_MASK_FP,
++ 		     &to, &xsave->i387.st_space, &xinit->i387.st_space,
++ 		     sizeof(xsave->i387.st_space));
++ 
++ 	/* Copy the SSE state - shared with YMM, but independently managed */
++ 	copy_feature(header.xfeatures & XFEATURE_MASK_SSE,
++ 		     &to, &xsave->i387.xmm_space, &xinit->i387.xmm_space,
++ 		     sizeof(xsave->i387.xmm_space));
++ 
++ 	if (copy_mode != XSTATE_COPY_XSAVE)
++ 		goto out;
++ 
++ 	/* Zero the padding area */
++ 	membuf_zero(&to, sizeof(xsave->i387.padding));
++ 
++ 	/* Copy xsave->i387.sw_reserved */
++ 	membuf_write(&to, xstate_fx_sw_bytes, sizeof(xsave->i387.sw_reserved));
++ 
++ 	/* Copy the user space relevant state of @xsave->header */
++ 	membuf_write(&to, &header, sizeof(header));
++ 
++ 	zerofrom = offsetof(struct xregs_state, extended_state_area);
+++>>>>>>> 65e952102122 (x86/fpu: Rename xfeatures_mask_user() to xfeatures_mask_uabi())
+  
+  	for (i = FIRST_EXTENDED_XFEATURE; i < XFEATURE_MAX; i++) {
+  		/*
+ -		 * The ptrace buffer is in non-compacted XSAVE format.
+ -		 * In non-compacted format disabled features still occupy
+ -		 * state space, but there is no state to copy from in the
+ -		 * compacted init_fpstate. The gap tracking will zero this
+ -		 * later.
+ +		 * Copy only in-use xstates:
+  		 */
+++<<<<<<< HEAD
+ +		if ((header.xfeatures >> i) & 1) {
+ +			void *src = __raw_xsave_addr(xsave, i);
+++=======
++ 		if (!(xfeatures_mask_uabi() & BIT_ULL(i)))
++ 			continue;
+++>>>>>>> 65e952102122 (x86/fpu: Rename xfeatures_mask_user() to xfeatures_mask_uabi())
+  
+ -		/*
+ -		 * If there was a feature or alignment gap, zero the space
+ -		 * in the destination buffer.
+ -		 */
+ -		if (zerofrom < xstate_offsets[i])
+ -			membuf_zero(&to, xstate_offsets[i] - zerofrom);
+ -
+ -		copy_feature(header.xfeatures & BIT_ULL(i), &to,
+ -			     __raw_xsave_addr(xsave, i),
+ -			     __raw_xsave_addr(xinit, i),
+ -			     xstate_sizes[i]);
+ +			copy_part(xstate_offsets[i], xstate_sizes[i],
+ +				  src, &kbuf, &offset_start, &count);
+ +		}
+  
+ -		/*
+ -		 * Keep track of the last copied state in the non-compacted
+ -		 * target buffer for gap zeroing.
+ -		 */
+ -		zerofrom = xstate_offsets[i] + xstate_sizes[i];
+  	}
+ +	fill_gap(size_total, &kbuf, &offset_start, &count);
+  
+ -out:
+ -	if (to.left)
+ -		membuf_zero(&to, to.left);
+ +	return 0;
+  }
+  
+ -static int copy_from_buffer(void *dst, unsigned int offset, unsigned int size,
+ -			    const void *kbuf, const void __user *ubuf)
+ +static inline int
+ +__copy_xstate_to_user(void __user *ubuf, const void *data, unsigned int offset, unsigned int size, unsigned int size_total)
+  {
+ -	if (kbuf) {
+ -		memcpy(dst, kbuf + offset, size);
+ -	} else {
+ -		if (copy_from_user(dst, ubuf + offset, size))
+ +	if (!size)
+ +		return 0;
+ +
+ +	if (offset < size_total) {
+ +		unsigned int copy = min(size, size_total - offset);
+ +
+ +		if (__copy_to_user(ubuf + offset, data, copy))
+  			return -EFAULT;
+  	}
+  	return 0;
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 5a42546d89cb..adcb02aa9e39 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -322,7 +322,12 @@ static inline void copy_kernel_to_xregs(struct xregs_state *xstate, u64 mask)
+  */
+ static inline int xsave_to_user_sigframe(struct xregs_state __user *buf)
+ {
+-	u64 mask = xfeatures_mask_user();
++	/*
++	 * Include the features which are not xsaved/rstored by the kernel
++	 * internally, e.g. PKRU. That's user space ABI and also required
++	 * to allow the signal handler to modify PKRU.
++	 */
++	u64 mask = xfeatures_mask_uabi();
+ 	u32 lmask = mask;
+ 	u32 hmask = mask >> 32;
+ 	int err;
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 1a0fecae6ef8..b6b2b133af3d 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -83,7 +83,11 @@ static inline u64 xfeatures_mask_supervisor(void)
+ 	return xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
+ }
+ 
+-static inline u64 xfeatures_mask_user(void)
++/*
++ * The xfeatures which are enabled in XCR0 and expected to be in ptrace
++ * buffers and signal frames.
++ */
++static inline u64 xfeatures_mask_uabi(void)
+ {
+ 	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+ }
+* Unmerged path arch/x86/kernel/fpu/core.c
+* Unmerged path arch/x86/kernel/fpu/signal.c
+* Unmerged path arch/x86/kernel/fpu/xstate.c
