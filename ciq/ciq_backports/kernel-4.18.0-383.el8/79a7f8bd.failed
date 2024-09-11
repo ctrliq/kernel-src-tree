@@ -1,0 +1,254 @@
+bpf: Introduce bpf_sys_bpf() helper and program type.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit 79a7f8bdb159d9914b58740f3d31d602a6e4aca8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/79a7f8bd.failed
+
+Add placeholders for bpf_sys_bpf() helper and new program type.
+Make sure to check that expected_attach_type is zero for future extensibility.
+Allow tracing helper functions to be used in this program type, since they will
+only execute from user context via bpf_prog_test_run.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Andrii Nakryiko <andrii@kernel.org>
+Link: https://lore.kernel.org/bpf/20210514003623.28033-2-alexei.starovoitov@gmail.com
+(cherry picked from commit 79a7f8bdb159d9914b58740f3d31d602a6e4aca8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index d613063f6429,c92648f38144..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -940,7 -937,7 +940,11 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_EXT,
+  	BPF_PROG_TYPE_LSM,
+  	BPF_PROG_TYPE_SK_LOOKUP,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+++>>>>>>> 79a7f8bdb159 (bpf: Introduce bpf_sys_bpf() helper and program type.)
+  };
+  
+  enum bpf_attach_type {
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 03b6e29e91cf..a199c5523ce0 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1849,6 +1849,9 @@ static inline bool bpf_map_is_dev_bound(struct bpf_map *map)
+ 
+ struct bpf_map *bpf_map_offload_map_alloc(union bpf_attr *attr);
+ void bpf_map_offload_map_free(struct bpf_map *map);
++int bpf_prog_test_run_syscall(struct bpf_prog *prog,
++			      const union bpf_attr *kattr,
++			      union bpf_attr __user *uattr);
+ #else
+ static inline int bpf_prog_offload_init(struct bpf_prog *prog,
+ 					union bpf_attr *attr)
+@@ -1874,6 +1877,13 @@ static inline struct bpf_map *bpf_map_offload_map_alloc(union bpf_attr *attr)
+ static inline void bpf_map_offload_map_free(struct bpf_map *map)
+ {
+ }
++
++static inline int bpf_prog_test_run_syscall(struct bpf_prog *prog,
++					    const union bpf_attr *kattr,
++					    union bpf_attr __user *uattr)
++{
++	return -ENOTSUPP;
++}
+ #endif /* CONFIG_NET && CONFIG_BPF_SYSCALL */
+ 
+ #if defined(CONFIG_INET) && defined(CONFIG_BPF_SYSCALL)
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 2bb5801b5887..ed8f5c51c547 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -77,6 +77,8 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ 	       void *, void *)
+ #endif /* CONFIG_BPF_LSM */
+ #endif
++BPF_PROG_TYPE(BPF_PROG_TYPE_SYSCALL, bpf_syscall,
++	      void *, void *)
+ 
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 7aed15cc139e..2251b0e2d6a1 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2040,6 +2040,7 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ 		if (expected_attach_type == BPF_SK_LOOKUP)
+ 			return 0;
+ 		return -EINVAL;
++	case BPF_PROG_TYPE_SYSCALL:
+ 	case BPF_PROG_TYPE_EXT:
+ 		if (expected_attach_type)
+ 			return -EINVAL;
+@@ -4541,3 +4542,55 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
+ 
+ 	return err;
+ }
++
++static bool syscall_prog_is_valid_access(int off, int size,
++					 enum bpf_access_type type,
++					 const struct bpf_prog *prog,
++					 struct bpf_insn_access_aux *info)
++{
++	if (off < 0 || off >= U16_MAX)
++		return false;
++	if (off % size != 0)
++		return false;
++	return true;
++}
++
++BPF_CALL_3(bpf_sys_bpf, int, cmd, void *, attr, u32, attr_size)
++{
++	return -EINVAL;
++}
++
++const struct bpf_func_proto bpf_sys_bpf_proto = {
++	.func		= bpf_sys_bpf,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_ANYTHING,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++};
++
++const struct bpf_func_proto * __weak
++tracing_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	return bpf_base_func_proto(func_id);
++}
++
++static const struct bpf_func_proto *
++syscall_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	case BPF_FUNC_sys_bpf:
++		return &bpf_sys_bpf_proto;
++	default:
++		return tracing_prog_func_proto(func_id, prog);
++	}
++}
++
++const struct bpf_verifier_ops bpf_syscall_verifier_ops = {
++	.get_func_proto  = syscall_prog_func_proto,
++	.is_valid_access = syscall_prog_is_valid_access,
++};
++
++const struct bpf_prog_ops bpf_syscall_prog_ops = {
++	.test_run = bpf_prog_test_run_syscall,
++};
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 8c36b59459d3..34bb4e146ad7 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -13192,6 +13192,14 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 	int ret;
+ 	u64 key;
+ 
++	if (prog->type == BPF_PROG_TYPE_SYSCALL) {
++		if (prog->aux->sleepable)
++			/* attach_btf_id checked to be zero already */
++			return 0;
++		verbose(env, "Syscall programs can only be sleepable\n");
++		return -EINVAL;
++	}
++
+ 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
+ 	    prog->type != BPF_PROG_TYPE_LSM) {
+ 		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
+diff --git a/net/bpf/test_run.c b/net/bpf/test_run.c
+index a73e52cc9bb2..971ccd01ce1e 100644
+--- a/net/bpf/test_run.c
++++ b/net/bpf/test_run.c
+@@ -921,3 +921,46 @@ int bpf_prog_test_run_sk_lookup(struct bpf_prog *prog, const union bpf_attr *kat
+ 	kfree(user_ctx);
+ 	return ret;
+ }
++
++int bpf_prog_test_run_syscall(struct bpf_prog *prog,
++			      const union bpf_attr *kattr,
++			      union bpf_attr __user *uattr)
++{
++	void __user *ctx_in = u64_to_user_ptr(kattr->test.ctx_in);
++	__u32 ctx_size_in = kattr->test.ctx_size_in;
++	void *ctx = NULL;
++	u32 retval;
++	int err = 0;
++
++	/* doesn't support data_in/out, ctx_out, duration, or repeat or flags */
++	if (kattr->test.data_in || kattr->test.data_out ||
++	    kattr->test.ctx_out || kattr->test.duration ||
++	    kattr->test.repeat || kattr->test.flags)
++		return -EINVAL;
++
++	if (ctx_size_in < prog->aux->max_ctx_offset ||
++	    ctx_size_in > U16_MAX)
++		return -EINVAL;
++
++	if (ctx_size_in) {
++		ctx = kzalloc(ctx_size_in, GFP_USER);
++		if (!ctx)
++			return -ENOMEM;
++		if (copy_from_user(ctx, ctx_in, ctx_size_in)) {
++			err = -EFAULT;
++			goto out;
++		}
++	}
++	retval = bpf_prog_run_pin_on_cpu(prog, ctx);
++
++	if (copy_to_user(&uattr->test.retval, &retval, sizeof(u32))) {
++		err = -EFAULT;
++		goto out;
++	}
++	if (ctx_size_in)
++		if (copy_to_user(ctx_in, ctx, ctx_size_in))
++			err = -EFAULT;
++out:
++	kfree(ctx);
++	return err;
++}
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index ed06cd84257e..779849d8c8f0 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -937,6 +937,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_EXT,
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
++	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ };
+ 
+ enum bpf_attach_type {
+@@ -4735,6 +4736,12 @@ union bpf_attr {
+  *		be zero-terminated except when **str_size** is 0.
+  *
+  *		Or **-EBUSY** if the per-CPU memory copy buffer is busy.
++ *
++ * long bpf_sys_bpf(u32 cmd, void *attr, u32 attr_size)
++ * 	Description
++ * 		Execute bpf syscall with given arguments.
++ * 	Return
++ * 		A syscall result.
+  */
+ #define __BPF_FUNC_MAPPER(FN)		\
+ 	FN(unspec),			\
+@@ -4903,6 +4910,7 @@ union bpf_attr {
+ 	FN(check_mtu),			\
+ 	FN(for_each_map_elem),		\
+ 	FN(snprintf),			\
++	FN(sys_bpf),			\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
