@@ -41,7 +41,7 @@ static struct kernfs_iattrs *__kernfs_iattrs(struct kernfs_node *kn, int alloc)
 	if (kn->iattr || !alloc)
 		goto out_unlock;
 
-	kn->iattr = kzalloc(sizeof(struct kernfs_iattrs), GFP_KERNEL);
+	kn->iattr = kmem_cache_zalloc(kernfs_iattrs_cache, GFP_KERNEL);
 	if (!kn->iattr)
 		goto out_unlock;
 
