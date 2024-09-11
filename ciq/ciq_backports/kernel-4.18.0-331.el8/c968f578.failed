@@ -1,0 +1,199 @@
+gfs2: Clean up on-stack transactions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit c968f5788bc91fe4f86df1a68f0d6471396b4d78
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/c968f578.failed
+
+Replace the TR_ALLOCED flag by its inverse, TR_ONSTACK: that way, the flag only
+needs to be set in the exceptional case of on-stack transactions.  Split off
+__gfs2_trans_begin from gfs2_trans_begin and use it to replace the open-coded
+version in gfs2_ail_empty_gl.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit c968f5788bc91fe4f86df1a68f0d6471396b4d78)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glops.c
+#	fs/gfs2/trans.c
+diff --cc fs/gfs2/glops.c
+index ed31726a32f4,a067924341e3..000000000000
+--- a/fs/gfs2/glops.c
++++ b/fs/gfs2/glops.c
+@@@ -89,14 -86,12 +89,19 @@@ static int gfs2_ail_empty_gl(struct gfs
+  {
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  	struct gfs2_trans tr;
++ 	unsigned int revokes;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	memset(&tr, 0, sizeof(tr));
+ +	INIT_LIST_HEAD(&tr.tr_buf);
+ +	INIT_LIST_HEAD(&tr.tr_databuf);
+ +	tr.tr_revokes = atomic_read(&gl->gl_ail_count);
+++=======
++ 	revokes = atomic_read(&gl->gl_ail_count);
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  
+- 	if (!tr.tr_revokes) {
++ 	if (!revokes) {
+  		bool have_revokes;
+  		bool log_in_flight;
+  
+@@@ -123,20 -118,14 +128,30 @@@
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* A shortened, inline version of gfs2_trans_begin()
+ +         * tr->alloced is not set since the transaction structure is
+ +         * on the stack */
+ +	tr.tr_reserved = 1 + gfs2_struct2blk(sdp, tr.tr_revokes, sizeof(u64));
+ +	tr.tr_ip = _RET_IP_;
+ +	ret = gfs2_log_reserve(sdp, tr.tr_reserved);
+ +	if (ret < 0)
+ +		return ret;
+ +	WARN_ON_ONCE(current->journal_info);
+ +	current->journal_info = &tr;
+ +
+ +	__gfs2_ail_flush(gl, 0, tr.tr_revokes);
+ +
+++=======
++ 	memset(&tr, 0, sizeof(tr));
++ 	set_bit(TR_ONSTACK, &tr.tr_flags);
++ 	ret = __gfs2_trans_begin(&tr, sdp, 0, revokes, _RET_IP_);
++ 	if (ret)
++ 		goto flush;
++ 	__gfs2_ail_flush(gl, 0, revokes);
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  	gfs2_trans_end(sdp);
++ 
+  flush:
+  	gfs2_log_flush(sdp, NULL, GFS2_LOG_HEAD_FLUSH_NORMAL |
+  		       GFS2_LFC_AIL_EMPTY_GL);
+diff --cc fs/gfs2/trans.c
+index 35084a676633,db29ca253853..000000000000
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@@ -55,11 -52,7 +55,15 @@@ int __gfs2_trans_begin(struct gfs2_tran
+  	if (!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
+  		return -EROFS;
+  
+++<<<<<<< HEAD
+ +	tr = kzalloc(sizeof(struct gfs2_trans), GFP_NOFS);
+ +	if (!tr)
+ +		return -ENOMEM;
+ +
+ +	tr->tr_ip = _RET_IP_;
+++=======
++ 	tr->tr_ip = ip;
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  	tr->tr_blocks = blocks;
+  	tr->tr_revokes = revokes;
+  	tr->tr_reserved = 1;
+@@@ -82,11 -77,20 +87,26 @@@
+  	current->journal_info = tr;
+  
+  	return 0;
++ }
+  
+++<<<<<<< HEAD
+ +fail:
+ +	sb_end_intwrite(sdp->sd_vfs);
+ +	kfree(tr);
+++=======
++ int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
++ 		     unsigned int revokes)
++ {
++ 	struct gfs2_trans *tr;
++ 	int error;
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  
++ 	tr = kmem_cache_zalloc(gfs2_trans_cachep, GFP_NOFS);
++ 	if (!tr)
++ 		return -ENOMEM;
++ 	error = __gfs2_trans_begin(tr, sdp, blocks, revokes, _RET_IP_);
++ 	if (error)
++ 		kmem_cache_free(gfs2_trans_cachep, tr);
+  	return error;
+  }
+  
+@@@ -100,10 -103,9 +119,16 @@@ void gfs2_trans_end(struct gfs2_sbd *sd
+  
+  	if (!test_bit(TR_TOUCHED, &tr->tr_flags)) {
+  		gfs2_log_release(sdp, tr->tr_reserved);
+++<<<<<<< HEAD
+ +		if (alloced) {
+ +			kfree(tr);
+ +			sb_end_intwrite(sdp->sd_vfs);
+ +		}
+++=======
++ 		if (!test_bit(TR_ONSTACK, &tr->tr_flags))
++ 			gfs2_trans_free(sdp, tr);
++ 		sb_end_intwrite(sdp->sd_vfs);
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  		return;
+  	}
+  
+@@@ -116,8 -118,9 +141,14 @@@
+  		gfs2_print_trans(sdp, tr);
+  
+  	gfs2_log_commit(sdp, tr);
+++<<<<<<< HEAD
+ +	if (alloced && !test_bit(TR_ATTACHED, &tr->tr_flags))
+ +		kfree(tr);
+++=======
++ 	if (!test_bit(TR_ONSTACK, &tr->tr_flags) &&
++ 	    !test_bit(TR_ATTACHED, &tr->tr_flags))
++ 		gfs2_trans_free(sdp, tr);
+++>>>>>>> c968f5788bc9 (gfs2: Clean up on-stack transactions)
+  	up_read(&sdp->sd_log_flush_lock);
+  
+  	if (sdp->sd_vfs->s_flags & SB_SYNCHRONOUS)
+* Unmerged path fs/gfs2/glops.c
+diff --git a/fs/gfs2/incore.h b/fs/gfs2/incore.h
+index f42b0ae25288..58b805032788 100644
+--- a/fs/gfs2/incore.h
++++ b/fs/gfs2/incore.h
+@@ -498,7 +498,7 @@ struct gfs2_quota_data {
+ enum {
+ 	TR_TOUCHED = 1,
+ 	TR_ATTACHED = 2,
+-	TR_ALLOCED = 3,
++	TR_ONSTACK = 3,
+ };
+ 
+ struct gfs2_trans {
+diff --git a/fs/gfs2/log.c b/fs/gfs2/log.c
+index 1a5aad0b1fab..491c1ea15d24 100644
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@ -1070,7 +1070,7 @@ static void log_refund(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
+ 	if (sdp->sd_log_tr) {
+ 		gfs2_merge_trans(sdp, tr);
+ 	} else if (tr->tr_num_buf_new || tr->tr_num_databuf_new) {
+-		gfs2_assert_withdraw(sdp, test_bit(TR_ALLOCED, &tr->tr_flags));
++		gfs2_assert_withdraw(sdp, !test_bit(TR_ONSTACK, &tr->tr_flags));
+ 		sdp->sd_log_tr = tr;
+ 		set_bit(TR_ATTACHED, &tr->tr_flags);
+ 	}
+* Unmerged path fs/gfs2/trans.c
+diff --git a/fs/gfs2/trans.h b/fs/gfs2/trans.h
+index 1e39f056ccb7..259dbd63cb26 100644
+--- a/fs/gfs2/trans.h
++++ b/fs/gfs2/trans.h
+@@ -37,6 +37,9 @@ static inline unsigned int gfs2_rg_blocks(const struct gfs2_inode *ip, unsigned
+ 	return rgd->rd_length;
+ }
+ 
++extern int __gfs2_trans_begin(struct gfs2_trans *tr, struct gfs2_sbd *sdp,
++			      unsigned int blocks, unsigned int revokes,
++			      unsigned long ip);
+ extern int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
+ 			    unsigned int revokes);
+ 
