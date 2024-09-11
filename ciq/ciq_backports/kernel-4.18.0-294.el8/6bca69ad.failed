@@ -1,0 +1,209 @@
+x86/kvm: Sanitize kvm_async_pf_task_wait()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] kvm: Sanitize kvm_async_pf_task_wait() (Vitaly Kuznetsov) [1882793]
+Rebuild_FUZZ: 95.00%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6bca69ada4bc20fa27eb44a5e09da3363d1752af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6bca69ad.failed
+
+While working on the entry consolidation I stumbled over the KVM async page
+fault handler and kvm_async_pf_task_wait() in particular. It took me a
+while to realize that the randomly sprinkled around rcu_irq_enter()/exit()
+invocations are just cargo cult programming. Several patches "fixed" RCU
+splats by curing the symptoms without noticing that the code is flawed 
+from a design perspective.
+
+The main problem is that this async injection is not based on a proper
+handshake mechanism and only respects the minimal requirement, i.e. the
+guest is not in a state where it has interrupts disabled.
+
+Aside of that the actual code is a convoluted one fits it all swiss army
+knife. It is invoked from different places with different RCU constraints:
+
+  1) Host side:
+
+     vcpu_enter_guest()
+       kvm_x86_ops->handle_exit()
+         kvm_handle_page_fault()
+           kvm_async_pf_task_wait()
+
+     The invocation happens from fully preemptible context.
+
+  2) Guest side:
+
+     The async page fault interrupted:
+
+         a) user space
+
+	 b) preemptible kernel code which is not in a RCU read side
+	    critical section
+
+     	 c) non-preemtible kernel code or a RCU read side critical section
+	    or kernel code with CONFIG_PREEMPTION=n which allows not to
+	    differentiate between #2b and #2c.
+
+RCU is watching for:
+
+  #1  The vCPU exited and current is definitely not the idle task
+
+  #2a The #PF entry code on the guest went through enter_from_user_mode()
+      which reactivates RCU
+
+  #2b There is no preemptible, interrupts enabled code in the kernel
+      which can run with RCU looking away. (The idle task is always
+      non preemptible).
+
+I.e. all schedulable states (#1, #2a, #2b) do not need any of this RCU
+voodoo at all.
+
+In #2c RCU is eventually not watching, but as that state cannot schedule
+anyway there is no point to worry about it so it has to invoke
+rcu_irq_enter() before running that code. This can be optimized, but this
+will be done as an extra step in course of the entry code consolidation
+work.
+
+So the proper solution for this is to:
+
+  - Split kvm_async_pf_task_wait() into schedule and halt based waiting
+    interfaces which share the enqueueing code.
+
+  - Add comments (condensed form of this changelog) to spare others the
+    time waste and pain of reverse engineering all of this with the help of
+    uncomprehensible changelogs and code history.
+
+  - Invoke kvm_async_pf_task_wait_schedule() from kvm_handle_page_fault(),
+    user mode and schedulable kernel side async page faults (#1, #2a, #2b)
+
+  - Invoke kvm_async_pf_task_wait_halt() for the non schedulable kernel
+    case (#2c).
+
+    For this case also remove the rcu_irq_exit()/enter() pair around the
+    halt as it is just a pointless exercise:
+
+       - vCPUs can VMEXIT at any random point and can be scheduled out for
+         an arbitrary amount of time by the host and this is not any
+         different except that it voluntary triggers the exit via halt.
+
+       - The interrupted context could have RCU watching already. So the
+	 rcu_irq_exit() before the halt is not gaining anything aside of
+	 confusing the reader. Claiming that this might prevent RCU stalls
+	 is just an illusion.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200505134059.262701431@linutronix.de
+
+
+(cherry picked from commit 6bca69ada4bc20fa27eb44a5e09da3363d1752af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/kernel/kvm.c
+index 34ea59cb4c95,c6a82f9f537f..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -255,29 -316,37 +327,58 @@@ u32 kvm_read_and_reset_pf_reason(void
+  EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
+  NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
+  
+ -bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ +dotraplinkage void
+ +do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+++<<<<<<< HEAD
+ +	enum ctx_state prev_state;
+ +
+ +	switch (kvm_read_and_reset_pf_reason()) {
+ +	default:
+ +		do_page_fault(regs, error_code);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ +		/* page is swapped out by the host. */
+ +		prev_state = exception_enter();
+ +		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
+ +		exception_exit(prev_state);
+ +		break;
+ +	case KVM_PV_REASON_PAGE_READY:
+++=======
++ 	u32 reason = kvm_read_and_reset_pf_reason();
++ 
++ 	switch (reason) {
++ 	case KVM_PV_REASON_PAGE_NOT_PRESENT:
++ 	case KVM_PV_REASON_PAGE_READY:
++ 		break;
++ 	default:
++ 		return false;
++ 	}
++ 
++ 	/*
++ 	 * If the host managed to inject an async #PF into an interrupt
++ 	 * disabled region, then die hard as this is not going to end well
++ 	 * and the host side is seriously broken.
++ 	 */
++ 	if (unlikely(!(regs->flags & X86_EFLAGS_IF)))
++ 		panic("Host injected async #PF in interrupt disabled region\n");
++ 
++ 	if (reason == KVM_PV_REASON_PAGE_NOT_PRESENT) {
++ 		/* page is swapped out by the host. */
++ 		kvm_async_pf_task_wait(token, user_mode(regs));
++ 	} else {
+++>>>>>>> 6bca69ada4bc (x86/kvm: Sanitize kvm_async_pf_task_wait())
+  		rcu_irq_enter();
+ -		kvm_async_pf_task_wake(token);
+ +		kvm_async_pf_task_wake((u32)read_cr2());
+  		rcu_irq_exit();
+++<<<<<<< HEAD
+ +		break;
+++=======
+++>>>>>>> 6bca69ada4bc (x86/kvm: Sanitize kvm_async_pf_task_wait())
+  	}
++ 	return true;
+  }
+ -NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+ +NOKPROBE_SYMBOL(do_async_page_fault);
+  
+  static void __init paravirt_ops_setup(void)
+  {
+diff --git a/arch/x86/include/asm/kvm_para.h b/arch/x86/include/asm/kvm_para.h
+index 5ed3cf1c3934..dc8d25bb36b7 100644
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@ -88,7 +88,7 @@ static inline long kvm_hypercall4(unsigned int nr, unsigned long p1,
+ bool kvm_para_available(void);
+ unsigned int kvm_arch_para_features(void);
+ unsigned int kvm_arch_para_hints(void);
+-void kvm_async_pf_task_wait(u32 token, int interrupt_kernel);
++void kvm_async_pf_task_wait_schedule(u32 token);
+ void kvm_async_pf_task_wake(u32 token);
+ u32 kvm_read_and_reset_pf_reason(void);
+ extern void kvm_disable_steal_time(void);
+@@ -103,7 +103,7 @@ static inline void kvm_spinlock_init(void)
+ #endif /* CONFIG_PARAVIRT_SPINLOCKS */
+ 
+ #else /* CONFIG_KVM_GUEST */
+-#define kvm_async_pf_task_wait(T, I) do {} while(0)
++#define kvm_async_pf_task_wait_schedule(T) do {} while(0)
+ #define kvm_async_pf_task_wake(T) do {} while(0)
+ 
+ static inline bool kvm_para_available(void)
+* Unmerged path arch/x86/kernel/kvm.c
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 7ea1e3fb17e3..b0a2e228eea2 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4176,7 +4176,7 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
+ 	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ 		vcpu->arch.apf.host_apf_reason = 0;
+ 		local_irq_disable();
+-		kvm_async_pf_task_wait(fault_address, 0);
++		kvm_async_pf_task_wait_schedule(fault_address);
+ 		local_irq_enable();
+ 		break;
+ 	case KVM_PV_REASON_PAGE_READY:
