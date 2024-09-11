@@ -1,0 +1,188 @@
+virtiofs: implement dax read/write operations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit c2d0ad00d948de73c78f05d2b3e5bdfa605035cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c2d0ad00.failed
+
+This patch implements basic DAX support. mmap() is not implemented
+yet and will come in later patches. This patch looks into implemeting
+read/write.
+
+We make use of interval tree to keep track of per inode dax mappings.
+
+Do not use dax for file extending writes, instead just send WRITE message
+to daemon (like we do for direct I/O path). This will keep write and
+i_size change atomic w.r.t crash.
+
+	Signed-off-by: Stefan Hajnoczi <stefanha@redhat.com>
+	Signed-off-by: Dr. David Alan Gilbert <dgilbert@redhat.com>
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Liu Bo <bo.liu@linux.alibaba.com>
+	Signed-off-by: Peng Tao <tao.peng@linux.alibaba.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit c2d0ad00d948de73c78f05d2b3e5bdfa605035cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/Kconfig
+#	fs/fuse/dax.c
+#	fs/fuse/file.c
+#	fs/fuse/fuse_i.h
+#	fs/fuse/inode.c
+diff --cc fs/fuse/Kconfig
+index e70f6a548ec0,40ce9a1c12e5..000000000000
+--- a/fs/fuse/Kconfig
++++ b/fs/fuse/Kconfig
+@@@ -37,3 -38,17 +37,20 @@@ config VIRTIO_F
+  
+  	  If you want to share files between guests or with the host, answer Y
+  	  or M.
+++<<<<<<< HEAD
+++=======
++ 
++ config FUSE_DAX
++ 	bool "Virtio Filesystem Direct Host Memory Access support"
++ 	default y
++ 	select INTERVAL_TREE
++ 	depends on VIRTIO_FS
++ 	depends on FS_DAX
++ 	depends on DAX_DRIVER
++ 	help
++ 	  This allows bypassing guest page cache and allows mapping host page
++ 	  cache directly in guest address space.
++ 
++ 	  If you want to allow mounting a Virtio Filesystem with the "dax"
++ 	  option, answer Y.
+++>>>>>>> c2d0ad00d948 (virtiofs: implement dax read/write operations)
+diff --cc fs/fuse/file.c
+index e64ca703e652,6c586bc97b64..000000000000
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@@ -3420,5 -3447,8 +3428,12 @@@ void fuse_init_file_inode(struct inode 
+  	INIT_LIST_HEAD(&fi->queued_writes);
+  	fi->writectr = 0;
+  	init_waitqueue_head(&fi->page_waitq);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&fi->writepages);
+++=======
++ 	fi->writepages = RB_ROOT;
++ 
++ 	if (IS_ENABLED(CONFIG_FUSE_DAX))
++ 		fuse_dax_inode_init(inode);
+++>>>>>>> c2d0ad00d948 (virtiofs: implement dax read/write operations)
+  }
+diff --cc fs/fuse/fuse_i.h
+index 50415774dba0,2d2bdd596194..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -1092,4 -1109,18 +1099,21 @@@ unsigned int fuse_len_args(unsigned in
+  u64 fuse_get_unique(struct fuse_iqueue *fiq);
+  void fuse_free_conn(struct fuse_conn *fc);
+  
+++<<<<<<< HEAD
+++=======
++ /* dax.c */
++ 
++ #define FUSE_IS_DAX(inode) (IS_ENABLED(CONFIG_FUSE_DAX) && IS_DAX(inode))
++ 
++ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to);
++ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from);
++ int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma);
++ int fuse_dax_conn_alloc(struct fuse_conn *fc, struct dax_device *dax_dev);
++ void fuse_dax_conn_free(struct fuse_conn *fc);
++ bool fuse_dax_inode_alloc(struct super_block *sb, struct fuse_inode *fi);
++ void fuse_dax_inode_init(struct inode *inode);
++ void fuse_dax_inode_cleanup(struct inode *inode);
++ bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
++ 
+++>>>>>>> c2d0ad00d948 (virtiofs: implement dax read/write operations)
+  #endif /* _FS_FUSE_I_H */
+diff --cc fs/fuse/inode.c
+index 10b75246113a,cab4239bd78a..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -82,23 -87,47 +82,55 @@@ static struct inode *fuse_alloc_inode(s
+  	mutex_init(&fi->mutex);
+  	spin_lock_init(&fi->lock);
+  	fi->forget = fuse_alloc_forget();
+- 	if (!fi->forget) {
+- 		kmem_cache_free(fuse_inode_cachep, fi);
+- 		return NULL;
+- 	}
++ 	if (!fi->forget)
++ 		goto out_free;
++ 
++ 	if (IS_ENABLED(CONFIG_FUSE_DAX) && !fuse_dax_inode_alloc(sb, fi))
++ 		goto out_free_forget;
+  
+  	return &fi->inode;
++ 
++ out_free_forget:
++ 	kfree(fi->forget);
++ out_free:
++ 	kmem_cache_free(fuse_inode_cachep, fi);
++ 	return NULL;
+  }
+  
+ -static void fuse_free_inode(struct inode *inode)
+ +static void fuse_i_callback(struct rcu_head *head)
+  {
+++<<<<<<< HEAD
+ +	struct inode *inode = container_of(head, struct inode, i_rcu);
+ +	kmem_cache_free(fuse_inode_cachep, inode);
+++=======
++ 	struct fuse_inode *fi = get_fuse_inode(inode);
++ 
++ 	mutex_destroy(&fi->mutex);
++ 	kfree(fi->forget);
++ #ifdef CONFIG_FUSE_DAX
++ 	kfree(fi->dax);
++ #endif
++ 	kmem_cache_free(fuse_inode_cachep, fi);
+++>>>>>>> c2d0ad00d948 (virtiofs: implement dax read/write operations)
+  }
+  
+ -static void fuse_evict_inode(struct inode *inode)
+ +static void fuse_destroy_inode(struct inode *inode)
+  {
+  	struct fuse_inode *fi = get_fuse_inode(inode);
+++<<<<<<< HEAD
+++=======
++ 
++ 	truncate_inode_pages_final(&inode->i_data);
++ 	clear_inode(inode);
++ 	if (inode->i_sb->s_flags & SB_ACTIVE) {
++ 		struct fuse_conn *fc = get_fuse_conn(inode);
++ 
++ 		if (FUSE_IS_DAX(inode))
++ 			fuse_dax_inode_cleanup(inode);
++ 		fuse_queue_forget(fc, fi->forget, fi->nodeid, fi->nlookup);
++ 		fi->forget = NULL;
++ 	}
+++>>>>>>> c2d0ad00d948 (virtiofs: implement dax read/write operations)
+  	if (S_ISREG(inode->i_mode) && !is_bad_inode(inode)) {
+  		WARN_ON(!list_empty(&fi->write_files));
+  		WARN_ON(!list_empty(&fi->queued_writes));
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/Kconfig
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/file.c
+* Unmerged path fs/fuse/fuse_i.h
+* Unmerged path fs/fuse/inode.c
+diff --git a/include/uapi/linux/fuse.h b/include/uapi/linux/fuse.h
+index c2889592dca2..4cb857a4c529 100644
+--- a/include/uapi/linux/fuse.h
++++ b/include/uapi/linux/fuse.h
+@@ -849,6 +849,7 @@ struct fuse_copy_file_range_in {
+ };
+ 
+ #define FUSE_SETUPMAPPING_FLAG_WRITE (1ull << 0)
++#define FUSE_SETUPMAPPING_FLAG_READ (1ull << 1)
+ struct fuse_setupmapping_in {
+ 	/* An already open handle */
+ 	uint64_t	fh;
