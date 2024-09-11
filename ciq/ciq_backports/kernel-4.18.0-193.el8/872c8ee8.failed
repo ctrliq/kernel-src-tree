@@ -1,0 +1,171 @@
+perf session: Fix loading of compressed data split across adjacent records
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Alexey Budankov <alexey.budankov@linux.intel.com>
+commit 872c8ee8f0f47222f7b10da96eea84d0486540a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/872c8ee8.failed
+
+Fix decompression failure found during the loading of compressed trace
+collected on larger scale systems (>48 cores).
+
+The error happened due to lack of decompression space for a mmaped
+buffer data chunk split across adjacent PERF_RECORD_COMPRESSED records.
+
+  $ perf report -i bt.16384.data --stats
+  failed to decompress (B): 63869 -> 0 : Destination buffer is too small
+  user stack dump failure
+  Can't parse sample, err = -14
+  0x2637e436 [0x4080]: failed to process type: 9
+  Error:
+  failed to process sample
+
+  $ perf test 71
+  71: Zstd perf.data compression/decompression              : Ok
+
+	Signed-off-by: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/4d839e1b-9c48-89c4-9702-a12217420611@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 872c8ee8f0f47222f7b10da96eea84d0486540a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/session.c
+#	tools/perf/util/session.h
+#	tools/perf/util/zstd.c
+diff --cc tools/perf/util/session.c
+index fa55b3504b7b,37efa1f43d8b..000000000000
+--- a/tools/perf/util/session.c
++++ b/tools/perf/util/session.c
+@@@ -29,6 -29,67 +29,70 @@@
+  #include "stat.h"
+  #include "arch/common.h"
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef HAVE_ZSTD_SUPPORT
++ static int perf_session__process_compressed_event(struct perf_session *session,
++ 						  union perf_event *event, u64 file_offset)
++ {
++ 	void *src;
++ 	size_t decomp_size, src_size;
++ 	u64 decomp_last_rem = 0;
++ 	size_t mmap_len, decomp_len = session->header.env.comp_mmap_len;
++ 	struct decomp *decomp, *decomp_last = session->decomp_last;
++ 
++ 	if (decomp_last) {
++ 		decomp_last_rem = decomp_last->size - decomp_last->head;
++ 		decomp_len += decomp_last_rem;
++ 	}
++ 
++ 	mmap_len = sizeof(struct decomp) + decomp_len;
++ 	decomp = mmap(NULL, mmap_len, PROT_READ|PROT_WRITE,
++ 		      MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
++ 	if (decomp == MAP_FAILED) {
++ 		pr_err("Couldn't allocate memory for decompression\n");
++ 		return -1;
++ 	}
++ 
++ 	decomp->file_pos = file_offset;
++ 	decomp->mmap_len = mmap_len;
++ 	decomp->head = 0;
++ 
++ 	if (decomp_last_rem) {
++ 		memcpy(decomp->data, &(decomp_last->data[decomp_last->head]), decomp_last_rem);
++ 		decomp->size = decomp_last_rem;
++ 	}
++ 
++ 	src = (void *)event + sizeof(struct compressed_event);
++ 	src_size = event->pack.header.size - sizeof(struct compressed_event);
++ 
++ 	decomp_size = zstd_decompress_stream(&(session->zstd_data), src, src_size,
++ 				&(decomp->data[decomp_last_rem]), decomp_len - decomp_last_rem);
++ 	if (!decomp_size) {
++ 		munmap(decomp, mmap_len);
++ 		pr_err("Couldn't decompress data\n");
++ 		return -1;
++ 	}
++ 
++ 	decomp->size += decomp_size;
++ 
++ 	if (session->decomp == NULL) {
++ 		session->decomp = decomp;
++ 		session->decomp_last = decomp;
++ 	} else {
++ 		session->decomp_last->next = decomp;
++ 		session->decomp_last = decomp;
++ 	}
++ 
++ 	pr_debug("decomp (B): %ld to %ld\n", src_size, decomp_size);
++ 
++ 	return 0;
++ }
++ #else /* !HAVE_ZSTD_SUPPORT */
++ #define perf_session__process_compressed_event perf_session__process_compressed_event_stub
++ #endif
++ 
+++>>>>>>> 872c8ee8f0f4 (perf session: Fix loading of compressed data split across adjacent records)
+  static int perf_session__deliver_event(struct perf_session *session,
+  				       union perf_event *event,
+  				       struct perf_tool *tool,
+@@@ -197,6 -258,21 +261,24 @@@ static void perf_session__delete_thread
+  	machine__delete_threads(&session->machines.host);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void perf_session__release_decomp_events(struct perf_session *session)
++ {
++ 	struct decomp *next, *decomp;
++ 	size_t mmap_len;
++ 	next = session->decomp;
++ 	do {
++ 		decomp = next;
++ 		if (decomp == NULL)
++ 			break;
++ 		next = decomp->next;
++ 		mmap_len = decomp->mmap_len;
++ 		munmap(decomp, mmap_len);
++ 	} while (1);
++ }
++ 
+++>>>>>>> 872c8ee8f0f4 (perf session: Fix loading of compressed data split across adjacent records)
+  void perf_session__delete(struct perf_session *session)
+  {
+  	if (session == NULL)
+diff --cc tools/perf/util/session.h
+index 6c984c895924,863dbad87849..000000000000
+--- a/tools/perf/util/session.h
++++ b/tools/perf/util/session.h
+@@@ -39,6 -39,17 +39,20 @@@ struct perf_session 
+  	u64			bytes_transferred;
+  	u64			bytes_compressed;
+  	struct zstd_data	zstd_data;
+++<<<<<<< HEAD
+++=======
++ 	struct decomp		*decomp;
++ 	struct decomp		*decomp_last;
++ };
++ 
++ struct decomp {
++ 	struct decomp *next;
++ 	u64 file_pos;
++ 	size_t mmap_len;
++ 	u64 head;
++ 	size_t size;
++ 	char data[];
+++>>>>>>> 872c8ee8f0f4 (perf session: Fix loading of compressed data split across adjacent records)
+  };
+  
+  struct perf_tool;
+* Unmerged path tools/perf/util/zstd.c
+* Unmerged path tools/perf/util/session.c
+* Unmerged path tools/perf/util/session.h
+* Unmerged path tools/perf/util/zstd.c
