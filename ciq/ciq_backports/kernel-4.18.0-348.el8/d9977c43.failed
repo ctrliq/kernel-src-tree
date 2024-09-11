@@ -1,0 +1,368 @@
+perf/x86: Register hybrid PMUs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit d9977c43bff895ed49a9d25e1f382b0a98bb271f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/d9977c43.failed
+
+Different hybrid PMUs have different PMU capabilities and events. Perf
+should registers a dedicated PMU for each of them.
+
+To check the X86 event, perf has to go through all possible hybrid pmus.
+
+All the hybrid PMUs are registered at boot time. Before the
+registration, add intel_pmu_check_hybrid_pmus() to check and update the
+counters information, the event constraints, the extra registers and the
+unique capabilities for each hybrid PMUs.
+
+Postpone the display of the PMU information and HW check to
+CPU_STARTING, because the boot CPU is the only online CPU in the
+init_hw_perf_events(). Perf doesn't know the availability of the other
+PMUs. Perf should display the PMU information only if the counters of
+the PMU are available.
+
+One type of CPUs may be all offline. For this case, users can still
+observe the PMU in /sys/devices, but its CPU mask is 0.
+
+All hybrid PMUs have capability PERF_PMU_CAP_HETEROGENEOUS_CPUS.
+The PMU name for hybrid PMUs will be "cpu_XXX", which will be assigned
+later in a separated patch.
+
+The PMU type id for the core PMU is still PERF_TYPE_RAW. For the other
+hybrid PMUs, the PMU type id is not hard code.
+
+The event->cpu must be compatitable with the supported CPUs of the PMU.
+Add a check in the x86_pmu_event_init().
+
+The events in a group must be from the same type of hybrid PMU.
+The fake cpuc used in the validation must be from the supported CPU of
+the event->pmu.
+
+Perf may not retrieve a valid core type from get_this_hybrid_cpu_type().
+For example, ADL may have an alternative configuration. With that
+configuration, Perf cannot retrieve the core type from the CPUID leaf
+0x1a. Add a platform specific get_hybrid_cpu_type(). If the generic way
+fails, invoke the platform specific get_hybrid_cpu_type().
+
+	Suggested-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/1618237865-33448-17-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit d9977c43bff895ed49a9d25e1f382b0a98bb271f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/core.c
+#	arch/x86/events/perf_event.h
+diff --cc arch/x86/events/core.c
+index 499d8b925c05,bd465a806638..000000000000
+--- a/arch/x86/events/core.c
++++ b/arch/x86/events/core.c
+@@@ -696,16 -740,33 +696,26 @@@ void x86_pmu_enable_all(int added
+  	}
+  }
+  
+ +static struct pmu pmu;
+ +
+  static inline int is_x86_event(struct perf_event *event)
+  {
+- 	return event->pmu == &pmu;
++ 	int i;
++ 
++ 	if (!is_hybrid())
++ 		return event->pmu == &pmu;
++ 
++ 	for (i = 0; i < x86_pmu.num_hybrid_pmus; i++) {
++ 		if (event->pmu == &x86_pmu.hybrid_pmu[i].pmu)
++ 			return true;
++ 	}
++ 
++ 	return false;
+  }
+  
+ -struct pmu *x86_get_pmu(unsigned int cpu)
+ +struct pmu *x86_get_pmu(void)
+  {
+ -	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
+ -
+ -	/*
+ -	 * All CPUs of the hybrid type have been offline.
+ -	 * The x86_get_pmu() should not be invoked.
+ -	 */
+ -	if (WARN_ON_ONCE(!cpuc->pmu))
+ -		return &pmu;
+ -
+ -	return cpuc->pmu;
+ +	return &pmu;
+  }
+  /*
+   * Event scheduler state:
+@@@ -1900,6 -1952,71 +1910,74 @@@ ssize_t x86_event_sysfs_show(char *page
+  static struct attribute_group x86_pmu_attr_group;
+  static struct attribute_group x86_pmu_caps_group;
+  
+++<<<<<<< HEAD
+++=======
++ static void x86_pmu_static_call_update(void)
++ {
++ 	static_call_update(x86_pmu_handle_irq, x86_pmu.handle_irq);
++ 	static_call_update(x86_pmu_disable_all, x86_pmu.disable_all);
++ 	static_call_update(x86_pmu_enable_all, x86_pmu.enable_all);
++ 	static_call_update(x86_pmu_enable, x86_pmu.enable);
++ 	static_call_update(x86_pmu_disable, x86_pmu.disable);
++ 
++ 	static_call_update(x86_pmu_add, x86_pmu.add);
++ 	static_call_update(x86_pmu_del, x86_pmu.del);
++ 	static_call_update(x86_pmu_read, x86_pmu.read);
++ 
++ 	static_call_update(x86_pmu_schedule_events, x86_pmu.schedule_events);
++ 	static_call_update(x86_pmu_get_event_constraints, x86_pmu.get_event_constraints);
++ 	static_call_update(x86_pmu_put_event_constraints, x86_pmu.put_event_constraints);
++ 
++ 	static_call_update(x86_pmu_start_scheduling, x86_pmu.start_scheduling);
++ 	static_call_update(x86_pmu_commit_scheduling, x86_pmu.commit_scheduling);
++ 	static_call_update(x86_pmu_stop_scheduling, x86_pmu.stop_scheduling);
++ 
++ 	static_call_update(x86_pmu_sched_task, x86_pmu.sched_task);
++ 	static_call_update(x86_pmu_swap_task_ctx, x86_pmu.swap_task_ctx);
++ 
++ 	static_call_update(x86_pmu_drain_pebs, x86_pmu.drain_pebs);
++ 	static_call_update(x86_pmu_pebs_aliases, x86_pmu.pebs_aliases);
++ 
++ 	static_call_update(x86_pmu_guest_get_msrs, x86_pmu.guest_get_msrs);
++ }
++ 
++ static void _x86_pmu_read(struct perf_event *event)
++ {
++ 	x86_perf_event_update(event);
++ }
++ 
++ void x86_pmu_show_pmu_cap(int num_counters, int num_counters_fixed,
++ 			  u64 intel_ctrl)
++ {
++ 	pr_info("... version:                %d\n",     x86_pmu.version);
++ 	pr_info("... bit width:              %d\n",     x86_pmu.cntval_bits);
++ 	pr_info("... generic registers:      %d\n",     num_counters);
++ 	pr_info("... value mask:             %016Lx\n", x86_pmu.cntval_mask);
++ 	pr_info("... max period:             %016Lx\n", x86_pmu.max_period);
++ 	pr_info("... fixed-purpose events:   %lu\n",
++ 			hweight64((((1ULL << num_counters_fixed) - 1)
++ 					<< INTEL_PMC_IDX_FIXED) & intel_ctrl));
++ 	pr_info("... event mask:             %016Lx\n", intel_ctrl);
++ }
++ 
++ /*
++  * The generic code is not hybrid friendly. The hybrid_pmu->pmu
++  * of the first registered PMU is unconditionally assigned to
++  * each possible cpuctx->ctx.pmu.
++  * Update the correct hybrid PMU to the cpuctx->ctx.pmu.
++  */
++ void x86_pmu_update_cpu_context(struct pmu *pmu, int cpu)
++ {
++ 	struct perf_cpu_context *cpuctx;
++ 
++ 	if (!pmu->pmu_cpu_context)
++ 		return;
++ 
++ 	cpuctx = per_cpu_ptr(pmu->pmu_cpu_context, cpu);
++ 	cpuctx->ctx.pmu = pmu;
++ }
++ 
+++>>>>>>> d9977c43bff8 (perf/x86: Register hybrid PMUs)
+  static int __init init_hw_perf_events(void)
+  {
+  	struct x86_pmu_quirk *quirk;
+@@@ -1952,15 -2077,19 +2030,31 @@@
+  
+  	pmu.attr_update = x86_pmu.attr_update;
+  
+++<<<<<<< HEAD
+ +	pr_info("... version:                %d\n",     x86_pmu.version);
+ +	pr_info("... bit width:              %d\n",     x86_pmu.cntval_bits);
+ +	pr_info("... generic registers:      %d\n",     x86_pmu.num_counters);
+ +	pr_info("... value mask:             %016Lx\n", x86_pmu.cntval_mask);
+ +	pr_info("... max period:             %016Lx\n", x86_pmu.max_period);
+ +	pr_info("... fixed-purpose events:   %lu\n",
+ +			hweight64((((1ULL << x86_pmu.num_counters_fixed) - 1)
+ +					<< INTEL_PMC_IDX_FIXED) & x86_pmu.intel_ctrl));
+ +	pr_info("... event mask:             %016Lx\n", x86_pmu.intel_ctrl);
+++=======
++ 	if (!is_hybrid()) {
++ 		x86_pmu_show_pmu_cap(x86_pmu.num_counters,
++ 				     x86_pmu.num_counters_fixed,
++ 				     x86_pmu.intel_ctrl);
++ 	}
++ 
++ 	if (!x86_pmu.read)
++ 		x86_pmu.read = _x86_pmu_read;
++ 
++ 	if (!x86_pmu.guest_get_msrs)
++ 		x86_pmu.guest_get_msrs = (void *)&__static_call_return0;
++ 
++ 	x86_pmu_static_call_update();
+++>>>>>>> d9977c43bff8 (perf/x86: Register hybrid PMUs)
+  
+  	/*
+  	 * Install callbacks. Core will call them for each online
+diff --cc arch/x86/events/perf_event.h
+index 8a9ce0e512b6,4282ce48c063..000000000000
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@@ -1074,6 -1104,11 +1086,14 @@@ void x86_pmu_enable_event(struct perf_e
+  
+  int x86_pmu_handle_irq(struct pt_regs *regs);
+  
+++<<<<<<< HEAD
+++=======
++ void x86_pmu_show_pmu_cap(int num_counters, int num_counters_fixed,
++ 			  u64 intel_ctrl);
++ 
++ void x86_pmu_update_cpu_context(struct pmu *pmu, int cpu);
++ 
+++>>>>>>> d9977c43bff8 (perf/x86: Register hybrid PMUs)
+  extern struct event_constraint emptyconstraint;
+  
+  extern struct event_constraint unconstrained;
+* Unmerged path arch/x86/events/core.c
+diff --git a/arch/x86/events/intel/core.c b/arch/x86/events/intel/core.c
+index c2c1939fa685..3e8d4d74c1ce 100644
+--- a/arch/x86/events/intel/core.c
++++ b/arch/x86/events/intel/core.c
+@@ -3716,7 +3716,8 @@ static int intel_pmu_hw_config(struct perf_event *event)
+ 		event->hw.flags |= PERF_X86_EVENT_PEBS_VIA_PT;
+ 	}
+ 
+-	if (event->attr.type != PERF_TYPE_RAW)
++	if ((event->attr.type == PERF_TYPE_HARDWARE) ||
++	    (event->attr.type == PERF_TYPE_HW_CACHE))
+ 		return 0;
+ 
+ 	/*
+@@ -4223,12 +4224,62 @@ static void flip_smm_bit(void *data)
+ 	}
+ }
+ 
++static bool init_hybrid_pmu(int cpu)
++{
++	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
++	u8 cpu_type = get_this_hybrid_cpu_type();
++	struct x86_hybrid_pmu *pmu = NULL;
++	int i;
++
++	if (!cpu_type && x86_pmu.get_hybrid_cpu_type)
++		cpu_type = x86_pmu.get_hybrid_cpu_type();
++
++	for (i = 0; i < x86_pmu.num_hybrid_pmus; i++) {
++		if (x86_pmu.hybrid_pmu[i].cpu_type == cpu_type) {
++			pmu = &x86_pmu.hybrid_pmu[i];
++			break;
++		}
++	}
++	if (WARN_ON_ONCE(!pmu || (pmu->pmu.type == -1))) {
++		cpuc->pmu = NULL;
++		return false;
++	}
++
++	/* Only check and dump the PMU information for the first CPU */
++	if (!cpumask_empty(&pmu->supported_cpus))
++		goto end;
++
++	if (!check_hw_exists(&pmu->pmu, pmu->num_counters, pmu->num_counters_fixed))
++		return false;
++
++	pr_info("%s PMU driver: ", pmu->name);
++
++	if (pmu->intel_cap.pebs_output_pt_available)
++		pr_cont("PEBS-via-PT ");
++
++	pr_cont("\n");
++
++	x86_pmu_show_pmu_cap(pmu->num_counters, pmu->num_counters_fixed,
++			     pmu->intel_ctrl);
++
++end:
++	cpumask_set_cpu(cpu, &pmu->supported_cpus);
++	cpuc->pmu = &pmu->pmu;
++
++	x86_pmu_update_cpu_context(&pmu->pmu, cpu);
++
++	return true;
++}
++
+ static void intel_pmu_cpu_starting(int cpu)
+ {
+ 	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
+ 	int core_id = topology_core_id(cpu);
+ 	int i;
+ 
++	if (is_hybrid() && !init_hybrid_pmu(cpu))
++		return;
++
+ 	init_debug_store_on_cpu(cpu);
+ 	/*
+ 	 * Deal with CPUs that don't clear their LBRs on power-up.
+@@ -4342,7 +4393,12 @@ void intel_cpuc_finish(struct cpu_hw_events *cpuc)
+ 
+ static void intel_pmu_cpu_dead(int cpu)
+ {
+-	intel_cpuc_finish(&per_cpu(cpu_hw_events, cpu));
++	struct cpu_hw_events *cpuc = &per_cpu(cpu_hw_events, cpu);
++
++	intel_cpuc_finish(cpuc);
++
++	if (is_hybrid() && cpuc->pmu)
++		cpumask_clear_cpu(cpu, &hybrid_pmu(cpuc->pmu)->supported_cpus);
+ }
+ 
+ static void intel_pmu_sched_task(struct perf_event_context *ctx,
+@@ -5158,6 +5214,36 @@ static void intel_pmu_check_extra_regs(struct extra_reg *extra_regs)
+ 	}
+ }
+ 
++static void intel_pmu_check_hybrid_pmus(u64 fixed_mask)
++{
++	struct x86_hybrid_pmu *pmu;
++	int i;
++
++	for (i = 0; i < x86_pmu.num_hybrid_pmus; i++) {
++		pmu = &x86_pmu.hybrid_pmu[i];
++
++		intel_pmu_check_num_counters(&pmu->num_counters,
++					     &pmu->num_counters_fixed,
++					     &pmu->intel_ctrl,
++					     fixed_mask);
++
++		if (pmu->intel_cap.perf_metrics) {
++			pmu->intel_ctrl |= 1ULL << GLOBAL_CTRL_EN_PERF_METRICS;
++			pmu->intel_ctrl |= INTEL_PMC_MSK_FIXED_SLOTS;
++		}
++
++		if (pmu->intel_cap.pebs_output_pt_available)
++			pmu->pmu.capabilities |= PERF_PMU_CAP_AUX_OUTPUT;
++
++		intel_pmu_check_event_constraints(pmu->event_constraints,
++						  pmu->num_counters,
++						  pmu->num_counters_fixed,
++						  pmu->intel_ctrl);
++
++		intel_pmu_check_extra_regs(pmu->extra_regs);
++	}
++}
++
+ __init int intel_pmu_init(void)
+ {
+ 	struct attribute **extra_skl_attr = &empty_attrs;
+@@ -5837,6 +5923,9 @@ __init int intel_pmu_init(void)
+ 	if (!is_hybrid() && x86_pmu.intel_cap.perf_metrics)
+ 		x86_pmu.intel_ctrl |= 1ULL << GLOBAL_CTRL_EN_PERF_METRICS;
+ 
++	if (is_hybrid())
++		intel_pmu_check_hybrid_pmus((u64)fixed_mask);
++
+ 	return 0;
+ }
+ 
+* Unmerged path arch/x86/events/perf_event.h
