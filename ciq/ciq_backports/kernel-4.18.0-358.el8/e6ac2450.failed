@@ -1,0 +1,770 @@
+bpf: Support bpf program calling kernel function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit e6ac2450d6dee3121cd8bbf2907b78a68a8a353d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/e6ac2450.failed
+
+This patch adds support to BPF verifier to allow bpf program calling
+kernel function directly.
+
+The use case included in this set is to allow bpf-tcp-cc to directly
+call some tcp-cc helper functions (e.g. "tcp_cong_avoid_ai()").  Those
+functions have already been used by some kernel tcp-cc implementations.
+
+This set will also allow the bpf-tcp-cc program to directly call the
+kernel tcp-cc implementation,  For example, a bpf_dctcp may only want to
+implement its own dctcp_cwnd_event() and reuse other dctcp_*() directly
+from the kernel tcp_dctcp.c instead of reimplementing (or
+copy-and-pasting) them.
+
+The tcp-cc kernel functions mentioned above will be white listed
+for the struct_ops bpf-tcp-cc programs to use in a later patch.
+The white listed functions are not bounded to a fixed ABI contract.
+Those functions have already been used by the existing kernel tcp-cc.
+If any of them has changed, both in-tree and out-of-tree kernel tcp-cc
+implementations have to be changed.  The same goes for the struct_ops
+bpf-tcp-cc programs which have to be adjusted accordingly.
+
+This patch is to make the required changes in the bpf verifier.
+
+First change is in btf.c, it adds a case in "btf_check_func_arg_match()".
+When the passed in "btf->kernel_btf == true", it means matching the
+verifier regs' states with a kernel function.  This will handle the
+PTR_TO_BTF_ID reg.  It also maps PTR_TO_SOCK_COMMON, PTR_TO_SOCKET,
+and PTR_TO_TCP_SOCK to its kernel's btf_id.
+
+In the later libbpf patch, the insn calling a kernel function will
+look like:
+
+insn->code == (BPF_JMP | BPF_CALL)
+insn->src_reg == BPF_PSEUDO_KFUNC_CALL /* <- new in this patch */
+insn->imm == func_btf_id /* btf_id of the running kernel */
+
+[ For the future calling function-in-kernel-module support, an array
+  of module btf_fds can be passed at the load time and insn->off
+  can be used to index into this array. ]
+
+At the early stage of verifier, the verifier will collect all kernel
+function calls into "struct bpf_kfunc_desc".  Those
+descriptors are stored in "prog->aux->kfunc_tab" and will
+be available to the JIT.  Since this "add" operation is similar
+to the current "add_subprog()" and looking for the same insn->code,
+they are done together in the new "add_subprog_and_kfunc()".
+
+In the "do_check()" stage, the new "check_kfunc_call()" is added
+to verify the kernel function call instruction:
+1. Ensure the kernel function can be used by a particular BPF_PROG_TYPE.
+   A new bpf_verifier_ops "check_kfunc_call" is added to do that.
+   The bpf-tcp-cc struct_ops program will implement this function in
+   a later patch.
+2. Call "btf_check_kfunc_args_match()" to ensure the regs can be
+   used as the args of a kernel function.
+3. Mark the regs' type, subreg_def, and zext_dst.
+
+At the later do_misc_fixups() stage, the new fixup_kfunc_call()
+will replace the insn->imm with the function address (relative
+to __bpf_call_base).  If needed, the jit can find the btf_func_model
+by calling the new bpf_jit_find_kfunc_model(prog, insn).
+With the imm set to the function address, "bpftool prog dump xlated"
+will be able to display the kernel function calls the same way as
+it displays other bpf helper calls.
+
+gpl_compatible program is required to call kernel function.
+
+This feature currently requires JIT.
+
+The verifier selftests are adjusted because of the changes in
+the verbose log in add_subprog_and_kfunc().
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20210325015142.1544736-1-kafai@fb.com
+(cherry picked from commit e6ac2450d6dee3121cd8bbf2907b78a68a8a353d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/btf.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 9232230ec903,b5b7967e3ff3..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -424,6 -425,9 +424,12 @@@ enum bpf_reg_type 
+  	PTR_TO_RDWR_BUF,	 /* reg points to a read/write buffer */
+  	PTR_TO_RDWR_BUF_OR_NULL, /* reg points to a read/write buffer or NULL */
+  	PTR_TO_PERCPU_BTF_ID,	 /* reg points to a percpu kernel variable */
+++<<<<<<< HEAD
+++=======
++ 	PTR_TO_FUNC,		 /* reg points to a bpf program function */
++ 	PTR_TO_MAP_KEY,		 /* reg points to a map element key */
++ 	__BPF_REG_TYPE_MAX,
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  };
+  
+  /* The information passed from prog-specific *_is_valid_access
+@@@ -799,14 -798,15 +806,16 @@@ struct btf_mod_pair 
+  	struct module *module;
+  };
+  
++ struct bpf_kfunc_desc_tab;
++ 
+  struct bpf_prog_aux {
+ -	atomic64_t refcnt;
+ +	RH_KABI_BROKEN_REPLACE(atomic_t refcnt, atomic64_t refcnt)
+  	u32 used_map_cnt;
+ -	u32 used_btf_cnt;
+ +	RH_KABI_BROKEN_INSERT(u32 used_btf_cnt)
+  	u32 max_ctx_offset;
+ -	u32 max_pkt_offset;
+ -	u32 max_tp_access;
+ +	/* not protected by KABI, safe to extend in the middle */
+ +	RH_KABI_BROKEN_INSERT(u32 max_pkt_offset)
+ +	RH_KABI_BROKEN_INSERT(u32 max_tp_access)
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+@@@ -822,30 -822,27 +831,37 @@@
+  	struct bpf_trampoline *dst_trampoline;
+  	enum bpf_prog_type saved_dst_prog_type;
+  	enum bpf_attach_type saved_dst_attach_type;
+ -	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+ +	struct btf *attach_btf;
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+ +	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
+  	bool offload_requested;
+ -	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+ -	bool func_proto_unreliable;
+ -	bool sleepable;
+ -	bool tail_call_reachable;
+ -	struct hlist_node tramp_hlist;
+ +	RH_KABI_BROKEN_INSERT(bool attach_btf_trace) /* true if attaching to BTF-enabled raw tp */
+ +	RH_KABI_BROKEN_INSERT(bool func_proto_unreliable)
+ +	RH_KABI_BROKEN_INSERT(bool sleepable)
+ +	RH_KABI_BROKEN_INSERT(bool tail_call_reachable)
+ +	RH_KABI_BROKEN_INSERT(struct hlist_node tramp_hlist)
+  	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ -	const struct btf_type *attach_func_proto;
+ +	RH_KABI_BROKEN_INSERT(const struct btf_type *attach_func_proto)
+  	/* function name for valid attach_btf_id */
+ -	const char *attach_func_name;
+ +	RH_KABI_BROKEN_INSERT(const char *attach_func_name)
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(struct bpf_jit_poke_descriptor *poke_tab)
+ +	RH_KABI_BROKEN_INSERT(u32 size_poke_tab)
+ +	RH_KABI_BROKEN_REMOVE(struct latch_tree_node ksym_tnode)
+ +	RH_KABI_BROKEN_REMOVE(struct list_head ksym_lnode)
+ +	RH_KABI_BROKEN_INSERT(struct bpf_ksym ksym)
+++=======
++ 	struct bpf_jit_poke_descriptor *poke_tab;
++ 	struct bpf_kfunc_desc_tab *kfunc_tab;
++ 	u32 size_poke_tab;
++ 	struct bpf_ksym ksym;
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  	const struct bpf_prog_ops *ops;
+  	struct bpf_map **used_maps;
+ -	struct mutex used_maps_mutex; /* mutex for used_maps and used_map_cnt */
+ -	struct btf_mod_pair *used_btfs;
+ +	RH_KABI_BROKEN_INSERT(struct mutex used_maps_mutex) /* mutex for used_maps and used_map_cnt */
+ +	RH_KABI_BROKEN_INSERT(struct btf_mod_pair *used_btfs)
+  	struct bpf_prog *prog;
+  	struct user_struct *user;
+  	u64 load_time; /* ns since boottime */
+@@@ -1543,8 -1550,11 +1559,16 @@@ int btf_distill_func_proto(struct bpf_v
+  			   struct btf_func_model *m);
+  
+  struct bpf_reg_state;
+++<<<<<<< HEAD
+ +int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
+ +			     struct bpf_reg_state *regs);
+++=======
++ int btf_check_subprog_arg_match(struct bpf_verifier_env *env, int subprog,
++ 				struct bpf_reg_state *regs);
++ int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
++ 			      const struct btf *btf, u32 func_id,
++ 			      struct bpf_reg_state *regs);
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
+  			  struct bpf_reg_state *reg);
+  int btf_check_type_match(struct bpf_verifier_log *log, const struct bpf_prog *prog,
+@@@ -1554,6 -1564,11 +1578,14 @@@ struct bpf_prog *bpf_prog_by_id(u32 id)
+  struct bpf_link *bpf_link_by_id(u32 id);
+  
+  const struct bpf_func_proto *bpf_base_func_proto(enum bpf_func_id func_id);
+++<<<<<<< HEAD
+++=======
++ void bpf_task_storage_free(struct task_struct *task);
++ bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog);
++ const struct btf_func_model *
++ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
++ 			 const struct bpf_insn *insn);
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  #else /* !CONFIG_BPF_SYSCALL */
+  static inline struct bpf_prog *bpf_prog_get(u32 ufd)
+  {
+@@@ -1746,6 -1745,22 +1778,25 @@@ bpf_base_func_proto(enum bpf_func_id fu
+  {
+  	return NULL;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void bpf_task_storage_free(struct task_struct *task)
++ {
++ }
++ 
++ static inline bool bpf_prog_has_kfunc_call(const struct bpf_prog *prog)
++ {
++ 	return false;
++ }
++ 
++ static inline const struct btf_func_model *
++ bpf_jit_find_kfunc_model(const struct bpf_prog *prog,
++ 			 const struct bpf_insn *insn)
++ {
++ 	return NULL;
++ }
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  #endif /* CONFIG_BPF_SYSCALL */
+  
+  void __bpf_free_used_btfs(struct bpf_prog_aux *aux,
+diff --cc kernel/bpf/btf.c
+index 9c8a2e36b8dd,ec8afc4bc560..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -5361,6 -5362,147 +5361,150 @@@ int btf_check_type_match(struct bpf_ver
+  	return btf_check_func_type_match(log, btf1, t1, btf2, t2);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 *reg2btf_ids[__BPF_REG_TYPE_MAX] = {
++ #ifdef CONFIG_NET
++ 	[PTR_TO_SOCKET] = &btf_sock_ids[BTF_SOCK_TYPE_SOCK],
++ 	[PTR_TO_SOCK_COMMON] = &btf_sock_ids[BTF_SOCK_TYPE_SOCK_COMMON],
++ 	[PTR_TO_TCP_SOCK] = &btf_sock_ids[BTF_SOCK_TYPE_TCP],
++ #endif
++ };
++ 
++ static int btf_check_func_arg_match(struct bpf_verifier_env *env,
++ 				    const struct btf *btf, u32 func_id,
++ 				    struct bpf_reg_state *regs,
++ 				    bool ptr_to_mem_ok)
++ {
++ 	struct bpf_verifier_log *log = &env->log;
++ 	const char *func_name, *ref_tname;
++ 	const struct btf_type *t, *ref_t;
++ 	const struct btf_param *args;
++ 	u32 i, nargs, ref_id;
++ 
++ 	t = btf_type_by_id(btf, func_id);
++ 	if (!t || !btf_type_is_func(t)) {
++ 		/* These checks were already done by the verifier while loading
++ 		 * struct bpf_func_info or in add_kfunc_call().
++ 		 */
++ 		bpf_log(log, "BTF of func_id %u doesn't point to KIND_FUNC\n",
++ 			func_id);
++ 		return -EFAULT;
++ 	}
++ 	func_name = btf_name_by_offset(btf, t->name_off);
++ 
++ 	t = btf_type_by_id(btf, t->type);
++ 	if (!t || !btf_type_is_func_proto(t)) {
++ 		bpf_log(log, "Invalid BTF of func %s\n", func_name);
++ 		return -EFAULT;
++ 	}
++ 	args = (const struct btf_param *)(t + 1);
++ 	nargs = btf_type_vlen(t);
++ 	if (nargs > MAX_BPF_FUNC_REG_ARGS) {
++ 		bpf_log(log, "Function %s has %d > %d args\n", func_name, nargs,
++ 			MAX_BPF_FUNC_REG_ARGS);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* check that BTF function arguments match actual types that the
++ 	 * verifier sees.
++ 	 */
++ 	for (i = 0; i < nargs; i++) {
++ 		u32 regno = i + 1;
++ 		struct bpf_reg_state *reg = &regs[regno];
++ 
++ 		t = btf_type_skip_modifiers(btf, args[i].type, NULL);
++ 		if (btf_type_is_scalar(t)) {
++ 			if (reg->type == SCALAR_VALUE)
++ 				continue;
++ 			bpf_log(log, "R%d is not a scalar\n", regno);
++ 			return -EINVAL;
++ 		}
++ 
++ 		if (!btf_type_is_ptr(t)) {
++ 			bpf_log(log, "Unrecognized arg#%d type %s\n",
++ 				i, btf_type_str(t));
++ 			return -EINVAL;
++ 		}
++ 
++ 		ref_t = btf_type_skip_modifiers(btf, t->type, &ref_id);
++ 		ref_tname = btf_name_by_offset(btf, ref_t->name_off);
++ 		if (btf_is_kernel(btf)) {
++ 			const struct btf_type *reg_ref_t;
++ 			const struct btf *reg_btf;
++ 			const char *reg_ref_tname;
++ 			u32 reg_ref_id;
++ 
++ 			if (!btf_type_is_struct(ref_t)) {
++ 				bpf_log(log, "kernel function %s args#%d pointer type %s %s is not supported\n",
++ 					func_name, i, btf_type_str(ref_t),
++ 					ref_tname);
++ 				return -EINVAL;
++ 			}
++ 
++ 			if (reg->type == PTR_TO_BTF_ID) {
++ 				reg_btf = reg->btf;
++ 				reg_ref_id = reg->btf_id;
++ 			} else if (reg2btf_ids[reg->type]) {
++ 				reg_btf = btf_vmlinux;
++ 				reg_ref_id = *reg2btf_ids[reg->type];
++ 			} else {
++ 				bpf_log(log, "kernel function %s args#%d expected pointer to %s %s but R%d is not a pointer to btf_id\n",
++ 					func_name, i,
++ 					btf_type_str(ref_t), ref_tname, regno);
++ 				return -EINVAL;
++ 			}
++ 
++ 			reg_ref_t = btf_type_skip_modifiers(reg_btf, reg_ref_id,
++ 							    &reg_ref_id);
++ 			reg_ref_tname = btf_name_by_offset(reg_btf,
++ 							   reg_ref_t->name_off);
++ 			if (!btf_struct_ids_match(log, reg_btf, reg_ref_id,
++ 						  reg->off, btf, ref_id)) {
++ 				bpf_log(log, "kernel function %s args#%d expected pointer to %s %s but R%d has a pointer to %s %s\n",
++ 					func_name, i,
++ 					btf_type_str(ref_t), ref_tname,
++ 					regno, btf_type_str(reg_ref_t),
++ 					reg_ref_tname);
++ 				return -EINVAL;
++ 			}
++ 		} else if (btf_get_prog_ctx_type(log, btf, t,
++ 						 env->prog->type, i)) {
++ 			/* If function expects ctx type in BTF check that caller
++ 			 * is passing PTR_TO_CTX.
++ 			 */
++ 			if (reg->type != PTR_TO_CTX) {
++ 				bpf_log(log,
++ 					"arg#%d expected pointer to ctx, but got %s\n",
++ 					i, btf_type_str(t));
++ 				return -EINVAL;
++ 			}
++ 			if (check_ctx_reg(env, reg, regno))
++ 				return -EINVAL;
++ 		} else if (ptr_to_mem_ok) {
++ 			const struct btf_type *resolve_ret;
++ 			u32 type_size;
++ 
++ 			resolve_ret = btf_resolve_size(btf, ref_t, &type_size);
++ 			if (IS_ERR(resolve_ret)) {
++ 				bpf_log(log,
++ 					"arg#%d reference type('%s %s') size cannot be determined: %ld\n",
++ 					i, btf_type_str(ref_t), ref_tname,
++ 					PTR_ERR(resolve_ret));
++ 				return -EINVAL;
++ 			}
++ 
++ 			if (check_mem_reg(env, reg, regno, type_size))
++ 				return -EINVAL;
++ 		} else {
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  /* Compare BTF of a function with given bpf_reg_state.
+   * Returns:
+   * EFAULT - there is a verifier bug. Abort verification.
+@@@ -5474,10 -5536,18 +5618,17 @@@ out
+  	 * or mismatched type can be passed into a global function.
+  	 * In such cases mark the function as unreliable from BTF point of view.
+  	 */
+ -	if (err)
+ -		prog->aux->func_info_aux[subprog].unreliable = true;
+ -	return err;
+ +	prog->aux->func_info_aux[subprog].unreliable = true;
+ +	return -EINVAL;
+  }
+  
++ int btf_check_kfunc_arg_match(struct bpf_verifier_env *env,
++ 			      const struct btf *btf, u32 func_id,
++ 			      struct bpf_reg_state *regs)
++ {
++ 	return btf_check_func_arg_match(env, btf, func_id, regs, false);
++ }
++ 
+  /* Convert BTF of a function into bpf_reg_state if possible
+   * Returns:
+   * EFAULT - there is a verifier bug. Abort verification.
+diff --cc kernel/bpf/verifier.c
+index b1498684b49b,852541a435ef..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -242,6 -234,18 +242,21 @@@ static bool bpf_pseudo_call(const struc
+  	       insn->src_reg == BPF_PSEUDO_CALL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool bpf_pseudo_kfunc_call(const struct bpf_insn *insn)
++ {
++ 	return insn->code == (BPF_JMP | BPF_CALL) &&
++ 	       insn->src_reg == BPF_PSEUDO_KFUNC_CALL;
++ }
++ 
++ static bool bpf_pseudo_func(const struct bpf_insn *insn)
++ {
++ 	return insn->code == (BPF_LD | BPF_IMM | BPF_DW) &&
++ 	       insn->src_reg == BPF_PSEUDO_FUNC;
++ }
++ 
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  struct bpf_call_arg_meta {
+  	struct bpf_map *map_ptr;
+  	bool raw_mode;
+@@@ -1563,19 -1735,30 +1738,36 @@@ static int add_subprog_and_kfunc(struc
+  
+  	/* Add entry function. */
+  	ret = add_subprog(env, 0);
+- 	if (ret < 0)
++ 	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	/* determine subprog starts. The end is one before the next starts */
+ +	for (i = 0; i < insn_cnt; i++) {
+ +		if (!bpf_pseudo_call(insn + i))
+++=======
++ 	for (i = 0; i < insn_cnt; i++, insn++) {
++ 		if (!bpf_pseudo_func(insn) && !bpf_pseudo_call(insn) &&
++ 		    !bpf_pseudo_kfunc_call(insn))
+++>>>>>>> e6ac2450d6de (bpf: Support bpf program calling kernel function)
+  			continue;
++ 
+  		if (!env->bpf_capable) {
+- 			verbose(env,
+- 				"function calls to other bpf functions are allowed for CAP_BPF and CAP_SYS_ADMIN\n");
++ 			verbose(env, "loading/calling other bpf or kernel functions are allowed for CAP_BPF and CAP_SYS_ADMIN\n");
+  			return -EPERM;
+  		}
+- 		ret = add_subprog(env, i + insn[i].imm + 1);
++ 
++ 		if (bpf_pseudo_func(insn)) {
++ 			ret = add_subprog(env, i + insn->imm + 1);
++ 			if (ret >= 0)
++ 				/* remember subprog */
++ 				insn[1].imm = ret;
++ 		} else if (bpf_pseudo_call(insn)) {
++ 			ret = add_subprog(env, i + insn->imm + 1);
++ 		} else {
++ 			ret = add_kfunc_call(env, insn->imm);
++ 		}
++ 
+  		if (ret < 0)
+  			return ret;
+  	}
+@@@ -10280,11 -10604,12 +10588,13 @@@ static int do_check(struct bpf_verifier
+  				}
+  				if (insn->src_reg == BPF_PSEUDO_CALL)
+  					err = check_func_call(env, insn, &env->insn_idx);
++ 				else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
++ 					err = check_kfunc_call(env, insn);
+  				else
+ -					err = check_helper_call(env, insn, &env->insn_idx);
+ +					err = check_helper_call(env, insn->imm, env->insn_idx);
+  				if (err)
+  					return err;
+ +
+  			} else if (opcode == BPF_JA) {
+  				if (BPF_SRC(insn->code) != BPF_K ||
+  				    insn->imm != 0 ||
+diff --git a/arch/x86/net/bpf_jit_comp.c b/arch/x86/net/bpf_jit_comp.c
+index cbaab3007430..ec918b06a877 100644
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@ -2361,3 +2361,8 @@ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog)
+ 					   tmp : orig_prog);
+ 	return prog;
+ }
++
++bool bpf_jit_supports_kfunc_call(void)
++{
++	return true;
++}
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/btf.h b/include/linux/btf.h
+index 9c1b52738bbe..9b048eb95ade 100644
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@ -110,6 +110,7 @@ const struct btf_type *btf_type_resolve_func_ptr(const struct btf *btf,
+ const struct btf_type *
+ btf_resolve_size(const struct btf *btf, const struct btf_type *type,
+ 		 u32 *type_size);
++const char *btf_type_str(const struct btf_type *t);
+ 
+ #define for_each_member(i, struct_type, member)			\
+ 	for (i = 0, member = btf_type_member(struct_type);	\
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index dc6533c86452..2bfc3e1baee5 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -931,6 +931,7 @@ u64 __bpf_call_base(u64 r1, u64 r2, u64 r3, u64 r4, u64 r5);
+ struct bpf_prog *bpf_int_jit_compile(struct bpf_prog *prog);
+ void bpf_jit_compile(struct bpf_prog *prog);
+ bool bpf_jit_needs_zext(void);
++bool bpf_jit_supports_kfunc_call(void);
+ bool bpf_helper_changes_pkt_data(void *func);
+ 
+ static inline bool bpf_dump_raw_ok(const struct cred *cred)
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 9930d97a9c63..c217f06ce927 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -1114,6 +1114,10 @@ enum bpf_link_type {
+  * offset to another bpf function
+  */
+ #define BPF_PSEUDO_CALL		1
++/* when bpf_call->src_reg == BPF_PSEUDO_KFUNC_CALL,
++ * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
++ */
++#define BPF_PSEUDO_KFUNC_CALL	2
+ 
+ /* flags for BPF_MAP_UPDATE_ELEM command */
+ enum {
+* Unmerged path kernel/bpf/btf.c
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 40abfa959fed..78828687bafa 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -158,6 +158,9 @@ void bpf_prog_jit_attempt_done(struct bpf_prog *prog)
+ 		kvfree(prog->aux->jited_linfo);
+ 		prog->aux->jited_linfo = NULL;
+ 	}
++
++	kfree(prog->aux->kfunc_tab);
++	prog->aux->kfunc_tab = NULL;
+ }
+ 
+ /* The jit engine is responsible to provide an array
+@@ -1854,9 +1857,15 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
+ 	/* In case of BPF to BPF calls, verifier did all the prep
+ 	 * work with regards to JITing, etc.
+ 	 */
++	bool jit_needed = false;
++
+ 	if (fp->bpf_func)
+ 		goto finalize;
+ 
++	if (IS_ENABLED(CONFIG_BPF_JIT_ALWAYS_ON) ||
++	    bpf_prog_has_kfunc_call(fp))
++		jit_needed = true;
++
+ 	bpf_prog_select_func(fp);
+ 
+ 	/* eBPF JITs can rewrite the program in case constant
+@@ -1872,12 +1881,10 @@ struct bpf_prog *bpf_prog_select_runtime(struct bpf_prog *fp, int *err)
+ 
+ 		fp = bpf_int_jit_compile(fp);
+ 		bpf_prog_jit_attempt_done(fp);
+-#ifdef CONFIG_BPF_JIT_ALWAYS_ON
+-		if (!fp->jited) {
++		if (!fp->jited && jit_needed) {
+ 			*err = -ENOTSUPP;
+ 			return fp;
+ 		}
+-#endif
+ 	} else {
+ 		*err = bpf_prog_offload_compile(fp);
+ 		if (*err)
+@@ -2363,6 +2370,11 @@ bool __weak bpf_jit_needs_zext(void)
+ 	return false;
+ }
+ 
++bool __weak bpf_jit_supports_kfunc_call(void)
++{
++	return false;
++}
++
+ /* To execute LD_ABS/LD_IND instructions __bpf_prog_run() may call
+  * skb_copy_bits(), so provide a weak definition of it for NET-less config.
+  */
+diff --git a/kernel/bpf/disasm.c b/kernel/bpf/disasm.c
+index 59481a8eece8..c8f02b33da04 100644
+--- a/kernel/bpf/disasm.c
++++ b/kernel/bpf/disasm.c
+@@ -27,16 +27,23 @@ static const char *__func_get_name(const struct bpf_insn_cbs *cbs,
+ {
+ 	BUILD_BUG_ON(ARRAY_SIZE(func_id_str) != __BPF_FUNC_MAX_ID);
+ 
+-	if (insn->src_reg != BPF_PSEUDO_CALL &&
++	if (!insn->src_reg &&
+ 	    insn->imm >= 0 && insn->imm < __BPF_FUNC_MAX_ID &&
+ 	    func_id_str[insn->imm])
+ 		return func_id_str[insn->imm];
+ 
+-	if (cbs && cbs->cb_call)
+-		return cbs->cb_call(cbs->private_data, insn);
++	if (cbs && cbs->cb_call) {
++		const char *res;
++
++		res = cbs->cb_call(cbs->private_data, insn);
++		if (res)
++			return res;
++	}
+ 
+ 	if (insn->src_reg == BPF_PSEUDO_CALL)
+ 		snprintf(buff, len, "%+d", insn->imm);
++	else if (insn->src_reg == BPF_PSEUDO_KFUNC_CALL)
++		snprintf(buff, len, "kernel-function");
+ 
+ 	return buff;
+ }
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 675eb8474771..774459c4a2c7 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1721,6 +1721,7 @@ static void __bpf_prog_put_noref(struct bpf_prog *prog, bool deferred)
+ 	btf_put(prog->aux->btf);
+ 	kvfree(prog->aux->jited_linfo);
+ 	kvfree(prog->aux->linfo);
++	kfree(prog->aux->kfunc_tab);
+ 	if (prog->aux->attach_btf)
+ 		btf_put(prog->aux->attach_btf);
+ 
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 517733cfbfaf..897f596673d6 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -1108,6 +1108,10 @@ enum bpf_link_type {
+  * offset to another bpf function
+  */
+ #define BPF_PSEUDO_CALL		1
++/* when bpf_call->src_reg == BPF_PSEUDO_KFUNC_CALL,
++ * bpf_call->imm == btf_id of a BTF_KIND_FUNC in the running kernel
++ */
++#define BPF_PSEUDO_KFUNC_CALL	2
+ 
+ /* flags for BPF_MAP_UPDATE_ELEM command */
+ enum {
+diff --git a/tools/testing/selftests/bpf/verifier/calls.c b/tools/testing/selftests/bpf/verifier/calls.c
+index eb888c8479c3..336a749673d1 100644
+--- a/tools/testing/selftests/bpf/verifier/calls.c
++++ b/tools/testing/selftests/bpf/verifier/calls.c
+@@ -19,7 +19,7 @@
+ 	BPF_MOV64_IMM(BPF_REG_0, 2),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 1,
+@@ -136,7 +136,7 @@
+ {
+ 	"calls: wrong src reg",
+ 	.insns = {
+-	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 2, 0, 0),
++	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 3, 0, 0),
+ 	BPF_MOV64_IMM(BPF_REG_0, 1),
+ 	BPF_EXIT_INSN(),
+ 	},
+@@ -397,7 +397,7 @@
+ 	BPF_MOV64_IMM(BPF_REG_0, 1),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.fixup_map_hash_48b = { 3 },
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+@@ -1977,7 +1977,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ },
+@@ -2003,7 +2003,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.errstr = "!read_ok",
+ 	.result = REJECT,
+ },
+@@ -2028,7 +2028,7 @@
+ 	BPF_EXIT_INSN(),
+ 	},
+ 	.prog_type = BPF_PROG_TYPE_SOCKET_FILTER,
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.errstr = "!read_ok",
+ 	.result = REJECT,
+ },
+diff --git a/tools/testing/selftests/bpf/verifier/dead_code.c b/tools/testing/selftests/bpf/verifier/dead_code.c
+index 5cf361d8eb1c..17fe33a75034 100644
+--- a/tools/testing/selftests/bpf/verifier/dead_code.c
++++ b/tools/testing/selftests/bpf/verifier/dead_code.c
+@@ -85,7 +85,7 @@
+ 	BPF_MOV64_IMM(BPF_REG_0, 12),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 7,
+@@ -103,7 +103,7 @@
+ 	BPF_MOV64_IMM(BPF_REG_0, 12),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 7,
+@@ -121,7 +121,7 @@
+ 	BPF_RAW_INSN(BPF_JMP | BPF_CALL, 0, 1, 0, -5),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 7,
+@@ -137,7 +137,7 @@
+ 	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 2,
+@@ -152,7 +152,7 @@
+ 	BPF_MOV64_REG(BPF_REG_0, BPF_REG_1),
+ 	BPF_EXIT_INSN(),
+ 	},
+-	.errstr_unpriv = "function calls to other bpf functions are allowed for",
++	.errstr_unpriv = "loading/calling other bpf or kernel functions are allowed for",
+ 	.result_unpriv = REJECT,
+ 	.result = ACCEPT,
+ 	.retval = 2,
