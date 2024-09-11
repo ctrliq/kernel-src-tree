@@ -1,0 +1,124 @@
+KVM: vmx/pmu: Reduce the overhead of LBR pass-through or cancellation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Like Xu <like.xu@linux.intel.com>
+commit 9254beaafd12e27d48149fab3b16db372bc90ad7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/9254beaa.failed
+
+When the LBR records msrs has already been pass-through, there is no
+need to call vmx_update_intercept_for_lbr_msrs() again and again, and
+vice versa.
+
+	Signed-off-by: Like Xu <like.xu@linux.intel.com>
+	Reviewed-by: Andi Kleen <ak@linux.intel.com>
+Message-Id: <20210201051039.255478-8-like.xu@linux.intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 9254beaafd12e27d48149fab3b16db372bc90ad7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/pmu_intel.c
+diff --cc arch/x86/kvm/vmx/pmu_intel.c
+index 48690db4db6a,254d9fc09863..000000000000
+--- a/arch/x86/kvm/vmx/pmu_intel.c
++++ b/arch/x86/kvm/vmx/pmu_intel.c
+@@@ -517,6 -586,78 +518,81 @@@ static void intel_pmu_reset(struct kvm_
+  	intel_pmu_release_guest_lbr_event(vcpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vmx_update_intercept_for_lbr_msrs(struct kvm_vcpu *vcpu, bool set)
++ {
++ 	struct x86_pmu_lbr *lbr = vcpu_to_lbr_records(vcpu);
++ 	int i;
++ 
++ 	for (i = 0; i < lbr->nr; i++) {
++ 		vmx_set_intercept_for_msr(vcpu, lbr->from + i, MSR_TYPE_RW, set);
++ 		vmx_set_intercept_for_msr(vcpu, lbr->to + i, MSR_TYPE_RW, set);
++ 		if (lbr->info)
++ 			vmx_set_intercept_for_msr(vcpu, lbr->info + i, MSR_TYPE_RW, set);
++ 	}
++ 
++ 	vmx_set_intercept_for_msr(vcpu, MSR_LBR_SELECT, MSR_TYPE_RW, set);
++ 	vmx_set_intercept_for_msr(vcpu, MSR_LBR_TOS, MSR_TYPE_RW, set);
++ }
++ 
++ static inline void vmx_disable_lbr_msrs_passthrough(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (!lbr_desc->msr_passthrough)
++ 		return;
++ 
++ 	vmx_update_intercept_for_lbr_msrs(vcpu, true);
++ 	lbr_desc->msr_passthrough = false;
++ }
++ 
++ static inline void vmx_enable_lbr_msrs_passthrough(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (lbr_desc->msr_passthrough)
++ 		return;
++ 
++ 	vmx_update_intercept_for_lbr_msrs(vcpu, false);
++ 	lbr_desc->msr_passthrough = true;
++ }
++ 
++ /*
++  * Higher priority host perf events (e.g. cpu pinned) could reclaim the
++  * pmu resources (e.g. LBR) that were assigned to the guest. This is
++  * usually done via ipi calls (more details in perf_install_in_context).
++  *
++  * Before entering the non-root mode (with irq disabled here), double
++  * confirm that the pmu features enabled to the guest are not reclaimed
++  * by higher priority host events. Otherwise, disallow vcpu's access to
++  * the reclaimed features.
++  */
++ void vmx_passthrough_lbr_msrs(struct kvm_vcpu *vcpu)
++ {
++ 	struct lbr_desc *lbr_desc = vcpu_to_lbr_desc(vcpu);
++ 
++ 	if (!lbr_desc->event) {
++ 		vmx_disable_lbr_msrs_passthrough(vcpu);
++ 		if (vmcs_read64(GUEST_IA32_DEBUGCTL) & DEBUGCTLMSR_LBR)
++ 			goto warn;
++ 		return;
++ 	}
++ 
++ 	if (lbr_desc->event->state < PERF_EVENT_STATE_ACTIVE) {
++ 		vmx_disable_lbr_msrs_passthrough(vcpu);
++ 		goto warn;
++ 	} else
++ 		vmx_enable_lbr_msrs_passthrough(vcpu);
++ 
++ 	return;
++ 
++ warn:
++ 	pr_warn_ratelimited("kvm: vcpu-%d: fail to passthrough LBR.\n",
++ 		vcpu->vcpu_id);
++ }
++ 
+++>>>>>>> 9254beaafd12 (KVM: vmx/pmu: Reduce the overhead of LBR pass-through or cancellation)
+  struct kvm_pmu_ops intel_pmu_ops = {
+  	.find_arch_event = intel_find_arch_event,
+  	.find_fixed_event = intel_find_fixed_event,
+* Unmerged path arch/x86/kvm/vmx/pmu_intel.c
+diff --git a/arch/x86/kvm/vmx/vmx.h b/arch/x86/kvm/vmx/vmx.h
+index 6d7ed00160a2..e3b28f0dcc00 100644
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@ -111,6 +111,9 @@ struct lbr_desc {
+ 	 * The records may be inaccurate if the host reclaims the LBR.
+ 	 */
+ 	struct perf_event *event;
++
++	/* True if LBRs are marked as not intercepted in the MSR bitmap */
++	bool msr_passthrough;
+ };
+ 
+ /*
