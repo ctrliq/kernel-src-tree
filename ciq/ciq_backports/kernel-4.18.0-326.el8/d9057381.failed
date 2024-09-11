@@ -1,0 +1,374 @@
+iommu/uapi: Handle data and argsz filled by users
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jacob Pan <jacob.pan.linux@gmail.com>
+commit d90573812eea63c6bc8ab8a38f661b4c27c3cdc0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/d9057381.failed
+
+IOMMU user APIs are responsible for processing user data. This patch
+changes the interface such that user pointers can be passed into IOMMU
+code directly. Separate kernel APIs without user pointers are introduced
+for in-kernel users of the UAPI functionality.
+
+IOMMU UAPI data has a user filled argsz field which indicates the data
+length of the structure. User data is not trusted, argsz must be
+validated based on the current kernel data size, mandatory data size,
+and feature flags.
+
+User data may also be extended, resulting in possible argsz increase.
+Backward compatibility is ensured based on size and flags (or
+the functional equivalent fields) checking.
+
+This patch adds sanity checks in the IOMMU layer. In addition to argsz,
+reserved/unused fields in padding, flags, and version are also checked.
+Details are documented in Documentation/userspace-api/iommu.rst
+
+	Signed-off-by: Liu Yi L <yi.l.liu@intel.com>
+	Signed-off-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Reviewed-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Reviewed-by: Eric Auger <eric.auger@redhat.com>
+Link: https://lore.kernel.org/r/1601051567-54787-6-git-send-email-jacob.jun.pan@linux.intel.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit d90573812eea63c6bc8ab8a38f661b4c27c3cdc0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/iommu/iommu.c
+index 5335b649855c,6d847027d35e..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -1960,35 -1961,188 +1960,208 @@@ out_unlock
+  }
+  EXPORT_SYMBOL_GPL(iommu_attach_device);
+  
+++<<<<<<< HEAD
+ +int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain)
+ +{
+ +	const struct iommu_ops *ops = domain->ops;
+ +
+ +	if (ops->is_attach_deferred && ops->is_attach_deferred(domain, dev))
+ +		return __iommu_attach_device(domain, dev);
+ +
+ +	return 0;
+ +}
+ +
+ +int iommu_cache_invalidate(struct iommu_domain *domain, struct device *dev,
+ +			   struct iommu_cache_invalidate_info *inv_info)
+++=======
++ /*
++  * Check flags and other user provided data for valid combinations. We also
++  * make sure no reserved fields or unused flags are set. This is to ensure
++  * not breaking userspace in the future when these fields or flags are used.
++  */
++ static int iommu_check_cache_invl_data(struct iommu_cache_invalidate_info *info)
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
++ {
++ 	u32 mask;
++ 	int i;
++ 
++ 	if (info->version != IOMMU_CACHE_INVALIDATE_INFO_VERSION_1)
++ 		return -EINVAL;
++ 
++ 	mask = (1 << IOMMU_CACHE_INV_TYPE_NR) - 1;
++ 	if (info->cache & ~mask)
++ 		return -EINVAL;
++ 
++ 	if (info->granularity >= IOMMU_INV_GRANU_NR)
++ 		return -EINVAL;
++ 
++ 	switch (info->granularity) {
++ 	case IOMMU_INV_GRANU_ADDR:
++ 		if (info->cache & IOMMU_CACHE_INV_TYPE_PASID)
++ 			return -EINVAL;
++ 
++ 		mask = IOMMU_INV_ADDR_FLAGS_PASID |
++ 			IOMMU_INV_ADDR_FLAGS_ARCHID |
++ 			IOMMU_INV_ADDR_FLAGS_LEAF;
++ 
++ 		if (info->granu.addr_info.flags & ~mask)
++ 			return -EINVAL;
++ 		break;
++ 	case IOMMU_INV_GRANU_PASID:
++ 		mask = IOMMU_INV_PASID_FLAGS_PASID |
++ 			IOMMU_INV_PASID_FLAGS_ARCHID;
++ 		if (info->granu.pasid_info.flags & ~mask)
++ 			return -EINVAL;
++ 
++ 		break;
++ 	case IOMMU_INV_GRANU_DOMAIN:
++ 		if (info->cache & IOMMU_CACHE_INV_TYPE_DEV_IOTLB)
++ 			return -EINVAL;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check reserved padding fields */
++ 	for (i = 0; i < sizeof(info->padding); i++) {
++ 		if (info->padding[i])
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int iommu_uapi_cache_invalidate(struct iommu_domain *domain, struct device *dev,
++ 				void __user *uinfo)
+  {
++ 	struct iommu_cache_invalidate_info inv_info = { 0 };
++ 	u32 minsz;
++ 	int ret;
++ 
+  	if (unlikely(!domain->ops->cache_invalidate))
+  		return -ENODEV;
+  
+- 	return domain->ops->cache_invalidate(domain, dev, inv_info);
++ 	/*
++ 	 * No new spaces can be added before the variable sized union, the
++ 	 * minimum size is the offset to the union.
++ 	 */
++ 	minsz = offsetof(struct iommu_cache_invalidate_info, granu);
++ 
++ 	/* Copy minsz from user to get flags and argsz */
++ 	if (copy_from_user(&inv_info, uinfo, minsz))
++ 		return -EFAULT;
++ 
++ 	/* Fields before the variable size union are mandatory */
++ 	if (inv_info.argsz < minsz)
++ 		return -EINVAL;
++ 
++ 	/* PASID and address granu require additional info beyond minsz */
++ 	if (inv_info.granularity == IOMMU_INV_GRANU_PASID &&
++ 	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.pasid_info))
++ 		return -EINVAL;
++ 
++ 	if (inv_info.granularity == IOMMU_INV_GRANU_ADDR &&
++ 	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.addr_info))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * User might be using a newer UAPI header which has a larger data
++ 	 * size, we shall support the existing flags within the current
++ 	 * size. Copy the remaining user data _after_ minsz but not more
++ 	 * than the current kernel supported size.
++ 	 */
++ 	if (copy_from_user((void *)&inv_info + minsz, uinfo + minsz,
++ 			   min_t(u32, inv_info.argsz, sizeof(inv_info)) - minsz))
++ 		return -EFAULT;
++ 
++ 	/* Now the argsz is validated, check the content */
++ 	ret = iommu_check_cache_invl_data(&inv_info);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return domain->ops->cache_invalidate(domain, dev, &inv_info);
+  }
+ -EXPORT_SYMBOL_GPL(iommu_uapi_cache_invalidate);
+ +EXPORT_SYMBOL_GPL(iommu_cache_invalidate);
+  
+++<<<<<<< HEAD
+ +int iommu_sva_bind_gpasid(struct iommu_domain *domain,
+ +			   struct device *dev, struct iommu_gpasid_bind_data *data)
+++=======
++ static int iommu_check_bind_data(struct iommu_gpasid_bind_data *data)
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
++ {
++ 	u32 mask;
++ 	int i;
++ 
++ 	if (data->version != IOMMU_GPASID_BIND_VERSION_1)
++ 		return -EINVAL;
++ 
++ 	/* Check the range of supported formats */
++ 	if (data->format >= IOMMU_PASID_FORMAT_LAST)
++ 		return -EINVAL;
++ 
++ 	/* Check all flags */
++ 	mask = IOMMU_SVA_GPASID_VAL;
++ 	if (data->flags & ~mask)
++ 		return -EINVAL;
++ 
++ 	/* Check reserved padding fields */
++ 	for (i = 0; i < sizeof(data->padding); i++) {
++ 		if (data->padding[i])
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int iommu_sva_prepare_bind_data(void __user *udata,
++ 				       struct iommu_gpasid_bind_data *data)
++ {
++ 	u32 minsz;
++ 
++ 	/*
++ 	 * No new spaces can be added before the variable sized union, the
++ 	 * minimum size is the offset to the union.
++ 	 */
++ 	minsz = offsetof(struct iommu_gpasid_bind_data, vendor);
++ 
++ 	/* Copy minsz from user to get flags and argsz */
++ 	if (copy_from_user(data, udata, minsz))
++ 		return -EFAULT;
++ 
++ 	/* Fields before the variable size union are mandatory */
++ 	if (data->argsz < minsz)
++ 		return -EINVAL;
++ 	/*
++ 	 * User might be using a newer UAPI header, we shall let IOMMU vendor
++ 	 * driver decide on what size it needs. Since the guest PASID bind data
++ 	 * can be vendor specific, larger argsz could be the result of extension
++ 	 * for one vendor but it should not affect another vendor.
++ 	 * Copy the remaining user data _after_ minsz
++ 	 */
++ 	if (copy_from_user((void *)data + minsz, udata + minsz,
++ 			   min_t(u32, data->argsz, sizeof(*data)) - minsz))
++ 		return -EFAULT;
++ 
++ 	return iommu_check_bind_data(data);
++ }
++ 
++ int iommu_uapi_sva_bind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 			       void __user *udata)
+  {
++ 	struct iommu_gpasid_bind_data data = { 0 };
++ 	int ret;
++ 
+  	if (unlikely(!domain->ops->sva_bind_gpasid))
+  		return -ENODEV;
+  
+- 	return domain->ops->sva_bind_gpasid(domain, dev, data);
++ 	ret = iommu_sva_prepare_bind_data(udata, &data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return domain->ops->sva_bind_gpasid(domain, dev, &data);
+  }
+ -EXPORT_SYMBOL_GPL(iommu_uapi_sva_bind_gpasid);
+ +EXPORT_SYMBOL_GPL(iommu_sva_bind_gpasid);
+  
+  int iommu_sva_unbind_gpasid(struct iommu_domain *domain, struct device *dev,
+  			     ioasid_t pasid)
+@@@ -1999,6 -2153,23 +2172,26 @@@
+  	return domain->ops->sva_unbind_gpasid(dev, pasid);
+  }
+  EXPORT_SYMBOL_GPL(iommu_sva_unbind_gpasid);
+++<<<<<<< HEAD
+++=======
++ 
++ int iommu_uapi_sva_unbind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 				 void __user *udata)
++ {
++ 	struct iommu_gpasid_bind_data data = { 0 };
++ 	int ret;
++ 
++ 	if (unlikely(!domain->ops->sva_bind_gpasid))
++ 		return -ENODEV;
++ 
++ 	ret = iommu_sva_prepare_bind_data(udata, &data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return iommu_sva_unbind_gpasid(domain, dev, data.hpasid);
++ }
++ EXPORT_SYMBOL_GPL(iommu_uapi_sva_unbind_gpasid);
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
+  
+  static void __iommu_detach_device(struct iommu_domain *domain,
+  				  struct device *dev)
+diff --cc include/linux/iommu.h
+index 4968822e1068,82876f682367..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -454,13 -424,16 +454,26 @@@ extern int iommu_attach_device(struct i
+  			       struct device *dev);
+  extern void iommu_detach_device(struct iommu_domain *domain,
+  				struct device *dev);
+++<<<<<<< HEAD
+ +extern int iommu_cache_invalidate(struct iommu_domain *domain,
+ +				  struct device *dev,
+ +				  struct iommu_cache_invalidate_info *inv_info);
+ +extern int iommu_sva_bind_gpasid(struct iommu_domain *domain,
+ +		struct device *dev, struct iommu_gpasid_bind_data *data);
+ +extern int iommu_sva_unbind_gpasid(struct iommu_domain *domain,
+ +				struct device *dev, ioasid_t pasid);
+++=======
++ extern int iommu_uapi_cache_invalidate(struct iommu_domain *domain,
++ 				       struct device *dev,
++ 				       void __user *uinfo);
++ 
++ extern int iommu_uapi_sva_bind_gpasid(struct iommu_domain *domain,
++ 				      struct device *dev, void __user *udata);
++ extern int iommu_uapi_sva_unbind_gpasid(struct iommu_domain *domain,
++ 					struct device *dev, void __user *udata);
++ extern int iommu_sva_unbind_gpasid(struct iommu_domain *domain,
++ 				   struct device *dev, ioasid_t pasid);
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
+  extern struct iommu_domain *iommu_get_domain_for_dev(struct device *dev);
+  extern struct iommu_domain *iommu_get_dma_domain(struct device *dev);
+  extern int iommu_map(struct iommu_domain *domain, unsigned long iova,
+@@@ -1062,20 -1036,28 +1075,44 @@@ static inline u32 iommu_sva_get_pasid(s
+  }
+  
+  static inline int
+++<<<<<<< HEAD
+ +iommu_cache_invalidate(struct iommu_domain *domain,
+ +		       struct device *dev,
+ +		       struct iommu_cache_invalidate_info *inv_info)
+ +{
+ +	return -ENODEV;
+ +}
+ +static inline int iommu_sva_bind_gpasid(struct iommu_domain *domain,
+ +				struct device *dev, struct iommu_gpasid_bind_data *data)
+++=======
++ iommu_uapi_cache_invalidate(struct iommu_domain *domain,
++ 			    struct device *dev,
++ 			    struct iommu_cache_invalidate_info *inv_info)
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
+  {
+  	return -ENODEV;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int iommu_sva_unbind_gpasid(struct iommu_domain *domain,
+ +					   struct device *dev, u32 pasid)
+++=======
++ static inline int iommu_uapi_sva_bind_gpasid(struct iommu_domain *domain,
++ 					     struct device *dev, void __user *udata)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline int iommu_uapi_sva_unbind_gpasid(struct iommu_domain *domain,
++ 					       struct device *dev, void __user *udata)
++ {
++ 	return -ENODEV;
++ }
++ 
++ static inline int iommu_sva_unbind_gpasid(struct iommu_domain *domain,
++ 					  struct device *dev,
++ 					  ioasid_t pasid)
+++>>>>>>> d90573812eea (iommu/uapi: Handle data and argsz filled by users)
+  {
+  	return -ENODEV;
+  }
+* Unmerged path drivers/iommu/iommu.c
+* Unmerged path include/linux/iommu.h
+diff --git a/include/uapi/linux/iommu.h b/include/uapi/linux/iommu.h
+index 5946779ac1f9..66d4ca40b40f 100644
+--- a/include/uapi/linux/iommu.h
++++ b/include/uapi/linux/iommu.h
+@@ -322,6 +322,7 @@ struct iommu_gpasid_bind_data {
+ #define IOMMU_GPASID_BIND_VERSION_1	1
+ 	__u32 version;
+ #define IOMMU_PASID_FORMAT_INTEL_VTD	1
++#define IOMMU_PASID_FORMAT_LAST		2
+ 	__u32 format;
+ 	__u32 addr_width;
+ #define IOMMU_SVA_GPASID_VAL	(1 << 0) /* guest PASID valid */
