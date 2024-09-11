@@ -1,0 +1,107 @@
+mm/hotplug: treat CMA pages as unmovable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Qian Cai <cai@lca.pw>
+commit 1a9f219157b22d0ffb340a9c5f431afd02cd2cf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1a9f2191.failed
+
+has_unmovable_pages() is used by allocating CMA and gigantic pages as
+well as the memory hotplug.  The later doesn't know how to offline CMA
+pool properly now, but if an unused (free) CMA page is encountered, then
+has_unmovable_pages() happily considers it as a free memory and
+propagates this up the call chain.  Memory offlining code then frees the
+page without a proper CMA tear down which leads to an accounting issues.
+Moreover if the same memory range is onlined again then the memory never
+gets back to the CMA pool.
+
+State after memory offline:
+
+ # grep cma /proc/vmstat
+ nr_free_cma 205824
+
+ # cat /sys/kernel/debug/cma/cma-kvm_cma/count
+ 209920
+
+Also, kmemleak still think those memory address are reserved below but
+have already been used by the buddy allocator after onlining.  This
+patch fixes the situation by treating CMA pageblocks as unmovable except
+when has_unmovable_pages() is called as part of CMA allocation.
+
+  Offlined Pages 4096
+  kmemleak: Cannot insert 0xc000201f7d040008 into the object search tree (overlaps existing)
+  Call Trace:
+    dump_stack+0xb0/0xf4 (unreliable)
+    create_object+0x344/0x380
+    __kmalloc_node+0x3ec/0x860
+    kvmalloc_node+0x58/0x110
+    seq_read+0x41c/0x620
+    __vfs_read+0x3c/0x70
+    vfs_read+0xbc/0x1a0
+    ksys_read+0x7c/0x140
+    system_call+0x5c/0x70
+  kmemleak: Kernel memory leak detector disabled
+  kmemleak: Object 0xc000201cc8000000 (size 13757317120):
+  kmemleak:   comm "swapper/0", pid 0, jiffies 4294937297
+  kmemleak:   min_count = -1
+  kmemleak:   count = 0
+  kmemleak:   flags = 0x5
+  kmemleak:   checksum = 0
+  kmemleak:   backtrace:
+       cma_declare_contiguous+0x2a4/0x3b0
+       kvm_cma_reserve+0x11c/0x134
+       setup_arch+0x300/0x3f8
+       start_kernel+0x9c/0x6e8
+       start_here_common+0x1c/0x4b0
+  kmemleak: Automatic memory scanning thread ended
+
+[cai@lca.pw: use is_migrate_cma_page() and update commit log]
+  Link: http://lkml.kernel.org/r/20190416170510.20048-1-cai@lca.pw
+Link: http://lkml.kernel.org/r/20190413002623.8967-1-cai@lca.pw
+	Signed-off-by: Qian Cai <cai@lca.pw>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1a9f219157b22d0ffb340a9c5f431afd02cd2cf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_alloc.c
+diff --cc mm/page_alloc.c
+index f3729b032924,c6ce20aaf80b..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -7839,10 -8003,12 +7839,13 @@@ void *__init alloc_large_system_hash(co
+   * race condition. So you can't expect this function should be exact.
+   */
+  bool has_unmovable_pages(struct zone *zone, struct page *page, int count,
+ -			 int migratetype, int flags)
+ +			 int migratetype,
+ +			 bool skip_hwpoisoned_pages)
+  {
+- 	unsigned long pfn, iter, found;
++ 	unsigned long found;
++ 	unsigned long iter = 0;
++ 	unsigned long pfn = page_to_pfn(page);
++ 	const char *reason = "unmovable page";
+  
+  	/*
+  	 * TODO we could make this much more efficient by not checking every
+@@@ -7941,7 -8110,8 +7947,12 @@@
+  	return false;
+  unmovable:
+  	WARN_ON_ONCE(zone_idx(zone) == ZONE_MOVABLE);
+++<<<<<<< HEAD
+ +	dump_page(pfn_to_page(pfn+iter), "unmovable page");
+++=======
++ 	if (flags & REPORT_FAILURE)
++ 		dump_page(pfn_to_page(pfn + iter), reason);
+++>>>>>>> 1a9f219157b2 (mm/hotplug: treat CMA pages as unmovable)
+  	return true;
+  }
+  
+* Unmerged path mm/page_alloc.c
