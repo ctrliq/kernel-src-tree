@@ -136,8 +136,8 @@ struct block_info {
 };
 
 struct addr_location {
-	struct machine *machine;
 	struct thread *thread;
+	struct map_groups *mg;
 	struct map    *map;
 	struct symbol *sym;
 	const char    *srcline;
