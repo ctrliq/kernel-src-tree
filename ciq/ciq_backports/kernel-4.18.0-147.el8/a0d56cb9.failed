@@ -1,0 +1,111 @@
+netfilter: ipv6: nf_defrag: fix leakage of unqueued fragments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Guillaume Nault <gnault@redhat.com>
+commit a0d56cb911ca301de81735f1d73c2aab424654ba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a0d56cb9.failed
+
+With commit 997dd9647164 ("net: IP6 defrag: use rbtrees in
+nf_conntrack_reasm.c"), nf_ct_frag6_reasm() is now called from
+nf_ct_frag6_queue(). With this change, nf_ct_frag6_queue() can fail
+after the skb has been added to the fragment queue and
+nf_ct_frag6_gather() was adapted to handle this case.
+
+But nf_ct_frag6_queue() can still fail before the fragment has been
+queued. nf_ct_frag6_gather() can't handle this case anymore, because it
+has no way to know if nf_ct_frag6_queue() queued the fragment before
+failing. If it didn't, the skb is lost as the error code is overwritten
+with -EINPROGRESS.
+
+Fix this by setting -EINPROGRESS directly in nf_ct_frag6_queue(), so
+that nf_ct_frag6_gather() can propagate the error as is.
+
+Fixes: 997dd9647164 ("net: IP6 defrag: use rbtrees in nf_conntrack_reasm.c")
+	Signed-off-by: Guillaume Nault <gnault@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit a0d56cb911ca301de81735f1d73c2aab424654ba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/netfilter/nf_conntrack_reasm.c
+diff --cc net/ipv6/netfilter/nf_conntrack_reasm.c
+index 043ed8eb0ab9,5b3f65e29b6f..000000000000
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@@ -319,11 -286,29 +319,30 @@@ found
+  		fq->q.flags |= INET_FRAG_FIRST_IN;
+  	}
+  
+ -	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ -	    fq->q.meat == fq->q.len) {
+ -		unsigned long orefdst = skb->_skb_refdst;
+ +	return 0;
+  
+++<<<<<<< HEAD
+ +discard_fq:
+++=======
++ 		skb->_skb_refdst = 0UL;
++ 		err = nf_ct_frag6_reasm(fq, skb, prev, dev);
++ 		skb->_skb_refdst = orefdst;
++ 
++ 		/* After queue has assumed skb ownership, only 0 or
++ 		 * -EINPROGRESS must be returned.
++ 		 */
++ 		return err ? -EINPROGRESS : 0;
++ 	}
++ 
++ 	skb_dst_drop(skb);
++ 	return -EINPROGRESS;
++ 
++ insert_error:
++ 	if (err == IPFRAG_DUP)
++ 		goto err;
+++>>>>>>> a0d56cb911ca (netfilter: ipv6: nf_defrag: fix leakage of unqueued fragments)
+  	inet_frag_kill(&fq->q);
+  err:
+ -	skb_dst_drop(skb);
+  	return -EINVAL;
+  }
+  
+@@@ -580,31 -479,11 +599,34 @@@ int nf_ct_frag6_gather(struct net *net
+  	spin_lock_bh(&fq->q.lock);
+  
+  	ret = nf_ct_frag6_queue(fq, skb, fhdr, nhoff);
+ -	if (ret == -EPROTO) {
+ -		skb->transport_header = savethdr;
+ -		ret = 0;
+ +	if (ret < 0) {
+ +		if (ret == -EPROTO) {
+ +			skb->transport_header = savethdr;
+ +			ret = 0;
+ +		}
+ +		goto out_unlock;
+ +	}
+ +
+++<<<<<<< HEAD
+ +	/* after queue has assumed skb ownership, only 0 or -EINPROGRESS
+ +	 * must be returned.
+ +	 */
+ +	ret = -EINPROGRESS;
+ +	if (fq->q.flags == (INET_FRAG_FIRST_IN | INET_FRAG_LAST_IN) &&
+ +	    fq->q.meat == fq->q.len) {
+ +		unsigned long orefdst = skb->_skb_refdst;
+ +
+ +		skb->_skb_refdst = 0UL;
+ +		if (nf_ct_frag6_reasm(fq, skb, dev))
+ +			ret = 0;
+ +		skb->_skb_refdst = orefdst;
+ +	} else {
+ +		skb_dst_drop(skb);
+  	}
+  
+ +out_unlock:
+++=======
+++>>>>>>> a0d56cb911ca (netfilter: ipv6: nf_defrag: fix leakage of unqueued fragments)
+  	spin_unlock_bh(&fq->q.lock);
+  	inet_frag_put(&fq->q);
+  	return ret;
+* Unmerged path net/ipv6/netfilter/nf_conntrack_reasm.c
