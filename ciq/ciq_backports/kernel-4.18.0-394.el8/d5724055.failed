@@ -1,0 +1,495 @@
+RDMA/rxe: Use kzmalloc/kfree for mca
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit d572405518ffd7c21882c1f2e9a568f2e8548d0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/d5724055.failed
+
+Remove rxe_mca (was rxe_mc_elem) from rxe pools and use kzmalloc and kfree
+to allocate and free in rxe_mcast.c. Call kzalloc outside of spinlocks to
+avoid having to use GFP_ATOMIC.
+
+Link: https://lore.kernel.org/r/20220208211644.123457-3-rpearsonhpe@gmail.com
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit d572405518ffd7c21882c1f2e9a568f2e8548d0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_mcast.c
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+#	drivers/infiniband/sw/rxe/rxe_verbs.h
+diff --cc drivers/infiniband/sw/rxe/rxe_mcast.c
+index 5f1c72c1473c,2c0a2d3cc93e..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@@ -25,26 -25,20 +25,38 @@@ static int rxe_mcast_delete(struct rxe_
+  	return dev_mc_del(rxe->ndev, ll_addr);
+  }
+  
+++<<<<<<< HEAD
+ +/* caller should hold mc_grp_pool->pool_lock */
+ +static struct rxe_mc_grp *create_grp(struct rxe_dev *rxe,
+ +				     struct rxe_pool *pool,
+ +				     union ib_gid *mgid)
+ +{
+ +	int err;
+ +	struct rxe_mc_grp *grp;
+++=======
++ /* caller should hold rxe->mcg_lock */
++ static struct rxe_mcg *__rxe_create_grp(struct rxe_dev *rxe,
++ 					struct rxe_pool *pool,
++ 					union ib_gid *mgid)
++ {
++ 	struct rxe_mcg *grp;
++ 	int err;
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  
+- 	grp = rxe_alloc_locked(&rxe->mc_grp_pool);
++ 	grp = rxe_alloc_locked(pool);
+  	if (!grp)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&grp->qp_list);
+ +	spin_lock_init(&grp->mcg_lock);
+ +	grp->rxe = rxe;
+ +	rxe_add_key_locked(grp, mgid);
+ +
+++=======
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  	err = rxe_mcast_add(rxe, mgid);
+  	if (unlikely(err)) {
+- 		rxe_drop_key_locked(grp);
+  		rxe_drop_ref(grp);
+  		return ERR_PTR(err);
+  	}
+@@@ -52,47 -59,52 +77,93 @@@
+  	return grp;
+  }
+  
+++<<<<<<< HEAD
+ +int rxe_mcast_get_grp(struct rxe_dev *rxe, union ib_gid *mgid,
+ +		      struct rxe_mc_grp **grp_p)
+ +{
+ +	int err;
+ +	struct rxe_mc_grp *grp;
+++=======
++ static struct rxe_mcg *rxe_mcast_get_grp(struct rxe_dev *rxe,
++ 					 union ib_gid *mgid)
++ {
++ 	struct rxe_mcg *grp;
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  	struct rxe_pool *pool = &rxe->mc_grp_pool;
+  	unsigned long flags;
+  
+  	if (rxe->attr.max_mcast_qp_attach == 0)
+- 		return -EINVAL;
++ 		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	write_lock_irqsave(&pool->pool_lock, flags);
+ +
+ +	grp = rxe_pool_get_key_locked(pool, mgid);
+ +	if (grp)
+ +		goto done;
+ +
+ +	grp = create_grp(rxe, pool, mgid);
+ +	if (IS_ERR(grp)) {
+ +		write_unlock_irqrestore(&pool->pool_lock, flags);
+ +		err = PTR_ERR(grp);
+ +		return err;
+ +	}
+ +
+ +done:
+ +	write_unlock_irqrestore(&pool->pool_lock, flags);
+ +	*grp_p = grp;
+ +	return 0;
+ +}
+ +
+ +int rxe_mcast_add_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			   struct rxe_mc_grp *grp)
+ +{
+ +	int err;
+ +	struct rxe_mc_elem *elem;
+ +
+ +	/* check to see of the qp is already a member of the group */
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+ +	list_for_each_entry(elem, &grp->qp_list, qp_list) {
+ +		if (elem->qp == qp) {
+++=======
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	grp = rxe_pool_get_key_locked(pool, mgid);
++ 	if (!grp)
++ 		grp = __rxe_create_grp(rxe, pool, mgid);
++ 	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++ 
++ 	return grp;
++ }
++ 
++ static int rxe_mcast_add_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
++ 				  struct rxe_mcg *grp)
++ {
++ 	struct rxe_mca *mca, *tmp;
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	/* check to see if the qp is already a member of the group */
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	list_for_each_entry(mca, &grp->qp_list, qp_list) {
++ 		if (mca->qp == qp) {
++ 			spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++ 			return 0;
++ 		}
++ 	}
++ 	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++ 
++ 	/* speculative alloc new mca without using GFP_ATOMIC */
++ 	mca = kzalloc(sizeof(*mca), GFP_KERNEL);
++ 	if (!mca)
++ 		return -ENOMEM;
++ 
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	/* re-check to see if someone else just attached qp */
++ 	list_for_each_entry(tmp, &grp->qp_list, qp_list) {
++ 		if (tmp->qp == qp) {
++ 			kfree(mca);
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  			err = 0;
+  			goto out;
+  		}
+@@@ -103,21 -117,13 +176,25 @@@
+  		goto out;
+  	}
+  
+- 	elem = rxe_alloc_locked(&rxe->mc_elem_pool);
+- 	if (!elem) {
+- 		err = -ENOMEM;
+- 		goto out;
+- 	}
++ 	/* protect pointer to qp in mca */
++ 	rxe_add_ref(qp);
++ 	mca->qp = qp;
+  
+++<<<<<<< HEAD
+ +	/* each qp holds a ref on the grp */
+ +	rxe_add_ref(grp);
+ +
+ +	grp->num_qp++;
+ +	elem->qp = qp;
+ +	elem->grp = grp;
+ +
+ +	list_add(&elem->qp_list, &grp->qp_list);
+ +	list_add(&elem->grp_list, &qp->grp_list);
+++=======
++ 	atomic_inc(&qp->mcg_num);
++ 	grp->num_qp++;
++ 	list_add(&mca->qp_list, &grp->qp_list);
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  
+  	err = 0;
+  out:
+@@@ -126,72 -131,108 +203,178 @@@
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			    union ib_gid *mgid)
+ +{
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem, *tmp;
+ +
+ +	grp = rxe_pool_get_key(&rxe->mc_grp_pool, mgid);
+ +	if (!grp)
+ +		goto err1;
+ +
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+ +
+ +	list_for_each_entry_safe(elem, tmp, &grp->qp_list, qp_list) {
+ +		if (elem->qp == qp) {
+ +			list_del(&elem->qp_list);
+ +			list_del(&elem->grp_list);
+ +			grp->num_qp--;
+ +
+ +			spin_unlock_bh(&grp->mcg_lock);
+ +			spin_unlock_bh(&qp->grp_lock);
+ +			rxe_drop_ref(elem);
+ +			rxe_drop_ref(grp);	/* ref held by QP */
+ +			rxe_drop_ref(grp);	/* ref from get_key */
+ +			return 0;
+ +		}
+ +	}
+ +
+ +	spin_unlock_bh(&grp->mcg_lock);
+ +	spin_unlock_bh(&qp->grp_lock);
+ +	rxe_drop_ref(grp);			/* ref from get_key */
+ +err1:
+ +	return -EINVAL;
+++=======
++ /* caller should be holding rxe->mcg_lock */
++ static void __rxe_destroy_grp(struct rxe_mcg *grp)
++ {
++ 	/* first remove grp from red-black tree then drop ref */
++ 	rxe_drop_key_locked(grp);
++ 	rxe_drop_ref(grp);
++ 
++ 	rxe_mcast_delete(grp->rxe, &grp->mgid);
++ }
++ 
++ static void rxe_destroy_grp(struct rxe_mcg *grp)
++ {
++ 	struct rxe_dev *rxe = grp->rxe;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	__rxe_destroy_grp(grp);
++ 	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  }
+  
+ -void rxe_mc_cleanup(struct rxe_pool_elem *elem)
+ +void rxe_drop_all_mcast_groups(struct rxe_qp *qp)
+  {
+++<<<<<<< HEAD
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem;
+ +
+ +	while (1) {
+ +		spin_lock_bh(&qp->grp_lock);
+ +		if (list_empty(&qp->grp_list)) {
+ +			spin_unlock_bh(&qp->grp_lock);
+ +			break;
+ +		}
+ +		elem = list_first_entry(&qp->grp_list, struct rxe_mc_elem,
+ +					grp_list);
+ +		list_del(&elem->grp_list);
+ +		spin_unlock_bh(&qp->grp_lock);
+ +
+ +		grp = elem->grp;
+ +		spin_lock_bh(&grp->mcg_lock);
+ +		list_del(&elem->qp_list);
+ +		grp->num_qp--;
+ +		spin_unlock_bh(&grp->mcg_lock);
+ +		rxe_drop_ref(grp);
+ +		rxe_drop_ref(elem);
+ +	}
+ +}
+ +
+ +void rxe_mc_cleanup(struct rxe_pool_entry *arg)
+ +{
+ +	struct rxe_mc_grp *grp = container_of(arg, typeof(*grp), pelem);
+ +	struct rxe_dev *rxe = grp->rxe;
+++=======
++ 	/* nothing left to do for now */
++ }
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
++ 
++ static int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
++ 				   union ib_gid *mgid)
++ {
++ 	struct rxe_mcg *grp;
++ 	struct rxe_mca *mca, *tmp;
++ 	unsigned long flags;
++ 	int err;
++ 
++ 	spin_lock_irqsave(&rxe->mcg_lock, flags);
++ 	grp = rxe_pool_get_key_locked(&rxe->mc_grp_pool, mgid);
++ 	if (!grp) {
++ 		/* we didn't find the mcast group for mgid */
++ 		err = -EINVAL;
++ 		goto out_unlock;
++ 	}
++ 
++ 	list_for_each_entry_safe(mca, tmp, &grp->qp_list, qp_list) {
++ 		if (mca->qp == qp) {
++ 			list_del(&mca->qp_list);
++ 
++ 			/* if the number of qp's attached to the
++ 			 * mcast group falls to zero go ahead and
++ 			 * tear it down. This will not free the
++ 			 * object since we are still holding a ref
++ 			 * from the get key above.
++ 			 */
++ 			grp->num_qp--;
++ 			if (grp->num_qp <= 0)
++ 				__rxe_destroy_grp(grp);
++ 
++ 			atomic_dec(&qp->mcg_num);
++ 
++ 			/* drop the ref from get key. This will free the
++ 			 * object if num_qp is zero.
++ 			 */
++ 			rxe_drop_ref(grp);
++ 			kfree(mca);
++ 			err = 0;
++ 			goto out_unlock;
++ 		}
++ 	}
++ 
++ 	/* we didn't find the qp on the list */
++ 	rxe_drop_ref(grp);
++ 	err = -EINVAL;
++ 
++ out_unlock:
++ 	spin_unlock_irqrestore(&rxe->mcg_lock, flags);
++ 	return err;
++ }
+++<<<<<<< HEAD
+++=======
++ 
++ int rxe_attach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid)
++ {
++ 	int err;
++ 	struct rxe_dev *rxe = to_rdev(ibqp->device);
++ 	struct rxe_qp *qp = to_rqp(ibqp);
++ 	struct rxe_mcg *grp;
++ 
++ 	/* takes a ref on grp if successful */
++ 	grp = rxe_mcast_get_grp(rxe, mgid);
++ 	if (IS_ERR(grp))
++ 		return PTR_ERR(grp);
++ 
++ 	err = rxe_mcast_add_grp_elem(rxe, qp, grp);
++ 
++ 	/* if we failed to attach the first qp to grp tear it down */
++ 	if (grp->num_qp == 0)
++ 		rxe_destroy_grp(grp);
++ 
++ 	rxe_drop_ref(grp);
++ 	return err;
++ }
++ 
++ int rxe_detach_mcast(struct ib_qp *ibqp, union ib_gid *mgid, u16 mlid)
++ {
++ 	struct rxe_dev *rxe = to_rdev(ibqp->device);
++ 	struct rxe_qp *qp = to_rqp(ibqp);
+  
+- 	rxe_drop_key(grp);
+- 	rxe_mcast_delete(rxe, &grp->mgid);
++ 	return rxe_mcast_drop_grp_elem(rxe, qp, mgid);
+  }
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index e7b233608b61,eaf4bfc9b856..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -83,25 -83,15 +83,28 @@@ static const struct rxe_type_info 
+  	},
+  	[RXE_TYPE_MC_GRP] = {
+  		.name		= "rxe-mc_grp",
+ -		.size		= sizeof(struct rxe_mcg),
+ -		.elem_offset	= offsetof(struct rxe_mcg, elem),
+ +		.size		= sizeof(struct rxe_mc_grp),
+ +		.elem_offset	= offsetof(struct rxe_mc_grp, pelem),
+  		.cleanup	= rxe_mc_cleanup,
+  		.flags		= RXE_POOL_KEY,
+ -		.key_offset	= offsetof(struct rxe_mcg, mgid),
+ +		.key_offset	= offsetof(struct rxe_mc_grp, mgid),
+  		.key_size	= sizeof(union ib_gid),
+  	},
+++<<<<<<< HEAD
+ +	[RXE_TYPE_MC_ELEM] = {
+ +		.name		= "rxe-mc_elem",
+ +		.size		= sizeof(struct rxe_mc_elem),
+ +		.elem_offset	= offsetof(struct rxe_mc_elem, pelem),
+ +	},
+++=======
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  };
+  
+ +static inline const char *pool_name(struct rxe_pool *pool)
+ +{
+ +	return rxe_type_info[pool->type].name;
+ +}
+ +
+  static int rxe_pool_init_index(struct rxe_pool *pool, u32 max, u32 min)
+  {
+  	int err = 0;
+diff --cc drivers/infiniband/sw/rxe/rxe_verbs.h
+index 2fd73c878e17,1b0f40881895..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.h
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.h
+@@@ -365,12 -361,9 +365,16 @@@ struct rxe_mc_grp 
+  	u16			pkey;
+  };
+  
+++<<<<<<< HEAD
+ +struct rxe_mc_elem {
+ +	struct rxe_pool_entry	pelem;
+++=======
++ struct rxe_mca {
+++>>>>>>> d572405518ff (RDMA/rxe: Use kzmalloc/kfree for mca)
+  	struct list_head	qp_list;
+ +	struct list_head	grp_list;
+  	struct rxe_qp		*qp;
+ +	struct rxe_mc_grp	*grp;
+  };
+  
+  struct rxe_port {
+@@@ -402,8 -395,9 +406,7 @@@ struct rxe_dev 
+  	struct rxe_pool		mr_pool;
+  	struct rxe_pool		mw_pool;
+  	struct rxe_pool		mc_grp_pool;
+- 	struct rxe_pool		mc_elem_pool;
+  
+ -	spinlock_t		mcg_lock;
+ -
+  	spinlock_t		pending_lock; /* guard pending_mmaps */
+  	struct list_head	pending_mmaps;
+  
+diff --git a/drivers/infiniband/sw/rxe/rxe.c b/drivers/infiniband/sw/rxe/rxe.c
+index 1eb33c81b99d..eb7c5276b509 100644
+--- a/drivers/infiniband/sw/rxe/rxe.c
++++ b/drivers/infiniband/sw/rxe/rxe.c
+@@ -31,7 +31,6 @@ void rxe_dealloc(struct ib_device *ib_dev)
+ 	rxe_pool_cleanup(&rxe->mr_pool);
+ 	rxe_pool_cleanup(&rxe->mw_pool);
+ 	rxe_pool_cleanup(&rxe->mc_grp_pool);
+-	rxe_pool_cleanup(&rxe->mc_elem_pool);
+ 
+ 	if (rxe->tfm)
+ 		crypto_free_shash(rxe->tfm);
+@@ -165,15 +164,8 @@ static int rxe_init_pools(struct rxe_dev *rxe)
+ 	if (err)
+ 		goto err9;
+ 
+-	err = rxe_pool_init(rxe, &rxe->mc_elem_pool, RXE_TYPE_MC_ELEM,
+-			    rxe->attr.max_total_mcast_qp_attach);
+-	if (err)
+-		goto err10;
+-
+ 	return 0;
+ 
+-err10:
+-	rxe_pool_cleanup(&rxe->mc_grp_pool);
+ err9:
+ 	rxe_pool_cleanup(&rxe->mw_pool);
+ err8:
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mcast.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_pool.h b/drivers/infiniband/sw/rxe/rxe_pool.h
+index 837585fdbc34..f5b55f0bb999 100644
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@ -23,7 +23,6 @@ enum rxe_elem_type {
+ 	RXE_TYPE_MR,
+ 	RXE_TYPE_MW,
+ 	RXE_TYPE_MC_GRP,
+-	RXE_TYPE_MC_ELEM,
+ 	RXE_NUM_TYPES,		/* keep me last */
+ };
+ 
+@@ -155,4 +154,6 @@ void rxe_elem_release(struct kref *kref);
+ /* drop a reference on an object */
+ #define rxe_drop_ref(elem) kref_put(&(elem)->pelem.ref_cnt, rxe_elem_release)
+ 
++#define rxe_read_ref(obj) kref_read(&(obj)->elem.ref_cnt)
++
+ #endif /* RXE_POOL_H */
+* Unmerged path drivers/infiniband/sw/rxe/rxe_verbs.h
