@@ -1,0 +1,88 @@
+xprtrdma: Destroy reps from previous connection instance
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit b7ff0185e92a68e77da7edff38e124dfb25b079c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b7ff0185.failed
+
+To safely get rid of all rpcrdma_reps from a particular connection
+instance, xprtrdma has to wait until each of those reps is finished
+being used. A rep may be backing the rq_rcv_buf of an RPC that has
+just completed, for example.
+
+Since it is safe to invoke rpcrdma_rep_destroy() only in the Receive
+completion handler, simply mark reps remaining in the rb_all_reps
+list after the transport is drained. These will then be deleted as
+rpcrdma_post_recvs pulls them off the rep free list.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit b7ff0185e92a68e77da7edff38e124dfb25b079c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index e03a8d720a48,ec557e434de0..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -1060,6 -1142,52 +1060,55 @@@ out
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* No locking needed here. This function is invoked only by the
++  * Receive completion handler, or during transport shutdown.
++  */
++ static void rpcrdma_rep_destroy(struct rpcrdma_rep *rep)
++ {
++ 	list_del(&rep->rr_all);
++ 	rpcrdma_regbuf_free(rep->rr_rdmabuf);
++ 	kfree(rep);
++ }
++ 
++ static struct rpcrdma_rep *rpcrdma_rep_get_locked(struct rpcrdma_buffer *buf)
++ {
++ 	struct llist_node *node;
++ 
++ 	/* Calls to llist_del_first are required to be serialized */
++ 	node = llist_del_first(&buf->rb_free_reps);
++ 	if (!node)
++ 		return NULL;
++ 	return llist_entry(node, struct rpcrdma_rep, rr_node);
++ }
++ 
++ static void rpcrdma_rep_put(struct rpcrdma_buffer *buf,
++ 			    struct rpcrdma_rep *rep)
++ {
++ 	llist_add(&rep->rr_node, &buf->rb_free_reps);
++ }
++ 
++ static void rpcrdma_reps_unmap(struct rpcrdma_xprt *r_xprt)
++ {
++ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
++ 	struct rpcrdma_rep *rep;
++ 
++ 	list_for_each_entry(rep, &buf->rb_all_reps, rr_all) {
++ 		rpcrdma_regbuf_dma_unmap(rep->rr_rdmabuf);
++ 		rep->rr_temp = true;
++ 	}
++ }
++ 
++ static void rpcrdma_reps_destroy(struct rpcrdma_buffer *buf)
++ {
++ 	struct rpcrdma_rep *rep;
++ 
++ 	while ((rep = rpcrdma_rep_get_locked(buf)) != NULL)
++ 		rpcrdma_rep_destroy(rep);
++ }
++ 
+++>>>>>>> b7ff0185e92a (xprtrdma: Destroy reps from previous connection instance)
+  /**
+   * rpcrdma_buffer_create - Create initial set of req/rep objects
+   * @r_xprt: transport instance to (re)initialize
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
