@@ -1,0 +1,209 @@
+mt76: mt7921: introduce mt7921_dma_{enable,disable} utilities
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 5536e7354aa8abf0e27a1bc58f4b4653b4884bdf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5536e735.failed
+
+Introduce mt7921_dma_enable and mt7921_dma_disable utilities routine in
+order for code reusing between mt7921_dma_reset and mt7921_dma_init.
+This is a preliminary patch to reset dma during device driver_own
+request.
+
+	Signed-off-by: Sean Wang <sean.wang@mediatek.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 5536e7354aa8abf0e27a1bc58f4b4653b4884bdf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+index cd9665610284,fb7f98d92377..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+@@@ -198,11 -221,135 +198,141 @@@ static u32 mt7921_rmw(struct mt76_dev *
+  	return dev->bus_ops->rmw(mdev, addr, mask, val);
+  }
+  
+- static int mt7921_dmashdl_disabled(struct mt7921_dev *dev)
++ static int mt7921_dma_disable(struct mt7921_dev *dev, bool force)
+  {
+++<<<<<<< HEAD
+ +	mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0, MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
+ +	mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);
+ +
+++=======
++ 	if (force) {
++ 		/* reset */
++ 		mt76_clear(dev, MT_WFDMA0_RST,
++ 			   MT_WFDMA0_RST_DMASHDL_ALL_RST |
++ 			   MT_WFDMA0_RST_LOGIC_RST);
++ 
++ 		mt76_set(dev, MT_WFDMA0_RST,
++ 			 MT_WFDMA0_RST_DMASHDL_ALL_RST |
++ 			 MT_WFDMA0_RST_LOGIC_RST);
++ 	}
++ 
++ 	/* disable dmashdl */
++ 	mt76_clear(dev, MT_WFDMA0_GLO_CFG_EXT0,
++ 		   MT_WFDMA0_CSR_TX_DMASHDL_ENABLE);
++ 	mt76_set(dev, MT_DMASHDL_SW_CONTROL, MT_DMASHDL_DMASHDL_BYPASS);
++ 
++ 	/* disable WFDMA0 */
++ 	mt76_clear(dev, MT_WFDMA0_GLO_CFG,
++ 		   MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN |
++ 		   MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
++ 		   MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
++ 		   MT_WFDMA0_GLO_CFG_OMIT_RX_INFO |
++ 		   MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2);
++ 
++ 	if (!mt76_poll(dev, MT_WFDMA0_GLO_CFG,
++ 		       MT_WFDMA0_GLO_CFG_TX_DMA_BUSY |
++ 		       MT_WFDMA0_GLO_CFG_RX_DMA_BUSY, 0, 1000))
++ 		return -ETIMEDOUT;
++ 
++ 	return 0;
++ }
++ 
++ static int mt7921_dma_enable(struct mt7921_dev *dev)
++ {
++ 	/* configure perfetch settings */
++ 	mt7921_dma_prefetch(dev);
++ 
++ 	/* reset dma idx */
++ 	mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
++ 
++ 	/* configure delay interrupt */
++ 	mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
++ 
++ 	mt76_set(dev, MT_WFDMA0_GLO_CFG,
++ 		 MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
++ 		 MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
++ 		 MT_WFDMA0_GLO_CFG_CLK_GAT_DIS |
++ 		 MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
++ 		 MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
++ 		 MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2);
++ 
++ 	mt76_set(dev, MT_WFDMA0_GLO_CFG,
++ 		 MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
++ 
++ 	mt76_set(dev, MT_WFDMA_DUMMY_CR, MT_WFDMA_NEED_REINIT);
++ 
++ 	/* enable interrupts for TX/RX rings */
++ 	mt7921_irq_enable(dev,
++ 			  MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
++ 			  MT_INT_MCU_CMD);
++ 	mt76_set(dev, MT_MCU2HOST_SW_INT_ENA, MT_MCU_CMD_WAKE_RX_PCIE);
++ 
++ 	return 0;
++ }
++ 
++ static int mt7921_dma_reset(struct mt7921_dev *dev, bool force)
++ {
++ 	int i, err;
++ 
++ 	err = mt7921_dma_disable(dev, force);
++ 	if (err)
++ 		return err;
++ 
++ 	/* reset hw queues */
++ 	for (i = 0; i < __MT_TXQ_MAX; i++)
++ 		mt76_queue_reset(dev, dev->mphy.q_tx[i]);
++ 
++ 	for (i = 0; i < __MT_MCUQ_MAX; i++)
++ 		mt76_queue_reset(dev, dev->mt76.q_mcu[i]);
++ 
++ 	mt76_for_each_q_rx(&dev->mt76, i)
++ 		mt76_queue_reset(dev, &dev->mt76.q_rx[i]);
++ 
++ 	mt76_tx_status_check(&dev->mt76, NULL, true);
++ 
++ 	return mt7921_dma_enable(dev);
++ }
++ 
++ int mt7921_wfsys_reset(struct mt7921_dev *dev)
++ {
++ 	mt76_set(dev, 0x70002600, BIT(0));
++ 	msleep(200);
++ 	mt76_clear(dev, 0x70002600, BIT(0));
++ 
++ 	if (!__mt76_poll_msec(&dev->mt76, MT_WFSYS_SW_RST_B,
++ 			      WFSYS_SW_INIT_DONE, WFSYS_SW_INIT_DONE, 500))
++ 		return -ETIMEDOUT;
++ 
++ 	return 0;
++ }
++ 
++ int mt7921_wpdma_reset(struct mt7921_dev *dev, bool force)
++ {
++ 	int i, err;
++ 
++ 	/* clean up hw queues */
++ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++)
++ 		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);
++ 
++ 	for (i = 0; i < ARRAY_SIZE(dev->mt76.q_mcu); i++)
++ 		mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[i], true);
++ 
++ 	mt76_for_each_q_rx(&dev->mt76, i)
++ 		mt76_queue_rx_cleanup(dev, &dev->mt76.q_rx[i]);
++ 
++ 	if (force) {
++ 		err = mt7921_wfsys_reset(dev);
++ 		if (err)
++ 			return err;
++ 	}
++ 	err = mt7921_dma_reset(dev, force);
++ 	if (err)
++ 		return err;
++ 
++ 	mt76_for_each_q_rx(&dev->mt76, i)
++ 		mt76_queue_rx_reset(dev, i);
++ 
+++>>>>>>> 5536e7354aa8 (mt76: mt7921: introduce mt7921_dma_{enable,disable} utilities)
+  	return 0;
+  }
+  
+@@@ -303,33 -428,7 +411,37 @@@ int mt7921_dma_init(struct mt7921_dev *
+  			  mt7921_poll_tx, NAPI_POLL_WEIGHT);
+  	napi_enable(&dev->mt76.tx_napi);
+  
+++<<<<<<< HEAD
+ +	/* configure perfetch settings */
+ +	mt7921_dma_prefetch(dev);
+ +
+ +	/* reset dma idx */
+ +	mt76_wr(dev, MT_WFDMA0_RST_DTX_PTR, ~0);
+ +
+ +	/* configure delay interrupt */
+ +	mt76_wr(dev, MT_WFDMA0_PRI_DLY_INT_CFG0, 0);
+ +
+ +	mt76_set(dev, MT_WFDMA0_GLO_CFG,
+ +		 MT_WFDMA0_GLO_CFG_TX_WB_DDONE |
+ +		 MT_WFDMA0_GLO_CFG_FIFO_LITTLE_ENDIAN |
+ +		 MT_WFDMA0_GLO_CFG_CLK_GAT_DIS |
+ +		 MT_WFDMA0_GLO_CFG_OMIT_TX_INFO |
+ +		 MT_WFDMA0_GLO_CFG_CSR_DISP_BASE_PTR_CHAIN_EN |
+ +		 MT_WFDMA0_GLO_CFG_OMIT_RX_INFO_PFET2);
+ +
+ +	mt76_set(dev, MT_WFDMA0_GLO_CFG,
+ +		 MT_WFDMA0_GLO_CFG_TX_DMA_EN | MT_WFDMA0_GLO_CFG_RX_DMA_EN);
+ +
+ +	mt76_set(dev, 0x54000120, BIT(1));
+ +
+ +	/* enable interrupts for TX/RX rings */
+ +	mt7921_irq_enable(dev, MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
+ +			  MT_INT_MCU_CMD);
+ +
+ +	return 0;
+++=======
++ 	return mt7921_dma_enable(dev);
+++>>>>>>> 5536e7354aa8 (mt76: mt7921: introduce mt7921_dma_{enable,disable} utilities)
+  }
+  
+  void mt7921_dma_cleanup(struct mt7921_dev *dev)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/dma.c
