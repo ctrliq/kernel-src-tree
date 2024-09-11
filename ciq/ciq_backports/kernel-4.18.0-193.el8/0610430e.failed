@@ -1,0 +1,275 @@
+HID: logitech-hidpp: add input_device ptr to struct hidpp_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [hid] logitech-hidpp: add input_device ptr to struct hidpp_device (Benjamin Tissoires) [1740778]
+Rebuild_FUZZ: 95.93%
+commit-author Hans de Goede <hdegoede@redhat.com>
+commit 0610430e3dea51c9a00565af685745898048fa2b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0610430e.failed
+
+Most device-class specific code needs access to the input_device, instead
+of storing that in the class specific data-struct, simply store this into
+the hidpp_device struct itself.
+
+In case of the m560 this avoids the need for having private data at all
+and this will also avoid the need to add private data in some upcoming
+patches.
+
+	Signed-off-by: Hans de Goede <hdegoede@redhat.com>
+	Signed-off-by: Benjamin Tissoires <benjamin.tissoires@redhat.com>
+(cherry picked from commit 0610430e3dea51c9a00565af685745898048fa2b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/hid/hid-logitech-hidpp.c
+diff --cc drivers/hid/hid-logitech-hidpp.c
+index adbbeea06947,5ef3f76c3f66..000000000000
+--- a/drivers/hid/hid-logitech-hidpp.c
++++ b/drivers/hid/hid-logitech-hidpp.c
+@@@ -136,8 -137,27 +136,30 @@@ struct hidpp_battery 
+  	bool online;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct hidpp_scroll_counter - Utility class for processing high-resolution
++  *                             scroll events.
++  * @dev: the input device for which events should be reported.
++  * @wheel_multiplier: the scalar multiplier to be applied to each wheel event
++  * @remainder: counts the number of high-resolution units moved since the last
++  *             low-resolution event (REL_WHEEL or REL_HWHEEL) was sent. Should
++  *             only be used by class methods.
++  * @direction: direction of last movement (1 or -1)
++  * @last_time: last event time, used to reset remainder after inactivity
++  */
++ struct hidpp_scroll_counter {
++ 	int wheel_multiplier;
++ 	int remainder;
++ 	int direction;
++ 	unsigned long long last_time;
++ };
++ 
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  struct hidpp_device {
+  	struct hid_device *hid_dev;
++ 	struct input_dev *input;
+  	struct mutex send_mutex;
+  	void *send_receive_buf;
+  	char *name;		/* will never be NULL and should not be freed */
+@@@ -398,6 -419,68 +420,71 @@@ static void hidpp_prefix_name(char **na
+  	*name = new_name;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * hidpp_scroll_counter_handle_scroll() - Send high- and low-resolution scroll
++  *                                        events given a high-resolution wheel
++  *                                        movement.
++  * @counter: a hid_scroll_counter struct describing the wheel.
++  * @hi_res_value: the movement of the wheel, in the mouse's high-resolution
++  *                units.
++  *
++  * Given a high-resolution movement, this function converts the movement into
++  * fractions of 120 and emits high-resolution scroll events for the input
++  * device. It also uses the multiplier from &struct hid_scroll_counter to
++  * emit low-resolution scroll events when appropriate for
++  * backwards-compatibility with userspace input libraries.
++  */
++ static void hidpp_scroll_counter_handle_scroll(struct input_dev *input_dev,
++ 					       struct hidpp_scroll_counter *counter,
++ 					       int hi_res_value)
++ {
++ 	int low_res_value, remainder, direction;
++ 	unsigned long long now, previous;
++ 
++ 	hi_res_value = hi_res_value * 120/counter->wheel_multiplier;
++ 	input_report_rel(input_dev, REL_WHEEL_HI_RES, hi_res_value);
++ 
++ 	remainder = counter->remainder;
++ 	direction = hi_res_value > 0 ? 1 : -1;
++ 
++ 	now = sched_clock();
++ 	previous = counter->last_time;
++ 	counter->last_time = now;
++ 	/*
++ 	 * Reset the remainder after a period of inactivity or when the
++ 	 * direction changes. This prevents the REL_WHEEL emulation point
++ 	 * from sliding for devices that don't always provide the same
++ 	 * number of movements per detent.
++ 	 */
++ 	if (now - previous > 1000000000 || direction != counter->direction)
++ 		remainder = 0;
++ 
++ 	counter->direction = direction;
++ 	remainder += hi_res_value;
++ 
++ 	/* Some wheels will rest 7/8ths of a detent from the previous detent
++ 	 * after slow movement, so we want the threshold for low-res events to
++ 	 * be in the middle between two detents (e.g. after 4/8ths) as
++ 	 * opposed to on the detents themselves (8/8ths).
++ 	 */
++ 	if (abs(remainder) >= 60) {
++ 		/* Add (or subtract) 1 because we want to trigger when the wheel
++ 		 * is half-way to the next detent (i.e. scroll 1 detent after a
++ 		 * 1/2 detent movement, 2 detents after a 1 1/2 detent movement,
++ 		 * etc.).
++ 		 */
++ 		low_res_value = remainder / 120;
++ 		if (low_res_value == 0)
++ 			low_res_value = (hi_res_value > 0 ? 1 : -1);
++ 		input_report_rel(input_dev, REL_WHEEL, low_res_value);
++ 		remainder -= low_res_value * 120;
++ 	}
++ 	counter->remainder = remainder;
++ }
++ 
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  /* -------------------------------------------------------------------------- */
+  /* HIDP++ 1.0 commands                                                        */
+  /* -------------------------------------------------------------------------- */
+@@@ -2519,51 -2577,55 +2583,84 @@@ static int m560_raw_event(struct hid_de
+  
+  		int v;
+  
+- 		input_report_key(mydata->input, BTN_LEFT,
++ 		input_report_key(hidpp->input, BTN_LEFT,
+  			!!(data[1] & M560_MOUSE_BTN_LEFT));
+- 		input_report_key(mydata->input, BTN_RIGHT,
++ 		input_report_key(hidpp->input, BTN_RIGHT,
+  			!!(data[1] & M560_MOUSE_BTN_RIGHT));
+  
+++<<<<<<< HEAD
+ +		if (data[1] & M560_MOUSE_BTN_WHEEL_LEFT)
+ +			input_report_rel(mydata->input, REL_HWHEEL, -1);
+ +		else if (data[1] & M560_MOUSE_BTN_WHEEL_RIGHT)
+ +			input_report_rel(mydata->input, REL_HWHEEL, 1);
+++=======
++ 		if (data[1] & M560_MOUSE_BTN_WHEEL_LEFT) {
++ 			input_report_rel(hidpp->input, REL_HWHEEL, -1);
++ 			input_report_rel(hidpp->input, REL_HWHEEL_HI_RES,
++ 					 -120);
++ 		} else if (data[1] & M560_MOUSE_BTN_WHEEL_RIGHT) {
++ 			input_report_rel(hidpp->input, REL_HWHEEL, 1);
++ 			input_report_rel(hidpp->input, REL_HWHEEL_HI_RES,
++ 					 120);
++ 		}
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  
+  		v = hid_snto32(hid_field_extract(hdev, data+3, 0, 12), 12);
+- 		input_report_rel(mydata->input, REL_X, v);
++ 		input_report_rel(hidpp->input, REL_X, v);
+  
+  		v = hid_snto32(hid_field_extract(hdev, data+3, 12, 12), 12);
+- 		input_report_rel(mydata->input, REL_Y, v);
++ 		input_report_rel(hidpp->input, REL_Y, v);
+  
+  		v = hid_snto32(data[6], 8);
+++<<<<<<< HEAD
+ +		hid_scroll_counter_handle_scroll(
+ +				&hidpp->vertical_wheel_counter, v);
+++=======
++ 		if (v != 0)
++ 			hidpp_scroll_counter_handle_scroll(hidpp->input,
++ 					&hidpp->vertical_wheel_counter, v);
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  
+- 		input_sync(mydata->input);
++ 		input_sync(hidpp->input);
+  	}
+  
+  	return 1;
+  }
+  
+  static void m560_populate_input(struct hidpp_device *hidpp,
+ -				struct input_dev *input_dev)
+ +		struct input_dev *input_dev, bool origin_is_hid_core)
+  {
+- 	struct m560_private_data *mydata = hidpp->private_data;
++ 	__set_bit(EV_KEY, input_dev->evbit);
++ 	__set_bit(BTN_MIDDLE, input_dev->keybit);
++ 	__set_bit(BTN_RIGHT, input_dev->keybit);
++ 	__set_bit(BTN_LEFT, input_dev->keybit);
++ 	__set_bit(BTN_BACK, input_dev->keybit);
++ 	__set_bit(BTN_FORWARD, input_dev->keybit);
+  
+++<<<<<<< HEAD
+ +	mydata->input = input_dev;
+ +
+ +	__set_bit(EV_KEY, mydata->input->evbit);
+ +	__set_bit(BTN_MIDDLE, mydata->input->keybit);
+ +	__set_bit(BTN_RIGHT, mydata->input->keybit);
+ +	__set_bit(BTN_LEFT, mydata->input->keybit);
+ +	__set_bit(BTN_BACK, mydata->input->keybit);
+ +	__set_bit(BTN_FORWARD, mydata->input->keybit);
+ +
+ +	__set_bit(EV_REL, mydata->input->evbit);
+ +	__set_bit(REL_X, mydata->input->relbit);
+ +	__set_bit(REL_Y, mydata->input->relbit);
+ +	__set_bit(REL_WHEEL, mydata->input->relbit);
+ +	__set_bit(REL_HWHEEL, mydata->input->relbit);
+++=======
++ 	__set_bit(EV_REL, input_dev->evbit);
++ 	__set_bit(REL_X, input_dev->relbit);
++ 	__set_bit(REL_Y, input_dev->relbit);
++ 	__set_bit(REL_WHEEL, input_dev->relbit);
++ 	__set_bit(REL_HWHEEL, input_dev->relbit);
++ 	__set_bit(REL_WHEEL_HI_RES, input_dev->relbit);
++ 	__set_bit(REL_HWHEEL_HI_RES, input_dev->relbit);
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  }
+  
+  static int m560_input_mapping(struct hid_device *hdev, struct hid_input *hi,
+@@@ -2771,17 -2803,14 +2868,23 @@@ static int hidpp_input_mapped(struct hi
+  
+  
+  static void hidpp_populate_input(struct hidpp_device *hidpp,
+ -				 struct input_dev *input)
+ +		struct input_dev *input, bool origin_is_hid_core)
+  {
++ 	hidpp->input = input;
++ 
+  	if (hidpp->quirks & HIDPP_QUIRK_CLASS_WTP)
+ -		wtp_populate_input(hidpp, input);
+ +		wtp_populate_input(hidpp, input, origin_is_hid_core);
+  	else if (hidpp->quirks & HIDPP_QUIRK_CLASS_M560)
+++<<<<<<< HEAD
+ +		m560_populate_input(hidpp, input, origin_is_hid_core);
+ +
+ +	if (hidpp->quirks & HIDPP_QUIRK_HI_RES_SCROLL) {
+ +		input_set_capability(input, EV_REL, REL_WHEEL_HI_RES);
+ +		hidpp->vertical_wheel_counter.dev = input;
+ +	}
+++=======
++ 		m560_populate_input(hidpp, input);
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  }
+  
+  static int hidpp_input_configured(struct hid_device *hdev,
+@@@ -2911,13 -2951,13 +3014,20 @@@ static int hidpp_event(struct hid_devic
+  	/* A scroll event may occur before the multiplier has been retrieved or
+  	 * the input device set, or high-res scroll enabling may fail. In such
+  	 * cases we must return early (falling back to default behaviour) to
+ -	 * avoid a crash in hidpp_scroll_counter_handle_scroll.
+ +	 * avoid a crash in hid_scroll_counter_handle_scroll.
+  	 */
+  	if (!(hidpp->quirks & HIDPP_QUIRK_HI_RES_SCROLL) || value == 0
+++<<<<<<< HEAD
+ +	    || counter->dev == NULL || counter->resolution_multiplier == 0)
+ +		return 0;
+ +
+ +	hid_scroll_counter_handle_scroll(counter, value);
+++=======
++ 	    || hidpp->input == NULL || counter->wheel_multiplier == 0)
++ 		return 0;
++ 
++ 	hidpp_scroll_counter_handle_scroll(hidpp->input, counter, value);
+++>>>>>>> 0610430e3dea (HID: logitech-hidpp: add input_device ptr to struct hidpp_device)
+  	return 1;
+  }
+  
+* Unmerged path drivers/hid/hid-logitech-hidpp.c
