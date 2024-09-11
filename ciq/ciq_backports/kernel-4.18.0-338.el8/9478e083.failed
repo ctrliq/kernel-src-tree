@@ -1,0 +1,101 @@
+ch_ktls: packet handling prior to start marker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 9478e083941c873d60a97b232760a14dec6c69d3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/9478e083.failed
+
+There could be a case where ACK for tls exchanges prior to start
+marker is missed out, and by the time tls is offloaded. This pkt
+should not be discarded and handled carefully. It could be
+plaintext alone or plaintext + finish as well.
+
+Fixes: 5a4b9fe7fece ("cxgb4/chcr: complete record tx handling")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 9478e083941c873d60a97b232760a14dec6c69d3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 074af13f5bc4,bbda71b7f98b..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1935,12 -1909,63 +1935,72 @@@ int chcr_ktls_xmit(struct sk_buff *skb
+  			goto out;
+  		}
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		if (unlikely(tls_record_is_start_marker(record))) {
+ +			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+ +			atomic64_inc(&stats->ktls_tx_skip_no_sync_data);
+ +			goto out;
+ +		}
+ +
+++=======
++ 		tls_end_offset = record->end_seq - tcp_seq;
++ 
++ 		pr_debug("seq 0x%x, end_seq 0x%x prev_seq 0x%x, datalen 0x%x\n",
++ 			 tcp_seq, record->end_seq, tx_info->prev_seq, data_len);
++ 		/* update tcb for the skb */
++ 		if (skb_data_len == data_len) {
++ 			u32 tx_max = tcp_seq;
++ 
++ 			if (!tls_record_is_start_marker(record) &&
++ 			    tls_end_offset < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
++ 				tx_max = record->end_seq -
++ 					TLS_CIPHER_AES_GCM_128_TAG_SIZE;
++ 
++ 			ret = chcr_ktls_xmit_tcb_cpls(tx_info, q, tx_max,
++ 						      ntohl(th->ack_seq),
++ 						      ntohs(th->window),
++ 						      tls_end_offset !=
++ 						      record->len);
++ 			if (ret) {
++ 				spin_unlock_irqrestore(&tx_ctx->base.lock,
++ 						       flags);
++ 				goto out;
++ 			}
++ 		}
++ 
++ 		if (unlikely(tls_record_is_start_marker(record))) {
++ 			atomic64_inc(&port_stats->ktls_tx_skip_no_sync_data);
++ 			/* If tls_end_offset < data_len, means there is some
++ 			 * data after start marker, which needs encryption, send
++ 			 * plaintext first and take skb refcount. else send out
++ 			 * complete pkt as plaintext.
++ 			 */
++ 			if (tls_end_offset < data_len)
++ 				skb_get(skb);
++ 			else
++ 				tls_end_offset = data_len;
++ 
++ 			ret = chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
++ 						    (!th->fin && th->psh), q,
++ 						    tx_info->port_id, NULL,
++ 						    tls_end_offset, skb_offset,
++ 						    0);
++ 
++ 			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
++ 			if (ret) {
++ 				/* free the refcount taken earlier */
++ 				if (tls_end_offset < data_len)
++ 					dev_kfree_skb_any(skb);
++ 				goto out;
++ 			}
++ 
++ 			data_len -= tls_end_offset;
++ 			tcp_seq = record->end_seq;
++ 			skb_offset += tls_end_offset;
++ 			continue;
++ 		}
++ 
+++>>>>>>> 9478e083941c (ch_ktls: packet handling prior to start marker):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		/* increase page reference count of the record, so that there
+  		 * won't be any chance of page free in middle if in case stack
+  		 * receives ACK and try to delete the record.
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
