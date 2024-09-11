@@ -1,0 +1,352 @@
+RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 526a12c8c56e80930621cedcf8b5f2fc3a169037
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/526a12c8.failed
+
+This code is trying to attach a list of counters grouped into 4 groups to
+the ib_port sysfs. Instead of creating a bunch of kobjects simply express
+everything naturally as an ib_port_attribute and add a single
+attribute_groups list.
+
+Remove all the naked kobject manipulations.
+
+Link: https://lore.kernel.org/r/0d5a7241ee0fe66622de04fcbaafaf6a791d5c7c.1623427137.git.leonro@nvidia.com
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 526a12c8c56e80930621cedcf8b5f2fc3a169037)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cm.c
+#	drivers/infiniband/core/core_priv.h
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/cm.c
+index 98486d3832e9,4a92729068eb..000000000000
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@@ -202,10 -158,8 +160,15 @@@ struct cm_counter_attribute 
+  struct cm_port {
+  	struct cm_device *cm_dev;
+  	struct ib_mad_agent *mad_agent;
+++<<<<<<< HEAD
+ +	u8 port_num;
+ +	struct list_head cm_priv_prim_list;
+ +	struct list_head cm_priv_altr_list;
+ +	struct cm_counter_group counter_group[CM_COUNTER_GROUPS];
+++=======
++ 	u32 port_num;
++ 	atomic_long_t counters[CM_COUNTER_GROUPS][CM_ATTR_COUNT];
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  };
+  
+  struct cm_device {
+@@@ -4298,59 -4251,74 +4258,79 @@@ int ib_cm_init_qp_attr(struct ib_cm_id 
+  }
+  EXPORT_SYMBOL(ib_cm_init_qp_attr);
+  
+- static ssize_t cm_show_counter(struct kobject *obj, struct attribute *attr,
+- 			       char *buf)
++ static ssize_t cm_show_counter(struct ib_device *ibdev, u32 port_num,
++ 			       struct ib_port_attribute *attr, char *buf)
+  {
+- 	struct cm_counter_group *group;
+- 	struct cm_counter_attribute *cm_attr;
++ 	struct cm_counter_attribute *cm_attr =
++ 		container_of(attr, struct cm_counter_attribute, attr);
++ 	struct cm_device *cm_dev = ib_get_client_data(ibdev, &cm_client);
+  
+- 	group = container_of(obj, struct cm_counter_group, obj);
+- 	cm_attr = container_of(attr, struct cm_counter_attribute, attr);
++ 	if (WARN_ON(!cm_dev))
++ 		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	return sprintf(buf, "%ld\n",
+ +		       atomic_long_read(&group->counter[cm_attr->index]));
+++=======
++ 	return sysfs_emit(
++ 		buf, "%ld\n",
++ 		atomic_long_read(
++ 			&cm_dev->port[port_num - 1]
++ 				 ->counters[cm_attr->group][cm_attr->index]));
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  }
+  
+- static const struct sysfs_ops cm_counter_ops = {
+- 	.show = cm_show_counter
+- };
+- 
+- static struct kobj_type cm_counter_obj_type = {
+- 	.sysfs_ops = &cm_counter_ops,
+- 	.default_attrs = cm_counter_default_attrs
+- };
+- 
+- static int cm_create_port_fs(struct cm_port *port)
+- {
+- 	int i, ret;
+- 
+- 	for (i = 0; i < CM_COUNTER_GROUPS; i++) {
+- 		ret = ib_port_register_module_stat(port->cm_dev->ib_device,
+- 						   port->port_num,
+- 						   &port->counter_group[i].obj,
+- 						   &cm_counter_obj_type,
+- 						   counter_group_names[i]);
+- 		if (ret)
+- 			goto error;
++ #define CM_COUNTER_ATTR(_name, _group, _index)                                 \
++ 	{                                                                      \
++ 		.attr = __ATTR(_name, 0444, cm_show_counter, NULL),            \
++ 		.group = _group, .index = _index                               \
+  	}
+  
+- 	return 0;
+- 
+- error:
+- 	while (i--)
+- 		ib_port_unregister_module_stat(&port->counter_group[i].obj);
+- 	return ret;
+- 
+- }
+- 
+- static void cm_remove_port_fs(struct cm_port *port)
+- {
+- 	int i;
+- 
+- 	for (i = 0; i < CM_COUNTER_GROUPS; i++)
+- 		ib_port_unregister_module_stat(&port->counter_group[i].obj);
++ #define CM_COUNTER_GROUP(_group, _name)                                        \
++ 	static struct cm_counter_attribute cm_counter_attr_##_group[] = {      \
++ 		CM_COUNTER_ATTR(req, _group, CM_REQ_COUNTER),                  \
++ 		CM_COUNTER_ATTR(mra, _group, CM_MRA_COUNTER),                  \
++ 		CM_COUNTER_ATTR(rej, _group, CM_REJ_COUNTER),                  \
++ 		CM_COUNTER_ATTR(rep, _group, CM_REP_COUNTER),                  \
++ 		CM_COUNTER_ATTR(rtu, _group, CM_RTU_COUNTER),                  \
++ 		CM_COUNTER_ATTR(dreq, _group, CM_DREQ_COUNTER),                \
++ 		CM_COUNTER_ATTR(drep, _group, CM_DREP_COUNTER),                \
++ 		CM_COUNTER_ATTR(sidr_req, _group, CM_SIDR_REQ_COUNTER),        \
++ 		CM_COUNTER_ATTR(sidr_rep, _group, CM_SIDR_REP_COUNTER),        \
++ 		CM_COUNTER_ATTR(lap, _group, CM_LAP_COUNTER),                  \
++ 		CM_COUNTER_ATTR(apr, _group, CM_APR_COUNTER),                  \
++ 	};                                                                     \
++ 	static struct attribute *cm_counter_attrs_##_group[] = {               \
++ 		&cm_counter_attr_##_group[0].attr.attr,                        \
++ 		&cm_counter_attr_##_group[1].attr.attr,                        \
++ 		&cm_counter_attr_##_group[2].attr.attr,                        \
++ 		&cm_counter_attr_##_group[3].attr.attr,                        \
++ 		&cm_counter_attr_##_group[4].attr.attr,                        \
++ 		&cm_counter_attr_##_group[5].attr.attr,                        \
++ 		&cm_counter_attr_##_group[6].attr.attr,                        \
++ 		&cm_counter_attr_##_group[7].attr.attr,                        \
++ 		&cm_counter_attr_##_group[8].attr.attr,                        \
++ 		&cm_counter_attr_##_group[9].attr.attr,                        \
++ 		&cm_counter_attr_##_group[10].attr.attr,                       \
++ 		NULL,                                                          \
++ 	};                                                                     \
++ 	static const struct attribute_group cm_counter_group_##_group = {      \
++ 		.name = _name,                                                 \
++ 		.attrs = cm_counter_attrs_##_group,                            \
++ 	};
+  
+- }
++ CM_COUNTER_GROUP(CM_XMIT, "cm_tx_msgs")
++ CM_COUNTER_GROUP(CM_XMIT_RETRIES, "cm_tx_retries")
++ CM_COUNTER_GROUP(CM_RECV, "cm_rx_msgs")
++ CM_COUNTER_GROUP(CM_RECV_DUPLICATES, "cm_rx_duplicates")
++ 
++ static const struct attribute_group *cm_counter_groups[] = {
++ 	&cm_counter_group_CM_XMIT,
++ 	&cm_counter_group_CM_XMIT_RETRIES,
++ 	&cm_counter_group_CM_RECV,
++ 	&cm_counter_group_CM_RECV_DUPLICATES,
++ 	NULL,
++ };
+  
+  static int cm_add_one(struct ib_device *ib_device)
+  {
+@@@ -4392,10 -4364,8 +4374,15 @@@
+  		port->cm_dev = cm_dev;
+  		port->port_num = i;
+  
+++<<<<<<< HEAD
+ +		INIT_LIST_HEAD(&port->cm_priv_prim_list);
+ +		INIT_LIST_HEAD(&port->cm_priv_altr_list);
+ +
+ +		ret = cm_create_port_fs(port);
+++=======
++ 		ret = ib_port_register_client_groups(ib_device, i,
++ 						     cm_counter_groups);
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  		if (ret)
+  			goto error1;
+  
+@@@ -4446,11 -4413,11 +4431,16 @@@ error1
+  		port = cm_dev->port[i-1];
+  		ib_modify_port(ib_device, port->port_num, 0, &port_modify);
+  		ib_unregister_mad_agent(port->mad_agent);
+++<<<<<<< HEAD
+ +		cm_remove_port_fs(port);
+ +		kfree(port);
+++=======
++ 		ib_port_unregister_client_groups(ib_device, i,
++ 						 cm_counter_groups);
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  	}
+  free:
+ -	cm_device_put(cm_dev);
+ +	kfree(cm_dev);
+  	return ret;
+  }
+  
+@@@ -4493,16 -4454,19 +4483,23 @@@ static void cm_remove_one(struct ib_dev
+  		 * after that we can call the unregister_mad_agent
+  		 */
+  		flush_workqueue(cm.wq);
+ -		/*
+ -		 * The above ensures no call paths from the work are running,
+ -		 * the remaining paths all take the mad_agent_lock.
+ -		 */
+ -		spin_lock(&cm_dev->mad_agent_lock);
+ +		spin_lock_irq(&cm.state_lock);
+ +		cur_mad_agent = port->mad_agent;
+  		port->mad_agent = NULL;
+++<<<<<<< HEAD
+ +		spin_unlock_irq(&cm.state_lock);
+ +		ib_unregister_mad_agent(cur_mad_agent);
+ +		cm_remove_port_fs(port);
+ +		kfree(port);
+++=======
++ 		spin_unlock(&cm_dev->mad_agent_lock);
++ 		ib_unregister_mad_agent(mad_agent);
++ 		ib_port_unregister_client_groups(ib_device, i,
++ 						 cm_counter_groups);
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  	}
+  
+ -	cm_device_put(cm_dev);
+ +	kfree(cm_dev);
+  }
+  
+  static int __init ib_cm_init(void)
+diff --cc drivers/infiniband/core/core_priv.h
+index 6cae355ad0d7,78782cce47a1..000000000000
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@@ -382,10 -380,12 +382,17 @@@ struct rdma_hw_stats *ib_get_hw_stats_p
+  
+  int rdma_compatdev_set(u8 enable);
+  
+++<<<<<<< HEAD
+ +int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
+ +				 struct kobject *kobj, struct kobj_type *ktype,
+ +				 const char *name);
+ +void ib_port_unregister_module_stat(struct kobject *kobj);
+++=======
++ int ib_port_register_client_groups(struct ib_device *ibdev, u32 port_num,
++ 				   const struct attribute_group **groups);
++ void ib_port_unregister_client_groups(struct ib_device *ibdev, u32 port_num,
++ 				     const struct attribute_group **groups);
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  
+  int ib_device_set_netns_put(struct sk_buff *skb,
+  			    struct ib_device *dev, u32 ns_fd);
+diff --cc drivers/infiniband/core/sysfs.c
+index 1ae9eecb09be,e550a7eb37f6..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -1385,70 -1447,27 +1385,56 @@@ err_put
+  	return ret;
+  }
+  
+ +int ib_device_register_sysfs(struct ib_device *device)
+ +{
+ +	int ret;
+ +
+ +	ret = ib_setup_port_attrs(&device->coredev);
+ +	if (ret)
+ +		return ret;
+ +
+ +	if (device->ops.alloc_hw_stats)
+ +		setup_hw_stats(device, NULL, 0);
+ +
+ +	return 0;
+ +}
+ +
+ +void ib_device_unregister_sysfs(struct ib_device *device)
+ +{
+ +	if (device->hw_stats_ag)
+ +		free_hsag(&device->dev.kobj, device->hw_stats_ag);
+ +	kfree(device->hw_stats);
+ +
+ +	ib_free_port_attrs(&device->coredev);
+ +}
+ +
+  /**
+-  * ib_port_register_module_stat - add module counters under relevant port
+-  *  of IB device.
++  * ib_port_register_client_groups - Add an ib_client's attributes to the port
+   *
+-  * @device: IB device to add counters
++  * @ibdev: IB device to add counters
+   * @port_num: valid port number
+-  * @kobj: pointer to the kobject to initialize
+-  * @ktype: pointer to the ktype for this kobject.
+-  * @name: the name of the kobject
++  * @groups: Group list of attributes
++  *
++  * Do not use. Only for legacy sysfs compatibility.
+   */
+++<<<<<<< HEAD
+ +int ib_port_register_module_stat(struct ib_device *device, u8 port_num,
+ +				 struct kobject *kobj, struct kobj_type *ktype,
+ +				 const char *name)
+++=======
++ int ib_port_register_client_groups(struct ib_device *ibdev, u32 port_num,
++ 				   const struct attribute_group **groups)
+++>>>>>>> 526a12c8c56e (RDMA/cm: Use an attribute_group on the ib_port_attribute intead of kobj's)
+  {
+- 	struct kobject *p, *t;
+- 	int ret;
+- 
+- 	list_for_each_entry_safe(p, t, &device->coredev.port_list, entry) {
+- 		struct ib_port *port = container_of(p, struct ib_port, kobj);
+- 
+- 		if (port->port_num != port_num)
+- 			continue;
+- 
+- 		ret = kobject_init_and_add(kobj, ktype, &port->kobj, "%s",
+- 					   name);
+- 		if (ret) {
+- 			kobject_put(kobj);
+- 			return ret;
+- 		}
+- 	}
+- 
+- 	return 0;
++ 	return sysfs_create_groups(&ibdev->port_data[port_num].sysfs->kobj,
++ 				   groups);
+  }
+- EXPORT_SYMBOL(ib_port_register_module_stat);
++ EXPORT_SYMBOL(ib_port_register_client_groups);
+  
+- /**
+-  * ib_port_unregister_module_stat - release module counters
+-  * @kobj: pointer to the kobject to release
+-  */
+- void ib_port_unregister_module_stat(struct kobject *kobj)
++ void ib_port_unregister_client_groups(struct ib_device *ibdev, u32 port_num,
++ 				      const struct attribute_group **groups)
+  {
+- 	kobject_put(kobj);
++ 	return sysfs_remove_groups(&ibdev->port_data[port_num].sysfs->kobj,
++ 				   groups);
+  }
+- EXPORT_SYMBOL(ib_port_unregister_module_stat);
++ EXPORT_SYMBOL(ib_port_unregister_client_groups);
+* Unmerged path drivers/infiniband/core/cm.c
+* Unmerged path drivers/infiniband/core/core_priv.h
+* Unmerged path drivers/infiniband/core/sysfs.c
