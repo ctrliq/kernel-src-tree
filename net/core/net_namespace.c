@@ -709,6 +709,7 @@ static int rtnl_net_get_size(void)
 {
 	return NLMSG_ALIGN(sizeof(struct rtgenmsg))
 	       + nla_total_size(sizeof(s32)) /* NETNSA_NSID */
+	       + nla_total_size(sizeof(s32)) /* NETNSA_CURRENT_NSID */
 	       ;
 }
 
@@ -718,6 +719,8 @@ struct net_fill_args {
 	int flags;
 	int cmd;
 	int nsid;
+	bool add_ref;
+	int ref_nsid;
 };
 
 static int rtnl_net_fill(struct sk_buff *skb, struct net_fill_args *args)
@@ -734,6 +737,10 @@ static int rtnl_net_fill(struct sk_buff *skb, struct net_fill_args *args)
 	rth->rtgen_family = AF_UNSPEC;
 
 	if (nla_put_s32(skb, NETNSA_NSID, args->nsid))
+		goto nla_put_failure;
+
+	if (args->add_ref &&
+	    nla_put_s32(skb, NETNSA_CURRENT_NSID, args->ref_nsid))
 		goto nla_put_failure;
 
 	nlmsg_end(skb, nlh);
@@ -755,7 +762,6 @@ static int rtnl_net_getid(struct sk_buff *skb, struct nlmsghdr *nlh,
 		.cmd = RTM_NEWNSID,
 	};
 	struct net *peer, *target = net;
-	bool put_target = false;
 	struct nlattr *nla;
 	struct sk_buff *msg;
 	int err;
@@ -797,7 +803,8 @@ static int rtnl_net_getid(struct sk_buff *skb, struct nlmsghdr *nlh,
 			err = PTR_ERR(target);
 			goto out;
 		}
-		put_target = true;
+		fillargs.add_ref = true;
+		fillargs.ref_nsid = peernet2id(net, peer);
 	}
 
 	msg = nlmsg_new(rtnl_net_get_size(), GFP_KERNEL);
@@ -817,7 +824,7 @@ static int rtnl_net_getid(struct sk_buff *skb, struct nlmsghdr *nlh,
 err_out:
 	nlmsg_free(msg);
 out:
-	if (put_target)
+	if (fillargs.add_ref)
 		put_net(target);
 	put_net(peer);
 	return err;
@@ -825,11 +832,11 @@ out:
 
 struct rtnl_net_dump_cb {
 	struct net *tgt_net;
+	struct net *ref_net;
 	struct sk_buff *skb;
 	struct net_fill_args fillargs;
 	int idx;
 	int s_idx;
-	bool put_tgt_net;
 };
 
 static int rtnl_net_dumpid_one(int id, void *peer, void *data)
@@ -841,6 +848,8 @@ static int rtnl_net_dumpid_one(int id, void *peer, void *data)
 		goto cont;
 
 	net_cb->fillargs.nsid = id;
+	if (net_cb->fillargs.add_ref)
+		net_cb->fillargs.ref_nsid = __peernet2id(net_cb->ref_net, peer);
 	ret = rtnl_net_fill(net_cb->skb, &net_cb->fillargs);
 	if (ret < 0)
 		return ret;
@@ -877,8 +886,9 @@ static int rtnl_valid_dump_net_req(const struct nlmsghdr *nlh, struct sock *sk,
 					       "Invalid target network namespace id");
 				return PTR_ERR(net);
 			}
+			net_cb->fillargs.add_ref = true;
+			net_cb->ref_net = net_cb->tgt_net;
 			net_cb->tgt_net = net;
-			net_cb->put_tgt_net = true;
 		} else {
 			NL_SET_BAD_ATTR(extack, tb[i]);
 			NL_SET_ERR_MSG(extack,
@@ -913,12 +923,22 @@ static int rtnl_net_dumpid(struct sk_buff *skb, struct netlink_callback *cb)
 	}
 
 	spin_lock_bh(&net_cb.tgt_net->nsid_lock);
+	if (net_cb.fillargs.add_ref &&
+	    !net_eq(net_cb.ref_net, net_cb.tgt_net) &&
+	    !spin_trylock_bh(&net_cb.ref_net->nsid_lock)) {
+		spin_unlock_bh(&net_cb.tgt_net->nsid_lock);
+		err = -EAGAIN;
+		goto end;
+	}
 	idr_for_each(&net_cb.tgt_net->netns_ids, rtnl_net_dumpid_one, &net_cb);
+	if (net_cb.fillargs.add_ref &&
+	    !net_eq(net_cb.ref_net, net_cb.tgt_net))
+		spin_unlock_bh(&net_cb.ref_net->nsid_lock);
 	spin_unlock_bh(&net_cb.tgt_net->nsid_lock);
 
 	cb->args[0] = net_cb.idx;
 end:
-	if (net_cb.put_tgt_net)
+	if (net_cb.fillargs.add_ref)
 		put_net(net_cb.tgt_net);
 	return err < 0 ? err : skb->len;
 }
