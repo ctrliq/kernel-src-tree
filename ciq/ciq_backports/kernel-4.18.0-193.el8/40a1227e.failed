@@ -1,0 +1,187 @@
+tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 40a1227ea845a37ab197dd1caffb60b047fa36b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/40a1227e.failed
+
+Although the actual cookie check "__cookie_v[46]_check()" does
+not involve sk specific info, it checks whether the sk has recent
+synq overflow event in "tcp_synq_no_recent_overflow()".  The
+tcp_sk(sk)->rx_opt.ts_recent_stamp is updated every second
+when it has sent out a syncookie (through "tcp_synq_overflow()").
+
+The above per sk "recent synq overflow event timestamp" works well
+for non SO_REUSEPORT use case.  However, it may cause random
+connection request reject/discard when SO_REUSEPORT is used with
+syncookie because it fails the "tcp_synq_no_recent_overflow()"
+test.
+
+When SO_REUSEPORT is used, it usually has multiple listening
+socks serving TCP connection requests destinated to the same local IP:PORT.
+There are cases that the TCP-ACK-COOKIE may not be received
+by the same sk that sent out the syncookie.  For example,
+if reuse->socks[] began with {sk0, sk1},
+1) sk1 sent out syncookies and tcp_sk(sk1)->rx_opt.ts_recent_stamp
+   was updated.
+2) the reuse->socks[] became {sk1, sk2} later.  e.g. sk0 was first closed
+   and then sk2 was added.  Here, sk2 does not have ts_recent_stamp set.
+   There are other ordering that will trigger the similar situation
+   below but the idea is the same.
+3) When the TCP-ACK-COOKIE comes back, sk2 was selected.
+   "tcp_synq_no_recent_overflow(sk2)" returns true. In this case,
+   all syncookies sent by sk1 will be handled (and rejected)
+   by sk2 while sk1 is still alive.
+
+The userspace may create and remove listening SO_REUSEPORT sockets
+as it sees fit.  E.g. Adding new thread (and SO_REUSEPORT sock) to handle
+incoming requests, old process stopping and new process starting...etc.
+With or without SO_ATTACH_REUSEPORT_[CB]BPF,
+the sockets leaving and joining a reuseport group makes picking
+the same sk to check the syncookie very difficult (if not impossible).
+
+The later patches will allow bpf prog more flexibility in deciding
+where a sk should be located in a bpf map and selecting a particular
+SO_REUSEPORT sock as it sees fit.  e.g. Without closing any sock,
+replace the whole bpf reuseport_array in one map_update() by using
+map-in-map.  Getting the syncookie check working smoothly across
+socks in the same "reuse->socks[]" is important.
+
+A partial solution is to set the newly added sk's ts_recent_stamp
+to the max ts_recent_stamp of a reuseport group but that will require
+to iterate through reuse->socks[]  OR
+pessimistically set it to "now - TCP_SYNCOOKIE_VALID" when a sk is
+joining a reuseport group.  However, neither of them will solve the
+existing sk getting moved around the reuse->socks[] and that
+sk may not have ts_recent_stamp updated, unlikely under continuous
+synflood but not impossible.
+
+This patch opts to treat the reuseport group as a whole when
+considering the last synq overflow timestamp since
+they are serving the same IP:PORT from the userspace
+(and BPF program) perspective.
+
+"synq_overflow_ts" is added to "struct sock_reuseport".
+The tcp_synq_overflow() and tcp_synq_no_recent_overflow()
+will update/check reuse->synq_overflow_ts if the sk is
+in a reuseport group.  Similar to the reuseport decision in
+__inet_lookup_listener(), both sk->sk_reuseport and
+sk->sk_reuseport_cb are tested for SO_REUSEPORT usage.
+Update on "synq_overflow_ts" happens at roughly once
+every second.
+
+A synflood test was done with a 16 rx-queues and 16 reuseport sockets.
+No meaningful performance change is observed.  Before and
+after the change is ~9Mpps in IPv4.
+
+	Cc: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 40a1227ea845a37ab197dd1caffb60b047fa36b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock_reuseport.h
+#	include/net/tcp.h
+diff --cc include/net/sock_reuseport.h
+index b0ff88240049,6bef7a0052f2..000000000000
+--- a/include/net/sock_reuseport.h
++++ b/include/net/sock_reuseport.h
+@@@ -15,9 -12,10 +15,16 @@@ struct sock_reuseport 
+  
+  	u16			max_socks;	/* length of socks */
+  	u16			num_socks;	/* elements in socks */
+++<<<<<<< HEAD
+ +	/* ID stays the same even after the size of socks[] grows. */
+ +	unsigned int		reuseport_id;
+ +	bool			bind_inany;
+++=======
++ 	/* The last synq overflow event timestamp of this
++ 	 * reuse->socks[] group.
++ 	 */
++ 	unsigned int		synq_overflow_ts;
+++>>>>>>> 40a1227ea845 (tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket)
+  	struct bpf_prog __rcu	*prog;		/* optional BPF sock selector */
+  	struct sock		*socks[0];	/* array of sock pointers */
+  };
+diff --cc include/net/tcp.h
+index a2d22446a290,d196901c9dba..000000000000
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@@ -475,19 -474,45 +476,58 @@@ struct sock *cookie_v4_check(struct soc
+   */
+  static inline void tcp_synq_overflow(const struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+ +	unsigned long now = jiffies;
+ +
+ +	if (time_after(now, last_overflow + HZ))
+++=======
++ 	unsigned int last_overflow;
++ 	unsigned int now = jiffies;
++ 
++ 	if (sk->sk_reuseport) {
++ 		struct sock_reuseport *reuse;
++ 
++ 		reuse = rcu_dereference(sk->sk_reuseport_cb);
++ 		if (likely(reuse)) {
++ 			last_overflow = READ_ONCE(reuse->synq_overflow_ts);
++ 			if (time_after32(now, last_overflow + HZ))
++ 				WRITE_ONCE(reuse->synq_overflow_ts, now);
++ 			return;
++ 		}
++ 	}
++ 
++ 	last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++ 	if (time_after32(now, last_overflow + HZ))
+++>>>>>>> 40a1227ea845 (tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket)
+  		tcp_sk(sk)->rx_opt.ts_recent_stamp = now;
+  }
+  
+  /* syncookies: no recent synqueue overflow on this listening socket? */
+  static inline bool tcp_synq_no_recent_overflow(const struct sock *sk)
+  {
+++<<<<<<< HEAD
+ +	unsigned long last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
+ +
+ +	return time_after(jiffies, last_overflow + TCP_SYNCOOKIE_VALID);
+++=======
++ 	unsigned int last_overflow;
++ 	unsigned int now = jiffies;
++ 
++ 	if (sk->sk_reuseport) {
++ 		struct sock_reuseport *reuse;
++ 
++ 		reuse = rcu_dereference(sk->sk_reuseport_cb);
++ 		if (likely(reuse)) {
++ 			last_overflow = READ_ONCE(reuse->synq_overflow_ts);
++ 			return time_after32(now, last_overflow +
++ 					    TCP_SYNCOOKIE_VALID);
++ 		}
++ 	}
++ 
++ 	last_overflow = tcp_sk(sk)->rx_opt.ts_recent_stamp;
++ 	return time_after32(now, last_overflow + TCP_SYNCOOKIE_VALID);
+++>>>>>>> 40a1227ea845 (tcp: Avoid TCP syncookie rejected by SO_REUSEPORT socket)
+  }
+  
+  static inline u32 tcp_cookie_time(void)
+* Unmerged path include/net/sock_reuseport.h
+* Unmerged path include/net/tcp.h
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 14feb61fcdff..dc4aefdf2a08 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -115,6 +115,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
++	more_reuse->synq_overflow_ts = READ_ONCE(reuse->synq_overflow_ts);
+ 
+ 	for (i = 0; i < reuse->num_socks; ++i)
+ 		rcu_assign_pointer(reuse->socks[i]->sk_reuseport_cb,
