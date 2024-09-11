@@ -1,0 +1,232 @@
+ata: move ata_eh_analyze_ncq_error() & co. to libata-sata.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+commit a0ccd2511b6f70394b30f8290da8bfc723d6bc07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a0ccd251.failed
+
+* move ata_eh_analyze_ncq_error() and ata_eh_read_log_10h() to
+  libata-sata.c
+
+* add static inline for ata_eh_analyze_ncq_error() for
+  CONFIG_SATA_HOST=n case (link->sactive is non-zero only if
+  NCQ commands are actually queued so empty function body is
+  sufficient)
+
+Code size savings on m68k arch using (modified) atari_defconfig:
+
+   text    data     bss     dec     hex filename
+before:
+  16164      18       0   16182    3f36 drivers/ata/libata-eh.o
+after:
+  15446      18       0   15464    3c68 drivers/ata/libata-eh.o
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit a0ccd2511b6f70394b30f8290da8bfc723d6bc07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/ata/libata-eh.c
+#	drivers/ata/libata-sata.c
+#	include/linux/libata.h
+diff --cc drivers/ata/libata-eh.c
+index 4b54e83864fa,474c6c34fe02..000000000000
+--- a/drivers/ata/libata-eh.c
++++ b/drivers/ata/libata-eh.c
+@@@ -1672,80 -1535,6 +1616,83 @@@ static void ata_eh_analyze_serror(struc
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + *	ata_eh_analyze_ncq_error - analyze NCQ error
+ + *	@link: ATA link to analyze NCQ error for
+ + *
+ + *	Read log page 10h, determine the offending qc and acquire
+ + *	error status TF.  For NCQ device errors, all LLDDs have to do
+ + *	is setting AC_ERR_DEV in ehi->err_mask.  This function takes
+ + *	care of the rest.
+ + *
+ + *	LOCKING:
+ + *	Kernel thread context (may sleep).
+ + */
+ +void ata_eh_analyze_ncq_error(struct ata_link *link)
+ +{
+ +	struct ata_port *ap = link->ap;
+ +	struct ata_eh_context *ehc = &link->eh_context;
+ +	struct ata_device *dev = link->device;
+ +	struct ata_queued_cmd *qc;
+ +	struct ata_taskfile tf;
+ +	int tag, rc;
+ +
+ +	/* if frozen, we can't do much */
+ +	if (ap->pflags & ATA_PFLAG_FROZEN)
+ +		return;
+ +
+ +	/* is it NCQ device error? */
+ +	if (!link->sactive || !(ehc->i.err_mask & AC_ERR_DEV))
+ +		return;
+ +
+ +	/* has LLDD analyzed already? */
+ +	ata_qc_for_each_raw(ap, qc, tag) {
+ +		if (!(qc->flags & ATA_QCFLAG_FAILED))
+ +			continue;
+ +
+ +		if (qc->err_mask)
+ +			return;
+ +	}
+ +
+ +	/* okay, this error is ours */
+ +	memset(&tf, 0, sizeof(tf));
+ +	rc = ata_eh_read_log_10h(dev, &tag, &tf);
+ +	if (rc) {
+ +		ata_link_err(link, "failed to read log page 10h (errno=%d)\n",
+ +			     rc);
+ +		return;
+ +	}
+ +
+ +	if (!(link->sactive & (1 << tag))) {
+ +		ata_link_err(link, "log page 10h reported inactive tag %d\n",
+ +			     tag);
+ +		return;
+ +	}
+ +
+ +	/* we've got the perpetrator, condemn it */
+ +	qc = __ata_qc_from_tag(ap, tag);
+ +	memcpy(&qc->result_tf, &tf, sizeof(tf));
+ +	qc->result_tf.flags = ATA_TFLAG_ISADDR | ATA_TFLAG_LBA | ATA_TFLAG_LBA48;
+ +	qc->err_mask |= AC_ERR_DEV | AC_ERR_NCQ;
+ +	if (dev->class == ATA_DEV_ZAC &&
+ +	    ((qc->result_tf.command & ATA_SENSE) || qc->result_tf.auxiliary)) {
+ +		char sense_key, asc, ascq;
+ +
+ +		sense_key = (qc->result_tf.auxiliary >> 16) & 0xff;
+ +		asc = (qc->result_tf.auxiliary >> 8) & 0xff;
+ +		ascq = qc->result_tf.auxiliary & 0xff;
+ +		ata_scsi_set_sense(dev, qc->scsicmd, sense_key, asc, ascq);
+ +		ata_scsi_set_sense_information(dev, qc->scsicmd,
+ +					       &qc->result_tf);
+ +		qc->flags |= ATA_QCFLAG_SENSE_VALID;
+ +	}
+ +
+ +	ehc->i.err_mask &= ~AC_ERR_DEV;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> a0ccd2511b6f (ata: move ata_eh_analyze_ncq_error() & co. to libata-sata.c)
+   *	ata_eh_analyze_tf - analyze taskfile of a failed qc
+   *	@qc: qc to analyze
+   *	@tf: Taskfile registers to analyze
+diff --cc include/linux/libata.h
+index ce0dc53b9adc,cffa4714bfa8..000000000000
+--- a/include/linux/libata.h
++++ b/include/linux/libata.h
+@@@ -1208,7 -1153,96 +1208,98 @@@ extern struct ata_device *ata_dev_pair(
+  extern int ata_do_set_mode(struct ata_link *link, struct ata_device **r_failed_dev);
+  extern void ata_scsi_port_error_handler(struct Scsi_Host *host, struct ata_port *ap);
+  extern void ata_scsi_cmd_error_handler(struct Scsi_Host *host, struct ata_port *ap, struct list_head *eh_q);
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * SATA specific code - drivers/ata/libata-sata.c
++  */
++ #ifdef CONFIG_SATA_HOST
++ extern const unsigned long sata_deb_timing_normal[];
++ extern const unsigned long sata_deb_timing_hotplug[];
++ extern const unsigned long sata_deb_timing_long[];
++ 
++ static inline const unsigned long *
++ sata_ehc_deb_timing(struct ata_eh_context *ehc)
++ {
++ 	if (ehc->i.flags & ATA_EHI_HOTPLUGGED)
++ 		return sata_deb_timing_hotplug;
++ 	else
++ 		return sata_deb_timing_normal;
++ }
++ 
++ extern int sata_scr_valid(struct ata_link *link);
++ extern int sata_scr_read(struct ata_link *link, int reg, u32 *val);
++ extern int sata_scr_write(struct ata_link *link, int reg, u32 val);
++ extern int sata_scr_write_flush(struct ata_link *link, int reg, u32 val);
++ extern int sata_set_spd(struct ata_link *link);
++ extern int sata_link_hardreset(struct ata_link *link,
++ 			const unsigned long *timing, unsigned long deadline,
++ 			bool *online, int (*check_ready)(struct ata_link *));
++ extern int sata_link_resume(struct ata_link *link, const unsigned long *params,
++ 			    unsigned long deadline);
++ extern void ata_eh_analyze_ncq_error(struct ata_link *link);
++ #else
++ static inline const unsigned long *
++ sata_ehc_deb_timing(struct ata_eh_context *ehc)
++ {
++ 	return NULL;
++ }
++ static inline int sata_scr_valid(struct ata_link *link) { return 0; }
++ static inline int sata_scr_read(struct ata_link *link, int reg, u32 *val)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int sata_scr_write(struct ata_link *link, int reg, u32 val)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int sata_scr_write_flush(struct ata_link *link, int reg, u32 val)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline int sata_set_spd(struct ata_link *link) { return -EOPNOTSUPP; }
++ static inline int sata_link_hardreset(struct ata_link *link,
++ 				      const unsigned long *timing,
++ 				      unsigned long deadline,
++ 				      bool *online,
++ 				      int (*check_ready)(struct ata_link *))
++ {
++ 	if (online)
++ 		*online = false;
++ 	return -EOPNOTSUPP;
++ }
++ static inline int sata_link_resume(struct ata_link *link,
++ 				   const unsigned long *params,
++ 				   unsigned long deadline)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ static inline void ata_eh_analyze_ncq_error(struct ata_link *link) { }
++ #endif
++ extern int sata_link_debounce(struct ata_link *link,
++ 			const unsigned long *params, unsigned long deadline);
++ extern int sata_link_scr_lpm(struct ata_link *link, enum ata_lpm_policy policy,
++ 			     bool spm_wakeup);
++ extern int ata_slave_link_init(struct ata_port *ap);
++ extern void ata_sas_port_destroy(struct ata_port *);
++ extern struct ata_port *ata_sas_port_alloc(struct ata_host *,
++ 					   struct ata_port_info *, struct Scsi_Host *);
++ extern void ata_sas_async_probe(struct ata_port *ap);
++ extern int ata_sas_sync_probe(struct ata_port *ap);
++ extern int ata_sas_port_init(struct ata_port *);
++ extern int ata_sas_port_start(struct ata_port *ap);
++ extern int ata_sas_tport_add(struct device *parent, struct ata_port *ap);
++ extern void ata_sas_tport_delete(struct ata_port *ap);
++ extern void ata_sas_port_stop(struct ata_port *ap);
++ extern int ata_sas_slave_configure(struct scsi_device *, struct ata_port *);
++ extern int ata_sas_queuecmd(struct scsi_cmnd *cmd, struct ata_port *ap);
++ extern void ata_tf_to_fis(const struct ata_taskfile *tf,
++ 			  u8 pmp, int is_cmd, u8 *fis);
++ extern void ata_tf_from_fis(const u8 *fis, struct ata_taskfile *tf);
++ extern int ata_qc_complete_multiple(struct ata_port *ap, u64 qc_active);
+++>>>>>>> a0ccd2511b6f (ata: move ata_eh_analyze_ncq_error() & co. to libata-sata.c)
+  extern bool sata_lpm_ignore_phy_events(struct ata_link *link);
+ -extern int sata_async_notification(struct ata_port *ap);
+  
+  extern int ata_cable_40wire(struct ata_port *ap);
+  extern int ata_cable_80wire(struct ata_port *ap);
+* Unmerged path drivers/ata/libata-sata.c
+* Unmerged path drivers/ata/libata-eh.c
+* Unmerged path drivers/ata/libata-sata.c
+* Unmerged path include/linux/libata.h
