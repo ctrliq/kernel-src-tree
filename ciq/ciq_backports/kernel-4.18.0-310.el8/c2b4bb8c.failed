@@ -1,0 +1,195 @@
+block: fix locking for struct block_device size updates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit c2b4bb8cb3741c0bacf3683e4c1ecd04c977ada3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c2b4bb8c.failed
+
+Two different callers use two different mutexes for updating the
+block device size, which obviously doesn't help to actually protect
+against concurrent updates from the different callers.  In addition
+one of the locks, bd_mutex is rather prone to deadlocks with other
+parts of the block stack that use it for high level synchronization.
+
+Switch to using a new spinlock protecting just the size updates, as
+that is all we need, and make sure everyone does the update through
+the proper helper.
+
+This fixes a bug reported with the nvme revalidating disks during a
+hot removal operation, which can currently deadlock on bd_mutex.
+
+	Reported-by: Xianting Tian <xianting_tian@126.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c2b4bb8cb3741c0bacf3683e4c1ecd04c977ada3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/block_dev.c
+#	include/linux/blk_types.h
+diff --cc fs/block_dev.c
+index f19cc879b480,08158bb2e76c..000000000000
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@@ -1472,13 -1374,13 +1475,19 @@@ int check_disk_change(struct block_devi
+  
+  EXPORT_SYMBOL(check_disk_change);
+  
+ -void bd_set_nr_sectors(struct block_device *bdev, sector_t sectors)
+ +void bd_set_size(struct block_device *bdev, loff_t size)
+  {
+++<<<<<<< HEAD
+ +	inode_lock(bdev->bd_inode);
+ +	i_size_write(bdev->bd_inode, size);
+ +	inode_unlock(bdev->bd_inode);
+++=======
++ 	spin_lock(&bdev->bd_size_lock);
++ 	i_size_write(bdev->bd_inode, (loff_t)sectors << SECTOR_SHIFT);
++ 	spin_unlock(&bdev->bd_size_lock);
+++>>>>>>> c2b4bb8cb374 (block: fix locking for struct block_device size updates)
+  }
+ -EXPORT_SYMBOL(bd_set_nr_sectors);
+ +EXPORT_SYMBOL(bd_set_size);
+  
+  static void __blkdev_put(struct block_device *bdev, fmode_t mode, int for_part);
+  
+diff --cc include/linux/blk_types.h
+index 01eb143dd5ae,5accc2549d22..000000000000
+--- a/include/linux/blk_types.h
++++ b/include/linux/blk_types.h
+@@@ -19,6 -17,36 +19,39 @@@ struct block_device
+  struct io_context;
+  struct cgroup_subsys_state;
+  typedef void (bio_end_io_t) (struct bio *);
+++<<<<<<< HEAD
+++=======
++ struct bio_crypt_ctx;
++ 
++ struct block_device {
++ 	dev_t			bd_dev;  /* not a kdev_t - it's a search key */
++ 	int			bd_openers;
++ 	struct inode *		bd_inode;	/* will die */
++ 	struct super_block *	bd_super;
++ 	struct mutex		bd_mutex;	/* open/close mutex */
++ 	void *			bd_claiming;
++ 	void *			bd_holder;
++ 	int			bd_holders;
++ 	bool			bd_write_holder;
++ #ifdef CONFIG_SYSFS
++ 	struct list_head	bd_holder_disks;
++ #endif
++ 	struct block_device *	bd_contains;
++ 	u8			bd_partno;
++ 	struct hd_struct *	bd_part;
++ 	/* number of times partitions within this device have been opened. */
++ 	unsigned		bd_part_count;
++ 	int			bd_invalidated;
++ 	spinlock_t		bd_size_lock; /* for bd_inode->i_size updates */
++ 	struct gendisk *	bd_disk;
++ 	struct backing_dev_info *bd_bdi;
++ 
++ 	/* The counter of freeze processes */
++ 	int			bd_fsfreeze_count;
++ 	/* Mutex for freeze */
++ 	struct mutex		bd_fsfreeze_mutex;
++ } __randomize_layout;
+++>>>>>>> c2b4bb8cb374 (block: fix locking for struct block_device size updates)
+  
+  /*
+   * Block error status values.  See block/blk-core:blk_errors for the details.
+diff --git a/block/partitions/core.c b/block/partitions/core.c
+index 9e97e6d9a3bd..61acc911c5d0 100644
+--- a/block/partitions/core.c
++++ b/block/partitions/core.c
+@@ -587,8 +587,8 @@ int bdev_resize_partition(struct block_device *bdev, int partno,
+ 	if (partition_overlaps(bdev->bd_disk, start, length, partno))
+ 		goto out_unlock;
+ 
+-	part_nr_sects_write(part, (sector_t)length);
+-	i_size_write(bdevp->bd_inode, length << SECTOR_SHIFT);
++	part_nr_sects_write(part, length);
++	bd_set_nr_sectors(bdevp, length);
+ 
+ 	ret = 0;
+ out_unlock:
+diff --git a/drivers/block/aoe/aoecmd.c b/drivers/block/aoe/aoecmd.c
+index 3cf9bc5d8d95..6ad73fe730be 100644
+--- a/drivers/block/aoe/aoecmd.c
++++ b/drivers/block/aoe/aoecmd.c
+@@ -900,9 +900,7 @@ aoecmd_sleepwork(struct work_struct *work)
+ 		ssize = get_capacity(d->gd);
+ 		bd = bdget_disk(d->gd, 0);
+ 		if (bd) {
+-			inode_lock(bd->bd_inode);
+-			i_size_write(bd->bd_inode, (loff_t)ssize<<9);
+-			inode_unlock(bd->bd_inode);
++			bd_set_nr_sectors(bd, ssize);
+ 			bdput(bd);
+ 		}
+ 		spin_lock_irq(&d->lock);
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 8ce0c549a2e9..4549fef36ded 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1983,18 +1983,6 @@ static void event_callback(void *context)
+ 	dm_issue_global_event();
+ }
+ 
+-/*
+- * Protected by md->suspend_lock obtained by dm_swap_table().
+- */
+-static void __set_size(struct mapped_device *md, sector_t size)
+-{
+-	lockdep_assert_held(&md->suspend_lock);
+-
+-	set_capacity(md->disk, size);
+-
+-	i_size_write(md->bdev->bd_inode, (loff_t)size << SECTOR_SHIFT);
+-}
+-
+ /*
+  * Returns old map, which caller must destroy.
+  */
+@@ -2017,7 +2005,8 @@ static struct dm_table *__bind(struct mapped_device *md, struct dm_table *t,
+ 	if (size != dm_get_size(md))
+ 		memset(&md->geometry, 0, sizeof(md->geometry));
+ 
+-	__set_size(md, size);
++	set_capacity(md->disk, size);
++	bd_set_nr_sectors(md->bdev, size);
+ 
+ 	dm_table_event_callback(t, event_callback, md);
+ 
+diff --git a/drivers/s390/block/dasd_ioctl.c b/drivers/s390/block/dasd_ioctl.c
+index 9b7782395c37..30005d46e1a4 100644
+--- a/drivers/s390/block/dasd_ioctl.c
++++ b/drivers/s390/block/dasd_ioctl.c
+@@ -54,10 +54,7 @@ dasd_ioctl_enable(struct block_device *bdev)
+ 
+ 	dasd_enable_device(base);
+ 	/* Formatting the dasd device can change the capacity. */
+-	mutex_lock(&bdev->bd_mutex);
+-	i_size_write(bdev->bd_inode,
+-		     (loff_t)get_capacity(base->block->gdp) << 9);
+-	mutex_unlock(&bdev->bd_mutex);
++	bd_set_nr_sectors(bdev, get_capacity(base->block->gdp));
+ 	dasd_put_device(base);
+ 	return 0;
+ }
+@@ -90,9 +87,7 @@ dasd_ioctl_disable(struct block_device *bdev)
+ 	 * Set i_size to zero, since read, write, etc. check against this
+ 	 * value.
+ 	 */
+-	mutex_lock(&bdev->bd_mutex);
+-	i_size_write(bdev->bd_inode, 0);
+-	mutex_unlock(&bdev->bd_mutex);
++	bd_set_nr_sectors(bdev, 0);
+ 	dasd_put_device(base);
+ 	return 0;
+ }
+* Unmerged path fs/block_dev.c
+* Unmerged path include/linux/blk_types.h
