@@ -1,0 +1,292 @@
+selinux: fix cond_list corruption when changing booleans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ondrej Mosnacek <omosnace@redhat.com>
+commit d8f5f0ea5b86300390b026b6c6e7836b7150814a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/d8f5f0ea.failed
+
+Currently, duplicate_policydb_cond_list() first copies the whole
+conditional avtab and then tries to link to the correct entries in
+cond_dup_av_list() using avtab_search(). However, since the conditional
+avtab may contain multiple entries with the same key, this approach
+often fails to find the right entry, potentially leading to wrong rules
+being activated/deactivated when booleans are changed.
+
+To fix this, instead start with an empty conditional avtab and add the
+individual entries one-by-one while building the new av_lists. This
+approach leads to the correct result, since each entry is present in the
+av_lists exactly once.
+
+The issue can be reproduced with Fedora policy as follows:
+
+    # sesearch -s ftpd_t -t public_content_rw_t -c dir -p create -A
+    allow ftpd_t non_security_file_type:dir { add_name create getattr ioctl link lock open read remove_name rename reparent rmdir search setattr unlink watch watch_reads write }; [ ftpd_full_access ]:True
+    allow ftpd_t public_content_rw_t:dir { add_name create link remove_name rename reparent rmdir setattr unlink watch watch_reads write }; [ ftpd_anon_write ]:True
+    # setsebool ftpd_anon_write=off ftpd_connect_all_unreserved=off ftpd_connect_db=off ftpd_full_access=off
+
+On fixed kernels, the sesearch output is the same after the setsebool
+command:
+
+    # sesearch -s ftpd_t -t public_content_rw_t -c dir -p create -A
+    allow ftpd_t non_security_file_type:dir { add_name create getattr ioctl link lock open read remove_name rename reparent rmdir search setattr unlink watch watch_reads write }; [ ftpd_full_access ]:True
+    allow ftpd_t public_content_rw_t:dir { add_name create link remove_name rename reparent rmdir setattr unlink watch watch_reads write }; [ ftpd_anon_write ]:True
+
+While on the broken kernels, it will be different:
+
+    # sesearch -s ftpd_t -t public_content_rw_t -c dir -p create -A
+    allow ftpd_t non_security_file_type:dir { add_name create getattr ioctl link lock open read remove_name rename reparent rmdir search setattr unlink watch watch_reads write }; [ ftpd_full_access ]:True
+    allow ftpd_t non_security_file_type:dir { add_name create getattr ioctl link lock open read remove_name rename reparent rmdir search setattr unlink watch watch_reads write }; [ ftpd_full_access ]:True
+    allow ftpd_t non_security_file_type:dir { add_name create getattr ioctl link lock open read remove_name rename reparent rmdir search setattr unlink watch watch_reads write }; [ ftpd_full_access ]:True
+
+While there, also simplify the computation of nslots. This changes the
+nslots values for nrules 2 or 3 to just two slots instead of 4, which
+makes the sequence more consistent.
+
+	Cc: stable@vger.kernel.org
+Fixes: c7c556f1e81b ("selinux: refactor changing booleans")
+	Signed-off-by: Ondrej Mosnacek <omosnace@redhat.com>
+	Signed-off-by: Paul Moore <paul@paul-moore.com>
+(cherry picked from commit d8f5f0ea5b86300390b026b6c6e7836b7150814a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	security/selinux/ss/avtab.c
+#	security/selinux/ss/avtab.h
+#	security/selinux/ss/conditional.c
+diff --cc security/selinux/ss/avtab.c
+index a4f577339964,75df32906055..000000000000
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@@ -334,13 -319,39 +320,42 @@@ static int avtab_alloc_common(struct av
+  
+  	h->nslot = nslot;
+  	h->mask = nslot - 1;
++ 	return 0;
++ }
+  
+- avtab_alloc_out:
+- 	pr_debug("SELinux: %d avtab hash slots, %d rules.\n",
+- 	       h->nslot, nrules);
+++<<<<<<< HEAD
+++=======
++ int avtab_alloc(struct avtab *h, u32 nrules)
++ {
++ 	int rc;
++ 	u32 nslot = 0;
++ 
++ 	if (nrules != 0) {
++ 		u32 shift = 1;
++ 		u32 work = nrules >> 3;
++ 		while (work) {
++ 			work >>= 1;
++ 			shift++;
++ 		}
++ 		nslot = 1 << shift;
++ 		if (nslot > MAX_AVTAB_HASH_BUCKETS)
++ 			nslot = MAX_AVTAB_HASH_BUCKETS;
++ 
++ 		rc = avtab_alloc_common(h, nslot);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	pr_debug("SELinux: %d avtab hash slots, %d rules.\n", nslot, nrules);
+  	return 0;
+  }
+  
++ int avtab_alloc_dup(struct avtab *new, const struct avtab *orig)
++ {
++ 	return avtab_alloc_common(new, orig->nslot);
++ }
++ 
+++>>>>>>> d8f5f0ea5b86 (selinux: fix cond_list corruption when changing booleans)
+  void avtab_hash_eval(struct avtab *h, char *tag)
+  {
+  	int i, chain_len, slots_used, max_chain_len;
+diff --cc security/selinux/ss/avtab.h
+index 37767fbe787e,f2eeb36265d1..000000000000
+--- a/security/selinux/ss/avtab.h
++++ b/security/selinux/ss/avtab.h
+@@@ -91,6 -89,7 +91,10 @@@ struct avtab 
+  
+  void avtab_init(struct avtab *h);
+  int avtab_alloc(struct avtab *, u32);
+++<<<<<<< HEAD
+++=======
++ int avtab_alloc_dup(struct avtab *new, const struct avtab *orig);
+++>>>>>>> d8f5f0ea5b86 (selinux: fix cond_list corruption when changing booleans)
+  struct avtab_datum *avtab_search(struct avtab *h, struct avtab_key *k);
+  void avtab_destroy(struct avtab *h);
+  void avtab_hash_eval(struct avtab *h, char *tag);
+diff --cc security/selinux/ss/conditional.c
+index 82171fda95f1,1ef74c085f2b..000000000000
+--- a/security/selinux/ss/conditional.c
++++ b/security/selinux/ss/conditional.c
+@@@ -603,3 -600,158 +603,161 @@@ void cond_compute_av(struct avtab *ctab
+  			services_compute_xperms_drivers(xperms, node);
+  	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int cond_dup_av_list(struct cond_av_list *new,
++ 			struct cond_av_list *orig,
++ 			struct avtab *avtab)
++ {
++ 	u32 i;
++ 
++ 	memset(new, 0, sizeof(*new));
++ 
++ 	new->nodes = kcalloc(orig->len, sizeof(*new->nodes), GFP_KERNEL);
++ 	if (!new->nodes)
++ 		return -ENOMEM;
++ 
++ 	for (i = 0; i < orig->len; i++) {
++ 		new->nodes[i] = avtab_insert_nonunique(avtab,
++ 						       &orig->nodes[i]->key,
++ 						       &orig->nodes[i]->datum);
++ 		if (!new->nodes[i])
++ 			return -ENOMEM;
++ 		new->len++;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int duplicate_policydb_cond_list(struct policydb *newp,
++ 					struct policydb *origp)
++ {
++ 	int rc, i, j;
++ 
++ 	rc = avtab_alloc_dup(&newp->te_cond_avtab, &origp->te_cond_avtab);
++ 	if (rc)
++ 		return rc;
++ 
++ 	newp->cond_list_len = 0;
++ 	newp->cond_list = kcalloc(origp->cond_list_len,
++ 				sizeof(*newp->cond_list),
++ 				GFP_KERNEL);
++ 	if (!newp->cond_list)
++ 		goto error;
++ 
++ 	for (i = 0; i < origp->cond_list_len; i++) {
++ 		struct cond_node *newn = &newp->cond_list[i];
++ 		struct cond_node *orign = &origp->cond_list[i];
++ 
++ 		newp->cond_list_len++;
++ 
++ 		newn->cur_state = orign->cur_state;
++ 		newn->expr.nodes = kcalloc(orign->expr.len,
++ 					sizeof(*newn->expr.nodes), GFP_KERNEL);
++ 		if (!newn->expr.nodes)
++ 			goto error;
++ 		for (j = 0; j < orign->expr.len; j++)
++ 			newn->expr.nodes[j] = orign->expr.nodes[j];
++ 		newn->expr.len = orign->expr.len;
++ 
++ 		rc = cond_dup_av_list(&newn->true_list, &orign->true_list,
++ 				&newp->te_cond_avtab);
++ 		if (rc)
++ 			goto error;
++ 
++ 		rc = cond_dup_av_list(&newn->false_list, &orign->false_list,
++ 				&newp->te_cond_avtab);
++ 		if (rc)
++ 			goto error;
++ 	}
++ 
++ 	return 0;
++ 
++ error:
++ 	avtab_destroy(&newp->te_cond_avtab);
++ 	cond_list_destroy(newp);
++ 	return -ENOMEM;
++ }
++ 
++ static int cond_bools_destroy(void *key, void *datum, void *args)
++ {
++ 	/* key was not copied so no need to free here */
++ 	kfree(datum);
++ 	return 0;
++ }
++ 
++ static int cond_bools_copy(struct hashtab_node *new, struct hashtab_node *orig, void *args)
++ {
++ 	struct cond_bool_datum *datum;
++ 
++ 	datum = kmemdup(orig->datum, sizeof(struct cond_bool_datum),
++ 			GFP_KERNEL);
++ 	if (!datum)
++ 		return -ENOMEM;
++ 
++ 	new->key = orig->key; /* No need to copy, never modified */
++ 	new->datum = datum;
++ 	return 0;
++ }
++ 
++ static int cond_bools_index(void *key, void *datum, void *args)
++ {
++ 	struct cond_bool_datum *booldatum, **cond_bool_array;
++ 
++ 	booldatum = datum;
++ 	cond_bool_array = args;
++ 	cond_bool_array[booldatum->value - 1] = booldatum;
++ 
++ 	return 0;
++ }
++ 
++ static int duplicate_policydb_bools(struct policydb *newdb,
++ 				struct policydb *orig)
++ {
++ 	struct cond_bool_datum **cond_bool_array;
++ 	int rc;
++ 
++ 	cond_bool_array = kmalloc_array(orig->p_bools.nprim,
++ 					sizeof(*orig->bool_val_to_struct),
++ 					GFP_KERNEL);
++ 	if (!cond_bool_array)
++ 		return -ENOMEM;
++ 
++ 	rc = hashtab_duplicate(&newdb->p_bools.table, &orig->p_bools.table,
++ 			cond_bools_copy, cond_bools_destroy, NULL);
++ 	if (rc) {
++ 		kfree(cond_bool_array);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	hashtab_map(&newdb->p_bools.table, cond_bools_index, cond_bool_array);
++ 	newdb->bool_val_to_struct = cond_bool_array;
++ 
++ 	newdb->p_bools.nprim = orig->p_bools.nprim;
++ 
++ 	return 0;
++ }
++ 
++ void cond_policydb_destroy_dup(struct policydb *p)
++ {
++ 	hashtab_map(&p->p_bools.table, cond_bools_destroy, NULL);
++ 	hashtab_destroy(&p->p_bools.table);
++ 	cond_policydb_destroy(p);
++ }
++ 
++ int cond_policydb_dup(struct policydb *new, struct policydb *orig)
++ {
++ 	cond_policydb_init(new);
++ 
++ 	if (duplicate_policydb_bools(new, orig))
++ 		return -ENOMEM;
++ 
++ 	if (duplicate_policydb_cond_list(new, orig)) {
++ 		cond_policydb_destroy_dup(new);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	return 0;
++ }
+++>>>>>>> d8f5f0ea5b86 (selinux: fix cond_list corruption when changing booleans)
+* Unmerged path security/selinux/ss/avtab.c
+* Unmerged path security/selinux/ss/avtab.h
+* Unmerged path security/selinux/ss/conditional.c
