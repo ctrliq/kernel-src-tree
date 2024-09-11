@@ -1,0 +1,150 @@
+powerpc/watchpoint: Provide DAWR number to __set_breakpoint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit 4a8a9379f2af4c9928529b3959bc2d8f7023c6bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4a8a9379.failed
+
+Introduce new parameter 'nr' to __set_breakpoint() which indicates
+which DAWR should be programed. Also convert current_brk variable
+to an array.
+
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Reviewed-by: Michael Neuling <mikey@neuling.org>
+Link: https://lore.kernel.org/r/20200514111741.97993-7-ravi.bangoria@linux.ibm.com
+(cherry picked from commit 4a8a9379f2af4c9928529b3959bc2d8f7023c6bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/process.c
+#	arch/powerpc/xmon/xmon.c
+diff --cc arch/powerpc/kernel/process.c
+index 6ca2453dede4,f303aea61794..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -803,13 -800,15 +803,19 @@@ static inline int set_dawr(struct arch_
+  	return 0;
+  }
+  
+- void __set_breakpoint(struct arch_hw_breakpoint *brk)
++ void __set_breakpoint(int nr, struct arch_hw_breakpoint *brk)
+  {
+- 	memcpy(this_cpu_ptr(&current_brk), brk, sizeof(*brk));
++ 	memcpy(this_cpu_ptr(&current_brk[nr]), brk, sizeof(*brk));
+  
+ -	if (dawr_enabled())
+ +	if (cpu_has_feature(CPU_FTR_DAWR))
+  		// Power8 or later
+++<<<<<<< HEAD
+ +		set_dawr(brk);
+++=======
++ 		set_dawr(nr, brk);
++ 	else if (IS_ENABLED(CONFIG_PPC_8xx))
++ 		set_breakpoint_8xx(brk);
+++>>>>>>> 4a8a9379f2af (powerpc/watchpoint: Provide DAWR number to __set_breakpoint)
+  	else if (!cpu_has_feature(CPU_FTR_ARCH_207S))
+  		// Power7 or earlier
+  		set_dabr(brk);
+diff --cc arch/powerpc/xmon/xmon.c
+index d44c79009e35,30b3e3d99c0d..000000000000
+--- a/arch/powerpc/xmon/xmon.c
++++ b/arch/powerpc/xmon/xmon.c
+@@@ -872,8 -953,8 +872,13 @@@ static void insert_cpu_bpts(void
+  	if (dabr.enabled) {
+  		brk.address = dabr.address;
+  		brk.type = (dabr.enabled & HW_BRK_TYPE_DABR) | HW_BRK_TYPE_PRIV_ALL;
+++<<<<<<< HEAD
+ +		brk.len = 8;
+ +		__set_breakpoint(&brk);
+++=======
++ 		brk.len = DABR_MAX_LEN;
++ 		__set_breakpoint(0, &brk);
+++>>>>>>> 4a8a9379f2af (powerpc/watchpoint: Provide DAWR number to __set_breakpoint)
+  	}
+  
+  	if (iabr)
+diff --git a/arch/powerpc/include/asm/debug.h b/arch/powerpc/include/asm/debug.h
+index 7756026b95ca..ec57daf87f40 100644
+--- a/arch/powerpc/include/asm/debug.h
++++ b/arch/powerpc/include/asm/debug.h
+@@ -45,7 +45,7 @@ static inline int debugger_break_match(struct pt_regs *regs) { return 0; }
+ static inline int debugger_fault_handler(struct pt_regs *regs) { return 0; }
+ #endif
+ 
+-void __set_breakpoint(struct arch_hw_breakpoint *brk);
++void __set_breakpoint(int nr, struct arch_hw_breakpoint *brk);
+ bool ppc_breakpoint_available(void);
+ #ifdef CONFIG_PPC_ADV_DEBUG_REGS
+ extern void do_send_trap(struct pt_regs *regs, unsigned long address,
+diff --git a/arch/powerpc/include/asm/hw_breakpoint.h b/arch/powerpc/include/asm/hw_breakpoint.h
+index 27d6e3c8fde9..f00f964eae03 100644
+--- a/arch/powerpc/include/asm/hw_breakpoint.h
++++ b/arch/powerpc/include/asm/hw_breakpoint.h
+@@ -84,7 +84,7 @@ static inline void hw_breakpoint_disable(void)
+ 	brk.type = 0;
+ 	brk.len = 0;
+ 	if (ppc_breakpoint_available())
+-		__set_breakpoint(&brk);
++		__set_breakpoint(0, &brk);
+ }
+ extern void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs);
+ int hw_breakpoint_handler(struct die_args *args);
+diff --git a/arch/powerpc/kernel/hw_breakpoint.c b/arch/powerpc/kernel/hw_breakpoint.c
+index cb5dfa15ad41..a876aae5b9c1 100644
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@ -73,7 +73,7 @@ int arch_install_hw_breakpoint(struct perf_event *bp)
+ 	 * If so, DABR will be populated in single_step_dabr_instruction().
+ 	 */
+ 	if (current->thread.last_hit_ubp != bp)
+-		__set_breakpoint(info);
++		__set_breakpoint(0, info);
+ 
+ 	return 0;
+ }
+@@ -201,7 +201,7 @@ void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+ 
+ 	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+ 	regs->msr &= ~MSR_SE;
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ 	tsk->thread.last_hit_ubp = NULL;
+ }
+ 
+@@ -326,7 +326,7 @@ int hw_breakpoint_handler(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ out:
+ 	rcu_read_unlock();
+ 	return rc;
+@@ -359,7 +359,7 @@ static int single_step_dabr_instruction(struct die_args *args)
+ 	if (!(info->type & HW_BRK_TYPE_EXTRANEOUS_IRQ))
+ 		perf_bp_event(bp, regs);
+ 
+-	__set_breakpoint(info);
++	__set_breakpoint(0, info);
+ 	current->thread.last_hit_ubp = NULL;
+ 
+ 	/*
+* Unmerged path arch/powerpc/kernel/process.c
+diff --git a/arch/powerpc/kernel/signal.c b/arch/powerpc/kernel/signal.c
+index d215f9554553..1e7f01445140 100644
+--- a/arch/powerpc/kernel/signal.c
++++ b/arch/powerpc/kernel/signal.c
+@@ -129,7 +129,7 @@ static void do_signal(struct task_struct *tsk)
+ 	 * triggered inside the kernel.
+ 	 */
+ 	if (tsk->thread.hw_brk.address && tsk->thread.hw_brk.type)
+-		__set_breakpoint(&tsk->thread.hw_brk);
++		__set_breakpoint(0, &tsk->thread.hw_brk);
+ #endif
+ 	/* Re-enable the breakpoints for the signal stack */
+ 	thread_change_pc(tsk, tsk->thread.regs);
+* Unmerged path arch/powerpc/xmon/xmon.c
