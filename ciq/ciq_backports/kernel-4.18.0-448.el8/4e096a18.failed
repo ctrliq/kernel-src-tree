@@ -1,0 +1,380 @@
+net: introduce CAN specific pointer in the struct net_device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Oleksij Rempel <o.rempel@pengutronix.de>
+commit 4e096a18867a5a989b510f6999d9c6b6622e8f7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/4e096a18.failed
+
+Since 20dd3850bcf8 ("can: Speed up CAN frame receiption by using
+ml_priv") the CAN framework uses per device specific data in the AF_CAN
+protocol. For this purpose the struct net_device->ml_priv is used. Later
+the ml_priv usage in CAN was extended for other users, one of them being
+CAN_J1939.
+
+Later in the kernel ml_priv was converted to an union, used by other
+drivers. E.g. the tun driver started storing it's stats pointer.
+
+Since tun devices can claim to be a CAN device, CAN specific protocols
+will wrongly interpret this pointer, which will cause system crashes.
+Mostly this issue is visible in the CAN_J1939 stack.
+
+To fix this issue, we request a dedicated CAN pointer within the
+net_device struct.
+
+	Reported-by: syzbot+5138c4dd15a0401bec7b@syzkaller.appspotmail.com
+Fixes: 20dd3850bcf8 ("can: Speed up CAN frame receiption by using ml_priv")
+Fixes: ffd956eef69b ("can: introduce CAN midlayer private and allocate it automatically")
+Fixes: 9d71dd0c7009 ("can: add support of SAE J1939 protocol")
+Fixes: 497a5757ce4e ("tun: switch to net core provided statistics counters")
+	Signed-off-by: Oleksij Rempel <o.rempel@pengutronix.de>
+Link: https://lore.kernel.org/r/20210223070127.4538-1-o.rempel@pengutronix.de
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 4e096a18867a5a989b510f6999d9c6b6622e8f7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/can/dev/dev.c
+#	drivers/net/can/slcan.c
+#	drivers/net/can/vcan.c
+#	drivers/net/can/vxcan.c
+#	include/linux/can/can-ml.h
+#	net/can/af_can.c
+#	net/can/j1939/main.c
+#	net/can/j1939/socket.c
+#	net/can/proc.c
+diff --cc drivers/net/can/slcan.c
+index b6c05a6b7047,30c8d53c9745..000000000000
+--- a/drivers/net/can/slcan.c
++++ b/drivers/net/can/slcan.c
+@@@ -520,7 -516,9 +520,8 @@@ static struct slcan *slc_alloc(void
+  	int i;
+  	char name[IFNAMSIZ];
+  	struct net_device *dev = NULL;
++ 	struct can_ml_priv *can_ml;
+  	struct slcan       *sl;
+ -	int size;
+  
+  	for (i = 0; i < maxdev; i++) {
+  		dev = slcan_devs[i];
+@@@ -540,6 -539,8 +541,11 @@@
+  
+  	dev->base_addr  = i;
+  	sl = netdev_priv(dev);
+++<<<<<<< HEAD
+++=======
++ 	can_ml = (void *)sl + ALIGN(sizeof(*sl), NETDEV_ALIGN);
++ 	can_set_ml_priv(dev, can_ml);
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  
+  	/* Initialize channel control data */
+  	sl->magic = SLCAN_MAGIC;
+diff --cc drivers/net/can/vcan.c
+index d200a5b0651c,067705e2850b..000000000000
+--- a/drivers/net/can/vcan.c
++++ b/drivers/net/can/vcan.c
+@@@ -157,6 -153,7 +157,10 @@@ static void vcan_setup(struct net_devic
+  	dev->addr_len		= 0;
+  	dev->tx_queue_len	= 0;
+  	dev->flags		= IFF_NOARP;
+++<<<<<<< HEAD
+++=======
++ 	can_set_ml_priv(dev, netdev_priv(dev));
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  
+  	/* set flags according to driver capabilities */
+  	if (echo)
+diff --cc drivers/net/can/vxcan.c
+index 42c9d690c9d0,8861a7d875e7..000000000000
+--- a/drivers/net/can/vxcan.c
++++ b/drivers/net/can/vxcan.c
+@@@ -157,6 -151,9 +159,12 @@@ static void vxcan_setup(struct net_devi
+  	dev->flags		= (IFF_NOARP|IFF_ECHO);
+  	dev->netdev_ops		= &vxcan_netdev_ops;
+  	dev->needs_free_netdev	= true;
+++<<<<<<< HEAD
+++=======
++ 
++ 	can_ml = netdev_priv(dev) + ALIGN(sizeof(struct vxcan_priv), NETDEV_ALIGN);
++ 	can_set_ml_priv(dev, can_ml);
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  }
+  
+  /* forward declaration for rtnl_create_link() */
+diff --cc net/can/af_can.c
+index f17b713dcaea,cce2af10eb3e..000000000000
+--- a/net/can/af_can.c
++++ b/net/can/af_can.c
+@@@ -317,17 -298,17 +317,26 @@@ inval_skb
+  }
+  EXPORT_SYMBOL(can_send);
+  
+ -/* af_can rx path */
+ +/*
+ + * af_can rx path
+ + */
+  
+ -static struct can_dev_rcv_lists *can_dev_rcv_lists_find(struct net *net,
+ -							struct net_device *dev)
+ +static struct can_dev_rcv_lists *find_dev_rcv_lists(struct net *net,
+ +						struct net_device *dev)
+  {
+++<<<<<<< HEAD
+ +	if (!dev)
+ +		return net->can.can_rx_alldev_list;
+ +	else
+ +		return (struct can_dev_rcv_lists *)dev->ml_priv;
+++=======
++ 	if (dev) {
++ 		struct can_ml_priv *can_ml = can_get_ml_priv(dev);
++ 		return &can_ml->dev_rcv_lists;
++ 	} else {
++ 		return net->can.rx_alldev_list;
++ 	}
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  }
+  
+  /**
+@@@ -832,67 -790,19 +841,70 @@@ void can_proto_unregister(const struct 
+  }
+  EXPORT_SYMBOL(can_proto_unregister);
+  
+++<<<<<<< HEAD
+ +/*
+ + * af_can notifier to create/remove CAN netdevice specific structs
+ + */
+ +static int can_notifier(struct notifier_block *nb, unsigned long msg,
+ +			void *ptr)
+ +{
+ +	struct net_device *dev = netdev_notifier_info_to_dev(ptr);
+ +	struct can_dev_rcv_lists *d;
+ +
+ +	if (dev->type != ARPHRD_CAN)
+ +		return NOTIFY_DONE;
+ +
+ +	switch (msg) {
+ +
+ +	case NETDEV_REGISTER:
+ +
+ +		/* create new dev_rcv_lists for this device */
+ +		d = kzalloc(sizeof(*d), GFP_KERNEL);
+ +		if (!d)
+ +			return NOTIFY_DONE;
+ +		BUG_ON(dev->ml_priv);
+ +		dev->ml_priv = d;
+ +
+ +		break;
+ +
+ +	case NETDEV_UNREGISTER:
+ +		spin_lock(&dev_net(dev)->can.can_rcvlists_lock);
+ +
+ +		d = dev->ml_priv;
+ +		if (d) {
+ +			if (d->entries)
+ +				d->remove_on_zero_entries = 1;
+ +			else {
+ +				kfree(d);
+ +				dev->ml_priv = NULL;
+ +			}
+ +		} else
+ +			pr_err("can: notifier: receive list not found for dev "
+ +			       "%s\n", dev->name);
+ +
+ +		spin_unlock(&dev_net(dev)->can.can_rcvlists_lock);
+ +
+ +		break;
+ +	}
+ +
+ +	return NOTIFY_DONE;
+ +}
+ +
+++=======
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  static int can_pernet_init(struct net *net)
+  {
+ -	spin_lock_init(&net->can.rcvlists_lock);
+ -	net->can.rx_alldev_list =
+ -		kzalloc(sizeof(*net->can.rx_alldev_list), GFP_KERNEL);
+ -	if (!net->can.rx_alldev_list)
+ +	spin_lock_init(&net->can.can_rcvlists_lock);
+ +	net->can.can_rx_alldev_list =
+ +		kzalloc(sizeof(struct can_dev_rcv_lists), GFP_KERNEL);
+ +	if (!net->can.can_rx_alldev_list)
+  		goto out;
+ -	net->can.pkg_stats = kzalloc(sizeof(*net->can.pkg_stats), GFP_KERNEL);
+ -	if (!net->can.pkg_stats)
+ -		goto out_free_rx_alldev_list;
+ -	net->can.rcv_lists_stats = kzalloc(sizeof(*net->can.rcv_lists_stats), GFP_KERNEL);
+ -	if (!net->can.rcv_lists_stats)
+ -		goto out_free_pkg_stats;
+ +	net->can.can_stats = kzalloc(sizeof(struct s_stats), GFP_KERNEL);
+ +	if (!net->can.can_stats)
+ +		goto out_free_alldev_list;
+ +	net->can.can_pstats = kzalloc(sizeof(struct s_pstats), GFP_KERNEL);
+ +	if (!net->can.can_pstats)
+ +		goto out_free_can_stats;
+  
+  	if (IS_ENABLED(CONFIG_PROC_FS)) {
+  		/* the statistics are updated every second (timer triggered) */
+@@@ -989,15 -879,26 +996,32 @@@ static __init int can_init(void
+  	if (!rcv_cache)
+  		return -ENOMEM;
+  
+ -	err = register_pernet_subsys(&can_pernet_ops);
+ -	if (err)
+ -		goto out_pernet;
+ +	register_pernet_subsys(&can_pernet_ops);
+  
+  	/* protocol register */
+++<<<<<<< HEAD
+ +	sock_register(&can_family_ops);
+ +	register_netdevice_notifier(&can_netdev_notifier);
+++=======
++ 	err = sock_register(&can_family_ops);
++ 	if (err)
++ 		goto out_sock;
++ 
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  	dev_add_pack(&can_packet);
+  	dev_add_pack(&canfd_packet);
+  
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ 
++ out_sock:
++ 	unregister_pernet_subsys(&can_pernet_ops);
++ out_pernet:
++ 	kmem_cache_destroy(rcv_cache);
++ 
++ 	return err;
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  }
+  
+  static __exit void can_exit(void)
+diff --cc net/can/proc.c
+index a3071f43acd7,b15760b5c1cc..000000000000
+--- a/net/can/proc.c
++++ b/net/can/proc.c
+@@@ -379,10 -378,12 +382,19 @@@ static int can_rcvlist_sff_proc_show(st
+  
+  	/* sff receive list for registered CAN devices */
+  	for_each_netdev_rcu(net, dev) {
+++<<<<<<< HEAD
+ +		if (dev->type == ARPHRD_CAN && dev->ml_priv) {
+ +			d = dev->ml_priv;
+ +			can_rcvlist_proc_show_array(m, dev, d->rx_sff,
+ +						    ARRAY_SIZE(d->rx_sff));
+++=======
++ 		struct can_ml_priv *can_ml = can_get_ml_priv(dev);
++ 
++ 		if (can_ml) {
++ 			dev_rcv_lists = &can_ml->dev_rcv_lists;
++ 			can_rcvlist_proc_show_array(m, dev, dev_rcv_lists->rx_sff,
++ 						    ARRAY_SIZE(dev_rcv_lists->rx_sff));
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  		}
+  	}
+  
+@@@ -409,10 -411,12 +421,19 @@@ static int can_rcvlist_eff_proc_show(st
+  
+  	/* eff receive list for registered CAN devices */
+  	for_each_netdev_rcu(net, dev) {
+++<<<<<<< HEAD
+ +		if (dev->type == ARPHRD_CAN && dev->ml_priv) {
+ +			d = dev->ml_priv;
+ +			can_rcvlist_proc_show_array(m, dev, d->rx_eff,
+ +						    ARRAY_SIZE(d->rx_eff));
+++=======
++ 		struct can_ml_priv *can_ml = can_get_ml_priv(dev);
++ 
++ 		if (can_ml) {
++ 			dev_rcv_lists = &can_ml->dev_rcv_lists;
++ 			can_rcvlist_proc_show_array(m, dev, dev_rcv_lists->rx_eff,
++ 						    ARRAY_SIZE(dev_rcv_lists->rx_eff));
+++>>>>>>> 4e096a18867a (net: introduce CAN specific pointer in the struct net_device)
+  		}
+  	}
+  
+* Unmerged path drivers/net/can/dev/dev.c
+* Unmerged path include/linux/can/can-ml.h
+* Unmerged path net/can/j1939/main.c
+* Unmerged path net/can/j1939/socket.c
+* Unmerged path drivers/net/can/dev/dev.c
+* Unmerged path drivers/net/can/slcan.c
+* Unmerged path drivers/net/can/vcan.c
+* Unmerged path drivers/net/can/vxcan.c
+* Unmerged path include/linux/can/can-ml.h
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 379d8bad852d..c8e8fe84edbb 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -1718,6 +1718,12 @@ enum netdev_priv_flags {
+ struct net_device_extended_rh {
+ };
+ 
++/* Specifies the type of the struct net_device::ml_priv pointer */
++enum netdev_ml_priv_type {
++	ML_PRIV_NONE,
++	ML_PRIV_CAN,
++};
++
+ /**
+  *	struct net_device - The DEVICE structure.
+  *
+@@ -1895,6 +1901,7 @@ struct net_device_extended_rh {
+  * 	@nd_net:		Network namespace this network device is inside
+  *
+  * 	@ml_priv:	Mid-layer private
++ *	@ml_priv_type:  Mid-layer private type
+  * 	@lstats:	Loopback statistics
+  * 	@tstats:	Tunnel statistics
+  * 	@dstats:	Dummy statistics
+@@ -2195,8 +2202,10 @@ struct net_device {
+ 	possible_net_t			nd_net;
+ 
+ 	/* mid-layer private */
++	void				*ml_priv;
++	enum netdev_ml_priv_type	ml_priv_type;
++
+ 	union {
+-		void					*ml_priv;
+ 		struct pcpu_lstats __percpu		*lstats;
+ 		struct pcpu_sw_netstats __percpu	*tstats;
+ 		struct pcpu_dstats __percpu		*dstats;
+@@ -2414,6 +2423,29 @@ static inline void netdev_reset_rx_headroom(struct net_device *dev)
+ 	netdev_set_rx_headroom(dev, -1);
+ }
+ 
++static inline void *netdev_get_ml_priv(struct net_device *dev,
++				       enum netdev_ml_priv_type type)
++{
++	if (dev->ml_priv_type != type)
++		return NULL;
++
++	return dev->ml_priv;
++}
++
++static inline void netdev_set_ml_priv(struct net_device *dev,
++				      void *ml_priv,
++				      enum netdev_ml_priv_type type)
++{
++	WARN(dev->ml_priv_type && dev->ml_priv_type != type,
++	     "Overwriting already set ml_priv_type (%u) with different ml_priv_type (%u)!\n",
++	     dev->ml_priv_type, type);
++	WARN(!dev->ml_priv_type && dev->ml_priv,
++	     "Overwriting already set ml_priv and ml_priv_type is ML_PRIV_NONE!\n");
++
++	dev->ml_priv = ml_priv;
++	dev->ml_priv_type = type;
++}
++
+ /*
+  * Net namespace inlines
+  */
+* Unmerged path net/can/af_can.c
+* Unmerged path net/can/j1939/main.c
+* Unmerged path net/can/j1939/socket.c
+* Unmerged path net/can/proc.c
