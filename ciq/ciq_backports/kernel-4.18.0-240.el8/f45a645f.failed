@@ -1,0 +1,252 @@
+ice: report netlist version in .info_get
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit f45a645fa6af37abb5484a8d8be779283a38fb53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f45a645f.failed
+
+The flash memory for the ice hardware contains a block of information
+used for link management called the Netlist module.
+
+As this essentially represents another section of firmware, add its
+version information to the output of the driver's .info_get handler.
+
+This includes both a version and the first few bytes of a hash of the
+module contents.
+
+  fw.netlist -> the version information extracted from the netlist module
+  fw.netlist.build-> first 4 bytes of the hash of the contents, similar
+                     to fw.mgmt.build
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Tested-by: Andrew Bowers <andrewx.bowers@intel.com>
+	Signed-off-by: Jeff Kirsher <jeffrey.t.kirsher@intel.com>
+(cherry picked from commit f45a645fa6af37abb5484a8d8be779283a38fb53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/networking/devlink/ice.rst
+#	drivers/net/ethernet/intel/ice/ice_devlink.c
+#	drivers/net/ethernet/intel/ice/ice_nvm.c
+diff --cc drivers/net/ethernet/intel/ice/ice_nvm.c
+index 1fb467323f6f,7c2a06892bbb..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_nvm.c
++++ b/drivers/net/ethernet/intel/ice/ice_nvm.c
+@@@ -243,6 -367,139 +243,142 @@@ static enum ice_status ice_get_orom_ver
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * ice_get_netlist_ver_info
++  * @hw: pointer to the HW struct
++  *
++  * Get the netlist version information
++  */
++ static enum ice_status ice_get_netlist_ver_info(struct ice_hw *hw)
++ {
++ 	struct ice_netlist_ver_info *ver = &hw->netlist_ver;
++ 	enum ice_status ret;
++ 	u32 id_blk_start;
++ 	__le16 raw_data;
++ 	u16 data, i;
++ 	u16 *buff;
++ 
++ 	ret = ice_acquire_nvm(hw, ICE_RES_READ);
++ 	if (ret)
++ 		return ret;
++ 	buff = kcalloc(ICE_AQC_NVM_NETLIST_ID_BLK_LEN, sizeof(*buff),
++ 		       GFP_KERNEL);
++ 	if (!buff) {
++ 		ret = ICE_ERR_NO_MEMORY;
++ 		goto exit_no_mem;
++ 	}
++ 
++ 	/* read module length */
++ 	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
++ 			      ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN_OFFSET * 2,
++ 			      ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN, &raw_data,
++ 			      false, false, NULL);
++ 	if (ret)
++ 		goto exit_error;
++ 
++ 	data = le16_to_cpu(raw_data);
++ 	/* exit if length is = 0 */
++ 	if (!data)
++ 		goto exit_error;
++ 
++ 	/* read node count */
++ 	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
++ 			      ICE_AQC_NVM_NETLIST_NODE_COUNT_OFFSET * 2,
++ 			      ICE_AQC_NVM_NETLIST_NODE_COUNT_LEN, &raw_data,
++ 			      false, false, NULL);
++ 	if (ret)
++ 		goto exit_error;
++ 	data = le16_to_cpu(raw_data) & ICE_AQC_NVM_NETLIST_NODE_COUNT_M;
++ 
++ 	/* netlist ID block starts from offset 4 + node count * 2 */
++ 	id_blk_start = ICE_AQC_NVM_NETLIST_ID_BLK_START_OFFSET + data * 2;
++ 
++ 	/* read the entire netlist ID block */
++ 	ret = ice_aq_read_nvm(hw, ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID,
++ 			      id_blk_start * 2,
++ 			      ICE_AQC_NVM_NETLIST_ID_BLK_LEN * 2, buff, false,
++ 			      false, NULL);
++ 	if (ret)
++ 		goto exit_error;
++ 
++ 	for (i = 0; i < ICE_AQC_NVM_NETLIST_ID_BLK_LEN; i++)
++ 		buff[i] = le16_to_cpu(((__force __le16 *)buff)[i]);
++ 
++ 	ver->major = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_HIGH] << 16) |
++ 		buff[ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_LOW];
++ 	ver->minor = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_HIGH] << 16) |
++ 		buff[ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_LOW];
++ 	ver->type = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_HIGH] << 16) |
++ 		buff[ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_LOW];
++ 	ver->rev = (buff[ICE_AQC_NVM_NETLIST_ID_BLK_REV_HIGH] << 16) |
++ 		buff[ICE_AQC_NVM_NETLIST_ID_BLK_REV_LOW];
++ 	ver->cust_ver = buff[ICE_AQC_NVM_NETLIST_ID_BLK_CUST_VER];
++ 	/* Read the left most 4 bytes of SHA */
++ 	ver->hash = buff[ICE_AQC_NVM_NETLIST_ID_BLK_SHA_HASH + 15] << 16 |
++ 		buff[ICE_AQC_NVM_NETLIST_ID_BLK_SHA_HASH + 14];
++ 
++ exit_error:
++ 	kfree(buff);
++ exit_no_mem:
++ 	ice_release_nvm(hw);
++ 	return ret;
++ }
++ 
++ /**
++  * ice_discover_flash_size - Discover the available flash size.
++  * @hw: pointer to the HW struct
++  *
++  * The device flash could be up to 16MB in size. However, it is possible that
++  * the actual size is smaller. Use bisection to determine the accessible size
++  * of flash memory.
++  */
++ static enum ice_status ice_discover_flash_size(struct ice_hw *hw)
++ {
++ 	u32 min_size = 0, max_size = ICE_AQC_NVM_MAX_OFFSET + 1;
++ 	enum ice_status status;
++ 
++ 	status = ice_acquire_nvm(hw, ICE_RES_READ);
++ 	if (status)
++ 		return status;
++ 
++ 	while ((max_size - min_size) > 1) {
++ 		u32 offset = (max_size + min_size) / 2;
++ 		u32 len = 1;
++ 		u8 data;
++ 
++ 		status = ice_read_flat_nvm(hw, offset, &len, &data, false);
++ 		if (status == ICE_ERR_AQ_ERROR &&
++ 		    hw->adminq.sq_last_status == ICE_AQ_RC_EINVAL) {
++ 			ice_debug(hw, ICE_DBG_NVM,
++ 				  "%s: New upper bound of %u bytes\n",
++ 				  __func__, offset);
++ 			status = 0;
++ 			max_size = offset;
++ 		} else if (!status) {
++ 			ice_debug(hw, ICE_DBG_NVM,
++ 				  "%s: New lower bound of %u bytes\n",
++ 				  __func__, offset);
++ 			min_size = offset;
++ 		} else {
++ 			/* an unexpected error occurred */
++ 			goto err_read_flat_nvm;
++ 		}
++ 	}
++ 
++ 	ice_debug(hw, ICE_DBG_NVM,
++ 		  "Predicted flash size is %u bytes\n", max_size);
++ 
++ 	hw->nvm.flash_size = max_size;
++ 
++ err_read_flat_nvm:
++ 	ice_release_nvm(hw);
++ 
++ 	return status;
++ }
++ 
++ /**
+++>>>>>>> f45a645fa6af (ice: report netlist version in .info_get)
+   * ice_init_nvm - initializes NVM setting
+   * @hw: pointer to the HW struct
+   *
+* Unmerged path Documentation/networking/devlink/ice.rst
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+* Unmerged path Documentation/networking/devlink/ice.rst
+diff --git a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+index 2240f226568f..69eb03c45c4b 100644
+--- a/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
++++ b/drivers/net/ethernet/intel/ice/ice_adminq_cmd.h
+@@ -1263,6 +1263,33 @@ struct ice_aqc_nvm_checksum {
+ 	u8 rsvd2[12];
+ };
+ 
++/* The result of netlist NVM read comes in a TLV format. The actual data
++ * (netlist header) starts from word offset 1 (byte 2). The FW strips
++ * out the type field from the TLV header so all the netlist fields
++ * should adjust their offset value by 1 word (2 bytes) in order to map
++ * their correct location.
++ */
++#define ICE_AQC_NVM_LINK_TOPO_NETLIST_MOD_ID		0x11B
++#define ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN_OFFSET	1
++#define ICE_AQC_NVM_LINK_TOPO_NETLIST_LEN		2 /* In bytes */
++#define ICE_AQC_NVM_NETLIST_NODE_COUNT_OFFSET		2
++#define ICE_AQC_NVM_NETLIST_NODE_COUNT_LEN		2 /* In bytes */
++#define ICE_AQC_NVM_NETLIST_NODE_COUNT_M		ICE_M(0x3FF, 0)
++#define ICE_AQC_NVM_NETLIST_ID_BLK_START_OFFSET		5
++#define ICE_AQC_NVM_NETLIST_ID_BLK_LEN			0x30 /* In words */
++
++/* netlist ID block field offsets (word offsets) */
++#define ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_LOW	2
++#define ICE_AQC_NVM_NETLIST_ID_BLK_MAJOR_VER_HIGH	3
++#define ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_LOW	4
++#define ICE_AQC_NVM_NETLIST_ID_BLK_MINOR_VER_HIGH	5
++#define ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_LOW		6
++#define ICE_AQC_NVM_NETLIST_ID_BLK_TYPE_HIGH		7
++#define ICE_AQC_NVM_NETLIST_ID_BLK_REV_LOW		8
++#define ICE_AQC_NVM_NETLIST_ID_BLK_REV_HIGH		9
++#define ICE_AQC_NVM_NETLIST_ID_BLK_SHA_HASH		0xA
++#define ICE_AQC_NVM_NETLIST_ID_BLK_CUST_VER		0x2F
++
+ /**
+  * Send to PF command (indirect 0x0801) ID is only used by PF
+  *
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_nvm.c
+diff --git a/drivers/net/ethernet/intel/ice/ice_type.h b/drivers/net/ethernet/intel/ice/ice_type.h
+index 28048b67cefb..1fd8c5823c0c 100644
+--- a/drivers/net/ethernet/intel/ice/ice_type.h
++++ b/drivers/net/ethernet/intel/ice/ice_type.h
+@@ -258,6 +258,16 @@ struct ice_nvm_info {
+ 
+ #define ICE_NVM_VER_LEN	32
+ 
++/* netlist version information */
++struct ice_netlist_ver_info {
++	u32 major;			/* major high/low */
++	u32 minor;			/* minor high/low */
++	u32 type;			/* type high/low */
++	u32 rev;			/* revision high/low */
++	u32 hash;			/* SHA-1 hash word */
++	u16 cust_ver;			/* customer version */
++};
++
+ /* Max number of port to queue branches w.r.t topology */
+ #define ICE_MAX_TRAFFIC_CLASS 8
+ #define ICE_TXSCHED_MAX_BRANCHES ICE_MAX_TRAFFIC_CLASS
+@@ -505,6 +515,7 @@ struct ice_hw {
+ 	struct ice_nvm_info nvm;
+ 	struct ice_hw_dev_caps dev_caps;	/* device capabilities */
+ 	struct ice_hw_func_caps func_caps;	/* function capabilities */
++	struct ice_netlist_ver_info netlist_ver; /* netlist version info */
+ 
+ 	struct ice_switch_info *switch_info;	/* switch filter lists */
+ 
