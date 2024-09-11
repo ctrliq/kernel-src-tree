@@ -1,0 +1,206 @@
+cifs: get rid of cifs_sb->mountdata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Ronnie Sahlberg <lsahlber@redhat.com>
+commit a2a52a8a3601c37a68b31b734f5a06af8a7903f1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/a2a52a8a.failed
+
+as we now have a full smb3_fs_context as part of the cifs superblock
+we no longer need a local copy of the mount options and can just
+reference the copy in the smb3_fs_context.
+
+	Signed-off-by: Ronnie Sahlberg <lsahlber@redhat.com>
+	Reviewed-by: Shyam Prasad N <sprasad@microsoft.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit a2a52a8a3601c37a68b31b734f5a06af8a7903f1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/cifs_dfs_ref.c
+#	fs/cifs/cifsfs.c
+#	fs/cifs/connect.c
+diff --cc fs/cifs/cifs_dfs_ref.c
+index b57afa90dc46,6f7187b90fda..000000000000
+--- a/fs/cifs/cifs_dfs_ref.c
++++ b/fs/cifs/cifs_dfs_ref.c
+@@@ -278,9 -271,13 +279,14 @@@ static struct vfsmount *cifs_dfs_do_mou
+  
+  	convert_delimiter(devname, '/');
+  
+ -	/* TODO: change to call fs_context_for_mount(), fill in context directly, call fc_mount */
+ -
+ -	/* See afs_mntpt_do_automount in fs/afs/mntpt.c for an example */
+ -
+  	/* strip first '\' from fullpath */
+++<<<<<<< HEAD
+ +	mountdata = cifs_compose_mount_options(cifs_sb->mountdata,
+ +					       fullpath + 1, NULL, NULL);
+++=======
++ 	mountdata = cifs_compose_mount_options(cifs_sb->ctx->mount_options,
++ 					       fullpath + 1, NULL);
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  	if (IS_ERR(mountdata)) {
+  		kfree(devname);
+  		return (struct vfsmount *)mountdata;
+diff --cc fs/cifs/cifsfs.c
+index bb1bb435a156,4f27f77d3053..000000000000
+--- a/fs/cifs/cifsfs.c
++++ b/fs/cifs/cifsfs.c
+@@@ -811,22 -792,33 +811,43 @@@ cifs_smb3_do_mount(struct file_system_t
+  	cifs_sb = kzalloc(sizeof(struct cifs_sb_info), GFP_KERNEL);
+  	if (cifs_sb == NULL) {
+  		root = ERR_PTR(-ENOMEM);
+ -		goto out;
+ +		goto out_nls;
+  	}
+  
+++<<<<<<< HEAD
+ +	cifs_sb->mountdata = kstrndup(data, PAGE_SIZE, GFP_KERNEL);
+ +	if (cifs_sb->mountdata == NULL) {
+ +		root = ERR_PTR(-ENOMEM);
+ +		goto out_free;
+ +	}
+ +
+ +	rc = cifs_setup_cifs_sb(ctx, cifs_sb);
+++=======
++ 	cifs_sb->ctx = kzalloc(sizeof(struct smb3_fs_context), GFP_KERNEL);
++ 	if (!cifs_sb->ctx) {
++ 		root = ERR_PTR(-ENOMEM);
++ 		goto out;
++ 	}
++ 	rc = smb3_fs_context_dup(cifs_sb->ctx, old_ctx);
++ 	if (rc) {
++ 		root = ERR_PTR(rc);
++ 		goto out;
++ 	}
++ 
++ 	rc = cifs_setup_volume_info(cifs_sb->ctx);
++ 	if (rc) {
++ 		root = ERR_PTR(rc);
++ 		goto out;
++ 	}
++ 
++ 	rc = cifs_setup_cifs_sb(cifs_sb->ctx, cifs_sb);
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  	if (rc) {
+  		root = ERR_PTR(rc);
+ -		goto out;
+ +		goto out_free;
+  	}
+  
+ -	rc = cifs_mount(cifs_sb, cifs_sb->ctx);
+ +	rc = cifs_mount(cifs_sb, ctx);
+  	if (rc) {
+  		if (!(flags & SB_SILENT))
+  			cifs_dbg(VFS, "cifs_mount failed w/return code = %d\n",
+@@@ -872,31 -864,14 +893,39 @@@
+  out_super:
+  	deactivate_locked_super(sb);
+  out:
+++<<<<<<< HEAD
+ +	cifs_cleanup_volume_info(ctx);
+++=======
++ 	if (cifs_sb) {
++ 		kfree(cifs_sb->prepath);
++ 		cifs_cleanup_volume_info(cifs_sb->ctx);
++ 		kfree(cifs_sb);
++ 	}
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  	return root;
+ +
+ +out_free:
+ +	kfree(cifs_sb->prepath);
+ +	kfree(cifs_sb->mountdata);
+ +	kfree(cifs_sb);
+ +out_nls:
+ +	unload_nls(ctx->local_nls);
+ +	goto out;
+  }
+  
+ +static struct dentry *
+ +smb3_do_mount(struct file_system_type *fs_type,
+ +	      int flags, const char *dev_name, void *data)
+ +{
+ +	return cifs_smb3_do_mount(fs_type, flags, dev_name, data, true);
+ +}
+ +
+ +static struct dentry *
+ +cifs_do_mount(struct file_system_type *fs_type,
+ +	      int flags, const char *dev_name, void *data)
+ +{
+ +	return cifs_smb3_do_mount(fs_type, flags, dev_name, data, false);
+ +}
+  
+  static ssize_t
+  cifs_loose_read_iter(struct kiocb *iocb, struct iov_iter *iter)
+diff --cc fs/cifs/connect.c
+index aef3c1f69972,95b12f148735..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -4122,11 -3038,8 +4122,16 @@@ expand_dfs_referral(const unsigned int 
+  	rc = dfs_cache_find(xid, ses, cifs_sb->local_nls, cifs_remap(cifs_sb),
+  			    ref_path, &referral, NULL);
+  	if (!rc) {
+++<<<<<<< HEAD
+ +		char *fake_devname = NULL;
+ +
+ +		mdata = cifs_compose_mount_options(cifs_sb->mountdata,
+ +						   full_path + 1, &referral,
+ +						   &fake_devname);
+++=======
++ 		mdata = cifs_compose_mount_options(cifs_sb->ctx->mount_options,
++ 						   full_path + 1, &referral);
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  		free_dfs_info_param(&referral);
+  
+  		if (IS_ERR(mdata)) {
+@@@ -4134,12 -3047,10 +4139,17 @@@
+  			mdata = NULL;
+  		} else {
+  			cifs_cleanup_volume_info_contents(ctx);
+ -			rc = cifs_setup_volume_info(ctx);
+ +			rc = cifs_setup_volume_info(ctx, mdata,
+ +						    fake_devname, false);
+  		}
+++<<<<<<< HEAD
+ +		kfree(fake_devname);
+ +		kfree(cifs_sb->mountdata);
+ +		cifs_sb->mountdata = mdata;
+++=======
++ 		kfree(cifs_sb->ctx->mount_options);
++ 		cifs_sb->ctx->mount_options = mdata;
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  	}
+  	kfree(full_path);
+  	return rc;
+@@@ -4198,7 -3109,8 +4208,12 @@@ static int setup_dfs_tgt_conn(const cha
+  	if (rc)
+  		return rc;
+  
+++<<<<<<< HEAD
+ +	mdata = cifs_compose_mount_options(cifs_sb->mountdata, full_path + 1, &ref, &fake_devname);
+++=======
++ 	mdata = cifs_compose_mount_options(cifs_sb->ctx->mount_options,
++ 					   full_path + 1, &ref);
+++>>>>>>> a2a52a8a3601 (cifs: get rid of cifs_sb->mountdata)
+  	free_dfs_info_param(&ref);
+  
+  	if (IS_ERR(mdata)) {
+* Unmerged path fs/cifs/cifs_dfs_ref.c
+diff --git a/fs/cifs/cifs_fs_sb.h b/fs/cifs/cifs_fs_sb.h
+index 6e7c4427369d..3073141c23e5 100644
+--- a/fs/cifs/cifs_fs_sb.h
++++ b/fs/cifs/cifs_fs_sb.h
+@@ -73,7 +73,6 @@ struct cifs_sb_info {
+ 	umode_t	mnt_file_mode;
+ 	umode_t	mnt_dir_mode;
+ 	unsigned int mnt_cifs_flags;
+-	char   *mountdata; /* options received at mount time or via DFS refs */
+ 	struct delayed_work prune_tlinks;
+ 	struct rcu_head rcu;
+ 
+* Unmerged path fs/cifs/cifsfs.c
+* Unmerged path fs/cifs/connect.c
