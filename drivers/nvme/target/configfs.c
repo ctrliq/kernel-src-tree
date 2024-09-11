@@ -403,13 +403,11 @@ static ssize_t nvmet_ns_device_uuid_store(struct config_item *item,
 	struct nvmet_subsys *subsys = ns->subsys;
 	int ret = 0;
 
-
 	mutex_lock(&subsys->lock);
 	if (ns->enabled) {
 		ret = -EBUSY;
 		goto out_unlock;
 	}
-
 
 	if (uuid_parse(page, &ns->uuid))
 		ret = -EINVAL;
@@ -823,10 +821,10 @@ static ssize_t nvmet_subsys_attr_version_show(struct config_item *item,
 				(int)NVME_MAJOR(subsys->ver),
 				(int)NVME_MINOR(subsys->ver),
 				(int)NVME_TERTIARY(subsys->ver));
-	else
-		return snprintf(page, PAGE_SIZE, "%d.%d\n",
-				(int)NVME_MAJOR(subsys->ver),
-				(int)NVME_MINOR(subsys->ver));
+
+	return snprintf(page, PAGE_SIZE, "%d.%d\n",
+			(int)NVME_MAJOR(subsys->ver),
+			(int)NVME_MINOR(subsys->ver));
 }
 
 static ssize_t nvmet_subsys_attr_version_store(struct config_item *item,
@@ -835,7 +833,6 @@ static ssize_t nvmet_subsys_attr_version_store(struct config_item *item,
 	struct nvmet_subsys *subsys = to_subsys(item);
 	int major, minor, tertiary = 0;
 	int ret;
-
 
 	ret = sscanf(page, "%d.%d.%d\n", &major, &minor, &tertiary);
 	if (ret != 2 && ret != 3)
