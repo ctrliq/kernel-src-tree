@@ -1,0 +1,191 @@
+x86/kvm/nVMX: nested state migration for Enlightened VMCS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 8cab6507f64eff0ccfea01fccbc7e3e05e2aaf7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8cab6507.failed
+
+Add support for get/set of nested state when Enlightened VMCS is in use.
+A new KVM_STATE_NESTED_EVMCS flag to indicate eVMCS on the vCPU was enabled
+is added.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8cab6507f64eff0ccfea01fccbc7e3e05e2aaf7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 981512975df3,8d7c60faaacd..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1597,6 -1601,35 +1597,38 @@@ static inline void evmcs_sanitize_exec_
+  static inline void evmcs_touch_msr_bitmap(void) {}
+  #endif /* IS_ENABLED(CONFIG_HYPERV) */
+  
+++<<<<<<< HEAD
+++=======
++ static int nested_enable_evmcs(struct kvm_vcpu *vcpu,
++ 			       uint16_t *vmcs_version)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	/* We don't support disabling the feature for simplicity. */
++ 	if (vmx->nested.enlightened_vmcs_enabled)
++ 		return 0;
++ 
++ 	vmx->nested.enlightened_vmcs_enabled = true;
++ 
++ 	/*
++ 	 * vmcs_version represents the range of supported Enlightened VMCS
++ 	 * versions: lower 8 bits is the minimal version, higher 8 bits is the
++ 	 * maximum supported version. KVM supports versions from 1 to
++ 	 * KVM_EVMCS_VERSION.
++ 	 */
++ 	if (vmcs_version)
++ 		*vmcs_version = (KVM_EVMCS_VERSION << 8) | 1;
++ 
++ 	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
++ 	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
++ 	vmx->nested.msrs.exit_ctls_high &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
++ 	vmx->nested.msrs.secondary_ctls_high &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
++ 	vmx->nested.msrs.vmfunc_controls &= ~EVMCS1_UNSUPPORTED_VMFUNC;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 8cab6507f64e (x86/kvm/nVMX: nested state migration for Enlightened VMCS)
+  static inline bool is_exception_n(u32 intr_info, u8 vector)
+  {
+  	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
+@@@ -9313,8 -9332,71 +9345,76 @@@ static int handle_vmptrld(struct kvm_vc
+  		set_current_vmptr(vmx, vmptr);
+  	}
+  
+++<<<<<<< HEAD
+ +	nested_vmx_succeed(vcpu);
+ +	return kvm_skip_emulated_instruction(vcpu);
+++=======
++ 	return nested_vmx_succeed(vcpu);
++ }
++ 
++ /*
++  * This is an equivalent of the nested hypervisor executing the vmptrld
++  * instruction.
++  */
++ static int nested_vmx_handle_enlightened_vmptrld(struct kvm_vcpu *vcpu,
++ 						 bool from_launch)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	struct hv_vp_assist_page assist_page;
++ 
++ 	if (likely(!vmx->nested.enlightened_vmcs_enabled))
++ 		return 1;
++ 
++ 	if (unlikely(!kvm_hv_get_assist_page(vcpu, &assist_page)))
++ 		return 1;
++ 
++ 	if (unlikely(!assist_page.enlighten_vmentry))
++ 		return 1;
++ 
++ 	if (unlikely(assist_page.current_nested_vmcs !=
++ 		     vmx->nested.hv_evmcs_vmptr)) {
++ 
++ 		if (!vmx->nested.hv_evmcs)
++ 			vmx->nested.current_vmptr = -1ull;
++ 
++ 		nested_release_evmcs(vcpu);
++ 
++ 		vmx->nested.hv_evmcs_page = kvm_vcpu_gpa_to_page(
++ 			vcpu, assist_page.current_nested_vmcs);
++ 
++ 		if (unlikely(is_error_page(vmx->nested.hv_evmcs_page)))
++ 			return 0;
++ 
++ 		vmx->nested.hv_evmcs = kmap(vmx->nested.hv_evmcs_page);
++ 
++ 		if (vmx->nested.hv_evmcs->revision_id != VMCS12_REVISION) {
++ 			nested_release_evmcs(vcpu);
++ 			return 0;
++ 		}
++ 
++ 		vmx->nested.dirty_vmcs12 = true;
++ 		/*
++ 		 * As we keep L2 state for one guest only 'hv_clean_fields' mask
++ 		 * can't be used when we switch between them. Reset it here for
++ 		 * simplicity.
++ 		 */
++ 		vmx->nested.hv_evmcs->hv_clean_fields &=
++ 			~HV_VMX_ENLIGHTENED_CLEAN_FIELD_ALL;
++ 		vmx->nested.hv_evmcs_vmptr = assist_page.current_nested_vmcs;
++ 
++ 		/*
++ 		 * Unlike normal vmcs12, enlightened vmcs12 is not fully
++ 		 * reloaded from guest's memory (read only fields, fields not
++ 		 * present in struct hv_enlightened_vmcs, ...). Make sure there
++ 		 * are no leftovers.
++ 		 */
++ 		if (from_launch)
++ 			memset(vmx->nested.cached_vmcs12, 0,
++ 			       sizeof(*vmx->nested.cached_vmcs12));
++ 
++ 	}
++ 	return 1;
+++>>>>>>> 8cab6507f64e (x86/kvm/nVMX: nested state migration for Enlightened VMCS)
+  }
+  
+  /* Emulate the VMPTRST instruction */
+@@@ -13361,8 -13436,11 +13470,16 @@@ static int nested_vmx_run(struct kvm_vc
+  	if (!nested_vmx_check_permission(vcpu))
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	if (!nested_vmx_check_vmcs12(vcpu))
+ +		goto out;
+++=======
++ 	if (!nested_vmx_handle_enlightened_vmptrld(vcpu, true))
++ 		return 1;
++ 
++ 	if (!vmx->nested.hv_evmcs && vmx->nested.current_vmptr == -1ull)
++ 		return nested_vmx_failInvalid(vcpu);
+++>>>>>>> 8cab6507f64e (x86/kvm/nVMX: nested state migration for Enlightened VMCS)
+  
+  	vmcs12 = get_vmcs12(vcpu);
+  
+diff --git a/arch/x86/include/uapi/asm/kvm.h b/arch/x86/include/uapi/asm/kvm.h
+index fd23d5778ea1..ab76aa1d3a4d 100644
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@ -381,6 +381,7 @@ struct kvm_sync_regs {
+ 
+ #define KVM_STATE_NESTED_GUEST_MODE	0x00000001
+ #define KVM_STATE_NESTED_RUN_PENDING	0x00000002
++#define KVM_STATE_NESTED_EVMCS		0x00000004
+ 
+ #define KVM_STATE_NESTED_SMM_GUEST_MODE	0x00000001
+ #define KVM_STATE_NESTED_SMM_VMXON	0x00000002
+* Unmerged path arch/x86/kvm/vmx.c
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index ec01edf7f9e4..4c3d69e6b1c6 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -4054,11 +4054,13 @@ long kvm_arch_vcpu_ioctl(struct file *filp,
+ 			break;
+ 
+ 		if (kvm_state.flags &
+-		    ~(KVM_STATE_NESTED_RUN_PENDING | KVM_STATE_NESTED_GUEST_MODE))
++		    ~(KVM_STATE_NESTED_RUN_PENDING | KVM_STATE_NESTED_GUEST_MODE
++		      | KVM_STATE_NESTED_EVMCS))
+ 			break;
+ 
+ 		/* nested_run_pending implies guest_mode.  */
+-		if (kvm_state.flags == KVM_STATE_NESTED_RUN_PENDING)
++		if ((kvm_state.flags & KVM_STATE_NESTED_RUN_PENDING)
++		    && !(kvm_state.flags & KVM_STATE_NESTED_GUEST_MODE))
+ 			break;
+ 
+ 		r = kvm_x86_ops->set_nested_state(vcpu, user_kvm_nested_state, &kvm_state);
