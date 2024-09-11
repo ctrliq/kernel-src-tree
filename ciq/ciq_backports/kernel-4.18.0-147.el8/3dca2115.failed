@@ -1,0 +1,204 @@
+bpf, libbpf: simplify and cleanup perf ring buffer walk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 3dca21156b5f809510e8c3efe7f1046e27242e3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/3dca2115.failed
+
+Simplify bpf_perf_event_read_simple() a bit and fix up some minor
+things along the way: the return code in the header is not of type
+int but enum bpf_perf_event_ret instead. Once callback indicated
+to break the loop walking event data, it also needs to be consumed
+in data_tail since it has been processed already.
+
+Moreover, bpf_perf_event_print_t callback should avoid void * as
+we actually get a pointer to struct perf_event_header and thus
+applications can make use of container_of() to have type checks.
+The walk also doesn't have to use modulo op since the ring size is
+required to be power of two.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 3dca21156b5f809510e8c3efe7f1046e27242e3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.h
+diff --cc tools/lib/bpf/libbpf.h
+index c8c168c73302,1f3468dad8b2..000000000000
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@@ -298,10 -297,24 +298,34 @@@ enum bpf_perf_event_ret 
+  	LIBBPF_PERF_EVENT_CONT	= -2,
+  };
+  
+++<<<<<<< HEAD
+ +typedef enum bpf_perf_event_ret (*bpf_perf_event_print_t)(void *event,
+ +							  void *priv);
+ +int bpf_perf_event_read_simple(void *mem, unsigned long size,
+ +			       unsigned long page_size,
+ +			       void **buf, size_t *buf_len,
+ +			       bpf_perf_event_print_t fn, void *priv);
+ +#endif
+++=======
++ struct perf_event_header;
++ typedef enum bpf_perf_event_ret
++ 	(*bpf_perf_event_print_t)(struct perf_event_header *hdr,
++ 				  void *private_data);
++ LIBBPF_API enum bpf_perf_event_ret
++ bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
++ 			   void **copy_mem, size_t *copy_size,
++ 			   bpf_perf_event_print_t fn, void *private_data);
++ 
++ struct nlattr;
++ typedef int (*libbpf_dump_nlmsg_t)(void *cookie, void *msg, struct nlattr **tb);
++ int libbpf_netlink_open(unsigned int *nl_pid);
++ int libbpf_nl_get_link(int sock, unsigned int nl_pid,
++ 		       libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie);
++ int libbpf_nl_get_class(int sock, unsigned int nl_pid, int ifindex,
++ 			libbpf_dump_nlmsg_t dump_class_nlmsg, void *cookie);
++ int libbpf_nl_get_qdisc(int sock, unsigned int nl_pid, int ifindex,
++ 			libbpf_dump_nlmsg_t dump_qdisc_nlmsg, void *cookie);
++ int libbpf_nl_get_filter(int sock, unsigned int nl_pid, int ifindex, int handle,
++ 			 libbpf_dump_nlmsg_t dump_filter_nlmsg, void *cookie);
++ #endif /* __LIBBPF_LIBBPF_H */
+++>>>>>>> 3dca21156b5f (bpf, libbpf: simplify and cleanup perf ring buffer walk)
+diff --git a/tools/bpf/bpftool/map_perf_ring.c b/tools/bpf/bpftool/map_perf_ring.c
+index 6d41323be291..bdaf4062e26e 100644
+--- a/tools/bpf/bpftool/map_perf_ring.c
++++ b/tools/bpf/bpftool/map_perf_ring.c
+@@ -50,15 +50,17 @@ static void int_exit(int signo)
+ 	stop = true;
+ }
+ 
+-static enum bpf_perf_event_ret print_bpf_output(void *event, void *priv)
++static enum bpf_perf_event_ret
++print_bpf_output(struct perf_event_header *event, void *private_data)
+ {
+-	struct event_ring_info *ring = priv;
+-	struct perf_event_sample *e = event;
++	struct perf_event_sample *e = container_of(event, struct perf_event_sample,
++						   header);
++	struct event_ring_info *ring = private_data;
+ 	struct {
+ 		struct perf_event_header header;
+ 		__u64 id;
+ 		__u64 lost;
+-	} *lost = event;
++	} *lost = (typeof(lost))event;
+ 
+ 	if (json_output) {
+ 		jsonw_start_object(json_wtr);
+diff --git a/tools/lib/bpf/libbpf.c b/tools/lib/bpf/libbpf.c
+index 16c776507656..0aedcd9d2b0e 100644
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@ -2428,56 +2428,47 @@ int bpf_prog_load_xattr(const struct bpf_prog_load_attr *attr,
+ }
+ 
+ enum bpf_perf_event_ret
+-bpf_perf_event_read_simple(void *mem, unsigned long size,
+-			   unsigned long page_size, void **buf, size_t *buf_len,
+-			   bpf_perf_event_print_t fn, void *priv)
++bpf_perf_event_read_simple(void *mmap_mem, size_t mmap_size, size_t page_size,
++			   void **copy_mem, size_t *copy_size,
++			   bpf_perf_event_print_t fn, void *private_data)
+ {
+-	struct perf_event_mmap_page *header = mem;
++	struct perf_event_mmap_page *header = mmap_mem;
+ 	__u64 data_head = ring_buffer_read_head(header);
+ 	__u64 data_tail = header->data_tail;
+-	int ret = LIBBPF_PERF_EVENT_ERROR;
+-	void *base, *begin, *end;
+-
+-	if (data_head == data_tail)
+-		return LIBBPF_PERF_EVENT_CONT;
+-
+-	base = ((char *)header) + page_size;
+-
+-	begin = base + data_tail % size;
+-	end = base + data_head % size;
+-
+-	while (begin != end) {
+-		struct perf_event_header *ehdr;
+-
+-		ehdr = begin;
+-		if (begin + ehdr->size > base + size) {
+-			long len = base + size - begin;
+-
+-			if (*buf_len < ehdr->size) {
+-				free(*buf);
+-				*buf = malloc(ehdr->size);
+-				if (!*buf) {
++	void *base = ((__u8 *)header) + page_size;
++	int ret = LIBBPF_PERF_EVENT_CONT;
++	struct perf_event_header *ehdr;
++	size_t ehdr_size;
++
++	while (data_head != data_tail) {
++		ehdr = base + (data_tail & (mmap_size - 1));
++		ehdr_size = ehdr->size;
++
++		if (((void *)ehdr) + ehdr_size > base + mmap_size) {
++			void *copy_start = ehdr;
++			size_t len_first = base + mmap_size - copy_start;
++			size_t len_secnd = ehdr_size - len_first;
++
++			if (*copy_size < ehdr_size) {
++				free(*copy_mem);
++				*copy_mem = malloc(ehdr_size);
++				if (!*copy_mem) {
++					*copy_size = 0;
+ 					ret = LIBBPF_PERF_EVENT_ERROR;
+ 					break;
+ 				}
+-				*buf_len = ehdr->size;
++				*copy_size = ehdr_size;
+ 			}
+ 
+-			memcpy(*buf, begin, len);
+-			memcpy(*buf + len, base, ehdr->size - len);
+-			ehdr = (void *)*buf;
+-			begin = base + ehdr->size - len;
+-		} else if (begin + ehdr->size == base + size) {
+-			begin = base;
+-		} else {
+-			begin += ehdr->size;
++			memcpy(*copy_mem, copy_start, len_first);
++			memcpy(*copy_mem + len_first, base, len_secnd);
++			ehdr = *copy_mem;
+ 		}
+ 
+-		ret = fn(ehdr, priv);
++		ret = fn(ehdr, private_data);
++		data_tail += ehdr_size;
+ 		if (ret != LIBBPF_PERF_EVENT_CONT)
+ 			break;
+-
+-		data_tail += ehdr->size;
+ 	}
+ 
+ 	ring_buffer_write_tail(header, data_tail);
+* Unmerged path tools/lib/bpf/libbpf.h
+diff --git a/tools/testing/selftests/bpf/trace_helpers.c b/tools/testing/selftests/bpf/trace_helpers.c
+index a3d1dace4a75..4cdb63bf0521 100644
+--- a/tools/testing/selftests/bpf/trace_helpers.c
++++ b/tools/testing/selftests/bpf/trace_helpers.c
+@@ -125,10 +125,11 @@ struct perf_event_sample {
+ 	char data[];
+ };
+ 
+-static enum bpf_perf_event_ret bpf_perf_event_print(void *event, void *priv)
++static enum bpf_perf_event_ret
++bpf_perf_event_print(struct perf_event_header *hdr, void *private_data)
+ {
+-	struct perf_event_sample *e = event;
+-	perf_event_print_fn fn = priv;
++	struct perf_event_sample *e = (struct perf_event_sample *)hdr;
++	perf_event_print_fn fn = private_data;
+ 	int ret;
+ 
+ 	if (e->header.type == PERF_RECORD_SAMPLE) {
