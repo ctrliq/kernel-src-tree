@@ -2011,8 +2011,8 @@ static void pqi_dev_info(struct pqi_ctrl_info *ctrl_info,
 
 /* Assumes the SCSI device list lock is held. */
 
-static void pqi_scsi_update_device(struct pqi_scsi_dev *existing_device,
-	struct pqi_scsi_dev *new_device)
+static void pqi_scsi_update_device(struct pqi_ctrl_info *ctrl_info,
+	struct pqi_scsi_dev *existing_device, struct pqi_scsi_dev *new_device)
 {
 	existing_device->device_type = new_device->device_type;
 	existing_device->bus = new_device->bus;
@@ -2022,9 +2022,8 @@ static void pqi_scsi_update_device(struct pqi_scsi_dev *existing_device,
 		existing_device->target_lun_valid = true;
 	}
 
-	if ((existing_device->volume_status == CISS_LV_QUEUED_FOR_EXPANSION ||
-		existing_device->volume_status == CISS_LV_UNDERGOING_EXPANSION) &&
-		new_device->volume_status == CISS_LV_OK)
+	if (pqi_is_logical_device(existing_device) &&
+		ctrl_info->logical_volume_rescan_needed)
 		existing_device->rescan = true;
 
 	/* By definition, the scsi3addr and wwid fields are already the same. */
@@ -2142,7 +2141,7 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
 			 */
 			device->new_device = false;
 			matching_device->device_gone = false;
-			pqi_scsi_update_device(matching_device, device);
+			pqi_scsi_update_device(ctrl_info, matching_device, device);
 			break;
 		case DEVICE_NOT_FOUND:
 			/*
@@ -2214,8 +2213,8 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
 	}
 
 	/*
-	 * Notify the SCSI ML if the queue depth of any existing device has
-	 * changed.
+	 * Notify the SML of any existing device changes such as;
+	 * queue depth, device size.
 	 */
 	list_for_each_entry(device, &ctrl_info->scsi_device_list, scsi_device_list_entry) {
 		if (device->sdev && device->queue_depth != device->advertised_queue_depth) {
@@ -2244,6 +2243,9 @@ static void pqi_update_device_list(struct pqi_ctrl_info *ctrl_info,
 			}
 		}
 	}
+
+	ctrl_info->logical_volume_rescan_needed = false;
+
 }
 
 static inline bool pqi_is_supported_device(struct pqi_scsi_dev *device)
@@ -3700,6 +3702,8 @@ static void pqi_event_worker(struct work_struct *work)
 			} else {
 				ack_event = true;
 				rescan_needed = true;
+				if (event->event_type == PQI_EVENT_TYPE_LOGICAL_DEVICE)
+					ctrl_info->logical_volume_rescan_needed = true;
 			}
 			if (ack_event)
 				pqi_acknowledge_event(ctrl_info, event);
