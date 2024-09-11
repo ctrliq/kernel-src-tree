@@ -1,0 +1,300 @@
+net: bridge: propagate extack through switchdev_port_attr_set
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit dcbdf1350e3312c199dbc6a76f41cf8f67e8c09c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/dcbdf135.failed
+
+The benefit is the ability to propagate errors from switchdev drivers
+for the SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING and
+SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL attributes.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dcbdf1350e3312c199dbc6a76f41cf8f67e8c09c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_private.h
+#	net/switchdev/switchdev.c
+diff --cc net/bridge/br_private.h
+index d65647185dbd,da71e71fcddc..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -950,9 -1085,12 +950,18 @@@ int br_vlan_delete(struct net_bridge *b
+  void br_vlan_flush(struct net_bridge *br);
+  struct net_bridge_vlan *br_vlan_find(struct net_bridge_vlan_group *vg, u16 vid);
+  void br_recalculate_fwd_mask(struct net_bridge *br);
+++<<<<<<< HEAD
+ +int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val);
+ +int __br_vlan_set_proto(struct net_bridge *br, __be16 proto);
+ +int br_vlan_set_proto(struct net_bridge *br, unsigned long val);
+++=======
++ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val,
++ 			  struct netlink_ext_ack *extack);
++ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto,
++ 			struct netlink_ext_ack *extack);
++ int br_vlan_set_proto(struct net_bridge *br, unsigned long val,
++ 		      struct netlink_ext_ack *extack);
+++>>>>>>> dcbdf1350e33 (net: bridge: propagate extack through switchdev_port_attr_set)
+  int br_vlan_set_stats(struct net_bridge *br, unsigned long val);
+  int br_vlan_set_stats_per_port(struct net_bridge *br, unsigned long val);
+  int br_vlan_init(struct net_bridge *br);
+diff --cc net/switchdev/switchdev.c
+index 09070c250522,89a36db47ab4..000000000000
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@@ -105,7 -101,7 +105,11 @@@ static int switchdev_deferred_enqueue(s
+  static int switchdev_port_attr_notify(enum switchdev_notifier_type nt,
+  				      struct net_device *dev,
+  				      const struct switchdev_attr *attr,
+++<<<<<<< HEAD
+ +				      struct switchdev_trans *trans)
+++=======
++ 				      struct netlink_ext_ack *extack)
+++>>>>>>> dcbdf1350e33 (net: bridge: propagate extack through switchdev_port_attr_set)
+  {
+  	int err;
+  	int rc;
+@@@ -131,36 -126,11 +135,42 @@@
+  }
+  
+  static int switchdev_port_attr_set_now(struct net_device *dev,
+- 				       const struct switchdev_attr *attr)
++ 				       const struct switchdev_attr *attr,
++ 				       struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	struct switchdev_trans trans;
+ +	int err;
+ +
+ +	/* Phase I: prepare for attr set. Driver/device should fail
+ +	 * here if there are going to be issues in the commit phase,
+ +	 * such as lack of resources or support.  The driver/device
+ +	 * should reserve resources needed for the commit phase here,
+ +	 * but should not commit the attr.
+ +	 */
+ +
+ +	trans.ph_prepare = true;
+ +	err = switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr,
+ +					 &trans);
+ +	if (err)
+ +		return err;
+ +
+ +	/* Phase II: commit attr set.  This cannot fail as a fault
+ +	 * of driver/device.  If it does, it's a bug in the driver/device
+ +	 * because the driver said everythings was OK in phase I.
+ +	 */
+ +
+ +	trans.ph_prepare = false;
+ +	err = switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr,
+ +					 &trans);
+ +	WARN(err, "%s: Commit of attribute (id=%d) failed.\n",
+ +	     dev->name, attr->id);
+ +
+ +	return err;
+++=======
++ 	return switchdev_port_attr_notify(SWITCHDEV_PORT_ATTR_SET, dev, attr,
++ 					  extack);
+++>>>>>>> dcbdf1350e33 (net: bridge: propagate extack through switchdev_port_attr_set)
+  }
+  
+  static void switchdev_port_attr_set_deferred(struct net_device *dev,
+@@@ -189,11 -159,8 +199,12 @@@ static int switchdev_port_attr_set_defe
+   *
+   *	@dev: port device
+   *	@attr: attribute to set
++  *	@extack: netlink extended ack, for error message propagation
+   *
+ + *	Use a 2-phase prepare-commit transaction model to ensure
+ + *	system is not left in a partially updated state due to
+ + *	failure from driver/device.
+ + *
+   *	rtnl_lock must be held and must not be in atomic section,
+   *	in case SWITCHDEV_F_DEFER flag is not set.
+   */
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 2ce151de5c5a..19a766a1c09f 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -196,7 +196,8 @@ switchdev_notifier_info_to_extack(const struct switchdev_notifier_info *info)
+ 
+ void switchdev_deferred_process(void);
+ int switchdev_port_attr_set(struct net_device *dev,
+-			    const struct switchdev_attr *attr);
++			    const struct switchdev_attr *attr,
++			    struct netlink_ext_ack *extack);
+ int switchdev_port_obj_add(struct net_device *dev,
+ 			   const struct switchdev_obj *obj,
+ 			   struct netlink_ext_ack *extack);
+diff --git a/net/bridge/br_mrp_switchdev.c b/net/bridge/br_mrp_switchdev.c
+index 99d532ab6efa..c58be1c29a40 100644
+--- a/net/bridge/br_mrp_switchdev.c
++++ b/net/bridge/br_mrp_switchdev.c
+@@ -176,7 +176,7 @@ int br_mrp_port_switchdev_set_state(struct net_bridge_port *p,
+ 	};
+ 	int err;
+ 
+-	err = switchdev_port_attr_set(p->dev, &attr);
++	err = switchdev_port_attr_set(p->dev, &attr, NULL);
+ 	if (err && err != -EOPNOTSUPP)
+ 		br_warn(p->br, "error setting offload MRP state on port %u(%s)\n",
+ 			(unsigned int)p->port_no, p->dev->name);
+@@ -194,7 +194,7 @@ int br_mrp_port_switchdev_set_role(struct net_bridge_port *p,
+ 	};
+ 	int err;
+ 
+-	err = switchdev_port_attr_set(p->dev, &attr);
++	err = switchdev_port_attr_set(p->dev, &attr, NULL);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+ 
+diff --git a/net/bridge/br_multicast.c b/net/bridge/br_multicast.c
+index 4eaac3b4a6ea..dc5b6442d06d 100644
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@ -974,7 +974,7 @@ static void br_mc_router_state_change(struct net_bridge *p,
+ 		.u.mrouter = is_mc_router,
+ 	};
+ 
+-	switchdev_port_attr_set(p->dev, &attr);
++	switchdev_port_attr_set(p->dev, &attr, NULL);
+ }
+ 
+ static void br_multicast_local_router_expired(struct timer_list *t)
+@@ -1195,7 +1195,7 @@ static void br_mc_disabled_update(struct net_device *dev, bool value)
+ 		.u.mc_disabled = !value,
+ 	};
+ 
+-	switchdev_port_attr_set(dev, &attr);
++	switchdev_port_attr_set(dev, &attr, NULL);
+ }
+ 
+ int br_multicast_add_port(struct net_bridge_port *port)
+@@ -2156,7 +2156,7 @@ static void br_port_mc_router_state_change(struct net_bridge_port *p,
+ 		.u.mrouter = is_mc_router,
+ 	};
+ 
+-	switchdev_port_attr_set(p->dev, &attr);
++	switchdev_port_attr_set(p->dev, &attr, NULL);
+ }
+ 
+ /*
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 1c6fc5cc1b5a..b6c88ef9cc6b 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -1187,7 +1187,7 @@ static int br_changelink(struct net_device *brdev, struct nlattr *tb[],
+ 	if (data[IFLA_BR_VLAN_PROTOCOL]) {
+ 		__be16 vlan_proto = nla_get_be16(data[IFLA_BR_VLAN_PROTOCOL]);
+ 
+-		err = __br_vlan_set_proto(br, vlan_proto);
++		err = __br_vlan_set_proto(br, vlan_proto, extack);
+ 		if (err)
+ 			return err;
+ 	}
+* Unmerged path net/bridge/br_private.h
+diff --git a/net/bridge/br_stp.c b/net/bridge/br_stp.c
+index 4715353eba7c..e270e40b34ed 100644
+--- a/net/bridge/br_stp.c
++++ b/net/bridge/br_stp.c
+@@ -47,7 +47,7 @@ void br_set_state(struct net_bridge_port *p, unsigned int state)
+ 		return;
+ 
+ 	p->state = state;
+-	err = switchdev_port_attr_set(p->dev, &attr);
++	err = switchdev_port_attr_set(p->dev, &attr, NULL);
+ 	if (err && err != -EOPNOTSUPP)
+ 		br_warn(p->br, "error setting offload STP state on port %u(%s)\n",
+ 				(unsigned int) p->port_no, p->dev->name);
+@@ -595,7 +595,7 @@ int __set_ageing_time(struct net_device *dev, unsigned long t)
+ 	};
+ 	int err;
+ 
+-	err = switchdev_port_attr_set(dev, &attr);
++	err = switchdev_port_attr_set(dev, &attr, NULL);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+ 
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index cef6330b1cc4..e305065d8dcb 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -96,9 +96,11 @@ int br_switchdev_set_port_flag(struct net_bridge_port *p,
+ 	attr.flags = SWITCHDEV_F_DEFER;
+ 	attr.u.brport_flags = flags;
+ 
+-	err = switchdev_port_attr_set(p->dev, &attr);
++	err = switchdev_port_attr_set(p->dev, &attr, extack);
+ 	if (err) {
+-		NL_SET_ERR_MSG_MOD(extack, "error setting offload flag on port");
++		if (extack && !extack->_msg)
++			NL_SET_ERR_MSG_MOD(extack,
++					   "error setting offload flag on port");
+ 		return err;
+ 	}
+ 
+diff --git a/net/bridge/br_vlan.c b/net/bridge/br_vlan.c
+index 33c6fc7fff45..954b4f35cddf 100644
+--- a/net/bridge/br_vlan.c
++++ b/net/bridge/br_vlan.c
+@@ -797,7 +797,7 @@ int br_vlan_filter_toggle(struct net_bridge *br, unsigned long val)
+ 	if (br_opt_get(br, BROPT_VLAN_ENABLED) == !!val)
+ 		return 0;
+ 
+-	err = switchdev_port_attr_set(br->dev, &attr);
++	err = switchdev_port_attr_set(br->dev, &attr, extack);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+ 
+@@ -827,7 +827,8 @@ int br_vlan_get_proto(const struct net_device *dev, u16 *p_proto)
+ }
+ EXPORT_SYMBOL_GPL(br_vlan_get_proto);
+ 
+-int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
++int __br_vlan_set_proto(struct net_bridge *br, __be16 proto,
++			struct netlink_ext_ack *extack)
+ {
+ 	struct switchdev_attr attr = {
+ 		.orig_dev = br->dev,
+@@ -844,7 +845,7 @@ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
+ 	if (br->vlan_proto == proto)
+ 		return 0;
+ 
+-	err = switchdev_port_attr_set(br->dev, &attr);
++	err = switchdev_port_attr_set(br->dev, &attr, extack);
+ 	if (err && err != -EOPNOTSUPP)
+ 		return err;
+ 
+@@ -874,7 +875,7 @@ int __br_vlan_set_proto(struct net_bridge *br, __be16 proto)
+ 
+ err_filt:
+ 	attr.u.vlan_protocol = ntohs(oldproto);
+-	switchdev_port_attr_set(br->dev, &attr);
++	switchdev_port_attr_set(br->dev, &attr, NULL);
+ 
+ 	list_for_each_entry_continue_reverse(vlan, &vg->vlan_list, vlist)
+ 		vlan_vid_del(p->dev, proto, vlan->vid);
+@@ -893,7 +894,7 @@ int br_vlan_set_proto(struct net_bridge *br, unsigned long val)
+ 	if (!eth_type_vlan(htons(val)))
+ 		return -EPROTONOSUPPORT;
+ 
+-	return __br_vlan_set_proto(br, htons(val));
++	return __br_vlan_set_proto(br, htons(val), extack);
+ }
+ 
+ int br_vlan_set_stats(struct net_bridge *br, unsigned long val)
+@@ -1126,7 +1127,7 @@ int nbp_vlan_init(struct net_bridge_port *p, struct netlink_ext_ack *extack)
+ 	if (!vg)
+ 		goto out;
+ 
+-	ret = switchdev_port_attr_set(p->dev, &attr);
++	ret = switchdev_port_attr_set(p->dev, &attr, extack);
+ 	if (ret && ret != -EOPNOTSUPP)
+ 		goto err_vlan_enabled;
+ 
+* Unmerged path net/switchdev/switchdev.c
