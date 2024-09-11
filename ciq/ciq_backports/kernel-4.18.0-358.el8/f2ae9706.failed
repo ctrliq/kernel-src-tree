@@ -1,0 +1,195 @@
+firmware: smccc: Refactor SMCCC specific bits into separate file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sudeep Holla <sudeep.holla@arm.com>
+commit f2ae97062a48b114bcf8fb2e99574d9ed2c2cd1b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f2ae9706.failed
+
+In order to add newer SMCCC v1.1+ functionality and to avoid cluttering
+PSCI firmware driver with SMCCC bits, let us move the SMCCC specific
+details under drivers/firmware/smccc/smccc.c
+
+We can also drop conduit and smccc_version from psci_operations structure
+as SMCCC was the sole user and now it maintains those.
+
+No functionality change in this patch though.
+
+	Signed-off-by: Sudeep Holla <sudeep.holla@arm.com>
+	Tested-by: Etienne Carriere <etienne.carriere@st.com>
+	Reviewed-by: Etienne Carriere <etienne.carriere@st.com>
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20200518091222.27467-6-sudeep.holla@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit f2ae97062a48b114bcf8fb2e99574d9ed2c2cd1b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/Makefile
+diff --cc drivers/firmware/Makefile
+index 19a5fa9bb161,99510be9f5ed..000000000000
+--- a/drivers/firmware/Makefile
++++ b/drivers/firmware/Makefile
+@@@ -18,17 -17,19 +18,22 @@@ obj-$(CONFIG_ISCSI_IBFT)	+= iscsi_ibft.
+  obj-$(CONFIG_FIRMWARE_MEMMAP)	+= memmap.o
+  obj-$(CONFIG_RASPBERRYPI_FIRMWARE) += raspberrypi.o
+  obj-$(CONFIG_FW_CFG_SYSFS)	+= qemu_fw_cfg.o
+ -obj-$(CONFIG_QCOM_SCM)		+= qcom_scm.o qcom_scm-smc.o qcom_scm-legacy.o
+ +obj-$(CONFIG_QCOM_SCM)		+= qcom_scm.o
+ +obj-$(CONFIG_QCOM_SCM_64)	+= qcom_scm-64.o
+ +obj-$(CONFIG_QCOM_SCM_32)	+= qcom_scm-32.o
+ +CFLAGS_qcom_scm-32.o :=$(call as-instr,.arch armv7-a\n.arch_extension sec,-DREQUIRES_SEC=1) -march=armv7-a
+  obj-$(CONFIG_TI_SCI_PROTOCOL)	+= ti_sci.o
+ -obj-$(CONFIG_TRUSTED_FOUNDATIONS) += trusted_foundations.o
+ -obj-$(CONFIG_TURRIS_MOX_RWTM)	+= turris-mox-rwtm.o
+  
+  obj-$(CONFIG_ARM_SCMI_PROTOCOL)	+= arm_scmi/
+- obj-y				+= psci/
+  obj-y				+= broadcom/
+  obj-y				+= meson/
+  obj-$(CONFIG_GOOGLE_FIRMWARE)	+= google/
+  obj-$(CONFIG_EFI)		+= efi/
+  obj-$(CONFIG_UEFI_CPER)		+= efi/
+++<<<<<<< HEAD
+++=======
++ obj-y				+= imx/
++ obj-y				+= psci/
++ obj-y				+= smccc/
+++>>>>>>> f2ae97062a48 (firmware: smccc: Refactor SMCCC specific bits into separate file)
+  obj-y				+= tegra/
+ -obj-y				+= xilinx/
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 1a0fe84135cb..9844fc051bfc 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -13474,6 +13474,15 @@ M:	Nicolas Pitre <nico@fluxnic.net>
+ S:	Odd Fixes
+ F:	drivers/net/ethernet/smsc/smc91x.*
+ 
++SECURE MONITOR CALL(SMC) CALLING CONVENTION (SMCCC)
++M:	Mark Rutland <mark.rutland@arm.com>
++M:	Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
++M:	Sudeep Holla <sudeep.holla@arm.com>
++L:	linux-arm-kernel@lists.infradead.org
++S:	Maintained
++F:	drivers/firmware/smccc/
++F:	include/linux/arm-smccc.h
++
+ SMIA AND SMIA++ IMAGE SENSOR DRIVER
+ M:	Sakari Ailus <sakari.ailus@iki.fi>
+ L:	linux-media@vger.kernel.org
+* Unmerged path drivers/firmware/Makefile
+diff --git a/drivers/firmware/psci/psci.c b/drivers/firmware/psci/psci.c
+index bb1d53965413..070c65c8e5c0 100644
+--- a/drivers/firmware/psci/psci.c
++++ b/drivers/firmware/psci/psci.c
+@@ -53,25 +53,14 @@
+  * require cooperation with a Trusted OS driver.
+  */
+ static int resident_cpu = -1;
++struct psci_operations psci_ops;
++static enum arm_smccc_conduit psci_conduit = SMCCC_CONDUIT_NONE;
+ 
+ bool psci_tos_resident_on(int cpu)
+ {
+ 	return cpu == resident_cpu;
+ }
+ 
+-struct psci_operations psci_ops = {
+-	.conduit = SMCCC_CONDUIT_NONE,
+-	.smccc_version = ARM_SMCCC_VERSION_1_0,
+-};
+-
+-enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)
+-{
+-	if (psci_ops.smccc_version < ARM_SMCCC_VERSION_1_1)
+-		return SMCCC_CONDUIT_NONE;
+-
+-	return psci_ops.conduit;
+-}
+-
+ typedef unsigned long (psci_fn)(unsigned long, unsigned long,
+ 				unsigned long, unsigned long);
+ static psci_fn *invoke_psci_fn;
+@@ -97,6 +86,7 @@ static u32 psci_function_id[PSCI_FN_MAX];
+ 
+ static u32 psci_cpu_suspend_feature;
+ static bool psci_system_reset2_supported;
++void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit);
+ 
+ static inline bool psci_has_ext_power_state(void)
+ {
+@@ -240,7 +230,7 @@ static void set_conduit(enum arm_smccc_conduit conduit)
+ 		WARN(1, "Unexpected PSCI conduit %d\n", conduit);
+ 	}
+ 
+-	psci_ops.conduit = conduit;
++	psci_conduit = conduit;
+ }
+ 
+ static int get_set_conduit_method(struct device_node *np)
+@@ -561,7 +551,7 @@ static void __init psci_init_smccc(void)
+ 		u32 ret;
+ 		ret = invoke_psci_fn(ARM_SMCCC_VERSION_FUNC_ID, 0, 0, 0);
+ 		if (ret >= ARM_SMCCC_VERSION_1_1) {
+-			psci_ops.smccc_version = ret;
++			arm_smccc_version_init(ret, psci_conduit);
+ 			ver = ret;
+ 		}
+ 	}
+diff --git a/drivers/firmware/smccc/Makefile b/drivers/firmware/smccc/Makefile
+new file mode 100644
+index 000000000000..6f369fe3f0b9
+--- /dev/null
++++ b/drivers/firmware/smccc/Makefile
+@@ -0,0 +1,3 @@
++# SPDX-License-Identifier: GPL-2.0
++#
++obj-$(CONFIG_HAVE_ARM_SMCCC_DISCOVERY)	+= smccc.o
+diff --git a/drivers/firmware/smccc/smccc.c b/drivers/firmware/smccc/smccc.c
+new file mode 100644
+index 000000000000..de92a4b9f8f6
+--- /dev/null
++++ b/drivers/firmware/smccc/smccc.c
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2020 Arm Limited
++ */
++
++#define pr_fmt(fmt) "smccc: " fmt
++
++#include <linux/init.h>
++#include <linux/arm-smccc.h>
++
++static u32 smccc_version = ARM_SMCCC_VERSION_1_0;
++static enum arm_smccc_conduit smccc_conduit = SMCCC_CONDUIT_NONE;
++
++void __init arm_smccc_version_init(u32 version, enum arm_smccc_conduit conduit)
++{
++	smccc_version = version;
++	smccc_conduit = conduit;
++}
++
++enum arm_smccc_conduit arm_smccc_1_1_get_conduit(void)
++{
++	if (smccc_version < ARM_SMCCC_VERSION_1_1)
++		return SMCCC_CONDUIT_NONE;
++
++	return smccc_conduit;
++}
+diff --git a/include/linux/psci.h b/include/linux/psci.h
+index fb6e507b57c5..ff8e822ef87e 100644
+--- a/include/linux/psci.h
++++ b/include/linux/psci.h
+@@ -35,8 +35,6 @@ struct psci_operations {
+ 	int (*affinity_info)(unsigned long target_affinity,
+ 			unsigned long lowest_affinity_level);
+ 	int (*migrate_info_type)(void);
+-	enum arm_smccc_conduit conduit;
+-	u32 smccc_version;
+ };
+ 
+ extern struct psci_operations psci_ops;
