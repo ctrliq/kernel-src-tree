@@ -1,0 +1,147 @@
+powerpc/powernv/sriov: Register IOMMU groups for VFs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit 8f5b27347e88b171c755562f0090ce40e514fc00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8f5b2734.failed
+
+The compound IOMMU group rework moved iommu_register_group() together
+in pnv_pci_ioda_setup_iommu_api() (which is a part of
+ppc_md.pcibios_fixup). As the result, pnv_ioda_setup_bus_iommu_group()
+does not create groups any more, it only adds devices to groups.
+
+This works fine for boot time devices. However IOMMU groups for
+SRIOV's VFs were added by pnv_ioda_setup_bus_iommu_group() so this got
+broken: pnv_tce_iommu_bus_notifier() expects a group to be registered
+for VF and it is not.
+
+This adds missing group registration and adds a NULL pointer check
+into the bus notifier so we won't crash if there is no group, although
+it is not expected to happen now because of the change above.
+
+Example oops seen prior to this patch:
+
+  $ echo 1 > /sys/bus/pci/devices/0000\:01\:00.0/sriov_numvfs
+  Unable to handle kernel paging request for data at address 0x00000030
+  Faulting instruction address: 0xc0000000004a6018
+  Oops: Kernel access of bad area, sig: 11 [#1]
+  LE SMP NR_CPUS=2048 NUMA PowerNV
+  CPU: 46 PID: 7006 Comm: bash Not tainted 4.15-ish
+  NIP:  c0000000004a6018 LR: c0000000004a6014 CTR: 0000000000000000
+  REGS: c000008fc876b400 TRAP: 0300   Not tainted  (4.15-ish)
+  MSR:  900000000280b033 <SF,HV,VEC,VSX,EE,FP,ME,IR,DR,RI,LE>
+  CFAR: c000000000d0be20 DAR: 0000000000000030 DSISR: 40000000 SOFTE: 1
+  ...
+  NIP sysfs_do_create_link_sd.isra.0+0x68/0x150
+  LR  sysfs_do_create_link_sd.isra.0+0x64/0x150
+  Call Trace:
+    pci_dev_type+0x0/0x30 (unreliable)
+    iommu_group_add_device+0x8c/0x600
+    iommu_add_device+0xe8/0x180
+    pnv_tce_iommu_bus_notifier+0xb0/0xf0
+    notifier_call_chain+0x9c/0x110
+    blocking_notifier_call_chain+0x64/0xa0
+    device_add+0x524/0x7d0
+    pci_device_add+0x248/0x450
+    pci_iov_add_virtfn+0x294/0x3e0
+    pci_enable_sriov+0x43c/0x580
+    mlx5_core_sriov_configure+0x15c/0x2f0 [mlx5_core]
+    sriov_numvfs_store+0x180/0x240
+    dev_attr_store+0x3c/0x60
+    sysfs_kf_write+0x64/0x90
+    kernfs_fop_write+0x1ac/0x240
+    __vfs_write+0x3c/0x70
+    vfs_write+0xd8/0x220
+    SyS_write+0x6c/0x110
+    system_call+0x58/0x6c
+
+Fixes: 0bd971676e68 ("powerpc/powernv/npu: Add compound IOMMU groups")
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reported-by: Santwana Samantray <santwana.samantray@in.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 8f5b27347e88b171c755562f0090ce40e514fc00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci-ioda.c
+#	arch/powerpc/platforms/powernv/pci.c
+diff --cc arch/powerpc/platforms/powernv/pci-ioda.c
+index ef463c498398,145373f0e5dc..000000000000
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@@ -1585,6 -1592,11 +1585,14 @@@ static void pnv_ioda_setup_vf_PE(struc
+  		mutex_unlock(&phb->ioda.pe_list_mutex);
+  
+  		pnv_pci_ioda2_setup_dma_pe(phb, pe);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_IOMMU_API
++ 		iommu_register_group(&pe->table_group,
++ 				pe->phb->hose->global_number, pe->pe_number);
++ 		pnv_ioda_setup_bus_iommu_group(pe, &pe->table_group, NULL);
++ #endif
+++>>>>>>> 8f5b27347e88 (powerpc/powernv/sriov: Register IOMMU groups for VFs)
+  	}
+  }
+  
+diff --cc arch/powerpc/platforms/powernv/pci.c
+index 13aef2323bbc,ef9448a907c6..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.c
++++ b/arch/powerpc/platforms/powernv/pci.c
+@@@ -1127,4 -1125,47 +1127,51 @@@ void __init pnv_pci_init(void
+  	set_pci_dma_ops(&dma_iommu_ops);
+  }
+  
+++<<<<<<< HEAD
+ +machine_subsys_initcall_sync(powernv, tce_iommu_bus_notifier_init);
+++=======
++ static int pnv_tce_iommu_bus_notifier(struct notifier_block *nb,
++ 		unsigned long action, void *data)
++ {
++ 	struct device *dev = data;
++ 	struct pci_dev *pdev;
++ 	struct pci_dn *pdn;
++ 	struct pnv_ioda_pe *pe;
++ 	struct pci_controller *hose;
++ 	struct pnv_phb *phb;
++ 
++ 	switch (action) {
++ 	case BUS_NOTIFY_ADD_DEVICE:
++ 		pdev = to_pci_dev(dev);
++ 		pdn = pci_get_pdn(pdev);
++ 		hose = pci_bus_to_host(pdev->bus);
++ 		phb = hose->private_data;
++ 
++ 		WARN_ON_ONCE(!phb);
++ 		if (!pdn || pdn->pe_number == IODA_INVALID_PE || !phb)
++ 			return 0;
++ 
++ 		pe = &phb->ioda.pe_array[pdn->pe_number];
++ 		if (!pe->table_group.group)
++ 			return 0;
++ 		iommu_add_device(&pe->table_group, dev);
++ 		return 0;
++ 	case BUS_NOTIFY_DEL_DEVICE:
++ 		iommu_del_device(dev);
++ 		return 0;
++ 	default:
++ 		return 0;
++ 	}
++ }
++ 
++ static struct notifier_block pnv_tce_iommu_bus_nb = {
++ 	.notifier_call = pnv_tce_iommu_bus_notifier,
++ };
++ 
++ static int __init pnv_tce_iommu_bus_notifier_init(void)
++ {
++ 	bus_register_notifier(&pci_bus_type, &pnv_tce_iommu_bus_nb);
++ 	return 0;
++ }
++ machine_subsys_initcall_sync(powernv, pnv_tce_iommu_bus_notifier_init);
+++>>>>>>> 8f5b27347e88 (powerpc/powernv/sriov: Register IOMMU groups for VFs)
+* Unmerged path arch/powerpc/platforms/powernv/pci-ioda.c
+* Unmerged path arch/powerpc/platforms/powernv/pci.c
