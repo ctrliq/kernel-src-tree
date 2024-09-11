@@ -1,0 +1,451 @@
+memremap: add a migrate_to_ram method to struct dev_pagemap_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 897e6365cda6ba6356e83a3aaa68dec82ef4c548
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/897e6365.failed
+
+This replaces the hacky ->fault callback, which is currently directly
+called from common code through a hmm specific data structure as an
+exercise in layering violations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 897e6365cda6ba6356e83a3aaa68dec82ef4c548)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hmm.h
+#	include/linux/memremap.h
+#	include/linux/swapops.h
+#	kernel/memremap.c
+#	mm/hmm.c
+diff --cc include/linux/hmm.h
+index 2f68a486cc0d,ba19c19e24ed..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -517,7 -676,23 +517,11 @@@ struct hmm_devmem_ops 
+   *
+   * Device drivers can directly use ZONE_DEVICE memory on their own if they
+   * wish to do so.
+ - *
+ - * The page_fault() callback must migrate page back, from device memory to
+ - * system memory, so that the CPU can access it. This might fail for various
+ - * reasons (device issues,  device have been unplugged, ...). When such error
+ - * conditions happen, the page_fault() callback must return VM_FAULT_SIGBUS and
+ - * set the CPU page table entry to "poisoned".
+ - *
+ - * Note that because memory cgroup charges are transferred to the device memory,
+ - * this should never fail due to memory restrictions. However, allocation
+ - * of a regular system page might still fail because we are out of memory. If
+ - * that happens, the page_fault() callback must return VM_FAULT_OOM.
+ - *
+ - * The page_fault() callback can also try to migrate back multiple pages in one
+ - * chunk, as an optimization. It must, however, prioritize the faulting address
+ - * over all the others.
+   */
+++<<<<<<< HEAD
+++=======
++ 
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  struct hmm_devmem {
+  	struct completion		completion;
+  	unsigned long			pfn_first;
+diff --cc include/linux/memremap.h
+index ae6713454b27,ac985bd03a7f..000000000000
+--- a/include/linux/memremap.h
++++ b/include/linux/memremap.h
+@@@ -66,44 -62,31 +66,71 @@@ enum memory_type 
+  	MEMORY_DEVICE_PCI_P2PDMA,
+  };
+  
+++<<<<<<< HEAD
+ +/*
+ + * For MEMORY_DEVICE_PRIVATE we use ZONE_DEVICE and extend it with two
+ + * callbacks:
+ + *   page_fault()
+ + *   page_free()
+ + *
+ + * Additional notes about MEMORY_DEVICE_PRIVATE may be found in
+ + * include/linux/hmm.h and Documentation/vm/hmm.rst. There is also a brief
+ + * explanation in include/linux/memory_hotplug.h.
+ + *
+ + * The page_fault() callback must migrate page back, from device memory to
+ + * system memory, so that the CPU can access it. This might fail for various
+ + * reasons (device issues,  device have been unplugged, ...). When such error
+ + * conditions happen, the page_fault() callback must return VM_FAULT_SIGBUS and
+ + * set the CPU page table entry to "poisoned".
+ + *
+ + * Note that because memory cgroup charges are transferred to the device memory,
+ + * this should never fail due to memory restrictions. However, allocation
+ + * of a regular system page might still fail because we are out of memory. If
+ + * that happens, the page_fault() callback must return VM_FAULT_OOM.
+ + *
+ + * The page_fault() callback can also try to migrate back multiple pages in one
+ + * chunk, as an optimization. It must, however, prioritize the faulting address
+ + * over all the others.
+ + *
+ + *
+ + * The page_free() callback is called once the page refcount reaches 1
+ + * (ZONE_DEVICE pages never reach 0 refcount unless there is a refcount bug.
+ + * This allows the device driver to implement its own memory management.)
+ + *
+ + * For MEMORY_DEVICE_PUBLIC only the page_free() callback matter.
+ + */
+ +typedef int (*dev_page_fault_t)(struct vm_area_struct *vma,
+ +				unsigned long addr,
+ +				const struct page *page,
+ +				unsigned int flags,
+ +				pmd_t *pmdp);
+ +typedef void (*dev_page_free_t)(struct page *page, void *data);
+++=======
++ struct dev_pagemap_ops {
++ 	/*
++ 	 * Called once the page refcount reaches 1.  (ZONE_DEVICE pages never
++ 	 * reach 0 refcount unless there is a refcount bug. This allows the
++ 	 * device driver to implement its own memory management.)
++ 	 */
++ 	void (*page_free)(struct page *page, void *data);
++ 
++ 	/*
++ 	 * Transition the refcount in struct dev_pagemap to the dead state.
++ 	 */
++ 	void (*kill)(struct dev_pagemap *pgmap);
++ 
++ 	/*
++ 	 * Wait for refcount in struct dev_pagemap to be idle and reap it.
++ 	 */
++ 	void (*cleanup)(struct dev_pagemap *pgmap);
++ 
++ 	/*
++ 	 * Used for private (un-addressable) device memory only.  Must migrate
++ 	 * the page back to a CPU accessible page.
++ 	 */
++ 	vm_fault_t (*migrate_to_ram)(struct vm_fault *vmf);
++ };
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  
+  /**
+   * struct dev_pagemap - metadata for ZONE_DEVICE mappings
+diff --cc include/linux/swapops.h
+index fe8e08b08c38,15bdb6fe71e5..000000000000
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@@ -128,12 -129,6 +128,15 @@@ static inline struct page *device_priva
+  {
+  	return pfn_to_page(swp_offset(entry));
+  }
+++<<<<<<< HEAD
+ +
+ +int device_private_entry_fault(struct vm_area_struct *vma,
+ +		       unsigned long addr,
+ +		       swp_entry_t entry,
+ +		       unsigned int flags,
+ +		       pmd_t *pmdp);
+++=======
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  #else /* CONFIG_DEVICE_PRIVATE */
+  static inline swp_entry_t make_device_private_entry(struct page *page, bool write)
+  {
+@@@ -163,15 -158,6 +166,18 @@@ static inline struct page *device_priva
+  {
+  	return NULL;
+  }
+++<<<<<<< HEAD
+ +
+ +static inline int device_private_entry_fault(struct vm_area_struct *vma,
+ +				     unsigned long addr,
+ +				     swp_entry_t entry,
+ +				     unsigned int flags,
+ +				     pmd_t *pmdp)
+ +{
+ +	return VM_FAULT_SIGBUS;
+ +}
+++=======
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  #endif /* CONFIG_DEVICE_PRIVATE */
+  
+  #ifdef CONFIG_MIGRATION
+diff --cc kernel/memremap.c
+index 794888559eb7,c06a5487dda7..000000000000
+--- a/kernel/memremap.c
++++ b/kernel/memremap.c
+@@@ -1,86 -1,54 +1,94 @@@
+  /* SPDX-License-Identifier: GPL-2.0 */
+  /* Copyright(c) 2015 Intel Corporation. All rights reserved. */
+ +#include <linux/radix-tree.h>
+  #include <linux/device.h>
+ +#include <linux/types.h>
+ +#include <linux/pfn_t.h>
+  #include <linux/io.h>
+  #include <linux/kasan.h>
+ -#include <linux/memory_hotplug.h>
+  #include <linux/mm.h>
+ -#include <linux/pfn_t.h>
+ +#include <linux/memory_hotplug.h>
+  #include <linux/swap.h>
+  #include <linux/swapops.h>
+ -#include <linux/types.h>
+  #include <linux/wait_bit.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/xarray.h>
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  
+ -static DEFINE_XARRAY(pgmap_array);
+ +static DEFINE_MUTEX(pgmap_lock);
+ +static RADIX_TREE(pgmap_radix, GFP_KERNEL);
+  #define SECTION_MASK ~((1UL << PA_SECTION_SHIFT) - 1)
+  #define SECTION_SIZE (1UL << PA_SECTION_SHIFT)
+  
+ -#ifdef CONFIG_DEV_PAGEMAP_OPS
+ -DEFINE_STATIC_KEY_FALSE(devmap_managed_key);
+ -EXPORT_SYMBOL(devmap_managed_key);
+ -static atomic_t devmap_managed_enable;
+ -
+ -static void devmap_managed_enable_put(void *data)
+ +static unsigned long order_at(struct resource *res, unsigned long pgoff)
+  {
+ -	if (atomic_dec_and_test(&devmap_managed_enable))
+ -		static_branch_disable(&devmap_managed_key);
+ -}
+ +	unsigned long phys_pgoff = PHYS_PFN(res->start) + pgoff;
+ +	unsigned long nr_pages, mask;
+  
+ -static int devmap_managed_enable_get(struct device *dev, struct dev_pagemap *pgmap)
+ -{
+ -	if (!pgmap->ops->page_free) {
+ -		WARN(1, "Missing page_free method\n");
+ -		return -EINVAL;
+ -	}
+ +	nr_pages = PHYS_PFN(resource_size(res));
+ +	if (nr_pages == pgoff)
+ +		return ULONG_MAX;
+  
+ -	if (atomic_inc_return(&devmap_managed_enable) == 1)
+ -		static_branch_enable(&devmap_managed_key);
+ -	return devm_add_action_or_reset(dev, devmap_managed_enable_put, NULL);
+ +	/*
+ +	 * What is the largest aligned power-of-2 range available from
+ +	 * this resource pgoff to the end of the resource range,
+ +	 * considering the alignment of the current pgoff?
+ +	 */
+ +	mask = phys_pgoff | rounddown_pow_of_two(nr_pages - pgoff);
+ +	if (!mask)
+ +		return ULONG_MAX;
+ +
+ +	return find_first_bit(&mask, BITS_PER_LONG);
+  }
+ -#else
+ -static int devmap_managed_enable_get(struct device *dev, struct dev_pagemap *pgmap)
+ +
+ +#define foreach_order_pgoff(res, order, pgoff) \
+ +	for (pgoff = 0, order = order_at((res), pgoff); order < ULONG_MAX; \
+ +			pgoff += 1UL << order, order = order_at((res), pgoff))
+ +
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
+ +int device_private_entry_fault(struct vm_area_struct *vma,
+ +		       unsigned long addr,
+ +		       swp_entry_t entry,
+ +		       unsigned int flags,
+ +		       pmd_t *pmdp)
+  {
+ -	return -EINVAL;
+ +	struct page *page = device_private_entry_to_page(entry);
+ +
+ +	/*
+ +	 * The page_fault() callback must migrate page back to system memory
+ +	 * so that CPU can access it. This might fail for various reasons
+ +	 * (device issue, device was unsafely unplugged, ...). When such
+ +	 * error conditions happen, the callback must return VM_FAULT_SIGBUS.
+ +	 *
+ +	 * Note that because memory cgroup charges are accounted to the device
+ +	 * memory, this should never fail because of memory restrictions (but
+ +	 * allocation of regular system page might still fail because we are
+ +	 * out of memory).
+ +	 *
+ +	 * There is a more in-depth description of what that callback can and
+ +	 * cannot do, in include/linux/memremap.h
+ +	 */
+ +	return page->pgmap->page_fault(vma, addr, page, flags, pmdp);
+  }
+ -#endif /* CONFIG_DEV_PAGEMAP_OPS */
+ +#endif /* CONFIG_DEVICE_PRIVATE */
+  
+ +static void pgmap_radix_release(struct resource *res, unsigned long end_pgoff)
+++=======
++ static void pgmap_array_delete(struct resource *res)
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  {
+ -	xa_store_range(&pgmap_array, PHYS_PFN(res->start), PHYS_PFN(res->end),
+ -			NULL, GFP_KERNEL);
+ +	unsigned long pgoff, order;
+ +
+ +	mutex_lock(&pgmap_lock);
+ +	foreach_order_pgoff(res, order, pgoff) {
+ +		if (pgoff >= end_pgoff)
+ +			break;
+ +		radix_tree_delete(&pgmap_radix, PHYS_PFN(res->start) + pgoff);
+ +	}
+ +	mutex_unlock(&pgmap_lock);
+ +
+  	synchronize_rcu();
+  }
+  
+@@@ -177,12 -146,54 +185,45 @@@ void *devm_memremap_pages(struct devic
+  			&pgmap->altmap : NULL;
+  	struct resource *res = &pgmap->res;
+  	struct dev_pagemap *conflict_pgmap;
+ -	struct mhp_restrictions restrictions = {
+ -		/*
+ -		 * We do not want any optional features only our own memmap
+ -		*/
+ -		.altmap = altmap,
+ -	};
+  	pgprot_t pgprot = PAGE_KERNEL;
+ +	unsigned long pgoff, order;
+  	int error, nid, is_ram;
+ -	bool need_devmap_managed = true;
+  
+++<<<<<<< HEAD
+ +	if (!pgmap->ref || !pgmap->kill)
+++=======
++ 	switch (pgmap->type) {
++ 	case MEMORY_DEVICE_PRIVATE:
++ 		if (!IS_ENABLED(CONFIG_DEVICE_PRIVATE)) {
++ 			WARN(1, "Device private memory not supported\n");
++ 			return ERR_PTR(-EINVAL);
++ 		}
++ 		if (!pgmap->ops || !pgmap->ops->migrate_to_ram) {
++ 			WARN(1, "Missing migrate_to_ram method\n");
++ 			return ERR_PTR(-EINVAL);
++ 		}
++ 		break;
++ 	case MEMORY_DEVICE_FS_DAX:
++ 		if (!IS_ENABLED(CONFIG_ZONE_DEVICE) ||
++ 		    IS_ENABLED(CONFIG_FS_DAX_LIMITED)) {
++ 			WARN(1, "File system DAX not supported\n");
++ 			return ERR_PTR(-EINVAL);
++ 		}
++ 		break;
++ 	case MEMORY_DEVICE_DEVDAX:
++ 	case MEMORY_DEVICE_PCI_P2PDMA:
++ 		need_devmap_managed = false;
++ 		break;
++ 	default:
++ 		WARN(1, "Invalid pgmap type %d\n", pgmap->type);
++ 		break;
++ 	}
++ 
++ 	if (!pgmap->ref || !pgmap->ops || !pgmap->ops->kill ||
++ 	    !pgmap->ops->cleanup) {
++ 		WARN(1, "Missing reference count teardown definition\n");
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  		return ERR_PTR(-EINVAL);
+ -	}
+ -
+ -	if (need_devmap_managed) {
+ -		error = devmap_managed_enable_get(dev, pgmap);
+ -		if (error)
+ -			return ERR_PTR(error);
+ -	}
+  
+  	align_start = res->start & ~(SECTION_SIZE - 1);
+  	align_size = ALIGN(res->start + resource_size(res), SECTION_SIZE)
+diff --cc mm/hmm.c
+index 91b885757871,96633ee066d8..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -968,30 -1352,26 +968,35 @@@ static void hmm_devmem_ref_release(stru
+  	complete(&devmem->completion);
+  }
+  
+ -static void hmm_devmem_ref_exit(struct dev_pagemap *pgmap)
+ +static void hmm_devmem_ref_exit(void *data)
+  {
+ +	struct percpu_ref *ref = data;
+  	struct hmm_devmem *devmem;
+  
+ -	devmem = container_of(pgmap, struct hmm_devmem, pagemap);
+ +	devmem = container_of(ref, struct hmm_devmem, ref);
+  	wait_for_completion(&devmem->completion);
+ -	percpu_ref_exit(pgmap->ref);
+ +	percpu_ref_exit(ref);
+  }
+  
+ -static void hmm_devmem_ref_kill(struct dev_pagemap *pgmap)
+ +static void hmm_devmem_ref_kill(struct percpu_ref *ref)
+  {
+ -	percpu_ref_kill(pgmap->ref);
+ +	percpu_ref_kill(ref);
+  }
+  
+++<<<<<<< HEAD
+ +static int hmm_devmem_fault(struct vm_area_struct *vma,
+ +			    unsigned long addr,
+ +			    const struct page *page,
+ +			    unsigned int flags,
+ +			    pmd_t *pmdp)
+++=======
++ static vm_fault_t hmm_devmem_migrate_to_ram(struct vm_fault *vmf)
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  {
+- 	struct hmm_devmem *devmem = page->pgmap->data;
++ 	struct hmm_devmem *devmem = vmf->page->pgmap->data;
+  
+- 	return devmem->ops->fault(devmem, vma, addr, page, flags, pmdp);
++ 	return devmem->ops->fault(devmem, vmf->vma, vmf->address, vmf->page,
++ 			vmf->flags, vmf->pmd);
+  }
+  
+  static void hmm_devmem_free(struct page *page, void *data)
+@@@ -1001,6 -1381,13 +1006,16 @@@
+  	devmem->ops->free(devmem, page);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct dev_pagemap_ops hmm_pagemap_ops = {
++ 	.page_free		= hmm_devmem_free,
++ 	.kill			= hmm_devmem_ref_kill,
++ 	.cleanup		= hmm_devmem_ref_exit,
++ 	.migrate_to_ram		= hmm_devmem_migrate_to_ram,
++ };
++ 
+++>>>>>>> 897e6365cda6 (memremap: add a migrate_to_ram method to struct dev_pagemap_ops)
+  /*
+   * hmm_devmem_add() - hotplug ZONE_DEVICE memory for device memory
+   *
+* Unmerged path include/linux/hmm.h
+* Unmerged path include/linux/memremap.h
+* Unmerged path include/linux/swapops.h
+* Unmerged path kernel/memremap.c
+* Unmerged path mm/hmm.c
+diff --git a/mm/memory.c b/mm/memory.c
+index 041d24985cf6..b8ec56eddc0b 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -3024,13 +3024,8 @@ int do_swap_page(struct vm_fault *vmf)
+ 			migration_entry_wait(vma->vm_mm, vmf->pmd,
+ 					     vmf->address);
+ 		} else if (is_device_private_entry(entry)) {
+-			/*
+-			 * For un-addressable device memory we call the pgmap
+-			 * fault handler callback. The callback must migrate
+-			 * the page back to some CPU accessible page.
+-			 */
+-			ret = device_private_entry_fault(vma, vmf->address, entry,
+-						 vmf->flags, vmf->pmd);
++			vmf->page = device_private_entry_to_page(entry);
++			ret = vmf->page->pgmap->ops->migrate_to_ram(vmf);
+ 		} else if (is_hwpoison_entry(entry)) {
+ 			ret = VM_FAULT_HWPOISON;
+ 		} else {
