@@ -1,0 +1,183 @@
+net/mlx5e: XDP, fix redirect resources availability check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 407e17b1a69a51ba9a512a04342da56c1f931df4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/407e17b1.failed
+
+Currently mlx5 driver creates xdp redirect hw queues unconditionally on
+netdevice open, This is great until someone starts redirecting XDP traffic
+via ndo_xdp_xmit on mlx5 device and changes the device configuration at
+the same time, this might cause crashes, since the other device's napi
+is not aware of the mlx5 state change (resources un-availability).
+
+To fix this we must synchronize with other devices napi's on the system.
+Added a new flag under mlx5e_priv to determine XDP TX resources are
+available, set/clear it up when necessary and use synchronize_rcu()
+when the flag is turned off, so other napi's are in-sync with it, before
+we actually cleanup the hw resources.
+
+The flag is tested prior to committing to transmit on mlx5e_xdp_xmit, and
+it is sufficient to determine if it safe to transmit or not. The other
+two internal flags (MLX5E_STATE_OPENED and MLX5E_SQ_STATE_ENABLED) become
+unnecessary. Thus, they are removed from data path.
+
+Fixes: 58b99ee3e3eb ("net/mlx5e: Add support for XDP_REDIRECT in device-out side")
+	Reported-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 407e17b1a69a51ba9a512a04342da56c1f931df4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index 60fd47414ccc,03b2a9f9c589..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@@ -243,3 -356,78 +243,81 @@@ void mlx5e_free_xdpsq_descs(struct mlx5
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++ 		   u32 flags)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5e_xdpsq *sq;
++ 	int drops = 0;
++ 	int sq_num;
++ 	int i;
++ 
++ 	/* this flag is sufficient, no need to test internal sq state */
++ 	if (unlikely(!mlx5e_xdp_tx_is_enabled(priv)))
++ 		return -ENETDOWN;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	sq_num = smp_processor_id();
++ 
++ 	if (unlikely(sq_num >= priv->channels.num))
++ 		return -ENXIO;
++ 
++ 	sq = &priv->channels.c[sq_num]->xdpsq;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdpf = frames[i];
++ 		struct mlx5e_xdp_info xdpi;
++ 
++ 		xdpi.dma_addr = dma_map_single(sq->pdev, xdpf->data, xdpf->len,
++ 					       DMA_TO_DEVICE);
++ 		if (unlikely(dma_mapping_error(sq->pdev, xdpi.dma_addr))) {
++ 			xdp_return_frame_rx_napi(xdpf);
++ 			drops++;
++ 			continue;
++ 		}
++ 
++ 		xdpi.xdpf = xdpf;
++ 
++ 		if (unlikely(!sq->xmit_xdp_frame(sq, &xdpi))) {
++ 			dma_unmap_single(sq->pdev, xdpi.dma_addr,
++ 					 xdpf->len, DMA_TO_DEVICE);
++ 			xdp_return_frame_rx_napi(xdpf);
++ 			drops++;
++ 		}
++ 	}
++ 
++ 	if (flags & XDP_XMIT_FLUSH) {
++ 		if (sq->mpwqe.wqe)
++ 			mlx5e_xdp_mpwqe_complete(sq);
++ 		mlx5e_xmit_xdp_doorbell(sq);
++ 	}
++ 
++ 	return n - drops;
++ }
++ 
++ void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq)
++ {
++ 	struct mlx5e_xdpsq *xdpsq = &rq->xdpsq;
++ 
++ 	if (xdpsq->mpwqe.wqe)
++ 		mlx5e_xdp_mpwqe_complete(xdpsq);
++ 
++ 	mlx5e_xmit_xdp_doorbell(xdpsq);
++ 
++ 	if (xdpsq->redirect_flush) {
++ 		xdp_do_flush_map();
++ 		xdpsq->redirect_flush = false;
++ 	}
++ }
++ 
++ void mlx5e_set_xmit_fp(struct mlx5e_xdpsq *sq, bool is_mpw)
++ {
++ 	sq->xmit_xdp_frame = is_mpw ?
++ 		mlx5e_xmit_xdp_frame_mpwqe : mlx5e_xmit_xdp_frame;
++ }
++ 
+++>>>>>>> 407e17b1a69a (net/mlx5e: XDP, fix redirect resources availability check)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 007808f3e87f..f47fddc728f4 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -630,6 +630,7 @@ enum {
+ 	MLX5E_STATE_ASYNC_EVENTS_ENABLED,
+ 	MLX5E_STATE_OPENED,
+ 	MLX5E_STATE_DESTROYING,
++	MLX5E_STATE_XDP_TX_ENABLED,
+ };
+ 
+ struct mlx5e_rqt {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+index 81739aad0188..3c000bd372e2 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -47,6 +47,23 @@ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+ 
+ bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_info *xdpi);
+ 
++static inline void mlx5e_xdp_tx_enable(struct mlx5e_priv *priv)
++{
++	set_bit(MLX5E_STATE_XDP_TX_ENABLED, &priv->state);
++}
++
++static inline void mlx5e_xdp_tx_disable(struct mlx5e_priv *priv)
++{
++	clear_bit(MLX5E_STATE_XDP_TX_ENABLED, &priv->state);
++	/* let other device's napi(s) see our new state */
++	synchronize_rcu();
++}
++
++static inline bool mlx5e_xdp_tx_is_enabled(struct mlx5e_priv *priv)
++{
++	return test_bit(MLX5E_STATE_XDP_TX_ENABLED, &priv->state);
++}
++
+ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+ {
+ 	struct mlx5_wq_cyc *wq = &sq->wq;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 75e7f186a09e..09e2b0bd3105 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -2872,6 +2872,7 @@ void mlx5e_activate_priv_channels(struct mlx5e_priv *priv)
+ 
+ 	mlx5e_build_tx2sq_maps(priv);
+ 	mlx5e_activate_channels(&priv->channels);
++	mlx5e_xdp_tx_enable(priv);
+ 	netif_tx_start_all_queues(priv->netdev);
+ 
+ 	if (MLX5_ESWITCH_MANAGER(priv->mdev))
+@@ -2893,6 +2894,7 @@ void mlx5e_deactivate_priv_channels(struct mlx5e_priv *priv)
+ 	 */
+ 	netif_tx_stop_all_queues(priv->netdev);
+ 	netif_tx_disable(priv->netdev);
++	mlx5e_xdp_tx_disable(priv);
+ 	mlx5e_deactivate_channels(&priv->channels);
+ }
+ 
