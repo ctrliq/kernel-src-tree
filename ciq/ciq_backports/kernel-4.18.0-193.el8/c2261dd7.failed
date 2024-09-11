@@ -1,0 +1,493 @@
+RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c2261dd76b549754c14c8ac7cadadd0993b182d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c2261dd7.failed
+
+The associated netdev should not actually be very dynamic, so for most
+drivers there is no reason for a callback like this. Provide an API to
+inform the core code about the net dev affiliation and use a core
+maintained data structure instead.
+
+This allows the core code to be more aware of the ndev relationship which
+will allow some new APIs based around this.
+
+This also uses locking that makes some kind of sense, many drivers had a
+confusing RCU lock, or missing locking which isn't right.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c2261dd76b549754c14c8ac7cadadd0993b182d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/device.c
+index 8641d8bca5aa,7680a64a98bc..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -72,21 -93,48 +72,22 @@@ static LIST_HEAD(device_list)
+  static LIST_HEAD(client_list);
+  #define CLIENT_REGISTERED XA_MARK_1
+  static DEFINE_XARRAY_FLAGS(clients, XA_FLAGS_ALLOC);
+ -static DECLARE_RWSEM(clients_rwsem);
+  
+  /*
+ - * If client_data is registered then the corresponding client must also still
+ - * be registered.
+ - */
+ -#define CLIENT_DATA_REGISTERED XA_MARK_1
+ -/*
+ - * xarray has this behavior where it won't iterate over NULL values stored in
+ - * allocated arrays.  So we need our own iterator to see all values stored in
+ - * the array. This does the same thing as xa_for_each except that it also
+ - * returns NULL valued entries if the array is allocating. Simplified to only
+ - * work on simple xarrays.
+ + * device_mutex and lists_rwsem protect access to both device_list and
+ + * clients.  device_mutex protects writer access by device and client
+ + * registration / de-registration.  lists_rwsem protects reader access to
+ + * these lists.  Iterators of these lists must lock it for read, while updates
+ + * to the lists must be done with a write lock. A special case is when the
+ + * device_mutex is locked. In this case locking the lists for read access is
+ + * not necessary as the device_mutex implies it.
+ + *
+ + * lists_rwsem also protects access to the client data list.
+   */
+ -static void *xan_find_marked(struct xarray *xa, unsigned long *indexp,
+ -			     xa_mark_t filter)
+ -{
+ -	XA_STATE(xas, xa, *indexp);
+ -	void *entry;
+ -
+ -	rcu_read_lock();
+ -	do {
+ -		entry = xas_find_marked(&xas, ULONG_MAX, filter);
+ -		if (xa_is_zero(entry))
+ -			break;
+ -	} while (xas_retry(&xas, entry));
+ -	rcu_read_unlock();
+ -
+ -	if (entry) {
+ -		*indexp = xas.xa_index;
+ -		if (xa_is_zero(entry))
+ -			return NULL;
+ -		return entry;
+ -	}
+ -	return XA_ERROR(-ENOENT);
+ -}
+ -#define xan_for_each_marked(xa, index, entry, filter)                          \
+ -	for (index = 0, entry = xan_find_marked(xa, &(index), filter);         \
+ -	     !xa_is_err(entry);                                                \
+ -	     (index)++, entry = xan_find_marked(xa, &(index), filter))
+ +static DEFINE_MUTEX(device_mutex);
+ +static DECLARE_RWSEM(lists_rwsem);
+  
++ static void free_netdevs(struct ib_device *ib_dev);
+  static int ib_security_change(struct notifier_block *nb, unsigned long event,
+  			      void *lsm_data);
+  static void ib_policy_change_task(struct work_struct *work);
+@@@ -323,7 -373,10 +325,14 @@@ EXPORT_SYMBOL(_ib_alloc_device)
+   */
+  void ib_dealloc_device(struct ib_device *device)
+  {
+++<<<<<<< HEAD
+ +	WARN_ON(!list_empty(&device->client_data_list));
+++=======
++ 	/* Expedite releasing netdev references */
++ 	free_netdevs(device);
++ 
++ 	WARN_ON(!xa_empty(&device->client_data));
+++>>>>>>> c2261dd76b54 (RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev)
+  	WARN_ON(refcount_read(&device->refcount));
+  	rdma_restrack_clean(device);
+  	/* Balances with device_initialize */
+@@@ -331,59 -384,141 +340,105 @@@
+  }
+  EXPORT_SYMBOL(ib_dealloc_device);
+  
+ -/*
+ - * add_client_context() and remove_client_context() must be safe against
+ - * parallel calls on the same device - registration/unregistration of both the
+ - * device and client can be occurring in parallel.
+ - *
+ - * The routines need to be a fence, any caller must not return until the add
+ - * or remove is fully completed.
+ - */
+ -static int add_client_context(struct ib_device *device,
+ -			      struct ib_client *client)
+ +static int add_client_context(struct ib_device *device, struct ib_client *client)
+  {
+ -	int ret = 0;
+ +	struct ib_client_data *context;
+  
+  	if (!device->kverbs_provider && !client->no_kverbs_req)
+ -		return 0;
+ +		return -EOPNOTSUPP;
+  
+ -	down_write(&device->client_data_rwsem);
+ -	/*
+ -	 * Another caller to add_client_context got here first and has already
+ -	 * completely initialized context.
+ -	 */
+ -	if (xa_get_mark(&device->client_data, client->client_id,
+ -		    CLIENT_DATA_REGISTERED))
+ -		goto out;
+ +	context = kmalloc(sizeof(*context), GFP_KERNEL);
+ +	if (!context)
+ +		return -ENOMEM;
+  
+ -	ret = xa_err(xa_store(&device->client_data, client->client_id, NULL,
+ -			      GFP_KERNEL));
+ -	if (ret)
+ -		goto out;
+ -	downgrade_write(&device->client_data_rwsem);
+ -	if (client->add)
+ -		client->add(device);
+ -
+ -	/* Readers shall not see a client until add has been completed */
+ -	xa_set_mark(&device->client_data, client->client_id,
+ -		    CLIENT_DATA_REGISTERED);
+ -	up_read(&device->client_data_rwsem);
+ -	return 0;
+ +	context->client = client;
+ +	context->data   = NULL;
+ +	context->going_down = false;
+  
+ -out:
+ -	up_write(&device->client_data_rwsem);
+ -	return ret;
+ +	down_write(&lists_rwsem);
+ +	write_lock_irq(&device->client_data_lock);
+ +	list_add(&context->list, &device->client_data_list);
+ +	write_unlock_irq(&device->client_data_lock);
+ +	up_write(&lists_rwsem);
+ +
+ +	return 0;
+  }
+  
+ -static void remove_client_context(struct ib_device *device,
+ -				  unsigned int client_id)
+++<<<<<<< HEAD
+ +static int verify_immutable(const struct ib_device *dev, u8 port)
+  {
+ -	struct ib_client *client;
+ -	void *client_data;
+ -
+ -	down_write(&device->client_data_rwsem);
+ -	if (!xa_get_mark(&device->client_data, client_id,
+ -			 CLIENT_DATA_REGISTERED)) {
+ -		up_write(&device->client_data_rwsem);
+ -		return;
+ -	}
+ -	client_data = xa_load(&device->client_data, client_id);
+ -	xa_clear_mark(&device->client_data, client_id, CLIENT_DATA_REGISTERED);
+ -	client = xa_load(&clients, client_id);
+ -	downgrade_write(&device->client_data_rwsem);
+ -
+ -	/*
+ -	 * Notice we cannot be holding any exclusive locks when calling the
+ -	 * remove callback as the remove callback can recurse back into any
+ -	 * public functions in this module and thus try for any locks those
+ -	 * functions take.
+ -	 *
+ -	 * For this reason clients and drivers should not call the
+ -	 * unregistration functions will holdling any locks.
+ -	 *
+ -	 * It tempting to drop the client_data_rwsem too, but this is required
+ -	 * to ensure that unregister_client does not return until all clients
+ -	 * are completely unregistered, which is required to avoid module
+ -	 * unloading races.
+ -	 */
+ -	if (client->remove)
+ -		client->remove(device, client_data);
+ -
+ -	xa_erase(&device->client_data, client_id);
+ -	up_read(&device->client_data_rwsem);
+ +	return WARN_ON(!rdma_cap_ib_mad(dev, port) &&
+ +			    rdma_max_mad_size(dev, port) != 0);
+  }
+  
+ +static int read_port_immutable(struct ib_device *device)
+ +{
+ +	int ret;
+ +	u8 start_port = rdma_start_port(device);
+ +	u8 end_port = rdma_end_port(device);
+ +	u8 port;
+++=======
++ static int alloc_port_data(struct ib_device *device)
++ {
++ 	unsigned int port;
++ 
++ 	if (device->port_data)
++ 		return 0;
++ 
++ 	/* This can only be called once the physical port range is defined */
++ 	if (WARN_ON(!device->phys_port_cnt))
++ 		return -EINVAL;
+++>>>>>>> c2261dd76b54 (RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev)
+  
+ -	/*
+ -	 * device->port_data is indexed directly by the port number to make
+ +	/**
+ +	 * device->port_immutable is indexed directly by the port number to make
+  	 * access to this data as efficient as possible.
+  	 *
+ -	 * Therefore port_data is declared as a 1 based array with potential
+ -	 * empty slots at the beginning.
+ +	 * Therefore port_immutable is declared as a 1 based array with
+ +	 * potential empty slots at the beginning.
+  	 */
+ -	device->port_data = kcalloc(rdma_end_port(device) + 1,
+ -				    sizeof(*device->port_data), GFP_KERNEL);
+ -	if (!device->port_data)
+ +	device->port_immutable = kcalloc(end_port + 1,
+ +					 sizeof(*device->port_immutable),
+ +					 GFP_KERNEL);
+ +	if (!device->port_immutable)
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	for (port = start_port; port <= end_port; ++port) {
+ +		ret = device->ops.get_port_immutable(
+ +			device, port, &device->port_immutable[port]);
+++=======
++ 	rdma_for_each_port (device, port) {
++ 		struct ib_port_data *pdata = &device->port_data[port];
++ 
++ 		spin_lock_init(&pdata->pkey_list_lock);
++ 		INIT_LIST_HEAD(&pdata->pkey_list);
++ 		spin_lock_init(&pdata->netdev_lock);
++ 	}
++ 	return 0;
++ }
++ 
++ static int verify_immutable(const struct ib_device *dev, u8 port)
++ {
++ 	return WARN_ON(!rdma_cap_ib_mad(dev, port) &&
++ 			    rdma_max_mad_size(dev, port) != 0);
++ }
++ 
++ static int setup_port_data(struct ib_device *device)
++ {
++ 	unsigned int port;
++ 	int ret;
++ 
++ 	ret = alloc_port_data(device);
++ 	if (ret)
++ 		return ret;
++ 
++ 	rdma_for_each_port (device, port) {
++ 		struct ib_port_data *pdata = &device->port_data[port];
++ 
++ 		ret = device->ops.get_port_immutable(device, port,
++ 						     &pdata->immutable);
+++>>>>>>> c2261dd76b54 (RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev)
+  		if (ret)
+  			return ret;
+  
+@@@ -545,12 -688,57 +600,64 @@@ static int setup_device(struct ib_devic
+  		return ret;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = setup_port_pkey_list(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev, "Couldn't create per port_pkey_list\n");
+ +		return ret;
+++=======
++ 	return 0;
++ }
++ 
++ static void disable_device(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 
++ 	WARN_ON(!refcount_read(&device->refcount));
++ 
++ 	down_write(&devices_rwsem);
++ 	xa_clear_mark(&devices, device->index, DEVICE_REGISTERED);
++ 	up_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	list_for_each_entry_reverse(client, &client_list, list)
++ 		remove_client_context(device, client->client_id);
++ 	up_read(&clients_rwsem);
++ 
++ 	/* Pairs with refcount_set in enable_device */
++ 	ib_device_put(device);
++ 	wait_for_completion(&device->unreg_completion);
++ 
++ 	/* Expedite removing unregistered pointers from the hash table */
++ 	free_netdevs(device);
++ }
++ 
++ /*
++  * An enabled device is visible to all clients and to all the public facing
++  * APIs that return a device pointer.
++  */
++ static int enable_device(struct ib_device *device)
++ {
++ 	struct ib_client *client;
++ 	unsigned long index;
++ 	int ret;
++ 
++ 	refcount_set(&device->refcount, 1);
++ 	down_write(&devices_rwsem);
++ 	xa_set_mark(&devices, device->index, DEVICE_REGISTERED);
++ 	up_write(&devices_rwsem);
++ 
++ 	down_read(&clients_rwsem);
++ 	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED) {
++ 		ret = add_client_context(device, client);
++ 		if (ret) {
++ 			up_read(&clients_rwsem);
++ 			disable_device(device);
++ 			return ret;
++ 		}
+++>>>>>>> c2261dd76b54 (RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev)
+  	}
+ -	up_read(&clients_rwsem);
+ +
+  	return 0;
+  }
+  
+@@@ -984,21 -1168,12 +1199,13 @@@ void ib_enum_roce_netdev(struct ib_devi
+  			 roce_netdev_callback cb,
+  			 void *cookie)
+  {
+ -	unsigned int port;
+ +	u8 port;
+  
+ -	rdma_for_each_port (ib_dev, port)
+ +	for (port = rdma_start_port(ib_dev); port <= rdma_end_port(ib_dev);
+ +	     port++)
+  		if (rdma_protocol_roce(ib_dev, port)) {
+- 			struct net_device *idev = NULL;
+- 
+- 			if (ib_dev->ops.get_netdev)
+- 				idev = ib_dev->ops.get_netdev(ib_dev, port);
+- 
+- 			if (idev &&
+- 			    idev->reg_state >= NETREG_UNREGISTERED) {
+- 				dev_put(idev);
+- 				idev = NULL;
+- 			}
++ 			struct net_device *idev =
++ 				ib_device_get_netdev(ib_dev, port);
+  
+  			if (filter(ib_dev, port, idev, filter_cookie))
+  				cb(ib_dev, port, idev, cookie);
+diff --cc include/rdma/ib_verbs.h
+index 2ff74f11eec0,7f81a313c01b..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2198,6 -2197,18 +2198,21 @@@ struct ib_port_immutable 
+  	u32                           max_mad_size;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct ib_port_data {
++ 	struct ib_port_immutable immutable;
++ 
++ 	spinlock_t pkey_list_lock;
++ 	struct list_head pkey_list;
++ 
++ 	struct ib_port_cache cache;
++ 
++ 	spinlock_t netdev_lock;
++ 	struct net_device *netdev;
++ };
++ 
+++>>>>>>> c2261dd76b54 (RDMA/device: Add ib_device_set_netdev() as an alternative to get_netdev)
+  /* rdma netdev type - specifies protocol type */
+  enum rdma_netdev_t {
+  	RDMA_NETDEV_OPA_VNIC,
+diff --git a/drivers/infiniband/core/cache.c b/drivers/infiniband/core/cache.c
+index f50de4cb4cd9..ccc6eb2a0d0f 100644
+--- a/drivers/infiniband/core/cache.c
++++ b/drivers/infiniband/core/cache.c
+@@ -547,21 +547,19 @@ int ib_cache_gid_add(struct ib_device *ib_dev, u8 port,
+ 	unsigned long mask;
+ 	int ret;
+ 
+-	if (ib_dev->ops.get_netdev) {
+-		idev = ib_dev->ops.get_netdev(ib_dev, port);
+-		if (idev && attr->ndev != idev) {
+-			union ib_gid default_gid;
+-
+-			/* Adding default GIDs in not permitted */
+-			make_default_gid(idev, &default_gid);
+-			if (!memcmp(gid, &default_gid, sizeof(*gid))) {
+-				dev_put(idev);
+-				return -EPERM;
+-			}
+-		}
+-		if (idev)
++	idev = ib_device_get_netdev(ib_dev, port);
++	if (idev && attr->ndev != idev) {
++		union ib_gid default_gid;
++
++		/* Adding default GIDs is not permitted */
++		make_default_gid(idev, &default_gid);
++		if (!memcmp(gid, &default_gid, sizeof(*gid))) {
+ 			dev_put(idev);
++			return -EPERM;
++		}
+ 	}
++	if (idev)
++		dev_put(idev);
+ 
+ 	mask = GID_ATTR_FIND_MASK_GID |
+ 	       GID_ATTR_FIND_MASK_GID_TYPE |
+diff --git a/drivers/infiniband/core/core_priv.h b/drivers/infiniband/core/core_priv.h
+index 9d1d4bce8f87..e4d90379073e 100644
+--- a/drivers/infiniband/core/core_priv.h
++++ b/drivers/infiniband/core/core_priv.h
+@@ -64,6 +64,9 @@ typedef void (*roce_netdev_callback)(struct ib_device *device, u8 port,
+ typedef bool (*roce_netdev_filter)(struct ib_device *device, u8 port,
+ 				   struct net_device *idev, void *cookie);
+ 
++struct net_device *ib_device_get_netdev(struct ib_device *ib_dev,
++					unsigned int port);
++
+ void ib_enum_roce_netdev(struct ib_device *ib_dev,
+ 			 roce_netdev_filter filter,
+ 			 void *filter_cookie,
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index efccd8e0fb77..51e08d730859 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -262,9 +262,7 @@ static int fill_port_info(struct sk_buff *msg,
+ 	if (nla_put_u8(msg, RDMA_NLDEV_ATTR_PORT_PHYS_STATE, attr.phys_state))
+ 		return -EMSGSIZE;
+ 
+-	if (device->ops.get_netdev)
+-		netdev = device->ops.get_netdev(device, port);
+-
++	netdev = ib_device_get_netdev(device, port);
+ 	if (netdev && net_eq(dev_net(netdev), net)) {
+ 		ret = nla_put_u32(msg,
+ 				  RDMA_NLDEV_ATTR_NDEV_INDEX, netdev->ifindex);
+diff --git a/drivers/infiniband/core/verbs.c b/drivers/infiniband/core/verbs.c
+index 3220fb42ecce..6cd8b2d0f2fb 100644
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@ -1718,10 +1718,7 @@ int ib_get_eth_speed(struct ib_device *dev, u8 port_num, u8 *speed, u8 *width)
+ 	if (rdma_port_get_link_layer(dev, port_num) != IB_LINK_LAYER_ETHERNET)
+ 		return -EINVAL;
+ 
+-	if (!dev->ops.get_netdev)
+-		return -EOPNOTSUPP;
+-
+-	netdev = dev->ops.get_netdev(dev, port_num);
++	netdev = ib_device_get_netdev(dev, port_num);
+ 	if (!netdev)
+ 		return -ENODEV;
+ 
+* Unmerged path include/rdma/ib_verbs.h
