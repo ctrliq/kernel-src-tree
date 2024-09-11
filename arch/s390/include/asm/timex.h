@@ -63,6 +63,11 @@ static inline int store_tod_clock(__u64 *time)
 	return cc;
 }
 
+static inline void store_tod_clock_ext(union tod_clock *tod)
+{
+	asm volatile("stcke %0" : "=Q" (*tod) : : "cc");
+}
+
 static inline void set_clock_comparator(__u64 time)
 {
 	asm volatile("sckc %0" : : "Q" (time));
