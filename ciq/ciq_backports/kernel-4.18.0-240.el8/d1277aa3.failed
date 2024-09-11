@@ -1,0 +1,233 @@
+perf cgroup: Maintain cgroup hierarchy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Namhyung Kim <namhyung@kernel.org>
+commit d1277aa36bff4bfc1a187a469fc6a6a1d17cf59c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d1277aa3.failed
+
+Each cgroup is kept in the perf_env's cgroup_tree sorted by the cgroup
+id.  Hist entries have cgroup id can compare it directly and later it
+can be used to find a group name using this tree.
+
+	Signed-off-by: Namhyung Kim <namhyung@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20200325124536.2800725-5-namhyung@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d1277aa36bff4bfc1a187a469fc6a6a1d17cf59c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/machine.c
+diff --cc tools/perf/util/machine.c
+index 40cbcc9a1474,97142e9671be..000000000000
+--- a/tools/perf/util/machine.c
++++ b/tools/perf/util/machine.c
+@@@ -25,6 -32,8 +25,11 @@@
+  #include "linux/hash.h"
+  #include "asm/bug.h"
+  #include "bpf-event.h"
+++<<<<<<< HEAD
+++=======
++ #include <internal/lib.h> // page_size
++ #include "cgroup.h"
+++>>>>>>> d1277aa36bff (perf cgroup: Maintain cgroup hierarchy)
+  
+  #include <linux/ctype.h>
+  #include <symbol/kallsyms.h>
+@@@ -646,6 -655,22 +651,25 @@@ int machine__process_namespaces_event(s
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int machine__process_cgroup_event(struct machine *machine,
++ 				  union perf_event *event,
++ 				  struct perf_sample *sample __maybe_unused)
++ {
++ 	struct cgroup *cgrp;
++ 
++ 	if (dump_trace)
++ 		perf_event__fprintf_cgroup(event, stdout);
++ 
++ 	cgrp = cgroup__findnew(machine->env, event->cgroup.id, event->cgroup.path);
++ 	if (cgrp == NULL)
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d1277aa36bff (perf cgroup: Maintain cgroup hierarchy)
+  int machine__process_lost_event(struct machine *machine __maybe_unused,
+  				union perf_event *event, struct perf_sample *sample __maybe_unused)
+  {
+diff --git a/tools/perf/util/cgroup.c b/tools/perf/util/cgroup.c
+index 450b9a4b266b..7c6055cf22f3 100644
+--- a/tools/perf/util/cgroup.c
++++ b/tools/perf/util/cgroup.c
+@@ -248,3 +248,83 @@ int parse_cgroups(const struct option *opt, const char *str,
+ 	}
+ 	return 0;
+ }
++
++static struct cgroup *__cgroup__findnew(struct rb_root *root, uint64_t id,
++					bool create, const char *path)
++{
++	struct rb_node **p = &root->rb_node;
++	struct rb_node *parent = NULL;
++	struct cgroup *cgrp;
++
++	while (*p != NULL) {
++		parent = *p;
++		cgrp = rb_entry(parent, struct cgroup, node);
++
++		if (cgrp->id == id)
++			return cgrp;
++
++		if (cgrp->id < id)
++			p = &(*p)->rb_left;
++		else
++			p = &(*p)->rb_right;
++	}
++
++	if (!create)
++		return NULL;
++
++	cgrp = malloc(sizeof(*cgrp));
++	if (cgrp == NULL)
++		return NULL;
++
++	cgrp->name = strdup(path);
++	if (cgrp->name == NULL) {
++		free(cgrp);
++		return NULL;
++	}
++
++	cgrp->fd = -1;
++	cgrp->id = id;
++	refcount_set(&cgrp->refcnt, 1);
++
++	rb_link_node(&cgrp->node, parent, p);
++	rb_insert_color(&cgrp->node, root);
++
++	return cgrp;
++}
++
++struct cgroup *cgroup__findnew(struct perf_env *env, uint64_t id,
++			       const char *path)
++{
++	struct cgroup *cgrp;
++
++	down_write(&env->cgroups.lock);
++	cgrp = __cgroup__findnew(&env->cgroups.tree, id, true, path);
++	up_write(&env->cgroups.lock);
++	return cgrp;
++}
++
++struct cgroup *cgroup__find(struct perf_env *env, uint64_t id)
++{
++	struct cgroup *cgrp;
++
++	down_read(&env->cgroups.lock);
++	cgrp = __cgroup__findnew(&env->cgroups.tree, id, false, NULL);
++	up_read(&env->cgroups.lock);
++	return cgrp;
++}
++
++void perf_env__purge_cgroups(struct perf_env *env)
++{
++	struct rb_node *node;
++	struct cgroup *cgrp;
++
++	down_write(&env->cgroups.lock);
++	while (!RB_EMPTY_ROOT(&env->cgroups.tree)) {
++		node = rb_first(&env->cgroups.tree);
++		cgrp = rb_entry(node, struct cgroup, node);
++
++		rb_erase(node, &env->cgroups.tree);
++		cgroup__put(cgrp);
++	}
++	up_write(&env->cgroups.lock);
++}
+diff --git a/tools/perf/util/cgroup.h b/tools/perf/util/cgroup.h
+index f033a80c1b14..840eba77bf85 100644
+--- a/tools/perf/util/cgroup.h
++++ b/tools/perf/util/cgroup.h
+@@ -3,16 +3,19 @@
+ #define __CGROUP_H__
+ 
+ #include <linux/refcount.h>
++#include <linux/rbtree.h>
++#include "util/env.h"
+ 
+ struct option;
+ 
+ struct cgroup {
+-	char *name;
+-	int fd;
+-	refcount_t refcnt;
++	struct rb_node		node;
++	u64			id;
++	char			*name;
++	int			fd;
++	refcount_t		refcnt;
+ };
+ 
+-
+ extern int nr_cgroups; /* number of explicit cgroups defined */
+ 
+ struct cgroup *cgroup__get(struct cgroup *cgroup);
+@@ -26,4 +29,10 @@ void evlist__set_default_cgroup(struct perf_evlist *evlist, struct cgroup *cgrou
+ 
+ int parse_cgroups(const struct option *opt, const char *str, int unset);
+ 
++struct cgroup *cgroup__findnew(struct perf_env *env, uint64_t id,
++			       const char *path);
++struct cgroup *cgroup__find(struct perf_env *env, uint64_t id);
++
++void perf_env__purge_cgroups(struct perf_env *env);
++
+ #endif /* __CGROUP_H__ */
+diff --git a/tools/perf/util/env.c b/tools/perf/util/env.c
+index 4f986e7e85cb..d19f70624bf0 100644
+--- a/tools/perf/util/env.c
++++ b/tools/perf/util/env.c
+@@ -5,6 +5,7 @@
+ #include <linux/ctype.h>
+ #include <linux/zalloc.h>
+ #include "bpf-event.h"
++#include "cgroup.h"
+ #include <errno.h>
+ #include <sys/utsname.h>
+ #include <bpf/libbpf.h>
+@@ -166,6 +167,7 @@ void perf_env__exit(struct perf_env *env)
+ 	int i;
+ 
+ 	perf_env__purge_bpf(env);
++	perf_env__purge_cgroups(env);
+ 	zfree(&env->hostname);
+ 	zfree(&env->os_release);
+ 	zfree(&env->version);
+diff --git a/tools/perf/util/env.h b/tools/perf/util/env.h
+index a63818e66715..18563f1924cc 100644
+--- a/tools/perf/util/env.h
++++ b/tools/perf/util/env.h
+@@ -87,6 +87,12 @@ struct perf_env {
+ 		u32			btfs_cnt;
+ 	} bpf_progs;
+ 
++	/* same reason as above (for perf-top) */
++	struct {
++		struct rw_semaphore	lock;
++		struct rb_root		tree;
++	} cgroups;
++
+ 	/* For fast cpu to numa node lookup via perf_env__numa_node */
+ 	int			*numa_map;
+ 	int			 nr_numa_map;
+* Unmerged path tools/perf/util/machine.c
