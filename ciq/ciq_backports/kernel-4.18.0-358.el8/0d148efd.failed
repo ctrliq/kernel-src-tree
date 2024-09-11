@@ -1,0 +1,142 @@
+nvmet: allow mn change if subsys not discovered
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Noam Gottlieb <ngottlieb@nvidia.com>
+commit 0d148efdf0f0414b2ed2dd9c31e71302bb9ce123
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0d148efd.failed
+
+Currently, once the subsystem's model_number is set for the first time
+there is no way to change it. However, as long as no connection was
+established to nvmf target, there is no reason for such restriction and
+we should allow to change the subsystem's model_number as many times as
+needed.
+
+In addition, in order to simplfy the changes and make the model number
+flow more similar to the rest of the attributes in the Identify
+Controller data structure, we set a default value for the model number
+at the initiation of the subsystem.
+
+	Reviewed-by: Max Gurtovoy <mgurtovoy@nvidia.com>
+	Signed-off-by: Noam Gottlieb <ngottlieb@nvidia.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 0d148efdf0f0414b2ed2dd9c31e71302bb9ce123)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/admin-cmd.c
+#	drivers/nvme/target/core.c
+diff --cc drivers/nvme/target/admin-cmd.c
+index 45307501071c,cd60a8184d04..000000000000
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@@ -343,14 -321,10 +327,21 @@@ static void nvmet_execute_identify_ctrl
+  	u32 cmd_capsule_size;
+  	u16 status = 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If there is no model number yet, set it now.  It will then remain
+ +	 * stable for the life time of the subsystem.
+ +	 */
+ +	if (!subsys->model_number) {
+ +		status = nvmet_set_model_number(subsys);
+ +		if (status)
+ +			goto out;
+++=======
++ 	if (!subsys->subsys_discovered) {
++ 		mutex_lock(&subsys->lock);
++ 		subsys->subsys_discovered = true;
++ 		mutex_unlock(&subsys->lock);
+++>>>>>>> 0d148efdf0f0 (nvmet: allow mn change if subsys not discovered)
+  	}
+  
+  	id = kzalloc(sizeof(*id), GFP_KERNEL);
+diff --cc drivers/nvme/target/core.c
+index 6f05fb126776,146909486b8f..000000000000
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@@ -1506,6 -1493,8 +1506,11 @@@ struct nvmet_subsys *nvmet_subsys_alloc
+  		enum nvme_subsys_type type)
+  {
+  	struct nvmet_subsys *subsys;
+++<<<<<<< HEAD
+++=======
++ 	char serial[NVMET_SN_MAX_SIZE / 2];
++ 	int ret;
+++>>>>>>> 0d148efdf0f0 (nvmet: allow mn change if subsys not discovered)
+  
+  	subsys = kzalloc(sizeof(*subsys), GFP_KERNEL);
+  	if (!subsys)
+@@@ -1513,8 -1502,15 +1518,14 @@@
+  
+  	subsys->ver = NVMET_DEFAULT_VS;
+  	/* generate a random serial number as our controllers are ephemeral: */
+ -	get_random_bytes(&serial, sizeof(serial));
+ -	bin2hex(subsys->serial, &serial, sizeof(serial));
+ +	get_random_bytes(&subsys->serial, sizeof(subsys->serial));
+  
++ 	subsys->model_number = kstrdup(NVMET_DEFAULT_CTRL_MODEL, GFP_KERNEL);
++ 	if (!subsys->model_number) {
++ 		ret = -ENOMEM;
++ 		goto free_subsys;
++ 	}
++ 
+  	switch (type) {
+  	case NVME_NQN_NVME:
+  		subsys->max_qid = NVMET_NR_QUEUES;
+* Unmerged path drivers/nvme/target/admin-cmd.c
+diff --git a/drivers/nvme/target/configfs.c b/drivers/nvme/target/configfs.c
+index cd889d71ec13..21d6084efaa7 100644
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@ -1126,14 +1126,8 @@ static ssize_t nvmet_subsys_attr_model_show(struct config_item *item,
+ 					    char *page)
+ {
+ 	struct nvmet_subsys *subsys = to_subsys(item);
+-	int ret;
+ 
+-	mutex_lock(&subsys->lock);
+-	ret = snprintf(page, PAGE_SIZE, "%s\n", subsys->model_number ?
+-			subsys->model_number : NVMET_DEFAULT_CTRL_MODEL);
+-	mutex_unlock(&subsys->lock);
+-
+-	return ret;
++	return snprintf(page, PAGE_SIZE, "%s\n", subsys->model_number);
+ }
+ 
+ /* See Section 1.5 of NVMe 1.4 */
+@@ -1147,7 +1141,7 @@ static ssize_t nvmet_subsys_attr_model_store_locked(struct nvmet_subsys *subsys,
+ {
+ 	int pos = 0, len;
+ 
+-	if (subsys->model_number) {
++	if (subsys->subsys_discovered) {
+ 		pr_err("Can't set model number. %s is already assigned\n",
+ 		       subsys->model_number);
+ 		return -EINVAL;
+* Unmerged path drivers/nvme/target/core.c
+diff --git a/drivers/nvme/target/discovery.c b/drivers/nvme/target/discovery.c
+index 7aa2deaaf562..e347de04a6eb 100644
+--- a/drivers/nvme/target/discovery.c
++++ b/drivers/nvme/target/discovery.c
+@@ -252,7 +252,6 @@ static void nvmet_execute_disc_identify(struct nvmet_req *req)
+ {
+ 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+ 	struct nvme_id_ctrl *id;
+-	const char model[] = "Linux";
+ 	u16 status = 0;
+ 
+ 	if (!nvmet_check_transfer_len(req, NVME_IDENTIFY_DATA_SIZE))
+@@ -274,7 +273,8 @@ static void nvmet_execute_disc_identify(struct nvmet_req *req)
+ 	bin2hex(id->sn, &ctrl->subsys->serial,
+ 		min(sizeof(ctrl->subsys->serial), sizeof(id->sn) / 2));
+ 	memset(id->fr, ' ', sizeof(id->fr));
+-	memcpy_and_pad(id->mn, sizeof(id->mn), model, sizeof(model) - 1, ' ');
++	memcpy_and_pad(id->mn, sizeof(id->mn), ctrl->subsys->model_number,
++		       strlen(ctrl->subsys->model_number), ' ');
+ 	memcpy_and_pad(id->fr, sizeof(id->fr),
+ 		       UTS_RELEASE, strlen(UTS_RELEASE), ' ');
+ 
