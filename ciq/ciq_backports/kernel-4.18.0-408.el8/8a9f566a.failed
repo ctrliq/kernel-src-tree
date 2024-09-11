@@ -1,0 +1,242 @@
+KVM: x86/mmu: Avoid memslot lookup in rmap_add
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 8a9f566ae4a4156343afb5cbfa79401c07647b1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8a9f566a.failed
+
+Avoid the memslot lookup in rmap_add, by passing it down from the fault
+handling code to mmu_set_spte and then to rmap_add.
+
+No functional change intended.
+
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20210813203504.2742757-6-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8a9f566ae4a4156343afb5cbfa79401c07647b1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+#	arch/x86/kvm/mmu/paging_tmpl.h
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,7ff2c6c896a8..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1640,28 -1625,34 +1640,41 @@@ static int kvm_test_age_rmapp(struct kv
+  
+  #define RMAP_RECYCLE_THRESHOLD 1000
+  
+++<<<<<<< HEAD
+ +static void rmap_recycle(struct kvm_vcpu *vcpu, u64 *spte, gfn_t gfn)
+ +{
+ +	struct kvm_memory_slot *slot;
+++=======
++ static void rmap_add(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 		     u64 *spte, gfn_t gfn)
++ {
++ 	struct kvm_mmu_page *sp;
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  	struct kvm_rmap_head *rmap_head;
+ -	int rmap_count;
+ +	struct kvm_mmu_page *sp;
+  
+  	sp = sptep_to_sp(spte);
+++<<<<<<< HEAD
+ +	slot = kvm_vcpu_gfn_to_memslot(vcpu, gfn);
+ +	rmap_head = __gfn_to_rmap(gfn, sp->role.level, slot);
+++=======
++ 	kvm_mmu_page_set_gfn(sp, spte - sp->spt, gfn);
++ 	rmap_head = gfn_to_rmap(gfn, sp->role.level, slot);
++ 	rmap_count = pte_list_add(vcpu, spte, rmap_head);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  
+ -	if (rmap_count > RMAP_RECYCLE_THRESHOLD) {
+ -		kvm_unmap_rmapp(vcpu->kvm, rmap_head, NULL, gfn, sp->role.level, __pte(0));
+ -		kvm_flush_remote_tlbs_with_address(
+ -				vcpu->kvm, sp->gfn, KVM_PAGES_PER_HPAGE(sp->role.level));
+ -	}
+ +	kvm_unmap_rmapp(vcpu->kvm, rmap_head, NULL, gfn, sp->role.level, 0);
+ +	kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
+ +			KVM_PAGES_PER_HPAGE(sp->role.level));
+  }
+  
+ -bool kvm_age_gfn(struct kvm *kvm, struct kvm_gfn_range *range)
+ +int kvm_age_hva(struct kvm *kvm, unsigned long start, unsigned long end)
+  {
+ -	bool young = false;
+ -
+ -	if (kvm_memslots_have_rmaps(kvm))
+ -		young = kvm_handle_gfn_range(kvm, range, kvm_age_rmapp);
+ +	int young = false;
+  
+ +	young = kvm_handle_hva_range(kvm, start, end, 0, kvm_age_rmapp);
+  	if (is_tdp_mmu_enabled(kvm))
+ -		young |= kvm_tdp_mmu_age_gfn_range(kvm, range);
+ +		young |= kvm_tdp_mmu_age_hva_range(kvm, start, end);
+  
+  	return young;
+  }
+@@@ -2652,40 -2673,22 +2665,46 @@@ int mmu_try_to_unsync_pages(struct kvm_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +		    unsigned int pte_access, int level,
+ +		    gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +		    bool can_unsync, bool host_writable)
+ +{
+ +	u64 spte;
+ +	struct kvm_mmu_page *sp;
+ +	int ret;
+ +
+ +	sp = sptep_to_sp(sptep);
+ +
+ +	ret = make_spte(vcpu, pte_access, level, gfn, pfn, *sptep, speculative,
+ +			can_unsync, host_writable, sp_ad_disabled(sp), &spte);
+ +
+ +	if (spte & PT_WRITABLE_MASK)
+ +		kvm_vcpu_mark_page_dirty(vcpu, gfn);
+ +
+ +	if (*sptep == spte)
+ +		ret |= SET_SPTE_SPURIOUS;
+ +	else if (mmu_spte_update(sptep, spte))
+ +		ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
+ +	return ret;
+ +}
+ +
+ +static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +			unsigned int pte_access, bool write_fault, int level,
+ +			gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +			bool host_writable)
+++=======
++ static int mmu_set_spte(struct kvm_vcpu *vcpu, struct kvm_memory_slot *slot,
++ 			u64 *sptep, unsigned int pte_access, gfn_t gfn,
++ 			kvm_pfn_t pfn, struct kvm_page_fault *fault)
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  {
+ -	struct kvm_mmu_page *sp = sptep_to_sp(sptep);
+ -	int level = sp->role.level;
+  	int was_rmapped = 0;
+ +	int rmap_count;
+ +	int set_spte_ret;
+  	int ret = RET_PF_FIXED;
+  	bool flush = false;
+ -	bool wrprot;
+ -	u64 spte;
+ -
+ -	/* Prefetching always gets a writable pfn.  */
+ -	bool host_writable = !fault || fault->map_writable;
+ -	bool speculative = !fault || fault->prefault;
+ -	bool write_fault = fault && fault->write;
+  
+  	pgprintk("%s: spte %llx write_fault %d gfn %llx\n", __func__,
+  		 *sptep, write_fault, gfn);
+@@@ -2727,24 -2738,12 +2746,30 @@@
+  		kvm_flush_remote_tlbs_with_address(vcpu->kvm, gfn,
+  				KVM_PAGES_PER_HPAGE(level));
+  
+ +	/*
+ +	 * The fault is fully spurious if and only if the new SPTE and old SPTE
+ +	 * are identical, and emulation is not required.
+ +	 */
+ +	if ((set_spte_ret & SET_SPTE_SPURIOUS) && ret == RET_PF_FIXED) {
+ +		WARN_ON_ONCE(!was_rmapped);
+ +		return RET_PF_SPURIOUS;
+ +	}
+ +
+  	pgprintk("%s: setting spte %llx\n", __func__, *sptep);
+ +	trace_kvm_mmu_set_spte(level, gfn, sptep);
+  
+  	if (!was_rmapped) {
+++<<<<<<< HEAD
+ +		if (is_large_pte(*sptep))
+ +			++vcpu->kvm->stat.lpages;
+ +		rmap_count = rmap_add(vcpu, sptep, gfn);
+ +		if (rmap_count > RMAP_RECYCLE_THRESHOLD)
+ +			rmap_recycle(vcpu, sptep, gfn);
+++=======
++ 		WARN_ON_ONCE(ret == RET_PF_SPURIOUS);
++ 		kvm_update_page_stats(vcpu->kvm, level, 1);
++ 		rmap_add(vcpu, slot, sptep, gfn);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  	}
+  
+  	return ret;
+@@@ -2782,8 -2769,8 +2795,13 @@@ static int direct_pte_prefetch_many(str
+  		return -1;
+  
+  	for (i = 0; i < ret; i++, gfn++, start++) {
+++<<<<<<< HEAD
+ +		mmu_set_spte(vcpu, start, access, false, sp->role.level, gfn,
+ +			     page_to_pfn(pages[i]), true, true);
+++=======
++ 		mmu_set_spte(vcpu, slot, start, access, gfn,
++ 			     page_to_pfn(pages[i]), NULL);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  		put_page(pages[i]);
+  	}
+  
+@@@ -2996,9 -2968,11 +3014,17 @@@ static int __direct_map(struct kvm_vcp
+  			account_huge_nx_page(vcpu->kvm, sp);
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = mmu_set_spte(vcpu, it.sptep, ACC_ALL,
+ +			   write, level, base_gfn, pfn, prefault,
+ +			   map_writable);
+++=======
++ 	if (WARN_ON_ONCE(it.level != fault->goal_level))
++ 		return -EFAULT;
++ 
++ 	ret = mmu_set_spte(vcpu, fault->slot, it.sptep, ACC_ALL,
++ 			   base_gfn, fault->pfn, fault);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  	if (ret == RET_PF_SPURIOUS)
+  		return ret;
+  
+diff --cc arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48,44361f7e70c8..000000000000
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@@ -578,13 -584,7 +584,17 @@@ FNAME(prefetch_gpte)(struct kvm_vcpu *v
+  	if (is_error_pfn(pfn))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * we call mmu_set_spte() with host_writable = true because
+ +	 * pte_prefetch_gfn_to_pfn always gets a writable pfn.
+ +	 */
+ +	mmu_set_spte(vcpu, spte, pte_access, false, PG_LEVEL_4K, gfn, pfn,
+ +		     true, true);
+ +
+++=======
++ 	mmu_set_spte(vcpu, slot, spte, pte_access, gfn, pfn, NULL);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  	kvm_release_pfn_clean(pfn);
+  	return true;
+  }
+@@@ -766,8 -760,11 +776,16 @@@ static int FNAME(fetch)(struct kvm_vcp
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = mmu_set_spte(vcpu, it.sptep, gw->pte_access, write_fault,
+ +			   it.level, base_gfn, pfn, prefault, map_writable);
+++=======
++ 	if (WARN_ON_ONCE(it.level != fault->goal_level))
++ 		return -EFAULT;
++ 
++ 	ret = mmu_set_spte(vcpu, fault->slot, it.sptep, gw->pte_access,
++ 			   base_gfn, fault->pfn, fault);
+++>>>>>>> 8a9f566ae4a4 (KVM: x86/mmu: Avoid memslot lookup in rmap_add)
+  	if (ret == RET_PF_SPURIOUS)
+  		return ret;
+  
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+* Unmerged path arch/x86/kvm/mmu/paging_tmpl.h
