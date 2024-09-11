@@ -1,0 +1,196 @@
+libbpf: Add various netlink helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Kumar Kartikeya Dwivedi <memxor@gmail.com>
+commit 8bbb77b7c7a226803270dac3fc8dd564fd2f5756
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/8bbb77b7.failed
+
+This change introduces a few helpers to wrap open coded attribute
+preparation in netlink.c. It also adds a libbpf_netlink_send_recv() that
+is useful to wrap send + recv handling in a generic way. Subsequent patch
+will also use this function for sending and receiving a netlink response.
+The libbpf_nl_get_link() helper has been removed instead, moving socket
+creation into the newly named libbpf_netlink_send_recv().
+
+Every nested attribute's closure must happen using the helper
+nlattr_end_nested(), which sets its length properly. NLA_F_NESTED is
+enforced using nlattr_begin_nested() helper. Other simple attributes
+can be added directly.
+
+The maxsz parameter corresponds to the size of the request structure
+which is being filled in, so for instance with req being:
+
+  struct {
+	struct nlmsghdr nh;
+	struct tcmsg t;
+	char buf[4096];
+  } req;
+
+Then, maxsz should be sizeof(req).
+
+This change also converts the open coded attribute preparation with these
+helpers. Note that the only failure the internal call to nlattr_add()
+could result in the nested helper would be -EMSGSIZE, hence that is what
+we return to our caller.
+
+The libbpf_netlink_send_recv() call takes care of opening the socket,
+sending the netlink message, receiving the response, potentially invoking
+callbacks, and return errors if any, and then finally close the socket.
+This allows users to avoid identical socket setup code in different places.
+The only user of libbpf_nl_get_link() has been converted to make use of it.
+__bpf_set_link_xdp_fd_replace() has also been refactored to use it.
+
+	Signed-off-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+[ Daniel: major patch cleanup ]
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20210512103451.989420-2-memxor@gmail.com
+(cherry picked from commit 8bbb77b7c7a226803270dac3fc8dd564fd2f5756)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/netlink.c
+diff --cc tools/lib/bpf/netlink.c
+index 4676dcf5eae8,8bbdc6c38f06..000000000000
+--- a/tools/lib/bpf/netlink.c
++++ b/tools/lib/bpf/netlink.c
+@@@ -282,16 -286,21 +286,29 @@@ static int get_xdp_info(void *cookie, v
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int libbpf_nl_get_link(int sock, unsigned int nl_pid,
+ +			      libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie);
+ +
+ +int bpf_get_link_xdp_info_v0_0_4(int ifindex, struct xdp_link_info *info,
+ +				 size_t info_size, __u32 flags)
+++=======
++ int bpf_get_link_xdp_info(int ifindex, struct xdp_link_info *info,
++ 			  size_t info_size, __u32 flags)
+++>>>>>>> 8bbb77b7c7a2 (libbpf: Add various netlink helpers)
+  {
+  	struct xdp_id_md xdp_id = {};
+- 	int sock, ret;
+- 	__u32 nl_pid = 0;
+  	__u32 mask;
++ 	int ret;
++ 	struct {
++ 		struct nlmsghdr  nh;
++ 		struct ifinfomsg ifm;
++ 	} req = {
++ 		.nh.nlmsg_len   = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
++ 		.nh.nlmsg_type  = RTM_GETLINK,
++ 		.nh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
++ 		.ifm.ifi_family = AF_PACKET,
++ 	};
+  
+  	if (flags & ~XDP_FLAGS_MASK || !info_size)
+  		return -EINVAL;
+@@@ -348,35 -353,3 +361,38 @@@ int bpf_get_link_xdp_id(int ifindex, __
+  
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +
+ +int libbpf_nl_get_link(int sock, unsigned int nl_pid,
+ +		       libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie)
+ +{
+ +	struct {
+ +		struct nlmsghdr nlh;
+ +		struct ifinfomsg ifm;
+ +	} req = {
+ +		.nlh.nlmsg_len = NLMSG_LENGTH(sizeof(struct ifinfomsg)),
+ +		.nlh.nlmsg_type = RTM_GETLINK,
+ +		.nlh.nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST,
+ +		.ifm.ifi_family = AF_PACKET,
+ +	};
+ +	int seq = time(NULL);
+ +
+ +	req.nlh.nlmsg_seq = seq;
+ +	if (send(sock, &req, req.nlh.nlmsg_len, 0) < 0)
+ +		return -errno;
+ +
+ +	return bpf_netlink_recv(sock, nl_pid, seq, __dump_link_nlmsg,
+ +				dump_link_nlmsg, cookie);
+ +}
+ +
+ +/* RHEL-only, libbpf version workaround */
+ +extern int bpf_get_link_xdp_info_v0_0_6(int ifindex, struct xdp_link_info *info,
+ +					size_t info_size, __u32 flags)
+ +	__attribute__((alias("bpf_get_link_xdp_info_v0_0_4")));
+ +
+ +COMPAT_VERSION(bpf_get_link_xdp_info_v0_0_4,
+ +	       bpf_get_link_xdp_info, LIBBPF_0.0.4)
+ +DEFAULT_VERSION(bpf_get_link_xdp_info_v0_0_6,
+ +	        bpf_get_link_xdp_info, LIBBPF_0.0.6)
+++=======
+++>>>>>>> 8bbb77b7c7a2 (libbpf: Add various netlink helpers)
+* Unmerged path tools/lib/bpf/netlink.c
+diff --git a/tools/lib/bpf/nlattr.h b/tools/lib/bpf/nlattr.h
+index 6cc3ac91690f..3c780ab6d022 100644
+--- a/tools/lib/bpf/nlattr.h
++++ b/tools/lib/bpf/nlattr.h
+@@ -10,7 +10,10 @@
+ #define __LIBBPF_NLATTR_H
+ 
+ #include <stdint.h>
++#include <string.h>
++#include <errno.h>
+ #include <linux/netlink.h>
++
+ /* avoid multiple definition of netlink features */
+ #define __LINUX_NETLINK_H
+ 
+@@ -103,4 +106,49 @@ int libbpf_nla_parse_nested(struct nlattr *tb[], int maxtype,
+ 
+ int libbpf_nla_dump_errormsg(struct nlmsghdr *nlh);
+ 
++static inline struct nlattr *nla_data(struct nlattr *nla)
++{
++	return (struct nlattr *)((char *)nla + NLA_HDRLEN);
++}
++
++static inline struct nlattr *nh_tail(struct nlmsghdr *nh)
++{
++	return (struct nlattr *)((char *)nh + NLMSG_ALIGN(nh->nlmsg_len));
++}
++
++static inline int nlattr_add(struct nlmsghdr *nh, size_t maxsz, int type,
++			     const void *data, int len)
++{
++	struct nlattr *nla;
++
++	if (NLMSG_ALIGN(nh->nlmsg_len) + NLA_ALIGN(NLA_HDRLEN + len) > maxsz)
++		return -EMSGSIZE;
++	if (!!data != !!len)
++		return -EINVAL;
++
++	nla = nh_tail(nh);
++	nla->nla_type = type;
++	nla->nla_len = NLA_HDRLEN + len;
++	if (data)
++		memcpy(nla_data(nla), data, len);
++	nh->nlmsg_len = NLMSG_ALIGN(nh->nlmsg_len) + NLA_ALIGN(nla->nla_len);
++	return 0;
++}
++
++static inline struct nlattr *nlattr_begin_nested(struct nlmsghdr *nh,
++						 size_t maxsz, int type)
++{
++	struct nlattr *tail;
++
++	tail = nh_tail(nh);
++	if (nlattr_add(nh, maxsz, type | NLA_F_NESTED, NULL, 0))
++		return NULL;
++	return tail;
++}
++
++static inline void nlattr_end_nested(struct nlmsghdr *nh, struct nlattr *tail)
++{
++	tail->nla_len = (char *)nh_tail(nh) - (char *)tail;
++}
++
+ #endif /* __LIBBPF_NLATTR_H */
