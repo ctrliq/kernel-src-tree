@@ -1,0 +1,201 @@
+perf pmu: Use file system cache to optimize sysfs access
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andi Kleen <ak@linux.intel.com>
+commit d96645821e940bddff3fc5290656f83bf70d4c92
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d9664582.failed
+
+pmu.c does a lot of redundant /sys accesses while parsing aliases
+and probing for PMUs. On large systems with a lot of PMUs this
+can get expensive (>2s):
+
+  % time     seconds  usecs/call     calls    errors syscall
+  ------ ----------- ----------- --------- --------- ----------------
+   27.25    1.227847           8    160888     16976 openat
+   26.42    1.190481           7    164224    164077 stat
+
+Add a cache to remember if specific file names exist or don't
+exist, which eliminates most of this overhead.
+
+Also optimize some stat() calls to be slightly cheaper access()
+
+Resulting in:
+
+    0.18    0.004166           2      1851       305 open
+    0.08    0.001970           2       829       622 access
+
+	Signed-off-by: Andi Kleen <ak@linux.intel.com>
+	Acked-by: Jiri Olsa <jolsa@kernel.org>
+Link: http://lore.kernel.org/lkml/20191121001522.180827-2-andi@firstfloor.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit d96645821e940bddff3fc5290656f83bf70d4c92)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/pmu.c
+#	tools/perf/util/srccode.c
+diff --cc tools/perf/util/pmu.c
+index 1820b31e1c9b,8b99fd312aae..000000000000
+--- a/tools/perf/util/pmu.c
++++ b/tools/perf/util/pmu.c
+@@@ -15,13 -16,15 +15,18 @@@
+  #include <api/fs/fs.h>
+  #include <locale.h>
+  #include <regex.h>
+ -#include <perf/cpumap.h>
+ -#include "debug.h"
+  #include "pmu.h"
+  #include "parse-events.h"
+ +#include "cpumap.h"
+  #include "header.h"
+  #include "pmu-events/pmu-events.h"
+ +#include "cache.h"
+  #include "string2.h"
+++<<<<<<< HEAD
+++=======
++ #include "strbuf.h"
++ #include "fncache.h"
+++>>>>>>> d96645821e94 (perf pmu: Use file system cache to optimize sysfs access)
+  
+  struct perf_pmu_format {
+  	char *name;
+@@@ -626,14 -626,11 +628,23 @@@ static struct cpu_map *pmu_cpumask(cons
+  static bool pmu_is_uncore(const char *name)
+  {
+  	char path[PATH_MAX];
+++<<<<<<< HEAD
+ +	struct cpu_map *cpus;
+ +	const char *sysfs = sysfs__mountpoint();
+++=======
++ 	const char *sysfs;
+++>>>>>>> d96645821e94 (perf pmu: Use file system cache to optimize sysfs access)
+  
++ 	sysfs = sysfs__mountpoint();
+  	snprintf(path, PATH_MAX, CPUS_TEMPLATE_UNCORE, sysfs, name);
+++<<<<<<< HEAD
+ +	cpus = __pmu_cpumask(path);
+ +	cpu_map__put(cpus);
+ +
+ +	return !!cpus;
+++=======
++ 	return file_available(path);
+++>>>>>>> d96645821e94 (perf pmu: Use file system cache to optimize sysfs access)
+  }
+  
+  /*
+diff --cc tools/perf/util/srccode.c
+index f733e609da28,c29edaaca863..000000000000
+--- a/tools/perf/util/srccode.c
++++ b/tools/perf/util/srccode.c
+@@@ -23,7 -15,8 +23,12 @@@
+  #include <string.h>
+  #include "srccode.h"
+  #include "debug.h"
+++<<<<<<< HEAD
+ +#include "util.h"
+++=======
++ #include <internal/lib.h> // page_size
++ #include "fncache.h"
+++>>>>>>> d96645821e94 (perf pmu: Use file system cache to optimize sysfs access)
+  
+  #define MAXSRCCACHE (32*1024*1024)
+  #define MAXSRCFILES     64
+diff --git a/tools/perf/util/Build b/tools/perf/util/Build
+index 8d12abd789fa..02e3214a4577 100644
+--- a/tools/perf/util/Build
++++ b/tools/perf/util/Build
+@@ -45,6 +45,7 @@ perf-y += header.o
+ perf-y += callchain.o
+ perf-y += values.o
+ perf-y += debug.o
++perf-y += fncache.o
+ perf-y += machine.o
+ perf-y += map.o
+ perf-y += pstack.o
+diff --git a/tools/perf/util/fncache.c b/tools/perf/util/fncache.c
+new file mode 100644
+index 000000000000..6225cbc52310
+--- /dev/null
++++ b/tools/perf/util/fncache.c
+@@ -0,0 +1,63 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Manage a cache of file names' existence */
++#include <stdlib.h>
++#include <unistd.h>
++#include <string.h>
++#include <linux/list.h>
++#include "fncache.h"
++
++struct fncache {
++	struct hlist_node nd;
++	bool res;
++	char name[];
++};
++
++#define FNHSIZE 61
++
++static struct hlist_head fncache_hash[FNHSIZE];
++
++unsigned shash(const unsigned char *s)
++{
++	unsigned h = 0;
++	while (*s)
++		h = 65599 * h + *s++;
++	return h ^ (h >> 16);
++}
++
++static bool lookup_fncache(const char *name, bool *res)
++{
++	int h = shash((const unsigned char *)name) % FNHSIZE;
++	struct fncache *n;
++
++	hlist_for_each_entry(n, &fncache_hash[h], nd) {
++		if (!strcmp(n->name, name)) {
++			*res = n->res;
++			return true;
++		}
++	}
++	return false;
++}
++
++static void update_fncache(const char *name, bool res)
++{
++	struct fncache *n = malloc(sizeof(struct fncache) + strlen(name) + 1);
++	int h = shash((const unsigned char *)name) % FNHSIZE;
++
++	if (!n)
++		return;
++	strcpy(n->name, name);
++	n->res = res;
++	hlist_add_head(&n->nd, &fncache_hash[h]);
++}
++
++/* No LRU, only use when bounded in some other way. */
++bool file_available(const char *name)
++{
++	bool res;
++
++	if (lookup_fncache(name, &res))
++		return res;
++	res = access(name, R_OK) == 0;
++	update_fncache(name, res);
++	return res;
++}
+diff --git a/tools/perf/util/fncache.h b/tools/perf/util/fncache.h
+new file mode 100644
+index 000000000000..fe020beaefb1
+--- /dev/null
++++ b/tools/perf/util/fncache.h
+@@ -0,0 +1,7 @@
++#ifndef _FCACHE_H
++#define _FCACHE_H 1
++
++unsigned shash(const unsigned char *s);
++bool file_available(const char *name);
++
++#endif
+* Unmerged path tools/perf/util/pmu.c
+* Unmerged path tools/perf/util/srccode.c
