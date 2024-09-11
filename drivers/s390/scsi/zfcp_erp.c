@@ -1135,7 +1135,8 @@ static int zfcp_erp_lun_strategy(struct zfcp_erp_action *erp_action)
 		zfcp_erp_lun_strategy_clearstati(sdev);
 		if (atomic_read(&zfcp_sdev->status) & ZFCP_STATUS_COMMON_OPEN)
 			return zfcp_erp_lun_strategy_close(erp_action);
-		/* already closed, fall through */
+		/* already closed */
+		/* fall through */
 	case ZFCP_ERP_STEP_LUN_CLOSING:
 		if (atomic_read(&zfcp_sdev->status) & ZFCP_STATUS_COMMON_OPEN)
 			return ZFCP_ERP_FAILED;
