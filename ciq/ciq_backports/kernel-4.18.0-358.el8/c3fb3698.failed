@@ -1,0 +1,258 @@
+net: bridge: mcast: consolidate querier selection for ipv4 and ipv6
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit c3fb3698f935381161101d2479d66dd48c106183
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c3fb3698.failed
+
+We can consolidate both functions as they share almost the same logic.
+This is easier to maintain and we have a single querier update function.
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c3fb3698f935381161101d2479d66dd48c106183)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,3705b7ace62d..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -2070,81 -2864,126 +2070,118 @@@ unlock_continue
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static bool br_ip4_multicast_select_querier(struct net_bridge *br,
+ +					    struct net_bridge_port *port,
+ +					    __be32 saddr)
+ +{
+ +	if (!timer_pending(&br->ip4_own_query.timer) &&
+ +	    !timer_pending(&br->ip4_other_query.timer))
+ +		goto update;
+ +
+ +	if (!br->ip4_querier.addr.src.ip4)
+ +		goto update;
+ +
+ +	if (ntohl(saddr) <= ntohl(br->ip4_querier.addr.src.ip4))
+ +		goto update;
+ +
+ +	return false;
+ +
+ +update:
+ +	br->ip4_querier.addr.src.ip4 = saddr;
+ +
+ +	/* update protected by general multicast_lock by caller */
+ +	rcu_assign_pointer(br->ip4_querier.port, port);
+ +
+ +	return true;
+ +}
+ +
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +static bool br_ip6_multicast_select_querier(struct net_bridge *br,
+ +					    struct net_bridge_port *port,
+ +					    struct in6_addr *saddr)
+ +{
+ +	if (!timer_pending(&br->ip6_own_query.timer) &&
+ +	    !timer_pending(&br->ip6_other_query.timer))
+ +		goto update;
+ +
+ +	if (ipv6_addr_cmp(saddr, &br->ip6_querier.addr.src.ip6) <= 0)
+++=======
++ static bool br_multicast_select_querier(struct net_bridge_mcast *brmctx,
++ 					struct net_bridge_mcast_port *pmctx,
++ 					struct br_ip *saddr)
++ {
++ 	int port_ifidx = pmctx ? pmctx->port->dev->ifindex : 0;
++ 	struct timer_list *own_timer, *other_timer;
++ 	struct bridge_mcast_querier *querier;
++ 
++ 	switch (saddr->proto) {
++ 	case htons(ETH_P_IP):
++ 		querier = &brmctx->ip4_querier;
++ 		own_timer = &brmctx->ip4_own_query.timer;
++ 		other_timer = &brmctx->ip4_other_query.timer;
++ 		if (!querier->addr.src.ip4 ||
++ 		    ntohl(saddr->src.ip4) <= ntohl(querier->addr.src.ip4))
++ 			goto update;
++ 		break;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case htons(ETH_P_IPV6):
++ 		querier = &brmctx->ip6_querier;
++ 		own_timer = &brmctx->ip6_own_query.timer;
++ 		other_timer = &brmctx->ip6_other_query.timer;
++ 		if (ipv6_addr_cmp(&saddr->src.ip6, &querier->addr.src.ip6) <= 0)
++ 			goto update;
++ 		break;
++ #endif
++ 	default:
++ 		return false;
++ 	}
++ 
++ 	if (!timer_pending(own_timer) && !timer_pending(other_timer))
+++>>>>>>> c3fb3698f935 (net: bridge: mcast: consolidate querier selection for ipv4 and ipv6)
+  		goto update;
+  
+  	return false;
+  
+ -update:
+ -	br_multicast_update_querier(brmctx, querier, port_ifidx, saddr);
+ -
+ -	return true;
+ -}
+ -
+ -static void
+ -br_multicast_update_query_timer(struct net_bridge_mcast *brmctx,
+ -				struct bridge_mcast_other_query *query,
+ -				unsigned long max_delay)
+ -{
+ -	if (!timer_pending(&query->timer))
+ -		query->delay_time = jiffies + max_delay;
+ -
+ -	mod_timer(&query->timer, jiffies + brmctx->multicast_querier_interval);
+ -}
+ -
+ -static void br_port_mc_router_state_change(struct net_bridge_port *p,
+ -					   bool is_mc_router)
+ -{
+ -	struct switchdev_attr attr = {
+ -		.orig_dev = p->dev,
+ -		.id = SWITCHDEV_ATTR_ID_PORT_MROUTER,
+ -		.flags = SWITCHDEV_F_DEFER,
+ -		.u.mrouter = is_mc_router,
+ -	};
+ -
+ -	switchdev_port_attr_set(p->dev, &attr, NULL);
+ -}
+ -
+ -static struct net_bridge_port *
+ -br_multicast_rport_from_node(struct net_bridge_mcast *brmctx,
+ -			     struct hlist_head *mc_router_list,
+ -			     struct hlist_node *rlist)
+ -{
+ -	struct net_bridge_mcast_port *pmctx;
+ -
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	if (mc_router_list == &brmctx->ip6_mc_router_list)
+ -		pmctx = hlist_entry(rlist, struct net_bridge_mcast_port,
+ -				    ip6_rlist);
+ -	else
+ -#endif
+ -		pmctx = hlist_entry(rlist, struct net_bridge_mcast_port,
+ -				    ip4_rlist);
+ -
+ -	return pmctx->port;
+ -}
+ -
+ -static struct hlist_node *
+ -br_multicast_get_rport_slot(struct net_bridge_mcast *brmctx,
+ -			    struct net_bridge_port *port,
+ -			    struct hlist_head *mc_router_list)
+ -
+ -{
+ -	struct hlist_node *slot = NULL;
+ -	struct net_bridge_port *p;
+ -	struct hlist_node *rlist;
+ -
+ -	hlist_for_each(rlist, mc_router_list) {
+ -		p = br_multicast_rport_from_node(brmctx, mc_router_list, rlist);
+ +update:
+++<<<<<<< HEAD
+ +	br->ip6_querier.addr.src.ip6 = *saddr;
+  
+ -		if ((unsigned long)port >= (unsigned long)p)
+ -			break;
+ +	/* update protected by general multicast_lock by caller */
+ +	rcu_assign_pointer(br->ip6_querier.port, port);
+++=======
+++	br_multicast_update_querier(brmctx, querier, port_ifidx, saddr);
+++>>>>>>> c3fb3698f935 (net: bridge: mcast: consolidate querier selection for ipv4 and ipv6)
+  
+ -		slot = rlist;
+ -	}
+ +	return true;
+ +}
+- #endif
+ +
+ +static void
+ +br_multicast_update_query_timer(struct net_bridge *br,
+ +				struct bridge_mcast_other_query *query,
+ +				unsigned long max_delay)
+ +{
+ +	if (!timer_pending(&query->timer))
+ +		query->delay_time = jiffies + max_delay;
+  
+ -	return slot;
+ +	mod_timer(&query->timer, jiffies + br->multicast_querier_interval);
+  }
+  
+ -static bool br_multicast_no_router_otherpf(struct net_bridge_mcast_port *pmctx,
+ -					   struct hlist_node *rnode)
+ +static void br_port_mc_router_state_change(struct net_bridge_port *p,
+ +					   bool is_mc_router)
+  {
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	if (rnode != &pmctx->ip6_rlist)
+ -		return hlist_unhashed(&pmctx->ip6_rlist);
+ -	else
+ -		return hlist_unhashed(&pmctx->ip4_rlist);
+ -#else
+ -	return true;
+ -#endif
+ +	struct switchdev_attr attr = {
+ +		.orig_dev = p->dev,
+ +		.id = SWITCHDEV_ATTR_ID_PORT_MROUTER,
+ +		.flags = SWITCHDEV_F_DEFER,
+ +		.u.mrouter = is_mc_router,
+ +	};
+ +
+ +	switchdev_port_attr_set(p->dev, &attr);
+  }
+  
+ -/* Add port to router_list
+ +/*
+ + * Add port to router_list
+   *  list is maintained ordered by pointer value
+   *  and locked by br->multicast_lock and RCU
+   */
+@@@ -2203,11 -3106,11 +2240,15 @@@ br_ip4_multicast_query_received(struct 
+  				struct br_ip *saddr,
+  				unsigned long max_delay)
+  {
+++<<<<<<< HEAD
+ +	if (!br_ip4_multicast_select_querier(br, port, saddr->src.ip4))
+++=======
++ 	if (!br_multicast_select_querier(brmctx, pmctx, saddr))
+++>>>>>>> c3fb3698f935 (net: bridge: mcast: consolidate querier selection for ipv4 and ipv6)
+  		return;
+  
+ -	br_multicast_update_query_timer(brmctx, query, max_delay);
+ -	br_ip4_multicast_mark_router(brmctx, pmctx);
+ +	br_multicast_update_query_timer(br, query, max_delay);
+ +	br_multicast_mark_router(br, port);
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+@@@ -2218,11 -3121,11 +2259,15 @@@ br_ip6_multicast_query_received(struct 
+  				struct br_ip *saddr,
+  				unsigned long max_delay)
+  {
+++<<<<<<< HEAD
+ +	if (!br_ip6_multicast_select_querier(br, port, &saddr->src.ip6))
+++=======
++ 	if (!br_multicast_select_querier(brmctx, pmctx, saddr))
+++>>>>>>> c3fb3698f935 (net: bridge: mcast: consolidate querier selection for ipv4 and ipv6)
+  		return;
+  
+ -	br_multicast_update_query_timer(brmctx, query, max_delay);
+ -	br_ip6_multicast_mark_router(brmctx, pmctx);
+ +	br_multicast_update_query_timer(br, query, max_delay);
+ +	br_multicast_mark_router(br, port);
+  }
+  #endif
+  
+* Unmerged path net/bridge/br_multicast.c
