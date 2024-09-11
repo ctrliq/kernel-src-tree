@@ -1,0 +1,1244 @@
+RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit ef87df2c7a8f04d31cbf06f0b14b8dd5feafe473
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ef87df2c.failed
+
+The core code needs to compute the udata so we may as well pass it in the
+uverbs_attr_bundle instead of on the stack. This converts the simple case
+of write_ex() which already has a core calculation.
+
+Also change the write() path to use the attrs for ib_uverbs_init_udata()
+instead of on the stack. This lets the write to write_ex compatibility
+path continue to follow the lead of the _ex path.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit ef87df2c7a8f04d31cbf06f0b14b8dd5feafe473)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_cmd.c
+#	drivers/infiniband/core/uverbs_main.c
+#	drivers/infiniband/core/uverbs_uapi.c
+#	include/rdma/uverbs_ioctl.h
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,b11396536d8e..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,105 +113,108 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ struct uverbs_api_object {
++ 	const struct uverbs_obj_type *type_attrs;
++ 	const struct uverbs_obj_type_class *type_class;
++ 	u8 disabled:1;
++ };
++ 
++ struct uverbs_api_ioctl_method {
++ 	int(__rcu *handler)(struct uverbs_attr_bundle *attrs);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_write_method {
++ 	int (*handler)(struct uverbs_attr_bundle *attrs, const char __user *buf,
++ 		       int in_len, int out_len);
++ 	int (*handler_ex)(struct uverbs_attr_bundle *attrs,
++ 			  struct ib_udata *ucore);
++ 	u8 disabled:1;
++ 	u8 is_ex:1;
++ 	u8 has_udata:1;
++ 	u8 has_resp:1;
++ 	u8 req_size;
++ 	u8 resp_size;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ 
++ 	unsigned int num_write;
++ 	unsigned int num_write_ex;
++ 	struct uverbs_api_write_method notsupp_method;
++ 	const struct uverbs_api_write_method **write_methods;
++ 	const struct uverbs_api_write_method **write_ex_methods;
++ };
++ 
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	return radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ extern const struct uapi_definition uverbs_def_write_intf[];
++ 
++ static inline const struct uverbs_api_write_method *
++ uapi_get_method(const struct uverbs_api *uapi, u32 command)
++ {
++ 	u32 cmd_idx = command & IB_USER_VERBS_CMD_COMMAND_MASK;
++ 
++ 	if (command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
++ 			     IB_USER_VERBS_CMD_COMMAND_MASK))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (command & IB_USER_VERBS_CMD_FLAG_EXTENDED) {
++ 		if (cmd_idx >= uapi->num_write_ex)
++ 			return ERR_PTR(-EOPNOTSUPP);
++ 		return uapi->write_ex_methods[cmd_idx];
++ 	}
++ 
++ 	if (cmd_idx >= uapi->num_write)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	return uapi->write_methods[cmd_idx];
++ }
++ 
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,3ee827047cb1..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -60,19 -59,19 +60,18 @@@ ib_uverbs_lookup_comp_file(int fd, stru
+  	uverbs_uobject_get(uobj);
+  	uobj_put_read(uobj);
+  
+ -	return container_of(uobj, struct ib_uverbs_completion_event_file,
+ -			    uobj);
+ +	uobj_file = container_of(uobj, struct ib_uobject_file, uobj);
+ +	return container_of(uobj_file, struct ib_uverbs_completion_event_file,
+ +			    uobj_file);
+  }
+ -#define ib_uverbs_lookup_comp_file(_fd, _ufile)                                \
+ -	_ib_uverbs_lookup_comp_file((_fd)*typecheck(s32, _fd), _ufile)
+  
+ -static int ib_uverbs_get_context(struct uverbs_attr_bundle *attrs,
+ -				 const char __user *buf, int in_len,
+ -				 int out_len)
+ +ssize_t ib_uverbs_get_context(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      const char __user *buf,
+ +			      int in_len, int out_len)
+  {
+ -	struct ib_uverbs_file *file = attrs->ufile;
+  	struct ib_uverbs_get_context      cmd;
+  	struct ib_uverbs_get_context_resp resp;
+- 	struct ib_udata                   udata;
+  	struct ib_ucontext		 *ucontext;
+  	struct file			 *filp;
+  	struct ib_rdmacg_object		 cg_obj;
+@@@ -350,7 -361,7 +348,11 @@@ ssize_t ib_uverbs_alloc_pd(struct ib_uv
+  	if (IS_ERR(uobj))
+  		return PTR_ERR(uobj);
+  
+++<<<<<<< HEAD
+ +	pd = ib_dev->alloc_pd(ib_dev, file->ucontext, &udata);
+++=======
++ 	pd = ib_dev->alloc_pd(ib_dev, uobj->context, &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  	if (IS_ERR(pd)) {
+  		ret = PTR_ERR(pd);
+  		goto err;
+@@@ -483,14 -489,12 +485,13 @@@ static void xrcd_table_delete(struct ib
+  	}
+  }
+  
+ -static int ib_uverbs_open_xrcd(struct uverbs_attr_bundle *attrs,
+ -			       const char __user *buf, int in_len, int out_len)
+ +ssize_t ib_uverbs_open_xrcd(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+  {
+ -	struct ib_uverbs_device *ibudev = attrs->ufile->device;
+  	struct ib_uverbs_open_xrcd	cmd;
+  	struct ib_uverbs_open_xrcd_resp	resp;
+- 	struct ib_udata			udata;
+  	struct ib_uxrcd_object         *obj;
+  	struct ib_xrcd                 *xrcd = NULL;
+  	struct fd			f = {NULL, 0};
+@@@ -541,7 -546,8 +542,12 @@@
+  	}
+  
+  	if (!xrcd) {
+++<<<<<<< HEAD
+ +		xrcd = ib_dev->alloc_xrcd(ib_dev, file->ucontext, &udata);
+++=======
++ 		xrcd = ib_dev->alloc_xrcd(ib_dev, obj->uobject.context,
++ 					  &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  		if (IS_ERR(xrcd)) {
+  			ret = PTR_ERR(xrcd);
+  			goto err;
+@@@ -851,8 -844,8 +855,7 @@@ ssize_t ib_uverbs_alloc_mw(struct ib_uv
+  	struct ib_uobject             *uobj;
+  	struct ib_pd                  *pd;
+  	struct ib_mw                  *mw;
+- 	struct ib_udata		       udata;
+  	int                            ret;
+ -	struct ib_device *ib_dev;
+  
+  	if (out_len < sizeof(resp))
+  		return -ENOSPC;
+@@@ -956,20 -944,17 +959,19 @@@ ssize_t ib_uverbs_create_comp_channel(s
+  		return -EFAULT;
+  	}
+  
+ -	return uobj_alloc_commit(uobj);
+ +	uobj_alloc_commit(uobj);
+ +	return in_len;
+  }
+  
+ -static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+ +static struct ib_ucq_object *create_cq(struct ib_uverbs_file *file,
+ +					struct ib_device *ib_dev,
+  				       struct ib_udata *ucore,
+- 				       struct ib_udata *uhw,
+  				       struct ib_uverbs_ex_create_cq *cmd,
+  				       size_t cmd_sz,
+ -				       int (*cb)(struct uverbs_attr_bundle *attrs,
+ +				       int (*cb)(struct ib_uverbs_file *file,
+  						 struct ib_ucq_object *obj,
+  						 struct ib_uverbs_ex_create_cq_resp *resp,
+- 						 struct ib_udata *udata,
++ 						 struct ib_udata *ucore,
+  						 void *context),
+  				       void *context)
+  {
+@@@ -1012,7 -994,8 +1014,12 @@@
+  	if (cmd_sz > offsetof(typeof(*cmd), flags) + sizeof(cmd->flags))
+  		attr.flags = cmd->flags;
+  
+++<<<<<<< HEAD
+ +	cq = ib_dev->create_cq(ib_dev, &attr, file->ucontext, uhw);
+++=======
++ 	cq = ib_dev->create_cq(ib_dev, &attr, obj->uobject.context,
++ 			       &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  	if (IS_ERR(cq)) {
+  		ret = PTR_ERR(cq);
+  		goto err_file;
+@@@ -1099,10 -1081,10 +1105,14 @@@ ssize_t ib_uverbs_create_cq(struct ib_u
+  	cmd_ex.comp_vector = cmd.comp_vector;
+  	cmd_ex.comp_channel = cmd.comp_channel;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, &ucore, &uhw, &cmd_ex,
+++=======
++ 	obj = create_cq(attrs, &ucore, &cmd_ex,
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  			offsetof(typeof(cmd_ex), comp_channel) +
+- 			sizeof(cmd.comp_channel), ib_uverbs_create_cq_cb,
+- 			NULL);
++ 				sizeof(cmd.comp_channel),
++ 			ib_uverbs_create_cq_cb, NULL);
+  
+  	if (IS_ERR(obj))
+  		return PTR_ERR(obj);
+@@@ -1121,10 -1103,8 +1131,15 @@@ static int ib_uverbs_ex_create_cq_cb(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_cq(struct ib_uverbs_file *file,
+ +			 struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_cq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_create_cq_resp resp;
+  	struct ib_uverbs_ex_create_cq  cmd;
+@@@ -1148,8 -1128,7 +1163,12 @@@
+  			     sizeof(resp.response_length)))
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	obj = create_cq(file, ib_dev, ucore, uhw, &cmd,
+ +			min(ucore->inlen, sizeof(cmd)),
+++=======
++ 	obj = create_cq(attrs, ucore, &cmd, min(ucore->inlen, sizeof(cmd)),
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  			ib_uverbs_ex_create_cq_cb, NULL);
+  
+  	return PTR_ERR_OR_ZERO(obj);
+@@@ -1341,15 -1296,14 +1359,14 @@@ ssize_t ib_uverbs_destroy_cq(struct ib_
+  	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof resp))
+  		return -EFAULT;
+  
+ -	return 0;
+ +	return in_len;
+  }
+  
+ -static int create_qp(struct uverbs_attr_bundle *attrs,
+ +static int create_qp(struct ib_uverbs_file *file,
+  		     struct ib_udata *ucore,
+- 		     struct ib_udata *uhw,
+  		     struct ib_uverbs_ex_create_qp *cmd,
+  		     size_t cmd_sz,
+ -		     int (*cb)(struct uverbs_attr_bundle *attrs,
+ +		     int (*cb)(struct ib_uverbs_file *file,
+  			       struct ib_uverbs_ex_create_qp_resp *resp,
+  			       struct ib_udata *udata),
+  		     void *context)
+@@@ -1669,10 -1621,9 +1685,16 @@@ ssize_t ib_uverbs_create_qp(struct ib_u
+  	cmd_ex.qp_type = cmd.qp_type;
+  	cmd_ex.is_srq = cmd.is_srq;
+  
+++<<<<<<< HEAD
+ +	err = create_qp(file, &ucore, &uhw, &cmd_ex,
+ +			offsetof(typeof(cmd_ex), is_srq) +
+ +			sizeof(cmd.is_srq), ib_uverbs_create_qp_cb,
+ +			NULL);
+++=======
++ 	err = create_qp(attrs, &ucore, &cmd_ex,
++ 			offsetof(typeof(cmd_ex), is_srq) + sizeof(cmd.is_srq),
++ 			ib_uverbs_create_qp_cb, NULL);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (err)
+  		return err;
+@@@ -1690,10 -1641,8 +1712,15 @@@ static int ib_uverbs_ex_create_qp_cb(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_qp(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_create_qp_resp resp;
+  	struct ib_uverbs_ex_create_qp cmd = {0};
+@@@ -1717,7 -1666,7 +1744,11 @@@
+  			     sizeof(resp.response_length)))
+  		return -ENOSPC;
+  
+++<<<<<<< HEAD
+ +	err = create_qp(file, ucore, uhw, &cmd,
+++=======
++ 	err = create_qp(attrs, ucore, &cmd,
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  			min(ucore->inlen, sizeof(cmd)),
+  			ib_uverbs_ex_create_qp_cb, NULL);
+  
+@@@ -1954,8 -1896,8 +1984,13 @@@ static void copy_ah_attr_from_uverbs(st
+  	rdma_ah_set_make_grd(rdma_attr, false);
+  }
+  
+++<<<<<<< HEAD
+ +static int modify_qp(struct ib_uverbs_file *file,
+ +		     struct ib_uverbs_ex_modify_qp *cmd, struct ib_udata *udata)
+++=======
++ static int modify_qp(struct uverbs_attr_bundle *attrs,
++ 		     struct ib_uverbs_ex_modify_qp *cmd)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_qp_attr *attr;
+  	struct ib_qp *qp;
+@@@ -2112,14 -2055,10 +2147,17 @@@ out
+  	return ret;
+  }
+  
+ -static int ib_uverbs_modify_qp(struct uverbs_attr_bundle *attrs,
+ -			       const char __user *buf, int in_len, int out_len)
+ +ssize_t ib_uverbs_modify_qp(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    const char __user *buf, int in_len,
+ +			    int out_len)
+  {
+  	struct ib_uverbs_ex_modify_qp cmd = {};
+++<<<<<<< HEAD
+ +	struct ib_udata udata;
+ +	int ret;
+++=======
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (copy_from_user(&cmd.base, buf, sizeof(cmd.base)))
+  		return -EFAULT;
+@@@ -2132,17 -2071,11 +2170,25 @@@
+  		   in_len - sizeof(cmd.base) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len);
+  
+++<<<<<<< HEAD
+ +	ret = modify_qp(file, &cmd, &udata);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return in_len;
+ +}
+ +
+ +int ib_uverbs_ex_modify_qp(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ 	return modify_qp(attrs, &cmd);
++ }
++ 
++ static int ib_uverbs_ex_modify_qp(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_modify_qp cmd = {};
+  	int ret;
+@@@ -2170,7 -2103,7 +2216,11 @@@
+  			return -EOPNOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = modify_qp(file, &cmd, uhw);
+++=======
++ 	ret = modify_qp(attrs, &cmd);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	return ret;
+  }
+@@@ -2619,7 -2531,7 +2669,11 @@@ ssize_t ib_uverbs_create_ah(struct ib_u
+  	struct ib_ah			*ah;
+  	struct rdma_ah_attr		attr = {};
+  	int ret;
+++<<<<<<< HEAD
+ +	struct ib_udata                   udata;
+++=======
++ 	struct ib_device *ib_dev;
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (out_len < sizeof resp)
+  		return -ENOSPC;
+@@@ -2627,10 -2539,7 +2681,14 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	if (!rdma_is_port_valid(ib_dev, cmd.attr.port_num))
+ +		return -EINVAL;
+ +
+ +	ib_uverbs_init_udata(&udata, buf + sizeof(cmd),
+++=======
++ 	ib_uverbs_init_udata(&attrs->driver_udata, buf + sizeof(cmd),
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  		   u64_to_user_ptr(cmd.response) + sizeof(resp),
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+@@@ -3128,10 -3030,8 +3186,15 @@@ static int kern_spec_to_ib_spec(struct 
+  		return kern_spec_to_ib_spec_filter(kern_spec, ib_spec);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_wq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_create_wq	  cmd = {};
+  	struct ib_uverbs_ex_create_wq_resp resp = {};
+@@@ -3194,11 -3095,7 +3257,15 @@@
+  	obj->uevent.events_reported = 0;
+  	INIT_LIST_HEAD(&obj->uevent.event_list);
+  
+++<<<<<<< HEAD
+ +	if (!pd->device->create_wq) {
+ +		err = -EOPNOTSUPP;
+ +		goto err_put_cq;
+ +	}
+ +	wq = pd->device->create_wq(pd, &wq_init_attr, uhw);
+++=======
++ 	wq = pd->device->create_wq(pd, &wq_init_attr, &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  	if (IS_ERR(wq)) {
+  		err = PTR_ERR(wq);
+  		goto err_put_cq;
+@@@ -3245,10 -3141,8 +3312,15 @@@ err_uobj
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_wq(struct ib_uverbs_file *file,
+ +			    struct ib_device *ib_dev,
+ +			    struct ib_udata *ucore,
+ +			    struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_wq(struct uverbs_attr_bundle *attrs,
++ 				   struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_destroy_wq	cmd = {};
+  	struct ib_uverbs_ex_destroy_wq_resp	resp = {};
+@@@ -3301,10 -3186,8 +3373,15 @@@
+  	return ib_copy_to_udata(ucore, &resp, resp.response_length);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_modify_wq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_modify_wq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_modify_wq cmd = {};
+  	struct ib_wq *wq;
+@@@ -3341,20 -3224,14 +3418,30 @@@
+  		wq_attr.flags = cmd.flags;
+  		wq_attr.flags_mask = cmd.flags_mask;
+  	}
+++<<<<<<< HEAD
+ +	if (!wq->device->modify_wq) {
+ +		ret = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +	ret = wq->device->modify_wq(wq, &wq_attr, cmd.attr_mask, uhw);
+ +out:
+++=======
++ 	ret = wq->device->modify_wq(wq, &wq_attr, cmd.attr_mask,
++ 				    &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  	uobj_put_obj_read(wq);
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_rwq_ind_table(struct ib_uverbs_file *file,
+ +				      struct ib_device *ib_dev,
+ +				      struct ib_udata *ucore,
+ +				      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_rwq_ind_table(struct uverbs_attr_bundle *attrs,
++ 					     struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_create_rwq_ind_table	  cmd = {};
+  	struct ib_uverbs_ex_create_rwq_ind_table_resp  resp = {};
+@@@ -3444,11 -3322,8 +3531,16 @@@
+  	init_attr.log_ind_tbl_size = cmd.log_ind_tbl_size;
+  	init_attr.ind_tbl = wqs;
+  
+++<<<<<<< HEAD
+ +	if (!ib_dev->create_rwq_ind_table) {
+ +		err = -EOPNOTSUPP;
+ +		goto err_uobj;
+ +	}
+ +	rwq_ind_tbl = ib_dev->create_rwq_ind_table(ib_dev, &init_attr, uhw);
+++=======
++ 	rwq_ind_tbl = ib_dev->create_rwq_ind_table(ib_dev, &init_attr,
++ 						   &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (IS_ERR(rwq_ind_tbl)) {
+  		err = PTR_ERR(rwq_ind_tbl);
+@@@ -3495,10 -3369,8 +3587,15 @@@ err_free
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_rwq_ind_table(struct ib_uverbs_file *file,
+ +				       struct ib_device *ib_dev,
+ +				       struct ib_udata *ucore,
+ +				       struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_rwq_ind_table(struct uverbs_attr_bundle *attrs,
++ 					      struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_destroy_rwq_ind_table	cmd = {};
+  	int			ret;
+@@@ -3522,13 -3394,11 +3619,18 @@@
+  		return -EOPNOTSUPP;
+  
+  	return uobj_perform_destroy(UVERBS_OBJECT_RWQ_IND_TBL,
+ -				    cmd.ind_tbl_handle, attrs);
+ +				    cmd.ind_tbl_handle, file, 0);
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_create_flow(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     struct ib_udata *ucore,
+ +			     struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_create_flow(struct uverbs_attr_bundle *attrs,
++ 				    struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_create_flow	  cmd;
+  	struct ib_uverbs_create_flow_resp resp;
+@@@ -3705,10 -3569,8 +3807,15 @@@ err_free_attr
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_destroy_flow(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      struct ib_udata *ucore,
+ +			      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_destroy_flow(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_destroy_flow	cmd;
+  	int				ret;
+@@@ -3873,8 -3730,6 +3980,11 @@@ ssize_t ib_uverbs_create_srq(struct ib_
+  	struct ib_uverbs_create_srq      cmd;
+  	struct ib_uverbs_create_xsrq     xcmd;
+  	struct ib_uverbs_create_srq_resp resp;
+++<<<<<<< HEAD
+ +	struct ib_udata                  udata;
+ +	int ret;
+++=======
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (out_len < sizeof resp)
+  		return -ENOSPC;
+@@@ -3896,21 -3751,15 +4006,28 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	ret = __uverbs_create_xsrq(file, ib_dev, &xcmd, &udata);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return in_len;
+++=======
++ 	return __uverbs_create_xsrq(attrs, &xcmd, &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  }
+  
+ -static int ib_uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ -				 const char __user *buf, int in_len,
+ -				 int out_len)
+ +ssize_t ib_uverbs_create_xsrq(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      const char __user *buf, int in_len, int out_len)
+  {
+  	struct ib_uverbs_create_xsrq     cmd;
+  	struct ib_uverbs_create_srq_resp resp;
+++<<<<<<< HEAD
+ +	struct ib_udata                  udata;
+ +	int ret;
+++=======
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  
+  	if (out_len < sizeof resp)
+  		return -ENOSPC;
+@@@ -3923,20 -3772,13 +4040,23 @@@
+  		   in_len - sizeof(cmd) - sizeof(struct ib_uverbs_cmd_hdr),
+  		   out_len - sizeof(resp));
+  
+++<<<<<<< HEAD
+ +	ret = __uverbs_create_xsrq(file, ib_dev, &cmd, &udata);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return in_len;
+++=======
++ 	return __uverbs_create_xsrq(attrs, &cmd, &attrs->driver_udata);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  }
+  
+ -static int ib_uverbs_modify_srq(struct uverbs_attr_bundle *attrs,
+ -				const char __user *buf, int in_len, int out_len)
+ +ssize_t ib_uverbs_modify_srq(struct ib_uverbs_file *file,
+ +			     struct ib_device *ib_dev,
+ +			     const char __user *buf, int in_len,
+ +			     int out_len)
+  {
+  	struct ib_uverbs_modify_srq cmd;
+- 	struct ib_udata             udata;
+  	struct ib_srq              *srq;
+  	struct ib_srq_attr          attr;
+  	int                         ret;
+@@@ -3944,10 -3786,10 +4064,10 @@@
+  	if (copy_from_user(&cmd, buf, sizeof cmd))
+  		return -EFAULT;
+  
+- 	ib_uverbs_init_udata(&udata, buf + sizeof cmd, NULL, in_len - sizeof cmd,
+- 		   out_len);
++ 	ib_uverbs_init_udata(&attrs->driver_udata, buf + sizeof cmd, NULL,
++ 			     in_len - sizeof cmd, out_len);
+  
+ -	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, attrs);
+ +	srq = uobj_get_obj_read(srq, UVERBS_OBJECT_SRQ, cmd.srq_handle, file->ucontext);
+  	if (!srq)
+  		return -EINVAL;
+  
+@@@ -4039,13 -3867,11 +4160,18 @@@ ssize_t ib_uverbs_destroy_srq(struct ib
+  	if (copy_to_user(u64_to_user_ptr(cmd.response), &resp, sizeof(resp)))
+  		return -EFAULT;
+  
+ -	return 0;
+ +	return in_len;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_query_device(struct ib_uverbs_file *file,
+ +			      struct ib_device *ib_dev,
+ +			      struct ib_udata *ucore,
+ +			      struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_query_device(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_query_device_resp resp = { {0} };
+  	struct ib_uverbs_ex_query_device  cmd;
+@@@ -4163,10 -3993,8 +4289,15 @@@ end
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int ib_uverbs_ex_modify_cq(struct ib_uverbs_file *file,
+ +			   struct ib_device *ib_dev,
+ +			   struct ib_udata *ucore,
+ +			   struct ib_udata *uhw)
+++=======
++ static int ib_uverbs_ex_modify_cq(struct uverbs_attr_bundle *attrs,
++ 				  struct ib_udata *ucore)
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  {
+  	struct ib_uverbs_ex_modify_cq cmd = {};
+  	struct ib_cq *cq;
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 495189811c27,fc8d3d1c7048..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -773,13 -691,12 +773,12 @@@ static ssize_t ib_uverbs_write(struct f
+  
+  	buf += sizeof(hdr);
+  
+ -	bundle.ufile = file;
+ -	if (!method_elm->is_ex) {
+ -		ret = method_elm->handler(&bundle, buf, hdr.in_words * 4,
+ -					  hdr.out_words * 4);
+ +	if (!extended) {
+ +		ret = uverbs_cmd_table[command](file, ib_dev, buf,
+ +						hdr.in_words * 4,
+ +						hdr.out_words * 4);
+  	} else {
+  		struct ib_udata ucore;
+- 		struct ib_udata uhw;
+  
+  		buf += sizeof(ex_hdr);
+  
+@@@ -793,13 -710,11 +792,17 @@@
+  					ex_hdr.provider_in_words * 8,
+  					ex_hdr.provider_out_words * 8);
+  
+++<<<<<<< HEAD
+ +		ret = uverbs_ex_cmd_table[command](file, ib_dev, &ucore, &uhw);
+ +		ret = (ret) ? : count;
+++=======
++ 		ret = method_elm->handler_ex(&bundle, &ucore);
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  	}
+  
+ +out:
+  	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ -	return (ret) ? : count;
+ +	return ret;
+  }
+  
+  static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
+diff --cc include/rdma/uverbs_ioctl.h
+index 90a4947ff548,5fa8d63aa838..000000000000
+--- a/include/rdma/uverbs_ioctl.h
++++ b/include/rdma/uverbs_ioctl.h
+@@@ -191,137 -337,271 +191,270 @@@ struct uverbs_object_def 
+  	const struct uverbs_method_def * const (*methods)[];
+  };
+  
+ -enum uapi_definition_kind {
+ -	UAPI_DEF_END = 0,
+ -	UAPI_DEF_OBJECT_START,
+ -	UAPI_DEF_WRITE,
+ -	UAPI_DEF_CHAIN_OBJ_TREE,
+ -	UAPI_DEF_CHAIN,
+ -	UAPI_DEF_IS_SUPPORTED_FUNC,
+ -	UAPI_DEF_IS_SUPPORTED_DEV_FN,
+ -};
+ -
+ -enum uapi_definition_scope {
+ -	UAPI_SCOPE_OBJECT = 1,
+ -	UAPI_SCOPE_METHOD = 2,
+ +struct uverbs_object_tree_def {
+ +	size_t					 num_objects;
+ +	const struct uverbs_object_def * const (*objects)[];
+  };
+  
+ +#define UA_FLAGS(_flags)  .flags = _flags
+ +#define __UVERBS_ATTR0(_id, _type, _fld, _attr, ...)              \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, .flags = 0, } }, } })
+ +#define __UVERBS_ATTR1(_id, _type, _fld, _attr, _extra1, ...)      \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1 } },} })
+ +#define __UVERBS_ATTR2(_id, _type, _fld, _attr, _extra1, _extra2)    \
+ +	((const struct uverbs_attr_def)				  \
+ +	 {.id = _id, .attr = {{._fld = {.type = _type, _attr, _extra1, _extra2 } },} })
+ +#define __UVERBS_ATTR(_id, _type, _fld, _attr, _extra1, _extra2, _n, ...)	\
+ +	__UVERBS_ATTR##_n(_id, _type, _fld, _attr, _extra1, _extra2)
+ +
+++<<<<<<< HEAD
+++=======
++ struct uapi_definition {
++ 	u8 kind;
++ 	u8 scope;
++ 	union {
++ 		struct {
++ 			u16 object_id;
++ 		} object_start;
++ 		struct {
++ 			u16 command_num;
++ 			u8 is_ex:1;
++ 			u8 has_udata:1;
++ 			u8 has_resp:1;
++ 			u8 req_size;
++ 			u8 resp_size;
++ 		} write;
++ 	};
++ 
++ 	union {
++ 		bool (*func_is_supported)(struct ib_device *device);
++ 		int (*func_write)(struct uverbs_attr_bundle *attrs,
++ 				  const char __user *buf, int in_len,
++ 				  int out_len);
++ 		int (*func_write_ex)(struct uverbs_attr_bundle *attrs,
++ 				     struct ib_udata *ucore);
++ 		const struct uapi_definition *chain;
++ 		const struct uverbs_object_def *chain_obj_tree;
++ 		size_t needs_fn_offset;
++ 	};
++ };
++ 
++ /* Define things connected to object_id */
++ #define DECLARE_UVERBS_OBJECT(_object_id, ...)                                 \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_OBJECT_START,                                 \
++ 		.object_start = { .object_id = _object_id },                   \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /* Use in a var_args of DECLARE_UVERBS_OBJECT */
++ #define DECLARE_UVERBS_WRITE(_command_num, _func, _cmd_desc, ...)              \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_WRITE,                                        \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.write = { .is_ex = 0, .command_num = _command_num },          \
++ 		.func_write = _func,                                           \
++ 		_cmd_desc,                                                     \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /* Use in a var_args of DECLARE_UVERBS_OBJECT */
++ #define DECLARE_UVERBS_WRITE_EX(_command_num, _func, _cmd_desc, ...)           \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_WRITE,                                        \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.write = { .is_ex = 1, .command_num = _command_num },          \
++ 		.func_write_ex = _func,                                        \
++ 		_cmd_desc,                                                     \
++ 	},                                                                     \
++ 		##__VA_ARGS__
++ 
++ /*
++  * Object is only supported if the function pointer named ibdev_fn in struct
++  * ib_device is not NULL.
++  */
++ #define UAPI_DEF_OBJ_NEEDS_FN(ibdev_fn)                                        \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_DEV_FN,                          \
++ 		.scope = UAPI_SCOPE_OBJECT,                                    \
++ 		.needs_fn_offset =                                             \
++ 			offsetof(struct ib_device, ibdev_fn) +                 \
++ 			BUILD_BUG_ON_ZERO(                                     \
++ 				sizeof(((struct ib_device *)0)->ibdev_fn) !=   \
++ 				sizeof(void *)),                               \
++ 	}
++ 
++ /*
++  * Method is only supported if the function pointer named ibdev_fn in struct
++  * ib_device is not NULL.
++  */
++ #define UAPI_DEF_METHOD_NEEDS_FN(ibdev_fn)                                     \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_DEV_FN,                          \
++ 		.scope = UAPI_SCOPE_METHOD,                                    \
++ 		.needs_fn_offset =                                             \
++ 			offsetof(struct ib_device, ibdev_fn) +                 \
++ 			BUILD_BUG_ON_ZERO(                                     \
++ 				sizeof(((struct ib_device *)0)->ibdev_fn) !=   \
++ 				sizeof(void *)),                               \
++ 	}
++ 
++ /* Call a function to determine if the entire object is supported or not */
++ #define UAPI_DEF_IS_OBJ_SUPPORTED(_func)                                       \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_IS_SUPPORTED_FUNC,                            \
++ 		.scope = UAPI_SCOPE_OBJECT, .func_is_supported = _func,        \
++ 	}
++ 
++ /* Include another struct uapi_definition in this one */
++ #define UAPI_DEF_CHAIN(_def_var)                                               \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_CHAIN, .chain = _def_var,                     \
++ 	}
++ 
++ /* Temporary until the tree base description is replaced */
++ #define UAPI_DEF_CHAIN_OBJ_TREE(_object_enum, _object_ptr)                     \
++ 	{                                                                      \
++ 		.kind = UAPI_DEF_CHAIN_OBJ_TREE,                               \
++ 		.object_start = { .object_id = _object_enum },                 \
++ 		.chain_obj_tree = _object_ptr,                                 \
++ 	}
++ #define UAPI_DEF_CHAIN_OBJ_TREE_NAMED(_object_enum, ...)                       \
++ 	UAPI_DEF_CHAIN_OBJ_TREE(_object_enum, &UVERBS_OBJECT(_object_enum)),   \
++ 		##__VA_ARGS__
++ 
++ /*
++  * =======================================
++  *	Attribute Specifications
++  * =======================================
++  */
++ 
++ #define UVERBS_ATTR_SIZE(_min_len, _len)			\
++ 	.u.ptr.min_len = _min_len, .u.ptr.len = _len
++ 
++ #define UVERBS_ATTR_NO_DATA() UVERBS_ATTR_SIZE(0, 0)
++ 
++ /*
++  * Specifies a uapi structure that cannot be extended. The user must always
++  * supply the whole structure and nothing more. The structure must be declared
++  * in a header under include/uapi/rdma.
++  */
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  #define UVERBS_ATTR_TYPE(_type)					\
+ -	.u.ptr.min_len = sizeof(_type), .u.ptr.len = sizeof(_type)
+ -/*
+ - * Specifies a uapi structure where the user must provide at least up to
+ - * member 'last'.  Anything after last and up until the end of the structure
+ - * can be non-zero, anything longer than the end of the structure must be
+ - * zero. The structure must be declared in a header under include/uapi/rdma.
+ - */
+ -#define UVERBS_ATTR_STRUCT(_type, _last)                                       \
+ -	.zero_trailing = 1,                                                    \
+ -	UVERBS_ATTR_SIZE(((uintptr_t)(&((_type *)0)->_last + 1)),              \
+ -			 sizeof(_type))
+ -/*
+ - * Specifies at least min_len bytes must be passed in, but the amount can be
+ - * larger, up to the protocol maximum size. No check for zeroing is done.
+ - */
+ -#define UVERBS_ATTR_MIN_SIZE(_min_len) UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+ -
+ -/* Must be used in the '...' of any UVERBS_ATTR */
+ -#define UA_ALLOC_AND_COPY .alloc_and_copy = 1
+ -#define UA_MANDATORY .mandatory = 1
+ -#define UA_OPTIONAL .mandatory = 0
+ -
+ -/*
+ - * min_len must be bigger than 0 and _max_len must be smaller than 4095.  Only
+ - * READ\WRITE accesses are supported.
+ - */
+ -#define UVERBS_ATTR_IDRS_ARR(_attr_id, _idr_type, _access, _min_len, _max_len, \
+ -			     ...)                                              \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = (_attr_id) +                                             \
+ -		      BUILD_BUG_ON_ZERO((_min_len) == 0 ||                     \
+ -					(_max_len) >                           \
+ -						PAGE_SIZE / sizeof(void *) ||  \
+ -					(_min_len) > (_max_len) ||             \
+ -					(_access) == UVERBS_ACCESS_NEW ||      \
+ -					(_access) == UVERBS_ACCESS_DESTROY),   \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_IDRS_ARRAY,                 \
+ -			  .u2.objs_arr.obj_type = _idr_type,                   \
+ -			  .u2.objs_arr.access = _access,                       \
+ -			  .u2.objs_arr.min_len = _min_len,                     \
+ -			  .u2.objs_arr.max_len = _max_len,                     \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_IDR(_attr_id, _idr_type, _access, ...)                     \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_IDR,                        \
+ -			  .u.obj.obj_type = _idr_type,                         \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_FD(_attr_id, _fd_type, _access, ...)                       \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = (_attr_id) +                                             \
+ -		      BUILD_BUG_ON_ZERO((_access) != UVERBS_ACCESS_NEW &&      \
+ -					(_access) != UVERBS_ACCESS_READ),      \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_FD,                         \
+ -			  .u.obj.obj_type = _fd_type,                          \
+ -			  .u.obj.access = _access,                             \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_IN(_attr_id, _type, ...)                               \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_IN,                     \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -#define UVERBS_ATTR_PTR_OUT(_attr_id, _type, ...)                              \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_PTR_OUT,                    \
+ -			  _type,                                               \
+ -			  __VA_ARGS__ } })
+ -
+ -/* _enum_arry should be a 'static const union uverbs_attr_spec[]' */
+ -#define UVERBS_ATTR_ENUM_IN(_attr_id, _enum_arr, ...)                          \
+ -	(&(const struct uverbs_attr_def){                                      \
+ -		.id = _attr_id,                                                \
+ -		.attr = { .type = UVERBS_ATTR_TYPE_ENUM_IN,                    \
+ -			  .u2.enum_def.ids = _enum_arr,                        \
+ -			  .u.enum_def.num_elems = ARRAY_SIZE(_enum_arr),       \
+ -			  __VA_ARGS__ },                                       \
+ -	})
+ -
+ -/* An input value that is a member in the enum _enum_type. */
+ -#define UVERBS_ATTR_CONST_IN(_attr_id, _enum_type, ...)                        \
+ -	UVERBS_ATTR_PTR_IN(                                                    \
+ -		_attr_id,                                                      \
+ -		UVERBS_ATTR_SIZE(                                              \
+ -			sizeof(u64) + BUILD_BUG_ON_ZERO(!sizeof(_enum_type)),  \
+ -			sizeof(u64)),                                          \
+ -		__VA_ARGS__)
+ +	.min_len = sizeof(_type), .len = sizeof(_type)
+ +#define UVERBS_ATTR_STRUCT(_type, _last)			\
+ +	.min_len = ((uintptr_t)(&((_type *)0)->_last + 1)), .len = sizeof(_type)
+ +#define UVERBS_ATTR_SIZE(_min_len, _len)			\
+ +	.min_len = _min_len, .len = _len
+ +#define UVERBS_ATTR_MIN_SIZE(_min_len)				\
+ +	UVERBS_ATTR_SIZE(_min_len, USHRT_MAX)
+  
+  /*
+ - * An input value that is a bitwise combination of values of _enum_type.
+ - * This permits the flag value to be passed as either a u32 or u64, it must
+ - * be retrieved via uverbs_get_flag().
+ + * In new compiler, UVERBS_ATTR could be simplified by declaring it as
+ + * [_id] = {.type = _type, .len = _len, ##__VA_ARGS__}
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -#define UVERBS_ATTR_FLAGS_IN(_attr_id, _enum_type, ...)                        \
+ -	UVERBS_ATTR_PTR_IN(                                                    \
+ -		_attr_id,                                                      \
+ -		UVERBS_ATTR_SIZE(sizeof(u32) + BUILD_BUG_ON_ZERO(              \
+ -						       !sizeof(_enum_type *)), \
+ -				 sizeof(u64)),                                 \
+ -		__VA_ARGS__)
+ +#define UVERBS_ATTR(_id, _type, _fld, _attr, ...)			\
+ +	__UVERBS_ATTR(_id, _type, _fld, _attr, ##__VA_ARGS__, 2, 1, 0)
+ +#define UVERBS_ATTR_PTR_IN_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_IN, ptr, _len, ##__VA_ARGS__)
+ +/* If sizeof(_type) <= sizeof(u64), this will be inlined rather than a pointer */
+ +#define UVERBS_ATTR_PTR_IN(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_IN_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT_SZ(_id, _len, ...)				\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_PTR_OUT, ptr, _len, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_PTR_OUT(_id, _type, ...)				\
+ +	UVERBS_ATTR_PTR_OUT_SZ(_id, _type, ##__VA_ARGS__)
+ +#define UVERBS_ATTR_ENUM_IN(_id, _enum_arr, ...)			\
+ +	UVERBS_ATTR(_id, UVERBS_ATTR_TYPE_ENUM_IN, enum_def,		\
+ +		    .ids = (_enum_arr),					\
+ +		    .num_elems = ARRAY_SIZE(_enum_arr), ##__VA_ARGS__)
+  
+  /*
+ - * This spec is used in order to pass information to the hardware driver in a
+ - * legacy way. Every verb that could get driver specific data should get this
+ - * spec.
+ + * In new compiler, UVERBS_ATTR_IDR (and FD) could be simplified by declaring
+ + * it as
+ + * {.id = _id,								\
+ + *  .attr {.type = __obj_class,						\
+ + *         .obj = {.obj_type = _idr_type,				\
+ + *                       .access = _access                              \
+ + *                }, ##__VA_ARGS__ } }
+ + * But since we support older compilers too, we need the more complex code.
+   */
+ -#define UVERBS_ATTR_UHW()                                                      \
+ -	UVERBS_ATTR_PTR_IN(UVERBS_ATTR_UHW_IN,                                 \
+ -			   UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			   UA_OPTIONAL),				       \
+ -	UVERBS_ATTR_PTR_OUT(UVERBS_ATTR_UHW_OUT,                               \
+ -			    UVERBS_ATTR_MIN_SIZE(0),			       \
+ -			    UA_OPTIONAL)
+ +#define ___UVERBS_ATTR_OBJ0(_id, _obj_class, _obj_type, _access, ...)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	 .attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			    .access = _access, .flags = 0 } }, } })
+ +#define ___UVERBS_ATTR_OBJ1(_id, _obj_class, _obj_type, _access, _flags)\
+ +	((const struct uverbs_attr_def)					\
+ +	{.id = _id,							\
+ +	.attr = { {.obj = {.type = _obj_class, .obj_type = _obj_type,	\
+ +			   .access = _access, _flags} }, } })
+ +#define ___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, _flags, \
+ +			   _n, ...)					\
+ +	___UVERBS_ATTR_OBJ##_n(_id, _obj_class, _obj_type, _access, _flags)
+ +#define __UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access, ...)	\
+ +	___UVERBS_ATTR_OBJ(_id, _obj_class, _obj_type, _access,		\
+ +			   ##__VA_ARGS__, 1, 0)
+ +#define UVERBS_ATTR_IDR(_id, _idr_type, _access, ...)			 \
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_IDR, _idr_type, _access,\
+ +			  ##__VA_ARGS__)
+ +#define UVERBS_ATTR_FD(_id, _fd_type, _access, ...)			\
+ +	__UVERBS_ATTR_OBJ(_id, UVERBS_ATTR_TYPE_FD, _fd_type,		\
+ +			  (_access) + BUILD_BUG_ON_ZERO(		\
+ +				(_access) != UVERBS_ACCESS_NEW &&	\
+ +				(_access) != UVERBS_ACCESS_READ),	\
+ +			  ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_ATTR_SPEC(_name, ...)				\
+ +	const struct uverbs_attr_def _name = __VA_ARGS__
+ +
+ +#define DECLARE_UVERBS_ENUM(_name, ...)					\
+ +	const struct uverbs_enum_spec _name = {				\
+ +		.len = ARRAY_SIZE(((struct uverbs_attr_spec[]){__VA_ARGS__})),\
+ +		.ids = {__VA_ARGS__},					\
+ +	}
+ +#define _UVERBS_METHOD_ATTRS_SZ(...)					\
+ +	(sizeof((const struct uverbs_attr_def * const []){__VA_ARGS__}) /\
+ +	 sizeof(const struct uverbs_attr_def *))
+ +#define _UVERBS_METHOD(_id, _handler, _flags, ...)			\
+ +	((const struct uverbs_method_def) {				\
+ +	 .id = _id,							\
+ +	 .flags = _flags,						\
+ +	 .handler = _handler,						\
+ +	 .num_attrs = _UVERBS_METHOD_ATTRS_SZ(__VA_ARGS__),		\
+ +	 .attrs = &(const struct uverbs_attr_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_METHOD(_name, _id, _handler, ...)		\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler, 0, ##__VA_ARGS__)
+ +#define DECLARE_UVERBS_CTX_METHOD(_name, _id, _handler, _flags, ...)	\
+ +	const struct uverbs_method_def _name =				\
+ +		_UVERBS_METHOD(_id, _handler,				\
+ +			       UVERBS_ACTION_FLAG_CREATE_ROOT,		\
+ +			       ##__VA_ARGS__)
+ +#define _UVERBS_OBJECT_METHODS_SZ(...)					\
+ +	(sizeof((const struct uverbs_method_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_method_def *))
+ +#define _UVERBS_OBJECT(_id, _type_attrs, ...)				\
+ +	((const struct uverbs_object_def) {				\
+ +	 .id = _id,							\
+ +	 .type_attrs = _type_attrs,					\
+ +	 .num_methods = _UVERBS_OBJECT_METHODS_SZ(__VA_ARGS__),		\
+ +	 .methods = &(const struct uverbs_method_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT(_name, _id, _type_attrs, ...)		\
+ +	const struct uverbs_object_def _name =				\
+ +		_UVERBS_OBJECT(_id, _type_attrs, ##__VA_ARGS__)
+ +#define _UVERBS_TREE_OBJECTS_SZ(...)					\
+ +	(sizeof((const struct uverbs_object_def * const []){__VA_ARGS__}) / \
+ +	 sizeof(const struct uverbs_object_def *))
+ +#define _UVERBS_OBJECT_TREE(...)					\
+ +	((const struct uverbs_object_tree_def) {			\
+ +	 .num_objects = _UVERBS_TREE_OBJECTS_SZ(__VA_ARGS__),		\
+ +	 .objects = &(const struct uverbs_object_def * const []){__VA_ARGS__} })
+ +#define DECLARE_UVERBS_OBJECT_TREE(_name, ...)				\
+ +	const struct uverbs_object_tree_def _name =			\
+ +		_UVERBS_OBJECT_TREE(__VA_ARGS__)
+  
+  /* =================================================
+   *              Parsing infrastructure
+@@@ -359,28 -640,14 +492,36 @@@ struct uverbs_attr 
+  	};
+  };
+  
+++<<<<<<< HEAD
+ +struct uverbs_attr_bundle_hash {
+ +	/* if bit i is set, it means attrs[i] contains valid information */
+ +	unsigned long *valid_bitmap;
+ +	size_t num_attrs;
+ +	/*
+ +	 * arrays of attributes, each element corresponds to the specification
+ +	 * of the attribute in the same index.
+ +	 */
+ +	struct uverbs_attr *attrs;
+++=======
++ struct uverbs_attr_bundle {
++ 	struct ib_udata driver_udata;
++ 	struct ib_uverbs_file *ufile;
++ 	DECLARE_BITMAP(attr_present, UVERBS_API_ATTR_BKEY_LEN);
++ 	struct uverbs_attr attrs[];
+++>>>>>>> ef87df2c7a8f (RDMA/uverbs: Use uverbs_attr_bundle to pass udata for write_ex)
+  };
+  
+ +struct uverbs_attr_bundle {
+ +	size_t				num_buckets;
+ +	struct uverbs_attr_bundle_hash  hash[];
+ +};
+ +
+ +static inline bool uverbs_attr_is_valid_in_hash(const struct uverbs_attr_bundle_hash *attrs_hash,
+ +						unsigned int idx)
+ +{
+ +	return test_bit(idx, attrs_hash->valid_bitmap);
+ +}
+ +
+  static inline bool uverbs_attr_is_valid(const struct uverbs_attr_bundle *attrs_bundle,
+  					unsigned int idx)
+  {
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path include/rdma/uverbs_ioctl.h
