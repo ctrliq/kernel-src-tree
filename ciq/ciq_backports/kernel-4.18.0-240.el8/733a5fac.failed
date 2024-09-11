@@ -1,0 +1,294 @@
+xfrm: remove afinfo pointer from xfrm_mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 733a5fac2f15b55b9059230d098ed04341d2d884
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/733a5fac.failed
+
+Adds an EXPORT_SYMBOL for afinfo_get_rcu, as it will now be called from
+ipv6 in case of CONFIG_IPV6=m.
+
+This change has virtually no effect on vmlinux size, but it reduces
+afinfo size and allows followup patch to make xfrm modes const.
+
+v2: mark if (afinfo) tests as likely (Sabrina)
+    re-fetch afinfo according to inner_mode in xfrm_prepare_input().
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Reviewed-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 733a5fac2f15b55b9059230d098ed04341d2d884)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xfrm.h
+#	net/xfrm/xfrm_input.c
+diff --cc include/net/xfrm.h
+index e9420a08d663,8d1c9506bcf6..000000000000
+--- a/include/net/xfrm.h
++++ b/include/net/xfrm.h
+@@@ -443,43 -423,6 +443,46 @@@ int xfrm_register_type_offload(const st
+  int xfrm_unregister_type_offload(const struct xfrm_type_offload *type, unsigned short family);
+  
+  struct xfrm_mode {
+++<<<<<<< HEAD
+ +	/*
+ +	 * Remove encapsulation header.
+ +	 *
+ +	 * The IP header will be moved over the top of the encapsulation
+ +	 * header.
+ +	 *
+ +	 * On entry, the transport header shall point to where the IP header
+ +	 * should be and the network header shall be set to where the IP
+ +	 * header currently is.  skb->data shall point to the start of the
+ +	 * payload.
+ +	 */
+ +	int (*input2)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Add encapsulation header.
+ +	 *
+ +	 * On exit, the transport header will be set to the start of the
+ +	 * encapsulation header to be filled in by x->type->output and
+ +	 * the mac header will be set to the nextheader (protocol for
+ +	 * IPv4) field of the extension header directly preceding the
+ +	 * encapsulation header, or in its absence, that of the top IP
+ +	 * header.  The value of the network header will always point
+ +	 * to the top IP header while skb->data will point to the payload.
+ +	 */
+ +	int (*output2)(struct xfrm_state *x,struct sk_buff *skb);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet and do GSO segmentation.
+ +	 */
+ +	struct sk_buff *(*gso_segment)(struct xfrm_state *x, struct sk_buff *skb, netdev_features_t features);
+ +
+ +	/*
+ +	 * Adjust pointers into the packet when IPsec is done at layer2.
+ +	 */
+ +	void (*xmit)(struct xfrm_state *x, struct sk_buff *skb);
+ +
+ +	struct xfrm_state_afinfo *afinfo;
+++=======
+++>>>>>>> 733a5fac2f15 (xfrm: remove afinfo pointer from xfrm_mode)
+  	struct module *owner;
+  	u8 encap;
+  	u8 family;
+diff --cc net/xfrm/xfrm_input.c
+index 1d7a1a30c2d9,74b53c13279b..000000000000
+--- a/net/xfrm/xfrm_input.c
++++ b/net/xfrm/xfrm_input.c
+@@@ -211,12 -367,21 +218,26 @@@ static int xfrm_prepare_input(struct xf
+  
+  	if (x->sel.family == AF_UNSPEC) {
+  		inner_mode = xfrm_ip2inner_mode(x, XFRM_MODE_SKB_CB(skb)->protocol);
+- 		if (inner_mode == NULL)
++ 		if (!inner_mode) {
++ 			rcu_read_unlock();
+  			return -EAFNOSUPPORT;
++ 		}
+  	}
+  
+++<<<<<<< HEAD
+ +	skb->protocol = inner_mode->afinfo->eth_proto;
+ +	return inner_mode->input2(x, skb);
+++=======
++ 	afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
++ 	if (unlikely(!afinfo)) {
++ 		rcu_read_unlock();
++ 		return -EAFNOSUPPORT;
++ 	}
++ 
++ 	skb->protocol = afinfo->eth_proto;
++ 	rcu_read_unlock();
++ 	return xfrm_inner_mode_encap_remove(x, inner_mode, skb);
+++>>>>>>> 733a5fac2f15 (xfrm: remove afinfo pointer from xfrm_mode)
+  }
+  
+  /* Remove encapsulation header.
+@@@ -555,10 -722,16 +577,15 @@@ resume
+  		if (xo)
+  			xfrm_gro = xo->flags & XFRM_GRO;
+  
+- 		err = x->inner_mode->afinfo->transport_finish(skb, xfrm_gro || async);
++ 		err = -EAFNOSUPPORT;
++ 		rcu_read_lock();
++ 		afinfo = xfrm_state_afinfo_get_rcu(x->inner_mode->family);
++ 		if (likely(afinfo))
++ 			err = afinfo->transport_finish(skb, xfrm_gro || async);
++ 		rcu_read_unlock();
+  		if (xfrm_gro) {
+ -			sp = skb_sec_path(skb);
+ -			if (sp)
+ -				sp->olen = 0;
+ +			if (skb->sp)
+ +				skb->sp->olen = 0;
+  			skb_dst_drop(skb);
+  			gro_cells_receive(&gro_cells, skb);
+  			return err;
+* Unmerged path include/net/xfrm.h
+diff --git a/net/ipv4/xfrm4_output.c b/net/ipv4/xfrm4_output.c
+index 5a48d977796b..8a50e5a1b976 100644
+--- a/net/ipv4/xfrm4_output.c
++++ b/net/ipv4/xfrm4_output.c
+@@ -72,6 +72,8 @@ int xfrm4_output_finish(struct sock *sk, struct sk_buff *skb)
+ static int __xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct xfrm_state *x = skb_dst(skb)->xfrm;
++	const struct xfrm_state_afinfo *afinfo;
++	int ret = -EAFNOSUPPORT;
+ 
+ #ifdef CONFIG_NETFILTER
+ 	if (!x) {
+@@ -80,7 +82,15 @@ static int __xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 	}
+ #endif
+ 
+-	return x->outer_mode->afinfo->output_finish(sk, skb);
++	rcu_read_lock();
++	afinfo = xfrm_state_afinfo_get_rcu(x->outer_mode->family);
++	if (likely(afinfo))
++		ret = afinfo->output_finish(sk, skb);
++	else
++		kfree_skb(skb);
++	rcu_read_unlock();
++
++	return ret;
+ }
+ 
+ int xfrm4_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+diff --git a/net/ipv6/xfrm6_output.c b/net/ipv6/xfrm6_output.c
+index 88778a8ac66d..7dbf1df31360 100644
+--- a/net/ipv6/xfrm6_output.c
++++ b/net/ipv6/xfrm6_output.c
+@@ -122,11 +122,28 @@ int xfrm6_output_finish(struct sock *sk, struct sk_buff *skb)
+ 	return xfrm_output(sk, skb);
+ }
+ 
++static int __xfrm6_output_state_finish(struct xfrm_state *x, struct sock *sk,
++				       struct sk_buff *skb)
++{
++	const struct xfrm_state_afinfo *afinfo;
++	int ret = -EAFNOSUPPORT;
++
++	rcu_read_lock();
++	afinfo = xfrm_state_afinfo_get_rcu(x->outer_mode->family);
++	if (likely(afinfo))
++		ret = afinfo->output_finish(sk, skb);
++	else
++		kfree_skb(skb);
++	rcu_read_unlock();
++
++	return ret;
++}
++
+ static int __xfrm6_output_finish(struct net *net, struct sock *sk, struct sk_buff *skb)
+ {
+ 	struct xfrm_state *x = skb_dst(skb)->xfrm;
+ 
+-	return x->outer_mode->afinfo->output_finish(sk, skb);
++	return __xfrm6_output_state_finish(x, sk, skb);
+ }
+ 
+ static int __xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+@@ -168,7 +185,7 @@ static int __xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+ 				    __xfrm6_output_finish);
+ 
+ skip_frag:
+-	return x->outer_mode->afinfo->output_finish(sk, skb);
++	return __xfrm6_output_state_finish(x, sk, skb);
+ }
+ 
+ int xfrm6_output(struct net *net, struct sock *sk, struct sk_buff *skb)
+* Unmerged path net/xfrm/xfrm_input.c
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 2330abcb848d..7033d3195497 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -426,7 +426,10 @@ EXPORT_SYMBOL_GPL(xfrm_output);
+ 
+ static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+ {
++	const struct xfrm_state_afinfo *afinfo;
+ 	struct xfrm_mode *inner_mode;
++	int err = -EAFNOSUPPORT;
++
+ 	if (x->sel.family == AF_UNSPEC)
+ 		inner_mode = xfrm_ip2inner_mode(x,
+ 				xfrm_af2proto(skb_dst(skb)->ops->family));
+@@ -435,7 +438,14 @@ static int xfrm_inner_extract_output(struct xfrm_state *x, struct sk_buff *skb)
+ 
+ 	if (inner_mode == NULL)
+ 		return -EAFNOSUPPORT;
+-	return inner_mode->afinfo->extract_output(x, skb);
++
++	rcu_read_lock();
++	afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
++	if (likely(afinfo))
++		err = afinfo->extract_output(x, skb);
++	rcu_read_unlock();
++
++	return err;
+ }
+ 
+ void xfrm_local_error(struct sk_buff *skb, int mtu)
+diff --git a/net/xfrm/xfrm_policy.c b/net/xfrm/xfrm_policy.c
+index 2fc87b8c92c6..19b310a73a91 100644
+--- a/net/xfrm/xfrm_policy.c
++++ b/net/xfrm/xfrm_policy.c
+@@ -2548,6 +2548,7 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+ 					    const struct flowi *fl,
+ 					    struct dst_entry *dst)
+ {
++	const struct xfrm_state_afinfo *afinfo;
+ 	struct net *net = xp_net(policy);
+ 	unsigned long now = jiffies;
+ 	struct net_device *dev;
+@@ -2626,7 +2627,14 @@ static struct dst_entry *xfrm_bundle_create(struct xfrm_policy *policy,
+ 		dst1->lastuse = now;
+ 
+ 		dst1->input = dst_discard;
+-		dst1->output = inner_mode->afinfo->output;
++
++		rcu_read_lock();
++		afinfo = xfrm_state_afinfo_get_rcu(inner_mode->family);
++		if (likely(afinfo))
++			dst1->output = afinfo->output;
++		else
++			dst1->output = dst_discard_out;
++		rcu_read_unlock();
+ 
+ 		xdst_prev = xdst;
+ 
+diff --git a/net/xfrm/xfrm_state.c b/net/xfrm/xfrm_state.c
+index b1ac3a477829..e6f5bc4737ad 100644
+--- a/net/xfrm/xfrm_state.c
++++ b/net/xfrm/xfrm_state.c
+@@ -354,7 +354,6 @@ int xfrm_register_mode(struct xfrm_mode *mode)
+ 	if (!try_module_get(afinfo->owner))
+ 		goto out;
+ 
+-	mode->afinfo = afinfo;
+ 	modemap[mode->encap] = mode;
+ 	err = 0;
+ 
+@@ -378,7 +377,7 @@ void xfrm_unregister_mode(struct xfrm_mode *mode)
+ 	spin_lock_bh(&xfrm_mode_lock);
+ 	if (likely(modemap[mode->encap] == mode)) {
+ 		modemap[mode->encap] = NULL;
+-		module_put(mode->afinfo->owner);
++		module_put(afinfo->owner);
+ 	}
+ 
+ 	spin_unlock_bh(&xfrm_mode_lock);
+@@ -2199,6 +2198,7 @@ struct xfrm_state_afinfo *xfrm_state_afinfo_get_rcu(unsigned int family)
+ 
+ 	return rcu_dereference(xfrm_state_afinfo[family]);
+ }
++EXPORT_SYMBOL_GPL(xfrm_state_afinfo_get_rcu);
+ 
+ struct xfrm_state_afinfo *xfrm_state_get_afinfo(unsigned int family)
+ {
