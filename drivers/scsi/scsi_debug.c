@@ -4196,7 +4196,7 @@ static void __init sdebug_build_parts(unsigned char *ramp,
 		sdebug_num_parts = SDEBUG_MAX_PARTS;
 		pr_warn("reducing partitions to %d\n", SDEBUG_MAX_PARTS);
 	}
-	num_sectors = (int)sdebug_store_sectors;
+	num_sectors = (int)get_sdebug_capacity();
 	sectors_per_part = (num_sectors - sdebug_sectors_per)
 			   / sdebug_num_parts;
 	heads_by_sects = sdebug_heads * sdebug_sectors_per;
