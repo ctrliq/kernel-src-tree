@@ -1,0 +1,245 @@
+drm/i915: Keep track of pwm-related backlight hooks separately
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Lyude Paul <lyude@redhat.com>
+commit a575c00e5bc153ab380a097d5be54b97b496cdeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/a575c00e.failed
+
+Currently, every different type of backlight hook that i915 supports is
+pretty straight forward - you have a backlight, probably through PWM
+(but maybe DPCD), with a single set of platform-specific hooks that are
+used for controlling it.
+
+HDR backlights, in particular VESA and Intel's HDR backlight
+implementations, can end up being more complicated. With Intel's
+proprietary interface, HDR backlight controls always run through the
+DPCD. When the backlight is in SDR backlight mode however, the driver
+may need to bypass the TCON and control the backlight directly through
+PWM.
+
+So, in order to support this we'll need to split our backlight callbacks
+into two groups: a set of high-level backlight control callbacks in
+intel_panel, and an additional set of pwm-specific backlight control
+callbacks. This also implies a functional changes for how these
+callbacks are used:
+
+* We now keep track of two separate backlight level ranges, one for the
+  high-level backlight, and one for the pwm backlight range
+* We also keep track of backlight enablement and PWM backlight
+  enablement separately
+* Since the currently set backlight level might not be the same as the
+  currently programmed PWM backlight level, we stop setting
+  panel->backlight.level with the currently programmed PWM backlight
+  level in panel->backlight.pwm_funcs->setup(). Instead, we rely
+  on the higher level backlight control functions to retrieve the
+  current PWM backlight level (in this case, intel_pwm_get_backlight()).
+  Note that there are still a few PWM backlight setup callbacks that
+  do actually need to retrieve the current PWM backlight level, although
+  we no longer save this value in panel->backlight.level like before.
+
+Additionally, we drop the call to lpt_get_backlight() in
+lpt_setup_backlight(), and avoid unconditionally writing the PWM value that
+we get from it and only write it back if we're in CPU mode, and switching
+to PCH mode. The reason for this is because in the original codepath for
+this, it was expected that the intel_panel_bl_funcs->setup() hook would be
+responsible for fetching the initial backlight level. On lpt systems, the
+only time we could ever be in PCH backlight mode is during the initial
+driver load - meaning that outside of the setup() hook, lpt_get_backlight()
+will always be the callback used for retrieving the current backlight
+level. After this patch we still need to fetch and write-back the PCH
+backlight value if we're switching from CPU mode to PCH, but because
+intel_pwm_setup_backlight() will retrieve the backlight level after setup()
+using the get() hook, which always ends up being lpt_get_backlight(). Thus
+- an additional call to lpt_get_backlight() in lpt_setup_backlight() is
+made redundant.
+
+v9:
+* Drop the intel_panel_invert_pwm_level() call in lpt_setup_backlight()
+* Remove leftover detritus from lpt_setup_backlight()
+v8:
+* Go back to getting initial brightness level with
+  intel_pwm_get_backlight(), the other fix we had was definitely wrong.
+v7:
+* Use panel->backlight.pwm_funcs->get() to get the backlight level in
+  intel_pwm_setup_backlight(), lest we upset lockdep
+* Rebase
+* Rename intel_panel_sanitize_pwm_level() to intel_panel_invert_pwm_level()
+v6:
+* Make sure to grab connection_mutex before calling
+  intel_pwm_get_backlight() in intel_pwm_setup_backlight()
+v5:
+* Fix indenting warnings from checkpatch
+v4:
+* Fix commit message
+* Remove outdated comment in intel_panel.c
+* Rename pwm_(min|max) to pwm_level_(min|max)
+* Use intel_pwm_get_backlight() in intel_pwm_setup_backlight() instead of
+  indirection
+* Don't move intel_dp_aux_init_bcklight_funcs() call to bottom of
+  intel_panel_init_backlight_funcs() quite yet
+v3:
+* Reuse intel_panel_bl_funcs() for pwm_funcs
+* Explain why we drop lpt_get_backlight()
+
+	Signed-off-by: Lyude Paul <lyude@redhat.com>
+	Reviewed-by: Jani Nikula <jani.nikula@intel.com>
+	Cc: thaytan@noraisin.net
+	Cc: Vasily Khoruzhick <anarsoul@gmail.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20210114221709.2261452-3-lyude@redhat.com
+(cherry picked from commit a575c00e5bc153ab380a097d5be54b97b496cdeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_panel.c
+diff --cc drivers/gpu/drm/i915/display/intel_panel.c
+index 8e4ea68c5b2c,79e73e3f700c..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_panel.c
++++ b/drivers/gpu/drm/i915/display/intel_panel.c
+@@@ -1172,8 -1176,9 +1180,14 @@@ static void ext_pwm_enable_backlight(co
+  	struct intel_connector *connector = to_intel_connector(conn_state->connector);
+  	struct intel_panel *panel = &connector->panel;
+  
+++<<<<<<< HEAD
+ +	pwm_enable(panel->backlight.pwm);
+ +	intel_panel_actually_set_backlight(conn_state, panel->backlight.level);
+++=======
++ 	pwm_set_relative_duty_cycle(&panel->backlight.pwm_state, level, 100);
++ 	panel->backlight.pwm_state.enabled = true;
++ 	pwm_apply_state(panel->backlight.pwm, &panel->backlight.pwm_state);
+++>>>>>>> a575c00e5bc1 (drm/i915: Keep track of pwm-related backlight hooks separately)
+  }
+  
+  static void __intel_panel_enable_backlight(const struct intel_crtc_state *crtc_state,
+@@@ -1912,31 -1880,27 +1890,53 @@@ static int ext_pwm_setup_backlight(stru
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * FIXME: pwm_apply_args() should be removed when switching to
+ +	 * the atomic PWM API.
+ +	 */
+ +	pwm_apply_args(panel->backlight.pwm);
+ +
+ +	panel->backlight.min = 0; /* 0% */
+ +	panel->backlight.max = 100; /* 100% */
+ +	level = intel_panel_compute_brightness(connector, 100);
+ +	ns = DIV_ROUND_UP(level * CRC_PMIC_PWM_PERIOD_NS, 100);
+ +
+ +	retval = pwm_config(panel->backlight.pwm, ns, CRC_PMIC_PWM_PERIOD_NS);
+ +	if (retval < 0) {
+ +		drm_err(&dev_priv->drm, "Failed to configure the pwm chip\n");
+ +		pwm_put(panel->backlight.pwm);
+ +		panel->backlight.pwm = NULL;
+ +		return retval;
+++=======
++ 	panel->backlight.pwm_level_max = 100; /* 100% */
++ 	panel->backlight.pwm_level_min = get_backlight_min_vbt(connector);
++ 
++ 	if (pwm_is_enabled(panel->backlight.pwm)) {
++ 		/* PWM is already enabled, use existing settings */
++ 		pwm_get_state(panel->backlight.pwm, &panel->backlight.pwm_state);
++ 
++ 		level = pwm_get_relative_duty_cycle(&panel->backlight.pwm_state,
++ 						    100);
++ 		level = intel_panel_invert_pwm_level(connector, level);
++ 		panel->backlight.pwm_enabled = true;
++ 
++ 		drm_dbg_kms(&dev_priv->drm, "PWM already enabled at freq %ld, VBT freq %d, level %d\n",
++ 			    NSEC_PER_SEC / (unsigned long)panel->backlight.pwm_state.period,
++ 			    get_vbt_pwm_freq(dev_priv), level);
++ 	} else {
++ 		/* Set period from VBT frequency, leave other settings at 0. */
++ 		panel->backlight.pwm_state.period =
++ 			NSEC_PER_SEC / get_vbt_pwm_freq(dev_priv);
+++>>>>>>> a575c00e5bc1 (drm/i915: Keep track of pwm-related backlight hooks separately)
+  	}
+  
+ +	level = DIV_ROUND_UP_ULL(pwm_get_duty_cycle(panel->backlight.pwm) * 100,
+ +			     CRC_PMIC_PWM_PERIOD_NS);
+ +	panel->backlight.level =
+ +		intel_panel_compute_brightness(connector, level);
+ +	panel->backlight.enabled = panel->backlight.level != 0;
+ +
+  	drm_info(&dev_priv->drm, "Using %s PWM for LCD backlight control\n",
+  		 desc);
+  	return 0;
+@@@ -2112,29 -2136,43 +2172,32 @@@ intel_panel_init_backlight_funcs(struc
+  		return;
+  
+  	if (IS_GEN9_LP(dev_priv)) {
+- 		panel->backlight.funcs = &bxt_funcs;
++ 		panel->backlight.pwm_funcs = &bxt_pwm_funcs;
+  	} else if (INTEL_PCH_TYPE(dev_priv) >= PCH_CNP) {
+- 		panel->backlight.funcs = &cnp_funcs;
++ 		panel->backlight.pwm_funcs = &cnp_pwm_funcs;
+  	} else if (INTEL_PCH_TYPE(dev_priv) >= PCH_LPT) {
+  		if (HAS_PCH_LPT(dev_priv))
+- 			panel->backlight.funcs = &lpt_funcs;
++ 			panel->backlight.pwm_funcs = &lpt_pwm_funcs;
+  		else
+- 			panel->backlight.funcs = &spt_funcs;
++ 			panel->backlight.pwm_funcs = &spt_pwm_funcs;
+  	} else if (HAS_PCH_SPLIT(dev_priv)) {
+- 		panel->backlight.funcs = &pch_funcs;
++ 		panel->backlight.pwm_funcs = &pch_pwm_funcs;
+  	} else if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) {
+  		if (connector->base.connector_type == DRM_MODE_CONNECTOR_DSI) {
+- 			panel->backlight.funcs = &ext_pwm_funcs;
++ 			panel->backlight.pwm_funcs = &ext_pwm_funcs;
+  		} else {
+- 			panel->backlight.funcs = &vlv_funcs;
++ 			panel->backlight.pwm_funcs = &vlv_pwm_funcs;
+  		}
+  	} else if (IS_GEN(dev_priv, 4)) {
+- 		panel->backlight.funcs = &i965_funcs;
++ 		panel->backlight.pwm_funcs = &i965_pwm_funcs;
+  	} else {
+- 		panel->backlight.funcs = &i9xx_funcs;
++ 		panel->backlight.pwm_funcs = &i9xx_pwm_funcs;
+  	}
++ 
++ 	/* We're using a standard PWM backlight interface */
++ 	panel->backlight.funcs = &pwm_bl_funcs;
+  }
+  
+ -enum drm_connector_status
+ -intel_panel_detect(struct drm_connector *connector, bool force)
+ -{
+ -	struct drm_i915_private *i915 = to_i915(connector->dev);
+ -
+ -	if (!INTEL_DISPLAY_ENABLED(i915))
+ -		return connector_status_disconnected;
+ -
+ -	return connector_status_connected;
+ -}
+ -
+  int intel_panel_init(struct intel_panel *panel,
+  		     struct drm_display_mode *fixed_mode,
+  		     struct drm_display_mode *downclock_mode)
+diff --git a/drivers/gpu/drm/i915/display/intel_display_types.h b/drivers/gpu/drm/i915/display/intel_display_types.h
+index ab6e942224e3..cb8f524774c2 100644
+--- a/drivers/gpu/drm/i915/display/intel_display_types.h
++++ b/drivers/gpu/drm/i915/display/intel_display_types.h
+@@ -231,6 +231,9 @@ struct intel_panel {
+ 		bool alternate_pwm_increment;	/* lpt+ */
+ 
+ 		/* PWM chip */
++		u32 pwm_level_min;
++		u32 pwm_level_max;
++		bool pwm_enabled;
+ 		bool util_pin_active_low;	/* bxt+ */
+ 		u8 controller;		/* bxt+ only */
+ 		struct pwm_device *pwm;
+@@ -241,6 +244,7 @@ struct intel_panel {
+ 		struct backlight_device *device;
+ 
+ 		const struct intel_panel_bl_funcs *funcs;
++		const struct intel_panel_bl_funcs *pwm_funcs;
+ 		void (*power)(struct intel_connector *, bool enable);
+ 	} backlight;
+ };
+* Unmerged path drivers/gpu/drm/i915/display/intel_panel.c
