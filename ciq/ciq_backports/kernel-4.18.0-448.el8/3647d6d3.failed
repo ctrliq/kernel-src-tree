@@ -1,0 +1,235 @@
+fbcon: Move more code into fbcon_release
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 3647d6d3dbdafc55f8c4ca8225966963252abe7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/3647d6d3.failed
+
+con2fb_release_oldinfo() has a bunch more kfree() calls than
+fbcon_exit(), but since kfree() on NULL is harmless doing that in both
+places should be ok. This is also a bit more symmetric now again with
+fbcon_open also allocating the fbcon_ops structure.
+
+	Acked-by: Sam Ravnborg <sam@ravnborg.org>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: Tetsuo Handa <penguin-kernel@I-love.SAKURA.ne.jp>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Du Cheng <ducheng2@gmail.com>
+	Cc: Claudio Suarez <cssk@net-c.es>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220405210335.3434130-16-daniel.vetter@ffwll.ch
+(cherry picked from commit 3647d6d3dbdafc55f8c4ca8225966963252abe7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/core/fbcon.c
+diff --cc drivers/video/fbdev/core/fbcon.c
+index 1a25ce50a9fd,685b4a9e5546..000000000000
+--- a/drivers/video/fbdev/core/fbcon.c
++++ b/drivers/video/fbdev/core/fbcon.c
+@@@ -709,87 -682,95 +709,162 @@@ static int fbcon_invalid_charcount(stru
+  
+  #endif /* CONFIG_MISC_TILEBLITTING */
+  
+++<<<<<<< HEAD
+++=======
++ static void fbcon_release(struct fb_info *info)
++ {
++ 	lock_fb_info(info);
++ 	if (info->fbops->fb_release)
++ 		info->fbops->fb_release(info, 0);
++ 	unlock_fb_info(info);
++ 
++ 	module_put(info->fbops->owner);
++ 
++ 	if (info->fbcon_par) {
++ 		struct fbcon_ops *ops = info->fbcon_par;
++ 
++ 		fbcon_del_cursor_work(info);
++ 		kfree(ops->cursor_state.mask);
++ 		kfree(ops->cursor_data);
++ 		kfree(ops->cursor_src);
++ 		kfree(ops->fontbuffer);
++ 		kfree(info->fbcon_par);
++ 		info->fbcon_par = NULL;
++ 	}
++ }
++ 
++ static int fbcon_open(struct fb_info *info)
++ {
++ 	struct fbcon_ops *ops;
++ 
++ 	if (!try_module_get(info->fbops->owner))
++ 		return -ENODEV;
++ 
++ 	lock_fb_info(info);
++ 	if (info->fbops->fb_open &&
++ 	    info->fbops->fb_open(info, 0)) {
++ 		unlock_fb_info(info);
++ 		module_put(info->fbops->owner);
++ 		return -ENODEV;
++ 	}
++ 	unlock_fb_info(info);
++ 
++ 	ops = kzalloc(sizeof(struct fbcon_ops), GFP_KERNEL);
++ 	if (!ops) {
++ 		fbcon_release(info);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	INIT_DELAYED_WORK(&ops->cursor_work, fb_flashcursor);
++ 	ops->info = info;
++ 	info->fbcon_par = ops;
++ 	ops->cur_blink_jiffies = HZ / 5;
++ 
++ 	return 0;
++ }
+++>>>>>>> 3647d6d3dbda (fbcon: Move more code into fbcon_release)
+  
+  static int con2fb_acquire_newinfo(struct vc_data *vc, struct fb_info *info,
+ -				  int unit)
+ +				  int unit, int oldidx)
+  {
+ -	int err;
+ +	struct fbcon_ops *ops = NULL;
+ +	int err = 0;
+ +
+ +	if (!try_module_get(info->fbops->owner))
+ +		err = -ENODEV;
+  
+ -	err = fbcon_open(info);
+ -	if (err)
+ -		return err;
+ +	if (!err && info->fbops->fb_open &&
+ +	    info->fbops->fb_open(info, 0))
+ +		err = -ENODEV;
+  
+ -	if (vc)
+ -		set_blitting_type(vc, info);
+ +	if (!err) {
+ +		ops = kzalloc(sizeof(struct fbcon_ops), GFP_KERNEL);
+ +		if (!ops)
+ +			err = -ENOMEM;
+ +	}
+ +
+ +	if (!err) {
+ +		ops->cur_blink_jiffies = HZ / 5;
+ +		ops->info = info;
+ +		info->fbcon_par = ops;
+ +
+ +		if (vc)
+ +			set_blitting_type(vc, info);
+ +	}
+ +
+ +	if (err) {
+ +		con2fb_map[unit] = oldidx;
+ +		module_put(info->fbops->owner);
+ +	}
+  
+  	return err;
+  }
+  
+ -static void con2fb_release_oldinfo(struct vc_data *vc, struct fb_info *oldinfo,
+ -				   struct fb_info *newinfo)
+ +static int con2fb_release_oldinfo(struct vc_data *vc, struct fb_info *oldinfo,
+ +				  struct fb_info *newinfo, int unit,
+ +				  int oldidx, int found)
+  {
+++<<<<<<< HEAD
+ +	struct fbcon_ops *ops = oldinfo->fbcon_par;
+ +	int err = 0, ret;
+ +
+ +	if (oldinfo->fbops->fb_release &&
+ +	    oldinfo->fbops->fb_release(oldinfo, 0)) {
+ +		con2fb_map[unit] = oldidx;
+ +		if (!found && newinfo->fbops->fb_release)
+ +			newinfo->fbops->fb_release(newinfo, 0);
+ +		if (!found)
+ +			module_put(newinfo->fbops->owner);
+ +		err = -ENODEV;
+++=======
++ 	int ret;
++ 
++ 	fbcon_release(oldinfo);
++ 
++ 	/*
++ 	  If oldinfo and newinfo are driving the same hardware,
++ 	  the fb_release() method of oldinfo may attempt to
++ 	  restore the hardware state.  This will leave the
++ 	  newinfo in an undefined state. Thus, a call to
++ 	  fb_set_par() may be needed for the newinfo.
++ 	*/
++ 	if (newinfo && newinfo->fbops->fb_set_par) {
++ 		ret = newinfo->fbops->fb_set_par(newinfo);
++ 
++ 		if (ret)
++ 			printk(KERN_ERR "con2fb_release_oldinfo: "
++ 				"detected unhandled fb_set_par error, "
++ 				"error code %d\n", ret);
+++>>>>>>> 3647d6d3dbda (fbcon: Move more code into fbcon_release)
+  	}
+ +
+ +	if (!err) {
+ +		fbcon_del_cursor_timer(oldinfo);
+ +		kfree(ops->cursor_state.mask);
+ +		kfree(ops->cursor_data);
+ +		kfree(ops->cursor_src);
+ +		kfree(ops->fontbuffer);
+ +		kfree(oldinfo->fbcon_par);
+ +		oldinfo->fbcon_par = NULL;
+ +		module_put(oldinfo->fbops->owner);
+ +		/*
+ +		  If oldinfo and newinfo are driving the same hardware,
+ +		  the fb_release() method of oldinfo may attempt to
+ +		  restore the hardware state.  This will leave the
+ +		  newinfo in an undefined state. Thus, a call to
+ +		  fb_set_par() may be needed for the newinfo.
+ +		*/
+ +		if (newinfo && newinfo->fbops->fb_set_par) {
+ +			ret = newinfo->fbops->fb_set_par(newinfo);
+ +
+ +			if (ret)
+ +				printk(KERN_ERR "con2fb_release_oldinfo: "
+ +					"detected unhandled fb_set_par error, "
+ +					"error code %d\n", ret);
+ +		}
+ +	}
+ +
+ +	return err;
+  }
+  
+  static void con2fb_init_display(struct vc_data *vc, struct fb_info *info,
+@@@ -3708,24 -3319,8 +3783,29 @@@ static void fbcon_exit(void
+  			}
+  		}
+  
+++<<<<<<< HEAD
+ +		if (mapped) {
+ +			if (info->fbops->fb_release)
+ +				info->fbops->fb_release(info, 0);
+ +			module_put(info->fbops->owner);
+ +
+ +			if (info->fbcon_par) {
+ +				struct fbcon_ops *ops = info->fbcon_par;
+ +
+ +				fbcon_del_cursor_timer(info);
+ +				kfree(ops->cursor_src);
+ +				kfree(ops->cursor_state.mask);
+ +				kfree(info->fbcon_par);
+ +				info->fbcon_par = NULL;
+ +			}
+ +
+ +			if (info->queue.func == fb_flashcursor)
+ +				info->queue.func = NULL;
+ +		}
+++=======
++ 		if (mapped)
++ 			fbcon_release(info);
+++>>>>>>> 3647d6d3dbda (fbcon: Move more code into fbcon_release)
+  	}
+  }
+  
+* Unmerged path drivers/video/fbdev/core/fbcon.c
