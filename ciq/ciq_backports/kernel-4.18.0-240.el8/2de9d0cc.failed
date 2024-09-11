@@ -1,0 +1,135 @@
+kvm: x86: Introduce x86 ops hook for pre-update APICv
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit 2de9d0ccd0fea32fc6a684f3f22496967ed608bc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2de9d0cc.failed
+
+AMD SVM AVIC needs to update APIC backing page mapping before changing
+APICv mode. Introduce struct kvm_x86_ops.pre_update_apicv_exec_ctrl
+function hook to be called prior KVM APICv update request to each vcpu.
+
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2de9d0ccd0fea32fc6a684f3f22496967ed608bc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 5bd73b4f5d32,19a7d0d3a5fa..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1121,6 -1123,8 +1121,11 @@@ struct kvm_x86_ops 
+  	void (*enable_nmi_window)(struct kvm_vcpu *vcpu);
+  	void (*enable_irq_window)(struct kvm_vcpu *vcpu);
+  	void (*update_cr8_intercept)(struct kvm_vcpu *vcpu, int tpr, int irr);
+++<<<<<<< HEAD
+++=======
++ 	bool (*check_apicv_inhibit_reasons)(ulong bit);
++ 	void (*pre_update_apicv_exec_ctrl)(struct kvm *kvm, bool activate);
+++>>>>>>> 2de9d0ccd0fe (kvm: x86: Introduce x86 ops hook for pre-update APICv)
+  	void (*refresh_apicv_exec_ctrl)(struct kvm_vcpu *vcpu);
+  	void (*hwapic_irr_update)(struct kvm_vcpu *vcpu, int max_irr);
+  	void (*hwapic_isr_update)(struct kvm_vcpu *vcpu, int isr);
+diff --cc arch/x86/kvm/svm.c
+index 3155f79855c8,d85e29bc6ff1..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -7343,6 -7298,18 +7343,21 @@@ static bool svm_apic_init_signal_blocke
+  		   (svm->vmcb->control.intercept & (1ULL << INTERCEPT_INIT));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool svm_check_apicv_inhibit_reasons(ulong bit)
++ {
++ 	ulong supported = BIT(APICV_INHIBIT_REASON_DISABLE);
++ 
++ 	return supported & BIT(bit);
++ }
++ 
++ static void svm_pre_update_apicv_exec_ctrl(struct kvm *kvm, bool activate)
++ {
++ 	avic_update_access_page(kvm, activate);
++ }
++ 
+++>>>>>>> 2de9d0ccd0fe (kvm: x86: Introduce x86 ops hook for pre-update APICv)
+  static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+  	.cpu_has_kvm_support = has_svm,
+  	.disabled_by_bios = is_disabled,
+@@@ -7418,6 -7385,8 +7433,11 @@@
+  	.update_cr8_intercept = update_cr8_intercept,
+  	.set_virtual_apic_mode = svm_set_virtual_apic_mode,
+  	.refresh_apicv_exec_ctrl = svm_refresh_apicv_exec_ctrl,
+++<<<<<<< HEAD
+++=======
++ 	.check_apicv_inhibit_reasons = svm_check_apicv_inhibit_reasons,
++ 	.pre_update_apicv_exec_ctrl = svm_pre_update_apicv_exec_ctrl,
+++>>>>>>> 2de9d0ccd0fe (kvm: x86: Introduce x86 ops hook for pre-update APICv)
+  	.load_eoi_exitmap = svm_load_eoi_exitmap,
+  	.hwapic_irr_update = svm_hwapic_irr_update,
+  	.hwapic_isr_update = svm_hwapic_isr_update,
+diff --cc arch/x86/kvm/x86.c
+index caae36aa2ba4,d2f15cbe2634..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -7977,6 -8014,47 +7977,50 @@@ void kvm_make_scan_ioapic_request(struc
+  	kvm_make_all_cpus_request(kvm, KVM_REQ_SCAN_IOAPIC);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu)
++ {
++ 	if (!lapic_in_kernel(vcpu))
++ 		return;
++ 
++ 	vcpu->arch.apicv_active = kvm_apicv_activated(vcpu->kvm);
++ 	kvm_apic_update_apicv(vcpu);
++ 	kvm_x86_ops->refresh_apicv_exec_ctrl(vcpu);
++ }
++ EXPORT_SYMBOL_GPL(kvm_vcpu_update_apicv);
++ 
++ /*
++  * NOTE: Do not hold any lock prior to calling this.
++  *
++  * In particular, kvm_request_apicv_update() expects kvm->srcu not to be
++  * locked, because it calls __x86_set_memory_region() which does
++  * synchronize_srcu(&kvm->srcu).
++  */
++ void kvm_request_apicv_update(struct kvm *kvm, bool activate, ulong bit)
++ {
++ 	if (!kvm_x86_ops->check_apicv_inhibit_reasons ||
++ 	    !kvm_x86_ops->check_apicv_inhibit_reasons(bit))
++ 		return;
++ 
++ 	if (activate) {
++ 		if (!test_and_clear_bit(bit, &kvm->arch.apicv_inhibit_reasons) ||
++ 		    !kvm_apicv_activated(kvm))
++ 			return;
++ 	} else {
++ 		if (test_and_set_bit(bit, &kvm->arch.apicv_inhibit_reasons) ||
++ 		    kvm_apicv_activated(kvm))
++ 			return;
++ 	}
++ 
++ 	trace_kvm_apicv_update_request(activate, bit);
++ 	if (kvm_x86_ops->pre_update_apicv_exec_ctrl)
++ 		kvm_x86_ops->pre_update_apicv_exec_ctrl(kvm, activate);
++ 	kvm_make_all_cpus_request(kvm, KVM_REQ_APICV_UPDATE);
++ }
++ EXPORT_SYMBOL_GPL(kvm_request_apicv_update);
++ 
+++>>>>>>> 2de9d0ccd0fe (kvm: x86: Introduce x86 ops hook for pre-update APICv)
+  static void vcpu_scan_ioapic(struct kvm_vcpu *vcpu)
+  {
+  	if (!kvm_apic_present(vcpu))
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/x86.c
