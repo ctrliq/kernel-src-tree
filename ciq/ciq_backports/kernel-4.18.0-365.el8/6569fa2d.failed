@@ -1,0 +1,244 @@
+bonding: combine netlink and console error messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Jonathan Toppins <jtoppins@redhat.com>
+commit 6569fa2d4e0147759f7580cb36fd6505feab12f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/6569fa2d.failed
+
+There seems to be no reason to have different error messages between
+netlink and printk. It also cleans up the function slightly.
+
+	Signed-off-by: Jonathan Toppins <jtoppins@redhat.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 6569fa2d4e0147759f7580cb36fd6505feab12f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index feddb0923d91,c0db4e2b2462..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -2134,6 -2155,39 +2143,42 @@@ int bond_enslave(struct net_device *bon
+  		bond_update_slave_arr(bond, NULL);
+  
+  
+++<<<<<<< HEAD
+++=======
++ 	if (!slave_dev->netdev_ops->ndo_bpf ||
++ 	    !slave_dev->netdev_ops->ndo_xdp_xmit) {
++ 		if (bond->xdp_prog) {
++ 			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
++ 				     "Slave does not support XDP");
++ 			res = -EOPNOTSUPP;
++ 			goto err_sysfs_del;
++ 		}
++ 	} else {
++ 		struct netdev_bpf xdp = {
++ 			.command = XDP_SETUP_PROG,
++ 			.flags   = 0,
++ 			.prog    = bond->xdp_prog,
++ 			.extack  = extack,
++ 		};
++ 
++ 		if (dev_xdp_prog_count(slave_dev) > 0) {
++ 			SLAVE_NL_ERR(bond_dev, slave_dev, extack,
++ 				     "Slave has XDP program loaded, please unload before enslaving");
++ 			res = -EOPNOTSUPP;
++ 			goto err_sysfs_del;
++ 		}
++ 
++ 		res = slave_dev->netdev_ops->ndo_bpf(slave_dev, &xdp);
++ 		if (res < 0) {
++ 			/* ndo_bpf() sets extack error message */
++ 			slave_dbg(bond_dev, slave_dev, "Error %d calling ndo_bpf\n", res);
++ 			goto err_sysfs_del;
++ 		}
++ 		if (bond->xdp_prog)
++ 			bpf_prog_inc(bond->xdp_prog);
++ 	}
++ 
+++>>>>>>> 6569fa2d4e01 (bonding: combine netlink and console error messages)
+  	slave_info(bond_dev, slave_dev, "Enslaving as %s interface with %s link\n",
+  		   bond_is_active_slave(new_slave) ? "an active" : "a backup",
+  		   new_slave->link != BOND_LINK_DOWN ? "an up" : "a down");
+@@@ -4890,6 -5097,172 +4935,175 @@@ static netdev_tx_t bond_start_xmit(stru
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct net_device *
++ bond_xdp_get_xmit_slave(struct net_device *bond_dev, struct xdp_buff *xdp)
++ {
++ 	struct bonding *bond = netdev_priv(bond_dev);
++ 	struct slave *slave;
++ 
++ 	/* Caller needs to hold rcu_read_lock() */
++ 
++ 	switch (BOND_MODE(bond)) {
++ 	case BOND_MODE_ROUNDROBIN:
++ 		slave = bond_xdp_xmit_roundrobin_slave_get(bond, xdp);
++ 		break;
++ 
++ 	case BOND_MODE_ACTIVEBACKUP:
++ 		slave = bond_xmit_activebackup_slave_get(bond);
++ 		break;
++ 
++ 	case BOND_MODE_8023AD:
++ 	case BOND_MODE_XOR:
++ 		slave = bond_xdp_xmit_3ad_xor_slave_get(bond, xdp);
++ 		break;
++ 
++ 	default:
++ 		/* Should never happen. Mode guarded by bond_xdp_check() */
++ 		netdev_err(bond_dev, "Unknown bonding mode %d for xdp xmit\n", BOND_MODE(bond));
++ 		WARN_ON_ONCE(1);
++ 		return NULL;
++ 	}
++ 
++ 	if (slave)
++ 		return slave->dev;
++ 
++ 	return NULL;
++ }
++ 
++ static int bond_xdp_xmit(struct net_device *bond_dev,
++ 			 int n, struct xdp_frame **frames, u32 flags)
++ {
++ 	int nxmit, err = -ENXIO;
++ 
++ 	rcu_read_lock();
++ 
++ 	for (nxmit = 0; nxmit < n; nxmit++) {
++ 		struct xdp_frame *frame = frames[nxmit];
++ 		struct xdp_frame *frames1[] = {frame};
++ 		struct net_device *slave_dev;
++ 		struct xdp_buff xdp;
++ 
++ 		xdp_convert_frame_to_buff(frame, &xdp);
++ 
++ 		slave_dev = bond_xdp_get_xmit_slave(bond_dev, &xdp);
++ 		if (!slave_dev) {
++ 			err = -ENXIO;
++ 			break;
++ 		}
++ 
++ 		err = slave_dev->netdev_ops->ndo_xdp_xmit(slave_dev, 1, frames1, flags);
++ 		if (err < 1)
++ 			break;
++ 	}
++ 
++ 	rcu_read_unlock();
++ 
++ 	/* If error happened on the first frame then we can pass the error up, otherwise
++ 	 * report the number of frames that were xmitted.
++ 	 */
++ 	if (err < 0)
++ 		return (nxmit == 0 ? err : nxmit);
++ 
++ 	return nxmit;
++ }
++ 
++ static int bond_xdp_set(struct net_device *dev, struct bpf_prog *prog,
++ 			struct netlink_ext_ack *extack)
++ {
++ 	struct bonding *bond = netdev_priv(dev);
++ 	struct list_head *iter;
++ 	struct slave *slave, *rollback_slave;
++ 	struct bpf_prog *old_prog;
++ 	struct netdev_bpf xdp = {
++ 		.command = XDP_SETUP_PROG,
++ 		.flags   = 0,
++ 		.prog    = prog,
++ 		.extack  = extack,
++ 	};
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (!bond_xdp_check(bond))
++ 		return -EOPNOTSUPP;
++ 
++ 	old_prog = bond->xdp_prog;
++ 	bond->xdp_prog = prog;
++ 
++ 	bond_for_each_slave(bond, slave, iter) {
++ 		struct net_device *slave_dev = slave->dev;
++ 
++ 		if (!slave_dev->netdev_ops->ndo_bpf ||
++ 		    !slave_dev->netdev_ops->ndo_xdp_xmit) {
++ 			SLAVE_NL_ERR(dev, slave_dev, extack,
++ 				     "Slave device does not support XDP");
++ 			err = -EOPNOTSUPP;
++ 			goto err;
++ 		}
++ 
++ 		if (dev_xdp_prog_count(slave_dev) > 0) {
++ 			SLAVE_NL_ERR(dev, slave_dev, extack,
++ 				     "Slave has XDP program loaded, please unload before enslaving");
++ 			err = -EOPNOTSUPP;
++ 			goto err;
++ 		}
++ 
++ 		err = slave_dev->netdev_ops->ndo_bpf(slave_dev, &xdp);
++ 		if (err < 0) {
++ 			/* ndo_bpf() sets extack error message */
++ 			slave_err(dev, slave_dev, "Error %d calling ndo_bpf\n", err);
++ 			goto err;
++ 		}
++ 		if (prog)
++ 			bpf_prog_inc(prog);
++ 	}
++ 
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	if (prog)
++ 		static_branch_inc(&bpf_master_redirect_enabled_key);
++ 	else
++ 		static_branch_dec(&bpf_master_redirect_enabled_key);
++ 
++ 	return 0;
++ 
++ err:
++ 	/* unwind the program changes */
++ 	bond->xdp_prog = old_prog;
++ 	xdp.prog = old_prog;
++ 	xdp.extack = NULL; /* do not overwrite original error */
++ 
++ 	bond_for_each_slave(bond, rollback_slave, iter) {
++ 		struct net_device *slave_dev = rollback_slave->dev;
++ 		int err_unwind;
++ 
++ 		if (slave == rollback_slave)
++ 			break;
++ 
++ 		err_unwind = slave_dev->netdev_ops->ndo_bpf(slave_dev, &xdp);
++ 		if (err_unwind < 0)
++ 			slave_err(dev, slave_dev,
++ 				  "Error %d when unwinding XDP program change\n", err_unwind);
++ 		else if (xdp.prog)
++ 			bpf_prog_inc(xdp.prog);
++ 	}
++ 	return err;
++ }
++ 
++ static int bond_xdp(struct net_device *dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return bond_xdp_set(dev, xdp->prog, xdp->extack);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 6569fa2d4e01 (bonding: combine netlink and console error messages)
+  static u32 bond_mode_bcast_speed(struct slave *slave, u32 speed)
+  {
+  	if (speed == 0 || speed == SPEED_UNKNOWN)
+* Unmerged path drivers/net/bonding/bond_main.c
