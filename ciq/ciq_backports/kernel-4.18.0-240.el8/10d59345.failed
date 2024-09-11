@@ -1,0 +1,91 @@
+io_uring: add sockets to list of files that support non-blocking issue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 10d59345578a116042c1a5d737a18234aaf3e0e6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/10d59345.failed
+
+In chasing a performance issue between using IORING_OP_RECVMSG and
+IORING_OP_READV on sockets, tracing showed that we always punt the
+socket reads to async offload. This is due to io_file_supports_async()
+not checking for S_ISSOCK on the inode. Since sockets supports the
+O_NONBLOCK (or MSG_DONTWAIT) flag just fine, add sockets to the list
+of file types that we can do a non-blocking issue to.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 10d59345578a116042c1a5d737a18234aaf3e0e6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7e2b8c92aeeb,42de210be631..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1401,33 -1841,38 +1401,51 @@@ static int io_write(struct io_kiocb *re
+  	struct iov_iter iter;
+  	struct file *file;
+  	size_t iov_count;
+ -	ssize_t ret, io_size;
+ +	ssize_t ret;
+  
+ -	if (!req->io) {
+ -		ret = io_write_prep(req, &iovec, &iter, force_nonblock);
+ -		if (ret < 0)
+ -			return ret;
+ -	} else {
+ -		ret = io_import_iovec(WRITE, req, &iovec, &iter);
+ -		if (ret < 0)
+ -			return ret;
+ -	}
+ +	ret = io_prep_rw(req, s, force_nonblock);
+ +	if (ret)
+ +		return ret;
+  
+  	file = kiocb->ki_filp;
+ -	io_size = ret;
+ +	if (unlikely(!(file->f_mode & FMODE_WRITE)))
+ +		return -EBADF;
+ +
+ +	ret = io_import_iovec(req->ctx, WRITE, s, &iovec, &iter);
+ +	if (ret < 0)
+ +		return ret;
+ +
+  	if (req->flags & REQ_F_LINK)
+++<<<<<<< HEAD
+ +		req->result = ret;
+++=======
++ 		req->result = io_size;
++ 
++ 	/*
++ 	 * If the file doesn't support async, mark it as REQ_F_MUST_PUNT so
++ 	 * we know to async punt it even if it was opened O_NONBLOCK
++ 	 */
++ 	if (force_nonblock && !io_file_supports_async(req->file)) {
++ 		req->flags |= REQ_F_MUST_PUNT;
++ 		goto copy_iov;
++ 	}
++ 
++ 	/* file path doesn't support NOWAIT for non-direct_IO */
++ 	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT) &&
++ 	    (req->flags & REQ_F_ISREG))
++ 		goto copy_iov;
+++>>>>>>> 10d59345578a (io_uring: add sockets to list of files that support non-blocking issue)
+  
+  	iov_count = iov_iter_count(&iter);
+ +
+ +	ret = -EAGAIN;
+ +	if (force_nonblock && !(kiocb->ki_flags & IOCB_DIRECT)) {
+ +		/* If ->needs_lock is true, we're already in async context. */
+ +		if (!s->needs_lock)
+ +			io_async_list_note(WRITE, req, iov_count);
+ +		goto out_free;
+ +	}
+ +
+  	ret = rw_verify_area(WRITE, file, &kiocb->ki_pos, iov_count);
+  	if (!ret) {
+  		ssize_t ret2;
+* Unmerged path fs/io_uring.c
