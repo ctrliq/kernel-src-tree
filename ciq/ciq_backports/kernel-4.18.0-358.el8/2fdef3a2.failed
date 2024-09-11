@@ -1,0 +1,142 @@
+kvm: add PM-notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sergey Senozhatsky <senozhatsky@chromium.org>
+commit 2fdef3a2ae01dfd928c4b42c5a3b76546170a74c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2fdef3a2.failed
+
+Add KVM PM-notifier so that architectures can have arch-specific
+VM suspend/resume routines. Such architectures need to select
+CONFIG_HAVE_KVM_PM_NOTIFIER and implement kvm_arch_pm_notifier().
+
+	Signed-off-by: Sergey Senozhatsky <senozhatsky@chromium.org>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+Message-Id: <20210606021045.14159-1-senozhatsky@chromium.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 2fdef3a2ae01dfd928c4b42c5a3b76546170a74c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/Kconfig
+diff --cc virt/kvm/Kconfig
+index aad9284c043a,62b39149b8c8..000000000000
+--- a/virt/kvm/Kconfig
++++ b/virt/kvm/Kconfig
+@@@ -60,3 -60,9 +60,12 @@@ config HAVE_KVM_VCPU_RUN_PID_CHANG
+  
+  config HAVE_KVM_NO_POLL
+         bool
+++<<<<<<< HEAD
+++=======
++ 
++ config KVM_XFER_TO_GUEST_WORK
++        bool
++ 
++ config HAVE_KVM_PM_NOTIFIER
++        bool
+++>>>>>>> 2fdef3a2ae01 (kvm: add PM-notifier)
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 5dcd8faa29b8..460cce5945b0 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -31,6 +31,7 @@
+ #include <linux/rcuwait.h>
+ #include <linux/refcount.h>
+ #include <linux/nospec.h>
++#include <linux/notifier.h>
+ #include <asm/signal.h>
+ 
+ #include <linux/kvm.h>
+@@ -546,6 +547,10 @@ struct kvm {
+ 	pid_t userspace_pid;
+ 	unsigned int max_halt_poll_ns;
+ 	u32 dirty_ring_size;
++
++#ifdef CONFIG_HAVE_KVM_PM_NOTIFIER
++	struct notifier_block pm_notifier;
++#endif
+ };
+ 
+ #define kvm_err(fmt, ...) \
+@@ -959,6 +964,10 @@ int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu);
+ void kvm_arch_vcpu_postcreate(struct kvm_vcpu *vcpu);
+ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu);
+ 
++#ifdef CONFIG_HAVE_KVM_PM_NOTIFIER
++int kvm_arch_pm_notifier(struct kvm *kvm, unsigned long state);
++#endif
++
+ #ifdef __KVM_HAVE_ARCH_VCPU_DEBUGFS
+ void kvm_arch_create_vcpu_debugfs(struct kvm_vcpu *vcpu, struct dentry *debugfs_dentry);
+ #endif
+* Unmerged path virt/kvm/Kconfig
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 94b7085973c0..db569887685a 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -54,6 +54,7 @@
+ #include <linux/io.h>
+ #include <linux/lockdep.h>
+ #include <linux/kthread.h>
++#include <linux/suspend.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/ioctl.h>
+@@ -651,6 +652,38 @@ static int kvm_init_mmu_notifier(struct kvm *kvm)
+ 
+ #endif /* CONFIG_MMU_NOTIFIER && KVM_ARCH_WANT_MMU_NOTIFIER */
+ 
++#ifdef CONFIG_HAVE_KVM_PM_NOTIFIER
++static int kvm_pm_notifier_call(struct notifier_block *bl,
++				unsigned long state,
++				void *unused)
++{
++	struct kvm *kvm = container_of(bl, struct kvm, pm_notifier);
++
++	return kvm_arch_pm_notifier(kvm, state);
++}
++
++static void kvm_init_pm_notifier(struct kvm *kvm)
++{
++	kvm->pm_notifier.notifier_call = kvm_pm_notifier_call;
++	/* Suspend KVM before we suspend ftrace, RCU, etc. */
++	kvm->pm_notifier.priority = INT_MAX;
++	register_pm_notifier(&kvm->pm_notifier);
++}
++
++static void kvm_destroy_pm_notifier(struct kvm *kvm)
++{
++	unregister_pm_notifier(&kvm->pm_notifier);
++}
++#else /* !CONFIG_HAVE_KVM_PM_NOTIFIER */
++static void kvm_init_pm_notifier(struct kvm *kvm)
++{
++}
++
++static void kvm_destroy_pm_notifier(struct kvm *kvm)
++{
++}
++#endif /* CONFIG_HAVE_KVM_PM_NOTIFIER */
++
+ static struct kvm_memslots *kvm_alloc_memslots(void)
+ {
+ 	int i;
+@@ -835,6 +868,7 @@ static struct kvm *kvm_create_vm(unsigned long type)
+ 	mutex_unlock(&kvm_lock);
+ 
+ 	preempt_notifier_inc();
++	kvm_init_pm_notifier(kvm);
+ 
+ 	return kvm;
+ 
+@@ -882,6 +916,7 @@ static void kvm_destroy_vm(struct kvm *kvm)
+ 	int i;
+ 	struct mm_struct *mm = kvm->mm;
+ 
++	kvm_destroy_pm_notifier(kvm);
+ 	kvm_uevent_notify_change(KVM_EVENT_DESTROY_VM, kvm);
+ 	kvm_destroy_vm_debugfs(kvm);
+ 	kvm_arch_sync_events(kvm);
