@@ -1,0 +1,533 @@
+xfrm: add IPv6 support for espintcp
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sabrina Dubroca <sd@queasysnail.net>
+commit 26333c37fc285e7372f1b9461f3ae0ba3dc699c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/26333c37.failed
+
+This extends espintcp to support IPv6, building on the existing code
+and the new UDPv6 encapsulation support. Most of the code is either
+reused directly (stream parser, ULP) or very similar to the IPv4
+variant (net/ipv6/esp6.c changes).
+
+The separation of config options for IPv4 and IPv6 espintcp requires a
+bit of Kconfig gymnastics to enable the core code.
+
+	Signed-off-by: Sabrina Dubroca <sd@queasysnail.net>
+	Signed-off-by: Steffen Klassert <steffen.klassert@secunet.com>
+(cherry picked from commit 26333c37fc285e7372f1b9461f3ae0ba3dc699c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ipv6_stubs.h
+#	net/ipv4/Kconfig
+#	net/ipv6/af_inet6.c
+#	net/ipv6/esp6.c
+#	net/xfrm/Makefile
+#	net/xfrm/espintcp.c
+diff --cc include/net/ipv6_stubs.h
+index 44a56078b6fb,1e9e0cf7dc75..000000000000
+--- a/include/net/ipv6_stubs.h
++++ b/include/net/ipv6_stubs.h
+@@@ -46,6 -56,11 +46,14 @@@ struct ipv6_stub 
+  	void (*ndisc_send_na)(struct net_device *dev, const struct in6_addr *daddr,
+  			      const struct in6_addr *solicited_addr,
+  			      bool router, bool solicited, bool override, bool inc_opt);
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_XFRM)
++ 	int (*xfrm6_udp_encap_rcv)(struct sock *sk, struct sk_buff *skb);
++ 	int (*xfrm6_rcv_encap)(struct sk_buff *skb, int nexthdr, __be32 spi,
++ 			       int encap_type);
++ #endif
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  	struct neigh_table *nd_tbl;
+  };
+  extern const struct ipv6_stub *ipv6_stub __read_mostly;
+diff --cc net/ipv4/Kconfig
+index 4ecd9798a5d3,014aaa17dc79..000000000000
+--- a/net/ipv4/Kconfig
++++ b/net/ipv4/Kconfig
+@@@ -378,6 -379,18 +378,21 @@@ config INET_ESP_OFFLOA
+  
+  	  If unsure, say N.
+  
+++<<<<<<< HEAD
+++=======
++ config INET_ESPINTCP
++ 	bool "IP: ESP in TCP encapsulation (RFC 8229)"
++ 	depends on XFRM && INET_ESP
++ 	select STREAM_PARSER
++ 	select NET_SOCK_MSG
++ 	select XFRM_ESPINTCP
++ 	help
++ 	  Support for RFC 8229 encapsulation of ESP and IKE over
++ 	  TCP/IPv4 sockets.
++ 
++ 	  If unsure, say N.
++ 
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  config INET_IPCOMP
+  	tristate "IP: IPComp transformation"
+  	select INET_XFRM_TUNNEL
+diff --cc net/ipv6/af_inet6.c
+index c077c7765b2b,cbbb00bad20e..000000000000
+--- a/net/ipv6/af_inet6.c
++++ b/net/ipv6/af_inet6.c
+@@@ -943,10 -953,19 +943,17 @@@ static const struct ipv6_stub ipv6_stub
+  	.fib6_get_table	   = fib6_get_table,
+  	.fib6_table_lookup = fib6_table_lookup,
+  	.fib6_lookup       = fib6_lookup,
+ -	.fib6_select_path  = fib6_select_path,
+ +	.fib6_multipath_select = fib6_multipath_select,
+  	.ip6_mtu_from_fib6 = ip6_mtu_from_fib6,
+ -	.fib6_nh_init	   = fib6_nh_init,
+ -	.fib6_nh_release   = fib6_nh_release,
+ -	.fib6_update_sernum = fib6_update_sernum_stub,
+ -	.fib6_rt_update	   = fib6_rt_update,
+ -	.ip6_del_rt	   = ip6_del_rt,
+  	.udpv6_encap_enable = udpv6_encap_enable,
+  	.ndisc_send_na = ndisc_send_na,
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_XFRM)
++ 	.xfrm6_udp_encap_rcv = xfrm6_udp_encap_rcv,
++ 	.xfrm6_rcv_encap = xfrm6_rcv_encap,
++ #endif
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  	.nd_tbl	= &nd_tbl,
+  };
+  
+diff --cc net/ipv6/esp6.c
+index 9fa1a7270fe0,c43592771126..000000000000
+--- a/net/ipv6/esp6.c
++++ b/net/ipv6/esp6.c
+@@@ -42,7 -31,11 +42,10 @@@
+  #include <net/icmp.h>
+  #include <net/ipv6.h>
+  #include <net/protocol.h>
+ -#include <net/udp.h>
+  #include <linux/icmpv6.h>
++ #include <net/tcp.h>
++ #include <net/espintcp.h>
++ #include <net/inet6_hashtables.h>
+  
+  #include <linux/highmem.h>
+  
+@@@ -138,6 -135,149 +141,152 @@@ static void esp_ssg_unref(struct xfrm_s
+  			put_page(sg_page(sg));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_INET6_ESPINTCP
++ struct esp_tcp_sk {
++ 	struct sock *sk;
++ 	struct rcu_head rcu;
++ };
++ 
++ static void esp_free_tcp_sk(struct rcu_head *head)
++ {
++ 	struct esp_tcp_sk *esk = container_of(head, struct esp_tcp_sk, rcu);
++ 
++ 	sock_put(esk->sk);
++ 	kfree(esk);
++ }
++ 
++ static struct sock *esp6_find_tcp_sk(struct xfrm_state *x)
++ {
++ 	struct xfrm_encap_tmpl *encap = x->encap;
++ 	struct esp_tcp_sk *esk;
++ 	__be16 sport, dport;
++ 	struct sock *nsk;
++ 	struct sock *sk;
++ 
++ 	sk = rcu_dereference(x->encap_sk);
++ 	if (sk && sk->sk_state == TCP_ESTABLISHED)
++ 		return sk;
++ 
++ 	spin_lock_bh(&x->lock);
++ 	sport = encap->encap_sport;
++ 	dport = encap->encap_dport;
++ 	nsk = rcu_dereference_protected(x->encap_sk,
++ 					lockdep_is_held(&x->lock));
++ 	if (sk && sk == nsk) {
++ 		esk = kmalloc(sizeof(*esk), GFP_ATOMIC);
++ 		if (!esk) {
++ 			spin_unlock_bh(&x->lock);
++ 			return ERR_PTR(-ENOMEM);
++ 		}
++ 		RCU_INIT_POINTER(x->encap_sk, NULL);
++ 		esk->sk = sk;
++ 		call_rcu(&esk->rcu, esp_free_tcp_sk);
++ 	}
++ 	spin_unlock_bh(&x->lock);
++ 
++ 	sk = __inet6_lookup_established(xs_net(x), &tcp_hashinfo, &x->id.daddr.in6,
++ 					dport, &x->props.saddr.in6, ntohs(sport), 0, 0);
++ 	if (!sk)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	if (!tcp_is_ulp_esp(sk)) {
++ 		sock_put(sk);
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	spin_lock_bh(&x->lock);
++ 	nsk = rcu_dereference_protected(x->encap_sk,
++ 					lockdep_is_held(&x->lock));
++ 	if (encap->encap_sport != sport ||
++ 	    encap->encap_dport != dport) {
++ 		sock_put(sk);
++ 		sk = nsk ?: ERR_PTR(-EREMCHG);
++ 	} else if (sk == nsk) {
++ 		sock_put(sk);
++ 	} else {
++ 		rcu_assign_pointer(x->encap_sk, sk);
++ 	}
++ 	spin_unlock_bh(&x->lock);
++ 
++ 	return sk;
++ }
++ 
++ static int esp_output_tcp_finish(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	struct sock *sk;
++ 	int err;
++ 
++ 	rcu_read_lock();
++ 
++ 	sk = esp6_find_tcp_sk(x);
++ 	err = PTR_ERR_OR_ZERO(sk);
++ 	if (err)
++ 		goto out;
++ 
++ 	bh_lock_sock(sk);
++ 	if (sock_owned_by_user(sk))
++ 		err = espintcp_queue_out(sk, skb);
++ 	else
++ 		err = espintcp_push_skb(sk, skb);
++ 	bh_unlock_sock(sk);
++ 
++ out:
++ 	rcu_read_unlock();
++ 	return err;
++ }
++ 
++ static int esp_output_tcp_encap_cb(struct net *net, struct sock *sk,
++ 				   struct sk_buff *skb)
++ {
++ 	struct dst_entry *dst = skb_dst(skb);
++ 	struct xfrm_state *x = dst->xfrm;
++ 
++ 	return esp_output_tcp_finish(x, skb);
++ }
++ 
++ static int esp_output_tail_tcp(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	int err;
++ 
++ 	local_bh_disable();
++ 	err = xfrm_trans_queue_net(xs_net(x), skb, esp_output_tcp_encap_cb);
++ 	local_bh_enable();
++ 
++ 	/* EINPROGRESS just happens to do the right thing.  It
++ 	 * actually means that the skb has been consumed and
++ 	 * isn't coming back.
++ 	 */
++ 	return err ?: -EINPROGRESS;
++ }
++ #else
++ static int esp_output_tail_tcp(struct xfrm_state *x, struct sk_buff *skb)
++ {
++ 	kfree_skb(skb);
++ 
++ 	return -EOPNOTSUPP;
++ }
++ #endif
++ 
++ static void esp_output_encap_csum(struct sk_buff *skb)
++ {
++ 	/* UDP encap with IPv6 requires a valid checksum */
++ 	if (*skb_mac_header(skb) == IPPROTO_UDP) {
++ 		struct udphdr *uh = udp_hdr(skb);
++ 		struct ipv6hdr *ip6h = ipv6_hdr(skb);
++ 		int len = ntohs(uh->len);
++ 		unsigned int offset = skb_transport_offset(skb);
++ 		__wsum csum = skb_checksum(skb, offset, skb->len - offset, 0);
++ 
++ 		uh->check = csum_ipv6_magic(&ip6h->saddr, &ip6h->daddr,
++ 					    len, IPPROTO_UDP, csum);
++ 		if (uh->check == 0)
++ 			uh->check = CSUM_MANGLED_0;
++ 	}
++ }
++ 
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  static void esp_output_done(struct crypto_async_request *base, int err)
+  {
+  	struct sk_buff *skb = base->data;
+@@@ -218,6 -376,105 +371,108 @@@ static void esp_output_done_esn(struct 
+  	esp_output_done(base, err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct ip_esp_hdr *esp6_output_udp_encap(struct sk_buff *skb,
++ 					       int encap_type,
++ 					       struct esp_info *esp,
++ 					       __be16 sport,
++ 					       __be16 dport)
++ {
++ 	struct udphdr *uh;
++ 	__be32 *udpdata32;
++ 	unsigned int len;
++ 
++ 	len = skb->len + esp->tailen - skb_transport_offset(skb);
++ 	if (len > U16_MAX)
++ 		return ERR_PTR(-EMSGSIZE);
++ 
++ 	uh = (struct udphdr *)esp->esph;
++ 	uh->source = sport;
++ 	uh->dest = dport;
++ 	uh->len = htons(len);
++ 	uh->check = 0;
++ 
++ 	*skb_mac_header(skb) = IPPROTO_UDP;
++ 
++ 	if (encap_type == UDP_ENCAP_ESPINUDP_NON_IKE) {
++ 		udpdata32 = (__be32 *)(uh + 1);
++ 		udpdata32[0] = udpdata32[1] = 0;
++ 		return (struct ip_esp_hdr *)(udpdata32 + 2);
++ 	}
++ 
++ 	return (struct ip_esp_hdr *)(uh + 1);
++ }
++ 
++ #ifdef CONFIG_INET6_ESPINTCP
++ static struct ip_esp_hdr *esp6_output_tcp_encap(struct xfrm_state *x,
++ 						struct sk_buff *skb,
++ 						struct esp_info *esp)
++ {
++ 	__be16 *lenp = (void *)esp->esph;
++ 	struct ip_esp_hdr *esph;
++ 	unsigned int len;
++ 	struct sock *sk;
++ 
++ 	len = skb->len + esp->tailen - skb_transport_offset(skb);
++ 	if (len > IP_MAX_MTU)
++ 		return ERR_PTR(-EMSGSIZE);
++ 
++ 	rcu_read_lock();
++ 	sk = esp6_find_tcp_sk(x);
++ 	rcu_read_unlock();
++ 
++ 	if (IS_ERR(sk))
++ 		return ERR_CAST(sk);
++ 
++ 	*lenp = htons(len);
++ 	esph = (struct ip_esp_hdr *)(lenp + 1);
++ 
++ 	return esph;
++ }
++ #else
++ static struct ip_esp_hdr *esp6_output_tcp_encap(struct xfrm_state *x,
++ 						struct sk_buff *skb,
++ 						struct esp_info *esp)
++ {
++ 	return ERR_PTR(-EOPNOTSUPP);
++ }
++ #endif
++ 
++ static int esp6_output_encap(struct xfrm_state *x, struct sk_buff *skb,
++ 			    struct esp_info *esp)
++ {
++ 	struct xfrm_encap_tmpl *encap = x->encap;
++ 	struct ip_esp_hdr *esph;
++ 	__be16 sport, dport;
++ 	int encap_type;
++ 
++ 	spin_lock_bh(&x->lock);
++ 	sport = encap->encap_sport;
++ 	dport = encap->encap_dport;
++ 	encap_type = encap->encap_type;
++ 	spin_unlock_bh(&x->lock);
++ 
++ 	switch (encap_type) {
++ 	default:
++ 	case UDP_ENCAP_ESPINUDP:
++ 	case UDP_ENCAP_ESPINUDP_NON_IKE:
++ 		esph = esp6_output_udp_encap(skb, encap_type, esp, sport, dport);
++ 		break;
++ 	case TCP_ENCAP_ESPINTCP:
++ 		esph = esp6_output_tcp_encap(x, skb, esp);
++ 		break;
++ 	}
++ 
++ 	if (IS_ERR(esph))
++ 		return PTR_ERR(esph);
++ 
++ 	esp->esph = esph;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  int esp6_output_head(struct xfrm_state *x, struct sk_buff *skb, struct esp_info *esp)
+  {
+  	u8 *tail;
+@@@ -528,6 -803,60 +786,63 @@@ int esp6_input_done2(struct sk_buff *sk
+  	if (unlikely(err < 0))
+  		goto out;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (x->encap) {
++ 		const struct ipv6hdr *ip6h = ipv6_hdr(skb);
++ 		struct xfrm_encap_tmpl *encap = x->encap;
++ 		struct udphdr *uh = (void *)(skb_network_header(skb) + hdr_len);
++ 		struct tcphdr *th = (void *)(skb_network_header(skb) + hdr_len);
++ 		__be16 source;
++ 
++ 		switch (x->encap->encap_type) {
++ 		case TCP_ENCAP_ESPINTCP:
++ 			source = th->source;
++ 			break;
++ 		case UDP_ENCAP_ESPINUDP:
++ 		case UDP_ENCAP_ESPINUDP_NON_IKE:
++ 			source = uh->source;
++ 			break;
++ 		default:
++ 			WARN_ON_ONCE(1);
++ 			err = -EINVAL;
++ 			goto out;
++ 		}
++ 
++ 		/*
++ 		 * 1) if the NAT-T peer's IP or port changed then
++ 		 *    advertize the change to the keying daemon.
++ 		 *    This is an inbound SA, so just compare
++ 		 *    SRC ports.
++ 		 */
++ 		if (!ipv6_addr_equal(&ip6h->saddr, &x->props.saddr.in6) ||
++ 		    source != encap->encap_sport) {
++ 			xfrm_address_t ipaddr;
++ 
++ 			memcpy(&ipaddr.a6, &ip6h->saddr.s6_addr, sizeof(ipaddr.a6));
++ 			km_new_mapping(x, &ipaddr, source);
++ 
++ 			/* XXX: perhaps add an extra
++ 			 * policy check here, to see
++ 			 * if we should allow or
++ 			 * reject a packet from a
++ 			 * different source
++ 			 * address/port.
++ 			 */
++ 		}
++ 
++ 		/*
++ 		 * 2) ignore UDP/TCP checksums in case
++ 		 *    of NAT-T in Transport Mode, or
++ 		 *    perform other post-processing fixes
++ 		 *    as per draft-ietf-ipsec-udp-encaps-06,
++ 		 *    section 3.1.2
++ 		 */
++ 		if (x->props.mode == XFRM_MODE_TRANSPORT)
++ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++ 	}
++ 
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  	skb_postpull_rcsum(skb, skb_network_header(skb),
+  			   skb_network_header_len(skb));
+  	skb_pull_rcsum(skb, hlen);
+@@@ -893,6 -1204,30 +1208,33 @@@ static int esp6_init_state(struct xfrm_
+  		break;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (x->encap) {
++ 		struct xfrm_encap_tmpl *encap = x->encap;
++ 
++ 		switch (encap->encap_type) {
++ 		default:
++ 			err = -EINVAL;
++ 			goto error;
++ 		case UDP_ENCAP_ESPINUDP:
++ 			x->props.header_len += sizeof(struct udphdr);
++ 			break;
++ 		case UDP_ENCAP_ESPINUDP_NON_IKE:
++ 			x->props.header_len += sizeof(struct udphdr) + 2 * sizeof(u32);
++ 			break;
++ #ifdef CONFIG_INET6_ESPINTCP
++ 		case TCP_ENCAP_ESPINTCP:
++ 			/* only the length field, TCP encap is done by
++ 			 * the socket
++ 			 */
++ 			x->props.header_len += 2;
++ 			break;
++ #endif
++ 		}
++ 	}
++ 
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+  	align = ALIGN(crypto_aead_blocksize(aead), 4);
+  	x->props.trailer_len = align + 1 + crypto_aead_authsize(aead);
+  
+diff --cc net/xfrm/Makefile
+index fbc4552d17b8,2d4bb4b9f75e..000000000000
+--- a/net/xfrm/Makefile
++++ b/net/xfrm/Makefile
+@@@ -11,3 -11,4 +11,7 @@@ obj-$(CONFIG_XFRM_ALGO) += xfrm_algo.
+  obj-$(CONFIG_XFRM_USER) += xfrm_user.o
+  obj-$(CONFIG_XFRM_IPCOMP) += xfrm_ipcomp.o
+  obj-$(CONFIG_XFRM_INTERFACE) += xfrm_interface.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_XFRM_ESPINTCP) += espintcp.o
+++>>>>>>> 26333c37fc28 (xfrm: add IPv6 support for espintcp)
+* Unmerged path net/xfrm/espintcp.c
+* Unmerged path include/net/ipv6_stubs.h
+* Unmerged path net/ipv4/Kconfig
+diff --git a/net/ipv6/Kconfig b/net/ipv6/Kconfig
+index b3885ca22d6f..4b34199b9675 100644
+--- a/net/ipv6/Kconfig
++++ b/net/ipv6/Kconfig
+@@ -87,6 +87,18 @@ config INET6_ESP_OFFLOAD
+ 
+ 	  If unsure, say N.
+ 
++config INET6_ESPINTCP
++	bool "IPv6: ESP in TCP encapsulation (RFC 8229)"
++	depends on XFRM && INET6_ESP
++	select STREAM_PARSER
++	select NET_SOCK_MSG
++	select XFRM_ESPINTCP
++	help
++	  Support for RFC 8229 encapsulation of ESP and IKE over
++	  TCP/IPv6 sockets.
++
++	  If unsure, say N.
++
+ config INET6_IPCOMP
+ 	tristate "IPv6: IPComp transformation"
+ 	select INET6_XFRM_TUNNEL
+* Unmerged path net/ipv6/af_inet6.c
+* Unmerged path net/ipv6/esp6.c
+diff --git a/net/xfrm/Kconfig b/net/xfrm/Kconfig
+index 8f45f857b420..b19d97632ad7 100644
+--- a/net/xfrm/Kconfig
++++ b/net/xfrm/Kconfig
+@@ -95,4 +95,7 @@ config NET_KEY_MIGRATE
+ 
+ 	  If unsure, say N.
+ 
++config XFRM_ESPINTCP
++	bool
++
+ endif # INET
+* Unmerged path net/xfrm/Makefile
+* Unmerged path net/xfrm/espintcp.c
