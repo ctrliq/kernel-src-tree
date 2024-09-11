@@ -1,0 +1,226 @@
+x86/fpu: Add XFD state to fpstate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit 8bf26758ca9659866b844dd51037314b4c0fa6bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/8bf26758.failed
+
+Add storage for XFD register state to struct fpstate. This will be used to
+store the XFD MSR state. This will be used for switching the XFD MSR when
+FPU content is restored.
+
+Add a per-CPU variable to cache the current MSR value so the MSR has only
+to be written when the values are different.
+
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021225527.10184-15-chang.seok.bae@intel.com
+(cherry picked from commit 8bf26758ca9659866b844dd51037314b4c0fa6bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/types.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/types.h
+index 696fdf451047,b1897638d68d..000000000000
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@@ -311,6 -309,91 +311,94 @@@ union fpregs_state 
+  	u8 __padding[PAGE_SIZE];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct fpstate {
++ 	/* @kernel_size: The size of the kernel register image */
++ 	unsigned int		size;
++ 
++ 	/* @user_size: The size in non-compacted UABI format */
++ 	unsigned int		user_size;
++ 
++ 	/* @xfeatures:		xfeatures for which the storage is sized */
++ 	u64			xfeatures;
++ 
++ 	/* @user_xfeatures:	xfeatures valid in UABI buffers */
++ 	u64			user_xfeatures;
++ 
++ 	/* @xfd:		xfeatures disabled to trap userspace use. */
++ 	u64			xfd;
++ 
++ 	/* @is_valloc:		Indicator for dynamically allocated state */
++ 	unsigned int		is_valloc	: 1;
++ 
++ 	/* @is_guest:		Indicator for guest state (KVM) */
++ 	unsigned int		is_guest	: 1;
++ 
++ 	/*
++ 	 * @is_confidential:	Indicator for KVM confidential mode.
++ 	 *			The FPU registers are restored by the
++ 	 *			vmentry firmware from encrypted guest
++ 	 *			memory. On vmexit the FPU registers are
++ 	 *			saved by firmware to encrypted guest memory
++ 	 *			and the registers are scrubbed before
++ 	 *			returning to the host. So there is no
++ 	 *			content which is worth saving and restoring.
++ 	 *			The fpstate has to be there so that
++ 	 *			preemption and softirq FPU usage works
++ 	 *			without special casing.
++ 	 */
++ 	unsigned int		is_confidential	: 1;
++ 
++ 	/* @in_use:		State is in use */
++ 	unsigned int		in_use		: 1;
++ 
++ 	/* @regs: The register state union for all supported formats */
++ 	union fpregs_state	regs;
++ 
++ 	/* @regs is dynamically sized! Don't add anything after @regs! */
++ } __aligned(64);
++ 
++ struct fpu_state_perm {
++ 	/*
++ 	 * @__state_perm:
++ 	 *
++ 	 * This bitmap indicates the permission for state components, which
++ 	 * are available to a thread group. The permission prctl() sets the
++ 	 * enabled state bits in thread_group_leader()->thread.fpu.
++ 	 *
++ 	 * All run time operations use the per thread information in the
++ 	 * currently active fpu.fpstate which contains the xfeature masks
++ 	 * and sizes for kernel and user space.
++ 	 *
++ 	 * This master permission field is only to be used when
++ 	 * task.fpu.fpstate based checks fail to validate whether the task
++ 	 * is allowed to expand it's xfeatures set which requires to
++ 	 * allocate a larger sized fpstate buffer.
++ 	 *
++ 	 * Do not access this field directly.  Use the provided helper
++ 	 * function. Unlocked access is possible for quick checks.
++ 	 */
++ 	u64				__state_perm;
++ 
++ 	/*
++ 	 * @__state_size:
++ 	 *
++ 	 * The size required for @__state_perm. Only valid to access
++ 	 * with sighand locked.
++ 	 */
++ 	unsigned int			__state_size;
++ 
++ 	/*
++ 	 * @__user_state_size:
++ 	 *
++ 	 * The size required for @__state_perm user part. Only valid to
++ 	 * access with sighand locked.
++ 	 */
++ 	unsigned int			__user_state_size;
++ };
++ 
+++>>>>>>> 8bf26758ca96 (x86/fpu: Add XFD state to fpstate)
+  /*
+   * Highest level per task FPU state data structure that
+   * contains the FPU register state plus various FPU
+diff --cc arch/x86/kernel/fpu/core.c
+index 483daf3e67a3,3b72cddf990d..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -24,6 -25,11 +24,14 @@@
+  #define CREATE_TRACE_POINTS
+  #include <asm/trace/fpu.h>
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_X86_64
++ DEFINE_STATIC_KEY_FALSE(__fpu_state_size_dynamic);
++ DEFINE_PER_CPU(u64, xfd_state);
++ #endif
++ 
+++>>>>>>> 8bf26758ca96 (x86/fpu: Add XFD state to fpstate)
+  /* The FPU state configuration data for kernel and user space */
+  struct fpu_state_config	fpu_kernel_cfg __ro_after_init;
+  struct fpu_state_config fpu_user_cfg __ro_after_init;
+@@@ -320,24 -395,50 +328,57 @@@ void fpstate_init_user(union fpregs_sta
+  		return;
+  	}
+  
+ -	xstate_init_xcomp_bv(&fpstate->regs.xsave, fpstate->xfeatures);
+ +	xstate_init_xcomp_bv(&state->xsave, xfeatures_mask_uabi());
+  
+  	if (cpu_feature_enabled(X86_FEATURE_FXSR))
+ -		fpstate_init_fxstate(fpstate);
+ +		fpstate_init_fxstate(&state->fxsave);
+  	else
+ -		fpstate_init_fstate(fpstate);
+ +		fpstate_init_fstate(&state->fsave);
+  }
+  
+ -static void __fpstate_reset(struct fpstate *fpstate)
+ +#if IS_ENABLED(CONFIG_KVM)
+ +void fpu_init_fpstate_user(struct fpu *fpu)
+  {
+++<<<<<<< HEAD
+ +	fpstate_init_user(&fpu->state);
+++=======
++ 	/* Initialize sizes and feature masks */
++ 	fpstate->size		= fpu_kernel_cfg.default_size;
++ 	fpstate->user_size	= fpu_user_cfg.default_size;
++ 	fpstate->xfeatures	= fpu_kernel_cfg.default_features;
++ 	fpstate->user_xfeatures	= fpu_user_cfg.default_features;
++ 	fpstate->xfd		= init_fpstate.xfd;
++ }
++ 
++ void fpstate_reset(struct fpu *fpu)
++ {
++ 	/* Set the fpstate pointer to the default fpstate */
++ 	fpu->fpstate = &fpu->__fpstate;
++ 	__fpstate_reset(fpu->fpstate);
++ 
++ 	/* Initialize the permission related info in fpu */
++ 	fpu->perm.__state_perm		= fpu_kernel_cfg.default_features;
++ 	fpu->perm.__state_size		= fpu_kernel_cfg.default_size;
++ 	fpu->perm.__user_state_size	= fpu_user_cfg.default_size;
++ }
++ 
++ static inline void fpu_inherit_perms(struct fpu *dst_fpu)
++ {
++ 	if (fpu_state_size_dynamic()) {
++ 		struct fpu *src_fpu = &current->group_leader->thread.fpu;
++ 
++ 		spin_lock_irq(&current->sighand->siglock);
++ 		/* Fork also inherits the permissions of the parent */
++ 		dst_fpu->perm = src_fpu->perm;
++ 		spin_unlock_irq(&current->sighand->siglock);
++ 	}
+++>>>>>>> 8bf26758ca96 (x86/fpu: Add XFD state to fpstate)
+  }
+ +EXPORT_SYMBOL_GPL(fpu_init_fpstate_user);
+ +#endif
+  
+  /* Clone current's FPU state on fork */
+ -int fpu_clone(struct task_struct *dst, unsigned long clone_flags)
+ +int fpu_clone(struct task_struct *dst)
+  {
+  	struct fpu *src_fpu = &current->thread.fpu;
+  	struct fpu *dst_fpu = &dst->thread.fpu;
+* Unmerged path arch/x86/include/asm/fpu/types.h
+* Unmerged path arch/x86/kernel/fpu/core.c
+diff --git a/arch/x86/kernel/fpu/xstate.h b/arch/x86/kernel/fpu/xstate.h
+index 0789a04ee705..c58c376db7c8 100644
+--- a/arch/x86/kernel/fpu/xstate.h
++++ b/arch/x86/kernel/fpu/xstate.h
+@@ -5,6 +5,10 @@
+ #include <asm/cpufeature.h>
+ #include <asm/fpu/xstate.h>
+ 
++#ifdef CONFIG_X86_64
++DECLARE_PER_CPU(u64, xfd_state);
++#endif
++
+ static inline void xstate_init_xcomp_bv(struct xregs_state *xsave, u64 mask)
+ {
+ 	/*
