@@ -1,0 +1,156 @@
+netfilter: nf_tables: coalesce multiple notifications into one skbuff
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 67cc570edaa02016a8685a06a0ee91f05a6277d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/67cc570e.failed
+
+On x86_64, each notification results in one skbuff allocation which
+consumes at least 768 bytes due to the skbuff overhead.
+
+This patch coalesces several notifications into one single skbuff, so
+each notification consumes at least ~211 bytes, that ~3.5 times less
+memory consumption. As a result, this is reducing the chances to exhaust
+the netlink socket receive buffer.
+
+Rule of thumb is that each notification batch only contains netlink
+messages whose report flag is the same, nfnetlink_send() requires this
+to do appropriate delivery to userspace, either via unicast (echo
+mode) or multicast (monitor mode).
+
+The skbuff control buffer is used to annotate the report flag for later
+handling at the new coalescing routine.
+
+The batch skbuff notification size is NLMSG_GOODSIZE, using a larger
+skbuff would allow for more socket receiver buffer savings (to amortize
+the cost of the skbuff even more), however, going over that size might
+break userspace applications, so let's be conservative and stick to
+NLMSG_GOODSIZE.
+
+	Reported-by: Phil Sutter <phil@nwl.cc>
+	Acked-by: Phil Sutter <phil@nwl.cc>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 67cc570edaa02016a8685a06a0ee91f05a6277d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netns/nftables.h
+#	net/netfilter/nf_tables_api.c
+diff --cc include/net/netns/nftables.h
+index 94767ea3a490,6c0806bd8d1e..000000000000
+--- a/include/net/netns/nftables.h
++++ b/include/net/netns/nftables.h
+@@@ -7,6 -7,9 +7,12 @@@
+  struct netns_nftables {
+  	struct list_head	tables;
+  	struct list_head	commit_list;
+++<<<<<<< HEAD
+++=======
++ 	struct list_head	module_list;
++ 	struct list_head	notify_list;
++ 	struct mutex		commit_mutex;
+++>>>>>>> 67cc570edaa0 (netfilter: nf_tables: coalesce multiple notifications into one skbuff)
+  	unsigned int		base_seq;
+  	u8			gencursor;
+  	u8			validate_state;
+diff --cc net/netfilter/nf_tables_api.c
+index d7dac7e83b5c,4603b667973a..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -7182,11 -7696,46 +7188,46 @@@ static void nf_tables_commit_release(st
+  	spin_unlock(&nf_tables_destroy_list_lock);
+  
+  	nf_tables_module_autoload_cleanup(net);
+ -	schedule_work(&trans_destroy_work);
+ +	mutex_unlock(&net->nft_commit_mutex);
+  
+ -	mutex_unlock(&net->nft.commit_mutex);
+ +	schedule_work(&trans_destroy_work);
+  }
+  
++ static void nft_commit_notify(struct net *net, u32 portid)
++ {
++ 	struct sk_buff *batch_skb = NULL, *nskb, *skb;
++ 	unsigned char *data;
++ 	int len;
++ 
++ 	list_for_each_entry_safe(skb, nskb, &net->nft.notify_list, list) {
++ 		if (!batch_skb) {
++ new_batch:
++ 			batch_skb = skb;
++ 			len = NLMSG_GOODSIZE - skb->len;
++ 			list_del(&skb->list);
++ 			continue;
++ 		}
++ 		len -= skb->len;
++ 		if (len > 0 && NFT_CB(skb).report == NFT_CB(batch_skb).report) {
++ 			data = skb_put(batch_skb, skb->len);
++ 			memcpy(data, skb->data, skb->len);
++ 			list_del(&skb->list);
++ 			kfree_skb(skb);
++ 			continue;
++ 		}
++ 		nfnetlink_send(batch_skb, net, portid, NFNLGRP_NFTABLES,
++ 			       NFT_CB(batch_skb).report, GFP_KERNEL);
++ 		goto new_batch;
++ 	}
++ 
++ 	if (batch_skb) {
++ 		nfnetlink_send(batch_skb, net, portid, NFNLGRP_NFTABLES,
++ 			       NFT_CB(batch_skb).report, GFP_KERNEL);
++ 	}
++ 
++ 	WARN_ON_ONCE(!list_empty(&net->nft.notify_list));
++ }
++ 
+  static int nf_tables_commit(struct net *net, struct sk_buff *skb)
+  {
+  	struct nft_trans *trans, *next;
+@@@ -8143,28 -8762,25 +8185,39 @@@ static int __net_init nf_tables_init_ne
+  {
+  	INIT_LIST_HEAD(&net->nft.tables);
+  	INIT_LIST_HEAD(&net->nft.commit_list);
+++<<<<<<< HEAD
+ +	INIT_LIST_HEAD(&net->nft_module_list);
+ +	mutex_init(&net->nft_commit_mutex);
+++=======
++ 	INIT_LIST_HEAD(&net->nft.module_list);
++ 	INIT_LIST_HEAD(&net->nft.notify_list);
++ 	mutex_init(&net->nft.commit_mutex);
+++>>>>>>> 67cc570edaa0 (netfilter: nf_tables: coalesce multiple notifications into one skbuff)
+  	net->nft.base_seq = 1;
+  	net->nft.validate_state = NFT_VALIDATE_SKIP;
+  
+  	return 0;
+  }
+  
+ +static void __net_exit nf_tables_pre_exit_net(struct net *net)
+ +{
+ +	__nft_release_hooks(net);
+ +}
+ +
+  static void __net_exit nf_tables_exit_net(struct net *net)
+  {
+ -	mutex_lock(&net->nft.commit_mutex);
+ +	mutex_lock(&net->nft_commit_mutex);
+  	if (!list_empty(&net->nft.commit_list))
+ -		__nf_tables_abort(net, false);
+ +		__nf_tables_abort(net, NFNL_ABORT_NONE);
+  	__nft_release_tables(net);
+ -	mutex_unlock(&net->nft.commit_mutex);
+ +	mutex_unlock(&net->nft_commit_mutex);
+  	WARN_ON_ONCE(!list_empty(&net->nft.tables));
+++<<<<<<< HEAD
+ +	WARN_ON_ONCE(!list_empty(&net->nft_module_list));
+++=======
++ 	WARN_ON_ONCE(!list_empty(&net->nft.module_list));
++ 	WARN_ON_ONCE(!list_empty(&net->nft.notify_list));
+++>>>>>>> 67cc570edaa0 (netfilter: nf_tables: coalesce multiple notifications into one skbuff)
+  }
+  
+  static struct pernet_operations nf_tables_net_ops = {
+* Unmerged path include/net/netns/nftables.h
+* Unmerged path net/netfilter/nf_tables_api.c
