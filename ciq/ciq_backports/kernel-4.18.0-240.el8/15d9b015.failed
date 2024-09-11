@@ -1,0 +1,93 @@
+xprtrdma: Ensure ri_id is stable during MR recycling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 15d9b015d3d1c997893472cb42d9f225a60a9219
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/15d9b015.failed
+
+ia->ri_id is replaced during a reconnect. The connect_worker runs
+with the transport send lock held to prevent ri_id from being
+dereferenced by the send_request path during this process.
+
+Currently, however, there is no guarantee that ia->ri_id is stable
+in the MR recycling worker, which operates in the background and is
+not serialized with the connect_worker in any way.
+
+But now that Local_Inv completions are being done in process
+context, we can handle the recycling operation there instead of
+deferring the recycling work to another process. Because the
+disconnect path drains all work before allowing tear down to
+proceed, it is guaranteed that Local Invalidations complete only
+while the ri_id pointer is stable.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 15d9b015d3d1c997893472cb42d9f225a60a9219)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index e504ba4329ef,5cd871568c67..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -118,13 -88,8 +118,18 @@@ void frwr_release_mr(struct rpcrdma_mr 
+  	kfree(mr);
+  }
+  
+++<<<<<<< HEAD
+ +/* MRs are dynamically allocated, so simply clean up and release the MR.
+ + * A replacement MR will subsequently be allocated on demand.
+ + */
+ +static void
+ +frwr_mr_recycle_worker(struct work_struct *work)
+ +{
+ +	struct rpcrdma_mr *mr = container_of(work, struct rpcrdma_mr, mr_recycle);
+++=======
++ static void frwr_mr_recycle(struct rpcrdma_mr *mr)
++ {
+++>>>>>>> 15d9b015d3d1 (xprtrdma: Ensure ri_id is stable during MR recycling)
+  	struct rpcrdma_xprt *r_xprt = mr->mr_xprt;
+  
+  	trace_xprtrdma_mr_recycle(mr);
+@@@ -493,9 -437,9 +497,9 @@@ void frwr_reminv(struct rpcrdma_rep *re
+  static void __frwr_release_mr(struct ib_wc *wc, struct rpcrdma_mr *mr)
+  {
+  	if (wc->status != IB_WC_SUCCESS)
+- 		rpcrdma_mr_recycle(mr);
++ 		frwr_mr_recycle(mr);
+  	else
+ -		rpcrdma_mr_put(mr);
+ +		rpcrdma_mr_unmap_and_put(mr);
+  }
+  
+  /**
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 2dbd229358d4..fc93d85efb66 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -262,7 +262,6 @@ struct rpcrdma_mr {
+ 	u32			mr_handle;
+ 	u32			mr_length;
+ 	u64			mr_offset;
+-	struct work_struct	mr_recycle;
+ 	struct list_head	mr_all;
+ };
+ 
+@@ -493,12 +492,6 @@ struct rpcrdma_mr *rpcrdma_mr_get(struct rpcrdma_xprt *r_xprt);
+ void rpcrdma_mr_put(struct rpcrdma_mr *mr);
+ void rpcrdma_mr_unmap_and_put(struct rpcrdma_mr *mr);
+ 
+-static inline void
+-rpcrdma_mr_recycle(struct rpcrdma_mr *mr)
+-{
+-	schedule_work(&mr->mr_recycle);
+-}
+-
+ struct rpcrdma_req *rpcrdma_buffer_get(struct rpcrdma_buffer *);
+ void rpcrdma_buffer_put(struct rpcrdma_buffer *buffers,
+ 			struct rpcrdma_req *req);
