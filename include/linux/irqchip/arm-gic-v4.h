@@ -114,6 +114,7 @@ enum its_vcpu_info_cmd_type {
 	SCHEDULE_VPE,
 	DESCHEDULE_VPE,
 	INVALL_VPE,
+	PROP_UPDATE_VSGI,
 };
 
 struct its_cmd_info {
@@ -125,6 +126,10 @@ struct its_cmd_info {
 		struct {
 			bool		g0en;
 			bool		g1en;
+		};
+		struct {
+			u8		priority;
+			bool		group;
 		};
 	};
 };
