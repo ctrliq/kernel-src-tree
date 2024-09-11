@@ -1,0 +1,151 @@
+dm: Call proper helper to determine dax support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jan Kara <jack@suse.cz>
+commit e2ec5128254518cae320d5dc631b71b94160f663
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e2ec5128.failed
+
+DM was calling generic_fsdax_supported() to determine whether a device
+referenced in the DM table supports DAX. However this is a helper for "leaf" device drivers so that
+they don't have to duplicate common generic checks. High level code
+should call dax_supported() helper which that calls into appropriate
+helper for the particular device. This problem manifested itself as
+kernel messages:
+
+dm-3: error: dax access failed (-95)
+
+when lvm2-testsuite run in cases where a DM device was stacked on top of
+another DM device.
+
+Fixes: 7bf7eac8d648 ("dax: Arrange for dax_supported check to span multiple devices")
+	Cc: <stable@vger.kernel.org>
+	Tested-by: Adrian Huang <ahuang12@lenovo.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+	Acked-by: Mike Snitzer <snitzer@redhat.com>
+	Reported-by: kernel test robot <lkp@intel.com>
+Link: https://lore.kernel.org/r/160061715195.13131.5503173247632041975.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit e2ec5128254518cae320d5dc631b71b94160f663)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-table.c
+diff --cc drivers/md/dm-table.c
+index e9e7c95707c4,229f461e7def..000000000000
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@@ -863,16 -857,28 +863,25 @@@ void dm_table_set_type(struct dm_table 
+  EXPORT_SYMBOL_GPL(dm_table_set_type);
+  
+  /* validate the dax capability of the target device span */
+ -int device_supports_dax(struct dm_target *ti, struct dm_dev *dev,
+ -			sector_t start, sector_t len, void *data)
+ +static int device_supports_dax(struct dm_target *ti, struct dm_dev *dev,
+ +				       sector_t start, sector_t len, void *data)
+  {
+- 	int blocksize = *(int *) data;
++ 	int blocksize = *(int *) data, id;
++ 	bool rc;
+  
+++<<<<<<< HEAD
+ +	return generic_fsdax_supported(dev->dax_dev, dev->bdev, blocksize,
+ +			start, len);
+++=======
++ 	id = dax_read_lock();
++ 	rc = dax_supported(dev->dax_dev, dev->bdev, blocksize, start, len);
++ 	dax_read_unlock(id);
++ 
++ 	return rc;
+++>>>>>>> e2ec51282545 (dm: Call proper helper to determine dax support)
+  }
+  
+ -/* Check devices support synchronous DAX */
+ -static int device_dax_synchronous(struct dm_target *ti, struct dm_dev *dev,
+ -				  sector_t start, sector_t len, void *data)
+ -{
+ -	return dev->dax_dev && dax_synchronous(dev->dax_dev);
+ -}
+ -
+ -bool dm_table_supports_dax(struct dm_table *t,
+ -			   iterate_devices_callout_fn iterate_fn, int *blocksize)
+ +bool dm_table_supports_dax(struct dm_table *t, int blocksize)
+  {
+  	struct dm_target *ti;
+  	unsigned i;
+diff --git a/drivers/dax/super.c b/drivers/dax/super.c
+index c500de6c2388..19c80ae6c169 100644
+--- a/drivers/dax/super.c
++++ b/drivers/dax/super.c
+@@ -332,11 +332,15 @@ EXPORT_SYMBOL_GPL(dax_direct_access);
+ bool dax_supported(struct dax_device *dax_dev, struct block_device *bdev,
+ 		int blocksize, sector_t start, sector_t len)
+ {
++	if (!dax_dev)
++		return false;
++
+ 	if (!dax_alive(dax_dev))
+ 		return false;
+ 
+ 	return dax_dev->ops->dax_supported(dax_dev, bdev, blocksize, start, len);
+ }
++EXPORT_SYMBOL_GPL(dax_supported);
+ 
+ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ 		size_t bytes, struct iov_iter *i)
+* Unmerged path drivers/md/dm-table.c
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index 778498bdf577..636161598ab5 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -131,6 +131,8 @@ static inline bool generic_fsdax_supported(struct dax_device *dax_dev,
+ 	return __generic_fsdax_supported(dax_dev, bdev, blocksize, start,
+ 			sectors);
+ }
++bool dax_supported(struct dax_device *dax_dev, struct block_device *bdev,
++		int blocksize, sector_t start, sector_t len);
+ 
+ static inline void fs_put_dax(struct dax_device *dax_dev)
+ {
+@@ -158,6 +160,13 @@ static inline bool generic_fsdax_supported(struct dax_device *dax_dev,
+ 	return false;
+ }
+ 
++static inline bool dax_supported(struct dax_device *dax_dev,
++		struct block_device *bdev, int blocksize, sector_t start,
++		sector_t len)
++{
++	return false;
++}
++
+ static inline void fs_put_dax(struct dax_device *dax_dev)
+ {
+ }
+@@ -190,14 +199,23 @@ static inline void dax_unlock_page(struct page *page, dax_entry_t cookie)
+ }
+ #endif
+ 
++#if IS_ENABLED(CONFIG_DAX)
+ int dax_read_lock(void);
+ void dax_read_unlock(int id);
++#else
++static inline int dax_read_lock(void)
++{
++	return 0;
++}
++
++static inline void dax_read_unlock(int id)
++{
++}
++#endif /* CONFIG_DAX */
+ bool dax_alive(struct dax_device *dax_dev);
+ void *dax_get_private(struct dax_device *dax_dev);
+ long dax_direct_access(struct dax_device *dax_dev, pgoff_t pgoff, long nr_pages,
+ 		void **kaddr, pfn_t *pfn);
+-bool dax_supported(struct dax_device *dax_dev, struct block_device *bdev,
+-		int blocksize, sector_t start, sector_t len);
+ size_t dax_copy_from_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
+ 		size_t bytes, struct iov_iter *i);
+ size_t dax_copy_to_iter(struct dax_device *dax_dev, pgoff_t pgoff, void *addr,
