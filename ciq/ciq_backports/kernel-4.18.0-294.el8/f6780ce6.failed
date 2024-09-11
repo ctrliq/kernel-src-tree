@@ -1,0 +1,351 @@
+powerpc/watchpoint: Fix DAWR exception constraint
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit f6780ce619f8daa285760302d56e95892087bd1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f6780ce6.failed
+
+Pedro Miraglia Franco de Carvalho noticed that on p8/p9, DAR value is
+inconsistent with different type of load/store. Like for byte,word
+etc. load/stores, DAR is set to the address of the first byte of
+overlap between watch range and real access. But for quadword load/
+store it's sometime set to the address of the first byte of real
+access whereas sometime set to the address of the first byte of
+overlap. This issue has been fixed in p10. In p10(ISA 3.1), DAR is
+always set to the address of the first byte of overlap. Commit 27985b2a640e
+("powerpc/watchpoint: Don't ignore extraneous exceptions blindly")
+wrongly assumes that DAR is set to the address of the first byte of
+overlap for all load/stores on p8/p9 as well. Fix that. With the fix,
+we now rely on 'ea' provided by analyse_instr(). If analyse_instr()
+fails, generate event unconditionally on p8/p9, and on p10 generate
+event only if DAR is within a DAWR range.
+
+Note: 8xx is not affected.
+
+Fixes: 27985b2a640e ("powerpc/watchpoint: Don't ignore extraneous exceptions blindly")
+Fixes: 74c6881019b7 ("powerpc/watchpoint: Prepare handler to handle more than one watchpoint")
+	Reported-by: Pedro Miraglia Franco de Carvalho <pedromfc@br.ibm.com>
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200723090813.303838-3-ravi.bangoria@linux.ibm.com
+(cherry picked from commit f6780ce619f8daa285760302d56e95892087bd1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/hw_breakpoint.c
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 90c5c77a5704,a971e22aea81..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -436,43 -498,156 +436,193 @@@ static bool dar_within_range(unsigned l
+  	return ((info->address <= dar) && (dar - info->address < info->len));
+  }
+  
+++<<<<<<< HEAD
+ +static bool
+ +dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
+ +{
+ +	return ((dar <= info->address + info->len - 1) &&
+ +		(dar + size - 1 >= info->address));
+ +}
+ +
+ +/*
+ + * Handle debug exception notifications.
+ + */
+ +static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ +			     struct arch_hw_breakpoint *info)
+++=======
++ static bool ea_user_range_overlaps(unsigned long ea, int size,
++ 				   struct arch_hw_breakpoint *info)
++ {
++ 	return ((ea < info->address + info->len) &&
++ 		(ea + size > info->address));
++ }
++ 
++ static bool dar_in_hw_range(unsigned long dar, struct arch_hw_breakpoint *info)
++ {
++ 	unsigned long hw_start_addr, hw_end_addr;
++ 
++ 	hw_start_addr = ALIGN_DOWN(info->address, HW_BREAKPOINT_SIZE);
++ 	hw_end_addr = ALIGN(info->address + info->len, HW_BREAKPOINT_SIZE);
++ 
++ 	return ((hw_start_addr <= dar) && (hw_end_addr > dar));
++ }
++ 
++ static bool ea_hw_range_overlaps(unsigned long ea, int size,
++ 				 struct arch_hw_breakpoint *info)
++ {
++ 	unsigned long hw_start_addr, hw_end_addr;
++ 
++ 	hw_start_addr = ALIGN_DOWN(info->address, HW_BREAKPOINT_SIZE);
++ 	hw_end_addr = ALIGN(info->address + info->len, HW_BREAKPOINT_SIZE);
++ 
++ 	return ((ea < hw_end_addr) && (ea + size > hw_start_addr));
++ }
++ 
++ /*
++  * If hw has multiple DAWR registers, we also need to check all
++  * dawrx constraint bits to confirm this is _really_ a valid event.
++  * If type is UNKNOWN, but privilege level matches, consider it as
++  * a positive match.
++  */
++ static bool check_dawrx_constraints(struct pt_regs *regs, int type,
++ 				    struct arch_hw_breakpoint *info)
++ {
++ 	if (OP_IS_LOAD(type) && !(info->type & HW_BRK_TYPE_READ))
++ 		return false;
++ 
++ 	if (OP_IS_STORE(type) && !(info->type & HW_BRK_TYPE_WRITE))
++ 		return false;
++ 
++ 	if (is_kernel_addr(regs->nip) && !(info->type & HW_BRK_TYPE_KERNEL))
++ 		return false;
++ 
++ 	if (user_mode(regs) && !(info->type & HW_BRK_TYPE_USER))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /*
++  * Return true if the event is valid wrt dawr configuration,
++  * including extraneous exception. Otherwise return false.
++  */
++ static bool check_constraints(struct pt_regs *regs, struct ppc_inst instr,
++ 			      unsigned long ea, int type, int size,
++ 			      struct arch_hw_breakpoint *info)
++ {
++ 	bool in_user_range = dar_in_user_range(regs->dar, info);
++ 	bool dawrx_constraints;
++ 
++ 	/*
++ 	 * 8xx supports only one breakpoint and thus we can
++ 	 * unconditionally return true.
++ 	 */
++ 	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++ 		if (!in_user_range)
++ 			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 		return true;
++ 	}
++ 
++ 	if (unlikely(ppc_inst_equal(instr, ppc_inst(0)))) {
++ 		if (cpu_has_feature(CPU_FTR_ARCH_31) &&
++ 		    !dar_in_hw_range(regs->dar, info))
++ 			return false;
++ 
++ 		return true;
++ 	}
++ 
++ 	dawrx_constraints = check_dawrx_constraints(regs, type, info);
++ 
++ 	if (type == UNKNOWN) {
++ 		if (cpu_has_feature(CPU_FTR_ARCH_31) &&
++ 		    !dar_in_hw_range(regs->dar, info))
++ 			return false;
++ 
++ 		return dawrx_constraints;
++ 	}
++ 
++ 	if (ea_user_range_overlaps(ea, size, info))
++ 		return dawrx_constraints;
++ 
++ 	if (ea_hw_range_overlaps(ea, size, info)) {
++ 		if (dawrx_constraints) {
++ 			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 			return true;
++ 		}
++ 	}
++ 	return false;
++ }
++ 
++ static void get_instr_detail(struct pt_regs *regs, struct ppc_inst *instr,
++ 			     int *type, int *size, unsigned long *ea)
+++>>>>>>> f6780ce619f8 (powerpc/watchpoint: Fix DAWR exception constraint)
+  {
+ +	unsigned int instr = 0;
+ +	int ret, type, size;
+  	struct instruction_op op;
+ +	unsigned long addr = info->address;
+  
+ -	if (__get_user_instr_inatomic(*instr, (void __user *)regs->nip))
+ -		return;
+ +	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
+ +		goto fail;
+ +
+++<<<<<<< HEAD
+ +	ret = analyse_instr(&op, regs, instr);
+ +	type = GETTYPE(op.type);
+ +	size = GETSIZE(op.type);
+ +
+ +	if (!ret && (type == LARX || type == STCX)) {
+ +		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+ +				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+ +		goto disable;
+ +	}
+  
+ +	/*
+ +	 * If it's extraneous event, we still need to emulate/single-
+ +	 * step the instruction, but we don't generate an event.
+ +	 */
+ +	if (size && !dar_range_overlaps(regs->dar, size, info))
+ +		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+++=======
++ 	analyse_instr(&op, regs, *instr);
++ 	*type = GETTYPE(op.type);
++ 	*ea = op.ea;
++ #ifdef __powerpc64__
++ 	if (!(regs->msr & MSR_64BIT))
++ 		*ea &= 0xffffffffUL;
++ #endif
++ 	*size = GETSIZE(op.type);
++ }
++ 
++ static bool is_larx_stcx_instr(int type)
++ {
++ 	return type == LARX || type == STCX;
++ }
++ 
++ /*
++  * We've failed in reliably handling the hw-breakpoint. Unregister
++  * it and throw a warning message to let the user know about it.
++  */
++ static void handler_error(struct perf_event *bp, struct arch_hw_breakpoint *info)
++ {
++ 	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at 0x%lx will be disabled.",
++ 	     info->address);
++ 	perf_event_disable_inatomic(bp);
++ }
++ 
++ static void larx_stcx_err(struct perf_event *bp, struct arch_hw_breakpoint *info)
++ {
++ 	printk_ratelimited("Breakpoint hit on instruction that can't be emulated. Breakpoint at 0x%lx will be disabled.\n",
++ 			   info->address);
++ 	perf_event_disable_inatomic(bp);
++ }
++ 
++ static bool stepping_handler(struct pt_regs *regs, struct perf_event **bp,
++ 			     struct arch_hw_breakpoint **info, int *hit,
++ 			     struct ppc_inst instr)
++ {
++ 	int i;
++ 	int stepped;
+++>>>>>>> f6780ce619f8 (powerpc/watchpoint: Fix DAWR exception constraint)
+  
+  	/* Do not emulate user-space instructions, instead single-step them */
+  	if (user_mode(regs)) {
+@@@ -501,10 -676,19 +651,22 @@@ disable
+  
+  int hw_breakpoint_handler(struct die_args *args)
+  {
+ -	bool err = false;
+  	int rc = NOTIFY_STOP;
+ -	struct perf_event *bp[HBP_NUM_MAX] = { NULL };
+ +	struct perf_event *bp;
+  	struct pt_regs *regs = args->regs;
+++<<<<<<< HEAD
+ +	struct arch_hw_breakpoint *info;
+++=======
++ 	struct arch_hw_breakpoint *info[HBP_NUM_MAX] = { NULL };
++ 	int i;
++ 	int hit[HBP_NUM_MAX] = {0};
++ 	int nr_hit = 0;
++ 	bool ptrace_bp = false;
++ 	struct ppc_inst instr = ppc_inst(0);
++ 	int type = 0;
++ 	int size = 0;
++ 	unsigned long ea;
+++>>>>>>> f6780ce619f8 (powerpc/watchpoint: Fix DAWR exception constraint)
+  
+  	/* Disable breakpoints during exception handling */
+  	hw_breakpoint_disable();
+@@@ -517,8 -701,37 +679,42 @@@
+  	 */
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	bp = __this_cpu_read(bp_per_reg);
+ +	if (!bp) {
+++=======
++ 	if (!IS_ENABLED(CONFIG_PPC_8xx))
++ 		get_instr_detail(regs, &instr, &type, &size, &ea);
++ 
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		bp[i] = __this_cpu_read(bp_per_reg[i]);
++ 		if (!bp[i])
++ 			continue;
++ 
++ 		info[i] = counter_arch_bp(bp[i]);
++ 		info[i]->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 
++ 		if (check_constraints(regs, instr, ea, type, size, info[i])) {
++ 			if (!IS_ENABLED(CONFIG_PPC_8xx) &&
++ 			    ppc_inst_equal(instr, ppc_inst(0))) {
++ 				handler_error(bp[i], info[i]);
++ 				info[i] = NULL;
++ 				err = 1;
++ 				continue;
++ 			}
++ 
++ 			if (is_ptrace_bp(bp[i]))
++ 				ptrace_bp = true;
++ 			hit[i] = 1;
++ 			nr_hit++;
++ 		}
++ 	}
++ 
++ 	if (err)
++ 		goto reset;
++ 
++ 	if (!nr_hit) {
+++>>>>>>> f6780ce619f8 (powerpc/watchpoint: Fix DAWR exception constraint)
+  		rc = NOTIFY_DONE;
+  		goto out;
+  	}
+@@@ -530,19 -742,30 +726,35 @@@
+  	 * one-shot mode. The ptrace-ed process will receive the SIGTRAP signal
+  	 * generated in do_dabr().
+  	 */
+ -	if (ptrace_bp) {
+ -		for (i = 0; i < nr_wp_slots(); i++) {
+ -			if (!hit[i])
+ -				continue;
+ -			perf_bp_event(bp[i], regs);
+ -			info[i] = NULL;
+ -		}
+ +	if (is_ptrace_bp(bp)) {
+ +		perf_bp_event(bp, regs);
+  		rc = NOTIFY_DONE;
+ -		goto reset;
+ +		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	info->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ +	if (IS_ENABLED(CONFIG_PPC_8xx)) {
+ +		if (!dar_within_range(regs->dar, info))
+ +			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+ +	} else {
+ +		if (!stepping_handler(regs, bp, info))
+ +			goto out;
+++=======
++ 	if (!IS_ENABLED(CONFIG_PPC_8xx)) {
++ 		if (is_larx_stcx_instr(type)) {
++ 			for (i = 0; i < nr_wp_slots(); i++) {
++ 				if (!hit[i])
++ 					continue;
++ 				larx_stcx_err(bp[i], info[i]);
++ 				info[i] = NULL;
++ 			}
++ 			goto reset;
++ 		}
++ 
++ 		if (!stepping_handler(regs, bp, info, hit, instr))
++ 			goto reset;
+++>>>>>>> f6780ce619f8 (powerpc/watchpoint: Fix DAWR exception constraint)
+  	}
+  
+  	/*
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
