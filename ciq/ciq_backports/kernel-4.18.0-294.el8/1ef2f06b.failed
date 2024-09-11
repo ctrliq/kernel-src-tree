@@ -1,0 +1,140 @@
+powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 1ef2f06b71792c2efaa4fb4aef8f1fc2a115ee1f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1ef2f06b.failed
+
+When switching to balloon compaction, we want to drop the cmm_lock and
+completely rely on the balloon compaction list lock internally.
+loaned_pages is currently protected under the cmm_lock.
+
+Note: Right now cmm_alloc_pages() and cmm_free_pages() can be called
+at the same time, e.g., via the thread and a concurrent OOM notifier.
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191031142933.10779-8-david@redhat.com
+(cherry picked from commit 1ef2f06b71792c2efaa4fb4aef8f1fc2a115ee1f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/cmm.c
+diff --cc arch/powerpc/platforms/pseries/cmm.c
+index 317181692fcb,3a55dd1fdd39..000000000000
+--- a/arch/powerpc/platforms/pseries/cmm.c
++++ b/arch/powerpc/platforms/pseries/cmm.c
+@@@ -89,17 -71,9 +89,21 @@@ module_param_named(debug, cmm_debug, ui
+  MODULE_PARM_DESC(debug, "Enable module debugging logging. Set to 1 to enable. "
+  		 "[Default=" __stringify(CMM_DEBUG) "]");
+  
+ +#define CMM_NR_PAGES ((PAGE_SIZE - sizeof(void *) - sizeof(unsigned long)) / sizeof(unsigned long))
+ +
+  #define cmm_dbg(...) if (cmm_debug) { printk(KERN_INFO "cmm: "__VA_ARGS__); }
+  
+++<<<<<<< HEAD
+ +struct cmm_page_array {
+ +	struct cmm_page_array *next;
+ +	unsigned long index;
+ +	unsigned long page[CMM_NR_PAGES];
+ +};
+ +
+ +static unsigned long loaned_pages;
+++=======
++ static atomic_long_t loaned_pages;
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  static unsigned long loaned_pages_target;
+  static unsigned long oom_freed_pages;
+  
+@@@ -206,9 -158,9 +210,15 @@@ static long cmm_alloc_pages(long nr
+  			break;
+  		}
+  
+++<<<<<<< HEAD
+ +		pa->page[pa->index++] = addr;
+ +		loaned_pages++;
+ +		totalram_pages--;
+++=======
++ 		list_add(&page->lru, &cmm_page_list);
++ 		atomic_long_inc(&loaned_pages);
++ 		adjust_managed_page_count(page, -1);
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  		spin_unlock(&cmm_lock);
+  		nr--;
+  	}
+@@@ -231,23 -182,15 +241,31 @@@ static long cmm_free_pages(long nr
+  
+  	cmm_dbg("Begin free of %ld pages.\n", nr);
+  	spin_lock(&cmm_lock);
+ -	list_for_each_entry_safe(page, tmp, &cmm_page_list, lru) {
+ -		if (!nr)
+ +	pa = cmm_page_list;
+ +	while (nr) {
+ +		if (!pa || pa->index <= 0)
+  			break;
+++<<<<<<< HEAD
+ +		addr = pa->page[--pa->index];
+ +
+ +		if (pa->index == 0) {
+ +			pa = pa->next;
+ +			free_page((unsigned long) cmm_page_list);
+ +			cmm_page_list = pa;
+ +		}
+ +
+ +		plpar_page_set_active(__pa(addr));
+ +		free_page(addr);
+ +		loaned_pages--;
+++=======
++ 		plpar_page_set_active(page);
++ 		list_del(&page->lru);
++ 		adjust_managed_page_count(page, 1);
++ 		__free_page(page);
++ 		atomic_long_dec(&loaned_pages);
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  		nr--;
+ +		totalram_pages++;
+  	}
+  	spin_unlock(&cmm_lock);
+  	cmm_dbg("End request with %ld pages unfulfilled\n", nr);
+@@@ -291,7 -236,6 +311,10 @@@ static void cmm_get_mpp(void
+  	int rc;
+  	struct hvcall_mpp_data mpp_data;
+  	signed long active_pages_target, page_loan_request, target;
+++<<<<<<< HEAD
+ +	signed long total_pages = totalram_pages + loaned_pages;
+++=======
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  	signed long min_mem_pages = (min_mem_mb * 1024 * 1024) / PAGE_SIZE;
+  
+  	rc = h_get_mpp(&mpp_data);
+@@@ -321,8 -265,8 +344,13 @@@
+  	loaned_pages_target = target;
+  
+  	cmm_dbg("delta = %ld, loaned = %lu, target = %lu, oom = %lu, totalram = %lu\n",
+++<<<<<<< HEAD
+ +		page_loan_request, loaned_pages, loaned_pages_target,
+ +		oom_freed_pages, totalram_pages);
+++=======
++ 		page_loan_request, __loaned_pages, loaned_pages_target,
++ 		oom_freed_pages, totalram_pages());
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  }
+  
+  static struct notifier_block cmm_oom_nb = {
+@@@ -739,8 -543,7 +769,12 @@@ static void cmm_exit(void
+  	unregister_oom_notifier(&cmm_oom_nb);
+  	unregister_reboot_notifier(&cmm_reboot_nb);
+  	unregister_memory_notifier(&cmm_mem_nb);
+++<<<<<<< HEAD
+ +	unregister_memory_isolate_notifier(&cmm_mem_isolate_nb);
+ +	cmm_free_pages(loaned_pages);
+++=======
++ 	cmm_free_pages(atomic_long_read(&loaned_pages));
+++>>>>>>> 1ef2f06b7179 (powerpc/pseries/cmm: Convert loaned_pages to an atomic_long_t)
+  	cmm_unregister_sysfs(&cmm_dev);
+  }
+  
+* Unmerged path arch/powerpc/platforms/pseries/cmm.c
