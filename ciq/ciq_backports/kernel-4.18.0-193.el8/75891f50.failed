@@ -1,0 +1,268 @@
+SUNRPC: Support for congestion control when queuing is enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 75891f502f5fc70f52a01af5b924384ed4866907
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/75891f50.failed
+
+Both RDMA and UDP transports require the request to get a "congestion control"
+credit before they can be transmitted. Right now, this is done when
+the request locks the socket. We'd like it to happen when a request attempts
+to be transmitted for the first time.
+In order to support retransmission of requests that already hold such
+credits, we also want to ensure that they get queued first, so that we
+don't deadlock with requests that have yet to obtain a credit.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 75891f502f5fc70f52a01af5b924384ed4866907)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index eacde9249456,b03355ae7b16..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -245,9 -267,8 +269,9 @@@ int xprt_reserve_xprt_cong(struct rpc_x
+  		xprt->snd_task = task;
+  		return 1;
+  	}
+- 	if (__xprt_get_cong(xprt, task)) {
++ 	if (!xprt_need_congestion_window_wait(xprt)) {
+  		xprt->snd_task = task;
+ +		req->rq_ntrans++;
+  		return 1;
+  	}
+  	xprt_clear_locked(xprt);
+@@@ -956,6 -1046,145 +996,148 @@@ static void xprt_timer(struct rpc_task 
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * xprt_request_wait_receive - wait for the reply to an RPC request
++  * @task: RPC task about to send a request
++  *
++  */
++ void xprt_request_wait_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		return;
++ 	/*
++ 	 * Sleep on the pending queue if we're expecting a reply.
++ 	 * The spinlock ensures atomicity between the test of
++ 	 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
++ 	 */
++ 	spin_lock(&xprt->queue_lock);
++ 	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
++ 		xprt->ops->set_retrans_timeout(task);
++ 		rpc_sleep_on(&xprt->pending, task, xprt_timer);
++ 		/*
++ 		 * Send an extra queue wakeup call if the
++ 		 * connection was dropped in case the call to
++ 		 * rpc_sleep_on() raced.
++ 		 */
++ 		if (xprt_request_retransmit_after_disconnect(task))
++ 			rpc_wake_up_queued_task_set_status(&xprt->pending,
++ 					task, -ENOTCONN);
++ 	}
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_transmit(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return !test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ }
++ 
++ /**
++  * xprt_request_enqueue_transmit - queue a task for transmission
++  * @task: pointer to rpc_task
++  *
++  * Add a task to the transmission queue.
++  */
++ void
++ xprt_request_enqueue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *pos, *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (xprt_request_need_enqueue_transmit(task, req)) {
++ 		spin_lock(&xprt->queue_lock);
++ 		/*
++ 		 * Requests that carry congestion control credits are added
++ 		 * to the head of the list to avoid starvation issues.
++ 		 */
++ 		if (req->rq_cong) {
++ 			xprt_clear_congestion_window_wait(xprt);
++ 			list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 				if (pos->rq_cong)
++ 					continue;
++ 				/* Note: req is added _before_ pos */
++ 				list_add_tail(&req->rq_xmit, &pos->rq_xmit);
++ 				INIT_LIST_HEAD(&req->rq_xmit2);
++ 				goto out;
++ 			}
++ 		} else {
++ 			list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 				if (pos->rq_task->tk_owner != task->tk_owner)
++ 					continue;
++ 				list_add_tail(&req->rq_xmit2, &pos->rq_xmit2);
++ 				INIT_LIST_HEAD(&req->rq_xmit);
++ 				goto out;
++ 			}
++ 		}
++ 		list_add_tail(&req->rq_xmit, &xprt->xmit_queue);
++ 		INIT_LIST_HEAD(&req->rq_xmit2);
++ out:
++ 		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ 		spin_unlock(&xprt->queue_lock);
++ 	}
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit_locked - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  * Caller must hold xprt->queue_lock
++  */
++ static void
++ xprt_request_dequeue_transmit_locked(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 
++ 	if (!test_and_clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 		return;
++ 	if (!list_empty(&req->rq_xmit)) {
++ 		list_del(&req->rq_xmit);
++ 		if (!list_empty(&req->rq_xmit2)) {
++ 			struct rpc_rqst *next = list_first_entry(&req->rq_xmit2,
++ 					struct rpc_rqst, rq_xmit2);
++ 			list_del(&req->rq_xmit2);
++ 			list_add_tail(&next->rq_xmit, &next->rq_xprt->xmit_queue);
++ 		}
++ 	} else
++ 		list_del(&req->rq_xmit2);
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  */
++ static void
++ xprt_request_dequeue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	xprt_request_dequeue_transmit_locked(task);
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ /**
++  * xprt_request_need_retransmit - Test if a task needs retransmission
++  * @task: pointer to rpc_task
++  *
++  * Test for whether a connection breakage requires the task to retransmit
++  */
++ bool
++ xprt_request_need_retransmit(struct rpc_task *task)
++ {
++ 	return xprt_request_retransmit_after_disconnect(task);
++ }
++ 
++ /**
+++>>>>>>> 75891f502f5f (SUNRPC: Support for congestion control when queuing is enabled)
+   * xprt_prepare_transmit - reserve the transport before sending a request
+   * @task: RPC task about to send a request
+   *
+diff --git a/include/linux/sunrpc/xprt.h b/include/linux/sunrpc/xprt.h
+index dea3a9fa5d2a..e18e7f7cc44a 100644
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@ -382,6 +382,7 @@ void			xprt_complete_rqst(struct rpc_task *task, int copied);
+ void			xprt_pin_rqst(struct rpc_rqst *req);
+ void			xprt_unpin_rqst(struct rpc_rqst *req);
+ void			xprt_release_rqst_cong(struct rpc_task *task);
++bool			xprt_request_get_cong(struct rpc_xprt *xprt, struct rpc_rqst *req);
+ void			xprt_disconnect_done(struct rpc_xprt *xprt);
+ void			xprt_force_disconnect(struct rpc_xprt *xprt);
+ void			xprt_conditional_disconnect(struct rpc_xprt *xprt, unsigned int cookie);
+@@ -400,6 +401,7 @@ void			xprt_unlock_connect(struct rpc_xprt *, void *);
+ #define XPRT_BINDING		(5)
+ #define XPRT_CLOSING		(6)
+ #define XPRT_CONGESTED		(9)
++#define XPRT_CWND_WAIT		(10)
+ 
+ static inline void xprt_set_connected(struct rpc_xprt *xprt)
+ {
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index d6ca4ed0e072..b8490f6c21fd 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -2000,6 +2000,11 @@ call_transmit_status(struct rpc_task *task)
+ 		dprint_status(task);
+ 		xprt_end_transmit(task);
+ 		break;
++	case -EBADSLT:
++		xprt_end_transmit(task);
++		task->tk_action = call_transmit;
++		task->tk_status = 0;
++		break;
+ 	case -EBADMSG:
+ 		clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+ 		task->tk_action = call_transmit;
+* Unmerged path net/sunrpc/xprt.c
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index d21c49c1fa08..196dae27dcc2 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -187,6 +187,9 @@ int xprt_rdma_bc_send_reply(struct rpc_rqst *rqst)
+ 	if (!xprt_connected(xprt))
+ 		return -ENOTCONN;
+ 
++	if (!xprt_request_get_cong(rqst->rq_xprt, rqst))
++		return -EBADSLT;
++
+ 	rc = rpcrdma_bc_marshal_reply(rqst);
+ 	if (rc < 0)
+ 		goto failed_marshal;
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 112d4b459fc7..656d104c7555 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -721,6 +721,9 @@ xprt_rdma_send_request(struct rpc_rqst *rqst, struct rpc_task *task)
+ 	if (!xprt_connected(xprt))
+ 		return -ENOTCONN;
+ 
++	if (!xprt_request_get_cong(xprt, rqst))
++		return -EBADSLT;
++
+ 	rc = rpcrdma_marshal_req(r_xprt, rqst);
+ 	if (rc < 0)
+ 		goto failed_marshal;
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index 84e50cc60026..8ea90be0f6bf 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -609,6 +609,10 @@ static int xs_udp_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ 
+ 	if (!xprt_bound(xprt))
+ 		return -ENOTCONN;
++
++	if (!xprt_request_get_cong(xprt, req))
++		return -EBADSLT;
++
+ 	req->rq_xtime = ktime_get();
+ 	status = xs_sendpages(transport->sock, xs_addr(xprt), xprt->addrlen,
+ 			      xdr, 0, true, &sent);
