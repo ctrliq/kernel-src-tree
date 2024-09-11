@@ -1,0 +1,160 @@
+bpf: Disable GCC -fgcse optimization for ___bpf_prog_run()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit 3193c0836f203a91bef96d88c64cccf0be090d9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3193c083.failed
+
+On x86-64, with CONFIG_RETPOLINE=n, GCC's "global common subexpression
+elimination" optimization results in ___bpf_prog_run()'s jumptable code
+changing from this:
+
+	select_insn:
+		jmp *jumptable(, %rax, 8)
+		...
+	ALU64_ADD_X:
+		...
+		jmp *jumptable(, %rax, 8)
+	ALU_ADD_X:
+		...
+		jmp *jumptable(, %rax, 8)
+
+to this:
+
+	select_insn:
+		mov jumptable, %r12
+		jmp *(%r12, %rax, 8)
+		...
+	ALU64_ADD_X:
+		...
+		jmp *(%r12, %rax, 8)
+	ALU_ADD_X:
+		...
+		jmp *(%r12, %rax, 8)
+
+The jumptable address is placed in a register once, at the beginning of
+the function.  The function execution can then go through multiple
+indirect jumps which rely on that same register value.  This has a few
+issues:
+
+1) Objtool isn't smart enough to be able to track such a register value
+   across multiple recursive indirect jumps through the jump table.
+
+2) With CONFIG_RETPOLINE enabled, this optimization actually results in
+   a small slowdown.  I measured a ~4.7% slowdown in the test_bpf
+   "tcpdump port 22" selftest.
+
+   This slowdown is actually predicted by the GCC manual:
+
+     Note: When compiling a program using computed gotos, a GCC
+     extension, you may get better run-time performance if you
+     disable the global common subexpression elimination pass by
+     adding -fno-gcse to the command line.
+
+So just disable the optimization for this function.
+
+Fixes: e55a73251da3 ("bpf: Fix ORC unwinding in non-JIT BPF code")
+	Reported-by: Randy Dunlap <rdunlap@infradead.org>
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/30c3ca29ba037afcbd860a8672eef0021addf9fe.1563413318.git.jpoimboe@redhat.com
+
+(cherry picked from commit 3193c0836f203a91bef96d88c64cccf0be090d9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/compiler_types.h
+diff --cc include/linux/compiler_types.h
+index a8ba6b04152c,599c27b56c29..000000000000
+--- a/include/linux/compiler_types.h
++++ b/include/linux/compiler_types.h
+@@@ -231,46 -185,23 +231,53 @@@ struct ftrace_likely_data 
+  # define randomized_struct_fields_end
+  #endif
+  
+ -#ifndef asm_volatile_goto
+ -#define asm_volatile_goto(x...) asm goto(x)
+ +/*
+ + * Tell gcc if a function is cold. The compiler will assume any path
+ + * directly leading to the call is unlikely.
+ + */
+ +
+ +#ifndef __cold
+ +#define __cold
+ +#endif
+ +
+++<<<<<<< HEAD
+ +/* Simple shorthand for a section definition */
+ +#ifndef __section
+ +# define __section(S) __attribute__ ((__section__(#S)))
+ +#endif
+ +
+ +#ifndef __visible
+ +#define __visible
+ +#endif
+ +
+ +#ifndef __nostackprotector
+ +# define __nostackprotector
+  #endif
+  
+ +/*
+ + * Assume alignment of return value.
+ + */
+ +#ifndef __assume_aligned
+ +#define __assume_aligned(a, ...)
+ +#endif
+ +
+ +
+++=======
++ #ifndef __no_fgcse
++ # define __no_fgcse
++ #endif
++ 
+++>>>>>>> 3193c0836f20 (bpf: Disable GCC -fgcse optimization for ___bpf_prog_run())
+  /* Are two types/vars the same type (ignoring qualifiers)? */
+ -#define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
+ +#ifndef __same_type
+ +# define __same_type(a, b) __builtin_types_compatible_p(typeof(a), typeof(b))
+ +#endif
+  
+  /* Is this type a native word size -- useful for atomic operations */
+ -#define __native_word(t) \
+ -	(sizeof(t) == sizeof(char) || sizeof(t) == sizeof(short) || \
+ -	 sizeof(t) == sizeof(int) || sizeof(t) == sizeof(long))
+ +#ifndef __native_word
+ +# define __native_word(t) (sizeof(t) == sizeof(char) || sizeof(t) == sizeof(short) || sizeof(t) == sizeof(int) || sizeof(t) == sizeof(long))
+ +#endif
+  
+ -/* Helpers for emitting diagnostics in pragmas. */
+  #ifndef __diag
+  #define __diag(string)
+  #endif
+diff --git a/include/linux/compiler-gcc.h b/include/linux/compiler-gcc.h
+index 573f5a7d42d4..af361866fd9a 100644
+--- a/include/linux/compiler-gcc.h
++++ b/include/linux/compiler-gcc.h
+@@ -387,3 +387,5 @@
+ #else
+ #define __diag_GCC_8(s)
+ #endif
++
++#define __no_fgcse __attribute__((optimize("-fno-gcse")))
+* Unmerged path include/linux/compiler_types.h
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 334525016ee5..3546290b642f 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1271,7 +1271,7 @@ bool bpf_opcode_in_insntable(u8 code)
+  *
+  * Decode and execute eBPF instructions.
+  */
+-static u64 ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 *stack)
++static u64 __no_fgcse ___bpf_prog_run(u64 *regs, const struct bpf_insn *insn, u64 *stack)
+ {
+ #define BPF_INSN_2_LBL(x, y)    [BPF_##x | BPF_##y] = &&x##_##y
+ #define BPF_INSN_3_LBL(x, y, z) [BPF_##x | BPF_##y | BPF_##z] = &&x##_##y##_##z
