@@ -1,0 +1,174 @@
+drm/i915/icl: move MG pll hw_state readout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Lucas De Marchi <lucas.demarchi@intel.com>
+commit 510a75a5d2b8540001c5c49ccad310df94623db8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/510a75a5.failed
+
+Let the MG plls have their own hooks since it shares very little with
+other PLL types. It's also better so the platform info contains the info
+if the PLL is for MG PHY rather than relying on the PLL ids.
+
+	Signed-off-by: Lucas De Marchi <lucas.demarchi@intel.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190222232324.16405-1-lucas.demarchi@intel.com
+(cherry picked from commit 510a75a5d2b8540001c5c49ccad310df94623db8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_dpll_mgr.c
+diff --cc drivers/gpu/drm/i915/intel_dpll_mgr.c
+index 383fbc15113d,e4ec73d415d9..000000000000
+--- a/drivers/gpu/drm/i915/intel_dpll_mgr.c
++++ b/drivers/gpu/drm/i915/intel_dpll_mgr.c
+@@@ -2817,20 -2958,76 +2817,82 @@@ icl_get_dpll(struct intel_crtc *crtc, s
+  
+  static i915_reg_t icl_pll_id_to_enable_reg(enum intel_dpll_id id)
+  {
+ -	if (intel_dpll_is_combophy(id))
+ +	switch (id) {
+ +	default:
+ +		MISSING_CASE(id);
+ +	case DPLL_ID_ICL_DPLL0:
+ +	case DPLL_ID_ICL_DPLL1:
+  		return CNL_DPLL_ENABLE(id);
+ -	else if (id == DPLL_ID_ICL_TBTPLL)
+ -		return TBT_PLL_ENABLE;
+ -
+ -	return MG_PLL_ENABLE(icl_pll_id_to_tc_port(id));
+ +	case DPLL_ID_ICL_MGPLL1:
+ +	case DPLL_ID_ICL_MGPLL2:
+ +	case DPLL_ID_ICL_MGPLL3:
+ +	case DPLL_ID_ICL_MGPLL4:
+ +		return MG_PLL_ENABLE(icl_mg_pll_id_to_port(id));
+ +	}
+  }
+  
++ static bool mg_pll_get_hw_state(struct drm_i915_private *dev_priv,
++ 				struct intel_shared_dpll *pll,
++ 				struct intel_dpll_hw_state *hw_state)
++ {
++ 	const enum intel_dpll_id id = pll->info->id;
++ 	enum tc_port tc_port = icl_pll_id_to_tc_port(id);
++ 	intel_wakeref_t wakeref;
++ 	bool ret = false;
++ 	u32 val;
++ 
++ 	wakeref = intel_display_power_get_if_enabled(dev_priv,
++ 						     POWER_DOMAIN_PLLS);
++ 	if (!wakeref)
++ 		return false;
++ 
++ 	val = I915_READ(MG_PLL_ENABLE(tc_port));
++ 	if (!(val & PLL_ENABLE))
++ 		goto out;
++ 
++ 	hw_state->mg_refclkin_ctl = I915_READ(MG_REFCLKIN_CTL(tc_port));
++ 	hw_state->mg_refclkin_ctl &= MG_REFCLKIN_CTL_OD_2_MUX_MASK;
++ 
++ 	hw_state->mg_clktop2_coreclkctl1 =
++ 		I915_READ(MG_CLKTOP2_CORECLKCTL1(tc_port));
++ 	hw_state->mg_clktop2_coreclkctl1 &=
++ 		MG_CLKTOP2_CORECLKCTL1_A_DIVRATIO_MASK;
++ 
++ 	hw_state->mg_clktop2_hsclkctl =
++ 		I915_READ(MG_CLKTOP2_HSCLKCTL(tc_port));
++ 	hw_state->mg_clktop2_hsclkctl &=
++ 		MG_CLKTOP2_HSCLKCTL_TLINEDRV_CLKSEL_MASK |
++ 		MG_CLKTOP2_HSCLKCTL_CORE_INPUTSEL_MASK |
++ 		MG_CLKTOP2_HSCLKCTL_HSDIV_RATIO_MASK |
++ 		MG_CLKTOP2_HSCLKCTL_DSDIV_RATIO_MASK;
++ 
++ 	hw_state->mg_pll_div0 = I915_READ(MG_PLL_DIV0(tc_port));
++ 	hw_state->mg_pll_div1 = I915_READ(MG_PLL_DIV1(tc_port));
++ 	hw_state->mg_pll_lf = I915_READ(MG_PLL_LF(tc_port));
++ 	hw_state->mg_pll_frac_lock = I915_READ(MG_PLL_FRAC_LOCK(tc_port));
++ 	hw_state->mg_pll_ssc = I915_READ(MG_PLL_SSC(tc_port));
++ 
++ 	hw_state->mg_pll_bias = I915_READ(MG_PLL_BIAS(tc_port));
++ 	hw_state->mg_pll_tdc_coldst_bias =
++ 		I915_READ(MG_PLL_TDC_COLDST_BIAS(tc_port));
++ 
++ 	if (dev_priv->cdclk.hw.ref == 38400) {
++ 		hw_state->mg_pll_tdc_coldst_bias_mask = MG_PLL_TDC_COLDST_COLDSTART;
++ 		hw_state->mg_pll_bias_mask = 0;
++ 	} else {
++ 		hw_state->mg_pll_tdc_coldst_bias_mask = -1U;
++ 		hw_state->mg_pll_bias_mask = -1U;
++ 	}
++ 
++ 	hw_state->mg_pll_tdc_coldst_bias &= hw_state->mg_pll_tdc_coldst_bias_mask;
++ 	hw_state->mg_pll_bias &= hw_state->mg_pll_bias_mask;
++ 
++ 	ret = true;
++ out:
++ 	intel_display_power_put(dev_priv, POWER_DOMAIN_PLLS, wakeref);
++ 	return ret;
++ }
++ 
+  static bool icl_pll_get_hw_state(struct drm_i915_private *dev_priv,
+  				 struct intel_shared_dpll *pll,
+  				 struct intel_dpll_hw_state *hw_state)
+@@@ -2847,34 -3046,8 +2909,39 @@@
+  	if (!(val & PLL_ENABLE))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	switch (id) {
+ +	case DPLL_ID_ICL_DPLL0:
+ +	case DPLL_ID_ICL_DPLL1:
+ +		hw_state->cfgcr0 = I915_READ(ICL_DPLL_CFGCR0(id));
+ +		hw_state->cfgcr1 = I915_READ(ICL_DPLL_CFGCR1(id));
+ +		break;
+ +	case DPLL_ID_ICL_MGPLL1:
+ +	case DPLL_ID_ICL_MGPLL2:
+ +	case DPLL_ID_ICL_MGPLL3:
+ +	case DPLL_ID_ICL_MGPLL4:
+ +		port = icl_mg_pll_id_to_port(id);
+ +		hw_state->mg_refclkin_ctl = I915_READ(MG_REFCLKIN_CTL(port));
+ +		hw_state->mg_clktop2_coreclkctl1 =
+ +			I915_READ(MG_CLKTOP2_CORECLKCTL1(port));
+ +		hw_state->mg_clktop2_hsclkctl =
+ +			I915_READ(MG_CLKTOP2_HSCLKCTL(port));
+ +		hw_state->mg_pll_div0 = I915_READ(MG_PLL_DIV0(port));
+ +		hw_state->mg_pll_div1 = I915_READ(MG_PLL_DIV1(port));
+ +		hw_state->mg_pll_lf = I915_READ(MG_PLL_LF(port));
+ +		hw_state->mg_pll_frac_lock = I915_READ(MG_PLL_FRAC_LOCK(port));
+ +		hw_state->mg_pll_ssc = I915_READ(MG_PLL_SSC(port));
+ +		hw_state->mg_pll_bias = I915_READ(MG_PLL_BIAS(port));
+ +		hw_state->mg_pll_tdc_coldst_bias =
+ +			I915_READ(MG_PLL_TDC_COLDST_BIAS(port));
+ +		break;
+ +	default:
+ +		MISSING_CASE(id);
+ +	}
+++=======
++ 	hw_state->cfgcr0 = I915_READ(ICL_DPLL_CFGCR0(id));
++ 	hw_state->cfgcr1 = I915_READ(ICL_DPLL_CFGCR1(id));
+++>>>>>>> 510a75a5d2b8 (drm/i915/icl: move MG pll hw_state readout)
+  
+  	ret = true;
+  out:
+@@@ -3034,10 -3232,11 +3107,18 @@@ static const struct intel_shared_dpll_f
+  static const struct dpll_info icl_plls[] = {
+  	{ "DPLL 0",   &icl_pll_funcs, DPLL_ID_ICL_DPLL0,  0 },
+  	{ "DPLL 1",   &icl_pll_funcs, DPLL_ID_ICL_DPLL1,  0 },
+++<<<<<<< HEAD
+ +	{ "MG PLL 1", &icl_pll_funcs, DPLL_ID_ICL_MGPLL1, 0 },
+ +	{ "MG PLL 2", &icl_pll_funcs, DPLL_ID_ICL_MGPLL2, 0 },
+ +	{ "MG PLL 3", &icl_pll_funcs, DPLL_ID_ICL_MGPLL3, 0 },
+ +	{ "MG PLL 4", &icl_pll_funcs, DPLL_ID_ICL_MGPLL4, 0 },
+++=======
++ 	{ "TBT PLL",  &icl_pll_funcs, DPLL_ID_ICL_TBTPLL, 0 },
++ 	{ "MG PLL 1", &mg_pll_funcs, DPLL_ID_ICL_MGPLL1, 0 },
++ 	{ "MG PLL 2", &mg_pll_funcs, DPLL_ID_ICL_MGPLL2, 0 },
++ 	{ "MG PLL 3", &mg_pll_funcs, DPLL_ID_ICL_MGPLL3, 0 },
++ 	{ "MG PLL 4", &mg_pll_funcs, DPLL_ID_ICL_MGPLL4, 0 },
+++>>>>>>> 510a75a5d2b8 (drm/i915/icl: move MG pll hw_state readout)
+  	{ },
+  };
+  
+* Unmerged path drivers/gpu/drm/i915/intel_dpll_mgr.c
