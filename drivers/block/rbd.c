@@ -1327,7 +1327,7 @@ static void rbd_obj_zero_range(struct rbd_obj_request *obj_req, u32 off,
 		zero_bvecs(&obj_req->bvec_pos, off, bytes);
 		break;
 	default:
-		rbd_assert(0);
+		BUG();
 	}
 }
 
@@ -1582,7 +1582,7 @@ static void rbd_obj_request_destroy(struct kref *kref)
 		kfree(obj_request->bvec_pos.bvecs);
 		break;
 	default:
-		rbd_assert(0);
+		BUG();
 	}
 
 	kfree(obj_request->img_extents);
@@ -1782,7 +1782,7 @@ static void rbd_osd_req_setup_data(struct rbd_obj_request *obj_req, u32 which)
 						    &obj_req->bvec_pos);
 		break;
 	default:
-		rbd_assert(0);
+		BUG();
 	}
 }
 
@@ -2037,7 +2037,7 @@ static int __rbd_img_fill_request(struct rbd_img_request *img_req)
 			ret = rbd_obj_setup_zeroout(obj_req);
 			break;
 		default:
-			rbd_assert(0);
+			BUG();
 		}
 		if (ret < 0)
 			return ret;
@@ -2516,7 +2516,7 @@ static int rbd_obj_issue_copyup_ops(struct rbd_obj_request *obj_req, u32 bytes)
 		num_osd_ops += count_zeroout_ops(obj_req);
 		break;
 	default:
-		rbd_assert(0);
+		BUG();
 	}
 
 	obj_req->osd_req = rbd_osd_req_create(obj_req, num_osd_ops);
@@ -2543,7 +2543,7 @@ static int rbd_obj_issue_copyup_ops(struct rbd_obj_request *obj_req, u32 bytes)
 		__rbd_obj_setup_zeroout(obj_req, which);
 		break;
 	default:
-		rbd_assert(0);
+		BUG();
 	}
 
 	ret = ceph_osdc_alloc_messages(obj_req->osd_req, GFP_NOIO);
