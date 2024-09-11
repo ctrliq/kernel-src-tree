@@ -1,0 +1,176 @@
+KVM: arm64: Don't BUG_ON() if emulated register table is unsorted
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Alexandru Elisei <alexandru.elisei@arm.com>
+commit f1f0c0cfeaa7c10eb536d9919bf3902af0e17bce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f1f0c0cf.failed
+
+To emulate a register access, KVM uses a table of registers sorted by
+register encoding to speed up queries using binary search.
+
+When Linux boots, KVM checks that the table is sorted and uses a BUG_ON()
+statement to let the user know if it's not. The unfortunate side effect is
+that an unsorted sysreg table brings down the whole kernel, not just KVM,
+even though the rest of the kernel can function just fine without KVM. To
+make matters worse, on machines which lack a serial console, the user is
+left pondering why the machine is taking so long to boot.
+
+Improve this situation by returning an error from kvm_arch_init() if the
+sysreg tables are not in the correct order. The machine is still very much
+usable for the user, with the exception of virtualization, who can now
+easily determine what went wrong.
+
+A minor typo has also been corrected in the check_sysreg_table() function.
+
+	Signed-off-by: Alexandru Elisei <alexandru.elisei@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20220428103405.70884-2-alexandru.elisei@arm.com
+(cherry picked from commit f1f0c0cfeaa7c10eb536d9919bf3902af0e17bce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_host.h
+#	arch/arm64/kvm/arm.c
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 904c61e9d332,39ca91cc1f01..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -514,6 -677,17 +514,20 @@@ void force_vm_exit(const cpumask_t *mas
+  int handle_exit(struct kvm_vcpu *vcpu, int exception_index);
+  void handle_exit_early(struct kvm_vcpu *vcpu, int exception_index);
+  
+++<<<<<<< HEAD
+++=======
++ int kvm_handle_cp14_load_store(struct kvm_vcpu *vcpu);
++ int kvm_handle_cp14_32(struct kvm_vcpu *vcpu);
++ int kvm_handle_cp14_64(struct kvm_vcpu *vcpu);
++ int kvm_handle_cp15_32(struct kvm_vcpu *vcpu);
++ int kvm_handle_cp15_64(struct kvm_vcpu *vcpu);
++ int kvm_handle_sys_reg(struct kvm_vcpu *vcpu);
++ 
++ void kvm_reset_sys_regs(struct kvm_vcpu *vcpu);
++ 
++ int kvm_sys_reg_table_init(void);
++ 
+++>>>>>>> f1f0c0cfeaa7 (KVM: arm64: Don't BUG_ON() if emulated register table is unsorted)
+  /* MMIO helpers */
+  void kvm_mmio_write_buf(void *buf, unsigned int len, unsigned long data);
+  unsigned long kvm_mmio_read_buf(const void *buf, unsigned int len);
+diff --cc arch/arm64/kvm/arm.c
+index 60a64e83f8da,ab365358747a..000000000000
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@@ -1482,11 -1759,11 +1482,15 @@@ static int init_subsystems(void
+  	if (err)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	kvm_perf_init();
+ +	kvm_coproc_table_init();
+++=======
++ 	kvm_register_perf_callbacks(NULL);
+++>>>>>>> f1f0c0cfeaa7 (KVM: arm64: Don't BUG_ON() if emulated register table is unsorted)
+  
+  out:
+ -	if (err || !is_protected_kvm_enabled())
+ -		on_each_cpu(_kvm_arch_hardware_disable, NULL, 1);
+ +	on_each_cpu(_kvm_arch_hardware_disable, NULL, 1);
+  
+  	return err;
+  }
+@@@ -1677,6 -2087,14 +1681,17 @@@ int kvm_arch_init(void *opaque
+  		return -ENODEV;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	err = kvm_sys_reg_table_init();
++ 	if (err) {
++ 		kvm_info("Error initializing system register tables");
++ 		return err;
++ 	}
++ 
++ 	in_hyp_mode = is_kernel_in_hyp_mode();
++ 
+++>>>>>>> f1f0c0cfeaa7 (KVM: arm64: Don't BUG_ON() if emulated register table is unsorted)
+  	if (cpus_have_final_cap(ARM64_WORKAROUND_DEVICE_LOAD_ACQUIRE) ||
+  	    cpus_have_final_cap(ARM64_WORKAROUND_1508412))
+  		kvm_info("Guests without required CPU erratum workarounds can deadlock system!\n" \
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+* Unmerged path arch/arm64/kvm/arm.c
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index 5de2df33fc42..af45a7e902df 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -2169,25 +2169,24 @@ static const struct sys_reg_desc cp15_64_regs[] = {
+ 	{ SYS_DESC(SYS_AARCH32_CNTP_CVAL),    access_arch_timer },
+ };
+ 
+-static int check_sysreg_table(const struct sys_reg_desc *table, unsigned int n,
+-			      bool is_32)
++static bool check_sysreg_table(const struct sys_reg_desc *table, unsigned int n,
++			       bool is_32)
+ {
+ 	unsigned int i;
+ 
+ 	for (i = 0; i < n; i++) {
+ 		if (!is_32 && table[i].reg && !table[i].reset) {
+-			kvm_err("sys_reg table %p entry %d has lacks reset\n",
+-				table, i);
+-			return 1;
++			kvm_err("sys_reg table %p entry %d lacks reset\n", table, i);
++			return false;
+ 		}
+ 
+ 		if (i && cmp_sys_reg(&table[i-1], &table[i]) >= 0) {
+ 			kvm_err("sys_reg table %p out of order (%d)\n", table, i - 1);
+-			return 1;
++			return false;
+ 		}
+ 	}
+ 
+-	return 0;
++	return true;
+ }
+ 
+ static int match_sys_reg(const void *key, const void *elt)
+@@ -2870,18 +2869,22 @@ int kvm_arm_copy_sys_reg_indices(struct kvm_vcpu *vcpu, u64 __user *uindices)
+ 	return write_demux_regids(uindices);
+ }
+ 
+-void kvm_sys_reg_table_init(void)
++int kvm_sys_reg_table_init(void)
+ {
++	bool valid = true;
+ 	unsigned int i;
+ 	struct sys_reg_desc clidr;
+ 
+ 	/* Make sure tables are unique and in order. */
+-	BUG_ON(check_sysreg_table(sys_reg_descs, ARRAY_SIZE(sys_reg_descs), false));
+-	BUG_ON(check_sysreg_table(cp14_regs, ARRAY_SIZE(cp14_regs), true));
+-	BUG_ON(check_sysreg_table(cp14_64_regs, ARRAY_SIZE(cp14_64_regs), true));
+-	BUG_ON(check_sysreg_table(cp15_regs, ARRAY_SIZE(cp15_regs), true));
+-	BUG_ON(check_sysreg_table(cp15_64_regs, ARRAY_SIZE(cp15_64_regs), true));
+-	BUG_ON(check_sysreg_table(invariant_sys_regs, ARRAY_SIZE(invariant_sys_regs), false));
++	valid &= check_sysreg_table(sys_reg_descs, ARRAY_SIZE(sys_reg_descs), false);
++	valid &= check_sysreg_table(cp14_regs, ARRAY_SIZE(cp14_regs), true);
++	valid &= check_sysreg_table(cp14_64_regs, ARRAY_SIZE(cp14_64_regs), true);
++	valid &= check_sysreg_table(cp15_regs, ARRAY_SIZE(cp15_regs), true);
++	valid &= check_sysreg_table(cp15_64_regs, ARRAY_SIZE(cp15_64_regs), true);
++	valid &= check_sysreg_table(invariant_sys_regs, ARRAY_SIZE(invariant_sys_regs), false);
++
++	if (!valid)
++		return -EINVAL;
+ 
+ 	/* We abuse the reset function to overwrite the table itself. */
+ 	for (i = 0; i < ARRAY_SIZE(invariant_sys_regs); i++)
+@@ -2904,4 +2907,6 @@ void kvm_sys_reg_table_init(void)
+ 			break;
+ 	/* Clear all higher bits. */
+ 	cache_levels &= (1 << (i*3))-1;
++
++	return 0;
+ }
