@@ -1,0 +1,1039 @@
+cifs: minor kernel style fixes for comments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Steve French <stfrench@microsoft.com>
+commit bc04499477d9f01034c2afb6097e835c705ac3bd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/bc044994.failed
+
+Trivial fix for a few comments which didn't follow kernel style
+
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit bc04499477d9f01034c2afb6097e835c705ac3bd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/connect.c
+diff --cc fs/cifs/connect.c
+index aef3c1f69972,ec80b6c3e20f..000000000000
+--- a/fs/cifs/connect.c
++++ b/fs/cifs/connect.c
+@@@ -1174,996 -1024,9 +1174,1002 @@@ next_pdu
+  	module_put_and_exit(0);
+  }
+  
+++<<<<<<< HEAD
+ +/* extract the host portion of the UNC string */
+ +static char *
+ +extract_hostname(const char *unc)
+ +{
+ +	const char *src;
+ +	char *dst, *delim;
+ +	unsigned int len;
+ +
+ +	/* skip double chars at beginning of string */
+ +	/* BB: check validity of these bytes? */
+ +	if (strlen(unc) < 3)
+ +		return ERR_PTR(-EINVAL);
+ +	for (src = unc; *src && *src == '\\'; src++)
+ +		;
+ +	if (!*src)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	/* delimiter between hostname and sharename is always '\\' now */
+ +	delim = strchr(src, '\\');
+ +	if (!delim)
+ +		return ERR_PTR(-EINVAL);
+ +
+ +	len = delim - src;
+ +	dst = kmalloc((len + 1), GFP_KERNEL);
+ +	if (dst == NULL)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	memcpy(dst, src, len);
+ +	dst[len] = '\0';
+ +
+ +	return dst;
+ +}
+ +
+ +static int get_option_ul(substring_t args[], unsigned long *option)
+ +{
+ +	int rc;
+ +	char *string;
+ +
+ +	string = match_strdup(args);
+ +	if (string == NULL)
+ +		return -ENOMEM;
+ +	rc = kstrtoul(string, 0, option);
+ +	kfree(string);
+ +
+ +	return rc;
+ +}
+ +
+ +static int get_option_uid(substring_t args[], kuid_t *result)
+ +{
+ +	unsigned long value;
+ +	kuid_t uid;
+ +	int rc;
+ +
+ +	rc = get_option_ul(args, &value);
+ +	if (rc)
+ +		return rc;
+ +
+ +	uid = make_kuid(current_user_ns(), value);
+ +	if (!uid_valid(uid))
+ +		return -EINVAL;
+ +
+ +	*result = uid;
+ +	return 0;
+ +}
+ +
+ +static int get_option_gid(substring_t args[], kgid_t *result)
+ +{
+ +	unsigned long value;
+ +	kgid_t gid;
+ +	int rc;
+ +
+ +	rc = get_option_ul(args, &value);
+ +	if (rc)
+ +		return rc;
+ +
+ +	gid = make_kgid(current_user_ns(), value);
+ +	if (!gid_valid(gid))
+ +		return -EINVAL;
+ +
+ +	*result = gid;
+ +	return 0;
+ +}
+ +
+ +static int
+ +cifs_parse_mount_options(const char *mountdata, const char *devname,
+ +			 struct smb3_fs_context *ctx, bool is_smb3)
+ +{
+ +	char *data, *end;
+ +	char *mountdata_copy = NULL, *options;
+ +	unsigned int  temp_len, i, j;
+ +	char separator[2];
+ +	short int override_uid = -1;
+ +	short int override_gid = -1;
+ +	bool uid_specified = false;
+ +	bool gid_specified = false;
+ +	bool sloppy = false;
+ +	char *invalid = NULL;
+ +	char *nodename = utsname()->nodename;
+ +	char *string = NULL;
+ +	char *tmp_end, *value;
+ +	char delim;
+ +	bool got_ip = false;
+ +	bool got_version = false;
+ +	unsigned short port = 0;
+ +	struct sockaddr *dstaddr = (struct sockaddr *)&ctx->dstaddr;
+ +
+ +	separator[0] = ',';
+ +	separator[1] = 0;
+ +	delim = separator[0];
+ +
+ +	/* ensure we always start with zeroed-out ctx */
+ +	memset(ctx, 0, sizeof(*ctx));
+ +
+ +	/*
+ +	 * does not have to be perfect mapping since field is
+ +	 * informational, only used for servers that do not support
+ +	 * port 445 and it can be overridden at mount time
+ +	 */
+ +	memset(ctx->source_rfc1001_name, 0x20, RFC1001_NAME_LEN);
+ +	for (i = 0; i < strnlen(nodename, RFC1001_NAME_LEN); i++)
+ +		ctx->source_rfc1001_name[i] = toupper(nodename[i]);
+ +
+ +	ctx->source_rfc1001_name[RFC1001_NAME_LEN] = 0;
+ +	/* null target name indicates to use *SMBSERVR default called name
+ +	   if we end up sending RFC1001 session initialize */
+ +	ctx->target_rfc1001_name[0] = 0;
+ +	ctx->cred_uid = current_uid();
+ +	ctx->linux_uid = current_uid();
+ +	ctx->linux_gid = current_gid();
+ +	ctx->bsize = 1024 * 1024; /* can improve cp performance significantly */
+ +	/*
+ +	 * default to SFM style remapping of seven reserved characters
+ +	 * unless user overrides it or we negotiate CIFS POSIX where
+ +	 * it is unnecessary.  Can not simultaneously use more than one mapping
+ +	 * since then readdir could list files that open could not open
+ +	 */
+ +	ctx->remap = true;
+ +
+ +	/* default to only allowing write access to owner of the mount */
+ +	ctx->dir_mode = ctx->file_mode = S_IRUGO | S_IXUGO | S_IWUSR;
+ +
+ +	/* ctx->retry default is 0 (i.e. "soft" limited retry not hard retry) */
+ +	/* default is always to request posix paths. */
+ +	ctx->posix_paths = 1;
+ +	/* default to using server inode numbers where available */
+ +	ctx->server_ino = 1;
+ +
+ +	/* default is to use strict cifs caching semantics */
+ +	ctx->strict_io = true;
+ +
+ +	ctx->actimeo = CIFS_DEF_ACTIMEO;
+ +
+ +	/* Most clients set timeout to 0, allows server to use its default */
+ +	ctx->handle_timeout = 0; /* See MS-SMB2 spec section 2.2.14.2.12 */
+ +
+ +	/* offer SMB2.1 and later (SMB3 etc). Secure and widely accepted */
+ +	ctx->ops = &smb30_operations;
+ +	ctx->vals = &smbdefault_values;
+ +
+ +	ctx->echo_interval = SMB_ECHO_INTERVAL_DEFAULT;
+ +
+ +	/* default to no multichannel (single server connection) */
+ +	ctx->multichannel = false;
+ +	ctx->max_channels = 1;
+ +
+ +	if (!mountdata)
+ +		goto cifs_parse_mount_err;
+ +
+ +	mountdata_copy = kstrndup(mountdata, PAGE_SIZE, GFP_KERNEL);
+ +	if (!mountdata_copy)
+ +		goto cifs_parse_mount_err;
+ +
+ +	options = mountdata_copy;
+ +	end = options + strlen(options);
+ +
+ +	if (strncmp(options, "sep=", 4) == 0) {
+ +		if (options[4] != 0) {
+ +			separator[0] = options[4];
+ +			options += 5;
+ +		} else {
+ +			cifs_dbg(FYI, "Null separator not allowed\n");
+ +		}
+ +	}
+ +	ctx->backupuid_specified = false; /* no backup intent for a user */
+ +	ctx->backupgid_specified = false; /* no backup intent for a group */
+ +
+ +	switch (smb3_parse_devname(devname, ctx)) {
+ +	case 0:
+ +		break;
+ +	case -ENOMEM:
+ +		cifs_dbg(VFS, "Unable to allocate memory for devname\n");
+ +		goto cifs_parse_mount_err;
+ +	case -EINVAL:
+ +		cifs_dbg(VFS, "Malformed UNC in devname\n");
+ +		goto cifs_parse_mount_err;
+ +	default:
+ +		cifs_dbg(VFS, "Unknown error parsing devname\n");
+ +		goto cifs_parse_mount_err;
+ +	}
+ +
+ +	while ((data = strsep(&options, separator)) != NULL) {
+ +		substring_t args[MAX_OPT_ARGS];
+ +		unsigned long option;
+ +		int token;
+ +
+ +		if (!*data)
+ +			continue;
+ +
+ +		token = match_token(data, cifs_mount_option_tokens, args);
+ +
+ +		switch (token) {
+ +
+ +		/* Ingnore the following */
+ +		case Opt_ignore:
+ +			break;
+ +
+ +		/* Boolean values */
+ +		case Opt_user_xattr:
+ +			ctx->no_xattr = 0;
+ +			break;
+ +		case Opt_nouser_xattr:
+ +			ctx->no_xattr = 1;
+ +			break;
+ +		case Opt_forceuid:
+ +			override_uid = 1;
+ +			break;
+ +		case Opt_noforceuid:
+ +			override_uid = 0;
+ +			break;
+ +		case Opt_forcegid:
+ +			override_gid = 1;
+ +			break;
+ +		case Opt_noforcegid:
+ +			override_gid = 0;
+ +			break;
+ +		case Opt_noblocksend:
+ +			ctx->noblocksnd = 1;
+ +			break;
+ +		case Opt_noautotune:
+ +			ctx->noautotune = 1;
+ +			break;
+ +		case Opt_nolease:
+ +			ctx->no_lease = 1;
+ +			break;
+ +		case Opt_hard:
+ +			ctx->retry = 1;
+ +			break;
+ +		case Opt_soft:
+ +			ctx->retry = 0;
+ +			break;
+ +		case Opt_perm:
+ +			ctx->noperm = 0;
+ +			break;
+ +		case Opt_noperm:
+ +			ctx->noperm = 1;
+ +			break;
+ +		case Opt_nodelete:
+ +			ctx->nodelete = 1;
+ +			break;
+ +		case Opt_mapchars:
+ +			ctx->sfu_remap = true;
+ +			ctx->remap = false; /* disable SFM mapping */
+ +			break;
+ +		case Opt_nomapchars:
+ +			ctx->sfu_remap = false;
+ +			break;
+ +		case Opt_mapposix:
+ +			ctx->remap = true;
+ +			ctx->sfu_remap = false; /* disable SFU mapping */
+ +			break;
+ +		case Opt_nomapposix:
+ +			ctx->remap = false;
+ +			break;
+ +		case Opt_sfu:
+ +			ctx->sfu_emul = 1;
+ +			break;
+ +		case Opt_nosfu:
+ +			ctx->sfu_emul = 0;
+ +			break;
+ +		case Opt_nodfs:
+ +			ctx->nodfs = 1;
+ +			break;
+ +		case Opt_rootfs:
+ +#ifdef CONFIG_CIFS_ROOT
+ +			ctx->rootfs = true;
+ +#endif
+ +			break;
+ +		case Opt_posixpaths:
+ +			ctx->posix_paths = 1;
+ +			break;
+ +		case Opt_noposixpaths:
+ +			ctx->posix_paths = 0;
+ +			break;
+ +		case Opt_nounix:
+ +			if (ctx->linux_ext)
+ +				cifs_dbg(VFS,
+ +					"conflicting unix mount options\n");
+ +			ctx->no_linux_ext = 1;
+ +			break;
+ +		case Opt_unix:
+ +			if (ctx->no_linux_ext)
+ +				cifs_dbg(VFS,
+ +					"conflicting unix mount options\n");
+ +			ctx->linux_ext = 1;
+ +			break;
+ +		case Opt_nocase:
+ +			ctx->nocase = 1;
+ +			break;
+ +		case Opt_brl:
+ +			ctx->nobrl =  0;
+ +			break;
+ +		case Opt_nobrl:
+ +			ctx->nobrl =  1;
+ +			/*
+ +			 * turn off mandatory locking in mode
+ +			 * if remote locking is turned off since the
+ +			 * local vfs will do advisory
+ +			 */
+ +			if (ctx->file_mode ==
+ +				(S_IALLUGO & ~(S_ISUID | S_IXGRP)))
+ +				ctx->file_mode = S_IALLUGO;
+ +			break;
+ +		case Opt_nohandlecache:
+ +			ctx->nohandlecache = 1;
+ +			break;
+ +		case Opt_handlecache:
+ +			ctx->nohandlecache = 0;
+ +			break;
+ +		case Opt_forcemandatorylock:
+ +			ctx->mand_lock = 1;
+ +			break;
+ +		case Opt_setuids:
+ +			ctx->setuids = 1;
+ +			break;
+ +		case Opt_nosetuids:
+ +			ctx->setuids = 0;
+ +			break;
+ +		case Opt_setuidfromacl:
+ +			ctx->setuidfromacl = 1;
+ +			break;
+ +		case Opt_dynperm:
+ +			ctx->dynperm = true;
+ +			break;
+ +		case Opt_nodynperm:
+ +			ctx->dynperm = false;
+ +			break;
+ +		case Opt_nohard:
+ +			ctx->retry = 0;
+ +			break;
+ +		case Opt_nosoft:
+ +			ctx->retry = 1;
+ +			break;
+ +		case Opt_nointr:
+ +			ctx->intr = 0;
+ +			break;
+ +		case Opt_intr:
+ +			ctx->intr = 1;
+ +			break;
+ +		case Opt_nostrictsync:
+ +			ctx->nostrictsync = 1;
+ +			break;
+ +		case Opt_strictsync:
+ +			ctx->nostrictsync = 0;
+ +			break;
+ +		case Opt_serverino:
+ +			ctx->server_ino = 1;
+ +			break;
+ +		case Opt_noserverino:
+ +			ctx->server_ino = 0;
+ +			break;
+ +		case Opt_rwpidforward:
+ +			ctx->rwpidforward = 1;
+ +			break;
+ +		case Opt_modesid:
+ +			ctx->mode_ace = 1;
+ +			break;
+ +		case Opt_cifsacl:
+ +			ctx->cifs_acl = 1;
+ +			break;
+ +		case Opt_nocifsacl:
+ +			ctx->cifs_acl = 0;
+ +			break;
+ +		case Opt_acl:
+ +			ctx->no_psx_acl = 0;
+ +			break;
+ +		case Opt_noacl:
+ +			ctx->no_psx_acl = 1;
+ +			break;
+ +		case Opt_locallease:
+ +			ctx->local_lease = 1;
+ +			break;
+ +		case Opt_sign:
+ +			ctx->sign = true;
+ +			break;
+ +		case Opt_ignore_signature:
+ +			ctx->sign = true;
+ +			ctx->ignore_signature = true;
+ +			break;
+ +		case Opt_seal:
+ +			/* we do not do the following in secFlags because seal
+ +			 * is a per tree connection (mount) not a per socket
+ +			 * or per-smb connection option in the protocol
+ +			 * ctx->secFlg |= CIFSSEC_MUST_SEAL;
+ +			 */
+ +			ctx->seal = 1;
+ +			break;
+ +		case Opt_noac:
+ +			pr_warn("Mount option noac not supported. Instead set /proc/fs/cifs/LookupCacheEnabled to 0\n");
+ +			break;
+ +		case Opt_fsc:
+ +#ifndef CONFIG_CIFS_FSCACHE
+ +			cifs_dbg(VFS, "FS-Cache support needs CONFIG_CIFS_FSCACHE kernel config option set\n");
+ +			goto cifs_parse_mount_err;
+ +#endif
+ +			ctx->fsc = true;
+ +			break;
+ +		case Opt_mfsymlinks:
+ +			ctx->mfsymlinks = true;
+ +			break;
+ +		case Opt_multiuser:
+ +			ctx->multiuser = true;
+ +			break;
+ +		case Opt_sloppy:
+ +			sloppy = true;
+ +			break;
+ +		case Opt_nosharesock:
+ +			ctx->nosharesock = true;
+ +			break;
+ +		case Opt_nopersistent:
+ +			ctx->nopersistent = true;
+ +			if (ctx->persistent) {
+ +				cifs_dbg(VFS,
+ +				  "persistenthandles mount options conflict\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_persistent:
+ +			ctx->persistent = true;
+ +			if ((ctx->nopersistent) || (ctx->resilient)) {
+ +				cifs_dbg(VFS,
+ +				  "persistenthandles mount options conflict\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_resilient:
+ +			ctx->resilient = true;
+ +			if (ctx->persistent) {
+ +				cifs_dbg(VFS,
+ +				  "persistenthandles mount options conflict\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_noresilient:
+ +			ctx->resilient = false; /* already the default */
+ +			break;
+ +		case Opt_domainauto:
+ +			ctx->domainauto = true;
+ +			break;
+ +		case Opt_rdma:
+ +			ctx->rdma = true;
+ +			break;
+ +		case Opt_multichannel:
+ +			ctx->multichannel = true;
+ +			/* if number of channels not specified, default to 2 */
+ +			if (ctx->max_channels < 2)
+ +				ctx->max_channels = 2;
+ +			break;
+ +		case Opt_nomultichannel:
+ +			ctx->multichannel = false;
+ +			ctx->max_channels = 1;
+ +			break;
+ +		case Opt_compress:
+ +			ctx->compression = UNKNOWN_TYPE;
+ +			cifs_dbg(VFS,
+ +				"SMB3 compression support is experimental\n");
+ +			break;
+ +
+ +		/* Numeric Values */
+ +		case Opt_backupuid:
+ +			if (get_option_uid(args, &ctx->backupuid)) {
+ +				cifs_dbg(VFS, "%s: Invalid backupuid value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->backupuid_specified = true;
+ +			break;
+ +		case Opt_backupgid:
+ +			if (get_option_gid(args, &ctx->backupgid)) {
+ +				cifs_dbg(VFS, "%s: Invalid backupgid value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->backupgid_specified = true;
+ +			break;
+ +		case Opt_uid:
+ +			if (get_option_uid(args, &ctx->linux_uid)) {
+ +				cifs_dbg(VFS, "%s: Invalid uid value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			uid_specified = true;
+ +			break;
+ +		case Opt_cruid:
+ +			if (get_option_uid(args, &ctx->cred_uid)) {
+ +				cifs_dbg(VFS, "%s: Invalid cruid value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_gid:
+ +			if (get_option_gid(args, &ctx->linux_gid)) {
+ +				cifs_dbg(VFS, "%s: Invalid gid value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			gid_specified = true;
+ +			break;
+ +		case Opt_file_mode:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid file_mode value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->file_mode = option;
+ +			break;
+ +		case Opt_dirmode:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid dir_mode value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->dir_mode = option;
+ +			break;
+ +		case Opt_port:
+ +			if (get_option_ul(args, &option) ||
+ +			    option > USHRT_MAX) {
+ +				cifs_dbg(VFS, "%s: Invalid port value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			port = (unsigned short)option;
+ +			break;
+ +		case Opt_min_enc_offload:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "Invalid minimum encrypted read offload size (esize)\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->min_offload = option;
+ +			break;
+ +		case Opt_blocksize:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid blocksize value\n",
+ +					__func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			/*
+ +			 * inode blocksize realistically should never need to be
+ +			 * less than 16K or greater than 16M and default is 1MB.
+ +			 * Note that small inode block sizes (e.g. 64K) can lead
+ +			 * to very poor performance of common tools like cp and scp
+ +			 */
+ +			if ((option < CIFS_MAX_MSGSIZE) ||
+ +			   (option > (4 * SMB3_DEFAULT_IOSIZE))) {
+ +				cifs_dbg(VFS, "%s: Invalid blocksize\n",
+ +					__func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->bsize = option;
+ +			break;
+ +		case Opt_rsize:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid rsize value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->rsize = option;
+ +			break;
+ +		case Opt_wsize:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid wsize value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->wsize = option;
+ +			break;
+ +		case Opt_actimeo:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid actimeo value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->actimeo = HZ * option;
+ +			if (ctx->actimeo > CIFS_MAX_ACTIMEO) {
+ +				cifs_dbg(VFS, "attribute cache timeout too large\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_handletimeout:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid handletimeout value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->handle_timeout = option;
+ +			if (ctx->handle_timeout > SMB3_MAX_HANDLE_TIMEOUT) {
+ +				cifs_dbg(VFS, "Invalid handle cache timeout, longer than 16 minutes\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_echo_interval:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid echo interval value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->echo_interval = option;
+ +			break;
+ +		case Opt_snapshot:
+ +			if (get_option_ul(args, &option)) {
+ +				cifs_dbg(VFS, "%s: Invalid snapshot time\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->snapshot_time = option;
+ +			break;
+ +		case Opt_max_credits:
+ +			if (get_option_ul(args, &option) || (option < 20) ||
+ +			    (option > 60000)) {
+ +				cifs_dbg(VFS, "%s: Invalid max_credits value\n",
+ +					 __func__);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->max_credits = option;
+ +			break;
+ +		case Opt_max_channels:
+ +			if (get_option_ul(args, &option) || option < 1 ||
+ +				option > CIFS_MAX_CHANNELS) {
+ +				cifs_dbg(VFS, "%s: Invalid max_channels value, needs to be 1-%d\n",
+ +					 __func__, CIFS_MAX_CHANNELS);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			ctx->max_channels = option;
+ +			break;
+ +
+ +		/* String Arguments */
+ +
+ +		case Opt_blank_user:
+ +			/* null user, ie. anonymous authentication */
+ +			ctx->nullauth = 1;
+ +			ctx->username = NULL;
+ +			break;
+ +		case Opt_user:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (strnlen(string, CIFS_MAX_USERNAME_LEN) >
+ +							CIFS_MAX_USERNAME_LEN) {
+ +				pr_warn("username too long\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +
+ +			kfree(ctx->username);
+ +			ctx->username = kstrdup(string, GFP_KERNEL);
+ +			if (!ctx->username)
+ +				goto cifs_parse_mount_err;
+ +			break;
+ +		case Opt_blank_pass:
+ +			/* passwords have to be handled differently
+ +			 * to allow the character used for deliminator
+ +			 * to be passed within them
+ +			 */
+ +
+ +			/*
+ +			 * Check if this is a case where the  password
+ +			 * starts with a delimiter
+ +			 */
+ +			tmp_end = strchr(data, '=');
+ +			tmp_end++;
+ +			if (!(tmp_end < end && tmp_end[1] == delim)) {
+ +				/* No it is not. Set the password to NULL */
+ +				kfree_sensitive(ctx->password);
+ +				ctx->password = NULL;
+ +				break;
+ +			}
+ +			/* Fallthrough - to Opt_pass below.*/
+ +		case Opt_pass:
+ +			/* Obtain the value string */
+ +			value = strchr(data, '=');
+ +			value++;
+ +
+ +			/* Set tmp_end to end of the string */
+ +			tmp_end = (char *) value + strlen(value);
+ +
+ +			/* Check if following character is the deliminator
+ +			 * If yes, we have encountered a double deliminator
+ +			 * reset the NULL character to the deliminator
+ +			 */
+ +			if (tmp_end < end && tmp_end[1] == delim) {
+ +				tmp_end[0] = delim;
+ +
+ +				/* Keep iterating until we get to a single
+ +				 * deliminator OR the end
+ +				 */
+ +				while ((tmp_end = strchr(tmp_end, delim))
+ +					!= NULL && (tmp_end[1] == delim)) {
+ +						tmp_end = (char *) &tmp_end[2];
+ +				}
+ +
+ +				/* Reset var options to point to next element */
+ +				if (tmp_end) {
+ +					tmp_end[0] = '\0';
+ +					options = (char *) &tmp_end[1];
+ +				} else
+ +					/* Reached the end of the mount option
+ +					 * string */
+ +					options = end;
+ +			}
+ +
+ +			kfree_sensitive(ctx->password);
+ +			/* Now build new password string */
+ +			temp_len = strlen(value);
+ +			ctx->password = kzalloc(temp_len+1, GFP_KERNEL);
+ +			if (ctx->password == NULL) {
+ +				pr_warn("no memory for password\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +
+ +			for (i = 0, j = 0; i < temp_len; i++, j++) {
+ +				ctx->password[j] = value[i];
+ +				if ((value[i] == delim) &&
+ +				     value[i+1] == delim)
+ +					/* skip the second deliminator */
+ +					i++;
+ +			}
+ +			ctx->password[j] = '\0';
+ +			break;
+ +		case Opt_blank_ip:
+ +			/* FIXME: should this be an error instead? */
+ +			got_ip = false;
+ +			break;
+ +		case Opt_ip:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (!cifs_convert_address(dstaddr, string,
+ +					strlen(string))) {
+ +				pr_err("bad ip= option (%s)\n", string);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			got_ip = true;
+ +			break;
+ +		case Opt_domain:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (strnlen(string, CIFS_MAX_DOMAINNAME_LEN)
+ +					== CIFS_MAX_DOMAINNAME_LEN) {
+ +				pr_warn("domain name too long\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +
+ +			kfree(ctx->domainname);
+ +			ctx->domainname = kstrdup(string, GFP_KERNEL);
+ +			if (!ctx->domainname) {
+ +				pr_warn("no memory for domainname\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			cifs_dbg(FYI, "Domain name set\n");
+ +			break;
+ +		case Opt_srcaddr:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (!cifs_convert_address(
+ +					(struct sockaddr *)&ctx->srcaddr,
+ +					string, strlen(string))) {
+ +				pr_warn("Could not parse srcaddr: %s\n",
+ +					string);
+ +				goto cifs_parse_mount_err;
+ +			}
+ +			break;
+ +		case Opt_iocharset:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (strnlen(string, 1024) >= 65) {
+ +				pr_warn("iocharset name too long\n");
+ +				goto cifs_parse_mount_err;
+ +			}
+ +
+ +			 if (strncasecmp(string, "default", 7) != 0) {
+ +				kfree(ctx->iocharset);
+ +				ctx->iocharset = kstrdup(string,
+ +							 GFP_KERNEL);
+ +				if (!ctx->iocharset) {
+ +					pr_warn("no memory for charset\n");
+ +					goto cifs_parse_mount_err;
+ +				}
+ +			}
+ +			/* if iocharset not set then load_nls_default
+ +			 * is used by caller
+ +			 */
+ +			 cifs_dbg(FYI, "iocharset set to %s\n", string);
+ +			break;
+ +		case Opt_netbiosname:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			memset(ctx->source_rfc1001_name, 0x20,
+ +				RFC1001_NAME_LEN);
+ +			/*
+ +			 * FIXME: are there cases in which a comma can
+ +			 * be valid in workstation netbios name (and
+ +			 * need special handling)?
+ +			 */
+ +			for (i = 0; i < RFC1001_NAME_LEN; i++) {
+ +				/* don't ucase netbiosname for user */
+ +				if (string[i] == 0)
+ +					break;
+ +				ctx->source_rfc1001_name[i] = string[i];
+ +			}
+ +			/* The string has 16th byte zero still from
+ +			 * set at top of the function
+ +			 */
+ +			if (i == RFC1001_NAME_LEN && string[i] != 0)
+ +				pr_warn("netbiosname longer than 15 truncated\n");
+ +			break;
+ +		case Opt_servern:
+ +			/* servernetbiosname specified override *SMBSERVER */
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			/* last byte, type, is 0x20 for servr type */
+ +			memset(ctx->target_rfc1001_name, 0x20,
+ +				RFC1001_NAME_LEN_WITH_NULL);
+ +
+ +			/* BB are there cases in which a comma can be
+ +			   valid in this workstation netbios name
+ +			   (and need special handling)? */
+ +
+ +			/* user or mount helper must uppercase the
+ +			   netbios name */
+ +			for (i = 0; i < 15; i++) {
+ +				if (string[i] == 0)
+ +					break;
+ +				ctx->target_rfc1001_name[i] = string[i];
+ +			}
+ +			/* The string has 16th byte zero still from
+ +			   set at top of the function  */
+ +			if (i == RFC1001_NAME_LEN && string[i] != 0)
+ +				pr_warn("server netbiosname longer than 15 truncated\n");
+ +			break;
+ +		case Opt_ver:
+ +			/* version of mount userspace tools, not dialect */
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			/* If interface changes in mount.cifs bump to new ver */
+ +			if (strncasecmp(string, "1", 1) == 0) {
+ +				if (strlen(string) > 1) {
+ +					pr_warn("Bad mount helper ver=%s. Did you want SMB1 (CIFS) dialect and mean to type vers=1.0 instead?\n",
+ +						string);
+ +					goto cifs_parse_mount_err;
+ +				}
+ +				/* This is the default */
+ +				break;
+ +			}
+ +			/* For all other value, error */
+ +			pr_warn("Invalid mount helper version specified\n");
+ +			goto cifs_parse_mount_err;
+ +		case Opt_vers:
+ +			/* protocol version (dialect) */
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (cifs_parse_smb_version(string, ctx, is_smb3) != 0)
+ +				goto cifs_parse_mount_err;
+ +			got_version = true;
+ +			break;
+ +		case Opt_sec:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (cifs_parse_security_flavors(string, ctx) != 0)
+ +				goto cifs_parse_mount_err;
+ +			break;
+ +		case Opt_cache:
+ +			string = match_strdup(args);
+ +			if (string == NULL)
+ +				goto out_nomem;
+ +
+ +			if (cifs_parse_cache_flavor(string, ctx) != 0)
+ +				goto cifs_parse_mount_err;
+ +			break;
+ +		default:
+ +			/*
+ +			 * An option we don't recognize. Save it off for later
+ +			 * if we haven't already found one
+ +			 */
+ +			if (!invalid)
+ +				invalid = data;
+ +			break;
+ +		}
+ +		/* Free up any allocated string */
+ +		kfree(string);
+ +		string = NULL;
+ +	}
+ +
+ +	if (!sloppy && invalid) {
+ +		pr_err("Unknown mount option \"%s\"\n", invalid);
+ +		goto cifs_parse_mount_err;
+ +	}
+ +
+ +	if (ctx->rdma && ctx->vals->protocol_id < SMB30_PROT_ID) {
+ +		cifs_dbg(VFS, "SMB Direct requires Version >=3.0\n");
+ +		goto cifs_parse_mount_err;
+ +	}
+ +
+ +#ifndef CONFIG_KEYS
+ +	/* Muliuser mounts require CONFIG_KEYS support */
+ +	if (ctx->multiuser) {
+ +		cifs_dbg(VFS, "Multiuser mounts require kernels with CONFIG_KEYS enabled\n");
+ +		goto cifs_parse_mount_err;
+ +	}
+ +#endif
+ +	if (!ctx->UNC) {
+ +		cifs_dbg(VFS, "CIFS mount error: No usable UNC path provided in device string!\n");
+ +		goto cifs_parse_mount_err;
+ +	}
+ +
+ +	/* make sure UNC has a share name */
+ +	if (!strchr(ctx->UNC + 3, '\\')) {
+ +		cifs_dbg(VFS, "Malformed UNC. Unable to find share name.\n");
+ +		goto cifs_parse_mount_err;
+ +	}
+ +
+ +	if (!got_ip) {
+ +		int len;
+ +		const char *slash;
+ +
+ +		/* No ip= option specified? Try to get it from UNC */
+ +		/* Use the address part of the UNC. */
+ +		slash = strchr(&ctx->UNC[2], '\\');
+ +		len = slash - &ctx->UNC[2];
+ +		if (!cifs_convert_address(dstaddr, &ctx->UNC[2], len)) {
+ +			pr_err("Unable to determine destination address\n");
+ +			goto cifs_parse_mount_err;
+ +		}
+ +	}
+ +
+ +	/* set the port that we got earlier */
+ +	cifs_set_port(dstaddr, port);
+ +
+ +	if (uid_specified)
+ +		ctx->override_uid = override_uid;
+ +	else if (override_uid == 1)
+ +		pr_notice("ignoring forceuid mount option specified with no uid= option\n");
+ +
+ +	if (gid_specified)
+ +		ctx->override_gid = override_gid;
+ +	else if (override_gid == 1)
+ +		pr_notice("ignoring forcegid mount option specified with no gid= option\n");
+ +
+ +	if (got_version == false)
+ +		pr_warn_once("No dialect specified on mount. Default has changed to a more secure dialect, SMB2.1 or later (e.g. SMB3.1.1), from CIFS (SMB1). To use the less secure SMB1 dialect to access old servers which do not support SMB3.1.1 (or even SMB3 or SMB2.1) specify vers=1.0 on mount.\n");
+ +
+ +	kfree(mountdata_copy);
+ +	return 0;
+ +
+ +out_nomem:
+ +	pr_warn("Could not allocate temporary buffer\n");
+ +cifs_parse_mount_err:
+ +	kfree(string);
+ +	kfree(mountdata_copy);
+ +	return 1;
+ +}
+ +
+ +/** Returns true if srcaddr isn't specified and rhs isn't
+ + * specified, or if srcaddr is specified and
+ + * matches the IP address of the rhs argument.
+++=======
++ /**
++  * Returns true if srcaddr isn't specified and rhs isn't specified, or
++  * if srcaddr is specified and matches the IP address of the rhs argument
+++>>>>>>> bc04499477d9 (cifs: minor kernel style fixes for comments)
+   */
+  bool
+  cifs_match_ipaddr(struct sockaddr *srcaddr, struct sockaddr *rhs)
+@@@ -4095,8 -2983,7 +4107,12 @@@ build_unc_path_to_root(const struct smb
+  /**
+   * expand_dfs_referral - Perform a dfs referral query and update the cifs_sb
+   *
+++<<<<<<< HEAD
+ + *
+ + * If a referral is found, cifs_sb->mountdata will be (re-)allocated
+++=======
++  * If a referral is found, cifs_sb->ctx->mount_options will be (re-)allocated
+++>>>>>>> bc04499477d9 (cifs: minor kernel style fixes for comments)
+   * to a string containing updated options for the submount.  Otherwise it
+   * will be left untouched.
+   *
+* Unmerged path fs/cifs/connect.c
