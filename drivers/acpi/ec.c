@@ -182,7 +182,7 @@ struct acpi_ec_query {
 };
 
 static int acpi_ec_query(struct acpi_ec *ec, u8 *data);
-static void advance_transaction(struct acpi_ec *ec);
+static void advance_transaction(struct acpi_ec *ec, bool interrupt);
 static void acpi_ec_event_handler(struct work_struct *work);
 static void acpi_ec_event_processor(struct work_struct *work);
 
@@ -371,7 +371,7 @@ static inline void acpi_ec_enable_gpe(struct acpi_ec *ec, bool open)
 		 * EN=1 writes.
 		 */
 		ec_dbg_raw("Polling quirk");
-		advance_transaction(ec);
+		advance_transaction(ec, false);
 	}
 }
 
@@ -501,7 +501,7 @@ static inline void __acpi_ec_enable_event(struct acpi_ec *ec)
 	 * Unconditionally invoke this once after enabling the event
 	 * handling mechanism to detect the pending events.
 	 */
-	advance_transaction(ec);
+	advance_transaction(ec, false);
 }
 
 static inline void __acpi_ec_disable_event(struct acpi_ec *ec)
@@ -645,14 +645,13 @@ static inline void ec_transaction_transition(struct acpi_ec *ec, unsigned long f
 	}
 }
 
-static void advance_transaction(struct acpi_ec *ec)
+static void advance_transaction(struct acpi_ec *ec, bool interrupt)
 {
 	struct transaction *t;
 	u8 status;
 	bool wakeup = false;
 
-	ec_dbg_stm("%s (%d)", in_interrupt() ? "IRQ" : "TASK",
-		   smp_processor_id());
+	ec_dbg_stm("%s (%d)", interrupt ? "IRQ" : "TASK", smp_processor_id());
 	/*
 	 * By always clearing STS before handling all indications, we can
 	 * ensure a hardware STS 0->1 change after this clearing can always
@@ -712,7 +711,7 @@ err:
 	 * otherwise will take a not handled IRQ as a false one.
 	 */
 	if (!(status & ACPI_EC_FLAG_SCI)) {
-		if (in_interrupt() && t) {
+		if (interrupt && t) {
 			if (t->irq_count < ec_storm_threshold)
 				++t->irq_count;
 			/* Allow triggering on 0 threshold */
@@ -723,7 +722,7 @@ err:
 out:
 	if (status & ACPI_EC_FLAG_SCI)
 		acpi_ec_submit_query(ec);
-	if (wakeup && in_interrupt())
+	if (wakeup && interrupt)
 		wake_up(&ec->wait);
 }
 
@@ -780,7 +779,7 @@ static int ec_poll(struct acpi_ec *ec)
 			if (!ec_guard(ec))
 				return 0;
 			spin_lock_irqsave(&ec->lock, flags);
-			advance_transaction(ec);
+			advance_transaction(ec, false);
 			spin_unlock_irqrestore(&ec->lock, flags);
 		} while (time_before(jiffies, delay));
 		pr_debug("controller reset, restart transaction\n");
@@ -1229,7 +1228,7 @@ static void acpi_ec_check_event(struct acpi_ec *ec)
 			 * taking care of it.
 			 */
 			if (!ec->curr)
-				advance_transaction(ec);
+				advance_transaction(ec, false);
 			spin_unlock_irqrestore(&ec->lock, flags);
 		}
 	}
@@ -1272,7 +1271,7 @@ static void acpi_ec_handle_interrupt(struct acpi_ec *ec)
 	unsigned long flags;
 
 	spin_lock_irqsave(&ec->lock, flags);
-	advance_transaction(ec);
+	advance_transaction(ec, true);
 	spin_unlock_irqrestore(&ec->lock, flags);
 }
 
