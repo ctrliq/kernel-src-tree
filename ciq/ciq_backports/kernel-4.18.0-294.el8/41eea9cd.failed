@@ -1,0 +1,189 @@
+kasan, arm64: add brk handler for inline instrumentation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 41eea9cd239c5b3fff726894f85c97f60e5799a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/41eea9cd.failed
+
+Tag-based KASAN inline instrumentation mode (which embeds checks of shadow
+memory into the generated code, instead of inserting a callback) generates
+a brk instruction when a tag mismatch is detected.
+
+This commit adds a tag-based KASAN specific brk handler, that decodes the
+immediate value passed to the brk instructions (to extract information
+about the memory access that triggered the mismatch), reads the register
+values (x0 contains the guilty address) and reports the bug.
+
+Link: http://lkml.kernel.org/r/c91fe7684070e34dc34b419e6b69498f4dcacc2d.1544099024.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 41eea9cd239c5b3fff726894f85c97f60e5799a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+diff --cc include/linux/kasan.h
+index fa457ffe3494,8da7b7a4397a..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -155,4 -151,40 +155,43 @@@ static inline size_t kasan_metadata_siz
+  
+  #endif /* CONFIG_KASAN */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_GENERIC
++ 
++ #define KASAN_SHADOW_INIT 0
++ 
++ void kasan_cache_shrink(struct kmem_cache *cache);
++ void kasan_cache_shutdown(struct kmem_cache *cache);
++ 
++ #else /* CONFIG_KASAN_GENERIC */
++ 
++ static inline void kasan_cache_shrink(struct kmem_cache *cache) {}
++ static inline void kasan_cache_shutdown(struct kmem_cache *cache) {}
++ 
++ #endif /* CONFIG_KASAN_GENERIC */
++ 
++ #ifdef CONFIG_KASAN_SW_TAGS
++ 
++ #define KASAN_SHADOW_INIT 0xFF
++ 
++ void kasan_init_tags(void);
++ 
++ void *kasan_reset_tag(const void *addr);
++ 
++ void kasan_report(unsigned long addr, size_t size,
++ 		bool is_write, unsigned long ip);
++ 
++ #else /* CONFIG_KASAN_SW_TAGS */
++ 
++ static inline void kasan_init_tags(void) { }
++ 
++ static inline void *kasan_reset_tag(const void *addr)
++ {
++ 	return (void *)addr;
++ }
++ 
++ #endif /* CONFIG_KASAN_SW_TAGS */
++ 
+++>>>>>>> 41eea9cd239c (kasan, arm64: add brk handler for inline instrumentation)
+  #endif /* LINUX_KASAN_H */
+diff --git a/arch/arm64/include/asm/brk-imm.h b/arch/arm64/include/asm/brk-imm.h
+index ed693c5bcec0..2945fe6cd863 100644
+--- a/arch/arm64/include/asm/brk-imm.h
++++ b/arch/arm64/include/asm/brk-imm.h
+@@ -16,10 +16,12 @@
+  * 0x400: for dynamic BRK instruction
+  * 0x401: for compile time BRK instruction
+  * 0x800: kernel-mode BUG() and WARN() traps
++ * 0x9xx: tag-based KASAN trap (allowed values 0x900 - 0x9ff)
+  */
+ #define FAULT_BRK_IMM			0x100
+ #define KGDB_DYN_DBG_BRK_IMM		0x400
+ #define KGDB_COMPILED_DBG_BRK_IMM	0x401
+ #define BUG_BRK_IMM			0x800
++#define KASAN_BRK_IMM			0x900
+ 
+ #endif
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index ae6247d29f31..4bd2ceef3d9a 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -35,6 +35,7 @@
+ #include <linux/sizes.h>
+ #include <linux/syscalls.h>
+ #include <linux/mm_types.h>
++#include <linux/kasan.h>
+ 
+ #include <asm/atomic.h>
+ #include <asm/bug.h>
+@@ -802,6 +803,58 @@ static struct break_hook bug_break_hook = {
+ 	.fn = bug_handler,
+ };
+ 
++#ifdef CONFIG_KASAN_SW_TAGS
++
++#define KASAN_ESR_RECOVER	0x20
++#define KASAN_ESR_WRITE	0x10
++#define KASAN_ESR_SIZE_MASK	0x0f
++#define KASAN_ESR_SIZE(esr)	(1 << ((esr) & KASAN_ESR_SIZE_MASK))
++
++static int kasan_handler(struct pt_regs *regs, unsigned int esr)
++{
++	bool recover = esr & KASAN_ESR_RECOVER;
++	bool write = esr & KASAN_ESR_WRITE;
++	size_t size = KASAN_ESR_SIZE(esr);
++	u64 addr = regs->regs[0];
++	u64 pc = regs->pc;
++
++	if (user_mode(regs))
++		return DBG_HOOK_ERROR;
++
++	kasan_report(addr, size, write, pc);
++
++	/*
++	 * The instrumentation allows to control whether we can proceed after
++	 * a crash was detected. This is done by passing the -recover flag to
++	 * the compiler. Disabling recovery allows to generate more compact
++	 * code.
++	 *
++	 * Unfortunately disabling recovery doesn't work for the kernel right
++	 * now. KASAN reporting is disabled in some contexts (for example when
++	 * the allocator accesses slab object metadata; this is controlled by
++	 * current->kasan_depth). All these accesses are detected by the tool,
++	 * even though the reports for them are not printed.
++	 *
++	 * This is something that might be fixed at some point in the future.
++	 */
++	if (!recover)
++		die("Oops - KASAN", regs, 0);
++
++	/* If thread survives, skip over the brk instruction and continue: */
++	arm64_skip_faulting_instruction(regs, AARCH64_INSN_SIZE);
++	return DBG_HOOK_HANDLED;
++}
++
++#define KASAN_ESR_VAL (0xf2000000 | KASAN_BRK_IMM)
++#define KASAN_ESR_MASK 0xffffff00
++
++static struct break_hook kasan_break_hook = {
++	.esr_val = KASAN_ESR_VAL,
++	.esr_mask = KASAN_ESR_MASK,
++	.fn = kasan_handler,
++};
++#endif
++
+ /*
+  * Initial handler for AArch64 BRK exceptions
+  * This handler only used until debug_traps_init().
+@@ -809,6 +862,10 @@ static struct break_hook bug_break_hook = {
+ int __init early_brk64(unsigned long addr, unsigned int esr,
+ 		struct pt_regs *regs)
+ {
++#ifdef CONFIG_KASAN_SW_TAGS
++	if ((esr & KASAN_ESR_MASK) == KASAN_ESR_VAL)
++		return kasan_handler(regs, esr) != DBG_HOOK_HANDLED;
++#endif
+ 	return bug_handler(regs, esr) != DBG_HOOK_HANDLED;
+ }
+ 
+@@ -816,4 +873,7 @@ int __init early_brk64(unsigned long addr, unsigned int esr,
+ void __init trap_init(void)
+ {
+ 	register_break_hook(&bug_break_hook);
++#ifdef CONFIG_KASAN_SW_TAGS
++	register_break_hook(&kasan_break_hook);
++#endif
+ }
+* Unmerged path include/linux/kasan.h
