@@ -3336,6 +3336,12 @@ static int shmem_parse_options(char *options, struct shmem_options *ctx)
 	uid_t uid;
 	gid_t gid;
 
+	if (options) {
+		int err = security_sb_eat_lsm_opts(options, &fc->security);
+		if (err)
+			return err;
+	}
+
 	while (options != NULL) {
 		this_char = options;
 		for (;;) {
