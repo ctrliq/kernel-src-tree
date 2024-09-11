@@ -1,0 +1,176 @@
+mm: devmap: refactor 1-based refcounting for ZONE_DEVICE pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit 07d8026995287c2a2f03e28c69cdd8152fa69107
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/07d80269.failed
+
+An upcoming patch changes and complicates the refcounting and especially
+the "put page" aspects of it.  In order to keep everything clean,
+refactor the devmap page release routines:
+
+* Rename put_devmap_managed_page() to page_is_devmap_managed(), and
+  limit the functionality to "read only": return a bool, with no side
+  effects.
+
+* Add a new routine, put_devmap_managed_page(), to handle decrementing
+  the refcount for ZONE_DEVICE pages.
+
+* Change callers (just release_pages() and put_page()) to check
+  page_is_devmap_managed() before calling the new
+  put_devmap_managed_page() routine.  This is a performance point:
+  put_page() is a hot path, so we need to avoid non- inline function calls
+  where possible.
+
+* Rename __put_devmap_managed_page() to free_devmap_managed_page(), and
+  limit the functionality to unconditionally freeing a devmap page.
+
+This is originally based on a separate patch by Ira Weiny, which applied
+to an early version of the put_user_page() experiments.  Since then,
+Jérôme Glisse suggested the refactoring described above.
+
+Link: http://lkml.kernel.org/r/20200107224558.2362728-5-jhubbard@nvidia.com
+	Signed-off-by: Ira Weiny <ira.weiny@intel.com>
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Suggested-by: Jérôme Glisse <jglisse@redhat.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Kirill A. Shutemov <kirill@shutemov.name>
+	Cc: Alex Williamson <alex.williamson@redhat.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Björn Töpel <bjorn.topel@intel.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Hans Verkuil <hverkuil-cisco@xs4all.nl>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Leon Romanovsky <leonro@mellanox.com>
+	Cc: Mauro Carvalho Chehab <mchehab@kernel.org>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 07d8026995287c2a2f03e28c69cdd8152fa69107)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mm.h
+#	mm/swap.c
+diff --cc include/linux/mm.h
+index 5691398f32fe,3b88618e361a..000000000000
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@@ -896,30 -966,18 +896,42 @@@ static inline bool page_is_devmap_manag
+  	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool is_device_private_page(const struct page *page)
+ +{
+ +	return is_zone_device_page(page) &&
+ +		page->pgmap->type == MEMORY_DEVICE_PRIVATE;
+ +}
+ +
+ +#ifdef CONFIG_PCI_P2PDMA
+ +static inline bool is_pci_p2pdma_page(const struct page *page)
+ +{
+ +	return is_zone_device_page(page) &&
+ +		page->pgmap->type == MEMORY_DEVICE_PCI_P2PDMA;
+ +}
+ +#else /* CONFIG_PCI_P2PDMA */
+ +static inline bool is_pci_p2pdma_page(const struct page *page)
+ +{
+ +	return false;
+ +}
+ +#endif /* CONFIG_PCI_P2PDMA */
+++=======
++ void put_devmap_managed_page(struct page *page);
+++>>>>>>> 07d802699528 (mm: devmap: refactor 1-based refcounting for ZONE_DEVICE pages)
+  
+  #else /* CONFIG_DEV_PAGEMAP_OPS */
+- static inline bool put_devmap_managed_page(struct page *page)
++ static inline bool page_is_devmap_managed(struct page *page)
+  {
+  	return false;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline void put_devmap_managed_page(struct page *page)
++ {
++ }
++ #endif /* CONFIG_DEV_PAGEMAP_OPS */
+++>>>>>>> 07d802699528 (mm: devmap: refactor 1-based refcounting for ZONE_DEVICE pages)
+  
+  static inline bool is_device_private_page(const struct page *page)
+  {
+diff --cc mm/swap.c
+index f2098f8772b3,cf39d24ada2a..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -736,6 -801,24 +736,27 @@@ void release_pages(struct page **pages
+  		if (is_huge_zero_page(page))
+  			continue;
+  
+++<<<<<<< HEAD
+++=======
++ 		if (is_zone_device_page(page)) {
++ 			if (locked_pgdat) {
++ 				spin_unlock_irqrestore(&locked_pgdat->lru_lock,
++ 						       flags);
++ 				locked_pgdat = NULL;
++ 			}
++ 			/*
++ 			 * ZONE_DEVICE pages that return 'false' from
++ 			 * put_devmap_managed_page() do not require special
++ 			 * processing, and instead, expect a call to
++ 			 * put_page_testzero().
++ 			 */
++ 			if (page_is_devmap_managed(page)) {
++ 				put_devmap_managed_page(page);
++ 				continue;
++ 			}
++ 		}
++ 
+++>>>>>>> 07d802699528 (mm: devmap: refactor 1-based refcounting for ZONE_DEVICE pages)
+  		page = compound_head(page);
+  		if (!put_page_testzero(page))
+  			continue;
+* Unmerged path include/linux/mm.h
+diff --git a/mm/memremap.c b/mm/memremap.c
+index 8251979327a0..ab6d8acf9208 100644
+--- a/mm/memremap.c
++++ b/mm/memremap.c
+@@ -392,20 +392,8 @@ struct dev_pagemap *get_dev_pagemap(unsigned long pfn,
+ EXPORT_SYMBOL_GPL(get_dev_pagemap);
+ 
+ #ifdef CONFIG_DEV_PAGEMAP_OPS
+-void __put_devmap_managed_page(struct page *page)
++void free_devmap_managed_page(struct page *page)
+ {
+-	int count = page_ref_dec_return(page);
+-
+-	/* still busy */
+-	if (count > 1)
+-		return;
+-
+-	/* only triggered by the dev_pagemap shutdown path */
+-	if (count == 0) {
+-		__put_page(page);
+-		return;
+-	}
+-
+ 	/* notify page idle for dax */
+ 	if (!is_device_private_page(page)) {
+ 		wake_up_var(&page->_refcount);
+@@ -442,5 +430,4 @@ void __put_devmap_managed_page(struct page *page)
+ 	page->mapping = NULL;
+ 	page->pgmap->ops->page_free(page);
+ }
+-EXPORT_SYMBOL(__put_devmap_managed_page);
+ #endif /* CONFIG_DEV_PAGEMAP_OPS */
+* Unmerged path mm/swap.c
