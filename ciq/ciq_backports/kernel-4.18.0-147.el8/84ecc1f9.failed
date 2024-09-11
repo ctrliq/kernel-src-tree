@@ -1,0 +1,468 @@
+bpf: Expect !info.func_info and insn_off name changes in test_btf/libbpf/bpftool
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 84ecc1f98ca7ce28ede9bc5cc70a557fdfa09caa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/84ecc1f9.failed
+
+Similar to info.jited_*, info.func_info could be 0 if
+bpf_dump_raw_ok() == false.
+
+This patch makes changes to test_btf and bpftool to expect info.func_info
+could be 0.
+
+This patch also makes the needed changes for s/insn_offset/insn_off/.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 84ecc1f98ca7ce28ede9bc5cc70a557fdfa09caa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/btf.c
+diff --cc tools/lib/bpf/btf.c
+index ad19a43e946a,85d6446cf832..000000000000
+--- a/tools/lib/bpf/btf.c
++++ b/tools/lib/bpf/btf.c
+@@@ -32,12 -37,21 +32,28 @@@ struct btf 
+  	int fd;
+  };
+  
+++<<<<<<< HEAD
+ +static const char *btf_name_by_offset(const struct btf *btf, __u32 offset)
+++=======
++ struct btf_ext {
++ 	void *func_info;
++ 	__u32 func_info_rec_size;
++ 	__u32 func_info_len;
++ };
++ 
++ /* The minimum bpf_func_info checked by the loader */
++ struct bpf_func_info_min {
++ 	__u32   insn_off;
++ 	__u32   type_id;
++ };
++ 
++ static inline __u64 ptr_to_u64(const void *ptr)
+++>>>>>>> 84ecc1f98ca7 (bpf: Expect !info.func_info and insn_off name changes in test_btf/libbpf/bpftool)
+  {
+ -	return (__u64) (unsigned long) ptr;
+ +	if (offset < btf->hdr->str_len)
+ +		return &btf->strings[offset];
+ +	else
+ +		return NULL;
+  }
+  
+  static int btf_add_type(struct btf *btf, struct btf_type *t)
+@@@ -372,3 -406,337 +388,340 @@@ int btf__fd(const struct btf *btf
+  {
+  	return btf->fd;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ const char *btf__name_by_offset(const struct btf *btf, __u32 offset)
++ {
++ 	if (offset < btf->hdr->str_len)
++ 		return &btf->strings[offset];
++ 	else
++ 		return NULL;
++ }
++ 
++ int btf__get_from_id(__u32 id, struct btf **btf)
++ {
++ 	struct bpf_btf_info btf_info = { 0 };
++ 	__u32 len = sizeof(btf_info);
++ 	__u32 last_size;
++ 	int btf_fd;
++ 	void *ptr;
++ 	int err;
++ 
++ 	err = 0;
++ 	*btf = NULL;
++ 	btf_fd = bpf_btf_get_fd_by_id(id);
++ 	if (btf_fd < 0)
++ 		return 0;
++ 
++ 	/* we won't know btf_size until we call bpf_obj_get_info_by_fd(). so
++ 	 * let's start with a sane default - 4KiB here - and resize it only if
++ 	 * bpf_obj_get_info_by_fd() needs a bigger buffer.
++ 	 */
++ 	btf_info.btf_size = 4096;
++ 	last_size = btf_info.btf_size;
++ 	ptr = malloc(last_size);
++ 	if (!ptr) {
++ 		err = -ENOMEM;
++ 		goto exit_free;
++ 	}
++ 
++ 	bzero(ptr, last_size);
++ 	btf_info.btf = ptr_to_u64(ptr);
++ 	err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 
++ 	if (!err && btf_info.btf_size > last_size) {
++ 		void *temp_ptr;
++ 
++ 		last_size = btf_info.btf_size;
++ 		temp_ptr = realloc(ptr, last_size);
++ 		if (!temp_ptr) {
++ 			err = -ENOMEM;
++ 			goto exit_free;
++ 		}
++ 		ptr = temp_ptr;
++ 		bzero(ptr, last_size);
++ 		btf_info.btf = ptr_to_u64(ptr);
++ 		err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 	}
++ 
++ 	if (err || btf_info.btf_size > last_size) {
++ 		err = errno;
++ 		goto exit_free;
++ 	}
++ 
++ 	*btf = btf__new((__u8 *)(long)btf_info.btf, btf_info.btf_size, NULL);
++ 	if (IS_ERR(*btf)) {
++ 		err = PTR_ERR(*btf);
++ 		*btf = NULL;
++ 	}
++ 
++ exit_free:
++ 	close(btf_fd);
++ 	free(ptr);
++ 
++ 	return err;
++ }
++ 
++ static int btf_ext_validate_func_info(const void *finfo, __u32 size,
++ 				      btf_print_fn_t err_log)
++ {
++ 	int sec_hdrlen = sizeof(struct btf_sec_func_info);
++ 	__u32 size_left, num_records, record_size;
++ 	const struct btf_sec_func_info *sinfo;
++ 	__u64 total_record_size;
++ 
++ 	/* At least a func_info record size */
++ 	if (size < sizeof(__u32)) {
++ 		elog("BTF.ext func_info record size not found");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* The record size needs to meet below minimum standard */
++ 	record_size = *(__u32 *)finfo;
++ 	if (record_size < sizeof(struct bpf_func_info_min) ||
++ 	    record_size % sizeof(__u32)) {
++ 		elog("BTF.ext func_info invalid record size");
++ 		return -EINVAL;
++ 	}
++ 
++ 	sinfo = finfo + sizeof(__u32);
++ 	size_left = size - sizeof(__u32);
++ 
++ 	/* If no func_info records, return failure now so .BTF.ext
++ 	 * won't be used.
++ 	 */
++ 	if (!size_left) {
++ 		elog("BTF.ext no func info records");
++ 		return -EINVAL;
++ 	}
++ 
++ 	while (size_left) {
++ 		if (size_left < sec_hdrlen) {
++ 			elog("BTF.ext func_info header not found");
++ 			return -EINVAL;
++ 		}
++ 
++ 		num_records = sinfo->num_func_info;
++ 		if (num_records == 0) {
++ 			elog("incorrect BTF.ext num_func_info");
++ 			return -EINVAL;
++ 		}
++ 
++ 		total_record_size = sec_hdrlen +
++ 				    (__u64)num_records * record_size;
++ 		if (size_left < total_record_size) {
++ 			elog("incorrect BTF.ext num_func_info");
++ 			return -EINVAL;
++ 		}
++ 
++ 		size_left -= total_record_size;
++ 		sinfo = (void *)sinfo + total_record_size;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int btf_ext_parse_hdr(__u8 *data, __u32 data_size,
++ 			     btf_print_fn_t err_log)
++ {
++ 	const struct btf_ext_header *hdr = (struct btf_ext_header *)data;
++ 	__u32 meta_left, last_func_info_pos;
++ 	void *finfo;
++ 
++ 	if (data_size < offsetof(struct btf_ext_header, func_info_off) ||
++ 	    data_size < hdr->hdr_len) {
++ 		elog("BTF.ext header not found");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->magic != BTF_MAGIC) {
++ 		elog("Invalid BTF.ext magic:%x\n", hdr->magic);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->version != BTF_VERSION) {
++ 		elog("Unsupported BTF.ext version:%u\n", hdr->version);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	if (hdr->flags) {
++ 		elog("Unsupported BTF.ext flags:%x\n", hdr->flags);
++ 		return -ENOTSUP;
++ 	}
++ 
++ 	meta_left = data_size - hdr->hdr_len;
++ 	if (!meta_left) {
++ 		elog("BTF.ext has no data\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (meta_left < hdr->func_info_off) {
++ 		elog("Invalid BTF.ext func_info section offset:%u\n",
++ 		     hdr->func_info_off);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (hdr->func_info_off & 0x03) {
++ 		elog("BTF.ext func_info section is not aligned to 4 bytes\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	last_func_info_pos = hdr->hdr_len + hdr->func_info_off +
++ 			     hdr->func_info_len;
++ 	if (last_func_info_pos > data_size) {
++ 		elog("Invalid BTF.ext func_info section size:%u\n",
++ 		     hdr->func_info_len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	finfo = data + hdr->hdr_len + hdr->func_info_off;
++ 	return btf_ext_validate_func_info(finfo, hdr->func_info_len,
++ 					  err_log);
++ }
++ 
++ void btf_ext__free(struct btf_ext *btf_ext)
++ {
++ 	if (!btf_ext)
++ 		return;
++ 
++ 	free(btf_ext->func_info);
++ 	free(btf_ext);
++ }
++ 
++ struct btf_ext *btf_ext__new(__u8 *data, __u32 size, btf_print_fn_t err_log)
++ {
++ 	const struct btf_ext_header *hdr;
++ 	struct btf_ext *btf_ext;
++ 	void *org_fdata, *fdata;
++ 	__u32 hdrlen, size_u32;
++ 	int err;
++ 
++ 	err = btf_ext_parse_hdr(data, size, err_log);
++ 	if (err)
++ 		return ERR_PTR(err);
++ 
++ 	btf_ext = calloc(1, sizeof(struct btf_ext));
++ 	if (!btf_ext)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	hdr = (const struct btf_ext_header *)data;
++ 	hdrlen = hdr->hdr_len;
++ 	size_u32 = sizeof(__u32);
++ 	fdata = malloc(hdr->func_info_len - size_u32);
++ 	if (!fdata) {
++ 		free(btf_ext);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	/* remember record size and copy rest of func_info data */
++ 	org_fdata = data + hdrlen + hdr->func_info_off;
++ 	btf_ext->func_info_rec_size = *(__u32 *)org_fdata;
++ 	memcpy(fdata, org_fdata + size_u32, hdr->func_info_len - size_u32);
++ 	btf_ext->func_info = fdata;
++ 	btf_ext->func_info_len = hdr->func_info_len - size_u32;
++ 
++ 	return btf_ext;
++ }
++ 
++ int btf_ext__reloc_init(struct btf *btf, struct btf_ext *btf_ext,
++ 			const char *sec_name, void **func_info,
++ 			__u32 *func_info_rec_size, __u32 *func_info_len)
++ {
++ 	__u32 sec_hdrlen = sizeof(struct btf_sec_func_info);
++ 	__u32 i, record_size, records_len;
++ 	struct btf_sec_func_info *sinfo;
++ 	const char *info_sec_name;
++ 	__s64 remain_len;
++ 	void *data;
++ 
++ 	record_size = btf_ext->func_info_rec_size;
++ 	sinfo = btf_ext->func_info;
++ 	remain_len = btf_ext->func_info_len;
++ 
++ 	while (remain_len > 0) {
++ 		records_len = sinfo->num_func_info * record_size;
++ 		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
++ 		if (strcmp(info_sec_name, sec_name)) {
++ 			remain_len -= sec_hdrlen + records_len;
++ 			sinfo = (void *)sinfo + sec_hdrlen + records_len;
++ 			continue;
++ 		}
++ 
++ 		data = malloc(records_len);
++ 		if (!data)
++ 			return -ENOMEM;
++ 
++ 		memcpy(data, sinfo->data, records_len);
++ 
++ 		/* adjust the insn_off, the data in .BTF.ext is
++ 		 * the actual byte offset, and the kernel expects
++ 		 * the offset in term of bpf_insn.
++ 		 *
++ 		 * adjust the insn offset only, the rest data will
++ 		 * be passed to kernel.
++ 		 */
++ 		for (i = 0; i < sinfo->num_func_info; i++) {
++ 			struct bpf_func_info_min *record;
++ 
++ 			record = data + i * record_size;
++ 			record->insn_off /= sizeof(struct bpf_insn);
++ 		}
++ 
++ 		*func_info = data;
++ 		*func_info_len = records_len;
++ 		*func_info_rec_size = record_size;
++ 		return 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
++ 
++ int btf_ext__reloc(struct btf *btf, struct btf_ext *btf_ext,
++ 		   const char *sec_name, __u32 insns_cnt,
++ 		   void **func_info, __u32 *func_info_len)
++ {
++ 	__u32 sec_hdrlen = sizeof(struct btf_sec_func_info);
++ 	__u32 i, record_size, existing_flen, records_len;
++ 	struct btf_sec_func_info *sinfo;
++ 	const char *info_sec_name;
++ 	__u64 remain_len;
++ 	void *data;
++ 
++ 	record_size = btf_ext->func_info_rec_size;
++ 	sinfo = btf_ext->func_info;
++ 	remain_len = btf_ext->func_info_len;
++ 	while (remain_len > 0) {
++ 		records_len = sinfo->num_func_info * record_size;
++ 		info_sec_name = btf__name_by_offset(btf, sinfo->sec_name_off);
++ 		if (strcmp(info_sec_name, sec_name)) {
++ 			remain_len -= sec_hdrlen + records_len;
++ 			sinfo = (void *)sinfo + sec_hdrlen + records_len;
++ 			continue;
++ 		}
++ 
++ 		existing_flen = *func_info_len;
++ 		data = realloc(*func_info, existing_flen + records_len);
++ 		if (!data)
++ 			return -ENOMEM;
++ 
++ 		memcpy(data + existing_flen, sinfo->data, records_len);
++ 		/* adjust insn_off only, the rest data will be passed
++ 		 * to the kernel.
++ 		 */
++ 		for (i = 0; i < sinfo->num_func_info; i++) {
++ 			struct bpf_func_info_min *record;
++ 
++ 			record = data + existing_flen + i * record_size;
++ 			record->insn_off =
++ 				record->insn_off / sizeof(struct bpf_insn) +
++ 				insns_cnt;
++ 		}
++ 		*func_info = data;
++ 		*func_info_len = existing_flen + records_len;
++ 		return 0;
++ 	}
++ 
++ 	return -EINVAL;
++ }
+++>>>>>>> 84ecc1f98ca7 (bpf: Expect !info.func_info and insn_off name changes in test_btf/libbpf/bpftool)
+diff --git a/tools/bpf/bpftool/prog.c b/tools/bpf/bpftool/prog.c
+index e60f0d85d6d8..1c427fdfd67c 100644
+--- a/tools/bpf/bpftool/prog.c
++++ b/tools/bpf/bpftool/prog.c
+@@ -590,6 +590,13 @@ static int do_dump(int argc, char **argv)
+ 		goto err_free;
+ 	}
+ 
++	if (func_info && !info.func_info) {
++		/* kernel.kptr_restrict is set.  No func_info available. */
++		free(func_info);
++		func_info = NULL;
++		finfo_cnt = 0;
++	}
++
+ 	if ((member_len == &info.jited_prog_len &&
+ 	     info.jited_prog_insns == 0) ||
+ 	    (member_len == &info.xlated_prog_len &&
+diff --git a/tools/bpf/bpftool/xlated_dumper.c b/tools/bpf/bpftool/xlated_dumper.c
+index e06ac0286a75..131ecd175533 100644
+--- a/tools/bpf/bpftool/xlated_dumper.c
++++ b/tools/bpf/bpftool/xlated_dumper.c
+@@ -261,7 +261,7 @@ void dump_xlated_json(struct dump_data *dd, void *buf, unsigned int len,
+ 		jsonw_start_object(json_wtr);
+ 
+ 		if (btf && record) {
+-			if (record->insn_offset == i) {
++			if (record->insn_off == i) {
+ 				btf_dumper_type_only(btf, record->type_id,
+ 						     func_sig,
+ 						     sizeof(func_sig));
+@@ -330,7 +330,7 @@ void dump_xlated_plain(struct dump_data *dd, void *buf, unsigned int len,
+ 		}
+ 
+ 		if (btf && record) {
+-			if (record->insn_offset == i) {
++			if (record->insn_off == i) {
+ 				btf_dumper_type_only(btf, record->type_id,
+ 						     func_sig,
+ 						     sizeof(func_sig));
+* Unmerged path tools/lib/bpf/btf.c
+diff --git a/tools/testing/selftests/bpf/test_btf.c b/tools/testing/selftests/bpf/test_btf.c
+index 42aad55cbe88..af0e398e4467 100644
+--- a/tools/testing/selftests/bpf/test_btf.c
++++ b/tools/testing/selftests/bpf/test_btf.c
+@@ -3517,7 +3517,7 @@ static struct btf_func_type_test {
+ },
+ 
+ {
+-	.descr = "func_type (Incorrect bpf_func_info.insn_offset)",
++	.descr = "func_type (Incorrect bpf_func_info.insn_off)",
+ 	.raw_types = {
+ 		BTF_TYPE_INT_ENC(NAME_TBD, BTF_INT_SIGNED, 0, 32, 4),	/* [1] */
+ 		BTF_TYPE_INT_ENC(NAME_TBD, 0, 0, 32, 4),	/* [2] */
+@@ -3664,6 +3664,12 @@ static int do_test_func_type(int test_num)
+ 		goto done;
+ 	}
+ 
++	if (CHECK(!info.func_info,
++		  "info.func_info == 0. kernel.kptr_restrict is set?")) {
++		err = -1;
++		goto done;
++	}
++
+ 	finfo = func_info;
+ 	for (i = 0; i < 2; i++) {
+ 		if (CHECK(finfo->type_id != test->func_info[i][1],
