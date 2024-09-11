@@ -1,0 +1,202 @@
+fuse: dissociate DESTROY from fuseblk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit 783863d6476ce9f27fa87227f76ae9134caf43fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/783863d6.failed
+
+Allow virtio-fs to also send DESTROY request.
+
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 783863d6476ce9f27fa87227f76ae9134caf43fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/fuse_i.h
+#	fs/fuse/inode.c
+diff --cc fs/fuse/fuse_i.h
+index b9287760b32a,48d214df9172..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -405,6 -455,27 +405,30 @@@ struct fuse_dev 
+  	struct list_head entry;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct fuse_fs_context {
++ 	int fd;
++ 	unsigned int rootmode;
++ 	kuid_t user_id;
++ 	kgid_t group_id;
++ 	bool is_bdev:1;
++ 	bool fd_present:1;
++ 	bool rootmode_present:1;
++ 	bool user_id_present:1;
++ 	bool group_id_present:1;
++ 	bool default_permissions:1;
++ 	bool allow_other:1;
++ 	bool destroy:1;
++ 	unsigned int max_read;
++ 	unsigned int blksize;
++ 	const char *subtype;
++ 
++ 	/* fuse_dev pointer to fill in, should contain NULL on entry */
++ 	void **fudptr;
++ };
++ 
+++>>>>>>> 783863d6476c (fuse: dissociate DESTROY from fuseblk)
+  /**
+   * A Fuse connection.
+   *
+@@@ -901,9 -933,26 +925,16 @@@ void fuse_conn_init(struct fuse_conn *f
+   */
+  void fuse_conn_put(struct fuse_conn *fc);
+  
+ -struct fuse_dev *fuse_dev_alloc_install(struct fuse_conn *fc);
+ -struct fuse_dev *fuse_dev_alloc(void);
+ -void fuse_dev_install(struct fuse_dev *fud, struct fuse_conn *fc);
+ +struct fuse_dev *fuse_dev_alloc(struct fuse_conn *fc);
+  void fuse_dev_free(struct fuse_dev *fud);
+ -void fuse_send_init(struct fuse_conn *fc);
+ -
+ -/**
+ - * Fill in superblock and initialize fuse connection
+ - * @sb: partially-initialized superblock to fill in
+ - * @ctx: mount context
+ - */
+ -int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx);
+  
++ /**
++  * Disassociate fuse connection from superblock and kill the superblock
++  *
++  * Calls kill_anon_super(), do not use with bdev mounts.
++  */
++ void fuse_kill_sb_anon(struct super_block *sb);
++ 
+  /**
+   * Add connection to control filesystem
+   */
+diff --cc fs/fuse/inode.c
+index 523a1f18c557,cd6ffb3fe69e..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -988,14 -987,19 +988,14 @@@ static void fuse_send_init(struct fuse_
+  	/* Variable length argument used for backward compatibility
+  	   with interface version < 7.5.  Rest of init_out is zeroed
+  	   by do_get_request(), so a short reply is not a problem */
+ -	ia->args.out_argvar = 1;
+ -	ia->args.out_args[0].size = sizeof(ia->out);
+ -	ia->args.out_args[0].value = &ia->out;
+ -	ia->args.force = true;
+ -	ia->args.nocreds = true;
+ -	ia->args.end = process_init_reply;
+ -
+ -	if (fuse_simple_background(fc, &ia->args, GFP_KERNEL) != 0)
+ -		process_init_reply(fc, &ia->args, -ENOTCONN);
+ +	req->out.argvar = 1;
+ +	req->out.args[0].size = sizeof(struct fuse_init_out);
+ +	req->out.args[0].value = &req->misc.init_out;
+ +	req->end = process_init_reply;
+ +	fuse_request_send_background(fc, req);
+  }
+ -EXPORT_SYMBOL_GPL(fuse_send_init);
+  
+- static void fuse_free_conn(struct fuse_conn *fc)
++ void fuse_free_conn(struct fuse_conn *fc)
+  {
+  	WARN_ON(!list_empty(&fc->devices));
+  	kfree_rcu(fc, rcu);
+@@@ -1168,17 -1165,15 +1169,26 @@@ static int fuse_fill_super(struct super
+  		fc->dont_mask = 1;
+  	sb->s_flags |= SB_POSIXACL;
+  
+++<<<<<<< HEAD
+ +	fc->default_permissions = d.default_permissions;
+ +	fc->allow_other = d.allow_other;
+ +	fc->user_id = d.user_id;
+ +	fc->group_id = d.group_id;
+ +	fc->max_read = max_t(unsigned, 4096, d.max_read);
+ +
+ +	/* Used by get_root_inode() */
+ +	sb->s_fs_info = fc;
+++=======
++ 	fc->default_permissions = ctx->default_permissions;
++ 	fc->allow_other = ctx->allow_other;
++ 	fc->user_id = ctx->user_id;
++ 	fc->group_id = ctx->group_id;
++ 	fc->max_read = max_t(unsigned, 4096, ctx->max_read);
++ 	fc->destroy = ctx->destroy;
+++>>>>>>> 783863d6476c (fuse: dissociate DESTROY from fuseblk)
+  
+  	err = -ENOMEM;
+ -	root = fuse_get_root_inode(sb, ctx->rootmode);
+ +	root = fuse_get_root_inode(sb, d.rootmode);
+  	sb->s_d_op = &fuse_root_dentry_operations;
+  	root_dentry = d_make_root(root);
+  	if (!root_dentry)
+@@@ -1238,11 -1257,52 +1248,58 @@@
+  	return err;
+  }
+  
+ -static int fuse_get_tree(struct fs_context *fc)
+ +static struct dentry *fuse_mount(struct file_system_type *fs_type,
+ +		       int flags, const char *dev_name,
+ +		       void *raw_data)
+  {
+++<<<<<<< HEAD
+ +	return mount_nodev(fs_type, flags, raw_data, fuse_fill_super);
+++=======
++ 	struct fuse_fs_context *ctx = fc->fs_private;
++ 
++ 	if (!ctx->fd_present || !ctx->rootmode_present ||
++ 	    !ctx->user_id_present || !ctx->group_id_present)
++ 		return -EINVAL;
++ 
++ #ifdef CONFIG_BLOCK
++ 	if (ctx->is_bdev)
++ 		return get_tree_bdev(fc, fuse_fill_super);
++ #endif
++ 
++ 	return get_tree_nodev(fc, fuse_fill_super);
++ }
++ 
++ static const struct fs_context_operations fuse_context_ops = {
++ 	.free		= fuse_free_fc,
++ 	.parse_param	= fuse_parse_param,
++ 	.get_tree	= fuse_get_tree,
++ };
++ 
++ /*
++  * Set up the filesystem mount context.
++  */
++ static int fuse_init_fs_context(struct fs_context *fc)
++ {
++ 	struct fuse_fs_context *ctx;
++ 
++ 	ctx = kzalloc(sizeof(struct fuse_fs_context), GFP_KERNEL);
++ 	if (!ctx)
++ 		return -ENOMEM;
++ 
++ 	ctx->max_read = ~0;
++ 	ctx->blksize = FUSE_DEFAULT_BLKSIZE;
++ 
++ #ifdef CONFIG_BLOCK
++ 	if (fc->fs_type == &fuseblk_fs_type) {
++ 		ctx->is_bdev = true;
++ 		ctx->destroy = true;
++ 	}
++ #endif
++ 
++ 	fc->fs_private = ctx;
++ 	fc->ops = &fuse_context_ops;
++ 	return 0;
+++>>>>>>> 783863d6476c (fuse: dissociate DESTROY from fuseblk)
+  }
+  
+  static void fuse_sb_destroy(struct super_block *sb)
+* Unmerged path fs/fuse/fuse_i.h
+* Unmerged path fs/fuse/inode.c
