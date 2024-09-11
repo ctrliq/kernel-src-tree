@@ -2287,7 +2287,10 @@ static int handle_pmi_common(struct pt_regs *regs, u64 status)
 	 * counters from the GLOBAL_STATUS mask and we always process PEBS
 	 * events via drain_pebs().
 	 */
-	status &= ~(cpuc->pebs_enabled & PEBS_COUNTER_MASK);
+	if (x86_pmu.flags & PMU_FL_PEBS_ALL)
+		status &= ~cpuc->pebs_enabled;
+	else
+		status &= ~(cpuc->pebs_enabled & PEBS_COUNTER_MASK);
 
 	/*
 	 * PEBS overflow sets bit 62 in the global status register
