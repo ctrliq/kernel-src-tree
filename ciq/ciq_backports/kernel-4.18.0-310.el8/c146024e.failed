@@ -1,0 +1,149 @@
+fuse: fix warning in tree_insert() and clean up writepage insertion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Miklos Szeredi <mszeredi@redhat.com>
+commit c146024ec44c2946de7c6c45ddd3402abcab17f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c146024e.failed
+
+fuse_writepages_fill() calls tree_insert() with ap->num_pages = 0 which
+triggers the following warning:
+
+ WARNING: CPU: 1 PID: 17211 at fs/fuse/file.c:1728 tree_insert+0xab/0xc0 [fuse]
+ RIP: 0010:tree_insert+0xab/0xc0 [fuse]
+ Call Trace:
+  fuse_writepages_fill+0x5da/0x6a0 [fuse]
+  write_cache_pages+0x171/0x470
+  fuse_writepages+0x8a/0x100 [fuse]
+  do_writepages+0x43/0xe0
+
+Fix up the warning and clean up the code around rb-tree insertion:
+
+ - Rename tree_insert() to fuse_insert_writeback() and make it return the
+   conflicting entry in case of failure
+
+ - Re-add tree_insert() as a wrapper around fuse_insert_writeback()
+
+ - Rename fuse_writepage_in_flight() to fuse_writepage_add() and reverse
+   the meaning of the return value to mean
+
+    + "true" in case the writepage entry was successfully added
+
+    + "false" in case it was in-fligt queued on an existing writepage
+       entry's auxiliary list or the existing writepage entry's temporary
+       page updated
+
+   Switch from fuse_find_writeback() + tree_insert() to
+   fuse_insert_writeback()
+
+ - Move setting orig_pages to before inserting/updating the entry; this may
+   result in the orig_pages value being discarded later in case of an
+   in-flight request
+
+ - In case of a new writepage entry use fuse_writepage_add()
+   unconditionally, only set data->wpa if the entry was added.
+
+Fixes: 6b2fb79963fb ("fuse: optimize writepages search")
+	Reported-by: kernel test robot <rong.a.chen@intel.com>
+Original-path-by: Vasily Averin <vvs@virtuozzo.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit c146024ec44c2946de7c6c45ddd3402abcab17f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/file.c
+diff --cc fs/fuse/file.c
+index 1b617c09a013,63d52fed3381..000000000000
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@@ -1750,6 -1674,43 +1750,46 @@@ __acquires(fi->lock
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct fuse_writepage_args *fuse_insert_writeback(struct rb_root *root,
++ 						struct fuse_writepage_args *wpa)
++ {
++ 	pgoff_t idx_from = wpa->ia.write.in.offset >> PAGE_SHIFT;
++ 	pgoff_t idx_to = idx_from + wpa->ia.ap.num_pages - 1;
++ 	struct rb_node **p = &root->rb_node;
++ 	struct rb_node  *parent = NULL;
++ 
++ 	WARN_ON(!wpa->ia.ap.num_pages);
++ 	while (*p) {
++ 		struct fuse_writepage_args *curr;
++ 		pgoff_t curr_index;
++ 
++ 		parent = *p;
++ 		curr = rb_entry(parent, struct fuse_writepage_args,
++ 				writepages_entry);
++ 		WARN_ON(curr->inode != wpa->inode);
++ 		curr_index = curr->ia.write.in.offset >> PAGE_SHIFT;
++ 
++ 		if (idx_from >= curr_index + curr->ia.ap.num_pages)
++ 			p = &(*p)->rb_right;
++ 		else if (idx_to < curr_index)
++ 			p = &(*p)->rb_left;
++ 		else
++ 			return curr;
++ 	}
++ 
++ 	rb_link_node(&wpa->writepages_entry, parent, p);
++ 	rb_insert_color(&wpa->writepages_entry, root);
++ 	return NULL;
++ }
++ 
++ static void tree_insert(struct rb_root *root, struct fuse_writepage_args *wpa)
++ {
++ 	WARN_ON(fuse_insert_writeback(root, wpa));
++ }
++ 
+++>>>>>>> c146024ec44c (fuse: fix warning in tree_insert() and clean up writepage insertion)
+  static void fuse_writepage_end(struct fuse_conn *fc, struct fuse_args *args,
+  			       int error)
+  {
+@@@ -2013,17 -1975,15 +2053,22 @@@ static bool fuse_writepage_add(struct f
+  	struct fuse_args_pages *new_ap = &new_wpa->ia.ap;
+  
+  	WARN_ON(new_ap->num_pages != 0);
++ 	new_ap->num_pages = 1;
+  
+  	spin_lock(&fi->lock);
+++<<<<<<< HEAD
+ +	list_del(&new_wpa->writepages_entry);
+ +	old_wpa = fuse_find_writeback(fi, page->index, page->index);
+ +	if (!old_wpa) {
+ +		list_add(&new_wpa->writepages_entry, &fi->writepages);
+++=======
++ 	old_wpa = fuse_insert_writeback(&fi->writepages, new_wpa);
++ 	if (!old_wpa) {
+++>>>>>>> c146024ec44c (fuse: fix warning in tree_insert() and clean up writepage insertion)
+  		spin_unlock(&fi->lock);
+- 		return false;
++ 		return true;
+  	}
+  
+- 	new_ap->num_pages = 1;
+  	for (tmp = old_wpa->next; tmp; tmp = tmp->next) {
+  		pgoff_t curr_index;
+  
+@@@ -2131,12 -2091,6 +2176,15 @@@ static int fuse_writepages_fill(struct 
+  		ap->args.end = fuse_writepage_end;
+  		ap->num_pages = 0;
+  		wpa->inode = inode;
+++<<<<<<< HEAD
+ +
+ +		spin_lock(&fi->lock);
+ +		list_add(&wpa->writepages_entry, &fi->writepages);
+ +		spin_unlock(&fi->lock);
+ +
+ +		data->wpa = wpa;
+++=======
+++>>>>>>> c146024ec44c (fuse: fix warning in tree_insert() and clean up writepage insertion)
+  	}
+  	set_page_writeback(page);
+  
+* Unmerged path fs/fuse/file.c
