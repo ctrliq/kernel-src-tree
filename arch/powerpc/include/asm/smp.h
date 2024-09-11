@@ -36,6 +36,7 @@ extern bool coregroup_enabled;
 
 extern void cpu_die(void);
 extern int cpu_to_chip_id(int cpu);
+extern int *chip_id_lookup_table;
 
 #ifdef CONFIG_SMP
 
