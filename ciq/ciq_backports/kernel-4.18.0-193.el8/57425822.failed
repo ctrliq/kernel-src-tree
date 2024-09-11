@@ -1,0 +1,423 @@
+RDMA/hns: Remove asynchronic QP destroy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 574258222281221444b561b05c3a5fa85947a80c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/57425822.failed
+
+Verbs destroy callbacks are synchronous operations and can't be delayed.
+The expectation is that after driver returned from destroy function, the
+memory can be freed and user won't be able to access it again.
+
+Ditch workqueue implementation used in HNS driver.
+
+Fixes: d838c481e025 ("IB/hns: Fix the bug when destroy qp")
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Acked-by: oulijun <oulijun@huawei.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 574258222281221444b561b05c3a5fa85947a80c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+diff --cc drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+index ce18a158aa0b,26d4ed447bea..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+@@@ -3640,284 -3602,7 +3598,288 @@@ static int hns_roce_v1_query_qp(struct 
+  		hns_roce_v1_q_qp(ibqp, qp_attr, qp_attr_mask, qp_init_attr);
+  }
+  
+++<<<<<<< HEAD
+ +static void hns_roce_check_sdb_status(struct hns_roce_dev *hr_dev,
+ +				      u32 *old_send, u32 *old_retry,
+ +				      u32 *tsp_st, u32 *success_flags)
+ +{
+ +	__le32 *old_send_tmp, *old_retry_tmp;
+ +	u32 sdb_retry_cnt;
+ +	u32 sdb_send_ptr;
+ +	u32 cur_cnt, old_cnt;
+ +	__le32 tmp, tmp1;
+ +	u32 send_ptr;
+ +
+ +	sdb_send_ptr = roce_read(hr_dev, ROCEE_SDB_SEND_PTR_REG);
+ +	sdb_retry_cnt =	roce_read(hr_dev, ROCEE_SDB_RETRY_CNT_REG);
+ +	tmp = cpu_to_le32(sdb_send_ptr);
+ +	tmp1 = cpu_to_le32(sdb_retry_cnt);
+ +	cur_cnt = roce_get_field(tmp, ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +				 ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S) +
+ +		  roce_get_field(tmp1, ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_M,
+ +				 ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_S);
+ +
+ +	old_send_tmp = (__le32 *)old_send;
+ +	old_retry_tmp = (__le32 *)old_retry;
+ +	if (!roce_get_bit(*tsp_st, ROCEE_CNT_CLR_CE_CNT_CLR_CE_S)) {
+ +		old_cnt = roce_get_field(*old_send_tmp,
+ +					 ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +					 ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S) +
+ +			  roce_get_field(*old_retry_tmp,
+ +					 ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_M,
+ +					 ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_S);
+ +		if (cur_cnt - old_cnt > SDB_ST_CMP_VAL)
+ +			*success_flags = 1;
+ +	} else {
+ +		old_cnt = roce_get_field(*old_send_tmp,
+ +					 ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +					 ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S);
+ +		if (cur_cnt - old_cnt > SDB_ST_CMP_VAL) {
+ +			*success_flags = 1;
+ +		} else {
+ +			send_ptr = roce_get_field(*old_send_tmp,
+ +					    ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +					    ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S) +
+ +				   roce_get_field(tmp1,
+ +					    ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_M,
+ +					    ROCEE_SDB_RETRY_CNT_SDB_RETRY_CT_S);
+ +			roce_set_field(*old_send_tmp,
+ +				       ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +				       ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S,
+ +				       send_ptr);
+ +		}
+ +	}
+ +}
+ +
+ +static int check_qp_db_process_status(struct hns_roce_dev *hr_dev,
+ +				      struct hns_roce_qp *hr_qp,
+ +				      u32 sdb_issue_ptr,
+ +				      u32 *sdb_inv_cnt,
+ +				      u32 *wait_stage)
+ +{
+ +	struct device *dev = &hr_dev->pdev->dev;
+ +	u32 sdb_send_ptr, old_send;
+ +	__le32 sdb_issue_ptr_tmp;
+ +	__le32 sdb_send_ptr_tmp;
+ +	u32 success_flags = 0;
+ +	unsigned long end;
+ +	u32 old_retry;
+ +	u32 inv_cnt;
+ +	u32 tsp_st;
+ +	__le32 tmp;
+ +
+ +	if (*wait_stage > HNS_ROCE_V1_DB_STAGE2 ||
+ +	    *wait_stage < HNS_ROCE_V1_DB_STAGE1) {
+ +		dev_err(dev, "QP(0x%lx) db status wait stage(%d) error!\n",
+ +			hr_qp->qpn, *wait_stage);
+ +		return -EINVAL;
+ +	}
+ +
+ +	/* Calculate the total timeout for the entire verification process */
+ +	end = msecs_to_jiffies(HNS_ROCE_V1_CHECK_DB_TIMEOUT_MSECS) + jiffies;
+ +
+ +	if (*wait_stage == HNS_ROCE_V1_DB_STAGE1) {
+ +		/* Query db process status, until hw process completely */
+ +		sdb_send_ptr = roce_read(hr_dev, ROCEE_SDB_SEND_PTR_REG);
+ +		while (roce_hw_index_cmp_lt(sdb_send_ptr, sdb_issue_ptr,
+ +					    ROCEE_SDB_PTR_CMP_BITS)) {
+ +			if (!time_before(jiffies, end)) {
+ +				dev_dbg(dev, "QP(0x%lx) db process stage1 timeout. issue 0x%x send 0x%x.\n",
+ +					hr_qp->qpn, sdb_issue_ptr,
+ +					sdb_send_ptr);
+ +				return 0;
+ +			}
+ +
+ +			msleep(HNS_ROCE_V1_CHECK_DB_SLEEP_MSECS);
+ +			sdb_send_ptr = roce_read(hr_dev,
+ +						 ROCEE_SDB_SEND_PTR_REG);
+ +		}
+ +
+ +		sdb_send_ptr_tmp = cpu_to_le32(sdb_send_ptr);
+ +		sdb_issue_ptr_tmp = cpu_to_le32(sdb_issue_ptr);
+ +		if (roce_get_field(sdb_issue_ptr_tmp,
+ +				   ROCEE_SDB_ISSUE_PTR_SDB_ISSUE_PTR_M,
+ +				   ROCEE_SDB_ISSUE_PTR_SDB_ISSUE_PTR_S) ==
+ +		    roce_get_field(sdb_send_ptr_tmp,
+ +				   ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M,
+ +				   ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S)) {
+ +			old_send = roce_read(hr_dev, ROCEE_SDB_SEND_PTR_REG);
+ +			old_retry = roce_read(hr_dev, ROCEE_SDB_RETRY_CNT_REG);
+ +
+ +			do {
+ +				tsp_st = roce_read(hr_dev, ROCEE_TSP_BP_ST_REG);
+ +				tmp = cpu_to_le32(tsp_st);
+ +				if (roce_get_bit(tmp,
+ +					ROCEE_TSP_BP_ST_QH_FIFO_ENTRY_S) == 1) {
+ +					*wait_stage = HNS_ROCE_V1_DB_WAIT_OK;
+ +					return 0;
+ +				}
+ +
+ +				if (!time_before(jiffies, end)) {
+ +					dev_dbg(dev, "QP(0x%lx) db process stage1 timeout when send ptr equals issue ptr.\n"
+ +						     "issue 0x%x send 0x%x.\n",
+ +						hr_qp->qpn,
+ +						le32_to_cpu(sdb_issue_ptr_tmp),
+ +						le32_to_cpu(sdb_send_ptr_tmp));
+ +					return 0;
+ +				}
+ +
+ +				msleep(HNS_ROCE_V1_CHECK_DB_SLEEP_MSECS);
+ +
+ +				hns_roce_check_sdb_status(hr_dev, &old_send,
+ +							  &old_retry, &tsp_st,
+ +							  &success_flags);
+ +			} while (!success_flags);
+ +		}
+ +
+ +		*wait_stage = HNS_ROCE_V1_DB_STAGE2;
+ +
+ +		/* Get list pointer */
+ +		*sdb_inv_cnt = roce_read(hr_dev, ROCEE_SDB_INV_CNT_REG);
+ +		dev_dbg(dev, "QP(0x%lx) db process stage2. inv cnt = 0x%x.\n",
+ +			hr_qp->qpn, *sdb_inv_cnt);
+ +	}
+ +
+ +	if (*wait_stage == HNS_ROCE_V1_DB_STAGE2) {
+ +		/* Query db's list status, until hw reversal */
+ +		inv_cnt = roce_read(hr_dev, ROCEE_SDB_INV_CNT_REG);
+ +		while (roce_hw_index_cmp_lt(inv_cnt,
+ +					    *sdb_inv_cnt + SDB_INV_CNT_OFFSET,
+ +					    ROCEE_SDB_CNT_CMP_BITS)) {
+ +			if (!time_before(jiffies, end)) {
+ +				dev_dbg(dev, "QP(0x%lx) db process stage2 timeout. inv cnt 0x%x.\n",
+ +					hr_qp->qpn, inv_cnt);
+ +				return 0;
+ +			}
+ +
+ +			msleep(HNS_ROCE_V1_CHECK_DB_SLEEP_MSECS);
+ +			inv_cnt = roce_read(hr_dev, ROCEE_SDB_INV_CNT_REG);
+ +		}
+ +
+ +		*wait_stage = HNS_ROCE_V1_DB_WAIT_OK;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int check_qp_reset_state(struct hns_roce_dev *hr_dev,
+ +				struct hns_roce_qp *hr_qp,
+ +				struct hns_roce_qp_work *qp_work_entry,
+ +				int *is_timeout)
+ +{
+ +	struct device *dev = &hr_dev->pdev->dev;
+ +	u32 sdb_issue_ptr;
+ +	int ret;
+ +
+ +	if (hr_qp->state != IB_QPS_RESET) {
+ +		/* Set qp to ERR, waiting for hw complete processing all dbs */
+ +		ret = hns_roce_v1_modify_qp(&hr_qp->ibqp, NULL, 0, hr_qp->state,
+ +					    IB_QPS_ERR);
+ +		if (ret) {
+ +			dev_err(dev, "Modify QP(0x%lx) to ERR failed!\n",
+ +				hr_qp->qpn);
+ +			return ret;
+ +		}
+ +
+ +		/* Record issued doorbell */
+ +		sdb_issue_ptr = roce_read(hr_dev, ROCEE_SDB_ISSUE_PTR_REG);
+ +		qp_work_entry->sdb_issue_ptr = sdb_issue_ptr;
+ +		qp_work_entry->db_wait_stage = HNS_ROCE_V1_DB_STAGE1;
+ +
+ +		/* Query db process status, until hw process completely */
+ +		ret = check_qp_db_process_status(hr_dev, hr_qp, sdb_issue_ptr,
+ +						 &qp_work_entry->sdb_inv_cnt,
+ +						 &qp_work_entry->db_wait_stage);
+ +		if (ret) {
+ +			dev_err(dev, "Check QP(0x%lx) db process status failed!\n",
+ +				hr_qp->qpn);
+ +			return ret;
+ +		}
+ +
+ +		if (qp_work_entry->db_wait_stage != HNS_ROCE_V1_DB_WAIT_OK) {
+ +			qp_work_entry->sche_cnt = 0;
+ +			*is_timeout = 1;
+ +			return 0;
+ +		}
+ +
+ +		/* Modify qp to reset before destroying qp */
+ +		ret = hns_roce_v1_modify_qp(&hr_qp->ibqp, NULL, 0, hr_qp->state,
+ +					    IB_QPS_RESET);
+ +		if (ret) {
+ +			dev_err(dev, "Modify QP(0x%lx) to RST failed!\n",
+ +				hr_qp->qpn);
+ +			return ret;
+ +		}
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static void hns_roce_v1_destroy_qp_work_fn(struct work_struct *work)
+ +{
+ +	struct hns_roce_qp_work *qp_work_entry;
+ +	struct hns_roce_v1_priv *priv;
+ +	struct hns_roce_dev *hr_dev;
+ +	struct hns_roce_qp *hr_qp;
+ +	struct device *dev;
+ +	unsigned long qpn;
+ +	int ret;
+ +
+ +	qp_work_entry = container_of(work, struct hns_roce_qp_work, work);
+ +	hr_dev = to_hr_dev(qp_work_entry->ib_dev);
+ +	dev = &hr_dev->pdev->dev;
+ +	priv = (struct hns_roce_v1_priv *)hr_dev->priv;
+ +	hr_qp = qp_work_entry->qp;
+ +	qpn = hr_qp->qpn;
+ +
+ +	dev_dbg(dev, "Schedule destroy QP(0x%lx) work.\n", qpn);
+ +
+ +	qp_work_entry->sche_cnt++;
+ +
+ +	/* Query db process status, until hw process completely */
+ +	ret = check_qp_db_process_status(hr_dev, hr_qp,
+ +					 qp_work_entry->sdb_issue_ptr,
+ +					 &qp_work_entry->sdb_inv_cnt,
+ +					 &qp_work_entry->db_wait_stage);
+ +	if (ret) {
+ +		dev_err(dev, "Check QP(0x%lx) db process status failed!\n",
+ +			qpn);
+ +		return;
+ +	}
+ +
+ +	if (qp_work_entry->db_wait_stage != HNS_ROCE_V1_DB_WAIT_OK &&
+ +	    priv->des_qp.requeue_flag) {
+ +		queue_work(priv->des_qp.qp_wq, work);
+ +		return;
+ +	}
+ +
+ +	/* Modify qp to reset before destroying qp */
+ +	ret = hns_roce_v1_modify_qp(&hr_qp->ibqp, NULL, 0, hr_qp->state,
+ +				    IB_QPS_RESET);
+ +	if (ret) {
+ +		dev_err(dev, "Modify QP(0x%lx) to RST failed!\n", qpn);
+ +		return;
+ +	}
+ +
+ +	hns_roce_qp_remove(hr_dev, hr_qp);
+ +	hns_roce_qp_free(hr_dev, hr_qp);
+ +
+ +	if (hr_qp->ibqp.qp_type == IB_QPT_RC) {
+ +		/* RC QP, release QPN */
+ +		hns_roce_release_range_qp(hr_dev, qpn, 1);
+ +		kfree(hr_qp);
+ +	} else
+ +		kfree(hr_to_hr_sqp(hr_qp));
+ +
+ +	kfree(qp_work_entry);
+ +
+ +	dev_dbg(dev, "Accomplished destroy QP(0x%lx) work.\n", qpn);
+ +}
+ +
+ +int hns_roce_v1_destroy_qp(struct ib_qp *ibqp)
+++=======
++ int hns_roce_v1_destroy_qp(struct ib_qp *ibqp, struct ib_udata *udata)
+++>>>>>>> 574258222281 (RDMA/hns: Remove asynchronic QP destroy)
+  {
+  	struct hns_roce_dev *hr_dev = to_hr_dev(ibqp->device);
+  	struct hns_roce_qp *hr_qp = to_hr_qp(ibqp);
+diff --git a/drivers/infiniband/hw/hns/hns_roce_common.h b/drivers/infiniband/hw/hns/hns_roce_common.h
+index f4c92a7ac1ce..8e95a1aa1b4f 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_common.h
++++ b/drivers/infiniband/hw/hns/hns_roce_common.h
+@@ -57,32 +57,6 @@
+ #define roce_set_bit(origin, shift, val) \
+ 	roce_set_field((origin), (1ul << (shift)), (shift), (val))
+ 
+-/*
+- * roce_hw_index_cmp_lt - Compare two hardware index values in hisilicon
+- *                        SOC, check if a is less than b.
+- * @a: hardware index value
+- * @b: hardware index value
+- * @bits: the number of bits of a and b, range: 0~31.
+- *
+- * Hardware index increases continuously till max value, and then restart
+- * from zero, again and again. Because the bits of reg field is often
+- * limited, the reg field can only hold the low bits of the hardware index
+- * in hisilicon SOC.
+- * In some scenes we need to compare two values(a,b) getted from two reg
+- * fields in this driver, for example:
+- * If a equals 0xfffe, b equals 0x1 and bits equals 16, we think b has
+- * incresed from 0xffff to 0x1 and a is less than b.
+- * If a equals 0xfffe, b equals 0x0xf001 and bits equals 16, we think a
+- * is bigger than b.
+- *
+- * Return true on a less than b, otherwise false.
+- */
+-#define roce_hw_index_mask(bits)	((1ul << (bits)) - 1)
+-#define roce_hw_index_shift(bits)	(32 - (bits))
+-#define roce_hw_index_cmp_lt(a, b, bits) \
+-	((int)((((a) - (b)) & roce_hw_index_mask(bits)) << \
+-		roce_hw_index_shift(bits)) < 0)
+-
+ #define ROCEE_GLB_CFG_ROCEE_DB_SQ_MODE_S 3
+ #define ROCEE_GLB_CFG_ROCEE_DB_OTH_MODE_S 4
+ 
+@@ -271,8 +245,6 @@
+ #define ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_M   \
+ 	(((1UL << 28) - 1) << ROCEE_SDB_SEND_PTR_SDB_SEND_PTR_S)
+ 
+-#define ROCEE_SDB_PTR_CMP_BITS 28
+-
+ #define ROCEE_SDB_INV_CNT_SDB_INV_CNT_S 0
+ #define ROCEE_SDB_INV_CNT_SDB_INV_CNT_M   \
+ 	(((1UL << 16) - 1) << ROCEE_SDB_INV_CNT_SDB_INV_CNT_S)
+@@ -353,13 +325,8 @@
+ #define ROCEE_CAEP_AE_MASK_REG			0x6C8
+ #define ROCEE_CAEP_AE_ST_REG			0x6CC
+ 
+-#define ROCEE_SDB_ISSUE_PTR_REG			0x758
+-#define ROCEE_SDB_SEND_PTR_REG			0x75C
+ #define ROCEE_CAEP_CQE_WCMD_EMPTY		0x850
+ #define ROCEE_SCAEP_WR_CQE_CNT			0x8D0
+-#define ROCEE_SDB_INV_CNT_REG			0x9A4
+-#define ROCEE_SDB_RETRY_CNT_REG			0x9AC
+-#define ROCEE_TSP_BP_ST_REG			0x9EC
+ #define ROCEE_ECC_UCERR_ALM0_REG		0xB34
+ #define ROCEE_ECC_CERR_ALM0_REG			0xB40
+ 
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_hw_v1.c
+diff --git a/drivers/infiniband/hw/hns/hns_roce_hw_v1.h b/drivers/infiniband/hw/hns/hns_roce_hw_v1.h
+index 66440147d9eb..7edd2eb8214e 100644
+--- a/drivers/infiniband/hw/hns/hns_roce_hw_v1.h
++++ b/drivers/infiniband/hw/hns/hns_roce_hw_v1.h
+@@ -110,11 +110,6 @@
+ #define HNS_ROCE_V1_EXT_ODB_ALFUL	\
+ 	(HNS_ROCE_V1_EXT_ODB_DEPTH - HNS_ROCE_V1_DB_RSVD)
+ 
+-#define HNS_ROCE_V1_DB_WAIT_OK				0
+-#define HNS_ROCE_V1_DB_STAGE1				1
+-#define HNS_ROCE_V1_DB_STAGE2				2
+-#define HNS_ROCE_V1_CHECK_DB_TIMEOUT_MSECS		10000
+-#define HNS_ROCE_V1_CHECK_DB_SLEEP_MSECS		20
+ #define HNS_ROCE_V1_FREE_MR_TIMEOUT_MSECS		50000
+ #define HNS_ROCE_V1_RECREATE_LP_QP_TIMEOUT_MSECS	10000
+ #define HNS_ROCE_V1_FREE_MR_WAIT_VALUE			5
+@@ -162,7 +157,6 @@
+ #define SQ_PSN_SHIFT					8
+ #define QKEY_VAL					0x80010000
+ #define SDB_INV_CNT_OFFSET				8
+-#define SDB_ST_CMP_VAL					8
+ 
+ #define HNS_ROCE_CEQ_DEFAULT_INTERVAL			0x10
+ #define HNS_ROCE_CEQ_DEFAULT_BURST_NUM			0x10
+@@ -1068,11 +1062,6 @@ struct hns_roce_qp_work {
+ 	u32	sche_cnt;
+ };
+ 
+-struct hns_roce_des_qp {
+-	struct workqueue_struct	*qp_wq;
+-	int	requeue_flag;
+-};
+-
+ struct hns_roce_mr_free_work {
+ 	struct	work_struct work;
+ 	struct	ib_device *ib_dev;
+@@ -1100,7 +1089,6 @@ struct hns_roce_v1_priv {
+ 	struct hns_roce_raq_table raq_table;
+ 	struct hns_roce_bt_table  bt_table;
+ 	struct hns_roce_tptr_table tptr_table;
+-	struct hns_roce_des_qp des_qp;
+ 	struct hns_roce_free_mr free_mr;
+ };
+ 
