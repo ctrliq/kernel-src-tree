@@ -1,0 +1,207 @@
+iommu/amd: Fix race in increase_address_space()/fetch_pte()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit eb791aa70b90c559eeb371d807c8813d569393f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/eb791aa7.failed
+
+The 'pt_root' and 'mode' struct members of 'struct protection_domain'
+need to be get/set atomically, otherwise the page-table of the domain
+can get corrupted.
+
+Merge the fields into one atomic64_t struct member which can be
+get/set atomically.
+
+Fixes: 92d420ec028d ("iommu/amd: Relax locking in dma_ops path")
+	Reported-by: Qian Cai <cai@lca.pw>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Qian Cai <cai@lca.pw>
+Link: https://lore.kernel.org/r/20200504125413.16798-2-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit eb791aa70b90c559eeb371d807c8813d569393f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/amd_iommu.c
+diff --cc drivers/iommu/amd_iommu.c
+index 6213e619c569,28229a38af4d..000000000000
+--- a/drivers/iommu/amd_iommu.c
++++ b/drivers/iommu/amd_iommu.c
+@@@ -199,10 -151,24 +199,31 @@@ static struct protection_domain *to_pdo
+  	return container_of(dom, struct protection_domain, domain);
+  }
+  
+++<<<<<<< HEAD
+ +static struct dma_ops_domain* to_dma_ops_domain(struct protection_domain *domain)
+ +{
+ +	BUG_ON(domain->flags != PD_DMA_OPS_MASK);
+ +	return container_of(domain, struct dma_ops_domain, domain);
+++=======
++ static void amd_iommu_domain_get_pgtable(struct protection_domain *domain,
++ 					 struct domain_pgtable *pgtable)
++ {
++ 	u64 pt_root = atomic64_read(&domain->pt_root);
++ 
++ 	pgtable->root = (u64 *)(pt_root & PAGE_MASK);
++ 	pgtable->mode = pt_root & 7; /* lowest 3 bits encode pgtable mode */
++ }
++ 
++ static u64 amd_iommu_domain_encode_pgtable(u64 *root, int mode)
++ {
++ 	u64 pt_root;
++ 
++ 	/* lowest 3 bits encode pgtable mode */
++ 	pt_root = mode & 7;
++ 	pt_root |= (u64)root;
++ 
++ 	return pt_root;
+++>>>>>>> eb791aa70b90 (iommu/amd: Fix race in increase_address_space()/fetch_pte())
+  }
+  
+  static struct iommu_dev_data *alloc_dev_data(u16 devid)
+@@@ -1922,35 -1841,33 +1961,53 @@@ static void dma_ops_domain_free(struct 
+   * It also initializes the page table and the address allocator data
+   * structures required for the dma_ops interface
+   */
+ -static struct protection_domain *dma_ops_domain_alloc(void)
+ +static struct dma_ops_domain *dma_ops_domain_alloc(void)
+  {
+++<<<<<<< HEAD
+ +	struct dma_ops_domain *dma_dom;
+++=======
++ 	struct protection_domain *domain;
++ 	u64 *pt_root, root;
+++>>>>>>> eb791aa70b90 (iommu/amd: Fix race in increase_address_space()/fetch_pte())
+  
+ -	domain = kzalloc(sizeof(struct protection_domain), GFP_KERNEL);
+ -	if (!domain)
+ +	dma_dom = kzalloc(sizeof(struct dma_ops_domain), GFP_KERNEL);
+ +	if (!dma_dom)
+  		return NULL;
+  
+ -	if (protection_domain_init(domain))
+ -		goto free_domain;
+ +	if (protection_domain_init(&dma_dom->domain))
+ +		goto free_dma_dom;
+ +
+++<<<<<<< HEAD
+ +	dma_dom->domain.mode = PAGE_MODE_3_LEVEL;
+ +	dma_dom->domain.pt_root = (void *)get_zeroed_page(GFP_KERNEL);
+ +	dma_dom->domain.flags = PD_DMA_OPS_MASK;
+ +	if (!dma_dom->domain.pt_root)
+ +		goto free_dma_dom;
+  
+ +	init_iova_domain(&dma_dom->iovad, PAGE_SIZE, IOVA_START_PFN);
+++=======
++ 	pt_root = (void *)get_zeroed_page(GFP_KERNEL);
++ 	if (!pt_root)
++ 		goto free_domain;
++ 
++ 	root = amd_iommu_domain_encode_pgtable(pt_root, PAGE_MODE_3_LEVEL);
++ 	atomic64_set(&domain->pt_root, root);
++ 	domain->flags = PD_DMA_OPS_MASK;
++ 
++ 	if (iommu_get_dma_cookie(&domain->domain) == -ENOMEM)
++ 		goto free_domain;
+++>>>>>>> eb791aa70b90 (iommu/amd: Fix race in increase_address_space()/fetch_pte())
+  
+ -	return domain;
+ +	if (init_iova_flush_queue(&dma_dom->iovad, iova_domain_flush_tlb, NULL))
+ +		goto free_dma_dom;
+ +
+ +	/* Initialize reserved ranges */
+ +	copy_reserved_iova(&reserved_iova_ranges, &dma_dom->iovad);
+ +
+ +	return dma_dom;
+  
+ -free_domain:
+ -	dma_ops_domain_free(domain);
+ +free_dma_dom:
+ +	dma_ops_domain_free(dma_dom);
+  
+  	return NULL;
+  }
+@@@ -2964,7 -2419,7 +3024,11 @@@ out_err
+  static struct iommu_domain *amd_iommu_domain_alloc(unsigned type)
+  {
+  	struct protection_domain *pdomain;
+++<<<<<<< HEAD
+ +	struct dma_ops_domain *dma_domain;
+++=======
++ 	u64 *pt_root, root;
+++>>>>>>> eb791aa70b90 (iommu/amd: Fix race in increase_address_space()/fetch_pte())
+  
+  	switch (type) {
+  	case IOMMU_DOMAIN_UNMANAGED:
+@@@ -3009,7 -2465,7 +3075,11 @@@
+  static void amd_iommu_domain_free(struct iommu_domain *dom)
+  {
+  	struct protection_domain *domain;
+++<<<<<<< HEAD
+ +	struct dma_ops_domain *dma_dom;
+++=======
++ 	struct domain_pgtable pgtable;
+++>>>>>>> eb791aa70b90 (iommu/amd: Fix race in increase_address_space()/fetch_pte())
+  
+  	domain = to_pdomain(dom);
+  
+@@@ -3024,11 -2480,12 +3094,13 @@@
+  	switch (dom->type) {
+  	case IOMMU_DOMAIN_DMA:
+  		/* Now release the domain */
+ -		dma_ops_domain_free(domain);
+ +		dma_dom = to_dma_ops_domain(domain);
+ +		dma_ops_domain_free(dma_dom);
+  		break;
+  	default:
+- 		if (domain->mode != PAGE_MODE_NONE)
++ 		amd_iommu_domain_get_pgtable(domain, &pgtable);
++ 
++ 		if (pgtable.mode != PAGE_MODE_NONE)
+  			free_pagetable(domain);
+  
+  		if (domain->flags & PD_IOMMUV2_MASK)
+@@@ -3106,9 -2564,11 +3178,10 @@@ static int amd_iommu_attach_device(stru
+  }
+  
+  static int amd_iommu_map(struct iommu_domain *dom, unsigned long iova,
+ -			 phys_addr_t paddr, size_t page_size, int iommu_prot,
+ -			 gfp_t gfp)
+ +			 phys_addr_t paddr, size_t page_size, int iommu_prot)
+  {
+  	struct protection_domain *domain = to_pdomain(dom);
++ 	struct domain_pgtable pgtable;
+  	int prot = 0;
+  	int ret;
+  
+* Unmerged path drivers/iommu/amd_iommu.c
+diff --git a/drivers/iommu/amd_iommu_types.h b/drivers/iommu/amd_iommu_types.h
+index 34d7de7b2ee7..1adb4e0ba96d 100644
+--- a/drivers/iommu/amd_iommu_types.h
++++ b/drivers/iommu/amd_iommu_types.h
+@@ -480,8 +480,7 @@ struct protection_domain {
+ 				       iommu core code */
+ 	spinlock_t lock;	/* mostly used to lock the page table*/
+ 	u16 id;			/* the domain id written to the device table */
+-	int mode;		/* paging mode (0-6 levels) */
+-	u64 *pt_root;		/* page table root pointer */
++	atomic64_t pt_root;	/* pgtable root and pgtable mode */
+ 	int glx;		/* Number of levels for GCR3 table */
+ 	u64 *gcr3_tbl;		/* Guest CR3 table */
+ 	unsigned long flags;	/* flags to find out type of domain */
+@@ -489,6 +488,12 @@ struct protection_domain {
+ 	unsigned dev_iommu[MAX_IOMMUS]; /* per-IOMMU reference count */
+ };
+ 
++/* For decocded pt_root */
++struct domain_pgtable {
++	int mode;
++	u64 *root;
++};
++
+ /*
+  * Structure where we save information about one hardware AMD IOMMU in the
+  * system.
