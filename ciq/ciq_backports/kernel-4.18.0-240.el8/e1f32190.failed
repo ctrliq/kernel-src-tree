@@ -1,0 +1,260 @@
+tipc: add support for AEAD key setting via netlink
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit e1f32190cf7ddd55778b460e7d44af3f76529698
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e1f32190.failed
+
+This commit adds two netlink commands to TIPC in order for user to be
+able to set or remove AEAD keys:
+- TIPC_NL_KEY_SET
+- TIPC_NL_KEY_FLUSH
+
+When the 'KEY_SET' is given along with the key data, the key will be
+initiated and attached to TIPC crypto. On the other hand, the
+'KEY_FLUSH' command will remove all existing keys if any.
+
+	Acked-by: Ying Xue <ying.xue@windreiver.com>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e1f32190cf7ddd55778b460e7d44af3f76529698)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/node.c
+#	net/tipc/node.h
+diff --cc net/tipc/node.c
+index 3fe27ab13350,aaf595613e6e..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -2546,11 -2760,141 +2546,149 @@@ int tipc_nl_node_dump_monitor_peer(stru
+  	return skb->len;
+  }
+  
+++<<<<<<< HEAD
+ +u32 tipc_node_get_addr(struct tipc_node *node)
+ +{
+ +	return (node) ? node->addr : 0;
+ +}
+ +
+++=======
++ #ifdef CONFIG_TIPC_CRYPTO
++ static int tipc_nl_retrieve_key(struct nlattr **attrs,
++ 				struct tipc_aead_key **key)
++ {
++ 	struct nlattr *attr = attrs[TIPC_NLA_NODE_KEY];
++ 
++ 	if (!attr)
++ 		return -ENODATA;
++ 
++ 	*key = (struct tipc_aead_key *)nla_data(attr);
++ 	if (nla_len(attr) < tipc_aead_key_size(*key))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static int tipc_nl_retrieve_nodeid(struct nlattr **attrs, u8 **node_id)
++ {
++ 	struct nlattr *attr = attrs[TIPC_NLA_NODE_ID];
++ 
++ 	if (!attr)
++ 		return -ENODATA;
++ 
++ 	if (nla_len(attr) < TIPC_NODEID_LEN)
++ 		return -EINVAL;
++ 
++ 	*node_id = (u8 *)nla_data(attr);
++ 	return 0;
++ }
++ 
++ int __tipc_nl_node_set_key(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct nlattr *attrs[TIPC_NLA_NODE_MAX + 1];
++ 	struct net *net = sock_net(skb->sk);
++ 	struct tipc_net *tn = tipc_net(net);
++ 	struct tipc_node *n = NULL;
++ 	struct tipc_aead_key *ukey;
++ 	struct tipc_crypto *c;
++ 	u8 *id, *own_id;
++ 	int rc = 0;
++ 
++ 	if (!info->attrs[TIPC_NLA_NODE])
++ 		return -EINVAL;
++ 
++ 	rc = nla_parse_nested(attrs, TIPC_NLA_NODE_MAX,
++ 			      info->attrs[TIPC_NLA_NODE],
++ 			      tipc_nl_node_policy, info->extack);
++ 	if (rc)
++ 		goto exit;
++ 
++ 	own_id = tipc_own_id(net);
++ 	if (!own_id) {
++ 		rc = -EPERM;
++ 		goto exit;
++ 	}
++ 
++ 	rc = tipc_nl_retrieve_key(attrs, &ukey);
++ 	if (rc)
++ 		goto exit;
++ 
++ 	rc = tipc_aead_key_validate(ukey);
++ 	if (rc)
++ 		goto exit;
++ 
++ 	rc = tipc_nl_retrieve_nodeid(attrs, &id);
++ 	switch (rc) {
++ 	case -ENODATA:
++ 		/* Cluster key mode */
++ 		rc = tipc_crypto_key_init(tn->crypto_tx, ukey, CLUSTER_KEY);
++ 		break;
++ 	case 0:
++ 		/* Per-node key mode */
++ 		if (!memcmp(id, own_id, NODE_ID_LEN)) {
++ 			c = tn->crypto_tx;
++ 		} else {
++ 			n = tipc_node_find_by_id(net, id) ?:
++ 				tipc_node_create(net, 0, id, 0xffffu, 0, true);
++ 			if (unlikely(!n)) {
++ 				rc = -ENOMEM;
++ 				break;
++ 			}
++ 			c = n->crypto_rx;
++ 		}
++ 
++ 		rc = tipc_crypto_key_init(c, ukey, PER_NODE_KEY);
++ 		if (n)
++ 			tipc_node_put(n);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ exit:
++ 	return (rc < 0) ? rc : 0;
++ }
++ 
++ int tipc_nl_node_set_key(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = __tipc_nl_node_set_key(skb, info);
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ 
++ int __tipc_nl_node_flush_key(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	struct net *net = sock_net(skb->sk);
++ 	struct tipc_net *tn = tipc_net(net);
++ 	struct tipc_node *n;
++ 
++ 	tipc_crypto_key_flush(tn->crypto_tx);
++ 	rcu_read_lock();
++ 	list_for_each_entry_rcu(n, &tn->node_list, list)
++ 		tipc_crypto_key_flush(n->crypto_rx);
++ 	rcu_read_unlock();
++ 
++ 	pr_info("All keys are flushed!\n");
++ 	return 0;
++ }
++ 
++ int tipc_nl_node_flush_key(struct sk_buff *skb, struct genl_info *info)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = __tipc_nl_node_flush_key(skb, info);
++ 	rtnl_unlock();
++ 
++ 	return err;
++ }
++ #endif
++ 
+++>>>>>>> e1f32190cf7d (tipc: add support for AEAD key setting via netlink)
+  /**
+   * tipc_node_dump - dump TIPC node data
+   * @n: tipc node to be dumped
+diff --cc net/tipc/node.h
+index b9036f289aea,a6803b449a2c..000000000000
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@@ -110,4 -119,9 +110,12 @@@ int tipc_nl_node_get_monitor(struct sk_
+  int tipc_nl_node_dump_monitor(struct sk_buff *skb, struct netlink_callback *cb);
+  int tipc_nl_node_dump_monitor_peer(struct sk_buff *skb,
+  				   struct netlink_callback *cb);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TIPC_CRYPTO
++ int tipc_nl_node_set_key(struct sk_buff *skb, struct genl_info *info);
++ int tipc_nl_node_flush_key(struct sk_buff *skb, struct genl_info *info);
++ #endif
++ void tipc_node_pre_cleanup_net(struct net *exit_net);
+++>>>>>>> e1f32190cf7d (tipc: add support for AEAD key setting via netlink)
+  #endif
+diff --git a/include/uapi/linux/tipc_netlink.h b/include/uapi/linux/tipc_netlink.h
+index efb958fd167d..6c2194ab745b 100644
+--- a/include/uapi/linux/tipc_netlink.h
++++ b/include/uapi/linux/tipc_netlink.h
+@@ -63,6 +63,8 @@ enum {
+ 	TIPC_NL_PEER_REMOVE,
+ 	TIPC_NL_BEARER_ADD,
+ 	TIPC_NL_UDP_GET_REMOTEIP,
++	TIPC_NL_KEY_SET,
++	TIPC_NL_KEY_FLUSH,
+ 
+ 	__TIPC_NL_CMD_MAX,
+ 	TIPC_NL_CMD_MAX = __TIPC_NL_CMD_MAX - 1
+@@ -160,6 +162,8 @@ enum {
+ 	TIPC_NLA_NODE_UNSPEC,
+ 	TIPC_NLA_NODE_ADDR,		/* u32 */
+ 	TIPC_NLA_NODE_UP,		/* flag */
++	TIPC_NLA_NODE_ID,		/* data */
++	TIPC_NLA_NODE_KEY,		/* data */
+ 
+ 	__TIPC_NLA_NODE_MAX,
+ 	TIPC_NLA_NODE_MAX = __TIPC_NLA_NODE_MAX - 1
+diff --git a/net/tipc/netlink.c b/net/tipc/netlink.c
+index d6165ad384c0..90aae55ae9d0 100644
+--- a/net/tipc/netlink.c
++++ b/net/tipc/netlink.c
+@@ -102,7 +102,11 @@ const struct nla_policy tipc_nl_link_policy[TIPC_NLA_LINK_MAX + 1] = {
+ const struct nla_policy tipc_nl_node_policy[TIPC_NLA_NODE_MAX + 1] = {
+ 	[TIPC_NLA_NODE_UNSPEC]		= { .type = NLA_UNSPEC },
+ 	[TIPC_NLA_NODE_ADDR]		= { .type = NLA_U32 },
+-	[TIPC_NLA_NODE_UP]		= { .type = NLA_FLAG }
++	[TIPC_NLA_NODE_UP]		= { .type = NLA_FLAG },
++	[TIPC_NLA_NODE_ID]		= { .type = NLA_BINARY,
++					    .len = TIPC_NODEID_LEN},
++	[TIPC_NLA_NODE_KEY]		= { .type = NLA_BINARY,
++					    .len = TIPC_AEAD_KEY_SIZE_MAX},
+ };
+ 
+ /* Properties valid for media, bearer and link */
+@@ -254,6 +258,18 @@ static const struct genl_ops tipc_genl_v2_ops[] = {
+ 		.dumpit	= tipc_udp_nl_dump_remoteip,
+ 	},
+ #endif
++#ifdef CONFIG_TIPC_CRYPTO
++	{
++		.cmd	= TIPC_NL_KEY_SET,
++		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.doit	= tipc_nl_node_set_key,
++	},
++	{
++		.cmd	= TIPC_NL_KEY_FLUSH,
++		.validate = GENL_DONT_VALIDATE_STRICT | GENL_DONT_VALIDATE_DUMP,
++		.doit	= tipc_nl_node_flush_key,
++	},
++#endif
+ };
+ 
+ struct genl_family tipc_genl_family __ro_after_init = {
+* Unmerged path net/tipc/node.c
+* Unmerged path net/tipc/node.h
