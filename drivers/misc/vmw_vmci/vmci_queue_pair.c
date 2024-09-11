@@ -2221,7 +2221,6 @@ int vmci_qp_broker_map(struct vmci_handle handle,
 {
 	struct qp_broker_entry *entry;
 	const u32 context_id = vmci_ctx_get_id(context);
-	bool is_local = false;
 	int result;
 
 	if (vmci_handle_is_invalid(handle) || !context ||
@@ -2250,7 +2249,6 @@ int vmci_qp_broker_map(struct vmci_handle handle,
 		goto out;
 	}
 
-	is_local = entry->qp.flags & VMCI_QPFLAG_LOCAL;
 	result = VMCI_SUCCESS;
 
 	if (context_id != VMCI_HOST_CONTEXT_ID) {
@@ -2332,7 +2330,6 @@ int vmci_qp_broker_unmap(struct vmci_handle handle,
 {
 	struct qp_broker_entry *entry;
 	const u32 context_id = vmci_ctx_get_id(context);
-	bool is_local = false;
 	int result;
 
 	if (vmci_handle_is_invalid(handle) || !context ||
@@ -2360,8 +2357,6 @@ int vmci_qp_broker_unmap(struct vmci_handle handle,
 		result = VMCI_ERROR_QUEUEPAIR_NOTATTACHED;
 		goto out;
 	}
-
-	is_local = entry->qp.flags & VMCI_QPFLAG_LOCAL;
 
 	if (context_id != VMCI_HOST_CONTEXT_ID) {
 		qp_acquire_queue_mutex(entry->produce_q);
