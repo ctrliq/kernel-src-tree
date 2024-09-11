@@ -1,0 +1,174 @@
+iommu/arm-smmu: Abstract context bank accesses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 19713fd40df8e65759e836129671be5f6f21c626
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/19713fd4.failed
+
+Context bank accesses are fiddly enough to deserve a number of extra
+helpers to keep the callsites looking sane, even though there are only
+one or two of each.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 19713fd40df8e65759e836129671be5f6f21c626)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu.c
+diff --cc drivers/iommu/arm-smmu.c
+index 9a0dbef6026f,e72554f334ee..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -92,20 -82,6 +92,23 @@@
+  		((smmu->options & ARM_SMMU_OPT_SECURE_CFG_ACCESS)	\
+  			? 0x400 : 0))
+  
+++<<<<<<< HEAD
+ +/*
+ + * Some 64-bit registers only make sense to write atomically, but in such
+ + * cases all the data relevant to AArch32 formats lies within the lower word,
+ + * therefore this actually makes more sense than it might first appear.
+ + */
+ +#ifdef CONFIG_64BIT
+ +#define smmu_write_atomic_lq		writeq_relaxed
+ +#else
+ +#define smmu_write_atomic_lq		writel_relaxed
+ +#endif
+ +
+ +/* Translation context bank */
+ +#define ARM_SMMU_CB(smmu, n)	((smmu)->cb_base + ((n) << (smmu)->pgshift))
+ +
+++=======
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  #define MSI_IOVA_BASE			0x8000000
+  #define MSI_IOVA_LENGTH			0x100000
+  
+@@@ -526,46 -518,57 +549,90 @@@ static void arm_smmu_tlb_inv_context_s2
+  	arm_smmu_tlb_sync_global(smmu);
+  }
+  
+ -static void arm_smmu_tlb_inv_range_s1(unsigned long iova, size_t size,
+ -				      size_t granule, bool leaf, void *cookie)
+ +static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
+ +					  size_t granule, bool leaf, void *cookie)
+  {
+  	struct arm_smmu_domain *smmu_domain = cookie;
+ -	struct arm_smmu_device *smmu = smmu_domain->smmu;
+  	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+++<<<<<<< HEAD
+ +	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+ +	void __iomem *reg = ARM_SMMU_CB(smmu_domain->smmu, cfg->cbndx);
+++=======
++ 	int reg, idx = cfg->cbndx;
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  
+ -	if (smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
+ +	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
+  		wmb();
+  
+++<<<<<<< HEAD
+ +	if (stage1) {
+ +		reg += leaf ? ARM_SMMU_CB_S1_TLBIVAL : ARM_SMMU_CB_S1_TLBIVA;
+ +
+ +		if (cfg->fmt != ARM_SMMU_CTX_FMT_AARCH64) {
+ +			iova = (iova >> 12) << 12;
+ +			iova |= cfg->asid;
+ +			do {
+ +				writel_relaxed(iova, reg);
+ +				iova += granule;
+ +			} while (size -= granule);
+ +		} else {
+ +			iova >>= 12;
+ +			iova |= (u64)cfg->asid << 48;
+ +			do {
+ +				writeq_relaxed(iova, reg);
+ +				iova += granule >> 12;
+ +			} while (size -= granule);
+ +		}
+++=======
++ 	reg = leaf ? ARM_SMMU_CB_S1_TLBIVAL : ARM_SMMU_CB_S1_TLBIVA;
++ 
++ 	if (cfg->fmt != ARM_SMMU_CTX_FMT_AARCH64) {
++ 		iova = (iova >> 12) << 12;
++ 		iova |= cfg->asid;
++ 		do {
++ 			arm_smmu_cb_write(smmu, idx, reg, iova);
++ 			iova += granule;
++ 		} while (size -= granule);
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  	} else {
+ +		reg += leaf ? ARM_SMMU_CB_S2_TLBIIPAS2L :
+ +			      ARM_SMMU_CB_S2_TLBIIPAS2;
+  		iova >>= 12;
+ -		iova |= (u64)cfg->asid << 48;
+  		do {
+++<<<<<<< HEAD
+ +			smmu_write_atomic_lq(iova, reg);
+++=======
++ 			arm_smmu_cb_writeq(smmu, idx, reg, iova);
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  			iova += granule >> 12;
+  		} while (size -= granule);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void arm_smmu_tlb_inv_range_s2(unsigned long iova, size_t size,
++ 				      size_t granule, bool leaf, void *cookie)
++ {
++ 	struct arm_smmu_domain *smmu_domain = cookie;
++ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
++ 	int reg, idx = smmu_domain->cfg.cbndx;
++ 
++ 	if (smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
++ 		wmb();
++ 
++ 	reg = leaf ? ARM_SMMU_CB_S2_TLBIIPAS2L : ARM_SMMU_CB_S2_TLBIIPAS2;
++ 	iova >>= 12;
++ 	do {
++ 		if (smmu_domain->cfg.fmt == ARM_SMMU_CTX_FMT_AARCH64)
++ 			arm_smmu_cb_writeq(smmu, idx, reg, iova);
++ 		else
++ 			arm_smmu_cb_write(smmu, idx, reg, iova);
++ 		iova += granule >> 12;
++ 	} while (size -= granule);
++ }
++ 
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  /*
+   * On MMU-401 at least, the cost of firing off multiple TLBIVMIDs appears
+   * almost negligible, but the benefit of getting the first one in as far ahead
+@@@ -1432,18 -1392,15 +1494,23 @@@ static phys_addr_t arm_smmu_iova_to_phy
+  	if (ret < 0)
+  		return 0;
+  
+- 	cb_base = ARM_SMMU_CB(smmu, cfg->cbndx);
+- 
+  	spin_lock_irqsave(&smmu_domain->cb_lock, flags);
+ +	/* ATS1 registers can only be written atomically */
+  	va = iova & ~0xfffUL;
+++<<<<<<< HEAD
+ +	if (smmu->version == ARM_SMMU_V2)
+ +		smmu_write_atomic_lq(va, cb_base + ARM_SMMU_CB_ATS1PR);
+ +	else /* Register is only 32-bit in v1 */
+ +		writel_relaxed(va, cb_base + ARM_SMMU_CB_ATS1PR);
+++=======
++ 	if (cfg->fmt == ARM_SMMU_CTX_FMT_AARCH64)
++ 		arm_smmu_cb_writeq(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
++ 	else
++ 		arm_smmu_cb_write(smmu, idx, ARM_SMMU_CB_ATS1PR, va);
+++>>>>>>> 19713fd40df8 (iommu/arm-smmu: Abstract context bank accesses)
+  
+- 	if (readl_poll_timeout_atomic(cb_base + ARM_SMMU_CB_ATSR, tmp,
+- 				      !(tmp & ATSR_ACTIVE), 5, 50)) {
++ 	reg = arm_smmu_page(smmu, ARM_SMMU_CB(smmu, idx)) + ARM_SMMU_CB_ATSR;
++ 	if (readl_poll_timeout_atomic(reg, tmp, !(tmp & ATSR_ACTIVE), 5, 50)) {
+  		spin_unlock_irqrestore(&smmu_domain->cb_lock, flags);
+  		dev_err(dev,
+  			"iova to phys timed out on %pad. Falling back to software table walk.\n",
+* Unmerged path drivers/iommu/arm-smmu.c
