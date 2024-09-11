@@ -1,0 +1,127 @@
+block: bypass ->make_request_fn for blk-mq drivers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 8cf7961dab42c9177a556b719c15f5b9449c24d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8cf7961d.failed
+
+Call blk_mq_make_request when no ->make_request_fn is set.  This is
+safe now that blk_alloc_queue always sets up the pointer for make_request
+based drivers.  This avoids an indirect call in the blk-mq driver I/O
+fast path, which is rather expensive due to spectre mitigations.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8cf7961dab42c9177a556b719c15f5b9449c24d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 1e23696c4fb0,bcc3a2397d4a..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -3077,11 -2956,6 +3078,14 @@@ struct request_queue *blk_mq_init_alloc
+  	INIT_LIST_HEAD(&q->requeue_list);
+  	spin_lock_init(&q->requeue_lock);
+  
+++<<<<<<< HEAD
+ +	blk_queue_make_request(q, blk_mq_make_request);
+ +
+ +	/*
+ +	 * Do this after blk_queue_make_request() overrides it...
+ +	 */
+++=======
+++>>>>>>> 8cf7961dab42 (block: bypass ->make_request_fn for blk-mq drivers)
+  	q->nr_requests = set->queue_depth;
+  
+  	/*
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 556355f94c3a..dec350d4c021 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1080,7 +1080,10 @@ blk_qc_t generic_make_request(struct bio *bio)
+ 			/* Create a fresh bio_list for all subordinate requests */
+ 			bio_list_on_stack[1] = bio_list_on_stack[0];
+ 			bio_list_init(&bio_list_on_stack[0]);
+-			ret = q->make_request_fn(q, bio);
++			if (q->make_request_fn)
++				ret = q->make_request_fn(q, bio);
++			else
++				ret = blk_mq_make_request(q, bio);
+ 
+ 			blk_queue_exit(q);
+ 
+@@ -1120,9 +1123,7 @@ EXPORT_SYMBOL(generic_make_request);
+  *
+  * This function behaves like generic_make_request(), but does not protect
+  * against recursion.  Must only be used if the called driver is known
+- * to not call generic_make_request (or direct_make_request) again from
+- * its make_request function.  (Calling direct_make_request again from
+- * a workqueue is perfectly fine as that doesn't recurse).
++ * to be blk-mq based.
+  */
+ blk_qc_t direct_make_request(struct bio *bio)
+ {
+@@ -1130,20 +1131,27 @@ blk_qc_t direct_make_request(struct bio *bio)
+ 	bool nowait = bio->bi_opf & REQ_NOWAIT;
+ 	blk_qc_t ret;
+ 
++	if (WARN_ON_ONCE(q->make_request_fn))
++		goto io_error;
+ 	if (!generic_make_request_checks(bio))
+ 		return BLK_QC_T_NONE;
+ 
+ 	if (unlikely(blk_queue_enter(q, nowait ? BLK_MQ_REQ_NOWAIT : 0))) {
+ 		if (nowait && !blk_queue_dying(q))
+-			bio_wouldblock_error(bio);
+-		else
+-			bio_io_error(bio);
+-		return BLK_QC_T_NONE;
++			goto would_block;
++		goto io_error;
+ 	}
+ 
+-	ret = q->make_request_fn(q, bio);
++	ret = blk_mq_make_request(q, bio);
+ 	blk_queue_exit(q);
+ 	return ret;
++
++would_block:
++	bio_wouldblock_error(bio);
++	return BLK_QC_T_NONE;
++io_error:
++	bio_io_error(bio);
++	return BLK_QC_T_NONE;
+ }
+ EXPORT_SYMBOL_GPL(direct_make_request);
+ 
+* Unmerged path block/blk-mq.c
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 4432fad8e41a..37ff77f4ec49 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1744,6 +1744,9 @@ static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+ 	int srcu_idx;
+ 	struct dm_table *map;
+ 
++	if (dm_get_md_type(md) == DM_TYPE_REQUEST_BASED)
++		return blk_mq_make_request(q, bio);
++
+ 	map = dm_get_live_table(md, &srcu_idx);
+ 
+ 	/* if we're suspended, we have to queue this io for later */
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 200eeffcb439..fc557cf68f13 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -469,4 +469,6 @@ static inline void blk_mq_cleanup_rq(struct request *rq)
+ 		rq->q->mq_ops->cleanup_rq(rq);
+ }
+ 
++blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio);
++
+ #endif
