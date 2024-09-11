@@ -37,7 +37,7 @@ struct compat_ethtool_rxnfc {
 	compat_u64			data;
 	struct compat_ethtool_rx_flow_spec fs;
 	u32				rule_cnt;
-	u32				rule_locs[0];
+	u32				rule_locs[];
 };
 
 #endif /* CONFIG_COMPAT */
@@ -508,7 +508,7 @@ struct ethtool_ops {
 
 struct ethtool_rx_flow_rule {
 	struct flow_rule	*rule;
-	unsigned long		priv[0];
+	unsigned long		priv[];
 };
 
 struct ethtool_rx_flow_spec_input {
