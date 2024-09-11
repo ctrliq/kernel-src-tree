@@ -1,0 +1,250 @@
+perf header: Add die information in CPU topology
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit acae8b36cded0ee62038dedd0a44d54d5d673a96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/acae8b36.failed
+
+With the new CPUID.1F, a new level type of CPU topology, 'die', is
+introduced. The 'die' information in CPU topology should be added in
+perf header.
+
+To be compatible with old perf.data, the patch checks the section size
+before reading the die information. The new info is added at the end of
+the cpu_topology section, the old perf tool ignores the extra data.  It
+never reads data crossing the section boundary.
+
+The new perf tool with the patch can be used on legacy kernel. Add a new
+function has_die_topology() to check if die topology information is
+supported by kernel. The function only check X86 and CPU 0. Assuming
+other CPUs have same topology.
+
+Use similar method for core and socket to support die id and sibling
+dies string.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Reviewed-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/1559688644-106558-2-git-send-email-kan.liang@linux.intel.com
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit acae8b36cded0ee62038dedd0a44d54d5d673a96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/cputopo.c
+#	tools/perf/util/cputopo.h
+* Unmerged path tools/perf/util/cputopo.c
+* Unmerged path tools/perf/util/cputopo.h
+diff --git a/tools/perf/Documentation/perf.data-file-format.txt b/tools/perf/Documentation/perf.data-file-format.txt
+index 593ef49b273c..ec0b40db939d 100644
+--- a/tools/perf/Documentation/perf.data-file-format.txt
++++ b/tools/perf/Documentation/perf.data-file-format.txt
+@@ -153,7 +153,7 @@ struct {
+ 
+ String lists defining the core and CPU threads topology.
+ The string lists are followed by a variable length array
+-which contains core_id and socket_id of each cpu.
++which contains core_id, die_id (for x86) and socket_id of each cpu.
+ The number of entries can be determined by the size of the
+ section minus the sizes of both string lists.
+ 
+@@ -162,14 +162,19 @@ struct {
+        struct perf_header_string_list threads; /* Variable length */
+        struct {
+ 	      uint32_t core_id;
++	      uint32_t die_id;
+ 	      uint32_t socket_id;
+        } cpus[nr]; /* Variable length records */
+ };
+ 
+ Example:
+-	sibling cores   : 0-3
++	sibling cores   : 0-8
++	sibling dies	: 0-3
++	sibling dies	: 4-7
+ 	sibling threads : 0-1
+ 	sibling threads : 2-3
++	sibling threads : 4-5
++	sibling threads : 6-7
+ 
+ 	HEADER_NUMA_TOPOLOGY = 14,
+ 
+* Unmerged path tools/perf/util/cputopo.c
+* Unmerged path tools/perf/util/cputopo.h
+diff --git a/tools/perf/util/env.c b/tools/perf/util/env.c
+index 6a3eaf7d9353..1cc7a1837822 100644
+--- a/tools/perf/util/env.c
++++ b/tools/perf/util/env.c
+@@ -246,6 +246,7 @@ int perf_env__read_cpu_topology_map(struct perf_env *env)
+ 	for (cpu = 0; cpu < nr_cpus; ++cpu) {
+ 		env->cpu[cpu].core_id	= cpu_map__get_core_id(cpu);
+ 		env->cpu[cpu].socket_id	= cpu_map__get_socket_id(cpu);
++		env->cpu[cpu].die_id	= cpu_map__get_die_id(cpu);
+ 	}
+ 
+ 	env->nr_cpus_avail = nr_cpus;
+diff --git a/tools/perf/util/env.h b/tools/perf/util/env.h
+index 34868ca7efd1..bd8eefb38723 100644
+--- a/tools/perf/util/env.h
++++ b/tools/perf/util/env.h
+@@ -9,6 +9,7 @@
+ 
+ struct cpu_topology_map {
+ 	int	socket_id;
++	int	die_id;
+ 	int	core_id;
+ };
+ 
+@@ -49,6 +50,7 @@ struct perf_env {
+ 
+ 	int			nr_cmdline;
+ 	int			nr_sibling_cores;
++	int			nr_sibling_dies;
+ 	int			nr_sibling_threads;
+ 	int			nr_numa_nodes;
+ 	int			nr_memory_nodes;
+@@ -57,6 +59,7 @@ struct perf_env {
+ 	char			*cmdline;
+ 	const char		**cmdline_argv;
+ 	char			*sibling_cores;
++	char			*sibling_dies;
+ 	char			*sibling_threads;
+ 	char			*pmu_mappings;
+ 	struct cpu_topology_map	*cpu;
+diff --git a/tools/perf/util/header.c b/tools/perf/util/header.c
+index 5b16579df3db..e858658b835f 100644
+--- a/tools/perf/util/header.c
++++ b/tools/perf/util/header.c
+@@ -739,6 +739,27 @@ static int write_cpu_topology(struct feat_fd *ff,
+ 		if (ret < 0)
+ 			return ret;
+ 	}
++
++	if (!tp->die_sib)
++		goto done;
++
++	ret = do_write(ff, &tp->die_sib, sizeof(tp->die_sib));
++	if (ret < 0)
++		goto done;
++
++	for (i = 0; i < tp->die_sib; i++) {
++		ret = do_write_string(ff, tp->die_siblings[i]);
++		if (ret < 0)
++			goto done;
++	}
++
++	for (j = 0; j < perf_env.nr_cpus_avail; j++) {
++		ret = do_write(ff, &perf_env.cpu[j].die_id,
++			       sizeof(perf_env.cpu[j].die_id));
++		if (ret < 0)
++			return ret;
++	}
++
+ done:
+ 	free_cpu_topo(tp);
+ 	return ret;
+@@ -1544,6 +1565,16 @@ static void print_cpu_topology(struct feat_fd *ff, FILE *fp)
+ 		str += strlen(str) + 1;
+ 	}
+ 
++	if (ph->env.nr_sibling_dies) {
++		nr = ph->env.nr_sibling_dies;
++		str = ph->env.sibling_dies;
++
++		for (i = 0; i < nr; i++) {
++			fprintf(fp, "# sibling dies    : %s\n", str);
++			str += strlen(str) + 1;
++		}
++	}
++
+ 	nr = ph->env.nr_sibling_threads;
+ 	str = ph->env.sibling_threads;
+ 
+@@ -1552,12 +1583,28 @@ static void print_cpu_topology(struct feat_fd *ff, FILE *fp)
+ 		str += strlen(str) + 1;
+ 	}
+ 
+-	if (ph->env.cpu != NULL) {
+-		for (i = 0; i < cpu_nr; i++)
+-			fprintf(fp, "# CPU %d: Core ID %d, Socket ID %d\n", i,
+-				ph->env.cpu[i].core_id, ph->env.cpu[i].socket_id);
+-	} else
+-		fprintf(fp, "# Core ID and Socket ID information is not available\n");
++	if (ph->env.nr_sibling_dies) {
++		if (ph->env.cpu != NULL) {
++			for (i = 0; i < cpu_nr; i++)
++				fprintf(fp, "# CPU %d: Core ID %d, "
++					    "Die ID %d, Socket ID %d\n",
++					    i, ph->env.cpu[i].core_id,
++					    ph->env.cpu[i].die_id,
++					    ph->env.cpu[i].socket_id);
++		} else
++			fprintf(fp, "# Core ID, Die ID and Socket ID "
++				    "information is not available\n");
++	} else {
++		if (ph->env.cpu != NULL) {
++			for (i = 0; i < cpu_nr; i++)
++				fprintf(fp, "# CPU %d: Core ID %d, "
++					    "Socket ID %d\n",
++					    i, ph->env.cpu[i].core_id,
++					    ph->env.cpu[i].socket_id);
++		} else
++			fprintf(fp, "# Core ID and Socket ID "
++				    "information is not available\n");
++	}
+ }
+ 
+ static void print_clockid(struct feat_fd *ff, FILE *fp)
+@@ -2262,6 +2309,7 @@ static int process_cpu_topology(struct feat_fd *ff, void *data __maybe_unused)
+ 			goto free_cpu;
+ 
+ 		ph->env.cpu[i].core_id = nr;
++		size += sizeof(u32);
+ 
+ 		if (do_read_u32(ff, &nr))
+ 			goto free_cpu;
+@@ -2273,6 +2321,40 @@ static int process_cpu_topology(struct feat_fd *ff, void *data __maybe_unused)
+ 		}
+ 
+ 		ph->env.cpu[i].socket_id = nr;
++		size += sizeof(u32);
++	}
++
++	/*
++	 * The header may be from old perf,
++	 * which doesn't include die information.
++	 */
++	if (ff->size <= size)
++		return 0;
++
++	if (do_read_u32(ff, &nr))
++		return -1;
++
++	ph->env.nr_sibling_dies = nr;
++	size += sizeof(u32);
++
++	for (i = 0; i < nr; i++) {
++		str = do_read_string(ff);
++		if (!str)
++			goto error;
++
++		/* include a NULL character at the end */
++		if (strbuf_add(&sb, str, strlen(str) + 1) < 0)
++			goto error;
++		size += string_size(str);
++		free(str);
++	}
++	ph->env.sibling_dies = strbuf_detach(&sb, NULL);
++
++	for (i = 0; i < (u32)cpu_nr; i++) {
++		if (do_read_u32(ff, &nr))
++			goto free_cpu;
++
++		ph->env.cpu[i].die_id = nr;
+ 	}
+ 
+ 	return 0;
