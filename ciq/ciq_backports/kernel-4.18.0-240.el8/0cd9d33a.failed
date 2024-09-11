@@ -1,0 +1,125 @@
+cgroup: init_tasks shouldn't be linked to the root cgroup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tejun Heo <tj@kernel.org>
+commit 0cd9d33ace336bc424fc30944aa3defd6786e4fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0cd9d33a.failed
+
+5153faac18d2 ("cgroup: remove cgroup_enable_task_cg_lists()
+optimization") removed lazy initialization of css_sets so that new
+tasks are always lniked to its css_set. In the process, it incorrectly
+ended up adding init_tasks to root css_set. They show up as PID 0's in
+root's cgroup.procs triggering warnings in systemd and generally
+confusing people.
+
+Fix it by skip css_set linking for init_tasks.
+
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+	Reported-by: https://github.com/joanbm
+Link: https://github.com/systemd/systemd/issues/14682
+Fixes: 5153faac18d2 ("cgroup: remove cgroup_enable_task_cg_lists() optimization")
+	Cc: stable@vger.kernel.org # v5.5+
+(cherry picked from commit 0cd9d33ace336bc424fc30944aa3defd6786e4fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup.c
+diff --cc kernel/cgroup/cgroup.c
+index 9a099537faaf,cf8a36bdf5c8..000000000000
+--- a/kernel/cgroup/cgroup.c
++++ b/kernel/cgroup/cgroup.c
+@@@ -5915,61 -5927,40 +5915,75 @@@ void cgroup_cancel_fork(struct task_str
+  void cgroup_post_fork(struct task_struct *child)
+  {
+  	struct cgroup_subsys *ss;
+ -	struct css_set *cset;
+  	int i;
+  
+++<<<<<<< HEAD
+++=======
++ 	spin_lock_irq(&css_set_lock);
++ 
++ 	/* init tasks are special, only link regular threads */
++ 	if (likely(child->pid)) {
++ 		WARN_ON_ONCE(!list_empty(&child->cg_list));
++ 		cset = task_css_set(current); /* current is @child's parent */
++ 		get_css_set(cset);
++ 		cset->nr_tasks++;
++ 		css_set_move_task(child, NULL, cset, false);
++ 	}
++ 
+++>>>>>>> 0cd9d33ace33 (cgroup: init_tasks shouldn't be linked to the root cgroup)
+  	/*
+ -	 * If the cgroup has to be frozen, the new task has too.  Let's set
+ -	 * the JOBCTL_TRAP_FREEZE jobctl bit to get the task into the
+ -	 * frozen state.
+ +	 * This may race against cgroup_enable_task_cg_lists().  As that
+ +	 * function sets use_task_css_set_links before grabbing
+ +	 * tasklist_lock and we just went through tasklist_lock to add
+ +	 * @child, it's guaranteed that either we see the set
+ +	 * use_task_css_set_links or cgroup_enable_task_cg_lists() sees
+ +	 * @child during its iteration.
+ +	 *
+ +	 * If we won the race, @child is associated with %current's
+ +	 * css_set.  Grabbing css_set_lock guarantees both that the
+ +	 * association is stable, and, on completion of the parent's
+ +	 * migration, @child is visible in the source of migration or
+ +	 * already in the destination cgroup.  This guarantee is necessary
+ +	 * when implementing operations which need to migrate all tasks of
+ +	 * a cgroup to another.
+ +	 *
+ +	 * Note that if we lose to cgroup_enable_task_cg_lists(), @child
+ +	 * will remain in init_css_set.  This is safe because all tasks are
+ +	 * in the init_css_set before cg_links is enabled and there's no
+ +	 * operation which transfers all tasks out of init_css_set.
+  	 */
+ -	if (unlikely(cgroup_task_freeze(child))) {
+ -		spin_lock(&child->sighand->siglock);
+ -		WARN_ON_ONCE(child->frozen);
+ -		child->jobctl |= JOBCTL_TRAP_FREEZE;
+ -		spin_unlock(&child->sighand->siglock);
+ +	if (use_task_css_set_links) {
+ +		struct css_set *cset;
+ +
+ +		spin_lock_irq(&css_set_lock);
+ +		cset = task_css_set(current); /* current is @child's parent */
+ +		if (list_empty(&child->cg_list)) {
+ +			get_css_set(cset);
+ +			cset->nr_tasks++;
+ +			css_set_move_task(child, NULL, cset, false);
+ +		}
+  
+  		/*
+ -		 * Calling cgroup_update_frozen() isn't required here,
+ -		 * because it will be called anyway a bit later from
+ -		 * do_freezer_trap(). So we avoid cgroup's transient switch
+ -		 * from the frozen state and back.
+ +		 * If the cgroup has to be frozen, the new task has too.
+ +		 * Let's set the JOBCTL_TRAP_FREEZE jobctl bit to get
+ +		 * the task into the frozen state.
+  		 */
+ -	}
+ +		if (unlikely(cgroup_task_freeze(child))) {
+ +			spin_lock(&child->sighand->siglock);
+ +			WARN_ON_ONCE(child->frozen);
+ +			child->jobctl |= JOBCTL_TRAP_FREEZE;
+ +			spin_unlock(&child->sighand->siglock);
+  
+ -	spin_unlock_irq(&css_set_lock);
+ +			/*
+ +			 * Calling cgroup_update_frozen() isn't required here,
+ +			 * because it will be called anyway a bit later
+ +			 * from do_freezer_trap(). So we avoid cgroup's
+ +			 * transient switch from the frozen state and back.
+ +			 */
+ +		}
+ +
+ +		spin_unlock_irq(&css_set_lock);
+ +	}
+  
+  	/*
+  	 * Call ss->fork().  This must happen after @child is linked on
+* Unmerged path kernel/cgroup/cgroup.c
