@@ -1,0 +1,4139 @@
+netlink: make nla_nest_start() add NLA_F_NESTED flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Michal Kubecek <mkubecek@suse.cz>
+commit ae0be8de9a53cda3505865c11826d8ff0640237c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ae0be8de.failed
+
+Even if the NLA_F_NESTED flag was introduced more than 11 years ago, most
+netlink based interfaces (including recently added ones) are still not
+setting it in kernel generated messages. Without the flag, message parsers
+not aware of attribute semantics (e.g. wireshark dissector or libmnl's
+mnl_nlmsg_fprintf()) cannot recognize nested attributes and won't display
+the structure of their contents.
+
+Unfortunately we cannot just add the flag everywhere as there may be
+userspace applications which check nlattr::nla_type directly rather than
+through a helper masking out the flags. Therefore the patch renames
+nla_nest_start() to nla_nest_start_noflag() and introduces nla_nest_start()
+as a wrapper adding NLA_F_NESTED. The calls which add NLA_F_NESTED manually
+are rewritten to use nla_nest_start().
+
+Except for changes in include/net/netlink.h, the patch was generated using
+this semantic patch:
+
+@@ expression E1, E2; @@
+-nla_nest_start(E1, E2)
++nla_nest_start_noflag(E1, E2)
+
+@@ expression E1, E2; @@
+-nla_nest_start_noflag(E1, E2 | NLA_F_NESTED)
++nla_nest_start(E1, E2)
+
+	Signed-off-by: Michal Kubecek <mkubecek@suse.cz>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ae0be8de9a53cda3505865c11826d8ff0640237c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/drbd/drbd_nl.c
+#	drivers/infiniband/core/nldev.c
+#	drivers/net/ieee802154/mac802154_hwsim.c
+#	net/bridge/br_mdb.c
+#	net/core/lwtunnel.c
+#	net/ipv4/fib_semantics.c
+#	net/netfilter/nfnetlink_cttimeout.c
+#	net/netfilter/nft_ct.c
+#	net/netfilter/nft_tunnel.c
+#	net/openvswitch/conntrack.c
+#	net/openvswitch/flow_netlink.c
+#	net/sched/sch_taprio.c
+diff --cc drivers/block/drbd/drbd_nl.c
+index b4f02768ba47,1cb5a0b85fd9..000000000000
+--- a/drivers/block/drbd/drbd_nl.c
++++ b/drivers/block/drbd/drbd_nl.c
+@@@ -127,6 -127,35 +127,38 @@@ static int drbd_msg_put_info(struct sk_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ __printf(2, 3)
++ static int drbd_msg_sprintf_info(struct sk_buff *skb, const char *fmt, ...)
++ {
++ 	va_list args;
++ 	struct nlattr *nla, *txt;
++ 	int err = -EMSGSIZE;
++ 	int len;
++ 
++ 	nla = nla_nest_start_noflag(skb, DRBD_NLA_CFG_REPLY);
++ 	if (!nla)
++ 		return err;
++ 
++ 	txt = nla_reserve(skb, T_info_text, 256);
++ 	if (!txt) {
++ 		nla_nest_cancel(skb, nla);
++ 		return err;
++ 	}
++ 	va_start(args, fmt);
++ 	len = vscnprintf(nla_data(txt), 256, fmt, args);
++ 	va_end(args);
++ 
++ 	/* maybe: retry with larger reserve, if truncated */
++ 	txt->nla_len = nla_attr_size(len+1);
++ 	nlmsg_trim(skb, (char*)txt + NLA_ALIGN(txt->nla_len));
++ 	nla_nest_end(skb, nla);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  /* This would be a good candidate for a "pre_doit" hook,
+   * and per-family private info->pointers.
+   * But we need to stay compatible with older kernels.
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,ad189a29cc67..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -1029,28 -1135,31 +1030,38 @@@ static int res_get_common_dumpit(struc
+  
+  		filled = true;
+  
+++<<<<<<< HEAD
+ +		up_read(&device->res.rwsem);
+++=======
++ 		entry_attr = nla_nest_start_noflag(skb, fe->entry);
++ 		if (!entry_attr) {
++ 			ret = -EMSGSIZE;
++ 			rdma_restrack_put(res);
++ 			goto msg_full;
++ 		}
++ 
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  		ret = fe->fill_res_func(skb, has_cap_net_admin, res, port);
+ +		down_read(&device->res.rwsem);
+ +		/*
+ +		 * Return resource back, but it won't be released till
+ +		 * the &device->res.rwsem will be released for write.
+ +		 */
+  		rdma_restrack_put(res);
+  
+ -		if (ret) {
+ -			nla_nest_cancel(skb, entry_attr);
+ -			if (ret == -EMSGSIZE)
+ -				goto msg_full;
+ -			if (ret == -EAGAIN)
+ -				goto again;
+ +		if (ret == -EMSGSIZE)
+ +			/*
+ +			 * There is a chance to optimize here.
+ +			 * It can be done by using list_prepare_entry
+ +			 * and list_for_each_entry_continue afterwards.
+ +			 */
+ +			break;
+ +		if (ret)
+  			goto res_err;
+ -		}
+ -		nla_nest_end(skb, entry_attr);
+ -again:		xa_lock(&rt->xa);
+  next:		idx++;
+  	}
+ -	xa_unlock(&rt->xa);
+ +	up_read(&device->res.rwsem);
+  
+ -msg_full:
+  	nla_nest_end(skb, table_attr);
+  	nlmsg_end(skb, nlh);
+  	cb->args[0] = idx;
+diff --cc net/bridge/br_mdb.c
+index b7add7010820,3619c1a12a77..000000000000
+--- a/net/bridge/br_mdb.c
++++ b/net/bridge/br_mdb.c
+@@@ -87,11 -86,7 +87,15 @@@ static int br_mdb_fill_info(struct sk_b
+  	if (!br_opt_get(br, BROPT_MULTICAST_ENABLED))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	mdb = rcu_dereference(br->mdb);
+ +	if (!mdb)
+ +		return 0;
+ +
+ +	nest = nla_nest_start(skb, MDBA_MDB);
+++=======
++ 	nest = nla_nest_start_noflag(skb, MDBA_MDB);
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  	if (nest == NULL)
+  		return -EMSGSIZE;
+  
+@@@ -101,59 -95,56 +105,77 @@@
+  		struct net_bridge_port_group __rcu **pp;
+  		struct net_bridge_port *port;
+  
+ -		if (idx < s_idx)
+ -			goto skip;
+ +		hlist_for_each_entry_rcu(mp, &mdb->mhash[i], hlist[mdb->ver]) {
+ +			if (idx < s_idx)
+ +				goto skip;
+  
+++<<<<<<< HEAD
+ +			nest2 = nla_nest_start(skb, MDBA_MDB_ENTRY);
+ +			if (nest2 == NULL) {
+ +				err = -EMSGSIZE;
+ +				goto out;
+ +			}
+++=======
++ 		nest2 = nla_nest_start_noflag(skb, MDBA_MDB_ENTRY);
++ 		if (!nest2) {
++ 			err = -EMSGSIZE;
++ 			break;
++ 		}
+ -
+ -		for (pp = &mp->ports; (p = rcu_dereference(*pp)) != NULL;
+ -		      pp = &p->next) {
+ -			struct nlattr *nest_ent;
+ -			struct br_mdb_entry e;
+ -
+ -			port = p->port;
+ -			if (!port)
+ -				continue;
+ -
+ -			memset(&e, 0, sizeof(e));
+ -			e.ifindex = port->dev->ifindex;
+ -			e.vid = p->addr.vid;
+ -			__mdb_entry_fill_flags(&e, p->flags);
+ -			if (p->addr.proto == htons(ETH_P_IP))
+ -				e.addr.u.ip4 = p->addr.u.ip4;
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+ +
+ +			for (pp = &mp->ports;
+ +			     (p = rcu_dereference(*pp)) != NULL;
+ +			      pp = &p->next) {
+ +				struct nlattr *nest_ent;
+ +				struct br_mdb_entry e;
+ +
+ +				port = p->port;
+ +				if (!port)
+ +					continue;
+ +
+ +				memset(&e, 0, sizeof(e));
+ +				e.ifindex = port->dev->ifindex;
+ +				e.vid = p->addr.vid;
+ +				__mdb_entry_fill_flags(&e, p->flags);
+ +				if (p->addr.proto == htons(ETH_P_IP))
+ +					e.addr.u.ip4 = p->addr.u.ip4;
+  #if IS_ENABLED(CONFIG_IPV6)
+ -			if (p->addr.proto == htons(ETH_P_IPV6))
+ -				e.addr.u.ip6 = p->addr.u.ip6;
+ +				if (p->addr.proto == htons(ETH_P_IPV6))
+ +					e.addr.u.ip6 = p->addr.u.ip6;
+  #endif
+++<<<<<<< HEAD
+ +				e.addr.proto = p->addr.proto;
+ +				nest_ent = nla_nest_start(skb,
+ +							  MDBA_MDB_ENTRY_INFO);
+ +				if (!nest_ent) {
+ +					nla_nest_cancel(skb, nest2);
+ +					err = -EMSGSIZE;
+ +					goto out;
+ +				}
+ +				if (nla_put_nohdr(skb, sizeof(e), &e) ||
+ +				    nla_put_u32(skb,
+ +						MDBA_MDB_EATTR_TIMER,
+ +						br_timer_value(&p->timer))) {
+ +					nla_nest_cancel(skb, nest_ent);
+ +					nla_nest_cancel(skb, nest2);
+ +					err = -EMSGSIZE;
+ +					goto out;
+ +				}
+ +				nla_nest_end(skb, nest_ent);
+++=======
++ 			e.addr.proto = p->addr.proto;
++ 			nest_ent = nla_nest_start_noflag(skb,
++ 							 MDBA_MDB_ENTRY_INFO);
++ 			if (!nest_ent) {
++ 				nla_nest_cancel(skb, nest2);
++ 				err = -EMSGSIZE;
++ 				goto out;
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  			}
+ -			if (nla_put_nohdr(skb, sizeof(e), &e) ||
+ -			    nla_put_u32(skb,
+ -					MDBA_MDB_EATTR_TIMER,
+ -					br_timer_value(&p->timer))) {
+ -				nla_nest_cancel(skb, nest_ent);
+ -				nla_nest_cancel(skb, nest2);
+ -				err = -EMSGSIZE;
+ -				goto out;
+ -			}
+ -			nla_nest_end(skb, nest_ent);
+ +			nla_nest_end(skb, nest2);
+ +		skip:
+ +			idx++;
+  		}
+ -		nla_nest_end(skb, nest2);
+ -skip:
+ -		idx++;
+  	}
+  
+  out:
+diff --cc net/core/lwtunnel.c
+index 0b171756453c,69e249fbc02f..000000000000
+--- a/net/core/lwtunnel.c
++++ b/net/core/lwtunnel.c
+@@@ -236,7 -237,7 +236,11 @@@ int lwtunnel_fill_encap(struct sk_buff 
+  	    lwtstate->type > LWTUNNEL_ENCAP_MAX)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	nest = nla_nest_start(skb, RTA_ENCAP);
+++=======
++ 	nest = nla_nest_start_noflag(skb, encap_attr);
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  	if (!nest)
+  		return -EMSGSIZE;
+  
+diff --cc net/ipv4/fib_semantics.c
+index 446204ca7406,71c2165a2ce3..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -1288,6 -1443,141 +1288,144 @@@ failure
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int fib_nexthop_info(struct sk_buff *skb, const struct fib_nh_common *nhc,
++ 		     unsigned char *flags, bool skip_oif)
++ {
++ 	if (nhc->nhc_flags & RTNH_F_DEAD)
++ 		*flags |= RTNH_F_DEAD;
++ 
++ 	if (nhc->nhc_flags & RTNH_F_LINKDOWN) {
++ 		*flags |= RTNH_F_LINKDOWN;
++ 
++ 		rcu_read_lock();
++ 		switch (nhc->nhc_family) {
++ 		case AF_INET:
++ 			if (ip_ignore_linkdown(nhc->nhc_dev))
++ 				*flags |= RTNH_F_DEAD;
++ 			break;
++ 		case AF_INET6:
++ 			if (ip6_ignore_linkdown(nhc->nhc_dev))
++ 				*flags |= RTNH_F_DEAD;
++ 			break;
++ 		}
++ 		rcu_read_unlock();
++ 	}
++ 
++ 	switch (nhc->nhc_gw_family) {
++ 	case AF_INET:
++ 		if (nla_put_in_addr(skb, RTA_GATEWAY, nhc->nhc_gw.ipv4))
++ 			goto nla_put_failure;
++ 		break;
++ 	case AF_INET6:
++ 		/* if gateway family does not match nexthop family
++ 		 * gateway is encoded as RTA_VIA
++ 		 */
++ 		if (nhc->nhc_gw_family != nhc->nhc_family) {
++ 			int alen = sizeof(struct in6_addr);
++ 			struct nlattr *nla;
++ 			struct rtvia *via;
++ 
++ 			nla = nla_reserve(skb, RTA_VIA, alen + 2);
++ 			if (!nla)
++ 				goto nla_put_failure;
++ 
++ 			via = nla_data(nla);
++ 			via->rtvia_family = AF_INET6;
++ 			memcpy(via->rtvia_addr, &nhc->nhc_gw.ipv6, alen);
++ 		} else if (nla_put_in6_addr(skb, RTA_GATEWAY,
++ 					    &nhc->nhc_gw.ipv6) < 0) {
++ 			goto nla_put_failure;
++ 		}
++ 		break;
++ 	}
++ 
++ 	*flags |= (nhc->nhc_flags & RTNH_F_ONLINK);
++ 	if (nhc->nhc_flags & RTNH_F_OFFLOAD)
++ 		*flags |= RTNH_F_OFFLOAD;
++ 
++ 	if (!skip_oif && nhc->nhc_dev &&
++ 	    nla_put_u32(skb, RTA_OIF, nhc->nhc_dev->ifindex))
++ 		goto nla_put_failure;
++ 
++ 	if (nhc->nhc_lwtstate &&
++ 	    lwtunnel_fill_encap(skb, nhc->nhc_lwtstate,
++ 				RTA_ENCAP, RTA_ENCAP_TYPE) < 0)
++ 		goto nla_put_failure;
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -EMSGSIZE;
++ }
++ EXPORT_SYMBOL_GPL(fib_nexthop_info);
++ 
++ #if IS_ENABLED(CONFIG_IP_ROUTE_MULTIPATH) || IS_ENABLED(CONFIG_IPV6)
++ int fib_add_nexthop(struct sk_buff *skb, const struct fib_nh_common *nhc,
++ 		    int nh_weight)
++ {
++ 	const struct net_device *dev = nhc->nhc_dev;
++ 	struct rtnexthop *rtnh;
++ 	unsigned char flags = 0;
++ 
++ 	rtnh = nla_reserve_nohdr(skb, sizeof(*rtnh));
++ 	if (!rtnh)
++ 		goto nla_put_failure;
++ 
++ 	rtnh->rtnh_hops = nh_weight - 1;
++ 	rtnh->rtnh_ifindex = dev ? dev->ifindex : 0;
++ 
++ 	if (fib_nexthop_info(skb, nhc, &flags, true) < 0)
++ 		goto nla_put_failure;
++ 
++ 	rtnh->rtnh_flags = flags;
++ 
++ 	/* length of rtnetlink header + attributes */
++ 	rtnh->rtnh_len = nlmsg_get_pos(skb) - (void *)rtnh;
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -EMSGSIZE;
++ }
++ EXPORT_SYMBOL_GPL(fib_add_nexthop);
++ #endif
++ 
++ #ifdef CONFIG_IP_ROUTE_MULTIPATH
++ static int fib_add_multipath(struct sk_buff *skb, struct fib_info *fi)
++ {
++ 	struct nlattr *mp;
++ 
++ 	mp = nla_nest_start_noflag(skb, RTA_MULTIPATH);
++ 	if (!mp)
++ 		goto nla_put_failure;
++ 
++ 	for_nexthops(fi) {
++ 		if (fib_add_nexthop(skb, &nh->nh_common, nh->fib_nh_weight) < 0)
++ 			goto nla_put_failure;
++ #ifdef CONFIG_IP_ROUTE_CLASSID
++ 		if (nh->nh_tclassid &&
++ 		    nla_put_u32(skb, RTA_FLOW, nh->nh_tclassid))
++ 			goto nla_put_failure;
++ #endif
++ 	} endfor_nexthops(fi);
++ 
++ 	nla_nest_end(skb, mp);
++ 
++ 	return 0;
++ 
++ nla_put_failure:
++ 	return -EMSGSIZE;
++ }
++ #else
++ static int fib_add_multipath(struct sk_buff *skb, struct fib_info *fi)
++ {
++ 	return 0;
++ }
++ #endif
++ 
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
+  		  u32 tb_id, u8 type, __be32 dst, int dst_len, u8 tos,
+  		  struct fib_info *fi, unsigned int flags)
+diff --cc net/netfilter/nfnetlink_cttimeout.c
+index 9ee5fa551fa6,572cb42e1ee1..000000000000
+--- a/net/netfilter/nfnetlink_cttimeout.c
++++ b/net/netfilter/nfnetlink_cttimeout.c
+@@@ -186,21 -184,15 +186,27 @@@ ctnl_timeout_fill_info(struct sk_buff *
+  			 htonl(refcount_read(&timeout->refcnt))))
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +	if (likely(l4proto->ctnl_timeout.obj_to_nlattr)) {
+ +		struct nlattr *nest_parms;
+ +		int ret;
+++=======
++ 	nest_parms = nla_nest_start(skb, CTA_TIMEOUT_DATA);
++ 	if (!nest_parms)
++ 		goto nla_put_failure;
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  
+ -	ret = l4proto->ctnl_timeout.obj_to_nlattr(skb, &timeout->timeout.data);
+ -	if (ret < 0)
+ -		goto nla_put_failure;
+ +		nest_parms = nla_nest_start(skb,
+ +					    CTA_TIMEOUT_DATA | NLA_F_NESTED);
+ +		if (!nest_parms)
+ +			goto nla_put_failure;
+  
+ -	nla_nest_end(skb, nest_parms);
+ +		ret = l4proto->ctnl_timeout.obj_to_nlattr(skb, &timeout->data);
+ +		if (ret < 0)
+ +			goto nla_put_failure;
+ +
+ +		nla_nest_end(skb, nest_parms);
+ +	}
+  
+  	nlmsg_end(skb, nlh);
+  	return skb->len;
+@@@ -430,22 -401,15 +436,28 @@@ cttimeout_default_fill_info(struct net 
+  	    nla_put_u8(skb, CTA_TIMEOUT_L4PROTO, l4proto->l4proto))
+  		goto nla_put_failure;
+  
+++<<<<<<< HEAD
+ +	if (likely(l4proto->ctnl_timeout.obj_to_nlattr)) {
+ +		struct nlattr *nest_parms;
+ +		unsigned int *timeouts = l4proto->get_timeouts(net);
+ +		int ret;
+++=======
++ 	nest_parms = nla_nest_start(skb, CTA_TIMEOUT_DATA);
++ 	if (!nest_parms)
++ 		goto nla_put_failure;
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  
+ -	ret = l4proto->ctnl_timeout.obj_to_nlattr(skb, timeouts);
+ -	if (ret < 0)
+ -		goto nla_put_failure;
+ +		nest_parms = nla_nest_start(skb,
+ +					    CTA_TIMEOUT_DATA | NLA_F_NESTED);
+ +		if (!nest_parms)
+ +			goto nla_put_failure;
+  
+ -	nla_nest_end(skb, nest_parms);
+ +		ret = l4proto->ctnl_timeout.obj_to_nlattr(skb, timeouts);
+ +		if (ret < 0)
+ +			goto nla_put_failure;
+ +
+ +		nla_nest_end(skb, nest_parms);
+ +	}
+  
+  	nlmsg_end(skb, nlh);
+  	return skb->len;
+diff --cc net/netfilter/nft_ct.c
+index 3fe9a7819557,1738ef6dcb56..000000000000
+--- a/net/netfilter/nft_ct.c
++++ b/net/netfilter/nft_ct.c
+@@@ -765,6 -782,189 +765,192 @@@ static struct nft_expr_type nft_notrack
+  	.owner		= THIS_MODULE,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_NF_CONNTRACK_TIMEOUT
++ static int
++ nft_ct_timeout_parse_policy(void *timeouts,
++ 			    const struct nf_conntrack_l4proto *l4proto,
++ 			    struct net *net, const struct nlattr *attr)
++ {
++ 	struct nlattr **tb;
++ 	int ret = 0;
++ 
++ 	tb = kcalloc(l4proto->ctnl_timeout.nlattr_max + 1, sizeof(*tb),
++ 		     GFP_KERNEL);
++ 
++ 	if (!tb)
++ 		return -ENOMEM;
++ 
++ 	ret = nla_parse_nested(tb, l4proto->ctnl_timeout.nlattr_max,
++ 			       attr, l4proto->ctnl_timeout.nla_policy,
++ 			       NULL);
++ 	if (ret < 0)
++ 		goto err;
++ 
++ 	ret = l4proto->ctnl_timeout.nlattr_to_obj(tb, net, timeouts);
++ 
++ err:
++ 	kfree(tb);
++ 	return ret;
++ }
++ 
++ struct nft_ct_timeout_obj {
++ 	struct nf_ct_timeout    *timeout;
++ 	u8			l4proto;
++ };
++ 
++ static void nft_ct_timeout_obj_eval(struct nft_object *obj,
++ 				    struct nft_regs *regs,
++ 				    const struct nft_pktinfo *pkt)
++ {
++ 	const struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	struct nf_conn *ct = (struct nf_conn *)skb_nfct(pkt->skb);
++ 	struct nf_conn_timeout *timeout;
++ 	const unsigned int *values;
++ 
++ 	if (priv->l4proto != pkt->tprot)
++ 		return;
++ 
++ 	if (!ct || nf_ct_is_template(ct) || nf_ct_is_confirmed(ct))
++ 		return;
++ 
++ 	timeout = nf_ct_timeout_find(ct);
++ 	if (!timeout) {
++ 		timeout = nf_ct_timeout_ext_add(ct, priv->timeout, GFP_ATOMIC);
++ 		if (!timeout) {
++ 			regs->verdict.code = NF_DROP;
++ 			return;
++ 		}
++ 	}
++ 
++ 	rcu_assign_pointer(timeout->timeout, priv->timeout);
++ 
++ 	/* adjust the timeout as per 'new' state. ct is unconfirmed,
++ 	 * so the current timestamp must not be added.
++ 	 */
++ 	values = nf_ct_timeout_data(timeout);
++ 	if (values)
++ 		nf_ct_refresh(ct, pkt->skb, values[0]);
++ }
++ 
++ static int nft_ct_timeout_obj_init(const struct nft_ctx *ctx,
++ 				   const struct nlattr * const tb[],
++ 				   struct nft_object *obj)
++ {
++ 	struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	const struct nf_conntrack_l4proto *l4proto;
++ 	struct nf_ct_timeout *timeout;
++ 	int l3num = ctx->family;
++ 	__u8 l4num;
++ 	int ret;
++ 
++ 	if (!tb[NFTA_CT_TIMEOUT_L4PROTO] ||
++ 	    !tb[NFTA_CT_TIMEOUT_DATA])
++ 		return -EINVAL;
++ 
++ 	if (tb[NFTA_CT_TIMEOUT_L3PROTO])
++ 		l3num = ntohs(nla_get_be16(tb[NFTA_CT_TIMEOUT_L3PROTO]));
++ 
++ 	l4num = nla_get_u8(tb[NFTA_CT_TIMEOUT_L4PROTO]);
++ 	priv->l4proto = l4num;
++ 
++ 	l4proto = nf_ct_l4proto_find(l4num);
++ 
++ 	if (l4proto->l4proto != l4num) {
++ 		ret = -EOPNOTSUPP;
++ 		goto err_proto_put;
++ 	}
++ 
++ 	timeout = kzalloc(sizeof(struct nf_ct_timeout) +
++ 			  l4proto->ctnl_timeout.obj_size, GFP_KERNEL);
++ 	if (timeout == NULL) {
++ 		ret = -ENOMEM;
++ 		goto err_proto_put;
++ 	}
++ 
++ 	ret = nft_ct_timeout_parse_policy(&timeout->data, l4proto, ctx->net,
++ 					  tb[NFTA_CT_TIMEOUT_DATA]);
++ 	if (ret < 0)
++ 		goto err_free_timeout;
++ 
++ 	timeout->l3num = l3num;
++ 	timeout->l4proto = l4proto;
++ 
++ 	ret = nf_ct_netns_get(ctx->net, ctx->family);
++ 	if (ret < 0)
++ 		goto err_free_timeout;
++ 
++ 	priv->timeout = timeout;
++ 	return 0;
++ 
++ err_free_timeout:
++ 	kfree(timeout);
++ err_proto_put:
++ 	return ret;
++ }
++ 
++ static void nft_ct_timeout_obj_destroy(const struct nft_ctx *ctx,
++ 				       struct nft_object *obj)
++ {
++ 	struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	struct nf_ct_timeout *timeout = priv->timeout;
++ 
++ 	nf_ct_untimeout(ctx->net, timeout);
++ 	nf_ct_netns_put(ctx->net, ctx->family);
++ 	kfree(priv->timeout);
++ }
++ 
++ static int nft_ct_timeout_obj_dump(struct sk_buff *skb,
++ 				   struct nft_object *obj, bool reset)
++ {
++ 	const struct nft_ct_timeout_obj *priv = nft_obj_data(obj);
++ 	const struct nf_ct_timeout *timeout = priv->timeout;
++ 	struct nlattr *nest_params;
++ 	int ret;
++ 
++ 	if (nla_put_u8(skb, NFTA_CT_TIMEOUT_L4PROTO, timeout->l4proto->l4proto) ||
++ 	    nla_put_be16(skb, NFTA_CT_TIMEOUT_L3PROTO, htons(timeout->l3num)))
++ 		return -1;
++ 
++ 	nest_params = nla_nest_start(skb, NFTA_CT_TIMEOUT_DATA);
++ 	if (!nest_params)
++ 		return -1;
++ 
++ 	ret = timeout->l4proto->ctnl_timeout.obj_to_nlattr(skb, &timeout->data);
++ 	if (ret < 0)
++ 		return -1;
++ 	nla_nest_end(skb, nest_params);
++ 	return 0;
++ }
++ 
++ static const struct nla_policy nft_ct_timeout_policy[NFTA_CT_TIMEOUT_MAX + 1] = {
++ 	[NFTA_CT_TIMEOUT_L3PROTO] = {.type = NLA_U16 },
++ 	[NFTA_CT_TIMEOUT_L4PROTO] = {.type = NLA_U8 },
++ 	[NFTA_CT_TIMEOUT_DATA]	  = {.type = NLA_NESTED },
++ };
++ 
++ static struct nft_object_type nft_ct_timeout_obj_type;
++ 
++ static const struct nft_object_ops nft_ct_timeout_obj_ops = {
++ 	.type		= &nft_ct_timeout_obj_type,
++ 	.size		= sizeof(struct nft_ct_timeout_obj),
++ 	.eval		= nft_ct_timeout_obj_eval,
++ 	.init		= nft_ct_timeout_obj_init,
++ 	.destroy	= nft_ct_timeout_obj_destroy,
++ 	.dump		= nft_ct_timeout_obj_dump,
++ };
++ 
++ static struct nft_object_type nft_ct_timeout_obj_type __read_mostly = {
++ 	.type		= NFT_OBJECT_CT_TIMEOUT,
++ 	.ops		= &nft_ct_timeout_obj_ops,
++ 	.maxattr	= NFTA_CT_TIMEOUT_MAX,
++ 	.policy		= nft_ct_timeout_policy,
++ 	.owner		= THIS_MODULE,
++ };
++ #endif /* CONFIG_NF_CONNTRACK_TIMEOUT */
++ 
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  static int nft_ct_helper_obj_init(const struct nft_ctx *ctx,
+  				  const struct nlattr * const tb[],
+  				  struct nft_object *obj)
+diff --cc net/openvswitch/conntrack.c
+index f4b59fc63a75,ff8baf810bb3..000000000000
+--- a/net/openvswitch/conntrack.c
++++ b/net/openvswitch/conntrack.c
+@@@ -2129,11 -2160,7 +2129,15 @@@ static int ovs_ct_limit_cmd_get(struct 
+  	if (IS_ERR(reply))
+  		return PTR_ERR(reply);
+  
+++<<<<<<< HEAD
+ +	nla_reply = nla_nest_start(reply, OVS_CT_LIMIT_ATTR_ZONE_LIMIT);
+ +	if (!nla_reply) {
+ +		err = -EMSGSIZE;
+ +		goto exit_err;
+ +	}
+++=======
++ 	nla_reply = nla_nest_start_noflag(reply, OVS_CT_LIMIT_ATTR_ZONE_LIMIT);
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  
+  	if (a[OVS_CT_LIMIT_ATTR_ZONE_LIMIT]) {
+  		err = ovs_ct_limit_get_zone_limit(
+diff --cc net/openvswitch/flow_netlink.c
+index eab5e8eaddaa,2427b672107a..000000000000
+--- a/net/openvswitch/flow_netlink.c
++++ b/net/openvswitch/flow_netlink.c
+@@@ -3183,6 -3306,75 +3184,78 @@@ static int clone_action_to_attr(const s
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_pkt_len_action_to_attr(const struct nlattr *attr,
++ 					struct sk_buff *skb)
++ {
++ 	struct nlattr *start, *ac_start = NULL;
++ 	const struct check_pkt_len_arg *arg;
++ 	const struct nlattr *a, *cpl_arg;
++ 	int err = 0, rem = nla_len(attr);
++ 
++ 	start = nla_nest_start_noflag(skb, OVS_ACTION_ATTR_CHECK_PKT_LEN);
++ 	if (!start)
++ 		return -EMSGSIZE;
++ 
++ 	/* The first nested attribute in 'attr' is always
++ 	 * 'OVS_CHECK_PKT_LEN_ATTR_ARG'.
++ 	 */
++ 	cpl_arg = nla_data(attr);
++ 	arg = nla_data(cpl_arg);
++ 
++ 	if (nla_put_u16(skb, OVS_CHECK_PKT_LEN_ATTR_PKT_LEN, arg->pkt_len)) {
++ 		err = -EMSGSIZE;
++ 		goto out;
++ 	}
++ 
++ 	/* Second nested attribute in 'attr' is always
++ 	 * 'OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL'.
++ 	 */
++ 	a = nla_next(cpl_arg, &rem);
++ 	ac_start =  nla_nest_start_noflag(skb,
++ 					  OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_LESS_EQUAL);
++ 	if (!ac_start) {
++ 		err = -EMSGSIZE;
++ 		goto out;
++ 	}
++ 
++ 	err = ovs_nla_put_actions(nla_data(a), nla_len(a), skb);
++ 	if (err) {
++ 		nla_nest_cancel(skb, ac_start);
++ 		goto out;
++ 	} else {
++ 		nla_nest_end(skb, ac_start);
++ 	}
++ 
++ 	/* Third nested attribute in 'attr' is always
++ 	 * OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER.
++ 	 */
++ 	a = nla_next(a, &rem);
++ 	ac_start =  nla_nest_start_noflag(skb,
++ 					  OVS_CHECK_PKT_LEN_ATTR_ACTIONS_IF_GREATER);
++ 	if (!ac_start) {
++ 		err = -EMSGSIZE;
++ 		goto out;
++ 	}
++ 
++ 	err = ovs_nla_put_actions(nla_data(a), nla_len(a), skb);
++ 	if (err) {
++ 		nla_nest_cancel(skb, ac_start);
++ 		goto out;
++ 	} else {
++ 		nla_nest_end(skb, ac_start);
++ 	}
++ 
++ 	nla_nest_end(skb, start);
++ 	return 0;
++ 
++ out:
++ 	nla_nest_cancel(skb, start);
++ 	return err;
++ }
++ 
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  static int set_action_to_attr(const struct nlattr *a, struct sk_buff *skb)
+  {
+  	const struct nlattr *ovs_key = nla_data(a);
+diff --cc net/sched/sch_taprio.c
+index fcaf3eaa7b4f,e016ee07dd1f..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -1070,9 -883,9 +1070,9 @@@ static int taprio_dump(struct Qdisc *sc
+  		opt.offset[i] = dev->tc_to_txq[i].offset;
+  	}
+  
+- 	nest = nla_nest_start(skb, TCA_OPTIONS);
++ 	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+  	if (!nest)
+ -		return -ENOSPC;
+ +		goto start_error;
+  
+  	if (nla_put(skb, TCA_TAPRIO_ATTR_PRIOMAP, sizeof(opt), &opt))
+  		goto options_error;
+@@@ -1080,23 -893,21 +1080,29 @@@
+  	if (nla_put_s32(skb, TCA_TAPRIO_ATTR_SCHED_CLOCKID, q->clockid))
+  		goto options_error;
+  
+++<<<<<<< HEAD
+ +	if (oper && dump_schedule(skb, oper))
+++=======
++ 	entry_list = nla_nest_start_noflag(skb,
++ 					   TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST);
++ 	if (!entry_list)
+++>>>>>>> ae0be8de9a53 (netlink: make nla_nest_start() add NLA_F_NESTED flag)
+  		goto options_error;
+  
+ -	list_for_each_entry(entry, &q->entries, list) {
+ -		if (dump_entry(skb, entry) < 0)
+ -			goto options_error;
+ -	}
+ +	if (!admin)
+ +		goto done;
+  
+ -	nla_nest_end(skb, entry_list);
+ +	sched_nest = nla_nest_start(skb, TCA_TAPRIO_ATTR_ADMIN_SCHED);
+ +	if (!sched_nest)
+ +		goto options_error;
+ +
+ +	if (dump_schedule(skb, admin))
+ +		goto admin_error;
+ +
+ +	nla_nest_end(skb, sched_nest);
+ +
+ +done:
+ +	rcu_read_unlock();
+  
+  	return nla_nest_end(skb, nest);
+  
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+* Unmerged path net/netfilter/nft_tunnel.c
+* Unmerged path drivers/block/drbd/drbd_nl.c
+diff --git a/drivers/block/nbd.c b/drivers/block/nbd.c
+index e769f4352e98..c0052e9488b8 100644
+--- a/drivers/block/nbd.c
++++ b/drivers/block/nbd.c
+@@ -2076,7 +2076,7 @@ static int populate_nbd_status(struct nbd_device *nbd, struct sk_buff *reply)
+ 	 */
+ 	if (refcount_read(&nbd->config_refs))
+ 		connected = 1;
+-	dev_opt = nla_nest_start(reply, NBD_DEVICE_ITEM);
++	dev_opt = nla_nest_start_noflag(reply, NBD_DEVICE_ITEM);
+ 	if (!dev_opt)
+ 		return -EMSGSIZE;
+ 	ret = nla_put_u32(reply, NBD_DEVICE_INDEX, nbd->index);
+@@ -2124,7 +2124,7 @@ static int nbd_genl_status(struct sk_buff *skb, struct genl_info *info)
+ 		goto out;
+ 	}
+ 
+-	dev_list = nla_nest_start(reply, NBD_ATTR_DEVICE_LIST);
++	dev_list = nla_nest_start_noflag(reply, NBD_ATTR_DEVICE_LIST);
+ 	if (index == -1) {
+ 		ret = idr_for_each(&nbd_index_idr, &status_cb, reply);
+ 		if (ret) {
+* Unmerged path drivers/infiniband/core/nldev.c
+diff --git a/drivers/infiniband/hw/cxgb4/restrack.c b/drivers/infiniband/hw/cxgb4/restrack.c
+index 9a7520ee41e0..f82d46ed969d 100644
+--- a/drivers/infiniband/hw/cxgb4/restrack.c
++++ b/drivers/infiniband/hw/cxgb4/restrack.c
+@@ -149,7 +149,7 @@ static int fill_res_qp_entry(struct sk_buff *msg,
+ 	if (qhp->ucontext)
+ 		return 0;
+ 
+-	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_DRIVER);
++	table_attr = nla_nest_start_noflag(msg, RDMA_NLDEV_ATTR_DRIVER);
+ 	if (!table_attr)
+ 		goto err;
+ 
+@@ -216,7 +216,7 @@ static int fill_res_ep_entry(struct sk_buff *msg,
+ 	if (!uep)
+ 		return 0;
+ 
+-	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_DRIVER);
++	table_attr = nla_nest_start_noflag(msg, RDMA_NLDEV_ATTR_DRIVER);
+ 	if (!table_attr)
+ 		goto err_free_uep;
+ 
+@@ -387,7 +387,7 @@ static int fill_res_cq_entry(struct sk_buff *msg,
+ 	if (ibcq->uobject)
+ 		return 0;
+ 
+-	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_DRIVER);
++	table_attr = nla_nest_start_noflag(msg, RDMA_NLDEV_ATTR_DRIVER);
+ 	if (!table_attr)
+ 		goto err;
+ 
+@@ -447,7 +447,7 @@ static int fill_res_mr_entry(struct sk_buff *msg,
+ 	if (!stag)
+ 		return 0;
+ 
+-	table_attr = nla_nest_start(msg, RDMA_NLDEV_ATTR_DRIVER);
++	table_attr = nla_nest_start_noflag(msg, RDMA_NLDEV_ATTR_DRIVER);
+ 	if (!table_attr)
+ 		goto err;
+ 
+diff --git a/drivers/net/bonding/bond_netlink.c b/drivers/net/bonding/bond_netlink.c
+index 66b51eb3bb62..42bc5522995b 100644
+--- a/drivers/net/bonding/bond_netlink.c
++++ b/drivers/net/bonding/bond_netlink.c
+@@ -560,7 +560,7 @@ static int bond_fill_info(struct sk_buff *skb,
+ 	if (nla_put_u32(skb, IFLA_BOND_ARP_INTERVAL, bond->params.arp_interval))
+ 		goto nla_put_failure;
+ 
+-	targets = nla_nest_start(skb, IFLA_BOND_ARP_IP_TARGET);
++	targets = nla_nest_start_noflag(skb, IFLA_BOND_ARP_IP_TARGET);
+ 	if (!targets)
+ 		goto nla_put_failure;
+ 
+@@ -658,7 +658,7 @@ static int bond_fill_info(struct sk_buff *skb,
+ 		if (!bond_3ad_get_active_agg_info(bond, &info)) {
+ 			struct nlattr *nest;
+ 
+-			nest = nla_nest_start(skb, IFLA_BOND_AD_INFO);
++			nest = nla_nest_start_noflag(skb, IFLA_BOND_AD_INFO);
+ 			if (!nest)
+ 				goto nla_put_failure;
+ 
+@@ -725,7 +725,7 @@ static int bond_fill_linkxstats(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	nest = nla_nest_start(skb, LINK_XSTATS_TYPE_BOND);
++	nest = nla_nest_start_noflag(skb, LINK_XSTATS_TYPE_BOND);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 	if (BOND_MODE(bond) == BOND_MODE_8023AD) {
+@@ -736,7 +736,7 @@ static int bond_fill_linkxstats(struct sk_buff *skb,
+ 		else
+ 			stats = &BOND_AD_INFO(bond).stats;
+ 
+-		nest2 = nla_nest_start(skb, BOND_XSTATS_3AD);
++		nest2 = nla_nest_start_noflag(skb, BOND_XSTATS_3AD);
+ 		if (!nest2) {
+ 			nla_nest_end(skb, nest);
+ 			return -EMSGSIZE;
+* Unmerged path drivers/net/ieee802154/mac802154_hwsim.c
+diff --git a/drivers/net/macsec.c b/drivers/net/macsec.c
+index 590f48f56360..4320a477895f 100644
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@ -2365,7 +2365,8 @@ static int copy_secy_stats(struct sk_buff *skb,
+ static int nla_put_secy(struct macsec_secy *secy, struct sk_buff *skb)
+ {
+ 	struct macsec_tx_sc *tx_sc = &secy->tx_sc;
+-	struct nlattr *secy_nest = nla_nest_start(skb, MACSEC_ATTR_SECY);
++	struct nlattr *secy_nest = nla_nest_start_noflag(skb,
++							 MACSEC_ATTR_SECY);
+ 	u64 csid;
+ 
+ 	if (!secy_nest)
+@@ -2434,7 +2435,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 	if (nla_put_secy(secy, skb))
+ 		goto nla_put_failure;
+ 
+-	attr = nla_nest_start(skb, MACSEC_ATTR_TXSC_STATS);
++	attr = nla_nest_start_noflag(skb, MACSEC_ATTR_TXSC_STATS);
+ 	if (!attr)
+ 		goto nla_put_failure;
+ 	if (copy_tx_sc_stats(skb, tx_sc->stats)) {
+@@ -2443,7 +2444,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 	}
+ 	nla_nest_end(skb, attr);
+ 
+-	attr = nla_nest_start(skb, MACSEC_ATTR_SECY_STATS);
++	attr = nla_nest_start_noflag(skb, MACSEC_ATTR_SECY_STATS);
+ 	if (!attr)
+ 		goto nla_put_failure;
+ 	if (copy_secy_stats(skb, macsec_priv(dev)->stats)) {
+@@ -2452,7 +2453,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 	}
+ 	nla_nest_end(skb, attr);
+ 
+-	txsa_list = nla_nest_start(skb, MACSEC_ATTR_TXSA_LIST);
++	txsa_list = nla_nest_start_noflag(skb, MACSEC_ATTR_TXSA_LIST);
+ 	if (!txsa_list)
+ 		goto nla_put_failure;
+ 	for (i = 0, j = 1; i < MACSEC_NUM_AN; i++) {
+@@ -2462,7 +2463,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 		if (!tx_sa)
+ 			continue;
+ 
+-		txsa_nest = nla_nest_start(skb, j++);
++		txsa_nest = nla_nest_start_noflag(skb, j++);
+ 		if (!txsa_nest) {
+ 			nla_nest_cancel(skb, txsa_list);
+ 			goto nla_put_failure;
+@@ -2477,7 +2478,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 			goto nla_put_failure;
+ 		}
+ 
+-		attr = nla_nest_start(skb, MACSEC_SA_ATTR_STATS);
++		attr = nla_nest_start_noflag(skb, MACSEC_SA_ATTR_STATS);
+ 		if (!attr) {
+ 			nla_nest_cancel(skb, txsa_nest);
+ 			nla_nest_cancel(skb, txsa_list);
+@@ -2495,7 +2496,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 	}
+ 	nla_nest_end(skb, txsa_list);
+ 
+-	rxsc_list = nla_nest_start(skb, MACSEC_ATTR_RXSC_LIST);
++	rxsc_list = nla_nest_start_noflag(skb, MACSEC_ATTR_RXSC_LIST);
+ 	if (!rxsc_list)
+ 		goto nla_put_failure;
+ 
+@@ -2503,7 +2504,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 	for_each_rxsc_rtnl(secy, rx_sc) {
+ 		int k;
+ 		struct nlattr *rxsa_list;
+-		struct nlattr *rxsc_nest = nla_nest_start(skb, j++);
++		struct nlattr *rxsc_nest = nla_nest_start_noflag(skb, j++);
+ 
+ 		if (!rxsc_nest) {
+ 			nla_nest_cancel(skb, rxsc_list);
+@@ -2518,7 +2519,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 			goto nla_put_failure;
+ 		}
+ 
+-		attr = nla_nest_start(skb, MACSEC_RXSC_ATTR_STATS);
++		attr = nla_nest_start_noflag(skb, MACSEC_RXSC_ATTR_STATS);
+ 		if (!attr) {
+ 			nla_nest_cancel(skb, rxsc_nest);
+ 			nla_nest_cancel(skb, rxsc_list);
+@@ -2532,7 +2533,8 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 		}
+ 		nla_nest_end(skb, attr);
+ 
+-		rxsa_list = nla_nest_start(skb, MACSEC_RXSC_ATTR_SA_LIST);
++		rxsa_list = nla_nest_start_noflag(skb,
++						  MACSEC_RXSC_ATTR_SA_LIST);
+ 		if (!rxsa_list) {
+ 			nla_nest_cancel(skb, rxsc_nest);
+ 			nla_nest_cancel(skb, rxsc_list);
+@@ -2546,7 +2548,7 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 			if (!rx_sa)
+ 				continue;
+ 
+-			rxsa_nest = nla_nest_start(skb, k++);
++			rxsa_nest = nla_nest_start_noflag(skb, k++);
+ 			if (!rxsa_nest) {
+ 				nla_nest_cancel(skb, rxsa_list);
+ 				nla_nest_cancel(skb, rxsc_nest);
+@@ -2554,7 +2556,8 @@ static int dump_secy(struct macsec_secy *secy, struct net_device *dev,
+ 				goto nla_put_failure;
+ 			}
+ 
+-			attr = nla_nest_start(skb, MACSEC_SA_ATTR_STATS);
++			attr = nla_nest_start_noflag(skb,
++						     MACSEC_SA_ATTR_STATS);
+ 			if (!attr) {
+ 				nla_nest_cancel(skb, rxsa_list);
+ 				nla_nest_cancel(skb, rxsc_nest);
+diff --git a/drivers/net/macvlan.c b/drivers/net/macvlan.c
+index 7170cd658a88..fd7e000191a7 100644
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@ -1625,7 +1625,7 @@ static int macvlan_fill_info(struct sk_buff *skb,
+ 	if (nla_put_u32(skb, IFLA_MACVLAN_MACADDR_COUNT, vlan->macaddr_count))
+ 		goto nla_put_failure;
+ 	if (vlan->macaddr_count > 0) {
+-		nest = nla_nest_start(skb, IFLA_MACVLAN_MACADDR_DATA);
++		nest = nla_nest_start_noflag(skb, IFLA_MACVLAN_MACADDR_DATA);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 
+diff --git a/drivers/net/team/team.c b/drivers/net/team/team.c
+index 192fd83d4878..f7eba3ea0bd4 100644
+--- a/drivers/net/team/team.c
++++ b/drivers/net/team/team.c
+@@ -2307,7 +2307,7 @@ static int team_nl_fill_one_option_get(struct sk_buff *skb, struct team *team,
+ 	if (err)
+ 		return err;
+ 
+-	option_item = nla_nest_start(skb, TEAM_ATTR_ITEM_OPTION);
++	option_item = nla_nest_start_noflag(skb, TEAM_ATTR_ITEM_OPTION);
+ 	if (!option_item)
+ 		return -EMSGSIZE;
+ 
+@@ -2421,7 +2421,7 @@ static int team_nl_send_options_get(struct team *team, u32 portid, u32 seq,
+ 
+ 	if (nla_put_u32(skb, TEAM_ATTR_TEAM_IFINDEX, team->dev->ifindex))
+ 		goto nla_put_failure;
+-	option_list = nla_nest_start(skb, TEAM_ATTR_LIST_OPTION);
++	option_list = nla_nest_start_noflag(skb, TEAM_ATTR_LIST_OPTION);
+ 	if (!option_list)
+ 		goto nla_put_failure;
+ 
+@@ -2649,7 +2649,7 @@ static int team_nl_fill_one_port_get(struct sk_buff *skb,
+ {
+ 	struct nlattr *port_item;
+ 
+-	port_item = nla_nest_start(skb, TEAM_ATTR_ITEM_PORT);
++	port_item = nla_nest_start_noflag(skb, TEAM_ATTR_ITEM_PORT);
+ 	if (!port_item)
+ 		goto nest_cancel;
+ 	if (nla_put_u32(skb, TEAM_ATTR_PORT_IFINDEX, port->dev->ifindex))
+@@ -2704,7 +2704,7 @@ static int team_nl_send_port_list_get(struct team *team, u32 portid, u32 seq,
+ 
+ 	if (nla_put_u32(skb, TEAM_ATTR_TEAM_IFINDEX, team->dev->ifindex))
+ 		goto nla_put_failure;
+-	port_list = nla_nest_start(skb, TEAM_ATTR_LIST_PORT);
++	port_list = nla_nest_start_noflag(skb, TEAM_ATTR_LIST_PORT);
+ 	if (!port_list)
+ 		goto nla_put_failure;
+ 
+diff --git a/drivers/net/wireless/ath/wil6210/cfg80211.c b/drivers/net/wireless/ath/wil6210/cfg80211.c
+index 78946f28d0c7..b704797dd9a8 100644
+--- a/drivers/net/wireless/ath/wil6210/cfg80211.c
++++ b/drivers/net/wireless/ath/wil6210/cfg80211.c
+@@ -2318,13 +2318,13 @@ static int wil_rf_sector_get_cfg(struct wiphy *wiphy,
+ 			      QCA_ATTR_PAD))
+ 		goto nla_put_failure;
+ 
+-	nl_cfgs = nla_nest_start(msg, QCA_ATTR_DMG_RF_SECTOR_CFG);
++	nl_cfgs = nla_nest_start_noflag(msg, QCA_ATTR_DMG_RF_SECTOR_CFG);
+ 	if (!nl_cfgs)
+ 		goto nla_put_failure;
+ 	for (i = 0; i < WMI_MAX_RF_MODULES_NUM; i++) {
+ 		if (!(rf_modules_vec & BIT(i)))
+ 			continue;
+-		nl_cfg = nla_nest_start(msg, i);
++		nl_cfg = nla_nest_start_noflag(msg, i);
+ 		if (!nl_cfg)
+ 			goto nla_put_failure;
+ 		si = &reply.evt.sectors_info[i];
+diff --git a/include/linux/netfilter/ipset/ip_set.h b/include/linux/netfilter/ipset/ip_set.h
+index f2e1e6b13ca4..965dc6c6653e 100644
+--- a/include/linux/netfilter/ipset/ip_set.h
++++ b/include/linux/netfilter/ipset/ip_set.h
+@@ -401,7 +401,7 @@ ip_set_get_h16(const struct nlattr *attr)
+ 	return ntohs(nla_get_be16(attr));
+ }
+ 
+-#define ipset_nest_start(skb, attr) nla_nest_start(skb, attr | NLA_F_NESTED)
++#define ipset_nest_start(skb, attr) nla_nest_start(skb, attr)
+ #define ipset_nest_end(skb, start)  nla_nest_end(skb, start)
+ 
+ static inline int nla_put_ipaddr4(struct sk_buff *skb, int type, __be32 ipaddr)
+diff --git a/include/net/netlink.h b/include/net/netlink.h
+index bc0bce06e70a..95113770307a 100644
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@ -1336,13 +1336,18 @@ static inline void *nla_memdup(const struct nlattr *src, gfp_t gfp)
+ }
+ 
+ /**
+- * nla_nest_start - Start a new level of nested attributes
++ * nla_nest_start_noflag - Start a new level of nested attributes
+  * @skb: socket buffer to add attributes to
+  * @attrtype: attribute type of container
+  *
+- * Returns the container attribute
++ * This function exists for backward compatibility to use in APIs which never
++ * marked their nest attributes with NLA_F_NESTED flag. New APIs should use
++ * nla_nest_start() which sets the flag.
++ *
++ * Returns the container attribute or NULL on error
+  */
+-static inline struct nlattr *nla_nest_start(struct sk_buff *skb, int attrtype)
++static inline struct nlattr *nla_nest_start_noflag(struct sk_buff *skb,
++						   int attrtype)
+ {
+ 	struct nlattr *start = (struct nlattr *)skb_tail_pointer(skb);
+ 
+@@ -1352,6 +1357,21 @@ static inline struct nlattr *nla_nest_start(struct sk_buff *skb, int attrtype)
+ 	return start;
+ }
+ 
++/**
++ * nla_nest_start - Start a new level of nested attributes, with NLA_F_NESTED
++ * @skb: socket buffer to add attributes to
++ * @attrtype: attribute type of container
++ *
++ * Unlike nla_nest_start_noflag(), mark the nest attribute with NLA_F_NESTED
++ * flag. This is the preferred function to use in new code.
++ *
++ * Returns the container attribute or NULL on error
++ */
++static inline struct nlattr *nla_nest_start(struct sk_buff *skb, int attrtype)
++{
++	return nla_nest_start_noflag(skb, attrtype | NLA_F_NESTED);
++}
++
+ /**
+  * nla_nest_end - Finalize nesting of attributes
+  * @skb: socket buffer the attributes are stored in
+diff --git a/kernel/taskstats.c b/kernel/taskstats.c
+index 4e62a4a8fa91..692925754bdc 100644
+--- a/kernel/taskstats.c
++++ b/kernel/taskstats.c
+@@ -375,7 +375,7 @@ static struct taskstats *mk_reply(struct sk_buff *skb, int type, u32 pid)
+ 			? TASKSTATS_TYPE_AGGR_PID
+ 			: TASKSTATS_TYPE_AGGR_TGID;
+ 
+-	na = nla_nest_start(skb, aggr);
++	na = nla_nest_start_noflag(skb, aggr);
+ 	if (!na)
+ 		goto err;
+ 
+diff --git a/net/8021q/vlan_netlink.c b/net/8021q/vlan_netlink.c
+index 9b60c1e399e2..0a4913bcb089 100644
+--- a/net/8021q/vlan_netlink.c
++++ b/net/8021q/vlan_netlink.c
+@@ -226,7 +226,7 @@ static int vlan_fill_info(struct sk_buff *skb, const struct net_device *dev)
+ 			goto nla_put_failure;
+ 	}
+ 	if (vlan->nr_ingress_mappings) {
+-		nest = nla_nest_start(skb, IFLA_VLAN_INGRESS_QOS);
++		nest = nla_nest_start_noflag(skb, IFLA_VLAN_INGRESS_QOS);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 
+@@ -244,7 +244,7 @@ static int vlan_fill_info(struct sk_buff *skb, const struct net_device *dev)
+ 	}
+ 
+ 	if (vlan->nr_egress_mappings) {
+-		nest = nla_nest_start(skb, IFLA_VLAN_EGRESS_QOS);
++		nest = nla_nest_start_noflag(skb, IFLA_VLAN_EGRESS_QOS);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 
+* Unmerged path net/bridge/br_mdb.c
+diff --git a/net/bridge/br_netlink.c b/net/bridge/br_netlink.c
+index 0b3ccef34ba8..41eca6f167d7 100644
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@ -404,7 +404,7 @@ static int br_fill_ifinfo(struct sk_buff *skb,
+ 
+ 	if (event == RTM_NEWLINK && port) {
+ 		struct nlattr *nest
+-			= nla_nest_start(skb, IFLA_PROTINFO | NLA_F_NESTED);
++			= nla_nest_start(skb, IFLA_PROTINFO);
+ 
+ 		if (nest == NULL || br_port_fill_attrs(skb, port) < 0)
+ 			goto nla_put_failure;
+@@ -429,7 +429,7 @@ static int br_fill_ifinfo(struct sk_buff *skb,
+ 			rcu_read_unlock();
+ 			goto done;
+ 		}
+-		af = nla_nest_start(skb, IFLA_AF_SPEC);
++		af = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
+ 		if (!af) {
+ 			rcu_read_unlock();
+ 			goto nla_put_failure;
+@@ -1536,7 +1536,7 @@ static int br_fill_linkxstats(struct sk_buff *skb,
+ 		return -EINVAL;
+ 	}
+ 
+-	nest = nla_nest_start(skb, LINK_XSTATS_TYPE_BRIDGE);
++	nest = nla_nest_start_noflag(skb, LINK_XSTATS_TYPE_BRIDGE);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/bridge/br_netlink_tunnel.c b/net/bridge/br_netlink_tunnel.c
+index da8cb99fd259..787e140dc4b5 100644
+--- a/net/bridge/br_netlink_tunnel.c
++++ b/net/bridge/br_netlink_tunnel.c
+@@ -97,7 +97,7 @@ static int br_fill_vlan_tinfo(struct sk_buff *skb, u16 vid,
+ 	__be32 tid = tunnel_id_to_key32(tunnel_id);
+ 	struct nlattr *tmap;
+ 
+-	tmap = nla_nest_start(skb, IFLA_BRIDGE_VLAN_TUNNEL_INFO);
++	tmap = nla_nest_start_noflag(skb, IFLA_BRIDGE_VLAN_TUNNEL_INFO);
+ 	if (!tmap)
+ 		return -EMSGSIZE;
+ 	if (nla_put_u32(skb, IFLA_BRIDGE_VLAN_TUNNEL_ID,
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index d12ffdf1735e..916487aeeb23 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -1674,7 +1674,7 @@ int devlink_dpipe_match_put(struct sk_buff *skb,
+ 	struct devlink_dpipe_field *field = &header->fields[match->field_id];
+ 	struct nlattr *match_attr;
+ 
+-	match_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_MATCH);
++	match_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_MATCH);
+ 	if (!match_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -1699,7 +1699,8 @@ static int devlink_dpipe_matches_put(struct devlink_dpipe_table *table,
+ {
+ 	struct nlattr *matches_attr;
+ 
+-	matches_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_TABLE_MATCHES);
++	matches_attr = nla_nest_start_noflag(skb,
++					     DEVLINK_ATTR_DPIPE_TABLE_MATCHES);
+ 	if (!matches_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -1721,7 +1722,7 @@ int devlink_dpipe_action_put(struct sk_buff *skb,
+ 	struct devlink_dpipe_field *field = &header->fields[action->field_id];
+ 	struct nlattr *action_attr;
+ 
+-	action_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_ACTION);
++	action_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_ACTION);
+ 	if (!action_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -1746,7 +1747,8 @@ static int devlink_dpipe_actions_put(struct devlink_dpipe_table *table,
+ {
+ 	struct nlattr *actions_attr;
+ 
+-	actions_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_TABLE_ACTIONS);
++	actions_attr = nla_nest_start_noflag(skb,
++					     DEVLINK_ATTR_DPIPE_TABLE_ACTIONS);
+ 	if (!actions_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -1768,7 +1770,7 @@ static int devlink_dpipe_table_put(struct sk_buff *skb,
+ 	u64 table_size;
+ 
+ 	table_size = table->table_ops->size_get(table->priv);
+-	table_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_TABLE);
++	table_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_TABLE);
+ 	if (!table_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -1848,7 +1850,7 @@ static int devlink_dpipe_tables_fill(struct genl_info *info,
+ 
+ 	if (devlink_nl_put_handle(skb, devlink))
+ 		goto nla_put_failure;
+-	tables_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_TABLES);
++	tables_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_TABLES);
+ 	if (!tables_attr)
+ 		goto nla_put_failure;
+ 
+@@ -1949,8 +1951,8 @@ static int devlink_dpipe_action_values_put(struct sk_buff *skb,
+ 	int err;
+ 
+ 	for (i = 0; i < values_count; i++) {
+-		action_attr = nla_nest_start(skb,
+-					     DEVLINK_ATTR_DPIPE_ACTION_VALUE);
++		action_attr = nla_nest_start_noflag(skb,
++						    DEVLINK_ATTR_DPIPE_ACTION_VALUE);
+ 		if (!action_attr)
+ 			return -EMSGSIZE;
+ 		err = devlink_dpipe_action_value_put(skb, &values[i]);
+@@ -1986,8 +1988,8 @@ static int devlink_dpipe_match_values_put(struct sk_buff *skb,
+ 	int err;
+ 
+ 	for (i = 0; i < values_count; i++) {
+-		match_attr = nla_nest_start(skb,
+-					    DEVLINK_ATTR_DPIPE_MATCH_VALUE);
++		match_attr = nla_nest_start_noflag(skb,
++						   DEVLINK_ATTR_DPIPE_MATCH_VALUE);
+ 		if (!match_attr)
+ 			return -EMSGSIZE;
+ 		err = devlink_dpipe_match_value_put(skb, &values[i]);
+@@ -2008,7 +2010,7 @@ static int devlink_dpipe_entry_put(struct sk_buff *skb,
+ 	struct nlattr *entry_attr, *matches_attr, *actions_attr;
+ 	int err;
+ 
+-	entry_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_ENTRY);
++	entry_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_ENTRY);
+ 	if (!entry_attr)
+ 		return  -EMSGSIZE;
+ 
+@@ -2020,8 +2022,8 @@ static int devlink_dpipe_entry_put(struct sk_buff *skb,
+ 				      entry->counter, DEVLINK_ATTR_PAD))
+ 			goto nla_put_failure;
+ 
+-	matches_attr = nla_nest_start(skb,
+-				      DEVLINK_ATTR_DPIPE_ENTRY_MATCH_VALUES);
++	matches_attr = nla_nest_start_noflag(skb,
++					     DEVLINK_ATTR_DPIPE_ENTRY_MATCH_VALUES);
+ 	if (!matches_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2033,8 +2035,8 @@ static int devlink_dpipe_entry_put(struct sk_buff *skb,
+ 	}
+ 	nla_nest_end(skb, matches_attr);
+ 
+-	actions_attr = nla_nest_start(skb,
+-				      DEVLINK_ATTR_DPIPE_ENTRY_ACTION_VALUES);
++	actions_attr = nla_nest_start_noflag(skb,
++					     DEVLINK_ATTR_DPIPE_ENTRY_ACTION_VALUES);
+ 	if (!actions_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2091,8 +2093,8 @@ int devlink_dpipe_entry_ctx_prepare(struct devlink_dpipe_dump_ctx *dump_ctx)
+ 	devlink = dump_ctx->info->user_ptr[0];
+ 	if (devlink_nl_put_handle(dump_ctx->skb, devlink))
+ 		goto nla_put_failure;
+-	dump_ctx->nest = nla_nest_start(dump_ctx->skb,
+-					DEVLINK_ATTR_DPIPE_ENTRIES);
++	dump_ctx->nest = nla_nest_start_noflag(dump_ctx->skb,
++					       DEVLINK_ATTR_DPIPE_ENTRIES);
+ 	if (!dump_ctx->nest)
+ 		goto nla_put_failure;
+ 	return 0;
+@@ -2202,7 +2204,8 @@ static int devlink_dpipe_fields_put(struct sk_buff *skb,
+ 
+ 	for (i = 0; i < header->fields_count; i++) {
+ 		field = &header->fields[i];
+-		field_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_FIELD);
++		field_attr = nla_nest_start_noflag(skb,
++						   DEVLINK_ATTR_DPIPE_FIELD);
+ 		if (!field_attr)
+ 			return -EMSGSIZE;
+ 		if (nla_put_string(skb, DEVLINK_ATTR_DPIPE_FIELD_NAME, field->name) ||
+@@ -2225,7 +2228,7 @@ static int devlink_dpipe_header_put(struct sk_buff *skb,
+ 	struct nlattr *fields_attr, *header_attr;
+ 	int err;
+ 
+-	header_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_HEADER);
++	header_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_HEADER);
+ 	if (!header_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -2234,7 +2237,8 @@ static int devlink_dpipe_header_put(struct sk_buff *skb,
+ 	    nla_put_u8(skb, DEVLINK_ATTR_DPIPE_HEADER_GLOBAL, header->global))
+ 		goto nla_put_failure;
+ 
+-	fields_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_HEADER_FIELDS);
++	fields_attr = nla_nest_start_noflag(skb,
++					    DEVLINK_ATTR_DPIPE_HEADER_FIELDS);
+ 	if (!fields_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2281,7 +2285,7 @@ static int devlink_dpipe_headers_fill(struct genl_info *info,
+ 
+ 	if (devlink_nl_put_handle(skb, devlink))
+ 		goto nla_put_failure;
+-	headers_attr = nla_nest_start(skb, DEVLINK_ATTR_DPIPE_HEADERS);
++	headers_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_DPIPE_HEADERS);
+ 	if (!headers_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2505,7 +2509,7 @@ static int devlink_resource_put(struct devlink *devlink, struct sk_buff *skb,
+ 	struct nlattr *child_resource_attr;
+ 	struct nlattr *resource_attr;
+ 
+-	resource_attr = nla_nest_start(skb, DEVLINK_ATTR_RESOURCE);
++	resource_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_RESOURCE);
+ 	if (!resource_attr)
+ 		return -EMSGSIZE;
+ 
+@@ -2529,7 +2533,8 @@ static int devlink_resource_put(struct devlink *devlink, struct sk_buff *skb,
+ 		       resource->size_valid))
+ 		goto nla_put_failure;
+ 
+-	child_resource_attr = nla_nest_start(skb, DEVLINK_ATTR_RESOURCE_LIST);
++	child_resource_attr = nla_nest_start_noflag(skb,
++						    DEVLINK_ATTR_RESOURCE_LIST);
+ 	if (!child_resource_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2580,7 +2585,8 @@ static int devlink_resource_fill(struct genl_info *info,
+ 	if (devlink_nl_put_handle(skb, devlink))
+ 		goto nla_put_failure;
+ 
+-	resources_attr = nla_nest_start(skb, DEVLINK_ATTR_RESOURCE_LIST);
++	resources_attr = nla_nest_start_noflag(skb,
++					       DEVLINK_ATTR_RESOURCE_LIST);
+ 	if (!resources_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2834,7 +2840,8 @@ devlink_nl_param_value_fill_one(struct sk_buff *msg,
+ {
+ 	struct nlattr *param_value_attr;
+ 
+-	param_value_attr = nla_nest_start(msg, DEVLINK_ATTR_PARAM_VALUE);
++	param_value_attr = nla_nest_start_noflag(msg,
++						 DEVLINK_ATTR_PARAM_VALUE);
+ 	if (!param_value_attr)
+ 		goto nla_put_failure;
+ 
+@@ -2925,7 +2932,7 @@ static int devlink_nl_param_fill(struct sk_buff *msg, struct devlink *devlink,
+ 		if (nla_put_u32(msg, DEVLINK_ATTR_PORT_INDEX, port_index))
+ 			goto genlmsg_cancel;
+ 
+-	param_attr = nla_nest_start(msg, DEVLINK_ATTR_PARAM);
++	param_attr = nla_nest_start_noflag(msg, DEVLINK_ATTR_PARAM);
+ 	if (!param_attr)
+ 		goto genlmsg_cancel;
+ 	if (nla_put_string(msg, DEVLINK_ATTR_PARAM_NAME, param->name))
+@@ -2939,7 +2946,8 @@ static int devlink_nl_param_fill(struct sk_buff *msg, struct devlink *devlink,
+ 	if (nla_put_u8(msg, DEVLINK_ATTR_PARAM_TYPE, nla_type))
+ 		goto param_nest_cancel;
+ 
+-	param_values_list = nla_nest_start(msg, DEVLINK_ATTR_PARAM_VALUES_LIST);
++	param_values_list = nla_nest_start_noflag(msg,
++						  DEVLINK_ATTR_PARAM_VALUES_LIST);
+ 	if (!param_values_list)
+ 		goto param_nest_cancel;
+ 
+@@ -3339,7 +3347,7 @@ static int devlink_nl_region_snapshot_id_put(struct sk_buff *msg,
+ 	struct nlattr *snap_attr;
+ 	int err;
+ 
+-	snap_attr = nla_nest_start(msg, DEVLINK_ATTR_REGION_SNAPSHOT);
++	snap_attr = nla_nest_start_noflag(msg, DEVLINK_ATTR_REGION_SNAPSHOT);
+ 	if (!snap_attr)
+ 		return -EINVAL;
+ 
+@@ -3363,7 +3371,8 @@ static int devlink_nl_region_snapshots_id_put(struct sk_buff *msg,
+ 	struct nlattr *snapshots_attr;
+ 	int err;
+ 
+-	snapshots_attr = nla_nest_start(msg, DEVLINK_ATTR_REGION_SNAPSHOTS);
++	snapshots_attr = nla_nest_start_noflag(msg,
++					       DEVLINK_ATTR_REGION_SNAPSHOTS);
+ 	if (!snapshots_attr)
+ 		return -EINVAL;
+ 
+@@ -3579,7 +3588,7 @@ static int devlink_nl_cmd_region_read_chunk_fill(struct sk_buff *msg,
+ 	struct nlattr *chunk_attr;
+ 	int err;
+ 
+-	chunk_attr = nla_nest_start(msg, DEVLINK_ATTR_REGION_CHUNK);
++	chunk_attr = nla_nest_start_noflag(msg, DEVLINK_ATTR_REGION_CHUNK);
+ 	if (!chunk_attr)
+ 		return -EINVAL;
+ 
+@@ -3712,7 +3721,7 @@ static int devlink_nl_cmd_region_read_dumpit(struct sk_buff *skb,
+ 	if (err)
+ 		goto nla_put_failure;
+ 
+-	chunks_attr = nla_nest_start(skb, DEVLINK_ATTR_REGION_CHUNKS);
++	chunks_attr = nla_nest_start_noflag(skb, DEVLINK_ATTR_REGION_CHUNKS);
+ 	if (!chunks_attr) {
+ 		err = -EMSGSIZE;
+ 		goto nla_put_failure;
+@@ -3788,7 +3797,7 @@ static int devlink_info_version_put(struct devlink_info_req *req, int attr,
+ 	struct nlattr *nest;
+ 	int err;
+ 
+-	nest = nla_nest_start(req->msg, attr);
++	nest = nla_nest_start_noflag(req->msg, attr);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -4316,7 +4325,7 @@ devlink_fmsg_prepare_skb(struct devlink_fmsg *fmsg, struct sk_buff *skb,
+ 	int i = 0;
+ 	int err;
+ 
+-	fmsg_nlattr = nla_nest_start(skb, DEVLINK_ATTR_FMSG);
++	fmsg_nlattr = nla_nest_start_noflag(skb, DEVLINK_ATTR_FMSG);
+ 	if (!fmsg_nlattr)
+ 		return -EMSGSIZE;
+ 
+@@ -4668,7 +4677,8 @@ devlink_nl_health_reporter_fill(struct sk_buff *msg,
+ 	if (devlink_nl_put_handle(msg, devlink))
+ 		goto genlmsg_cancel;
+ 
+-	reporter_attr = nla_nest_start(msg, DEVLINK_ATTR_HEALTH_REPORTER);
++	reporter_attr = nla_nest_start_noflag(msg,
++					      DEVLINK_ATTR_HEALTH_REPORTER);
+ 	if (!reporter_attr)
+ 		goto genlmsg_cancel;
+ 	if (nla_put_string(msg, DEVLINK_ATTR_HEALTH_REPORTER_NAME,
+diff --git a/net/core/lwt_bpf.c b/net/core/lwt_bpf.c
+index ce7df04c7b12..222f394af825 100644
+--- a/net/core/lwt_bpf.c
++++ b/net/core/lwt_bpf.c
+@@ -453,7 +453,7 @@ static int bpf_fill_lwt_prog(struct sk_buff *skb, int attr,
+ 	if (!prog->prog)
+ 		return 0;
+ 
+-	nest = nla_nest_start(skb, attr);
++	nest = nla_nest_start_noflag(skb, attr);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+* Unmerged path net/core/lwtunnel.c
+diff --git a/net/core/neighbour.c b/net/core/neighbour.c
+index 23d863c9f0c7..27240758db22 100644
+--- a/net/core/neighbour.c
++++ b/net/core/neighbour.c
+@@ -1859,7 +1859,7 @@ static int neightbl_fill_parms(struct sk_buff *skb, struct neigh_parms *parms)
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, NDTA_PARMS);
++	nest = nla_nest_start_noflag(skb, NDTA_PARMS);
+ 	if (nest == NULL)
+ 		return -ENOBUFS;
+ 
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index e0965865302f..4623fc01e881 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -635,7 +635,7 @@ static int rtnl_link_slave_info_fill(struct sk_buff *skb,
+ 	if (nla_put_string(skb, IFLA_INFO_SLAVE_KIND, ops->kind) < 0)
+ 		return -EMSGSIZE;
+ 	if (ops->fill_slave_info) {
+-		slave_data = nla_nest_start(skb, IFLA_INFO_SLAVE_DATA);
++		slave_data = nla_nest_start_noflag(skb, IFLA_INFO_SLAVE_DATA);
+ 		if (!slave_data)
+ 			return -EMSGSIZE;
+ 		err = ops->fill_slave_info(skb, master_dev, dev);
+@@ -667,7 +667,7 @@ static int rtnl_link_info_fill(struct sk_buff *skb,
+ 			return err;
+ 	}
+ 	if (ops->fill_info) {
+-		data = nla_nest_start(skb, IFLA_INFO_DATA);
++		data = nla_nest_start_noflag(skb, IFLA_INFO_DATA);
+ 		if (data == NULL)
+ 			return -EMSGSIZE;
+ 		err = ops->fill_info(skb, dev);
+@@ -687,7 +687,7 @@ static int rtnl_link_fill(struct sk_buff *skb, const struct net_device *dev)
+ 	struct nlattr *linkinfo;
+ 	int err = -EMSGSIZE;
+ 
+-	linkinfo = nla_nest_start(skb, IFLA_LINKINFO);
++	linkinfo = nla_nest_start_noflag(skb, IFLA_LINKINFO);
+ 	if (linkinfo == NULL)
+ 		goto out;
+ 
+@@ -756,7 +756,7 @@ int rtnetlink_put_metrics(struct sk_buff *skb, u32 *metrics)
+ 	struct nlattr *mx;
+ 	int i, valid = 0;
+ 
+-	mx = nla_nest_start(skb, RTA_METRICS);
++	mx = nla_nest_start_noflag(skb, RTA_METRICS);
+ 	if (mx == NULL)
+ 		return -ENOBUFS;
+ 
+@@ -1037,12 +1037,12 @@ static int rtnl_vf_ports_fill(struct sk_buff *skb, struct net_device *dev)
+ 	int vf;
+ 	int err;
+ 
+-	vf_ports = nla_nest_start(skb, IFLA_VF_PORTS);
++	vf_ports = nla_nest_start_noflag(skb, IFLA_VF_PORTS);
+ 	if (!vf_ports)
+ 		return -EMSGSIZE;
+ 
+ 	for (vf = 0; vf < dev_num_vf(dev->dev.parent); vf++) {
+-		vf_port = nla_nest_start(skb, IFLA_VF_PORT);
++		vf_port = nla_nest_start_noflag(skb, IFLA_VF_PORT);
+ 		if (!vf_port)
+ 			goto nla_put_failure;
+ 		if (nla_put_u32(skb, IFLA_PORT_VF, vf))
+@@ -1071,7 +1071,7 @@ static int rtnl_port_self_fill(struct sk_buff *skb, struct net_device *dev)
+ 	struct nlattr *port_self;
+ 	int err;
+ 
+-	port_self = nla_nest_start(skb, IFLA_PORT_SELF);
++	port_self = nla_nest_start_noflag(skb, IFLA_PORT_SELF);
+ 	if (!port_self)
+ 		return -EMSGSIZE;
+ 
+@@ -1272,7 +1272,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
+ 	vf_linkstate.link_state = ivi.linkstate;
+ 	vf_rss_query_en.setting = ivi.rss_query_en;
+ 	vf_trust.setting = ivi.trusted;
+-	vf = nla_nest_start(skb, IFLA_VF_INFO);
++	vf = nla_nest_start_noflag(skb, IFLA_VF_INFO);
+ 	if (!vf)
+ 		goto nla_put_vfinfo_failure;
+ 	if (nla_put(skb, IFLA_VF_MAC, sizeof(vf_mac), &vf_mac) ||
+@@ -1291,7 +1291,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
+ 	    nla_put(skb, IFLA_VF_TRUST,
+ 		    sizeof(vf_trust), &vf_trust))
+ 		goto nla_put_vf_failure;
+-	vfvlanlist = nla_nest_start(skb, IFLA_VF_VLAN_LIST);
++	vfvlanlist = nla_nest_start_noflag(skb, IFLA_VF_VLAN_LIST);
+ 	if (!vfvlanlist)
+ 		goto nla_put_vf_failure;
+ 	if (nla_put(skb, IFLA_VF_VLAN_INFO, sizeof(vf_vlan_info),
+@@ -1304,7 +1304,7 @@ static noinline_for_stack int rtnl_fill_vfinfo(struct sk_buff *skb,
+ 	if (dev->netdev_ops->ndo_get_vf_stats)
+ 		dev->netdev_ops->ndo_get_vf_stats(dev, vfs_num,
+ 						&vf_stats);
+-	vfstats = nla_nest_start(skb, IFLA_VF_STATS);
++	vfstats = nla_nest_start_noflag(skb, IFLA_VF_STATS);
+ 	if (!vfstats)
+ 		goto nla_put_vf_failure;
+ 	if (nla_put_u64_64bit(skb, IFLA_VF_STATS_RX_PACKETS,
+@@ -1354,7 +1354,7 @@ static noinline_for_stack int rtnl_fill_vf(struct sk_buff *skb,
+ 	if (!dev->netdev_ops->ndo_get_vf_config)
+ 		return 0;
+ 
+-	vfinfo = nla_nest_start(skb, IFLA_VFINFO_LIST);
++	vfinfo = nla_nest_start_noflag(skb, IFLA_VFINFO_LIST);
+ 	if (!vfinfo)
+ 		return -EMSGSIZE;
+ 
+@@ -1439,7 +1439,7 @@ static int rtnl_xdp_fill(struct sk_buff *skb, struct net_device *dev)
+ 	int err;
+ 	u8 mode;
+ 
+-	xdp = nla_nest_start(skb, IFLA_XDP);
++	xdp = nla_nest_start_noflag(skb, IFLA_XDP);
+ 	if (!xdp)
+ 		return -EMSGSIZE;
+ 
+@@ -1571,7 +1571,7 @@ static int rtnl_fill_link_af(struct sk_buff *skb,
+ 	const struct rtnl_af_ops *af_ops;
+ 	struct nlattr *af_spec;
+ 
+-	af_spec = nla_nest_start(skb, IFLA_AF_SPEC);
++	af_spec = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
+ 	if (!af_spec)
+ 		return -EMSGSIZE;
+ 
+@@ -1582,7 +1582,7 @@ static int rtnl_fill_link_af(struct sk_buff *skb,
+ 		if (!af_ops->fill_link_af)
+ 			continue;
+ 
+-		af = nla_nest_start(skb, af_ops->family);
++		af = nla_nest_start_noflag(skb, af_ops->family);
+ 		if (!af)
+ 			return -EMSGSIZE;
+ 
+@@ -4143,7 +4143,7 @@ int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+ 	     nla_put_u32(skb, IFLA_LINK, dev_get_iflink(dev))))
+ 		goto nla_put_failure;
+ 
+-	br_afspec = nla_nest_start(skb, IFLA_AF_SPEC);
++	br_afspec = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
+ 	if (!br_afspec)
+ 		goto nla_put_failure;
+ 
+@@ -4167,7 +4167,7 @@ int ndo_dflt_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
+ 	}
+ 	nla_nest_end(skb, br_afspec);
+ 
+-	protinfo = nla_nest_start(skb, IFLA_PROTINFO | NLA_F_NESTED);
++	protinfo = nla_nest_start(skb, IFLA_PROTINFO);
+ 	if (!protinfo)
+ 		goto nla_put_failure;
+ 
+@@ -4648,8 +4648,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
+ 
+ 		if (ops && ops->fill_linkxstats) {
+ 			*idxattr = IFLA_STATS_LINK_XSTATS;
+-			attr = nla_nest_start(skb,
+-					      IFLA_STATS_LINK_XSTATS);
++			attr = nla_nest_start_noflag(skb,
++						     IFLA_STATS_LINK_XSTATS);
+ 			if (!attr)
+ 				goto nla_put_failure;
+ 
+@@ -4671,8 +4671,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
+ 			ops = master->rtnl_link_ops;
+ 		if (ops && ops->fill_linkxstats) {
+ 			*idxattr = IFLA_STATS_LINK_XSTATS_SLAVE;
+-			attr = nla_nest_start(skb,
+-					      IFLA_STATS_LINK_XSTATS_SLAVE);
++			attr = nla_nest_start_noflag(skb,
++						     IFLA_STATS_LINK_XSTATS_SLAVE);
+ 			if (!attr)
+ 				goto nla_put_failure;
+ 
+@@ -4687,7 +4687,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
+ 	if (stats_attr_valid(filter_mask, IFLA_STATS_LINK_OFFLOAD_XSTATS,
+ 			     *idxattr)) {
+ 		*idxattr = IFLA_STATS_LINK_OFFLOAD_XSTATS;
+-		attr = nla_nest_start(skb, IFLA_STATS_LINK_OFFLOAD_XSTATS);
++		attr = nla_nest_start_noflag(skb,
++					     IFLA_STATS_LINK_OFFLOAD_XSTATS);
+ 		if (!attr)
+ 			goto nla_put_failure;
+ 
+@@ -4706,7 +4707,7 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
+ 		struct rtnl_af_ops *af_ops;
+ 
+ 		*idxattr = IFLA_STATS_AF_SPEC;
+-		attr = nla_nest_start(skb, IFLA_STATS_AF_SPEC);
++		attr = nla_nest_start_noflag(skb, IFLA_STATS_AF_SPEC);
+ 		if (!attr)
+ 			goto nla_put_failure;
+ 
+@@ -4716,7 +4717,8 @@ static int rtnl_fill_statsinfo(struct sk_buff *skb, struct net_device *dev,
+ 				struct nlattr *af;
+ 				int err;
+ 
+-				af = nla_nest_start(skb, af_ops->family);
++				af = nla_nest_start_noflag(skb,
++							   af_ops->family);
+ 				if (!af) {
+ 					rcu_read_unlock();
+ 					goto nla_put_failure;
+diff --git a/net/dcb/dcbnl.c b/net/dcb/dcbnl.c
+index a556cd708885..3fd3aa7348bd 100644
+--- a/net/dcb/dcbnl.c
++++ b/net/dcb/dcbnl.c
+@@ -246,7 +246,7 @@ static int dcbnl_getpfccfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	nest = nla_nest_start(skb, DCB_ATTR_PFC_CFG);
++	nest = nla_nest_start_noflag(skb, DCB_ATTR_PFC_CFG);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -304,7 +304,7 @@ static int dcbnl_getcap(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	nest = nla_nest_start(skb, DCB_ATTR_CAP);
++	nest = nla_nest_start_noflag(skb, DCB_ATTR_CAP);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -348,7 +348,7 @@ static int dcbnl_getnumtcs(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	nest = nla_nest_start(skb, DCB_ATTR_NUMTCS);
++	nest = nla_nest_start_noflag(skb, DCB_ATTR_NUMTCS);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -479,7 +479,7 @@ static int dcbnl_getapp(struct net_device *netdev, struct nlmsghdr *nlh,
+ 		up = dcb_getapp(netdev, &app);
+ 	}
+ 
+-	app_nest = nla_nest_start(skb, DCB_ATTR_APP);
++	app_nest = nla_nest_start_noflag(skb, DCB_ATTR_APP);
+ 	if (!app_nest)
+ 		return -EMSGSIZE;
+ 
+@@ -578,7 +578,7 @@ static int __dcbnl_pg_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	pg_nest = nla_nest_start(skb, DCB_ATTR_PG_CFG);
++	pg_nest = nla_nest_start_noflag(skb, DCB_ATTR_PG_CFG);
+ 	if (!pg_nest)
+ 		return -EMSGSIZE;
+ 
+@@ -598,7 +598,7 @@ static int __dcbnl_pg_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 		if (ret)
+ 			goto err_pg;
+ 
+-		param_nest = nla_nest_start(skb, i);
++		param_nest = nla_nest_start_noflag(skb, i);
+ 		if (!param_nest)
+ 			goto err_pg;
+ 
+@@ -889,7 +889,7 @@ static int dcbnl_bcn_getcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	bcn_nest = nla_nest_start(skb, DCB_ATTR_BCN);
++	bcn_nest = nla_nest_start_noflag(skb, DCB_ATTR_BCN);
+ 	if (!bcn_nest)
+ 		return -EMSGSIZE;
+ 
+@@ -1002,7 +1002,7 @@ static int dcbnl_build_peer_app(struct net_device *netdev, struct sk_buff* skb,
+ 		 */
+ 		err = -EMSGSIZE;
+ 
+-		app = nla_nest_start(skb, app_nested_type);
++		app = nla_nest_start_noflag(skb, app_nested_type);
+ 		if (!app)
+ 			goto nla_put_failure;
+ 
+@@ -1036,7 +1036,7 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 	if (nla_put_string(skb, DCB_ATTR_IFNAME, netdev->name))
+ 		return -EMSGSIZE;
+ 
+-	ieee = nla_nest_start(skb, DCB_ATTR_IEEE);
++	ieee = nla_nest_start_noflag(skb, DCB_ATTR_IEEE);
+ 	if (!ieee)
+ 		return -EMSGSIZE;
+ 
+@@ -1106,7 +1106,7 @@ static int dcbnl_ieee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 			return -EMSGSIZE;
+ 	}
+ 
+-	app = nla_nest_start(skb, DCB_ATTR_IEEE_APP_TABLE);
++	app = nla_nest_start_noflag(skb, DCB_ATTR_IEEE_APP_TABLE);
+ 	if (!app)
+ 		return -EMSGSIZE;
+ 
+@@ -1174,13 +1174,13 @@ static int dcbnl_cee_pg_fill(struct sk_buff *skb, struct net_device *dev,
+ 	u8 pgid, up_map, prio, tc_pct;
+ 	const struct dcbnl_rtnl_ops *ops = dev->dcbnl_ops;
+ 	int i = dir ? DCB_ATTR_CEE_TX_PG : DCB_ATTR_CEE_RX_PG;
+-	struct nlattr *pg = nla_nest_start(skb, i);
++	struct nlattr *pg = nla_nest_start_noflag(skb, i);
+ 
+ 	if (!pg)
+ 		return -EMSGSIZE;
+ 
+ 	for (i = DCB_PG_ATTR_TC_0; i <= DCB_PG_ATTR_TC_7; i++) {
+-		struct nlattr *tc_nest = nla_nest_start(skb, i);
++		struct nlattr *tc_nest = nla_nest_start_noflag(skb, i);
+ 
+ 		if (!tc_nest)
+ 			return -EMSGSIZE;
+@@ -1231,7 +1231,7 @@ static int dcbnl_cee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 
+ 	if (nla_put_string(skb, DCB_ATTR_IFNAME, netdev->name))
+ 		goto nla_put_failure;
+-	cee = nla_nest_start(skb, DCB_ATTR_CEE);
++	cee = nla_nest_start_noflag(skb, DCB_ATTR_CEE);
+ 	if (!cee)
+ 		goto nla_put_failure;
+ 
+@@ -1250,7 +1250,8 @@ static int dcbnl_cee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 
+ 	/* local pfc */
+ 	if (ops->getpfccfg) {
+-		struct nlattr *pfc_nest = nla_nest_start(skb, DCB_ATTR_CEE_PFC);
++		struct nlattr *pfc_nest = nla_nest_start_noflag(skb,
++								DCB_ATTR_CEE_PFC);
+ 
+ 		if (!pfc_nest)
+ 			goto nla_put_failure;
+@@ -1265,14 +1266,14 @@ static int dcbnl_cee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 
+ 	/* local app */
+ 	spin_lock_bh(&dcb_lock);
+-	app = nla_nest_start(skb, DCB_ATTR_CEE_APP_TABLE);
++	app = nla_nest_start_noflag(skb, DCB_ATTR_CEE_APP_TABLE);
+ 	if (!app)
+ 		goto dcb_unlock;
+ 
+ 	list_for_each_entry(itr, &dcb_app_list, list) {
+ 		if (itr->ifindex == netdev->ifindex) {
+-			struct nlattr *app_nest = nla_nest_start(skb,
+-								 DCB_ATTR_APP);
++			struct nlattr *app_nest = nla_nest_start_noflag(skb,
++									DCB_ATTR_APP);
+ 			if (!app_nest)
+ 				goto dcb_unlock;
+ 
+@@ -1305,7 +1306,8 @@ static int dcbnl_cee_fill(struct sk_buff *skb, struct net_device *netdev)
+ 
+ 	/* features flags */
+ 	if (ops->getfeatcfg) {
+-		struct nlattr *feat = nla_nest_start(skb, DCB_ATTR_CEE_FEAT);
++		struct nlattr *feat = nla_nest_start_noflag(skb,
++							    DCB_ATTR_CEE_FEAT);
+ 		if (!feat)
+ 			goto nla_put_failure;
+ 
+@@ -1607,7 +1609,7 @@ static int dcbnl_getfeatcfg(struct net_device *netdev, struct nlmsghdr *nlh,
+ 	if (ret)
+ 		return ret;
+ 
+-	nest = nla_nest_start(skb, DCB_ATTR_FEATCFG);
++	nest = nla_nest_start_noflag(skb, DCB_ATTR_FEATCFG);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/decnet/dn_table.c b/net/decnet/dn_table.c
+index f0710b5d037d..2fb764321b97 100644
+--- a/net/decnet/dn_table.c
++++ b/net/decnet/dn_table.c
+@@ -348,7 +348,7 @@ static int dn_fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
+ 		struct rtnexthop *nhp;
+ 		struct nlattr *mp_head;
+ 
+-		if (!(mp_head = nla_nest_start(skb, RTA_MULTIPATH)))
++		if (!(mp_head = nla_nest_start_noflag(skb, RTA_MULTIPATH)))
+ 			goto errout;
+ 
+ 		for_nexthops(fi) {
+diff --git a/net/ieee802154/nl802154.c b/net/ieee802154/nl802154.c
+index 99f6c254ea77..fb1b52130610 100644
+--- a/net/ieee802154/nl802154.c
++++ b/net/ieee802154/nl802154.c
+@@ -312,7 +312,7 @@ static inline void *nl802154hdr_put(struct sk_buff *skb, u32 portid, u32 seq,
+ static int
+ nl802154_put_flags(struct sk_buff *msg, int attr, u32 mask)
+ {
+-	struct nlattr *nl_flags = nla_nest_start(msg, attr);
++	struct nlattr *nl_flags = nla_nest_start_noflag(msg, attr);
+ 	int i;
+ 
+ 	if (!nl_flags)
+@@ -338,7 +338,7 @@ nl802154_send_wpan_phy_channels(struct cfg802154_registered_device *rdev,
+ 	struct nlattr *nl_page;
+ 	unsigned long page;
+ 
+-	nl_page = nla_nest_start(msg, NL802154_ATTR_CHANNELS_SUPPORTED);
++	nl_page = nla_nest_start_noflag(msg, NL802154_ATTR_CHANNELS_SUPPORTED);
+ 	if (!nl_page)
+ 		return -ENOBUFS;
+ 
+@@ -360,11 +360,11 @@ nl802154_put_capabilities(struct sk_buff *msg,
+ 	struct nlattr *nl_caps, *nl_channels;
+ 	int i;
+ 
+-	nl_caps = nla_nest_start(msg, NL802154_ATTR_WPAN_PHY_CAPS);
++	nl_caps = nla_nest_start_noflag(msg, NL802154_ATTR_WPAN_PHY_CAPS);
+ 	if (!nl_caps)
+ 		return -ENOBUFS;
+ 
+-	nl_channels = nla_nest_start(msg, NL802154_CAP_ATTR_CHANNELS);
++	nl_channels = nla_nest_start_noflag(msg, NL802154_CAP_ATTR_CHANNELS);
+ 	if (!nl_channels)
+ 		return -ENOBUFS;
+ 
+@@ -380,8 +380,8 @@ nl802154_put_capabilities(struct sk_buff *msg,
+ 	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_CCA_ED_LEVEL) {
+ 		struct nlattr *nl_ed_lvls;
+ 
+-		nl_ed_lvls = nla_nest_start(msg,
+-					    NL802154_CAP_ATTR_CCA_ED_LEVELS);
++		nl_ed_lvls = nla_nest_start_noflag(msg,
++						   NL802154_CAP_ATTR_CCA_ED_LEVELS);
+ 		if (!nl_ed_lvls)
+ 			return -ENOBUFS;
+ 
+@@ -396,7 +396,8 @@ nl802154_put_capabilities(struct sk_buff *msg,
+ 	if (rdev->wpan_phy.flags & WPAN_PHY_FLAG_TXPOWER) {
+ 		struct nlattr *nl_tx_pwrs;
+ 
+-		nl_tx_pwrs = nla_nest_start(msg, NL802154_CAP_ATTR_TX_POWERS);
++		nl_tx_pwrs = nla_nest_start_noflag(msg,
++						   NL802154_CAP_ATTR_TX_POWERS);
+ 		if (!nl_tx_pwrs)
+ 			return -ENOBUFS;
+ 
+@@ -504,7 +505,7 @@ static int nl802154_send_wpan_phy(struct cfg802154_registered_device *rdev,
+ 	if (nl802154_put_capabilities(msg, rdev))
+ 		goto nla_put_failure;
+ 
+-	nl_cmds = nla_nest_start(msg, NL802154_ATTR_SUPPORTED_COMMANDS);
++	nl_cmds = nla_nest_start_noflag(msg, NL802154_ATTR_SUPPORTED_COMMANDS);
+ 	if (!nl_cmds)
+ 		goto nla_put_failure;
+ 
+@@ -693,7 +694,8 @@ ieee802154_llsec_send_key_id(struct sk_buff *msg,
+ 
+ 	switch (desc->mode) {
+ 	case NL802154_KEY_ID_MODE_IMPLICIT:
+-		nl_dev_addr = nla_nest_start(msg, NL802154_KEY_ID_ATTR_IMPLICIT);
++		nl_dev_addr = nla_nest_start_noflag(msg,
++						    NL802154_KEY_ID_ATTR_IMPLICIT);
+ 		if (!nl_dev_addr)
+ 			return -ENOBUFS;
+ 
+@@ -768,7 +770,7 @@ static int nl802154_get_llsec_params(struct sk_buff *msg,
+ 			 params.frame_counter))
+ 		return -ENOBUFS;
+ 
+-	nl_key_id = nla_nest_start(msg, NL802154_ATTR_SEC_OUT_KEY_ID);
++	nl_key_id = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_OUT_KEY_ID);
+ 	if (!nl_key_id)
+ 		return -ENOBUFS;
+ 
+@@ -1455,11 +1457,11 @@ static int nl802154_send_key(struct sk_buff *msg, u32 cmd, u32 portid,
+ 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
+ 		goto nla_put_failure;
+ 
+-	nl_key = nla_nest_start(msg, NL802154_ATTR_SEC_KEY);
++	nl_key = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_KEY);
+ 	if (!nl_key)
+ 		goto nla_put_failure;
+ 
+-	nl_key_id = nla_nest_start(msg, NL802154_KEY_ATTR_ID);
++	nl_key_id = nla_nest_start_noflag(msg, NL802154_KEY_ATTR_ID);
+ 	if (!nl_key_id)
+ 		goto nla_put_failure;
+ 
+@@ -1639,7 +1641,7 @@ static int nl802154_send_device(struct sk_buff *msg, u32 cmd, u32 portid,
+ 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
+ 		goto nla_put_failure;
+ 
+-	nl_device = nla_nest_start(msg, NL802154_ATTR_SEC_DEVICE);
++	nl_device = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_DEVICE);
+ 	if (!nl_device)
+ 		goto nla_put_failure;
+ 
+@@ -1808,7 +1810,7 @@ static int nl802154_send_devkey(struct sk_buff *msg, u32 cmd, u32 portid,
+ 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
+ 		goto nla_put_failure;
+ 
+-	nl_devkey = nla_nest_start(msg, NL802154_ATTR_SEC_DEVKEY);
++	nl_devkey = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_DEVKEY);
+ 	if (!nl_devkey)
+ 		goto nla_put_failure;
+ 
+@@ -1818,7 +1820,7 @@ static int nl802154_send_devkey(struct sk_buff *msg, u32 cmd, u32 portid,
+ 			devkey->frame_counter))
+ 		goto nla_put_failure;
+ 
+-	nl_key_id = nla_nest_start(msg, NL802154_DEVKEY_ATTR_ID);
++	nl_key_id = nla_nest_start_noflag(msg, NL802154_DEVKEY_ATTR_ID);
+ 	if (!nl_key_id)
+ 		goto nla_put_failure;
+ 
+@@ -1976,7 +1978,7 @@ static int nl802154_send_seclevel(struct sk_buff *msg, u32 cmd, u32 portid,
+ 	if (nla_put_u32(msg, NL802154_ATTR_IFINDEX, dev->ifindex))
+ 		goto nla_put_failure;
+ 
+-	nl_seclevel = nla_nest_start(msg, NL802154_ATTR_SEC_LEVEL);
++	nl_seclevel = nla_nest_start_noflag(msg, NL802154_ATTR_SEC_LEVEL);
+ 	if (!nl_seclevel)
+ 		goto nla_put_failure;
+ 
+* Unmerged path net/ipv4/fib_semantics.c
+diff --git a/net/ipv4/ipmr.c b/net/ipv4/ipmr.c
+index 379c86dc93ce..87d00b0b4b46 100644
+--- a/net/ipv4/ipmr.c
++++ b/net/ipv4/ipmr.c
+@@ -2762,7 +2762,7 @@ static bool ipmr_fill_vif(struct mr_table *mrt, u32 vifid, struct sk_buff *skb)
+ 		return true;
+ 
+ 	vif = &mrt->vif_table[vifid];
+-	vif_nest = nla_nest_start(skb, IPMRA_VIF);
++	vif_nest = nla_nest_start_noflag(skb, IPMRA_VIF);
+ 	if (!vif_nest)
+ 		return false;
+ 	if (nla_put_u32(skb, IPMRA_VIFA_IFINDEX, vif->dev->ifindex) ||
+@@ -2846,7 +2846,7 @@ static int ipmr_rtm_dumplink(struct sk_buff *skb, struct netlink_callback *cb)
+ 		memset(hdr, 0, sizeof(*hdr));
+ 		hdr->ifi_family = RTNL_FAMILY_IPMR;
+ 
+-		af = nla_nest_start(skb, IFLA_AF_SPEC);
++		af = nla_nest_start_noflag(skb, IFLA_AF_SPEC);
+ 		if (!af) {
+ 			nlmsg_cancel(skb, nlh);
+ 			goto out;
+@@ -2857,7 +2857,7 @@ static int ipmr_rtm_dumplink(struct sk_buff *skb, struct netlink_callback *cb)
+ 			goto out;
+ 		}
+ 
+-		vifs = nla_nest_start(skb, IPMRA_TABLE_VIFS);
++		vifs = nla_nest_start_noflag(skb, IPMRA_TABLE_VIFS);
+ 		if (!vifs) {
+ 			nla_nest_end(skb, af);
+ 			nlmsg_end(skb, nlh);
+diff --git a/net/ipv4/ipmr_base.c b/net/ipv4/ipmr_base.c
+index 950b0dfaf86f..80541012aa2a 100644
+--- a/net/ipv4/ipmr_base.c
++++ b/net/ipv4/ipmr_base.c
+@@ -228,7 +228,7 @@ int mr_fill_mroute(struct mr_table *mrt, struct sk_buff *skb,
+ 	if (c->mfc_flags & MFC_OFFLOAD)
+ 		rtm->rtm_flags |= RTNH_F_OFFLOAD;
+ 
+-	mp_attr = nla_nest_start(skb, RTA_MULTIPATH);
++	mp_attr = nla_nest_start_noflag(skb, RTA_MULTIPATH);
+ 	if (!mp_attr)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/ipv4/tcp_metrics.c b/net/ipv4/tcp_metrics.c
+index 03b51cdcc731..92cc0b306d2c 100644
+--- a/net/ipv4/tcp_metrics.c
++++ b/net/ipv4/tcp_metrics.c
+@@ -658,7 +658,7 @@ static int tcp_metrics_fill_info(struct sk_buff *msg,
+ 	{
+ 		int n = 0;
+ 
+-		nest = nla_nest_start(msg, TCP_METRICS_ATTR_VALS);
++		nest = nla_nest_start_noflag(msg, TCP_METRICS_ATTR_VALS);
+ 		if (!nest)
+ 			goto nla_put_failure;
+ 		for (i = 0; i < TCP_METRIC_MAX_KERNEL + 1; i++) {
+diff --git a/net/ipv6/addrconf.c b/net/ipv6/addrconf.c
+index 55d37d6eddc0..eb60dbf0736d 100644
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@ -5750,7 +5750,7 @@ static int inet6_fill_ifinfo(struct sk_buff *skb, struct inet6_dev *idev,
+ 	    nla_put_u8(skb, IFLA_OPERSTATE,
+ 		       netif_running(dev) ? dev->operstate : IF_OPER_DOWN))
+ 		goto nla_put_failure;
+-	protoinfo = nla_nest_start(skb, IFLA_PROTINFO);
++	protoinfo = nla_nest_start_noflag(skb, IFLA_PROTINFO);
+ 	if (!protoinfo)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/ipv6/route.c b/net/ipv6/route.c
+index ce16fcfc9697..24510bf8ce6b 100644
+--- a/net/ipv6/route.c
++++ b/net/ipv6/route.c
+@@ -4811,7 +4811,7 @@ static int rt6_fill_node(struct net *net, struct sk_buff *skb,
+ 		struct fib6_info *sibling, *next_sibling;
+ 		struct nlattr *mp;
+ 
+-		mp = nla_nest_start(skb, RTA_MULTIPATH);
++		mp = nla_nest_start_noflag(skb, RTA_MULTIPATH);
+ 		if (!mp)
+ 			goto nla_put_failure;
+ 
+diff --git a/net/ipv6/seg6_local.c b/net/ipv6/seg6_local.c
+index 9ff512baf0a6..0b92a8ae6f03 100644
+--- a/net/ipv6/seg6_local.c
++++ b/net/ipv6/seg6_local.c
+@@ -855,7 +855,7 @@ static int put_nla_bpf(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+ 	if (!slwt->bpf.prog)
+ 		return 0;
+ 
+-	nest = nla_nest_start(skb, SEG6_LOCAL_BPF);
++	nest = nla_nest_start_noflag(skb, SEG6_LOCAL_BPF);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/l2tp/l2tp_netlink.c b/net/l2tp/l2tp_netlink.c
+index 5b9900889e31..f612bcb9026a 100644
+--- a/net/l2tp/l2tp_netlink.c
++++ b/net/l2tp/l2tp_netlink.c
+@@ -345,7 +345,7 @@ static int l2tp_nl_tunnel_send(struct sk_buff *skb, u32 portid, u32 seq, int fla
+ 	    nla_put_u16(skb, L2TP_ATTR_ENCAP_TYPE, tunnel->encap))
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, L2TP_ATTR_STATS);
++	nest = nla_nest_start_noflag(skb, L2TP_ATTR_STATS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -771,7 +771,7 @@ static int l2tp_nl_session_send(struct sk_buff *skb, u32 portid, u32 seq, int fl
+ 			   session->reorder_timeout, L2TP_ATTR_PAD)))
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, L2TP_ATTR_STATS);
++	nest = nla_nest_start_noflag(skb, L2TP_ATTR_STATS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/mpls/af_mpls.c b/net/mpls/af_mpls.c
+index daca8ffff9f0..81d449eda2d0 100644
+--- a/net/mpls/af_mpls.c
++++ b/net/mpls/af_mpls.c
+@@ -2013,7 +2013,7 @@ static int mpls_dump_route(struct sk_buff *skb, u32 portid, u32 seq, int event,
+ 		u8 linkdown = 0;
+ 		u8 dead = 0;
+ 
+-		mp = nla_nest_start(skb, RTA_MULTIPATH);
++		mp = nla_nest_start_noflag(skb, RTA_MULTIPATH);
+ 		if (!mp)
+ 			goto nla_put_failure;
+ 
+diff --git a/net/ncsi/ncsi-netlink.c b/net/ncsi/ncsi-netlink.c
+index 13765ffc2ef2..5e4134d47130 100644
+--- a/net/ncsi/ncsi-netlink.c
++++ b/net/ncsi/ncsi-netlink.c
+@@ -75,7 +75,7 @@ static int ncsi_write_channel_info(struct sk_buff *skb,
+ 	nla_put_u32(skb, NCSI_CHANNEL_ATTR_VERSION_MINOR, nc->version.alpha2);
+ 	nla_put_string(skb, NCSI_CHANNEL_ATTR_VERSION_STR, nc->version.fw_name);
+ 
+-	vid_nest = nla_nest_start(skb, NCSI_CHANNEL_ATTR_VLAN_LIST);
++	vid_nest = nla_nest_start_noflag(skb, NCSI_CHANNEL_ATTR_VLAN_LIST);
+ 	if (!vid_nest)
+ 		return -ENOMEM;
+ 	ncf = &nc->vlan_filter;
+@@ -109,19 +109,19 @@ static int ncsi_write_package_info(struct sk_buff *skb,
+ 	NCSI_FOR_EACH_PACKAGE(ndp, np) {
+ 		if (np->id != id)
+ 			continue;
+-		pnest = nla_nest_start(skb, NCSI_PKG_ATTR);
++		pnest = nla_nest_start_noflag(skb, NCSI_PKG_ATTR);
+ 		if (!pnest)
+ 			return -ENOMEM;
+ 		nla_put_u32(skb, NCSI_PKG_ATTR_ID, np->id);
+ 		if (ndp->force_package == np)
+ 			nla_put_flag(skb, NCSI_PKG_ATTR_FORCED);
+-		cnest = nla_nest_start(skb, NCSI_PKG_ATTR_CHANNEL_LIST);
++		cnest = nla_nest_start_noflag(skb, NCSI_PKG_ATTR_CHANNEL_LIST);
+ 		if (!cnest) {
+ 			nla_nest_cancel(skb, pnest);
+ 			return -ENOMEM;
+ 		}
+ 		NCSI_FOR_EACH_CHANNEL(np, nc) {
+-			nest = nla_nest_start(skb, NCSI_CHANNEL_ATTR);
++			nest = nla_nest_start_noflag(skb, NCSI_CHANNEL_ATTR);
+ 			if (!nest) {
+ 				nla_nest_cancel(skb, cnest);
+ 				nla_nest_cancel(skb, pnest);
+@@ -183,7 +183,7 @@ static int ncsi_pkg_info_nl(struct sk_buff *msg, struct genl_info *info)
+ 
+ 	package_id = nla_get_u32(info->attrs[NCSI_ATTR_PACKAGE_ID]);
+ 
+-	attr = nla_nest_start(skb, NCSI_ATTR_PACKAGE_LIST);
++	attr = nla_nest_start_noflag(skb, NCSI_ATTR_PACKAGE_LIST);
+ 	if (!attr) {
+ 		kfree_skb(skb);
+ 		return -EMSGSIZE;
+@@ -246,7 +246,7 @@ static int ncsi_pkg_info_all_nl(struct sk_buff *skb,
+ 		goto err;
+ 	}
+ 
+-	attr = nla_nest_start(skb, NCSI_ATTR_PACKAGE_LIST);
++	attr = nla_nest_start_noflag(skb, NCSI_ATTR_PACKAGE_LIST);
+ 	if (!attr) {
+ 		rc = -EMSGSIZE;
+ 		goto err;
+diff --git a/net/netfilter/ipvs/ip_vs_ctl.c b/net/netfilter/ipvs/ip_vs_ctl.c
+index cba808405e0a..8a4cf1ff3182 100644
+--- a/net/netfilter/ipvs/ip_vs_ctl.c
++++ b/net/netfilter/ipvs/ip_vs_ctl.c
+@@ -2884,7 +2884,7 @@ static const struct nla_policy ip_vs_dest_policy[IPVS_DEST_ATTR_MAX + 1] = {
+ static int ip_vs_genl_fill_stats(struct sk_buff *skb, int container_type,
+ 				 struct ip_vs_kstats *kstats)
+ {
+-	struct nlattr *nl_stats = nla_nest_start(skb, container_type);
++	struct nlattr *nl_stats = nla_nest_start_noflag(skb, container_type);
+ 
+ 	if (!nl_stats)
+ 		return -EMSGSIZE;
+@@ -2914,7 +2914,7 @@ static int ip_vs_genl_fill_stats(struct sk_buff *skb, int container_type,
+ static int ip_vs_genl_fill_stats64(struct sk_buff *skb, int container_type,
+ 				   struct ip_vs_kstats *kstats)
+ {
+-	struct nlattr *nl_stats = nla_nest_start(skb, container_type);
++	struct nlattr *nl_stats = nla_nest_start_noflag(skb, container_type);
+ 
+ 	if (!nl_stats)
+ 		return -EMSGSIZE;
+@@ -2960,7 +2960,7 @@ static int ip_vs_genl_fill_service(struct sk_buff *skb,
+ 	struct ip_vs_kstats kstats;
+ 	char *sched_name;
+ 
+-	nl_service = nla_nest_start(skb, IPVS_CMD_ATTR_SERVICE);
++	nl_service = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_SERVICE);
+ 	if (!nl_service)
+ 		return -EMSGSIZE;
+ 
+@@ -3171,7 +3171,7 @@ static int ip_vs_genl_fill_dest(struct sk_buff *skb, struct ip_vs_dest *dest)
+ 	struct nlattr *nl_dest;
+ 	struct ip_vs_kstats kstats;
+ 
+-	nl_dest = nla_nest_start(skb, IPVS_CMD_ATTR_DEST);
++	nl_dest = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_DEST);
+ 	if (!nl_dest)
+ 		return -EMSGSIZE;
+ 
+@@ -3329,7 +3329,7 @@ static int ip_vs_genl_fill_daemon(struct sk_buff *skb, __u32 state,
+ {
+ 	struct nlattr *nl_daemon;
+ 
+-	nl_daemon = nla_nest_start(skb, IPVS_CMD_ATTR_DAEMON);
++	nl_daemon = nla_nest_start_noflag(skb, IPVS_CMD_ATTR_DAEMON);
+ 	if (!nl_daemon)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/netfilter/nf_conntrack_netlink.c b/net/netfilter/nf_conntrack_netlink.c
+index b33075a42117..e3c700ed509b 100644
+--- a/net/netfilter/nf_conntrack_netlink.c
++++ b/net/netfilter/nf_conntrack_netlink.c
+@@ -65,7 +65,7 @@ static int ctnetlink_dump_tuples_proto(struct sk_buff *skb,
+ 	int ret = 0;
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_PROTO | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_PROTO);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (nla_put_u8(skb, CTA_PROTO_NUM, tuple->dst.protonum))
+@@ -89,7 +89,7 @@ static int ctnetlink_dump_tuples_ip(struct sk_buff *skb,
+ 	int ret = 0;
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_IP | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_IP);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+@@ -169,7 +169,7 @@ static int ctnetlink_dump_protoinfo(struct sk_buff *skb, struct nf_conn *ct)
+ 	if (!l4proto->to_nlattr)
+ 		return 0;
+ 
+-	nest_proto = nla_nest_start(skb, CTA_PROTOINFO | NLA_F_NESTED);
++	nest_proto = nla_nest_start(skb, CTA_PROTOINFO);
+ 	if (!nest_proto)
+ 		goto nla_put_failure;
+ 
+@@ -197,7 +197,7 @@ static int ctnetlink_dump_helpinfo(struct sk_buff *skb,
+ 	if (!helper)
+ 		goto out;
+ 
+-	nest_helper = nla_nest_start(skb, CTA_HELP | NLA_F_NESTED);
++	nest_helper = nla_nest_start(skb, CTA_HELP);
+ 	if (!nest_helper)
+ 		goto nla_put_failure;
+ 	if (nla_put_string(skb, CTA_HELP_NAME, helper->name))
+@@ -231,7 +231,7 @@ dump_counters(struct sk_buff *skb, struct nf_conn_acct *acct,
+ 		bytes = atomic64_read(&counter[dir].bytes);
+ 	}
+ 
+-	nest_count = nla_nest_start(skb, attr | NLA_F_NESTED);
++	nest_count = nla_nest_start(skb, attr);
+ 	if (!nest_count)
+ 		goto nla_put_failure;
+ 
+@@ -275,7 +275,7 @@ ctnetlink_dump_timestamp(struct sk_buff *skb, const struct nf_conn *ct)
+ 	if (!tstamp)
+ 		return 0;
+ 
+-	nest_count = nla_nest_start(skb, CTA_TIMESTAMP | NLA_F_NESTED);
++	nest_count = nla_nest_start(skb, CTA_TIMESTAMP);
+ 	if (!nest_count)
+ 		goto nla_put_failure;
+ 
+@@ -319,7 +319,7 @@ static int ctnetlink_dump_secctx(struct sk_buff *skb, const struct nf_conn *ct)
+ 		return 0;
+ 
+ 	ret = -1;
+-	nest_secctx = nla_nest_start(skb, CTA_SECCTX | NLA_F_NESTED);
++	nest_secctx = nla_nest_start(skb, CTA_SECCTX);
+ 	if (!nest_secctx)
+ 		goto nla_put_failure;
+ 
+@@ -379,7 +379,7 @@ static int ctnetlink_dump_master(struct sk_buff *skb, const struct nf_conn *ct)
+ 	if (!(ct->status & IPS_EXPECTED))
+ 		return 0;
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_MASTER | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_MASTER);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, master_tuple(ct)) < 0)
+@@ -397,7 +397,7 @@ dump_ct_seq_adj(struct sk_buff *skb, const struct nf_ct_seqadj *seq, int type)
+ {
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, type | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, type);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+@@ -449,7 +449,7 @@ static int ctnetlink_dump_ct_synproxy(struct sk_buff *skb, struct nf_conn *ct)
+ 	if (!synproxy)
+ 		return 0;
+ 
+-	nest_parms = nla_nest_start(skb, CTA_SYNPROXY | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_SYNPROXY);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+@@ -510,7 +510,7 @@ ctnetlink_fill_info(struct sk_buff *skb, u32 portid, u32 seq, u32 type,
+ 
+ 	zone = nf_ct_zone(ct);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_ORIGINAL)) < 0)
+@@ -520,7 +520,7 @@ ctnetlink_fill_info(struct sk_buff *skb, u32 portid, u32 seq, u32 type,
+ 		goto nla_put_failure;
+ 	nla_nest_end(skb, nest_parms);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+@@ -697,7 +697,7 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
+ 
+ 	zone = nf_ct_zone(ct);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_ORIGINAL)) < 0)
+@@ -707,7 +707,7 @@ ctnetlink_conntrack_event(unsigned int events, struct nf_ct_event *item)
+ 		goto nla_put_failure;
+ 	nla_nest_end(skb, nest_parms);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+@@ -2325,7 +2325,7 @@ static int __ctnetlink_glue_build(struct sk_buff *skb, struct nf_conn *ct)
+ 
+ 	zone = nf_ct_zone(ct);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_ORIG);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_ORIGINAL)) < 0)
+@@ -2335,7 +2335,7 @@ static int __ctnetlink_glue_build(struct sk_buff *skb, struct nf_conn *ct)
+ 		goto nla_put_failure;
+ 	nla_nest_end(skb, nest_parms);
+ 
+-	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_TUPLE_REPLY);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, nf_ct_tuple(ct, IP_CT_DIR_REPLY)) < 0)
+@@ -2397,7 +2397,7 @@ ctnetlink_glue_build(struct sk_buff *skb, struct nf_conn *ct,
+ {
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, ct_attr | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, ct_attr);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+@@ -2576,7 +2576,7 @@ static int ctnetlink_exp_dump_tuple(struct sk_buff *skb,
+ {
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, type | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, type);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (ctnetlink_dump_tuples(skb, tuple) < 0)
+@@ -2604,7 +2604,7 @@ static int ctnetlink_exp_dump_mask(struct sk_buff *skb,
+ 	m.src.u.all = mask->src.u.all;
+ 	m.dst.protonum = tuple->dst.protonum;
+ 
+-	nest_parms = nla_nest_start(skb, CTA_EXPECT_MASK | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_EXPECT_MASK);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+@@ -2678,7 +2678,7 @@ ctnetlink_exp_dump_expect(struct sk_buff *skb,
+ #ifdef CONFIG_NF_NAT_NEEDED
+ 	if (!nf_inet_addr_cmp(&exp->saved_addr, &any_addr) ||
+ 	    exp->saved_proto.all) {
+-		nest_parms = nla_nest_start(skb, CTA_EXPECT_NAT | NLA_F_NESTED);
++		nest_parms = nla_nest_start(skb, CTA_EXPECT_NAT);
+ 		if (!nest_parms)
+ 			goto nla_put_failure;
+ 
+diff --git a/net/netfilter/nf_conntrack_proto_dccp.c b/net/netfilter/nf_conntrack_proto_dccp.c
+index 9ce6336d1e55..fe30ae500868 100644
+--- a/net/netfilter/nf_conntrack_proto_dccp.c
++++ b/net/netfilter/nf_conntrack_proto_dccp.c
+@@ -628,7 +628,7 @@ static int dccp_to_nlattr(struct sk_buff *skb, struct nlattr *nla,
+ 	struct nlattr *nest_parms;
+ 
+ 	spin_lock_bh(&ct->lock);
+-	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_DCCP | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_DCCP);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 	if (nla_put_u8(skb, CTA_PROTOINFO_DCCP_STATE, ct->proto.dccp.state) ||
+diff --git a/net/netfilter/nf_conntrack_proto_sctp.c b/net/netfilter/nf_conntrack_proto_sctp.c
+index fb9a35d16069..71e703d018e0 100644
+--- a/net/netfilter/nf_conntrack_proto_sctp.c
++++ b/net/netfilter/nf_conntrack_proto_sctp.c
+@@ -550,7 +550,7 @@ static int sctp_to_nlattr(struct sk_buff *skb, struct nlattr *nla,
+ 	struct nlattr *nest_parms;
+ 
+ 	spin_lock_bh(&ct->lock);
+-	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_SCTP | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_SCTP);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/netfilter/nf_conntrack_proto_tcp.c b/net/netfilter/nf_conntrack_proto_tcp.c
+index 970b7ad8174e..5fbb357b41f8 100644
+--- a/net/netfilter/nf_conntrack_proto_tcp.c
++++ b/net/netfilter/nf_conntrack_proto_tcp.c
+@@ -1199,7 +1199,7 @@ static int tcp_to_nlattr(struct sk_buff *skb, struct nlattr *nla,
+ 	struct nf_ct_tcp_flags tmp = {};
+ 
+ 	spin_lock_bh(&ct->lock);
+-	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_TCP | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, CTA_PROTOINFO_TCP);
+ 	if (!nest_parms)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/netfilter/nf_tables_api.c b/net/netfilter/nf_tables_api.c
+index 244f61593914..f67fcf852b5a 100644
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@ -1129,7 +1129,7 @@ static int nft_dump_stats(struct sk_buff *skb, struct nft_stats __percpu *stats)
+ 		total.pkts += pkts;
+ 		total.bytes += bytes;
+ 	}
+-	nest = nla_nest_start(skb, NFTA_CHAIN_COUNTERS);
++	nest = nla_nest_start_noflag(skb, NFTA_CHAIN_COUNTERS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -1177,7 +1177,7 @@ static int nf_tables_fill_chain_info(struct sk_buff *skb, struct net *net,
+ 		const struct nf_hook_ops *ops = &basechain->ops;
+ 		struct nlattr *nest;
+ 
+-		nest = nla_nest_start(skb, NFTA_CHAIN_HOOK);
++		nest = nla_nest_start_noflag(skb, NFTA_CHAIN_HOOK);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 		if (nla_put_be32(skb, NFTA_HOOK_HOOKNUM, htonl(ops->hooknum)))
+@@ -1984,7 +1984,8 @@ static int nf_tables_fill_expr_info(struct sk_buff *skb,
+ 		goto nla_put_failure;
+ 
+ 	if (expr->ops->dump) {
+-		struct nlattr *data = nla_nest_start(skb, NFTA_EXPR_DATA);
++		struct nlattr *data = nla_nest_start_noflag(skb,
++							    NFTA_EXPR_DATA);
+ 		if (data == NULL)
+ 			goto nla_put_failure;
+ 		if (expr->ops->dump(skb, expr) < 0)
+@@ -2003,7 +2004,7 @@ int nft_expr_dump(struct sk_buff *skb, unsigned int attr,
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, attr);
++	nest = nla_nest_start_noflag(skb, attr);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 	if (nf_tables_fill_expr_info(skb, expr) < 0)
+@@ -2206,7 +2207,7 @@ static int nf_tables_fill_rule_info(struct sk_buff *skb, struct net *net,
+ 			goto nla_put_failure;
+ 	}
+ 
+-	list = nla_nest_start(skb, NFTA_RULE_EXPRESSIONS);
++	list = nla_nest_start_noflag(skb, NFTA_RULE_EXPRESSIONS);
+ 	if (list == NULL)
+ 		goto nla_put_failure;
+ 	nft_rule_for_each_expr(expr, next, rule) {
+@@ -3169,7 +3170,7 @@ static int nf_tables_fill_set(struct sk_buff *skb, const struct nft_ctx *ctx,
+ 	if (nla_put(skb, NFTA_SET_USERDATA, set->udlen, set->udata))
+ 		goto nla_put_failure;
+ 
+-	desc = nla_nest_start(skb, NFTA_SET_DESC);
++	desc = nla_nest_start_noflag(skb, NFTA_SET_DESC);
+ 	if (desc == NULL)
+ 		goto nla_put_failure;
+ 	if (set->size &&
+@@ -3796,7 +3797,7 @@ static int nf_tables_fill_setelem(struct sk_buff *skb,
+ 	unsigned char *b = skb_tail_pointer(skb);
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, NFTA_LIST_ELEM);
++	nest = nla_nest_start_noflag(skb, NFTA_LIST_ELEM);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -3940,7 +3941,7 @@ static int nf_tables_dump_set(struct sk_buff *skb, struct netlink_callback *cb)
+ 	if (nla_put_string(skb, NFTA_SET_ELEM_LIST_SET, set->name))
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, NFTA_SET_ELEM_LIST_ELEMENTS);
++	nest = nla_nest_start_noflag(skb, NFTA_SET_ELEM_LIST_ELEMENTS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -4012,7 +4013,7 @@ static int nf_tables_fill_setelem_info(struct sk_buff *skb,
+ 	if (nla_put_string(skb, NFTA_SET_NAME, set->name))
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, NFTA_SET_ELEM_LIST_ELEMENTS);
++	nest = nla_nest_start_noflag(skb, NFTA_SET_ELEM_LIST_ELEMENTS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -4904,7 +4905,7 @@ static int nft_object_dump(struct sk_buff *skb, unsigned int attr,
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, attr);
++	nest = nla_nest_start_noflag(skb, attr);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 	if (obj->ops->dump(skb, obj, reset) < 0)
+@@ -5721,14 +5722,14 @@ static int nf_tables_fill_flowtable_info(struct sk_buff *skb, struct net *net,
+ 			 NFTA_FLOWTABLE_PAD))
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, NFTA_FLOWTABLE_HOOK);
++	nest = nla_nest_start_noflag(skb, NFTA_FLOWTABLE_HOOK);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 	if (nla_put_be32(skb, NFTA_FLOWTABLE_HOOK_NUM, htonl(flowtable->hooknum)) ||
+ 	    nla_put_be32(skb, NFTA_FLOWTABLE_HOOK_PRIORITY, htonl(flowtable->priority)))
+ 		goto nla_put_failure;
+ 
+-	nest_devs = nla_nest_start(skb, NFTA_FLOWTABLE_HOOK_DEVS);
++	nest_devs = nla_nest_start_noflag(skb, NFTA_FLOWTABLE_HOOK_DEVS);
+ 	if (!nest_devs)
+ 		goto nla_put_failure;
+ 
+@@ -7085,7 +7086,7 @@ int nft_verdict_dump(struct sk_buff *skb, int type, const struct nft_verdict *v)
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, type);
++	nest = nla_nest_start_noflag(skb, type);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+@@ -7198,7 +7199,7 @@ int nft_data_dump(struct sk_buff *skb, int attr, const struct nft_data *data,
+ 	struct nlattr *nest;
+ 	int err;
+ 
+-	nest = nla_nest_start(skb, attr);
++	nest = nla_nest_start_noflag(skb, attr);
+ 	if (nest == NULL)
+ 		return -1;
+ 
+diff --git a/net/netfilter/nfnetlink_cthelper.c b/net/netfilter/nfnetlink_cthelper.c
+index e5d27b2e4eba..74c9794d28d6 100644
+--- a/net/netfilter/nfnetlink_cthelper.c
++++ b/net/netfilter/nfnetlink_cthelper.c
+@@ -462,7 +462,7 @@ nfnl_cthelper_dump_tuple(struct sk_buff *skb,
+ {
+ 	struct nlattr *nest_parms;
+ 
+-	nest_parms = nla_nest_start(skb, NFCTH_TUPLE | NLA_F_NESTED);
++	nest_parms = nla_nest_start(skb, NFCTH_TUPLE);
+ 	if (nest_parms == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -487,7 +487,7 @@ nfnl_cthelper_dump_policy(struct sk_buff *skb,
+ 	int i;
+ 	struct nlattr *nest_parms1, *nest_parms2;
+ 
+-	nest_parms1 = nla_nest_start(skb, NFCTH_POLICY | NLA_F_NESTED);
++	nest_parms1 = nla_nest_start(skb, NFCTH_POLICY);
+ 	if (nest_parms1 == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -496,8 +496,7 @@ nfnl_cthelper_dump_policy(struct sk_buff *skb,
+ 		goto nla_put_failure;
+ 
+ 	for (i = 0; i < helper->expect_class_max + 1; i++) {
+-		nest_parms2 = nla_nest_start(skb,
+-				(NFCTH_POLICY_SET+i) | NLA_F_NESTED);
++		nest_parms2 = nla_nest_start(skb, (NFCTH_POLICY_SET + i));
+ 		if (nest_parms2 == NULL)
+ 			goto nla_put_failure;
+ 
+* Unmerged path net/netfilter/nfnetlink_cttimeout.c
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index 974fa430836d..f7d916af32f6 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -351,7 +351,7 @@ static int nfqnl_put_bridge(struct nf_queue_entry *entry, struct sk_buff *skb)
+ 	if (skb_vlan_tag_present(entskb)) {
+ 		struct nlattr *nest;
+ 
+-		nest = nla_nest_start(skb, NFQA_VLAN | NLA_F_NESTED);
++		nest = nla_nest_start(skb, NFQA_VLAN);
+ 		if (!nest)
+ 			goto nla_put_failure;
+ 
+* Unmerged path net/netfilter/nft_ct.c
+* Unmerged path net/netfilter/nft_tunnel.c
+diff --git a/net/netlabel/netlabel_cipso_v4.c b/net/netlabel/netlabel_cipso_v4.c
+index 9aacf2da3d98..4e59771572e1 100644
+--- a/net/netlabel/netlabel_cipso_v4.c
++++ b/net/netlabel/netlabel_cipso_v4.c
+@@ -498,7 +498,7 @@ static int netlbl_cipsov4_list(struct sk_buff *skb, struct genl_info *info)
+ 	if (ret_val != 0)
+ 		goto list_failure_lock;
+ 
+-	nla_a = nla_nest_start(ans_skb, NLBL_CIPSOV4_A_TAGLST);
++	nla_a = nla_nest_start_noflag(ans_skb, NLBL_CIPSOV4_A_TAGLST);
+ 	if (nla_a == NULL) {
+ 		ret_val = -ENOMEM;
+ 		goto list_failure_lock;
+@@ -517,7 +517,8 @@ static int netlbl_cipsov4_list(struct sk_buff *skb, struct genl_info *info)
+ 
+ 	switch (doi_def->type) {
+ 	case CIPSO_V4_MAP_TRANS:
+-		nla_a = nla_nest_start(ans_skb, NLBL_CIPSOV4_A_MLSLVLLST);
++		nla_a = nla_nest_start_noflag(ans_skb,
++					      NLBL_CIPSOV4_A_MLSLVLLST);
+ 		if (nla_a == NULL) {
+ 			ret_val = -ENOMEM;
+ 			goto list_failure_lock;
+@@ -529,7 +530,8 @@ static int netlbl_cipsov4_list(struct sk_buff *skb, struct genl_info *info)
+ 			    CIPSO_V4_INV_LVL)
+ 				continue;
+ 
+-			nla_b = nla_nest_start(ans_skb, NLBL_CIPSOV4_A_MLSLVL);
++			nla_b = nla_nest_start_noflag(ans_skb,
++						      NLBL_CIPSOV4_A_MLSLVL);
+ 			if (nla_b == NULL) {
+ 				ret_val = -ENOMEM;
+ 				goto list_retry;
+@@ -548,7 +550,8 @@ static int netlbl_cipsov4_list(struct sk_buff *skb, struct genl_info *info)
+ 		}
+ 		nla_nest_end(ans_skb, nla_a);
+ 
+-		nla_a = nla_nest_start(ans_skb, NLBL_CIPSOV4_A_MLSCATLST);
++		nla_a = nla_nest_start_noflag(ans_skb,
++					      NLBL_CIPSOV4_A_MLSCATLST);
+ 		if (nla_a == NULL) {
+ 			ret_val = -ENOMEM;
+ 			goto list_retry;
+@@ -560,7 +563,8 @@ static int netlbl_cipsov4_list(struct sk_buff *skb, struct genl_info *info)
+ 			    CIPSO_V4_INV_CAT)
+ 				continue;
+ 
+-			nla_b = nla_nest_start(ans_skb, NLBL_CIPSOV4_A_MLSCAT);
++			nla_b = nla_nest_start_noflag(ans_skb,
++						      NLBL_CIPSOV4_A_MLSCAT);
+ 			if (nla_b == NULL) {
+ 				ret_val = -ENOMEM;
+ 				goto list_retry;
+diff --git a/net/netlabel/netlabel_mgmt.c b/net/netlabel/netlabel_mgmt.c
+index 21e0095b1d14..5b40790114c0 100644
+--- a/net/netlabel/netlabel_mgmt.c
++++ b/net/netlabel/netlabel_mgmt.c
+@@ -315,7 +315,7 @@ static int netlbl_mgmt_listentry(struct sk_buff *skb,
+ 
+ 	switch (entry->def.type) {
+ 	case NETLBL_NLTYPE_ADDRSELECT:
+-		nla_a = nla_nest_start(skb, NLBL_MGMT_A_SELECTORLIST);
++		nla_a = nla_nest_start_noflag(skb, NLBL_MGMT_A_SELECTORLIST);
+ 		if (nla_a == NULL)
+ 			return -ENOMEM;
+ 
+@@ -323,7 +323,8 @@ static int netlbl_mgmt_listentry(struct sk_buff *skb,
+ 			struct netlbl_domaddr4_map *map4;
+ 			struct in_addr addr_struct;
+ 
+-			nla_b = nla_nest_start(skb, NLBL_MGMT_A_ADDRSELECTOR);
++			nla_b = nla_nest_start_noflag(skb,
++						      NLBL_MGMT_A_ADDRSELECTOR);
+ 			if (nla_b == NULL)
+ 				return -ENOMEM;
+ 
+@@ -357,7 +358,8 @@ static int netlbl_mgmt_listentry(struct sk_buff *skb,
+ 		netlbl_af6list_foreach_rcu(iter6, &entry->def.addrsel->list6) {
+ 			struct netlbl_domaddr6_map *map6;
+ 
+-			nla_b = nla_nest_start(skb, NLBL_MGMT_A_ADDRSELECTOR);
++			nla_b = nla_nest_start_noflag(skb,
++						      NLBL_MGMT_A_ADDRSELECTOR);
+ 			if (nla_b == NULL)
+ 				return -ENOMEM;
+ 
+diff --git a/net/netlink/genetlink.c b/net/netlink/genetlink.c
+index cb69d35c8e6a..56313f6a75d0 100644
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@ -665,7 +665,7 @@ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+ 		struct nlattr *nla_ops;
+ 		int i;
+ 
+-		nla_ops = nla_nest_start(skb, CTRL_ATTR_OPS);
++		nla_ops = nla_nest_start_noflag(skb, CTRL_ATTR_OPS);
+ 		if (nla_ops == NULL)
+ 			goto nla_put_failure;
+ 
+@@ -681,7 +681,7 @@ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+ 			if (ops->policy)
+ 				op_flags |= GENL_CMD_CAP_HASPOL;
+ 
+-			nest = nla_nest_start(skb, i + 1);
++			nest = nla_nest_start_noflag(skb, i + 1);
+ 			if (nest == NULL)
+ 				goto nla_put_failure;
+ 
+@@ -699,7 +699,7 @@ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+ 		struct nlattr *nla_grps;
+ 		int i;
+ 
+-		nla_grps = nla_nest_start(skb, CTRL_ATTR_MCAST_GROUPS);
++		nla_grps = nla_nest_start_noflag(skb, CTRL_ATTR_MCAST_GROUPS);
+ 		if (nla_grps == NULL)
+ 			goto nla_put_failure;
+ 
+@@ -709,7 +709,7 @@ static int ctrl_fill_info(const struct genl_family *family, u32 portid, u32 seq,
+ 
+ 			grp = &family->mcgrps[i];
+ 
+-			nest = nla_nest_start(skb, i + 1);
++			nest = nla_nest_start_noflag(skb, i + 1);
+ 			if (nest == NULL)
+ 				goto nla_put_failure;
+ 
+@@ -749,11 +749,11 @@ static int ctrl_fill_mcgrp_info(const struct genl_family *family,
+ 	    nla_put_u16(skb, CTRL_ATTR_FAMILY_ID, family->id))
+ 		goto nla_put_failure;
+ 
+-	nla_grps = nla_nest_start(skb, CTRL_ATTR_MCAST_GROUPS);
++	nla_grps = nla_nest_start_noflag(skb, CTRL_ATTR_MCAST_GROUPS);
+ 	if (nla_grps == NULL)
+ 		goto nla_put_failure;
+ 
+-	nest = nla_nest_start(skb, 1);
++	nest = nla_nest_start_noflag(skb, 1);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/nfc/netlink.c b/net/nfc/netlink.c
+index 376181cc1def..090f9dd0ccc1 100644
+--- a/net/nfc/netlink.c
++++ b/net/nfc/netlink.c
+@@ -392,7 +392,7 @@ int nfc_genl_llc_send_sdres(struct nfc_dev *dev, struct hlist_head *sdres_list)
+ 	if (nla_put_u32(msg, NFC_ATTR_DEVICE_INDEX, dev->idx))
+ 		goto nla_put_failure;
+ 
+-	sdp_attr = nla_nest_start(msg, NFC_ATTR_LLC_SDP);
++	sdp_attr = nla_nest_start_noflag(msg, NFC_ATTR_LLC_SDP);
+ 	if (sdp_attr == NULL) {
+ 		rc = -ENOMEM;
+ 		goto nla_put_failure;
+@@ -402,7 +402,7 @@ int nfc_genl_llc_send_sdres(struct nfc_dev *dev, struct hlist_head *sdres_list)
+ 	hlist_for_each_entry_safe(sdres, n, sdres_list, node) {
+ 		pr_debug("uri: %s, sap: %d\n", sdres->uri, sdres->sap);
+ 
+-		uri_attr = nla_nest_start(msg, i++);
++		uri_attr = nla_nest_start_noflag(msg, i++);
+ 		if (uri_attr == NULL) {
+ 			rc = -ENOMEM;
+ 			goto nla_put_failure;
+* Unmerged path net/openvswitch/conntrack.c
+diff --git a/net/openvswitch/datapath.c b/net/openvswitch/datapath.c
+index 40d80caa4367..716fe1362dfa 100644
+--- a/net/openvswitch/datapath.c
++++ b/net/openvswitch/datapath.c
+@@ -464,7 +464,8 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 			  nla_data(upcall_info->userdata));
+ 
+ 	if (upcall_info->egress_tun_info) {
+-		nla = nla_nest_start(user_skb, OVS_PACKET_ATTR_EGRESS_TUN_KEY);
++		nla = nla_nest_start_noflag(user_skb,
++					    OVS_PACKET_ATTR_EGRESS_TUN_KEY);
+ 		if (!nla) {
+ 			err = -EMSGSIZE;
+ 			goto out;
+@@ -478,7 +479,7 @@ static int queue_userspace_packet(struct datapath *dp, struct sk_buff *skb,
+ 	}
+ 
+ 	if (upcall_info->actions_len) {
+-		nla = nla_nest_start(user_skb, OVS_PACKET_ATTR_ACTIONS);
++		nla = nla_nest_start_noflag(user_skb, OVS_PACKET_ATTR_ACTIONS);
+ 		if (!nla) {
+ 			err = -EMSGSIZE;
+ 			goto out;
+@@ -779,7 +780,7 @@ static int ovs_flow_cmd_fill_actions(const struct sw_flow *flow,
+ 	 * This can only fail for dump operations because the skb is always
+ 	 * properly sized for single flows.
+ 	 */
+-	start = nla_nest_start(skb, OVS_FLOW_ATTR_ACTIONS);
++	start = nla_nest_start_noflag(skb, OVS_FLOW_ATTR_ACTIONS);
+ 	if (start) {
+ 		const struct sw_flow_actions *sf_acts;
+ 
+* Unmerged path net/openvswitch/flow_netlink.c
+diff --git a/net/openvswitch/meter.c b/net/openvswitch/meter.c
+index 43849d752a1e..4ce4e02d6195 100644
+--- a/net/openvswitch/meter.c
++++ b/net/openvswitch/meter.c
+@@ -127,7 +127,7 @@ static int ovs_meter_cmd_reply_stats(struct sk_buff *reply, u32 meter_id,
+ 			      OVS_METER_ATTR_PAD))
+ 		goto error;
+ 
+-	nla = nla_nest_start(reply, OVS_METER_ATTR_BANDS);
++	nla = nla_nest_start_noflag(reply, OVS_METER_ATTR_BANDS);
+ 	if (!nla)
+ 		goto error;
+ 
+@@ -136,7 +136,7 @@ static int ovs_meter_cmd_reply_stats(struct sk_buff *reply, u32 meter_id,
+ 	for (i = 0; i < meter->n_bands; ++i, ++band) {
+ 		struct nlattr *band_nla;
+ 
+-		band_nla = nla_nest_start(reply, OVS_BAND_ATTR_UNSPEC);
++		band_nla = nla_nest_start_noflag(reply, OVS_BAND_ATTR_UNSPEC);
+ 		if (!band_nla || nla_put(reply, OVS_BAND_ATTR_STATS,
+ 					 sizeof(struct ovs_flow_stats),
+ 					 &band->stats))
+@@ -166,11 +166,11 @@ static int ovs_meter_cmd_features(struct sk_buff *skb, struct genl_info *info)
+ 	    nla_put_u32(reply, OVS_METER_ATTR_MAX_BANDS, DP_MAX_BANDS))
+ 		goto nla_put_failure;
+ 
+-	nla = nla_nest_start(reply, OVS_METER_ATTR_BANDS);
++	nla = nla_nest_start_noflag(reply, OVS_METER_ATTR_BANDS);
+ 	if (!nla)
+ 		goto nla_put_failure;
+ 
+-	band_nla = nla_nest_start(reply, OVS_BAND_ATTR_UNSPEC);
++	band_nla = nla_nest_start_noflag(reply, OVS_BAND_ATTR_UNSPEC);
+ 	if (!band_nla)
+ 		goto nla_put_failure;
+ 	/* Currently only DROP band type is supported. */
+diff --git a/net/openvswitch/vport-vxlan.c b/net/openvswitch/vport-vxlan.c
+index 8f16f11f7ad3..54965ff8cc66 100644
+--- a/net/openvswitch/vport-vxlan.c
++++ b/net/openvswitch/vport-vxlan.c
+@@ -43,7 +43,7 @@ static int vxlan_get_options(const struct vport *vport, struct sk_buff *skb)
+ 	if (vxlan->cfg.flags & VXLAN_F_GBP) {
+ 		struct nlattr *exts;
+ 
+-		exts = nla_nest_start(skb, OVS_TUNNEL_ATTR_EXTENSION);
++		exts = nla_nest_start_noflag(skb, OVS_TUNNEL_ATTR_EXTENSION);
+ 		if (!exts)
+ 			return -EMSGSIZE;
+ 
+diff --git a/net/openvswitch/vport.c b/net/openvswitch/vport.c
+index 19f6765566e7..258ce3b7b452 100644
+--- a/net/openvswitch/vport.c
++++ b/net/openvswitch/vport.c
+@@ -319,7 +319,7 @@ int ovs_vport_get_options(const struct vport *vport, struct sk_buff *skb)
+ 	if (!vport->ops->get_options)
+ 		return 0;
+ 
+-	nla = nla_nest_start(skb, OVS_VPORT_ATTR_OPTIONS);
++	nla = nla_nest_start_noflag(skb, OVS_VPORT_ATTR_OPTIONS);
+ 	if (!nla)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/packet/diag.c b/net/packet/diag.c
+index 7ef1c881ae74..98abfd8644a4 100644
+--- a/net/packet/diag.c
++++ b/net/packet/diag.c
+@@ -39,7 +39,7 @@ static int pdiag_put_mclist(const struct packet_sock *po, struct sk_buff *nlskb)
+ 	struct nlattr *mca;
+ 	struct packet_mclist *ml;
+ 
+-	mca = nla_nest_start(nlskb, PACKET_DIAG_MCLIST);
++	mca = nla_nest_start_noflag(nlskb, PACKET_DIAG_MCLIST);
+ 	if (!mca)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/sched/act_api.c b/net/sched/act_api.c
+index f44a574dc4d5..1fcc445e27a5 100644
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@ -243,7 +243,7 @@ static int tcf_dump_walker(struct tcf_idrinfo *idrinfo, struct sk_buff *skb,
+ 			       (unsigned long)p->tcfa_tm.lastuse))
+ 			continue;
+ 
+-		nest = nla_nest_start(skb, n_i);
++		nest = nla_nest_start_noflag(skb, n_i);
+ 		if (!nest) {
+ 			index--;
+ 			goto nla_put_failure;
+@@ -301,7 +301,7 @@ static int tcf_del_walker(struct tcf_idrinfo *idrinfo, struct sk_buff *skb,
+ 	unsigned long id = 1;
+ 	unsigned long tmp;
+ 
+-	nest = nla_nest_start(skb, 0);
++	nest = nla_nest_start_noflag(skb, 0);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put_string(skb, TCA_KIND, ops->kind))
+@@ -779,7 +779,7 @@ tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
+ 	}
+ 	rcu_read_unlock();
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	err = tcf_action_dump_old(skb, a, bind, ref);
+@@ -803,7 +803,7 @@ int tcf_action_dump(struct sk_buff *skb, struct tc_action *actions[],
+ 
+ 	for (i = 0; i < TCA_ACT_MAX_PRIO && actions[i]; i++) {
+ 		a = actions[i];
+-		nest = nla_nest_start(skb, a->order);
++		nest = nla_nest_start_noflag(skb, a->order);
+ 		if (nest == NULL)
+ 			goto nla_put_failure;
+ 		err = tcf_action_dump_1(skb, a, bind, ref);
+@@ -1055,7 +1055,7 @@ static int tca_get_fill(struct sk_buff *skb, struct tc_action *actions[],
+ 	t->tca__pad1 = 0;
+ 	t->tca__pad2 = 0;
+ 
+-	nest = nla_nest_start(skb, TCA_ACT_TAB);
++	nest = nla_nest_start_noflag(skb, TCA_ACT_TAB);
+ 	if (!nest)
+ 		goto out_nlmsg_trim;
+ 
+@@ -1179,7 +1179,7 @@ static int tca_action_flush(struct net *net, struct nlattr *nla,
+ 	t->tca__pad1 = 0;
+ 	t->tca__pad2 = 0;
+ 
+-	nest = nla_nest_start(skb, TCA_ACT_TAB);
++	nest = nla_nest_start_noflag(skb, TCA_ACT_TAB);
+ 	if (!nest) {
+ 		NL_SET_ERR_MSG(extack, "Failed to add new netlink message");
+ 		goto out_module_put;
+@@ -1511,7 +1511,7 @@ static int tc_dump_action(struct sk_buff *skb, struct netlink_callback *cb)
+ 	if (!count_attr)
+ 		goto out_module_put;
+ 
+-	nest = nla_nest_start(skb, TCA_ACT_TAB);
++	nest = nla_nest_start_noflag(skb, TCA_ACT_TAB);
+ 	if (nest == NULL)
+ 		goto out_module_put;
+ 
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 575a19b4b575..774fcd44d268 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -387,7 +387,7 @@ static int dump_metalist(struct sk_buff *skb, struct tcf_ife_info *ife)
+ 	if (list_empty(&ife->metalist))
+ 		return 0;
+ 
+-	nest = nla_nest_start(skb, TCA_IFE_METALST);
++	nest = nla_nest_start_noflag(skb, TCA_IFE_METALST);
+ 	if (!nest)
+ 		goto out_nlmsg_trim;
+ 
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index 14225288f643..1e1313cfa39c 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -108,14 +108,15 @@ static struct tcf_pedit_key_ex *tcf_pedit_keys_ex_parse(struct nlattr *nla,
+ static int tcf_pedit_key_ex_dump(struct sk_buff *skb,
+ 				 struct tcf_pedit_key_ex *keys_ex, int n)
+ {
+-	struct nlattr *keys_start = nla_nest_start(skb, TCA_PEDIT_KEYS_EX);
++	struct nlattr *keys_start = nla_nest_start_noflag(skb,
++							  TCA_PEDIT_KEYS_EX);
+ 
+ 	if (!keys_start)
+ 		goto nla_failure;
+ 	for (; n > 0; n--) {
+ 		struct nlattr *key_start;
+ 
+-		key_start = nla_nest_start(skb, TCA_PEDIT_KEY_EX);
++		key_start = nla_nest_start_noflag(skb, TCA_PEDIT_KEY_EX);
+ 		if (!key_start)
+ 			goto nla_failure;
+ 
+diff --git a/net/sched/act_tunnel_key.c b/net/sched/act_tunnel_key.c
+index 2e1c7c13ae7a..cb2aa31721a0 100644
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@ -428,7 +428,7 @@ static int tunnel_key_geneve_opts_dump(struct sk_buff *skb,
+ 	u8 *src = (u8 *)(info + 1);
+ 	struct nlattr *start;
+ 
+-	start = nla_nest_start(skb, TCA_TUNNEL_KEY_ENC_OPTS_GENEVE);
++	start = nla_nest_start_noflag(skb, TCA_TUNNEL_KEY_ENC_OPTS_GENEVE);
+ 	if (!start)
+ 		return -EMSGSIZE;
+ 
+@@ -462,7 +462,7 @@ static int tunnel_key_opts_dump(struct sk_buff *skb,
+ 	if (!info->options_len)
+ 		return 0;
+ 
+-	start = nla_nest_start(skb, TCA_TUNNEL_KEY_ENC_OPTS);
++	start = nla_nest_start_noflag(skb, TCA_TUNNEL_KEY_ENC_OPTS);
+ 	if (!start)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/sched/cls_api.c b/net/sched/cls_api.c
+index a2bdef3274d4..f45035b6890d 100644
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@ -3113,7 +3113,7 @@ int tcf_exts_dump(struct sk_buff *skb, struct tcf_exts *exts)
+ 		 * tc data even if iproute2  was newer - jhs
+ 		 */
+ 		if (exts->type != TCA_OLD_COMPAT) {
+-			nest = nla_nest_start(skb, exts->action);
++			nest = nla_nest_start_noflag(skb, exts->action);
+ 			if (nest == NULL)
+ 				goto nla_put_failure;
+ 
+@@ -3122,7 +3122,7 @@ int tcf_exts_dump(struct sk_buff *skb, struct tcf_exts *exts)
+ 			nla_nest_end(skb, nest);
+ 		} else if (exts->police) {
+ 			struct tc_action *act = tcf_exts_first_act(exts);
+-			nest = nla_nest_start(skb, exts->police);
++			nest = nla_nest_start_noflag(skb, exts->police);
+ 			if (nest == NULL || !act)
+ 				goto nla_put_failure;
+ 			if (tcf_action_dump_old(skb, act, 0, 0) < 0)
+diff --git a/net/sched/cls_basic.c b/net/sched/cls_basic.c
+index 687b0af67878..dd5fdb62c6df 100644
+--- a/net/sched/cls_basic.c
++++ b/net/sched/cls_basic.c
+@@ -288,7 +288,7 @@ static int basic_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = f->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_bpf.c b/net/sched/cls_bpf.c
+index ff1deece0104..23c6799e98c8 100644
+--- a/net/sched/cls_bpf.c
++++ b/net/sched/cls_bpf.c
+@@ -595,7 +595,7 @@ static int cls_bpf_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	cls_bpf_offload_update_stats(tp, prog);
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_cgroup.c b/net/sched/cls_cgroup.c
+index 706a160142ea..cd01ba258ecb 100644
+--- a/net/sched/cls_cgroup.c
++++ b/net/sched/cls_cgroup.c
+@@ -178,7 +178,7 @@ static int cls_cgroup_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = head->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_flow.c b/net/sched/cls_flow.c
+index eece1ee26930..cb29fe7d5ed3 100644
+--- a/net/sched/cls_flow.c
++++ b/net/sched/cls_flow.c
+@@ -629,7 +629,7 @@ static int flow_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = f->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_flower.c b/net/sched/cls_flower.c
+index 3eb4f57be10d..c94d8622112a 100644
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@ -1934,7 +1934,7 @@ static int fl_dump_key_geneve_opt(struct sk_buff *skb,
+ 	struct nlattr *nest;
+ 	int opt_off = 0;
+ 
+-	nest = nla_nest_start(skb, TCA_FLOWER_KEY_ENC_OPTS_GENEVE);
++	nest = nla_nest_start_noflag(skb, TCA_FLOWER_KEY_ENC_OPTS_GENEVE);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+@@ -2004,7 +2004,7 @@ static int fl_dump_key_options(struct sk_buff *skb, int enc_opt_type,
+ 	if (!enc_opts->len)
+ 		return 0;
+ 
+-	nest = nla_nest_start(skb, enc_opt_type);
++	nest = nla_nest_start_noflag(skb, enc_opt_type);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+@@ -2252,7 +2252,7 @@ static int fl_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = f->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+@@ -2296,7 +2296,7 @@ static int fl_tmplt_dump(struct sk_buff *skb, struct net *net, void *tmplt_priv)
+ 	struct fl_flow_key *key, *mask;
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_fw.c b/net/sched/cls_fw.c
+index ad036b00427d..3fcc1d51b9d7 100644
+--- a/net/sched/cls_fw.c
++++ b/net/sched/cls_fw.c
+@@ -402,7 +402,7 @@ static int fw_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 	if (!f->res.classid && !tcf_exts_has_actions(&f->exts))
+ 		return skb->len;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_matchall.c b/net/sched/cls_matchall.c
+index 297b15dae9b8..1f94c1186ea5 100644
+--- a/net/sched/cls_matchall.c
++++ b/net/sched/cls_matchall.c
+@@ -358,7 +358,7 @@ static int mall_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = head->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_route.c b/net/sched/cls_route.c
+index f006af23b64a..b3b9b151a61d 100644
+--- a/net/sched/cls_route.c
++++ b/net/sched/cls_route.c
+@@ -607,7 +607,7 @@ static int route4_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = f->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_rsvp.h b/net/sched/cls_rsvp.h
+index 0719a21d9c41..fa059cf934a6 100644
+--- a/net/sched/cls_rsvp.h
++++ b/net/sched/cls_rsvp.h
+@@ -706,7 +706,7 @@ static int rsvp_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = f->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_tcindex.c b/net/sched/cls_tcindex.c
+index 24e0a62a65cc..1a2e7d5a8776 100644
+--- a/net/sched/cls_tcindex.c
++++ b/net/sched/cls_tcindex.c
+@@ -601,7 +601,7 @@ static int tcindex_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 		 tp, fh, skb, t, p, r);
+ 	pr_debug("p->perfect %p p->h %p\n", p->perfect, p->h);
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/cls_u32.c b/net/sched/cls_u32.c
+index b0858cec6fae..1904b9d21391 100644
+--- a/net/sched/cls_u32.c
++++ b/net/sched/cls_u32.c
+@@ -1294,7 +1294,7 @@ static int u32_dump(struct net *net, struct tcf_proto *tp, void *fh,
+ 
+ 	t->tcm_handle = n->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/ematch.c b/net/sched/ematch.c
+index 1331a4c2d8ff..6f2d6a761dbe 100644
+--- a/net/sched/ematch.c
++++ b/net/sched/ematch.c
+@@ -440,14 +440,14 @@ int tcf_em_tree_dump(struct sk_buff *skb, struct tcf_ematch_tree *tree, int tlv)
+ 	struct nlattr *top_start;
+ 	struct nlattr *list_start;
+ 
+-	top_start = nla_nest_start(skb, tlv);
++	top_start = nla_nest_start_noflag(skb, tlv);
+ 	if (top_start == NULL)
+ 		goto nla_put_failure;
+ 
+ 	if (nla_put(skb, TCA_EMATCH_TREE_HDR, sizeof(tree->hdr), &tree->hdr))
+ 		goto nla_put_failure;
+ 
+-	list_start = nla_nest_start(skb, TCA_EMATCH_TREE_LIST);
++	list_start = nla_nest_start_noflag(skb, TCA_EMATCH_TREE_LIST);
+ 	if (list_start == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_api.c b/net/sched/sch_api.c
+index c126b9f78d6e..6c81b22d214f 100644
+--- a/net/sched/sch_api.c
++++ b/net/sched/sch_api.c
+@@ -542,7 +542,7 @@ static int qdisc_dump_stab(struct sk_buff *skb, struct qdisc_size_table *stab)
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_STAB);
++	nest = nla_nest_start_noflag(skb, TCA_STAB);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put(skb, TCA_STAB_BASE, sizeof(stab->szopts), &stab->szopts))
+diff --git a/net/sched/sch_atm.c b/net/sched/sch_atm.c
+index d714d3747bcb..c36aa57eb4af 100644
+--- a/net/sched/sch_atm.c
++++ b/net/sched/sch_atm.c
+@@ -609,7 +609,7 @@ static int atm_tc_dump_class(struct Qdisc *sch, unsigned long cl,
+ 	tcm->tcm_handle = flow->common.classid;
+ 	tcm->tcm_info = flow->q->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 259d97bc2abd..50db72fe44de 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -2735,7 +2735,7 @@ static int cake_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!opts)
+ 		goto nla_put_failure;
+ 
+@@ -2806,7 +2806,7 @@ static int cake_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 
+ static int cake_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ {
+-	struct nlattr *stats = nla_nest_start(d->skb, TCA_STATS_APP);
++	struct nlattr *stats = nla_nest_start_noflag(d->skb, TCA_STATS_APP);
+ 	struct cake_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *tstats, *ts;
+ 	int i;
+@@ -2836,7 +2836,7 @@ static int cake_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ #undef PUT_STAT_U32
+ #undef PUT_STAT_U64
+ 
+-	tstats = nla_nest_start(d->skb, TCA_CAKE_STATS_TIN_STATS);
++	tstats = nla_nest_start_noflag(d->skb, TCA_CAKE_STATS_TIN_STATS);
+ 	if (!tstats)
+ 		goto nla_put_failure;
+ 
+@@ -2853,7 +2853,7 @@ static int cake_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
+ 	for (i = 0; i < q->tin_cnt; i++) {
+ 		struct cake_tin_data *b = &q->tins[q->tin_order[i]];
+ 
+-		ts = nla_nest_start(d->skb, i + 1);
++		ts = nla_nest_start_noflag(d->skb, i + 1);
+ 		if (!ts)
+ 			goto nla_put_failure;
+ 
+@@ -2973,7 +2973,7 @@ static int cake_dump_class_stats(struct Qdisc *sch, unsigned long cl,
+ 	if (flow) {
+ 		ktime_t now = ktime_get();
+ 
+-		stats = nla_nest_start(d->skb, TCA_STATS_APP);
++		stats = nla_nest_start_noflag(d->skb, TCA_STATS_APP);
+ 		if (!stats)
+ 			return -1;
+ 
+diff --git a/net/sched/sch_cbq.c b/net/sched/sch_cbq.c
+index 114b9048ea7e..243bce4b888b 100644
+--- a/net/sched/sch_cbq.c
++++ b/net/sched/sch_cbq.c
+@@ -1305,7 +1305,7 @@ static int cbq_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct cbq_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (cbq_dump_attr(skb, &q->link) < 0)
+@@ -1340,7 +1340,7 @@ cbq_dump_class(struct Qdisc *sch, unsigned long arg,
+ 	tcm->tcm_handle = cl->common.classid;
+ 	tcm->tcm_info = cl->q->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (cbq_dump_attr(skb, cl) < 0)
+diff --git a/net/sched/sch_cbs.c b/net/sched/sch_cbs.c
+index c4b73380a917..8d4a747e12e6 100644
+--- a/net/sched/sch_cbs.c
++++ b/net/sched/sch_cbs.c
+@@ -449,7 +449,7 @@ static int cbs_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct tc_cbs_qopt opt = { };
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_choke.c b/net/sched/sch_choke.c
+index eafc0d17d174..eda21dc94bde 100644
+--- a/net/sched/sch_choke.c
++++ b/net/sched/sch_choke.c
+@@ -452,7 +452,7 @@ static int choke_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 		.Scell_log	= q->parms.Scell_log,
+ 	};
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_codel.c b/net/sched/sch_codel.c
+index 17cd81f84b5d..60ac4e61ce3a 100644
+--- a/net/sched/sch_codel.c
++++ b/net/sched/sch_codel.c
+@@ -217,7 +217,7 @@ static int codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct codel_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_drr.c b/net/sched/sch_drr.c
+index 430df9a55ec4..022db73fd5a9 100644
+--- a/net/sched/sch_drr.c
++++ b/net/sched/sch_drr.c
+@@ -244,7 +244,7 @@ static int drr_dump_class(struct Qdisc *sch, unsigned long arg,
+ 	tcm->tcm_handle	= cl->common.classid;
+ 	tcm->tcm_info	= cl->qdisc->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put_u32(skb, TCA_DRR_QUANTUM, cl->quantum))
+diff --git a/net/sched/sch_dsmark.c b/net/sched/sch_dsmark.c
+index 42471464ded3..cdf744e710f1 100644
+--- a/net/sched/sch_dsmark.c
++++ b/net/sched/sch_dsmark.c
+@@ -432,7 +432,7 @@ static int dsmark_dump_class(struct Qdisc *sch, unsigned long cl,
+ 	tcm->tcm_handle = TC_H_MAKE(TC_H_MAJ(sch->handle), cl - 1);
+ 	tcm->tcm_info = p->q->handle;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put_u8(skb, TCA_DSMARK_MASK, p->mv[cl - 1].mask) ||
+@@ -451,7 +451,7 @@ static int dsmark_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct dsmark_qdisc_data *p = qdisc_priv(sch);
+ 	struct nlattr *opts = NULL;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put_u16(skb, TCA_DSMARK_INDICES, p->indices))
+diff --git a/net/sched/sch_etf.c b/net/sched/sch_etf.c
+index 1150f22983df..67107caa287c 100644
+--- a/net/sched/sch_etf.c
++++ b/net/sched/sch_etf.c
+@@ -460,7 +460,7 @@ static int etf_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct tc_etf_qopt opt = { };
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!nest)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index b27ba36a269c..f69d73756efd 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -838,7 +838,7 @@ static int fq_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct fq_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index cd04d40c30b6..825a933b019a 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -527,7 +527,7 @@ static int fq_codel_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct fq_codel_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_gred.c b/net/sched/sch_gred.c
+index 234afbf9115b..9bfa15e12d23 100644
+--- a/net/sched/sch_gred.c
++++ b/net/sched/sch_gred.c
+@@ -772,7 +772,7 @@ static int gred_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	if (gred_offload_dump_stats(sch))
+ 		goto nla_put_failure;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put(skb, TCA_GRED_DPS, sizeof(sopt), &sopt))
+@@ -790,7 +790,7 @@ static int gred_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 		goto nla_put_failure;
+ 
+ 	/* Old style all-in-one dump of VQs */
+-	parms = nla_nest_start(skb, TCA_GRED_PARMS);
++	parms = nla_nest_start_noflag(skb, TCA_GRED_PARMS);
+ 	if (parms == NULL)
+ 		goto nla_put_failure;
+ 
+@@ -841,7 +841,7 @@ static int gred_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	nla_nest_end(skb, parms);
+ 
+ 	/* Dump the VQs again, in more structured way */
+-	vqs = nla_nest_start(skb, TCA_GRED_VQ_LIST);
++	vqs = nla_nest_start_noflag(skb, TCA_GRED_VQ_LIST);
+ 	if (!vqs)
+ 		goto nla_put_failure;
+ 
+@@ -852,7 +852,7 @@ static int gred_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 		if (!q)
+ 			continue;
+ 
+-		vq = nla_nest_start(skb, TCA_GRED_VQ_ENTRY);
++		vq = nla_nest_start_noflag(skb, TCA_GRED_VQ_ENTRY);
+ 		if (!vq)
+ 			goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_hfsc.c b/net/sched/sch_hfsc.c
+index d2ab463f22ae..97d2fb91c39f 100644
+--- a/net/sched/sch_hfsc.c
++++ b/net/sched/sch_hfsc.c
+@@ -1300,7 +1300,7 @@ hfsc_dump_class(struct Qdisc *sch, unsigned long arg, struct sk_buff *skb,
+ 	if (cl->level == 0)
+ 		tcm->tcm_info = cl->qdisc->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (hfsc_dump_curves(skb, cl) < 0)
+diff --git a/net/sched/sch_hhf.c b/net/sched/sch_hhf.c
+index 9d6a47697406..43bc159c4f7c 100644
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@ -654,7 +654,7 @@ static int hhf_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct hhf_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_htb.c b/net/sched/sch_htb.c
+index 2f9883b196e8..64010aec5437 100644
+--- a/net/sched/sch_htb.c
++++ b/net/sched/sch_htb.c
+@@ -1057,7 +1057,7 @@ static int htb_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	gopt.defcls = q->defcls;
+ 	gopt.debug = 0;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put(skb, TCA_HTB_INIT, sizeof(gopt), &gopt) ||
+@@ -1086,7 +1086,7 @@ static int htb_dump_class(struct Qdisc *sch, unsigned long arg,
+ 	if (!cl->level && cl->leaf.q)
+ 		tcm->tcm_info = cl->leaf.q->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_ingress.c b/net/sched/sch_ingress.c
+index ce3f55259d0d..0bac926b46c7 100644
+--- a/net/sched/sch_ingress.c
++++ b/net/sched/sch_ingress.c
+@@ -106,7 +106,7 @@ static int ingress_dump(struct Qdisc *sch, struct sk_buff *skb)
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_mqprio.c b/net/sched/sch_mqprio.c
+index ea0dc112b38d..7afefed72d35 100644
+--- a/net/sched/sch_mqprio.c
++++ b/net/sched/sch_mqprio.c
+@@ -349,7 +349,7 @@ static int dump_rates(struct mqprio_sched *priv,
+ 	int i;
+ 
+ 	if (priv->flags & TC_MQPRIO_F_MIN_RATE) {
+-		nest = nla_nest_start(skb, TCA_MQPRIO_MIN_RATE64);
++		nest = nla_nest_start_noflag(skb, TCA_MQPRIO_MIN_RATE64);
+ 		if (!nest)
+ 			goto nla_put_failure;
+ 
+@@ -363,7 +363,7 @@ static int dump_rates(struct mqprio_sched *priv,
+ 	}
+ 
+ 	if (priv->flags & TC_MQPRIO_F_MAX_RATE) {
+-		nest = nla_nest_start(skb, TCA_MQPRIO_MAX_RATE64);
++		nest = nla_nest_start_noflag(skb, TCA_MQPRIO_MAX_RATE64);
+ 		if (!nest)
+ 			goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index f7ac84c1d5b1..8431076e79b4 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -1081,7 +1081,7 @@ static int dump_loss_model(const struct netem_sched_data *q,
+ {
+ 	struct nlattr *nest;
+ 
+-	nest = nla_nest_start(skb, TCA_NETEM_LOSS);
++	nest = nla_nest_start_noflag(skb, TCA_NETEM_LOSS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_pie.c b/net/sched/sch_pie.c
+index 1cc0c7b74aa3..9bf41f4a2312 100644
+--- a/net/sched/sch_pie.c
++++ b/net/sched/sch_pie.c
+@@ -491,7 +491,7 @@ static int pie_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct pie_sched_data *q = qdisc_priv(sch);
+ 	struct nlattr *opts;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (!opts)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/sched/sch_qfq.c b/net/sched/sch_qfq.c
+index 1589364b54da..bab2d4026e8b 100644
+--- a/net/sched/sch_qfq.c
++++ b/net/sched/sch_qfq.c
+@@ -619,7 +619,7 @@ static int qfq_dump_class(struct Qdisc *sch, unsigned long arg,
+ 	tcm->tcm_handle	= cl->common.classid;
+ 	tcm->tcm_info	= cl->qdisc->handle;
+ 
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put_u32(skb, TCA_QFQ_WEIGHT, cl->agg->class_weight) ||
+diff --git a/net/sched/sch_red.c b/net/sched/sch_red.c
+index 4e8c0abf6194..b9f34e057e87 100644
+--- a/net/sched/sch_red.c
++++ b/net/sched/sch_red.c
+@@ -318,7 +318,7 @@ static int red_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	if (err)
+ 		goto nla_put_failure;
+ 
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put(skb, TCA_RED_PARMS, sizeof(opt), &opt) ||
+diff --git a/net/sched/sch_sfb.c b/net/sched/sch_sfb.c
+index 2419fdb75966..f54b00a431a3 100644
+--- a/net/sched/sch_sfb.c
++++ b/net/sched/sch_sfb.c
+@@ -580,7 +580,7 @@ static int sfb_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	};
+ 
+ 	sch->qstats.backlog = q->qdisc->qstats.backlog;
+-	opts = nla_nest_start(skb, TCA_OPTIONS);
++	opts = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (opts == NULL)
+ 		goto nla_put_failure;
+ 	if (nla_put(skb, TCA_SFB_PARMS, sizeof(opt), &opt))
+* Unmerged path net/sched/sch_taprio.c
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index f71578dbb9e3..3ae5a29eeab3 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -448,7 +448,7 @@ static int tbf_dump(struct Qdisc *sch, struct sk_buff *skb)
+ 	struct tc_tbf_qopt opt;
+ 
+ 	sch->qstats.backlog = q->qdisc->qstats.backlog;
+-	nest = nla_nest_start(skb, TCA_OPTIONS);
++	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ 	if (nest == NULL)
+ 		goto nla_put_failure;
+ 
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 70fe195237ff..257337011a11 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -687,14 +687,14 @@ static int __tipc_nl_add_bearer(struct tipc_nl_msg *msg,
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_BEARER);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_BEARER);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+ 	if (nla_put_string(msg->skb, TIPC_NLA_BEARER_NAME, bearer->name))
+ 		goto attr_msg_full;
+ 
+-	prop = nla_nest_start(msg->skb, TIPC_NLA_BEARER_PROP);
++	prop = nla_nest_start_noflag(msg->skb, TIPC_NLA_BEARER_PROP);
+ 	if (!prop)
+ 		goto prop_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_PRIO, bearer->priority))
+@@ -1033,14 +1033,14 @@ static int __tipc_nl_add_media(struct tipc_nl_msg *msg,
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_MEDIA);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_MEDIA);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+ 	if (nla_put_string(msg->skb, TIPC_NLA_MEDIA_NAME, media->name))
+ 		goto attr_msg_full;
+ 
+-	prop = nla_nest_start(msg->skb, TIPC_NLA_MEDIA_PROP);
++	prop = nla_nest_start_noflag(msg->skb, TIPC_NLA_MEDIA_PROP);
+ 	if (!prop)
+ 		goto prop_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_PRIO, media->priority))
+diff --git a/net/tipc/group.c b/net/tipc/group.c
+index 63f39201e41e..992be6113676 100644
+--- a/net/tipc/group.c
++++ b/net/tipc/group.c
+@@ -917,7 +917,7 @@ void tipc_group_member_evt(struct tipc_group *grp,
+ 
+ int tipc_group_fill_sock_diag(struct tipc_group *grp, struct sk_buff *skb)
+ {
+-	struct nlattr *group = nla_nest_start(skb, TIPC_NLA_SOCK_GROUP);
++	struct nlattr *group = nla_nest_start_noflag(skb, TIPC_NLA_SOCK_GROUP);
+ 
+ 	if (!group)
+ 		return -EMSGSIZE;
+diff --git a/net/tipc/link.c b/net/tipc/link.c
+index 6dac63b94ab3..27cc0174cdd8 100644
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@ -2264,7 +2264,7 @@ static int __tipc_nl_add_stats(struct sk_buff *skb, struct tipc_stats *s)
+ 			(s->accu_queue_sz / s->queue_sz_counts) : 0}
+ 	};
+ 
+-	stats = nla_nest_start(skb, TIPC_NLA_LINK_STATS);
++	stats = nla_nest_start_noflag(skb, TIPC_NLA_LINK_STATS);
+ 	if (!stats)
+ 		return -EMSGSIZE;
+ 
+@@ -2296,7 +2296,7 @@ int __tipc_nl_add_link(struct net *net, struct tipc_nl_msg *msg,
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_LINK);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_LINK);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+@@ -2318,7 +2318,7 @@ int __tipc_nl_add_link(struct net *net, struct tipc_nl_msg *msg,
+ 		if (nla_put_flag(msg->skb, TIPC_NLA_LINK_ACTIVE))
+ 			goto attr_msg_full;
+ 
+-	prop = nla_nest_start(msg->skb, TIPC_NLA_LINK_PROP);
++	prop = nla_nest_start_noflag(msg->skb, TIPC_NLA_LINK_PROP);
+ 	if (!prop)
+ 		goto attr_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_PRIO, link->priority))
+@@ -2385,7 +2385,7 @@ static int __tipc_nl_add_bc_link_stat(struct sk_buff *skb,
+ 			(stats->accu_queue_sz / stats->queue_sz_counts) : 0}
+ 	};
+ 
+-	nest = nla_nest_start(skb, TIPC_NLA_LINK_STATS);
++	nest = nla_nest_start_noflag(skb, TIPC_NLA_LINK_STATS);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -2425,7 +2425,7 @@ int tipc_nl_add_bc_link(struct net *net, struct tipc_nl_msg *msg)
+ 		return -EMSGSIZE;
+ 	}
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_LINK);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_LINK);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+@@ -2442,7 +2442,7 @@ int tipc_nl_add_bc_link(struct net *net, struct tipc_nl_msg *msg)
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_LINK_TX, 0))
+ 		goto attr_msg_full;
+ 
+-	prop = nla_nest_start(msg->skb, TIPC_NLA_LINK_PROP);
++	prop = nla_nest_start_noflag(msg->skb, TIPC_NLA_LINK_PROP);
+ 	if (!prop)
+ 		goto attr_msg_full;
+ 	if (nla_put_u32(msg->skb, TIPC_NLA_PROP_WIN, bcl->window))
+diff --git a/net/tipc/monitor.c b/net/tipc/monitor.c
+index 67f69389ec17..6a6eae88442f 100644
+--- a/net/tipc/monitor.c
++++ b/net/tipc/monitor.c
+@@ -696,7 +696,7 @@ static int __tipc_nl_add_monitor_peer(struct tipc_peer *peer,
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_MON_PEER);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_MON_PEER);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+@@ -785,7 +785,7 @@ int __tipc_nl_add_monitor(struct net *net, struct tipc_nl_msg *msg,
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_MON);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_MON);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+diff --git a/net/tipc/name_table.c b/net/tipc/name_table.c
+index 89993afe0fbd..66a65c2cdb23 100644
+--- a/net/tipc/name_table.c
++++ b/net/tipc/name_table.c
+@@ -829,11 +829,11 @@ static int __tipc_nl_add_nametable_publ(struct tipc_nl_msg *msg,
+ 		if (!hdr)
+ 			return -EMSGSIZE;
+ 
+-		attrs = nla_nest_start(msg->skb, TIPC_NLA_NAME_TABLE);
++		attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_NAME_TABLE);
+ 		if (!attrs)
+ 			goto msg_full;
+ 
+-		b = nla_nest_start(msg->skb, TIPC_NLA_NAME_TABLE_PUBL);
++		b = nla_nest_start_noflag(msg->skb, TIPC_NLA_NAME_TABLE_PUBL);
+ 		if (!b)
+ 			goto attr_msg_full;
+ 
+diff --git a/net/tipc/net.c b/net/tipc/net.c
+index 7ce1e86b024f..0bba4e6b005c 100644
+--- a/net/tipc/net.c
++++ b/net/tipc/net.c
+@@ -187,7 +187,7 @@ static int __tipc_nl_add_net(struct net *net, struct tipc_nl_msg *msg)
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_NET);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_NET);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+diff --git a/net/tipc/netlink_compat.c b/net/tipc/netlink_compat.c
+index a83aee01a707..f7839d67b7af 100644
+--- a/net/tipc/netlink_compat.c
++++ b/net/tipc/netlink_compat.c
+@@ -402,7 +402,7 @@ static int tipc_nl_compat_bearer_enable(struct tipc_nl_compat_cmd_doit *cmd,
+ 
+ 	b = (struct tipc_bearer_config *)TLV_DATA(msg->req);
+ 
+-	bearer = nla_nest_start(skb, TIPC_NLA_BEARER);
++	bearer = nla_nest_start_noflag(skb, TIPC_NLA_BEARER);
+ 	if (!bearer)
+ 		return -EMSGSIZE;
+ 
+@@ -422,7 +422,7 @@ static int tipc_nl_compat_bearer_enable(struct tipc_nl_compat_cmd_doit *cmd,
+ 		return -EMSGSIZE;
+ 
+ 	if (ntohl(b->priority) <= TIPC_MAX_LINK_PRI) {
+-		prop = nla_nest_start(skb, TIPC_NLA_BEARER_PROP);
++		prop = nla_nest_start_noflag(skb, TIPC_NLA_BEARER_PROP);
+ 		if (!prop)
+ 			return -EMSGSIZE;
+ 		if (nla_put_u32(skb, TIPC_NLA_PROP_PRIO, ntohl(b->priority)))
+@@ -444,7 +444,7 @@ static int tipc_nl_compat_bearer_disable(struct tipc_nl_compat_cmd_doit *cmd,
+ 
+ 	name = (char *)TLV_DATA(msg->req);
+ 
+-	bearer = nla_nest_start(skb, TIPC_NLA_BEARER);
++	bearer = nla_nest_start_noflag(skb, TIPC_NLA_BEARER);
+ 	if (!bearer)
+ 		return -EMSGSIZE;
+ 
+@@ -688,7 +688,7 @@ static int tipc_nl_compat_media_set(struct sk_buff *skb,
+ 
+ 	lc = (struct tipc_link_config *)TLV_DATA(msg->req);
+ 
+-	media = nla_nest_start(skb, TIPC_NLA_MEDIA);
++	media = nla_nest_start_noflag(skb, TIPC_NLA_MEDIA);
+ 	if (!media)
+ 		return -EMSGSIZE;
+ 
+@@ -699,7 +699,7 @@ static int tipc_nl_compat_media_set(struct sk_buff *skb,
+ 	if (nla_put_string(skb, TIPC_NLA_MEDIA_NAME, lc->name))
+ 		return -EMSGSIZE;
+ 
+-	prop = nla_nest_start(skb, TIPC_NLA_MEDIA_PROP);
++	prop = nla_nest_start_noflag(skb, TIPC_NLA_MEDIA_PROP);
+ 	if (!prop)
+ 		return -EMSGSIZE;
+ 
+@@ -720,7 +720,7 @@ static int tipc_nl_compat_bearer_set(struct sk_buff *skb,
+ 
+ 	lc = (struct tipc_link_config *)TLV_DATA(msg->req);
+ 
+-	bearer = nla_nest_start(skb, TIPC_NLA_BEARER);
++	bearer = nla_nest_start_noflag(skb, TIPC_NLA_BEARER);
+ 	if (!bearer)
+ 		return -EMSGSIZE;
+ 
+@@ -731,7 +731,7 @@ static int tipc_nl_compat_bearer_set(struct sk_buff *skb,
+ 	if (nla_put_string(skb, TIPC_NLA_BEARER_NAME, lc->name))
+ 		return -EMSGSIZE;
+ 
+-	prop = nla_nest_start(skb, TIPC_NLA_BEARER_PROP);
++	prop = nla_nest_start_noflag(skb, TIPC_NLA_BEARER_PROP);
+ 	if (!prop)
+ 		return -EMSGSIZE;
+ 
+@@ -751,14 +751,14 @@ static int __tipc_nl_compat_link_set(struct sk_buff *skb,
+ 
+ 	lc = (struct tipc_link_config *)TLV_DATA(msg->req);
+ 
+-	link = nla_nest_start(skb, TIPC_NLA_LINK);
++	link = nla_nest_start_noflag(skb, TIPC_NLA_LINK);
+ 	if (!link)
+ 		return -EMSGSIZE;
+ 
+ 	if (nla_put_string(skb, TIPC_NLA_LINK_NAME, lc->name))
+ 		return -EMSGSIZE;
+ 
+-	prop = nla_nest_start(skb, TIPC_NLA_LINK_PROP);
++	prop = nla_nest_start_noflag(skb, TIPC_NLA_LINK_PROP);
+ 	if (!prop)
+ 		return -EMSGSIZE;
+ 
+@@ -814,7 +814,7 @@ static int tipc_nl_compat_link_reset_stats(struct tipc_nl_compat_cmd_doit *cmd,
+ 
+ 	name = (char *)TLV_DATA(msg->req);
+ 
+-	link = nla_nest_start(skb, TIPC_NLA_LINK);
++	link = nla_nest_start_noflag(skb, TIPC_NLA_LINK);
+ 	if (!link)
+ 		return -EMSGSIZE;
+ 
+@@ -976,7 +976,7 @@ static int tipc_nl_compat_publ_dump(struct tipc_nl_compat_msg *msg, u32 sock)
+ 		return -EMSGSIZE;
+ 	}
+ 
+-	nest = nla_nest_start(args, TIPC_NLA_SOCK);
++	nest = nla_nest_start_noflag(args, TIPC_NLA_SOCK);
+ 	if (!nest) {
+ 		kfree_skb(args);
+ 		return -EMSGSIZE;
+@@ -1103,7 +1103,7 @@ static int tipc_nl_compat_net_set(struct tipc_nl_compat_cmd_doit *cmd,
+ 
+ 	val = ntohl(*(__be32 *)TLV_DATA(msg->req));
+ 
+-	net = nla_nest_start(skb, TIPC_NLA_NET);
++	net = nla_nest_start_noflag(skb, TIPC_NLA_NET);
+ 	if (!net)
+ 		return -EMSGSIZE;
+ 
+diff --git a/net/tipc/node.c b/net/tipc/node.c
+index 548f7a0a9670..38cbd9974ad9 100644
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@ -1397,7 +1397,7 @@ static int __tipc_nl_add_node(struct tipc_nl_msg *msg, struct tipc_node *node)
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_NODE);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_NODE);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+@@ -2394,7 +2394,7 @@ static int __tipc_nl_add_monitor_prop(struct net *net, struct tipc_nl_msg *msg)
+ 	if (!hdr)
+ 		return -EMSGSIZE;
+ 
+-	attrs = nla_nest_start(msg->skb, TIPC_NLA_MON);
++	attrs = nla_nest_start_noflag(msg->skb, TIPC_NLA_MON);
+ 	if (!attrs)
+ 		goto msg_full;
+ 
+diff --git a/net/tipc/socket.c b/net/tipc/socket.c
+index 57c8f2459016..b5a472be647c 100644
+--- a/net/tipc/socket.c
++++ b/net/tipc/socket.c
+@@ -3272,7 +3272,7 @@ static int __tipc_nl_add_sk_con(struct sk_buff *skb, struct tipc_sock *tsk)
+ 	peer_node = tsk_peer_node(tsk);
+ 	peer_port = tsk_peer_port(tsk);
+ 
+-	nest = nla_nest_start(skb, TIPC_NLA_SOCK_CON);
++	nest = nla_nest_start_noflag(skb, TIPC_NLA_SOCK_CON);
+ 	if (!nest)
+ 		return -EMSGSIZE;
+ 
+@@ -3331,7 +3331,7 @@ static int __tipc_nl_add_sk(struct sk_buff *skb, struct netlink_callback *cb,
+ 	if (!hdr)
+ 		goto msg_cancel;
+ 
+-	attrs = nla_nest_start(skb, TIPC_NLA_SOCK);
++	attrs = nla_nest_start_noflag(skb, TIPC_NLA_SOCK);
+ 	if (!attrs)
+ 		goto genlmsg_cancel;
+ 
+@@ -3436,7 +3436,7 @@ int tipc_sk_fill_sock_diag(struct sk_buff *skb, struct netlink_callback *cb,
+ 	if (!(sk_filter_state & (1 << sk->sk_state)))
+ 		return 0;
+ 
+-	attrs = nla_nest_start(skb, TIPC_NLA_SOCK);
++	attrs = nla_nest_start_noflag(skb, TIPC_NLA_SOCK);
+ 	if (!attrs)
+ 		goto msg_cancel;
+ 
+@@ -3454,7 +3454,7 @@ int tipc_sk_fill_sock_diag(struct sk_buff *skb, struct netlink_callback *cb,
+ 			      TIPC_NLA_SOCK_PAD))
+ 		goto attr_msg_cancel;
+ 
+-	stat = nla_nest_start(skb, TIPC_NLA_SOCK_STAT);
++	stat = nla_nest_start_noflag(skb, TIPC_NLA_SOCK_STAT);
+ 	if (!stat)
+ 		goto attr_msg_cancel;
+ 
+@@ -3511,7 +3511,7 @@ static int __tipc_nl_add_sk_publ(struct sk_buff *skb,
+ 	if (!hdr)
+ 		goto msg_cancel;
+ 
+-	attrs = nla_nest_start(skb, TIPC_NLA_PUBL);
++	attrs = nla_nest_start_noflag(skb, TIPC_NLA_PUBL);
+ 	if (!attrs)
+ 		goto genlmsg_cancel;
+ 
+diff --git a/net/tipc/udp_media.c b/net/tipc/udp_media.c
+index fca0dcea0b75..2baebbe1652a 100644
+--- a/net/tipc/udp_media.c
++++ b/net/tipc/udp_media.c
+@@ -521,7 +521,7 @@ int tipc_udp_nl_add_bearer_data(struct tipc_nl_msg *msg, struct tipc_bearer *b)
+ 	if (!ub)
+ 		return -ENODEV;
+ 
+-	nest = nla_nest_start(msg->skb, TIPC_NLA_BEARER_UDP_OPTS);
++	nest = nla_nest_start_noflag(msg->skb, TIPC_NLA_BEARER_UDP_OPTS);
+ 	if (!nest)
+ 		goto msg_full;
+ 
