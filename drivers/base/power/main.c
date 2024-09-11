@@ -569,8 +569,7 @@ static void dpm_watchdog_clear(struct dpm_watchdog *wd)
  *
  * Return:
  * - %false if the transition under way is RESTORE.
- * - The return value of dev_pm_smart_suspend_and_suspended() if the transition
- *   under way is THAW.
+ * - Return value of dev_pm_skip_suspend() if the transition under way is THAW.
  * - The logical negation of %power.must_resume otherwise (that is, when the
  *   transition under way is RESUME).
  */
@@ -580,7 +579,7 @@ bool dev_pm_skip_resume(struct device *dev)
 		return false;
 
 	if (pm_transition.event == PM_EVENT_THAW)
-		return dev_pm_smart_suspend_and_suspended(dev);
+		return dev_pm_skip_suspend(dev);
 
 	return !dev->power.must_resume;
 }
@@ -626,7 +625,7 @@ static int device_resume_noirq(struct device *dev, pm_message_t state, bool asyn
 	 */
 	if (skip_resume)
 		pm_runtime_set_suspended(dev);
-	else if (dev_pm_smart_suspend_and_suspended(dev))
+	else if (dev_pm_skip_suspend(dev))
 		pm_runtime_set_active(dev);
 
 	if (dev->pm_domain) {
@@ -1225,7 +1224,7 @@ static int __device_suspend_noirq(struct device *dev, pm_message_t state, bool a
 	if (callback)
 		goto Run;
 
-	if (dev_pm_smart_suspend_and_suspended(dev))
+	if (dev_pm_skip_suspend(dev))
 		goto Skip;
 
 	if (dev->driver && dev->driver->pm) {
@@ -1417,7 +1416,7 @@ static int __device_suspend_late(struct device *dev, pm_message_t state, bool as
 	if (callback)
 		goto Run;
 
-	if (dev_pm_smart_suspend_and_suspended(dev))
+	if (dev_pm_skip_suspend(dev))
 		goto Skip;
 
 	if (dev->driver && dev->driver->pm) {
@@ -2005,7 +2004,7 @@ void device_pm_check_callbacks(struct device *dev)
 	spin_unlock_irq(&dev->power.lock);
 }
 
-bool dev_pm_smart_suspend_and_suspended(struct device *dev)
+bool dev_pm_skip_suspend(struct device *dev)
 {
 	return dev_pm_test_driver_flags(dev, DPM_FLAG_SMART_SUSPEND) &&
 		pm_runtime_status_suspended(dev);
