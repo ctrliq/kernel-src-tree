@@ -1,0 +1,398 @@
+xprtrdma: Pull up sometimes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 614f3c96d7e5efd1c4dc699524857130a52c6a7f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/614f3c96.failed
+
+On some platforms, DMA mapping part of a page is more costly than
+copying bytes. Restore the pull-up code and use that when we
+think it's going to be faster. The heuristic for now is to pull-up
+when the size of the RPC message body fits in the buffer underlying
+the head iovec.
+
+Indeed, not involving the I/O MMU can help the RPC/RDMA transport
+scale better for tiny I/Os across more RDMA devices. This is because
+interaction with the I/O MMU is eliminated, as is handling a Send
+completion, for each of these small I/Os. Without the explicit
+unmapping, the NIC no longer needs to do a costly internal TLB shoot
+down for buffers that are just a handful of bytes.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 614f3c96d7e5efd1c4dc699524857130a52c6a7f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index c46eab8b8cd7,4ad88893e964..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -580,129 -663,152 +580,241 @@@ out_regbuf
+  	return false;
+  }
+  
+ -/* The tail iovec may include an XDR pad for the page list,
+ - * as well as additional content, and may not reside in the
+ - * same page as the head iovec.
+ +/* Prepare the Send SGEs. The head and tail iovec, and each entry
+ + * in the page list, gets its own SGE.
+   */
+ -static bool rpcrdma_prepare_tail_iov(struct rpcrdma_req *req,
+ +static bool rpcrdma_prepare_msg_sges(struct rpcrdma_xprt *r_xprt,
+ +				     struct rpcrdma_req *req,
+  				     struct xdr_buf *xdr,
+ -				     unsigned int page_base, unsigned int len)
+ +				     enum rpcrdma_chunktype rtype)
+  {
+  	struct rpcrdma_sendctx *sc = req->rl_sendctx;
+ -	struct ib_sge *sge = &sc->sc_sges[req->rl_wr.num_sge++];
+ +	unsigned int sge_no, page_base, len, remaining;
+  	struct rpcrdma_regbuf *rb = req->rl_sendbuf;
+ -	struct page *page = virt_to_page(xdr->tail[0].iov_base);
+ +	struct ib_sge *sge = sc->sc_sges;
+ +	struct page *page, **ppages;
+  
+++<<<<<<< HEAD
+ +	/* The head iovec is straightforward, as it is already
+ +	 * DMA-mapped. Sync the content that has changed.
+ +	 */
+ +	if (!rpcrdma_regbuf_dma_map(r_xprt, rb))
+ +		goto out_regbuf;
+ +	sc->sc_device = rdmab_device(rb);
+ +	sge_no = 1;
+ +	sge[sge_no].addr = rdmab_addr(rb);
+ +	sge[sge_no].length = xdr->head[0].iov_len;
+ +	sge[sge_no].lkey = rdmab_lkey(rb);
+ +	ib_dma_sync_single_for_device(rdmab_device(rb), sge[sge_no].addr,
+ +				      sge[sge_no].length, DMA_TO_DEVICE);
+++=======
++ 	sge->addr = ib_dma_map_page(rdmab_device(rb), page, page_base, len,
++ 				    DMA_TO_DEVICE);
++ 	if (ib_dma_mapping_error(rdmab_device(rb), sge->addr))
++ 		goto out_mapping_err;
++ 
++ 	sge->length = len;
++ 	sge->lkey = rdmab_lkey(rb);
++ 	++sc->sc_unmap_count;
++ 	return true;
++ 
++ out_mapping_err:
++ 	trace_xprtrdma_dma_maperr(sge->addr);
++ 	return false;
++ }
++ 
++ /* Copy the tail to the end of the head buffer.
++  */
++ static void rpcrdma_pullup_tail_iov(struct rpcrdma_xprt *r_xprt,
++ 				    struct rpcrdma_req *req,
++ 				    struct xdr_buf *xdr)
++ {
++ 	unsigned char *dst;
++ 
++ 	dst = (unsigned char *)xdr->head[0].iov_base;
++ 	dst += xdr->head[0].iov_len + xdr->page_len;
++ 	memmove(dst, xdr->tail[0].iov_base, xdr->tail[0].iov_len);
++ 	r_xprt->rx_stats.pullup_copy_count += xdr->tail[0].iov_len;
++ }
++ 
++ /* Copy pagelist content into the head buffer.
++  */
++ static void rpcrdma_pullup_pagelist(struct rpcrdma_xprt *r_xprt,
++ 				    struct rpcrdma_req *req,
++ 				    struct xdr_buf *xdr)
++ {
++ 	unsigned int len, page_base, remaining;
++ 	struct page **ppages;
++ 	unsigned char *src, *dst;
++ 
++ 	dst = (unsigned char *)xdr->head[0].iov_base;
++ 	dst += xdr->head[0].iov_len;
++ 	ppages = xdr->pages + (xdr->page_base >> PAGE_SHIFT);
++ 	page_base = offset_in_page(xdr->page_base);
++ 	remaining = xdr->page_len;
++ 	while (remaining) {
++ 		src = page_address(*ppages);
++ 		src += page_base;
++ 		len = min_t(unsigned int, PAGE_SIZE - page_base, remaining);
++ 		memcpy(dst, src, len);
++ 		r_xprt->rx_stats.pullup_copy_count += len;
++ 
++ 		ppages++;
++ 		dst += len;
++ 		remaining -= len;
++ 		page_base = 0;
++ 	}
++ }
++ 
++ /* Copy the contents of @xdr into @rl_sendbuf and DMA sync it.
++  * When the head, pagelist, and tail are small, a pull-up copy
++  * is considerably less costly than DMA mapping the components
++  * of @xdr.
++  *
++  * Assumptions:
++  *  - the caller has already verified that the total length
++  *    of the RPC Call body will fit into @rl_sendbuf.
++  */
++ static bool rpcrdma_prepare_noch_pullup(struct rpcrdma_xprt *r_xprt,
++ 					struct rpcrdma_req *req,
++ 					struct xdr_buf *xdr)
++ {
++ 	if (unlikely(xdr->tail[0].iov_len))
++ 		rpcrdma_pullup_tail_iov(r_xprt, req, xdr);
++ 
++ 	if (unlikely(xdr->page_len))
++ 		rpcrdma_pullup_pagelist(r_xprt, req, xdr);
++ 
++ 	/* The whole RPC message resides in the head iovec now */
++ 	return rpcrdma_prepare_head_iov(r_xprt, req, xdr->len);
++ }
++ 
++ static bool rpcrdma_prepare_noch_mapped(struct rpcrdma_xprt *r_xprt,
++ 					struct rpcrdma_req *req,
++ 					struct xdr_buf *xdr)
++ {
++ 	struct kvec *tail = &xdr->tail[0];
++ 
++ 	if (!rpcrdma_prepare_head_iov(r_xprt, req, xdr->head[0].iov_len))
++ 		return false;
++ 	if (xdr->page_len)
++ 		if (!rpcrdma_prepare_pagelist(req, xdr))
++ 			return false;
++ 	if (tail->iov_len)
++ 		if (!rpcrdma_prepare_tail_iov(req, xdr,
++ 					      offset_in_page(tail->iov_base),
++ 					      tail->iov_len))
++ 			return false;
++ 
++ 	if (req->rl_sendctx->sc_unmap_count)
++ 		kref_get(&req->rl_kref);
++ 	return true;
++ }
++ 
++ static bool rpcrdma_prepare_readch(struct rpcrdma_xprt *r_xprt,
++ 				   struct rpcrdma_req *req,
++ 				   struct xdr_buf *xdr)
++ {
++ 	if (!rpcrdma_prepare_head_iov(r_xprt, req, xdr->head[0].iov_len))
++ 		return false;
+++>>>>>>> 614f3c96d7e5 (xprtrdma: Pull up sometimes)
+  
+  	/* If there is a Read chunk, the page list is being handled
+ -	 * via explicit RDMA, and thus is skipped here.
+ +	 * via explicit RDMA, and thus is skipped here. However, the
+ +	 * tail iovec may include an XDR pad for the page list, as
+ +	 * well as additional content, and may not reside in the
+ +	 * same page as the head iovec.
+  	 */
+ +	if (rtype == rpcrdma_readch) {
+ +		len = xdr->tail[0].iov_len;
+  
+ -	/* Do not include the tail if it is only an XDR pad */
+ -	if (xdr->tail[0].iov_len > 3) {
+ -		unsigned int page_base, len;
+ +		/* Do not include the tail if it is only an XDR pad */
+ +		if (len < 4)
+ +			goto out;
+ +
+ +		page = virt_to_page(xdr->tail[0].iov_base);
+ +		page_base = offset_in_page(xdr->tail[0].iov_base);
+  
+  		/* If the content in the page list is an odd length,
+ -		 * xdr_write_pages() adds a pad at the beginning of
+ -		 * the tail iovec. Force the tail's non-pad content to
+ -		 * land at the next XDR position in the Send message.
+ +		 * xdr_write_pages() has added a pad at the beginning
+ +		 * of the tail iovec. Force the tail's non-pad content
+ +		 * to land at the next XDR position in the Send message.
+  		 */
+ -		page_base = offset_in_page(xdr->tail[0].iov_base);
+ -		len = xdr->tail[0].iov_len;
+  		page_base += len & 3;
+  		len -= len & 3;
+ -		if (!rpcrdma_prepare_tail_iov(req, xdr, page_base, len))
+ -			return false;
+ -		kref_get(&req->rl_kref);
+ +		goto map_tail;
+ +	}
+ +
+ +	/* If there is a page list present, temporarily DMA map
+ +	 * and prepare an SGE for each page to be sent.
+ +	 */
+ +	if (xdr->page_len) {
+ +		ppages = xdr->pages + (xdr->page_base >> PAGE_SHIFT);
+ +		page_base = offset_in_page(xdr->page_base);
+ +		remaining = xdr->page_len;
+ +		while (remaining) {
+ +			sge_no++;
+ +			if (sge_no > RPCRDMA_MAX_SEND_SGES - 2)
+ +				goto out_mapping_overflow;
+ +
+ +			len = min_t(u32, PAGE_SIZE - page_base, remaining);
+ +			sge[sge_no].addr =
+ +				ib_dma_map_page(rdmab_device(rb), *ppages,
+ +						page_base, len, DMA_TO_DEVICE);
+ +			if (ib_dma_mapping_error(rdmab_device(rb),
+ +						 sge[sge_no].addr))
+ +				goto out_mapping_err;
+ +			sge[sge_no].length = len;
+ +			sge[sge_no].lkey = rdmab_lkey(rb);
+ +
+ +			sc->sc_unmap_count++;
+ +			ppages++;
+ +			remaining -= len;
+ +			page_base = 0;
+ +		}
+  	}
+  
+ +	/* The tail iovec is not always constructed in the same
+ +	 * page where the head iovec resides (see, for example,
+ +	 * gss_wrap_req_priv). To neatly accommodate that case,
+ +	 * DMA map it separately.
+ +	 */
+ +	if (xdr->tail[0].iov_len) {
+ +		page = virt_to_page(xdr->tail[0].iov_base);
+ +		page_base = offset_in_page(xdr->tail[0].iov_base);
+ +		len = xdr->tail[0].iov_len;
+ +
+ +map_tail:
+ +		sge_no++;
+ +		sge[sge_no].addr =
+ +			ib_dma_map_page(rdmab_device(rb), page, page_base, len,
+ +					DMA_TO_DEVICE);
+ +		if (ib_dma_mapping_error(rdmab_device(rb), sge[sge_no].addr))
+ +			goto out_mapping_err;
+ +		sge[sge_no].length = len;
+ +		sge[sge_no].lkey = rdmab_lkey(rb);
+ +		sc->sc_unmap_count++;
+ +	}
+ +
+ +out:
+ +	req->rl_wr.num_sge += sge_no;
+ +	if (sc->sc_unmap_count)
+ +		kref_get(&req->rl_kref);
+  	return true;
+ +
+ +out_regbuf:
+ +	pr_err("rpcrdma: failed to DMA map a Send buffer\n");
+ +	return false;
+ +
+ +out_mapping_overflow:
+ +	rpcrdma_sendctx_unmap(sc);
+ +	pr_err("rpcrdma: too many Send SGEs (%u)\n", sge_no);
+ +	return false;
+ +
+ +out_mapping_err:
+ +	rpcrdma_sendctx_unmap(sc);
+ +	trace_xprtrdma_dma_maperr(sge[sge_no].addr);
+ +	return false;
+  }
+  
+  /**
+@@@ -736,13 -842,32 +848,37 @@@ rpcrdma_prepare_send_sges(struct rpcrdm
+  
+  	ret = -EIO;
+  	if (!rpcrdma_prepare_hdr_sge(r_xprt, req, hdrlen))
+++<<<<<<< HEAD
+ +		goto err;
+ +	if (rtype != rpcrdma_areadch)
+ +		if (!rpcrdma_prepare_msg_sges(r_xprt, req, xdr, rtype))
+ +			goto err;
+++=======
++ 		goto out_unmap;
++ 
++ 	switch (rtype) {
++ 	case rpcrdma_noch_pullup:
++ 		if (!rpcrdma_prepare_noch_pullup(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_noch_mapped:
++ 		if (!rpcrdma_prepare_noch_mapped(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_readch:
++ 		if (!rpcrdma_prepare_readch(r_xprt, req, xdr))
++ 			goto out_unmap;
++ 		break;
++ 	case rpcrdma_areadch:
++ 		break;
++ 	default:
++ 		goto out_unmap;
++ 	}
++ 
+++>>>>>>> 614f3c96d7e5 (xprtrdma: Pull up sometimes)
+  	return 0;
+  
+ -out_unmap:
+ -	rpcrdma_sendctx_unmap(req->rl_sendctx);
+ -out_nosc:
+ +err:
+  	trace_xprtrdma_prepsend_failed(&req->rl_slot, ret);
+  	return ret;
+  }
+diff --git a/include/trace/events/rpcrdma.h b/include/trace/events/rpcrdma.h
+index 80aac15e813a..70b4db982c1a 100644
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@ -471,6 +471,8 @@ DEFINE_WRCH_EVENT(write);
+ DEFINE_WRCH_EVENT(reply);
+ 
+ TRACE_DEFINE_ENUM(rpcrdma_noch);
++TRACE_DEFINE_ENUM(rpcrdma_noch_pullup);
++TRACE_DEFINE_ENUM(rpcrdma_noch_mapped);
+ TRACE_DEFINE_ENUM(rpcrdma_readch);
+ TRACE_DEFINE_ENUM(rpcrdma_areadch);
+ TRACE_DEFINE_ENUM(rpcrdma_writech);
+@@ -479,6 +481,8 @@ TRACE_DEFINE_ENUM(rpcrdma_replych);
+ #define xprtrdma_show_chunktype(x)					\
+ 		__print_symbolic(x,					\
+ 				{ rpcrdma_noch, "inline" },		\
++				{ rpcrdma_noch_pullup, "pullup" },	\
++				{ rpcrdma_noch_mapped, "mapped" },	\
+ 				{ rpcrdma_readch, "read list" },	\
+ 				{ rpcrdma_areadch, "*read list" },	\
+ 				{ rpcrdma_writech, "write list" },	\
+diff --git a/net/sunrpc/xprtrdma/backchannel.c b/net/sunrpc/xprtrdma/backchannel.c
+index a580572e3aff..37408b7ebd63 100644
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@ -74,7 +74,7 @@ static int rpcrdma_bc_marshal_reply(struct rpc_rqst *rqst)
+ 	*p = xdr_zero;
+ 
+ 	if (rpcrdma_prepare_send_sges(r_xprt, req, RPCRDMA_HDRLEN_MIN,
+-				      &rqst->rq_snd_buf, rpcrdma_noch))
++				      &rqst->rq_snd_buf, rpcrdma_noch_pullup))
+ 		return -EIO;
+ 
+ 	trace_xprtrdma_cb_reply(rqst);
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index b85547dfac69..c9938216396c 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -1112,7 +1112,7 @@ int rpcrdma_buffer_create(struct rpcrdma_xprt *r_xprt)
+ 	for (i = 0; i < buf->rb_max_requests; i++) {
+ 		struct rpcrdma_req *req;
+ 
+-		req = rpcrdma_req_create(r_xprt, RPCRDMA_V1_DEF_INLINE_SIZE,
++		req = rpcrdma_req_create(r_xprt, RPCRDMA_V1_DEF_INLINE_SIZE * 2,
+ 					 GFP_KERNEL);
+ 		if (!req)
+ 			goto out;
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index 550e60551656..a8d4c59fd387 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -567,6 +567,8 @@ void frwr_unmap_async(struct rpcrdma_xprt *r_xprt, struct rpcrdma_req *req);
+ 
+ enum rpcrdma_chunktype {
+ 	rpcrdma_noch = 0,
++	rpcrdma_noch_pullup,
++	rpcrdma_noch_mapped,
+ 	rpcrdma_readch,
+ 	rpcrdma_areadch,
+ 	rpcrdma_writech,
