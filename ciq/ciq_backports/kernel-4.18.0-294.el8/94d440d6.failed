@@ -1,0 +1,164 @@
+proc, time/namespace: Show clock symbolic names in /proc/pid/timens_offsets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrei Vagin <avagin@gmail.com>
+commit 94d440d618467806009c8edc70b094d64e12ee5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/94d440d6.failed
+
+Michael Kerrisk suggested to replace numeric clock IDs with symbolic names.
+
+Now the content of these files looks like this:
+$ cat /proc/774/timens_offsets
+monotonic      864000         0
+boottime      1728000         0
+
+For setting offsets, both representations of clocks (numeric and symbolic)
+can be used.
+
+As for compatibility, it is acceptable to change things as long as
+userspace doesn't care. The format of timens_offsets files is very new and
+there are no userspace tools yet which rely on this format.
+
+But three projects crun, util-linux and criu rely on the interface of
+setting time offsets and this is why it's required to continue supporting
+the numeric clock IDs on write.
+
+Fixes: 04a8682a71be ("fs/proc: Introduce /proc/pid/timens_offsets")
+	Suggested-by: Michael Kerrisk <mtk.manpages@gmail.com>
+	Signed-off-by: Andrei Vagin <avagin@gmail.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Michael Kerrisk <mtk.manpages@gmail.com>
+	Acked-by: Michael Kerrisk <mtk.manpages@gmail.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Eric W. Biederman <ebiederm@xmission.com>
+	Cc: Dmitry Safonov <0x7f454c46@gmail.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/20200411154031.642557-1-avagin@gmail.com
+(cherry picked from commit 94d440d618467806009c8edc70b094d64e12ee5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/proc/base.c
+#	kernel/time/namespace.c
+diff --cc fs/proc/base.c
+index 50a314a6a42b,572898dd16a0..000000000000
+--- a/fs/proc/base.c
++++ b/fs/proc/base.c
+@@@ -1515,6 -1535,108 +1515,111 @@@ static const struct file_operations pro
+  
+  #endif /* CONFIG_SCHED_AUTOGROUP */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_TIME_NS
++ static int timens_offsets_show(struct seq_file *m, void *v)
++ {
++ 	struct task_struct *p;
++ 
++ 	p = get_proc_task(file_inode(m->file));
++ 	if (!p)
++ 		return -ESRCH;
++ 	proc_timens_show_offsets(p, m);
++ 
++ 	put_task_struct(p);
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t timens_offsets_write(struct file *file, const char __user *buf,
++ 				    size_t count, loff_t *ppos)
++ {
++ 	struct inode *inode = file_inode(file);
++ 	struct proc_timens_offset offsets[2];
++ 	char *kbuf = NULL, *pos, *next_line;
++ 	struct task_struct *p;
++ 	int ret, noffsets;
++ 
++ 	/* Only allow < page size writes at the beginning of the file */
++ 	if ((*ppos != 0) || (count >= PAGE_SIZE))
++ 		return -EINVAL;
++ 
++ 	/* Slurp in the user data */
++ 	kbuf = memdup_user_nul(buf, count);
++ 	if (IS_ERR(kbuf))
++ 		return PTR_ERR(kbuf);
++ 
++ 	/* Parse the user data */
++ 	ret = -EINVAL;
++ 	noffsets = 0;
++ 	for (pos = kbuf; pos; pos = next_line) {
++ 		struct proc_timens_offset *off = &offsets[noffsets];
++ 		char clock[10];
++ 		int err;
++ 
++ 		/* Find the end of line and ensure we don't look past it */
++ 		next_line = strchr(pos, '\n');
++ 		if (next_line) {
++ 			*next_line = '\0';
++ 			next_line++;
++ 			if (*next_line == '\0')
++ 				next_line = NULL;
++ 		}
++ 
++ 		err = sscanf(pos, "%9s %lld %lu", clock,
++ 				&off->val.tv_sec, &off->val.tv_nsec);
++ 		if (err != 3 || off->val.tv_nsec >= NSEC_PER_SEC)
++ 			goto out;
++ 
++ 		clock[sizeof(clock) - 1] = 0;
++ 		if (strcmp(clock, "monotonic") == 0 ||
++ 		    strcmp(clock, __stringify(CLOCK_MONOTONIC)) == 0)
++ 			off->clockid = CLOCK_MONOTONIC;
++ 		else if (strcmp(clock, "boottime") == 0 ||
++ 			 strcmp(clock, __stringify(CLOCK_BOOTTIME)) == 0)
++ 			off->clockid = CLOCK_BOOTTIME;
++ 		else
++ 			goto out;
++ 
++ 		noffsets++;
++ 		if (noffsets == ARRAY_SIZE(offsets)) {
++ 			if (next_line)
++ 				count = next_line - kbuf;
++ 			break;
++ 		}
++ 	}
++ 
++ 	ret = -ESRCH;
++ 	p = get_proc_task(inode);
++ 	if (!p)
++ 		goto out;
++ 	ret = proc_timens_set_offset(file, p, offsets, noffsets);
++ 	put_task_struct(p);
++ 	if (ret)
++ 		goto out;
++ 
++ 	ret = count;
++ out:
++ 	kfree(kbuf);
++ 	return ret;
++ }
++ 
++ static int timens_offsets_open(struct inode *inode, struct file *filp)
++ {
++ 	return single_open(filp, timens_offsets_show, inode);
++ }
++ 
++ static const struct file_operations proc_timens_offsets_operations = {
++ 	.open		= timens_offsets_open,
++ 	.read		= seq_read,
++ 	.write		= timens_offsets_write,
++ 	.llseek		= seq_lseek,
++ 	.release	= single_release,
++ };
++ #endif /* CONFIG_TIME_NS */
++ 
+++>>>>>>> 94d440d61846 (proc, time/namespace: Show clock symbolic names in /proc/pid/timens_offsets)
+  static ssize_t comm_write(struct file *file, const char __user *buf,
+  				size_t count, loff_t *offset)
+  {
+* Unmerged path kernel/time/namespace.c
+* Unmerged path fs/proc/base.c
+* Unmerged path kernel/time/namespace.c
