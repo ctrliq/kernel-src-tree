@@ -1,0 +1,208 @@
+io_uring: make timeout sequence == 0 mean no sequence
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 93bd25bb69f46367ba8f82c578e0c05702ceb482
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/93bd25bb.failed
+
+Currently we make sequence == 0 be the same as sequence == 1, but that's
+not super useful if the intent is really to have a timeout that's just
+a pure timeout.
+
+If the user passes in sqe->off == 0, then don't apply any sequence logic
+to the request, let it purely be driven by the timeout specified.
+
+	Reported-by: 李通洲 <carter.li@eoitek.com>
+	Reviewed-by: 李通洲 <carter.li@eoitek.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 93bd25bb69f46367ba8f82c578e0c05702ceb482)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,87beca4377f7..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -337,6 -323,10 +337,13 @@@ struct io_kiocb 
+  #define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+  #define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++<<<<<<< HEAD
+++=======
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_TIMEOUT_NOSEQ	8192	/* no timeout sequence */
+++>>>>>>> 93bd25bb69f4 (io_uring: make timeout sequence == 0 mean no sequence)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -440,13 -440,27 +447,31 @@@ static struct io_kiocb *io_get_deferred
+  {
+  	struct io_kiocb *req;
+  
+ -	req = list_first_entry_or_null(&ctx->defer_list, struct io_kiocb, list);
+ -	if (req && !io_sequence_defer(ctx, req)) {
+ +	if (list_empty(&ctx->defer_list))
+ +		return NULL;
+ +
+++<<<<<<< HEAD
+ +	req = list_first_entry(&ctx->defer_list, struct io_kiocb, list);
+ +	if (!io_sequence_defer(ctx, req)) {
+  		list_del_init(&req->list);
+  		return req;
+ -	}
+ -
+++=======
++ 	return NULL;
++ }
++ 
++ static struct io_kiocb *io_get_timeout_req(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req;
++ 
++ 	req = list_first_entry_or_null(&ctx->timeout_list, struct io_kiocb, list);
++ 	if (req) {
++ 		if (req->flags & REQ_F_TIMEOUT_NOSEQ)
++ 			return NULL;
++ 		if (!__io_sequence_defer(ctx, req)) {
++ 			list_del_init(&req->list);
++ 			return req;
++ 		}
+++>>>>>>> 93bd25bb69f4 (io_uring: make timeout sequence == 0 mean no sequence)
+  	}
+  
+  	return NULL;
+@@@ -1838,6 -1897,124 +1863,127 @@@ static int io_poll_add(struct io_kiocb 
+  	return ipt.error;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static enum hrtimer_restart io_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_ring_ctx *ctx;
++ 	struct io_kiocb *req, *prev;
++ 	unsigned long flags;
++ 
++ 	req = container_of(timer, struct io_kiocb, timeout.timer);
++ 	ctx = req->ctx;
++ 	atomic_inc(&ctx->cq_timeouts);
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 	/*
++ 	 * Adjust the reqs sequence before the current one because it
++ 	 * will consume a slot in the cq_ring and the the cq_tail pointer
++ 	 * will be increased, otherwise other timeout reqs may return in
++ 	 * advance without waiting for enough wait_nr.
++ 	 */
++ 	prev = req;
++ 	list_for_each_entry_continue_reverse(prev, &ctx->timeout_list, list)
++ 		prev->sequence++;
++ 	list_del(&req->list);
++ 
++ 	io_cqring_fill_event(ctx, req->user_data, -ETIME);
++ 	io_commit_cqring(ctx);
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	io_cqring_ev_posted(ctx);
++ 
++ 	io_put_req(req);
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static int io_timeout(struct io_kiocb *req, const struct io_uring_sqe *sqe)
++ {
++ 	unsigned count;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct list_head *entry;
++ 	struct timespec64 ts;
++ 	unsigned span = 0;
++ 
++ 	if (unlikely(ctx->flags & IORING_SETUP_IOPOLL))
++ 		return -EINVAL;
++ 	if (sqe->flags || sqe->ioprio || sqe->buf_index || sqe->timeout_flags ||
++ 	    sqe->len != 1)
++ 		return -EINVAL;
++ 
++ 	if (get_timespec64(&ts, u64_to_user_ptr(sqe->addr)))
++ 		return -EFAULT;
++ 
++ 	req->flags |= REQ_F_TIMEOUT;
++ 
++ 	/*
++ 	 * sqe->off holds how many events that need to occur for this
++ 	 * timeout event to be satisfied. If it isn't set, then this is
++ 	 * a pure timeout request, sequence isn't used.
++ 	 */
++ 	count = READ_ONCE(sqe->off);
++ 	if (!count) {
++ 		req->flags |= REQ_F_TIMEOUT_NOSEQ;
++ 		spin_lock_irq(&ctx->completion_lock);
++ 		entry = ctx->timeout_list.prev;
++ 		goto add;
++ 	}
++ 
++ 	req->sequence = ctx->cached_sq_head + count - 1;
++ 	/* reuse it to store the count */
++ 	req->submit.sequence = count;
++ 
++ 	/*
++ 	 * Insertion sort, ensuring the first entry in the list is always
++ 	 * the one we need first.
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_prev(entry, &ctx->timeout_list) {
++ 		struct io_kiocb *nxt = list_entry(entry, struct io_kiocb, list);
++ 		unsigned nxt_sq_head;
++ 		long long tmp, tmp_nxt;
++ 
++ 		if (nxt->flags & REQ_F_TIMEOUT_NOSEQ)
++ 			continue;
++ 
++ 		/*
++ 		 * Since cached_sq_head + count - 1 can overflow, use type long
++ 		 * long to store it.
++ 		 */
++ 		tmp = (long long)ctx->cached_sq_head + count - 1;
++ 		nxt_sq_head = nxt->sequence - nxt->submit.sequence + 1;
++ 		tmp_nxt = (long long)nxt_sq_head + nxt->submit.sequence - 1;
++ 
++ 		/*
++ 		 * cached_sq_head may overflow, and it will never overflow twice
++ 		 * once there is some timeout req still be valid.
++ 		 */
++ 		if (ctx->cached_sq_head < nxt_sq_head)
++ 			tmp += UINT_MAX;
++ 
++ 		if (tmp > tmp_nxt)
++ 			break;
++ 
++ 		/*
++ 		 * Sequence of reqs after the insert one and itself should
++ 		 * be adjusted because each timeout req consumes a slot.
++ 		 */
++ 		span++;
++ 		nxt->sequence++;
++ 	}
++ 	req->sequence -= span;
++ add:
++ 	list_add(&req->list, entry);
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	hrtimer_init(&req->timeout.timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
++ 	req->timeout.timer.function = io_timeout_fn;
++ 	hrtimer_start(&req->timeout.timer, timespec64_to_ktime(ts),
++ 			HRTIMER_MODE_REL);
++ 	return 0;
++ }
++ 
+++>>>>>>> 93bd25bb69f4 (io_uring: make timeout sequence == 0 mean no sequence)
+  static int io_req_defer(struct io_ring_ctx *ctx, struct io_kiocb *req,
+  			const struct io_uring_sqe *sqe)
+  {
+* Unmerged path fs/io_uring.c
