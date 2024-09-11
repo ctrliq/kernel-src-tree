@@ -1,0 +1,207 @@
+drm/i915: Push MST link retraining to the hotplug work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit f0617ff0b89416d5e15e14c22489ae3013d343fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f0617ff0.failed
+
+We shouldn't try to do link retraining from the short hpd handler.
+We can't take any modeset locks there so this is racy as hell.
+Push the whole thing into the hotplug work like we do with SST.
+
+We'll just have to adjust the SST retraining code to deal with
+the MST encoders and multiple pipes.
+
+TODO: I have a feeling we should just rip this all out and
+do a full modeset instead. Stuff like port sync and the tgl+
+MST master transcoder stuff maybe doesn't work well if we
+try to retrain without following the proper modeset sequence.
+So far haven't done any actual tests to confirm that though.
+
+	Cc: Lyude Paul <lyude@redhat.com>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200417152734.464-2-ville.syrjala@linux.intel.com
+	Reviewed-by: Lyude Paul <lyude@redhat.com>
+(cherry picked from commit f0617ff0b89416d5e15e14c22489ae3013d343fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_dp.c
+diff --cc drivers/gpu/drm/i915/display/intel_dp.c
+index 9ec0808f141e,ec1157858ac5..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_dp.c
++++ b/drivers/gpu/drm/i915/display/intel_dp.c
+@@@ -4720,58 -5624,52 +4720,78 @@@ update_status
+  static int
+  intel_dp_check_mst_status(struct intel_dp *intel_dp)
+  {
+++<<<<<<< HEAD
+ +	bool bret;
+++=======
++ 	struct drm_i915_private *i915 = dp_to_i915(intel_dp);
++ 	bool need_retrain = false;
+++>>>>>>> f0617ff0b894 (drm/i915: Push MST link retraining to the hotplug work)
+  
+ -	if (!intel_dp->is_mst)
+ -		return -EINVAL;
+ -
+ -	WARN_ON_ONCE(intel_dp->active_mst_links < 0);
+ -
+ -	for (;;) {
+ -		u8 esi[DP_DPRX_ESI_LEN] = {};
+ -		bool bret, handled;
+ +	if (intel_dp->is_mst) {
+ +		u8 esi[DP_DPRX_ESI_LEN] = { 0 };
+ +		int ret = 0;
+  		int retry;
+ +		bool handled;
+  
+ +		WARN_ON_ONCE(intel_dp->active_mst_links < 0);
+  		bret = intel_dp_get_sink_irq_esi(intel_dp, esi);
+ -		if (!bret) {
+ -			drm_dbg_kms(&i915->drm,
+ -				    "failed to get ESI - device may have failed\n");
+ -			return -EINVAL;
+ -		}
+ -
+ +go_again:
+ +		if (bret == true) {
+ +
+++<<<<<<< HEAD
+ +			/* check link status - esi[10] = 0x200c */
+ +			if (intel_dp->active_mst_links > 0 &&
+ +			    !drm_dp_channel_eq_ok(&esi[10], intel_dp->lane_count)) {
+ +				DRM_DEBUG_KMS("channel EQ not ok, retraining\n");
+ +				intel_dp_start_link_train(intel_dp);
+ +				intel_dp_stop_link_train(intel_dp);
+ +			}
+++=======
++ 		/* check link status - esi[10] = 0x200c */
++ 		if (intel_dp->active_mst_links > 0 && !need_retrain &&
++ 		    !drm_dp_channel_eq_ok(&esi[10], intel_dp->lane_count)) {
++ 			drm_dbg_kms(&i915->drm,
++ 				    "channel EQ not ok, retraining\n");
++ 			need_retrain = true;
++ 		}
+++>>>>>>> f0617ff0b894 (drm/i915: Push MST link retraining to the hotplug work)
+ +
+ +			DRM_DEBUG_KMS("got esi %3ph\n", esi);
+ +			ret = drm_dp_mst_hpd_irq(&intel_dp->mst_mgr, esi, &handled);
+ +
+ +			if (handled) {
+ +				for (retry = 0; retry < 3; retry++) {
+ +					int wret;
+ +					wret = drm_dp_dpcd_write(&intel_dp->aux,
+ +								 DP_SINK_COUNT_ESI+1,
+ +								 &esi[1], 3);
+ +					if (wret == 3) {
+ +						break;
+ +					}
+ +				}
+  
+ -		drm_dbg_kms(&i915->drm, "got esi %3ph\n", esi);
+ -
+ -		drm_dp_mst_hpd_irq(&intel_dp->mst_mgr, esi, &handled);
+ -		if (!handled)
+ -			break;
+ -
+ -		for (retry = 0; retry < 3; retry++) {
+ -			int wret;
+ +				bret = intel_dp_get_sink_irq_esi(intel_dp, esi);
+ +				if (bret == true) {
+ +					DRM_DEBUG_KMS("got esi2 %3ph\n", esi);
+ +					goto go_again;
+ +				}
+ +			} else
+ +				ret = 0;
+  
+ -			wret = drm_dp_dpcd_write(&intel_dp->aux,
+ -						 DP_SINK_COUNT_ESI+1,
+ -						 &esi[1], 3);
+ -			if (wret == 3)
+ -				break;
+ +			return ret;
+ +		} else {
+ +			DRM_DEBUG_KMS("failed to get ESI - device may have failed\n");
+ +			intel_dp->is_mst = false;
+ +			drm_dp_mst_topology_mgr_set_mst(&intel_dp->mst_mgr,
+ +							intel_dp->is_mst);
+  		}
+  	}
+++<<<<<<< HEAD
+ +	return -EINVAL;
+++=======
++ 
++ 	return need_retrain;
+++>>>>>>> f0617ff0b894 (drm/i915: Push MST link retraining to the hotplug work)
+  }
+  
+  static bool
+@@@ -4812,16 -5796,12 +4918,19 @@@ int intel_dp_retrain_link(struct intel_
+  			  struct drm_modeset_acquire_ctx *ctx)
+  {
+  	struct drm_i915_private *dev_priv = to_i915(encoder->base.dev);
+++<<<<<<< HEAD
+ +	struct intel_dp *intel_dp = enc_to_intel_dp(&encoder->base);
+ +	struct intel_connector *connector = intel_dp->attached_connector;
+ +	struct drm_connector_state *conn_state;
+ +	struct intel_crtc_state *crtc_state;
+++=======
++ 	struct intel_dp *intel_dp = enc_to_intel_dp(encoder);
+++>>>>>>> f0617ff0b894 (drm/i915: Push MST link retraining to the hotplug work)
+  	struct intel_crtc *crtc;
++ 	u32 crtc_mask;
+  	int ret;
+  
+- 	/* FIXME handle the MST connectors as well */
+- 
+- 	if (!connector || connector->base.status != connector_status_connected)
++ 	if (!intel_dp_is_connected(intel_dp))
+  		return 0;
+  
+  	ret = drm_modeset_lock(&dev_priv->drm.mode_config.connection_mutex,
+@@@ -4839,25 -5813,22 +4942,30 @@@
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	crtc_state = to_intel_crtc_state(crtc->base.state);
+ +
+ +	WARN_ON(!intel_crtc_has_dp_encoder(crtc_state));
+ +
+ +	if (!crtc_state->base.active)
+++=======
++ 	if (crtc_mask == 0)
+++>>>>>>> f0617ff0b894 (drm/i915: Push MST link retraining to the hotplug work)
+  		return 0;
+  
+- 	if (conn_state->commit &&
+- 	    !try_wait_for_completion(&conn_state->commit->hw_done))
+- 		return 0;
++ 	drm_dbg_kms(&dev_priv->drm, "[ENCODER:%d:%s] retraining link\n",
++ 		    encoder->base.base.id, encoder->base.name);
+  
+- 	if (!intel_dp_needs_link_retrain(intel_dp))
+- 		return 0;
++ 	for_each_intel_crtc_mask(&dev_priv->drm, crtc, crtc_mask) {
++ 		const struct intel_crtc_state *crtc_state =
++ 			to_intel_crtc_state(crtc->base.state);
+  
+- 	/* Suppress underruns caused by re-training */
+- 	intel_set_cpu_fifo_underrun_reporting(dev_priv, crtc->pipe, false);
+- 	if (crtc_state->has_pch_encoder)
+- 		intel_set_pch_fifo_underrun_reporting(dev_priv,
+- 						      intel_crtc_pch_transcoder(crtc), false);
++ 		/* Suppress underruns caused by re-training */
++ 		intel_set_cpu_fifo_underrun_reporting(dev_priv, crtc->pipe, false);
++ 		if (crtc_state->has_pch_encoder)
++ 			intel_set_pch_fifo_underrun_reporting(dev_priv,
++ 							      intel_crtc_pch_transcoder(crtc), false);
++ 	}
+  
+  	intel_dp_start_link_train(intel_dp);
+  	intel_dp_stop_link_train(intel_dp);
+* Unmerged path drivers/gpu/drm/i915/display/intel_dp.c
