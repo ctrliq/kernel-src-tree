@@ -1,0 +1,137 @@
+XArray: Fix xas_next() with a single entry at 0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 91abab83839aa2eba073e4a63c729832fdb27ea1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/91abab83.failed
+
+If there is only a single entry at 0, the first time we call xas_next(),
+we return the entry.  Unfortunately, all subsequent times we call
+xas_next(), we also return the entry at 0 instead of noticing that the
+xa_index is now greater than zero.  This broke find_get_pages_contig().
+
+Fixes: 64d3e9a9e0cc ("xarray: Step through an XArray")
+	Reported-by: Kent Overstreet <kent.overstreet@gmail.com>
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+(cherry picked from commit 91abab83839aa2eba073e4a63c729832fdb27ea1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_xarray.c
+diff --cc lib/test_xarray.c
+index 0436f0c804e5,7df4f7f395bf..000000000000
+--- a/lib/test_xarray.c
++++ b/lib/test_xarray.c
+@@@ -978,6 -1055,83 +978,86 @@@ static noinline void check_find(struct 
+  	check_multi_find_2(xa);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* See find_swap_entry() in mm/shmem.c */
++ static noinline unsigned long xa_find_entry(struct xarray *xa, void *item)
++ {
++ 	XA_STATE(xas, xa, 0);
++ 	unsigned int checked = 0;
++ 	void *entry;
++ 
++ 	rcu_read_lock();
++ 	xas_for_each(&xas, entry, ULONG_MAX) {
++ 		if (xas_retry(&xas, entry))
++ 			continue;
++ 		if (entry == item)
++ 			break;
++ 		checked++;
++ 		if ((checked % 4) != 0)
++ 			continue;
++ 		xas_pause(&xas);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return entry ? xas.xa_index : -1;
++ }
++ 
++ static noinline void check_find_entry(struct xarray *xa)
++ {
++ #ifdef CONFIG_XARRAY_MULTI
++ 	unsigned int order;
++ 	unsigned long offset, index;
++ 
++ 	for (order = 0; order < 20; order++) {
++ 		for (offset = 0; offset < (1UL << (order + 3));
++ 		     offset += (1UL << order)) {
++ 			for (index = 0; index < (1UL << (order + 5));
++ 			     index += (1UL << order)) {
++ 				xa_store_order(xa, index, order,
++ 						xa_mk_index(index), GFP_KERNEL);
++ 				XA_BUG_ON(xa, xa_load(xa, index) !=
++ 						xa_mk_index(index));
++ 				XA_BUG_ON(xa, xa_find_entry(xa,
++ 						xa_mk_index(index)) != index);
++ 			}
++ 			XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 			xa_destroy(xa);
++ 		}
++ 	}
++ #endif
++ 
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 	xa_store_index(xa, ULONG_MAX, GFP_KERNEL);
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa) != -1);
++ 	XA_BUG_ON(xa, xa_find_entry(xa, xa_mk_index(ULONG_MAX)) != -1);
++ 	xa_erase_index(xa, ULONG_MAX);
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
++ static noinline void check_move_tiny(struct xarray *xa)
++ {
++ 	XA_STATE(xas, xa, 0);
++ 
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ 	rcu_read_lock();
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	rcu_read_unlock();
++ 	xa_store_index(xa, 0, GFP_KERNEL);
++ 	rcu_read_lock();
++ 	xas_set(&xas, 0);
++ 	XA_BUG_ON(xa, xas_next(&xas) != xa_mk_index(0));
++ 	XA_BUG_ON(xa, xas_next(&xas) != NULL);
++ 	xas_set(&xas, 0);
++ 	XA_BUG_ON(xa, xas_prev(&xas) != xa_mk_index(0));
++ 	XA_BUG_ON(xa, xas_prev(&xas) != NULL);
++ 	rcu_read_unlock();
++ 	xa_erase_index(xa, 0);
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
+++>>>>>>> 91abab83839a (XArray: Fix xas_next() with a single entry at 0)
+  static noinline void check_move_small(struct xarray *xa, unsigned long idx)
+  {
+  	XA_STATE(xas, xa, 0);
+* Unmerged path lib/test_xarray.c
+diff --git a/lib/xarray.c b/lib/xarray.c
+index 3fdc1d4bf44d..5df3c8a1e21c 100644
+--- a/lib/xarray.c
++++ b/lib/xarray.c
+@@ -994,6 +994,8 @@ void *__xas_prev(struct xa_state *xas)
+ 
+ 	if (!xas_frozen(xas->xa_node))
+ 		xas->xa_index--;
++	if (!xas->xa_node)
++		return set_bounds(xas);
+ 	if (xas_not_node(xas->xa_node))
+ 		return xas_load(xas);
+ 
+@@ -1031,6 +1033,8 @@ void *__xas_next(struct xa_state *xas)
+ 
+ 	if (!xas_frozen(xas->xa_node))
+ 		xas->xa_index++;
++	if (!xas->xa_node)
++		return set_bounds(xas);
+ 	if (xas_not_node(xas->xa_node))
+ 		return xas_load(xas);
+ 
