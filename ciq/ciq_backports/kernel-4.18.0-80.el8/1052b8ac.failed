@@ -1,0 +1,308 @@
+blk-mq: when polling for IO, look for any completion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 1052b8ac5282daf35df331edcbdb645839d17e6a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/1052b8ac.failed
+
+If we want to support async IO polling, then we have to allow finding
+completions that aren't just for the one we are looking for. Always pass
+in -1 to the mq_ops->poll() helper, and have that return how many events
+were found in this poll loop.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 1052b8ac5282daf35df331edcbdb645839d17e6a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+diff --cc block/blk-mq.c
+index 52f967bfb7fc,ec6c79578332..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -3294,11 -3327,41 +3291,45 @@@ static bool blk_mq_poll_hybrid_sleep(st
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static bool __blk_mq_poll(struct blk_mq_hw_ctx *hctx, struct request *rq)
+++=======
++ static bool blk_mq_poll_hybrid(struct request_queue *q,
++ 			       struct blk_mq_hw_ctx *hctx, blk_qc_t cookie)
+++>>>>>>> 1052b8ac5282 (blk-mq: when polling for IO, look for any completion)
+  {
+- 	struct request_queue *q = hctx->queue;
++ 	struct request *rq;
++ 
++ 	if (q->poll_nsec == -1)
++ 		return false;
++ 
++ 	if (!blk_qc_t_is_internal(cookie))
++ 		rq = blk_mq_tag_to_rq(hctx->tags, blk_qc_t_to_tag(cookie));
++ 	else {
++ 		rq = blk_mq_tag_to_rq(hctx->sched_tags, blk_qc_t_to_tag(cookie));
++ 		/*
++ 		 * With scheduling, if the request has completed, we'll
++ 		 * get a NULL return here, as we clear the sched tag when
++ 		 * that happens. The request still remains valid, like always,
++ 		 * so we should be safe with just the NULL check.
++ 		 */
++ 		if (!rq)
++ 			return false;
++ 	}
++ 
++ 	return blk_mq_poll_hybrid_sleep(q, hctx, rq);
++ }
++ 
++ static int blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
++ {
++ 	struct blk_mq_hw_ctx *hctx;
+  	long state;
+  
++ 	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
++ 		return 0;
++ 
++ 	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
++ 
+  	/*
+  	 * If we sleep, have the caller restart the poll loop to reset
+  	 * the state. Like for the other success return cases, the
+@@@ -3306,8 -3369,8 +3337,13 @@@
+  	 * the IO isn't complete, we'll get called again and will go
+  	 * straight to the busy poll loop.
+  	 */
+++<<<<<<< HEAD
+ +	if (blk_mq_poll_hybrid_sleep(q, hctx, rq))
+ +		return true;
+++=======
++ 	if (blk_mq_poll_hybrid(q, hctx, cookie))
++ 		return 1;
+++>>>>>>> 1052b8ac5282 (blk-mq: when polling for IO, look for any completion)
+  
+  	hctx->poll_considered++;
+  
+@@@ -3335,35 -3398,9 +3371,38 @@@
+  	}
+  
+  	__set_current_state(TASK_RUNNING);
+ -	return 0;
+ +	return false;
+ +}
+ +
+++<<<<<<< HEAD
+ +static bool blk_mq_poll(struct request_queue *q, blk_qc_t cookie)
+ +{
+ +	struct blk_mq_hw_ctx *hctx;
+ +	struct request *rq;
+ +
+ +	if (!test_bit(QUEUE_FLAG_POLL, &q->queue_flags))
+ +		return false;
+ +
+ +	hctx = q->queue_hw_ctx[blk_qc_t_to_queue_num(cookie)];
+ +	if (!blk_qc_t_is_internal(cookie))
+ +		rq = blk_mq_tag_to_rq(hctx->tags, blk_qc_t_to_tag(cookie));
+ +	else {
+ +		rq = blk_mq_tag_to_rq(hctx->sched_tags, blk_qc_t_to_tag(cookie));
+ +		/*
+ +		 * With scheduling, if the request has completed, we'll
+ +		 * get a NULL return here, as we clear the sched tag when
+ +		 * that happens. The request still remains valid, like always,
+ +		 * so we should be safe with just the NULL check.
+ +		 */
+ +		if (!rq)
+ +			return false;
+ +	}
+ +
+ +	return __blk_mq_poll(hctx, rq);
+  }
+  
+++=======
+++>>>>>>> 1052b8ac5282 (blk-mq: when polling for IO, look for any completion)
+  unsigned int blk_mq_rq_cpu(struct request *rq)
+  {
+  	return rq->mq_ctx->cpu;
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 7df0c1244abd..833e8d98f6fa 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -2519,10 +2519,19 @@ blk_qc_t submit_bio(struct bio *bio)
+ }
+ EXPORT_SYMBOL(submit_bio);
+ 
+-bool blk_poll(struct request_queue *q, blk_qc_t cookie)
++/**
++ * blk_poll - poll for IO completions
++ * @q:  the queue
++ * @cookie: cookie passed back at IO submission time
++ *
++ * Description:
++ *    Poll for completions on the passed in queue. Returns number of
++ *    completed entries found.
++ */
++int blk_poll(struct request_queue *q, blk_qc_t cookie)
+ {
+ 	if (!q->poll_fn || !blk_qc_t_valid(cookie))
+-		return false;
++		return 0;
+ 
+ 	if (current->plug)
+ 		blk_flush_plug_list(current->plug, false);
+* Unmerged path block/blk-mq.c
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 12f1a221feb9..ee66af61ef8a 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1002,15 +1002,15 @@ static inline void nvme_update_cq_head(struct nvme_queue *nvmeq)
+ 	}
+ }
+ 
+-static inline bool nvme_process_cq(struct nvme_queue *nvmeq, u16 *start,
+-		u16 *end, int tag)
++static inline int nvme_process_cq(struct nvme_queue *nvmeq, u16 *start,
++				  u16 *end, unsigned int tag)
+ {
+-	bool found = false;
++	int found = 0;
+ 
+ 	*start = nvmeq->cq_head;
+-	while (!found && nvme_cqe_pending(nvmeq)) {
+-		if (nvmeq->cqes[nvmeq->cq_head].command_id == tag)
+-			found = true;
++	while (nvme_cqe_pending(nvmeq)) {
++		if (tag == -1U || nvmeq->cqes[nvmeq->cq_head].command_id == tag)
++			found++;
+ 		nvme_update_cq_head(nvmeq);
+ 	}
+ 	*end = nvmeq->cq_head;
+@@ -1052,7 +1052,7 @@ static irqreturn_t nvme_irq_check(int irq, void *data)
+ static int __nvme_poll(struct nvme_queue *nvmeq, unsigned int tag)
+ {
+ 	u16 start, end;
+-	bool found;
++	int found;
+ 
+ 	if (!nvme_cqe_pending(nvmeq))
+ 		return 0;
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 8ecaac370289..a3d1cbb82974 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -1359,12 +1359,11 @@ static void nvme_rdma_submit_async_event(struct nvme_ctrl *arg)
+ 	WARN_ON_ONCE(ret);
+ }
+ 
+-static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+-		struct nvme_completion *cqe, struct ib_wc *wc, int tag)
++static void nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
++		struct nvme_completion *cqe, struct ib_wc *wc)
+ {
+ 	struct request *rq;
+ 	struct nvme_rdma_request *req;
+-	int ret = 0;
+ 
+ 	rq = blk_mq_tag_to_rq(nvme_rdma_tagset(queue), cqe->command_id);
+ 	if (!rq) {
+@@ -1372,7 +1371,7 @@ static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 			"tag 0x%x on QP %#x not found\n",
+ 			cqe->command_id, queue->qp->qp_num);
+ 		nvme_rdma_error_recovery(queue->ctrl);
+-		return ret;
++		return;
+ 	}
+ 	req = blk_mq_rq_to_pdu(rq);
+ 
+@@ -1387,6 +1386,8 @@ static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 			nvme_rdma_error_recovery(queue->ctrl);
+ 		}
+ 	} else if (req->mr) {
++		int ret;
++
+ 		ret = nvme_rdma_inv_rkey(queue, req);
+ 		if (unlikely(ret < 0)) {
+ 			dev_err(queue->ctrl->ctrl.device,
+@@ -1395,19 +1396,14 @@ static int nvme_rdma_process_nvme_rsp(struct nvme_rdma_queue *queue,
+ 			nvme_rdma_error_recovery(queue->ctrl);
+ 		}
+ 		/* the local invalidation completion will end the request */
+-		return 0;
++		return;
+ 	}
+ 
+-	if (refcount_dec_and_test(&req->ref)) {
+-		if (rq->tag == tag)
+-			ret = 1;
++	if (refcount_dec_and_test(&req->ref))
+ 		nvme_end_request(rq, req->status, req->result);
+-	}
+-
+-	return ret;
+ }
+ 
+-static int __nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc, int tag)
++static void nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+ {
+ 	struct nvme_rdma_qe *qe =
+ 		container_of(wc->wr_cqe, struct nvme_rdma_qe, cqe);
+@@ -1415,11 +1411,10 @@ static int __nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc, int tag)
+ 	struct ib_device *ibdev = queue->device->dev;
+ 	struct nvme_completion *cqe = qe->data;
+ 	const size_t len = sizeof(struct nvme_completion);
+-	int ret = 0;
+ 
+ 	if (unlikely(wc->status != IB_WC_SUCCESS)) {
+ 		nvme_rdma_wr_error(cq, wc, "RECV");
+-		return 0;
++		return;
+ 	}
+ 
+ 	ib_dma_sync_single_for_cpu(ibdev, qe->dma, len, DMA_FROM_DEVICE);
+@@ -1434,16 +1429,10 @@ static int __nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc, int tag)
+ 		nvme_complete_async_event(&queue->ctrl->ctrl, cqe->status,
+ 				&cqe->result);
+ 	else
+-		ret = nvme_rdma_process_nvme_rsp(queue, cqe, wc, tag);
++		nvme_rdma_process_nvme_rsp(queue, cqe, wc);
+ 	ib_dma_sync_single_for_device(ibdev, qe->dma, len, DMA_FROM_DEVICE);
+ 
+ 	nvme_rdma_post_recv(queue, qe);
+-	return ret;
+-}
+-
+-static void nvme_rdma_recv_done(struct ib_cq *cq, struct ib_wc *wc)
+-{
+-	__nvme_rdma_recv_done(cq, wc, -1);
+ }
+ 
+ static int nvme_rdma_conn_established(struct nvme_rdma_queue *queue)
+@@ -1707,10 +1696,12 @@ static int nvme_rdma_poll(struct blk_mq_hw_ctx *hctx, unsigned int tag)
+ 		struct ib_cqe *cqe = wc.wr_cqe;
+ 
+ 		if (cqe) {
+-			if (cqe->done == nvme_rdma_recv_done)
+-				found |= __nvme_rdma_recv_done(cq, &wc, tag);
+-			else
++			if (cqe->done == nvme_rdma_recv_done) {
++				nvme_rdma_recv_done(cq, &wc);
++				found++;
++			} else {
+ 				cqe->done(cq, &wc);
++			}
+ 		}
+ 	}
+ 
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index d890005b9f66..3ed3695bba97 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -982,7 +982,7 @@ extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
+ int blk_status_to_errno(blk_status_t status);
+ blk_status_t errno_to_blk_status(int errno);
+ 
+-bool blk_poll(struct request_queue *q, blk_qc_t cookie);
++int blk_poll(struct request_queue *q, blk_qc_t cookie);
+ 
+ static inline struct request_queue *bdev_get_queue(struct block_device *bdev)
+ {
