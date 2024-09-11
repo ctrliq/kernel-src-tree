@@ -1,0 +1,184 @@
+net/mlx5: Move ACL drop counters life cycle close to ACL lifecycle
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit b7752f8341c4fecc4720fbd58f868e114a57fdea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b7752f83.failed
+
+It is better to create/destroy ACL related drop counters where the actual
+drop rule ACLs are created/destroyed, so that ACL configuration is self
+contained for ingress and egress.
+
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Vu Pham <vuhuong@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b7752f8341c4fecc4720fbd58f868e114a57fdea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 7ecf89103bc8,0e5113167739..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -1654,63 -1663,103 +1654,155 @@@ static void esw_apply_vport_conf(struc
+  		SET_VLAN_STRIP | SET_VLAN_INSERT : 0;
+  	modify_esw_vport_cvlan(esw->dev, vport_num, vport->info.vlan, vport->info.qos,
+  			       flags);
+ +
+ +	/* Only legacy mode needs ACLs */
+ +	if (esw->mode == MLX5_ESWITCH_LEGACY) {
+ +		esw_vport_ingress_config(esw, vport);
+ +		esw_vport_egress_config(esw, vport);
+ +	}
+ +}
+ +
+++<<<<<<< HEAD
+ +static void esw_vport_create_drop_counters(struct mlx5_vport *vport)
+ +{
+ +	struct mlx5_core_dev *dev = vport->dev;
+ +
+ +	if (MLX5_CAP_ESW_INGRESS_ACL(dev, flow_counter)) {
+ +		vport->ingress.drop_counter = mlx5_fc_create(dev, false);
+ +		if (IS_ERR(vport->ingress.drop_counter)) {
+ +			esw_warn(dev,
+ +				 "vport[%d] configure ingress drop rule counter failed\n",
+ +				 vport->vport);
+ +			vport->ingress.drop_counter = NULL;
+ +		}
+ +	}
+ +
+ +	if (MLX5_CAP_ESW_EGRESS_ACL(dev, flow_counter)) {
+ +		vport->egress.drop_counter = mlx5_fc_create(dev, false);
+ +		if (IS_ERR(vport->egress.drop_counter)) {
+ +			esw_warn(dev,
+ +				 "vport[%d] configure egress drop rule counter failed\n",
+ +				 vport->vport);
+ +			vport->egress.drop_counter = NULL;
+ +		}
+ +	}
+  }
+  
+ +static void esw_vport_destroy_drop_counters(struct mlx5_vport *vport)
+ +{
+ +	struct mlx5_core_dev *dev = vport->dev;
+ +
+ +	if (vport->ingress.drop_counter)
+ +		mlx5_fc_destroy(dev, vport->ingress.drop_counter);
+ +	if (vport->egress.drop_counter)
+ +		mlx5_fc_destroy(dev, vport->egress.drop_counter);
+ +}
+ +
+ +static void esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
+ +			     enum mlx5_eswitch_vport_event enabled_events)
+++=======
++ static int esw_vport_create_legacy_acl_tables(struct mlx5_eswitch *esw,
++ 					      struct mlx5_vport *vport)
++ {
++ 	int ret;
++ 
++ 	/* Only non manager vports need ACL in legacy mode */
++ 	if (mlx5_esw_is_manager_vport(esw, vport->vport))
++ 		return 0;
++ 
++ 	if (!mlx5_esw_is_manager_vport(esw, vport->vport) &&
++ 	    MLX5_CAP_ESW_INGRESS_ACL(esw->dev, flow_counter)) {
++ 		vport->ingress.legacy.drop_counter = mlx5_fc_create(esw->dev, false);
++ 		if (IS_ERR(vport->ingress.legacy.drop_counter)) {
++ 			esw_warn(esw->dev,
++ 				 "vport[%d] configure ingress drop rule counter failed\n",
++ 				 vport->vport);
++ 			vport->ingress.legacy.drop_counter = NULL;
++ 		}
++ 	}
++ 
++ 	ret = esw_vport_ingress_config(esw, vport);
++ 	if (ret)
++ 		goto ingress_err;
++ 
++ 	if (!mlx5_esw_is_manager_vport(esw, vport->vport) &&
++ 	    MLX5_CAP_ESW_EGRESS_ACL(esw->dev, flow_counter)) {
++ 		vport->egress.legacy.drop_counter = mlx5_fc_create(esw->dev, false);
++ 		if (IS_ERR(vport->egress.legacy.drop_counter)) {
++ 			esw_warn(esw->dev,
++ 				 "vport[%d] configure egress drop rule counter failed\n",
++ 				 vport->vport);
++ 			vport->egress.legacy.drop_counter = NULL;
++ 		}
++ 	}
++ 
++ 	ret = esw_vport_egress_config(esw, vport);
++ 	if (ret)
++ 		goto egress_err;
++ 
++ 	return 0;
++ 
++ egress_err:
++ 	esw_vport_disable_ingress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->egress.legacy.drop_counter);
++ 	vport->egress.legacy.drop_counter = NULL;
++ 
++ ingress_err:
++ 	mlx5_fc_destroy(esw->dev, vport->ingress.legacy.drop_counter);
++ 	vport->ingress.legacy.drop_counter = NULL;
++ 	return ret;
++ }
++ 
++ static int esw_vport_setup_acl(struct mlx5_eswitch *esw,
++ 			       struct mlx5_vport *vport)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY)
++ 		return esw_vport_create_legacy_acl_tables(esw, vport);
++ 
++ 	return 0;
++ }
++ 
++ static void esw_vport_destroy_legacy_acl_tables(struct mlx5_eswitch *esw,
++ 						struct mlx5_vport *vport)
++ 
++ {
++ 	if (mlx5_esw_is_manager_vport(esw, vport->vport))
++ 		return;
++ 
++ 	esw_vport_disable_egress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->egress.legacy.drop_counter);
++ 	vport->egress.legacy.drop_counter = NULL;
++ 
++ 	esw_vport_disable_ingress_acl(esw, vport);
++ 	mlx5_fc_destroy(esw->dev, vport->ingress.legacy.drop_counter);
++ 	vport->ingress.legacy.drop_counter = NULL;
++ }
++ 
++ static void esw_vport_cleanup_acl(struct mlx5_eswitch *esw,
++ 				  struct mlx5_vport *vport)
++ {
++ 	if (esw->mode == MLX5_ESWITCH_LEGACY)
++ 		esw_vport_destroy_legacy_acl_tables(esw, vport);
++ }
++ 
++ static int esw_enable_vport(struct mlx5_eswitch *esw, struct mlx5_vport *vport,
++ 			    enum mlx5_eswitch_vport_event enabled_events)
+++>>>>>>> b7752f8341c4 (net/mlx5: Move ACL drop counters life cycle close to ACL lifecycle)
+  {
+  	u16 vport_num = vport->vport;
+ -	int ret;
+  
+  	mutex_lock(&esw->state_lock);
+  	WARN_ON(vport->enabled);
+  
+  	esw_debug(esw->dev, "Enabling VPORT(%d)\n", vport_num);
+  
+++<<<<<<< HEAD
+ +	/* Create steering drop counters for ingress and egress ACLs */
+ +	if (vport_num && esw->mode == MLX5_ESWITCH_LEGACY)
+ +		esw_vport_create_drop_counters(vport);
+ +
+++=======
+++>>>>>>> b7752f8341c4 (net/mlx5: Move ACL drop counters life cycle close to ACL lifecycle)
+  	/* Restore old vport configuration */
+  	esw_apply_vport_conf(esw, vport);
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
