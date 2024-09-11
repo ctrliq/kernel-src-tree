@@ -1,0 +1,160 @@
+scsi: qla2xxx: Fix NVMe retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Quinn Tran <qutran@marvell.com>
+commit f88444570072a6863f3e2bd67878560a51b187f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f8844457.failed
+
+For target port that register itself as both FCP + NVMe, initiator driver
+will try to login one mode at a time. If the last mode did not succeed,
+then driver will try the other mode.
+
+When error is encountered, current code only flip to other mode one time
+(NVMe->FCP) and remain on the last mode.  Driver wrongly assumed target
+port does not support PRLI NVMe, instead it was not ready to receive PRLI.
+
+This patch will alternate back and forth on every PRLI failure until login
+retry count has depleted or it is succeeded.
+
+Link: https://lore.kernel.org/r/20210817051315.2477-10-njavali@marvell.com
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit f88444570072a6863f3e2bd67878560a51b187f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_init.c
+#	drivers/scsi/qla2xxx/qla_mbx.c
+diff --cc drivers/scsi/qla2xxx/qla_init.c
+index 5a2eb786a332,1e4e3e83b5c7..000000000000
+--- a/drivers/scsi/qla2xxx/qla_init.c
++++ b/drivers/scsi/qla2xxx/qla_init.c
+@@@ -1948,22 -2028,27 +1949,39 @@@ qla24xx_handle_prli_done_event(struct s
+  			break;
+  		}
+  
++ 		sp = ea->sp;
+  		ql_dbg(ql_dbg_disc, vha, 0x2118,
+- 		       "%s %d %8phC priority %s, fc4type %x\n",
++ 		       "%s %d %8phC priority %s, fc4type %x prev try %s\n",
+  		       __func__, __LINE__, ea->fcport->port_name,
+  		       vha->hw->fc4_type_priority == FC4_PRIORITY_FCP ?
+- 		       "FCP" : "NVMe", ea->fcport->fc4_type);
++ 		       "FCP" : "NVMe", ea->fcport->fc4_type,
++ 		       (sp->u.iocb_cmd.u.logio.flags & SRB_LOGIN_NVME_PRLI) ?
++ 			"NVME" : "FCP");
++ 
++ 		if (NVME_FCP_TARGET(ea->fcport)) {
++ 			if (sp->u.iocb_cmd.u.logio.flags & SRB_LOGIN_NVME_PRLI)
++ 				ea->fcport->do_prli_nvme = 0;
++ 			else
++ 				ea->fcport->do_prli_nvme = 1;
++ 		} else {
++ 			ea->fcport->do_prli_nvme = 0;
++ 		}
+  
+  		if (N2N_TOPO(vha->hw)) {
+++<<<<<<< HEAD
+ +			if (vha->hw->fc4_type_priority == FC4_PRIORITY_NVME) {
+ +				ea->fcport->fc4_type &= ~FS_FC4TYPE_NVME;
+ +				ea->fcport->fc4_type |= FS_FC4TYPE_FCP;
+ +			} else {
+ +				ea->fcport->fc4_type &= ~FS_FC4TYPE_FCP;
+ +				ea->fcport->fc4_type |= FS_FC4TYPE_NVME;
+ +			}
+ +
+ +			if (ea->fcport->n2n_link_reset_cnt < 3) {
+++=======
++ 			if (ea->fcport->n2n_link_reset_cnt <
++ 			    vha->hw->login_retry_count) {
+++>>>>>>> f88444570072 (scsi: qla2xxx: Fix NVMe retry)
+  				ea->fcport->n2n_link_reset_cnt++;
+  				vha->relogin_jif = jiffies + 2 * HZ;
+  				/*
+diff --cc drivers/scsi/qla2xxx/qla_mbx.c
+index a3a82430134a,438af0d55135..000000000000
+--- a/drivers/scsi/qla2xxx/qla_mbx.c
++++ b/drivers/scsi/qla2xxx/qla_mbx.c
+@@@ -4036,6 -4049,10 +4036,13 @@@ qla24xx_report_id_acquisition(scsi_qla_
+  				fcport->scan_state = QLA_FCPORT_FOUND;
+  				fcport->n2n_flag = 1;
+  				fcport->keep_nport_handle = 1;
+++<<<<<<< HEAD
+++=======
++ 				fcport->login_retry = vha->hw->login_retry_count;
++ 				fcport->fc4_type = FS_FC4TYPE_FCP;
++ 				if (vha->flags.nvme_enabled)
++ 					fcport->fc4_type |= FS_FC4TYPE_NVME;
+++>>>>>>> f88444570072 (scsi: qla2xxx: Fix NVMe retry)
+  
+  				if (wwn_to_u64(vha->port_name) >
+  				    wwn_to_u64(fcport->port_name)) {
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 74b95de4a24c..66cc036f1ad4 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2467,6 +2467,8 @@ typedef struct fc_port {
+ 	unsigned int n2n_flag:1;
+ 	unsigned int explicit_logout:1;
+ 	unsigned int prli_pend_timer:1;
++	unsigned int do_prli_nvme:1;
++
+ 	uint8_t nvme_flag;
+ 
+ 	uint8_t node_name[WWN_SIZE];
+@@ -5219,9 +5221,12 @@ struct sff_8247_a0 {
+ #define NVME_FCP_TARGET(fcport) \
+ 	(FCP_TYPE(fcport) && NVME_TYPE(fcport)) \
+ 
++#define NVME_PRIORITY(ha, fcport) \
++	(NVME_FCP_TARGET(fcport) && \
++	 (ha->fc4_type_priority == FC4_PRIORITY_NVME))
++
+ #define NVME_TARGET(ha, fcport) \
+-	((NVME_FCP_TARGET(fcport) && \
+-	(ha->fc4_type_priority == FC4_PRIORITY_NVME)) || \
++	(fcport->do_prli_nvme || \
+ 	NVME_ONLY_TARGET(fcport)) \
+ 
+ #define PRLI_PHASE(_cls) \
+diff --git a/drivers/scsi/qla2xxx/qla_gs.c b/drivers/scsi/qla2xxx/qla_gs.c
+index e34fc0aa4de8..c97edd97836b 100644
+--- a/drivers/scsi/qla2xxx/qla_gs.c
++++ b/drivers/scsi/qla2xxx/qla_gs.c
+@@ -3494,6 +3494,14 @@ void qla24xx_async_gnnft_done(scsi_qla_host_t *vha, srb_t *sp)
+ 			fcport->last_rscn_gen = fcport->rscn_gen;
+ 			fcport->fc4_type = rp->fc4type;
+ 			found = true;
++
++			if (fcport->scan_needed) {
++				if (NVME_PRIORITY(vha->hw, fcport))
++					fcport->do_prli_nvme = 1;
++				else
++					fcport->do_prli_nvme = 0;
++			}
++
+ 			/*
+ 			 * If device was not a fabric device before.
+ 			 */
+* Unmerged path drivers/scsi/qla2xxx/qla_init.c
+* Unmerged path drivers/scsi/qla2xxx/qla_mbx.c
+diff --git a/drivers/scsi/qla2xxx/qla_os.c b/drivers/scsi/qla2xxx/qla_os.c
+index 6ae02d789e96..fec09392a325 100644
+--- a/drivers/scsi/qla2xxx/qla_os.c
++++ b/drivers/scsi/qla2xxx/qla_os.c
+@@ -4990,6 +4990,11 @@ void qla24xx_create_new_sess(struct scsi_qla_host *vha, struct qla_work_evt *e)
+ 			    WWN_SIZE);
+ 
+ 			fcport->fc4_type = e->u.new_sess.fc4_type;
++			if (NVME_PRIORITY(vha->hw, fcport))
++				fcport->do_prli_nvme = 1;
++			else
++				fcport->do_prli_nvme = 0;
++
+ 			if (e->u.new_sess.fc4_type & FS_FCP_IS_N2N) {
+ 				fcport->dm_login_expire = jiffies +
+ 					QLA_N2N_WAIT_TIME * HZ;
