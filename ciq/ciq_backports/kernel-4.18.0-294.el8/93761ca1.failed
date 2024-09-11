@@ -1,0 +1,178 @@
+net/mlx5e: XDP, Avoid indirect call in TX flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 93761ca17edf83f4222ab5abda8bde837ea5a309
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/93761ca1.failed
+
+Use INDIRECT_CALL_2() helper to avoid the cost of the indirect call
+when/if CONFIG_RETPOLINE=y.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Reviewed-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 93761ca17edf83f4222ab5abda8bde837ea5a309)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
+index 11085a861787,0dfbc96e952a..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
+@@@ -5,7 -5,8 +5,12 @@@
+  #include "umem.h"
+  #include "en/xdp.h"
+  #include "en/params.h"
+++<<<<<<< HEAD
+ +#include <net/xdp_sock.h>
+++=======
++ #include <net/xdp_sock_drv.h>
++ #include <linux/indirect_call_wrapper.h>
+++>>>>>>> 93761ca17edf (net/mlx5e: XDP, Avoid indirect call in TX flow)
+  
+  int mlx5e_xsk_wakeup(struct net_device *dev, u32 qid, u32 flags)
+  {
+@@@ -92,14 -97,15 +101,16 @@@ bool mlx5e_xsk_tx(struct mlx5e_xdpsq *s
+  			break;
+  		}
+  
+ -		xdptxd.dma_addr = xsk_buff_raw_get_dma(umem, desc.addr);
+ -		xdptxd.data = xsk_buff_raw_get_data(umem, desc.addr);
+ +		xdptxd.dma_addr = xdp_umem_get_dma(umem, desc.addr);
+ +		xdptxd.data = xdp_umem_get_data(umem, desc.addr);
+  		xdptxd.len = desc.len;
+  
+ -		xsk_buff_raw_dma_sync_for_device(umem, xdptxd.dma_addr, xdptxd.len);
+ +		dma_sync_single_for_device(sq->pdev, xdptxd.dma_addr,
+ +					   xdptxd.len, DMA_BIDIRECTIONAL);
+  
+- 		if (unlikely(!sq->xmit_xdp_frame(sq, &xdptxd, &xdpi, check_result))) {
++ 		ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
++ 				      mlx5e_xmit_xdp_frame, sq, &xdptxd, &xdpi, check_result);
++ 		if (unlikely(!ret)) {
+  			if (sq->mpwqe.wqe)
+  				mlx5e_xdp_mpwqe_complete(sq);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index 42202d19245c..eb751b272b9a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -34,6 +34,7 @@
+ #include <net/xdp_sock.h>
+ #include "en/xdp.h"
+ #include "en/params.h"
++#include <linux/indirect_call_wrapper.h>
+ 
+ int mlx5e_xdp_max_mtu(struct mlx5e_params *params, struct mlx5e_xsk_param *xsk)
+ {
+@@ -114,7 +115,8 @@ mlx5e_xmit_xdp_buff(struct mlx5e_xdpsq *sq, struct mlx5e_rq *rq,
+ 		xdpi.page.di    = *di;
+ 	}
+ 
+-	return sq->xmit_xdp_frame(sq, &xdptxd, &xdpi, 0);
++	return INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
++			       mlx5e_xmit_xdp_frame, sq, &xdptxd, &xdpi, 0);
+ }
+ 
+ /* returns true if packet was consumed by xdp */
+@@ -254,7 +256,7 @@ enum {
+ 	MLX5E_XDP_CHECK_START_MPWQE = 2,
+ };
+ 
+-static int mlx5e_xmit_xdp_frame_check_mpwqe(struct mlx5e_xdpsq *sq)
++INDIRECT_CALLABLE_SCOPE int mlx5e_xmit_xdp_frame_check_mpwqe(struct mlx5e_xdpsq *sq)
+ {
+ 	if (unlikely(!sq->mpwqe.wqe)) {
+ 		const u16 stop_room = mlx5e_stop_room_for_wqe(MLX5_SEND_WQE_MAX_WQEBBS);
+@@ -273,10 +275,9 @@ static int mlx5e_xmit_xdp_frame_check_mpwqe(struct mlx5e_xdpsq *sq)
+ 	return MLX5E_XDP_CHECK_OK;
+ }
+ 
+-static bool mlx5e_xmit_xdp_frame_mpwqe(struct mlx5e_xdpsq *sq,
+-				       struct mlx5e_xdp_xmit_data *xdptxd,
+-				       struct mlx5e_xdp_info *xdpi,
+-				       int check_result)
++INDIRECT_CALLABLE_SCOPE bool
++mlx5e_xmit_xdp_frame_mpwqe(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_xmit_data *xdptxd,
++			   struct mlx5e_xdp_info *xdpi, int check_result)
+ {
+ 	struct mlx5e_xdp_mpwqe *session = &sq->mpwqe;
+ 	struct mlx5e_xdpsq_stats *stats = sq->stats;
+@@ -310,7 +311,7 @@ static bool mlx5e_xmit_xdp_frame_mpwqe(struct mlx5e_xdpsq *sq,
+ 	return true;
+ }
+ 
+-static int mlx5e_xmit_xdp_frame_check(struct mlx5e_xdpsq *sq)
++INDIRECT_CALLABLE_SCOPE int mlx5e_xmit_xdp_frame_check(struct mlx5e_xdpsq *sq)
+ {
+ 	if (unlikely(!mlx5e_wqc_has_room_for(&sq->wq, sq->cc, sq->pc, 1))) {
+ 		/* SQ is full, ring doorbell */
+@@ -322,10 +323,9 @@ static int mlx5e_xmit_xdp_frame_check(struct mlx5e_xdpsq *sq)
+ 	return MLX5E_XDP_CHECK_OK;
+ }
+ 
+-static bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq,
+-				 struct mlx5e_xdp_xmit_data *xdptxd,
+-				 struct mlx5e_xdp_info *xdpi,
+-				 int check_result)
++INDIRECT_CALLABLE_SCOPE bool
++mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_xmit_data *xdptxd,
++		     struct mlx5e_xdp_info *xdpi, int check_result)
+ {
+ 	struct mlx5_wq_cyc       *wq   = &sq->wq;
+ 	u16                       pi   = mlx5_wq_cyc_ctr2ix(wq, sq->pc);
+@@ -523,6 +523,7 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		struct xdp_frame *xdpf = frames[i];
+ 		struct mlx5e_xdp_xmit_data xdptxd;
+ 		struct mlx5e_xdp_info xdpi;
++		bool ret;
+ 
+ 		xdptxd.data = xdpf->data;
+ 		xdptxd.len = xdpf->len;
+@@ -539,7 +540,9 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		xdpi.frame.xdpf     = xdpf;
+ 		xdpi.frame.dma_addr = xdptxd.dma_addr;
+ 
+-		if (unlikely(!sq->xmit_xdp_frame(sq, &xdptxd, &xdpi, 0))) {
++		ret = INDIRECT_CALL_2(sq->xmit_xdp_frame, mlx5e_xmit_xdp_frame_mpwqe,
++				      mlx5e_xmit_xdp_frame, sq, &xdptxd, &xdpi, 0);
++		if (unlikely(!ret)) {
+ 			dma_unmap_single(sq->pdev, xdptxd.dma_addr,
+ 					 xdptxd.len, DMA_TO_DEVICE);
+ 			xdp_return_frame_rx_napi(xdpf);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+index be64eb68f4e5..6a6ec3487891 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -32,6 +32,8 @@
+ #ifndef __MLX5_EN_XDP_H__
+ #define __MLX5_EN_XDP_H__
+ 
++#include <linux/indirect_call_wrapper.h>
++
+ #include "en.h"
+ #include "en/txrx.h"
+ 
+@@ -70,6 +72,17 @@ void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq);
+ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		   u32 flags);
+ 
++INDIRECT_CALLABLE_DECLARE(bool mlx5e_xmit_xdp_frame_mpwqe(struct mlx5e_xdpsq *sq,
++							  struct mlx5e_xdp_xmit_data *xdptxd,
++							  struct mlx5e_xdp_info *xdpi,
++							  int check_result));
++INDIRECT_CALLABLE_DECLARE(bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq,
++						    struct mlx5e_xdp_xmit_data *xdptxd,
++						    struct mlx5e_xdp_info *xdpi,
++						    int check_result));
++INDIRECT_CALLABLE_DECLARE(int mlx5e_xmit_xdp_frame_check_mpwqe(struct mlx5e_xdpsq *sq));
++INDIRECT_CALLABLE_DECLARE(int mlx5e_xmit_xdp_frame_check(struct mlx5e_xdpsq *sq));
++
+ static inline void mlx5e_xdp_tx_enable(struct mlx5e_priv *priv)
+ {
+ 	set_bit(MLX5E_STATE_XDP_TX_ENABLED, &priv->state);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xsk/tx.c
