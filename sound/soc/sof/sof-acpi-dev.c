@@ -125,7 +125,6 @@ static int sof_acpi_probe(struct platform_device *pdev)
 	const struct sof_dev_desc *desc;
 	struct snd_sof_pdata *sof_pdata;
 	const struct snd_sof_dsp_ops *ops;
-	int ret;
 
 	id = acpi_match_device(dev->driver->acpi_match_table, dev);
 	if (!id)
@@ -177,22 +176,11 @@ static int sof_acpi_probe(struct platform_device *pdev)
 		sof_pdata->tplg_filename_prefix =
 			sof_pdata->desc->default_tplg_path;
 
-#if IS_ENABLED(CONFIG_SND_SOC_SOF_PROBE_WORK_QUEUE)
-	/* set callback to enable runtime_pm */
+	/* set callback to be called on successful device probe to enable runtime_pm */
 	sof_pdata->sof_probe_complete = sof_acpi_probe_complete;
-#endif
+
 	/* call sof helper for DSP hardware probe */
-	ret = snd_sof_device_probe(dev, sof_pdata);
-	if (ret) {
-		dev_err(dev, "error: failed to probe DSP hardware!\n");
-		return ret;
-	}
-
-#if !IS_ENABLED(CONFIG_SND_SOC_SOF_PROBE_WORK_QUEUE)
-	sof_acpi_probe_complete(dev);
-#endif
-
-	return ret;
+	return snd_sof_device_probe(dev, sof_pdata);
 }
 
 static int sof_acpi_remove(struct platform_device *pdev)
