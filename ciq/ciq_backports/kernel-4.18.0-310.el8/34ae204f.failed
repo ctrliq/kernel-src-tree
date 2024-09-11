@@ -1,0 +1,182 @@
+hugetlbfs: remove call to huge_pte_alloc without i_mmap_rwsem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 34ae204f18519f0920bd50a644abd6fefc8dbfcf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/34ae204f.failed
+
+Commit c0d0381ade79 ("hugetlbfs: use i_mmap_rwsem for more pmd sharing
+synchronization") requires callers of huge_pte_alloc to hold i_mmap_rwsem
+in at least read mode.  This is because the explicit locking in
+huge_pmd_share (called by huge_pte_alloc) was removed.  When restructuring
+the code, the call to huge_pte_alloc in the else block at the beginning of
+hugetlb_fault was missed.
+
+Unfortunately, that else clause is exercised when there is no page table
+entry.  This will likely lead to a call to huge_pmd_share.  If
+huge_pmd_share thinks pmd sharing is possible, it will traverse the
+mapping tree (i_mmap) without holding i_mmap_rwsem.  If someone else is
+modifying the tree, bad things such as addressing exceptions or worse
+could happen.
+
+Simply remove the else clause.  It should have been removed previously.
+The code following the else will call huge_pte_alloc with the appropriate
+locking.
+
+To prevent this type of issue in the future, add routines to assert that
+i_mmap_rwsem is held, and call these routines in huge pmd sharing
+routines.
+
+Fixes: c0d0381ade79 ("hugetlbfs: use i_mmap_rwsem for more pmd sharing synchronization")
+	Suggested-by: Matthew Wilcox <willy@infradead.org>
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Kirill A.Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
+	Cc: <stable@vger.kernel.org>
+Link: http://lkml.kernel.org/r/e670f327-5cf9-1959-96e4-6dc7cc30d3d5@oracle.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 34ae204f18519f0920bd50a644abd6fefc8dbfcf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hugetlb.h
+#	mm/rmap.c
+diff --cc include/linux/hugetlb.h
+index cd86e23fcb9f,a520bf26e5d8..000000000000
+--- a/include/linux/hugetlb.h
++++ b/include/linux/hugetlb.h
+@@@ -151,8 -198,15 +152,20 @@@ static inline unsigned long hugetlb_tot
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr,
+ +					pte_t *ptep)
+++=======
++ static inline struct address_space *hugetlb_page_mapping_lock_write(
++ 							struct page *hpage)
++ {
++ 	return NULL;
++ }
++ 
++ static inline int huge_pmd_unshare(struct mm_struct *mm,
++ 					struct vm_area_struct *vma,
++ 					unsigned long *addr, pte_t *ptep)
+++>>>>>>> 34ae204f1851 (hugetlbfs: remove call to huge_pte_alloc without i_mmap_rwsem)
+  {
+  	return 0;
+  }
+diff --cc mm/rmap.c
+index 5b780f3cf0f3,6cce9ef06753..000000000000
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@@ -1454,7 -1463,13 +1454,17 @@@ static bool try_to_unmap_one(struct pag
+  		address = pvmw.address;
+  
+  		if (PageHuge(page)) {
+++<<<<<<< HEAD
+ +			if (huge_pmd_unshare(mm, &address, pvmw.pte)) {
+++=======
++ 			/*
++ 			 * To call huge_pmd_unshare, i_mmap_rwsem must be
++ 			 * held in write mode.  Caller needs to explicitly
++ 			 * do this outside rmap routines.
++ 			 */
++ 			VM_BUG_ON(!(flags & TTU_RMAP_LOCKED));
++ 			if (huge_pmd_unshare(mm, vma, &address, pvmw.pte)) {
+++>>>>>>> 34ae204f1851 (hugetlbfs: remove call to huge_pte_alloc without i_mmap_rwsem)
+  				/*
+  				 * huge_pmd_unshare unmapped an entire PMD
+  				 * page.  There is no way of knowing exactly
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index b1ec4c482c66..f2d86b4fc56f 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -523,6 +523,16 @@ static inline void i_mmap_unlock_read(struct address_space *mapping)
+ 	up_read(&mapping->i_mmap_rwsem);
+ }
+ 
++static inline void i_mmap_assert_locked(struct address_space *mapping)
++{
++	lockdep_assert_held(&mapping->i_mmap_rwsem);
++}
++
++static inline void i_mmap_assert_write_locked(struct address_space *mapping)
++{
++	lockdep_assert_held_write(&mapping->i_mmap_rwsem);
++}
++
+ /*
+  * Might pages of this file be mapped into userspace?
+  */
+* Unmerged path include/linux/hugetlb.h
+diff --git a/mm/hugetlb.c b/mm/hugetlb.c
+index 5899c1f83920..963a4d33d08b 100644
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@ -3634,7 +3634,7 @@ void __unmap_hugepage_range(struct mmu_gather *tlb, struct vm_area_struct *vma,
+ 			continue;
+ 
+ 		ptl = huge_pte_lock(h, mm, ptep);
+-		if (huge_pmd_unshare(mm, &address, ptep)) {
++		if (huge_pmd_unshare(mm, vma, &address, ptep)) {
+ 			spin_unlock(ptl);
+ 			/*
+ 			 * We just unmapped a page of PMDs by clearing a PUD.
+@@ -4217,10 +4217,6 @@ vm_fault_t hugetlb_fault(struct mm_struct *mm, struct vm_area_struct *vma,
+ 		} else if (unlikely(is_hugetlb_entry_hwpoisoned(entry)))
+ 			return VM_FAULT_HWPOISON_LARGE |
+ 				VM_FAULT_SET_HINDEX(hstate_index(h));
+-	} else {
+-		ptep = huge_pte_alloc(mm, haddr, huge_page_size(h));
+-		if (!ptep)
+-			return VM_FAULT_OOM;
+ 	}
+ 
+ 	mapping = vma->vm_file->f_mapping;
+@@ -4679,7 +4675,7 @@ unsigned long hugetlb_change_protection(struct vm_area_struct *vma,
+ 		if (!ptep)
+ 			continue;
+ 		ptl = huge_pte_lock(h, mm, ptep);
+-		if (huge_pmd_unshare(mm, &address, ptep)) {
++		if (huge_pmd_unshare(mm, vma, &address, ptep)) {
+ 			pages++;
+ 			spin_unlock(ptl);
+ 			shared_pmd = true;
+@@ -5023,12 +5019,14 @@ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
+  * returns: 1 successfully unmapped a shared pte page
+  *	    0 the underlying pte page is not shared, or it is the last user
+  */
+-int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
++int huge_pmd_unshare(struct mm_struct *mm, struct vm_area_struct *vma,
++					unsigned long *addr, pte_t *ptep)
+ {
+ 	pgd_t *pgd = pgd_offset(mm, *addr);
+ 	p4d_t *p4d = p4d_offset(pgd, *addr);
+ 	pud_t *pud = pud_offset(p4d, *addr);
+ 
++	i_mmap_assert_write_locked(vma->vm_file->f_mapping);
+ 	BUG_ON(page_count(virt_to_page(ptep)) == 0);
+ 	if (page_count(virt_to_page(ptep)) == 1)
+ 		return 0;
+@@ -5046,7 +5044,8 @@ pte_t *huge_pmd_share(struct mm_struct *mm, unsigned long addr, pud_t *pud)
+ 	return NULL;
+ }
+ 
+-int huge_pmd_unshare(struct mm_struct *mm, unsigned long *addr, pte_t *ptep)
++int huge_pmd_unshare(struct mm_struct *mm, struct vm_area_struct *vma,
++				unsigned long *addr, pte_t *ptep)
+ {
+ 	return 0;
+ }
+* Unmerged path mm/rmap.c
