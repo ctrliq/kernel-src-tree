@@ -1,0 +1,178 @@
+perf map_groups: Add a front end cache for map lookups by name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit 1ae14516cba032a83b561144d3d48fd381584c0c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1ae14516.failed
+
+Lets see if it helps:
+
+First look at the probeable lines for the function that does lookups by
+name in a map_groups struct:
+
+  # perf probe -x ~/bin/perf -L map_groups__find_by_name
+  <map_groups__find_by_name@/home/acme/git/perf/tools/perf/util/symbol.c:0>
+        0  struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+        1  {
+        2         struct maps *maps = &mg->maps;
+                  struct map *map;
+
+        5         down_read(&maps->lock);
+
+        7         if (mg->last_search_by_name && strcmp(mg->last_search_by_name->dso->short_name, name) == 0) {
+        8                 map = mg->last_search_by_name;
+        9                 goto out_unlock;
+                  }
+
+       12         maps__for_each_entry(maps, map)
+       13                 if (strcmp(map->dso->short_name, name) == 0) {
+       14                         mg->last_search_by_name = map;
+       15                         goto out_unlock;
+                          }
+
+       18         map = NULL;
+
+           out_unlock:
+       21         up_read(&maps->lock);
+       22         return map;
+       23  }
+
+           int dso__load_vmlinux(struct dso *dso, struct map *map,
+                                const char *vmlinux, bool vmlinux_allocated)
+
+  #
+
+Now add a probe to the place where we reuse the last search:
+
+  # perf probe -x ~/bin/perf map_groups__find_by_name:8
+  Added new event:
+    probe_perf:map_groups__find_by_name (on map_groups__find_by_name:8 in /home/acme/bin/perf)
+
+  You can now use it in all perf tools, such as:
+
+  	perf record -e probe_perf:map_groups__find_by_name -aR sleep 1
+
+  #
+
+Now lets do a system wide 'perf stat' counting those events:
+
+  # perf stat -e probe_perf:*
+
+Leave it running and lets do a 'perf top', then, after a while, stop the
+'perf stat':
+
+  # perf stat -e probe_perf:*
+  ^C
+   Performance counter stats for 'system wide':
+
+               3,603      probe_perf:map_groups__find_by_name
+
+        44.565253139 seconds time elapsed
+  #
+
+yeah, good to have.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-tcz37g3nxv3tvxw3q90vga3p@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 1ae14516cba032a83b561144d3d48fd381584c0c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/symbol.c
+diff --cc tools/perf/util/symbol.c
+index 78ada2be3cd3,b146d87176e7..000000000000
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@@ -1769,20 -1767,16 +1769,33 @@@ struct map *map_groups__find_by_name(st
+  
+  	down_read(&maps->lock);
+  
+++<<<<<<< HEAD
+ +	for (node = maps->names.rb_node; node; ) {
+ +		int rc;
+ +
+ +		map = rb_entry(node, struct map, rb_node_name);
+ +
+ +		rc = strcmp(map->dso->short_name, name);
+ +		if (rc < 0)
+ +			node = node->rb_left;
+ +		else if (rc > 0)
+ +			node = node->rb_right;
+ +		else
+ +
+ +			goto out_unlock;
+ +	}
+++=======
++ 	if (mg->last_search_by_name && strcmp(mg->last_search_by_name->dso->short_name, name) == 0) {
++ 		map = mg->last_search_by_name;
++ 		goto out_unlock;
++ 	}
++ 
++ 	maps__for_each_entry(maps, map)
++ 		if (strcmp(map->dso->short_name, name) == 0) {
++ 			mg->last_search_by_name = map;
++ 			goto out_unlock;
++ 		}
+++>>>>>>> 1ae14516cba0 (perf map_groups: Add a front end cache for map lookups by name)
+  
+  	map = NULL;
+  
+diff --git a/tools/perf/util/map.c b/tools/perf/util/map.c
+index 09fd25d1d0fd..90c6ff7751e8 100644
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@ -571,6 +571,7 @@ void map_groups__init(struct map_groups *mg, struct machine *machine)
+ {
+ 	maps__init(&mg->maps);
+ 	mg->machine = machine;
++	mg->last_search_by_name = NULL;
+ 	refcount_set(&mg->refcnt, 1);
+ }
+ 
+@@ -579,6 +580,14 @@ void map_groups__insert(struct map_groups *mg, struct map *map)
+ 	maps__insert(&mg->maps, map);
+ }
+ 
++void map_groups__remove(struct map_groups *mg, struct map *map)
++{
++	if (mg->last_search_by_name == map)
++		mg->last_search_by_name = NULL;
++
++	maps__remove(&mg->maps, map);
++}
++
+ static void __maps__purge(struct maps *maps)
+ {
+ 	struct rb_root *root = &maps->entries;
+diff --git a/tools/perf/util/map_groups.h b/tools/perf/util/map_groups.h
+index 1876388e8dd8..48db299a3999 100644
+--- a/tools/perf/util/map_groups.h
++++ b/tools/perf/util/map_groups.h
+@@ -30,6 +30,7 @@ struct symbol *maps__find_symbol_by_name(struct maps *maps, const char *name, st
+ struct map_groups {
+ 	struct maps	 maps;
+ 	struct machine	 *machine;
++	struct map	 *last_search_by_name;
+ 	refcount_t	 refcnt;
+ #ifdef HAVE_LIBUNWIND_SUPPORT
+ 	void				*addr_space;
+@@ -64,10 +65,7 @@ size_t map_groups__fprintf(struct map_groups *mg, FILE *fp);
+ 
+ void map_groups__insert(struct map_groups *mg, struct map *map);
+ 
+-static inline void map_groups__remove(struct map_groups *mg, struct map *map)
+-{
+-	maps__remove(&mg->maps, map);
+-}
++void map_groups__remove(struct map_groups *mg, struct map *map);
+ 
+ static inline struct map *map_groups__find(struct map_groups *mg, u64 addr)
+ {
+* Unmerged path tools/perf/util/symbol.c
