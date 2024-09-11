@@ -1,0 +1,547 @@
+mm: vmscan: determine anon/file pressure balance at the reclaim root
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 7cf111bc39f6792abedcdfbc4e6291a5603b0ef0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7cf111bc.failed
+
+We split the LRU lists into anon and file, and we rebalance the scan
+pressure between them when one of them begins thrashing: if the file cache
+experiences workingset refaults, we increase the pressure on anonymous
+pages; if the workload is stalled on swapins, we increase the pressure on
+the file cache instead.
+
+With cgroups and their nested LRU lists, we currently don't do this
+correctly.  While recursive cgroup reclaim establishes a relative LRU
+order among the pages of all involved cgroups, LRU pressure balancing is
+done on an individual cgroup LRU level.  As a result, when one cgroup is
+thrashing on the filesystem cache while a sibling may have cold anonymous
+pages, pressure doesn't get equalized between them.
+
+This patch moves LRU balancing decision to the root of reclaim - the same
+level where the LRU order is established.
+
+It does this by tracking LRU cost recursively, so that every level of the
+cgroup tree knows the aggregate LRU cost of all memory within its domain.
+When the page scanner calculates the scan balance for any given individual
+cgroup's LRU list, it uses the values from the ancestor cgroup that
+initiated the reclaim cycle.
+
+If one sibling is then thrashing on the cache, it will tip the pressure
+balance inside its ancestors, and the next hierarchical reclaim iteration
+will go more after the anon pages in the tree.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-13-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7cf111bc39f6792abedcdfbc4e6291a5603b0ef0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/swap.c
+#	mm/vmscan.c
+diff --cc mm/swap.c
+index 70728521e27e,4dff2123f695..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -261,14 -278,37 +261,44 @@@ void rotate_reclaimable_page(struct pag
+  	}
+  }
+  
+ -void lru_note_cost(struct page *page)
+ +static void update_page_reclaim_stat(struct lruvec *lruvec,
+ +				     int file, int rotated)
+  {
+ -	struct lruvec *lruvec = mem_cgroup_page_lruvec(page, page_pgdat(page));
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  
+++<<<<<<< HEAD
+ +	reclaim_stat->recent_scanned[file]++;
+ +	if (rotated)
+ +		reclaim_stat->recent_rotated[file]++;
+++=======
++ 	do {
++ 		unsigned long lrusize;
++ 
++ 		/* Record cost event */
++ 		if (page_is_file_lru(page))
++ 			lruvec->file_cost++;
++ 		else
++ 			lruvec->anon_cost++;
++ 
++ 		/*
++ 		 * Decay previous events
++ 		 *
++ 		 * Because workloads change over time (and to avoid
++ 		 * overflow) we keep these statistics as a floating
++ 		 * average, which ends up weighing recent refaults
++ 		 * more than old ones.
++ 		 */
++ 		lrusize = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_FILE);
++ 
++ 		if (lruvec->file_cost + lruvec->anon_cost > lrusize / 4) {
++ 			lruvec->file_cost /= 2;
++ 			lruvec->anon_cost /= 2;
++ 		}
++ 	} while ((lruvec = parent_lruvec(lruvec)));
+++>>>>>>> 7cf111bc39f6 (mm: vmscan: determine anon/file pressure balance at the reclaim root)
+  }
+  
+  static void __activate_page(struct page *page, struct lruvec *lruvec,
+diff --cc mm/vmscan.c
+index 709a0e80e054,d08640f0235c..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -79,6 -79,19 +79,22 @@@ struct scan_control 
+  	 */
+  	struct mem_cgroup *target_mem_cgroup;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Scan pressure balancing between anon and file LRUs
++ 	 */
++ 	unsigned long	anon_cost;
++ 	unsigned long	file_cost;
++ 
++ 	/* Can active pages be deactivated as part of reclaim? */
++ #define DEACTIVATE_ANON 1
++ #define DEACTIVATE_FILE 2
++ 	unsigned int may_deactivate:2;
++ 	unsigned int force_deactivate:1;
++ 	unsigned int skipped_deactivate:1;
++ 
+++>>>>>>> 7cf111bc39f6 (mm: vmscan: determine anon/file pressure balance at the reclaim root)
+  	/* Writepage batching in laptop mode; RECLAIM_WRITE */
+  	unsigned int may_writepage:1;
+  
+@@@ -2299,17 -2230,16 +2315,20 @@@ enum scan_balance 
+   * nr[0] = anon inactive pages to scan; nr[1] = anon active pages to scan
+   * nr[2] = file inactive pages to scan; nr[3] = file active pages to scan
+   */
+ -static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ -			   unsigned long *nr)
+ +static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ +			   struct scan_control *sc, unsigned long *nr)
+  {
+ -	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+  	int swappiness = mem_cgroup_swappiness(memcg);
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  	u64 fraction[2];
+  	u64 denominator = 0;	/* gcc */
+- 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+  	unsigned long anon_prio, file_prio;
+  	enum scan_balance scan_balance;
+++<<<<<<< HEAD
+ +	unsigned long anon, file;
+++=======
++ 	unsigned long totalcost;
+++>>>>>>> 7cf111bc39f6 (mm: vmscan: determine anon/file pressure balance at the reclaim root)
+  	unsigned long ap, fp;
+  	enum lru_list lru;
+  
+@@@ -2399,53 -2289,26 +2418,61 @@@
+  	}
+  
+  	scan_balance = SCAN_FRACT;
+- 
+  	/*
+ -	 * Calculate the pressure balance between anon and file pages.
+ -	 *
+ -	 * The amount of pressure we put on each LRU is inversely
+ -	 * proportional to the cost of reclaiming each list, as
+ -	 * determined by the share of pages that are refaulting, times
+ -	 * the relative IO cost of bringing back a swapped out
+ -	 * anonymous page vs reloading a filesystem page (swappiness).
+ -	 *
+ -	 * With swappiness at 100, anon and file have equal IO cost.
+ +	 * With swappiness at 100, anonymous and file have the same priority.
+ +	 * This scanning priority is essentially the inverse of IO cost.
+  	 */
+  	anon_prio = swappiness;
+  	file_prio = 200 - anon_prio;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * OK, so we have swap space and a fair amount of page cache
+ +	 * pages.  We use the recently rotated / recently scanned
+ +	 * ratios to determine how valuable each cache is.
+ +	 *
+ +	 * Because workloads change over time (and to avoid overflow)
+ +	 * we keep these statistics as a floating average, which ends
+ +	 * up weighing recent references more than old ones.
+ +	 *
+ +	 * anon in [0], file in [1]
+ +	 */
+ +
+ +	anon  = lruvec_lru_size(lruvec, LRU_ACTIVE_ANON, MAX_NR_ZONES) +
+ +		lruvec_lru_size(lruvec, LRU_INACTIVE_ANON, MAX_NR_ZONES);
+ +	file  = lruvec_lru_size(lruvec, LRU_ACTIVE_FILE, MAX_NR_ZONES) +
+ +		lruvec_lru_size(lruvec, LRU_INACTIVE_FILE, MAX_NR_ZONES);
+ +
+ +	spin_lock_irq(&pgdat->lru_lock);
+ +	if (unlikely(reclaim_stat->recent_scanned[0] > anon / 4)) {
+ +		reclaim_stat->recent_scanned[0] /= 2;
+ +		reclaim_stat->recent_rotated[0] /= 2;
+ +	}
+ +
+ +	if (unlikely(reclaim_stat->recent_scanned[1] > file / 4)) {
+ +		reclaim_stat->recent_scanned[1] /= 2;
+ +		reclaim_stat->recent_rotated[1] /= 2;
+ +	}
+ +
+ +	/*
+ +	 * The amount of pressure on anon vs file pages is inversely
+ +	 * proportional to the fraction of recently scanned pages on
+ +	 * each list that were recently referenced and in active use.
+ +	 */
+ +	ap = anon_prio * (reclaim_stat->recent_scanned[0] + 1);
+ +	ap /= reclaim_stat->recent_rotated[0] + 1;
+ +
+ +	fp = file_prio * (reclaim_stat->recent_scanned[1] + 1);
+ +	fp /= reclaim_stat->recent_rotated[1] + 1;
+ +	spin_unlock_irq(&pgdat->lru_lock);
+++=======
++ 	totalcost = sc->anon_cost + sc->file_cost;
++ 	ap = anon_prio * (totalcost + 1);
++ 	ap /= sc->anon_cost + 1;
++ 
++ 	fp = file_prio * (totalcost + 1);
++ 	fp /= sc->file_cost + 1;
+++>>>>>>> 7cf111bc39f6 (mm: vmscan: determine anon/file pressure balance at the reclaim root)
+  
+  	fraction[0] = ap;
+  	fraction[1] = fp;
+@@@ -2750,143 -2660,180 +2777,160 @@@ static void shrink_node(pg_data_t *pgda
+  {
+  	struct reclaim_state *reclaim_state = current->reclaim_state;
+  	unsigned long nr_reclaimed, nr_scanned;
+ -	struct lruvec *target_lruvec;
+  	bool reclaimable = false;
+ -	unsigned long file;
+  
+ -	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
+ +	do {
+ +		struct mem_cgroup *root = sc->target_mem_cgroup;
+ +		struct mem_cgroup *memcg;
+  
+ -again:
+ -	memset(&sc->nr, 0, sizeof(sc->nr));
+ +		memset(&sc->nr, 0, sizeof(sc->nr));
+  
+ -	nr_reclaimed = sc->nr_reclaimed;
+ -	nr_scanned = sc->nr_scanned;
+ +		nr_reclaimed = sc->nr_reclaimed;
+ +		nr_scanned = sc->nr_scanned;
+  
+++<<<<<<< HEAD
+ +		memcg = mem_cgroup_iter(root, NULL, NULL);
+ +		do {
+ +			unsigned long reclaimed;
+ +			unsigned long scanned;
+++=======
++ 	/*
++ 	 * Determine the scan balance between anon and file LRUs.
++ 	 */
++ 	spin_lock_irq(&pgdat->lru_lock);
++ 	sc->anon_cost = target_lruvec->anon_cost;
++ 	sc->file_cost = target_lruvec->file_cost;
++ 	spin_unlock_irq(&pgdat->lru_lock);
++ 
++ 	/*
++ 	 * Target desirable inactive:active list ratios for the anon
++ 	 * and file LRU lists.
++ 	 */
++ 	if (!sc->force_deactivate) {
++ 		unsigned long refaults;
+++>>>>>>> 7cf111bc39f6 (mm: vmscan: determine anon/file pressure balance at the reclaim root)
+  
+ -		if (inactive_is_low(target_lruvec, LRU_INACTIVE_ANON))
+ -			sc->may_deactivate |= DEACTIVATE_ANON;
+ -		else
+ -			sc->may_deactivate &= ~DEACTIVATE_ANON;
+ -
+ -		/*
+ -		 * When refaults are being observed, it means a new
+ -		 * workingset is being established. Deactivate to get
+ -		 * rid of any stale active pages quickly.
+ -		 */
+ -		refaults = lruvec_page_state(target_lruvec,
+ -					     WORKINGSET_ACTIVATE);
+ -		if (refaults != target_lruvec->refaults ||
+ -		    inactive_is_low(target_lruvec, LRU_INACTIVE_FILE))
+ -			sc->may_deactivate |= DEACTIVATE_FILE;
+ -		else
+ -			sc->may_deactivate &= ~DEACTIVATE_FILE;
+ -	} else
+ -		sc->may_deactivate = DEACTIVATE_ANON | DEACTIVATE_FILE;
+ +			switch (mem_cgroup_protected(root, memcg)) {
+ +			case MEMCG_PROT_MIN:
+ +				/*
+ +				 * Hard protection.
+ +				 * If there is no reclaimable memory, OOM.
+ +				 */
+ +				continue;
+ +			case MEMCG_PROT_LOW:
+ +				/*
+ +				 * Soft protection.
+ +				 * Respect the protection only as long as
+ +				 * there is an unprotected supply
+ +				 * of reclaimable memory from other cgroups.
+ +				 */
+ +				if (!sc->memcg_low_reclaim) {
+ +					sc->memcg_low_skipped = 1;
+ +					continue;
+ +				}
+ +				memcg_memory_event(memcg, MEMCG_LOW);
+ +				break;
+ +			case MEMCG_PROT_NONE:
+ +				/*
+ +				 * All protection thresholds breached. We may
+ +				 * still choose to vary the scan pressure
+ +				 * applied based on by how much the cgroup in
+ +				 * question has exceeded its protection
+ +				 * thresholds (see get_scan_count).
+ +				 */
+ +				break;
+ +			}
+  
+ -	/*
+ -	 * If we have plenty of inactive file pages that aren't
+ -	 * thrashing, try to reclaim those first before touching
+ -	 * anonymous pages.
+ -	 */
+ -	file = lruvec_page_state(target_lruvec, NR_INACTIVE_FILE);
+ -	if (file >> sc->priority && !(sc->may_deactivate & DEACTIVATE_FILE))
+ -		sc->cache_trim_mode = 1;
+ -	else
+ -		sc->cache_trim_mode = 0;
+ +			reclaimed = sc->nr_reclaimed;
+ +			scanned = sc->nr_scanned;
+ +			shrink_node_memcg(pgdat, memcg, sc);
+  
+ -	/*
+ -	 * Prevent the reclaimer from falling into the cache trap: as
+ -	 * cache pages start out inactive, every cache fault will tip
+ -	 * the scan balance towards the file LRU.  And as the file LRU
+ -	 * shrinks, so does the window for rotation from references.
+ -	 * This means we have a runaway feedback loop where a tiny
+ -	 * thrashing file LRU becomes infinitely more attractive than
+ -	 * anon pages.  Try to detect this based on file LRU size.
+ -	 */
+ -	if (!cgroup_reclaim(sc)) {
+ -		unsigned long total_high_wmark = 0;
+ -		unsigned long free, anon;
+ -		int z;
+ +			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+ +					sc->priority);
+  
+ -		free = sum_zone_node_page_state(pgdat->node_id, NR_FREE_PAGES);
+ -		file = node_page_state(pgdat, NR_ACTIVE_FILE) +
+ -			   node_page_state(pgdat, NR_INACTIVE_FILE);
+ +			/* Record the group's reclaim efficiency */
+ +			vmpressure(sc->gfp_mask, memcg, false,
+ +				   sc->nr_scanned - scanned,
+ +				   sc->nr_reclaimed - reclaimed);
+  
+ -		for (z = 0; z < MAX_NR_ZONES; z++) {
+ -			struct zone *zone = &pgdat->node_zones[z];
+ -			if (!managed_zone(zone))
+ -				continue;
+ +		} while ((memcg = mem_cgroup_iter(root, memcg, NULL)));
+  
+ -			total_high_wmark += high_wmark_pages(zone);
+ +		if (reclaim_state) {
+ +			sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+ +			reclaim_state->reclaimed_slab = 0;
+  		}
+  
+ -		/*
+ -		 * Consider anon: if that's low too, this isn't a
+ -		 * runaway file reclaim problem, but rather just
+ -		 * extreme pressure. Reclaim as per usual then.
+ -		 */
+ -		anon = node_page_state(pgdat, NR_INACTIVE_ANON);
+ +		/* Record the subtree's reclaim efficiency */
+ +		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+ +			   sc->nr_scanned - nr_scanned,
+ +			   sc->nr_reclaimed - nr_reclaimed);
+  
+ -		sc->file_is_tiny =
+ -			file + free <= total_high_wmark &&
+ -			!(sc->may_deactivate & DEACTIVATE_ANON) &&
+ -			anon >> sc->priority;
+ -	}
+ +		if (sc->nr_reclaimed - nr_reclaimed)
+ +			reclaimable = true;
+  
+ -	shrink_node_memcgs(pgdat, sc);
+ +		if (current_is_kswapd()) {
+ +			/*
+ +			 * If reclaim is isolating dirty pages under writeback,
+ +			 * it implies that the long-lived page allocation rate
+ +			 * is exceeding the page laundering rate. Either the
+ +			 * global limits are not being effective at throttling
+ +			 * processes due to the page distribution throughout
+ +			 * zones or there is heavy usage of a slow backing
+ +			 * device. The only option is to throttle from reclaim
+ +			 * context which is not ideal as there is no guarantee
+ +			 * the dirtying process is throttled in the same way
+ +			 * balance_dirty_pages() manages.
+ +			 *
+ +			 * Once a node is flagged PGDAT_WRITEBACK, kswapd will
+ +			 * count the number of pages under pages flagged for
+ +			 * immediate reclaim and stall if any are encountered
+ +			 * in the nr_immediate check below.
+ +			 */
+ +			if (sc->nr.writeback && sc->nr.writeback == sc->nr.taken)
+ +				set_bit(PGDAT_WRITEBACK, &pgdat->flags);
+  
+ -	if (reclaim_state) {
+ -		sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+ -		reclaim_state->reclaimed_slab = 0;
+ -	}
+ +			/*
+ +			 * Tag a node as congested if all the dirty pages
+ +			 * scanned were backed by a congested BDI and
+ +			 * wait_iff_congested will stall.
+ +			 */
+ +			if (sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ +				set_bit(PGDAT_CONGESTED, &pgdat->flags);
+  
+ -	/* Record the subtree's reclaim efficiency */
+ -	vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+ -		   sc->nr_scanned - nr_scanned,
+ -		   sc->nr_reclaimed - nr_reclaimed);
+ +			/* Allow kswapd to start writing pages during reclaim.*/
+ +			if (sc->nr.unqueued_dirty == sc->nr.file_taken)
+ +				set_bit(PGDAT_DIRTY, &pgdat->flags);
+  
+ -	if (sc->nr_reclaimed - nr_reclaimed)
+ -		reclaimable = true;
+ +			/*
+ +			 * If kswapd scans pages marked marked for immediate
+ +			 * reclaim and under writeback (nr_immediate), it
+ +			 * implies that pages are cycling through the LRU
+ +			 * faster than they are written so also forcibly stall.
+ +			 */
+ +			if (sc->nr.immediate)
+ +				congestion_wait(BLK_RW_ASYNC, HZ/10);
+ +		}
+  
+ -	if (current_is_kswapd()) {
+  		/*
+ -		 * If reclaim is isolating dirty pages under writeback,
+ -		 * it implies that the long-lived page allocation rate
+ -		 * is exceeding the page laundering rate. Either the
+ -		 * global limits are not being effective at throttling
+ -		 * processes due to the page distribution throughout
+ -		 * zones or there is heavy usage of a slow backing
+ -		 * device. The only option is to throttle from reclaim
+ -		 * context which is not ideal as there is no guarantee
+ -		 * the dirtying process is throttled in the same way
+ -		 * balance_dirty_pages() manages.
+ -		 *
+ -		 * Once a node is flagged PGDAT_WRITEBACK, kswapd will
+ -		 * count the number of pages under pages flagged for
+ -		 * immediate reclaim and stall if any are encountered
+ -		 * in the nr_immediate check below.
+ +		 * Legacy memcg will stall in page writeback so avoid forcibly
+ +		 * stalling in wait_iff_congested().
+  		 */
+ -		if (sc->nr.writeback && sc->nr.writeback == sc->nr.taken)
+ -			set_bit(PGDAT_WRITEBACK, &pgdat->flags);
+ -
+ -		/* Allow kswapd to start writing pages during reclaim.*/
+ -		if (sc->nr.unqueued_dirty == sc->nr.file_taken)
+ -			set_bit(PGDAT_DIRTY, &pgdat->flags);
+ +		if (!global_reclaim(sc) && sane_reclaim(sc) &&
+ +		    sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ +			set_memcg_congestion(pgdat, root, true);
+  
+  		/*
+ -		 * If kswapd scans pages marked marked for immediate
+ -		 * reclaim and under writeback (nr_immediate), it
+ -		 * implies that pages are cycling through the LRU
+ -		 * faster than they are written so also forcibly stall.
+ +		 * Stall direct reclaim for IO completions if underlying BDIs
+ +		 * and node is congested. Allow kswapd to continue until it
+ +		 * starts encountering unqueued dirty pages or cycling through
+ +		 * the LRU too quickly.
+  		 */
+ -		if (sc->nr.immediate)
+ -			congestion_wait(BLK_RW_ASYNC, HZ/10);
+ -	}
+ +		if (!sc->hibernation_mode && !current_is_kswapd() &&
+ +		   current_may_throttle() && pgdat_memcg_congested(pgdat, root))
+ +			wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+  
+ -	/*
+ -	 * Tag a node/memcg as congested if all the dirty pages
+ -	 * scanned were backed by a congested BDI and
+ -	 * wait_iff_congested will stall.
+ -	 *
+ -	 * Legacy memcg will stall in page writeback so avoid forcibly
+ -	 * stalling in wait_iff_congested().
+ -	 */
+ -	if ((current_is_kswapd() ||
+ -	     (cgroup_reclaim(sc) && writeback_throttling_sane(sc))) &&
+ -	    sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ -		set_bit(LRUVEC_CONGESTED, &target_lruvec->flags);
+ -
+ -	/*
+ -	 * Stall direct reclaim for IO completions if underlying BDIs
+ -	 * and node is congested. Allow kswapd to continue until it
+ -	 * starts encountering unqueued dirty pages or cycling through
+ -	 * the LRU too quickly.
+ -	 */
+ -	if (!current_is_kswapd() && current_may_throttle() &&
+ -	    !sc->hibernation_mode &&
+ -	    test_bit(LRUVEC_CONGESTED, &target_lruvec->flags))
+ -		wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+ -
+ -	if (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ -				    sc))
+ -		goto again;
+ +	} while (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ +					 sc));
+  
+  	/*
+  	 * Kswapd gives up on balancing particular nodes after too
+diff --git a/include/linux/memcontrol.h b/include/linux/memcontrol.h
+index aaaa5a5dc184..388eda0edeb9 100644
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@ -1278,6 +1278,19 @@ static inline void dec_lruvec_page_state(struct page *page,
+ 	mod_lruvec_page_state(page, idx, -1);
+ }
+ 
++static inline struct lruvec *parent_lruvec(struct lruvec *lruvec)
++{
++	struct mem_cgroup *memcg;
++
++	memcg = lruvec_memcg(lruvec);
++	if (!memcg)
++		return NULL;
++	memcg = parent_mem_cgroup(memcg);
++	if (!memcg)
++		return NULL;
++	return mem_cgroup_lruvec(memcg, lruvec_pgdat(lruvec));
++}
++
+ #ifdef CONFIG_CGROUP_WRITEBACK
+ 
+ struct wb_domain *mem_cgroup_wb_domain(struct bdi_writeback *wb);
+* Unmerged path mm/swap.c
+* Unmerged path mm/vmscan.c
