@@ -1,0 +1,84 @@
+KVM: sefltests: Add explicit synchronization to move mem region test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 8a0639fe9201ed7af73dd40fc4b6f9a4f7b16a42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8a0639fe.failed
+
+Use sem_post() and sem_timedwait() to synchronize test stages between
+the vCPU thread and the main thread instead of using usleep() to wait
+for the vCPU thread and hoping for the best.
+
+Opportunistically refactor the code to make it suck less in general,
+and to prepare for adding more testcases.
+
+	Suggested-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200410231707.7128-6-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8a0639fe9201ed7af73dd40fc4b6f9a4f7b16a42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+diff --cc tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+index 125aeab59ab6,629dd8579b73..000000000000
+--- a/tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
++++ b/tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
+@@@ -49,20 -52,40 +52,46 @@@ static void *vcpu_worker(void *data
+  
+  	/*
+  	 * Loop until the guest is done.  Re-enter the guest on all MMIO exits,
+- 	 * which will occur if the guest attempts to access a memslot while it
+- 	 * is being moved.
++ 	 * which will occur if the guest attempts to access a memslot after it
++ 	 * has been deleted or while it is being moved .
+  	 */
+  	run = vcpu_state(vm, VCPU_ID);
+- 	do {
++ 
++ 	while (1) {
+  		vcpu_run(vm, VCPU_ID);
+- 	} while (run->exit_reason == KVM_EXIT_MMIO);
+  
+- 	TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
+- 		    "Unexpected exit reason = %d", run->exit_reason);
++ 		if (run->exit_reason == KVM_EXIT_IO) {
++ 			cmd = get_ucall(vm, VCPU_ID, &uc);
++ 			if (cmd != UCALL_SYNC)
++ 				break;
+  
++ 			sem_post(&vcpu_ready);
++ 			continue;
++ 		}
++ 
++ 		if (run->exit_reason != KVM_EXIT_MMIO)
++ 			break;
++ 
++ 		TEST_ASSERT(!run->mmio.is_write, "Unexpected exit mmio write");
++ 		TEST_ASSERT(run->mmio.len == 8,
++ 			    "Unexpected exit mmio size = %u", run->mmio.len);
++ 
++ 		TEST_ASSERT(run->mmio.phys_addr == MEM_REGION_GPA,
++ 			    "Unexpected exit mmio address = 0x%llx",
++ 			    run->mmio.phys_addr);
++ 		memcpy(run->mmio.data, &MMIO_VAL, 8);
++ 	}
++ 
++ 	if (run->exit_reason == KVM_EXIT_IO && cmd == UCALL_ABORT)
++ 		TEST_FAIL("%s at %s:%ld, val = %lu", (const char *)uc.args[0],
++ 			  __FILE__, uc.args[1], uc.args[2]);
++ 
+++<<<<<<< HEAD
+ +	cmd = get_ucall(vm, VCPU_ID, &uc);
+ +	TEST_ASSERT(cmd == UCALL_DONE, "Unexpected val in guest = %llu",
+ +		    uc.args[0]);
+++=======
+++>>>>>>> 8a0639fe9201 (KVM: sefltests: Add explicit synchronization to move mem region test)
+  	return NULL;
+  }
+  
+* Unmerged path tools/testing/selftests/kvm/x86_64/set_memory_region_test.c
