@@ -1640,6 +1640,17 @@ bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
 				enum bpf_attach_type expected_attach_type)
 {
 	switch (prog_type) {
+	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+		if (btf_id > BTF_MAX_TYPE)
+			return -EINVAL;
+		break;
+	default:
+		if (btf_id)
+			return -EINVAL;
+		break;
+	}
+
+	switch (prog_type) {
 	case BPF_PROG_TYPE_CGROUP_SOCK:
 		switch (expected_attach_type) {
 		case BPF_CGROUP_INET_SOCK_CREATE:
