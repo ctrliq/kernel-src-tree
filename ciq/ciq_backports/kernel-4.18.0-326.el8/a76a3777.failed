@@ -1,0 +1,108 @@
+iommu/arm-smmu-v3: Ensure queue is read after updating prod pointer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Zhou Wang <wangzhou1@hisilicon.com>
+commit a76a37777f2c936b1f046bfc0c5982c958b16bfe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/a76a3777.failed
+
+Reading the 'prod' MMIO register in order to determine whether or not
+there is valid data beyond 'cons' for a given queue does not provide
+sufficient dependency ordering, as the resulting access is address
+dependent only on 'cons' and can therefore be speculated ahead of time,
+potentially allowing stale data to be read by the CPU.
+
+Use readl() instead of readl_relaxed() when updating the shadow copy of
+the 'prod' pointer, so that all speculated memory reads from the
+corresponding queue can occur only from valid slots.
+
+	Signed-off-by: Zhou Wang <wangzhou1@hisilicon.com>
+Link: https://lore.kernel.org/r/1601281922-117296-1-git-send-email-wangzhou1@hisilicon.com
+[will: Use readl() instead of explicit barrier. Update 'cons' side to match.]
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit a76a37777f2c936b1f046bfc0c5982c958b16bfe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/io.h
+diff --cc arch/arm64/include/asm/io.h
+index bb2abd312459,fd172c41df90..000000000000
+--- a/arch/arm64/include/asm/io.h
++++ b/arch/arm64/include/asm/io.h
+@@@ -104,8 -91,26 +104,31 @@@ static inline u64 __raw_readq(const vol
+  }
+  
+  /* IO barriers */
+++<<<<<<< HEAD
+ +#define __iormb()		rmb()
+ +#define __iowmb()		wmb()
+++=======
++ #define __iormb(v)							\
++ ({									\
++ 	unsigned long tmp;						\
++ 									\
++ 	dma_rmb();								\
++ 									\
++ 	/*								\
++ 	 * Create a dummy control dependency from the IO read to any	\
++ 	 * later instructions. This ensures that a subsequent call to	\
++ 	 * udelay() will be ordered due to the ISB in get_cycles().	\
++ 	 */								\
++ 	asm volatile("eor	%0, %1, %1\n"				\
++ 		     "cbnz	%0, ."					\
++ 		     : "=r" (tmp) : "r" ((unsigned long)(v))		\
++ 		     : "memory");					\
++ })
++ 
++ #define __io_par(v)		__iormb(v)
++ #define __iowmb()		dma_wmb()
++ #define __iomb()		dma_mb()
+++>>>>>>> a76a37777f2c (iommu/arm-smmu-v3: Ensure queue is read after updating prod pointer)
+  
+  /*
+   * Relaxed I/O memory access primitives. These follow the Device memory
+diff --git a/arch/arm64/include/asm/barrier.h b/arch/arm64/include/asm/barrier.h
+index 1b3e1194b511..59487ad3bf7a 100644
+--- a/arch/arm64/include/asm/barrier.h
++++ b/arch/arm64/include/asm/barrier.h
+@@ -54,6 +54,7 @@
+ #define rmb()		dsb(ld)
+ #define wmb()		dsb(st)
+ 
++#define dma_mb()	dmb(osh)
+ #define dma_rmb()	dmb(oshld)
+ #define dma_wmb()	dmb(oshst)
+ 
+* Unmerged path arch/arm64/include/asm/io.h
+diff --git a/drivers/iommu/arm-smmu-v3.c b/drivers/iommu/arm-smmu-v3.c
+index 50b45eab7d93..66a63ac5be1a 100644
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@ -810,7 +810,7 @@ static void queue_sync_cons_out(struct arm_smmu_queue *q)
+ 	 * Ensure that all CPU accesses (reads and writes) to the queue
+ 	 * are complete before we update the cons pointer.
+ 	 */
+-	mb();
++	__iomb();
+ 	writel_relaxed(q->llq.cons, q->cons_reg);
+ }
+ 
+@@ -822,8 +822,15 @@ static void queue_inc_cons(struct arm_smmu_ll_queue *q)
+ 
+ static int queue_sync_prod_in(struct arm_smmu_queue *q)
+ {
++	u32 prod;
+ 	int ret = 0;
+-	u32 prod = readl_relaxed(q->prod_reg);
++
++	/*
++	 * We can't use the _relaxed() variant here, as we must prevent
++	 * speculative reads of the queue before we have determined that
++	 * prod has indeed moved.
++	 */
++	prod = readl(q->prod_reg);
+ 
+ 	if (Q_OVF(prod) != Q_OVF(q->llq.prod))
+ 		ret = -EOVERFLOW;
