@@ -1,0 +1,401 @@
+block: add queue_is_mq() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 344e9ffcbd1898e1dc04085564a6e05c30ea8199
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/344e9ffc.failed
+
+Various spots check for q->mq_ops being non-NULL, but provide
+a helper to do this instead.
+
+Where the ->mq_ops != NULL check is redundant, remove it.
+
+Since mq == rq-based now that legacy is gone, get rid of the
+queue_is_rq_based() and just use queue_is_mq() everywhere.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 344e9ffcbd1898e1dc04085564a6e05c30ea8199)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-sysfs.c
+#	block/elevator.c
+diff --cc block/blk-sysfs.c
+index 369b4855dcaf,80eef48fddc8..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -68,7 -68,7 +68,11 @@@ queue_requests_store(struct request_que
+  	unsigned long nr;
+  	int ret, err;
+  
+++<<<<<<< HEAD
+ +	if (!q->request_fn && !q->mq_ops)
+++=======
++ 	if (!queue_is_mq(q))
+++>>>>>>> 344e9ffcbd18 (block: add queue_is_mq() helper)
+  		return -EINVAL;
+  
+  	ret = queue_var_store(&nr, page, count);
+@@@ -819,19 -816,27 +823,23 @@@ static void __blk_release_queue(struct 
+  		blk_stat_remove_callback(q, q->poll_cb);
+  	blk_stat_free_callback(q->poll_cb);
+  
+ -	if (!blk_queue_dead(q)) {
+ -		/*
+ -		 * Last reference was dropped without having called
+ -		 * blk_cleanup_queue().
+ -		 */
+ -		WARN_ONCE(blk_queue_init_done(q),
+ -			  "request queue %p has been registered but blk_cleanup_queue() has not been called for that queue\n",
+ -			  q);
+ -		blk_exit_queue(q);
+ -	}
+ -
+ -	WARN(blk_queue_root_blkg(q),
+ -	     "request queue %p is being released but it has not yet been removed from the blkcg controller\n",
+ -	     q);
+ -
+  	blk_free_queue_stats(q->stats);
+  
+ +	blk_exit_rl(q, &q->root_rl);
+ +
+  	blk_queue_free_zone_bitmaps(q);
+  
+++<<<<<<< HEAD
+ +	if (!q->mq_ops) {
+ +		if (q->exit_rq_fn)
+ +			q->exit_rq_fn(q, q->fq->flush_rq);
+ +		blk_free_flush_queue(q->fq);
+ +	} else {
+++=======
++ 	if (queue_is_mq(q))
+++>>>>>>> 344e9ffcbd18 (block: add queue_is_mq() helper)
+  		blk_mq_release(q);
+ +	}
+  
+  	blk_trace_shutdown(q);
+  
+@@@ -921,7 -925,7 +929,11 @@@ int blk_register_queue(struct gendisk *
+  
+  	blk_throtl_register_queue(q);
+  
+++<<<<<<< HEAD
+ +	if (q->request_fn || (q->mq_ops && q->elevator)) {
+++=======
++ 	if (q->elevator) {
+++>>>>>>> 344e9ffcbd18 (block: add queue_is_mq() helper)
+  		ret = elv_register_queue(q);
+  		if (ret) {
+  			mutex_unlock(&q->sysfs_lock);
+@@@ -979,7 -983,7 +991,11 @@@ void blk_unregister_queue(struct gendis
+  	blk_trace_remove_sysfs(disk_to_dev(disk));
+  
+  	mutex_lock(&q->sysfs_lock);
+++<<<<<<< HEAD
+ +	if (q->request_fn || (q->mq_ops && q->elevator))
+++=======
++ 	if (q->elevator)
+++>>>>>>> 344e9ffcbd18 (block: add queue_is_mq() helper)
+  		elv_unregister_queue(q);
+  	mutex_unlock(&q->sysfs_lock);
+  
+diff --cc block/elevator.c
+index 3306a9c70686,f05e90d4e695..000000000000
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@@ -1096,7 -695,7 +1095,11 @@@ ssize_t elv_iosched_store(struct reques
+  {
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!(q->mq_ops || q->request_fn) || !elv_support_iosched(q))
+++=======
++ 	if (!queue_is_mq(q) || !elv_support_iosched(q))
+++>>>>>>> 344e9ffcbd18 (block: add queue_is_mq() helper)
+  		return count;
+  
+  	ret = __elevator_change(q, name);
+@@@ -1111,10 -710,9 +1114,10 @@@ ssize_t elv_iosched_show(struct request
+  	struct elevator_queue *e = q->elevator;
+  	struct elevator_type *elv = NULL;
+  	struct elevator_type *__e;
+ +	bool uses_mq = q->mq_ops != NULL;
+  	int len = 0;
+  
+- 	if (!queue_is_rq_based(q))
++ 	if (!queue_is_mq(q))
+  		return sprintf(name, "none\n");
+  
+  	if (!q->elevator)
+diff --git a/block/blk-cgroup.c b/block/blk-cgroup.c
+index 301ed0447460..c6eb8e08c952 100644
+--- a/block/blk-cgroup.c
++++ b/block/blk-cgroup.c
+@@ -1382,7 +1382,7 @@ int blkcg_activate_policy(struct request_queue *q,
+ 	if (blkcg_policy_enabled(q, pol))
+ 		return 0;
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_freeze_queue(q);
+ pd_prealloc:
+ 	if (!pd_prealloc) {
+@@ -1421,7 +1421,7 @@ int blkcg_activate_policy(struct request_queue *q,
+ 
+ 	spin_unlock_irq(q->queue_lock);
+ out_bypass_end:
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_unfreeze_queue(q);
+ 	if (pd_prealloc)
+ 		pol->pd_free_fn(pd_prealloc);
+@@ -1445,7 +1445,7 @@ void blkcg_deactivate_policy(struct request_queue *q,
+ 	if (!blkcg_policy_enabled(q, pol))
+ 		return;
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_freeze_queue(q);
+ 
+ 	spin_lock_irq(q->queue_lock);
+@@ -1466,7 +1466,7 @@ void blkcg_deactivate_policy(struct request_queue *q,
+ 
+ 	spin_unlock_irq(q->queue_lock);
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_unfreeze_queue(q);
+ }
+ EXPORT_SYMBOL_GPL(blkcg_deactivate_policy);
+diff --git a/block/blk-core.c b/block/blk-core.c
+index f000f658d70d..6d4f4b62922c 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -402,7 +402,7 @@ void blk_sync_queue(struct request_queue *q)
+ 	del_timer_sync(&q->timeout);
+ 	cancel_work_sync(&q->timeout_work);
+ 
+-	if (q->mq_ops) {
++	if (queue_is_mq(q)) {
+ 		struct blk_mq_hw_ctx *hctx;
+ 		int i;
+ 
+@@ -691,7 +691,7 @@ void blk_set_queue_dying(struct request_queue *q)
+ 	 */
+ 	blk_freeze_queue_start(q);
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_wake_waiters(q);
+ 	else {
+ 		struct request_list *rl;
+@@ -784,7 +784,7 @@ void blk_cleanup_queue(struct request_queue *q)
+ 	 * blk_freeze_queue() should be enough for cases of passthrough
+ 	 * request.
+ 	 */
+-	if (q->mq_ops && blk_queue_init_done(q))
++	if (queue_is_mq(q) && blk_queue_init_done(q))
+ 		blk_mq_quiesce_queue(q);
+ 
+ 	/* for synchronous bio-based driver finish in-flight integrity i/o */
+@@ -802,7 +802,7 @@ void blk_cleanup_queue(struct request_queue *q)
+ 
+ 	blk_exit_queue(q);
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		blk_mq_free_queue(q);
+ 	percpu_ref_exit(&q->q_usage_counter);
+ 
+@@ -2220,7 +2220,7 @@ generic_make_request_checks(struct bio *bio)
+ 	 * For a REQ_NOWAIT based request, return -EOPNOTSUPP
+ 	 * if queue is not a request based queue.
+ 	 */
+-	if ((bio->bi_opf & REQ_NOWAIT) && !queue_is_rq_based(q))
++	if ((bio->bi_opf & REQ_NOWAIT) && !queue_is_mq(q))
+ 		goto not_supported;
+ 
+ 	if (should_fail_bio(bio))
+@@ -3382,7 +3382,7 @@ EXPORT_SYMBOL_GPL(rq_flush_dcache_pages);
+  */
+ int blk_lld_busy(struct request_queue *q)
+ {
+-	if (q->mq_ops && q->mq_ops->busy)
++	if (queue_is_mq(q) && q->mq_ops->busy)
+ 		return q->mq_ops->busy(q);
+ 
+ 	return 0;
+diff --git a/block/blk-flush.c b/block/blk-flush.c
+index e5418f2c39fb..10456a7458e8 100644
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@ -274,8 +274,7 @@ static void blk_kick_flush(struct request_queue *q, struct blk_flush_queue *fq,
+ 	 * assigned to empty flushes, and we deadlock if we are expecting
+ 	 * other requests to make progress. Don't defer for that case.
+ 	 */
+-	if (!list_empty(&fq->flush_data_in_flight) &&
+-	    !(q->mq_ops && q->elevator) &&
++	if (!list_empty(&fq->flush_data_in_flight) && q->elevator &&
+ 	    time_before(jiffies,
+ 			fq->flush_pending_since + FLUSH_PENDING_TIMEOUT))
+ 		return;
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 4b2e156a81b5..1b1cb44b8db9 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -146,7 +146,7 @@ void blk_freeze_queue_start(struct request_queue *q)
+ 	freeze_depth = atomic_inc_return(&q->mq_freeze_depth);
+ 	if (freeze_depth == 1) {
+ 		percpu_ref_kill(&q->q_usage_counter);
+-		if (q->mq_ops)
++		if (queue_is_mq(q))
+ 			blk_mq_run_hw_queues(q, false);
+ 	}
+ }
+* Unmerged path block/blk-sysfs.c
+diff --git a/block/blk-throttle.c b/block/blk-throttle.c
+index 07f1b008e5ab..3efed8c8e5fb 100644
+--- a/block/blk-throttle.c
++++ b/block/blk-throttle.c
+@@ -2455,7 +2455,7 @@ void blk_throtl_register_queue(struct request_queue *q)
+ 	td->throtl_slice = DFL_THROTL_SLICE_HD;
+ #endif
+ 
+-	td->track_bio_latency = !queue_is_rq_based(q);
++	td->track_bio_latency = !queue_is_mq(q);
+ 	if (!td->track_bio_latency)
+ 		blk_stat_enable_accounting(q);
+ }
+diff --git a/block/blk-wbt.c b/block/blk-wbt.c
+index 9f142b84dc85..d051ebfb4852 100644
+--- a/block/blk-wbt.c
++++ b/block/blk-wbt.c
+@@ -701,7 +701,7 @@ void wbt_enable_default(struct request_queue *q)
+ 	if (!test_bit(QUEUE_FLAG_REGISTERED, &q->queue_flags))
+ 		return;
+ 
+-	if (q->mq_ops && IS_ENABLED(CONFIG_BLK_WBT_MQ))
++	if (queue_is_mq(q) && IS_ENABLED(CONFIG_BLK_WBT_MQ))
+ 		wbt_init(q);
+ }
+ EXPORT_SYMBOL_GPL(wbt_enable_default);
+diff --git a/block/blk-zoned.c b/block/blk-zoned.c
+index 13ba2011a306..e9c332b1d9da 100644
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@ -421,7 +421,7 @@ int blk_revalidate_disk_zones(struct gendisk *disk)
+ 	 * BIO based queues do not use a scheduler so only q->nr_zones
+ 	 * needs to be updated so that the sysfs exposed value is correct.
+ 	 */
+-	if (!queue_is_rq_based(q)) {
++	if (!queue_is_mq(q)) {
+ 		q->nr_zones = nr_zones;
+ 		return 0;
+ 	}
+diff --git a/block/bsg.c b/block/bsg.c
+index db588add6ba6..1562dff98e1c 100644
+--- a/block/bsg.c
++++ b/block/bsg.c
+@@ -471,7 +471,7 @@ int bsg_register_queue(struct request_queue *q, struct device *parent,
+ 	/*
+ 	 * we need a proper transport to send commands, not a stacked device
+ 	 */
+-	if (!queue_is_rq_based(q))
++	if (!queue_is_mq(q))
+ 		return 0;
+ 
+ 	bcd = &q->bsg_dev;
+* Unmerged path block/elevator.c
+diff --git a/block/genhd.c b/block/genhd.c
+index be5bab20b2ab..8a7e7909ed52 100644
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@ -47,7 +47,7 @@ static void disk_release_events(struct gendisk *disk);
+ 
+ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+ {
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		return;
+ 
+ 	atomic_inc(&part->in_flight[rw]);
+@@ -57,7 +57,7 @@ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+ 
+ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+ {
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		return;
+ 
+ 	atomic_dec(&part->in_flight[rw]);
+@@ -68,7 +68,7 @@ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part, int rw)
+ void part_in_flight(struct request_queue *q, struct hd_struct *part,
+ 		    unsigned int inflight[2])
+ {
+-	if (q->mq_ops) {
++	if (queue_is_mq(q)) {
+ 		blk_mq_in_flight(q, part, inflight);
+ 		return;
+ 	}
+@@ -85,7 +85,7 @@ void part_in_flight(struct request_queue *q, struct hd_struct *part,
+ void part_in_flight_rw(struct request_queue *q, struct hd_struct *part,
+ 		       unsigned int inflight[2])
+ {
+-	if (q->mq_ops) {
++	if (queue_is_mq(q)) {
+ 		blk_mq_in_flight_rw(q, part, inflight);
+ 		return;
+ 	}
+diff --git a/drivers/md/dm-rq.c b/drivers/md/dm-rq.c
+index 7cd36e4d1310..1f1fe9a618ea 100644
+--- a/drivers/md/dm-rq.c
++++ b/drivers/md/dm-rq.c
+@@ -43,7 +43,7 @@ static unsigned dm_get_blk_mq_queue_depth(void)
+ 
+ int dm_request_based(struct mapped_device *md)
+ {
+-	return queue_is_rq_based(md->queue);
++	return queue_is_mq(md->queue);
+ }
+ 
+ void dm_start_queue(struct request_queue *q)
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 812f1ff43137..04dc0470538d 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -919,12 +919,12 @@ static int device_is_rq_based(struct dm_target *ti, struct dm_dev *dev,
+ 	struct request_queue *q = bdev_get_queue(dev->bdev);
+ 	struct verify_rq_based_data *v = data;
+ 
+-	if (q->mq_ops)
++	if (queue_is_mq(q))
+ 		v->mq_count++;
+ 	else
+ 		v->sq_count++;
+ 
+-	return queue_is_rq_based(q);
++	return queue_is_mq(q);
+ }
+ 
+ static int dm_table_determine_type(struct dm_table *t)
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index d486e83425a8..c369b66f60f2 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -747,11 +747,7 @@ static inline bool blk_account_rq(struct request *rq)
+ 
+ #define rq_data_dir(rq)		(op_is_write(req_op(rq)) ? WRITE : READ)
+ 
+-/*
+- * Driver can handle struct request, if it either has an old style
+- * request_fn defined, or is blk-mq based.
+- */
+-static inline bool queue_is_rq_based(struct request_queue *q)
++static inline bool queue_is_mq(struct request_queue *q)
+ {
+ 	return q->request_fn || q->mq_ops;
+ }
