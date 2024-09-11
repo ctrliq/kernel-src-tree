@@ -1,0 +1,91 @@
+udp: fix GRO reception in case of length mismatch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 21f1b8a6636c4dbde4aa1ec0343f42eaf653ffcc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/21f1b8a6.failed
+
+Currently, the UDP GRO code path does bad things on some edge
+conditions - Aggregation can happen even on packet with different
+lengths.
+
+Fix the above by rewriting the 'complete' condition for GRO
+packets. While at it, note explicitly that we allow merging the
+first packet per burst below gso_size.
+
+	Reported-by: Sean Tong <seantong114@gmail.com>
+Fixes: e20cf8d3f1f7 ("udp: implement GRO for plain UDP sockets.")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 21f1b8a6636c4dbde4aa1ec0343f42eaf653ffcc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp_offload.c
+diff --cc net/ipv4/udp_offload.c
+index b081620854e2,d8776b2110c1..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -349,6 -344,55 +349,58 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define UDP_GRO_CNT_MAX 64
++ static struct sk_buff *udp_gro_receive_segment(struct list_head *head,
++ 					       struct sk_buff *skb)
++ {
++ 	struct udphdr *uh = udp_hdr(skb);
++ 	struct sk_buff *pp = NULL;
++ 	struct udphdr *uh2;
++ 	struct sk_buff *p;
++ 
++ 	/* requires non zero csum, for symmetry with GSO */
++ 	if (!uh->check) {
++ 		NAPI_GRO_CB(skb)->flush = 1;
++ 		return NULL;
++ 	}
++ 
++ 	/* pull encapsulating udp header */
++ 	skb_gro_pull(skb, sizeof(struct udphdr));
++ 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
++ 
++ 	list_for_each_entry(p, head, list) {
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		uh2 = udp_hdr(p);
++ 
++ 		/* Match ports only, as csum is always non zero */
++ 		if ((*(u32 *)&uh->source != *(u32 *)&uh2->source)) {
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 			continue;
++ 		}
++ 
++ 		/* Terminate the flow on len mismatch or if it grow "too much".
++ 		 * Under small packet flood GRO count could elsewhere grow a lot
++ 		 * leading to execessive truesize values.
++ 		 * On len mismatch merge the first packet shorter than gso_size,
++ 		 * otherwise complete the GRO packet.
++ 		 */
++ 		if (uh->len > uh2->len || skb_gro_receive(p, skb) ||
++ 		    uh->len != uh2->len ||
++ 		    NAPI_GRO_CB(p)->count >= UDP_GRO_CNT_MAX)
++ 			pp = p;
++ 
++ 		return pp;
++ 	}
++ 
++ 	/* mismatch, but we never need to flush */
++ 	return NULL;
++ }
++ 
+++>>>>>>> 21f1b8a6636c (udp: fix GRO reception in case of length mismatch)
+  INDIRECT_CALLABLE_DECLARE(struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+  						   __be16 sport, __be16 dport));
+  struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
+* Unmerged path net/ipv4/udp_offload.c
