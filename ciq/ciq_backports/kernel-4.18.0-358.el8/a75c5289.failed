@@ -1,0 +1,411 @@
+x86/fpu/xstate: Sanitize handling of independent features
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit a75c52896b6d42d6600db4d4dd9f7e4bde9218db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/a75c5289.failed
+
+The copy functions for the independent features are horribly named and the
+supervisor and independent part is just overengineered.
+
+The point is that the supplied mask has either to be a subset of the
+independent features or a subset of the task->fpu.xstate managed features.
+
+Rewrite it so it checks for invalid overlaps of these areas in the caller
+supplied feature mask. Rename it so it follows the new naming convention
+for these operations. Mop up the function documentation.
+
+This allows to use that function for other purposes as well.
+
+	Suggested-by: Peter Zijlstra <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Tested-by: Kan Liang <kan.liang@linux.intel.com>
+Link: https://lkml.kernel.org/r/20210623121455.004880675@linutronix.de
+(cherry picked from commit a75c52896b6d42d6600db4d4dd9f7e4bde9218db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/events/intel/lbr.c
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/events/intel/lbr.c
+index e93d8ea21be8,f338645071c8..000000000000
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@@ -491,7 -491,7 +491,11 @@@ static void intel_pmu_arch_lbr_xrstors(
+  {
+  	struct x86_perf_task_context_arch_lbr_xsave *task_ctx = ctx;
+  
+++<<<<<<< HEAD
+ +	copy_kernel_to_dynamic_supervisor(&task_ctx->xsave, XFEATURE_MASK_LBR);
+++=======
++ 	xrstors(&task_ctx->xsave, XFEATURE_MASK_LBR);
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  }
+  
+  static __always_inline bool lbr_is_reset_in_cstate(void *ctx)
+@@@ -576,7 -576,7 +580,11 @@@ static void intel_pmu_arch_lbr_xsaves(v
+  {
+  	struct x86_perf_task_context_arch_lbr_xsave *task_ctx = ctx;
+  
+++<<<<<<< HEAD
+ +	copy_dynamic_supervisor_to_kernel(&task_ctx->xsave, XFEATURE_MASK_LBR);
+++=======
++ 	xsaves(&task_ctx->xsave, XFEATURE_MASK_LBR);
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  }
+  
+  static void __intel_pmu_lbr_save(void *ctx)
+@@@ -993,7 -992,7 +1001,11 @@@ static void intel_pmu_arch_lbr_read_xsa
+  		intel_pmu_store_lbr(cpuc, NULL);
+  		return;
+  	}
+++<<<<<<< HEAD
+ +	copy_dynamic_supervisor_to_kernel(&xsave->xsave, XFEATURE_MASK_LBR);
+++=======
++ 	xsaves(&xsave->xsave, XFEATURE_MASK_LBR);
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  
+  	intel_pmu_store_lbr(cpuc, xsave->lbr.entries);
+  }
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 3c3a675cc056,7de2384628e2..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -101,14 -101,21 +101,32 @@@ extern void __init update_regset_xstate
+  					     u64 xstate_mask);
+  
+  void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
+ +const void *get_xsave_field_ptr(int xfeature_nr);
+ +int using_compacted_format(void);
+  int xfeature_size(int xfeature_nr);
+++<<<<<<< HEAD
+ +int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ +int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ +int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+ +int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
+ +void copy_dynamic_supervisor_to_kernel(struct xregs_state *xstate, u64 mask);
+ +void copy_kernel_to_dynamic_supervisor(struct xregs_state *xstate, u64 mask);
+++=======
++ int copy_uabi_from_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
++ int copy_sigframe_from_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
++ 
++ void xsaves(struct xregs_state *xsave, u64 mask);
++ void xrstors(struct xregs_state *xsave, u64 mask);
++ 
++ enum xstate_copy_mode {
++ 	XSTATE_COPY_FP,
++ 	XSTATE_COPY_FX,
++ 	XSTATE_COPY_XSAVE,
++ };
++ 
++ struct membuf;
++ void copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
++ 			     enum xstate_copy_mode mode);
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  
+  #endif
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 4641d3145e59,735d44c3efb6..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -1268,181 -1156,123 +1268,249 @@@ int copy_kernel_to_xstate(struct xregs_
+   * XSAVE[S] format and copy to the target thread. This is called from the
+   * sigreturn() and rt_sigreturn() system calls.
+   */
+ -int copy_sigframe_from_user_to_xstate(struct xregs_state *xsave,
+ -				      const void __user *ubuf)
+ +int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf)
+  {
+ -	return copy_uabi_to_xstate(xsave, NULL, ubuf);
+ +	unsigned int offset, size;
+ +	int i;
+ +	struct xstate_header hdr;
+ +
+ +	offset = offsetof(struct xregs_state, header);
+ +	size = sizeof(hdr);
+ +
+ +	if (copy_from_user(&hdr, ubuf + offset, size))
+ +		return -EFAULT;
+ +
+ +	if (validate_user_xstate_header(&hdr))
+ +		return -EINVAL;
+ +
+ +	for (i = 0; i < XFEATURE_MAX; i++) {
+ +		u64 mask = ((u64)1 << i);
+ +
+ +		if (hdr.xfeatures & mask) {
+ +			void *dst = __raw_xsave_addr(xsave, i);
+ +
+ +			offset = xstate_offsets[i];
+ +			size = xstate_sizes[i];
+ +
+ +			if (copy_from_user(dst, ubuf + offset, size))
+ +				return -EFAULT;
+ +		}
+ +	}
+ +
+ +	if (xfeatures_mxcsr_quirk(hdr.xfeatures)) {
+ +		offset = offsetof(struct fxregs_state, mxcsr);
+ +		size = MXCSR_AND_FLAGS_SIZE;
+ +		if (copy_from_user(&xsave->i387.mxcsr, ubuf + offset, size))
+ +			return -EFAULT;
+ +	}
+ +
+ +	/*
+ +	 * The state that came in from userspace was user-state only.
+ +	 * Mask all the user states out of 'xfeatures':
+ +	 */
+ +	xsave->header.xfeatures &= XFEATURE_MASK_SUPERVISOR_ALL;
+ +
+ +	/*
+ +	 * Add back in the features that came in from userspace:
+ +	 */
+ +	xsave->header.xfeatures |= hdr.xfeatures;
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/**
+ + * copy_dynamic_supervisor_to_kernel() - Save dynamic supervisor states to
+ + *                                       an xsave area
+ + * @xstate: A pointer to an xsave area
+ + * @mask: Represent the dynamic supervisor features saved into the xsave area
+ + *
+ + * Only the dynamic supervisor states sets in the mask are saved into the xsave
+ + * area (See the comment in XFEATURE_MASK_DYNAMIC for the details of dynamic
+ + * supervisor feature). Besides the dynamic supervisor states, the legacy
+ + * region and XSAVE header are also saved into the xsave area. The supervisor
+ + * features in the XFEATURE_MASK_SUPERVISOR_SUPPORTED and
+ + * XFEATURE_MASK_SUPERVISOR_UNSUPPORTED are not saved.
+ + *
+ + * The xsave area must be 64-bytes aligned.
+ + */
+ +void copy_dynamic_supervisor_to_kernel(struct xregs_state *xstate, u64 mask)
+ +{
+ +	u64 dynamic_mask = xfeatures_mask_dynamic() & mask;
+ +	u32 lmask, hmask;
+ +	int err;
+++=======
++ static bool validate_xsaves_xrstors(u64 mask)
++ {
++ 	u64 xchk;
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  
+- 	if (WARN_ON_FPU(!boot_cpu_has(X86_FEATURE_XSAVES)))
+- 		return;
++ 	if (WARN_ON_FPU(!cpu_feature_enabled(X86_FEATURE_XSAVES)))
++ 		return false;
++ 	/*
++ 	 * Validate that this is either a task->fpstate related component
++ 	 * subset or an independent one.
++ 	 */
++ 	if (mask & xfeatures_mask_independent())
++ 		xchk = ~xfeatures_mask_independent();
++ 	else
++ 		xchk = ~xfeatures_mask_all;
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON_FPU(!dynamic_mask))
+ +		return;
+ +
+ +	lmask = dynamic_mask;
+ +	hmask = dynamic_mask >> 32;
+ +
+ +	XSTATE_OP(XSAVES, xstate, lmask, hmask, err);
+ +
+ +	/* Should never fault when copying to a kernel buffer */
+ +	WARN_ON_FPU(err);
+ +}
+ +
+ +/**
+ + * copy_kernel_to_dynamic_supervisor() - Restore dynamic supervisor states from
+ + *                                       an xsave area
+ + * @xstate: A pointer to an xsave area
+ + * @mask: Represent the dynamic supervisor features restored from the xsave area
+ + *
+ + * Only the dynamic supervisor states sets in the mask are restored from the
+ + * xsave area (See the comment in XFEATURE_MASK_DYNAMIC for the details of
+ + * dynamic supervisor feature). Besides the dynamic supervisor states, the
+ + * legacy region and XSAVE header are also restored from the xsave area. The
+ + * supervisor features in the XFEATURE_MASK_SUPERVISOR_SUPPORTED and
+ + * XFEATURE_MASK_SUPERVISOR_UNSUPPORTED are not restored.
+++=======
++ 	if (WARN_ON_ONCE(!mask || mask & xchk))
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /**
++  * xsaves - Save selected components to a kernel xstate buffer
++  * @xstate:	Pointer to the buffer
++  * @mask:	Feature mask to select the components to save
+   *
+-  * The xsave area must be 64-bytes aligned.
++  * The @xstate buffer must be 64 byte aligned and correctly initialized as
++  * XSAVES does not write the full xstate header. Before first use the
++  * buffer should be zeroed otherwise a consecutive XRSTORS from that buffer
++  * can #GP.
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
++  *
++  * The feature mask must either be a subset of the independent features or
++  * a subset of the task->fpstate related features.
+   */
+++<<<<<<< HEAD
+ +void copy_kernel_to_dynamic_supervisor(struct xregs_state *xstate, u64 mask)
+ +{
+ +	u64 dynamic_mask = xfeatures_mask_dynamic() & mask;
+ +	u32 lmask, hmask;
+++=======
++ void xsaves(struct xregs_state *xstate, u64 mask)
++ {
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  	int err;
+  
+- 	if (WARN_ON_FPU(!boot_cpu_has(X86_FEATURE_XSAVES)))
++ 	if (!validate_xsaves_xrstors(mask))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (WARN_ON_FPU(!dynamic_mask))
+ +		return;
+ +
+ +	lmask = dynamic_mask;
+ +	hmask = dynamic_mask >> 32;
+ +
+ +	XSTATE_OP(XRSTORS, xstate, lmask, hmask, err);
+ +
+ +	/* Should never fault when copying from a kernel buffer */
+ +	WARN_ON_FPU(err);
+++=======
++ 	XSTATE_OP(XSAVES, xstate, (u32)mask, (u32)(mask >> 32), err);
++ 	WARN_ON_ONCE(err);
++ }
++ 
++ /**
++  * xrstors - Restore selected components from a kernel xstate buffer
++  * @xstate:	Pointer to the buffer
++  * @mask:	Feature mask to select the components to restore
++  *
++  * The @xstate buffer must be 64 byte aligned and correctly initialized
++  * otherwise XRSTORS from that buffer can #GP.
++  *
++  * Proper usage is to restore the state which was saved with
++  * xsaves() into @xstate.
++  *
++  * The feature mask must either be a subset of the independent features or
++  * a subset of the task->fpstate related features.
++  */
++ void xrstors(struct xregs_state *xstate, u64 mask)
++ {
++ 	int err;
++ 
++ 	if (!validate_xsaves_xrstors(mask))
++ 		return;
++ 
++ 	XSTATE_OP(XRSTORS, xstate, (u32)mask, (u32)(mask >> 32), err);
++ 	WARN_ON_ONCE(err);
+++>>>>>>> a75c52896b6d (x86/fpu/xstate: Sanitize handling of independent features)
+  }
+  
+ -#ifdef CONFIG_PROC_PID_ARCH_STATUS
+ -/*
+ - * Report the amount of time elapsed in millisecond since last AVX512
+ - * use in the task.
+ - */
+ -static void avx512_status(struct seq_file *m, struct task_struct *task)
+ +#ifdef CONFIG_IOMMU_SUPPORT
+ +void update_pasid(void)
+  {
+ -	unsigned long timestamp = READ_ONCE(task->thread.fpu.avx512_timestamp);
+ -	long delta;
+ +	u64 pasid_state;
+ +	u32 pasid;
+  
+ -	if (!timestamp) {
+ -		/*
+ -		 * Report -1 if no AVX512 usage
+ -		 */
+ -		delta = -1;
+ -	} else {
+ -		delta = (long)(jiffies - timestamp);
+ -		/*
+ -		 * Cap to LONG_MAX if time difference > LONG_MAX
+ -		 */
+ -		if (delta < 0)
+ -			delta = LONG_MAX;
+ -		delta = jiffies_to_msecs(delta);
+ -	}
+ +	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
+ +		return;
+  
+ -	seq_put_decimal_ll(m, "AVX512_elapsed_ms:\t", delta);
+ -	seq_putc(m, '\n');
+ -}
+ +	if (!current->mm)
+ +		return;
+ +
+ +	pasid = READ_ONCE(current->mm->pasid);
+ +	/* Set the valid bit in the PASID MSR/state only for valid pasid. */
+ +	pasid_state = pasid == PASID_DISABLED ?
+ +		      pasid : pasid | MSR_IA32_PASID_VALID;
+  
+ -/*
+ - * Report architecture specific information
+ - */
+ -int proc_pid_arch_status(struct seq_file *m, struct pid_namespace *ns,
+ -			struct pid *pid, struct task_struct *task)
+ -{
+  	/*
+ -	 * Report AVX512 state if the processor and build option supported.
+ +	 * No need to hold fregs_lock() since the task's fpstate won't
+ +	 * be changed by others (e.g. ptrace) while the task is being
+ +	 * switched to or is in IPI.
+  	 */
+ -	if (cpu_feature_enabled(X86_FEATURE_AVX512F))
+ -		avx512_status(m, task);
+ +	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+ +		/* The MSR is active and can be directly updated. */
+ +		wrmsrl(MSR_IA32_PASID, pasid_state);
+ +	} else {
+ +		struct fpu *fpu = &current->thread.fpu;
+ +		struct ia32_pasid_state *ppasid_state;
+ +		struct xregs_state *xsave;
+  
+ -	return 0;
+ +		/*
+ +		 * The CPU's xstate registers are not currently active. Just
+ +		 * update the PASID state in the memory buffer here. The
+ +		 * PASID MSR will be loaded when returning to user mode.
+ +		 */
+ +		xsave = &fpu->state.xsave;
+ +		xsave->header.xfeatures |= XFEATURE_MASK_PASID;
+ +		ppasid_state = get_xsave_addr(xsave, XFEATURE_PASID);
+ +		/*
+ +		 * Since XFEATURE_MASK_PASID is set in xfeatures, ppasid_state
+ +		 * won't be NULL and no need to check its value.
+ +		 *
+ +		 * Only update the task's PASID state when it's different
+ +		 * from the mm's pasid.
+ +		 */
+ +		if (ppasid_state->pasid != pasid_state) {
+ +			/*
+ +			 * Invalid fpregs so that state restoring will pick up
+ +			 * the PASID state.
+ +			 */
+ +			__fpu_invalidate_fpregs_state(fpu);
+ +			ppasid_state->pasid = pasid_state;
+ +		}
+ +	}
+  }
+ -#endif /* CONFIG_PROC_PID_ARCH_STATUS */
+ +#endif /* CONFIG_IOMMU_SUPPORT */
+* Unmerged path arch/x86/events/intel/lbr.c
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
