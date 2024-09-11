@@ -1,0 +1,321 @@
+mm, slub: convert kmem_cpu_slab protection to local_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit bd0e7491a931f5a2960555b10b9551464ff8cc8e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/bd0e7491.failed
+
+Embed local_lock into struct kmem_cpu_slab and use the irq-safe versions of
+local_lock instead of plain local_irq_save/restore. On !PREEMPT_RT that's
+equivalent, with better lockdep visibility. On PREEMPT_RT that means better
+preemption.
+
+However, the cost on PREEMPT_RT is the loss of lockless fast paths which only
+work with cpu freelist. Those are designed to detect and recover from being
+preempted by other conflicting operations (both fast or slow path), but the
+slow path operations assume they cannot be preempted by a fast path operation,
+which is guaranteed naturally with disabled irqs. With local locks on
+PREEMPT_RT, the fast paths now also need to take the local lock to avoid races.
+
+In the allocation fastpath slab_alloc_node() we can just defer to the slowpath
+__slab_alloc() which also works with cpu freelist, but under the local lock.
+In the free fastpath do_slab_free() we have to add a new local lock protected
+version of freeing to the cpu freelist, as the existing slowpath only works
+with the page freelist.
+
+Also update the comment about locking scheme in SLUB to reflect changes done
+by this series.
+
+[ Mike Galbraith <efault@gmx.de>: use local_lock() without irq in PREEMPT_RT
+  scope; debugging of RT crashes resulting in put_cpu_partial() locking changes ]
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+(cherry picked from commit bd0e7491a931f5a2960555b10b9551464ff8cc8e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 89494fc5a481,3d2025f7163b..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2445,10 -2587,25 +2487,28 @@@ static inline void unfreeze_partials_cp
+  
+  static inline void flush_slab(struct kmem_cache *s, struct kmem_cache_cpu *c)
+  {
+ -	unsigned long flags;
+ -	struct page *page;
+ -	void *freelist;
+ +	stat(s, CPUSLAB_FLUSH);
+ +	deactivate_slab(s, c->page, c->freelist, c);
+  
+++<<<<<<< HEAD
+++	c->tid = next_tid(c->tid);
+++=======
++ 	local_lock_irqsave(&s->cpu_slab->lock, flags);
++ 
++ 	page = c->page;
++ 	freelist = c->freelist;
++ 
++ 	c->page = NULL;
++ 	c->freelist = NULL;
+  	c->tid = next_tid(c->tid);
++ 
++ 	local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 
++ 	if (page) {
++ 		deactivate_slab(s, page, freelist);
++ 		stat(s, CPUSLAB_FLUSH);
++ 	}
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  }
+  
+  static inline void __flush_cpu_slab(struct kmem_cache *s, int cpu)
+@@@ -2693,12 -2911,15 +2753,23 @@@ redo
+  	 * PFMEMALLOC but right now, we are losing the pfmemalloc
+  	 * information when the page leaves the per-cpu allocator
+  	 */
+++<<<<<<< HEAD
+ +	if (unlikely(!pfmemalloc_match(page, gfpflags))) {
+ +		deactivate_slab(s, page, c->freelist, c);
+ +		goto new_slab;
+++=======
++ 	if (unlikely(!pfmemalloc_match_unsafe(page, gfpflags)))
++ 		goto deactivate_slab;
++ 
++ 	/* must check again c->page in case we got preempted and it changed */
++ 	local_lock_irqsave(&s->cpu_slab->lock, flags);
++ 	if (unlikely(page != c->page)) {
++ 		local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 		goto reread_page;
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  	}
+ +
+ +	/* must check again c->freelist in case of cpu migration or IRQ */
+  	freelist = c->freelist;
+  	if (freelist)
+  		goto load_freelist;
+@@@ -2707,6 -2928,7 +2778,10 @@@
+  
+  	if (!freelist) {
+  		c->page = NULL;
+++<<<<<<< HEAD
+++=======
++ 		local_unlock_irqrestore(&s->cpu_slab->lock, flags);
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  		stat(s, DEACTIVATE_BYPASS);
+  		goto new_slab;
+  	}
+@@@ -2714,6 -2936,9 +2789,12 @@@
+  	stat(s, ALLOC_REFILL);
+  
+  load_freelist:
+++<<<<<<< HEAD
+++=======
++ 
++ 	lockdep_assert_held(this_cpu_ptr(&s->cpu_slab->lock));
++ 
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  	/*
+  	 * freelist is pointing to the list of objects to be used.
+  	 * page is pointing to the page from which the objects are obtained.
+@@@ -2722,13 -2947,39 +2803,49 @@@
+  	VM_BUG_ON(!c->page->frozen);
+  	c->freelist = get_freepointer(s, freelist);
+  	c->tid = next_tid(c->tid);
+++<<<<<<< HEAD
+ +	return freelist;
+ +
+ +new_slab:
+ +
+ +	if (slub_percpu_partial(c)) {
+ +		page = c->page = slub_percpu_partial(c);
+ +		slub_set_percpu_partial(c, page);
+++=======
++ 	local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 	return freelist;
++ 
++ deactivate_slab:
++ 
++ 	local_lock_irqsave(&s->cpu_slab->lock, flags);
++ 	if (page != c->page) {
++ 		local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 		goto reread_page;
++ 	}
++ 	freelist = c->freelist;
++ 	c->page = NULL;
++ 	c->freelist = NULL;
++ 	local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 	deactivate_slab(s, page, freelist);
++ 
++ new_slab:
++ 
++ 	if (slub_percpu_partial(c)) {
++ 		local_lock_irqsave(&s->cpu_slab->lock, flags);
++ 		if (unlikely(c->page)) {
++ 			local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 			goto reread_page;
++ 		}
++ 		if (unlikely(!slub_percpu_partial(c))) {
++ 			local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 			/* we were preempted and partial list got empty */
++ 			goto new_objects;
++ 		}
++ 
++ 		page = c->page = slub_percpu_partial(c);
++ 		slub_set_percpu_partial(c, page);
++ 		local_unlock_irqrestore(&s->cpu_slab->lock, flags);
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  		stat(s, CPU_PARTIAL_ALLOC);
+  		goto redo;
+  	}
+@@@ -2781,6 -3030,27 +2898,30 @@@ check_new_page
+  		 */
+  		goto return_single;
+  
+++<<<<<<< HEAD
+++=======
++ retry_load_page:
++ 
++ 	local_lock_irqsave(&s->cpu_slab->lock, flags);
++ 	if (unlikely(c->page)) {
++ 		void *flush_freelist = c->freelist;
++ 		struct page *flush_page = c->page;
++ 
++ 		c->page = NULL;
++ 		c->freelist = NULL;
++ 		c->tid = next_tid(c->tid);
++ 
++ 		local_unlock_irqrestore(&s->cpu_slab->lock, flags);
++ 
++ 		deactivate_slab(s, flush_page, flush_freelist);
++ 
++ 		stat(s, CPUSLAB_FLUSH);
++ 
++ 		goto retry_load_page;
++ 	}
++ 	c->page = page;
++ 
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  	goto load_freelist;
+  
+  return_single:
+@@@ -3326,12 -3643,18 +3501,17 @@@ int kmem_cache_alloc_bulk(struct kmem_c
+  	 * IRQs, which protects against PREEMPT and interrupts
+  	 * handlers invoking normal fastpath.
+  	 */
+++<<<<<<< HEAD
+ +	local_irq_disable();
+ +	c = this_cpu_ptr(s->cpu_slab);
+++=======
++ 	c = slub_get_cpu_ptr(s->cpu_slab);
++ 	local_lock_irq(&s->cpu_slab->lock);
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  
+  	for (i = 0; i < size; i++) {
+ -		void *object = kfence_alloc(s, s->object_size, flags);
+ -
+ -		if (unlikely(object)) {
+ -			p[i] = object;
+ -			continue;
+ -		}
+ +		void *object = c->freelist;
+  
+ -		object = c->freelist;
+  		if (unlikely(!object)) {
+  			/*
+  			 * We may have removed an object from c->freelist using
+@@@ -3342,6 -3665,8 +3522,11 @@@
+  			 */
+  			c->tid = next_tid(c->tid);
+  
+++<<<<<<< HEAD
+++=======
++ 			local_unlock_irq(&s->cpu_slab->lock);
++ 
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  			/*
+  			 * Invoking slow path likely have side-effect
+  			 * of re-populating per CPU c->freelist
+@@@ -3354,6 -3679,8 +3539,11 @@@
+  			c = this_cpu_ptr(s->cpu_slab);
+  			maybe_wipe_obj_freeptr(s, p[i]);
+  
+++<<<<<<< HEAD
+++=======
++ 			local_lock_irq(&s->cpu_slab->lock);
++ 
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  			continue; /* goto for-loop */
+  		}
+  		c->freelist = get_freepointer(s, object);
+@@@ -3361,22 -3688,19 +3551,27 @@@
+  		maybe_wipe_obj_freeptr(s, p[i]);
+  	}
+  	c->tid = next_tid(c->tid);
+++<<<<<<< HEAD
+ +	local_irq_enable();
+++=======
++ 	local_unlock_irq(&s->cpu_slab->lock);
++ 	slub_put_cpu_ptr(s->cpu_slab);
+++>>>>>>> bd0e7491a931 (mm, slub: convert kmem_cpu_slab protection to local_lock)
+  
+ -	/*
+ -	 * memcg and kmem_cache debug support and memory initialization.
+ -	 * Done outside of the IRQ disabled fastpath loop.
+ -	 */
+ -	slab_post_alloc_hook(s, objcg, flags, size, p,
+ -				slab_want_init_on_alloc(flags, s));
+ +	/* Clear memory outside IRQ disabled fastpath loop */
+ +	if (unlikely(slab_want_init_on_alloc(flags, s))) {
+ +		int j;
+ +
+ +		for (j = 0; j < i; j++)
+ +			memset(p[j], 0, s->object_size);
+ +	}
+ +
+ +	/* memcg and kmem_cache debug support */
+ +	slab_post_alloc_hook(s, objcg, flags, size, p);
+  	return i;
+  error:
+ -	slub_put_cpu_ptr(s->cpu_slab);
+ -	slab_post_alloc_hook(s, objcg, flags, i, p, false);
+ +	local_irq_enable();
+ +	slab_post_alloc_hook(s, objcg, flags, i, p);
+  	__kmem_cache_free_bulk(s, i, p);
+  	return 0;
+  }
+diff --git a/include/linux/slub_def.h b/include/linux/slub_def.h
+index 4390094ba9c9..add4e9efc636 100644
+--- a/include/linux/slub_def.h
++++ b/include/linux/slub_def.h
+@@ -9,6 +9,7 @@
+  */
+ #include <linux/kobject.h>
+ #include <linux/reciprocal_div.h>
++#include <linux/local_lock.h>
+ 
+ enum stat_item {
+ 	ALLOC_FASTPATH,		/* Allocation from cpu slab */
+@@ -39,6 +40,10 @@ enum stat_item {
+ 	CPU_PARTIAL_DRAIN,	/* Drain cpu partial to node partial */
+ 	NR_SLUB_STAT_ITEMS };
+ 
++/*
++ * When changing the layout, make sure freelist and tid are still compatible
++ * with this_cpu_cmpxchg_double() alignment requirements.
++ */
+ struct kmem_cache_cpu {
+ 	void **freelist;	/* Pointer to next available object */
+ 	unsigned long tid;	/* Globally unique transaction id */
+@@ -46,6 +51,7 @@ struct kmem_cache_cpu {
+ #ifdef CONFIG_SLUB_CPU_PARTIAL
+ 	struct page *partial;	/* Partially allocated frozen slabs */
+ #endif
++	local_lock_t lock;	/* Protects the fields above */
+ #ifdef CONFIG_SLUB_STATS
+ 	unsigned stat[NR_SLUB_STAT_ITEMS];
+ #endif
+* Unmerged path mm/slub.c
