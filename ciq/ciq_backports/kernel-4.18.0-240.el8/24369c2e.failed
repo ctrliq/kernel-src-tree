@@ -1,0 +1,227 @@
+io_uring: add io-wq workqueue sharing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 24369c2e3bb06d8c4e71fd6ceaf4f8a01ae79b7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/24369c2e.failed
+
+If IORING_SETUP_ATTACH_WQ is set, it expects wq_fd in io_uring_params to
+be a valid io_uring fd io-wq of which will be shared with the newly
+created io_uring instance. If the flag is set but it can't share io-wq,
+it fails.
+
+This allows creation of "sibling" io_urings, where we prefer to keep the
+SQ/CQ private, but want to share the async backend to minimize the amount
+of overhead associated with having multiple rings that belong to the same
+backend.
+
+	Reported-by: Jens Axboe <axboe@kernel.dk>
+	Reported-by: Daurnimator <quae@daurnimator.com>
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 24369c2e3bb06d8c4e71fd6ceaf4f8a01ae79b7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+#	include/uapi/linux/io_uring.h
+diff --cc fs/io_uring.c
+index e4dddc0b25db,275355bd3a64..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -3144,7 -5673,84 +3144,54 @@@ static int io_sqe_files_update(struct i
+  
+  	return done ? done : err;
+  }
+ -static int io_sqe_files_update(struct io_ring_ctx *ctx, void __user *arg,
+ -			       unsigned nr_args)
+ -{
+ -	struct io_uring_files_update up;
+ -
+ -	if (!ctx->file_data)
+ -		return -ENXIO;
+ -	if (!nr_args)
+ -		return -EINVAL;
+ -	if (copy_from_user(&up, arg, sizeof(up)))
+ -		return -EFAULT;
+ -	if (up.resv)
+ -		return -EINVAL;
+ -
+ -	return __io_sqe_files_update(ctx, &up, nr_args);
+ -}
+ -
+ -static void io_put_work(struct io_wq_work *work)
+ -{
+ -	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+ -
+ -	io_put_req(req);
+ -}
+ -
+ -static void io_get_work(struct io_wq_work *work)
+ -{
+ -	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+ -
+ -	refcount_inc(&req->refs);
+ -}
+  
++ static int io_init_wq_offload(struct io_ring_ctx *ctx,
++ 			      struct io_uring_params *p)
++ {
++ 	struct io_wq_data data;
++ 	struct fd f;
++ 	struct io_ring_ctx *ctx_attach;
++ 	unsigned int concurrency;
++ 	int ret = 0;
++ 
++ 	data.user = ctx->user;
++ 	data.get_work = io_get_work;
++ 	data.put_work = io_put_work;
++ 
++ 	if (!(p->flags & IORING_SETUP_ATTACH_WQ)) {
++ 		/* Do QD, or 4 * CPUS, whatever is smallest */
++ 		concurrency = min(ctx->sq_entries, 4 * num_online_cpus());
++ 
++ 		ctx->io_wq = io_wq_create(concurrency, &data);
++ 		if (IS_ERR(ctx->io_wq)) {
++ 			ret = PTR_ERR(ctx->io_wq);
++ 			ctx->io_wq = NULL;
++ 		}
++ 		return ret;
++ 	}
++ 
++ 	f = fdget(p->wq_fd);
++ 	if (!f.file)
++ 		return -EBADF;
++ 
++ 	if (f.file->f_op != &io_uring_fops) {
++ 		ret = -EINVAL;
++ 		goto out_fput;
++ 	}
++ 
++ 	ctx_attach = f.file->private_data;
++ 	/* @io_wq is protected by holding the fd */
++ 	if (!io_wq_get(ctx_attach->io_wq, &data)) {
++ 		ret = -EINVAL;
++ 		goto out_fput;
++ 	}
++ 
++ 	ctx->io_wq = ctx_attach->io_wq;
++ out_fput:
++ 	fdput(f);
++ 	return ret;
++ }
++ 
+  static int io_sq_offload_start(struct io_ring_ctx *ctx,
+  			       struct io_uring_params *p)
+  {
+@@@ -3191,28 -5797,9 +3238,32 @@@
+  		goto err;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* Do QD, or 2 * CPUS, whatever is smallest */
+ +	ctx->sqo_wq[0] = alloc_workqueue("io_ring-wq",
+ +			WQ_UNBOUND | WQ_FREEZABLE,
+ +			min(ctx->sq_entries - 1, 2 * num_online_cpus()));
+ +	if (!ctx->sqo_wq[0]) {
+ +		ret = -ENOMEM;
+ +		goto err;
+ +	}
+ +
+ +	/*
+ +	 * This is for buffered writes, where we want to limit the parallelism
+ +	 * due to file locking in file systems. As "normal" buffered writes
+ +	 * should parellelize on writeout quite nicely, limit us to having 2
+ +	 * pending. This avoids massive contention on the inode when doing
+ +	 * buffered async writes.
+ +	 */
+ +	ctx->sqo_wq[1] = alloc_workqueue("io_ring-write-wq",
+ +						WQ_UNBOUND | WQ_FREEZABLE, 2);
+ +	if (!ctx->sqo_wq[1]) {
+ +		ret = -ENOMEM;
+++=======
++ 	ret = io_init_wq_offload(ctx, p);
++ 	if (ret)
+++>>>>>>> 24369c2e3bb0 (io_uring: add io-wq workqueue sharing)
+  		goto err;
+- 	}
+  
+  	return 0;
+  err:
+diff --cc include/uapi/linux/io_uring.h
+index dd4a49ec83b7,e067b92af5ad..000000000000
+--- a/include/uapi/linux/io_uring.h
++++ b/include/uapi/linux/io_uring.h
+@@@ -51,18 -75,42 +51,19 @@@ struct io_uring_sqe 
+  #define IORING_SETUP_SQ_AFF	(1U << 2)	/* sq_thread_cpu is valid */
+  #define IORING_SETUP_CQSIZE	(1U << 3)	/* app defines CQ size */
+  #define IORING_SETUP_CLAMP	(1U << 4)	/* clamp SQ/CQ ring sizes */
++ #define IORING_SETUP_ATTACH_WQ	(1U << 5)	/* attach to existing wq */
+  
+ -enum {
+ -	IORING_OP_NOP,
+ -	IORING_OP_READV,
+ -	IORING_OP_WRITEV,
+ -	IORING_OP_FSYNC,
+ -	IORING_OP_READ_FIXED,
+ -	IORING_OP_WRITE_FIXED,
+ -	IORING_OP_POLL_ADD,
+ -	IORING_OP_POLL_REMOVE,
+ -	IORING_OP_SYNC_FILE_RANGE,
+ -	IORING_OP_SENDMSG,
+ -	IORING_OP_RECVMSG,
+ -	IORING_OP_TIMEOUT,
+ -	IORING_OP_TIMEOUT_REMOVE,
+ -	IORING_OP_ACCEPT,
+ -	IORING_OP_ASYNC_CANCEL,
+ -	IORING_OP_LINK_TIMEOUT,
+ -	IORING_OP_CONNECT,
+ -	IORING_OP_FALLOCATE,
+ -	IORING_OP_OPENAT,
+ -	IORING_OP_CLOSE,
+ -	IORING_OP_FILES_UPDATE,
+ -	IORING_OP_STATX,
+ -	IORING_OP_READ,
+ -	IORING_OP_WRITE,
+ -	IORING_OP_FADVISE,
+ -	IORING_OP_MADVISE,
+ -	IORING_OP_SEND,
+ -	IORING_OP_RECV,
+ -	IORING_OP_OPENAT2,
+ -
+ -	/* this goes last, obviously */
+ -	IORING_OP_LAST,
+ -};
+ +#define IORING_OP_NOP		0
+ +#define IORING_OP_READV		1
+ +#define IORING_OP_WRITEV	2
+ +#define IORING_OP_FSYNC		3
+ +#define IORING_OP_READ_FIXED	4
+ +#define IORING_OP_WRITE_FIXED	5
+ +#define IORING_OP_POLL_ADD	6
+ +#define IORING_OP_POLL_REMOVE	7
+ +#define IORING_OP_SYNC_FILE_RANGE	8
+ +#define IORING_OP_SENDMSG	9
+ +#define IORING_OP_RECVMSG	10
+  
+  /*
+   * sqe->fsync_flags
+@@@ -130,7 -183,9 +131,13 @@@ struct io_uring_params 
+  	__u32 flags;
+  	__u32 sq_thread_cpu;
+  	__u32 sq_thread_idle;
+++<<<<<<< HEAD
+ +	__u32 resv[5];
+++=======
++ 	__u32 features;
++ 	__u32 wq_fd;
++ 	__u32 resv[3];
+++>>>>>>> 24369c2e3bb0 (io_uring: add io-wq workqueue sharing)
+  	struct io_sqring_offsets sq_off;
+  	struct io_cqring_offsets cq_off;
+  };
+* Unmerged path fs/io_uring.c
+* Unmerged path include/uapi/linux/io_uring.h
