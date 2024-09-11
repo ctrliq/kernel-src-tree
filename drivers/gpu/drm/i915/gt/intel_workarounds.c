@@ -651,6 +651,13 @@ static void tgl_ctx_workarounds_init(struct intel_engine_cs *engine,
 	       FF_MODE2_GS_TIMER_MASK | FF_MODE2_TDS_TIMER_MASK,
 	       FF_MODE2_GS_TIMER_224  | FF_MODE2_TDS_TIMER_128,
 	       0);
+
+	/*
+	 * Wa_14012131227:dg1
+	 * Wa_1508744258:tgl,rkl,dg1,adl-s,adl-p
+	 */
+	wa_masked_en(wal, GEN7_COMMON_SLICE_CHICKEN1,
+		     GEN9_RHWO_OPTIMIZATION_DISABLE);
 }
 
 static void dg1_ctx_workarounds_init(struct intel_engine_cs *engine,
