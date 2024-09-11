@@ -1,0 +1,238 @@
+taprio: Add support adding an admin schedule
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Vinicius Costa Gomes <vinicius.gomes@intel.com>
+commit a3d43c0d56f1b94e74963a2fbadfb70126d92213
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a3d43c0d.failed
+
+The IEEE 802.1Q-2018 defines two "types" of schedules, the "Oper" (from
+operational?) and "Admin" ones. Up until now, 'taprio' only had
+support for the "Oper" one, added when the qdisc is created. This adds
+support for the "Admin" one, which allows the .change() operation to
+be supported.
+
+Just for clarification, some quick (and dirty) definitions, the "Oper"
+schedule is the currently (as in this instant) running one, and it's
+read-only. The "Admin" one is the one that the system configurator has
+installed, it can be changed, and it will be "promoted" to "Oper" when
+it's 'base-time' is reached.
+
+The idea behing this patch is that calling something like the below,
+(after taprio is already configured with an initial schedule):
+
+$ tc qdisc change taprio dev IFACE parent root 	     \
+     	   base-time X 	     	   	       	     \
+     	   sched-entry <CMD> <GATES> <INTERVAL>	     \
+	   ...
+
+Will cause a new admin schedule to be created and programmed to be
+"promoted" to "Oper" at instant X. If an "Admin" schedule already
+exists, it will be overwritten with the new parameters.
+
+Up until now, there was some code that was added to ease the support
+of changing a single entry of a schedule, but was ultimately unused.
+Now, that we have support for "change" with more well thought
+semantics, updating a single entry seems to be less useful.
+
+So we remove what is in practice dead code, and return a "not
+supported" error if the user tries to use it. If changing a single
+entry would make the user's life easier we may ressurrect this idea,
+but at this point, removing it simplifies the code.
+
+For now, only the schedule specific bits are allowed to be added for a
+new schedule, that means that 'clockid', 'num_tc', 'map' and 'queues'
+cannot be modified.
+
+Example:
+
+$ tc qdisc change dev IFACE parent root handle 100 taprio \
+      base-time $BASE_TIME \
+      sched-entry S 00 500000 \
+      sched-entry S 0f 500000 \
+      clockid CLOCK_TAI
+
+The only change in the netlink API introduced by this change is the
+introduction of an "admin" type in the response to a dump request,
+that type allows userspace to separate the "oper" schedule from the
+"admin" schedule. If userspace doesn't support the "admin" type, it
+will only display the "oper" schedule.
+
+	Signed-off-by: Vinicius Costa Gomes <vinicius.gomes@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a3d43c0d56f1b94e74963a2fbadfb70126d92213)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/sch_taprio.c
+diff --cc net/sched/sch_taprio.c
+index fc147ade41b9,ec8ccaee64e6..000000000000
+--- a/net/sched/sch_taprio.c
++++ b/net/sched/sch_taprio.c
+@@@ -324,70 -407,8 +407,73 @@@ static int parse_sched_entry(struct nla
+  	return fill_sched_entry(tb, entry, extack);
+  }
+  
+++<<<<<<< HEAD
+ +/* Returns the number of entries in case of success */
+ +static int parse_sched_single_entry(struct nlattr *n,
+ +				    struct taprio_sched *q,
+ +				    struct netlink_ext_ack *extack)
+ +{
+ +	struct nlattr *tb_entry[TCA_TAPRIO_SCHED_ENTRY_MAX + 1] = { };
+ +	struct nlattr *tb_list[TCA_TAPRIO_SCHED_MAX + 1] = { };
+ +	struct sched_entry *entry;
+ +	bool found = false;
+ +	u32 index;
+ +	int err;
+ +
+ +	err = nla_parse_nested(tb_list, TCA_TAPRIO_SCHED_MAX,
+ +			       n, entry_list_policy, NULL);
+ +	if (err < 0) {
+ +		NL_SET_ERR_MSG(extack, "Could not parse nested entry");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (!tb_list[TCA_TAPRIO_SCHED_ENTRY]) {
+ +		NL_SET_ERR_MSG(extack, "Single-entry must include an entry");
+ +		return -EINVAL;
+ +	}
+ +
+ +	err = nla_parse_nested(tb_entry, TCA_TAPRIO_SCHED_ENTRY_MAX,
+ +			       tb_list[TCA_TAPRIO_SCHED_ENTRY],
+ +			       entry_policy, NULL);
+ +	if (err < 0) {
+ +		NL_SET_ERR_MSG(extack, "Could not parse nested entry");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (!tb_entry[TCA_TAPRIO_SCHED_ENTRY_INDEX]) {
+ +		NL_SET_ERR_MSG(extack, "Entry must specify an index\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	index = nla_get_u32(tb_entry[TCA_TAPRIO_SCHED_ENTRY_INDEX]);
+ +	if (index >= q->num_entries) {
+ +		NL_SET_ERR_MSG(extack, "Index for single entry exceeds number of entries in schedule");
+ +		return -EINVAL;
+ +	}
+ +
+ +	list_for_each_entry(entry, &q->entries, list) {
+ +		if (entry->index == index) {
+ +			found = true;
+ +			break;
+ +		}
+ +	}
+ +
+ +	if (!found) {
+ +		NL_SET_ERR_MSG(extack, "Could not find entry");
+ +		return -ENOENT;
+ +	}
+ +
+ +	err = fill_sched_entry(tb_entry, entry, extack);
+ +	if (err < 0)
+ +		return err;
+ +
+ +	return q->num_entries;
+ +}
+ +
+++=======
+++>>>>>>> a3d43c0d56f1 (taprio: Add support adding an admin schedule)
+  static int parse_sched_list(struct nlattr *list,
+- 			    struct taprio_sched *q,
++ 			    struct sched_gate_list *sched,
+  			    struct netlink_ext_ack *extack)
+  {
+  	struct nlattr *n;
+@@@ -643,11 -657,12 +722,12 @@@ static int taprio_change(struct Qdisc *
+  	struct taprio_sched *q = qdisc_priv(sch);
+  	struct net_device *dev = qdisc_dev(sch);
+  	struct tc_mqprio_qopt *mqprio = NULL;
+- 	int i, err, size;
++ 	int i, err, clockid;
++ 	unsigned long flags;
+  	ktime_t start;
+  
+ -	err = nla_parse_nested_deprecated(tb, TCA_TAPRIO_ATTR_MAX, opt,
+ -					  taprio_policy, extack);
+ +	err = nla_parse_nested(tb, TCA_TAPRIO_ATTR_MAX, opt,
+ +			       taprio_policy, extack);
+  	if (err < 0)
+  		return err;
+  
+@@@ -885,9 -1004,9 +1069,9 @@@ static int taprio_dump(struct Qdisc *sc
+  		opt.offset[i] = dev->tc_to_txq[i].offset;
+  	}
+  
+ -	nest = nla_nest_start_noflag(skb, TCA_OPTIONS);
+ +	nest = nla_nest_start(skb, TCA_OPTIONS);
+  	if (!nest)
+- 		return -ENOSPC;
++ 		goto start_error;
+  
+  	if (nla_put(skb, TCA_TAPRIO_ATTR_PRIOMAP, sizeof(opt), &opt))
+  		goto options_error;
+@@@ -895,20 -1014,21 +1079,26 @@@
+  	if (nla_put_s32(skb, TCA_TAPRIO_ATTR_SCHED_CLOCKID, q->clockid))
+  		goto options_error;
+  
+++<<<<<<< HEAD
+ +	entry_list = nla_nest_start(skb, TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST);
+ +	if (!entry_list)
+++=======
++ 	if (oper && dump_schedule(skb, oper))
+++>>>>>>> a3d43c0d56f1 (taprio: Add support adding an admin schedule)
+  		goto options_error;
+  
+- 	list_for_each_entry(entry, &q->entries, list) {
+- 		if (dump_entry(skb, entry) < 0)
+- 			goto options_error;
+- 	}
++ 	if (!admin)
++ 		goto done;
+  
+- 	nla_nest_end(skb, entry_list);
++ 	sched_nest = nla_nest_start_noflag(skb, TCA_TAPRIO_ATTR_ADMIN_SCHED);
++ 
++ 	if (dump_schedule(skb, admin))
++ 		goto admin_error;
++ 
++ 	nla_nest_end(skb, sched_nest);
++ 
++ done:
++ 	rcu_read_unlock();
+  
+  	return nla_nest_end(skb, nest);
+  
+diff --git a/include/uapi/linux/pkt_sched.h b/include/uapi/linux/pkt_sched.h
+index a26080235fb7..6a0221fc8977 100644
+--- a/include/uapi/linux/pkt_sched.h
++++ b/include/uapi/linux/pkt_sched.h
+@@ -1145,6 +1145,16 @@ enum {
+ 
+ #define TCA_TAPRIO_SCHED_MAX (__TCA_TAPRIO_SCHED_MAX - 1)
+ 
++/* The format for the admin sched (dump only):
++ * [TCA_TAPRIO_SCHED_ADMIN_SCHED]
++ *   [TCA_TAPRIO_ATTR_SCHED_BASE_TIME]
++ *   [TCA_TAPRIO_ATTR_SCHED_ENTRY_LIST]
++ *     [TCA_TAPRIO_ATTR_SCHED_ENTRY]
++ *       [TCA_TAPRIO_ATTR_SCHED_ENTRY_CMD]
++ *       [TCA_TAPRIO_ATTR_SCHED_ENTRY_GATES]
++ *       [TCA_TAPRIO_ATTR_SCHED_ENTRY_INTERVAL]
++ */
++
+ enum {
+ 	TCA_TAPRIO_ATTR_UNSPEC,
+ 	TCA_TAPRIO_ATTR_PRIOMAP, /* struct tc_mqprio_qopt */
+@@ -1153,6 +1163,7 @@ enum {
+ 	TCA_TAPRIO_ATTR_SCHED_SINGLE_ENTRY, /* single entry */
+ 	TCA_TAPRIO_ATTR_SCHED_CLOCKID, /* s32 */
+ 	TCA_TAPRIO_PAD,
++	TCA_TAPRIO_ATTR_ADMIN_SCHED, /* The admin sched, only used in dump */
+ 	__TCA_TAPRIO_ATTR_MAX,
+ };
+ 
+* Unmerged path net/sched/sch_taprio.c
