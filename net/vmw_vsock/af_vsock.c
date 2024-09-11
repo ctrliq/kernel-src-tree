@@ -2074,7 +2074,6 @@ static long vsock_dev_do_ioctl(struct file *filp,
 		break;
 
 	default:
-		pr_err("Unknown ioctl %d\n", cmd);
 		retval = -EINVAL;
 	}
 
