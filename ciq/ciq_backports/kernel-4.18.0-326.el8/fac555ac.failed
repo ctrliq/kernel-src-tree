@@ -1,0 +1,455 @@
+mm/hmm: remove superfluous arguments from hmm_range_register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit fac555ac93d453a0d2265eef88bf4c249dd63e07
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/fac555ac.failed
+
+The start, end and page_shift values are all saved in the range structure,
+so we might as well use that for argument passing.
+
+Link: https://lore.kernel.org/r/20190806160554.14046-7-hch@lst.de
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Felix Kuehling <Felix.Kuehling@amd.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit fac555ac93d453a0d2265eef88bf4c249dd63e07)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+#	drivers/gpu/drm/nouveau/nouveau_svm.c
+diff --cc drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+index b7fd0cdffce0,71d6e7087b0b..000000000000
+--- a/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
++++ b/drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+@@@ -936,46 -812,44 +936,60 @@@ int amdgpu_ttm_tt_get_user_pages(struc
+  		goto out_free_ranges;
+  	}
+  
+++<<<<<<< HEAD
+ +	mmap_read_lock(mm);
+ +	vma = find_vma(mm, start);
+ +	if (unlikely(!vma || start < vma->vm_start)) {
+ +		r = -EFAULT;
+ +		goto out_unlock;
+ +	}
+ +	if (unlikely((gtt->userflags & AMDGPU_GEM_USERPTR_ANONONLY) &&
+ +		vma->vm_file)) {
+ +		r = -EPERM;
+ +		goto out_unlock;
+ +	}
+ +	mmap_read_unlock(mm);
+ +	timeout = jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+++=======
++ 	amdgpu_hmm_init_range(range);
++ 	range->default_flags = range->flags[HMM_PFN_VALID];
++ 	range->default_flags |= amdgpu_ttm_tt_is_readonly(ttm) ?
++ 				0 : range->flags[HMM_PFN_WRITE];
++ 	range->pfn_flags_mask = 0;
++ 	range->pfns = pfns;
++ 	range->page_shift = PAGE_SHIFT;
++ 	range->start = start;
++ 	range->end = start + ttm->num_pages * PAGE_SIZE;
++ 
++ 	hmm_range_register(range, mirror);
+++>>>>>>> fac555ac93d4 (mm/hmm: remove superfluous arguments from hmm_range_register)
+  
+ -	/*
+ -	 * Just wait for range to be valid, safe to ignore return value as we
+ -	 * will use the return value of hmm_range_fault() below under the
+ -	 * mmap_sem to ascertain the validity of the range.
+ -	 */
+ -	hmm_range_wait_until_valid(range, HMM_RANGE_DEFAULT_TIMEOUT);
+ -
+ -	down_read(&mm->mmap_sem);
+ -	r = hmm_range_fault(range, 0);
+ -	up_read(&mm->mmap_sem);
+ +retry:
+ +	range->notifier_seq = mmu_interval_read_begin(&bo->notifier);
+  
+ -	if (unlikely(r < 0))
+ +	mmap_read_lock(mm);
+ +	r = hmm_range_fault(range);
+ +	mmap_read_unlock(mm);
+ +	if (unlikely(r)) {
+ +		/*
+ +		 * FIXME: This timeout should encompass the retry from
+ +		 * mmu_interval_read_retry() as well.
+ +		 */
+ +		if (r == -EBUSY && !time_after(jiffies, timeout))
+ +			goto retry;
+  		goto out_free_pfns;
+ -
+ -	for (i = 0; i < ttm->num_pages; i++) {
+ -		pages[i] = hmm_device_entry_to_page(range, pfns[i]);
+ -		if (unlikely(!pages[i])) {
+ -			pr_err("Page fault failed for pfn[%lu] = 0x%llx\n",
+ -			       i, pfns[i]);
+ -			r = -ENOMEM;
+ -
+ -			goto out_free_pfns;
+ -		}
+  	}
+  
+ +	/*
+ +	 * Due to default_flags, all pages are HMM_PFN_VALID or
+ +	 * hmm_range_fault() fails. FIXME: The pages cannot be touched outside
+ +	 * the notifier_lock, and mmu_interval_read_retry() must be done first.
+ +	 */
+ +	for (i = 0; i < ttm->num_pages; i++)
+ +		pages[i] = hmm_pfn_to_page(range->hmm_pfns[i]);
+ +
+  	gtt->range = range;
+ +	mmput(mm);
+  
+  	return 0;
+  
+diff --cc drivers/gpu/drm/nouveau/nouveau_svm.c
+index 4f69e4c3dafd,41fad4719ac6..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_svm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_svm.c
+@@@ -471,138 -475,43 +471,148 @@@ nouveau_svm_fault_cache(struct nouveau_
+  		fault->inst, fault->addr, fault->access);
+  }
+  
+ -static inline bool
+ -nouveau_range_done(struct hmm_range *range)
+ +struct svm_notifier {
+ +	struct mmu_interval_notifier notifier;
+ +	struct nouveau_svmm *svmm;
+ +};
+ +
+ +static bool nouveau_svm_range_invalidate(struct mmu_interval_notifier *mni,
+ +					 const struct mmu_notifier_range *range,
+ +					 unsigned long cur_seq)
+  {
+ -	bool ret = hmm_range_valid(range);
+ +	struct svm_notifier *sn =
+ +		container_of(mni, struct svm_notifier, notifier);
+  
+ -	hmm_range_unregister(range);
+ -	return ret;
+ +	/*
+ +	 * serializes the update to mni->invalidate_seq done by caller and
+ +	 * prevents invalidation of the PTE from progressing while HW is being
+ +	 * programmed. This is very hacky and only works because the normal
+ +	 * notifier that does invalidation is always called after the range
+ +	 * notifier.
+ +	 */
+ +	if (mmu_notifier_range_blockable(range))
+ +		mutex_lock(&sn->svmm->mutex);
+ +	else if (!mutex_trylock(&sn->svmm->mutex))
+ +		return false;
+ +	mmu_interval_set_seq(mni, cur_seq);
+ +	mutex_unlock(&sn->svmm->mutex);
+ +	return true;
+  }
+  
+ -static int
+ -nouveau_range_fault(struct nouveau_svmm *svmm, struct hmm_range *range)
+ +static const struct mmu_interval_notifier_ops nouveau_svm_mni_ops = {
+ +	.invalidate = nouveau_svm_range_invalidate,
+ +};
+ +
+ +static void nouveau_hmm_convert_pfn(struct nouveau_drm *drm,
+ +				    struct hmm_range *range,
+ +				    struct nouveau_pfnmap_args *args)
+  {
+ -	long ret;
+ +	struct page *page;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The address prepared here is passed through nvif_object_ioctl()
+ +	 * to an eventual DMA map in something like gp100_vmm_pgt_pfn()
+ +	 *
+ +	 * This is all just encoding the internal hmm representation into a
+ +	 * different nouveau internal representation.
+ +	 */
+ +	if (!(range->hmm_pfns[0] & HMM_PFN_VALID)) {
+ +		args->p.phys[0] = 0;
+ +		return;
+++=======
++ 	range->default_flags = 0;
++ 	range->pfn_flags_mask = -1UL;
++ 
++ 	ret = hmm_range_register(range, &svmm->mirror);
++ 	if (ret) {
++ 		up_read(&svmm->mm->mmap_sem);
++ 		return (int)ret;
+++>>>>>>> fac555ac93d4 (mm/hmm: remove superfluous arguments from hmm_range_register)
+  	}
+  
+ -	if (!hmm_range_wait_until_valid(range, HMM_RANGE_DEFAULT_TIMEOUT)) {
+ -		up_read(&svmm->mm->mmap_sem);
+ -		return -EBUSY;
+ +	page = hmm_pfn_to_page(range->hmm_pfns[0]);
+ +	/*
+ +	 * Only map compound pages to the GPU if the CPU is also mapping the
+ +	 * page as a compound page. Otherwise, the PTE protections might not be
+ +	 * consistent (e.g., CPU only maps part of a compound page).
+ +	 * Note that the underlying page might still be larger than the
+ +	 * CPU mapping (e.g., a PUD sized compound page partially mapped with
+ +	 * a PMD sized page table entry).
+ +	 */
+ +	if (hmm_pfn_to_map_order(range->hmm_pfns[0])) {
+ +		unsigned long addr = args->p.addr;
+ +
+ +		args->p.page = hmm_pfn_to_map_order(range->hmm_pfns[0]) +
+ +				PAGE_SHIFT;
+ +		args->p.size = 1UL << args->p.page;
+ +		args->p.addr &= ~(args->p.size - 1);
+ +		page -= (addr - args->p.addr) >> PAGE_SHIFT;
+  	}
+ +	if (is_device_private_page(page))
+ +		args->p.phys[0] = nouveau_dmem_page_addr(page) |
+ +				NVIF_VMM_PFNMAP_V0_V |
+ +				NVIF_VMM_PFNMAP_V0_VRAM;
+ +	else
+ +		args->p.phys[0] = page_to_phys(page) |
+ +				NVIF_VMM_PFNMAP_V0_V |
+ +				NVIF_VMM_PFNMAP_V0_HOST;
+ +	if (range->hmm_pfns[0] & HMM_PFN_WRITE)
+ +		args->p.phys[0] |= NVIF_VMM_PFNMAP_V0_W;
+ +}
+  
+ -	ret = hmm_range_fault(range, 0);
+ -	if (ret <= 0) {
+ -		if (ret == 0)
+ -			ret = -EBUSY;
+ -		up_read(&svmm->mm->mmap_sem);
+ -		hmm_range_unregister(range);
+ -		return ret;
+ +static int nouveau_range_fault(struct nouveau_svmm *svmm,
+ +			       struct nouveau_drm *drm,
+ +			       struct nouveau_pfnmap_args *args, u32 size,
+ +			       unsigned long hmm_flags,
+ +			       struct svm_notifier *notifier)
+ +{
+ +	unsigned long timeout =
+ +		jiffies + msecs_to_jiffies(HMM_RANGE_DEFAULT_TIMEOUT);
+ +	/* Have HMM fault pages within the fault window to the GPU. */
+ +	unsigned long hmm_pfns[1];
+ +	struct hmm_range range = {
+ +		.notifier = &notifier->notifier,
+ +		.start = notifier->notifier.interval_tree.start,
+ +		.end = notifier->notifier.interval_tree.last + 1,
+ +		.default_flags = hmm_flags,
+ +		.hmm_pfns = hmm_pfns,
+ +		.dev_private_owner = drm->dev,
+ +	};
+ +	struct mm_struct *mm = notifier->notifier.mm;
+ +	int ret;
+ +
+ +	while (true) {
+ +		if (time_after(jiffies, timeout))
+ +			return -EBUSY;
+ +
+ +		range.notifier_seq = mmu_interval_read_begin(range.notifier);
+ +		mmap_read_lock(mm);
+ +		ret = hmm_range_fault(&range);
+ +		mmap_read_unlock(mm);
+ +		if (ret) {
+ +			if (ret == -EBUSY)
+ +				continue;
+ +			return ret;
+ +		}
+ +
+ +		mutex_lock(&svmm->mutex);
+ +		if (mmu_interval_read_retry(range.notifier,
+ +					    range.notifier_seq)) {
+ +			mutex_unlock(&svmm->mutex);
+ +			continue;
+ +		}
+ +		break;
+  	}
+ -	return 0;
+ +
+ +	nouveau_hmm_convert_pfn(drm, &range, args);
+ +
+ +	svmm->vmm->vmm.object.client->super = true;
+ +	ret = nvif_object_ioctl(&svmm->vmm->vmm.object, args, size, NULL);
+ +	svmm->vmm->vmm.object.client->super = false;
+ +	mutex_unlock(&svmm->mutex);
+ +
+ +	return ret;
+  }
+  
+  static int
+@@@ -741,29 -654,77 +751,73 @@@ nouveau_svm_fault(struct nvif_notify *n
+  			 *
+  			 * ie. WRITE faults appear first, thus any handling of
+  			 * pending READ faults will already be satisfied.
+ +			 * But if a large page is mapped, make sure subsequent
+ +			 * fault addresses have sufficient access permission.
+  			 */
+ -			while (++fn < buffer->fault_nr &&
+ -			       buffer->fault[fn]->svmm == svmm &&
+ -			       buffer->fault[fn    ]->addr ==
+ -			       buffer->fault[fn - 1]->addr);
+ -
+ -			/* If the next fault is outside the window, or all GPU
+ -			 * faults have been dealt with, we're done here.
+ -			 */
+ -			if (fn >= buffer->fault_nr ||
+ -			    buffer->fault[fn]->svmm != svmm ||
+ -			    buffer->fault[fn]->addr >= limit)
+ +			if (buffer->fault[fn]->svmm != svmm ||
+ +			    buffer->fault[fn]->addr >= limit ||
+ +			    (buffer->fault[fi]->access == 0 /* READ. */ &&
+ +			     !(args.phys[0] & NVIF_VMM_PFNMAP_V0_V)) ||
+ +			    (buffer->fault[fi]->access != 0 /* READ. */ &&
+ +			     buffer->fault[fi]->access != 3 /* PREFETCH. */ &&
+ +			     !(args.phys[0] & NVIF_VMM_PFNMAP_V0_W)))
+  				break;
+ -
+ -			/* Fill in the gap between this fault and the next. */
+ -			fill = (buffer->fault[fn    ]->addr -
+ -				buffer->fault[fn - 1]->addr) >> PAGE_SHIFT;
+ -			while (--fill)
+ -				args.phys[pi++] = NVIF_VMM_PFNMAP_V0_NONE;
+  		}
+  
+ -		SVMM_DBG(svmm, "wndw %016llx-%016llx covering %d fault(s)",
+ -			 args.i.p.addr,
+ -			 args.i.p.addr + args.i.p.size, fn - fi);
+ +		/* If handling failed completely, cancel all faults. */
+ +		if (ret) {
+ +			while (fi < fn) {
+ +				struct nouveau_svm_fault *fault =
+ +					buffer->fault[fi++];
+  
+++<<<<<<< HEAD
+++=======
++ 		/* Have HMM fault pages within the fault window to the GPU. */
++ 		range.page_shift = PAGE_SHIFT;
++ 		range.start = args.i.p.addr;
++ 		range.end = args.i.p.addr + args.i.p.size;
++ 		range.pfns = args.phys;
++ 		range.flags = nouveau_svm_pfn_flags;
++ 		range.values = nouveau_svm_pfn_values;
++ 		range.pfn_shift = NVIF_VMM_PFNMAP_V0_ADDR_SHIFT;
++ again:
++ 		ret = nouveau_range_fault(svmm, &range);
++ 		if (ret == 0) {
++ 			mutex_lock(&svmm->mutex);
++ 			if (!nouveau_range_done(&range)) {
++ 				mutex_unlock(&svmm->mutex);
++ 				goto again;
++ 			}
++ 
++ 			nouveau_dmem_convert_pfn(svm->drm, &range);
++ 
++ 			svmm->vmm->vmm.object.client->super = true;
++ 			ret = nvif_object_ioctl(&svmm->vmm->vmm.object,
++ 						&args, sizeof(args.i) +
++ 						pi * sizeof(args.phys[0]),
++ 						NULL);
++ 			svmm->vmm->vmm.object.client->super = false;
++ 			mutex_unlock(&svmm->mutex);
++ 			up_read(&svmm->mm->mmap_sem);
++ 		}
++ 
++ 		/* Cancel any faults in the window whose pages didn't manage
++ 		 * to keep their valid bit, or stay writeable when required.
++ 		 *
++ 		 * If handling failed completely, cancel all faults.
++ 		 */
++ 		while (fi < fn) {
++ 			struct nouveau_svm_fault *fault = buffer->fault[fi++];
++ 			pi = (fault->addr - range.start) >> PAGE_SHIFT;
++ 			if (ret ||
++ 			     !(range.pfns[pi] & NVIF_VMM_PFNMAP_V0_V) ||
++ 			    (!(range.pfns[pi] & NVIF_VMM_PFNMAP_V0_W) &&
++ 			     fault->access != 0 && fault->access != 3)) {
+++>>>>>>> fac555ac93d4 (mm/hmm: remove superfluous arguments from hmm_range_register)
+  				nouveau_svm_fault_cancel_fault(svm, fault);
+ -				continue;
+  			}
+ +		} else
+  			replay++;
+ -		}
+  	}
+  
+  	/* Issue fault replay to the GPU. */
+diff --git a/Documentation/vm/hmm.rst b/Documentation/vm/hmm.rst
+index b4b84a2cecd8..0c4e4c8d5100 100644
+--- a/Documentation/vm/hmm.rst
++++ b/Documentation/vm/hmm.rst
+@@ -217,7 +217,7 @@ respect in order to keep things properly synchronized. The usage pattern is::
+       range.flags = ...;
+       range.values = ...;
+       range.pfn_shift = ...;
+-      hmm_range_register(&range);
++      hmm_range_register(&range, mirror);
+ 
+       /*
+        * Just wait for range to be valid, safe to ignore return value as we
+* Unmerged path drivers/gpu/drm/amd/amdgpu/amdgpu_ttm.c
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_svm.c
+diff --git a/include/linux/hmm.h b/include/linux/hmm.h
+index 6a8157d67186..73911bc2c244 100644
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@ -477,11 +477,7 @@ void hmm_mirror_unregister(struct hmm_mirror *mirror);
+ /*
+  * Please see Documentation/vm/hmm.rst for how to use the range API.
+  */
+-int hmm_range_register(struct hmm_range *range,
+-		       struct hmm_mirror *mirror,
+-		       unsigned long start,
+-		       unsigned long end,
+-		       unsigned page_shift);
++int hmm_range_register(struct hmm_range *range, struct hmm_mirror *mirror);
+ void hmm_range_unregister(struct hmm_range *range);
+ long hmm_range_snapshot(struct hmm_range *range);
+ long hmm_range_fault(struct hmm_range *range, bool block);
+diff --git a/mm/hmm.c b/mm/hmm.c
+index fc893fc2d462..57cee96a19a7 100644
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@ -887,35 +887,25 @@ static void hmm_pfns_clear(struct hmm_range *range,
+  * hmm_range_register() - start tracking change to CPU page table over a range
+  * @range: range
+  * @mm: the mm struct for the range of virtual address
+- * @start: start virtual address (inclusive)
+- * @end: end virtual address (exclusive)
+- * @page_shift: expect page shift for the range
++ *
+  * Return: 0 on success, -EFAULT if the address space is no longer valid
+  *
+  * Track updates to the CPU page table see include/linux/hmm.h
+  */
+-int hmm_range_register(struct hmm_range *range,
+-		       struct hmm_mirror *mirror,
+-		       unsigned long start,
+-		       unsigned long end,
+-		       unsigned page_shift)
++int hmm_range_register(struct hmm_range *range, struct hmm_mirror *mirror)
+ {
+-	unsigned long mask = ((1UL << page_shift) - 1UL);
++	unsigned long mask = ((1UL << range->page_shift) - 1UL);
+ 	struct hmm *hmm = mirror->hmm;
+ 	unsigned long flags;
+ 
+ 	range->valid = false;
+ 	range->hmm = NULL;
+ 
+-	if ((start & mask) || (end & mask))
++	if ((range->start & mask) || (range->end & mask))
+ 		return -EINVAL;
+-	if (start >= end)
++	if (range->start >= range->end)
+ 		return -EINVAL;
+ 
+-	range->page_shift = page_shift;
+-	range->start = start;
+-	range->end = end;
+-
+ 	/* Prevent hmm_release() from running while the range is valid */
+ 	if (!mmget_not_zero(hmm->mm))
+ 		return -EFAULT;
