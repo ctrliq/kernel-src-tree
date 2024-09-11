@@ -1,0 +1,183 @@
+devlink: allow driver to update progress of flash update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 191ed2024de9fcfaab24106f9dbf7e544b07d633
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/191ed202.failed
+
+Introduce a function to be called from drivers during flash. It sends
+notification to userspace about flash update progress.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 191ed2024de9fcfaab24106f9dbf7e544b07d633)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/devlink.h
+diff --cc include/net/devlink.h
+index cf565c488ce4,8f65356132be..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -721,6 -741,16 +721,19 @@@ voi
+  devlink_health_reporter_state_update(struct devlink_health_reporter *reporter,
+  				     enum devlink_health_reporter_state state);
+  
+++<<<<<<< HEAD
+++=======
++ void devlink_flash_update_begin_notify(struct devlink *devlink);
++ void devlink_flash_update_end_notify(struct devlink *devlink);
++ void devlink_flash_update_status_notify(struct devlink *devlink,
++ 					const char *status_msg,
++ 					const char *component,
++ 					unsigned long done,
++ 					unsigned long total);
++ 
++ #if IS_ENABLED(CONFIG_NET_DEVLINK)
++ 
+++>>>>>>> 191ed2024de9 (devlink: allow driver to update progress of flash update)
+  void devlink_compat_running_version(struct net_device *dev,
+  				    char *buf, size_t len);
+  int devlink_compat_flash_update(struct net_device *dev, const char *file_name);
+* Unmerged path include/net/devlink.h
+diff --git a/include/uapi/linux/devlink.h b/include/uapi/linux/devlink.h
+index 5bb4ea67d84f..5287b42c181f 100644
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@ -104,6 +104,8 @@ enum devlink_command {
+ 	DEVLINK_CMD_HEALTH_REPORTER_DUMP_CLEAR,
+ 
+ 	DEVLINK_CMD_FLASH_UPDATE,
++	DEVLINK_CMD_FLASH_UPDATE_END,		/* notification only */
++	DEVLINK_CMD_FLASH_UPDATE_STATUS,	/* notification only */
+ 
+ 	/* add new commands above here */
+ 	__DEVLINK_CMD_MAX,
+@@ -331,6 +333,9 @@ enum devlink_attr {
+ 
+ 	DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME,	/* string */
+ 	DEVLINK_ATTR_FLASH_UPDATE_COMPONENT,	/* string */
++	DEVLINK_ATTR_FLASH_UPDATE_STATUS_MSG,	/* string */
++	DEVLINK_ATTR_FLASH_UPDATE_STATUS_DONE,	/* u64 */
++	DEVLINK_ATTR_FLASH_UPDATE_STATUS_TOTAL,	/* u64 */
+ 
+ 	/* add new attributes above here, update the policy in devlink.c */
+ 
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index b4c4f4fedadb..822e4f49d164 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -2672,6 +2672,108 @@ static int devlink_nl_cmd_reload(struct sk_buff *skb, struct genl_info *info)
+ 	return devlink->ops->reload(devlink, info->extack);
+ }
+ 
++static int devlink_nl_flash_update_fill(struct sk_buff *msg,
++					struct devlink *devlink,
++					enum devlink_command cmd,
++					const char *status_msg,
++					const char *component,
++					unsigned long done, unsigned long total)
++{
++	void *hdr;
++
++	hdr = genlmsg_put(msg, 0, 0, &devlink_nl_family, 0, cmd);
++	if (!hdr)
++		return -EMSGSIZE;
++
++	if (devlink_nl_put_handle(msg, devlink))
++		goto nla_put_failure;
++
++	if (cmd != DEVLINK_CMD_FLASH_UPDATE_STATUS)
++		goto out;
++
++	if (status_msg &&
++	    nla_put_string(msg, DEVLINK_ATTR_FLASH_UPDATE_STATUS_MSG,
++			   status_msg))
++		goto nla_put_failure;
++	if (component &&
++	    nla_put_string(msg, DEVLINK_ATTR_FLASH_UPDATE_COMPONENT,
++			   component))
++		goto nla_put_failure;
++	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_FLASH_UPDATE_STATUS_DONE,
++			      done, DEVLINK_ATTR_PAD))
++		goto nla_put_failure;
++	if (nla_put_u64_64bit(msg, DEVLINK_ATTR_FLASH_UPDATE_STATUS_TOTAL,
++			      total, DEVLINK_ATTR_PAD))
++		goto nla_put_failure;
++
++out:
++	genlmsg_end(msg, hdr);
++	return 0;
++
++nla_put_failure:
++	genlmsg_cancel(msg, hdr);
++	return -EMSGSIZE;
++}
++
++static void __devlink_flash_update_notify(struct devlink *devlink,
++					  enum devlink_command cmd,
++					  const char *status_msg,
++					  const char *component,
++					  unsigned long done,
++					  unsigned long total)
++{
++	struct sk_buff *msg;
++	int err;
++
++	WARN_ON(cmd != DEVLINK_CMD_FLASH_UPDATE &&
++		cmd != DEVLINK_CMD_FLASH_UPDATE_END &&
++		cmd != DEVLINK_CMD_FLASH_UPDATE_STATUS);
++
++	msg = nlmsg_new(NLMSG_DEFAULT_SIZE, GFP_KERNEL);
++	if (!msg)
++		return;
++
++	err = devlink_nl_flash_update_fill(msg, devlink, cmd, status_msg,
++					   component, done, total);
++	if (err)
++		goto out_free_msg;
++
++	genlmsg_multicast_netns(&devlink_nl_family, devlink_net(devlink),
++				msg, 0, DEVLINK_MCGRP_CONFIG, GFP_KERNEL);
++	return;
++
++out_free_msg:
++	nlmsg_free(msg);
++}
++
++void devlink_flash_update_begin_notify(struct devlink *devlink)
++{
++	__devlink_flash_update_notify(devlink,
++				      DEVLINK_CMD_FLASH_UPDATE,
++				      NULL, NULL, 0, 0);
++}
++EXPORT_SYMBOL_GPL(devlink_flash_update_begin_notify);
++
++void devlink_flash_update_end_notify(struct devlink *devlink)
++{
++	__devlink_flash_update_notify(devlink,
++				      DEVLINK_CMD_FLASH_UPDATE_END,
++				      NULL, NULL, 0, 0);
++}
++EXPORT_SYMBOL_GPL(devlink_flash_update_end_notify);
++
++void devlink_flash_update_status_notify(struct devlink *devlink,
++					const char *status_msg,
++					const char *component,
++					unsigned long done,
++					unsigned long total)
++{
++	__devlink_flash_update_notify(devlink,
++				      DEVLINK_CMD_FLASH_UPDATE_STATUS,
++				      status_msg, component, done, total);
++}
++EXPORT_SYMBOL_GPL(devlink_flash_update_status_notify);
++
+ static int devlink_nl_cmd_flash_update(struct sk_buff *skb,
+ 				       struct genl_info *info)
+ {
