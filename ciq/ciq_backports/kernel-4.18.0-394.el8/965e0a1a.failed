@@ -1,0 +1,149 @@
+xfs: move the di_flushiter field to struct xfs_inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 965e0a1ad273ba61a8040220ef8ec09c9d065875
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/965e0a1a.failed
+
+In preparation of removing the historic icinode struct, move the
+flushiter field into the containing xfs_inode structure.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 965e0a1ad273ba61a8040220ef8ec09c9d065875)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_inode_buf.h
+#	fs/xfs/xfs_inode.h
+diff --cc fs/xfs/libxfs/xfs_inode_buf.h
+index 406f66799288,e41a11bef044..000000000000
+--- a/fs/xfs/libxfs/xfs_inode_buf.h
++++ b/fs/xfs/libxfs/xfs_inode_buf.h
+@@@ -16,10 -16,6 +16,13 @@@ struct xfs_dinode
+   * format specific structures at the appropriate time.
+   */
+  struct xfs_icdinode {
+++<<<<<<< HEAD
+ +	uint16_t	di_flushiter;	/* incremented on flush */
+ +	xfs_fsize_t	di_size;	/* number of bytes in file */
+ +	xfs_rfsblock_t	di_nblocks;	/* # of direct & btree blocks used */
+ +	xfs_extlen_t	di_extsize;	/* basic/minimum extent size for file */
+++=======
+++>>>>>>> 965e0a1ad273 (xfs: move the di_flushiter field to struct xfs_inode)
+  	uint8_t		di_forkoff;	/* attr fork offs, <<3 for 64b align */
+  	uint16_t	di_flags;	/* random flags, XFS_DIFLAG_... */
+  
+diff --cc fs/xfs/xfs_inode.h
+index ab59fceed361,a76ca913f769..000000000000
+--- a/fs/xfs/xfs_inode.h
++++ b/fs/xfs/xfs_inode.h
+@@@ -54,7 -54,12 +54,13 @@@ typedef struct xfs_inode 
+  	/* Miscellaneous state. */
+  	unsigned long		i_flags;	/* see defined flags below */
+  	uint64_t		i_delayed_blks;	/* count of delay alloc blks */
+ -	xfs_fsize_t		i_disk_size;	/* number of bytes in file */
+ -	xfs_rfsblock_t		i_nblocks;	/* # of direct & btree blocks */
+  	prid_t			i_projid;	/* owner's project id */
+++<<<<<<< HEAD
+++=======
++ 	xfs_extlen_t		i_extsize;	/* basic/minimum extent size */
++ 	xfs_extlen_t		i_cowextsize;	/* basic cow extent size */
++ 	uint16_t		i_flushiter;	/* incremented on flush */
+++>>>>>>> 965e0a1ad273 (xfs: move the di_flushiter field to struct xfs_inode)
+  
+  	struct xfs_icdinode	i_d;		/* most of ondisk inode */
+  
+diff --git a/fs/xfs/libxfs/xfs_inode_buf.c b/fs/xfs/libxfs/xfs_inode_buf.c
+index 671aeb012e3f..ced183cebad1 100644
+--- a/fs/xfs/libxfs/xfs_inode_buf.c
++++ b/fs/xfs/libxfs/xfs_inode_buf.c
+@@ -193,7 +193,7 @@ xfs_inode_from_disk(
+ 	 * inode. If the inode is unused, mode is zero and we shouldn't mess
+ 	 * with the uninitialized part of it.
+ 	 */
+-	to->di_flushiter = be16_to_cpu(from->di_flushiter);
++	ip->i_flushiter = be16_to_cpu(from->di_flushiter);
+ 	inode->i_generation = be32_to_cpu(from->di_gen);
+ 	inode->i_mode = be16_to_cpu(from->di_mode);
+ 	if (!inode->i_mode)
+@@ -327,7 +327,7 @@ xfs_inode_to_disk(
+ 		to->di_flushiter = 0;
+ 	} else {
+ 		to->di_version = 2;
+-		to->di_flushiter = cpu_to_be16(from->di_flushiter);
++		to->di_flushiter = cpu_to_be16(ip->i_flushiter);
+ 	}
+ }
+ 
+* Unmerged path fs/xfs/libxfs/xfs_inode_buf.h
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index 7ea1c183137f..8089243e6026 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -497,7 +497,7 @@ xfs_iget_cache_miss(
+ 	 * simply build the new inode core with a random generation number.
+ 	 *
+ 	 * For version 4 (and older) superblocks, log recovery is dependent on
+-	 * the di_flushiter field being initialised from the current on-disk
++	 * the i_flushiter field being initialised from the current on-disk
+ 	 * value and hence we must also read the inode off disk even when
+ 	 * initializing new inodes.
+ 	 */
+diff --git a/fs/xfs/xfs_inode.c b/fs/xfs/xfs_inode.c
+index d856a2225b9c..a3442f8317ed 100644
+--- a/fs/xfs/xfs_inode.c
++++ b/fs/xfs/xfs_inode.c
+@@ -3424,16 +3424,15 @@ xfs_iflush(
+ 	}
+ 
+ 	/*
+-	 * Inode item log recovery for v2 inodes are dependent on the
+-	 * di_flushiter count for correct sequencing. We bump the flush
+-	 * iteration count so we can detect flushes which postdate a log record
+-	 * during recovery. This is redundant as we now log every change and
+-	 * hence this can't happen but we need to still do it to ensure
+-	 * backwards compatibility with old kernels that predate logging all
+-	 * inode changes.
++	 * Inode item log recovery for v2 inodes are dependent on the flushiter
++	 * count for correct sequencing.  We bump the flush iteration count so
++	 * we can detect flushes which postdate a log record during recovery.
++	 * This is redundant as we now log every change and hence this can't
++	 * happen but we need to still do it to ensure backwards compatibility
++	 * with old kernels that predate logging all inode changes.
+ 	 */
+ 	if (!xfs_sb_version_has_v3inode(&mp->m_sb))
+-		ip->i_d.di_flushiter++;
++		ip->i_flushiter++;
+ 
+ 	/*
+ 	 * If there are inline format data / attr forks attached to this inode,
+@@ -3454,8 +3453,8 @@ xfs_iflush(
+ 	xfs_inode_to_disk(ip, dip, iip->ili_item.li_lsn);
+ 
+ 	/* Wrap, we never let the log put out DI_MAX_FLUSH */
+-	if (ip->i_d.di_flushiter == DI_MAX_FLUSH)
+-		ip->i_d.di_flushiter = 0;
++	if (ip->i_flushiter == DI_MAX_FLUSH)
++		ip->i_flushiter = 0;
+ 
+ 	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK);
+ 	if (XFS_IFORK_Q(ip))
+* Unmerged path fs/xfs/xfs_inode.h
+diff --git a/fs/xfs/xfs_inode_item.c b/fs/xfs/xfs_inode_item.c
+index 342023fbc07e..0c13b60c9b3a 100644
+--- a/fs/xfs/xfs_inode_item.c
++++ b/fs/xfs/xfs_inode_item.c
+@@ -410,7 +410,7 @@ xfs_inode_to_log_dinode(
+ 		to->di_flushiter = 0;
+ 	} else {
+ 		to->di_version = 2;
+-		to->di_flushiter = from->di_flushiter;
++		to->di_flushiter = ip->i_flushiter;
+ 	}
+ }
+ 
