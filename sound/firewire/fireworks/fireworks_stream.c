@@ -193,9 +193,9 @@ int snd_efw_stream_start_duplex(struct snd_efw *efw, unsigned int rate)
 	unsigned int curr_rate;
 	int err = 0;
 
-	/* Need no substreams */
-	if (efw->playback_substreams == 0 && efw->capture_substreams  == 0)
-		goto end;
+	// Need no substreams.
+	if (efw->substreams_counter == 0)
+		return -EIO;
 
 	/*
 	 * Considering JACK/FFADO streaming:
@@ -205,19 +205,15 @@ int snd_efw_stream_start_duplex(struct snd_efw *efw, unsigned int rate)
 	if (err < 0)
 		goto end;
 
-	/* packet queueing error */
-	if (amdtp_streaming_error(&efw->tx_stream))
-		stop_stream(efw, &efw->tx_stream);
-	if (amdtp_streaming_error(&efw->rx_stream))
-		stop_stream(efw, &efw->rx_stream);
-
 	/* stop streams if rate is different */
 	err = snd_efw_command_get_sampling_rate(efw, &curr_rate);
 	if (err < 0)
 		goto end;
 	if (rate == 0)
 		rate = curr_rate;
-	if (rate != curr_rate) {
+	if (rate != curr_rate ||
+	    amdtp_streaming_error(&efw->tx_stream) ||
+	    amdtp_streaming_error(&efw->rx_stream)) {
 		stop_stream(efw, &efw->tx_stream);
 		stop_stream(efw, &efw->rx_stream);
 	}
@@ -236,13 +232,12 @@ int snd_efw_stream_start_duplex(struct snd_efw *efw, unsigned int rate)
 		}
 	}
 
-	/* start slave if needed */
-	if (efw->capture_substreams > 0 &&
-	    !amdtp_stream_running(&efw->tx_stream)) {
+	if (!amdtp_stream_running(&efw->tx_stream)) {
 		err = start_stream(efw, &efw->tx_stream, rate);
 		if (err < 0) {
 			dev_err(&efw->unit->device,
 				"fail to start AMDTP slave stream:%d\n", err);
+			stop_stream(efw, &efw->tx_stream);
 			stop_stream(efw, &efw->rx_stream);
 		}
 	}
@@ -252,11 +247,9 @@ end:
 
 void snd_efw_stream_stop_duplex(struct snd_efw *efw)
 {
-	if (efw->capture_substreams == 0) {
+	if (efw->substreams_counter == 0) {
 		stop_stream(efw, &efw->tx_stream);
-
-		if (efw->playback_substreams == 0)
-			stop_stream(efw, &efw->rx_stream);
+		stop_stream(efw, &efw->rx_stream);
 	}
 }
 
