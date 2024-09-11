@@ -1,0 +1,215 @@
+nfp: flower: offload pre-tunnel rules
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author John Hurley <john.hurley@netronome.com>
+commit f12725d98cbe862c7680c63fd1f8b381af965f7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f12725d9.failed
+
+Pre-tunnel rules are TC flower and OvS rules that forward a packet to the
+tunnel end point where it can then pass through the network stack and be
+decapsulated. These are required if the tunnel end point is, say, an OvS
+internal port.
+
+Currently, firmware determines that a packet is in a tunnel and decaps it
+if it has a known destination IP and MAC address. However, this bypasses
+the flower pre-tunnel rule and so does not update the stats. Further to
+this it ignores VLANs that may exist outside of the tunnel header.
+
+Offload pre-tunnel rules to the NFP. This embeds the pre-tunnel rule into
+the tunnel decap process based on (firmware) mac index and VLAN. This
+means that decap can be carried out correctly with VLANs and that stats
+can be updated for all kernel rules correctly.
+
+	Signed-off-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f12725d98cbe862c7680c63fd1f8b381af965f7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+#	drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --cc drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 25576417ebab,7eb2ec8969c3..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@@ -446,6 -481,10 +446,13 @@@ enum nfp_flower_cmsg_type_port 
+  	NFP_FLOWER_CMSG_TYPE_TUN_IPS =		14,
+  	NFP_FLOWER_CMSG_TYPE_FLOW_STATS =	15,
+  	NFP_FLOWER_CMSG_TYPE_PORT_ECHO =	16,
+++<<<<<<< HEAD
+++=======
++ 	NFP_FLOWER_CMSG_TYPE_QOS_MOD =		18,
++ 	NFP_FLOWER_CMSG_TYPE_QOS_DEL =		19,
++ 	NFP_FLOWER_CMSG_TYPE_QOS_STATS =	20,
++ 	NFP_FLOWER_CMSG_TYPE_PRE_TUN_RULE =	21,
+++>>>>>>> f12725d98cbe (nfp: flower: offload pre-tunnel rules)
+  	NFP_FLOWER_CMSG_TYPE_MAX =		32,
+  };
+  
+diff --cc drivers/net/ethernet/netronome/nfp/flower/main.h
+index cbede9cb0351,5d302d79c004..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.h
+@@@ -160,6 -160,10 +160,13 @@@ struct nfp_fl_internal_ports 
+   * @active_mem_unit:	Current active memory unit for flower rules
+   * @total_mem_units:	Total number of available memory units for flower rules
+   * @internal_ports:	Internal port ids used in offloaded rules
+++<<<<<<< HEAD
+++=======
++  * @qos_stats_work:	Workqueue for qos stats processing
++  * @qos_rate_limiters:	Current active qos rate limiters
++  * @qos_stats_lock:	Lock on qos stats updates
++  * @pre_tun_rule_cnt:	Number of pre-tunnel rules offloaded
+++>>>>>>> f12725d98cbe (nfp: flower: offload pre-tunnel rules)
+   */
+  struct nfp_flower_priv {
+  	struct nfp_app *app;
+@@@ -188,6 -192,24 +195,27 @@@
+  	unsigned int active_mem_unit;
+  	unsigned int total_mem_units;
+  	struct nfp_fl_internal_ports internal_ports;
+++<<<<<<< HEAD
+++=======
++ 	struct delayed_work qos_stats_work;
++ 	unsigned int qos_rate_limiters;
++ 	spinlock_t qos_stats_lock; /* Protect the qos stats */
++ 	int pre_tun_rule_cnt;
++ };
++ 
++ /**
++  * struct nfp_fl_qos - Flower APP priv data for quality of service
++  * @netdev_port_id:	NFP port number of repr with qos info
++  * @curr_stats:		Currently stored stats updates for qos info
++  * @prev_stats:		Previously stored updates for qos info
++  * @last_update:	Stored time when last stats were updated
++  */
++ struct nfp_fl_qos {
++ 	u32 netdev_port_id;
++ 	struct nfp_stat_pair curr_stats;
++ 	struct nfp_stat_pair prev_stats;
++ 	u64 last_update;
+++>>>>>>> f12725d98cbe (nfp: flower: offload pre-tunnel rules)
+  };
+  
+  /**
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/main.c b/drivers/net/ethernet/netronome/nfp/flower/main.c
+index d476917c8f7d..b59089f85834 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/main.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/main.c
+@@ -778,6 +778,7 @@ static int nfp_flower_init(struct nfp_app *app)
+ 
+ 	INIT_LIST_HEAD(&app_priv->indr_block_cb_priv);
+ 	INIT_LIST_HEAD(&app_priv->non_repr_priv);
++	app_priv->pre_tun_rule_cnt = 0;
+ 
+ 	return 0;
+ 
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/main.h
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+index 353833ffcf69..12e47909cae3 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/tunnel_conf.c
+@@ -15,6 +15,23 @@
+ 
+ #define NFP_FL_MAX_ROUTES               32
+ 
++#define NFP_TUN_PRE_TUN_RULE_LIMIT	32
++#define NFP_TUN_PRE_TUN_RULE_DEL	0x1
++
++/**
++ * struct nfp_tun_pre_run_rule - rule matched before decap
++ * @flags:		options for the rule offset
++ * @port_idx:		index of destination MAC address for the rule
++ * @vlan_tci:		VLAN info associated with MAC
++ * @host_ctx_id:	stats context of rule to update
++ */
++struct nfp_tun_pre_tun_rule {
++	__be32 flags;
++	__be16 port_idx;
++	__be16 vlan_tci;
++	__be32 host_ctx_id;
++};
++
+ /**
+  * struct nfp_tun_active_tuns - periodic message of active tunnels
+  * @seq:		sequence number of the message
+@@ -836,13 +853,71 @@ int nfp_tunnel_mac_event_handler(struct nfp_app *app,
+ int nfp_flower_xmit_pre_tun_flow(struct nfp_app *app,
+ 				 struct nfp_fl_payload *flow)
+ {
+-	return -EOPNOTSUPP;
++	struct nfp_flower_priv *app_priv = app->priv;
++	struct nfp_tun_offloaded_mac *mac_entry;
++	struct nfp_tun_pre_tun_rule payload;
++	struct net_device *internal_dev;
++	int err;
++
++	if (app_priv->pre_tun_rule_cnt == NFP_TUN_PRE_TUN_RULE_LIMIT)
++		return -ENOSPC;
++
++	memset(&payload, 0, sizeof(struct nfp_tun_pre_tun_rule));
++
++	internal_dev = flow->pre_tun_rule.dev;
++	payload.vlan_tci = flow->pre_tun_rule.vlan_tci;
++	payload.host_ctx_id = flow->meta.host_ctx_id;
++
++	/* Lookup MAC index for the pre-tunnel rule egress device.
++	 * Note that because the device is always an internal port, it will
++	 * have a constant global index so does not need to be tracked.
++	 */
++	mac_entry = nfp_tunnel_lookup_offloaded_macs(app,
++						     internal_dev->dev_addr);
++	if (!mac_entry)
++		return -ENOENT;
++
++	payload.port_idx = cpu_to_be16(mac_entry->index);
++
++	/* Copy mac id and vlan to flow - dev may not exist at delete time. */
++	flow->pre_tun_rule.vlan_tci = payload.vlan_tci;
++	flow->pre_tun_rule.port_idx = payload.port_idx;
++
++	err = nfp_flower_xmit_tun_conf(app, NFP_FLOWER_CMSG_TYPE_PRE_TUN_RULE,
++				       sizeof(struct nfp_tun_pre_tun_rule),
++				       (unsigned char *)&payload, GFP_KERNEL);
++	if (err)
++		return err;
++
++	app_priv->pre_tun_rule_cnt++;
++
++	return 0;
+ }
+ 
+ int nfp_flower_xmit_pre_tun_del_flow(struct nfp_app *app,
+ 				     struct nfp_fl_payload *flow)
+ {
+-	return -EOPNOTSUPP;
++	struct nfp_flower_priv *app_priv = app->priv;
++	struct nfp_tun_pre_tun_rule payload;
++	u32 tmp_flags = 0;
++	int err;
++
++	memset(&payload, 0, sizeof(struct nfp_tun_pre_tun_rule));
++
++	tmp_flags |= NFP_TUN_PRE_TUN_RULE_DEL;
++	payload.flags = cpu_to_be32(tmp_flags);
++	payload.vlan_tci = flow->pre_tun_rule.vlan_tci;
++	payload.port_idx = flow->pre_tun_rule.port_idx;
++
++	err = nfp_flower_xmit_tun_conf(app, NFP_FLOWER_CMSG_TYPE_PRE_TUN_RULE,
++				       sizeof(struct nfp_tun_pre_tun_rule),
++				       (unsigned char *)&payload, GFP_KERNEL);
++	if (err)
++		return err;
++
++	app_priv->pre_tun_rule_cnt--;
++
++	return 0;
+ }
+ 
+ int nfp_tunnel_config_start(struct nfp_app *app)
