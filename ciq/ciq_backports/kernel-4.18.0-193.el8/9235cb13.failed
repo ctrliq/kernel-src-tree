@@ -1,0 +1,199 @@
+iommu/vt-d: Allow devices with RMRRs to use identity domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit 9235cb13d7d17baba0b3a9277381258361e95c16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9235cb13.failed
+
+Since commit ea2447f700cab ("intel-iommu: Prevent devices with
+RMRRs from being placed into SI Domain"), the Intel IOMMU driver
+doesn't allow any devices with RMRR locked to use the identity
+domain. This was added to to fix the issue where the RMRR info
+for devices being placed in and out of the identity domain gets
+lost. This identity maps all RMRRs when setting up the identity
+domain, so that devices with RMRRs could also use it.
+
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 9235cb13d7d17baba0b3a9277381258361e95c16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index 1431de3bfba0,47d023c1088c..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2777,6 -2892,26 +2777,29 @@@ static int __init si_domain_init(int hw
+  		}
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Identity map the RMRRs so that devices with RMRRs could also use
++ 	 * the si_domain.
++ 	 */
++ 	for_each_rmrr_units(rmrr) {
++ 		for_each_active_dev_scope(rmrr->devices, rmrr->devices_cnt,
++ 					  i, dev) {
++ 			unsigned long long start = rmrr->base_address;
++ 			unsigned long long end = rmrr->end_address;
++ 
++ 			if (WARN_ON(end < start ||
++ 				    end >> agaw_to_width(si_domain->agaw)))
++ 				continue;
++ 
++ 			ret = iommu_domain_identity_map(si_domain, start, end);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 	}
++ 
+++>>>>>>> 9235cb13d7d1 (iommu/vt-d: Allow devices with RMRRs to use identity domain)
+  	return 0;
+  }
+  
+@@@ -2948,118 -3077,34 +2968,115 @@@ static int device_def_domain_type(struc
+  				return IOMMU_DOMAIN_DMA;
+  		} else if (pci_pcie_type(pdev) == PCI_EXP_TYPE_PCI_BRIDGE)
+  			return IOMMU_DOMAIN_DMA;
+- 	} else {
+- 		if (device_has_rmrr(dev))
+- 			return IOMMU_DOMAIN_DMA;
+  	}
+  
+ -	return (iommu_identity_mapping & IDENTMAP_ALL) ?
+ -			IOMMU_DOMAIN_IDENTITY : 0;
+ -}
+ -
+ -static void intel_iommu_init_qi(struct intel_iommu *iommu)
+ -{
+  	/*
+ -	 * Start from the sane iommu hardware state.
+ -	 * If the queued invalidation is already initialized by us
+ -	 * (for example, while enabling interrupt-remapping) then
+ -	 * we got the things already rolling from a sane state.
+ +	 * At boot time, we don't yet know if devices will be 64-bit capable.
+ +	 * Assume that they will — if they turn out not to be, then we can
+ +	 * take them out of the 1:1 domain later.
+  	 */
+ -	if (!iommu->qi) {
+ -		/*
+ -		 * Clear any previous faults.
+ -		 */
+ -		dmar_fault(-1, iommu);
+ +	if (!startup) {
+  		/*
+ -		 * Disable queued invalidation if supported and already enabled
+ -		 * before OS handover.
+ +		 * If the device's dma_mask is less than the system's memory
+ +		 * size then this is not a candidate for identity mapping.
+  		 */
+ -		dmar_disable_qi(iommu);
+ +		u64 dma_mask = *dev->dma_mask;
+ +
+ +		if (dev->coherent_dma_mask &&
+ +		    dev->coherent_dma_mask < dma_mask)
+ +			dma_mask = dev->coherent_dma_mask;
+ +
+ +		return dma_mask >= dma_get_required_mask(dev);
+  	}
+  
+ -	if (dmar_enable_qi(iommu)) {
+ -		/*
+ +	return (iommu_identity_mapping & IDENTMAP_ALL) ?
+ +			IOMMU_DOMAIN_IDENTITY : 0;
+ +}
+ +
+ +static inline int iommu_should_identity_map(struct device *dev)
+ +{
+ +	return device_def_domain_type(dev) == IOMMU_DOMAIN_IDENTITY;
+ +}
+ +
+ +static int __init dev_prepare_static_identity_mapping(struct device *dev, int hw)
+ +{
+ +	int ret;
+ +
+ +	if (!iommu_should_identity_map(dev))
+ +		return 0;
+ +
+ +	ret = domain_add_dev_info(si_domain, dev);
+ +	if (!ret)
+ +		pr_info("%s identity mapping for device %s\n",
+ +			hw ? "Hardware" : "Software", dev_name(dev));
+ +	else if (ret == -ENODEV)
+ +		/* device not associated with an iommu */
+ +		ret = 0;
+ +
+ +	return ret;
+ +}
+ +
+ +
+ +static int __init iommu_prepare_static_identity_mapping(int hw)
+ +{
+ +	struct pci_dev *pdev = NULL;
+ +	struct dmar_drhd_unit *drhd;
+ +	struct intel_iommu *iommu;
+ +	struct device *dev;
+ +	int i;
+ +	int ret = 0;
+ +
+ +	for_each_pci_dev(pdev) {
+ +		ret = dev_prepare_static_identity_mapping(&pdev->dev, hw);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	for_each_active_iommu(iommu, drhd)
+ +		for_each_active_dev_scope(drhd->devices, drhd->devices_cnt, i, dev) {
+ +			struct acpi_device_physical_node *pn;
+ +			struct acpi_device *adev;
+ +
+ +			if (dev->bus != &acpi_bus_type)
+ +				continue;
+ +
+ +			adev= to_acpi_device(dev);
+ +			mutex_lock(&adev->physical_node_lock);
+ +			list_for_each_entry(pn, &adev->physical_node_list, node) {
+ +				ret = dev_prepare_static_identity_mapping(pn->dev, hw);
+ +				if (ret)
+ +					break;
+ +			}
+ +			mutex_unlock(&adev->physical_node_lock);
+ +			if (ret)
+ +				return ret;
+ +		}
+ +
+ +	return 0;
+ +}
+ +
+ +static void intel_iommu_init_qi(struct intel_iommu *iommu)
+ +{
+ +	/*
+ +	 * Start from the sane iommu hardware state.
+ +	 * If the queued invalidation is already initialized by us
+ +	 * (for example, while enabling interrupt-remapping) then
+ +	 * we got the things already rolling from a sane state.
+ +	 */
+ +	if (!iommu->qi) {
+ +		/*
+ +		 * Clear any previous faults.
+ +		 */
+ +		dmar_fault(-1, iommu);
+ +		/*
+ +		 * Disable queued invalidation if supported and already enabled
+ +		 * before OS handover.
+ +		 */
+ +		dmar_disable_qi(iommu);
+ +	}
+ +
+ +	if (dmar_enable_qi(iommu)) {
+ +		/*
+  		 * Queued Invalidate not enabled, use Register Based Invalidate
+  		 */
+  		iommu->flush.flush_context = __iommu_flush_context;
+* Unmerged path drivers/iommu/intel-iommu.c
