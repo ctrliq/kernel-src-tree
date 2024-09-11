@@ -1,0 +1,228 @@
+skmsg: Get rid of struct sk_psock_parser
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit 5a685cd94b21a88efa6be77169eddef525368034
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/5a685cd9.failed
+
+struct sk_psock_parser is embedded in sk_psock, it is
+unnecessary as skb verdict also uses ->saved_data_ready.
+We can simply fold these fields into sk_psock, and get rid
+of ->enabled.
+
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+Link: https://lore.kernel.org/bpf/20210223184934.6054-3-xiyou.wangcong@gmail.com
+(cherry picked from commit 5a685cd94b21a88efa6be77169eddef525368034)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skmsg.h
+#	net/core/skmsg.c
+diff --cc include/linux/skmsg.h
+index 98263673d9b8,22e26f82de33..000000000000
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@@ -70,12 -70,6 +70,15 @@@ struct sk_psock_link 
+  	void				*link_raw;
+  };
+  
+++<<<<<<< HEAD
+ +struct sk_psock_parser {
+ +	struct strparser		strp;
+ +	bool				enabled;
+ +	void (*saved_data_ready)(struct sock *sk);
+ +};
+ +
+++=======
+++>>>>>>> 5a685cd94b21 (skmsg: Get rid of struct sk_psock_parser)
+  struct sk_psock_work_state {
+  	struct sk_buff			*skb;
+  	u32				len;
+diff --cc net/core/skmsg.c
+index e8d58a185b39,d00c9a4b47e7..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -1008,57 -951,107 +1008,123 @@@ int sk_psock_init_strp(struct sock *sk
+  		.parse_msg	= sk_psock_strp_parse,
+  	};
+  
+- 	psock->parser.enabled = false;
+- 	return strp_init(&psock->parser.strp, sk, &cb);
++ 	return strp_init(&psock->strp, sk, &cb);
+  }
+  
+ +void sk_psock_start_verdict(struct sock *sk, struct sk_psock *psock)
+ +{
+ +	struct sk_psock_parser *parser = &psock->parser;
+ +
+ +	if (parser->enabled)
+ +		return;
+ +
+ +	parser->saved_data_ready = sk->sk_data_ready;
+ +	sk->sk_data_ready = sk_psock_verdict_data_ready;
+ +	sk->sk_write_space = sk_psock_write_space;
+ +	parser->enabled = true;
+ +}
+ +
+  void sk_psock_start_strp(struct sock *sk, struct sk_psock *psock)
+  {
+- 	struct sk_psock_parser *parser = &psock->parser;
+- 
+- 	if (parser->enabled)
++ 	if (psock->saved_data_ready)
+  		return;
+  
+- 	parser->saved_data_ready = sk->sk_data_ready;
++ 	psock->saved_data_ready = sk->sk_data_ready;
+  	sk->sk_data_ready = sk_psock_strp_data_ready;
+  	sk->sk_write_space = sk_psock_write_space;
+- 	parser->enabled = true;
+  }
+  
+  void sk_psock_stop_strp(struct sock *sk, struct sk_psock *psock)
+  {
+- 	struct sk_psock_parser *parser = &psock->parser;
++ 	if (!psock->saved_data_ready)
++ 		return;
+  
+- 	if (!parser->enabled)
++ 	sk->sk_data_ready = psock->saved_data_ready;
++ 	psock->saved_data_ready = NULL;
++ 	strp_stop(&psock->strp);
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ static void sk_psock_done_strp(struct sk_psock *psock)
++ {
++ 	/* Parser has been stopped */
++ 	if (psock->progs.skb_parser)
++ 		strp_done(&psock->strp);
++ }
++ #else
++ static void sk_psock_done_strp(struct sk_psock *psock)
++ {
++ }
++ #endif /* CONFIG_BPF_STREAM_PARSER */
++ 
++ static int sk_psock_verdict_recv(read_descriptor_t *desc, struct sk_buff *skb,
++ 				 unsigned int offset, size_t orig_len)
++ {
++ 	struct sock *sk = (struct sock *)desc->arg.data;
++ 	struct sk_psock *psock;
++ 	struct bpf_prog *prog;
++ 	int ret = __SK_DROP;
++ 	int len = skb->len;
++ 
++ 	/* clone here so sk_eat_skb() in tcp_read_sock does not drop our data */
++ 	skb = skb_clone(skb, GFP_ATOMIC);
++ 	if (!skb) {
++ 		desc->error = -ENOMEM;
++ 		return 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	psock = sk_psock(sk);
++ 	if (unlikely(!psock)) {
++ 		len = 0;
++ 		kfree_skb(skb);
++ 		goto out;
++ 	}
++ 	skb_set_owner_r(skb, sk);
++ 	prog = READ_ONCE(psock->progs.skb_verdict);
++ 	if (likely(prog)) {
++ 		tcp_skb_bpf_redirect_clear(skb);
++ 		ret = sk_psock_bpf_run(psock, prog, skb);
++ 		ret = sk_psock_map_verd(ret, tcp_skb_bpf_redirect_fetch(skb));
++ 	}
++ 	sk_psock_verdict_apply(psock, skb, ret);
++ out:
++ 	rcu_read_unlock();
++ 	return len;
++ }
++ 
++ static void sk_psock_verdict_data_ready(struct sock *sk)
++ {
++ 	struct socket *sock = sk->sk_socket;
++ 	read_descriptor_t desc;
++ 
++ 	if (unlikely(!sock || !sock->ops || !sock->ops->read_sock))
+  		return;
+  
+- 	sk->sk_data_ready = parser->saved_data_ready;
+- 	parser->saved_data_ready = NULL;
+- 	strp_stop(&parser->strp);
+- 	parser->enabled = false;
++ 	desc.arg.data = sk;
++ 	desc.error = 0;
++ 	desc.count = 1;
++ 
++ 	sock->ops->read_sock(sk, &desc, sk_psock_verdict_recv);
+  }
+  
+- void sk_psock_stop_verdict(struct sock *sk, struct sk_psock *psock)
++ void sk_psock_start_verdict(struct sock *sk, struct sk_psock *psock)
+  {
+- 	struct sk_psock_parser *parser = &psock->parser;
++ 	if (psock->saved_data_ready)
++ 		return;
+  
+- 	if (!parser->enabled)
++ 	psock->saved_data_ready = sk->sk_data_ready;
++ 	sk->sk_data_ready = sk_psock_verdict_data_ready;
++ 	sk->sk_write_space = sk_psock_write_space;
++ }
++ 
+++>>>>>>> 5a685cd94b21 (skmsg: Get rid of struct sk_psock_parser)
++ void sk_psock_stop_verdict(struct sock *sk, struct sk_psock *psock)
++ {
++ 	if (!psock->saved_data_ready)
+  		return;
+  
+- 	sk->sk_data_ready = parser->saved_data_ready;
+- 	parser->saved_data_ready = NULL;
+- 	parser->enabled = false;
++ 	sk->sk_data_ready = psock->saved_data_ready;
++ 	psock->saved_data_ready = NULL;
+  }
+* Unmerged path include/linux/skmsg.h
+* Unmerged path net/core/skmsg.c
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index f2963865e78e..e5616da6fc8f 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -152,9 +152,9 @@ static void sock_map_del_link(struct sock *sk,
+ 			struct bpf_map *map = link->map;
+ 			struct bpf_stab *stab = container_of(map, struct bpf_stab,
+ 							     map);
+-			if (psock->parser.enabled && stab->progs.skb_parser)
++			if (psock->saved_data_ready && stab->progs.skb_parser)
+ 				strp_stop = true;
+-			if (psock->parser.enabled && stab->progs.skb_verdict)
++			if (psock->saved_data_ready && stab->progs.skb_verdict)
+ 				verdict_stop = true;
+ 			list_del(&link->list);
+ 			sk_psock_free_link(link);
+@@ -287,14 +287,14 @@ static int sock_map_link(struct bpf_map *map, struct sk_psock_progs *progs,
+ 		goto out_drop;
+ 
+ 	write_lock_bh(&sk->sk_callback_lock);
+-	if (skb_parser && skb_verdict && !psock->parser.enabled) {
++	if (skb_parser && skb_verdict && !psock->saved_data_ready) {
+ 		ret = sk_psock_init_strp(sk, psock);
+ 		if (ret)
+ 			goto out_unlock_drop;
+ 		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
+ 		psock_set_prog(&psock->progs.skb_parser, skb_parser);
+ 		sk_psock_start_strp(sk, psock);
+-	} else if (!skb_parser && skb_verdict && !psock->parser.enabled) {
++	} else if (!skb_parser && skb_verdict && !psock->saved_data_ready) {
+ 		psock_set_prog(&psock->progs.skb_verdict, skb_verdict);
+ 		sk_psock_start_verdict(sk,psock);
+ 	}
