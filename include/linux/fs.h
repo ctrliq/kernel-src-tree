@@ -700,6 +700,8 @@ struct inode {
 	RH_KABI_RESERVE(2)
 } __randomize_layout;
 
+struct timespec64 timestamp_truncate(struct timespec64 t, struct inode *inode);
+
 static inline unsigned int i_blocksize(const struct inode *node)
 {
 	return (1 << node->i_blkbits);
