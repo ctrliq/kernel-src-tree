@@ -1,0 +1,222 @@
+net/mlx5: CmdIF, Use async events chain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit 71edc69ca1a78ce18411a540c550a4ef1eb017cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/71edc69c.failed
+
+Remove the explicit call to mlx5_cmd_comp_handler on MLX5_EVENT_TYPE_CMD
+and let command interface to register its own handler when its ready.
+
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 71edc69ca1a78ce18411a540c550a4ef1eb017cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/health.c
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/health.c
+index 43118de8ee99,4e42bd290959..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@@ -78,29 -79,6 +78,32 @@@ void mlx5_set_nic_state(struct mlx5_cor
+  		    &dev->iseg->cmdq_addr_l_sz);
+  }
+  
+++<<<<<<< HEAD
+ +static void trigger_cmd_completions(struct mlx5_core_dev *dev)
+ +{
+ +	unsigned long flags;
+ +	u64 vector;
+ +
+ +	/* wait for pending handlers to complete */
+ +	synchronize_irq(pci_irq_vector(dev->pdev, MLX5_EQ_VEC_CMD));
+ +	spin_lock_irqsave(&dev->cmd.alloc_lock, flags);
+ +	vector = ~dev->cmd.bitmask & ((1ul << (1 << dev->cmd.log_sz)) - 1);
+ +	if (!vector)
+ +		goto no_trig;
+ +
+ +	vector |= MLX5_TRIGGERED_CMD_COMP;
+ +	spin_unlock_irqrestore(&dev->cmd.alloc_lock, flags);
+ +
+ +	mlx5_core_dbg(dev, "vector 0x%llx\n", vector);
+ +	mlx5_cmd_comp_handler(dev, vector, true);
+ +	return;
+ +
+ +no_trig:
+ +	spin_unlock_irqrestore(&dev->cmd.alloc_lock, flags);
+ +}
+ +
+++=======
+++>>>>>>> 71edc69ca1a7 (net/mlx5: CmdIF, Use async events chain)
+  static int in_fatal(struct mlx5_core_dev *dev)
+  {
+  	struct mlx5_core_health *health = &dev->priv.health;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index 0594d0961cb3,5dd453e47a04..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -124,28 -127,7 +124,32 @@@ int mlx5_destroy_scheduling_element_cmd
+  int mlx5_wait_for_vf_pages(struct mlx5_core_dev *dev);
+  u64 mlx5_read_internal_timer(struct mlx5_core_dev *dev);
+  
+++<<<<<<< HEAD
+ +int mlx5_eq_init(struct mlx5_core_dev *dev);
+ +void mlx5_eq_cleanup(struct mlx5_core_dev *dev);
+ +int mlx5_create_map_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq, u8 vecidx,
+ +		       int nent, u64 mask, const char *name,
+ +		       enum mlx5_eq_type type);
+ +int mlx5_destroy_unmap_eq(struct mlx5_core_dev *dev, struct mlx5_eq *eq);
+ +int mlx5_eq_add_cq(struct mlx5_eq *eq, struct mlx5_core_cq *cq);
+ +int mlx5_eq_del_cq(struct mlx5_eq *eq, struct mlx5_core_cq *cq);
+ +int mlx5_core_eq_query(struct mlx5_core_dev *dev, struct mlx5_eq *eq,
+ +		       u32 *out, int outlen);
+ +int mlx5_start_eqs(struct mlx5_core_dev *dev);
+ +void mlx5_stop_eqs(struct mlx5_core_dev *dev);
+ +/* This function should only be called after mlx5_cmd_force_teardown_hca */
+ +void mlx5_core_eq_free_irqs(struct mlx5_core_dev *dev);
+ +struct mlx5_eq *mlx5_eqn2eq(struct mlx5_core_dev *dev, int eqn);
+ +u32 mlx5_eq_poll_irq_disabled(struct mlx5_eq *eq);
+ +void mlx5_cq_tasklet_cb(unsigned long data);
+ +void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced);
+ +int mlx5_debug_eq_add(struct mlx5_core_dev *dev, struct mlx5_eq *eq);
+ +void mlx5_debug_eq_remove(struct mlx5_core_dev *dev, struct mlx5_eq *eq);
+ +int mlx5_eq_debugfs_init(struct mlx5_core_dev *dev);
+ +void mlx5_eq_debugfs_cleanup(struct mlx5_core_dev *dev);
+++=======
++ void mlx5_cmd_trigger_completions(struct mlx5_core_dev *dev);
+++>>>>>>> 71edc69ca1a7 (net/mlx5: CmdIF, Use async events chain)
+  int mlx5_cq_debugfs_init(struct mlx5_core_dev *dev);
+  void mlx5_cq_debugfs_cleanup(struct mlx5_core_dev *dev);
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+index e8bb3b4dbc2b..b87cbb85ce81 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/cmd.c
+@@ -40,9 +40,11 @@
+ #include <linux/random.h>
+ #include <linux/io-mapping.h>
+ #include <linux/mlx5/driver.h>
++#include <linux/mlx5/eq.h>
+ #include <linux/debugfs.h>
+ 
+ #include "mlx5_core.h"
++#include "lib/eq.h"
+ 
+ enum {
+ 	CMD_IF_REV = 5,
+@@ -784,6 +786,8 @@ static u16 msg_to_opcode(struct mlx5_cmd_msg *in)
+ 	return MLX5_GET(mbox_in, in->first.data, opcode);
+ }
+ 
++static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced);
++
+ static void cb_timeout_handler(struct work_struct *work)
+ {
+ 	struct delayed_work *dwork = container_of(work, struct delayed_work,
+@@ -1391,14 +1395,32 @@ static void mlx5_cmd_change_mod(struct mlx5_core_dev *dev, int mode)
+ 		up(&cmd->sem);
+ }
+ 
++static int cmd_comp_notifier(struct notifier_block *nb,
++			     unsigned long type, void *data)
++{
++	struct mlx5_core_dev *dev;
++	struct mlx5_cmd *cmd;
++	struct mlx5_eqe *eqe;
++
++	cmd = mlx5_nb_cof(nb, struct mlx5_cmd, nb);
++	dev = container_of(cmd, struct mlx5_core_dev, cmd);
++	eqe = data;
++
++	mlx5_cmd_comp_handler(dev, be32_to_cpu(eqe->data.cmd.vector), false);
++
++	return NOTIFY_OK;
++}
+ void mlx5_cmd_use_events(struct mlx5_core_dev *dev)
+ {
++	MLX5_NB_INIT(&dev->cmd.nb, cmd_comp_notifier, CMD);
++	mlx5_eq_notifier_register(dev, &dev->cmd.nb);
+ 	mlx5_cmd_change_mod(dev, CMD_MODE_EVENTS);
+ }
+ 
+ void mlx5_cmd_use_polling(struct mlx5_core_dev *dev)
+ {
+ 	mlx5_cmd_change_mod(dev, CMD_MODE_POLLING);
++	mlx5_eq_notifier_unregister(dev, &dev->cmd.nb);
+ }
+ 
+ static void free_msg(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *msg)
+@@ -1414,7 +1436,7 @@ static void free_msg(struct mlx5_core_dev *dev, struct mlx5_cmd_msg *msg)
+ 	}
+ }
+ 
+-void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced)
++static void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced)
+ {
+ 	struct mlx5_cmd *cmd = &dev->cmd;
+ 	struct mlx5_cmd_work_ent *ent;
+@@ -1512,7 +1534,29 @@ void mlx5_cmd_comp_handler(struct mlx5_core_dev *dev, u64 vec, bool forced)
+ 		}
+ 	}
+ }
+-EXPORT_SYMBOL(mlx5_cmd_comp_handler);
++
++void mlx5_cmd_trigger_completions(struct mlx5_core_dev *dev)
++{
++	unsigned long flags;
++	u64 vector;
++
++	/* wait for pending handlers to complete */
++	mlx5_eq_synchronize_cmd_irq(dev);
++	spin_lock_irqsave(&dev->cmd.alloc_lock, flags);
++	vector = ~dev->cmd.bitmask & ((1ul << (1 << dev->cmd.log_sz)) - 1);
++	if (!vector)
++		goto no_trig;
++
++	vector |= MLX5_TRIGGERED_CMD_COMP;
++	spin_unlock_irqrestore(&dev->cmd.alloc_lock, flags);
++
++	mlx5_core_dbg(dev, "vector 0x%llx\n", vector);
++	mlx5_cmd_comp_handler(dev, vector, true);
++	return;
++
++no_trig:
++	spin_unlock_irqrestore(&dev->cmd.alloc_lock, flags);
++}
+ 
+ static int status_to_err(u8 status)
+ {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eq.c b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index a997f6ba7cac..945c4cc77c4a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@ -502,10 +502,6 @@ static irqreturn_t mlx5_eq_int(int irq, void *eq_ptr)
+ 			mlx5_srq_event(dev, rsn, eqe->type);
+ 			break;
+ 
+-		case MLX5_EVENT_TYPE_CMD:
+-			mlx5_cmd_comp_handler(dev, be32_to_cpu(eqe->data.cmd.vector), false);
+-			break;
+-
+ 		case MLX5_EVENT_TYPE_PORT_CHANGE:
+ 			port = (eqe->data.port.port >> 4) & 0xf;
+ 			switch (eqe->sub_type) {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/health.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --git a/include/linux/mlx5/driver.h b/include/linux/mlx5/driver.h
+index 2b6e906af6bb..a4808ca61625 100644
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@ -293,6 +293,8 @@ struct mlx5_cmd_stats {
+ };
+ 
+ struct mlx5_cmd {
++	struct mlx5_nb    nb;
++
+ 	void	       *cmd_alloc_buf;
+ 	dma_addr_t	alloc_dma;
+ 	int		alloc_size;
