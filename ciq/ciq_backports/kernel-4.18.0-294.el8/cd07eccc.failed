@@ -1,0 +1,253 @@
+net: ena: xdp: XDP_TX: fix memory leak
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Sameeh Jubran <sameehj@amazon.com>
+commit cd07ecccba13b8bd5023ffe7be57363d07e3105f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cd07eccc.failed
+
+When sending very high packet rate, the XDP tx queues can get full and
+start dropping packets. In this case we don't free the pages which
+results in ena driver draining the system memory.
+
+Fix:
+Simply free the pages when necessary.
+
+Fixes: 548c4940b9f1 ("net: ena: Implement XDP_TX action")
+	Signed-off-by: Sameeh Jubran <sameehj@amazon.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit cd07ecccba13b8bd5023ffe7be57363d07e3105f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/amazon/ena/ena_netdev.c
+diff --cc drivers/net/ethernet/amazon/ena/ena_netdev.c
+index c8d0e2454b88,e101fc934f83..000000000000
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@@ -123,7 -150,218 +123,222 @@@ static int ena_change_mtu(struct net_de
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
+++=======
++ static int ena_xmit_common(struct net_device *dev,
++ 			   struct ena_ring *ring,
++ 			   struct ena_tx_buffer *tx_info,
++ 			   struct ena_com_tx_ctx *ena_tx_ctx,
++ 			   u16 next_to_use,
++ 			   u32 bytes)
++ {
++ 	struct ena_adapter *adapter = netdev_priv(dev);
++ 	int rc, nb_hw_desc;
++ 
++ 	if (unlikely(ena_com_is_doorbell_needed(ring->ena_com_io_sq,
++ 						ena_tx_ctx))) {
++ 		netif_dbg(adapter, tx_queued, dev,
++ 			  "llq tx max burst size of queue %d achieved, writing doorbell to send burst\n",
++ 			  ring->qid);
++ 		ena_com_write_sq_doorbell(ring->ena_com_io_sq);
++ 	}
++ 
++ 	/* prepare the packet's descriptors to dma engine */
++ 	rc = ena_com_prepare_tx(ring->ena_com_io_sq, ena_tx_ctx,
++ 				&nb_hw_desc);
++ 
++ 	/* In case there isn't enough space in the queue for the packet,
++ 	 * we simply drop it. All other failure reasons of
++ 	 * ena_com_prepare_tx() are fatal and therefore require a device reset.
++ 	 */
++ 	if (unlikely(rc)) {
++ 		netif_err(adapter, tx_queued, dev,
++ 			  "failed to prepare tx bufs\n");
++ 		u64_stats_update_begin(&ring->syncp);
++ 		ring->tx_stats.prepare_ctx_err++;
++ 		u64_stats_update_end(&ring->syncp);
++ 		if (rc != -ENOMEM) {
++ 			adapter->reset_reason =
++ 				ENA_REGS_RESET_DRIVER_INVALID_STATE;
++ 			set_bit(ENA_FLAG_TRIGGER_RESET, &adapter->flags);
++ 		}
++ 		return rc;
++ 	}
++ 
++ 	u64_stats_update_begin(&ring->syncp);
++ 	ring->tx_stats.cnt++;
++ 	ring->tx_stats.bytes += bytes;
++ 	u64_stats_update_end(&ring->syncp);
++ 
++ 	tx_info->tx_descs = nb_hw_desc;
++ 	tx_info->last_jiffies = jiffies;
++ 	tx_info->print_once = 0;
++ 
++ 	ring->next_to_use = ENA_TX_RING_IDX_NEXT(next_to_use,
++ 						 ring->ring_size);
++ 	return 0;
++ }
++ 
++ /* This is the XDP napi callback. XDP queues use a separate napi callback
++  * than Rx/Tx queues.
++  */
++ static int ena_xdp_io_poll(struct napi_struct *napi, int budget)
++ {
++ 	struct ena_napi *ena_napi = container_of(napi, struct ena_napi, napi);
++ 	u32 xdp_work_done, xdp_budget;
++ 	struct ena_ring *xdp_ring;
++ 	int napi_comp_call = 0;
++ 	int ret;
++ 
++ 	xdp_ring = ena_napi->xdp_ring;
++ 	xdp_ring->first_interrupt = ena_napi->first_interrupt;
++ 
++ 	xdp_budget = budget;
++ 
++ 	if (!test_bit(ENA_FLAG_DEV_UP, &xdp_ring->adapter->flags) ||
++ 	    test_bit(ENA_FLAG_TRIGGER_RESET, &xdp_ring->adapter->flags)) {
++ 		napi_complete_done(napi, 0);
++ 		return 0;
++ 	}
++ 
++ 	xdp_work_done = ena_clean_xdp_irq(xdp_ring, xdp_budget);
++ 
++ 	/* If the device is about to reset or down, avoid unmask
++ 	 * the interrupt and return 0 so NAPI won't reschedule
++ 	 */
++ 	if (unlikely(!test_bit(ENA_FLAG_DEV_UP, &xdp_ring->adapter->flags))) {
++ 		napi_complete_done(napi, 0);
++ 		ret = 0;
++ 	} else if (xdp_budget > xdp_work_done) {
++ 		napi_comp_call = 1;
++ 		if (napi_complete_done(napi, xdp_work_done))
++ 			ena_unmask_interrupt(xdp_ring, NULL);
++ 		ena_update_ring_numa_node(xdp_ring, NULL);
++ 		ret = xdp_work_done;
++ 	} else {
++ 		ret = xdp_budget;
++ 	}
++ 
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.napi_comp += napi_comp_call;
++ 	xdp_ring->tx_stats.tx_poll++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 
++ 	return ret;
++ }
++ 
++ static int ena_xdp_tx_map_buff(struct ena_ring *xdp_ring,
++ 			       struct ena_tx_buffer *tx_info,
++ 			       struct xdp_buff *xdp,
++ 			       void **push_hdr,
++ 			       u32 *push_len)
++ {
++ 	struct ena_adapter *adapter = xdp_ring->adapter;
++ 	struct ena_com_buf *ena_buf;
++ 	dma_addr_t dma = 0;
++ 	u32 size;
++ 
++ 	tx_info->xdpf = xdp_convert_buff_to_frame(xdp);
++ 	size = tx_info->xdpf->len;
++ 	ena_buf = tx_info->bufs;
++ 
++ 	/* llq push buffer */
++ 	*push_len = min_t(u32, size, xdp_ring->tx_max_header_size);
++ 	*push_hdr = tx_info->xdpf->data;
++ 
++ 	if (size - *push_len > 0) {
++ 		dma = dma_map_single(xdp_ring->dev,
++ 				     *push_hdr + *push_len,
++ 				     size - *push_len,
++ 				     DMA_TO_DEVICE);
++ 		if (unlikely(dma_mapping_error(xdp_ring->dev, dma)))
++ 			goto error_report_dma_error;
++ 
++ 		tx_info->map_linear_data = 1;
++ 		tx_info->num_of_bufs = 1;
++ 	}
++ 
++ 	ena_buf->paddr = dma;
++ 	ena_buf->len = size;
++ 
++ 	return 0;
++ 
++ error_report_dma_error:
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.dma_mapping_err++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 	netdev_warn(adapter->netdev, "failed to map xdp buff\n");
++ 
++ 	xdp_return_frame_rx_napi(tx_info->xdpf);
++ 	tx_info->xdpf = NULL;
++ 	tx_info->num_of_bufs = 0;
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int ena_xdp_xmit_buff(struct net_device *dev,
++ 			     struct xdp_buff *xdp,
++ 			     int qid,
++ 			     struct ena_rx_buffer *rx_info)
++ {
++ 	struct ena_adapter *adapter = netdev_priv(dev);
++ 	struct ena_com_tx_ctx ena_tx_ctx = {0};
++ 	struct ena_tx_buffer *tx_info;
++ 	struct ena_ring *xdp_ring;
++ 	u16 next_to_use, req_id;
++ 	int rc;
++ 	void *push_hdr;
++ 	u32 push_len;
++ 
++ 	xdp_ring = &adapter->tx_ring[qid];
++ 	next_to_use = xdp_ring->next_to_use;
++ 	req_id = xdp_ring->free_ids[next_to_use];
++ 	tx_info = &xdp_ring->tx_buffer_info[req_id];
++ 	tx_info->num_of_bufs = 0;
++ 	page_ref_inc(rx_info->page);
++ 	tx_info->xdp_rx_page = rx_info->page;
++ 
++ 	rc = ena_xdp_tx_map_buff(xdp_ring, tx_info, xdp, &push_hdr, &push_len);
++ 	if (unlikely(rc))
++ 		goto error_drop_packet;
++ 
++ 	ena_tx_ctx.ena_bufs = tx_info->bufs;
++ 	ena_tx_ctx.push_header = push_hdr;
++ 	ena_tx_ctx.num_bufs = tx_info->num_of_bufs;
++ 	ena_tx_ctx.req_id = req_id;
++ 	ena_tx_ctx.header_len = push_len;
++ 
++ 	rc = ena_xmit_common(dev,
++ 			     xdp_ring,
++ 			     tx_info,
++ 			     &ena_tx_ctx,
++ 			     next_to_use,
++ 			     xdp->data_end - xdp->data);
++ 	if (rc)
++ 		goto error_unmap_dma;
++ 	/* trigger the dma engine. ena_com_write_sq_doorbell()
++ 	 * has a mb
++ 	 */
++ 	ena_com_write_sq_doorbell(xdp_ring->ena_com_io_sq);
++ 	u64_stats_update_begin(&xdp_ring->syncp);
++ 	xdp_ring->tx_stats.doorbells++;
++ 	u64_stats_update_end(&xdp_ring->syncp);
++ 
++ 	return NETDEV_TX_OK;
++ 
++ error_unmap_dma:
++ 	ena_unmap_tx_buff(xdp_ring, tx_info);
++ 	tx_info->xdpf = NULL;
++ error_drop_packet:
++ 	__free_page(tx_info->xdp_rx_page);
++ 	return NETDEV_TX_OK;
++ }
++ 
++ static int ena_xdp_execute(struct ena_ring *rx_ring,
++ 			   struct xdp_buff *xdp,
++ 			   struct ena_rx_buffer *rx_info)
+++>>>>>>> cd07ecccba13 (net: ena: xdp: XDP_TX: fix memory leak)
+  {
+  	struct bpf_prog *xdp_prog;
+  	u32 verdict = XDP_PASS;
+* Unmerged path drivers/net/ethernet/amazon/ena/ena_netdev.c
