@@ -1,0 +1,255 @@
+KVM: fix KVM_CLEAR_DIRTY_LOG for memory slots of unaligned size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 76d58e0f07ec203bbdfcaabd9a9fc10a5a3ed5ea
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/76d58e0f.failed
+
+If a memory slot's size is not a multiple of 64 pages (256K), then
+the KVM_CLEAR_DIRTY_LOG API is unusable: clearing the final 64 pages
+either requires the requested page range to go beyond memslot->npages,
+or requires log->num_pages to be unaligned, and kvm_clear_dirty_log_protect
+requires log->num_pages to be both in range and aligned.
+
+To allow this case, allow log->num_pages not to be a multiple of 64 if
+it ends exactly on the last page of the slot.
+
+	Reported-by: Peter Xu <peterx@redhat.com>
+Fixes: 98938aa8edd6 ("KVM: validate userspace input in kvm_clear_dirty_log_protect()", 2019-01-02)
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 76d58e0f07ec203bbdfcaabd9a9fc10a5a3ed5ea)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	tools/testing/selftests/kvm/dirty_log_test.c
+#	virt/kvm/kvm_main.c
+diff --cc Documentation/virtual/kvm/api.txt
+index 8283ab2604ae,64b38dfcc243..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -3756,8 -3801,108 +3756,113 @@@ Coalesced mmio is used if one or more w
+  register can be deferred until a read or a write to another hardware
+  register on the same device.  This last access will cause a vmexit and
+  userspace will process accesses from the ring buffer before emulating
+++<<<<<<< HEAD
+ +it. That will avoid exiting to userspace on repeated writes to the
+ +first register.
+++=======
++ it. That will avoid exiting to userspace on repeated writes.
++ 
++ Coalesced pio is based on coalesced mmio. There is little difference
++ between coalesced mmio and pio except that coalesced pio records accesses
++ to I/O ports.
++ 
++ 4.117 KVM_CLEAR_DIRTY_LOG (vm ioctl)
++ 
++ Capability: KVM_CAP_MANUAL_DIRTY_LOG_PROTECT
++ Architectures: x86, arm, arm64, mips
++ Type: vm ioctl
++ Parameters: struct kvm_dirty_log (in)
++ Returns: 0 on success, -1 on error
++ 
++ /* for KVM_CLEAR_DIRTY_LOG */
++ struct kvm_clear_dirty_log {
++ 	__u32 slot;
++ 	__u32 num_pages;
++ 	__u64 first_page;
++ 	union {
++ 		void __user *dirty_bitmap; /* one bit per page */
++ 		__u64 padding;
++ 	};
++ };
++ 
++ The ioctl clears the dirty status of pages in a memory slot, according to
++ the bitmap that is passed in struct kvm_clear_dirty_log's dirty_bitmap
++ field.  Bit 0 of the bitmap corresponds to page "first_page" in the
++ memory slot, and num_pages is the size in bits of the input bitmap.
++ first_page must be a multiple of 64; num_pages must also be a multiple of
++ 64 unless first_page + num_pages is the size of the memory slot.  For each
++ bit that is set in the input bitmap, the corresponding page is marked "clean"
++ in KVM's dirty bitmap, and dirty tracking is re-enabled for that page
++ (for example via write-protection, or by clearing the dirty bit in
++ a page table entry).
++ 
++ If KVM_CAP_MULTI_ADDRESS_SPACE is available, bits 16-31 specifies
++ the address space for which you want to return the dirty bitmap.
++ They must be less than the value that KVM_CHECK_EXTENSION returns for
++ the KVM_CAP_MULTI_ADDRESS_SPACE capability.
++ 
++ This ioctl is mostly useful when KVM_CAP_MANUAL_DIRTY_LOG_PROTECT
++ is enabled; for more information, see the description of the capability.
++ However, it can always be used as long as KVM_CHECK_EXTENSION confirms
++ that KVM_CAP_MANUAL_DIRTY_LOG_PROTECT is present.
++ 
++ 4.118 KVM_GET_SUPPORTED_HV_CPUID
++ 
++ Capability: KVM_CAP_HYPERV_CPUID
++ Architectures: x86
++ Type: vcpu ioctl
++ Parameters: struct kvm_cpuid2 (in/out)
++ Returns: 0 on success, -1 on error
++ 
++ struct kvm_cpuid2 {
++ 	__u32 nent;
++ 	__u32 padding;
++ 	struct kvm_cpuid_entry2 entries[0];
++ };
++ 
++ struct kvm_cpuid_entry2 {
++ 	__u32 function;
++ 	__u32 index;
++ 	__u32 flags;
++ 	__u32 eax;
++ 	__u32 ebx;
++ 	__u32 ecx;
++ 	__u32 edx;
++ 	__u32 padding[3];
++ };
++ 
++ This ioctl returns x86 cpuid features leaves related to Hyper-V emulation in
++ KVM.  Userspace can use the information returned by this ioctl to construct
++ cpuid information presented to guests consuming Hyper-V enlightenments (e.g.
++ Windows or Hyper-V guests).
++ 
++ CPUID feature leaves returned by this ioctl are defined by Hyper-V Top Level
++ Functional Specification (TLFS). These leaves can't be obtained with
++ KVM_GET_SUPPORTED_CPUID ioctl because some of them intersect with KVM feature
++ leaves (0x40000000, 0x40000001).
++ 
++ Currently, the following list of CPUID leaves are returned:
++  HYPERV_CPUID_VENDOR_AND_MAX_FUNCTIONS
++  HYPERV_CPUID_INTERFACE
++  HYPERV_CPUID_VERSION
++  HYPERV_CPUID_FEATURES
++  HYPERV_CPUID_ENLIGHTMENT_INFO
++  HYPERV_CPUID_IMPLEMENT_LIMITS
++  HYPERV_CPUID_NESTED_FEATURES
++ 
++ HYPERV_CPUID_NESTED_FEATURES leaf is only exposed when Enlightened VMCS was
++ enabled on the corresponding vCPU (KVM_CAP_HYPERV_ENLIGHTENED_VMCS).
++ 
++ Userspace invokes KVM_GET_SUPPORTED_CPUID by passing a kvm_cpuid2 structure
++ with the 'nent' field indicating the number of entries in the variable-size
++ array 'entries'.  If the number of entries is too low to describe all Hyper-V
++ feature leaves, an error (E2BIG) is returned. If the number is more or equal
++ to the number of Hyper-V feature leaves, the 'nent' field is adjusted to the
++ number of valid entries in the 'entries' array, which is then filled.
++ 
++ 'index' and 'flags' fields in 'struct kvm_cpuid_entry2' are currently reserved,
++ userspace should not expect to get any particular value there.
+++>>>>>>> 76d58e0f07ec (KVM: fix KVM_CLEAR_DIRTY_LOG for memory slots of unaligned size)
+  
+  5. The kvm_run structure
+  ------------------------
+diff --cc tools/testing/selftests/kvm/dirty_log_test.c
+index a2e86fdacc19,93f99c6b7d79..000000000000
+--- a/tools/testing/selftests/kvm/dirty_log_test.c
++++ b/tools/testing/selftests/kvm/dirty_log_test.c
+@@@ -326,6 -360,10 +329,13 @@@ static void run_test(enum vm_guest_mod
+  		/* Give the vcpu thread some time to dirty some pages */
+  		usleep(interval * 1000);
+  		kvm_vm_get_dirty_log(vm, TEST_MEM_SLOT_INDEX, bmap);
+++<<<<<<< HEAD
+++=======
++ #ifdef USE_CLEAR_DIRTY_LOG
++ 		kvm_vm_clear_dirty_log(vm, TEST_MEM_SLOT_INDEX, bmap, 0,
++ 				       host_num_pages);
++ #endif
+++>>>>>>> 76d58e0f07ec (KVM: fix KVM_CLEAR_DIRTY_LOG for memory slots of unaligned size)
+  		vm_dirty_log_verify(bmap);
+  		iteration++;
+  		sync_global_to_guest(vm, iteration);
+diff --cc virt/kvm/kvm_main.c
+index a1d8a57c6f3a,a704d1f9bd96..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1210,6 -1217,79 +1210,82 @@@ int kvm_get_dirty_log_protect(struct kv
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(kvm_get_dirty_log_protect);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * kvm_clear_dirty_log_protect - clear dirty bits in the bitmap
++  *	and reenable dirty page tracking for the corresponding pages.
++  * @kvm:	pointer to kvm instance
++  * @log:	slot id and address from which to fetch the bitmap of dirty pages
++  */
++ int kvm_clear_dirty_log_protect(struct kvm *kvm,
++ 				struct kvm_clear_dirty_log *log, bool *flush)
++ {
++ 	struct kvm_memslots *slots;
++ 	struct kvm_memory_slot *memslot;
++ 	int as_id, id;
++ 	gfn_t offset;
++ 	unsigned long i, n;
++ 	unsigned long *dirty_bitmap;
++ 	unsigned long *dirty_bitmap_buffer;
++ 
++ 	as_id = log->slot >> 16;
++ 	id = (u16)log->slot;
++ 	if (as_id >= KVM_ADDRESS_SPACE_NUM || id >= KVM_USER_MEM_SLOTS)
++ 		return -EINVAL;
++ 
++ 	if (log->first_page & 63)
++ 		return -EINVAL;
++ 
++ 	slots = __kvm_memslots(kvm, as_id);
++ 	memslot = id_to_memslot(slots, id);
++ 
++ 	dirty_bitmap = memslot->dirty_bitmap;
++ 	if (!dirty_bitmap)
++ 		return -ENOENT;
++ 
++ 	n = kvm_dirty_bitmap_bytes(memslot);
++ 
++ 	if (log->first_page > memslot->npages ||
++ 	    log->num_pages > memslot->npages - log->first_page ||
++ 	    (log->num_pages < memslot->npages - log->first_page && (log->num_pages & 63)))
++ 	    return -EINVAL;
++ 
++ 	*flush = false;
++ 	dirty_bitmap_buffer = kvm_second_dirty_bitmap(memslot);
++ 	if (copy_from_user(dirty_bitmap_buffer, log->dirty_bitmap, n))
++ 		return -EFAULT;
++ 
++ 	spin_lock(&kvm->mmu_lock);
++ 	for (offset = log->first_page,
++ 	     i = offset / BITS_PER_LONG, n = log->num_pages / BITS_PER_LONG; n--;
++ 	     i++, offset += BITS_PER_LONG) {
++ 		unsigned long mask = *dirty_bitmap_buffer++;
++ 		atomic_long_t *p = (atomic_long_t *) &dirty_bitmap[i];
++ 		if (!mask)
++ 			continue;
++ 
++ 		mask &= atomic_long_fetch_andnot(mask, p);
++ 
++ 		/*
++ 		 * mask contains the bits that really have been cleared.  This
++ 		 * never includes any bits beyond the length of the memslot (if
++ 		 * the length is not aligned to 64 pages), therefore it is not
++ 		 * a problem if userspace sets them in log->dirty_bitmap.
++ 		*/
++ 		if (mask) {
++ 			*flush = true;
++ 			kvm_arch_mmu_enable_log_dirty_pt_masked(kvm, memslot,
++ 								offset, mask);
++ 		}
++ 	}
++ 	spin_unlock(&kvm->mmu_lock);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(kvm_clear_dirty_log_protect);
+++>>>>>>> 76d58e0f07ec (KVM: fix KVM_CLEAR_DIRTY_LOG for memory slots of unaligned size)
+  #endif
+  
+  bool kvm_largepages_enabled(void)
+* Unmerged path Documentation/virtual/kvm/api.txt
+* Unmerged path tools/testing/selftests/kvm/dirty_log_test.c
+* Unmerged path virt/kvm/kvm_main.c
