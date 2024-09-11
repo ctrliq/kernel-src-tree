@@ -1,0 +1,311 @@
+net: atlantic: implement wake_phy feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nikita Danilov <ndanilov@marvell.com>
+commit 837c637869bef28b06653462cd010ccc0c2ce984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/837c6378.failed
+
+Wake on PHY allows to configure device to wakeup host
+as soon as PHY link status is changed to active.
+
+	Signed-off-by: Nikita Danilov <ndanilov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 837c637869bef28b06653462cd010ccc0c2ce984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index 0035792b0cff,75faf288a2fc..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@@ -961,7 -1026,12 +975,16 @@@ void aq_nic_deinit(struct aq_nic_s *sel
+  		self->aq_vecs > i; ++i, aq_vec = self->aq_vec[i])
+  		aq_vec_deinit(aq_vec);
+  
+++<<<<<<< HEAD
+ +	if (likely(self->aq_fw_ops->deinit)) {
+++=======
++ 	aq_ptp_unregister(self);
++ 	aq_ptp_ring_deinit(self);
++ 	aq_ptp_ring_free(self);
++ 	aq_ptp_free(self);
++ 
++ 	if (likely(self->aq_fw_ops->deinit) && link_down) {
+++>>>>>>> 837c637869be (net: atlantic: implement wake_phy feature)
+  		mutex_lock(&self->fwreq_mutex);
+  		self->aq_fw_ops->deinit(self->aq_hw);
+  		mutex_unlock(&self->fwreq_mutex);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+index d890c36d302b..ec19bfdbe05f 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_cfg.h
+@@ -81,6 +81,9 @@
+ 
+ #define AQ_CFG_FC_MODE AQ_NIC_FC_FULL
+ 
++/* Default WOL modes used on initialization */
++#define AQ_CFG_WOL_MODES WAKE_MAGIC
++
+ #define AQ_CFG_SPEED_MSK  0xFFFFU	/* 0xFFFFU==auto_neg */
+ 
+ #define AQ_CFG_IS_AUTONEG_DEF       1U
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+index 79da48094770..38c17b722eb1 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_ethtool.c
+@@ -356,11 +356,8 @@ static void aq_ethtool_get_wol(struct net_device *ndev,
+ 	struct aq_nic_s *aq_nic = netdev_priv(ndev);
+ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(aq_nic);
+ 
+-	wol->supported = WAKE_MAGIC;
+-	wol->wolopts = 0;
+-
+-	if (cfg->wol)
+-		wol->wolopts |= WAKE_MAGIC;
++	wol->supported = AQ_NIC_WOL_MODES;
++	wol->wolopts = cfg->wol;
+ }
+ 
+ static int aq_ethtool_set_wol(struct net_device *ndev,
+@@ -371,11 +368,12 @@ static int aq_ethtool_set_wol(struct net_device *ndev,
+ 	struct aq_nic_cfg_s *cfg = aq_nic_get_cfg(aq_nic);
+ 	int err = 0;
+ 
+-	if (wol->wolopts & WAKE_MAGIC)
+-		cfg->wol |= AQ_NIC_WOL_ENABLED;
+-	else
+-		cfg->wol &= ~AQ_NIC_WOL_ENABLED;
+-	err = device_set_wakeup_enable(&pdev->dev, wol->wolopts);
++	if (wol->wolopts & ~AQ_NIC_WOL_MODES)
++		return -EOPNOTSUPP;
++
++	cfg->wol = wol->wolopts;
++
++	err = device_set_wakeup_enable(&pdev->dev, !!cfg->wol);
+ 
+ 	return err;
+ }
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_main.c b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+index 25a59894105a..3502bd45b831 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_main.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+@@ -74,7 +74,7 @@ static int aq_ndev_open(struct net_device *ndev)
+ 
+ err_exit:
+ 	if (err < 0)
+-		aq_nic_deinit(aq_nic);
++		aq_nic_deinit(aq_nic, true);
+ 	return err;
+ }
+ 
+@@ -86,7 +86,7 @@ static int aq_ndev_close(struct net_device *ndev)
+ 	err = aq_nic_stop(aq_nic);
+ 	if (err < 0)
+ 		goto err_exit;
+-	aq_nic_deinit(aq_nic);
++	aq_nic_deinit(aq_nic, true);
+ 
+ err_exit:
+ 	return err;
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+index c80d38f5e889..caa2400440e2 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.h
+@@ -58,7 +58,8 @@ struct aq_nic_cfg_s {
+ #define AQ_NIC_FLAG_ERR_UNPLUG  0x40000000U
+ #define AQ_NIC_FLAG_ERR_HW      0x80000000U
+ 
+-#define AQ_NIC_WOL_ENABLED	BIT(0)
++#define AQ_NIC_WOL_MODES        (WAKE_MAGIC |\
++				 WAKE_PHY)
+ 
+ #define AQ_NIC_TCVEC2RING(_NIC_, _TC_, _VEC_) \
+ 	((_TC_) * AQ_CFG_TCS_MAX + (_VEC_))
+@@ -132,7 +133,8 @@ int aq_nic_get_regs(struct aq_nic_s *self, struct ethtool_regs *regs, void *p);
+ int aq_nic_get_regs_count(struct aq_nic_s *self);
+ void aq_nic_get_stats(struct aq_nic_s *self, u64 *data);
+ int aq_nic_stop(struct aq_nic_s *self);
+-void aq_nic_deinit(struct aq_nic_s *self);
++void aq_nic_deinit(struct aq_nic_s *self, bool link_down);
++void aq_nic_set_power(struct aq_nic_s *self);
+ void aq_nic_free_hot_resources(struct aq_nic_s *self);
+ void aq_nic_free_vectors(struct aq_nic_s *self);
+ int aq_nic_set_mtu(struct aq_nic_s *self, int new_mtu);
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.c
+index 3fc41da39a0a..3883abb13247 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils.c
+@@ -849,7 +849,8 @@ int hw_atl_utils_get_fw_version(struct aq_hw_s *self, u32 *fw_version)
+ 	return 0;
+ }
+ 
+-static int aq_fw1x_set_wol(struct aq_hw_s *self, bool wol_enabled, u8 *mac)
++static int aq_fw1x_set_wake_magic(struct aq_hw_s *self, bool wol_enabled,
++				  u8 *mac)
+ {
+ 	struct hw_atl_utils_fw_rpc *prpc = NULL;
+ 	unsigned int rpc_size = 0U;
+@@ -894,8 +895,8 @@ static int aq_fw1x_set_power(struct aq_hw_s *self, unsigned int power_state,
+ 	unsigned int rpc_size = 0U;
+ 	int err = 0;
+ 
+-	if (self->aq_nic_cfg->wol & AQ_NIC_WOL_ENABLED) {
+-		err = aq_fw1x_set_wol(self, 1, mac);
++	if (self->aq_nic_cfg->wol & WAKE_MAGIC) {
++		err = aq_fw1x_set_wake_magic(self, 1, mac);
+ 
+ 		if (err < 0)
+ 			goto err_exit;
+diff --git a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+index 103608a7664f..a03e7cadfae1 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+@@ -34,6 +34,7 @@
+ #define HW_ATL_FW2X_CAP_SLEEP_PROXY      BIT(CAPS_HI_SLEEP_PROXY)
+ #define HW_ATL_FW2X_CAP_WOL              BIT(CAPS_HI_WOL)
+ 
++#define HW_ATL_FW2X_CTRL_WAKE_ON_LINK     BIT(CTRL_WAKE_ON_LINK)
+ #define HW_ATL_FW2X_CTRL_SLEEP_PROXY      BIT(CTRL_SLEEP_PROXY)
+ #define HW_ATL_FW2X_CTRL_WOL              BIT(CTRL_WOL)
+ #define HW_ATL_FW2X_CTRL_LINK_DROP        BIT(CTRL_LINK_DROP)
+@@ -345,87 +346,46 @@ static int aq_fw2x_get_phy_temp(struct aq_hw_s *self, int *temp)
+ 	return 0;
+ }
+ 
+-static int aq_fw2x_set_sleep_proxy(struct aq_hw_s *self, u8 *mac)
++static int aq_fw2x_set_wol(struct aq_hw_s *self, u8 *mac)
+ {
+ 	struct hw_atl_utils_fw_rpc *rpc = NULL;
+-	struct offload_info *cfg = NULL;
+-	unsigned int rpc_size = 0U;
+-	u32 mpi_opts;
++	struct offload_info *info = NULL;
++	u32 wol_bits = 0;
++	u32 rpc_size;
+ 	int err = 0;
+ 	u32 val;
+ 
+-	rpc_size = sizeof(rpc->msg_id) + sizeof(*cfg);
+-
+-	err = hw_atl_utils_fw_rpc_wait(self, &rpc);
+-	if (err < 0)
+-		goto err_exit;
+-
+-	memset(rpc, 0, rpc_size);
+-	cfg = (struct offload_info *)(&rpc->msg_id + 1);
+-
+-	memcpy(cfg->mac_addr, mac, ETH_ALEN);
+-	cfg->len = sizeof(*cfg);
+-
+-	/* Clear bit 0x36C.23 and 0x36C.22 */
+-	mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
+-	mpi_opts &= ~HW_ATL_FW2X_CTRL_SLEEP_PROXY;
+-	mpi_opts &= ~HW_ATL_FW2X_CTRL_LINK_DROP;
+-
+-	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
+-
+-	err = hw_atl_utils_fw_rpc_call(self, rpc_size);
+-	if (err < 0)
+-		goto err_exit;
+-
+-	/* Set bit 0x36C.23 */
+-	mpi_opts |= HW_ATL_FW2X_CTRL_SLEEP_PROXY;
+-	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
+-
+-	err = readx_poll_timeout_atomic(aq_fw2x_state2_get,
+-					self, val,
+-					val & HW_ATL_FW2X_CTRL_SLEEP_PROXY,
+-					1U, 100000U);
+-
+-err_exit:
+-	return err;
+-}
+-
+-static int aq_fw2x_set_wol_params(struct aq_hw_s *self, u8 *mac)
+-{
+-	struct hw_atl_utils_fw_rpc *rpc = NULL;
+-	struct fw2x_msg_wol *msg = NULL;
+-	u32 mpi_opts;
+-	int err = 0;
+-	u32 val;
+-
+-	err = hw_atl_utils_fw_rpc_wait(self, &rpc);
+-	if (err < 0)
+-		goto err_exit;
+-
+-	msg = (struct fw2x_msg_wol *)rpc;
+-
+-	memset(msg, 0, sizeof(*msg));
+-
+-	msg->msg_id = HAL_ATLANTIC_UTILS_FW2X_MSG_WOL;
+-	msg->magic_packet_enabled = true;
+-	memcpy(msg->hw_addr, mac, ETH_ALEN);
++	if (self->aq_nic_cfg->wol & WAKE_PHY) {
++		aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR,
++				HW_ATL_FW2X_CTRL_LINK_DROP);
++		readx_poll_timeout_atomic(aq_fw2x_state2_get, self, val,
++					  (val &
++					   HW_ATL_FW2X_CTRL_LINK_DROP) != 0,
++					  1000, 100000);
++		wol_bits |= HW_ATL_FW2X_CTRL_WAKE_ON_LINK;
++	}
+ 
+-	mpi_opts = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR);
+-	mpi_opts &= ~(HW_ATL_FW2X_CTRL_SLEEP_PROXY | HW_ATL_FW2X_CTRL_WOL);
++	if (self->aq_nic_cfg->wol & WAKE_MAGIC) {
++		wol_bits |= HW_ATL_FW2X_CTRL_SLEEP_PROXY |
++			    HW_ATL_FW2X_CTRL_WOL;
+ 
+-	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++		err = hw_atl_utils_fw_rpc_wait(self, &rpc);
++		if (err < 0)
++			goto err_exit;
+ 
+-	err = hw_atl_utils_fw_rpc_call(self, sizeof(*msg));
+-	if (err < 0)
+-		goto err_exit;
++		rpc_size = sizeof(*info) +
++			   offsetof(struct hw_atl_utils_fw_rpc, fw2x_offloads);
++		memset(rpc, 0, rpc_size);
++		info = &rpc->fw2x_offloads;
++		memcpy(info->mac_addr, mac, ETH_ALEN);
++		info->len = sizeof(*info);
+ 
+-	/* Set bit 0x36C.24 */
+-	mpi_opts |= HW_ATL_FW2X_CTRL_WOL;
+-	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, mpi_opts);
++		err = hw_atl_utils_fw_rpc_call(self, rpc_size);
++		if (err < 0)
++			goto err_exit;
++	}
+ 
+-	err = readx_poll_timeout_atomic(aq_fw2x_state2_get,
+-					self, val, val & HW_ATL_FW2X_CTRL_WOL,
+-					1U, 10000U);
++	aq_hw_write_reg(self, HW_ATL_FW2X_MPI_CONTROL2_ADDR, wol_bits);
+ 
+ err_exit:
+ 	return err;
+@@ -436,14 +396,9 @@ static int aq_fw2x_set_power(struct aq_hw_s *self, unsigned int power_state,
+ {
+ 	int err = 0;
+ 
+-	if (self->aq_nic_cfg->wol & AQ_NIC_WOL_ENABLED) {
+-		err = aq_fw2x_set_sleep_proxy(self, mac);
+-		if (err < 0)
+-			goto err_exit;
+-		err = aq_fw2x_set_wol_params(self, mac);
+-	}
++	if (self->aq_nic_cfg->wol)
++		err = aq_fw2x_set_wol(self, mac);
+ 
+-err_exit:
+ 	return err;
+ }
+ 
