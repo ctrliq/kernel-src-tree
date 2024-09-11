@@ -1,0 +1,884 @@
+mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 9d82c69438d0dff8809061edbcce43a5a4bcf09f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9d82c694.failed
+
+With the page->mapping requirement gone from memcg, we can charge anon and
+file-thp pages in one single step, right after they're allocated.
+
+This removes two out of three API calls - especially the tricky commit
+step that needed to happen at just the right time between when the page is
+"set up" and when it's "published" - somewhat vague and fluid concepts
+that varied by page type.  All we need is a freshly allocated page and a
+memcg context to charge.
+
+v2: prevent double charges on pre-allocated hugepages in khugepaged
+
+[hannes@cmpxchg.org: Fix crash - *hpage could be ERR_PTR instead of NULL]
+  Link: http://lkml.kernel.org/r/20200512215813.GA487759@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Alex Shi <alex.shi@linux.alibaba.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: Qian Cai <cai@lca.pw>
+Link: http://lkml.kernel.org/r/20200508183105.225460-13-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 9d82c69438d0dff8809061edbcce43a5a4bcf09f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/uprobes.c
+#	mm/huge_memory.c
+#	mm/khugepaged.c
+#	mm/memory.c
+#	mm/migrate.c
+#	mm/swapfile.c
+#	mm/userfaultfd.c
+diff --cc kernel/events/uprobes.c
+index 053c0240152f,4253c153e985..000000000000
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@@ -160,16 -161,14 +160,25 @@@ static int __replace_page(struct vm_are
+  		.address = addr,
+  	};
+  	int err;
+++<<<<<<< HEAD
+ +	/* For mmu_notifiers */
+ +	const unsigned long mmun_start = addr;
+ +	const unsigned long mmun_end   = addr + PAGE_SIZE;
+ +	struct mem_cgroup *memcg;
+++=======
++ 	struct mmu_notifier_range range;
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  
+ -	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, vma, mm, addr,
+ -				addr + PAGE_SIZE);
+ +	VM_BUG_ON_PAGE(PageTransHuge(old_page), old_page);
+  
+  	if (new_page) {
+++<<<<<<< HEAD
+ +		err = mem_cgroup_try_charge(new_page, vma->vm_mm, GFP_KERNEL,
+ +					    &memcg, false);
+++=======
++ 		err = mem_cgroup_charge(new_page, vma->vm_mm, GFP_KERNEL,
++ 					false);
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		if (err)
+  			return err;
+  	}
+@@@ -177,13 -176,10 +186,16 @@@
+  	/* For try_to_free_swap() and munlock_vma_page() below */
+  	lock_page(old_page);
+  
+ -	mmu_notifier_invalidate_range_start(&range);
+ +	mmu_notifier_invalidate_range_start(mm, mmun_start, mmun_end);
+  	err = -EAGAIN;
+++<<<<<<< HEAD
+ +	if (!page_vma_mapped_walk(&pvmw)) {
+ +		if (new_page)
+ +			mem_cgroup_cancel_charge(new_page, memcg, false);
+++=======
++ 	if (!page_vma_mapped_walk(&pvmw))
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		goto unlock;
+- 	}
+  	VM_BUG_ON_PAGE(addr != pvmw.address, old_page);
+  
+  	if (new_page) {
+diff --cc mm/huge_memory.c
+index 4033c78cc361,e9201a88157e..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -556,14 -593,15 +555,19 @@@ static vm_fault_t __do_huge_pmd_anonymo
+  
+  	VM_BUG_ON_PAGE(!PageCompound(page), page);
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(page, vma->vm_mm, gfp, &memcg, true)) {
+++=======
++ 	if (mem_cgroup_charge(page, vma->vm_mm, gfp, false)) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		put_page(page);
+  		count_vm_event(THP_FAULT_FALLBACK);
+  		count_vm_event(THP_FAULT_FALLBACK_CHARGE);
+  		return VM_FAULT_FALLBACK;
+  	}
++ 	cgroup_throttle_swaprate(page, gfp);
+  
+ -	pgtable = pte_alloc_one(vma->vm_mm);
+ +	pgtable = pte_alloc_one(vma->vm_mm, haddr);
+  	if (unlikely(!pgtable)) {
+  		ret = VM_FAULT_OOM;
+  		goto release;
+@@@ -592,7 -630,6 +596,10 @@@
+  			vm_fault_t ret2;
+  
+  			spin_unlock(vmf->ptl);
+++<<<<<<< HEAD
+ +			mem_cgroup_cancel_charge(page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  			put_page(page);
+  			pte_free(vma->vm_mm, pgtable);
+  			ret2 = handle_userfault(vmf, VM_UFFD_MISSING);
+@@@ -620,7 -656,6 +627,10 @@@ unlock_release
+  release:
+  	if (pgtable)
+  		pte_free(vma->vm_mm, pgtable);
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	put_page(page);
+  	return ret;
+  
+diff --cc mm/khugepaged.c
+index 0af263adde1a,32c85b81837a..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -961,10 -1037,8 +961,9 @@@ static void collapse_huge_page(struct m
+  	struct page *new_page;
+  	spinlock_t *pmd_ptl, *pte_ptl;
+  	int isolated = 0, result = 0;
+- 	struct mem_cgroup *memcg;
+  	struct vm_area_struct *vma;
+ -	struct mmu_notifier_range range;
+ +	unsigned long mmun_start;	/* For mmu_notifiers */
+ +	unsigned long mmun_end;		/* For mmu_notifiers */
+  	gfp_t gfp;
+  
+  	VM_BUG_ON(address & ~HPAGE_PMD_MASK);
+@@@ -985,7 -1059,7 +984,11 @@@
+  		goto out_nolock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp, &memcg, true))) {
+++=======
++ 	if (unlikely(mem_cgroup_charge(new_page, mm, gfp, false))) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		result = SCAN_CGROUP_CHARGE_FAIL;
+  		goto out_nolock;
+  	}
+@@@ -993,7 -1068,6 +997,10 @@@
+  	down_read(&mm->mmap_sem);
+  	result = hugepage_vma_revalidate(mm, address, &vma);
+  	if (result) {
+++<<<<<<< HEAD
+ +		mem_cgroup_cancel_charge(new_page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		up_read(&mm->mmap_sem);
+  		goto out_nolock;
+  	}
+@@@ -1001,7 -1075,6 +1008,10 @@@
+  	pmd = mm_find_pmd(mm, address);
+  	if (!pmd) {
+  		result = SCAN_PMD_NULL;
+++<<<<<<< HEAD
+ +		mem_cgroup_cancel_charge(new_page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		up_read(&mm->mmap_sem);
+  		goto out_nolock;
+  	}
+@@@ -1013,7 -1086,6 +1023,10 @@@
+  	 */
+  	if (unmapped && !__collapse_huge_page_swapin(mm, vma, address,
+  						     pmd, referenced)) {
+++<<<<<<< HEAD
+ +		mem_cgroup_cancel_charge(new_page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		up_read(&mm->mmap_sem);
+  		goto out_nolock;
+  	}
+@@@ -1098,8 -1173,6 +1111,11 @@@
+  	spin_lock(pmd_ptl);
+  	BUG_ON(!pmd_none(*pmd));
+  	page_add_new_anon_rmap(new_page, vma, address, true);
+++<<<<<<< HEAD
+ +	mem_cgroup_commit_charge(new_page, memcg, false, true);
+ +	count_memcg_events(memcg, THP_COLLAPSE_ALLOC, 1);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	lru_cache_add_active_or_unevictable(new_page, vma);
+  	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+  	set_pmd_at(mm, address, pmd, _pmd);
+@@@ -1116,7 -1191,6 +1134,10 @@@ out_nolock
+  	trace_mm_collapse_huge_page(mm, isolated, result);
+  	return;
+  out:
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(new_page, memcg, true);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	goto out_up_write;
+  }
+  
+@@@ -1342,14 -1613,14 +1363,18 @@@ static void collapse_file(struct mm_str
+  {
+  	struct address_space *mapping = file->f_mapping;
+  	gfp_t gfp;
+++<<<<<<< HEAD
+ +	struct page *page, *new_page, *tmp;
+ +	struct mem_cgroup *memcg;
+++=======
++ 	struct page *new_page;
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	pgoff_t index, end = start + HPAGE_PMD_NR;
+  	LIST_HEAD(pagelist);
+ -	XA_STATE_ORDER(xas, &mapping->i_pages, start, HPAGE_PMD_ORDER);
+ +	struct radix_tree_iter iter;
+ +	void **slot;
+  	int nr_none = 0, result = SCAN_SUCCEED;
+ -	bool is_shmem = shmem_file(file);
+  
+ -	VM_BUG_ON(!IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) && !is_shmem);
+  	VM_BUG_ON(start & (HPAGE_PMD_NR - 1));
+  
+  	/* Only allocate from the target node */
+@@@ -1361,64 -1632,118 +1386,88 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(mem_cgroup_try_charge(new_page, mm, gfp, &memcg, true))) {
+++=======
++ 	if (unlikely(mem_cgroup_charge(new_page, mm, gfp, false))) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		result = SCAN_CGROUP_CHARGE_FAIL;
+  		goto out;
+  	}
++ 	count_memcg_page_event(new_page, THP_COLLAPSE_ALLOC);
++ 
+++<<<<<<< HEAD
+++=======
++ 	/* This will be less messy when we use multi-index entries */
++ 	do {
++ 		xas_lock_irq(&xas);
++ 		xas_create_range(&xas);
++ 		if (!xas_error(&xas))
++ 			break;
++ 		xas_unlock_irq(&xas);
++ 		if (!xas_nomem(&xas, GFP_KERNEL)) {
++ 			result = SCAN_FAIL;
++ 			goto out;
++ 		}
++ 	} while (1);
+  
++ 	__SetPageLocked(new_page);
++ 	if (is_shmem)
++ 		__SetPageSwapBacked(new_page);
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	new_page->index = start;
+  	new_page->mapping = mapping;
+ +	__SetPageSwapBacked(new_page);
+ +	__SetPageLocked(new_page);
+ +	BUG_ON(!page_ref_freeze(new_page, 1));
+ +
+  
+  	/*
+ -	 * At this point the new_page is locked and not up-to-date.
+ -	 * It's safe to insert it into the page cache, because nobody would
+ -	 * be able to map it or use it in another way until we unlock it.
+ +	 * At this point the new_page is 'frozen' (page_count() is zero), locked
+ +	 * and not up-to-date. It's safe to insert it into radix tree, because
+ +	 * nobody would be able to map it or use it in other way until we
+ +	 * unfreeze it.
+  	 */
+  
+ -	xas_set(&xas, start);
+ -	for (index = start; index < end; index++) {
+ -		struct page *page = xas_next(&xas);
+ +	index = start;
+ +	xa_lock_irq(&mapping->i_pages);
+ +	radix_tree_for_each_slot(slot, &mapping->i_pages, &iter, start) {
+ +		int n = min(iter.index, end) - index;
+  
+ -		VM_BUG_ON(index != xas.xa_index);
+ -		if (is_shmem) {
+ -			if (!page) {
+ -				/*
+ -				 * Stop if extent has been truncated or
+ -				 * hole-punched, and is now completely
+ -				 * empty.
+ -				 */
+ -				if (index == start) {
+ -					if (!xas_next_entry(&xas, end - 1)) {
+ -						result = SCAN_TRUNCATED;
+ -						goto xa_locked;
+ -					}
+ -					xas_set(&xas, index);
+ -				}
+ -				if (!shmem_charge(mapping->host, 1)) {
+ -					result = SCAN_FAIL;
+ -					goto xa_locked;
+ -				}
+ -				xas_store(&xas, new_page);
+ -				nr_none++;
+ -				continue;
+ -			}
+ +		/*
+ +		 * Handle holes in the radix tree: charge it from shmem and
+ +		 * insert relevant subpage of new_page into the radix-tree.
+ +		 */
+ +		if (n && !shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			break;
+ +		}
+ +		nr_none += n;
+ +		for (; index < min(iter.index, end); index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+ +		}
+  
+ -			if (xa_is_value(page) || !PageUptodate(page)) {
+ -				xas_unlock_irq(&xas);
+ -				/* swap in or instantiate fallocated page */
+ -				if (shmem_getpage(mapping->host, index, &page,
+ -						  SGP_NOHUGE)) {
+ -					result = SCAN_FAIL;
+ -					goto xa_unlocked;
+ -				}
+ -			} else if (trylock_page(page)) {
+ -				get_page(page);
+ -				xas_unlock_irq(&xas);
+ -			} else {
+ -				result = SCAN_PAGE_LOCK;
+ -				goto xa_locked;
+ -			}
+ -		} else {	/* !is_shmem */
+ -			if (!page || xa_is_value(page)) {
+ -				xas_unlock_irq(&xas);
+ -				page_cache_sync_readahead(mapping, &file->f_ra,
+ -							  file, index,
+ -							  PAGE_SIZE);
+ -				/* drain pagevecs to help isolate_lru_page() */
+ -				lru_add_drain();
+ -				page = find_lock_page(mapping, index);
+ -				if (unlikely(page == NULL)) {
+ -					result = SCAN_FAIL;
+ -					goto xa_unlocked;
+ -				}
+ -			} else if (PageDirty(page)) {
+ -				/*
+ -				 * khugepaged only works on read-only fd,
+ -				 * so this page is dirty because it hasn't
+ -				 * been flushed since first write. There
+ -				 * won't be new dirty pages.
+ -				 *
+ -				 * Trigger async flush here and hope the
+ -				 * writeback is done when khugepaged
+ -				 * revisits this page.
+ -				 *
+ -				 * This is a one-off situation. We are not
+ -				 * forcing writeback in loop.
+ -				 */
+ -				xas_unlock_irq(&xas);
+ -				filemap_flush(mapping);
+ +		/* We are done. */
+ +		if (index >= end)
+ +			break;
+ +
+ +		page = radix_tree_deref_slot_protected(slot,
+ +				&mapping->i_pages.xa_lock);
+ +		if (xa_is_value(page) || !PageUptodate(page)) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			/* swap in or instantiate fallocated page */
+ +			if (shmem_getpage(mapping->host, index, &page,
+ +						SGP_NOHUGE)) {
+  				result = SCAN_FAIL;
+ -				goto xa_unlocked;
+ -			} else if (trylock_page(page)) {
+ -				get_page(page);
+ -				xas_unlock_irq(&xas);
+ -			} else {
+ -				result = SCAN_PAGE_LOCK;
+ -				goto xa_locked;
+ +				goto tree_unlocked;
+  			}
+ +			xa_lock_irq(&mapping->i_pages);
+ +		} else if (trylock_page(page)) {
+ +			get_page(page);
+ +		} else {
+ +			result = SCAN_PAGE_LOCK;
+ +			break;
+  		}
+  
+  		/*
+@@@ -1492,40 -1828,32 +1541,52 @@@ out_isolate_failed
+  out_unlock:
+  		unlock_page(page);
+  		put_page(page);
+ -		goto xa_unlocked;
+ +		break;
+  	}
+  
+ -	if (is_shmem)
+ -		__inc_node_page_state(new_page, NR_SHMEM_THPS);
+ -	else {
+ -		__inc_node_page_state(new_page, NR_FILE_THPS);
+ -		filemap_nr_thps_inc(mapping);
+ +	/*
+ +	 * Handle hole in radix tree at the end of the range.
+ +	 * This code only triggers if there's nothing in radix tree
+ +	 * beyond 'end'.
+ +	 */
+ +	if (result == SCAN_SUCCEED && index < end) {
+ +		int n = end - index;
+ +
+ +		if (!shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			goto tree_locked;
+ +		}
+ +
+ +		for (; index < end; index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+ +		}
+ +		nr_none += n;
+  	}
+  
+++<<<<<<< HEAD
+ +tree_locked:
+ +	xa_unlock_irq(&mapping->i_pages);
+ +tree_unlocked:
+++=======
++ 	if (nr_none) {
++ 		__mod_lruvec_page_state(new_page, NR_FILE_PAGES, nr_none);
++ 		if (is_shmem)
++ 			__mod_lruvec_page_state(new_page, NR_SHMEM, nr_none);
++ 	}
++ 
++ xa_locked:
++ 	xas_unlock_irq(&xas);
++ xa_unlocked:
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  
+  	if (result == SCAN_SUCCEED) {
+ -		struct page *page, *tmp;
+ +		unsigned long flags;
+ +		struct zone *zone = page_zone(new_page);
+  
+  		/*
+ -		 * Replacing old pages with new one has succeeded, now we
+ -		 * need to copy the content and free the old pages.
+ +		 * Replacing old pages with new one has succeed, now we need to
+ +		 * copy the content and free old pages.
+  		 */
+  		index = start;
+  		list_for_each_entry_safe(page, tmp, &pagelist, lru) {
+@@@ -1549,29 -1877,20 +1610,41 @@@
+  			index++;
+  		}
+  
+++<<<<<<< HEAD
+ +		local_irq_save(flags);
+ +		__inc_node_page_state(new_page, NR_SHMEM_THPS);
+ +		if (nr_none) {
+ +			__mod_node_page_state(zone->zone_pgdat, NR_FILE_PAGES, nr_none);
+ +			__mod_node_page_state(zone->zone_pgdat, NR_SHMEM, nr_none);
+ +		}
+ +		local_irq_restore(flags);
+++=======
++ 		SetPageUptodate(new_page);
++ 		page_ref_add(new_page, HPAGE_PMD_NR - 1);
++ 
++ 		if (is_shmem) {
++ 			set_page_dirty(new_page);
++ 			lru_cache_add_anon(new_page);
++ 		} else {
++ 			lru_cache_add_file(new_page);
++ 		}
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  
+  		/*
+ -		 * Remove pte page tables, so we can re-fault the page as huge.
+ +		 * Remove pte page tables, so we can re-faulti
+ +		 * the page as huge.
+  		 */
+  		retract_page_tables(mapping, start);
+ +
+ +		/* Everything is ready, let's unfreeze the new_page */
+ +		set_page_dirty(new_page);
+ +		SetPageUptodate(new_page);
+ +		page_ref_unfreeze(new_page, HPAGE_PMD_NR);
+ +		mem_cgroup_commit_charge(new_page, memcg, false, true);
+ +		count_memcg_events(memcg, THP_COLLAPSE_ALLOC, 1);
+ +		lru_cache_add_anon(new_page);
+ +		unlock_page(new_page);
+ +
+  		*hpage = NULL;
+  
+  		khugepaged_pages_collapsed++;
+@@@ -1599,24 -1922,24 +1672,29 @@@
+  			/* Unfreeze the page. */
+  			list_del(&page->lru);
+  			page_ref_unfreeze(page, 2);
+ -			xas_store(&xas, page);
+ -			xas_pause(&xas);
+ -			xas_unlock_irq(&xas);
+ -			unlock_page(page);
+ +			radix_tree_replace_slot(&mapping->i_pages, slot, page);
+ +			slot = radix_tree_iter_resume(slot, &iter);
+ +			xa_unlock_irq(&mapping->i_pages);
+  			putback_lru_page(page);
+ -			xas_lock_irq(&xas);
+ +			unlock_page(page);
+ +			xa_lock_irq(&mapping->i_pages);
+  		}
+  		VM_BUG_ON(nr_none);
+ -		xas_unlock_irq(&xas);
+ -
+ +		xa_unlock_irq(&mapping->i_pages);
+ +
+++<<<<<<< HEAD
+ +		/* Unfreeze new_page, caller would take care about freeing it */
+ +		page_ref_unfreeze(new_page, 1);
+ +		mem_cgroup_cancel_charge(new_page, memcg, true);
+ +		unlock_page(new_page);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		new_page->mapping = NULL;
+  	}
+ -
+ -	unlock_page(new_page);
+  out:
+  	VM_BUG_ON(!list_empty(&pagelist));
++ 	if (!IS_ERR_OR_NULL(*hpage))
++ 		mem_cgroup_uncharge(*hpage);
+  	/* TODO: tracepoints */
+  }
+  
+diff --cc mm/memory.c
+index 583eb7e0dd7f,27e225bef5d0..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2591,9 -2645,7 +2591,13 @@@ static vm_fault_t wp_page_copy(struct v
+  	struct page *new_page = NULL;
+  	pte_t entry;
+  	int page_copied = 0;
+++<<<<<<< HEAD
+ +	const unsigned long mmun_start = vmf->address & PAGE_MASK;
+ +	const unsigned long mmun_end = mmun_start + PAGE_SIZE;
+ +	struct mem_cgroup *memcg;
+++=======
++ 	struct mmu_notifier_range range;
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  
+  	if (unlikely(anon_vma_prepare(vma)))
+  		goto oom;
+@@@ -2608,11 -2660,24 +2612,16 @@@
+  				vmf->address);
+  		if (!new_page)
+  			goto oom;
+ -
+ -		if (!cow_user_page(new_page, old_page, vmf)) {
+ -			/*
+ -			 * COW failed, if the fault was solved by other,
+ -			 * it's fine. If not, userspace would re-fault on
+ -			 * the same address and we will handle the fault
+ -			 * from the second attempt.
+ -			 */
+ -			put_page(new_page);
+ -			if (old_page)
+ -				put_page(old_page);
+ -			return 0;
+ -		}
+ +		cow_user_page(new_page, old_page, vmf->address, vma);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(new_page, mm, GFP_KERNEL, &memcg, false))
+++=======
++ 	if (mem_cgroup_charge(new_page, mm, GFP_KERNEL, false))
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		goto oom_free_new;
++ 	cgroup_throttle_swaprate(new_page, GFP_KERNEL);
+  
+  	__SetPageUptodate(new_page);
+  
+@@@ -2681,8 -2748,6 +2690,11 @@@
+  		/* Free the old page.. */
+  		new_page = old_page;
+  		page_copied = 1;
+++<<<<<<< HEAD
+ +	} else {
+ +		mem_cgroup_cancel_charge(new_page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	}
+  
+  	if (new_page)
+@@@ -3106,8 -3189,7 +3117,12 @@@ vm_fault_t do_swap_page(struct vm_faul
+  		goto out_page;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(page, vma->vm_mm, GFP_KERNEL,
+ +					&memcg, false)) {
+++=======
++ 	if (mem_cgroup_charge(page, vma->vm_mm, GFP_KERNEL, true)) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		ret = VM_FAULT_OOM;
+  		goto out_page;
+  	}
+@@@ -3194,7 -3279,6 +3210,10 @@@ unlock
+  out:
+  	return ret;
+  out_nomap:
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	pte_unmap_unlock(vmf->pte, vmf->ptl);
+  out_page:
+  	unlock_page(page);
+@@@ -3268,9 -3351,9 +3286,14 @@@ static vm_fault_t do_anonymous_page(str
+  	if (!page)
+  		goto oom;
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(page, vma->vm_mm, GFP_KERNEL, &memcg,
+ +					false))
+++=======
++ 	if (mem_cgroup_charge(page, vma->vm_mm, GFP_KERNEL, false))
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		goto oom_free_page;
++ 	cgroup_throttle_swaprate(page, GFP_KERNEL);
+  
+  	/*
+  	 * The memory barrier inside __SetPageUptodate makes sure that
+@@@ -3295,7 -3378,6 +3318,10 @@@
+  	/* Deliver the page fault to userland, check inside PT lock */
+  	if (userfaultfd_missing(vma)) {
+  		pte_unmap_unlock(vmf->pte, vmf->ptl);
+++<<<<<<< HEAD
+ +		mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		put_page(page);
+  		return handle_userfault(vmf, VM_UFFD_MISSING);
+  	}
+@@@ -3313,7 -3394,6 +3339,10 @@@ unlock
+  	pte_unmap_unlock(vmf->pte, vmf->ptl);
+  	return ret;
+  release:
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	put_page(page);
+  	goto unlock;
+  oom_free_page:
+@@@ -3539,20 -3605,17 +3567,23 @@@ static vm_fault_t do_set_pmd(struct vm_
+   *
+   * Target users are page handler itself and implementations of
+   * vm_ops->map_pages.
+ - *
+ - * Return: %0 on success, %VM_FAULT_ code in case of error.
+   */
+- vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct mem_cgroup *memcg,
+- 		struct page *page)
++ vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct page *page)
+  {
+  	struct vm_area_struct *vma = vmf->vma;
+  	bool write = vmf->flags & FAULT_FLAG_WRITE;
+  	pte_t entry;
+  	vm_fault_t ret;
+  
+++<<<<<<< HEAD
+ +	if (pmd_none(*vmf->pmd) && PageTransCompound(page) &&
+ +			IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE)) {
+ +		/* THP on COW? */
+ +		VM_BUG_ON_PAGE(memcg, page);
+ +
+++=======
++ 	if (pmd_none(*vmf->pmd) && PageTransCompound(page)) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		ret = do_set_pmd(vmf, page);
+  		if (ret != VM_FAULT_FALLBACK)
+  			return ret;
+@@@ -3789,8 -3847,7 +3820,12 @@@ static vm_fault_t do_cow_fault(struct v
+  	if (!vmf->cow_page)
+  		return VM_FAULT_OOM;
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge_delay(vmf->cow_page, vma->vm_mm, GFP_KERNEL,
+ +				&vmf->memcg, false)) {
+++=======
++ 	if (mem_cgroup_charge(vmf->cow_page, vma->vm_mm, GFP_KERNEL, false)) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		put_page(vmf->cow_page);
+  		return VM_FAULT_OOM;
+  	}
+@@@ -3811,7 -3869,6 +3847,10 @@@
+  		goto uncharge_out;
+  	return ret;
+  uncharge_out:
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(vmf->cow_page, vmf->memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  	put_page(vmf->cow_page);
+  	return ret;
+  }
+diff --cc mm/migrate.c
+index 60059875287d,44cee40221ec..000000000000
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@@ -2737,7 -2786,7 +2736,11 @@@ static void migrate_vma_insert_page(str
+  
+  	if (unlikely(anon_vma_prepare(vma)))
+  		goto abort;
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge(page, vma->vm_mm, GFP_KERNEL, &memcg, false))
+++=======
++ 	if (mem_cgroup_charge(page, vma->vm_mm, GFP_KERNEL, false))
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		goto abort;
+  
+  	/*
+@@@ -2805,7 -2853,6 +2808,10 @@@
+  
+  unlock_abort:
+  	pte_unmap_unlock(ptep, ptl);
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  abort:
+  	*src &= ~MIGRATE_PFN_MIGRATE;
+  }
+diff --cc mm/swapfile.c
+index b77fb155eaf4,720e9a924c01..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1927,15 -1901,13 +1926,22 @@@ static int unuse_pte(struct vm_area_str
+  	if (unlikely(!page))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge(page, vma->vm_mm, GFP_KERNEL,
+ +				&memcg, false)) {
+++=======
++ 	if (mem_cgroup_charge(page, vma->vm_mm, GFP_KERNEL, true)) {
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		ret = -ENOMEM;
+  		goto out_nolock;
+  	}
+  
+  	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+  	if (unlikely(!pte_same_as_swp(*pte, swp_entry_to_pte(entry)))) {
+++<<<<<<< HEAD
+ +		mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		ret = 0;
+  		goto out;
+  	}
+diff --cc mm/userfaultfd.c
+index 7529d3fcc899,2745489415cc..000000000000
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@@ -25,9 -53,9 +25,8 @@@ static int mcopy_atomic_pte(struct mm_s
+  			    struct vm_area_struct *dst_vma,
+  			    unsigned long dst_addr,
+  			    unsigned long src_addr,
+ -			    struct page **pagep,
+ -			    bool wp_copy)
+ +			    struct page **pagep)
+  {
+- 	struct mem_cgroup *memcg;
+  	pte_t _dst_pte, *dst_pte;
+  	spinlock_t *ptl;
+  	void *page_kaddr;
+@@@ -68,12 -96,16 +67,16 @@@
+  	__SetPageUptodate(page);
+  
+  	ret = -ENOMEM;
+++<<<<<<< HEAD
+ +	if (mem_cgroup_try_charge(page, dst_mm, GFP_KERNEL, &memcg, false))
+++=======
++ 	if (mem_cgroup_charge(page, dst_mm, GFP_KERNEL, false))
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  		goto out_release;
+  
+ -	_dst_pte = pte_mkdirty(mk_pte(page, dst_vma->vm_page_prot));
+ -	if (dst_vma->vm_flags & VM_WRITE) {
+ -		if (wp_copy)
+ -			_dst_pte = pte_mkuffd_wp(_dst_pte);
+ -		else
+ -			_dst_pte = pte_mkwrite(_dst_pte);
+ -	}
+ +	_dst_pte = mk_pte(page, dst_vma->vm_page_prot);
+ +	if (dst_vma->vm_flags & VM_WRITE)
+ +		_dst_pte = pte_mkwrite(pte_mkdirty(_dst_pte));
+  
+  	dst_pte = pte_offset_map_lock(dst_mm, dst_pmd, dst_addr, &ptl);
+  	if (dst_vma->vm_file) {
+@@@ -105,7 -136,6 +108,10 @@@ out
+  	return ret;
+  out_release_uncharge_unlock:
+  	pte_unmap_unlock(dst_pte, ptl);
+++<<<<<<< HEAD
+ +	mem_cgroup_cancel_charge(page, memcg, false);
+++=======
+++>>>>>>> 9d82c69438d0 (mm: memcontrol: convert anon and file-thp to new mem_cgroup_charge() API)
+  out_release:
+  	put_page(page);
+  	goto out;
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index ef77bd76b21c..3d1436510bf7 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -369,7 +369,6 @@ struct vm_fault {
+ 	pte_t orig_pte;			/* Value of PTE at the time of fault */
+ 
+ 	struct page *cow_page;		/* Page handler may use for COW fault */
+-	struct mem_cgroup *memcg;	/* Cgroup cow_page belongs to */
+ 	struct page *page;		/* ->fault handlers should return a
+ 					 * page here, unless VM_FAULT_NOPAGE
+ 					 * is set (which is also implied by
+@@ -734,8 +733,7 @@ static inline pte_t maybe_mkwrite(pte_t pte, struct vm_area_struct *vma)
+ 	return pte;
+ }
+ 
+-vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct mem_cgroup *memcg,
+-		struct page *page);
++vm_fault_t alloc_set_pte(struct vm_fault *vmf, struct page *page);
+ vm_fault_t finish_fault(struct vm_fault *vmf);
+ vm_fault_t finish_mkwrite_fault(struct vm_fault *vmf);
+ #endif
+* Unmerged path kernel/events/uprobes.c
+diff --git a/mm/filemap.c b/mm/filemap.c
+index efe054d0678b..9972580353f7 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2676,7 +2676,7 @@ void filemap_map_pages(struct vm_fault *vmf,
+ 		if (vmf->pte)
+ 			vmf->pte += xas.xa_index - last_pgoff;
+ 		last_pgoff = xas.xa_index;
+-		if (alloc_set_pte(vmf, NULL, page))
++		if (alloc_set_pte(vmf, page))
+ 			goto unlock;
+ 		unlock_page(page);
+ 		goto next;
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/khugepaged.c
+* Unmerged path mm/memory.c
+* Unmerged path mm/migrate.c
+* Unmerged path mm/swapfile.c
+* Unmerged path mm/userfaultfd.c
