@@ -1,0 +1,401 @@
+tools/testing/selftests/bpf: Add self-tests for new helper bpf_get_ns_current_pid_tgid.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [tools] tools/testing/selftests/bpf: Add self-tests for new helper bpf_get_ns_current_pid_tgid (Yauheni Kaliuta) [1845114]
+Rebuild_FUZZ: 99.42%
+commit-author Carlos Neira <cneirabustos@gmail.com>
+commit 1c1052e0140af8f211c283c0a333ecff2a6edfc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1c1052e0.failed
+
+Self tests added for new helper bpf_get_ns_current_pid_tgid
+
+	Signed-off-by: Carlos Neira <cneirabustos@gmail.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200304204157.58695-4-cneirabustos@gmail.com
+(cherry picked from commit 1c1052e0140af8f211c283c0a333ecff2a6edfc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/.gitignore
+#	tools/testing/selftests/bpf/Makefile
+diff --cc tools/testing/selftests/bpf/.gitignore
+index f9d8aed126b8,2198cd876675..000000000000
+--- a/tools/testing/selftests/bpf/.gitignore
++++ b/tools/testing/selftests/bpf/.gitignore
+@@@ -22,4 -22,20 +22,24 @@@ get_cgroup_id_use
+  test_skb_cgroup_id_user
+  test_socket_cookie
+  test_cgroup_storage
+++<<<<<<< HEAD
+ +test_select_reuseport
+++=======
++ test_flow_dissector
++ flow_dissector_load
++ test_netcnt
++ test_tcpnotify_user
++ test_libbpf
++ test_tcp_check_syncookie_user
++ test_sysctl
++ test_hashmap
++ test_btf_dump
++ test_current_pid_tgid_new_ns
++ xdping
++ test_cpp
++ *.skel.h
++ /no_alu32
++ /bpf_gcc
++ /tools
++ 
+++>>>>>>> 1c1052e0140a (tools/testing/selftests/bpf: Add self-tests for new helper bpf_get_ns_current_pid_tgid.)
+diff --cc tools/testing/selftests/bpf/Makefile
+index a1d9b7ae56bd,da4389dde9f7..000000000000
+--- a/tools/testing/selftests/bpf/Makefile
++++ b/tools/testing/selftests/bpf/Makefile
+@@@ -27,29 -32,18 +27,34 @@@ TEST_GEN_PROGS = test_verifier test_ta
+  	test_sock test_btf test_sockmap get_cgroup_id_user test_socket_cookie \
+  	test_cgroup_storage \
+  	test_netcnt test_tcpnotify_user test_sock_fields test_sysctl test_hashmap \
+++<<<<<<< HEAD
+ +	test_btf_dump test_cgroup_attach test_sockopt test_sockopt_sk \
+ +	test_sockopt_multi test_tcp_rtt
+++=======
++ 	test_progs-no_alu32 \
++ 	test_current_pid_tgid_new_ns
+++>>>>>>> 1c1052e0140a (tools/testing/selftests/bpf: Add self-tests for new helper bpf_get_ns_current_pid_tgid.)
+ +
+ +BPF_OBJ_FILES = $(patsubst %.c,%.o, $(notdir $(wildcard progs/*.c)))
+ +TEST_GEN_FILES = $(BPF_OBJ_FILES)
+ +
+ +BTF_C_FILES = $(wildcard progs/btf_dump_test_case_*.c)
+ +TEST_FILES = $(BTF_C_FILES)
+ +
+ +# Also test sub-register code-gen if LLVM has eBPF v3 processor support which
+ +# contains both ALU32 and JMP32 instructions.
+ +SUBREG_CODEGEN := $(shell echo "int cal(int a) { return a > 0; }" | \
+ +			$(CLANG) -target bpf -O2 -emit-llvm -S -x c - -o - | \
+ +			$(LLC) -mattr=+alu32 -mcpu=v3 2>&1 | \
+ +			grep 'if w')
+ +ifneq ($(SUBREG_CODEGEN),)
+ +TEST_GEN_FILES += $(patsubst %.o,alu32/%.o, $(BPF_OBJ_FILES))
+ +endif
+  
+ -# Also test bpf-gcc, if present
+  ifneq ($(BPF_GCC),)
+ -TEST_GEN_PROGS += test_progs-bpf_gcc
+ +TEST_GEN_FILES += $(patsubst %.o,bpf_gcc/%.o, $(BPF_OBJ_FILES))
+  endif
+  
+ -TEST_GEN_FILES =
+ -TEST_FILES = test_lwt_ip_encap.o \
+ -	test_tc_edt.o
+ -
+  # Order correspond to 'make run_tests' order
+  TEST_PROGS := test_kmod.sh \
+  	test_xdp_redirect.sh \
+* Unmerged path tools/testing/selftests/bpf/.gitignore
+* Unmerged path tools/testing/selftests/bpf/Makefile
+diff --git a/tools/testing/selftests/bpf/prog_tests/ns_current_pid_tgid.c b/tools/testing/selftests/bpf/prog_tests/ns_current_pid_tgid.c
+new file mode 100644
+index 000000000000..542240e16564
+--- /dev/null
++++ b/tools/testing/selftests/bpf/prog_tests/ns_current_pid_tgid.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Carlos Neira cneirabustos@gmail.com */
++#include <test_progs.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++
++struct bss {
++	__u64 dev;
++	__u64 ino;
++	__u64 pid_tgid;
++	__u64 user_pid_tgid;
++};
++
++void test_ns_current_pid_tgid(void)
++{
++	const char *probe_name = "raw_tracepoint/sys_enter";
++	const char *file = "test_ns_current_pid_tgid.o";
++	int err, key = 0, duration = 0;
++	struct bpf_link *link = NULL;
++	struct bpf_program *prog;
++	struct bpf_map *bss_map;
++	struct bpf_object *obj;
++	struct bss bss;
++	struct stat st;
++	__u64 id;
++
++	obj = bpf_object__open_file(file, NULL);
++	if (CHECK(IS_ERR(obj), "obj_open", "err %ld\n", PTR_ERR(obj)))
++		return;
++
++	err = bpf_object__load(obj);
++	if (CHECK(err, "obj_load", "err %d errno %d\n", err, errno))
++		goto cleanup;
++
++	bss_map = bpf_object__find_map_by_name(obj, "test_ns_.bss");
++	if (CHECK(!bss_map, "find_bss_map", "failed\n"))
++		goto cleanup;
++
++	prog = bpf_object__find_program_by_title(obj, probe_name);
++	if (CHECK(!prog, "find_prog", "prog '%s' not found\n",
++		  probe_name))
++		goto cleanup;
++
++	memset(&bss, 0, sizeof(bss));
++	pid_t tid = syscall(SYS_gettid);
++	pid_t pid = getpid();
++
++	id = (__u64) tid << 32 | pid;
++	bss.user_pid_tgid = id;
++
++	if (CHECK_FAIL(stat("/proc/self/ns/pid", &st))) {
++		perror("Failed to stat /proc/self/ns/pid");
++		goto cleanup;
++	}
++
++	bss.dev = st.st_dev;
++	bss.ino = st.st_ino;
++
++	err = bpf_map_update_elem(bpf_map__fd(bss_map), &key, &bss, 0);
++	if (CHECK(err, "setting_bss", "failed to set bss : %d\n", err))
++		goto cleanup;
++
++	link = bpf_program__attach_raw_tracepoint(prog, "sys_enter");
++	if (CHECK(IS_ERR(link), "attach_raw_tp", "err %ld\n",
++		  PTR_ERR(link))) {
++		link = NULL;
++		goto cleanup;
++	}
++
++	/* trigger some syscalls */
++	usleep(1);
++
++	err = bpf_map_lookup_elem(bpf_map__fd(bss_map), &key, &bss);
++	if (CHECK(err, "set_bss", "failed to get bss : %d\n", err))
++		goto cleanup;
++
++	if (CHECK(id != bss.pid_tgid, "Compare user pid/tgid vs. bpf pid/tgid",
++		  "User pid/tgid %llu BPF pid/tgid %llu\n", id, bss.pid_tgid))
++		goto cleanup;
++cleanup:
++	if (!link) {
++		bpf_link__destroy(link);
++		link = NULL;
++	}
++	bpf_object__close(obj);
++}
+diff --git a/tools/testing/selftests/bpf/progs/test_ns_current_pid_tgid.c b/tools/testing/selftests/bpf/progs/test_ns_current_pid_tgid.c
+new file mode 100644
+index 000000000000..1dca70a6de2f
+--- /dev/null
++++ b/tools/testing/selftests/bpf/progs/test_ns_current_pid_tgid.c
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2019 Carlos Neira cneirabustos@gmail.com */
++
++#include <linux/bpf.h>
++#include <stdint.h>
++#include <bpf/bpf_helpers.h>
++
++static volatile struct {
++	__u64 dev;
++	__u64 ino;
++	__u64 pid_tgid;
++	__u64 user_pid_tgid;
++} res;
++
++SEC("raw_tracepoint/sys_enter")
++int trace(void *ctx)
++{
++	__u64  ns_pid_tgid, expected_pid;
++	struct bpf_pidns_info nsdata;
++	__u32 key = 0;
++
++	if (bpf_get_ns_current_pid_tgid(res.dev, res.ino, &nsdata,
++		   sizeof(struct bpf_pidns_info)))
++		return 0;
++
++	ns_pid_tgid = (__u64)nsdata.tgid << 32 | nsdata.pid;
++	expected_pid = res.user_pid_tgid;
++
++	if (expected_pid != ns_pid_tgid)
++		return 0;
++
++	res.pid_tgid = ns_pid_tgid;
++
++	return 0;
++}
++
++char _license[] SEC("license") = "GPL";
+diff --git a/tools/testing/selftests/bpf/test_current_pid_tgid_new_ns.c b/tools/testing/selftests/bpf/test_current_pid_tgid_new_ns.c
+new file mode 100644
+index 000000000000..ed253f252cd0
+--- /dev/null
++++ b/tools/testing/selftests/bpf/test_current_pid_tgid_new_ns.c
+@@ -0,0 +1,159 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Carlos Neira cneirabustos@gmail.com */
++#define _GNU_SOURCE
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <unistd.h>
++#include <sys/syscall.h>
++#include <sched.h>
++#include <sys/wait.h>
++#include <sys/mount.h>
++#include "test_progs.h"
++
++#define CHECK_NEWNS(condition, tag, format...) ({		\
++	int __ret = !!(condition);			\
++	if (__ret) {					\
++		printf("%s:FAIL:%s ", __func__, tag);	\
++		printf(format);				\
++	} else {					\
++		printf("%s:PASS:%s\n", __func__, tag);	\
++	}						\
++	__ret;						\
++})
++
++struct bss {
++	__u64 dev;
++	__u64 ino;
++	__u64 pid_tgid;
++	__u64 user_pid_tgid;
++};
++
++int main(int argc, char **argv)
++{
++	pid_t pid;
++	int exit_code = 1;
++	struct stat st;
++
++	printf("Testing bpf_get_ns_current_pid_tgid helper in new ns\n");
++
++	if (stat("/proc/self/ns/pid", &st)) {
++		perror("stat failed on /proc/self/ns/pid ns\n");
++		printf("%s:FAILED\n", argv[0]);
++		return exit_code;
++	}
++
++	if (CHECK_NEWNS(unshare(CLONE_NEWPID | CLONE_NEWNS),
++			"unshare CLONE_NEWPID | CLONE_NEWNS", "error errno=%d\n", errno))
++		return exit_code;
++
++	pid = fork();
++	if (pid == -1) {
++		perror("Fork() failed\n");
++		printf("%s:FAILED\n", argv[0]);
++		return exit_code;
++	}
++
++	if (pid > 0) {
++		int status;
++
++		usleep(5);
++		waitpid(pid, &status, 0);
++		return 0;
++	} else {
++
++		pid = fork();
++		if (pid == -1) {
++			perror("Fork() failed\n");
++			printf("%s:FAILED\n", argv[0]);
++			return exit_code;
++		}
++
++		if (pid > 0) {
++			int status;
++			waitpid(pid, &status, 0);
++			return 0;
++		} else {
++			if (CHECK_NEWNS(mount("none", "/proc", NULL, MS_PRIVATE|MS_REC, NULL),
++				"Unmounting proc", "Cannot umount proc! errno=%d\n", errno))
++				return exit_code;
++
++			if (CHECK_NEWNS(mount("proc", "/proc", "proc", MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL),
++				"Mounting proc", "Cannot mount proc! errno=%d\n", errno))
++				return exit_code;
++
++			const char *probe_name = "raw_tracepoint/sys_enter";
++			const char *file = "test_ns_current_pid_tgid.o";
++			struct bpf_link *link = NULL;
++			struct bpf_program *prog;
++			struct bpf_map *bss_map;
++			struct bpf_object *obj;
++			int exit_code = 1;
++			int err, key = 0;
++			struct bss bss;
++			struct stat st;
++			__u64 id;
++
++			obj = bpf_object__open_file(file, NULL);
++			if (CHECK_NEWNS(IS_ERR(obj), "obj_open", "err %ld\n", PTR_ERR(obj)))
++				return exit_code;
++
++			err = bpf_object__load(obj);
++			if (CHECK_NEWNS(err, "obj_load", "err %d errno %d\n", err, errno))
++				goto cleanup;
++
++			bss_map = bpf_object__find_map_by_name(obj, "test_ns_.bss");
++			if (CHECK_NEWNS(!bss_map, "find_bss_map", "failed\n"))
++				goto cleanup;
++
++			prog = bpf_object__find_program_by_title(obj, probe_name);
++			if (CHECK_NEWNS(!prog, "find_prog", "prog '%s' not found\n",
++						probe_name))
++				goto cleanup;
++
++			memset(&bss, 0, sizeof(bss));
++			pid_t tid = syscall(SYS_gettid);
++			pid_t pid = getpid();
++
++			id = (__u64) tid << 32 | pid;
++			bss.user_pid_tgid = id;
++
++			if (CHECK_NEWNS(stat("/proc/self/ns/pid", &st),
++				"stat new ns", "Failed to stat /proc/self/ns/pid errno=%d\n", errno))
++				goto cleanup;
++
++			bss.dev = st.st_dev;
++			bss.ino = st.st_ino;
++
++			err = bpf_map_update_elem(bpf_map__fd(bss_map), &key, &bss, 0);
++			if (CHECK_NEWNS(err, "setting_bss", "failed to set bss : %d\n", err))
++				goto cleanup;
++
++			link = bpf_program__attach_raw_tracepoint(prog, "sys_enter");
++			if (CHECK_NEWNS(IS_ERR(link), "attach_raw_tp", "err %ld\n",
++						PTR_ERR(link))) {
++				link = NULL;
++				goto cleanup;
++			}
++
++			/* trigger some syscalls */
++			usleep(1);
++
++			err = bpf_map_lookup_elem(bpf_map__fd(bss_map), &key, &bss);
++			if (CHECK_NEWNS(err, "set_bss", "failed to get bss : %d\n", err))
++				goto cleanup;
++
++			if (CHECK_NEWNS(id != bss.pid_tgid, "Compare user pid/tgid vs. bpf pid/tgid",
++						"User pid/tgid %llu BPF pid/tgid %llu\n", id, bss.pid_tgid))
++				goto cleanup;
++
++			exit_code = 0;
++			printf("%s:PASS\n", argv[0]);
++cleanup:
++			if (!link) {
++				bpf_link__destroy(link);
++				link = NULL;
++			}
++			bpf_object__close(obj);
++		}
++	}
++}
