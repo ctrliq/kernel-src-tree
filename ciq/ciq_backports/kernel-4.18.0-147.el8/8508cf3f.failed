@@ -1,0 +1,304 @@
+sched: loadavg: consolidate LOAD_INT, LOAD_FRAC, CALC_LOAD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 8508cf3ffad4defa202b303e5b6379efc4cd9054
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8508cf3f.failed
+
+There are several definitions of those functions/macros in places that
+mess with fixed-point load averages.  Provide an official version.
+
+[akpm@linux-foundation.org: fix missed conversion in block/blk-iolatency.c]
+Link: http://lkml.kernel.org/r/20180828172258.3185-5-hannes@cmpxchg.org
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Tested-by: Suren Baghdasaryan <surenb@google.com>
+	Tested-by: Daniel Drake <drake@endlessm.com>
+	Cc: Christopher Lameter <cl@linux.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Johannes Weiner <jweiner@fb.com>
+	Cc: Mike Galbraith <efault@gmx.de>
+	Cc: Peter Enderborg <peter.enderborg@sony.com>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Vinayak Menon <vinmenon@codeaurora.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8508cf3ffad4defa202b303e5b6379efc4cd9054)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-iolatency.c
+diff --cc block/blk-iolatency.c
+index dc0d429bc020,28f80d227528..000000000000
+--- a/block/blk-iolatency.c
++++ b/block/blk-iolatency.c
+@@@ -172,15 -186,91 +172,89 @@@ static inline struct blkcg_gq *lat_to_b
+  	return pd_to_blkg(&iolat->pd);
+  }
+  
+ -static inline void latency_stat_init(struct iolatency_grp *iolat,
+ -				     struct latency_stat *stat)
+ +static void iolat_cleanup_cb(struct rq_wait *rqw, void *private_data)
+  {
+ -	if (iolat->ssd) {
+ -		stat->ps.total = 0;
+ -		stat->ps.missed = 0;
+ -	} else
+ -		blk_rq_stat_init(&stat->rqs);
+ +	atomic_dec(&rqw->inflight);
+ +	wake_up(&rqw->wait);
+  }
+  
+ -static inline void latency_stat_sum(struct iolatency_grp *iolat,
+ -				    struct latency_stat *sum,
+ -				    struct latency_stat *stat)
+ +static bool iolat_acquire_inflight(struct rq_wait *rqw, void *private_data)
+  {
+++<<<<<<< HEAD
+ +	struct iolatency_grp *iolat = private_data;
+++=======
++ 	if (iolat->ssd) {
++ 		sum->ps.total += stat->ps.total;
++ 		sum->ps.missed += stat->ps.missed;
++ 	} else
++ 		blk_rq_stat_sum(&sum->rqs, &stat->rqs);
++ }
++ 
++ static inline void latency_stat_record_time(struct iolatency_grp *iolat,
++ 					    u64 req_time)
++ {
++ 	struct latency_stat *stat = get_cpu_ptr(iolat->stats);
++ 	if (iolat->ssd) {
++ 		if (req_time >= iolat->min_lat_nsec)
++ 			stat->ps.missed++;
++ 		stat->ps.total++;
++ 	} else
++ 		blk_rq_stat_add(&stat->rqs, req_time);
++ 	put_cpu_ptr(stat);
++ }
++ 
++ static inline bool latency_sum_ok(struct iolatency_grp *iolat,
++ 				  struct latency_stat *stat)
++ {
++ 	if (iolat->ssd) {
++ 		u64 thresh = div64_u64(stat->ps.total, 10);
++ 		thresh = max(thresh, 1ULL);
++ 		return stat->ps.missed < thresh;
++ 	}
++ 	return stat->rqs.mean <= iolat->min_lat_nsec;
++ }
++ 
++ static inline u64 latency_stat_samples(struct iolatency_grp *iolat,
++ 				       struct latency_stat *stat)
++ {
++ 	if (iolat->ssd)
++ 		return stat->ps.total;
++ 	return stat->rqs.nr_samples;
++ }
++ 
++ static inline void iolat_update_total_lat_avg(struct iolatency_grp *iolat,
++ 					      struct latency_stat *stat)
++ {
++ 	int exp_idx;
++ 
++ 	if (iolat->ssd)
++ 		return;
++ 
++ 	/*
++ 	 * calc_load() takes in a number stored in fixed point representation.
++ 	 * Because we are using this for IO time in ns, the values stored
++ 	 * are significantly larger than the FIXED_1 denominator (2048).
++ 	 * Therefore, rounding errors in the calculation are negligible and
++ 	 * can be ignored.
++ 	 */
++ 	exp_idx = min_t(int, BLKIOLATENCY_NR_EXP_FACTORS - 1,
++ 			div64_u64(iolat->cur_win_nsec,
++ 				  BLKIOLATENCY_EXP_BUCKET_SIZE));
++ 	iolat->lat_avg = calc_load(iolat->lat_avg,
++ 				   iolatency_exp_factors[exp_idx],
++ 				   stat->rqs.mean);
++ }
++ 
++ static inline bool iolatency_may_queue(struct iolatency_grp *iolat,
++ 				       wait_queue_entry_t *wait,
++ 				       bool first_block)
++ {
++ 	struct rq_wait *rqw = &iolat->rq_wait;
++ 
++ 	if (first_block && waitqueue_active(&rqw->wait) &&
++ 	    rqw->wait.head.next != &wait->entry)
++ 		return false;
+++>>>>>>> 8508cf3ffad4 (sched: loadavg: consolidate LOAD_INT, LOAD_FRAC, CALC_LOAD)
+  	return rq_wait_inc_below(rqw, iolat->rq_depth.max_depth);
+  }
+  
+diff --git a/arch/powerpc/platforms/cell/cpufreq_spudemand.c b/arch/powerpc/platforms/cell/cpufreq_spudemand.c
+index 882944c36ef5..5d8e8b6bb1cc 100644
+--- a/arch/powerpc/platforms/cell/cpufreq_spudemand.c
++++ b/arch/powerpc/platforms/cell/cpufreq_spudemand.c
+@@ -49,7 +49,7 @@ static int calc_freq(struct spu_gov_info_struct *info)
+ 	cpu = info->policy->cpu;
+ 	busy_spus = atomic_read(&cbe_spu_info[cpu_to_node(cpu)].busy_spus);
+ 
+-	CALC_LOAD(info->busy_spus, EXP, busy_spus * FIXED_1);
++	info->busy_spus = calc_load(info->busy_spus, EXP, busy_spus * FIXED_1);
+ 	pr_debug("cpu %d: busy_spus=%d, info->busy_spus=%ld\n",
+ 			cpu, busy_spus, info->busy_spus);
+ 
+diff --git a/arch/powerpc/platforms/cell/spufs/sched.c b/arch/powerpc/platforms/cell/spufs/sched.c
+index c9ef3c532169..9fcccb4490b9 100644
+--- a/arch/powerpc/platforms/cell/spufs/sched.c
++++ b/arch/powerpc/platforms/cell/spufs/sched.c
+@@ -987,9 +987,9 @@ static void spu_calc_load(void)
+ 	unsigned long active_tasks; /* fixed-point */
+ 
+ 	active_tasks = count_active_contexts() * FIXED_1;
+-	CALC_LOAD(spu_avenrun[0], EXP_1, active_tasks);
+-	CALC_LOAD(spu_avenrun[1], EXP_5, active_tasks);
+-	CALC_LOAD(spu_avenrun[2], EXP_15, active_tasks);
++	spu_avenrun[0] = calc_load(spu_avenrun[0], EXP_1, active_tasks);
++	spu_avenrun[1] = calc_load(spu_avenrun[1], EXP_5, active_tasks);
++	spu_avenrun[2] = calc_load(spu_avenrun[2], EXP_15, active_tasks);
+ }
+ 
+ static void spusched_wake(struct timer_list *unused)
+@@ -1071,9 +1071,6 @@ void spuctx_switch_state(struct spu_context *ctx,
+ 	}
+ }
+ 
+-#define LOAD_INT(x) ((x) >> FSHIFT)
+-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+-
+ static int show_spu_loadavg(struct seq_file *s, void *private)
+ {
+ 	int a, b, c;
+diff --git a/arch/s390/appldata/appldata_os.c b/arch/s390/appldata/appldata_os.c
+index 433a994b1a89..54f375627532 100644
+--- a/arch/s390/appldata/appldata_os.c
++++ b/arch/s390/appldata/appldata_os.c
+@@ -25,10 +25,6 @@
+ 
+ #include "appldata.h"
+ 
+-
+-#define LOAD_INT(x) ((x) >> FSHIFT)
+-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+-
+ /*
+  * OS data
+  *
+* Unmerged path block/blk-iolatency.c
+diff --git a/drivers/cpuidle/governors/menu.c b/drivers/cpuidle/governors/menu.c
+index 910f8a68f58b..58e12602854e 100644
+--- a/drivers/cpuidle/governors/menu.c
++++ b/drivers/cpuidle/governors/menu.c
+@@ -131,10 +131,6 @@ struct menu_device {
+ 	int		interval_ptr;
+ };
+ 
+-
+-#define LOAD_INT(x) ((x) >> FSHIFT)
+-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+-
+ static inline int get_loadavg(unsigned long load)
+ {
+ 	return LOAD_INT(load) * 10 + LOAD_FRAC(load) / 10;
+diff --git a/fs/proc/loadavg.c b/fs/proc/loadavg.c
+index d06694757201..8468baee951d 100644
+--- a/fs/proc/loadavg.c
++++ b/fs/proc/loadavg.c
+@@ -10,9 +10,6 @@
+ #include <linux/seqlock.h>
+ #include <linux/time.h>
+ 
+-#define LOAD_INT(x) ((x) >> FSHIFT)
+-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+-
+ static int loadavg_proc_show(struct seq_file *m, void *v)
+ {
+ 	unsigned long avnrun[3];
+diff --git a/include/linux/sched/loadavg.h b/include/linux/sched/loadavg.h
+index 80bc84ba5d2a..cc9cc62bb1f8 100644
+--- a/include/linux/sched/loadavg.h
++++ b/include/linux/sched/loadavg.h
+@@ -22,10 +22,23 @@ extern void get_avenrun(unsigned long *loads, unsigned long offset, int shift);
+ #define EXP_5		2014		/* 1/exp(5sec/5min) */
+ #define EXP_15		2037		/* 1/exp(5sec/15min) */
+ 
+-#define CALC_LOAD(load,exp,n) \
+-	load *= exp; \
+-	load += n*(FIXED_1-exp); \
+-	load >>= FSHIFT;
++/*
++ * a1 = a0 * e + a * (1 - e)
++ */
++static inline unsigned long
++calc_load(unsigned long load, unsigned long exp, unsigned long active)
++{
++	unsigned long newload;
++
++	newload = load * exp + active * (FIXED_1 - exp);
++	if (active >= load)
++		newload += FIXED_1-1;
++
++	return newload / FIXED_1;
++}
++
++#define LOAD_INT(x) ((x) >> FSHIFT)
++#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+ 
+ extern void calc_global_load(unsigned long ticks);
+ 
+diff --git a/kernel/debug/kdb/kdb_main.c b/kernel/debug/kdb/kdb_main.c
+index 2ddfce8f1e8f..bb4fe4e1a601 100644
+--- a/kernel/debug/kdb/kdb_main.c
++++ b/kernel/debug/kdb/kdb_main.c
+@@ -2556,16 +2556,11 @@ static int kdb_summary(int argc, const char **argv)
+ 	}
+ 	kdb_printf("%02ld:%02ld\n", val.uptime/(60*60), (val.uptime/60)%60);
+ 
+-	/* lifted from fs/proc/proc_misc.c::loadavg_read_proc() */
+-
+-#define LOAD_INT(x) ((x) >> FSHIFT)
+-#define LOAD_FRAC(x) LOAD_INT(((x) & (FIXED_1-1)) * 100)
+ 	kdb_printf("load avg   %ld.%02ld %ld.%02ld %ld.%02ld\n",
+ 		LOAD_INT(val.loads[0]), LOAD_FRAC(val.loads[0]),
+ 		LOAD_INT(val.loads[1]), LOAD_FRAC(val.loads[1]),
+ 		LOAD_INT(val.loads[2]), LOAD_FRAC(val.loads[2]));
+-#undef LOAD_INT
+-#undef LOAD_FRAC
++
+ 	/* Display in kilobytes */
+ #define K(x) ((x) << (PAGE_SHIFT - 10))
+ 	kdb_printf("\nMemTotal:       %8lu kB\nMemFree:        %8lu kB\n"
+diff --git a/kernel/sched/loadavg.c b/kernel/sched/loadavg.c
+index a171c1258109..54fbdfb2d86c 100644
+--- a/kernel/sched/loadavg.c
++++ b/kernel/sched/loadavg.c
+@@ -91,21 +91,6 @@ long calc_load_fold_active(struct rq *this_rq, long adjust)
+ 	return delta;
+ }
+ 
+-/*
+- * a1 = a0 * e + a * (1 - e)
+- */
+-static unsigned long
+-calc_load(unsigned long load, unsigned long exp, unsigned long active)
+-{
+-	unsigned long newload;
+-
+-	newload = load * exp + active * (FIXED_1 - exp);
+-	if (active >= load)
+-		newload += FIXED_1-1;
+-
+-	return newload / FIXED_1;
+-}
+-
+ #ifdef CONFIG_NO_HZ_COMMON
+ /*
+  * Handle NO_HZ for the global load-average.
