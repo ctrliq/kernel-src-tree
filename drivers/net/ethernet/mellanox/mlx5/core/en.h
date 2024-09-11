@@ -431,6 +431,7 @@ struct mlx5e_xdp_info {
 			dma_addr_t dma_addr;
 		} frame;
 		struct {
+			struct mlx5e_rq *rq;
 			struct mlx5e_dma_info di;
 		} page;
 	};
@@ -643,7 +644,7 @@ struct mlx5e_rq {
 
 	/* XDP */
 	struct bpf_prog       *xdp_prog;
-	struct mlx5e_xdpsq     xdpsq;
+	struct mlx5e_xdpsq    *xdpsq;
 	DECLARE_BITMAP(flags, 8);
 	struct page_pool      *page_pool;
 
@@ -662,6 +663,7 @@ struct mlx5e_rq {
 struct mlx5e_channel {
 	/* data path */
 	struct mlx5e_rq            rq;
+	struct mlx5e_xdpsq         rq_xdpsq;
 	struct mlx5e_txqsq         sq[MLX5E_MAX_NUM_TC];
 	struct mlx5e_icosq         icosq;   /* internal control operations */
 	bool                       xdp;
