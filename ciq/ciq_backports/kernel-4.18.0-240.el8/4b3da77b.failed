@@ -1,0 +1,296 @@
+bpf, x86: Generalize and extend bpf_arch_text_poke for direct jumps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit 4b3da77b72ad6b3c48c6fe4a395ace7db39a12c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4b3da77b.failed
+
+Add BPF_MOD_{NOP_TO_JUMP,JUMP_TO_JUMP,JUMP_TO_NOP} patching for x86
+JIT in order to be able to patch direct jumps or nop them out. We need
+this facility in order to patch tail call jumps and in later work also
+BPF static keys.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/aa4784196a8e5e985af4b30a4fe5336bce6e9643.1574452833.git.daniel@iogearbox.net
+(cherry picked from commit 4b3da77b72ad6b3c48c6fe4a395ace7db39a12c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/net/bpf_jit_comp.c
+diff --cc arch/x86/net/bpf_jit_comp.c
+index 490d8e35c7c9,f438bd3b7689..000000000000
+--- a/arch/x86/net/bpf_jit_comp.c
++++ b/arch/x86/net/bpf_jit_comp.c
+@@@ -505,13 -516,25 +517,30 @@@ int bpf_arch_text_poke(void *ip, enum b
+  	u8 *prog;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (!is_kernel_text((long)ip))
+ +		/* BPF trampoline in modules is not supported */
+++=======
++ 	if (!is_kernel_text((long)ip) &&
++ 	    !is_bpf_text_address((long)ip))
++ 		/* BPF poking in modules is not supported */
+++>>>>>>> 4b3da77b72ad (bpf, x86: Generalize and extend bpf_arch_text_poke for direct jumps)
+  		return -EINVAL;
+  
++ 	switch (t) {
++ 	case BPF_MOD_NOP_TO_CALL ... BPF_MOD_CALL_TO_NOP:
++ 		emit_patch_fn = emit_call;
++ 		break;
++ 	case BPF_MOD_NOP_TO_JUMP ... BPF_MOD_JUMP_TO_NOP:
++ 		emit_patch_fn = emit_jump;
++ 		break;
++ 	default:
++ 		return -ENOTSUPP;
++ 	}
++ 
+  	if (old_addr) {
+  		prog = old_insn;
+- 		ret = emit_call(&prog, old_addr, (void *)ip);
++ 		ret = emit_patch_fn(&prog, old_addr, (void *)ip);
+  		if (ret)
+  			return ret;
+  	}
+@@@ -1242,6 -1270,210 +1276,213 @@@ emit_jmp
+  	return proglen;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void save_regs(struct btf_func_model *m, u8 **prog, int nr_args,
++ 		      int stack_size)
++ {
++ 	int i;
++ 	/* Store function arguments to stack.
++ 	 * For a function that accepts two pointers the sequence will be:
++ 	 * mov QWORD PTR [rbp-0x10],rdi
++ 	 * mov QWORD PTR [rbp-0x8],rsi
++ 	 */
++ 	for (i = 0; i < min(nr_args, 6); i++)
++ 		emit_stx(prog, bytes_to_bpf_size(m->arg_size[i]),
++ 			 BPF_REG_FP,
++ 			 i == 5 ? X86_REG_R9 : BPF_REG_1 + i,
++ 			 -(stack_size - i * 8));
++ }
++ 
++ static void restore_regs(struct btf_func_model *m, u8 **prog, int nr_args,
++ 			 int stack_size)
++ {
++ 	int i;
++ 
++ 	/* Restore function arguments from stack.
++ 	 * For a function that accepts two pointers the sequence will be:
++ 	 * EMIT4(0x48, 0x8B, 0x7D, 0xF0); mov rdi,QWORD PTR [rbp-0x10]
++ 	 * EMIT4(0x48, 0x8B, 0x75, 0xF8); mov rsi,QWORD PTR [rbp-0x8]
++ 	 */
++ 	for (i = 0; i < min(nr_args, 6); i++)
++ 		emit_ldx(prog, bytes_to_bpf_size(m->arg_size[i]),
++ 			 i == 5 ? X86_REG_R9 : BPF_REG_1 + i,
++ 			 BPF_REG_FP,
++ 			 -(stack_size - i * 8));
++ }
++ 
++ static int invoke_bpf(struct btf_func_model *m, u8 **pprog,
++ 		      struct bpf_prog **progs, int prog_cnt, int stack_size)
++ {
++ 	u8 *prog = *pprog;
++ 	int cnt = 0, i;
++ 
++ 	for (i = 0; i < prog_cnt; i++) {
++ 		if (emit_call(&prog, __bpf_prog_enter, prog))
++ 			return -EINVAL;
++ 		/* remember prog start time returned by __bpf_prog_enter */
++ 		emit_mov_reg(&prog, true, BPF_REG_6, BPF_REG_0);
++ 
++ 		/* arg1: lea rdi, [rbp - stack_size] */
++ 		EMIT4(0x48, 0x8D, 0x7D, -stack_size);
++ 		/* arg2: progs[i]->insnsi for interpreter */
++ 		if (!progs[i]->jited)
++ 			emit_mov_imm64(&prog, BPF_REG_2,
++ 				       (long) progs[i]->insnsi >> 32,
++ 				       (u32) (long) progs[i]->insnsi);
++ 		/* call JITed bpf program or interpreter */
++ 		if (emit_call(&prog, progs[i]->bpf_func, prog))
++ 			return -EINVAL;
++ 
++ 		/* arg1: mov rdi, progs[i] */
++ 		emit_mov_imm64(&prog, BPF_REG_1, (long) progs[i] >> 32,
++ 			       (u32) (long) progs[i]);
++ 		/* arg2: mov rsi, rbx <- start time in nsec */
++ 		emit_mov_reg(&prog, true, BPF_REG_2, BPF_REG_6);
++ 		if (emit_call(&prog, __bpf_prog_exit, prog))
++ 			return -EINVAL;
++ 	}
++ 	*pprog = prog;
++ 	return 0;
++ }
++ 
++ /* Example:
++  * __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
++  * its 'struct btf_func_model' will be nr_args=2
++  * The assembly code when eth_type_trans is executing after trampoline:
++  *
++  * push rbp
++  * mov rbp, rsp
++  * sub rsp, 16                     // space for skb and dev
++  * push rbx                        // temp regs to pass start time
++  * mov qword ptr [rbp - 16], rdi   // save skb pointer to stack
++  * mov qword ptr [rbp - 8], rsi    // save dev pointer to stack
++  * call __bpf_prog_enter           // rcu_read_lock and preempt_disable
++  * mov rbx, rax                    // remember start time in bpf stats are enabled
++  * lea rdi, [rbp - 16]             // R1==ctx of bpf prog
++  * call addr_of_jited_FENTRY_prog
++  * movabsq rdi, 64bit_addr_of_struct_bpf_prog  // unused if bpf stats are off
++  * mov rsi, rbx                    // prog start time
++  * call __bpf_prog_exit            // rcu_read_unlock, preempt_enable and stats math
++  * mov rdi, qword ptr [rbp - 16]   // restore skb pointer from stack
++  * mov rsi, qword ptr [rbp - 8]    // restore dev pointer from stack
++  * pop rbx
++  * leave
++  * ret
++  *
++  * eth_type_trans has 5 byte nop at the beginning. These 5 bytes will be
++  * replaced with 'call generated_bpf_trampoline'. When it returns
++  * eth_type_trans will continue executing with original skb and dev pointers.
++  *
++  * The assembly code when eth_type_trans is called from trampoline:
++  *
++  * push rbp
++  * mov rbp, rsp
++  * sub rsp, 24                     // space for skb, dev, return value
++  * push rbx                        // temp regs to pass start time
++  * mov qword ptr [rbp - 24], rdi   // save skb pointer to stack
++  * mov qword ptr [rbp - 16], rsi   // save dev pointer to stack
++  * call __bpf_prog_enter           // rcu_read_lock and preempt_disable
++  * mov rbx, rax                    // remember start time if bpf stats are enabled
++  * lea rdi, [rbp - 24]             // R1==ctx of bpf prog
++  * call addr_of_jited_FENTRY_prog  // bpf prog can access skb and dev
++  * movabsq rdi, 64bit_addr_of_struct_bpf_prog  // unused if bpf stats are off
++  * mov rsi, rbx                    // prog start time
++  * call __bpf_prog_exit            // rcu_read_unlock, preempt_enable and stats math
++  * mov rdi, qword ptr [rbp - 24]   // restore skb pointer from stack
++  * mov rsi, qword ptr [rbp - 16]   // restore dev pointer from stack
++  * call eth_type_trans+5           // execute body of eth_type_trans
++  * mov qword ptr [rbp - 8], rax    // save return value
++  * call __bpf_prog_enter           // rcu_read_lock and preempt_disable
++  * mov rbx, rax                    // remember start time in bpf stats are enabled
++  * lea rdi, [rbp - 24]             // R1==ctx of bpf prog
++  * call addr_of_jited_FEXIT_prog   // bpf prog can access skb, dev, return value
++  * movabsq rdi, 64bit_addr_of_struct_bpf_prog  // unused if bpf stats are off
++  * mov rsi, rbx                    // prog start time
++  * call __bpf_prog_exit            // rcu_read_unlock, preempt_enable and stats math
++  * mov rax, qword ptr [rbp - 8]    // restore eth_type_trans's return value
++  * pop rbx
++  * leave
++  * add rsp, 8                      // skip eth_type_trans's frame
++  * ret                             // return to its caller
++  */
++ int arch_prepare_bpf_trampoline(void *image, struct btf_func_model *m, u32 flags,
++ 				struct bpf_prog **fentry_progs, int fentry_cnt,
++ 				struct bpf_prog **fexit_progs, int fexit_cnt,
++ 				void *orig_call)
++ {
++ 	int cnt = 0, nr_args = m->nr_args;
++ 	int stack_size = nr_args * 8;
++ 	u8 *prog;
++ 
++ 	/* x86-64 supports up to 6 arguments. 7+ can be added in the future */
++ 	if (nr_args > 6)
++ 		return -ENOTSUPP;
++ 
++ 	if ((flags & BPF_TRAMP_F_RESTORE_REGS) &&
++ 	    (flags & BPF_TRAMP_F_SKIP_FRAME))
++ 		return -EINVAL;
++ 
++ 	if (flags & BPF_TRAMP_F_CALL_ORIG)
++ 		stack_size += 8; /* room for return value of orig_call */
++ 
++ 	if (flags & BPF_TRAMP_F_SKIP_FRAME)
++ 		/* skip patched call instruction and point orig_call to actual
++ 		 * body of the kernel function.
++ 		 */
++ 		orig_call += X86_PATCH_SIZE;
++ 
++ 	prog = image;
++ 
++ 	EMIT1(0x55);		 /* push rbp */
++ 	EMIT3(0x48, 0x89, 0xE5); /* mov rbp, rsp */
++ 	EMIT4(0x48, 0x83, 0xEC, stack_size); /* sub rsp, stack_size */
++ 	EMIT1(0x53);		 /* push rbx */
++ 
++ 	save_regs(m, &prog, nr_args, stack_size);
++ 
++ 	if (fentry_cnt)
++ 		if (invoke_bpf(m, &prog, fentry_progs, fentry_cnt, stack_size))
++ 			return -EINVAL;
++ 
++ 	if (flags & BPF_TRAMP_F_CALL_ORIG) {
++ 		if (fentry_cnt)
++ 			restore_regs(m, &prog, nr_args, stack_size);
++ 
++ 		/* call original function */
++ 		if (emit_call(&prog, orig_call, prog))
++ 			return -EINVAL;
++ 		/* remember return value in a stack for bpf prog to access */
++ 		emit_stx(&prog, BPF_DW, BPF_REG_FP, BPF_REG_0, -8);
++ 	}
++ 
++ 	if (fexit_cnt)
++ 		if (invoke_bpf(m, &prog, fexit_progs, fexit_cnt, stack_size))
++ 			return -EINVAL;
++ 
++ 	if (flags & BPF_TRAMP_F_RESTORE_REGS)
++ 		restore_regs(m, &prog, nr_args, stack_size);
++ 
++ 	if (flags & BPF_TRAMP_F_CALL_ORIG)
++ 		/* restore original return value back into RAX */
++ 		emit_ldx(&prog, BPF_DW, BPF_REG_0, BPF_REG_FP, -8);
++ 
++ 	EMIT1(0x5B); /* pop rbx */
++ 	EMIT1(0xC9); /* leave */
++ 	if (flags & BPF_TRAMP_F_SKIP_FRAME)
++ 		/* skip our return address and return to parent */
++ 		EMIT4(0x48, 0x83, 0xC4, 8); /* add rsp, 8 */
++ 	EMIT1(0xC3); /* ret */
++ 	/* One half of the page has active running trampoline.
++ 	 * Another half is an area for next trampoline.
++ 	 * Make sure the trampoline generation logic doesn't overflow.
++ 	 */
++ 	if (WARN_ON_ONCE(prog - (u8 *)image > PAGE_SIZE / 2 - BPF_INSN_SAFETY))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
+++>>>>>>> 4b3da77b72ad (bpf, x86: Generalize and extend bpf_arch_text_poke for direct jumps)
+  struct x64_jit_data {
+  	struct bpf_binary_header *header;
+  	int *addrs;
+* Unmerged path arch/x86/net/bpf_jit_comp.c
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index a5585413dfbe..a21238c0fbd9 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -1178,10 +1178,16 @@ static inline u32 bpf_xdp_sock_convert_ctx_access(enum bpf_access_type type,
+ #endif /* CONFIG_INET */
+ 
+ enum bpf_text_poke_type {
++	/* All call-related pokes. */
+ 	BPF_MOD_NOP_TO_CALL,
+ 	BPF_MOD_CALL_TO_CALL,
+ 	BPF_MOD_CALL_TO_NOP,
++	/* All jump-related pokes. */
++	BPF_MOD_NOP_TO_JUMP,
++	BPF_MOD_JUMP_TO_JUMP,
++	BPF_MOD_JUMP_TO_NOP,
+ };
++
+ int bpf_arch_text_poke(void *ip, enum bpf_text_poke_type t,
+ 		       void *addr1, void *addr2);
+ 
