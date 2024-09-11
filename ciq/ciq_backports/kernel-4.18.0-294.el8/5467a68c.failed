@@ -1,0 +1,193 @@
+dcache: sort the freeing-without-RCU-delay mess for good.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [fs] dcache: sort the freeing-without-RCU-delay mess for good (Waiman Long) [1860031]
+Rebuild_FUZZ: 99.12%
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 5467a68cbf6884c9a9d91e2a89140afb1839c835
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5467a68c.failed
+
+For lockless accesses to dentries we don't have pinned we rely
+(among other things) upon having an RCU delay between dropping
+the last reference and actually freeing the memory.
+
+On the other hand, for things like pipes and sockets we neither
+do that kind of lockless access, nor want to deal with the
+overhead of an RCU delay every time a socket gets closed.
+
+So delay was made optional - setting DCACHE_RCUACCESS in ->d_flags
+made sure it would happen.  We tried to avoid setting it unless
+we knew we need it.  Unfortunately, that had led to recurring
+class of bugs, in which we missed the need to set it.
+
+We only really need it for dentries that are created by
+d_alloc_pseudo(), so let's not bother with trying to be smart -
+just make having an RCU delay the default.  The ones that do
+*not* get it set the replacement flag (DCACHE_NORCU) and we'd
+better use that sparingly.  d_alloc_pseudo() is the only
+such user right now.
+
+FWIW, the race that finally prompted that switch had been
+between __lock_parent() of immediate subdirectory of what's
+currently the root of a disconnected tree (e.g. from
+open-by-handle in progress) racing with d_splice_alias()
+elsewhere picking another alias for the same inode, either
+on outright corrupted fs image, or (in case of open-by-handle
+on NFS) that subdirectory having been just moved on server.
+It's not easy to hit, so the sky is not falling, but that's
+not the first race on similar missed cases and the logics
+for settinf DCACHE_RCUACCESS has gotten ridiculously
+convoluted.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 5467a68cbf6884c9a9d91e2a89140afb1839c835)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/porting
+diff --cc Documentation/filesystems/porting
+index 1c1e63b29a35,a60fa516d4cb..000000000000
+--- a/Documentation/filesystems/porting
++++ b/Documentation/filesystems/porting
+@@@ -607,3 -627,19 +607,22 @@@ in your dentry operations instead
+  	->clone_file_range() and ->dedupe_file_range have been replaced with
+  	->remap_file_range().  See Documentation/filesystems/vfs.txt for more
+  	information.
+++<<<<<<< HEAD
+++=======
++ --
++ [recommended]
++ 	->lookup() instances doing an equivalent of
++ 		if (IS_ERR(inode))
++ 			return ERR_CAST(inode);
++ 		return d_splice_alias(inode, dentry);
++ 	don't need to bother with the check - d_splice_alias() will do the
++ 	right thing when given ERR_PTR(...) as inode.  Moreover, passing NULL
++ 	inode to d_splice_alias() will also do the right thing (equivalent of
++ 	d_add(dentry, NULL); return NULL;), so that kind of special cases
++ 	also doesn't need a separate treatment.
++ --
++ [mandatory]
++ 	DCACHE_RCUACCESS is gone; having an RCU delay on dentry freeing is the
++ 	default.  DCACHE_NORCU opts out, and only d_alloc_pseudo() has any
++ 	business doing so.
+++>>>>>>> 5467a68cbf68 (dcache: sort the freeing-without-RCU-delay mess for good.)
+* Unmerged path Documentation/filesystems/porting
+diff --git a/fs/dcache.c b/fs/dcache.c
+index aaaa83976afa..84c8c1e2328b 100644
+--- a/fs/dcache.c
++++ b/fs/dcache.c
+@@ -342,7 +342,7 @@ static void dentry_free(struct dentry *dentry)
+ 		}
+ 	}
+ 	/* if dentry was never visible to RCU, immediate free is OK */
+-	if (!(dentry->d_flags & DCACHE_RCUACCESS))
++	if (dentry->d_flags & DCACHE_NORCU)
+ 		__d_free(&dentry->d_u.d_rcu);
+ 	else
+ 		call_rcu(&dentry->d_u.d_rcu, __d_free);
+@@ -1720,7 +1720,6 @@ struct dentry *d_alloc(struct dentry * parent, const struct qstr *name)
+ 	struct dentry *dentry = __d_alloc(parent->d_sb, name);
+ 	if (!dentry)
+ 		return NULL;
+-	dentry->d_flags |= DCACHE_RCUACCESS;
+ 	spin_lock(&parent->d_lock);
+ 	/*
+ 	 * don't need child lock because it is not subject
+@@ -1745,7 +1744,7 @@ struct dentry *d_alloc_cursor(struct dentry * parent)
+ {
+ 	struct dentry *dentry = d_alloc_anon(parent->d_sb);
+ 	if (dentry) {
+-		dentry->d_flags |= DCACHE_RCUACCESS | DCACHE_DENTRY_CURSOR;
++		dentry->d_flags |= DCACHE_DENTRY_CURSOR;
+ 		dentry->d_parent = dget(parent);
+ 	}
+ 	return dentry;
+@@ -1758,10 +1757,17 @@ struct dentry *d_alloc_cursor(struct dentry * parent)
+  *
+  * For a filesystem that just pins its dentries in memory and never
+  * performs lookups at all, return an unhashed IS_ROOT dentry.
++ * This is used for pipes, sockets et.al. - the stuff that should
++ * never be anyone's children or parents.  Unlike all other
++ * dentries, these will not have RCU delay between dropping the
++ * last reference and freeing them.
+  */
+ struct dentry *d_alloc_pseudo(struct super_block *sb, const struct qstr *name)
+ {
+-	return __d_alloc(sb, name);
++	struct dentry *dentry = __d_alloc(sb, name);
++	if (likely(dentry))
++		dentry->d_flags |= DCACHE_NORCU;
++	return dentry;
+ }
+ EXPORT_SYMBOL(d_alloc_pseudo);
+ 
+@@ -1957,12 +1963,10 @@ struct dentry *d_make_root(struct inode *root_inode)
+ 
+ 	if (root_inode) {
+ 		res = d_alloc_anon(root_inode->i_sb);
+-		if (res) {
+-			res->d_flags |= DCACHE_RCUACCESS;
++		if (res)
+ 			d_instantiate(res, root_inode);
+-		} else {
++		else
+ 			iput(root_inode);
+-		}
+ 	}
+ 	return res;
+ }
+@@ -2854,9 +2858,7 @@ static void __d_move(struct dentry *dentry, struct dentry *target,
+ 		copy_name(dentry, target);
+ 		target->d_hash.pprev = NULL;
+ 		dentry->d_parent->d_lockref.count++;
+-		if (dentry == old_parent)
+-			dentry->d_flags |= DCACHE_RCUACCESS;
+-		else
++		if (dentry != old_parent) /* wasn't IS_ROOT */
+ 			WARN_ON(!--old_parent->d_lockref.count);
+ 	} else {
+ 		target->d_parent = old_parent;
+diff --git a/fs/nsfs.c b/fs/nsfs.c
+index 93b6d0b8748d..138ee770f2f8 100644
+--- a/fs/nsfs.c
++++ b/fs/nsfs.c
+@@ -85,13 +85,12 @@ static void *__ns_get_path(struct path *path, struct ns_common *ns)
+ 	inode->i_fop = &ns_file_operations;
+ 	inode->i_private = ns;
+ 
+-	dentry = d_alloc_pseudo(mnt->mnt_sb, &empty_name);
++	dentry = d_alloc_anon(mnt->mnt_sb);
+ 	if (!dentry) {
+ 		iput(inode);
+ 		return ERR_PTR(-ENOMEM);
+ 	}
+ 	d_instantiate(dentry, inode);
+-	dentry->d_flags |= DCACHE_RCUACCESS;
+ 	dentry->d_fsdata = (void *)ns->ops;
+ 	d = atomic_long_cmpxchg(&ns->stashed, 0, (unsigned long)dentry);
+ 	if (d) {
+diff --git a/include/linux/dcache.h b/include/linux/dcache.h
+index d04a87ab392e..1846fc4ddc5e 100644
+--- a/include/linux/dcache.h
++++ b/include/linux/dcache.h
+@@ -187,7 +187,6 @@ struct dentry_operations {
+       * typically using d_splice_alias. */
+ 
+ #define DCACHE_REFERENCED		0x00000040 /* Recently used, don't discard. */
+-#define DCACHE_RCUACCESS		0x00000080 /* Entry has ever been RCU-visible */
+ 
+ #define DCACHE_DONTCACHE		0x00000080 /* Purge from memory on final dput() */
+ 
+@@ -230,6 +229,7 @@ struct dentry_operations {
+ 
+ #define DCACHE_PAR_LOOKUP		0x10000000 /* being looked up (with parent locked shared) */
+ #define DCACHE_DENTRY_CURSOR		0x20000000
++#define DCACHE_NORCU			0x40000000 /* No RCU delay for freeing */
+ 
+ extern seqlock_t rename_lock;
+ 
