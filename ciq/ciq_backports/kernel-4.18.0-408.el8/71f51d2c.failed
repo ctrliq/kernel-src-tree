@@ -1,0 +1,189 @@
+KVM: x86/mmu: Add detailed page size stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mingwei Zhang <mizhang@google.com>
+commit 71f51d2c3253645ccff69d6fa3a870f47005f0b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/71f51d2c.failed
+
+Existing KVM code tracks the number of large pages regardless of their
+sizes. Therefore, when large page of 1GB (or larger) is adopted, the
+information becomes less useful because lpages counts a mix of 1G and 2M
+pages.
+
+So remove the lpages since it is easy for user space to aggregate the info.
+Instead, provide a comprehensive page stats of all sizes from 4K to 512G.
+
+	Suggested-by: Ben Gardon <bgardon@google.com>
+
+	Reviewed-by: David Matlack <dmatlack@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Mingwei Zhang <mizhang@google.com>
+	Cc: Jing Zhang <jingzhangos@google.com>
+	Cc: David Matlack <dmatlack@google.com>
+	Cc: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210803044607.599629-4-mizhang@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 71f51d2c3253645ccff69d6fa3a870f47005f0b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu.h
+index c9adcc66bdd5,e9688a9f7b57..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -229,4 -230,39 +229,42 @@@ int kvm_arch_write_log_dirty(struct kvm
+  int kvm_mmu_post_init_vm(struct kvm *kvm);
+  void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read memslot_have_rmaps before rmap pointers.  Hence, threads reading
++ 	 * memslots_have_rmaps in any lock context are guaranteed to see the
++ 	 * pointers.  Pairs with smp_store_release in alloc_all_memslots_rmaps.
++ 	 */
++ 	return smp_load_acquire(&kvm->arch.memslots_have_rmaps);
++ }
++ 
++ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
++ {
++ 	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
++ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
++ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
++ }
++ 
++ static inline unsigned long
++ __kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, unsigned long npages,
++ 		      int level)
++ {
++ 	return gfn_to_index(slot->base_gfn + npages - 1,
++ 			    slot->base_gfn, level) + 1;
++ }
++ 
++ static inline unsigned long
++ kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, int level)
++ {
++ 	return __kvm_mmu_slot_lpages(slot, slot->npages, level);
++ }
++ 
++ static inline void kvm_update_page_stats(struct kvm *kvm, int level, int count)
++ {
++ 	atomic64_add(count, &kvm->stat.pages[level - 1]);
++ }
+++>>>>>>> 71f51d2c3253 (KVM: x86/mmu: Add detailed page size stats)
+  #endif
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4c612c0dc324,54cb15e4b550..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1413,14 -1451,14 +1416,14 @@@ static bool rmap_write_protect(struct k
+  }
+  
+  static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ -			  const struct kvm_memory_slot *slot)
+ +			  struct kvm_memory_slot *slot)
+  {
+- 	return pte_list_destroy(rmap_head);
++ 	return pte_list_destroy(kvm, rmap_head);
+  }
+  
+ -static bool kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ -			    struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ -			    pte_t unused)
+ +static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ +			   struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ +			   unsigned long data)
+  {
+  	return kvm_zap_rmapp(kvm, rmap_head, slot);
+  }
+@@@ -1446,8 -1483,8 +1449,13 @@@ restart
+  
+  		need_flush = 1;
+  
+++<<<<<<< HEAD
+ +		if (pte_write(*ptep)) {
+ +			pte_list_remove(rmap_head, sptep);
+++=======
++ 		if (pte_write(pte)) {
++ 			pte_list_remove(kvm, rmap_head, sptep);
+++>>>>>>> 71f51d2c3253 (KVM: x86/mmu: Add detailed page size stats)
+  			goto restart;
+  		} else {
+  			new_spte = kvm_mmu_changed_pte_notifier_make_spte(
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c108053d930b..ded8bb655395 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1222,7 +1222,14 @@ struct kvm_vm_stat {
+ 	u64 mmu_recycled;
+ 	u64 mmu_cache_miss;
+ 	u64 mmu_unsync;
+-	u64 lpages;
++	union {
++		struct {
++			atomic64_t pages_4k;
++			atomic64_t pages_2m;
++			atomic64_t pages_1g;
++		};
++		atomic64_t pages[KVM_NR_PAGE_SIZES];
++	};
+ 	u64 nx_lpage_splits;
+ 	u64 max_mmu_page_hash_collisions;
+ 	u64 max_mmu_rmap_size;
+* Unmerged path arch/x86/kvm/mmu.h
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 506d3bdb9486..eb99112e83b6 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -397,7 +397,6 @@ static void __handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 	bool was_leaf = was_present && is_last_spte(old_spte, level);
+ 	bool is_leaf = is_present && is_last_spte(new_spte, level);
+ 	bool pfn_changed = spte_to_pfn(old_spte) != spte_to_pfn(new_spte);
+-	bool was_large, is_large;
+ 
+ 	WARN_ON(level > PT64_ROOT_MAX_LEVEL);
+ 	WARN_ON(level < PG_LEVEL_4K);
+@@ -456,18 +455,8 @@ static void __handle_changed_spte(struct kvm *kvm, int as_id, gfn_t gfn,
+ 		return;
+ 	}
+ 
+-	/*
+-	 * Update large page stats if a large page is being zapped, created, or
+-	 * is replacing an existing shadow page.
+-	 */
+-	was_large = was_leaf && is_large_pte(old_spte);
+-	is_large = is_leaf && is_large_pte(new_spte);
+-	if (was_large != is_large) {
+-		if (was_large)
+-			atomic64_sub(1, (atomic64_t *)&kvm->stat.lpages);
+-		else
+-			atomic64_add(1, (atomic64_t *)&kvm->stat.lpages);
+-	}
++	if (is_leaf != was_leaf)
++		kvm_update_page_stats(kvm, level, is_leaf ? 1 : -1);
+ 
+ 	if (was_leaf && is_dirty_spte(old_spte) &&
+ 	    (!is_present || !is_dirty_spte(new_spte) || pfn_changed))
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8637d2d61d5e..534e078542b1 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -236,7 +236,9 @@ const struct _kvm_stats_desc kvm_vm_stats_desc[] = {
+ 	STATS_DESC_COUNTER(VM, mmu_recycled),
+ 	STATS_DESC_COUNTER(VM, mmu_cache_miss),
+ 	STATS_DESC_ICOUNTER(VM, mmu_unsync),
+-	STATS_DESC_ICOUNTER(VM, lpages),
++	STATS_DESC_ICOUNTER(VM, pages_4k),
++	STATS_DESC_ICOUNTER(VM, pages_2m),
++	STATS_DESC_ICOUNTER(VM, pages_1g),
+ 	STATS_DESC_ICOUNTER(VM, nx_lpage_splits),
+ 	STATS_DESC_PCOUNTER(VM, max_mmu_rmap_size),
+ 	STATS_DESC_PCOUNTER(VM, max_mmu_page_hash_collisions)
