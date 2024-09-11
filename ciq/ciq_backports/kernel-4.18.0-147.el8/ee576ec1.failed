@@ -1,0 +1,246 @@
+net/mlx5e: Fix compilation warning in en_tc.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Saeed Mahameed <saeedm@mellanox.com>
+commit ee576ec1c1c66ec1cd0c4735bb12bc08f675f530
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ee576ec1.failed
+
+Amazingly a mlx5e_tc function is being called from the eswitch layer,
+which is by itself very terrible! The function was declared locally in
+eswitch_offloads.c so it could be used there, which caused the following
+compilation warning, fix that.
+
+drivers/.../mlx5/core/en_tc.c:3242:6: [-Werror=missing-prototypes]
+error: no previous prototype for ‘mlx5e_tc_clean_fdb_peer_flows’
+
+Fixes: 04de7dda7394 ("net/mlx5e: Infrastructure for duplicated offloading of TC flows")
+	Reviewed-by: Roi Dayan <roid@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit ee576ec1c1c66ec1cd0c4735bb12bc08f675f530)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index ea6bca2dae6d,e0ba59b5296f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -342,6 -384,56 +342,59 @@@ bool mlx5_esw_lag_prereq(struct mlx5_co
+  
+  #define esw_debug(dev, format, ...)				\
+  	mlx5_core_dbg_mask(dev, MLX5_DEBUG_ESWITCH_MASK, format, ##__VA_ARGS__)
+++<<<<<<< HEAD
+++=======
++ 
++ /* The returned number is valid only when the dev is eswitch manager. */
++ static inline u16 mlx5_eswitch_manager_vport(struct mlx5_core_dev *dev)
++ {
++ 	return mlx5_core_is_ecpf_esw_manager(dev) ?
++ 		MLX5_VPORT_ECPF : MLX5_VPORT_PF;
++ }
++ 
++ static inline int mlx5_eswitch_uplink_idx(struct mlx5_eswitch *esw)
++ {
++ 	/* Uplink always locate at the last element of the array.*/
++ 	return esw->total_vports - 1;
++ }
++ 
++ static inline int mlx5_eswitch_ecpf_idx(struct mlx5_eswitch *esw)
++ {
++ 	return esw->total_vports - 2;
++ }
++ 
++ static inline int mlx5_eswitch_vport_num_to_index(struct mlx5_eswitch *esw,
++ 						  u16 vport_num)
++ {
++ 	if (vport_num == MLX5_VPORT_ECPF) {
++ 		if (!mlx5_ecpf_vport_exists(esw->dev))
++ 			esw_warn(esw->dev, "ECPF vport doesn't exist!\n");
++ 		return mlx5_eswitch_ecpf_idx(esw);
++ 	}
++ 
++ 	if (vport_num == MLX5_VPORT_UPLINK)
++ 		return mlx5_eswitch_uplink_idx(esw);
++ 
++ 	return vport_num;
++ }
++ 
++ static inline int mlx5_eswitch_index_to_vport_num(struct mlx5_eswitch *esw,
++ 						  int index)
++ {
++ 	if (index == mlx5_eswitch_ecpf_idx(esw) &&
++ 	    mlx5_ecpf_vport_exists(esw->dev))
++ 		return MLX5_VPORT_ECPF;
++ 
++ 	if (index == mlx5_eswitch_uplink_idx(esw))
++ 		return MLX5_VPORT_UPLINK;
++ 
++ 	return index;
++ }
++ 
++ /* TODO: This mlx5e_tc function shouldn't be called by eswitch */
++ void mlx5e_tc_clean_fdb_peer_flows(struct mlx5_eswitch *esw);
++ 
+++>>>>>>> ee576ec1c1c6 (net/mlx5e: Fix compilation warning in en_tc.c)
+  #else  /* CONFIG_MLX5_ESWITCH */
+  /* eswitch API stubs */
+  static inline int  mlx5_eswitch_init(struct mlx5_core_dev *dev) { return 0; }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index b4200165ccae,6c72f33f6d09..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1160,7 -1468,144 +1160,148 @@@ err_reps
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +int esw_offloads_init(struct mlx5_eswitch *esw, int nvports)
+++=======
++ static int __load_reps_all_vport(struct mlx5_eswitch *esw, int nvports,
++ 				 u8 rep_type)
++ {
++ 	int err;
++ 
++ 	/* Special vports must be loaded first. */
++ 	err = __load_reps_special_vport(esw, rep_type);
++ 	if (err)
++ 		return err;
++ 
++ 	err = __load_reps_vf_vport(esw, nvports, rep_type);
++ 	if (err)
++ 		goto err_vfs;
++ 
++ 	return 0;
++ 
++ err_vfs:
++ 	__unload_reps_special_vport(esw, rep_type);
++ 	return err;
++ }
++ 
++ static int esw_offloads_load_all_reps(struct mlx5_eswitch *esw, int nvports)
++ {
++ 	u8 rep_type = 0;
++ 	int err;
++ 
++ 	for (rep_type = 0; rep_type < NUM_REP_TYPES; rep_type++) {
++ 		err = __load_reps_all_vport(esw, nvports, rep_type);
++ 		if (err)
++ 			goto err_reps;
++ 	}
++ 
++ 	return err;
++ 
++ err_reps:
++ 	while (rep_type-- > 0)
++ 		__unload_reps_all_vport(esw, nvports, rep_type);
++ 	return err;
++ }
++ 
++ #define ESW_OFFLOADS_DEVCOM_PAIR	(0)
++ #define ESW_OFFLOADS_DEVCOM_UNPAIR	(1)
++ 
++ static int mlx5_esw_offloads_pair(struct mlx5_eswitch *esw,
++ 				  struct mlx5_eswitch *peer_esw)
++ {
++ 	int err;
++ 
++ 	err = esw_add_fdb_peer_miss_rules(esw, peer_esw->dev);
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static void mlx5_esw_offloads_unpair(struct mlx5_eswitch *esw)
++ {
++ 	mlx5e_tc_clean_fdb_peer_flows(esw);
++ 	esw_del_fdb_peer_miss_rules(esw);
++ }
++ 
++ static int mlx5_esw_offloads_devcom_event(int event,
++ 					  void *my_data,
++ 					  void *event_data)
++ {
++ 	struct mlx5_eswitch *esw = my_data;
++ 	struct mlx5_eswitch *peer_esw = event_data;
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 	int err;
++ 
++ 	switch (event) {
++ 	case ESW_OFFLOADS_DEVCOM_PAIR:
++ 		err = mlx5_esw_offloads_pair(esw, peer_esw);
++ 		if (err)
++ 			goto err_out;
++ 
++ 		err = mlx5_esw_offloads_pair(peer_esw, esw);
++ 		if (err)
++ 			goto err_pair;
++ 
++ 		mlx5_devcom_set_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS, true);
++ 		break;
++ 
++ 	case ESW_OFFLOADS_DEVCOM_UNPAIR:
++ 		if (!mlx5_devcom_is_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS))
++ 			break;
++ 
++ 		mlx5_devcom_set_paired(devcom, MLX5_DEVCOM_ESW_OFFLOADS, false);
++ 		mlx5_esw_offloads_unpair(peer_esw);
++ 		mlx5_esw_offloads_unpair(esw);
++ 		break;
++ 	}
++ 
++ 	return 0;
++ 
++ err_pair:
++ 	mlx5_esw_offloads_unpair(esw);
++ 
++ err_out:
++ 	mlx5_core_err(esw->dev, "esw offloads devcom event failure, event %u err %d",
++ 		      event, err);
++ 	return err;
++ }
++ 
++ static void esw_offloads_devcom_init(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 
++ 	INIT_LIST_HEAD(&esw->offloads.peer_flows);
++ 	mutex_init(&esw->offloads.peer_mutex);
++ 
++ 	if (!MLX5_CAP_ESW(esw->dev, merged_eswitch))
++ 		return;
++ 
++ 	mlx5_devcom_register_component(devcom,
++ 				       MLX5_DEVCOM_ESW_OFFLOADS,
++ 				       mlx5_esw_offloads_devcom_event,
++ 				       esw);
++ 
++ 	mlx5_devcom_send_event(devcom,
++ 			       MLX5_DEVCOM_ESW_OFFLOADS,
++ 			       ESW_OFFLOADS_DEVCOM_PAIR, esw);
++ }
++ 
++ static void esw_offloads_devcom_cleanup(struct mlx5_eswitch *esw)
++ {
++ 	struct mlx5_devcom *devcom = esw->dev->priv.devcom;
++ 
++ 	if (!MLX5_CAP_ESW(esw->dev, merged_eswitch))
++ 		return;
++ 
++ 	mlx5_devcom_send_event(devcom, MLX5_DEVCOM_ESW_OFFLOADS,
++ 			       ESW_OFFLOADS_DEVCOM_UNPAIR, esw);
++ 
++ 	mlx5_devcom_unregister_component(devcom, MLX5_DEVCOM_ESW_OFFLOADS);
++ }
++ 
++ static int esw_offloads_steering_init(struct mlx5_eswitch *esw, int nvports)
+++>>>>>>> ee576ec1c1c6 (net/mlx5e: Fix compilation warning in en_tc.c)
+  {
+  	int err;
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
