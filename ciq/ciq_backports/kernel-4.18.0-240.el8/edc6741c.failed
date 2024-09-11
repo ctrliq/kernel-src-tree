@@ -1,0 +1,163 @@
+bpf: Add sockmap hooks for UDP sockets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Lorenz Bauer <lmb@cloudflare.com>
+commit edc6741cc66059532ba621928e3f1b02a53a2f39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/edc6741c.failed
+
+Add basic psock hooks for UDP sockets. This allows adding and
+removing sockets, as well as automatic removal on unhash and close.
+
+	Signed-off-by: Lorenz Bauer <lmb@cloudflare.com>
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20200309111243.6982-8-lmb@cloudflare.com
+(cherry picked from commit edc6741cc66059532ba621928e3f1b02a53a2f39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/udp.h
+diff --cc include/net/udp.h
+index b2402c6e63b9,a8fa6c0c6ded..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -450,4 -464,48 +450,51 @@@ DECLARE_STATIC_KEY_FALSE(udpv6_encap_ne
+  void udpv6_encap_enable(void);
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static inline struct sk_buff *udp_rcv_segment(struct sock *sk,
++ 					      struct sk_buff *skb, bool ipv4)
++ {
++ 	netdev_features_t features = NETIF_F_SG;
++ 	struct sk_buff *segs;
++ 
++ 	/* Avoid csum recalculation by skb_segment unless userspace explicitly
++ 	 * asks for the final checksum values
++ 	 */
++ 	if (!inet_get_convert_csum(sk))
++ 		features |= NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM;
++ 
++ 	/* UDP segmentation expects packets of type CHECKSUM_PARTIAL or
++ 	 * CHECKSUM_NONE in __udp_gso_segment. UDP GRO indeed builds partial
++ 	 * packets in udp_gro_complete_segment. As does UDP GSO, verified by
++ 	 * udp_send_skb. But when those packets are looped in dev_loopback_xmit
++ 	 * their ip_summed is set to CHECKSUM_UNNECESSARY. Reset in this
++ 	 * specific case, where PARTIAL is both correct and required.
++ 	 */
++ 	if (skb->pkt_type == PACKET_LOOPBACK)
++ 		skb->ip_summed = CHECKSUM_PARTIAL;
++ 
++ 	/* the GSO CB lays after the UDP one, no need to save and restore any
++ 	 * CB fragment
++ 	 */
++ 	segs = __skb_gso_segment(skb, features, false);
++ 	if (IS_ERR_OR_NULL(segs)) {
++ 		int segs_nr = skb_shinfo(skb)->gso_segs;
++ 
++ 		atomic_add(segs_nr, &sk->sk_drops);
++ 		SNMP_ADD_STATS(__UDPX_MIB(sk, ipv4), UDP_MIB_INERRORS, segs_nr);
++ 		kfree_skb(skb);
++ 		return NULL;
++ 	}
++ 
++ 	consume_skb(skb);
++ 	return segs;
++ }
++ 
++ #ifdef CONFIG_BPF_STREAM_PARSER
++ struct sk_psock;
++ struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
++ #endif /* BPF_STREAM_PARSER */
++ 
+++>>>>>>> edc6741cc660 (bpf: Add sockmap hooks for UDP sockets)
+  #endif	/* _UDP_H */
+diff --git a/MAINTAINERS b/MAINTAINERS
+index 0470e68e4a05..707f1ca2055d 100644
+--- a/MAINTAINERS
++++ b/MAINTAINERS
+@@ -8112,6 +8112,7 @@ F:	include/linux/skmsg.h
+ F:	net/core/skmsg.c
+ F:	net/core/sock_map.c
+ F:	net/ipv4/tcp_bpf.c
++F:	net/ipv4/udp_bpf.c
+ 
+ LANTIQ MIPS ARCHITECTURE
+ M:	John Crispin <john@phrozen.org>
+* Unmerged path include/net/udp.h
+diff --git a/net/ipv4/Makefile b/net/ipv4/Makefile
+index c754b84dbd9d..79b57a230f5a 100644
+--- a/net/ipv4/Makefile
++++ b/net/ipv4/Makefile
+@@ -64,6 +64,7 @@ obj-$(CONFIG_TCP_CONG_LP) += tcp_lp.o
+ obj-$(CONFIG_TCP_CONG_YEAH) += tcp_yeah.o
+ obj-$(CONFIG_TCP_CONG_ILLINOIS) += tcp_illinois.o
+ obj-$(CONFIG_NET_SOCK_MSG) += tcp_bpf.o
++obj-$(CONFIG_BPF_STREAM_PARSER) += udp_bpf.o
+ obj-$(CONFIG_NETLABEL) += cipso_ipv4.o
+ 
+ obj-$(CONFIG_XFRM) += xfrm4_policy.o xfrm4_state.o xfrm4_input.o \
+diff --git a/net/ipv4/udp_bpf.c b/net/ipv4/udp_bpf.c
+new file mode 100644
+index 000000000000..eddd973e6575
+--- /dev/null
++++ b/net/ipv4/udp_bpf.c
+@@ -0,0 +1,53 @@
++// SPDX-License-Identifier: GPL-2.0
++/* Copyright (c) 2020 Cloudflare Ltd https://cloudflare.com */
++
++#include <linux/skmsg.h>
++#include <net/sock.h>
++#include <net/udp.h>
++
++enum {
++	UDP_BPF_IPV4,
++	UDP_BPF_IPV6,
++	UDP_BPF_NUM_PROTS,
++};
++
++static struct proto *udpv6_prot_saved __read_mostly;
++static DEFINE_SPINLOCK(udpv6_prot_lock);
++static struct proto udp_bpf_prots[UDP_BPF_NUM_PROTS];
++
++static void udp_bpf_rebuild_protos(struct proto *prot, const struct proto *base)
++{
++	*prot        = *base;
++	prot->unhash = sock_map_unhash;
++	prot->close  = sock_map_close;
++}
++
++static void udp_bpf_check_v6_needs_rebuild(struct sock *sk, struct proto *ops)
++{
++	if (sk->sk_family == AF_INET6 &&
++	    unlikely(ops != smp_load_acquire(&udpv6_prot_saved))) {
++		spin_lock_bh(&udpv6_prot_lock);
++		if (likely(ops != udpv6_prot_saved)) {
++			udp_bpf_rebuild_protos(&udp_bpf_prots[UDP_BPF_IPV6], ops);
++			smp_store_release(&udpv6_prot_saved, ops);
++		}
++		spin_unlock_bh(&udpv6_prot_lock);
++	}
++}
++
++static int __init udp_bpf_v4_build_proto(void)
++{
++	udp_bpf_rebuild_protos(&udp_bpf_prots[UDP_BPF_IPV4], &udp_prot);
++	return 0;
++}
++core_initcall(udp_bpf_v4_build_proto);
++
++struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock)
++{
++	int family = sk->sk_family == AF_INET ? UDP_BPF_IPV4 : UDP_BPF_IPV6;
++
++	if (!psock->sk_proto)
++		udp_bpf_check_v6_needs_rebuild(sk, READ_ONCE(sk->sk_prot));
++
++	return &udp_bpf_prots[family];
++}
