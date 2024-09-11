@@ -42,19 +42,13 @@ struct ath10k_snoc_ce_irq {
 	u32 irq_line;
 };
 
-struct ath10k_clk_info {
-	struct clk *handle;
-	const char *name;
-	u32 freq;
-	bool required;
-};
-
 enum ath10k_snoc_flags {
 	ATH10K_SNOC_FLAG_REGISTERED,
 	ATH10K_SNOC_FLAG_UNREGISTERING,
 	ATH10K_SNOC_FLAG_RECOVERY,
 };
 
+struct clk_bulk_data;
 struct regulator_bulk_data;
 
 struct ath10k_snoc {
@@ -70,7 +64,8 @@ struct ath10k_snoc {
 	struct timer_list rx_post_retry;
 	struct regulator_bulk_data *vregs;
 	size_t num_vregs;
-	struct ath10k_clk_info *clk;
+	struct clk_bulk_data *clks;
+	size_t num_clks;
 	struct ath10k_qmi *qmi;
 	unsigned long flags;
 };
