@@ -1,0 +1,710 @@
+tc-testing: Restore original behaviour for namespaces in tdc
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Lucas Bates <lucasb@mojatatu.com>
+commit 489ce2f42514b4324e5c63e93ae7570cab995254
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/489ce2f4.failed
+
+This patch restores the original behaviour for tdc prior to the
+introduction of the plugin system, where the network namespace
+functionality was split from the main script.
+
+It introduces the concept of required plugins for testcases,
+and will automatically load any plugin that isn't already
+enabled when said plugin is required by even one testcase.
+
+Additionally, the -n option for the nsPlugin is deprecated
+so the default action is to make use of the namespaces.
+Instead, we introduce -N to not use them, but still create
+the veth pair.
+
+buildebpfPlugin's -B option is also deprecated.
+
+If a test cases requires the features of a specific plugin
+in order to pass, it should instead include a new key/value
+pair describing plugin interactions:
+
+        "plugins": {
+                "requires": "buildebpfPlugin"
+        },
+
+A test case can have more than one required plugin: a list
+can be inserted as the value for 'requires'.
+
+	Signed-off-by: Lucas Bates <lucasb@mojatatu.com>
+	Acked-by: Davide Caratti <dcaratti@redhat.com>
+	Tested-by: Nicolas Dichtel <nicolas.dichtel@6wind.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 489ce2f42514b4324e5c63e93ae7570cab995254)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/tc-testing/tc-tests/filters/tests.json
+diff --cc tools/testing/selftests/tc-testing/tc-tests/filters/tests.json
+index 39de2934ffe5,8135778040c2..000000000000
+--- a/tools/testing/selftests/tc-testing/tc-tests/filters/tests.json
++++ b/tools/testing/selftests/tc-testing/tc-tests/filters/tests.json
+@@@ -77,5 -67,28 +86,31 @@@
+              "$TC qdisc del dev $DEV2 ingress",
+              "/bin/rm $BATCH_FILE"
+          ]
+++<<<<<<< HEAD
+++=======
++     },
++     {
++         "id": "4cbd",
++         "name": "Try to add filter with duplicate key",
++         "category": [
++             "filter",
++             "flower"
++         ],
++         "plugins": {
++                 "requires": "nsPlugin"
++         },
++         "setup": [
++             "$TC qdisc add dev $DEV2 ingress",
++             "$TC filter add dev $DEV2 protocol ip prio 1 parent ffff: flower dst_mac e4:11:22:11:4a:51 src_mac e4:11:22:11:4a:50 ip_proto tcp src_ip 1.1.1.1 dst_ip 2.2.2.2 action drop"
++         ],
++         "cmdUnderTest": "$TC filter add dev $DEV2 protocol ip prio 1 parent ffff: flower dst_mac e4:11:22:11:4a:51 src_mac e4:11:22:11:4a:50 ip_proto tcp src_ip 1.1.1.1 dst_ip 2.2.2.2 action drop",
++         "expExitCode": "2",
++         "verifyCmd": "$TC -s filter show dev $DEV2 ingress",
++         "matchPattern": "filter protocol ip pref 1 flower chain 0 handle",
++         "matchCount": "1",
++         "teardown": [
++             "$TC qdisc del dev $DEV2 ingress"
++         ]
+++>>>>>>> 489ce2f42514 (tc-testing: Restore original behaviour for namespaces in tdc)
+      }
+  ]
+diff --git a/tools/testing/selftests/tc-testing/README b/tools/testing/selftests/tc-testing/README
+index f9281e8aa313..22e5da9008fd 100644
+--- a/tools/testing/selftests/tc-testing/README
++++ b/tools/testing/selftests/tc-testing/README
+@@ -12,10 +12,10 @@ REQUIREMENTS
+ *  Minimum Python version of 3.4. Earlier 3.X versions may work but are not
+    guaranteed.
+ 
+-*  The kernel must have network namespace support
++*  The kernel must have network namespace support if using nsPlugin
+ 
+ *  The kernel must have veth support available, as a veth pair is created
+-   prior to running the tests.
++   prior to running the tests when using nsPlugin.
+ 
+ *  The kernel must have the appropriate infrastructure enabled to run all tdc
+    unit tests. See the config file in this directory for minimum required
+@@ -53,8 +53,12 @@ commands being tested must be run as root.  The code that enforces
+ execution by root uid has been moved into a plugin (see PLUGIN
+ ARCHITECTURE, below).
+ 
+-If nsPlugin is linked, all tests are executed inside a network
+-namespace to prevent conflicts within the host.
++Tests that use a network device should have nsPlugin.py listed as a
++requirement for that test. nsPlugin executes all commands within a
++network namespace and creates a veth pair which may be used in those test
++cases. To disable execution within the namespace, pass the -N option
++to tdc when starting a test run; the veth pair will still be created
++by the plugin.
+ 
+ Running tdc without any arguments will run all tests. Refer to the section
+ on command line arguments for more information, or run:
+@@ -154,8 +158,8 @@ action:
+ netns:
+   options for nsPlugin (run commands in net namespace)
+ 
+-  -n, --namespace
+-                        Run commands in namespace as specified in tdc_config.py
++  -N, --no-namespace
++                        Do not run commands in a network namespace.
+ 
+ valgrind:
+   options for valgrindPlugin (run command under test under Valgrind)
+@@ -171,7 +175,8 @@ was in the tdc.py script has been moved into the plugins.
+ 
+ The plugins are in the directory plugin-lib.  The are executed from
+ directory plugins.  Put symbolic links from plugins to plugin-lib,
+-and name them according to the order you want them to run.
++and name them according to the order you want them to run. This is not
++necessary if a test case being run requires a specific plugin to work.
+ 
+ Example:
+ 
+@@ -223,7 +228,8 @@ directory:
+   - rootPlugin.py:
+       implements the enforcement of running as root
+   - nsPlugin.py:
+-      sets up a network namespace and runs all commands in that namespace
++      sets up a network namespace and runs all commands in that namespace,
++      while also setting up dummy devices to be used in testing.
+   - valgrindPlugin.py
+       runs each command in the execute stage under valgrind,
+       and checks for leaks.
+diff --git a/tools/testing/selftests/tc-testing/plugin-lib/buildebpfPlugin.py b/tools/testing/selftests/tc-testing/plugin-lib/buildebpfPlugin.py
+index 9f0ba10c44b4..e98c36750fae 100644
+--- a/tools/testing/selftests/tc-testing/plugin-lib/buildebpfPlugin.py
++++ b/tools/testing/selftests/tc-testing/plugin-lib/buildebpfPlugin.py
+@@ -34,8 +34,9 @@ class SubPlugin(TdcPlugin):
+             'buildebpf',
+             'options for buildebpfPlugin')
+         self.argparser_group.add_argument(
+-            '-B', '--buildebpf', action='store_true',
+-            help='build eBPF programs')
++            '--nobuildebpf', action='store_false', default=True,
++            dest='buildebpf',
++            help='Don\'t build eBPF programs')
+ 
+         return self.argparser
+ 
+diff --git a/tools/testing/selftests/tc-testing/plugin-lib/nsPlugin.py b/tools/testing/selftests/tc-testing/plugin-lib/nsPlugin.py
+index a194b1af2b30..affa7f2d9670 100644
+--- a/tools/testing/selftests/tc-testing/plugin-lib/nsPlugin.py
++++ b/tools/testing/selftests/tc-testing/plugin-lib/nsPlugin.py
+@@ -18,6 +18,8 @@ class SubPlugin(TdcPlugin):
+ 
+         if self.args.namespace:
+             self._ns_create()
++        else:
++            self._ports_create()
+ 
+     def post_suite(self, index):
+         '''run commands after test_runner goes into a test loop'''
+@@ -27,6 +29,8 @@ class SubPlugin(TdcPlugin):
+ 
+         if self.args.namespace:
+             self._ns_destroy()
++        else:
++            self._ports_destroy()
+ 
+     def add_args(self, parser):
+         super().add_args(parser)
+@@ -34,8 +38,8 @@ class SubPlugin(TdcPlugin):
+             'netns',
+             'options for nsPlugin(run commands in net namespace)')
+         self.argparser_group.add_argument(
+-            '-n', '--namespace', action='store_true',
+-            help='Run commands in namespace')
++            '-N', '--no-namespace', action='store_false', default=True,
++            dest='namespace', help='Don\'t run commands in namespace')
+         return self.argparser
+ 
+     def adjust_command(self, stage, command):
+@@ -73,20 +77,30 @@ class SubPlugin(TdcPlugin):
+             print('adjust_command:  return command [{}]'.format(command))
+         return command
+ 
++    def _ports_create(self):
++        cmd = 'ip link add $DEV0 type veth peer name $DEV1'
++        self._exec_cmd('pre', cmd)
++        cmd = 'ip link set $DEV0 up'
++        self._exec_cmd('pre', cmd)
++        if not self.args.namespace:
++            cmd = 'ip link set $DEV1 up'
++            self._exec_cmd('pre', cmd)
++
++    def _ports_destroy(self):
++        cmd = 'ip link del $DEV0'
++        self._exec_cmd('post', cmd)
++
+     def _ns_create(self):
+         '''
+         Create the network namespace in which the tests will be run and set up
+         the required network devices for it.
+         '''
++        self._ports_create()
+         if self.args.namespace:
+             cmd = 'ip netns add {}'.format(self.args.NAMES['NS'])
+             self._exec_cmd('pre', cmd)
+-            cmd = 'ip link add $DEV0 type veth peer name $DEV1'
+-            self._exec_cmd('pre', cmd)
+             cmd = 'ip link set $DEV1 netns {}'.format(self.args.NAMES['NS'])
+             self._exec_cmd('pre', cmd)
+-            cmd = 'ip link set $DEV0 up'
+-            self._exec_cmd('pre', cmd)
+             cmd = 'ip -n {} link set $DEV1 up'.format(self.args.NAMES['NS'])
+             self._exec_cmd('pre', cmd)
+             if self.args.device:
+diff --git a/tools/testing/selftests/tc-testing/tc-tests/actions/bpf.json b/tools/testing/selftests/tc-testing/tc-tests/actions/bpf.json
+index b074ea9b6fe8..47a3082b6661 100644
+--- a/tools/testing/selftests/tc-testing/tc-tests/actions/bpf.json
++++ b/tools/testing/selftests/tc-testing/tc-tests/actions/bpf.json
+@@ -54,6 +54,9 @@
+             "actions",
+             "bpf"
+         ],
++        "plugins": {
++                "requires": "buildebpfPlugin"
++        },
+         "setup": [
+             [
+                 "$TC action flush action bpf",
+@@ -78,6 +81,9 @@
+             "actions",
+             "bpf"
+         ],
++        "plugins": {
++                "requires": "buildebpfPlugin"
++        },
+         "setup": [
+             [
+                 "$TC action flush action bpf",
+diff --git a/tools/testing/selftests/tc-testing/tc-tests/filters/fw.json b/tools/testing/selftests/tc-testing/tc-tests/filters/fw.json
+index 6944b90d4897..5272049566d6 100644
+--- a/tools/testing/selftests/tc-testing/tc-tests/filters/fw.json
++++ b/tools/testing/selftests/tc-testing/tc-tests/filters/fw.json
+@@ -6,6 +6,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress"
+         ],
+@@ -25,6 +28,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress"
+         ],
+@@ -44,6 +50,114 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress"
+         ],
+@@ -872,6 +986,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: protocol 802_3 prio 3 handle 7 fw action ok"
+@@ -892,6 +1009,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: prio 6 handle 2 fw action continue index 5"
+@@ -912,6 +1032,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress"
+         ],
+@@ -931,6 +1054,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress"
+         ],
+@@ -950,6 +1076,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 5 prio 7 fw action pass",
+@@ -972,6 +1101,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 5 prio 7 fw action pass",
+@@ -994,6 +1126,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 5 prio 7 fw action pass",
+@@ -1015,6 +1150,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 1 prio 4 fw action ok",
+@@ -1036,6 +1174,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 4 prio 2 chain 13 fw action pipe",
+@@ -1057,6 +1198,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 2 prio 4 fw action drop"
+@@ -1077,6 +1221,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 3 prio 4 fw action continue"
+@@ -1097,6 +1244,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 4 prio 2 protocol arp fw action pipe"
+@@ -1117,6 +1267,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 4 prio 2 fw action pipe flowid 45"
+@@ -1137,6 +1290,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 1 prio 2 fw action ok"
+@@ -1157,6 +1313,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 1 prio 2 fw action ok"
+@@ -1177,6 +1336,9 @@
+             "filter",
+             "fw"
+         ],
++	"plugins": {
++		"requires": "nsPlugin"
++	},
+         "setup": [
+             "$TC qdisc add dev $DEV1 ingress",
+             "$TC filter add dev $DEV1 parent ffff: handle 1 prio 2 fw action ok index 3"
+* Unmerged path tools/testing/selftests/tc-testing/tc-tests/filters/tests.json
+diff --git a/tools/testing/selftests/tc-testing/tdc.py b/tools/testing/selftests/tc-testing/tdc.py
+index 5cee15659e5f..678182a2676d 100755
+--- a/tools/testing/selftests/tc-testing/tdc.py
++++ b/tools/testing/selftests/tc-testing/tdc.py
+@@ -25,6 +25,9 @@ from tdc_helper import *
+ import TdcPlugin
+ from TdcResults import *
+ 
++class PluginDependencyException(Exception):
++    def __init__(self, missing_pg):
++        self.missing_pg = missing_pg
+ 
+ class PluginMgrTestFail(Exception):
+     def __init__(self, stage, output, message):
+@@ -37,7 +40,7 @@ class PluginMgr:
+         super().__init__()
+         self.plugins = {}
+         self.plugin_instances = []
+-        self.args = []
++        self.failed_plugins = {}
+         self.argparser = argparser
+ 
+         # TODO, put plugins in order
+@@ -53,6 +56,64 @@ class PluginMgr:
+                     self.plugins[mn] = foo
+                     self.plugin_instances.append(foo.SubPlugin())
+ 
++    def load_plugin(self, pgdir, pgname):
++        pgname = pgname[0:-3]
++        foo = importlib.import_module('{}.{}'.format(pgdir, pgname))
++        self.plugins[pgname] = foo
++        self.plugin_instances.append(foo.SubPlugin())
++        self.plugin_instances[-1].check_args(self.args, None)
++
++    def get_required_plugins(self, testlist):
++        '''
++        Get all required plugins from the list of test cases and return
++        all unique items.
++        '''
++        reqs = []
++        for t in testlist:
++            try:
++                if 'requires' in t['plugins']:
++                    if isinstance(t['plugins']['requires'], list):
++                        reqs.extend(t['plugins']['requires'])
++                    else:
++                        reqs.append(t['plugins']['requires'])
++            except KeyError:
++                continue
++        reqs = get_unique_item(reqs)
++        return reqs
++
++    def load_required_plugins(self, reqs, parser, args, remaining):
++        '''
++        Get all required plugins from the list of test cases and load any plugin
++        that is not already enabled.
++        '''
++        pgd = ['plugin-lib', 'plugin-lib-custom']
++        pnf = []
++
++        for r in reqs:
++            if r not in self.plugins:
++                fname = '{}.py'.format(r)
++                source_path = []
++                for d in pgd:
++                    pgpath = '{}/{}'.format(d, fname)
++                    if os.path.isfile(pgpath):
++                        source_path.append(pgpath)
++                if len(source_path) == 0:
++                    print('ERROR: unable to find required plugin {}'.format(r))
++                    pnf.append(fname)
++                    continue
++                elif len(source_path) > 1:
++                    print('WARNING: multiple copies of plugin {} found, using version found')
++                    print('at {}'.format(source_path[0]))
++                pgdir = source_path[0]
++                pgdir = pgdir.split('/')[0]
++                self.load_plugin(pgdir, fname)
++        if len(pnf) > 0:
++            raise PluginDependencyException(pnf)
++
++        parser = self.call_add_args(parser)
++        (args, remaining) = parser.parse_known_args(args=remaining, namespace=args)
++        return args
++
+     def call_pre_suite(self, testcount, testidlist):
+         for pgn_inst in self.plugin_instances:
+             pgn_inst.pre_suite(testcount, testidlist)
+@@ -98,6 +159,9 @@ class PluginMgr:
+             command = pgn_inst.adjust_command(stage, command)
+         return command
+ 
++    def set_args(self, args):
++        self.args = args
++
+     @staticmethod
+     def _make_argparser(args):
+         self.argparser = argparse.ArgumentParser(
+@@ -550,6 +614,7 @@ def filter_tests_by_category(args, testlist):
+ 
+     return answer
+ 
++
+ def get_test_cases(args):
+     """
+     If a test case file is specified, retrieve tests from that file.
+@@ -611,7 +676,7 @@ def get_test_cases(args):
+     return allcatlist, allidlist, testcases_by_cats, alltestcases
+ 
+ 
+-def set_operation_mode(pm, args):
++def set_operation_mode(pm, parser, args, remaining):
+     """
+     Load the test case data and process remaining arguments to determine
+     what the script should do for this run, and call the appropriate
+@@ -649,6 +714,12 @@ def set_operation_mode(pm, args):
+             exit(0)
+ 
+     if len(alltests):
++        req_plugins = pm.get_required_plugins(alltests)
++        try:
++            args = pm.load_required_plugins(req_plugins, parser, args, remaining)
++        except PluginDependencyException as pde:
++            print('The following plugins were not found:')
++            print('{}'.format(pde.missing_pg))
+         catresults = test_runner(pm, args, alltests)
+         if args.format == 'none':
+             print('Test results output suppression requested\n')
+@@ -686,11 +757,12 @@ def main():
+     parser = pm.call_add_args(parser)
+     (args, remaining) = parser.parse_known_args()
+     args.NAMES = NAMES
++    pm.set_args(args)
+     check_default_settings(args, remaining, pm)
+     if args.verbose > 2:
+         print('args is {}'.format(args))
+ 
+-    set_operation_mode(pm, args)
++    set_operation_mode(pm, parser, args, remaining)
+ 
+     exit(0)
+ 
+diff --git a/tools/testing/selftests/tc-testing/tdc_helper.py b/tools/testing/selftests/tc-testing/tdc_helper.py
+index 9f35c96c88a0..0440d252c4c5 100644
+--- a/tools/testing/selftests/tc-testing/tdc_helper.py
++++ b/tools/testing/selftests/tc-testing/tdc_helper.py
+@@ -17,7 +17,10 @@ def get_categorized_testlist(alltests, ucat):
+ 
+ def get_unique_item(lst):
+     """ For a list, return a list of the unique items in the list. """
+-    return list(set(lst))
++    if len(lst) > 1:
++        return list(set(lst))
++    else:
++        return lst
+ 
+ 
+ def get_test_categories(alltests):
