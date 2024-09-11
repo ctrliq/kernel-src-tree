@@ -1516,8 +1516,8 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
 	u8 mac_addr[ETH_ALEN];
 	int err;
 
-	netdev = alloc_etherdev_mqs(sizeof(struct ice_netdev_priv),
-				    vsi->alloc_txq, vsi->alloc_rxq);
+	netdev = alloc_etherdev_mqs(sizeof(*np), vsi->alloc_txq,
+				    vsi->alloc_rxq);
 	if (!netdev)
 		return -ENOMEM;
 
@@ -1870,7 +1870,7 @@ static int ice_ena_msix_range(struct ice_pf *pf)
 	v_left -= pf->num_lan_msix;
 
 	pf->msix_entries = devm_kcalloc(&pf->pdev->dev, v_budget,
-					sizeof(struct msix_entry), GFP_KERNEL);
+					sizeof(*pf->msix_entries), GFP_KERNEL);
 
 	if (!pf->msix_entries) {
 		err = -ENOMEM;
@@ -1958,7 +1958,6 @@ static void ice_clear_interrupt_scheme(struct ice_pf *pf)
 static int ice_init_interrupt_scheme(struct ice_pf *pf)
 {
 	int vectors = 0, hw_vectors = 0;
-	ssize_t size;
 
 	if (test_bit(ICE_FLAG_MSIX_ENA, pf->flags))
 		vectors = ice_ena_msix_range(pf);
@@ -1969,9 +1968,9 @@ static int ice_init_interrupt_scheme(struct ice_pf *pf)
 		return vectors;
 
 	/* set up vector assignment tracking */
-	size = sizeof(struct ice_res_tracker) + (sizeof(u16) * vectors);
-
-	pf->sw_irq_tracker = devm_kzalloc(&pf->pdev->dev, size, GFP_KERNEL);
+	pf->sw_irq_tracker =
+		devm_kzalloc(&pf->pdev->dev, sizeof(*pf->sw_irq_tracker) +
+			     (sizeof(u16) * vectors), GFP_KERNEL);
 	if (!pf->sw_irq_tracker) {
 		ice_dis_msix(pf);
 		return -ENOMEM;
@@ -1983,9 +1982,9 @@ static int ice_init_interrupt_scheme(struct ice_pf *pf)
 
 	/* set up HW vector assignment tracking */
 	hw_vectors = pf->hw.func_caps.common_cap.num_msix_vectors;
-	size = sizeof(struct ice_res_tracker) + (sizeof(u16) * hw_vectors);
-
-	pf->hw_irq_tracker = devm_kzalloc(&pf->pdev->dev, size, GFP_KERNEL);
+	pf->hw_irq_tracker =
+		devm_kzalloc(&pf->pdev->dev, sizeof(*pf->hw_irq_tracker) +
+			     (sizeof(u16) * hw_vectors), GFP_KERNEL);
 	if (!pf->hw_irq_tracker) {
 		ice_clear_interrupt_scheme(pf);
 		return -ENOMEM;
@@ -2102,7 +2101,7 @@ static int ice_probe(struct pci_dev *pdev,
 	}
 
 	pf->vsi = devm_kcalloc(&pdev->dev, pf->num_alloc_vsi,
-			       sizeof(struct ice_vsi *), GFP_KERNEL);
+			       sizeof(*pf->vsi), GFP_KERNEL);
 	if (!pf->vsi) {
 		err = -ENOMEM;
 		goto err_init_pf_unroll;
@@ -2134,7 +2133,7 @@ static int ice_probe(struct pci_dev *pdev,
 	}
 
 	/* create switch struct for the switch element created by FW on boot */
-	pf->first_sw = devm_kzalloc(&pdev->dev, sizeof(struct ice_sw),
+	pf->first_sw = devm_kzalloc(&pdev->dev, sizeof(*pf->first_sw),
 				    GFP_KERNEL);
 	if (!pf->first_sw) {
 		err = -ENOMEM;
