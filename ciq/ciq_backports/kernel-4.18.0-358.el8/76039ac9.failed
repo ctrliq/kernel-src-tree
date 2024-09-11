@@ -1,0 +1,252 @@
+IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Mark Zhang <markzhang@nvidia.com>
+commit 76039ac9095f5ee5ec7fb95ccb6a5460d5f8c3a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/76039ac9.failed
+
+During cm_dev deregistration in cm_remove_one(), the cm_device and
+cm_ports will be freed, after that they should not be accessed. The
+mad_agent needs to be protected as well.
+
+This patch adds a cm_device kref to protect cm_dev and cm_ports, and a
+mad_agent_lock spinlock to protect mad_agent.
+
+Link: https://lore.kernel.org/r/501ba7a2ff203dccd0e6755d3f93329772adce52.1622629024.git.leonro@nvidia.com
+	Signed-off-by: Mark Zhang <markzhang@nvidia.com>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 76039ac9095f5ee5ec7fb95ccb6a5460d5f8c3a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cm.c
+diff --cc drivers/infiniband/core/cm.c
+index 1e3f002ae60c,80087e678030..000000000000
+--- a/drivers/infiniband/core/cm.c
++++ b/drivers/infiniband/core/cm.c
+@@@ -310,35 -318,22 +328,53 @@@ static struct ib_mad_send_buf *cm_alloc
+  	struct ib_mad_agent *mad_agent;
+  	struct ib_mad_send_buf *m;
+  	struct ib_ah *ah;
+ +	struct cm_av *av;
+ +	unsigned long flags, flags2;
+ +	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	/* don't let the port to be released till the agent is down */
+ +	spin_lock_irqsave(&cm.state_lock, flags2);
+ +	spin_lock_irqsave(&cm.lock, flags);
+ +	if (!cm_id_priv->prim_send_port_not_ready)
+ +		av = &cm_id_priv->av;
+ +	else if (!cm_id_priv->altr_send_port_not_ready &&
+ +		 (cm_id_priv->alt_av.port))
+ +		av = &cm_id_priv->alt_av;
+ +	else {
+ +		pr_info("%s: not valid CM id\n", __func__);
+ +		ret = -ENODEV;
+ +		spin_unlock_irqrestore(&cm.lock, flags);
+ +		goto out;
+ +	}
+ +	spin_unlock_irqrestore(&cm.lock, flags);
+ +	/* Make sure the port haven't released the mad yet */
+ +	mad_agent = cm_id_priv->av.port->mad_agent;
+ +	if (!mad_agent) {
+ +		pr_info("%s: not a valid MAD agent\n", __func__);
+ +		ret = -ENODEV;
+ +		goto out;
+ +	}
+ +	ah = rdma_create_ah(mad_agent->qp->pd, &av->ah_attr, 0);
+ +	if (IS_ERR(ah)) {
+ +		ret = PTR_ERR(ah);
+++=======
++ 	lockdep_assert_held(&cm_id_priv->lock);
++ 
++ 	if (!cm_id_priv->av.port)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	spin_lock(&cm_id_priv->av.port->cm_dev->mad_agent_lock);
++ 	mad_agent = cm_id_priv->av.port->mad_agent;
++ 	if (!mad_agent) {
++ 		m = ERR_PTR(-EINVAL);
++ 		goto out;
++ 	}
++ 
++ 	ah = rdma_create_ah(mad_agent->qp->pd, &cm_id_priv->av.ah_attr, 0);
++ 	if (IS_ERR(ah)) {
++ 		m = ERR_CAST(ah);
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  		goto out;
+  	}
+  
+@@@ -349,7 -344,6 +385,10 @@@
+  			       IB_MGMT_BASE_VERSION);
+  	if (IS_ERR(m)) {
+  		rdma_destroy_ah(ah, 0);
+++<<<<<<< HEAD
+ +		ret = PTR_ERR(m);
+++=======
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  		goto out;
+  	}
+  
+@@@ -358,13 -352,11 +397,16 @@@
+  	m->retries = cm_id_priv->max_cm_retries;
+  
+  	refcount_inc(&cm_id_priv->refcount);
+ +	spin_unlock_irqrestore(&cm.state_lock, flags2);
+  	m->context[0] = cm_id_priv;
++ 
++ out:
++ 	spin_unlock(&cm_id_priv->av.port->cm_dev->mad_agent_lock);
+  	return m;
+ +
+ +out:
+ +	spin_unlock_irqrestore(&cm.state_lock, flags2);
+ +	return ERR_PTR(ret);
+  }
+  
+  static void cm_free_msg(struct ib_mad_send_buf *msg)
+@@@ -482,30 -474,26 +524,51 @@@ static void cm_set_private_data(struct 
+  	cm_id_priv->private_data_len = private_data_len;
+  }
+  
+++<<<<<<< HEAD
+ +static int cm_init_av_for_lap(struct cm_port *port, struct ib_wc *wc,
+ +			      struct ib_grh *grh, struct cm_av *av)
+ +{
+ +	struct rdma_ah_attr new_ah_attr;
+ +	int ret;
+ +
+ +	av->port = port;
+++=======
++ static void cm_set_av_port(struct cm_av *av, struct cm_port *port)
++ {
++ 	struct cm_port *old_port = av->port;
++ 
++ 	if (old_port == port)
++ 		return;
++ 
++ 	av->port = port;
++ 	if (old_port)
++ 		cm_device_put(old_port->cm_dev);
++ 	if (port)
++ 		kref_get(&port->cm_dev->kref);
++ }
++ 
++ static void cm_init_av_for_lap(struct cm_port *port, struct ib_wc *wc,
++ 			       struct rdma_ah_attr *ah_attr, struct cm_av *av)
++ {
++ 	cm_set_av_port(av, port);
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  	av->pkey_index = wc->pkey_index;
+ -	rdma_move_ah_attr(&av->ah_attr, ah_attr);
+ +
+ +	/*
+ +	 * av->ah_attr might be initialized based on past wc during incoming
+ +	 * connect request or while sending out connect request. So initialize
+ +	 * a new ah_attr on stack. If initialization fails, old ah_attr is
+ +	 * used for sending any responses. If initialization is successful,
+ +	 * than new ah_attr is used by overwriting old one.
+ +	 */
+ +	ret = ib_init_ah_attr_from_wc(port->cm_dev->ib_device,
+ +				      port->port_num, wc,
+ +				      grh, &new_ah_attr);
+ +	if (ret)
+ +		return ret;
+ +
+ +	rdma_move_ah_attr(&av->ah_attr, &new_ah_attr);
+ +	return 0;
+  }
+  
+  static int cm_init_av_for_response(struct cm_port *port, struct ib_wc *wc,
+@@@ -616,6 -587,22 +679,25 @@@ static int cm_init_av_by_path(struct sa
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Move av created by cm_init_av_by_path(), so av.dgid is not moved */
++ static void cm_move_av_from_path(struct cm_av *dest, struct cm_av *src)
++ {
++ 	cm_set_av_port(dest, src->port);
++ 	cm_set_av_port(src, NULL);
++ 	dest->pkey_index = src->pkey_index;
++ 	rdma_move_ah_attr(&dest->ah_attr, &src->ah_attr);
++ 	dest->timeout = src->timeout;
++ }
++ 
++ static void cm_destroy_av(struct cm_av *av)
++ {
++ 	rdma_destroy_ah_attr(&av->ah_attr);
++ 	cm_set_av_port(av, NULL);
++ }
++ 
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  static u32 cm_local_id(__be32 local_id)
+  {
+  	return (__force u32) (local_id ^ cm.random_id_operand);
+@@@ -2204,8 -2197,10 +2294,15 @@@ static int cm_req_handler(struct cm_wor
+  		sa_path_set_dmac(&work->path[0],
+  				 cm_id_priv->av.ah_attr.roce.dmac);
+  	work->path[0].hop_limit = grh->hop_limit;
+++<<<<<<< HEAD
+ +	ret = cm_init_av_by_path(&work->path[0], gid_attr, &cm_id_priv->av,
+ +				 cm_id_priv);
+++=======
++ 
++ 	/* This destroy call is needed to pair with cm_init_av_for_response */
++ 	cm_destroy_av(&cm_id_priv->av);
++ 	ret = cm_init_av_by_path(&work->path[0], gid_attr, &cm_id_priv->av);
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  	if (ret) {
+  		int err;
+  
+@@@ -4484,30 -4479,26 +4587,41 @@@ static void cm_remove_one(struct ib_dev
+  			continue;
+  
+  		port = cm_dev->port[i-1];
++ 		mad_agent = port->mad_agent;
+  		ib_modify_port(ib_device, port->port_num, 0, &port_modify);
+ +		/* Mark all the cm_id's as not valid */
+ +		spin_lock_irq(&cm.lock);
+ +		list_for_each_entry(cm_id_priv, &port->cm_priv_altr_list, altr_list)
+ +			cm_id_priv->altr_send_port_not_ready = 1;
+ +		list_for_each_entry(cm_id_priv, &port->cm_priv_prim_list, prim_list)
+ +			cm_id_priv->prim_send_port_not_ready = 1;
+ +		spin_unlock_irq(&cm.lock);
+  		/*
+  		 * We flush the queue here after the going_down set, this
+  		 * verify that no new works will be queued in the recv handler,
+  		 * after that we can call the unregister_mad_agent
+  		 */
+  		flush_workqueue(cm.wq);
+++<<<<<<< HEAD
+ +		spin_lock_irq(&cm.state_lock);
+ +		cur_mad_agent = port->mad_agent;
+ +		port->mad_agent = NULL;
+ +		spin_unlock_irq(&cm.state_lock);
+ +		ib_unregister_mad_agent(cur_mad_agent);
+++=======
++ 		/*
++ 		 * The above ensures no call paths from the work are running,
++ 		 * the remaining paths all take the mad_agent_lock.
++ 		 */
++ 		spin_lock(&cm_dev->mad_agent_lock);
++ 		port->mad_agent = NULL;
++ 		spin_unlock(&cm_dev->mad_agent_lock);
++ 		ib_unregister_mad_agent(mad_agent);
+++>>>>>>> 76039ac9095f (IB/cm: Protect cm_dev, cm_ports and mad_agent with kref and lock)
+  		cm_remove_port_fs(port);
+- 		kfree(port);
+  	}
+  
+- 	kfree(cm_dev);
++ 	cm_device_put(cm_dev);
+  }
+  
+  static int __init ib_cm_init(void)
+* Unmerged path drivers/infiniband/core/cm.c
