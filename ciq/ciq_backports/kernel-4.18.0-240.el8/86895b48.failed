@@ -1,0 +1,357 @@
+perf stat: Add --per-node agregation support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 86895b480a2f10c7c6659fc5312f84b93011ce2d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/86895b48.failed
+
+Adding new --per-node option to aggregate counts per NUMA
+nodes for system-wide mode measurements.
+
+You can specify --per-node in live mode:
+
+  # perf stat  -a -I 1000 -e cycles --per-node
+  #           time node   cpus             counts unit events
+       1.000542550 N0       20          6,202,097      cycles
+       1.000542550 N1       20            639,559      cycles
+       2.002040063 N0       20          7,412,495      cycles
+       2.002040063 N1       20          2,185,577      cycles
+       3.003451699 N0       20          6,508,917      cycles
+       3.003451699 N1       20            765,607      cycles
+  ...
+
+Or in the record/report stat session:
+
+  # perf stat record -a -I 1000 -e cycles
+  #           time             counts unit events
+       1.000536937         10,008,468      cycles
+       2.002090152          9,578,539      cycles
+       3.003625233          7,647,869      cycles
+       4.005135036          7,032,086      cycles
+  ^C     4.340902364          3,923,893      cycles
+
+  # perf stat report --per-node
+  #           time node   cpus             counts unit events
+       1.000536937 N0       20          9,355,086      cycles
+       1.000536937 N1       20            653,382      cycles
+       2.002090152 N0       20          7,712,838      cycles
+       2.002090152 N1       20          1,865,701      cycles
+       3.003625233 N0       20          6,604,441      cycles
+       3.003625233 N1       20          1,043,428      cycles
+       4.005135036 N0       20          6,350,522      cycles
+       4.005135036 N1       20            681,564      cycles
+       4.340902364 N0       20          3,403,188      cycles
+       4.340902364 N1       20            520,705      cycles
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Joe Mario <jmario@redhat.com>
+	Cc: Kan Liang <kan.liang@linux.intel.com>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <a.p.zijlstra@chello.nl>
+Link: http://lkml.kernel.org/r/20190904073415.723-4-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 86895b480a2f10c7c6659fc5312f84b93011ce2d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-stat.c
+#	tools/perf/util/cpumap.c
+#	tools/perf/util/cpumap.h
+diff --cc tools/perf/builtin-stat.c
+index 13e7c7e6714e,5964e808d73d..000000000000
+--- a/tools/perf/builtin-stat.c
++++ b/tools/perf/builtin-stat.c
+@@@ -828,16 -832,10 +830,23 @@@ static int perf_stat__get_core(struct p
+  	return cpu_map__get_core(map, cpu, NULL);
+  }
+  
+++<<<<<<< HEAD
+ +static int cpu_map__get_max(struct cpu_map *map)
+ +{
+ +	int i, max = -1;
+ +
+ +	for (i = 0; i < map->nr; i++) {
+ +		if (map->map[i] > max)
+ +			max = map->map[i];
+ +	}
+ +
+ +	return max;
+++=======
++ static int perf_stat__get_node(struct perf_stat_config *config __maybe_unused,
++ 			       struct perf_cpu_map *map, int cpu)
++ {
++ 	return cpu_map__get_node(map, cpu, NULL);
+++>>>>>>> 86895b480a2f (perf stat: Add --per-node agregation support)
+  }
+  
+  static int perf_stat__get_aggr(struct perf_stat_config *config,
+@@@ -874,9 -872,15 +883,15 @@@ static int perf_stat__get_core_cached(s
+  	return perf_stat__get_aggr(config, perf_stat__get_core, map, idx);
+  }
+  
++ static int perf_stat__get_node_cached(struct perf_stat_config *config,
++ 				      struct perf_cpu_map *map, int idx)
++ {
++ 	return perf_stat__get_aggr(config, perf_stat__get_node, map, idx);
++ }
++ 
+  static bool term_percore_set(void)
+  {
+ -	struct evsel *counter;
+ +	struct perf_evsel *counter;
+  
+  	evlist__for_each_entry(evsel_list, counter) {
+  		if (counter->percore)
+@@@ -912,9 -916,16 +927,16 @@@ static int perf_stat_init_aggr_mode(voi
+  		}
+  		stat_config.aggr_get_id = perf_stat__get_core_cached;
+  		break;
++ 	case AGGR_NODE:
++ 		if (cpu_map__build_node_map(evsel_list->core.cpus, &stat_config.aggr_map)) {
++ 			perror("cannot build core map");
++ 			return -1;
++ 		}
++ 		stat_config.aggr_get_id = perf_stat__get_node_cached;
++ 		break;
+  	case AGGR_NONE:
+  		if (term_percore_set()) {
+ -			if (cpu_map__build_core_map(evsel_list->core.cpus,
+ +			if (cpu_map__build_core_map(evsel_list->cpus,
+  						    &stat_config.aggr_map)) {
+  				perror("cannot build core map");
+  				return -1;
+@@@ -1024,8 -1035,15 +1046,20 @@@ static int perf_env__get_core(struct cp
+  	return core;
+  }
+  
+++<<<<<<< HEAD
+ +static int perf_env__build_socket_map(struct perf_env *env, struct cpu_map *cpus,
+ +				      struct cpu_map **sockp)
+++=======
++ static int perf_env__get_node(struct perf_cpu_map *map, int idx, void *data)
++ {
++ 	int cpu = perf_env__get_cpu(data, map, idx);
++ 
++ 	return perf_env__numa_node(data, cpu);
++ }
++ 
++ static int perf_env__build_socket_map(struct perf_env *env, struct perf_cpu_map *cpus,
++ 				      struct perf_cpu_map **sockp)
+++>>>>>>> 86895b480a2f (perf stat: Add --per-node agregation support)
+  {
+  	return cpu_map__build_map(cpus, sockp, perf_env__get_socket, env);
+  }
+@@@ -1042,8 -1060,14 +1076,14 @@@ static int perf_env__build_core_map(str
+  	return cpu_map__build_map(cpus, corep, perf_env__get_core, env);
+  }
+  
++ static int perf_env__build_node_map(struct perf_env *env, struct perf_cpu_map *cpus,
++ 				    struct perf_cpu_map **nodep)
++ {
++ 	return cpu_map__build_map(cpus, nodep, perf_env__get_node, env);
++ }
++ 
+  static int perf_stat__get_socket_file(struct perf_stat_config *config __maybe_unused,
+ -				      struct perf_cpu_map *map, int idx)
+ +				      struct cpu_map *map, int idx)
+  {
+  	return perf_env__get_socket(map, idx, &perf_stat.session->header.env);
+  }
+diff --cc tools/perf/util/cpumap.c
+index e84f227eb884,983b7388f22b..000000000000
+--- a/tools/perf/util/cpumap.c
++++ b/tools/perf/util/cpumap.c
+@@@ -424,7 -206,12 +424,16 @@@ int cpu_map__get_core_id(int cpu
+  	return ret ?: value;
+  }
+  
+++<<<<<<< HEAD
+ +int cpu_map__get_core(struct cpu_map *map, int idx, void *data)
+++=======
++ int cpu_map__get_node_id(int cpu)
++ {
++ 	return cpu__get_node(cpu);
++ }
++ 
++ int cpu_map__get_core(struct perf_cpu_map *map, int idx, void *data)
+++>>>>>>> 86895b480a2f (perf stat: Add --per-node agregation support)
+  {
+  	int cpu, s_die;
+  
+@@@ -453,7 -240,15 +462,19 @@@
+  	return (s_die << 16) | (cpu & 0xffff);
+  }
+  
+++<<<<<<< HEAD
+ +int cpu_map__build_socket_map(struct cpu_map *cpus, struct cpu_map **sockp)
+++=======
++ int cpu_map__get_node(struct perf_cpu_map *map, int idx, void *data __maybe_unused)
++ {
++ 	if (idx < 0 || idx >= map->nr)
++ 		return -1;
++ 
++ 	return cpu_map__get_node_id(map->map[idx]);
++ }
++ 
++ int cpu_map__build_socket_map(struct perf_cpu_map *cpus, struct perf_cpu_map **sockp)
+++>>>>>>> 86895b480a2f (perf stat: Add --per-node agregation support)
+  {
+  	return cpu_map__build_map(cpus, sockp, cpu_map__get_socket, NULL);
+  }
+diff --cc tools/perf/util/cpumap.h
+index 1265f0e33920,57943f3685f8..000000000000
+--- a/tools/perf/util/cpumap.h
++++ b/tools/perf/util/cpumap.h
+@@@ -4,40 -4,31 +4,51 @@@
+  
+  #include <stdio.h>
+  #include <stdbool.h>
+ -#include <internal/cpumap.h>
+ -#include <perf/cpumap.h>
+ +#include <linux/refcount.h>
+  
+ -struct perf_record_cpu_map_data;
+ +#include "perf.h"
+ +#include "util/debug.h"
+  
+ -struct perf_cpu_map *perf_cpu_map__empty_new(int nr);
+ -struct perf_cpu_map *cpu_map__new_data(struct perf_record_cpu_map_data *data);
+ -size_t cpu_map__snprint(struct perf_cpu_map *map, char *buf, size_t size);
+ -size_t cpu_map__snprint_mask(struct perf_cpu_map *map, char *buf, size_t size);
+ -size_t cpu_map__fprintf(struct perf_cpu_map *map, FILE *fp);
+ +struct cpu_map {
+ +	refcount_t refcnt;
+ +	int nr;
+ +	int map[];
+ +};
+ +
+ +struct cpu_map *cpu_map__new(const char *cpu_list);
+ +struct cpu_map *cpu_map__empty_new(int nr);
+ +struct cpu_map *cpu_map__dummy_new(void);
+ +struct cpu_map *cpu_map__new_data(struct cpu_map_data *data);
+ +struct cpu_map *cpu_map__read(FILE *file);
+ +size_t cpu_map__snprint(struct cpu_map *map, char *buf, size_t size);
+ +size_t cpu_map__snprint_mask(struct cpu_map *map, char *buf, size_t size);
+ +size_t cpu_map__fprintf(struct cpu_map *map, FILE *fp);
+  int cpu_map__get_socket_id(int cpu);
+ -int cpu_map__get_socket(struct perf_cpu_map *map, int idx, void *data);
+ +int cpu_map__get_socket(struct cpu_map *map, int idx, void *data);
+  int cpu_map__get_die_id(int cpu);
+ -int cpu_map__get_die(struct perf_cpu_map *map, int idx, void *data);
+ +int cpu_map__get_die(struct cpu_map *map, int idx, void *data);
+  int cpu_map__get_core_id(int cpu);
+++<<<<<<< HEAD
+ +int cpu_map__get_core(struct cpu_map *map, int idx, void *data);
+ +int cpu_map__build_socket_map(struct cpu_map *cpus, struct cpu_map **sockp);
+ +int cpu_map__build_die_map(struct cpu_map *cpus, struct cpu_map **diep);
+ +int cpu_map__build_core_map(struct cpu_map *cpus, struct cpu_map **corep);
+ +const struct cpu_map *cpu_map__online(void); /* thread unsafe */
+++=======
++ int cpu_map__get_core(struct perf_cpu_map *map, int idx, void *data);
++ int cpu_map__get_node_id(int cpu);
++ int cpu_map__get_node(struct perf_cpu_map *map, int idx, void *data);
++ int cpu_map__build_socket_map(struct perf_cpu_map *cpus, struct perf_cpu_map **sockp);
++ int cpu_map__build_die_map(struct perf_cpu_map *cpus, struct perf_cpu_map **diep);
++ int cpu_map__build_core_map(struct perf_cpu_map *cpus, struct perf_cpu_map **corep);
++ int cpu_map__build_node_map(struct perf_cpu_map *cpus, struct perf_cpu_map **nodep);
++ const struct perf_cpu_map *cpu_map__online(void); /* thread unsafe */
+++>>>>>>> 86895b480a2f (perf stat: Add --per-node agregation support)
+ +
+ +struct cpu_map *cpu_map__get(struct cpu_map *map);
+ +void cpu_map__put(struct cpu_map *map);
+  
+ -static inline int cpu_map__socket(struct perf_cpu_map *sock, int s)
+ +static inline int cpu_map__socket(struct cpu_map *sock, int s)
+  {
+  	if (!sock || s > sock->nr || s < 0)
+  		return 0;
+diff --git a/tools/perf/Documentation/perf-stat.txt b/tools/perf/Documentation/perf-stat.txt
+index a9af4e440e80..9431b8066fb4 100644
+--- a/tools/perf/Documentation/perf-stat.txt
++++ b/tools/perf/Documentation/perf-stat.txt
+@@ -217,6 +217,11 @@ core number and the number of online logical processors on that physical process
+ Aggregate counts per monitored threads, when monitoring threads (-t option)
+ or processes (-p option).
+ 
++--per-node::
++Aggregate counts per NUMA nodes for system-wide mode measurements. This
++is a useful mode to detect imbalance between NUMA nodes. To enable this
++mode, use --per-node in addition to -a. (system-wide).
++
+ -D msecs::
+ --delay msecs::
+ After starting the program, wait msecs before measuring. This is useful to
+* Unmerged path tools/perf/builtin-stat.c
+* Unmerged path tools/perf/util/cpumap.c
+* Unmerged path tools/perf/util/cpumap.h
+diff --git a/tools/perf/util/stat-display.c b/tools/perf/util/stat-display.c
+index 69a800dd6926..64d5ee99e029 100644
+--- a/tools/perf/util/stat-display.c
++++ b/tools/perf/util/stat-display.c
+@@ -100,6 +100,15 @@ static void aggr_printout(struct perf_stat_config *config,
+ 			nr,
+ 			config->csv_sep);
+ 			break;
++	case AGGR_NODE:
++		fprintf(config->output, "N%*d%s%*d%s",
++			config->csv_output ? 0 : -5,
++			id,
++			config->csv_sep,
++			config->csv_output ? 0 : 4,
++			nr,
++			config->csv_sep);
++			break;
+ 	case AGGR_NONE:
+ 		if (evsel->percore) {
+ 			fprintf(config->output, "S%d-D%d-C%*d%s",
+@@ -965,6 +974,11 @@ static void print_interval(struct perf_stat_config *config,
+ 
+ 	if ((num_print_interval == 0 && !config->csv_output) || config->interval_clear) {
+ 		switch (config->aggr_mode) {
++		case AGGR_NODE:
++			fprintf(output, "#           time node   cpus");
++			if (!metric_only)
++				fprintf(output, "             counts %*s events\n", unit_width, "unit");
++			break;
+ 		case AGGR_SOCKET:
+ 			fprintf(output, "#           time socket cpus");
+ 			if (!metric_only)
+@@ -1188,6 +1202,7 @@ perf_evlist__print_counters(struct perf_evlist *evlist,
+ 	case AGGR_CORE:
+ 	case AGGR_DIE:
+ 	case AGGR_SOCKET:
++	case AGGR_NODE:
+ 		print_aggr(config, evlist, prefix);
+ 		break;
+ 	case AGGR_THREAD:
+diff --git a/tools/perf/util/stat.c b/tools/perf/util/stat.c
+index 95dac0b5d3fc..8e0eb72a069b 100644
+--- a/tools/perf/util/stat.c
++++ b/tools/perf/util/stat.c
+@@ -276,6 +276,7 @@ process_counter_values(struct perf_stat_config *config, struct perf_evsel *evsel
+ 	case AGGR_CORE:
+ 	case AGGR_DIE:
+ 	case AGGR_SOCKET:
++	case AGGR_NODE:
+ 	case AGGR_NONE:
+ 		if (!evsel->snapshot)
+ 			perf_evsel__compute_deltas(evsel, cpu, thread, count);
+diff --git a/tools/perf/util/stat.h b/tools/perf/util/stat.h
+index 672981c1bbe8..a138dd58f5f8 100644
+--- a/tools/perf/util/stat.h
++++ b/tools/perf/util/stat.h
+@@ -48,6 +48,7 @@ enum aggr_mode {
+ 	AGGR_CORE,
+ 	AGGR_THREAD,
+ 	AGGR_UNSET,
++	AGGR_NODE,
+ };
+ 
+ enum {
