@@ -1,0 +1,282 @@
+NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 7f87fc2d34d475225e78b7f5c4eabb121f4282b2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/7f87fc2d.failed
+
+The benefit of the xdr_stream helpers is that they transparently
+handle encoding an XDR data item that crosses page boundaries.
+Most of the open-coded logic to do that here can be eliminated.
+
+A sub-buffer and sub-stream are set up as a sink buffer for the
+directory entry encoder. As an entry is encoded, it is added to
+the end of the content in this buffer/stream. The total length of
+the directory list is tracked in the buffer's @len field.
+
+When it comes time to encode the Reply, the sub-buffer is merged
+into rq_res's page array at the correct place using
+xdr_write_pages().
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit 7f87fc2d34d475225e78b7f5c4eabb121f4282b2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfs3proc.c
+#	fs/nfsd/nfs3xdr.c
+diff --cc fs/nfsd/nfs3proc.c
+index 5d8b39219ffb,bc64e95a168d..000000000000
+--- a/fs/nfsd/nfs3proc.c
++++ b/fs/nfsd/nfs3proc.c
+@@@ -441,13 -441,16 +441,20 @@@ static void nfsd3_init_dirlist_pages(st
+  				     struct nfsd3_readdirres *resp,
+  				     int count)
+  {
++ 	struct xdr_buf *buf = &resp->dirlist;
++ 	struct xdr_stream *xdr = &resp->xdr;
++ 
+  	count = min_t(u32, count, svc_max_payload(rqstp));
+  
+- 	/* Convert byte count to number of words (i.e. >> 2),
+- 	 * and reserve room for the NULL ptr & eof flag (-2 words) */
+- 	resp->buflen = (count >> 2) - 2;
++ 	memset(buf, 0, sizeof(*buf));
+  
+++<<<<<<< HEAD
+ +	resp->buffer = page_address(*rqstp->rq_next_page);
+++=======
++ 	/* Reserve room for the NULL ptr & eof flag (-2 words) */
++ 	buf->buflen = count - XDR_UNIT * 2;
++ 	buf->pages = rqstp->rq_next_page;
+++>>>>>>> 7f87fc2d34d4 (NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream)
+  	while (count > 0) {
+  		rqstp->rq_next_page++;
+  		count -= PAGE_SIZE;
+@@@ -473,39 -483,15 +490,41 @@@ nfsd3_proc_readdir(struct svc_rqst *rqs
+  
+  	nfsd3_init_dirlist_pages(rqstp, resp, argp->count);
+  
+- 	/* Read directory and encode entries on the fly */
+  	fh_copy(&resp->fh, &argp->fh);
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> 7f87fc2d34d4 (NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream)
+  	resp->common.err = nfs_ok;
++ 	resp->cookie_offset = 0;
+  	resp->rqstp = rqstp;
+  	offset = argp->cookie;
+- 
+  	resp->status = nfsd_readdir(rqstp, &resp->fh, &offset,
+- 				    &resp->common, nfs3svc_encode_entry);
++ 				    &resp->common, nfs3svc_encode_entry3);
+  	memcpy(resp->verf, argp->verf, 8);
+ -	nfs3svc_encode_cookie3(resp, offset);
+ +	count = 0;
+ +	for (p = rqstp->rq_respages + 1; p < rqstp->rq_next_page; p++) {
+ +		page_addr = page_address(*p);
+ +
+ +		if (((caddr_t)resp->buffer >= page_addr) &&
+ +		    ((caddr_t)resp->buffer < page_addr + PAGE_SIZE)) {
+ +			count += (caddr_t)resp->buffer - page_addr;
+ +			break;
+ +		}
+ +		count += PAGE_SIZE;
+ +	}
+ +	resp->count = count >> 2;
+ +	if (resp->offset) {
+ +		if (unlikely(resp->offset1)) {
+ +			/* we ended up with offset on a page boundary */
+ +			*resp->offset = htonl(offset >> 32);
+ +			*resp->offset1 = htonl(offset & 0xffffffff);
+ +			resp->offset1 = NULL;
+ +		} else {
+ +			xdr_encode_hyper(resp->offset, offset);
+ +		}
+ +		resp->offset = NULL;
+ +	}
+  
+  	return rpc_success;
+  }
+@@@ -530,10 -513,9 +549,13 @@@ nfsd3_proc_readdirplus(struct svc_rqst 
+  
+  	nfsd3_init_dirlist_pages(rqstp, resp, argp->count);
+  
+- 	/* Read directory and encode entries on the fly */
+  	fh_copy(&resp->fh, &argp->fh);
+++<<<<<<< HEAD
+ +
+++=======
+++>>>>>>> 7f87fc2d34d4 (NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream)
+  	resp->common.err = nfs_ok;
++ 	resp->cookie_offset = 0;
+  	resp->rqstp = rqstp;
+  	offset = argp->cookie;
+  
+@@@ -547,30 -529,9 +569,30 @@@
+  	}
+  
+  	resp->status = nfsd_readdir(rqstp, &resp->fh, &offset,
+- 				    &resp->common, nfs3svc_encode_entry_plus);
++ 				    &resp->common, nfs3svc_encode_entryplus3);
+  	memcpy(resp->verf, argp->verf, 8);
+ -	nfs3svc_encode_cookie3(resp, offset);
+ +	for (p = rqstp->rq_respages + 1; p < rqstp->rq_next_page; p++) {
+ +		page_addr = page_address(*p);
+ +
+ +		if (((caddr_t)resp->buffer >= page_addr) &&
+ +		    ((caddr_t)resp->buffer < page_addr + PAGE_SIZE)) {
+ +			count += (caddr_t)resp->buffer - page_addr;
+ +			break;
+ +		}
+ +		count += PAGE_SIZE;
+ +	}
+ +	resp->count = count >> 2;
+ +	if (resp->offset) {
+ +		if (unlikely(resp->offset1)) {
+ +			/* we ended up with offset on a page boundary */
+ +			*resp->offset = htonl(offset >> 32);
+ +			*resp->offset1 = htonl(offset & 0xffffffff);
+ +			resp->offset1 = NULL;
+ +		} else {
+ +			xdr_encode_hyper(resp->offset, offset);
+ +		}
+ +		resp->offset = NULL;
+ +	}
+  
+  out:
+  	return rpc_success;
+diff --cc fs/nfsd/nfs3xdr.c
+index 3fa16aaa5ee2,f38d845ac8a0..000000000000
+--- a/fs/nfsd/nfs3xdr.c
++++ b/fs/nfsd/nfs3xdr.c
+@@@ -1110,27 -1137,31 +1110,50 @@@ nfs3svc_encode_linkres(struct svc_rqst 
+  int
+  nfs3svc_encode_readdirres(struct svc_rqst *rqstp, __be32 *p)
+  {
+ -	struct xdr_stream *xdr = &rqstp->rq_res_stream;
+  	struct nfsd3_readdirres *resp = rqstp->rq_resp;
++ 	struct xdr_buf *dirlist = &resp->dirlist;
+  
+++<<<<<<< HEAD
+ +	*p++ = resp->status;
+ +	p = encode_post_op_attr(rqstp, p, &resp->fh);
+++=======
++ 	if (!svcxdr_encode_nfsstat3(xdr, resp->status))
++ 		return 0;
++ 	switch (resp->status) {
++ 	case nfs_ok:
++ 		if (!svcxdr_encode_post_op_attr(rqstp, xdr, &resp->fh))
++ 			return 0;
++ 		if (!svcxdr_encode_cookieverf3(xdr, resp->verf))
++ 			return 0;
++ 		xdr_write_pages(xdr, dirlist->pages, 0, dirlist->len);
++ 		/* no more entries */
++ 		if (xdr_stream_encode_item_absent(xdr) < 0)
++ 			return 0;
++ 		if (xdr_stream_encode_bool(xdr, resp->common.err == nfserr_eof) < 0)
++ 			return 0;
++ 		break;
++ 	default:
++ 		if (!svcxdr_encode_post_op_attr(rqstp, xdr, &resp->fh))
++ 			return 0;
++ 	}
+ -
+ -	return 1;
+++>>>>>>> 7f87fc2d34d4 (NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream)
+ +
+ +	if (resp->status == 0) {
+ +		/* stupid readdir cookie */
+ +		memcpy(p, resp->verf, 8); p += 2;
+ +		xdr_ressize_check(rqstp, p);
+ +		if (rqstp->rq_res.head[0].iov_len + (2<<2) > PAGE_SIZE)
+ +			return 1; /*No room for trailer */
+ +		rqstp->rq_res.page_len = (resp->count) << 2;
+ +
+ +		/* add the 'tail' to the end of the 'head' page - page 0. */
+ +		rqstp->rq_res.tail[0].iov_base = p;
+ +		*p++ = 0;		/* no more entries */
+ +		*p++ = htonl(resp->common.err == nfserr_eof);
+ +		rqstp->rq_res.tail[0].iov_len = 2<<2;
+ +		return 1;
+ +	} else
+ +		return xdr_ressize_check(rqstp, p);
+  }
+  
+  static __be32 *
+@@@ -1205,6 -1236,25 +1228,28 @@@ out
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * nfs3svc_encode_cookie3 - Encode a directory offset cookie
++  * @resp: readdir result context
++  * @offset: offset cookie to encode
++  *
++  * The buffer space for the offset cookie has already been reserved
++  * by svcxdr_encode_entry3_common().
++  */
++ void nfs3svc_encode_cookie3(struct nfsd3_readdirres *resp, u64 offset)
++ {
++ 	__be64 cookie = cpu_to_be64(offset);
++ 
++ 	if (!resp->cookie_offset)
++ 		return;
++ 	write_bytes_to_xdr_buf(&resp->dirlist, resp->cookie_offset, &cookie,
++ 			       sizeof(cookie));
++ 	resp->cookie_offset = 0;
++ }
++ 
+++>>>>>>> 7f87fc2d34d4 (NFSD: Update NFSv3 READDIR entry encoders to use struct xdr_stream)
+  /*
+   * Encode a directory entry. This one works for both normal readdir
+   * and readdirplus.
+* Unmerged path fs/nfsd/nfs3proc.c
+* Unmerged path fs/nfsd/nfs3xdr.c
+diff --git a/fs/nfsd/xdr3.h b/fs/nfsd/xdr3.h
+index 8759e771bbc6..1e5346d7b6fb 100644
+--- a/fs/nfsd/xdr3.h
++++ b/fs/nfsd/xdr3.h
+@@ -169,19 +169,22 @@ struct nfsd3_linkres {
+ };
+ 
+ struct nfsd3_readdirres {
++	/* Components of the reply */
+ 	__be32			status;
+ 	struct svc_fh		fh;
+-	/* Just to save kmalloc on every readdirplus entry (svc_fh is a
+-	 * little large for the stack): */
+-	struct svc_fh		scratch;
+ 	int			count;
+ 	__be32			verf[2];
+ 
++	/* Used to encode the reply's entry list */
++	struct xdr_stream	xdr;
++	struct xdr_buf		dirlist;
++	struct svc_fh		scratch;
+ 	struct readdir_cd	common;
+ 	__be32 *		buffer;
+ 	int			buflen;
+ 	__be32 *		offset;
+ 	__be32 *		offset1;
++	unsigned int		cookie_offset;
+ 	struct svc_rqst *	rqstp;
+ 
+ };
+@@ -305,6 +308,10 @@ int nfs3svc_encode_entry(void *, const char *name,
+ int nfs3svc_encode_entry_plus(void *, const char *name,
+ 				int namlen, loff_t offset, u64 ino,
+ 				unsigned int);
++int nfs3svc_encode_entry3(void *data, const char *name, int namlen,
++			  loff_t offset, u64 ino, unsigned int d_type);
++int nfs3svc_encode_entryplus3(void *data, const char *name, int namlen,
++			      loff_t offset, u64 ino, unsigned int d_type);
+ /* Helper functions for NFSv3 ACL code */
+ __be32 *nfs3svc_encode_post_op_attr(struct svc_rqst *rqstp, __be32 *p,
+ 				struct svc_fh *fhp);
