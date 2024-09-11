@@ -1,0 +1,223 @@
+nvme: implement non-mdts command limits
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit 5befc7c26e5a98cd49789fb1beb52c62bd472dba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5befc7c2.failed
+
+Commands that access LBA contents without a data transfer between the
+host historically have not had a spec defined upper limit. The driver
+set the queue constraints for such commands to the max data transfer
+size just to be safe, but this artificial constraint frequently limits
+devices below their capabilities.
+
+The NVMe Workgroup ratified TP4040 defines how a controller may
+advertise their non-MDTS limits. Use these if provided and default to
+the current constraints if not. Since the Dataset Management command
+limits are defined in logical blocks, but without a namespace to tell us
+the logical block size, the code defaults to the safe 512b size.
+
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 5befc7c26e5a98cd49789fb1beb52c62bd472dba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index beaf8705f770,e37e2ecd574c..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2211,10 -2139,11 +2185,11 @@@ static void nvme_update_disk_info(struc
+  			capacity = 0;
+  	}
+  
+ -	set_capacity_and_notify(disk, capacity);
+ +	set_capacity_revalidate_and_notify(disk, capacity, true);
+  
+  	nvme_config_discard(disk, ns);
+- 	nvme_config_write_zeroes(disk, ns);
++ 	blk_queue_max_write_zeroes_sectors(disk->queue,
++ 					   ns->ctrl->max_zeroes_sectors);
+  
+  	set_disk_ro(disk, (id->nsattr & NVME_NS_ATTR_RO) ||
+  		test_bit(NVME_NS_FORCE_RO, &ns->flags));
+@@@ -3127,28 -3047,72 +3102,95 @@@ out
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Initialize the cached copies of the Identify data and various controller
+ + * register in our nvme_ctrl structure.  This should be called as soon as
+ + * the admin queue is fully up and running.
+ + */
+ +int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl)
+++=======
++ static inline u32 nvme_mps_to_sectors(struct nvme_ctrl *ctrl, u32 units)
++ {
++ 	u32 page_shift = NVME_CAP_MPSMIN(ctrl->cap) + 12;
++ 
++ 	return 1 << (units + page_shift - 9);
++ }
++ 
++ static int nvme_init_non_mdts_limits(struct nvme_ctrl *ctrl)
++ {
++ 	struct nvme_command c = { };
++ 	struct nvme_id_ctrl_nvm *id;
++ 	int ret;
++ 
++ 	if (ctrl->oncs & NVME_CTRL_ONCS_DSM) {
++ 		ctrl->max_discard_sectors = UINT_MAX;
++ 		ctrl->max_discard_segments = NVME_DSM_MAX_RANGES;
++ 	} else {
++ 		ctrl->max_discard_sectors = 0;
++ 		ctrl->max_discard_segments = 0;
++ 	}
++ 
++ 	/*
++ 	 * Even though NVMe spec explicitly states that MDTS is not applicable
++ 	 * to the write-zeroes, we are cautious and limit the size to the
++ 	 * controllers max_hw_sectors value, which is based on the MDTS field
++ 	 * and possibly other limiting factors.
++ 	 */
++ 	if ((ctrl->oncs & NVME_CTRL_ONCS_WRITE_ZEROES) &&
++ 	    !(ctrl->quirks & NVME_QUIRK_DISABLE_WRITE_ZEROES))
++ 		ctrl->max_zeroes_sectors = ctrl->max_hw_sectors;
++ 	else
++ 		ctrl->max_zeroes_sectors = 0;
++ 
++ 	if (nvme_ctrl_limited_cns(ctrl))
++ 		return 0;
++ 
++ 	id = kzalloc(sizeof(*id), GFP_KERNEL);
++ 	if (!id)
++ 		return 0;
++ 
++ 	c.identify.opcode = nvme_admin_identify;
++ 	c.identify.cns = NVME_ID_CNS_CS_CTRL;
++ 	c.identify.csi = NVME_CSI_NVM;
++ 
++ 	ret = nvme_submit_sync_cmd(ctrl->admin_q, &c, id, sizeof(*id));
++ 	if (ret)
++ 		goto free_data;
++ 
++ 	if (id->dmrl)
++ 		ctrl->max_discard_segments = id->dmrl;
++ 	if (id->dmrsl)
++ 		ctrl->max_discard_sectors = le32_to_cpu(id->dmrsl);
++ 	if (id->wzsl)
++ 		ctrl->max_zeroes_sectors = nvme_mps_to_sectors(ctrl, id->wzsl);
++ 
++ free_data:
++ 	kfree(id);
++ 	return ret;
++ }
++ 
++ static int nvme_init_identify(struct nvme_ctrl *ctrl)
+++>>>>>>> 5befc7c26e5a (nvme: implement non-mdts command limits)
+  {
+  	struct nvme_id_ctrl *id;
+- 	int ret, page_shift;
+  	u32 max_hw_sectors;
+  	bool prev_apst_enabled;
+++<<<<<<< HEAD
+ +
+ +	ret = ctrl->ops->reg_read32(ctrl, NVME_REG_VS, &ctrl->vs);
+ +	if (ret) {
+ +		dev_err(ctrl->device, "Reading VS failed (%d)\n", ret);
+ +		return ret;
+ +	}
+ +	page_shift = NVME_CAP_MPSMIN(ctrl->cap) + 12;
+ +	ctrl->sqsize = min_t(u16, NVME_CAP_MQES(ctrl->cap), ctrl->sqsize);
+ +
+ +	if (ctrl->vs >= NVME_VS(1, 1, 0))
+ +		ctrl->subsystem = NVME_CAP_NSSRC(ctrl->cap);
+++=======
++ 	int ret;
+++>>>>>>> 5befc7c26e5a (nvme: implement non-mdts command limits)
+  
+  	ret = nvme_identify_ctrl(ctrl, &id);
+  	if (ret) {
+@@@ -3289,6 -3251,39 +3331,42 @@@
+  	else if (!ctrl->apst_enabled && prev_apst_enabled)
+  		dev_pm_qos_hide_latency_tolerance(ctrl->device);
+  
+++<<<<<<< HEAD
+++=======
++ out_free:
++ 	kfree(id);
++ 	return ret;
++ }
++ 
++ /*
++  * Initialize the cached copies of the Identify data and various controller
++  * register in our nvme_ctrl structure.  This should be called as soon as
++  * the admin queue is fully up and running.
++  */
++ int nvme_init_ctrl_finish(struct nvme_ctrl *ctrl)
++ {
++ 	int ret;
++ 
++ 	ret = ctrl->ops->reg_read32(ctrl, NVME_REG_VS, &ctrl->vs);
++ 	if (ret) {
++ 		dev_err(ctrl->device, "Reading VS failed (%d)\n", ret);
++ 		return ret;
++ 	}
++ 
++ 	ctrl->sqsize = min_t(u16, NVME_CAP_MQES(ctrl->cap), ctrl->sqsize);
++ 
++ 	if (ctrl->vs >= NVME_VS(1, 1, 0))
++ 		ctrl->subsystem = NVME_CAP_NSSRC(ctrl->cap);
++ 
++ 	ret = nvme_init_identify(ctrl);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = nvme_init_non_mdts_limits(ctrl);
++ 	if (ret < 0)
++ 		return ret;
++ 
+++>>>>>>> 5befc7c26e5a (nvme: implement non-mdts command limits)
+  	ret = nvme_configure_apst(ctrl);
+  	if (ret < 0)
+  		return ret;
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 6299d4f17651..b067ad5536d8 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -276,6 +276,9 @@ struct nvme_ctrl {
+ 	u32 max_hw_sectors;
+ 	u32 max_segments;
+ 	u32 max_integrity_segments;
++	u32 max_discard_sectors;
++	u32 max_discard_segments;
++	u32 max_zeroes_sectors;
+ #ifdef CONFIG_BLK_DEV_ZONED
+ 	u32 max_zone_append;
+ #endif
+diff --git a/include/linux/nvme.h b/include/linux/nvme.h
+index 57c0175c5889..eaef97444bff 100644
+--- a/include/linux/nvme.h
++++ b/include/linux/nvme.h
+@@ -413,6 +413,16 @@ struct nvme_id_ctrl_zns {
+ 	__u8	rsvd1[4095];
+ };
+ 
++struct nvme_id_ctrl_nvm {
++	__u8	vsl;
++	__u8	wzsl;
++	__u8	wusl;
++	__u8	dmrl;
++	__le32	dmrsl;
++	__le64	dmsl;
++	__u8	rsvd16[4080];
++};
++
+ enum {
+ 	NVME_ID_CNS_NS			= 0x00,
+ 	NVME_ID_CNS_CTRL		= 0x01,
