@@ -1,0 +1,177 @@
+iommu: Move new probe_device path to separate function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit cf193888bfbd3d57e03a511e49d26f7d9c6f76df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cf193888.failed
+
+This makes it easier to remove to old code-path when all drivers are
+converted. As a side effect that it also fixes the error cleanup
+path.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Link: https://lore.kernel.org/r/20200429133712.31431-11-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit cf193888bfbd3d57e03a511e49d26f7d9c6f76df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+diff --cc drivers/iommu/iommu.c
+index 7997fcb701e0,8be047a4808f..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -161,17 -161,139 +161,90 @@@ void iommu_device_unregister(struct iom
+  	list_del(&iommu->list);
+  	spin_unlock(&iommu_device_lock);
+  }
+ -EXPORT_SYMBOL_GPL(iommu_device_unregister);
+ -
+ -static struct dev_iommu *dev_iommu_get(struct device *dev)
+ -{
+ -	struct dev_iommu *param = dev->iommu;
+ -
+ -	if (param)
+ -		return param;
+ -
+ -	param = kzalloc(sizeof(*param), GFP_KERNEL);
+ -	if (!param)
+ -		return NULL;
+ -
+ -	mutex_init(&param->lock);
+ -	dev->iommu = param;
+ -	return param;
+ -}
+ -
+ -static void dev_iommu_free(struct device *dev)
+ -{
+ -	kfree(dev->iommu);
+ -	dev->iommu = NULL;
+ -}
+ -
+ -static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
+ -{
+ -	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -	struct iommu_device *iommu_dev;
+ -	struct iommu_group *group;
+ -	int ret;
+ -
+ -	iommu_dev = ops->probe_device(dev);
+ -	if (IS_ERR(iommu_dev))
+ -		return PTR_ERR(iommu_dev);
+ -
+ -	dev->iommu->iommu_dev = iommu_dev;
+ -
+ -	group = iommu_group_get_for_dev(dev);
+ -	if (!IS_ERR(group)) {
+ -		ret = PTR_ERR(group);
+ -		goto out_release;
+ -	}
+ -	iommu_group_put(group);
+ -
+ -	if (group_list && !group->default_domain && list_empty(&group->entry))
+ -		list_add_tail(&group->entry, group_list);
+ -
+ -	iommu_device_link(iommu_dev, dev);
+ -
+ -	return 0;
+ -
+ -out_release:
+ -	ops->release_device(dev);
+ -
+ -	return ret;
+ -}
+  
++ static int __iommu_probe_device_helper(struct device *dev)
++ {
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 	struct iommu_group *group;
++ 	int ret;
++ 
++ 	ret = __iommu_probe_device(dev, NULL);
++ 	if (ret)
++ 		goto err_out;
++ 
++ 	/*
++ 	 * Try to allocate a default domain - needs support from the
++ 	 * IOMMU driver. There are still some drivers which don't
++ 	 * support default domains, so the return value is not yet
++ 	 * checked.
++ 	 */
++ 	iommu_alloc_default_domain(dev);
++ 
++ 	group = iommu_group_get(dev);
++ 	if (!group)
++ 		goto err_release;
++ 
++ 	if (group->default_domain)
++ 		ret = __iommu_attach_device(group->default_domain, dev);
++ 
++ 	iommu_group_put(group);
++ 
++ 	if (ret)
++ 		goto err_release;
++ 
++ 	if (ops->probe_finalize)
++ 		ops->probe_finalize(dev);
++ 
++ 	return 0;
++ 
++ err_release:
++ 	iommu_release_device(dev);
++ err_out:
++ 	return ret;
++ 
++ }
++ 
+  int iommu_probe_device(struct device *dev)
+  {
+  	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -	int ret;
+ +	int ret = -EINVAL;
+  
+  	WARN_ON(dev->iommu_group);
+++<<<<<<< HEAD
+ +
+ +	if (ops)
+ +		ret = ops->add_device(dev);
+ +
+++=======
++ 
++ 	if (!ops)
++ 		return -EINVAL;
++ 
++ 	if (!dev_iommu_get(dev))
++ 		return -ENOMEM;
++ 
++ 	if (!try_module_get(ops->owner)) {
++ 		ret = -EINVAL;
++ 		goto err_free_dev_param;
++ 	}
++ 
++ 	if (ops->probe_device)
++ 		return __iommu_probe_device_helper(dev);
++ 
++ 	ret = ops->add_device(dev);
++ 	if (ret)
++ 		goto err_module_put;
++ 
++ 	if (ops->probe_finalize)
++ 		ops->probe_finalize(dev);
++ 
++ 	return 0;
++ 
++ err_module_put:
++ 	module_put(ops->owner);
++ err_free_dev_param:
++ 	dev_iommu_free(dev);
+++>>>>>>> cf193888bfbd (iommu: Move new probe_device path to separate function)
+  	return ret;
+  }
+  
+* Unmerged path drivers/iommu/iommu.c
