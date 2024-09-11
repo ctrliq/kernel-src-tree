@@ -1,0 +1,430 @@
+printk: remove logbuf_lock writer-protection of ringbuffer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit b031a684bfd01d633c79d281bd0cf11c2f834ada
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b031a684.failed
+
+Since the ringbuffer is lockless, there is no need for it to be
+protected by @logbuf_lock. Remove @logbuf_lock writer-protection of
+the ringbuffer. The reader-protection is not removed because some
+variables, used by readers, are using @logbuf_lock for synchronization:
+@syslog_seq, @syslog_time, @syslog_partial, @console_seq,
+struct kmsg_dumper.
+
+For PRINTK_NMI_DIRECT_CONTEXT_MASK, @logbuf_lock usage is not removed
+because it may be used for dumper synchronization.
+
+Without @logbuf_lock synchronization of vprintk_store() it is no
+longer possible to use the single static buffer for temporarily
+sprint'ing the message. Instead, use vsnprintf() to determine the
+length and perform the real vscnprintf() using the area reserved from
+the ringbuffer. This leads to suboptimal packing of the message data,
+but will result in less wasted storage than multiple per-cpu buffers
+to support lockless temporary sprint'ing.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20201209004453.17720-3-john.ogness@linutronix.de
+(cherry picked from commit b031a684bfd01d633c79d281bd0cf11c2f834ada)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index c1fedccb5ed4,c8847ee571f0..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1203,13 -1103,52 +1203,57 @@@ void __init setup_log_buf(int early
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irqsave(flags);
+ +	log_buf_len = new_log_buf_len;
+ +	log_buf = new_log_buf;
+ +	new_log_buf_len = 0;
+ +	free = __LOG_BUF_LEN - log_next_idx;
+ +	memcpy(log_buf, __log_buf, __LOG_BUF_LEN);
+ +	logbuf_unlock_irqrestore(flags);
+++=======
++ 	new_descs_size = new_descs_count * sizeof(struct prb_desc);
++ 	new_descs = memblock_alloc(new_descs_size, LOG_ALIGN);
++ 	if (unlikely(!new_descs)) {
++ 		pr_err("log_buf_len: %zu desc bytes not available\n",
++ 		       new_descs_size);
++ 		goto err_free_log_buf;
++ 	}
++ 
++ 	new_infos_size = new_descs_count * sizeof(struct printk_info);
++ 	new_infos = memblock_alloc(new_infos_size, LOG_ALIGN);
++ 	if (unlikely(!new_infos)) {
++ 		pr_err("log_buf_len: %zu info bytes not available\n",
++ 		       new_infos_size);
++ 		goto err_free_descs;
++ 	}
++ 
++ 	prb_rec_init_rd(&r, &info, &setup_text_buf[0], sizeof(setup_text_buf));
++ 
++ 	prb_init(&printk_rb_dynamic,
++ 		 new_log_buf, ilog2(new_log_buf_len),
++ 		 new_descs, ilog2(new_descs_count),
++ 		 new_infos);
++ 
++ 	printk_safe_enter_irqsave(flags);
++ 
++ 	log_buf_len = new_log_buf_len;
++ 	log_buf = new_log_buf;
++ 	new_log_buf_len = 0;
++ 
++ 	free = __LOG_BUF_LEN;
++ 	prb_for_each_record(0, &printk_rb_static, seq, &r)
++ 		free -= add_to_rb(&printk_rb_dynamic, &r);
++ 
++ 	/*
++ 	 * This is early enough that everything is still running on the
++ 	 * boot CPU and interrupts are disabled. So no new messages will
++ 	 * appear during the transition to the dynamic buffer.
++ 	 */
++ 	prb = &printk_rb_dynamic;
++ 
++ 	printk_safe_exit_irqrestore(flags);
+ -
+ -	if (seq != prb_next_seq(&printk_rb_static)) {
+ -		pr_err("dropped %llu messages\n",
+ -		       prb_next_seq(&printk_rb_static) - seq);
+ -	}
+++>>>>>>> b031a684bfd0 (printk: remove logbuf_lock writer-protection of ringbuffer)
+  
+  	pr_info("log_buf_len: %u bytes\n", log_buf_len);
+  	pr_info("early log buf free: %u(%u%%)\n",
+@@@ -1847,143 -1861,177 +1891,274 @@@ static inline u32 printk_caller_id(void
+  		0x80000000 + raw_smp_processor_id();
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Continuation lines are buffered, and not committed to the record buffer
+ + * until the line is complete, or a race forces it. The line fragments
+ + * though, are printed immediately to the consoles to ensure everything has
+ + * reached the console in case of a kernel crash.
+ + */
+ +static struct cont {
+ +	char buf[LOG_LINE_MAX];
+ +	size_t len;			/* length == 0 means unused buffer */
+ +	u32 caller_id;			/* printk_caller_id() of first print */
+ +	u64 ts_nsec;			/* time of first print */
+ +	u8 level;			/* log level of first message */
+ +	u8 facility;			/* log facility of first message */
+ +	enum log_flags flags;		/* prefix, newline flags */
+ +} cont;
+ +
+ +static void cont_flush(void)
+ +{
+ +	if (cont.len == 0)
+ +		return;
+ +
+ +	log_store(cont.caller_id, cont.facility, cont.level, cont.flags,
+ +		  cont.ts_nsec, NULL, 0, cont.buf, cont.len);
+ +	cont.len = 0;
+ +}
+ +
+ +static bool cont_add(u32 caller_id, int facility, int level,
+ +		     enum log_flags flags, const char *text, size_t len)
+ +{
+ +	/* If the line gets too long, split it up in separate records. */
+ +	if (cont.len + len > sizeof(cont.buf)) {
+ +		cont_flush();
+ +		return false;
+ +	}
+ +
+ +	if (!cont.len) {
+ +		cont.facility = facility;
+ +		cont.level = level;
+ +		cont.caller_id = caller_id;
+ +		cont.ts_nsec = local_clock();
+ +		cont.flags = flags;
+ +	}
+ +
+ +	memcpy(cont.buf + cont.len, text, len);
+ +	cont.len += len;
+ +
+ +	// The original flags come from the first line,
+ +	// but later continuations can add a newline.
+ +	if (flags & LOG_NEWLINE) {
+ +		cont.flags |= LOG_NEWLINE;
+ +		cont_flush();
+ +	}
+ +
+ +	return true;
+ +}
+ +
+ +static size_t log_output(int facility, int level, enum log_flags lflags, const char *dict, size_t dictlen, char *text, size_t text_len)
+ +{
+ +	const u32 caller_id = printk_caller_id();
+++=======
++ /**
++  * parse_prefix - Parse level and control flags.
++  *
++  * @text:     The terminated text message.
++  * @level:    A pointer to the current level value, will be updated.
++  * @lflags:   A pointer to the current log flags, will be updated.
++  *
++  * @level may be NULL if the caller is not interested in the parsed value.
++  * Otherwise the variable pointed to by @level must be set to
++  * LOGLEVEL_DEFAULT in order to be updated with the parsed value.
++  *
++  * @lflags may be NULL if the caller is not interested in the parsed value.
++  * Otherwise the variable pointed to by @lflags will be OR'd with the parsed
++  * value.
++  *
++  * Return: The length of the parsed level and control flags.
++  */
++ static u16 parse_prefix(char *text, int *level, enum log_flags *lflags)
++ {
++ 	u16 prefix_len = 0;
++ 	int kern_level;
++ 
++ 	while (*text) {
++ 		kern_level = printk_get_level(text);
++ 		if (!kern_level)
++ 			break;
++ 
++ 		switch (kern_level) {
++ 		case '0' ... '7':
++ 			if (level && *level == LOGLEVEL_DEFAULT)
++ 				*level = kern_level - '0';
++ 			break;
++ 		case 'c':	/* KERN_CONT */
++ 			if (lflags)
++ 				*lflags |= LOG_CONT;
++ 		}
++ 
++ 		prefix_len += 2;
++ 		text += 2;
++ 	}
++ 
++ 	return prefix_len;
++ }
++ 
++ static u16 printk_sprint(char *text, u16 size, int facility, enum log_flags *lflags,
++ 			 const char *fmt, va_list args)
++ {
++ 	u16 text_len;
++ 
++ 	text_len = vscnprintf(text, size, fmt, args);
++ 
++ 	/* Mark and strip a trailing newline. */
++ 	if (text_len && text[text_len - 1] == '\n') {
++ 		text_len--;
++ 		*lflags |= LOG_NEWLINE;
++ 	}
++ 
++ 	/* Strip log level and control flags. */
++ 	if (facility == 0) {
++ 		u16 prefix_len;
++ 
++ 		prefix_len = parse_prefix(text, NULL, NULL);
++ 		if (prefix_len) {
++ 			text_len -= prefix_len;
++ 			memmove(text, text + prefix_len, text_len);
++ 		}
++ 	}
++ 
++ 	return text_len;
++ }
++ 
++ __printf(4, 0)
++ int vprintk_store(int facility, int level,
++ 		  const struct dev_printk_info *dev_info,
++ 		  const char *fmt, va_list args)
++ {
++ 	const u32 caller_id = printk_caller_id();
++ 	struct prb_reserved_entry e;
++ 	enum log_flags lflags = 0;
++ 	struct printk_record r;
++ 	u16 trunc_msg_len = 0;
++ 	char prefix_buf[8];
++ 	u16 reserve_size;
++ 	va_list args2;
++ 	u16 text_len;
++ 	u64 ts_nsec;
+++>>>>>>> b031a684bfd0 (printk: remove logbuf_lock writer-protection of ringbuffer)
+  
+  	/*
+ -	 * Since the duration of printk() can vary depending on the message
+ -	 * and state of the ringbuffer, grab the timestamp now so that it is
+ -	 * close to the call of printk(). This provides a more deterministic
+ -	 * timestamp with respect to the caller.
+ +	 * If an earlier line was buffered, and we're a continuation
+ +	 * write from the same context, try to add it to the buffer.
+  	 */
+ -	ts_nsec = local_clock();
+ +	if (cont.len) {
+ +		if (cont.caller_id == caller_id && (lflags & LOG_CONT)) {
+ +			if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +				return text_len;
+ +		}
+ +		/* Otherwise, make sure it's flushed */
+ +		cont_flush();
+ +	}
+ +
+ +	/* Skip empty continuation lines that couldn't be added - they just flush */
+ +	if (!text_len && (lflags & LOG_CONT))
+ +		return 0;
+ +
+ +	/* If it doesn't end in a newline, try to buffer the current line */
+ +	if (!(lflags & LOG_NEWLINE)) {
+ +		if (cont_add(caller_id, facility, level, lflags, text, text_len))
+ +			return text_len;
+ +	}
+ +
+ +	/* Store it in the record log */
+ +	return log_store(caller_id, facility, level, lflags, 0,
+ +			 dict, dictlen, text, text_len);
+ +}
+ +
+ +/* Must be called under logbuf_lock. */
+ +int vprintk_store(int facility, int level,
+ +		  const char *dict, size_t dictlen,
+ +		  const char *fmt, va_list args)
+ +{
+ +	static char textbuf[LOG_LINE_MAX];
+ +	char *text = textbuf;
+ +	size_t text_len;
+ +	enum log_flags lflags = 0;
+  
+  	/*
+- 	 * The printf needs to come first; we need the syslog
+- 	 * prefix which might be passed-in as a parameter.
++ 	 * The sprintf needs to come first since the syslog prefix might be
++ 	 * passed in as a parameter. An extra byte must be reserved so that
++ 	 * later the vscnprintf() into the reserved buffer has room for the
++ 	 * terminating '\0', which is not counted by vsnprintf().
+  	 */
+- 	text_len = vscnprintf(text, sizeof(textbuf), fmt, args);
+- 
+- 	/* mark and strip a trailing newline */
+- 	if (text_len && text[text_len-1] == '\n') {
+- 		text_len--;
+- 		lflags |= LOG_NEWLINE;
+- 	}
+- 
+- 	/* strip kernel syslog prefix and extract log level or control flags */
+- 	if (facility == 0) {
+- 		int kern_level;
++ 	va_copy(args2, args);
++ 	reserve_size = vsnprintf(&prefix_buf[0], sizeof(prefix_buf), fmt, args2) + 1;
++ 	va_end(args2);
+  
+- 		while ((kern_level = printk_get_level(text)) != 0) {
+- 			switch (kern_level) {
+- 			case '0' ... '7':
+- 				if (level == LOGLEVEL_DEFAULT)
+- 					level = kern_level - '0';
+- 				break;
+- 			case 'c':	/* KERN_CONT */
+- 				lflags |= LOG_CONT;
+- 			}
++ 	if (reserve_size > LOG_LINE_MAX)
++ 		reserve_size = LOG_LINE_MAX;
+  
+- 			text_len -= 2;
+- 			text += 2;
+- 		}
+- 	}
++ 	/* Extract log level or control flags. */
++ 	if (facility == 0)
++ 		parse_prefix(&prefix_buf[0], &level, &lflags);
+  
+  	if (level == LOGLEVEL_DEFAULT)
+  		level = default_message_loglevel;
+  
+ -	if (dev_info)
+ +	if (dict)
+  		lflags |= LOG_NEWLINE;
+  
+++<<<<<<< HEAD
+ +	return log_output(facility, level, lflags,
+ +			  dict, dictlen, text, text_len);
+++=======
++ 	if (lflags & LOG_CONT) {
++ 		prb_rec_init_wr(&r, reserve_size);
++ 		if (prb_reserve_in_last(&e, prb, &r, caller_id, LOG_LINE_MAX)) {
++ 			text_len = printk_sprint(&r.text_buf[r.info->text_len], reserve_size,
++ 						 facility, &lflags, fmt, args);
++ 			r.info->text_len += text_len;
++ 
++ 			if (lflags & LOG_NEWLINE) {
++ 				r.info->flags |= LOG_NEWLINE;
++ 				prb_final_commit(&e);
++ 			} else {
++ 				prb_commit(&e);
++ 			}
++ 
++ 			return text_len;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * Explicitly initialize the record before every prb_reserve() call.
++ 	 * prb_reserve_in_last() and prb_reserve() purposely invalidate the
++ 	 * structure when they fail.
++ 	 */
++ 	prb_rec_init_wr(&r, reserve_size);
++ 	if (!prb_reserve(&e, prb, &r)) {
++ 		/* truncate the message if it is too long for empty buffer */
++ 		truncate_msg(&reserve_size, &trunc_msg_len);
++ 
++ 		prb_rec_init_wr(&r, reserve_size + trunc_msg_len);
++ 		if (!prb_reserve(&e, prb, &r))
++ 			return 0;
++ 	}
++ 
++ 	/* fill message */
++ 	text_len = printk_sprint(&r.text_buf[0], reserve_size, facility, &lflags, fmt, args);
++ 	if (trunc_msg_len)
++ 		memcpy(&r.text_buf[text_len], trunc_msg, trunc_msg_len);
++ 	r.info->text_len = text_len + trunc_msg_len;
++ 	r.info->facility = facility;
++ 	r.info->level = level & 7;
++ 	r.info->flags = lflags & 0x1f;
++ 	r.info->ts_nsec = ts_nsec;
++ 	r.info->caller_id = caller_id;
++ 	if (dev_info)
++ 		memcpy(&r.info->dev_info, dev_info, sizeof(r.info->dev_info));
++ 
++ 	/* A message without a trailing newline can be continued. */
++ 	if (!(lflags & LOG_NEWLINE))
++ 		prb_commit(&e);
++ 	else
++ 		prb_final_commit(&e);
++ 
++ 	return (text_len + trunc_msg_len);
+++>>>>>>> b031a684bfd0 (printk: remove logbuf_lock writer-protection of ringbuffer)
+  }
+  
+  asmlinkage int vprintk_emit(int facility, int level,
+@@@ -2006,10 -2054,9 +2181,16 @@@
+  	boot_delay_msec(level);
+  	printk_delay();
+  
+++<<<<<<< HEAD
+ +	/* This stops the holder of console_sem just where we want him */
+ +	logbuf_lock_irqsave(flags);
+ +	printed_len = vprintk_store(facility, level, dict, dictlen, fmt, args);
+ +	logbuf_unlock_irqrestore(flags);
+++=======
++ 	printk_safe_enter_irqsave(flags);
++ 	printed_len = vprintk_store(facility, level, dev_info, fmt, args);
++ 	printk_safe_exit_irqrestore(flags);
+++>>>>>>> b031a684bfd0 (printk: remove logbuf_lock writer-protection of ringbuffer)
+  
+  	/* If called from the scheduler, we can not call up(). */
+  	if (!in_sched) {
+* Unmerged path kernel/printk/printk.c
