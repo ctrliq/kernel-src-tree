@@ -1,0 +1,143 @@
+mm/mmu_notifiers: add a lockdep map for invalidate_range_start/end
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Vetter <daniel.vetter@ffwll.ch>
+commit 23b68395c7c78a764e8963fc15a7cfd318bf187f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/23b68395.failed
+
+This is a similar idea to the fs_reclaim fake lockdep lock. It's fairly
+easy to provoke a specific notifier to be run on a specific range: Just
+prep it, and then munmap() it.
+
+A bit harder, but still doable, is to provoke the mmu notifiers for all
+the various callchains that might lead to them. But both at the same time
+is really hard to reliably hit, especially when you want to exercise paths
+like direct reclaim or compaction, where it's not easy to control what
+exactly will be unmapped.
+
+By introducing a lockdep map to tie them all together we allow lockdep to
+see a lot more dependencies, without having to actually hit them in a
+single challchain while testing.
+
+On Jason's suggestion this is is rolled out for both
+invalidate_range_start and invalidate_range_end. They both have the same
+calling context, hence we can share the same lockdep map. Note that the
+annotation for invalidate_ranage_start is outside of the
+mm_has_notifiers(), to make sure lockdep is informed about all paths
+leading to this context irrespective of whether mmu notifiers are present
+for a given context. We don't do that on the invalidate_range_end side to
+avoid paying the overhead twice, there the lockdep annotation is pushed
+down behind the mm_has_notifiers() check.
+
+Link: https://lore.kernel.org/r/20190826201425.17547-2-daniel.vetter@ffwll.ch
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Daniel Vetter <daniel.vetter@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 23b68395c7c78a764e8963fc15a7cfd318bf187f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmu_notifier.h
+diff --cc include/linux/mmu_notifier.h
+index 2684ed8b98c2,4dfe996dafd2..000000000000
+--- a/include/linux/mmu_notifier.h
++++ b/include/linux/mmu_notifier.h
+@@@ -285,25 -340,43 +289,46 @@@ static inline void mmu_notifier_change_
+  		__mmu_notifier_change_pte(mm, address, pte);
+  }
+  
+ -static inline void
+ -mmu_notifier_invalidate_range_start(struct mmu_notifier_range *range)
+ +static inline void mmu_notifier_invalidate_range_start(struct mm_struct *mm,
+ +				  unsigned long start, unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	if (mm_has_notifiers(mm))
+ +		__mmu_notifier_invalidate_range_start(mm, start, end);
+++=======
++ 	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
++ 	if (mm_has_notifiers(range->mm)) {
++ 		range->flags |= MMU_NOTIFIER_RANGE_BLOCKABLE;
++ 		__mmu_notifier_invalidate_range_start(range);
++ 	}
++ 	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+++>>>>>>> 23b68395c7c7 (mm/mmu_notifiers: add a lockdep map for invalidate_range_start/end)
+  }
+  
+ -static inline int
+ -mmu_notifier_invalidate_range_start_nonblock(struct mmu_notifier_range *range)
+ +static inline void mmu_notifier_invalidate_range_end(struct mm_struct *mm,
+ +				  unsigned long start, unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	if (mm_has_notifiers(mm))
+ +		__mmu_notifier_invalidate_range_end(mm, start, end, false);
+++=======
++ 	int ret = 0;
++ 
++ 	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
++ 	if (mm_has_notifiers(range->mm)) {
++ 		range->flags &= ~MMU_NOTIFIER_RANGE_BLOCKABLE;
++ 		ret = __mmu_notifier_invalidate_range_start(range);
++ 	}
++ 	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
++ 	return ret;
+++>>>>>>> 23b68395c7c7 (mm/mmu_notifiers: add a lockdep map for invalidate_range_start/end)
+  }
+  
+ -static inline void
+ -mmu_notifier_invalidate_range_end(struct mmu_notifier_range *range)
+ -{
+ -	if (mm_has_notifiers(range->mm))
+ -		__mmu_notifier_invalidate_range_end(range, false);
+ -}
+ -
+ -static inline void
+ -mmu_notifier_invalidate_range_only_end(struct mmu_notifier_range *range)
+ +static inline void mmu_notifier_invalidate_range_only_end(struct mm_struct *mm,
+ +				  unsigned long start, unsigned long end)
+  {
+ -	if (mm_has_notifiers(range->mm))
+ -		__mmu_notifier_invalidate_range_end(range, true);
+ +	if (mm_has_notifiers(mm))
+ +		__mmu_notifier_invalidate_range_end(mm, start, end, true);
+  }
+  
+  static inline void mmu_notifier_invalidate_range(struct mm_struct *mm,
+* Unmerged path include/linux/mmu_notifier.h
+diff --git a/mm/mmu_notifier.c b/mm/mmu_notifier.c
+index e6c07a8c4021..0607a427da95 100644
+--- a/mm/mmu_notifier.c
++++ b/mm/mmu_notifier.c
+@@ -23,6 +23,12 @@
+ /* global SRCU for all MMs */
+ DEFINE_STATIC_SRCU(srcu);
+ 
++#ifdef CONFIG_LOCKDEP
++struct lockdep_map __mmu_notifier_invalidate_range_start_map = {
++	.name = "mmu_notifier_invalidate_range_start"
++};
++#endif
++
+ /*
+  * This function allows mmu_notifier::release callback to delay a call to
+  * a function that will free appropriate resources. The function must be
+@@ -190,6 +196,7 @@ void __mmu_notifier_invalidate_range_end(struct mm_struct *mm,
+ 	struct mmu_notifier *mn;
+ 	int id;
+ 
++	lock_map_acquire(&__mmu_notifier_invalidate_range_start_map);
+ 	id = srcu_read_lock(&srcu);
+ 	hlist_for_each_entry_rcu(mn, &mm->mmu_notifier_mm->list, hlist) {
+ 		/*
+@@ -211,6 +218,7 @@ void __mmu_notifier_invalidate_range_end(struct mm_struct *mm,
+ 			mn->ops->invalidate_range_end(mn, mm, start, end);
+ 	}
+ 	srcu_read_unlock(&srcu, id);
++	lock_map_release(&__mmu_notifier_invalidate_range_start_map);
+ }
+ EXPORT_SYMBOL_GPL(__mmu_notifier_invalidate_range_end);
+ 
