@@ -1,0 +1,138 @@
+dm: fix race in dm_start_io_acct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Benjamin Marzinski <bmarzins@redhat.com>
+commit 10eb3a0d517fcc83eeea4242c149461205675eb4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/10eb3a0d.failed
+
+After commit 82f6cdcc3676c ("dm: switch dm_io booleans over to proper
+flags") dm_start_io_acct stopped atomically checking and setting
+was_accounted, which turned into the DM_IO_ACCOUNTED flag. This opened
+the possibility for a race where IO accounting is started twice for
+duplicate bios. To remove the race, check the flag while holding the
+io->lock.
+
+Fixes: 82f6cdcc3676c ("dm: switch dm_io booleans over to proper flags")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Benjamin Marzinski <bmarzins@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 10eb3a0d517fcc83eeea4242c149461205675eb4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,d5e6d33700e5..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -556,43 -495,80 +556,73 @@@ static bool bio_is_flush_with_data(stru
+  	return ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size);
+  }
+  
+ -static void dm_io_acct(struct dm_io *io, bool end)
+ +static void dm_io_acct(bool end, struct mapped_device *md, struct bio *bio,
+ +		       unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+ -	struct dm_stats_aux *stats_aux = &io->stats_aux;
+ -	unsigned long start_time = io->start_time;
+ -	struct mapped_device *md = io->md;
+ -	struct bio *bio = io->orig_bio;
+ -	unsigned int sectors;
+ +	bool is_flush_with_data;
+ +	unsigned int bi_size;
+  
+ -	/*
+ -	 * If REQ_PREFLUSH set, don't account payload, it will be
+ -	 * submitted (and accounted) after this flush completes.
+ -	 */
+ -	if (bio_is_flush_with_data(bio))
+ -		sectors = 0;
+ -	else if (likely(!(dm_io_flagged(io, DM_IO_WAS_SPLIT))))
+ -		sectors = bio_sectors(bio);
+ -	else
+ -		sectors = io->sectors;
+ +	/* If REQ_PREFLUSH set save any payload but do not account it */
+ +	is_flush_with_data = bio_is_flush_with_data(bio);
+ +	if (is_flush_with_data) {
+ +		bi_size = bio->bi_iter.bi_size;
+ +		bio->bi_iter.bi_size = 0;
+ +	}
+  
+  	if (!end)
+ -		bdev_start_io_acct(bio->bi_bdev, sectors, bio_op(bio),
+ -				   start_time);
+ +		bio_start_io_acct_time(bio, start_time);
+  	else
+ -		bdev_end_io_acct(bio->bi_bdev, bio_op(bio), start_time);
+ -
+ -	if (static_branch_unlikely(&stats_enabled) &&
+ -	    unlikely(dm_stats_used(&md->stats))) {
+ -		sector_t sector;
+ -
+ -		if (likely(!dm_io_flagged(io, DM_IO_WAS_SPLIT)))
+ -			sector = bio->bi_iter.bi_sector;
+ -		else
+ -			sector = bio_end_sector(bio) - io->sector_offset;
+ +		bio_end_io_acct(bio, start_time);
+  
+ +	if (unlikely(dm_stats_used(&md->stats)))
+  		dm_stats_account_io(&md->stats, bio_data_dir(bio),
+ -				    sector, sectors,
+ +				    bio->bi_iter.bi_sector, bio_sectors(bio),
+  				    end, start_time, stats_aux);
+ -	}
+ +
+ +	/* Restore bio's payload so it does get accounted upon requeue */
+ +	if (is_flush_with_data)
+ +		bio->bi_iter.bi_size = bi_size;
+  }
+  
+ -static void __dm_start_io_acct(struct dm_io *io)
+ +static void start_io_acct(struct dm_io *io)
+  {
+ -	dm_io_acct(io, false);
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+++=======
++ 	/*
++ 	 * Ensure IO accounting is only ever started once.
++ 	 */
++ 	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
++ 		return;
++ 
++ 	/* Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO. */
++ 	if (!clone || likely(dm_tio_is_normal(clone_to_tio(clone)))) {
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 	} else {
++ 		unsigned long flags;
++ 		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
++ 		spin_lock_irqsave(&io->lock, flags);
++ 		if (dm_io_flagged(io, DM_IO_ACCOUNTED)) {
++ 			spin_unlock_irqrestore(&io->lock, flags);
++ 			return;
++ 		}
++ 		dm_io_set_flag(io, DM_IO_ACCOUNTED);
++ 		spin_unlock_irqrestore(&io->lock, flags);
++ 	}
++ 
++ 	__dm_start_io_acct(io);
++ }
++ 
++ static void dm_end_io_acct(struct dm_io *io)
++ {
++ 	dm_io_acct(io, true);
+++>>>>>>> 10eb3a0d517f (dm: fix race in dm_start_io_acct)
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+* Unmerged path drivers/md/dm.c
