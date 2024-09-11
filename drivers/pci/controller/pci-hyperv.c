@@ -500,7 +500,6 @@ struct hv_pcibus_device {
 	struct list_head dr_list;
 
 	struct msi_domain_info msi_info;
-	struct msi_controller msi_chip;
 	struct irq_domain *irq_domain;
 
 	spinlock_t retarget_msi_interrupt_lock;
@@ -1933,9 +1932,6 @@ static int create_root_hv_pci_bus(struct hv_pcibus_device *hbus)
 	error = pci_scan_root_bus_bridge(bridge);
 	if (error)
 		return error;
-
-	hbus->pci_bus->msi = &hbus->msi_chip;
-	hbus->pci_bus->msi->dev = &hbus->hdev->device;
 
 	pci_lock_rescan_remove();
 	hv_pci_assign_numa_node(hbus);
