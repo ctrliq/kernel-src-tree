@@ -1,0 +1,188 @@
+blk-mq: support multiple hctx maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit b3c661b15d5ab11d982e58bee23e05c1780528a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/b3c661b1.failed
+
+Add support for the tag set carrying multiple queue maps, and
+for the driver to inform blk-mq how many it wishes to support
+through setting set->nr_maps.
+
+This adds an mq_ops helper for drivers that support more than 1
+map, mq_ops->rq_flags_to_type(). The function takes request/bio
+flags and CPU, and returns a queue map index for that. We then
+use the type information in blk_mq_map_queue() to index the map
+set.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b3c661b15d5ab11d982e58bee23e05c1780528a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq.c
+#	block/blk-mq.h
+diff --cc block/blk-mq.c
+index aae5a0029422,2e730c95513f..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2265,9 -2274,11 +2266,17 @@@ static void blk_mq_init_cpu_queues(stru
+  		 * Set local node, IFF we have more than one hw queue. If
+  		 * not, we remain on the home node of the device
+  		 */
+++<<<<<<< HEAD
+ +		hctx = blk_mq_map_queue(q, i);
+ +		if (nr_hw_queues > 1 && hctx->numa_node == NUMA_NO_NODE)
+ +			hctx->numa_node = local_memory_node(cpu_to_node(i));
+++=======
++ 		for (j = 0; j < set->nr_maps; j++) {
++ 			hctx = blk_mq_map_queue_type(q, j, i);
++ 			if (nr_hw_queues > 1 && hctx->numa_node == NUMA_NO_NODE)
++ 				hctx->numa_node = local_memory_node(cpu_to_node(i));
++ 		}
+++>>>>>>> b3c661b15d5a (blk-mq: support multiple hctx maps)
+  	}
+  }
+  
+@@@ -2338,11 -2349,28 +2347,36 @@@ static void blk_mq_map_swqueue(struct r
+  		}
+  
+  		ctx = per_cpu_ptr(q->queue_ctx, i);
+++<<<<<<< HEAD
+ +		hctx = blk_mq_map_queue(q, i);
+ +
+ +		cpumask_set_cpu(i, hctx->cpumask);
+ +		ctx->index_hw = hctx->nr_ctx;
+ +		hctx->ctxs[hctx->nr_ctx++] = ctx;
+++=======
++ 		for (j = 0; j < set->nr_maps; j++) {
++ 			hctx = blk_mq_map_queue_type(q, j, i);
++ 
++ 			/*
++ 			 * If the CPU is already set in the mask, then we've
++ 			 * mapped this one already. This can happen if
++ 			 * devices share queues across queue maps.
++ 			 */
++ 			if (cpumask_test_cpu(i, hctx->cpumask))
++ 				continue;
++ 
++ 			cpumask_set_cpu(i, hctx->cpumask);
++ 			hctx->type = j;
++ 			ctx->index_hw[hctx->type] = hctx->nr_ctx;
++ 			hctx->ctxs[hctx->nr_ctx++] = ctx;
++ 
++ 			/*
++ 			 * If the nr_ctx type overflows, we have exceeded the
++ 			 * amount of sw queues we can support.
++ 			 */
++ 			BUG_ON(!hctx->nr_ctx);
++ 		}
+++>>>>>>> b3c661b15d5a (blk-mq: support multiple hctx maps)
+  	}
+  
+  	mutex_unlock(&q->sysfs_lock);
+diff --cc block/blk-mq.h
+index d9facfb9ca51,053862270125..000000000000
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@@ -72,19 -72,37 +72,52 @@@ void blk_mq_try_issue_list_directly(str
+   */
+  extern int blk_mq_hw_queue_to_node(struct blk_mq_queue_map *qmap, unsigned int);
+  
+++<<<<<<< HEAD
+ +static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
+ +						     unsigned int cpu)
+ +{
+ +	struct blk_mq_tag_set *set = q->tag_set;
+ +
+ +	return q->queue_hw_ctx[set->map[0].mq_map[cpu]];
+ +}
+ +
+++=======
++ /*
++  * blk_mq_map_queue_type() - map (hctx_type,cpu) to hardware queue
++  * @q: request queue
++  * @hctx_type: the hctx type index
++  * @cpu: CPU
++  */
+++>>>>>>> b3c661b15d5a (blk-mq: support multiple hctx maps)
+  static inline struct blk_mq_hw_ctx *blk_mq_map_queue_type(struct request_queue *q,
+  							  unsigned int hctx_type,
+  							  unsigned int cpu)
+  {
+++<<<<<<< HEAD
+ +	return blk_mq_map_queue(q, cpu);
+++=======
++ 	struct blk_mq_tag_set *set = q->tag_set;
++ 
++ 	return q->queue_hw_ctx[set->map[hctx_type].mq_map[cpu]];
++ }
++ 
++ /*
++  * blk_mq_map_queue() - map (cmd_flags,type) to hardware queue
++  * @q: request queue
++  * @flags: request command flags
++  * @cpu: CPU
++  */
++ static inline struct blk_mq_hw_ctx *blk_mq_map_queue(struct request_queue *q,
++ 						     unsigned int flags,
++ 						     unsigned int cpu)
++ {
++ 	int hctx_type = 0;
++ 
++ 	if (q->mq_ops->rq_flags_to_type)
++ 		hctx_type = q->mq_ops->rq_flags_to_type(q, flags);
++ 
++ 	return blk_mq_map_queue_type(q, hctx_type, cpu);
+++>>>>>>> b3c661b15d5a (blk-mq: support multiple hctx maps)
+  }
+  
+  /*
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk-mq.h
+diff --git a/include/linux/blk-mq.h b/include/linux/blk-mq.h
+index 8e2d34099914..d4e1244f8afd 100644
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@ -84,7 +84,14 @@ enum {
+ };
+ 
+ struct blk_mq_tag_set {
++	/*
++	 * map[] holds ctx -> hctx mappings, one map exists for each type
++	 * that the driver wishes to support. There are no restrictions
++	 * on maps being of the same size, and it's perfectly legal to
++	 * share maps between types.
++	 */
+ 	struct blk_mq_queue_map	map[HCTX_MAX_TYPES];
++	unsigned int		nr_maps;	/* nr entries in map[] */
+ 	const struct blk_mq_ops	*ops;
+ 	unsigned int		nr_hw_queues;	/* nr hw queues across maps */
+ 	unsigned int		queue_depth;	/* max hw supported */
+@@ -108,6 +115,8 @@ struct blk_mq_queue_data {
+ 
+ typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
+ 		const struct blk_mq_queue_data *);
++/* takes rq->cmd_flags as input, returns a hardware type index */
++typedef int (rq_flags_to_type_fn)(struct request_queue *, unsigned int);
+ typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
+ typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
+ typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+@@ -132,6 +141,11 @@ struct blk_mq_ops {
+ 	 */
+ 	queue_rq_fn		*queue_rq;
+ 
++	/*
++	 * Return a queue map type for the given request/bio flags
++	 */
++	rq_flags_to_type_fn	*rq_flags_to_type;
++
+ 	/*
+ 	 * Reserve budget before queue request, once .queue_rq is
+ 	 * run, it is driver's responsibility to release the
