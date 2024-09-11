@@ -1,0 +1,130 @@
+fuse: implement crossmounts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Max Reitz <mreitz@redhat.com>
+commit bf109c64040f5b6bfe8a7044667e11d62dff6d91
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/bf109c64.failed
+
+FUSE servers can indicate crossmount points by setting FUSE_ATTR_SUBMOUNT
+in fuse_attr.flags.  The inode will then be marked as S_AUTOMOUNT, and the
+.d_automount implementation creates a new submount at that location, so
+that the submount gets a distinct st_dev value.
+
+Note that all submounts get a distinct superblock and a distinct st_dev
+value, so for virtio-fs, even if the same filesystem is mounted more than
+once on the host, none of its mount points will have the same st_dev.  We
+need distinct superblocks because the superblock points to the root node,
+but the different host mounts may show different trees (e.g. due to
+submounts in some of them, but not in others).
+
+Right now, this behavior is only enabled when fuse_conn.auto_submounts is
+set, which is the case only for virtio-fs.
+
+	Signed-off-by: Max Reitz <mreitz@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit bf109c64040f5b6bfe8a7044667e11d62dff6d91)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dir.c
+diff --cc fs/fuse/dir.c
+index 4026eb58cd91,ff7dbeb16f88..000000000000
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@@ -237,8 -238,10 +238,15 @@@ static int fuse_dentry_revalidate(struc
+  			ret = -ENOENT;
+  		if (!ret) {
+  			fi = get_fuse_inode(inode);
+++<<<<<<< HEAD
+ +			if (outarg.nodeid != get_node_id(inode)) {
+ +				fuse_queue_forget(fc, forget, outarg.nodeid, 1);
+++=======
++ 			if (outarg.nodeid != get_node_id(inode) ||
++ 			    (bool) IS_AUTOMOUNT(inode) != (bool) (outarg.attr.flags & FUSE_ATTR_SUBMOUNT)) {
++ 				fuse_queue_forget(fm->fc, forget,
++ 						  outarg.nodeid, 1);
+++>>>>>>> bf109c64040f (fuse: implement crossmounts)
+  				goto invalid;
+  			}
+  			spin_lock(&fi->lock);
+* Unmerged path fs/fuse/dir.c
+diff --git a/fs/fuse/fuse_i.h b/fs/fuse/fuse_i.h
+index 1e2f0f27c1cd..7bee0aa4e0a4 100644
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@ -743,6 +743,9 @@ struct fuse_conn {
+ 	/** Do not allow MNT_FORCE umount */
+ 	unsigned int no_force_umount:1;
+ 
++	/* Auto-mount submounts announced by the server */
++	unsigned int auto_submounts:1;
++
+ 	/** The number of requests waiting for completion */
+ 	atomic_t num_waiting;
+ 
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index ad83ccd9accc..c8ae5ff09cac 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -310,7 +310,26 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+ 	struct fuse_inode *fi;
+ 	struct fuse_conn *fc = get_fuse_conn_super(sb);
+ 
+- retry:
++	/*
++	 * Auto mount points get their node id from the submount root, which is
++	 * not a unique identifier within this filesystem.
++	 *
++	 * To avoid conflicts, do not place submount points into the inode hash
++	 * table.
++	 */
++	if (fc->auto_submounts && (attr->flags & FUSE_ATTR_SUBMOUNT) &&
++	    S_ISDIR(attr->mode)) {
++		inode = new_inode(sb);
++		if (!inode)
++			return NULL;
++
++		fuse_init_inode(inode, attr);
++		get_fuse_inode(inode)->nodeid = nodeid;
++		inode->i_flags |= S_AUTOMOUNT;
++		goto done;
++	}
++
++retry:
+ 	inode = iget5_locked(sb, nodeid, fuse_inode_eq, fuse_inode_set, &nodeid);
+ 	if (!inode)
+ 		return NULL;
+@@ -328,7 +347,7 @@ struct inode *fuse_iget(struct super_block *sb, u64 nodeid,
+ 		iput(inode);
+ 		goto retry;
+ 	}
+-
++done:
+ 	fi = get_fuse_inode(inode);
+ 	spin_lock(&fi->lock);
+ 	fi->nlookup++;
+@@ -1044,6 +1063,9 @@ void fuse_send_init(struct fuse_conn *fc)
+ 	if (fc->dax)
+ 		ia->in.flags |= FUSE_MAP_ALIGNMENT;
+ #endif
++	if (fm->fc->auto_submounts)
++		ia->in.flags |= FUSE_SUBMOUNTS;
++
+ 	ia->args.opcode = FUSE_INIT;
+ 	ia->args.in_numargs = 1;
+ 	ia->args.in_args[0].size = sizeof(ia->in);
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index b0eea2a11d25..b76b1965f53b 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1434,6 +1434,7 @@ static int virtio_fs_get_tree(struct fs_context *fsc)
+ 		       fs);
+ 	fc->release = fuse_free_conn;
+ 	fc->delete_stale = true;
++	fc->auto_submounts = true;
+ 
+ 	fsc->s_fs_info = fc;
+ 	sb = sget_fc(fsc, virtio_fs_test_super, virtio_fs_set_super);
