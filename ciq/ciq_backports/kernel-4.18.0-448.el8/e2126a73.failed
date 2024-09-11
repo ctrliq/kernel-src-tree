@@ -1,0 +1,170 @@
+s390/vfio-ap: allow assignment of unavailable AP queues to mdev device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit e2126a73746ec6d5f519edf5bf33d76347a51ee9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/e2126a73.failed
+
+The current implementation does not allow assignment of an AP adapter or
+domain to an mdev device if each APQN resulting from the assignment
+does not reference an AP queue device that is bound to the vfio_ap device
+driver. This patch allows assignment of AP resources to the matrix mdev as
+long as the APQNs resulting from the assignment:
+   1. Are not reserved by the AP BUS for use by the zcrypt device drivers.
+   2. Are not assigned to another matrix mdev.
+
+The rationale behind this is that the AP architecture does not preclude
+assignment of APQNs to an AP configuration profile that are not available
+to the system.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Halil Pasic <pasic@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit e2126a73746ec6d5f519edf5bf33d76347a51ee9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,f1f24b359a85..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -560,6 -727,26 +469,29 @@@ static int vfio_ap_mdev_verify_no_shari
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vfio_ap_mdev_validate_masks(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	if (ap_apqn_in_matrix_owned_by_def_drv(matrix_mdev->matrix.apm,
++ 					       matrix_mdev->matrix.aqm))
++ 		return -EADDRNOTAVAIL;
++ 
++ 	return vfio_ap_mdev_verify_no_sharing(matrix_mdev->matrix.apm,
++ 					      matrix_mdev->matrix.aqm);
++ }
++ 
++ static void vfio_ap_mdev_link_adapter(struct ap_matrix_mdev *matrix_mdev,
++ 				      unsigned long apid)
++ {
++ 	unsigned long apqi;
++ 
++ 	for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm, AP_DOMAINS)
++ 		vfio_ap_mdev_link_apqn(matrix_mdev,
++ 				       AP_MKQID(apid, apqi));
++ }
++ 
+++>>>>>>> e2126a73746e (s390/vfio-ap: allow assignment of unavailable AP queues to mdev device)
+  /**
+   * assign_adapter_store - parses the APID from @buf and sets the
+   * corresponding bit in the mediated matrix device's APM
+@@@ -616,26 -804,20 +548,15 @@@ static ssize_t assign_adapter_store(str
+  		goto done;
+  	}
+  
+- 	/*
+- 	 * Set the bit in the AP mask (APM) corresponding to the AP adapter
+- 	 * number (APID). The bits in the mask, from most significant to least
+- 	 * significant bit, correspond to APIDs 0-255.
+- 	 */
+- 	ret = vfio_ap_mdev_verify_queues_reserved_for_apid(matrix_mdev, apid);
+- 	if (ret)
+- 		goto done;
+- 
+  	set_bit_inv(apid, matrix_mdev->matrix.apm);
+  
+- 	ret = vfio_ap_mdev_verify_no_sharing(matrix_mdev);
+- 	if (ret)
+- 		goto share_err;
++ 	ret = vfio_ap_mdev_validate_masks(matrix_mdev);
++ 	if (ret) {
++ 		clear_bit_inv(apid, matrix_mdev->matrix.apm);
++ 		goto done;
++ 	}
+  
+ -	vfio_ap_mdev_link_adapter(matrix_mdev, apid);
+ -	memset(apm_delta, 0, sizeof(apm_delta));
+ -	set_bit_inv(apid, apm_delta);
+ -	vfio_ap_mdev_filter_matrix(apm_delta,
+ -				   matrix_mdev->matrix.aqm, matrix_mdev);
+  	ret = count;
+- 	goto done;
+- 
+- share_err:
+- 	clear_bit_inv(apid, matrix_mdev->matrix.apm);
+  done:
+  	mutex_unlock(&matrix_dev->lock);
+  
+@@@ -692,24 -892,14 +613,35 @@@ done
+  }
+  static DEVICE_ATTR_WO(unassign_adapter);
+  
+++<<<<<<< HEAD
+ +static int
+ +vfio_ap_mdev_verify_queues_reserved_for_apqi(struct ap_matrix_mdev *matrix_mdev,
+ +					     unsigned long apqi)
+ +{
+ +	int ret;
+ +	unsigned long apid;
+ +	unsigned long nbits = matrix_mdev->matrix.apm_max + 1;
+ +
+ +	if (find_first_bit_inv(matrix_mdev->matrix.apm, nbits) >= nbits)
+ +		return vfio_ap_verify_queue_reserved(NULL, &apqi);
+ +
+ +	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, nbits) {
+ +		ret = vfio_ap_verify_queue_reserved(&apid, &apqi);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	return 0;
+++=======
++ static void vfio_ap_mdev_link_domain(struct ap_matrix_mdev *matrix_mdev,
++ 				     unsigned long apqi)
++ {
++ 	unsigned long apid;
++ 
++ 	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, AP_DEVICES)
++ 		vfio_ap_mdev_link_apqn(matrix_mdev,
++ 				       AP_MKQID(apid, apqi));
+++>>>>>>> e2126a73746e (s390/vfio-ap: allow assignment of unavailable AP queues to mdev device)
+  }
+  
+  /**
+@@@ -768,21 -958,20 +700,15 @@@ static ssize_t assign_domain_store(stru
+  		goto done;
+  	}
+  
+- 	ret = vfio_ap_mdev_verify_queues_reserved_for_apqi(matrix_mdev, apqi);
+- 	if (ret)
+- 		goto done;
+- 
+  	set_bit_inv(apqi, matrix_mdev->matrix.aqm);
+  
+- 	ret = vfio_ap_mdev_verify_no_sharing(matrix_mdev);
+- 	if (ret)
+- 		goto share_err;
++ 	ret = vfio_ap_mdev_validate_masks(matrix_mdev);
++ 	if (ret) {
++ 		clear_bit_inv(apqi, matrix_mdev->matrix.aqm);
++ 		goto done;
++ 	}
+  
+ -	vfio_ap_mdev_link_domain(matrix_mdev, apqi);
+ -	memset(aqm_delta, 0, sizeof(aqm_delta));
+ -	set_bit_inv(apqi, aqm_delta);
+ -	vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm, aqm_delta,
+ -				   matrix_mdev);
+  	ret = count;
+- 	goto done;
+- 
+- share_err:
+- 	clear_bit_inv(apqi, matrix_mdev->matrix.aqm);
+  done:
+  	mutex_unlock(&matrix_dev->lock);
+  
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
