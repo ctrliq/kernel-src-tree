@@ -1,0 +1,210 @@
+selftests: KVM: Introduce psci_cpu_on_test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Oliver Upton <oupton@google.com>
+commit cb97cf95c44021278b7637731bc0928026bc29ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/cb97cf95.failed
+
+Introduce a test for aarch64 that ensures CPU resets induced by PSCI are
+reflected in the target vCPU's state, even if the target is never run
+again. This is a regression test for a race between vCPU migration and
+PSCI.
+
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20210818202133.1106786-5-oupton@google.com
+(cherry picked from commit cb97cf95c44021278b7637731bc0928026bc29ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+#	tools/testing/selftests/kvm/Makefile
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 875fd0bd2081,98053d3afbda..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -1,3 -1,11 +1,14 @@@
+++<<<<<<< HEAD
+++=======
++ # SPDX-License-Identifier: GPL-2.0-only
++ /aarch64/debug-exceptions
++ /aarch64/get-reg-list
++ /aarch64/psci_cpu_on_test
++ /aarch64/vgic_init
++ /s390x/memop
++ /s390x/resets
++ /s390x/sync_regs_test
+++>>>>>>> cb97cf95c440 (selftests: KVM: Introduce psci_cpu_on_test)
+  /x86_64/cr4_cpuid_sync_test
+  /x86_64/debug_regs
+  /x86_64/evmcs_test
+diff --cc tools/testing/selftests/kvm/Makefile
+index 8d904d4815e5,5d05801ab816..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -88,7 -86,7 +88,11 @@@ TEST_GEN_PROGS_x86_64 += kvm_binary_sta
+  
+  TEST_GEN_PROGS_aarch64 += aarch64/debug-exceptions
+  TEST_GEN_PROGS_aarch64 += aarch64/get-reg-list
+++<<<<<<< HEAD
+ +TEST_GEN_PROGS_aarch64 += aarch64/get-reg-list-sve
+++=======
++ TEST_GEN_PROGS_aarch64 += aarch64/psci_cpu_on_test
+++>>>>>>> cb97cf95c440 (selftests: KVM: Introduce psci_cpu_on_test)
+  TEST_GEN_PROGS_aarch64 += aarch64/vgic_init
+  TEST_GEN_PROGS_aarch64 += demand_paging_test
+  TEST_GEN_PROGS_aarch64 += dirty_log_test
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+* Unmerged path tools/testing/selftests/kvm/Makefile
+diff --git a/tools/testing/selftests/kvm/aarch64/psci_cpu_on_test.c b/tools/testing/selftests/kvm/aarch64/psci_cpu_on_test.c
+new file mode 100644
+index 000000000000..018c269990e1
+--- /dev/null
++++ b/tools/testing/selftests/kvm/aarch64/psci_cpu_on_test.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * psci_cpu_on_test - Test that the observable state of a vCPU targeted by the
++ * CPU_ON PSCI call matches what the caller requested.
++ *
++ * Copyright (c) 2021 Google LLC.
++ *
++ * This is a regression test for a race between KVM servicing the PSCI call and
++ * userspace reading the vCPUs registers.
++ */
++
++#define _GNU_SOURCE
++
++#include <linux/psci.h>
++
++#include "kvm_util.h"
++#include "processor.h"
++#include "test_util.h"
++
++#define VCPU_ID_SOURCE 0
++#define VCPU_ID_TARGET 1
++
++#define CPU_ON_ENTRY_ADDR 0xfeedf00dul
++#define CPU_ON_CONTEXT_ID 0xdeadc0deul
++
++static uint64_t psci_cpu_on(uint64_t target_cpu, uint64_t entry_addr,
++			    uint64_t context_id)
++{
++	register uint64_t x0 asm("x0") = PSCI_0_2_FN64_CPU_ON;
++	register uint64_t x1 asm("x1") = target_cpu;
++	register uint64_t x2 asm("x2") = entry_addr;
++	register uint64_t x3 asm("x3") = context_id;
++
++	asm("hvc #0"
++	    : "=r"(x0)
++	    : "r"(x0), "r"(x1), "r"(x2), "r"(x3)
++	    : "memory");
++
++	return x0;
++}
++
++static uint64_t psci_affinity_info(uint64_t target_affinity,
++				   uint64_t lowest_affinity_level)
++{
++	register uint64_t x0 asm("x0") = PSCI_0_2_FN64_AFFINITY_INFO;
++	register uint64_t x1 asm("x1") = target_affinity;
++	register uint64_t x2 asm("x2") = lowest_affinity_level;
++
++	asm("hvc #0"
++	    : "=r"(x0)
++	    : "r"(x0), "r"(x1), "r"(x2)
++	    : "memory");
++
++	return x0;
++}
++
++static void guest_main(uint64_t target_cpu)
++{
++	GUEST_ASSERT(!psci_cpu_on(target_cpu, CPU_ON_ENTRY_ADDR, CPU_ON_CONTEXT_ID));
++	uint64_t target_state;
++
++	do {
++		target_state = psci_affinity_info(target_cpu, 0);
++
++		GUEST_ASSERT((target_state == PSCI_0_2_AFFINITY_LEVEL_ON) ||
++			     (target_state == PSCI_0_2_AFFINITY_LEVEL_OFF));
++	} while (target_state != PSCI_0_2_AFFINITY_LEVEL_ON);
++
++	GUEST_DONE();
++}
++
++int main(void)
++{
++	uint64_t target_mpidr, obs_pc, obs_x0;
++	struct kvm_vcpu_init init;
++	struct kvm_vm *vm;
++	struct ucall uc;
++
++	vm = vm_create(VM_MODE_DEFAULT, DEFAULT_GUEST_PHY_PAGES, O_RDWR);
++	kvm_vm_elf_load(vm, program_invocation_name);
++	ucall_init(vm, NULL);
++
++	vm_ioctl(vm, KVM_ARM_PREFERRED_TARGET, &init);
++	init.features[0] |= (1 << KVM_ARM_VCPU_PSCI_0_2);
++
++	aarch64_vcpu_add_default(vm, VCPU_ID_SOURCE, &init, guest_main);
++
++	/*
++	 * make sure the target is already off when executing the test.
++	 */
++	init.features[0] |= (1 << KVM_ARM_VCPU_POWER_OFF);
++	aarch64_vcpu_add_default(vm, VCPU_ID_TARGET, &init, guest_main);
++
++	get_reg(vm, VCPU_ID_TARGET, ARM64_SYS_REG(MPIDR_EL1), &target_mpidr);
++	vcpu_args_set(vm, VCPU_ID_SOURCE, 1, target_mpidr & MPIDR_HWID_BITMASK);
++	vcpu_run(vm, VCPU_ID_SOURCE);
++
++	switch (get_ucall(vm, VCPU_ID_SOURCE, &uc)) {
++	case UCALL_DONE:
++		break;
++	case UCALL_ABORT:
++		TEST_FAIL("%s at %s:%ld", (const char *)uc.args[0], __FILE__,
++			  uc.args[1]);
++		break;
++	default:
++		TEST_FAIL("Unhandled ucall: %lu", uc.cmd);
++	}
++
++	get_reg(vm, VCPU_ID_TARGET, ARM64_CORE_REG(regs.pc), &obs_pc);
++	get_reg(vm, VCPU_ID_TARGET, ARM64_CORE_REG(regs.regs[0]), &obs_x0);
++
++	TEST_ASSERT(obs_pc == CPU_ON_ENTRY_ADDR,
++		    "unexpected target cpu pc: %lx (expected: %lx)",
++		    obs_pc, CPU_ON_ENTRY_ADDR);
++	TEST_ASSERT(obs_x0 == CPU_ON_CONTEXT_ID,
++		    "unexpected target context id: %lx (expected: %lx)",
++		    obs_x0, CPU_ON_CONTEXT_ID);
++
++	kvm_vm_free(vm);
++	return 0;
++}
+diff --git a/tools/testing/selftests/kvm/include/aarch64/processor.h b/tools/testing/selftests/kvm/include/aarch64/processor.h
+index 27dc5c2e56b9..c0273aefa63d 100644
+--- a/tools/testing/selftests/kvm/include/aarch64/processor.h
++++ b/tools/testing/selftests/kvm/include/aarch64/processor.h
+@@ -17,6 +17,7 @@
+ #define CPACR_EL1               3, 0,  1, 0, 2
+ #define TCR_EL1                 3, 0,  2, 0, 2
+ #define MAIR_EL1                3, 0, 10, 2, 0
++#define MPIDR_EL1               3, 0,  0, 0, 5
+ #define TTBR0_EL1               3, 0,  2, 0, 0
+ #define SCTLR_EL1               3, 0,  1, 0, 0
+ #define VBAR_EL1                3, 0, 12, 0, 0
+@@ -40,6 +41,8 @@
+ 			  (0xfful << (4 * 8)) | \
+ 			  (0xbbul << (5 * 8)))
+ 
++#define MPIDR_HWID_BITMASK (0xff00fffffful)
++
+ static inline void get_reg(struct kvm_vm *vm, uint32_t vcpuid, uint64_t id, uint64_t *addr)
+ {
+ 	struct kvm_one_reg reg;
