@@ -1,0 +1,204 @@
+md/raid5: Ensure batch_last is released before sleeping for quiesce
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit 20313b1b8cd1bda34ee136b656c39ff2ae189330
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/20313b1b.failed
+
+A race condition exists where if raid5_quiesce() is called in the
+middle of a request that has set batch_last, it will deadlock.
+
+batch_last will hold a reference to a stripe when raid5_quiesce() is
+called. This will cause the next raid5_get_active_stripe() call to
+sleep waiting for the quiesce to finish, but the raid5_quiesce() thread
+will wait for active_stripes to go to zero which will never happen
+because request thread is waiting for the quiesce to stop.
+
+Fix this by creating a special __raid5_get_active_stripe() function
+which takes the request context and clears the last_batch before
+sleeping.
+
+While we're at it, change the arguments of raid5_get_active_stripe()
+to bools.
+
+Fixes: 3312e6c887fe ("md/raid5: Keep a reference to last stripe_head for batch")
+	Reported-by: David Sloan <David.Sloan@eideticom.com>
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Song Liu <song@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 20313b1b8cd1bda34ee136b656c39ff2ae189330)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 402cdd6bb213,8d10b190bdbb..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -763,9 -755,54 +763,60 @@@ static bool has_failed(struct r5conf *c
+  	return degraded > conf->max_degraded;
+  }
+  
+++<<<<<<< HEAD
+ +struct stripe_head *
+ +raid5_get_active_stripe(struct r5conf *conf, sector_t sector,
+ +			int previous, int noblock, int noquiesce)
+++=======
++ enum stripe_result {
++ 	STRIPE_SUCCESS = 0,
++ 	STRIPE_RETRY,
++ 	STRIPE_SCHEDULE_AND_RETRY,
++ 	STRIPE_FAIL,
++ };
++ 
++ struct stripe_request_ctx {
++ 	/* a reference to the last stripe_head for batching */
++ 	struct stripe_head *batch_last;
++ 
++ 	/* first sector in the request */
++ 	sector_t first_sector;
++ 
++ 	/* last sector in the request */
++ 	sector_t last_sector;
++ 
++ 	/*
++ 	 * bitmap to track stripe sectors that have been added to stripes
++ 	 * add one to account for unaligned requests
++ 	 */
++ 	DECLARE_BITMAP(sectors_to_do, RAID5_MAX_REQ_STRIPES + 1);
++ 
++ 	/* the request had REQ_PREFLUSH, cleared after the first stripe_head */
++ 	bool do_flush;
++ };
++ 
++ /*
++  * Block until another thread clears R5_INACTIVE_BLOCKED or
++  * there are fewer than 3/4 the maximum number of active stripes
++  * and there is an inactive stripe available.
++  */
++ static bool is_inactive_blocked(struct r5conf *conf, int hash)
++ {
++ 	int active = atomic_read(&conf->active_stripes);
++ 
++ 	if (list_empty(conf->inactive_list + hash))
++ 		return false;
++ 
++ 	if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
++ 		return true;
++ 
++ 	return active < (conf->max_nr_stripes * 3 / 4);
++ }
++ 
++ static struct stripe_head *__raid5_get_active_stripe(struct r5conf *conf,
++ 		struct stripe_request_ctx *ctx, sector_t sector,
++ 		bool previous, bool noblock, bool noquiesce)
+++>>>>>>> 20313b1b8cd1 (md/raid5: Ensure batch_last is released before sleeping for quiesce)
+  {
+  	struct stripe_head *sh;
+  	int hash = stripe_hash_locks_hash(conf, sector);
+@@@ -774,41 -811,54 +825,64 @@@
+  
+  	spin_lock_irq(conf->hash_locks + hash);
+  
+++<<<<<<< HEAD
+ +	do {
+ +		wait_event_lock_irq(conf->wait_for_quiescent,
+ +				    conf->quiesce == 0 || noquiesce,
+ +				    *(conf->hash_locks + hash));
+ +		sh = find_get_stripe(conf, sector, conf->generation - previous,
+ +				     hash);
+ +		if (sh)
+ +			break;
+++=======
++ retry:
++ 	if (!noquiesce && conf->quiesce) {
++ 		/*
++ 		 * Must release the reference to batch_last before waiting,
++ 		 * on quiesce, otherwise the batch_last will hold a reference
++ 		 * to a stripe and raid5_quiesce() will deadlock waiting for
++ 		 * active_stripes to go to zero.
++ 		 */
++ 		if (ctx && ctx->batch_last) {
++ 			raid5_release_stripe(ctx->batch_last);
++ 			ctx->batch_last = NULL;
++ 		}
++ 
++ 		wait_event_lock_irq(conf->wait_for_quiescent, !conf->quiesce,
++ 				    *(conf->hash_locks + hash));
++ 	}
++ 
++ 	sh = find_get_stripe(conf, sector, conf->generation - previous, hash);
++ 	if (sh)
++ 		goto out;
+++>>>>>>> 20313b1b8cd1 (md/raid5: Ensure batch_last is released before sleeping for quiesce)
+  
+ -	if (test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state))
+ -		goto wait_for_stripe;
+ +		if (!test_bit(R5_INACTIVE_BLOCKED, &conf->cache_state)) {
+ +			sh = get_free_stripe(conf, hash);
+ +			if (!sh && !test_bit(R5_DID_ALLOC, &conf->cache_state))
+ +				set_bit(R5_ALLOC_MORE, &conf->cache_state);
+ +		}
+ +		if (noblock && !sh)
+ +			break;
+  
+ -	sh = get_free_stripe(conf, hash);
+ -	if (sh) {
+  		r5c_check_stripe_cache_usage(conf);
+ -		init_stripe(sh, sector, previous);
+ -		atomic_inc(&sh->count);
+ -		goto out;
+ -	}
+ -
+ -	if (!test_bit(R5_DID_ALLOC, &conf->cache_state))
+ -		set_bit(R5_ALLOC_MORE, &conf->cache_state);
+ -
+ -wait_for_stripe:
+ -	if (noblock)
+ -		goto out;
+ -
+ -	set_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ -	r5l_wake_reclaim(conf->log, 0);
+ -	wait_event_lock_irq(conf->wait_for_stripe,
+ -			    is_inactive_blocked(conf, hash),
+ -			    *(conf->hash_locks + hash));
+ -	clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ -	goto retry;
+ +		if (!sh) {
+ +			set_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ +			r5l_wake_reclaim(conf->log, 0);
+ +			wait_event_lock_irq(conf->wait_for_stripe,
+ +					!list_empty(conf->inactive_list + hash) &&
+ +					(atomic_read(&conf->active_stripes)
+ +					 < (conf->max_nr_stripes * 3 / 4)
+ +					 || !test_bit(R5_INACTIVE_BLOCKED,
+ +						      &conf->cache_state)),
+ +					*(conf->hash_locks + hash));
+ +			clear_bit(R5_INACTIVE_BLOCKED, &conf->cache_state);
+ +		} else {
+ +			init_stripe(sh, sector, previous);
+ +			atomic_inc(&sh->count);
+ +		}
+ +	} while (sh == NULL);
+  
+ -out:
+  	spin_unlock_irq(conf->hash_locks + hash);
+  	return sh;
+  }
+* Unmerged path drivers/md/raid5.c
+diff --git a/drivers/md/raid5.h b/drivers/md/raid5.h
+index 13bde70c396c..5e5eb09442c8 100644
+--- a/drivers/md/raid5.h
++++ b/drivers/md/raid5.h
+@@ -812,7 +812,7 @@ extern sector_t raid5_compute_sector(struct r5conf *conf, sector_t r_sector,
+ 				     struct stripe_head *sh);
+ extern struct stripe_head *
+ raid5_get_active_stripe(struct r5conf *conf, sector_t sector,
+-			int previous, int noblock, int noquiesce);
++			bool previous, bool noblock, bool noquiesce);
+ extern int raid5_calc_degraded(struct r5conf *conf);
+ extern int r5c_journal_mode_set(struct mddev *mddev, int journal_mode);
+ #endif
