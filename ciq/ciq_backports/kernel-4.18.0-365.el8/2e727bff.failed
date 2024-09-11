@@ -1,0 +1,198 @@
+iommu/dma: Check CONFIG_SWIOTLB more broadly
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author David Stevens <stevensd@chromium.org>
+commit 2e727bffbe93750a13d2414f3ce43de2f21600d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/2e727bff.failed
+
+Introduce a new dev_use_swiotlb function to guard swiotlb code, instead
+of overloading dev_is_untrusted. This allows CONFIG_SWIOTLB to be
+checked more broadly, so the swiotlb related code can be removed more
+aggressively.
+
+	Signed-off-by: David Stevens <stevensd@chromium.org>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20210929023300.335969-6-stevensd@google.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 2e727bffbe93750a13d2414f3ce43de2f21600d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+diff --cc drivers/iommu/dma-iommu.c
+index 5899c384b30a,85a005b268f6..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -329,6 -317,35 +329,38 @@@ static bool dev_is_untrusted(struct dev
+  	return dev_is_pci(dev) && to_pci_dev(dev)->untrusted;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool dev_use_swiotlb(struct device *dev)
++ {
++ 	return IS_ENABLED(CONFIG_SWIOTLB) && dev_is_untrusted(dev);
++ }
++ 
++ /* sysfs updates are serialised by the mutex of the group owning @domain */
++ int iommu_dma_init_fq(struct iommu_domain *domain)
++ {
++ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
++ 	int ret;
++ 
++ 	if (cookie->fq_domain)
++ 		return 0;
++ 
++ 	ret = init_iova_flush_queue(&cookie->iovad, iommu_dma_flush_iotlb_all,
++ 				    iommu_dma_entry_dtor);
++ 	if (ret) {
++ 		pr_warn("iova flush queue initialization failed\n");
++ 		return ret;
++ 	}
++ 	/*
++ 	 * Prevent incomplete iovad->fq being observable. Pairs with path from
++ 	 * __iommu_dma_unmap() through iommu_dma_free_iova() to queue_iova()
++ 	 */
++ 	smp_wmb();
++ 	WRITE_ONCE(cookie->fq_domain, domain);
++ 	return 0;
++ }
++ 
+++>>>>>>> 2e727bffbe93 (iommu/dma: Check CONFIG_SWIOTLB more broadly)
+  /**
+   * iommu_dma_init_domain - Initialise a DMA mapping domain
+   * @domain: IOMMU domain previously prepared by iommu_get_dma_cookie()
+@@@ -831,17 -770,13 +863,26 @@@ static void iommu_dma_sync_sg_for_cpu(s
+  	struct scatterlist *sg;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (dev_is_dma_coherent(dev) && !dev_is_untrusted(dev))
+ +		return;
+ +
+ +	for_each_sg(sgl, sg, nelems, i) {
+ +		if (!dev_is_dma_coherent(dev))
+++=======
++ 	if (dev_use_swiotlb(dev))
++ 		for_each_sg(sgl, sg, nelems, i)
++ 			iommu_dma_sync_single_for_cpu(dev, sg_dma_address(sg),
++ 						      sg->length, dir);
++ 	else if (!dev_is_dma_coherent(dev))
++ 		for_each_sg(sgl, sg, nelems, i)
+++>>>>>>> 2e727bffbe93 (iommu/dma: Check CONFIG_SWIOTLB more broadly)
+  			arch_sync_dma_for_cpu(sg_phys(sg), sg->length, dir);
+ +
+ +		if (is_swiotlb_buffer(sg_phys(sg)))
+ +			swiotlb_tbl_sync_single(dev, sg_phys(sg), sg->length,
+ +						dir, SYNC_FOR_CPU);
+ +	}
+  }
+  
+  static void iommu_dma_sync_sg_for_device(struct device *dev,
+@@@ -851,17 -786,14 +892,27 @@@
+  	struct scatterlist *sg;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (dev_is_dma_coherent(dev) && !dev_is_untrusted(dev))
+ +		return;
+ +
+ +	for_each_sg(sgl, sg, nelems, i) {
+ +		if (is_swiotlb_buffer(sg_phys(sg)))
+ +			swiotlb_tbl_sync_single(dev, sg_phys(sg), sg->length,
+ +						dir, SYNC_FOR_DEVICE);
+ +
+ +		if (!dev_is_dma_coherent(dev))
+++=======
++ 	if (dev_use_swiotlb(dev))
++ 		for_each_sg(sgl, sg, nelems, i)
++ 			iommu_dma_sync_single_for_device(dev,
++ 							 sg_dma_address(sg),
++ 							 sg->length, dir);
++ 	else if (!dev_is_dma_coherent(dev))
++ 		for_each_sg(sgl, sg, nelems, i)
+++>>>>>>> 2e727bffbe93 (iommu/dma: Check CONFIG_SWIOTLB more broadly)
+  			arch_sync_dma_for_device(sg_phys(sg), sg->length, dir);
+ +	}
+  }
+  
+  static dma_addr_t iommu_dma_map_page(struct device *dev, struct page *page,
+@@@ -870,9 -802,48 +921,47 @@@
+  {
+  	phys_addr_t phys = page_to_phys(page) + offset;
+  	bool coherent = dev_is_dma_coherent(dev);
+ -	int prot = dma_info_to_prot(dir, coherent, attrs);
+ -	struct iommu_domain *domain = iommu_get_dma_domain(dev);
+ -	struct iommu_dma_cookie *cookie = domain->iova_cookie;
+ -	struct iova_domain *iovad = &cookie->iovad;
+ -	size_t aligned_size = size;
+ -	dma_addr_t iova, dma_mask = dma_get_mask(dev);
+  
+++<<<<<<< HEAD
+ +	return __iommu_dma_map_swiotlb(dev, phys, size, dma_get_mask(dev),
+ +			coherent, dir, attrs);
+++=======
++ 	/*
++ 	 * If both the physical buffer start address and size are
++ 	 * page aligned, we don't need to use a bounce page.
++ 	 */
++ 	if (dev_use_swiotlb(dev) && iova_offset(iovad, phys | size)) {
++ 		void *padding_start;
++ 		size_t padding_size;
++ 
++ 		aligned_size = iova_align(iovad, size);
++ 		phys = swiotlb_tbl_map_single(dev, phys, size,
++ 					      aligned_size, dir, attrs);
++ 
++ 		if (phys == DMA_MAPPING_ERROR)
++ 			return DMA_MAPPING_ERROR;
++ 
++ 		/* Cleanup the padding area. */
++ 		padding_start = phys_to_virt(phys);
++ 		padding_size = aligned_size;
++ 
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++ 		    (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL)) {
++ 			padding_start += size;
++ 			padding_size -= size;
++ 		}
++ 
++ 		memset(padding_start, 0, padding_size);
++ 	}
++ 
++ 	if (!coherent && !(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_device(phys, size, dir);
++ 
++ 	iova = __iommu_dma_map(dev, phys, aligned_size, prot, dma_mask);
++ 	if (iova == DMA_MAPPING_ERROR && is_swiotlb_buffer(dev, phys))
++ 		swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
++ 	return iova;
+++>>>>>>> 2e727bffbe93 (iommu/dma: Check CONFIG_SWIOTLB more broadly)
+  }
+  
+  static void iommu_dma_unmap_page(struct device *dev, dma_addr_t dma_handle,
+@@@ -1007,13 -990,15 +1096,13 @@@ static int iommu_dma_map_sg(struct devi
+  	dma_addr_t iova;
+  	size_t iova_len = 0;
+  	unsigned long mask = dma_get_seg_boundary(dev);
+ -	ssize_t ret;
+  	int i;
+  
+ -	if (static_branch_unlikely(&iommu_deferred_attach_enabled)) {
+ -		ret = iommu_deferred_attach(dev, domain);
+ -		goto out;
+ -	}
+ +	if (static_branch_unlikely(&iommu_deferred_attach_enabled) &&
+ +	    iommu_deferred_attach(dev, domain))
+ +		return 0;
+  
+- 	if (dev_is_untrusted(dev))
++ 	if (dev_use_swiotlb(dev))
+  		return iommu_dma_map_sg_swiotlb(dev, sg, nents, dir, attrs);
+  
+  	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+* Unmerged path drivers/iommu/dma-iommu.c
