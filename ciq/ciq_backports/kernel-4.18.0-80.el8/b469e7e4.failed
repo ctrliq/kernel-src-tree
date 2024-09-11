@@ -1,0 +1,87 @@
+fanotify: fix handling of events on child sub-directory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Amir Goldstein <amir73il@gmail.com>
+commit b469e7e47c8a075cc08bcd1e85d4365134bdcdd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/b469e7e4.failed
+
+When an event is reported on a sub-directory and the parent inode has
+a mark mask with FS_EVENT_ON_CHILD|FS_ISDIR, the event will be sent to
+fsnotify() even if the event type is not in the parent mark mask
+(e.g. FS_OPEN).
+
+Further more, if that event happened on a mount or a filesystem with
+a mount/sb mark that does have that event type in their mask, the "on
+child" event will be reported on the mount/sb mark.  That is not
+desired, because user will get a duplicate event for the same action.
+
+Note that the event reported on the victim inode is never merged with
+the event reported on the parent inode, because of the check in
+should_merge(): old_fsn->inode == new_fsn->inode.
+
+Fix this by looking for a match of an actual event type (i.e. not just
+FS_ISDIR) in parent's inode mark mask and by not reporting an "on child"
+event to group if event type is only found on mount/sb marks.
+
+[backport hint: The bug seems to have always been in fanotify, but this
+                patch will only apply cleanly to v4.19.y]
+
+	Cc: <stable@vger.kernel.org> # v4.19
+	Signed-off-by: Amir Goldstein <amir73il@gmail.com>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+(cherry picked from commit b469e7e47c8a075cc08bcd1e85d4365134bdcdd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/notify/fsnotify.c
+diff --cc fs/notify/fsnotify.c
+index 6f92b9bddf6a,d2c34900ae05..000000000000
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@@ -323,10 -334,14 +323,19 @@@ int fsnotify(struct inode *to_tell, __u
+  	int ret = 0;
+  	__u32 test_mask = (mask & ALL_FSNOTIFY_EVENTS);
+  
+ -	if (data_is == FSNOTIFY_EVENT_PATH) {
+ +	if (data_is == FSNOTIFY_EVENT_PATH)
+  		mnt = real_mount(((const struct path *)data)->mnt);
+++<<<<<<< HEAD
+ +	else
+ +		mnt = NULL;
+++=======
++ 		sb = mnt->mnt.mnt_sb;
++ 		mnt_or_sb_mask = mnt->mnt_fsnotify_mask | sb->s_fsnotify_mask;
++ 	}
++ 	/* An event "on child" is not intended for a mount/sb mark */
++ 	if (mask & FS_EVENT_ON_CHILD)
++ 		mnt_or_sb_mask = 0;
+++>>>>>>> b469e7e47c8a (fanotify: fix handling of events on child sub-directory)
+  
+  	/*
+  	 * Optimization: srcu_read_lock() has a memory barrier which can
+diff --git a/fs/notify/fanotify/fanotify.c b/fs/notify/fanotify/fanotify.c
+index f90842efea13..78126bd7c162 100644
+--- a/fs/notify/fanotify/fanotify.c
++++ b/fs/notify/fanotify/fanotify.c
+@@ -113,12 +113,12 @@ static bool fanotify_should_send_event(struct fsnotify_iter_info *iter_info,
+ 			continue;
+ 		mark = iter_info->marks[type];
+ 		/*
+-		 * if the event is for a child and this inode doesn't care about
+-		 * events on the child, don't send it!
++		 * If the event is for a child and this mark doesn't care about
++		 * events on a child, don't send it!
+ 		 */
+-		if (type == FSNOTIFY_OBJ_TYPE_INODE &&
+-		    (event_mask & FS_EVENT_ON_CHILD) &&
+-		    !(mark->mask & FS_EVENT_ON_CHILD))
++		if (event_mask & FS_EVENT_ON_CHILD &&
++		    (type != FSNOTIFY_OBJ_TYPE_INODE ||
++		     !(mark->mask & FS_EVENT_ON_CHILD)))
+ 			continue;
+ 
+ 		marks_mask |= mark->mask;
+* Unmerged path fs/notify/fsnotify.c
