@@ -1,0 +1,411 @@
+mm/gup: migrate pinned pages out of movable zone
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Pavel Tatashin <pasha.tatashin@soleen.com>
+commit d1e153fea2a8940273174fc17733c44323d35cd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d1e153fe.failed
+
+We should not pin pages in ZONE_MOVABLE.  Currently, we do not pin only
+movable CMA pages.  Generalize the function that migrates CMA pages to
+migrate all movable pages.  Use is_pinnable_page() to check which pages
+need to be migrated
+
+Link: https://lkml.kernel.org/r/20210215161349.246722-10-pasha.tatashin@soleen.com
+	Signed-off-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: James Morris <jmorris@namei.org>
+	Cc: Jason Gunthorpe <jgg@nvidia.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Sasha Levin <sashal@kernel.org>
+	Cc: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Cc: Tyler Hicks <tyhicks@linux.microsoft.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d1e153fea2a8940273174fc17733c44323d35cd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index b6ca92e3db6b,4bc57420f535..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -227,21 -87,14 +227,22 @@@ static __maybe_unused struct page *try_
+  		int orig_refs = refs;
+  
+  		/*
+- 		 * Can't do FOLL_LONGTERM + FOLL_PIN with CMA in the gup fast
+- 		 * path, so fail and let the caller fall back to the slow path.
++ 		 * Can't do FOLL_LONGTERM + FOLL_PIN gup fast path if not in a
++ 		 * right zone, so fail and let the caller fall back to the slow
++ 		 * path.
+  		 */
+- 		if (unlikely(flags & FOLL_LONGTERM) &&
+- 				is_migrate_cma_page(page))
++ 		if (unlikely((flags & FOLL_LONGTERM) &&
++ 			     !is_pinnable_page(page)))
+  			return NULL;
+  
+ +		/*
+ +		 * CAUTION: Don't use compound_head() on the page before this
+ +		 * point, the result won't be stable.
+ +		 */
+ +		page = try_get_compound_head(page, refs);
+ +		if (!page)
+ +			return NULL;
+ +
+  		/*
+  		 * When pinning a compound page of order > 1 (which is what
+  		 * hpage_pincount_available() checks for), use an exact count to
+@@@ -1809,150 -1566,48 +1810,160 @@@ finish_or_fault
+  #endif /* !CONFIG_MMU */
+  
+  /**
+ - * get_dump_page() - pin user page in memory while writing it to core dump
+ - * @addr: user address
+ + * fault_in_writeable - fault in userspace address range for writing
+ + * @uaddr: start of address range
+ + * @size: size of address range
+   *
+ - * Returns struct page pointer of user page pinned for dump,
+ - * to be freed afterwards by put_page().
+ + * Returns the number of bytes not faulted in (like copy_to_user() and
+ + * copy_from_user()).
+ + */
+ +size_t fault_in_writeable(char __user *uaddr, size_t size)
+ +{
+ +	char __user *start = uaddr, *end;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	if (!PAGE_ALIGNED(uaddr)) {
+ +		if (unlikely(__put_user(0, uaddr) != 0))
+ +			return size;
+ +		uaddr = (char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ +	}
+ +	end = (char __user *)PAGE_ALIGN((unsigned long)start + size);
+ +	if (unlikely(end < start))
+ +		end = NULL;
+ +	while (uaddr != end) {
+ +		if (unlikely(__put_user(0, uaddr) != 0))
+ +			goto out;
+ +		uaddr += PAGE_SIZE;
+ +	}
+ +
+ +out:
+ +	if (size > uaddr - start)
+ +		return size - (uaddr - start);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(fault_in_writeable);
+ +
+ +/*
+ + * fault_in_safe_writeable - fault in an address range for writing
+ + * @uaddr: start of address range
+ + * @size: length of address range
+   *
+ - * Returns NULL on any kind of failure - a hole must then be inserted into
+ - * the corefile, to preserve alignment with its headers; and also returns
+ - * NULL wherever the ZERO_PAGE, or an anonymous pte_none, has been found -
+ - * allowing a hole to be left in the corefile to save diskspace.
+ + * Faults in an address range for writing.  This is primarily useful when we
+ + * already know that some or all of the pages in the address range aren't in
+ + * memory.
+ + *
+ + * Unlike fault_in_writeable(), this function is non-destructive.
+   *
+ - * Called without mmap_lock (takes and releases the mmap_lock by itself).
+ + * Note that we don't pin or otherwise hold the pages referenced that we fault
+ + * in.  There's no guarantee that they'll stay in memory for any duration of
+ + * time.
+ + *
+ + * Returns the number of bytes not faulted in, like copy_to_user() and
+ + * copy_from_user().
+   */
+ -#ifdef CONFIG_ELF_CORE
+ -struct page *get_dump_page(unsigned long addr)
+ +size_t fault_in_safe_writeable(const char __user *uaddr, size_t size)
+  {
+ +	unsigned long start = (unsigned long)uaddr, end;
+  	struct mm_struct *mm = current->mm;
+ -	struct page *page;
+ -	int locked = 1;
+ -	int ret;
+ +	bool unlocked = false;
+  
+ -	if (mmap_read_lock_killable(mm))
+ -		return NULL;
+ -	ret = __get_user_pages_locked(mm, addr, 1, &page, NULL, &locked,
+ -				      FOLL_FORCE | FOLL_DUMP | FOLL_GET);
+ -	if (locked)
+ -		mmap_read_unlock(mm);
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	end = PAGE_ALIGN(start + size);
+ +	if (end < start)
+ +		end = 0;
+  
+ -	if (ret == 1 && is_page_poisoned(page))
+ -		return NULL;
+ +	mmap_read_lock(mm);
+ +	do {
+ +		if (fixup_user_fault(current, mm, start, FAULT_FLAG_WRITE,
+ +				     &unlocked))
+ +			break;
+ +		start = (start + PAGE_SIZE) & PAGE_MASK;
+ +	} while (start != end);
+ +	mmap_read_unlock(mm);
+  
+ -	return (ret == 1) ? page : NULL;
+ +	if (size > (unsigned long)uaddr - start)
+ +		return size - ((unsigned long)uaddr - start);
+ +	return 0;
+  }
+ -#endif /* CONFIG_ELF_CORE */
+ +EXPORT_SYMBOL(fault_in_safe_writeable);
+ +
+ +/**
+ + * fault_in_readable - fault in userspace address range for reading
+ + * @uaddr: start of user address range
+ + * @size: size of user address range
+ + *
+ + * Returns the number of bytes not faulted in (like copy_to_user() and
+ + * copy_from_user()).
+ + */
+ +size_t fault_in_readable(const char __user *uaddr, size_t size)
+ +{
+ +	const char __user *start = uaddr, *end;
+ +	volatile char c;
+ +
+ +	if (unlikely(size == 0))
+ +		return 0;
+ +	if (!PAGE_ALIGNED(uaddr)) {
+ +		if (unlikely(__get_user(c, uaddr) != 0))
+ +			return size;
+ +		uaddr = (const char __user *)PAGE_ALIGN((unsigned long)uaddr);
+ +	}
+ +	end = (const char __user *)PAGE_ALIGN((unsigned long)start + size);
+ +	if (unlikely(end < start))
+ +		end = NULL;
+ +	while (uaddr != end) {
+ +		if (unlikely(__get_user(c, uaddr) != 0))
+ +			goto out;
+ +		uaddr += PAGE_SIZE;
+ +	}
+ +
+ +out:
+ +	(void)c;
+ +	if (size > uaddr - start)
+ +		return size - (uaddr - start);
+ +	return 0;
+ +}
+ +EXPORT_SYMBOL(fault_in_readable);
+ +
+ +#if defined(CONFIG_FS_DAX) || defined (CONFIG_CMA)
+ +static bool check_dax_vmas(struct vm_area_struct **vmas, long nr_pages)
+ +{
+ +	long i;
+ +	struct vm_area_struct *vma_prev = NULL;
+ +
+ +	for (i = 0; i < nr_pages; i++) {
+ +		struct vm_area_struct *vma = vmas[i];
+ +
+ +		if (vma == vma_prev)
+ +			continue;
+ +
+ +		vma_prev = vma;
+  
+ +		if (vma_is_fsdax(vma))
+ +			return true;
+ +	}
+ +	return false;
+ +}
+ +
+++<<<<<<< HEAD
+ +#ifdef CONFIG_CMA
+ +static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ +					struct mm_struct *mm,
+ +					unsigned long start,
+ +					unsigned long nr_pages,
+ +					struct page **pages,
+ +					struct vm_area_struct **vmas,
+ +					unsigned int gup_flags)
+++=======
++ #ifdef CONFIG_MIGRATION
++ static long check_and_migrate_movable_pages(struct mm_struct *mm,
++ 					    unsigned long start,
++ 					    unsigned long nr_pages,
++ 					    struct page **pages,
++ 					    struct vm_area_struct **vmas,
++ 					    unsigned int gup_flags)
+++>>>>>>> d1e153fea2a8 (mm/gup: migrate pinned pages out of movable zone)
+  {
+  	unsigned long i, isolation_error_count;
+  	bool drain_allow;
+@@@ -2042,13 -1696,12 +2052,22 @@@ check_again
+  	goto check_again;
+  }
+  #else
+++<<<<<<< HEAD
+ +static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ +					struct mm_struct *mm,
+ +					unsigned long start,
+ +					unsigned long nr_pages,
+ +					struct page **pages,
+ +					struct vm_area_struct **vmas,
+ +					unsigned int gup_flags)
+++=======
++ static long check_and_migrate_movable_pages(struct mm_struct *mm,
++ 					    unsigned long start,
++ 					    unsigned long nr_pages,
++ 					    struct page **pages,
++ 					    struct vm_area_struct **vmas,
++ 					    unsigned int gup_flags)
+++>>>>>>> d1e153fea2a8 (mm/gup: migrate pinned pages out of movable zone)
+  {
+  	return nr_pages;
+  }
+@@@ -2066,64 -1718,24 +2085,72 @@@ static long __gup_longterm_locked(struc
+  				  struct vm_area_struct **vmas,
+  				  unsigned int gup_flags)
+  {
+ +	struct vm_area_struct **vmas_tmp = vmas;
+  	unsigned long flags = 0;
+ -	long rc;
+ -
+ -	if (gup_flags & FOLL_LONGTERM)
+ -		flags = memalloc_pin_save();
+ -
+ -	rc = __get_user_pages_locked(mm, start, nr_pages, pages, vmas, NULL,
+ -				     gup_flags);
+ +	long rc, i;
+  
+  	if (gup_flags & FOLL_LONGTERM) {
+++<<<<<<< HEAD
+ +		if (!pages)
+ +			return -EINVAL;
+ +
+ +		if (!vmas_tmp) {
+ +			vmas_tmp = kcalloc(nr_pages,
+ +					   sizeof(struct vm_area_struct *),
+ +					   GFP_KERNEL);
+ +			if (!vmas_tmp)
+ +				return -ENOMEM;
+ +		}
+ +		flags = memalloc_nocma_save();
+++=======
++ 		if (rc > 0)
++ 			rc = check_and_migrate_movable_pages(mm, start, rc,
++ 							     pages, vmas,
++ 							     gup_flags);
++ 		memalloc_pin_restore(flags);
+++>>>>>>> d1e153fea2a8 (mm/gup: migrate pinned pages out of movable zone)
+ +	}
+ +
+ +	rc = __get_user_pages_locked(tsk, mm, start, nr_pages, pages,
+ +				     vmas_tmp, NULL, gup_flags);
+ +
+ +	if (gup_flags & FOLL_LONGTERM) {
+ +		if (rc < 0)
+ +			goto out;
+ +
+ +		if (check_dax_vmas(vmas_tmp, rc)) {
+ +			if (gup_flags & FOLL_PIN)
+ +				unpin_user_pages(pages, rc);
+ +			else
+ +				for (i = 0; i < rc; i++)
+ +					put_page(pages[i]);
+ +			rc = -EOPNOTSUPP;
+ +			goto out;
+ +		}
+ +
+ +		rc = check_and_migrate_cma_pages(tsk, mm, start, rc, pages,
+ +						 vmas_tmp, gup_flags);
+ +out:
+ +		memalloc_nocma_restore(flags);
+  	}
+ +
+ +	if (vmas_tmp != vmas)
+ +		kfree(vmas_tmp);
+  	return rc;
+  }
+ +#else /* !CONFIG_FS_DAX && !CONFIG_CMA */
+ +static __always_inline long __gup_longterm_locked(struct task_struct *tsk,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long nr_pages,
+ +						  struct page **pages,
+ +						  struct vm_area_struct **vmas,
+ +						  unsigned int flags)
+ +{
+ +	return __get_user_pages_locked(tsk, mm, start, nr_pages, pages, vmas,
+ +				       NULL, flags);
+ +}
+ +#endif /* CONFIG_FS_DAX || CONFIG_CMA */
+  
+  static bool is_valid_gup_flags(unsigned int gup_flags)
+  {
+diff --git a/include/linux/migrate.h b/include/linux/migrate.h
+index bf905fe717d8..1b7f50abcd9c 100644
+--- a/include/linux/migrate.h
++++ b/include/linux/migrate.h
+@@ -27,6 +27,7 @@ enum migrate_reason {
+ 	MR_MEMPOLICY_MBIND,
+ 	MR_NUMA_MISPLACED,
+ 	MR_CONTIG_RANGE,
++	MR_LONGTERM_PIN,
+ 	MR_TYPES
+ };
+ 
+diff --git a/include/linux/mmzone.h b/include/linux/mmzone.h
+index cda5a543ac18..be425eaf5abe 100644
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -447,8 +447,13 @@ enum zone_type {
+ 	 * to increase the number of THP/huge pages. Notable special cases are:
+ 	 *
+ 	 * 1. Pinned pages: (long-term) pinning of movable pages might
+-	 *    essentially turn such pages unmovable. Memory offlining might
+-	 *    retry a long time.
++	 *    essentially turn such pages unmovable. Therefore, we do not allow
++	 *    pinning long-term pages in ZONE_MOVABLE. When pages are pinned and
++	 *    faulted, they come from the right zone right away. However, it is
++	 *    still possible that address space already has pages in
++	 *    ZONE_MOVABLE at the time when pages are pinned (i.e. user has
++	 *    touches that memory before pinning). In such case we migrate them
++	 *    to a different zone. When migration fails - pinning fails.
+ 	 * 2. memblock allocations: kernelcore/movablecore setups might create
+ 	 *    situations where ZONE_MOVABLE contains unmovable allocations
+ 	 *    after boot. Memory offlining and allocations fail early.
+diff --git a/include/trace/events/migrate.h b/include/trace/events/migrate.h
+index 705b33d1e395..77b8972a38f1 100644
+--- a/include/trace/events/migrate.h
++++ b/include/trace/events/migrate.h
+@@ -20,7 +20,8 @@
+ 	EM( MR_SYSCALL,		"syscall_or_cpuset")		\
+ 	EM( MR_MEMPOLICY_MBIND,	"mempolicy_mbind")		\
+ 	EM( MR_NUMA_MISPLACED,	"numa_misplaced")		\
+-	EMe(MR_CONTIG_RANGE,	"contig_range")
++	EM( MR_CONTIG_RANGE,	"contig_range")			\
++	EMe(MR_LONGTERM_PIN,	"longterm_pin")
+ 
+ /*
+  * First define the enums in the above macros to be exported to userspace
+* Unmerged path mm/gup.c
