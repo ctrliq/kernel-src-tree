@@ -1,0 +1,73 @@
+netfilter: conntrack: do not auto-delete clash entries on reply
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit c46172147ebbeb70094db48d76ab7945d96c638b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c4617214.failed
+
+Its possible that we have more than one packet with the same ct tuple
+simultaneously, e.g. when an application emits n packets on same UDP
+socket from multiple threads.
+
+NAT rules might be applied to those packets. With the right set of rules,
+n packets will be mapped to m destinations, where at least two packets end
+up with the same destination.
+
+When this happens, the existing clash resolution may merge the skb that
+is processed after the first has been received with the identical tuple
+already in hash table.
+
+However, its possible that this identical tuple is a NAT_CLASH tuple.
+In that case the second skb will be sent, but no reply can be received
+since the reply that is processed first removes the NAT_CLASH tuple.
+
+Do not auto-delete, this gives a 1 second window for replies to be passed
+back to originator.
+
+Packets that are coming later (udp stream case) will not be affected:
+they match the original ct entry, not a NAT_CLASH one.
+
+Also prevent NAT_CLASH entries from getting offloaded.
+
+Fixes: 6a757c07e51f ("netfilter: conntrack: allow insertion of clashing entries")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit c46172147ebbeb70094db48d76ab7945d96c638b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_proto_udp.c
+diff --cc net/netfilter/nf_conntrack_proto_udp.c
+index a17997e66535,af402f458ee0..000000000000
+--- a/net/netfilter/nf_conntrack_proto_udp.c
++++ b/net/netfilter/nf_conntrack_proto_udp.c
+@@@ -213,8 -205,7 +220,12 @@@ int nf_conntrack_udplite_packet(struct 
+  		if (!test_and_set_bit(IPS_ASSURED_BIT, &ct->status))
+  			nf_conntrack_event_cache(IPCT_ASSURED, ct);
+  	} else {
+++<<<<<<< HEAD
+ +		nf_ct_refresh_acct(ct, ctinfo, skb,
+ +				   timeouts[UDP_CT_UNREPLIED]);
+++=======
++ 		nf_ct_refresh_acct(ct, ctinfo, skb, timeouts[UDP_CT_UNREPLIED]);
+++>>>>>>> c46172147ebb (netfilter: conntrack: do not auto-delete clash entries on reply)
+  	}
+  	return NF_ACCEPT;
+  }
+* Unmerged path net/netfilter/nf_conntrack_proto_udp.c
+diff --git a/net/netfilter/nft_flow_offload.c b/net/netfilter/nft_flow_offload.c
+index d3730b448f12..7754126a6a9c 100644
+--- a/net/netfilter/nft_flow_offload.c
++++ b/net/netfilter/nft_flow_offload.c
+@@ -101,7 +101,7 @@ static void nft_flow_offload_eval(const struct nft_expr *expr,
+ 	}
+ 
+ 	if (nf_ct_ext_exist(ct, NF_CT_EXT_HELPER) ||
+-	    ct->status & IPS_SEQ_ADJUST)
++	    ct->status & (IPS_SEQ_ADJUST | IPS_NAT_CLASH))
+ 		goto out;
+ 
+ 	if (!nf_ct_is_confirmed(ct))
