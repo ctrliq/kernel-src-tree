@@ -1,0 +1,108 @@
+bonding: do not discard lowest hash bit for non layer3+4 hashing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author suresh kumar <suresh2514@gmail.com>
+commit 49aefd131739df552f83c566d0665744c30b1d70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/49aefd13.failed
+
+Commit b5f862180d70 was introduced to discard lowest hash bit for layer3+4 hashing
+but it also removes last bit from non layer3+4 hashing
+
+Below script shows layer2+3 hashing will result in same slave to be used with above commit.
+$ cat hash.py
+#/usr/bin/python3.6
+
+h_dests=[0xa0, 0xa1]
+h_source=0xe3
+hproto=0x8
+saddr=0x1e7aa8c0
+daddr=0x17aa8c0
+
+for h_dest in h_dests:
+    hash = (h_dest ^ h_source ^ hproto ^ saddr ^ daddr)
+    hash ^= hash >> 16
+    hash ^= hash >> 8
+    print(hash)
+
+print("with last bit removed")
+for h_dest in h_dests:
+    hash = (h_dest ^ h_source ^ hproto ^ saddr ^ daddr)
+    hash ^= hash >> 16
+    hash ^= hash >> 8
+    hash = hash >> 1
+    print(hash)
+
+Output:
+$ python3.6 hash.py
+522133332
+522133333   <-------------- will result in both slaves being used
+
+with last bit removed
+261066666
+261066666   <-------------- only single slave used
+
+	Signed-off-by: suresh kumar <suresh2514@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 49aefd131739df552f83c566d0665744c30b1d70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/bonding/bond_main.c
+diff --cc drivers/net/bonding/bond_main.c
+index afdb823be865,38e152548126..000000000000
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@@ -3740,10 -4033,45 +3740,48 @@@ static u32 bond_ip_hash(u32 hash, struc
+  		(__force u32)flow_get_u32_src(flow);
+  	hash ^= (hash >> 16);
+  	hash ^= (hash >> 8);
++ 
+  	/* discard lowest hash bit to deal with the common even ports pattern */
+- 	return hash >> 1;
++ 	if (xmit_policy == BOND_XMIT_POLICY_LAYER34 ||
++ 		xmit_policy == BOND_XMIT_POLICY_ENCAP34)
++ 		return hash >> 1;
++ 
++ 	return hash;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Generate hash based on xmit policy. If @skb is given it is used to linearize
++  * the data as required, but this function can be used without it if the data is
++  * known to be linear (e.g. with xdp_buff).
++  */
++ static u32 __bond_xmit_hash(struct bonding *bond, struct sk_buff *skb, const void *data,
++ 			    __be16 l2_proto, int mhoff, int nhoff, int hlen)
++ {
++ 	struct flow_keys flow;
++ 	u32 hash;
++ 
++ 	if (bond->params.xmit_policy == BOND_XMIT_POLICY_VLAN_SRCMAC)
++ 		return bond_vlan_srcmac_hash(skb, data, mhoff, hlen);
++ 
++ 	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER2 ||
++ 	    !bond_flow_dissect(bond, skb, data, l2_proto, nhoff, hlen, &flow))
++ 		return bond_eth_hash(skb, data, mhoff, hlen);
++ 
++ 	if (bond->params.xmit_policy == BOND_XMIT_POLICY_LAYER23 ||
++ 	    bond->params.xmit_policy == BOND_XMIT_POLICY_ENCAP23) {
++ 		hash = bond_eth_hash(skb, data, mhoff, hlen);
++ 	} else {
++ 		if (flow.icmp.id)
++ 			memcpy(&hash, &flow.icmp, sizeof(hash));
++ 		else
++ 			memcpy(&hash, &flow.ports.ports, sizeof(hash));
++ 	}
++ 
++ 	return bond_ip_hash(hash, &flow, bond->params.xmit_policy);
++ }
++ 
+++>>>>>>> 49aefd131739 (bonding: do not discard lowest hash bit for non layer3+4 hashing)
+  /**
+   * bond_xmit_hash - generate a hash value based on the xmit policy
+   * @bond: bonding device
+* Unmerged path drivers/net/bonding/bond_main.c
