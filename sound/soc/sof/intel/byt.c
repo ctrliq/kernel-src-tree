@@ -540,6 +540,8 @@ const struct snd_sof_dsp_ops sof_tng_ops = {
 			SNDRV_PCM_INFO_INTERLEAVED |
 			SNDRV_PCM_INFO_PAUSE |
 			SNDRV_PCM_INFO_BATCH,
+
+	.arch_ops = &sof_xtensa_arch_ops,
 };
 EXPORT_SYMBOL(sof_tng_ops);
 
@@ -708,6 +710,8 @@ const struct snd_sof_dsp_ops sof_byt_ops = {
 			SNDRV_PCM_INFO_INTERLEAVED |
 			SNDRV_PCM_INFO_PAUSE |
 			SNDRV_PCM_INFO_BATCH,
+
+	.arch_ops = &sof_xtensa_arch_ops,
 };
 EXPORT_SYMBOL(sof_byt_ops);
 
@@ -775,6 +779,8 @@ const struct snd_sof_dsp_ops sof_cht_ops = {
 			SNDRV_PCM_INFO_INTERLEAVED |
 			SNDRV_PCM_INFO_PAUSE |
 			SNDRV_PCM_INFO_BATCH,
+
+	.arch_ops = &sof_xtensa_arch_ops,
 };
 EXPORT_SYMBOL(sof_cht_ops);
 
