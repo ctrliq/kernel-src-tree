@@ -1,0 +1,131 @@
+ceph: new mount option to disable usage of copy-from op
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Luis Henriques <lhenriques@suse.com>
+commit ea4cdc548e5e74a529cdd1aea885d74b4aa8f1b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ea4cdc54.failed
+
+Add a new mount option 'nocopyfrom' that will prevent the usage of the
+RADOS 'copy-from' operation in cephfs.  This could be useful, for example,
+for an administrator to temporarily mitigate any possible bugs in the
+'copy-from' implementation.
+
+Currently, only copy_file_range uses this RADOS operation.  Setting this
+mount option will result in this syscall reverting to the default VFS
+implementation, i.e. to perform the copies locally instead of doing remote
+object copies.
+
+	Signed-off-by: Luis Henriques <lhenriques@suse.com>
+	Reviewed-by: "Yan, Zheng" <zyan@redhat.com>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit ea4cdc548e5e74a529cdd1aea885d74b4aa8f1b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/ceph.txt
+diff --cc Documentation/filesystems/ceph.txt
+index 3583a9b5d371,1177052701e1..000000000000
+--- a/Documentation/filesystems/ceph.txt
++++ b/Documentation/filesystems/ceph.txt
+@@@ -155,19 -151,10 +155,26 @@@ Mount Option
+          Report overall filesystem usage in statfs instead of using the root
+          directory quota.
+  
+++<<<<<<< HEAD
+ +  recover_session=<no|clean>
+ +	Set auto reconnect mode in the case where the client is blacklisted. The
+ +	available modes are "no" and "clean". The default is "no".
+ +
+ +	* no: never attempt to reconnect when client detects that it has been
+ +	blacklisted. Operations will generally fail after being blacklisted.
+ +
+ +	* clean: client reconnects to the ceph cluster automatically when it
+ +	detects that it has been blacklisted. During reconnect, client drops
+ +	dirty data/metadata, invalidates page caches and writable file handles.
+ +	After reconnect, file locks become stale because the MDS loses track
+ +	of them. If an inode contains any stale file locks, read/write on the
+ +	inode is not allowed until applications release all stale file locks.
+++=======
++   nocopyfrom
++         Don't use the RADOS 'copy-from' operation to perform remote object
++         copies.  Currently, it's only used in copy_file_range, which will revert
++         to the default VFS implementation if this option is used.
+++>>>>>>> ea4cdc548e5e (ceph: new mount option to disable usage of copy-from op)
+  
+  More Information
+  ================
+* Unmerged path Documentation/filesystems/ceph.txt
+diff --git a/fs/ceph/file.c b/fs/ceph/file.c
+index 4f636836ec93..9b5a6f1fa2af 100644
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@ -1964,6 +1964,9 @@ static ssize_t ceph_copy_file_range(struct file *src_file, loff_t src_off,
+ 	 * efficient).
+ 	 */
+ 
++	if (ceph_test_mount_opt(ceph_inode_to_client(src_inode), NOCOPYFROM))
++		return -EOPNOTSUPP;
++
+ 	if ((src_ci->i_layout.stripe_unit != dst_ci->i_layout.stripe_unit) ||
+ 	    (src_ci->i_layout.stripe_count != dst_ci->i_layout.stripe_count) ||
+ 	    (src_ci->i_layout.object_size != dst_ci->i_layout.object_size))
+diff --git a/fs/ceph/super.c b/fs/ceph/super.c
+index 655dabcff182..854e476728c1 100644
+--- a/fs/ceph/super.c
++++ b/fs/ceph/super.c
+@@ -167,6 +167,8 @@ enum {
+ 	Opt_noacl,
+ 	Opt_quotadf,
+ 	Opt_noquotadf,
++	Opt_copyfrom,
++	Opt_nocopyfrom,
+ };
+ 
+ static match_table_t fsopt_tokens = {
+@@ -207,6 +209,8 @@ static match_table_t fsopt_tokens = {
+ 	{Opt_noacl, "noacl"},
+ 	{Opt_quotadf, "quotadf"},
+ 	{Opt_noquotadf, "noquotadf"},
++	{Opt_copyfrom, "copyfrom"},
++	{Opt_nocopyfrom, "nocopyfrom"},
+ 	{-1, NULL}
+ };
+ 
+@@ -384,6 +388,12 @@ static int parse_fsopt_token(char *c, void *private)
+ 	case Opt_noquotadf:
+ 		fsopt->flags |= CEPH_MOUNT_OPT_NOQUOTADF;
+ 		break;
++	case Opt_copyfrom:
++		fsopt->flags &= ~CEPH_MOUNT_OPT_NOCOPYFROM;
++		break;
++	case Opt_nocopyfrom:
++		fsopt->flags |= CEPH_MOUNT_OPT_NOCOPYFROM;
++		break;
+ #ifdef CONFIG_CEPH_FS_POSIX_ACL
+ 	case Opt_acl:
+ 		fsopt->sb_flags |= SB_POSIXACL;
+@@ -582,6 +592,9 @@ static int ceph_show_options(struct seq_file *m, struct dentry *root)
+ 		seq_puts(m, ",noacl");
+ #endif
+ 
++	if (fsopt->flags & CEPH_MOUNT_OPT_NOCOPYFROM)
++		seq_puts(m, ",nocopyfrom");
++
+ 	if (fsopt->mds_namespace)
+ 		seq_show_option(m, "mds_namespace", fsopt->mds_namespace);
+ 
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 78a329c8e763..c2e375661e1a 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -42,6 +42,7 @@
+ #define CEPH_MOUNT_OPT_NOPOOLPERM      (1<<11) /* no pool permission check */
+ #define CEPH_MOUNT_OPT_MOUNTWAIT       (1<<12) /* mount waits if no mds is up */
+ #define CEPH_MOUNT_OPT_NOQUOTADF       (1<<13) /* no root dir quota in statfs */
++#define CEPH_MOUNT_OPT_NOCOPYFROM      (1<<14) /* don't use RADOS 'copy-from' op */
+ 
+ #define CEPH_MOUNT_OPT_DEFAULT    CEPH_MOUNT_OPT_DCACHE
+ 
