@@ -1,0 +1,259 @@
+mptcp: trigger msk processing even for OoO data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 6719331c2f736fba881f2ce85c8b0e37fe054c46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6719331c.failed
+
+This is a prerequisite to allow receiving data from multiple
+subflows without re-injection.
+
+Instead of dropping the OoO - "future" data in
+subflow_check_data_avail(), call into __mptcp_move_skbs()
+and let the msk drop that.
+
+To avoid code duplication factor out the mptcp_subflow_discard_data()
+helper.
+
+Note that __mptcp_move_skbs() can now find multiple subflows
+with data avail (comprising to-be-discarded data), so must
+update the byte counter incrementally.
+
+v1 -> v2:
+ - fix checkpatch issues (unsigned -> unsigned int)
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6719331c2f736fba881f2ce85c8b0e37fe054c46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/protocol.h
+index 223e4fb33f77,794997852c5e..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -348,7 -353,8 +354,12 @@@ int mptcp_is_enabled(struct net *net)
+  void mptcp_subflow_fully_established(struct mptcp_subflow_context *subflow,
+  				     struct mptcp_options_received *mp_opt);
+  bool mptcp_subflow_data_available(struct sock *sk);
+++<<<<<<< HEAD
+ +void mptcp_subflow_init(void);
+++=======
++ int mptcp_subflow_discard_data(struct sock *sk, unsigned int limit);
++ void __init mptcp_subflow_init(void);
+++>>>>>>> 6719331c2f73 (mptcp: trigger msk processing even for OoO data)
+  
+  /* called with sk socket lock held */
+  int __mptcp_subflow_connect(struct sock *sk, int ifindex,
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 86cc132efa3d..08b0a390cfa4 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -186,7 +186,8 @@ static bool mptcp_subflow_dsn_valid(const struct mptcp_sock *msk,
+ 		return true;
+ 
+ 	subflow->data_avail = 0;
+-	return mptcp_subflow_data_available(ssk);
++	mptcp_subflow_data_available(ssk);
++	return subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
+ }
+ 
+ static void mptcp_check_data_fin_ack(struct sock *sk)
+@@ -333,11 +334,18 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
+ 	struct tcp_sock *tp;
+ 	bool done = false;
+ 
+-	if (!mptcp_subflow_dsn_valid(msk, ssk)) {
+-		*bytes = 0;
++	pr_debug("msk=%p ssk=%p data avail=%d valid=%d empty=%d",
++		 msk, ssk, subflow->data_avail,
++		 mptcp_subflow_dsn_valid(msk, ssk),
++		 !skb_peek(&ssk->sk_receive_queue));
++	if (subflow->data_avail == MPTCP_SUBFLOW_OOO_DATA) {
++		mptcp_subflow_discard_data(ssk, subflow->map_data_len);
+ 		return false;
+ 	}
+ 
++	if (!mptcp_subflow_dsn_valid(msk, ssk))
++		return false;
++
+ 	tp = tcp_sk(ssk);
+ 	do {
+ 		u32 map_remaining, offset;
+@@ -396,7 +404,7 @@ static bool __mptcp_move_skbs_from_subflow(struct mptcp_sock *msk,
+ 		}
+ 	} while (more_data_avail);
+ 
+-	*bytes = moved;
++	*bytes += moved;
+ 
+ 	/* If the moves have caught up with the DATA_FIN sequence number
+ 	 * it's time to ack the DATA_FIN and change socket state, but
+@@ -435,9 +443,17 @@ static bool move_skbs_to_msk(struct mptcp_sock *msk, struct sock *ssk)
+ 
+ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+ {
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
++	bool wake;
+ 
+-	set_bit(MPTCP_DATA_READY, &msk->flags);
++	/* move_skbs_to_msk below can legitly clear the data_avail flag,
++	 * but we will need later to properly woke the reader, cache its
++	 * value
++	 */
++	wake = subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
++	if (wake)
++		set_bit(MPTCP_DATA_READY, &msk->flags);
+ 
+ 	if (atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
+ 	    move_skbs_to_msk(msk, ssk))
+@@ -458,7 +474,8 @@ void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+ 		move_skbs_to_msk(msk, ssk);
+ 	}
+ wake:
+-	sk->sk_data_ready(sk);
++	if (wake)
++		sk->sk_data_ready(sk);
+ }
+ 
+ static void __mptcp_flush_join_list(struct mptcp_sock *msk)
+@@ -1307,6 +1324,9 @@ static int mptcp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len,
+ 		set_bit(MPTCP_DATA_READY, &msk->flags);
+ 	}
+ out_err:
++	pr_debug("msk=%p data_ready=%d rx queue empty=%d copied=%d",
++		 msk, test_bit(MPTCP_DATA_READY, &msk->flags),
++		 skb_queue_empty(&sk->sk_receive_queue), copied);
+ 	mptcp_rcv_space_adjust(msk, copied);
+ 
+ 	release_sock(sk);
+@@ -2296,6 +2316,7 @@ static __poll_t mptcp_poll(struct file *file, struct socket *sock,
+ 	sock_poll_wait(file, sock, wait);
+ 
+ 	state = inet_sk_state_load(sk);
++	pr_debug("msk=%p state=%d flags=%lx", msk, state, msk->flags);
+ 	if (state == TCP_LISTEN)
+ 		return mptcp_check_readable(msk);
+ 
+* Unmerged path net/mptcp/protocol.h
+diff --git a/net/mptcp/subflow.c b/net/mptcp/subflow.c
+index 750f1161d6e1..533a2f75a875 100644
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@ -780,6 +780,40 @@ static int subflow_read_actor(read_descriptor_t *desc,
+ 	return copy_len;
+ }
+ 
++int mptcp_subflow_discard_data(struct sock *ssk, unsigned int limit)
++{
++	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
++	u32 map_remaining;
++	size_t delta;
++
++	map_remaining = subflow->map_data_len -
++			mptcp_subflow_get_map_offset(subflow);
++	delta = min_t(size_t, limit, map_remaining);
++
++	/* discard mapped data */
++	pr_debug("discarding %zu bytes, current map len=%d", delta,
++		 map_remaining);
++	if (delta) {
++		read_descriptor_t desc = {
++			.count = delta,
++		};
++		int ret;
++
++		ret = tcp_read_sock(ssk, &desc, subflow_read_actor);
++		if (ret < 0) {
++			ssk->sk_err = -ret;
++			return ret;
++		}
++		if (ret < delta)
++			return 0;
++		if (delta == map_remaining) {
++			subflow->data_avail = 0;
++			subflow->map_valid = 0;
++		}
++	}
++	return 0;
++}
++
+ static bool subflow_check_data_avail(struct sock *ssk)
+ {
+ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+@@ -796,8 +830,6 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 
+ 	msk = mptcp_sk(subflow->conn);
+ 	for (;;) {
+-		u32 map_remaining;
+-		size_t delta;
+ 		u64 ack_seq;
+ 		u64 old_ack;
+ 
+@@ -815,7 +847,7 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 			subflow->map_data_len = skb->len;
+ 			subflow->map_subflow_seq = tcp_sk(ssk)->copied_seq -
+ 						   subflow->ssn_offset;
+-			subflow->data_avail = 1;
++			subflow->data_avail = MPTCP_SUBFLOW_DATA_AVAIL;
+ 			return true;
+ 		}
+ 
+@@ -844,43 +876,19 @@ static bool subflow_check_data_avail(struct sock *ssk)
+ 		pr_debug("msk ack_seq=%llx subflow ack_seq=%llx", old_ack,
+ 			 ack_seq);
+ 		if (ack_seq == old_ack) {
+-			subflow->data_avail = 1;
++			subflow->data_avail = MPTCP_SUBFLOW_DATA_AVAIL;
++			break;
++		} else if (after64(ack_seq, old_ack)) {
++			subflow->data_avail = MPTCP_SUBFLOW_OOO_DATA;
+ 			break;
+ 		}
+ 
+ 		/* only accept in-sequence mapping. Old values are spurious
+-		 * retransmission; we can hit "future" values on active backup
+-		 * subflow switch, we relay on retransmissions to get
+-		 * in-sequence data.
+-		 * Cuncurrent subflows support will require subflow data
+-		 * reordering
++		 * retransmission
+ 		 */
+-		map_remaining = subflow->map_data_len -
+-				mptcp_subflow_get_map_offset(subflow);
+-		if (before64(ack_seq, old_ack))
+-			delta = min_t(size_t, old_ack - ack_seq, map_remaining);
+-		else
+-			delta = min_t(size_t, ack_seq - old_ack, map_remaining);
+-
+-		/* discard mapped data */
+-		pr_debug("discarding %zu bytes, current map len=%d", delta,
+-			 map_remaining);
+-		if (delta) {
+-			read_descriptor_t desc = {
+-				.count = delta,
+-			};
+-			int ret;
+-
+-			ret = tcp_read_sock(ssk, &desc, subflow_read_actor);
+-			if (ret < 0) {
+-				ssk->sk_err = -ret;
+-				goto fatal;
+-			}
+-			if (ret < delta)
+-				return false;
+-			if (delta == map_remaining)
+-				subflow->map_valid = 0;
+-		}
++		if (mptcp_subflow_discard_data(ssk, old_ack - ack_seq))
++			goto fatal;
++		return false;
+ 	}
+ 	return true;
+ 
