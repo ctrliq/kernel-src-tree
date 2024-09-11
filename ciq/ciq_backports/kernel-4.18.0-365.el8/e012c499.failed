@@ -1,0 +1,136 @@
+powerpc/watchdog: help remote CPUs to flush NMI printk output
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit e012c499985c608c936410d8bab29d9596d62859
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/e012c499.failed
+
+The printk layer at the moment does not seem to have a good way to force
+flush printk messages that are created in NMI context, except in the
+panic path.
+
+NMI-context printk messages normally get to the console with irq_work,
+but that won't help if the CPU is stuck with irqs disabled, as can be
+the case for hard lockup watchdog messages.
+
+The watchdog currently flushes the printk buffers after detecting a
+lockup on remote CPUs, but they may not have processed their NMI IPI
+yet by that stage, or they may have self-detected a lockup in which
+case they won't go via this NMI IPI path.
+
+Improve the situation by having NMI-context mark a flag if it called
+printk, and have watchdog timer interrupts check if that flag was set
+and try to flush if it was. Latency is not a big problem because we
+were already stuck for a while, just need to try to make sure the
+messages eventually make it out.
+
+Depends-on: 5d5e4522a7f4 ("printk: restore flushing of NMI buffers on remote CPUs after NMI backtraces")
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+	Reviewed-by: Laurent Dufour <ldufour@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20211119113146.752759-6-npiggin@gmail.com
+(cherry picked from commit e012c499985c608c936410d8bab29d9596d62859)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kernel/watchdog.c
+diff --cc arch/powerpc/kernel/watchdog.c
+index ad2f126d0d8d,bfc27496fe7e..000000000000
+--- a/arch/powerpc/kernel/watchdog.c
++++ b/arch/powerpc/kernel/watchdog.c
+@@@ -82,6 -85,8 +82,11 @@@ static DEFINE_PER_CPU(u64, wd_timer_tb)
+  
+  /* SMP checker bits */
+  static unsigned long __wd_smp_lock;
+++<<<<<<< HEAD
+++=======
++ static unsigned long __wd_reporting;
++ static unsigned long __wd_nmi_output;
+++>>>>>>> e012c499985c (powerpc/watchdog: help remote CPUs to flush NMI printk output)
+  static cpumask_t wd_smp_cpus_pending;
+  static cpumask_t wd_smp_cpus_stuck;
+  static u64 wd_smp_last_reset_tb;
+@@@ -171,28 -236,15 +193,31 @@@ static void watchdog_smp_panic(int cpu
+  		 * Try to trigger the stuck CPUs, unless we are going to
+  		 * get a backtrace on all of them anyway.
+  		 */
+ -		for_each_cpu(c, &wd_smp_cpus_ipi) {
+ +		for_each_cpu(c, &wd_smp_cpus_pending) {
+ +			bool empty;
+ +			if (c == cpu)
+ +				continue;
+ +			/* Take the stuck CPUs out of the watch group */
+ +			empty = set_cpu_stuck(c, tb);
+  			smp_send_nmi_ipi(c, wd_lockup_ipi, 1000000);
+ -			__cpumask_clear_cpu(c, &wd_smp_cpus_ipi);
+ +			if (empty)
+ +				break;
+  		}
+ -	} else {
+ -		trigger_allbutself_cpu_backtrace();
+ -		cpumask_clear(&wd_smp_cpus_ipi);
+  	}
+  
+++<<<<<<< HEAD
+ +	wd_smp_unlock(&flags);
+ +
+ +	printk_safe_flush();
+ +	/*
+ +	 * printk_safe_flush() seems to require another print
+ +	 * before anything actually goes out to console.
+ +	 */
+ +	if (sysctl_hardlockup_all_cpu_backtrace)
+ +		trigger_allbutself_cpu_backtrace();
+ +
+++=======
+++>>>>>>> e012c499985c (powerpc/watchdog: help remote CPUs to flush NMI printk output)
+  	if (hardlockup_panic)
+  		nmi_panic(NULL, "Hard LOCKUP");
+  
+@@@ -292,13 -345,24 +317,28 @@@ static void watchdog_timer_interrupt(in
+  
+  	per_cpu(wd_timer_tb, cpu) = tb;
+  
+ -	wd_smp_clear_cpu_pending(cpu);
+ +	wd_smp_clear_cpu_pending(cpu, tb);
+  
+  	if ((s64)(tb - wd_smp_last_reset_tb) >= (s64)wd_smp_panic_timeout_tb)
+++<<<<<<< HEAD
+ +		watchdog_smp_panic(cpu, tb);
+++=======
++ 		watchdog_smp_panic(cpu);
++ 
++ 	if (__wd_nmi_output && xchg(&__wd_nmi_output, 0)) {
++ 		/*
++ 		 * Something has called printk from NMI context. It might be
++ 		 * stuck, so this this triggers a flush that will get that
++ 		 * printk output to the console.
++ 		 *
++ 		 * See wd_lockup_ipi.
++ 		 */
++ 		printk_trigger_flush();
++ 	}
+++>>>>>>> e012c499985c (powerpc/watchdog: help remote CPUs to flush NMI printk output)
+  }
+  
+ -DEFINE_INTERRUPT_HANDLER_NMI(soft_nmi_interrupt)
+ +void soft_nmi_interrupt(struct pt_regs *regs)
+  {
+  	unsigned long flags;
+  	int cpu = raw_smp_processor_id();
+@@@ -329,7 -409,7 +369,11 @@@
+  		print_irqtrace_events(current);
+  		show_regs(regs);
+  
+++<<<<<<< HEAD
+ +		wd_smp_unlock(&flags);
+++=======
++ 		xchg(&__wd_nmi_output, 1); // see wd_lockup_ipi
+++>>>>>>> e012c499985c (powerpc/watchdog: help remote CPUs to flush NMI printk output)
+  
+  		if (sysctl_hardlockup_all_cpu_backtrace)
+  			trigger_allbutself_cpu_backtrace();
+* Unmerged path arch/powerpc/kernel/watchdog.c
