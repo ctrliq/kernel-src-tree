@@ -1,0 +1,113 @@
+io_uring: fix potential deadlock in io_poll_wake()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 7c9e7f0fe0d8abf856a957c150c48778e75154c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7c9e7f0f.failed
+
+We attempt to run the poll completion inline, but we're using trylock to
+do so. This avoids a deadlock since we're grabbing the locks in reverse
+order at this point, we already hold the poll wq lock and we're trying
+to grab the completion lock, while the normal rules are the reverse of
+that order.
+
+IO completion for a timeout link will need to grab the completion lock,
+but that's not safe from this context. Put the completion under the
+completion_lock in io_poll_wake(), and mark the request as entering
+the completion with the completion_lock already held.
+
+Fixes: 2665abfd757f ("io_uring: add support for linked SQE timeouts")
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 7c9e7f0fe0d8abf856a957c150c48778e75154c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index fca9cdc96d77,247e5e1137a3..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -334,9 -334,14 +334,17 @@@ struct io_kiocb 
+  #define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+  #define REQ_F_IO_DRAINED	32	/* drain done */
+  #define REQ_F_LINK		64	/* linked sqes */
+ -#define REQ_F_LINK_TIMEOUT	128	/* has linked timeout */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+  #define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++<<<<<<< HEAD
+++=======
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_INFLIGHT		8192	/* on inflight list */
++ #define REQ_F_COMP_LOCKED	16384	/* completion under lock */
+++>>>>>>> 7c9e7f0fe0d8 (io_uring: fix potential deadlock in io_poll_wake())
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -680,11 -930,23 +688,31 @@@ static void io_free_req(struct io_kioc
+  	 * dependencies to the next request. In case of failure, fail the rest
+  	 * of the chain.
+  	 */
+++<<<<<<< HEAD
+ +	if (req->flags & REQ_F_LINK) {
+ +		if (req->flags & REQ_F_FAIL_LINK)
+ +			io_fail_links(req);
+ +		else
+ +			io_req_link_next(req);
+++=======
++ 	if (req->flags & REQ_F_FAIL_LINK) {
++ 		io_fail_links(req);
++ 	} else if ((req->flags & (REQ_F_LINK_TIMEOUT | REQ_F_COMP_LOCKED)) ==
++ 			REQ_F_LINK_TIMEOUT) {
++ 		struct io_ring_ctx *ctx = req->ctx;
++ 		unsigned long flags;
++ 
++ 		/*
++ 		 * If this is a timeout link, we could be racing with the
++ 		 * timeout timer. Grab the completion lock for this case to
++ 		 * protect against that.
++ 		 */
++ 		spin_lock_irqsave(&ctx->completion_lock, flags);
++ 		io_req_link_next(req, nxt);
++ 		spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 	} else {
++ 		io_req_link_next(req, nxt);
+++>>>>>>> 7c9e7f0fe0d8 (io_uring: fix potential deadlock in io_poll_wake())
+  	}
+  
+  	__io_free_req(req);
+@@@ -1735,15 -2066,22 +1763,26 @@@ static int io_poll_wake(struct wait_que
+  
+  	list_del_init(&poll->wait.entry);
+  
++ 	/*
++ 	 * Run completion inline if we can. We're using trylock here because
++ 	 * we are violating the completion_lock -> poll wq lock ordering.
++ 	 * If we have a link timeout we're going to need the completion_lock
++ 	 * for finalizing the request, mark us as having grabbed that already.
++ 	 */
+  	if (mask && spin_trylock_irqsave(&ctx->completion_lock, flags)) {
+  		list_del(&req->list);
+++<<<<<<< HEAD
+ +		io_poll_complete(ctx, req, mask);
+++=======
++ 		io_poll_complete(req, mask);
++ 		req->flags |= REQ_F_COMP_LOCKED;
++ 		io_put_req(req);
+++>>>>>>> 7c9e7f0fe0d8 (io_uring: fix potential deadlock in io_poll_wake())
+  		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+  
+  		io_cqring_ev_posted(ctx);
+- 		io_put_req(req);
+  	} else {
+ -		io_queue_async_work(req);
+ +		io_queue_async_work(ctx, req);
+  	}
+  
+  	return 1;
+* Unmerged path fs/io_uring.c
