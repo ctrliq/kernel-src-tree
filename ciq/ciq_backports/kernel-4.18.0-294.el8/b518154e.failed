@@ -1,0 +1,312 @@
+mm/vmscan: protect the workingset on anonymous LRU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit b518154e59aab3ad0780a169c5cc84bd4ee4357e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b518154e.failed
+
+In current implementation, newly created or swap-in anonymous page is
+started on active list.  Growing active list results in rebalancing
+active/inactive list so old pages on active list are demoted to inactive
+list.  Hence, the page on active list isn't protected at all.
+
+Following is an example of this situation.
+
+Assume that 50 hot pages on active list.  Numbers denote the number of
+pages on active/inactive list (active | inactive).
+
+1. 50 hot pages on active list
+50(h) | 0
+
+2. workload: 50 newly created (used-once) pages
+50(uo) | 50(h)
+
+3. workload: another 50 newly created (used-once) pages
+50(uo) | 50(uo), swap-out 50(h)
+
+This patch tries to fix this issue.  Like as file LRU, newly created or
+swap-in anonymous pages will be inserted to the inactive list.  They are
+promoted to active list if enough reference happens.  This simple
+modification changes the above example as following.
+
+1. 50 hot pages on active list
+50(h) | 0
+
+2. workload: 50 newly created (used-once) pages
+50(h) | 50(uo)
+
+3. workload: another 50 newly created (used-once) pages
+50(h) | 50(uo), swap-out 50(uo)
+
+As you can see, hot pages on active list would be protected.
+
+Note that, this implementation has a drawback that the page cannot be
+promoted and will be swapped-out if re-access interval is greater than the
+size of inactive list but less than the size of total(active+inactive).
+To solve this potential issue, following patch will apply workingset
+detection similar to the one that's already applied to file LRU.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+Link: http://lkml.kernel.org/r/1595490560-15117-3-git-send-email-iamjoonsoo.kim@lge.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit b518154e59aab3ad0780a169c5cc84bd4ee4357e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/events/uprobes.c
+#	mm/huge_memory.c
+#	mm/khugepaged.c
+#	mm/memory.c
+#	mm/swapfile.c
+#	mm/userfaultfd.c
+diff --cc kernel/events/uprobes.c
+index 053c0240152f,49047d479c57..000000000000
+--- a/kernel/events/uprobes.c
++++ b/kernel/events/uprobes.c
+@@@ -189,8 -184,7 +189,12 @@@ static int __replace_page(struct vm_are
+  	if (new_page) {
+  		get_page(new_page);
+  		page_add_new_anon_rmap(new_page, vma, addr, false);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(new_page, memcg, false, false);
+ +		lru_cache_add_active_or_unevictable(new_page, vma);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(new_page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  	} else
+  		/* no new page, just dec_mm_counter for old_page */
+  		dec_mm_counter(mm, MM_ANONPAGES);
+diff --cc mm/huge_memory.c
+index 4033c78cc361,863c495776d7..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -603,8 -640,7 +603,12 @@@ static vm_fault_t __do_huge_pmd_anonymo
+  		entry = mk_huge_pmd(page, vma->vm_page_prot);
+  		entry = maybe_pmd_mkwrite(pmd_mkdirty(entry), vma);
+  		page_add_new_anon_rmap(page, vma, haddr, true);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(page, memcg, false, true);
+ +		lru_cache_add_active_or_unevictable(page, vma);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  		pgtable_trans_huge_deposit(vma->vm_mm, vmf->pmd, pgtable);
+  		set_pmd_at(vma->vm_mm, haddr, vmf->pmd, entry);
+  		add_mm_counter(vma->vm_mm, MM_ANONPAGES, HPAGE_PMD_NR);
+diff --cc mm/khugepaged.c
+index 9b4e03006b98,15a9af791014..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -1110,9 -1173,7 +1110,13 @@@ static void collapse_huge_page(struct m
+  	spin_lock(pmd_ptl);
+  	BUG_ON(!pmd_none(*pmd));
+  	page_add_new_anon_rmap(new_page, vma, address, true);
+++<<<<<<< HEAD
+ +	mem_cgroup_commit_charge(new_page, memcg, false, true);
+ +	count_memcg_events(memcg, THP_COLLAPSE_ALLOC, 1);
+ +	lru_cache_add_active_or_unevictable(new_page, vma);
+++=======
++ 	lru_cache_add_inactive_or_unevictable(new_page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  	pgtable_trans_huge_deposit(mm, pmd, pgtable);
+  	set_pmd_at(mm, address, pmd, _pmd);
+  	update_mmu_cache_pmd(vma, address, pmd);
+diff --cc mm/memory.c
+index 583eb7e0dd7f,6fe8b5b22c57..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -2643,8 -2715,7 +2643,12 @@@ static vm_fault_t wp_page_copy(struct v
+  		 */
+  		ptep_clear_flush_notify(vma, vmf->address, vmf->pte);
+  		page_add_new_anon_rmap(new_page, vma, vmf->address, false);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(new_page, memcg, false, false);
+ +		lru_cache_add_active_or_unevictable(new_page, vma);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(new_page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  		/*
+  		 * We call the notify macro here because, when using secondary
+  		 * mmu page tables (such as kvm shadow page tables), we want the
+@@@ -3154,12 -3266,9 +3158,18 @@@ vm_fault_t do_swap_page(struct vm_faul
+  	/* ksm created a completely new copy */
+  	if (unlikely(page != swapcache && swapcache)) {
+  		page_add_new_anon_rmap(page, vma, vmf->address, false);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(page, memcg, false, false);
+ +		lru_cache_add_active_or_unevictable(page, vma);
+ +	} else {
+ +		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
+ +		mem_cgroup_commit_charge(page, memcg, true, false);
+ +		activate_page(page);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(page, vma);
++ 	} else {
++ 		do_page_add_anon_rmap(page, vma, vmf->address, exclusive);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  	}
+  
+  	swap_free(entry);
+@@@ -3302,8 -3413,7 +3312,12 @@@ static vm_fault_t do_anonymous_page(str
+  
+  	inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+  	page_add_new_anon_rmap(page, vma, vmf->address, false);
+++<<<<<<< HEAD
+ +	mem_cgroup_commit_charge(page, memcg, false, false);
+ +	lru_cache_add_active_or_unevictable(page, vma);
+++=======
++ 	lru_cache_add_inactive_or_unevictable(page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  setpte:
+  	set_pte_at(vma->vm_mm, vmf->address, vmf->pte, entry);
+  
+@@@ -3576,8 -3671,7 +3590,12 @@@ vm_fault_t alloc_set_pte(struct vm_faul
+  	if (write && !(vma->vm_flags & VM_SHARED)) {
+  		inc_mm_counter_fast(vma->vm_mm, MM_ANONPAGES);
+  		page_add_new_anon_rmap(page, vma, vmf->address, false);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(page, memcg, false, false);
+ +		lru_cache_add_active_or_unevictable(page, vma);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  	} else {
+  		inc_mm_counter_fast(vma->vm_mm, mm_counter_file(page));
+  		page_add_file_rmap(page, false);
+diff --cc mm/swapfile.c
+index b77fb155eaf4,82183432fdd0..000000000000
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@@ -1947,11 -1913,9 +1947,15 @@@ static int unuse_pte(struct vm_area_str
+  		   pte_mkold(mk_pte(page, vma->vm_page_prot)));
+  	if (page == swapcache) {
+  		page_add_anon_rmap(page, vma, addr, false);
+ +		mem_cgroup_commit_charge(page, memcg, true, false);
+  	} else { /* ksm created a completely new copy */
+  		page_add_new_anon_rmap(page, vma, addr, false);
+++<<<<<<< HEAD
+ +		mem_cgroup_commit_charge(page, memcg, false, false);
+ +		lru_cache_add_active_or_unevictable(page, vma);
+++=======
++ 		lru_cache_add_inactive_or_unevictable(page, vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  	}
+  	swap_free(entry);
+  	/*
+diff --cc mm/userfaultfd.c
+index 7529d3fcc899,9a3d451402d7..000000000000
+--- a/mm/userfaultfd.c
++++ b/mm/userfaultfd.c
+@@@ -91,8 -123,7 +91,12 @@@ static int mcopy_atomic_pte(struct mm_s
+  
+  	inc_mm_counter(dst_mm, MM_ANONPAGES);
+  	page_add_new_anon_rmap(page, dst_vma, dst_addr, false);
+++<<<<<<< HEAD
+ +	mem_cgroup_commit_charge(page, memcg, false, false);
+ +	lru_cache_add_active_or_unevictable(page, dst_vma);
+++=======
++ 	lru_cache_add_inactive_or_unevictable(page, dst_vma);
+++>>>>>>> b518154e59aa (mm/vmscan: protect the workingset on anonymous LRU)
+  
+  	set_pte_at(dst_mm, dst_addr, dst_pte, _dst_pte);
+  
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 8552871db183..c0a6b5eeaecc 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -341,7 +341,7 @@ extern void deactivate_page(struct page *page);
+ extern void mark_page_lazyfree(struct page *page);
+ extern void swap_setup(void);
+ 
+-extern void lru_cache_add_active_or_unevictable(struct page *page,
++extern void lru_cache_add_inactive_or_unevictable(struct page *page,
+ 						struct vm_area_struct *vma);
+ 
+ /* linux/mm/vmscan.c */
+* Unmerged path kernel/events/uprobes.c
+* Unmerged path mm/huge_memory.c
+* Unmerged path mm/khugepaged.c
+* Unmerged path mm/memory.c
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 60059875287d..f49df89527ce 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -2785,7 +2785,7 @@ static void migrate_vma_insert_page(struct migrate_vma *migrate,
+ 	page_add_new_anon_rmap(page, vma, addr, false);
+ 	mem_cgroup_commit_charge(page, memcg, false, false);
+ 	if (!is_zone_device_page(page))
+-		lru_cache_add_active_or_unevictable(page, vma);
++		lru_cache_add_inactive_or_unevictable(page, vma);
+ 	get_page(page);
+ 
+ 	if (flush) {
+diff --git a/mm/swap.c b/mm/swap.c
+index 70728521e27e..a61021c172b2 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -452,23 +452,24 @@ void lru_cache_add(struct page *page)
+ }
+ 
+ /**
+- * lru_cache_add_active_or_unevictable
++ * lru_cache_add_inactive_or_unevictable
+  * @page:  the page to be added to LRU
+  * @vma:   vma in which page is mapped for determining reclaimability
+  *
+- * Place @page on the active or unevictable LRU list, depending on its
++ * Place @page on the inactive or unevictable LRU list, depending on its
+  * evictability.  Note that if the page is not evictable, it goes
+  * directly back onto it's zone's unevictable list, it does NOT use a
+  * per cpu pagevec.
+  */
+-void lru_cache_add_active_or_unevictable(struct page *page,
++void lru_cache_add_inactive_or_unevictable(struct page *page,
+ 					 struct vm_area_struct *vma)
+ {
++	bool unevictable;
++
+ 	VM_BUG_ON_PAGE(PageLRU(page), page);
+ 
+-	if (likely((vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) != VM_LOCKED))
+-		SetPageActive(page);
+-	else if (!TestSetPageMlocked(page)) {
++	unevictable = (vma->vm_flags & (VM_LOCKED | VM_SPECIAL)) == VM_LOCKED;
++	if (unlikely(unevictable) && !TestSetPageMlocked(page)) {
+ 		/*
+ 		 * We use the irq-unsafe __mod_zone_page_stat because this
+ 		 * counter is not modified from interrupt context, and the pte
+* Unmerged path mm/swapfile.c
+* Unmerged path mm/userfaultfd.c
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index d33ed25f0511..286f16c579f8 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1006,8 +1006,6 @@ static enum page_references page_check_references(struct page *page,
+ 		return PAGEREF_RECLAIM;
+ 
+ 	if (referenced_ptes) {
+-		if (PageSwapBacked(page))
+-			return PAGEREF_ACTIVATE;
+ 		/*
+ 		 * All mapped pages start out with page table
+ 		 * references from the instantiating fault, so we need
+@@ -1030,7 +1028,7 @@ static enum page_references page_check_references(struct page *page,
+ 		/*
+ 		 * Activate file-backed executable pages after first usage.
+ 		 */
+-		if (vm_flags & VM_EXEC)
++		if ((vm_flags & VM_EXEC) && !PageSwapBacked(page))
+ 			return PAGEREF_ACTIVATE;
+ 
+ 		return PAGEREF_KEEP;
