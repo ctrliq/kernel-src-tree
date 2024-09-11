@@ -1,0 +1,697 @@
+io_uring: fix sequencing issues with linked timeouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 94ae5e77a9150a8c6c57432e2db290c6868ddfad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/94ae5e77.failed
+
+We have an issue with timeout links that are deeper in the submit chain,
+because we only handle it upfront, not from later submissions. Move the
+prep + issue of the timeout link to the async work prep handler, and do
+it normally for non-async queue. If we validate and prepare the timeout
+links upfront when we first see them, there's nothing stopping us from
+supporting any sort of nesting.
+
+Fixes: 2665abfd757f ("io_uring: add support for linked SQE timeouts")
+	Reported-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 94ae5e77a9150a8c6c57432e2db290c6868ddfad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index f656b9c7fa46,759a30e52fda..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -334,9 -344,16 +334,19 @@@ struct io_kiocb 
+  #define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+  #define REQ_F_IO_DRAINED	32	/* drain done */
+  #define REQ_F_LINK		64	/* linked sqes */
+ -#define REQ_F_LINK_TIMEOUT	128	/* has linked timeout */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+  #define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++<<<<<<< HEAD
+++=======
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_TIMEOUT_NOSEQ	8192	/* no timeout sequence */
++ #define REQ_F_INFLIGHT		16384	/* on inflight list */
++ #define REQ_F_COMP_LOCKED	32768	/* completion under lock */
++ #define REQ_F_FREE_SQE		65536	/* free sqe if not async queued */
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -367,8 -386,14 +377,16 @@@ struct io_submit_state 
+  	unsigned int		ios_left;
+  };
+  
+ -static void io_wq_submit_work(struct io_wq_work **workptr);
+ -static void io_cqring_fill_event(struct io_kiocb *req, long res);
+ +static void io_sq_wq_submit_work(struct work_struct *work);
+  static void __io_free_req(struct io_kiocb *req);
+++<<<<<<< HEAD
+++=======
++ static void io_put_req(struct io_kiocb *req);
++ static void io_double_put_req(struct io_kiocb *req);
++ static void __io_double_put_req(struct io_kiocb *req);
++ static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req);
++ static void io_queue_linked_timeout(struct io_kiocb *req);
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  
+  static struct kmem_cache *req_cachep;
+  
+@@@ -467,21 -524,90 +485,83 @@@ static void __io_commit_cqring(struct i
+  	}
+  }
+  
+ -static inline bool io_sqe_needs_user(const struct io_uring_sqe *sqe)
+ +static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ +				       struct io_kiocb *req)
+  {
+++<<<<<<< HEAD
+ +	int rw = 0;
+++=======
++ 	u8 opcode = READ_ONCE(sqe->opcode);
++ 
++ 	return !(opcode == IORING_OP_READ_FIXED ||
++ 		 opcode == IORING_OP_WRITE_FIXED);
++ }
++ 
++ static inline bool io_prep_async_work(struct io_kiocb *req,
++ 				      struct io_kiocb **link)
++ {
++ 	bool do_hashed = false;
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  
+  	if (req->submit.sqe) {
+  		switch (req->submit.sqe->opcode) {
+  		case IORING_OP_WRITEV:
+  		case IORING_OP_WRITE_FIXED:
+ -			do_hashed = true;
+ -			/* fall-through */
+ -		case IORING_OP_READV:
+ -		case IORING_OP_READ_FIXED:
+ -		case IORING_OP_SENDMSG:
+ -		case IORING_OP_RECVMSG:
+ -		case IORING_OP_ACCEPT:
+ -		case IORING_OP_POLL_ADD:
+ -			/*
+ -			 * We know REQ_F_ISREG is not set on some of these
+ -			 * opcodes, but this enables us to keep the check in
+ -			 * just one place.
+ -			 */
+ -			if (!(req->flags & REQ_F_ISREG))
+ -				req->work.flags |= IO_WQ_WORK_UNBOUND;
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+  			break;
+  		}
+ -		if (io_sqe_needs_user(req->submit.sqe))
+ -			req->work.flags |= IO_WQ_WORK_NEEDS_USER;
+  	}
+  
+++<<<<<<< HEAD
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+++=======
++ 	*link = io_prep_linked_timeout(req);
++ 	return do_hashed;
++ }
++ 
++ static inline void io_queue_async_work(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *link;
++ 	bool do_hashed;
++ 
++ 	do_hashed = io_prep_async_work(req, &link);
++ 
++ 	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
++ 					req->flags);
++ 	if (!do_hashed) {
++ 		io_wq_enqueue(ctx->io_wq, &req->work);
++ 	} else {
++ 		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
++ 					file_inode(req->file));
++ 	}
++ 
++ 	if (link)
++ 		io_queue_linked_timeout(link);
++ }
++ 
++ static void io_kill_timeout(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	ret = hrtimer_try_to_cancel(&req->timeout.data->timer);
++ 	if (ret != -1) {
++ 		atomic_inc(&req->ctx->cq_timeouts);
++ 		list_del_init(&req->list);
++ 		io_cqring_fill_event(req, 0);
++ 		io_put_req(req);
++ 	}
++ }
++ 
++ static void io_kill_timeouts(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req, *tmp;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
++ 		io_kill_timeout(req);
++ 	spin_unlock_irq(&ctx->completion_lock);
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -642,18 -884,38 +722,46 @@@ static void io_req_link_next(struct io_
+  	 * safe side.
+  	 */
+  	nxt = list_first_entry_or_null(&req->link_list, struct io_kiocb, list);
+++<<<<<<< HEAD
+ +	if (nxt) {
+ +		list_del(&nxt->list);
+++=======
++ 	while (nxt) {
++ 		list_del_init(&nxt->list);
++ 
++ 		if ((req->flags & REQ_F_LINK_TIMEOUT) &&
++ 		    (nxt->flags & REQ_F_TIMEOUT)) {
++ 			wake_ev |= io_link_cancel_timeout(nxt);
++ 			nxt = list_first_entry_or_null(&req->link_list,
++ 							struct io_kiocb, list);
++ 			req->flags &= ~REQ_F_LINK_TIMEOUT;
++ 			continue;
++ 		}
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  		if (!list_empty(&req->link_list)) {
+  			INIT_LIST_HEAD(&nxt->link_list);
+  			list_splice(&req->link_list, &nxt->link_list);
+  			nxt->flags |= REQ_F_LINK;
+  		}
+  
+++<<<<<<< HEAD
+ +		nxt->flags |= REQ_F_LINK_DONE;
+ +		INIT_WORK(&nxt->work, io_sq_wq_submit_work);
+ +		io_queue_async_work(req->ctx, nxt);
+++=======
++ 		/*
++ 		 * If we're in async work, we can continue processing the chain
++ 		 * in this context instead of having to queue up new async work.
++ 		 */
++ 		if (nxt) {
++ 			if (nxtptr && io_wq_current_is_worker())
++ 				*nxtptr = nxt;
++ 			else
++ 				io_queue_async_work(nxt);
++ 		}
++ 		break;
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  	}
+ -
+ -	if (wake_ev)
+ -		io_cqring_ev_posted(ctx);
+  }
+  
+  /*
+@@@ -661,19 -923,45 +769,37 @@@
+   */
+  static void io_fail_links(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+  	struct io_kiocb *link;
+ -	unsigned long flags;
+ -
+ -	spin_lock_irqsave(&ctx->completion_lock, flags);
+  
+  	while (!list_empty(&req->link_list)) {
++ 		const struct io_uring_sqe *sqe_to_free = NULL;
++ 
+  		link = list_first_entry(&req->link_list, struct io_kiocb, list);
+ -		list_del_init(&link->list);
+ +		list_del(&link->list);
+  
+++<<<<<<< HEAD
+ +		io_cqring_add_event(req->ctx, link->user_data, -ECANCELED);
+ +		__io_free_req(link);
+++=======
++ 		trace_io_uring_fail_link(req, link);
++ 
++ 		if (link->flags & REQ_F_FREE_SQE)
++ 			sqe_to_free = link->submit.sqe;
++ 
++ 		if ((req->flags & REQ_F_LINK_TIMEOUT) &&
++ 		    link->submit.sqe->opcode == IORING_OP_LINK_TIMEOUT) {
++ 			io_link_cancel_timeout(link);
++ 		} else {
++ 			io_cqring_fill_event(link, -ECANCELED);
++ 			__io_double_put_req(link);
++ 		}
++ 		kfree(sqe_to_free);
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  	}
+ -
+ -	io_commit_cqring(ctx);
+ -	spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	io_cqring_ev_posted(ctx);
+  }
+  
+ -static void io_free_req_find_next(struct io_kiocb *req, struct io_kiocb **nxt)
+ +static void io_free_req(struct io_kiocb *req)
+  {
+ -	if (likely(!(req->flags & REQ_F_LINK))) {
+ -		__io_free_req(req);
+ -		return;
+ -	}
+ -
+  	/*
+  	 * If LINK is set, we have dependent requests in this chain. If we
+  	 * didn't fail this request, queue the first one up, moving any other
+@@@ -1935,177 -2657,59 +2061,191 @@@ static int __io_submit_sqe(struct io_ri
+  	return 0;
+  }
+  
+ -static void io_wq_submit_work(struct io_wq_work **workptr)
+ +static struct async_list *io_async_list_from_sqe(struct io_ring_ctx *ctx,
+ +						 const struct io_uring_sqe *sqe)
+ +{
+ +	switch (sqe->opcode) {
+ +	case IORING_OP_READV:
+ +	case IORING_OP_READ_FIXED:
+ +		return &ctx->pending_async[READ];
+ +	case IORING_OP_WRITEV:
+ +	case IORING_OP_WRITE_FIXED:
+ +		return &ctx->pending_async[WRITE];
+ +	default:
+ +		return NULL;
+ +	}
+ +}
+ +
+ +static inline bool io_sqe_needs_user(const struct io_uring_sqe *sqe)
+ +{
+ +	u8 opcode = READ_ONCE(sqe->opcode);
+ +
+ +	return !(opcode == IORING_OP_READ_FIXED ||
+ +		 opcode == IORING_OP_WRITE_FIXED);
+ +}
+ +
+ +static void io_sq_wq_submit_work(struct work_struct *work)
+  {
+ -	struct io_wq_work *work = *workptr;
+  	struct io_kiocb *req = container_of(work, struct io_kiocb, work);
+ -	struct sqe_submit *s = &req->submit;
+ -	const struct io_uring_sqe *sqe = s->sqe;
+ -	struct io_kiocb *nxt = NULL;
+ -	int ret = 0;
+ +	struct io_ring_ctx *ctx = req->ctx;
+ +	struct mm_struct *cur_mm = NULL;
+ +	struct async_list *async_list;
+ +	LIST_HEAD(req_list);
+ +	mm_segment_t old_fs;
+ +	int ret;
+  
+ -	/* Ensure we clear previously set non-block flag */
+ -	req->rw.ki_flags &= ~IOCB_NOWAIT;
+ +	async_list = io_async_list_from_sqe(ctx, req->submit.sqe);
+ +restart:
+ +	do {
+ +		struct sqe_submit *s = &req->submit;
+ +		const struct io_uring_sqe *sqe = s->sqe;
+ +		unsigned int flags = req->flags;
+  
+ -	if (work->flags & IO_WQ_WORK_CANCEL)
+ -		ret = -ECANCELED;
+ +		/* Ensure we clear previously set non-block flag */
+ +		req->rw.ki_flags &= ~IOCB_NOWAIT;
+  
+ -	if (!ret) {
+ -		s->has_user = (work->flags & IO_WQ_WORK_HAS_MM) != 0;
+ -		s->in_async = true;
+ -		do {
+ -			ret = __io_submit_sqe(req, &nxt, false);
+ -			/*
+ -			 * We can get EAGAIN for polled IO even though we're
+ -			 * forcing a sync submission from here, since we can't
+ -			 * wait for request slots on the block side.
+ -			 */
+ -			if (ret != -EAGAIN)
+ -				break;
+ -			cond_resched();
+ -		} while (1);
+ -	}
+ +		ret = 0;
+ +		if (io_sqe_needs_user(sqe) && !cur_mm) {
+ +			if (!mmget_not_zero(ctx->sqo_mm)) {
+ +				ret = -EFAULT;
+ +			} else {
+ +				cur_mm = ctx->sqo_mm;
+ +				use_mm(cur_mm);
+ +				old_fs = get_fs();
+ +				set_fs(USER_DS);
+ +			}
+ +		}
+  
+ -	/* drop submission reference */
+ -	io_put_req(req);
+ +		if (!ret) {
+ +			s->has_user = cur_mm != NULL;
+ +			s->needs_lock = true;
+ +			do {
+ +				ret = __io_submit_sqe(ctx, req, s, false);
+ +				/*
+ +				 * We can get EAGAIN for polled IO even though
+ +				 * we're forcing a sync submission from here,
+ +				 * since we can't wait for request slots on the
+ +				 * block side.
+ +				 */
+ +				if (ret != -EAGAIN)
+ +					break;
+ +				cond_resched();
+ +			} while (1);
+ +		}
+  
+ -	if (ret) {
+ -		if (req->flags & REQ_F_LINK)
+ -			req->flags |= REQ_F_FAIL_LINK;
+ -		io_cqring_add_event(req, ret);
+ +		/* drop submission reference */
+  		io_put_req(req);
+ +
+ +		if (ret) {
+ +			io_cqring_add_event(ctx, sqe->user_data, ret);
+ +			io_put_req(req);
+ +		}
+ +
+ +		/* async context always use a copy of the sqe */
+ +		kfree(sqe);
+ +
+ +		/* req from defer and link list needn't decrease async cnt */
+ +		if (flags & (REQ_F_IO_DRAINED | REQ_F_LINK_DONE))
+ +			goto out;
+ +
+ +		if (!async_list)
+ +			break;
+ +		if (!list_empty(&req_list)) {
+ +			req = list_first_entry(&req_list, struct io_kiocb,
+ +						list);
+ +			list_del(&req->list);
+ +			continue;
+ +		}
+ +		if (list_empty(&async_list->list))
+ +			break;
+ +
+ +		req = NULL;
+ +		spin_lock(&async_list->lock);
+ +		if (list_empty(&async_list->list)) {
+ +			spin_unlock(&async_list->lock);
+ +			break;
+ +		}
+ +		list_splice_init(&async_list->list, &req_list);
+ +		spin_unlock(&async_list->lock);
+ +
+ +		req = list_first_entry(&req_list, struct io_kiocb, list);
+ +		list_del(&req->list);
+ +	} while (req);
+ +
+ +	/*
+ +	 * Rare case of racing with a submitter. If we find the count has
+ +	 * dropped to zero AND we have pending work items, then restart
+ +	 * the processing. This is a tiny race window.
+ +	 */
+ +	if (async_list) {
+ +		ret = atomic_dec_return(&async_list->cnt);
+ +		while (!ret && !list_empty(&async_list->list)) {
+ +			spin_lock(&async_list->lock);
+ +			atomic_inc(&async_list->cnt);
+ +			list_splice_init(&async_list->list, &req_list);
+ +			spin_unlock(&async_list->lock);
+ +
+ +			if (!list_empty(&req_list)) {
+ +				req = list_first_entry(&req_list,
+ +							struct io_kiocb, list);
+ +				list_del(&req->list);
+ +				goto restart;
+ +			}
+ +			ret = atomic_dec_return(&async_list->cnt);
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +out:
+ +	if (cur_mm) {
+ +		set_fs(old_fs);
+ +		unuse_mm(cur_mm);
+ +		mmput(cur_mm);
+++=======
++ 	/* async context always use a copy of the sqe */
++ 	kfree(sqe);
++ 
++ 	/* if a dependent link is ready, pass it back */
++ 	if (!ret && nxt) {
++ 		struct io_kiocb *link;
++ 
++ 		io_prep_async_work(nxt, &link);
++ 		*workptr = &nxt->work;
++ 		if (link)
++ 			io_queue_linked_timeout(link);
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+ +	}
+ +}
+ +
+ +/*
+ + * See if we can piggy back onto previously submitted work, that is still
+ + * running. We currently only allow this if the new request is sequential
+ + * to the previous one we punted.
+ + */
+ +static bool io_add_to_prev_work(struct async_list *list, struct io_kiocb *req)
+ +{
+ +	bool ret;
+ +
+ +	if (!list)
+ +		return false;
+ +	if (!(req->flags & REQ_F_SEQ_PREV))
+ +		return false;
+ +	if (!atomic_read(&list->cnt))
+ +		return false;
+ +
+ +	ret = true;
+ +	spin_lock(&list->lock);
+ +	list_add_tail(&req->list, &list->list);
+ +	/*
+ +	 * Ensure we see a simultaneous modification from io_sq_wq_submit_work()
+ +	 */
+ +	smp_mb();
+ +	if (!atomic_read(&list->cnt)) {
+ +		list_del_init(&req->list);
+ +		ret = false;
+  	}
+ +	spin_unlock(&list->lock);
+ +	return ret;
+  }
+  
+  static bool io_op_needs_file(const struct io_uring_sqe *sqe)
+@@@ -2163,13 -2781,117 +2303,125 @@@ static int io_req_set_file(struct io_ri
+  	return 0;
+  }
+  
+ -static int io_grab_files(struct io_kiocb *req)
+ +static int __io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			struct sqe_submit *s, bool force_nonblock)
+  {
+++<<<<<<< HEAD
+ +	int ret;
+ +
+ +	ret = __io_submit_sqe(ctx, req, s, force_nonblock);
+ +	if (ret == -EAGAIN && !(req->flags & REQ_F_NOWAIT)) {
+++=======
++ 	int ret = -EBADF;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	rcu_read_lock();
++ 	spin_lock_irq(&ctx->inflight_lock);
++ 	/*
++ 	 * We use the f_ops->flush() handler to ensure that we can flush
++ 	 * out work accessing these files if the fd is closed. Check if
++ 	 * the fd has changed since we started down this path, and disallow
++ 	 * this operation if it has.
++ 	 */
++ 	if (fcheck(req->submit.ring_fd) == req->submit.ring_file) {
++ 		list_add(&req->inflight_entry, &ctx->inflight_list);
++ 		req->flags |= REQ_F_INFLIGHT;
++ 		req->work.files = current->files;
++ 		ret = 0;
++ 	}
++ 	spin_unlock_irq(&ctx->inflight_lock);
++ 	rcu_read_unlock();
++ 
++ 	return ret;
++ }
++ 
++ static enum hrtimer_restart io_link_timeout_fn(struct hrtimer *timer)
++ {
++ 	struct io_timeout_data *data = container_of(timer,
++ 						struct io_timeout_data, timer);
++ 	struct io_kiocb *req = data->req;
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *prev = NULL;
++ 	unsigned long flags;
++ 
++ 	spin_lock_irqsave(&ctx->completion_lock, flags);
++ 
++ 	/*
++ 	 * We don't expect the list to be empty, that will only happen if we
++ 	 * race with the completion of the linked work.
++ 	 */
++ 	if (!list_empty(&req->list)) {
++ 		prev = list_entry(req->list.prev, struct io_kiocb, link_list);
++ 		if (refcount_inc_not_zero(&prev->refs))
++ 			list_del_init(&req->list);
++ 		else
++ 			prev = NULL;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&ctx->completion_lock, flags);
++ 
++ 	if (prev) {
++ 		io_async_find_and_cancel(ctx, req, prev->user_data, NULL);
++ 		io_put_req(prev);
++ 	} else {
++ 		io_cqring_add_event(req, -ETIME);
++ 		io_put_req(req);
++ 	}
++ 	return HRTIMER_NORESTART;
++ }
++ 
++ static void io_queue_linked_timeout(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 
++ 	/*
++ 	 * If the list is now empty, then our linked request finished before
++ 	 * we got a chance to setup the timer
++ 	 */
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	if (!list_empty(&req->list)) {
++ 		struct io_timeout_data *data = req->timeout.data;
++ 
++ 		data->timer.function = io_link_timeout_fn;
++ 		hrtimer_start(&data->timer, timespec64_to_ktime(data->ts),
++ 				data->mode);
++ 	}
++ 	spin_unlock_irq(&ctx->completion_lock);
++ 
++ 	/* drop submission reference */
++ 	io_put_req(req);
++ }
++ 
++ static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req)
++ {
++ 	struct io_kiocb *nxt;
++ 
++ 	if (!(req->flags & REQ_F_LINK))
++ 		return NULL;
++ 
++ 	nxt = list_first_entry_or_null(&req->link_list, struct io_kiocb, list);
++ 	if (!nxt || nxt->submit.sqe->opcode != IORING_OP_LINK_TIMEOUT)
++ 		return NULL;
++ 
++ 	req->flags |= REQ_F_LINK_TIMEOUT;
++ 	return nxt;
++ }
++ 
++ static void __io_queue_sqe(struct io_kiocb *req)
++ {
++ 	struct io_kiocb *nxt = io_prep_linked_timeout(req);
++ 	int ret;
++ 
++ 	ret = __io_submit_sqe(req, NULL, true);
++ 
++ 	/*
++ 	 * We async punt it if the file wasn't marked NOWAIT, or if the file
++ 	 * doesn't support non-blocking read/write attempts
++ 	 */
++ 	if (ret == -EAGAIN && (!(req->flags & REQ_F_NOWAIT) ||
++ 	    (req->flags & REQ_F_MUST_PUNT))) {
++ 		struct sqe_submit *s = &req->submit;
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  		struct io_uring_sqe *sqe_copy;
+  
+  		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
+@@@ -2190,7 -2909,8 +2442,12 @@@
+  			 * Queued up for async execution, worker will release
+  			 * submit reference when the iocb is actually submitted.
+  			 */
+++<<<<<<< HEAD
+ +			return 0;
+++=======
++ 			io_queue_async_work(req);
++ 			return;
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  		}
+  	}
+  
+@@@ -2231,9 -2952,16 +2488,20 @@@ static int io_queue_link_head(struct io
+  {
+  	int ret;
+  	int need_submit = false;
+ -	struct io_ring_ctx *ctx = req->ctx;
+  
+++<<<<<<< HEAD
+ +	if (!shadow)
+ +		return io_queue_sqe(ctx, req, s, force_nonblock);
+++=======
++ 	if (unlikely(req->flags & REQ_F_FAIL_LINK)) {
++ 		ret = -ECANCELED;
++ 		goto err;
++ 	}
++ 	if (!shadow) {
++ 		io_queue_sqe(req);
++ 		return;
++ 	}
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  
+  	/*
+  	 * Mark the first IO in link list as DRAIN, let all the following
+@@@ -2241,13 -2969,15 +2509,22 @@@
+  	 * list.
+  	 */
+  	req->flags |= REQ_F_IO_DRAIN;
+ -	ret = io_req_defer(req);
+ +	ret = io_req_defer(ctx, req, s->sqe);
+  	if (ret) {
+  		if (ret != -EIOCBQUEUED) {
+++<<<<<<< HEAD
+ +			io_free_req(req);
+ +			__io_free_req(shadow);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +			return 0;
+++=======
++ err:
++ 			io_cqring_add_event(req, ret);
++ 			io_double_put_req(req);
++ 			if (shadow)
++ 				__io_free_req(shadow);
++ 			return;
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  		}
+  	} else {
+  		/*
+@@@ -2318,7 -3051,8 +2606,12 @@@ err
+  		}
+  
+  		s->sqe = sqe_copy;
+++<<<<<<< HEAD
+ +		memcpy(&req->submit, s, sizeof(*s));
+++=======
++ 		req->flags |= REQ_F_FREE_SQE;
++ 		trace_io_uring_link(ctx, req, prev);
+++>>>>>>> 94ae5e77a915 (io_uring: fix sequencing issues with linked timeouts)
+  		list_add_tail(&req->list, &prev->link_list);
+  	} else if (s->sqe->flags & IOSQE_IO_LINK) {
+  		req->flags |= REQ_F_LINK;
+* Unmerged path fs/io_uring.c
