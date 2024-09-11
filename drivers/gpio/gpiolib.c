@@ -1676,8 +1676,6 @@ static void gpiochip_set_cascaded_irqchip(struct gpio_chip *gpiochip,
 					  unsigned int parent_irq,
 					  irq_flow_handler_t parent_handler)
 {
-	unsigned int offset;
-
 	if (!gpiochip->irq.domain) {
 		chip_err(gpiochip, "called %s before setting up irqchip\n",
 			 __func__);
@@ -1700,14 +1698,6 @@ static void gpiochip_set_cascaded_irqchip(struct gpio_chip *gpiochip,
 		gpiochip->irq.parent_irq = parent_irq;
 		gpiochip->irq.parents = &gpiochip->irq.parent_irq;
 		gpiochip->irq.num_parents = 1;
-	}
-
-	/* Set the parent IRQ for all affected IRQs */
-	for (offset = 0; offset < gpiochip->ngpio; offset++) {
-		if (!gpiochip_irqchip_irq_valid(gpiochip, offset))
-			continue;
-		irq_set_parent(irq_find_mapping(gpiochip->irq.domain, offset),
-			       parent_irq);
 	}
 }
 
