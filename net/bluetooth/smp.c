@@ -24,7 +24,6 @@
 #include <linux/scatterlist.h>
 #include <linux/crypto.h>
 #include <crypto/algapi.h>
-#include <crypto/b128ops.h>
 #include <crypto/hash.h>
 #include <crypto/kpp.h>
 
@@ -434,7 +433,7 @@ static int smp_c1(struct crypto_cipher *tfm_aes, const u8 k[16],
 	SMP_DBG("p1 %16phN", p1);
 
 	/* res = r XOR p1 */
-	u128_xor((u128 *) res, (u128 *) r, (u128 *) p1);
+	crypto_xor_cpy(res, r, p1, sizeof(p1));
 
 	/* res = e(k, res) */
 	err = smp_e(tfm_aes, k, res);
@@ -451,7 +450,7 @@ static int smp_c1(struct crypto_cipher *tfm_aes, const u8 k[16],
 	SMP_DBG("p2 %16phN", p2);
 
 	/* res = res XOR p2 */
-	u128_xor((u128 *) res, (u128 *) res, (u128 *) p2);
+	crypto_xor(res, p2, sizeof(p2));
 
 	/* res = e(k, res) */
 	err = smp_e(tfm_aes, k, res);
