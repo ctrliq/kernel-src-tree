@@ -1,0 +1,154 @@
+mptcp: do not shrink snd_nxt when recovering
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 0d199e4363b482badcedba764e2aceab53a4a10a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0d199e43.failed
+
+When recovering after a link failure, snd_nxt should not be set to a
+lower value.  Else, update of snd_nxt is broken because:
+
+  msk->snd_nxt += ret; (where ret is number of bytes sent)
+
+assumes that snd_nxt always moves forward.
+After reduction, its possible that snd_nxt update gets out of sync:
+dfrag we just sent might have had a data sequence number even past
+recovery_snd_nxt.
+
+This change factors the common msk state update to a helper
+and updates snd_nxt based on the current dfrag data sequence number.
+
+The conditional is required for the recovery phase where we may
+re-transmit old dfrags that are before current snd_nxt.
+
+After this change, snd_nxt only moves forward and covers all in-sequence
+data that was transmitted.
+
+recovery_snd_nxt is retained to detect when recovery has completed.
+
+Fixes: 1e1d9d6f119c5 ("mptcp: handle pending data on closed subflow")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0d199e4363b482badcedba764e2aceab53a4a10a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/options.c
+index 1377816711e0,1ec6529c4326..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -926,8 -1019,8 +926,13 @@@ static void ack_update_msk(struct mptcp
+  	old_snd_una = msk->snd_una;
+  	new_snd_una = mptcp_expand_seq(old_snd_una, mp_opt->data_ack, mp_opt->ack64);
+  
+++<<<<<<< HEAD
+ +	/* ACK for data not even sent yet? Ignore. */
+ +	if (after64(new_snd_una, snd_nxt))
+++=======
++ 	/* ACK for data not even sent yet? Ignore.*/
++ 	if (unlikely(after64(new_snd_una, snd_nxt)))
+++>>>>>>> 0d199e4363b4 (mptcp: do not shrink snd_nxt when recovering)
+  		new_snd_una = old_snd_una;
+  
+  	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
+diff --cc net/mptcp/protocol.c
+index 3c6947aa65c4,3d1757b8ef69..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -1454,7 -1525,33 +1454,37 @@@ static void mptcp_push_release(struct s
+  	release_sock(ssk);
+  }
+  
+++<<<<<<< HEAD
+ +static void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+++=======
++ static void mptcp_update_post_push(struct mptcp_sock *msk,
++ 				   struct mptcp_data_frag *dfrag,
++ 				   u32 sent)
++ {
++ 	u64 snd_nxt_new = dfrag->data_seq;
++ 
++ 	dfrag->already_sent += sent;
++ 
++ 	msk->snd_burst -= sent;
++ 	msk->tx_pending_data -= sent;
++ 
++ 	snd_nxt_new += dfrag->already_sent;
++ 
++ 	/* snd_nxt_new can be smaller than snd_nxt in case mptcp
++ 	 * is recovering after a failover. In that event, this re-sends
++ 	 * old segments.
++ 	 *
++ 	 * Thus compute snd_nxt_new candidate based on
++ 	 * the dfrag->data_seq that was sent and the data
++ 	 * that has been handed to the subflow for transmission
++ 	 * and skip update in case it was old dfrag.
++ 	 */
++ 	if (likely(after64(snd_nxt_new, msk->snd_nxt)))
++ 		msk->snd_nxt = snd_nxt_new;
++ }
++ 
++ void __mptcp_push_pending(struct sock *sk, unsigned int flags)
+++>>>>>>> 0d199e4363b4 (mptcp: do not shrink snd_nxt when recovering)
+  {
+  	struct sock *prev_ssk = NULL, *ssk = NULL;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+@@@ -2105,6 -2229,47 +2131,50 @@@ static void mptcp_dispose_initial_subfl
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool __mptcp_retransmit_pending_data(struct sock *sk)
++ {
++ 	struct mptcp_data_frag *cur, *rtx_head;
++ 	struct mptcp_sock *msk = mptcp_sk(sk);
++ 
++ 	if (__mptcp_check_fallback(mptcp_sk(sk)))
++ 		return false;
++ 
++ 	if (tcp_rtx_and_write_queues_empty(sk))
++ 		return false;
++ 
++ 	/* the closing socket has some data untransmitted and/or unacked:
++ 	 * some data in the mptcp rtx queue has not really xmitted yet.
++ 	 * keep it simple and re-inject the whole mptcp level rtx queue
++ 	 */
++ 	mptcp_data_lock(sk);
++ 	__mptcp_clean_una_wakeup(sk);
++ 	rtx_head = mptcp_rtx_head(sk);
++ 	if (!rtx_head) {
++ 		mptcp_data_unlock(sk);
++ 		return false;
++ 	}
++ 
++ 	msk->recovery_snd_nxt = msk->snd_nxt;
++ 	msk->recovery = true;
++ 	mptcp_data_unlock(sk);
++ 
++ 	msk->first_pending = rtx_head;
++ 	msk->tx_pending_data += msk->snd_nxt - rtx_head->data_seq;
++ 	msk->snd_burst = 0;
++ 
++ 	/* be sure to clear the "sent status" on all re-injected fragments */
++ 	list_for_each_entry(cur, &msk->rtx_queue, list) {
++ 		if (!cur->already_sent)
++ 			break;
++ 		cur->already_sent = 0;
++ 	}
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 0d199e4363b4 (mptcp: do not shrink snd_nxt when recovering)
+  /* subflow sockets can be either outgoing (connect) or incoming
+   * (accept).
+   *
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/protocol.c
