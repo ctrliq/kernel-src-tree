@@ -1,0 +1,112 @@
+netfilter: nft_dynset: honor stateful expressions in set definition
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit fca05d4d61e65fa573a3768f9019a42143c03349
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/fca05d4d.failed
+
+If the set definition contains stateful expressions, allocate them for
+the newly added entries from the packet path.
+
+Fixes: 65038428b2c6 ("netfilter: nf_tables: allow to specify stateful expression in set definition")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit fca05d4d61e65fa573a3768f9019a42143c03349)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_tables.h
+#	net/netfilter/nf_tables_api.c
+diff --cc include/net/netfilter/nf_tables.h
+index d15fbf83639b,4b6ecf532623..000000000000
+--- a/include/net/netfilter/nf_tables.h
++++ b/include/net/netfilter/nf_tables.h
+@@@ -697,7 -720,9 +697,13 @@@ struct nft_expr *nft_set_elem_expr_allo
+  void *nft_set_elem_init(const struct nft_set *set,
+  			const struct nft_set_ext_tmpl *tmpl,
+  			const u32 *key, const u32 *key_end, const u32 *data,
+++<<<<<<< HEAD
+ +			u64 timeout, gfp_t gfp);
+++=======
++ 			u64 timeout, u64 expiration, gfp_t gfp);
++ int nft_set_elem_expr_clone(const struct nft_ctx *ctx, struct nft_set *set,
++ 			    struct nft_expr *expr_array[]);
+++>>>>>>> fca05d4d61e6 (netfilter: nft_dynset: honor stateful expressions in set definition)
+  void nft_set_elem_destroy(const struct nft_set *set, void *elem,
+  			  bool destroy_expr);
+  
+diff --cc net/netfilter/nf_tables_api.c
+index 9f4a0cc92500,8d3aa97b52e7..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -4943,6 -5235,46 +4943,49 @@@ static void nf_tables_set_elem_destroy(
+  	kfree(elem);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int nft_set_elem_expr_clone(const struct nft_ctx *ctx, struct nft_set *set,
++ 			    struct nft_expr *expr_array[])
++ {
++ 	struct nft_expr *expr;
++ 	int err, i, k;
++ 
++ 	for (i = 0; i < set->num_exprs; i++) {
++ 		expr = kzalloc(set->exprs[i]->ops->size, GFP_KERNEL);
++ 		if (!expr)
++ 			goto err_expr;
++ 
++ 		err = nft_expr_clone(expr, set->exprs[i]);
++ 		if (err < 0) {
++ 			nft_expr_destroy(ctx, expr);
++ 			goto err_expr;
++ 		}
++ 		expr_array[i] = expr;
++ 	}
++ 
++ 	return 0;
++ 
++ err_expr:
++ 	for (k = i - 1; k >= 0; k--)
++ 		nft_expr_destroy(ctx, expr_array[k]);
++ 
++ 	return -ENOMEM;
++ }
++ 
++ static void nft_set_elem_expr_setup(const struct nft_set_ext *ext, int i,
++ 				    struct nft_expr *expr_array[])
++ {
++ 	struct nft_set_elem_expr *elem_expr = nft_set_ext_expr(ext);
++ 	struct nft_expr *expr = nft_setelem_expr_at(elem_expr, elem_expr->size);
++ 
++ 	memcpy(expr, expr_array[i], expr_array[i]->ops->size);
++ 	elem_expr->size += expr_array[i]->ops->size;
++ 	kfree(expr_array[i]);
++ 	expr_array[i] = NULL;
++ }
++ 
+++>>>>>>> fca05d4d61e6 (netfilter: nft_dynset: honor stateful expressions in set definition)
+  static int nft_add_set_elem(struct nft_ctx *ctx, struct nft_set *set,
+  			    const struct nlattr *attr, u32 nlmsg_flags)
+  {
+* Unmerged path include/net/netfilter/nf_tables.h
+* Unmerged path net/netfilter/nf_tables_api.c
+diff --git a/net/netfilter/nft_dynset.c b/net/netfilter/nft_dynset.c
+index abb6d9645c0c..97d13f0cfb84 100644
+--- a/net/netfilter/nft_dynset.c
++++ b/net/netfilter/nft_dynset.c
+@@ -192,6 +192,12 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
+ 			err = -EOPNOTSUPP;
+ 			goto err_expr_free;
+ 		}
++	} else if (set->num_exprs > 0) {
++		err = nft_set_elem_expr_clone(ctx, set, priv->expr_array);
++		if (err < 0)
++			return err;
++
++		priv->num_exprs = set->num_exprs;
+ 	}
+ 
+ 	nft_set_ext_prepare(&priv->tmpl);
