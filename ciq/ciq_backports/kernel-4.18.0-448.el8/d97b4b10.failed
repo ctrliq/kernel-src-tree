@@ -1,0 +1,478 @@
+flow_offload: reject offload for all drivers with invalid police parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jianbo Liu <jianbol@nvidia.com>
+commit d97b4b105ce71f9f907f1511986cc1d224126772
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/d97b4b10.failed
+
+As more police parameters are passed to flow_offload, driver can check
+them to make sure hardware handles packets in the way indicated by tc.
+The conform-exceed control should be drop/pipe or drop/ok. Besides,
+for drop/ok, the police should be the last action. As hardware can't
+configure peakrate/avrate/overhead, offload should not be supported if
+any of them is configured.
+
+	Signed-off-by: Jianbo Liu <jianbol@nvidia.com>
+	Reviewed-by: Ido Schimmel <idosch@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d97b4b105ce71f9f907f1511986cc1d224126772)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/dsa/sja1105/sja1105_flower.c
+#	drivers/net/ethernet/freescale/enetc/enetc_qos.c
+#	drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+#	drivers/net/ethernet/mscc/ocelot_flower.c
+#	drivers/net/ethernet/mscc/ocelot_net.c
+#	drivers/net/ethernet/mscc/ocelot_police.c
+#	drivers/net/ethernet/mscc/ocelot_police.h
+#	drivers/net/ethernet/netronome/nfp/flower/qos_conf.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/qos_conf.c
+index 88bea6ad59bc,cd3fdb9f953b..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/qos_conf.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/qos_conf.c
+@@@ -57,20 -83,93 +57,92 @@@ struct nfp_police_stats_reply 
+  	__be64 drop_pkts;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ int nfp_flower_offload_one_police(struct nfp_app *app, bool ingress,
++ 				  bool pps, u32 id, u32 rate, u32 burst)
++ {
++ 	struct nfp_police_config *config;
++ 	struct sk_buff *skb;
++ 
++ 	skb = nfp_flower_cmsg_alloc(app, sizeof(struct nfp_police_config),
++ 				    NFP_FLOWER_CMSG_TYPE_QOS_MOD, GFP_KERNEL);
++ 	if (!skb)
++ 		return -ENOMEM;
++ 
++ 	config = nfp_flower_cmsg_get_data(skb);
++ 	memset(config, 0, sizeof(struct nfp_police_config));
++ 	if (pps)
++ 		config->head.flags_opts |= cpu_to_be32(NFP_FL_QOS_PPS);
++ 	if (!ingress)
++ 		config->head.flags_opts |= cpu_to_be32(NFP_FL_QOS_METER);
++ 
++ 	if (ingress)
++ 		config->head.port = cpu_to_be32(id);
++ 	else
++ 		config->head.meter_id = cpu_to_be32(id);
++ 
++ 	config->bkt_tkn_p = cpu_to_be32(burst);
++ 	config->bkt_tkn_c = cpu_to_be32(burst);
++ 	config->pbs = cpu_to_be32(burst);
++ 	config->cbs = cpu_to_be32(burst);
++ 	config->pir = cpu_to_be32(rate);
++ 	config->cir = cpu_to_be32(rate);
++ 	nfp_ctrl_tx(app->ctrl, skb);
++ 
++ 	return 0;
++ }
++ 
++ static int nfp_policer_validate(const struct flow_action *action,
++ 				const struct flow_action_entry *act,
++ 				struct netlink_ext_ack *extack)
++ {
++ 	if (act->police.exceed.act_id != FLOW_ACTION_DROP) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Offload not supported when exceed action is not drop");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (act->police.notexceed.act_id != FLOW_ACTION_PIPE &&
++ 	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Offload not supported when conform action is not pipe or ok");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (act->police.notexceed.act_id == FLOW_ACTION_ACCEPT &&
++ 	    !flow_action_is_last_entry(action, act)) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Offload not supported when conform action is ok, but action is not last");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (act->police.peakrate_bytes_ps ||
++ 	    act->police.avrate || act->police.overhead) {
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Offload not supported when peakrate/avrate/overhead is configured");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d97b4b105ce7 (flow_offload: reject offload for all drivers with invalid police parameters)
+  static int
+  nfp_flower_install_rate_limiter(struct nfp_app *app, struct net_device *netdev,
+  				struct tc_cls_matchall_offload *flow,
+  				struct netlink_ext_ack *extack)
+  {
+ -	struct flow_action_entry *paction = &flow->rule->action.entries[0];
+ -	u32 action_num = flow->rule->action.num_entries;
+ +	struct flow_action_entry *action = &flow->rule->action.entries[0];
+  	struct nfp_flower_priv *fl_priv = app->priv;
+ -	struct flow_action_entry *action = NULL;
+  	struct nfp_flower_repr_priv *repr_priv;
+ -	u32 netdev_port_id, i;
+ +	struct nfp_police_config *config;
+  	struct nfp_repr *repr;
+ -	bool pps_support;
+ -	u32 bps_num = 0;
+ -	u32 pps_num = 0;
+ +	struct sk_buff *skb;
+ +	u32 netdev_port_id;
+  	u32 burst;
+ -	bool pps;
+  	u64 rate;
++ 	int err;
+  
+  	if (!nfp_netdev_is_nfp_repr(netdev)) {
+  		NL_SET_ERR_MSG_MOD(extack, "unsupported offload: qos rate limit offload not supported on higher level port");
+@@@ -99,36 -209,63 +171,70 @@@
+  		return -EOPNOTSUPP;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (action->id != FLOW_ACTION_POLICE) {
+ +		NL_SET_ERR_MSG_MOD(extack, "unsupported offload: qos rate limit offload requires police action");
+ +		return -EOPNOTSUPP;
+++=======
++ 	for (i = 0 ; i < action_num; i++) {
++ 		action = paction + i;
++ 		if (action->id != FLOW_ACTION_POLICE) {
++ 			NL_SET_ERR_MSG_MOD(extack,
++ 					   "unsupported offload: qos rate limit offload requires police action");
++ 			return -EOPNOTSUPP;
++ 		}
++ 
++ 		err = nfp_policer_validate(&flow->rule->action, action, extack);
++ 		if (err)
++ 			return err;
++ 
++ 		if (action->police.rate_bytes_ps > 0) {
++ 			if (bps_num++) {
++ 				NL_SET_ERR_MSG_MOD(extack,
++ 						   "unsupported offload: qos rate limit offload only support one BPS action");
++ 				return -EOPNOTSUPP;
++ 			}
++ 		}
++ 		if (action->police.rate_pkt_ps > 0) {
++ 			if (!pps_support) {
++ 				NL_SET_ERR_MSG_MOD(extack,
++ 						   "unsupported offload: FW does not support PPS action");
++ 				return -EOPNOTSUPP;
++ 			}
++ 			if (pps_num++) {
++ 				NL_SET_ERR_MSG_MOD(extack,
++ 						   "unsupported offload: qos rate limit offload only support one PPS action");
++ 				return -EOPNOTSUPP;
++ 			}
++ 		}
+++>>>>>>> d97b4b105ce7 (flow_offload: reject offload for all drivers with invalid police parameters)
+  	}
+  
+ -	for (i = 0 ; i < action_num; i++) {
+ -		/* Set QoS data for this interface */
+ -		action = paction + i;
+ -		if (action->police.rate_bytes_ps > 0) {
+ -			rate = action->police.rate_bytes_ps;
+ -			burst = action->police.burst;
+ -		} else if (action->police.rate_pkt_ps > 0) {
+ -			rate = action->police.rate_pkt_ps;
+ -			burst = action->police.burst_pkt;
+ -		} else {
+ -			NL_SET_ERR_MSG_MOD(extack,
+ -					   "unsupported offload: qos rate limit is not BPS or PPS");
+ -			continue;
+ -		}
+ -
+ -		if (rate != 0) {
+ -			pps = false;
+ -			if (action->police.rate_pkt_ps > 0)
+ -				pps = true;
+ -			nfp_flower_offload_one_police(repr->app, true,
+ -						      pps, netdev_port_id,
+ -						      rate, burst);
+ -		}
+ +	if (action->police.rate_pkt_ps) {
+ +		NL_SET_ERR_MSG_MOD(extack, "unsupported offload: qos rate limit offload not support packets per second");
+ +		return -EOPNOTSUPP;
+  	}
+ +
+ +	rate = action->police.rate_bytes_ps;
+ +	burst = action->police.burst;
+ +	netdev_port_id = nfp_repr_get_port_id(netdev);
+ +
+ +	skb = nfp_flower_cmsg_alloc(repr->app, sizeof(struct nfp_police_config),
+ +				    NFP_FLOWER_CMSG_TYPE_QOS_MOD, GFP_KERNEL);
+ +	if (!skb)
+ +		return -ENOMEM;
+ +
+ +	config = nfp_flower_cmsg_get_data(skb);
+ +	memset(config, 0, sizeof(struct nfp_police_config));
+ +	config->head.port = cpu_to_be32(netdev_port_id);
+ +	config->bkt_tkn_p = cpu_to_be32(burst);
+ +	config->bkt_tkn_c = cpu_to_be32(burst);
+ +	config->pbs = cpu_to_be32(burst);
+ +	config->cbs = cpu_to_be32(burst);
+ +	config->pir = cpu_to_be32(rate);
+ +	config->cir = cpu_to_be32(rate);
+ +	nfp_ctrl_tx(repr->app->ctrl, skb);
+ +
+  	repr_priv->qos_table.netdev_port_id = netdev_port_id;
+  	fl_priv->qos_rate_limiters++;
+  	if (fl_priv->qos_rate_limiters == 1)
+* Unmerged path drivers/net/dsa/sja1105/sja1105_flower.c
+* Unmerged path drivers/net/ethernet/freescale/enetc/enetc_qos.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_flower.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_police.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_police.h
+* Unmerged path drivers/net/dsa/sja1105/sja1105_flower.c
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_matchall.c b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_matchall.c
+index 28fd2de9e4cf..1672d3afe5be 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_matchall.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_tc_matchall.c
+@@ -8,6 +8,46 @@
+ #include "cxgb4_filter.h"
+ #include "cxgb4_tc_flower.h"
+ 
++static int cxgb4_policer_validate(const struct flow_action *action,
++				  const struct flow_action_entry *act,
++				  struct netlink_ext_ack *extack)
++{
++	if (act->police.exceed.act_id != FLOW_ACTION_DROP) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when exceed action is not drop");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id != FLOW_ACTION_PIPE &&
++	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is not pipe or ok");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id == FLOW_ACTION_ACCEPT &&
++	    !flow_action_is_last_entry(action, act)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is ok, but action is not last");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.peakrate_bytes_ps ||
++	    act->police.avrate || act->police.overhead) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when peakrate/avrate/overhead is configured");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.rate_pkt_ps) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "QoS offload not support packets per second");
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
+ static int cxgb4_matchall_egress_validate(struct net_device *dev,
+ 					  struct tc_cls_matchall_offload *cls)
+ {
+@@ -48,11 +88,10 @@ static int cxgb4_matchall_egress_validate(struct net_device *dev,
+ 	flow_action_for_each(i, entry, actions) {
+ 		switch (entry->id) {
+ 		case FLOW_ACTION_POLICE:
+-			if (entry->police.rate_pkt_ps) {
+-				NL_SET_ERR_MSG_MOD(extack,
+-						   "QoS offload not support packets per second");
+-				return -EOPNOTSUPP;
+-			}
++			ret = cxgb4_policer_validate(actions, entry, extack);
++			if (ret)
++				return ret;
++
+ 			/* Convert bytes per second to bits per second */
+ 			if (entry->police.rate_bytes_ps * 8 > max_link_rate) {
+ 				NL_SET_ERR_MSG_MOD(extack,
+@@ -150,11 +189,11 @@ static int cxgb4_matchall_alloc_tc(struct net_device *dev,
+ 	flow_action_for_each(i, entry, &cls->rule->action)
+ 		if (entry->id == FLOW_ACTION_POLICE)
+ 			break;
+-	if (entry->police.rate_pkt_ps) {
+-		NL_SET_ERR_MSG_MOD(extack,
+-				   "QoS offload not support packets per second");
+-		return -EOPNOTSUPP;
+-	}
++
++	ret = cxgb4_policer_validate(&cls->rule->action, entry, extack);
++	if (ret)
++		return ret;
++
+ 	/* Convert from bytes per second to Kbps */
+ 	p.u.params.maxrate = div_u64(entry->police.rate_bytes_ps * 8, 1000);
+ 	p.u.params.channel = pi->tx_chan;
+* Unmerged path drivers/net/ethernet/freescale/enetc/enetc_qos.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_tc.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index fc4bc5950238..1b9a65a0b085 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@ -4920,6 +4920,46 @@ static int apply_police_params(struct mlx5e_priv *priv, u64 rate,
+ 	return err;
+ }
+ 
++static int mlx5e_policer_validate(const struct flow_action *action,
++				  const struct flow_action_entry *act,
++				  struct netlink_ext_ack *extack)
++{
++	if (act->police.exceed.act_id != FLOW_ACTION_DROP) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when exceed action is not drop");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id != FLOW_ACTION_PIPE &&
++	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is not pipe or ok");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id == FLOW_ACTION_ACCEPT &&
++	    !flow_action_is_last_entry(action, act)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is ok, but action is not last");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.peakrate_bytes_ps ||
++	    act->police.avrate || act->police.overhead) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when peakrate/avrate/overhead is configured");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.rate_pkt_ps) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "QoS offload not support packets per second");
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
+ static int scan_tc_matchall_fdb_actions(struct mlx5e_priv *priv,
+ 					struct flow_action *flow_action,
+ 					struct netlink_ext_ack *extack)
+@@ -4945,10 +4985,10 @@ static int scan_tc_matchall_fdb_actions(struct mlx5e_priv *priv,
+ 	flow_action_for_each(i, act, flow_action) {
+ 		switch (act->id) {
+ 		case FLOW_ACTION_POLICE:
+-			if (act->police.rate_pkt_ps) {
+-				NL_SET_ERR_MSG_MOD(extack, "QoS offload not support packets per second");
+-				return -EOPNOTSUPP;
+-			}
++			err = mlx5e_policer_validate(flow_action, act, extack);
++			if (err)
++				return err;
++
+ 			err = apply_police_params(priv, act->police.rate_bytes_ps, extack);
+ 			if (err)
+ 				return err;
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+index be3791ca6069..448daa2e2323 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/spectrum_flower.c
+@@ -15,6 +15,46 @@
+ #include "spectrum.h"
+ #include "core_acl_flex_keys.h"
+ 
++static int mlxsw_sp_policer_validate(const struct flow_action *action,
++				     const struct flow_action_entry *act,
++				     struct netlink_ext_ack *extack)
++{
++	if (act->police.exceed.act_id != FLOW_ACTION_DROP) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when exceed action is not drop");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id != FLOW_ACTION_PIPE &&
++	    act->police.notexceed.act_id != FLOW_ACTION_ACCEPT) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is not pipe or ok");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.notexceed.act_id == FLOW_ACTION_ACCEPT &&
++	    !flow_action_is_last_entry(action, act)) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when conform action is ok, but action is not last");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.peakrate_bytes_ps ||
++	    act->police.avrate || act->police.overhead) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "Offload not supported when peakrate/avrate/overhead is configured");
++		return -EOPNOTSUPP;
++	}
++
++	if (act->police.rate_pkt_ps) {
++		NL_SET_ERR_MSG_MOD(extack,
++				   "QoS offload not support packets per second");
++		return -EOPNOTSUPP;
++	}
++
++	return 0;
++}
++
+ static int mlxsw_sp_flower_parse_actions(struct mlxsw_sp *mlxsw_sp,
+ 					 struct mlxsw_sp_flow_block *block,
+ 					 struct mlxsw_sp_acl_rule_info *rulei,
+@@ -191,10 +231,9 @@ static int mlxsw_sp_flower_parse_actions(struct mlxsw_sp *mlxsw_sp,
+ 				return -EOPNOTSUPP;
+ 			}
+ 
+-			if (act->police.rate_pkt_ps) {
+-				NL_SET_ERR_MSG_MOD(extack, "QoS offload not support packets per second");
+-				return -EOPNOTSUPP;
+-			}
++			err = mlxsw_sp_policer_validate(flow_action, act, extack);
++			if (err)
++				return err;
+ 
+ 			/* The kernel might adjust the requested burst size so
+ 			 * that it is not exactly a power of two. Re-adjust it
+* Unmerged path drivers/net/ethernet/mscc/ocelot_flower.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_net.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_police.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_police.h
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/qos_conf.c
+diff --git a/include/net/flow_offload.h b/include/net/flow_offload.h
+index d20115a94aee..88e47f90dd3d 100644
+--- a/include/net/flow_offload.h
++++ b/include/net/flow_offload.h
+@@ -303,6 +303,12 @@ static inline bool flow_offload_has_one_action(const struct flow_action *action)
+ 	return action->num_entries == 1;
+ }
+ 
++static inline bool flow_action_is_last_entry(const struct flow_action *action,
++					     const struct flow_action_entry *entry)
++{
++	return entry == &action->entries[action->num_entries - 1];
++}
++
+ #define flow_action_for_each(__i, __act, __actions)			\
+         for (__i = 0, __act = &(__actions)->entries[0];			\
+ 	     __i < (__actions)->num_entries;				\
