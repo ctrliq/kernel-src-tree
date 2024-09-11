@@ -1,0 +1,200 @@
+swiotlb: manipulate orig_addr when tlb_addr has offset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Bumyong Lee <bumyong.lee@samsung.com>
+commit 5f89468e2f060031cd89fd4287298e0eaf246bf6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/5f89468e.failed
+
+in case of driver wants to sync part of ranges with offset,
+swiotlb_tbl_sync_single() copies from orig_addr base to tlb_addr with
+offset and ends up with data mismatch.
+
+It was removed from
+"swiotlb: don't modify orig_addr in swiotlb_tbl_sync_single",
+but said logic has to be added back in.
+
+From Linus's email:
+"That commit which the removed the offset calculation entirely, because the old
+
+        (unsigned long)tlb_addr & (IO_TLB_SIZE - 1)
+
+was wrong, but instead of removing it, I think it should have just
+fixed it to be
+
+        (tlb_addr - mem->start) & (IO_TLB_SIZE - 1);
+
+instead. That way the slot offset always matches the slot index calculation."
+
+(Unfortunatly that broke NVMe).
+
+The use-case that drivers are hitting is as follow:
+
+1. Get dma_addr_t from dma_map_single()
+
+dma_addr_t tlb_addr = dma_map_single(dev, vaddr, vsize, DMA_TO_DEVICE);
+
+    |<---------------vsize------------->|
+    +-----------------------------------+
+    |                                   | original buffer
+    +-----------------------------------+
+  vaddr
+
+ swiotlb_align_offset
+     |<----->|<---------------vsize------------->|
+     +-------+-----------------------------------+
+     |       |                                   | swiotlb buffer
+     +-------+-----------------------------------+
+          tlb_addr
+
+2. Do something
+3. Sync dma_addr_t through dma_sync_single_for_device(..)
+
+dma_sync_single_for_device(dev, tlb_addr + offset, size, DMA_TO_DEVICE);
+
+  Error case.
+    Copy data to original buffer but it is from base addr (instead of
+  base addr + offset) in original buffer:
+
+ swiotlb_align_offset
+     |<----->|<- offset ->|<- size ->|
+     +-------+-----------------------------------+
+     |       |            |##########|           | swiotlb buffer
+     +-------+-----------------------------------+
+          tlb_addr
+
+    |<- size ->|
+    +-----------------------------------+
+    |##########|                        | original buffer
+    +-----------------------------------+
+  vaddr
+
+The fix is to copy the data to the original buffer and take into
+account the offset, like so:
+
+ swiotlb_align_offset
+     |<----->|<- offset ->|<- size ->|
+     +-------+-----------------------------------+
+     |       |            |##########|           | swiotlb buffer
+     +-------+-----------------------------------+
+          tlb_addr
+
+    |<- offset ->|<- size ->|
+    +-----------------------------------+
+    |            |##########|           | original buffer
+    +-----------------------------------+
+  vaddr
+
+[One fix which was Linus's that made more sense to as it created a
+symmetry would break NVMe. The reason for that is the:
+ unsigned int offset = (tlb_addr - mem->start) & (IO_TLB_SIZE - 1);
+
+would come up with the proper offset, but it would lose the
+alignment (which this patch contains).]
+
+Fixes: 16fc3cef33a0 ("swiotlb: don't modify orig_addr in swiotlb_tbl_sync_single")
+	Signed-off-by: Bumyong Lee <bumyong.lee@samsung.com>
+	Signed-off-by: Chanho Park <chanho61.park@samsung.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reported-by: Dominique MARTINET <dominique.martinet@atmark-techno.com>
+	Reported-by: Horia Geantă <horia.geanta@nxp.com>
+	Tested-by: Horia Geantă <horia.geanta@nxp.com>
+CC: stable@vger.kernel.org
+	Signed-off-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+(cherry picked from commit 5f89468e2f060031cd89fd4287298e0eaf246bf6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/swiotlb.c
+diff --cc kernel/dma/swiotlb.c
+index 017e72bac63a,e50df8d8f87e..000000000000
+--- a/kernel/dma/swiotlb.c
++++ b/kernel/dma/swiotlb.c
+@@@ -431,40 -320,58 +431,68 @@@ cleanup3
+  
+  void __init swiotlb_exit(void)
+  {
+ -	struct io_tlb_mem *mem = io_tlb_default_mem;
+ -	size_t size;
+ -
+ -	if (!mem)
+ +	if (!io_tlb_orig_addr)
+  		return;
+  
+ -	size = struct_size(mem, slots, mem->nslabs);
+ -	if (mem->late_alloc)
+ -		free_pages((unsigned long)mem, get_order(size));
+ -	else
+ -		memblock_free_late(__pa(mem), PAGE_ALIGN(size));
+ -	io_tlb_default_mem = NULL;
+ +	if (late_alloc) {
+ +		free_pages((unsigned long)io_tlb_orig_size,
+ +			   get_order(io_tlb_nslabs * sizeof(size_t)));
+ +		free_pages((unsigned long)io_tlb_orig_addr,
+ +			   get_order(io_tlb_nslabs * sizeof(phys_addr_t)));
+ +		free_pages((unsigned long)io_tlb_list, get_order(io_tlb_nslabs *
+ +								 sizeof(int)));
+ +		free_pages((unsigned long)phys_to_virt(io_tlb_start),
+ +			   get_order(io_tlb_nslabs << IO_TLB_SHIFT));
+ +	} else {
+ +		memblock_free_late(__pa(io_tlb_orig_addr),
+ +				   PAGE_ALIGN(io_tlb_nslabs * sizeof(phys_addr_t)));
+ +		memblock_free_late(__pa(io_tlb_orig_size),
+ +				   PAGE_ALIGN(io_tlb_nslabs * sizeof(size_t)));
+ +		memblock_free_late(__pa(io_tlb_list),
+ +				   PAGE_ALIGN(io_tlb_nslabs * sizeof(int)));
+ +		memblock_free_late(io_tlb_start,
+ +				   PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
+ +	}
+ +	swiotlb_cleanup();
+  }
+  
++ /*
++  * Return the offset into a iotlb slot required to keep the device happy.
++  */
++ static unsigned int swiotlb_align_offset(struct device *dev, u64 addr)
++ {
++ 	return addr & dma_get_min_align_mask(dev) & (IO_TLB_SIZE - 1);
++ }
++ 
+  /*
+   * Bounce: copy the swiotlb buffer from or back to the original dma location
+   */
+ -static void swiotlb_bounce(struct device *dev, phys_addr_t tlb_addr, size_t size,
+ -			   enum dma_data_direction dir)
+ +static void swiotlb_bounce(phys_addr_t orig_addr, phys_addr_t tlb_addr,
+ +			   size_t size, enum dma_data_direction dir)
+  {
+ -	struct io_tlb_mem *mem = io_tlb_default_mem;
+ -	int index = (tlb_addr - mem->start) >> IO_TLB_SHIFT;
+ -	phys_addr_t orig_addr = mem->slots[index].orig_addr;
+ -	size_t alloc_size = mem->slots[index].alloc_size;
+  	unsigned long pfn = PFN_DOWN(orig_addr);
+  	unsigned char *vaddr = phys_to_virt(tlb_addr);
++ 	unsigned int tlb_offset;
++ 
+++<<<<<<< HEAD
+++=======
++ 	if (orig_addr == INVALID_PHYS_ADDR)
++ 		return;
++ 
++ 	tlb_offset = (tlb_addr & (IO_TLB_SIZE - 1)) -
++ 		     swiotlb_align_offset(dev, orig_addr);
+  
++ 	orig_addr += tlb_offset;
++ 	alloc_size -= tlb_offset;
++ 
++ 	if (size > alloc_size) {
++ 		dev_WARN_ONCE(dev, 1,
++ 			"Buffer overflow detected. Allocation size: %zu. Mapping size: %zu.\n",
++ 			alloc_size, size);
++ 		size = alloc_size;
++ 	}
++ 
+++>>>>>>> 5f89468e2f06 (swiotlb: manipulate orig_addr when tlb_addr has offset)
+  	if (PageHighMem(pfn_to_page(pfn))) {
+  		/* The buffer does not have a mapping.  Map it in and copy */
+  		unsigned int offset = orig_addr & ~PAGE_MASK;
+* Unmerged path kernel/dma/swiotlb.c
