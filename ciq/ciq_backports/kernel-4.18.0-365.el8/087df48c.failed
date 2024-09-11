@@ -1,0 +1,311 @@
+x86/fpu: Replace KVMs xstate component clearing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 087df48c298c1cb829f4cd468d90f93234b1bc44
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/087df48c.failed
+
+In order to prepare for the support of dynamically enabled FPU features,
+move the clearing of xstate components to the FPU core code.
+
+No functional change.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Cc: kvm@vger.kernel.org
+Link: https://lkml.kernel.org/r/20211013145322.399567049@linutronix.de
+(cherry picked from commit 087df48c298c1cb829f4cd468d90f93234b1bc44)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/xstate.h
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 2df5bd667a43,fb329bbfe89f..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -134,8 -128,6 +134,11 @@@ extern u64 xstate_fx_sw_bytes[USER_XSTA
+  extern void __init update_regset_xstate_info(unsigned int size,
+  					     u64 xstate_mask);
+  
+++<<<<<<< HEAD
+ +void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
+ +const void *get_xsave_field_ptr(int xfeature_nr);
+++=======
+++>>>>>>> 087df48c298c (x86/fpu: Replace KVMs xstate component clearing)
+  int xfeature_size(int xfeature_nr);
+  int copy_uabi_from_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+  int copy_sigframe_from_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
+diff --cc arch/x86/kernel/fpu/xstate.h
+index 0789a04ee705,99f8cfec719d..000000000000
+--- a/arch/x86/kernel/fpu/xstate.h
++++ b/arch/x86/kernel/fpu/xstate.h
+@@@ -15,4 -15,186 +15,189 @@@ static inline void xstate_init_xcomp_bv
+  		xsave->header.xcomp_bv = mask | XCOMP_BV_COMPACTED_FORMAT;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ extern void __copy_xstate_to_uabi_buf(struct membuf to, struct xregs_state *xsave,
++ 				      u32 pkru_val, enum xstate_copy_mode copy_mode);
++ 
++ extern void fpu__init_cpu_xstate(void);
++ extern void fpu__init_system_xstate(void);
++ 
++ extern void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
++ 
++ /* XSAVE/XRSTOR wrapper functions */
++ 
++ #ifdef CONFIG_X86_64
++ #define REX_PREFIX	"0x48, "
++ #else
++ #define REX_PREFIX
++ #endif
++ 
++ /* These macros all use (%edi)/(%rdi) as the single memory argument. */
++ #define XSAVE		".byte " REX_PREFIX "0x0f,0xae,0x27"
++ #define XSAVEOPT	".byte " REX_PREFIX "0x0f,0xae,0x37"
++ #define XSAVES		".byte " REX_PREFIX "0x0f,0xc7,0x2f"
++ #define XRSTOR		".byte " REX_PREFIX "0x0f,0xae,0x2f"
++ #define XRSTORS		".byte " REX_PREFIX "0x0f,0xc7,0x1f"
++ 
++ /*
++  * After this @err contains 0 on success or the trap number when the
++  * operation raises an exception.
++  */
++ #define XSTATE_OP(op, st, lmask, hmask, err)				\
++ 	asm volatile("1:" op "\n\t"					\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "2:\n\t"						\
++ 		     _ASM_EXTABLE_TYPE(1b, 2b, EX_TYPE_FAULT_MCE_SAFE)	\
++ 		     : [err] "=a" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * If XSAVES is enabled, it replaces XSAVEOPT because it supports a compact
++  * format and supervisor states in addition to modified optimization in
++  * XSAVEOPT.
++  *
++  * Otherwise, if XSAVEOPT is enabled, XSAVEOPT replaces XSAVE because XSAVEOPT
++  * supports modified optimization which is not supported by XSAVE.
++  *
++  * We use XSAVE as a fallback.
++  *
++  * The 661 label is defined in the ALTERNATIVE* macros as the address of the
++  * original instruction which gets replaced. We need to use it here as the
++  * address of the instruction where we might get an exception at.
++  */
++ #define XSTATE_XSAVE(st, lmask, hmask, err)				\
++ 	asm volatile(ALTERNATIVE_2(XSAVE,				\
++ 				   XSAVEOPT, X86_FEATURE_XSAVEOPT,	\
++ 				   XSAVES,   X86_FEATURE_XSAVES)	\
++ 		     "\n"						\
++ 		     "xor %[err], %[err]\n"				\
++ 		     "3:\n"						\
++ 		     ".pushsection .fixup,\"ax\"\n"			\
++ 		     "4: movl $-2, %[err]\n"				\
++ 		     "jmp 3b\n"						\
++ 		     ".popsection\n"					\
++ 		     _ASM_EXTABLE(661b, 4b)				\
++ 		     : [err] "=r" (err)					\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * Use XRSTORS to restore context if it is enabled. XRSTORS supports compact
++  * XSAVE area format.
++  */
++ #define XSTATE_XRESTORE(st, lmask, hmask)				\
++ 	asm volatile(ALTERNATIVE(XRSTOR,				\
++ 				 XRSTORS, X86_FEATURE_XSAVES)		\
++ 		     "\n"						\
++ 		     "3:\n"						\
++ 		     _ASM_EXTABLE_TYPE(661b, 3b, EX_TYPE_FPU_RESTORE)	\
++ 		     :							\
++ 		     : "D" (st), "m" (*st), "a" (lmask), "d" (hmask)	\
++ 		     : "memory")
++ 
++ /*
++  * Save processor xstate to xsave area.
++  *
++  * Uses either XSAVE or XSAVEOPT or XSAVES depending on the CPU features
++  * and command line options. The choice is permanent until the next reboot.
++  */
++ static inline void os_xsave(struct xregs_state *xstate)
++ {
++ 	u64 mask = xfeatures_mask_all;
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	WARN_ON_FPU(!alternatives_patched);
++ 
++ 	XSTATE_XSAVE(xstate, lmask, hmask, err);
++ 
++ 	/* We should never fault when copying to a kernel buffer: */
++ 	WARN_ON_FPU(err);
++ }
++ 
++ /*
++  * Restore processor xstate from xsave area.
++  *
++  * Uses XRSTORS when XSAVES is used, XRSTOR otherwise.
++  */
++ static inline void os_xrstor(struct xregs_state *xstate, u64 mask)
++ {
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 
++ 	XSTATE_XRESTORE(xstate, lmask, hmask);
++ }
++ 
++ /*
++  * Save xstate to user space xsave area.
++  *
++  * We don't use modified optimization because xrstor/xrstors might track
++  * a different application.
++  *
++  * We don't use compacted format xsave area for backward compatibility for
++  * old applications which don't understand the compacted format of the
++  * xsave area.
++  *
++  * The caller has to zero buf::header before calling this because XSAVE*
++  * does not touch the reserved fields in the header.
++  */
++ static inline int xsave_to_user_sigframe(struct xregs_state __user *buf)
++ {
++ 	/*
++ 	 * Include the features which are not xsaved/rstored by the kernel
++ 	 * internally, e.g. PKRU. That's user space ABI and also required
++ 	 * to allow the signal handler to modify PKRU.
++ 	 */
++ 	u64 mask = xfeatures_mask_uabi();
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	stac();
++ 	XSTATE_OP(XSAVE, buf, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from user space xsave area.
++  */
++ static inline int xrstor_from_user_sigframe(struct xregs_state __user *buf, u64 mask)
++ {
++ 	struct xregs_state *xstate = ((__force struct xregs_state *)buf);
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	stac();
++ 	XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 	clac();
++ 
++ 	return err;
++ }
++ 
++ /*
++  * Restore xstate from kernel space xsave area, return an error code instead of
++  * an exception.
++  */
++ static inline int os_xrstor_safe(struct xregs_state *xstate, u64 mask)
++ {
++ 	u32 lmask = mask;
++ 	u32 hmask = mask >> 32;
++ 	int err;
++ 
++ 	if (cpu_feature_enabled(X86_FEATURE_XSAVES))
++ 		XSTATE_OP(XRSTORS, xstate, lmask, hmask, err);
++ 	else
++ 		XSTATE_OP(XRSTOR, xstate, lmask, hmask, err);
++ 
++ 	return err;
++ }
++ 
++ 
+++>>>>>>> 087df48c298c (x86/fpu: Replace KVMs xstate component clearing)
+  #endif
+diff --git a/arch/x86/include/asm/fpu/api.h b/arch/x86/include/asm/fpu/api.h
+index 9833eb36228b..826ba0524535 100644
+--- a/arch/x86/include/asm/fpu/api.h
++++ b/arch/x86/include/asm/fpu/api.h
+@@ -97,6 +97,7 @@ static inline void update_pasid(void) { }
+ 
+ /* fpstate-related functions which are exported to KVM */
+ extern void fpu_init_fpstate_user(struct fpu *fpu);
++extern void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature);
+ 
+ /* KVM specific functions */
+ extern void fpu_swap_kvm_fpu(struct fpu *save, struct fpu *rstor, u64 restore_mask);
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 8c27dcecbad5..687fd854df41 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -907,7 +907,6 @@ void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr)
+ 
+ 	return __raw_xsave_addr(xsave, xfeature_nr);
+ }
+-EXPORT_SYMBOL_GPL(get_xsave_addr);
+ 
+ /*
+  * This wraps up the common operations that need to occur when retrieving
+@@ -1268,6 +1267,17 @@ void xrstors(struct xregs_state *xstate, u64 mask)
+ 	WARN_ON_ONCE(err);
+ }
+ 
++#if IS_ENABLED(CONFIG_KVM)
++void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature)
++{
++	void *addr = get_xsave_addr(&fps->regs.xsave, xfeature);
++
++	if (addr)
++		memset(addr, 0, xstate_sizes[xfeature]);
++}
++EXPORT_SYMBOL_GPL(fpstate_clear_xstate_component);
++#endif
++
+ #ifdef CONFIG_PROC_PID_ARCH_STATUS
+ 
+ /*
+* Unmerged path arch/x86/kernel/fpu/xstate.h
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index b151efd08025..f5750e17ba24 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -10793,7 +10793,7 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 	vcpu->arch.apf.halted = false;
+ 
+ 	if (vcpu->arch.guest_fpu && kvm_mpx_supported()) {
+-		void *mpx_state_buffer;
++		struct fpstate *fpstate = vcpu->arch.guest_fpu->fpstate;
+ 
+ 		/*
+ 		 * To avoid have the INIT path from kvm_apic_has_events() that be
+@@ -10801,14 +10801,10 @@ void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
+ 		 */
+ 		if (init_event)
+ 			kvm_put_guest_fpu(vcpu);
+-		mpx_state_buffer = get_xsave_addr(&vcpu->arch.guest_fpu->state.xsave,
+-					XFEATURE_BNDREGS);
+-		if (mpx_state_buffer)
+-			memset(mpx_state_buffer, 0, sizeof(struct mpx_bndreg_state));
+-		mpx_state_buffer = get_xsave_addr(&vcpu->arch.guest_fpu->state.xsave,
+-					XFEATURE_BNDCSR);
+-		if (mpx_state_buffer)
+-			memset(mpx_state_buffer, 0, sizeof(struct mpx_bndcsr));
++
++		fpstate_clear_xstate_component(fpstate, XFEATURE_BNDREGS);
++		fpstate_clear_xstate_component(fpstate, XFEATURE_BNDCSR);
++
+ 		if (init_event)
+ 			kvm_load_guest_fpu(vcpu);
+ 	}
