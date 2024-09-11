@@ -1,0 +1,301 @@
+lockdep: Use raw_cpu_*() for per-cpu variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit fddf9055a60dfcc97bda5ef03c8fa4108ed555c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fddf9055.failed
+
+Sven reported that commit a21ee6055c30 ("lockdep: Change
+hardirq{s_enabled,_context} to per-cpu variables") caused trouble on
+s390 because their this_cpu_*() primitives disable preemption which
+then lands back tracing.
+
+On the one hand, per-cpu ops should use preempt_*able_notrace() and
+raw_local_irq_*(), on the other hand, we can trivialy use raw_cpu_*()
+ops for this.
+
+Fixes: a21ee6055c30 ("lockdep: Change hardirq{s_enabled,_context} to per-cpu variables")
+	Reported-by: Sven Schnelle <svens@linux.ibm.com>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Marco Elver <elver@google.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200821085348.192346882@infradead.org
+(cherry picked from commit fddf9055a60dfcc97bda5ef03c8fa4108ed555c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+#	include/linux/lockdep.h
+#	kernel/locking/lockdep.c
+diff --cc include/linux/irqflags.h
+index b53a9f136087,d7e50a215ea9..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -14,28 -14,61 +14,43 @@@
+  
+  #include <linux/typecheck.h>
+  #include <asm/irqflags.h>
+ -#include <asm/percpu.h>
+ -
+ -/* Currently lockdep_softirqs_on/off is used only by lockdep */
+ -#ifdef CONFIG_PROVE_LOCKING
+ -  extern void lockdep_softirqs_on(unsigned long ip);
+ -  extern void lockdep_softirqs_off(unsigned long ip);
+ -  extern void lockdep_hardirqs_on_prepare(unsigned long ip);
+ -  extern void lockdep_hardirqs_on(unsigned long ip);
+ -  extern void lockdep_hardirqs_off(unsigned long ip);
+ -#else
+ -  static inline void lockdep_softirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_softirqs_off(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on_prepare(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_off(unsigned long ip) { }
+ -#endif
+  
+  #ifdef CONFIG_TRACE_IRQFLAGS
+ -
+ -/* Per-task IRQ trace events information. */
+ -struct irqtrace_events {
+ -	unsigned int	irq_events;
+ -	unsigned long	hardirq_enable_ip;
+ -	unsigned long	hardirq_disable_ip;
+ -	unsigned int	hardirq_enable_event;
+ -	unsigned int	hardirq_disable_event;
+ -	unsigned long	softirq_disable_ip;
+ -	unsigned long	softirq_enable_ip;
+ -	unsigned int	softirq_disable_event;
+ -	unsigned int	softirq_enable_event;
+ -};
+ -
+ -DECLARE_PER_CPU(int, hardirqs_enabled);
+ -DECLARE_PER_CPU(int, hardirq_context);
+ -
+ -  extern void trace_hardirqs_on_prepare(void);
+ -  extern void trace_hardirqs_off_finish(void);
+ +  extern void trace_softirqs_on(unsigned long ip);
+ +  extern void trace_softirqs_off(unsigned long ip);
+    extern void trace_hardirqs_on(void);
+    extern void trace_hardirqs_off(void);
+++<<<<<<< HEAD
+ +# define trace_hardirq_context(p)	((p)->hardirq_context)
+ +# define trace_softirq_context(p)	((p)->softirq_context)
+ +# define trace_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ +# define trace_softirqs_enabled(p)	((p)->softirqs_enabled)
+ +# define trace_hardirq_enter()			\
+ +do {						\
+ +	if (!current->hardirq_context++)	\
+ +		current->hardirq_threaded = 0;	\
+++=======
++ # define lockdep_hardirq_context()	(raw_cpu_read(hardirq_context))
++ # define lockdep_softirq_context(p)	((p)->softirq_context)
++ # define lockdep_hardirqs_enabled()	(this_cpu_read(hardirqs_enabled))
++ # define lockdep_softirqs_enabled(p)	((p)->softirqs_enabled)
++ # define lockdep_hardirq_enter()			\
++ do {							\
++ 	if (__this_cpu_inc_return(hardirq_context) == 1)\
++ 		current->hardirq_threaded = 0;		\
+++>>>>>>> fddf9055a60d (lockdep: Use raw_cpu_*() for per-cpu variables)
+  } while (0)
+ -# define lockdep_hardirq_threaded()		\
+ +# define trace_hardirq_threaded()		\
+  do {						\
+  	current->hardirq_threaded = 1;		\
+  } while (0)
+ -# define lockdep_hardirq_exit()			\
+ +# define trace_hardirq_exit()			\
+  do {						\
+++<<<<<<< HEAD
+ +	current->hardirq_context--;		\
+++=======
++ 	__this_cpu_dec(hardirq_context);	\
+++>>>>>>> fddf9055a60d (lockdep: Use raw_cpu_*() for per-cpu variables)
+  } while (0)
+  # define lockdep_softirq_enter()		\
+  do {						\
+diff --cc include/linux/lockdep.h
+index 15a6e20d4aa2,6a584b3e5c74..000000000000
+--- a/include/linux/lockdep.h
++++ b/include/linux/lockdep.h
+@@@ -532,23 -532,31 +532,48 @@@ do {									
+  	lock_release(&(lock)->dep_map, _THIS_IP_);			\
+  } while (0)
+  
+ -DECLARE_PER_CPU(int, hardirqs_enabled);
+ -DECLARE_PER_CPU(int, hardirq_context);
+ +#define lockdep_assert_irqs_enabled()	do {				\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  !current->hardirqs_enabled,			\
+ +			  "IRQs not enabled as expected\n");		\
+ +	} while (0)
+ +
+++<<<<<<< HEAD
+ +#define lockdep_assert_irqs_disabled()	do {				\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  current->hardirqs_enabled,			\
+ +			  "IRQs not disabled as expected\n");		\
+ +	} while (0)
+  
+ +#define lockdep_assert_in_irq() do {					\
+ +		WARN_ONCE(debug_locks && !current->lockdep_recursion &&	\
+ +			  !current->hardirq_context,			\
+ +			  "Not in hardirq as expected\n");		\
+ +	} while (0)
+++=======
++ /*
++  * The below lockdep_assert_*() macros use raw_cpu_read() to access the above
++  * per-cpu variables. This is required because this_cpu_read() will potentially
++  * call into preempt/irq-disable and that obviously isn't right. This is also
++  * correct because when IRQs are enabled, it doesn't matter if we accidentally
++  * read the value from our previous CPU.
++  */
++ 
++ #define lockdep_assert_irqs_enabled()					\
++ do {									\
++ 	WARN_ON_ONCE(debug_locks && !raw_cpu_read(hardirqs_enabled));	\
++ } while (0)
++ 
++ #define lockdep_assert_irqs_disabled()					\
++ do {									\
++ 	WARN_ON_ONCE(debug_locks && raw_cpu_read(hardirqs_enabled));	\
++ } while (0)
++ 
++ #define lockdep_assert_in_irq()						\
++ do {									\
++ 	WARN_ON_ONCE(debug_locks && !raw_cpu_read(hardirq_context));	\
++ } while (0)
+++>>>>>>> fddf9055a60d (lockdep: Use raw_cpu_*() for per-cpu variables)
+  
+  #define lockdep_assert_preemption_enabled()				\
+  do {									\
+diff --cc kernel/locking/lockdep.c
+index 908dcc016f45,c872e95e6e4d..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3682,20 -3688,80 +3682,82 @@@ __visible void trace_hardirqs_on_caller
+  	 * Can't allow enabling interrupts while in an interrupt handler,
+  	 * that's general bad form and such. Recursion, limited stack etc..
+  	 */
+ -	if (DEBUG_LOCKS_WARN_ON(lockdep_hardirq_context()))
+ +	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
+ -	current->hardirq_chain_key = current->curr_chain_key;
+ -
+  	current->lockdep_recursion++;
+ -	__trace_hardirqs_on_caller();
+ +	__trace_hardirqs_on_caller(ip);
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct irqtrace_events *trace = &current->irqtrace;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
++ 		return;
++ 
++ 	if (lockdep_hardirqs_enabled()) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	__this_cpu_write(hardirqs_enabled, 1);
++ 	trace->hardirq_enable_ip = ip;
++ 	trace->hardirq_enable_event = ++trace->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> fddf9055a60d (lockdep: Use raw_cpu_*() for per-cpu variables)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+@@@ -3720,20 -3795,15 +3782,26 @@@ __visible void trace_hardirqs_off_calle
+  		/*
+  		 * We have done an ON -> OFF transition:
+  		 */
+++<<<<<<< HEAD
+ +		curr->hardirqs_enabled = 0;
+ +		curr->hardirq_disable_ip = ip;
+ +		curr->hardirq_disable_event = ++curr->irq_events;
+++=======
++ 		__this_cpu_write(hardirqs_enabled, 0);
++ 		trace->hardirq_disable_ip = ip;
++ 		trace->hardirq_disable_event = ++trace->irq_events;
+++>>>>>>> fddf9055a60d (lockdep: Use raw_cpu_*() for per-cpu variables)
+  		debug_atomic_inc(hardirqs_off_events);
+ -	} else {
+ +	} else
+  		debug_atomic_inc(redundant_hardirqs_off);
+ -	}
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_off);
+ +EXPORT_SYMBOL(trace_hardirqs_off_caller);
+ +
+ +void trace_hardirqs_off(void)
+ +{
+ +	trace_hardirqs_off_caller(CALLER_ADDR0);
+ +}
+ +EXPORT_SYMBOL(trace_hardirqs_off);
+  
+  /*
+   * Softirqs will be enabled:
+* Unmerged path include/linux/irqflags.h
+* Unmerged path include/linux/lockdep.h
+* Unmerged path kernel/locking/lockdep.c
