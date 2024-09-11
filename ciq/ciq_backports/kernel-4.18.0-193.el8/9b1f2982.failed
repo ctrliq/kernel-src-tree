@@ -1,0 +1,126 @@
+net/mlx5: Add support for FW fatal reporter dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Add support for FW fatal reporter dump (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 95.65%
+commit-author Moshe Shemesh <moshe@mellanox.com>
+commit 9b1f2982360579cbdb3069fa026f6cfc31c4388b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/9b1f2982.failed
+
+Add support of dump callback for mlx5 FW fatal reporter.
+The FW fatal dump uses cr-dump functionality to gather cr-space data for
+debug. The cr-dump uses vsc interface which is valid even if the FW
+command interface is not functional, which is the case in most FW fatal
+errors.
+
+Command example and output:
+$ devlink health dump show pci/0000:82:00.0 reporter fw_fatal
+ crdump_data:
+  00 20 00 01 00 00 00 00 03 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 80
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+  00 00 00 00 00 00 00 00 00 00 00 00 ba 82 00 00
+  0c 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20
+  00 00 00 00 00 00 00 00 00 00 00 00 00 00 fa 00
+  a4 0e 00 00 00 00 00 00 80 c7 fe ff 50 0a 00 00
+...
+...
+
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 9b1f2982360579cbdb3069fa026f6cfc31c4388b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/health.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/health.c
+index fa1691ba661a,4ef62c6c6424..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@@ -262,9 -421,207 +262,78 @@@ mlx5_fw_reporter_diagnose(struct devlin
+  static const struct devlink_health_reporter_ops mlx5_fw_reporter_ops = {
+  		.name = "fw",
+  		.diagnose = mlx5_fw_reporter_diagnose,
+ -		.dump = mlx5_fw_reporter_dump,
+  };
+  
+++<<<<<<< HEAD
+ +static void mlx5_fw_reporter_create(struct mlx5_core_dev *dev)
+++=======
++ static int
++ mlx5_fw_fatal_reporter_recover(struct devlink_health_reporter *reporter,
++ 			       void *priv_ctx)
++ {
++ 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
++ 
++ 	return mlx5_health_try_recover(dev);
++ }
++ 
++ #define MLX5_CR_DUMP_CHUNK_SIZE 256
++ static int
++ mlx5_fw_fatal_reporter_dump(struct devlink_health_reporter *reporter,
++ 			    struct devlink_fmsg *fmsg, void *priv_ctx)
++ {
++ 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
++ 	u32 crdump_size = dev->priv.health.crdump_size;
++ 	u32 *cr_data;
++ 	u32 data_size;
++ 	u32 offset;
++ 	int err;
++ 
++ 	if (!mlx5_core_is_pf(dev))
++ 		return -EPERM;
++ 
++ 	cr_data = kvmalloc(crdump_size, GFP_KERNEL);
++ 	if (!cr_data)
++ 		return -ENOMEM;
++ 	err = mlx5_crdump_collect(dev, cr_data);
++ 	if (err)
++ 		return err;
++ 
++ 	if (priv_ctx) {
++ 		struct mlx5_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
++ 
++ 		err = mlx5_fw_reporter_ctx_pairs_put(fmsg, fw_reporter_ctx);
++ 		if (err)
++ 			goto free_data;
++ 	}
++ 
++ 	err = devlink_fmsg_arr_pair_nest_start(fmsg, "crdump_data");
++ 	if (err)
++ 		goto free_data;
++ 	for (offset = 0; offset < crdump_size; offset += data_size) {
++ 		if (crdump_size - offset < MLX5_CR_DUMP_CHUNK_SIZE)
++ 			data_size = crdump_size - offset;
++ 		else
++ 			data_size = MLX5_CR_DUMP_CHUNK_SIZE;
++ 		err = devlink_fmsg_binary_put(fmsg, cr_data, data_size);
++ 		if (err)
++ 			goto free_data;
++ 	}
++ 	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++ 
++ free_data:
++ 	kfree(cr_data);
++ 	return err;
++ }
++ 
++ static const struct devlink_health_reporter_ops mlx5_fw_fatal_reporter_ops = {
++ 		.name = "fw_fatal",
++ 		.recover = mlx5_fw_fatal_reporter_recover,
++ 		.dump = mlx5_fw_fatal_reporter_dump,
++ };
++ 
++ #define MLX5_REPORTER_FW_GRACEFUL_PERIOD 1200000
++ static void mlx5_fw_reporters_create(struct mlx5_core_dev *dev)
+++>>>>>>> 9b1f29823605 (net/mlx5: Add support for FW fatal reporter dump)
+  {
+  	struct mlx5_core_health *health = &dev->priv.health;
+  	struct devlink *devlink = priv_to_devlink(dev);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/health.c
