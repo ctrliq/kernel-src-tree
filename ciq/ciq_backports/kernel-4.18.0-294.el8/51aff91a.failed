@@ -1,0 +1,272 @@
+ASoC: soc-component: add mark for soc_pcm_components_open/close()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-component: add mark for soc_pcm_components_open/close() (Jaroslav Kysela) [1783462]
+Rebuild_FUZZ: 95.59%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit 51aff91ad123e03d1461ec1d980efd1814dca69e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/51aff91a.failed
+
+soc_pcm_open() does rollback when failed (A),
+but, it is almost same as soc_pcm_close().
+
+	static int soc_pcm_open(xxx)
+	{
+		...
+		if (ret < 0)
+			goto xxx_err;
+		...
+		return 0;
+
+ ^	config_err:
+ |		...
+ |	rtd_startup_err:
+(A)		...
+ |	component_err:
+ |		...
+ v		return ret;
+	}
+
+The difference is
+soc_pcm_close() is for all dai/component/substream,
+rollback        is for succeeded part only.
+
+This kind of duplicated code can be a hotbed of bugs,
+thus, we want to share soc_pcm_close() and rollback.
+
+Now, soc_pcm_open/close() are handling
+	1) snd_soc_dai_startup/shutdown()
+	2) snd_soc_link_startup/shutdown()
+=>	3) snd_soc_component_module_get/put()
+=>	4) snd_soc_component_open/close()
+	5) pm_runtime_put/get()
+
+This patch is for 3) snd_soc_component_module_get/put()
+4) snd_soc_component_open/close().
+
+The idea of having bit-flag or counter is not enough for this purpose.
+For example if one DAI is used for 2xPlaybacks for some reasons,
+and if 1st Playback was succeeded but 2nd Playback was failed,
+2nd Playback rollback doesn't need to call shutdown.
+But it has succeeded bit-flag or counter via 1st Playback,
+thus, 2nd Playback rollback will call unneeded shutdown.
+And 1st Playback's necessary shutdown will not be called,
+because bit-flag or counter was cleared by wrong 2nd Playback rollback.
+
+To avoid such case, this patch marks substream pointer when open() was
+succeeded. If rollback needed, it will check rollback flag and marked
+substream pointer.
+
+One note here is that it cares *current* open() only now.
+but we might want to check *whole* marked substream in the future.
+This patch is using macro named "push/pop", so that it can be easily
+update.
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/87imbybwno.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 51aff91ad123e03d1461ec1d980efd1814dca69e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/soc-pcm.c
+diff --cc sound/soc/soc-pcm.c
+index f3af956b9680,d9f9c0a243df..000000000000
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@@ -487,8 -608,7 +487,12 @@@ static void soc_pcm_init_runtime_hw(str
+  
+  static int soc_pcm_components_open(struct snd_pcm_substream *substream)
+  {
+++<<<<<<< HEAD
+ +	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ +	struct snd_soc_component *last = NULL;
+++=======
++ 	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+++>>>>>>> 51aff91ad123 (ASoC: soc-component: add mark for soc_pcm_components_open/close())
+  	struct snd_soc_component *component;
+  	int i, ret = 0;
+  
+@@@ -516,20 -633,10 +517,10 @@@
+  	return ret;
+  }
+  
+- static int soc_pcm_components_close(struct snd_pcm_substream *substream)
++ static int soc_pcm_components_close(struct snd_pcm_substream *substream,
++ 				    int rollback)
+  {
+ -	struct snd_soc_pcm_runtime *rtd = asoc_substream_to_rtd(substream);
+ +	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+  	struct snd_soc_component *component;
+  	int i, r, ret = 0;
+  
+@@@ -561,11 -668,11 +552,11 @@@ static int soc_pcm_close(struct snd_pcm
+  	snd_soc_runtime_deactivate(rtd, substream->stream);
+  
+  	for_each_rtd_dais(rtd, i, dai)
+ -		snd_soc_dai_shutdown(dai, substream, 0);
+ +		snd_soc_dai_shutdown(dai, substream);
+  
+ -	snd_soc_link_shutdown(substream, 0);
+ +	soc_rtd_shutdown(rtd, substream);
+  
+- 	soc_pcm_components_close(substream);
++ 	soc_pcm_components_close(substream, 0);
+  
+  	snd_soc_dapm_stream_stop(rtd, substream->stream);
+  
+@@@ -695,11 -799,11 +686,11 @@@ dynamic
+  
+  config_err:
+  	for_each_rtd_dais_rollback(rtd, i, dai)
+ -		snd_soc_dai_shutdown(dai, substream, 1);
+ +		snd_soc_dai_shutdown(dai, substream);
+  
+ -	snd_soc_link_shutdown(substream, 1);
+ +	soc_rtd_shutdown(rtd, substream);
+  rtd_startup_err:
+- 	soc_pcm_components_close(substream);
++ 	soc_pcm_components_close(substream, 1);
+  component_err:
+  	mutex_unlock(&rtd->card->pcm_mutex);
+  
+diff --git a/include/sound/soc-component.h b/include/sound/soc-component.h
+index 2cb2446242d9..306b96f28b8c 100644
+--- a/include/sound/soc-component.h
++++ b/include/sound/soc-component.h
+@@ -217,6 +217,10 @@ struct snd_soc_component {
+ 	/* machine specific init */
+ 	int (*init)(struct snd_soc_component *component);
+ 
++	/* function mark */
++	struct snd_pcm_substream *mark_module;
++	struct snd_pcm_substream *mark_open;
++
+ #ifdef CONFIG_DEBUG_FS
+ 	struct dentry *debugfs_root;
+ 	const char *debugfs_prefix;
+@@ -372,17 +376,19 @@ void snd_soc_component_exit_regmap(struct snd_soc_component *component);
+ #endif
+ 
+ #define snd_soc_component_module_get_when_probe(component)\
+-	snd_soc_component_module_get(component, 0)
+-#define snd_soc_component_module_get_when_open(component)	\
+-	snd_soc_component_module_get(component, 1)
++	snd_soc_component_module_get(component, NULL, 0)
++#define snd_soc_component_module_get_when_open(component, substream)	\
++	snd_soc_component_module_get(component, substream, 1)
+ int snd_soc_component_module_get(struct snd_soc_component *component,
++				 struct snd_pcm_substream *substream,
+ 				 int upon_open);
+ #define snd_soc_component_module_put_when_remove(component)	\
+-	snd_soc_component_module_put(component, 0)
+-#define snd_soc_component_module_put_when_close(component)	\
+-	snd_soc_component_module_put(component, 1)
++	snd_soc_component_module_put(component, NULL, 0, 0)
++#define snd_soc_component_module_put_when_close(component, substream, rollback) \
++	snd_soc_component_module_put(component, substream, 1, rollback)
+ void snd_soc_component_module_put(struct snd_soc_component *component,
+-				  int upon_open);
++				  struct snd_pcm_substream *substream,
++				  int upon_open, int rollback);
+ 
+ static inline void snd_soc_component_set_drvdata(struct snd_soc_component *c,
+ 						 void *data)
+@@ -426,7 +432,8 @@ int snd_soc_component_force_enable_pin_unlocked(
+ int snd_soc_component_open(struct snd_soc_component *component,
+ 			   struct snd_pcm_substream *substream);
+ int snd_soc_component_close(struct snd_soc_component *component,
+-			    struct snd_pcm_substream *substream);
++			    struct snd_pcm_substream *substream,
++			    int rollback);
+ void snd_soc_component_suspend(struct snd_soc_component *component);
+ void snd_soc_component_resume(struct snd_soc_component *component);
+ int snd_soc_component_is_suspended(struct snd_soc_component *component);
+diff --git a/sound/soc/soc-component.c b/sound/soc/soc-component.c
+index 05dcb9c6e130..88d54f5bee1b 100644
+--- a/sound/soc/soc-component.c
++++ b/sound/soc/soc-component.c
+@@ -30,6 +30,14 @@ static inline int _soc_component_ret(struct snd_soc_component *component,
+ 	return ret;
+ }
+ 
++/*
++ * We might want to check substream by using list.
++ * In such case, we can update these macros.
++ */
++#define soc_component_mark_push(component, substream, tgt)	((component)->mark_##tgt = substream)
++#define soc_component_mark_pop(component, substream, tgt)	((component)->mark_##tgt = NULL)
++#define soc_component_mark_match(component, substream, tgt)	((component)->mark_##tgt == substream)
++
+ void snd_soc_component_set_aux(struct snd_soc_component *component,
+ 			       struct snd_soc_aux_dev *aux)
+ {
+@@ -235,6 +243,7 @@ int snd_soc_component_set_jack(struct snd_soc_component *component,
+ EXPORT_SYMBOL_GPL(snd_soc_component_set_jack);
+ 
+ int snd_soc_component_module_get(struct snd_soc_component *component,
++				 struct snd_pcm_substream *substream,
+ 				 int upon_open)
+ {
+ 	int ret = 0;
+@@ -243,14 +252,25 @@ int snd_soc_component_module_get(struct snd_soc_component *component,
+ 	    !try_module_get(component->dev->driver->owner))
+ 		ret = -ENODEV;
+ 
++	/* mark substream if succeeded */
++	if (ret == 0)
++		soc_component_mark_push(component, substream, module);
++
+ 	return soc_component_ret(component, ret);
+ }
+ 
+ void snd_soc_component_module_put(struct snd_soc_component *component,
+-				  int upon_open)
++				  struct snd_pcm_substream *substream,
++				  int upon_open, int rollback)
+ {
++	if (rollback && !soc_component_mark_match(component, substream, module))
++		return;
++
+ 	if (component->driver->module_get_upon_open == !!upon_open)
+ 		module_put(component->dev->driver->owner);
++
++	/* remove marked substream */
++	soc_component_mark_pop(component, substream, module);
+ }
+ 
+ int snd_soc_component_open(struct snd_soc_component *component,
+@@ -261,17 +281,28 @@ int snd_soc_component_open(struct snd_soc_component *component,
+ 	if (component->driver->open)
+ 		ret = component->driver->open(component, substream);
+ 
++	/* mark substream if succeeded */
++	if (ret == 0)
++		soc_component_mark_push(component, substream, open);
++
+ 	return soc_component_ret(component, ret);
+ }
+ 
+ int snd_soc_component_close(struct snd_soc_component *component,
+-			    struct snd_pcm_substream *substream)
++			    struct snd_pcm_substream *substream,
++			    int rollback)
+ {
+ 	int ret = 0;
+ 
++	if (rollback && !soc_component_mark_match(component, substream, open))
++		return 0;
++
+ 	if (component->driver->close)
+ 		ret = component->driver->close(component, substream);
+ 
++	/* remove marked substream */
++	soc_component_mark_pop(component, substream, open);
++
+ 	return soc_component_ret(component, ret);
+ }
+ 
+* Unmerged path sound/soc/soc-pcm.c
