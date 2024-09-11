@@ -1,0 +1,486 @@
+mm/workingset: prepare the workingset detection infrastructure for anon LRU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joonsoo Kim <iamjoonsoo.kim@lge.com>
+commit 170b04b7ae49634df103810dad67b22cf8a99aa6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/170b04b7.failed
+
+To prepare the workingset detection for anon LRU, this patch splits
+workingset event counters for refault, activate and restore into anon and
+file variants, as well as the refaults counter in struct lruvec.
+
+	Signed-off-by: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+Link: http://lkml.kernel.org/r/1595490560-15117-4-git-send-email-iamjoonsoo.kim@lge.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 170b04b7ae49634df103810dad67b22cf8a99aa6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/mmzone.h
+#	mm/vmscan.c
+#	mm/vmstat.c
+#	mm/workingset.c
+diff --cc include/linux/mmzone.h
+index 142aaa10ed9e,efbd95dd3bbf..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -217,12 -168,20 +217,25 @@@ enum node_stat_item 
+  	NR_INACTIVE_FILE,	/*  "     "     "   "       "         */
+  	NR_ACTIVE_FILE,		/*  "     "     "   "       "         */
+  	NR_UNEVICTABLE,		/*  "     "     "   "       "         */
+ -	NR_SLAB_RECLAIMABLE_B,
+ -	NR_SLAB_UNRECLAIMABLE_B,
+ +	NR_SLAB_RECLAIMABLE,
+ +	NR_SLAB_UNRECLAIMABLE,
+  	NR_ISOLATED_ANON,	/* Temporary isolated pages from anon lru */
+  	NR_ISOLATED_FILE,	/* Temporary isolated pages from file lru */
+++<<<<<<< HEAD
+ +	WORKINGSET_REFAULT,
+ +	WORKINGSET_ACTIVATE,
+++=======
++ 	WORKINGSET_NODES,
++ 	WORKINGSET_REFAULT_BASE,
++ 	WORKINGSET_REFAULT_ANON = WORKINGSET_REFAULT_BASE,
++ 	WORKINGSET_REFAULT_FILE,
++ 	WORKINGSET_ACTIVATE_BASE,
++ 	WORKINGSET_ACTIVATE_ANON = WORKINGSET_ACTIVATE_BASE,
++ 	WORKINGSET_ACTIVATE_FILE,
++ 	WORKINGSET_RESTORE_BASE,
++ 	WORKINGSET_RESTORE_ANON = WORKINGSET_RESTORE_BASE,
++ 	WORKINGSET_RESTORE_FILE,
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  	WORKINGSET_NODERECLAIM,
+  	NR_ANON_MAPPED,	/* Mapped anonymous pages */
+  	NR_FILE_MAPPED,	/* pagecache pages mapped into pagetables.
+@@@ -328,11 -274,19 +341,27 @@@ struct zone_reclaim_stat 
+  
+  struct lruvec {
+  	struct list_head		lists[NR_LRU_LISTS];
+++<<<<<<< HEAD
+ +	struct zone_reclaim_stat	reclaim_stat;
+ +	/* Evictions & activations on the inactive file list */
+ +	atomic_long_t			inactive_age;
+ +	/* Refaults at the time of last reclaim cycle */
+ +	unsigned long			refaults;
+++=======
++ 	/*
++ 	 * These track the cost of reclaiming one LRU - file or anon -
++ 	 * over the other. As the observed cost of reclaiming one LRU
++ 	 * increases, the reclaim scan balance tips toward the other.
++ 	 */
++ 	unsigned long			anon_cost;
++ 	unsigned long			file_cost;
++ 	/* Non-resident age, driven by LRU movement */
++ 	atomic_long_t			nonresident_age;
++ 	/* Refaults at the time of last reclaim cycle, anon=0, file=1 */
++ 	unsigned long			refaults[2];
++ 	/* Various lruvec state flags (enum lruvec_flags) */
++ 	unsigned long			flags;
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  #ifdef CONFIG_MEMCG
+  	struct pglist_data *pgdat;
+  #endif
+diff --cc mm/vmscan.c
+index d33ed25f0511,017f323318a3..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2751,143 -2656,183 +2751,208 @@@ static void shrink_node(pg_data_t *pgda
+  {
+  	struct reclaim_state *reclaim_state = current->reclaim_state;
+  	unsigned long nr_reclaimed, nr_scanned;
+ -	struct lruvec *target_lruvec;
+  	bool reclaimable = false;
+ -	unsigned long file;
+  
+ -	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
+ +	do {
+ +		struct mem_cgroup *root = sc->target_mem_cgroup;
+ +		struct mem_cgroup *memcg;
+  
+ -again:
+ -	memset(&sc->nr, 0, sizeof(sc->nr));
+ +		memset(&sc->nr, 0, sizeof(sc->nr));
+  
+ -	nr_reclaimed = sc->nr_reclaimed;
+ -	nr_scanned = sc->nr_scanned;
+ +		nr_reclaimed = sc->nr_reclaimed;
+ +		nr_scanned = sc->nr_scanned;
+  
+ -	/*
+ -	 * Determine the scan balance between anon and file LRUs.
+ -	 */
+ -	spin_lock_irq(&pgdat->lru_lock);
+ -	sc->anon_cost = target_lruvec->anon_cost;
+ -	sc->file_cost = target_lruvec->file_cost;
+ -	spin_unlock_irq(&pgdat->lru_lock);
+ +		memcg = mem_cgroup_iter(root, NULL, NULL);
+ +		do {
+ +			unsigned long reclaimed;
+ +			unsigned long scanned;
+  
+++<<<<<<< HEAD
+ +			switch (mem_cgroup_protected(root, memcg)) {
+ +			case MEMCG_PROT_MIN:
+ +				/*
+ +				 * Hard protection.
+ +				 * If there is no reclaimable memory, OOM.
+ +				 */
+++=======
++ 	/*
++ 	 * Target desirable inactive:active list ratios for the anon
++ 	 * and file LRU lists.
++ 	 */
++ 	if (!sc->force_deactivate) {
++ 		unsigned long refaults;
++ 
++ 		refaults = lruvec_page_state(target_lruvec,
++ 				WORKINGSET_ACTIVATE_ANON);
++ 		if (refaults != target_lruvec->refaults[0] ||
++ 			inactive_is_low(target_lruvec, LRU_INACTIVE_ANON))
++ 			sc->may_deactivate |= DEACTIVATE_ANON;
++ 		else
++ 			sc->may_deactivate &= ~DEACTIVATE_ANON;
++ 
++ 		/*
++ 		 * When refaults are being observed, it means a new
++ 		 * workingset is being established. Deactivate to get
++ 		 * rid of any stale active pages quickly.
++ 		 */
++ 		refaults = lruvec_page_state(target_lruvec,
++ 				WORKINGSET_ACTIVATE_FILE);
++ 		if (refaults != target_lruvec->refaults[1] ||
++ 		    inactive_is_low(target_lruvec, LRU_INACTIVE_FILE))
++ 			sc->may_deactivate |= DEACTIVATE_FILE;
++ 		else
++ 			sc->may_deactivate &= ~DEACTIVATE_FILE;
++ 	} else
++ 		sc->may_deactivate = DEACTIVATE_ANON | DEACTIVATE_FILE;
++ 
++ 	/*
++ 	 * If we have plenty of inactive file pages that aren't
++ 	 * thrashing, try to reclaim those first before touching
++ 	 * anonymous pages.
++ 	 */
++ 	file = lruvec_page_state(target_lruvec, NR_INACTIVE_FILE);
++ 	if (file >> sc->priority && !(sc->may_deactivate & DEACTIVATE_FILE))
++ 		sc->cache_trim_mode = 1;
++ 	else
++ 		sc->cache_trim_mode = 0;
++ 
++ 	/*
++ 	 * Prevent the reclaimer from falling into the cache trap: as
++ 	 * cache pages start out inactive, every cache fault will tip
++ 	 * the scan balance towards the file LRU.  And as the file LRU
++ 	 * shrinks, so does the window for rotation from references.
++ 	 * This means we have a runaway feedback loop where a tiny
++ 	 * thrashing file LRU becomes infinitely more attractive than
++ 	 * anon pages.  Try to detect this based on file LRU size.
++ 	 */
++ 	if (!cgroup_reclaim(sc)) {
++ 		unsigned long total_high_wmark = 0;
++ 		unsigned long free, anon;
++ 		int z;
++ 
++ 		free = sum_zone_node_page_state(pgdat->node_id, NR_FREE_PAGES);
++ 		file = node_page_state(pgdat, NR_ACTIVE_FILE) +
++ 			   node_page_state(pgdat, NR_INACTIVE_FILE);
++ 
++ 		for (z = 0; z < MAX_NR_ZONES; z++) {
++ 			struct zone *zone = &pgdat->node_zones[z];
++ 			if (!managed_zone(zone))
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  				continue;
+ +			case MEMCG_PROT_LOW:
+ +				/*
+ +				 * Soft protection.
+ +				 * Respect the protection only as long as
+ +				 * there is an unprotected supply
+ +				 * of reclaimable memory from other cgroups.
+ +				 */
+ +				if (!sc->memcg_low_reclaim) {
+ +					sc->memcg_low_skipped = 1;
+ +					continue;
+ +				}
+ +				memcg_memory_event(memcg, MEMCG_LOW);
+ +				break;
+ +			case MEMCG_PROT_NONE:
+ +				/*
+ +				 * All protection thresholds breached. We may
+ +				 * still choose to vary the scan pressure
+ +				 * applied based on by how much the cgroup in
+ +				 * question has exceeded its protection
+ +				 * thresholds (see get_scan_count).
+ +				 */
+ +				break;
+ +			}
+  
+ -			total_high_wmark += high_wmark_pages(zone);
+ +			reclaimed = sc->nr_reclaimed;
+ +			scanned = sc->nr_scanned;
+ +			shrink_node_memcg(pgdat, memcg, sc);
+ +
+ +			shrink_slab(sc->gfp_mask, pgdat->node_id, memcg,
+ +					sc->priority);
+ +
+ +			/* Record the group's reclaim efficiency */
+ +			vmpressure(sc->gfp_mask, memcg, false,
+ +				   sc->nr_scanned - scanned,
+ +				   sc->nr_reclaimed - reclaimed);
+ +
+ +		} while ((memcg = mem_cgroup_iter(root, memcg, NULL)));
+ +
+ +		if (reclaim_state) {
+ +			sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+ +			reclaim_state->reclaimed_slab = 0;
+  		}
+  
+ -		/*
+ -		 * Consider anon: if that's low too, this isn't a
+ -		 * runaway file reclaim problem, but rather just
+ -		 * extreme pressure. Reclaim as per usual then.
+ -		 */
+ -		anon = node_page_state(pgdat, NR_INACTIVE_ANON);
+ +		/* Record the subtree's reclaim efficiency */
+ +		vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+ +			   sc->nr_scanned - nr_scanned,
+ +			   sc->nr_reclaimed - nr_reclaimed);
+  
+ -		sc->file_is_tiny =
+ -			file + free <= total_high_wmark &&
+ -			!(sc->may_deactivate & DEACTIVATE_ANON) &&
+ -			anon >> sc->priority;
+ -	}
+ +		if (sc->nr_reclaimed - nr_reclaimed)
+ +			reclaimable = true;
+  
+ -	shrink_node_memcgs(pgdat, sc);
+ +		if (current_is_kswapd()) {
+ +			/*
+ +			 * If reclaim is isolating dirty pages under writeback,
+ +			 * it implies that the long-lived page allocation rate
+ +			 * is exceeding the page laundering rate. Either the
+ +			 * global limits are not being effective at throttling
+ +			 * processes due to the page distribution throughout
+ +			 * zones or there is heavy usage of a slow backing
+ +			 * device. The only option is to throttle from reclaim
+ +			 * context which is not ideal as there is no guarantee
+ +			 * the dirtying process is throttled in the same way
+ +			 * balance_dirty_pages() manages.
+ +			 *
+ +			 * Once a node is flagged PGDAT_WRITEBACK, kswapd will
+ +			 * count the number of pages under pages flagged for
+ +			 * immediate reclaim and stall if any are encountered
+ +			 * in the nr_immediate check below.
+ +			 */
+ +			if (sc->nr.writeback && sc->nr.writeback == sc->nr.taken)
+ +				set_bit(PGDAT_WRITEBACK, &pgdat->flags);
+  
+ -	if (reclaim_state) {
+ -		sc->nr_reclaimed += reclaim_state->reclaimed_slab;
+ -		reclaim_state->reclaimed_slab = 0;
+ -	}
+ +			/*
+ +			 * Tag a node as congested if all the dirty pages
+ +			 * scanned were backed by a congested BDI and
+ +			 * wait_iff_congested will stall.
+ +			 */
+ +			if (sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ +				set_bit(PGDAT_CONGESTED, &pgdat->flags);
+  
+ -	/* Record the subtree's reclaim efficiency */
+ -	vmpressure(sc->gfp_mask, sc->target_mem_cgroup, true,
+ -		   sc->nr_scanned - nr_scanned,
+ -		   sc->nr_reclaimed - nr_reclaimed);
+ +			/* Allow kswapd to start writing pages during reclaim.*/
+ +			if (sc->nr.unqueued_dirty == sc->nr.file_taken)
+ +				set_bit(PGDAT_DIRTY, &pgdat->flags);
+  
+ -	if (sc->nr_reclaimed - nr_reclaimed)
+ -		reclaimable = true;
+ +			/*
+ +			 * If kswapd scans pages marked marked for immediate
+ +			 * reclaim and under writeback (nr_immediate), it
+ +			 * implies that pages are cycling through the LRU
+ +			 * faster than they are written so also forcibly stall.
+ +			 */
+ +			if (sc->nr.immediate)
+ +				congestion_wait(BLK_RW_ASYNC, HZ/10);
+ +		}
+  
+ -	if (current_is_kswapd()) {
+  		/*
+ -		 * If reclaim is isolating dirty pages under writeback,
+ -		 * it implies that the long-lived page allocation rate
+ -		 * is exceeding the page laundering rate. Either the
+ -		 * global limits are not being effective at throttling
+ -		 * processes due to the page distribution throughout
+ -		 * zones or there is heavy usage of a slow backing
+ -		 * device. The only option is to throttle from reclaim
+ -		 * context which is not ideal as there is no guarantee
+ -		 * the dirtying process is throttled in the same way
+ -		 * balance_dirty_pages() manages.
+ -		 *
+ -		 * Once a node is flagged PGDAT_WRITEBACK, kswapd will
+ -		 * count the number of pages under pages flagged for
+ -		 * immediate reclaim and stall if any are encountered
+ -		 * in the nr_immediate check below.
+ +		 * Legacy memcg will stall in page writeback so avoid forcibly
+ +		 * stalling in wait_iff_congested().
+  		 */
+ -		if (sc->nr.writeback && sc->nr.writeback == sc->nr.taken)
+ -			set_bit(PGDAT_WRITEBACK, &pgdat->flags);
+ -
+ -		/* Allow kswapd to start writing pages during reclaim.*/
+ -		if (sc->nr.unqueued_dirty == sc->nr.file_taken)
+ -			set_bit(PGDAT_DIRTY, &pgdat->flags);
+ +		if (!global_reclaim(sc) && sane_reclaim(sc) &&
+ +		    sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ +			set_memcg_congestion(pgdat, root, true);
+  
+  		/*
+ -		 * If kswapd scans pages marked marked for immediate
+ -		 * reclaim and under writeback (nr_immediate), it
+ -		 * implies that pages are cycling through the LRU
+ -		 * faster than they are written so also forcibly stall.
+ +		 * Stall direct reclaim for IO completions if underlying BDIs
+ +		 * and node is congested. Allow kswapd to continue until it
+ +		 * starts encountering unqueued dirty pages or cycling through
+ +		 * the LRU too quickly.
+  		 */
+ -		if (sc->nr.immediate)
+ -			congestion_wait(BLK_RW_ASYNC, HZ/10);
+ -	}
+ +		if (!sc->hibernation_mode && !current_is_kswapd() &&
+ +		   current_may_throttle() && pgdat_memcg_congested(pgdat, root))
+ +			wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+  
+ -	/*
+ -	 * Tag a node/memcg as congested if all the dirty pages
+ -	 * scanned were backed by a congested BDI and
+ -	 * wait_iff_congested will stall.
+ -	 *
+ -	 * Legacy memcg will stall in page writeback so avoid forcibly
+ -	 * stalling in wait_iff_congested().
+ -	 */
+ -	if ((current_is_kswapd() ||
+ -	     (cgroup_reclaim(sc) && writeback_throttling_sane(sc))) &&
+ -	    sc->nr.dirty && sc->nr.dirty == sc->nr.congested)
+ -		set_bit(LRUVEC_CONGESTED, &target_lruvec->flags);
+ -
+ -	/*
+ -	 * Stall direct reclaim for IO completions if underlying BDIs
+ -	 * and node is congested. Allow kswapd to continue until it
+ -	 * starts encountering unqueued dirty pages or cycling through
+ -	 * the LRU too quickly.
+ -	 */
+ -	if (!current_is_kswapd() && current_may_throttle() &&
+ -	    !sc->hibernation_mode &&
+ -	    test_bit(LRUVEC_CONGESTED, &target_lruvec->flags))
+ -		wait_iff_congested(BLK_RW_ASYNC, HZ/10);
+ -
+ -	if (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ -				    sc))
+ -		goto again;
+ +	} while (should_continue_reclaim(pgdat, sc->nr_reclaimed - nr_reclaimed,
+ +					 sc));
+  
+  	/*
+  	 * Kswapd gives up on balancing particular nodes after too
+diff --cc mm/vmstat.c
+index 172d389e26f2,fef03463a0cf..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -1166,9 -1166,13 +1166,19 @@@ const char * const vmstat_text[] = 
+  	"nr_slab_unreclaimable",
+  	"nr_isolated_anon",
+  	"nr_isolated_file",
+++<<<<<<< HEAD
+ +	"workingset_refault",
+ +	"workingset_activate",
+ +	"workingset_restore",
+++=======
++ 	"workingset_nodes",
++ 	"workingset_refault_anon",
++ 	"workingset_refault_file",
++ 	"workingset_activate_anon",
++ 	"workingset_activate_file",
++ 	"workingset_restore_anon",
++ 	"workingset_restore_file",
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  	"workingset_nodereclaim",
+  	"nr_anon_pages",
+  	"nr_mapped",
+diff --cc mm/workingset.c
+index 44c5c225f293,941bbaa6c262..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -359,13 -367,17 +361,26 @@@ void workingset_refault(struct page *pa
+  		goto out;
+  
+  	SetPageActive(page);
+++<<<<<<< HEAD
+ +	advance_inactive_age(memcg, pgdat);
+ +	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE);
+++=======
++ 	workingset_age_nonresident(lruvec, hpage_nr_pages(page));
++ 	inc_lruvec_state(lruvec, WORKINGSET_ACTIVATE_BASE + file);
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  
+  	/* Page was active prior to eviction */
+  	if (workingset) {
+  		SetPageWorkingset(page);
+++<<<<<<< HEAD
+ +		inc_lruvec_state(lruvec, WORKINGSET_RESTORE);
+++=======
++ 		/* XXX: Move to lru_cache_add() when it supports new vs putback */
++ 		spin_lock_irq(&page_pgdat(page)->lru_lock);
++ 		lru_note_cost_page(page);
++ 		spin_unlock_irq(&page_pgdat(page)->lru_lock);
++ 		inc_lruvec_state(lruvec, WORKINGSET_RESTORE_BASE + file);
+++>>>>>>> 170b04b7ae49 (mm/workingset: prepare the workingset detection infrastructure for anon LRU)
+  	}
+  out:
+  	rcu_read_unlock();
+* Unmerged path include/linux/mmzone.h
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 406972ba9675..fe24345e0e0a 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1467,12 +1467,18 @@ static char *memory_stat_format(struct mem_cgroup *memcg)
+ 	seq_buf_printf(&s, "%s %lu\n", vm_event_name(PGMAJFAULT),
+ 		       memcg_events(memcg, PGMAJFAULT));
+ 
+-	seq_buf_printf(&s, "workingset_refault %lu\n",
+-		       memcg_page_state(memcg, WORKINGSET_REFAULT));
+-	seq_buf_printf(&s, "workingset_activate %lu\n",
+-		       memcg_page_state(memcg, WORKINGSET_ACTIVATE));
++	seq_buf_printf(&s, "workingset_refault_anon %lu\n",
++		       memcg_page_state(memcg, WORKINGSET_REFAULT_ANON));
++	seq_buf_printf(&s, "workingset_refault_file %lu\n",
++		       memcg_page_state(memcg, WORKINGSET_REFAULT_FILE));
++	seq_buf_printf(&s, "workingset_activate_anon %lu\n",
++		       memcg_page_state(memcg, WORKINGSET_ACTIVATE_ANON));
++	seq_buf_printf(&s, "workingset_activate_file %lu\n",
++		       memcg_page_state(memcg, WORKINGSET_ACTIVATE_FILE));
+ 	seq_buf_printf(&s, "workingset_restore %lu\n",
+-		       memcg_page_state(memcg, WORKINGSET_RESTORE));
++		       memcg_page_state(memcg, WORKINGSET_RESTORE_ANON));
++	seq_buf_printf(&s, "workingset_restore %lu\n",
++		       memcg_page_state(memcg, WORKINGSET_RESTORE_FILE));
+ 	seq_buf_printf(&s, "workingset_nodereclaim %lu\n",
+ 		       memcg_page_state(memcg, WORKINGSET_NODERECLAIM));
+ 
+* Unmerged path mm/vmscan.c
+* Unmerged path mm/vmstat.c
+* Unmerged path mm/workingset.c
