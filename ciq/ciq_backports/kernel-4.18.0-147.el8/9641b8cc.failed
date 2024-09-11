@@ -1,0 +1,510 @@
+s390/ipl: read IPL report at early boot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 9641b8cc733f70a5400aa7e6831de4542c46a94c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/9641b8cc.failed
+
+Read the IPL Report block provided by secure-boot, add the entries
+of the certificate list to the system key ring and print the list
+of components.
+
+PR: Adjust to Vasilys bootdata_preserved patch set. Preserve ipl_cert_list
+for later use in kexec_file.
+
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+	Signed-off-by: Philipp Rudo <prudo@linux.ibm.com>
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 9641b8cc733f70a5400aa7e6831de4542c46a94c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/boot/Makefile
+#	arch/s390/boot/startup.c
+#	arch/s390/kernel/setup.c
+diff --cc arch/s390/boot/Makefile
+index fbc62d6b038c,1f8fd68beae3..000000000000
+--- a/arch/s390/boot/Makefile
++++ b/arch/s390/boot/Makefile
+@@@ -28,8 -28,10 +28,15 @@@ endi
+  
+  CFLAGS_sclp_early_core.o += -I$(srctree)/drivers/s390/char
+  
+++<<<<<<< HEAD
+ +obj-y	:= head.o als.o startup.o mem_detect.o ipl_parm.o string.o ebcdic.o
+ +obj-y	+= sclp_early_core.o mem.o ipl_vmparm.o cmdline.o ctype.o
+++=======
++ obj-y	:= head.o als.o startup.o mem_detect.o ipl_parm.o ipl_report.o
++ obj-y	+= string.o ebcdic.o sclp_early_core.o mem.o ipl_vmparm.o cmdline.o
++ obj-y	+= ctype.o
++ obj-$(CONFIG_PROTECTED_VIRTUALIZATION_GUEST)	+= uv.o
+++>>>>>>> 9641b8cc733f (s390/ipl: read IPL report at early boot)
+  targets	:= bzImage startup.a section_cmp.boot.data section_cmp.boot.preserved.data $(obj-y)
+  subdir-	:= compressed
+  
+diff --cc arch/s390/boot/startup.c
+index a6990c16a506,90898976a941..000000000000
+--- a/arch/s390/boot/startup.c
++++ b/arch/s390/boot/startup.c
+@@@ -51,12 -49,17 +48,21 @@@ static void copy_bootdata(void
+  
+  void startup_kernel(void)
+  {
++ 	unsigned long safe_addr;
+  	void *img;
+  
+++<<<<<<< HEAD
+ +	rescue_initrd();
+ +	sclp_early_read_info();
+++=======
+++>>>>>>> 9641b8cc733f (s390/ipl: read IPL report at early boot)
+  	store_ipl_parmblock();
++ 	safe_addr = mem_safe_offset();
++ 	safe_addr = read_ipl_report(safe_addr);
++ 	uv_query_info();
++ 	rescue_initrd(safe_addr);
++ 	sclp_early_read_info();
+  	setup_boot_command_line();
+ -	parse_boot_command_line();
+  	setup_memory_end();
+  	detect_memory();
+  	if (!IS_ENABLED(CONFIG_KERNEL_UNCOMPRESSED)) {
+diff --cc arch/s390/kernel/setup.c
+index 00ead407e32c,ffc87520aca9..000000000000
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@@ -49,7 -48,9 +49,8 @@@
+  #include <linux/crash_dump.h>
+  #include <linux/memory.h>
+  #include <linux/compat.h>
+ -#include <linux/start_kernel.h>
+  
++ #include <asm/boot_data.h>
+  #include <asm/ipl.h>
+  #include <asm/facility.h>
+  #include <asm/smp.h>
+@@@ -934,6 -1027,57 +944,60 @@@ static void __init setup_task_size(void
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Issue diagnose 318 to set the control program name and
++  * version codes.
++  */
++ static void __init setup_control_program_code(void)
++ {
++ 	union diag318_info diag318_info = {
++ 		.cpnc = CPNC_LINUX,
++ 		.cpvc_linux = 0,
++ 		.cpvc_distro = {0},
++ 	};
++ 
++ 	if (!sclp.has_diag318)
++ 		return;
++ 
++ 	diag_stat_inc(DIAG_STAT_X318);
++ 	asm volatile("diag %0,0,0x318\n" : : "d" (diag318_info.val));
++ }
++ 
++ /*
++  * Print the component list from the IPL report
++  */
++ static void __init log_component_list(void)
++ {
++ 	struct ipl_rb_component_entry *ptr, *end;
++ 	char *str;
++ 
++ 	if (!early_ipl_comp_list_addr)
++ 		return;
++ 	if (ipl_block.hdr.flags & IPL_PL_FLAG_IPLSR)
++ 		pr_info("Linux is running with Secure-IPL enabled\n");
++ 	else
++ 		pr_info("Linux is running with Secure-IPL disabled\n");
++ 	ptr = (void *) early_ipl_comp_list_addr;
++ 	end = (void *) ptr + early_ipl_comp_list_size;
++ 	pr_info("The IPL report contains the following components:\n");
++ 	while (ptr < end) {
++ 		if (ptr->flags & IPL_RB_COMPONENT_FLAG_SIGNED) {
++ 			if (ptr->flags & IPL_RB_COMPONENT_FLAG_VERIFIED)
++ 				str = "signed, verified";
++ 			else
++ 				str = "signed, verification failed";
++ 		} else {
++ 			str = "not signed";
++ 		}
++ 		pr_info("%016llx - %016llx (%s)\n",
++ 			ptr->addr, ptr->addr + ptr->len, str);
++ 		ptr++;
++ 	}
++ }
++ 
++ /*
+++>>>>>>> 9641b8cc733f (s390/ipl: read IPL report at early boot)
+   * Setup function called from init/main.c just after the banner
+   * was printed.
+   */
+@@@ -950,7 -1094,11 +1014,9 @@@ void __init setup_arch(char **cmdline_p
+  		pr_info("Linux is running under KVM in 64-bit mode\n");
+  	else if (MACHINE_IS_LPAR)
+  		pr_info("Linux is running natively in 64-bit mode\n");
+ -	else
+ -		pr_info("Linux is running as a guest in 64-bit mode\n");
+  
++ 	log_component_list();
++ 
+  	/* Have one command line that is parsed and saved in /proc/cmdline */
+  	/* boot_command_line has been already set up in early.c */
+  	*cmdline_p = boot_command_line;
+* Unmerged path arch/s390/boot/Makefile
+diff --git a/arch/s390/boot/boot.h b/arch/s390/boot/boot.h
+index fc41e2277ea8..6f7565c1e2f3 100644
+--- a/arch/s390/boot/boot.h
++++ b/arch/s390/boot/boot.h
+@@ -8,4 +8,6 @@ void store_ipl_parmblock(void);
+ void setup_boot_command_line(void);
+ void setup_memory_end(void);
+ 
++unsigned long read_ipl_report(unsigned long safe_offset);
++
+ #endif /* BOOT_BOOT_H */
+diff --git a/arch/s390/boot/ipl_report.c b/arch/s390/boot/ipl_report.c
+new file mode 100644
+index 000000000000..0b4965573656
+--- /dev/null
++++ b/arch/s390/boot/ipl_report.c
+@@ -0,0 +1,165 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/init.h>
++#include <linux/ctype.h>
++#include <asm/ebcdic.h>
++#include <asm/sclp.h>
++#include <asm/sections.h>
++#include <asm/boot_data.h>
++#include <uapi/asm/ipl.h>
++#include "boot.h"
++
++int __bootdata_preserved(ipl_secure_flag);
++
++unsigned long __bootdata_preserved(ipl_cert_list_addr);
++unsigned long __bootdata_preserved(ipl_cert_list_size);
++
++unsigned long __bootdata(early_ipl_comp_list_addr);
++unsigned long __bootdata(early_ipl_comp_list_size);
++
++#define for_each_rb_entry(entry, rb) \
++	for (entry = rb->entries; \
++	     (void *) entry + sizeof(*entry) <= (void *) rb + rb->len; \
++	     entry++)
++
++static inline bool intersects(unsigned long addr0, unsigned long size0,
++			      unsigned long addr1, unsigned long size1)
++{
++	return addr0 + size0 > addr1 && addr1 + size1 > addr0;
++}
++
++static unsigned long find_bootdata_space(struct ipl_rb_components *comps,
++					 struct ipl_rb_certificates *certs,
++					 unsigned long safe_addr)
++{
++	struct ipl_rb_certificate_entry *cert;
++	struct ipl_rb_component_entry *comp;
++	size_t size;
++
++	/*
++	 * Find the length for the IPL report boot data
++	 */
++	early_ipl_comp_list_size = 0;
++	for_each_rb_entry(comp, comps)
++		early_ipl_comp_list_size += sizeof(*comp);
++	ipl_cert_list_size = 0;
++	for_each_rb_entry(cert, certs)
++		ipl_cert_list_size += sizeof(unsigned int) + cert->len;
++	size = ipl_cert_list_size + early_ipl_comp_list_size;
++
++	/*
++	 * Start from safe_addr to find a free memory area large
++	 * enough for the IPL report boot data. This area is used
++	 * for ipl_cert_list_addr/ipl_cert_list_size and
++	 * early_ipl_comp_list_addr/early_ipl_comp_list_size. It must
++	 * not overlap with any component or any certificate.
++	 */
++repeat:
++	if (IS_ENABLED(CONFIG_BLK_DEV_INITRD) && INITRD_START && INITRD_SIZE &&
++	    intersects(INITRD_START, INITRD_SIZE, safe_addr, size))
++		safe_addr = INITRD_START + INITRD_SIZE;
++	for_each_rb_entry(comp, comps)
++		if (intersects(safe_addr, size, comp->addr, comp->len)) {
++			safe_addr = comp->addr + comp->len;
++			goto repeat;
++		}
++	for_each_rb_entry(cert, certs)
++		if (intersects(safe_addr, size, cert->addr, cert->len)) {
++			safe_addr = cert->addr + cert->len;
++			goto repeat;
++		}
++	early_ipl_comp_list_addr = safe_addr;
++	ipl_cert_list_addr = safe_addr + early_ipl_comp_list_size;
++
++	return safe_addr + size;
++}
++
++static void copy_components_bootdata(struct ipl_rb_components *comps)
++{
++	struct ipl_rb_component_entry *comp, *ptr;
++
++	ptr = (struct ipl_rb_component_entry *) early_ipl_comp_list_addr;
++	for_each_rb_entry(comp, comps)
++		memcpy(ptr++, comp, sizeof(*ptr));
++}
++
++static void copy_certificates_bootdata(struct ipl_rb_certificates *certs)
++{
++	struct ipl_rb_certificate_entry *cert;
++	void *ptr;
++
++	ptr = (void *) ipl_cert_list_addr;
++	for_each_rb_entry(cert, certs) {
++		*(unsigned int *) ptr = cert->len;
++		ptr += sizeof(unsigned int);
++		memcpy(ptr, (void *) cert->addr, cert->len);
++		ptr += cert->len;
++	}
++}
++
++unsigned long read_ipl_report(unsigned long safe_addr)
++{
++	struct ipl_rb_certificates *certs;
++	struct ipl_rb_components *comps;
++	struct ipl_pl_hdr *pl_hdr;
++	struct ipl_rl_hdr *rl_hdr;
++	struct ipl_rb_hdr *rb_hdr;
++	unsigned long tmp;
++	void *rl_end;
++
++	/*
++	 * Check if there is a IPL report by looking at the copy
++	 * of the IPL parameter information block.
++	 */
++	if (!ipl_block_valid ||
++	    !(ipl_block.hdr.flags & IPL_PL_FLAG_IPLSR))
++		return safe_addr;
++	ipl_secure_flag = !!(ipl_block.hdr.flags & IPL_PL_FLAG_SIPL);
++	/*
++	 * There is an IPL report, to find it load the pointer to the
++	 * IPL parameter information block from lowcore and skip past
++	 * the IPL parameter list, then align the address to a double
++	 * word boundary.
++	 */
++	tmp = (unsigned long) S390_lowcore.ipl_parmblock_ptr;
++	pl_hdr = (struct ipl_pl_hdr *) tmp;
++	tmp = (tmp + pl_hdr->len + 7) & -8UL;
++	rl_hdr = (struct ipl_rl_hdr *) tmp;
++	/* Walk through the IPL report blocks in the IPL Report list */
++	certs = NULL;
++	comps = NULL;
++	rl_end = (void *) rl_hdr + rl_hdr->len;
++	rb_hdr = (void *) rl_hdr + sizeof(*rl_hdr);
++	while ((void *) rb_hdr + sizeof(*rb_hdr) < rl_end &&
++	       (void *) rb_hdr + rb_hdr->len <= rl_end) {
++
++		switch (rb_hdr->rbt) {
++		case IPL_RBT_CERTIFICATES:
++			certs = (struct ipl_rb_certificates *) rb_hdr;
++			break;
++		case IPL_RBT_COMPONENTS:
++			comps = (struct ipl_rb_components *) rb_hdr;
++			break;
++		default:
++			break;
++		}
++
++		rb_hdr = (void *) rb_hdr + rb_hdr->len;
++	}
++
++	/*
++	 * With either the component list or the certificate list
++	 * missing the kernel will stay ignorant of secure IPL.
++	 */
++	if (!comps || !certs)
++		return safe_addr;
++
++	/*
++	 * Copy component and certificate list to a safe area
++	 * where the decompressed kernel can find them.
++	 */
++	safe_addr = find_bootdata_space(comps, certs, safe_addr);
++	copy_components_bootdata(comps);
++	copy_certificates_bootdata(certs);
++
++	return safe_addr;
++}
+* Unmerged path arch/s390/boot/startup.c
+diff --git a/arch/s390/include/asm/boot_data.h b/arch/s390/include/asm/boot_data.h
+index d794802a2291..f7eed27b3220 100644
+--- a/arch/s390/include/asm/boot_data.h
++++ b/arch/s390/include/asm/boot_data.h
+@@ -7,5 +7,12 @@
+ extern char early_command_line[COMMAND_LINE_SIZE];
+ extern struct ipl_parameter_block ipl_block;
+ extern int ipl_block_valid;
++extern int ipl_secure_flag;
++
++extern unsigned long ipl_cert_list_addr;
++extern unsigned long ipl_cert_list_size;
++
++extern unsigned long early_ipl_comp_list_addr;
++extern unsigned long early_ipl_comp_list_size;
+ 
+ #endif /* _ASM_S390_BOOT_DATA_H */
+diff --git a/arch/s390/kernel/ipl.c b/arch/s390/kernel/ipl.c
+index fe0293d5313d..117023e2f9ba 100644
+--- a/arch/s390/kernel/ipl.c
++++ b/arch/s390/kernel/ipl.c
+@@ -121,6 +121,13 @@ static char *dump_type_str(enum dump_type type)
+ 
+ int __bootdata_preserved(ipl_block_valid);
+ struct ipl_parameter_block __bootdata_preserved(ipl_block);
++int __bootdata_preserved(ipl_secure_flag);
++
++unsigned long __bootdata_preserved(ipl_cert_list_addr);
++unsigned long __bootdata_preserved(ipl_cert_list_size);
++
++unsigned long __bootdata(early_ipl_comp_list_addr);
++unsigned long __bootdata(early_ipl_comp_list_size);
+ 
+ static int reipl_capabilities = IPL_TYPE_UNKNOWN;
+ 
+@@ -264,6 +271,15 @@ static ssize_t ipl_type_show(struct kobject *kobj, struct kobj_attribute *attr,
+ 
+ static struct kobj_attribute sys_ipl_type_attr = __ATTR_RO(ipl_type);
+ 
++static ssize_t ipl_secure_show(struct kobject *kobj,
++			       struct kobj_attribute *attr, char *page)
++{
++	return sprintf(page, "%i\n", !!ipl_secure_flag);
++}
++
++static struct kobj_attribute sys_ipl_secure_attr =
++	__ATTR(secure, 0444, ipl_secure_show, NULL);
++
+ static ssize_t ipl_vm_parm_show(struct kobject *kobj,
+ 				struct kobj_attribute *attr, char *page)
+ {
+@@ -359,6 +375,7 @@ static struct attribute *ipl_fcp_attrs[] = {
+ 	&sys_ipl_fcp_bootprog_attr.attr,
+ 	&sys_ipl_fcp_br_lba_attr.attr,
+ 	&sys_ipl_ccw_loadparm_attr.attr,
++	&sys_ipl_secure_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -374,6 +391,7 @@ static struct attribute *ipl_ccw_attrs_vm[] = {
+ 	&sys_ipl_device_attr.attr,
+ 	&sys_ipl_ccw_loadparm_attr.attr,
+ 	&sys_ipl_vm_parm_attr.attr,
++	&sys_ipl_secure_attr.attr,
+ 	NULL,
+ };
+ 
+@@ -381,6 +399,7 @@ static struct attribute *ipl_ccw_attrs_lpar[] = {
+ 	&sys_ipl_type_attr.attr,
+ 	&sys_ipl_device_attr.attr,
+ 	&sys_ipl_ccw_loadparm_attr.attr,
++	&sys_ipl_secure_attr.attr,
+ 	NULL,
+ };
+ 
+* Unmerged path arch/s390/kernel/setup.c
+diff --git a/security/integrity/Kconfig b/security/integrity/Kconfig
+index 4b4d2aeef539..a6c0193c252d 100644
+--- a/security/integrity/Kconfig
++++ b/security/integrity/Kconfig
+@@ -55,13 +55,22 @@ config INTEGRITY_PLATFORM_KEYRING
+         bool "Provide keyring for platform/firmware trusted keys"
+         depends on INTEGRITY_ASYMMETRIC_KEYS
+         depends on SYSTEM_BLACKLIST_KEYRING
+-        depends on EFI
+         help
+          Provide a separate, distinct keyring for platform trusted keys, which
+          the kernel automatically populates during initialization from values
+          provided by the platform for verifying the kexec'ed kerned image
+          and, possibly, the initramfs signature.
+ 
++config LOAD_UEFI_KEYS
++       depends on INTEGRITY_PLATFORM_KEYRING
++       depends on EFI
++       def_bool y
++
++config LOAD_IPL_KEYS
++       depends on INTEGRITY_PLATFORM_KEYRING
++       depends on S390
++       def_bool y
++
+ config INTEGRITY_AUDIT
+ 	bool "Enables integrity auditing support "
+ 	depends on AUDIT
+diff --git a/security/integrity/Makefile b/security/integrity/Makefile
+index 86df9aba8c0f..19faace69644 100644
+--- a/security/integrity/Makefile
++++ b/security/integrity/Makefile
+@@ -9,10 +9,10 @@ integrity-y := iint.o
+ integrity-$(CONFIG_INTEGRITY_AUDIT) += integrity_audit.o
+ integrity-$(CONFIG_INTEGRITY_SIGNATURE) += digsig.o
+ integrity-$(CONFIG_INTEGRITY_ASYMMETRIC_KEYS) += digsig_asymmetric.o
+-integrity-$(CONFIG_INTEGRITY_PLATFORM_KEYRING) += platform_certs/platform_keyring.o \
+-						  platform_certs/efi_parser.o \
+-						  platform_certs/load_uefi.o
+-obj-$(CONFIG_LOAD_UEFI_KEYS) += platform_certs/load_uefi.o
++integrity-$(CONFIG_INTEGRITY_PLATFORM_KEYRING) += platform_certs/platform_keyring.o
++integrity-$(CONFIG_LOAD_UEFI_KEYS) += platform_certs/efi_parser.o \
++					platform_certs/load_uefi.o
++integrity-$(CONFIG_LOAD_IPL_KEYS) += platform_certs/load_ipl_s390.o
+ $(obj)/load_uefi.o: KBUILD_CFLAGS += -fshort-wchar
+ 
+ subdir-$(CONFIG_IMA)			+= ima
+diff --git a/security/integrity/platform_certs/load_ipl_s390.c b/security/integrity/platform_certs/load_ipl_s390.c
+new file mode 100644
+index 000000000000..e769dcb7ea94
+--- /dev/null
++++ b/security/integrity/platform_certs/load_ipl_s390.c
+@@ -0,0 +1,36 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/kernel.h>
++#include <linux/sched.h>
++#include <linux/cred.h>
++#include <linux/err.h>
++#include <linux/efi.h>
++#include <linux/slab.h>
++#include <keys/asymmetric-type.h>
++#include <keys/system_keyring.h>
++#include <asm/boot_data.h>
++#include "../integrity.h"
++
++/*
++ * Load the certs contained in the IPL report created by the machine loader
++ * into the platform trusted keyring.
++ */
++static int __init load_ipl_certs(void)
++{
++	void *ptr, *end;
++	unsigned int len;
++
++	if (!ipl_cert_list_addr)
++		return 0;
++	/* Copy the certificates to the system keyring */
++	ptr = (void *) ipl_cert_list_addr;
++	end = ptr + ipl_cert_list_size;
++	while ((void *) ptr < end) {
++		len = *(unsigned int *) ptr;
++		ptr += sizeof(unsigned int);
++		add_to_platform_keyring("IPL:db", ptr, len);
++		ptr += len;
++	}
++	return 0;
++}
++late_initcall(load_ipl_certs);
