@@ -1,0 +1,120 @@
+Bluetooth: Handle PM_SUSPEND_PREPARE and PM_POST_SUSPEND
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+commit 9952d90ea2885d7cbf80cd233f694f09a9c0eaec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9952d90e.failed
+
+Register for PM_SUSPEND_PREPARE and PM_POST_SUSPEND to make sure the
+Bluetooth controller is prepared correctly for suspend/resume. Implement
+the registration, scheduling and task handling portions only in this
+patch.
+
+	Signed-off-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 9952d90ea2885d7cbf80cd233f694f09a9c0eaec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bluetooth/hci_core.c
+diff --cc net/bluetooth/hci_core.c
+index 2d71e1f91ae8,39aa21a1fe92..000000000000
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@@ -30,6 -30,9 +30,12 @@@
+  #include <linux/rfkill.h>
+  #include <linux/debugfs.h>
+  #include <linux/crypto.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/property.h>
++ #include <linux/suspend.h>
++ #include <linux/wait.h>
+++>>>>>>> 9952d90ea288 (Bluetooth: Handle PM_SUSPEND_PREPARE and PM_POST_SUSPEND)
+  #include <asm/unaligned.h>
+  
+  #include <net/bluetooth/bluetooth.h>
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index b46e3ee436f3..fad49d1c29e5 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -88,6 +88,20 @@ struct discovery_state {
+ 	unsigned long		scan_duration;
+ };
+ 
++#define SUSPEND_NOTIFIER_TIMEOUT	msecs_to_jiffies(2000) /* 2 seconds */
++
++enum suspend_tasks {
++	SUSPEND_POWERING_DOWN,
++
++	SUSPEND_PREPARE_NOTIFIER,
++	__SUSPEND_NUM_TASKS
++};
++
++enum suspended_state {
++	BT_RUNNING = 0,
++	BT_SUSPENDED,
++};
++
+ struct hci_conn_hash {
+ 	struct list_head list;
+ 	unsigned int     acl_num;
+@@ -359,6 +373,15 @@ struct hci_dev {
+ 	void			*smp_bredr_data;
+ 
+ 	struct discovery_state	discovery;
++
++	struct notifier_block	suspend_notifier;
++	struct work_struct	suspend_prepare;
++	enum suspended_state	suspend_state_next;
++	enum suspended_state	suspend_state;
++
++	wait_queue_head_t	suspend_wait_q;
++	DECLARE_BITMAP(suspend_tasks, __SUSPEND_NUM_TASKS);
++
+ 	struct hci_conn_hash	conn_hash;
+ 
+ 	struct list_head	mgmt_pending;
+* Unmerged path net/bluetooth/hci_core.c
+diff --git a/net/bluetooth/hci_request.c b/net/bluetooth/hci_request.c
+index ef1f5ba85455..70ca49c4cb85 100644
+--- a/net/bluetooth/hci_request.c
++++ b/net/bluetooth/hci_request.c
+@@ -820,6 +820,21 @@ void hci_req_add_le_passive_scan(struct hci_request *req)
+ 		    &enable_cp);
+ }
+ 
++/* Call with hci_dev_lock */
++void hci_req_prepare_suspend(struct hci_dev *hdev, enum suspended_state next)
++{
++	if (next == hdev->suspend_state) {
++		bt_dev_dbg(hdev, "Same state before and after: %d", next);
++		goto done;
++	}
++
++	hdev->suspend_state = next;
++
++done:
++	clear_bit(SUSPEND_PREPARE_NOTIFIER, hdev->suspend_tasks);
++	wake_up(&hdev->suspend_wait_q);
++}
++
+ static u8 get_cur_adv_instance_scan_rsp_len(struct hci_dev *hdev)
+ {
+ 	u8 instance = hdev->cur_adv_instance;
+diff --git a/net/bluetooth/hci_request.h b/net/bluetooth/hci_request.h
+index 702beb140d9f..d7757d298027 100644
+--- a/net/bluetooth/hci_request.h
++++ b/net/bluetooth/hci_request.h
+@@ -67,6 +67,8 @@ void __hci_req_update_eir(struct hci_request *req);
+ void hci_req_add_le_scan_disable(struct hci_request *req);
+ void hci_req_add_le_passive_scan(struct hci_request *req);
+ 
++void hci_req_prepare_suspend(struct hci_dev *hdev, enum suspended_state next);
++
+ void hci_req_reenable_advertising(struct hci_dev *hdev);
+ void __hci_req_enable_advertising(struct hci_request *req);
+ void __hci_req_disable_advertising(struct hci_request *req);
