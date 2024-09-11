@@ -1,0 +1,144 @@
+powerpc/kexec_file: Prepare elfcore header for crashing kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] ppc64/kexec_file: prepare elfcore header for crashing kernel (Diego Domingos) [1829715]
+Rebuild_FUZZ: 95.08%
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit cb350c1f1f867db16725f1bb06be033ece19e998
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cb350c1f.failed
+
+Prepare elf headers for the crashing kernel's core file using
+crash_prepare_elf64_headers() and pass on this info to kdump kernel by
+updating its command line with elfcorehdr parameter. Also, add
+elfcorehdr location to reserve map to avoid it from being stomped on
+while booting.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Tested-by: Pingfan Liu <piliu@redhat.com>
+	Reviewed-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+[mpe: Ensure cmdline is nul terminated]
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/159602298855.575379.15819225623219909517.stgit@hbathini
+(cherry picked from commit cb350c1f1f867db16725f1bb06be033ece19e998)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kexec.h
+#	arch/powerpc/kexec/elf_64.c
+#	arch/powerpc/kexec/file_load_64.c
+diff --cc arch/powerpc/include/asm/kexec.h
+index 4a585cba1787,55d6ede30c19..000000000000
+--- a/arch/powerpc/include/asm/kexec.h
++++ b/arch/powerpc/include/asm/kexec.h
+@@@ -101,11 -103,23 +101,26 @@@ extern const struct kexec_file_ops kexe
+  #define ARCH_HAS_KIMAGE_ARCH
+  
+  struct kimage_arch {
+++<<<<<<< HEAD
+++=======
++ 	struct crash_mem *exclude_ranges;
++ 
++ 	unsigned long backup_start;
++ 	void *backup_buf;
++ 
++ 	unsigned long elfcorehdr_addr;
++ 	unsigned long elf_headers_sz;
++ 	void *elf_headers;
++ 
++ #ifdef CONFIG_IMA_KEXEC
+++>>>>>>> cb350c1f1f86 (powerpc/kexec_file: Prepare elfcore header for crashing kernel)
+  	phys_addr_t ima_buffer_addr;
+  	size_t ima_buffer_size;
+ -#endif
+  };
+ +#endif
+  
++ char *setup_kdump_cmdline(struct kimage *image, char *cmdline,
++ 			  unsigned long cmdline_len);
+  int setup_purgatory(struct kimage *image, const void *slave_code,
+  		    const void *fdt, unsigned long kernel_load_addr,
+  		    unsigned long fdt_load_addr);
+* Unmerged path arch/powerpc/kexec/elf_64.c
+* Unmerged path arch/powerpc/kexec/file_load_64.c
+* Unmerged path arch/powerpc/include/asm/kexec.h
+diff --git a/arch/powerpc/kernel/machine_kexec_file_64.c b/arch/powerpc/kernel/machine_kexec_file_64.c
+index 5357b09902c5..be6b3249a894 100644
+--- a/arch/powerpc/kernel/machine_kexec_file_64.c
++++ b/arch/powerpc/kernel/machine_kexec_file_64.c
+@@ -26,6 +26,7 @@
+ #include <linux/kexec.h>
+ #include <linux/of_fdt.h>
+ #include <linux/libfdt.h>
++#include <asm/setup.h>
+ #include <asm/ima.h>
+ 
+ #define SLAVE_CODE_SIZE		256
+@@ -45,6 +46,42 @@ int arch_kexec_kernel_image_probe(struct kimage *image, void *buf,
+ 	return kexec_image_probe_default(image, buf, buf_len);
+ }
+ 
++/**
++ * setup_kdump_cmdline - Prepend "elfcorehdr=<addr> " to command line
++ *                       of kdump kernel for exporting the core.
++ * @image:               Kexec image
++ * @cmdline:             Command line parameters to update.
++ * @cmdline_len:         Length of the cmdline parameters.
++ *
++ * kdump segment must be setup before calling this function.
++ *
++ * Returns new cmdline buffer for kdump kernel on success, NULL otherwise.
++ */
++char *setup_kdump_cmdline(struct kimage *image, char *cmdline,
++			  unsigned long cmdline_len)
++{
++	int elfcorehdr_strlen;
++	char *cmdline_ptr;
++
++	cmdline_ptr = kzalloc(COMMAND_LINE_SIZE, GFP_KERNEL);
++	if (!cmdline_ptr)
++		return NULL;
++
++	elfcorehdr_strlen = sprintf(cmdline_ptr, "elfcorehdr=0x%lx ",
++				    image->arch.elfcorehdr_addr);
++
++	if (elfcorehdr_strlen + cmdline_len > COMMAND_LINE_SIZE) {
++		pr_err("Appending elfcorehdr=<addr> exceeds cmdline size\n");
++		kfree(cmdline_ptr);
++		return NULL;
++	}
++
++	memcpy(cmdline_ptr + elfcorehdr_strlen, cmdline, cmdline_len);
++	// Ensure it's nul terminated
++	cmdline_ptr[COMMAND_LINE_SIZE - 1] = '\0';
++	return cmdline_ptr;
++}
++
+ /**
+  * setup_purgatory - initialize the purgatory's global variables
+  * @image:		kexec image.
+@@ -250,6 +287,20 @@ int setup_new_fdt(const struct kimage *image, void *fdt,
+ 		}
+ 	}
+ 
++	if (image->type == KEXEC_TYPE_CRASH) {
++		/*
++		 * Avoid elfcorehdr from being stomped on in kdump kernel by
++		 * setting up memory reserve map.
++		 */
++		ret = fdt_add_mem_rsv(fdt, image->arch.elfcorehdr_addr,
++				      image->arch.elf_headers_sz);
++		if (ret) {
++			pr_err("Error reserving elfcorehdr memory: %s\n",
++			       fdt_strerror(ret));
++			goto err;
++		}
++	}
++
+ 	ret = setup_ima_buffer(image, fdt, chosen_node);
+ 	if (ret) {
+ 		pr_err("Error setting up the new device tree.\n");
+* Unmerged path arch/powerpc/kexec/elf_64.c
+* Unmerged path arch/powerpc/kexec/file_load_64.c
