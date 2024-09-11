@@ -1,0 +1,415 @@
+sched: Replace rq::wake_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit a148866489fbe243c936fe43e4525d8dbfa0318f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/a1488664.failed
+
+The recent commit: 90b5363acd47 ("sched: Clean up scheduler_ipi()")
+got smp_call_function_single_async() subtly wrong. Even though it will
+return -EBUSY when trying to re-use a csd, that condition is not
+atomic and still requires external serialization.
+
+The change in ttwu_queue_remote() got this wrong.
+
+While on first reading ttwu_queue_remote() has an atomic test-and-set
+that appears to serialize the use, the matching 'release' is not in
+the right place to actually guarantee this serialization.
+
+The actual race is vs the sched_ttwu_pending() call in the idle loop;
+that can run the wakeup-list without consuming the CSD.
+
+Instead of trying to chain the lists, merge them.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200526161908.129371594@infradead.org
+(cherry picked from commit a148866489fbe243c936fe43e4525d8dbfa0318f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/smp.h
+#	kernel/sched/core.c
+#	kernel/sched/idle.c
+#	kernel/sched/sched.h
+#	kernel/smp.c
+diff --cc include/linux/smp.h
+index f30fcf12cc27,84f90e24ed6f..000000000000
+--- a/include/linux/smp.h
++++ b/include/linux/smp.h
+@@@ -16,11 -16,27 +16,30 @@@
+  
+  typedef void (*smp_call_func_t)(void *info);
+  typedef bool (*smp_cond_func_t)(int cpu, void *info);
+++<<<<<<< HEAD
+++=======
++ 
++ enum {
++ 	CSD_FLAG_LOCK		= 0x01,
++ 
++ 	/* IRQ_WORK_flags */
++ 
++ 	CSD_TYPE_ASYNC		= 0x00,
++ 	CSD_TYPE_SYNC		= 0x10,
++ 	CSD_TYPE_IRQ_WORK	= 0x20,
++ 	CSD_TYPE_TTWU		= 0x30,
++ 	CSD_FLAG_TYPE_MASK	= 0xF0,
++ };
++ 
++ /*
++  * structure shares (partial) layout with struct irq_work
++  */
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  struct __call_single_data {
+  	struct llist_node llist;
+ -	unsigned int flags;
+  	smp_call_func_t func;
+  	void *info;
+ +	unsigned int flags;
+  };
+  
+  /* Use __aligned() to avoid to use 2 cache lines for 1 csd */
+diff --cc kernel/sched/core.c
+index 631f3e8030ae,b3c64c6b4d2e..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -2365,10 -2272,10 +2365,14 @@@ static int ttwu_runnable(struct task_st
+  }
+  
+  #ifdef CONFIG_SMP
+- void sched_ttwu_pending(void)
++ void sched_ttwu_pending(void *arg)
+  {
++ 	struct llist_node *llist = arg;
+  	struct rq *rq = this_rq();
+++<<<<<<< HEAD
+ +	struct llist_node *llist = llist_del_all(&rq->wake_list);
+++=======
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  	struct task_struct *p, *t;
+  	struct rq_flags rf;
+  
+@@@ -2391,19 -2298,14 +2395,23 @@@
+  	rq_unlock_irqrestore(rq, &rf);
+  }
+  
+ -void send_call_function_single_ipi(int cpu)
+++<<<<<<< HEAD
+ +static void wake_csd_func(void *info)
+  {
+ -	struct rq *rq = cpu_rq(cpu);
+ +	sched_ttwu_pending();
+ +}
+  
+ -	if (!set_nr_if_polling(rq->idle))
+ -		arch_send_call_function_single_ipi(cpu);
+ -	else
+ -		trace_sched_wake_idle_without_ipi(cpu);
+ +void scheduler_ipi(void)
+++=======
+++void send_call_function_single_ipi(int cpu)
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+ +{
+ +	/*
+ +	 * Fold TIF_NEED_RESCHED into the preempt_count; anybody setting
+ +	 * TIF_NEED_RESCHED remotely (for the first time) will also send
+ +	 * this IPI.
+ +	 */
+ +	preempt_fold_need_resched();
+  }
+  
+  /*
+@@@ -2418,12 -2320,8 +2426,17 @@@ static void __ttwu_queue_wakelist(struc
+  
+  	p->sched_remote_wakeup = !!(wake_flags & WF_MIGRATED);
+  
+++<<<<<<< HEAD
+ +	if (llist_add(&p->wake_entry, &rq->wake_list)) {
+ +		if (!set_nr_if_polling(rq->idle))
+ +			smp_call_function_single_async(cpu, &rq->wake_csd);
+ +		else
+ +			trace_sched_wake_idle_without_ipi(cpu);
+ +	}
+++=======
++ 	WRITE_ONCE(rq->ttwu_pending, 1);
++ 	__smp_call_single_queue(cpu, &p->wake_entry);
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  }
+  
+  void wake_up_if_idle(int cpu)
+@@@ -2967,7 -2762,7 +2980,11 @@@ static void __sched_fork(unsigned long 
+  #endif
+  	init_numa_balancing(clone_flags, p);
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +	p->migration_pending = NULL;
+++=======
++ 	p->wake_entry_type = CSD_TYPE_TTWU;
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  #endif
+  }
+  
+@@@ -7275,12 -6752,8 +7291,10 @@@ void __init sched_init(void
+  		rq->online = 0;
+  		rq->idle_stamp = 0;
+  		rq->avg_idle = 2*sysctl_sched_migration_cost;
+ +		rq->wake_stamp = jiffies;
+ +		rq->wake_avg_idle = rq->avg_idle;
+  		rq->max_idle_balance_cost = sysctl_sched_migration_cost;
+  
+- 		rq_csd_init(rq, &rq->wake_csd, wake_csd_func);
+- 
+  		INIT_LIST_HEAD(&rq->cfs_tasks);
+  
+  		rq_attach_root(rq, &def_root_domain);
+diff --cc kernel/sched/idle.c
+index 7203381da5c0,05deb81bb3e3..000000000000
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@@ -295,7 -289,11 +295,15 @@@ static void do_idle(void
+  	 */
+  	smp_mb__after_atomic();
+  
+++<<<<<<< HEAD
+ +	sched_ttwu_pending();
+++=======
++ 	/*
++ 	 * RCU relies on this call to be done outside of an RCU read-side
++ 	 * critical section.
++ 	 */
++ 	flush_smp_call_function_from_idle();
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  	schedule_idle();
+  
+  	if (unlikely(klp_patch_pending(current)))
+diff --cc kernel/sched/sched.h
+index 018da337e9e4,1d4e94c1e5fe..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1006,42 -1023,10 +1006,37 @@@ struct rq 
+  	unsigned int		ttwu_local;
+  #endif
+  
+- #ifdef CONFIG_SMP
+- 	call_single_data_t	wake_csd;
+- 	struct llist_head	wake_list;
+- #endif
+- 
+  #ifdef CONFIG_CPU_IDLE
+ -	/* Must be inspected within a rcu lock section */
+ +	/*
+ +	 * Must be inspected within a rcu lock section.
+ +	 * RH_KABI: In future versions of RHEL wrap
+ +	 * idle_state with RH_KABI_EXCLUDE prior to GA.
+ +	 */
+  	struct cpuidle_state	*idle_state;
+  #endif
+ +
+ +#if defined(CONFIG_SCHED_HRTICK) && defined(CONFIG_SMP)
+ +	RH_KABI_USE(1, ktime_t hrtick_time)
+ +#else
+ +	RH_KABI_RESERVE(1)
+ +#endif
+ +	RH_KABI_USE_SPLIT(2, unsigned int push_busy,
+ +			     unsigned int nr_pinned)
+ +#ifdef CONFIG_NUMA_BALANCING
+ +	RH_KABI_EXTEND(unsigned int numa_migrate_on)
+ +#endif
+ +	RH_KABI_EXTEND(struct sched_avg	avg_rt)
+ +	RH_KABI_EXTEND(struct sched_avg	avg_dl)
+ +#ifdef CONFIG_HAVE_SCHED_AVG_IRQ
+ +	RH_KABI_EXTEND(struct sched_avg	avg_irq)
+ +#endif
+ +	RH_KABI_EXTEND(unsigned long misfit_task_load)
+ +
+ +	/* Ensure that all clocks are in the same cache line */
+ +	RH_KABI_EXTEND(u64 clock_task ____cacheline_aligned)
+ +	RH_KABI_EXTEND(u64 clock_pelt)
+ +	RH_KABI_EXTEND(unsigned long lost_idle_time)
+ +	RH_KABI_EXTEND(struct cpu_stop_work push_work)
+  };
+  
+  #ifdef CONFIG_FAIR_GROUP_SCHED
+@@@ -1575,11 -1501,11 +1568,17 @@@ static inline void unregister_sched_dom
+  }
+  #endif
+  
+ -extern void flush_smp_call_function_from_idle(void);
+ +#else
+ +
+++<<<<<<< HEAD
+ +static inline void sched_ttwu_pending(void) { }
+  
+ +#endif /* CONFIG_SMP */
+++=======
++ #else /* !CONFIG_SMP: */
++ static inline void flush_smp_call_function_from_idle(void) { }
++ #endif
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  
+  #include "stats.h"
+  #include "autogroup.h"
+diff --cc kernel/smp.c
+index db3e44b3aed3,0d61dc060b01..000000000000
+--- a/kernel/smp.c
++++ b/kernel/smp.c
+@@@ -191,15 -194,10 +191,20 @@@ static int generic_exec_single(int cpu
+  void generic_smp_call_function_single_interrupt(void)
+  {
+  	flush_smp_call_function_queue(true);
+ -}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Handle irq works queued remotely by irq_work_queue_on().
+ +	 * Smp functions above are typically synchronous so they
+ +	 * better run first since some other CPUs may be busy waiting
+ +	 * for them.
+ +	 */
+ +	irq_work_run();
+ +}
+++=======
++ extern void sched_ttwu_pending(void *);
++ extern void irq_work_single(void *);
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  
+  /**
+   * flush_smp_call_function_queue - Flush pending smp-call-function callbacks
+@@@ -238,9 -236,25 +243,31 @@@ static void flush_smp_call_function_que
+  		 * We don't have to use the _safe() variant here
+  		 * because we are not invoking the IPI handlers yet.
+  		 */
+++<<<<<<< HEAD
+ +		llist_for_each_entry(csd, entry, llist)
+ +			pr_warn("IPI callback %pS sent to offline CPU\n",
+ +				csd->func);
+++=======
++ 		llist_for_each_entry(csd, entry, llist) {
++ 			switch (CSD_TYPE(csd)) {
++ 			case CSD_TYPE_ASYNC:
++ 			case CSD_TYPE_SYNC:
++ 			case CSD_TYPE_IRQ_WORK:
++ 				pr_warn("IPI callback %pS sent to offline CPU\n",
++ 					csd->func);
++ 				break;
++ 
++ 			case CSD_TYPE_TTWU:
++ 				pr_warn("IPI task-wakeup sent to offline CPU\n");
++ 				break;
++ 
++ 			default:
++ 				pr_warn("IPI callback, unknown type %d, sent to offline CPU\n",
++ 					CSD_TYPE(csd));
++ 				break;
++ 			}
++ 		}
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  	}
+  
+  	/*
+@@@ -268,15 -286,51 +298,45 @@@
+  	/*
+  	 * Second; run all !SYNC callbacks.
+  	 */
++ 	prev = NULL;
+  	llist_for_each_entry_safe(csd, csd_next, entry, llist) {
+ -		int type = CSD_TYPE(csd);
+ +		smp_call_func_t func = csd->func;
+ +		void *info = csd->info;
+  
+++<<<<<<< HEAD
+ +		csd_unlock(csd);
+ +		func(info);
+++=======
++ 		if (type != CSD_TYPE_TTWU) {
++ 			if (prev) {
++ 				prev->next = &csd_next->llist;
++ 			} else {
++ 				entry = &csd_next->llist;
++ 			}
++ 
++ 			if (type == CSD_TYPE_ASYNC) {
++ 				smp_call_func_t func = csd->func;
++ 				void *info = csd->info;
++ 
++ 				csd_unlock(csd);
++ 				func(info);
++ 			} else if (type == CSD_TYPE_IRQ_WORK) {
++ 				irq_work_single(csd);
++ 			}
++ 
++ 		} else {
++ 			prev = &csd->llist;
++ 		}
+++>>>>>>> a148866489fb (sched: Replace rq::wake_list)
+  	}
++ 
++ 	/*
++ 	 * Third; only CSD_TYPE_TTWU is left, issue those.
++ 	 */
++ 	if (entry)
++ 		sched_ttwu_pending(entry);
+  }
+  
+ -void flush_smp_call_function_from_idle(void)
+ -{
+ -	unsigned long flags;
+ -
+ -	if (llist_empty(this_cpu_ptr(&call_single_queue)))
+ -		return;
+ -
+ -	local_irq_save(flags);
+ -	flush_smp_call_function_queue(true);
+ -	local_irq_restore(flags);
+ -}
+ -
+  /*
+   * smp_call_function_single - Run a function on a specific CPU
+   * @func: The function to run. This must be fast and non-blocking.
+@@@ -602,8 -673,25 +662,15 @@@ void __init setup_nr_cpu_ids(void
+  void __init smp_init(void)
+  {
+  	int num_nodes, num_cpus;
+ -
+ -	/*
+ -	 * Ensure struct irq_work layout matches so that
+ -	 * flush_smp_call_function_queue() can do horrible things.
+ -	 */
+ -	BUILD_BUG_ON(offsetof(struct irq_work, llnode) !=
+ -		     offsetof(struct __call_single_data, llist));
+ -	BUILD_BUG_ON(offsetof(struct irq_work, func) !=
+ -		     offsetof(struct __call_single_data, func));
+ -	BUILD_BUG_ON(offsetof(struct irq_work, flags) !=
+ -		     offsetof(struct __call_single_data, flags));
+ +	unsigned int cpu;
+  
++ 	/*
++ 	 * Assert the CSD_TYPE_TTWU layout is similar enough
++ 	 * for task_struct to be on the @call_single_queue.
++ 	 */
++ 	BUILD_BUG_ON(offsetof(struct task_struct, wake_entry_type) - offsetof(struct task_struct, wake_entry) !=
++ 		     offsetof(struct __call_single_data, flags) - offsetof(struct __call_single_data, llist));
++ 
+  	idle_threads_init();
+  	cpuhp_threads_init();
+  
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index 6d61d76e88d8..85ce737db79b 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -737,6 +737,7 @@ struct task_struct {
+ 
+ #ifdef CONFIG_SMP
+ 	struct llist_node		wake_entry;
++	unsigned int			wake_entry_type;
+ 	int				on_cpu;
+ #ifdef CONFIG_THREAD_INFO_IN_TASK
+ 	/* Current CPU: */
+* Unmerged path include/linux/smp.h
+* Unmerged path kernel/sched/core.c
+* Unmerged path kernel/sched/idle.c
+* Unmerged path kernel/sched/sched.h
+* Unmerged path kernel/smp.c
