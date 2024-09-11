@@ -1,0 +1,157 @@
+KVM: move EXIT_FASTPATH_REENTER_GUEST to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit d89d04ab6030c73b24bbe032fb474e0fb74dd891
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/d89d04ab.failed
+
+Now that KVM is using static calls, calling vmx_vcpu_run and
+vmx_sync_pir_to_irr does not incur anymore the cost of a
+retpoline.
+
+Therefore there is no need anymore to handle EXIT_FASTPATH_REENTER_GUEST
+in vendor code.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d89d04ab6030c73b24bbe032fb474e0fb74dd891)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index cddc90666d5f,39f01a051868..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -1824,46 -1796,11 +1824,49 @@@ int kvm_emulate_wrmsr(struct kvm_vcpu *
+  }
+  EXPORT_SYMBOL_GPL(kvm_emulate_wrmsr);
+  
+++<<<<<<< HEAD
+ +int kvm_emulate_as_nop(struct kvm_vcpu *vcpu)
+ +{
+ +	return kvm_skip_emulated_instruction(vcpu);
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_emulate_as_nop);
+ +
+ +int kvm_emulate_invd(struct kvm_vcpu *vcpu)
+ +{
+ +	/* Treat an INVD instruction as a NOP and just skip it. */
+ +	return kvm_emulate_as_nop(vcpu);
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_emulate_invd);
+ +
+ +int kvm_emulate_mwait(struct kvm_vcpu *vcpu)
+ +{
+ +	pr_warn_once("kvm: MWAIT instruction emulated as NOP!\n");
+ +	return kvm_emulate_as_nop(vcpu);
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_emulate_mwait);
+ +
+ +int kvm_handle_invalid_op(struct kvm_vcpu *vcpu)
+ +{
+ +	kvm_queue_exception(vcpu, UD_VECTOR);
+ +	return 1;
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_handle_invalid_op);
+ +
+ +int kvm_emulate_monitor(struct kvm_vcpu *vcpu)
+ +{
+ +	pr_warn_once("kvm: MONITOR instruction emulated as NOP!\n");
+ +	return kvm_emulate_as_nop(vcpu);
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_emulate_monitor);
+ +
+ +bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu)
+++=======
++ static inline bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu)
+++>>>>>>> d89d04ab6030 (KVM: move EXIT_FASTPATH_REENTER_GUEST to common code)
+  {
+  	return vcpu->mode == EXITING_GUEST_MODE || kvm_request_pending(vcpu) ||
+ -		xfer_to_guest_mode_work_pending();
+ +		need_resched() || signal_pending(current);
+  }
+- EXPORT_SYMBOL_GPL(kvm_vcpu_exit_request);
+  
+  /*
+   * The fast path for frequent and performance sensitive wrmsr emulation,
+@@@ -9307,11 -9041,21 +9310,23 @@@ static int vcpu_enter_guest(struct kvm_
+  		set_debugreg(vcpu->arch.eff_db[3], 3);
+  		set_debugreg(vcpu->arch.dr6, 6);
+  		vcpu->arch.switch_db_regs &= ~KVM_DEBUGREG_RELOAD;
+ +	} else if (unlikely(hw_breakpoint_active())) {
+ +		set_debugreg(0, 7);
+  	}
+  
+- 	exit_fastpath = static_call(kvm_x86_run)(vcpu);
++ 	for (;;) {
++ 		exit_fastpath = static_call(kvm_x86_run)(vcpu);
++ 		if (likely(exit_fastpath != EXIT_FASTPATH_REENTER_GUEST))
++ 			break;
++ 
++                 if (unlikely(kvm_vcpu_exit_request(vcpu))) {
++ 			exit_fastpath = EXIT_FASTPATH_EXIT_HANDLED;
++ 			break;
++ 		}
++ 
++ 		if (vcpu->arch.apicv_active)
++ 			static_call(kvm_x86_sync_pir_to_irr)(vcpu);
++         }
+  
+  	/*
+  	 * Do this here before restoring debug registers on the host.  And
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 253740a29b0e..7bd75e378fd4 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -6690,11 +6690,9 @@ static noinstr void vmx_vcpu_enter_exit(struct kvm_vcpu *vcpu,
+ 
+ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ {
+-	fastpath_t exit_fastpath;
+ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
+ 	unsigned long cr3, cr4;
+ 
+-reenter_guest:
+ 	/* Record the guest's net vcpu time for enforced NMI injections. */
+ 	if (unlikely(!enable_vnmi &&
+ 		     vmx->loaded_vmcs->soft_vnmi_blocked))
+@@ -6857,22 +6855,7 @@ static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+ 	if (is_guest_mode(vcpu))
+ 		return EXIT_FASTPATH_NONE;
+ 
+-	exit_fastpath = vmx_exit_handlers_fastpath(vcpu);
+-	if (exit_fastpath == EXIT_FASTPATH_REENTER_GUEST) {
+-		if (!kvm_vcpu_exit_request(vcpu)) {
+-			/*
+-			 * FIXME: this goto should be a loop in vcpu_enter_guest,
+-			 * but it would incur the cost of a retpoline for now.
+-			 * Revisit once static calls are available.
+-			 */
+-			if (vcpu->arch.apicv_active)
+-				vmx_sync_pir_to_irr(vcpu);
+-			goto reenter_guest;
+-		}
+-		exit_fastpath = EXIT_FASTPATH_EXIT_HANDLED;
+-	}
+-
+-	return exit_fastpath;
++	return vmx_exit_handlers_fastpath(vcpu);
+ }
+ 
+ static void vmx_free_vcpu(struct kvm_vcpu *vcpu)
+* Unmerged path arch/x86/kvm/x86.c
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 29ad704e8a6c..dbffe34af583 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -451,7 +451,6 @@ void kvm_load_host_xsave_state(struct kvm_vcpu *vcpu);
+ 
+ int kvm_spec_ctrl_test_value(u64 value);
+ bool kvm_is_valid_cr4(struct kvm_vcpu *vcpu, unsigned long cr4);
+-bool kvm_vcpu_exit_request(struct kvm_vcpu *vcpu);
+ int kvm_handle_memory_failure(struct kvm_vcpu *vcpu, int r,
+ 			      struct x86_exception *e);
+ int kvm_handle_invpcid(struct kvm_vcpu *vcpu, unsigned long type, gva_t gva);
