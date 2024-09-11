@@ -1,0 +1,274 @@
+dax: Fix missed wakeup with PMD faults
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 23c84eb7837514e16d79ed6d849b13745e0ce688
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/23c84eb7.failed
+
+RocksDB can hang indefinitely when using a DAX file.  This is due to
+a bug in the XArray conversion when handling a PMD fault and finding a
+PTE entry.  We use the wrong index in the hash and end up waiting on
+the wrong waitqueue.
+
+There's actually no need to wait; if we find a PTE entry while looking
+for a PMD entry, we can return immediately as we know we should fall
+back to a PTE fault (which may not conflict with the lock held).
+
+We reuse the XA_RETRY_ENTRY to signal a conflicting entry was found.
+This value can never be found in an XArray while holding its lock, so
+it does not create an ambiguity.
+
+	Cc: <stable@vger.kernel.org>
+Link: http://lkml.kernel.org/r/CAPcyv4hwHpX-MkUEqxwdTj7wCCZCN4RV-L4jsnuwLGyL_UEG4A@mail.gmail.com
+Fixes: b15cd800682f ("dax: Convert page fault handlers to XArray")
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Reported-by: Robert Barror <robert.barror@intel.com>
+	Reported-by: Seema Pandit <seema.pandit@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 23c84eb7837514e16d79ed6d849b13745e0ce688)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index 7752d3866711,7a75031da644..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -225,9 -220,10 +236,16 @@@ static void *get_unlocked_entry(struct 
+  	ewait.wait.func = wake_exceptional_entry_func;
+  
+  	for (;;) {
+++<<<<<<< HEAD
+ +		entry = xas_load(xas);
+ +		if (!entry || xa_is_internal(entry) ||
+ +				WARN_ON_ONCE(!xa_is_value(entry)) ||
+++=======
++ 		entry = xas_find_conflict(xas);
++ 		if (dax_entry_order(entry) < order)
++ 			return XA_RETRY_ENTRY;
++ 		if (!entry || WARN_ON_ONCE(!xa_is_value(entry)) ||
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  				!dax_is_locked(entry))
+  			return entry;
+  
+@@@ -592,31 -468,31 +610,52 @@@ void dax_unlock_mapping_entry(struct pa
+   * Note: Unlike filemap_fault() we don't honor FAULT_FLAG_RETRY flags. For
+   * persistent memory the benefit is doubtful. We can add that later if we can
+   * show it helps.
+ - *
+ - * On error, this function does not return an ERR_PTR.  Instead it returns
+ - * a VM_FAULT code, encoded as an xarray internal entry.  The ERR_PTR values
+ - * overlap with xarray value entries.
+   */
+++<<<<<<< HEAD
+ +static void *grab_mapping_entry(struct address_space *mapping, pgoff_t index,
+ +		unsigned long size_flag)
+++=======
++ static void *grab_mapping_entry(struct xa_state *xas,
++ 		struct address_space *mapping, unsigned int order)
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  {
+ -	unsigned long index = xas->xa_index;
+ -	bool pmd_downgrade = false; /* splitting PMD entry into PTE entries? */
+ -	void *entry;
+ +	bool pmd_downgrade = false; /* splitting 2MiB entry into 4k entries? */
+ +	void *entry, **slot;
+  
+++<<<<<<< HEAD
+ +restart:
+ +	xa_lock_irq(&mapping->i_pages);
+ +	entry = get_unlocked_mapping_entry(mapping, index, &slot);
+ +
+ +	if (WARN_ON_ONCE(entry && !xa_is_value(entry))) {
+ +		entry = ERR_PTR(-EIO);
+ +		goto out_unlock;
+ +	}
+ +
+ +	if (entry) {
+ +		if (size_flag & DAX_PMD) {
+ +			if (dax_is_pte_entry(entry)) {
+ +				put_unlocked_mapping_entry(mapping, index,
+ +						entry);
+ +				entry = ERR_PTR(-EEXIST);
+ +				goto out_unlock;
+ +			}
+ +		} else { /* trying to grab a PTE entry */
+++=======
++ retry:
++ 	xas_lock_irq(xas);
++ 	entry = get_unlocked_entry(xas, order);
++ 
++ 	if (entry) {
++ 		if (dax_is_conflict(entry))
++ 			goto fallback;
++ 		if (!xa_is_value(entry)) {
++ 			xas_set_err(xas, EIO);
++ 			goto out_unlock;
++ 		}
++ 
++ 		if (order == 0) {
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  			if (dax_is_pmd_entry(entry) &&
+  			    (dax_is_zero_entry(entry) ||
+  			     dax_is_empty_entry(entry))) {
+@@@ -643,69 -513,49 +682,83 @@@
+  		 * downgraded are empty entries which don't need to be
+  		 * unmapped.
+  		 */
+ -		if (dax_is_zero_entry(entry)) {
+ -			xas_unlock_irq(xas);
+ -			unmap_mapping_pages(mapping,
+ -					xas->xa_index & ~PG_PMD_COLOUR,
+ -					PG_PMD_NR, false);
+ -			xas_reset(xas);
+ -			xas_lock_irq(xas);
+ +		if (pmd_downgrade && dax_is_zero_entry(entry))
+ +			unmap_mapping_pages(mapping, index & ~PG_PMD_COLOUR,
+ +							PG_PMD_NR, false);
+ +
+ +		err = radix_tree_preload(
+ +				mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM);
+ +		if (err) {
+ +			if (pmd_downgrade)
+ +				put_locked_mapping_entry(mapping, index);
+ +			return ERR_PTR(err);
+ +		}
+ +		xa_lock_irq(&mapping->i_pages);
+ +
+ +		if (!entry) {
+ +			/*
+ +			 * We needed to drop the i_pages lock while calling
+ +			 * radix_tree_preload() and we didn't have an entry to
+ +			 * lock.  See if another thread inserted an entry at
+ +			 * our index during this time.
+ +			 */
+ +			entry = __radix_tree_lookup(&mapping->i_pages, index,
+ +					NULL, &slot);
+ +			if (entry) {
+ +				radix_tree_preload_end();
+ +				xa_unlock_irq(&mapping->i_pages);
+ +				goto restart;
+ +			}
+  		}
+  
+ -		dax_disassociate_entry(entry, mapping, false);
+ -		xas_store(xas, NULL);	/* undo the PMD join */
+ -		dax_wake_entry(xas, entry, true);
+ -		mapping->nrexceptional--;
+ -		entry = NULL;
+ -		xas_set(xas, index);
+ -	}
+ +		if (pmd_downgrade) {
+ +			dax_disassociate_entry(entry, mapping, false);
+ +			radix_tree_delete(&mapping->i_pages, index);
+ +			mapping->nrexceptional--;
+ +			dax_wake_mapping_entry_waiter(&mapping->i_pages,
+ +					index, entry, true);
+ +		}
+  
+++<<<<<<< HEAD
+ +		entry = dax_make_locked(0, size_flag | DAX_EMPTY);
+ +
+ +		err = __radix_tree_insert(&mapping->i_pages, index,
+ +				dax_entry_order(entry), entry);
+ +		radix_tree_preload_end();
+ +		if (err) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			/*
+ +			 * Our insertion of a DAX entry failed, most likely
+ +			 * because we were inserting a PMD entry and it
+ +			 * collided with a PTE sized entry at a different
+ +			 * index in the PMD range.  We haven't inserted
+ +			 * anything into the radix tree and have no waiters to
+ +			 * wake.
+ +			 */
+ +			return ERR_PTR(err);
+ +		}
+ +		/* Good, we have inserted empty locked entry into the tree. */
+++=======
++ 	if (entry) {
++ 		dax_lock_entry(xas, entry);
++ 	} else {
++ 		unsigned long flags = DAX_EMPTY;
++ 
++ 		if (order > 0)
++ 			flags |= DAX_PMD;
++ 		entry = dax_make_entry(pfn_to_pfn_t(0), flags);
++ 		dax_lock_entry(xas, entry);
++ 		if (xas_error(xas))
++ 			goto out_unlock;
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  		mapping->nrexceptional++;
+ +		xa_unlock_irq(&mapping->i_pages);
+ +		return entry;
+  	}
+ -
+ -out_unlock:
+ -	xas_unlock_irq(xas);
+ -	if (xas_nomem(xas, mapping_gfp_mask(mapping) & ~__GFP_HIGHMEM))
+ -		goto retry;
+ -	if (xas->xa_node == XA_ERROR(-ENOMEM))
+ -		return xa_mk_internal(VM_FAULT_OOM);
+ -	if (xas_error(xas))
+ -		return xa_mk_internal(VM_FAULT_SIGBUS);
+ +	entry = lock_slot(mapping, slot);
+ + out_unlock:
+ +	xa_unlock_irq(&mapping->i_pages);
+  	return entry;
+ -fallback:
+ -	xas_unlock_irq(xas);
+ -	return xa_mk_internal(VM_FAULT_FALLBACK);
+  }
+  
+  /**
+@@@ -1671,14 -1519,16 +1724,20 @@@ static vm_fault_t dax_iomap_pmd_fault(s
+  		goto fallback;
+  
+  	/*
+ -	 * grab_mapping_entry() will make sure we get an empty PMD entry,
+ -	 * a zero PMD entry or a DAX PMD.  If it can't (because a PTE
+ -	 * entry is already in the array, for instance), it will return
+ -	 * VM_FAULT_FALLBACK.
+ +	 * grab_mapping_entry() will make sure we get a 2MiB empty entry, a
+ +	 * 2MiB zero page entry or a DAX PMD.  If it can't (because a 4k page
+ +	 * is already in the tree, for instance), it will return -EEXIST and
+ +	 * we just fall back to 4k entries.
+  	 */
+++<<<<<<< HEAD
+ +	entry = grab_mapping_entry(mapping, pgoff, DAX_PMD);
+ +	if (IS_ERR(entry))
+++=======
++ 	entry = grab_mapping_entry(&xas, mapping, PMD_ORDER);
++ 	if (xa_is_internal(entry)) {
++ 		result = xa_to_internal(entry);
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  		goto fallback;
+ -	}
+  
+  	/*
+  	 * It is possible, particularly with mixed reads & writes to private
+@@@ -1824,12 -1673,10 +1883,17 @@@ dax_insert_pfn_mkwrite(struct vm_fault 
+  	vm_fault_t ret;
+  
+  	xas_lock_irq(&xas);
+- 	entry = get_unlocked_entry(&xas);
++ 	entry = get_unlocked_entry(&xas, order);
+  	/* Did we race with someone splitting entry or so? */
+++<<<<<<< HEAD
+ +	if (!entry ||
+ +	    (order == 0 && !dax_is_pte_entry(entry)) ||
+ +	    (order == PMD_ORDER && (xa_is_internal(entry) ||
+ +				    !dax_is_pmd_entry(entry)))) {
+++=======
++ 	if (!entry || dax_is_conflict(entry) ||
++ 	    (order == 0 && !dax_is_pte_entry(entry))) {
+++>>>>>>> 23c84eb78375 (dax: Fix missed wakeup with PMD faults)
+  		put_unlocked_entry(&xas, entry);
+  		xas_unlock_irq(&xas);
+  		trace_dax_insert_pfn_mkwrite_no_entry(mapping->host, vmf,
+* Unmerged path fs/dax.c
