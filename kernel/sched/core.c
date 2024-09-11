@@ -3087,6 +3087,7 @@ static void sched_tick_remote(struct work_struct *work)
 	if (is_idle_task(curr))
 		goto out_unlock;
 
+	curr = rq->curr;
 	update_rq_clock(rq);
 	delta = rq_clock_task(rq) - curr->se.exec_start;
 
@@ -3097,10 +3098,11 @@ static void sched_tick_remote(struct work_struct *work)
 	WARN_ON_ONCE(delta > (u64)NSEC_PER_SEC * 3);
 	curr->sched_class->task_tick(rq, curr, 0);
 
+	calc_load_nohz_remote(rq);
 out_unlock:
 	rq_unlock_irq(rq, &rf);
-
 out_requeue:
+
 	/*
 	 * Run the remote tick once per second (1Hz). This arbitrary
 	 * frequency is large enough to avoid overload but short enough
