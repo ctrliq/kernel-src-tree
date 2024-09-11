@@ -1,0 +1,351 @@
+mm: introduce compound_nr()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit d8c6546b1aea843fbeb4d54a1202f1adda6504be
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d8c6546b.failed
+
+Replace 1 << compound_order(page) with compound_nr(page).  Minor
+improvements in readability.
+
+Link: http://lkml.kernel.org/r/20190721104612.19120-4-willy@infradead.org
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Ira Weiny <ira.weiny@intel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d8c6546b1aea843fbeb4d54a1202f1adda6504be)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/kasan.c
+#	mm/swap_state.c
+diff --cc mm/kasan/kasan.c
+index c7365a12b42a,6814d6d6a023..000000000000
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@@ -396,8 -334,11 +396,16 @@@ size_t kasan_metadata_size(struct kmem_
+  
+  void kasan_poison_slab(struct page *page)
+  {
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +	kasan_poison_shadow(page_address(page),
+ +			PAGE_SIZE << compound_order(page),
+++=======
++ 	unsigned long i;
++ 
++ 	for (i = 0; i < compound_nr(page); i++)
++ 		page_kasan_tag_reset(page + i);
++ 	kasan_poison_shadow(page_address(page), page_size(page),
+++>>>>>>> d8c6546b1aea (mm: introduce compound_nr()):mm/kasan/common.c
+  			KASAN_KMALLOC_REDZONE);
+  }
+  
+diff --cc mm/swap_state.c
+index a2c7d535ec74,f844af5f09ba..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -107,14 -108,15 +107,19 @@@ void show_swap_cache_info(void
+  }
+  
+  /*
+ - * add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+ + * __add_to_swap_cache resembles add_to_page_cache_locked on swapper_space,
+   * but sets SwapCache flag and private instead of mapping and index.
+   */
+ -int add_to_swap_cache(struct page *page, swp_entry_t entry, gfp_t gfp)
+ +int __add_to_swap_cache(struct page *page, swp_entry_t entry)
+  {
+ -	struct address_space *address_space = swap_address_space(entry);
+ +	int error, i, nr = hpage_nr_pages(page);
+ +	struct address_space *address_space;
+  	pgoff_t idx = swp_offset(entry);
+++<<<<<<< HEAD
+++=======
++ 	XA_STATE_ORDER(xas, &address_space->i_pages, idx, compound_order(page));
++ 	unsigned long i, nr = compound_nr(page);
+++>>>>>>> d8c6546b1aea (mm: introduce compound_nr())
+  
+  	VM_BUG_ON_PAGE(!PageLocked(page), page);
+  	VM_BUG_ON_PAGE(PageSwapCache(page), page);
+diff --git a/arch/arm/mm/flush.c b/arch/arm/mm/flush.c
+index 58469623b015..09ea8fa6216e 100644
+--- a/arch/arm/mm/flush.c
++++ b/arch/arm/mm/flush.c
+@@ -212,13 +212,13 @@ void __flush_dcache_page(struct address_space *mapping, struct page *page)
+ 	} else {
+ 		unsigned long i;
+ 		if (cache_is_vipt_nonaliasing()) {
+-			for (i = 0; i < (1 << compound_order(page)); i++) {
++			for (i = 0; i < compound_nr(page); i++) {
+ 				void *addr = kmap_atomic(page + i);
+ 				__cpuc_flush_dcache_area(addr, PAGE_SIZE);
+ 				kunmap_atomic(addr);
+ 			}
+ 		} else {
+-			for (i = 0; i < (1 << compound_order(page)); i++) {
++			for (i = 0; i < compound_nr(page); i++) {
+ 				void *addr = kmap_high_get(page + i);
+ 				if (addr) {
+ 					__cpuc_flush_dcache_area(addr, PAGE_SIZE);
+diff --git a/arch/powerpc/mm/hugetlbpage.c b/arch/powerpc/mm/hugetlbpage.c
+index 2ee76f7b28cf..c08cf3e41cc6 100644
+--- a/arch/powerpc/mm/hugetlbpage.c
++++ b/arch/powerpc/mm/hugetlbpage.c
+@@ -745,7 +745,7 @@ void flush_dcache_icache_hugepage(struct page *page)
+ 
+ 	BUG_ON(!PageCompound(page));
+ 
+-	for (i = 0; i < (1UL << compound_order(page)); i++) {
++	for (i = 0; i < compound_nr(page); i++) {
+ 		if (!PageHighMem(page)) {
+ 			__flush_dcache_icache(page_address(page+i));
+ 		} else {
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index ee0c6b420a36..a4bf085eaef7 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -457,7 +457,7 @@ struct mem_size_stats {
+ static void smaps_account(struct mem_size_stats *mss, struct page *page,
+ 		bool compound, bool young, bool dirty)
+ {
+-	int i, nr = compound ? 1 << compound_order(page) : 1;
++	int i, nr = compound ? compound_nr(page) : 1;
+ 	unsigned long size = nr * PAGE_SIZE;
+ 
+ 	if (PageAnon(page)) {
+diff --git a/include/linux/mm.h b/include/linux/mm.h
+index c0a5ccbd3b5a..81868da7cc32 100644
+--- a/include/linux/mm.h
++++ b/include/linux/mm.h
+@@ -712,6 +712,12 @@ static inline void set_compound_order(struct page *page, unsigned int order)
+ 	page[1].compound_order = order;
+ }
+ 
++/* Returns the number of pages in this potentially compound page. */
++static inline unsigned long compound_nr(struct page *page)
++{
++	return 1UL << compound_order(page);
++}
++
+ /* Returns the number of bytes in this potentially compound page. */
+ static inline unsigned long page_size(struct page *page)
+ {
+diff --git a/mm/compaction.c b/mm/compaction.c
+index b6967117f62a..7385ae579076 100644
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@ -864,7 +864,7 @@ isolate_migratepages_block(struct compact_control *cc, unsigned long low_pfn,
+ 			 * is safe to read and it's 0 for tail pages.
+ 			 */
+ 			if (unlikely(PageCompound(page))) {
+-				low_pfn += (1UL << compound_order(page)) - 1;
++				low_pfn += compound_nr(page) - 1;
+ 				goto isolate_fail;
+ 			}
+ 		}
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 4725c9d5c659..5bcf4af788b6 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -126,7 +126,7 @@ static void page_cache_delete(struct address_space *mapping,
+ 	/* hugetlb pages are represented by a single entry in the xarray */
+ 	if (!PageHuge(page)) {
+ 		xas_set_order(&xas, page->index, compound_order(page));
+-		nr = 1U << compound_order(page);
++		nr = compound_nr(page);
+ 	}
+ 
+ 	VM_BUG_ON_PAGE(!PageLocked(page), page);
+diff --git a/mm/gup.c b/mm/gup.c
+index 29961ddc4873..ca5b4c5efd15 100644
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@ -1338,7 +1338,7 @@ static long check_and_migrate_cma_pages(struct task_struct *tsk,
+ 		 * gup may start from a tail page. Advance step by the left
+ 		 * part.
+ 		 */
+-		step = (1 << compound_order(head)) - (pages[i] - head);
++		step = compound_nr(head) - (pages[i] - head);
+ 		/*
+ 		 * If we get a page from the CMA zone, since we are going to
+ 		 * be pinning these entries, we might as well move them out
+diff --git a/mm/hugetlb_cgroup.c b/mm/hugetlb_cgroup.c
+index b11d4a08aa85..d5856648ee20 100644
+--- a/mm/hugetlb_cgroup.c
++++ b/mm/hugetlb_cgroup.c
+@@ -161,7 +161,7 @@ static void hugetlb_cgroup_move_parent(int idx, struct hugetlb_cgroup *h_cg,
+ 	if (!page_hcg || page_hcg != h_cg)
+ 		goto out;
+ 
+-	nr_pages = 1 << compound_order(page);
++	nr_pages = compound_nr(page);
+ 	if (!parent) {
+ 		parent = root_h_cgroup;
+ 		/* root has no limit */
+* Unmerged path mm/kasan/kasan.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index 48fa67e8a272..1ea72dd1914e 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -6330,7 +6330,7 @@ static void uncharge_page(struct page *page, struct uncharge_gather *ug)
+ 		unsigned int nr_pages = 1;
+ 
+ 		if (PageTransHuge(page)) {
+-			nr_pages <<= compound_order(page);
++			nr_pages = compound_nr(page);
+ 			ug->nr_huge += nr_pages;
+ 		}
+ 		if (PageAnon(page))
+@@ -6342,7 +6342,7 @@ static void uncharge_page(struct page *page, struct uncharge_gather *ug)
+ 		}
+ 		ug->pgpgout++;
+ 	} else {
+-		ug->nr_kmem += 1 << compound_order(page);
++		ug->nr_kmem += compound_nr(page);
+ 		__ClearPageKmemcg(page);
+ 	}
+ 
+diff --git a/mm/memory_hotplug.c b/mm/memory_hotplug.c
+index 5686bb25e6f0..d8100c74eeac 100644
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@ -1271,7 +1271,7 @@ static unsigned long scan_movable_pages(unsigned long start, unsigned long end)
+ 		head = compound_head(page);
+ 		if (page_huge_active(head))
+ 			return pfn;
+-		skip = (1 << compound_order(head)) - (page - head);
++		skip = compound_nr(head) - (page - head);
+ 		pfn += skip - 1;
+ 	}
+ 	return 0;
+@@ -1309,7 +1309,7 @@ do_migrate_range(unsigned long start_pfn, unsigned long end_pfn)
+ 
+ 		if (PageHuge(page)) {
+ 			struct page *head = compound_head(page);
+-			pfn = page_to_pfn(head) + (1<<compound_order(head)) - 1;
++			pfn = page_to_pfn(head) + compound_nr(head) - 1;
+ 			isolate_huge_page(head, &source);
+ 			continue;
+ 		} else if (PageTransHuge(page))
+diff --git a/mm/migrate.c b/mm/migrate.c
+index 218f5aecadb6..6fc2863f61ca 100644
+--- a/mm/migrate.c
++++ b/mm/migrate.c
+@@ -1895,7 +1895,7 @@ static int numamigrate_isolate_page(pg_data_t *pgdat, struct page *page)
+ 	VM_BUG_ON_PAGE(compound_order(page) && !PageTransHuge(page), page);
+ 
+ 	/* Avoid migrating to a node that is nearly full */
+-	if (!migrate_balanced_pgdat(pgdat, 1UL << compound_order(page)))
++	if (!migrate_balanced_pgdat(pgdat, compound_nr(page)))
+ 		return 0;
+ 
+ 	if (isolate_lru_page(page))
+diff --git a/mm/page_alloc.c b/mm/page_alloc.c
+index c12002ea3102..bf18fd1a4bff 100644
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@ -7893,7 +7893,7 @@ bool has_unmovable_pages(struct zone *zone, struct page *page, int count,
+ 			if (!hugepage_migration_supported(page_hstate(head)))
+ 				goto unmovable;
+ 
+-			skip_pages = (1 << compound_order(head)) - (page - head);
++			skip_pages = compound_nr(head) - (page - head);
+ 			iter += skip_pages - 1;
+ 			continue;
+ 		}
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 4ca7a0db9645..044a894d91bd 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -1522,8 +1522,7 @@ static bool try_to_unmap_one(struct page *page, struct vm_area_struct *vma,
+ 		if (PageHWPoison(page) && !(flags & TTU_IGNORE_HWPOISON)) {
+ 			pteval = swp_entry_to_pte(make_hwpoison_entry(subpage));
+ 			if (PageHuge(page)) {
+-				int nr = 1 << compound_order(page);
+-				hugetlb_count_sub(nr, mm);
++				hugetlb_count_sub(compound_nr(page), mm);
+ 				set_huge_swap_pte_at(mm, address,
+ 						     pvmw.pte, pteval,
+ 						     vma_mmu_pagesize(vma));
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 5e4f4ddaea2c..e76082055831 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -607,7 +607,7 @@ static int shmem_add_to_page_cache(struct page *page,
+ {
+ 	XA_STATE_ORDER(xas, &mapping->i_pages, index, compound_order(page));
+ 	unsigned long i = 0;
+-	unsigned long nr = 1UL << compound_order(page);
++	unsigned long nr = compound_nr(page);
+ 
+ 	VM_BUG_ON_PAGE(PageTail(page), page);
+ 	VM_BUG_ON_PAGE(index != round_down(index, nr), page);
+@@ -1888,7 +1888,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 	lru_cache_add_anon(page);
+ 
+ 	spin_lock_irq(&info->lock);
+-	info->alloced += 1 << compound_order(page);
++	info->alloced += compound_nr(page);
+ 	inode->i_blocks += BLOCKS_PER_PAGE << compound_order(page);
+ 	shmem_recalc_inode(inode);
+ 	spin_unlock_irq(&info->lock);
+@@ -1929,7 +1929,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 		struct page *head = compound_head(page);
+ 		int i;
+ 
+-		for (i = 0; i < (1 << compound_order(head)); i++) {
++		for (i = 0; i < compound_nr(head); i++) {
+ 			clear_highpage(head + i);
+ 			flush_dcache_page(head + i);
+ 		}
+@@ -1956,7 +1956,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ 	 * Error recovery.
+ 	 */
+ unacct:
+-	shmem_inode_unacct_blocks(inode, 1 << compound_order(page));
++	shmem_inode_unacct_blocks(inode, compound_nr(page));
+ 
+ 	if (PageTransHuge(page)) {
+ 		unlock_page(page);
+* Unmerged path mm/swap_state.c
+diff --git a/mm/util.c b/mm/util.c
+index e99de9d3c8ae..f7dc82390d23 100644
+--- a/mm/util.c
++++ b/mm/util.c
+@@ -543,7 +543,7 @@ bool page_mapped(struct page *page)
+ 		return true;
+ 	if (PageHuge(page))
+ 		return false;
+-	for (i = 0; i < (1 << compound_order(page)); i++) {
++	for (i = 0; i < compound_nr(page); i++) {
+ 		if (atomic_read(&page[i]._mapcount) >= 0)
+ 			return true;
+ 	}
+diff --git a/mm/vmscan.c b/mm/vmscan.c
+index ae5bda4b2c61..af4b3dd2cef4 100644
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@ -1126,7 +1126,7 @@ static unsigned long shrink_page_list(struct list_head *page_list,
+ 
+ 		VM_BUG_ON_PAGE(PageActive(page), page);
+ 
+-		nr_pages = 1 << compound_order(page);
++		nr_pages = compound_nr(page);
+ 
+ 		/* Account the number of base pages even though THP */
+ 		sc->nr_scanned += nr_pages;
+@@ -1687,7 +1687,7 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
+ 
+ 		VM_BUG_ON_PAGE(!PageLRU(page), page);
+ 
+-		nr_pages = 1 << compound_order(page);
++		nr_pages = compound_nr(page);
+ 		total_scan += nr_pages;
+ 
+ 		if (page_zonenum(page) > sc->reclaim_idx) {
