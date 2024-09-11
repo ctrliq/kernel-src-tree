@@ -761,6 +761,7 @@ static int mlx5_pci_init(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 
 	mutex_init(&priv->alloc_mutex);
 
+	dev->bar_addr = pci_resource_start(pdev, 0);
 	priv->numa_node = dev_to_node(&dev->pdev->dev);
 
 	if (mlx5_debugfs_root)
@@ -792,7 +793,7 @@ static int mlx5_pci_init(struct mlx5_core_dev *dev, struct mlx5_priv *priv)
 	    pci_enable_atomic_ops_to_root(pdev, PCI_EXP_DEVCAP2_ATOMIC_COMP128))
 		mlx5_core_dbg(dev, "Enabling pci atomics failed\n");
 
-	dev->iseg_base = pci_resource_start(dev->pdev, 0);
+	dev->iseg_base = dev->bar_addr;
 	dev->iseg = ioremap(dev->iseg_base, sizeof(*dev->iseg));
 	if (!dev->iseg) {
 		err = -ENOMEM;
