@@ -3385,8 +3385,6 @@ static const struct constant_table shmem_param_enums_huge[] = {
 	{"always",	SHMEM_HUGE_ALWAYS },
 	{"within_size",	SHMEM_HUGE_WITHIN_SIZE },
 	{"advise",	SHMEM_HUGE_ADVISE },
-	{"deny",	SHMEM_HUGE_DENY },
-	{"force",	SHMEM_HUGE_FORCE },
 	{}
 };
 
