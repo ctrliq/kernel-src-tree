@@ -252,14 +252,6 @@ struct mlxsw_sp_sample_params {
 	bool truncate;
 };
 
-struct mlxsw_sp_port_sample {
-	struct psample_group *psample_group;
-	u32 trunc_size;
-	u32 rate;
-	bool truncate;
-	int span_id;	/* Relevant for Spectrum-2 onwards. */
-};
-
 struct mlxsw_sp_bridge_port;
 struct mlxsw_sp_fid;
 
@@ -323,7 +315,6 @@ struct mlxsw_sp_port {
 		struct mlxsw_sp_port_xstats xstats;
 		struct delayed_work update_dw;
 	} periodic_hw_stats;
-	struct mlxsw_sp_port_sample __rcu *sample;
 	struct list_head vlans_list;
 	struct mlxsw_sp_port_vlan *default_vlan;
 	struct mlxsw_sp_qdisc_state *qdisc;
@@ -1091,6 +1082,11 @@ struct mlxsw_sp_mall_trap_entry {
 	int span_id;
 };
 
+struct mlxsw_sp_mall_sample_entry {
+	struct mlxsw_sp_sample_params params;
+	int span_id;	/* Relevant for Spectrum-2 onwards. */
+};
+
 struct mlxsw_sp_mall_entry {
 	struct list_head list;
 	unsigned long cookie;
@@ -1100,7 +1096,7 @@ struct mlxsw_sp_mall_entry {
 	union {
 		struct mlxsw_sp_mall_mirror_entry mirror;
 		struct mlxsw_sp_mall_trap_entry trap;
-		struct mlxsw_sp_port_sample sample;
+		struct mlxsw_sp_mall_sample_entry sample;
 	};
 	struct rcu_head rcu;
 };
