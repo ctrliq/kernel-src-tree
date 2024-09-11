@@ -1,0 +1,109 @@
+futex: Handle faults correctly for PI futexes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 34b1a1ce1458f50ef27c54e28eb9b1947012907a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/34b1a1ce.failed
+
+fixup_pi_state_owner() tries to ensure that the state of the rtmutex,
+pi_state and the user space value related to the PI futex are consistent
+before returning to user space. In case that the user space value update
+faults and the fault cannot be resolved by faulting the page in via
+fault_in_user_writeable() the function returns with -EFAULT and leaves
+the rtmutex and pi_state owner state inconsistent.
+
+A subsequent futex_unlock_pi() operates on the inconsistent pi_state and
+releases the rtmutex despite not owning it which can corrupt the RB tree of
+the rtmutex and cause a subsequent kernel stack use after free.
+
+It was suggested to loop forever in fixup_pi_state_owner() if the fault
+cannot be resolved, but that results in runaway tasks which is especially
+undesired when the problem happens due to a programming error and not due
+to malice.
+
+As the user space value cannot be fixed up, the proper solution is to make
+the rtmutex and the pi_state consistent so both have the same owner. This
+leaves the user space value out of sync. Any subsequent operation on the
+futex will fail because the 10th rule of PI futexes (pi_state owner and
+user space value are consistent) has been violated.
+
+As a consequence this removes the inept attempts of 'fixing' the situation
+in case that the current task owns the rtmutex when returning with an
+unresolvable fault by unlocking the rtmutex which left pi_state::owner and
+rtmutex::owner out of sync in a different and only slightly less dangerous
+way.
+
+Fixes: 1b7558e457ed ("futexes: fix fault handling in futex_lock_pi")
+	Reported-by: gzobqq@gmail.com
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 34b1a1ce1458f50ef27c54e28eb9b1947012907a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 68d78b271694,45a13eb8894e..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -2484,17 -2474,44 +2485,40 @@@ handle_err
+  	/*
+  	 * Check if someone else fixed it for us:
+  	 */
+ -	if (pi_state->owner != oldowner)
+ -		return argowner == current;
+ +	if (pi_state->owner != oldowner) {
+ +		ret = argowner == current;
+ +		goto out_unlock;
+ +	}
+  
+ -	/* Retry if err was -EAGAIN or the fault in succeeded */
+ -	if (!err)
+ -		goto retry;
+ +	if (ret)
+ +		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +	goto retry;
+++=======
++ 	/*
++ 	 * fault_in_user_writeable() failed so user state is immutable. At
++ 	 * best we can make the kernel state consistent but user state will
++ 	 * be most likely hosed and any subsequent unlock operation will be
++ 	 * rejected due to PI futex rule [10].
++ 	 *
++ 	 * Ensure that the rtmutex owner is also the pi_state owner despite
++ 	 * the user space value claiming something different. There is no
++ 	 * point in unlocking the rtmutex if current is the owner as it
++ 	 * would need to wait until the next waiter has taken the rtmutex
++ 	 * to guarantee consistent state. Keep it simple. Userspace asked
++ 	 * for this wreckaged state.
++ 	 *
++ 	 * The rtmutex has an owner - either current or some other
++ 	 * task. See the EAGAIN loop above.
++ 	 */
++ 	pi_state_update_owner(pi_state, rt_mutex_owner(&pi_state->pi_mutex));
++ 
++ 	return err;
++ }
+++>>>>>>> 34b1a1ce1458 (futex: Handle faults correctly for PI futexes)
+  
+ -static int fixup_pi_state_owner(u32 __user *uaddr, struct futex_q *q,
+ -				struct task_struct *argowner)
+ -{
+ -	struct futex_pi_state *pi_state = q->pi_state;
+ -	int ret;
+ -
+ -	lockdep_assert_held(q->lock_ptr);
+ -
+ -	raw_spin_lock_irq(&pi_state->pi_mutex.wait_lock);
+ -	ret = __fixup_pi_state_owner(uaddr, q, argowner);
+ +out_unlock:
+  	raw_spin_unlock_irq(&pi_state->pi_mutex.wait_lock);
+  	return ret;
+  }
+* Unmerged path kernel/futex.c
