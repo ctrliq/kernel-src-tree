@@ -127,7 +127,7 @@ static void assert_uverbs_usecnt(struct ib_uobject *uobj,
 static int uverbs_destroy_uobject(struct ib_uobject *uobj,
 				  enum rdma_remove_reason reason)
 {
-	struct ib_uverbs_file *ufile = uobj->ufile;
+	struct ib_uverbs_file *ufile = attrs->ufile;
 	unsigned long flags;
 	int ret;
 
@@ -198,7 +198,7 @@ static int uverbs_destroy_uobject(struct ib_uobject *uobj,
  */
 int uobj_destroy(struct ib_uobject *uobj)
 {
-	struct ib_uverbs_file *ufile = uobj->ufile;
+	struct ib_uverbs_file *ufile = attrs->ufile;
 	int ret;
 
 	down_read(&ufile->hw_destroy_rwsem);
@@ -645,7 +645,7 @@ static int alloc_commit_fd_uobject(struct ib_uobject *uobj)
  */
 int __must_check rdma_alloc_commit_uobject(struct ib_uobject *uobj)
 {
-	struct ib_uverbs_file *ufile = uobj->ufile;
+	struct ib_uverbs_file *ufile = attrs->ufile;
 	int ret;
 
 	/* alloc_commit consumes the uobj kref */
