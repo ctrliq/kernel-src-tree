@@ -1,0 +1,144 @@
+bnxt_en: Add BNXT_STATE_IN_FW_RESET state.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Add BNXT_STATE_IN_FW_RESET state (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 98.80%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 3bc7d4a352efe5b596883ef16b769055320db1f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3bc7d4a3.failed
+
+The new flag will be set in subsequent patches when firmware is
+going through reset.  If bnxt_close() is called while the new flag
+is set, the FW reset sequence will have to be aborted because the
+NIC is prematurely closed before FW reset has completed.  We also
+reject SRIOV configurations while FW reset is in progress.
+
+v2: No longer drop rtnl_lock() in close and wait for FW reset to complete.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3bc7d4a352efe5b596883ef16b769055320db1f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index cf30b6d65d63,4caacabf62e2..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -8330,26 -8702,57 +8330,50 @@@ static int bnxt_hwrm_if_change(struct b
+  		req.flags = cpu_to_le32(FUNC_DRV_IF_CHANGE_REQ_FLAGS_UP);
+  	mutex_lock(&bp->hwrm_cmd_lock);
+  	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
+ -	if (!rc)
+ -		flags = le32_to_cpu(resp->flags);
+ -	mutex_unlock(&bp->hwrm_cmd_lock);
+ -	if (rc)
+ -		return rc;
+ -
+ -	if (!up)
+ -		return 0;
+ -
+ -	if (flags & FUNC_DRV_IF_CHANGE_RESP_FLAGS_RESC_CHANGE)
+ +	if (!rc && (resp->flags &
+ +		    cpu_to_le32(FUNC_DRV_IF_CHANGE_RESP_FLAGS_RESC_CHANGE)))
+  		resc_reinit = true;
+ -	if (flags & FUNC_DRV_IF_CHANGE_RESP_FLAGS_HOT_FW_RESET_DONE)
+ -		fw_reset = true;
+ +	mutex_unlock(&bp->hwrm_cmd_lock);
+  
+++<<<<<<< HEAD
+ +	if (up && resc_reinit && BNXT_NEW_RM(bp)) {
+ +		struct bnxt_hw_resc *hw_resc = &bp->hw_resc;
+++=======
++ 	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state) && !fw_reset) {
++ 		netdev_err(bp->dev, "RESET_DONE not set during FW reset.\n");
++ 		return -ENODEV;
++ 	}
++ 	if (resc_reinit || fw_reset) {
++ 		if (fw_reset) {
++ 			rc = bnxt_fw_init_one(bp);
++ 			if (rc) {
++ 				set_bit(BNXT_STATE_ABORT_ERR, &bp->state);
++ 				return rc;
++ 			}
++ 			bnxt_clear_int_mode(bp);
++ 			rc = bnxt_init_int_mode(bp);
++ 			if (rc) {
++ 				netdev_err(bp->dev, "init int mode failed\n");
++ 				return rc;
++ 			}
++ 			set_bit(BNXT_STATE_FW_RESET_DET, &bp->state);
++ 		}
++ 		if (BNXT_NEW_RM(bp)) {
++ 			struct bnxt_hw_resc *hw_resc = &bp->hw_resc;
+++>>>>>>> 3bc7d4a352ef (bnxt_en: Add BNXT_STATE_IN_FW_RESET state.)
+  
+ -			rc = bnxt_hwrm_func_resc_qcaps(bp, true);
+ -			hw_resc->resv_cp_rings = 0;
+ -			hw_resc->resv_stat_ctxs = 0;
+ -			hw_resc->resv_irqs = 0;
+ -			hw_resc->resv_tx_rings = 0;
+ -			hw_resc->resv_rx_rings = 0;
+ -			hw_resc->resv_hw_ring_grps = 0;
+ -			hw_resc->resv_vnics = 0;
+ -			if (!fw_reset) {
+ -				bp->tx_nr_rings = 0;
+ -				bp->rx_nr_rings = 0;
+ -			}
+ -		}
+ +		rc = bnxt_hwrm_func_resc_qcaps(bp, true);
+ +		hw_resc->resv_cp_rings = 0;
+ +		hw_resc->resv_stat_ctxs = 0;
+ +		hw_resc->resv_irqs = 0;
+ +		hw_resc->resv_tx_rings = 0;
+ +		hw_resc->resv_rx_rings = 0;
+ +		hw_resc->resv_hw_ring_grps = 0;
+ +		hw_resc->resv_vnics = 0;
+ +		bp->tx_nr_rings = 0;
+ +		bp->rx_nr_rings = 0;
+  	}
+ -	return 0;
+ +	return rc;
+  }
+  
+  static int bnxt_hwrm_port_led_qcaps(struct bnxt *bp)
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index ec38cf13f1c9,6f7aa7ca9400..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1544,6 -1604,9 +1544,12 @@@ struct bnxt 
+  #define BNXT_STATE_OPEN		0
+  #define BNXT_STATE_IN_SP_TASK	1
+  #define BNXT_STATE_READ_STATS	2
+++<<<<<<< HEAD
+++=======
++ #define BNXT_STATE_FW_RESET_DET 3
++ #define BNXT_STATE_IN_FW_RESET	4
++ #define BNXT_STATE_ABORT_ERR	5
+++>>>>>>> 3bc7d4a352ef (bnxt_en: Add BNXT_STATE_IN_FW_RESET state.)
+  
+  	struct bnxt_irq	*irq_tbl;
+  	int			total_irqs;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+index ac890ca9feb1..4aacfc33a8cc 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_sriov.c
+@@ -828,6 +828,11 @@ int bnxt_sriov_configure(struct pci_dev *pdev, int num_vfs)
+ 		rtnl_unlock();
+ 		return 0;
+ 	}
++	if (test_bit(BNXT_STATE_IN_FW_RESET, &bp->state)) {
++		netdev_warn(dev, "Reject SRIOV config request when FW reset is in progress\n");
++		rtnl_unlock();
++		return 0;
++	}
+ 	bp->sriov_cfg = true;
+ 	rtnl_unlock();
+ 
