@@ -1,0 +1,191 @@
+ch_ktls: Fix kernel panic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+commit 1a73e427b824133940c2dd95ebe26b6dce1cbf10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/1a73e427.failed
+
+Taking page refcount is not ideal and causes kernel panic
+sometimes. It's better to take tx_ctx lock for the complete
+skb transmit, to avoid page cleanup if ACK received in middle.
+
+Fixes: 5a4b9fe7fece ("cxgb4/chcr: complete record tx handling")
+	Signed-off-by: Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1a73e427b824133940c2dd95ebe26b6dce1cbf10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 887ecc2060e8,e39fa0940367..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1935,52 -2027,75 +1934,86 @@@ int chcr_ktls_xmit(struct sk_buff *skb
+  			goto out;
+  		}
+  
+ +		if (unlikely(tls_record_is_start_marker(record))) {
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+ +			atomic64_inc(&stats->ktls_tx_skip_no_sync_data);
+ +			goto out;
+ +		}
+ +
+ +		/* increase page reference count of the record, so that there
+ +		 * won't be any chance of page free in middle if in case stack
+ +		 * receives ACK and try to delete the record.
+ +		 */
+ +		for (i = 0; i < record->num_frags; i++)
+ +			__skb_frag_ref(&record->frags[i]);
+ +		/* lock cleared */
+ +		spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
+ +
+  		tls_end_offset = record->end_seq - tcp_seq;
+  
+  		pr_debug("seq 0x%x, end_seq 0x%x prev_seq 0x%x, datalen 0x%x\n",
+  			 tcp_seq, record->end_seq, tx_info->prev_seq, data_len);
+ -		/* update tcb for the skb */
+ -		if (skb_data_len == data_len) {
+ -			u32 tx_max = tcp_seq;
+ -
+ -			if (!tls_record_is_start_marker(record) &&
+ -			    tls_end_offset < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
+ -				tx_max = record->end_seq -
+ -					TLS_CIPHER_AES_GCM_128_TAG_SIZE;
+ -
+ -			ret = chcr_ktls_xmit_tcb_cpls(tx_info, q, tx_max,
+ -						      ntohl(th->ack_seq),
+ -						      ntohs(th->window),
+ -						      tls_end_offset !=
+ -						      record->len);
+ -			if (ret) {
+ -				spin_unlock_irqrestore(&tx_ctx->base.lock,
+ -						       flags);
+ -				goto out;
+ -			}
+ -
+ -			if (th->fin)
+ -				skb_get(skb);
+ -		}
+ -
+ -		if (unlikely(tls_record_is_start_marker(record))) {
+++=======
++ 			atomic64_inc(&port_stats->ktls_tx_skip_no_sync_data);
++ 			/* If tls_end_offset < data_len, means there is some
++ 			 * data after start marker, which needs encryption, send
++ 			 * plaintext first and take skb refcount. else send out
++ 			 * complete pkt as plaintext.
++ 			 */
++ 			if (tls_end_offset < data_len)
++ 				skb_get(skb);
++ 			else
++ 				tls_end_offset = data_len;
++ 
++ 			ret = chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
++ 						    (!th->fin && th->psh), q,
++ 						    tx_info->port_id, NULL,
++ 						    tls_end_offset, skb_offset,
++ 						    0);
++ 
++ 			if (ret) {
++ 				/* free the refcount taken earlier */
++ 				if (tls_end_offset < data_len)
++ 					dev_kfree_skb_any(skb);
++ 				spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
++ 				goto out;
++ 			}
++ 
++ 			data_len -= tls_end_offset;
++ 			tcp_seq = record->end_seq;
++ 			skb_offset += tls_end_offset;
++ 			continue;
++ 		}
++ 
+++>>>>>>> 1a73e427b824 (ch_ktls: Fix kernel panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		/* if a tls record is finishing in this SKB */
+  		if (tls_end_offset <= data_len) {
+ -			ret = chcr_end_part_handler(tx_info, skb, record,
+ +			struct sk_buff *nskb = NULL;
+ +
+ +			if (tls_end_offset < data_len) {
+ +				nskb = alloc_skb(0, GFP_KERNEL);
+ +				if (unlikely(!nskb)) {
+ +					ret = -ENOMEM;
+ +					goto clear_ref;
+ +				}
+ +
+ +				chcr_ktls_skb_shift(nskb, local_skb,
+ +						    tls_end_offset);
+ +			} else {
+ +				/* its the only record in this skb, directly
+ +				 * point it.
+ +				 */
+ +				nskb = local_skb;
+ +			}
+ +			ret = chcr_end_part_handler(tx_info, nskb, record,
+  						    tcp_seq, mss,
+  						    (!th->fin && th->psh), q,
+ -						    skb_offset,
+  						    tls_end_offset,
+ -						    skb_offset +
+ -						    tls_end_offset == skb->len);
+ +						    (nskb == local_skb));
+ +
+ +			if (ret && nskb != local_skb)
+ +				dev_kfree_skb_any(local_skb);
+  
+  			data_len -= tls_end_offset;
+  			/* tcp_seq increment is required to handle next record.
+@@@ -1993,24 -2109,28 +2026,46 @@@
+  							q, tls_end_offset);
+  			data_len = 0;
+  		}
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +clear_ref:
+ +		/* clear the frag ref count which increased locally before */
+ +		for (i = 0; i < record->num_frags; i++) {
+ +			/* clear the frag ref count */
+ +			__skb_frag_unref(&record->frags[i]);
+ +		}
+ +		/* if any failure, come out from the loop. */
+ +		if (ret)
+ +			goto out;
+++=======
++ 
++ 		/* if any failure, come out from the loop. */
++ 		if (ret) {
++ 			spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
++ 			if (th->fin)
++ 				dev_kfree_skb_any(skb);
++ 
++ 			if (ret == FALLBACK)
++ 				return chcr_ktls_sw_fallback(skb, tx_info, q);
++ 
++ 			return NETDEV_TX_OK;
++ 		}
++ 
+++>>>>>>> 1a73e427b824 (ch_ktls: Fix kernel panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		/* length should never be less than 0 */
+  		WARN_ON(data_len < 0);
+  
+  	} while (data_len > 0);
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	tx_info->prev_seq = ntohl(th->seq) + skb->data_len;
+ +
+ +	atomic64_inc(&stats->ktls_tx_encrypted_packets);
+ +	atomic64_add(skb->data_len, &stats->ktls_tx_encrypted_bytes);
+++=======
++ 	spin_unlock_irqrestore(&tx_ctx->base.lock, flags);
++ 	atomic64_inc(&port_stats->ktls_tx_encrypted_packets);
++ 	atomic64_add(skb_data_len, &port_stats->ktls_tx_encrypted_bytes);
+++>>>>>>> 1a73e427b824 (ch_ktls: Fix kernel panic):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+  	/* tcp finish is set, send a separate tcp msg including all the options
+  	 * as well.
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
