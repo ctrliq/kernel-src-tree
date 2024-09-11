@@ -1,0 +1,142 @@
+powerpc/kexec_file: Setup backup region for kdump kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] ppc64/kexec_file: setup backup region for kdump kernel (Diego Domingos) [1829715]
+Rebuild_FUZZ: 94.55%
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit 1a1cf93c200581c72a3cd521e1e0a1a3b5d0077d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1a1cf93c.failed
+
+Though kdump kernel boots from loaded address, the first 64KB of it is
+copied down to real 0. So, setup a backup region and let purgatory
+copy the first 64KB of crashed kernel into this backup region before
+booting into kdump kernel. Update reserve map with backup region and
+crashed kernel's memory to avoid kdump kernel from accidentially using
+that memory.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Reviewed-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/159602294718.575379.16216507537038008623.stgit@hbathini
+(cherry picked from commit 1a1cf93c200581c72a3cd521e1e0a1a3b5d0077d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kexec.h
+#	arch/powerpc/kexec/elf_64.c
+#	arch/powerpc/kexec/file_load_64.c
+#	arch/powerpc/purgatory/trampoline.S
+diff --cc arch/powerpc/include/asm/kexec.h
+index 4a585cba1787,807bb58ed8fa..000000000000
+--- a/arch/powerpc/include/asm/kexec.h
++++ b/arch/powerpc/include/asm/kexec.h
+@@@ -101,10 -103,16 +101,19 @@@ extern const struct kexec_file_ops kexe
+  #define ARCH_HAS_KIMAGE_ARCH
+  
+  struct kimage_arch {
+++<<<<<<< HEAD
+++=======
++ 	struct crash_mem *exclude_ranges;
++ 
++ 	unsigned long backup_start;
++ 	void *backup_buf;
++ 
++ #ifdef CONFIG_IMA_KEXEC
+++>>>>>>> 1a1cf93c2005 (powerpc/kexec_file: Setup backup region for kdump kernel)
+  	phys_addr_t ima_buffer_addr;
+  	size_t ima_buffer_size;
+ -#endif
+  };
+ +#endif
+  
+  int setup_purgatory(struct kimage *image, const void *slave_code,
+  		    const void *fdt, unsigned long kernel_load_addr,
+@@@ -113,6 -121,20 +122,23 @@@ int setup_new_fdt(const struct kimage *
+  		  unsigned long initrd_load_addr, unsigned long initrd_len,
+  		  const char *cmdline);
+  int delete_fdt_mem_rsv(void *fdt, unsigned long start, unsigned long size);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_PPC64
++ struct kexec_buf;
++ 
++ int load_crashdump_segments_ppc64(struct kimage *image,
++ 				  struct kexec_buf *kbuf);
++ int setup_purgatory_ppc64(struct kimage *image, const void *slave_code,
++ 			  const void *fdt, unsigned long kernel_load_addr,
++ 			  unsigned long fdt_load_addr);
++ int setup_new_fdt_ppc64(const struct kimage *image, void *fdt,
++ 			unsigned long initrd_load_addr,
++ 			unsigned long initrd_len, const char *cmdline);
++ #endif /* CONFIG_PPC64 */
++ 
+++>>>>>>> 1a1cf93c2005 (powerpc/kexec_file: Setup backup region for kdump kernel)
+  #endif /* CONFIG_KEXEC_FILE */
+  
+  #else /* !CONFIG_KEXEC_CORE */
+diff --cc arch/powerpc/purgatory/trampoline.S
+index 4aad9dd10ace,b567da56dde1..000000000000
+--- a/arch/powerpc/purgatory/trampoline.S
++++ b/arch/powerpc/purgatory/trampoline.S
+@@@ -6,21 -7,10 +6,26 @@@
+   * Copyright (C) 2004 - 2005, Milton D Miller II, IBM Corporation
+   * Copyright (C) 2006, Mohan Kumar M, IBM Corporation
+   * Copyright (C) 2013, Anton Blanchard, IBM Corporation
+ + *
+ + * This program is free software; you can redistribute it and/or modify it under
+ + * the terms of the GNU General Public License as published by the Free
+ + * Software Foundation (version 2 of the License).
+   */
+  
+++<<<<<<< HEAD:arch/powerpc/purgatory/trampoline.S
+ +#if defined(__LITTLE_ENDIAN__)
+ +#define STWX_BE	stwbrx
+ +#define LWZX_BE	lwbrx
+ +#elif defined(__BIG_ENDIAN__)
+ +#define STWX_BE	stwx
+ +#define LWZX_BE	lwzx
+ +#else
+ +#error no endianness defined!
+ +#endif
+++=======
++ #include <asm/asm-compat.h>
++ #include <asm/crashdump-ppc64.h>
+++>>>>>>> 1a1cf93c2005 (powerpc/kexec_file: Setup backup region for kdump kernel):arch/powerpc/purgatory/trampoline_64.S
+  
+  	.machine ppc64
+  	.balign 256
+* Unmerged path arch/powerpc/kexec/elf_64.c
+* Unmerged path arch/powerpc/kexec/file_load_64.c
+diff --git a/arch/powerpc/include/asm/crashdump-ppc64.h b/arch/powerpc/include/asm/crashdump-ppc64.h
+new file mode 100644
+index 000000000000..68d9717cc5ee
+--- /dev/null
++++ b/arch/powerpc/include/asm/crashdump-ppc64.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _ASM_POWERPC_CRASHDUMP_PPC64_H
++#define _ASM_POWERPC_CRASHDUMP_PPC64_H
++
++/*
++ * Backup region - first 64KB of System RAM
++ *
++ * If ever the below macros are to be changed, please be judicious.
++ * The implicit assumptions are:
++ *     - start, end & size are less than UINT32_MAX.
++ *     - start & size are at least 8 byte aligned.
++ *
++ * For implementation details: arch/powerpc/purgatory/trampoline_64.S
++ */
++#define BACKUP_SRC_START	0
++#define BACKUP_SRC_END		0xffff
++#define BACKUP_SRC_SIZE		(BACKUP_SRC_END - BACKUP_SRC_START + 1)
++
++#endif /* __ASM_POWERPC_CRASHDUMP_PPC64_H */
+* Unmerged path arch/powerpc/include/asm/kexec.h
+* Unmerged path arch/powerpc/kexec/elf_64.c
+* Unmerged path arch/powerpc/kexec/file_load_64.c
+* Unmerged path arch/powerpc/purgatory/trampoline.S
