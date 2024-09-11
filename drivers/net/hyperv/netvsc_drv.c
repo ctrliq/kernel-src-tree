@@ -2410,6 +2410,9 @@ static int netvsc_register_vf(struct net_device *vf_netdev)
 	dev_hold(vf_netdev);
 	rcu_assign_pointer(net_device_ctx->vf_netdev, vf_netdev);
 
+	if (ndev->needed_headroom < vf_netdev->needed_headroom)
+		ndev->needed_headroom = vf_netdev->needed_headroom;
+
 	vf_netdev->wanted_features = ndev->features;
 	netdev_update_features(vf_netdev);
 
@@ -2487,6 +2490,8 @@ static int netvsc_unregister_vf(struct net_device *vf_netdev)
 	netdev_upper_dev_unlink(vf_netdev, ndev);
 	RCU_INIT_POINTER(net_device_ctx->vf_netdev, NULL);
 	dev_put(vf_netdev);
+
+	ndev->needed_headroom = RNDIS_AND_PPI_SIZE;
 
 	return NOTIFY_OK;
 }
