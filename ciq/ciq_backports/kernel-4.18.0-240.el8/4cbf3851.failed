@@ -1,0 +1,130 @@
+iommu: Add def_domain_type() callback in iommu_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+commit 4cbf38511a007867def958872203ae8adb8e2351
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4cbf3851.failed
+
+Some devices are reqired to use a specific type (identity or dma)
+of default domain when they are used with a vendor iommu. When the
+system level default domain type is different from it, the vendor
+iommu driver has to request a new default domain with
+iommu_request_dma_domain_for_dev() and iommu_request_dm_for_dev()
+in the add_dev() callback. Unfortunately, these two helpers only
+work when the group hasn't been assigned to any other devices,
+hence, some vendor iommu driver has to use a private domain if
+it fails to request a new default one.
+
+This adds def_domain_type() callback in the iommu_ops, so that
+any special requirement of default domain for a device could be
+aware by the iommu generic layer.
+
+	Signed-off-by: Sai Praneeth Prakhya <sai.praneeth.prakhya@intel.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+[ jroedel@suse.de: Added iommu_get_def_domain_type() function and use
+                   it to allocate the default domain ]
+Co-developed-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Link: https://lore.kernel.org/r/20200429133712.31431-3-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 4cbf38511a007867def958872203ae8adb8e2351)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/iommu.h
+diff --cc include/linux/iommu.h
+index c0752afea934,1f027b07e499..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -257,7 -244,16 +257,18 @@@ struct iommu_iotlb_gather 
+   * @sva_bind: Bind process address space to device
+   * @sva_unbind: Unbind process address space from device
+   * @sva_get_pasid: Get PASID associated to a SVA handle
+++<<<<<<< HEAD
+++=======
++  * @page_response: handle page request response
++  * @cache_invalidate: invalidate translation caches
++  * @sva_bind_gpasid: bind guest pasid and mm
++  * @sva_unbind_gpasid: unbind guest pasid and mm
++  * @def_domain_type: device default domain type, return value:
++  *		- IOMMU_DOMAIN_IDENTITY: must use an identity domain
++  *		- IOMMU_DOMAIN_DMA: must use a dma domain
++  *		- 0: use the default setting
+++>>>>>>> 4cbf38511a00 (iommu: Add def_domain_type() callback in iommu_ops)
+   * @pgsize_bitmap: bitmap of all possible supported page sizes
+ - * @owner: Driver module providing these ops
+   */
+  struct iommu_ops {
+  	bool (*capable)(enum iommu_cap);
+@@@ -324,9 -311,21 +335,11 @@@
+  				      void *drvdata);
+  	void (*sva_unbind)(struct iommu_sva *handle);
+  	int (*sva_get_pasid)(struct iommu_sva *handle);
+ -
+ -	int (*page_response)(struct device *dev,
+ -			     struct iommu_fault_event *evt,
+ -			     struct iommu_page_response *msg);
+ -	int (*cache_invalidate)(struct iommu_domain *domain, struct device *dev,
+ -				struct iommu_cache_invalidate_info *inv_info);
+ -	int (*sva_bind_gpasid)(struct iommu_domain *domain,
+ -			struct device *dev, struct iommu_gpasid_bind_data *data);
+ -
+ -	int (*sva_unbind_gpasid)(struct device *dev, int pasid);
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+  
++ 	int (*def_domain_type)(struct device *dev);
++ 
+  	unsigned long pgsize_bitmap;
+ -	struct module *owner;
+  };
+  
+  /**
+diff --git a/drivers/iommu/iommu.c b/drivers/iommu/iommu.c
+index 7997fcb701e0..bd993251bda0 100644
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@ -1120,21 +1120,35 @@ struct iommu_group *pci_device_group(struct device *dev)
+ 	return iommu_group_alloc();
+ }
+ 
++static int iommu_get_def_domain_type(struct device *dev)
++{
++	const struct iommu_ops *ops = dev->bus->iommu_ops;
++	unsigned int type = 0;
++
++	if (ops->def_domain_type)
++		type = ops->def_domain_type(dev);
++
++	return (type == 0) ? iommu_def_domain_type : type;
++}
++
+ static int iommu_alloc_default_domain(struct device *dev,
+ 				      struct iommu_group *group)
+ {
+ 	struct iommu_domain *dom;
++	unsigned int type;
+ 
+ 	if (group->default_domain)
+ 		return 0;
+ 
+-	dom = __iommu_domain_alloc(dev->bus, iommu_def_domain_type);
+-	if (!dom && iommu_def_domain_type != IOMMU_DOMAIN_DMA) {
++	type = iommu_get_def_domain_type(dev);
++
++	dom = __iommu_domain_alloc(dev->bus, type);
++	if (!dom && type != IOMMU_DOMAIN_DMA) {
+ 		dom = __iommu_domain_alloc(dev->bus, IOMMU_DOMAIN_DMA);
+ 		if (dom) {
+ 			dev_warn(dev,
+ 				 "failed to allocate default IOMMU domain of type %u; falling back to IOMMU_DOMAIN_DMA",
+-				 iommu_def_domain_type);
++				 type);
+ 		}
+ 	}
+ 
+* Unmerged path include/linux/iommu.h
