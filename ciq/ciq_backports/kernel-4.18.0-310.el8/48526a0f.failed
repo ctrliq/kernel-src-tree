@@ -1,0 +1,173 @@
+genetlink: bring back per op policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 48526a0f4ca2b484cab4318dc0b2c2be1d8685b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/48526a0f.failed
+
+Add policy to the struct genl_ops structure, this time
+with maxattr, so it can be used properly.
+
+Propagate .policy and .maxattr from the family
+in genl_get_cmd() if needed, this way the rest of the
+code does not have to worry if the policy is per op
+or global.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Johannes Berg <johannes@sipsolutions.net>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 48526a0f4ca2b484cab4318dc0b2c2be1d8685b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/genetlink.c
+diff --cc net/netlink/genetlink.c
+index dd6470734a4f,c3673d84d8b5..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -107,16 -107,83 +107,90 @@@ static const struct genl_family *genl_f
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct genl_ops *genl_get_cmd(u8 cmd,
+ +					   const struct genl_family *family)
+++=======
++ static int genl_get_cmd_cnt(const struct genl_family *family)
++ {
++ 	return family->n_ops + family->n_small_ops;
++ }
++ 
++ static void genl_op_from_full(const struct genl_family *family,
++ 			      unsigned int i, struct genl_ops *op)
++ {
++ 	*op = family->ops[i];
++ 
++ 	if (!op->maxattr)
++ 		op->maxattr = family->maxattr;
++ 	if (!op->policy)
++ 		op->policy = family->policy;
++ }
++ 
++ static int genl_get_cmd_full(u8 cmd, const struct genl_family *family,
++ 			     struct genl_ops *op)
+++>>>>>>> 48526a0f4ca2 (genetlink: bring back per op policy)
+  {
+  	int i;
+  
+  	for (i = 0; i < family->n_ops; i++)
+ -		if (family->ops[i].cmd == cmd) {
+ -			genl_op_from_full(family, i, op);
+ -			return 0;
+ -		}
+ +		if (family->ops[i].cmd == cmd)
+ +			return &family->ops[i];
+  
+++<<<<<<< HEAD
+ +	return NULL;
+++=======
++ 	return -ENOENT;
++ }
++ 
++ static void genl_op_from_small(const struct genl_family *family,
++ 			       unsigned int i, struct genl_ops *op)
++ {
++ 	memset(op, 0, sizeof(*op));
++ 	op->doit	= family->small_ops[i].doit;
++ 	op->dumpit	= family->small_ops[i].dumpit;
++ 	op->cmd		= family->small_ops[i].cmd;
++ 	op->internal_flags = family->small_ops[i].internal_flags;
++ 	op->flags	= family->small_ops[i].flags;
++ 	op->validate	= family->small_ops[i].validate;
++ 
++ 	op->maxattr = family->maxattr;
++ 	op->policy = family->policy;
++ }
++ 
++ static int genl_get_cmd_small(u8 cmd, const struct genl_family *family,
++ 			      struct genl_ops *op)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < family->n_small_ops; i++)
++ 		if (family->small_ops[i].cmd == cmd) {
++ 			genl_op_from_small(family, i, op);
++ 			return 0;
++ 		}
++ 
++ 	return -ENOENT;
++ }
++ 
++ static int genl_get_cmd(u8 cmd, const struct genl_family *family,
++ 			struct genl_ops *op)
++ {
++ 	if (!genl_get_cmd_full(cmd, family, op))
++ 		return 0;
++ 	return genl_get_cmd_small(cmd, family, op);
++ }
++ 
++ static void genl_get_cmd_by_index(unsigned int i,
++ 				  const struct genl_family *family,
++ 				  struct genl_ops *op)
++ {
++ 	if (i < family->n_ops)
++ 		genl_op_from_full(family, i, op);
++ 	else if (i < family->n_ops + family->n_small_ops)
++ 		genl_op_from_small(family, i - family->n_ops, op);
++ 	else
++ 		WARN_ON_ONCE(1);
+++>>>>>>> 48526a0f4ca2 (genetlink: bring back per op policy)
+  }
+  
+  static int genl_allocate_reserve_groups(int n_groups, int *first_id)
+@@@ -773,16 -842,18 +847,16 @@@ static int ctrl_fill_info(const struct 
+  		if (nla_ops == NULL)
+  			goto nla_put_failure;
+  
+ -		for (i = 0; i < genl_get_cmd_cnt(family); i++) {
+ +		for (i = 0; i < family->n_ops; i++) {
+  			struct nlattr *nest;
+ -			struct genl_ops op;
+ -			u32 op_flags;
+ +			const struct genl_ops *ops = &family->ops[i];
+ +			u32 op_flags = ops->flags;
+  
+ -			genl_get_cmd_by_index(i, family, &op);
+ -			op_flags = op.flags;
+ -			if (op.dumpit)
+ +			if (ops->dumpit)
+  				op_flags |= GENL_CMD_CAP_DUMP;
+ -			if (op.doit)
+ +			if (ops->doit)
+  				op_flags |= GENL_CMD_CAP_DO;
+- 			if (family->policy)
++ 			if (op.policy)
+  				op_flags |= GENL_CMD_CAP_HASPOL;
+  
+  			nest = nla_nest_start_noflag(skb, i + 1);
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 021ea3a01a34..7e30be116095 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -160,6 +160,8 @@ genl_dumpit_info(struct netlink_callback *cb)
+  * @cmd: command identifier
+  * @internal_flags: flags used by the family
+  * @flags: flags
++ * @maxattr: maximum number of attributes supported
++ * @policy: netlink policy (takes precedence over family policy)
+  * @doit: standard command callback
+  * @start: start callback for dumps
+  * @dumpit: callback for dumpers
+@@ -172,6 +174,8 @@ struct genl_ops {
+ 	int		       (*dumpit)(struct sk_buff *skb,
+ 					 struct netlink_callback *cb);
+ 	int		       (*done)(struct netlink_callback *cb);
++	const struct nla_policy *policy;
++	unsigned int		maxattr;
+ 	u8			cmd;
+ 	u8			internal_flags;
+ 	u8			flags;
+* Unmerged path net/netlink/genetlink.c
