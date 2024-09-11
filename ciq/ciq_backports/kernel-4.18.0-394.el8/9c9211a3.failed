@@ -1,0 +1,902 @@
+net_tstamp: add new flag HWTSTAMP_FLAG_BONDED_PHC_INDEX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Hangbin Liu <liuhangbin@gmail.com>
+commit 9c9211a3fc7aa41b2952765b62000443b3bb6f23
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/9c9211a3.failed
+
+Since commit 94dd016ae538 ("bond: pass get_ts_info and SIOC[SG]HWTSTAMP
+ioctl to active device") the user could get bond active interface's
+PHC index directly. But when there is a failover, the bond active
+interface will change, thus the PHC index is also changed. This may
+break the user's program if they did not update the PHC timely.
+
+This patch adds a new hwtstamp_config flag HWTSTAMP_FLAG_BONDED_PHC_INDEX.
+When the user wants to get the bond active interface's PHC, they need to
+add this flag and be aware the PHC index may be changed.
+
+With the new flag. All flag checks in current drivers are removed. Only
+the checking in net_hwtstamp_validate() is kept.
+
+	Suggested-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Hangbin Liu <liuhangbin@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9c9211a3fc7aa41b2952765b62000443b3bb6f23)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/dsa/hirschmann/hellcreek_hwtstamp.c
+#	drivers/net/ethernet/engleder/tsnep_ptp.c
+#	drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+#	drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+#	drivers/net/ethernet/microchip/lan743x_ptp.c
+#	drivers/net/ethernet/mscc/ocelot.c
+#	drivers/net/ethernet/ti/cpsw_priv.c
+#	drivers/net/ethernet/xscale/ixp4xx_eth.c
+#	drivers/net/phy/mscc/mscc_ptp.c
+#	drivers/ptp/ptp_ines.c
+diff --cc drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index 9638dce58ba2,b1cce4425296..000000000000
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@@ -3585,6 -5133,105 +3585,108 @@@ mvpp2_get_stats64(struct net_device *de
+  	stats->tx_dropped	= dev->stats.tx_dropped;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int mvpp2_set_ts_config(struct mvpp2_port *port, struct ifreq *ifr)
++ {
++ 	struct hwtstamp_config config;
++ 	void __iomem *ptp;
++ 	u32 gcr, int_mask;
++ 
++ 	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
++ 		return -EFAULT;
++ 
++ 	if (config.tx_type != HWTSTAMP_TX_OFF &&
++ 	    config.tx_type != HWTSTAMP_TX_ON)
++ 		return -ERANGE;
++ 
++ 	ptp = port->priv->iface_base + MVPP22_PTP_BASE(port->gop_id);
++ 
++ 	int_mask = gcr = 0;
++ 	if (config.tx_type != HWTSTAMP_TX_OFF) {
++ 		gcr |= MVPP22_PTP_GCR_TSU_ENABLE | MVPP22_PTP_GCR_TX_RESET;
++ 		int_mask |= MVPP22_PTP_INT_MASK_QUEUE1 |
++ 			    MVPP22_PTP_INT_MASK_QUEUE0;
++ 	}
++ 
++ 	/* It seems we must also release the TX reset when enabling the TSU */
++ 	if (config.rx_filter != HWTSTAMP_FILTER_NONE)
++ 		gcr |= MVPP22_PTP_GCR_TSU_ENABLE | MVPP22_PTP_GCR_RX_RESET |
++ 		       MVPP22_PTP_GCR_TX_RESET;
++ 
++ 	if (gcr & MVPP22_PTP_GCR_TSU_ENABLE)
++ 		mvpp22_tai_start(port->priv->tai);
++ 
++ 	if (config.rx_filter != HWTSTAMP_FILTER_NONE) {
++ 		config.rx_filter = HWTSTAMP_FILTER_ALL;
++ 		mvpp2_modify(ptp + MVPP22_PTP_GCR,
++ 			     MVPP22_PTP_GCR_RX_RESET |
++ 			     MVPP22_PTP_GCR_TX_RESET |
++ 			     MVPP22_PTP_GCR_TSU_ENABLE, gcr);
++ 		port->rx_hwtstamp = true;
++ 	} else {
++ 		port->rx_hwtstamp = false;
++ 		mvpp2_modify(ptp + MVPP22_PTP_GCR,
++ 			     MVPP22_PTP_GCR_RX_RESET |
++ 			     MVPP22_PTP_GCR_TX_RESET |
++ 			     MVPP22_PTP_GCR_TSU_ENABLE, gcr);
++ 	}
++ 
++ 	mvpp2_modify(ptp + MVPP22_PTP_INT_MASK,
++ 		     MVPP22_PTP_INT_MASK_QUEUE1 |
++ 		     MVPP22_PTP_INT_MASK_QUEUE0, int_mask);
++ 
++ 	if (!(gcr & MVPP22_PTP_GCR_TSU_ENABLE))
++ 		mvpp22_tai_stop(port->priv->tai);
++ 
++ 	port->tx_hwtstamp_type = config.tx_type;
++ 
++ 	if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int mvpp2_get_ts_config(struct mvpp2_port *port, struct ifreq *ifr)
++ {
++ 	struct hwtstamp_config config;
++ 
++ 	memset(&config, 0, sizeof(config));
++ 
++ 	config.tx_type = port->tx_hwtstamp_type;
++ 	config.rx_filter = port->rx_hwtstamp ?
++ 		HWTSTAMP_FILTER_ALL : HWTSTAMP_FILTER_NONE;
++ 
++ 	if (copy_to_user(ifr->ifr_data, &config, sizeof(config)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int mvpp2_ethtool_get_ts_info(struct net_device *dev,
++ 				     struct ethtool_ts_info *info)
++ {
++ 	struct mvpp2_port *port = netdev_priv(dev);
++ 
++ 	if (!port->hwtstamp)
++ 		return -EOPNOTSUPP;
++ 
++ 	info->phc_index = mvpp22_tai_ptp_clock_index(port->priv->tai);
++ 	info->so_timestamping = SOF_TIMESTAMPING_TX_SOFTWARE |
++ 				SOF_TIMESTAMPING_RX_SOFTWARE |
++ 				SOF_TIMESTAMPING_SOFTWARE |
++ 				SOF_TIMESTAMPING_TX_HARDWARE |
++ 				SOF_TIMESTAMPING_RX_HARDWARE |
++ 				SOF_TIMESTAMPING_RAW_HARDWARE;
++ 	info->tx_types = BIT(HWTSTAMP_TX_OFF) |
++ 			 BIT(HWTSTAMP_TX_ON);
++ 	info->rx_filters = BIT(HWTSTAMP_FILTER_NONE) |
++ 			   BIT(HWTSTAMP_FILTER_ALL);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 9c9211a3fc7a (net_tstamp: add new flag HWTSTAMP_FLAG_BONDED_PHC_INDEX)
+  static int mvpp2_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+  {
+  	struct mvpp2_port *port = netdev_priv(dev);
+diff --cc drivers/net/ethernet/mscc/ocelot.c
+index fb1208bf823d,9b42187a026a..000000000000
+--- a/drivers/net/ethernet/mscc/ocelot.c
++++ b/drivers/net/ethernet/mscc/ocelot.c
+@@@ -703,24 -1467,225 +703,245 @@@ static int ocelot_get_port_parent_id(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct net_device_ops ocelot_port_netdev_ops = {
+ +	.ndo_open			= ocelot_port_open,
+ +	.ndo_stop			= ocelot_port_stop,
+ +	.ndo_start_xmit			= ocelot_port_xmit,
+ +	.ndo_set_rx_mode		= ocelot_set_rx_mode,
+ +	.ndo_get_phys_port_name		= ocelot_port_get_phys_port_name,
+ +	.ndo_set_mac_address		= ocelot_port_set_mac_address,
+ +	.ndo_get_stats64		= ocelot_get_stats64,
+ +	.ndo_fdb_add			= ocelot_fdb_add,
+ +	.ndo_fdb_del			= ocelot_fdb_del,
+ +	.ndo_fdb_dump			= ocelot_fdb_dump,
+ +	.ndo_get_port_parent_id		= ocelot_get_port_parent_id,
+ +};
+ +
+ +static void ocelot_get_strings(struct net_device *netdev, u32 sset, u8 *data)
+++=======
++ static int ocelot_trap_del(struct ocelot *ocelot, int port,
++ 			   unsigned long cookie)
++ {
++ 	struct ocelot_vcap_block *block_vcap_is2;
++ 	struct ocelot_vcap_filter *trap;
++ 
++ 	block_vcap_is2 = &ocelot->block[VCAP_IS2];
++ 
++ 	trap = ocelot_vcap_block_find_filter_by_id(block_vcap_is2, cookie,
++ 						   false);
++ 	if (!trap)
++ 		return 0;
++ 
++ 	trap->ingress_port_mask &= ~BIT(port);
++ 	if (!trap->ingress_port_mask)
++ 		return ocelot_vcap_filter_del(ocelot, trap);
++ 
++ 	return ocelot_vcap_filter_replace(ocelot, trap);
++ }
++ 
++ static int ocelot_l2_ptp_trap_add(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long l2_cookie = ocelot->num_phys_ports + 1;
++ 
++ 	return ocelot_trap_add(ocelot, port, l2_cookie,
++ 			       ocelot_populate_l2_ptp_trap_key);
++ }
++ 
++ static int ocelot_l2_ptp_trap_del(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long l2_cookie = ocelot->num_phys_ports + 1;
++ 
++ 	return ocelot_trap_del(ocelot, port, l2_cookie);
++ }
++ 
++ static int ocelot_ipv4_ptp_trap_add(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long ipv4_gen_cookie = ocelot->num_phys_ports + 2;
++ 	unsigned long ipv4_ev_cookie = ocelot->num_phys_ports + 3;
++ 	int err;
++ 
++ 	err = ocelot_trap_add(ocelot, port, ipv4_ev_cookie,
++ 			      ocelot_populate_ipv4_ptp_event_trap_key);
++ 	if (err)
++ 		return err;
++ 
++ 	err = ocelot_trap_add(ocelot, port, ipv4_gen_cookie,
++ 			      ocelot_populate_ipv4_ptp_general_trap_key);
++ 	if (err)
++ 		ocelot_trap_del(ocelot, port, ipv4_ev_cookie);
++ 
++ 	return err;
++ }
++ 
++ static int ocelot_ipv4_ptp_trap_del(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long ipv4_gen_cookie = ocelot->num_phys_ports + 2;
++ 	unsigned long ipv4_ev_cookie = ocelot->num_phys_ports + 3;
++ 	int err;
++ 
++ 	err = ocelot_trap_del(ocelot, port, ipv4_ev_cookie);
++ 	err |= ocelot_trap_del(ocelot, port, ipv4_gen_cookie);
++ 	return err;
++ }
++ 
++ static int ocelot_ipv6_ptp_trap_add(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long ipv6_gen_cookie = ocelot->num_phys_ports + 4;
++ 	unsigned long ipv6_ev_cookie = ocelot->num_phys_ports + 5;
++ 	int err;
++ 
++ 	err = ocelot_trap_add(ocelot, port, ipv6_ev_cookie,
++ 			      ocelot_populate_ipv6_ptp_event_trap_key);
++ 	if (err)
++ 		return err;
++ 
++ 	err = ocelot_trap_add(ocelot, port, ipv6_gen_cookie,
++ 			      ocelot_populate_ipv6_ptp_general_trap_key);
++ 	if (err)
++ 		ocelot_trap_del(ocelot, port, ipv6_ev_cookie);
++ 
++ 	return err;
++ }
++ 
++ static int ocelot_ipv6_ptp_trap_del(struct ocelot *ocelot, int port)
++ {
++ 	unsigned long ipv6_gen_cookie = ocelot->num_phys_ports + 4;
++ 	unsigned long ipv6_ev_cookie = ocelot->num_phys_ports + 5;
++ 	int err;
++ 
++ 	err = ocelot_trap_del(ocelot, port, ipv6_ev_cookie);
++ 	err |= ocelot_trap_del(ocelot, port, ipv6_gen_cookie);
++ 	return err;
++ }
++ 
++ static int ocelot_setup_ptp_traps(struct ocelot *ocelot, int port,
++ 				  bool l2, bool l4)
++ {
++ 	int err;
++ 
++ 	if (l2)
++ 		err = ocelot_l2_ptp_trap_add(ocelot, port);
++ 	else
++ 		err = ocelot_l2_ptp_trap_del(ocelot, port);
++ 	if (err)
++ 		return err;
++ 
++ 	if (l4) {
++ 		err = ocelot_ipv4_ptp_trap_add(ocelot, port);
++ 		if (err)
++ 			goto err_ipv4;
++ 
++ 		err = ocelot_ipv6_ptp_trap_add(ocelot, port);
++ 		if (err)
++ 			goto err_ipv6;
++ 	} else {
++ 		err = ocelot_ipv4_ptp_trap_del(ocelot, port);
++ 
++ 		err |= ocelot_ipv6_ptp_trap_del(ocelot, port);
++ 	}
++ 	if (err)
++ 		return err;
++ 
++ 	return 0;
++ 
++ err_ipv6:
++ 	ocelot_ipv4_ptp_trap_del(ocelot, port);
++ err_ipv4:
++ 	if (l2)
++ 		ocelot_l2_ptp_trap_del(ocelot, port);
++ 	return err;
++ }
++ 
++ int ocelot_hwstamp_get(struct ocelot *ocelot, int port, struct ifreq *ifr)
++ {
++ 	return copy_to_user(ifr->ifr_data, &ocelot->hwtstamp_config,
++ 			    sizeof(ocelot->hwtstamp_config)) ? -EFAULT : 0;
++ }
++ EXPORT_SYMBOL(ocelot_hwstamp_get);
++ 
++ int ocelot_hwstamp_set(struct ocelot *ocelot, int port, struct ifreq *ifr)
++ {
++ 	struct ocelot_port *ocelot_port = ocelot->ports[port];
++ 	bool l2 = false, l4 = false;
++ 	struct hwtstamp_config cfg;
++ 	int err;
++ 
++ 	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
++ 		return -EFAULT;
++ 
++ 	/* Tx type sanity check */
++ 	switch (cfg.tx_type) {
++ 	case HWTSTAMP_TX_ON:
++ 		ocelot_port->ptp_cmd = IFH_REW_OP_TWO_STEP_PTP;
++ 		break;
++ 	case HWTSTAMP_TX_ONESTEP_SYNC:
++ 		/* IFH_REW_OP_ONE_STEP_PTP updates the correctional field, we
++ 		 * need to update the origin time.
++ 		 */
++ 		ocelot_port->ptp_cmd = IFH_REW_OP_ORIGIN_PTP;
++ 		break;
++ 	case HWTSTAMP_TX_OFF:
++ 		ocelot_port->ptp_cmd = 0;
++ 		break;
++ 	default:
++ 		return -ERANGE;
++ 	}
++ 
++ 	mutex_lock(&ocelot->ptp_lock);
++ 
++ 	switch (cfg.rx_filter) {
++ 	case HWTSTAMP_FILTER_NONE:
++ 		break;
++ 	case HWTSTAMP_FILTER_PTP_V2_L4_EVENT:
++ 	case HWTSTAMP_FILTER_PTP_V2_L4_SYNC:
++ 	case HWTSTAMP_FILTER_PTP_V2_L4_DELAY_REQ:
++ 		l4 = true;
++ 		break;
++ 	case HWTSTAMP_FILTER_PTP_V2_L2_EVENT:
++ 	case HWTSTAMP_FILTER_PTP_V2_L2_SYNC:
++ 	case HWTSTAMP_FILTER_PTP_V2_L2_DELAY_REQ:
++ 		l2 = true;
++ 		break;
++ 	case HWTSTAMP_FILTER_PTP_V2_EVENT:
++ 	case HWTSTAMP_FILTER_PTP_V2_SYNC:
++ 	case HWTSTAMP_FILTER_PTP_V2_DELAY_REQ:
++ 		l2 = true;
++ 		l4 = true;
++ 		break;
++ 	default:
++ 		mutex_unlock(&ocelot->ptp_lock);
++ 		return -ERANGE;
++ 	}
++ 
++ 	err = ocelot_setup_ptp_traps(ocelot, port, l2, l4);
++ 	if (err) {
++ 		mutex_unlock(&ocelot->ptp_lock);
++ 		return err;
++ 	}
++ 
++ 	if (l2 && l4)
++ 		cfg.rx_filter = HWTSTAMP_FILTER_PTP_V2_EVENT;
++ 	else if (l2)
++ 		cfg.rx_filter = HWTSTAMP_FILTER_PTP_V2_L2_EVENT;
++ 	else if (l4)
++ 		cfg.rx_filter = HWTSTAMP_FILTER_PTP_V2_L4_EVENT;
++ 	else
++ 		cfg.rx_filter = HWTSTAMP_FILTER_NONE;
++ 
++ 	/* Commit back the result & save it */
++ 	memcpy(&ocelot->hwtstamp_config, &cfg, sizeof(cfg));
++ 	mutex_unlock(&ocelot->ptp_lock);
++ 
++ 	return copy_to_user(ifr->ifr_data, &cfg, sizeof(cfg)) ? -EFAULT : 0;
++ }
++ EXPORT_SYMBOL(ocelot_hwstamp_set);
++ 
++ void ocelot_get_strings(struct ocelot *ocelot, int port, u32 sset, u8 *data)
+++>>>>>>> 9c9211a3fc7a (net_tstamp: add new flag HWTSTAMP_FLAG_BONDED_PHC_INDEX)
+  {
+ +	struct ocelot_port *port = netdev_priv(netdev);
+ +	struct ocelot *ocelot = port->ocelot;
+  	int i;
+  
+  	if (sset != ETH_SS_STATS)
+diff --cc drivers/net/ethernet/xscale/ixp4xx_eth.c
+index aee55c03def0,df77a22d1b81..000000000000
+--- a/drivers/net/ethernet/xscale/ixp4xx_eth.c
++++ b/drivers/net/ethernet/xscale/ixp4xx_eth.c
+@@@ -378,11 -382,12 +378,17 @@@ static int hwtstamp_set(struct net_devi
+  	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	if (cfg.flags) /* reserved for future extensions */
+ +		return -EINVAL;
+++=======
++ 	ret = ixp46x_ptp_find(&port->timesync_regs, &port->phc_index);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 9c9211a3fc7a (net_tstamp: add new flag HWTSTAMP_FLAG_BONDED_PHC_INDEX)
+  
+  	ch = PORT2CHANNEL(port);
+ -	regs = port->timesync_regs;
+ +	regs = (struct ixp46x_ts_regs __iomem *) IXP4XX_TIMESYNC_BASE_VIRT;
+  
+  	if (cfg.tx_type != HWTSTAMP_TX_OFF && cfg.tx_type != HWTSTAMP_TX_ON)
+  		return -ERANGE;
+* Unmerged path drivers/net/dsa/hirschmann/hellcreek_hwtstamp.c
+* Unmerged path drivers/net/ethernet/engleder/tsnep_ptp.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+* Unmerged path drivers/net/ethernet/microchip/lan743x_ptp.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+* Unmerged path drivers/net/phy/mscc/mscc_ptp.c
+* Unmerged path drivers/ptp/ptp_ines.c
+* Unmerged path drivers/net/dsa/hirschmann/hellcreek_hwtstamp.c
+diff --git a/drivers/net/dsa/mv88e6xxx/hwtstamp.c b/drivers/net/dsa/mv88e6xxx/hwtstamp.c
+index a036c490b7ce..de482bfeb71f 100644
+--- a/drivers/net/dsa/mv88e6xxx/hwtstamp.c
++++ b/drivers/net/dsa/mv88e6xxx/hwtstamp.c
+@@ -102,10 +102,6 @@ static int mv88e6xxx_set_hwtstamp_config(struct mv88e6xxx_chip *chip, int port,
+ 	 */
+ 	clear_bit_unlock(MV88E6XXX_HWTSTAMP_ENABLED, &ps->state);
+ 
+-	/* reserved for future extensions */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		tstamp_enable = false;
+diff --git a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+index 724a3a43c70e..bd8e0e9c4d05 100644
+--- a/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
++++ b/drivers/net/ethernet/amd/xgbe/xgbe-drv.c
+@@ -1583,9 +1583,6 @@ static int xgbe_set_hwtstamp_settings(struct xgbe_prv_data *pdata,
+ 	if (copy_from_user(&config, ifreq->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	mac_tscr = 0;
+ 
+ 	switch (config.tx_type) {
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_main.c b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+index 8f70a3909929..a82472b381d8 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_main.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_main.c
+@@ -229,9 +229,6 @@ static void aq_ndev_set_multicast_settings(struct net_device *ndev)
+ static int aq_ndev_config_hwtstamp(struct aq_nic_s *aq_nic,
+ 				   struct hwtstamp_config *config)
+ {
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 	case HWTSTAMP_TX_ON:
+diff --git a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+index 9a00d58802f9..d5451d82c14f 100644
+--- a/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
++++ b/drivers/net/ethernet/broadcom/bnx2x/bnx2x_main.c
+@@ -15380,11 +15380,6 @@ static int bnx2x_hwtstamp_ioctl(struct bnx2x *bp, struct ifreq *ifr)
+ 	DP(BNX2X_MSG_PTP, "Requested tx_type: %d, requested rx_filters = %d\n",
+ 	   config.tx_type, config.rx_filter);
+ 
+-	if (config.flags) {
+-		BNX2X_ERR("config.flags is reserved for future use\n");
+-		return -EINVAL;
+-	}
+-
+ 	bp->hwtstamp_ioctl_called = true;
+ 	bp->tx_type = config.tx_type;
+ 	bp->rx_filter = config.rx_filter;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+index f0aa480799ca..4ee6e92a6362 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ptp.c
+@@ -419,9 +419,6 @@ int bnxt_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
+ 	if (copy_from_user(&stmpconf, ifr->ifr_data, sizeof(stmpconf)))
+ 		return -EFAULT;
+ 
+-	if (stmpconf.flags)
+-		return -EINVAL;
+-
+ 	if (stmpconf.tx_type != HWTSTAMP_TX_ON &&
+ 	    stmpconf.tx_type != HWTSTAMP_TX_OFF)
+ 		return -ERANGE;
+diff --git a/drivers/net/ethernet/broadcom/tg3.c b/drivers/net/ethernet/broadcom/tg3.c
+index bf7fb5273575..c61b6ff26b72 100644
+--- a/drivers/net/ethernet/broadcom/tg3.c
++++ b/drivers/net/ethernet/broadcom/tg3.c
+@@ -13804,9 +13804,6 @@ static int tg3_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
+ 	if (copy_from_user(&stmpconf, ifr->ifr_data, sizeof(stmpconf)))
+ 		return -EFAULT;
+ 
+-	if (stmpconf.flags)
+-		return -EINVAL;
+-
+ 	if (stmpconf.tx_type != HWTSTAMP_TX_ON &&
+ 	    stmpconf.tx_type != HWTSTAMP_TX_OFF)
+ 		return -ERANGE;
+diff --git a/drivers/net/ethernet/cadence/macb_ptp.c b/drivers/net/ethernet/cadence/macb_ptp.c
+index 678835136bf8..82f683bc25a6 100644
+--- a/drivers/net/ethernet/cadence/macb_ptp.c
++++ b/drivers/net/ethernet/cadence/macb_ptp.c
+@@ -456,10 +456,6 @@ int gem_set_hwtst(struct net_device *dev, struct ifreq *ifr, int cmd)
+ 			   sizeof(*tstamp_config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (tstamp_config->flags)
+-		return -EINVAL;
+-
+ 	switch (tstamp_config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		break;
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index b2a985da79c9..a83beebce5d4 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -2151,9 +2151,6 @@ static int hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr)
+ 	if (copy_from_user(&conf, ifr->ifr_data, sizeof(conf)))
+ 		return -EFAULT;
+ 
+-	if (conf.flags)
+-		return -EINVAL;
+-
+ 	switch (conf.tx_type) {
+ 	case HWTSTAMP_TX_ON:
+ 	case HWTSTAMP_TX_OFF:
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+index 103f74aef5e5..5b00e0c6e1eb 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_vf_main.c
+@@ -1234,9 +1234,6 @@ static int hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr)
+ 	if (copy_from_user(&conf, ifr->ifr_data, sizeof(conf)))
+ 		return -EFAULT;
+ 
+-	if (conf.flags)
+-		return -EINVAL;
+-
+ 	switch (conf.tx_type) {
+ 	case HWTSTAMP_TX_ON:
+ 	case HWTSTAMP_TX_OFF:
+diff --git a/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c b/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
+index 49acc448a787..580965378e24 100644
+--- a/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
++++ b/drivers/net/ethernet/cavium/octeon/octeon_mgmt.c
+@@ -698,9 +698,6 @@ static int octeon_mgmt_ioctl_hwtstamp(struct net_device *netdev,
+ 	if (copy_from_user(&config, rq->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	if (config.flags) /* reserved for future extensions */
+-		return -EINVAL;
+-
+ 	/* Check the status of hardware for tiemstamps */
+ 	if (OCTEON_IS_MODEL(OCTEON_CN6XXX)) {
+ 		/* Get the current state of the PTP clock */
+diff --git a/drivers/net/ethernet/cavium/thunder/nicvf_main.c b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+index a086087f42fa..12dd23822c53 100644
+--- a/drivers/net/ethernet/cavium/thunder/nicvf_main.c
++++ b/drivers/net/ethernet/cavium/thunder/nicvf_main.c
+@@ -1908,10 +1908,6 @@ static int nicvf_config_hwtstamp(struct net_device *netdev, struct ifreq *ifr)
+ 	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 	case HWTSTAMP_TX_ON:
+* Unmerged path drivers/net/ethernet/engleder/tsnep_ptp.c
+diff --git a/drivers/net/ethernet/freescale/fec_ptp.c b/drivers/net/ethernet/freescale/fec_ptp.c
+index 36c2d7d6ee1b..0ab50d5ee831 100644
+--- a/drivers/net/ethernet/freescale/fec_ptp.c
++++ b/drivers/net/ethernet/freescale/fec_ptp.c
+@@ -463,10 +463,6 @@ int fec_ptp_set(struct net_device *ndev, struct ifreq *ifr)
+ 	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		fep->hwts_tx_en = 0;
+diff --git a/drivers/net/ethernet/freescale/gianfar.c b/drivers/net/ethernet/freescale/gianfar.c
+index 939b6ac9535e..64db01f0bdf9 100644
+--- a/drivers/net/ethernet/freescale/gianfar.c
++++ b/drivers/net/ethernet/freescale/gianfar.c
+@@ -940,10 +940,6 @@ static int gfar_hwtstamp_set(struct net_device *netdev, struct ifreq *ifr)
+ 	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		priv->hwts_tx_en = 0;
+diff --git a/drivers/net/ethernet/intel/e1000e/netdev.c b/drivers/net/ethernet/intel/e1000e/netdev.c
+index 79f8400fa550..799cde34bb3a 100644
+--- a/drivers/net/ethernet/intel/e1000e/netdev.c
++++ b/drivers/net/ethernet/intel/e1000e/netdev.c
+@@ -3616,10 +3616,6 @@ static int e1000e_config_hwtstamp(struct e1000_adapter *adapter,
+ 	if (!(adapter->flags & FLAG_HAS_HW_TIMESTAMP))
+ 		return -EINVAL;
+ 
+-	/* flags reserved for future extensions - must be zero */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		tsync_tx_ctl = 0;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_ptp.c b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+index 09b1d5aed1c9..61e5789d78db 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_ptp.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_ptp.c
+@@ -1205,10 +1205,6 @@ static int i40e_ptp_set_timestamp_mode(struct i40e_pf *pf,
+ 
+ 	INIT_WORK(&pf->ptp_extts0_work, i40e_ptp_extts0_work);
+ 
+-	/* Reserved for future extensions. */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		pf->ptp_tx = false;
+diff --git a/drivers/net/ethernet/intel/ice/ice_ptp.c b/drivers/net/ethernet/intel/ice/ice_ptp.c
+index 007dd945d9f5..000c39d163a2 100644
+--- a/drivers/net/ethernet/intel/ice/ice_ptp.c
++++ b/drivers/net/ethernet/intel/ice/ice_ptp.c
+@@ -1715,10 +1715,6 @@ int ice_ptp_get_ts_config(struct ice_pf *pf, struct ifreq *ifr)
+ static int
+ ice_ptp_set_timestamp_mode(struct ice_pf *pf, struct hwtstamp_config *config)
+ {
+-	/* Reserved for future extensions. */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		ice_set_tx_tstamp(pf, false);
+diff --git a/drivers/net/ethernet/intel/igb/igb_ptp.c b/drivers/net/ethernet/intel/igb/igb_ptp.c
+index 0011b15e678c..0ac4cc5eaa2d 100644
+--- a/drivers/net/ethernet/intel/igb/igb_ptp.c
++++ b/drivers/net/ethernet/intel/igb/igb_ptp.c
+@@ -1015,10 +1015,6 @@ static int igb_ptp_set_timestamp_mode(struct igb_adapter *adapter,
+ 	bool is_l2 = false;
+ 	u32 regval;
+ 
+-	/* reserved for future extensions */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		tsync_tx_ctl = 0;
+diff --git a/drivers/net/ethernet/intel/igc/igc_ptp.c b/drivers/net/ethernet/intel/igc/igc_ptp.c
+index 30568e3544cd..71813fa8f928 100644
+--- a/drivers/net/ethernet/intel/igc/igc_ptp.c
++++ b/drivers/net/ethernet/intel/igc/igc_ptp.c
+@@ -560,10 +560,6 @@ static void igc_ptp_enable_tx_timestamp(struct igc_adapter *adapter)
+ static int igc_ptp_set_timestamp_mode(struct igc_adapter *adapter,
+ 				      struct hwtstamp_config *config)
+ {
+-	/* reserved for future extensions */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		igc_ptp_disable_tx_timestamp(adapter);
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+index 74d168ce4a6c..2872c0710394 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_ptp.c
+@@ -958,10 +958,6 @@ static int ixgbe_ptp_set_timestamp_mode(struct ixgbe_adapter *adapter,
+ 	bool is_l2 = false;
+ 	u32 regval;
+ 
+-	/* reserved for future extensions */
+-	if (config->flags)
+-		return -EINVAL;
+-
+ 	switch (config->tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		tsync_tx_ctl = 0;
+* Unmerged path drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/nic/otx2_pf.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+index fddd9057b084..c83d3eb5920d 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
++++ b/drivers/net/ethernet/mellanox/mlx4/en_netdev.c
+@@ -2428,10 +2428,6 @@ static int mlx4_en_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
+ 	if (copy_from_user(&config, ifr->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	/* device doesn't support time stamping */
+ 	if (!(mdev->dev->caps.flags2 & MLX4_DEV_CAP_FLAG2_TS))
+ 		return -EINVAL;
+* Unmerged path drivers/net/ethernet/microchip/lan743x_ptp.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot.c
+diff --git a/drivers/net/ethernet/neterion/vxge/vxge-main.c b/drivers/net/ethernet/neterion/vxge/vxge-main.c
+index 115dc3a9da42..fb6410f7fe50 100644
+--- a/drivers/net/ethernet/neterion/vxge/vxge-main.c
++++ b/drivers/net/ethernet/neterion/vxge/vxge-main.c
+@@ -3172,10 +3172,6 @@ static int vxge_hwtstamp_set(struct vxgedev *vdev, void __user *data)
+ 	if (copy_from_user(&config, data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	/* Transmit HW Timestamp not supported */
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+diff --git a/drivers/net/ethernet/oki-semi/pch_gbe/pch_gbe_main.c b/drivers/net/ethernet/oki-semi/pch_gbe/pch_gbe_main.c
+index 7b091837e2fe..357812c5cf4b 100644
+--- a/drivers/net/ethernet/oki-semi/pch_gbe/pch_gbe_main.c
++++ b/drivers/net/ethernet/oki-semi/pch_gbe/pch_gbe_main.c
+@@ -231,9 +231,6 @@ static int hwtstamp_ioctl(struct net_device *netdev, struct ifreq *ifr, int cmd)
+ 	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+ 		return -EFAULT;
+ 
+-	if (cfg.flags) /* reserved for future extensions */
+-		return -EINVAL;
+-
+ 	/* Get ieee1588's dev information */
+ 	pdev = adapter->ptp_pdev;
+ 
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_ptp.c b/drivers/net/ethernet/qlogic/qede/qede_ptp.c
+index 8c28fabb0ff6..39176e765767 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_ptp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_ptp.c
+@@ -304,11 +304,6 @@ int qede_ptp_hw_ts(struct qede_dev *edev, struct ifreq *ifr)
+ 		   "HWTSTAMP IOCTL: Requested tx_type = %d, requested rx_filters = %d\n",
+ 		   config.tx_type, config.rx_filter);
+ 
+-	if (config.flags) {
+-		DP_ERR(edev, "config.flags is reserved for future use\n");
+-		return -EINVAL;
+-	}
+-
+ 	ptp->hw_ts_ioctl_called = 1;
+ 	ptp->tx_type = config.tx_type;
+ 	ptp->rx_filter = config.rx_filter;
+diff --git a/drivers/net/ethernet/renesas/ravb_main.c b/drivers/net/ethernet/renesas/ravb_main.c
+index 36646b352dd3..022ca7bc0301 100644
+--- a/drivers/net/ethernet/renesas/ravb_main.c
++++ b/drivers/net/ethernet/renesas/ravb_main.c
+@@ -1741,10 +1741,6 @@ static int ravb_hwtstamp_set(struct net_device *ndev, struct ifreq *req)
+ 	if (copy_from_user(&config, req->ifr_data, sizeof(config)))
+ 		return -EFAULT;
+ 
+-	/* Reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	switch (config.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		tstamp_tx_ctrl = 0;
+diff --git a/drivers/net/ethernet/sfc/ptp.c b/drivers/net/ethernet/sfc/ptp.c
+index 797e51802ccb..f0ef515e2ade 100644
+--- a/drivers/net/ethernet/sfc/ptp.c
++++ b/drivers/net/ethernet/sfc/ptp.c
+@@ -1765,9 +1765,6 @@ static int efx_ptp_ts_init(struct efx_nic *efx, struct hwtstamp_config *init)
+ {
+ 	int rc;
+ 
+-	if (init->flags)
+-		return -EINVAL;
+-
+ 	if ((init->tx_type != HWTSTAMP_TX_OFF) &&
+ 	    (init->tx_type != HWTSTAMP_TX_ON))
+ 		return -ERANGE;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 185a2e3b67eb..0af02b964c23 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -604,10 +604,6 @@ static int stmmac_hwtstamp_set(struct net_device *dev, struct ifreq *ifr)
+ 	netdev_dbg(priv->dev, "%s config flags:0x%x, tx_type:0x%x, rx_filter:0x%x\n",
+ 		   __func__, config.flags, config.tx_type, config.rx_filter);
+ 
+-	/* reserved for future extensions */
+-	if (config.flags)
+-		return -EINVAL;
+-
+ 	if (config.tx_type != HWTSTAMP_TX_OFF &&
+ 	    config.tx_type != HWTSTAMP_TX_ON)
+ 		return -ERANGE;
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+diff --git a/drivers/net/ethernet/ti/netcp_ethss.c b/drivers/net/ethernet/ti/netcp_ethss.c
+index a6dad0df1954..18a299cf0339 100644
+--- a/drivers/net/ethernet/ti/netcp_ethss.c
++++ b/drivers/net/ethernet/ti/netcp_ethss.c
+@@ -2662,10 +2662,6 @@ static int gbe_hwtstamp_set(struct gbe_intf *gbe_intf, struct ifreq *ifr)
+ 	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+ 		return -EFAULT;
+ 
+-	/* reserved for future extensions */
+-	if (cfg.flags)
+-		return -EINVAL;
+-
+ 	switch (cfg.tx_type) {
+ 	case HWTSTAMP_TX_OFF:
+ 		cpts_tx_enable(cpts, 0);
+* Unmerged path drivers/net/ethernet/xscale/ixp4xx_eth.c
+diff --git a/drivers/net/phy/dp83640.c b/drivers/net/phy/dp83640.c
+index 6ba852632d2e..c606d5709bdf 100644
+--- a/drivers/net/phy/dp83640.c
++++ b/drivers/net/phy/dp83640.c
+@@ -1276,9 +1276,6 @@ static int dp83640_hwtstamp(struct mii_timestamper *mii_ts, struct ifreq *ifr)
+ 	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+ 		return -EFAULT;
+ 
+-	if (cfg.flags) /* reserved for future extensions */
+-		return -EINVAL;
+-
+ 	if (cfg.tx_type < 0 || cfg.tx_type > HWTSTAMP_TX_ONESTEP_SYNC)
+ 		return -ERANGE;
+ 
+* Unmerged path drivers/net/phy/mscc/mscc_ptp.c
+* Unmerged path drivers/ptp/ptp_ines.c
+diff --git a/include/uapi/linux/net_tstamp.h b/include/uapi/linux/net_tstamp.h
+index 7ed0b3d1c00a..4cd78ea62c3b 100644
+--- a/include/uapi/linux/net_tstamp.h
++++ b/include/uapi/linux/net_tstamp.h
+@@ -49,7 +49,7 @@ enum {
+ /**
+  * struct hwtstamp_config - %SIOCGHWTSTAMP and %SIOCSHWTSTAMP parameter
+  *
+- * @flags:	no flags defined right now, must be zero for %SIOCSHWTSTAMP
++ * @flags:	one of HWTSTAMP_FLAG_*
+  * @tx_type:	one of HWTSTAMP_TX_*
+  * @rx_filter:	one of HWTSTAMP_FILTER_*
+  *
+@@ -65,6 +65,20 @@ struct hwtstamp_config {
+ 	int rx_filter;
+ };
+ 
++/* possible values for hwtstamp_config->flags */
++enum hwtstamp_flags {
++	/*
++	 * With this flag, the user could get bond active interface's
++	 * PHC index. Note this PHC index is not stable as when there
++	 * is a failover, the bond active interface will be changed, so
++	 * will be the PHC index.
++	 */
++	HWTSTAMP_FLAG_BONDED_PHC_INDEX = (1<<0),
++
++	HWTSTAMP_FLAG_LAST = HWTSTAMP_FLAG_BONDED_PHC_INDEX,
++	HWTSTAMP_FLAG_MASK = (HWTSTAMP_FLAG_LAST - 1) | HWTSTAMP_FLAG_LAST
++};
++
+ /* possible values for hwtstamp_config->tx_type */
+ enum hwtstamp_tx_types {
+ 	/*
+diff --git a/net/core/dev_ioctl.c b/net/core/dev_ioctl.c
+index 97abf1f3f2b0..9b44185cd7e6 100644
+--- a/net/core/dev_ioctl.c
++++ b/net/core/dev_ioctl.c
+@@ -166,7 +166,7 @@ static int net_hwtstamp_validate(struct ifreq *ifr)
+ 	if (copy_from_user(&cfg, ifr->ifr_data, sizeof(cfg)))
+ 		return -EFAULT;
+ 
+-	if (cfg.flags) /* reserved for future extensions */
++	if (cfg.flags & ~HWTSTAMP_FLAG_MASK)
+ 		return -EINVAL;
+ 
+ 	tx_type = cfg.tx_type;
