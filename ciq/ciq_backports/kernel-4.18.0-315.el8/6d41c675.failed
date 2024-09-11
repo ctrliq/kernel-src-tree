@@ -1,0 +1,256 @@
+locking/rtmutex: Remove output from deadlock detector
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+commit 6d41c675a5394057f6fb1dc97cc0a0e360f2c2f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/6d41c675.failed
+
+The rtmutex specific deadlock detector predates lockdep coverage of rtmutex
+and since commit f5694788ad8da ("rt_mutex: Add lockdep annotations") it
+contains a lot of redundant functionality:
+
+ - lockdep will detect an potential deadlock before rtmutex-debug
+   has a chance to do so
+
+ - the deadlock debugging is restricted to rtmutexes which are not
+   associated to futexes and have an active waiter, which is covered by
+   lockdep already
+
+Remove the redundant functionality and move actual deadlock WARN() into the
+deadlock code path. The latter needs a seperate cleanup.
+
+	Signed-off-by: Sebastian Andrzej Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20210326153943.320398604@linutronix.de
+(cherry picked from commit 6d41c675a5394057f6fb1dc97cc0a0e360f2c2f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/rtmutex-debug.c
+diff --cc kernel/locking/rtmutex-debug.c
+index 36222f3f2c33,fb150100335f..000000000000
+--- a/kernel/locking/rtmutex-debug.c
++++ b/kernel/locking/rtmutex-debug.c
+@@@ -58,79 -38,6 +38,82 @@@ void rt_mutex_debug_task_free(struct ta
+  	DEBUG_LOCKS_WARN_ON(task->pi_blocked_on);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * We fill out the fields in the waiter to store the information about
+ + * the deadlock. We print when we return. act_waiter can be NULL in
+ + * case of a remove waiter operation.
+ + */
+ +void debug_rt_mutex_deadlock(enum rtmutex_chainwalk chwalk,
+ +			     struct rt_mutex_waiter *act_waiter,
+ +			     struct rt_mutex *lock)
+ +{
+ +	struct task_struct *task;
+ +
+ +	if (!debug_locks || chwalk == RT_MUTEX_FULL_CHAINWALK || !act_waiter)
+ +		return;
+ +
+ +	task = rt_mutex_owner(act_waiter->lock);
+ +	if (task && task != current) {
+ +		act_waiter->deadlock_task_pid = get_pid(task_pid(task));
+ +		act_waiter->deadlock_lock = lock;
+ +	}
+ +}
+ +
+ +void debug_rt_mutex_print_deadlock(struct rt_mutex_waiter *waiter)
+ +{
+ +	struct task_struct *task;
+ +
+ +	if (!waiter->deadlock_lock || !debug_locks)
+ +		return;
+ +
+ +	rcu_read_lock();
+ +	task = pid_task(waiter->deadlock_task_pid, PIDTYPE_PID);
+ +	if (!task) {
+ +		rcu_read_unlock();
+ +		return;
+ +	}
+ +
+ +	if (!debug_locks_off()) {
+ +		rcu_read_unlock();
+ +		return;
+ +	}
+ +
+ +	pr_warn("\n");
+ +	pr_warn("============================================\n");
+ +	pr_warn("WARNING: circular locking deadlock detected!\n");
+ +	pr_warn("%s\n", print_tainted());
+ +	pr_warn("--------------------------------------------\n");
+ +	printk("%s/%d is deadlocking current task %s/%d\n\n",
+ +	       task->comm, task_pid_nr(task),
+ +	       current->comm, task_pid_nr(current));
+ +
+ +	printk("\n1) %s/%d is trying to acquire this lock:\n",
+ +	       current->comm, task_pid_nr(current));
+ +	printk_lock(waiter->lock, 1);
+ +
+ +	printk("\n2) %s/%d is blocked on this lock:\n",
+ +		task->comm, task_pid_nr(task));
+ +	printk_lock(waiter->deadlock_lock, 1);
+ +
+ +	debug_show_held_locks(current);
+ +	debug_show_held_locks(task);
+ +
+ +	printk("\n%s/%d's [blocked] stackdump:\n\n",
+ +		task->comm, task_pid_nr(task));
+ +	show_stack(task, NULL);
+ +	printk("\n%s/%d's [current] stackdump:\n\n",
+ +		current->comm, task_pid_nr(current));
+ +	dump_stack();
+ +	debug_show_all_locks();
+ +	rcu_read_unlock();
+ +
+ +	printk("[ turning off deadlock detection."
+ +	       "Please report this trace. ]\n\n");
+ +}
+ +
+++=======
+++>>>>>>> 6d41c675a539 (locking/rtmutex: Remove output from deadlock detector)
+  void debug_rt_mutex_lock(struct rt_mutex *lock)
+  {
+  }
+diff --git a/include/linux/rtmutex.h b/include/linux/rtmutex.h
+index 48b334b9eb87..0725c4b45749 100644
+--- a/include/linux/rtmutex.h
++++ b/include/linux/rtmutex.h
+@@ -31,9 +31,6 @@ struct rt_mutex {
+ 	raw_spinlock_t		wait_lock;
+ 	struct rb_root_cached   waiters;
+ 	struct task_struct	*owner;
+-#ifdef CONFIG_DEBUG_RT_MUTEXES
+-	const char		*name;
+-#endif
+ #ifdef CONFIG_DEBUG_LOCK_ALLOC
+ 	struct lockdep_map	dep_map;
+ #endif
+@@ -56,8 +53,6 @@ struct hrtimer_sleeper;
+ #endif
+ 
+ #ifdef CONFIG_DEBUG_RT_MUTEXES
+-# define __DEBUG_RT_MUTEX_INITIALIZER(mutexname) \
+-	, .name = #mutexname
+ 
+ # define rt_mutex_init(mutex) \
+ do { \
+@@ -67,7 +62,6 @@ do { \
+ 
+  extern void rt_mutex_debug_task_free(struct task_struct *tsk);
+ #else
+-# define __DEBUG_RT_MUTEX_INITIALIZER(mutexname)
+ # define rt_mutex_init(mutex)			__rt_mutex_init(mutex, NULL, NULL)
+ # define rt_mutex_debug_task_free(t)			do { } while (0)
+ #endif
+@@ -83,7 +77,6 @@ do { \
+ 	{ .wait_lock = __RAW_SPIN_LOCK_UNLOCKED(mutexname.wait_lock) \
+ 	, .waiters = RB_ROOT_CACHED \
+ 	, .owner = NULL \
+-	__DEBUG_RT_MUTEX_INITIALIZER(mutexname) \
+ 	__DEP_MAP_RT_MUTEX_INITIALIZER(mutexname)}
+ 
+ #define DEFINE_RT_MUTEX(mutexname) \
+* Unmerged path kernel/locking/rtmutex-debug.c
+diff --git a/kernel/locking/rtmutex-debug.h b/kernel/locking/rtmutex-debug.h
+index 772c9b012b62..659e93e256c6 100644
+--- a/kernel/locking/rtmutex-debug.h
++++ b/kernel/locking/rtmutex-debug.h
+@@ -18,18 +18,9 @@ extern void debug_rt_mutex_unlock(struct rt_mutex *lock);
+ extern void debug_rt_mutex_proxy_lock(struct rt_mutex *lock,
+ 				      struct task_struct *powner);
+ extern void debug_rt_mutex_proxy_unlock(struct rt_mutex *lock);
+-extern void debug_rt_mutex_deadlock(enum rtmutex_chainwalk chwalk,
+-				    struct rt_mutex_waiter *waiter,
+-				    struct rt_mutex *lock);
+-extern void debug_rt_mutex_print_deadlock(struct rt_mutex_waiter *waiter);
+ 
+ static inline bool debug_rt_mutex_detect_deadlock(struct rt_mutex_waiter *waiter,
+ 						  enum rtmutex_chainwalk walk)
+ {
+ 	return (waiter != NULL);
+ }
+-
+-static inline void rt_mutex_print_deadlock(struct rt_mutex_waiter *w)
+-{
+-	debug_rt_mutex_print_deadlock(w);
+-}
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index 0d1634491095..440487f065be 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -578,7 +578,6 @@ static int rt_mutex_adjust_prio_chain(struct task_struct *task,
+ 	 * walk, we detected a deadlock.
+ 	 */
+ 	if (lock == orig_lock || rt_mutex_owner(lock) == top_task) {
+-		debug_rt_mutex_deadlock(chwalk, orig_waiter, lock);
+ 		raw_spin_unlock(&lock->wait_lock);
+ 		ret = -EDEADLK;
+ 		goto out_unlock_pi;
+@@ -1170,8 +1169,6 @@ __rt_mutex_slowlock(struct rt_mutex *lock, int state,
+ 
+ 		raw_spin_unlock_irq(&lock->wait_lock);
+ 
+-		debug_rt_mutex_print_deadlock(waiter);
+-
+ 		schedule();
+ 
+ 		raw_spin_lock_irq(&lock->wait_lock);
+@@ -1195,7 +1192,7 @@ static void rt_mutex_handle_deadlock(int res, int detect_deadlock,
+ 	/*
+ 	 * Yell lowdly and stop the task right here.
+ 	 */
+-	rt_mutex_print_deadlock(w);
++	WARN(1, "rtmutex deadlock detected\n");
+ 	while (1) {
+ 		set_current_state(TASK_INTERRUPTIBLE);
+ 		schedule();
+@@ -1703,8 +1700,6 @@ int __rt_mutex_start_proxy_lock(struct rt_mutex *lock,
+ 		ret = 0;
+ 	}
+ 
+-	debug_rt_mutex_print_deadlock(waiter);
+-
+ 	return ret;
+ }
+ 
+diff --git a/kernel/locking/rtmutex.h b/kernel/locking/rtmutex.h
+index 4dbdec15f1a0..d77cb8280aa6 100644
+--- a/kernel/locking/rtmutex.h
++++ b/kernel/locking/rtmutex.h
+@@ -18,13 +18,6 @@
+ #define debug_rt_mutex_proxy_unlock(l)			do { } while (0)
+ #define debug_rt_mutex_unlock(l)			do { } while (0)
+ #define debug_rt_mutex_init(m, n, k)			do { } while (0)
+-#define debug_rt_mutex_deadlock(d, a ,l)		do { } while (0)
+-#define debug_rt_mutex_print_deadlock(w)		do { } while (0)
+-
+-static inline void rt_mutex_print_deadlock(struct rt_mutex_waiter *w)
+-{
+-	WARN(1, "rtmutex deadlock detected\n");
+-}
+ 
+ static inline bool debug_rt_mutex_detect_deadlock(struct rt_mutex_waiter *w,
+ 						  enum rtmutex_chainwalk walk)
+diff --git a/kernel/locking/rtmutex_common.h b/kernel/locking/rtmutex_common.h
+index e6913103d7ff..b1455dc2366f 100644
+--- a/kernel/locking/rtmutex_common.h
++++ b/kernel/locking/rtmutex_common.h
+@@ -29,10 +29,6 @@ struct rt_mutex_waiter {
+ 	struct rb_node          pi_tree_entry;
+ 	struct task_struct	*task;
+ 	struct rt_mutex		*lock;
+-#ifdef CONFIG_DEBUG_RT_MUTEXES
+-	struct pid		*deadlock_task_pid;
+-	struct rt_mutex		*deadlock_lock;
+-#endif
+ 	int prio;
+ 	u64 deadline;
+ };
