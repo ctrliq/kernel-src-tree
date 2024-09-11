@@ -1,0 +1,211 @@
+software node: allow embedding of small arrays into property_entry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit 996b0830f95d132e50891a5568fef9e2965e4af2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/996b0830.failed
+
+We should not conflate whether a property data is an array or a single
+value with where it is stored (embedded into property_entry structure or
+out-of-line). All single-value properties are in effect 1-element
+arrays, and we can figure the amount of data stored in a property by
+examining its length and the data type. And arrays can be as easily
+stored in property entry instances as single values are, provided that
+we have enough space (we have up to 8 bytes). We can embed:
+
+ - up to 8 bytes from U8 arrays
+ - up to 4 words
+ - up to 2 double words
+ - one U64 value
+ - one (on 64 bit architectures) or 2 (on 32 bit) strings.
+
+This change also has an effect of switching properties with small amount
+of data to embed it instead of keeping it separate when copying such
+properties.
+
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 996b0830f95d132e50891a5568fef9e2965e4af2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/swnode.c
+#	include/linux/property.h
+diff --cc drivers/base/swnode.c
+index d8d0dc0ca5ac,3d422918a53d..000000000000
+--- a/drivers/base/swnode.c
++++ b/drivers/base/swnode.c
+@@@ -204,18 -201,16 +204,29 @@@ static void property_entry_free_data(co
+  	const char * const *src_str;
+  	size_t i, nval;
+  
+++<<<<<<< HEAD
+ +	if (p->is_array) {
+ +		if (p->type == DEV_PROP_STRING && p->pointer) {
+ +			src_str = p->pointer;
+ +			nval = p->length / sizeof(const char *);
+ +			for (i = 0; i < nval; i++)
+ +				kfree(src_str[i]);
+ +		}
+ +		kfree(pointer);
+ +	} else if (p->type == DEV_PROP_STRING) {
+ +		kfree(p->value.str);
+++=======
++ 	if (p->type == DEV_PROP_STRING) {
++ 		src_str = property_get_pointer(p);
++ 		nval = p->length / sizeof(*src_str);
++ 		for (i = 0; i < nval; i++)
++ 			kfree(src_str[i]);
+++>>>>>>> 996b0830f95d (software node: allow embedding of small arrays into property_entry)
+  	}
++ 
++ 	if (!p->is_inline)
++ 		kfree(p->pointer);
++ 
+  	kfree(p->name);
+  }
+  
+@@@ -248,32 -236,35 +252,62 @@@ static int property_entry_copy_data(str
+  				    const struct property_entry *src)
+  {
+  	const void *pointer = property_get_pointer(src);
+- 	const void *new;
++ 	void *dst_ptr;
++ 	size_t nval;
+  
+++<<<<<<< HEAD
+ +	if (src->is_array) {
+ +		if (!src->length)
+ +			return -ENODATA;
+ +
+ +		if (src->type == DEV_PROP_STRING) {
+ +			new = property_copy_string_array(src);
+ +			if (!new)
+ +				return -ENOMEM;
+ +		} else {
+ +			new = kmemdup(pointer, src->length, GFP_KERNEL);
+ +			if (!new)
+ +				return -ENOMEM;
+ +		}
+ +
+ +		dst->is_array = true;
+ +		dst->pointer = new;
+ +	} else if (src->type == DEV_PROP_STRING) {
+ +		new = kstrdup(src->value.str, GFP_KERNEL);
+ +		if (!new && src->value.str)
+ +			return -ENOMEM;
+ +
+ +		dst->value.str = new;
+ +	} else {
+ +		dst->value = src->value;
+++=======
++ 	/*
++ 	 * Properties with no data should not be marked as stored
++ 	 * out of line.
++ 	 */
++ 	if (!src->is_inline && !src->length)
++ 		return -ENODATA;
++ 
++ 	if (src->length <= sizeof(dst->value)) {
++ 		dst_ptr = &dst->value;
++ 		dst->is_inline = true;
++ 	} else {
++ 		dst_ptr = kmalloc(src->length, GFP_KERNEL);
++ 		if (!dst_ptr)
++ 			return -ENOMEM;
++ 		dst->pointer = dst_ptr;
++ 	}
++ 
++ 	if (src->type == DEV_PROP_STRING) {
++ 		nval = src->length / sizeof(const char *);
++ 		if (!property_copy_string_array(dst_ptr, pointer, nval)) {
++ 			if (!dst->is_inline)
++ 				kfree(dst->pointer);
++ 			return -ENOMEM;
++ 		}
++ 	} else {
++ 		memcpy(dst_ptr, pointer, src->length);
+++>>>>>>> 996b0830f95d (software node: allow embedding of small arrays into property_entry)
+  	}
+  
+  	dst->length = src->length;
+diff --cc include/linux/property.h
+index b1dbe0ba27b1,fc819c6ebf33..000000000000
+--- a/include/linux/property.h
++++ b/include/linux/property.h
+@@@ -258,11 -255,13 +258,18 @@@ struct property_entry 
+   * and structs.
+   */
+  
+++<<<<<<< HEAD
+ +#define __PROPERTY_ENTRY_ARRAY_LEN(_name_, _type_, _Type_, _val_, _len_)\
+++=======
++ #define __PROPERTY_ENTRY_ELEMENT_SIZE(_elem_)				\
++ 	sizeof(((struct property_entry *)NULL)->value._elem_[0])
++ 
++ #define __PROPERTY_ENTRY_ARRAY_LEN(_name_, _elem_, _Type_, _val_, _len_)\
+++>>>>>>> 996b0830f95d (software node: allow embedding of small arrays into property_entry)
+  (struct property_entry) {						\
+  	.name = _name_,							\
+ -	.length = (_len_) * __PROPERTY_ENTRY_ELEMENT_SIZE(_elem_),	\
+ +	.length = (_len_) * sizeof(_type_),				\
+ +	.is_array = true,						\
+  	.type = DEV_PROP_##_Type_,					\
+  	{ .pointer = _val_ },						\
+  }
+@@@ -296,30 -288,25 +303,40 @@@
+  #define PROPERTY_ENTRY_STRING_ARRAY(_name_, _val_)			\
+  	PROPERTY_ENTRY_STRING_ARRAY_LEN(_name_, _val_, ARRAY_SIZE(_val_))
+  
+++<<<<<<< HEAD
+ +#define __PROPERTY_ENTRY_INTEGER(_name_, _type_, _Type_, _val_)	\
+ +(struct property_entry) {					\
+ +	.name = _name_,						\
+ +	.length = sizeof(_type_),				\
+ +	.type = DEV_PROP_##_Type_,				\
+ +	{ .value = { ._type_##_data = _val_ } },		\
+++=======
++ #define __PROPERTY_ENTRY_ELEMENT(_name_, _elem_, _Type_, _val_)		\
++ (struct property_entry) {						\
++ 	.name = _name_,							\
++ 	.length = __PROPERTY_ENTRY_ELEMENT_SIZE(_elem_),		\
++ 	.is_inline = true,						\
++ 	.type = DEV_PROP_##_Type_,					\
++ 	{ .value = { ._elem_[0] = _val_ } },				\
+++>>>>>>> 996b0830f95d (software node: allow embedding of small arrays into property_entry)
+  }
+  
+ -#define PROPERTY_ENTRY_U8(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u8_data, U8, _val_)
+ -#define PROPERTY_ENTRY_U16(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u16_data, U16, _val_)
+ -#define PROPERTY_ENTRY_U32(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u32_data, U32, _val_)
+ -#define PROPERTY_ENTRY_U64(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, u64_data, U64, _val_)
+ -#define PROPERTY_ENTRY_STRING(_name_, _val_)				\
+ -	__PROPERTY_ENTRY_ELEMENT(_name_, str, STRING, _val_)
+ +#define PROPERTY_ENTRY_U8(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u8, U8, _val_)
+ +#define PROPERTY_ENTRY_U16(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u16, U16, _val_)
+ +#define PROPERTY_ENTRY_U32(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u32, U32, _val_)
+ +#define PROPERTY_ENTRY_U64(_name_, _val_)		\
+ +	__PROPERTY_ENTRY_INTEGER(_name_, u64, U64, _val_)
+ +
+ +#define PROPERTY_ENTRY_STRING(_name_, _val_)		\
+ +(struct property_entry) {				\
+ +	.name = _name_,					\
+ +	.length = sizeof(_val_),			\
+ +	.type = DEV_PROP_STRING,			\
+ +	{ .value = { .str = _val_ } },			\
+ +}
+  
+  #define PROPERTY_ENTRY_BOOL(_name_)		\
+  (struct property_entry) {			\
+* Unmerged path drivers/base/swnode.c
+* Unmerged path include/linux/property.h
