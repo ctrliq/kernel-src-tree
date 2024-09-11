@@ -308,8 +308,7 @@ retry:
 			rc = security_filter_rule_match(osid,
 							rule->lsm[i].type,
 							Audit_equal,
-							rule->lsm[i].rule,
-							NULL);
+							rule->lsm[i].rule);
 			break;
 		case LSM_SUBJ_USER:
 		case LSM_SUBJ_ROLE:
@@ -317,8 +316,7 @@ retry:
 			rc = security_filter_rule_match(secid,
 							rule->lsm[i].type,
 							Audit_equal,
-							rule->lsm[i].rule,
-							NULL);
+							rule->lsm[i].rule);
 		default:
 			break;
 		}
