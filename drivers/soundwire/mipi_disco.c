@@ -61,7 +61,6 @@ int sdw_master_read_prop(struct sdw_bus *bus)
 	nval = fwnode_property_read_u32_array(link,
 			"mipi-sdw-clock-frequencies-supported", NULL, 0);
 	if (nval > 0) {
-
 		prop->num_freq = nval;
 		prop->freq = devm_kcalloc(bus->dev, prop->num_freq,
 				sizeof(*prop->freq), GFP_KERNEL);
@@ -88,7 +87,6 @@ int sdw_master_read_prop(struct sdw_bus *bus)
 	nval = fwnode_property_read_u32_array(link,
 			"mipi-sdw-supported-clock-gears", NULL, 0);
 	if (nval > 0) {
-
 		prop->num_clk_gears = nval;
 		prop->clk_gears = devm_kcalloc(bus->dev, prop->num_clk_gears,
 				sizeof(*prop->clk_gears), GFP_KERNEL);
@@ -191,7 +189,6 @@ static int sdw_slave_read_dpn(struct sdw_slave *slave,
 		nval = fwnode_property_read_u32_array(node,
 				"mipi-sdw-port-wordlength-configs", NULL, 0);
 		if (nval > 0) {
-
 			dpn[i].num_words = nval;
 			dpn[i].words = devm_kcalloc(&slave->dev,
 					dpn[i].num_words,
@@ -231,7 +228,6 @@ static int sdw_slave_read_dpn(struct sdw_slave *slave,
 		nval = fwnode_property_read_u32_array(node,
 				"mipi-sdw-channel-number-list", NULL, 0);
 		if (nval > 0) {
-
 			dpn[i].num_ch = nval;
 			dpn[i].ch = devm_kcalloc(&slave->dev, dpn[i].num_ch,
 					sizeof(*dpn[i].ch), GFP_KERNEL);
@@ -246,7 +242,6 @@ static int sdw_slave_read_dpn(struct sdw_slave *slave,
 		nval = fwnode_property_read_u32_array(node,
 				"mipi-sdw-channel-combination-list", NULL, 0);
 		if (nval > 0) {
-
 			dpn[i].num_ch_combinations = nval;
 			dpn[i].ch_combinations = devm_kcalloc(&slave->dev,
 					dpn[i].num_ch_combinations,
@@ -346,7 +341,6 @@ int sdw_slave_read_prop(struct sdw_slave *slave)
 	if (!port) {
 		dev_dbg(dev, "DP0 node not found!!\n");
 	} else {
-
 		prop->dp0_prop = devm_kzalloc(&slave->dev,
 				sizeof(*prop->dp0_prop), GFP_KERNEL);
 		if (!prop->dp0_prop)
