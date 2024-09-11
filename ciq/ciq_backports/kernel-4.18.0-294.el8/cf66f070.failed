@@ -1,0 +1,188 @@
+mm, compaction: do not consider a need to reschedule as contention
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit cf66f0700c8f1d7c7c1c1d7e5e846a1836814601
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/cf66f070.failed
+
+Scanning on large machines can take a considerable length of time and
+eventually need to be rescheduled.  This is treated as an abort event
+but that's not appropriate as the attempt is likely to be retried after
+making numerous checks and taking another cycle through the page
+allocator.  This patch will check the need to reschedule if necessary
+but continue the scanning.
+
+The main benefit is reduced scanning when compaction is taking a long
+time or the machine is over-saturated.  It also avoids an unnecessary
+exit of compaction that ends up being retried by the page allocator in
+the outer loop.
+
+                                     5.0.0-rc1              5.0.0-rc1
+                              synccached-v3r16        noresched-v3r17
+Amean     fault-both-1         0.00 (   0.00%)        0.00 *   0.00%*
+Amean     fault-both-3      2958.27 (   0.00%)     2965.68 (  -0.25%)
+Amean     fault-both-5      4091.90 (   0.00%)     3995.90 (   2.35%)
+Amean     fault-both-7      5803.05 (   0.00%)     5842.12 (  -0.67%)
+Amean     fault-both-12     9481.06 (   0.00%)     9550.87 (  -0.74%)
+Amean     fault-both-18    14141.51 (   0.00%)    13304.72 (   5.92%)
+Amean     fault-both-24    16438.00 (   0.00%)    14618.59 (  11.07%)
+Amean     fault-both-30    17531.72 (   0.00%)    16650.96 (   5.02%)
+Amean     fault-both-32    17101.96 (   0.00%)    17145.15 (  -0.25%)
+
+Link: http://lkml.kernel.org/r/20190118175136.31341-18-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit cf66f0700c8f1d7c7c1c1d7e5e846a1836814601)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 79db11f23bf2,9c7d43fd4655..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -342,24 -382,25 +342,36 @@@ static inline void update_pageblock_ski
+  
+  /*
+   * Compaction requires the taking of some coarse locks that are potentially
+ - * very heavily contended. For async compaction, trylock and record if the
+ - * lock is contended. The lock will still be acquired but compaction will
+ - * abort when the current block is finished regardless of success rate.
+ - * Sync compaction acquires the lock.
+ + * very heavily contended. For async compaction, back out if the lock cannot
+ + * be taken immediately. For sync compaction, spin on the lock if needed.
+   *
+ - * Always returns true which makes it easier to track lock state in callers.
+ + * Returns true if the lock is held
+ + * Returns false if the lock is not held and compaction should abort
+   */
+ -static bool compact_lock_irqsave(spinlock_t *lock, unsigned long *flags,
+ +static bool compact_trylock_irqsave(spinlock_t *lock, unsigned long *flags,
+  						struct compact_control *cc)
+  {
+++<<<<<<< HEAD
+ +	if (cc->mode == MIGRATE_ASYNC) {
+ +		if (!spin_trylock_irqsave(lock, *flags)) {
+ +			cc->contended = true;
+ +			return false;
+ +		}
+ +	} else {
+ +		spin_lock_irqsave(lock, *flags);
+ +	}
+ +
+++=======
++ 	/* Track if the lock is contended in async mode */
++ 	if (cc->mode == MIGRATE_ASYNC && !cc->contended) {
++ 		if (spin_trylock_irqsave(lock, *flags))
++ 			return true;
++ 
++ 		cc->contended = true;
++ 	}
++ 
++ 	spin_lock_irqsave(lock, *flags);
+++>>>>>>> cf66f0700c8f (mm, compaction: do not consider a need to reschedule as contention)
+  	return true;
+  }
+  
+@@@ -391,37 -432,7 +403,41 @@@ static bool compact_unlock_should_abort
+  		return true;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (need_resched()) {
+ +		if (cc->mode == MIGRATE_ASYNC) {
+ +			cc->contended = true;
+ +			return true;
+ +		}
+ +		cond_resched();
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +/*
+ + * Aside from avoiding lock contention, compaction also periodically checks
+ + * need_resched() and either schedules in sync compaction or aborts async
+ + * compaction. This is similar to what compact_unlock_should_abort() does, but
+ + * is used where no lock is concerned.
+ + *
+ + * Returns false when no scheduling was needed, or sync compaction scheduled.
+ + * Returns true when async compaction should abort.
+ + */
+ +static inline bool compact_should_abort(struct compact_control *cc)
+ +{
+ +	/* async compaction aborts if contended */
+ +	if (need_resched()) {
+ +		if (cc->mode == MIGRATE_ASYNC) {
+ +			cc->contended = true;
+ +			return true;
+ +		}
+ +
+ +		cond_resched();
+ +	}
+++=======
++ 	cond_resched();
+++>>>>>>> cf66f0700c8f (mm, compaction: do not consider a need to reschedule as contention)
+  
+  	return false;
+  }
+@@@ -719,8 -721,7 +735,12 @@@ isolate_migratepages_block(struct compa
+  			return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (compact_should_abort(cc))
+ +		return 0;
+++=======
++ 	cond_resched();
+++>>>>>>> cf66f0700c8f (mm, compaction: do not consider a need to reschedule as contention)
+  
+  	if (cc->direct_compaction && (cc->mode == MIGRATE_ASYNC)) {
+  		skip_on_failure = true;
+@@@ -1095,12 -1352,10 +1115,17 @@@ static void isolate_freepages(struct co
+  				isolate_start_pfn = block_start_pfn) {
+  		/*
+  		 * This can iterate a massively long zone without finding any
+ -		 * suitable migration targets, so periodically check resched.
+ +		 * suitable migration targets, so periodically check if we need
+ +		 * to schedule, or even abort async compaction.
+  		 */
+++<<<<<<< HEAD
+ +		if (!(block_start_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages))
+ +						&& compact_should_abort(cc))
+ +			break;
+++=======
++ 		if (!(block_start_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages)))
++ 			cond_resched();
+++>>>>>>> cf66f0700c8f (mm, compaction: do not consider a need to reschedule as contention)
+  
+  		page = pageblock_pfn_to_page(block_start_pfn, block_end_pfn,
+  									zone);
+@@@ -1250,11 -1648,10 +1275,16 @@@ static isolate_migrate_t isolate_migrat
+  		/*
+  		 * This can potentially iterate a massively long zone with
+  		 * many pageblocks unsuitable, so periodically check if we
+ -		 * need to schedule.
+ +		 * need to schedule, or even abort async compaction.
+  		 */
+++<<<<<<< HEAD
+ +		if (!(low_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages))
+ +						&& compact_should_abort(cc))
+ +			break;
+++=======
++ 		if (!(low_pfn % (SWAP_CLUSTER_MAX * pageblock_nr_pages)))
++ 			cond_resched();
+++>>>>>>> cf66f0700c8f (mm, compaction: do not consider a need to reschedule as contention)
+  
+  		page = pageblock_pfn_to_page(block_start_pfn, block_end_pfn,
+  									zone);
+* Unmerged path mm/compaction.c
