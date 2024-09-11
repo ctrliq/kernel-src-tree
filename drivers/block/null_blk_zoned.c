@@ -147,7 +147,6 @@ void null_zone_reset(struct nullb_cmd *cmd, sector_t sector)
 		zone->wp = zone->start;
 		break;
 	default:
-		cmd->error = BLK_STS_NOTSUPP;
-		break;
+		return BLK_STS_NOTSUPP;
 	}
 }
