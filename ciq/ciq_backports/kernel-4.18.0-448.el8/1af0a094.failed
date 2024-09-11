@@ -1,0 +1,301 @@
+ethtool: don't drop the rtnl_lock half way thru the ioctl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 1af0a0948e28d83bcfa9d48cd0f992f616c5d62e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1af0a094.failed
+
+devlink compat code needs to drop rtnl_lock to take
+devlink->lock to ensure correct lock ordering.
+
+This is problematic because we're not strictly guaranteed
+that the netdev will not disappear after we re-lock.
+It may open a possibility of nested ->begin / ->complete
+calls.
+
+Instead of calling into devlink under rtnl_lock take
+a ref on the devlink instance and make the call after
+we've dropped rtnl_lock.
+
+We (continue to) assume that netdevs have an implicit
+reference on the devlink returned from ndo_get_devlink_port
+
+Note that ndo_get_devlink_port will now get called
+under rtnl_lock. That should be fine since none of
+the drivers seem to be taking serious locks inside
+ndo_get_devlink_port.
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1af0a0948e28d83bcfa9d48cd0f992f616c5d62e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ethtool/ioctl.c
+diff --cc net/ethtool/ioctl.c
+index be7380037e8d,65e9bc1058b5..000000000000
+--- a/net/ethtool/ioctl.c
++++ b/net/ethtool/ioctl.c
+@@@ -33,6 -32,29 +33,32 @@@
+  #include <generated/utsrelease.h>
+  #include "common.h"
+  
+++<<<<<<< HEAD
+++=======
++ /* State held across locks and calls for commands which have devlink fallback */
++ struct ethtool_devlink_compat {
++ 	struct devlink *devlink;
++ 	union {
++ 		struct ethtool_flash efl;
++ 		struct ethtool_drvinfo info;
++ 	};
++ };
++ 
++ static struct devlink *netdev_to_devlink_get(struct net_device *dev)
++ {
++ 	struct devlink_port *devlink_port;
++ 
++ 	if (!dev->netdev_ops->ndo_get_devlink_port)
++ 		return NULL;
++ 
++ 	devlink_port = dev->netdev_ops->ndo_get_devlink_port(dev);
++ 	if (!devlink_port)
++ 		return NULL;
++ 
++ 	return devlink_try_get(devlink_port->devlink);
++ }
++ 
+++>>>>>>> 1af0a0948e28 (ethtool: don't drop the rtnl_lock half way thru the ioctl)
+  /*
+   * Some useful ethtool_ops methods that're device independent.
+   * If we find that all drivers want to do the same thing here,
+@@@ -831,14 -763,11 +857,20 @@@ static noinline_for_stack int ethtool_g
+  	}
+  
+  	if (ops->get_eeprom_len)
+ -		rsp->info.eedump_len = ops->get_eeprom_len(dev);
+ +		info.eedump_len = ops->get_eeprom_len(dev);
+  
+++<<<<<<< HEAD
+ +	if (!info.fw_version[0])
+ +		devlink_compat_running_version(dev, info.fw_version,
+ +					       sizeof(info.fw_version));
+ +
+ +	if (copy_to_user(useraddr, &info, sizeof(info)))
+ +		return -EFAULT;
+++=======
++ 	if (!rsp->info.fw_version[0])
++ 		rsp->devlink = netdev_to_devlink_get(dev);
++ 
+++>>>>>>> 1af0a0948e28 (ethtool: don't drop the rtnl_lock half way thru the ioctl)
+  	return 0;
+  }
+  
+@@@ -2166,19 -2196,15 +2198,26 @@@ static int ethtool_set_value(struct net
+  	return actor(dev, edata.data);
+  }
+  
+ -static int
+ -ethtool_flash_device(struct net_device *dev, struct ethtool_devlink_compat *req)
+ +static noinline_for_stack int ethtool_flash_device(struct net_device *dev,
+ +						   char __user *useraddr)
+  {
+++<<<<<<< HEAD
+ +	struct ethtool_flash efl;
+++=======
++ 	if (!dev->ethtool_ops->flash_device) {
++ 		req->devlink = netdev_to_devlink_get(dev);
++ 		return 0;
++ 	}
+++>>>>>>> 1af0a0948e28 (ethtool: don't drop the rtnl_lock half way thru the ioctl)
+ +
+ +	if (copy_from_user(&efl, useraddr, sizeof(efl)))
+ +		return -EFAULT;
+ +	efl.data[ETHTOOL_FLASH_MAX_FILENAME - 1] = 0;
+ +
+ +	if (!dev->ethtool_ops->flash_device)
+ +		return devlink_compat_flash_update(dev, efl.data);
+  
+ -	return dev->ethtool_ops->flash_device(dev, &req->efl);
+ +	return dev->ethtool_ops->flash_device(dev, &efl);
+  }
+  
+  static int ethtool_set_dump(struct net_device *dev,
+@@@ -2979,6 -3014,60 +3018,63 @@@ int dev_ethtool(struct net *net, struc
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int dev_ethtool(struct net *net, struct ifreq *ifr, void __user *useraddr)
++ {
++ 	struct ethtool_devlink_compat *state;
++ 	u32 ethcmd;
++ 	int rc;
++ 
++ 	if (copy_from_user(&ethcmd, useraddr, sizeof(ethcmd)))
++ 		return -EFAULT;
++ 
++ 	state = kzalloc(sizeof(*state), GFP_KERNEL);
++ 	if (!state)
++ 		return -ENOMEM;
++ 
++ 	switch (ethcmd) {
++ 	case ETHTOOL_FLASHDEV:
++ 		if (copy_from_user(&state->efl, useraddr, sizeof(state->efl))) {
++ 			rc = -EFAULT;
++ 			goto exit_free;
++ 		}
++ 		state->efl.data[ETHTOOL_FLASH_MAX_FILENAME - 1] = 0;
++ 		break;
++ 	}
++ 
++ 	rtnl_lock();
++ 	rc = __dev_ethtool(net, ifr, useraddr, ethcmd, state);
++ 	rtnl_unlock();
++ 	if (rc)
++ 		goto exit_free;
++ 
++ 	switch (ethcmd) {
++ 	case ETHTOOL_FLASHDEV:
++ 		if (state->devlink)
++ 			rc = devlink_compat_flash_update(state->devlink,
++ 							 state->efl.data);
++ 		break;
++ 	case ETHTOOL_GDRVINFO:
++ 		if (state->devlink)
++ 			devlink_compat_running_version(state->devlink,
++ 						       state->info.fw_version,
++ 						       sizeof(state->info.fw_version));
++ 		if (copy_to_user(useraddr, &state->info, sizeof(state->info))) {
++ 			rc = -EFAULT;
++ 			goto exit_free;
++ 		}
++ 		break;
++ 	}
++ 
++ exit_free:
++ 	if (state->devlink)
++ 		devlink_put(state->devlink);
++ 	kfree(state);
++ 	return rc;
++ }
++ 
+++>>>>>>> 1af0a0948e28 (ethtool: don't drop the rtnl_lock half way thru the ioctl)
+  struct ethtool_rx_flow_key {
+  	struct flow_dissector_key_basic			basic;
+  	union {
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 7d2e9c9b2043..eb763beac3d0 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -1717,9 +1717,9 @@ devlink_trap_policers_unregister(struct devlink *devlink,
+ struct devlink *__must_check devlink_try_get(struct devlink *devlink);
+ void devlink_put(struct devlink *devlink);
+ 
+-void devlink_compat_running_version(struct net_device *dev,
++void devlink_compat_running_version(struct devlink *devlink,
+ 				    char *buf, size_t len);
+-int devlink_compat_flash_update(struct net_device *dev, const char *file_name);
++int devlink_compat_flash_update(struct devlink *devlink, const char *file_name);
+ int devlink_compat_phys_port_name_get(struct net_device *dev,
+ 				      char *name, size_t len);
+ int devlink_compat_switch_id_get(struct net_device *dev,
+@@ -1737,12 +1737,12 @@ static inline void devlink_put(struct devlink *devlink)
+ }
+ 
+ static inline void
+-devlink_compat_running_version(struct net_device *dev, char *buf, size_t len)
++devlink_compat_running_version(struct devlink *devlink, char *buf, size_t len)
+ {
+ }
+ 
+ static inline int
+-devlink_compat_flash_update(struct net_device *dev, const char *file_name)
++devlink_compat_flash_update(struct devlink *devlink, const char *file_name)
+ {
+ 	return -EOPNOTSUPP;
+ }
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index a6dbe5106a3b..6c1c214a0203 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -11340,55 +11340,28 @@ static struct devlink_port *netdev_to_devlink_port(struct net_device *dev)
+ 	return dev->netdev_ops->ndo_get_devlink_port(dev);
+ }
+ 
+-static struct devlink *netdev_to_devlink(struct net_device *dev)
+-{
+-	struct devlink_port *devlink_port = netdev_to_devlink_port(dev);
+-
+-	if (!devlink_port)
+-		return NULL;
+-
+-	return devlink_port->devlink;
+-}
+-
+-void devlink_compat_running_version(struct net_device *dev,
++void devlink_compat_running_version(struct devlink *devlink,
+ 				    char *buf, size_t len)
+ {
+-	struct devlink *devlink;
+-
+-	dev_hold(dev);
+-	rtnl_unlock();
+-
+-	devlink = netdev_to_devlink(dev);
+-	if (!devlink || !devlink->ops->info_get)
+-		goto out;
++	if (!devlink->ops->info_get)
++		return;
+ 
+ 	mutex_lock(&devlink->lock);
+ 	__devlink_compat_running_version(devlink, buf, len);
+ 	mutex_unlock(&devlink->lock);
+-
+-out:
+-	rtnl_lock();
+-	dev_put(dev);
+ }
+ 
+-int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
++int devlink_compat_flash_update(struct devlink *devlink, const char *file_name)
+ {
+ 	struct devlink_flash_update_params params = {};
+-	struct devlink *devlink;
+ 	int ret;
+ 
+-	dev_hold(dev);
+-	rtnl_unlock();
+-
+-	devlink = netdev_to_devlink(dev);
+-	if (!devlink || !devlink->ops->flash_update) {
+-		ret = -EOPNOTSUPP;
+-		goto out;
+-	}
++	if (!devlink->ops->flash_update)
++		return -EOPNOTSUPP;
+ 
+ 	ret = request_firmware(&params.fw, file_name, devlink->dev);
+ 	if (ret)
+-		goto out;
++		return ret;
+ 
+ 	mutex_lock(&devlink->lock);
+ 	devlink_flash_update_begin_notify(devlink);
+@@ -11398,10 +11371,6 @@ int devlink_compat_flash_update(struct net_device *dev, const char *file_name)
+ 
+ 	release_firmware(params.fw);
+ 
+-out:
+-	rtnl_lock();
+-	dev_put(dev);
+-
+ 	return ret;
+ }
+ 
+* Unmerged path net/ethtool/ioctl.c
