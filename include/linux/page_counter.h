@@ -13,7 +13,6 @@ struct page_counter {
 	unsigned long low;
 	RH_KABI_BROKEN_INSERT(unsigned long high)
 	unsigned long max;
-	struct page_counter *parent;
 
 	/* effective memory.min and memory.min usage tracking */
 	unsigned long emin;
@@ -28,6 +27,14 @@ struct page_counter {
 	/* legacy */
 	unsigned long watermark;
 	unsigned long failcnt;
+
+	/*
+	 * 'parent' is placed here to be far from 'usage' to reduce
+	 * cache false sharing, as 'usage' is written mostly while
+	 * parent is frequently read for cgroup's hierarchical
+	 * counting nature.
+	 */
+	struct page_counter *parent;
 };
 
 #if BITS_PER_LONG == 32
