@@ -1,0 +1,84 @@
+mm, mempolicy: fix up gup usage in lookup_node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Michal Hocko <mhocko@suse.com>
+commit 2d3a36a47964371101d9a71691c18d59ee611e87
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/2d3a36a4.failed
+
+ba841078cd05 ("mm/mempolicy: Allow lookup_node() to handle fatal signal")
+has added a special casing for 0 return value because that was a possible
+gup return value when interrupted by fatal signal.  This has been fixed by
+ae46d2aa6a7f ("mm/gup: Let __get_user_pages_locked() return -EINTR for
+fatal signal") in the mean time so ba841078cd05 can be reverted.
+
+This patch however doesn't go all the way to revert it because the check
+for 0 is wrong and confusing here.  Firstly it is inherently unsafe to
+access the page when get_user_pages_locked returns 0 (aka no page
+returned).
+
+Fortunatelly this will not happen because get_user_pages_locked will not
+return 0 when nr_pages > 0 unless FOLL_NOWAIT is specified which is not
+the case here.  Document this potential error code in gup code while we
+are at it.
+
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Peter Xu <peterx@redhat.com>
+Link: http://lkml.kernel.org/r/20200421071026.18394-1-mhocko@kernel.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2d3a36a47964371101d9a71691c18d59ee611e87)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/gup.c
+diff --cc mm/gup.c
+index ca1a0594a30a,e19ff770eb4c..000000000000
+--- a/mm/gup.c
++++ b/mm/gup.c
+@@@ -929,11 -982,18 +929,26 @@@ static int check_vma_flags(struct vm_ar
+   *		Or NULL if the caller does not require them.
+   * @locked:     whether we're still with the mmap_sem held
+   *
+++<<<<<<< HEAD
+ + * Returns number of pages pinned. This may be fewer than the number
+ + * requested. If nr_pages is 0 or negative, returns 0. If no pages
+ + * were pinned, returns -errno. Each page returned must be released
+ + * with a put_page() call when it is finished with. vmas will only
+ + * remain valid while mmap_sem is held.
+++=======
++  * Returns either number of pages pinned (which may be less than the
++  * number requested), or an error. Details about the return value:
++  *
++  * -- If nr_pages is 0, returns 0.
++  * -- If nr_pages is >0, but no pages were pinned, returns -errno.
++  * -- If nr_pages is >0, and some pages were pinned, returns the number of
++  *    pages pinned. Again, this may be less than nr_pages.
++  * -- 0 return value is possible when the fault would need to be retried.
++  *
++  * The caller is responsible for releasing returned @pages, via put_page().
++  *
++  * @vmas are valid only as long as mmap_sem is held.
+++>>>>>>> 2d3a36a47964 (mm, mempolicy: fix up gup usage in lookup_node)
+   *
+   * Must be called with mmap_sem held.  It may be released.  See below.
+   *
+* Unmerged path mm/gup.c
+diff --git a/mm/mempolicy.c b/mm/mempolicy.c
+index e2bd646d5f1e..f4c4280f15bf 100644
+--- a/mm/mempolicy.c
++++ b/mm/mempolicy.c
+@@ -889,10 +889,7 @@ static int lookup_node(struct mm_struct *mm, unsigned long addr)
+ 
+ 	int locked = 1;
+ 	err = get_user_pages_locked(addr & PAGE_MASK, 1, 0, &p, &locked);
+-	if (err == 0) {
+-		/* E.g. GUP interrupted by fatal signal */
+-		err = -EFAULT;
+-	} else if (err > 0) {
++	if (err > 0) {
+ 		err = page_to_nid(p);
+ 		put_page(p);
+ 	}
