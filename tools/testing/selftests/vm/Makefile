@@ -27,6 +27,8 @@ TEST_GEN_FILES += write_to_hugetlbfs
 
 TEST_PROGS := run_vmtests
 
+TEST_FILES := test_vmalloc.sh
+
 KSFT_KHDR_INSTALL := 1
 include ../lib.mk
 
