@@ -1,0 +1,79 @@
+KVM: VMX: Wake vCPU when delivering posted IRQ even if vCPU == this vCPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit fdba608f15e2427419997b0898750a49a735afcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/fdba608f.failed
+
+Drop a check that guards triggering a posted interrupt on the currently
+running vCPU, and more importantly guards waking the target vCPU if
+triggering a posted interrupt fails because the vCPU isn't IN_GUEST_MODE.
+If a vIRQ is delivered from asynchronous context, the target vCPU can be
+the currently running vCPU and can also be blocking, in which case
+skipping kvm_vcpu_wake_up() is effectively dropping what is supposed to
+be a wake event for the vCPU.
+
+The "do nothing" logic when "vcpu == running_vcpu" mostly works only
+because the majority of calls to ->deliver_posted_interrupt(), especially
+when using posted interrupts, come from synchronous KVM context.  But if
+a device is exposed to the guest using vfio-pci passthrough, the VFIO IRQ
+and vCPU are bound to the same pCPU, and the IRQ is _not_ configured to
+use posted interrupts, wake events from the device will be delivered to
+KVM from IRQ context, e.g.
+
+  vfio_msihandler()
+  |
+  |-> eventfd_signal()
+      |
+      |-> ...
+          |
+          |->  irqfd_wakeup()
+               |
+               |->kvm_arch_set_irq_inatomic()
+                  |
+                  |-> kvm_irq_delivery_to_apic_fast()
+                      |
+                      |-> kvm_apic_set_irq()
+
+This also aligns the non-nested and nested usage of triggering posted
+interrupts, and will allow for additional cleanups.
+
+Fixes: 379a3c8ee444 ("KVM: VMX: Optimize posted-interrupt delivery for timer fastpath")
+	Cc: stable@vger.kernel.org
+	Reported-by: Longpeng (Mike) <longpeng2@huawei.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20211208015236.1616697-18-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fdba608f15e2427419997b0898750a49a735afcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index cd2879ca5a1f,0dbf94eb954f..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -4022,14 -3964,7 +4022,18 @@@ static int vmx_deliver_posted_interrupt
+  	if (pi_test_and_set_on(&vmx->pi_desc))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * The implied barrier in pi_test_and_set_on() pairs with the smp_mb_*()
+ +	 * after setting vcpu->mode in vcpu_enter_guest(), thus the vCPU is
+ +	 * guaranteed to see PID.ON=1 and sync the PIR to IRR if triggering a
+ +	 * posted interrupt "fails" because vcpu->mode != IN_GUEST_MODE.
+ +	 */
+ +	if (vcpu != kvm_get_running_vcpu() &&
+ +	    !kvm_vcpu_trigger_posted_interrupt(vcpu, false))
+++=======
++ 	if (!kvm_vcpu_trigger_posted_interrupt(vcpu, false))
+++>>>>>>> fdba608f15e2 (KVM: VMX: Wake vCPU when delivering posted IRQ even if vCPU == this vCPU)
+  		kvm_vcpu_kick(vcpu);
+  
+  	return 0;
+* Unmerged path arch/x86/kvm/vmx/vmx.c
