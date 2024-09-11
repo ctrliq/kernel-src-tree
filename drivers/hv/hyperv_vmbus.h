@@ -147,8 +147,6 @@ struct hv_context {
 	 */
 	u64 guestid;
 
-	void *tsc_page;
-
 	struct hv_per_cpu_context __percpu *cpu_context;
 
 	/*
