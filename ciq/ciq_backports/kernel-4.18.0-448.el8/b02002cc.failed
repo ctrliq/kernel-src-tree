@@ -1,0 +1,332 @@
+s390/pci: Implement ioremap_wc/prot() with MIO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit b02002cc4c0f8a2340d07690f58cae0c04ba2325
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b02002cc.failed
+
+With our current support for the new MIO PCI instructions, write
+combining/write back MMIO memory can be obtained via the pci_iomap_wc()
+and pci_iomap_wc_range() functions.
+This is achieved by using the write back address for a specific bar
+as provided in clp_store_query_pci_fn()
+
+These functions are however not widely used and instead drivers often
+rely on ioremap_wc() and ioremap_prot(), which on other platforms enable
+write combining using a PTE flag set through the pgrprot value.
+
+While we do not have a write combining flag in the low order flag bits
+of the PTE like x86_64 does, with MIO support, there is a write back bit
+in the physical address (bit 1 on z15) and thus also the PTE.
+Which bit is used to toggle write back and whether it is available at
+all, is however not fixed in the architecture. Instead we get this
+information from the CLP Store Logical Processor Characteristics for PCI
+command. When the write back bit is not provided we fall back to the
+existing behavior.
+
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Reviewed-by: Gerald Schaefer <gerald.schaefer@linux.ibm.com>
+	Signed-off-by: Vasily Gorbik <gor@linux.ibm.com>
+(cherry picked from commit b02002cc4c0f8a2340d07690f58cae0c04ba2325)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/io.h
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/include/asm/io.h
+index ca421614722f,28664ee0abc1..000000000000
+--- a/arch/s390/include/asm/io.h
++++ b/arch/s390/include/asm/io.h
+@@@ -26,11 -27,10 +27,18 @@@ void unxlate_dev_mem_ptr(phys_addr_t ph
+  
+  #define IO_SPACE_LIMIT 0
+  
+++<<<<<<< HEAD
+ +#define ioremap_nocache(addr, size)	ioremap(addr, size)
+ +#define ioremap_wc			ioremap_nocache
+ +#define ioremap_wt			ioremap_nocache
+ +
+ +void __iomem *ioremap(unsigned long offset, unsigned long size);
+++=======
++ void __iomem *ioremap_prot(phys_addr_t addr, size_t size, unsigned long prot);
++ void __iomem *ioremap(phys_addr_t addr, size_t size);
++ void __iomem *ioremap_wc(phys_addr_t addr, size_t size);
++ void __iomem *ioremap_wt(phys_addr_t addr, size_t size);
+++>>>>>>> b02002cc4c0f (s390/pci: Implement ioremap_wc/prot() with MIO)
+  void iounmap(volatile void __iomem *addr);
+  
+  static inline void __iomem *ioport_map(unsigned long port, unsigned int nr)
+diff --cc arch/s390/pci/pci.c
+index 0438bf359bdb,fdbb99c4569d..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -225,12 -226,14 +225,16 @@@ void __iowrite64_copy(void __iomem *to
+         zpci_memcpy_toio(to, from, count);
+  }
+  
+++<<<<<<< HEAD
+ +void __iomem *ioremap(unsigned long ioaddr, unsigned long size)
+++=======
++ static void __iomem *__ioremap(phys_addr_t addr, size_t size, pgprot_t prot)
+++>>>>>>> b02002cc4c0f (s390/pci: Implement ioremap_wc/prot() with MIO)
+  {
+ -	unsigned long offset, vaddr;
+  	struct vm_struct *area;
+ -	phys_addr_t last_addr;
+ +	unsigned long offset;
+  
+ -	last_addr = addr + size - 1;
+ -	if (!size || last_addr < addr)
+ +	if (!size)
+  		return NULL;
+  
+  	if (!static_branch_unlikely(&have_mio))
+@@@ -243,10 -246,9 +247,16 @@@
+  	if (!area)
+  		return NULL;
+  
+++<<<<<<< HEAD
+ +	if (ioremap_page_range((unsigned long) area->addr,
+ +			       (unsigned long) area->addr + size,
+ +			       ioaddr, PAGE_KERNEL)) {
+ +		vunmap(area->addr);
+++=======
++ 	vaddr = (unsigned long) area->addr;
++ 	if (ioremap_page_range(vaddr, vaddr + size, addr, prot)) {
++ 		free_vm_area(area);
+++>>>>>>> b02002cc4c0f (s390/pci: Implement ioremap_wc/prot() with MIO)
+  		return NULL;
+  	}
+  	return (void __iomem *) ((unsigned long) area->addr + offset);
+diff --git a/Documentation/features/vm/ioremap_prot/arch-support.txt b/Documentation/features/vm/ioremap_prot/arch-support.txt
+index 8527601a3739..24758aa26aa1 100644
+--- a/Documentation/features/vm/ioremap_prot/arch-support.txt
++++ b/Documentation/features/vm/ioremap_prot/arch-support.txt
+@@ -23,7 +23,7 @@
+     |      parisc: | TODO |
+     |     powerpc: |  ok  |
+     |       riscv: | TODO |
+-    |        s390: | TODO |
++    |        s390: |  ok  |
+     |          sh: |  ok  |
+     |       sparc: | TODO |
+     |          um: | TODO |
+diff --git a/arch/s390/include/asm/clp.h b/arch/s390/include/asm/clp.h
+index 3925b0f085b7..10919eeb7533 100644
+--- a/arch/s390/include/asm/clp.h
++++ b/arch/s390/include/asm/clp.h
+@@ -5,6 +5,9 @@
+ /* CLP common request & response block size */
+ #define CLP_BLK_SIZE			PAGE_SIZE
+ 
++/* Call Logical Processor - Command Code */
++#define CLP_SLPC		0x0001
++
+ #define CLP_LPS_BASE	0
+ #define CLP_LPS_PCI	2
+ 
+* Unmerged path arch/s390/include/asm/io.h
+diff --git a/arch/s390/include/asm/pci.h b/arch/s390/include/asm/pci.h
+index ac5ad7605c7d..54b5bbafaae9 100644
+--- a/arch/s390/include/asm/pci.h
++++ b/arch/s390/include/asm/pci.h
+@@ -213,6 +213,7 @@ int zpci_unregister_ioat(struct zpci_dev *, u8);
+ void zpci_remove_reserved_devices(void);
+ 
+ /* CLP */
++int clp_setup_writeback_mio(void);
+ int clp_scan_pci_devices(void);
+ int clp_rescan_pci_devices(void);
+ int clp_rescan_pci_devices_simple(u32 *fid);
+diff --git a/arch/s390/include/asm/pci_clp.h b/arch/s390/include/asm/pci_clp.h
+index eb51272dd2cc..1f4b666e85ee 100644
+--- a/arch/s390/include/asm/pci_clp.h
++++ b/arch/s390/include/asm/pci_clp.h
+@@ -7,6 +7,7 @@
+ /*
+  * Call Logical Processor - Command Codes
+  */
++#define CLP_SLPC		0x0001
+ #define CLP_LIST_PCI		0x0002
+ #define CLP_QUERY_PCI_FN	0x0003
+ #define CLP_QUERY_PCI_FNGRP	0x0004
+@@ -51,6 +52,19 @@ struct clp_fh_list_entry {
+ 
+ extern bool zpci_unique_uid;
+ 
++struct clp_rsp_slpc_pci {
++	struct clp_rsp_hdr hdr;
++	u32 reserved2[4];
++	u32 lpif[8];
++	u32 reserved3[4];
++	u32 vwb		:  1;
++	u32		:  1;
++	u32 mio_wb	:  6;
++	u32		: 24;
++	u32 reserved5[3];
++	u32 lpic[8];
++} __packed;
++
+ /* List PCI functions request */
+ struct clp_req_list_pci {
+ 	struct clp_req_hdr hdr;
+@@ -172,6 +186,11 @@ struct clp_rsp_set_pci {
+ } __packed;
+ 
+ /* Combined request/response block structures used by clp insn */
++struct clp_req_rsp_slpc_pci {
++	struct clp_req_slpc request;
++	struct clp_rsp_slpc_pci response;
++} __packed;
++
+ struct clp_req_rsp_list_pci {
+ 	struct clp_req_list_pci request;
+ 	struct clp_rsp_list_pci response;
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 07651de11b88..fe857e96b253 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -1201,6 +1201,12 @@ void gmap_pmdp_invalidate(struct mm_struct *mm, unsigned long vmaddr);
+ void gmap_pmdp_idte_local(struct mm_struct *mm, unsigned long vmaddr);
+ void gmap_pmdp_idte_global(struct mm_struct *mm, unsigned long vmaddr);
+ 
++#define pgprot_writecombine	pgprot_writecombine
++pgprot_t pgprot_writecombine(pgprot_t prot);
++
++#define pgprot_writethrough	pgprot_writethrough
++pgprot_t pgprot_writethrough(pgprot_t prot);
++
+ /*
+  * Certain architectures need to do special things when PTEs
+  * within a page table are directly modified.  Thus, the following
+@@ -1224,7 +1230,8 @@ static inline void set_pte_at(struct mm_struct *mm, unsigned long addr,
+ static inline pte_t mk_pte_phys(unsigned long physpage, pgprot_t pgprot)
+ {
+ 	pte_t __pte;
+-	pte_val(__pte) = physpage + pgprot_val(pgprot);
++
++	pte_val(__pte) = physpage | pgprot_val(pgprot);
+ 	if (!MACHINE_HAS_NX)
+ 		pte_val(__pte) &= ~_PAGE_NOEXEC;
+ 	return pte_mkyoung(__pte);
+diff --git a/arch/s390/include/asm/setup.h b/arch/s390/include/asm/setup.h
+index 92ba15d7bfaa..3b4fe84b33a9 100644
+--- a/arch/s390/include/asm/setup.h
++++ b/arch/s390/include/asm/setup.h
+@@ -92,6 +92,9 @@ extern unsigned long vmalloc_size;
+ extern unsigned long max_physmem_end;
+ extern unsigned long __swsusp_reset_dma;
+ 
++/* The Write Back bit position in the physaddr is given by the SLPC PCI */
++extern unsigned long mio_wb_bit_mask;
++
+ #define MACHINE_IS_VM		(S390_lowcore.machine_flags & MACHINE_FLAG_VM)
+ #define MACHINE_IS_KVM		(S390_lowcore.machine_flags & MACHINE_FLAG_KVM)
+ #define MACHINE_IS_LPAR		(S390_lowcore.machine_flags & MACHINE_FLAG_LPAR)
+diff --git a/arch/s390/kernel/setup.c b/arch/s390/kernel/setup.c
+index 1e3370db09d2..f39ba0732add 100644
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@ -127,6 +127,12 @@ unsigned long MODULES_END;
+ struct lowcore *lowcore_ptr[NR_CPUS];
+ EXPORT_SYMBOL(lowcore_ptr);
+ 
++/*
++ * The Write Back bit position in the physaddr is given by the SLPC PCI.
++ * Leaving the mask zero always uses write through which is safe
++ */
++unsigned long mio_wb_bit_mask __ro_after_init;
++
+ /*
+  * This is set up by the setup-routine at boot-time
+  * for S390 need to find out, what we have to setup
+diff --git a/arch/s390/mm/pgtable.c b/arch/s390/mm/pgtable.c
+index 0e88be961d25..461e9c5939b2 100644
+--- a/arch/s390/mm/pgtable.c
++++ b/arch/s390/mm/pgtable.c
+@@ -26,6 +26,26 @@
+ #include <asm/mmu_context.h>
+ #include <asm/page-states.h>
+ 
++pgprot_t pgprot_writecombine(pgprot_t prot)
++{
++	/*
++	 * mio_wb_bit_mask may be set on a different CPU, but it is only set
++	 * once at init and only read afterwards.
++	 */
++	return __pgprot(pgprot_val(prot) | mio_wb_bit_mask);
++}
++EXPORT_SYMBOL_GPL(pgprot_writecombine);
++
++pgprot_t pgprot_writethrough(pgprot_t prot)
++{
++	/*
++	 * mio_wb_bit_mask may be set on a different CPU, but it is only set
++	 * once at init and only read afterwards.
++	 */
++	return __pgprot(pgprot_val(prot) & ~mio_wb_bit_mask);
++}
++EXPORT_SYMBOL_GPL(pgprot_writethrough);
++
+ static inline void ptep_ipte_local(struct mm_struct *mm, unsigned long addr,
+ 				   pte_t *ptep, int nodat)
+ {
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_clp.c b/arch/s390/pci/pci_clp.c
+index 322689bec217..0dbc26d0c8b7 100644
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -294,6 +294,40 @@ static int clp_set_pci_fn(struct zpci_dev *zdev, u8 nr_dma_as, u8 command)
+ 	return rc;
+ }
+ 
++int clp_setup_writeback_mio(void)
++{
++	struct clp_req_rsp_slpc_pci *rrb;
++	u8  wb_bit_pos;
++	int rc;
++
++	rrb = clp_alloc_block(GFP_KERNEL);
++	if (!rrb)
++		return -ENOMEM;
++
++	memset(rrb, 0, sizeof(*rrb));
++	rrb->request.hdr.len = sizeof(rrb->request);
++	rrb->request.hdr.cmd = CLP_SLPC;
++	rrb->response.hdr.len = sizeof(rrb->response);
++
++	rc = clp_req(rrb, CLP_LPS_PCI);
++	if (!rc && rrb->response.hdr.rsp == CLP_RC_OK) {
++		if (rrb->response.vwb) {
++			wb_bit_pos = rrb->response.mio_wb;
++			set_bit_inv(wb_bit_pos, &mio_wb_bit_mask);
++			zpci_dbg(3, "wb bit: %d\n", wb_bit_pos);
++		} else {
++			zpci_dbg(3, "wb bit: n.a.\n");
++		}
++
++	} else {
++		zpci_err("SLPC PCI:\n");
++		zpci_err_clp(rrb->response.hdr.rsp, rc);
++		rc = -EIO;
++	}
++	clp_free_block(rrb);
++	return rc;
++}
++
+ int clp_enable_fh(struct zpci_dev *zdev, u8 nr_dma_as)
+ {
+ 	int rc;
+@@ -497,7 +531,7 @@ static int clp_base_command(struct clp_req *req, struct clp_req_hdr *lpcb)
+ 	}
+ }
+ 
+-static int clp_pci_slpc(struct clp_req *req, struct clp_req_rsp_slpc *lpcb)
++static int clp_pci_slpc(struct clp_req *req, struct clp_req_rsp_slpc_pci *lpcb)
+ {
+ 	unsigned long limit = PAGE_SIZE - sizeof(lpcb->request);
+ 
