@@ -1,0 +1,139 @@
+ASoC: SOF: Intel: remove unnecessary waitq before loading firmware
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: SOF: Intel: remove unnecessary waitq before loading firmware (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 95.65%
+commit-author Amery Song <chao.song@intel.com>
+commit 828c2f7871d8f8051c7f412c74115ef2c583b1ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/828c2f78.failed
+
+The HDA_DSP_IPC_PURGE_FW IPC from ROM is already handled in
+cl_dsp_init(), and it will never be received in the IRQ thread,
+so the wait condition on this IPC will never be satisfied. The
+wait before loading firmware is redundant and can be removed safely.
+
+	Signed-off-by: Amery Song <chao.song@intel.com>
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Keyon Jie <yang.jie@linux.intel.com>
+	Reviewed-by: Kai Vehmanen <kai.vehmanen@linux.intel.com>
+	Reviewed-by: Pierre Bossart <pierre-louis.bossart@linux.intel.com>
+	Reviewed-by: Ranjani Sridharan <ranjani.sridharan@linux.intel.com>
+	Reviewed-by: Guennadi Liakhovetski <guennadi.liakhovetski@linux.intel.com>
+Link: https://lore.kernel.org/r/20200312200622.24477-6-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 828c2f7871d8f8051c7f412c74115ef2c583b1ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/sof-priv.h
+diff --cc sound/soc/sof/sof-priv.h
+index b6c2f9374075,a4b297c842df..000000000000
+--- a/sound/soc/sof/sof-priv.h
++++ b/sound/soc/sof/sof-priv.h
+@@@ -472,9 -421,9 +472,15 @@@ struct snd_sof_dev 
+  	int ipc_timeout;
+  	int boot_timeout;
+  
+++<<<<<<< HEAD
+ +	/* Wait queue for code loading */
+ +	wait_queue_head_t waitq;
+ +	int code_loading;
+++=======
++ #if IS_ENABLED(CONFIG_SND_SOC_SOF_DEBUG_PROBES)
++ 	unsigned int extractor_stream_tag;
++ #endif
+++>>>>>>> 828c2f7871d8 (ASoC: SOF: Intel: remove unnecessary waitq before loading firmware)
+  
+  	/* DMA for Trace */
+  	struct snd_dma_buffer dmatb;
+diff --git a/sound/soc/sof/intel/cnl.c b/sound/soc/sof/intel/cnl.c
+index aaa3f3a74f98..d5817e603a9b 100644
+--- a/sound/soc/sof/intel/cnl.c
++++ b/sound/soc/sof/intel/cnl.c
+@@ -64,11 +64,6 @@ static irqreturn_t cnl_ipc_irq_thread(int irq, void *context)
+ 		hda_dsp_ipc_get_reply(sdev);
+ 		snd_sof_ipc_reply(sdev, msg);
+ 
+-		if (sdev->code_loading)	{
+-			sdev->code_loading = 0;
+-			wake_up(&sdev->waitq);
+-		}
+-
+ 		cnl_ipc_dsp_done(sdev);
+ 
+ 		spin_unlock_irq(&sdev->ipc_lock);
+diff --git a/sound/soc/sof/intel/hda-ipc.c b/sound/soc/sof/intel/hda-ipc.c
+index 1837f66e361f..98d9374769d7 100644
+--- a/sound/soc/sof/intel/hda-ipc.c
++++ b/sound/soc/sof/intel/hda-ipc.c
+@@ -180,12 +180,6 @@ irqreturn_t hda_dsp_ipc_irq_thread(int irq, void *context)
+ 			snd_sof_ipc_reply(sdev, msg);
+ 		}
+ 
+-		/* wake up sleeper if we are loading code */
+-		if (sdev->code_loading)	{
+-			sdev->code_loading = 0;
+-			wake_up(&sdev->waitq);
+-		}
+-
+ 		/* set the done bit */
+ 		hda_dsp_ipc_dsp_done(sdev);
+ 
+diff --git a/sound/soc/sof/intel/hda-loader.c b/sound/soc/sof/intel/hda-loader.c
+index bae7ac3581e5..d04f47a6170d 100644
+--- a/sound/soc/sof/intel/hda-loader.c
++++ b/sound/soc/sof/intel/hda-loader.c
+@@ -173,9 +173,6 @@ static int cl_trigger(struct snd_sof_dev *sdev,
+ 	/* code loader is special case that reuses stream ops */
+ 	switch (cmd) {
+ 	case SNDRV_PCM_TRIGGER_START:
+-		wait_event_timeout(sdev->waitq, !sdev->code_loading,
+-				   HDA_DSP_CL_TRIGGER_TIMEOUT);
+-
+ 		snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR, SOF_HDA_INTCTL,
+ 					1 << hstream->index,
+ 					1 << hstream->index);
+diff --git a/sound/soc/sof/intel/hda.c b/sound/soc/sof/intel/hda.c
+index e20431686d1c..68468fec97cb 100644
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@ -686,9 +686,6 @@ int hda_dsp_probe(struct snd_sof_dev *sdev)
+ 	hda_dsp_ctrl_ppcap_enable(sdev, true);
+ 	hda_dsp_ctrl_ppcap_int_enable(sdev, true);
+ 
+-	/* initialize waitq for code loading */
+-	init_waitqueue_head(&sdev->waitq);
+-
+ 	/* set default mailbox offset for FW ready message */
+ 	sdev->dsp_box.offset = HDA_DSP_MBOX_UPLINK_OFFSET;
+ 
+diff --git a/sound/soc/sof/intel/hda.h b/sound/soc/sof/intel/hda.h
+index 8b0e8dd9071a..2c40a7dc2d4a 100644
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@ -175,7 +175,6 @@
+  * value cannot be read back within the specified time.
+  */
+ #define HDA_DSP_STREAM_RUN_TIMEOUT		300
+-#define HDA_DSP_CL_TRIGGER_TIMEOUT		300
+ 
+ #define HDA_DSP_SPIB_ENABLE			1
+ #define HDA_DSP_SPIB_DISABLE			0
+diff --git a/sound/soc/sof/loader.c b/sound/soc/sof/loader.c
+index 0e8680224dda..1c68f5a0aae0 100644
+--- a/sound/soc/sof/loader.c
++++ b/sound/soc/sof/loader.c
+@@ -469,9 +469,6 @@ int snd_sof_load_firmware_raw(struct snd_sof_dev *sdev)
+ 	const char *fw_filename;
+ 	int ret;
+ 
+-	/* set code loading condition to true */
+-	sdev->code_loading = 1;
+-
+ 	/* Don't request firmware again if firmware is already requested */
+ 	if (plat_data->fw)
+ 		return 0;
+* Unmerged path sound/soc/sof/sof-priv.h
