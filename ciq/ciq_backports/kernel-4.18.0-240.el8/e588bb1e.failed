@@ -1,0 +1,184 @@
+gpio: add new SET_CONFIG ioctl() to gpio chardev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Kent Gibson <warthog618@gmail.com>
+commit e588bb1eae31be73fbec2b731be986a7c09635a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e588bb1e.failed
+
+Add the GPIOHANDLE_SET_CONFIG_IOCTL to the gpio chardev.
+The ioctl allows some of the configuration of a requested handle to be
+changed without having to release the line.
+The primary use case is the changing of direction for bi-directional
+lines.
+
+Based on initial work by Bartosz Golaszewski <bgolaszewski@baylibre.com>
+
+	Signed-off-by: Kent Gibson <warthog618@gmail.com>
+	Signed-off-by: Bartosz Golaszewski <bgolaszewski@baylibre.com>
+(cherry picked from commit e588bb1eae31be73fbec2b731be986a7c09635a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpio/gpiolib.c
+diff --cc drivers/gpio/gpiolib.c
+index 07b822ae02a4,dba5f08f308c..000000000000
+--- a/drivers/gpio/gpiolib.c
++++ b/drivers/gpio/gpiolib.c
+@@@ -432,6 -428,121 +432,124 @@@ struct linehandle_state 
+  	GPIOHANDLE_REQUEST_OPEN_DRAIN | \
+  	GPIOHANDLE_REQUEST_OPEN_SOURCE)
+  
+++<<<<<<< HEAD
+++=======
++ static int linehandle_validate_flags(u32 flags)
++ {
++ 	/* Return an error if an unknown flag is set */
++ 	if (flags & ~GPIOHANDLE_REQUEST_VALID_FLAGS)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Do not allow both INPUT & OUTPUT flags to be set as they are
++ 	 * contradictory.
++ 	 */
++ 	if ((flags & GPIOHANDLE_REQUEST_INPUT) &&
++ 	    (flags & GPIOHANDLE_REQUEST_OUTPUT))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Do not allow OPEN_SOURCE & OPEN_DRAIN flags in a single request. If
++ 	 * the hardware actually supports enabling both at the same time the
++ 	 * electrical result would be disastrous.
++ 	 */
++ 	if ((flags & GPIOHANDLE_REQUEST_OPEN_DRAIN) &&
++ 	    (flags & GPIOHANDLE_REQUEST_OPEN_SOURCE))
++ 		return -EINVAL;
++ 
++ 	/* OPEN_DRAIN and OPEN_SOURCE flags only make sense for output mode. */
++ 	if (!(flags & GPIOHANDLE_REQUEST_OUTPUT) &&
++ 	    ((flags & GPIOHANDLE_REQUEST_OPEN_DRAIN) ||
++ 	     (flags & GPIOHANDLE_REQUEST_OPEN_SOURCE)))
++ 		return -EINVAL;
++ 
++ 	/* Bias flags only allowed for input or output mode. */
++ 	if (!((flags & GPIOHANDLE_REQUEST_INPUT) ||
++ 	      (flags & GPIOHANDLE_REQUEST_OUTPUT)) &&
++ 	    ((flags & GPIOHANDLE_REQUEST_BIAS_DISABLE) ||
++ 	     (flags & GPIOHANDLE_REQUEST_BIAS_PULL_UP) ||
++ 	     (flags & GPIOHANDLE_REQUEST_BIAS_PULL_DOWN)))
++ 		return -EINVAL;
++ 
++ 	/* Only one bias flag can be set. */
++ 	if (((flags & GPIOHANDLE_REQUEST_BIAS_DISABLE) &&
++ 	     (flags & (GPIOHANDLE_REQUEST_BIAS_PULL_DOWN |
++ 			GPIOHANDLE_REQUEST_BIAS_PULL_UP))) ||
++ 	    ((flags & GPIOHANDLE_REQUEST_BIAS_PULL_DOWN) &&
++ 	     (flags & GPIOHANDLE_REQUEST_BIAS_PULL_UP)))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ 
++ static void linehandle_configure_flag(unsigned long *flagsp,
++ 				      u32 bit, bool active)
++ {
++ 	if (active)
++ 		set_bit(bit, flagsp);
++ 	else
++ 		clear_bit(bit, flagsp);
++ }
++ 
++ static long linehandle_set_config(struct linehandle_state *lh,
++ 				  void __user *ip)
++ {
++ 	struct gpiohandle_config gcnf;
++ 	struct gpio_desc *desc;
++ 	int i, ret;
++ 	u32 lflags;
++ 	unsigned long *flagsp;
++ 
++ 	if (copy_from_user(&gcnf, ip, sizeof(gcnf)))
++ 		return -EFAULT;
++ 
++ 	lflags = gcnf.flags;
++ 	ret = linehandle_validate_flags(lflags);
++ 	if (ret)
++ 		return ret;
++ 
++ 	for (i = 0; i < lh->numdescs; i++) {
++ 		desc = lh->descs[i];
++ 		flagsp = &desc->flags;
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_ACTIVE_LOW,
++ 			lflags & GPIOHANDLE_REQUEST_ACTIVE_LOW);
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_OPEN_DRAIN,
++ 			lflags & GPIOHANDLE_REQUEST_OPEN_DRAIN);
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_OPEN_SOURCE,
++ 			lflags & GPIOHANDLE_REQUEST_OPEN_SOURCE);
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_PULL_UP,
++ 			lflags & GPIOHANDLE_REQUEST_BIAS_PULL_UP);
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_PULL_DOWN,
++ 			lflags & GPIOHANDLE_REQUEST_BIAS_PULL_DOWN);
++ 
++ 		linehandle_configure_flag(flagsp, FLAG_BIAS_DISABLE,
++ 			lflags & GPIOHANDLE_REQUEST_BIAS_DISABLE);
++ 
++ 		/*
++ 		 * Lines have to be requested explicitly for input
++ 		 * or output, else the line will be treated "as is".
++ 		 */
++ 		if (lflags & GPIOHANDLE_REQUEST_OUTPUT) {
++ 			int val = !!gcnf.default_values[i];
++ 
++ 			ret = gpiod_direction_output(desc, val);
++ 			if (ret)
++ 				return ret;
++ 		} else if (lflags & GPIOHANDLE_REQUEST_INPUT) {
++ 			ret = gpiod_direction_input(desc);
++ 			if (ret)
++ 				return ret;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> e588bb1eae31 (gpio: add new SET_CONFIG ioctl() to gpio chardev)
+  static long linehandle_ioctl(struct file *filep, unsigned int cmd,
+  			     unsigned long arg)
+  {
+* Unmerged path drivers/gpio/gpiolib.c
+diff --git a/include/uapi/linux/gpio.h b/include/uapi/linux/gpio.h
+index 4f8135d375f5..1a5c278e2356 100644
+--- a/include/uapi/linux/gpio.h
++++ b/include/uapi/linux/gpio.h
+@@ -98,6 +98,24 @@ struct gpiohandle_request {
+ 	int fd;
+ };
+ 
++/**
++ * struct gpiohandle_config - Configuration for a GPIO handle request
++ * @flags: updated flags for the requested GPIO lines, such as
++ * GPIOHANDLE_REQUEST_OUTPUT, GPIOHANDLE_REQUEST_ACTIVE_LOW etc, OR:ed
++ * together
++ * @default_values: if the GPIOHANDLE_REQUEST_OUTPUT is set in flags,
++ * this specifies the default output value, should be 0 (low) or
++ * 1 (high), anything else than 0 or 1 will be interpreted as 1 (high)
++ * @padding: reserved for future use and should be zero filled
++ */
++struct gpiohandle_config {
++	__u32 flags;
++	__u8 default_values[GPIOHANDLES_MAX];
++	__u32 padding[4]; /* padding for future use */
++};
++
++#define GPIOHANDLE_SET_CONFIG_IOCTL _IOWR(0xB4, 0x0a, struct gpiohandle_config)
++
+ /**
+  * struct gpiohandle_data - Information of values on a GPIO handle
+  * @values: when getting the state of lines this contains the current
