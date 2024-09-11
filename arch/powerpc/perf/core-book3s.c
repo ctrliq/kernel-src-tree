@@ -90,6 +90,7 @@ static unsigned int freeze_events_kernel = MMCR0_FCS;
 
 #define SPRN_MMCRA		SPRN_MMCR2
 #define MMCRA_SAMPLE_ENABLE	0
+#define MMCRA_BHRB_DISABLE     0
 
 static inline unsigned long perf_ip_adjust(struct pt_regs *regs)
 {
