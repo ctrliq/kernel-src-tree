@@ -1,0 +1,161 @@
+tipc: enable creating a "preliminary" node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit 4cbf8ac2fe5a0846508fe02b95a5de1a90fa73f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4cbf8ac2.failed
+
+When user sets RX key for a peer not existing on the own node, a new
+node entry is needed to which the RX key will be attached. However,
+since the peer node address (& capabilities) is unknown at that moment,
+only the node-ID is provided, this commit allows the creation of a node
+with only the data that we call as “preliminary”.
+
+A preliminary node is not the object of the “tipc_node_find()” but the
+“tipc_node_find_by_id()”. Once the first message i.e. LINK_CONFIG comes
+from that peer, and is successfully decrypted by the own node, the
+actual peer node data will be properly updated and the node will
+function as usual.
+
+In addition, the node timer always starts when a node object is created
+so if a preliminary node is not used, it will be cleaned up.
+
+The later encryption functions will also use the node timer and be able
+to create a preliminary node automatically when needed.
+
+	Acked-by: Ying Xue <ying.xue@windreiver.com>
+	Acked-by: Jon Maloy <jon.maloy@ericsson.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4cbf8ac2fe5a0846508fe02b95a5de1a90fa73f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/node.c
+diff --cc net/tipc/node.c
+index 3fe27ab13350,43d12a630f34..000000000000
+--- a/net/tipc/node.c
++++ b/net/tipc/node.c
+@@@ -360,8 -383,37 +373,13 @@@ static void tipc_node_write_unlock(stru
+  	}
+  }
+  
+ -static void tipc_node_assign_peer_net(struct tipc_node *n, u32 hash_mixes)
+ -{
+ -	int net_id = tipc_netid(n->net);
+ -	struct tipc_net *tn_peer;
+ -	struct net *tmp;
+ -	u32 hash_chk;
+ -
+ -	if (n->peer_net)
+ -		return;
+ -
+ -	for_each_net_rcu(tmp) {
+ -		tn_peer = tipc_net(tmp);
+ -		if (!tn_peer)
+ -			continue;
+ -		/* Integrity checking whether node exists in namespace or not */
+ -		if (tn_peer->net_id != net_id)
+ -			continue;
+ -		if (memcmp(n->peer_id, tn_peer->node_id, NODE_ID_LEN))
+ -			continue;
+ -		hash_chk = tipc_net_hash_mixes(tmp, tn_peer->random);
+ -		if (hash_mixes ^ hash_chk)
+ -			continue;
+ -		n->peer_net = tmp;
+ -		n->peer_hash_mix = hash_mixes;
+ -		break;
+ -	}
+ -}
+ -
+  static struct tipc_node *tipc_node_create(struct net *net, u32 addr,
+++<<<<<<< HEAD
+ +					  u8 *peer_id, u16 capabilities)
+++=======
++ 					  u8 *peer_id, u16 capabilities,
++ 					  u32 hash_mixes, bool preliminary)
+++>>>>>>> 4cbf8ac2fe5a (tipc: enable creating a "preliminary" node)
+  {
+  	struct tipc_net *tn = net_generic(net, tipc_net_id);
+  	struct tipc_node *n, *temp_node;
+@@@ -370,8 -423,31 +389,34 @@@
+  	int i;
+  
+  	spin_lock_bh(&tn->node_list_lock);
+- 	n = tipc_node_find(net, addr);
++ 	n = tipc_node_find(net, addr) ?:
++ 		tipc_node_find_by_id(net, peer_id);
+  	if (n) {
+++<<<<<<< HEAD
+++=======
++ 		if (!n->preliminary)
++ 			goto update;
++ 		if (preliminary)
++ 			goto exit;
++ 		/* A preliminary node becomes "real" now, refresh its data */
++ 		tipc_node_write_lock(n);
++ 		n->preliminary = false;
++ 		n->addr = addr;
++ 		hlist_del_rcu(&n->hash);
++ 		hlist_add_head_rcu(&n->hash,
++ 				   &tn->node_htable[tipc_hashfn(addr)]);
++ 		list_del_rcu(&n->list);
++ 		list_for_each_entry_rcu(temp_node, &tn->node_list, list) {
++ 			if (n->addr < temp_node->addr)
++ 				break;
++ 		}
++ 		list_add_tail_rcu(&n->list, &temp_node->list);
++ 		tipc_node_write_unlock_fast(n);
++ 
++ update:
++ 		if (n->peer_hash_mix ^ hash_mixes)
++ 			tipc_node_assign_peer_net(n, hash_mixes);
+++>>>>>>> 4cbf8ac2fe5a (tipc: enable creating a "preliminary" node)
+  		if (n->capabilities == capabilities)
+  			goto exit;
+  		/* Same node may come back with new capabilities */
+@@@ -400,9 -473,15 +445,11 @@@
+  		pr_warn("Node creation failed, no memory\n");
+  		goto exit;
+  	}
++ 	tipc_nodeid2string(n->peer_id_string, peer_id);
+  	n->addr = addr;
++ 	n->preliminary = preliminary;
+  	memcpy(&n->peer_id, peer_id, 16);
+  	n->net = net;
+ -	n->peer_net = NULL;
+ -	n->peer_hash_mix = 0;
+ -	/* Assign kernel local namespace if exists */
+ -	tipc_node_assign_peer_net(n, hash_mixes);
+  	n->capabilities = capabilities;
+  	kref_init(&n->kref);
+  	rwlock_init(&n->lock);
+@@@ -1009,7 -1082,8 +1052,12 @@@ void tipc_node_check_dest(struct net *n
+  	*dupl_addr = false;
+  	*respond = false;
+  
+++<<<<<<< HEAD
+ +	n = tipc_node_create(net, addr, peer_id, capabilities);
+++=======
++ 	n = tipc_node_create(net, addr, peer_id, capabilities, hash_mixes,
++ 			     false);
+++>>>>>>> 4cbf8ac2fe5a (tipc: enable creating a "preliminary" node)
+  	if (!n)
+  		return;
+  
+* Unmerged path net/tipc/node.c
+diff --git a/net/tipc/node.h b/net/tipc/node.h
+index b9036f289aea..1417ade44a73 100644
+--- a/net/tipc/node.h
++++ b/net/tipc/node.h
+@@ -75,6 +75,7 @@ enum {
+ void tipc_node_stop(struct net *net);
+ bool tipc_node_get_id(struct net *net, u32 addr, u8 *id);
+ u32 tipc_node_get_addr(struct tipc_node *node);
++char *tipc_node_get_id_str(struct tipc_node *node);
+ u32 tipc_node_try_addr(struct net *net, u8 *id, u32 addr);
+ void tipc_node_check_dest(struct net *net, u32 onode, u8 *peer_id128,
+ 			  struct tipc_bearer *bearer,
