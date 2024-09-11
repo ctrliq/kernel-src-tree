@@ -1672,6 +1672,7 @@ EXPORT_SYMBOL_GPL(target_init_cmd);
  * Returns:
  *	- less than zero to signal failure.
  *	- zero on success.
+ *
  * If failure is returned, lio will the callers queue_status to complete
  * the cmd.
  */
