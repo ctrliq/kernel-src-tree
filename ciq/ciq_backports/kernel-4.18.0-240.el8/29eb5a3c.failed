@@ -1,0 +1,235 @@
+KVM: arm64: Handle PtrAuth traps early
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 29eb5a3c57f7e06d803bb44a0ce2f9ed79f39cd9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/29eb5a3c.failed
+
+The current way we deal with PtrAuth is a bit heavy handed:
+
+- We forcefully save the host's keys on each vcpu_load()
+- Handling the PtrAuth trap forces us to go all the way back
+  to the exit handling code to just set the HCR bits
+
+Overall, this is pretty cumbersome. A better approach would be
+to handle it the same way we deal with the FPSIMD registers:
+
+- On vcpu_load() disable PtrAuth for the guest
+- On first use, save the host's keys, enable PtrAuth in the
+  guest
+
+Crucially, this can happen as a fixup, which is done very early
+on exit. We can then reenter the guest immediately without
+leaving the hypervisor role.
+
+Another thing is that it simplify the rest of the host handling:
+exiting all the way to the host means that the only possible
+outcome for this trap is to inject an UNDEF.
+
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 29eb5a3c57f7e06d803bb44a0ce2f9ed79f39cd9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/handle_exit.c
+#	virt/kvm/arm/arm.c
+diff --cc arch/arm64/kvm/handle_exit.c
+index 516aead3c2a9,5a02d4c90559..000000000000
+--- a/arch/arm64/kvm/handle_exit.c
++++ b/arch/arm64/kvm/handle_exit.c
+@@@ -173,36 -162,10 +173,40 @@@ static int handle_sve(struct kvm_vcpu *
+  	return 1;
+  }
+  
+ +#define __ptrauth_save_key(regs, key)						\
+ +({										\
+ +	regs[key ## KEYLO_EL1] = read_sysreg_s(SYS_ ## key ## KEYLO_EL1);	\
+ +	regs[key ## KEYHI_EL1] = read_sysreg_s(SYS_ ## key ## KEYHI_EL1);	\
+ +})
+ +
+ +/*
+++<<<<<<< HEAD
+ + * Handle the guest trying to use a ptrauth instruction, or trying to access a
+ + * ptrauth register.
+ + */
+ +void kvm_arm_vcpu_ptrauth_trap(struct kvm_vcpu *vcpu)
+ +{
+ +	struct kvm_cpu_context *ctxt;
+ +
+ +	if (vcpu_has_ptrauth(vcpu)) {
+ +		vcpu_ptrauth_enable(vcpu);
+ +		ctxt = vcpu->arch.host_cpu_context;
+ +		__ptrauth_save_key(ctxt->sys_regs, APIA);
+ +		__ptrauth_save_key(ctxt->sys_regs, APIB);
+ +		__ptrauth_save_key(ctxt->sys_regs, APDA);
+ +		__ptrauth_save_key(ctxt->sys_regs, APDB);
+ +		__ptrauth_save_key(ctxt->sys_regs, APGA);
+ +	} else {
+ +		kvm_inject_undefined(vcpu);
+ +	}
+ +}
+ +
+  /*
+++=======
+++>>>>>>> 29eb5a3c57f7 (KVM: arm64: Handle PtrAuth traps early)
+   * Guest usage of a ptrauth instruction (which the guest EL1 did not turn into
+-  * a NOP).
++  * a NOP). If we get here, it is that we didn't fixup ptrauth on exit, and all
++  * that we can do is give the guest an UNDEF.
+   */
+  static int kvm_handle_ptrauth(struct kvm_vcpu *vcpu, struct kvm_run *run)
+  {
+diff --cc virt/kvm/arm/arm.c
+index c7748896c963,14b747266607..000000000000
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@@ -343,22 -337,6 +343,25 @@@ void kvm_arch_vcpu_unblocking(struct kv
+  	preempt_enable();
+  }
+  
+++<<<<<<< HEAD:virt/kvm/arm/arm.c
+ +int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ +{
+ +	/* Force users to call KVM_ARM_VCPU_INIT */
+ +	vcpu->arch.target = -1;
+ +	bitmap_zero(vcpu->arch.features, KVM_VCPU_MAX_FEATURES);
+ +
+ +	/* Set up the timer */
+ +	kvm_timer_vcpu_init(vcpu);
+ +
+ +	kvm_pmu_vcpu_init(vcpu);
+ +
+ +	kvm_arm_reset_debug_ptr(vcpu);
+ +
+ +	return kvm_vgic_vcpu_init(vcpu);
+ +}
+ +
+++=======
+++>>>>>>> 29eb5a3c57f7 (KVM: arm64: Handle PtrAuth traps early):arch/arm64/kvm/arm.c
+  void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	int *last_ran;
+@@@ -390,7 -370,8 +393,12 @@@
+  	else
+  		vcpu_set_wfx_traps(vcpu);
+  
+++<<<<<<< HEAD:virt/kvm/arm/arm.c
+ +	vcpu_ptrauth_setup_lazy(vcpu);
+++=======
++ 	if (vcpu_has_ptrauth(vcpu))
++ 		vcpu_ptrauth_disable(vcpu);
+++>>>>>>> 29eb5a3c57f7 (KVM: arm64: Handle PtrAuth traps early):arch/arm64/kvm/arm.c
+  }
+  
+  void kvm_arch_vcpu_put(struct kvm_vcpu *vcpu)
+* Unmerged path arch/arm64/kvm/handle_exit.c
+diff --git a/arch/arm64/kvm/hyp/switch.c b/arch/arm64/kvm/hyp/switch.c
+index 03e90f8448bf..8a02b013bcc5 100644
+--- a/arch/arm64/kvm/hyp/switch.c
++++ b/arch/arm64/kvm/hyp/switch.c
+@@ -489,6 +489,64 @@ static bool __hyp_text handle_tx2_tvm(struct kvm_vcpu *vcpu)
+ 	return true;
+ }
+ 
++static bool __hyp_text esr_is_ptrauth_trap(u32 esr)
++{
++	u32 ec = ESR_ELx_EC(esr);
++
++	if (ec == ESR_ELx_EC_PAC)
++		return true;
++
++	if (ec != ESR_ELx_EC_SYS64)
++		return false;
++
++	switch (esr_sys64_to_sysreg(esr)) {
++	case SYS_APIAKEYLO_EL1:
++	case SYS_APIAKEYHI_EL1:
++	case SYS_APIBKEYLO_EL1:
++	case SYS_APIBKEYHI_EL1:
++	case SYS_APDAKEYLO_EL1:
++	case SYS_APDAKEYHI_EL1:
++	case SYS_APDBKEYLO_EL1:
++	case SYS_APDBKEYHI_EL1:
++	case SYS_APGAKEYLO_EL1:
++	case SYS_APGAKEYHI_EL1:
++		return true;
++	}
++
++	return false;
++}
++
++#define __ptrauth_save_key(regs, key)						\
++({										\
++	regs[key ## KEYLO_EL1] = read_sysreg_s(SYS_ ## key ## KEYLO_EL1);	\
++	regs[key ## KEYHI_EL1] = read_sysreg_s(SYS_ ## key ## KEYHI_EL1);	\
++})
++
++static bool __hyp_text __hyp_handle_ptrauth(struct kvm_vcpu *vcpu)
++{
++	struct kvm_cpu_context *ctxt;
++	u64 val;
++
++	if (!vcpu_has_ptrauth(vcpu) ||
++	    !esr_is_ptrauth_trap(kvm_vcpu_get_hsr(vcpu)))
++		return false;
++
++	ctxt = kern_hyp_va(vcpu->arch.host_cpu_context);
++	__ptrauth_save_key(ctxt->sys_regs, APIA);
++	__ptrauth_save_key(ctxt->sys_regs, APIB);
++	__ptrauth_save_key(ctxt->sys_regs, APDA);
++	__ptrauth_save_key(ctxt->sys_regs, APDB);
++	__ptrauth_save_key(ctxt->sys_regs, APGA);
++
++	vcpu_ptrauth_enable(vcpu);
++
++	val = read_sysreg(hcr_el2);
++	val |= (HCR_API | HCR_APK);
++	write_sysreg(val, hcr_el2);
++
++	return true;
++}
++
+ /*
+  * Return true when we were able to fixup the guest exit and should return to
+  * the guest, false when we should restore the host state and return to the
+@@ -523,6 +581,9 @@ static bool __hyp_text fixup_guest_exit(struct kvm_vcpu *vcpu, u64 *exit_code)
+ 	if (__hyp_handle_fpsimd(vcpu))
+ 		return true;
+ 
++	if (__hyp_handle_ptrauth(vcpu))
++		return true;
++
+ 	if (!__populate_fault_info(vcpu))
+ 		return true;
+ 
+diff --git a/arch/arm64/kvm/sys_regs.c b/arch/arm64/kvm/sys_regs.c
+index 9e6ef4991ede..e323ef9fcaa1 100644
+--- a/arch/arm64/kvm/sys_regs.c
++++ b/arch/arm64/kvm/sys_regs.c
+@@ -1030,16 +1030,13 @@ static bool trap_ptrauth(struct kvm_vcpu *vcpu,
+ 			 struct sys_reg_params *p,
+ 			 const struct sys_reg_desc *rd)
+ {
+-	kvm_arm_vcpu_ptrauth_trap(vcpu);
+-
+ 	/*
+-	 * Return false for both cases as we never skip the trapped
+-	 * instruction:
+-	 *
+-	 * - Either we re-execute the same key register access instruction
+-	 *   after enabling ptrauth.
+-	 * - Or an UNDEF is injected as ptrauth is not supported/enabled.
++	 * If we land here, that is because we didn't fixup the access on exit
++	 * by allowing the PtrAuth sysregs. The only way this happens is when
++	 * the guest does not have PtrAuth support enabled.
+ 	 */
++	kvm_inject_undefined(vcpu);
++
+ 	return false;
+ }
+ 
+* Unmerged path virt/kvm/arm/arm.c
