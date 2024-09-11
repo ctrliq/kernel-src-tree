@@ -1,0 +1,155 @@
+mm: add page_cache_readahead_unbounded
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 2c684234d36f7e8c80414e4a772911d407e821fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/2c684234.failed
+
+ext4 and f2fs have duplicated the guts of the readahead code so they can
+read past i_size.  Instead, separate out the guts of the readahead code
+so they can call it directly.
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Eric Biggers <ebiggers@google.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+	Reviewed-by: Eric Biggers <ebiggers@google.com>
+	Cc: Chao Yu <yuchao0@huawei.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Darrick J. Wong <darrick.wong@oracle.com>
+	Cc: Dave Chinner <dchinner@redhat.com>
+	Cc: Gao Xiang <gaoxiang25@huawei.com>
+	Cc: Jaegeuk Kim <jaegeuk@kernel.org>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Joseph Qi <joseph.qi@linux.alibaba.com>
+	Cc: Junxiao Bi <junxiao.bi@oracle.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Cc: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Cc: Miklos Szeredi <mszeredi@redhat.com>
+Link: http://lkml.kernel.org/r/20200414150233.24495-14-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 2c684234d36f7e8c80414e4a772911d407e821fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/verity.c
+#	fs/f2fs/verity.c
+* Unmerged path fs/ext4/verity.c
+* Unmerged path fs/f2fs/verity.c
+* Unmerged path fs/ext4/verity.c
+* Unmerged path fs/f2fs/verity.c
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index ce5eac0c4a2b..ed14de7df8a4 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -621,6 +621,9 @@ void page_cache_sync_readahead(struct address_space *, struct file_ra_state *,
+ void page_cache_async_readahead(struct address_space *, struct file_ra_state *,
+ 		struct file *, struct page *, pgoff_t index,
+ 		unsigned long req_count);
++void page_cache_readahead_unbounded(struct address_space *, struct file *,
++		pgoff_t index, unsigned long nr_to_read,
++		unsigned long lookahead_count);
+ 
+ /*
+  * Like add_to_page_cache_locked, but used to add newly allocated pages:
+diff --git a/mm/readahead.c b/mm/readahead.c
+index defa9dd20faf..20aa3a217ea8 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -148,37 +148,34 @@ static void read_pages(struct readahead_control *rac, struct list_head *pages,
+ 		rac->_index++;
+ }
+ 
+-/*
+- * __do_page_cache_readahead() actually reads a chunk of disk.  It allocates
+- * the pages first, then submits them for I/O. This avoids the very bad
+- * behaviour which would occur if page allocations are causing VM writeback.
+- * We really don't want to intermingle reads and writes like that.
++/**
++ * page_cache_readahead_unbounded - Start unchecked readahead.
++ * @mapping: File address space.
++ * @file: This instance of the open file; used for authentication.
++ * @index: First page index to read.
++ * @nr_to_read: The number of pages to read.
++ * @lookahead_size: Where to start the next readahead.
++ *
++ * This function is for filesystems to call when they want to start
++ * readahead beyond a file's stated i_size.  This is almost certainly
++ * not the function you want to call.  Use page_cache_async_readahead()
++ * or page_cache_sync_readahead() instead.
++ *
++ * Context: File is referenced by caller.  Mutexes may be held by caller.
++ * May sleep, but will not reenter filesystem to reclaim memory.
+  */
+-void __do_page_cache_readahead(struct address_space *mapping,
+-		struct file *filp, pgoff_t index, unsigned long nr_to_read,
++void page_cache_readahead_unbounded(struct address_space *mapping,
++		struct file *file, pgoff_t index, unsigned long nr_to_read,
+ 		unsigned long lookahead_size)
+ {
+-	struct inode *inode = mapping->host;
+ 	LIST_HEAD(page_pool);
+-	loff_t isize = i_size_read(inode);
+ 	gfp_t gfp_mask = readahead_gfp_mask(mapping);
+ 	struct readahead_control rac = {
+ 		.mapping = mapping,
+-		.file = filp,
++		.file = file,
+ 		._index = index,
+ 	};
+ 	unsigned long i;
+-	pgoff_t end_index;	/* The last page we want to read */
+-
+-	if (isize == 0)
+-		return;
+-
+-	end_index = (isize - 1) >> PAGE_SHIFT;
+-	if (index > end_index)
+-		return;
+-	/* Don't read past the page containing the last byte of the file */
+-	if (nr_to_read > end_index - index)
+-		nr_to_read = end_index - index + 1;
+ 
+ 	/*
+ 	 * Preallocate as many pages as we will need.
+@@ -222,6 +219,35 @@ void __do_page_cache_readahead(struct address_space *mapping,
+ 	 */
+ 	read_pages(&rac, &page_pool, false);
+ }
++EXPORT_SYMBOL_GPL(page_cache_readahead_unbounded);
++
++/*
++ * __do_page_cache_readahead() actually reads a chunk of disk.  It allocates
++ * the pages first, then submits them for I/O. This avoids the very bad
++ * behaviour which would occur if page allocations are causing VM writeback.
++ * We really don't want to intermingle reads and writes like that.
++ */
++void __do_page_cache_readahead(struct address_space *mapping,
++		struct file *file, pgoff_t index, unsigned long nr_to_read,
++		unsigned long lookahead_size)
++{
++	struct inode *inode = mapping->host;
++	loff_t isize = i_size_read(inode);
++	pgoff_t end_index;	/* The last page we want to read */
++
++	if (isize == 0)
++		return;
++
++	end_index = (isize - 1) >> PAGE_SHIFT;
++	if (index > end_index)
++		return;
++	/* Don't read past the page containing the last byte of the file */
++	if (nr_to_read > end_index - index)
++		nr_to_read = end_index - index + 1;
++
++	page_cache_readahead_unbounded(mapping, file, index, nr_to_read,
++			lookahead_size);
++}
+ 
+ /*
+  * Chunk the readahead into 2 megabyte units, so that we don't pin too much
