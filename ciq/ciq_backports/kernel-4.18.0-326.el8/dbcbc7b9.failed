@@ -1,0 +1,162 @@
+xfs: refactor testing if a particular dquot is being enforced
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit dbcbc7b90e8a43aa00412bfa601a2d110a29086a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/dbcbc7b9.failed
+
+Create a small helper to test if enforcement is enabled for a
+given incore dquot and replace the open-code logic testing.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit dbcbc7b90e8a43aa00412bfa601a2d110a29086a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_trans_dquot.c
+diff --cc fs/xfs/xfs_trans_dquot.c
+index 6985fda32f26,d7d710d25bbd..000000000000
+--- a/fs/xfs/xfs_trans_dquot.c
++++ b/fs/xfs/xfs_trans_dquot.c
+@@@ -599,58 -650,31 +599,71 @@@ xfs_trans_dqresv
+  	}
+  
+  	if ((flags & XFS_QMOPT_FORCE_RES) == 0 && dqp->q_id &&
+++<<<<<<< HEAD
+ +	    ((XFS_IS_UQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISUDQ(dqp)) ||
+ +	     (XFS_IS_GQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISGDQ(dqp)) ||
+ +	     (XFS_IS_PQUOTA_ENFORCED(dqp->q_mount) && XFS_QM_ISPDQ(dqp)))) {
+ +		if (nblks > 0) {
+++=======
++ 	    xfs_dquot_is_enforced(dqp)) {
++ 		int		quota_nl;
++ 		bool		fatal;
++ 
++ 		/*
++ 		 * dquot is locked already. See if we'd go over the hardlimit
++ 		 * or exceed the timelimit if we'd reserve resources.
++ 		 */
++ 		quota_nl = xfs_dqresv_check(blkres, qlim, nblks, &fatal);
++ 		if (quota_nl != QUOTA_NL_NOWARN) {
+++>>>>>>> dbcbc7b90e8a (xfs: refactor testing if a particular dquot is being enforced)
+  			/*
+ -			 * Quota block warning codes are 3 more than the inode
+ -			 * codes, which we check above.
+ +			 * dquot is locked already. See if we'd go over the
+ +			 * hardlimit or exceed the timelimit if we allocate
+ +			 * nblks.
+  			 */
+ -			xfs_quota_warn(mp, dqp, quota_nl + 3);
+ -			if (fatal)
+ +			total_count = *resbcountp + nblks;
+ +			if (hardlimit && total_count > hardlimit) {
+ +				xfs_quota_warn(mp, dqp, QUOTA_NL_BHARDWARN);
+  				goto error_return;
+ -		}
+ +			}
+ +			if (softlimit && total_count > softlimit) {
+ +				if ((timer != 0 &&
+ +				     ktime_get_real_seconds() > timer) ||
+ +				    (warns != 0 && warns >= warnlimit)) {
+ +					xfs_quota_warn(mp, dqp,
+ +						       QUOTA_NL_BSOFTLONGWARN);
+ +					goto error_return;
+ +				}
+  
+ -		quota_nl = xfs_dqresv_check(&dqp->q_ino, &defq->ino, ninos,
+ -				&fatal);
+ -		if (quota_nl != QUOTA_NL_NOWARN) {
+ -			xfs_quota_warn(mp, dqp, quota_nl);
+ -			if (fatal)
+ +				xfs_quota_warn(mp, dqp, QUOTA_NL_BSOFTWARN);
+ +			}
+ +		}
+ +		if (ninos > 0) {
+ +			total_count = dqp->q_ino.reserved + ninos;
+ +			timer = dqp->q_ino.timer;
+ +			warns = dqp->q_ino.warnings;
+ +			warnlimit = defq->iwarnlimit;
+ +			hardlimit = dqp->q_ino.hardlimit;
+ +			if (!hardlimit)
+ +				hardlimit = defq->ihardlimit;
+ +			softlimit = dqp->q_ino.softlimit;
+ +			if (!softlimit)
+ +				softlimit = defq->isoftlimit;
+ +
+ +			if (hardlimit && total_count > hardlimit) {
+ +				xfs_quota_warn(mp, dqp, QUOTA_NL_IHARDWARN);
+  				goto error_return;
+ +			}
+ +			if (softlimit && total_count > softlimit) {
+ +				if  ((timer != 0 &&
+ +				      ktime_get_real_seconds() > timer) ||
+ +				     (warns != 0 && warns >= warnlimit)) {
+ +					xfs_quota_warn(mp, dqp,
+ +						       QUOTA_NL_ISOFTLONGWARN);
+ +					goto error_return;
+ +				}
+ +				xfs_quota_warn(mp, dqp, QUOTA_NL_ISOFTWARN);
+ +			}
+  		}
+  	}
+  
+diff --git a/fs/xfs/xfs_dquot.h b/fs/xfs/xfs_dquot.h
+index 17a21677723f..fcf9bd676615 100644
+--- a/fs/xfs/xfs_dquot.h
++++ b/fs/xfs/xfs_dquot.h
+@@ -156,6 +156,23 @@ static inline struct xfs_dquot *xfs_inode_dquot(struct xfs_inode *ip, int type)
+ 	}
+ }
+ 
++/* Decide if the dquot's limits are actually being enforced. */
++static inline bool
++xfs_dquot_is_enforced(
++	const struct xfs_dquot	*dqp)
++{
++	switch (dqp->dq_flags & XFS_DQTYPE_REC_MASK) {
++	case XFS_DQTYPE_USER:
++		return XFS_IS_UQUOTA_ENFORCED(dqp->q_mount);
++	case XFS_DQTYPE_GROUP:
++		return XFS_IS_GQUOTA_ENFORCED(dqp->q_mount);
++	case XFS_DQTYPE_PROJ:
++		return XFS_IS_PQUOTA_ENFORCED(dqp->q_mount);
++	}
++	ASSERT(0);
++	return false;
++}
++
+ /*
+  * Check whether a dquot is under low free space conditions. We assume the quota
+  * is enabled and enforced.
+diff --git a/fs/xfs/xfs_qm_syscalls.c b/fs/xfs/xfs_qm_syscalls.c
+index 6a5fe01070c6..182e48f8d996 100644
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@ -638,19 +638,14 @@ xfs_qm_scall_getquota_fill_qc(
+ 	 * gets turned off. No need to confuse the user level code,
+ 	 * so return zeroes in that case.
+ 	 */
+-	if ((!XFS_IS_UQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_USER) ||
+-	    (!XFS_IS_GQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_GROUP) ||
+-	    (!XFS_IS_PQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_PROJ)) {
++	if (!xfs_dquot_is_enforced(dqp)) {
+ 		dst->d_spc_timer = 0;
+ 		dst->d_ino_timer = 0;
+ 		dst->d_rt_spc_timer = 0;
+ 	}
+ 
+ #ifdef DEBUG
+-	if (((XFS_IS_UQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_USER) ||
+-	     (XFS_IS_GQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_GROUP) ||
+-	     (XFS_IS_PQUOTA_ENFORCED(mp) && type == XFS_DQTYPE_PROJ)) &&
+-	    dqp->q_id != 0) {
++	if (xfs_dquot_is_enforced(dqp) && dqp->q_id != 0) {
+ 		if ((dst->d_space > dst->d_spc_softlimit) &&
+ 		    (dst->d_spc_softlimit > 0)) {
+ 			ASSERT(dst->d_spc_timer != 0);
+* Unmerged path fs/xfs/xfs_trans_dquot.c
