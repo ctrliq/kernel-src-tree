@@ -1,0 +1,161 @@
+net: avoid errors when trying to pop MLPS header on non-MPLS packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] avoid errors when trying to pop MLPS header on non-MPLS packets (Ivan Vecera) [1737820]
+Rebuild_FUZZ: 96.18%
+commit-author Davide Caratti <dcaratti@redhat.com>
+commit dedc5a08da07874c6e0d411e7f39c5c2cf137014
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/dedc5a08.failed
+
+the following script:
+
+ # tc qdisc add dev eth0 clsact
+ # tc filter add dev eth0 egress matchall action mpls pop
+
+implicitly makes the kernel drop all packets transmitted by eth0, if they
+don't have a MPLS header. This behavior is uncommon: other encapsulations
+(like VLAN) just let the packet pass unmodified. Since the result of MPLS
+'pop' operation would be the same regardless of the presence / absence of
+MPLS header(s) in the original packet, we can let skb_mpls_pop() return 0
+when dealing with non-MPLS packets.
+
+For the OVS use-case, this is acceptable because __ovs_nla_copy_actions()
+already ensures that MPLS 'pop' operation only occurs with packets having
+an MPLS Ethernet type (and there are no other callers in current code, so
+the semantic change should be ok).
+
+v2: better documentation of use-cases for skb_mpls_pop(), thanks to Simon
+    Horman
+
+Fixes: 2a2ea50870ba ("net: sched: add mpls manipulation actions to TC")
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: Davide Caratti <dcaratti@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit dedc5a08da07874c6e0d411e7f39c5c2cf137014)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skbuff.c
+diff --cc net/core/skbuff.c
+index 20259cd3ce3e,03b6809ebde4..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -5309,6 -5522,110 +5309,113 @@@ int skb_mpls_push(struct sk_buff *skb, 
+  EXPORT_SYMBOL_GPL(skb_mpls_push);
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * skb_mpls_pop() - pop the outermost MPLS header
++  *
++  * @skb: buffer
++  * @next_proto: ethertype of header after popped MPLS header
++  *
++  * Expects skb->data at mac header.
++  *
++  * Returns 0 on success, -errno otherwise.
++  */
++ int skb_mpls_pop(struct sk_buff *skb, __be16 next_proto)
++ {
++ 	int err;
++ 
++ 	if (unlikely(!eth_p_mpls(skb->protocol)))
++ 		return 0;
++ 
++ 	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
++ 	if (unlikely(err))
++ 		return err;
++ 
++ 	skb_postpull_rcsum(skb, mpls_hdr(skb), MPLS_HLEN);
++ 	memmove(skb_mac_header(skb) + MPLS_HLEN, skb_mac_header(skb),
++ 		skb->mac_len);
++ 
++ 	__skb_pull(skb, MPLS_HLEN);
++ 	skb_reset_mac_header(skb);
++ 	skb_set_network_header(skb, skb->mac_len);
++ 
++ 	if (skb->dev && skb->dev->type == ARPHRD_ETHER) {
++ 		struct ethhdr *hdr;
++ 
++ 		/* use mpls_hdr() to get ethertype to account for VLANs. */
++ 		hdr = (struct ethhdr *)((void *)mpls_hdr(skb) - ETH_HLEN);
++ 		skb_mod_eth_type(skb, hdr, next_proto);
++ 	}
++ 	skb->protocol = next_proto;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(skb_mpls_pop);
++ 
++ /**
++  * skb_mpls_update_lse() - modify outermost MPLS header and update csum
++  *
++  * @skb: buffer
++  * @mpls_lse: new MPLS label stack entry to update to
++  *
++  * Expects skb->data at mac header.
++  *
++  * Returns 0 on success, -errno otherwise.
++  */
++ int skb_mpls_update_lse(struct sk_buff *skb, __be32 mpls_lse)
++ {
++ 	int err;
++ 
++ 	if (unlikely(!eth_p_mpls(skb->protocol)))
++ 		return -EINVAL;
++ 
++ 	err = skb_ensure_writable(skb, skb->mac_len + MPLS_HLEN);
++ 	if (unlikely(err))
++ 		return err;
++ 
++ 	if (skb->ip_summed == CHECKSUM_COMPLETE) {
++ 		__be32 diff[] = { ~mpls_hdr(skb)->label_stack_entry, mpls_lse };
++ 
++ 		skb->csum = csum_partial((char *)diff, sizeof(diff), skb->csum);
++ 	}
++ 
++ 	mpls_hdr(skb)->label_stack_entry = mpls_lse;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(skb_mpls_update_lse);
++ 
++ /**
++  * skb_mpls_dec_ttl() - decrement the TTL of the outermost MPLS header
++  *
++  * @skb: buffer
++  *
++  * Expects skb->data at mac header.
++  *
++  * Returns 0 on success, -errno otherwise.
++  */
++ int skb_mpls_dec_ttl(struct sk_buff *skb)
++ {
++ 	u32 lse;
++ 	u8 ttl;
++ 
++ 	if (unlikely(!eth_p_mpls(skb->protocol)))
++ 		return -EINVAL;
++ 
++ 	lse = be32_to_cpu(mpls_hdr(skb)->label_stack_entry);
++ 	ttl = (lse & MPLS_LS_TTL_MASK) >> MPLS_LS_TTL_SHIFT;
++ 	if (!--ttl)
++ 		return -EINVAL;
++ 
++ 	lse &= ~MPLS_LS_TTL_MASK;
++ 	lse |= ttl << MPLS_LS_TTL_SHIFT;
++ 
++ 	return skb_mpls_update_lse(skb, cpu_to_be32(lse));
++ }
++ EXPORT_SYMBOL_GPL(skb_mpls_dec_ttl);
++ 
++ /**
+++>>>>>>> dedc5a08da07 (net: avoid errors when trying to pop MLPS header on non-MPLS packets)
+   * alloc_skb_with_frags - allocate skb with page frags
+   *
+   * @header_len: size of linear part
+* Unmerged path net/core/skbuff.c
