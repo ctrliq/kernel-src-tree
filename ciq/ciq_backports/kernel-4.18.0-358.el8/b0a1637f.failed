@@ -1,0 +1,92 @@
+KVM: x86: APICv: fix race in kvm_request_apicv_update on SVM
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit b0a1637f64b06586752cc507b94e4aeff02588d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b0a1637f.failed
+
+Currently on SVM, the kvm_request_apicv_update toggles the APICv
+memslot without doing any synchronization.
+
+If there is a mismatch between that memslot state and the AVIC state,
+on one of the vCPUs, an APIC mmio access can be lost:
+
+For example:
+
+VCPU0: enable the APIC_ACCESS_PAGE_PRIVATE_MEMSLOT
+VCPU1: access an APIC mmio register.
+
+Since AVIC is still disabled on VCPU1, the access will not be intercepted
+by it, and neither will it cause MMIO fault, but rather it will just be
+read/written from/to the dummy page mapped into the
+APIC_ACCESS_PAGE_PRIVATE_MEMSLOT.
+
+Fix that by adding a lock guarding the AVIC state changes, and carefully
+order the operations of kvm_request_apicv_update to avoid this race:
+
+1. Take the lock
+2. Send KVM_REQ_APICV_UPDATE
+3. Update the apic inhibit reason
+4. Release the lock
+
+This ensures that at (2) all vCPUs are kicked out of the guest mode,
+but don't yet see the new avic state.
+Then only after (4) all other vCPUs can update their AVIC state and resume.
+
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20210810205251.424103-10-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b0a1637f64b06586752cc507b94e4aeff02588d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index d169febd772a,89e666e5a707..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8446,9 -8577,11 +8446,15 @@@ bool kvm_apicv_activated(struct kvm *kv
+  }
+  EXPORT_SYMBOL_GPL(kvm_apicv_activated);
+  
+ -static void kvm_apicv_init(struct kvm *kvm)
+ +void kvm_apicv_init(struct kvm *kvm, bool enable)
+  {
+++<<<<<<< HEAD
+ +	if (enable)
+++=======
++ 	mutex_init(&kvm->arch.apicv_update_lock);
++ 
++ 	if (enable_apicv)
+++>>>>>>> b0a1637f64b0 (KVM: x86: APICv: fix race in kvm_request_apicv_update on SVM)
+  		clear_bit(APICV_INHIBIT_REASON_DISABLE,
+  			  &kvm->arch.apicv_inhibit_reasons);
+  	else
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 0ec4d0c1c822..e568ea34b4bd 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1042,6 +1042,9 @@ struct kvm_arch {
+ 	struct kvm_apic_map __rcu *apic_map;
+ 	atomic_t apic_map_dirty;
+ 
++	/* Protects apic_access_memslot_enabled and apicv_inhibit_reasons */
++	struct mutex apicv_update_lock;
++
+ 	bool apic_access_memslot_enabled;
+ 	unsigned long apicv_inhibit_reasons;
+ 
+@@ -1722,6 +1725,9 @@ void kvm_vcpu_update_apicv(struct kvm_vcpu *vcpu);
+ void kvm_request_apicv_update(struct kvm *kvm, bool activate,
+ 			      unsigned long bit);
+ 
++void __kvm_request_apicv_update(struct kvm *kvm, bool activate,
++				unsigned long bit);
++
+ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu);
+ 
+ int kvm_mmu_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa, u64 error_code,
+* Unmerged path arch/x86/kvm/x86.c
