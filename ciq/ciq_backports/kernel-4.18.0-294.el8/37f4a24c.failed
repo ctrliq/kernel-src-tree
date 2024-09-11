@@ -1,0 +1,193 @@
+blk-mq: centralise related handling into blk_mq_get_driver_tag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 37f4a24c2469a10a4c16c641671bd766e276cf9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/37f4a24c.failed
+
+Move .nr_active update and request assignment into blk_mq_get_driver_tag(),
+all are good to do during getting driver tag.
+
+Meantime blk-flush related code is simplified and flush request needn't
+to update the request table manually any more.
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Cc: Christoph Hellwig <hch@infradead.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 37f4a24c2469a10a4c16c641671bd766e276cf9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-flush.c
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+#	block/blk.h
+diff --cc block/blk-flush.c
+index 2c39c95dab56,e756db088d84..000000000000
+--- a/block/blk-flush.c
++++ b/block/blk-flush.c
+@@@ -224,13 -236,10 +224,20 @@@ static void flush_end_io(struct reques
+  		error = fq->rq_status;
+  
+  	hctx = flush_rq->mq_hctx;
+++<<<<<<< HEAD
+ +	if (!q->elevator) {
+ +		blk_mq_tag_set_rq(hctx, flush_rq->tag, fq->orig_rq);
+ +		flush_rq->tag = -1;
+ +	} else {
+ +		blk_mq_put_driver_tag(flush_rq);
+ +		flush_rq->internal_tag = -1;
+ +	}
+++=======
++ 	if (!q->elevator)
++ 		flush_rq->tag = BLK_MQ_NO_TAG;
++ 	else
++ 		flush_rq->internal_tag = BLK_MQ_NO_TAG;
+++>>>>>>> 37f4a24c2469 (blk-mq: centralise related handling into blk_mq_get_driver_tag)
+  
+  	running = &fq->flush_queue[fq->flush_running_idx];
+  	BUG_ON(fq->flush_pending_idx == fq->flush_running_idx);
+diff --cc block/blk-mq-tag.h
+index 2e4ef51cdb32,b1acac518c4e..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -79,15 -71,34 +79,46 @@@ static inline void blk_mq_tag_idle(stru
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * This helper should only be used for flush request to share tag
+ + * with the request cloned from, and both the two requests can't be
+ + * in flight at the same time. The caller has to make sure the tag
+ + * can't be freed.
+ + */
+ +static inline void blk_mq_tag_set_rq(struct blk_mq_hw_ctx *hctx,
+ +		unsigned int tag, struct request *rq)
+ +{
+ +	hctx->tags->rqs[tag] = rq;
+++=======
++  * For shared tag users, we track the number of currently active users
++  * and attempt to provide a fair share of the tag depth for each of them.
++  */
++ static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
++ 				  struct sbitmap_queue *bt)
++ {
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_SHARED))
++ 		return true;
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->sb.depth == 1)
++ 		return true;
++ 
++ 	users = atomic_read(&hctx->tags->active_queues);
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->sb.depth + users - 1) / users, 4U);
++ 	return atomic_read(&hctx->nr_active) < depth;
+++>>>>>>> 37f4a24c2469 (blk-mq: centralise related handling into blk_mq_get_driver_tag)
+  }
+  
+  static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
+diff --cc block/blk-mq.c
+index 51b640f2232f,65e0846fd065..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -275,9 -277,8 +275,8 @@@ static struct request *blk_mq_rq_ctx_in
+  {
+  	struct blk_mq_tags *tags = blk_mq_tags_from_data(data);
+  	struct request *rq = tags->static_rqs[tag];
+- 	req_flags_t rq_flags = 0;
+  
+ -	if (data->q->elevator) {
+ +	if (data->flags & BLK_MQ_REQ_INTERNAL) {
+  		rq->tag = BLK_MQ_NO_TAG;
+  		rq->internal_tag = tag;
+  	} else {
+@@@ -1069,6 -1117,44 +1063,47 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct sbitmap_queue *bt = &rq->mq_hctx->tags->bitmap_tags;
++ 	unsigned int tag_offset = rq->mq_hctx->tags->nr_reserved_tags;
++ 	int tag;
++ 
++ 	blk_mq_tag_busy(rq->mq_hctx);
++ 
++ 	if (blk_mq_tag_is_reserved(rq->mq_hctx->sched_tags, rq->internal_tag)) {
++ 		bt = &rq->mq_hctx->tags->breserved_tags;
++ 		tag_offset = 0;
++ 	}
++ 
++ 	if (!hctx_may_queue(rq->mq_hctx, bt))
++ 		return false;
++ 	tag = __sbitmap_queue_get(bt);
++ 	if (tag == BLK_MQ_NO_TAG)
++ 		return false;
++ 
++ 	rq->tag = tag + tag_offset;
++ 	return true;
++ }
++ 
++ static bool blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++ 
++ 	if (rq->tag == BLK_MQ_NO_TAG && !__blk_mq_get_driver_tag(rq))
++ 		return false;
++ 
++ 	if (hctx->flags & BLK_MQ_F_TAG_SHARED) {
++ 		rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 		atomic_inc(&hctx->nr_active);
++ 	}
++ 	hctx->tags->rqs[rq->tag] = rq;
++ 	return true;
++ }
++ 
+++>>>>>>> 37f4a24c2469 (blk-mq: centralise related handling into blk_mq_get_driver_tag)
+  static int blk_mq_dispatch_wake(wait_queue_entry_t *wait, unsigned mode,
+  				int flags, void *key)
+  {
+diff --cc block/blk.h
+index dcc1b6ac09cc,0184a31fe4df..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -23,14 -25,8 +23,18 @@@ struct blk_flush_queue 
+  	struct list_head	flush_data_in_flight;
+  	struct request		*flush_rq;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * flush_rq shares tag with this rq, both can't be active
+ +	 * at the same time
+ +	 */
+ +	struct request		*orig_rq;
+++=======
++ 	struct lock_class_key	key;
+++>>>>>>> 37f4a24c2469 (blk-mq: centralise related handling into blk_mq_get_driver_tag)
+  	spinlock_t		mq_flush_lock;
+ +	RH_KABI_EXTEND(blk_status_t 		rq_status)
+ +	RH_KABI_EXTEND(struct lock_class_key	key)
+  };
+  
+  extern struct kmem_cache *blk_requestq_cachep;
+* Unmerged path block/blk-flush.c
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
+* Unmerged path block/blk.h
