@@ -1,0 +1,200 @@
+gfs2: new slab for transactions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Bob Peterson <rpeterso@redhat.com>
+commit b839dadae8721eaf7245fcef3d67d82b95d00c77
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/b839dada.failed
+
+This patch adds a new slab for gfs2 transactions. That allows us to
+reduce kernel memory fragmentation, have better organization of data
+for analysis of vmcore dumps. A new centralized function is added to
+free the slab objects, and it exposes use-after-free by giving
+warnings if a transaction is freed while it still has bd elements
+attached to its buffers or ail lists. We make sure to initialize
+those transaction ail lists so we can check their integrity when freeing.
+
+At a later time, we should add a slab initialization function to
+make it more efficient, but for this initial patch I wanted to
+minimize the impact.
+
+	Signed-off-by: Bob Peterson <rpeterso@redhat.com>
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit b839dadae8721eaf7245fcef3d67d82b95d00c77)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/log.c
+diff --cc fs/gfs2/log.c
+index 60c486e0225a,a7415ab91c5f..000000000000
+--- a/fs/gfs2/log.c
++++ b/fs/gfs2/log.c
+@@@ -986,30 -1000,16 +987,35 @@@ void gfs2_log_flush(struct gfs2_sbd *sd
+  			atomic_set(&sdp->sd_freeze_state, SFS_FROZEN);
+  	}
+  
+ -out:
+ -	if (gfs2_withdrawn(sdp)) {
+ -		ail_drain(sdp); /* frees all transactions */
+ -		tr = NULL;
+ -	}
+ -
+ +out_end:
+  	trace_gfs2_log_flush(sdp, 0, flags);
+ +out:
+  	up_write(&sdp->sd_log_flush_lock);
+++<<<<<<< HEAD
+ +	kfree(tr);
+ +	if (gfs2_withdrawing(sdp))
+ +		gfs2_withdraw(sdp);
+ +	return;
+ +
+ +out_withdraw:
+ +	trans_drain(tr);
+ +	/**
+ +	 * If the tr_list is empty, we're withdrawing during a log
+ +	 * flush that targets a transaction, but the transaction was
+ +	 * never queued onto any of the ail lists. Here we add it to
+ +	 * ail1 just so that ail_drain() will find and free it.
+ +	 */
+ +	spin_lock(&sdp->sd_ail_lock);
+ +	if (tr && list_empty(&tr->tr_list))
+ +		list_add(&tr->tr_list, &sdp->sd_ail1_list);
+ +	spin_unlock(&sdp->sd_ail_lock);
+ +	ail_drain(sdp); /* frees all transactions */
+ +	tr = NULL;
+ +	goto out_end;
+++=======
++ 
++ 	gfs2_trans_free(sdp, tr);
+++>>>>>>> b839dadae872 (gfs2: new slab for transactions)
+  }
+  
+  /**
+* Unmerged path fs/gfs2/log.c
+diff --git a/fs/gfs2/main.c b/fs/gfs2/main.c
+index c7603063f861..8d41c4aba81c 100644
+--- a/fs/gfs2/main.c
++++ b/fs/gfs2/main.c
+@@ -146,6 +146,12 @@ static int __init init_gfs2_fs(void)
+ 	if (!gfs2_qadata_cachep)
+ 		goto fail_cachep7;
+ 
++	gfs2_trans_cachep = kmem_cache_create("gfs2_trans",
++					       sizeof(struct gfs2_trans),
++					       0, 0, NULL);
++	if (!gfs2_trans_cachep)
++		goto fail_cachep8;
++
+ 	error = register_shrinker(&gfs2_qd_shrinker);
+ 	if (error)
+ 		goto fail_shrinker;
+@@ -201,6 +207,8 @@ static int __init init_gfs2_fs(void)
+ fail_fs1:
+ 	unregister_shrinker(&gfs2_qd_shrinker);
+ fail_shrinker:
++	kmem_cache_destroy(gfs2_trans_cachep);
++fail_cachep8:
+ 	kmem_cache_destroy(gfs2_qadata_cachep);
+ fail_cachep7:
+ 	kmem_cache_destroy(gfs2_quotad_cachep);
+@@ -243,6 +251,7 @@ static void __exit exit_gfs2_fs(void)
+ 	rcu_barrier();
+ 
+ 	mempool_destroy(gfs2_page_pool);
++	kmem_cache_destroy(gfs2_trans_cachep);
+ 	kmem_cache_destroy(gfs2_qadata_cachep);
+ 	kmem_cache_destroy(gfs2_quotad_cachep);
+ 	kmem_cache_destroy(gfs2_rgrpd_cachep);
+diff --git a/fs/gfs2/trans.c b/fs/gfs2/trans.c
+index fba688d93b27..5918cbc30c8f 100644
+--- a/fs/gfs2/trans.c
++++ b/fs/gfs2/trans.c
+@@ -40,7 +40,7 @@ int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
+ 	if (!test_bit(SDF_JOURNAL_LIVE, &sdp->sd_flags))
+ 		return -EROFS;
+ 
+-	tr = kzalloc(sizeof(struct gfs2_trans), GFP_NOFS);
++	tr = kmem_cache_zalloc(gfs2_trans_cachep, GFP_NOFS);
+ 	if (!tr)
+ 		return -ENOMEM;
+ 
+@@ -70,7 +70,7 @@ int gfs2_trans_begin(struct gfs2_sbd *sdp, unsigned int blocks,
+ 
+ fail:
+ 	sb_end_intwrite(sdp->sd_vfs);
+-	kfree(tr);
++	kmem_cache_free(gfs2_trans_cachep, tr);
+ 
+ 	return error;
+ }
+@@ -98,7 +98,7 @@ void gfs2_trans_end(struct gfs2_sbd *sdp)
+ 	if (!test_bit(TR_TOUCHED, &tr->tr_flags)) {
+ 		gfs2_log_release(sdp, tr->tr_reserved);
+ 		if (alloced) {
+-			kfree(tr);
++			gfs2_trans_free(sdp, tr);
+ 			sb_end_intwrite(sdp->sd_vfs);
+ 		}
+ 		return;
+@@ -114,7 +114,7 @@ void gfs2_trans_end(struct gfs2_sbd *sdp)
+ 
+ 	gfs2_log_commit(sdp, tr);
+ 	if (alloced && !test_bit(TR_ATTACHED, &tr->tr_flags))
+-		kfree(tr);
++		gfs2_trans_free(sdp, tr);
+ 	up_read(&sdp->sd_log_flush_lock);
+ 
+ 	if (sdp->sd_vfs->s_flags & SB_SYNCHRONOUS)
+@@ -283,3 +283,14 @@ void gfs2_trans_remove_revoke(struct gfs2_sbd *sdp, u64 blkno, unsigned int len)
+ 	gfs2_log_unlock(sdp);
+ }
+ 
++void gfs2_trans_free(struct gfs2_sbd *sdp, struct gfs2_trans *tr)
++{
++	if (tr == NULL)
++		return;
++
++	gfs2_assert_warn(sdp, list_empty(&tr->tr_ail1_list));
++	gfs2_assert_warn(sdp, list_empty(&tr->tr_ail2_list));
++	gfs2_assert_warn(sdp, list_empty(&tr->tr_databuf));
++	gfs2_assert_warn(sdp, list_empty(&tr->tr_buf));
++	kmem_cache_free(gfs2_trans_cachep, tr);
++}
+diff --git a/fs/gfs2/trans.h b/fs/gfs2/trans.h
+index 1e39f056ccb7..23dc47bd6691 100644
+--- a/fs/gfs2/trans.h
++++ b/fs/gfs2/trans.h
+@@ -45,5 +45,6 @@ extern void gfs2_trans_add_data(struct gfs2_glock *gl, struct buffer_head *bh);
+ extern void gfs2_trans_add_meta(struct gfs2_glock *gl, struct buffer_head *bh);
+ extern void gfs2_trans_add_revoke(struct gfs2_sbd *sdp, struct gfs2_bufdata *bd);
+ extern void gfs2_trans_remove_revoke(struct gfs2_sbd *sdp, u64 blkno, unsigned int len);
++extern void gfs2_trans_free(struct gfs2_sbd *sdp, struct gfs2_trans *tr);
+ 
+ #endif /* __TRANS_DOT_H__ */
+diff --git a/fs/gfs2/util.c b/fs/gfs2/util.c
+index 8cdd21556672..ff67759b5145 100644
+--- a/fs/gfs2/util.c
++++ b/fs/gfs2/util.c
+@@ -35,6 +35,7 @@ struct kmem_cache *gfs2_bufdata_cachep __read_mostly;
+ struct kmem_cache *gfs2_rgrpd_cachep __read_mostly;
+ struct kmem_cache *gfs2_quotad_cachep __read_mostly;
+ struct kmem_cache *gfs2_qadata_cachep __read_mostly;
++struct kmem_cache *gfs2_trans_cachep __read_mostly;
+ mempool_t *gfs2_page_pool __read_mostly;
+ 
+ void gfs2_assert_i(struct gfs2_sbd *sdp)
+diff --git a/fs/gfs2/util.h b/fs/gfs2/util.h
+index ee1b3da80560..86bd14229577 100644
+--- a/fs/gfs2/util.h
++++ b/fs/gfs2/util.h
+@@ -178,6 +178,7 @@ extern struct kmem_cache *gfs2_bufdata_cachep;
+ extern struct kmem_cache *gfs2_rgrpd_cachep;
+ extern struct kmem_cache *gfs2_quotad_cachep;
+ extern struct kmem_cache *gfs2_qadata_cachep;
++extern struct kmem_cache *gfs2_trans_cachep;
+ extern mempool_t *gfs2_page_pool;
+ extern struct workqueue_struct *gfs2_control_wq;
+ 
