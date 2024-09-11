@@ -1,0 +1,167 @@
+xdp: force mem allocator removal and periodic warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jesper Dangaard Brouer <brouer@redhat.com>
+commit d956a048cd3fc1ba154101a1a50fb37950081ff6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d956a048.failed
+
+If bugs exists or are introduced later e.g. by drivers misusing the API,
+then we want to warn about the issue, such that developer notice. This patch
+will generate a bit of noise in form of periodic pr_warn every 30 seconds.
+
+It is not nice to have this stall warning running forever. Thus, this patch
+will (after 120 attempts) force disconnect the mem id (from the rhashtable)
+and free the page_pool object. This will cause fallback to the put_page() as
+before, which only potentially leak DMA-mappings, if objects are really
+stuck for this long. In that unlikely case, a WARN_ONCE should show us the
+call stack.
+
+	Signed-off-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d956a048cd3fc1ba154101a1a50fb37950081ff6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/page_pool.c
+#	net/core/xdp.c
+diff --cc net/core/page_pool.c
+index 41391b5dc14c,42c3b0a5a259..000000000000
+--- a/net/core/page_pool.c
++++ b/net/core/page_pool.c
+@@@ -296,6 -347,10 +309,13 @@@ void __page_pool_free(struct page_pool 
+  {
+  	WARN(pool->alloc.count, "API usage violation");
+  	WARN(!ptr_ring_empty(&pool->ring), "ptr_ring is not empty");
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Can happen due to forced shutdown */
++ 	if (!__page_pool_safe_to_destroy(pool))
++ 		__warn_in_flight(pool);
+++>>>>>>> d956a048cd3f (xdp: force mem allocator removal and periodic warning)
+  
+  	ptr_ring_cleanup(&pool->ring, NULL);
+  	kfree(pool);
+diff --cc net/core/xdp.c
+index 762abeb89847,622c81dc7ba8..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -38,6 -38,10 +38,13 @@@ struct xdp_mem_allocator 
+  	};
+  	struct rhash_head node;
+  	struct rcu_head rcu;
+++<<<<<<< HEAD
+++=======
++ 	struct delayed_work defer_wq;
++ 	unsigned long defer_start;
++ 	unsigned long defer_warn;
++ 	int disconnect_cnt;
+++>>>>>>> d956a048cd3f (xdp: force mem allocator removal and periodic warning)
+  };
+  
+  static u32 xdp_mem_id_hashfn(const void *data, u32 len, u32 seed)
+@@@ -94,6 -98,64 +101,67 @@@ static void __xdp_mem_allocator_rcu_fre
+  	kfree(xa);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool __mem_id_disconnect(int id, bool force)
++ {
++ 	struct xdp_mem_allocator *xa;
++ 	bool safe_to_remove = true;
++ 
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
++ 	if (!xa) {
++ 		mutex_unlock(&mem_id_lock);
++ 		WARN(1, "Request remove non-existing id(%d), driver bug?", id);
++ 		return true;
++ 	}
++ 	xa->disconnect_cnt++;
++ 
++ 	/* Detects in-flight packet-pages for page_pool */
++ 	if (xa->mem.type == MEM_TYPE_PAGE_POOL)
++ 		safe_to_remove = page_pool_request_shutdown(xa->page_pool);
++ 
++ 	/* TODO: Tracepoint will be added here in next-patch */
++ 
++ 	if ((safe_to_remove || force) &&
++ 	    !rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
++ 		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
++ 
++ 	mutex_unlock(&mem_id_lock);
++ 	return (safe_to_remove|force);
++ }
++ 
++ #define DEFER_TIME (msecs_to_jiffies(1000))
++ #define DEFER_WARN_INTERVAL (30 * HZ)
++ #define DEFER_MAX_RETRIES 120
++ 
++ static void mem_id_disconnect_defer_retry(struct work_struct *wq)
++ {
++ 	struct delayed_work *dwq = to_delayed_work(wq);
++ 	struct xdp_mem_allocator *xa = container_of(dwq, typeof(*xa), defer_wq);
++ 	bool force = false;
++ 
++ 	if (xa->disconnect_cnt > DEFER_MAX_RETRIES)
++ 		force = true;
++ 
++ 	if (__mem_id_disconnect(xa->mem.id, force))
++ 		return;
++ 
++ 	/* Periodic warning */
++ 	if (time_after_eq(jiffies, xa->defer_warn)) {
++ 		int sec = (s32)((u32)jiffies - (u32)xa->defer_start) / HZ;
++ 
++ 		pr_warn("%s() stalled mem.id=%u shutdown %d attempts %d sec\n",
++ 			__func__, xa->mem.id, xa->disconnect_cnt, sec);
++ 		xa->defer_warn = jiffies + DEFER_WARN_INTERVAL;
++ 	}
++ 
++ 	/* Still not ready to be disconnected, retry later */
++ 	schedule_delayed_work(&xa->defer_wq, DEFER_TIME);
++ }
++ 
+++>>>>>>> d956a048cd3f (xdp: force mem allocator removal and periodic warning)
+  void xdp_rxq_info_unreg_mem_model(struct xdp_rxq_info *xdp_rxq)
+  {
+  	struct xdp_mem_allocator *xa;
+@@@ -112,13 -174,23 +180,29 @@@
+  	if (id == 0)
+  		return;
+  
+++<<<<<<< HEAD
+ +	mutex_lock(&mem_id_lock);
+ +
+ +	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
+ +	if (xa && !rhashtable_remove_fast(mem_id_ht, &xa->node, mem_id_rht_params))
+ +		call_rcu(&xa->rcu, __xdp_mem_allocator_rcu_free);
+++=======
++ 	if (__mem_id_disconnect(id, false))
++ 		return;
++ 
++ 	/* Could not disconnect, defer new disconnect attempt to later */
++ 	mutex_lock(&mem_id_lock);
++ 
++ 	xa = rhashtable_lookup_fast(mem_id_ht, &id, mem_id_rht_params);
++ 	if (!xa) {
++ 		mutex_unlock(&mem_id_lock);
++ 		return;
++ 	}
++ 	xa->defer_start = jiffies;
++ 	xa->defer_warn  = jiffies + DEFER_WARN_INTERVAL;
+++>>>>>>> d956a048cd3f (xdp: force mem allocator removal and periodic warning)
+  
+ -	INIT_DELAYED_WORK(&xa->defer_wq, mem_id_disconnect_defer_retry);
+  	mutex_unlock(&mem_id_lock);
+ -	schedule_delayed_work(&xa->defer_wq, DEFER_TIME);
+  }
+  EXPORT_SYMBOL_GPL(xdp_rxq_info_unreg_mem_model);
+  
+* Unmerged path net/core/page_pool.c
+* Unmerged path net/core/xdp.c
