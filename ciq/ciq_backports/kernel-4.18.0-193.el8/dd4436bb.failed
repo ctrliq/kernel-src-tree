@@ -1,0 +1,135 @@
+libbpf: Teach bpf_object__open to guess program types
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit dd4436bb838338cfda253d7f012610a73e4078fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/dd4436bb.failed
+
+Teach bpf_object__open how to guess program type and expected attach
+type from section names, similar to what bpf_prog_load() does. This
+seems like a really useful features and an oversight to not have this
+done during bpf_object_open(). To preserver backwards compatible
+behavior of bpf_prog_load(), its attr->prog_type is treated as an
+override of bpf_object__open() decisions, if attr->prog_type is not
+UNSPECIFIED.
+
+There is a slight difference in behavior for bpf_prog_load().
+Previously, if bpf_prog_load() was loading BPF object with more than one
+program, first program's guessed program type and expected attach type
+would determine corresponding attributes of all the subsequent program
+types, even if their sections names suggest otherwise. That seems like
+a rather dubious behavior and with this change it will behave more
+sanely: each program's type is determined individually, unless they are
+forced to uniformity through attr->prog_type.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20191021033902.3856966-5-andriin@fb.com
+(cherry picked from commit dd4436bb838338cfda253d7f012610a73e4078fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index d91bdfbf910b,803219d6898c..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -2661,55 -3607,15 +2661,56 @@@ bpf_object__load_progs(struct bpf_objec
+  	return 0;
+  }
+  
+ +static bool bpf_prog_type__needs_kver(enum bpf_prog_type type)
+ +{
+ +	switch (type) {
+ +	case BPF_PROG_TYPE_SOCKET_FILTER:
+ +	case BPF_PROG_TYPE_SCHED_CLS:
+ +	case BPF_PROG_TYPE_SCHED_ACT:
+ +	case BPF_PROG_TYPE_XDP:
+ +	case BPF_PROG_TYPE_CGROUP_SKB:
+ +	case BPF_PROG_TYPE_CGROUP_SOCK:
+ +	case BPF_PROG_TYPE_LWT_IN:
+ +	case BPF_PROG_TYPE_LWT_OUT:
+ +	case BPF_PROG_TYPE_LWT_XMIT:
+ +	case BPF_PROG_TYPE_LWT_SEG6LOCAL:
+ +	case BPF_PROG_TYPE_SOCK_OPS:
+ +	case BPF_PROG_TYPE_SK_SKB:
+ +	case BPF_PROG_TYPE_CGROUP_DEVICE:
+ +	case BPF_PROG_TYPE_SK_MSG:
+ +	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+ +	case BPF_PROG_TYPE_LIRC_MODE2:
+ +	case BPF_PROG_TYPE_SK_REUSEPORT:
+ +	case BPF_PROG_TYPE_FLOW_DISSECTOR:
+ +	case BPF_PROG_TYPE_UNSPEC:
+ +	case BPF_PROG_TYPE_TRACEPOINT:
+ +	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+ +	case BPF_PROG_TYPE_PERF_EVENT:
+ +	case BPF_PROG_TYPE_CGROUP_SYSCTL:
+ +	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
+ +		return false;
+ +	case BPF_PROG_TYPE_KPROBE:
+ +	default:
+ +		return true;
+ +	}
+ +}
+ +
+ +static int bpf_object__validate(struct bpf_object *obj, bool needs_kver)
+ +{
+ +	if (needs_kver && obj->kern_version == 0) {
+ +		pr_warning("%s doesn't provide kernel version\n",
+ +			   obj->path);
+ +		return -LIBBPF_ERRNO__KVERSION;
+ +	}
+ +	return 0;
+ +}
+ +
+  static struct bpf_object *
+ -__bpf_object__open(const char *path, const void *obj_buf, size_t obj_buf_sz,
+ -		   struct bpf_object_open_opts *opts)
+ +__bpf_object__open(const char *path, void *obj_buf, size_t obj_buf_sz,
+ +		   bool needs_kver, int flags)
+  {
++ 	struct bpf_program *prog;
+  	struct bpf_object *obj;
+ -	const char *obj_name;
+ -	char tmp_name[64];
+ -	bool relaxed_maps;
+  	int err;
+  
+  	if (elf_version(EV_CURRENT) == EV_NONE) {
+@@@ -2724,11 -3646,29 +2725,31 @@@
+  	CHECK_ERR(bpf_object__elf_init(obj), err, out);
+  	CHECK_ERR(bpf_object__check_endianness(obj), err, out);
+  	CHECK_ERR(bpf_object__probe_caps(obj), err, out);
+ -	CHECK_ERR(bpf_object__elf_collect(obj, relaxed_maps), err, out);
+ +	CHECK_ERR(bpf_object__elf_collect(obj, flags), err, out);
+  	CHECK_ERR(bpf_object__collect_reloc(obj), err, out);
+++<<<<<<< HEAD
+ +	CHECK_ERR(bpf_object__validate(obj, needs_kver), err, out);
+ +
+++=======
+++>>>>>>> dd4436bb8383 (libbpf: Teach bpf_object__open to guess program types)
+  	bpf_object__elf_finish(obj);
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		enum bpf_prog_type prog_type;
++ 		enum bpf_attach_type attach_type;
++ 
++ 		err = libbpf_prog_type_by_name(prog->section_name, &prog_type,
++ 					       &attach_type);
++ 		if (err == -ESRCH)
++ 			/* couldn't guess, but user might manually specify */
++ 			continue;
++ 		if (err)
++ 			goto out;
++ 
++ 		bpf_program__set_type(prog, prog_type);
++ 		bpf_program__set_expected_attach_type(prog, attach_type);
++ 	}
++ 
+  	return obj;
+  out:
+  	bpf_object__close(obj);
+* Unmerged path tools/lib/bpf/libbpf.c
