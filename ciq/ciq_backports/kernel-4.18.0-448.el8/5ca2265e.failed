@@ -1,0 +1,155 @@
+gve: adminq: DQO specific device descriptor logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Bailey Forrest <bcf@google.com>
+commit 5ca2265eefc0bdfc80d4cbe9f70a81c40c41ae60
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5ca2265e.failed
+
+- In addition to TX and RX queues, DQO has TX completion and RX buffer
+  queues.
+  - TX completions are received when the device has completed sending a
+    packet on the wire.
+  - RX buffers are posted on a separate queue form the RX completions.
+- DQO descriptor rings are allowed to be smaller than PAGE_SIZE.
+
+	Signed-off-by: Bailey Forrest <bcf@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Reviewed-by: Catherine Sullivan <csully@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5ca2265eefc0bdfc80d4cbe9f70a81c40c41ae60)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/google/gve/gve.h
+diff --cc drivers/net/ethernet/google/gve/gve.h
+index ef331182e395,9045b86279cb..000000000000
+--- a/drivers/net/ethernet/google/gve/gve.h
++++ b/drivers/net/ethernet/google/gve/gve.h
+@@@ -182,6 -194,22 +182,25 @@@ struct gve_qpl_config 
+  	unsigned long *qpl_id_map; /* bitmap of used qpl ids */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct gve_options_dqo_rda {
++ 	u16 tx_comp_ring_entries; /* number of tx_comp descriptors */
++ 	u16 rx_buff_ring_entries; /* number of rx_buff descriptors */
++ };
++ 
++ /* GVE_QUEUE_FORMAT_UNSPECIFIED must be zero since 0 is the default value
++  * when the entire configure_device_resources command is zeroed out and the
++  * queue_format is not specified.
++  */
++ enum gve_queue_format {
++ 	GVE_QUEUE_FORMAT_UNSPECIFIED	= 0x0,
++ 	GVE_GQI_RDA_FORMAT		= 0x1,
++ 	GVE_GQI_QPL_FORMAT		= 0x2,
++ 	GVE_DQO_RDA_FORMAT		= 0x3,
++ };
++ 
+++>>>>>>> 5ca2265eefc0 (gve: adminq: DQO specific device descriptor logic)
+  struct gve_priv {
+  	struct net_device *dev;
+  	struct gve_tx_ring *tx; /* array of tx_cfg.num_queues */
+@@@ -263,6 -290,10 +282,13 @@@
+  
+  	/* Gvnic device link speed from hypervisor. */
+  	u64 link_speed;
+++<<<<<<< HEAD
+++=======
++ 
++ 	struct gve_options_dqo_rda options_dqo_rda;
++ 
++ 	enum gve_queue_format queue_format;
+++>>>>>>> 5ca2265eefc0 (gve: adminq: DQO specific device descriptor logic)
+  };
+  
+  enum gve_service_task_flags_bit {
+* Unmerged path drivers/net/ethernet/google/gve/gve.h
+diff --git a/drivers/net/ethernet/google/gve/gve_adminq.c b/drivers/net/ethernet/google/gve/gve_adminq.c
+index 763187f38df6..8ace6c87d4fb 100644
+--- a/drivers/net/ethernet/google/gve/gve_adminq.c
++++ b/drivers/net/ethernet/google/gve/gve_adminq.c
+@@ -598,6 +598,40 @@ int gve_adminq_destroy_rx_queues(struct gve_priv *priv, u32 num_queues)
+ 	return gve_adminq_kick_and_wait(priv);
+ }
+ 
++static int gve_set_desc_cnt(struct gve_priv *priv,
++			    struct gve_device_descriptor *descriptor)
++{
++	priv->tx_desc_cnt = be16_to_cpu(descriptor->tx_queue_entries);
++	if (priv->tx_desc_cnt * sizeof(priv->tx->desc[0]) < PAGE_SIZE) {
++		dev_err(&priv->pdev->dev, "Tx desc count %d too low\n",
++			priv->tx_desc_cnt);
++		return -EINVAL;
++	}
++	priv->rx_desc_cnt = be16_to_cpu(descriptor->rx_queue_entries);
++	if (priv->rx_desc_cnt * sizeof(priv->rx->desc.desc_ring[0])
++	    < PAGE_SIZE) {
++		dev_err(&priv->pdev->dev, "Rx desc count %d too low\n",
++			priv->rx_desc_cnt);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int
++gve_set_desc_cnt_dqo(struct gve_priv *priv,
++		     const struct gve_device_descriptor *descriptor,
++		     const struct gve_device_option_dqo_rda *dev_op_dqo_rda)
++{
++	priv->tx_desc_cnt = be16_to_cpu(descriptor->tx_queue_entries);
++	priv->options_dqo_rda.tx_comp_ring_entries =
++		be16_to_cpu(dev_op_dqo_rda->tx_comp_ring_entries);
++	priv->rx_desc_cnt = be16_to_cpu(descriptor->rx_queue_entries);
++	priv->options_dqo_rda.rx_buff_ring_entries =
++		be16_to_cpu(dev_op_dqo_rda->rx_buff_ring_entries);
++
++	return 0;
++}
++
+ int gve_adminq_describe_device(struct gve_priv *priv)
+ {
+ 	struct gve_device_option_gqi_rda *dev_op_gqi_rda = NULL;
+@@ -650,22 +684,14 @@ int gve_adminq_describe_device(struct gve_priv *priv)
+ 		dev_info(&priv->pdev->dev,
+ 			 "Driver is running with GQI QPL queue format.\n");
+ 	}
+-
+-	priv->tx_desc_cnt = be16_to_cpu(descriptor->tx_queue_entries);
+-	if (priv->tx_desc_cnt * sizeof(priv->tx->desc[0]) < PAGE_SIZE) {
+-		dev_err(&priv->pdev->dev, "Tx desc count %d too low\n", priv->tx_desc_cnt);
+-		err = -EINVAL;
+-		goto free_device_descriptor;
++	if (gve_is_gqi(priv)) {
++		err = gve_set_desc_cnt(priv, descriptor);
++	} else {
++		err = gve_set_desc_cnt_dqo(priv, descriptor, dev_op_dqo_rda);
+ 	}
+-	priv->rx_desc_cnt = be16_to_cpu(descriptor->rx_queue_entries);
+-	if (priv->rx_desc_cnt * sizeof(priv->rx->desc.desc_ring[0])
+-	    < PAGE_SIZE ||
+-	    priv->rx_desc_cnt * sizeof(priv->rx->data.data_ring[0])
+-	    < PAGE_SIZE) {
+-		dev_err(&priv->pdev->dev, "Rx desc count %d too low\n", priv->rx_desc_cnt);
+-		err = -EINVAL;
++	if (err)
+ 		goto free_device_descriptor;
+-	}
++
+ 	priv->max_registered_pages =
+ 				be64_to_cpu(descriptor->max_registered_pages);
+ 	mtu = be16_to_cpu(descriptor->mtu);
+@@ -681,7 +707,8 @@ int gve_adminq_describe_device(struct gve_priv *priv)
+ 	dev_info(&priv->pdev->dev, "MAC addr: %pM\n", mac);
+ 	priv->tx_pages_per_qpl = be16_to_cpu(descriptor->tx_pages_per_qpl);
+ 	priv->rx_data_slot_cnt = be16_to_cpu(descriptor->rx_pages_per_qpl);
+-	if (priv->rx_data_slot_cnt < priv->rx_desc_cnt) {
++
++	if (gve_is_gqi(priv) && priv->rx_data_slot_cnt < priv->rx_desc_cnt) {
+ 		dev_err(&priv->pdev->dev, "rx_data_slot_cnt cannot be smaller than rx_desc_cnt, setting rx_desc_cnt down to %d.\n",
+ 			priv->rx_data_slot_cnt);
+ 		priv->rx_desc_cnt = priv->rx_data_slot_cnt;
