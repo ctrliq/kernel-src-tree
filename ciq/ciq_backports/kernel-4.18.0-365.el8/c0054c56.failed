@@ -1,0 +1,201 @@
+kasan: inline kasan_reset_tag for tag-based modes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit c0054c565ae598073d6c27762c7d4f7de49a45d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/c0054c56.failed
+
+Using kasan_reset_tag() currently results in a function call. As it's
+called quite often from the allocator code, this leads to a noticeable
+slowdown. Move it to include/linux/kasan.h and turn it into a static
+inline function. Also remove the now unneeded reset_tag() internal KASAN
+macro and use kasan_reset_tag() instead.
+
+Link: https://lkml.kernel.org/r/6940383a3a9dfb416134d338d8fac97a9ebb8686.1606162397.git.andreyknvl@google.com
+Link: https://linux-review.googlesource.com/id/I4d2061acfe91d480a75df00b07c22d8494ef14b5
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c0054c565ae598073d6c27762c7d4f7de49a45d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+#	mm/kasan/hw_tags.c
+#	mm/kasan/report.c
+#	mm/kasan/report_hw_tags.c
+#	mm/kasan/shadow.c
+#	mm/kasan/tags.c
+diff --cc mm/kasan/common.c
+index e989322c0f3f,780ec27459ab..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -289,17 -176,17 +289,25 @@@ size_t kasan_metadata_size(struct kmem_
+  		sizeof(struct kasan_free_meta) : 0);
+  }
+  
+ -struct kasan_alloc_meta *kasan_get_alloc_meta(struct kmem_cache *cache,
+ -					      const void *object)
+ +struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+ +					const void *object)
+  {
+++<<<<<<< HEAD
+ +	return (void *)object + cache->kasan_info.alloc_meta_offset;
+++=======
++ 	return kasan_reset_tag(object) + cache->kasan_info.alloc_meta_offset;
+++>>>>>>> c0054c565ae5 (kasan: inline kasan_reset_tag for tag-based modes)
+  }
+  
+ -struct kasan_free_meta *kasan_get_free_meta(struct kmem_cache *cache,
+ -					    const void *object)
+ +struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
+ +				      const void *object)
+  {
+  	BUILD_BUG_ON(sizeof(struct kasan_free_meta) > 32);
+++<<<<<<< HEAD
+ +	return (void *)object + cache->kasan_info.free_meta_offset;
+++=======
++ 	return kasan_reset_tag(object) + cache->kasan_info.free_meta_offset;
+++>>>>>>> c0054c565ae5 (kasan: inline kasan_reset_tag for tag-based modes)
+  }
+  
+  void kasan_poison_slab(struct page *page)
+diff --cc mm/kasan/report.c
+index a0772fe304d1,00c590efdaea..000000000000
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@@ -463,7 -328,13 +463,17 @@@ void kasan_report_invalid_free(void *ob
+  	unsigned long flags;
+  	u8 tag = get_tag(object);
+  
+++<<<<<<< HEAD
+ +	object = reset_tag(object);
+++=======
++ 	object = kasan_reset_tag(object);
++ 
++ #if IS_ENABLED(CONFIG_KUNIT)
++ 	if (current->kunit_test)
++ 		kasan_update_kunit_status(current->kunit_test);
++ #endif /* IS_ENABLED(CONFIG_KUNIT) */
++ 
+++>>>>>>> c0054c565ae5 (kasan: inline kasan_reset_tag for tag-based modes)
+  	start_report(&flags);
+  	pr_err("BUG: KASAN: double-free or invalid-free in %pS\n", (void *)ip);
+  	print_tags(tag, object);
+@@@ -484,10 -356,15 +494,10 @@@ void __kasan_report(unsigned long addr
+  	disable_trace_on_warning();
+  
+  	tagged_addr = (void *)addr;
+- 	untagged_addr = reset_tag(tagged_addr);
++ 	untagged_addr = kasan_reset_tag(tagged_addr);
+  
+  	info.access_addr = tagged_addr;
+ -	if (addr_has_metadata(untagged_addr))
+ +	if (addr_has_shadow(untagged_addr))
+  		info.first_bad_addr = find_first_bad_addr(tagged_addr, size);
+  	else
+  		info.first_bad_addr = untagged_addr;
+diff --cc mm/kasan/tags.c
+index 5c8b08a25715,e17de2619bbf..000000000000
+--- a/mm/kasan/tags.c
++++ b/mm/kasan/tags.c
+@@@ -121,6 -118,15 +116,18 @@@ bool check_memory_region(unsigned long 
+  	return true;
+  }
+  
+++<<<<<<< HEAD:mm/kasan/tags.c
+++=======
++ bool check_invalid_free(void *addr)
++ {
++ 	u8 tag = get_tag(addr);
++ 	u8 shadow_byte = READ_ONCE(*(u8 *)kasan_mem_to_shadow(kasan_reset_tag(addr)));
++ 
++ 	return (shadow_byte == KASAN_TAG_INVALID) ||
++ 		(tag != KASAN_TAG_KERNEL && tag != shadow_byte);
++ }
++ 
+++>>>>>>> c0054c565ae5 (kasan: inline kasan_reset_tag for tag-based modes):mm/kasan/sw_tags.c
+  #define DEFINE_HWASAN_LOAD_STORE(size)					\
+  	void __hwasan_load##size##_noabort(unsigned long addr)		\
+  	{								\
+* Unmerged path mm/kasan/hw_tags.c
+* Unmerged path mm/kasan/report_hw_tags.c
+* Unmerged path mm/kasan/shadow.c
+diff --git a/include/linux/kasan.h b/include/linux/kasan.h
+index f00d17cf6822..b5131f28c6f8 100644
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@ -188,7 +188,10 @@ static inline void kasan_record_aux_stack(void *ptr) {}
+ 
+ void kasan_init_tags(void);
+ 
+-void *kasan_reset_tag(const void *addr);
++static inline void *kasan_reset_tag(const void *addr)
++{
++	return (void *)arch_kasan_reset_tag(addr);
++}
+ 
+ bool kasan_report(unsigned long addr, size_t size,
+ 		bool is_write, unsigned long ip);
+* Unmerged path mm/kasan/common.c
+* Unmerged path mm/kasan/hw_tags.c
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index 2db4c5c1b473..0a6fab24ebb0 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -212,15 +212,11 @@ static inline const void *arch_kasan_set_tag(const void *addr, u8 tag)
+ 	return addr;
+ }
+ #endif
+-#ifndef arch_kasan_reset_tag
+-#define arch_kasan_reset_tag(addr)	((void *)(addr))
+-#endif
+ #ifndef arch_kasan_get_tag
+ #define arch_kasan_get_tag(addr)	0
+ #endif
+ 
+ #define set_tag(addr, tag)	((void *)arch_kasan_set_tag((addr), (tag)))
+-#define reset_tag(addr)		((void *)arch_kasan_reset_tag(addr))
+ #define get_tag(addr)		arch_kasan_get_tag(addr)
+ 
+ #ifdef CONFIG_KASAN_HW_TAGS
+* Unmerged path mm/kasan/report.c
+* Unmerged path mm/kasan/report_hw_tags.c
+* Unmerged path mm/kasan/shadow.c
+* Unmerged path mm/kasan/tags.c
+diff --git a/mm/kasan/tags_report.c b/mm/kasan/tags_report.c
+index 5f183501b871..9d032e007a6a 100644
+--- a/mm/kasan/tags_report.c
++++ b/mm/kasan/tags_report.c
+@@ -41,7 +41,7 @@ const char *get_bug_type(struct kasan_access_info *info)
+ 	int i;
+ 
+ 	tag = get_tag(info->access_addr);
+-	addr = reset_tag(info->access_addr);
++	addr = kasan_reset_tag(info->access_addr);
+ 	page = kasan_addr_to_page(addr);
+ 	if (page && PageSlab(page)) {
+ 		cache = page->slab_cache;
+@@ -72,7 +72,7 @@ const char *get_bug_type(struct kasan_access_info *info)
+ void *find_first_bad_addr(void *addr, size_t size)
+ {
+ 	u8 tag = get_tag(addr);
+-	void *p = reset_tag(addr);
++	void *p = kasan_reset_tag(addr);
+ 	void *end = p + size;
+ 
+ 	while (p < end && tag == *(u8 *)kasan_mem_to_shadow(p))
