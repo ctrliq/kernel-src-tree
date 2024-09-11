@@ -1,0 +1,294 @@
+xfs: widen ondisk quota expiration timestamps to handle y2038+
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 4ea1ff3b49681af45a4a8c14baf7f0b3d11aa74a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/4ea1ff3b.failed
+
+Enable the bigtime feature for quota timers.  We decrease the accuracy
+of the timers to ~4s in exchange for being able to set timers up to the
+bigtime maximum.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Allison Collins <allison.henderson@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 4ea1ff3b49681af45a4a8c14baf7f0b3d11aa74a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_format.h
+#	fs/xfs/libxfs/xfs_quota_defs.h
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_ondisk.h
+#	fs/xfs/xfs_qm.c
+diff --cc fs/xfs/libxfs/xfs_format.h
+index 736c744a7aca,394159808ffa..000000000000
+--- a/fs/xfs/libxfs/xfs_format.h
++++ b/fs/xfs/libxfs/xfs_format.h
+@@@ -1192,6 -1260,102 +1192,105 @@@ static inline void xfs_dinode_put_rdev(
+  #define XFS_DQUOT_MAGIC		0x4451		/* 'DQ' */
+  #define XFS_DQUOT_VERSION	(uint8_t)0x01	/* latest version number */
+  
+++<<<<<<< HEAD
+++=======
++ #define XFS_DQTYPE_USER		0x01		/* user dquot record */
++ #define XFS_DQTYPE_PROJ		0x02		/* project dquot record */
++ #define XFS_DQTYPE_GROUP	0x04		/* group dquot record */
++ #define XFS_DQTYPE_BIGTIME	0x80		/* large expiry timestamps */
++ 
++ /* bitmask to determine if this is a user/group/project dquot */
++ #define XFS_DQTYPE_REC_MASK	(XFS_DQTYPE_USER | \
++ 				 XFS_DQTYPE_PROJ | \
++ 				 XFS_DQTYPE_GROUP)
++ 
++ #define XFS_DQTYPE_ANY		(XFS_DQTYPE_REC_MASK | \
++ 				 XFS_DQTYPE_BIGTIME)
++ 
++ /*
++  * XFS Quota Timers
++  * ================
++  *
++  * Traditional quota grace period expiration timers are an unsigned 32-bit
++  * seconds counter; time zero is the Unix epoch, Jan  1 00:00:01 UTC 1970.
++  * Note that an expiration value of zero means that the quota limit has not
++  * been reached, and therefore no expiration has been set.  Therefore, the
++  * ondisk min and max defined here can be used directly to constrain the incore
++  * quota expiration timestamps on a Unix system.
++  *
++  * When bigtime is enabled, we trade two bits of precision to expand the
++  * expiration timeout range to match that of big inode timestamps.  The min and
++  * max recorded here are the on-disk limits, not a Unix timestamp.
++  *
++  * The grace period for each quota type is stored in the root dquot (id = 0)
++  * and is applied to a non-root dquot when it exceeds the soft or hard limits.
++  * The length of quota grace periods are unsigned 32-bit quantities measured in
++  * units of seconds.  A value of zero means to use the default period.
++  */
++ 
++ /*
++  * Smallest possible ondisk quota expiration value with traditional timestamps.
++  * This corresponds exactly with the incore expiration Jan  1 00:00:01 UTC 1970.
++  */
++ #define XFS_DQ_LEGACY_EXPIRY_MIN	((int64_t)1)
++ 
++ /*
++  * Largest possible ondisk quota expiration value with traditional timestamps.
++  * This corresponds exactly with the incore expiration Feb  7 06:28:15 UTC 2106.
++  */
++ #define XFS_DQ_LEGACY_EXPIRY_MAX	((int64_t)U32_MAX)
++ 
++ /*
++  * Smallest possible ondisk quota expiration value with bigtime timestamps.
++  * This corresponds (after conversion to a Unix timestamp) with the incore
++  * expiration of Jan  1 00:00:04 UTC 1970.
++  */
++ #define XFS_DQ_BIGTIME_EXPIRY_MIN	(XFS_DQ_LEGACY_EXPIRY_MIN)
++ 
++ /*
++  * Largest supported ondisk quota expiration value with bigtime timestamps.
++  * This corresponds (after conversion to a Unix timestamp) with an incore
++  * expiration of Jul  2 20:20:24 UTC 2486.
++  *
++  * The ondisk field supports values up to -1U, which corresponds to an incore
++  * expiration in 2514.  This is beyond the maximum the bigtime inode timestamp,
++  * so we cap the maximum bigtime quota expiration to the max inode timestamp.
++  */
++ #define XFS_DQ_BIGTIME_EXPIRY_MAX	((int64_t)4074815106U)
++ 
++ /*
++  * The following conversion factors assist in converting a quota expiration
++  * timestamp between the incore and ondisk formats.
++  */
++ #define XFS_DQ_BIGTIME_SHIFT	(2)
++ #define XFS_DQ_BIGTIME_SLACK	((int64_t)(1ULL << XFS_DQ_BIGTIME_SHIFT) - 1)
++ 
++ /* Convert an incore quota expiration timestamp to an ondisk bigtime value. */
++ static inline uint32_t xfs_dq_unix_to_bigtime(time64_t unix_seconds)
++ {
++ 	/*
++ 	 * Round the expiration timestamp up to the nearest bigtime timestamp
++ 	 * that we can store, to give users the most time to fix problems.
++ 	 */
++ 	return ((uint64_t)unix_seconds + XFS_DQ_BIGTIME_SLACK) >>
++ 			XFS_DQ_BIGTIME_SHIFT;
++ }
++ 
++ /* Convert an ondisk bigtime quota expiration value to an incore timestamp. */
++ static inline time64_t xfs_dq_bigtime_to_unix(uint32_t ondisk_seconds)
++ {
++ 	return (time64_t)ondisk_seconds << XFS_DQ_BIGTIME_SHIFT;
++ }
++ 
++ /*
++  * Default quota grace periods, ranging from zero (use the compiled defaults)
++  * to ~136 years.  These are applied to a non-root dquot that has exceeded
++  * either limit.
++  */
++ #define XFS_DQ_GRACE_MIN		((int64_t)0)
++ #define XFS_DQ_GRACE_MAX		((int64_t)U32_MAX)
++ 
+++>>>>>>> 4ea1ff3b4968 (xfs: widen ondisk quota expiration timestamps to handle y2038+)
+  /*
+   * This is the main portion of the on-disk representation of quota information
+   * for a user.  We pad this with some more expansion room to construct the on
+diff --cc fs/xfs/libxfs/xfs_quota_defs.h
+index f4f6803a59bf,0f0af4e35032..000000000000
+--- a/fs/xfs/libxfs/xfs_quota_defs.h
++++ b/fs/xfs/libxfs/xfs_quota_defs.h
+@@@ -18,6 -18,14 +18,17 @@@
+  typedef uint64_t	xfs_qcnt_t;
+  typedef uint16_t	xfs_qwarncnt_t;
+  
+++<<<<<<< HEAD
+++=======
++ typedef uint8_t		xfs_dqtype_t;
++ 
++ #define XFS_DQTYPE_STRINGS \
++ 	{ XFS_DQTYPE_USER,	"USER" }, \
++ 	{ XFS_DQTYPE_PROJ,	"PROJ" }, \
++ 	{ XFS_DQTYPE_GROUP,	"GROUP" }, \
++ 	{ XFS_DQTYPE_BIGTIME,	"BIGTIME" }
++ 
+++>>>>>>> 4ea1ff3b4968 (xfs: widen ondisk quota expiration timestamps to handle y2038+)
+  /*
+   * flags for q_flags field in the dquot.
+   */
+diff --cc fs/xfs/xfs_dquot.c
+index fb1cc50ffc58,3072814e407d..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -239,7 -222,9 +239,13 @@@ xfs_qm_init_dquot_blk
+  		d->dd_diskdq.d_magic = cpu_to_be16(XFS_DQUOT_MAGIC);
+  		d->dd_diskdq.d_version = XFS_DQUOT_VERSION;
+  		d->dd_diskdq.d_id = cpu_to_be32(curid);
+++<<<<<<< HEAD
+ +		d->dd_diskdq.d_flags = type;
+++=======
++ 		d->dd_diskdq.d_type = type;
++ 		if (curid > 0 && xfs_sb_version_hasbigtime(&mp->m_sb))
++ 			d->dd_diskdq.d_type |= XFS_DQTYPE_BIGTIME;
+++>>>>>>> 4ea1ff3b4968 (xfs: widen ondisk quota expiration timestamps to handle y2038+)
+  		if (xfs_sb_version_hascrc(&mp->m_sb)) {
+  			uuid_copy(&d->dd_uuid, &mp->m_sb.sb_meta_uuid);
+  			xfs_update_cksum((char *)d, sizeof(struct xfs_dqblk),
+diff --cc fs/xfs/xfs_ondisk.h
+index cfa54d6b7c11,f6956c98b2f0..000000000000
+--- a/fs/xfs/xfs_ondisk.h
++++ b/fs/xfs/xfs_ondisk.h
+@@@ -154,6 -158,20 +154,23 @@@ xfs_check_ondisk_structs(void
+  	XFS_CHECK_STRUCT_SIZE(struct xfs_inumbers,		24);
+  	XFS_CHECK_STRUCT_SIZE(struct xfs_bulkstat_req,		64);
+  	XFS_CHECK_STRUCT_SIZE(struct xfs_inumbers_req,		64);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Make sure the incore inode timestamp range corresponds to hand
++ 	 * converted values based on the ondisk format specification.
++ 	 */
++ 	XFS_CHECK_VALUE(XFS_BIGTIME_TIME_MIN - XFS_BIGTIME_EPOCH_OFFSET,
++ 			XFS_LEGACY_TIME_MIN);
++ 	XFS_CHECK_VALUE(XFS_BIGTIME_TIME_MAX - XFS_BIGTIME_EPOCH_OFFSET,
++ 			16299260424LL);
++ 
++ 	/* Do the same with the incore quota expiration range. */
++ 	XFS_CHECK_VALUE(XFS_DQ_BIGTIME_EXPIRY_MIN << XFS_DQ_BIGTIME_SHIFT, 4);
++ 	XFS_CHECK_VALUE(XFS_DQ_BIGTIME_EXPIRY_MAX << XFS_DQ_BIGTIME_SHIFT,
++ 			16299260424LL);
+++>>>>>>> 4ea1ff3b4968 (xfs: widen ondisk quota expiration timestamps to handle y2038+)
+  }
+  
+  #endif /* __XFS_ONDISK_H */
+diff --cc fs/xfs/xfs_qm.c
+index ebb106499144,259588a4227d..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -661,6 -661,15 +661,18 @@@ xfs_qm_init_quotainfo
+  	/* Precalc some constants */
+  	qinf->qi_dqchunklen = XFS_FSB_TO_BB(mp, XFS_DQUOT_CLUSTER_SIZE_FSB);
+  	qinf->qi_dqperchunk = xfs_calc_dquots_per_chunk(qinf->qi_dqchunklen);
+++<<<<<<< HEAD
+++=======
++ 	if (xfs_sb_version_hasbigtime(&mp->m_sb)) {
++ 		qinf->qi_expiry_min =
++ 			xfs_dq_bigtime_to_unix(XFS_DQ_BIGTIME_EXPIRY_MIN);
++ 		qinf->qi_expiry_max =
++ 			xfs_dq_bigtime_to_unix(XFS_DQ_BIGTIME_EXPIRY_MAX);
++ 	} else {
++ 		qinf->qi_expiry_min = XFS_DQ_LEGACY_EXPIRY_MIN;
++ 		qinf->qi_expiry_max = XFS_DQ_LEGACY_EXPIRY_MAX;
++ 	}
+++>>>>>>> 4ea1ff3b4968 (xfs: widen ondisk quota expiration timestamps to handle y2038+)
+  
+  	mp->m_qflags |= (mp->m_sb.sb_qflags & XFS_ALL_QUOTA_CHKD);
+  
+diff --git a/fs/xfs/libxfs/xfs_dquot_buf.c b/fs/xfs/libxfs/xfs_dquot_buf.c
+index 1c915026b287..64a6f601746e 100644
+--- a/fs/xfs/libxfs/xfs_dquot_buf.c
++++ b/fs/xfs/libxfs/xfs_dquot_buf.c
+@@ -64,6 +64,13 @@ xfs_dquot_verify(
+ 	    ddq->d_flags != XFS_DQTYPE_GROUP)
+ 		return __this_address;
+ 
++	if ((ddq->d_type & XFS_DQTYPE_BIGTIME) &&
++	    !xfs_sb_version_hasbigtime(&mp->m_sb))
++		return __this_address;
++
++	if ((ddq->d_type & XFS_DQTYPE_BIGTIME) && !ddq->d_id)
++		return __this_address;
++
+ 	if (id != -1 && id != be32_to_cpu(ddq->d_id))
+ 		return __this_address;
+ 
+@@ -290,7 +297,12 @@ xfs_dquot_from_disk_ts(
+ 	struct xfs_disk_dquot	*ddq,
+ 	__be32			dtimer)
+ {
+-	return be32_to_cpu(dtimer);
++	uint32_t		t = be32_to_cpu(dtimer);
++
++	if (t != 0 && (ddq->d_type & XFS_DQTYPE_BIGTIME))
++		return xfs_dq_bigtime_to_unix(t);
++
++	return t;
+ }
+ 
+ /* Convert an incore timer value into an on-disk timer value. */
+@@ -299,5 +311,10 @@ xfs_dquot_to_disk_ts(
+ 	struct xfs_dquot	*dqp,
+ 	time64_t		timer)
+ {
+-	return cpu_to_be32(timer);
++	uint32_t		t = timer;
++
++	if (timer != 0 && (dqp->q_type & XFS_DQTYPE_BIGTIME))
++		t = xfs_dq_unix_to_bigtime(timer);
++
++	return cpu_to_be32(t);
+ }
+* Unmerged path fs/xfs/libxfs/xfs_format.h
+* Unmerged path fs/xfs/libxfs/xfs_quota_defs.h
+* Unmerged path fs/xfs/xfs_dquot.c
+* Unmerged path fs/xfs/xfs_ondisk.h
+* Unmerged path fs/xfs/xfs_qm.c
+diff --git a/fs/xfs/xfs_trans_dquot.c b/fs/xfs/xfs_trans_dquot.c
+index ce487518738a..d2fd26c350c4 100644
+--- a/fs/xfs/xfs_trans_dquot.c
++++ b/fs/xfs/xfs_trans_dquot.c
+@@ -54,6 +54,12 @@ xfs_trans_log_dquot(
+ {
+ 	ASSERT(XFS_DQ_IS_LOCKED(dqp));
+ 
++	/* Upgrade the dquot to bigtime format if possible. */
++	if (dqp->q_id != 0 &&
++	    xfs_sb_version_hasbigtime(&tp->t_mountp->m_sb) &&
++	    !(dqp->q_type & XFS_DQTYPE_BIGTIME))
++		dqp->q_type |= XFS_DQTYPE_BIGTIME;
++
+ 	tp->t_flags |= XFS_TRANS_DIRTY;
+ 	set_bit(XFS_LI_DIRTY, &dqp->q_logitem.qli_item.li_flags);
+ }
