@@ -1,0 +1,315 @@
+net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Parav Pandit <parav@mellanox.com>
+commit b7826076d7ae5928fdd2972a6c3e180148fb74c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b7826076.failed
+
+In cited commit, when prio tag mode is enabled, FTE creation fails
+due to missing group with valid match criteria.
+
+Hence,
+(a) create prio tag group metadata_prio_tag_grp when prio tag is
+enabled with match criteria for vlan push FTE.
+(b) Rename metadata_grp to metadata_allmatch_grp to reflect its purpose.
+
+Also when priority tag is enabled, delete metadata settings after
+deleting ingress rules, which are using it.
+
+Tide up rest of the ingress config code for unnecessary labels.
+
+Fixes: 10652f39943e ("net/mlx5: Refactor ingress acl configuration")
+	Signed-off-by: Parav Pandit <parav@mellanox.com>
+	Reviewed-by: Eli Britstein <elibr@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b7826076d7ae5928fdd2972a6c3e180148fb74c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index 38a4321bf0aa,ffcff3ba3701..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@@ -65,14 -71,24 +65,33 @@@
+  
+  struct vport_ingress {
+  	struct mlx5_flow_table *acl;
+ -	struct mlx5_flow_handle *allow_rule;
+ +	struct mlx5_flow_group *allow_untagged_spoofchk_grp;
+ +	struct mlx5_flow_group *allow_spoofchk_only_grp;
+ +	struct mlx5_flow_group *allow_untagged_only_grp;
+ +	struct mlx5_flow_group *drop_grp;
+ +	struct mlx5_flow_handle  *allow_rule;
+ +	struct mlx5_flow_handle  *drop_rule;
+ +	struct mlx5_fc           *drop_counter;
+  	struct {
+++<<<<<<< HEAD
+++=======
++ 		struct mlx5_flow_group *allow_spoofchk_only_grp;
++ 		struct mlx5_flow_group *allow_untagged_spoofchk_grp;
++ 		struct mlx5_flow_group *allow_untagged_only_grp;
++ 		struct mlx5_flow_group *drop_grp;
++ 		struct mlx5_flow_handle *drop_rule;
++ 		struct mlx5_fc *drop_counter;
++ 	} legacy;
++ 	struct {
++ 		/* Optional group to add an FTE to do internal priority
++ 		 * tagging on ingress packets.
++ 		 */
++ 		struct mlx5_flow_group *metadata_prio_tag_grp;
++ 		/* Group to add default match-all FTE entry to tag ingress
++ 		 * packet with metadata.
++ 		 */
++ 		struct mlx5_flow_group *metadata_allmatch_grp;
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  		struct mlx5_modify_hdr *modify_metadata;
+  		struct mlx5_flow_handle *modify_metadata_rule;
+  	} offloads;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index 00d126fa6e02,243a5440867e..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1860,6 -1853,90 +1856,93 @@@ void esw_vport_del_ingress_acl_modify_m
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int esw_vport_create_ingress_acl_group(struct mlx5_eswitch *esw,
++ 					      struct mlx5_vport *vport)
++ {
++ 	int inlen = MLX5_ST_SZ_BYTES(create_flow_group_in);
++ 	struct mlx5_flow_group *g;
++ 	void *match_criteria;
++ 	u32 *flow_group_in;
++ 	u32 flow_index = 0;
++ 	int ret = 0;
++ 
++ 	flow_group_in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!flow_group_in)
++ 		return -ENOMEM;
++ 
++ 	if (esw_check_ingress_prio_tag_enabled(esw, vport)) {
++ 		/* This group is to hold FTE to match untagged packets when prio_tag
++ 		 * is enabled.
++ 		 */
++ 		memset(flow_group_in, 0, inlen);
++ 
++ 		match_criteria = MLX5_ADDR_OF(create_flow_group_in,
++ 					      flow_group_in, match_criteria);
++ 		MLX5_SET(create_flow_group_in, flow_group_in,
++ 			 match_criteria_enable, MLX5_MATCH_OUTER_HEADERS);
++ 		MLX5_SET_TO_ONES(fte_match_param, match_criteria, outer_headers.cvlan_tag);
++ 		MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, flow_index);
++ 		MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, flow_index);
++ 
++ 		g = mlx5_create_flow_group(vport->ingress.acl, flow_group_in);
++ 		if (IS_ERR(g)) {
++ 			ret = PTR_ERR(g);
++ 			esw_warn(esw->dev, "vport[%d] ingress create untagged flow group, err(%d)\n",
++ 				 vport->vport, ret);
++ 			goto prio_tag_err;
++ 		}
++ 		vport->ingress.offloads.metadata_prio_tag_grp = g;
++ 		flow_index++;
++ 	}
++ 
++ 	if (mlx5_eswitch_vport_match_metadata_enabled(esw)) {
++ 		/* This group holds an FTE with no matches for add metadata for
++ 		 * tagged packets, if prio-tag is enabled (as a fallthrough),
++ 		 * or all traffic in case prio-tag is disabled.
++ 		 */
++ 		memset(flow_group_in, 0, inlen);
++ 		MLX5_SET(create_flow_group_in, flow_group_in, start_flow_index, flow_index);
++ 		MLX5_SET(create_flow_group_in, flow_group_in, end_flow_index, flow_index);
++ 
++ 		g = mlx5_create_flow_group(vport->ingress.acl, flow_group_in);
++ 		if (IS_ERR(g)) {
++ 			ret = PTR_ERR(g);
++ 			esw_warn(esw->dev, "vport[%d] ingress create drop flow group, err(%d)\n",
++ 				 vport->vport, ret);
++ 			goto metadata_err;
++ 		}
++ 		vport->ingress.offloads.metadata_allmatch_grp = g;
++ 	}
++ 
++ 	kvfree(flow_group_in);
++ 	return 0;
++ 
++ metadata_err:
++ 	if (!IS_ERR_OR_NULL(vport->ingress.offloads.metadata_prio_tag_grp)) {
++ 		mlx5_destroy_flow_group(vport->ingress.offloads.metadata_prio_tag_grp);
++ 		vport->ingress.offloads.metadata_prio_tag_grp = NULL;
++ 	}
++ prio_tag_err:
++ 	kvfree(flow_group_in);
++ 	return ret;
++ }
++ 
++ static void esw_vport_destroy_ingress_acl_group(struct mlx5_vport *vport)
++ {
++ 	if (vport->ingress.offloads.metadata_allmatch_grp) {
++ 		mlx5_destroy_flow_group(vport->ingress.offloads.metadata_allmatch_grp);
++ 		vport->ingress.offloads.metadata_allmatch_grp = NULL;
++ 	}
++ 
++ 	if (vport->ingress.offloads.metadata_prio_tag_grp) {
++ 		mlx5_destroy_flow_group(vport->ingress.offloads.metadata_prio_tag_grp);
++ 		vport->ingress.offloads.metadata_prio_tag_grp = NULL;
++ 	}
++ }
++ 
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  static int esw_vport_ingress_config(struct mlx5_eswitch *esw,
+  				    struct mlx5_vport *vport)
+  {
+@@@ -1871,7 -1949,12 +1955,16 @@@
+  
+  	esw_vport_cleanup_ingress_rules(esw, vport);
+  
+++<<<<<<< HEAD
+ +	err = esw_vport_enable_ingress_acl(esw, vport);
+++=======
++ 	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
++ 		num_ftes++;
++ 	if (esw_check_ingress_prio_tag_enabled(esw, vport))
++ 		num_ftes++;
++ 
++ 	err = esw_vport_create_ingress_acl_table(esw, vport, num_ftes);
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  	if (err) {
+  		esw_warn(esw->dev,
+  			 "failed to enable ingress acl (%d) on vport[%d]\n",
+@@@ -1885,19 -1972,22 +1978,27 @@@
+  	if (mlx5_eswitch_vport_match_metadata_enabled(esw)) {
+  		err = esw_vport_add_ingress_acl_modify_metadata(esw, vport);
+  		if (err)
+ -			goto metadata_err;
+ +			goto out;
+  	}
+  
+- 	if (MLX5_CAP_GEN(esw->dev, prio_tag_required) &&
+- 	    mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 	if (esw_check_ingress_prio_tag_enabled(esw, vport)) {
+  		err = esw_vport_ingress_prio_tag_config(esw, vport);
+  		if (err)
+ -			goto prio_tag_err;
+ +			goto out;
+  	}
+ -	return 0;
+  
+++<<<<<<< HEAD
+ +out:
+ +	if (err)
+ +		esw_vport_disable_ingress_acl(esw, vport);
+++=======
++ prio_tag_err:
++ 	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ metadata_err:
++ 	esw_vport_destroy_ingress_acl_group(vport);
++ group_err:
++ 	esw_vport_destroy_ingress_acl_table(vport);
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  	return err;
+  }
+  
+@@@ -1952,53 -2042,51 +2053,80 @@@ esw_check_vport_match_metadata_supporte
+  	return true;
+  }
+  
+ -int
+ -esw_vport_create_offloads_acl_tables(struct mlx5_eswitch *esw,
+ -				     struct mlx5_vport *vport)
+ +static bool
+ +esw_check_vport_match_metadata_mandatory(const struct mlx5_eswitch *esw)
+  {
+++<<<<<<< HEAD
+ +	return mlx5_core_mp_enabled(esw->dev);
+++=======
++ 	int err;
++ 
++ 	err = esw_vport_ingress_config(esw, vport);
++ 	if (err)
++ 		return err;
++ 
++ 	if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
++ 		err = esw_vport_egress_config(esw, vport);
++ 		if (err) {
++ 			esw_vport_cleanup_ingress_rules(esw, vport);
++ 			esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ 			esw_vport_destroy_ingress_acl_group(vport);
++ 			esw_vport_destroy_ingress_acl_table(vport);
++ 		}
++ 	}
++ 	return err;
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  }
+  
+ -void
+ -esw_vport_destroy_offloads_acl_tables(struct mlx5_eswitch *esw,
+ -				      struct mlx5_vport *vport)
+ +static bool esw_use_vport_metadata(const struct mlx5_eswitch *esw)
+  {
+++<<<<<<< HEAD
+ +	return esw_check_vport_match_metadata_mandatory(esw) &&
+ +	       esw_check_vport_match_metadata_supported(esw);
+++=======
++ 	esw_vport_disable_egress_acl(esw, vport);
++ 	esw_vport_cleanup_ingress_rules(esw, vport);
++ 	esw_vport_del_ingress_acl_modify_metadata(esw, vport);
++ 	esw_vport_destroy_ingress_acl_group(vport);
++ 	esw_vport_destroy_ingress_acl_table(vport);
+++>>>>>>> b7826076d7ae (net/mlx5e: E-switch, Fix Ingress ACL groups in switchdev mode for prio tag)
+  }
+  
+ -static int esw_create_uplink_offloads_acl_tables(struct mlx5_eswitch *esw)
+ +static int esw_create_offloads_acl_tables(struct mlx5_eswitch *esw)
+  {
+  	struct mlx5_vport *vport;
+ +	int i, j;
+  	int err;
+  
+ -	if (esw_check_vport_match_metadata_supported(esw))
+ +	if (esw_use_vport_metadata(esw))
+  		esw->flags |= MLX5_ESWITCH_VPORT_MATCH_METADATA;
+  
+ -	vport = mlx5_eswitch_get_vport(esw, MLX5_VPORT_UPLINK);
+ -	err = esw_vport_create_offloads_acl_tables(esw, vport);
+ -	if (err)
+ -		esw->flags &= ~MLX5_ESWITCH_VPORT_MATCH_METADATA;
+ +	mlx5_esw_for_all_vports(esw, i, vport) {
+ +		err = esw_vport_ingress_config(esw, vport);
+ +		if (err)
+ +			goto err_ingress;
+ +
+ +		if (mlx5_eswitch_is_vf_vport(esw, vport->vport)) {
+ +			err = esw_vport_egress_config(esw, vport);
+ +			if (err)
+ +				goto err_egress;
+ +		}
+ +	}
+ +
+ +	if (mlx5_eswitch_vport_match_metadata_enabled(esw))
+ +		esw_info(esw->dev, "Use metadata reg_c as source vport to match\n");
+ +
+ +	return 0;
+ +
+ +err_egress:
+ +	esw_vport_disable_ingress_acl(esw, vport);
+ +err_ingress:
+ +	for (j = MLX5_VPORT_PF; j < i; j++) {
+ +		vport = &esw->vports[j];
+ +		esw_vport_disable_egress_acl(esw, vport);
+ +		esw_vport_disable_ingress_acl(esw, vport);
+ +	}
+ +
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
