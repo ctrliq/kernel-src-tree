@@ -1,0 +1,125 @@
+lockdep: Make __bfs() visit every dependency until a match
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit d563bc6ead9e79be37067d58509a605b67378184
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/d563bc6e.failed
+
+Currently, __bfs() will do a breadth-first search in the dependency
+graph and visit each lock class in the graph exactly once, so for
+example, in the following graph:
+
+	A ---------> B
+	|            ^
+	|            |
+	+----------> C
+
+a __bfs() call starts at A, will visit B through dependency A -> B and
+visit C through dependency A -> C and that's it, IOW, __bfs() will not
+visit dependency C -> B.
+
+This is OK for now, as we only have strong dependencies in the
+dependency graph, so whenever there is a traverse path from A to B in
+__bfs(), it means A has strong dependencies to B (IOW, B depends on A
+strongly). So no need to visit all dependencies in the graph.
+
+However, as we are going to add recursive-read lock into the dependency
+graph, as a result, not all the paths mean strong dependencies, in the
+same example above, dependency A -> B may be a weak dependency and
+traverse A -> C -> B may be a strong dependency path. And with the old
+way of __bfs() (i.e. visiting every lock class exactly once), we will
+miss the strong dependency path, which will result into failing to find
+a deadlock. To cure this for the future, we need to find a way for
+__bfs() to visit each dependency, rather than each class, exactly once
+in the search until we find a match.
+
+The solution is simple:
+
+We used to mark lock_class::lockdep_dependency_gen_id to indicate a
+class has been visited in __bfs(), now we change the semantics a little
+bit: we now mark lock_class::lockdep_dependency_gen_id to indicate _all
+the dependencies_ in its lock_{after,before} have been visited in the
+__bfs() (note we only take one direction in a __bfs() search). In this
+way, every dependency is guaranteed to be visited until we find a match.
+
+Note: the checks in mark_lock_accessed() and lock_accessed() are
+removed, because after this modification, we may call these two
+functions on @source_entry of __bfs(), which may not be the entry in
+"list_entries"
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200807074238.1632519-5-boqun.feng@gmail.com
+(cherry picked from commit d563bc6ead9e79be37067d58509a605b67378184)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 4d916f0bb12e,150686a71be0..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -1533,26 -1536,39 +1529,59 @@@ static int __bfs(struct lock_list *sour
+  			goto exit;
+  		}
+  
++ 		/*
++ 		 * If we have visited all the dependencies from this @lock to
++ 		 * others (iow, if we have visited all lock_list entries in
++ 		 * @lock->class->locks_{after,before}) we skip, otherwise go
++ 		 * and visit all the dependencies in the list and mark this
++ 		 * list accessed.
++ 		 */
++ 		if (lock_accessed(lock))
++ 			continue;
++ 		else
++ 			mark_lock_accessed(lock);
++ 
+  		head = get_dep_list(lock, offset);
+  
+++<<<<<<< HEAD
+ +		list_for_each_entry_rcu(entry, head, entry) {
+ +			if (!lock_accessed(entry)) {
+ +				unsigned int cq_depth;
+ +				mark_lock_accessed(entry, lock);
+ +				if (match(entry, data)) {
+ +					*target_entry = entry;
+ +					ret = 0;
+ +					goto exit;
+ +				}
+ +
+ +				if (__cq_enqueue(cq, entry)) {
+ +					ret = -1;
+ +					goto exit;
+ +				}
+ +				cq_depth = __cq_get_elem_count(cq);
+ +				if (max_bfs_queue_depth < cq_depth)
+ +					max_bfs_queue_depth = cq_depth;
+++=======
++ 		DEBUG_LOCKS_WARN_ON(!irqs_disabled());
++ 
++ 		list_for_each_entry_rcu(entry, head, entry) {
++ 			unsigned int cq_depth;
++ 
++ 			visit_lock_entry(entry, lock);
++ 			if (match(entry, data)) {
++ 				*target_entry = entry;
++ 				ret = BFS_RMATCH;
++ 				goto exit;
+++>>>>>>> d563bc6ead9e (lockdep: Make __bfs() visit every dependency until a match)
++ 			}
++ 
++ 			if (__cq_enqueue(cq, entry)) {
++ 				ret = BFS_EQUEUEFULL;
++ 				goto exit;
+  			}
++ 			cq_depth = __cq_get_elem_count(cq);
++ 			if (max_bfs_queue_depth < cq_depth)
++ 				max_bfs_queue_depth = cq_depth;
+  		}
+  	}
+  exit:
+* Unmerged path kernel/locking/lockdep.c
