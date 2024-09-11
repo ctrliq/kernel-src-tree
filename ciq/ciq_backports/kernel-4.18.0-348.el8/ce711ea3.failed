@@ -1,0 +1,305 @@
+perf/x86/intel/lbr: Support XSAVES/XRSTORS for LBR context switch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit ce711ea3cab9ad325d849792d442848e553095b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/ce711ea3.failed
+
+In the LBR call stack mode, LBR information is used to reconstruct a
+call stack. To get the complete call stack, perf has to save/restore
+all LBR registers during a context switch. Due to a large number of the
+LBR registers, this process causes a high CPU overhead. To reduce the
+CPU overhead during a context switch, use the XSAVES/XRSTORS
+instructions.
+
+Every XSAVE area must follow a canonical format: the legacy region, an
+XSAVE header and the extended region. Although the LBR information is
+only kept in the extended region, a space for the legacy region and
+XSAVE header is still required. Add a new dedicated structure for LBR
+XSAVES support.
+
+Before enabling XSAVES support, the size of the LBR state has to be
+sanity checked, because:
+- the size of the software structure is calculated from the max number
+of the LBR depth, which is enumerated by the CPUID leaf for Arch LBR.
+The size of the LBR state is enumerated by the CPUID leaf for XSAVE
+support of Arch LBR. If the values from the two CPUID leaves are not
+consistent, it may trigger a buffer overflow. For example, a hypervisor
+may unconsciously set inconsistent values for the two emulated CPUID.
+- unlike other state components, the size of an LBR state depends on the
+max number of LBRs, which may vary from generation to generation.
+
+Expose the function xfeature_size() for the sanity check.
+The LBR XSAVES support will be disabled if the size of the LBR state
+enumerated by CPUID doesn't match with the size of the software
+structure.
+
+The XSAVE instruction requires 64-byte alignment for state buffers. A
+new macro is added to reflect the alignment requirement. A 64-byte
+aligned kmem_cache is created for architecture LBR.
+
+Currently, the structure for each state component is maintained in
+fpu/types.h. The structure for the new LBR state component should be
+maintained in the same place. Move structure lbr_entry to fpu/types.h as
+well for broader sharing.
+
+Add dedicated lbr_save/lbr_restore functions for LBR XSAVES support,
+which invokes the corresponding xstate helpers to XSAVES/XRSTORS LBR
+information at the context switch when the call stack mode is enabled.
+Since the XSAVES/XRSTORS instructions will be eventually invoked, the
+dedicated functions is named with '_xsaves'/'_xrstors' postfix.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+Link: https://lkml.kernel.org/r/1593780569-62993-23-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit ce711ea3cab9ad325d849792d442848e553095b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/types.h
+diff --cc arch/x86/include/asm/fpu/types.h
+index addf8a164c98,c87364ea6446..000000000000
+--- a/arch/x86/include/asm/fpu/types.h
++++ b/arch/x86/include/asm/fpu/types.h
+@@@ -234,11 -237,23 +234,31 @@@ struct pkru_state 
+  } __packed;
+  
+  /*
+++<<<<<<< HEAD
+ + * State component 10 is supervisor state used for context-switching the
+ + * PASID state.
+ + */
+ +struct ia32_pasid_state {
+ +	u64 pasid;
+++=======
++  * State component 15: Architectural LBR configuration state.
++  * The size of Arch LBR state depends on the number of LBRs (lbr_depth).
++  */
++ 
++ struct lbr_entry {
++ 	u64 from;
++ 	u64 to;
++ 	u64 info;
++ };
++ 
++ struct arch_lbr_state {
++ 	u64 lbr_ctl;
++ 	u64 lbr_depth;
++ 	u64 ler_from;
++ 	u64 ler_to;
++ 	u64 ler_info;
++ 	struct lbr_entry		entries[];
+++>>>>>>> ce711ea3cab9 (perf/x86/intel/lbr: Support XSAVES/XRSTORS for LBR context switch)
+  } __packed;
+  
+  struct xstate_header {
+diff --git a/arch/x86/events/intel/lbr.c b/arch/x86/events/intel/lbr.c
+index d05b80c1c2dd..debe3731a8de 100644
+--- a/arch/x86/events/intel/lbr.c
++++ b/arch/x86/events/intel/lbr.c
+@@ -483,6 +483,17 @@ static void intel_pmu_arch_lbr_restore(void *ctx)
+ 	}
+ }
+ 
++/*
++ * Restore the Architecture LBR state from the xsave area in the perf
++ * context data for the task via the XRSTORS instruction.
++ */
++static void intel_pmu_arch_lbr_xrstors(void *ctx)
++{
++	struct x86_perf_task_context_arch_lbr_xsave *task_ctx = ctx;
++
++	copy_kernel_to_dynamic_supervisor(&task_ctx->xsave, XFEATURE_MASK_LBR);
++}
++
+ static __always_inline bool lbr_is_reset_in_cstate(void *ctx)
+ {
+ 	if (static_cpu_has(X86_FEATURE_ARCH_LBR))
+@@ -557,6 +568,17 @@ static void intel_pmu_arch_lbr_save(void *ctx)
+ 		entries[x86_pmu.lbr_nr - 1].from = 0;
+ }
+ 
++/*
++ * Save the Architecture LBR state to the xsave area in the perf
++ * context data for the task via the XSAVES instruction.
++ */
++static void intel_pmu_arch_lbr_xsaves(void *ctx)
++{
++	struct x86_perf_task_context_arch_lbr_xsave *task_ctx = ctx;
++
++	copy_dynamic_supervisor_to_kernel(&task_ctx->xsave, XFEATURE_MASK_LBR);
++}
++
+ static void __intel_pmu_lbr_save(void *ctx)
+ {
+ 	struct cpu_hw_events *cpuc = this_cpu_ptr(&cpu_hw_events);
+@@ -1639,12 +1661,40 @@ void intel_pmu_lbr_init_knl(void)
+ 		x86_pmu.intel_cap.lbr_format = LBR_FORMAT_EIP_FLAGS;
+ }
+ 
++/*
++ * LBR state size is variable based on the max number of registers.
++ * This calculates the expected state size, which should match
++ * what the hardware enumerates for the size of XFEATURE_LBR.
++ */
++static inline unsigned int get_lbr_state_size(void)
++{
++	return sizeof(struct arch_lbr_state) +
++	       x86_pmu.lbr_nr * sizeof(struct lbr_entry);
++}
++
++static bool is_arch_lbr_xsave_available(void)
++{
++	if (!boot_cpu_has(X86_FEATURE_XSAVES))
++		return false;
++
++	/*
++	 * Check the LBR state with the corresponding software structure.
++	 * Disable LBR XSAVES support if the size doesn't match.
++	 */
++	if (WARN_ON(xfeature_size(XFEATURE_LBR) != get_lbr_state_size()))
++		return false;
++
++	return true;
++}
++
+ void __init intel_pmu_arch_lbr_init(void)
+ {
++	struct pmu *pmu = x86_get_pmu();
+ 	union cpuid28_eax eax;
+ 	union cpuid28_ebx ebx;
+ 	union cpuid28_ecx ecx;
+ 	unsigned int unused_edx;
++	bool arch_lbr_xsave;
+ 	size_t size;
+ 	u64 lbr_nr;
+ 
+@@ -1670,9 +1720,22 @@ void __init intel_pmu_arch_lbr_init(void)
+ 	x86_pmu.lbr_br_type = ecx.split.lbr_br_type;
+ 	x86_pmu.lbr_nr = lbr_nr;
+ 
+-	size = sizeof(struct x86_perf_task_context_arch_lbr) +
+-	       lbr_nr * sizeof(struct lbr_entry);
+-	x86_get_pmu()->task_ctx_cache = create_lbr_kmem_cache(size, 0);
++
++	arch_lbr_xsave = is_arch_lbr_xsave_available();
++	if (arch_lbr_xsave) {
++		size = sizeof(struct x86_perf_task_context_arch_lbr_xsave) +
++		       get_lbr_state_size();
++		pmu->task_ctx_cache = create_lbr_kmem_cache(size,
++							    XSAVE_ALIGNMENT);
++	}
++
++	if (!pmu->task_ctx_cache) {
++		arch_lbr_xsave = false;
++
++		size = sizeof(struct x86_perf_task_context_arch_lbr) +
++		       lbr_nr * sizeof(struct lbr_entry);
++		pmu->task_ctx_cache = create_lbr_kmem_cache(size, 0);
++	}
+ 
+ 	x86_pmu.lbr_from = MSR_ARCH_LBR_FROM_0;
+ 	x86_pmu.lbr_to = MSR_ARCH_LBR_TO_0;
+@@ -1705,8 +1768,14 @@ void __init intel_pmu_arch_lbr_init(void)
+ 
+ 	x86_pmu.lbr_reset = intel_pmu_arch_lbr_reset;
+ 	x86_pmu.lbr_read = intel_pmu_arch_lbr_read;
+-	x86_pmu.lbr_save = intel_pmu_arch_lbr_save;
+-	x86_pmu.lbr_restore = intel_pmu_arch_lbr_restore;
++	if (arch_lbr_xsave) {
++		x86_pmu.lbr_save = intel_pmu_arch_lbr_xsaves;
++		x86_pmu.lbr_restore = intel_pmu_arch_lbr_xrstors;
++		pr_cont("XSAVE ");
++	} else {
++		x86_pmu.lbr_save = intel_pmu_arch_lbr_save;
++		x86_pmu.lbr_restore = intel_pmu_arch_lbr_restore;
++	}
+ 
+ 	pr_cont("Architectural LBR, ");
+ 
+diff --git a/arch/x86/events/perf_event.h b/arch/x86/events/perf_event.h
+index 5b83205b6893..5f1b84bc9e37 100644
+--- a/arch/x86/events/perf_event.h
++++ b/arch/x86/events/perf_event.h
+@@ -840,6 +840,27 @@ struct x86_perf_task_context_arch_lbr {
+ 	struct lbr_entry entries[];
+ };
+ 
++/*
++ * Add padding to guarantee the 64-byte alignment of the state buffer.
++ *
++ * The structure is dynamically allocated. The size of the LBR state may vary
++ * based on the number of LBR registers.
++ *
++ * Do not put anything after the LBR state.
++ */
++struct x86_perf_task_context_arch_lbr_xsave {
++	struct x86_perf_task_context_opt		opt;
++
++	union {
++		struct xregs_state			xsave;
++		struct {
++			struct fxregs_state		i387;
++			struct xstate_header		header;
++			struct arch_lbr_state		lbr;
++		} __attribute__ ((packed, aligned (XSAVE_ALIGNMENT)));
++	};
++};
++
+ #define x86_add_quirk(func_)						\
+ do {									\
+ 	static struct x86_pmu_quirk __quirk __initdata = {		\
+* Unmerged path arch/x86/include/asm/fpu/types.h
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index eb690e810b95..b8b92a6581d4 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -21,6 +21,8 @@
+ #define XSAVE_YMM_SIZE	    256
+ #define XSAVE_YMM_OFFSET    (XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET)
+ 
++#define XSAVE_ALIGNMENT     64
++
+ /* All currently supported user features */
+ #define XFEATURE_MASK_USER_SUPPORTED (XFEATURE_MASK_FP | \
+ 				      XFEATURE_MASK_SSE | \
+@@ -72,6 +74,7 @@ void fpu__xstate_clear_all_cpu_caps(void);
+ void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
+ const void *get_xsave_field_ptr(int xfeature_nr);
+ int using_compacted_format(void);
++int xfeature_size(int xfeature_nr);
+ int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+diff --git a/arch/x86/include/asm/perf_event.h b/arch/x86/include/asm/perf_event.h
+index 3be442a17e89..d3530eac30bc 100644
+--- a/arch/x86/include/asm/perf_event.h
++++ b/arch/x86/include/asm/perf_event.h
+@@ -365,10 +365,6 @@ struct pebs_xmm {
+ 	u64 xmm[16*2];	/* two entries for each register */
+ };
+ 
+-struct lbr_entry {
+-	u64 from, to, info;
+-};
+-
+ /*
+  * IBS cpuid feature detection
+  */
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 401e69619a86..04040477960e 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -495,7 +495,7 @@ static int xfeature_uncompacted_offset(int xfeature_nr)
+ 	return ebx;
+ }
+ 
+-static int xfeature_size(int xfeature_nr)
++int xfeature_size(int xfeature_nr)
+ {
+ 	u32 eax, ebx, ecx, edx;
+ 
