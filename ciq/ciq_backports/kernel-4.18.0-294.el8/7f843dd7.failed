@@ -1,0 +1,157 @@
+intel_idle: Add __initdata annotations to init time variables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 7f843dd71258ca0e01674be1008eca98917f3f9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7f843dd7.failed
+
+Annotate static variables cpuidle_state_table and mwait_substates
+with __initdata, because they are only used during the initialization
+of the driver.
+
+Also notice that static variable icpu could be annotated analogously
+and the structure pointed to by it could be __initconst, but two of
+its fields are accessed via icpu in intel_idle_cpu_init() and
+auto_demotion_disable(), so introduce two new static variables,
+auto_demotion_disable_flags and disable_promotion_to_c1e, to hold
+the values of these fields, set them during the initialization and
+use them in those functions instead of accessing the source data
+structure via icpu.
+
+That allows icpu to be annotated with __initdata, so do that,
+and it will also allow some __initconst annotations to be added
+subsequently.
+
+No intentional functional impact.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 7f843dd71258ca0e01674be1008eca98917f3f9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/idle/intel_idle.c
+diff --cc drivers/idle/intel_idle.c
+index adafee3bbdac,b7341e0b910a..000000000000
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@@ -75,8 -63,13 +75,12 @@@ static struct cpuidle_driver intel_idle
+  };
+  /* intel_idle.max_cstate=0 disables driver */
+  static int max_cstate = CPUIDLE_STATE_MAX - 1;
+ -static unsigned int disabled_states_mask;
+  
+- static unsigned int mwait_substates;
++ static unsigned int mwait_substates __initdata;
++ 
++ static unsigned long auto_demotion_disable_flags;
++ static bool disable_promotion_to_c1e;
++ 
+  static bool lapic_timer_always_reliable;
+  
+  struct idle_cpu {
+@@@ -92,13 -85,9 +96,17 @@@
+  	bool use_acpi;
+  };
+  
+- static const struct idle_cpu *icpu;
++ static const struct idle_cpu *icpu __initdata;
+  static struct cpuidle_device __percpu *intel_idle_cpuidle_devices;
+++<<<<<<< HEAD
+ +static int intel_idle(struct cpuidle_device *dev,
+ +			struct cpuidle_driver *drv, int index);
+ +static void intel_idle_s2idle(struct cpuidle_device *dev,
+ +			      struct cpuidle_driver *drv, int index);
+ +static struct cpuidle_state *cpuidle_state_table;
+++=======
++ static struct cpuidle_state *cpuidle_state_table __initdata;
+++>>>>>>> 7f843dd71258 (intel_idle: Add __initdata annotations to init time variables)
+  
+  /*
+   * Enable this state by default even if the ACPI _CST does not list it.
+@@@ -1602,6 -1518,24 +1610,27 @@@ static void __init intel_idle_cpuidle_d
+  		intel_idle_init_cstates_acpi(drv);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void auto_demotion_disable(void)
++ {
++ 	unsigned long long msr_bits;
++ 
++ 	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
++ 	msr_bits &= ~auto_demotion_disable_flags;
++ 	wrmsrl(MSR_PKG_CST_CONFIG_CONTROL, msr_bits);
++ }
++ 
++ static void c1e_promotion_disable(void)
++ {
++ 	unsigned long long msr_bits;
++ 
++ 	rdmsrl(MSR_IA32_POWER_CTL, msr_bits);
++ 	msr_bits &= ~0x2;
++ 	wrmsrl(MSR_IA32_POWER_CTL, msr_bits);
++ }
++ 
+++>>>>>>> 7f843dd71258 (intel_idle: Add __initdata annotations to init time variables)
+  /*
+   * intel_idle_cpu_init()
+   * allocate, initialize, register cpuidle_devices
+@@@ -1658,9 -1602,48 +1684,54 @@@ static int __init intel_idle_init(void
+  	if (boot_option_idle_override != IDLE_NO_OVERRIDE)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	retval = intel_idle_probe();
+ +	if (retval)
+ +		return retval;
+++=======
++ 	if (max_cstate == 0) {
++ 		pr_debug("disabled\n");
++ 		return -EPERM;
++ 	}
++ 
++ 	id = x86_match_cpu(intel_idle_ids);
++ 	if (id) {
++ 		if (!boot_cpu_has(X86_FEATURE_MWAIT)) {
++ 			pr_debug("Please enable MWAIT in BIOS SETUP\n");
++ 			return -ENODEV;
++ 		}
++ 	} else {
++ 		id = x86_match_cpu(intel_mwait_ids);
++ 		if (!id)
++ 			return -ENODEV;
++ 	}
++ 
++ 	if (boot_cpu_data.cpuid_level < CPUID_MWAIT_LEAF)
++ 		return -ENODEV;
++ 
++ 	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &mwait_substates);
++ 
++ 	if (!(ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) ||
++ 	    !(ecx & CPUID5_ECX_INTERRUPT_BREAK) ||
++ 	    !mwait_substates)
++ 			return -ENODEV;
++ 
++ 	pr_debug("MWAIT substates: 0x%x\n", mwait_substates);
++ 
++ 	icpu = (const struct idle_cpu *)id->driver_data;
++ 	if (icpu) {
++ 		cpuidle_state_table = icpu->state_table;
++ 		auto_demotion_disable_flags = icpu->auto_demotion_disable_flags;
++ 		disable_promotion_to_c1e = icpu->disable_promotion_to_c1e;
++ 		if (icpu->use_acpi || force_use_acpi)
++ 			intel_idle_acpi_cst_extract();
++ 	} else if (!intel_idle_acpi_cst_extract()) {
++ 		return -ENODEV;
++ 	}
++ 
++ 	pr_debug("v" INTEL_IDLE_VERSION " model 0x%X\n",
++ 		 boot_cpu_data.x86_model);
+++>>>>>>> 7f843dd71258 (intel_idle: Add __initdata annotations to init time variables)
+  
+  	intel_idle_cpuidle_devices = alloc_percpu(struct cpuidle_device);
+  	if (!intel_idle_cpuidle_devices)
+* Unmerged path drivers/idle/intel_idle.c
