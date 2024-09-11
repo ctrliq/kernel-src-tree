@@ -237,9 +237,15 @@ struct fcloop_nport {
 	u32 port_id;
 };
 
+enum {
+	H2T	= 0,
+	T2H	= 1,
+};
+
 struct fcloop_lsreq {
 	struct nvmefc_ls_req		*lsreq;
 	struct nvmefc_ls_rsp		ls_rsp;
+	int				lsdir;	/* H2T or T2H */
 	int				status;
 	struct list_head		ls_list; /* fcloop_rport->ls_list */
 };
@@ -334,7 +340,7 @@ fcloop_rport_lsrqst_work(struct work_struct *work)
 }
 
 static int
-fcloop_ls_req(struct nvme_fc_local_port *localport,
+fcloop_h2t_ls_req(struct nvme_fc_local_port *localport,
 			struct nvme_fc_remote_port *remoteport,
 			struct nvmefc_ls_req *lsreq)
 {
@@ -342,6 +348,7 @@ fcloop_ls_req(struct nvme_fc_local_port *localport,
 	struct fcloop_rport *rport = remoteport->private;
 	int ret = 0;
 
+	tls_req->lsdir = H2T;
 	tls_req->lsreq = lsreq;
 	INIT_LIST_HEAD(&tls_req->ls_list);
 
@@ -362,7 +369,7 @@ fcloop_ls_req(struct nvme_fc_local_port *localport,
 }
 
 static int
-fcloop_xmt_ls_rsp(struct nvmet_fc_target_port *targetport,
+fcloop_h2t_xmt_ls_rsp(struct nvmet_fc_target_port *targetport,
 			struct nvmefc_ls_rsp *lsrsp)
 {
 	struct fcloop_lsreq *tls_req = ls_rsp_to_lsreq(lsrsp);
@@ -773,7 +780,7 @@ fcloop_fcp_req_release(struct nvmet_fc_target_port *tgtport,
 }
 
 static void
-fcloop_ls_abort(struct nvme_fc_local_port *localport,
+fcloop_h2t_ls_abort(struct nvme_fc_local_port *localport,
 			struct nvme_fc_remote_port *remoteport,
 				struct nvmefc_ls_req *lsreq)
 {
@@ -890,9 +897,9 @@ static struct nvme_fc_port_template fctemplate = {
 	.remoteport_delete	= fcloop_remoteport_delete,
 	.create_queue		= fcloop_create_queue,
 	.delete_queue		= fcloop_delete_queue,
-	.ls_req			= fcloop_ls_req,
+	.ls_req			= fcloop_h2t_ls_req,
 	.fcp_io			= fcloop_fcp_req,
-	.ls_abort		= fcloop_ls_abort,
+	.ls_abort		= fcloop_h2t_ls_abort,
 	.fcp_abort		= fcloop_fcp_abort,
 	.max_hw_queues		= FCLOOP_HW_QUEUES,
 	.max_sgl_segments	= FCLOOP_SGL_SEGS,
@@ -907,7 +914,7 @@ static struct nvme_fc_port_template fctemplate = {
 
 static struct nvmet_fc_target_template tgttemplate = {
 	.targetport_delete	= fcloop_targetport_delete,
-	.xmt_ls_rsp		= fcloop_xmt_ls_rsp,
+	.xmt_ls_rsp		= fcloop_h2t_xmt_ls_rsp,
 	.fcp_op			= fcloop_fcp_op,
 	.fcp_abort		= fcloop_tgt_fcp_abort,
 	.fcp_req_release	= fcloop_fcp_req_release,
