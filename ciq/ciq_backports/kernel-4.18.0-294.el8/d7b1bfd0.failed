@@ -1,0 +1,147 @@
+mptcp: be careful on subflows shutdown
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit d7b1bfd0832c1d005f571203306b6c50e9805150
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d7b1bfd0.failed
+
+When the workqueue disposes of the msk, the subflows can still
+receive some data from the peer after __mptcp_close_ssk()
+completes.
+
+The above could trigger a race between the msk receive path and the
+msk destruction. Acquiring the mptcp_data_lock() in __mptcp_destroy_sock()
+will not save the day: the rx path could be reached even after msk
+destruction completes.
+
+Instead use the subflow 'disposable' flag to prevent entering
+the msk receive path after __mptcp_close_ssk().
+
+Fixes: e16163b6e2b7 ("mptcp: refactor shutdown and close")
+	Reviewed-by: Matthieu Baerts <matthieu.baerts@tessares.net>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit d7b1bfd0832c1d005f571203306b6c50e9805150)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,2540d82742ac..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -449,33 -696,43 +449,50 @@@ static bool move_skbs_to_msk(struct mpt
+  
+  void mptcp_data_ready(struct sock *sk, struct sock *ssk)
+  {
+ -	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+ -	int sk_rbuf, ssk_rbuf;
+ -	bool wake;
+  
+++<<<<<<< HEAD
+ +	set_bit(MPTCP_DATA_READY, &msk->flags);
+++=======
++ 	/* The peer can send data while we are shutting down this
++ 	 * subflow at msk destruction time, but we must avoid enqueuing
++ 	 * more data to the msk receive queue
++ 	 */
++ 	if (unlikely(subflow->disposable))
++ 		return;
++ 
++ 	/* move_skbs_to_msk below can legitly clear the data_avail flag,
++ 	 * but we will need later to properly woke the reader, cache its
++ 	 * value
++ 	 */
++ 	wake = subflow->data_avail == MPTCP_SUBFLOW_DATA_AVAIL;
++ 	if (wake)
++ 		set_bit(MPTCP_DATA_READY, &msk->flags);
+++>>>>>>> d7b1bfd0832c (mptcp: be careful on subflows shutdown)
+  
+ -	ssk_rbuf = READ_ONCE(ssk->sk_rcvbuf);
+ -	sk_rbuf = READ_ONCE(sk->sk_rcvbuf);
+ -	if (unlikely(ssk_rbuf > sk_rbuf))
+ -		sk_rbuf = ssk_rbuf;
+ +	if (atomic_read(&sk->sk_rmem_alloc) < READ_ONCE(sk->sk_rcvbuf) &&
+ +	    move_skbs_to_msk(msk, ssk))
+ +		goto wake;
+  
+ -	/* over limit? can't append more skbs to msk */
+ -	if (atomic_read(&sk->sk_rmem_alloc) > sk_rbuf)
+ +	/* don't schedule if mptcp sk is (still) over limit */
+ +	if (atomic_read(&sk->sk_rmem_alloc) > READ_ONCE(sk->sk_rcvbuf))
+  		goto wake;
+  
+ -	move_skbs_to_msk(msk, ssk);
+ +	/* mptcp socket is owned, release_cb should retry */
+ +	if (!test_and_set_bit(TCP_DELACK_TIMER_DEFERRED,
+ +			      &sk->sk_tsq_flags)) {
+ +		sock_hold(sk);
+  
+ +		/* need to try again, its possible release_cb() has already
+ +		 * been called after the test_and_set_bit() above.
+ +		 */
+ +		move_skbs_to_msk(msk, ssk);
+ +	}
+  wake:
+ -	if (wake)
+ -		sk->sk_data_ready(sk);
+ +	sk->sk_data_ready(sk);
+  }
+  
+ -void __mptcp_flush_join_list(struct mptcp_sock *msk)
+ +static void __mptcp_flush_join_list(struct mptcp_sock *msk)
+  {
+  	if (likely(list_empty(&msk->join_list)))
+  		return;
+@@@ -1411,13 -2115,37 +1428,41 @@@ static void __mptcp_close_ssk(struct so
+  
+  	list_del(&subflow->node);
+  
+++<<<<<<< HEAD
+ +	if (sock && sock != sk->sk_socket) {
+ +		/* outgoing subflow */
+ +		sock_release(sock);
+ +	} else {
+ +		/* incoming subflow */
+ +		tcp_close(ssk, timeout);
+++=======
++ 	lock_sock(ssk);
++ 
++ 	/* if we are invoked by the msk cleanup code, the subflow is
++ 	 * already orphaned
++ 	 */
++ 	sock = ssk->sk_socket;
++ 	if (sock) {
++ 		dispose_socket = sock != sk->sk_socket;
++ 		sock_orphan(ssk);
++ 	}
++ 
++ 	subflow->disposable = 1;
++ 
++ 	/* if ssk hit tcp_done(), tcp_cleanup_ulp() cleared the related ops
++ 	 * the ssk has been already destroyed, we just need to release the
++ 	 * reference owned by msk;
++ 	 */
++ 	if (!inet_csk(ssk)->icsk_ulp_ops) {
++ 		kfree_rcu(subflow, rcu);
++ 	} else {
++ 		/* otherwise tcp will dispose of the ssk and subflow ctx */
++ 		__tcp_close(ssk, 0);
++ 
++ 		/* close acquired an extra ref */
++ 		__sock_put(ssk);
+++>>>>>>> d7b1bfd0832c (mptcp: be careful on subflows shutdown)
+  	}
+ -	release_sock(ssk);
+ -	if (dispose_socket)
+ -		iput(SOCK_INODE(sock));
+ -
+ -	sock_put(ssk);
+  }
+  
+  static unsigned int mptcp_sync_mss(struct sock *sk, u32 pmtu)
+* Unmerged path net/mptcp/protocol.c
