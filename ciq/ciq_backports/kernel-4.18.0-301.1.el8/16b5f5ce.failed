@@ -1,0 +1,200 @@
+ibmvnic: merge do_change_param_reset into do_reset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Lijun Pan <ljp@linux.ibm.com>
+commit 16b5f5ce351f8709a6b518cc3cbf240c378305bf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/16b5f5ce.failed
+
+Commit b27507bb59ed ("net/ibmvnic: unlock rtnl_lock in reset so
+linkwatch_event can run") introduced do_change_param_reset function to
+solve the rtnl lock issue. Majority of the code in do_change_param_reset
+duplicates do_reset. Also, we can handle the rtnl lock issue in do_reset
+itself. Hence merge do_change_param_reset back into do_reset to clean up
+the code.
+
+	Signed-off-by: Lijun Pan <ljp@linux.ibm.com>
+Link: https://lore.kernel.org/r/20201031094645.17255-1-ljp@linux.ibm.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 16b5f5ce351f8709a6b518cc3cbf240c378305bf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ibm/ibmvnic.c
+diff --cc drivers/net/ethernet/ibm/ibmvnic.c
+index e7d6ece9215c,f4167de30461..000000000000
+--- a/drivers/net/ethernet/ibm/ibmvnic.c
++++ b/drivers/net/ethernet/ibm/ibmvnic.c
+@@@ -1940,92 -1827,6 +1940,95 @@@ static int ibmvnic_set_mac(struct net_d
+  }
+  
+  /**
+++<<<<<<< HEAD
+ + * do_change_param_reset returns zero if we are able to keep processing reset
+ + * events, or non-zero if we hit a fatal error and must halt.
+ + */
+ +static int do_change_param_reset(struct ibmvnic_adapter *adapter,
+ +				 struct ibmvnic_rwi *rwi,
+ +				 u32 reset_state)
+ +{
+ +	struct net_device *netdev = adapter->netdev;
+ +	int i, rc;
+ +
+ +	netdev_dbg(adapter->netdev, "Change param resetting driver (%d)\n",
+ +		   rwi->reset_reason);
+ +
+ +	netif_carrier_off(netdev);
+ +	adapter->reset_reason = rwi->reset_reason;
+ +
+ +	ibmvnic_cleanup(netdev);
+ +
+ +	if (reset_state == VNIC_OPEN) {
+ +		rc = __ibmvnic_close(netdev);
+ +		if (rc)
+ +			goto out;
+ +	}
+ +
+ +	release_resources(adapter);
+ +	release_sub_crqs(adapter, 1);
+ +	release_crq_queue(adapter);
+ +
+ +	adapter->state = VNIC_PROBED;
+ +
+ +	rc = init_crq_queue(adapter);
+ +
+ +	if (rc) {
+ +		netdev_err(adapter->netdev,
+ +			   "Couldn't initialize crq. rc=%d\n", rc);
+ +		return rc;
+ +	}
+ +
+ +	rc = ibmvnic_reset_init(adapter, true);
+ +	if (rc) {
+ +		rc = IBMVNIC_INIT_FAILED;
+ +		goto out;
+ +	}
+ +
+ +	/* If the adapter was in PROBE state prior to the reset,
+ +	 * exit here.
+ +	 */
+ +	if (reset_state == VNIC_PROBED)
+ +		goto out;
+ +
+ +	rc = ibmvnic_login(netdev);
+ +	if (rc) {
+ +		goto out;
+ +	}
+ +
+ +	rc = init_resources(adapter);
+ +	if (rc)
+ +		goto out;
+ +
+ +	ibmvnic_disable_irqs(adapter);
+ +
+ +	adapter->state = VNIC_CLOSED;
+ +
+ +	if (reset_state == VNIC_CLOSED)
+ +		return 0;
+ +
+ +	rc = __ibmvnic_open(netdev);
+ +	if (rc) {
+ +		rc = IBMVNIC_OPEN_FAILED;
+ +		goto out;
+ +	}
+ +
+ +	/* refresh device's multicast list */
+ +	ibmvnic_set_multi(netdev);
+ +
+ +	/* kick napi */
+ +	for (i = 0; i < adapter->req_rx_queues; i++)
+ +		napi_schedule(&adapter->napi[i]);
+ +
+ +out:
+ +	if (rc)
+ +		adapter->state = reset_state;
+ +	return rc;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 16b5f5ce351f (ibmvnic: merge do_change_param_reset into do_reset)
+   * do_reset returns zero if we are able to keep processing reset events, or
+   * non-zero if we hit a fatal error and must halt.
+   */
+@@@ -2037,22 -1838,15 +2040,28 @@@ static int do_reset(struct ibmvnic_adap
+  	struct net_device *netdev = adapter->netdev;
+  	int i, rc;
+  
+ -	netdev_dbg(adapter->netdev, "Re-setting driver (%d)\n",
+ -		   rwi->reset_reason);
+ +	netdev_dbg(adapter->netdev,
+ +		   "[S:%d FOP:%d] Reset reason %d, reset_state %d\n",
+ +		   adapter->state, adapter->failover_pending,
+ +		   rwi->reset_reason, reset_state);
+  
+++<<<<<<< HEAD
+ +	rtnl_lock();
+ +	/*
+ +	 * Now that we have the rtnl lock, clear any pending failover.
+ +	 * This will ensure ibmvnic_open() has either completed or will
+ +	 * block until failover is complete.
+ +	 */
+ +	if (rwi->reset_reason == VNIC_RESET_FAILOVER)
+ +		adapter->failover_pending = false;
+++=======
++ 	adapter->reset_reason = rwi->reset_reason;
++ 	/* requestor of VNIC_RESET_CHANGE_PARAM already has the rtnl lock */
++ 	if (!(adapter->reset_reason == VNIC_RESET_CHANGE_PARAM))
++ 		rtnl_lock();
+++>>>>>>> 16b5f5ce351f (ibmvnic: merge do_change_param_reset into do_reset)
+  
+  	netif_carrier_off(netdev);
+- 	adapter->reset_reason = rwi->reset_reason;
+  
+  	old_num_rx_queues = adapter->req_rx_queues;
+  	old_num_tx_queues = adapter->req_tx_queues;
+@@@ -2194,13 -2004,10 +2221,19 @@@
+  	rc = 0;
+  
+  out:
+++<<<<<<< HEAD
+ +	/* restore the adapter state if reset failed */
+ +	if (rc)
+ +		adapter->state = reset_state;
+ +	rtnl_unlock();
+++=======
++ 	/* requestor of VNIC_RESET_CHANGE_PARAM should still hold the rtnl lock */
++ 	if (!(adapter->reset_reason == VNIC_RESET_CHANGE_PARAM))
++ 		rtnl_unlock();
+++>>>>>>> 16b5f5ce351f (ibmvnic: merge do_change_param_reset into do_reset)
+  
+ +	netdev_dbg(adapter->netdev, "[S:%d FOP:%d] Reset done, rc %d\n",
+ +		   adapter->state, adapter->failover_pending, rc);
+  	return rc;
+  }
+  
+@@@ -2331,17 -2140,7 +2364,21 @@@ static void __ibmvnic_reset(struct work
+  		}
+  		spin_unlock_irqrestore(&adapter->state_lock, flags);
+  
+++<<<<<<< HEAD
+ +		if (rwi->reset_reason == VNIC_RESET_CHANGE_PARAM) {
+ +			/* CHANGE_PARAM requestor holds rtnl_lock */
+ +			rc = do_change_param_reset(adapter, rwi, reset_state);
+ +		} else if (adapter->force_reset_recovery) {
+ +			/*
+ +			 * Since we are doing a hard reset now, clear the
+ +			 * failover_pending flag so we don't ignore any
+ +			 * future MOBILITY or other resets.
+ +			 */
+ +			adapter->failover_pending = false;
+ +
+++=======
++ 		if (adapter->force_reset_recovery) {
+++>>>>>>> 16b5f5ce351f (ibmvnic: merge do_change_param_reset into do_reset)
+  			/* Transport event occurred during previous reset */
+  			if (adapter->wait_for_reset) {
+  				/* Previous was CHANGE_PARAM; caller locked */
+* Unmerged path drivers/net/ethernet/ibm/ibmvnic.c
