@@ -1,0 +1,100 @@
+hugetlbfs: fix hugetlb page migration/fault race causing SIGBUS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 4643d67e8cb0b3536ef0ab5cddd1cedc73fa14ad
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/4643d67e.failed
+
+Li Wang discovered that LTP/move_page12 V2 sometimes triggers SIGBUS in
+the kernel-v5.2.3 testing.  This is caused by a race between hugetlb
+page migration and page fault.
+
+If a hugetlb page can not be allocated to satisfy a page fault, the task
+is sent SIGBUS.  This is normal hugetlbfs behavior.  A hugetlb fault
+mutex exists to prevent two tasks from trying to instantiate the same
+page.  This protects against the situation where there is only one
+hugetlb page, and both tasks would try to allocate.  Without the mutex,
+one would fail and SIGBUS even though the other fault would be
+successful.
+
+There is a similar race between hugetlb page migration and fault.
+Migration code will allocate a page for the target of the migration.  It
+will then unmap the original page from all page tables.  It does this
+unmap by first clearing the pte and then writing a migration entry.  The
+page table lock is held for the duration of this clear and write
+operation.  However, the beginnings of the hugetlb page fault code
+optimistically checks the pte without taking the page table lock.  If
+clear (as it can be during the migration unmap operation), a hugetlb
+page allocation is attempted to satisfy the fault.  Note that the page
+which will eventually satisfy this fault was already allocated by the
+migration code.  However, the allocation within the fault path could
+fail which would result in the task incorrectly being sent SIGBUS.
+
+Ideally, we could take the hugetlb fault mutex in the migration code
+when modifying the page tables.  However, locks must be taken in the
+order of hugetlb fault mutex, page lock, page table lock.  This would
+require significant rework of the migration code.  Instead, the issue is
+addressed in the hugetlb fault code.  After failing to allocate a huge
+page, take the page table lock and check for huge_pte_none before
+returning an error.  This is the same check that must be made further in
+the code even if page allocation is successful.
+
+Link: http://lkml.kernel.org/r/20190808000533.7701-1-mike.kravetz@oracle.com
+Fixes: 290408d4a250 ("hugetlb: hugepage migration core")
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Reported-by: Li Wang <liwang@redhat.com>
+	Tested-by: Li Wang <liwang@redhat.com>
+	Reviewed-by: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Cyril Hrubis <chrubis@suse.cz>
+	Cc: Xishi Qiu <xishi.qiuxishi@alibaba-inc.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 4643d67e8cb0b3536ef0ab5cddd1cedc73fa14ad)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 3211941cefe1,6d7296dd11b8..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -3783,11 -3856,26 +3783,34 @@@ retry
+  
+  		page = alloc_huge_page(vma, haddr, 0);
+  		if (IS_ERR(page)) {
+++<<<<<<< HEAD
+ +			ret = PTR_ERR(page);
+ +			if (ret == -ENOMEM)
+ +				ret = VM_FAULT_OOM;
+ +			else
+ +				ret = VM_FAULT_SIGBUS;
+++=======
++ 			/*
++ 			 * Returning error will result in faulting task being
++ 			 * sent SIGBUS.  The hugetlb fault mutex prevents two
++ 			 * tasks from racing to fault in the same page which
++ 			 * could result in false unable to allocate errors.
++ 			 * Page migration does not take the fault mutex, but
++ 			 * does a clear then write of pte's under page table
++ 			 * lock.  Page fault code could race with migration,
++ 			 * notice the clear pte and try to allocate a page
++ 			 * here.  Before returning error, get ptl and make
++ 			 * sure there really is no pte entry.
++ 			 */
++ 			ptl = huge_pte_lock(h, mm, ptep);
++ 			if (!huge_pte_none(huge_ptep_get(ptep))) {
++ 				ret = 0;
++ 				spin_unlock(ptl);
++ 				goto out;
++ 			}
++ 			spin_unlock(ptl);
++ 			ret = vmf_error(PTR_ERR(page));
+++>>>>>>> 4643d67e8cb0 (hugetlbfs: fix hugetlb page migration/fault race causing SIGBUS)
+  			goto out;
+  		}
+  		clear_huge_page(page, address, pages_per_huge_page(h));
+* Unmerged path mm/hugetlb.c
