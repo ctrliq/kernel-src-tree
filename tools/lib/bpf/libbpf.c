@@ -468,8 +468,10 @@ static int bpf_object__elf_init(struct bpf_object *obj)
 	} else {
 		obj->efile.fd = open(obj->path, O_RDONLY);
 		if (obj->efile.fd < 0) {
-			pr_warning("failed to open %s: %s\n", obj->path,
-					strerror(errno));
+			char errmsg[STRERR_BUFSIZE];
+			char *cp = strerror_r(errno, errmsg, sizeof(errmsg));
+
+			pr_warning("failed to open %s: %s\n", obj->path, cp);
 			return -errno;
 		}
 
@@ -808,10 +810,11 @@ static int bpf_object__elf_collect(struct bpf_object *obj)
 						      data->d_size, name, idx);
 			if (err) {
 				char errmsg[STRERR_BUFSIZE];
+				char *cp = strerror_r(-err, errmsg,
+						      sizeof(errmsg));
 
-				strerror_r(-err, errmsg, sizeof(errmsg));
 				pr_warning("failed to alloc program %s (%s): %s",
-					   name, obj->path, errmsg);
+					   name, obj->path, cp);
 			}
 		} else if (sh.sh_type == SHT_REL) {
 			void *reloc = obj->efile.reloc;
@@ -1097,6 +1100,7 @@ bpf_object__create_maps(struct bpf_object *obj)
 	for (i = 0; i < obj->nr_maps; i++) {
 		struct bpf_map *map = &obj->maps[i];
 		struct bpf_map_def *def = &map->def;
+		char *cp, errmsg[STRERR_BUFSIZE];
 		int *pfd = &map->fd;
 
 		if (map->fd >= 0) {
@@ -1124,8 +1128,9 @@ bpf_object__create_maps(struct bpf_object *obj)
 
 		*pfd = bpf_create_map_xattr(&create_attr);
 		if (*pfd < 0 && create_attr.btf_key_type_id) {
+			cp = strerror_r(errno, errmsg, sizeof(errmsg));
 			pr_warning("Error in bpf_create_map_xattr(%s):%s(%d). Retrying without BTF.\n",
-				   map->name, strerror(errno), errno);
+				   map->name, cp, errno);
 			create_attr.btf_fd = 0;
 			create_attr.btf_key_type_id = 0;
 			create_attr.btf_value_type_id = 0;
@@ -1138,9 +1143,9 @@ bpf_object__create_maps(struct bpf_object *obj)
 			size_t j;
 
 			err = *pfd;
+			cp = strerror_r(errno, errmsg, sizeof(errmsg));
 			pr_warning("failed to create map (name: '%s'): %s\n",
-				   map->name,
-				   strerror(errno));
+				   map->name, cp);
 			for (j = 0; j < i; j++)
 				zclose(obj->maps[j].fd);
 			return err;
@@ -1292,6 +1297,7 @@ load_program(enum bpf_prog_type type, enum bpf_attach_type expected_attach_type,
 	     char *license, u32 kern_version, int *pfd, int prog_ifindex)
 {
 	struct bpf_load_program_attr load_attr;
+	char *cp, errmsg[STRERR_BUFSIZE];
 	char *log_buf;
 	int ret;
 
@@ -1321,7 +1327,8 @@ load_program(enum bpf_prog_type type, enum bpf_attach_type expected_attach_type,
 	}
 
 	ret = -LIBBPF_ERRNO__LOAD;
-	pr_warning("load bpf program failed: %s\n", strerror(errno));
+	cp = strerror_r(errno, errmsg, sizeof(errmsg));
+	pr_warning("load bpf program failed: %s\n", cp);
 
 	if (log_buf && log_buf[0] != '\0') {
 		ret = -LIBBPF_ERRNO__VERIFY;
@@ -1620,6 +1627,7 @@ out:
 
 static int check_path(const char *path)
 {
+	char *cp, errmsg[STRERR_BUFSIZE];
 	struct statfs st_fs;
 	char *dname, *dir;
 	int err = 0;
@@ -1633,7 +1641,8 @@ static int check_path(const char *path)
 
 	dir = dirname(dname);
 	if (statfs(dir, &st_fs)) {
-		pr_warning("failed to statfs %s: %s\n", dir, strerror(errno));
+		cp = strerror_r(errno, errmsg, sizeof(errmsg));
+		pr_warning("failed to statfs %s: %s\n", dir, cp);
 		err = -errno;
 	}
 	free(dname);
@@ -1649,6 +1658,7 @@ static int check_path(const char *path)
 int bpf_program__pin_instance(struct bpf_program *prog, const char *path,
 			      int instance)
 {
+	char *cp, errmsg[STRERR_BUFSIZE];
 	int err;
 
 	err = check_path(path);
@@ -1667,7 +1677,8 @@ int bpf_program__pin_instance(struct bpf_program *prog, const char *path,
 	}
 
 	if (bpf_obj_pin(prog->instances.fds[instance], path)) {
-		pr_warning("failed to pin program: %s\n", strerror(errno));
+		cp = strerror_r(errno, errmsg, sizeof(errmsg));
+		pr_warning("failed to pin program: %s\n", cp);
 		return -errno;
 	}
 	pr_debug("pinned program '%s'\n", path);
@@ -1677,13 +1688,16 @@ int bpf_program__pin_instance(struct bpf_program *prog, const char *path,
 
 static int make_dir(const char *path)
 {
+	char *cp, errmsg[STRERR_BUFSIZE];
 	int err = 0;
 
 	if (mkdir(path, 0700) && errno != EEXIST)
 		err = -errno;
 
-	if (err)
-		pr_warning("failed to mkdir %s: %s\n", path, strerror(-err));
+	if (err) {
+		cp = strerror_r(-err, errmsg, sizeof(errmsg));
+		pr_warning("failed to mkdir %s: %s\n", path, cp);
+	}
 	return err;
 }
 
@@ -1730,6 +1744,7 @@ int bpf_program__pin(struct bpf_program *prog, const char *path)
 
 int bpf_map__pin(struct bpf_map *map, const char *path)
 {
+	char *cp, errmsg[STRERR_BUFSIZE];
 	int err;
 
 	err = check_path(path);
@@ -1742,7 +1757,8 @@ int bpf_map__pin(struct bpf_map *map, const char *path)
 	}
 
 	if (bpf_obj_pin(map->fd, path)) {
-		pr_warning("failed to pin map: %s\n", strerror(errno));
+		cp = strerror_r(errno, errmsg, sizeof(errmsg));
+		pr_warning("failed to pin map: %s\n", cp);
 		return -errno;
 	}
 
