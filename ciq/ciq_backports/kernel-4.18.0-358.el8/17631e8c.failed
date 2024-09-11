@@ -1,0 +1,361 @@
+i2c: designware: Add driver support for AMD NAVI GPU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Sanket Goswami <Sanket.Goswami@amd.com>
+commit 17631e8ca2d3421090e54b39d9a1402091019ba1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/17631e8c.failed
+
+The Latest AMD NAVI GPU card has an integrated Type-C controller and
+Designware I2C with PCI Interface. The PD controller for USB Type-C can
+be accessed over I2C. The client driver is part of the USB Type-C UCSI
+driver.
+
+Also, there exists a couple of notable IP limitations that are dealt as
+workarounds:
+- I2C transaction work on a polling mode as IP does not generate
+interrupt.
+- I2C read command sent twice to address the IP issues.
+- AMD NAVI GPU based products are already in the commercial market,
+  hence some of the I2C parameters are statically programmed as they
+  can not be part of the ACPI table.
+
+	Reviewed-by: Shyam Sundar S K <Shyam-sundar.S-k@amd.com>
+Co-developed-by: Nehal Bakulchandra Shah <Nehal-Bakulchandra.shah@amd.com>
+	Signed-off-by: Nehal Bakulchandra Shah <Nehal-Bakulchandra.shah@amd.com>
+	Signed-off-by: Sanket Goswami <Sanket.Goswami@amd.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Signed-off-by: Wolfram Sang <wsa@kernel.org>
+(cherry picked from commit 17631e8ca2d3421090e54b39d9a1402091019ba1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/i2c/busses/i2c-designware-core.h
+#	drivers/i2c/busses/i2c-designware-master.c
+diff --cc drivers/i2c/busses/i2c-designware-core.h
+index a622cda36d55,6a53f75abf7c..000000000000
+--- a/drivers/i2c/busses/i2c-designware-core.h
++++ b/drivers/i2c/busses/i2c-designware-core.h
+@@@ -278,18 -290,22 +278,34 @@@ struct dw_i2c_dev 
+  	bool			suspended;
+  };
+  
+ -#define ACCESS_INTR_MASK	BIT(0)
+ -#define ACCESS_NO_IRQ_SUSPEND	BIT(1)
+ +#define ACCESS_SWAP		0x00000001
+ +#define ACCESS_16BIT		0x00000002
+ +#define ACCESS_INTR_MASK	0x00000004
+ +#define ACCESS_NO_IRQ_SUSPEND	0x00000008
+  
+++<<<<<<< HEAD
+ +#define MODEL_CHERRYTRAIL	0x00000100
+ +#define MODEL_MSCC_OCELOT	0x00000200
+ +#define MODEL_MASK		0x00000f00
+ +
+ +u32 dw_readl(struct dw_i2c_dev *dev, int offset);
+ +void dw_writel(struct dw_i2c_dev *dev, u32 b, int offset);
+ +int i2c_dw_set_reg_access(struct dw_i2c_dev *dev);
+++=======
++ #define MODEL_MSCC_OCELOT	BIT(8)
++ #define MODEL_BAIKAL_BT1	BIT(9)
++ #define MODEL_AMD_NAVI_GPU	BIT(10)
++ #define MODEL_MASK		GENMASK(11, 8)
++ 
++ /*
++  * Enable UCSI interrupt by writing 0xd at register
++  * offset 0x474 specified in hardware specification.
++  */
++ #define AMD_UCSI_INTR_REG	0x474
++ #define AMD_UCSI_INTR_EN	0xd
++ 
++ int i2c_dw_init_regmap(struct dw_i2c_dev *dev);
+++>>>>>>> 17631e8ca2d3 (i2c: designware: Add driver support for AMD NAVI GPU)
+  u32 i2c_dw_scl_hcnt(u32 ic_clk, u32 tSYMBOL, u32 tf, int cond, int offset);
+  u32 i2c_dw_scl_lcnt(u32 ic_clk, u32 tLOW, u32 tf, int offset);
+  int i2c_dw_set_sda_hold(struct dw_i2c_dev *dev);
+diff --cc drivers/i2c/busses/i2c-designware-master.c
+index 6447da3d4a68,e288b654cb47..000000000000
+--- a/drivers/i2c/busses/i2c-designware-master.c
++++ b/drivers/i2c/busses/i2c-designware-master.c
+@@@ -249,13 -256,115 +253,115 @@@ static void i2c_dw_xfer_init(struct dw_
+  	__i2c_dw_enable(dev);
+  
+  	/* Dummy read to avoid the register getting stuck on Bay Trail */
+ -	regmap_read(dev->map, DW_IC_ENABLE_STATUS, &dummy);
+ +	dw_readl(dev, DW_IC_ENABLE_STATUS);
+  
+  	/* Clear and enable interrupts */
+ -	regmap_read(dev->map, DW_IC_CLR_INTR, &dummy);
+ -	regmap_write(dev->map, DW_IC_INTR_MASK, DW_IC_INTR_MASTER_MASK);
+ +	dw_readl(dev, DW_IC_CLR_INTR);
+ +	dw_writel(dev, DW_IC_INTR_MASTER_MASK, DW_IC_INTR_MASK);
+  }
+  
++ static int i2c_dw_check_stopbit(struct dw_i2c_dev *dev)
++ {
++ 	u32 val;
++ 	int ret;
++ 
++ 	ret = regmap_read_poll_timeout(dev->map, DW_IC_INTR_STAT, val,
++ 				       !(val & DW_IC_INTR_STOP_DET),
++ 					1100, 20000);
++ 	if (ret)
++ 		dev_err(dev->dev, "i2c timeout error %d\n", ret);
++ 
++ 	return ret;
++ }
++ 
++ static int i2c_dw_status(struct dw_i2c_dev *dev)
++ {
++ 	int status;
++ 
++ 	status = i2c_dw_wait_bus_not_busy(dev);
++ 	if (status)
++ 		return status;
++ 
++ 	return i2c_dw_check_stopbit(dev);
++ }
++ 
++ /*
++  * Initiate and continue master read/write transaction with polling
++  * based transfer routine afterward write messages into the Tx buffer.
++  */
++ static int amd_i2c_dw_xfer_quirk(struct i2c_adapter *adap, struct i2c_msg *msgs, int num_msgs)
++ {
++ 	struct dw_i2c_dev *dev = i2c_get_adapdata(adap);
++ 	int msg_wrt_idx, msg_itr_lmt, buf_len, data_idx;
++ 	int cmd = 0, status;
++ 	u8 *tx_buf;
++ 	u32 val;
++ 
++ 	/*
++ 	 * In order to enable the interrupt for UCSI i.e. AMD NAVI GPU card,
++ 	 * it is mandatory to set the right value in specific register
++ 	 * (offset:0x474) as per the hardware IP specification.
++ 	 */
++ 	regmap_write(dev->map, AMD_UCSI_INTR_REG, AMD_UCSI_INTR_EN);
++ 
++ 	dev->msgs = msgs;
++ 	dev->msgs_num = num_msgs;
++ 	i2c_dw_xfer_init(dev);
++ 	i2c_dw_disable_int(dev);
++ 
++ 	/* Initiate messages read/write transaction */
++ 	for (msg_wrt_idx = 0; msg_wrt_idx < num_msgs; msg_wrt_idx++) {
++ 		tx_buf = msgs[msg_wrt_idx].buf;
++ 		buf_len = msgs[msg_wrt_idx].len;
++ 
++ 		if (!(msgs[msg_wrt_idx].flags & I2C_M_RD))
++ 			regmap_write(dev->map, DW_IC_TX_TL, buf_len - 1);
++ 		/*
++ 		 * Initiate the i2c read/write transaction of buffer length,
++ 		 * and poll for bus busy status. For the last message transfer,
++ 		 * update the command with stopbit enable.
++ 		 */
++ 		for (msg_itr_lmt = buf_len; msg_itr_lmt > 0; msg_itr_lmt--) {
++ 			if (msg_wrt_idx == num_msgs - 1 && msg_itr_lmt == 1)
++ 				cmd |= BIT(9);
++ 
++ 			if (msgs[msg_wrt_idx].flags & I2C_M_RD) {
++ 				/* Due to hardware bug, need to write the same command twice. */
++ 				regmap_write(dev->map, DW_IC_DATA_CMD, 0x100);
++ 				regmap_write(dev->map, DW_IC_DATA_CMD, 0x100 | cmd);
++ 				if (cmd) {
++ 					regmap_write(dev->map, DW_IC_TX_TL, 2 * (buf_len - 1));
++ 					regmap_write(dev->map, DW_IC_RX_TL, 2 * (buf_len - 1));
++ 					/*
++ 					 * Need to check the stop bit. However, it cannot be
++ 					 * detected from the registers so we check it always
++ 					 * when read/write the last byte.
++ 					 */
++ 					status = i2c_dw_status(dev);
++ 					if (status)
++ 						return status;
++ 
++ 					for (data_idx = 0; data_idx < buf_len; data_idx++) {
++ 						regmap_read(dev->map, DW_IC_DATA_CMD, &val);
++ 						tx_buf[data_idx] = val;
++ 					}
++ 					status = i2c_dw_check_stopbit(dev);
++ 					if (status)
++ 						return status;
++ 				}
++ 			} else {
++ 				regmap_write(dev->map, DW_IC_DATA_CMD, *tx_buf++ | cmd);
++ 				usleep_range(AMD_TIMEOUT_MIN_US, AMD_TIMEOUT_MAX_US);
++ 			}
++ 		}
++ 		status = i2c_dw_check_stopbit(dev);
++ 		if (status)
++ 			return status;
++ 	}
++ 
++ 	return 0;
++ }
++ 
+  /*
+   * Initiate (and continue) low level master read/write transaction.
+   * This function is only called from i2c_dw_isr, and pumping i2c_msg
+@@@ -704,7 -854,21 +820,25 @@@ static int i2c_dw_init_recovery_info(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +int i2c_dw_probe(struct dw_i2c_dev *dev)
+++=======
++ static int amd_i2c_adap_quirk(struct dw_i2c_dev *dev)
++ {
++ 	struct i2c_adapter *adap = &dev->adapter;
++ 	int ret;
++ 
++ 	pm_runtime_get_noresume(dev->dev);
++ 	ret = i2c_add_numbered_adapter(adap);
++ 	if (ret)
++ 		dev_err(dev->dev, "Failed to add adapter: %d\n", ret);
++ 	pm_runtime_put_noidle(dev->dev);
++ 
++ 	return ret;
++ }
++ 
++ int i2c_dw_probe_master(struct dw_i2c_dev *dev)
+++>>>>>>> 17631e8ca2d3 (i2c: designware: Add driver support for AMD NAVI GPU)
+  {
+  	struct i2c_adapter *adap = &dev->adapter;
+  	unsigned long irq_flags;
+diff --git a/drivers/i2c/busses/i2c-designware-common.c b/drivers/i2c/busses/i2c-designware-common.c
+index 37ca1ea69f2b..a5a9eacfe31c 100644
+--- a/drivers/i2c/busses/i2c-designware-common.c
++++ b/drivers/i2c/busses/i2c-designware-common.c
+@@ -101,6 +101,9 @@ int i2c_dw_set_reg_access(struct dw_i2c_dev *dev)
+ 	reg = dw_readl(dev, DW_IC_COMP_TYPE);
+ 	i2c_dw_release_lock(dev);
+ 
++	if ((dev->flags & MODEL_MASK) == MODEL_AMD_NAVI_GPU)
++		map_cfg.max_register = AMD_UCSI_INTR_REG;
++
+ 	if (reg == swab32(DW_IC_COMP_TYPE_VALUE)) {
+ 		/* Configure register endianness access */
+ 		dev->flags |= ACCESS_SWAP;
+* Unmerged path drivers/i2c/busses/i2c-designware-core.h
+* Unmerged path drivers/i2c/busses/i2c-designware-master.c
+diff --git a/drivers/i2c/busses/i2c-designware-pcidrv.c b/drivers/i2c/busses/i2c-designware-pcidrv.c
+index 3664d76bb976..b12d376df8aa 100644
+--- a/drivers/i2c/busses/i2c-designware-pcidrv.c
++++ b/drivers/i2c/busses/i2c-designware-pcidrv.c
+@@ -26,6 +26,7 @@
+ #include "i2c-designware-core.h"
+ 
+ #define DRIVER_NAME "i2c-designware-pci"
++#define AMD_CLK_RATE_HZ	100000
+ 
+ enum dw_pci_ctl_id_t {
+ 	medfield,
+@@ -34,6 +35,7 @@ enum dw_pci_ctl_id_t {
+ 	cherrytrail,
+ 	haswell,
+ 	elkhartlake,
++	navi_amd,
+ };
+ 
+ struct dw_scl_sda_cfg {
+@@ -80,11 +82,23 @@ static struct dw_scl_sda_cfg hsw_config = {
+ 	.sda_hold = 0x9,
+ };
+ 
++/* NAVI-AMD HCNT/LCNT/SDA hold time */
++static struct dw_scl_sda_cfg navi_amd_config = {
++	.ss_hcnt = 0x1ae,
++	.ss_lcnt = 0x23a,
++	.sda_hold = 0x9,
++};
++
+ static u32 mfld_get_clk_rate_khz(struct dw_i2c_dev *dev)
+ {
+ 	return 25000;
+ }
+ 
++static u32 navi_amd_get_clk_rate_khz(struct dw_i2c_dev *dev)
++{
++	return AMD_CLK_RATE_HZ;
++}
++
+ static int mfld_setup(struct pci_dev *pdev, struct dw_pci_controller *c)
+ {
+ 	struct dw_i2c_dev *dev = dev_get_drvdata(&pdev->dev);
+@@ -106,6 +120,35 @@ static int mfld_setup(struct pci_dev *pdev, struct dw_pci_controller *c)
+ 	return -ENODEV;
+ }
+ 
++ /*
++  * TODO find a better way how to deduplicate instantiation
++  * of USB PD slave device from nVidia GPU driver.
++  */
++static int navi_amd_register_client(struct dw_i2c_dev *dev)
++{
++	struct i2c_board_info	info;
++
++	memset(&info, 0, sizeof(struct i2c_board_info));
++	strscpy(info.type, "ccgx-ucsi", I2C_NAME_SIZE);
++	info.addr = 0x08;
++	info.irq = dev->irq;
++
++	dev->slave = i2c_new_client_device(&dev->adapter, &info);
++	if (!dev->slave)
++		return -ENODEV;
++
++	return 0;
++}
++
++static int navi_amd_setup(struct pci_dev *pdev, struct dw_pci_controller *c)
++{
++	struct dw_i2c_dev *dev = dev_get_drvdata(&pdev->dev);
++
++	dev->flags |= MODEL_AMD_NAVI_GPU;
++	dev->timings.bus_freq_hz = I2C_MAX_STANDARD_MODE_FREQ;
++	return 0;
++}
++
+ static int mrfld_setup(struct pci_dev *pdev, struct dw_pci_controller *c)
+ {
+ 	/*
+@@ -170,6 +213,12 @@ static struct dw_pci_controller dw_pci_controllers[] = {
+ 		.rx_fifo_depth = 32,
+ 		.get_clk_rate_khz = ehl_get_clk_rate_khz,
+ 	},
++	[navi_amd] = {
++		.bus_num = -1,
++		.scl_sda_cfg = &navi_amd_config,
++		.setup =  navi_amd_setup,
++		.get_clk_rate_khz = navi_amd_get_clk_rate_khz,
++	},
+ };
+ 
+ #ifdef CONFIG_PM
+@@ -292,6 +341,14 @@ static int i2c_dw_pci_probe(struct pci_dev *pdev,
+ 		return r;
+ 	}
+ 
++	if ((dev->flags & MODEL_MASK) == MODEL_AMD_NAVI_GPU) {
++		r = navi_amd_register_client(dev);
++		if (r) {
++			dev_err(dev->dev, "register client failed with %d\n", r);
++			return r;
++		}
++	}
++
+ 	pm_runtime_set_autosuspend_delay(&pdev->dev, 1000);
+ 	pm_runtime_use_autosuspend(&pdev->dev);
+ 	pm_runtime_put_autosuspend(&pdev->dev);
+@@ -355,6 +412,10 @@ static const struct pci_device_id i2_designware_pci_ids[] = {
+ 	{ PCI_VDEVICE(INTEL, 0x4bbe), elkhartlake },
+ 	{ PCI_VDEVICE(INTEL, 0x4bbf), elkhartlake },
+ 	{ PCI_VDEVICE(INTEL, 0x4bc0), elkhartlake },
++	{ PCI_VDEVICE(ATI,  0x7314), navi_amd },
++	{ PCI_VDEVICE(ATI,  0x73a4), navi_amd },
++	{ PCI_VDEVICE(ATI,  0x73e4), navi_amd },
++	{ PCI_VDEVICE(ATI,  0x73c4), navi_amd },
+ 	{ 0,}
+ };
+ MODULE_DEVICE_TABLE(pci, i2_designware_pci_ids);
