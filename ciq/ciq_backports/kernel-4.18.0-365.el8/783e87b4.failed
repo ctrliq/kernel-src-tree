@@ -1,0 +1,492 @@
+x86/fpu/xstate: Add XFD #NM handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Chang S. Bae <chang.seok.bae@intel.com>
+commit 783e87b404956f8958657aed8a6a72aa98d5b7e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/783e87b4.failed
+
+If the XFD MSR has feature bits set then #NM will be raised when user space
+attempts to use an instruction related to one of these features.
+
+When the task has no permissions to use that feature, raise SIGILL, which
+is the same behavior as #UD.
+
+If the task has permissions, calculate the new buffer size for the extended
+feature set and allocate a larger fpstate. In the unlikely case that
+vzalloc() fails, SIGSEGV is raised.
+
+The allocation function will be added in the next step. Provide a stub
+which fails for now.
+
+  [ tglx: Updated serialization ]
+
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lore.kernel.org/r/20211021225527.10184-18-chang.seok.bae@intel.com
+(cherry picked from commit 783e87b404956f8958657aed8a6a72aa98d5b7e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/xstate.c
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 2df5bd667a43,b7b145cad019..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -143,14 -99,24 +143,22 @@@ int copy_sigframe_from_user_to_xstate(s
+  void xsaves(struct xregs_state *xsave, u64 mask);
+  void xrstors(struct xregs_state *xsave, u64 mask);
+  
+++<<<<<<< HEAD
+ +enum xstate_copy_mode {
+ +	XSTATE_COPY_FP,
+ +	XSTATE_COPY_FX,
+ +	XSTATE_COPY_XSAVE,
+ +};
+++=======
++ int xfd_enable_feature(u64 xfd_err);
++ 
++ #ifdef CONFIG_X86_64
++ DECLARE_STATIC_KEY_FALSE(__fpu_state_size_dynamic);
++ #endif
+++>>>>>>> 783e87b40495 (x86/fpu/xstate: Add XFD #NM handler)
+  
+ -#ifdef CONFIG_X86_64
+ -DECLARE_STATIC_KEY_FALSE(__fpu_state_size_dynamic);
+ -
+ -static __always_inline __pure bool fpu_state_size_dynamic(void)
+ -{
+ -	return static_branch_unlikely(&__fpu_state_size_dynamic);
+ -}
+ -#else
+ -static __always_inline __pure bool fpu_state_size_dynamic(void)
+ -{
+ -	return false;
+ -}
+ -#endif
+ +struct membuf;
+ +void copy_xstate_to_uabi_buf(struct membuf to, struct task_struct *tsk,
+ +			     enum xstate_copy_mode mode);
+  
+  #endif
+diff --cc arch/x86/kernel/fpu/xstate.c
+index f744359fb635,3d38558d594f..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -1288,8 -1301,276 +1288,280 @@@ void xrstors(struct xregs_state *xstate
+  	WARN_ON_ONCE(err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_KVM)
++ void fpstate_clear_xstate_component(struct fpstate *fps, unsigned int xfeature)
++ {
++ 	void *addr = get_xsave_addr(&fps->regs.xsave, xfeature);
++ 
++ 	if (addr)
++ 		memset(addr, 0, xstate_sizes[xfeature]);
++ }
++ EXPORT_SYMBOL_GPL(fpstate_clear_xstate_component);
++ #endif
++ 
++ #ifdef CONFIG_X86_64
++ 
++ #ifdef CONFIG_X86_DEBUG_FPU
++ /*
++  * Ensure that a subsequent XSAVE* or XRSTOR* instruction with RFBM=@mask
++  * can safely operate on the @fpstate buffer.
++  */
++ static bool xstate_op_valid(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	u64 xfd = __this_cpu_read(xfd_state);
++ 
++ 	if (fpstate->xfd == xfd)
++ 		return true;
++ 
++ 	 /*
++ 	  * The XFD MSR does not match fpstate->xfd. That's invalid when
++ 	  * the passed in fpstate is current's fpstate.
++ 	  */
++ 	if (fpstate->xfd == current->thread.fpu.fpstate->xfd)
++ 		return false;
++ 
++ 	/*
++ 	 * XRSTOR(S) from init_fpstate are always correct as it will just
++ 	 * bring all components into init state and not read from the
++ 	 * buffer. XSAVE(S) raises #PF after init.
++ 	 */
++ 	if (fpstate == &init_fpstate)
++ 		return rstor;
++ 
++ 	/*
++ 	 * XSAVE(S): clone(), fpu_swap_kvm_fpu()
++ 	 * XRSTORS(S): fpu_swap_kvm_fpu()
++ 	 */
++ 
++ 	/*
++ 	 * No XSAVE/XRSTOR instructions (except XSAVE itself) touch
++ 	 * the buffer area for XFD-disabled state components.
++ 	 */
++ 	mask &= ~xfd;
++ 
++ 	/*
++ 	 * Remove features which are valid in fpstate. They
++ 	 * have space allocated in fpstate.
++ 	 */
++ 	mask &= ~fpstate->xfeatures;
++ 
++ 	/*
++ 	 * Any remaining state components in 'mask' might be written
++ 	 * by XSAVE/XRSTOR. Fail validation it found.
++ 	 */
++ 	return !mask;
++ }
++ 
++ void xfd_validate_state(struct fpstate *fpstate, u64 mask, bool rstor)
++ {
++ 	WARN_ON_ONCE(!xstate_op_valid(fpstate, mask, rstor));
++ }
++ #endif /* CONFIG_X86_DEBUG_FPU */
++ 
++ static int validate_sigaltstack(unsigned int usize)
++ {
++ 	struct task_struct *thread, *leader = current->group_leader;
++ 	unsigned long framesize = get_sigframe_size();
++ 
++ 	lockdep_assert_held(&current->sighand->siglock);
++ 
++ 	/* get_sigframe_size() is based on fpu_user_cfg.max_size */
++ 	framesize -= fpu_user_cfg.max_size;
++ 	framesize += usize;
++ 	for_each_thread(leader, thread) {
++ 		if (thread->sas_ss_size && thread->sas_ss_size < framesize)
++ 			return -ENOSPC;
++ 	}
++ 	return 0;
++ }
++ 
++ static int __xstate_request_perm(u64 permitted, u64 requested)
++ {
++ 	/*
++ 	 * This deliberately does not exclude !XSAVES as we still might
++ 	 * decide to optionally context switch XCR0 or talk the silicon
++ 	 * vendors into extending XFD for the pre AMX states.
++ 	 */
++ 	bool compacted = cpu_feature_enabled(X86_FEATURE_XSAVES);
++ 	struct fpu *fpu = &current->group_leader->thread.fpu;
++ 	unsigned int ksize, usize;
++ 	u64 mask;
++ 	int ret;
++ 
++ 	/* Check whether fully enabled */
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Calculate the resulting kernel state size */
++ 	mask = permitted | requested;
++ 	ksize = xstate_calculate_size(mask, compacted);
++ 
++ 	/* Calculate the resulting user state size */
++ 	mask &= XFEATURE_MASK_USER_SUPPORTED;
++ 	usize = xstate_calculate_size(mask, false);
++ 
++ 	ret = validate_sigaltstack(usize);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* Pairs with the READ_ONCE() in xstate_get_group_perm() */
++ 	WRITE_ONCE(fpu->perm.__state_perm, requested);
++ 	/* Protected by sighand lock */
++ 	fpu->perm.__state_size = ksize;
++ 	fpu->perm.__user_state_size = usize;
++ 	return ret;
++ }
++ 
++ /*
++  * Permissions array to map facilities with more than one component
++  */
++ static const u64 xstate_prctl_req[XFEATURE_MAX] = {
++ 	/* [XFEATURE_XTILE_DATA] = XFEATURE_MASK_XTILE, */
++ };
++ 
++ static int xstate_request_perm(unsigned long idx)
++ {
++ 	u64 permitted, requested;
++ 	int ret;
++ 
++ 	if (idx >= XFEATURE_MAX)
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Look up the facility mask which can require more than
++ 	 * one xstate component.
++ 	 */
++ 	idx = array_index_nospec(idx, ARRAY_SIZE(xstate_prctl_req));
++ 	requested = xstate_prctl_req[idx];
++ 	if (!requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	if ((fpu_user_cfg.max_features & requested) != requested)
++ 		return -EOPNOTSUPP;
++ 
++ 	/* Lockless quick check */
++ 	permitted = xstate_get_host_group_perm();
++ 	if ((permitted & requested) == requested)
++ 		return 0;
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 	permitted = xstate_get_host_group_perm();
++ 	ret = __xstate_request_perm(permitted, requested);
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 	return ret;
++ }
++ 
++ /* Place holder for now */
++ static int fpstate_realloc(u64 xfeatures, unsigned int ksize,
++ 			   unsigned int usize)
++ {
++ 	return -ENOMEM;
++ }
++ 
++ int xfd_enable_feature(u64 xfd_err)
++ {
++ 	u64 xfd_event = xfd_err & XFEATURE_MASK_USER_DYNAMIC;
++ 	unsigned int ksize, usize;
++ 	struct fpu *fpu;
++ 
++ 	if (!xfd_event) {
++ 		pr_err_once("XFD: Invalid xfd error: %016llx\n", xfd_err);
++ 		return 0;
++ 	}
++ 
++ 	/* Protect against concurrent modifications */
++ 	spin_lock_irq(&current->sighand->siglock);
++ 
++ 	/* If not permitted let it die */
++ 	if ((xstate_get_host_group_perm() & xfd_event) != xfd_event) {
++ 		spin_unlock_irq(&current->sighand->siglock);
++ 		return -EPERM;
++ 	}
++ 
++ 	fpu = &current->group_leader->thread.fpu;
++ 	ksize = fpu->perm.__state_size;
++ 	usize = fpu->perm.__user_state_size;
++ 	/*
++ 	 * The feature is permitted. State size is sufficient.  Dropping
++ 	 * the lock is safe here even if more features are added from
++ 	 * another task, the retrieved buffer sizes are valid for the
++ 	 * currently requested feature(s).
++ 	 */
++ 	spin_unlock_irq(&current->sighand->siglock);
++ 
++ 	/*
++ 	 * Try to allocate a new fpstate. If that fails there is no way
++ 	 * out.
++ 	 */
++ 	if (fpstate_realloc(xfd_event, ksize, usize))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ #else /* CONFIG_X86_64 */
++ static inline int xstate_request_perm(unsigned long idx)
++ {
++ 	return -EPERM;
++ }
++ #endif  /* !CONFIG_X86_64 */
++ 
++ /**
++  * fpu_xstate_prctl - xstate permission operations
++  * @tsk:	Redundant pointer to current
++  * @option:	A subfunction of arch_prctl()
++  * @arg2:	option argument
++  * Return:	0 if successful; otherwise, an error code
++  *
++  * Option arguments:
++  *
++  * ARCH_GET_XCOMP_SUPP: Pointer to user space u64 to store the info
++  * ARCH_GET_XCOMP_PERM: Pointer to user space u64 to store the info
++  * ARCH_REQ_XCOMP_PERM: Facility number requested
++  *
++  * For facilities which require more than one XSTATE component, the request
++  * must be the highest state component number related to that facility,
++  * e.g. for AMX which requires XFEATURE_XTILE_CFG(17) and
++  * XFEATURE_XTILE_DATA(18) this would be XFEATURE_XTILE_DATA(18).
++  */
++ long fpu_xstate_prctl(struct task_struct *tsk, int option, unsigned long arg2)
++ {
++ 	u64 __user *uptr = (u64 __user *)arg2;
++ 	u64 permitted, supported;
++ 	unsigned long idx = arg2;
++ 
++ 	if (tsk != current)
++ 		return -EPERM;
++ 
++ 	switch (option) {
++ 	case ARCH_GET_XCOMP_SUPP:
++ 		supported = fpu_user_cfg.max_features |	fpu_user_cfg.legacy_features;
++ 		return put_user(supported, uptr);
++ 
++ 	case ARCH_GET_XCOMP_PERM:
++ 		/*
++ 		 * Lockless snapshot as it can also change right after the
++ 		 * dropping the lock.
++ 		 */
++ 		permitted = xstate_get_host_group_perm();
++ 		permitted &= XFEATURE_MASK_USER_SUPPORTED;
++ 		return put_user(permitted, uptr);
++ 
++ 	case ARCH_REQ_XCOMP_PERM:
++ 		if (!IS_ENABLED(CONFIG_X86_64))
++ 			return -EOPNOTSUPP;
++ 
++ 		return xstate_request_perm(idx);
++ 
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 783e87b40495 (x86/fpu/xstate: Add XFD #NM handler)
+  #ifdef CONFIG_PROC_PID_ARCH_STATUS
+ +
+  /*
+   * Report the amount of time elapsed in millisecond since last AVX512
+   * use in the task.
+diff --cc arch/x86/kernel/traps.c
+index 25a14698da49,6ca1454a65d4..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -882,43 -1057,101 +882,85 @@@ static void math_error(struct pt_regs *
+  	si_code = fpu__exception_code(fpu, trapnr);
+  	/* Retry when we get spurious exceptions: */
+  	if (!si_code)
+ -		goto exit;
+ +		return;
+  
+  	if (fixup_vdso_exception(regs, trapnr, 0, 0))
+ -		goto exit;
+ +		return;
+  
+  	force_sig_fault(SIGFPE, si_code,
+ -			(void __user *)uprobe_get_trap_addr(regs));
+ -exit:
+ -	cond_local_irq_disable(regs);
+ +			(void __user *)uprobe_get_trap_addr(regs), task);
+  }
+  
+ -DEFINE_IDTENTRY(exc_coprocessor_error)
+ +dotraplinkage void do_coprocessor_error(struct pt_regs *regs, long error_code)
+  {
+ -	math_error(regs, X86_TRAP_MF);
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	math_error(regs, error_code, X86_TRAP_MF);
+  }
+  
+ -DEFINE_IDTENTRY(exc_simd_coprocessor_error)
+ +dotraplinkage void
+ +do_simd_coprocessor_error(struct pt_regs *regs, long error_code)
+  {
+ -	if (IS_ENABLED(CONFIG_X86_INVD_BUG)) {
+ -		/* AMD 486 bug: INVD in CPL 0 raises #XF instead of #GP */
+ -		if (!static_cpu_has(X86_FEATURE_XMM)) {
+ -			__exc_general_protection(regs, 0);
+ -			return;
+ -		}
+ -	}
+ -	math_error(regs, X86_TRAP_XF);
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	math_error(regs, error_code, X86_TRAP_XF);
+  }
+  
+ -DEFINE_IDTENTRY(exc_spurious_interrupt_bug)
+ +dotraplinkage void
+ +do_spurious_interrupt_bug(struct pt_regs *regs, long error_code)
+  {
+ -	/*
+ -	 * This addresses a Pentium Pro Erratum:
+ -	 *
+ -	 * PROBLEM: If the APIC subsystem is configured in mixed mode with
+ -	 * Virtual Wire mode implemented through the local APIC, an
+ -	 * interrupt vector of 0Fh (Intel reserved encoding) may be
+ -	 * generated by the local APIC (Int 15).  This vector may be
+ -	 * generated upon receipt of a spurious interrupt (an interrupt
+ -	 * which is removed before the system receives the INTA sequence)
+ -	 * instead of the programmed 8259 spurious interrupt vector.
+ -	 *
+ -	 * IMPLICATION: The spurious interrupt vector programmed in the
+ -	 * 8259 is normally handled by an operating system's spurious
+ -	 * interrupt handler. However, a vector of 0Fh is unknown to some
+ -	 * operating systems, which would crash if this erratum occurred.
+ -	 *
+ -	 * In theory this could be limited to 32bit, but the handler is not
+ -	 * hurting and who knows which other CPUs suffer from this.
+ -	 */
+ +	cond_local_irq_enable(regs);
+  }
+  
+++<<<<<<< HEAD
+ +dotraplinkage void
+ +do_device_not_available(struct pt_regs *regs, long error_code)
+++=======
++ static bool handle_xfd_event(struct pt_regs *regs)
++ {
++ 	u64 xfd_err;
++ 	int err;
++ 
++ 	if (!IS_ENABLED(CONFIG_X86_64) || !cpu_feature_enabled(X86_FEATURE_XFD))
++ 		return false;
++ 
++ 	rdmsrl(MSR_IA32_XFD_ERR, xfd_err);
++ 	if (!xfd_err)
++ 		return false;
++ 
++ 	wrmsrl(MSR_IA32_XFD_ERR, 0);
++ 
++ 	/* Die if that happens in kernel space */
++ 	if (WARN_ON(!user_mode(regs)))
++ 		return false;
++ 
++ 	local_irq_enable();
++ 
++ 	err = xfd_enable_feature(xfd_err);
++ 
++ 	switch (err) {
++ 	case -EPERM:
++ 		force_sig_fault(SIGILL, ILL_ILLOPC, error_get_trap_addr(regs));
++ 		break;
++ 	case -EFAULT:
++ 		force_sig(SIGSEGV);
++ 		break;
++ 	}
++ 
++ 	local_irq_disable();
++ 	return true;
++ }
++ 
++ DEFINE_IDTENTRY(exc_device_not_available)
+++>>>>>>> 783e87b40495 (x86/fpu/xstate: Add XFD #NM handler)
+  {
+ -	unsigned long cr0 = read_cr0();
+ +	unsigned long cr0;
+ +
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+  
++ 	if (handle_xfd_event(regs))
++ 		return;
++ 
+  #ifdef CONFIG_MATH_EMULATION
+ -	if (!boot_cpu_has(X86_FEATURE_FPU) && (cr0 & X86_CR0_EM)) {
+ +	if (!boot_cpu_has(X86_FEATURE_FPU) && (read_cr0() & X86_CR0_EM)) {
+  		struct math_emu_info info = { };
+  
+  		cond_local_irq_enable(regs);
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/kernel/traps.c
