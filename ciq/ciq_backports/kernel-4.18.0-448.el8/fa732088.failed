@@ -1,0 +1,415 @@
+drm/i915: Rename INTEL_REGION_LMEM with INTEL_REGION_LMEM_0
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Andi Shyti <andi.shyti@linux.intel.com>
+commit fa732088378fa0492bd85f32a89f1f39b305d363
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/fa732088.failed
+
+With the upcoming multitile support each tile will have its own
+local memory. Mark the current LMEM with the suffix '0' to
+emphasise that it belongs to the root tile.
+
+	Suggested-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+	Signed-off-by: Andi Shyti <andi.shyti@linux.intel.com>
+	Reviewed-by: Michal Wajdeczko <michal.wajdeczko@intel.com>
+	Reviewed-by: Andrzej Hajda <andrzej.hajda@intel.com>
+	Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220318233938.149744-2-andi.shyti@linux.intel.com
+(cherry picked from commit fa732088378fa0492bd85f32a89f1f39b305d363)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_fb.c
+#	drivers/gpu/drm/i915/display/intel_fb_pin.c
+#	drivers/gpu/drm/i915/display/intel_plane_initial.c
+#	drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+#	drivers/gpu/drm/i915/gem/selftests/i915_gem_dmabuf.c
+#	drivers/gpu/drm/i915/gem/selftests/i915_gem_migrate.c
+diff --cc drivers/gpu/drm/i915/display/intel_fb.c
+index 0a98e8398b28,421f7238da05..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_fb.c
++++ b/drivers/gpu/drm/i915/display/intel_fb.c
+@@@ -1970,7 -1981,7 +1970,11 @@@ intel_user_framebuffer_create(struct dr
+  
+  	/* object is backed with LMEM for discrete */
+  	i915 = to_i915(obj->base.dev);
+++<<<<<<< HEAD
+ +	if (HAS_LMEM(i915) && !i915_gem_object_is_lmem(obj)) {
+++=======
++ 	if (HAS_LMEM(i915) && !i915_gem_object_can_migrate(obj, INTEL_REGION_LMEM_0)) {
+++>>>>>>> fa732088378f (drm/i915: Rename INTEL_REGION_LMEM with INTEL_REGION_LMEM_0)
+  		/* object is "remote", not in local memory */
+  		i915_gem_object_put(obj);
+  		return ERR_PTR(-EREMOTE);
+diff --cc drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+index 3b4aa28a076d,47e43dc3a174..000000000000
+--- a/drivers/gpu/drm/i915/gem/i915_gem_lmem.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+@@@ -95,31 -50,91 +95,119 @@@ bool i915_gem_object_is_lmem(struct drm
+  		      mr->type == INTEL_MEMORY_STOLEN_LOCAL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * __i915_gem_object_is_lmem - Whether the object is resident in
++  * lmem while in the fence signaling critical path.
++  * @obj: The object to check.
++  *
++  * This function is intended to be called from within the fence signaling
++  * path where the fence, or a pin, keeps the object from being migrated. For
++  * example during gpu reset or similar.
++  *
++  * Return: Whether the object is resident in lmem.
++  */
++ bool __i915_gem_object_is_lmem(struct drm_i915_gem_object *obj)
++ {
++ 	struct intel_memory_region *mr = READ_ONCE(obj->mm.region);
++ 
++ #ifdef CONFIG_LOCKDEP
++ 	GEM_WARN_ON(dma_resv_test_signaled(obj->base.resv, true) &&
++ 		    i915_gem_object_evictable(obj));
++ #endif
++ 	return mr && (mr->type == INTEL_MEMORY_LOCAL ||
++ 		      mr->type == INTEL_MEMORY_STOLEN_LOCAL);
++ }
++ 
++ /**
++  * __i915_gem_object_create_lmem_with_ps - Create lmem object and force the
++  * minimum page size for the backing pages.
++  * @i915: The i915 instance.
++  * @size: The size in bytes for the object. Note that we need to round the size
++  * up depending on the @page_size. The final object size can be fished out from
++  * the drm GEM object.
++  * @page_size: The requested minimum page size in bytes for this object. This is
++  * useful if we need something bigger than the regions min_page_size due to some
++  * hw restriction, or in some very specialised cases where it needs to be
++  * smaller, where the internal fragmentation cost is too great when rounding up
++  * the object size.
++  * @flags: The optional BO allocation flags.
++  *
++  * Note that this interface assumes you know what you are doing when forcing the
++  * @page_size. If this is smaller than the regions min_page_size then it can
++  * never be inserted into any GTT, otherwise it might lead to undefined
++  * behaviour.
++  *
++  * Return: The object pointer, which might be an ERR_PTR in the case of failure.
++  */
++ struct drm_i915_gem_object *
++ __i915_gem_object_create_lmem_with_ps(struct drm_i915_private *i915,
++ 				      resource_size_t size,
++ 				      resource_size_t page_size,
++ 				      unsigned int flags)
++ {
++ 	return i915_gem_object_create_region(i915->mm.regions[INTEL_REGION_LMEM_0],
++ 					     size, page_size, flags);
++ }
++ 
++ struct drm_i915_gem_object *
++ i915_gem_object_create_lmem_from_data(struct drm_i915_private *i915,
++ 				      const void *data, size_t size)
++ {
++ 	struct drm_i915_gem_object *obj;
++ 	void *map;
++ 
++ 	obj = i915_gem_object_create_lmem(i915,
++ 					  round_up(size, PAGE_SIZE),
++ 					  I915_BO_ALLOC_CONTIGUOUS);
++ 	if (IS_ERR(obj))
++ 		return obj;
++ 
++ 	map = i915_gem_object_pin_map_unlocked(obj, I915_MAP_WC);
++ 	if (IS_ERR(map)) {
++ 		i915_gem_object_put(obj);
++ 		return map;
++ 	}
++ 
++ 	memcpy(map, data, size);
++ 
++ 	i915_gem_object_unpin_map(obj);
++ 
++ 	return obj;
++ }
++ 
+++>>>>>>> fa732088378f (drm/i915: Rename INTEL_REGION_LMEM with INTEL_REGION_LMEM_0)
+  struct drm_i915_gem_object *
+  i915_gem_object_create_lmem(struct drm_i915_private *i915,
+  			    resource_size_t size,
+  			    unsigned int flags)
+  {
+++<<<<<<< HEAD
+ +	return i915_gem_object_create_region(i915->mm.regions[INTEL_REGION_LMEM],
+ +					     size, flags);
+ +}
+ +
+ +int __i915_gem_lmem_object_init(struct intel_memory_region *mem,
+ +				struct drm_i915_gem_object *obj,
+ +				resource_size_t size,
+ +				unsigned int flags)
+ +{
+ +	static struct lock_class_key lock_class;
+ +	struct drm_i915_private *i915 = mem->i915;
+ +
+ +	drm_gem_private_object_init(&i915->drm, &obj->base, size);
+ +	i915_gem_object_init(obj, &i915_gem_lmem_obj_ops, &lock_class, flags);
+ +
+ +	obj->read_domains = I915_GEM_DOMAIN_WC | I915_GEM_DOMAIN_GTT;
+ +
+ +	i915_gem_object_set_cache_coherency(obj, I915_CACHE_NONE);
+ +
+ +	i915_gem_object_init_memory_region(obj, mem);
+ +
+ +	return 0;
+++=======
++ 	return i915_gem_object_create_region(i915->mm.regions[INTEL_REGION_LMEM_0],
++ 					     size, 0, flags);
+++>>>>>>> fa732088378f (drm/i915: Rename INTEL_REGION_LMEM with INTEL_REGION_LMEM_0)
+  }
+diff --cc drivers/gpu/drm/i915/gem/selftests/i915_gem_dmabuf.c
+index dd74bc09ec88,a342fd387d4e..000000000000
+--- a/drivers/gpu/drm/i915/gem/selftests/i915_gem_dmabuf.c
++++ b/drivers/gpu/drm/i915/gem/selftests/i915_gem_dmabuf.c
+@@@ -76,6 -85,181 +76,184 @@@ out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int igt_dmabuf_import_same_driver_lmem(void *arg)
++ {
++ 	struct drm_i915_private *i915 = arg;
++ 	struct intel_memory_region *lmem = i915->mm.regions[INTEL_REGION_LMEM_0];
++ 	struct drm_i915_gem_object *obj;
++ 	struct drm_gem_object *import;
++ 	struct dma_buf *dmabuf;
++ 	int err;
++ 
++ 	if (!lmem)
++ 		return 0;
++ 
++ 	force_different_devices = true;
++ 
++ 	obj = __i915_gem_object_create_user(i915, PAGE_SIZE, &lmem, 1);
++ 	if (IS_ERR(obj)) {
++ 		pr_err("__i915_gem_object_create_user failed with err=%ld\n",
++ 		       PTR_ERR(obj));
++ 		err = PTR_ERR(obj);
++ 		goto out_ret;
++ 	}
++ 
++ 	dmabuf = i915_gem_prime_export(&obj->base, 0);
++ 	if (IS_ERR(dmabuf)) {
++ 		pr_err("i915_gem_prime_export failed with err=%ld\n",
++ 		       PTR_ERR(dmabuf));
++ 		err = PTR_ERR(dmabuf);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * We expect an import of an LMEM-only object to fail with
++ 	 * -EOPNOTSUPP because it can't be migrated to SMEM.
++ 	 */
++ 	import = i915_gem_prime_import(&i915->drm, dmabuf);
++ 	if (!IS_ERR(import)) {
++ 		drm_gem_object_put(import);
++ 		pr_err("i915_gem_prime_import succeeded when it shouldn't have\n");
++ 		err = -EINVAL;
++ 	} else if (PTR_ERR(import) != -EOPNOTSUPP) {
++ 		pr_err("i915_gem_prime_import failed with the wrong err=%ld\n",
++ 		       PTR_ERR(import));
++ 		err = PTR_ERR(import);
++ 	} else {
++ 		err = 0;
++ 	}
++ 
++ 	dma_buf_put(dmabuf);
++ out:
++ 	i915_gem_object_put(obj);
++ out_ret:
++ 	force_different_devices = false;
++ 	return err;
++ }
++ 
++ static int igt_dmabuf_import_same_driver(struct drm_i915_private *i915,
++ 					 struct intel_memory_region **regions,
++ 					 unsigned int num_regions)
++ {
++ 	struct drm_i915_gem_object *obj, *import_obj;
++ 	struct drm_gem_object *import;
++ 	struct dma_buf *dmabuf;
++ 	struct dma_buf_attachment *import_attach;
++ 	struct sg_table *st;
++ 	long timeout;
++ 	int err;
++ 
++ 	force_different_devices = true;
++ 
++ 	obj = __i915_gem_object_create_user(i915, PAGE_SIZE,
++ 					    regions, num_regions);
++ 	if (IS_ERR(obj)) {
++ 		pr_err("__i915_gem_object_create_user failed with err=%ld\n",
++ 		       PTR_ERR(obj));
++ 		err = PTR_ERR(obj);
++ 		goto out_ret;
++ 	}
++ 
++ 	dmabuf = i915_gem_prime_export(&obj->base, 0);
++ 	if (IS_ERR(dmabuf)) {
++ 		pr_err("i915_gem_prime_export failed with err=%ld\n",
++ 		       PTR_ERR(dmabuf));
++ 		err = PTR_ERR(dmabuf);
++ 		goto out;
++ 	}
++ 
++ 	import = i915_gem_prime_import(&i915->drm, dmabuf);
++ 	if (IS_ERR(import)) {
++ 		pr_err("i915_gem_prime_import failed with err=%ld\n",
++ 		       PTR_ERR(import));
++ 		err = PTR_ERR(import);
++ 		goto out_dmabuf;
++ 	}
++ 	import_obj = to_intel_bo(import);
++ 
++ 	if (import == &obj->base) {
++ 		pr_err("i915_gem_prime_import reused gem object!\n");
++ 		err = -EINVAL;
++ 		goto out_import;
++ 	}
++ 
++ 	i915_gem_object_lock(import_obj, NULL);
++ 	err = __i915_gem_object_get_pages(import_obj);
++ 	if (err) {
++ 		pr_err("Different objects dma-buf get_pages failed!\n");
++ 		i915_gem_object_unlock(import_obj);
++ 		goto out_import;
++ 	}
++ 
++ 	/*
++ 	 * If the exported object is not in system memory, something
++ 	 * weird is going on. TODO: When p2p is supported, this is no
++ 	 * longer considered weird.
++ 	 */
++ 	if (obj->mm.region != i915->mm.regions[INTEL_REGION_SMEM]) {
++ 		pr_err("Exported dma-buf is not in system memory\n");
++ 		err = -EINVAL;
++ 	}
++ 
++ 	i915_gem_object_unlock(import_obj);
++ 
++ 	/* Now try a fake an importer */
++ 	import_attach = dma_buf_attach(dmabuf, obj->base.dev->dev);
++ 	if (IS_ERR(import_attach)) {
++ 		err = PTR_ERR(import_attach);
++ 		goto out_import;
++ 	}
++ 
++ 	st = dma_buf_map_attachment(import_attach, DMA_BIDIRECTIONAL);
++ 	if (IS_ERR(st)) {
++ 		err = PTR_ERR(st);
++ 		goto out_detach;
++ 	}
++ 
++ 	timeout = dma_resv_wait_timeout(dmabuf->resv, false, true, 5 * HZ);
++ 	if (!timeout) {
++ 		pr_err("dmabuf wait for exclusive fence timed out.\n");
++ 		timeout = -ETIME;
++ 	}
++ 	err = timeout > 0 ? 0 : timeout;
++ 	dma_buf_unmap_attachment(import_attach, st, DMA_BIDIRECTIONAL);
++ out_detach:
++ 	dma_buf_detach(dmabuf, import_attach);
++ out_import:
++ 	i915_gem_object_put(import_obj);
++ out_dmabuf:
++ 	dma_buf_put(dmabuf);
++ out:
++ 	i915_gem_object_put(obj);
++ out_ret:
++ 	force_different_devices = false;
++ 	return err;
++ }
++ 
++ static int igt_dmabuf_import_same_driver_smem(void *arg)
++ {
++ 	struct drm_i915_private *i915 = arg;
++ 	struct intel_memory_region *smem = i915->mm.regions[INTEL_REGION_SMEM];
++ 
++ 	return igt_dmabuf_import_same_driver(i915, &smem, 1);
++ }
++ 
++ static int igt_dmabuf_import_same_driver_lmem_smem(void *arg)
++ {
++ 	struct drm_i915_private *i915 = arg;
++ 	struct intel_memory_region *regions[2];
++ 
++ 	if (!i915->mm.regions[INTEL_REGION_LMEM_0])
++ 		return 0;
++ 
++ 	regions[0] = i915->mm.regions[INTEL_REGION_LMEM_0];
++ 	regions[1] = i915->mm.regions[INTEL_REGION_SMEM];
++ 	return igt_dmabuf_import_same_driver(i915, regions, 2);
++ }
++ 
+++>>>>>>> fa732088378f (drm/i915: Rename INTEL_REGION_LMEM with INTEL_REGION_LMEM_0)
+  static int igt_dmabuf_import(void *arg)
+  {
+  	struct drm_i915_private *i915 = arg;
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb_pin.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_plane_initial.c
+* Unmerged path drivers/gpu/drm/i915/gem/selftests/i915_gem_migrate.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_fb_pin.c
+* Unmerged path drivers/gpu/drm/i915/display/intel_plane_initial.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_lmem.c
+* Unmerged path drivers/gpu/drm/i915/gem/selftests/i915_gem_dmabuf.c
+* Unmerged path drivers/gpu/drm/i915/gem/selftests/i915_gem_migrate.c
+diff --git a/drivers/gpu/drm/i915/gt/intel_gt.c b/drivers/gpu/drm/i915/gt/intel_gt.c
+index 59d36fff08ab..cbb4dbd1c904 100644
+--- a/drivers/gpu/drm/i915/gt/intel_gt.c
++++ b/drivers/gpu/drm/i915/gt/intel_gt.c
+@@ -67,7 +67,7 @@ int intel_gt_probe_lmem(struct intel_gt *gt)
+ 		return err;
+ 	}
+ 
+-	id = INTEL_REGION_LMEM;
++	id = INTEL_REGION_LMEM_0;
+ 
+ 	mem->id = id;
+ 
+diff --git a/drivers/gpu/drm/i915/intel_memory_region.c b/drivers/gpu/drm/i915/intel_memory_region.c
+index e6024eb7cca4..1e111a800dba 100644
+--- a/drivers/gpu/drm/i915/intel_memory_region.c
++++ b/drivers/gpu/drm/i915/intel_memory_region.c
+@@ -14,7 +14,7 @@ static const struct {
+ 		.class = INTEL_MEMORY_SYSTEM,
+ 		.instance = 0,
+ 	},
+-	[INTEL_REGION_LMEM] = {
++	[INTEL_REGION_LMEM_0] = {
+ 		.class = INTEL_MEMORY_LOCAL,
+ 		.instance = 0,
+ 	},
+diff --git a/drivers/gpu/drm/i915/intel_memory_region.h b/drivers/gpu/drm/i915/intel_memory_region.h
+index 1f7dac63abb7..35e7d1192435 100644
+--- a/drivers/gpu/drm/i915/intel_memory_region.h
++++ b/drivers/gpu/drm/i915/intel_memory_region.h
+@@ -29,14 +29,14 @@ enum intel_memory_type {
+ 
+ enum intel_region_id {
+ 	INTEL_REGION_SMEM = 0,
+-	INTEL_REGION_LMEM,
++	INTEL_REGION_LMEM_0,
+ 	INTEL_REGION_STOLEN_SMEM,
+ 	INTEL_REGION_STOLEN_LMEM,
+ 	INTEL_REGION_UNKNOWN, /* Should be last */
+ };
+ 
+ #define REGION_SMEM     BIT(INTEL_REGION_SMEM)
+-#define REGION_LMEM     BIT(INTEL_REGION_LMEM)
++#define REGION_LMEM     BIT(INTEL_REGION_LMEM_0)
+ #define REGION_STOLEN_SMEM   BIT(INTEL_REGION_STOLEN_SMEM)
+ #define REGION_STOLEN_LMEM   BIT(INTEL_REGION_STOLEN_LMEM)
+ 
