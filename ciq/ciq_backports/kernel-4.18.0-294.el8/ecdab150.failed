@@ -1,0 +1,245 @@
+vfs: syscall: Add fsconfig() for configuring and managing a context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit ecdab150fddb42fe6a739335257949220033b782
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ecdab150.failed
+
+Add a syscall for configuring a filesystem creation context and triggering
+actions upon it, to be used in conjunction with fsopen, fspick and fsmount.
+
+    long fsconfig(int fs_fd, unsigned int cmd, const char *key,
+		  const void *value, int aux);
+
+Where fs_fd indicates the context, cmd indicates the action to take, key
+indicates the parameter name for parameter-setting actions and, if needed,
+value points to a buffer containing the value and aux can give more
+information for the value.
+
+The following command IDs are proposed:
+
+ (*) FSCONFIG_SET_FLAG: No value is specified.  The parameter must be
+     boolean in nature.  The key may be prefixed with "no" to invert the
+     setting. value must be NULL and aux must be 0.
+
+ (*) FSCONFIG_SET_STRING: A string value is specified.  The parameter can
+     be expecting boolean, integer, string or take a path.  A conversion to
+     an appropriate type will be attempted (which may include looking up as
+     a path).  value points to a NUL-terminated string and aux must be 0.
+
+ (*) FSCONFIG_SET_BINARY: A binary blob is specified.  value points to
+     the blob and aux indicates its size.  The parameter must be expecting
+     a blob.
+
+ (*) FSCONFIG_SET_PATH: A non-empty path is specified.  The parameter must
+     be expecting a path object.  value points to a NUL-terminated string
+     that is the path and aux is a file descriptor at which to start a
+     relative lookup or AT_FDCWD.
+
+ (*) FSCONFIG_SET_PATH_EMPTY: As fsconfig_set_path, but with AT_EMPTY_PATH
+     implied.
+
+ (*) FSCONFIG_SET_FD: An open file descriptor is specified.  value must
+     be NULL and aux indicates the file descriptor.
+
+ (*) FSCONFIG_CMD_CREATE: Trigger superblock creation.
+
+ (*) FSCONFIG_CMD_RECONFIGURE: Trigger superblock reconfiguration.
+
+For the "set" command IDs, the idea is that the file_system_type will point
+to a list of parameters and the types of value that those parameters expect
+to take.  The core code can then do the parse and argument conversion and
+then give the LSM and FS a cooked option or array of options to use.
+
+Source specification is also done the same way same way, using special keys
+"source", "source1", "source2", etc..
+
+[!] Note that, for the moment, the key and value are just glued back
+together and handed to the filesystem.  Every filesystem that uses options
+uses match_token() and co. to do this, and this will need to be changed -
+but not all at once.
+
+Example usage:
+
+    fd = fsopen("ext4", FSOPEN_CLOEXEC);
+    fsconfig(fd, fsconfig_set_path, "source", "/dev/sda1", AT_FDCWD);
+    fsconfig(fd, fsconfig_set_path_empty, "journal_path", "", journal_fd);
+    fsconfig(fd, fsconfig_set_fd, "journal_fd", "", journal_fd);
+    fsconfig(fd, fsconfig_set_flag, "user_xattr", NULL, 0);
+    fsconfig(fd, fsconfig_set_flag, "noacl", NULL, 0);
+    fsconfig(fd, fsconfig_set_string, "sb", "1", 0);
+    fsconfig(fd, fsconfig_set_string, "errors", "continue", 0);
+    fsconfig(fd, fsconfig_set_string, "data", "journal", 0);
+    fsconfig(fd, fsconfig_set_string, "context", "unconfined_u:...", 0);
+    fsconfig(fd, fsconfig_cmd_create, NULL, NULL, 0);
+    mfd = fsmount(fd, FSMOUNT_CLOEXEC, MS_NOEXEC);
+
+or:
+
+    fd = fsopen("ext4", FSOPEN_CLOEXEC);
+    fsconfig(fd, fsconfig_set_string, "source", "/dev/sda1", 0);
+    fsconfig(fd, fsconfig_cmd_create, NULL, NULL, 0);
+    mfd = fsmount(fd, FSMOUNT_CLOEXEC, MS_NOEXEC);
+
+or:
+
+    fd = fsopen("afs", FSOPEN_CLOEXEC);
+    fsconfig(fd, fsconfig_set_string, "source", "#grand.central.org:root.cell", 0);
+    fsconfig(fd, fsconfig_cmd_create, NULL, NULL, 0);
+    mfd = fsmount(fd, FSMOUNT_CLOEXEC, MS_NOEXEC);
+
+or:
+
+    fd = fsopen("jffs2", FSOPEN_CLOEXEC);
+    fsconfig(fd, fsconfig_set_string, "source", "mtd0", 0);
+    fsconfig(fd, fsconfig_cmd_create, NULL, NULL, 0);
+    mfd = fsmount(fd, FSMOUNT_CLOEXEC, MS_NOEXEC);
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+cc: linux-api@vger.kernel.org
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit ecdab150fddb42fe6a739335257949220033b782)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/syscalls/syscall_32.tbl
+#	arch/x86/entry/syscalls/syscall_64.tbl
+#	fs/fs_context.c
+#	fs/fsopen.c
+#	fs/internal.h
+#	include/linux/syscalls.h
+#	include/uapi/linux/mount.h
+diff --cc arch/x86/entry/syscalls/syscall_32.tbl
+index 2eefd2a7c1ce,786728143205..000000000000
+--- a/arch/x86/entry/syscalls/syscall_32.tbl
++++ b/arch/x86/entry/syscalls/syscall_32.tbl
+@@@ -396,8 -396,44 +396,47 @@@
+  382	i386	pkey_free		sys_pkey_free			__ia32_sys_pkey_free
+  383	i386	statx			sys_statx			__ia32_sys_statx
+  384	i386	arch_prctl		sys_arch_prctl			__ia32_compat_sys_arch_prctl
+ -385	i386	io_pgetevents		sys_io_pgetevents_time32	__ia32_compat_sys_io_pgetevents
+ +385	i386	io_pgetevents		sys_io_pgetevents		__ia32_compat_sys_io_pgetevents
+  386	i386	rseq			sys_rseq			__ia32_sys_rseq
+++<<<<<<< HEAD
+++=======
++ 387	i386	open_tree		sys_open_tree			__ia32_sys_open_tree
++ 388	i386	move_mount		sys_move_mount			__ia32_sys_move_mount
++ 389	i386	fsopen			sys_fsopen			__ia32_sys_fsopen
++ 390	i386	fsconfig		sys_fsconfig			__ia32_sys_fsconfig
++ # don't use numbers 391 through 392, add new calls at the end
++ 393	i386	semget			sys_semget    			__ia32_sys_semget
++ 394	i386	semctl			sys_semctl    			__ia32_compat_sys_semctl
++ 395	i386	shmget			sys_shmget    			__ia32_sys_shmget
++ 396	i386	shmctl			sys_shmctl    			__ia32_compat_sys_shmctl
++ 397	i386	shmat			sys_shmat     			__ia32_compat_sys_shmat
++ 398	i386	shmdt			sys_shmdt     			__ia32_sys_shmdt
++ 399	i386	msgget			sys_msgget    			__ia32_sys_msgget
++ 400	i386	msgsnd			sys_msgsnd    			__ia32_compat_sys_msgsnd
++ 401	i386	msgrcv			sys_msgrcv    			__ia32_compat_sys_msgrcv
++ 402	i386	msgctl			sys_msgctl    			__ia32_compat_sys_msgctl
++ 403	i386	clock_gettime64		sys_clock_gettime		__ia32_sys_clock_gettime
++ 404	i386	clock_settime64		sys_clock_settime		__ia32_sys_clock_settime
++ 405	i386	clock_adjtime64		sys_clock_adjtime		__ia32_sys_clock_adjtime
++ 406	i386	clock_getres_time64	sys_clock_getres		__ia32_sys_clock_getres
++ 407	i386	clock_nanosleep_time64	sys_clock_nanosleep		__ia32_sys_clock_nanosleep
++ 408	i386	timer_gettime64		sys_timer_gettime		__ia32_sys_timer_gettime
++ 409	i386	timer_settime64		sys_timer_settime		__ia32_sys_timer_settime
++ 410	i386	timerfd_gettime64	sys_timerfd_gettime		__ia32_sys_timerfd_gettime
++ 411	i386	timerfd_settime64	sys_timerfd_settime		__ia32_sys_timerfd_settime
++ 412	i386	utimensat_time64	sys_utimensat			__ia32_sys_utimensat
++ 413	i386	pselect6_time64		sys_pselect6			__ia32_compat_sys_pselect6_time64
++ 414	i386	ppoll_time64		sys_ppoll			__ia32_compat_sys_ppoll_time64
++ 416	i386	io_pgetevents_time64	sys_io_pgetevents		__ia32_sys_io_pgetevents
++ 417	i386	recvmmsg_time64		sys_recvmmsg			__ia32_compat_sys_recvmmsg_time64
++ 418	i386	mq_timedsend_time64	sys_mq_timedsend		__ia32_sys_mq_timedsend
++ 419	i386	mq_timedreceive_time64	sys_mq_timedreceive		__ia32_sys_mq_timedreceive
++ 420	i386	semtimedop_time64	sys_semtimedop			__ia32_sys_semtimedop
++ 421	i386	rt_sigtimedwait_time64	sys_rt_sigtimedwait		__ia32_compat_sys_rt_sigtimedwait_time64
++ 422	i386	futex_time64		sys_futex			__ia32_sys_futex
++ 423	i386	sched_rr_get_interval_time64	sys_sched_rr_get_interval	__ia32_sys_sched_rr_get_interval
++ 424	i386	pidfd_send_signal	sys_pidfd_send_signal		__ia32_sys_pidfd_send_signal
+++>>>>>>> ecdab150fddb (vfs: syscall: Add fsconfig() for configuring and managing a context)
+  425	i386	io_uring_setup		sys_io_uring_setup		__ia32_sys_io_uring_setup
+  426	i386	io_uring_enter		sys_io_uring_enter		__ia32_sys_io_uring_enter
+  427	i386	io_uring_register	sys_io_uring_register		__ia32_sys_io_uring_register
+diff --cc arch/x86/entry/syscalls/syscall_64.tbl
+index 65c026185e61,7039a809d37d..000000000000
+--- a/arch/x86/entry/syscalls/syscall_64.tbl
++++ b/arch/x86/entry/syscalls/syscall_64.tbl
+@@@ -343,6 -343,13 +343,16 @@@
+  332	common	statx			__x64_sys_statx
+  333	common	io_pgetevents		__x64_sys_io_pgetevents
+  334	common	rseq			__x64_sys_rseq
+++<<<<<<< HEAD
+++=======
++ 335	common	open_tree		__x64_sys_open_tree
++ 336	common	move_mount		__x64_sys_move_mount
++ 337	common	fsopen			__x64_sys_fsopen
++ 338	common	fsconfig		__x64_sys_fsconfig
++ # don't use numbers 387 through 423, add new calls after the last
++ # 'common' entry
++ 424	common	pidfd_send_signal	__x64_sys_pidfd_send_signal
+++>>>>>>> ecdab150fddb (vfs: syscall: Add fsconfig() for configuring and managing a context)
+  425	common	io_uring_setup		__x64_sys_io_uring_setup
+  426	common	io_uring_enter		__x64_sys_io_uring_enter
+  427	common	io_uring_register	__x64_sys_io_uring_register
+diff --cc fs/internal.h
+index 172c0652a6e5,95cf7b0af21f..000000000000
+--- a/fs/internal.h
++++ b/fs/internal.h
+@@@ -50,6 -53,15 +50,18 @@@ extern int __block_write_begin_int(stru
+  extern void __init chrdev_init(void);
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * fs_context.c
++  */
++ extern const struct fs_context_operations legacy_fs_context_ops;
++ extern int parse_monolithic_mount_data(struct fs_context *, void *);
++ extern void fc_drop_locked(struct fs_context *);
++ extern void vfs_clean_context(struct fs_context *fc);
++ extern int finish_clean_context(struct fs_context *fc);
++ 
++ /*
+++>>>>>>> ecdab150fddb (vfs: syscall: Add fsconfig() for configuring and managing a context)
+   * namei.c
+   */
+  extern int filename_lookup(int dfd, struct filename *name, unsigned flags,
+diff --cc include/linux/syscalls.h
+index ed03cace6180,925f9dfc356b..000000000000
+--- a/include/linux/syscalls.h
++++ b/include/linux/syscalls.h
+@@@ -914,6 -985,16 +914,19 @@@ asmlinkage long sys_statx(int dfd, cons
+  			  unsigned mask, struct statx __user *buffer);
+  asmlinkage long sys_rseq(struct rseq __user *rseq, uint32_t rseq_len,
+  			 int flags, uint32_t sig);
+++<<<<<<< HEAD
+++=======
++ asmlinkage long sys_open_tree(int dfd, const char __user *path, unsigned flags);
++ asmlinkage long sys_move_mount(int from_dfd, const char __user *from_path,
++ 			       int to_dfd, const char __user *to_path,
++ 			       unsigned int ms_flags);
++ asmlinkage long sys_fsopen(const char __user *fs_name, unsigned int flags);
++ asmlinkage long sys_fsconfig(int fs_fd, unsigned int cmd, const char __user *key,
++ 			     const void __user *value, int aux);
++ asmlinkage long sys_pidfd_send_signal(int pidfd, int sig,
++ 				       siginfo_t __user *info,
++ 				       unsigned int flags);
+++>>>>>>> ecdab150fddb (vfs: syscall: Add fsconfig() for configuring and managing a context)
+  
+  /*
+   * Architecture-specific system calls
+* Unmerged path fs/fs_context.c
+* Unmerged path fs/fsopen.c
+* Unmerged path include/uapi/linux/mount.h
+* Unmerged path arch/x86/entry/syscalls/syscall_32.tbl
+* Unmerged path arch/x86/entry/syscalls/syscall_64.tbl
+* Unmerged path fs/fs_context.c
+* Unmerged path fs/fsopen.c
+* Unmerged path fs/internal.h
+* Unmerged path include/linux/syscalls.h
+* Unmerged path include/uapi/linux/mount.h
