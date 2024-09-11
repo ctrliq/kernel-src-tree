@@ -1,0 +1,188 @@
+x86/speculation: Enable Spectre v1 swapgs mitigations
+
+jira LE-1907
+cve CVE-2019-1125
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Josh Poimboeuf <jpoimboe@redhat.com>
+commit a2059825986a1c8143fd6698774fa9d83733bb11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/a2059825.failed
+
+
+The previous commit added macro calls in the entry code which mitigate the
+Spectre v1 swapgs issue if the X86_FEATURE_FENCE_SWAPGS_* features are
+enabled.  Enable those features where applicable.
+
+The mitigations may be disabled with "nospectre_v1" or "mitigations=off".
+
+There are different features which can affect the risk of attack:
+
+- When FSGSBASE is enabled, unprivileged users are able to place any
+  value in GS, using the wrgsbase instruction.  This means they can
+  write a GS value which points to any value in kernel space, which can
+  be useful with the following gadget in an interrupt/exception/NMI
+  handler:
+
+	if (coming from user space)
+		swapgs
+	mov %gs:<percpu_offset>, %reg1
+	// dependent load or store based on the value of %reg
+	// for example: mov %(reg1), %reg2
+
+  If an interrupt is coming from user space, and the entry code
+  speculatively skips the swapgs (due to user branch mistraining), it
+  may speculatively execute the GS-based load and a subsequent dependent
+  load or store, exposing the kernel data to an L1 side channel leak.
+
+  Note that, on Intel, a similar attack exists in the above gadget when
+  coming from kernel space, if the swapgs gets speculatively executed to
+  switch back to the user GS.  On AMD, this variant isn't possible
+  because swapgs is serializing with respect to future GS-based
+  accesses.
+
+  NOTE: The FSGSBASE patch set hasn't been merged yet, so the above case
+	doesn't exist quite yet.
+
+- When FSGSBASE is disabled, the issue is mitigated somewhat because
+  unprivileged users must use prctl(ARCH_SET_GS) to set GS, which
+  restricts GS values to user space addresses only.  That means the
+  gadget would need an additional step, since the target kernel address
+  needs to be read from user space first.  Something like:
+
+	if (coming from user space)
+		swapgs
+	mov %gs:<percpu_offset>, %reg1
+	mov (%reg1), %reg2
+	// dependent load or store based on the value of %reg2
+	// for example: mov %(reg2), %reg3
+
+  It's difficult to audit for this gadget in all the handlers, so while
+  there are no known instances of it, it's entirely possible that it
+  exists somewhere (or could be introduced in the future).  Without
+  tooling to analyze all such code paths, consider it vulnerable.
+
+  Effects of SMAP on the !FSGSBASE case:
+
+  - If SMAP is enabled, and the CPU reports RDCL_NO (i.e., not
+    susceptible to Meltdown), the kernel is prevented from speculatively
+    reading user space memory, even L1 cached values.  This effectively
+    disables the !FSGSBASE attack vector.
+
+  - If SMAP is enabled, but the CPU *is* susceptible to Meltdown, SMAP
+    still prevents the kernel from speculatively reading user space
+    memory.  But it does *not* prevent the kernel from reading the
+    user value from L1, if it has already been cached.  This is probably
+    only a small hurdle for an attacker to overcome.
+
+Thanks to Dave Hansen for contributing the speculative_smap() function.
+
+Thanks to Andrew Cooper for providing the inside scoop on whether swapgs
+is serializing on AMD.
+
+[ tglx: Fixed the USER fence decision and polished the comment as suggested
+  	by Dave Hansen ]
+
+	Signed-off-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+
+(cherry picked from commit a2059825986a1c8143fd6698774fa9d83733bb11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/admin-guide/kernel-parameters.txt
+#	arch/x86/kernel/cpu/bugs.c
+diff --cc Documentation/admin-guide/kernel-parameters.txt
+index b1827a553af7,01d7ad250e98..000000000000
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@@ -2535,10 -2585,14 +2535,18 @@@
+  				Disable all optional CPU mitigations.  This
+  				improves system performance, but it may also
+  				expose users to several CPU vulnerabilities.
+++<<<<<<< HEAD
+ +				Equivalent to: nopti [X86]
+ +					       nospectre_v2 [X86]
+++=======
++ 				Equivalent to: nopti [X86,PPC]
++ 					       kpti=0 [ARM64]
++ 					       nospectre_v1 [X86,PPC]
++ 					       nobp=0 [S390]
++ 					       nospectre_v2 [X86,PPC,S390,ARM64]
+++>>>>>>> a2059825986a (x86/speculation: Enable Spectre v1 swapgs mitigations)
+  					       spectre_v2_user=off [X86]
+ -					       spec_store_bypass_disable=off [X86,PPC]
+ -					       ssbd=force-off [ARM64]
+ +					       spec_store_bypass_disable=off [X86]
+  					       l1tf=off [X86]
+  					       mds=off [X86]
+  
+@@@ -2893,10 -2936,14 +2901,21 @@@
+  			nosmt=force: Force disable SMT, cannot be undone
+  				     via the sysfs control file.
+  
+++<<<<<<< HEAD
+ +	nospectre_v2	[X86] Disable all mitigations for the Spectre variant 2
+ +			(indirect branch prediction) vulnerability. System may
+ +			allow data leaks with this option, which is equivalent
+ +			to spectre_v2=off.
+++=======
++ 	nospectre_v1	[X86,PPC] Disable mitigations for Spectre Variant 1
++ 			(bounds check bypass). With this option data leaks are
++ 			possible in the system.
++ 
++ 	nospectre_v2	[X86,PPC_FSL_BOOK3E,ARM64] Disable all mitigations for
++ 			the Spectre variant 2 (indirect branch prediction)
++ 			vulnerability. System may allow data leaks with this
++ 			option.
+++>>>>>>> a2059825986a (x86/speculation: Enable Spectre v1 swapgs mitigations)
+  
+  	nospec_store_bypass_disable
+  			[HW] Disable all mitigations for the Speculative Store Bypass vulnerability
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 54b2ed151407,992f832c447b..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -31,8 -31,10 +31,9 @@@
+  #include <asm/intel-family.h>
+  #include <asm/e820/api.h>
+  #include <asm/hypervisor.h>
+ -
+ -#include "cpu.h"
+ +#include <asm/spec_ctrl.h>
+  
++ static void __init spectre_v1_select_mitigation(void);
+  static void __init spectre_v2_select_mitigation(void);
+  static void __init ssb_select_mitigation(void);
+  static void __init l1tf_select_mitigation(void);
+@@@ -97,21 -99,11 +98,25 @@@ void __init check_bugs(void
+  	if (boot_cpu_has(X86_FEATURE_STIBP))
+  		x86_spec_ctrl_mask |= SPEC_CTRL_STIBP;
+  
+++<<<<<<< HEAD
+ +	/* IBRS initialization */
+ +	spec_ctrl_init();
+ +
+ +	/* Select the proper spectre mitigation before patching alternatives */
+ +	spectre_v2_select_mitigation();
+ +	spec_ctrl_cpu_init();
+ +
+ +	/*
+ +	 * Select proper mitigation for any exposure to the Speculative Store
+ +	 * Bypass vulnerability.
+ +	 */
+++=======
++ 	/* Select the proper CPU mitigations before patching alternatives: */
++ 	spectre_v1_select_mitigation();
++ 	spectre_v2_select_mitigation();
+++>>>>>>> a2059825986a (x86/speculation: Enable Spectre v1 swapgs mitigations)
+  	ssb_select_mitigation();
+- 
+  	l1tf_select_mitigation();
+- 
+  	mds_select_mitigation();
+  
+  	arch_smt_update();
+* Unmerged path Documentation/admin-guide/kernel-parameters.txt
+* Unmerged path arch/x86/kernel/cpu/bugs.c
