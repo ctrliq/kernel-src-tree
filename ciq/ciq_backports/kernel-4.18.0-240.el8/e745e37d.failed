@@ -1,0 +1,171 @@
+KVM: x86: Refactor cpuid_mask() to auto-retrieve the register
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit e745e37d49771b8a06955f18c7a435830c0a4a5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e745e37d.failed
+
+Use the recently introduced cpuid_entry_get_reg() to automatically get
+the appropriate register when masking a CPUID entry.
+
+No functional change intended.
+
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e745e37d49771b8a06955f18c7a435830c0a4a5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.h
+diff --cc arch/x86/kvm/cpuid.h
+index a2335b92a9a0,407dc26c0633..000000000000
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@@ -136,6 -135,46 +136,49 @@@ static __always_inline bool cpuid_entry
+  	return cpuid_entry_get(entry, x86_feature);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline void cpuid_entry_clear(struct kvm_cpuid_entry2 *entry,
++ 					      unsigned int x86_feature)
++ {
++ 	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++ 
++ 	*reg &= ~__feature_bit(x86_feature);
++ }
++ 
++ static __always_inline void cpuid_entry_set(struct kvm_cpuid_entry2 *entry,
++ 					    unsigned int x86_feature)
++ {
++ 	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++ 
++ 	*reg |= __feature_bit(x86_feature);
++ }
++ 
++ static __always_inline void cpuid_entry_change(struct kvm_cpuid_entry2 *entry,
++ 					       unsigned int x86_feature,
++ 					       bool set)
++ {
++ 	u32 *reg = cpuid_entry_get_reg(entry, x86_feature);
++ 
++ 	/*
++ 	 * Open coded instead of using cpuid_entry_{clear,set}() to coerce the
++ 	 * compiler into using CMOV instead of Jcc when possible.
++ 	 */
++ 	if (set)
++ 		*reg |= __feature_bit(x86_feature);
++ 	else
++ 		*reg &= ~__feature_bit(x86_feature);
++ }
++ 
++ static __always_inline void cpuid_entry_mask(struct kvm_cpuid_entry2 *entry,
++ 					     enum cpuid_leafs leaf)
++ {
++ 	u32 *reg = cpuid_entry_get_reg(entry, leaf * 32);
++ 
++ 	*reg &= boot_cpu_data.x86_capability[leaf];
++ }
++ 
+++>>>>>>> e745e37d4977 (KVM: x86: Refactor cpuid_mask() to auto-retrieve the register)
+  static __always_inline u32 *guest_cpuid_get_register(struct kvm_vcpu *vcpu,
+  						     unsigned int x86_feature)
+  {
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index d4472786ed92..12b28661b662 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -285,12 +285,6 @@ int kvm_vcpu_ioctl_get_cpuid2(struct kvm_vcpu *vcpu,
+ 	return r;
+ }
+ 
+-static __always_inline void cpuid_mask(u32 *word, int wordnum)
+-{
+-	reverse_cpuid_check(wordnum);
+-	*word &= boot_cpu_data.x86_capability[wordnum];
+-}
+-
+ struct kvm_cpuid_array {
+ 	struct kvm_cpuid_entry2 *entries;
+ 	const int maxnent;
+@@ -404,13 +398,13 @@ static inline void do_cpuid_7_mask(struct kvm_cpuid_entry2 *entry)
+ 	case 0:
+ 		entry->eax = min(entry->eax, 1u);
+ 		entry->ebx &= kvm_cpuid_7_0_ebx_x86_features;
+-		cpuid_mask(&entry->ebx, CPUID_7_0_EBX);
++		cpuid_entry_mask(entry, CPUID_7_0_EBX);
+ 		/* TSC_ADJUST is emulated */
+ 		entry->ebx |= F(TSC_ADJUST);
+ 
+ 		entry->ecx &= kvm_cpuid_7_0_ecx_x86_features;
+ 		f_la57 = cpuid_entry_get(entry, X86_FEATURE_LA57);
+-		cpuid_mask(&entry->ecx, CPUID_7_ECX);
++		cpuid_entry_mask(entry, CPUID_7_ECX);
+ 		/* Set LA57 based on hardware capability. */
+ 		entry->ecx |= f_la57;
+ 		entry->ecx |= f_umip;
+@@ -420,7 +414,7 @@ static inline void do_cpuid_7_mask(struct kvm_cpuid_entry2 *entry)
+ 			entry->ecx &= ~F(PKU);
+ 
+ 		entry->edx &= kvm_cpuid_7_0_edx_x86_features;
+-		cpuid_mask(&entry->edx, CPUID_7_EDX);
++		cpuid_entry_mask(entry, CPUID_7_EDX);
+ 		if (boot_cpu_has(X86_FEATURE_IBPB) && boot_cpu_has(X86_FEATURE_IBRS))
+ 			entry->edx |= F(SPEC_CTRL);
+ 		if (boot_cpu_has(X86_FEATURE_STIBP))
+@@ -538,9 +532,9 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		break;
+ 	case 1:
+ 		entry->edx &= kvm_cpuid_1_edx_x86_features;
+-		cpuid_mask(&entry->edx, CPUID_1_EDX);
++		cpuid_entry_mask(entry, CPUID_1_EDX);
+ 		entry->ecx &= kvm_cpuid_1_ecx_x86_features;
+-		cpuid_mask(&entry->ecx, CPUID_1_ECX);
++		cpuid_entry_mask(entry, CPUID_1_ECX);
+ 		/* we support x2apic emulation even if host does not support
+ 		 * it since we emulate x2apic in software */
+ 		entry->ecx |= F(X2APIC);
+@@ -652,7 +646,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 			goto out;
+ 
+ 		entry->eax &= kvm_cpuid_D_1_eax_x86_features;
+-		cpuid_mask(&entry->eax, CPUID_D_1_EAX);
++		cpuid_entry_mask(entry, CPUID_D_1_EAX);
+ 		if (entry->eax & (F(XSAVES)|F(XSAVEC)))
+ 			entry->ebx = xstate_required_size(supported, true);
+ 		else
+@@ -733,9 +727,9 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		break;
+ 	case 0x80000001:
+ 		entry->edx &= kvm_cpuid_8000_0001_edx_x86_features;
+-		cpuid_mask(&entry->edx, CPUID_8000_0001_EDX);
++		cpuid_entry_mask(entry, CPUID_8000_0001_EDX);
+ 		entry->ecx &= kvm_cpuid_8000_0001_ecx_x86_features;
+-		cpuid_mask(&entry->ecx, CPUID_8000_0001_ECX);
++		cpuid_entry_mask(entry, CPUID_8000_0001_ECX);
+ 		break;
+ 	case 0x80000007: /* Advanced power management */
+ 		/* invariant TSC is CPUID.80000007H:EDX[8] */
+@@ -754,7 +748,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		entry->eax = g_phys_as | (virt_as << 8);
+ 		entry->edx = 0;
+ 		entry->ebx &= kvm_cpuid_8000_0008_ebx_x86_features;
+-		cpuid_mask(&entry->ebx, CPUID_8000_0008_EBX);
++		cpuid_entry_mask(entry, CPUID_8000_0008_EBX);
+ 		/*
+ 		 * AMD has separate bits for each SPEC_CTRL bit.
+ 		 * arch/x86/kernel/cpu/bugs.c is kind enough to
+@@ -797,7 +791,7 @@ static inline int __do_cpuid_func(struct kvm_cpuid_array *array, u32 function)
+ 		break;
+ 	case 0xC0000001:
+ 		entry->edx &= kvm_cpuid_C000_0001_edx_x86_features;
+-		cpuid_mask(&entry->edx, CPUID_C000_0001_EDX);
++		cpuid_entry_mask(entry, CPUID_C000_0001_EDX);
+ 		break;
+ 	case 3: /* Processor serial number */
+ 	case 5: /* MONITOR/MWAIT */
+* Unmerged path arch/x86/kvm/cpuid.h
