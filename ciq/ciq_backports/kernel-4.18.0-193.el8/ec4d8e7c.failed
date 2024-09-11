@@ -1,0 +1,189 @@
+bnxt_en: Add TPA ID mapping logic for 57500 chips.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Add TPA ID mapping logic for 57500 chips (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 98.99%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit ec4d8e7cf024e42def027531676918048e5c7982
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ec4d8e7c.failed
+
+The new TPA feature on 57500 supports a larger number of concurrent TPAs
+(up to 1024) divided among the functions.  We need to add some logic to
+map the hardware TPA ID to a software index that keeps track of each TPA
+in progress.  A 1:1 direct mapping without translation would be too
+wasteful as we would have to allocate 1024 TPA structures for each RX
+ring on each PCI function.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ec4d8e7cf024e42def027531676918048e5c7982)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 08038755587c,05c69a5626be..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -1130,6 -1189,12 +1157,15 @@@ static void bnxt_tpa_start(struct bnxt 
+  	struct rx_bd *prod_bd;
+  	dma_addr_t mapping;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++ 		agg_id = TPA_START_AGG_ID_P5(tpa_start);
++ 		agg_id = bnxt_alloc_agg_idx(rxr, agg_id);
++ 	} else {
++ 		agg_id = TPA_START_AGG_ID(tpa_start);
++ 	}
+++>>>>>>> ec4d8e7cf024 (bnxt_en: Add TPA ID mapping logic for 57500 chips.)
+  	cons = tpa_start->rx_tpa_start_cmp_opaque;
+  	prod = rxr->rx_prod;
+  	cons_rx_buf = &rxr->rx_buf_ring[cons];
+@@@ -1404,7 -1472,35 +1440,39 @@@ static inline struct sk_buff *bnxt_tpa_
+  		return NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	tpa_info = &rxr->rx_tpa[agg_id];
+++=======
++ 	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++ 		agg_id = TPA_END_AGG_ID_P5(tpa_end);
++ 		agg_id = bnxt_lookup_agg_idx(rxr, agg_id);
++ 		agg_bufs = TPA_END_AGG_BUFS_P5(tpa_end1);
++ 		tpa_info = &rxr->rx_tpa[agg_id];
++ 		if (unlikely(agg_bufs != tpa_info->agg_count)) {
++ 			netdev_warn(bp->dev, "TPA end agg_buf %d != expected agg_bufs %d\n",
++ 				    agg_bufs, tpa_info->agg_count);
++ 			agg_bufs = tpa_info->agg_count;
++ 		}
++ 		tpa_info->agg_count = 0;
++ 		*event |= BNXT_AGG_EVENT;
++ 		bnxt_free_agg_idx(rxr, agg_id);
++ 		idx = agg_id;
++ 		gro = !!(bp->flags & BNXT_FLAG_GRO);
++ 	} else {
++ 		agg_id = TPA_END_AGG_ID(tpa_end);
++ 		agg_bufs = TPA_END_AGG_BUFS(tpa_end);
++ 		tpa_info = &rxr->rx_tpa[agg_id];
++ 		idx = RING_CMP(*raw_cons);
++ 		if (agg_bufs) {
++ 			if (!bnxt_agg_bufs_valid(bp, cpr, agg_bufs, raw_cons))
++ 				return ERR_PTR(-EBUSY);
++ 
++ 			*event |= BNXT_AGG_EVENT;
++ 			idx = NEXT_CMP(idx);
++ 		}
++ 		gro = !!TPA_END_GRO(tpa_end);
++ 	}
+++>>>>>>> ec4d8e7cf024 (bnxt_en: Add TPA ID mapping logic for 57500 chips.)
+  	data = tpa_info->data;
+  	data_ptr = tpa_info->data_ptr;
+  	prefetch(data_ptr);
+@@@ -2486,6 -2577,61 +2559,64 @@@ static int bnxt_alloc_ring(struct bnxt 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void bnxt_free_tpa_info(struct bnxt *bp)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < bp->rx_nr_rings; i++) {
++ 		struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
++ 
++ 		kfree(rxr->rx_tpa_idx_map);
++ 		rxr->rx_tpa_idx_map = NULL;
++ 		if (rxr->rx_tpa) {
++ 			kfree(rxr->rx_tpa[0].agg_arr);
++ 			rxr->rx_tpa[0].agg_arr = NULL;
++ 		}
++ 		kfree(rxr->rx_tpa);
++ 		rxr->rx_tpa = NULL;
++ 	}
++ }
++ 
++ static int bnxt_alloc_tpa_info(struct bnxt *bp)
++ {
++ 	int i, j, total_aggs = 0;
++ 
++ 	bp->max_tpa = MAX_TPA;
++ 	if (bp->flags & BNXT_FLAG_CHIP_P5) {
++ 		if (!bp->max_tpa_v2)
++ 			return 0;
++ 		bp->max_tpa = max_t(u16, bp->max_tpa_v2, MAX_TPA_P5);
++ 		total_aggs = bp->max_tpa * MAX_SKB_FRAGS;
++ 	}
++ 
++ 	for (i = 0; i < bp->rx_nr_rings; i++) {
++ 		struct bnxt_rx_ring_info *rxr = &bp->rx_ring[i];
++ 		struct rx_agg_cmp *agg;
++ 
++ 		rxr->rx_tpa = kcalloc(bp->max_tpa, sizeof(struct bnxt_tpa_info),
++ 				      GFP_KERNEL);
++ 		if (!rxr->rx_tpa)
++ 			return -ENOMEM;
++ 
++ 		if (!(bp->flags & BNXT_FLAG_CHIP_P5))
++ 			continue;
++ 		agg = kcalloc(total_aggs, sizeof(*agg), GFP_KERNEL);
++ 		rxr->rx_tpa[0].agg_arr = agg;
++ 		if (!agg)
++ 			return -ENOMEM;
++ 		for (j = 1; j < bp->max_tpa; j++)
++ 			rxr->rx_tpa[j].agg_arr = agg + j * MAX_SKB_FRAGS;
++ 		rxr->rx_tpa_idx_map = kzalloc(sizeof(*rxr->rx_tpa_idx_map),
++ 					      GFP_KERNEL);
++ 		if (!rxr->rx_tpa_idx_map)
++ 			return -ENOMEM;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> ec4d8e7cf024 (bnxt_en: Add TPA ID mapping logic for 57500 chips.)
+  static void bnxt_free_rx_rings(struct bnxt *bp)
+  {
+  	int i;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 40decea98910,309cf99bcda9..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -552,6 -554,9 +552,12 @@@ struct nqe_cn 
+  #define BNXT_DEFAULT_TX_RING_SIZE	511
+  
+  #define MAX_TPA		64
+++<<<<<<< HEAD
+++=======
++ #define MAX_TPA_P5	256
++ #define MAX_TPA_P5_MASK	(MAX_TPA_P5 - 1)
++ #define MAX_TPA_SEGS_P5	0x3f
+++>>>>>>> ec4d8e7cf024 (bnxt_en: Add TPA ID mapping logic for 57500 chips.)
+  
+  #if (BNXT_PAGE_SHIFT == 16)
+  #define MAX_RX_PAGES	1
+@@@ -833,8 -838,17 +839,15 @@@ struct bnxt_tpa_info 
+  	((hdr_info) & 0x1ff)
+  
+  	u16			cfa_code; /* cfa_code in TPA start compl */
+ -	u8			agg_count;
+ -	struct rx_agg_cmp	*agg_arr;
+  };
+  
++ #define BNXT_AGG_IDX_BMAP_SIZE	(MAX_TPA_P5 / BITS_PER_LONG)
++ 
++ struct bnxt_tpa_idx_map {
++ 	u16		agg_id_tbl[1024];
++ 	unsigned long	agg_idx_bmap[BNXT_AGG_IDX_BMAP_SIZE];
++ };
++ 
+  struct bnxt_rx_ring_info {
+  	struct bnxt_napi	*bnapi;
+  	u16			rx_prod;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
