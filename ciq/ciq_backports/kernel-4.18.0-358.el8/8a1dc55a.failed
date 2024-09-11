@@ -1,0 +1,202 @@
+x86/cpu: Sanitize X86_FEATURE_OSPKE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 8a1dc55a3f3ef0a723c3c117a567e7b5dd2c1793
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/8a1dc55a.failed
+
+X86_FEATURE_OSPKE is enabled first on the boot CPU and the feature flag is
+set. Secondary CPUs have to enable CR4.PKE as well and set their per CPU
+feature flag. That's ineffective because all call sites have checks for
+boot_cpu_data.
+
+Make it smarter and force the feature flag when PKU is enabled on the boot
+cpu which allows then to use cpu_feature_enabled(X86_FEATURE_OSPKE) all
+over the place. That either compiles the code out when PKEY support is
+disabled in Kconfig or uses a static_cpu_has() for the feature check which
+makes a significant difference in hotpaths, e.g. context switch.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121455.305113644@linutronix.de
+(cherry picked from commit 8a1dc55a3f3ef0a723c3c117a567e7b5dd2c1793)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/common.c
+#	arch/x86/kernel/process_64.c
+diff --cc arch/x86/kernel/cpu/common.c
+index 730307584210,dbfb335ffac4..000000000000
+--- a/arch/x86/kernel/cpu/common.c
++++ b/arch/x86/kernel/cpu/common.c
+@@@ -389,22 -466,20 +389,29 @@@ static bool pku_disabled
+  
+  static __always_inline void setup_pku(struct cpuinfo_x86 *c)
+  {
+- 	/* check the boot processor, plus compile options for PKU: */
+- 	if (!cpu_feature_enabled(X86_FEATURE_PKU))
+- 		return;
+- 	/* checks the actual processor's cpuid bits: */
+- 	if (!cpu_has(c, X86_FEATURE_PKU))
+- 		return;
+- 	if (pku_disabled)
++ 	if (c == &boot_cpu_data) {
++ 		if (pku_disabled || !cpu_feature_enabled(X86_FEATURE_PKU))
++ 			return;
++ 		/*
++ 		 * Setting CR4.PKE will cause the X86_FEATURE_OSPKE cpuid
++ 		 * bit to be set.  Enforce it.
++ 		 */
++ 		setup_force_cpu_cap(X86_FEATURE_OSPKE);
++ 
++ 	} else if (!cpu_feature_enabled(X86_FEATURE_OSPKE)) {
+  		return;
++ 	}
+  
+  	cr4_set_bits(X86_CR4_PKE);
+++<<<<<<< HEAD
+ +	/*
+ +	 * Seting X86_CR4_PKE will cause the X86_FEATURE_OSPKE
+ +	 * cpuid bit to be set.  We need to ensure that we
+ +	 * update that bit in this CPU's "cpu_info".
+ +	 */
+ +	get_cpu_cap(c);
+++=======
+++>>>>>>> 8a1dc55a3f3e (x86/cpu: Sanitize X86_FEATURE_OSPKE)
+  }
+  
+  #ifdef CONFIG_X86_INTEL_MEMORY_PROTECTION_KEYS
+diff --cc arch/x86/kernel/process_64.c
+index d71593bd6cc0,40a963809203..000000000000
+--- a/arch/x86/kernel/process_64.c
++++ b/arch/x86/kernel/process_64.c
+@@@ -132,14 -131,14 +132,19 @@@ void __show_regs(struct pt_regs *regs, 
+  	/* Only print out debug registers if they are in their non-default state. */
+  	if (!((d0 == 0) && (d1 == 0) && (d2 == 0) && (d3 == 0) &&
+  	    (d6 == DR6_RESERVED) && (d7 == 0x400))) {
+ -		printk("%sDR0: %016lx DR1: %016lx DR2: %016lx\n",
+ -		       log_lvl, d0, d1, d2);
+ -		printk("%sDR3: %016lx DR6: %016lx DR7: %016lx\n",
+ -		       log_lvl, d3, d6, d7);
+ +		printk(KERN_DEFAULT "DR0: %016lx DR1: %016lx DR2: %016lx\n",
+ +		       d0, d1, d2);
+ +		printk(KERN_DEFAULT "DR3: %016lx DR6: %016lx DR7: %016lx\n",
+ +		       d3, d6, d7);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (boot_cpu_has(X86_FEATURE_OSPKE))
+ +		printk(KERN_DEFAULT "PKRU: %08x\n", read_pkru());
+++=======
++ 	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
++ 		printk("%sPKRU: %08x\n", log_lvl, read_pkru());
+++>>>>>>> 8a1dc55a3f3e (x86/cpu: Sanitize X86_FEATURE_OSPKE)
+  }
+  
+  void release_thread(struct task_struct *dead_task)
+diff --git a/arch/x86/include/asm/pkeys.h b/arch/x86/include/asm/pkeys.h
+index 2ff9b98812b7..4128f647c755 100644
+--- a/arch/x86/include/asm/pkeys.h
++++ b/arch/x86/include/asm/pkeys.h
+@@ -9,14 +9,14 @@
+  * will be necessary to ensure that the types that store key
+  * numbers and masks have sufficient capacity.
+  */
+-#define arch_max_pkey() (boot_cpu_has(X86_FEATURE_OSPKE) ? 16 : 1)
++#define arch_max_pkey() (cpu_feature_enabled(X86_FEATURE_OSPKE) ? 16 : 1)
+ 
+ extern int arch_set_user_pkey_access(struct task_struct *tsk, int pkey,
+ 		unsigned long init_val);
+ 
+ static inline bool arch_pkeys_enabled(void)
+ {
+-	return boot_cpu_has(X86_FEATURE_OSPKE);
++	return cpu_feature_enabled(X86_FEATURE_OSPKE);
+ }
+ 
+ /*
+@@ -26,7 +26,7 @@ static inline bool arch_pkeys_enabled(void)
+ extern int __execute_only_pkey(struct mm_struct *mm);
+ static inline int execute_only_pkey(struct mm_struct *mm)
+ {
+-	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return ARCH_DEFAULT_PKEY;
+ 
+ 	return __execute_only_pkey(mm);
+@@ -37,7 +37,7 @@ extern int __arch_override_mprotect_pkey(struct vm_area_struct *vma,
+ static inline int arch_override_mprotect_pkey(struct vm_area_struct *vma,
+ 		int prot, int pkey)
+ {
+-	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return 0;
+ 
+ 	return __arch_override_mprotect_pkey(vma, prot, pkey);
+diff --git a/arch/x86/include/asm/pkru.h b/arch/x86/include/asm/pkru.h
+index 35ffcfd6e403..ec8dd2878dc9 100644
+--- a/arch/x86/include/asm/pkru.h
++++ b/arch/x86/include/asm/pkru.h
+@@ -32,7 +32,7 @@ static inline bool __pkru_allows_write(u32 pkru, u16 pkey)
+ 
+ static inline u32 read_pkru(void)
+ {
+-	if (boot_cpu_has(X86_FEATURE_OSPKE))
++	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return rdpkru();
+ 	return 0;
+ }
+@@ -41,7 +41,7 @@ static inline void write_pkru(u32 pkru)
+ {
+ 	struct pkru_state *pk;
+ 
+-	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return;
+ 
+ 	pk = get_xsave_addr(&current->thread.fpu.state.xsave, XFEATURE_PKRU);
+* Unmerged path arch/x86/kernel/cpu/common.c
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 1e27c69db876..037ae28c7b00 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -356,7 +356,7 @@ static inline void copy_init_fpstate_to_fpregs(u64 features_mask)
+ 	else
+ 		frstor(&init_fpstate.fsave);
+ 
+-	if (boot_cpu_has(X86_FEATURE_OSPKE))
++	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		copy_init_pkru_to_fpregs();
+ }
+ 
+diff --git a/arch/x86/kernel/fpu/xstate.c b/arch/x86/kernel/fpu/xstate.c
+index 4641d3145e59..d3b336ef8b17 100644
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@ -962,7 +962,7 @@ int arch_set_user_pkey_access(struct task_struct *tsk, int pkey,
+ 	 * This check implies XSAVE support.  OSPKE only gets
+ 	 * set if we enable XSAVE and we enable PKU in XCR0.
+ 	 */
+-	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return -EINVAL;
+ 
+ 	/*
+* Unmerged path arch/x86/kernel/process_64.c
+diff --git a/arch/x86/mm/fault.c b/arch/x86/mm/fault.c
+index ddd5a5d2db4e..da4dbb368545 100644
+--- a/arch/x86/mm/fault.c
++++ b/arch/x86/mm/fault.c
+@@ -918,7 +918,7 @@ static inline bool bad_area_access_from_pkeys(unsigned long error_code,
+ 	/* This code is always called on the current mm */
+ 	bool foreign = false;
+ 
+-	if (!boot_cpu_has(X86_FEATURE_OSPKE))
++	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
+ 		return false;
+ 	if (error_code & X86_PF_PK)
+ 		return true;
