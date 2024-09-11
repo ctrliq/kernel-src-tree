@@ -2168,7 +2168,7 @@ static int devx_umem_get(struct mlx5_ib_dev *dev, struct ib_ucontext *ucontext,
 	if (err)
 		return err;
 
-	err = ib_check_mr_access(access);
+	err = ib_check_mr_access(&dev->ib_dev, access);
 	if (err)
 		return err;
 
