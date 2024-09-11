@@ -1,0 +1,281 @@
+x86/memory_failure: Introduce {set, clear}_mce_nospec()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 284ce4011ba60d6c487b668eea729b6294930806
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/284ce401.failed
+
+Currently memory_failure() returns zero if the error was handled. On
+that result mce_unmap_kpfn() is called to zap the page out of the kernel
+linear mapping to prevent speculative fetches of potentially poisoned
+memory. However, in the case of dax mapped devmap pages the page may be
+in active permanent use by the device driver, so it cannot be unmapped
+from the kernel.
+
+Instead of marking the page not present, marking the page UC should
+be sufficient for preventing poison from being pre-fetched into the
+cache. Convert mce_unmap_pfn() to set_mce_nospec() remapping the page as
+UC, to hide it from speculative accesses.
+
+Given that that persistent memory errors can be cleared by the driver,
+include a facility to restore the page to cacheable operation,
+clear_mce_nospec().
+
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: <linux-edac@vger.kernel.org>
+	Cc: <x86@kernel.org>
+	Acked-by: Tony Luck <tony.luck@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Ingo Molnar <mingo@redhat.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+(cherry picked from commit 284ce4011ba60d6c487b668eea729b6294930806)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mcheck/mce.c
+diff --cc arch/x86/kernel/cpu/mcheck/mce.c
+index 6a95e0fbe8a4,42a061ce1f5d..000000000000
+--- a/arch/x86/kernel/cpu/mcheck/mce.c
++++ b/arch/x86/kernel/cpu/mcheck/mce.c
+@@@ -1076,129 -1072,6 +1072,132 @@@ static int do_memory_failure(struct mc
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +#ifndef mce_unmap_kpfn
+ +static void mce_unmap_kpfn(unsigned long pfn)
+ +{
+ +	unsigned long decoy_addr;
+ +
+ +	/*
+ +	 * Unmap this page from the kernel 1:1 mappings to make sure
+ +	 * we don't log more errors because of speculative access to
+ +	 * the page.
+ +	 * We would like to just call:
+ +	 *	set_memory_np((unsigned long)pfn_to_kaddr(pfn), 1);
+ +	 * but doing that would radically increase the odds of a
+ +	 * speculative access to the poison page because we'd have
+ +	 * the virtual address of the kernel 1:1 mapping sitting
+ +	 * around in registers.
+ +	 * Instead we get tricky.  We create a non-canonical address
+ +	 * that looks just like the one we want, but has bit 63 flipped.
+ +	 * This relies on set_memory_np() not checking whether we passed
+ +	 * a legal address.
+ +	 */
+ +
+ +	decoy_addr = (pfn << PAGE_SHIFT) + (PAGE_OFFSET ^ BIT(63));
+ +
+ +	if (set_memory_np(decoy_addr, 1))
+ +		pr_warn("Could not invalidate pfn=0x%lx from 1:1 map\n", pfn);
+ +}
+ +#endif
+ +
+ +
+ +/*
+ + * Cases where we avoid rendezvous handler timeout:
+ + * 1) If this CPU is offline.
+ + *
+ + * 2) If crashing_cpu was set, e.g. we're entering kdump and we need to
+ + *  skip those CPUs which remain looping in the 1st kernel - see
+ + *  crash_nmi_callback().
+ + *
+ + * Note: there still is a small window between kexec-ing and the new,
+ + * kdump kernel establishing a new #MC handler where a broadcasted MCE
+ + * might not get handled properly.
+ + */
+ +static bool __mc_check_crashing_cpu(int cpu)
+ +{
+ +	if (cpu_is_offline(cpu) ||
+ +	    (crashing_cpu != -1 && crashing_cpu != cpu)) {
+ +		u64 mcgstatus;
+ +
+ +		mcgstatus = mce_rdmsrl(MSR_IA32_MCG_STATUS);
+ +		if (mcgstatus & MCG_STATUS_RIPV) {
+ +			mce_wrmsrl(MSR_IA32_MCG_STATUS, 0);
+ +			return true;
+ +		}
+ +	}
+ +	return false;
+ +}
+ +
+ +static void __mc_scan_banks(struct mce *m, struct mce *final,
+ +			    unsigned long *toclear, unsigned long *valid_banks,
+ +			    int no_way_out, int *worst)
+ +{
+ +	struct mca_config *cfg = &mca_cfg;
+ +	int severity, i;
+ +
+ +	for (i = 0; i < cfg->banks; i++) {
+ +		__clear_bit(i, toclear);
+ +		if (!test_bit(i, valid_banks))
+ +			continue;
+ +
+ +		if (!mce_banks[i].ctl)
+ +			continue;
+ +
+ +		m->misc = 0;
+ +		m->addr = 0;
+ +		m->bank = i;
+ +
+ +		m->status = mce_rdmsrl(msr_ops.status(i));
+ +		if (!(m->status & MCI_STATUS_VAL))
+ +			continue;
+ +
+ +		/*
+ +		 * Corrected or non-signaled errors are handled by
+ +		 * machine_check_poll(). Leave them alone, unless this panics.
+ +		 */
+ +		if (!(m->status & (cfg->ser ? MCI_STATUS_S : MCI_STATUS_UC)) &&
+ +			!no_way_out)
+ +			continue;
+ +
+ +		/* Set taint even when machine check was not enabled. */
+ +		add_taint(TAINT_MACHINE_CHECK, LOCKDEP_NOW_UNRELIABLE);
+ +
+ +		severity = mce_severity(m, cfg->tolerant, NULL, true);
+ +
+ +		/*
+ +		 * When machine check was for corrected/deferred handler don't
+ +		 * touch, unless we're panicking.
+ +		 */
+ +		if ((severity == MCE_KEEP_SEVERITY ||
+ +		     severity == MCE_UCNA_SEVERITY) && !no_way_out)
+ +			continue;
+ +
+ +		__set_bit(i, toclear);
+ +
+ +		/* Machine check event was not enabled. Clear, but ignore. */
+ +		if (severity == MCE_NO_SEVERITY)
+ +			continue;
+ +
+ +		mce_read_aux(m, i);
+ +
+ +		/* assuming valid severity level != 0 */
+ +		m->severity = severity;
+ +
+ +		mce_log(m);
+ +
+ +		if (severity > *worst) {
+ +			*final = *m;
+ +			*worst = severity;
+ +		}
+ +	}
+ +
+ +	/* mce_clear_state will clear *final, save locally for use later */
+ +	*m = *final;
+ +}
+ +
+++=======
+++>>>>>>> 284ce4011ba6 (x86/memory_failure: Introduce {set, clear}_mce_nospec())
+  /*
+   * The actual machine check handler. This only handles real
+   * exceptions when something got corrupted coming in through int 18.
+diff --git a/arch/x86/include/asm/set_memory.h b/arch/x86/include/asm/set_memory.h
+index bd090367236c..cf5e9124b45e 100644
+--- a/arch/x86/include/asm/set_memory.h
++++ b/arch/x86/include/asm/set_memory.h
+@@ -88,4 +88,46 @@ extern int kernel_set_to_readonly;
+ void set_kernel_text_rw(void);
+ void set_kernel_text_ro(void);
+ 
++#ifdef CONFIG_X86_64
++static inline int set_mce_nospec(unsigned long pfn)
++{
++	unsigned long decoy_addr;
++	int rc;
++
++	/*
++	 * Mark the linear address as UC to make sure we don't log more
++	 * errors because of speculative access to the page.
++	 * We would like to just call:
++	 *      set_memory_uc((unsigned long)pfn_to_kaddr(pfn), 1);
++	 * but doing that would radically increase the odds of a
++	 * speculative access to the poison page because we'd have
++	 * the virtual address of the kernel 1:1 mapping sitting
++	 * around in registers.
++	 * Instead we get tricky.  We create a non-canonical address
++	 * that looks just like the one we want, but has bit 63 flipped.
++	 * This relies on set_memory_uc() properly sanitizing any __pa()
++	 * results with __PHYSICAL_MASK or PTE_PFN_MASK.
++	 */
++	decoy_addr = (pfn << PAGE_SHIFT) + (PAGE_OFFSET ^ BIT(63));
++
++	rc = set_memory_uc(decoy_addr, 1);
++	if (rc)
++		pr_warn("Could not invalidate pfn=0x%lx from 1:1 map\n", pfn);
++	return rc;
++}
++#define set_mce_nospec set_mce_nospec
++
++/* Restore full speculative operation to the pfn. */
++static inline int clear_mce_nospec(unsigned long pfn)
++{
++	return set_memory_wb((unsigned long) pfn_to_kaddr(pfn), 1);
++}
++#define clear_mce_nospec clear_mce_nospec
++#else
++/*
++ * Few people would run a 32-bit kernel on a machine that supports
++ * recoverable errors because they have too much memory to boot 32-bit.
++ */
++#endif
++
+ #endif /* _ASM_X86_SET_MEMORY_H */
+diff --git a/arch/x86/kernel/cpu/mcheck/mce-internal.h b/arch/x86/kernel/cpu/mcheck/mce-internal.h
+index 374d1aa66952..ceb67cd5918f 100644
+--- a/arch/x86/kernel/cpu/mcheck/mce-internal.h
++++ b/arch/x86/kernel/cpu/mcheck/mce-internal.h
+@@ -113,21 +113,6 @@ static inline void mce_register_injector_chain(struct notifier_block *nb)	{ }
+ static inline void mce_unregister_injector_chain(struct notifier_block *nb)	{ }
+ #endif
+ 
+-#ifndef CONFIG_X86_64
+-/*
+- * On 32-bit systems it would be difficult to safely unmap a poison page
+- * from the kernel 1:1 map because there are no non-canonical addresses that
+- * we can use to refer to the address without risking a speculative access.
+- * However, this isn't much of an issue because:
+- * 1) Few unmappable pages are in the 1:1 map. Most are in HIGHMEM which
+- *    are only mapped into the kernel as needed
+- * 2) Few people would run a 32-bit kernel on a machine that supports
+- *    recoverable errors because they have too much memory to boot 32-bit.
+- */
+-static inline void mce_unmap_kpfn(unsigned long pfn) {}
+-#define mce_unmap_kpfn mce_unmap_kpfn
+-#endif
+-
+ struct mca_config {
+ 	bool dont_log_ce;
+ 	bool cmci_disabled;
+* Unmerged path arch/x86/kernel/cpu/mcheck/mce.c
+diff --git a/include/linux/set_memory.h b/include/linux/set_memory.h
+index da5178216da5..2a986d282a97 100644
+--- a/include/linux/set_memory.h
++++ b/include/linux/set_memory.h
+@@ -17,6 +17,20 @@ static inline int set_memory_x(unsigned long addr,  int numpages) { return 0; }
+ static inline int set_memory_nx(unsigned long addr, int numpages) { return 0; }
+ #endif
+ 
++#ifndef set_mce_nospec
++static inline int set_mce_nospec(unsigned long pfn)
++{
++	return 0;
++}
++#endif
++
++#ifndef clear_mce_nospec
++static inline int clear_mce_nospec(unsigned long pfn)
++{
++	return 0;
++}
++#endif
++
+ #ifndef CONFIG_ARCH_HAS_MEM_ENCRYPT
+ static inline int set_memory_encrypted(unsigned long addr, int numpages)
+ {
