@@ -1,0 +1,132 @@
+net: Add ID (if needed) to sock_reuseport and expose reuseport_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 736b46027eb4a4c602d3b8b93d2f48c9facbd915
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/736b4602.failed
+
+A later patch will introduce a BPF_MAP_TYPE_REUSEPORT_ARRAY which
+allows a SO_REUSEPORT sk to be added to a bpf map.  When a sk
+is removed from reuse->socks[], it also needs to be removed from
+the bpf map.  Also, when adding a sk to a bpf map, the bpf
+map needs to ensure it is indeed in a reuse->socks[].
+Hence, reuseport_lock is needed by the bpf map to ensure its
+map_update_elem() and map_delete_elem() operations are in-sync with
+the reuse->socks[].  The BPF_MAP_TYPE_REUSEPORT_ARRAY map will only
+acquire the reuseport_lock after ensuring the adding sk is already
+in a reuseport group (i.e. reuse->socks[]).  The map_lookup_elem()
+will be lockless.
+
+This patch also adds an ID to sock_reuseport.  A later patch
+will introduce BPF_PROG_TYPE_SK_REUSEPORT which allows
+a bpf prog to select a sk from a bpf map.  It is inflexible to
+statically enforce a bpf map can only contain the sk belonging to
+a particular reuse->socks[] (i.e. same IP:PORT) during the bpf
+verification time. For example, think about the the map-in-map situation
+where the inner map can be dynamically changed in runtime and the outer
+map may have inner maps belonging to different reuseport groups.
+Hence, when the bpf prog (in the new BPF_PROG_TYPE_SK_REUSEPORT
+type) selects a sk,  this selected sk has to be checked to ensure it
+belongs to the requesting reuseport group (i.e. the group serving
+that IP:PORT).
+
+The "sk->sk_reuseport_cb" pointer cannot be used for this checking
+purpose because the pointer value will change after reuseport_grow().
+Instead of saving all checking conditions like the ones
+preced calling "reuseport_add_sock()" and compare them everytime a
+bpf_prog is run, a 32bits ID is introduced to survive the
+reuseport_grow().  The ID is only acquired if any of the
+reuse->socks[] is added to the newly introduced
+"BPF_MAP_TYPE_REUSEPORT_ARRAY" map.
+
+If "BPF_MAP_TYPE_REUSEPORT_ARRAY" is not used,  the changes in this
+patch is a no-op.
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 736b46027eb4a4c602d3b8b93d2f48c9facbd915)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock_reuseport.h
+diff --cc include/net/sock_reuseport.h
+index 0054b3a9b923,e1a7681856f7..000000000000
+--- a/include/net/sock_reuseport.h
++++ b/include/net/sock_reuseport.h
+@@@ -12,6 -15,12 +15,15 @@@ struct sock_reuseport 
+  
+  	u16			max_socks;	/* length of socks */
+  	u16			num_socks;	/* elements in socks */
+++<<<<<<< HEAD
+++=======
++ 	/* The last synq overflow event timestamp of this
++ 	 * reuse->socks[] group.
++ 	 */
++ 	unsigned int		synq_overflow_ts;
++ 	/* ID stays the same even after the size of socks[] grows. */
++ 	unsigned int		reuseport_id;
+++>>>>>>> 736b46027eb4 (net: Add ID (if needed) to sock_reuseport and expose reuseport_lock)
+  	struct bpf_prog __rcu	*prog;		/* optional BPF sock selector */
+  	struct sock		*socks[0];	/* array of sock pointers */
+  };
+* Unmerged path include/net/sock_reuseport.h
+diff --git a/net/core/sock_reuseport.c b/net/core/sock_reuseport.c
+index 064acb04be0f..db56eacd0da7 100644
+--- a/net/core/sock_reuseport.c
++++ b/net/core/sock_reuseport.c
+@@ -8,11 +8,33 @@
+ 
+ #include <net/sock_reuseport.h>
+ #include <linux/bpf.h>
++#include <linux/idr.h>
+ #include <linux/rcupdate.h>
+ 
+ #define INIT_SOCKS 128
+ 
+-static DEFINE_SPINLOCK(reuseport_lock);
++DEFINE_SPINLOCK(reuseport_lock);
++
++#define REUSEPORT_MIN_ID 1
++static DEFINE_IDA(reuseport_ida);
++
++int reuseport_get_id(struct sock_reuseport *reuse)
++{
++	int id;
++
++	if (reuse->reuseport_id)
++		return reuse->reuseport_id;
++
++	id = ida_simple_get(&reuseport_ida, REUSEPORT_MIN_ID, 0,
++			    /* Called under reuseport_lock */
++			    GFP_ATOMIC);
++	if (id < 0)
++		return id;
++
++	reuse->reuseport_id = id;
++
++	return reuse->reuseport_id;
++}
+ 
+ static struct sock_reuseport *__reuseport_alloc(unsigned int max_socks)
+ {
+@@ -78,6 +100,7 @@ static struct sock_reuseport *reuseport_grow(struct sock_reuseport *reuse)
+ 	more_reuse->max_socks = more_socks_size;
+ 	more_reuse->num_socks = reuse->num_socks;
+ 	more_reuse->prog = reuse->prog;
++	more_reuse->reuseport_id = reuse->reuseport_id;
+ 
+ 	memcpy(more_reuse->socks, reuse->socks,
+ 	       reuse->num_socks * sizeof(struct sock *));
+@@ -101,6 +124,8 @@ static void reuseport_free_rcu(struct rcu_head *head)
+ 	reuse = container_of(head, struct sock_reuseport, rcu);
+ 	if (reuse->prog)
+ 		bpf_prog_destroy(reuse->prog);
++	if (reuse->reuseport_id)
++		ida_simple_remove(&reuseport_ida, reuse->reuseport_id);
+ 	kfree(reuse);
+ }
+ 
