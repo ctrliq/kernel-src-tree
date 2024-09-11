@@ -1,0 +1,484 @@
+RDMA/restrack: Hide restrack DB from IB/core
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 41eda65c6100930d95bb854a0114f3544593070c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/41eda65c.failed
+
+There is no need to expose internals of restrack DB to IB/core.
+
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 41eda65c6100930d95bb854a0114f3544593070c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/nldev.c
+#	drivers/infiniband/core/restrack.c
+#	include/rdma/restrack.h
+diff --cc drivers/infiniband/core/nldev.c
+index efccd8e0fb77,54312f9626a1..000000000000
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@@ -962,8 -1025,10 +963,9 @@@ static int res_get_common_dumpit(struc
+  	int start = cb->args[0];
+  	bool has_cap_net_admin;
+  	struct nlmsghdr *nlh;
+ -	unsigned long id;
+  	u32 index, port = 0;
+  	bool filled = false;
++ 	struct xarray *xa;
+  
+  	err = nlmsg_parse(cb->nlh, 0, tb, RDMA_NLDEV_ATTR_MAX - 1,
+  			  nldev_policy, NULL);
+@@@ -1011,8 -1076,14 +1013,19 @@@
+  
+  	has_cap_net_admin = netlink_capable(cb->skb, CAP_NET_ADMIN);
+  
+++<<<<<<< HEAD
+ +	down_read(&device->res.rwsem);
+ +	hash_for_each_possible(device->res.hash, res, node, res_type) {
+++=======
++ 	xa = &device->res->xa[res_type];
++ 	down_read(&device->res->rwsem);
++ 	/*
++ 	 * FIXME: if the skip ahead is something common this loop should
++ 	 * use xas_for_each & xas_pause to optimize, we can have a lot of
++ 	 * objects.
++ 	 */
++ 	xa_for_each(xa, id, res) {
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  		if (idx < start)
+  			goto next;
+  
+@@@ -1029,27 -1100,35 +1042,39 @@@
+  
+  		filled = true;
+  
+++<<<<<<< HEAD
+ +		up_read(&device->res.rwsem);
+++=======
++ 		entry_attr = nla_nest_start(skb, fe->entry);
++ 		if (!entry_attr) {
++ 			ret = -EMSGSIZE;
++ 			rdma_restrack_put(res);
++ 			up_read(&device->res->rwsem);
++ 			break;
++ 		}
++ 
++ 		up_read(&device->res->rwsem);
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  		ret = fe->fill_res_func(skb, has_cap_net_admin, res, port);
+- 		down_read(&device->res.rwsem);
++ 		down_read(&device->res->rwsem);
+  		/*
+  		 * Return resource back, but it won't be released till
+  		 * the &device->res.rwsem will be released for write.
+  		 */
+  		rdma_restrack_put(res);
+  
+ -		if (ret)
+ -			nla_nest_cancel(skb, entry_attr);
+  		if (ret == -EMSGSIZE)
+ +			/*
+ +			 * There is a chance to optimize here.
+ +			 * It can be done by using list_prepare_entry
+ +			 * and list_for_each_entry_continue afterwards.
+ +			 */
+  			break;
+ -		if (ret == -EAGAIN)
+ -			goto next;
+  		if (ret)
+  			goto res_err;
+ -		nla_nest_end(skb, entry_attr);
+  next:		idx++;
+  	}
+- 	up_read(&device->res.rwsem);
++ 	up_read(&device->res->rwsem);
+  
+  	nla_nest_end(skb, table_attr);
+  	nlmsg_end(skb, nlh);
+diff --cc drivers/infiniband/core/restrack.c
+index bfd36820ee66,6a4b76c66bcb..000000000000
+--- a/drivers/infiniband/core/restrack.c
++++ b/drivers/infiniband/core/restrack.c
+@@@ -9,25 -9,55 +9,46 @@@
+  #include <linux/mutex.h>
+  #include <linux/sched/task.h>
+  #include <linux/pid_namespace.h>
++ #include <linux/rwsem.h>
+  
+  #include "cma_priv.h"
++ #include "restrack.h"
+  
+ -static int rt_xa_alloc_cyclic(struct xarray *xa, u32 *id, void *entry,
+ -			      u32 *next)
+ +static int fill_res_noop(struct sk_buff *msg,
+ +			 struct rdma_restrack_entry *entry)
+  {
+ -	int err;
+ -
+ -	*id = *next;
+ -	if (*next == U32_MAX)
+ -		*id = 0;
+ -
+ -	xa_lock(xa);
+ -	err = __xa_alloc(xa, id, U32_MAX, entry, GFP_KERNEL);
+ -	if (err && *next != U32_MAX) {
+ -		*id = 0;
+ -		err = __xa_alloc(xa, id, *next, entry, GFP_KERNEL);
+ -	}
+ -
+ -	if (!err)
+ -		*next = *id + 1;
+ -	xa_unlock(xa);
+ -	return err;
+ +	return 0;
+  }
+  
+  /**
+-  * rdma_restrack_init() - initialize resource tracking
++  * rdma_restrack_init() - initialize and allocate resource tracking
+   * @dev:  IB device
++  *
++  * Return: 0 on success
+   */
+- void rdma_restrack_init(struct ib_device *dev)
++ int rdma_restrack_init(struct ib_device *dev)
+  {
+++<<<<<<< HEAD
+ +	struct rdma_restrack_root *res = &dev->res;
+ +
+ +	init_rwsem(&res->rwsem);
+ +	res->fill_res_entry = fill_res_noop;
+++=======
++ 	struct rdma_restrack_root *rt;
++ 	int i;
++ 
++ 	dev->res = kzalloc(sizeof(*rt), GFP_KERNEL);
++ 	if (!dev->res)
++ 		return -ENOMEM;
++ 
++ 	rt = dev->res;
++ 
++ 	for (i = 0 ; i < RDMA_RESTRACK_MAX; i++)
++ 		xa_init_flags(&rt->xa[i], XA_FLAGS_ALLOC);
++ 	init_rwsem(&rt->rwsem);
++ 
++ 	return 0;
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  }
+  
+  static const char *type2str(enum rdma_restrack_type type)
+@@@ -50,36 -80,49 +71,75 @@@
+   */
+  void rdma_restrack_clean(struct ib_device *dev)
+  {
+- 	struct rdma_restrack_root *res = &dev->res;
++ 	struct rdma_restrack_root *rt = dev->res;
+  	struct rdma_restrack_entry *e;
+  	char buf[TASK_COMM_LEN];
+ -	bool found = false;
+  	const char *owner;
+ -	int i;
+ +	int bkt;
+ +
+++<<<<<<< HEAD
+ +	if (hash_empty(res->hash))
+ +		return;
+ +
+ +	dev = container_of(res, struct ib_device, res);
+ +	pr_err("restrack: %s", CUT_HERE);
+ +	dev_err(&dev->dev, "BUG: RESTRACK detected leak of resources\n");
+ +	hash_for_each(res->hash, bkt, e, node) {
+ +		if (rdma_is_kernel_res(e)) {
+ +			owner = e->kern_name;
+ +		} else {
+ +			/*
+ +			 * There is no need to call get_task_struct here,
+ +			 * because we can be here only if there are more
+ +			 * get_task_struct() call than put_task_struct().
+ +			 */
+ +			get_task_comm(buf, e->task);
+ +			owner = buf;
+ +		}
+  
+ +		pr_err("restrack: %s %s object allocated by %s is not freed\n",
+ +		       rdma_is_kernel_res(e) ? "Kernel" : "User",
+ +		       type2str(e->type), owner);
+ +	}
+ +	pr_err("restrack: %s", CUT_HERE);
+++=======
++ 	for (i = 0 ; i < RDMA_RESTRACK_MAX; i++) {
++ 		struct xarray *xa = &dev->res->xa[i];
++ 
++ 		if (!xa_empty(xa)) {
++ 			unsigned long index;
++ 
++ 			if (!found) {
++ 				pr_err("restrack: %s", CUT_HERE);
++ 				dev_err(&dev->dev, "BUG: RESTRACK detected leak of resources\n");
++ 			}
++ 			xa_for_each(xa, index, e) {
++ 				if (rdma_is_kernel_res(e)) {
++ 					owner = e->kern_name;
++ 				} else {
++ 					/*
++ 					 * There is no need to call get_task_struct here,
++ 					 * because we can be here only if there are more
++ 					 * get_task_struct() call than put_task_struct().
++ 					 */
++ 					get_task_comm(buf, e->task);
++ 					owner = buf;
++ 				}
++ 
++ 				pr_err("restrack: %s %s object allocated by %s is not freed\n",
++ 				       rdma_is_kernel_res(e) ? "Kernel" :
++ 							       "User",
++ 				       type2str(e->type), owner);
++ 			}
++ 			found = true;
++ 		}
++ 		xa_destroy(xa);
++ 	}
++ 	if (found)
++ 		pr_err("restrack: %s", CUT_HERE);
++ 
++ 	kfree(rt);
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  }
+  
+  /**
+@@@ -91,12 -134,13 +151,17 @@@
+  int rdma_restrack_count(struct ib_device *dev, enum rdma_restrack_type type,
+  			struct pid_namespace *ns)
+  {
+- 	struct rdma_restrack_root *res = &dev->res;
++ 	struct xarray *xa = &dev->res->xa[type];
+  	struct rdma_restrack_entry *e;
+ -	unsigned long index = 0;
+  	u32 cnt = 0;
+  
+++<<<<<<< HEAD
+ +	down_read(&res->rwsem);
+ +	hash_for_each_possible(res->hash, e, node, type) {
+++=======
++ 	down_read(&dev->res->rwsem);
++ 	xa_for_each(xa, index, e) {
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  		if (ns == &init_pid_ns ||
+  		    (!rdma_is_kernel_res(e) &&
+  		     ns == task_active_pid_ns(e->task)))
+@@@ -173,17 -217,21 +238,32 @@@ EXPORT_SYMBOL(rdma_restrack_set_task)
+  static void rdma_restrack_add(struct rdma_restrack_entry *res)
+  {
+  	struct ib_device *dev = res_to_dev(res);
+++<<<<<<< HEAD
+++=======
++ 	struct rdma_restrack_root *rt;
++ 	struct xarray *xa;
++ 	int ret;
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  
+  	if (!dev)
+  		return;
+  
++ 	rt = dev->res;
++ 	xa = &dev->res->xa[res->type];
++ 
+  	kref_init(&res->kref);
+  	init_completion(&res->comp);
+++<<<<<<< HEAD
+ +	res->valid = true;
+ +
+ +	down_write(&dev->res.rwsem);
+ +	hash_add(dev->res.hash, &res->node, res->type);
+ +	up_write(&dev->res.rwsem);
+++=======
++ 	ret = rt_xa_alloc_cyclic(xa, &res->id, res, &rt->next_id[res->type]);
++ 	if (!ret)
++ 		res->valid = true;
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  }
+  
+  /**
+@@@ -273,15 -334,15 +366,21 @@@ void rdma_restrack_del(struct rdma_rest
+  	if (!dev)
+  		return;
+  
+++<<<<<<< HEAD
+ +	rdma_restrack_put(res);
+ +
+ +	wait_for_completion(&res->comp);
+ +
+ +	down_write(&dev->res.rwsem);
+ +	hash_del(&res->node);
+++=======
++ 	xa = &dev->res->xa[res->type];
++ 	down_write(&dev->res->rwsem);
++ 	xa_erase(xa, res->id);
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  	res->valid = false;
+- 	up_write(&dev->res.rwsem);
++ 	up_write(&dev->res->rwsem);
+  
+ -	rdma_restrack_put(res);
+ -	wait_for_completion(&res->comp);
+ -
+  out:
+  	if (res->task) {
+  		put_task_struct(res->task);
+diff --cc include/rdma/restrack.h
+index 7e9d9a881f70,ecf3c7702a4f..000000000000
+--- a/include/rdma/restrack.h
++++ b/include/rdma/restrack.h
+@@@ -48,31 -48,7 +47,34 @@@ enum rdma_restrack_type 
+  	RDMA_RESTRACK_MAX
+  };
+  
+ +#define RDMA_RESTRACK_HASH_BITS	8
+  struct ib_device;
+++<<<<<<< HEAD
+ +struct rdma_restrack_entry;
+ +
+ +/**
+ + * struct rdma_restrack_root - main resource tracking management
+ + * entity, per-device
+ + */
+ +struct rdma_restrack_root {
+ +	/*
+ +	 * @rwsem: Read/write lock to protect lists
+ +	 */
+ +	struct rw_semaphore	rwsem;
+ +	/**
+ +	 * @hash: global database for all resources per-device
+ +	 */
+ +	DECLARE_HASHTABLE(hash, RDMA_RESTRACK_HASH_BITS);
+ +	/**
+ +	 * @fill_res_entry: driver-specific fill function
+ +	 *
+ +	 * Allows rdma drivers to add their own restrack attributes.
+ +	 */
+ +	int (*fill_res_entry)(struct sk_buff *msg,
+ +			      struct rdma_restrack_entry *entry);
+ +};
+++=======
+++>>>>>>> 41eda65c6100 (RDMA/restrack: Hide restrack DB from IB/core)
+  
+  /**
+   * struct rdma_restrack_entry - metadata per-entry
+@@@ -121,10 -93,12 +123,8 @@@ struct rdma_restrack_entry 
+  	 * @user: user resource
+  	 */
+  	bool			user;
+ -	/**
+ -	 * @id: ID to expose to users
+ -	 */
+ -	u32 id;
+  };
+  
+- void rdma_restrack_init(struct ib_device *dev);
+- void rdma_restrack_clean(struct ib_device *dev);
+  int rdma_restrack_count(struct ib_device *dev,
+  			enum rdma_restrack_type type,
+  			struct pid_namespace *ns);
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index 8641d8bca5aa..03b53cedba72 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -46,6 +46,7 @@
+ #include <rdma/ib_cache.h>
+ 
+ #include "core_priv.h"
++#include "restrack.h"
+ 
+ MODULE_AUTHOR("Roland Dreier");
+ MODULE_DESCRIPTION("core kernel InfiniBand API");
+@@ -299,7 +300,10 @@ struct ib_device *_ib_alloc_device(size_t size)
+ 	if (!device)
+ 		return NULL;
+ 
+-	rdma_restrack_init(device);
++	if (rdma_restrack_init(device)) {
++		kfree(device);
++		return NULL;
++	}
+ 
+ 	device->dev.class = &ib_class;
+ 	device_initialize(&device->dev);
+* Unmerged path drivers/infiniband/core/nldev.c
+* Unmerged path drivers/infiniband/core/restrack.c
+diff --git a/drivers/infiniband/core/restrack.h b/drivers/infiniband/core/restrack.h
+new file mode 100644
+index 000000000000..cf89ef0b8ed5
+--- /dev/null
++++ b/drivers/infiniband/core/restrack.h
+@@ -0,0 +1,39 @@
++/* SPDX-License-Identifier: GPL-2.0 OR Linux-OpenIB */
++/*
++ * Copyright (c) 2017-2019 Mellanox Technologies. All rights reserved.
++ */
++
++#ifndef _RDMA_CORE_RESTRACK_H_
++#define _RDMA_CORE_RESTRACK_H_
++
++#include <linux/mutex.h>
++#include <linux/rwsem.h>
++
++/**
++ * struct rdma_restrack_root - main resource tracking management
++ * entity, per-device
++ */
++struct rdma_restrack_root {
++	/*
++	 * @rwsem: Read/write lock to protect erase of entry.
++	 * Lists and insertions are protected by XArray internal lock.
++	 */
++	struct rw_semaphore	rwsem;
++	/**
++	 * @xa: Array of XArray structures to hold restrack entries.
++	 * We want to use array of XArrays because insertion is type
++	 * dependent. For types with xisiting unique ID (like QPN),
++	 * we will insert to that unique index. For other types,
++	 * we insert based on pointers and auto-allocate unique index.
++	 */
++	struct xarray xa[RDMA_RESTRACK_MAX];
++	/**
++	 * @next_id: Next ID to support cyclic allocation
++	 */
++	u32 next_id[RDMA_RESTRACK_MAX];
++};
++
++
++int rdma_restrack_init(struct ib_device *dev);
++void rdma_restrack_clean(struct ib_device *dev);
++#endif /* _RDMA_CORE_RESTRACK_H_ */
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 2ff74f11eec0..8701ad9f6014 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2527,6 +2527,8 @@ struct ib_device_ops {
+ 			 struct kobject *port_sysfs);
+ };
+ 
++struct rdma_restrack_root;
++
+ struct ib_device {
+ 	/* Do not access @dma_device directly from ULP nor from HW drivers. */
+ 	struct device                *dma_device;
+@@ -2587,10 +2589,7 @@ struct ib_device {
+ #endif
+ 
+ 	u32                          index;
+-	/*
+-	 * Implementation details of the RDMA core, don't use in drivers
+-	 */
+-	struct rdma_restrack_root     res;
++	struct rdma_restrack_root *res;
+ 
+ 	const struct uapi_definition   *driver_def;
+ 	enum rdma_driver_id		driver_id;
+* Unmerged path include/rdma/restrack.h
