@@ -29,11 +29,23 @@ static int get_route_and_out_devs(struct mlx5e_priv *priv,
 	bool dst_is_lag_dev;
 
 	uplink_dev = mlx5_eswitch_uplink_get_proto_dev(esw, REP_ETH);
-	uplink_upper = netdev_master_upper_dev_get(uplink_dev);
+
+	rcu_read_lock();
+	uplink_upper = netdev_master_upper_dev_get_rcu(uplink_dev);
+	/* mlx5_lag_is_sriov() is a blocking function which can't be called
+	 * while holding rcu read lock. Take the net_device for correctness
+	 * sake.
+	 */
+	if (uplink_upper)
+		dev_hold(uplink_upper);
+	rcu_read_unlock();
+
 	dst_is_lag_dev = (uplink_upper &&
 			  netif_is_lag_master(uplink_upper) &&
 			  dev == uplink_upper &&
 			  mlx5_lag_is_sriov(priv->mdev));
+	if (uplink_upper)
+		dev_put(uplink_upper);
 
 	/* if the egress device isn't on the same HW e-switch or
 	 * it's a LAG device, use the uplink
