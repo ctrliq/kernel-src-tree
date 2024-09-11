@@ -1,0 +1,172 @@
+net/mlx5: Open-code create and destroy QP calls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit ec44e72b73b74af489196352152e53a20c8ad5eb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ec44e72b.failed
+
+FPGA, IPoIB and SW steering don't need anything from the
+mlx5_core_create_qp() and mlx5_core_destroy_qp() except calls
+to mlx5_cmd_exec().
+
+Let's open-code it, so we will be able to move qp.c to mlx5_ib.
+
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit ec44e72b73b74af489196352152e53a20c8ad5eb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/steering/dr_send.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/steering/dr_send.c
+index 5bdc02c260e2,88bc94a8b8f1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/steering/dr_send.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/steering/dr_send.c
+@@@ -180,13 -181,12 +181,20 @@@ static struct mlx5dr_qp *dr_create_rc_q
+  				  (__be64 *)MLX5_ADDR_OF(create_qp_in,
+  							 in, pas));
+  
+++<<<<<<< HEAD
+ +	err = mlx5_core_create_qp(mdev, &dr_qp->mqp, in, inlen);
+ +	kvfree(in);
+ +
+ +	if (err) {
+ +		mlx5_core_warn(mdev, " Can't create QP\n");
+++=======
++ 	MLX5_SET(create_qp_in, in, opcode, MLX5_CMD_OP_CREATE_QP);
++ 	err = mlx5_cmd_exec(mdev, in, inlen, out, sizeof(out));
++ 	dr_qp->mqp.qpn = MLX5_GET(create_qp_out, out, qpn);
++ 	kfree(in);
++ 	if (err)
+++>>>>>>> ec44e72b73b7 (net/mlx5: Open-code create and destroy QP calls)
+  		goto err_in;
+- 	}
+  	dr_qp->mqp.event = dr_qp_event;
+  	dr_qp->uar = attr->uar;
+  
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+index 61021133029e..7c3e7232852e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/fpga/conn.c
+@@ -534,8 +534,9 @@ static int mlx5_fpga_conn_create_qp(struct mlx5_fpga_conn *conn,
+ 				    unsigned int tx_size, unsigned int rx_size)
+ {
+ 	struct mlx5_fpga_device *fdev = conn->fdev;
++	u32 out[MLX5_ST_SZ_DW(create_qp_out)] = {};
+ 	struct mlx5_core_dev *mdev = fdev->mdev;
+-	u32 temp_qpc[MLX5_ST_SZ_DW(qpc)] = {0};
++	u32 temp_qpc[MLX5_ST_SZ_DW(qpc)] = {};
+ 	void *in = NULL, *qpc;
+ 	int err, inlen;
+ 
+@@ -600,10 +601,12 @@ static int mlx5_fpga_conn_create_qp(struct mlx5_fpga_conn *conn,
+ 	mlx5_fill_page_frag_array(&conn->qp.wq_ctrl.buf,
+ 				  (__be64 *)MLX5_ADDR_OF(create_qp_in, in, pas));
+ 
+-	err = mlx5_core_create_qp(mdev, &conn->qp.mqp, in, inlen);
++	MLX5_SET(create_qp_in, in, opcode, MLX5_CMD_OP_CREATE_QP);
++	err = mlx5_cmd_exec(mdev, in, inlen, out, sizeof(out));
+ 	if (err)
+ 		goto err_sq_bufs;
+ 
++	conn->qp.mqp.qpn = MLX5_GET(create_qp_out, out, qpn);
+ 	conn->qp.mqp.event = mlx5_fpga_conn_event;
+ 	mlx5_fpga_dbg(fdev, "Created QP #0x%x\n", conn->qp.mqp.qpn);
+ 
+@@ -658,7 +661,14 @@ static void mlx5_fpga_conn_flush_send_bufs(struct mlx5_fpga_conn *conn)
+ 
+ static void mlx5_fpga_conn_destroy_qp(struct mlx5_fpga_conn *conn)
+ {
+-	mlx5_core_destroy_qp(conn->fdev->mdev, &conn->qp.mqp);
++	struct mlx5_core_dev *dev = conn->fdev->mdev;
++	u32 in[MLX5_ST_SZ_DW(destroy_qp_in)] = {};
++	struct mlx5_core_qp *qp = &conn->qp.mqp;
++
++	MLX5_SET(destroy_qp_in, in, opcode, MLX5_CMD_OP_DESTROY_QP);
++	MLX5_SET(destroy_qp_in, in, qpn, qp->qpn);
++	mlx5_cmd_exec_in(dev, destroy_qp, in);
++
+ 	mlx5_fpga_conn_free_recv_bufs(conn);
+ 	mlx5_fpga_conn_flush_send_bufs(conn);
+ 	kvfree(conn->qp.sq.bufs);
+@@ -972,19 +982,11 @@ struct mlx5_fpga_conn *mlx5_fpga_conn_create(struct mlx5_fpga_device *fdev,
+ 
+ void mlx5_fpga_conn_destroy(struct mlx5_fpga_conn *conn)
+ {
+-	struct mlx5_fpga_device *fdev = conn->fdev;
+-	struct mlx5_core_dev *mdev = fdev->mdev;
+-	int err = 0;
+-
+ 	conn->qp.active = false;
+ 	tasklet_disable(&conn->cq.tasklet);
+ 	synchronize_irq(conn->cq.mcq.irqn);
+ 
+ 	mlx5_fpga_destroy_qp(conn->fdev->mdev, conn->fpga_qpn);
+-	err = mlx5_core_qp_modify(mdev, MLX5_CMD_OP_2ERR_QP, 0, NULL,
+-				  &conn->qp.mqp);
+-	if (err)
+-		mlx5_fpga_warn(fdev, "qp_modify 2ERR failed: %d\n", err);
+ 	mlx5_fpga_conn_destroy_qp(conn);
+ 	mlx5_fpga_conn_destroy_cq(conn);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+index e4253ba7a861..89c566dcff52 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/ipoib/ipoib.c
+@@ -219,17 +219,12 @@ void mlx5i_uninit_underlay_qp(struct mlx5e_priv *priv)
+ 
+ int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
+ {
+-	u32 *in = NULL;
++	u32 out[MLX5_ST_SZ_DW(create_qp_out)] = {};
++	u32 in[MLX5_ST_SZ_DW(create_qp_in)] = {};
+ 	void *addr_path;
+ 	int ret = 0;
+-	int inlen;
+ 	void *qpc;
+ 
+-	inlen = MLX5_ST_SZ_BYTES(create_qp_in);
+-	in = kvzalloc(inlen, GFP_KERNEL);
+-	if (!in)
+-		return -ENOMEM;
+-
+ 	qpc = MLX5_ADDR_OF(create_qp_in, in, qpc);
+ 	MLX5_SET(qpc, qpc, st, MLX5_QP_ST_UD);
+ 	MLX5_SET(qpc, qpc, pm_state, MLX5_QP_PM_MIGRATED);
+@@ -240,20 +235,23 @@ int mlx5i_create_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp
+ 	MLX5_SET(ads, addr_path, vhca_port_num, 1);
+ 	MLX5_SET(ads, addr_path, grh, 1);
+ 
+-	ret = mlx5_core_create_qp(mdev, qp, in, inlen);
+-	if (ret) {
+-		mlx5_core_err(mdev, "Failed creating IPoIB QP err : %d\n", ret);
+-		goto out;
+-	}
++	MLX5_SET(create_qp_in, in, opcode, MLX5_CMD_OP_CREATE_QP);
++	ret = mlx5_cmd_exec_inout(mdev, create_qp, in, out);
++	if (ret)
++		return ret;
+ 
+-out:
+-	kvfree(in);
+-	return ret;
++	qp->qpn = MLX5_GET(create_qp_out, out, qpn);
++
++	return 0;
+ }
+ 
+ void mlx5i_destroy_underlay_qp(struct mlx5_core_dev *mdev, struct mlx5_core_qp *qp)
+ {
+-	mlx5_core_destroy_qp(mdev, qp);
++	u32 in[MLX5_ST_SZ_DW(destroy_qp_in)] = {};
++
++	MLX5_SET(destroy_qp_in, in, opcode, MLX5_CMD_OP_DESTROY_QP);
++	MLX5_SET(destroy_qp_in, in, qpn, qp->qpn);
++	mlx5_cmd_exec_in(mdev, destroy_qp, in);
+ }
+ 
+ int mlx5i_update_nic_rx(struct mlx5e_priv *priv)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/steering/dr_send.c
