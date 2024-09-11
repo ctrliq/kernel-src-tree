@@ -1,0 +1,263 @@
+drm/ast: Allocate initial CRTC state of the correct size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Zimmermann <tzimmermann@suse.de>
+commit f0adbc382b8bb46a2467c4e5e1027763a197c8e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f0adbc38.failed
+
+The ast driver inherits from DRM's CRTC state, but still uses the atomic
+helper for struct drm_crtc_funcs.reset, drm_atomic_helper_crtc_reset().
+
+The helper only allocates enough memory for the core CRTC state. That
+results in an out-ouf-bounds access when duplicating the initial CRTC
+state. Simplified backtrace shown below:
+
+[   21.469321] ==================================================================
+[   21.469434] BUG: KASAN: slab-out-of-bounds in ast_crtc_atomic_duplicate_state+0x84/0x100 [ast]
+[   21.469445] Read of size 8 at addr ffff888036c1c5f8 by task systemd-udevd/382
+[   21.469451]
+[   21.469464] CPU: 2 PID: 382 Comm: systemd-udevd Tainted: G            E     5.5.0-rc6-1-default+ #214
+[   21.469473] Hardware name: Sun Microsystems SUN FIRE X2270 M2/SUN FIRE X2270 M2, BIOS 2.05    07/01/2010
+[   21.469480] Call Trace:
+[   21.469501]  dump_stack+0xb8/0x110
+[   21.469528]  print_address_description.constprop.0+0x1b/0x1e0
+[   21.469557]  ? ast_crtc_atomic_duplicate_state+0x84/0x100 [ast]
+[   21.469581]  ? ast_crtc_atomic_duplicate_state+0x84/0x100 [ast]
+[   21.469597]  __kasan_report.cold+0x1a/0x35
+[   21.469640]  ? ast_crtc_atomic_duplicate_state+0x84/0x100 [ast]
+[   21.469665]  kasan_report+0xe/0x20
+[   21.469693]  ast_crtc_atomic_duplicate_state+0x84/0x100 [ast]
+[   21.469733]  drm_atomic_get_crtc_state+0xbf/0x1c0
+[   21.469768]  __drm_atomic_helper_set_config+0x81/0x5a0
+[   21.469803]  ? drm_atomic_plane_check+0x690/0x690
+[   21.469843]  ? drm_client_rotation+0xae/0x240
+[   21.469876]  drm_client_modeset_commit_atomic+0x230/0x390
+[   21.469888]  ? __mutex_lock+0x8f0/0xbe0
+[   21.469929]  ? drm_client_firmware_config.isra.0+0xa60/0xa60
+[   21.469948]  ? drm_client_modeset_commit_force+0x28/0x230
+[   21.470031]  ? memset+0x20/0x40
+[   21.470078]  drm_client_modeset_commit_force+0x90/0x230
+[   21.470110]  drm_fb_helper_restore_fbdev_mode_unlocked+0x5f/0xc0
+[   21.470132]  drm_fb_helper_set_par+0x59/0x70
+[   21.470155]  fbcon_init+0x61d/0xad0
+[   21.470185]  ? drm_fb_helper_restore_fbdev_mode_unlocked+0xc0/0xc0
+[   21.470232]  visual_init+0x187/0x240
+[   21.470266]  do_bind_con_driver+0x2e3/0x460
+[   21.470321]  do_take_over_console+0x20a/0x290
+[   21.470371]  do_fbcon_takeover+0x85/0x100
+[   21.470402]  register_framebuffer+0x2fd/0x490
+[   21.470425]  ? kzalloc.constprop.0+0x10/0x10
+[   21.470503]  __drm_fb_helper_initial_config_and_unlock+0xf2/0x140
+[   21.470533]  drm_fbdev_client_hotplug+0x162/0x250
+[   21.470563]  drm_fbdev_generic_setup+0xd2/0x155
+[   21.470602]  ast_driver_load+0x688/0x850 [ast]
+<...>
+[   21.472625] ==================================================================
+
+Allocating enough memory for struct ast_crtc_state in a custom ast CRTC
+reset handler fixes the problem.
+
+v2:
+	* implement according to drm_atomic_helper_crtc_reset()
+	* update state with __drm_atomic_helper_crtc_reset()
+
+	Signed-off-by: Thomas Zimmermann <tzimmermann@suse.de>
+Fixes: 83be6a3ceb11 ("drm/ast: Introduce struct ast_crtc_state")
+	Reviewed-by: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Gerd Hoffmann <kraxel@redhat.com>
+	Cc: Dave Airlie <airlied@redhat.com>
+	Cc: Daniel Vetter <daniel.vetter@ffwll.ch>
+	Cc: Alex Deucher <alexander.deucher@amd.com>
+	Cc: "Noralf Trønnes" <noralf@tronnes.org>
+	Cc: Sam Ravnborg <sam@ravnborg.org>
+	Cc: Laurent Pinchart <laurent.pinchart@ideasonboard.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20200130094012.32140-1-tzimmermann@suse.de
+(cherry picked from commit f0adbc382b8bb46a2467c4e5e1027763a197c8e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ast/ast_mode.c
+diff --cc drivers/gpu/drm/ast/ast_mode.c
+index a1cb020e07e5,7a9f20a2fd30..000000000000
+--- a/drivers/gpu/drm/ast/ast_mode.c
++++ b/drivers/gpu/drm/ast/ast_mode.c
+@@@ -619,75 -816,128 +619,90 @@@ static int ast_crtc_mode_set(struct drm
+  	return 0;
+  }
+  
+ -static void ast_crtc_helper_atomic_begin(struct drm_crtc *crtc,
+ -					 struct drm_crtc_state *old_crtc_state)
+ +static void ast_crtc_disable(struct drm_crtc *crtc)
+  {
+ -	struct ast_private *ast = crtc->dev->dev_private;
+ -
+ -	ast_open_key(ast);
+ +	DRM_DEBUG_KMS("\n");
+ +	ast_crtc_dpms(crtc, DRM_MODE_DPMS_OFF);
+ +	if (crtc->primary->fb) {
+ +		struct ast_private *ast = crtc->dev->dev_private;
+ +		struct ast_framebuffer *ast_fb = to_ast_framebuffer(crtc->primary->fb);
+ +		struct drm_gem_object *obj = ast_fb->obj;
+ +		struct drm_gem_vram_object *gbo = drm_gem_vram_of_gem(obj);
+ +
+ +		/* unmap if console */
+ +		if (&ast->fbdev->afb == ast_fb)
+ +			drm_gem_vram_kunmap(gbo);
+ +		drm_gem_vram_unpin(gbo);
+ +	}
+ +	crtc->primary->fb = NULL;
+  }
+  
+ -static void ast_crtc_helper_atomic_flush(struct drm_crtc *crtc,
+ -					 struct drm_crtc_state *old_crtc_state)
+ +static void ast_crtc_prepare(struct drm_crtc *crtc)
+  {
+ -	struct drm_device *dev = crtc->dev;
+ -	struct ast_private *ast = dev->dev_private;
+ -	struct ast_crtc_state *ast_state;
+ -	const struct drm_format_info *format;
+ -	struct ast_vbios_mode_info *vbios_mode_info;
+ -	struct drm_display_mode *adjusted_mode;
+  
+ -	ast_state = to_ast_crtc_state(crtc->state);
+ +}
+  
+ -	format = ast_state->format;
+ -	if (!format)
+ -		return;
+ +static void ast_crtc_commit(struct drm_crtc *crtc)
+ +{
+ +	struct ast_private *ast = crtc->dev->dev_private;
+ +	ast_set_index_reg_mask(ast, AST_IO_SEQ_PORT, 0x1, 0xdf, 0);
+ +	ast_crtc_load_lut(crtc);
+ +}
+  
+ -	vbios_mode_info = &ast_state->vbios_mode_info;
+  
+ -	ast_set_color_reg(ast, format);
+ -	ast_set_vbios_color_reg(ast, format, vbios_mode_info);
+ +static const struct drm_crtc_helper_funcs ast_crtc_helper_funcs = {
+ +	.dpms = ast_crtc_dpms,
+ +	.mode_set = ast_crtc_mode_set,
+ +	.mode_set_base = ast_crtc_mode_set_base,
+ +	.disable = ast_crtc_disable,
+ +	.prepare = ast_crtc_prepare,
+ +	.commit = ast_crtc_commit,
+  
+ -	if (!crtc->state->mode_changed)
+ -		return;
+ +};
+  
+ -	adjusted_mode = &crtc->state->adjusted_mode;
+ +static void ast_crtc_reset(struct drm_crtc *crtc)
+ +{
+++<<<<<<< HEAD
+  
+ -	ast_set_vbios_mode_reg(ast, adjusted_mode, vbios_mode_info);
+ -	ast_set_index_reg(ast, AST_IO_CRTC_PORT, 0xa1, 0x06);
+ -	ast_set_std_reg(ast, adjusted_mode, vbios_mode_info);
+ -	ast_set_crtc_reg(ast, adjusted_mode, vbios_mode_info);
+ -	ast_set_dclk_reg(ast, adjusted_mode, vbios_mode_info);
+ -	ast_set_crtthd_reg(ast);
+ -	ast_set_sync_reg(ast, adjusted_mode, vbios_mode_info);
+  }
+  
+ -static void
+ -ast_crtc_helper_atomic_enable(struct drm_crtc *crtc,
+ -			      struct drm_crtc_state *old_crtc_state)
+ +static int ast_crtc_gamma_set(struct drm_crtc *crtc, u16 *red, u16 *green,
+ +			      u16 *blue, uint32_t size,
+ +			      struct drm_modeset_acquire_ctx *ctx)
+  {
+ -	ast_crtc_dpms(crtc, DRM_MODE_DPMS_ON);
+ -}
+ +	ast_crtc_load_lut(crtc);
+  
+ -static void
+ -ast_crtc_helper_atomic_disable(struct drm_crtc *crtc,
+ -			       struct drm_crtc_state *old_crtc_state)
+ -{
+ -	ast_crtc_dpms(crtc, DRM_MODE_DPMS_OFF);
+ +	return 0;
+  }
+  
+ -static const struct drm_crtc_helper_funcs ast_crtc_helper_funcs = {
+ -	.atomic_check = ast_crtc_helper_atomic_check,
+ -	.atomic_begin = ast_crtc_helper_atomic_begin,
+ -	.atomic_flush = ast_crtc_helper_atomic_flush,
+ -	.atomic_enable = ast_crtc_helper_atomic_enable,
+ -	.atomic_disable = ast_crtc_helper_atomic_disable,
+ -};
+  
+ -static void ast_crtc_reset(struct drm_crtc *crtc)
+ -{
+++=======
++ 	struct ast_crtc_state *ast_state =
++ 		kzalloc(sizeof(*ast_state), GFP_KERNEL);
++ 
++ 	if (crtc->state)
++ 		crtc->funcs->atomic_destroy_state(crtc, crtc->state);
++ 
++ 	__drm_atomic_helper_crtc_reset(crtc, &ast_state->base);
++ }
++ 
+++>>>>>>> f0adbc382b8b (drm/ast: Allocate initial CRTC state of the correct size)
+  static void ast_crtc_destroy(struct drm_crtc *crtc)
+  {
+  	drm_crtc_cleanup(crtc);
+  	kfree(crtc);
+  }
+  
+ -static struct drm_crtc_state *
+ -ast_crtc_atomic_duplicate_state(struct drm_crtc *crtc)
+ -{
+ -	struct ast_crtc_state *new_ast_state, *ast_state;
+ -
+ -	if (WARN_ON(!crtc->state))
+ -		return NULL;
+ -
+ -	new_ast_state = kmalloc(sizeof(*new_ast_state), GFP_KERNEL);
+ -	if (!new_ast_state)
+ -		return NULL;
+ -	__drm_atomic_helper_crtc_duplicate_state(crtc, &new_ast_state->base);
+ -
+ -	ast_state = to_ast_crtc_state(crtc->state);
+ -
+ -	new_ast_state->format = ast_state->format;
+ -	memcpy(&new_ast_state->vbios_mode_info, &ast_state->vbios_mode_info,
+ -	       sizeof(new_ast_state->vbios_mode_info));
+ -
+ -	return &new_ast_state->base;
+ -}
+ -
+ -static void ast_crtc_atomic_destroy_state(struct drm_crtc *crtc,
+ -					  struct drm_crtc_state *state)
+ -{
+ -	struct ast_crtc_state *ast_state = to_ast_crtc_state(state);
+ -
+ -	__drm_atomic_helper_crtc_destroy_state(&ast_state->base);
+ -	kfree(ast_state);
+ -}
+ -
+  static const struct drm_crtc_funcs ast_crtc_funcs = {
+++<<<<<<< HEAD
+ +	.cursor_set = ast_cursor_set,
+ +	.cursor_move = ast_cursor_move,
+++=======
+++>>>>>>> f0adbc382b8b (drm/ast: Allocate initial CRTC state of the correct size)
+  	.reset = ast_crtc_reset,
+  	.set_config = drm_crtc_helper_set_config,
+ -	.gamma_set = drm_atomic_helper_legacy_gamma_set,
+ +	.gamma_set = ast_crtc_gamma_set,
+  	.destroy = ast_crtc_destroy,
+ -	.set_config = drm_atomic_helper_set_config,
+ -	.page_flip = drm_atomic_helper_page_flip,
+ -	.atomic_duplicate_state = ast_crtc_atomic_duplicate_state,
+ -	.atomic_destroy_state = ast_crtc_atomic_destroy_state,
+  };
+  
+  static int ast_crtc_init(struct drm_device *dev)
+* Unmerged path drivers/gpu/drm/ast/ast_mode.c
