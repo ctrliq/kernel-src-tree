@@ -1,0 +1,88 @@
+net: tls: Save iv in tls_rec for async crypto requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Watson <davejwatson@fb.com>
+commit 32eb67b93c9e3cd62cb423e30b090cdd4aa8d275
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/32eb67b9.failed
+
+aead_request_set_crypt takes an iv pointer, and we change the iv
+soon after setting it.  Some async crypto algorithms don't save the iv,
+so we need to save it in the tls_rec for async requests.
+
+Found by hardcoding x64 aesni to use async crypto manager (to test the async
+codepath), however I don't think this combination can happen in the wild.
+Presumably other hardware offloads will need this fix, but there have been
+no user reports.
+
+Fixes: a42055e8d2c30 ("Add support for async encryption of records...")
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 32eb67b93c9e3cd62cb423e30b090cdd4aa8d275)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 60c7d9afa7a8,7e963560edef..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -357,25 -432,25 +357,38 @@@ static int tls_do_encryption(struct soc
+  			     struct tls_context *tls_ctx,
+  			     struct tls_sw_context_tx *ctx,
+  			     struct aead_request *aead_req,
+ -			     size_t data_len, u32 start)
+ +			     size_t data_len)
+  {
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ -	struct scatterlist *sge = sk_msg_elem(msg_en, start);
+ +	struct scatterlist *plain_sg = rec->sg_plaintext_data;
+ +	struct scatterlist *enc_sg = rec->sg_encrypted_data;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	/* Skip the first index as it contains AAD data */
+ +	rec->sg_encrypted_data[1].offset += tls_ctx->tx.prepend_size;
+ +	rec->sg_encrypted_data[1].length -= tls_ctx->tx.prepend_size;
+++=======
++ 	memcpy(rec->iv_data, tls_ctx->tx.iv, sizeof(rec->iv_data));
++ 
++ 	sge->offset += tls_ctx->tx.prepend_size;
++ 	sge->length -= tls_ctx->tx.prepend_size;
+++>>>>>>> 32eb67b93c9e (net: tls: Save iv in tls_rec for async crypto requests)
+  
+ -	msg_en->sg.curr = start;
+ +	/* If it is inplace crypto, then pass same SG list as both src, dst */
+ +	if (rec->inplace_crypto)
+ +		plain_sg = enc_sg;
+  
+  	aead_request_set_tfm(aead_req, ctx->aead_send);
+  	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
+++<<<<<<< HEAD
+ +	aead_request_set_crypt(aead_req, plain_sg, enc_sg,
+ +			       data_len, tls_ctx->tx.iv);
+++=======
++ 	aead_request_set_crypt(aead_req, rec->sg_aead_in,
++ 			       rec->sg_aead_out,
++ 			       data_len, rec->iv_data);
+++>>>>>>> 32eb67b93c9e (net: tls: Save iv in tls_rec for async crypto requests)
+  
+  	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+  				  tls_encrypt_done, sk);
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 6da19b6e6db1..b5dc533589b5 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -116,6 +116,8 @@ struct tls_rec {
+ 	int sg_encrypted_num_elem;
+ 
+ 	char aad_space[TLS_AAD_SPACE_SIZE];
++	u8 iv_data[TLS_CIPHER_AES_GCM_128_IV_SIZE +
++		   TLS_CIPHER_AES_GCM_128_SALT_SIZE];
+ 	struct aead_request aead_req;
+ 	u8 aead_req_ctx[];
+ };
+* Unmerged path net/tls/tls_sw.c
