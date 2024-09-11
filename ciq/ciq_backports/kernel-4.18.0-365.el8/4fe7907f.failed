@@ -1,0 +1,524 @@
+drm/i915/display/adlp: Disable underrun recovery
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author José Roberto de Souza <jose.souza@intel.com>
+commit 4fe7907f3775034140a518d1582580926da98ee2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/4fe7907f.failed
+
+It was also defeatured for ADL-P and other platforms.
+
+BSpec: 55424
+	Signed-off-by: José Roberto de Souza <jose.souza@intel.com>
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20211104010858.43559-1-jose.souza@intel.com
+(cherry picked from commit 4fe7907f3775034140a518d1582580926da98ee2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display.c
+diff --cc drivers/gpu/drm/i915/display/intel_display.c
+index 19f6e7572c75,4cd268ca52fb..000000000000
+--- a/drivers/gpu/drm/i915/display/intel_display.c
++++ b/drivers/gpu/drm/i915/display/intel_display.c
+@@@ -3701,435 -900,63 +3701,454 @@@ void intel_display_prepare_reset(struc
+  		return;
+  	}
+  
+ -	dev_priv->modeset_restore_state = state;
+ -	state->acquire_ctx = ctx;
+ +	dev_priv->modeset_restore_state = state;
+ +	state->acquire_ctx = ctx;
+ +}
+ +
+ +void intel_display_finish_reset(struct drm_i915_private *dev_priv)
+ +{
+ +	struct drm_device *dev = &dev_priv->drm;
+ +	struct drm_modeset_acquire_ctx *ctx = &dev_priv->reset_ctx;
+ +	struct drm_atomic_state *state;
+ +	int ret;
+ +
+ +	if (!HAS_DISPLAY(dev_priv))
+ +		return;
+ +
+ +	/* reset doesn't touch the display */
+ +	if (!test_bit(I915_RESET_MODESET, &dev_priv->gt.reset.flags))
+ +		return;
+ +
+ +	state = fetch_and_zero(&dev_priv->modeset_restore_state);
+ +	if (!state)
+ +		goto unlock;
+ +
+ +	/* reset doesn't touch the display */
+ +	if (!gpu_reset_clobbers_display(dev_priv)) {
+ +		/* for testing only restore the display */
+ +		ret = __intel_display_resume(dev, state, ctx);
+ +		if (ret)
+ +			drm_err(&dev_priv->drm,
+ +				"Restoring old state failed with %i\n", ret);
+ +	} else {
+ +		/*
+ +		 * The display has been reset as well,
+ +		 * so need a full re-initialization.
+ +		 */
+ +		intel_pps_unlock_regs_wa(dev_priv);
+ +		intel_modeset_init_hw(dev_priv);
+ +		intel_init_clock_gating(dev_priv);
+ +		intel_hpd_init(dev_priv);
+ +
+ +		ret = __intel_display_resume(dev, state, ctx);
+ +		if (ret)
+ +			drm_err(&dev_priv->drm,
+ +				"Restoring old state failed with %i\n", ret);
+ +
+ +		intel_hpd_poll_disable(dev_priv);
+ +	}
+ +
+ +	drm_atomic_state_put(state);
+ +unlock:
+ +	drm_modeset_drop_locks(ctx);
+ +	drm_modeset_acquire_fini(ctx);
+ +	mutex_unlock(&dev->mode_config.mutex);
+ +
+ +	clear_bit_unlock(I915_RESET_MODESET, &dev_priv->gt.reset.flags);
+ +}
+ +
+++<<<<<<< HEAD
+ +static void icl_set_pipe_chicken(struct intel_crtc *crtc)
+ +{
+++=======
+++static void icl_set_pipe_chicken(const struct intel_crtc_state *crtc_state)
+++{
+++	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+++>>>>>>> 4fe7907f3775 (drm/i915/display/adlp: Disable underrun recovery)
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +	enum pipe pipe = crtc->pipe;
+ +	u32 tmp;
+ +
+ +	tmp = intel_de_read(dev_priv, PIPE_CHICKEN(pipe));
+ +
+ +	/*
+ +	 * Display WA #1153: icl
+ +	 * enable hardware to bypass the alpha math
+ +	 * and rounding for per-pixel values 00 and 0xff
+ +	 */
+ +	tmp |= PER_PIXEL_ALPHA_BYPASS_EN;
+ +	/*
+ +	 * Display WA # 1605353570: icl
+ +	 * Set the pixel rounding bit to 1 for allowing
+ +	 * passthrough of Frame buffer pixels unmodified
+ +	 * across pipe
+ +	 */
+ +	tmp |= PIXEL_ROUNDING_TRUNC_FB_PASSTHRU;
+++<<<<<<< HEAD
+++=======
+++
+++	/*
+++	 * Underrun recovery must always be disabled on display 13+.
+++	 * DG2 chicken bit meaning is inverted compared to other platforms.
+++	 */
+++	if (IS_DG2(dev_priv))
+++		tmp &= ~UNDERRUN_RECOVERY_ENABLE_DG2;
+++	else if (DISPLAY_VER(dev_priv) >= 13)
+++		tmp |= UNDERRUN_RECOVERY_DISABLE_ADLP;
+++
+++>>>>>>> 4fe7907f3775 (drm/i915/display/adlp: Disable underrun recovery)
+ +	intel_de_write(dev_priv, PIPE_CHICKEN(pipe), tmp);
+ +}
+ +
+ +bool intel_has_pending_fb_unpin(struct drm_i915_private *dev_priv)
+ +{
+ +	struct drm_crtc *crtc;
+ +	bool cleanup_done;
+ +
+ +	drm_for_each_crtc(crtc, &dev_priv->drm) {
+ +		struct drm_crtc_commit *commit;
+ +		spin_lock(&crtc->commit_lock);
+ +		commit = list_first_entry_or_null(&crtc->commit_list,
+ +						  struct drm_crtc_commit, commit_entry);
+ +		cleanup_done = commit ?
+ +			try_wait_for_completion(&commit->cleanup_done) : true;
+ +		spin_unlock(&crtc->commit_lock);
+ +
+ +		if (cleanup_done)
+ +			continue;
+ +
+ +		drm_crtc_wait_one_vblank(crtc);
+ +
+ +		return true;
+ +	}
+ +
+ +	return false;
+ +}
+ +
+ +void lpt_disable_iclkip(struct drm_i915_private *dev_priv)
+ +{
+ +	u32 temp;
+ +
+ +	intel_de_write(dev_priv, PIXCLK_GATE, PIXCLK_GATE_GATE);
+ +
+ +	mutex_lock(&dev_priv->sb_lock);
+ +
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCCTL6, SBI_ICLK);
+ +	temp |= SBI_SSCCTL_DISABLE;
+ +	intel_sbi_write(dev_priv, SBI_SSCCTL6, temp, SBI_ICLK);
+ +
+ +	mutex_unlock(&dev_priv->sb_lock);
+ +}
+ +
+ +/* Program iCLKIP clock to the desired frequency */
+ +static void lpt_program_iclkip(const struct intel_crtc_state *crtc_state)
+ +{
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +	int clock = crtc_state->hw.adjusted_mode.crtc_clock;
+ +	u32 divsel, phaseinc, auxdiv, phasedir = 0;
+ +	u32 temp;
+ +
+ +	lpt_disable_iclkip(dev_priv);
+ +
+ +	/* The iCLK virtual clock root frequency is in MHz,
+ +	 * but the adjusted_mode->crtc_clock in in KHz. To get the
+ +	 * divisors, it is necessary to divide one by another, so we
+ +	 * convert the virtual clock precision to KHz here for higher
+ +	 * precision.
+ +	 */
+ +	for (auxdiv = 0; auxdiv < 2; auxdiv++) {
+ +		u32 iclk_virtual_root_freq = 172800 * 1000;
+ +		u32 iclk_pi_range = 64;
+ +		u32 desired_divisor;
+ +
+ +		desired_divisor = DIV_ROUND_CLOSEST(iclk_virtual_root_freq,
+ +						    clock << auxdiv);
+ +		divsel = (desired_divisor / iclk_pi_range) - 2;
+ +		phaseinc = desired_divisor % iclk_pi_range;
+ +
+ +		/*
+ +		 * Near 20MHz is a corner case which is
+ +		 * out of range for the 7-bit divisor
+ +		 */
+ +		if (divsel <= 0x7f)
+ +			break;
+ +	}
+ +
+ +	/* This should not happen with any sane values */
+ +	drm_WARN_ON(&dev_priv->drm, SBI_SSCDIVINTPHASE_DIVSEL(divsel) &
+ +		    ~SBI_SSCDIVINTPHASE_DIVSEL_MASK);
+ +	drm_WARN_ON(&dev_priv->drm, SBI_SSCDIVINTPHASE_DIR(phasedir) &
+ +		    ~SBI_SSCDIVINTPHASE_INCVAL_MASK);
+ +
+ +	drm_dbg_kms(&dev_priv->drm,
+ +		    "iCLKIP clock: found settings for %dKHz refresh rate: auxdiv=%x, divsel=%x, phasedir=%x, phaseinc=%x\n",
+ +		    clock, auxdiv, divsel, phasedir, phaseinc);
+ +
+ +	mutex_lock(&dev_priv->sb_lock);
+ +
+ +	/* Program SSCDIVINTPHASE6 */
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCDIVINTPHASE6, SBI_ICLK);
+ +	temp &= ~SBI_SSCDIVINTPHASE_DIVSEL_MASK;
+ +	temp |= SBI_SSCDIVINTPHASE_DIVSEL(divsel);
+ +	temp &= ~SBI_SSCDIVINTPHASE_INCVAL_MASK;
+ +	temp |= SBI_SSCDIVINTPHASE_INCVAL(phaseinc);
+ +	temp |= SBI_SSCDIVINTPHASE_DIR(phasedir);
+ +	temp |= SBI_SSCDIVINTPHASE_PROPAGATE;
+ +	intel_sbi_write(dev_priv, SBI_SSCDIVINTPHASE6, temp, SBI_ICLK);
+ +
+ +	/* Program SSCAUXDIV */
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCAUXDIV6, SBI_ICLK);
+ +	temp &= ~SBI_SSCAUXDIV_FINALDIV2SEL(1);
+ +	temp |= SBI_SSCAUXDIV_FINALDIV2SEL(auxdiv);
+ +	intel_sbi_write(dev_priv, SBI_SSCAUXDIV6, temp, SBI_ICLK);
+ +
+ +	/* Enable modulator and associated divider */
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCCTL6, SBI_ICLK);
+ +	temp &= ~SBI_SSCCTL_DISABLE;
+ +	intel_sbi_write(dev_priv, SBI_SSCCTL6, temp, SBI_ICLK);
+ +
+ +	mutex_unlock(&dev_priv->sb_lock);
+ +
+ +	/* Wait for initialization time */
+ +	udelay(24);
+ +
+ +	intel_de_write(dev_priv, PIXCLK_GATE, PIXCLK_GATE_UNGATE);
+ +}
+ +
+ +int lpt_get_iclkip(struct drm_i915_private *dev_priv)
+ +{
+ +	u32 divsel, phaseinc, auxdiv;
+ +	u32 iclk_virtual_root_freq = 172800 * 1000;
+ +	u32 iclk_pi_range = 64;
+ +	u32 desired_divisor;
+ +	u32 temp;
+ +
+ +	if ((intel_de_read(dev_priv, PIXCLK_GATE) & PIXCLK_GATE_UNGATE) == 0)
+ +		return 0;
+ +
+ +	mutex_lock(&dev_priv->sb_lock);
+ +
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCCTL6, SBI_ICLK);
+ +	if (temp & SBI_SSCCTL_DISABLE) {
+ +		mutex_unlock(&dev_priv->sb_lock);
+ +		return 0;
+ +	}
+ +
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCDIVINTPHASE6, SBI_ICLK);
+ +	divsel = (temp & SBI_SSCDIVINTPHASE_DIVSEL_MASK) >>
+ +		SBI_SSCDIVINTPHASE_DIVSEL_SHIFT;
+ +	phaseinc = (temp & SBI_SSCDIVINTPHASE_INCVAL_MASK) >>
+ +		SBI_SSCDIVINTPHASE_INCVAL_SHIFT;
+ +
+ +	temp = intel_sbi_read(dev_priv, SBI_SSCAUXDIV6, SBI_ICLK);
+ +	auxdiv = (temp & SBI_SSCAUXDIV_FINALDIV2SEL_MASK) >>
+ +		SBI_SSCAUXDIV_FINALDIV2SEL_SHIFT;
+ +
+ +	mutex_unlock(&dev_priv->sb_lock);
+ +
+ +	desired_divisor = (divsel + 2) * iclk_pi_range + phaseinc;
+ +
+ +	return DIV_ROUND_CLOSEST(iclk_virtual_root_freq,
+ +				 desired_divisor << auxdiv);
+ +}
+ +
+ +static void ilk_pch_transcoder_set_timings(const struct intel_crtc_state *crtc_state,
+ +					   enum pipe pch_transcoder)
+ +{
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +	enum transcoder cpu_transcoder = crtc_state->cpu_transcoder;
+ +
+ +	intel_de_write(dev_priv, PCH_TRANS_HTOTAL(pch_transcoder),
+ +		       intel_de_read(dev_priv, HTOTAL(cpu_transcoder)));
+ +	intel_de_write(dev_priv, PCH_TRANS_HBLANK(pch_transcoder),
+ +		       intel_de_read(dev_priv, HBLANK(cpu_transcoder)));
+ +	intel_de_write(dev_priv, PCH_TRANS_HSYNC(pch_transcoder),
+ +		       intel_de_read(dev_priv, HSYNC(cpu_transcoder)));
+ +
+ +	intel_de_write(dev_priv, PCH_TRANS_VTOTAL(pch_transcoder),
+ +		       intel_de_read(dev_priv, VTOTAL(cpu_transcoder)));
+ +	intel_de_write(dev_priv, PCH_TRANS_VBLANK(pch_transcoder),
+ +		       intel_de_read(dev_priv, VBLANK(cpu_transcoder)));
+ +	intel_de_write(dev_priv, PCH_TRANS_VSYNC(pch_transcoder),
+ +		       intel_de_read(dev_priv, VSYNC(cpu_transcoder)));
+ +	intel_de_write(dev_priv, PCH_TRANS_VSYNCSHIFT(pch_transcoder),
+ +		       intel_de_read(dev_priv, VSYNCSHIFT(cpu_transcoder)));
+ +}
+ +
+ +static void cpt_set_fdi_bc_bifurcation(struct drm_i915_private *dev_priv, bool enable)
+ +{
+ +	u32 temp;
+ +
+ +	temp = intel_de_read(dev_priv, SOUTH_CHICKEN1);
+ +	if (!!(temp & FDI_BC_BIFURCATION_SELECT) == enable)
+ +		return;
+ +
+ +	drm_WARN_ON(&dev_priv->drm,
+ +		    intel_de_read(dev_priv, FDI_RX_CTL(PIPE_B)) &
+ +		    FDI_RX_ENABLE);
+ +	drm_WARN_ON(&dev_priv->drm,
+ +		    intel_de_read(dev_priv, FDI_RX_CTL(PIPE_C)) &
+ +		    FDI_RX_ENABLE);
+ +
+ +	temp &= ~FDI_BC_BIFURCATION_SELECT;
+ +	if (enable)
+ +		temp |= FDI_BC_BIFURCATION_SELECT;
+ +
+ +	drm_dbg_kms(&dev_priv->drm, "%sabling fdi C rx\n",
+ +		    enable ? "en" : "dis");
+ +	intel_de_write(dev_priv, SOUTH_CHICKEN1, temp);
+ +	intel_de_posting_read(dev_priv, SOUTH_CHICKEN1);
+ +}
+ +
+ +static void ivb_update_fdi_bc_bifurcation(const struct intel_crtc_state *crtc_state)
+ +{
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+ +
+ +	switch (crtc->pipe) {
+ +	case PIPE_A:
+ +		break;
+ +	case PIPE_B:
+ +		if (crtc_state->fdi_lanes > 2)
+ +			cpt_set_fdi_bc_bifurcation(dev_priv, false);
+ +		else
+ +			cpt_set_fdi_bc_bifurcation(dev_priv, true);
+ +
+ +		break;
+ +	case PIPE_C:
+ +		cpt_set_fdi_bc_bifurcation(dev_priv, true);
+ +
+ +		break;
+ +	default:
+ +		BUG();
+ +	}
+ +}
+ +
+ +/*
+ + * Finds the encoder associated with the given CRTC. This can only be
+ + * used when we know that the CRTC isn't feeding multiple encoders!
+ + */
+ +struct intel_encoder *
+ +intel_get_crtc_new_encoder(const struct intel_atomic_state *state,
+ +			   const struct intel_crtc_state *crtc_state)
+ +{
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	const struct drm_connector_state *connector_state;
+ +	const struct drm_connector *connector;
+ +	struct intel_encoder *encoder = NULL;
+ +	int num_encoders = 0;
+ +	int i;
+ +
+ +	for_each_new_connector_in_state(&state->base, connector, connector_state, i) {
+ +		if (connector_state->crtc != &crtc->base)
+ +			continue;
+ +
+ +		encoder = to_intel_encoder(connector_state->best_encoder);
+ +		num_encoders++;
+ +	}
+ +
+ +	drm_WARN(encoder->base.dev, num_encoders != 1,
+ +		 "%d encoders for pipe %c\n",
+ +		 num_encoders, pipe_name(crtc->pipe));
+ +
+ +	return encoder;
+  }
+  
+ -void intel_display_finish_reset(struct drm_i915_private *dev_priv)
+ +/*
+ + * Enable PCH resources required for PCH ports:
+ + *   - PCH PLLs
+ + *   - FDI training & RX/TX
+ + *   - update transcoder timings
+ + *   - DP transcoding bits
+ + *   - transcoder
+ + */
+ +static void ilk_pch_enable(const struct intel_atomic_state *state,
+ +			   const struct intel_crtc_state *crtc_state)
+  {
+ -	struct drm_device *dev = &dev_priv->drm;
+ -	struct drm_modeset_acquire_ctx *ctx = &dev_priv->reset_ctx;
+ -	struct drm_atomic_state *state;
+ -	int ret;
+ +	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+ +	struct drm_device *dev = crtc->base.dev;
+ +	struct drm_i915_private *dev_priv = to_i915(dev);
+ +	enum pipe pipe = crtc->pipe;
+ +	u32 temp;
+  
+ -	if (!HAS_DISPLAY(dev_priv))
+ -		return;
+ +	assert_pch_transcoder_disabled(dev_priv, pipe);
+  
+ -	/* reset doesn't touch the display */
+ -	if (!test_bit(I915_RESET_MODESET, &dev_priv->gt.reset.flags))
+ -		return;
+ +	if (IS_IVYBRIDGE(dev_priv))
+ +		ivb_update_fdi_bc_bifurcation(crtc_state);
+  
+ -	state = fetch_and_zero(&dev_priv->modeset_restore_state);
+ -	if (!state)
+ -		goto unlock;
+ +	/* Write the TU size bits before fdi link training, so that error
+ +	 * detection works. */
+ +	intel_de_write(dev_priv, FDI_RX_TUSIZE1(pipe),
+ +		       intel_de_read(dev_priv, PIPE_DATA_M1(pipe)) & TU_SIZE_MASK);
+  
+ -	/* reset doesn't touch the display */
+ -	if (!gpu_reset_clobbers_display(dev_priv)) {
+ -		/* for testing only restore the display */
+ -		ret = __intel_display_resume(dev, state, ctx);
+ -		if (ret)
+ -			drm_err(&dev_priv->drm,
+ -				"Restoring old state failed with %i\n", ret);
+ -	} else {
+ -		/*
+ -		 * The display has been reset as well,
+ -		 * so need a full re-initialization.
+ -		 */
+ -		intel_pps_unlock_regs_wa(dev_priv);
+ -		intel_modeset_init_hw(dev_priv);
+ -		intel_init_clock_gating(dev_priv);
+ -		intel_hpd_init(dev_priv);
+ +	/* For PCH output, training FDI link */
+ +	dev_priv->display.fdi_link_train(crtc, crtc_state);
+  
+ -		ret = __intel_display_resume(dev, state, ctx);
+ -		if (ret)
+ -			drm_err(&dev_priv->drm,
+ -				"Restoring old state failed with %i\n", ret);
+ +	/* We need to program the right clock selection before writing the pixel
+ +	 * mutliplier into the DPLL. */
+ +	if (HAS_PCH_CPT(dev_priv)) {
+ +		u32 sel;
+  
+ -		intel_hpd_poll_disable(dev_priv);
+ +		temp = intel_de_read(dev_priv, PCH_DPLL_SEL);
+ +		temp |= TRANS_DPLL_ENABLE(pipe);
+ +		sel = TRANS_DPLLB_SEL(pipe);
+ +		if (crtc_state->shared_dpll ==
+ +		    intel_get_shared_dpll_by_id(dev_priv, DPLL_ID_PCH_PLL_B))
+ +			temp |= sel;
+ +		else
+ +			temp &= ~sel;
+ +		intel_de_write(dev_priv, PCH_DPLL_SEL, temp);
+  	}
+  
+ -	drm_atomic_state_put(state);
+ -unlock:
+ -	drm_modeset_drop_locks(ctx);
+ -	drm_modeset_acquire_fini(ctx);
+ -	mutex_unlock(&dev->mode_config.mutex);
+ +	/* XXX: pch pll's can be enabled any time before we enable the PCH
+ +	 * transcoder, and we actually should do this to not upset any PCH
+ +	 * transcoder that already use the clock when we share it.
+ +	 *
+ +	 * Note that enable_shared_dpll tries to do the right thing, but
+ +	 * get_shared_dpll unconditionally resets the pll - we need that to have
+ +	 * the right LVDS enable sequence. */
+ +	intel_enable_shared_dpll(crtc_state);
+  
+ -	clear_bit_unlock(I915_RESET_MODESET, &dev_priv->gt.reset.flags);
+ +	/* set transcoder timing, panel must allow it */
+ +	assert_panel_unlocked(dev_priv, pipe);
+ +	ilk_pch_transcoder_set_timings(crtc_state, pipe);
+ +
+ +	intel_fdi_normal_train(crtc);
+ +
+ +	/* For PCH DP, enable TRANS_DP_CTL */
+ +	if (HAS_PCH_CPT(dev_priv) &&
+ +	    intel_crtc_has_dp_encoder(crtc_state)) {
+ +		const struct drm_display_mode *adjusted_mode =
+ +			&crtc_state->hw.adjusted_mode;
+ +		u32 bpc = (intel_de_read(dev_priv, PIPECONF(pipe)) & PIPECONF_BPC_MASK) >> 5;
+ +		i915_reg_t reg = TRANS_DP_CTL(pipe);
+ +		enum port port;
+ +
+ +		temp = intel_de_read(dev_priv, reg);
+ +		temp &= ~(TRANS_DP_PORT_SEL_MASK |
+ +			  TRANS_DP_SYNC_MASK |
+ +			  TRANS_DP_BPC_MASK);
+ +		temp |= TRANS_DP_OUTPUT_ENABLE;
+ +		temp |= bpc << 9; /* same format but at 11:9 */
+ +
+ +		if (adjusted_mode->flags & DRM_MODE_FLAG_PHSYNC)
+ +			temp |= TRANS_DP_HSYNC_ACTIVE_HIGH;
+ +		if (adjusted_mode->flags & DRM_MODE_FLAG_PVSYNC)
+ +			temp |= TRANS_DP_VSYNC_ACTIVE_HIGH;
+ +
+ +		port = intel_get_crtc_new_encoder(state, crtc_state)->port;
+ +		drm_WARN_ON(dev, port < PORT_B || port > PORT_D);
+ +		temp |= TRANS_DP_PORT_SEL(port);
+ +
+ +		intel_de_write(dev_priv, reg, temp);
+ +	}
+ +
+ +	ilk_enable_pch_transcoder(crtc_state);
+  }
+  
+ -static void icl_set_pipe_chicken(const struct intel_crtc_state *crtc_state)
+ +void lpt_pch_enable(const struct intel_crtc_state *crtc_state)
+  {
+  	struct intel_crtc *crtc = to_intel_crtc(crtc_state->uapi.crtc);
+  	struct drm_i915_private *dev_priv = to_i915(crtc->base.dev);
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.c
