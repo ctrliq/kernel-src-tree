@@ -1,0 +1,224 @@
+devlink: publish params only after driver init is done
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 7c62cfb8c5744b377e9f33806e0db87a00dc6884
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7c62cfb8.failed
+
+Currently, user can do dump or get of param values right after the
+devlink params are registered. However the driver may not be initialized
+which is an issue. The same problem happens during notification
+upon param registration. Allow driver to publish devlink params
+whenever it is ready to handle get() ops. Note that this cannot
+be resolved by init reordering, as the "driverinit" params have
+to be available before the driver is initialized (it needs the param
+values there).
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Cc: Michael Chan <michael.chan@broadcom.com>
+	Cc: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7c62cfb8c5744b377e9f33806e0db87a00dc6884)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 140dbd62106d,2955e404fd18..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -225,8 -245,29 +225,27 @@@ int bnxt_dl_register(struct bnxt *bp
+  		goto err_dl_unreg;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	rc = devlink_port_register(dl, &bp->dl_port, bp->pf.port_id);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "devlink_port_register failed");
++ 		goto err_dl_param_unreg;
++ 	}
++ 	devlink_port_type_eth_set(&bp->dl_port, bp->dev);
++ 
++ 	rc = devlink_port_params_register(&bp->dl_port, bnxt_dl_port_params,
++ 					  ARRAY_SIZE(bnxt_dl_port_params));
++ 	if (rc) {
++ 		netdev_err(bp->dev, "devlink_port_params_register failed");
++ 		goto err_dl_port_unreg;
++ 	}
++ 
++ 	devlink_params_publish(dl);
++ 
+++>>>>>>> 7c62cfb8c574 (devlink: publish params only after driver init is done)
+  	return 0;
+  
+ -err_dl_port_unreg:
+ -	devlink_port_unregister(&bp->dl_port);
+ -err_dl_param_unreg:
+ -	devlink_params_unregister(dl, bnxt_dl_params,
+ -				  ARRAY_SIZE(bnxt_dl_params));
+  err_dl_unreg:
+  	devlink_unregister(dl);
+  err_dl_free:
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/main.c b/drivers/net/ethernet/mellanox/mlx4/main.c
+index bdb8dd161923..1f6e16d5ea6b 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -3981,6 +3981,7 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (ret)
+ 		goto err_params_unregister;
+ 
++	devlink_params_publish(devlink);
+ 	pci_save_state(pdev);
+ 	return 0;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/core.c b/drivers/net/ethernet/mellanox/mlxsw/core.c
+index 4f6fa515394e..b505d3858235 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@ -1062,6 +1062,9 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 			goto err_driver_init;
+ 	}
+ 
++	if (mlxsw_driver->params_register && !reload)
++		devlink_params_publish(devlink);
++
+ 	return 0;
+ 
+ err_driver_init:
+@@ -1131,6 +1134,8 @@ void mlxsw_core_bus_device_unregister(struct mlxsw_core *mlxsw_core,
+ 			return;
+ 	}
+ 
++	if (mlxsw_core->driver->params_unregister && !reload)
++		devlink_params_unpublish(devlink);
+ 	if (mlxsw_core->driver->fini)
+ 		mlxsw_core->driver->fini(mlxsw_core);
+ 	mlxsw_thermal_fini(mlxsw_core->thermal);
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 897208d8a17d..9542cb2dfcf1 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -357,6 +357,7 @@ struct devlink_param_item {
+ 	const struct devlink_param *param;
+ 	union devlink_param_value driverinit_value;
+ 	bool driverinit_value_valid;
++	bool published;
+ };
+ 
+ enum devlink_param_generic_id {
+@@ -574,6 +575,8 @@ int devlink_params_register(struct devlink *devlink,
+ void devlink_params_unregister(struct devlink *devlink,
+ 			       const struct devlink_param *params,
+ 			       size_t params_count);
++void devlink_params_publish(struct devlink *devlink);
++void devlink_params_unpublish(struct devlink *devlink);
+ int devlink_port_params_register(struct devlink_port *devlink_port,
+ 				 const struct devlink_param *params,
+ 				 size_t params_count);
+@@ -667,6 +670,14 @@ static inline void devlink_unregister(struct devlink *devlink)
+ {
+ }
+ 
++static inline void devlink_params_publish(struct devlink *devlink)
++{
++}
++
++static inline void devlink_params_unpublish(struct devlink *devlink)
++{
++}
++
+ static inline void devlink_free(struct devlink *devlink)
+ {
+ 	kfree(devlink);
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index dff98721dbf9..0253f0bd569e 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -2855,6 +2855,7 @@ static int devlink_nl_param_fill(struct sk_buff *msg, struct devlink *devlink,
+ 				 u32 portid, u32 seq, int flags)
+ {
+ 	union devlink_param_value param_value[DEVLINK_PARAM_CMODE_MAX + 1];
++	bool param_value_set[DEVLINK_PARAM_CMODE_MAX + 1] = {};
+ 	const struct devlink_param *param = param_item->param;
+ 	struct devlink_param_gset_ctx ctx;
+ 	struct nlattr *param_values_list;
+@@ -2873,12 +2874,15 @@ static int devlink_nl_param_fill(struct sk_buff *msg, struct devlink *devlink,
+ 				return -EOPNOTSUPP;
+ 			param_value[i] = param_item->driverinit_value;
+ 		} else {
++			if (!param_item->published)
++				continue;
+ 			ctx.cmode = i;
+ 			err = devlink_param_get(devlink, param, &ctx);
+ 			if (err)
+ 				return err;
+ 			param_value[i] = ctx.val;
+ 		}
++		param_value_set[i] = true;
+ 	}
+ 
+ 	hdr = genlmsg_put(msg, portid, seq, &devlink_nl_family, flags, cmd);
+@@ -2913,7 +2917,7 @@ static int devlink_nl_param_fill(struct sk_buff *msg, struct devlink *devlink,
+ 		goto param_nest_cancel;
+ 
+ 	for (i = 0; i <= DEVLINK_PARAM_CMODE_MAX; i++) {
+-		if (!devlink_param_cmode_is_supported(param, i))
++		if (!param_value_set[i])
+ 			continue;
+ 		err = devlink_nl_param_value_fill_one(msg, param->type,
+ 						      i, param_value[i]);
+@@ -5379,6 +5383,48 @@ void devlink_params_unregister(struct devlink *devlink,
+ }
+ EXPORT_SYMBOL_GPL(devlink_params_unregister);
+ 
++/**
++ *	devlink_params_publish - publish configuration parameters
++ *
++ *	@devlink: devlink
++ *
++ *	Publish previously registered configuration parameters.
++ */
++void devlink_params_publish(struct devlink *devlink)
++{
++	struct devlink_param_item *param_item;
++
++	list_for_each_entry(param_item, &devlink->param_list, list) {
++		if (param_item->published)
++			continue;
++		param_item->published = true;
++		devlink_param_notify(devlink, 0, param_item,
++				     DEVLINK_CMD_PARAM_NEW);
++	}
++}
++EXPORT_SYMBOL_GPL(devlink_params_publish);
++
++/**
++ *	devlink_params_unpublish - unpublish configuration parameters
++ *
++ *	@devlink: devlink
++ *
++ *	Unpublish previously registered configuration parameters.
++ */
++void devlink_params_unpublish(struct devlink *devlink)
++{
++	struct devlink_param_item *param_item;
++
++	list_for_each_entry(param_item, &devlink->param_list, list) {
++		if (!param_item->published)
++			continue;
++		param_item->published = false;
++		devlink_param_notify(devlink, 0, param_item,
++				     DEVLINK_CMD_PARAM_DEL);
++	}
++}
++EXPORT_SYMBOL_GPL(devlink_params_unpublish);
++
+ /**
+  *	devlink_port_params_register - register port configuration parameters
+  *
