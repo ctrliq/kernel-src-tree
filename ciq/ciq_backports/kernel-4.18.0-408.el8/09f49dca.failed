@@ -1,0 +1,225 @@
+mm: handle uninitialized numa nodes gracefully
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Michal Hocko <mhocko@suse.com>
+commit 09f49dca570a917a8c6bccd7e8c61f5141534e3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/09f49dca.failed
+
+We have had several reports [1][2][3] that page allocator blows up when an
+allocation from a possible node is requested.  The underlying reason is
+that NODE_DATA for the specific node is not allocated.
+
+NUMA specific initialization is arch specific and it can vary a lot.  E.g.
+x86 tries to initialize all nodes that have some cpu affinity (see
+init_cpu_to_node) but this can be insufficient because the node might be
+cpuless for example.
+
+One way to address this problem would be to check for !node_online nodes
+when trying to get a zonelist and silently fall back to another node.
+That is unfortunately adding a branch into allocator hot path and it
+doesn't handle any other potential NODE_DATA users.
+
+This patch takes a different approach (following a lead of [3]) and it pre
+allocates pgdat for all possible nodes in an arch indipendent code -
+free_area_init.  All uninitialized nodes are treated as memoryless nodes.
+node_state of the node is not changed because that would lead to other
+side effects - e.g.  sysfs representation of such a node and from past
+discussions [4] it is known that some tools might have problems digesting
+that.
+
+Newly allocated pgdat only gets a minimal initialization and the rest of
+the work is expected to be done by the memory hotplug - hotadd_new_pgdat
+(renamed to hotadd_init_pgdat).
+
+generic_alloc_nodedata is changed to use the memblock allocator because
+neither page nor slab allocators are available at the stage when all
+pgdats are allocated.  Hotplug doesn't allocate pgdat anymore so we can
+use the early boot allocator.  The only arch specific implementation is
+ia64 and that is changed to use the early allocator as well.
+
+[1] http://lkml.kernel.org/r/20211101201312.11589-1-amakhalov@vmware.com
+[2] http://lkml.kernel.org/r/20211207224013.880775-1-npache@redhat.com
+[3] http://lkml.kernel.org/r/20190114082416.30939-1-mhocko@kernel.org
+[4] http://lkml.kernel.org/r/20200428093836.27190-1-srikar@linux.vnet.ibm.com
+
+[akpm@linux-foundation.org: replace comment, per Mike]
+
+Link: https://lkml.kernel.org/r/Yfe7RBeLCijnWBON@dhcp22.suse.cz
+	Reported-by: Alexey Makhalov <amakhalov@vmware.com>
+	Tested-by: Alexey Makhalov <amakhalov@vmware.com>
+	Reported-by: Nico Pache <npache@redhat.com>
+	Acked-by: Rafael Aquini <raquini@redhat.com>
+	Tested-by: Rafael Aquini <raquini@redhat.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Acked-by: Mike Rapoport <rppt@linux.ibm.com>
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Dennis Zhou <dennis@kernel.org>
+	Cc: Eric Dumazet <eric.dumazet@gmail.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Wei Yang <richard.weiyang@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 09f49dca570a917a8c6bccd7e8c61f5141534e3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/mm/discontig.c
+#	mm/internal.h
+#	mm/memory_hotplug.c
+#	mm/page_alloc.c
+diff --cc arch/ia64/mm/discontig.c
+index a69c83049d5d,dd0cf4834eaa..000000000000
+--- a/arch/ia64/mm/discontig.c
++++ b/arch/ia64/mm/discontig.c
+@@@ -735,8 -608,7 +735,12 @@@ void __init paging_init(void
+  	zero_page_memmap_ptr = virt_to_page(ia64_imva(empty_zero_page));
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MEMORY_HOTPLUG
+ +pg_data_t *arch_alloc_nodedata(int nid)
+++=======
++ pg_data_t * __init arch_alloc_nodedata(int nid)
+++>>>>>>> 09f49dca570a (mm: handle uninitialized numa nodes gracefully)
+  {
+  	unsigned long size = compute_pernodesize(nid);
+  
+diff --cc mm/internal.h
+index f7917edb5636,f1554a4e249e..000000000000
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@@ -648,4 -687,26 +648,29 @@@ struct migration_target_control 
+  	gfp_t gfp_mask;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * mm/vmalloc.c
++  */
++ #ifdef CONFIG_MMU
++ int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
++                 pgprot_t prot, struct page **pages, unsigned int page_shift);
++ #else
++ static inline
++ int vmap_pages_range_noflush(unsigned long addr, unsigned long end,
++                 pgprot_t prot, struct page **pages, unsigned int page_shift)
++ {
++ 	return -EINVAL;
++ }
++ #endif
++ 
++ void vunmap_range_noflush(unsigned long start, unsigned long end);
++ 
++ int numa_migrate_prep(struct page *page, struct vm_area_struct *vma,
++ 		      unsigned long addr, int page_nid, int *flags);
++ 
++ DECLARE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
++ 
+++>>>>>>> 09f49dca570a (mm: handle uninitialized numa nodes gracefully)
+  #endif	/* __MM_INTERNAL_H */
+diff --cc mm/memory_hotplug.c
+index 27b7636cc032,11f39d0e76ec..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -1159,10 -1445,9 +1159,16 @@@ int __ref add_memory_resource(int nid, 
+  
+  	return ret;
+  error:
+++<<<<<<< HEAD
+ +	/* rollback pgdat allocation and others */
+ +	if (new_node)
+ +		rollback_node_hotadd(nid);
+ +	memblock_remove(start, size);
+++=======
++ 	if (IS_ENABLED(CONFIG_ARCH_KEEP_MEMBLOCK))
++ 		memblock_remove(start, size);
++ error_mem_hotplug_end:
+++>>>>>>> 09f49dca570a (mm: handle uninitialized numa nodes gracefully)
+  	mem_hotplug_done();
+  	return ret;
+  }
+diff --cc mm/page_alloc.c
+index 4fb2330e1382,4f141a4e5b64..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -5937,8 -6339,9 +5937,14 @@@ static void pageset_init(struct per_cpu
+  /* These effectively disable the pcplists in the boot pageset completely */
+  #define BOOT_PAGESET_HIGH	0
+  #define BOOT_PAGESET_BATCH	1
+++<<<<<<< HEAD
+ +static DEFINE_PER_CPU(struct per_cpu_pageset, boot_pageset);
+ +static DEFINE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
+++=======
++ static DEFINE_PER_CPU(struct per_cpu_pages, boot_pageset);
++ static DEFINE_PER_CPU(struct per_cpu_zonestat, boot_zonestats);
++ DEFINE_PER_CPU(struct per_cpu_nodestat, boot_nodestats);
+++>>>>>>> 09f49dca570a (mm: handle uninitialized numa nodes gracefully)
+  
+  static void __build_all_zonelists(void *data)
+  {
+@@@ -7560,9 -8067,36 +7570,42 @@@ void __init free_area_init(unsigned lon
+  	/* Initialise every node */
+  	mminit_verify_pageflags_layout();
+  	setup_nr_node_ids();
+++<<<<<<< HEAD
+ +	init_unavailable_mem();
+ +	for_each_online_node(nid) {
+ +		pg_data_t *pgdat = NODE_DATA(nid);
+++=======
++ 	for_each_node(nid) {
++ 		pg_data_t *pgdat;
++ 
++ 		if (!node_online(nid)) {
++ 			pr_info("Initializing node %d as memoryless\n", nid);
++ 
++ 			/* Allocator not initialized yet */
++ 			pgdat = arch_alloc_nodedata(nid);
++ 			if (!pgdat) {
++ 				pr_err("Cannot allocate %zuB for node %d.\n",
++ 						sizeof(*pgdat), nid);
++ 				continue;
++ 			}
++ 			arch_refresh_nodedata(nid, pgdat);
++ 			free_area_init_memoryless_node(nid);
++ 
++ 			/*
++ 			 * We do not want to confuse userspace by sysfs
++ 			 * files/directories for node without any memory
++ 			 * attached to it, so this node is not marked as
++ 			 * N_MEMORY and not marked online so that no sysfs
++ 			 * hierarchy will be created via register_one_node for
++ 			 * it. The pgdat will get fully initialized by
++ 			 * hotadd_init_pgdat() when memory is hotplugged into
++ 			 * this node.
++ 			 */
++ 			continue;
++ 		}
++ 
++ 		pgdat = NODE_DATA(nid);
+++>>>>>>> 09f49dca570a (mm: handle uninitialized numa nodes gracefully)
+  		free_area_init_node(nid);
+  
+  		/* Any memory on that node */
+* Unmerged path arch/ia64/mm/discontig.c
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index d16c9fe0f6df..e97547341426 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -172,7 +172,7 @@ extern void arch_refresh_nodedata(int nid, pg_data_t *pgdat);
+  */
+ #define generic_alloc_nodedata(nid)				\
+ ({								\
+-	kzalloc(sizeof(pg_data_t), GFP_KERNEL);			\
++	memblock_alloc(sizeof(*pgdat), SMP_CACHE_BYTES);	\
+ })
+ /*
+  * This definition is just for error path in node hotadd.
+* Unmerged path mm/internal.h
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/page_alloc.c
