@@ -1,0 +1,160 @@
+s390/setup: fix early warning messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Martin Schwidefsky <schwidefsky@de.ibm.com>
+commit 8727638426b0aea59d7f904ad8ddf483f9234f88
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/87276384.failed
+
+The setup_lowcore() function creates a new prefix page for the boot CPU.
+The PSW mask for the system_call, external interrupt, i/o interrupt and
+the program check handler have the DAT bit set in this new prefix page.
+
+At the time setup_lowcore is called the system still runs without virtual
+address translation, the paging_init() function creates the kernel page
+table and loads the CR13 with the kernel ASCE.
+
+Any code between setup_lowcore() and the end of paging_init() that has
+a BUG or WARN statement will create a program check that can not be
+handled correctly as there is no kernel page table yet.
+
+To allow early WARN statements initially setup the lowcore with DAT off
+and set the DAT bit only after paging_init() has completed.
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Martin Schwidefsky <schwidefsky@de.ibm.com>
+(cherry picked from commit 8727638426b0aea59d7f904ad8ddf483f9234f88)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kernel/setup.c
+diff --cc arch/s390/kernel/setup.c
+index d82a9ec64ea9,e89659f46401..000000000000
+--- a/arch/s390/kernel/setup.c
++++ b/arch/s390/kernel/setup.c
+@@@ -303,7 -297,79 +303,83 @@@ early_param("vmalloc", parse_vmalloc)
+  
+  void *restart_stack __section(.data);
+  
+++<<<<<<< HEAD
+ +static void __init setup_lowcore(void)
+++=======
++ unsigned long stack_alloc(void)
++ {
++ #ifdef CONFIG_VMAP_STACK
++ 	return (unsigned long)
++ 		__vmalloc_node_range(THREAD_SIZE, THREAD_SIZE,
++ 				     VMALLOC_START, VMALLOC_END,
++ 				     THREADINFO_GFP,
++ 				     PAGE_KERNEL, 0, NUMA_NO_NODE,
++ 				     __builtin_return_address(0));
++ #else
++ 	return __get_free_pages(GFP_KERNEL, THREAD_SIZE_ORDER);
++ #endif
++ }
++ 
++ void stack_free(unsigned long stack)
++ {
++ #ifdef CONFIG_VMAP_STACK
++ 	vfree((void *) stack);
++ #else
++ 	free_pages(stack, THREAD_SIZE_ORDER);
++ #endif
++ }
++ 
++ int __init arch_early_irq_init(void)
++ {
++ 	unsigned long stack;
++ 
++ 	stack = __get_free_pages(GFP_KERNEL, THREAD_SIZE_ORDER);
++ 	if (!stack)
++ 		panic("Couldn't allocate async stack");
++ 	S390_lowcore.async_stack = stack + STACK_INIT_OFFSET;
++ 	return 0;
++ }
++ 
++ static int __init async_stack_realloc(void)
++ {
++ 	unsigned long old, new;
++ 
++ 	old = S390_lowcore.async_stack - STACK_INIT_OFFSET;
++ 	new = stack_alloc();
++ 	if (!new)
++ 		panic("Couldn't allocate async stack");
++ 	S390_lowcore.async_stack = new + STACK_INIT_OFFSET;
++ 	free_pages(old, THREAD_SIZE_ORDER);
++ 	return 0;
++ }
++ early_initcall(async_stack_realloc);
++ 
++ void __init arch_call_rest_init(void)
++ {
++ 	struct stack_frame *frame;
++ 	unsigned long stack;
++ 
++ 	stack = stack_alloc();
++ 	if (!stack)
++ 		panic("Couldn't allocate kernel stack");
++ 	current->stack = (void *) stack;
++ #ifdef CONFIG_VMAP_STACK
++ 	current->stack_vm_area = (void *) stack;
++ #endif
++ 	set_task_stack_end_magic(current);
++ 	stack += STACK_INIT_OFFSET;
++ 	S390_lowcore.kernel_stack = stack;
++ 	frame = (struct stack_frame *) stack;
++ 	memset(frame, 0, sizeof(*frame));
++ 	/* Branch to rest_init on the new stack, never returns */
++ 	asm volatile(
++ 		"	la	15,0(%[_frame])\n"
++ 		"	jg	rest_init\n"
++ 		: : [_frame] "a" (frame));
++ }
++ 
++ static void __init setup_lowcore_dat_off(void)
+++>>>>>>> 8727638426b0 (s390/setup: fix early warning messages)
+  {
+  	struct lowcore *lc;
+  
+@@@ -311,32 -377,23 +387,29 @@@
+  	 * Setup lowcore for boot cpu
+  	 */
+  	BUILD_BUG_ON(sizeof(struct lowcore) != LC_PAGES * PAGE_SIZE);
+ -	lc = memblock_alloc_low(sizeof(*lc), sizeof(*lc));
+ +	lc = memblock_virt_alloc_low(sizeof(*lc), sizeof(*lc));
+  	lc->restart_psw.mask = PSW_KERNEL_BITS;
+  	lc->restart_psw.addr = (unsigned long) restart_int_handler;
+- 	lc->external_new_psw.mask = PSW_KERNEL_BITS |
+- 		PSW_MASK_DAT | PSW_MASK_MCHECK;
++ 	lc->external_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
+  	lc->external_new_psw.addr = (unsigned long) ext_int_handler;
+  	lc->svc_new_psw.mask = PSW_KERNEL_BITS |
+- 		PSW_MASK_DAT | PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
++ 		PSW_MASK_IO | PSW_MASK_EXT | PSW_MASK_MCHECK;
+  	lc->svc_new_psw.addr = (unsigned long) system_call;
+- 	lc->program_new_psw.mask = PSW_KERNEL_BITS |
+- 		PSW_MASK_DAT | PSW_MASK_MCHECK;
++ 	lc->program_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
+  	lc->program_new_psw.addr = (unsigned long) pgm_check_handler;
+  	lc->mcck_new_psw.mask = PSW_KERNEL_BITS;
+  	lc->mcck_new_psw.addr = (unsigned long) mcck_int_handler;
+- 	lc->io_new_psw.mask = PSW_KERNEL_BITS |
+- 		PSW_MASK_DAT | PSW_MASK_MCHECK;
++ 	lc->io_new_psw.mask = PSW_KERNEL_BITS | PSW_MASK_MCHECK;
+  	lc->io_new_psw.addr = (unsigned long) io_int_handler;
+  	lc->clock_comparator = clock_comparator_max;
+ -	lc->nodat_stack = ((unsigned long) &init_thread_union)
+ +	lc->kernel_stack = ((unsigned long) &init_thread_union)
+  		+ THREAD_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+ +	lc->async_stack = (unsigned long)
+ +		memblock_virt_alloc(ASYNC_SIZE, ASYNC_SIZE)
+ +		+ ASYNC_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+ +	lc->panic_stack = (unsigned long)
+ +		memblock_virt_alloc(PAGE_SIZE, PAGE_SIZE)
+ +		+ PAGE_SIZE - STACK_FRAME_OVERHEAD - sizeof(struct pt_regs);
+  	lc->current_task = (unsigned long)&init_task;
+  	lc->lpp = LPP_MAGIC;
+  	lc->machine_flags = S390_lowcore.machine_flags;
+* Unmerged path arch/s390/kernel/setup.c
