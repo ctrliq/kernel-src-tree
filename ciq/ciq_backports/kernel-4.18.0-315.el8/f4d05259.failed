@@ -1,0 +1,437 @@
+bpf: Add map_meta_equal map ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit f4d05259213ff1e91f767c91dcab455f68308fac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/f4d05259.failed
+
+Some properties of the inner map is used in the verification time.
+When an inner map is inserted to an outer map at runtime,
+bpf_map_meta_equal() is currently used to ensure those properties
+of the inserting inner map stays the same as the verification
+time.
+
+In particular, the current bpf_map_meta_equal() checks max_entries which
+turns out to be too restrictive for most of the maps which do not use
+max_entries during the verification time.  It limits the use case that
+wants to replace a smaller inner map with a larger inner map.  There are
+some maps do use max_entries during verification though.  For example,
+the map_gen_lookup in array_map_ops uses the max_entries to generate
+the inline lookup code.
+
+To accommodate differences between maps, the map_meta_equal is added
+to bpf_map_ops.  Each map-type can decide what to check when its
+map is used as an inner map during runtime.
+
+Also, some map types cannot be used as an inner map and they are
+currently black listed in bpf_map_meta_alloc() in map_in_map.c.
+It is not unusual that the new map types may not aware that such
+blacklist exists.  This patch enforces an explicit opt-in
+and only allows a map to be used as an inner map if it has
+implemented the map_meta_equal ops.  It is based on the
+discussion in [1].
+
+All maps that support inner map has its map_meta_equal points
+to bpf_map_meta_equal in this patch.  A later patch will
+relax the max_entries check for most maps.  bpf_types.h
+counts 28 map types.  This patch adds 23 ".map_meta_equal"
+by using coccinelle.  -5 for
+	BPF_MAP_TYPE_PROG_ARRAY
+	BPF_MAP_TYPE_(PERCPU)_CGROUP_STORAGE
+	BPF_MAP_TYPE_STRUCT_OPS
+	BPF_MAP_TYPE_ARRAY_OF_MAPS
+	BPF_MAP_TYPE_HASH_OF_MAPS
+
+The "if (inner_map->inner_map_meta)" check in bpf_map_meta_alloc()
+is moved such that the same error is returned.
+
+[1]: https://lore.kernel.org/bpf/20200522022342.899756-1-kafai@fb.com/
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200828011806.1970400-1-kafai@fb.com
+(cherry picked from commit f4d05259213ff1e91f767c91dcab455f68308fac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/bpf_inode_storage.c
+#	net/core/bpf_sk_storage.c
+diff --cc include/linux/bpf.h
+index 3f26f919575f,dbba82a80087..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -108,6 -106,25 +108,28 @@@ struct bpf_map_ops 
+  	__poll_t (*map_poll)(struct bpf_map *map, struct file *filp,
+  			     struct poll_table_struct *pts);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Functions called by bpf_local_storage maps */
++ 	int (*map_local_storage_charge)(struct bpf_local_storage_map *smap,
++ 					void *owner, u32 size);
++ 	void (*map_local_storage_uncharge)(struct bpf_local_storage_map *smap,
++ 					   void *owner, u32 size);
++ 	struct bpf_local_storage __rcu ** (*map_owner_storage_ptr)(void *owner);
++ 
++ 	/* map_meta_equal must be implemented for maps that can be
++ 	 * used as an inner map.  It is a runtime check to ensure
++ 	 * an inner map can be inserted to an outer map.
++ 	 *
++ 	 * Some properties of the inner map has been used during the
++ 	 * verification time.  When inserting an inner map at the runtime,
++ 	 * map_meta_equal has to ensure the inserting map has the same
++ 	 * properties that the verifier has used earlier.
++ 	 */
++ 	bool (*map_meta_equal)(const struct bpf_map *meta0,
++ 			       const struct bpf_map *meta1);
++ 
+++>>>>>>> f4d05259213f (bpf: Add map_meta_equal map ops)
+  	/* BTF name and id of struct allocated by map_alloc */
+  	const char * const map_btf_name;
+  	int *map_btf_id;
+diff --cc net/core/bpf_sk_storage.c
+index 7e46b3f88630,a0d1a3265b71..000000000000
+--- a/net/core/bpf_sk_storage.c
++++ b/net/core/bpf_sk_storage.c
+@@@ -921,11 -311,34 +921,18 @@@ BPF_CALL_2(bpf_sk_storage_delete, struc
+  	return -ENOENT;
+  }
+  
+ -static int sk_storage_charge(struct bpf_local_storage_map *smap,
+ -			     void *owner, u32 size)
+ -{
+ -	return omem_charge(owner, size);
+ -}
+ -
+ -static void sk_storage_uncharge(struct bpf_local_storage_map *smap,
+ -				void *owner, u32 size)
+ -{
+ -	struct sock *sk = owner;
+ -
+ -	atomic_sub(size, &sk->sk_omem_alloc);
+ -}
+ -
+ -static struct bpf_local_storage __rcu **
+ -sk_storage_ptr(void *owner)
+ -{
+ -	struct sock *sk = owner;
+ -
+ -	return &sk->sk_bpf_storage;
+ -}
+ -
+  static int sk_storage_map_btf_id;
+  const struct bpf_map_ops sk_storage_map_ops = {
+++<<<<<<< HEAD
+ +	.map_alloc_check = bpf_sk_storage_map_alloc_check,
+ +	.map_alloc = bpf_sk_storage_map_alloc,
+ +	.map_free = bpf_sk_storage_map_free,
+++=======
++ 	.map_meta_equal = bpf_map_meta_equal,
++ 	.map_alloc_check = bpf_local_storage_map_alloc_check,
++ 	.map_alloc = sk_storage_map_alloc,
++ 	.map_free = sk_storage_map_free,
+++>>>>>>> f4d05259213f (bpf: Add map_meta_equal map ops)
+  	.map_get_next_key = notsupp_get_next_key,
+  	.map_lookup_elem = bpf_fd_sk_storage_lookup_elem,
+  	.map_update_elem = bpf_fd_sk_storage_update_elem,
+* Unmerged path kernel/bpf/bpf_inode_storage.c
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index e44c2b8877d8..c6aaa8c7d689 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -633,6 +633,7 @@ static const struct bpf_iter_seq_info iter_seq_info = {
+ 
+ static int array_map_btf_id;
+ const struct bpf_map_ops array_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+ 	.map_free = array_map_free,
+@@ -655,6 +656,7 @@ const struct bpf_map_ops array_map_ops = {
+ 
+ static int percpu_array_map_btf_id;
+ const struct bpf_map_ops percpu_array_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+ 	.map_free = array_map_free,
+@@ -1011,6 +1013,11 @@ static void prog_array_map_free(struct bpf_map *map)
+ 	fd_array_map_free(map);
+ }
+ 
++/* prog_array->aux->{type,jited} is a runtime binding.
++ * Doing static check alone in the verifier is not enough.
++ * Thus, prog_array_map cannot be used as an inner_map
++ * and map_meta_equal is not implemented.
++ */
+ static int prog_array_map_btf_id;
+ const struct bpf_map_ops prog_array_map_ops = {
+ 	.map_alloc_check = fd_array_map_alloc_check,
+@@ -1109,6 +1116,7 @@ static void perf_event_fd_array_release(struct bpf_map *map,
+ 
+ static int perf_event_array_map_btf_id;
+ const struct bpf_map_ops perf_event_array_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = fd_array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+ 	.map_free = fd_array_map_free,
+@@ -1145,6 +1153,7 @@ static void cgroup_fd_array_free(struct bpf_map *map)
+ 
+ static int cgroup_array_map_btf_id;
+ const struct bpf_map_ops cgroup_array_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = fd_array_map_alloc_check,
+ 	.map_alloc = array_map_alloc,
+ 	.map_free = cgroup_fd_array_free,
+* Unmerged path kernel/bpf/bpf_inode_storage.c
+diff --git a/kernel/bpf/cpumap.c b/kernel/bpf/cpumap.c
+index 989aebbd6410..7df53efbba06 100644
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@ -658,6 +658,7 @@ static int cpu_map_get_next_key(struct bpf_map *map, void *key, void *next_key)
+ 
+ static int cpu_map_btf_id;
+ const struct bpf_map_ops cpu_map_ops = {
++	.map_meta_equal		= bpf_map_meta_equal,
+ 	.map_alloc		= cpu_map_alloc,
+ 	.map_free		= cpu_map_free,
+ 	.map_delete_elem	= cpu_map_delete_elem,
+diff --git a/kernel/bpf/devmap.c b/kernel/bpf/devmap.c
+index 59e839fca68e..ec7a07948789 100644
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -759,6 +759,7 @@ static int dev_map_hash_update_elem(struct bpf_map *map, void *key, void *value,
+ 
+ static int dev_map_btf_id;
+ const struct bpf_map_ops dev_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = dev_map_alloc,
+ 	.map_free = dev_map_free,
+ 	.map_get_next_key = dev_map_get_next_key,
+@@ -772,6 +773,7 @@ const struct bpf_map_ops dev_map_ops = {
+ 
+ static int dev_map_hash_map_btf_id;
+ const struct bpf_map_ops dev_map_hash_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = dev_map_alloc,
+ 	.map_free = dev_map_free,
+ 	.map_get_next_key = dev_map_hash_get_next_key,
+diff --git a/kernel/bpf/hashtab.c b/kernel/bpf/hashtab.c
+index 2ce243cadee6..5fe417de52af 100644
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@ -1811,6 +1811,7 @@ static const struct bpf_iter_seq_info iter_seq_info = {
+ 
+ static int htab_map_btf_id;
+ const struct bpf_map_ops htab_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = htab_map_alloc_check,
+ 	.map_alloc = htab_map_alloc,
+ 	.map_free = htab_map_free,
+@@ -1828,6 +1829,7 @@ const struct bpf_map_ops htab_map_ops = {
+ 
+ static int htab_lru_map_btf_id;
+ const struct bpf_map_ops htab_lru_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = htab_map_alloc_check,
+ 	.map_alloc = htab_map_alloc,
+ 	.map_free = htab_map_free,
+@@ -1948,6 +1950,7 @@ static void htab_percpu_map_seq_show_elem(struct bpf_map *map, void *key,
+ 
+ static int htab_percpu_map_btf_id;
+ const struct bpf_map_ops htab_percpu_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = htab_map_alloc_check,
+ 	.map_alloc = htab_map_alloc,
+ 	.map_free = htab_map_free,
+@@ -1964,6 +1967,7 @@ const struct bpf_map_ops htab_percpu_map_ops = {
+ 
+ static int htab_lru_percpu_map_btf_id;
+ const struct bpf_map_ops htab_lru_percpu_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = htab_map_alloc_check,
+ 	.map_alloc = htab_map_alloc,
+ 	.map_free = htab_map_free,
+diff --git a/kernel/bpf/lpm_trie.c b/kernel/bpf/lpm_trie.c
+index b52f71421c59..49ebc3e41dbb 100644
+--- a/kernel/bpf/lpm_trie.c
++++ b/kernel/bpf/lpm_trie.c
+@@ -735,6 +735,7 @@ static int trie_check_btf(const struct bpf_map *map,
+ 
+ static int trie_map_btf_id;
+ const struct bpf_map_ops trie_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = trie_alloc,
+ 	.map_free = trie_free,
+ 	.map_get_next_key = trie_get_next_key,
+diff --git a/kernel/bpf/map_in_map.c b/kernel/bpf/map_in_map.c
+index 759755f96f10..4fba8e1d43b6 100644
+--- a/kernel/bpf/map_in_map.c
++++ b/kernel/bpf/map_in_map.c
+@@ -20,23 +20,17 @@ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd)
+ 	if (IS_ERR(inner_map))
+ 		return inner_map;
+ 
+-	/* prog_array->aux->{type,jited} is a runtime binding.
+-	 * Doing static check alone in the verifier is not enough.
+-	 */
+-	if (inner_map->map_type == BPF_MAP_TYPE_PROG_ARRAY ||
+-	    inner_map->map_type == BPF_MAP_TYPE_CGROUP_STORAGE ||
+-	    inner_map->map_type == BPF_MAP_TYPE_PERCPU_CGROUP_STORAGE ||
+-	    inner_map->map_type == BPF_MAP_TYPE_STRUCT_OPS) {
+-		fdput(f);
+-		return ERR_PTR(-ENOTSUPP);
+-	}
+-
+ 	/* Does not support >1 level map-in-map */
+ 	if (inner_map->inner_map_meta) {
+ 		fdput(f);
+ 		return ERR_PTR(-EINVAL);
+ 	}
+ 
++	if (!inner_map->ops->map_meta_equal) {
++		fdput(f);
++		return ERR_PTR(-ENOTSUPP);
++	}
++
+ 	if (map_value_has_spin_lock(inner_map)) {
+ 		fdput(f);
+ 		return ERR_PTR(-ENOTSUPP);
+@@ -92,7 +86,7 @@ void *bpf_map_fd_get_ptr(struct bpf_map *map,
+ 			 struct file *map_file /* not used */,
+ 			 int ufd)
+ {
+-	struct bpf_map *inner_map;
++	struct bpf_map *inner_map, *inner_map_meta;
+ 	struct fd f;
+ 
+ 	f = fdget(ufd);
+@@ -100,7 +94,8 @@ void *bpf_map_fd_get_ptr(struct bpf_map *map,
+ 	if (IS_ERR(inner_map))
+ 		return inner_map;
+ 
+-	if (bpf_map_meta_equal(map->inner_map_meta, inner_map))
++	inner_map_meta = map->inner_map_meta;
++	if (inner_map_meta->ops->map_meta_equal(inner_map_meta, inner_map))
+ 		bpf_map_inc(inner_map);
+ 	else
+ 		inner_map = ERR_PTR(-EINVAL);
+diff --git a/kernel/bpf/map_in_map.h b/kernel/bpf/map_in_map.h
+index 6183db9ec08c..abfe411bf793 100644
+--- a/kernel/bpf/map_in_map.h
++++ b/kernel/bpf/map_in_map.h
+@@ -14,8 +14,6 @@ struct bpf_map;
+ 
+ struct bpf_map *bpf_map_meta_alloc(int inner_map_ufd);
+ void bpf_map_meta_free(struct bpf_map *map_meta);
+-bool bpf_map_meta_equal(const struct bpf_map *meta0,
+-			const struct bpf_map *meta1);
+ void *bpf_map_fd_get_ptr(struct bpf_map *map, struct file *map_file,
+ 			 int ufd);
+ void bpf_map_fd_put_ptr(void *ptr);
+diff --git a/kernel/bpf/queue_stack_maps.c b/kernel/bpf/queue_stack_maps.c
+index 44184f82916a..0ee2347ba510 100644
+--- a/kernel/bpf/queue_stack_maps.c
++++ b/kernel/bpf/queue_stack_maps.c
+@@ -257,6 +257,7 @@ static int queue_stack_map_get_next_key(struct bpf_map *map, void *key,
+ 
+ static int queue_map_btf_id;
+ const struct bpf_map_ops queue_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = queue_stack_map_alloc_check,
+ 	.map_alloc = queue_stack_map_alloc,
+ 	.map_free = queue_stack_map_free,
+@@ -273,6 +274,7 @@ const struct bpf_map_ops queue_map_ops = {
+ 
+ static int stack_map_btf_id;
+ const struct bpf_map_ops stack_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = queue_stack_map_alloc_check,
+ 	.map_alloc = queue_stack_map_alloc,
+ 	.map_free = queue_stack_map_free,
+diff --git a/kernel/bpf/reuseport_array.c b/kernel/bpf/reuseport_array.c
+index 90b29c5b1da7..5a2ba1182493 100644
+--- a/kernel/bpf/reuseport_array.c
++++ b/kernel/bpf/reuseport_array.c
+@@ -351,6 +351,7 @@ static int reuseport_array_get_next_key(struct bpf_map *map, void *key,
+ 
+ static int reuseport_array_map_btf_id;
+ const struct bpf_map_ops reuseport_array_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc_check = reuseport_array_alloc_check,
+ 	.map_alloc = reuseport_array_alloc,
+ 	.map_free = reuseport_array_free,
+diff --git a/kernel/bpf/ringbuf.c b/kernel/bpf/ringbuf.c
+index 002f8a5c9e51..31cb04a4dd2d 100644
+--- a/kernel/bpf/ringbuf.c
++++ b/kernel/bpf/ringbuf.c
+@@ -287,6 +287,7 @@ static __poll_t ringbuf_map_poll(struct bpf_map *map, struct file *filp,
+ 
+ static int ringbuf_map_btf_id;
+ const struct bpf_map_ops ringbuf_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = ringbuf_map_alloc,
+ 	.map_free = ringbuf_map_free,
+ 	.map_mmap = ringbuf_map_mmap,
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index ab109cc96ac5..8ab977cfa082 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -842,6 +842,7 @@ static void stack_map_free(struct bpf_map *map)
+ 
+ static int stack_trace_map_btf_id;
+ const struct bpf_map_ops stack_trace_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = stack_map_alloc,
+ 	.map_free = stack_map_free,
+ 	.map_get_next_key = stack_map_get_next_key,
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 70e6c7e995cb..fe17de18225b 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -119,6 +119,7 @@ int bpf_check_uarg_tail_zero(void __user *uaddr,
+ }
+ 
+ const struct bpf_map_ops bpf_map_offload_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = bpf_map_offload_map_alloc,
+ 	.map_free = bpf_map_offload_map_free,
+ 	.map_check_btf = map_check_no_btf,
+* Unmerged path net/core/bpf_sk_storage.c
+diff --git a/net/core/sock_map.c b/net/core/sock_map.c
+index 33696b15f81b..3043b4ee7234 100644
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@ -709,6 +709,7 @@ const struct bpf_func_proto bpf_msg_redirect_map_proto = {
+ 
+ static int sock_map_btf_id;
+ const struct bpf_map_ops sock_map_ops = {
++	.map_meta_equal		= bpf_map_meta_equal,
+ 	.map_alloc		= sock_map_alloc,
+ 	.map_free		= sock_map_free,
+ 	.map_get_next_key	= sock_map_get_next_key,
+@@ -1204,6 +1205,7 @@ const struct bpf_func_proto bpf_msg_redirect_hash_proto = {
+ 
+ static int sock_hash_map_btf_id;
+ const struct bpf_map_ops sock_hash_ops = {
++	.map_meta_equal		= bpf_map_meta_equal,
+ 	.map_alloc		= sock_hash_alloc,
+ 	.map_free		= sock_hash_free,
+ 	.map_get_next_key	= sock_hash_get_next_key,
+diff --git a/net/xdp/xskmap.c b/net/xdp/xskmap.c
+index 8367adbbe9df..f45f29f04151 100644
+--- a/net/xdp/xskmap.c
++++ b/net/xdp/xskmap.c
+@@ -256,6 +256,7 @@ void xsk_map_try_sock_delete(struct xsk_map *map, struct xdp_sock *xs,
+ 
+ static int xsk_map_btf_id;
+ const struct bpf_map_ops xsk_map_ops = {
++	.map_meta_equal = bpf_map_meta_equal,
+ 	.map_alloc = xsk_map_alloc,
+ 	.map_free = xsk_map_free,
+ 	.map_get_next_key = xsk_map_get_next_key,
