@@ -1,0 +1,215 @@
+net: sched: cls_flower: validate nested enc_opts_policy to avoid warning
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: cls_flower: validate nested enc_opts_policy to avoid warning (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 96.40%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 63c82997f5c0f3e1b914af43d82f712a86bc5f3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/63c82997.failed
+
+TCA_FLOWER_KEY_ENC_OPTS and TCA_FLOWER_KEY_ENC_OPTS_MASK can only
+currently contain further nested attributes, which are parsed by
+hand, so the policy is never actually used resulting in a W=1
+build warning:
+
+net/sched/cls_flower.c:492:1: warning: ‘enc_opts_policy’ defined but not used [-Wunused-const-variable=]
+ enc_opts_policy[TCA_FLOWER_KEY_ENC_OPTS_MAX + 1] = {
+
+Add the validation anyway to avoid potential bugs when other
+attributes are added and to make the attribute structure slightly
+more clear.  Validation will also set extact to point to bad
+attribute on error.
+
+Fixes: 0a6e77784f49 ("net/sched: allow flower to match tunnel options")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Acked-by: Simon Horman <simon.horman@netronome.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 63c82997f5c0f3e1b914af43d82f712a86bc5f3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index 5d7b922f3ed1,c6c327874abc..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -590,13 -611,164 +590,169 @@@ static void fl_set_key_ip(struct nlatt
+  			  struct flow_dissector_key_ip *key,
+  			  struct flow_dissector_key_ip *mask)
+  {
+ -	int tos_key = encap ? TCA_FLOWER_KEY_ENC_IP_TOS : TCA_FLOWER_KEY_IP_TOS;
+ -	int ttl_key = encap ? TCA_FLOWER_KEY_ENC_IP_TTL : TCA_FLOWER_KEY_IP_TTL;
+ -	int tos_mask = encap ? TCA_FLOWER_KEY_ENC_IP_TOS_MASK : TCA_FLOWER_KEY_IP_TOS_MASK;
+ -	int ttl_mask = encap ? TCA_FLOWER_KEY_ENC_IP_TTL_MASK : TCA_FLOWER_KEY_IP_TTL_MASK;
+ -
+ +		fl_set_key_val(tb, &key->tos, TCA_FLOWER_KEY_IP_TOS,
+ +			       &mask->tos, TCA_FLOWER_KEY_IP_TOS_MASK,
+ +			       sizeof(key->tos));
+ +
+++<<<<<<< HEAD
+ +		fl_set_key_val(tb, &key->ttl, TCA_FLOWER_KEY_IP_TTL,
+ +			       &mask->ttl, TCA_FLOWER_KEY_IP_TTL_MASK,
+ +			       sizeof(key->ttl));
+++=======
++ 	fl_set_key_val(tb, &key->tos, tos_key, &mask->tos, tos_mask, sizeof(key->tos));
++ 	fl_set_key_val(tb, &key->ttl, ttl_key, &mask->ttl, ttl_mask, sizeof(key->ttl));
++ }
++ 
++ static int fl_set_geneve_opt(const struct nlattr *nla, struct fl_flow_key *key,
++ 			     int depth, int option_len,
++ 			     struct netlink_ext_ack *extack)
++ {
++ 	struct nlattr *tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX + 1];
++ 	struct nlattr *class = NULL, *type = NULL, *data = NULL;
++ 	struct geneve_opt *opt;
++ 	int err, data_len = 0;
++ 
++ 	if (option_len > sizeof(struct geneve_opt))
++ 		data_len = option_len - sizeof(struct geneve_opt);
++ 
++ 	opt = (struct geneve_opt *)&key->enc_opts.data[key->enc_opts.len];
++ 	memset(opt, 0xff, option_len);
++ 	opt->length = data_len / 4;
++ 	opt->r1 = 0;
++ 	opt->r2 = 0;
++ 	opt->r3 = 0;
++ 
++ 	/* If no mask has been prodived we assume an exact match. */
++ 	if (!depth)
++ 		return sizeof(struct geneve_opt) + data_len;
++ 
++ 	if (nla_type(nla) != TCA_FLOWER_KEY_ENC_OPTS_GENEVE) {
++ 		NL_SET_ERR_MSG(extack, "Non-geneve option type for mask");
++ 		return -EINVAL;
++ 	}
++ 
++ 	err = nla_parse_nested(tb, TCA_FLOWER_KEY_ENC_OPT_GENEVE_MAX,
++ 			       nla, geneve_opt_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	/* We are not allowed to omit any of CLASS, TYPE or DATA
++ 	 * fields from the key.
++ 	 */
++ 	if (!option_len &&
++ 	    (!tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS] ||
++ 	     !tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE] ||
++ 	     !tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA])) {
++ 		NL_SET_ERR_MSG(extack, "Missing tunnel key geneve option class, type or data");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Omitting any of CLASS, TYPE or DATA fields is allowed
++ 	 * for the mask.
++ 	 */
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA]) {
++ 		int new_len = key->enc_opts.len;
++ 
++ 		data = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_DATA];
++ 		data_len = nla_len(data);
++ 		if (data_len < 4) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel key geneve option data is less than 4 bytes long");
++ 			return -ERANGE;
++ 		}
++ 		if (data_len % 4) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel key geneve option data is not a multiple of 4 bytes long");
++ 			return -ERANGE;
++ 		}
++ 
++ 		new_len += sizeof(struct geneve_opt) + data_len;
++ 		BUILD_BUG_ON(FLOW_DIS_TUN_OPTS_MAX != IP_TUNNEL_OPTS_MAX);
++ 		if (new_len > FLOW_DIS_TUN_OPTS_MAX) {
++ 			NL_SET_ERR_MSG(extack, "Tunnel options exceeds max size");
++ 			return -ERANGE;
++ 		}
++ 		opt->length = data_len / 4;
++ 		memcpy(opt->opt_data, nla_data(data), data_len);
++ 	}
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS]) {
++ 		class = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_CLASS];
++ 		opt->opt_class = nla_get_be16(class);
++ 	}
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE]) {
++ 		type = tb[TCA_FLOWER_KEY_ENC_OPT_GENEVE_TYPE];
++ 		opt->type = nla_get_u8(type);
++ 	}
++ 
++ 	return sizeof(struct geneve_opt) + data_len;
++ }
++ 
++ static int fl_set_enc_opt(struct nlattr **tb, struct fl_flow_key *key,
++ 			  struct fl_flow_key *mask,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	const struct nlattr *nla_enc_key, *nla_opt_key, *nla_opt_msk = NULL;
++ 	int err, option_len, key_depth, msk_depth = 0;
++ 
++ 	err = nla_validate_nested(tb[TCA_FLOWER_KEY_ENC_OPTS],
++ 				  TCA_FLOWER_KEY_ENC_OPTS_MAX,
++ 				  enc_opts_policy, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	nla_enc_key = nla_data(tb[TCA_FLOWER_KEY_ENC_OPTS]);
++ 
++ 	if (tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]) {
++ 		err = nla_validate_nested(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK],
++ 					  TCA_FLOWER_KEY_ENC_OPTS_MAX,
++ 					  enc_opts_policy, extack);
++ 		if (err)
++ 			return err;
++ 
++ 		nla_opt_msk = nla_data(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]);
++ 		msk_depth = nla_len(tb[TCA_FLOWER_KEY_ENC_OPTS_MASK]);
++ 	}
++ 
++ 	nla_for_each_attr(nla_opt_key, nla_enc_key,
++ 			  nla_len(tb[TCA_FLOWER_KEY_ENC_OPTS]), key_depth) {
++ 		switch (nla_type(nla_opt_key)) {
++ 		case TCA_FLOWER_KEY_ENC_OPTS_GENEVE:
++ 			option_len = 0;
++ 			key->enc_opts.dst_opt_type = TUNNEL_GENEVE_OPT;
++ 			option_len = fl_set_geneve_opt(nla_opt_key, key,
++ 						       key_depth, option_len,
++ 						       extack);
++ 			if (option_len < 0)
++ 				return option_len;
++ 
++ 			key->enc_opts.len += option_len;
++ 			/* At the same time we need to parse through the mask
++ 			 * in order to verify exact and mask attribute lengths.
++ 			 */
++ 			mask->enc_opts.dst_opt_type = TUNNEL_GENEVE_OPT;
++ 			option_len = fl_set_geneve_opt(nla_opt_msk, mask,
++ 						       msk_depth, option_len,
++ 						       extack);
++ 			if (option_len < 0)
++ 				return option_len;
++ 
++ 			mask->enc_opts.len += option_len;
++ 			if (key->enc_opts.len != mask->enc_opts.len) {
++ 				NL_SET_ERR_MSG(extack, "Key and mask miss aligned");
++ 				return -EINVAL;
++ 			}
++ 
++ 			if (msk_depth)
++ 				nla_opt_msk = nla_next(nla_opt_msk, &msk_depth);
++ 			break;
++ 		default:
++ 			NL_SET_ERR_MSG(extack, "Unknown tunnel option type");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 63c82997f5c0 (net: sched: cls_flower: validate nested enc_opts_policy to avoid warning)
+  }
+  
+  static int fl_set_key(struct net *net, struct nlattr **tb,
+* Unmerged path net/sched/cls_flower.c
