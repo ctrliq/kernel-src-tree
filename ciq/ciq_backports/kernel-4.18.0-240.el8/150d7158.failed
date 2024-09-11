@@ -1,0 +1,185 @@
+futex: Split futex_mm_release() for exit/exec
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 150d71584b12809144b8145b817e83b81158ae5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/150d7158.failed
+
+To allow separate handling of the futex exit state in the futex exit code
+for exit and exec, split futex_mm_release() into two functions and invoke
+them from the corresponding exit/exec_mm_release() callsites.
+
+Preparatory only, no functional change.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20191106224556.332094221@linutronix.de
+
+
+(cherry picked from commit 150d71584b12809144b8145b817e83b81158ae5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/futex.h
+#	kernel/fork.c
+#	kernel/futex.c
+diff --cc include/linux/futex.h
+index 821ae502d3d8,6414cfaf88e0..000000000000
+--- a/include/linux/futex.h
++++ b/include/linux/futex.h
+@@@ -51,20 -50,59 +51,75 @@@ union futex_key 
+  #define FUTEX_KEY_INIT (union futex_key) { .both = { .ptr = NULL } }
+  
+  #ifdef CONFIG_FUTEX
+++<<<<<<< HEAD
+ +extern void exit_robust_list(struct task_struct *curr);
+++=======
++ enum {
++ 	FUTEX_STATE_OK,
++ 	FUTEX_STATE_DEAD,
++ };
++ 
++ static inline void futex_init_task(struct task_struct *tsk)
++ {
++ 	tsk->robust_list = NULL;
++ #ifdef CONFIG_COMPAT
++ 	tsk->compat_robust_list = NULL;
++ #endif
++ 	INIT_LIST_HEAD(&tsk->pi_state_list);
++ 	tsk->pi_state_cache = NULL;
++ 	tsk->futex_state = FUTEX_STATE_OK;
++ }
++ 
++ /**
++  * futex_exit_done - Sets the tasks futex state to FUTEX_STATE_DEAD
++  * @tsk:	task to set the state on
++  *
++  * Set the futex exit state of the task lockless. The futex waiter code
++  * observes that state when a task is exiting and loops until the task has
++  * actually finished the futex cleanup. The worst case for this is that the
++  * waiter runs through the wait loop until the state becomes visible.
++  *
++  * This has two callers:
++  *
++  * - futex_mm_release() after the futex exit cleanup has been done
++  *
++  * - do_exit() from the recursive fault handling path.
++  *
++  * In case of a recursive fault this is best effort. Either the futex exit
++  * code has run already or not. If the OWNER_DIED bit has been set on the
++  * futex then the waiter can take it over. If not, the problem is pushed
++  * back to user space. If the futex exit code did not run yet, then an
++  * already queued waiter might block forever, but there is nothing which
++  * can be done about that.
++  */
++ static inline void futex_exit_done(struct task_struct *tsk)
++ {
++ 	tsk->futex_state = FUTEX_STATE_DEAD;
++ }
++ 
++ void futex_exit_release(struct task_struct *tsk);
++ void futex_exec_release(struct task_struct *tsk);
+++>>>>>>> 150d71584b12 (futex: Split futex_mm_release() for exit/exec)
+  
+  long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+  	      u32 __user *uaddr2, u32 val2, u32 val3);
+ +#ifdef CONFIG_HAVE_FUTEX_CMPXCHG
+ +#define futex_cmpxchg_enabled 1
+ +#else
+++<<<<<<< HEAD
+ +extern int futex_cmpxchg_enabled;
+ +#endif
+  #else
+ +static inline void exit_robust_list(struct task_struct *curr)
+ +{
+ +}
+ +
+++=======
++ static inline void futex_init_task(struct task_struct *tsk) { }
++ static inline void futex_exit_done(struct task_struct *tsk) { }
++ static inline void futex_exit_release(struct task_struct *tsk) { }
++ static inline void futex_exec_release(struct task_struct *tsk) { }
+++>>>>>>> 150d71584b12 (futex: Split futex_mm_release() for exit/exec)
+  static inline long do_futex(u32 __user *uaddr, int op, u32 val,
+  			    ktime_t *timeout, u32 __user *uaddr2,
+  			    u32 val2, u32 val3)
+diff --cc kernel/fork.c
+index 268e54fb3c8f,f1eb4d1f1a3b..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1265,22 -1285,6 +1265,25 @@@ static int wait_for_vfork_done(struct t
+   */
+  static void mm_release(struct task_struct *tsk, struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	/* Get rid of any futexes when releasing the mm */
+ +#ifdef CONFIG_FUTEX
+ +	if (unlikely(tsk->robust_list)) {
+ +		exit_robust_list(tsk);
+ +		tsk->robust_list = NULL;
+ +	}
+ +#ifdef CONFIG_COMPAT
+ +	if (unlikely(tsk->compat_robust_list)) {
+ +		compat_exit_robust_list(tsk);
+ +		tsk->compat_robust_list = NULL;
+ +	}
+ +#endif
+ +	if (unlikely(!list_empty(&tsk->pi_state_list)))
+ +		exit_pi_state_list(tsk);
+ +#endif
+ +
+++=======
+++>>>>>>> 150d71584b12 (futex: Split futex_mm_release() for exit/exec)
+  	uprobe_free_utask(tsk);
+  
+  	/* Get rid of any cached register state */
+diff --cc kernel/futex.c
+index ec3cc9521f31,909e4d3c3099..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -3608,9 -3655,33 +3608,37 @@@ void exit_robust_list(struct task_struc
+  		cond_resched();
+  	}
+  
+ -	if (pending) {
+ +	if (pending)
+  		handle_futex_death((void __user *)pending + futex_offset,
+++<<<<<<< HEAD
+ +				   curr, pip);
+++=======
++ 				   curr, pip, HANDLE_DEATH_PENDING);
++ 	}
++ }
++ 
++ void futex_exec_release(struct task_struct *tsk)
++ {
++ 	if (unlikely(tsk->robust_list)) {
++ 		exit_robust_list(tsk);
++ 		tsk->robust_list = NULL;
++ 	}
++ 
++ #ifdef CONFIG_COMPAT
++ 	if (unlikely(tsk->compat_robust_list)) {
++ 		compat_exit_robust_list(tsk);
++ 		tsk->compat_robust_list = NULL;
++ 	}
++ #endif
++ 
++ 	if (unlikely(!list_empty(&tsk->pi_state_list)))
++ 		exit_pi_state_list(tsk);
+++>>>>>>> 150d71584b12 (futex: Split futex_mm_release() for exit/exec)
++ }
++ 
++ void futex_exit_release(struct task_struct *tsk)
++ {
++ 	futex_exec_release(tsk);
+  }
+  
+  long do_futex(u32 __user *uaddr, int op, u32 val, ktime_t *timeout,
+* Unmerged path include/linux/futex.h
+* Unmerged path kernel/fork.c
+* Unmerged path kernel/futex.c
