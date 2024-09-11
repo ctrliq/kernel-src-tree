@@ -1,0 +1,322 @@
+rcu/tree: cache specified number of objects
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Uladzislau Rezki (Sony) <urezki@gmail.com>
+commit 53c72b590b3a0afd6747d6f7957e6838003e90a4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/53c72b59.failed
+
+In order to reduce the dynamic need for pages in kfree_rcu(),
+pre-allocate a configurable number of pages per CPU and link
+them in a list. When kfree_rcu() reclaims objects, the object's
+container page is cached into a list instead of being released
+to the low-level page allocator.
+
+Such an approach provides O(1) access to free pages while also
+reducing the number of requests to the page allocator. It also
+makes the kfree_rcu() code to have free pages available during
+a low memory condition.
+
+A read-only sysfs parameter (rcu_min_cached_objs) reflects the
+minimum number of allowed cached pages per CPU.
+
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 53c72b590b3a0afd6747d6f7957e6838003e90a4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,37c0cd0332f8..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2698,6 -3005,7 +2707,10 @@@ struct kfree_rcu_cpu_work 
+  /**
+   * struct kfree_rcu_cpu - batch up kfree_rcu() requests for RCU grace period
+   * @head: List of kfree_rcu() objects not yet waiting for a grace period
+++<<<<<<< HEAD
+++=======
++  * @bhead: Bulk-List of kfree_rcu() objects not yet waiting for a grace period
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+   * @krw_arr: Array of batches of kfree_rcu() objects waiting for a grace period
+   * @lock: Synchronize access to this structure
+   * @monitor_work: Promote @head to @head_free after KFREE_DRAIN_JIFFIES
+@@@ -2711,18 -3020,87 +2724,61 @@@
+   */
+  struct kfree_rcu_cpu {
+  	struct rcu_head *head;
+++<<<<<<< HEAD
+++=======
++ 	struct kfree_rcu_bulk_data *bhead;
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+  	struct kfree_rcu_cpu_work krw_arr[KFREE_N_BATCHES];
+ -	raw_spinlock_t lock;
+ +	spinlock_t lock;
+  	struct delayed_work monitor_work;
+  	bool monitor_todo;
+  	bool initialized;
+++<<<<<<< HEAD
+++=======
++ 	int count;
++ 
++ 	/*
++ 	 * A simple cache list that contains objects for
++ 	 * reuse purpose. In order to save some per-cpu
++ 	 * space the list is singular. Even though it is
++ 	 * lockless an access has to be protected by the
++ 	 * per-cpu lock.
++ 	 */
++ 	struct llist_head bkvcache;
++ 	int nr_bkv_objs;
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+  };
+  
+ -static DEFINE_PER_CPU(struct kfree_rcu_cpu, krc) = {
+ -	.lock = __RAW_SPIN_LOCK_UNLOCKED(krc.lock),
+ -};
+ -
+ -static __always_inline void
+ -debug_rcu_bhead_unqueue(struct kfree_rcu_bulk_data *bhead)
+ -{
+ -#ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
+ -	int i;
+ -
+ -	for (i = 0; i < bhead->nr_records; i++)
+ -		debug_rcu_head_unqueue((struct rcu_head *)(bhead->records[i]));
+ -#endif
+ -}
+ -
+ -static inline struct kfree_rcu_cpu *
+ -krc_this_cpu_lock(unsigned long *flags)
+ -{
+ -	struct kfree_rcu_cpu *krcp;
+ -
+ -	local_irq_save(*flags);	// For safely calling this_cpu_ptr().
+ -	krcp = this_cpu_ptr(&krc);
+ -	raw_spin_lock(&krcp->lock);
+ -
+ -	return krcp;
+ -}
+ -
+ -static inline void
+ -krc_this_cpu_unlock(struct kfree_rcu_cpu *krcp, unsigned long flags)
+ -{
+ -	raw_spin_unlock(&krcp->lock);
+ -	local_irq_restore(flags);
+ -}
+ +static DEFINE_PER_CPU(struct kfree_rcu_cpu, krc);
+  
++ static inline struct kfree_rcu_bulk_data *
++ get_cached_bnode(struct kfree_rcu_cpu *krcp)
++ {
++ 	if (!krcp->nr_bkv_objs)
++ 		return NULL;
++ 
++ 	krcp->nr_bkv_objs--;
++ 	return (struct kfree_rcu_bulk_data *)
++ 		llist_del_first(&krcp->bkvcache);
++ }
++ 
++ static inline bool
++ put_cached_bnode(struct kfree_rcu_cpu *krcp,
++ 	struct kfree_rcu_bulk_data *bnode)
++ {
++ 	// Check the limit.
++ 	if (krcp->nr_bkv_objs >= rcu_min_cached_objs)
++ 		return false;
++ 
++ 	llist_add((struct llist_node *) bnode, &krcp->bkvcache);
++ 	krcp->nr_bkv_objs++;
++ 	return true;
++ 
++ }
++ 
+  /*
+   * This function is invoked in workqueue context after a grace period.
+ - * It frees all the objects queued on ->bhead_free or ->head_free.
+ + * It frees all the objects queued on ->head_free.
+   */
+  static void kfree_rcu_work(struct work_struct *work)
+  {
+@@@ -2734,17 -3113,55 +2790,49 @@@
+  	krwp = container_of(to_rcu_work(work),
+  			    struct kfree_rcu_cpu_work, rcu_work);
+  	krcp = krwp->krcp;
+ -	raw_spin_lock_irqsave(&krcp->lock, flags);
+ +	spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
+ -	bhead = krwp->bhead_free;
+ -	krwp->bhead_free = NULL;
+ -	raw_spin_unlock_irqrestore(&krcp->lock, flags);
+ +	spin_unlock_irqrestore(&krcp->lock, flags);
+  
+++<<<<<<< HEAD
+ +	// List "head" is now private, so traverse locklessly.
+++=======
++ 	/* "bhead" is now private, so traverse locklessly. */
++ 	for (; bhead; bhead = bnext) {
++ 		bnext = bhead->next;
++ 
++ 		debug_rcu_bhead_unqueue(bhead);
++ 
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kfree_bulk_callback(rcu_state.name,
++ 			bhead->nr_records, bhead->records);
++ 
++ 		kfree_bulk(bhead->nr_records, bhead->records);
++ 		rcu_lock_release(&rcu_callback_map);
++ 
++ 		krcp = krc_this_cpu_lock(&flags);
++ 		if (put_cached_bnode(krcp, bhead))
++ 			bhead = NULL;
++ 		krc_this_cpu_unlock(krcp, flags);
++ 
++ 		if (bhead)
++ 			free_page((unsigned long) bhead);
++ 
++ 		cond_resched_tasks_rcu_qs();
++ 	}
++ 
++ 	/*
++ 	 * Emergency case only. It can happen under low memory
++ 	 * condition when an allocation gets failed, so the "bulk"
++ 	 * path can not be temporary maintained.
++ 	 */
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+  	for (; head; head = next) {
+ -		unsigned long offset = (unsigned long)head->func;
+ -		void *ptr = (void *)head - offset;
+ -
+  		next = head->next;
+ -		debug_rcu_head_unqueue((struct rcu_head *)ptr);
+ -		rcu_lock_acquire(&rcu_callback_map);
+ -		trace_rcu_invoke_kfree_callback(rcu_state.name, head, offset);
+ -
+ -		if (!WARN_ON_ONCE(!__is_kfree_rcu_offset(offset)))
+ -			kfree(ptr);
+ -
+ -		rcu_lock_release(&rcu_callback_map);
+ +		// Potentially optimize with kfree_bulk in future.
+ +		debug_rcu_head_unqueue(head);
+ +		__rcu_reclaim(rcu_state.name, head);
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+@@@ -2810,7 -3254,60 +2898,64 @@@ static void kfree_rcu_monitor(struct wo
+  	if (krcp->monitor_todo)
+  		kfree_rcu_drain_unlock(krcp, flags);
+  	else
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&krcp->lock, flags);
+++=======
++ 		raw_spin_unlock_irqrestore(&krcp->lock, flags);
++ }
++ 
++ static inline bool
++ kfree_call_rcu_add_ptr_to_bulk(struct kfree_rcu_cpu *krcp,
++ 	struct rcu_head *head, rcu_callback_t func)
++ {
++ 	struct kfree_rcu_bulk_data *bnode;
++ 
++ 	if (unlikely(!krcp->initialized))
++ 		return false;
++ 
++ 	lockdep_assert_held(&krcp->lock);
++ 
++ 	/* Check if a new block is required. */
++ 	if (!krcp->bhead ||
++ 			krcp->bhead->nr_records == KFREE_BULK_MAX_ENTR) {
++ 		bnode = get_cached_bnode(krcp);
++ 		if (!bnode) {
++ 			WARN_ON_ONCE(sizeof(struct kfree_rcu_bulk_data) > PAGE_SIZE);
++ 
++ 			/*
++ 			 * To keep this path working on raw non-preemptible
++ 			 * sections, prevent the optional entry into the
++ 			 * allocator as it uses sleeping locks. In fact, even
++ 			 * if the caller of kfree_rcu() is preemptible, this
++ 			 * path still is not, as krcp->lock is a raw spinlock.
++ 			 * With additional page pre-allocation in the works,
++ 			 * hitting this return is going to be much less likely.
++ 			 */
++ 			if (IS_ENABLED(CONFIG_PREEMPT_RT))
++ 				return false;
++ 
++ 			bnode = (struct kfree_rcu_bulk_data *)
++ 				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
++ 		}
++ 
++ 		/* Switch to emergency path. */
++ 		if (unlikely(!bnode))
++ 			return false;
++ 
++ 		/* Initialize the new block. */
++ 		bnode->nr_records = 0;
++ 		bnode->next = krcp->bhead;
++ 
++ 		/* Attach it to the head. */
++ 		krcp->bhead = bnode;
++ 	}
++ 
++ 	/* Finally insert. */
++ 	krcp->bhead->records[krcp->bhead->nr_records++] =
++ 		(void *) head - (unsigned long) func;
++ 
++ 	return true;
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+  }
+  
+  /*
+@@@ -3772,10 -4324,23 +3917,26 @@@ static void __init kfree_rcu_batch_init
+  
+  	for_each_possible_cpu(cpu) {
+  		struct kfree_rcu_cpu *krcp = per_cpu_ptr(&krc, cpu);
++ 		struct kfree_rcu_bulk_data *bnode;
+  
+ -		for (i = 0; i < KFREE_N_BATCHES; i++) {
+ -			INIT_RCU_WORK(&krcp->krw_arr[i].rcu_work, kfree_rcu_work);
+ +		spin_lock_init(&krcp->lock);
+ +		for (i = 0; i < KFREE_N_BATCHES; i++)
+  			krcp->krw_arr[i].krcp = krcp;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 
++ 		for (i = 0; i < rcu_min_cached_objs; i++) {
++ 			bnode = (struct kfree_rcu_bulk_data *)
++ 				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
++ 
++ 			if (bnode)
++ 				put_cached_bnode(krcp, bnode);
++ 			else
++ 				pr_err("Failed to preallocate for %d CPU!\n", cpu);
++ 		}
++ 
+++>>>>>>> 53c72b590b3a (rcu/tree: cache specified number of objects)
+  		INIT_DELAYED_WORK(&krcp->monitor_work, kfree_rcu_monitor);
+  		krcp->initialized = true;
+  	}
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 674efb78b307..78479a77d6dc 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -3884,6 +3884,14 @@
+ 			latencies, which will choose a value aligned
+ 			with the appropriate hardware boundaries.
+ 
++	rcutree.rcu_min_cached_objs= [KNL]
++			Minimum number of objects which are cached and
++			maintained per one CPU. Object size is equal
++			to PAGE_SIZE. The cache allows to reduce the
++			pressure to page allocator, also it makes the
++			whole algorithm to behave better in low memory
++			condition.
++
+ 	rcutree.jiffies_till_first_fqs= [KNL]
+ 			Set delay from grace-period initialization to
+ 			first attempt to force quiescent states.
+* Unmerged path kernel/rcu/tree.c
