@@ -1,0 +1,181 @@
+perf maps: Do not use an rbtree to sort by map name
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit c5c584d2dbb0883f1e6f61872964a4a3a35a2017
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c5c584d2.failed
+
+This is only used for the kernel maps, shave 24 bytes out 'struct map'
+and just traverse the existing per ip rbtree to look for maps by name,
+use a front end cache to reuse the last search if its the same name.
+
+After this 'struct map' is down to just two cachelines:
+
+  $ pahole -C map ~/bin/perf
+  struct map {
+  	union {
+  		struct rb_node rb_node __attribute__((__aligned__(8))); /*     0    24 */
+  		struct list_head node;                   /*     0    16 */
+  	} __attribute__((__aligned__(8)));                                               /*     0    24 */
+  	u64                        start;                /*    24     8 */
+  	u64                        end;                  /*    32     8 */
+  	_Bool                      erange_warned;        /*    40     1 */
+
+  	/* XXX 3 bytes hole, try to pack */
+
+  	u32                        priv;                 /*    44     4 */
+  	u32                        prot;                 /*    48     4 */
+  	u32                        flags;                /*    52     4 */
+  	u64                        pgoff;                /*    56     8 */
+  	/* --- cacheline 1 boundary (64 bytes) --- */
+  	u64                        reloc;                /*    64     8 */
+  	u32                        maj;                  /*    72     4 */
+  	u32                        min;                  /*    76     4 */
+  	u64                        ino;                  /*    80     8 */
+  	u64                        ino_generation;       /*    88     8 */
+  	u64                        (*map_ip)(struct map *, u64); /*    96     8 */
+  	u64                        (*unmap_ip)(struct map *, u64); /*   104     8 */
+  	struct dso *               dso;                  /*   112     8 */
+  	refcount_t                 refcnt;               /*   120     4 */
+
+  	/* size: 128, cachelines: 2, members: 17 */
+  	/* sum members: 121, holes: 1, sum holes: 3 */
+  	/* padding: 4 */
+  	/* forced alignments: 1 */
+  } __attribute__((__aligned__(8)));
+  $
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-bvr8fqfgzxtgnhnwt5sssx5g@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c5c584d2dbb0883f1e6f61872964a4a3a35a2017)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/util/map.c
+diff --cc tools/perf/util/map.c
+index 09fd25d1d0fd,49e353eaa337..000000000000
+--- a/tools/perf/util/map.c
++++ b/tools/perf/util/map.c
+@@@ -21,9 -23,9 +21,8 @@@
+  #include "namespaces.h"
+  #include "unwind.h"
+  #include "srccode.h"
+ -#include "ui/ui.h"
+  
+  static void __maps__insert(struct maps *maps, struct map *map);
+- static void __maps__insert_name(struct maps *maps, struct map *map);
+  
+  static inline int is_anon_memory(const char *filename, u32 flags)
+  {
+@@@ -581,29 -582,11 +579,32 @@@ void map_groups__insert(struct map_grou
+  
+  static void __maps__purge(struct maps *maps)
+  {
+ -	struct map *pos, *next;
+ +	struct rb_root *root = &maps->entries;
+ +	struct rb_node *next = rb_first(root);
+  
+ -	maps__for_each_entry_safe(maps, pos, next) {
+ -		rb_erase_init(&pos->rb_node,  &maps->entries);
+ +	while (next) {
+ +		struct map *pos = rb_entry(next, struct map, rb_node);
+ +
+ +		next = rb_next(&pos->rb_node);
+ +		rb_erase_init(&pos->rb_node, root);
+ +		map__put(pos);
+++<<<<<<< HEAD
+ +	}
+ +}
+ +
+ +static void __maps__purge_names(struct maps *maps)
+ +{
+ +	struct rb_root *root = &maps->names;
+ +	struct rb_node *next = rb_first(root);
+ +
+ +	while (next) {
+ +		struct map *pos = rb_entry(next, struct map, rb_node_name);
+ +
+ +		next = rb_next(&pos->rb_node_name);
+ +		rb_erase_init(&pos->rb_node_name, root);
+  		map__put(pos);
+++=======
+++>>>>>>> c5c584d2dbb0 (perf maps: Do not use an rbtree to sort by map name)
+  	}
+  }
+  
+diff --git a/tools/perf/tests/map_groups.c b/tools/perf/tests/map_groups.c
+index b52adad55f8d..6b9f1cdcbe5b 100644
+--- a/tools/perf/tests/map_groups.c
++++ b/tools/perf/tests/map_groups.c
+@@ -25,7 +25,7 @@ static int check_maps(struct map_def *merged, unsigned int size, struct map_grou
+ 		TEST_ASSERT_VAL("wrong map start",  map->start == merged[i].start);
+ 		TEST_ASSERT_VAL("wrong map end",    map->end == merged[i].end);
+ 		TEST_ASSERT_VAL("wrong map name",  !strcmp(map->dso->name, merged[i].name));
+-		TEST_ASSERT_VAL("wrong map refcnt", refcount_read(&map->refcnt) == 2);
++		TEST_ASSERT_VAL("wrong map refcnt", refcount_read(&map->refcnt) == 1);
+ 
+ 		i++;
+ 	}
+* Unmerged path tools/perf/util/map.c
+diff --git a/tools/perf/util/map.h b/tools/perf/util/map.h
+index 053b690a39f0..d1387300bfd1 100644
+--- a/tools/perf/util/map.h
++++ b/tools/perf/util/map.h
+@@ -23,7 +23,6 @@ struct map {
+ 		struct rb_node	rb_node;
+ 		struct list_head node;
+ 	};
+-	struct rb_node          rb_node_name;
+ 	u64			start;
+ 	u64			end;
+ 	bool			erange_warned;
+diff --git a/tools/perf/util/map_groups.h b/tools/perf/util/map_groups.h
+index 1876388e8dd8..2b0af431cd0b 100644
+--- a/tools/perf/util/map_groups.h
++++ b/tools/perf/util/map_groups.h
+@@ -16,7 +16,6 @@ struct thread;
+ 
+ struct maps {
+ 	struct rb_root      entries;
+-	struct rb_root	    names;
+ 	struct rw_semaphore lock;
+ };
+ 
+diff --git a/tools/perf/util/symbol.c b/tools/perf/util/symbol.c
+index 78ada2be3cd3..10dd6a97f222 100644
+--- a/tools/perf/util/symbol.c
++++ b/tools/perf/util/symbol.c
+@@ -1765,24 +1765,12 @@ struct map *map_groups__find_by_name(struct map_groups *mg, const char *name)
+ {
+ 	struct maps *maps = &mg->maps;
+ 	struct map *map;
+-	struct rb_node *node;
+ 
+ 	down_read(&maps->lock);
+ 
+-	for (node = maps->names.rb_node; node; ) {
+-		int rc;
+-
+-		map = rb_entry(node, struct map, rb_node_name);
+-
+-		rc = strcmp(map->dso->short_name, name);
+-		if (rc < 0)
+-			node = node->rb_left;
+-		else if (rc > 0)
+-			node = node->rb_right;
+-		else
+-
++	maps__for_each_entry(maps, map)
++		if (strcmp(map->dso->short_name, name) == 0)
+ 			goto out_unlock;
+-	}
+ 
+ 	map = NULL;
+ 
