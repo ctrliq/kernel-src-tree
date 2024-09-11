@@ -1,0 +1,224 @@
+libbpf: handle symbol versioning properly for libbpf.a
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 1bd63524593b964934a33afd442df16b8f90e2b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1bd63524.failed
+
+bcc uses libbpf repo as a submodule. It brings in libbpf source
+code and builds everything together to produce shared libraries.
+With latest libbpf, I got the following errors:
+  /bin/ld: libbcc_bpf.so.0.10.0: version node not found for symbol xsk_umem__create@LIBBPF_0.0.2
+  /bin/ld: failed to set dynamic section sizes: Bad value
+  collect2: error: ld returned 1 exit status
+  make[2]: *** [src/cc/libbcc_bpf.so.0.10.0] Error 1
+
+In xsk.c, we have
+  asm(".symver xsk_umem__create_v0_0_2, xsk_umem__create@LIBBPF_0.0.2");
+  asm(".symver xsk_umem__create_v0_0_4, xsk_umem__create@@LIBBPF_0.0.4");
+The linker thinks the built is for LIBBPF but cannot find proper version
+LIBBPF_0.0.2/4, so emit errors.
+
+I also confirmed that using libbpf.a to produce a shared library also
+has issues:
+  -bash-4.4$ cat t.c
+  extern void *xsk_umem__create;
+  void * test() { return xsk_umem__create; }
+  -bash-4.4$ gcc -c -fPIC t.c
+  -bash-4.4$ gcc -shared t.o libbpf.a -o t.so
+  /bin/ld: t.so: version node not found for symbol xsk_umem__create@LIBBPF_0.0.2
+  /bin/ld: failed to set dynamic section sizes: Bad value
+  collect2: error: ld returned 1 exit status
+  -bash-4.4$
+
+Symbol versioning does happens in commonly used libraries, e.g., elfutils
+and glibc. For static libraries, for a versioned symbol, the old definitions
+will be ignored, and the symbol will be an alias to the latest definition.
+For example, glibc sched_setaffinity is versioned.
+  -bash-4.4$ readelf -s /usr/lib64/libc.so.6 | grep sched_setaffinity
+     756: 000000000013d3d0    13 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@GLIBC_2.3.3
+     757: 00000000000e2e70   455 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@@GLIBC_2.3.4
+    1800: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS sched_setaffinity.c
+    4228: 00000000000e2e70   455 FUNC    LOCAL  DEFAULT   13 __sched_setaffinity_new
+    4648: 000000000013d3d0    13 FUNC    LOCAL  DEFAULT   13 __sched_setaffinity_old
+    7338: 000000000013d3d0    13 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@GLIBC_2
+    7380: 00000000000e2e70   455 FUNC    GLOBAL DEFAULT   13 sched_setaffinity@@GLIBC_
+  -bash-4.4$
+For static library, the definition of sched_setaffinity aliases to the new definition.
+  -bash-4.4$ readelf -s /usr/lib64/libc.a | grep sched_setaffinity
+  File: /usr/lib64/libc.a(sched_setaffinity.o)
+     8: 0000000000000000   455 FUNC    GLOBAL DEFAULT    1 __sched_setaffinity_new
+    12: 0000000000000000   455 FUNC    WEAK   DEFAULT    1 sched_setaffinity
+
+For both elfutils and glibc, additional macros are used to control different handling
+of symbol versioning w.r.t static and shared libraries.
+For elfutils, the macro is SYMBOL_VERSIONING
+(https://sourceware.org/git/?p=elfutils.git;a=blob;f=lib/eu-config.h).
+For glibc, the macro is SHARED
+(https://sourceware.org/git/?p=glibc.git;a=blob;f=include/shlib-compat.h;hb=refs/heads/master)
+
+This patch used SHARED as the macro name. After this patch, the libbpf.a has
+  -bash-4.4$ readelf -s libbpf.a | grep xsk_umem__create
+     372: 0000000000017145  1190 FUNC    GLOBAL DEFAULT    1 xsk_umem__create_v0_0_4
+     405: 0000000000017145  1190 FUNC    GLOBAL DEFAULT    1 xsk_umem__create
+     499: 00000000000175eb   103 FUNC    GLOBAL DEFAULT    1 xsk_umem__create_v0_0_2
+  -bash-4.4$
+No versioned symbols for xsk_umem__create.
+The libbpf.a can be used to build a shared library succesfully.
+  -bash-4.4$ cat t.c
+  extern void *xsk_umem__create;
+  void * test() { return xsk_umem__create; }
+  -bash-4.4$ gcc -c -fPIC t.c
+  -bash-4.4$ gcc -shared t.o libbpf.a -o t.so
+  -bash-4.4$
+
+Fixes: 10d30e301732 ("libbpf: add flags to umem config")
+	Cc: Kevin Laatz <kevin.laatz@intel.com>
+	Cc: Arnaldo Carvalho de Melo <acme@redhat.com>
+	Cc: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 1bd63524593b964934a33afd442df16b8f90e2b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/Makefile
+#	tools/lib/bpf/xsk.c
+diff --cc tools/lib/bpf/Makefile
+index 663c4c5270bc,56ce6292071b..000000000000
+--- a/tools/lib/bpf/Makefile
++++ b/tools/lib/bpf/Makefile
+@@@ -137,8 -143,10 +143,15 @@@ LIB_TARGET	:= $(addprefix $(OUTPUT),$(L
+  LIB_FILE	:= $(addprefix $(OUTPUT),$(LIB_FILE))
+  PC_FILE		:= $(addprefix $(OUTPUT),$(PC_FILE))
+  
+++<<<<<<< HEAD
+ +GLOBAL_SYM_COUNT = $(shell readelf -s --wide $(BPF_IN) | \
+ +			   awk '/GLOBAL/ && /DEFAULT/ && !/UND/ {s++} END{print s}')
+++=======
++ GLOBAL_SYM_COUNT = $(shell readelf -s --wide $(BPF_IN_SHARED) | \
++ 			   cut -d "@" -f1 | sed 's/_v[0-9]_[0-9]_[0-9].*//' | \
++ 			   awk '/GLOBAL/ && /DEFAULT/ && !/UND/ {print $$8}' | \
++ 			   sort -u | wc -l)
+++>>>>>>> 1bd63524593b (libbpf: handle symbol versioning properly for libbpf.a)
+  VERSIONED_SYM_COUNT = $(shell readelf -s --wide $(OUTPUT)libbpf.so | \
+  			      grep -Eo '[^ ]+@LIBBPF_' | cut -d@ -f1 | sort -u | wc -l)
+  
+@@@ -157,7 -165,7 +170,11 @@@ all: fixde
+  
+  all_cmd: $(CMD_TARGETS) check
+  
+++<<<<<<< HEAD
+ +$(BPF_IN): force elfdep bpfdep bpf_helper_defs.h
+++=======
++ $(BPF_IN_SHARED): force elfdep bpfdep
+++>>>>>>> 1bd63524593b (libbpf: handle symbol versioning properly for libbpf.a)
+  	@(test -f ../../include/uapi/linux/bpf.h -a -f ../../../include/uapi/linux/bpf.h && ( \
+  	(diff -B ../../include/uapi/linux/bpf.h ../../../include/uapi/linux/bpf.h >/dev/null) || \
+  	echo "Warning: Kernel ABI header at 'tools/include/uapi/linux/bpf.h' differs from latest version at 'include/uapi/linux/bpf.h'" >&2 )) || true
+@@@ -173,15 -181,14 +190,18 @@@
+  	@(test -f ../../include/uapi/linux/if_xdp.h -a -f ../../../include/uapi/linux/if_xdp.h && ( \
+  	(diff -B ../../include/uapi/linux/if_xdp.h ../../../include/uapi/linux/if_xdp.h >/dev/null) || \
+  	echo "Warning: Kernel ABI header at 'tools/include/uapi/linux/if_xdp.h' differs from latest version at 'include/uapi/linux/if_xdp.h'" >&2 )) || true
+- 	$(Q)$(MAKE) $(build)=libbpf
++ 	$(Q)$(MAKE) $(build)=libbpf OUTPUT=$(SHARED_OBJDIR) CFLAGS="$(CFLAGS) $(SHLIB_FLAGS)"
++ 
++ $(BPF_IN_STATIC): force elfdep bpfdep
++ 	$(Q)$(MAKE) $(build)=libbpf OUTPUT=$(STATIC_OBJDIR)
+  
+ +bpf_helper_defs.h: $(srctree)/include/uapi/linux/bpf.h
+ +	$(Q)$(srctree)/scripts/bpf_helpers_doc.py --header 		\
+ +		--file $(srctree)/include/uapi/linux/bpf.h > bpf_helper_defs.h
+ +
+  $(OUTPUT)libbpf.so: $(OUTPUT)libbpf.so.$(LIBBPF_VERSION)
+  
+- $(OUTPUT)libbpf.so.$(LIBBPF_VERSION): $(BPF_IN)
++ $(OUTPUT)libbpf.so.$(LIBBPF_VERSION): $(BPF_IN_SHARED)
+  	$(QUIET_LINK)$(CC) --shared -Wl,-soname,libbpf.so.$(LIBBPF_MAJOR_VERSION) \
+  				    -Wl,--version-script=$(VERSION_SCRIPT) $^ -lelf -o $@
+  	@ln -sf $(@F) $(OUTPUT)libbpf.so
+@@@ -265,9 -268,9 +285,13 @@@ config-clean
+  	$(Q)$(MAKE) -C $(srctree)/tools/build/feature/ clean >/dev/null
+  
+  clean:
+- 	$(call QUIET_CLEAN, libbpf) $(RM) $(TARGETS) $(CXX_TEST_TARGET) \
++ 	$(call QUIET_CLEAN, libbpf) $(RM) -rf $(TARGETS) $(CXX_TEST_TARGET) \
+  		*.o *~ *.a *.so *.so.$(LIBBPF_MAJOR_VERSION) .*.d .*.cmd \
+++<<<<<<< HEAD
+ +		*.pc LIBBPF-CFLAGS bpf_helper_defs.h
+++=======
++ 		*.pc LIBBPF-CFLAGS $(SHARED_OBJDIR) $(STATIC_OBJDIR)
+++>>>>>>> 1bd63524593b (libbpf: handle symbol versioning properly for libbpf.a)
+  	$(call QUIET_CLEAN, core-gen) $(RM) $(OUTPUT)FEATURE-DUMP.libbpf
+  
+  
+diff --cc tools/lib/bpf/xsk.c
+index ec98ccdf632f,a902838f9fcc..000000000000
+--- a/tools/lib/bpf/xsk.c
++++ b/tools/lib/bpf/xsk.c
+@@@ -236,6 -241,29 +236,32 @@@ out_umem_alloc
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct xsk_umem_config_v1 {
++ 	__u32 fill_size;
++ 	__u32 comp_size;
++ 	__u32 frame_size;
++ 	__u32 frame_headroom;
++ };
++ 
++ int xsk_umem__create_v0_0_2(struct xsk_umem **umem_ptr, void *umem_area,
++ 			    __u64 size, struct xsk_ring_prod *fill,
++ 			    struct xsk_ring_cons *comp,
++ 			    const struct xsk_umem_config *usr_config)
++ {
++ 	struct xsk_umem_config config;
++ 
++ 	memcpy(&config, usr_config, sizeof(struct xsk_umem_config_v1));
++ 	config.flags = 0;
++ 
++ 	return xsk_umem__create_v0_0_4(umem_ptr, umem_area, size, fill, comp,
++ 					&config);
++ }
++ COMPAT_VERSION(xsk_umem__create_v0_0_2, xsk_umem__create, LIBBPF_0.0.2)
++ DEFAULT_VERSION(xsk_umem__create_v0_0_4, xsk_umem__create, LIBBPF_0.0.4)
++ 
+++>>>>>>> 1bd63524593b (libbpf: handle symbol versioning properly for libbpf.a)
+  static int xsk_load_xdp_prog(struct xsk_socket *xsk)
+  {
+  	static const int log_buf_size = 16 * 1024;
+* Unmerged path tools/lib/bpf/Makefile
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index e5038838475d..c62e723191c6 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -34,6 +34,22 @@
+ 	(offsetof(TYPE, FIELD) + sizeof(((TYPE *)0)->FIELD))
+ #endif
+ 
++/* Symbol versioning is different between static and shared library.
++ * Properly versioned symbols are needed for shared library, but
++ * only the symbol of the new version is needed for static library.
++ */
++#ifdef SHARED
++# define COMPAT_VERSION(internal_name, api_name, version) \
++	asm(".symver " #internal_name "," #api_name "@" #version);
++# define DEFAULT_VERSION(internal_name, api_name, version) \
++	asm(".symver " #internal_name "," #api_name "@@" #version);
++#else
++# define COMPAT_VERSION(internal_name, api_name, version)
++# define DEFAULT_VERSION(internal_name, api_name, version) \
++	extern typeof(internal_name) api_name \
++	__attribute__((alias(#internal_name)));
++#endif
++
+ extern void libbpf_print(enum libbpf_print_level level,
+ 			 const char *format, ...)
+ 	__attribute__((format(printf, 2, 3)));
+* Unmerged path tools/lib/bpf/xsk.c
