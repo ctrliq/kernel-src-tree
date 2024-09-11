@@ -1,0 +1,183 @@
+bpf: Remove bpf_lsm_file_mprotect from sleepable list.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit f56407fa6e69499a06bf1e0543fa93be6922acba
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/f56407fa.failed
+
+Technically the bpf programs can sleep while attached to bpf_lsm_file_mprotect,
+but such programs need to access user memory. So they're in might_fault()
+category. Which means they cannot be called from file_mprotect lsm hook that
+takes write lock on mm->mmap_lock.
+Adjust the test accordingly.
+
+Also add might_fault() to __bpf_prog_enter_sleepable() to catch such deadlocks early.
+
+Fixes: 1e6c62a88215 ("bpf: Introduce sleepable BPF programs")
+Fixes: e68a144547fc ("selftests/bpf: Add sleepable tests")
+	Reported-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20200831201651.82447-1-alexei.starovoitov@gmail.com
+(cherry picked from commit f56407fa6e69499a06bf1e0543fa93be6922acba)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/trampoline.c
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/trampoline.c
+index b8e9e74ce71b,7dd523a7e32d..000000000000
+--- a/kernel/bpf/trampoline.c
++++ b/kernel/bpf/trampoline.c
+@@@ -410,6 -406,17 +410,20 @@@ void notrace __bpf_prog_exit(struct bpf
+  	rcu_read_unlock();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void notrace __bpf_prog_enter_sleepable(void)
++ {
++ 	rcu_read_lock_trace();
++ 	might_fault();
++ }
++ 
++ void notrace __bpf_prog_exit_sleepable(void)
++ {
++ 	rcu_read_unlock_trace();
++ }
++ 
+++>>>>>>> f56407fa6e69 (bpf: Remove bpf_lsm_file_mprotect from sleepable list.)
+  int __weak
+  arch_prepare_bpf_trampoline(void *image, void *image_end,
+  			    const struct btf_func_model *m, u32 flags,
+diff --cc kernel/bpf/verifier.c
+index 543b6ee6fd97,b4e9c56b8b32..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10981,15 -11003,47 +10981,28 @@@ static int check_attach_modify_return(u
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+ +int bpf_check_attach_target(struct bpf_verifier_log *log,
+ +			    const struct bpf_prog *prog,
+ +			    const struct bpf_prog *tgt_prog,
+ +			    u32 btf_id,
+ +			    struct bpf_attach_target_info *tgt_info)
+++=======
++ /* non exhaustive list of sleepable bpf_lsm_*() functions */
++ BTF_SET_START(btf_sleepable_lsm_hooks)
++ #ifdef CONFIG_BPF_LSM
++ BTF_ID(func, bpf_lsm_bprm_committed_creds)
++ #else
++ BTF_ID_UNUSED
++ #endif
++ BTF_SET_END(btf_sleepable_lsm_hooks)
++ 
++ static int check_sleepable_lsm_hook(u32 btf_id)
+++>>>>>>> f56407fa6e69 (bpf: Remove bpf_lsm_file_mprotect from sleepable list.)
+  {
+ -	return btf_id_set_contains(&btf_sleepable_lsm_hooks, btf_id);
+ -}
+ -
+ -/* list of non-sleepable functions that are otherwise on
+ - * ALLOW_ERROR_INJECTION list
+ - */
+ -BTF_SET_START(btf_non_sleepable_error_inject)
+ -/* Three functions below can be called from sleepable and non-sleepable context.
+ - * Assume non-sleepable from bpf safety point of view.
+ - */
+ -BTF_ID(func, __add_to_page_cache_locked)
+ -BTF_ID(func, should_fail_alloc_page)
+ -BTF_ID(func, should_failslab)
+ -BTF_SET_END(btf_non_sleepable_error_inject)
+ -
+ -static int check_non_sleepable_error_inject(u32 btf_id)
+ -{
+ -	return btf_id_set_contains(&btf_non_sleepable_error_inject, btf_id);
+ -}
+ -
+ -static int check_attach_btf_id(struct bpf_verifier_env *env)
+ -{
+ -	struct bpf_prog *prog = env->prog;
+  	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
+ -	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
+ -	u32 btf_id = prog->aux->attach_btf_id;
+  	const char prefix[] = "btf_trace_";
+ -	struct btf_func_model fmodel;
+  	int ret = 0, subprog = -1, i;
+ -	struct bpf_trampoline *tr;
+  	const struct btf_type *t;
+  	bool conservative = true;
+  	const char *tname;
+* Unmerged path kernel/bpf/trampoline.c
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/tools/testing/selftests/bpf/progs/lsm.c b/tools/testing/selftests/bpf/progs/lsm.c
+index 49fa6ca99755..ff4d343b94b5 100644
+--- a/tools/testing/selftests/bpf/progs/lsm.c
++++ b/tools/testing/selftests/bpf/progs/lsm.c
+@@ -36,14 +36,10 @@ int monitored_pid = 0;
+ int mprotect_count = 0;
+ int bprm_count = 0;
+ 
+-SEC("lsm.s/file_mprotect")
++SEC("lsm/file_mprotect")
+ int BPF_PROG(test_int_hook, struct vm_area_struct *vma,
+ 	     unsigned long reqprot, unsigned long prot, int ret)
+ {
+-	char args[64];
+-	__u32 key = 0;
+-	__u64 *value;
+-
+ 	if (ret != 0)
+ 		return ret;
+ 
+@@ -53,18 +49,6 @@ int BPF_PROG(test_int_hook, struct vm_area_struct *vma,
+ 	is_stack = (vma->vm_start <= vma->vm_mm->start_stack &&
+ 		    vma->vm_end >= vma->vm_mm->start_stack);
+ 
+-	bpf_copy_from_user(args, sizeof(args), (void *)vma->vm_mm->arg_start);
+-
+-	value = bpf_map_lookup_elem(&array, &key);
+-	if (value)
+-		*value = 0;
+-	value = bpf_map_lookup_elem(&hash, &key);
+-	if (value)
+-		*value = 0;
+-	value = bpf_map_lookup_elem(&lru_hash, &key);
+-	if (value)
+-		*value = 0;
+-
+ 	if (is_stack && monitored_pid == pid) {
+ 		mprotect_count++;
+ 		ret = -EPERM;
+@@ -77,10 +61,26 @@ SEC("lsm.s/bprm_committed_creds")
+ int BPF_PROG(test_void_hook, struct linux_binprm *bprm)
+ {
+ 	__u32 pid = bpf_get_current_pid_tgid() >> 32;
++	char args[64];
++	__u32 key = 0;
++	__u64 *value;
+ 
+ 	if (monitored_pid == pid)
+ 		bprm_count++;
+ 
++	bpf_copy_from_user(args, sizeof(args), (void *)bprm->vma->vm_mm->arg_start);
++	bpf_copy_from_user(args, sizeof(args), (void *)bprm->mm->arg_start);
++
++	value = bpf_map_lookup_elem(&array, &key);
++	if (value)
++		*value = 0;
++	value = bpf_map_lookup_elem(&hash, &key);
++	if (value)
++		*value = 0;
++	value = bpf_map_lookup_elem(&lru_hash, &key);
++	if (value)
++		*value = 0;
++
+ 	return 0;
+ }
+ SEC("lsm/task_free") /* lsm/ is ok, lsm.s/ fails */
