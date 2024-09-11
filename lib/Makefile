@@ -325,3 +325,5 @@ obj-$(CONFIG_LIST_KUNIT_TEST) += list-test.o
 obj-$(CONFIG_LINEAR_RANGES_KUNIT_TEST) += test_linear_ranges.o
 obj-$(CONFIG_BITS_KUNIT_TEST) += test_bits.o
 obj-$(CONFIG_CMDLINE_KUNIT_TEST) += cmdline_kunit.o
+obj-$(CONFIG_SLUB_KUNIT_TEST) += slub_kunit.o
+obj-$(CONFIG_MEMCPY_KUNIT_TEST) += memcpy_kunit.o

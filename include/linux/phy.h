@@ -79,11 +79,11 @@ extern const int phy_10gbit_features_array[1];
 
 /*
  * Set phydev->irq to PHY_POLL if interrupts are not supported,
- * or not desired for this PHY.  Set to PHY_IGNORE_INTERRUPT if
- * the attached driver handles the interrupt
+ * or not desired for this PHY.  Set to PHY_MAC_INTERRUPT if
+ * the attached MAC driver handles the interrupt
  */
 #define PHY_POLL		-1
-#define PHY_IGNORE_INTERRUPT	-2
+#define PHY_MAC_INTERRUPT	-2
 
 #define PHY_IS_INTERNAL		0x00000001
 #define PHY_RST_AFTER_CLK_EN	0x00000002
@@ -126,6 +126,7 @@ typedef enum {
 	PHY_INTERFACE_MODE_XLGMII,
 	/* 10GBASE-R, XFI, SFI - single lane 10G Serdes */
 	PHY_INTERFACE_MODE_10GBASER,
+	PHY_INTERFACE_MODE_5GBASER,
 #endif
 	PHY_INTERFACE_MODE_MAX,
 } phy_interface_t;
@@ -198,6 +199,8 @@ static inline const char *phy_modes(phy_interface_t interface)
 		return "1000base-x";
 	case PHY_INTERFACE_MODE_2500BASEX:
 		return "2500base-x";
+	case PHY_INTERFACE_MODE_5GBASER:
+		return "5gbase-r";
 	case PHY_INTERFACE_MODE_RXAUI:
 		return "rxaui";
 	case PHY_INTERFACE_MODE_XAUI:
@@ -465,6 +468,7 @@ struct phy_c45_device_ids {
  * sysfs_links: Internal boolean tracking sysfs symbolic links setup/removal.
  * loopback_enabled: Set true if this phy has been loopbacked successfully.
  * downshifted_rate: Set true if link speed has been downshifted.
+ * is_on_sfp_module: Set true if PHY is located on an SFP module.
  * state: state of the PHY for management purposes
  * dev_flags: Device-specific flags used by the PHY driver.
  * irq: IRQ number of the PHY's interrupt (-1 if none)
@@ -515,8 +519,9 @@ struct phy_device {
 	RH_KABI_FILL_HOLE(unsigned suspended_by_mdio_bus:1)
 	RH_KABI_FILL_HOLE(unsigned downshifted_rate:1)
 	RH_KABI_FILL_HOLE(unsigned mac_managed_pm:1)
+	RH_KABI_FILL_HOLE(unsigned is_on_sfp_module:1)
 
-	/* 17 bits hole remain */
+	/* 16 bits hole remain */
 
 	enum phy_state state;
 
@@ -1159,11 +1164,11 @@ static inline int phy_clear_bits_mmd(struct phy_device *phydev, int devad,
  * @phydev: the phy_device struct
  *
  * NOTE: must be kept in sync with addition/removal of PHY_POLL and
- * PHY_IGNORE_INTERRUPT
+ * PHY_MAC_INTERRUPT
  */
 static inline bool phy_interrupt_is_valid(struct phy_device *phydev)
 {
-	return phydev->irq != PHY_POLL && phydev->irq != PHY_IGNORE_INTERRUPT;
+	return phydev->irq != PHY_POLL && phydev->irq != PHY_MAC_INTERRUPT;
 }
 
 /**
@@ -1247,6 +1252,15 @@ static inline void phy_txtstamp(struct phy_device *phydev, struct sk_buff *skb,
 static inline bool phy_is_internal(struct phy_device *phydev)
 {
 	return phydev->is_internal;
+}
+
+/**
+ * phy_on_sfp - Convenience function for testing if a PHY is on an SFP module
+ * @phydev: the phy_device struct
+ */
+static inline bool phy_on_sfp(struct phy_device *phydev)
+{
+	return phydev->is_on_sfp_module;
 }
 
 /**

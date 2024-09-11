@@ -2255,23 +2255,6 @@ static void iscsi_ep_disconnect(struct iscsi_cls_conn *conn, bool is_active)
 	ISCSI_DBG_TRANS_CONN(conn, "disconnect ep done.\n");
 }
 
-static void iscsi_if_disconnect_bound_ep(struct iscsi_cls_conn *conn,
-					 struct iscsi_endpoint *ep,
-					 bool is_active)
-{
-	/* Check if this was a conn error and the kernel took ownership */
-	if (!test_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
-		iscsi_ep_disconnect(conn, is_active);
-	} else {
-		ISCSI_DBG_TRANS_CONN(conn, "flush kernel conn cleanup.\n");
-		mutex_unlock(&conn->ep_mutex);
-
-		flush_work(&conn->cleanup_work);
-
-		mutex_lock(&conn->ep_mutex);
-	}
-}
-
 static int iscsi_if_stop_conn(struct iscsi_transport *transport,
 			      struct iscsi_uevent *ev)
 {
@@ -2293,19 +2276,18 @@ static int iscsi_if_stop_conn(struct iscsi_transport *transport,
 		iscsi_stop_conn(conn, flag);
 	} else {
 		/*
-		 * For offload, when iscsid is restarted it won't know about
-		 * existing endpoints so it can't do a ep_disconnect. We clean
-		 * it up here for userspace.
-		 */
-		mutex_lock(&conn->ep_mutex);
-		if (conn->ep)
-			iscsi_if_disconnect_bound_ep(conn, conn->ep, true);
-		mutex_unlock(&conn->ep_mutex);
-
-		/*
 		 * Figure out if it was the kernel or userspace initiating this.
 		 */
 		if (!test_and_set_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
+			if (conn->ep) {
+				/*
+				 * For offload, when iscsid is restarted it
+				 * won't know about existing endpoints. We
+				 * clean it up here for userspace.
+				 */
+				iscsi_ep_disconnect(conn, true);
+			}
+
 			iscsi_stop_conn(conn, flag);
 		} else {
 			ISCSI_DBG_TRANS_CONN(conn,
@@ -3030,7 +3012,16 @@ static int iscsi_if_ep_disconnect(struct iscsi_transport *transport,
 	}
 
 	mutex_lock(&conn->ep_mutex);
-	iscsi_if_disconnect_bound_ep(conn, ep, false);
+	/* Check if this was a conn error and the kernel took ownership */
+	if (test_bit(ISCSI_CLS_CONN_BIT_CLEANUP, &conn->flags)) {
+		ISCSI_DBG_TRANS_CONN(conn, "flush kernel conn cleanup.\n");
+		mutex_unlock(&conn->ep_mutex);
+
+		flush_work(&conn->cleanup_work);
+		goto put_ep;
+	}
+
+	iscsi_ep_disconnect(conn, false);
 	mutex_unlock(&conn->ep_mutex);
 put_ep:
 	iscsi_put_endpoint(ep);

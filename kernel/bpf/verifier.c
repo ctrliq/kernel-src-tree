@@ -8945,12 +8945,14 @@ static int check_ld_imm(struct bpf_verifier_env *env, struct bpf_insn *insn)
 	mark_reg_known_zero(env, regs, insn->dst_reg);
 	dst_reg->map_ptr = map;
 
-	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE) {
+	if (insn->src_reg == BPF_PSEUDO_MAP_VALUE ||
+	    insn->src_reg == BPF_PSEUDO_MAP_IDX_VALUE) {
 		dst_reg->type = PTR_TO_MAP_VALUE;
 		dst_reg->off = aux->map_off;
 		if (map_value_has_spin_lock(map))
 			dst_reg->id = ++env->id_gen;
-	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD) {
+	} else if (insn->src_reg == BPF_PSEUDO_MAP_FD ||
+		   insn->src_reg == BPF_PSEUDO_MAP_IDX) {
 		dst_reg->type = CONST_PTR_TO_MAP;
 	} else {
 		verbose(env, "bpf verifier is misconfigured\n");
@@ -9466,7 +9468,7 @@ static int check_abnormal_return(struct bpf_verifier_env *env)
 
 static int check_btf_func(struct bpf_verifier_env *env,
 			  const union bpf_attr *attr,
-			  union bpf_attr __user *uattr)
+			  bpfptr_t uattr)
 {
 	const struct btf_type *type, *func_proto, *ret_type;
 	u32 i, nfuncs, urec_size, min_size;
@@ -9475,7 +9477,7 @@ static int check_btf_func(struct bpf_verifier_env *env,
 	struct bpf_func_info_aux *info_aux = NULL;
 	struct bpf_prog *prog;
 	const struct btf *btf;
-	void __user *urecord;
+	bpfptr_t urecord;
 	u32 prev_offset = 0;
 	bool scalar_return;
 	int ret = -ENOMEM;
@@ -9503,7 +9505,7 @@ static int check_btf_func(struct bpf_verifier_env *env,
 	prog = env->prog;
 	btf = prog->aux->btf;
 
-	urecord = u64_to_user_ptr(attr->func_info);
+	urecord = make_bpfptr(attr->func_info, uattr.is_kernel);
 	min_size = min_t(u32, krec_size, urec_size);
 
 	krecord = kvcalloc(nfuncs, krec_size, GFP_KERNEL | __GFP_NOWARN);
@@ -9521,13 +9523,15 @@ static int check_btf_func(struct bpf_verifier_env *env,
 				/* set the size kernel expects so loader can zero
 				 * out the rest of the record.
 				 */
-				if (put_user(min_size, &uattr->func_info_rec_size))
+				if (copy_to_bpfptr_offset(uattr,
+							  offsetof(union bpf_attr, func_info_rec_size),
+							  &min_size, sizeof(min_size)))
 					ret = -EFAULT;
 			}
 			goto err_free;
 		}
 
-		if (copy_from_user(&krecord[i], urecord, min_size)) {
+		if (copy_from_bpfptr(&krecord[i], urecord, min_size)) {
 			ret = -EFAULT;
 			goto err_free;
 		}
@@ -9579,7 +9583,7 @@ static int check_btf_func(struct bpf_verifier_env *env,
 		}
 
 		prev_offset = krecord[i].insn_off;
-		urecord += urec_size;
+		bpfptr_add(&urecord, urec_size);
 	}
 
 	prog->aux->func_info = krecord;
@@ -9611,14 +9615,14 @@ static void adjust_btf_func(struct bpf_verifier_env *env)
 
 static int check_btf_line(struct bpf_verifier_env *env,
 			  const union bpf_attr *attr,
-			  union bpf_attr __user *uattr)
+			  bpfptr_t uattr)
 {
 	u32 i, s, nr_linfo, ncopy, expected_size, rec_size, prev_offset = 0;
 	struct bpf_subprog_info *sub;
 	struct bpf_line_info *linfo;
 	struct bpf_prog *prog;
 	const struct btf *btf;
-	void __user *ulinfo;
+	bpfptr_t ulinfo;
 	int err;
 
 	nr_linfo = attr->line_info_cnt;
@@ -9644,7 +9648,7 @@ static int check_btf_line(struct bpf_verifier_env *env,
 
 	s = 0;
 	sub = env->subprog_info;
-	ulinfo = u64_to_user_ptr(attr->line_info);
+	ulinfo = make_bpfptr(attr->line_info, uattr.is_kernel);
 	expected_size = sizeof(struct bpf_line_info);
 	ncopy = min_t(u32, expected_size, rec_size);
 	for (i = 0; i < nr_linfo; i++) {
@@ -9652,14 +9656,15 @@ static int check_btf_line(struct bpf_verifier_env *env,
 		if (err) {
 			if (err == -E2BIG) {
 				verbose(env, "nonzero tailing record in line_info");
-				if (put_user(expected_size,
-					     &uattr->line_info_rec_size))
+				if (copy_to_bpfptr_offset(uattr,
+							  offsetof(union bpf_attr, line_info_rec_size),
+							  &expected_size, sizeof(expected_size)))
 					err = -EFAULT;
 			}
 			goto err_free;
 		}
 
-		if (copy_from_user(&linfo[i], ulinfo, ncopy)) {
+		if (copy_from_bpfptr(&linfo[i], ulinfo, ncopy)) {
 			err = -EFAULT;
 			goto err_free;
 		}
@@ -9711,7 +9716,7 @@ static int check_btf_line(struct bpf_verifier_env *env,
 		}
 
 		prev_offset = linfo[i].insn_off;
-		ulinfo += rec_size;
+		bpfptr_add(&ulinfo, rec_size);
 	}
 
 	if (s != env->subprog_cnt) {
@@ -9733,7 +9738,7 @@ err_free:
 
 static int check_btf_info(struct bpf_verifier_env *env,
 			  const union bpf_attr *attr,
-			  union bpf_attr __user *uattr)
+			  bpfptr_t uattr)
 {
 	struct btf *btf;
 	int err;
@@ -11201,6 +11206,7 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 			struct bpf_map *map;
 			struct fd f;
 			u64 addr;
+			u32 fd;
 
 			if (i == insn_cnt - 1 || insn[1].code != 0 ||
 			    insn[1].dst_reg != 0 || insn[1].src_reg != 0 ||
@@ -11230,16 +11236,38 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 			/* In final convert_pseudo_ld_imm64() step, this is
 			 * converted into regular 64-bit imm load insn.
 			 */
-			if ((insn[0].src_reg != BPF_PSEUDO_MAP_FD &&
-			     insn[0].src_reg != BPF_PSEUDO_MAP_VALUE) ||
-			    (insn[0].src_reg == BPF_PSEUDO_MAP_FD &&
-			     insn[1].imm != 0)) {
-				verbose(env,
-					"unrecognized bpf_ld_imm64 insn\n");
+			switch (insn[0].src_reg) {
+			case BPF_PSEUDO_MAP_VALUE:
+			case BPF_PSEUDO_MAP_IDX_VALUE:
+				break;
+			case BPF_PSEUDO_MAP_FD:
+			case BPF_PSEUDO_MAP_IDX:
+				if (insn[1].imm == 0)
+					break;
+				fallthrough;
+			default:
+				verbose(env, "unrecognized bpf_ld_imm64 insn\n");
 				return -EINVAL;
 			}
 
-			f = fdget(insn[0].imm);
+			switch (insn[0].src_reg) {
+			case BPF_PSEUDO_MAP_IDX_VALUE:
+			case BPF_PSEUDO_MAP_IDX:
+				if (bpfptr_is_null(env->fd_array)) {
+					verbose(env, "fd_idx without fd_array is invalid\n");
+					return -EPROTO;
+				}
+				if (copy_from_bpfptr_offset(&fd, env->fd_array,
+							    insn[0].imm * sizeof(fd),
+							    sizeof(fd)))
+					return -EFAULT;
+				break;
+			default:
+				fd = insn[0].imm;
+				break;
+			}
+
+			f = fdget(fd);
 			map = __bpf_map_get(f);
 			if (IS_ERR(map)) {
 				verbose(env, "fd %d is not pointing to valid bpf_map\n",
@@ -11254,7 +11282,8 @@ static int resolve_pseudo_ldimm64(struct bpf_verifier_env *env)
 			}
 
 			aux = &env->insn_aux_data[i];
-			if (insn->src_reg == BPF_PSEUDO_MAP_FD) {
+			if (insn[0].src_reg == BPF_PSEUDO_MAP_FD ||
+			    insn[0].src_reg == BPF_PSEUDO_MAP_IDX) {
 				addr = (unsigned long)map;
 			} else {
 				u32 off = insn[1].imm;
@@ -13197,6 +13226,14 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
 	int ret;
 	u64 key;
 
+	if (prog->type == BPF_PROG_TYPE_SYSCALL) {
+		if (prog->aux->sleepable)
+			/* attach_btf_id checked to be zero already */
+			return 0;
+		verbose(env, "Syscall programs can only be sleepable\n");
+		return -EINVAL;
+	}
+
 	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
 	    prog->type != BPF_PROG_TYPE_LSM) {
 		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
@@ -13271,8 +13308,7 @@ struct btf *bpf_get_btf_vmlinux(void)
 	return btf_vmlinux;
 }
 
-int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
-	      union bpf_attr __user *uattr)
+int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr)
 {
 	u64 start_time = ktime_get_ns();
 	struct bpf_verifier_env *env;
@@ -13302,6 +13338,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
 		env->insn_aux_data[i].orig_idx = i;
 	env->prog = *prog;
 	env->ops = bpf_verifier_ops[env->prog->type];
+	env->fd_array = make_bpfptr(attr->fd_array, uattr.is_kernel);
 	is_priv = bpf_capable();
 
 	bpf_get_btf_vmlinux();

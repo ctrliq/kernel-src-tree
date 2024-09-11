@@ -8281,9 +8281,13 @@ unsigned int nft_parse_register(const struct nlattr *attr)
 	switch (reg) {
 	case NFT_REG_VERDICT...NFT_REG_4:
 		return reg * NFT_REG_SIZE / NFT_REG32_SIZE;
-	default:
+	case NFT_REG32_00...NFT_REG32_15:
 		return reg + NFT_REG_SIZE / NFT_REG32_SIZE - NFT_REG32_00;
+	default:
+		break;
 	}
+
+	return 0xff; /* invalid register */
 }
 EXPORT_SYMBOL_GPL(nft_parse_register);
 
@@ -8324,6 +8328,8 @@ int nft_validate_register_load(enum nft_registers reg, unsigned int len)
 		return -EINVAL;
 	if (len == 0)
 		return -EINVAL;
+	if (reg > 0xff)
+		return -ERANGE;
 	if (reg * NFT_REG32_SIZE + len > FIELD_SIZEOF(struct nft_regs, data))
 		return -ERANGE;
 
@@ -8366,7 +8372,7 @@ int nft_validate_register_store(const struct nft_ctx *ctx,
 		}
 
 		return 0;
-	default:
+	case NFT_REG_1...NFT_REG32_15:
 		if (reg < NFT_REG_1 * NFT_REG_SIZE / NFT_REG32_SIZE)
 			return -EINVAL;
 		if (len == 0)
@@ -8378,6 +8384,8 @@ int nft_validate_register_store(const struct nft_ctx *ctx,
 		if (data != NULL && type != NFT_DATA_VALUE)
 			return -EINVAL;
 		return 0;
+	default:
+		return -ERANGE;
 	}
 }
 EXPORT_SYMBOL_GPL(nft_validate_register_store);

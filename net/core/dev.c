@@ -5903,18 +5903,6 @@ struct packet_offload *gro_find_complete_by_type(__be16 type)
 }
 EXPORT_SYMBOL(gro_find_complete_by_type);
 
-static void napi_skb_free_stolen_head(struct sk_buff *skb)
-{
-	if (unlikely(skb->slow_gro)) {
-		nf_reset(skb);
-		skb_dst_drop(skb);
-		skb_ext_put(skb);
-		skb_orphan(skb);
-		skb->slow_gro = 0;
-	}
-	kmem_cache_free(skbuff_head_cache, skb);
-}
-
 static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
 {
 	switch (ret) {
@@ -5933,7 +5921,7 @@ static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
 		else if (skb->fclone != SKB_FCLONE_UNAVAILABLE)
 			__kfree_skb(skb);
 		else
-			__kfree_skb(skb);
+			__kfree_skb_defer(skb);
 		break;
 
 	case GRO_HELD:

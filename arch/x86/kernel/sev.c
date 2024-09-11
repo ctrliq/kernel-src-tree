@@ -192,9 +192,16 @@ static __always_inline struct ghcb *sev_es_get_ghcb(struct ghcb_state *state)
 		/* GHCB is already in use - save its contents */
 
 		if (unlikely(data->backup_ghcb_active)) {
-			/* RHEL only: avoid 'may be used uninitialized'*/
-			state->ghcb = NULL;
-			return NULL;
+			/*
+			 * Backup-GHCB is also already in use. There is no way
+			 * to continue here so just kill the machine. To make
+			 * panic() work, mark GHCBs inactive so that messages
+			 * can be printed out.
+			 */
+			data->ghcb_active        = false;
+			data->backup_ghcb_active = false;
+
+			panic("Unable to handle #VC exception! GHCB and Backup GHCB are already in use");
 		}
 
 		/* Mark backup_ghcb active before writing to it */
@@ -1281,7 +1288,7 @@ static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
 		break;
 	case X86_TRAP_PF:
 		write_cr2(ctxt->fi.cr2);
-		exc_page_fault(ctxt->regs, error_code);
+		do_page_fault(ctxt->regs, error_code);
 		break;
 	case X86_TRAP_AC:
 		do_alignment_check(ctxt->regs, error_code);
@@ -1292,11 +1299,24 @@ static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
 	}
 }
 
-static __always_inline bool on_vc_fallback_stack(struct pt_regs *regs)
+static __always_inline bool is_vc2_stack(unsigned long sp)
 {
-	unsigned long sp = (unsigned long)regs;
-
 	return (sp >= __this_cpu_ist_bottom_va(VC2) && sp < __this_cpu_ist_top_va(VC2));
+}
+
+static __always_inline bool vc_from_invalid_context(struct pt_regs *regs)
+{
+	unsigned long sp, prev_sp;
+
+	sp      = (unsigned long)regs;
+	prev_sp = regs->sp;
+
+	/*
+	 * If the code was already executing on the VC2 stack when the #VC
+	 * happened, let it proceed to the normal handling routine. This way the
+	 * code executing on the VC2 stack can cause #VC exceptions to get handled.
+	 */
+	return is_vc2_stack(sp) && !is_vc2_stack(prev_sp);
 }
 
 /*
@@ -1312,7 +1332,6 @@ static __always_inline bool on_vc_fallback_stack(struct pt_regs *regs)
  */
 __visible noinstr void safe_stack_exc_vmm_communication(struct pt_regs *regs, long error_code)
 {
-	struct sev_es_runtime_data *data = this_cpu_read(runtime_data);
 	struct ghcb_state state;
 	struct es_em_ctxt ctxt;
 	enum es_result result;
@@ -1337,16 +1356,6 @@ __visible noinstr void safe_stack_exc_vmm_communication(struct pt_regs *regs, lo
 	 */
 
 	ghcb = sev_es_get_ghcb(&state);
-	if (!ghcb) {
-		/*
-		 * Mark GHCBs inactive so that panic() is able to print the
-		 * message.
-		 */
-		data->ghcb_active        = false;
-		data->backup_ghcb_active = false;
-
-		panic("Unable to handle #VC exception! GHCB and Backup GHCB are already in use");
-	}
 
 	vc_ghcb_invalidate(ghcb);
 	result = vc_init_em_ctxt(&ctxt, regs, error_code);
@@ -1428,7 +1437,7 @@ __visible noinstr void ist_exc_vmm_communication(struct pt_regs *regs, long erro
 
 dotraplinkage void do_vmm_communication(struct pt_regs *regs, long error_code)
 {
-	if (likely(!on_vc_fallback_stack(regs)))
+	if (likely(!vc_from_invalid_context(regs)))
 		safe_stack_exc_vmm_communication(regs, error_code);
 	else
 		ist_exc_vmm_communication(regs, error_code);

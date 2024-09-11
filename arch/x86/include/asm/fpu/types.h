@@ -480,7 +480,7 @@ struct fpu {
 	 *
 	 * Permission related information for guest pseudo FPUs
 	 */
-	struct fpu_state_perm		guest_perm;
+	RH_KABI_EXTEND(struct fpu_state_perm guest_perm)
 
 	/*
 	 * @__fpstate:

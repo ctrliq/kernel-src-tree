@@ -160,11 +160,23 @@ struct ice_rule_query_data {
 	u16 vsi_handle;
 };
 
+/* This structure allows to pass info about lb_en and lan_en
+ * flags to ice_add_adv_rule. Values in act would be used
+ * only if act_valid was set to true, otherwise default
+ * values would be used.
+ */
+struct ice_adv_rule_flags_info {
+	u32 act;
+	u8 act_valid;		/* indicate if flags in act are valid */
+};
+
 struct ice_adv_rule_info {
+	enum ice_sw_tunnel_type tun_type;
 	struct ice_sw_act_ctrl sw_act;
 	u32 priority;
 	u8 rx; /* true means LOOKUP_RX otherwise LOOKUP_TX */
 	u16 fltr_rule_id;
+	struct ice_adv_rule_flags_info flags_info;
 };
 
 /* A collection of one or more four word recipe */
@@ -199,6 +211,8 @@ struct ice_sw_recipe {
 
 	/* Bit map specifying the IDs associated with this group of recipe */
 	DECLARE_BITMAP(r_bitmap, ICE_MAX_NUM_RECIPES);
+
+	enum ice_sw_tunnel_type tun_type;
 
 	/* List of type ice_fltr_mgmt_list_entry or adv_rule */
 	u8 adv_rule;
@@ -242,7 +256,7 @@ struct ice_vsi_list_map_info {
 
 struct ice_fltr_list_entry {
 	struct list_head list_entry;
-	enum ice_status status;
+	int status;
 	struct ice_fltr_info fltr_info;
 };
 
@@ -288,73 +302,69 @@ enum ice_promisc_flags {
 };
 
 /* VSI related commands */
-enum ice_status
+int
 ice_add_vsi(struct ice_hw *hw, u16 vsi_handle, struct ice_vsi_ctx *vsi_ctx,
 	    struct ice_sq_cd *cd);
-enum ice_status
+int
 ice_free_vsi(struct ice_hw *hw, u16 vsi_handle, struct ice_vsi_ctx *vsi_ctx,
 	     bool keep_vsi_alloc, struct ice_sq_cd *cd);
-enum ice_status
+int
 ice_update_vsi(struct ice_hw *hw, u16 vsi_handle, struct ice_vsi_ctx *vsi_ctx,
 	       struct ice_sq_cd *cd);
 bool ice_is_vsi_valid(struct ice_hw *hw, u16 vsi_handle);
 struct ice_vsi_ctx *ice_get_vsi_ctx(struct ice_hw *hw, u16 vsi_handle);
 void ice_clear_all_vsi_ctx(struct ice_hw *hw);
 /* Switch config */
-enum ice_status ice_get_initial_sw_cfg(struct ice_hw *hw);
+int ice_get_initial_sw_cfg(struct ice_hw *hw);
 
-enum ice_status
+int
 ice_alloc_res_cntr(struct ice_hw *hw, u8 type, u8 alloc_shared, u16 num_items,
 		   u16 *counter_id);
-enum ice_status
+int
 ice_free_res_cntr(struct ice_hw *hw, u8 type, u8 alloc_shared, u16 num_items,
 		  u16 counter_id);
 
 /* Switch/bridge related commands */
-enum ice_status
+int
 ice_add_adv_rule(struct ice_hw *hw, struct ice_adv_lkup_elem *lkups,
 		 u16 lkups_cnt, struct ice_adv_rule_info *rinfo,
 		 struct ice_rule_query_data *added_entry);
-enum ice_status ice_update_sw_rule_bridge_mode(struct ice_hw *hw);
-enum ice_status ice_add_mac(struct ice_hw *hw, struct list_head *m_lst);
-enum ice_status ice_remove_mac(struct ice_hw *hw, struct list_head *m_lst);
-enum ice_status
-ice_add_eth_mac(struct ice_hw *hw, struct list_head *em_list);
-enum ice_status
-ice_remove_eth_mac(struct ice_hw *hw, struct list_head *em_list);
-int
-ice_cfg_rdma_fltr(struct ice_hw *hw, u16 vsi_handle, bool enable);
+int ice_update_sw_rule_bridge_mode(struct ice_hw *hw);
+int ice_add_vlan(struct ice_hw *hw, struct list_head *m_list);
+int ice_remove_vlan(struct ice_hw *hw, struct list_head *v_list);
+int ice_add_mac(struct ice_hw *hw, struct list_head *m_lst);
+int ice_remove_mac(struct ice_hw *hw, struct list_head *m_lst);
+bool ice_mac_fltr_exist(struct ice_hw *hw, u8 *mac, u16 vsi_handle);
+bool ice_vlan_fltr_exist(struct ice_hw *hw, u16 vlan_id, u16 vsi_handle);
+int ice_add_eth_mac(struct ice_hw *hw, struct list_head *em_list);
+int ice_remove_eth_mac(struct ice_hw *hw, struct list_head *em_list);
+int ice_cfg_rdma_fltr(struct ice_hw *hw, u16 vsi_handle, bool enable);
 void ice_remove_vsi_fltr(struct ice_hw *hw, u16 vsi_handle);
-enum ice_status
-ice_add_vlan(struct ice_hw *hw, struct list_head *m_list);
-enum ice_status ice_remove_vlan(struct ice_hw *hw, struct list_head *v_list);
 
 /* Promisc/defport setup for VSIs */
-enum ice_status
-ice_cfg_dflt_vsi(struct ice_hw *hw, u16 vsi_handle, bool set, u8 direction);
-enum ice_status
+int ice_cfg_dflt_vsi(struct ice_hw *hw, u16 vsi_handle, bool set, u8 direction);
+int
 ice_set_vsi_promisc(struct ice_hw *hw, u16 vsi_handle, u8 promisc_mask,
 		    u16 vid);
-enum ice_status
+int
 ice_clear_vsi_promisc(struct ice_hw *hw, u16 vsi_handle, u8 promisc_mask,
 		      u16 vid);
-enum ice_status
+int
 ice_set_vlan_vsi_promisc(struct ice_hw *hw, u16 vsi_handle, u8 promisc_mask,
 			 bool rm_vlan_promisc);
 
-enum ice_status
-ice_rem_adv_rule_for_vsi(struct ice_hw *hw, u16 vsi_handle);
-enum ice_status
+int ice_rem_adv_rule_for_vsi(struct ice_hw *hw, u16 vsi_handle);
+int
 ice_rem_adv_rule_by_id(struct ice_hw *hw,
 		       struct ice_rule_query_data *remove_entry);
 
-enum ice_status ice_init_def_sw_recp(struct ice_hw *hw);
+int ice_init_def_sw_recp(struct ice_hw *hw);
 u16 ice_get_hw_vsi_num(struct ice_hw *hw, u16 vsi_handle);
 
-enum ice_status ice_replay_vsi_all_fltr(struct ice_hw *hw, u16 vsi_handle);
+int ice_replay_vsi_all_fltr(struct ice_hw *hw, u16 vsi_handle);
 void ice_rm_all_sw_replay_rule_info(struct ice_hw *hw);
 
-enum ice_status
+int
 ice_aq_sw_rules(struct ice_hw *hw, void *rule_list, u16 rule_list_sz,
 		u8 num_rules, enum ice_adminq_opc opc, struct ice_sq_cd *cd);
 #endif /* _ICE_SWITCH_H_ */

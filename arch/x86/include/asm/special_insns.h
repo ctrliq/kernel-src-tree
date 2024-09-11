@@ -6,6 +6,8 @@
 #ifdef __KERNEL__
 
 #include <asm/nops.h>
+#include <asm/processor-flags.h>
+#include <linux/jump_label.h>
 
 /*
  * Volatile isn't enough to prevent the compiler from reordering the
@@ -16,29 +18,13 @@
  */
 extern unsigned long __force_order;
 
+void native_write_cr0(unsigned long val);
+
 static inline unsigned long native_read_cr0(void)
 {
 	unsigned long val;
 	asm volatile("mov %%cr0,%0\n\t" : "=r" (val), "=m" (__force_order));
 	return val;
-}
-
-static inline void native_write_cr0(unsigned long val)
-{
-	unsigned long bits_missing = 0;
-
-set_register:
-	asm volatile("mov %0,%%cr0": "+r" (val), "+m" (__force_order));
-
-	if (static_branch_likely(&cr_pinning)) {
-		if (unlikely((val & X86_CR0_WP) != X86_CR0_WP)) {
-			bits_missing = X86_CR0_WP;
-			val |= bits_missing;
-			goto set_register;
-		}
-		/* Warn after we've set the missing bits. */
-		WARN_ONCE(bits_missing, "CR0 WP bit went missing!?\n");
-	}
 }
 
 static inline unsigned long native_read_cr2(void)
@@ -85,10 +71,7 @@ static inline unsigned long native_read_cr4(void)
 	return val;
 }
 
-static inline void native_write_cr4(unsigned long val)
-{
-	asm volatile("mov %0,%%cr4": : "r" (val), "m" (__force_order));
-}
+void native_write_cr4(unsigned long val);
 
 #ifdef CONFIG_X86_64
 static inline unsigned long native_read_cr8(void)

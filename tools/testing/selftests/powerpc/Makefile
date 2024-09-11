@@ -28,7 +28,8 @@ SUB_DIRS = alignment		\
 	   tm			\
 	   vphn         \
 	   math		\
-	   ptrace
+	   ptrace	\
+	   mce
 
 endif
 

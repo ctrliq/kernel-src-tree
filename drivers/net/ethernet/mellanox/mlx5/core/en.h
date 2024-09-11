@@ -66,14 +66,13 @@ struct page_pool;
 #define MLX5E_METADATA_ETHER_TYPE (0x8CE4)
 #define MLX5E_METADATA_ETHER_LEN 8
 
-#define MLX5_SET_CFG(p, f, v) MLX5_SET(create_flow_group_in, p, f, v)
-
 #define MLX5E_ETH_HARD_MTU (ETH_HLEN + VLAN_HLEN + ETH_FCS_LEN)
 
 #define MLX5E_HW2SW_MTU(params, hwmtu) ((hwmtu) - ((params)->hard_mtu))
 #define MLX5E_SW2HW_MTU(params, swmtu) ((swmtu) + ((params)->hard_mtu))
 
 #define MLX5E_MAX_NUM_TC	8
+#define MLX5E_MAX_NUM_MQPRIO_CH_TC TC_QOPT_MAX_QUEUE
 
 #define MLX5_RX_HEADROOM NET_SKB_PAD
 #define MLX5_SKB_FRAG_SZ(len)	(SKB_DATA_ALIGN(len) +	\
@@ -253,6 +252,10 @@ struct mlx5e_params {
 	struct {
 		u16 mode;
 		u8 num_tc;
+		struct netdev_tc_txq tc_to_txq[TC_MAX_QUEUE];
+		struct {
+			struct mlx5e_mqprio_rl *rl;
+		} channel;
 	} mqprio;
 	bool rx_cqe_compress_def;
 	struct dim_cq_moder rx_cq_moderation;
@@ -881,6 +884,7 @@ struct mlx5e_priv {
 #endif
 	struct mlx5e_scratchpad    scratchpad;
 	struct mlx5e_htb           htb;
+	struct mlx5e_mqprio_rl    *mqprio_rl;
 };
 
 struct mlx5e_rx_handlers {
