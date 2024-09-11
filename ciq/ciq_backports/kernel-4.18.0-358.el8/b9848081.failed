@@ -1,0 +1,140 @@
+loop: split loop_lookup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit b9848081465d8734441408129bd44311c7b6d644
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b9848081.failed
+
+loop_lookup has two callers - one wants to do the a find by index and the
+other wants any unbound loop device.  Open code the respective
+functionality in each caller.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20210623145908.92973-9-hch@lst.de
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b9848081465d8734441408129bd44311c7b6d644)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/loop.c
+diff --cc drivers/block/loop.c
+index c2f478450eaa,ff7014608ef6..000000000000
+--- a/drivers/block/loop.c
++++ b/drivers/block/loop.c
+@@@ -2200,56 -2353,71 +2200,77 @@@ static void loop_remove(struct loop_dev
+  	kfree(lo);
+  }
+  
+- static int find_free_cb(int id, void *ptr, void *data)
++ static void loop_probe(dev_t dev)
+  {
+- 	struct loop_device *lo = ptr;
+- 	struct loop_device **l = data;
++ 	int idx = MINOR(dev) >> part_shift;
+++	struct loop_device *lo;
+  
+- 	if (lo->lo_state == Lo_unbound) {
+- 		*l = lo;
+- 		return 1;
+- 	}
+- 	return 0;
+- }
++ 	if (max_loop && idx >= max_loop)
++ 		return;
+ -	loop_add(idx);
+ -}
+  
+- static int loop_lookup(struct loop_device **l, int i)
+++<<<<<<< HEAD
+++	mutex_lock(&loop_ctl_mutex);
+++	if (loop_lookup(&lo, idx) < 0)
+++		loop_add(&lo, idx);
+++	mutex_unlock(&loop_ctl_mutex);
+++=======
++ static int loop_control_remove(int idx)
+  {
+  	struct loop_device *lo;
+- 	int ret = -ENODEV;
++ 	int ret;
+  
+- 	if (i < 0) {
+- 		int err;
++ 	if (idx < 0) {
++ 		pr_warn("deleting an unspecified loop device is not supported.\n");
++ 		return -EINVAL;
++ 	}
++ 		
++ 	ret = mutex_lock_killable(&loop_ctl_mutex);
++ 	if (ret)
++ 		return ret;
+  
+- 		err = idr_for_each(&loop_index_idr, &find_free_cb, &lo);
+- 		if (err == 1) {
+- 			*l = lo;
+- 			ret = lo->lo_number;
+- 		}
+- 		goto out;
++ 	lo = idr_find(&loop_index_idr, idx);
++ 	if (!lo) {
++ 		ret = -ENODEV;
++ 		goto out_unlock_ctrl;
+  	}
+  
+- 	/* lookup and return a specific i */
+- 	lo = idr_find(&loop_index_idr, i);
+- 	if (lo) {
+- 		*l = lo;
+- 		ret = lo->lo_number;
++ 	ret = mutex_lock_killable(&lo->lo_mutex);
++ 	if (ret)
++ 		goto out_unlock_ctrl;
++ 	if (lo->lo_state != Lo_unbound ||
++ 	    atomic_read(&lo->lo_refcnt) > 0) {
++ 		mutex_unlock(&lo->lo_mutex);
++ 		ret = -EBUSY;
++ 		goto out_unlock_ctrl;
+  	}
+- out:
++ 	lo->lo_state = Lo_deleting;
++ 	mutex_unlock(&lo->lo_mutex);
++ 
++ 	idr_remove(&loop_index_idr, lo->lo_number);
++ 	loop_remove(lo);
++ out_unlock_ctrl:
++ 	mutex_unlock(&loop_ctl_mutex);
+  	return ret;
+  }
+  
+- static void loop_probe(dev_t dev)
++ static int loop_control_get_free(int idx)
+  {
+- 	int idx = MINOR(dev) >> part_shift;
+  	struct loop_device *lo;
++ 	int id, ret;
+  
+- 	if (max_loop && idx >= max_loop)
+- 		return;
+- 
+- 	mutex_lock(&loop_ctl_mutex);
+- 	if (loop_lookup(&lo, idx) < 0)
+- 		loop_add(&lo, idx);
++ 	ret = mutex_lock_killable(&loop_ctl_mutex);
++ 	if (ret)
++ 		return ret;
++ 	idr_for_each_entry(&loop_index_idr, lo, id) {
++ 		if (lo->lo_state == Lo_unbound)
++ 			goto found;
++ 	}
++ 	mutex_unlock(&loop_ctl_mutex);
++ 	return loop_add(-1);
++ found:
+  	mutex_unlock(&loop_ctl_mutex);
++ 	return id;
+++>>>>>>> b9848081465d (loop: split loop_lookup)
+  }
+  
+  static long loop_control_ioctl(struct file *file, unsigned int cmd,
+* Unmerged path drivers/block/loop.c
