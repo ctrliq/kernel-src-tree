@@ -1,0 +1,138 @@
+memcg: fix use-after-free in uncharge_batch
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Michal Hocko <mhocko@suse.com>
+commit f1796544a0ca0f14386a679d3d05fbc69235015e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f1796544.failed
+
+syzbot has reported an use-after-free in the uncharge_batch path
+
+  BUG: KASAN: use-after-free in instrument_atomic_write include/linux/instrumented.h:71 [inline]
+  BUG: KASAN: use-after-free in atomic64_sub_return include/asm-generic/atomic-instrumented.h:970 [inline]
+  BUG: KASAN: use-after-free in atomic_long_sub_return include/asm-generic/atomic-long.h:113 [inline]
+  BUG: KASAN: use-after-free in page_counter_cancel mm/page_counter.c:54 [inline]
+  BUG: KASAN: use-after-free in page_counter_uncharge+0x3d/0xc0 mm/page_counter.c:155
+  Write of size 8 at addr ffff8880371c0148 by task syz-executor.0/9304
+
+  CPU: 0 PID: 9304 Comm: syz-executor.0 Not tainted 5.8.0-syzkaller #0
+  Hardware name: Google Google Compute Engine/Google Compute Engine, BIOS Google 01/01/2011
+  Call Trace:
+    __dump_stack lib/dump_stack.c:77 [inline]
+    dump_stack+0x1f0/0x31e lib/dump_stack.c:118
+    print_address_description+0x66/0x620 mm/kasan/report.c:383
+    __kasan_report mm/kasan/report.c:513 [inline]
+    kasan_report+0x132/0x1d0 mm/kasan/report.c:530
+    check_memory_region_inline mm/kasan/generic.c:183 [inline]
+    check_memory_region+0x2b5/0x2f0 mm/kasan/generic.c:192
+    instrument_atomic_write include/linux/instrumented.h:71 [inline]
+    atomic64_sub_return include/asm-generic/atomic-instrumented.h:970 [inline]
+    atomic_long_sub_return include/asm-generic/atomic-long.h:113 [inline]
+    page_counter_cancel mm/page_counter.c:54 [inline]
+    page_counter_uncharge+0x3d/0xc0 mm/page_counter.c:155
+    uncharge_batch+0x6c/0x350 mm/memcontrol.c:6764
+    uncharge_page+0x115/0x430 mm/memcontrol.c:6796
+    uncharge_list mm/memcontrol.c:6835 [inline]
+    mem_cgroup_uncharge_list+0x70/0xe0 mm/memcontrol.c:6877
+    release_pages+0x13a2/0x1550 mm/swap.c:911
+    tlb_batch_pages_flush mm/mmu_gather.c:49 [inline]
+    tlb_flush_mmu_free mm/mmu_gather.c:242 [inline]
+    tlb_flush_mmu+0x780/0x910 mm/mmu_gather.c:249
+    tlb_finish_mmu+0xcb/0x200 mm/mmu_gather.c:328
+    exit_mmap+0x296/0x550 mm/mmap.c:3185
+    __mmput+0x113/0x370 kernel/fork.c:1076
+    exit_mm+0x4cd/0x550 kernel/exit.c:483
+    do_exit+0x576/0x1f20 kernel/exit.c:793
+    do_group_exit+0x161/0x2d0 kernel/exit.c:903
+    get_signal+0x139b/0x1d30 kernel/signal.c:2743
+    arch_do_signal+0x33/0x610 arch/x86/kernel/signal.c:811
+    exit_to_user_mode_loop kernel/entry/common.c:135 [inline]
+    exit_to_user_mode_prepare+0x8d/0x1b0 kernel/entry/common.c:166
+    syscall_exit_to_user_mode+0x5e/0x1a0 kernel/entry/common.c:241
+    entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Commit 1a3e1f40962c ("mm: memcontrol: decouple reference counting from
+page accounting") reworked the memcg lifetime to be bound the the struct
+page rather than charges.  It also removed the css_put_many from
+uncharge_batch and that is causing the above splat.
+
+uncharge_batch() is supposed to uncharge accumulated charges for all
+pages freed from the same memcg.  The queuing is done by uncharge_page
+which however drops the memcg reference after it adds charges to the
+batch.  If the current page happens to be the last one holding the
+reference for its memcg then the memcg is OK to go and the next page to
+be freed will trigger batched uncharge which needs to access the memcg
+which is gone already.
+
+Fix the issue by taking a reference for the memcg in the current batch.
+
+Fixes: 1a3e1f40962c ("mm: memcontrol: decouple reference counting from page accounting")
+	Reported-by: syzbot+b305848212deec86eabe@syzkaller.appspotmail.com
+	Reported-by: syzbot+b5ea6fb6f139c8b9482b@syzkaller.appspotmail.com
+	Signed-off-by: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Roman Gushchin <guro@fb.com>
+	Cc: Hugh Dickins <hughd@google.com>
+Link: https://lkml.kernel.org/r/20200820090341.GC5033@dhcp22.suse.cz
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f1796544a0ca0f14386a679d3d05fbc69235015e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index 406972ba9675,cfa6cbad21d5..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -6523,8 -6775,8 +6523,13 @@@ static void uncharge_batch(const struc
+  	memcg_check_events(ug->memcg, ug->dummy_page);
+  	local_irq_restore(flags);
+  
+++<<<<<<< HEAD
+ +	if (!mem_cgroup_is_root(ug->memcg))
+ +		css_put_many(&ug->memcg->css, nr_pages);
+++=======
++ 	/* drop reference from uncharge_page */
++ 	css_put(&ug->memcg->css);
+++>>>>>>> f1796544a0ca (memcg: fix use-after-free in uncharge_batch)
+  }
+  
+  static void uncharge_page(struct page *page, struct uncharge_gather *ug)
+@@@ -6548,25 -6800,18 +6553,28 @@@
+  			uncharge_gather_clear(ug);
+  		}
+  		ug->memcg = page->mem_cgroup;
++ 
++ 		/* pairs with css_put in uncharge_batch */
++ 		css_get(&ug->memcg->css);
+  	}
+  
+ -	nr_pages = compound_nr(page);
+ -	ug->nr_pages += nr_pages;
+ -
+  	if (!PageKmemcg(page)) {
+ +		unsigned int nr_pages = 1;
+ +
+ +		if (PageTransHuge(page)) {
+ +			nr_pages <<= compound_order(page);
+ +			ug->nr_huge += nr_pages;
+ +		}
+ +		if (PageAnon(page))
+ +			ug->nr_anon += nr_pages;
+ +		else {
+ +			ug->nr_file += nr_pages;
+ +			if (PageSwapBacked(page))
+ +				ug->nr_shmem += nr_pages;
+ +		}
+  		ug->pgpgout++;
+  	} else {
+ -		ug->nr_kmem += nr_pages;
+ +		ug->nr_kmem += 1 << compound_order(page);
+  		__ClearPageKmemcg(page);
+  	}
+  
+* Unmerged path mm/memcontrol.c
