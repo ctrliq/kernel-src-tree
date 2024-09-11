@@ -1,0 +1,324 @@
+mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx/rx napi
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 917dccb6eebcafd2a5ff73d75d2b0c5c7251e5f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/917dccb6.failed
+
+Introduce mt7921_poll_rx rx napi callback for mt7921.
+Do not access device registers in tx/rx napi if the device is not awake.
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 917dccb6eebcafd2a5ff73d75d2b0c5c7251e5f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+index cd9665610284,c26979614113..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+@@@ -295,7 -318,7 +318,11 @@@ int mt7921_dma_init(struct mt7921_dev *
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	ret = mt76_init_queues(dev);
+++=======
++ 	ret = mt76_init_queues(dev, mt7921_poll_rx);
+++>>>>>>> 917dccb6eebc (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx/rx napi)
+  	if (ret < 0)
+  		return ret;
+  
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+index bcbd59a23f9b,def00b255495..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+@@@ -1245,50 -1335,104 +1245,54 @@@ void mt7921_mac_reset_work(struct work_
+  	mt76_txq_schedule_all(&dev->mphy);
+  
+  	mt76_worker_disable(&dev->mt76.tx_worker);
+ -	napi_disable(&dev->mt76.napi[MT_RXQ_MAIN]);
+ -	napi_disable(&dev->mt76.napi[MT_RXQ_MCU]);
+ -	napi_disable(&dev->mt76.napi[MT_RXQ_MCU_WA]);
+ +	napi_disable(&dev->mt76.napi[0]);
+ +	napi_disable(&dev->mt76.napi[1]);
+ +	napi_disable(&dev->mt76.napi[2]);
+  	napi_disable(&dev->mt76.tx_napi);
+  
+ -	mt7921_tx_token_put(dev);
+ -	idr_init(&dev->token);
+ -
+ -	/* clean up hw queues */
+ -	for (i = 0; i < ARRAY_SIZE(dev->mt76.phy.q_tx); i++)
+ -		mt76_queue_tx_cleanup(dev, dev->mphy.q_tx[i], true);
+ +	mutex_lock(&dev->mt76.mutex);
+  
+ -	for (i = 0; i < ARRAY_SIZE(dev->mt76.q_mcu); i++)
+ -		mt76_queue_tx_cleanup(dev, dev->mt76.q_mcu[i], true);
+ +	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_STOPPED);
+  
+ -	mt76_for_each_q_rx(&dev->mt76, i)
+ -		mt76_queue_rx_cleanup(dev, &dev->mt76.q_rx[i]);
+ +	mt7921_tx_token_put(dev);
+ +	idr_init(&dev->token);
+  
+ -	mt7921_wfsys_reset(dev);
+ -	mt7921_dma_reset(dev);
+ +	if (mt7921_wait_reset_state(dev, MT_MCU_CMD_RESET_DONE)) {
+ +		mt7921_dma_reset(&dev->phy);
+  
+ -	mt76_for_each_q_rx(&dev->mt76, i) {
+ -		mt76_queue_rx_reset(dev, i);
+ -		napi_enable(&dev->mt76.napi[i]);
+ -		napi_schedule(&dev->mt76.napi[i]);
+ +		mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_DMA_INIT);
+ +		mt7921_wait_reset_state(dev, MT_MCU_CMD_RECOVERY_DONE);
+  	}
+  
+ -	napi_enable(&dev->mt76.tx_napi);
+ -	napi_schedule(&dev->mt76.tx_napi);
+ -	mt76_worker_enable(&dev->mt76.tx_worker);
+ -
+  	clear_bit(MT76_MCU_RESET, &dev->mphy.state);
+++<<<<<<< HEAD
+ +	clear_bit(MT76_RESET, &dev->mphy.state);
+++=======
++ 	clear_bit(MT76_STATE_PM, &dev->mphy.state);
+++>>>>>>> 917dccb6eebc (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx/rx napi)
+  
+ -	mt76_wr(dev, MT_WFDMA0_HOST_INT_ENA, 0);
+ -	mt76_wr(dev, MT_PCIE_MAC_INT_ENABLE, 0xff);
+ -	mt7921_irq_enable(dev,
+ -			  MT_INT_RX_DONE_ALL | MT_INT_TX_DONE_ALL |
+ -			  MT_INT_MCU_CMD);
+ -
+ -	err = mt7921_run_firmware(dev);
+ -	if (err)
+ -		return err;
+ -
+ -	err = mt7921_mcu_set_eeprom(dev);
+ -	if (err)
+ -		return err;
+ +	mt76_worker_enable(&dev->mt76.tx_worker);
+ +	napi_enable(&dev->mt76.tx_napi);
+ +	napi_schedule(&dev->mt76.tx_napi);
+  
+ -	mt7921_mac_init(dev);
+ -	return __mt7921_start(&dev->phy);
+ -}
+ +	napi_enable(&dev->mt76.napi[0]);
+ +	napi_schedule(&dev->mt76.napi[0]);
+  
+ -/* system error recovery */
+ -void mt7921_mac_reset_work(struct work_struct *work)
+ -{
+ -	struct ieee80211_hw *hw;
+ -	struct mt7921_dev *dev;
+ -	int i;
+ +	napi_enable(&dev->mt76.napi[1]);
+ +	napi_schedule(&dev->mt76.napi[1]);
+  
+ -	dev = container_of(work, struct mt7921_dev, reset_work);
+ -	hw = mt76_hw(dev);
+ +	napi_enable(&dev->mt76.napi[2]);
+ +	napi_schedule(&dev->mt76.napi[2]);
+  
+ -	dev_err(dev->mt76.dev, "chip reset\n");
+ -	ieee80211_stop_queues(hw);
+ +	ieee80211_wake_queues(mt76_hw(dev));
+  
+ -	cancel_delayed_work_sync(&dev->mphy.mac_work);
+ -	cancel_delayed_work_sync(&dev->pm.ps_work);
+ -	cancel_work_sync(&dev->pm.wake_work);
+ +	mt76_wr(dev, MT_MCU_INT_EVENT, MT_MCU_INT_EVENT_RESET_DONE);
+ +	mt7921_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+  
+ -	mutex_lock(&dev->mt76.mutex);
+ -	for (i = 0; i < 10; i++) {
+ -		if (!mt7921_mac_reset(dev))
+ -			break;
+ -	}
+  	mutex_unlock(&dev->mt76.mutex);
+  
+ -	if (i == 10)
+ -		dev_err(dev->mt76.dev, "chip reset failed\n");
+ -
+ -	if (test_and_clear_bit(MT76_HW_SCANNING, &dev->mphy.state)) {
+ -		struct cfg80211_scan_info info = {
+ -			.aborted = true,
+ -		};
+ -
+ -		ieee80211_scan_completed(dev->mphy.hw, &info);
+ -	}
+ -
+ -	ieee80211_wake_queues(hw);
+ -	ieee80211_iterate_active_interfaces(hw,
+ -					    IEEE80211_IFACE_ITER_RESUME_ALL,
+ -					    mt7921_vif_connect_iter, NULL);
+ -}
+ -
+ -void mt7921_reset(struct mt76_dev *mdev)
+ -{
+ -	struct mt7921_dev *dev = container_of(mdev, struct mt7921_dev, mt76);
+ -
+ -	queue_work(dev->mt76.wq, &dev->reset_work);
+ +	ieee80211_queue_delayed_work(mt76_hw(dev), &dev->mphy.mac_work,
+ +				     MT7921_WATCHDOG_TIME);
+  }
+  
+  static void
+@@@ -1368,8 -1515,123 +1372,125 @@@ void mt7921_mac_work(struct work_struc
+  		mt7921_mac_sta_stats_work(phy);
+  	}
+  
+ -	mt7921_mutex_release(phy->dev);
+ +	mutex_unlock(&mphy->dev->mutex);
+  
+ -out:
+ -	ieee80211_queue_delayed_work(phy->mt76->hw, &mphy->mac_work,
+ +	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
+  				     MT7921_WATCHDOG_TIME);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void mt7921_pm_wake_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	struct mt76_phy *mphy;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.wake_work);
++ 	mphy = dev->phy.mt76;
++ 
++ 	if (!mt7921_mcu_drv_pmctrl(dev)) {
++ 		int i;
++ 
++ 		mt76_for_each_q_rx(&dev->mt76, i)
++ 			napi_schedule(&dev->mt76.napi[i]);
++ 		mt76_connac_pm_dequeue_skbs(mphy, &dev->pm);
++ 		mt7921_tx_cleanup(dev);
++ 	}
++ 
++ 	ieee80211_wake_queues(mphy->hw);
++ 	complete_all(&dev->pm.wake_cmpl);
++ }
++ 
++ void mt7921_pm_power_save_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	unsigned long delta;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.ps_work.work);
++ 
++ 	delta = dev->pm.idle_timeout;
++ 	if (time_is_after_jiffies(dev->pm.last_activity + delta)) {
++ 		delta = dev->pm.last_activity + delta - jiffies;
++ 		goto out;
++ 	}
++ 
++ 	if (!mt7921_mcu_fw_pmctrl(dev))
++ 		return;
++ out:
++ 	queue_delayed_work(dev->mt76.wq, &dev->pm.ps_work, delta);
++ }
++ 
++ int mt7921_mac_set_beacon_filter(struct mt7921_phy *phy,
++ 				 struct ieee80211_vif *vif,
++ 				 bool enable)
++ {
++ 	struct mt7921_dev *dev = phy->dev;
++ 	bool ext_phy = phy != &dev->phy;
++ 	int err;
++ 
++ 	if (!dev->pm.enable)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = mt7921_mcu_set_bss_pm(dev, vif, enable);
++ 	if (err)
++ 		return err;
++ 
++ 	if (enable) {
++ 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_set(dev, MT_WF_RFCR(ext_phy),
++ 			 MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	} else {
++ 		vif->driver_flags &= ~IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_clear(dev, MT_WF_RFCR(ext_phy),
++ 			   MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void mt7921_coredump_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	char *dump, *data;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						coredump.work.work);
++ 
++ 	if (time_is_after_jiffies(dev->coredump.last_activity +
++ 				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
++ 		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
++ 				   MT76_CONNAC_COREDUMP_TIMEOUT);
++ 		return;
++ 	}
++ 
++ 	dump = vzalloc(MT76_CONNAC_COREDUMP_SZ);
++ 	data = dump;
++ 
++ 	while (true) {
++ 		struct sk_buff *skb;
++ 
++ 		spin_lock_bh(&dev->mt76.lock);
++ 		skb = __skb_dequeue(&dev->coredump.msg_list);
++ 		spin_unlock_bh(&dev->mt76.lock);
++ 
++ 		if (!skb)
++ 			break;
++ 
++ 		skb_pull(skb, sizeof(struct mt7921_mcu_rxd));
++ 		if (data + skb->len - dump > MT76_CONNAC_COREDUMP_SZ) {
++ 			dev_kfree_skb(skb);
++ 			continue;
++ 		}
++ 
++ 		memcpy(data, skb->data, skb->len);
++ 		data += skb->len;
++ 
++ 		dev_kfree_skb(skb);
++ 	}
++ 	dev_coredumpv(dev->mt76.dev, dump, MT76_CONNAC_COREDUMP_SZ,
++ 		      GFP_KERNEL);
++ 	mt7921_reset(&dev->mt76);
++ }
+++>>>>>>> 917dccb6eebc (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx/rx napi)
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+index 6e3579d48c30,c9687c57cbe7..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+@@@ -308,6 -331,8 +308,11 @@@ void mt7921_mac_sta_remove(struct mt76_
+  			   struct ieee80211_sta *sta);
+  void mt7921_mac_work(struct work_struct *work);
+  void mt7921_mac_reset_work(struct work_struct *work);
+++<<<<<<< HEAD
+++=======
++ void mt7921_reset(struct mt76_dev *mdev);
++ void mt7921_tx_cleanup(struct mt7921_dev *dev);
+++>>>>>>> 917dccb6eebc (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx/rx napi)
+  int mt7921_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+  			  enum mt76_txq_id qid, struct mt76_wcid *wcid,
+  			  struct ieee80211_sta *sta,
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/dma.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
