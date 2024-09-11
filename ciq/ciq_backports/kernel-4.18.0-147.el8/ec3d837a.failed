@@ -1,0 +1,87 @@
+net/flow_dissector: correctly cap nhoff and thoff in case of BPF
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit ec3d837aac5dca7cb8a69c9f101690c182da79c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/ec3d837a.failed
+
+We want to make sure that the following condition holds:
+0 <= nhoff <= thoff <= skb->len
+
+BPF program can set out-of-bounds nhoff and thoff, which is dangerous, see
+recent commit d0c081b49137 ("flow_dissector: properly cap thoff field")'.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit ec3d837aac5dca7cb8a69c9f101690c182da79c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/flow_dissector.c
+diff --cc net/core/flow_dissector.c
+index 9dda92c23ba9,af68207ee56c..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -658,6 -754,54 +658,57 @@@ bool __skb_flow_dissect(const struct sk
+  					      FLOW_DISSECTOR_KEY_BASIC,
+  					      target_container);
+  
+++<<<<<<< HEAD
+++=======
++ 	rcu_read_lock();
++ 	if (skb) {
++ 		if (skb->dev)
++ 			attached = rcu_dereference(dev_net(skb->dev)->flow_dissector_prog);
++ 		else if (skb->sk)
++ 			attached = rcu_dereference(sock_net(skb->sk)->flow_dissector_prog);
++ 		else
++ 			WARN_ON_ONCE(1);
++ 	}
++ 	if (attached) {
++ 		/* Note that even though the const qualifier is discarded
++ 		 * throughout the execution of the BPF program, all changes(the
++ 		 * control block) are reverted after the BPF program returns.
++ 		 * Therefore, __skb_flow_dissect does not alter the skb.
++ 		 */
++ 		struct bpf_flow_keys flow_keys = {};
++ 		struct bpf_skb_data_end cb_saved;
++ 		struct bpf_skb_data_end *cb;
++ 		u32 result;
++ 
++ 		cb = (struct bpf_skb_data_end *)skb->cb;
++ 
++ 		/* Save Control Block */
++ 		memcpy(&cb_saved, cb, sizeof(cb_saved));
++ 		memset(cb, 0, sizeof(cb_saved));
++ 
++ 		/* Pass parameters to the BPF program */
++ 		cb->qdisc_cb.flow_keys = &flow_keys;
++ 		flow_keys.nhoff = nhoff;
++ 		flow_keys.thoff = nhoff;
++ 
++ 		bpf_compute_data_pointers((struct sk_buff *)skb);
++ 		result = BPF_PROG_RUN(attached, skb);
++ 
++ 		/* Restore state */
++ 		memcpy(cb, &cb_saved, sizeof(cb_saved));
++ 
++ 		flow_keys.nhoff = clamp_t(u16, flow_keys.nhoff, 0, skb->len);
++ 		flow_keys.thoff = clamp_t(u16, flow_keys.thoff,
++ 					  flow_keys.nhoff, skb->len);
++ 
++ 		__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
++ 					 target_container);
++ 		rcu_read_unlock();
++ 		return result == BPF_OK;
++ 	}
++ 	rcu_read_unlock();
++ 
+++>>>>>>> ec3d837aac5d (net/flow_dissector: correctly cap nhoff and thoff in case of BPF)
+  	if (dissector_uses_key(flow_dissector,
+  			       FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+  		struct ethhdr *eth = eth_hdr(skb);
+* Unmerged path net/core/flow_dissector.c
