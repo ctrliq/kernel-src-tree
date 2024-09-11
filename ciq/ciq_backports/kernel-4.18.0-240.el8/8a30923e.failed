@@ -1,0 +1,240 @@
+cxgb4/chcr: Save tx keys and handle HW response
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 8a30923e1598c050f2670b88d51e3752b52b49ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8a30923e.failed
+
+As part of this patch generated and saved crypto keys, handled HW
+response of act_open_req and set_tcb_req. Defined connection state
+update.
+
+v1->v2:
+- optimized tcb update using control queue.
+- state machine handling when earlier states received.
+
+v2->v3:
+- Added one empty line after function declaration.
+
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8a30923e1598c050f2670b88d51e3752b52b49ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_common.h
+#	drivers/crypto/chelsio/chcr_core.h
+#	drivers/crypto/chelsio/chcr_ktls.c
+#	drivers/crypto/chelsio/chcr_ktls.h
+diff --cc drivers/crypto/chelsio/chcr_core.h
+index b41ef1abfe74,2dcbd188290a..000000000000
+--- a/drivers/crypto/chelsio/chcr_core.h
++++ b/drivers/crypto/chelsio/chcr_core.h
+@@@ -223,4 -222,10 +223,13 @@@ int chcr_handle_resp(struct crypto_asyn
+  		     int err);
+  int chcr_ipsec_xmit(struct sk_buff *skb, struct net_device *dev);
+  void chcr_add_xfrmops(const struct cxgb4_lld_info *lld);
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CHELSIO_TLS_DEVICE
++ void chcr_enable_ktls(struct adapter *adap);
++ void chcr_disable_ktls(struct adapter *adap);
++ int chcr_ktls_cpl_act_open_rpl(struct adapter *adap, unsigned char *input);
++ int chcr_ktls_cpl_set_tcb_rpl(struct adapter *adap, unsigned char *input);
++ #endif
+++>>>>>>> 8a30923e1598 (cxgb4/chcr: Save tx keys and handle HW response)
+  #endif /* __CHCR_CORE_H__ */
+* Unmerged path drivers/crypto/chelsio/chcr_common.h
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.h
+* Unmerged path drivers/crypto/chelsio/chcr_common.h
+diff --git a/drivers/crypto/chelsio/chcr_core.c b/drivers/crypto/chelsio/chcr_core.c
+index 850a3f4e837b..8ef509952086 100644
+--- a/drivers/crypto/chelsio/chcr_core.c
++++ b/drivers/crypto/chelsio/chcr_core.c
+@@ -28,13 +28,17 @@
+ 
+ static struct chcr_driver_data drv_data;
+ 
+-typedef int (*chcr_handler_func)(struct chcr_dev *dev, unsigned char *input);
+-static int cpl_fw6_pld_handler(struct chcr_dev *dev, unsigned char *input);
++typedef int (*chcr_handler_func)(struct adapter *adap, unsigned char *input);
++static int cpl_fw6_pld_handler(struct adapter *adap, unsigned char *input);
+ static void *chcr_uld_add(const struct cxgb4_lld_info *lld);
+ static int chcr_uld_state_change(void *handle, enum cxgb4_state state);
+ 
+ static chcr_handler_func work_handlers[NUM_CPL_CMDS] = {
+ 	[CPL_FW6_PLD] = cpl_fw6_pld_handler,
++#ifdef CONFIG_CHELSIO_TLS_DEVICE
++	[CPL_ACT_OPEN_RPL] = chcr_ktls_cpl_act_open_rpl,
++	[CPL_SET_TCB_RPL] = chcr_ktls_cpl_set_tcb_rpl,
++#endif
+ };
+ 
+ static struct cxgb4_uld_info chcr_uld_info = {
+@@ -148,14 +152,13 @@ static int chcr_dev_move(struct uld_ctx *u_ctx)
+ 	return 0;
+ }
+ 
+-static int cpl_fw6_pld_handler(struct chcr_dev *dev,
++static int cpl_fw6_pld_handler(struct adapter *adap,
+ 			       unsigned char *input)
+ {
+ 	struct crypto_async_request *req;
+ 	struct cpl_fw6_pld *fw6_pld;
+ 	u32 ack_err_status = 0;
+ 	int error_status = 0;
+-	struct adapter *adap = padap(dev);
+ 
+ 	fw6_pld = (struct cpl_fw6_pld *)input;
+ 	req = (struct crypto_async_request *)(uintptr_t)be64_to_cpu(
+@@ -213,17 +216,18 @@ int chcr_uld_rx_handler(void *handle, const __be64 *rsp,
+ {
+ 	struct uld_ctx *u_ctx = (struct uld_ctx *)handle;
+ 	struct chcr_dev *dev = &u_ctx->dev;
++	struct adapter *adap = padap(dev);
+ 	const struct cpl_fw6_pld *rpl = (struct cpl_fw6_pld *)rsp;
+ 
+-	if (rpl->opcode != CPL_FW6_PLD) {
+-		pr_err("Unsupported opcode\n");
++	if (!work_handlers[rpl->opcode]) {
++		pr_err("Unsupported opcode %d received\n", rpl->opcode);
+ 		return 0;
+ 	}
+ 
+ 	if (!pgl)
+-		work_handlers[rpl->opcode](dev, (unsigned char *)&rsp[1]);
++		work_handlers[rpl->opcode](adap, (unsigned char *)&rsp[1]);
+ 	else
+-		work_handlers[rpl->opcode](dev, pgl->va);
++		work_handlers[rpl->opcode](adap, pgl->va);
+ 	return 0;
+ }
+ 
+* Unmerged path drivers/crypto/chelsio/chcr_core.h
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.h
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/l2t.c b/drivers/net/ethernet/chelsio/cxgb4/l2t.c
+index 1a16449e9deb..b66e0332dbb3 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/l2t.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/l2t.c
+@@ -700,6 +700,17 @@ static char l2e_state(const struct l2t_entry *e)
+ 	}
+ }
+ 
++bool cxgb4_check_l2t_valid(struct l2t_entry *e)
++{
++	bool valid;
++
++	spin_lock(&e->lock);
++	valid = (e->state == L2T_STATE_VALID);
++	spin_unlock(&e->lock);
++	return valid;
++}
++EXPORT_SYMBOL(cxgb4_check_l2t_valid);
++
+ static int l2t_seq_show(struct seq_file *seq, void *v)
+ {
+ 	if (v == SEQ_START_TOKEN)
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/l2t.h b/drivers/net/ethernet/chelsio/cxgb4/l2t.h
+index 79665bd8f881..340fecb28a13 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/l2t.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/l2t.h
+@@ -122,6 +122,7 @@ struct l2t_entry *t4_l2t_alloc_switching(struct adapter *adap, u16 vlan,
+ 					 u8 port, u8 *dmac);
+ struct l2t_data *t4_init_l2t(unsigned int l2t_start, unsigned int l2t_end);
+ void do_l2t_write_rpl(struct adapter *p, const struct cpl_l2t_write_rpl *rpl);
++bool cxgb4_check_l2t_valid(struct l2t_entry *e);
+ 
+ extern const struct file_operations t4_l2t_fops;
+ #endif  /* __CXGB4_L2T_H */
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+index 575c6abcdae7..e9c775f1dd3e 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_msg.h
+@@ -705,6 +705,14 @@ struct cpl_set_tcb_field {
+ 	__be64 val;
+ };
+ 
++struct cpl_set_tcb_field_core {
++	union opcode_tid ot;
++	__be16 reply_ctrl;
++	__be16 word_cookie;
++	__be64 mask;
++	__be64 val;
++};
++
+ /* cpl_set_tcb_field.word_cookie fields */
+ #define TCB_WORD_S	0
+ #define TCB_WORD_V(x)	((x) << TCB_WORD_S)
+diff --git a/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h b/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+index 1b9afb192f7f..8371f6909208 100644
+--- a/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/t4_tcb.h
+@@ -35,6 +35,11 @@
+ #ifndef __T4_TCB_H
+ #define __T4_TCB_H
+ 
++#define TCB_L2T_IX_W		0
++#define TCB_L2T_IX_S		12
++#define TCB_L2T_IX_M		0xfffULL
++#define TCB_L2T_IX_V(x)		((x) << TCB_L2T_IX_S)
++
+ #define TCB_SMAC_SEL_W		0
+ #define TCB_SMAC_SEL_S		24
+ #define TCB_SMAC_SEL_M		0xffULL
+@@ -45,11 +50,6 @@
+ #define TCB_T_FLAGS_M		0xffffffffffffffffULL
+ #define TCB_T_FLAGS_V(x)	((__u64)(x) << TCB_T_FLAGS_S)
+ 
+-#define TCB_RQ_START_W		30
+-#define TCB_RQ_START_S		0
+-#define TCB_RQ_START_M		0x3ffffffULL
+-#define TCB_RQ_START_V(x)	((x) << TCB_RQ_START_S)
+-
+ #define TF_CCTRL_ECE_S		60
+ #define TF_CCTRL_CWR_S		61
+ #define TF_CCTRL_RFR_S		62
+@@ -70,12 +70,39 @@
+ #define TCB_RTT_TS_RECENT_AGE_V(x)	((x) << TCB_RTT_TS_RECENT_AGE_S)
+ 
+ #define TCB_SND_UNA_RAW_W	10
++#define TCB_SND_UNA_RAW_S	0
++#define TCB_SND_UNA_RAW_M	0xfffffffULL
++#define TCB_SND_UNA_RAW_V(x)	((x) << TCB_SND_UNA_RAW_S)
++
++#define TCB_SND_NXT_RAW_W	10
++#define TCB_SND_NXT_RAW_S	28
++#define TCB_SND_NXT_RAW_M	0xfffffffULL
++#define TCB_SND_NXT_RAW_V(x)	((x) << TCB_SND_NXT_RAW_S)
++
++#define TCB_SND_MAX_RAW_W	11
++#define TCB_SND_MAX_RAW_S	24
++#define TCB_SND_MAX_RAW_M	0xfffffffULL
++#define TCB_SND_MAX_RAW_V(x)	((x) << TCB_SND_MAX_RAW_S)
++
+ #define TCB_RX_FRAG2_PTR_RAW_W	27
+ #define TCB_RX_FRAG3_LEN_RAW_W	29
+ #define TCB_RX_FRAG3_START_IDX_OFFSET_RAW_W	30
+ #define TCB_PDU_HDR_LEN_W	31
+ 
++#define TCB_RQ_START_W		30
++#define TCB_RQ_START_S		0
++#define TCB_RQ_START_M		0x3ffffffULL
++#define TCB_RQ_START_V(x)	((x) << TCB_RQ_START_S)
++
+ #define TF_RX_PDU_OUT_S		49
+ #define TF_RX_PDU_OUT_V(x)	((__u64)(x) << TF_RX_PDU_OUT_S)
+ 
++#define TF_CORE_BYPASS_S	63
++#define TF_CORE_BYPASS_V(x)	((__u64)(x) << TF_CORE_BYPASS_S)
++#define TF_CORE_BYPASS_F	TF_CORE_BYPASS_V(1)
++
++#define TF_NON_OFFLOAD_S	1
++#define TF_NON_OFFLOAD_V(x)	((x) << TF_NON_OFFLOAD_S)
++#define TF_NON_OFFLOAD_F	TF_NON_OFFLOAD_V(1)
++
+ #endif /* __T4_TCB_H */
