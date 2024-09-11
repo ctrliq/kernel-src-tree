@@ -1,0 +1,255 @@
+net: bridge: mcast: dump ipv4 querier state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit c7fa1d9b1fb179375e889ff076a1566ecc997bfc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c7fa1d9b.failed
+
+Add support for dumping global IPv4 querier state, we dump the state
+only if our own querier is enabled or there has been another external
+querier which has won the election. For the bridge global state we use
+a new attribute IFLA_BR_MCAST_QUERIER_STATE and embed the state inside.
+The structure is:
+ [IFLA_BR_MCAST_QUERIER_STATE]
+  `[BRIDGE_QUERIER_IP_ADDRESS] - ip address of the querier
+  `[BRIDGE_QUERIER_IP_PORT]    - bridge port ifindex where the querier was
+                                 seen (set only if external querier)
+  `[BRIDGE_QUERIER_IP_OTHER_TIMER]   -  other querier timeout
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c7fa1d9b1fb179375e889ff076a1566ecc997bfc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+#	net/bridge/br_netlink.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,4513bc13b6d3..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -2095,32 -2905,81 +2095,107 @@@ update
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +static bool br_ip6_multicast_select_querier(struct net_bridge *br,
+ +					    struct net_bridge_port *port,
+ +					    struct in6_addr *saddr)
+ +{
+ +	if (!timer_pending(&br->ip6_own_query.timer) &&
+ +	    !timer_pending(&br->ip6_other_query.timer))
+ +		goto update;
+ +
+ +	if (ipv6_addr_cmp(saddr, &br->ip6_querier.addr.src.ip6) <= 0)
+ +		goto update;
+ +
+ +	return false;
+ +
+ +update:
+ +	br->ip6_querier.addr.src.ip6 = *saddr;
+ +
+ +	/* update protected by general multicast_lock by caller */
+ +	rcu_assign_pointer(br->ip6_querier.port, port);
+ +
+ +	return true;
+ +}
+ +#endif
+++=======
++ static struct net_bridge_port *
++ __br_multicast_get_querier_port(struct net_bridge *br,
++ 				const struct bridge_mcast_querier *querier)
++ {
++ 	int port_ifidx = READ_ONCE(querier->port_ifidx);
++ 	struct net_bridge_port *p;
++ 	struct net_device *dev;
++ 
++ 	if (port_ifidx == 0)
++ 		return NULL;
++ 
++ 	dev = dev_get_by_index_rcu(dev_net(br->dev), port_ifidx);
++ 	if (!dev)
++ 		return NULL;
++ 	p = br_port_get_rtnl_rcu(dev);
++ 	if (!p || p->br != br)
++ 		return NULL;
++ 
++ 	return p;
++ }
++ 
++ size_t br_multicast_querier_state_size(void)
++ {
++ 	return nla_total_size(sizeof(0)) +      /* nest attribute */
++ 	       nla_total_size(sizeof(__be32)) + /* BRIDGE_QUERIER_IP_ADDRESS */
++ 	       nla_total_size(sizeof(int)) +    /* BRIDGE_QUERIER_IP_PORT */
++ 	       nla_total_size_64bit(sizeof(u64)); /* BRIDGE_QUERIER_IP_OTHER_TIMER */
++ }
++ 
++ /* protected by rtnl or rcu */
++ int br_multicast_dump_querier_state(struct sk_buff *skb,
++ 				    const struct net_bridge_mcast *brmctx,
++ 				    int nest_attr)
++ {
++ 	struct bridge_mcast_querier querier = {};
++ 	struct net_bridge_port *p;
++ 	struct nlattr *nest;
++ 
++ 	if (!brmctx->multicast_querier &&
++ 	    !timer_pending(&brmctx->ip4_other_query.timer))
++ 		return 0;
++ 
++ 	nest = nla_nest_start(skb, nest_attr);
++ 	if (!nest)
++ 		return -EMSGSIZE;
++ 
++ 	rcu_read_lock();
++ 	br_multicast_read_querier(&brmctx->ip4_querier, &querier);
++ 	if (nla_put_in_addr(skb, BRIDGE_QUERIER_IP_ADDRESS,
++ 			    querier.addr.src.ip4)) {
++ 		rcu_read_unlock();
++ 		goto out_err;
++ 	}
++ 
++ 	p = __br_multicast_get_querier_port(brmctx->br, &querier);
++ 	if (timer_pending(&brmctx->ip4_other_query.timer) &&
++ 	    (nla_put_u64_64bit(skb, BRIDGE_QUERIER_IP_OTHER_TIMER,
++ 			       br_timer_value(&brmctx->ip4_other_query.timer),
++ 			       BRIDGE_QUERIER_PAD) ||
++ 	     (p && nla_put_u32(skb, BRIDGE_QUERIER_IP_PORT, p->dev->ifindex)))) {
++ 		rcu_read_unlock();
++ 		goto out_err;
++ 	}
++ 	rcu_read_unlock();
++ 	nla_nest_end(skb, nest);
++ 
++ 	return 0;
++ 
++ out_err:
++ 	nla_nest_cancel(skb, nest);
++ 	return -EMSGSIZE;
++ }
+++>>>>>>> c7fa1d9b1fb1 (net: bridge: mcast: dump ipv4 querier state)
+  
+  static void
+ -br_multicast_update_query_timer(struct net_bridge_mcast *brmctx,
+ +br_multicast_update_query_timer(struct net_bridge *br,
+  				struct bridge_mcast_other_query *query,
+  				unsigned long max_delay)
+  {
+diff --cc net/bridge/br_netlink.c
+index 75be8311a010,2f184ad8ae29..000000000000
+--- a/net/bridge/br_netlink.c
++++ b/net/bridge/br_netlink.c
+@@@ -1542,11 -1584,13 +1543,17 @@@ static int br_fill_info(struct sk_buff 
+  	    nla_put_u32(skb, IFLA_BR_MCAST_HASH_ELASTICITY, RHT_ELASTICITY) ||
+  	    nla_put_u32(skb, IFLA_BR_MCAST_HASH_MAX, br->hash_max) ||
+  	    nla_put_u32(skb, IFLA_BR_MCAST_LAST_MEMBER_CNT,
+ -			br->multicast_ctx.multicast_last_member_count) ||
+ +			br->multicast_last_member_count) ||
+  	    nla_put_u32(skb, IFLA_BR_MCAST_STARTUP_QUERY_CNT,
+ -			br->multicast_ctx.multicast_startup_query_count) ||
+ +			br->multicast_startup_query_count) ||
+  	    nla_put_u8(skb, IFLA_BR_MCAST_IGMP_VERSION,
+++<<<<<<< HEAD
+ +		       br->multicast_igmp_version))
+++=======
++ 		       br->multicast_ctx.multicast_igmp_version) ||
++ 	    br_multicast_dump_querier_state(skb, &br->multicast_ctx,
++ 					    IFLA_BR_MCAST_QUERIER_STATE))
+++>>>>>>> c7fa1d9b1fb1 (net: bridge: mcast: dump ipv4 querier state)
+  		return -EMSGSIZE;
+  #if IS_ENABLED(CONFIG_IPV6)
+  	if (nla_put_u8(skb, IFLA_BR_MCAST_MLD_VERSION,
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,9b1bf98a2c5a..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -767,8 -918,45 +767,47 @@@ void br_multicast_get_stats(const struc
+  			    struct br_mcast_stats *dest);
+  void br_mdb_init(void);
+  void br_mdb_uninit(void);
+ -void br_multicast_host_join(const struct net_bridge_mcast *brmctx,
+ -			    struct net_bridge_mdb_entry *mp, bool notify);
+ +void br_multicast_host_join(struct net_bridge_mdb_entry *mp, bool notify);
+  void br_multicast_host_leave(struct net_bridge_mdb_entry *mp, bool notify);
+++<<<<<<< HEAD
+++=======
++ void br_multicast_star_g_handle_mode(struct net_bridge_port_group *pg,
++ 				     u8 filter_mode);
++ void br_multicast_sg_add_exclude_ports(struct net_bridge_mdb_entry *star_mp,
++ 				       struct net_bridge_port_group *sg);
++ struct net_bridge_group_src *
++ br_multicast_find_group_src(struct net_bridge_port_group *pg, struct br_ip *ip);
++ void br_multicast_del_group_src(struct net_bridge_group_src *src,
++ 				bool fastleave);
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx);
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx);
++ void br_multicast_port_ctx_init(struct net_bridge_port *port,
++ 				struct net_bridge_vlan *vlan,
++ 				struct net_bridge_mcast_port *pmctx);
++ void br_multicast_port_ctx_deinit(struct net_bridge_mcast_port *pmctx);
++ void br_multicast_toggle_one_vlan(struct net_bridge_vlan *vlan, bool on);
++ void br_multicast_toggle_vlan(struct net_bridge_vlan *vlan, bool on);
++ int br_multicast_toggle_vlan_snooping(struct net_bridge *br, bool on,
++ 				      struct netlink_ext_ack *extack);
++ bool br_multicast_toggle_global_vlan(struct net_bridge_vlan *vlan, bool on);
++ 
++ int br_mdb_replay(struct net_device *br_dev, struct net_device *dev,
++ 		  const void *ctx, bool adding, struct notifier_block *nb,
++ 		  struct netlink_ext_ack *extack);
++ int br_rports_fill_info(struct sk_buff *skb,
++ 			const struct net_bridge_mcast *brmctx);
++ int br_multicast_dump_querier_state(struct sk_buff *skb,
++ 				    const struct net_bridge_mcast *brmctx,
++ 				    int nest_attr);
++ size_t br_multicast_querier_state_size(void);
++ 
++ static inline bool br_group_is_l2(const struct br_ip *group)
++ {
++ 	return group->proto == 0;
++ }
+++>>>>>>> c7fa1d9b1fb1 (net: bridge: mcast: dump ipv4 querier state)
+  
+  #define mlock_dereference(X, br) \
+  	rcu_dereference_protected(X, lockdep_is_held(&br->multicast_lock))
+diff --git a/include/uapi/linux/if_bridge.h b/include/uapi/linux/if_bridge.h
+index d643fa57361d..b47291e764f2 100644
+--- a/include/uapi/linux/if_bridge.h
++++ b/include/uapi/linux/if_bridge.h
+@@ -686,4 +686,14 @@ struct br_boolopt_multi {
+ 	__u32 optval;
+ 	__u32 optmask;
+ };
++
++enum {
++	BRIDGE_QUERIER_UNSPEC,
++	BRIDGE_QUERIER_IP_ADDRESS,
++	BRIDGE_QUERIER_IP_PORT,
++	BRIDGE_QUERIER_IP_OTHER_TIMER,
++	BRIDGE_QUERIER_PAD,
++	__BRIDGE_QUERIER_MAX
++};
++#define BRIDGE_QUERIER_MAX (__BRIDGE_QUERIER_MAX - 1)
+ #endif /* _UAPI_LINUX_IF_BRIDGE_H */
+diff --git a/include/uapi/linux/if_link.h b/include/uapi/linux/if_link.h
+index 33671c807b5c..8e6dd359c59b 100644
+--- a/include/uapi/linux/if_link.h
++++ b/include/uapi/linux/if_link.h
+@@ -491,6 +491,7 @@ enum {
+ 	IFLA_BR_MCAST_MLD_VERSION,
+ 	IFLA_BR_VLAN_STATS_PER_PORT,
+ 	IFLA_BR_MULTI_BOOLOPT,
++	IFLA_BR_MCAST_QUERIER_STATE,
+ 	__IFLA_BR_MAX,
+ };
+ 
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/bridge/br_netlink.c
+* Unmerged path net/bridge/br_private.h
