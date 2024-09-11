@@ -1,0 +1,137 @@
+block: disable iopoll for split bio
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jeffle Xu <jefflexu@linux.alibaba.com>
+commit cc29e1bf0d63f728a5bd60ef22638bbf77369552
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/cc29e1bf.failed
+
+iopoll is initially for small size, latency sensitive IO. It doesn't
+work well for big IO, especially when it needs to be split to multiple
+bios. In this case, the returned cookie of __submit_bio_noacct_mq() is
+indeed the cookie of the last split bio. The completion of *this* last
+split bio done by iopoll doesn't mean the whole original bio has
+completed. Callers of iopoll still need to wait for completion of other
+split bios.
+
+Besides bio splitting may cause more trouble for iopoll which isn't
+supposed to be used in case of big IO.
+
+iopoll for split bio may cause potential race if CPU migration happens
+during bio submission. Since the returned cookie is that of the last
+split bio, polling on the corresponding hardware queue doesn't help
+complete other split bios, if these split bios are enqueued into
+different hardware queues. Since interrupts are disabled for polling
+queues, the completion of these other split bios depends on timeout
+mechanism, thus causing a potential hang.
+
+iopoll for split bio may also cause hang for sync polling. Currently
+both the blkdev and iomap-based fs (ext4/xfs, etc) support sync polling
+in direct IO routine. These routines will submit bio without REQ_NOWAIT
+flag set, and then start sync polling in current process context. The
+process may hang in blk_mq_get_tag() if the submitted bio has to be
+split into multiple bios and can rapidly exhaust the queue depth. The
+process are waiting for the completion of the previously allocated
+requests, which should be reaped by the following polling, and thus
+causing a deadlock.
+
+To avoid these subtle trouble described above, just disable iopoll for
+split bio and return BLK_QC_T_NONE in this case. The side effect is that
+non-HIPRI IO also returns BLK_QC_T_NONE now. It should be acceptable
+since the returned cookie is never used for non-HIPRI IO.
+
+	Suggested-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jeffle Xu <jefflexu@linux.alibaba.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit cc29e1bf0d63f728a5bd60ef22638bbf77369552)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-merge.c
+#	block/blk-mq.c
+diff --cc block/blk-merge.c
+index e8b0b583f180,c3399bf29e9c..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -240,25 -280,33 +240,36 @@@ new_segment
+  split:
+  	*segs = nsegs;
+  
+++<<<<<<< HEAD
+ +	if (do_split) {
+ +		new = bio_split(bio, sectors, GFP_NOIO, bs);
+ +		if (new)
+ +			bio = new;
+ +	}
+ +
+ +	if (nsegs == 1 && seg_size > front_seg_size)
+ +		front_seg_size = seg_size;
+ +	bio->bi_seg_front_size = front_seg_size;
+ +	if (seg_size > bio->bi_seg_back_size)
+ +		bio->bi_seg_back_size = seg_size;
+ +
+ +	return do_split ? new : NULL;
+++=======
++ 	/*
++ 	 * Bio splitting may cause subtle trouble such as hang when doing sync
++ 	 * iopoll in direct IO routine. Given performance gain of iopoll for
++ 	 * big IO can be trival, disable iopoll when split needed.
++ 	 */
++ 	bio->bi_opf &= ~REQ_HIPRI;
++ 
++ 	return bio_split(bio, sectors, GFP_NOIO, bs);
+++>>>>>>> cc29e1bf0d63 (block: disable iopoll for split bio)
+  }
+  
+ -/**
+ - * __blk_queue_split - split a bio and submit the second half
+ - * @bio:     [in, out] bio to be split
+ - * @nr_segs: [out] number of segments in the first bio
+ - *
+ - * Split a bio into two bios, chain the two bios, submit the second half and
+ - * store a pointer to the first half in *@bio. If the second bio is still too
+ - * big it will be split by a recursive call to this function. Since this
+ - * function may allocate a new bio from @bio->bi_disk->queue->bio_split, it is
+ - * the responsibility of the caller to ensure that
+ - * @bio->bi_disk->queue->bio_split is only released after processing of the
+ - * split bio has finished.
+ - */
+ -void __blk_queue_split(struct bio **bio, unsigned int *nr_segs)
+ +void blk_queue_split(struct request_queue *q, struct bio **bio)
+  {
+ -	struct request_queue *q = (*bio)->bi_disk->queue;
+ -	struct bio *split = NULL;
+ +	struct bio *split, *res;
+ +	unsigned nsegs;
+  
+  	switch (bio_op(*bio)) {
+  	case REQ_OP_DISCARD:
+diff --cc block/blk-mq.c
+index bad344d5bc60,95ecc4c69969..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -2213,11 -2156,13 +2213,16 @@@ blk_qc_t blk_mq_make_request(struct req
+  	struct request *rq;
+  	struct blk_plug *plug;
+  	struct request *same_queue_rq = NULL;
+ -	unsigned int nr_segs;
+  	blk_qc_t cookie;
+++<<<<<<< HEAD
+++=======
++ 	blk_status_t ret;
++ 	bool hipri;
+++>>>>>>> cc29e1bf0d63 (block: disable iopoll for split bio)
+  
+  	blk_queue_bounce(q, &bio);
+ -	__blk_queue_split(&bio, &nr_segs);
+ +
+ +	blk_queue_split(q, &bio);
+  
+  	if (!bio_integrity_prep(bio))
+  		goto queue_exit;
+* Unmerged path block/blk-merge.c
+* Unmerged path block/blk-mq.c
