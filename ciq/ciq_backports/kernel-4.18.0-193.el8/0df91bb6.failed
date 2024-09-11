@@ -1,0 +1,108 @@
+RDMA/devices: Use xarray to store the client_data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 0df91bb67334eebaf73d4ba32567e16d55f4f116
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0df91bb6.failed
+
+Now that we have a small ID for each client we can use xarray instead of
+linearly searching linked lists for client data. This will give much
+faster and scalable client data lookup, and will lets us revise the
+locking scheme.
+
+Since xarray can store 'going_down' using a mark just entirely eliminate
+the struct ib_client_data and directly store the client_data value in the
+xarray. However this does require a special iterator as we must still
+iterate over any NULL client_data values.
+
+Also eliminate the client_data_lock in favour of internal xarray locking.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0df91bb67334eebaf73d4ba32567e16d55f4f116)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+diff --cc drivers/infiniband/core/device.c
+index 67ef68b75ec7,5096593b99e9..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -595,17 -636,10 +636,21 @@@ int ib_register_device(struct ib_devic
+  	if (ret) {
+  		dev_warn(&device->dev,
+  			 "Couldn't set up InfiniBand P_Key/GID cache\n");
+- 		goto out;
++ 		goto out_name;
+  	}
+  
+++<<<<<<< HEAD
+ +	device->index = __dev_new_index();
+ +
+ +	ret = ib_device_register_rdmacg(device);
+ +	if (ret) {
+ +		dev_warn(&device->dev,
+ +			 "Couldn't register device with rdma cgroup\n");
+ +		goto dev_cleanup;
+ +	}
+++=======
++ 	ib_device_register_rdmacg(device);
+++>>>>>>> 0df91bb67334 (RDMA/devices: Use xarray to store the client_data)
+  
+  	ret = ib_device_register_sysfs(device);
+  	if (ret) {
+@@@ -628,8 -662,9 +673,10 @@@
+  
+  cg_cleanup:
+  	ib_device_unregister_rdmacg(device);
+ +dev_cleanup:
+  	ib_cache_cleanup_one(device);
++ out_name:
++ 	release_name(device);
+  out:
+  	mutex_unlock(&device_mutex);
+  	return ret;
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 2ff74f11eec0..6e152750cbce 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2536,12 +2536,7 @@ struct ib_device {
+ 	struct list_head              event_handler_list;
+ 	spinlock_t                    event_handler_lock;
+ 
+-	rwlock_t			client_data_lock;
+-	struct list_head              core_list;
+-	/* Access to the client_data_list is protected by the client_data_lock
+-	 * rwlock and the lists_rwsem read-write semaphore
+-	 */
+-	struct list_head              client_data_list;
++	struct xarray                 client_data;
+ 
+ 	struct ib_cache               cache;
+ 	/**
+@@ -2654,7 +2649,21 @@ void ib_unregister_device(struct ib_device *device);
+ int ib_register_client   (struct ib_client *client);
+ void ib_unregister_client(struct ib_client *client);
+ 
+-void *ib_get_client_data(struct ib_device *device, struct ib_client *client);
++/**
++ * ib_get_client_data - Get IB client context
++ * @device:Device to get context for
++ * @client:Client to get context for
++ *
++ * ib_get_client_data() returns the client context data set with
++ * ib_set_client_data(). This can only be called while the client is
++ * registered to the device, once the ib_client remove() callback returns this
++ * cannot be called.
++ */
++static inline void *ib_get_client_data(struct ib_device *device,
++				       struct ib_client *client)
++{
++	return xa_load(&device->client_data, client->client_id);
++}
+ void  ib_set_client_data(struct ib_device *device, struct ib_client *client,
+ 			 void *data);
+ void ib_set_device_ops(struct ib_device *device,
