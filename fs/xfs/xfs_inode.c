@@ -2171,7 +2171,6 @@ xfs_iunlink_update_dinode(
 	xfs_dinode_calc_crc(mp, dip);
 	xfs_trans_inode_buf(tp, ibp);
 	xfs_trans_log_buf(tp, ibp, offset, offset + sizeof(xfs_agino_t) - 1);
-	xfs_inobp_check(mp, ibp);
 }
 
 /* Set an in-core inode's unlinked pointer and return the old value. */
@@ -3789,7 +3788,6 @@ xfs_iflush_int(
 	xfs_iflush_fork(ip, dip, iip, XFS_DATA_FORK);
 	if (XFS_IFORK_Q(ip))
 		xfs_iflush_fork(ip, dip, iip, XFS_ATTR_FORK);
-	xfs_inobp_check(mp, bp);
 
 	/*
 	 * We've recorded everything logged in the inode, so we'd like to clear
