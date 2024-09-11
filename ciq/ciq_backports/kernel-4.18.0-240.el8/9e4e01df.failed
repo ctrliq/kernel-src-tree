@@ -1,0 +1,861 @@
+bpf: lsm: Implement attach, detach and execution
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author KP Singh <kpsingh@google.com>
+commit 9e4e01dfd3254c7f04f24b7c6b29596bc12332f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9e4e01df.failed
+
+JITed BPF programs are dynamically attached to the LSM hooks
+using BPF trampolines. The trampoline prologue generates code to handle
+conversion of the signature of the hook to the appropriate BPF context.
+
+The allocated trampoline programs are attached to the nop functions
+initialized as LSM hooks.
+
+BPF_PROG_TYPE_LSM programs must have a GPL compatible license and
+and need CAP_SYS_ADMIN (required for loading eBPF programs).
+
+Upon attachment:
+
+* A BPF fexit trampoline is used for LSM hooks with a void return type.
+* A BPF fmod_ret trampoline is used for LSM hooks which return an
+  int. The attached programs can override the return value of the
+  bpf LSM hook to indicate a MAC Policy decision.
+
+	Signed-off-by: KP Singh <kpsingh@google.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Brendan Jackman <jackmanb@google.com>
+	Reviewed-by: Florent Revest <revest@google.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: James Morris <jamorris@linux.microsoft.com>
+Link: https://lore.kernel.org/bpf/20200329004356.27286-5-kpsingh@chromium.org
+(cherry picked from commit 9e4e01dfd3254c7f04f24b7c6b29596bc12332f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf_lsm.h
+#	kernel/bpf/bpf_lsm.c
+#	kernel/bpf/btf.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/trampoline.c
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/btf.c
+index d659110c662a,de335cd386f0..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -3574,20 -3701,62 +3574,68 @@@ bool btf_ctx_access(int off, int size, 
+  	}
+  	arg = off / 8;
+  	args = (const struct btf_param *)(t + 1);
+++<<<<<<< HEAD
+ +	/* skip first 'void *__data' argument in btf_trace_##name typedef */
+ +	args++;
+ +	nr_args = btf_type_vlen(t) - 1;
+ +	if (arg >= nr_args) {
+ +		bpf_log(log, "raw_tp '%s' doesn't have %d-th argument\n",
+ +			tname, arg);
+++=======
++ 	/* if (t == NULL) Fall back to default BPF prog with 5 u64 arguments */
++ 	nr_args = t ? btf_type_vlen(t) : 5;
++ 	if (prog->aux->attach_btf_trace) {
++ 		/* skip first 'void *__data' argument in btf_trace_##name typedef */
++ 		args++;
++ 		nr_args--;
++ 	}
++ 
++ 	if (arg == nr_args) {
++ 		if (prog->expected_attach_type == BPF_TRACE_FEXIT ||
++ 		    prog->expected_attach_type == BPF_LSM_MAC) {
++ 			/* When LSM programs are attached to void LSM hooks
++ 			 * they use FEXIT trampolines and when attached to
++ 			 * int LSM hooks, they use MODIFY_RETURN trampolines.
++ 			 *
++ 			 * While the LSM programs are BPF_MODIFY_RETURN-like
++ 			 * the check:
++ 			 *
++ 			 *	if (ret_type != 'int')
++ 			 *		return -EINVAL;
++ 			 *
++ 			 * is _not_ done here. This is still safe as LSM hooks
++ 			 * have only void and int return types.
++ 			 */
++ 			if (!t)
++ 				return true;
++ 			t = btf_type_by_id(btf, t->type);
++ 		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
++ 			/* For now the BPF_MODIFY_RETURN can only be attached to
++ 			 * functions that return an int.
++ 			 */
++ 			if (!t)
++ 				return false;
++ 
++ 			t = btf_type_skip_modifiers(btf, t->type, NULL);
++ 			if (!btf_type_is_int(t)) {
++ 				bpf_log(log,
++ 					"ret type %s not allowed for fmod_ret\n",
++ 					btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 				return false;
++ 			}
++ 		}
++ 	} else if (arg >= nr_args) {
++ 		bpf_log(log, "func '%s' doesn't have %d-th argument\n",
++ 			tname, arg + 1);
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  		return false;
+ -	} else {
+ -		if (!t)
+ -			/* Default prog with 5 args */
+ -			return true;
+ -		t = btf_type_by_id(btf, args[arg].type);
+  	}
+ +
+ +	t = btf_type_by_id(btf_vmlinux, args[arg].type);
+  	/* skip modifiers */
+  	while (btf_type_is_modifier(t))
+ -		t = btf_type_by_id(btf, t->type);
+ -	if (btf_type_is_int(t) || btf_type_is_enum(t))
+ +		t = btf_type_by_id(btf_vmlinux, t->type);
+ +	if (btf_type_is_int(t))
+  		/* accessing a scalar */
+  		return true;
+  	if (!btf_type_is_ptr(t)) {
+diff --cc kernel/bpf/syscall.c
+index b5b79e59cfd4,a616b63f23b4..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -32,16 -24,16 +32,21 @@@
+  #include <linux/ctype.h>
+  #include <linux/nospec.h>
+  #include <linux/audit.h>
+++<<<<<<< HEAD
+ +#include <linux/init.h>
+++=======
++ #include <uapi/linux/btf.h>
++ #include <linux/bpf_lsm.h>
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  
+ -#define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+ -			  (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+ -			  (map)->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
+ -#define IS_FD_PROG_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PROG_ARRAY)
+ +#include <linux/rh_features.h>
+ +
+ +#define IS_FD_ARRAY(map) ((map)->map_type == BPF_MAP_TYPE_PROG_ARRAY || \
+ +			   (map)->map_type == BPF_MAP_TYPE_PERF_EVENT_ARRAY || \
+ +			   (map)->map_type == BPF_MAP_TYPE_CGROUP_ARRAY || \
+ +			   (map)->map_type == BPF_MAP_TYPE_ARRAY_OF_MAPS)
+  #define IS_FD_HASH(map) ((map)->map_type == BPF_MAP_TYPE_HASH_OF_MAPS)
+ -#define IS_FD_MAP(map) (IS_FD_ARRAY(map) || IS_FD_PROG_ARRAY(map) || \
+ -			IS_FD_HASH(map))
+ +#define IS_FD_MAP(map) (IS_FD_ARRAY(map) || IS_FD_HASH(map))
+  
+  #define BPF_OBJ_FLAG_MASK   (BPF_F_RDONLY | BPF_F_WRONLY)
+  
+@@@ -1632,20 -1926,29 +1637,31 @@@ static void bpf_prog_load_fixup_attach_
+  }
+  
+  static int
+ -bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ -			   enum bpf_attach_type expected_attach_type,
+ -			   u32 btf_id, u32 prog_fd)
+ +bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ +				enum bpf_attach_type expected_attach_type)
+  {
+ -	if (btf_id) {
+ +	switch (prog_type) {
+ +	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+  		if (btf_id > BTF_MAX_TYPE)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		break;
+ +	default:
+ +		if (btf_id)
+++=======
++ 
++ 		switch (prog_type) {
++ 		case BPF_PROG_TYPE_TRACING:
++ 		case BPF_PROG_TYPE_LSM:
++ 		case BPF_PROG_TYPE_STRUCT_OPS:
++ 		case BPF_PROG_TYPE_EXT:
++ 			break;
++ 		default:
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  			return -EINVAL;
+ -		}
+ +		break;
+  	}
+  
+ -	if (prog_fd && prog_type != BPF_PROG_TYPE_TRACING &&
+ -	    prog_type != BPF_PROG_TYPE_EXT)
+ -		return -EINVAL;
+ -
+  	switch (prog_type) {
+  	case BPF_PROG_TYPE_CGROUP_SOCK:
+  		switch (expected_attach_type) {
+@@@ -1879,65 -2289,252 +1895,266 @@@ static const struct file_operations bpf
+  	.write		= bpf_dummy_write,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ int bpf_link_new_fd(struct bpf_link *link)
++ {
++ 	return anon_inode_getfd("bpf-link", &bpf_link_fops, link, O_CLOEXEC);
++ }
++ 
++ /* Similar to bpf_link_new_fd, create anon_inode for given bpf_link, but
++  * instead of immediately installing fd in fdtable, just reserve it and
++  * return. Caller then need to either install it with fd_install(fd, file) or
++  * release with put_unused_fd(fd).
++  * This is useful for cases when bpf_link attachment/detachment are
++  * complicated and expensive operations and should be delayed until all the fd
++  * reservation and anon_inode creation succeeds.
++  */
++ struct file *bpf_link_new_file(struct bpf_link *link, int *reserved_fd)
++ {
++ 	struct file *file;
++ 	int fd;
++ 
++ 	fd = get_unused_fd_flags(O_CLOEXEC);
++ 	if (fd < 0)
++ 		return ERR_PTR(fd);
++ 
++ 	file = anon_inode_getfile("bpf_link", &bpf_link_fops, link, O_CLOEXEC);
++ 	if (IS_ERR(file)) {
++ 		put_unused_fd(fd);
++ 		return file;
++ 	}
++ 
++ 	*reserved_fd = fd;
++ 	return file;
++ }
++ 
++ struct bpf_link *bpf_link_get_from_fd(u32 ufd)
++ {
++ 	struct fd f = fdget(ufd);
++ 	struct bpf_link *link;
++ 
++ 	if (!f.file)
++ 		return ERR_PTR(-EBADF);
++ 	if (f.file->f_op != &bpf_link_fops) {
++ 		fdput(f);
++ 		return ERR_PTR(-EINVAL);
++ 	}
++ 
++ 	link = f.file->private_data;
++ 	bpf_link_inc(link);
++ 	fdput(f);
++ 
++ 	return link;
++ }
++ 
++ struct bpf_tracing_link {
++ 	struct bpf_link link;
++ };
++ 
++ static void bpf_tracing_link_release(struct bpf_link *link)
++ {
++ 	WARN_ON_ONCE(bpf_trampoline_unlink_prog(link->prog));
++ }
++ 
++ static void bpf_tracing_link_dealloc(struct bpf_link *link)
++ {
++ 	struct bpf_tracing_link *tr_link =
++ 		container_of(link, struct bpf_tracing_link, link);
++ 
++ 	kfree(tr_link);
++ }
++ 
++ static const struct bpf_link_ops bpf_tracing_link_lops = {
++ 	.release = bpf_tracing_link_release,
++ 	.dealloc = bpf_tracing_link_dealloc,
++ };
++ 
++ static int bpf_tracing_prog_attach(struct bpf_prog *prog)
++ {
++ 	struct bpf_tracing_link *link;
++ 	struct file *link_file;
++ 	int link_fd, err;
++ 
++ 	switch (prog->type) {
++ 	case BPF_PROG_TYPE_TRACING:
++ 		if (prog->expected_attach_type != BPF_TRACE_FENTRY &&
++ 		    prog->expected_attach_type != BPF_TRACE_FEXIT &&
++ 		    prog->expected_attach_type != BPF_MODIFY_RETURN) {
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		break;
++ 	case BPF_PROG_TYPE_EXT:
++ 		if (prog->expected_attach_type != 0) {
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		break;
++ 	case BPF_PROG_TYPE_LSM:
++ 		if (prog->expected_attach_type != BPF_LSM_MAC) {
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		break;
++ 	default:
++ 		err = -EINVAL;
++ 		goto out_put_prog;
++ 	}
++ 
++ 	link = kzalloc(sizeof(*link), GFP_USER);
++ 	if (!link) {
++ 		err = -ENOMEM;
++ 		goto out_put_prog;
++ 	}
++ 	bpf_link_init(&link->link, &bpf_tracing_link_lops, prog);
++ 
++ 	link_file = bpf_link_new_file(&link->link, &link_fd);
++ 	if (IS_ERR(link_file)) {
++ 		kfree(link);
++ 		err = PTR_ERR(link_file);
++ 		goto out_put_prog;
++ 	}
++ 
++ 	err = bpf_trampoline_link_prog(prog);
++ 	if (err) {
++ 		bpf_link_cleanup(&link->link, link_file, link_fd);
++ 		goto out_put_prog;
++ 	}
++ 
++ 	fd_install(link_fd, link_file);
++ 	return link_fd;
++ 
++ out_put_prog:
++ 	bpf_prog_put(prog);
++ 	return err;
++ }
++ 
++ struct bpf_raw_tp_link {
++ 	struct bpf_link link;
++ 	struct bpf_raw_event_map *btp;
++ };
++ 
++ static void bpf_raw_tp_link_release(struct bpf_link *link)
++ {
++ 	struct bpf_raw_tp_link *raw_tp =
++ 		container_of(link, struct bpf_raw_tp_link, link);
++ 
++ 	bpf_probe_unregister(raw_tp->btp, raw_tp->link.prog);
++ 	bpf_put_raw_tracepoint(raw_tp->btp);
++ }
++ 
++ static void bpf_raw_tp_link_dealloc(struct bpf_link *link)
++ {
++ 	struct bpf_raw_tp_link *raw_tp =
++ 		container_of(link, struct bpf_raw_tp_link, link);
++ 
++ 	kfree(raw_tp);
++ }
++ 
++ static const struct bpf_link_ops bpf_raw_tp_lops = {
++ 	.release = bpf_raw_tp_link_release,
++ 	.dealloc = bpf_raw_tp_link_dealloc,
++ };
++ 
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  #define BPF_RAW_TRACEPOINT_OPEN_LAST_FIELD raw_tracepoint.prog_fd
+  
+  static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
+  {
+ -	struct bpf_raw_tp_link *link;
+ +	struct bpf_raw_tracepoint *raw_tp;
+  	struct bpf_raw_event_map *btp;
+ -	struct file *link_file;
+  	struct bpf_prog *prog;
+ -	const char *tp_name;
+ -	char buf[128];
+ -	int link_fd, err;
+ +	char tp_name[128];
+ +	int tp_fd, err;
+  
+ -	if (CHECK_ATTR(BPF_RAW_TRACEPOINT_OPEN))
+ -		return -EINVAL;
+ +	rh_mark_used_feature("eBPF/rawtrace");
+ +
+ +	if (strncpy_from_user(tp_name, u64_to_user_ptr(attr->raw_tracepoint.name),
+ +			      sizeof(tp_name) - 1) < 0)
+ +		return -EFAULT;
+ +	tp_name[sizeof(tp_name) - 1] = 0;
+ +
+ +	btp = bpf_get_raw_tracepoint(tp_name);
+ +	if (!btp)
+ +		return -ENOENT;
+ +
+ +	raw_tp = kzalloc(sizeof(*raw_tp), GFP_USER);
+ +	if (!raw_tp) {
+ +		err = -ENOMEM;
+ +		goto out_put_btp;
+ +	}
+ +	raw_tp->btp = btp;
+  
+  	prog = bpf_prog_get(attr->raw_tracepoint.prog_fd);
+++<<<<<<< HEAD
+ +	if (IS_ERR(prog)) {
+ +		err = PTR_ERR(prog);
+ +		goto out_free_tp;
+ +	}
+ +	if (prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT &&
+ +	    prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE) {
+ +		err = -EINVAL;
+ +		goto out_put_prog;
+ +	}
+ +
+ +	err = bpf_probe_register(raw_tp->btp, prog);
+ +	if (err)
+ +		goto out_put_prog;
+++=======
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	switch (prog->type) {
++ 	case BPF_PROG_TYPE_TRACING:
++ 	case BPF_PROG_TYPE_EXT:
++ 	case BPF_PROG_TYPE_LSM:
++ 		if (attr->raw_tracepoint.name) {
++ 			/* The attach point for this category of programs
++ 			 * should be specified via btf_id during program load.
++ 			 */
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		if (prog->type == BPF_PROG_TYPE_TRACING &&
++ 		    prog->expected_attach_type == BPF_TRACE_RAW_TP) {
++ 			tp_name = prog->aux->attach_func_name;
++ 			break;
++ 		}
++ 		return bpf_tracing_prog_attach(prog);
++ 	case BPF_PROG_TYPE_RAW_TRACEPOINT:
++ 	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
++ 		if (strncpy_from_user(buf,
++ 				      u64_to_user_ptr(attr->raw_tracepoint.name),
++ 				      sizeof(buf) - 1) < 0) {
++ 			err = -EFAULT;
++ 			goto out_put_prog;
++ 		}
++ 		buf[sizeof(buf) - 1] = 0;
++ 		tp_name = buf;
++ 		break;
++ 	default:
++ 		err = -EINVAL;
++ 		goto out_put_prog;
++ 	}
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  
+ -	btp = bpf_get_raw_tracepoint(tp_name);
+ -	if (!btp) {
+ -		err = -ENOENT;
+ +	raw_tp->prog = prog;
+ +	tp_fd = anon_inode_getfd("bpf-raw-tracepoint", &bpf_raw_tp_fops, raw_tp,
+ +				 O_CLOEXEC);
+ +	if (tp_fd < 0) {
+ +		bpf_probe_unregister(raw_tp->btp, prog);
+ +		err = tp_fd;
+  		goto out_put_prog;
+  	}
+ +	return tp_fd;
+  
+ -	link = kzalloc(sizeof(*link), GFP_USER);
+ -	if (!link) {
+ -		err = -ENOMEM;
+ -		goto out_put_btp;
+ -	}
+ -	bpf_link_init(&link->link, &bpf_raw_tp_lops, prog);
+ -	link->btp = btp;
+ -
+ -	link_file = bpf_link_new_file(&link->link, &link_fd);
+ -	if (IS_ERR(link_file)) {
+ -		kfree(link);
+ -		err = PTR_ERR(link_file);
+ -		goto out_put_btp;
+ -	}
+ -
+ -	err = bpf_probe_register(link->btp, prog);
+ -	if (err) {
+ -		bpf_link_cleanup(&link->link, link_file, link_fd);
+ -		goto out_put_btp;
+ -	}
+ -
+ -	fd_install(link_fd, link_file);
+ -	return link_fd;
+ -
+ -out_put_btp:
+ -	bpf_put_raw_tracepoint(btp);
+  out_put_prog:
+  	bpf_prog_put(prog);
+ +out_free_tp:
+ +	kfree(raw_tp);
+ +out_put_btp:
+ +	bpf_put_raw_tracepoint(btp);
+  	return err;
+  }
+  
+diff --cc kernel/bpf/verifier.c
+index d4bb81824068,047b2e876399..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -27,6 -19,8 +27,11 @@@
+  #include <linux/sort.h>
+  #include <linux/perf_event.h>
+  #include <linux/ctype.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/error-injection.h>
++ #include <linux/bpf_lsm.h>
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  
+  #include "disasm.h"
+  
+@@@ -6451,8 -6488,31 +6456,33 @@@ static int check_ld_abs(struct bpf_veri
+  static int check_return_code(struct bpf_verifier_env *env)
+  {
+  	struct tnum enforce_attach_type_range = tnum_unknown;
+ -	const struct bpf_prog *prog = env->prog;
+  	struct bpf_reg_state *reg;
+  	struct tnum range = tnum_range(0, 1);
+++<<<<<<< HEAD
+++=======
++ 	int err;
++ 
++ 	/* LSM and struct_ops func-ptr's return type could be "void" */
++ 	if ((env->prog->type == BPF_PROG_TYPE_STRUCT_OPS ||
++ 	     env->prog->type == BPF_PROG_TYPE_LSM) &&
++ 	    !prog->aux->attach_func_proto->type)
++ 		return 0;
++ 
++ 	/* eBPF calling convetion is such that R0 is used
++ 	 * to return the value from eBPF program.
++ 	 * Make sure that it's readable at this time
++ 	 * of bpf_exit, which means that program wrote
++ 	 * something into it earlier
++ 	 */
++ 	err = check_reg_arg(env, BPF_REG_0, SRC_OP);
++ 	if (err)
++ 		return err;
++ 
++ 	if (is_pointer_value(env, BPF_REG_0)) {
++ 		verbose(env, "R0 leaks addr as return value\n");
++ 		return -EACCES;
++ 	}
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  
+  	switch (env->prog->type) {
+  	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+@@@ -9631,6 -9834,297 +9661,300 @@@ static void print_verification_stats(st
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
++ {
++ 	const struct btf_type *t, *func_proto;
++ 	const struct bpf_struct_ops *st_ops;
++ 	const struct btf_member *member;
++ 	struct bpf_prog *prog = env->prog;
++ 	u32 btf_id, member_idx;
++ 	const char *mname;
++ 
++ 	btf_id = prog->aux->attach_btf_id;
++ 	st_ops = bpf_struct_ops_find(btf_id);
++ 	if (!st_ops) {
++ 		verbose(env, "attach_btf_id %u is not a supported struct\n",
++ 			btf_id);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	t = st_ops->type;
++ 	member_idx = prog->expected_attach_type;
++ 	if (member_idx >= btf_type_vlen(t)) {
++ 		verbose(env, "attach to invalid member idx %u of struct %s\n",
++ 			member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	member = &btf_type_member(t)[member_idx];
++ 	mname = btf_name_by_offset(btf_vmlinux, member->name_off);
++ 	func_proto = btf_type_resolve_func_ptr(btf_vmlinux, member->type,
++ 					       NULL);
++ 	if (!func_proto) {
++ 		verbose(env, "attach to invalid member %s(@idx %u) of struct %s\n",
++ 			mname, member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (st_ops->check_member) {
++ 		int err = st_ops->check_member(t, member);
++ 
++ 		if (err) {
++ 			verbose(env, "attach to unsupported member %s of struct %s\n",
++ 				mname, st_ops->name);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	prog->aux->attach_func_proto = func_proto;
++ 	prog->aux->attach_func_name = mname;
++ 	env->ops = st_ops->verifier_ops;
++ 
++ 	return 0;
++ }
++ #define SECURITY_PREFIX "security_"
++ 
++ static int check_attach_modify_return(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	unsigned long addr = (unsigned long) prog->aux->trampoline->func.addr;
++ 
++ 	/* This is expected to be cleaned up in the future with the KRSI effort
++ 	 * introducing the LSM_HOOK macro for cleaning up lsm_hooks.h.
++ 	 */
++ 	if (within_error_injection_list(addr) ||
++ 	    !strncmp(SECURITY_PREFIX, prog->aux->attach_func_name,
++ 		     sizeof(SECURITY_PREFIX) - 1))
++ 		return 0;
++ 
++ 	verbose(env, "fmod_ret attach_btf_id %u (%s) is not modifiable\n",
++ 		prog->aux->attach_btf_id, prog->aux->attach_func_name);
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	int ret = 0, subprog = -1, i;
++ 	struct bpf_trampoline *tr;
++ 	const struct btf_type *t;
++ 	bool conservative = true;
++ 	const char *tname;
++ 	struct btf *btf;
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM &&
++ 	    !prog_extension)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	btf = bpf_prog_get_target_btf(prog);
++ 	if (!btf) {
++ 		verbose(env,
++ 			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	if (tgt_prog) {
++ 		struct bpf_prog_aux *aux = tgt_prog->aux;
++ 
++ 		for (i = 0; i < aux->func_info_cnt; i++)
++ 			if (aux->func_info[i].type_id == btf_id) {
++ 				subprog = i;
++ 				break;
++ 			}
++ 		if (subprog == -1) {
++ 			verbose(env, "Subprog %s doesn't exist\n", tname);
++ 			return -EINVAL;
++ 		}
++ 		conservative = aux->func_info_aux[subprog].unreliable;
++ 		if (prog_extension) {
++ 			if (conservative) {
++ 				verbose(env,
++ 					"Cannot replace static functions\n");
++ 				return -EINVAL;
++ 			}
++ 			if (!prog->jit_requested) {
++ 				verbose(env,
++ 					"Extension programs should be JITed\n");
++ 				return -EINVAL;
++ 			}
++ 			env->ops = bpf_verifier_ops[tgt_prog->type];
++ 		}
++ 		if (!tgt_prog->jited) {
++ 			verbose(env, "Can attach to only JITed progs\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == prog->type) {
++ 			/* Cannot fentry/fexit another fentry/fexit program.
++ 			 * Cannot attach program extension to another extension.
++ 			 * It's ok to attach fentry/fexit to extension program.
++ 			 */
++ 			verbose(env, "Cannot recursively attach\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == BPF_PROG_TYPE_TRACING &&
++ 		    prog_extension &&
++ 		    (tgt_prog->expected_attach_type == BPF_TRACE_FENTRY ||
++ 		     tgt_prog->expected_attach_type == BPF_TRACE_FEXIT)) {
++ 			/* Program extensions can extend all program types
++ 			 * except fentry/fexit. The reason is the following.
++ 			 * The fentry/fexit programs are used for performance
++ 			 * analysis, stats and can be attached to any program
++ 			 * type except themselves. When extension program is
++ 			 * replacing XDP function it is necessary to allow
++ 			 * performance analysis of all functions. Both original
++ 			 * XDP program and its program extension. Hence
++ 			 * attaching fentry/fexit to BPF_PROG_TYPE_EXT is
++ 			 * allowed. If extending of fentry/fexit was allowed it
++ 			 * would be possible to create long call chain
++ 			 * fentry->extension->fentry->extension beyond
++ 			 * reasonable stack size. Hence extending fentry is not
++ 			 * allowed.
++ 			 */
++ 			verbose(env, "Cannot extend fentry/fexit\n");
++ 			return -EINVAL;
++ 		}
++ 		key = ((u64)aux->id) << 32 | btf_id;
++ 	} else {
++ 		if (prog_extension) {
++ 			verbose(env, "Cannot replace kernel functions\n");
++ 			return -EINVAL;
++ 		}
++ 		key = btf_id;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (tgt_prog) {
++ 			verbose(env,
++ 				"Only FENTRY/FEXIT progs are attachable to another BPF prog\n");
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	default:
++ 		if (!prog_extension)
++ 			return -EINVAL;
++ 		/* fallthrough */
++ 	case BPF_MODIFY_RETURN:
++ 	case BPF_LSM_MAC:
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		prog->aux->attach_func_name = tname;
++ 		if (prog->type == BPF_PROG_TYPE_LSM) {
++ 			ret = bpf_lsm_verify_prog(&env->log, prog);
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 
++ 		if (!btf_type_is_func(t)) {
++ 			verbose(env, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (prog_extension &&
++ 		    btf_check_type_match(env, prog, btf, t))
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		tr = bpf_trampoline_lookup(key);
++ 		if (!tr)
++ 			return -ENOMEM;
++ 		/* t is either vmlinux type or another program's type */
++ 		prog->aux->attach_func_proto = t;
++ 		mutex_lock(&tr->mutex);
++ 		if (tr->func.addr) {
++ 			prog->aux->trampoline = tr;
++ 			goto out;
++ 		}
++ 		if (tgt_prog && conservative) {
++ 			prog->aux->attach_func_proto = NULL;
++ 			t = NULL;
++ 		}
++ 		ret = btf_distill_func_proto(&env->log, btf, t,
++ 					     tname, &tr->func.model);
++ 		if (ret < 0)
++ 			goto out;
++ 		if (tgt_prog) {
++ 			if (subprog == 0)
++ 				addr = (long) tgt_prog->bpf_func;
++ 			else
++ 				addr = (long) tgt_prog->aux->func[subprog]->bpf_func;
++ 		} else {
++ 			addr = kallsyms_lookup_name(tname);
++ 			if (!addr) {
++ 				verbose(env,
++ 					"The address of function %s cannot be found\n",
++ 					tname);
++ 				ret = -ENOENT;
++ 				goto out;
++ 			}
++ 		}
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ 
++ 		if (prog->expected_attach_type == BPF_MODIFY_RETURN)
++ 			ret = check_attach_modify_return(env);
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
++ 	}
++ }
++ 
+++>>>>>>> 9e4e01dfd325 (bpf: lsm: Implement attach, detach and execution)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+* Unmerged path include/linux/bpf_lsm.h
+* Unmerged path kernel/bpf/bpf_lsm.c
+* Unmerged path kernel/bpf/trampoline.c
+* Unmerged path include/linux/bpf_lsm.h
+* Unmerged path kernel/bpf/bpf_lsm.c
+* Unmerged path kernel/bpf/btf.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/trampoline.c
+* Unmerged path kernel/bpf/verifier.c
