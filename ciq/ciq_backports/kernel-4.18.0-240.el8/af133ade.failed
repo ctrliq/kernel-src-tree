@@ -1,0 +1,242 @@
+ext4: add cond_resched() to ext4_protect_reserved_inode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Shijie Luo <luoshijie1@huawei.com>
+commit af133ade9a40794a37104ecbcc2827c0ea373a3c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/af133ade.failed
+
+When journal size is set too big by "mkfs.ext4 -J size=", or when
+we mount a crafted image to make journal inode->i_size too big,
+the loop, "while (i < num)", holds cpu too long. This could cause
+soft lockup.
+
+[  529.357541] Call trace:
+[  529.357551]  dump_backtrace+0x0/0x198
+[  529.357555]  show_stack+0x24/0x30
+[  529.357562]  dump_stack+0xa4/0xcc
+[  529.357568]  watchdog_timer_fn+0x300/0x3e8
+[  529.357574]  __hrtimer_run_queues+0x114/0x358
+[  529.357576]  hrtimer_interrupt+0x104/0x2d8
+[  529.357580]  arch_timer_handler_virt+0x38/0x58
+[  529.357584]  handle_percpu_devid_irq+0x90/0x248
+[  529.357588]  generic_handle_irq+0x34/0x50
+[  529.357590]  __handle_domain_irq+0x68/0xc0
+[  529.357593]  gic_handle_irq+0x6c/0x150
+[  529.357595]  el1_irq+0xb8/0x140
+[  529.357599]  __ll_sc_atomic_add_return_acquire+0x14/0x20
+[  529.357668]  ext4_map_blocks+0x64/0x5c0 [ext4]
+[  529.357693]  ext4_setup_system_zone+0x330/0x458 [ext4]
+[  529.357717]  ext4_fill_super+0x2170/0x2ba8 [ext4]
+[  529.357722]  mount_bdev+0x1a8/0x1e8
+[  529.357746]  ext4_mount+0x44/0x58 [ext4]
+[  529.357748]  mount_fs+0x50/0x170
+[  529.357752]  vfs_kern_mount.part.9+0x54/0x188
+[  529.357755]  do_mount+0x5ac/0xd78
+[  529.357758]  ksys_mount+0x9c/0x118
+[  529.357760]  __arm64_sys_mount+0x28/0x38
+[  529.357764]  el0_svc_common+0x78/0x130
+[  529.357766]  el0_svc_handler+0x38/0x78
+[  529.357769]  el0_svc+0x8/0xc
+[  541.356516] watchdog: BUG: soft lockup - CPU#0 stuck for 23s! [mount:18674]
+
+Link: https://lore.kernel.org/r/20200211011752.29242-1-luoshijie1@huawei.com
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Shijie Luo <luoshijie1@huawei.com>
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: stable@kernel.org
+(cherry picked from commit af133ade9a40794a37104ecbcc2827c0ea373a3c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/block_validity.c
+diff --cc fs/ext4/block_validity.c
+index 64c1310e4364,0a734ffb4310..000000000000
+--- a/fs/ext4/block_validity.c
++++ b/fs/ext4/block_validity.c
+@@@ -221,6 -189,179 +221,182 @@@ int ext4_data_block_valid(struct ext4_s
+  	return 1;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ext4_protect_reserved_inode(struct super_block *sb,
++ 				       struct ext4_system_blocks *system_blks,
++ 				       u32 ino)
++ {
++ 	struct inode *inode;
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	struct ext4_map_blocks map;
++ 	u32 i = 0, num;
++ 	int err = 0, n;
++ 
++ 	if ((ino < EXT4_ROOT_INO) ||
++ 	    (ino > le32_to_cpu(sbi->s_es->s_inodes_count)))
++ 		return -EINVAL;
++ 	inode = ext4_iget(sb, ino, EXT4_IGET_SPECIAL);
++ 	if (IS_ERR(inode))
++ 		return PTR_ERR(inode);
++ 	num = (inode->i_size + sb->s_blocksize - 1) >> sb->s_blocksize_bits;
++ 	while (i < num) {
++ 		cond_resched();
++ 		map.m_lblk = i;
++ 		map.m_len = num - i;
++ 		n = ext4_map_blocks(NULL, inode, &map, 0);
++ 		if (n < 0) {
++ 			err = n;
++ 			break;
++ 		}
++ 		if (n == 0) {
++ 			i++;
++ 		} else {
++ 			if (!ext4_data_block_valid_rcu(sbi, system_blks,
++ 						map.m_pblk, n)) {
++ 				ext4_error(sb, "blocks %llu-%llu from inode %u "
++ 					   "overlap system zone", map.m_pblk,
++ 					   map.m_pblk + map.m_len - 1, ino);
++ 				err = -EFSCORRUPTED;
++ 				break;
++ 			}
++ 			err = add_system_zone(system_blks, map.m_pblk, n);
++ 			if (err < 0)
++ 				break;
++ 			i += n;
++ 		}
++ 	}
++ 	iput(inode);
++ 	return err;
++ }
++ 
++ static void ext4_destroy_system_zone(struct rcu_head *rcu)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 
++ 	system_blks = container_of(rcu, struct ext4_system_blocks, rcu);
++ 	release_system_zone(system_blks);
++ 	kfree(system_blks);
++ }
++ 
++ /*
++  * Build system zone rbtree which is used for block validity checking.
++  *
++  * The update of system_blks pointer in this function is protected by
++  * sb->s_umount semaphore. However we have to be careful as we can be
++  * racing with ext4_data_block_valid() calls reading system_blks rbtree
++  * protected only by RCU. That's why we first build the rbtree and then
++  * swap it in place.
++  */
++ int ext4_setup_system_zone(struct super_block *sb)
++ {
++ 	ext4_group_t ngroups = ext4_get_groups_count(sb);
++ 	struct ext4_sb_info *sbi = EXT4_SB(sb);
++ 	struct ext4_system_blocks *system_blks;
++ 	struct ext4_group_desc *gdp;
++ 	ext4_group_t i;
++ 	int flex_size = ext4_flex_bg_size(sbi);
++ 	int ret;
++ 
++ 	if (!test_opt(sb, BLOCK_VALIDITY)) {
++ 		if (sbi->system_blks)
++ 			ext4_release_system_zone(sb);
++ 		return 0;
++ 	}
++ 	if (sbi->system_blks)
++ 		return 0;
++ 
++ 	system_blks = kzalloc(sizeof(*system_blks), GFP_KERNEL);
++ 	if (!system_blks)
++ 		return -ENOMEM;
++ 
++ 	for (i=0; i < ngroups; i++) {
++ 		cond_resched();
++ 		if (ext4_bg_has_super(sb, i) &&
++ 		    ((i < 5) || ((i % flex_size) == 0)))
++ 			add_system_zone(system_blks,
++ 					ext4_group_first_block_no(sb, i),
++ 					ext4_bg_num_gdb(sb, i) + 1);
++ 		gdp = ext4_get_group_desc(sb, i, NULL);
++ 		ret = add_system_zone(system_blks,
++ 				ext4_block_bitmap(sb, gdp), 1);
++ 		if (ret)
++ 			goto err;
++ 		ret = add_system_zone(system_blks,
++ 				ext4_inode_bitmap(sb, gdp), 1);
++ 		if (ret)
++ 			goto err;
++ 		ret = add_system_zone(system_blks,
++ 				ext4_inode_table(sb, gdp),
++ 				sbi->s_itb_per_group);
++ 		if (ret)
++ 			goto err;
++ 	}
++ 	if (ext4_has_feature_journal(sb) && sbi->s_es->s_journal_inum) {
++ 		ret = ext4_protect_reserved_inode(sb, system_blks,
++ 				le32_to_cpu(sbi->s_es->s_journal_inum));
++ 		if (ret)
++ 			goto err;
++ 	}
++ 
++ 	/*
++ 	 * System blks rbtree complete, announce it once to prevent racing
++ 	 * with ext4_data_block_valid() accessing the rbtree at the same
++ 	 * time.
++ 	 */
++ 	rcu_assign_pointer(sbi->system_blks, system_blks);
++ 
++ 	if (test_opt(sb, DEBUG))
++ 		debug_print_tree(sbi);
++ 	return 0;
++ err:
++ 	release_system_zone(system_blks);
++ 	kfree(system_blks);
++ 	return ret;
++ }
++ 
++ /*
++  * Called when the filesystem is unmounted or when remounting it with
++  * noblock_validity specified.
++  *
++  * The update of system_blks pointer in this function is protected by
++  * sb->s_umount semaphore. However we have to be careful as we can be
++  * racing with ext4_data_block_valid() calls reading system_blks rbtree
++  * protected only by RCU. So we first clear the system_blks pointer and
++  * then free the rbtree only after RCU grace period expires.
++  */
++ void ext4_release_system_zone(struct super_block *sb)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 
++ 	system_blks = rcu_dereference_protected(EXT4_SB(sb)->system_blks,
++ 					lockdep_is_held(&sb->s_umount));
++ 	rcu_assign_pointer(EXT4_SB(sb)->system_blks, NULL);
++ 
++ 	if (system_blks)
++ 		call_rcu(&system_blks->rcu, ext4_destroy_system_zone);
++ }
++ 
++ int ext4_data_block_valid(struct ext4_sb_info *sbi, ext4_fsblk_t start_blk,
++ 			  unsigned int count)
++ {
++ 	struct ext4_system_blocks *system_blks;
++ 	int ret;
++ 
++ 	/*
++ 	 * Lock the system zone to prevent it being released concurrently
++ 	 * when doing a remount which inverse current "[no]block_validity"
++ 	 * mount option.
++ 	 */
++ 	rcu_read_lock();
++ 	system_blks = rcu_dereference(sbi->system_blks);
++ 	ret = ext4_data_block_valid_rcu(sbi, system_blks, start_blk,
++ 					count);
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ 
+++>>>>>>> af133ade9a40 (ext4: add cond_resched() to ext4_protect_reserved_inode)
+  int ext4_check_blockref(const char *function, unsigned int line,
+  			struct inode *inode, __le32 *p, unsigned int max)
+  {
+* Unmerged path fs/ext4/block_validity.c
