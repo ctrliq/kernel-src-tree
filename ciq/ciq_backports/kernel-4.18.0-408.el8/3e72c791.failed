@@ -1,0 +1,185 @@
+KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Matlack <dmatlack@google.com>
+commit 3e72c791fd33d726ac026505f9c40644ec0afc51
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3e72c791.failed
+
+tdp_mmu_set_spte_atomic() and tdp_mmu_zap_spte_atomic() return a bool
+with true indicating the SPTE modification was successful and false
+indicating failure. Change these functions to return an int instead
+since that is the common practice.
+
+Opportunistically fix up the kernel-doc style for the Return section
+above tdp_mmu_set_spte_atomic().
+
+No functional change intended.
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: David Matlack <dmatlack@google.com>
+Message-Id: <20220119230739.2234394-5-dmatlack@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3e72c791fd33d726ac026505f9c40644ec0afc51)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 81d8077f43f3,33a23b63dec5..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -510,13 -518,19 +510,21 @@@ static void handle_changed_spte(struct 
+   * @kvm: kvm instance
+   * @iter: a tdp_iter instance currently on the SPTE that should be set
+   * @new_spte: The value the SPTE should be set to
+++<<<<<<< HEAD
+ + * Returns: true if the SPTE was set, false if it was not. If false is returned,
+ + *	    this function will have no side-effects.
+++=======
++  * Return:
++  * * 0      - If the SPTE was set.
++  * * -EBUSY - If the SPTE cannot be set. In this case this function will have
++  *            no side-effects other than setting iter->old_spte to the last
++  *            known value of the spte.
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+   */
+- static inline bool tdp_mmu_set_spte_atomic(struct kvm *kvm,
+- 					   struct tdp_iter *iter,
+- 					   u64 new_spte)
++ static inline int tdp_mmu_set_spte_atomic(struct kvm *kvm,
++ 					  struct tdp_iter *iter,
++ 					  u64 new_spte)
+  {
+ -	u64 *sptep = rcu_dereference(iter->sptep);
+ -	u64 old_spte;
+ -
+  	WARN_ON_ONCE(iter->yielded);
+  
+  	lockdep_assert_held_read(&kvm->mmu_lock);
+@@@ -532,19 -546,30 +540,35 @@@
+  	 * Note, fast_pf_fix_direct_spte() can also modify TDP MMU SPTEs and
+  	 * does not hold the mmu_lock.
+  	 */
+++<<<<<<< HEAD
+ +	if (cmpxchg64(rcu_dereference(iter->sptep), iter->old_spte,
+ +		      new_spte) != iter->old_spte)
+ +		return false;
+++=======
++ 	old_spte = cmpxchg64(sptep, iter->old_spte, new_spte);
++ 	if (old_spte != iter->old_spte) {
++ 		/*
++ 		 * The page table entry was modified by a different logical
++ 		 * CPU. Refresh iter->old_spte with the current value so the
++ 		 * caller operates on fresh data, e.g. if it retries
++ 		 * tdp_mmu_set_spte_atomic().
++ 		 */
++ 		iter->old_spte = old_spte;
++ 		return -EBUSY;
++ 	}
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  
+ -	__handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+ -			      new_spte, iter->level, true);
+ -	handle_changed_spte_acc_track(iter->old_spte, new_spte, iter->level);
+ +	handle_changed_spte(kvm, iter->as_id, iter->gfn, iter->old_spte,
+ +			    new_spte, iter->level, true);
+  
+- 	return true;
++ 	return 0;
+  }
+  
+- static inline bool tdp_mmu_zap_spte_atomic(struct kvm *kvm,
+- 					   struct tdp_iter *iter)
++ static inline int tdp_mmu_zap_spte_atomic(struct kvm *kvm,
++ 					  struct tdp_iter *iter)
+  {
++ 	int ret;
++ 
+  	/*
+  	 * Freeze the SPTE by setting it to a special,
+  	 * non-present value. This will stop other threads from
+@@@ -732,8 -787,12 +757,17 @@@ static bool zap_gfn_range(struct kvm *k
+  		    !is_last_spte(iter.old_spte, iter.level))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +		flush = true;
+++=======
++ 		if (!shared) {
++ 			tdp_mmu_set_spte(kvm, &iter, 0);
++ 			flush = true;
++ 		} else if (tdp_mmu_zap_spte_atomic(kvm, &iter)) {
++ 			goto retry;
++ 		}
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  	}
+  
+  	rcu_read_unlock();
+@@@ -994,11 -1040,10 +1028,18 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  			new_spte = make_nonleaf_spte(child_pt,
+  						     !shadow_accessed_mask);
+  
+++<<<<<<< HEAD
+ +			if (tdp_mmu_set_spte_atomic(vcpu->kvm, &iter,
+ +						    new_spte)) {
+ +				tdp_mmu_link_page(vcpu->kvm, sp, true,
+ +						  huge_page_disallowed &&
+ +						  req_level >= iter.level);
+++=======
++ 			if (!tdp_mmu_set_spte_atomic(vcpu->kvm, &iter, new_spte)) {
++ 				tdp_mmu_link_page(vcpu->kvm, sp,
++ 						  fault->huge_page_disallowed &&
++ 						  fault->req_level >= iter.level);
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  
+  				trace_kvm_mmu_get_page(sp, true);
+  			} else {
+@@@ -1248,7 -1223,9 +1289,13 @@@ static bool wrprot_gfn_range(struct kv
+  
+  		new_spte = iter.old_spte & ~PT_WRITABLE_MASK;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte_no_dirty_log(kvm, &iter, new_spte);
+++=======
++ 		if (tdp_mmu_set_spte_atomic(kvm, &iter, new_spte))
++ 			goto retry;
++ 
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  		spte_set = true;
+  	}
+  
+@@@ -1306,7 -1286,9 +1353,13 @@@ static bool clear_dirty_gfn_range(struc
+  				continue;
+  		}
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte_no_dirty_log(kvm, &iter, new_spte);
+++=======
++ 		if (tdp_mmu_set_spte_atomic(kvm, &iter, new_spte))
++ 			goto retry;
++ 
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  		spte_set = true;
+  	}
+  
+@@@ -1428,9 -1411,9 +1481,15 @@@ static bool zap_collapsible_spte_range(
+  							    pfn, PG_LEVEL_NUM))
+  			continue;
+  
+++<<<<<<< HEAD
+ +		tdp_mmu_set_spte(kvm, &iter, 0);
+ +
+ +		flush = true;
+++=======
++ 		/* Note, a successful atomic zap also does a remote TLB flush. */
++ 		if (tdp_mmu_zap_spte_atomic(kvm, &iter))
++ 			goto retry;
+++>>>>>>> 3e72c791fd33 (KVM: x86/mmu: Change tdp_mmu_{set,zap}_spte_atomic() to return 0/-EBUSY)
+  	}
+  
+  	rcu_read_unlock();
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
