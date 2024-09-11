@@ -1,0 +1,183 @@
+xfs: rename and simplify xfs_bmap_one_block
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 2ac131df03d4f06bb0d825335663cc5064421993
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/2ac131df.failed
+
+xfs_bmap_one_block is only called for the attribute fork.  Move it to
+xfs_attr.c, drop the unused whichfork argument and code only executed for
+the data fork and rename the result to xfs_attr_is_leaf.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <djwong@kernel.org>
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+(cherry picked from commit 2ac131df03d4f06bb0d825335663cc5064421993)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index 75cd057207ed,e32b8228d9cc..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -1439,38 -1442,6 +1439,41 @@@ xfs_bmap_last_offset
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Returns whether the selected fork of the inode has exactly one
+ + * block or not.  For the data fork we check this matches di_size,
+ + * implying the file's range is 0..bsize-1.
+ + */
+ +int					/* 1=>1 block, 0=>otherwise */
+ +xfs_bmap_one_block(
+ +	struct xfs_inode	*ip,		/* incore inode */
+ +	int			whichfork)	/* data or attr fork */
+ +{
+ +	struct xfs_ifork	*ifp = XFS_IFORK_PTR(ip, whichfork);
+ +	int			rval;		/* return value */
+ +	struct xfs_bmbt_irec	s;		/* internal version of extent */
+ +	struct xfs_iext_cursor icur;
+ +
+ +#ifndef DEBUG
+ +	if (whichfork == XFS_DATA_FORK)
+ +		return XFS_ISIZE(ip) == ip->i_mount->m_sb.sb_blocksize;
+ +#endif	/* !DEBUG */
+ +	if (ifp->if_nextents != 1)
+ +		return 0;
+ +	if (ifp->if_format != XFS_DINODE_FMT_EXTENTS)
+ +		return 0;
+ +	ASSERT(ifp->if_flags & XFS_IFEXTENTS);
+ +	xfs_iext_first(ifp, &icur);
+ +	xfs_iext_get_extent(ifp, &icur, &s);
+ +	rval = s.br_startoff == 0 && s.br_blockcount == 1;
+ +	if (rval && whichfork == XFS_DATA_FORK)
+ +		ASSERT(XFS_ISIZE(ip) == ip->i_mount->m_sb.sb_blocksize);
+ +	return rval;
+ +}
+ +
+ +/*
+++=======
+++>>>>>>> 2ac131df03d4 (xfs: rename and simplify xfs_bmap_one_block)
+   * Extent tree manipulation functions used during allocation.
+   */
+  
+diff --git a/fs/xfs/libxfs/xfs_attr.c b/fs/xfs/libxfs/xfs_attr.c
+index be7124728a01..33c197ae46d2 100644
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@ -70,6 +70,26 @@ xfs_inode_hasattr(
+ 	return 1;
+ }
+ 
++/*
++ * Returns true if the there is exactly only block in the attr fork, in which
++ * case the attribute fork consists of a single leaf block entry.
++ */
++bool
++xfs_attr_is_leaf(
++	struct xfs_inode	*ip)
++{
++	struct xfs_ifork	*ifp = ip->i_afp;
++	struct xfs_iext_cursor	icur;
++	struct xfs_bmbt_irec	imap;
++
++	if (ifp->if_nextents != 1 || ifp->if_format != XFS_DINODE_FMT_EXTENTS)
++		return false;
++
++	xfs_iext_first(ifp, &icur);
++	xfs_iext_get_extent(ifp, &icur, &imap);
++	return imap.br_startoff == 0 && imap.br_blockcount == 1;
++}
++
+ /*========================================================================
+  * Overall external interface routines.
+  *========================================================================*/
+@@ -89,7 +109,7 @@ xfs_attr_get_ilocked(
+ 
+ 	if (args->dp->i_afp->if_format == XFS_DINODE_FMT_LOCAL)
+ 		return xfs_attr_shortform_getvalue(args);
+-	if (xfs_bmap_one_block(args->dp, XFS_ATTR_FORK))
++	if (xfs_attr_is_leaf(args->dp))
+ 		return xfs_attr_leaf_get(args);
+ 	return xfs_attr_node_get(args);
+ }
+@@ -293,7 +313,7 @@ xfs_attr_set_args(
+ 			return error;
+ 	}
+ 
+-	if (xfs_bmap_one_block(dp, XFS_ATTR_FORK)) {
++	if (xfs_attr_is_leaf(dp)) {
+ 		error = xfs_attr_leaf_addname(args);
+ 		if (error != -ENOSPC)
+ 			return error;
+@@ -347,7 +367,7 @@ xfs_has_attr(
+ 		return xfs_attr_sf_findname(args, NULL, NULL);
+ 	}
+ 
+-	if (xfs_bmap_one_block(dp, XFS_ATTR_FORK)) {
++	if (xfs_attr_is_leaf(dp)) {
+ 		error = xfs_attr_leaf_hasname(args, &bp);
+ 
+ 		if (bp)
+@@ -374,7 +394,7 @@ xfs_attr_remove_args(
+ 	} else if (dp->i_afp->if_format == XFS_DINODE_FMT_LOCAL) {
+ 		ASSERT(dp->i_afp->if_flags & XFS_IFINLINE);
+ 		error = xfs_attr_shortform_remove(args);
+-	} else if (xfs_bmap_one_block(dp, XFS_ATTR_FORK)) {
++	} else if (xfs_attr_is_leaf(dp)) {
+ 		error = xfs_attr_leaf_removename(args);
+ 	} else {
+ 		error = xfs_attr_node_removename(args);
+@@ -1284,7 +1304,7 @@ xfs_attr_node_removename(
+ 	/*
+ 	 * If the result is small enough, push it all into the inode.
+ 	 */
+-	if (xfs_bmap_one_block(dp, XFS_ATTR_FORK))
++	if (xfs_attr_is_leaf(dp))
+ 		error = xfs_attr_node_shrink(args, state);
+ 
+ out:
+diff --git a/fs/xfs/libxfs/xfs_attr.h b/fs/xfs/libxfs/xfs_attr.h
+index 3e97a935e712..2b1f61987a9d 100644
+--- a/fs/xfs/libxfs/xfs_attr.h
++++ b/fs/xfs/libxfs/xfs_attr.h
+@@ -85,6 +85,7 @@ int xfs_attr_inactive(struct xfs_inode *dp);
+ int xfs_attr_list_ilocked(struct xfs_attr_list_context *);
+ int xfs_attr_list(struct xfs_attr_list_context *);
+ int xfs_inode_hasattr(struct xfs_inode *ip);
++bool xfs_attr_is_leaf(struct xfs_inode *ip);
+ int xfs_attr_get_ilocked(struct xfs_da_args *args);
+ int xfs_attr_get(struct xfs_da_args *args);
+ int xfs_attr_set(struct xfs_da_args *args);
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_bmap.h b/fs/xfs/libxfs/xfs_bmap.h
+index 6747e97a7949..59fa4834a761 100644
+--- a/fs/xfs/libxfs/xfs_bmap.h
++++ b/fs/xfs/libxfs/xfs_bmap.h
+@@ -199,7 +199,6 @@ int	xfs_bmap_last_before(struct xfs_trans *tp, struct xfs_inode *ip,
+ 		xfs_fileoff_t *last_block, int whichfork);
+ int	xfs_bmap_last_offset(struct xfs_inode *ip, xfs_fileoff_t *unused,
+ 		int whichfork);
+-int	xfs_bmap_one_block(struct xfs_inode *ip, int whichfork);
+ int	xfs_bmapi_read(struct xfs_inode *ip, xfs_fileoff_t bno,
+ 		xfs_filblks_t len, struct xfs_bmbt_irec *mval,
+ 		int *nmap, int flags);
+diff --git a/fs/xfs/xfs_attr_list.c b/fs/xfs/xfs_attr_list.c
+index 8f8837fe21cf..25dcc98d50e6 100644
+--- a/fs/xfs/xfs_attr_list.c
++++ b/fs/xfs/xfs_attr_list.c
+@@ -514,7 +514,7 @@ xfs_attr_list_ilocked(
+ 		return 0;
+ 	if (dp->i_afp->if_format == XFS_DINODE_FMT_LOCAL)
+ 		return xfs_attr_shortform_list(context);
+-	if (xfs_bmap_one_block(dp, XFS_ATTR_FORK))
++	if (xfs_attr_is_leaf(dp))
+ 		return xfs_attr_leaf_list(context);
+ 	return xfs_attr_node_list(context);
+ }
