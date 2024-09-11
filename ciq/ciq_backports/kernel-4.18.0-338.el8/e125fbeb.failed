@@ -1,0 +1,169 @@
+fs: dlm: fix mark setting deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Alexander Aring <aahringo@redhat.com>
+commit e125fbeb538e5e35a00c6c8150a5361bef34814c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/e125fbeb.failed
+
+This patch fixes an deadlock issue when dlm_lowcomms_close() is called.
+When dlm_lowcomms_close() is called the clusters_root.subsys.su_mutex is
+held to remove configfs items. At this time we flushing (e.g.
+cancel_work_sync()) the workers of send and recv workqueue. Due the fact
+that we accessing configfs items (mark values), these workers will lock
+clusters_root.subsys.su_mutex as well which are already hold by
+dlm_lowcomms_close() and ends in a deadlock situation.
+
+[67170.703046] ======================================================
+[67170.703965] WARNING: possible circular locking dependency detected
+[67170.704758] 5.11.0-rc4+ #22 Tainted: G        W
+[67170.705433] ------------------------------------------------------
+[67170.706228] dlm_controld/280 is trying to acquire lock:
+[67170.706915] ffff9f2f475a6948 ((wq_completion)dlm_recv){+.+.}-{0:0}, at: __flush_work+0x203/0x4c0
+[67170.708026]
+               but task is already holding lock:
+[67170.708758] ffffffffa132f878 (&clusters_root.subsys.su_mutex){+.+.}-{3:3}, at: configfs_rmdir+0x29b/0x310
+[67170.710016]
+               which lock already depends on the new lock.
+
+The new behaviour adds the mark value to the node address configuration
+which doesn't require to held the clusters_root.subsys.su_mutex by
+accessing mark values in a separate datastructure. However the mark
+values can be set now only after a node address was set which is the
+case when the user is using dlm_controld.
+
+	Signed-off-by: Alexander Aring <aahringo@redhat.com>
+	Signed-off-by: David Teigland <teigland@redhat.com>
+(cherry picked from commit e125fbeb538e5e35a00c6c8150a5361bef34814c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dlm/config.c
+#	fs/dlm/lowcomms.c
+diff --cc fs/dlm/config.c
+index 1270551d24e3,582bffa09a66..000000000000
+--- a/fs/dlm/config.c
++++ b/fs/dlm/config.c
+@@@ -662,8 -680,37 +662,39 @@@ static ssize_t comm_addr_list_show(stru
+  	return 4096 - allowance;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static ssize_t comm_mark_show(struct config_item *item, char *buf)
++ {
++ 	return sprintf(buf, "%u\n", config_item_to_comm(item)->mark);
++ }
++ 
++ static ssize_t comm_mark_store(struct config_item *item, const char *buf,
++ 			       size_t len)
++ {
++ 	struct dlm_comm *comm;
++ 	unsigned int mark;
++ 	int rc;
++ 
++ 	rc = kstrtouint(buf, 0, &mark);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (mark == 0)
++ 		mark = dlm_config.ci_mark;
++ 
++ 	comm = config_item_to_comm(item);
++ 	rc = dlm_lowcomms_nodes_set_mark(comm->nodeid, mark);
++ 	if (rc)
++ 		return rc;
++ 
++ 	comm->mark = mark;
++ 	return len;
++ }
++ 
+++>>>>>>> e125fbeb538e (fs: dlm: fix mark setting deadlock)
+  CONFIGFS_ATTR(comm_, nodeid);
+  CONFIGFS_ATTR(comm_, local);
+ -CONFIGFS_ATTR(comm_, mark);
+  CONFIGFS_ATTR_WO(comm_, addr);
+  CONFIGFS_ATTR_RO(comm_, addr_list);
+  
+diff --cc fs/dlm/lowcomms.c
+index 2ece988dabc6,440dce99d0d9..000000000000
+--- a/fs/dlm/lowcomms.c
++++ b/fs/dlm/lowcomms.c
+@@@ -786,7 -912,10 +810,14 @@@ static int tcp_accept_from_sock(struct 
+  		result = -ENOMEM;
+  		goto accept_err;
+  	}
+++<<<<<<< HEAD
+ +	mutex_lock_nested(&newcon->sock_mutex, 1);
+++=======
++ 
++ 	sock_set_mark(newsock->sk, mark);
++ 
++ 	mutex_lock(&newcon->sock_mutex);
+++>>>>>>> e125fbeb538e (fs: dlm: fix mark setting deadlock)
+  	if (newcon->sock) {
+  		struct connection *othercon = newcon->othercon;
+  
+@@@ -1037,13 -1036,8 +1068,16 @@@ static void sctp_connect_to_sock(struc
+  	int result;
+  	int addr_len;
+  	struct socket *sock;
+ -	unsigned int mark;
+ +	struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+  
+++<<<<<<< HEAD
+ +	if (con->nodeid == 0) {
+ +		log_print("attempt to connect sock 0 foiled");
+ +		return;
+ +	}
+ +
+++=======
+++>>>>>>> e125fbeb538e (fs: dlm: fix mark setting deadlock)
+  	mutex_lock(&con->sock_mutex);
+  
+  	/* Some odd races can cause double-connects, ignore them */
+@@@ -1136,11 -1130,6 +1171,14 @@@ static void tcp_connect_to_sock(struct 
+  	struct socket *sock = NULL;
+  	int result;
+  
+++<<<<<<< HEAD
+ +	if (con->nodeid == 0) {
+ +		log_print("attempt to connect sock 0 foiled");
+ +		return;
+ +	}
+ +
+++=======
+++>>>>>>> e125fbeb538e (fs: dlm: fix mark setting deadlock)
+  	mutex_lock(&con->sock_mutex);
+  	if (con->retries++ > MAX_CONNECT_RETRIES)
+  		goto out;
+@@@ -1162,8 -1151,8 +1200,13 @@@
+  		goto out_err;
+  	}
+  
+++<<<<<<< HEAD
+ +	con->rx_action = receive_from_sock;
+ +	con->connect_action = tcp_connect_to_sock;
+++=======
++ 	sock_set_mark(sock->sk, mark);
++ 
+++>>>>>>> e125fbeb538e (fs: dlm: fix mark setting deadlock)
+  	add_sock(sock, con);
+  
+  	/* Bind to our cluster-known address connecting to avoid
+* Unmerged path fs/dlm/config.c
+* Unmerged path fs/dlm/lowcomms.c
+diff --git a/fs/dlm/lowcomms.h b/fs/dlm/lowcomms.h
+index 67462e54fc2f..0bd4b2ff7f28 100644
+--- a/fs/dlm/lowcomms.h
++++ b/fs/dlm/lowcomms.h
+@@ -21,6 +21,7 @@ int dlm_lowcomms_close(int nodeid);
+ void *dlm_lowcomms_get_buffer(int nodeid, int len, gfp_t allocation, char **ppc);
+ void dlm_lowcomms_commit_buffer(void *mh);
+ int dlm_lowcomms_connect_node(int nodeid);
++int dlm_lowcomms_nodes_set_mark(int nodeid, unsigned int mark);
+ int dlm_lowcomms_addr(int nodeid, struct sockaddr_storage *addr, int len);
+ 
+ #endif				/* __LOWCOMMS_DOT_H__ */
