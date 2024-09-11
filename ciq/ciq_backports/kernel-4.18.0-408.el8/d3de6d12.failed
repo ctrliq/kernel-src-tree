@@ -1,0 +1,123 @@
+dm: switch to bdev based IO accounting interfaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit d3de6d12694de45dfb4d7821d09224ed43dde3d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/d3de6d12.failed
+
+DM splits flush with data into empty flush followed by bio with data
+payload, switch dm_io_acct() to use bdev_{start,end}_io_acct() to do
+this accoiunting more naturally (rather than temporarily changing the
+bio's bi_size).
+
+This will allow DM to more easily account bios that are split (in
+following commit).
+
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit d3de6d12694de45dfb4d7821d09224ed43dde3d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,30578ee0cbe3..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -556,43 -502,66 +556,50 @@@ static bool bio_is_flush_with_data(stru
+  	return ((bio->bi_opf & REQ_PREFLUSH) && bio->bi_iter.bi_size);
+  }
+  
+ -static void dm_io_acct(struct dm_io *io, bool end)
+ +static void dm_io_acct(bool end, struct mapped_device *md, struct bio *bio,
+ +		       unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+++<<<<<<< HEAD
+ +	bool is_flush_with_data;
+ +	unsigned int bi_size;
+++=======
++ 	struct dm_stats_aux *stats_aux = &io->stats_aux;
++ 	unsigned long start_time = io->start_time;
++ 	struct mapped_device *md = io->md;
++ 	struct bio *bio = io->orig_bio;
++ 	unsigned int sectors;
+++>>>>>>> d3de6d12694d (dm: switch to bdev based IO accounting interfaces)
+  
+- 	/* If REQ_PREFLUSH set save any payload but do not account it */
+- 	is_flush_with_data = bio_is_flush_with_data(bio);
+- 	if (is_flush_with_data) {
+- 		bi_size = bio->bi_iter.bi_size;
+- 		bio->bi_iter.bi_size = 0;
+- 	}
++ 	/*
++ 	 * If REQ_PREFLUSH set, don't account payload, it will be
++ 	 * submitted (and accounted) after this flush completes.
++ 	 */
++ 	if (bio_is_flush_with_data(bio))
++ 		sectors = 0;
++ 	else
++ 		sectors = bio_sectors(bio);
+  
+  	if (!end)
+- 		bio_start_io_acct_time(bio, start_time);
++ 		bdev_start_io_acct(bio->bi_bdev, sectors, bio_op(bio),
++ 				   start_time);
+  	else
+- 		bio_end_io_acct(bio, start_time);
++ 		bdev_end_io_acct(bio->bi_bdev, bio_op(bio), start_time);
+  
+ -	if (static_branch_unlikely(&stats_enabled) &&
+ -	    unlikely(dm_stats_used(&md->stats)))
+ +	if (unlikely(dm_stats_used(&md->stats)))
+  		dm_stats_account_io(&md->stats, bio_data_dir(bio),
+- 				    bio->bi_iter.bi_sector, bio_sectors(bio),
++ 				    bio->bi_iter.bi_sector, sectors,
+  				    end, start_time, stats_aux);
+- 
+- 	/* Restore bio's payload so it does get accounted upon requeue */
+- 	if (is_flush_with_data)
+- 		bio->bi_iter.bi_size = bi_size;
+  }
+  
+ -static void __dm_start_io_acct(struct dm_io *io)
+ +static void start_io_acct(struct dm_io *io)
+  {
+ -	dm_io_acct(io, false);
+ -}
+ -
+ -static void dm_start_io_acct(struct dm_io *io, struct bio *clone)
+ -{
+ -	/*
+ -	 * Ensure IO accounting is only ever started once.
+ -	 */
+ -	if (dm_io_flagged(io, DM_IO_ACCOUNTED))
+ -		return;
+ -
+ -	/* Expect no possibility for race unless DM_TIO_IS_DUPLICATE_BIO. */
+ -	if (!clone || likely(dm_tio_is_normal(clone_to_tio(clone)))) {
+ -		dm_io_set_flag(io, DM_IO_ACCOUNTED);
+ -	} else {
+ -		unsigned long flags;
+ -		/* Can afford locking given DM_TIO_IS_DUPLICATE_BIO */
+ -		spin_lock_irqsave(&io->lock, flags);
+ -		dm_io_set_flag(io, DM_IO_ACCOUNTED);
+ -		spin_unlock_irqrestore(&io->lock, flags);
+ -	}
+ -
+ -	__dm_start_io_acct(io);
+ +	dm_io_acct(false, io->md, io->orig_bio, io->start_time, &io->stats_aux);
+  }
+  
+ -static void dm_end_io_acct(struct dm_io *io)
+ +static void end_io_acct(struct mapped_device *md, struct bio *bio,
+ +			unsigned long start_time, struct dm_stats_aux *stats_aux)
+  {
+ -	dm_io_acct(io, true);
+ +	dm_io_acct(true, md, bio, start_time, stats_aux);
+  }
+  
+  static struct dm_io *alloc_io(struct mapped_device *md, struct bio *bio)
+* Unmerged path drivers/md/dm.c
