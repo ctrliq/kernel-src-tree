@@ -1179,7 +1179,8 @@ static void login_rsp(struct srp_event_struct *evt_struct)
 		   be32_to_cpu(evt_struct->xfer_iu->srp.login_rsp.req_lim_delta));
 
 	/* If we had any pending I/Os, kick them */
-	scsi_unblock_requests(hostdata->host);
+	hostdata->action = IBMVSCSI_HOST_ACTION_UNBLOCK;
+	wake_up(&hostdata->work_wait_q);
 }
 
 /**
@@ -2124,6 +2125,7 @@ static void ibmvscsi_do_work(struct ibmvscsi_host_data *hostdata)
 	spin_lock_irqsave(hostdata->host->host_lock, flags);
 	switch (hostdata->action) {
 	case IBMVSCSI_HOST_ACTION_NONE:
+	case IBMVSCSI_HOST_ACTION_UNBLOCK:
 		break;
 	case IBMVSCSI_HOST_ACTION_RESET:
 		spin_unlock_irqrestore(hostdata->host->host_lock, flags);
@@ -2165,6 +2167,7 @@ static int __ibmvscsi_work_to_do(struct ibmvscsi_host_data *hostdata)
 		return 0;
 	case IBMVSCSI_HOST_ACTION_RESET:
 	case IBMVSCSI_HOST_ACTION_REENABLE:
+	case IBMVSCSI_HOST_ACTION_UNBLOCK:
 	default:
 		break;
 	}
