@@ -1,0 +1,123 @@
+dmaengine: idxd: fix missed completion on abort path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 8affd8a4b5ce356c8900cfb037674f3a4a11fbdb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8affd8a4.failed
+
+Ming reported that with the abort path of the descriptor submission, there
+can be a window where a completed descriptor can be missed to be completed
+by the irq completion thread:
+
+CPU A				CPU B
+Submit (successful)
+
+Submit (fail)
+				irq_process_work_list() // empty
+
+llist_abort_desc()
+// remove all descs from pending list
+
+				irq_process_pending_llist() // empty
+				exit idxd_wq_thread() with no processing
+
+Add opportunistic descriptor completion in the abort path in order to
+remove the missed completion.
+
+Fixes: 6b4b87f2c31a ("dmaengine: idxd: fix submission race window")
+	Reported-by: Ming Li <ming4.li@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/163898288714.443911.16084982766671976640.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 8affd8a4b5ce356c8900cfb037674f3a4a11fbdb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/submit.c
+diff --cc drivers/dma/idxd/submit.c
+index 0afcd1322339,83452fbbb168..000000000000
+--- a/drivers/dma/idxd/submit.c
++++ b/drivers/dma/idxd/submit.c
+@@@ -88,6 -79,75 +88,78 @@@ void idxd_free_desc(struct idxd_wq *wq
+  	sbitmap_queue_clear(&wq->sbq, desc->id, cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 					 struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *n;
++ 
++ 	lockdep_assert_held(&ie->list_lock);
++ 	list_for_each_entry_safe(d, n, &ie->work_list, list) {
++ 		if (d == desc) {
++ 			list_del(&d->list);
++ 			return d;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * At this point, the desc needs to be aborted is held by the completion
++ 	 * handler where it has taken it off the pending list but has not added to the
++ 	 * work list. It will be cleaned up by the interrupt handler when it sees the
++ 	 * IDXD_COMP_DESC_ABORT for completion status.
++ 	 */
++ 	return NULL;
++ }
++ 
++ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 			     struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *t, *found = NULL;
++ 	struct llist_node *head;
++ 	LIST_HEAD(flist);
++ 
++ 	desc->completion->status = IDXD_COMP_DESC_ABORT;
++ 	/*
++ 	 * Grab the list lock so it will block the irq thread handler. This allows the
++ 	 * abort code to locate the descriptor need to be aborted.
++ 	 */
++ 	spin_lock(&ie->list_lock);
++ 	head = llist_del_all(&ie->pending_llist);
++ 	if (head) {
++ 		llist_for_each_entry_safe(d, t, head, llnode) {
++ 			if (d == desc) {
++ 				found = desc;
++ 				continue;
++ 			}
++ 
++ 			if (d->completion->status)
++ 				list_add_tail(&d->list, &flist);
++ 			else
++ 				list_add_tail(&d->list, &ie->work_list);
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		found = list_abort_desc(wq, ie, desc);
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	if (found)
++ 		complete_desc(found, IDXD_COMPLETE_ABORT);
++ 
++ 	/*
++ 	 * complete_desc() will return desc to allocator and the desc can be
++ 	 * acquired by a different process and the desc->list can be modified.
++ 	 * Delete desc from list so the list trasversing does not get corrupted
++ 	 * by the other process.
++ 	 */
++ 	list_for_each_entry_safe(d, t, &flist, list) {
++ 		list_del_init(&d->list);
++ 		complete_desc(d, IDXD_COMPLETE_NORMAL);
++ 	}
++ }
++ 
+++>>>>>>> 8affd8a4b5ce (dmaengine: idxd: fix missed completion on abort path)
+  int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+  {
+  	struct idxd_device *idxd = wq->idxd;
+* Unmerged path drivers/dma/idxd/submit.c
