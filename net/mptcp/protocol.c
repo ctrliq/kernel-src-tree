@@ -1523,6 +1523,7 @@ struct sock *mptcp_sk_clone(const struct sock *sk,
 	msk->local_key = subflow_req->local_key;
 	msk->token = subflow_req->token;
 	msk->subflow = NULL;
+	WRITE_ONCE(msk->fully_established, false);
 
 	if (unlikely(mptcp_token_new_accept(subflow_req->token, nsk))) {
 		nsk->sk_state = TCP_CLOSE;
@@ -1620,7 +1621,6 @@ static struct sock *mptcp_accept(struct sock *sk, int flags, int *err,
 		newsk = new_mptcp_sock;
 		mptcp_copy_inaddrs(newsk, ssk);
 		list_add(&subflow->node, &msk->conn_list);
-		inet_sk_state_store(newsk, TCP_ESTABLISHED);
 
 		mptcp_rcv_space_init(msk, ssk);
 		bh_unlock_sock(new_mptcp_sock);
@@ -1857,7 +1857,7 @@ bool mptcp_finish_join(struct sock *sk)
 	pr_debug("msk=%p, subflow=%p", msk, subflow);
 
 	/* mptcp socket already closing? */
-	if (inet_sk_state_load(parent) != TCP_ESTABLISHED)
+	if (!mptcp_is_fully_established(parent))
 		return false;
 
 	if (!msk->pm.server_side)
