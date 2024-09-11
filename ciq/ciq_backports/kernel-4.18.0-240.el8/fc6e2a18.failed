@@ -1,0 +1,217 @@
+KVM: x86: Move FPU allocation to common x86 code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit fc6e2a1845abfcfa335aef5ffaac664e104d72ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fc6e2a18.failed
+
+The allocation of FPU structs is identical across VMX and SVM, move it
+to common x86 code.  Somewhat arbitrarily place the allocation so that
+it resides directly above the associated initialization via fx_init(),
+e.g. instead of retaining its position with respect to the overall vcpu
+creation flow.  Although the names names kvm_arch_vcpu_create() and
+kvm_arch_vcpu_init() might suggest otherwise, x86 does not have a clean
+split between 'create' and 'init'.  Allocating the struct immediately
+prior to the first use arguably improves readability *now*, and will
+yield even bigger improvements when kvm_arch_vcpu_init() is removed in
+a future patch.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fc6e2a1845abfcfa335aef5ffaac664e104d72ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/svm.c
+index 4b247e55061a,e8a5cd44dd59..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -2210,34 -2197,12 +2210,40 @@@ static struct kvm_vcpu *svm_create_vcpu
+  	struct page *nested_msrpm_pages;
+  	int err;
+  
+ -	BUILD_BUG_ON(offsetof(struct vcpu_svm, vcpu) != 0);
+ -	svm = to_svm(vcpu);
+ +	BUILD_BUG_ON_MSG(offsetof(struct vcpu_svm, vcpu) != 0,
+ +		"struct kvm_vcpu must be at offset 0 for arch usercopy region");
+ +
+++<<<<<<< HEAD
+ +	svm = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL_ACCOUNT);
+ +	if (!svm) {
+ +		err = -ENOMEM;
+ +		goto out;
+ +	}
+ +
+ +	svm->vcpu.arch.user_fpu = kmem_cache_zalloc(x86_fpu_cache,
+ +						     GFP_KERNEL_ACCOUNT);
+ +	if (!svm->vcpu.arch.user_fpu) {
+ +		printk(KERN_ERR "kvm: failed to allocate kvm userspace's fpu\n");
+ +		err = -ENOMEM;
+ +		goto free_partial_svm;
+ +	}
+ +
+ +	svm->vcpu.arch.guest_fpu = kmem_cache_zalloc(x86_fpu_cache,
+ +						     GFP_KERNEL_ACCOUNT);
+ +	if (!svm->vcpu.arch.guest_fpu) {
+ +		printk(KERN_ERR "kvm: failed to allocate vcpu's fpu\n");
+ +		err = -ENOMEM;
+ +		goto free_user_fpu;
+ +	}
+  
+ +	err = kvm_vcpu_init(&svm->vcpu, kvm, id);
+ +	if (err)
+ +		goto free_svm;
+++=======
++ 	err = kvm_vcpu_init(vcpu, kvm, id);
++ 	if (err)
++ 		return err;
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  
+  	err = -ENOMEM;
+  	page = alloc_page(GFP_KERNEL_ACCOUNT);
+@@@ -2293,15 -2257,8 +2299,20 @@@ free_page2
+  free_page1:
+  	__free_page(page);
+  uninit:
+++<<<<<<< HEAD
+ +	kvm_vcpu_uninit(&svm->vcpu);
+ +free_svm:
+ +	kmem_cache_free(x86_fpu_cache, svm->vcpu.arch.guest_fpu);
+ +free_user_fpu:
+ +	kmem_cache_free(x86_fpu_cache, svm->vcpu.arch.user_fpu);
+ +free_partial_svm:
+ +	kmem_cache_free(kvm_vcpu_cache, svm);
+ +out:
+ +	return ERR_PTR(err);
+++=======
++ 	kvm_vcpu_uninit(vcpu);
++ 	return err;
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  }
+  
+  static void svm_clear_current_vmcb(struct vmcb *vmcb)
+@@@ -2328,9 -2285,6 +2339,12 @@@ static void svm_free_vcpu(struct kvm_vc
+  	__free_page(virt_to_page(svm->nested.hsave));
+  	__free_pages(virt_to_page(svm->nested.msrpm), MSRPM_ALLOC_ORDER);
+  	kvm_vcpu_uninit(vcpu);
+++<<<<<<< HEAD
+ +	kmem_cache_free(x86_fpu_cache, svm->vcpu.arch.user_fpu);
+ +	kmem_cache_free(x86_fpu_cache, svm->vcpu.arch.guest_fpu);
+ +	kmem_cache_free(kvm_vcpu_cache, svm);
+++=======
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  }
+  
+  static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+diff --cc arch/x86/kvm/vmx/vmx.c
+index aace07a1fbd9,40c47d2709bb..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6753,44 -6682,21 +6753,51 @@@ static void vmx_free_vcpu(struct kvm_vc
+  	nested_vmx_free_vcpu(vcpu);
+  	free_loaded_vmcs(vmx->loaded_vmcs);
+  	kvm_vcpu_uninit(vcpu);
+++<<<<<<< HEAD
+ +	kmem_cache_free(x86_fpu_cache, vmx->vcpu.arch.user_fpu);
+ +	kmem_cache_free(x86_fpu_cache, vmx->vcpu.arch.guest_fpu);
+ +	kmem_cache_free(kvm_vcpu_cache, vmx);
+++=======
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  }
+  
+ -static int vmx_create_vcpu(struct kvm *kvm, struct kvm_vcpu *vcpu,
+ -			   unsigned int id)
+ +static struct kvm_vcpu *vmx_create_vcpu(struct kvm *kvm, unsigned int id)
+  {
+ +	int err;
+  	struct vcpu_vmx *vmx;
+  	unsigned long *msr_bitmap;
+ -	int i, cpu, err;
+ +	int cpu;
+  
+ -	BUILD_BUG_ON(offsetof(struct vcpu_vmx, vcpu) != 0);
+ -	vmx = to_vmx(vcpu);
+ +	BUILD_BUG_ON_MSG(offsetof(struct vcpu_vmx, vcpu) != 0,
+ +		"struct kvm_vcpu must be at offset 0 for arch usercopy region");
+  
+++<<<<<<< HEAD
+ +	vmx = kmem_cache_zalloc(kvm_vcpu_cache, GFP_KERNEL_ACCOUNT);
+ +	if (!vmx)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	vmx->vcpu.arch.user_fpu = kmem_cache_zalloc(x86_fpu_cache,
+ +			GFP_KERNEL_ACCOUNT);
+ +	if (!vmx->vcpu.arch.user_fpu) {
+ +		printk(KERN_ERR "kvm: failed to allocate kvm userspace's fpu\n");
+ +		err = -ENOMEM;
+ +		goto free_partial_vcpu;
+ +	}
+ +
+ +	vmx->vcpu.arch.guest_fpu = kmem_cache_zalloc(x86_fpu_cache,
+ +			GFP_KERNEL_ACCOUNT);
+ +	if (!vmx->vcpu.arch.guest_fpu) {
+ +		printk(KERN_ERR "kvm: failed to allocate vcpu's fpu\n");
+ +		err = -ENOMEM;
+ +		goto free_user_fpu;
+ +	}
+ +
+ +	err = kvm_vcpu_init(&vmx->vcpu, kvm, id);
+++=======
++ 	err = kvm_vcpu_init(vcpu, kvm, id);
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  	if (err)
+- 		goto free_vcpu;
++ 		return err;
+  
+  	err = -ENOMEM;
+  
+@@@ -6878,15 -6811,9 +6885,19 @@@ free_vmcs
+  free_pml:
+  	vmx_destroy_pml_buffer(vmx);
+  uninit_vcpu:
+ -	kvm_vcpu_uninit(vcpu);
+ +	kvm_vcpu_uninit(&vmx->vcpu);
+  	free_vpid(vmx->vpid);
+++<<<<<<< HEAD
+ +free_vcpu:
+ +	kmem_cache_free(x86_fpu_cache, vmx->vcpu.arch.guest_fpu);
+ +free_user_fpu:
+ +	kmem_cache_free(x86_fpu_cache, vmx->vcpu.arch.user_fpu);
+ +free_partial_vcpu:
+ +	kmem_cache_free(kvm_vcpu_cache, vmx);
+ +	return ERR_PTR(err);
+++=======
++ 	return err;
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  }
+  
+  #define L1TF_MSG_SMT "L1TF CPU bug present and SMT on, data leak possible. See CVE-2018-3646 and https://www.kernel.org/doc/html/latest/admin-guide/hw-vuln/l1tf.html for details.\n"
+diff --cc arch/x86/kvm/x86.c
+index 28c9e8821b43,29d058db3207..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -9155,7 -9175,11 +9155,15 @@@ void kvm_arch_vcpu_free(struct kvm_vcp
+  	kvmclock_reset(vcpu);
+  
+  	kvm_x86_ops->vcpu_free(vcpu);
+++<<<<<<< HEAD
+ +	free_cpumask_var(wbinvd_dirty_mask);
+++=======
++ 
++ 	free_cpumask_var(vcpu->arch.wbinvd_dirty_mask);
++ 	kmem_cache_free(x86_fpu_cache, vcpu->arch.user_fpu);
++ 	kmem_cache_free(x86_fpu_cache, vcpu->arch.guest_fpu);
++ 	kmem_cache_free(kvm_vcpu_cache, vcpu);
+++>>>>>>> fc6e2a1845ab (KVM: x86: Move FPU allocation to common x86 code)
+  }
+  
+  struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/x86.c
