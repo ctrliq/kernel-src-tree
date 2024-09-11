@@ -1,0 +1,730 @@
+RDMA/bnxt_re: Add 64bit doorbells for 57500 series
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Devesh Sharma <devesh.sharma@broadcom.com>
+commit b353ce556d521351eb7daf609e446f3595a6fad6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b353ce55.failed
+
+The new chip series has 64 bit doorbell for notification queues. Thus,
+both control and data path event queues need new routines to write 64 bit
+doorbell. Adding the same. There is new doorbell interface between the
+chip and driver. Changing the chip specific data structure definitions.
+
+Additional significant changes are listed below
+- bnxt_re_net_ring_free/alloc takes a new argument
+- bnxt_qplib_enable_nq and enable_rcfw uses new doorbell offset
+  for new chip.
+- DB mapping for NQ and CREQ now maps 8 bytes.
+- DBR_DBR_* macros renames to DBC_DBC_*
+- store nq_db_offset in a 32bit data type.
+- got rid of __iowrite64_copy, used writeq instead.
+- changed the DB header initialization to simpler scheme.
+
+	Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Signed-off-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b353ce556d521351eb7daf609e446f3595a6fad6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/main.c
+diff --cc drivers/infiniband/hw/bnxt_re/main.c
+index 87f12e17de15,0df180850a75..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@@ -1256,12 -1268,10 +1268,17 @@@ static void bnxt_re_query_hwrm_intf_ver
+  
+  static void bnxt_re_ib_unreg(struct bnxt_re_dev *rdev)
+  {
+++<<<<<<< HEAD
+ +	int i, rc;
+++=======
++ 	u8 type;
++ 	int rc;
+++>>>>>>> b353ce556d52 (RDMA/bnxt_re: Add 64bit doorbells for 57500 series)
+  
+  	if (test_and_clear_bit(BNXT_RE_FLAG_IBDEV_REGISTERED, &rdev->flags)) {
+ +		for (i = 0; i < ARRAY_SIZE(bnxt_re_attributes); i++)
+ +			device_remove_file(&rdev->ibdev.dev,
+ +					   bnxt_re_attributes[i]);
+  		/* Cleanup ib dev */
+  		bnxt_re_unregister_ib(rdev);
+  	}
+@@@ -1313,9 -1324,12 +1331,17 @@@ static void bnxt_re_worker(struct work_
+  
+  static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
+  {
+++<<<<<<< HEAD
+ +	int i, j, rc;
+ +
+++=======
++ 	dma_addr_t *pg_map;
++ 	u32 db_offt, ridx;
++ 	int pages, vid;
+++>>>>>>> b353ce556d52 (RDMA/bnxt_re: Add 64bit doorbells for 57500 series)
+  	bool locked;
++ 	u8 type;
++ 	int rc;
+  
+  	/* Acquire rtnl lock through out this function */
+  	rtnl_lock();
+diff --git a/drivers/infiniband/hw/bnxt_re/Kconfig b/drivers/infiniband/hw/bnxt_re/Kconfig
+index 18f5ed082f41..be2fdad248eb 100644
+--- a/drivers/infiniband/hw/bnxt_re/Kconfig
++++ b/drivers/infiniband/hw/bnxt_re/Kconfig
+@@ -1,5 +1,6 @@
+ config INFINIBAND_BNXT_RE
+     tristate "Broadcom Netxtreme HCA support"
++    depends on 64BIT
+     depends on ETHERNET && NETDEVICES && PCI && INET && DCB
+     depends on MAY_USE_DEVLINK
+     select NET_VENDOR_BROADCOM
+diff --git a/drivers/infiniband/hw/bnxt_re/ib_verbs.c b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index fffc5b5f04de..3c530d6b2e0f 100644
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@ -3300,10 +3300,10 @@ int bnxt_re_req_notify_cq(struct ib_cq *ib_cq,
+ 	spin_lock_irqsave(&cq->cq_lock, flags);
+ 	/* Trigger on the very next completion */
+ 	if (ib_cqn_flags & IB_CQ_NEXT_COMP)
+-		type = DBR_DBR_TYPE_CQ_ARMALL;
++		type = DBC_DBC_TYPE_CQ_ARMALL;
+ 	/* Trigger on the next solicited completion */
+ 	else if (ib_cqn_flags & IB_CQ_SOLICITED)
+-		type = DBR_DBR_TYPE_CQ_ARMSE;
++		type = DBC_DBC_TYPE_CQ_ARMSE;
+ 
+ 	/* Poll to see if there are missed events */
+ 	if ((ib_cqn_flags & IB_CQ_REPORT_MISSED_EVENTS) &&
+* Unmerged path drivers/infiniband/hw/bnxt_re/main.c
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_fp.c b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+index b98b054148cd..01ea3d010017 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@ -244,6 +244,7 @@ static void bnxt_qplib_service_nq(unsigned long data)
+ 	u16 type;
+ 	int budget = nq->budget;
+ 	uintptr_t q_handle;
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(nq->res->cctx);
+ 
+ 	/* Service the NQ until empty */
+ 	raw_cons = hwq->cons;
+@@ -290,7 +291,7 @@ static void bnxt_qplib_service_nq(unsigned long data)
+ 			q_handle |= (u64)le32_to_cpu(nqsrqe->srq_handle_high)
+ 				     << 32;
+ 			bnxt_qplib_arm_srq((struct bnxt_qplib_srq *)q_handle,
+-					   DBR_DBR_TYPE_SRQ_ARMENA);
++					   DBC_DBC_TYPE_SRQ_ARMENA);
+ 			if (!nq->srqn_handler(nq,
+ 					      (struct bnxt_qplib_srq *)q_handle,
+ 					      nqsrqe->event))
+@@ -312,7 +313,9 @@ static void bnxt_qplib_service_nq(unsigned long data)
+ 	}
+ 	if (hwq->cons != raw_cons) {
+ 		hwq->cons = raw_cons;
+-		NQ_DB_REARM(nq->bar_reg_iomem, hwq->cons, hwq->max_elements);
++		bnxt_qplib_ring_nq_db_rearm(nq->bar_reg_iomem, hwq->cons,
++					    hwq->max_elements, nq->ring_id,
++					    gen_p5);
+ 	}
+ }
+ 
+@@ -336,9 +339,11 @@ static irqreturn_t bnxt_qplib_nq_irq(int irq, void *dev_instance)
+ 
+ void bnxt_qplib_nq_stop_irq(struct bnxt_qplib_nq *nq, bool kill)
+ {
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(nq->res->cctx);
+ 	tasklet_disable(&nq->worker);
+ 	/* Mask h/w interrupt */
+-	NQ_DB(nq->bar_reg_iomem, nq->hwq.cons, nq->hwq.max_elements);
++	bnxt_qplib_ring_nq_db(nq->bar_reg_iomem, nq->hwq.cons,
++			      nq->hwq.max_elements, nq->ring_id, gen_p5);
+ 	/* Sync with last running IRQ handler */
+ 	synchronize_irq(nq->vector);
+ 	if (kill)
+@@ -373,6 +378,7 @@ void bnxt_qplib_disable_nq(struct bnxt_qplib_nq *nq)
+ int bnxt_qplib_nq_start_irq(struct bnxt_qplib_nq *nq, int nq_indx,
+ 			    int msix_vector, bool need_init)
+ {
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(nq->res->cctx);
+ 	int rc;
+ 
+ 	if (nq->requested)
+@@ -399,7 +405,8 @@ int bnxt_qplib_nq_start_irq(struct bnxt_qplib_nq *nq, int nq_indx,
+ 			 nq->vector, nq_indx);
+ 	}
+ 	nq->requested = true;
+-	NQ_DB_REARM(nq->bar_reg_iomem, nq->hwq.cons, nq->hwq.max_elements);
++	bnxt_qplib_ring_nq_db_rearm(nq->bar_reg_iomem, nq->hwq.cons,
++				    nq->hwq.max_elements, nq->ring_id, gen_p5);
+ 
+ 	return rc;
+ }
+@@ -433,7 +440,8 @@ int bnxt_qplib_enable_nq(struct pci_dev *pdev, struct bnxt_qplib_nq *nq,
+ 		rc = -ENOMEM;
+ 		goto fail;
+ 	}
+-	nq->bar_reg_iomem = ioremap_nocache(nq_base + nq->bar_reg_off, 4);
++	/* Unconditionally map 8 bytes to support 57500 series */
++	nq->bar_reg_iomem = ioremap_nocache(nq_base + nq->bar_reg_off, 8);
+ 	if (!nq->bar_reg_iomem) {
+ 		rc = -ENOMEM;
+ 		goto fail;
+@@ -462,15 +470,17 @@ void bnxt_qplib_free_nq(struct bnxt_qplib_nq *nq)
+ 
+ int bnxt_qplib_alloc_nq(struct pci_dev *pdev, struct bnxt_qplib_nq *nq)
+ {
++	u8 hwq_type;
++
+ 	nq->pdev = pdev;
+ 	if (!nq->hwq.max_elements ||
+ 	    nq->hwq.max_elements > BNXT_QPLIB_NQE_MAX_CNT)
+ 		nq->hwq.max_elements = BNXT_QPLIB_NQE_MAX_CNT;
+-
++	hwq_type = bnxt_qplib_get_hwq_type(nq->res);
+ 	if (bnxt_qplib_alloc_init_hwq(nq->pdev, &nq->hwq, NULL, 0,
+ 				      &nq->hwq.max_elements,
+ 				      BNXT_QPLIB_MAX_NQE_ENTRY_SIZE, 0,
+-				      PAGE_SIZE, HWQ_TYPE_L2_CMPL))
++				      PAGE_SIZE, hwq_type))
+ 		return -ENOMEM;
+ 
+ 	nq->budget = 8;
+@@ -481,21 +491,19 @@ int bnxt_qplib_alloc_nq(struct pci_dev *pdev, struct bnxt_qplib_nq *nq)
+ static void bnxt_qplib_arm_srq(struct bnxt_qplib_srq *srq, u32 arm_type)
+ {
+ 	struct bnxt_qplib_hwq *srq_hwq = &srq->hwq;
+-	struct dbr_dbr db_msg = { 0 };
+ 	void __iomem *db;
+-	u32 sw_prod = 0;
++	u32 sw_prod;
++	u64 val = 0;
+ 
+ 	/* Ring DB */
+-	sw_prod = (arm_type == DBR_DBR_TYPE_SRQ_ARM) ? srq->threshold :
+-		   HWQ_CMP(srq_hwq->prod, srq_hwq);
+-	db_msg.index = cpu_to_le32((sw_prod << DBR_DBR_INDEX_SFT) &
+-				   DBR_DBR_INDEX_MASK);
+-	db_msg.type_xid = cpu_to_le32(((srq->id << DBR_DBR_XID_SFT) &
+-					DBR_DBR_XID_MASK) | arm_type);
+-	db = (arm_type == DBR_DBR_TYPE_SRQ_ARMENA) ?
+-		srq->dbr_base : srq->dpi->dbr;
+-	wmb(); /* barrier before db ring */
+-	__iowrite64_copy(db, &db_msg, sizeof(db_msg) / sizeof(u64));
++	sw_prod = (arm_type == DBC_DBC_TYPE_SRQ_ARM) ?
++		   srq->threshold : HWQ_CMP(srq_hwq->prod, srq_hwq);
++	db = (arm_type == DBC_DBC_TYPE_SRQ_ARMENA) ? srq->dbr_base :
++						     srq->dpi->dbr;
++	val = ((srq->id << DBC_DBC_XID_SFT) & DBC_DBC_XID_MASK) | arm_type;
++	val <<= 32;
++	val |= (sw_prod << DBC_DBC_INDEX_SFT) & DBC_DBC_INDEX_MASK;
++	writeq(val, db);
+ }
+ 
+ int bnxt_qplib_destroy_srq(struct bnxt_qplib_res *res,
+@@ -590,7 +598,7 @@ int bnxt_qplib_create_srq(struct bnxt_qplib_res *res,
+ 	srq->id = le32_to_cpu(resp.xid);
+ 	srq->dbr_base = res->dpi_tbl.dbr_bar_reg_iomem;
+ 	if (srq->threshold)
+-		bnxt_qplib_arm_srq(srq, DBR_DBR_TYPE_SRQ_ARMENA);
++		bnxt_qplib_arm_srq(srq, DBC_DBC_TYPE_SRQ_ARMENA);
+ 	srq->arm_req = false;
+ 
+ 	return 0;
+@@ -614,7 +622,7 @@ int bnxt_qplib_modify_srq(struct bnxt_qplib_res *res,
+ 				    srq_hwq->max_elements - sw_cons + sw_prod;
+ 	if (count > srq->threshold) {
+ 		srq->arm_req = false;
+-		bnxt_qplib_arm_srq(srq, DBR_DBR_TYPE_SRQ_ARM);
++		bnxt_qplib_arm_srq(srq, DBC_DBC_TYPE_SRQ_ARM);
+ 	} else {
+ 		/* Deferred arming */
+ 		srq->arm_req = true;
+@@ -702,10 +710,10 @@ int bnxt_qplib_post_srq_recv(struct bnxt_qplib_srq *srq,
+ 				    srq_hwq->max_elements - sw_cons + sw_prod;
+ 	spin_unlock(&srq_hwq->lock);
+ 	/* Ring DB */
+-	bnxt_qplib_arm_srq(srq, DBR_DBR_TYPE_SRQ);
++	bnxt_qplib_arm_srq(srq, DBC_DBC_TYPE_SRQ);
+ 	if (srq->arm_req == true && count > srq->threshold) {
+ 		srq->arm_req = false;
+-		bnxt_qplib_arm_srq(srq, DBR_DBR_TYPE_SRQ_ARM);
++		bnxt_qplib_arm_srq(srq, DBC_DBC_TYPE_SRQ_ARM);
+ 	}
+ done:
+ 	return rc;
+@@ -1494,19 +1502,16 @@ void *bnxt_qplib_get_qp1_rq_buf(struct bnxt_qplib_qp *qp,
+ void bnxt_qplib_post_send_db(struct bnxt_qplib_qp *qp)
+ {
+ 	struct bnxt_qplib_q *sq = &qp->sq;
+-	struct dbr_dbr db_msg = { 0 };
+ 	u32 sw_prod;
++	u64 val = 0;
+ 
++	val = (((qp->id << DBC_DBC_XID_SFT) & DBC_DBC_XID_MASK) |
++	       DBC_DBC_TYPE_SQ);
++	val <<= 32;
+ 	sw_prod = HWQ_CMP(sq->hwq.prod, &sq->hwq);
+-
+-	db_msg.index = cpu_to_le32((sw_prod << DBR_DBR_INDEX_SFT) &
+-				   DBR_DBR_INDEX_MASK);
+-	db_msg.type_xid =
+-		cpu_to_le32(((qp->id << DBR_DBR_XID_SFT) & DBR_DBR_XID_MASK) |
+-			    DBR_DBR_TYPE_SQ);
++	val |= (sw_prod << DBC_DBC_INDEX_SFT) & DBC_DBC_INDEX_MASK;
+ 	/* Flush all the WQE writes to HW */
+-	wmb();
+-	__iowrite64_copy(qp->dpi->dbr, &db_msg, sizeof(db_msg) / sizeof(u64));
++	writeq(val, qp->dpi->dbr);
+ }
+ 
+ int bnxt_qplib_post_send(struct bnxt_qplib_qp *qp,
+@@ -1785,19 +1790,16 @@ int bnxt_qplib_post_send(struct bnxt_qplib_qp *qp,
+ void bnxt_qplib_post_recv_db(struct bnxt_qplib_qp *qp)
+ {
+ 	struct bnxt_qplib_q *rq = &qp->rq;
+-	struct dbr_dbr db_msg = { 0 };
+ 	u32 sw_prod;
++	u64 val = 0;
+ 
++	val = (((qp->id << DBC_DBC_XID_SFT) & DBC_DBC_XID_MASK) |
++	       DBC_DBC_TYPE_RQ);
++	val <<= 32;
+ 	sw_prod = HWQ_CMP(rq->hwq.prod, &rq->hwq);
+-	db_msg.index = cpu_to_le32((sw_prod << DBR_DBR_INDEX_SFT) &
+-				   DBR_DBR_INDEX_MASK);
+-	db_msg.type_xid =
+-		cpu_to_le32(((qp->id << DBR_DBR_XID_SFT) & DBR_DBR_XID_MASK) |
+-			    DBR_DBR_TYPE_RQ);
+-
++	val |= (sw_prod << DBC_DBC_INDEX_SFT) & DBC_DBC_INDEX_MASK;
+ 	/* Flush the writes to HW Rx WQE before the ringing Rx DB */
+-	wmb();
+-	__iowrite64_copy(qp->dpi->dbr, &db_msg, sizeof(db_msg) / sizeof(u64));
++	writeq(val, qp->dpi->dbr);
+ }
+ 
+ int bnxt_qplib_post_recv(struct bnxt_qplib_qp *qp,
+@@ -1881,32 +1883,28 @@ int bnxt_qplib_post_recv(struct bnxt_qplib_qp *qp,
+ /* Spinlock must be held */
+ static void bnxt_qplib_arm_cq_enable(struct bnxt_qplib_cq *cq)
+ {
+-	struct dbr_dbr db_msg = { 0 };
++	u64 val = 0;
+ 
+-	db_msg.type_xid =
+-		cpu_to_le32(((cq->id << DBR_DBR_XID_SFT) & DBR_DBR_XID_MASK) |
+-			    DBR_DBR_TYPE_CQ_ARMENA);
++	val = ((cq->id << DBC_DBC_XID_SFT) & DBC_DBC_XID_MASK) |
++	       DBC_DBC_TYPE_CQ_ARMENA;
++	val <<= 32;
+ 	/* Flush memory writes before enabling the CQ */
+-	wmb();
+-	__iowrite64_copy(cq->dbr_base, &db_msg, sizeof(db_msg) / sizeof(u64));
++	writeq(val, cq->dbr_base);
+ }
+ 
+ static void bnxt_qplib_arm_cq(struct bnxt_qplib_cq *cq, u32 arm_type)
+ {
+ 	struct bnxt_qplib_hwq *cq_hwq = &cq->hwq;
+-	struct dbr_dbr db_msg = { 0 };
+ 	u32 sw_cons;
++	u64 val = 0;
+ 
+ 	/* Ring DB */
++	val = ((cq->id << DBC_DBC_XID_SFT) & DBC_DBC_XID_MASK) | arm_type;
++	val <<= 32;
+ 	sw_cons = HWQ_CMP(cq_hwq->cons, cq_hwq);
+-	db_msg.index = cpu_to_le32((sw_cons << DBR_DBR_INDEX_SFT) &
+-				    DBR_DBR_INDEX_MASK);
+-	db_msg.type_xid =
+-		cpu_to_le32(((cq->id << DBR_DBR_XID_SFT) & DBR_DBR_XID_MASK) |
+-			    arm_type);
++	val |= (sw_cons << DBC_DBC_INDEX_SFT) & DBC_DBC_INDEX_MASK;
+ 	/* flush memory writes before arming the CQ */
+-	wmb();
+-	__iowrite64_copy(cq->dpi->dbr, &db_msg, sizeof(db_msg) / sizeof(u64));
++	writeq(val, cq->dpi->dbr);
+ }
+ 
+ int bnxt_qplib_create_cq(struct bnxt_qplib_res *res, struct bnxt_qplib_cq *cq)
+@@ -2125,7 +2123,7 @@ static int do_wa9060(struct bnxt_qplib_qp *qp, struct bnxt_qplib_cq *cq,
+ 		sq->send_phantom = true;
+ 
+ 		/* TODO: Only ARM if the previous SQE is ARMALL */
+-		bnxt_qplib_arm_cq(cq, DBR_DBR_TYPE_CQ_ARMALL);
++		bnxt_qplib_arm_cq(cq, DBC_DBC_TYPE_CQ_ARMALL);
+ 
+ 		rc = -EAGAIN;
+ 		goto out;
+@@ -2794,7 +2792,7 @@ int bnxt_qplib_poll_cq(struct bnxt_qplib_cq *cq, struct bnxt_qplib_cqe *cqe,
+ 	}
+ 	if (cq->hwq.cons != raw_cons) {
+ 		cq->hwq.cons = raw_cons;
+-		bnxt_qplib_arm_cq(cq, DBR_DBR_TYPE_CQ);
++		bnxt_qplib_arm_cq(cq, DBC_DBC_TYPE_CQ);
+ 	}
+ exit:
+ 	return num_cqes - budget;
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_fp.h b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+index f317bae36dd0..a00f1b019da0 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+@@ -432,10 +432,43 @@ struct bnxt_qplib_cq {
+ #define NQ_DB_CP_FLAGS			(NQ_DB_KEY_CP    |	\
+ 					 NQ_DB_IDX_VALID |	\
+ 					 NQ_DB_IRQ_DIS)
+-#define NQ_DB_REARM(db, raw_cons, cp_bit)			\
+-	writel(NQ_DB_CP_FLAGS_REARM | ((raw_cons) & ((cp_bit) - 1)), db)
+-#define NQ_DB(db, raw_cons, cp_bit)				\
+-	writel(NQ_DB_CP_FLAGS | ((raw_cons) & ((cp_bit) - 1)), db)
++
++static inline void bnxt_qplib_ring_nq_db64(void __iomem *db, u32 index,
++					   u32 xid, bool arm)
++{
++	u64 val;
++
++	val = xid & DBC_DBC_XID_MASK;
++	val |= DBC_DBC_PATH_ROCE;
++	val |= arm ? DBC_DBC_TYPE_NQ_ARM : DBC_DBC_TYPE_NQ;
++	val <<= 32;
++	val |= index & DBC_DBC_INDEX_MASK;
++	writeq(val, db);
++}
++
++static inline void bnxt_qplib_ring_nq_db_rearm(void __iomem *db, u32 raw_cons,
++					       u32 max_elements, u32 xid,
++					       bool gen_p5)
++{
++	u32 index = raw_cons & (max_elements - 1);
++
++	if (gen_p5)
++		bnxt_qplib_ring_nq_db64(db, index, xid, true);
++	else
++		writel(NQ_DB_CP_FLAGS_REARM | (index & DBC_DBC32_XID_MASK), db);
++}
++
++static inline void bnxt_qplib_ring_nq_db(void __iomem *db, u32 raw_cons,
++					 u32 max_elements, u32 xid,
++					 bool gen_p5)
++{
++	u32 index = raw_cons & (max_elements - 1);
++
++	if (gen_p5)
++		bnxt_qplib_ring_nq_db64(db, index, xid, false);
++	else
++		writel(NQ_DB_CP_FLAGS | (index & DBC_DBC32_XID_MASK), db);
++}
+ 
+ struct bnxt_qplib_nq {
+ 	struct pci_dev		*pdev;
+@@ -449,7 +482,7 @@ struct bnxt_qplib_nq {
+ 	struct bnxt_qplib_hwq	hwq;
+ 
+ 	u16			bar_reg;
+-	u16			bar_reg_off;
++	u32			bar_reg_off;
+ 	u16			ring_id;
+ 	void __iomem		*bar_reg_iomem;
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+index 742346ea5b0d..ca0a7c683786 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+@@ -359,11 +359,12 @@ static int bnxt_qplib_process_qp_event(struct bnxt_qplib_rcfw *rcfw,
+ static void bnxt_qplib_service_creq(unsigned long data)
+ {
+ 	struct bnxt_qplib_rcfw *rcfw = (struct bnxt_qplib_rcfw *)data;
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(rcfw->res->cctx);
+ 	struct bnxt_qplib_hwq *creq = &rcfw->creq;
++	u32 type, budget = CREQ_ENTRY_POLL_BUDGET;
+ 	struct creq_base *creqe, **creq_ptr;
+ 	u32 sw_cons, raw_cons;
+ 	unsigned long flags;
+-	u32 type, budget = CREQ_ENTRY_POLL_BUDGET;
+ 
+ 	/* Service the CREQ until budget is over */
+ 	spin_lock_irqsave(&creq->lock, flags);
+@@ -407,8 +408,9 @@ static void bnxt_qplib_service_creq(unsigned long data)
+ 
+ 	if (creq->cons != raw_cons) {
+ 		creq->cons = raw_cons;
+-		CREQ_DB_REARM(rcfw->creq_bar_reg_iomem, raw_cons,
+-			      creq->max_elements);
++		bnxt_qplib_ring_creq_db_rearm(rcfw->creq_bar_reg_iomem,
++					      raw_cons, creq->max_elements,
++					      rcfw->creq_ring_id, gen_p5);
+ 	}
+ 	spin_unlock_irqrestore(&creq->lock, flags);
+ }
+@@ -560,12 +562,15 @@ int bnxt_qplib_alloc_rcfw_channel(struct pci_dev *pdev,
+ 				  struct bnxt_qplib_ctx *ctx,
+ 				  int qp_tbl_sz)
+ {
++	u8 hwq_type;
++
+ 	rcfw->pdev = pdev;
+ 	rcfw->creq.max_elements = BNXT_QPLIB_CREQE_MAX_CNT;
++	hwq_type = bnxt_qplib_get_hwq_type(rcfw->res);
+ 	if (bnxt_qplib_alloc_init_hwq(rcfw->pdev, &rcfw->creq, NULL, 0,
+ 				      &rcfw->creq.max_elements,
+-				      BNXT_QPLIB_CREQE_UNITS, 0, PAGE_SIZE,
+-				      HWQ_TYPE_L2_CMPL)) {
++				      BNXT_QPLIB_CREQE_UNITS,
++				      0, PAGE_SIZE, hwq_type)) {
+ 		dev_err(&rcfw->pdev->dev,
+ 			"HW channel CREQ allocation failed\n");
+ 		goto fail;
+@@ -607,10 +612,13 @@ int bnxt_qplib_alloc_rcfw_channel(struct pci_dev *pdev,
+ 
+ void bnxt_qplib_rcfw_stop_irq(struct bnxt_qplib_rcfw *rcfw, bool kill)
+ {
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(rcfw->res->cctx);
++
+ 	tasklet_disable(&rcfw->worker);
+ 	/* Mask h/w interrupts */
+-	CREQ_DB(rcfw->creq_bar_reg_iomem, rcfw->creq.cons,
+-		rcfw->creq.max_elements);
++	bnxt_qplib_ring_creq_db(rcfw->creq_bar_reg_iomem, rcfw->creq.cons,
++				rcfw->creq.max_elements, rcfw->creq_ring_id,
++				gen_p5);
+ 	/* Sync with last running IRQ-handler */
+ 	synchronize_irq(rcfw->vector);
+ 	if (kill)
+@@ -647,6 +655,7 @@ void bnxt_qplib_disable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw)
+ int bnxt_qplib_rcfw_start_irq(struct bnxt_qplib_rcfw *rcfw, int msix_vector,
+ 			      bool need_init)
+ {
++	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(rcfw->res->cctx);
+ 	int rc;
+ 
+ 	if (rcfw->requested)
+@@ -663,8 +672,9 @@ int bnxt_qplib_rcfw_start_irq(struct bnxt_qplib_rcfw *rcfw, int msix_vector,
+ 	if (rc)
+ 		return rc;
+ 	rcfw->requested = true;
+-	CREQ_DB_REARM(rcfw->creq_bar_reg_iomem, rcfw->creq.cons,
+-		      rcfw->creq.max_elements);
++	bnxt_qplib_ring_creq_db_rearm(rcfw->creq_bar_reg_iomem,
++				      rcfw->creq.cons, rcfw->creq.max_elements,
++				      rcfw->creq_ring_id, gen_p5);
+ 
+ 	return 0;
+ }
+@@ -717,8 +727,9 @@ int bnxt_qplib_enable_rcfw_channel(struct pci_dev *pdev,
+ 		dev_err(&rcfw->pdev->dev,
+ 			"CREQ BAR region %d resc start is 0!\n",
+ 			rcfw->creq_bar_reg);
++	/* Unconditionally map 8 bytes to support 57500 series */
+ 	rcfw->creq_bar_reg_iomem = ioremap_nocache(res_base + cp_bar_reg_off,
+-						   4);
++						   8);
+ 	if (!rcfw->creq_bar_reg_iomem) {
+ 		dev_err(&rcfw->pdev->dev, "CREQ BAR region %d mapping failed\n",
+ 			rcfw->creq_bar_reg);
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+index 8011d674391e..2138533bb642 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+@@ -157,10 +157,46 @@ static inline u32 get_creq_idx(u32 val)
+ #define CREQ_DB_CP_FLAGS		(CREQ_DB_KEY_CP |	\
+ 					 CREQ_DB_IDX_VALID |	\
+ 					 CREQ_DB_IRQ_DIS)
+-#define CREQ_DB_REARM(db, raw_cons, cp_bit)			\
+-	writel(CREQ_DB_CP_FLAGS_REARM | ((raw_cons) & ((cp_bit) - 1)), db)
+-#define CREQ_DB(db, raw_cons, cp_bit)				\
+-	writel(CREQ_DB_CP_FLAGS | ((raw_cons) & ((cp_bit) - 1)), db)
++
++static inline void bnxt_qplib_ring_creq_db64(void __iomem *db, u32 index,
++					     u32 xid, bool arm)
++{
++	u64 val = 0;
++
++	val = xid & DBC_DBC_XID_MASK;
++	val |= DBC_DBC_PATH_ROCE;
++	val |= arm ? DBC_DBC_TYPE_NQ_ARM : DBC_DBC_TYPE_NQ;
++	val <<= 32;
++	val |= index & DBC_DBC_INDEX_MASK;
++
++	writeq(val, db);
++}
++
++static inline void bnxt_qplib_ring_creq_db_rearm(void __iomem *db, u32 raw_cons,
++						 u32 max_elements, u32 xid,
++						 bool gen_p5)
++{
++	u32 index = raw_cons & (max_elements - 1);
++
++	if (gen_p5)
++		bnxt_qplib_ring_creq_db64(db, index, xid, true);
++	else
++		writel(CREQ_DB_CP_FLAGS_REARM | (index & DBC_DBC32_XID_MASK),
++		       db);
++}
++
++static inline void bnxt_qplib_ring_creq_db(void __iomem *db, u32 raw_cons,
++					   u32 max_elements, u32 xid,
++					   bool gen_p5)
++{
++	u32 index = raw_cons & (max_elements - 1);
++
++	if (gen_p5)
++		bnxt_qplib_ring_creq_db64(db, index, xid, true);
++	else
++		writel(CREQ_DB_CP_FLAGS | (index & DBC_DBC32_XID_MASK),
++		       db);
++}
+ 
+ #define CREQ_ENTRY_POLL_BUDGET		0x100
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_res.h b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+index 6a0c45827053..35d862b44908 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+@@ -206,6 +206,19 @@ static inline bool bnxt_qplib_is_chip_gen_p5(struct bnxt_qplib_chip_ctx *cctx)
+ 	return (cctx->chip_num == CHIP_NUM_57500);
+ }
+ 
++static inline u8 bnxt_qplib_get_hwq_type(struct bnxt_qplib_res *res)
++{
++	return bnxt_qplib_is_chip_gen_p5(res->cctx) ?
++					HWQ_TYPE_QUEUE : HWQ_TYPE_L2_CMPL;
++}
++
++static inline u8 bnxt_qplib_get_ring_type(struct bnxt_qplib_chip_ctx *cctx)
++{
++	return bnxt_qplib_is_chip_gen_p5(cctx) ?
++	       RING_ALLOC_REQ_RING_TYPE_NQ :
++	       RING_ALLOC_REQ_RING_TYPE_ROCE_CMPL;
++}
++
+ #define to_bnxt_qplib(ptr, type, member)	\
+ 	container_of(ptr, type, member)
+ 
+diff --git a/drivers/infiniband/hw/bnxt_re/roce_hsi.h b/drivers/infiniband/hw/bnxt_re/roce_hsi.h
+index 8a9ead419ac2..73e0982fc48f 100644
+--- a/drivers/infiniband/hw/bnxt_re/roce_hsi.h
++++ b/drivers/infiniband/hw/bnxt_re/roce_hsi.h
+@@ -49,11 +49,11 @@ struct cmpl_doorbell {
+ 	#define CMPL_DOORBELL_IDX_SFT				    0
+ 	#define CMPL_DOORBELL_RESERVED_MASK			    0x3000000UL
+ 	#define CMPL_DOORBELL_RESERVED_SFT			    24
+-	#define CMPL_DOORBELL_IDX_VALID			    0x4000000UL
++	#define CMPL_DOORBELL_IDX_VALID				    0x4000000UL
+ 	#define CMPL_DOORBELL_MASK				    0x8000000UL
+ 	#define CMPL_DOORBELL_KEY_MASK				    0xf0000000UL
+ 	#define CMPL_DOORBELL_KEY_SFT				    28
+-	#define CMPL_DOORBELL_KEY_CMPL				   (0x2UL << 28)
++	#define CMPL_DOORBELL_KEY_CMPL				(0x2UL << 28)
+ };
+ 
+ /* Status Door Bell Format (4 bytes) */
+@@ -71,46 +71,56 @@ struct status_doorbell {
+ /* RoCE Host Structures */
+ 
+ /* Doorbell Structures */
+-/* 64b Doorbell Format (8 bytes) */
+-struct dbr_dbr {
+-	__le32 index;
+-	#define DBR_DBR_INDEX_MASK				    0xfffffUL
+-	#define DBR_DBR_INDEX_SFT				    0
+-	#define DBR_DBR_RESERVED12_MASK			    0xfff00000UL
+-	#define DBR_DBR_RESERVED12_SFT				    20
+-	__le32 type_xid;
+-	#define DBR_DBR_XID_MASK				    0xfffffUL
+-	#define DBR_DBR_XID_SFT				    0
+-	#define DBR_DBR_RESERVED8_MASK				    0xff00000UL
+-	#define DBR_DBR_RESERVED8_SFT				    20
+-	#define DBR_DBR_TYPE_MASK				    0xf0000000UL
+-	#define DBR_DBR_TYPE_SFT				    28
+-	#define DBR_DBR_TYPE_SQ				   (0x0UL << 28)
+-	#define DBR_DBR_TYPE_RQ				   (0x1UL << 28)
+-	#define DBR_DBR_TYPE_SRQ				   (0x2UL << 28)
+-	#define DBR_DBR_TYPE_SRQ_ARM				   (0x3UL << 28)
+-	#define DBR_DBR_TYPE_CQ				   (0x4UL << 28)
+-	#define DBR_DBR_TYPE_CQ_ARMSE				   (0x5UL << 28)
+-	#define DBR_DBR_TYPE_CQ_ARMALL				   (0x6UL << 28)
+-	#define DBR_DBR_TYPE_CQ_ARMENA				   (0x7UL << 28)
+-	#define DBR_DBR_TYPE_SRQ_ARMENA			   (0x8UL << 28)
+-	#define DBR_DBR_TYPE_CQ_CUTOFF_ACK			   (0x9UL << 28)
+-	#define DBR_DBR_TYPE_NULL				   (0xfUL << 28)
+-};
+-
+-/* 32b Doorbell Format (4 bytes) */
+-struct dbr_dbr32 {
+-	__le32 type_abs_incr_xid;
+-	#define DBR_DBR32_XID_MASK				    0xfffffUL
+-	#define DBR_DBR32_XID_SFT				    0
+-	#define DBR_DBR32_RESERVED4_MASK			    0xf00000UL
+-	#define DBR_DBR32_RESERVED4_SFT			    20
+-	#define DBR_DBR32_INCR_MASK				    0xf000000UL
+-	#define DBR_DBR32_INCR_SFT				    24
+-	#define DBR_DBR32_ABS					    0x10000000UL
+-	#define DBR_DBR32_TYPE_MASK				    0xe0000000UL
+-	#define DBR_DBR32_TYPE_SFT				    29
+-	#define DBR_DBR32_TYPE_SQ				   (0x0UL << 29)
++/* dbc_dbc (size:64b/8B) */
++struct dbc_dbc {
++	__le32  index;
++	#define DBC_DBC_INDEX_MASK		0xffffffUL
++	#define DBC_DBC_INDEX_SFT		0
++	__le32  type_path_xid;
++	#define DBC_DBC_XID_MASK		0xfffffUL
++	#define DBC_DBC_XID_SFT			0
++	#define DBC_DBC_PATH_MASK		0x3000000UL
++	#define DBC_DBC_PATH_SFT		24
++	#define DBC_DBC_PATH_ROCE		(0x0UL << 24)
++	#define DBC_DBC_PATH_L2			(0x1UL << 24)
++	#define DBC_DBC_PATH_ENGINE		(0x2UL << 24)
++	#define DBC_DBC_PATH_LAST		DBC_DBC_PATH_ENGINE
++	#define DBC_DBC_DEBUG_TRACE		0x8000000UL
++	#define DBC_DBC_TYPE_MASK		0xf0000000UL
++	#define DBC_DBC_TYPE_SFT		28
++	#define DBC_DBC_TYPE_SQ			(0x0UL << 28)
++	#define DBC_DBC_TYPE_RQ			(0x1UL << 28)
++	#define DBC_DBC_TYPE_SRQ		(0x2UL << 28)
++	#define DBC_DBC_TYPE_SRQ_ARM		(0x3UL << 28)
++	#define DBC_DBC_TYPE_CQ			(0x4UL << 28)
++	#define DBC_DBC_TYPE_CQ_ARMSE		(0x5UL << 28)
++	#define DBC_DBC_TYPE_CQ_ARMALL		(0x6UL << 28)
++	#define DBC_DBC_TYPE_CQ_ARMENA		(0x7UL << 28)
++	#define DBC_DBC_TYPE_SRQ_ARMENA		(0x8UL << 28)
++	#define DBC_DBC_TYPE_CQ_CUTOFF_ACK	(0x9UL << 28)
++	#define DBC_DBC_TYPE_NQ			(0xaUL << 28)
++	#define DBC_DBC_TYPE_NQ_ARM		(0xbUL << 28)
++	#define DBC_DBC_TYPE_NULL		(0xfUL << 28)
++	#define DBC_DBC_TYPE_LAST		DBC_DBC_TYPE_NULL
++};
++
++/* dbc_dbc32 (size:32b/4B) */
++struct dbc_dbc32 {
++	__le32  type_abs_incr_xid;
++	#define DBC_DBC32_XID_MASK		0xfffffUL
++	#define DBC_DBC32_XID_SFT		0
++	#define DBC_DBC32_PATH_MASK		0xc00000UL
++	#define DBC_DBC32_PATH_SFT		22
++	#define DBC_DBC32_PATH_ROCE		(0x0UL << 22)
++	#define DBC_DBC32_PATH_L2		(0x1UL << 22)
++	#define DBC_DBC32_PATH_LAST		DBC_DBC32_PATH_L2
++	#define DBC_DBC32_INCR_MASK		0xf000000UL
++	#define DBC_DBC32_INCR_SFT		24
++	#define DBC_DBC32_ABS			0x10000000UL
++	#define DBC_DBC32_TYPE_MASK		0xe0000000UL
++	#define DBC_DBC32_TYPE_SFT		29
++	#define DBC_DBC32_TYPE_SQ		(0x0UL << 29)
++	#define DBC_DBC32_TYPE_LAST		DBC_DBC32_TYPE_SQ
+ };
+ 
+ /* SQ WQE Structures */
+@@ -2719,6 +2729,8 @@ struct creq_query_func_resp_sb {
+ 	__le16 max_srq;
+ 	__le32 max_gid;
+ 	__le32 tqm_alloc_reqs[12];
++	__le32 max_dpi;
++	__le32 reserved_32;
+ };
+ 
+ /* Set resources command response (16 bytes) */
