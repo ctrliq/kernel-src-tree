@@ -1,0 +1,87 @@
+IB/hfi1: Fix alloc failure with larger txqueuelen
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mike Marciniszyn <mike.marciniszyn@cornelisnetworks.com>
+commit b1151b74ff68cc83c2a8e1a618efe7d056e4f237
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/b1151b74.failed
+
+The following allocation with large txqueuelen will result in the
+following warning:
+
+  Call Trace:
+   __alloc_pages_nodemask+0x283/0x2c0
+   kmalloc_large_node+0x3c/0xa0
+   __kmalloc_node+0x22a/0x2f0
+   hfi1_ipoib_txreq_init+0x19f/0x330 [hfi1]
+   hfi1_ipoib_setup_rn+0xd3/0x1a0 [hfi1]
+   rdma_init_netdev+0x5a/0x80 [ib_core]
+   ipoib_intf_init+0x6c/0x350 [ib_ipoib]
+   ipoib_intf_alloc+0x5c/0xc0 [ib_ipoib]
+   ipoib_add_one+0xbe/0x300 [ib_ipoib]
+   add_client_context+0x12c/0x1a0 [ib_core]
+   ib_register_client+0x147/0x190 [ib_core]
+   ipoib_init_module+0xdd/0x132 [ib_ipoib]
+   do_one_initcall+0x46/0x1c3
+   do_init_module+0x5a/0x220
+   load_module+0x14c5/0x17f0
+   __do_sys_init_module+0x13b/0x180
+   do_syscall_64+0x5b/0x1a0
+   entry_SYSCALL_64_after_hwframe+0x65/0xca
+
+For ipoib, the txqueuelen is modified with the module parameter
+send_queue_size.
+
+Fix by changing to use kv versions of the same allocator to handle the
+large allocations.  The allocation embeds a hdr struct that is dma mapped.
+Change that struct to a pointer to a kzalloced struct.
+
+	Cc: stable@vger.kernel.org
+Fixes: d99dc602e2a5 ("IB/hfi1: Add functions to transmit datagram ipoib packets")
+Link: https://lore.kernel.org/r/1642287756-182313-3-git-send-email-mike.marciniszyn@cornelisnetworks.com
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@cornelisnetworks.com>
+	Signed-off-by: Mike Marciniszyn <mike.marciniszyn@cornelisnetworks.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit b1151b74ff68cc83c2a8e1a618efe7d056e4f237)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/ipoib_tx.c
+diff --cc drivers/infiniband/hw/hfi1/ipoib_tx.c
+index 8c87ea176d14,d6bbdb8fcb50..000000000000
+--- a/drivers/infiniband/hw/hfi1/ipoib_tx.c
++++ b/drivers/infiniband/hw/hfi1/ipoib_tx.c
+@@@ -722,7 -734,13 +725,17 @@@ int hfi1_ipoib_txreq_init(struct hfi1_i
+  			goto free_txqs;
+  
+  		txq->tx_ring.max_items = tx_ring_size;
+++<<<<<<< HEAD
+ +		txq->tx_ring.shift = ilog2(tx_ring_size);
+++=======
++ 		txq->tx_ring.shift = ilog2(tx_item_size);
++ 		txq->tx_ring.avail = hfi1_ipoib_ring_hwat(txq);
++ 		tx_ring = &txq->tx_ring;
++ 		for (j = 0; j < tx_ring_size; j++)
++ 			hfi1_txreq_from_idx(tx_ring, j)->sdma_hdr =
++ 				kzalloc_node(sizeof(*tx->sdma_hdr),
++ 					     GFP_KERNEL, priv->dd->node);
+++>>>>>>> b1151b74ff68 (IB/hfi1: Fix alloc failure with larger txqueuelen)
+  
+  		netif_tx_napi_add(dev, &txq->napi,
+  				  hfi1_ipoib_poll_tx_ring,
+diff --git a/drivers/infiniband/hw/hfi1/ipoib.h b/drivers/infiniband/hw/hfi1/ipoib.h
+index 9ce5849bf89b..3102f21b6114 100644
+--- a/drivers/infiniband/hw/hfi1/ipoib.h
++++ b/drivers/infiniband/hw/hfi1/ipoib.h
+@@ -55,7 +55,7 @@ union hfi1_ipoib_flow {
+  */
+ struct ipoib_txreq {
+ 	struct sdma_txreq           txreq;
+-	struct hfi1_sdma_header     sdma_hdr;
++	struct hfi1_sdma_header     *sdma_hdr;
+ 	int                         sdma_status;
+ 	int                         complete;
+ 	struct hfi1_ipoib_dev_priv *priv;
+* Unmerged path drivers/infiniband/hw/hfi1/ipoib_tx.c
