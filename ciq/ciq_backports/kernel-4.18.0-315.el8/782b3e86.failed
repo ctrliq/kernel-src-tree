@@ -1,0 +1,150 @@
+mt76: mt7921: fix memory leak in mt7921_coredump_work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Sean Wang <sean.wang@mediatek.com>
+commit 782b3e86ea970e899f8e723db9f64708a15ca30e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/782b3e86.failed
+
+Fix possible memory leak in mt7921_coredump_work.
+
+Fixes: 1c099ab44727c ("mt76: mt7921: add MCU support")
+	Signed-off-by: Sean Wang <sean.wang@mediatek.com>
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 782b3e86ea970e899f8e723db9f64708a15ca30e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+index 968894cfc98b,8befa8167cde..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mac.c
+@@@ -1386,8 -1401,118 +1386,120 @@@ void mt7921_mac_work(struct work_struc
+  		mt7921_mac_sta_stats_work(phy);
+  	};
+  
+ -	mt7921_mutex_release(phy->dev);
+ +	mutex_unlock(&mphy->dev->mutex);
+  
+ -out:
+ -	ieee80211_queue_delayed_work(phy->mt76->hw, &mphy->mac_work,
+ +	ieee80211_queue_delayed_work(mphy->hw, &mphy->mac_work,
+  				     MT7921_WATCHDOG_TIME);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void mt7921_pm_wake_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	struct mt76_phy *mphy;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.wake_work);
++ 	mphy = dev->phy.mt76;
++ 
++ 	if (!mt7921_mcu_drv_pmctrl(dev))
++ 		mt76_connac_pm_dequeue_skbs(mphy, &dev->pm);
++ 	else
++ 		dev_err(mphy->dev->dev, "failed to wake device\n");
++ 
++ 	ieee80211_wake_queues(mphy->hw);
++ 	complete_all(&dev->pm.wake_cmpl);
++ }
++ 
++ void mt7921_pm_power_save_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	unsigned long delta;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						pm.ps_work.work);
++ 
++ 	delta = dev->pm.idle_timeout;
++ 	if (time_is_after_jiffies(dev->pm.last_activity + delta)) {
++ 		delta = dev->pm.last_activity + delta - jiffies;
++ 		goto out;
++ 	}
++ 
++ 	if (!mt7921_mcu_fw_pmctrl(dev))
++ 		return;
++ out:
++ 	queue_delayed_work(dev->mt76.wq, &dev->pm.ps_work, delta);
++ }
++ 
++ int mt7921_mac_set_beacon_filter(struct mt7921_phy *phy,
++ 				 struct ieee80211_vif *vif,
++ 				 bool enable)
++ {
++ 	struct mt7921_dev *dev = phy->dev;
++ 	bool ext_phy = phy != &dev->phy;
++ 	int err;
++ 
++ 	if (!dev->pm.enable)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = mt7921_mcu_set_bss_pm(dev, vif, enable);
++ 	if (err)
++ 		return err;
++ 
++ 	if (enable) {
++ 		vif->driver_flags |= IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_set(dev, MT_WF_RFCR(ext_phy),
++ 			 MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	} else {
++ 		vif->driver_flags &= ~IEEE80211_VIF_BEACON_FILTER;
++ 		mt76_clear(dev, MT_WF_RFCR(ext_phy),
++ 			   MT_WF_RFCR_DROP_OTHER_BEACON);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void mt7921_coredump_work(struct work_struct *work)
++ {
++ 	struct mt7921_dev *dev;
++ 	char *dump, *data;
++ 
++ 	dev = (struct mt7921_dev *)container_of(work, struct mt7921_dev,
++ 						coredump.work.work);
++ 
++ 	if (time_is_after_jiffies(dev->coredump.last_activity +
++ 				  4 * MT76_CONNAC_COREDUMP_TIMEOUT)) {
++ 		queue_delayed_work(dev->mt76.wq, &dev->coredump.work,
++ 				   MT76_CONNAC_COREDUMP_TIMEOUT);
++ 		return;
++ 	}
++ 
++ 	dump = vzalloc(MT76_CONNAC_COREDUMP_SZ);
++ 	data = dump;
++ 
++ 	while (true) {
++ 		struct sk_buff *skb;
++ 
++ 		spin_lock_bh(&dev->mt76.lock);
++ 		skb = __skb_dequeue(&dev->coredump.msg_list);
++ 		spin_unlock_bh(&dev->mt76.lock);
++ 
++ 		if (!skb)
++ 			break;
++ 
++ 		skb_pull(skb, sizeof(struct mt7921_mcu_rxd));
++ 		if (data + skb->len - dump > MT76_CONNAC_COREDUMP_SZ) {
++ 			dev_kfree_skb(skb);
++ 			continue;
++ 		}
++ 
++ 		memcpy(data, skb->data, skb->len);
++ 		data += skb->len;
++ 
++ 		dev_kfree_skb(skb);
++ 	}
++ 	dev_coredumpv(dev->mt76.dev, dump, MT76_CONNAC_COREDUMP_SZ,
++ 		      GFP_KERNEL);
++ }
+++>>>>>>> 782b3e86ea97 (mt76: mt7921: fix memory leak in mt7921_coredump_work)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mac.c
