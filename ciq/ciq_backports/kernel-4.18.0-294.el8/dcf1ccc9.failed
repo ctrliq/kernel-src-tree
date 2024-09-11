@@ -1,0 +1,126 @@
+xfs: always return -ENOSPC on project quota reservation failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric Sandeen <sandeen@redhat.com>
+commit dcf1ccc99e6db06a3a3cc9f72161f7d084a38d40
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dcf1ccc9.failed
+
+XFS project quota treats project hierarchies as "mini filesysems" and
+so rather than -EDQUOT, the intent is to return -ENOSPC when a quota
+reservation fails, but this behavior is not consistent.
+
+The only place we make a decision between -EDQUOT and -ENOSPC
+returns based on quota type is in xfs_trans_dqresv().
+
+This behavior is currently controlled by whether or not the
+XFS_QMOPT_ENOSPC flag gets passed into the quota reservation.  However,
+its use is not consistent; paths such as xfs_create() and xfs_symlink()
+don't set the flag, so a reservation failure will return -EDQUOT for
+project quota reservation failures rather than -ENOSPC for these sorts
+of operations, even for project quota:
+
+# mkdir mnt/project
+# xfs_quota -x -c "project -s -p mnt/project 42" mnt
+# xfs_quota -x -c 'limit -p isoft=2 ihard=3 42' mnt
+# touch mnt/project/file{1,2,3}
+touch: cannot touch ‘mnt/project/file3’: Disk quota exceeded
+
+We can make this consistent by not requiring the flag to be set at the
+top of the callchain; instead we can simply test whether we are
+reserving a project quota with XFS_QM_ISPDQ in xfs_trans_dqresv and if
+so, return -ENOSPC for that failure.  This removes the need for the
+XFS_QMOPT_ENOSPC altogether and simplifies the code a fair bit.
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+(cherry picked from commit dcf1ccc99e6db06a3a3cc9f72161f7d084a38d40)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_qm.c
+diff --cc fs/xfs/xfs_qm.c
+index e6a9a2df4dc8,27a907645631..000000000000
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@@ -1835,8 -1848,7 +1835,12 @@@ xfs_qm_vop_chown_reserve
+  	}
+  
+  	if (XFS_IS_PQUOTA_ON(ip->i_mount) && pdqp &&
+++<<<<<<< HEAD
+ +	    xfs_get_projid(ip) != be32_to_cpu(pdqp->q_core.d_id)) {
+ +		prjflags = XFS_QMOPT_ENOSPC;
+++=======
++ 	    ip->i_d.di_projid != be32_to_cpu(pdqp->q_core.d_id)) {
+++>>>>>>> dcf1ccc99e6d (xfs: always return -ENOSPC on project quota reservation failure)
+  		pdq_delblks = pdqp;
+  		if (delblks) {
+  			ASSERT(ip->i_pdquot);
+diff --git a/fs/xfs/libxfs/xfs_quota_defs.h b/fs/xfs/libxfs/xfs_quota_defs.h
+index b2113b17e53c..56d9dd787e7b 100644
+--- a/fs/xfs/libxfs/xfs_quota_defs.h
++++ b/fs/xfs/libxfs/xfs_quota_defs.h
+@@ -100,7 +100,6 @@ typedef uint16_t	xfs_qwarncnt_t;
+ #define XFS_QMOPT_FORCE_RES	0x0000010 /* ignore quota limits */
+ #define XFS_QMOPT_SBVERSION	0x0000040 /* change superblock version num */
+ #define XFS_QMOPT_GQUOTA	0x0002000 /* group dquot requested */
+-#define XFS_QMOPT_ENOSPC	0x0004000 /* enospc instead of edquot (prj) */
+ 
+ /*
+  * flags to xfs_trans_mod_dquot to indicate which field needs to be
+* Unmerged path fs/xfs/xfs_qm.c
+diff --git a/fs/xfs/xfs_trans_dquot.c b/fs/xfs/xfs_trans_dquot.c
+index fe844aa123aa..edde366ca8e9 100644
+--- a/fs/xfs/xfs_trans_dquot.c
++++ b/fs/xfs/xfs_trans_dquot.c
+@@ -711,7 +711,7 @@ xfs_trans_dqresv(
+ 
+ error_return:
+ 	xfs_dqunlock(dqp);
+-	if (flags & XFS_QMOPT_ENOSPC)
++	if (XFS_QM_ISPDQ(dqp))
+ 		return -ENOSPC;
+ 	return -EDQUOT;
+ }
+@@ -751,15 +751,13 @@ xfs_trans_reserve_quota_bydquots(
+ 	ASSERT(flags & XFS_QMOPT_RESBLK_MASK);
+ 
+ 	if (udqp) {
+-		error = xfs_trans_dqresv(tp, mp, udqp, nblks, ninos,
+-					(flags & ~XFS_QMOPT_ENOSPC));
++		error = xfs_trans_dqresv(tp, mp, udqp, nblks, ninos, flags);
+ 		if (error)
+ 			return error;
+ 	}
+ 
+ 	if (gdqp) {
+-		error = xfs_trans_dqresv(tp, mp, gdqp, nblks, ninos,
+-					(flags & ~XFS_QMOPT_ENOSPC));
++		error = xfs_trans_dqresv(tp, mp, gdqp, nblks, ninos, flags);
+ 		if (error)
+ 			goto unwind_usr;
+ 	}
+@@ -804,16 +802,12 @@ xfs_trans_reserve_quota_nblks(
+ 
+ 	if (!XFS_IS_QUOTA_RUNNING(mp) || !XFS_IS_QUOTA_ON(mp))
+ 		return 0;
+-	if (XFS_IS_PQUOTA_ON(mp))
+-		flags |= XFS_QMOPT_ENOSPC;
+ 
+ 	ASSERT(!xfs_is_quota_inode(&mp->m_sb, ip->i_ino));
+ 
+ 	ASSERT(xfs_isilocked(ip, XFS_ILOCK_EXCL));
+-	ASSERT((flags & ~(XFS_QMOPT_FORCE_RES | XFS_QMOPT_ENOSPC)) ==
+-				XFS_TRANS_DQ_RES_RTBLKS ||
+-	       (flags & ~(XFS_QMOPT_FORCE_RES | XFS_QMOPT_ENOSPC)) ==
+-				XFS_TRANS_DQ_RES_BLKS);
++	ASSERT((flags & ~(XFS_QMOPT_FORCE_RES)) == XFS_TRANS_DQ_RES_RTBLKS ||
++	       (flags & ~(XFS_QMOPT_FORCE_RES)) == XFS_TRANS_DQ_RES_BLKS);
+ 
+ 	/*
+ 	 * Reserve nblks against these dquots, with trans as the mediator.
