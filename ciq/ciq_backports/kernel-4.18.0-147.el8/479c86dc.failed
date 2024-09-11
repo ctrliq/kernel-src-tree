@@ -1,0 +1,164 @@
+net: switchdev: Add extack to struct switchdev_notifier_info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] switchdev: Add extack to struct switchdev_notifier_info (Ivan Vecera) [1690125]
+Rebuild_FUZZ: 95.65%
+commit-author Petr Machata <petrm@mellanox.com>
+commit 479c86dc551c9720765ed19433990eae6a1f899f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/479c86dc.failed
+
+In order to pass extack to the drivers that need it, add an extack field
+to struct switchdev_notifier_info, and an extack argument to the
+function call_switchdev_blocking_notifiers(). Also add a helper function
+switchdev_notifier_info_to_extack().
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Ivan Vecera <ivecera@redhat.com>
+	Reviewed-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 479c86dc551c9720765ed19433990eae6a1f899f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+#	net/switchdev/switchdev.c
+diff --cc drivers/net/vxlan.c
+index 6bf62e1be8b8,49d4b5854c62..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -355,6 -358,23 +355,26 @@@ errout
+  		rtnl_set_sk_err(net, RTNLGRP_NEIGH, err);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void vxlan_fdb_switchdev_notifier_info(const struct vxlan_dev *vxlan,
++ 			    const struct vxlan_fdb *fdb,
++ 			    const struct vxlan_rdst *rd,
++ 			    struct switchdev_notifier_vxlan_fdb_info *fdb_info)
++ {
++ 	fdb_info->info.dev = vxlan->dev;
++ 	fdb_info->info.extack = NULL;
++ 	fdb_info->remote_ip = rd->remote_ip;
++ 	fdb_info->remote_port = rd->remote_port;
++ 	fdb_info->remote_vni = rd->remote_vni;
++ 	fdb_info->remote_ifindex = rd->remote_ifindex;
++ 	memcpy(fdb_info->eth_addr, fdb->eth_addr, ETH_ALEN);
++ 	fdb_info->vni = fdb->vni;
++ 	fdb_info->offloaded = rd->offloaded;
++ 	fdb_info->added_by_user = fdb->flags & NTF_VXLAN_ADDED_BY_USER;
++ }
++ 
+++>>>>>>> 479c86dc551c (net: switchdev: Add extack to struct switchdev_notifier_info)
+  static void vxlan_fdb_switchdev_call_notifiers(struct vxlan_dev *vxlan,
+  					       struct vxlan_fdb *fdb,
+  					       struct vxlan_rdst *rd,
+diff --cc net/switchdev/switchdev.c
+index 099434ec7996,aa84acfb6632..000000000000
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@@ -353,30 -353,30 +353,38 @@@ static size_t switchdev_obj_size(const 
+  	return 0;
+  }
+  
+ -static int switchdev_port_obj_notify(enum switchdev_notifier_type nt,
+ -				     struct net_device *dev,
+ -				     const struct switchdev_obj *obj,
+ -				     struct switchdev_trans *trans,
+ -				     struct netlink_ext_ack *extack)
+ +static int __switchdev_port_obj_add(struct net_device *dev,
+ +				    const struct switchdev_obj *obj,
+ +				    struct switchdev_trans *trans)
+  {
+ -	int rc;
+ -	int err;
+ +	const struct switchdev_ops *ops = dev->switchdev_ops;
+ +	struct net_device *lower_dev;
+ +	struct list_head *iter;
+ +	int err = -EOPNOTSUPP;
+  
+ -	struct switchdev_notifier_port_obj_info obj_info = {
+ -		.obj = obj,
+ -		.trans = trans,
+ -		.handled = false,
+ -	};
+ +	if (ops && ops->switchdev_port_obj_add)
+ +		return ops->switchdev_port_obj_add(dev, obj, trans);
+  
+++<<<<<<< HEAD
+ +	/* Switch device port(s) may be stacked under
+ +	 * bond/team/vlan dev, so recurse down to add object on
+ +	 * each port.
+ +	 */
+ +
+ +	netdev_for_each_lower_dev(dev, lower_dev, iter) {
+ +		err = __switchdev_port_obj_add(lower_dev, obj, trans);
+ +		if (err)
+ +			break;
+++=======
++ 	rc = call_switchdev_blocking_notifiers(nt, dev, &obj_info.info, extack);
++ 	err = notifier_to_errno(rc);
++ 	if (err) {
++ 		WARN_ON(!obj_info.handled);
++ 		return err;
+++>>>>>>> 479c86dc551c (net: switchdev: Add extack to struct switchdev_notifier_info)
+  	}
+ -	if (!obj_info.handled)
+ -		return -EOPNOTSUPP;
+ -	return 0;
+ +
+ +	return err;
+  }
+  
+  static int switchdev_port_obj_add_now(struct net_device *dev,
+* Unmerged path drivers/net/vxlan.c
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index 62f9c343de20..b2cb85d0bb77 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -177,6 +177,7 @@ enum switchdev_notifier_type {
+ 
+ struct switchdev_notifier_info {
+ 	struct net_device *dev;
++	struct netlink_ext_ack *extack;
+ };
+ 
+ struct switchdev_notifier_fdb_info {
+@@ -200,6 +201,12 @@ switchdev_notifier_info_to_dev(const struct switchdev_notifier_info *info)
+ 	return info->dev;
+ }
+ 
++static inline struct netlink_ext_ack *
++switchdev_notifier_info_to_extack(const struct switchdev_notifier_info *info)
++{
++	return info->extack;
++}
++
+ #ifdef CONFIG_NET_SWITCHDEV
+ 
+ void switchdev_deferred_process(void);
+@@ -220,7 +227,8 @@ int call_switchdev_notifiers(unsigned long val, struct net_device *dev,
+ int register_switchdev_blocking_notifier(struct notifier_block *nb);
+ int unregister_switchdev_blocking_notifier(struct notifier_block *nb);
+ int call_switchdev_blocking_notifiers(unsigned long val, struct net_device *dev,
+-				      struct switchdev_notifier_info *info);
++				      struct switchdev_notifier_info *info,
++				      struct netlink_ext_ack *extack);
+ 
+ void switchdev_port_fwd_mark_set(struct net_device *dev,
+ 				 struct net_device *group_dev,
+@@ -304,7 +312,8 @@ unregister_switchdev_blocking_notifier(struct notifier_block *nb)
+ static inline int
+ call_switchdev_blocking_notifiers(unsigned long val,
+ 				  struct net_device *dev,
+-				  struct switchdev_notifier_info *info)
++				  struct switchdev_notifier_info *info,
++				  struct netlink_ext_ack *extack)
+ {
+ 	return NOTIFY_DONE;
+ }
+* Unmerged path net/switchdev/switchdev.c
