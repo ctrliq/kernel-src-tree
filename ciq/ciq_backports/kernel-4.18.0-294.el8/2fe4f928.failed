@@ -1,0 +1,134 @@
+xfs: refactor "does this fork map blocks" predicate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 2fe4f92834c40e81945284b3eaf4610c4dd84e9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2fe4f928.failed
+
+Replace the open-coded checks for whether or not an inode fork maps
+blocks with a macro that will implant the code for us.  This helps us
+declutter the bmap code a bit.
+
+Note that I had to use a macro instead of a static inline function
+because of C header dependency problems between xfs_inode.h and
+xfs_inode_fork.h.
+
+Conversion was performed with the following Coccinelle script:
+
+@@
+expression ip, w;
+@@
+
+- XFS_IFORK_FORMAT(ip, w) == XFS_DINODE_FMT_EXTENTS || XFS_IFORK_FORMAT(ip, w) == XFS_DINODE_FMT_BTREE
++ xfs_ifork_has_extents(ip, w)
+
+@@
+expression ip, w;
+@@
+
+- XFS_IFORK_FORMAT(ip, w) != XFS_DINODE_FMT_EXTENTS && XFS_IFORK_FORMAT(ip, w) != XFS_DINODE_FMT_BTREE
++ !xfs_ifork_has_extents(ip, w)
+
+@@
+expression ip, w;
+@@
+
+- XFS_IFORK_FORMAT(ip, w) == XFS_DINODE_FMT_BTREE || XFS_IFORK_FORMAT(ip, w) == XFS_DINODE_FMT_EXTENTS
++ xfs_ifork_has_extents(ip, w)
+
+@@
+expression ip, w;
+@@
+
+- XFS_IFORK_FORMAT(ip, w) != XFS_DINODE_FMT_BTREE && XFS_IFORK_FORMAT(ip, w) != XFS_DINODE_FMT_EXTENTS
++ !xfs_ifork_has_extents(ip, w)
+
+@@
+expression ip, w;
+@@
+
+- (xfs_ifork_has_extents(ip, w))
++ xfs_ifork_has_extents(ip, w)
+
+@@
+expression ip, w;
+@@
+
+- (!xfs_ifork_has_extents(ip, w))
++ !xfs_ifork_has_extents(ip, w)
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2fe4f92834c40e81945284b3eaf4610c4dd84e9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_bmap.c
+diff --cc fs/xfs/libxfs/xfs_bmap.c
+index c6697d590fad,b7cc2f9eae7b..000000000000
+--- a/fs/xfs/libxfs/xfs_bmap.c
++++ b/fs/xfs/libxfs/xfs_bmap.c
+@@@ -1437,9 -1439,10 +1436,16 @@@ xfs_bmap_last_offset
+  	if (XFS_IFORK_FORMAT(ip, whichfork) == XFS_DINODE_FMT_LOCAL)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	if (XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_BTREE &&
+ +	    XFS_IFORK_FORMAT(ip, whichfork) != XFS_DINODE_FMT_EXTENTS)
+ +	       return -EIO;
+++=======
++ 	if (!xfs_ifork_has_extents(ip, whichfork)) {
++ 		ASSERT(0);
++ 		return -EFSCORRUPTED;
++ 	}
+++>>>>>>> 2fe4f92834c4 (xfs: refactor "does this fork map blocks" predicate)
+  
+  	error = xfs_bmap_last_extent(NULL, ip, whichfork, &rec, &is_empty);
+  	if (error || is_empty)
+* Unmerged path fs/xfs/libxfs/xfs_bmap.c
+diff --git a/fs/xfs/libxfs/xfs_inode_fork.h b/fs/xfs/libxfs/xfs_inode_fork.h
+index 7b845c052fb4..500333d0101e 100644
+--- a/fs/xfs/libxfs/xfs_inode_fork.h
++++ b/fs/xfs/libxfs/xfs_inode_fork.h
+@@ -87,6 +87,10 @@ struct xfs_ifork {
+ #define XFS_IFORK_MAXEXT(ip, w) \
+ 	(XFS_IFORK_SIZE(ip, w) / sizeof(xfs_bmbt_rec_t))
+ 
++#define xfs_ifork_has_extents(ip, w) \
++	(XFS_IFORK_FORMAT((ip), (w)) == XFS_DINODE_FMT_EXTENTS || \
++	 XFS_IFORK_FORMAT((ip), (w)) == XFS_DINODE_FMT_BTREE)
++
+ struct xfs_ifork *xfs_iext_state_to_fork(struct xfs_inode *ip, int state);
+ 
+ int		xfs_iformat_fork(struct xfs_inode *, struct xfs_dinode *);
+diff --git a/fs/xfs/scrub/dabtree.c b/fs/xfs/scrub/dabtree.c
+index 77ff9f97bcda..ff30429d6e51 100644
+--- a/fs/xfs/scrub/dabtree.c
++++ b/fs/xfs/scrub/dabtree.c
+@@ -485,8 +485,7 @@ xchk_da_btree(
+ 	int				error;
+ 
+ 	/* Skip short format data structures; no btree to scan. */
+-	if (XFS_IFORK_FORMAT(sc->ip, whichfork) != XFS_DINODE_FMT_EXTENTS &&
+-	    XFS_IFORK_FORMAT(sc->ip, whichfork) != XFS_DINODE_FMT_BTREE)
++	if (!xfs_ifork_has_extents(sc->ip, whichfork))
+ 		return 0;
+ 
+ 	/* Set up initial da state. */
+diff --git a/fs/xfs/xfs_iomap.c b/fs/xfs/xfs_iomap.c
+index 2ae36199a773..c3dda2e7503d 100644
+--- a/fs/xfs/xfs_iomap.c
++++ b/fs/xfs/xfs_iomap.c
+@@ -551,8 +551,7 @@ xfs_file_iomap_begin_delay(
+ 	xfs_ilock(ip, XFS_ILOCK_EXCL);
+ 
+ 	if (unlikely(XFS_TEST_ERROR(
+-	    (XFS_IFORK_FORMAT(ip, XFS_DATA_FORK) != XFS_DINODE_FMT_EXTENTS &&
+-	     XFS_IFORK_FORMAT(ip, XFS_DATA_FORK) != XFS_DINODE_FMT_BTREE),
++	    !xfs_ifork_has_extents(ip, XFS_DATA_FORK),
+ 	     mp, XFS_ERRTAG_BMAPIFORMAT))) {
+ 		XFS_ERROR_REPORT(__func__, XFS_ERRLEVEL_LOW, mp);
+ 		error = -EFSCORRUPTED;
