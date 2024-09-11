@@ -1,0 +1,279 @@
+RDMA/uverbs: Use the iterator for ib_uverbs_unmarshall_recv()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c3bea3d2dc5358e05541527283279102383b0231
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c3bea3d2.failed
+
+This has a very complicated memory layout, with two flex arrays. Use
+the iterator API to make reading it clearer.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit c3bea3d2dc5358e05541527283279102383b0231)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_cmd.c
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,15b9db4463da..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -47,12 -47,132 +47,136 @@@
+  #include "uverbs.h"
+  #include "core_priv.h"
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Copy a response to userspace. If the provided 'resp' is larger than the
++  * user buffer it is silently truncated. If the user provided a larger buffer
++  * then the trailing portion is zero filled.
++  *
++  * These semantics are intended to support future extension of the output
++  * structures.
++  */
++ static int uverbs_response(struct uverbs_attr_bundle *attrs, const void *resp,
++ 			   size_t resp_len)
++ {
++ 	u8 __user *cur = attrs->ucore.outbuf + resp_len;
++ 	u8 __user *end = attrs->ucore.outbuf + attrs->ucore.outlen;
++ 	int ret;
++ 
++ 	if (copy_to_user(attrs->ucore.outbuf, resp,
++ 			 min(attrs->ucore.outlen, resp_len)))
++ 		return -EFAULT;
++ 
++ 	/* Zero fill any extra memory that user space might have provided */
++ 	for (; cur < end; cur++) {
++ 		ret = put_user(0, cur);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Copy a request from userspace. If the provided 'req' is larger than the
++  * user buffer then the user buffer is zero extended into the 'req'. If 'req'
++  * is smaller than the user buffer then the uncopied bytes in the user buffer
++  * must be zero.
++  */
++ static int uverbs_request(struct uverbs_attr_bundle *attrs, void *req,
++ 			  size_t req_len)
++ {
++ 	if (copy_from_user(req, attrs->ucore.inbuf,
++ 			   min(attrs->ucore.inlen, req_len)))
++ 		return -EFAULT;
++ 
++ 	if (attrs->ucore.inlen < req_len) {
++ 		memset(req + attrs->ucore.inlen, 0,
++ 		       req_len - attrs->ucore.inlen);
++ 	} else if (attrs->ucore.inlen > req_len) {
++ 		if (!ib_is_buffer_cleared(attrs->ucore.inbuf + req_len,
++ 					  attrs->ucore.inlen - req_len))
++ 			return -EOPNOTSUPP;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Generate the value for the 'response_length' protocol used by write_ex.
++  * This is the number of bytes the kernel actually wrote. Userspace can use
++  * this to detect what structure members in the response the kernel
++  * understood.
++  */
++ static u32 uverbs_response_length(struct uverbs_attr_bundle *attrs,
++ 				  size_t resp_len)
++ {
++ 	return min_t(size_t, attrs->ucore.outlen, resp_len);
++ }
++ 
++ /*
++  * The iterator version of the request interface is for handlers that need to
++  * step over a flex array at the end of a command header.
++  */
++ struct uverbs_req_iter {
++ 	const void __user *cur;
++ 	const void __user *end;
++ };
++ 
++ static int uverbs_request_start(struct uverbs_attr_bundle *attrs,
++ 				struct uverbs_req_iter *iter,
++ 				void *req,
++ 				size_t req_len)
++ {
++ 	if (attrs->ucore.inlen < req_len)
++ 		return -ENOSPC;
++ 
++ 	if (copy_from_user(req, attrs->ucore.inbuf, req_len))
++ 		return -EFAULT;
++ 
++ 	iter->cur = attrs->ucore.inbuf + req_len;
++ 	iter->end = attrs->ucore.inbuf + attrs->ucore.inlen;
++ 	return 0;
++ }
++ 
++ static int uverbs_request_next(struct uverbs_req_iter *iter, void *val,
++ 			       size_t len)
++ {
++ 	if (iter->cur + len > iter->end)
++ 		return -ENOSPC;
++ 
++ 	if (copy_from_user(val, iter->cur, len))
++ 		return -EFAULT;
++ 
++ 	iter->cur += len;
++ 	return 0;
++ }
++ 
++ static const void __user *uverbs_request_next_ptr(struct uverbs_req_iter *iter,
++ 						  size_t len)
++ {
++ 	const void __user *res = iter->cur;
++ 
++ 	if (iter->cur + len > iter->end)
++ 		return ERR_PTR(-ENOSPC);
++ 	iter->cur += len;
++ 	return res;
++ }
++ 
++ static int uverbs_request_finish(struct uverbs_req_iter *iter)
++ {
++ 	if (!ib_is_buffer_cleared(iter->cur, iter->end - iter->cur))
++ 		return -EOPNOTSUPP;
++ 	return 0;
++ }
++ 
+++>>>>>>> c3bea3d2dc53 (RDMA/uverbs: Use the iterator for ib_uverbs_unmarshall_recv())
+  static struct ib_uverbs_completion_event_file *
+ -_ib_uverbs_lookup_comp_file(s32 fd, const struct uverbs_attr_bundle *attrs)
+ +ib_uverbs_lookup_comp_file(int fd, struct ib_ucontext *context)
+  {
+ -	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ -					       fd, attrs);
+ +	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ +						fd, context);
+ +	struct ib_uobject_file *uobj_file;
+  
+  	if (IS_ERR(uobj))
+  		return (void *)uobj;
+@@@ -2240,18 -2082,25 +2364,25 @@@ ssize_t ib_uverbs_post_send(struct ib_u
+  	struct ib_qp                   *qp;
+  	int                             i, sg_ind;
+  	int				is_ud;
+ -	int ret, ret2;
+ +	ssize_t                         ret = -EINVAL;
+  	size_t                          next_size;
++ 	const struct ib_sge __user *sgls;
++ 	const void __user *wqes;
++ 	struct uverbs_req_iter iter;
+  
+- 	if (copy_from_user(&cmd, buf, sizeof cmd))
+- 		return -EFAULT;
+- 
+- 	if (in_len < sizeof cmd + cmd.wqe_size * cmd.wr_count +
+- 	    cmd.sge_count * sizeof (struct ib_uverbs_sge))
+- 		return -EINVAL;
+- 
+- 	if (cmd.wqe_size < sizeof (struct ib_uverbs_send_wr))
+- 		return -EINVAL;
++ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
++ 	if (ret)
++ 		return ret;
++ 	wqes = uverbs_request_next_ptr(&iter, cmd.wqe_size * cmd.wr_count);
++ 	if (IS_ERR(wqes))
++ 		return PTR_ERR(wqes);
++ 	sgls = uverbs_request_next_ptr(
++ 		&iter, cmd.sge_count * sizeof(struct ib_uverbs_sge));
++ 	if (IS_ERR(sgls))
++ 		return PTR_ERR(sgls);
++ 	ret = uverbs_request_finish(&iter);
++ 	if (ret)
++ 		return ret;
+  
+  	user_wr = kmalloc(cmd.wqe_size, GFP_KERNEL);
+  	if (!user_wr)
+@@@ -2413,14 -2260,12 +2541,12 @@@ out_put
+  out:
+  	kfree(user_wr);
+  
+ -	return ret;
+ +	return ret ? ret : in_len;
+  }
+  
+- static struct ib_recv_wr *ib_uverbs_unmarshall_recv(const char __user *buf,
+- 						    int in_len,
+- 						    u32 wr_count,
+- 						    u32 sge_count,
+- 						    u32 wqe_size)
++ static struct ib_recv_wr *
++ ib_uverbs_unmarshall_recv(struct uverbs_req_iter *iter, u32 wr_count,
++ 			  u32 wqe_size, u32 sge_count)
+  {
+  	struct ib_uverbs_recv_wr *user_wr;
+  	struct ib_recv_wr        *wr = NULL, *last, *next;
+@@@ -2515,16 -2366,18 +2649,21 @@@ ssize_t ib_uverbs_post_recv(struct ib_u
+  {
+  	struct ib_uverbs_post_recv      cmd;
+  	struct ib_uverbs_post_recv_resp resp;
+ -	struct ib_recv_wr              *wr, *next;
+ -	const struct ib_recv_wr	       *bad_wr;
+ +	struct ib_recv_wr              *wr, *next, *bad_wr;
+  	struct ib_qp                   *qp;
+++<<<<<<< HEAD
+ +	ssize_t                         ret = -EINVAL;
+++=======
++ 	int ret, ret2;
++ 	struct uverbs_req_iter iter;
+++>>>>>>> c3bea3d2dc53 (RDMA/uverbs: Use the iterator for ib_uverbs_unmarshall_recv())
+  
+- 	if (copy_from_user(&cmd, buf, sizeof cmd))
+- 		return -EFAULT;
++ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
++ 	if (ret)
++ 		return ret;
+  
+- 	wr = ib_uverbs_unmarshall_recv(buf + sizeof cmd,
+- 				       in_len - sizeof cmd, cmd.wr_count,
+- 				       cmd.sge_count, cmd.wqe_size);
++ 	wr = ib_uverbs_unmarshall_recv(&iter, cmd.wr_count, cmd.wqe_size,
++ 				       cmd.sge_count);
+  	if (IS_ERR(wr))
+  		return PTR_ERR(wr);
+  
+@@@ -2564,16 -2418,18 +2703,21 @@@ ssize_t ib_uverbs_post_srq_recv(struct 
+  {
+  	struct ib_uverbs_post_srq_recv      cmd;
+  	struct ib_uverbs_post_srq_recv_resp resp;
+ -	struct ib_recv_wr                  *wr, *next;
+ -	const struct ib_recv_wr		   *bad_wr;
+ +	struct ib_recv_wr                  *wr, *next, *bad_wr;
+  	struct ib_srq                      *srq;
+++<<<<<<< HEAD
+ +	ssize_t                             ret = -EINVAL;
+++=======
++ 	int ret, ret2;
++ 	struct uverbs_req_iter iter;
+++>>>>>>> c3bea3d2dc53 (RDMA/uverbs: Use the iterator for ib_uverbs_unmarshall_recv())
+  
+- 	if (copy_from_user(&cmd, buf, sizeof cmd))
+- 		return -EFAULT;
++ 	ret = uverbs_request_start(attrs, &iter, &cmd, sizeof(cmd));
++ 	if (ret)
++ 		return ret;
+  
+- 	wr = ib_uverbs_unmarshall_recv(buf + sizeof cmd,
+- 				       in_len - sizeof cmd, cmd.wr_count,
+- 				       cmd.sge_count, cmd.wqe_size);
++ 	wr = ib_uverbs_unmarshall_recv(&iter, cmd.wr_count, cmd.wqe_size,
++ 				       cmd.sge_count);
+  	if (IS_ERR(wr))
+  		return PTR_ERR(wr);
+  
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
