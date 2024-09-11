@@ -1,0 +1,87 @@
+KVM: nVMX: Fix kernel info-leak when enabling KVM_CAP_HYPERV_ENLIGHTENED_VMCS more than once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Liran Alon <liran.alon@oracle.com>
+commit 7f9ad1dfa3c768d1116c2dbacd7a09f9a871534e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7f9ad1df.failed
+
+Consider the case that userspace enables KVM_CAP_HYPERV_ENLIGHTENED_VMCS twice:
+1) kvm_vcpu_ioctl_enable_cap() is called to enable
+KVM_CAP_HYPERV_ENLIGHTENED_VMCS which calls nested_enable_evmcs().
+2) nested_enable_evmcs() sets enlightened_vmcs_enabled to true and fills
+vmcs_version which is then copied to userspace.
+3) kvm_vcpu_ioctl_enable_cap() is called again to enable
+KVM_CAP_HYPERV_ENLIGHTENED_VMCS which calls nested_enable_evmcs().
+4) This time nested_enable_evmcs() just returns 0 as
+enlightened_vmcs_enabled is already true. *Without filling
+vmcs_version*.
+5) kvm_vcpu_ioctl_enable_cap() continues as usual and copies
+*uninitialized* vmcs_version to userspace which leads to kernel info-leak.
+
+Fix this issue by simply changing nested_enable_evmcs() to always fill
+vmcs_version output argument. Even when enlightened_vmcs_enabled is
+already set to true.
+
+Note that SVM's nested_enable_evmcs() should not be modified because it
+always returns a non-zero value (-ENODEV) which results in
+kvm_vcpu_ioctl_enable_cap() skipping the copy of vmcs_version to
+userspace (as it should).
+
+Fixes: 57b119da3594 ("KVM: nVMX: add KVM_CAP_HYPERV_ENLIGHTENED_VMCS capability")
+	Reported-by: syzbot+cfbc368e283d381f8cef@syzkaller.appspotmail.com
+	Reviewed-by: Krish Sadhukhan <krish.sadhukhan@oracle.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Liran Alon <liran.alon@oracle.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7f9ad1dfa3c768d1116c2dbacd7a09f9a871534e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index 24b81a468c99,065f1df74000..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -1597,6 -1606,35 +1597,38 @@@ static inline void evmcs_sanitize_exec_
+  static inline void evmcs_touch_msr_bitmap(void) {}
+  #endif /* IS_ENABLED(CONFIG_HYPERV) */
+  
+++<<<<<<< HEAD
+++=======
++ static int nested_enable_evmcs(struct kvm_vcpu *vcpu,
++ 			       uint16_t *vmcs_version)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	/*
++ 	 * vmcs_version represents the range of supported Enlightened VMCS
++ 	 * versions: lower 8 bits is the minimal version, higher 8 bits is the
++ 	 * maximum supported version. KVM supports versions from 1 to
++ 	 * KVM_EVMCS_VERSION.
++ 	 */
++ 	if (vmcs_version)
++ 		*vmcs_version = (KVM_EVMCS_VERSION << 8) | 1;
++ 
++ 	/* We don't support disabling the feature for simplicity. */
++ 	if (vmx->nested.enlightened_vmcs_enabled)
++ 		return 0;
++ 
++ 	vmx->nested.enlightened_vmcs_enabled = true;
++ 
++ 	vmx->nested.msrs.pinbased_ctls_high &= ~EVMCS1_UNSUPPORTED_PINCTRL;
++ 	vmx->nested.msrs.entry_ctls_high &= ~EVMCS1_UNSUPPORTED_VMENTRY_CTRL;
++ 	vmx->nested.msrs.exit_ctls_high &= ~EVMCS1_UNSUPPORTED_VMEXIT_CTRL;
++ 	vmx->nested.msrs.secondary_ctls_high &= ~EVMCS1_UNSUPPORTED_2NDEXEC;
++ 	vmx->nested.msrs.vmfunc_controls &= ~EVMCS1_UNSUPPORTED_VMFUNC;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 7f9ad1dfa3c7 (KVM: nVMX: Fix kernel info-leak when enabling KVM_CAP_HYPERV_ENLIGHTENED_VMCS more than once)
+  static inline bool is_exception_n(u32 intr_info, u8 vector)
+  {
+  	return (intr_info & (INTR_INFO_INTR_TYPE_MASK | INTR_INFO_VECTOR_MASK |
+* Unmerged path arch/x86/kvm/vmx.c
