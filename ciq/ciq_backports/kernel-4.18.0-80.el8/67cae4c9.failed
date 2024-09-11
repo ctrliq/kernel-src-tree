@@ -1,0 +1,130 @@
+blk-mq: cleanup and improve list insertion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 67cae4c948a5311121905a2a8740c50daf7f6478
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/67cae4c9.failed
+
+It's somewhat strange to have a list insertion function that
+relies on the fact that the caller has mapped things correctly.
+Pass in the hardware queue directly for insertion, which makes
+for a much cleaner interface and implementation.
+
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 67cae4c948a5311121905a2a8740c50daf7f6478)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.c
+diff --cc block/blk-mq-sched.c
+index 51ff587cddb8,66fda19be5a3..000000000000
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@@ -475,11 -399,11 +475,19 @@@ void blk_mq_sched_insert_requests(struc
+  				  struct blk_mq_ctx *ctx,
+  				  struct list_head *list, bool run_queue_async)
+  {
+++<<<<<<< HEAD
+ +	struct blk_mq_hw_ctx *hctx = blk_mq_map_queue(q, ctx->cpu);
+ +	struct elevator_queue *e = hctx->queue->elevator;
+ +
+ +	if (e && e->type->ops.mq.insert_requests)
+ +		e->type->ops.mq.insert_requests(hctx, list, false);
+++=======
++ 	struct elevator_queue *e;
++ 
++ 	e = hctx->queue->elevator;
++ 	if (e && e->type->ops.insert_requests)
++ 		e->type->ops.insert_requests(hctx, list, false);
+++>>>>>>> 67cae4c948a5 (blk-mq: cleanup and improve list insertion)
+  	else {
+  		/*
+  		 * try to issue requests directly if the hw queue isn't
+* Unmerged path block/blk-mq-sched.c
+diff --git a/block/blk-mq-sched.h b/block/blk-mq-sched.h
+index 8a9544203173..ffd7b5989d63 100644
+--- a/block/blk-mq-sched.h
++++ b/block/blk-mq-sched.h
+@@ -19,7 +19,7 @@ void blk_mq_sched_restart(struct blk_mq_hw_ctx *hctx);
+ 
+ void blk_mq_sched_insert_request(struct request *rq, bool at_head,
+ 				 bool run_queue, bool async);
+-void blk_mq_sched_insert_requests(struct request_queue *q,
++void blk_mq_sched_insert_requests(struct blk_mq_hw_ctx *hctx,
+ 				  struct blk_mq_ctx *ctx,
+ 				  struct list_head *list, bool run_queue_async);
+ 
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index e9efa8a78a58..1d00c8fff8e9 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1618,11 +1618,12 @@ static int plug_ctx_cmp(void *priv, struct list_head *a, struct list_head *b)
+ 
+ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ {
++	struct blk_mq_hw_ctx *this_hctx;
+ 	struct blk_mq_ctx *this_ctx;
+ 	struct request_queue *this_q;
+ 	struct request *rq;
+ 	LIST_HEAD(list);
+-	LIST_HEAD(ctx_list);
++	LIST_HEAD(rq_list);
+ 	unsigned int depth;
+ 
+ 	list_splice_init(&plug->mq_list, &list);
+@@ -1630,6 +1631,7 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 	list_sort(NULL, &list, plug_ctx_cmp);
+ 
+ 	this_q = NULL;
++	this_hctx = NULL;
+ 	this_ctx = NULL;
+ 	depth = 0;
+ 
+@@ -1637,30 +1639,31 @@ void blk_mq_flush_plug_list(struct blk_plug *plug, bool from_schedule)
+ 		rq = list_entry_rq(list.next);
+ 		list_del_init(&rq->queuelist);
+ 		BUG_ON(!rq->q);
+-		if (rq->mq_ctx != this_ctx) {
+-			if (this_ctx) {
++		if (rq->mq_hctx != this_hctx || rq->mq_ctx != this_ctx) {
++			if (this_hctx) {
+ 				trace_block_unplug(this_q, depth, !from_schedule);
+-				blk_mq_sched_insert_requests(this_q, this_ctx,
+-								&ctx_list,
++				blk_mq_sched_insert_requests(this_hctx, this_ctx,
++								&rq_list,
+ 								from_schedule);
+ 			}
+ 
+-			this_ctx = rq->mq_ctx;
+ 			this_q = rq->q;
++			this_ctx = rq->mq_ctx;
++			this_hctx = rq->mq_hctx;
+ 			depth = 0;
+ 		}
+ 
+ 		depth++;
+-		list_add_tail(&rq->queuelist, &ctx_list);
++		list_add_tail(&rq->queuelist, &rq_list);
+ 	}
+ 
+ 	/*
+-	 * If 'this_ctx' is set, we know we have entries to complete
+-	 * on 'ctx_list'. Do those.
++	 * If 'this_hctx' is set, we know we have entries to complete
++	 * on 'rq_list'. Do those.
+ 	 */
+-	if (this_ctx) {
++	if (this_hctx) {
+ 		trace_block_unplug(this_q, depth, !from_schedule);
+-		blk_mq_sched_insert_requests(this_q, this_ctx, &ctx_list,
++		blk_mq_sched_insert_requests(this_hctx, this_ctx, &rq_list,
+ 						from_schedule);
+ 	}
+ }
