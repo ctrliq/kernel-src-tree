@@ -1,0 +1,268 @@
+net: atlantic: move FRAC_PER_NS to aq_hw.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mark Starovoytov <mstarovoitov@marvell.com>
+commit 519f0cefb4bcac8faf76b2a7b4042fb950eea23e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/519f0cef.failed
+
+This patch moves FRAC_PER_NS to aq_hw.h so that it can be used in both
+hw_atl (A1) and hw_atl2 (A2) in the future.
+
+	Signed-off-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 519f0cefb4bcac8faf76b2a7b4042fb950eea23e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+index 46eaf70c5ccb,284ea943e8cd..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+@@@ -29,6 -36,11 +29,14 @@@
+  			(AQ_RX_LAST_LOC_FVLANID - AQ_RX_FIRST_LOC_FVLANID + 1U)
+  #define AQ_RX_QUEUE_NOT_ASSIGNED   0xFFU
+  
+++<<<<<<< HEAD
+++=======
++ #define AQ_FRAC_PER_NS 0x100000000LL
++ 
++ /* Used for rate to Mbps conversion */
++ #define AQ_MBPS_DIVISOR         125000 /* 1000000 / 8 */
++ 
+++>>>>>>> 519f0cefb4bc (net: atlantic: move FRAC_PER_NS to aq_hw.h)
+  /* NIC H/W capabilities */
+  struct aq_hw_caps_s {
+  	u64 hw_features;
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+index b7e5ce0d7af5,97672ff142a8..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
+@@@ -978,6 -1200,218 +978,220 @@@ static int hw_atl_b0_hw_ring_rx_stop(st
+  	return aq_hw_err_from_flags(self);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #define get_ptp_ts_val_u64(self, indx) \
++ 	((u64)(hw_atl_pcs_ptp_clock_get(self, indx) & 0xffff))
++ 
++ static void hw_atl_b0_get_ptp_ts(struct aq_hw_s *self, u64 *stamp)
++ {
++ 	u64 ns;
++ 
++ 	hw_atl_pcs_ptp_clock_read_enable(self, 1);
++ 	hw_atl_pcs_ptp_clock_read_enable(self, 0);
++ 	ns = (get_ptp_ts_val_u64(self, 0) +
++ 	      (get_ptp_ts_val_u64(self, 1) << 16)) * NSEC_PER_SEC +
++ 	     (get_ptp_ts_val_u64(self, 3) +
++ 	      (get_ptp_ts_val_u64(self, 4) << 16));
++ 
++ 	*stamp = ns + self->ptp_clk_offset;
++ }
++ 
++ static void hw_atl_b0_adj_params_get(u64 freq, s64 adj, u32 *ns, u32 *fns)
++ {
++ 	/* For accuracy, the digit is extended */
++ 	s64 base_ns = ((adj + NSEC_PER_SEC) * NSEC_PER_SEC);
++ 	u64 nsi_frac = 0;
++ 	u64 nsi;
++ 
++ 	base_ns = div64_s64(base_ns, freq);
++ 	nsi = div64_u64(base_ns, NSEC_PER_SEC);
++ 
++ 	if (base_ns != nsi * NSEC_PER_SEC) {
++ 		s64 divisor = div64_s64((s64)NSEC_PER_SEC * NSEC_PER_SEC,
++ 					base_ns - nsi * NSEC_PER_SEC);
++ 		nsi_frac = div64_s64(AQ_FRAC_PER_NS * NSEC_PER_SEC, divisor);
++ 	}
++ 
++ 	*ns = (u32)nsi;
++ 	*fns = (u32)nsi_frac;
++ }
++ 
++ static void
++ hw_atl_b0_mac_adj_param_calc(struct hw_fw_request_ptp_adj_freq *ptp_adj_freq,
++ 			     u64 phyfreq, u64 macfreq)
++ {
++ 	s64 adj_fns_val;
++ 	s64 fns_in_sec_phy = phyfreq * (ptp_adj_freq->fns_phy +
++ 					AQ_FRAC_PER_NS * ptp_adj_freq->ns_phy);
++ 	s64 fns_in_sec_mac = macfreq * (ptp_adj_freq->fns_mac +
++ 					AQ_FRAC_PER_NS * ptp_adj_freq->ns_mac);
++ 	s64 fault_in_sec_phy = AQ_FRAC_PER_NS * NSEC_PER_SEC - fns_in_sec_phy;
++ 	s64 fault_in_sec_mac = AQ_FRAC_PER_NS * NSEC_PER_SEC - fns_in_sec_mac;
++ 	/* MAC MCP counter freq is macfreq / 4 */
++ 	s64 diff_in_mcp_overflow = (fault_in_sec_mac - fault_in_sec_phy) *
++ 				   4 * AQ_FRAC_PER_NS;
++ 
++ 	diff_in_mcp_overflow = div64_s64(diff_in_mcp_overflow,
++ 					 AQ_HW_MAC_COUNTER_HZ);
++ 	adj_fns_val = (ptp_adj_freq->fns_mac + AQ_FRAC_PER_NS *
++ 		       ptp_adj_freq->ns_mac) + diff_in_mcp_overflow;
++ 
++ 	ptp_adj_freq->mac_ns_adj = div64_s64(adj_fns_val, AQ_FRAC_PER_NS);
++ 	ptp_adj_freq->mac_fns_adj = adj_fns_val - ptp_adj_freq->mac_ns_adj *
++ 				    AQ_FRAC_PER_NS;
++ }
++ 
++ static int hw_atl_b0_adj_sys_clock(struct aq_hw_s *self, s64 delta)
++ {
++ 	self->ptp_clk_offset += delta;
++ 
++ 	self->aq_fw_ops->adjust_ptp(self, self->ptp_clk_offset);
++ 
++ 	return 0;
++ }
++ 
++ static int hw_atl_b0_set_sys_clock(struct aq_hw_s *self, u64 time, u64 ts)
++ {
++ 	s64 delta = time - (self->ptp_clk_offset + ts);
++ 
++ 	return hw_atl_b0_adj_sys_clock(self, delta);
++ }
++ 
++ static int hw_atl_b0_ts_to_sys_clock(struct aq_hw_s *self, u64 ts, u64 *time)
++ {
++ 	*time = self->ptp_clk_offset + ts;
++ 	return 0;
++ }
++ 
++ static int hw_atl_b0_adj_clock_freq(struct aq_hw_s *self, s32 ppb)
++ {
++ 	struct hw_fw_request_iface fwreq;
++ 	size_t size;
++ 
++ 	memset(&fwreq, 0, sizeof(fwreq));
++ 
++ 	fwreq.msg_id = HW_AQ_FW_REQUEST_PTP_ADJ_FREQ;
++ 	hw_atl_b0_adj_params_get(AQ_HW_MAC_COUNTER_HZ, ppb,
++ 				 &fwreq.ptp_adj_freq.ns_mac,
++ 				 &fwreq.ptp_adj_freq.fns_mac);
++ 	hw_atl_b0_adj_params_get(AQ_HW_PHY_COUNTER_HZ, ppb,
++ 				 &fwreq.ptp_adj_freq.ns_phy,
++ 				 &fwreq.ptp_adj_freq.fns_phy);
++ 	hw_atl_b0_mac_adj_param_calc(&fwreq.ptp_adj_freq,
++ 				     AQ_HW_PHY_COUNTER_HZ,
++ 				     AQ_HW_MAC_COUNTER_HZ);
++ 
++ 	size = sizeof(fwreq.msg_id) + sizeof(fwreq.ptp_adj_freq);
++ 	return self->aq_fw_ops->send_fw_request(self, &fwreq, size);
++ }
++ 
++ static int hw_atl_b0_gpio_pulse(struct aq_hw_s *self, u32 index,
++ 				u64 start, u32 period)
++ {
++ 	struct hw_fw_request_iface fwreq;
++ 	size_t size;
++ 
++ 	memset(&fwreq, 0, sizeof(fwreq));
++ 
++ 	fwreq.msg_id = HW_AQ_FW_REQUEST_PTP_GPIO_CTRL;
++ 	fwreq.ptp_gpio_ctrl.index = index;
++ 	fwreq.ptp_gpio_ctrl.period = period;
++ 	/* Apply time offset */
++ 	fwreq.ptp_gpio_ctrl.start = start;
++ 
++ 	size = sizeof(fwreq.msg_id) + sizeof(fwreq.ptp_gpio_ctrl);
++ 	return self->aq_fw_ops->send_fw_request(self, &fwreq, size);
++ }
++ 
++ static int hw_atl_b0_extts_gpio_enable(struct aq_hw_s *self, u32 index,
++ 				       u32 enable)
++ {
++ 	/* Enable/disable Sync1588 GPIO Timestamping */
++ 	aq_phy_write_reg(self, MDIO_MMD_PCS, 0xc611, enable ? 0x71 : 0);
++ 
++ 	return 0;
++ }
++ 
++ static int hw_atl_b0_get_sync_ts(struct aq_hw_s *self, u64 *ts)
++ {
++ 	u64 sec_l;
++ 	u64 sec_h;
++ 	u64 nsec_l;
++ 	u64 nsec_h;
++ 
++ 	if (!ts)
++ 		return -1;
++ 
++ 	/* PTP external GPIO clock seconds count 15:0 */
++ 	sec_l = aq_phy_read_reg(self, MDIO_MMD_PCS, 0xc914);
++ 	/* PTP external GPIO clock seconds count 31:16 */
++ 	sec_h = aq_phy_read_reg(self, MDIO_MMD_PCS, 0xc915);
++ 	/* PTP external GPIO clock nanoseconds count 15:0 */
++ 	nsec_l = aq_phy_read_reg(self, MDIO_MMD_PCS, 0xc916);
++ 	/* PTP external GPIO clock nanoseconds count 31:16 */
++ 	nsec_h = aq_phy_read_reg(self, MDIO_MMD_PCS, 0xc917);
++ 
++ 	*ts = (nsec_h << 16) + nsec_l + ((sec_h << 16) + sec_l) * NSEC_PER_SEC;
++ 
++ 	return 0;
++ }
++ 
++ static u16 hw_atl_b0_rx_extract_ts(struct aq_hw_s *self, u8 *p,
++ 				   unsigned int len, u64 *timestamp)
++ {
++ 	unsigned int offset = 14;
++ 	struct ethhdr *eth;
++ 	__be64 sec;
++ 	__be32 ns;
++ 	u8 *ptr;
++ 
++ 	if (len <= offset || !timestamp)
++ 		return 0;
++ 
++ 	/* The TIMESTAMP in the end of package has following format:
++ 	 * (big-endian)
++ 	 *   struct {
++ 	 *     uint64_t sec;
++ 	 *     uint32_t ns;
++ 	 *     uint16_t stream_id;
++ 	 *   };
++ 	 */
++ 	ptr = p + (len - offset);
++ 	memcpy(&sec, ptr, sizeof(sec));
++ 	ptr += sizeof(sec);
++ 	memcpy(&ns, ptr, sizeof(ns));
++ 
++ 	*timestamp = (be64_to_cpu(sec) & 0xffffffffffffllu) * NSEC_PER_SEC +
++ 		     be32_to_cpu(ns) + self->ptp_clk_offset;
++ 
++ 	eth = (struct ethhdr *)p;
++ 
++ 	return (eth->h_proto == htons(ETH_P_1588)) ? 12 : 14;
++ }
++ 
++ static int hw_atl_b0_extract_hwts(struct aq_hw_s *self, u8 *p, unsigned int len,
++ 				  u64 *timestamp)
++ {
++ 	struct hw_atl_rxd_hwts_wb_s *hwts_wb = (struct hw_atl_rxd_hwts_wb_s *)p;
++ 	u64 tmp, sec, ns;
++ 
++ 	sec = 0;
++ 	tmp = (hwts_wb->sec_lw0 >> 2) & 0x3ff;
++ 	sec += tmp;
++ 	tmp = (u64)((hwts_wb->sec_lw1 >> 16) & 0xffff) << 10;
++ 	sec += tmp;
++ 	tmp = (u64)(hwts_wb->sec_hw & 0xfff) << 26;
++ 	sec += tmp;
++ 	tmp = (u64)((hwts_wb->sec_hw >> 22) & 0x3ff) << 38;
++ 	sec += tmp;
++ 	ns = sec * NSEC_PER_SEC + hwts_wb->ns;
++ 	if (timestamp)
++ 		*timestamp = ns + self->ptp_clk_offset;
++ 	return 0;
++ }
++ 
+++>>>>>>> 519f0cefb4bc (net: atlantic: move FRAC_PER_NS to aq_hw.h)
+  static int hw_atl_b0_hw_fl3l4_clear(struct aq_hw_s *self,
+  				    struct aq_rx_filter_l3l4 *data)
+  {
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/aq_hw.h
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_b0.c
