@@ -1,0 +1,176 @@
+net: Make locking in sock_bindtoindex optional
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] Make locking in sock_bindtoindex optional (Jiri Benc) [1882708]
+Rebuild_FUZZ: 94.25%
+commit-author Ferenc Fejes <fejes@inf.elte.hu>
+commit 8ea204c2b658eaef55b4716fde469fb66c589a3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8ea204c2.failed
+
+The sock_bindtoindex intended for kernel wide usage however
+it will lock the socket regardless of the context. This modification
+relax this behavior optionally: locking the socket will be optional
+by calling the sock_bindtoindex with lock_sk = true.
+
+The modification applied to all users of the sock_bindtoindex.
+
+	Signed-off-by: Ferenc Fejes <fejes@inf.elte.hu>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/bee6355da40d9e991b2f2d12b67d55ebb5f5b207.1590871065.git.fejes@inf.elte.hu
+(cherry picked from commit 8ea204c2b658eaef55b4716fde469fb66c589a3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/sock.h
+#	net/core/sock.c
+#	net/ipv4/udp_tunnel.c
+#	net/ipv6/ip6_udp_tunnel.c
+diff --cc include/net/sock.h
+index 50c624432ded,c53cc42b5ab9..000000000000
+--- a/include/net/sock.h
++++ b/include/net/sock.h
+@@@ -2630,7 -2690,16 +2630,12 @@@ static inline bool sk_dev_equal_l3scope
+  
+  void sock_def_readable(struct sock *sk);
+  
+++<<<<<<< HEAD
+++=======
++ int sock_bindtoindex(struct sock *sk, int ifindex, bool lock_sk);
++ void sock_enable_timestamps(struct sock *sk);
+++>>>>>>> 8ea204c2b658 (net: Make locking in sock_bindtoindex optional)
+  void sock_no_linger(struct sock *sk);
+ -void sock_set_keepalive(struct sock *sk);
+ -void sock_set_priority(struct sock *sk, u32 priority);
+ -void sock_set_rcvbuf(struct sock *sk, int val);
+  void sock_set_reuseaddr(struct sock *sk);
+ -void sock_set_reuseport(struct sock *sk);
+ -void sock_set_sndtimeo(struct sock *sk, s64 secs);
+ -
+ -int sock_bind_add(struct sock *sk, struct sockaddr *addr, int addr_len);
+  
+  #endif	/* _SOCK_H */
+diff --cc net/core/sock.c
+index d5f0115da4aa,6c4acf1f0220..000000000000
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@@ -566,6 -566,48 +566,51 @@@ struct dst_entry *sk_dst_check(struct s
+  }
+  EXPORT_SYMBOL(sk_dst_check);
+  
+++<<<<<<< HEAD
+++=======
++ static int sock_bindtoindex_locked(struct sock *sk, int ifindex)
++ {
++ 	int ret = -ENOPROTOOPT;
++ #ifdef CONFIG_NETDEVICES
++ 	struct net *net = sock_net(sk);
++ 
++ 	/* Sorry... */
++ 	ret = -EPERM;
++ 	if (sk->sk_bound_dev_if && !ns_capable(net->user_ns, CAP_NET_RAW))
++ 		goto out;
++ 
++ 	ret = -EINVAL;
++ 	if (ifindex < 0)
++ 		goto out;
++ 
++ 	sk->sk_bound_dev_if = ifindex;
++ 	if (sk->sk_prot->rehash)
++ 		sk->sk_prot->rehash(sk);
++ 	sk_dst_reset(sk);
++ 
++ 	ret = 0;
++ 
++ out:
++ #endif
++ 
++ 	return ret;
++ }
++ 
++ int sock_bindtoindex(struct sock *sk, int ifindex, bool lock_sk)
++ {
++ 	int ret;
++ 
++ 	if (lock_sk)
++ 		lock_sock(sk);
++ 	ret = sock_bindtoindex_locked(sk, ifindex);
++ 	if (lock_sk)
++ 		release_sock(sk);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(sock_bindtoindex);
++ 
+++>>>>>>> 8ea204c2b658 (net: Make locking in sock_bindtoindex optional)
+  static int sock_setbindtodevice(struct sock *sk, char __user *optval,
+  				int optlen)
+  {
+@@@ -611,13 -648,7 +656,17 @@@
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	lock_sock(sk);
+ +	sk->sk_bound_dev_if = index;
+ +	sk_dst_reset(sk);
+ +	release_sock(sk);
+ +
+ +	ret = 0;
+ +
+++=======
++ 	return sock_bindtoindex(sk, index, true);
+++>>>>>>> 8ea204c2b658 (net: Make locking in sock_bindtoindex optional)
+  out:
+  #endif
+  
+diff --cc net/ipv4/udp_tunnel.c
+index d0c412fc56ad,3eecba0874aa..000000000000
+--- a/net/ipv4/udp_tunnel.c
++++ b/net/ipv4/udp_tunnel.c
+@@@ -20,6 -21,12 +20,15 @@@ int udp_sock_create4(struct net *net, s
+  	if (err < 0)
+  		goto error;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (cfg->bind_ifindex) {
++ 		err = sock_bindtoindex(sock->sk, cfg->bind_ifindex, true);
++ 		if (err < 0)
++ 			goto error;
++ 	}
++ 
+++>>>>>>> 8ea204c2b658 (net: Make locking in sock_bindtoindex optional)
+  	udp_addr.sin_family = AF_INET;
+  	udp_addr.sin_addr = cfg->local_ip;
+  	udp_addr.sin_port = cfg->local_udp_port;
+diff --cc net/ipv6/ip6_udp_tunnel.c
+index caad40d6e74d,cdc4d4ee2420..000000000000
+--- a/net/ipv6/ip6_udp_tunnel.c
++++ b/net/ipv6/ip6_udp_tunnel.c
+@@@ -24,10 -25,12 +24,19 @@@ int udp_sock_create6(struct net *net, s
+  		goto error;
+  
+  	if (cfg->ipv6_v6only) {
+++<<<<<<< HEAD
+ +		int val = 1;
+ +
+ +		err = kernel_setsockopt(sock, IPPROTO_IPV6, IPV6_V6ONLY,
+ +					(char *) &val, sizeof(val));
+++=======
++ 		err = ip6_sock_set_v6only(sock->sk);
++ 		if (err < 0)
++ 			goto error;
++ 	}
++ 	if (cfg->bind_ifindex) {
++ 		err = sock_bindtoindex(sock->sk, cfg->bind_ifindex, true);
+++>>>>>>> 8ea204c2b658 (net: Make locking in sock_bindtoindex optional)
+  		if (err < 0)
+  			goto error;
+  	}
+* Unmerged path include/net/sock.h
+* Unmerged path net/core/sock.c
+* Unmerged path net/ipv4/udp_tunnel.c
+* Unmerged path net/ipv6/ip6_udp_tunnel.c
