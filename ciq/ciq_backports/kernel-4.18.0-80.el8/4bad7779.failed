@@ -1,0 +1,426 @@
+KVM: PPC: Book3S HV: Handle hypercalls correctly when nested
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit 4bad77799fede9d95abaf499fff385608ee14877
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/4bad7779.failed
+
+When we are running as a nested hypervisor, we use a hypercall to
+enter the guest rather than code in book3s_hv_rmhandlers.S.  This means
+that the hypercall handlers listed in hcall_real_table never get called.
+There are some hypercalls that are handled there and not in
+kvmppc_pseries_do_hcall(), which therefore won't get processed for
+a nested guest.
+
+To fix this, we add cases to kvmppc_pseries_do_hcall() to handle those
+hypercalls, with the following exceptions:
+
+- The HPT hypercalls (H_ENTER, H_REMOVE, etc.) are not handled because
+  we only support radix mode for nested guests.
+
+- H_CEDE has to be handled specially because the cede logic in
+  kvmhv_run_single_vcpu assumes that it has been processed by the time
+  that kvmhv_p9_guest_entry() returns.  Therefore we put a special
+  case for H_CEDE in kvmhv_p9_guest_entry().
+
+For the XICS hypercalls, if real-mode processing is enabled, then the
+virtual-mode handlers assume that they are being called only to finish
+up the operation.  Therefore we turn off the real-mode flag in the XICS
+code when running as a nested hypervisor.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 4bad77799fede9d95abaf499fff385608ee14877)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/asm-prototypes.h
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/include/asm/asm-prototypes.h
+index 7841b8a60657,c55ba3b4873b..000000000000
+--- a/arch/powerpc/include/asm/asm-prototypes.h
++++ b/arch/powerpc/include/asm/asm-prototypes.h
+@@@ -143,4 -143,32 +143,35 @@@ struct kvm_vcpu
+  void _kvmppc_restore_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  void _kvmppc_save_tm_pr(struct kvm_vcpu *vcpu, u64 guest_msr);
+  
+++<<<<<<< HEAD
+++=======
++ /* Patch sites */
++ extern s32 patch__call_flush_count_cache;
++ extern s32 patch__flush_count_cache_return;
++ extern s32 patch__memset_nocache, patch__memcpy_nocache;
++ 
++ extern long flush_count_cache;
++ 
++ #ifdef CONFIG_PPC_TRANSACTIONAL_MEM
++ void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
++ void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr, bool preserve_nv);
++ #else
++ static inline void kvmppc_save_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
++ 				     bool preserve_nv) { }
++ static inline void kvmppc_restore_tm_hv(struct kvm_vcpu *vcpu, u64 msr,
++ 					bool preserve_nv) { }
++ #endif /* CONFIG_PPC_TRANSACTIONAL_MEM */
++ 
++ void kvmhv_save_host_pmu(void);
++ void kvmhv_load_host_pmu(void);
++ void kvmhv_save_guest_pmu(struct kvm_vcpu *vcpu, bool pmu_in_use);
++ void kvmhv_load_guest_pmu(struct kvm_vcpu *vcpu);
++ 
++ int __kvmhv_vcpu_entry_p9(struct kvm_vcpu *vcpu);
++ 
++ long kvmppc_h_set_dabr(struct kvm_vcpu *vcpu, unsigned long dabr);
++ long kvmppc_h_set_xdabr(struct kvm_vcpu *vcpu, unsigned long dabr,
++ 			unsigned long dabrx);
++ 
+++>>>>>>> 4bad77799fed (KVM: PPC: Book3S HV: Handle hypercalls correctly when nested)
+  #endif /* _ASM_POWERPC_ASM_PROTOTYPES_H */
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index de29c24e5f3d,a87912508f63..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3100,6 -3241,300 +3136,303 @@@ static noinline void kvmppc_run_core(st
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Load up hypervisor-mode registers on P9.
++  */
++ static int kvmhv_load_hv_regs_and_go(struct kvm_vcpu *vcpu, u64 time_limit,
++ 				     unsigned long lpcr)
++ {
++ 	struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ 	s64 hdec;
++ 	u64 tb, purr, spurr;
++ 	int trap;
++ 	unsigned long host_hfscr = mfspr(SPRN_HFSCR);
++ 	unsigned long host_ciabr = mfspr(SPRN_CIABR);
++ 	unsigned long host_dawr = mfspr(SPRN_DAWR);
++ 	unsigned long host_dawrx = mfspr(SPRN_DAWRX);
++ 	unsigned long host_psscr = mfspr(SPRN_PSSCR);
++ 	unsigned long host_pidr = mfspr(SPRN_PID);
++ 
++ 	hdec = time_limit - mftb();
++ 	if (hdec < 0)
++ 		return BOOK3S_INTERRUPT_HV_DECREMENTER;
++ 	mtspr(SPRN_HDEC, hdec);
++ 
++ 	if (vc->tb_offset) {
++ 		u64 new_tb = mftb() + vc->tb_offset;
++ 		mtspr(SPRN_TBU40, new_tb);
++ 		tb = mftb();
++ 		if ((tb & 0xffffff) < (new_tb & 0xffffff))
++ 			mtspr(SPRN_TBU40, new_tb + 0x1000000);
++ 		vc->tb_offset_applied = vc->tb_offset;
++ 	}
++ 
++ 	if (vc->pcr)
++ 		mtspr(SPRN_PCR, vc->pcr);
++ 	mtspr(SPRN_DPDES, vc->dpdes);
++ 	mtspr(SPRN_VTB, vc->vtb);
++ 
++ 	local_paca->kvm_hstate.host_purr = mfspr(SPRN_PURR);
++ 	local_paca->kvm_hstate.host_spurr = mfspr(SPRN_SPURR);
++ 	mtspr(SPRN_PURR, vcpu->arch.purr);
++ 	mtspr(SPRN_SPURR, vcpu->arch.spurr);
++ 
++ 	if (cpu_has_feature(CPU_FTR_DAWR)) {
++ 		mtspr(SPRN_DAWR, vcpu->arch.dawr);
++ 		mtspr(SPRN_DAWRX, vcpu->arch.dawrx);
++ 	}
++ 	mtspr(SPRN_CIABR, vcpu->arch.ciabr);
++ 	mtspr(SPRN_IC, vcpu->arch.ic);
++ 	mtspr(SPRN_PID, vcpu->arch.pid);
++ 
++ 	mtspr(SPRN_PSSCR, vcpu->arch.psscr | PSSCR_EC |
++ 	      (local_paca->kvm_hstate.fake_suspend << PSSCR_FAKE_SUSPEND_LG));
++ 
++ 	mtspr(SPRN_HFSCR, vcpu->arch.hfscr);
++ 
++ 	mtspr(SPRN_SPRG0, vcpu->arch.shregs.sprg0);
++ 	mtspr(SPRN_SPRG1, vcpu->arch.shregs.sprg1);
++ 	mtspr(SPRN_SPRG2, vcpu->arch.shregs.sprg2);
++ 	mtspr(SPRN_SPRG3, vcpu->arch.shregs.sprg3);
++ 
++ 	mtspr(SPRN_AMOR, ~0UL);
++ 
++ 	mtspr(SPRN_LPCR, lpcr);
++ 	isync();
++ 
++ 	kvmppc_xive_push_vcpu(vcpu);
++ 
++ 	mtspr(SPRN_SRR0, vcpu->arch.shregs.srr0);
++ 	mtspr(SPRN_SRR1, vcpu->arch.shregs.srr1);
++ 
++ 	trap = __kvmhv_vcpu_entry_p9(vcpu);
++ 
++ 	/* Advance host PURR/SPURR by the amount used by guest */
++ 	purr = mfspr(SPRN_PURR);
++ 	spurr = mfspr(SPRN_SPURR);
++ 	mtspr(SPRN_PURR, local_paca->kvm_hstate.host_purr +
++ 	      purr - vcpu->arch.purr);
++ 	mtspr(SPRN_SPURR, local_paca->kvm_hstate.host_spurr +
++ 	      spurr - vcpu->arch.spurr);
++ 	vcpu->arch.purr = purr;
++ 	vcpu->arch.spurr = spurr;
++ 
++ 	vcpu->arch.ic = mfspr(SPRN_IC);
++ 	vcpu->arch.pid = mfspr(SPRN_PID);
++ 	vcpu->arch.psscr = mfspr(SPRN_PSSCR) & PSSCR_GUEST_VIS;
++ 
++ 	vcpu->arch.shregs.sprg0 = mfspr(SPRN_SPRG0);
++ 	vcpu->arch.shregs.sprg1 = mfspr(SPRN_SPRG1);
++ 	vcpu->arch.shregs.sprg2 = mfspr(SPRN_SPRG2);
++ 	vcpu->arch.shregs.sprg3 = mfspr(SPRN_SPRG3);
++ 
++ 	mtspr(SPRN_PSSCR, host_psscr);
++ 	mtspr(SPRN_HFSCR, host_hfscr);
++ 	mtspr(SPRN_CIABR, host_ciabr);
++ 	mtspr(SPRN_DAWR, host_dawr);
++ 	mtspr(SPRN_DAWRX, host_dawrx);
++ 	mtspr(SPRN_PID, host_pidr);
++ 
++ 	/*
++ 	 * Since this is radix, do a eieio; tlbsync; ptesync sequence in
++ 	 * case we interrupted the guest between a tlbie and a ptesync.
++ 	 */
++ 	asm volatile("eieio; tlbsync; ptesync");
++ 
++ 	mtspr(SPRN_LPID, vcpu->kvm->arch.host_lpid);	/* restore host LPID */
++ 	isync();
++ 
++ 	vc->dpdes = mfspr(SPRN_DPDES);
++ 	vc->vtb = mfspr(SPRN_VTB);
++ 	mtspr(SPRN_DPDES, 0);
++ 	if (vc->pcr)
++ 		mtspr(SPRN_PCR, 0);
++ 
++ 	if (vc->tb_offset_applied) {
++ 		u64 new_tb = mftb() - vc->tb_offset_applied;
++ 		mtspr(SPRN_TBU40, new_tb);
++ 		tb = mftb();
++ 		if ((tb & 0xffffff) < (new_tb & 0xffffff))
++ 			mtspr(SPRN_TBU40, new_tb + 0x1000000);
++ 		vc->tb_offset_applied = 0;
++ 	}
++ 
++ 	mtspr(SPRN_HDEC, 0x7fffffff);
++ 	mtspr(SPRN_LPCR, vcpu->kvm->arch.host_lpcr);
++ 
++ 	return trap;
++ }
++ 
++ /*
++  * Virtual-mode guest entry for POWER9 and later when the host and
++  * guest are both using the radix MMU.  The LPIDR has already been set.
++  */
++ int kvmhv_p9_guest_entry(struct kvm_vcpu *vcpu, u64 time_limit,
++ 			 unsigned long lpcr)
++ {
++ 	struct kvmppc_vcore *vc = vcpu->arch.vcore;
++ 	unsigned long host_dscr = mfspr(SPRN_DSCR);
++ 	unsigned long host_tidr = mfspr(SPRN_TIDR);
++ 	unsigned long host_iamr = mfspr(SPRN_IAMR);
++ 	s64 dec;
++ 	u64 tb;
++ 	int trap, save_pmu;
++ 
++ 	dec = mfspr(SPRN_DEC);
++ 	tb = mftb();
++ 	if (dec < 512)
++ 		return BOOK3S_INTERRUPT_HV_DECREMENTER;
++ 	local_paca->kvm_hstate.dec_expires = dec + tb;
++ 	if (local_paca->kvm_hstate.dec_expires < time_limit)
++ 		time_limit = local_paca->kvm_hstate.dec_expires;
++ 
++ 	vcpu->arch.ceded = 0;
++ 
++ 	kvmhv_save_host_pmu();		/* saves it to PACA kvm_hstate */
++ 
++ 	kvmppc_subcore_enter_guest();
++ 
++ 	vc->entry_exit_map = 1;
++ 	vc->in_guest = 1;
++ 
++ 	if (vcpu->arch.vpa.pinned_addr) {
++ 		struct lppaca *lp = vcpu->arch.vpa.pinned_addr;
++ 		u32 yield_count = be32_to_cpu(lp->yield_count) + 1;
++ 		lp->yield_count = cpu_to_be32(yield_count);
++ 		vcpu->arch.vpa.dirty = 1;
++ 	}
++ 
++ 	if (cpu_has_feature(CPU_FTR_TM) ||
++ 	    cpu_has_feature(CPU_FTR_P9_TM_HV_ASSIST))
++ 		kvmppc_restore_tm_hv(vcpu, vcpu->arch.shregs.msr, true);
++ 
++ 	kvmhv_load_guest_pmu(vcpu);
++ 
++ 	msr_check_and_set(MSR_FP | MSR_VEC | MSR_VSX);
++ 	load_fp_state(&vcpu->arch.fp);
++ #ifdef CONFIG_ALTIVEC
++ 	load_vr_state(&vcpu->arch.vr);
++ #endif
++ 
++ 	mtspr(SPRN_DSCR, vcpu->arch.dscr);
++ 	mtspr(SPRN_IAMR, vcpu->arch.iamr);
++ 	mtspr(SPRN_PSPB, vcpu->arch.pspb);
++ 	mtspr(SPRN_FSCR, vcpu->arch.fscr);
++ 	mtspr(SPRN_TAR, vcpu->arch.tar);
++ 	mtspr(SPRN_EBBHR, vcpu->arch.ebbhr);
++ 	mtspr(SPRN_EBBRR, vcpu->arch.ebbrr);
++ 	mtspr(SPRN_BESCR, vcpu->arch.bescr);
++ 	mtspr(SPRN_WORT, vcpu->arch.wort);
++ 	mtspr(SPRN_TIDR, vcpu->arch.tid);
++ 	mtspr(SPRN_DAR, vcpu->arch.shregs.dar);
++ 	mtspr(SPRN_DSISR, vcpu->arch.shregs.dsisr);
++ 	mtspr(SPRN_AMR, vcpu->arch.amr);
++ 	mtspr(SPRN_UAMOR, vcpu->arch.uamor);
++ 
++ 	if (!(vcpu->arch.ctrl & 1))
++ 		mtspr(SPRN_CTRLT, mfspr(SPRN_CTRLF) & ~1);
++ 
++ 	mtspr(SPRN_DEC, vcpu->arch.dec_expires - mftb());
++ 
++ 	if (kvmhv_on_pseries()) {
++ 		/* call our hypervisor to load up HV regs and go */
++ 		struct hv_guest_state hvregs;
++ 
++ 		kvmhv_save_hv_regs(vcpu, &hvregs);
++ 		hvregs.lpcr = lpcr;
++ 		vcpu->arch.regs.msr = vcpu->arch.shregs.msr;
++ 		hvregs.version = HV_GUEST_STATE_VERSION;
++ 		if (vcpu->arch.nested) {
++ 			hvregs.lpid = vcpu->arch.nested->shadow_lpid;
++ 			hvregs.vcpu_token = vcpu->arch.nested_vcpu_id;
++ 		} else {
++ 			hvregs.lpid = vcpu->kvm->arch.lpid;
++ 			hvregs.vcpu_token = vcpu->vcpu_id;
++ 		}
++ 		hvregs.hdec_expiry = time_limit;
++ 		trap = plpar_hcall_norets(H_ENTER_NESTED, __pa(&hvregs),
++ 					  __pa(&vcpu->arch.regs));
++ 		kvmhv_restore_hv_return_state(vcpu, &hvregs);
++ 		vcpu->arch.shregs.msr = vcpu->arch.regs.msr;
++ 		vcpu->arch.shregs.dar = mfspr(SPRN_DAR);
++ 		vcpu->arch.shregs.dsisr = mfspr(SPRN_DSISR);
++ 
++ 		/* H_CEDE has to be handled now, not later */
++ 		if (trap == BOOK3S_INTERRUPT_SYSCALL && !vcpu->arch.nested &&
++ 		    kvmppc_get_gpr(vcpu, 3) == H_CEDE) {
++ 			kvmppc_nested_cede(vcpu);
++ 			trap = 0;
++ 		}
++ 	} else {
++ 		trap = kvmhv_load_hv_regs_and_go(vcpu, time_limit, lpcr);
++ 	}
++ 
++ 	vcpu->arch.slb_max = 0;
++ 	dec = mfspr(SPRN_DEC);
++ 	tb = mftb();
++ 	vcpu->arch.dec_expires = dec + tb;
++ 	vcpu->cpu = -1;
++ 	vcpu->arch.thread_cpu = -1;
++ 	vcpu->arch.ctrl = mfspr(SPRN_CTRLF);
++ 
++ 	vcpu->arch.iamr = mfspr(SPRN_IAMR);
++ 	vcpu->arch.pspb = mfspr(SPRN_PSPB);
++ 	vcpu->arch.fscr = mfspr(SPRN_FSCR);
++ 	vcpu->arch.tar = mfspr(SPRN_TAR);
++ 	vcpu->arch.ebbhr = mfspr(SPRN_EBBHR);
++ 	vcpu->arch.ebbrr = mfspr(SPRN_EBBRR);
++ 	vcpu->arch.bescr = mfspr(SPRN_BESCR);
++ 	vcpu->arch.wort = mfspr(SPRN_WORT);
++ 	vcpu->arch.tid = mfspr(SPRN_TIDR);
++ 	vcpu->arch.amr = mfspr(SPRN_AMR);
++ 	vcpu->arch.uamor = mfspr(SPRN_UAMOR);
++ 	vcpu->arch.dscr = mfspr(SPRN_DSCR);
++ 
++ 	mtspr(SPRN_PSPB, 0);
++ 	mtspr(SPRN_WORT, 0);
++ 	mtspr(SPRN_AMR, 0);
++ 	mtspr(SPRN_UAMOR, 0);
++ 	mtspr(SPRN_DSCR, host_dscr);
++ 	mtspr(SPRN_TIDR, host_tidr);
++ 	mtspr(SPRN_IAMR, host_iamr);
++ 	mtspr(SPRN_PSPB, 0);
++ 
++ 	msr_check_and_set(MSR_FP | MSR_VEC | MSR_VSX);
++ 	store_fp_state(&vcpu->arch.fp);
++ #ifdef CONFIG_ALTIVEC
++ 	store_vr_state(&vcpu->arch.vr);
++ #endif
++ 
++ 	if (cpu_has_feature(CPU_FTR_TM) ||
++ 	    cpu_has_feature(CPU_FTR_P9_TM_HV_ASSIST))
++ 		kvmppc_save_tm_hv(vcpu, vcpu->arch.shregs.msr, true);
++ 
++ 	save_pmu = 1;
++ 	if (vcpu->arch.vpa.pinned_addr) {
++ 		struct lppaca *lp = vcpu->arch.vpa.pinned_addr;
++ 		u32 yield_count = be32_to_cpu(lp->yield_count) + 1;
++ 		lp->yield_count = cpu_to_be32(yield_count);
++ 		vcpu->arch.vpa.dirty = 1;
++ 		save_pmu = lp->pmcregs_in_use;
++ 	}
++ 
++ 	kvmhv_save_guest_pmu(vcpu, save_pmu);
++ 
++ 	vc->entry_exit_map = 0x101;
++ 	vc->in_guest = 0;
++ 
++ 	mtspr(SPRN_DEC, local_paca->kvm_hstate.dec_expires - mftb());
++ 
++ 	kvmhv_load_host_pmu();
++ 
++ 	kvmppc_subcore_exit_guest();
++ 
++ 	return trap;
++ }
++ 
++ /*
+++>>>>>>> 4bad77799fed (KVM: PPC: Book3S HV: Handle hypercalls correctly when nested)
+   * Wait for some other vcpu thread to execute us, and
+   * wake us up when we need to handle something in the host.
+   */
+* Unmerged path arch/powerpc/include/asm/asm-prototypes.h
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
+diff --git a/arch/powerpc/kvm/book3s_hv_rmhandlers.S b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+index ec859f4f230a..31946a974794 100644
+--- a/arch/powerpc/kvm/book3s_hv_rmhandlers.S
++++ b/arch/powerpc/kvm/book3s_hv_rmhandlers.S
+@@ -2516,6 +2516,7 @@ hcall_real_table:
+ hcall_real_table_end:
+ 
+ _GLOBAL(kvmppc_h_set_xdabr)
++EXPORT_SYMBOL_GPL(kvmppc_h_set_xdabr)
+ 	andi.	r0, r5, DABRX_USER | DABRX_KERNEL
+ 	beq	6f
+ 	li	r0, DABRX_USER | DABRX_KERNEL | DABRX_BTI
+@@ -2525,6 +2526,7 @@ _GLOBAL(kvmppc_h_set_xdabr)
+ 	blr
+ 
+ _GLOBAL(kvmppc_h_set_dabr)
++EXPORT_SYMBOL_GPL(kvmppc_h_set_dabr)
+ 	li	r5, DABRX_USER | DABRX_KERNEL
+ 3:
+ BEGIN_FTR_SECTION
+diff --git a/arch/powerpc/kvm/book3s_xics.c b/arch/powerpc/kvm/book3s_xics.c
+index d9ba1b06d0f5..b0b2bfc2ff51 100644
+--- a/arch/powerpc/kvm/book3s_xics.c
++++ b/arch/powerpc/kvm/book3s_xics.c
+@@ -1390,7 +1390,8 @@ static int kvmppc_xics_create(struct kvm_device *dev, u32 type)
+ 	}
+ 
+ #ifdef CONFIG_KVM_BOOK3S_HV_POSSIBLE
+-	if (cpu_has_feature(CPU_FTR_ARCH_206)) {
++	if (cpu_has_feature(CPU_FTR_ARCH_206) &&
++	    cpu_has_feature(CPU_FTR_HVMODE)) {
+ 		/* Enable real mode support */
+ 		xics->real_mode = ENABLE_REALMODE;
+ 		xics->real_mode_dbg = DEBUG_REALMODE;
