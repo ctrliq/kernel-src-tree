@@ -1,0 +1,414 @@
+locking/lockdep: Add a skip() function to __bfs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Boqun Feng <boqun.feng@gmail.com>
+commit bc2dd71b283665f0a409d5b6fc603d5a6fdc219e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/bc2dd71b.failed
+
+Some __bfs() walks will have additional iteration constraints (beyond
+the path being strong). Provide an additional function to allow
+terminating graph walks.
+
+	Signed-off-by: Boqun Feng <boqun.feng@gmail.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+(cherry picked from commit bc2dd71b283665f0a409d5b6fc603d5a6fdc219e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/locking/lockdep.c
+diff --cc kernel/locking/lockdep.c
+index 53f2c3da5c8b,f50f026772d7..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -1566,85 -1593,210 +1566,208 @@@ static inline u8 calc_depb(struct held_
+  }
+  
+  /*
+ - * Initialize a lock_list entry @lock belonging to @class as the root for a BFS
+ - * search.
+ + * Forward- or backward-dependency search, used for both circular dependency
+ + * checking and hardirq-unsafe/softirq-unsafe checking.
+   */
+ -static inline void __bfs_init_root(struct lock_list *lock,
+ -				   struct lock_class *class)
+ -{
+ +static int __bfs(struct lock_list *source_entry,
+ +		 void *data,
+ +		 int (*match)(struct lock_list *entry, void *data),
+ +		 struct lock_list **target_entry,
+ +		 int offset)
+ +{
+++<<<<<<< HEAD
+++=======
++ 	lock->class = class;
++ 	lock->parent = NULL;
++ 	lock->only_xr = 0;
++ }
++ 
++ /*
++  * Initialize a lock_list entry @lock based on a lock acquisition @hlock as the
++  * root for a BFS search.
++  *
++  * ->only_xr of the initial lock node is set to @hlock->read == 2, to make sure
++  * that <prev> -> @hlock and @hlock -> <whatever __bfs() found> is not -(*R)->
++  * and -(S*)->.
++  */
++ static inline void bfs_init_root(struct lock_list *lock,
++ 				 struct held_lock *hlock)
++ {
++ 	__bfs_init_root(lock, hlock_class(hlock));
++ 	lock->only_xr = (hlock->read == 2);
++ }
++ 
++ /*
++  * Similar to bfs_init_root() but initialize the root for backwards BFS.
++  *
++  * ->only_xr of the initial lock node is set to @hlock->read != 0, to make sure
++  * that <next> -> @hlock and @hlock -> <whatever backwards BFS found> is not
++  * -(*S)-> and -(R*)-> (reverse order of -(*R)-> and -(S*)->).
++  */
++ static inline void bfs_init_rootb(struct lock_list *lock,
++ 				  struct held_lock *hlock)
++ {
++ 	__bfs_init_root(lock, hlock_class(hlock));
++ 	lock->only_xr = (hlock->read != 0);
++ }
++ 
++ static inline struct lock_list *__bfs_next(struct lock_list *lock, int offset)
++ {
++ 	if (!lock || !lock->parent)
++ 		return NULL;
++ 
++ 	return list_next_or_null_rcu(get_dep_list(lock->parent, offset),
++ 				     &lock->entry, struct lock_list, entry);
++ }
++ 
++ /*
++  * Breadth-First Search to find a strong path in the dependency graph.
++  *
++  * @source_entry: the source of the path we are searching for.
++  * @data: data used for the second parameter of @match function
++  * @match: match function for the search
++  * @target_entry: pointer to the target of a matched path
++  * @offset: the offset to struct lock_class to determine whether it is
++  *          locks_after or locks_before
++  *
++  * We may have multiple edges (considering different kinds of dependencies,
++  * e.g. ER and SN) between two nodes in the dependency graph. But
++  * only the strong dependency path in the graph is relevant to deadlocks. A
++  * strong dependency path is a dependency path that doesn't have two adjacent
++  * dependencies as -(*R)-> -(S*)->, please see:
++  *
++  *         Documentation/locking/lockdep-design.rst
++  *
++  * for more explanation of the definition of strong dependency paths
++  *
++  * In __bfs(), we only traverse in the strong dependency path:
++  *
++  *     In lock_list::only_xr, we record whether the previous dependency only
++  *     has -(*R)-> in the search, and if it does (prev only has -(*R)->), we
++  *     filter out any -(S*)-> in the current dependency and after that, the
++  *     ->only_xr is set according to whether we only have -(*R)-> left.
++  */
++ static enum bfs_result __bfs(struct lock_list *source_entry,
++ 			     void *data,
++ 			     bool (*match)(struct lock_list *entry, void *data),
++ 			     bool (*skip)(struct lock_list *entry, void *data),
++ 			     struct lock_list **target_entry,
++ 			     int offset)
++ {
++ 	struct circular_queue *cq = &lock_cq;
++ 	struct lock_list *lock = NULL;
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  	struct lock_list *entry;
+ +	struct lock_list *lock;
+  	struct list_head *head;
+ -	unsigned int cq_depth;
+ -	bool first;
+ +	struct circular_queue *cq = &lock_cq;
+ +	int ret = 1;
+  
+  	lockdep_assert_locked();
+  
+ -	__cq_init(cq);
+ -	__cq_enqueue(cq, source_entry);
+ -
+ -	while ((lock = __bfs_next(lock, offset)) || (lock = __cq_dequeue(cq))) {
+ -		if (!lock->class)
+ -			return BFS_EINVALIDNODE;
+ +	if (match(source_entry, data)) {
+ +		*target_entry = source_entry;
+ +		ret = 0;
+ +		goto exit;
+ +	}
+  
+ -		/*
+ -		 * Step 1: check whether we already finish on this one.
+ -		 *
+ -		 * If we have visited all the dependencies from this @lock to
+ -		 * others (iow, if we have visited all lock_list entries in
+ -		 * @lock->class->locks_{after,before}) we skip, otherwise go
+ -		 * and visit all the dependencies in the list and mark this
+ -		 * list accessed.
+ -		 */
+ -		if (lock_accessed(lock))
+ -			continue;
+ -		else
+ -			mark_lock_accessed(lock);
+ +	head = get_dep_list(source_entry, offset);
+ +	if (list_empty(head))
+ +		goto exit;
+  
+ -		/*
+ -		 * Step 2: check whether prev dependency and this form a strong
+ -		 *         dependency path.
+ -		 */
+ -		if (lock->parent) { /* Parent exists, check prev dependency */
+ -			u8 dep = lock->dep;
+ -			bool prev_only_xr = lock->parent->only_xr;
+ -
+ -			/*
+ -			 * Mask out all -(S*)-> if we only have *R in previous
+ -			 * step, because -(*R)-> -(S*)-> don't make up a strong
+ -			 * dependency.
+ -			 */
+ -			if (prev_only_xr)
+ -				dep &= ~(DEP_SR_MASK | DEP_SN_MASK);
+ +	__cq_init(cq);
+ +	__cq_enqueue(cq, source_entry);
+  
+ -			/* If nothing left, we skip */
+ -			if (!dep)
+ -				continue;
+ +	while ((lock = __cq_dequeue(cq))) {
+  
+ -			/* If there are only -(*R)-> left, set that for the next step */
+ -			lock->only_xr = !(dep & (DEP_SN_MASK | DEP_EN_MASK));
+ +		if (!lock->class) {
+ +			ret = -2;
+ +			goto exit;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		/*
++ 		 * Step 3: we haven't visited this and there is a strong
++ 		 *         dependency path to this, so check with @match.
++ 		 *         If @skip is provide and returns true, we skip this
++ 		 *         lock (and any path this lock is in).
++ 		 */
++ 		if (skip && skip(lock, data))
++ 			continue;
++ 
++ 		if (match(lock, data)) {
++ 			*target_entry = lock;
++ 			return BFS_RMATCH;
++ 		}
++ 
++ 		/*
++ 		 * Step 4: if not match, expand the path by adding the
++ 		 *         forward or backwards dependencis in the search
++ 		 *
++ 		 */
++ 		first = true;
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  		head = get_dep_list(lock, offset);
+ -		list_for_each_entry_rcu(entry, head, entry) {
+ -			visit_lock_entry(entry, lock);
+  
+ -			/*
+ -			 * Note we only enqueue the first of the list into the
+ -			 * queue, because we can always find a sibling
+ -			 * dependency from one (see __bfs_next()), as a result
+ -			 * the space of queue is saved.
+ -			 */
+ -			if (!first)
+ -				continue;
+ -
+ -			first = false;
+ -
+ -			if (__cq_enqueue(cq, entry))
+ -				return BFS_EQUEUEFULL;
+ +		list_for_each_entry_rcu(entry, head, entry) {
+ +			if (!lock_accessed(entry)) {
+ +				unsigned int cq_depth;
+ +				mark_lock_accessed(entry, lock);
+ +				if (match(entry, data)) {
+ +					*target_entry = entry;
+ +					ret = 0;
+ +					goto exit;
+ +				}
+  
+ -			cq_depth = __cq_get_elem_count(cq);
+ -			if (max_bfs_queue_depth < cq_depth)
+ -				max_bfs_queue_depth = cq_depth;
+ +				if (__cq_enqueue(cq, entry)) {
+ +					ret = -1;
+ +					goto exit;
+ +				}
+ +				cq_depth = __cq_get_elem_count(cq);
+ +				if (max_bfs_queue_depth < cq_depth)
+ +					max_bfs_queue_depth = cq_depth;
+ +			}
+  		}
+  	}
+ -
+ -	return BFS_RNOMATCH;
+ +exit:
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int __bfs_forwards(struct lock_list *src_entry,
+ +			void *data,
+ +			int (*match)(struct lock_list *entry, void *data),
+ +			struct lock_list **target_entry)
+- {
+- 	return __bfs(src_entry, data, match, target_entry,
+++=======
++ static inline enum bfs_result
++ __bfs_forwards(struct lock_list *src_entry,
++ 	       void *data,
++ 	       bool (*match)(struct lock_list *entry, void *data),
++ 	       bool (*skip)(struct lock_list *entry, void *data),
++ 	       struct lock_list **target_entry)
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
++ {
++ 	return __bfs(src_entry, data, match, skip, target_entry,
+  		     offsetof(struct lock_class, locks_after));
+  
+  }
+  
+++<<<<<<< HEAD
+ +static inline int __bfs_backwards(struct lock_list *src_entry,
+ +			void *data,
+ +			int (*match)(struct lock_list *entry, void *data),
+ +			struct lock_list **target_entry)
+- {
+- 	return __bfs(src_entry, data, match, target_entry,
+++=======
++ static inline enum bfs_result
++ __bfs_backwards(struct lock_list *src_entry,
++ 		void *data,
++ 		bool (*match)(struct lock_list *entry, void *data),
++ 	       bool (*skip)(struct lock_list *entry, void *data),
++ 		struct lock_list **target_entry)
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
++ {
++ 	return __bfs(src_entry, data, match, skip, target_entry,
+  		     offsetof(struct lock_class, locks_before));
+  
+  }
+@@@ -1816,9 -2025,9 +1939,9 @@@ static int noop_count(struct lock_list 
+  static unsigned long __lockdep_count_forward_deps(struct lock_list *this)
+  {
+  	unsigned long  count = 0;
+ -	struct lock_list *target_entry;
+ +	struct lock_list *uninitialized_var(target_entry);
+  
+- 	__bfs_forwards(this, (void *)&count, noop_count, &target_entry);
++ 	__bfs_forwards(this, (void *)&count, noop_count, NULL, &target_entry);
+  
+  	return count;
+  }
+@@@ -1842,9 -2050,9 +1965,9 @@@ unsigned long lockdep_count_forward_dep
+  static unsigned long __lockdep_count_backward_deps(struct lock_list *this)
+  {
+  	unsigned long  count = 0;
+ -	struct lock_list *target_entry;
+ +	struct lock_list *uninitialized_var(target_entry);
+  
+- 	__bfs_backwards(this, (void *)&count, noop_count, &target_entry);
++ 	__bfs_backwards(this, (void *)&count, noop_count, NULL, &target_entry);
+  
+  	return count;
+  }
+@@@ -1868,18 -2075,19 +1991,29 @@@ unsigned long lockdep_count_backward_de
+  
+  /*
+   * Check that the dependency graph starting at <src> can lead to
+ - * <target> or not.
+ + * <target> or not. Print an error and return 0 if it does.
+   */
+++<<<<<<< HEAD
+ +static noinline int
+ +check_path(struct lock_class *target, struct lock_list *src_entry,
+++=======
++ static noinline enum bfs_result
++ check_path(struct held_lock *target, struct lock_list *src_entry,
++ 	   bool (*match)(struct lock_list *entry, void *data),
++ 	   bool (*skip)(struct lock_list *entry, void *data),
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  	   struct lock_list **target_entry)
+  {
+ -	enum bfs_result ret;
+ +	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = __bfs_forwards(src_entry, (void *)target, class_equal,
+ +			     target_entry);
+++=======
++ 	ret = __bfs_forwards(src_entry, target, match, skip, target_entry);
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  
+ -	if (unlikely(bfs_error(ret)))
+ +	if (unlikely(ret < 0))
+  		print_bfs_bug(ret);
+  
+  	return ret;
+@@@ -1905,9 -2112,9 +2039,13 @@@ check_noncircular(struct held_lock *src
+  
+  	debug_atomic_inc(nr_cyclic_checks);
+  
+++<<<<<<< HEAD
+ +	ret = check_path(hlock_class(target), &src_entry, &target_entry);
+++=======
++ 	ret = check_path(target, &src_entry, hlock_conflict, NULL, &target_entry);
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  
+ -	if (unlikely(ret == BFS_RMATCH)) {
+ +	if (unlikely(!ret)) {
+  		if (!*trace) {
+  			/*
+  			 * If save_trace fails here, the printing might
+@@@ -1943,13 -2161,10 +2081,17 @@@ check_redundant(struct held_lock *src, 
+  
+  	debug_atomic_inc(nr_redundant_checks);
+  
+++<<<<<<< HEAD
+ +	ret = check_path(hlock_class(target), &src_entry, &target_entry);
+++=======
++ 	ret = check_path(target, &src_entry, hlock_equal, NULL, &target_entry);
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  
+ -	if (ret == BFS_RMATCH)
+ +	if (!ret) {
+  		debug_atomic_inc(nr_redundant);
+ +		ret = 2;
+ +	} else if (ret < 0)
+ +		ret = 0;
+  
+  	return ret;
+  }
+@@@ -2346,11 -2635,10 +2488,16 @@@ static int check_irq_usage(struct task_
+  	 * Step 1: gather all hard/soft IRQs usages backward in an
+  	 * accumulated usage mask.
+  	 */
+ -	bfs_init_rootb(&this, prev);
+ +	this.parent = NULL;
+ +	this.class = hlock_class(prev);
+  
+++<<<<<<< HEAD
+ +	ret = __bfs_backwards(&this, &usage_mask, usage_accumulate, NULL);
+ +	if (ret < 0) {
+++=======
++ 	ret = __bfs_backwards(&this, &usage_mask, usage_accumulate, NULL, NULL);
++ 	if (bfs_error(ret)) {
+++>>>>>>> bc2dd71b2836 (locking/lockdep: Add a skip() function to __bfs())
+  		print_bfs_bug(ret);
+  		return 0;
+  	}
+* Unmerged path kernel/locking/lockdep.c
