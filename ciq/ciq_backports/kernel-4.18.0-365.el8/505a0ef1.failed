@@ -1,0 +1,151 @@
+kasan: stackdepot: move filter_irq_stacks() to stackdepot.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Alexander Potapenko <glider@google.com>
+commit 505a0ef15f96c6c43ec719c9fc1833d98957bb39
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/505a0ef1.failed
+
+filter_irq_stacks() can be used by other tools (e.g.  KMSAN), so it needs
+to be moved to a common location.  lib/stackdepot.c seems a good place, as
+filter_irq_stacks() is usually applied to the output of
+stack_trace_save().
+
+This patch has been previously mailed as part of KMSAN RFC patch series.
+
+[glider@google.co: nds32: linker script: add SOFTIRQENTRY_TEXT\
+  Link: http://lkml.kernel.org/r/20200311121002.241430-1-glider@google.com
+[glider@google.com: add IRQENTRY_TEXT and SOFTIRQENTRY_TEXT to linker script]
+  Link: http://lkml.kernel.org/r/20200311121124.243352-1-glider@google.com
+	Signed-off-by: Alexander Potapenko <glider@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Vegard Nossum <vegard.nossum@oracle.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Marco Elver <elver@google.com>
+	Cc: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+Link: http://lkml.kernel.org/r/20200220141916.55455-3-glider@google.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 505a0ef15f96c6c43ec719c9fc1833d98957bb39)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+diff --cc mm/kasan/common.c
+index ebb081aceddc,2906358e42f0..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -42,29 -41,7 +41,33 @@@
+  #include "kasan.h"
+  #include "../slab.h"
+  
+++<<<<<<< HEAD
+ +static inline int in_irqentry_text(unsigned long ptr)
+ +{
+ +	return (ptr >= (unsigned long)&__irqentry_text_start &&
+ +		ptr < (unsigned long)&__irqentry_text_end) ||
+ +		(ptr >= (unsigned long)&__softirqentry_text_start &&
+ +		 ptr < (unsigned long)&__softirqentry_text_end);
+ +}
+ +
+ +static inline unsigned int filter_irq_stacks(unsigned long *entries,
+ +					     unsigned int nr_entries)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < nr_entries; i++) {
+ +		if (in_irqentry_text(entries[i])) {
+ +			/* Include the irqentry function into the stack. */
+ +			return i + 1;
+ +		}
+ +	}
+ +	return nr_entries;
+ +}
+ +
+ +depot_stack_handle_t kasan_save_stack(gfp_t flags)
+++=======
++ static inline depot_stack_handle_t save_stack(gfp_t flags)
+++>>>>>>> 505a0ef15f96 (kasan: stackdepot: move filter_irq_stacks() to stackdepot.c)
+  {
+  	unsigned long entries[KASAN_STACK_DEPTH];
+  	unsigned int nr_entries;
+diff --git a/arch/ia64/kernel/vmlinux.lds.S b/arch/ia64/kernel/vmlinux.lds.S
+index 0da58cf8e213..6cc9af261fdb 100644
+--- a/arch/ia64/kernel/vmlinux.lds.S
++++ b/arch/ia64/kernel/vmlinux.lds.S
+@@ -51,6 +51,8 @@ SECTIONS {
+ 		CPUIDLE_TEXT
+ 		LOCK_TEXT
+ 		KPROBES_TEXT
++		IRQENTRY_TEXT
++		SOFTIRQENTRY_TEXT
+ 		*(.gnu.linkonce.t*)
+ 	}
+ 
+diff --git a/arch/nds32/kernel/vmlinux.lds.S b/arch/nds32/kernel/vmlinux.lds.S
+index 288313b886ef..7082153b7176 100644
+--- a/arch/nds32/kernel/vmlinux.lds.S
++++ b/arch/nds32/kernel/vmlinux.lds.S
+@@ -35,6 +35,7 @@ SECTIONS
+ 		LOCK_TEXT
+ 		KPROBES_TEXT
+ 		IRQENTRY_TEXT
++		SOFTIRQENTRY_TEXT
+ 		*(.fixup)
+ 	}
+ 
+diff --git a/include/linux/stackdepot.h b/include/linux/stackdepot.h
+index 0805dee1b6b8..edfb927a86c4 100644
+--- a/include/linux/stackdepot.h
++++ b/include/linux/stackdepot.h
+@@ -29,4 +29,6 @@ depot_stack_handle_t stack_depot_save(unsigned long *entries,
+ unsigned int stack_depot_fetch(depot_stack_handle_t handle,
+ 			       unsigned long **entries);
+ 
++unsigned int filter_irq_stacks(unsigned long *entries, unsigned int nr_entries);
++
+ #endif
+diff --git a/lib/stackdepot.c b/lib/stackdepot.c
+index 1bc0078a86f0..acff67ce2213 100644
+--- a/lib/stackdepot.c
++++ b/lib/stackdepot.c
+@@ -29,6 +29,7 @@
+  */
+ 
+ #include <linux/gfp.h>
++#include <linux/interrupt.h>
+ #include <linux/jhash.h>
+ #include <linux/kernel.h>
+ #include <linux/mm.h>
+@@ -325,3 +326,26 @@ depot_stack_handle_t stack_depot_save(unsigned long *entries,
+ 	return retval;
+ }
+ EXPORT_SYMBOL_GPL(stack_depot_save);
++
++static inline int in_irqentry_text(unsigned long ptr)
++{
++	return (ptr >= (unsigned long)&__irqentry_text_start &&
++		ptr < (unsigned long)&__irqentry_text_end) ||
++		(ptr >= (unsigned long)&__softirqentry_text_start &&
++		 ptr < (unsigned long)&__softirqentry_text_end);
++}
++
++unsigned int filter_irq_stacks(unsigned long *entries,
++					     unsigned int nr_entries)
++{
++	unsigned int i;
++
++	for (i = 0; i < nr_entries; i++) {
++		if (in_irqentry_text(entries[i])) {
++			/* Include the irqentry function into the stack. */
++			return i + 1;
++		}
++	}
++	return nr_entries;
++}
++EXPORT_SYMBOL_GPL(filter_irq_stacks);
+* Unmerged path mm/kasan/common.c
