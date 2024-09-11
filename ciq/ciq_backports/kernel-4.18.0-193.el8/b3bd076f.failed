@@ -1,0 +1,335 @@
+net/mlx5: Report devlink health on FW fatal issues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Report devlink health on FW fatal issues (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 95.83%
+commit-author Moshe Shemesh <moshe@mellanox.com>
+commit b3bd076f7501afea2871bb4738ab53498fd32cd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b3bd076f.failed
+
+Report devlink health on FW fatal issues via fw_fatal_reporter. The
+driver recover flow for FW fatal error is now being handled by the
+devlink health.
+
+Having the recovery controlled by devlink health, the user has the
+ability to cancel the auto-recovery for debug session and run it
+manually.
+
+Call mlx5_enter_error_state() before calling devlink_health_report() to
+ensure entering device error state even if auto-recovery is off.
+
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b3bd076f7501afea2871bb4738ab53498fd32cd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/health.c
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+#	include/linux/mlx5/driver.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/health.c
+index fa1691ba661a,2fe6923f7ce0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/health.c
+@@@ -137,54 -299,34 +137,57 @@@ static void mlx5_handle_bad_state(struc
+  	mlx5_disable_device(dev);
+  }
+  
+ +static void health_recover(struct work_struct *work)
+ +{
+ +	struct mlx5_core_health *health;
+ +	struct delayed_work *dwork;
+ +	struct mlx5_core_dev *dev;
+ +	struct mlx5_priv *priv;
+ +	u8 nic_state;
+ +
+ +	dwork = container_of(work, struct delayed_work, work);
+ +	health = container_of(dwork, struct mlx5_core_health, recover_work);
+ +	priv = container_of(health, struct mlx5_priv, health);
+ +	dev = container_of(priv, struct mlx5_core_dev, priv);
+ +
+ +	nic_state = mlx5_get_nic_state(dev);
+ +	if (nic_state == MLX5_NIC_IFC_INVALID) {
+ +		dev_err(&dev->pdev->dev, "health recovery flow aborted since the nic state is invalid\n");
+ +		return;
+ +	}
+ +
+ +	dev_err(&dev->pdev->dev, "starting health recovery flow\n");
+ +	mlx5_recover_device(dev);
+ +}
+ +
+++<<<<<<< HEAD
+  /* How much time to wait until health resetting the driver (in msecs) */
+ -#define MLX5_RECOVERY_WAIT_MSECS 60000
+ -static int mlx5_health_try_recover(struct mlx5_core_dev *dev)
+ +#define MLX5_RECOVERY_DELAY_MSECS 60000
+ +static void health_care(struct work_struct *work)
+  {
+ -	unsigned long end;
+ +	unsigned long recover_delay = msecs_to_jiffies(MLX5_RECOVERY_DELAY_MSECS);
+ +	struct mlx5_core_health *health;
+ +	struct mlx5_core_dev *dev;
+ +	struct mlx5_priv *priv;
+ +	unsigned long flags;
+  
+ +	health = container_of(work, struct mlx5_core_health, work);
+ +	priv = container_of(health, struct mlx5_priv, health);
+ +	dev = container_of(priv, struct mlx5_core_dev, priv);
+  	mlx5_core_warn(dev, "handling bad device here\n");
+  	mlx5_handle_bad_state(dev);
+ -	end = jiffies + msecs_to_jiffies(MLX5_RECOVERY_WAIT_MSECS);
+ -	while (sensor_pci_not_working(dev)) {
+ -		if (time_after(jiffies, end)) {
+ -			mlx5_core_err(dev,
+ -				      "health recovery flow aborted, PCI reads still not working\n");
+ -			return -EIO;
+ -		}
+ -		msleep(100);
+ -	}
+  
+ -	mlx5_core_err(dev, "starting health recovery flow\n");
+ -	mlx5_recover_device(dev);
+ -	if (!test_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state) ||
+ -	    check_fatal_sensors(dev)) {
+ -		mlx5_core_err(dev, "health recovery failed\n");
+ -		return -EIO;
+ -	}
+ -	return 0;
+ +	spin_lock_irqsave(&health->wq_lock, flags);
+ +	if (!test_bit(MLX5_DROP_NEW_RECOVERY_WORK, &health->flags))
+ +		schedule_delayed_work(&health->recover_work, recover_delay);
+ +	else
+ +		dev_err(&dev->pdev->dev,
+ +			"new health works are not permitted at this stage\n");
+ +	spin_unlock_irqrestore(&health->wq_lock, flags);
+  }
+  
+++=======
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  static const char *hsynd_str(u8 synd)
+  {
+  	switch (synd) {
+@@@ -262,9 -408,230 +265,101 @@@ mlx5_fw_reporter_diagnose(struct devlin
+  static const struct devlink_health_reporter_ops mlx5_fw_reporter_ops = {
+  		.name = "fw",
+  		.diagnose = mlx5_fw_reporter_diagnose,
+ -		.dump = mlx5_fw_reporter_dump,
+  };
+  
+++<<<<<<< HEAD
+ +static void mlx5_fw_reporter_create(struct mlx5_core_dev *dev)
+++=======
++ static int
++ mlx5_fw_fatal_reporter_recover(struct devlink_health_reporter *reporter,
++ 			       void *priv_ctx)
++ {
++ 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
++ 
++ 	return mlx5_health_try_recover(dev);
++ }
++ 
++ #define MLX5_CR_DUMP_CHUNK_SIZE 256
++ static int
++ mlx5_fw_fatal_reporter_dump(struct devlink_health_reporter *reporter,
++ 			    struct devlink_fmsg *fmsg, void *priv_ctx)
++ {
++ 	struct mlx5_core_dev *dev = devlink_health_reporter_priv(reporter);
++ 	u32 crdump_size = dev->priv.health.crdump_size;
++ 	u32 *cr_data;
++ 	u32 data_size;
++ 	u32 offset;
++ 	int err;
++ 
++ 	if (!mlx5_core_is_pf(dev))
++ 		return -EPERM;
++ 
++ 	cr_data = kvmalloc(crdump_size, GFP_KERNEL);
++ 	if (!cr_data)
++ 		return -ENOMEM;
++ 	err = mlx5_crdump_collect(dev, cr_data);
++ 	if (err)
++ 		return err;
++ 
++ 	if (priv_ctx) {
++ 		struct mlx5_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
++ 
++ 		err = mlx5_fw_reporter_ctx_pairs_put(fmsg, fw_reporter_ctx);
++ 		if (err)
++ 			goto free_data;
++ 	}
++ 
++ 	err = devlink_fmsg_arr_pair_nest_start(fmsg, "crdump_data");
++ 	if (err)
++ 		goto free_data;
++ 	for (offset = 0; offset < crdump_size; offset += data_size) {
++ 		if (crdump_size - offset < MLX5_CR_DUMP_CHUNK_SIZE)
++ 			data_size = crdump_size - offset;
++ 		else
++ 			data_size = MLX5_CR_DUMP_CHUNK_SIZE;
++ 		err = devlink_fmsg_binary_put(fmsg, cr_data, data_size);
++ 		if (err)
++ 			goto free_data;
++ 	}
++ 	err = devlink_fmsg_arr_pair_nest_end(fmsg);
++ 
++ free_data:
++ 	kfree(cr_data);
++ 	return err;
++ }
++ 
++ static void mlx5_fw_fatal_reporter_err_work(struct work_struct *work)
++ {
++ 	struct mlx5_fw_reporter_ctx fw_reporter_ctx;
++ 	struct mlx5_core_health *health;
++ 	struct mlx5_core_dev *dev;
++ 	struct mlx5_priv *priv;
++ 
++ 	health = container_of(work, struct mlx5_core_health, fatal_report_work);
++ 	priv = container_of(health, struct mlx5_priv, health);
++ 	dev = container_of(priv, struct mlx5_core_dev, priv);
++ 
++ 	mlx5_enter_error_state(dev, false);
++ 	if (IS_ERR_OR_NULL(health->fw_fatal_reporter)) {
++ 		if (mlx5_health_try_recover(dev))
++ 			mlx5_core_err(dev, "health recovery failed\n");
++ 		return;
++ 	}
++ 	fw_reporter_ctx.err_synd = health->synd;
++ 	fw_reporter_ctx.miss_counter = health->miss_counter;
++ 	devlink_health_report(health->fw_fatal_reporter,
++ 			      "FW fatal error reported", &fw_reporter_ctx);
++ }
++ 
++ static const struct devlink_health_reporter_ops mlx5_fw_fatal_reporter_ops = {
++ 		.name = "fw_fatal",
++ 		.recover = mlx5_fw_fatal_reporter_recover,
++ 		.dump = mlx5_fw_fatal_reporter_dump,
++ };
++ 
++ #define MLX5_REPORTER_FW_GRACEFUL_PERIOD 1200000
++ static void mlx5_fw_reporters_create(struct mlx5_core_dev *dev)
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  {
+  	struct mlx5_core_health *health = &dev->priv.health;
+  	struct devlink *devlink = priv_to_devlink(dev);
+@@@ -305,10 -682,9 +400,10 @@@ void mlx5_trigger_health_work(struct ml
+  
+  	spin_lock_irqsave(&health->wq_lock, flags);
+  	if (!test_bit(MLX5_DROP_NEW_HEALTH_WORK, &health->flags))
+- 		queue_work(health->wq, &health->work);
++ 		queue_work(health->wq, &health->fatal_report_work);
+  	else
+ -		mlx5_core_err(dev, "new health works are not permitted at this stage\n");
+ +		dev_err(&dev->pdev->dev,
+ +			"new health works are not permitted at this stage\n");
+  	spin_unlock_irqrestore(&health->wq_lock, flags);
+  }
+  
+@@@ -380,21 -766,16 +475,26 @@@ void mlx5_drain_health_wq(struct mlx5_c
+  
+  	spin_lock_irqsave(&health->wq_lock, flags);
+  	set_bit(MLX5_DROP_NEW_HEALTH_WORK, &health->flags);
+ +	set_bit(MLX5_DROP_NEW_RECOVERY_WORK, &health->flags);
+  	spin_unlock_irqrestore(&health->wq_lock, flags);
+++<<<<<<< HEAD
+ +	cancel_delayed_work_sync(&health->recover_work);
+ +	cancel_work_sync(&health->work);
+++=======
++ 	cancel_work_sync(&health->report_work);
++ 	cancel_work_sync(&health->fatal_report_work);
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  }
+  
+ -void mlx5_health_flush(struct mlx5_core_dev *dev)
+ +void mlx5_drain_health_recovery(struct mlx5_core_dev *dev)
+  {
+  	struct mlx5_core_health *health = &dev->priv.health;
+ +	unsigned long flags;
+  
+ -	flush_workqueue(health->wq);
+ +	spin_lock_irqsave(&health->wq_lock, flags);
+ +	set_bit(MLX5_DROP_NEW_RECOVERY_WORK, &health->flags);
+ +	spin_unlock_irqrestore(&health->wq_lock, flags);
+ +	cancel_delayed_work_sync(&dev->priv.health.recover_work);
+  }
+  
+  void mlx5_health_cleanup(struct mlx5_core_dev *dev)
+@@@ -420,12 -803,14 +520,17 @@@ int mlx5_health_init(struct mlx5_core_d
+  	health->wq = create_singlethread_workqueue(name);
+  	kfree(name);
+  	if (!health->wq)
+ -		goto out_err;
+ +		return -ENOMEM;
+  	spin_lock_init(&health->wq_lock);
+++<<<<<<< HEAD
+ +	INIT_WORK(&health->work, health_care);
+ +	INIT_DELAYED_WORK(&health->recover_work, health_recover);
+ +
+ +	mlx5_fw_reporter_create(dev);
+++=======
++ 	INIT_WORK(&health->fatal_report_work, mlx5_fw_fatal_reporter_err_work);
++ 	INIT_WORK(&health->report_work, mlx5_fw_reporter_err_work);
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  
+  	return 0;
+ -
+ -out_err:
+ -	mlx5_fw_reporters_destroy(dev);
+ -	return -ENOMEM;
+  }
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index ea5e5990b832,998eec938d3c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -1388,17 -1357,14 +1388,24 @@@ static pci_ers_result_t mlx5_pci_err_de
+  					      pci_channel_state_t state)
+  {
+  	struct mlx5_core_dev *dev = pci_get_drvdata(pdev);
+ +	struct mlx5_priv *priv = &dev->priv;
+  
+ -	mlx5_core_info(dev, "%s was called\n", __func__);
+ +	dev_info(&pdev->dev, "%s was called\n", __func__);
+  
+  	mlx5_enter_error_state(dev, false);
+++<<<<<<< HEAD
+ +	mlx5_unload_one(dev, priv, false);
+ +	/* In case of kernel call drain the health wq */
+ +	if (state) {
+ +		mlx5_drain_health_wq(dev);
+ +		mlx5_pci_disable_device(dev);
+ +	}
+++=======
++ 	mlx5_error_sw_reset(dev);
++ 	mlx5_unload_one(dev, false);
++ 	mlx5_drain_health_wq(dev);
++ 	mlx5_pci_disable_device(dev);
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  
+  	return state == pci_channel_io_perm_failure ?
+  		PCI_ERS_RESULT_DISCONNECT : PCI_ERS_RESULT_NEED_RESET;
+diff --cc include/linux/mlx5/driver.h
+index a8a8d169f681,25847beabd3f..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -441,9 -442,11 +441,14 @@@ struct mlx5_core_health 
+  	spinlock_t			wq_lock;
+  	struct workqueue_struct	       *wq;
+  	unsigned long			flags;
+++<<<<<<< HEAD
+ +	struct work_struct		work;
+++=======
++ 	struct work_struct		fatal_report_work;
++ 	struct work_struct		report_work;
+++>>>>>>> b3bd076f7501 (net/mlx5: Report devlink health on FW fatal issues)
+  	struct delayed_work		recover_work;
+  	struct devlink_health_reporter *fw_reporter;
+ -	struct devlink_health_reporter *fw_fatal_reporter;
+  };
+  
+  struct mlx5_qp_table {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/health.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+* Unmerged path include/linux/mlx5/driver.h
