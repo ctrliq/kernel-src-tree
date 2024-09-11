@@ -1,0 +1,184 @@
+bpf, cgroup: Return ENOLINK for auto-detached links on update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit 0c047ecbb7bab4c1d2136f5f04bb47a66a9a12b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0c047ecb.failed
+
+Failure to update a bpf_link because it has been auto-detached by a dying
+cgroup currently results in EINVAL error, even though the arguments passed
+to bpf() syscall are not wrong.
+
+bpf_links attaching to netns in this case will return ENOLINK, which
+carries the message that the link is no longer attached to anything.
+
+Change cgroup bpf_links to do the same to keep the uAPI errors consistent.
+
+Fixes: 0c991ebc8c69 ("bpf: Implement bpf_prog replacement for an active bpf_cgroup_link")
+	Suggested-by: Lorenz Bauer <lmb@cloudflare.com>
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200531082846.2117903-6-jakub@cloudflare.com
+(cherry picked from commit 0c047ecbb7bab4c1d2136f5f04bb47a66a9a12b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/cgroup.c
+diff --cc kernel/bpf/cgroup.c
+index 5b8da1ceafe3,fdf7836750a3..000000000000
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@@ -407,8 -503,145 +407,104 @@@ cleanup
+  	return err;
+  }
+  
+ -/* Swap updated BPF program for given link in effective program arrays across
+ - * all descendant cgroups. This function is guaranteed to succeed.
+ - */
+ -static void replace_effective_prog(struct cgroup *cgrp,
+ -				   enum bpf_attach_type type,
+ -				   struct bpf_cgroup_link *link)
+ -{
+ -	struct bpf_prog_array_item *item;
+ -	struct cgroup_subsys_state *css;
+ -	struct bpf_prog_array *progs;
+ -	struct bpf_prog_list *pl;
+ -	struct list_head *head;
+ -	struct cgroup *cg;
+ -	int pos;
+ -
+ -	css_for_each_descendant_pre(css, &cgrp->self) {
+ -		struct cgroup *desc = container_of(css, struct cgroup, self);
+ -
+ -		if (percpu_ref_is_zero(&desc->bpf.refcnt))
+ -			continue;
+ -
+ -		/* find position of link in effective progs array */
+ -		for (pos = 0, cg = desc; cg; cg = cgroup_parent(cg)) {
+ -			if (pos && !(cg->bpf.flags[type] & BPF_F_ALLOW_MULTI))
+ -				continue;
+ -
+ -			head = &cg->bpf.progs[type];
+ -			list_for_each_entry(pl, head, node) {
+ -				if (!prog_list_prog(pl))
+ -					continue;
+ -				if (pl->link == link)
+ -					goto found;
+ -				pos++;
+ -			}
+ -		}
+ -found:
+ -		BUG_ON(!cg);
+ -		progs = rcu_dereference_protected(
+ -				desc->bpf.effective[type],
+ -				lockdep_is_held(&cgroup_mutex));
+ -		item = &progs->items[pos];
+ -		WRITE_ONCE(item->prog, link->link.prog);
+ -	}
+ -}
+ -
+  /**
+++<<<<<<< HEAD
+ + * __cgroup_bpf_detach() - Detach the program from a cgroup, and
+++=======
++  * __cgroup_bpf_replace() - Replace link's program and propagate the change
++  *                          to descendants
++  * @cgrp: The cgroup which descendants to traverse
++  * @link: A link for which to replace BPF program
++  * @type: Type of attach operation
++  *
++  * Must be called with cgroup_mutex held.
++  */
++ static int __cgroup_bpf_replace(struct cgroup *cgrp,
++ 				struct bpf_cgroup_link *link,
++ 				struct bpf_prog *new_prog)
++ {
++ 	struct list_head *progs = &cgrp->bpf.progs[link->type];
++ 	struct bpf_prog *old_prog;
++ 	struct bpf_prog_list *pl;
++ 	bool found = false;
++ 
++ 	if (link->link.prog->type != new_prog->type)
++ 		return -EINVAL;
++ 
++ 	list_for_each_entry(pl, progs, node) {
++ 		if (pl->link == link) {
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 	if (!found)
++ 		return -ENOENT;
++ 
++ 	old_prog = xchg(&link->link.prog, new_prog);
++ 	replace_effective_prog(cgrp, link->type, link);
++ 	bpf_prog_put(old_prog);
++ 	return 0;
++ }
++ 
++ static int cgroup_bpf_replace(struct bpf_link *link, struct bpf_prog *new_prog,
++ 			      struct bpf_prog *old_prog)
++ {
++ 	struct bpf_cgroup_link *cg_link;
++ 	int ret;
++ 
++ 	cg_link = container_of(link, struct bpf_cgroup_link, link);
++ 
++ 	mutex_lock(&cgroup_mutex);
++ 	/* link might have been auto-released by dying cgroup, so fail */
++ 	if (!cg_link->cgroup) {
++ 		ret = -ENOLINK;
++ 		goto out_unlock;
++ 	}
++ 	if (old_prog && link->prog != old_prog) {
++ 		ret = -EPERM;
++ 		goto out_unlock;
++ 	}
++ 	ret = __cgroup_bpf_replace(cg_link->cgroup, cg_link, new_prog);
++ out_unlock:
++ 	mutex_unlock(&cgroup_mutex);
++ 	return ret;
++ }
++ 
++ static struct bpf_prog_list *find_detach_entry(struct list_head *progs,
++ 					       struct bpf_prog *prog,
++ 					       struct bpf_cgroup_link *link,
++ 					       bool allow_multi)
++ {
++ 	struct bpf_prog_list *pl;
++ 
++ 	if (!allow_multi) {
++ 		if (list_empty(progs))
++ 			/* report error when trying to detach and nothing is attached */
++ 			return ERR_PTR(-ENOENT);
++ 
++ 		/* to maintain backward compatibility NONE and OVERRIDE cgroups
++ 		 * allow detaching with invalid FD (prog==NULL) in legacy mode
++ 		 */
++ 		return list_first_entry(progs, typeof(*pl), node);
++ 	}
++ 
++ 	if (!prog && !link)
++ 		/* to detach MULTI prog the user has to specify valid FD
++ 		 * of the program or link to be detached
++ 		 */
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	/* find the prog or link and detach it */
++ 	list_for_each_entry(pl, progs, node) {
++ 		if (pl->prog == prog && pl->link == link)
++ 			return pl;
++ 	}
++ 	return ERR_PTR(-ENOENT);
++ }
++ 
++ /**
++  * __cgroup_bpf_detach() - Detach the program or link from a cgroup, and
+++>>>>>>> 0c047ecbb7ba (bpf, cgroup: Return ENOLINK for auto-detached links on update)
+   *                         propagate the change to descendants
+   * @cgrp: The cgroup which descendants to traverse
+   * @prog: A program to detach or NULL
+* Unmerged path kernel/bpf/cgroup.c
