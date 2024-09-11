@@ -1,0 +1,123 @@
+drm/amd/display: Fix potential integer wraparound resulting in a hang
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Aric Cyr <aric.cyr@amd.com>
+commit 4e5183200d9b66695c754ef214933402056e7b95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4e518320.failed
+
+[Why]
+If VUPDATE_END is before VUPDATE_START the delay calculated can become
+very large, causing a soft hang.
+
+[How]
+Take the absolute value of the difference between START and END.
+
+	Signed-off-by: Aric Cyr <aric.cyr@amd.com>
+	Reviewed-by: Nicholas Kazlauskas <Nicholas.Kazlauskas@amd.com>
+	Acked-by: Qingqing Zhuo <qingqing.zhuo@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+	Cc: stable@vger.kernel.org
+(cherry picked from commit 4e5183200d9b66695c754ef214933402056e7b95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+diff --cc drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+index 2118ea21d7e9,416afb99529d..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
++++ b/drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
+@@@ -1417,7 -1622,86 +1417,90 @@@ static void dcn10_pipe_control_lock
+  		pipe->stream_res.tg->funcs->unlock(pipe->stream_res.tg);
+  
+  	if (dc->debug.sanity_checks)
+++<<<<<<< HEAD
+ +		dcn10_verify_allow_pstate_change_high(dc);
+++=======
++ 		hws->funcs.verify_allow_pstate_change_high(dc);
++ }
++ 
++ /**
++  * delay_cursor_until_vupdate() - Delay cursor update if too close to VUPDATE.
++  *
++  * Software keepout workaround to prevent cursor update locking from stalling
++  * out cursor updates indefinitely or from old values from being retained in
++  * the case where the viewport changes in the same frame as the cursor.
++  *
++  * The idea is to calculate the remaining time from VPOS to VUPDATE. If it's
++  * too close to VUPDATE, then stall out until VUPDATE finishes.
++  *
++  * TODO: Optimize cursor programming to be once per frame before VUPDATE
++  *       to avoid the need for this workaround.
++  */
++ static void delay_cursor_until_vupdate(struct dc *dc, struct pipe_ctx *pipe_ctx)
++ {
++ 	struct dc_stream_state *stream = pipe_ctx->stream;
++ 	struct crtc_position position;
++ 	uint32_t vupdate_start, vupdate_end;
++ 	unsigned int lines_to_vupdate, us_to_vupdate, vpos;
++ 	unsigned int us_per_line, us_vupdate;
++ 
++ 	if (!dc->hwss.calc_vupdate_position || !dc->hwss.get_position)
++ 		return;
++ 
++ 	if (!pipe_ctx->stream_res.stream_enc || !pipe_ctx->stream_res.tg)
++ 		return;
++ 
++ 	dc->hwss.calc_vupdate_position(dc, pipe_ctx, &vupdate_start,
++ 				       &vupdate_end);
++ 
++ 	dc->hwss.get_position(&pipe_ctx, 1, &position);
++ 	vpos = position.vertical_count;
++ 
++ 	/* Avoid wraparound calculation issues */
++ 	vupdate_start += stream->timing.v_total;
++ 	vupdate_end += stream->timing.v_total;
++ 	vpos += stream->timing.v_total;
++ 
++ 	if (vpos <= vupdate_start) {
++ 		/* VPOS is in VACTIVE or back porch. */
++ 		lines_to_vupdate = vupdate_start - vpos;
++ 	} else if (vpos > vupdate_end) {
++ 		/* VPOS is in the front porch. */
++ 		return;
++ 	} else {
++ 		/* VPOS is in VUPDATE. */
++ 		lines_to_vupdate = 0;
++ 	}
++ 
++ 	/* Calculate time until VUPDATE in microseconds. */
++ 	us_per_line =
++ 		stream->timing.h_total * 10000u / stream->timing.pix_clk_100hz;
++ 	us_to_vupdate = lines_to_vupdate * us_per_line;
++ 
++ 	/* 70 us is a conservative estimate of cursor update time*/
++ 	if (us_to_vupdate > 70)
++ 		return;
++ 
++ 	/* Stall out until the cursor update completes. */
++ 	if (vupdate_end < vupdate_start)
++ 		vupdate_end += stream->timing.v_total;
++ 	us_vupdate = (vupdate_end - vupdate_start + 1) * us_per_line;
++ 	udelay(us_to_vupdate + us_vupdate);
++ }
++ 
++ void dcn10_cursor_lock(struct dc *dc, struct pipe_ctx *pipe, bool lock)
++ {
++ 	/* cursor lock is per MPCC tree, so only need to lock one pipe per stream */
++ 	if (!pipe || pipe->top_pipe)
++ 		return;
++ 
++ 	/* Prevent cursor lock from stalling out cursor updates. */
++ 	if (lock)
++ 		delay_cursor_until_vupdate(dc, pipe);
++ 
++ 	dc->res_pool->mpc->funcs->cursor_lock(dc->res_pool->mpc,
++ 			pipe->stream_res.opp->inst, lock);
+++>>>>>>> 4e5183200d9b (drm/amd/display: Fix potential integer wraparound resulting in a hang)
+  }
+  
+  static bool wait_for_reset_trigger_to_occur(
+* Unmerged path drivers/gpu/drm/amd/display/dc/dcn10/dcn10_hw_sequencer.c
