@@ -1,0 +1,168 @@
+cgroup: Fix memory leak when parsing multiple source parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Qinglang Miao <miaoqinglang@huawei.com>
+commit 2d18e54dd8662442ef5898c6bdadeaf90b3cebbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2d18e54d.failed
+
+A memory leak is found in cgroup1_parse_param() when multiple source
+parameters overwrite fc->source in the fs_context struct without free.
+
+unreferenced object 0xffff888100d930e0 (size 16):
+  comm "mount", pid 520, jiffies 4303326831 (age 152.783s)
+  hex dump (first 16 bytes):
+    74 65 73 74 6c 65 61 6b 00 00 00 00 00 00 00 00  testleak........
+  backtrace:
+    [<000000003e5023ec>] kmemdup_nul+0x2d/0xa0
+    [<00000000377dbdaa>] vfs_parse_fs_string+0xc0/0x150
+    [<00000000cb2b4882>] generic_parse_monolithic+0x15a/0x1d0
+    [<000000000f750198>] path_mount+0xee1/0x1820
+    [<0000000004756de2>] do_mount+0xea/0x100
+    [<0000000094cafb0a>] __x64_sys_mount+0x14b/0x1f0
+
+Fix this bug by permitting a single source parameter and rejecting with
+an error all subsequent ones.
+
+Fixes: 8d2451f4994f ("cgroup1: switch to option-by-option parsing")
+	Reported-by: Hulk Robot <hulkci@huawei.com>
+	Signed-off-by: Qinglang Miao <miaoqinglang@huawei.com>
+	Reviewed-by: Zefan Li <lizefan@huawei.com>
+	Signed-off-by: Tejun Heo <tj@kernel.org>
+(cherry picked from commit 2d18e54dd8662442ef5898c6bdadeaf90b3cebbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/cgroup/cgroup-v1.c
+diff --cc kernel/cgroup/cgroup-v1.c
+index dd94e2a4c22e,32596fdbcd5b..000000000000
+--- a/kernel/cgroup/cgroup-v1.c
++++ b/kernel/cgroup/cgroup-v1.c
+@@@ -873,13 -875,117 +873,99 @@@ static int cgroup1_show_options(struct 
+  	return 0;
+  }
+  
+ -enum cgroup1_param {
+ -	Opt_all,
+ -	Opt_clone_children,
+ -	Opt_cpuset_v2_mode,
+ -	Opt_name,
+ -	Opt_none,
+ -	Opt_noprefix,
+ -	Opt_release_agent,
+ -	Opt_xattr,
+ -};
+ -
+ -const struct fs_parameter_spec cgroup1_fs_parameters[] = {
+ -	fsparam_flag  ("all",		Opt_all),
+ -	fsparam_flag  ("clone_children", Opt_clone_children),
+ -	fsparam_flag  ("cpuset_v2_mode", Opt_cpuset_v2_mode),
+ -	fsparam_string("name",		Opt_name),
+ -	fsparam_flag  ("none",		Opt_none),
+ -	fsparam_flag  ("noprefix",	Opt_noprefix),
+ -	fsparam_string("release_agent",	Opt_release_agent),
+ -	fsparam_flag  ("xattr",		Opt_xattr),
+ -	{}
+ -};
+ -
+ -int cgroup1_parse_param(struct fs_context *fc, struct fs_parameter *param)
+ +static int parse_cgroupfs_options(char *data, struct cgroup_sb_opts *opts)
+  {
+++<<<<<<< HEAD
+ +	char *token, *o = data;
+ +	bool all_ss = false, one_ss = false;
+++=======
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
++ 	struct cgroup_subsys *ss;
++ 	struct fs_parse_result result;
++ 	int opt, i;
++ 
++ 	opt = fs_parse(fc, cgroup1_fs_parameters, param, &result);
++ 	if (opt == -ENOPARAM) {
++ 		if (strcmp(param->key, "source") == 0) {
++ 			if (fc->source)
++ 				return invalf(fc, "Multiple sources not supported");
++ 			fc->source = param->string;
++ 			param->string = NULL;
++ 			return 0;
++ 		}
++ 		for_each_subsys(ss, i) {
++ 			if (strcmp(param->key, ss->legacy_name))
++ 				continue;
++ 			ctx->subsys_mask |= (1 << i);
++ 			return 0;
++ 		}
++ 		return invalfc(fc, "Unknown subsys name '%s'", param->key);
++ 	}
++ 	if (opt < 0)
++ 		return opt;
++ 
++ 	switch (opt) {
++ 	case Opt_none:
++ 		/* Explicitly have no subsystems */
++ 		ctx->none = true;
++ 		break;
++ 	case Opt_all:
++ 		ctx->all_ss = true;
++ 		break;
++ 	case Opt_noprefix:
++ 		ctx->flags |= CGRP_ROOT_NOPREFIX;
++ 		break;
++ 	case Opt_clone_children:
++ 		ctx->cpuset_clone_children = true;
++ 		break;
++ 	case Opt_cpuset_v2_mode:
++ 		ctx->flags |= CGRP_ROOT_CPUSET_V2_MODE;
++ 		break;
++ 	case Opt_xattr:
++ 		ctx->flags |= CGRP_ROOT_XATTR;
++ 		break;
++ 	case Opt_release_agent:
++ 		/* Specifying two release agents is forbidden */
++ 		if (ctx->release_agent)
++ 			return invalfc(fc, "release_agent respecified");
++ 		ctx->release_agent = param->string;
++ 		param->string = NULL;
++ 		break;
++ 	case Opt_name:
++ 		/* blocked by boot param? */
++ 		if (cgroup_no_v1_named)
++ 			return -ENOENT;
++ 		/* Can't specify an empty name */
++ 		if (!param->size)
++ 			return invalfc(fc, "Empty name");
++ 		if (param->size > MAX_CGROUP_ROOT_NAMELEN - 1)
++ 			return invalfc(fc, "Name too long");
++ 		/* Must match [\w.-]+ */
++ 		for (i = 0; i < param->size; i++) {
++ 			char c = param->string[i];
++ 			if (isalnum(c))
++ 				continue;
++ 			if ((c == '.') || (c == '-') || (c == '_'))
++ 				continue;
++ 			return invalfc(fc, "Invalid name");
++ 		}
++ 		/* Specifying two names is forbidden */
++ 		if (ctx->name)
++ 			return invalfc(fc, "name respecified");
++ 		ctx->name = param->string;
++ 		param->string = NULL;
++ 		break;
++ 	}
++ 	return 0;
++ }
++ 
++ static int check_cgroupfs_options(struct fs_context *fc)
++ {
++ 	struct cgroup_fs_context *ctx = cgroup_fc2context(fc);
+++>>>>>>> 2d18e54dd866 (cgroup: Fix memory leak when parsing multiple source parameters)
+  	u16 mask = U16_MAX;
+ -	u16 enabled = 0;
+  	struct cgroup_subsys *ss;
+ +	int nr_opts = 0;
+  	int i;
+  
+  #ifdef CONFIG_CPUSETS
+* Unmerged path kernel/cgroup/cgroup-v1.c
