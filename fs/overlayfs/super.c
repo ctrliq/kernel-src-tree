@@ -322,12 +322,6 @@ static const char *ovl_redirect_mode_def(void)
 	return ovl_redirect_dir_def ? "on" : "off";
 }
 
-enum {
-	OVL_XINO_OFF,
-	OVL_XINO_AUTO,
-	OVL_XINO_ON,
-};
-
 static const char * const ovl_xino_str[] = {
 	"off",
 	"auto",
@@ -1483,8 +1477,8 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 
 	/*
 	 * When all layers on same fs, overlay can use real inode numbers.
-	 * With mount option "xino=on", mounter declares that there are enough
-	 * free high bits in underlying fs to hold the unique fsid.
+	 * With mount option "xino=<on|auto>", mounter declares that there are
+	 * enough free high bits in underlying fs to hold the unique fsid.
 	 * If overlayfs does encounter underlying inodes using the high xino
 	 * bits reserved for fsid, it emits a warning and uses the original
 	 * inode number or a non persistent inode number allocated from a
@@ -1496,7 +1490,7 @@ static int ovl_get_layers(struct super_block *sb, struct ovl_fs *ofs,
 		ofs->xino_mode = 0;
 	} else if (ofs->config.xino == OVL_XINO_OFF) {
 		ofs->xino_mode = -1;
-	} else if (ofs->config.xino == OVL_XINO_ON && ofs->xino_mode < 0) {
+	} else if (ofs->xino_mode < 0) {
 		/*
 		 * This is a roundup of number of bits needed for encoding
 		 * fsid, where fsid 0 is reserved for upper fs (even with
