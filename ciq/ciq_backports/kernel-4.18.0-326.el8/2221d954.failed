@@ -1,0 +1,372 @@
+net/mlx5e: Refactor neigh update infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Vlad Buslov <vladbu@nvidia.com>
+commit 2221d954d984d07dc66a4fd0f11a8b2705816a6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/2221d954.failed
+
+Following patches in series implements route update which can cause encap
+entries to migrate between routing devices. Consecutively, their parent
+nhe's need to be also transferable between devices instead of having neigh
+device as a part of their immutable key. Move neigh device from struct
+mlx5_neigh to struct mlx5e_neigh_hash_entry and check that nhe and neigh
+devices are the same in workqueue neigh update handler.
+
+Save neigh net_device that can change dynamically in dedicated nhe->dev
+field. With FIB event handler that is implemented in following patches
+changing nhe->dev, NETEVENT_DELAY_PROBE_TIME_UPDATE handler can
+concurrently access the nhe entry when traversing neigh list under rcu read
+lock. Processing stale values in that handler doesn't change the handler
+logic, so just wrap all accesses to the dev pointer in {WRITE|READ}_ONCE()
+helpers.
+
+	Signed-off-by: Vlad Buslov <vladbu@nvidia.com>
+	Signed-off-by: Dmytro Linkin <dlinkin@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 2221d954d984d07dc66a4fd0f11a8b2705816a6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+index b2322fbe0687,0ad22f5709a1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+@@@ -188,13 -212,12 +188,18 @@@ int mlx5e_tc_tun_create_header_ipv4(str
+  {
+  	int max_encap_size = MLX5_CAP_ESW(priv->mdev, max_encap_header_size);
+  	const struct ip_tunnel_key *tun_key = &e->tun_info->key;
+++<<<<<<< HEAD
+ +	struct net_device *out_dev, *route_dev;
+ +	struct flowi4 fl4 = {};
+ +	struct neighbour *n = NULL;
+++=======
++ 	struct mlx5e_neigh m_neigh = {};
++ 	TC_TUN_ROUTE_ATTR_INIT(attr);
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  	int ipv4_encap_size;
+  	char *encap_header;
+ +	u8 nud_state, ttl;
+  	struct iphdr *ip;
+ -	u8 nud_state;
+  	int err;
+  
+  	/* add the IP fields */
+@@@ -226,21 -248,17 +231,32 @@@
+  		goto release_neigh;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* used by mlx5e_detach_encap to lookup a neigh hash table
+ +	 * entry in the neigh hash table when a user deletes a rule
+ +	 */
+ +	e->m_neigh.dev = n->dev;
+ +	e->m_neigh.family = n->ops->family;
+ +	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
+ +	e->out_dev = out_dev;
+ +	e->route_dev_ifindex = route_dev->ifindex;
+++=======
++ 	m_neigh.family = attr.n->ops->family;
++ 	memcpy(&m_neigh.dst_ip, attr.n->primary_key, attr.n->tbl->key_len);
++ 	e->out_dev = attr.out_dev;
++ 	e->route_dev_ifindex = attr.route_dev->ifindex;
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  
+  	/* It's important to add the neigh to the hash table before checking
+  	 * the neigh validity state. So if we'll get a notification, in case the
+  	 * neigh changes it's validity state, we would find the relevant neigh
+  	 * in the hash.
+  	 */
+++<<<<<<< HEAD
+ +	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
+++=======
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(attr.out_dev), e, &m_neigh, attr.n->dev);
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  	if (err)
+  		goto free_encap;
+  
+@@@ -353,23 -372,20 +369,28 @@@ int mlx5e_tc_tun_create_header_ipv6(str
+  {
+  	int max_encap_size = MLX5_CAP_ESW(priv->mdev, max_encap_header_size);
+  	const struct ip_tunnel_key *tun_key = &e->tun_info->key;
+++<<<<<<< HEAD
+ +	struct net_device *out_dev, *route_dev;
+ +	struct flowi6 fl6 = {};
+++=======
++ 	struct mlx5e_neigh m_neigh = {};
++ 	TC_TUN_ROUTE_ATTR_INIT(attr);
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  	struct ipv6hdr *ip6h;
+ +	struct neighbour *n = NULL;
+  	int ipv6_encap_size;
+  	char *encap_header;
+ -	u8 nud_state;
+ +	u8 nud_state, ttl;
+  	int err;
+  
+ -	attr.ttl = tun_key->ttl;
+ -	attr.fl.fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tun_key->tos), tun_key->label);
+ -	attr.fl.fl6.daddr = tun_key->u.ipv6.dst;
+ -	attr.fl.fl6.saddr = tun_key->u.ipv6.src;
+ +	ttl = tun_key->ttl;
+  
+ -	err = mlx5e_route_lookup_ipv6_get(priv, mirred_dev, &attr);
+ +	fl6.flowlabel = ip6_make_flowinfo(RT_TOS(tun_key->tos), tun_key->label);
+ +	fl6.daddr = tun_key->u.ipv6.dst;
+ +	fl6.saddr = tun_key->u.ipv6.src;
+ +
+ +	err = mlx5e_route_lookup_ipv6_get(priv, mirred_dev, &out_dev, &route_dev,
+ +					  &fl6, &n, &ttl);
+  	if (err)
+  		return err;
+  
+@@@ -391,21 -407,17 +412,32 @@@
+  		goto release_neigh;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* used by mlx5e_detach_encap to lookup a neigh hash table
+ +	 * entry in the neigh hash table when a user deletes a rule
+ +	 */
+ +	e->m_neigh.dev = n->dev;
+ +	e->m_neigh.family = n->ops->family;
+ +	memcpy(&e->m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
+ +	e->out_dev = out_dev;
+ +	e->route_dev_ifindex = route_dev->ifindex;
+++=======
++ 	m_neigh.family = attr.n->ops->family;
++ 	memcpy(&m_neigh.dst_ip, attr.n->primary_key, attr.n->tbl->key_len);
++ 	e->out_dev = attr.out_dev;
++ 	e->route_dev_ifindex = attr.route_dev->ifindex;
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  
+  	/* It's importent to add the neigh to the hash table before checking
+  	 * the neigh validity state. So if we'll get a notification, in case the
+  	 * neigh changes it's validity state, we would find the relevant neigh
+  	 * in the hash.
+  	 */
+++<<<<<<< HEAD
+ +	err = mlx5e_rep_encap_entry_attach(netdev_priv(out_dev), e);
+++=======
++ 	err = mlx5e_rep_encap_entry_attach(netdev_priv(attr.out_dev), e, &m_neigh, attr.n->dev);
+++>>>>>>> 2221d954d984 (net/mlx5e: Refactor neigh update infrastructure)
+  	if (err)
+  		goto free_encap;
+  
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/diag/en_rep_tracepoint.h b/drivers/net/ethernet/mellanox/mlx5/core/diag/en_rep_tracepoint.h
+index 1177860a2ee4..f15718db5d0e 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/en_rep_tracepoint.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/en_rep_tracepoint.h
+@@ -15,7 +15,7 @@ TRACE_EVENT(mlx5e_rep_neigh_update,
+ 	    TP_PROTO(const struct mlx5e_neigh_hash_entry *nhe, const u8 *ha,
+ 		     bool neigh_connected),
+ 	    TP_ARGS(nhe, ha, neigh_connected),
+-	    TP_STRUCT__entry(__string(devname, nhe->m_neigh.dev->name)
++	    TP_STRUCT__entry(__string(devname, nhe->neigh_dev->name)
+ 			     __array(u8, ha, ETH_ALEN)
+ 			     __array(u8, v4, 4)
+ 			     __array(u8, v6, 16)
+@@ -25,7 +25,7 @@ TRACE_EVENT(mlx5e_rep_neigh_update,
+ 			struct in6_addr *pin6;
+ 			__be32 *p32;
+ 
+-			__assign_str(devname, mn->dev->name);
++			__assign_str(devname, nhe->neigh_dev->name);
+ 			__entry->neigh_connected = neigh_connected;
+ 			memcpy(__entry->ha, ha, ETH_ALEN);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/diag/en_tc_tracepoint.h b/drivers/net/ethernet/mellanox/mlx5/core/diag/en_tc_tracepoint.h
+index d4e6cfaaade3..ac52ef37f38a 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/diag/en_tc_tracepoint.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/diag/en_tc_tracepoint.h
+@@ -77,7 +77,7 @@ TRACE_EVENT(mlx5e_stats_flower,
+ TRACE_EVENT(mlx5e_tc_update_neigh_used_value,
+ 	    TP_PROTO(const struct mlx5e_neigh_hash_entry *nhe, bool neigh_used),
+ 	    TP_ARGS(nhe, neigh_used),
+-	    TP_STRUCT__entry(__string(devname, nhe->m_neigh.dev->name)
++	    TP_STRUCT__entry(__string(devname, nhe->neigh_dev->name)
+ 			     __array(u8, v4, 4)
+ 			     __array(u8, v6, 16)
+ 			     __field(bool, neigh_used)
+@@ -86,7 +86,7 @@ TRACE_EVENT(mlx5e_tc_update_neigh_used_value,
+ 			struct in6_addr *pin6;
+ 			__be32 *p32;
+ 
+-			__assign_str(devname, mn->dev->name);
++			__assign_str(devname, nhe->neigh_dev->name);
+ 			__entry->neigh_used = neigh_used;
+ 
+ 			p32 = (__be32 *)__entry->v4;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.c b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.c
+index 616ee585a985..be0ee03de721 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.c
+@@ -129,10 +129,10 @@ static void mlx5e_rep_neigh_update(struct work_struct *work)
+ 							     work);
+ 	struct mlx5e_neigh_hash_entry *nhe = update_work->nhe;
+ 	struct neighbour *n = update_work->n;
++	bool neigh_connected, same_dev;
+ 	struct mlx5e_encap_entry *e;
+ 	unsigned char ha[ETH_ALEN];
+ 	struct mlx5e_priv *priv;
+-	bool neigh_connected;
+ 	u8 nud_state, dead;
+ 
+ 	rtnl_lock();
+@@ -146,12 +146,16 @@ static void mlx5e_rep_neigh_update(struct work_struct *work)
+ 	memcpy(ha, n->ha, ETH_ALEN);
+ 	nud_state = n->nud_state;
+ 	dead = n->dead;
++	same_dev = READ_ONCE(nhe->neigh_dev) == n->dev;
+ 	read_unlock_bh(&n->lock);
+ 
+ 	neigh_connected = (nud_state & NUD_VALID) && !dead;
+ 
+ 	trace_mlx5e_rep_neigh_update(nhe, ha, neigh_connected);
+ 
++	if (!same_dev)
++		goto out;
++
+ 	list_for_each_entry(e, &nhe->encap_list, encap_list) {
+ 		if (!mlx5e_encap_take(e))
+ 			continue;
+@@ -160,6 +164,7 @@ static void mlx5e_rep_neigh_update(struct work_struct *work)
+ 		mlx5e_rep_update_flows(priv, e, neigh_connected, ha);
+ 		mlx5e_encap_put(priv, e);
+ 	}
++out:
+ 	rtnl_unlock();
+ 	mlx5e_release_neigh_update_work(update_work);
+ }
+@@ -175,7 +180,6 @@ static struct neigh_update_work *mlx5e_alloc_neigh_update_work(struct mlx5e_priv
+ 	if (WARN_ON(!update_work))
+ 		return NULL;
+ 
+-	m_neigh.dev = n->dev;
+ 	m_neigh.family = n->ops->family;
+ 	memcpy(&m_neigh.dst_ip, n->primary_key, n->tbl->key_len);
+ 
+@@ -246,7 +250,7 @@ static int mlx5e_rep_netevent_event(struct notifier_block *nb,
+ 		rcu_read_lock();
+ 		list_for_each_entry_rcu(nhe, &neigh_update->neigh_list,
+ 					neigh_list) {
+-			if (p->dev == nhe->m_neigh.dev) {
++			if (p->dev == READ_ONCE(nhe->neigh_dev)) {
+ 				found = true;
+ 				break;
+ 			}
+@@ -369,7 +373,8 @@ mlx5e_rep_neigh_entry_lookup(struct mlx5e_priv *priv,
+ }
+ 
+ int mlx5e_rep_neigh_entry_create(struct mlx5e_priv *priv,
+-				 struct mlx5e_encap_entry *e,
++				 struct mlx5e_neigh *m_neigh,
++				 struct net_device *neigh_dev,
+ 				 struct mlx5e_neigh_hash_entry **nhe)
+ {
+ 	int err;
+@@ -379,10 +384,11 @@ int mlx5e_rep_neigh_entry_create(struct mlx5e_priv *priv,
+ 		return -ENOMEM;
+ 
+ 	(*nhe)->priv = priv;
+-	memcpy(&(*nhe)->m_neigh, &e->m_neigh, sizeof(e->m_neigh));
++	memcpy(&(*nhe)->m_neigh, m_neigh, sizeof(*m_neigh));
+ 	spin_lock_init(&(*nhe)->encap_list_lock);
+ 	INIT_LIST_HEAD(&(*nhe)->encap_list);
+ 	refcount_set(&(*nhe)->refcnt, 1);
++	WRITE_ONCE((*nhe)->neigh_dev, neigh_dev);
+ 
+ 	err = mlx5e_rep_neigh_entry_insert(priv, *nhe);
+ 	if (err)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.h b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.h
+index 32b239189c95..6fe0ab970943 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/neigh.h
+@@ -16,7 +16,8 @@ struct mlx5e_neigh_hash_entry *
+ mlx5e_rep_neigh_entry_lookup(struct mlx5e_priv *priv,
+ 			     struct mlx5e_neigh *m_neigh);
+ int mlx5e_rep_neigh_entry_create(struct mlx5e_priv *priv,
+-				 struct mlx5e_encap_entry *e,
++				 struct mlx5e_neigh *m_neigh,
++				 struct net_device *neigh_dev,
+ 				 struct mlx5e_neigh_hash_entry **nhe);
+ void mlx5e_rep_neigh_entry_release(struct mlx5e_neigh_hash_entry *nhe);
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+index 0664a4e01bff..d24f43513f41 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.c
+@@ -26,7 +26,9 @@ struct mlx5e_rep_indr_block_priv {
+ };
+ 
+ int mlx5e_rep_encap_entry_attach(struct mlx5e_priv *priv,
+-				 struct mlx5e_encap_entry *e)
++				 struct mlx5e_encap_entry *e,
++				 struct mlx5e_neigh *m_neigh,
++				 struct net_device *neigh_dev)
+ {
+ 	struct mlx5e_rep_priv *rpriv = priv->ppriv;
+ 	struct mlx5_rep_uplink_priv *uplink_priv = &rpriv->uplink_priv;
+@@ -39,9 +41,9 @@ int mlx5e_rep_encap_entry_attach(struct mlx5e_priv *priv,
+ 		return err;
+ 
+ 	mutex_lock(&rpriv->neigh_update.encap_lock);
+-	nhe = mlx5e_rep_neigh_entry_lookup(priv, &e->m_neigh);
++	nhe = mlx5e_rep_neigh_entry_lookup(priv, m_neigh);
+ 	if (!nhe) {
+-		err = mlx5e_rep_neigh_entry_create(priv, e, &nhe);
++		err = mlx5e_rep_neigh_entry_create(priv, m_neigh, neigh_dev, &nhe);
+ 		if (err) {
+ 			mutex_unlock(&rpriv->neigh_update.encap_lock);
+ 			mlx5_tun_entropy_refcount_dec(tun_entropy,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.h b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.h
+index fdf9702c2d7d..d0661578467b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/rep/tc.h
+@@ -27,7 +27,9 @@ void mlx5e_rep_update_flows(struct mlx5e_priv *priv,
+ 			    unsigned char ha[ETH_ALEN]);
+ 
+ int mlx5e_rep_encap_entry_attach(struct mlx5e_priv *priv,
+-				 struct mlx5e_encap_entry *e);
++				 struct mlx5e_encap_entry *e,
++				 struct mlx5e_neigh *m_neigh,
++				 struct net_device *neigh_dev);
+ void mlx5e_rep_encap_entry_detach(struct mlx5e_priv *priv,
+ 				  struct mlx5e_encap_entry *e);
+ 
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/tc_tun_encap.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+index 988195ab1c54..1fe244952422 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rep.h
+@@ -110,7 +110,6 @@ struct mlx5e_rep_priv *mlx5e_rep_to_rep_priv(struct mlx5_eswitch_rep *rep)
+ }
+ 
+ struct mlx5e_neigh {
+-	struct net_device *dev;
+ 	union {
+ 		__be32	v4;
+ 		struct in6_addr v6;
+@@ -122,6 +121,7 @@ struct mlx5e_neigh_hash_entry {
+ 	struct rhash_head rhash_node;
+ 	struct mlx5e_neigh m_neigh;
+ 	struct mlx5e_priv *priv;
++	struct net_device *neigh_dev;
+ 
+ 	/* Save the neigh hash entry in a list on the representor in
+ 	 * addition to the hash table. In order to iterate easily over the
+@@ -175,7 +175,6 @@ struct mlx5e_encap_entry {
+ 	struct mlx5e_neigh_hash_entry *nhe;
+ 	/* neigh hash entry list of encaps sharing the same neigh */
+ 	struct list_head encap_list;
+-	struct mlx5e_neigh m_neigh;
+ 	/* a node of the eswitch encap hash table which keeping all the encap
+ 	 * entries
+ 	 */
