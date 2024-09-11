@@ -1,0 +1,695 @@
+net: sched: atomically check-allocate action
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: atomically check-allocate action (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 93.98%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 0190c1d452a91c38a3462abdd81752be1b9006a8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0190c1d4.failed
+
+Implement function that atomically checks if action exists and either takes
+reference to it, or allocates idr slot for action index to prevent
+concurrent allocations of actions with same index. Use EBUSY error pointer
+to indicate that idr slot is reserved.
+
+Implement cleanup helper function that removes temporary error pointer from
+idr. (in case of error between idr allocation and insertion of newly
+created action to specified index)
+
+Refactor all action init functions to insert new action to idr using this
+API.
+
+	Reviewed-by: Marcelo Ricardo Leitner <marcelo.leitner@gmail.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0190c1d452a91c38a3462abdd81752be1b9006a8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+#	net/sched/act_bpf.c
+#	net/sched/act_csum.c
+#	net/sched/act_gact.c
+#	net/sched/act_nat.c
+diff --cc net/sched/act_api.c
+index d445f144d9dc,9511502e1cbb..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -278,9 -303,20 +278,19 @@@ static struct tc_action *tcf_idr_lookup
+  
+  	spin_lock(&idrinfo->lock);
+  	p = idr_find(&idrinfo->action_idr, index);
+++<<<<<<< HEAD
+++=======
++ 	if (IS_ERR(p)) {
++ 		p = NULL;
++ 	} else if (p) {
++ 		refcount_inc(&p->tcfa_refcnt);
++ 		if (bind)
++ 			atomic_inc(&p->tcfa_bindcnt);
++ 	}
+++>>>>>>> 0190c1d452a9 (net: sched: atomically check-allocate action)
+  	spin_unlock(&idrinfo->lock);
+  
+ -	if (p) {
+ -		*a = p;
+ -		return true;
+ -	}
+ -	return false;
+ +	return p;
+  }
+  
+  int tcf_idr_search(struct tc_action_net *tn, struct tc_action **a, u32 index)
+diff --cc net/sched/act_bpf.c
+index 7b65769d95ee,06f743d8ed41..000000000000
+--- a/net/sched/act_bpf.c
++++ b/net/sched/act_bpf.c
+@@@ -311,9 -314,12 +314,15 @@@ static int tcf_bpf_init(struct net *net
+  		if (bind)
+  			return 0;
+  
+ -		if (!replace) {
+ -			tcf_idr_release(*act, bind);
+ +		tcf_idr_release(*act, bind);
+ +		if (!replace)
+  			return -EEXIST;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 	} else {
++ 		return ret;
+++>>>>>>> 0190c1d452a9 (net: sched: atomically check-allocate action)
+  	}
+  
+  	is_bpf = tb[TCA_ACT_BPF_OPS_LEN] && tb[TCA_ACT_BPF_OPS];
+diff --cc net/sched/act_csum.c
+index 08b34187b0cb,bd232d3bd022..000000000000
+--- a/net/sched/act_csum.c
++++ b/net/sched/act_csum.c
+@@@ -67,18 -67,24 +67,27 @@@ static int tcf_csum_init(struct net *ne
+  		return -EINVAL;
+  	parm = nla_data(tb[TCA_CSUM_PARMS]);
+  
+- 	if (!tcf_idr_check(tn, parm->index, a, bind)) {
++ 	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++ 	if (!err) {
+  		ret = tcf_idr_create(tn, parm->index, est, a,
+  				     &act_csum_ops, bind, true);
+- 		if (ret)
++ 		if (ret) {
++ 			tcf_idr_cleanup(tn, parm->index);
+  			return ret;
++ 		}
+  		ret = ACT_P_CREATED;
+- 	} else {
++ 	} else if (err > 0) {
+  		if (bind)/* dont override defaults */
+  			return 0;
+ -		if (!ovr) {
+ -			tcf_idr_release(*a, bind);
+ +		tcf_idr_release(*a, bind);
+ +		if (!ovr)
+  			return -EEXIST;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 	} else {
++ 		return err;
+++>>>>>>> 0190c1d452a9 (net: sched: atomically check-allocate action)
+  	}
+  
+  	p = to_tcf_csum(*a);
+diff --cc net/sched/act_gact.c
+index ea5ed2de5910,661b72b9147d..000000000000
+--- a/net/sched/act_gact.c
++++ b/net/sched/act_gact.c
+@@@ -91,18 -91,24 +91,27 @@@ static int tcf_gact_init(struct net *ne
+  	}
+  #endif
+  
+- 	if (!tcf_idr_check(tn, parm->index, a, bind)) {
++ 	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++ 	if (!err) {
+  		ret = tcf_idr_create(tn, parm->index, est, a,
+  				     &act_gact_ops, bind, true);
+- 		if (ret)
++ 		if (ret) {
++ 			tcf_idr_cleanup(tn, parm->index);
+  			return ret;
++ 		}
+  		ret = ACT_P_CREATED;
+- 	} else {
++ 	} else if (err > 0) {
+  		if (bind)/* dont override defaults */
+  			return 0;
+ -		if (!ovr) {
+ -			tcf_idr_release(*a, bind);
+ +		tcf_idr_release(*a, bind);
+ +		if (!ovr)
+  			return -EEXIST;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 	} else {
++ 		return err;
+++>>>>>>> 0190c1d452a9 (net: sched: atomically check-allocate action)
+  	}
+  
+  	gact = to_gact(*a);
+diff --cc net/sched/act_nat.c
+index ee3dbb8e20b5,4dd9188a72fd..000000000000
+--- a/net/sched/act_nat.c
++++ b/net/sched/act_nat.c
+@@@ -57,18 -57,24 +57,27 @@@ static int tcf_nat_init(struct net *net
+  		return -EINVAL;
+  	parm = nla_data(tb[TCA_NAT_PARMS]);
+  
+- 	if (!tcf_idr_check(tn, parm->index, a, bind)) {
++ 	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++ 	if (!err) {
+  		ret = tcf_idr_create(tn, parm->index, est, a,
+  				     &act_nat_ops, bind, false);
+- 		if (ret)
++ 		if (ret) {
++ 			tcf_idr_cleanup(tn, parm->index);
+  			return ret;
++ 		}
+  		ret = ACT_P_CREATED;
+- 	} else {
++ 	} else if (err > 0) {
+  		if (bind)
+  			return 0;
+ -		if (!ovr) {
+ -			tcf_idr_release(*a, bind);
+ +		tcf_idr_release(*a, bind);
+ +		if (!ovr)
+  			return -EEXIST;
+++<<<<<<< HEAD
+++=======
++ 		}
++ 	} else {
++ 		return err;
+++>>>>>>> 0190c1d452a9 (net: sched: atomically check-allocate action)
+  	}
+  	p = to_tcf_nat(*a);
+  
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index eb868a54cfdd..29a215977c4c 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -153,6 +153,9 @@ int tcf_idr_create(struct tc_action_net *tn, u32 index, struct nlattr *est,
+ 		   int bind, bool cpustats);
+ void tcf_idr_insert(struct tc_action_net *tn, struct tc_action *a);
+ 
++void tcf_idr_cleanup(struct tc_action_net *tn, u32 index);
++int tcf_idr_check_alloc(struct tc_action_net *tn, u32 *index,
++			struct tc_action **a, int bind);
+ int tcf_idr_delete_index(struct tc_action_net *tn, u32 index);
+ int __tcf_idr_release(struct tc_action *a, bool bind, bool strict);
+ 
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/act_bpf.c
+diff --git a/net/sched/act_connmark.c b/net/sched/act_connmark.c
+index c86c24794b2e..74ae7ba8539a 100644
+--- a/net/sched/act_connmark.c
++++ b/net/sched/act_connmark.c
+@@ -118,11 +118,14 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 
+ 	parm = nla_data(tb[TCA_CONNMARK_PARMS]);
+ 
+-	if (!tcf_idr_check(tn, parm->index, a, bind)) {
++	ret = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (!ret) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_connmark_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 
+ 		ci = to_connmark(*a);
+ 		ci->tcf_action = parm->action;
+@@ -131,7 +134,7 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 
+ 		tcf_idr_insert(tn, *a);
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (ret > 0) {
+ 		ci = to_connmark(*a);
+ 		if (bind)
+ 			return 0;
+@@ -141,6 +144,7 @@ static int tcf_connmark_init(struct net *net, struct nlattr *nla,
+ 		/* replacing action and zone */
+ 		ci->tcf_action = parm->action;
+ 		ci->zone = parm->zone;
++		ret = 0;
+ 	}
+ 
+ 	return ret;
+* Unmerged path net/sched/act_csum.c
+* Unmerged path net/sched/act_gact.c
+diff --git a/net/sched/act_ife.c b/net/sched/act_ife.c
+index 2aab42c549af..efb9e88f5e71 100644
+--- a/net/sched/act_ife.c
++++ b/net/sched/act_ife.c
+@@ -484,7 +484,10 @@ static int tcf_ife_init(struct net *net, struct nlattr *nla,
+ 	if (!p)
+ 		return -ENOMEM;
+ 
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind) {
+ 		kfree(p);
+ 		return 0;
+@@ -494,6 +497,7 @@ static int tcf_ife_init(struct net *net, struct nlattr *nla,
+ 		ret = tcf_idr_create(tn, parm->index, est, a, &act_ife_ops,
+ 				     bind, true);
+ 		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			kfree(p);
+ 			return ret;
+ 		}
+diff --git a/net/sched/act_ipt.c b/net/sched/act_ipt.c
+index 7d52deafea56..f19fa27076c0 100644
+--- a/net/sched/act_ipt.c
++++ b/net/sched/act_ipt.c
+@@ -119,13 +119,18 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
+ 	if (tb[TCA_IPT_INDEX] != NULL)
+ 		index = nla_get_u32(tb[TCA_IPT_INDEX]);
+ 
+-	exists = tcf_idr_check(tn, index, a, bind);
++	err = tcf_idr_check_alloc(tn, &index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (tb[TCA_IPT_HOOK] == NULL || tb[TCA_IPT_TARG] == NULL) {
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, index);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -133,14 +138,18 @@ static int __tcf_ipt_init(struct net *net, unsigned int id, struct nlattr *nla,
+ 	if (nla_len(tb[TCA_IPT_TARG]) < td->u.target_size) {
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, index);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, index, est, a, ops, bind,
+ 				     false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, index);
+ 			return ret;
++		}
+ 		ret = ACT_P_CREATED;
+ 	} else {
+ 		if (bind)/* dont override defaults */
+diff --git a/net/sched/act_mirred.c b/net/sched/act_mirred.c
+index 82c6f70d596c..4027b5061804 100644
+--- a/net/sched/act_mirred.c
++++ b/net/sched/act_mirred.c
+@@ -79,7 +79,7 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 	struct tcf_mirred *m;
+ 	struct net_device *dev;
+ 	bool exists = false;
+-	int ret;
++	int ret, err;
+ 
+ 	if (!nla) {
+ 		NL_SET_ERR_MSG_MOD(extack, "Mirred requires attributes to be passed");
+@@ -94,7 +94,10 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 	}
+ 	parm = nla_data(tb[TCA_MIRRED_PARMS]);
+ 
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+@@ -107,6 +110,8 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 	default:
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, parm->index);
+ 		NL_SET_ERR_MSG_MOD(extack, "Unknown mirred option");
+ 		return -EINVAL;
+ 	}
+@@ -115,6 +120,8 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 		if (dev == NULL) {
+ 			if (exists)
+ 				tcf_idr_release(*a, bind);
++			else
++				tcf_idr_cleanup(tn, parm->index);
+ 			return -ENODEV;
+ 		}
+ 		mac_header_xmit = dev_is_mac_header_xmit(dev);
+@@ -124,13 +131,16 @@ static int tcf_mirred_init(struct net *net, struct nlattr *nla,
+ 
+ 	if (!exists) {
+ 		if (!dev) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			NL_SET_ERR_MSG_MOD(extack, "Specified device does not exist");
+ 			return -EINVAL;
+ 		}
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_mirred_ops, bind, true);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 		ret = ACT_P_CREATED;
+ 	} else {
+ 		tcf_idr_release(*a, bind);
+* Unmerged path net/sched/act_nat.c
+diff --git a/net/sched/act_pedit.c b/net/sched/act_pedit.c
+index 7e8d233c0e7d..e42997aa7ed5 100644
+--- a/net/sched/act_pedit.c
++++ b/net/sched/act_pedit.c
+@@ -173,16 +173,20 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
+ 	if (IS_ERR(keys_ex))
+ 		return PTR_ERR(keys_ex);
+ 
+-	if (!tcf_idr_check(tn, parm->index, a, bind)) {
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (!err) {
+ 		if (!parm->nkeys) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			NL_SET_ERR_MSG_MOD(extack, "Pedit requires keys to be passed");
+ 			ret = -EINVAL;
+ 			goto out_free;
+ 		}
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_pedit_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			goto out_free;
++		}
+ 		p = to_pedit(*a);
+ 		keys = kmalloc(ksize, GFP_KERNEL);
+ 		if (!keys) {
+@@ -191,7 +195,7 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
+ 			goto out_free;
+ 		}
+ 		ret = ACT_P_CREATED;
+-	} else {
++	} else if (err > 0) {
+ 		if (bind)
+ 			goto out_free;
+ 		tcf_idr_release(*a, bind);
+@@ -207,6 +211,8 @@ static int tcf_pedit_init(struct net *net, struct nlattr *nla,
+ 				goto out_free;
+ 			}
+ 		}
++	} else {
++		return err;
+ 	}
+ 
+ 	spin_lock_bh(&p->tcf_lock);
+diff --git a/net/sched/act_police.c b/net/sched/act_police.c
+index 5ce7c3afa9b0..26af263cb67f 100644
+--- a/net/sched/act_police.c
++++ b/net/sched/act_police.c
+@@ -101,15 +101,20 @@ static int tcf_act_police_init(struct net *net, struct nlattr *nla,
+ 		return -EINVAL;
+ 
+ 	parm = nla_data(tb[TCA_POLICE_TBF]);
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, NULL, a,
+ 				     &act_police_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 		ret = ACT_P_CREATED;
+ 	} else {
+ 		tcf_idr_release(*a, bind);
+diff --git a/net/sched/act_sample.c b/net/sched/act_sample.c
+index f17d3a84eb7f..873caa33cc98 100644
+--- a/net/sched/act_sample.c
++++ b/net/sched/act_sample.c
+@@ -46,7 +46,7 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 	struct tc_sample *parm;
+ 	struct tcf_sample *s;
+ 	bool exists = false;
+-	int ret;
++	int ret, err;
+ 
+ 	if (!nla)
+ 		return -EINVAL;
+@@ -59,15 +59,20 @@ static int tcf_sample_init(struct net *net, struct nlattr *nla,
+ 
+ 	parm = nla_data(tb[TCA_SAMPLE_PARMS]);
+ 
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_sample_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 		ret = ACT_P_CREATED;
+ 	} else {
+ 		tcf_idr_release(*a, bind);
+diff --git a/net/sched/act_simple.c b/net/sched/act_simple.c
+index 3e22f76567cc..e4e6d20c10f0 100644
+--- a/net/sched/act_simple.c
++++ b/net/sched/act_simple.c
+@@ -100,21 +100,28 @@ static int tcf_simp_init(struct net *net, struct nlattr *nla,
+ 		return -EINVAL;
+ 
+ 	parm = nla_data(tb[TCA_DEF_PARMS]);
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (tb[TCA_DEF_DATA] == NULL) {
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, parm->index);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_simp_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 
+ 		d = to_defact(*a);
+ 		ret = alloc_defdata(d, tb[TCA_DEF_DATA]);
+diff --git a/net/sched/act_skbedit.c b/net/sched/act_skbedit.c
+index c802e1a85239..f5ada887ef71 100644
+--- a/net/sched/act_skbedit.c
++++ b/net/sched/act_skbedit.c
+@@ -152,21 +152,28 @@ static int tcf_skbedit_init(struct net *net, struct nlattr *nla,
+ 
+ 	parm = nla_data(tb[TCA_SKBEDIT_PARMS]);
+ 
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (!flags) {
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, parm->index);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_skbedit_ops, bind, false);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 
+ 		d = to_skbedit(*a);
+ 		ret = ACT_P_CREATED;
+diff --git a/net/sched/act_skbmod.c b/net/sched/act_skbmod.c
+index f58fe4aa104d..9fdc996601a6 100644
+--- a/net/sched/act_skbmod.c
++++ b/net/sched/act_skbmod.c
+@@ -128,21 +128,28 @@ static int tcf_skbmod_init(struct net *net, struct nlattr *nla,
+ 	if (parm->flags & SKBMOD_F_SWAPMAC)
+ 		lflags = SKBMOD_F_SWAPMAC;
+ 
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+ 	if (!lflags) {
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, parm->index);
+ 		return -EINVAL;
+ 	}
+ 
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_skbmod_ops, bind, true);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 
+ 		ret = ACT_P_CREATED;
+ 	} else {
+diff --git a/net/sched/act_tunnel_key.c b/net/sched/act_tunnel_key.c
+index 1670ff5d2af5..27dee3c53ad9 100644
+--- a/net/sched/act_tunnel_key.c
++++ b/net/sched/act_tunnel_key.c
+@@ -240,7 +240,10 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
+ 	}
+ 
+ 	parm = nla_data(tb[TCA_TUNNEL_KEY_PARMS]);
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+@@ -335,7 +338,7 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
+ 				     &act_tunnel_key_ops, bind, true);
+ 		if (ret) {
+ 			NL_SET_ERR_MSG(extack, "Cannot create TC IDR");
+-			return ret;
++			goto err_out;
+ 		}
+ 
+ 		ret = ACT_P_CREATED;
+@@ -377,6 +380,8 @@ static int tunnel_key_init(struct net *net, struct nlattr *nla,
+ err_out:
+ 	if (exists)
+ 		tcf_idr_release(*a, bind);
++	else
++		tcf_idr_cleanup(tn, parm->index);
+ 	return ret;
+ }
+ 
+diff --git a/net/sched/act_vlan.c b/net/sched/act_vlan.c
+index c71fc085e1cd..6074952310f4 100644
+--- a/net/sched/act_vlan.c
++++ b/net/sched/act_vlan.c
+@@ -134,7 +134,10 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	if (!tb[TCA_VLAN_PARMS])
+ 		return -EINVAL;
+ 	parm = nla_data(tb[TCA_VLAN_PARMS]);
+-	exists = tcf_idr_check(tn, parm->index, a, bind);
++	err = tcf_idr_check_alloc(tn, &parm->index, a, bind);
++	if (err < 0)
++		return err;
++	exists = err;
+ 	if (exists && bind)
+ 		return 0;
+ 
+@@ -146,12 +149,16 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 		if (!tb[TCA_VLAN_PUSH_VLAN_ID]) {
+ 			if (exists)
+ 				tcf_idr_release(*a, bind);
++			else
++				tcf_idr_cleanup(tn, parm->index);
+ 			return -EINVAL;
+ 		}
+ 		push_vid = nla_get_u16(tb[TCA_VLAN_PUSH_VLAN_ID]);
+ 		if (push_vid >= VLAN_VID_MASK) {
+ 			if (exists)
+ 				tcf_idr_release(*a, bind);
++			else
++				tcf_idr_cleanup(tn, parm->index);
+ 			return -ERANGE;
+ 		}
+ 
+@@ -164,6 +171,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 			default:
+ 				if (exists)
+ 					tcf_idr_release(*a, bind);
++				else
++					tcf_idr_cleanup(tn, parm->index);
+ 				return -EPROTONOSUPPORT;
+ 			}
+ 		} else {
+@@ -176,6 +185,8 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	default:
+ 		if (exists)
+ 			tcf_idr_release(*a, bind);
++		else
++			tcf_idr_cleanup(tn, parm->index);
+ 		return -EINVAL;
+ 	}
+ 	action = parm->v_action;
+@@ -183,8 +194,10 @@ static int tcf_vlan_init(struct net *net, struct nlattr *nla,
+ 	if (!exists) {
+ 		ret = tcf_idr_create(tn, parm->index, est, a,
+ 				     &act_vlan_ops, bind, true);
+-		if (ret)
++		if (ret) {
++			tcf_idr_cleanup(tn, parm->index);
+ 			return ret;
++		}
+ 
+ 		ret = ACT_P_CREATED;
+ 	} else {
