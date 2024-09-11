@@ -1,0 +1,167 @@
+NFS: Separate tracking of file nlinks cache validity from the mode/uid/gid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit fabf2b341502e894001d70f91309dd6f3785e2dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/fabf2b34.failed
+
+Rename can cause us to revalidate the access cache, so lets track the
+nlinks separately from the mode/uid/gid.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit fabf2b341502e894001d70f91309dd6f3785e2dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/inode.c
+diff --cc fs/nfs/inode.c
+index 8e864cad6b0c,7bf9138330f2..000000000000
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@@ -801,18 -788,30 +801,39 @@@ static void nfs_readdirplus_parent_cach
+  	dput(parent);
+  }
+  
+ -static u32 nfs_get_valid_attrmask(struct inode *inode)
+ +static bool nfs_need_revalidate_inode(struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	if (NFS_I(inode)->cache_validity &
+ +			(NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
+ +		return true;
+ +	if (nfs_attribute_cache_expired(inode))
+ +		return true;
+ +	return false;
+++=======
++ 	unsigned long cache_validity = READ_ONCE(NFS_I(inode)->cache_validity);
++ 	u32 reply_mask = STATX_INO | STATX_TYPE;
++ 
++ 	if (!(cache_validity & NFS_INO_INVALID_ATIME))
++ 		reply_mask |= STATX_ATIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_CTIME))
++ 		reply_mask |= STATX_CTIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_MTIME))
++ 		reply_mask |= STATX_MTIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_SIZE))
++ 		reply_mask |= STATX_SIZE;
++ 	if (!(cache_validity & NFS_INO_INVALID_NLINK))
++ 		reply_mask |= STATX_NLINK;
++ 	if (!(cache_validity & NFS_INO_INVALID_OTHER))
++ 		reply_mask |= STATX_UID | STATX_GID | STATX_MODE;
++ 	if (!(cache_validity & NFS_INO_INVALID_BLOCKS))
++ 		reply_mask |= STATX_BLOCKS;
++ 	return reply_mask;
+++>>>>>>> fabf2b341502 (NFS: Separate tracking of file nlinks cache validity from the mode/uid/gid)
+  }
+  
+ -int nfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
+ -		struct kstat *stat, u32 request_mask, unsigned int query_flags)
+ +int nfs_getattr(const struct path *path, struct kstat *stat,
+ +		u32 request_mask, unsigned int query_flags)
+  {
+  	struct inode *inode = d_inode(path->dentry);
+  	struct nfs_server *server = NFS_SERVER(inode);
+diff --git a/fs/nfs/dir.c b/fs/nfs/dir.c
+index 5ac7490c4e59..6d73d055417f 100644
+--- a/fs/nfs/dir.c
++++ b/fs/nfs/dir.c
+@@ -1710,7 +1710,7 @@ static void nfs_drop_nlink(struct inode *inode)
+ 	NFS_I(inode)->attr_gencount = nfs_inc_attr_generation_counter();
+ 	nfs_set_cache_invalid(
+ 		inode, NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_CTIME |
+-			       NFS_INO_INVALID_OTHER | NFS_INO_REVAL_FORCED);
++			       NFS_INO_INVALID_NLINK | NFS_INO_REVAL_FORCED);
+ 	spin_unlock(&inode->i_lock);
+ }
+ 
+* Unmerged path fs/nfs/inode.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 599edfec3dbe..03a5706a9f11 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1171,14 +1171,14 @@ int nfs4_call_sync(struct rpc_clnt *clnt,
+ static void
+ nfs4_inc_nlink_locked(struct inode *inode)
+ {
+-	nfs_set_cache_invalid(inode, NFS_INO_INVALID_OTHER);
++	nfs_set_cache_invalid(inode, NFS_INO_INVALID_NLINK);
+ 	inc_nlink(inode);
+ }
+ 
+ static void
+ nfs4_dec_nlink_locked(struct inode *inode)
+ {
+-	nfs_set_cache_invalid(inode, NFS_INO_INVALID_OTHER);
++	nfs_set_cache_invalid(inode, NFS_INO_INVALID_NLINK);
+ 	drop_nlink(inode);
+ }
+ 
+@@ -4721,11 +4721,11 @@ static int nfs4_proc_rename_done(struct rpc_task *task, struct inode *old_dir,
+ 			/* Note: If we moved a directory, nlink will change */
+ 			nfs4_update_changeattr(old_dir, &res->old_cinfo,
+ 					res->old_fattr->time_start,
+-					NFS_INO_INVALID_OTHER |
++					NFS_INO_INVALID_NLINK |
+ 					    NFS_INO_INVALID_DATA);
+ 			nfs4_update_changeattr(new_dir, &res->new_cinfo,
+ 					res->new_fattr->time_start,
+-					NFS_INO_INVALID_OTHER |
++					NFS_INO_INVALID_NLINK |
+ 					    NFS_INO_INVALID_DATA);
+ 		} else
+ 			nfs4_update_changeattr(old_dir, &res->old_cinfo,
+@@ -5404,8 +5404,9 @@ static void nfs4_bitmask_set(__u32 bitmask[NFS4_BITMASK_SZ], const __u32 *src,
+ 		bitmask[1] |= FATTR4_WORD1_TIME_ACCESS;
+ 	if (cache_validity & NFS_INO_INVALID_OTHER)
+ 		bitmask[1] |= FATTR4_WORD1_MODE | FATTR4_WORD1_OWNER |
+-				FATTR4_WORD1_OWNER_GROUP |
+-				FATTR4_WORD1_NUMLINKS;
++				FATTR4_WORD1_OWNER_GROUP;
++	if (cache_validity & NFS_INO_INVALID_NLINK)
++		bitmask[1] |= FATTR4_WORD1_NUMLINKS;
+ 	if (label && label->len && cache_validity & NFS_INO_INVALID_LABEL)
+ 		bitmask[2] |= FATTR4_WORD2_SECURITY_LABEL;
+ 	if (cache_validity & NFS_INO_INVALID_CTIME)
+diff --git a/fs/nfs/nfstrace.h b/fs/nfs/nfstrace.h
+index 2f72045b3d3a..aace31509b26 100644
+--- a/fs/nfs/nfstrace.h
++++ b/fs/nfs/nfstrace.h
+@@ -48,6 +48,7 @@ TRACE_DEFINE_ENUM(NFS_INO_INVALID_OTHER);
+ TRACE_DEFINE_ENUM(NFS_INO_DATA_INVAL_DEFER);
+ TRACE_DEFINE_ENUM(NFS_INO_INVALID_BLOCKS);
+ TRACE_DEFINE_ENUM(NFS_INO_INVALID_XATTR);
++TRACE_DEFINE_ENUM(NFS_INO_INVALID_NLINK);
+ 
+ #define nfs_show_cache_validity(v) \
+ 	__print_flags(v, "|", \
+@@ -65,7 +66,8 @@ TRACE_DEFINE_ENUM(NFS_INO_INVALID_XATTR);
+ 			{ NFS_INO_INVALID_OTHER, "INVALID_OTHER" }, \
+ 			{ NFS_INO_DATA_INVAL_DEFER, "DATA_INVAL_DEFER" }, \
+ 			{ NFS_INO_INVALID_BLOCKS, "INVALID_BLOCKS" }, \
+-			{ NFS_INO_INVALID_XATTR, "INVALID_XATTR" })
++			{ NFS_INO_INVALID_XATTR, "INVALID_XATTR" }, \
++			{ NFS_INO_INVALID_NLINK, "INVALID_NLINK" })
+ 
+ TRACE_DEFINE_ENUM(NFS_INO_ADVISE_RDPLUS);
+ TRACE_DEFINE_ENUM(NFS_INO_STALE);
+diff --git a/include/linux/nfs_fs.h b/include/linux/nfs_fs.h
+index 469010ea1e47..ed8368fda99b 100644
+--- a/include/linux/nfs_fs.h
++++ b/include/linux/nfs_fs.h
+@@ -245,11 +245,13 @@ struct nfs4_copy_state {
+ 				BIT(13)		/* Deferred cache invalidation */
+ #define NFS_INO_INVALID_BLOCKS	BIT(14)         /* cached blocks are invalid */
+ #define NFS_INO_INVALID_XATTR	BIT(15)		/* xattrs are invalid */
++#define NFS_INO_INVALID_NLINK	BIT(16)		/* cached nlinks is invalid */
+ 
+ #define NFS_INO_INVALID_ATTR	(NFS_INO_INVALID_CHANGE \
+ 		| NFS_INO_INVALID_CTIME \
+ 		| NFS_INO_INVALID_MTIME \
+ 		| NFS_INO_INVALID_SIZE \
++		| NFS_INO_INVALID_NLINK \
+ 		| NFS_INO_INVALID_OTHER)	/* inode metadata is invalid */
+ 
+ /*
