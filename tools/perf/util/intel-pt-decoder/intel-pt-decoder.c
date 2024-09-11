@@ -135,7 +135,7 @@ struct intel_pt_decoder {
 	uint64_t pos;
 	uint64_t last_ip;
 	uint64_t ip;
-	uint64_t cr3;
+	uint64_t pip_payload;
 	uint64_t timestamp;
 	uint64_t tsc_timestamp;
 	uint64_t ref_timestamp;
@@ -1766,7 +1766,7 @@ static int intel_pt_walk_psbend(struct intel_pt_decoder *decoder)
 			break;
 
 		case INTEL_PT_PIP:
-			decoder->cr3 = decoder->packet.payload & (BIT63 - 1);
+			decoder->pip_payload = decoder->packet.payload;
 			break;
 
 		case INTEL_PT_FUP:
@@ -1893,7 +1893,7 @@ static int intel_pt_walk_fup_tip(struct intel_pt_decoder *decoder)
 			return 0;
 
 		case INTEL_PT_PIP:
-			decoder->cr3 = decoder->packet.payload & (BIT63 - 1);
+			decoder->pip_payload = decoder->packet.payload;
 			break;
 
 		case INTEL_PT_MTC:
@@ -2306,7 +2306,7 @@ next:
 			return err;
 
 		case INTEL_PT_PIP:
-			decoder->cr3 = decoder->packet.payload & (BIT63 - 1);
+			decoder->pip_payload = decoder->packet.payload;
 			break;
 
 		case INTEL_PT_MTC:
@@ -2545,7 +2545,7 @@ static int intel_pt_walk_psb(struct intel_pt_decoder *decoder)
 			break;
 
 		case INTEL_PT_PIP:
-			decoder->cr3 = decoder->packet.payload & (BIT63 - 1);
+			decoder->pip_payload = decoder->packet.payload;
 			break;
 
 		case INTEL_PT_MODE_EXEC:
@@ -2664,7 +2664,7 @@ static int intel_pt_walk_to_ip(struct intel_pt_decoder *decoder)
 			break;
 
 		case INTEL_PT_PIP:
-			decoder->cr3 = decoder->packet.payload & (BIT63 - 1);
+			decoder->pip_payload = decoder->packet.payload;
 			break;
 
 		case INTEL_PT_MODE_EXEC:
@@ -2996,7 +2996,7 @@ const struct intel_pt_state *intel_pt_decode(struct intel_pt_decoder *decoder)
 
 	decoder->state.timestamp = decoder->sample_timestamp;
 	decoder->state.est_timestamp = intel_pt_est_timestamp(decoder);
-	decoder->state.cr3 = decoder->cr3;
+	decoder->state.pip_payload = decoder->pip_payload;
 	decoder->state.tot_insn_cnt = decoder->tot_insn_cnt;
 	decoder->state.tot_cyc_cnt = decoder->sample_tot_cyc_cnt;
 
