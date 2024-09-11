@@ -1,0 +1,192 @@
+netdevsim: take devlink net instead of init_net
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Pirko <jiri@mellanox.com>
+commit 4f174bbcc96c80720722e25f198580a184803c3a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4f174bbc.failed
+
+Follow-up patch is going to allow to reload devlink instance into
+different network namespace, so use devlink_net() helper instead
+of init_net.
+
+	Signed-off-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4f174bbcc96c80720722e25f198580a184803c3a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/netdevsim/fib.c
+diff --cc drivers/net/netdevsim/fib.c
+index 1a251f76d09b,13540dee7364..000000000000
+--- a/drivers/net/netdevsim/fib.c
++++ b/drivers/net/netdevsim/fib.c
+@@@ -199,69 -190,116 +199,102 @@@ static int nsim_fib_event_nb(struct not
+  /* inconsistent dump, trying again */
+  static void nsim_fib_dump_inconsistent(struct notifier_block *nb)
+  {
+ -	struct nsim_fib_data *data = container_of(nb, struct nsim_fib_data,
+ -						  fib_nb);
+ +	struct nsim_fib_data *data;
+ +	struct net *net;
+  
+ -	data->ipv4.fib.num = 0ULL;
+ -	data->ipv4.rules.num = 0ULL;
+ -	data->ipv6.fib.num = 0ULL;
+ -	data->ipv6.rules.num = 0ULL;
+ -}
+ +	rcu_read_lock();
+ +	for_each_net_rcu(net) {
+ +		data = net_generic(net, nsim_fib_net_id);
+  
+ -static u64 nsim_fib_ipv4_resource_occ_get(void *priv)
+ -{
+ -	struct nsim_fib_data *data = priv;
+ +		data->ipv4.fib.num = 0ULL;
+ +		data->ipv4.rules.num = 0ULL;
+  
+ -	return nsim_fib_get_val(data, NSIM_RESOURCE_IPV4_FIB, false);
+ +		data->ipv6.fib.num = 0ULL;
+ +		data->ipv6.rules.num = 0ULL;
+ +	}
+ +	rcu_read_unlock();
+  }
+  
+ -static u64 nsim_fib_ipv4_rules_res_occ_get(void *priv)
+ -{
+ -	struct nsim_fib_data *data = priv;
+ -
+ -	return nsim_fib_get_val(data, NSIM_RESOURCE_IPV4_FIB_RULES, false);
+ -}
+ +static struct notifier_block nsim_fib_nb = {
+ +	.notifier_call = nsim_fib_event_nb,
+ +};
+  
+ -static u64 nsim_fib_ipv6_resource_occ_get(void *priv)
+ +/* Initialize per network namespace state */
+ +static int __net_init nsim_fib_netns_init(struct net *net)
+  {
+ -	struct nsim_fib_data *data = priv;
+ +	struct nsim_fib_data *data = net_generic(net, nsim_fib_net_id);
+  
+ -	return nsim_fib_get_val(data, NSIM_RESOURCE_IPV6_FIB, false);
+ -}
+ +	data->ipv4.fib.max = (u64)-1;
+ +	data->ipv4.rules.max = (u64)-1;
+  
+ -static u64 nsim_fib_ipv6_rules_res_occ_get(void *priv)
+ -{
+ -	struct nsim_fib_data *data = priv;
+ +	data->ipv6.fib.max = (u64)-1;
+ +	data->ipv6.rules.max = (u64)-1;
+  
+ -	return nsim_fib_get_val(data, NSIM_RESOURCE_IPV6_FIB_RULES, false);
+ +	return 0;
+  }
+  
+ -static void nsim_fib_set_max_all(struct nsim_fib_data *data,
+ -				 struct devlink *devlink)
+ +static struct pernet_operations nsim_fib_net_ops = {
+ +	.init = nsim_fib_netns_init,
+ +	.id   = &nsim_fib_net_id,
+ +	.size = sizeof(struct nsim_fib_data),
+ +};
+ +
+ +void nsim_fib_exit(void)
+  {
+ -	enum nsim_resource_id res_ids[] = {
+ -		NSIM_RESOURCE_IPV4_FIB, NSIM_RESOURCE_IPV4_FIB_RULES,
+ -		NSIM_RESOURCE_IPV6_FIB, NSIM_RESOURCE_IPV6_FIB_RULES
+ -	};
+ -	int i;
+ -
+ -	for (i = 0; i < ARRAY_SIZE(res_ids); i++) {
+ -		int err;
+ -		u64 val;
+ -
+ -		err = devlink_resource_size_get(devlink, res_ids[i], &val);
+ -		if (err)
+ -			val = (u64) -1;
+ -		nsim_fib_set_max(data, res_ids[i], val);
+ -	}
+ +	unregister_fib_notifier(&nsim_fib_nb);
+ +	unregister_pernet_subsys(&nsim_fib_net_ops);
+  }
+  
+ -struct nsim_fib_data *nsim_fib_create(struct devlink *devlink,
+ -				      struct netlink_ext_ack *extack)
+ +int nsim_fib_init(void)
+  {
+ -	struct nsim_fib_data *data;
+  	int err;
+  
+++<<<<<<< HEAD
+ +	err = register_pernet_subsys(&nsim_fib_net_ops);
+ +	if (err < 0) {
+ +		pr_err("Failed to register pernet subsystem\n");
+++=======
++ 	data = kzalloc(sizeof(*data), GFP_KERNEL);
++ 	if (!data)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	nsim_fib_set_max_all(data, devlink);
++ 
++ 	data->fib_nb.notifier_call = nsim_fib_event_nb;
++ 	err = register_fib_notifier(devlink_net(devlink), &data->fib_nb,
++ 				    nsim_fib_dump_inconsistent, extack);
++ 	if (err) {
++ 		pr_err("Failed to register fib notifier\n");
+++>>>>>>> 4f174bbcc96c (netdevsim: take devlink net instead of init_net)
+  		goto err_out;
+  	}
+  
+ -	devlink_resource_occ_get_register(devlink,
+ -					  NSIM_RESOURCE_IPV4_FIB,
+ -					  nsim_fib_ipv4_resource_occ_get,
+ -					  data);
+ -	devlink_resource_occ_get_register(devlink,
+ -					  NSIM_RESOURCE_IPV4_FIB_RULES,
+ -					  nsim_fib_ipv4_rules_res_occ_get,
+ -					  data);
+ -	devlink_resource_occ_get_register(devlink,
+ -					  NSIM_RESOURCE_IPV6_FIB,
+ -					  nsim_fib_ipv6_resource_occ_get,
+ -					  data);
+ -	devlink_resource_occ_get_register(devlink,
+ -					  NSIM_RESOURCE_IPV6_FIB_RULES,
+ -					  nsim_fib_ipv6_rules_res_occ_get,
+ -					  data);
+ -	return data;
+ +	err = register_fib_notifier(&nsim_fib_nb, nsim_fib_dump_inconsistent);
+ +	if (err < 0) {
+ +		pr_err("Failed to register fib notifier\n");
+ +		unregister_pernet_subsys(&nsim_fib_net_ops);
+ +		goto err_out;
+ +	}
+  
+  err_out:
+++<<<<<<< HEAD
+ +	return err;
+++=======
++ 	kfree(data);
++ 	return ERR_PTR(err);
++ }
++ 
++ void nsim_fib_destroy(struct devlink *devlink, struct nsim_fib_data *data)
++ {
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    NSIM_RESOURCE_IPV6_FIB_RULES);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    NSIM_RESOURCE_IPV6_FIB);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    NSIM_RESOURCE_IPV4_FIB_RULES);
++ 	devlink_resource_occ_get_unregister(devlink,
++ 					    NSIM_RESOURCE_IPV4_FIB);
++ 	unregister_fib_notifier(devlink_net(devlink), &data->fib_nb);
++ 	kfree(data);
+++>>>>>>> 4f174bbcc96c (netdevsim: take devlink net instead of init_net)
+  }
+* Unmerged path drivers/net/netdevsim/fib.c
