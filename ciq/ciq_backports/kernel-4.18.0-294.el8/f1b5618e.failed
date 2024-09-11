@@ -1,0 +1,267 @@
+vfs: Add a sample program for the new mount API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Howells <dhowells@redhat.com>
+commit f1b5618e013af28b3c78daf424436a79674423c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f1b5618e.failed
+
+Add a sample program to demonstrate fsopen/fsmount/move_mount to mount
+something.
+
+To make it compile on all arches, irrespective of whether or not syscall
+numbers are assigned, define the syscall number to -1 if it isn't to cause
+the kernel to return -ENOSYS.
+
+	Signed-off-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit f1b5618e013af28b3c78daf424436a79674423c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	samples/Kconfig
+#	samples/Makefile
+diff --cc samples/Kconfig
+index bd133efc1a56,30a89425009c..000000000000
+--- a/samples/Kconfig
++++ b/samples/Kconfig
+@@@ -146,10 -147,18 +146,24 @@@ config SAMPLE_VFIO_MDEV_MBOCH
+  	  Specifically it does *not* include any legacy vga stuff.
+  	  Device looks a lot like "qemu -device secondary-vga".
+  
+++<<<<<<< HEAD
+ +config SAMPLE_STATX
+ +	bool "Build example extended-stat using code"
+ +	depends on BROKEN
+++=======
++ config SAMPLE_ANDROID_BINDERFS
++ 	bool "Build Android binderfs example"
++ 	depends on CONFIG_ANDROID_BINDERFS
+  	help
+- 	  Build example userspace program to use the new extended-stat syscall.
++ 	  Builds a sample program to illustrate the use of the Android binderfs
++ 	  filesystem.
++ 
++ config SAMPLE_VFS
++ 	bool "Build example programs that use new VFS system calls"
+++>>>>>>> f1b5618e013a (vfs: Add a sample program for the new mount API)
++ 	help
++ 	  Build example userspace programs that use new VFS system calls such
++ 	  as mount API and statx().  Note that this is restricted to the x86
++ 	  arch whilst it accesses system calls that aren't yet in all arches.
+  
+  endif # SAMPLES
+diff --cc samples/Makefile
+index bd601c038b86,95d71ffd62d5..000000000000
+--- a/samples/Makefile
++++ b/samples/Makefile
+@@@ -3,4 -3,4 +3,8 @@@
+  obj-$(CONFIG_SAMPLES)	+= kobject/ kprobes/ trace_events/ livepatch/ \
+  			   hw_breakpoint/ kfifo/ kdb/ hidraw/ rpmsg/ seccomp/ \
+  			   configfs/ connector/ v4l/ trace_printk/ \
+++<<<<<<< HEAD
+ +			   vfio-mdev/ statx/ qmi/
+++=======
++ 			   vfio-mdev/ vfs/ qmi/ binderfs/
+++>>>>>>> f1b5618e013a (vfs: Add a sample program for the new mount API)
+* Unmerged path samples/Kconfig
+* Unmerged path samples/Makefile
+diff --git a/samples/statx/Makefile b/samples/vfs/Makefile
+similarity index 55%
+rename from samples/statx/Makefile
+rename to samples/vfs/Makefile
+index 59df7c25a9d1..4ac9690fb3c4 100644
+--- a/samples/statx/Makefile
++++ b/samples/vfs/Makefile
+@@ -1,7 +1,10 @@
+ # List of programs to build
+-hostprogs-$(CONFIG_SAMPLE_STATX) := test-statx
++hostprogs-$(CONFIG_SAMPLE_VFS) := \
++	test-fsmount \
++	test-statx
+ 
+ # Tell kbuild to always build the programs
+ always := $(hostprogs-y)
+ 
++HOSTCFLAGS_test-fsmount.o += -I$(objtree)/usr/include
+ HOSTCFLAGS_test-statx.o += -I$(objtree)/usr/include
+diff --git a/samples/vfs/test-fsmount.c b/samples/vfs/test-fsmount.c
+new file mode 100644
+index 000000000000..266d72b3dce4
+--- /dev/null
++++ b/samples/vfs/test-fsmount.c
+@@ -0,0 +1,133 @@
++/* fd-based mount test.
++ *
++ * Copyright (C) 2017 Red Hat, Inc. All Rights Reserved.
++ * Written by David Howells (dhowells@redhat.com)
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public Licence
++ * as published by the Free Software Foundation; either version
++ * 2 of the Licence, or (at your option) any later version.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <sys/prctl.h>
++#include <sys/wait.h>
++#include <linux/mount.h>
++#include <linux/unistd.h>
++
++#define E(x) do { if ((x) == -1) { perror(#x); exit(1); } } while(0)
++
++static void check_messages(int fd)
++{
++	char buf[4096];
++	int err, n;
++
++	err = errno;
++
++	for (;;) {
++		n = read(fd, buf, sizeof(buf));
++		if (n < 0)
++			break;
++		n -= 2;
++
++		switch (buf[0]) {
++		case 'e':
++			fprintf(stderr, "Error: %*.*s\n", n, n, buf + 2);
++			break;
++		case 'w':
++			fprintf(stderr, "Warning: %*.*s\n", n, n, buf + 2);
++			break;
++		case 'i':
++			fprintf(stderr, "Info: %*.*s\n", n, n, buf + 2);
++			break;
++		}
++	}
++
++	errno = err;
++}
++
++static __attribute__((noreturn))
++void mount_error(int fd, const char *s)
++{
++	check_messages(fd);
++	fprintf(stderr, "%s: %m\n", s);
++	exit(1);
++}
++
++/* Hope -1 isn't a syscall */
++#ifndef __NR_fsopen
++#define __NR_fsopen -1
++#endif
++#ifndef __NR_fsmount
++#define __NR_fsmount -1
++#endif
++#ifndef __NR_fsconfig
++#define __NR_fsconfig -1
++#endif
++#ifndef __NR_move_mount
++#define __NR_move_mount -1
++#endif
++
++
++static inline int fsopen(const char *fs_name, unsigned int flags)
++{
++	return syscall(__NR_fsopen, fs_name, flags);
++}
++
++static inline int fsmount(int fsfd, unsigned int flags, unsigned int ms_flags)
++{
++	return syscall(__NR_fsmount, fsfd, flags, ms_flags);
++}
++
++static inline int fsconfig(int fsfd, unsigned int cmd,
++			   const char *key, const void *val, int aux)
++{
++	return syscall(__NR_fsconfig, fsfd, cmd, key, val, aux);
++}
++
++static inline int move_mount(int from_dfd, const char *from_pathname,
++			     int to_dfd, const char *to_pathname,
++			     unsigned int flags)
++{
++	return syscall(__NR_move_mount,
++		       from_dfd, from_pathname,
++		       to_dfd, to_pathname, flags);
++}
++
++#define E_fsconfig(fd, cmd, key, val, aux)				\
++	do {								\
++		if (fsconfig(fd, cmd, key, val, aux) == -1)		\
++			mount_error(fd, key ?: "create");		\
++	} while (0)
++
++int main(int argc, char *argv[])
++{
++	int fsfd, mfd;
++
++	/* Mount a publically available AFS filesystem */
++	fsfd = fsopen("afs", 0);
++	if (fsfd == -1) {
++		perror("fsopen");
++		exit(1);
++	}
++
++	E_fsconfig(fsfd, FSCONFIG_SET_STRING, "source", "#grand.central.org:root.cell.", 0);
++	E_fsconfig(fsfd, FSCONFIG_CMD_CREATE, NULL, NULL, 0);
++
++	mfd = fsmount(fsfd, 0, MOUNT_ATTR_RDONLY);
++	if (mfd < 0)
++		mount_error(fsfd, "fsmount");
++	E(close(fsfd));
++
++	if (move_mount(mfd, "", AT_FDCWD, "/mnt", MOVE_MOUNT_F_EMPTY_PATH) < 0) {
++		perror("move_mount");
++		exit(1);
++	}
++
++	E(close(mfd));
++	exit(0);
++}
+diff --git a/samples/statx/test-statx.c b/samples/vfs/test-statx.c
+similarity index 96%
+rename from samples/statx/test-statx.c
+rename to samples/vfs/test-statx.c
+index d4d77b09412c..e91f918e84c4 100644
+--- a/samples/statx/test-statx.c
++++ b/samples/vfs/test-statx.c
+@@ -25,13 +25,21 @@
+ #include <sys/types.h>
+ #include <linux/stat.h>
+ #include <linux/fcntl.h>
++#define statx foo
++#define statx_timestamp foo_timestamp
+ #include <sys/stat.h>
++#undef statx
++#undef statx_timestamp
+ 
+ #define AT_STATX_SYNC_TYPE	0x6000
+ #define AT_STATX_SYNC_AS_STAT	0x0000
+ #define AT_STATX_FORCE_SYNC	0x2000
+ #define AT_STATX_DONT_SYNC	0x4000
+ 
++#ifndef __NR_statx
++#define __NR_statx -1
++#endif
++
+ static __attribute__((unused))
+ ssize_t statx(int dfd, const char *filename, unsigned flags,
+ 	      unsigned int mask, struct statx *buffer)
+@@ -157,7 +165,8 @@ static void dump_statx(struct statx *stx)
+ 			"?dai?c??"	/*  7- 0	0x00000000-000000ff */
+ 			;
+ 
+-		printf("Attributes: %016llx (", stx->stx_attributes);
++		printf("Attributes: %016llx (",
++		       (unsigned long long)stx->stx_attributes);
+ 		for (byte = 64 - 8; byte >= 0; byte -= 8) {
+ 			bits = stx->stx_attributes >> byte;
+ 			mbits = stx->stx_attributes_mask >> byte;
