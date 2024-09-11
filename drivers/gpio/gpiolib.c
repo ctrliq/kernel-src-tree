@@ -4339,9 +4339,7 @@ struct gpio_desc *fwnode_get_named_gpiod(struct fwnode_handle *fwnode,
 			return desc;
 
 		acpi_gpio_update_gpiod_flags(&dflags, &info);
-
-		if (info.polarity == GPIO_ACTIVE_LOW)
-			lflags |= GPIO_ACTIVE_LOW;
+		acpi_gpio_update_gpiod_lookup_flags(&lflags, &info);
 	}
 
 	/* Currently only ACPI takes this path */
