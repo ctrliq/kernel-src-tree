@@ -1,0 +1,268 @@
+bpf: Add initial poke descriptor table for jit images
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit a66886fe6c24ebeeb6dc10fbd9b75158029eacf7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a66886fe.failed
+
+Add initial poke table data structures and management to the BPF
+prog that can later be used by JITs. Also add an instance of poke
+specific data for tail call maps; plan for later work is to extend
+this also for BPF static keys.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/1db285ec2ea4207ee0455b3f8e191a4fc58b9ade.1574452833.git.daniel@iogearbox.net
+(cherry picked from commit a66886fe6c24ebeeb6dc10fbd9b75158029eacf7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 8c8f4e236fdc,312983bf7faa..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -389,21 -390,149 +389,142 @@@ struct bpf_prog_stats 
+  	struct u64_stats_sync syncp;
+  } __aligned(2 * sizeof(u64));
+  
+++<<<<<<< HEAD
+++=======
++ struct btf_func_model {
++ 	u8 ret_size;
++ 	u8 nr_args;
++ 	u8 arg_size[MAX_BPF_FUNC_ARGS];
++ };
++ 
++ /* Restore arguments before returning from trampoline to let original function
++  * continue executing. This flag is used for fentry progs when there are no
++  * fexit progs.
++  */
++ #define BPF_TRAMP_F_RESTORE_REGS	BIT(0)
++ /* Call original function after fentry progs, but before fexit progs.
++  * Makes sense for fentry/fexit, normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_CALL_ORIG		BIT(1)
++ /* Skip current frame and return to parent.  Makes sense for fentry/fexit
++  * programs only. Should not be used with normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_SKIP_FRAME		BIT(2)
++ 
++ /* Different use cases for BPF trampoline:
++  * 1. replace nop at the function entry (kprobe equivalent)
++  *    flags = BPF_TRAMP_F_RESTORE_REGS
++  *    fentry = a set of programs to run before returning from trampoline
++  *
++  * 2. replace nop at the function entry (kprobe + kretprobe equivalent)
++  *    flags = BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_SKIP_FRAME
++  *    orig_call = fentry_ip + MCOUNT_INSN_SIZE
++  *    fentry = a set of program to run before calling original function
++  *    fexit = a set of program to run after original function
++  *
++  * 3. replace direct call instruction anywhere in the function body
++  *    or assign a function pointer for indirect call (like tcp_congestion_ops->cong_avoid)
++  *    With flags = 0
++  *      fentry = a set of programs to run before returning from trampoline
++  *    With flags = BPF_TRAMP_F_CALL_ORIG
++  *      orig_call = original callback addr or direct function addr
++  *      fentry = a set of program to run before calling original function
++  *      fexit = a set of program to run after original function
++  */
++ int arch_prepare_bpf_trampoline(void *image, struct btf_func_model *m, u32 flags,
++ 				struct bpf_prog **fentry_progs, int fentry_cnt,
++ 				struct bpf_prog **fexit_progs, int fexit_cnt,
++ 				void *orig_call);
++ /* these two functions are called from generated trampoline */
++ u64 notrace __bpf_prog_enter(void);
++ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
++ 
++ enum bpf_tramp_prog_type {
++ 	BPF_TRAMP_FENTRY,
++ 	BPF_TRAMP_FEXIT,
++ 	BPF_TRAMP_MAX
++ };
++ 
++ struct bpf_trampoline {
++ 	/* hlist for trampoline_table */
++ 	struct hlist_node hlist;
++ 	/* serializes access to fields of this trampoline */
++ 	struct mutex mutex;
++ 	refcount_t refcnt;
++ 	u64 key;
++ 	struct {
++ 		struct btf_func_model model;
++ 		void *addr;
++ 	} func;
++ 	/* list of BPF programs using this trampoline */
++ 	struct hlist_head progs_hlist[BPF_TRAMP_MAX];
++ 	/* Number of attached programs. A counter per kind. */
++ 	int progs_cnt[BPF_TRAMP_MAX];
++ 	/* Executable image of trampoline */
++ 	void *image;
++ 	u64 selector;
++ };
++ #ifdef CONFIG_BPF_JIT
++ struct bpf_trampoline *bpf_trampoline_lookup(u64 key);
++ int bpf_trampoline_link_prog(struct bpf_prog *prog);
++ int bpf_trampoline_unlink_prog(struct bpf_prog *prog);
++ void bpf_trampoline_put(struct bpf_trampoline *tr);
++ #else
++ static inline struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
++ {
++ 	return NULL;
++ }
++ static inline int bpf_trampoline_link_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
++ #endif
++ 
++ struct bpf_func_info_aux {
++ 	bool unreliable;
++ };
++ 
++ enum bpf_jit_poke_reason {
++ 	BPF_POKE_REASON_TAIL_CALL,
++ };
++ 
++ /* Descriptor of pokes pointing /into/ the JITed image. */
++ struct bpf_jit_poke_descriptor {
++ 	void *ip;
++ 	union {
++ 		struct {
++ 			struct bpf_map *map;
++ 			u32 key;
++ 		} tail_call;
++ 	};
++ 	bool ip_stable;
++ 	u8 adj_off;
++ 	u16 reason;
++ };
++ 
+++>>>>>>> a66886fe6c24 (bpf: Add initial poke descriptor table for jit images)
+  struct bpf_prog_aux {
+ -	atomic64_t refcnt;
+ +	atomic_t refcnt;
+  	u32 used_map_cnt;
+  	u32 max_ctx_offset;
+ -	u32 max_pkt_offset;
+ -	u32 max_tp_access;
+ +	/* not protected by KABI, safe to extend in the middle */
+ +	RH_KABI_BROKEN_INSERT(u32 max_pkt_offset)
+ +	RH_KABI_BROKEN_INSERT(u32 max_tp_access)
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+ -	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
+ -	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
+ -	struct bpf_prog *linked_prog;
+ -	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+ +	RH_KABI_BROKEN_INSERT(u32 func_idx) /* 0 for non-func prog, the index in func array for func prog */
+ +	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
+  	bool offload_requested;
+ -	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+ -	bool func_proto_unreliable;
+ -	enum bpf_tramp_prog_type trampoline_prog_type;
+ -	struct bpf_trampoline *trampoline;
+ -	struct hlist_node tramp_hlist;
+ -	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ -	const struct btf_type *attach_func_proto;
+ -	/* function name for valid attach_btf_id */
+ -	const char *attach_func_name;
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
++ 	struct bpf_jit_poke_descriptor *poke_tab;
++ 	u32 size_poke_tab;
+  	struct latch_tree_node ksym_tnode;
+  	struct list_head ksym_lnode;
+  	const struct bpf_prog_ops *ops;
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 5578dfca0c65..8b865174198b 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -958,6 +958,9 @@ void *bpf_jit_alloc_exec(unsigned long size);
+ void bpf_jit_free_exec(void *addr);
+ void bpf_jit_free(struct bpf_prog *fp);
+ 
++int bpf_jit_add_poke_descriptor(struct bpf_prog *prog,
++				struct bpf_jit_poke_descriptor *poke);
++
+ int bpf_jit_get_func_addr(const struct bpf_prog *prog,
+ 			  const struct bpf_insn *insn, bool extra_pass,
+ 			  u64 *func_addr, bool *func_addr_fixed);
+@@ -1061,6 +1064,13 @@ static inline bool bpf_prog_ebpf_jited(const struct bpf_prog *fp)
+ 	return false;
+ }
+ 
++static inline int
++bpf_jit_add_poke_descriptor(struct bpf_prog *prog,
++			    struct bpf_jit_poke_descriptor *poke)
++{
++	return -ENOTSUPP;
++}
++
+ static inline void bpf_jit_free(struct bpf_prog *fp)
+ {
+ 	bpf_prog_unlock_free(fp);
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index e8ab7b5844e9..0a7d957cad71 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -260,6 +260,7 @@ void __bpf_prog_free(struct bpf_prog *fp)
+ {
+ 	if (fp->aux) {
+ 		free_percpu(fp->aux->stats);
++		kfree(fp->aux->poke_tab);
+ 		kfree(fp->aux);
+ 	}
+ 	vfree(fp);
+@@ -762,6 +763,39 @@ int bpf_get_kallsym(unsigned int symnum, unsigned long *value, char *type,
+ 	return ret;
+ }
+ 
++int bpf_jit_add_poke_descriptor(struct bpf_prog *prog,
++				struct bpf_jit_poke_descriptor *poke)
++{
++	struct bpf_jit_poke_descriptor *tab = prog->aux->poke_tab;
++	static const u32 poke_tab_max = 1024;
++	u32 slot = prog->aux->size_poke_tab;
++	u32 size = slot + 1;
++
++	if (size > poke_tab_max)
++		return -ENOSPC;
++	if (poke->ip || poke->ip_stable || poke->adj_off)
++		return -EINVAL;
++
++	switch (poke->reason) {
++	case BPF_POKE_REASON_TAIL_CALL:
++		if (!poke->tail_call.map)
++			return -EINVAL;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	tab = krealloc(tab, size * sizeof(*poke), GFP_KERNEL);
++	if (!tab)
++		return -ENOMEM;
++
++	memcpy(&tab[slot], poke, sizeof(*poke));
++	prog->aux->size_poke_tab = size;
++	prog->aux->poke_tab = tab;
++
++	return slot;
++}
++
+ static atomic_long_t bpf_jit_current;
+ 
+ /* Can be overridden by an arch's JIT compiler if it has a custom,
