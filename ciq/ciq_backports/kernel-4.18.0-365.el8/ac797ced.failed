@@ -1,0 +1,159 @@
+bnxt_en: Free and allocate VF-Reps during error recovery.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+commit ac797ced1fd0faba285c460eb1f64d1296b9cfa4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/ac797ced.failed
+
+During firmware recovery, VF-Rep configuration in the firmware is lost.
+Fix it by freeing and (re)allocating VF-Reps in FW at relevant points
+during the error recovery process.
+
+	Signed-off-by: Sriharsha Basavapatna <sriharsha.basavapatna@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ac797ced1fd0faba285c460eb1f64d1296b9cfa4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index cb95a8092049,e15d454e33f0..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -11844,8 -11823,11 +11845,16 @@@ static void bnxt_fw_reset_task(struct w
+  		/* Make sure fw_reset_state is 0 before clearing the flag */
+  		smp_mb__before_atomic();
+  		clear_bit(BNXT_STATE_IN_FW_RESET, &bp->state);
+++<<<<<<< HEAD
+ +		bnxt_ulp_start(bp, 0);
+ +		bnxt_reenable_sriov(bp);
+++=======
++ 		bnxt_ulp_start(bp, rc);
++ 		if (!rc)
++ 			bnxt_reenable_sriov(bp);
++ 		bnxt_vf_reps_alloc(bp);
++ 		bnxt_vf_reps_open(bp);
+++>>>>>>> ac797ced1fd0 (bnxt_en: Free and allocate VF-Reps during error recovery.)
+  		bnxt_dl_health_recovery_done(bp);
+  		bnxt_dl_health_status_update(bp, true);
+  		rtnl_unlock();
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+index a4ac11f5b0e5..dd66302343a2 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.c
+@@ -284,8 +284,11 @@ void bnxt_vf_reps_open(struct bnxt *bp)
+ 	if (bp->eswitch_mode != DEVLINK_ESWITCH_MODE_SWITCHDEV)
+ 		return;
+ 
+-	for (i = 0; i < pci_num_vf(bp->pdev); i++)
+-		bnxt_vf_rep_open(bp->vf_reps[i]->dev);
++	for (i = 0; i < pci_num_vf(bp->pdev); i++) {
++		/* Open the VF-Rep only if it is allocated in the FW */
++		if (bp->vf_reps[i]->tx_cfa_action != CFA_HANDLE_INVALID)
++			bnxt_vf_rep_open(bp->vf_reps[i]->dev);
++	}
+ }
+ 
+ static void __bnxt_free_one_vf_rep(struct bnxt *bp, struct bnxt_vf_rep *vf_rep)
+@@ -361,6 +364,23 @@ void bnxt_vf_reps_destroy(struct bnxt *bp)
+ 	__bnxt_vf_reps_destroy(bp);
+ }
+ 
++/* Free the VF-Reps in firmware, during firmware hot-reset processing.
++ * Note that the VF-Rep netdevs are still active (not unregistered) during
++ * this process. As the mode transition from SWITCHDEV to LEGACY happens
++ * under the rtnl_lock() this routine is safe under the rtnl_lock().
++ */
++void bnxt_vf_reps_free(struct bnxt *bp)
++{
++	u16 num_vfs = pci_num_vf(bp->pdev);
++	int i;
++
++	if (bp->eswitch_mode != DEVLINK_ESWITCH_MODE_SWITCHDEV)
++		return;
++
++	for (i = 0; i < num_vfs; i++)
++		__bnxt_free_one_vf_rep(bp, bp->vf_reps[i]);
++}
++
+ static int bnxt_alloc_vf_rep(struct bnxt *bp, struct bnxt_vf_rep *vf_rep,
+ 			     u16 *cfa_code_map)
+ {
+@@ -381,6 +401,43 @@ static int bnxt_alloc_vf_rep(struct bnxt *bp, struct bnxt_vf_rep *vf_rep,
+ 	return 0;
+ }
+ 
++/* Allocate the VF-Reps in firmware, during firmware hot-reset processing.
++ * Note that the VF-Rep netdevs are still active (not unregistered) during
++ * this process. As the mode transition from SWITCHDEV to LEGACY happens
++ * under the rtnl_lock() this routine is safe under the rtnl_lock().
++ */
++int bnxt_vf_reps_alloc(struct bnxt *bp)
++{
++	u16 *cfa_code_map = bp->cfa_code_map, num_vfs = pci_num_vf(bp->pdev);
++	struct bnxt_vf_rep *vf_rep;
++	int rc, i;
++
++	if (bp->eswitch_mode != DEVLINK_ESWITCH_MODE_SWITCHDEV)
++		return 0;
++
++	if (!cfa_code_map)
++		return -EINVAL;
++
++	for (i = 0; i < MAX_CFA_CODE; i++)
++		cfa_code_map[i] = VF_IDX_INVALID;
++
++	for (i = 0; i < num_vfs; i++) {
++		vf_rep = bp->vf_reps[i];
++		vf_rep->vf_idx = i;
++
++		rc = bnxt_alloc_vf_rep(bp, vf_rep, cfa_code_map);
++		if (rc)
++			goto err;
++	}
++
++	return 0;
++
++err:
++	netdev_info(bp->dev, "%s error=%d\n", __func__, rc);
++	bnxt_vf_reps_free(bp);
++	return rc;
++}
++
+ /* Use the OUI of the PF's perm addr and report the same mac addr
+  * for the same VF-rep each time
+  */
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
+index d7287651422f..5637a84884d7 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_vfr.h
+@@ -19,6 +19,8 @@ void bnxt_vf_reps_close(struct bnxt *bp);
+ void bnxt_vf_reps_open(struct bnxt *bp);
+ void bnxt_vf_rep_rx(struct bnxt *bp, struct sk_buff *skb);
+ struct net_device *bnxt_get_vf_rep(struct bnxt *bp, u16 cfa_code);
++int bnxt_vf_reps_alloc(struct bnxt *bp);
++void bnxt_vf_reps_free(struct bnxt *bp);
+ 
+ static inline u16 bnxt_vf_rep_get_fid(struct net_device *dev)
+ {
+@@ -61,5 +63,15 @@ static inline bool bnxt_dev_is_vf_rep(struct net_device *dev)
+ {
+ 	return false;
+ }
++
++static inline int bnxt_vf_reps_alloc(struct bnxt *bp)
++{
++	return 0;
++}
++
++static inline void bnxt_vf_reps_free(struct bnxt *bp)
++{
++}
++
+ #endif /* CONFIG_BNXT_SRIOV */
+ #endif /* BNXT_VFR_H */
