@@ -1,0 +1,223 @@
+x86/kvm/vmx: Move guest enter/exit into .noinstr.text
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 3ebccdf373c21d8697782b7e8d5af0adc9c26e04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/3ebccdf3.failed
+
+Move the functions which are inside the RCU off region into the
+non-instrumentable text section.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+
+Message-Id: <20200708195322.037311579@linutronix.de>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3ebccdf373c21d8697782b7e8d5af0adc9c26e04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/vmx.c
+diff --cc arch/x86/kvm/vmx/vmx.c
+index a165c3a9d655,e71a3d982781..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -6598,6 -6655,65 +6598,68 @@@ static fastpath_t vmx_exit_handlers_fas
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool __vmx_vcpu_run(struct vcpu_vmx *vmx, unsigned long *regs, bool launched);
++ 
++ static noinstr void vmx_vcpu_enter_exit(struct kvm_vcpu *vcpu,
++ 					struct vcpu_vmx *vmx)
++ {
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	/* L1D Flush includes CPU buffer clear to mitigate MDS */
++ 	if (static_branch_unlikely(&vmx_l1d_should_flush))
++ 		vmx_l1d_flush(vcpu);
++ 	else if (static_branch_unlikely(&mds_user_clear))
++ 		mds_clear_cpu_buffers();
++ 
++ 	if (vcpu->arch.cr2 != read_cr2())
++ 		write_cr2(vcpu->arch.cr2);
++ 
++ 	vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
++ 				   vmx->loaded_vmcs->launched);
++ 
++ 	vcpu->arch.cr2 = read_cr2();
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
+++>>>>>>> 3ebccdf373c2 (x86/kvm/vmx: Move guest enter/exit into .noinstr.text)
+  static fastpath_t vmx_vcpu_run(struct kvm_vcpu *vcpu)
+  {
+  	fastpath_t exit_fastpath;
+@@@ -6674,19 -6788,8 +6736,24 @@@ reenter_guest
+  	 */
+  	x86_spec_ctrl_set_guest(vmx->spec_ctrl, 0);
+  
+++<<<<<<< HEAD
+ +	/* L1D Flush includes CPU buffer clear to mitigate MDS */
+ +	if (static_branch_unlikely(&vmx_l1d_should_flush))
+ +		vmx_l1d_flush(vcpu);
+ +	else if (static_branch_unlikely(&mds_user_clear))
+ +		mds_clear_cpu_buffers();
+ +
+ +	if (vcpu->arch.cr2 != native_read_cr2())
+ +		native_write_cr2(vcpu->arch.cr2);
+ +
+ +	vmx->fail = __vmx_vcpu_run(vmx, (unsigned long *)&vcpu->arch.regs,
+ +				   vmx->loaded_vmcs->launched);
+ +
+ +	vcpu->arch.cr2 = native_read_cr2();
+++=======
++ 	/* The actual VMENTER/EXIT is in the .noinstr.text section. */
++ 	vmx_vcpu_enter_exit(vcpu, vmx);
+++>>>>>>> 3ebccdf373c2 (x86/kvm/vmx: Move guest enter/exit into .noinstr.text)
+  
+  	/*
+  	 * We do not use IBRS in the kernel. If this vCPU has used the
+diff --git a/arch/x86/include/asm/hardirq.h b/arch/x86/include/asm/hardirq.h
+index d9069bb26c7f..a1e90b4815a7 100644
+--- a/arch/x86/include/asm/hardirq.h
++++ b/arch/x86/include/asm/hardirq.h
+@@ -67,12 +67,12 @@ static inline void kvm_set_cpu_l1tf_flush_l1d(void)
+ 	__this_cpu_write(irq_stat.kvm_cpu_l1tf_flush_l1d, 1);
+ }
+ 
+-static inline void kvm_clear_cpu_l1tf_flush_l1d(void)
++static __always_inline void kvm_clear_cpu_l1tf_flush_l1d(void)
+ {
+ 	__this_cpu_write(irq_stat.kvm_cpu_l1tf_flush_l1d, 0);
+ }
+ 
+-static inline bool kvm_get_cpu_l1tf_flush_l1d(void)
++static __always_inline bool kvm_get_cpu_l1tf_flush_l1d(void)
+ {
+ 	return __this_cpu_read(irq_stat.kvm_cpu_l1tf_flush_l1d);
+ }
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8a170b674804..7d3372750eee 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1753,7 +1753,15 @@ asmlinkage void kvm_spurious_fault(void);
+ 	insn "\n\t"							\
+ 	"jmp	668f \n\t"						\
+ 	"667: \n\t"							\
++	"1: \n\t"							\
++	".pushsection .discard.instr_begin \n\t"			\
++	".long 1b - . \n\t"						\
++	".popsection \n\t"						\
+ 	"call	kvm_spurious_fault \n\t"				\
++	"1: \n\t"							\
++	".pushsection .discard.instr_end \n\t"				\
++	".long 1b - . \n\t"						\
++	".popsection \n\t"						\
+ 	"668: \n\t"							\
+ 	_ASM_EXTABLE(666b, 667b)
+ 
+diff --git a/arch/x86/kvm/vmx/vmenter.S b/arch/x86/kvm/vmx/vmenter.S
+index f815c1b9287a..fd0a4aadb374 100644
+--- a/arch/x86/kvm/vmx/vmenter.S
++++ b/arch/x86/kvm/vmx/vmenter.S
+@@ -28,7 +28,7 @@
+ #define VCPU_R15	__VCPU_REGS_R15 * WORD_SIZE
+ #endif
+ 
+-	.text
++.section .noinstr.text, "ax"
+ 
+ /**
+  * vmx_vmenter - VM-Enter the current loaded VMCS
+@@ -235,6 +235,9 @@ SYM_FUNC_START(__vmx_vcpu_run)
+ 	jmp 1b
+ SYM_FUNC_END(__vmx_vcpu_run)
+ 
++
++.section .text, "ax"
++
+ /**
+  * vmread_error_trampoline - Trampoline from inline asm to vmread_error()
+  * @field:	VMCS field encoding that failed
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+diff --git a/arch/x86/kvm/vmx/vmx_ops.h b/arch/x86/kvm/vmx/vmx_ops.h
+index 1cebbad8cf4d..164b64f65a8f 100644
+--- a/arch/x86/kvm/vmx/vmx_ops.h
++++ b/arch/x86/kvm/vmx/vmx_ops.h
+@@ -150,7 +150,9 @@ do {									\
+ 			  : : op1 : "cc" : error, fault);		\
+ 	return;								\
+ error:									\
++	instrumentation_begin();					\
+ 	insn##_error(error_args);					\
++	instrumentation_end();						\
+ 	return;								\
+ fault:									\
+ 	kvm_spurious_fault();						\
+@@ -165,7 +167,9 @@ do {									\
+ 			  : : op1, op2 : "cc" : error, fault);		\
+ 	return;								\
+ error:									\
++	instrumentation_begin();					\
+ 	insn##_error(error_args);					\
++	instrumentation_end();						\
+ 	return;								\
+ fault:									\
+ 	kvm_spurious_fault();						\
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 1085ad8f4583..f67bcc1c103e 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -426,7 +426,7 @@ int kvm_set_apic_base(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ }
+ EXPORT_SYMBOL_GPL(kvm_set_apic_base);
+ 
+-asmlinkage __visible void kvm_spurious_fault(void)
++asmlinkage __visible noinstr void kvm_spurious_fault(void)
+ {
+ 	/* Fault while not rebooting.  We want the trace. */
+ 	BUG_ON(!kvm_rebooting);
