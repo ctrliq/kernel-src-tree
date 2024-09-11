@@ -1,0 +1,223 @@
+kasan: fix assigning tags twice
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit e1db95befb3e9e3476629afec6e0f5d0707b9825
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e1db95be.failed
+
+When an object is kmalloc()'ed, two hooks are called: kasan_slab_alloc()
+and kasan_kmalloc().  Right now we assign a tag twice, once in each of the
+hooks.  Fix it by assigning a tag only in the former hook.
+
+Link: http://lkml.kernel.org/r/ce8c6431da735aa7ec051fd6497153df690eb021.1549921721.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgeniy Stepanov <eugenis@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Kostya Serebryany <kcc@google.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e1db95befb3e9e3476629afec6e0f5d0707b9825)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/kasan.c
+diff --cc mm/kasan/kasan.c
+index d79269dd4b58,09b534fbba17..000000000000
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@@ -413,62 -346,50 +413,90 @@@ void kasan_poison_object_data(struct km
+  			KASAN_KMALLOC_REDZONE);
+  }
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +static inline int in_irqentry_text(unsigned long ptr)
+ +{
+ +	return (ptr >= (unsigned long)&__irqentry_text_start &&
+ +		ptr < (unsigned long)&__irqentry_text_end) ||
+ +		(ptr >= (unsigned long)&__softirqentry_text_start &&
+ +		 ptr < (unsigned long)&__softirqentry_text_end);
+ +}
+++=======
++ /*
++  * This function assigns a tag to an object considering the following:
++  * 1. A cache might have a constructor, which might save a pointer to a slab
++  *    object somewhere (e.g. in the object itself). We preassign a tag for
++  *    each object in caches with constructors during slab creation and reuse
++  *    the same tag each time a particular object is allocated.
++  * 2. A cache might be SLAB_TYPESAFE_BY_RCU, which means objects can be
++  *    accessed after being freed. We preassign tags for objects in these
++  *    caches as well.
++  * 3. For SLAB allocator we can't preassign tags randomly since the freelist
++  *    is stored as an array of indexes instead of a linked list. Assign tags
++  *    based on objects indexes, so that objects that are next to each other
++  *    get different tags.
++  */
++ static u8 assign_tag(struct kmem_cache *cache, const void *object,
++ 			bool init, bool keep_tag)
++ {
++ 	/*
++ 	 * 1. When an object is kmalloc()'ed, two hooks are called:
++ 	 *    kasan_slab_alloc() and kasan_kmalloc(). We assign the
++ 	 *    tag only in the first one.
++ 	 * 2. We reuse the same tag for krealloc'ed objects.
++ 	 */
++ 	if (keep_tag)
++ 		return get_tag(object);
+++>>>>>>> e1db95befb3e (kasan: fix assigning tags twice):mm/kasan/common.c
+  
+ -	/*
+ -	 * If the cache neither has a constructor nor has SLAB_TYPESAFE_BY_RCU
+ -	 * set, assign a tag when the object is being allocated (init == false).
+ -	 */
+ -	if (!cache->ctor && !(cache->flags & SLAB_TYPESAFE_BY_RCU))
+ -		return init ? KASAN_TAG_KERNEL : random_tag();
+ -
+ -	/* For caches that either have a constructor or SLAB_TYPESAFE_BY_RCU: */
+ -#ifdef CONFIG_SLAB
+ -	/* For SLAB assign tags based on the object index in the freelist. */
+ -	return (u8)obj_to_index(cache, virt_to_page(object), (void *)object);
+ -#else
+ -	/*
+ -	 * For SLUB assign a random tag during slab creation, otherwise reuse
+ -	 * the already assigned tag.
+ -	 */
+ -	return init ? random_tag() : get_tag(object);
+ -#endif
+ +static inline void filter_irq_stacks(struct stack_trace *trace)
+ +{
+ +	int i;
+ +
+ +	if (!trace->nr_entries)
+ +		return;
+ +	for (i = 0; i < trace->nr_entries; i++)
+ +		if (in_irqentry_text(trace->entries[i])) {
+ +			/* Include the irqentry function into the stack. */
+ +			trace->nr_entries = i + 1;
+ +			break;
+ +		}
+ +}
+ +
+ +static inline depot_stack_handle_t save_stack(gfp_t flags)
+ +{
+ +	unsigned long entries[KASAN_STACK_DEPTH];
+ +	struct stack_trace trace = {
+ +		.nr_entries = 0,
+ +		.entries = entries,
+ +		.max_entries = KASAN_STACK_DEPTH,
+ +		.skip = 0
+ +	};
+ +
+ +	save_stack_trace(&trace);
+ +	filter_irq_stacks(&trace);
+ +
+ +	return depot_save_stack(&trace, flags);
+ +}
+ +
+ +static inline void set_track(struct kasan_track *track, gfp_t flags)
+ +{
+ +	track->pid = current->pid;
+ +	track->stack = save_stack(flags);
+ +}
+ +
+ +struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+ +					const void *object)
+ +{
+ +	BUILD_BUG_ON(sizeof(struct kasan_alloc_meta) > 32);
+ +	return (void *)object + cache->kasan_info.alloc_meta_offset;
+ +}
+ +
+ +struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
+ +				      const void *object)
+ +{
+ +	BUILD_BUG_ON(sizeof(struct kasan_free_meta) > 32);
+ +	return (void *)object + cache->kasan_info.free_meta_offset;
+  }
+  
+  void * __must_check kasan_init_slab_obj(struct kmem_cache *cache,
+@@@ -485,10 -406,17 +513,20 @@@
+  	return (void *)object;
+  }
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
+ +					gfp_t flags)
+ +{
+ +	return kasan_kmalloc(cache, object, cache->object_size, flags);
+++=======
++ static inline bool shadow_invalid(u8 tag, s8 shadow_byte)
++ {
++ 	if (IS_ENABLED(CONFIG_KASAN_GENERIC))
++ 		return shadow_byte < 0 ||
++ 			shadow_byte >= KASAN_SHADOW_SCALE_SIZE;
++ 	else
++ 		return tag != (u8)shadow_byte;
+++>>>>>>> e1db95befb3e (kasan: fix assigning tags twice):mm/kasan/common.c
+  }
+  
+  static bool __kasan_slab_free(struct kmem_cache *cache, void *object,
+@@@ -529,8 -465,8 +567,13 @@@ bool kasan_slab_free(struct kmem_cache 
+  	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +					size_t size, gfp_t flags)
+++=======
++ static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
++ 				size_t size, gfp_t flags, bool keep_tag)
+++>>>>>>> e1db95befb3e (kasan: fix assigning tags twice):mm/kasan/common.c
+  {
+  	unsigned long redzone_start;
+  	unsigned long redzone_end;
+@@@ -546,14 -483,30 +589,38 @@@
+  	redzone_end = round_up((unsigned long)object + cache->object_size,
+  				KASAN_SHADOW_SCALE_SIZE);
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +	kasan_unpoison_shadow(object, size);
+++=======
++ 	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
++ 		tag = assign_tag(cache, object, false, keep_tag);
++ 
++ 	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
++ 	kasan_unpoison_shadow(set_tag(object, tag), size);
+++>>>>>>> e1db95befb3e (kasan: fix assigning tags twice):mm/kasan/common.c
+  	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+  		KASAN_KMALLOC_REDZONE);
+  
+  	if (cache->flags & SLAB_KASAN)
+  		set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+ +	return (void *)object;
+++=======
++ 	return set_tag(object, tag);
++ }
++ 
++ void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
++ 					gfp_t flags)
++ {
++ 	return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
++ }
++ 
++ void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
++ 				size_t size, gfp_t flags)
++ {
++ 	return __kasan_kmalloc(cache, object, size, flags, true);
+++>>>>>>> e1db95befb3e (kasan: fix assigning tags twice):mm/kasan/common.c
+  }
+  EXPORT_SYMBOL(kasan_kmalloc);
+  
+* Unmerged path mm/kasan/kasan.c
