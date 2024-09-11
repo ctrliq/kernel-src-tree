@@ -1,0 +1,164 @@
+scsi: zfcp: fix fc_host attributes that should be unknown on local link down
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Steffen Maier <maier@linux.ibm.com>
+commit 7e0e4e0958ef794ee868838249880d5c521ff761
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7e0e4e09.failed
+
+When we get an unsolicited notification on local link went down,
+zfcp_fsf_status_read_link_down() calls zfcp_fsf_link_down_info_eval().
+This only blocks rports, and sets ZFCP_STATUS_ADAPTER_LINK_UNPLUGGED and
+ZFCP_STATUS_COMMON_ERP_FAILED. Only the fc_host port_state changes to
+"Linkdown", because zfcp_scsi_get_host_port_state() is an active callback
+and uses the adapter status.
+
+Other fc_host attributes model, port_id, port_type, speed, fabric_name (and
+zfcp device attributes card_version, peer_wwpn, peer_wwnn, peer_d_id) which
+depend on a local link, continued to show their last known "good" value.
+
+Only if something triggered an exchange config data, some values were
+updated to their unknown equivalent via case
+FSF_EXCHANGE_CONFIG_DATA_INCOMPLETE due to local link down.  Triggers for
+exchange config data are adapter recovery, or reading any of the following
+zfcp-specific scsi host sysfs attributes "requests", "megabytes", or
+"seconds_active" in /sys/devices/css*/*.*.*/*.*.*/host*/scsi_host/host*/.
+
+The other fc_host attributes active_fc4s and permanent_port_name continued
+to show their last known "good" value.  Only if something triggered an
+exchange port data, some values changed.  Active_fc4s became all zeros as
+unknown equivalent during link down.  Permanent_port_name does not depend
+on a local link. But for non-NPIV FCP devices, permanent_port_name
+erroneously became whatever value fc_host port_name had at that point in
+time (see previous paragraph).  Triggers for exchange port data are the
+zfcp-specific scsi host sysfs attribute "utilization", or
+[{reset,get}_fc_host_stats] write anything into "reset_statistics" or read
+any of the other attributes under
+/sys/devices/css*/*.*.*/*.*.*/host*/fc_host/host*/statistics/.
+
+(cf. v4.9 commit bd77befa5bcf ("zfcp: fix fc_host port_type with NPIV"))
+
+This is particularly confusing when using "lszfcp -b <fcpdevbusid> -Ha" or
+dbginfo.sh which read fc_host attributes and also scsi_host attributes.
+After link down, the first invocation produces (abbreviated):
+
+Class = "fc_host"
+    active_fc4s         = "0x00 0x00 0x01 0x00 ..."
+    ...
+    fabric_name         = "0x10000027f8e04c49"
+    ...
+    permanent_port_name = "0xc05076e4588059c1"
+    port_id             = "0x244800"
+    port_state          = "Linkdown"
+    port_type           = "NPort (fabric via point-to-point)"
+    ...
+    speed               = "16 Gbit"
+Class = "scsi_host"
+    ...
+    megabytes           = "0 0"
+    ...
+    requests            = "0 0 0"
+    seconds_active      = "37"
+    ...
+    utilization         = "0 0 0"
+
+The second and next invocations produce (abbreviated):
+
+Class = "fc_host"
+    active_fc4s         = "0x00 0x00 0x00 0x00 ..."
+    ...
+    fabric_name         = "0x0"
+    ...
+    permanent_port_name = "0x0"
+    port_id             = "0x000000"
+    port_state          = "Linkdown"
+    port_type           = "Unknown"
+    ...
+    speed               = "unknown"
+Class = "scsi_host"
+    ...
+    megabytes           = "0 0"
+    ...
+    requests            = "0 0 0"
+    seconds_active      = "38"
+    ...
+    utilization         = "0 0 0"
+
+Factor out the resetting of local link dependent fc_host attributes from
+zfcp_fsf_exchange_config_data_handler() case
+FSF_EXCHANGE_CONFIG_DATA_INCOMPLETE into a new helper function
+zfcp_fsf_fc_host_link_down().  All code places that detect local link down
+(SRB, FSF_PROT_LINK_DOWN, xconf data/port incomplete) call
+zfcp_fsf_link_down_info_eval().  Call the new helper from there. This works
+because zfcp_fsf_link_down_info_eval() and thus the helper is called before
+zfcp_fsf_exchange_{config,port}_evaluate().
+
+Port_name and node_name are always valid, so never reset them.
+
+Get the permanent_port_name from exchange port data unconditionally as it
+always has a valid known good value, even during link down.
+
+Note: Rather than hardcode in zfcp_fsf_exchange_config_evaluate(), fc_host
+supported_classes could theoretically get its value from
+fsf_qtcb_bottom_port.class_of_service in zfcp_fsf_exchange_port_evaluate().
+
+When the link comes back, we get a different notification, perform adapter
+recovery, and this triggers an implicit exchange config data followed by
+exchange port data filling in the link dependent fc_host attributes with
+known good values again.
+
+Link: https://lore.kernel.org/r/20200312174505.51294-5-maier@linux.ibm.com
+	Reviewed-by: Jens Remus <jremus@linux.ibm.com>
+	Reviewed-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Steffen Maier <maier@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 7e0e4e0958ef794ee868838249880d5c521ff761)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_fsf.c
+diff --cc drivers/s390/scsi/zfcp_fsf.c
+index 1ed6f3c18039,1fa94277d287..000000000000
+--- a/drivers/s390/scsi/zfcp_fsf.c
++++ b/drivers/s390/scsi/zfcp_fsf.c
+@@@ -589,15 -621,8 +605,20 @@@ static void zfcp_fsf_exchange_config_da
+  				&adapter->status);
+  		break;
+  	case FSF_EXCHANGE_CONFIG_DATA_INCOMPLETE:
+++<<<<<<< HEAD
+ +		fc_host_node_name(shost) = 0;
+ +		fc_host_port_name(shost) = 0;
+ +		fc_host_port_id(shost) = 0;
+ +		fc_host_fabric_name(shost) = 0;
+ +		fc_host_speed(shost) = FC_PORTSPEED_UNKNOWN;
+ +		fc_host_port_type(shost) = FC_PORTTYPE_UNKNOWN;
+ +		adapter->hydra_version = 0;
+ +		snprintf(fc_host_model(shost), FC_SYMBOLIC_NAME_SIZE, "0x%04x",
+ +			 0);
+++=======
++ 		zfcp_diag_update_xdata(diag_hdr, bottom, true);
++ 		req->status |= ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE;
+++>>>>>>> 7e0e4e0958ef (scsi: zfcp: fix fc_host attributes that should be unknown on local link down)
+  
+  		/* avoids adapter shutdown to be able to recognize
+  		 * events such as LINK UP */
+@@@ -673,9 -698,18 +691,16 @@@ static void zfcp_fsf_exchange_port_data
+  		zfcp_fsf_exchange_port_evaluate(req);
+  		break;
+  	case FSF_EXCHANGE_CONFIG_DATA_INCOMPLETE:
+++<<<<<<< HEAD
+ +		zfcp_fsf_exchange_port_evaluate(req);
+++=======
++ 		zfcp_diag_update_xdata(diag_hdr, bottom, true);
++ 		req->status |= ZFCP_STATUS_FSFREQ_XDATAINCOMPLETE;
++ 
+++>>>>>>> 7e0e4e0958ef (scsi: zfcp: fix fc_host attributes that should be unknown on local link down)
+  		zfcp_fsf_link_down_info_eval(req,
+  			&qtcb->header.fsf_status_qual.link_down_info);
++ 		zfcp_fsf_exchange_port_evaluate(req);
+  		break;
+  	}
+  }
+* Unmerged path drivers/s390/scsi/zfcp_fsf.c
