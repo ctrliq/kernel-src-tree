@@ -1,0 +1,545 @@
+netfilter: conntrack: remove l3proto abstraction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit a0ae2562c6c4b2721d9fddba63b7286c13517d9f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a0ae2562.failed
+
+This unifies ipv4 and ipv6 protocol trackers and removes the l3proto
+abstraction.
+
+This gets rid of all l3proto indirect calls and the need to do
+a lookup on the function to call for l3 demux.
+
+It increases module size by only a small amount (12kbyte), so this reduces
+size because nf_conntrack.ko is useless without either nf_conntrack_ipv4
+or nf_conntrack_ipv6 module.
+
+before:
+   text    data     bss     dec     hex filename
+   7357    1088       0    8445    20fd nf_conntrack_ipv4.ko
+   7405    1084       4    8493    212d nf_conntrack_ipv6.ko
+  72614   13689     236   86539   1520b nf_conntrack.ko
+ 19K nf_conntrack_ipv4.ko
+ 19K nf_conntrack_ipv6.ko
+179K nf_conntrack.ko
+
+after:
+   text    data     bss     dec     hex filename
+  79277   13937     236   93450   16d0a nf_conntrack.ko
+  191K nf_conntrack.ko
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit a0ae2562c6c4b2721d9fddba63b7286c13517d9f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_conntrack_l3proto.h
+#	net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+#	net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+#	net/netfilter/Makefile
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_proto.c
+diff --cc net/netfilter/Makefile
+index c1b6a98afe92,53bd1ed1228a..000000000000
+--- a/net/netfilter/Makefile
++++ b/net/netfilter/Makefile
+@@@ -1,7 -1,12 +1,16 @@@
+  # SPDX-License-Identifier: GPL-2.0
+  netfilter-objs := core.o nf_log.o nf_queue.o nf_sockopt.o utils.o
+  
+++<<<<<<< HEAD
+ +nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o nf_conntrack_proto.o nf_conntrack_l3proto_generic.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o nf_conntrack_extend.o nf_conntrack_acct.o nf_conntrack_seqadj.o
+++=======
++ nf_conntrack-y	:= nf_conntrack_core.o nf_conntrack_standalone.o nf_conntrack_expect.o nf_conntrack_helper.o \
++ 		   nf_conntrack_proto.o nf_conntrack_proto_generic.o nf_conntrack_proto_tcp.o nf_conntrack_proto_udp.o \
++ 		   nf_conntrack_proto_icmp.o \
++ 		   nf_conntrack_extend.o nf_conntrack_acct.o nf_conntrack_seqadj.o
++ 
++ nf_conntrack-$(subst m,y,$(CONFIG_IPV6)) += nf_conntrack_proto_icmpv6.o
+++>>>>>>> a0ae2562c6c4 (netfilter: conntrack: remove l3proto abstraction)
+  nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMEOUT) += nf_conntrack_timeout.o
+  nf_conntrack-$(CONFIG_NF_CONNTRACK_TIMESTAMP) += nf_conntrack_timestamp.o
+  nf_conntrack-$(CONFIG_NF_CONNTRACK_EVENTS) += nf_conntrack_ecache.o
+diff --cc net/netfilter/nf_conntrack_core.c
+index 397b134cecce,5123e91b1982..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -288,6 -287,81 +288,84 @@@ nf_ct_get_tuple(const struct sk_buff *s
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int ipv4_get_l4proto(const struct sk_buff *skb, unsigned int nhoff,
++ 			    u_int8_t *protonum)
++ {
++ 	int dataoff = -1;
++ 	const struct iphdr *iph;
++ 	struct iphdr _iph;
++ 
++ 	iph = skb_header_pointer(skb, nhoff, sizeof(_iph), &_iph);
++ 	if (!iph)
++ 		return -1;
++ 
++ 	/* Conntrack defragments packets, we might still see fragments
++ 	 * inside ICMP packets though.
++ 	 */
++ 	if (iph->frag_off & htons(IP_OFFSET))
++ 		return -1;
++ 
++ 	dataoff = nhoff + (iph->ihl << 2);
++ 	*protonum = iph->protocol;
++ 
++ 	/* Check bogus IP headers */
++ 	if (dataoff > skb->len) {
++ 		pr_debug("bogus IPv4 packet: nhoff %u, ihl %u, skblen %u\n",
++ 			 nhoff, iph->ihl << 2, skb->len);
++ 		return -1;
++ 	}
++ 	return dataoff;
++ }
++ 
++ #if IS_ENABLED(CONFIG_IPV6)
++ static int ipv6_get_l4proto(const struct sk_buff *skb, unsigned int nhoff,
++ 			    u8 *protonum)
++ {
++ 	int protoff = -1;
++ 	unsigned int extoff = nhoff + sizeof(struct ipv6hdr);
++ 	__be16 frag_off;
++ 	u8 nexthdr;
++ 
++ 	if (skb_copy_bits(skb, nhoff + offsetof(struct ipv6hdr, nexthdr),
++ 			  &nexthdr, sizeof(nexthdr)) != 0) {
++ 		pr_debug("can't get nexthdr\n");
++ 		return -1;
++ 	}
++ 	protoff = ipv6_skip_exthdr(skb, extoff, &nexthdr, &frag_off);
++ 	/*
++ 	 * (protoff == skb->len) means the packet has not data, just
++ 	 * IPv6 and possibly extensions headers, but it is tracked anyway
++ 	 */
++ 	if (protoff < 0 || (frag_off & htons(~0x7)) != 0) {
++ 		pr_debug("can't find proto in pkt\n");
++ 		return -1;
++ 	}
++ 
++ 	*protonum = nexthdr;
++ 	return protoff;
++ }
++ #endif
++ 
++ static int get_l4proto(const struct sk_buff *skb,
++ 		       unsigned int nhoff, u8 pf, u8 *l4num)
++ {
++ 	switch (pf) {
++ 	case NFPROTO_IPV4:
++ 		return ipv4_get_l4proto(skb, nhoff, l4num);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case NFPROTO_IPV6:
++ 		return ipv6_get_l4proto(skb, nhoff, l4num);
++ #endif
++ 	default:
++ 		*l4num = 0;
++ 		break;
++ 	}
++ 	return -1;
++ }
++ 
+++>>>>>>> a0ae2562c6c4 (netfilter: conntrack: remove l3proto abstraction)
+  bool nf_ct_get_tuplepr(const struct sk_buff *skb, unsigned int nhoff,
+  		       u_int16_t l3num,
+  		       struct net *net, struct nf_conntrack_tuple *tuple)
+diff --cc net/netfilter/nf_conntrack_proto.c
+index 928ff492bf36,803607a90102..000000000000
+--- a/net/netfilter/nf_conntrack_proto.c
++++ b/net/netfilter/nf_conntrack_proto.c
+@@@ -287,52 -163,6 +163,55 @@@ static int kill_l4proto(struct nf_conn 
+  	       nf_ct_l3num(i) == l4proto->l3proto;
+  }
+  
+++<<<<<<< HEAD
+ +int nf_ct_l3proto_register(const struct nf_conntrack_l3proto *proto)
+ +{
+ +	int ret = 0;
+ +	struct nf_conntrack_l3proto *old;
+ +
+ +	if (proto->l3proto >= NFPROTO_NUMPROTO)
+ +		return -EBUSY;
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	if (proto->tuple_to_nlattr && proto->nla_size == 0)
+ +		return -EINVAL;
+ +#endif
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	old = rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
+ +					lockdep_is_held(&nf_ct_proto_mutex));
+ +	if (old != &nf_conntrack_l3proto_generic) {
+ +		ret = -EBUSY;
+ +		goto out_unlock;
+ +	}
+ +
+ +	rcu_assign_pointer(nf_ct_l3protos[proto->l3proto], proto);
+ +
+ +out_unlock:
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +	return ret;
+ +
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l3proto_register);
+ +
+ +void nf_ct_l3proto_unregister(const struct nf_conntrack_l3proto *proto)
+ +{
+ +	BUG_ON(proto->l3proto >= NFPROTO_NUMPROTO);
+ +
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	BUG_ON(rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
+ +					 lockdep_is_held(&nf_ct_proto_mutex)
+ +					 ) != proto);
+ +	rcu_assign_pointer(nf_ct_l3protos[proto->l3proto],
+ +			   &nf_conntrack_l3proto_generic);
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +
+ +	synchronize_rcu();
+ +	/* Remove all contrack entries for this protocol */
+ +	nf_ct_iterate_destroy(kill_l3proto, (void*)proto);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l3proto_unregister);
+ +
+++=======
+++>>>>>>> a0ae2562c6c4 (netfilter: conntrack: remove l3proto abstraction)
+  static struct nf_proto_net *nf_ct_l4proto_net(struct net *net,
+  				const struct nf_conntrack_l4proto *l4proto)
+  {
+@@@ -544,23 -386,6 +437,26 @@@ int nf_ct_l4proto_pernet_register(struc
+  }
+  EXPORT_SYMBOL_GPL(nf_ct_l4proto_pernet_register);
+  
+++<<<<<<< HEAD
+ +void nf_ct_l4proto_unregister(const struct nf_conntrack_l4proto * const l4proto[],
+ +			      unsigned int num_proto)
+ +{
+ +	int i;
+ +
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	for (i = 0; i < num_proto; i++)
+ +		__nf_ct_l4proto_unregister_one(l4proto[i]);
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +
+ +	synchronize_net();
+ +
+ +	for (i = 0; i < num_proto; i++)
+ +		nf_ct_iterate_destroy(kill_l4proto, (void *)l4proto[i]);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_unregister);
+ +
+++=======
+++>>>>>>> a0ae2562c6c4 (netfilter: conntrack: remove l3proto abstraction)
+  void nf_ct_l4proto_pernet_unregister(struct net *net,
+  				const struct nf_conntrack_l4proto *const l4proto[],
+  				unsigned int num_proto)
+* Unmerged path include/net/netfilter/nf_conntrack_l3proto.h
+* Unmerged path net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+* Unmerged path net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+diff --git a/include/net/netfilter/ipv4/nf_conntrack_ipv4.h b/include/net/netfilter/ipv4/nf_conntrack_ipv4.h
+index 73f825732326..c84b51682f08 100644
+--- a/include/net/netfilter/ipv4/nf_conntrack_ipv4.h
++++ b/include/net/netfilter/ipv4/nf_conntrack_ipv4.h
+@@ -10,9 +10,6 @@
+ #ifndef _NF_CONNTRACK_IPV4_H
+ #define _NF_CONNTRACK_IPV4_H
+ 
+-
+-const extern struct nf_conntrack_l3proto nf_conntrack_l3proto_ipv4;
+-
+ extern const struct nf_conntrack_l4proto nf_conntrack_l4proto_tcp4;
+ extern const struct nf_conntrack_l4proto nf_conntrack_l4proto_udp4;
+ extern const struct nf_conntrack_l4proto nf_conntrack_l4proto_icmp;
+diff --git a/include/net/netfilter/nf_conntrack.h b/include/net/netfilter/nf_conntrack.h
+index 786883dd3806..32d06902bc04 100644
+--- a/include/net/netfilter/nf_conntrack.h
++++ b/include/net/netfilter/nf_conntrack.h
+@@ -41,6 +41,11 @@ union nf_conntrack_expect_proto {
+ 	/* insert expect proto private data here */
+ };
+ 
++struct nf_conntrack_net {
++	unsigned int users4;
++	unsigned int users6;
++};
++
+ #include <linux/types.h>
+ #include <linux/skbuff.h>
+ 
+diff --git a/include/net/netfilter/nf_conntrack_core.h b/include/net/netfilter/nf_conntrack_core.h
+index f5bc17885ca0..4507bac0d1e3 100644
+--- a/include/net/netfilter/nf_conntrack_core.h
++++ b/include/net/netfilter/nf_conntrack_core.h
+@@ -14,7 +14,6 @@
+ #define _NF_CONNTRACK_CORE_H
+ 
+ #include <linux/netfilter.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_l4proto.h>
+ #include <net/netfilter/nf_conntrack_ecache.h>
+ 
+* Unmerged path include/net/netfilter/nf_conntrack_l3proto.h
+diff --git a/include/net/netfilter/nf_conntrack_l4proto.h b/include/net/netfilter/nf_conntrack_l4proto.h
+index 771e9d473ecd..b01c6bc1687c 100644
+--- a/include/net/netfilter/nf_conntrack_l4proto.h
++++ b/include/net/netfilter/nf_conntrack_l4proto.h
+@@ -132,10 +132,6 @@ void nf_ct_l4proto_pernet_unregister(struct net *net,
+ /* Protocol global registration. */
+ int nf_ct_l4proto_register_one(const struct nf_conntrack_l4proto *proto);
+ void nf_ct_l4proto_unregister_one(const struct nf_conntrack_l4proto *proto);
+-int nf_ct_l4proto_register(const struct nf_conntrack_l4proto * const proto[],
+-			   unsigned int num_proto);
+-void nf_ct_l4proto_unregister(const struct nf_conntrack_l4proto * const proto[],
+-			      unsigned int num_proto);
+ 
+ /* Generic netlink helpers */
+ int nf_ct_port_tuple_to_nlattr(struct sk_buff *skb,
+diff --git a/net/ipv4/netfilter/Kconfig b/net/ipv4/netfilter/Kconfig
+index bbfc356cb1b5..d9504adc47b3 100644
+--- a/net/ipv4/netfilter/Kconfig
++++ b/net/ipv4/netfilter/Kconfig
+@@ -9,22 +9,6 @@ config NF_DEFRAG_IPV4
+ 	tristate
+ 	default n
+ 
+-config NF_CONNTRACK_IPV4
+-	tristate "IPv4 connection tracking support (required for NAT)"
+-	depends on NF_CONNTRACK
+-	default m if NETFILTER_ADVANCED=n
+-	select NF_DEFRAG_IPV4
+-	---help---
+-	  Connection tracking keeps a record of what packets have passed
+-	  through your machine, in order to figure out how they are related
+-	  into connections.
+-
+-	  This is IPv4 support on Layer 3 independent connection tracking.
+-	  Layer 3 independent connection tracking is experimental scheme
+-	  which generalize ip_conntrack to support other layer 3 protocols.
+-
+-	  To compile it as a module, choose M here.  If unsure, say N.
+-
+ config NF_SOCKET_IPV4
+ 	tristate "IPv4 socket lookup support"
+ 	help
+@@ -112,7 +96,7 @@ config NF_REJECT_IPV4
+ 
+ config NF_NAT_IPV4
+ 	tristate "IPv4 NAT"
+-	depends on NF_CONNTRACK_IPV4
++	depends on NF_CONNTRACK
+ 	default m if NETFILTER_ADVANCED=n
+ 	select NF_NAT
+ 	help
+@@ -279,7 +263,7 @@ config IP_NF_TARGET_SYNPROXY
+ # NAT + specific targets: nf_conntrack
+ config IP_NF_NAT
+ 	tristate "iptables NAT support"
+-	depends on NF_CONNTRACK_IPV4
++	depends on NF_CONNTRACK
+ 	default m if NETFILTER_ADVANCED=n
+ 	select NF_NAT
+ 	select NF_NAT_IPV4
+@@ -340,7 +324,7 @@ config IP_NF_MANGLE
+ config IP_NF_TARGET_CLUSTERIP
+ 	tristate "CLUSTERIP target support"
+ 	depends on IP_NF_MANGLE
+-	depends on NF_CONNTRACK_IPV4
++	depends on NF_CONNTRACK
+ 	depends on NETFILTER_ADVANCED
+ 	select NF_CONNTRACK_MARK
+ 	select NETFILTER_FAMILY_ARP
+diff --git a/net/ipv4/netfilter/Makefile b/net/ipv4/netfilter/Makefile
+index 8394c17c269f..367993adf4d3 100644
+--- a/net/ipv4/netfilter/Makefile
++++ b/net/ipv4/netfilter/Makefile
+@@ -3,12 +3,6 @@
+ # Makefile for the netfilter modules on top of IPv4.
+ #
+ 
+-# objects for l3 independent conntrack
+-nf_conntrack_ipv4-y	:=  nf_conntrack_l3proto_ipv4.o nf_conntrack_proto_icmp.o
+-
+-# connection tracking
+-obj-$(CONFIG_NF_CONNTRACK_IPV4) += nf_conntrack_ipv4.o
+-
+ nf_nat_ipv4-y		:= nf_nat_l3proto_ipv4.o nf_nat_proto_icmp.o
+ nf_nat_ipv4-$(CONFIG_NF_NAT_MASQUERADE_IPV4) += nf_nat_masquerade_ipv4.o
+ obj-$(CONFIG_NF_NAT_IPV4) += nf_nat_ipv4.o
+* Unmerged path net/ipv4/netfilter/nf_conntrack_l3proto_ipv4.c
+diff --git a/net/ipv6/netfilter/Kconfig b/net/ipv6/netfilter/Kconfig
+index fd93b5a5e481..02664eb0d2fe 100644
+--- a/net/ipv6/netfilter/Kconfig
++++ b/net/ipv6/netfilter/Kconfig
+@@ -5,26 +5,6 @@
+ menu "IPv6: Netfilter Configuration"
+ 	depends on INET && IPV6 && NETFILTER
+ 
+-config NF_DEFRAG_IPV6
+-	tristate
+-	default n
+-
+-config NF_CONNTRACK_IPV6
+-	tristate "IPv6 connection tracking support"
+-	depends on INET && IPV6 && NF_CONNTRACK
+-	default m if NETFILTER_ADVANCED=n
+-	select NF_DEFRAG_IPV6
+-	---help---
+-	  Connection tracking keeps a record of what packets have passed
+-	  through your machine, in order to figure out how they are related
+-	  into connections.
+-
+-	  This is IPv6 support on Layer 3 independent connection tracking.
+-	  Layer 3 independent connection tracking is experimental scheme
+-	  which generalize ip_conntrack to support other layer 3 protocols.
+-
+-	  To compile it as a module, choose M here.  If unsure, say N.
+-
+ config NF_SOCKET_IPV6
+ 	tristate "IPv6 socket lookup support"
+ 	help
+@@ -128,7 +108,7 @@ config NF_LOG_IPV6
+ 
+ config NF_NAT_IPV6
+ 	tristate "IPv6 NAT"
+-	depends on NF_CONNTRACK_IPV6
++	depends on NF_CONNTRACK
+ 	depends on NETFILTER_ADVANCED
+ 	select NF_NAT
+ 	help
+@@ -328,7 +308,7 @@ config IP6_NF_SECURITY
+ 
+ config IP6_NF_NAT
+ 	tristate "ip6tables NAT support"
+-	depends on NF_CONNTRACK_IPV6
++	depends on NF_CONNTRACK
+ 	depends on NETFILTER_ADVANCED
+ 	select NF_NAT
+ 	select NF_NAT_IPV6
+@@ -365,6 +345,7 @@ config IP6_NF_TARGET_NPT
+ endif # IP6_NF_NAT
+ 
+ endif # IP6_NF_IPTABLES
+-
+ endmenu
+ 
++config NF_DEFRAG_IPV6
++	tristate
+diff --git a/net/ipv6/netfilter/Makefile b/net/ipv6/netfilter/Makefile
+index 10a5a1c87320..200c0c235565 100644
+--- a/net/ipv6/netfilter/Makefile
++++ b/net/ipv6/netfilter/Makefile
+@@ -11,12 +11,6 @@ obj-$(CONFIG_IP6_NF_RAW) += ip6table_raw.o
+ obj-$(CONFIG_IP6_NF_SECURITY) += ip6table_security.o
+ obj-$(CONFIG_IP6_NF_NAT) += ip6table_nat.o
+ 
+-# objects for l3 independent conntrack
+-nf_conntrack_ipv6-y  :=  nf_conntrack_l3proto_ipv6.o nf_conntrack_proto_icmpv6.o
+-
+-# l3 independent conntrack
+-obj-$(CONFIG_NF_CONNTRACK_IPV6) += nf_conntrack_ipv6.o
+-
+ nf_nat_ipv6-y		:= nf_nat_l3proto_ipv6.o nf_nat_proto_icmpv6.o
+ nf_nat_ipv6-$(CONFIG_NF_NAT_MASQUERADE_IPV6) += nf_nat_masquerade_ipv6.o
+ obj-$(CONFIG_NF_NAT_IPV6) += nf_nat_ipv6.o
+* Unmerged path net/ipv6/netfilter/nf_conntrack_l3proto_ipv6.c
+diff --git a/net/netfilter/Kconfig b/net/netfilter/Kconfig
+index 0afbf3b2f362..856d3d5b4a98 100644
+--- a/net/netfilter/Kconfig
++++ b/net/netfilter/Kconfig
+@@ -49,6 +49,8 @@ config NETFILTER_NETLINK_LOG
+ config NF_CONNTRACK
+ 	tristate "Netfilter connection tracking support"
+ 	default m if NETFILTER_ADVANCED=n
++	select NF_DEFRAG_IPV4
++	select NF_DEFRAG_IPV6 if IPV6 != n
+ 	help
+ 	  Connection tracking keeps a record of what packets have passed
+ 	  through your machine, in order to figure out how they are related
+* Unmerged path net/netfilter/Makefile
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_proto.c
+diff --git a/net/ipv4/netfilter/nf_conntrack_proto_icmp.c b/net/netfilter/nf_conntrack_proto_icmp.c
+similarity index 100%
+rename from net/ipv4/netfilter/nf_conntrack_proto_icmp.c
+rename to net/netfilter/nf_conntrack_proto_icmp.c
+diff --git a/net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c b/net/netfilter/nf_conntrack_proto_icmpv6.c
+similarity index 100%
+rename from net/ipv6/netfilter/nf_conntrack_proto_icmpv6.c
+rename to net/netfilter/nf_conntrack_proto_icmpv6.c
+diff --git a/net/netfilter/nf_conntrack_standalone.c b/net/netfilter/nf_conntrack_standalone.c
+index b642c0b2495c..7ae5dff5481b 100644
+--- a/net/netfilter/nf_conntrack_standalone.c
++++ b/net/netfilter/nf_conntrack_standalone.c
+@@ -1,12 +1,4 @@
+-/* (C) 1999-2001 Paul `Rusty' Russell
+- * (C) 2002-2004 Netfilter Core Team <coreteam@netfilter.org>
+- * (C) 2005-2012 Patrick McHardy <kaber@trash.net>
+- *
+- * This program is free software; you can redistribute it and/or modify
+- * it under the terms of the GNU General Public License version 2 as
+- * published by the Free Software Foundation.
+- */
+-
++// SPDX-License-Identifier: GPL-2.0
+ #include <linux/types.h>
+ #include <linux/netfilter.h>
+ #include <linux/slab.h>
+@@ -33,7 +25,7 @@
+ #include <net/netfilter/nf_conntrack_timestamp.h>
+ #include <linux/rculist_nulls.h>
+ 
+-MODULE_LICENSE("GPL");
++unsigned int nf_conntrack_net_id __read_mostly;
+ 
+ #ifdef CONFIG_NF_CONNTRACK_PROCFS
+ void
+@@ -680,6 +672,8 @@ static void nf_conntrack_pernet_exit(struct list_head *net_exit_list)
+ static struct pernet_operations nf_conntrack_net_ops = {
+ 	.init		= nf_conntrack_pernet_init,
+ 	.exit_batch	= nf_conntrack_pernet_exit,
++	.id		= &nf_conntrack_net_id,
++	.size = sizeof(struct nf_conntrack_net),
+ };
+ 
+ static int __init nf_conntrack_standalone_init(void)
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 5e173f6800a4..34e0b1d1a1d5 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -28,7 +28,6 @@
+ #include <net/netfilter/nf_nat_helper.h>
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <net/netfilter/nf_conntrack_seqadj.h>
+-#include <net/netfilter/nf_conntrack_l3proto.h>
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <linux/netfilter/nf_nat.h>
+ 
+@@ -744,12 +743,6 @@ EXPORT_SYMBOL_GPL(nf_nat_l4proto_unregister);
+ 
+ int nf_nat_l3proto_register(const struct nf_nat_l3proto *l3proto)
+ {
+-	int err;
+-
+-	err = nf_ct_l3proto_try_module_get(l3proto->l3proto);
+-	if (err < 0)
+-		return err;
+-
+ 	mutex_lock(&nf_nat_proto_mutex);
+ 	RCU_INIT_POINTER(nf_nat_l4protos[l3proto->l3proto][IPPROTO_TCP],
+ 			 &nf_nat_l4proto_tcp);
+@@ -782,7 +775,6 @@ void nf_nat_l3proto_unregister(const struct nf_nat_l3proto *l3proto)
+ 	synchronize_rcu();
+ 
+ 	nf_nat_l3proto_clean(l3proto->l3proto);
+-	nf_ct_l3proto_module_put(l3proto->l3proto);
+ }
+ EXPORT_SYMBOL_GPL(nf_nat_l3proto_unregister);
+ 
