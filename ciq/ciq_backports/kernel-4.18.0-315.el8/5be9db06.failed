@@ -1,0 +1,234 @@
+scsi: smartpqi: Update RAID bypass handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Kevin Barnett <kevin.barnett@microchip.com>
+commit 5be9db069d3faac584bec6db6ca98e699abf199e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/5be9db06.failed
+
+Simplify AIO retry management by removing retry list and list
+management. Need to retry is already set in the response status. Also
+remove the bypass worker thread.
+
+Accelerated I/O requests bypass the RAID engine and go directly to either
+an HBA disk or to a physical component of a RAID volume.
+
+Link: https://lore.kernel.org/r/161549380976.25025.11776487034357231156.stgit@brunhilda
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5be9db069d3faac584bec6db6ca98e699abf199e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index 20dab6ad8e02,b44de3e25541..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -5255,28 -5313,154 +5123,27 @@@ static void pqi_aio_io_complete(struct 
+  
+  	scmd = io_request->scmd;
+  	scsi_dma_unmap(scmd);
+- 	if (io_request->status == -EAGAIN)
++ 	if (io_request->status == -EAGAIN || pqi_raid_bypass_retry_needed(io_request)) {
+  		set_host_byte(scmd, DID_IMM_RETRY);
+- 	else if (pqi_raid_bypass_retry_needed(io_request)) {
+- 		pqi_queue_raid_bypass_retry(io_request);
+- 		return;
++ 		scmd->SCp.this_residual++;
+  	}
++ 
+  	pqi_free_io_request(io_request);
+  	pqi_scsi_done(scmd);
+ -}
+ -
+ -static inline int pqi_aio_submit_scsi_cmd(struct pqi_ctrl_info *ctrl_info,
+ -	struct pqi_scsi_dev *device, struct scsi_cmnd *scmd,
+ -	struct pqi_queue_group *queue_group)
+ -{
+ -	return pqi_aio_submit_io(ctrl_info, scmd, device->aio_handle,
+ -		scmd->cmnd, scmd->cmd_len, queue_group, NULL, false);
+ -}
+ -
+ -static int pqi_aio_submit_io(struct pqi_ctrl_info *ctrl_info,
+ -	struct scsi_cmnd *scmd, u32 aio_handle, u8 *cdb,
+ -	unsigned int cdb_length, struct pqi_queue_group *queue_group,
+ -	struct pqi_encryption_info *encryption_info, bool raid_bypass)
+ -{
+ -	int rc;
+ -	struct pqi_io_request *io_request;
+ -	struct pqi_aio_path_request *request;
+ -
+ -	io_request = pqi_alloc_io_request(ctrl_info);
+ -	io_request->io_complete_callback = pqi_aio_io_complete;
+ -	io_request->scmd = scmd;
+ -	io_request->raid_bypass = raid_bypass;
+ -
+ -	request = io_request->iu;
+ -	memset(request, 0, offsetof(struct pqi_raid_path_request, sg_descriptors));
+ -
+ -	request->header.iu_type = PQI_REQUEST_IU_AIO_PATH_IO;
+ -	put_unaligned_le32(aio_handle, &request->nexus_id);
+ -	put_unaligned_le32(scsi_bufflen(scmd), &request->buffer_length);
+ -	request->task_attribute = SOP_TASK_ATTRIBUTE_SIMPLE;
+ -	put_unaligned_le16(io_request->index, &request->request_id);
+ -	request->error_index = request->request_id;
+ -	if (cdb_length > sizeof(request->cdb))
+ -		cdb_length = sizeof(request->cdb);
+ -	request->cdb_length = cdb_length;
+ -	memcpy(request->cdb, cdb, cdb_length);
+ -
+ -	switch (scmd->sc_data_direction) {
+ -	case DMA_TO_DEVICE:
+ -		request->data_direction = SOP_READ_FLAG;
+ -		break;
+ -	case DMA_FROM_DEVICE:
+ -		request->data_direction = SOP_WRITE_FLAG;
+ -		break;
+ -	case DMA_NONE:
+ -		request->data_direction = SOP_NO_DIRECTION_FLAG;
+ -		break;
+ -	case DMA_BIDIRECTIONAL:
+ -		request->data_direction = SOP_BIDIRECTIONAL;
+ -		break;
+ -	default:
+ -		dev_err(&ctrl_info->pci_dev->dev,
+ -			"unknown data direction: %d\n",
+ -			scmd->sc_data_direction);
+ -		break;
+ -	}
+ -
+ -	if (encryption_info) {
+ -		request->encryption_enable = true;
+ -		put_unaligned_le16(encryption_info->data_encryption_key_index,
+ -			&request->data_encryption_key_index);
+ -		put_unaligned_le32(encryption_info->encrypt_tweak_lower,
+ -			&request->encrypt_tweak_lower);
+ -		put_unaligned_le32(encryption_info->encrypt_tweak_upper,
+ -			&request->encrypt_tweak_upper);
+ -	}
+ -
+ -	rc = pqi_build_aio_sg_list(ctrl_info, request, scmd, io_request);
+ -	if (rc) {
+ -		pqi_free_io_request(io_request);
+ -		return SCSI_MLQUEUE_HOST_BUSY;
+ -	}
+ -
+ -	pqi_start_io(ctrl_info, queue_group, AIO_PATH, io_request);
+ -
+ -	return 0;
+ -}
+ -
+ -static  int pqi_aio_submit_r1_write_io(struct pqi_ctrl_info *ctrl_info,
+ -	struct scsi_cmnd *scmd, struct pqi_queue_group *queue_group,
+ -	struct pqi_encryption_info *encryption_info, struct pqi_scsi_dev *device,
+ -	struct pqi_scsi_dev_raid_map_data *rmd)
+ -{
+ -	int rc;
+ -	struct pqi_io_request *io_request;
+ -	struct pqi_aio_r1_path_request *r1_request;
+ -
+ -	io_request = pqi_alloc_io_request(ctrl_info);
+ -	io_request->io_complete_callback = pqi_aio_io_complete;
+ -	io_request->scmd = scmd;
+ -	io_request->raid_bypass = true;
+ -
+ -	r1_request = io_request->iu;
+ -	memset(r1_request, 0, offsetof(struct pqi_aio_r1_path_request, sg_descriptors));
+ -
+ -	r1_request->header.iu_type = PQI_REQUEST_IU_AIO_PATH_RAID1_IO;
+ -	put_unaligned_le16(*(u16 *)device->scsi3addr & 0x3fff, &r1_request->volume_id);
+ -	r1_request->num_drives = rmd->num_it_nexus_entries;
+ -	put_unaligned_le32(rmd->it_nexus[0], &r1_request->it_nexus_1);
+ -	put_unaligned_le32(rmd->it_nexus[1], &r1_request->it_nexus_2);
+ -	if (rmd->num_it_nexus_entries == 3)
+ -		put_unaligned_le32(rmd->it_nexus[2], &r1_request->it_nexus_3);
+ -
+ -	put_unaligned_le32(scsi_bufflen(scmd), &r1_request->data_length);
+ -	r1_request->task_attribute = SOP_TASK_ATTRIBUTE_SIMPLE;
+ -	put_unaligned_le16(io_request->index, &r1_request->request_id);
+ -	r1_request->error_index = r1_request->request_id;
+ -	if (rmd->cdb_length > sizeof(r1_request->cdb))
+ -		rmd->cdb_length = sizeof(r1_request->cdb);
+ -	r1_request->cdb_length = rmd->cdb_length;
+ -	memcpy(r1_request->cdb, rmd->cdb, rmd->cdb_length);
+ -
+ -	/* The direction is always write. */
+ -	r1_request->data_direction = SOP_READ_FLAG;
+ -
+ -	if (encryption_info) {
+ -		r1_request->encryption_enable = true;
+ -		put_unaligned_le16(encryption_info->data_encryption_key_index,
+ -				&r1_request->data_encryption_key_index);
+ -		put_unaligned_le32(encryption_info->encrypt_tweak_lower,
+ -				&r1_request->encrypt_tweak_lower);
+ -		put_unaligned_le32(encryption_info->encrypt_tweak_upper,
+ -				&r1_request->encrypt_tweak_upper);
+ -	}
+ -
+ -	rc = pqi_build_aio_r1_sg_list(ctrl_info, r1_request, scmd, io_request);
+ -	if (rc) {
+ -		pqi_free_io_request(io_request);
+ -		return SCSI_MLQUEUE_HOST_BUSY;
+ -	}
+ -
+ -	pqi_start_io(ctrl_info, queue_group, AIO_PATH, io_request);
+ +}
+  
+ -	return 0;
+ +static inline int pqi_aio_submit_scsi_cmd(struct pqi_ctrl_info *ctrl_info,
+ +	struct pqi_scsi_dev *device, struct scsi_cmnd *scmd,
+ +	struct pqi_queue_group *queue_group)
+ +{
+ +	return pqi_aio_submit_io(ctrl_info, scmd, device->aio_handle,
+ +		scmd->cmnd, scmd->cmd_len, queue_group, NULL, false);
+  }
+  
+ -static int pqi_aio_submit_r56_write_io(struct pqi_ctrl_info *ctrl_info,
+ -	struct scsi_cmnd *scmd, struct pqi_queue_group *queue_group,
+ -	struct pqi_encryption_info *encryption_info, struct pqi_scsi_dev *device,
+ -	struct pqi_scsi_dev_raid_map_data *rmd)
+ +static int pqi_aio_submit_io(struct pqi_ctrl_info *ctrl_info,
+ +	struct scsi_cmnd *scmd, u32 aio_handle, u8 *cdb,
+ +	unsigned int cdb_length, struct pqi_queue_group *queue_group,
+ +	struct pqi_encryption_info *encryption_info, bool raid_bypass)
+  {
+  	int rc;
+  	struct pqi_io_request *io_request;
+@@@ -5424,9 -5684,9 +5297,15 @@@ static int pqi_scsi_queue_command(struc
+  	if (pqi_is_logical_device(device)) {
+  		raid_bypassed = false;
+  		if (device->raid_bypass_enabled &&
+++<<<<<<< HEAD
+ +			!blk_rq_is_passthrough(scmd->request)) {
+ +			rc = pqi_raid_bypass_submit_scsi_cmd(ctrl_info, device,
+ +				scmd, queue_group);
+++=======
++ 			pqi_is_bypass_eligible_request(scmd) &&
++ 			!pqi_is_parity_write_stream(ctrl_info, scmd)) {
++ 			rc = pqi_raid_bypass_submit_scsi_cmd(ctrl_info, device, scmd, queue_group);
+++>>>>>>> 5be9db069d3f (scsi: smartpqi: Update RAID bypass handling)
+  			if (rc == 0 || rc == SCSI_MLQUEUE_HOST_BUSY) {
+  				raid_bypassed = true;
+  				atomic_inc(&device->raid_bypass_cnt);
+diff --git a/drivers/scsi/smartpqi/smartpqi.h b/drivers/scsi/smartpqi/smartpqi.h
+index 8759c807d025..4963543d7500 100644
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@ -1187,10 +1187,6 @@ struct pqi_ctrl_info {
+ 	atomic_t	num_blocked_threads;
+ 	wait_queue_head_t block_requests_wait;
+ 
+-	struct list_head raid_bypass_retry_list;
+-	spinlock_t	raid_bypass_retry_list_lock;
+-	struct work_struct raid_bypass_retry_work;
+-
+ 	struct pqi_ofa_memory *pqi_ofa_mem_virt_addr;
+ 	dma_addr_t	pqi_ofa_mem_dma_handle;
+ 	void		**pqi_ofa_chunk_virt_addr;
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
