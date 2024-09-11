@@ -2881,7 +2881,7 @@ static int iavf_setup_tc_cls_flower(struct iavf_adapter *adapter,
 	case TC_CLSFLOWER_STATS:
 		return -EOPNOTSUPP;
 	default:
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	}
 }
 

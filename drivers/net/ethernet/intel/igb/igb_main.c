@@ -2697,7 +2697,7 @@ static int igb_setup_tc_cls_flower(struct igb_adapter *adapter,
 	case TC_CLSFLOWER_STATS:
 		return -EOPNOTSUPP;
 	default:
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	}
 }
 

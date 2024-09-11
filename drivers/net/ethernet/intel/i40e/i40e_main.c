@@ -7597,7 +7597,7 @@ static int i40e_setup_tc_cls_flower(struct i40e_netdev_priv *np,
 	case TC_CLSFLOWER_STATS:
 		return -EOPNOTSUPP;
 	default:
-		return -EINVAL;
+		return -EOPNOTSUPP;
 	}
 }
 
