@@ -1,0 +1,174 @@
+sched: Remove select_task_rq()'s sd_flag parameter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Valentin Schneider <valentin.schneider@arm.com>
+commit 3aef1551e942860a3881087171ef0cd45f6ebda7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/3aef1551.failed
+
+Only select_task_rq_fair() uses that parameter to do an actual domain
+search, other classes only care about what kind of wakeup is happening
+(fork, exec, or "regular") and thus just translate the flag into a wakeup
+type.
+
+WF_TTWU and WF_EXEC have just been added, use these along with WF_FORK to
+encode the wakeup types we care about. For select_task_rq_fair(), we can
+simply use the shiny new WF_flag : SD_flag mapping.
+
+	Signed-off-by: Valentin Schneider <valentin.schneider@arm.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20201102184514.2733-3-valentin.schneider@arm.com
+(cherry picked from commit 3aef1551e942860a3881087171ef0cd45f6ebda7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+#	kernel/sched/sched.h
+diff --cc kernel/sched/core.c
+index da95e3c3bc0d,a6aaf9fb3400..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -1675,8 -2773,8 +1675,13 @@@ int select_task_rq(struct task_struct *
+  {
+  	lockdep_assert_held(&p->pi_lock);
+  
+++<<<<<<< HEAD
+ +	if (p->nr_cpus_allowed > 1)
+ +		cpu = p->sched_class->select_task_rq(p, cpu, sd_flags, wake_flags);
+++=======
++ 	if (p->nr_cpus_allowed > 1 && !is_migration_disabled(p))
++ 		cpu = p->sched_class->select_task_rq(p, cpu, wake_flags);
+++>>>>>>> 3aef1551e942 (sched: Remove select_task_rq()'s sd_flag parameter)
+  	else
+  		cpu = cpumask_any(p->cpus_ptr);
+  
+diff --cc kernel/sched/sched.h
+index 22cabed6c4b7,590e6f27068c..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -1742,16 -1826,15 +1742,22 @@@ struct sched_class 
+  
+  	void (*check_preempt_curr)(struct rq *rq, struct task_struct *p, int flags);
+  
+ -	struct task_struct *(*pick_next_task)(struct rq *rq);
+ -
+ +	RH_KABI_REPLACE(struct task_struct * (*pick_next_task)(struct rq *rq,
+ +							       struct task_struct *prev,
+ +						               struct rq_flags *rf),
+ +			struct task_struct *(*pick_next_task)(struct rq *rq))
+  	void (*put_prev_task)(struct rq *rq, struct task_struct *p);
+ -	void (*set_next_task)(struct rq *rq, struct task_struct *p, bool first);
+  
+  #ifdef CONFIG_SMP
+++<<<<<<< HEAD
+ +	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int sd_flag, int flags);
+ +	RH_KABI_REPLACE(void (*migrate_task_rq)(struct task_struct *p),\
+ +			void (*migrate_task_rq)(struct task_struct *p, int new_cpu))
+++=======
++ 	int (*balance)(struct rq *rq, struct task_struct *prev, struct rq_flags *rf);
++ 	int  (*select_task_rq)(struct task_struct *p, int task_cpu, int flags);
++ 	void (*migrate_task_rq)(struct task_struct *p, int new_cpu);
+++>>>>>>> 3aef1551e942 (sched: Remove select_task_rq()'s sd_flag parameter)
+  
+  	void (*task_woken)(struct rq *this_rq, struct task_struct *task);
+  
+* Unmerged path kernel/sched/core.c
+diff --git a/kernel/sched/deadline.c b/kernel/sched/deadline.c
+index d3d477e6e2c1..ec44900eff0c 100644
+--- a/kernel/sched/deadline.c
++++ b/kernel/sched/deadline.c
+@@ -1631,12 +1631,12 @@ static void yield_task_dl(struct rq *rq)
+ static int find_later_rq(struct task_struct *task);
+ 
+ static int
+-select_task_rq_dl(struct task_struct *p, int cpu, int sd_flag, int flags)
++select_task_rq_dl(struct task_struct *p, int cpu, int flags)
+ {
+ 	struct task_struct *curr;
+ 	struct rq *rq;
+ 
+-	if (sd_flag != SD_BALANCE_WAKE)
++	if (!(flags & WF_TTWU))
+ 		goto out;
+ 
+ 	rq = cpu_rq(cpu);
+diff --git a/kernel/sched/fair.c b/kernel/sched/fair.c
+index b7f67217bf88..79adf5dd2b15 100644
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -6603,7 +6603,7 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+ 
+ /*
+  * select_task_rq_fair: Select target runqueue for the waking task in domains
+- * that have the 'sd_flag' flag set. In practice, this is SD_BALANCE_WAKE,
++ * that have the relevant SD flag set. In practice, this is SD_BALANCE_WAKE,
+  * SD_BALANCE_FORK, or SD_BALANCE_EXEC.
+  *
+  * Balances load by selecting the idlest CPU in the idlest group, or under
+@@ -6614,13 +6614,15 @@ static int find_energy_efficient_cpu(struct task_struct *p, int prev_cpu)
+  * preempt must be disabled.
+  */
+ static int
+-select_task_rq_fair(struct task_struct *p, int prev_cpu, int sd_flag, int wake_flags)
++select_task_rq_fair(struct task_struct *p, int prev_cpu, int wake_flags)
+ {
++	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
+ 	struct sched_domain *tmp, *sd = NULL;
+ 	int cpu = smp_processor_id();
+ 	int new_cpu = prev_cpu;
+ 	int want_affine = 0;
+-	int sync = (wake_flags & WF_SYNC) && !(current->flags & PF_EXITING);
++	/* SD_flags and WF_flags share the first nibble */
++	int sd_flag = wake_flags & 0xF;
+ 
+ 	if (sd_flag & SD_BALANCE_WAKE) {
+ 		record_wakee(p);
+diff --git a/kernel/sched/idle.c b/kernel/sched/idle.c
+index b98df0e51635..8a18cec1f9f6 100644
+--- a/kernel/sched/idle.c
++++ b/kernel/sched/idle.c
+@@ -386,7 +386,7 @@ void cpu_startup_entry(enum cpuhp_state state)
+ 
+ #ifdef CONFIG_SMP
+ static int
+-select_task_rq_idle(struct task_struct *p, int cpu, int sd_flag, int flags)
++select_task_rq_idle(struct task_struct *p, int cpu, int flags)
+ {
+ 	return task_cpu(p); /* IDLE tasks as never migrated */
+ }
+diff --git a/kernel/sched/rt.c b/kernel/sched/rt.c
+index d2cb9615319b..47ba410a21c2 100644
+--- a/kernel/sched/rt.c
++++ b/kernel/sched/rt.c
+@@ -1389,13 +1389,13 @@ static void yield_task_rt(struct rq *rq)
+ static int find_lowest_rq(struct task_struct *task);
+ 
+ static int
+-select_task_rq_rt(struct task_struct *p, int cpu, int sd_flag, int flags)
++select_task_rq_rt(struct task_struct *p, int cpu, int flags)
+ {
+ 	struct task_struct *curr;
+ 	struct rq *rq;
+ 
+ 	/* For anything but wake ups, just return the task_cpu */
+-	if (sd_flag != SD_BALANCE_WAKE && sd_flag != SD_BALANCE_FORK)
++	if (!(flags & (WF_TTWU | WF_FORK)))
+ 		goto out;
+ 
+ 	rq = cpu_rq(cpu);
+* Unmerged path kernel/sched/sched.h
+diff --git a/kernel/sched/stop_task.c b/kernel/sched/stop_task.c
+index 3e50a6a8f1e5..bd8a76679d21 100644
+--- a/kernel/sched/stop_task.c
++++ b/kernel/sched/stop_task.c
+@@ -11,7 +11,7 @@
+ 
+ #ifdef CONFIG_SMP
+ static int
+-select_task_rq_stop(struct task_struct *p, int cpu, int sd_flag, int flags)
++select_task_rq_stop(struct task_struct *p, int cpu, int flags)
+ {
+ 	return task_cpu(p); /* stop tasks as never migrate */
+ }
