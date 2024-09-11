@@ -1,0 +1,345 @@
+powerpc/fadump: add support to preserve crash data on FADUMP disabled kernel
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Hari Bathini <hbathini@linux.ibm.com>
+commit bec53196adf4791d466adf0e339b61186c7b5283
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/bec53196.failed
+
+Add a new kernel config option, CONFIG_PRESERVE_FA_DUMP that ensures
+that crash data, from previously crash'ed kernel, is preserved. This
+helps in cases where FADump is not enabled but the subsequent memory
+preserving kernel boot is likely to process this crash data. One
+typical usecase for this config option is petitboot kernel.
+
+As OPAL allows registering address with it in the first kernel and
+retrieving it after MPIPL, use it to store the top of boot memory.
+A kernel that intends to preserve crash data retrieves it and avoids
+using memory beyond this address.
+
+Move arch_reserved_kernel_pages() function as it is needed for both
+FA_DUMP and PRESERVE_FA_DUMP configurations.
+
+	Signed-off-by: Hari Bathini <hbathini@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/156821375751.5656.11459483669542541602.stgit@hbathini.in.ibm.com
+(cherry picked from commit bec53196adf4791d466adf0e339b61186c7b5283)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/fadump-internal.h
+#	arch/powerpc/kernel/fadump.c
+#	arch/powerpc/platforms/powernv/Makefile
+#	arch/powerpc/platforms/powernv/opal-fadump.c
+diff --cc arch/powerpc/include/asm/fadump-internal.h
+index f8097510e03f,6c2868d38bd3..000000000000
+--- a/arch/powerpc/include/asm/fadump-internal.h
++++ b/arch/powerpc/include/asm/fadump-internal.h
+@@@ -109,4 -147,28 +110,31 @@@ void fadump_update_elfcore_header(char 
+  bool is_fadump_boot_mem_contiguous(void);
+  bool is_fadump_reserved_mem_contiguous(void);
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_PRESERVE_FA_DUMP */
++ 
++ /* Firmware-assisted dump configuration details. */
++ struct fw_dump {
++ 	u64	boot_mem_top;
++ 	u64	dump_active;
++ };
++ 
++ #endif /* CONFIG_PRESERVE_FA_DUMP */
++ 
++ #ifdef CONFIG_PPC_PSERIES
++ extern void rtas_fadump_dt_scan(struct fw_dump *fadump_conf, u64 node);
++ #else
++ static inline void
++ rtas_fadump_dt_scan(struct fw_dump *fadump_conf, u64 node) { }
++ #endif
++ 
++ #ifdef CONFIG_PPC_POWERNV
++ extern void opal_fadump_dt_scan(struct fw_dump *fadump_conf, u64 node);
++ #else
++ static inline void
++ opal_fadump_dt_scan(struct fw_dump *fadump_conf, u64 node) { }
++ #endif
++ 
+++>>>>>>> bec53196adf4 (powerpc/fadump: add support to preserve crash data on FADUMP disabled kernel)
+  #endif /* _ASM_POWERPC_FADUMP_INTERNAL_H */
+diff --cc arch/powerpc/kernel/fadump.c
+index 56526469b148,645d9d4d9332..000000000000
+--- a/arch/powerpc/kernel/fadump.c
++++ b/arch/powerpc/kernel/fadump.c
+@@@ -45,17 -32,14 +45,18 @@@
+  #include <asm/fadump-internal.h>
+  #include <asm/setup.h>
+  
+ -static struct fw_dump fw_dump;
+ +#include "../platforms/pseries/rtas-fadump.h"
+  
+ -static void __init fadump_reserve_crash_area(u64 base);
+ +static struct fw_dump fw_dump;
+ +static struct rtas_fadump_mem_struct fdm;
+ +static const struct rtas_fadump_mem_struct *fdm_active;
+  
++ #ifndef CONFIG_PRESERVE_FA_DUMP
+  static DEFINE_MUTEX(fadump_mutex);
+ -struct fadump_mrange_info crash_mrange_info = { "crash", NULL, 0, 0, 0 };
+ -struct fadump_mrange_info reserved_mrange_info = { "reserved", NULL, 0, 0, 0 };
+ +struct fad_crash_memory_ranges *crash_memory_ranges;
+ +int crash_memory_ranges_size;
+ +int crash_mem_ranges;
+ +int max_crash_mem_ranges;
+  
+  #ifdef CONFIG_CMA
+  static struct cma *fadump_cma;
+@@@ -539,40 -401,45 +540,35 @@@ int __init fadump_reserve_mem(void
+  	} else {
+  		/*
+  		 * Reserve memory at an offset closer to bottom of the RAM to
+ -		 * minimize the impact of memory hot-remove operation.
+ +		 * minimize the impact of memory hot-remove operation. We can't
+ +		 * use memblock_find_in_range() here since it doesn't allocate
+ +		 * from bottom to top.
+  		 */
+ -		memblock_set_bottom_up(true);
+ -		base = memblock_find_in_range(base, mem_boundary, size, align);
+ -
+ -		/* Restore the previous allocation mode */
+ -		memblock_set_bottom_up(is_memblock_bottom_up);
+ -
+ -		if (!base) {
+ -			pr_err("Failed to find memory chunk for reservation!\n");
+ -			goto error_out;
+ +		for (base = fw_dump.boot_memory_size;
+ +		     base <= (memory_boundary - size);
+ +		     base += size) {
+ +			if (memblock_is_region_memory(base, size) &&
+ +			    !memblock_is_region_reserved(base, size))
+ +				break;
+  		}
+ -		fw_dump.reserve_dump_area_start = base;
+ -
+ -		/*
+ -		 * Calculate the kernel metadata address and register it with
+ -		 * f/w if the platform supports.
+ -		 */
+ -		if (fw_dump.ops->fadump_setup_metadata &&
+ -		    (fw_dump.ops->fadump_setup_metadata(&fw_dump) < 0))
+ -			goto error_out;
+ -
+ -		if (memblock_reserve(base, size)) {
+ -			pr_err("Failed to reserve memory!\n");
+ -			goto error_out;
+ +		if ((base > (memory_boundary - size)) ||
+ +		    memblock_reserve(base, size)) {
+ +			pr_err("Failed to reserve memory\n");
+ +			return 0;
+  		}
+  
+ -		pr_info("Reserved %lldMB of memory at %#016llx (System RAM: %lldMB)\n",
+ -			(size >> 20), base, (memblock_phys_mem_size() >> 20));
+ +		pr_info("Reserved %ldMB of memory at %ldMB for firmware-"
+ +			"assisted dump (System RAM: %ldMB)\n",
+ +			(unsigned long)(size >> 20),
+ +			(unsigned long)(base >> 20),
+ +			(unsigned long)(memblock_phys_mem_size() >> 20));
+  
+ -		ret = fadump_cma_init();
+ +		fw_dump.reserve_dump_area_start = base;
+ +		return fadump_cma_init();
+  	}
+ -
+ -	return ret;
+ -error_out:
+ -	fw_dump.fadump_enabled = 0;
+ -	return 0;
+ +	return 1;
+  }
+  
+- unsigned long __init arch_reserved_kernel_pages(void)
+- {
+- 	return memblock_reserved_size() / PAGE_SIZE;
+- }
+- 
+  /* Look for fadump= cmdline option. */
+  static int __init early_fadump_param(char *p)
+  {
+@@@ -1708,3 -1354,65 +1704,68 @@@ int __init setup_fadump(void
+  	return 1;
+  }
+  subsys_initcall(setup_fadump);
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_PRESERVE_FA_DUMP */
++ 
++ /* Scan the Firmware Assisted dump configuration details. */
++ int __init early_init_dt_scan_fw_dump(unsigned long node, const char *uname,
++ 				      int depth, void *data)
++ {
++ 	if ((depth != 1) || (strcmp(uname, "ibm,opal") != 0))
++ 		return 0;
++ 
++ 	opal_fadump_dt_scan(&fw_dump, node);
++ 	return 1;
++ }
++ 
++ /*
++  * When dump is active but PRESERVE_FA_DUMP is enabled on the kernel,
++  * preserve crash data. The subsequent memory preserving kernel boot
++  * is likely to process this crash data.
++  */
++ int __init fadump_reserve_mem(void)
++ {
++ 	if (fw_dump.dump_active) {
++ 		/*
++ 		 * If last boot has crashed then reserve all the memory
++ 		 * above boot memory to preserve crash data.
++ 		 */
++ 		pr_info("Preserving crash data for processing in next boot.\n");
++ 		fadump_reserve_crash_area(fw_dump.boot_mem_top);
++ 	} else
++ 		pr_debug("FADump-aware kernel..\n");
++ 
++ 	return 1;
++ }
++ #endif /* CONFIG_PRESERVE_FA_DUMP */
++ 
++ /* Preserve everything above the base address */
++ static void __init fadump_reserve_crash_area(u64 base)
++ {
++ 	struct memblock_region *reg;
++ 	u64 mstart, msize;
++ 
++ 	for_each_memblock(memory, reg) {
++ 		mstart = reg->base;
++ 		msize  = reg->size;
++ 
++ 		if ((mstart + msize) < base)
++ 			continue;
++ 
++ 		if (mstart < base) {
++ 			msize -= (base - mstart);
++ 			mstart = base;
++ 		}
++ 
++ 		pr_info("Reserving %lluMB of memory at %#016llx for preserving crash data",
++ 			(msize >> 20), mstart);
++ 		memblock_reserve(mstart, msize);
++ 	}
++ }
++ 
++ unsigned long __init arch_reserved_kernel_pages(void)
++ {
++ 	return memblock_reserved_size() / PAGE_SIZE;
++ }
+++>>>>>>> bec53196adf4 (powerpc/fadump: add support to preserve crash data on FADUMP disabled kernel)
+diff --cc arch/powerpc/platforms/powernv/Makefile
+index da2e99efbd04,2d13e6462339..000000000000
+--- a/arch/powerpc/platforms/powernv/Makefile
++++ b/arch/powerpc/platforms/powernv/Makefile
+@@@ -4,8 -4,11 +4,13 @@@ obj-y			+= idle.o opal-rtc.o opal-nvram
+  obj-y			+= rng.o opal-elog.o opal-dump.o opal-sysparam.o opal-sensor.o
+  obj-y			+= opal-msglog.o opal-hmi.o opal-power.o opal-irqchip.o
+  obj-y			+= opal-kmsg.o opal-powercap.o opal-psr.o opal-sensor-groups.o
+ -obj-y			+= ultravisor.o
+  
+  obj-$(CONFIG_SMP)	+= smp.o subcore.o subcore-asm.o
+++<<<<<<< HEAD
+++=======
++ obj-$(CONFIG_FA_DUMP)	+= opal-fadump.o
++ obj-$(CONFIG_PRESERVE_FA_DUMP)	+= opal-fadump.o
+++>>>>>>> bec53196adf4 (powerpc/fadump: add support to preserve crash data on FADUMP disabled kernel)
+  obj-$(CONFIG_PCI)	+= pci.o pci-ioda.o npu-dma.o pci-ioda-tce.o
+  obj-$(CONFIG_CXL_BASE)	+= pci-cxl.o
+  obj-$(CONFIG_EEH)	+= eeh-powernv.o
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
+diff --git a/arch/powerpc/Kconfig b/arch/powerpc/Kconfig
+index 40466f86cda5..b75d7bb6d29a 100644
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@ -595,6 +595,15 @@ config FA_DUMP
+ 
+ 	  If unsure, say "N"
+ 
++config PRESERVE_FA_DUMP
++	bool "Preserve Firmware-assisted dump"
++	depends on PPC64 && PPC_POWERNV && !FA_DUMP
++	help
++	  On a kernel with FA_DUMP disabled, this option helps to preserve
++	  crash data from a previously crash'ed kernel. Useful when the next
++	  memory preserving kernel boot would process this crash data.
++	  Petitboot kernel is the typical usecase for this option.
++
+ config IRQ_ALL_CPUS
+ 	bool "Distribute interrupts on all CPUs by default"
+ 	depends on SMP
+* Unmerged path arch/powerpc/include/asm/fadump-internal.h
+diff --git a/arch/powerpc/include/asm/fadump.h b/arch/powerpc/include/asm/fadump.h
+index 9eb0530ba5cb..f4ea39168e86 100644
+--- a/arch/powerpc/include/asm/fadump.h
++++ b/arch/powerpc/include/asm/fadump.h
+@@ -27,9 +27,6 @@
+ extern int crashing_cpu;
+ 
+ extern int is_fadump_memory_area(u64 addr, ulong size);
+-extern int early_init_dt_scan_fw_dump(unsigned long node,
+-		const char *uname, int depth, void *data);
+-extern int fadump_reserve_mem(void);
+ extern int setup_fadump(void);
+ extern int is_fadump_active(void);
+ extern int should_fadump_crash(void);
+@@ -42,4 +39,10 @@ static inline int should_fadump_crash(void) { return 0; }
+ static inline void crash_fadump(struct pt_regs *regs, const char *str) { }
+ static inline void fadump_cleanup(void) { }
+ #endif /* !CONFIG_FA_DUMP */
++
++#if defined(CONFIG_FA_DUMP) || defined(CONFIG_PRESERVE_FA_DUMP)
++extern int early_init_dt_scan_fw_dump(unsigned long node, const char *uname,
++				      int depth, void *data);
++extern int fadump_reserve_mem(void);
++#endif
+ #endif /* _ASM_POWERPC_FADUMP_H */
+diff --git a/arch/powerpc/kernel/Makefile b/arch/powerpc/kernel/Makefile
+index 3b66f2c19c84..9222cba55528 100644
+--- a/arch/powerpc/kernel/Makefile
++++ b/arch/powerpc/kernel/Makefile
+@@ -62,7 +62,9 @@ obj-$(CONFIG_EEH)              += eeh.o eeh_pe.o eeh_dev.o eeh_cache.o \
+ 				  eeh_driver.o eeh_event.o eeh_sysfs.o
+ obj-$(CONFIG_GENERIC_TBSYNC)	+= smp-tbsync.o
+ obj-$(CONFIG_CRASH_DUMP)	+= crash_dump.o
+-obj-$(CONFIG_FA_DUMP)		+= fadump.o
++ifneq ($(CONFIG_FA_DUMP)$(CONFIG_PRESERVE_FA_DUMP),)
++obj-y				+= fadump.o
++endif
+ ifdef CONFIG_PPC32
+ obj-$(CONFIG_E500)		+= idle_e500.o
+ endif
+* Unmerged path arch/powerpc/kernel/fadump.c
+diff --git a/arch/powerpc/kernel/prom.c b/arch/powerpc/kernel/prom.c
+index 8f32f14ba508..228c9ce69ebf 100644
+--- a/arch/powerpc/kernel/prom.c
++++ b/arch/powerpc/kernel/prom.c
+@@ -706,7 +706,7 @@ void __init early_init_devtree(void *params)
+ 	of_scan_flat_dt(early_init_dt_scan_opal, NULL);
+ #endif
+ 
+-#ifdef CONFIG_FA_DUMP
++#if defined(CONFIG_FA_DUMP) || defined(CONFIG_PRESERVE_FA_DUMP)
+ 	/* scan tree to see if dump is active during last boot */
+ 	of_scan_flat_dt(early_init_dt_scan_fw_dump, NULL);
+ #endif
+@@ -733,7 +733,7 @@ void __init early_init_devtree(void *params)
+ 	if (PHYSICAL_START > MEMORY_START)
+ 		memblock_reserve(MEMORY_START, 0x8000);
+ 	reserve_kdump_trampoline();
+-#ifdef CONFIG_FA_DUMP
++#if defined(CONFIG_FA_DUMP) || defined(CONFIG_PRESERVE_FA_DUMP)
+ 	/*
+ 	 * If we fail to reserve memory for firmware-assisted dump then
+ 	 * fallback to kexec based kdump.
+* Unmerged path arch/powerpc/platforms/powernv/Makefile
+* Unmerged path arch/powerpc/platforms/powernv/opal-fadump.c
