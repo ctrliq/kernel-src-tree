@@ -2412,7 +2412,7 @@ static void arm_smmu_device_shutdown(struct platform_device *pdev)
 		return;
 
 	if (!bitmap_empty(smmu->context_map, ARM_SMMU_MAX_CBS))
-		dev_err(&pdev->dev, "removing device with active domains!\n");
+		dev_notice(&pdev->dev, "disabling translation\n");
 
 	arm_smmu_rpm_get(smmu);
 	/* Turn the thing off */
