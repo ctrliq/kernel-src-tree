@@ -1,0 +1,273 @@
+arm64: mm: Support Common Not Private translations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Vladimir Murzin <vladimir.murzin@arm.com>
+commit 5ffdfaedfa0aba3f5db0fbb8ed4f3192be2b39b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/5ffdfaed.failed
+
+Common Not Private (CNP) is a feature of ARMv8.2 extension which
+allows translation table entries to be shared between different PEs in
+the same inner shareable domain, so the hardware can use this fact to
+optimise the caching of such entries in the TLB.
+
+CNP occupies one bit in TTBRx_ELy and VTTBR_EL2, which advertises to
+the hardware that the translation table entries pointed to by this
+TTBR are the same as every PE in the same inner shareable domain for
+which the equivalent TTBR also has CNP bit set. In case CNP bit is set
+but TTBR does not point at the same translation table entries for a
+given ASID and VMID, then the system is mis-configured, so the results
+of translations are UNPREDICTABLE.
+
+For kernel we postpone setting CNP till all cpus are up and rely on
+cpufeature framework to 1) patch the code which is sensitive to CNP
+and 2) update TTBR1_EL1 with CNP bit set. TTBR1_EL1 can be
+reprogrammed as result of hibernation or cpuidle (via __enable_mmu).
+For these two cases we restore CnP bit via __cpu_suspend_exit().
+
+There are a few cases we need to care of changes in TTBR0_EL1:
+  - a switch to idmap
+  - software emulated PAN
+
+we rule out latter via Kconfig options and for the former we make
+sure that CNP is set for non-zero ASIDs only.
+
+	Reviewed-by: James Morse <james.morse@arm.com>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Vladimir Murzin <vladimir.murzin@arm.com>
+[catalin.marinas@arm.com: default y for CONFIG_ARM64_CNP]
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 5ffdfaedfa0aba3f5db0fbb8ed4f3192be2b39b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpucaps.h
+#	arch/arm64/kernel/cpufeature.c
+diff --cc arch/arm64/include/asm/cpucaps.h
+index 8a699c708fc9,c51d7e868f3f..000000000000
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@@ -49,7 -49,12 +49,17 @@@
+  #define ARM64_HAS_CACHE_DIC			28
+  #define ARM64_HW_DBM				29
+  #define ARM64_SSBD				30
+++<<<<<<< HEAD
+ +
+ +#define ARM64_NCAPS				31
+++=======
++ #define ARM64_MISMATCHED_CACHE_TYPE		31
++ #define ARM64_HAS_STAGE2_FWB			32
++ #define ARM64_HAS_CRC32				33
++ #define ARM64_SSBS				34
++ #define ARM64_HAS_CNP				35
++ 
++ #define ARM64_NCAPS				36
+++>>>>>>> 5ffdfaedfa0a (arm64: mm: Support Common Not Private translations)
+  
+  #endif /* __ASM_CPUCAPS_H */
+diff --cc arch/arm64/kernel/cpufeature.c
+index c6d80743f4ed,237f8822a391..000000000000
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@@ -1202,6 -1306,41 +1218,44 @@@ static const struct arm64_cpu_capabilit
+  		.cpu_enable = cpu_enable_hw_dbm,
+  	},
+  #endif
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_ARM64_SSBD
++ 	{
++ 		.desc = "CRC32 instructions",
++ 		.capability = ARM64_HAS_CRC32,
++ 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++ 		.matches = has_cpuid_feature,
++ 		.sys_reg = SYS_ID_AA64ISAR0_EL1,
++ 		.field_pos = ID_AA64ISAR0_CRC32_SHIFT,
++ 		.min_field_value = 1,
++ 	},
++ 	{
++ 		.desc = "Speculative Store Bypassing Safe (SSBS)",
++ 		.capability = ARM64_SSBS,
++ 		.type = ARM64_CPUCAP_WEAK_LOCAL_CPU_FEATURE,
++ 		.matches = has_cpuid_feature,
++ 		.sys_reg = SYS_ID_AA64PFR1_EL1,
++ 		.field_pos = ID_AA64PFR1_SSBS_SHIFT,
++ 		.sign = FTR_UNSIGNED,
++ 		.min_field_value = ID_AA64PFR1_SSBS_PSTATE_ONLY,
++ 		.cpu_enable = cpu_enable_ssbs,
++ 	},
++ #endif
++ #ifdef CONFIG_ARM64_CNP
++ 	{
++ 		.desc = "Common not Private translations",
++ 		.capability = ARM64_HAS_CNP,
++ 		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++ 		.matches = has_useable_cnp,
++ 		.sys_reg = SYS_ID_AA64MMFR2_EL1,
++ 		.sign = FTR_UNSIGNED,
++ 		.field_pos = ID_AA64MMFR2_CNP_SHIFT,
++ 		.min_field_value = 1,
++ 		.cpu_enable = cpu_enable_cnp,
++ 	},
++ #endif
+++>>>>>>> 5ffdfaedfa0a (arm64: mm: Support Common Not Private translations)
+  	{},
+  };
+  
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 5b4fd63f9948..9b5841c4b718 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -1137,6 +1137,20 @@ config ARM64_RAS_EXTN
+ 	  and access the new registers if the system supports the extension.
+ 	  Platform RAS features may additionally depend on firmware support.
+ 
++config ARM64_CNP
++	bool "Enable support for Common Not Private (CNP) translations"
++	default y
++	depends on ARM64_PAN || !ARM64_SW_TTBR0_PAN
++	help
++	  Common Not Private (CNP) allows translation table entries to
++	  be shared between different PEs in the same inner shareable
++	  domain, so the hardware can use this fact to optimise the
++	  caching of such entries in the TLB.
++
++	  Selecting this option allows the CNP feature to be detected
++	  at runtime, and does not affect PEs that do not implement
++	  this feature.
++
+ endmenu
+ 
+ config ARM64_SVE
+* Unmerged path arch/arm64/include/asm/cpucaps.h
+diff --git a/arch/arm64/include/asm/cpufeature.h b/arch/arm64/include/asm/cpufeature.h
+index 072cc1c970c2..f451c47f9a72 100644
+--- a/arch/arm64/include/asm/cpufeature.h
++++ b/arch/arm64/include/asm/cpufeature.h
+@@ -508,6 +508,12 @@ static inline bool system_supports_sve(void)
+ 		cpus_have_const_cap(ARM64_SVE);
+ }
+ 
++static inline bool system_supports_cnp(void)
++{
++	return IS_ENABLED(CONFIG_ARM64_CNP) &&
++		cpus_have_const_cap(ARM64_HAS_CNP);
++}
++
+ #define ARM64_SSBD_UNKNOWN		-1
+ #define ARM64_SSBD_FORCE_DISABLE	0
+ #define ARM64_SSBD_KERNEL		1
+diff --git a/arch/arm64/include/asm/mmu_context.h b/arch/arm64/include/asm/mmu_context.h
+index 39ec0b8a689e..1e58bf58c22b 100644
+--- a/arch/arm64/include/asm/mmu_context.h
++++ b/arch/arm64/include/asm/mmu_context.h
+@@ -147,12 +147,25 @@ static inline void cpu_replace_ttbr1(pgd_t *pgdp)
+ 	extern ttbr_replace_func idmap_cpu_replace_ttbr1;
+ 	ttbr_replace_func *replace_phys;
+ 
+-	phys_addr_t pgd_phys = virt_to_phys(pgdp);
++	/* phys_to_ttbr() zeros lower 2 bits of ttbr with 52-bit PA */
++	phys_addr_t ttbr1 = phys_to_ttbr(virt_to_phys(pgdp));
++
++	if (system_supports_cnp() && !WARN_ON(pgdp != lm_alias(swapper_pg_dir))) {
++		/*
++		 * cpu_replace_ttbr1() is used when there's a boot CPU
++		 * up (i.e. cpufeature framework is not up yet) and
++		 * latter only when we enable CNP via cpufeature's
++		 * enable() callback.
++		 * Also we rely on the cpu_hwcap bit being set before
++		 * calling the enable() function.
++		 */
++		ttbr1 |= TTBR_CNP_BIT;
++	}
+ 
+ 	replace_phys = (void *)__pa_symbol(idmap_cpu_replace_ttbr1);
+ 
+ 	cpu_install_idmap();
+-	replace_phys(pgd_phys);
++	replace_phys(ttbr1);
+ 	cpu_uninstall_idmap();
+ }
+ 
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index fd208eac9f2a..1d7d8da2ef9b 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -211,6 +211,8 @@
+ #define PHYS_MASK_SHIFT		(CONFIG_ARM64_PA_BITS)
+ #define PHYS_MASK		((UL(1) << PHYS_MASK_SHIFT) - 1)
+ 
++#define TTBR_CNP_BIT		(UL(1) << 0)
++
+ /*
+  * TCR flags.
+  */
+* Unmerged path arch/arm64/kernel/cpufeature.c
+diff --git a/arch/arm64/kernel/suspend.c b/arch/arm64/kernel/suspend.c
+index 70c283368b64..9405d1b7f4b0 100644
+--- a/arch/arm64/kernel/suspend.c
++++ b/arch/arm64/kernel/suspend.c
+@@ -48,6 +48,10 @@ void notrace __cpu_suspend_exit(void)
+ 	 */
+ 	cpu_uninstall_idmap();
+ 
++	/* Restore CnP bit in TTBR1_EL1 */
++	if (system_supports_cnp())
++		cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
++
+ 	/*
+ 	 * PSTATE was not saved over suspend/resume, re-enable any detected
+ 	 * features that might not have been set correctly.
+diff --git a/arch/arm64/mm/context.c b/arch/arm64/mm/context.c
+index c127f94da8e2..a65af49e12e7 100644
+--- a/arch/arm64/mm/context.c
++++ b/arch/arm64/mm/context.c
+@@ -196,6 +196,9 @@ void check_and_switch_context(struct mm_struct *mm, unsigned int cpu)
+ 	unsigned long flags;
+ 	u64 asid, old_active_asid;
+ 
++	if (system_supports_cnp())
++		cpu_set_reserved_ttbr0();
++
+ 	asid = atomic64_read(&mm->context.id);
+ 
+ 	/*
+diff --git a/arch/arm64/mm/proc.S b/arch/arm64/mm/proc.S
+index 03646e6a2ef4..2c75b0b903ae 100644
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@ -160,6 +160,12 @@ ENTRY(cpu_do_switch_mm)
+ 	mrs	x2, ttbr1_el1
+ 	mmid	x1, x1				// get mm->context.id
+ 	phys_to_ttbr x3, x0
++
++alternative_if ARM64_HAS_CNP
++	cbz     x1, 1f                          // skip CNP for reserved ASID
++	orr     x3, x3, #TTBR_CNP_BIT
++1:
++alternative_else_nop_endif
+ #ifdef CONFIG_ARM64_SW_TTBR0_PAN
+ 	bfi	x3, x1, #48, #16		// set the ASID field in TTBR0
+ #endif
+@@ -184,7 +190,7 @@ ENDPROC(cpu_do_switch_mm)
+ .endm
+ 
+ /*
+- * void idmap_cpu_replace_ttbr1(phys_addr_t new_pgd)
++ * void idmap_cpu_replace_ttbr1(phys_addr_t ttbr1)
+  *
+  * This is the low-level counterpart to cpu_replace_ttbr1, and should not be
+  * called by anything else. It can only be executed from a TTBR0 mapping.
+@@ -194,8 +200,7 @@ ENTRY(idmap_cpu_replace_ttbr1)
+ 
+ 	__idmap_cpu_set_reserved_ttbr1 x1, x3
+ 
+-	phys_to_ttbr x3, x0
+-	msr	ttbr1_el1, x3
++	msr	ttbr1_el1, x0
+ 	isb
+ 
+ 	restore_daif x2
