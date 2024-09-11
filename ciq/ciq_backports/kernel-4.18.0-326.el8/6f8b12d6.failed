@@ -1,0 +1,194 @@
+net: napi: add hard irqs deferral feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit 6f8b12d661d09b488b9ac879b8eafbd2cc4a1450
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6f8b12d6.failed
+
+Back in commit 3b47d30396ba ("net: gro: add a per device gro flush timer")
+we added the ability to arm one high resolution timer, that we used
+to keep not-complete packets in GRO engine a bit longer, hoping that further
+frames might be added to them.
+
+Since then, we added the napi_complete_done() interface, and commit
+364b6055738b ("net: busy-poll: return busypolling status to drivers")
+allowed drivers to avoid re-arming NIC interrupts if we made a promise
+that their NAPI poll() handler would be called in the near future.
+
+This infrastructure can be leveraged, thanks to a new device parameter,
+which allows to arm the napi hrtimer, instead of re-arming the device
+hard IRQ.
+
+We have noticed that on some servers with 32 RX queues or more, the chit-chat
+between the NIC and the host caused by IRQ delivery and re-arming could hurt
+throughput by ~20% on 100Gbit NIC.
+
+In contrast, hrtimers are using local (percpu) resources and might have lower
+cost.
+
+The new tunable, named napi_defer_hard_irqs, is placed in the same hierarchy
+than gro_flush_timeout (/sys/class/net/ethX/)
+
+By default, both gro_flush_timeout and napi_defer_hard_irqs are zero.
+
+This patch does not change the prior behavior of gro_flush_timeout
+if used alone : NIC hard irqs should be rearmed as before.
+
+One concrete usage can be :
+
+echo 20000 >/sys/class/net/eth1/gro_flush_timeout
+echo 10 >/sys/class/net/eth1/napi_defer_hard_irqs
+
+If at least one packet is retired, then we will reset napi counter
+to 10 (napi_defer_hard_irqs), ensuring at least 10 periodic scans
+of the queue.
+
+On busy queues, this should avoid NIC hard IRQ, while before this patch IRQ
+avoidance was only possible if napi->poll() was exhausting its budget
+and not call napi_complete_done().
+
+This feature also can be used to work around some non-optimal NIC irq
+coalescing strategies.
+
+Having the ability to insert XX usec delays between each napi->poll()
+can increase cache efficiency, since we increase batch sizes.
+
+It also keeps serving cpus not idle too long, reducing tail latencies.
+
+Co-developed-by: Luigi Rizzo <lrizzo@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6f8b12d661d09b488b9ac879b8eafbd2cc4a1450)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/netdevice.h
+#	net/core/dev.c
+diff --cc include/linux/netdevice.h
+index 23ab5b9a2e64,5a8d40f1ffe2..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -331,7 -329,8 +331,12 @@@ struct napi_struct 
+  
+  	unsigned long		state;
+  	int			weight;
+++<<<<<<< HEAD
+ +	unsigned int		gro_count;
+++=======
++ 	int			defer_hard_irqs_count;
++ 	unsigned long		gro_bitmask;
+++>>>>>>> 6f8b12d661d0 (net: napi: add hard irqs deferral feature)
+  	int			(*poll)(struct napi_struct *, int);
+  #ifdef CONFIG_NETPOLL
+  	int			poll_owner;
+@@@ -2100,12 -1994,9 +2105,13 @@@ struct net_device 
+  	unsigned int		num_rx_queues;
+  	unsigned int		real_num_rx_queues;
+  
+ -	struct bpf_prog __rcu	*xdp_prog;
+ +	/* RHEL: while xdp_prog is explicitly removed from the kABI
+ +	 * whitelist, one semantics must be preserved: comparison of
+ +	 * xdp_prog to NULL denotes whether a XDP program is loaded or not.
+ +	 */
+ +	RH_KABI_EXCLUDE(struct bpf_prog __rcu	*xdp_prog)
+  	unsigned long		gro_flush_timeout;
++ 	int			napi_defer_hard_irqs;
+  	rx_handler_func_t __rcu	*rx_handler;
+  	void __rcu		*rx_handler_data;
+  
+diff --cc net/core/dev.c
+index 1e7b7a3fd02e,67585484ad32..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -6065,21 -6240,27 +6066,31 @@@ bool napi_complete_done(struct napi_str
+  				 NAPIF_STATE_IN_BUSY_POLL)))
+  		return false;
+  
+++<<<<<<< HEAD
+ +	if (!list_empty(&n->gro_list)) {
+ +		unsigned long timeout = 0;
+ +
+ +		if (work_done)
+++=======
++ 	if (work_done) {
++ 		if (n->gro_bitmask)
+++>>>>>>> 6f8b12d661d0 (net: napi: add hard irqs deferral feature)
+  			timeout = n->dev->gro_flush_timeout;
+- 
++ 		n->defer_hard_irqs_count = n->dev->napi_defer_hard_irqs;
++ 	}
++ 	if (n->defer_hard_irqs_count > 0) {
++ 		n->defer_hard_irqs_count--;
++ 		timeout = n->dev->gro_flush_timeout;
++ 		if (timeout)
++ 			ret = false;
++ 	}
++ 	if (n->gro_bitmask) {
+  		/* When the NAPI instance uses a timeout and keeps postponing
+  		 * it, we need to bound somehow the time packets are kept in
+  		 * the GRO layer
+  		 */
+  		napi_gro_flush(n, !!timeout);
+- 		if (timeout)
+- 			hrtimer_start(&n->timer, ns_to_ktime(timeout),
+- 				      HRTIMER_MODE_REL_PINNED);
+  	}
+ -
+ -	gro_normal_list(n);
+ -
+  	if (unlikely(!list_empty(&n->poll_list))) {
+  		/* If n->poll_list is not empty, we need to mask irqs */
+  		local_irq_save(flags);
+@@@ -6270,7 -6471,7 +6284,11 @@@ static enum hrtimer_restart napi_watchd
+  	/* Note : we use a relaxed variant of napi_schedule_prep() not setting
+  	 * NAPI_STATE_MISSED, since we do not react to a device IRQ.
+  	 */
+++<<<<<<< HEAD
+ +	if (!list_empty(&napi->gro_list) && !napi_disable_pending(napi) &&
+++=======
++ 	if (!napi_disable_pending(napi) &&
+++>>>>>>> 6f8b12d661d0 (net: napi: add hard irqs deferral feature)
+  	    !test_and_set_bit(NAPI_STATE_SCHED, &napi->state))
+  		__napi_schedule_irqoff(napi);
+  
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/core/dev.c
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index 932caab67e72..e4106abc1f6d 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -387,6 +387,23 @@ static ssize_t gro_flush_timeout_store(struct device *dev,
+ }
+ NETDEVICE_SHOW_RW(gro_flush_timeout, fmt_ulong);
+ 
++static int change_napi_defer_hard_irqs(struct net_device *dev, unsigned long val)
++{
++	dev->napi_defer_hard_irqs = val;
++	return 0;
++}
++
++static ssize_t napi_defer_hard_irqs_store(struct device *dev,
++					  struct device_attribute *attr,
++					  const char *buf, size_t len)
++{
++	if (!capable(CAP_NET_ADMIN))
++		return -EPERM;
++
++	return netdev_store(dev, attr, buf, len, change_napi_defer_hard_irqs);
++}
++NETDEVICE_SHOW_RW(napi_defer_hard_irqs, fmt_dec);
++
+ static ssize_t ifalias_store(struct device *dev, struct device_attribute *attr,
+ 			     const char *buf, size_t len)
+ {
+@@ -550,6 +567,7 @@ static struct attribute *net_class_attrs[] __ro_after_init = {
+ 	&dev_attr_flags.attr,
+ 	&dev_attr_tx_queue_len.attr,
+ 	&dev_attr_gro_flush_timeout.attr,
++	&dev_attr_napi_defer_hard_irqs.attr,
+ 	&dev_attr_phys_port_id.attr,
+ 	&dev_attr_phys_port_name.attr,
+ 	&dev_attr_phys_switch_id.attr,
