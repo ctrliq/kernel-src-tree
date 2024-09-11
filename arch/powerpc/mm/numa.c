@@ -167,8 +167,7 @@ static void unmap_cpu_from_node(unsigned long cpu)
 	if (cpumask_test_cpu(cpu, node_to_cpumask_map[node])) {
 		cpumask_clear_cpu(cpu, node_to_cpumask_map[node]);
 	} else {
-		printk(KERN_ERR "WARNING: cpu %lu not found in node %d\n",
-		       cpu, node);
+		pr_warn("Warning: cpu %lu not found in node %d\n", cpu, node);
 	}
 }
 #endif /* CONFIG_HOTPLUG_CPU || CONFIG_PPC_SPLPAR */
@@ -484,15 +483,14 @@ static int __init find_primary_domain_index(void)
 					&distance_ref_points_depth);
 
 	if (!distance_ref_points) {
-		pr_debug("NUMA: ibm,associativity-reference-points not found.\n");
+		pr_debug("ibm,associativity-reference-points not found.\n");
 		goto err;
 	}
 
 	distance_ref_points_depth /= sizeof(int);
 	if (affinity_form == FORM0_AFFINITY) {
 		if (distance_ref_points_depth < 2) {
-			printk(KERN_WARNING "NUMA: "
-			       "short ibm,associativity-reference-points\n");
+			pr_warn("short ibm,associativity-reference-points\n");
 			goto err;
 		}
 
@@ -509,8 +507,8 @@ static int __init find_primary_domain_index(void)
 	 * MAX_DISTANCE_REF_POINTS domains.
 	 */
 	if (distance_ref_points_depth > MAX_DISTANCE_REF_POINTS) {
-		printk(KERN_WARNING "NUMA: distance array capped at "
-			"%d entries\n", MAX_DISTANCE_REF_POINTS);
+		pr_warn("distance array capped at %d entries\n",
+			MAX_DISTANCE_REF_POINTS);
 		distance_ref_points_depth = MAX_DISTANCE_REF_POINTS;
 	}
 
@@ -915,7 +913,7 @@ static int __init parse_numa_properties(void)
 	const __be32 *associativity;
 
 	if (numa_enabled == 0) {
-		printk(KERN_WARNING "NUMA disabled by user\n");
+		pr_warn("disabled by user\n");
 		return -1;
 	}
 
@@ -930,7 +928,7 @@ static int __init parse_numa_properties(void)
 		return primary_domain_index;
 	}
 
-	pr_debug("NUMA associativity depth for CPU/Memory: %d\n", primary_domain_index);
+	pr_debug("associativity depth for CPU/Memory: %d\n", primary_domain_index);
 
 	/*
 	 * If it is FORM2 initialize the distance table here.
@@ -1045,10 +1043,8 @@ static void __init setup_nonnuma(void)
 	unsigned int nid = 0;
 	struct memblock_region *reg;
 
-	printk(KERN_DEBUG "Top of RAM: 0x%lx, Total RAM: 0x%lx\n",
-	       top_of_ram, total_ram);
-	printk(KERN_DEBUG "Memory hole size: %ldMB\n",
-	       (top_of_ram - total_ram) >> 20);
+	pr_debug("Top of RAM: 0x%lx, Total RAM: 0x%lx\n", top_of_ram, total_ram);
+	pr_debug("Memory hole size: %ldMB\n", (top_of_ram - total_ram) >> 20);
 
 	for_each_memblock(memory, reg) {
 		start_pfn = memblock_region_memory_base_pfn(reg);
