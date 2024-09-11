@@ -1,0 +1,277 @@
+dma-mapping: move the remap helpers to a separate file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f0edfea8ef93ed6cc5f747c46c85c8e53e0798a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/f0edfea8.failed
+
+The dma remap code only makes sense for not cache coherent architectures
+(or possibly the corner case of highmem CMA allocations) and currently
+is only used by arm, arm64, csky and xtensa.  Split it out into a
+separate file with a separate Kconfig symbol, which gets the right
+copyright notice given that this code was written by Laura Abbott
+working for Code Aurora at that point.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Laura Abbott <labbott@redhat.com>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+(cherry picked from commit f0edfea8ef93ed6cc5f747c46c85c8e53e0798a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/csky/Kconfig
+#	arch/xtensa/Kconfig
+diff --cc arch/xtensa/Kconfig
+index d575e8701955,239bfb16c58b..000000000000
+--- a/arch/xtensa/Kconfig
++++ b/arch/xtensa/Kconfig
+@@@ -10,6 -10,8 +10,11 @@@ config XTENS
+  	select BUILDTIME_EXTABLE_SORT
+  	select CLONE_BACKWARDS
+  	select COMMON_CLK
+++<<<<<<< HEAD
+++=======
++ 	select DMA_DIRECT_OPS
++ 	select DMA_REMAP if MMU
+++>>>>>>> f0edfea8ef93 (dma-mapping: move the remap helpers to a separate file)
+  	select GENERIC_ATOMIC64
+  	select GENERIC_CLOCKEVENTS
+  	select GENERIC_IRQ_SHOW
+* Unmerged path arch/csky/Kconfig
+diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index 843edfd000be..ea667a31aa5a 100644
+--- a/arch/arm/Kconfig
++++ b/arch/arm/Kconfig
+@@ -29,6 +29,7 @@ config ARM
+ 	select CPU_PM if (SUSPEND || CPU_IDLE)
+ 	select DCACHE_WORD_ACCESS if HAVE_EFFICIENT_UNALIGNED_ACCESS
+ 	select DMA_DIRECT_OPS if !MMU
++	select DMA_REMAP if MMU
+ 	select EDAC_SUPPORT
+ 	select EDAC_ATOMIC_SCRUB
+ 	select GENERIC_ALLOCATOR
+diff --git a/arch/arm64/Kconfig b/arch/arm64/Kconfig
+index 5b4fd63f9948..a67475f94c82 100644
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@ -77,6 +77,7 @@ config ARM64
+ 	select CPU_PM if (SUSPEND || CPU_IDLE)
+ 	select DCACHE_WORD_ACCESS
+ 	select DMA_DIRECT_OPS
++	select DMA_REMAP
+ 	select EDAC_SUPPORT
+ 	select FRAME_POINTER
+ 	select GENERIC_ALLOCATOR
+* Unmerged path arch/csky/Kconfig
+* Unmerged path arch/xtensa/Kconfig
+diff --git a/kernel/dma/Kconfig b/kernel/dma/Kconfig
+index 1b1d63b3634b..b2ea567a2a8d 100644
+--- a/kernel/dma/Kconfig
++++ b/kernel/dma/Kconfig
+@@ -51,3 +51,7 @@ config SWIOTLB
+ 	bool
+ 	select DMA_DIRECT_OPS
+ 	select NEED_DMA_MAP_STATE
++
++config DMA_REMAP
++	depends on MMU
++	bool
+diff --git a/kernel/dma/Makefile b/kernel/dma/Makefile
+index 6de44e4eb454..7efb4d57be18 100644
+--- a/kernel/dma/Makefile
++++ b/kernel/dma/Makefile
+@@ -8,4 +8,4 @@ obj-$(CONFIG_DMA_NONCOHERENT_OPS)	+= noncoherent.o
+ obj-$(CONFIG_DMA_VIRT_OPS)		+= virt.o
+ obj-$(CONFIG_DMA_API_DEBUG)		+= debug.o
+ obj-$(CONFIG_SWIOTLB)			+= swiotlb.o
+-
++obj-$(CONFIG_DMA_REMAP)			+= remap.o
+diff --git a/kernel/dma/mapping.c b/kernel/dma/mapping.c
+index e100ec904c99..f38bf9c3758e 100644
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@ -252,87 +252,3 @@ int dma_common_mmap(struct device *dev, struct vm_area_struct *vma,
+ 	return ret;
+ }
+ EXPORT_SYMBOL(dma_common_mmap);
+-
+-#ifdef CONFIG_MMU
+-static struct vm_struct *__dma_common_pages_remap(struct page **pages,
+-			size_t size, unsigned long vm_flags, pgprot_t prot,
+-			const void *caller)
+-{
+-	struct vm_struct *area;
+-
+-	area = get_vm_area_caller(size, vm_flags, caller);
+-	if (!area)
+-		return NULL;
+-
+-	if (map_vm_area(area, prot, pages)) {
+-		vunmap(area->addr);
+-		return NULL;
+-	}
+-
+-	return area;
+-}
+-
+-/*
+- * remaps an array of PAGE_SIZE pages into another vm_area
+- * Cannot be used in non-sleeping contexts
+- */
+-void *dma_common_pages_remap(struct page **pages, size_t size,
+-			unsigned long vm_flags, pgprot_t prot,
+-			const void *caller)
+-{
+-	struct vm_struct *area;
+-
+-	area = __dma_common_pages_remap(pages, size, vm_flags, prot, caller);
+-	if (!area)
+-		return NULL;
+-
+-	area->pages = pages;
+-
+-	return area->addr;
+-}
+-
+-/*
+- * remaps an allocated contiguous region into another vm_area.
+- * Cannot be used in non-sleeping contexts
+- */
+-
+-void *dma_common_contiguous_remap(struct page *page, size_t size,
+-			unsigned long vm_flags,
+-			pgprot_t prot, const void *caller)
+-{
+-	int i;
+-	struct page **pages;
+-	struct vm_struct *area;
+-
+-	pages = kmalloc(sizeof(struct page *) << get_order(size), GFP_KERNEL);
+-	if (!pages)
+-		return NULL;
+-
+-	for (i = 0; i < (size >> PAGE_SHIFT); i++)
+-		pages[i] = nth_page(page, i);
+-
+-	area = __dma_common_pages_remap(pages, size, vm_flags, prot, caller);
+-
+-	kfree(pages);
+-
+-	if (!area)
+-		return NULL;
+-	return area->addr;
+-}
+-
+-/*
+- * unmaps a range previously mapped by dma_common_*_remap
+- */
+-void dma_common_free_remap(void *cpu_addr, size_t size, unsigned long vm_flags)
+-{
+-	struct vm_struct *area = find_vm_area(cpu_addr);
+-
+-	if (!area || (area->flags & vm_flags) != vm_flags) {
+-		WARN(1, "trying to free invalid coherent area: %p\n", cpu_addr);
+-		return;
+-	}
+-
+-	unmap_kernel_range((unsigned long)cpu_addr, PAGE_ALIGN(size));
+-	vunmap(cpu_addr);
+-}
+-#endif
+diff --git a/kernel/dma/remap.c b/kernel/dma/remap.c
+new file mode 100644
+index 000000000000..a15c393ea4e5
+--- /dev/null
++++ b/kernel/dma/remap.c
+@@ -0,0 +1,88 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2014 The Linux Foundation
++ */
++#include <linux/dma-mapping.h>
++#include <linux/slab.h>
++#include <linux/vmalloc.h>
++
++static struct vm_struct *__dma_common_pages_remap(struct page **pages,
++			size_t size, unsigned long vm_flags, pgprot_t prot,
++			const void *caller)
++{
++	struct vm_struct *area;
++
++	area = get_vm_area_caller(size, vm_flags, caller);
++	if (!area)
++		return NULL;
++
++	if (map_vm_area(area, prot, pages)) {
++		vunmap(area->addr);
++		return NULL;
++	}
++
++	return area;
++}
++
++/*
++ * Remaps an array of PAGE_SIZE pages into another vm_area.
++ * Cannot be used in non-sleeping contexts
++ */
++void *dma_common_pages_remap(struct page **pages, size_t size,
++			unsigned long vm_flags, pgprot_t prot,
++			const void *caller)
++{
++	struct vm_struct *area;
++
++	area = __dma_common_pages_remap(pages, size, vm_flags, prot, caller);
++	if (!area)
++		return NULL;
++
++	area->pages = pages;
++
++	return area->addr;
++}
++
++/*
++ * Remaps an allocated contiguous region into another vm_area.
++ * Cannot be used in non-sleeping contexts
++ */
++void *dma_common_contiguous_remap(struct page *page, size_t size,
++			unsigned long vm_flags,
++			pgprot_t prot, const void *caller)
++{
++	int i;
++	struct page **pages;
++	struct vm_struct *area;
++
++	pages = kmalloc(sizeof(struct page *) << get_order(size), GFP_KERNEL);
++	if (!pages)
++		return NULL;
++
++	for (i = 0; i < (size >> PAGE_SHIFT); i++)
++		pages[i] = nth_page(page, i);
++
++	area = __dma_common_pages_remap(pages, size, vm_flags, prot, caller);
++
++	kfree(pages);
++
++	if (!area)
++		return NULL;
++	return area->addr;
++}
++
++/*
++ * Unmaps a range previously mapped by dma_common_*_remap
++ */
++void dma_common_free_remap(void *cpu_addr, size_t size, unsigned long vm_flags)
++{
++	struct vm_struct *area = find_vm_area(cpu_addr);
++
++	if (!area || (area->flags & vm_flags) != vm_flags) {
++		WARN(1, "trying to free invalid coherent area: %p\n", cpu_addr);
++		return;
++	}
++
++	unmap_kernel_range((unsigned long)cpu_addr, PAGE_ALIGN(size));
++	vunmap(cpu_addr);
++}
