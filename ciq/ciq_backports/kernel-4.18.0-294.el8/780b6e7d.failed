@@ -1,0 +1,257 @@
+s390/qeth: implement ndo_bridge_getlink for learning_sync
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alexandra Winter <wintera@linux.ibm.com>
+commit 780b6e7db25ed97248b7f747e98d2f7e7971156a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/780b6e7d.failed
+
+Documentation/networking/switchdev.txt and 'man bridge' indicate that the
+learning_sync bridge attribute is used to indicate whether a given
+device will sync MAC addresses learned on its device port to a master
+bridge FDB.
+
+learning_sync attribute can not be read while interface is offline (down).
+See
+'commit e6e771b3d897 ("s390/qeth: detach netdevice while card is offline")'
+We return EOPNOTSUPP and not EONODEV in this case, because EONOTSUPP is the
+only rc that is tolerated by 'bridge -d link show'.
+
+	Signed-off-by: Alexandra Winter <wintera@linux.ibm.com>
+	Reviewed-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 780b6e7db25ed97248b7f747e98d2f7e7971156a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 88261c8e41f6,338bc62556cf..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -28,8 -31,9 +28,14 @@@ static int qeth_l2_set_offline(struct c
+  static void qeth_bridgeport_query_support(struct qeth_card *card);
+  static void qeth_bridge_state_change(struct qeth_card *card,
+  					struct qeth_ipa_cmd *cmd);
+++<<<<<<< HEAD
+ +static void qeth_bridge_host_event(struct qeth_card *card,
+ +					struct qeth_ipa_cmd *cmd);
+++=======
++ static void qeth_addr_change_event(struct qeth_card *card,
++ 				   struct qeth_ipa_cmd *cmd);
++ static bool qeth_bridgeport_is_in_use(struct qeth_card *card);
+++>>>>>>> 780b6e7db25e (s390/qeth: implement ndo_bridge_getlink for learning_sync)
+  static void qeth_l2_vnicc_set_defaults(struct qeth_card *card);
+  static void qeth_l2_vnicc_init(struct qeth_card *card);
+  static bool qeth_l2_vnicc_recover_timeout(struct qeth_card *card, u32 vnicc,
+@@@ -669,6 -659,203 +675,206 @@@ static void qeth_l2_set_rx_mode(struct 
+  	schedule_work(&card->rx_mode_work);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  *	qeth_l2_pnso() - perform network subchannel operation
++  *	@card: qeth_card structure pointer
++  *	@oc: Operation Code
++  *	@cnc: Boolean Change-Notification Control
++  *	@cb: Callback function will be executed for each element
++  *		of the address list
++  *	@priv: Pointer to pass to the callback function.
++  *
++  *	Collects network information in a network address list and calls the
++  *	callback function for every entry in the list. If "change-notification-
++  *	control" is set, further changes in the address list will be reported
++  *	via the IPA command.
++  */
++ static int qeth_l2_pnso(struct qeth_card *card, u8 oc, int cnc,
++ 			void (*cb)(void *priv, struct chsc_pnso_naid_l2 *entry),
++ 			void *priv)
++ {
++ 	struct ccw_device *ddev = CARD_DDEV(card);
++ 	struct chsc_pnso_area *rr;
++ 	u32 prev_instance = 0;
++ 	int isfirstblock = 1;
++ 	int i, size, elems;
++ 	int rc;
++ 
++ 	rr = (struct chsc_pnso_area *)get_zeroed_page(GFP_KERNEL);
++ 	if (rr == NULL)
++ 		return -ENOMEM;
++ 	do {
++ 		QETH_CARD_TEXT(card, 2, "PNSO");
++ 		/* on the first iteration, naihdr.resume_token will be zero */
++ 		rc = ccw_device_pnso(ddev, rr, oc, rr->naihdr.resume_token,
++ 				     cnc);
++ 		if (rc)
++ 			continue;
++ 		if (cb == NULL)
++ 			continue;
++ 
++ 		size = rr->naihdr.naids;
++ 		if (size != sizeof(struct chsc_pnso_naid_l2)) {
++ 			WARN_ON_ONCE(1);
++ 			continue;
++ 		}
++ 
++ 		elems = (rr->response.length - sizeof(struct chsc_header) -
++ 			 sizeof(struct chsc_pnso_naihdr)) / size;
++ 
++ 		if (!isfirstblock && (rr->naihdr.instance != prev_instance)) {
++ 			/* Inform the caller that they need to scrap */
++ 			/* the data that was already reported via cb */
++ 			rc = -EAGAIN;
++ 			break;
++ 		}
++ 		isfirstblock = 0;
++ 		prev_instance = rr->naihdr.instance;
++ 		for (i = 0; i < elems; i++)
++ 			(*cb)(priv, &rr->entries[i]);
++ 	} while ((rc == -EBUSY) || (!rc && /* list stored */
++ 		   /* resume token is non-zero => list incomplete */
++ 		   (rr->naihdr.resume_token.t1 || rr->naihdr.resume_token.t2)));
++ 
++ 	if (rc)
++ 		QETH_CARD_TEXT_(card, 2, "PNrp%04x", rr->response.code);
++ 
++ 	free_page((unsigned long)rr);
++ 	return rc;
++ }
++ 
++ static bool qeth_is_my_net_if_token(struct qeth_card *card,
++ 				    struct net_if_token *token)
++ {
++ 	return ((card->info.ddev_devno == token->devnum) &&
++ 		(card->info.cssid == token->cssid) &&
++ 		(card->info.iid == token->iid) &&
++ 		(card->info.ssid == token->ssid) &&
++ 		(card->info.chpid == token->chpid) &&
++ 		(card->info.chid == token->chid));
++ }
++ 
++ /**
++  *	qeth_l2_dev2br_fdb_notify() - update fdb of master bridge
++  *	@card:	qeth_card structure pointer
++  *	@code:	event bitmask: high order bit 0x80 set to
++  *				1 - removal of an object
++  *				0 - addition of an object
++  *			       Object type(s):
++  *				0x01 - VLAN, 0x02 - MAC, 0x03 - VLAN and MAC
++  *	@token: "network token" structure identifying 'physical' location
++  *		of the target
++  *	@addr_lnid: structure with MAC address and VLAN ID of the target
++  */
++ static void qeth_l2_dev2br_fdb_notify(struct qeth_card *card, u8 code,
++ 				      struct net_if_token *token,
++ 				      struct mac_addr_lnid *addr_lnid)
++ {
++ 	struct switchdev_notifier_fdb_info info;
++ 	u8 ntfy_mac[ETH_ALEN];
++ 
++ 	ether_addr_copy(ntfy_mac, addr_lnid->mac);
++ 	/* Ignore VLAN only changes */
++ 	if (!(code & IPA_ADDR_CHANGE_CODE_MACADDR))
++ 		return;
++ 	/* Ignore mcast entries */
++ 	if (is_multicast_ether_addr(ntfy_mac))
++ 		return;
++ 	/* Ignore my own addresses */
++ 	if (qeth_is_my_net_if_token(card, token))
++ 		return;
++ 
++ 	info.addr = ntfy_mac;
++ 	/* don't report VLAN IDs */
++ 	info.vid = 0;
++ 	info.added_by_user = false;
++ 	info.offloaded = true;
++ 
++ 	if (code & IPA_ADDR_CHANGE_CODE_REMOVAL) {
++ 		call_switchdev_notifiers(SWITCHDEV_FDB_DEL_TO_BRIDGE,
++ 					 card->dev, &info.info, NULL);
++ 		QETH_CARD_TEXT(card, 4, "andelmac");
++ 		QETH_CARD_TEXT_(card, 4,
++ 				"mc%012lx", ether_addr_to_u64(ntfy_mac));
++ 	} else {
++ 		call_switchdev_notifiers(SWITCHDEV_FDB_ADD_TO_BRIDGE,
++ 					 card->dev, &info.info, NULL);
++ 		QETH_CARD_TEXT(card, 4, "anaddmac");
++ 		QETH_CARD_TEXT_(card, 4,
++ 				"mc%012lx", ether_addr_to_u64(ntfy_mac));
++ 	}
++ }
++ 
++ static void qeth_l2_dev2br_an_set_cb(void *priv,
++ 				     struct chsc_pnso_naid_l2 *entry)
++ {
++ 	u8 code = IPA_ADDR_CHANGE_CODE_MACADDR;
++ 	struct qeth_card *card = priv;
++ 
++ 	if (entry->addr_lnid.lnid < VLAN_N_VID)
++ 		code |= IPA_ADDR_CHANGE_CODE_VLANID;
++ 	qeth_l2_dev2br_fdb_notify(card, code,
++ 				  (struct net_if_token *)&entry->nit,
++ 				  (struct mac_addr_lnid *)&entry->addr_lnid);
++ }
++ 
++ /**
++  *	qeth_l2_dev2br_an_set() -
++  *	Enable or disable 'dev to bridge network address notification'
++  *	@card: qeth_card structure pointer
++  *	@enable: Enable or disable 'dev to bridge network address notification'
++  *
++  *	Returns negative errno-compatible error indication or 0 on success.
++  *
++  *	On enable, emits a series of address notifications for all
++  *	currently registered hosts.
++  *
++  *	Must be called under rtnl_lock
++  */
++ static int qeth_l2_dev2br_an_set(struct qeth_card *card, bool enable)
++ {
++ 	int rc;
++ 
++ 	if (enable) {
++ 		QETH_CARD_TEXT(card, 2, "anseton");
++ 		rc = qeth_l2_pnso(card, PNSO_OC_NET_ADDR_INFO, 1,
++ 				  qeth_l2_dev2br_an_set_cb, card);
++ 		if (rc == -EAGAIN)
++ 			/* address notification enabled, but inconsistent
++ 			 * addresses reported -> disable address notification
++ 			 */
++ 			qeth_l2_pnso(card, PNSO_OC_NET_ADDR_INFO, 0,
++ 				     NULL, NULL);
++ 	} else {
++ 		QETH_CARD_TEXT(card, 2, "ansetoff");
++ 		rc = qeth_l2_pnso(card, PNSO_OC_NET_ADDR_INFO, 0, NULL, NULL);
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ static int qeth_l2_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
++ 				  struct net_device *dev, u32 filter_mask,
++ 				  int nlflags)
++ {
++ 	struct qeth_priv *priv = netdev_priv(dev);
++ 	struct qeth_card *card = dev->ml_priv;
++ 	u16 mode = BRIDGE_MODE_UNDEF;
++ 
++ 	/* Do not even show qeth devs that cannot do bridge_setlink */
++ 	if (!priv->brport_hw_features || !netif_device_present(dev) ||
++ 	    qeth_bridgeport_is_in_use(card))
++ 		return -EOPNOTSUPP;
++ 
++ 	return ndo_dflt_bridge_getlink(skb, pid, seq, dev,
++ 				       mode, priv->brport_features,
++ 				       priv->brport_hw_features,
++ 				       nlflags, filter_mask, NULL);
++ }
++ 
+++>>>>>>> 780b6e7db25e (s390/qeth: implement ndo_bridge_getlink for learning_sync)
+  static const struct net_device_ops qeth_l2_netdev_ops = {
+  	.ndo_open		= qeth_open,
+  	.ndo_stop		= qeth_stop,
+* Unmerged path drivers/s390/net/qeth_l2_main.c
