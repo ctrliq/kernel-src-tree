@@ -1,0 +1,159 @@
+bpf: Fix narrow load on a bpf_sock returned from sk_lookup()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit d623876646be119439999a229a2c3ce30fd197fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d6238766.failed
+
+By adding this test to test_verifier:
+{
+	"reference tracking: access sk->src_ip4 (narrow load)",
+	.insns = {
+	BPF_SK_LOOKUP,
+	BPF_MOV64_REG(BPF_REG_6, BPF_REG_0),
+	BPF_JMP_IMM(BPF_JEQ, BPF_REG_0, 0, 3),
+	BPF_LDX_MEM(BPF_H, BPF_REG_2, BPF_REG_0, offsetof(struct bpf_sock, src_ip4) + 2),
+	BPF_MOV64_REG(BPF_REG_1, BPF_REG_6),
+	BPF_EMIT_CALL(BPF_FUNC_sk_release),
+	BPF_EXIT_INSN(),
+	},
+	.prog_type = BPF_PROG_TYPE_SCHED_CLS,
+	.result = ACCEPT,
+},
+
+The above test loads 2 bytes from sk->src_ip4 where
+sk is obtained by bpf_sk_lookup_tcp().
+
+It hits an internal verifier error from convert_ctx_accesses():
+[root@arch-fb-vm1 bpf]# ./test_verifier 665 665
+Failed to load prog 'Invalid argument'!
+0: (b7) r2 = 0
+1: (63) *(u32 *)(r10 -8) = r2
+2: (7b) *(u64 *)(r10 -16) = r2
+3: (7b) *(u64 *)(r10 -24) = r2
+4: (7b) *(u64 *)(r10 -32) = r2
+5: (7b) *(u64 *)(r10 -40) = r2
+6: (7b) *(u64 *)(r10 -48) = r2
+7: (bf) r2 = r10
+8: (07) r2 += -48
+9: (b7) r3 = 36
+10: (b7) r4 = 0
+11: (b7) r5 = 0
+12: (85) call bpf_sk_lookup_tcp#84
+13: (bf) r6 = r0
+14: (15) if r0 == 0x0 goto pc+3
+ R0=sock(id=1,off=0,imm=0) R6=sock(id=1,off=0,imm=0) R10=fp0,call_-1 fp-8=????0000 fp-16=0000mmmm fp-24=mmmmmmmm fp-32=mmmmmmmm fp-40=mmmmmmmm fp-48=mmmmmmmm refs=1
+15: (69) r2 = *(u16 *)(r0 +26)
+16: (bf) r1 = r6
+17: (85) call bpf_sk_release#86
+18: (95) exit
+
+from 14 to 18: safe
+processed 20 insns (limit 131072), stack depth 48
+bpf verifier is misconfigured
+Summary: 0 PASSED, 0 SKIPPED, 1 FAILED
+
+The bpf_sock_is_valid_access() is expecting src_ip4 can be narrowly
+loaded (meaning load any 1 or 2 bytes of the src_ip4) by
+marking info->ctx_field_size.  However, this marked
+ctx_field_size is not used.  This patch fixes it.
+
+Due to the recent refactoring in test_verifier,
+this new test will be added to the bpf-next branch
+(together with the bpf_tcp_sock patchset)
+to avoid merge conflict.
+
+Fixes: c64b7983288e ("bpf: Add PTR_TO_SOCKET verifier type")
+	Cc: Joe Stringer <joe@wand.net.nz>
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Acked-by: Joe Stringer <joe@wand.net.nz>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d623876646be119439999a229a2c3ce30fd197fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index a4dd6c940b0d,8f295b790297..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -1392,6 -1605,43 +1392,46 @@@ static int check_ctx_access(struct bpf_
+  	return -EACCES;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_flow_keys_access(struct bpf_verifier_env *env, int off,
++ 				  int size)
++ {
++ 	if (size < 0 || off < 0 ||
++ 	    (u64)off + size > sizeof(struct bpf_flow_keys)) {
++ 		verbose(env, "invalid access to flow keys off=%d size=%d\n",
++ 			off, size);
++ 		return -EACCES;
++ 	}
++ 	return 0;
++ }
++ 
++ static int check_sock_access(struct bpf_verifier_env *env, int insn_idx,
++ 			     u32 regno, int off, int size,
++ 			     enum bpf_access_type t)
++ {
++ 	struct bpf_reg_state *regs = cur_regs(env);
++ 	struct bpf_reg_state *reg = &regs[regno];
++ 	struct bpf_insn_access_aux info = {};
++ 
++ 	if (reg->smin_value < 0) {
++ 		verbose(env, "R%d min value is negative, either use unsigned index or do a if (index >=0) check.\n",
++ 			regno);
++ 		return -EACCES;
++ 	}
++ 
++ 	if (!bpf_sock_is_valid_access(off, size, t, &info)) {
++ 		verbose(env, "invalid bpf_sock access off=%d size=%d\n",
++ 			off, size);
++ 		return -EACCES;
++ 	}
++ 
++ 	env->insn_aux_data[insn_idx].ctx_field_size = info.ctx_field_size;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> d623876646be (bpf: Fix narrow load on a bpf_sock returned from sk_lookup())
+  static bool __is_pointer_value(bool allow_ptr_leaks,
+  			       const struct bpf_reg_state *reg)
+  {
+@@@ -1762,6 -2019,25 +1802,28 @@@ static int check_mem_access(struct bpf_
+  		err = check_packet_access(env, regno, off, size, false);
+  		if (!err && t == BPF_READ && value_regno >= 0)
+  			mark_reg_unknown(env, regs, value_regno);
+++<<<<<<< HEAD
+++=======
++ 	} else if (reg->type == PTR_TO_FLOW_KEYS) {
++ 		if (t == BPF_WRITE && value_regno >= 0 &&
++ 		    is_pointer_value(env, value_regno)) {
++ 			verbose(env, "R%d leaks addr into flow keys\n",
++ 				value_regno);
++ 			return -EACCES;
++ 		}
++ 
++ 		err = check_flow_keys_access(env, off, size);
++ 		if (!err && t == BPF_READ && value_regno >= 0)
++ 			mark_reg_unknown(env, regs, value_regno);
++ 	} else if (reg->type == PTR_TO_SOCKET) {
++ 		if (t == BPF_WRITE) {
++ 			verbose(env, "cannot write into socket\n");
++ 			return -EACCES;
++ 		}
++ 		err = check_sock_access(env, insn_idx, regno, off, size, t);
++ 		if (!err && value_regno >= 0)
++ 			mark_reg_unknown(env, regs, value_regno);
+++>>>>>>> d623876646be (bpf: Fix narrow load on a bpf_sock returned from sk_lookup())
+  	} else {
+  		verbose(env, "R%d invalid mem access '%s'\n", regno,
+  			reg_type_str[reg->type]);
+* Unmerged path kernel/bpf/verifier.c
