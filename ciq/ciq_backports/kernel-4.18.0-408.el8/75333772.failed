@@ -1,0 +1,133 @@
+KVM: x86/mmu: Use yield-safe TDP MMU root iter in MMU notifier unmapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 7533377215b6ee432c06c5855f6be5d66e694e46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/75333772.failed
+
+Use the yield-safe variant of the TDP MMU iterator when handling an
+unmapping event from the MMU notifier, as most occurences of the event
+allow yielding.
+
+Fixes: e1eed5847b09 ("KVM: x86/mmu: Allow yielding during MMU notifier unmap/zap, if possible")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20211120015008.3780032-1-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 7533377215b6ee432c06c5855f6be5d66e694e46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 968568d642d2,4cd6bf7e73f0..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -1009,71 -1026,43 +1009,77 @@@ int kvm_tdp_mmu_map(struct kvm_vcpu *vc
+  	return ret;
+  }
+  
+ -bool kvm_tdp_mmu_unmap_gfn_range(struct kvm *kvm, struct kvm_gfn_range *range,
+ -				 bool flush)
+ +typedef int (*tdp_handler_t)(struct kvm *kvm, struct kvm_memory_slot *slot,
+ +			     struct kvm_mmu_page *root, gfn_t start, gfn_t end,
+ +			     unsigned long data);
+ +
+ +static __always_inline int kvm_tdp_mmu_handle_hva_range(struct kvm *kvm,
+ +							unsigned long start,
+ +							unsigned long end,
+ +							unsigned long data,
+ +							tdp_handler_t handler)
+  {
+ +	struct kvm_memslots *slots;
+ +	struct kvm_memory_slot *memslot;
+  	struct kvm_mmu_page *root;
+ -
+ +	int ret = 0;
+ +	int as_id;
+ +
+++<<<<<<< HEAD
+ +	for (as_id = 0; as_id < KVM_ADDRESS_SPACE_NUM; as_id++) {
+ +		for_each_tdp_mmu_root_yield_safe(kvm, root, as_id) {
+ +			slots = __kvm_memslots(kvm, as_id);
+ +			kvm_for_each_memslot(memslot, slots) {
+ +				unsigned long hva_start, hva_end;
+ +				gfn_t gfn_start, gfn_end;
+++=======
++ 	for_each_tdp_mmu_root_yield_safe(kvm, root, range->slot->as_id, false)
++ 		flush = zap_gfn_range(kvm, root, range->start, range->end,
++ 				      range->may_block, flush, false);
+++>>>>>>> 7533377215b6 (KVM: x86/mmu: Use yield-safe TDP MMU root iter in MMU notifier unmapping)
+ +
+ +				hva_start = max(start, memslot->userspace_addr);
+ +				hva_end = min(end, memslot->userspace_addr +
+ +					(memslot->npages << PAGE_SHIFT));
+ +				if (hva_start >= hva_end)
+ +					continue;
+ +				/*
+ +				 * {gfn(page) | page intersects with [hva_start, hva_end)} =
+ +				 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
+ +				 */
+ +				gfn_start = hva_to_gfn_memslot(hva_start, memslot);
+ +				gfn_end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, memslot);
+ +
+ +				ret |= handler(kvm, memslot, root, gfn_start,
+ +					gfn_end, data);
+ +			}
+ +		}
+ +	}
+  
+ -	return flush;
+ +	return ret;
+  }
+  
+ -typedef bool (*tdp_handler_t)(struct kvm *kvm, struct tdp_iter *iter,
+ -			      struct kvm_gfn_range *range);
+ -
+ -static __always_inline bool kvm_tdp_mmu_handle_gfn(struct kvm *kvm,
+ -						   struct kvm_gfn_range *range,
+ -						   tdp_handler_t handler)
+ +static __always_inline int kvm_tdp_mmu_handle_hva(struct kvm *kvm,
+ +						  unsigned long addr,
+ +						  unsigned long data,
+ +						  tdp_handler_t handler)
+  {
+ -	struct kvm_mmu_page *root;
+ -	struct tdp_iter iter;
+ -	bool ret = false;
+ -
+ -	rcu_read_lock();
+ -
+ -	/*
+ -	 * Don't support rescheduling, none of the MMU notifiers that funnel
+ -	 * into this helper allow blocking; it'd be dead, wasteful code.
+ -	 */
+ -	for_each_tdp_mmu_root(kvm, root, range->slot->as_id) {
+ -		tdp_root_for_each_leaf_pte(iter, root, range->start, range->end)
+ -			ret |= handler(kvm, &iter, range);
+ -	}
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, addr, addr + 1, data, handler);
+ +}
+  
+ -	rcu_read_unlock();
+ +static int zap_gfn_range_hva_wrapper(struct kvm *kvm,
+ +				     struct kvm_memory_slot *slot,
+ +				     struct kvm_mmu_page *root, gfn_t start,
+ +				     gfn_t end, unsigned long unused)
+ +{
+ +	return zap_gfn_range(kvm, root, start, end, false, false);
+ +}
+  
+ -	return ret;
+ +int kvm_tdp_mmu_zap_hva_range(struct kvm *kvm, unsigned long start,
+ +			      unsigned long end)
+ +{
+ +	return kvm_tdp_mmu_handle_hva_range(kvm, start, end, 0,
+ +					    zap_gfn_range_hva_wrapper);
+  }
+  
+  /*
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
