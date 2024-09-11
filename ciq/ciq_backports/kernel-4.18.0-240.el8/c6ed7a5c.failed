@@ -1,0 +1,195 @@
+tipc: add back link trace events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Tuong Lien <tuong.t.lien@dektech.com.au>
+commit c6ed7a5cc2d68c36287c09260dc211173e0447d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c6ed7a5c.failed
+
+In the previous commit ("tipc: add Gap ACK blocks support for broadcast
+link"), we have removed the following link trace events due to the code
+changes:
+
+- tipc_link_bc_ack
+- tipc_link_retrans
+
+This commit adds them back along with some minor changes to adapt to
+the new code.
+
+	Acked-by: Ying Xue <ying.xue@windriver.com>
+	Acked-by: Jon Maloy <jmaloy@redhat.com>
+	Signed-off-by: Tuong Lien <tuong.t.lien@dektech.com.au>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6ed7a5cc2d68c36287c09260dc211173e0447d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index 91be69d1779e,288c5670cfa5..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1396,22 -1478,55 +1396,48 @@@ exit
+   * @gap: # of gap packets
+   * @ga: buffer pointer to Gap ACK blocks from peer
+   * @xmitq: queue for accumulating the retransmitted packets if any
+ - * @retransmitted: returned boolean value if a retransmission is really issued
+ - * @rc: returned code e.g. TIPC_LINK_DOWN_EVT if a repeated retransmit failures
+ - *      happens (- unlikely case)
+   *
+ - * Return: the number of packets released from the link transmq
+ + * In case of a repeated retransmit failures, the call will return shortly
+ + * with a returned code (e.g. TIPC_LINK_DOWN_EVT)
+   */
+ -static int tipc_link_advance_transmq(struct tipc_link *l, struct tipc_link *r,
+ -				     u16 acked, u16 gap,
+ +static int tipc_link_advance_transmq(struct tipc_link *l, u16 acked, u16 gap,
+  				     struct tipc_gap_ack_blks *ga,
+ -				     struct sk_buff_head *xmitq,
+ -				     bool *retransmitted, int *rc)
+ +				     struct sk_buff_head *xmitq)
+  {
+ -	struct tipc_gap_ack_blks *last_ga = r->last_ga, *this_ga = NULL;
+ -	struct tipc_gap_ack *gacks = NULL;
+  	struct sk_buff *skb, *_skb, *tmp;
+  	struct tipc_msg *hdr;
+ -	u32 qlen = skb_queue_len(&l->transmq);
+ -	u16 nacked = acked, ngap = gap, gack_cnt = 0;
+  	u16 bc_ack = l->bc_rcvlink->rcv_nxt - 1;
+  	u16 ack = l->rcv_nxt - 1;
+ +	bool passed = false;
+  	u16 seqno, n = 0;
+ -	u16 end = r->acked, start = end, offset = r->last_gap;
+ -	u16 si = (last_ga) ? last_ga->start_index : 0;
+ -	bool is_uc = !link_is_bc_sndlink(l);
+ -	bool bc_has_acked = false;
+ +	int rc = 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	trace_tipc_link_retrans(r, acked + 1, acked + gap, &l->transmq);
++ 
++ 	/* Determine Gap ACK blocks if any for the particular link */
++ 	if (ga && is_uc) {
++ 		/* Get the Gap ACKs, uc part */
++ 		gack_cnt = ga->ugack_cnt;
++ 		gacks = &ga->gacks[ga->bgack_cnt];
++ 	} else if (ga) {
++ 		/* Copy the Gap ACKs, bc part, for later renewal if needed */
++ 		this_ga = kmemdup(ga, tipc_gap_ack_blks_sz(ga->bgack_cnt),
++ 				  GFP_ATOMIC);
++ 		if (likely(this_ga)) {
++ 			this_ga->start_index = 0;
++ 			/* Start with the bc Gap ACKs */
++ 			gack_cnt = this_ga->bgack_cnt;
++ 			gacks = &this_ga->gacks[0];
++ 		} else {
++ 			/* Hmm, we can get in trouble..., simply ignore it */
++ 			pr_warn_ratelimited("Ignoring bc Gap ACKs, no memory\n");
++ 		}
++ 	}
++ 
++ 	/* Advance the link transmq */
+++>>>>>>> c6ed7a5cc2d6 (tipc: add back link trace events)
+  	skb_queue_walk_safe(&l->transmq, skb, tmp) {
+  		seqno = buf_seqno(skb);
+  
+@@@ -2233,38 -2398,28 +2259,43 @@@ int tipc_link_bc_sync_rcv(struct tipc_l
+  	return 0;
+  }
+  
+ -int tipc_link_bc_ack_rcv(struct tipc_link *r, u16 acked, u16 gap,
+ -			 struct tipc_gap_ack_blks *ga,
+ -			 struct sk_buff_head *xmitq)
+ +void tipc_link_bc_ack_rcv(struct tipc_link *l, u16 acked,
+ +			  struct sk_buff_head *xmitq)
+  {
+ -	struct tipc_link *l = r->bc_sndlink;
+ -	bool unused = false;
+ -	int rc = 0;
+ +	struct sk_buff *skb, *tmp;
+ +	struct tipc_link *snd_l = l->bc_sndlink;
+  
+ -	if (!link_is_up(r) || !r->bc_peer_is_up)
+ -		return 0;
+ +	if (!link_is_up(l) || !l->bc_peer_is_up)
+ +		return;
+  
+ -	if (less(acked, r->acked) || (acked == r->acked && !gap && !ga))
+ -		return 0;
+ +	if (!more(acked, l->acked))
+ +		return;
+  
+++<<<<<<< HEAD
+ +	trace_tipc_link_bc_ack(l, l->acked, acked, &snd_l->transmq);
+ +	/* Skip over packets peer has already acked */
+ +	skb_queue_walk(&snd_l->transmq, skb) {
+ +		if (more(buf_seqno(skb), l->acked))
+ +			break;
+ +	}
+++=======
++ 	trace_tipc_link_bc_ack(r, acked, gap, &l->transmq);
++ 	tipc_link_advance_transmq(l, r, acked, gap, ga, xmitq, &unused, &rc);
+++>>>>>>> c6ed7a5cc2d6 (tipc: add back link trace events)
+  
+ -	tipc_link_advance_backlog(l, xmitq);
+ -	if (unlikely(!skb_queue_empty(&l->wakeupq)))
+ -		link_prepare_wakeup(l);
+ -
+ -	return rc;
+ +	/* Update/release the packets peer is acking now */
+ +	skb_queue_walk_from_safe(&snd_l->transmq, skb, tmp) {
+ +		if (more(buf_seqno(skb), acked))
+ +			break;
+ +		if (!--TIPC_SKB_CB(skb)->ackers) {
+ +			__skb_unlink(skb, &snd_l->transmq);
+ +			kfree_skb(skb);
+ +		}
+ +	}
+ +	l->acked = acked;
+ +	tipc_link_advance_backlog(snd_l, xmitq);
+ +	if (unlikely(!skb_queue_empty(&snd_l->wakeupq)))
+ +		link_prepare_wakeup(snd_l);
+  }
+  
+  /* tipc_link_bc_nack_rcv(): receive broadcast nack message
+* Unmerged path net/tipc/link.c
+diff --git a/net/tipc/trace.h b/net/tipc/trace.h
+index 4d8e00483afc..e7535ab75255 100644
+--- a/net/tipc/trace.h
++++ b/net/tipc/trace.h
+@@ -299,8 +299,10 @@ DECLARE_EVENT_CLASS(tipc_link_transmq_class,
+ 		__entry->from = f;
+ 		__entry->to = t;
+ 		__entry->len = skb_queue_len(tq);
+-		__entry->fseqno = msg_seqno(buf_msg(skb_peek(tq)));
+-		__entry->lseqno = msg_seqno(buf_msg(skb_peek_tail(tq)));
++		__entry->fseqno = __entry->len ?
++				  msg_seqno(buf_msg(skb_peek(tq))) : 0;
++		__entry->lseqno = __entry->len ?
++				  msg_seqno(buf_msg(skb_peek_tail(tq))) : 0;
+ 	),
+ 
+ 	TP_printk("<%s> retrans req: [%u-%u] transmq: %u [%u-%u]\n",
+@@ -308,15 +310,16 @@ DECLARE_EVENT_CLASS(tipc_link_transmq_class,
+ 		  __entry->len, __entry->fseqno, __entry->lseqno)
+ );
+ 
+-DEFINE_EVENT(tipc_link_transmq_class, tipc_link_retrans,
++DEFINE_EVENT_CONDITION(tipc_link_transmq_class, tipc_link_retrans,
+ 	TP_PROTO(struct tipc_link *r, u16 f, u16 t, struct sk_buff_head *tq),
+-	TP_ARGS(r, f, t, tq)
++	TP_ARGS(r, f, t, tq),
++	TP_CONDITION(less_eq(f, t))
+ );
+ 
+ DEFINE_EVENT_PRINT(tipc_link_transmq_class, tipc_link_bc_ack,
+ 	TP_PROTO(struct tipc_link *r, u16 f, u16 t, struct sk_buff_head *tq),
+ 	TP_ARGS(r, f, t, tq),
+-	TP_printk("<%s> acked: [%u-%u] transmq: %u [%u-%u]\n",
++	TP_printk("<%s> acked: %u gap: %u transmq: %u [%u-%u]\n",
+ 		  __entry->name, __entry->from, __entry->to,
+ 		  __entry->len, __entry->fseqno, __entry->lseqno)
+ );
