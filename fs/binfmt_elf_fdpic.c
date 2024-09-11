@@ -1663,7 +1663,7 @@ static int elf_fdpic_core_dump(struct coredump_params *cprm)
 
 	numnote = 2;
 
-	auxv = (elf_addr_t *) current->mm->saved_auxv;
+	auxv = (elf_addr_t *) current->mm->mm_rh->saved_auxv;
 
 	i = 0;
 	do

@@ -5456,7 +5456,7 @@ static int schedule_resp(struct scsi_cmnd *cmnd, struct sdebug_dev_info *devip,
 		sd_dp->hc_idx = get_tag(cmnd);
 
 	if (hipri)
-		ns_from_boot = ktime_get_boot_ns();
+		ns_from_boot = ktime_get_boottime_ns();
 
 	/* one of the resp_*() response functions is called here */
 	cmnd->result = pfp != NULL ? pfp(cmnd, devip) : 0;
@@ -5497,7 +5497,7 @@ static int schedule_resp(struct scsi_cmnd *cmnd, struct sdebug_dev_info *devip,
 			kt = sdebug_random ? prandom_u32_max((u32)ndelay) :
 					     (u32)ndelay;
 			if (ndelay < INCLUSIVE_TIMING_MAX_NS) {
-				u64 d = ktime_get_boot_ns() - ns_from_boot;
+				u64 d = ktime_get_boottime_ns() - ns_from_boot;
 
 				if (kt <= d) {	/* elapsed duration >= kt */
 					spin_lock_irqsave(&sqp->qc_lock, iflags);

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
  * Copyright (C) 2015-2017 Intel Deutschland GmbH
- * Copyright (C) 2018-2020 Intel Corporation
+ * Copyright (C) 2018-2021 Intel Corporation
  */
 #include <linux/etherdevice.h>
 #include <linux/math64.h>
@@ -135,7 +135,7 @@ void iwl_mvm_ftm_restart(struct iwl_mvm *mvm)
 	struct cfg80211_pmsr_result result = {
 		.status = NL80211_PMSR_STATUS_FAILURE,
 		.final = 1,
-		.host_time = ktime_get_boot_ns(),
+		.host_time = ktime_get_boottime_ns(),
 		.type = NL80211_PMSR_TYPE_FTM,
 	};
 	int i;
@@ -942,7 +942,8 @@ static u64 iwl_mvm_ftm_get_host_time(struct iwl_mvm *mvm, __le32 fw_gp2_ts)
 	u32 curr_gp2, diff;
 	u64 now_from_boot_ns;
 
-	iwl_mvm_get_sync_time(mvm, &curr_gp2, &now_from_boot_ns);
+	iwl_mvm_get_sync_time(mvm, CLOCK_BOOTTIME, &curr_gp2,
+			      &now_from_boot_ns, NULL);
 
 	if (curr_gp2 >= gp2_ts)
 		diff = curr_gp2 - gp2_ts;

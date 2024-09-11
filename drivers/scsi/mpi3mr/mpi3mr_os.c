@@ -3706,8 +3706,6 @@ mpi3mr_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	struct Scsi_Host *shost = NULL;
 	int retval = 0, i;
 
-	mark_tech_preview("MPI3 Storage Controller Device Driver", THIS_MODULE);
-
 	if (osintfc_mrioc_security_status(pdev)) {
 		warn_non_secure_ctlr = 1;
 		return 1; /* For Invalid and Tampered device */

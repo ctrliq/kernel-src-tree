@@ -702,6 +702,9 @@ struct task_struct_rh {
 	 */
 	u32				pkru;
 #endif
+#if IS_ENABLED(CONFIG_KUNIT)
+	struct kunit			*kunit_test;
+#endif
 };
 
 struct task_struct {
@@ -1311,15 +1314,11 @@ struct task_struct {
 	u64				timer_slack_ns;
 	u64				default_timer_slack_ns;
 
-#ifdef CONFIG_KASAN
+#if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
 	unsigned int			kasan_depth;
 #endif
 #ifdef CONFIG_KCSAN
 	struct kcsan_ctx		kcsan_ctx;
-#endif
-
-#if IS_ENABLED(CONFIG_KUNIT)
-	struct kunit			*kunit_test;
 #endif
 
 #ifdef CONFIG_FUNCTION_GRAPH_TRACER

@@ -945,11 +945,10 @@ struct pci_driver {
 
 	const struct pci_error_handlers *err_handler;
 	const struct attribute_group **groups;
-	const struct attribute_group **dev_groups;
 	struct device_driver	driver;
 	struct pci_dynids	dynids;
 
-	RH_KABI_RESERVE(5)
+	RH_KABI_USE(5, const struct attribute_group **dev_groups)
 	RH_KABI_RESERVE(6)
 	RH_KABI_RESERVE(7)
 	RH_KABI_RESERVE(8)
@@ -1503,13 +1502,22 @@ int pci_add_dynid(struct pci_driver *drv,
 		  unsigned long driver_data);
 const struct pci_device_id *pci_match_id(const struct pci_device_id *ids,
 					 struct pci_dev *dev);
-/* Reserved for Internal Red Hat use only */
-const struct pci_device_id *pci_hw_vendor_status(
-						const struct pci_device_id *ids,
-						struct pci_dev *dev);
-void check_unsupported_pci_hardware(const struct pci_device_id *removed_ids,
-	struct pci_dev *dev);
 
+#ifdef CONFIG_RHEL_DIFFERENCES
+const struct pci_device_id *pci_hw_deprecated(const struct pci_device_id *ids,
+					      struct pci_dev *dev);
+const struct pci_device_id *pci_hw_unmaintained(const struct pci_device_id *ids,
+						struct pci_dev *dev);
+const struct pci_device_id *pci_hw_disabled(const struct pci_device_id *ids,
+					    struct pci_dev *dev);
+#else
+static inline const struct pci_device_id *pci_hw_deprecated(const struct pci_device_id *ids,
+							    struct pci_dev *dev) { return NULL; }
+static inline const struct pci_device_id *pci_hw_unmaintained(const struct pci_device_id *ids,
+							      struct pci_dev *dev) { return NULL; }
+const struct pci_device_id *pci_hw_disabled(const struct pci_device_id *ids,
+					    struct pci_dev *dev) {return NULL; }
+#endif
 
 int pci_scan_bridge(struct pci_bus *bus, struct pci_dev *dev, int max,
 		    int pass);

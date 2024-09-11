@@ -1013,6 +1013,7 @@ struct device_dma_parameters {
 	 */
 	unsigned int max_segment_size;
 	unsigned long segment_boundary_mask;
+	RH_KABI_EXTEND(unsigned int min_align_mask)
 };
 
 typedef void *(*devcon_match_fn_t)(struct fwnode_handle *fwnode, const char *id,
@@ -1075,6 +1076,22 @@ enum dl_dev_state {
 	DL_DEV_PROBING,
 	DL_DEV_DRIVER_BOUND,
 	DL_DEV_UNBINDING,
+};
+
+/**
+ * enum device_removable - Whether the device is removable. The criteria for a
+ * device to be classified as removable is determined by its subsystem or bus.
+ * @DEVICE_REMOVABLE_NOT_SUPPORTED: This attribute is not supported for this
+ *				    device (default).
+ * @DEVICE_REMOVABLE_UNKNOWN:  Device location is Unknown.
+ * @DEVICE_FIXED: Device is not removable by the user.
+ * @DEVICE_REMOVABLE: Device is removable by the user.
+ */
+enum device_removable {
+	DEVICE_REMOVABLE_NOT_SUPPORTED = 0, /* must be 0 */
+	DEVICE_REMOVABLE_UNKNOWN,
+	DEVICE_FIXED,
+	DEVICE_REMOVABLE,
 };
 
 /**
@@ -1153,12 +1170,13 @@ struct device_extended_rh {
  * 		such descriptors.
  * @bus_dma_limit: Limit of an upstream bridge or bus which imposes a smaller
  *		DMA limit than the device itself supports.
- * @dma_pfn_offset: offset of DMA memory range relatively of RAM
+ * @dma_range_map: map for DMA memory ranges relative to that of RAM
  * @dma_parms:	A low level driver may set these to teach IOMMU code about
  * 		segment limitations.
  * @dma_pools:	Dma pools (if dma'ble device).
  * @dma_mem:	Internal for coherent mem override.
  * @cma_area:	Contiguous memory area for dma allocations
+ * @dma_io_tlb_mem: Pointer to the swiotlb pool used.  Not for driver use.
  * @archdata:	For arch-specific additions.
  * @of_node:	Associated device tree node.
  * @fwnode:	Associated device node supplied by platform firmware.
@@ -1174,6 +1192,9 @@ struct device_extended_rh {
  * 		device (i.e. the bus driver that discovered the device).
  * @iommu_group: IOMMU group the device belongs to.
  * @iommu:	Per device generic IOMMU runtime data
+ * @removable:  Whether the device can be removed from the system. This
+ *              should be set by the subsystem / bus driver that discovered
+ *              the device.
  *
  * @offline_disabled: If set, the device is permanently online.
  * @offline:	Set after successful invocation of bus type's .offline().
@@ -1246,7 +1267,7 @@ struct device {
 					     allocations such descriptors. */
 	u64		RH_KABI_RENAME(bus_dma_mask,
 					bus_dma_limit); /* upstream dma constraint */
-	unsigned long	dma_pfn_offset;
+	RH_KABI_BROKEN_REPLACE(unsigned long	dma_pfn_offset, const struct bus_dma_region *dma_range_map)
 
 	struct device_dma_parameters *dma_parms;
 
@@ -1294,7 +1315,11 @@ struct device {
 	/* Use device_extended after all RESERVE fields used */
 
 	RH_KABI_USE(1, struct dev_iommu *iommu)
+#ifdef CONFIG_SWIOTLB
+	RH_KABI_USE(2, struct io_tlb_mem *dma_io_tlb_mem)
+#else
 	RH_KABI_RESERVE(2)
+#endif
 
 	/* NB: See the note for struct dev_links_info: */
 	RH_KABI_RESERVE(3)
@@ -1302,7 +1327,7 @@ struct device {
 	RH_KABI_RESERVE(5)
 	RH_KABI_USE(6, 7, struct list_head links_defer_sync)
 
-	RH_KABI_RESERVE(8)
+	RH_KABI_USE(8, enum device_removable   removable)
 	RH_KABI_RESERVE(9)
 	RH_KABI_RESERVE(10)
 	RH_KABI_RESERVE(11)
@@ -1538,6 +1563,22 @@ static inline bool dev_has_sync_state(struct device *dev)
 	if (dev->bus && dev->bus->sync_state)
 		return true;
 	return false;
+}
+
+static inline void dev_set_removable(struct device *dev,
+				     enum device_removable removable)
+{
+	dev->removable = removable;
+}
+
+static inline bool dev_is_removable(struct device *dev)
+{
+	return dev->removable == DEVICE_REMOVABLE;
+}
+
+static inline bool dev_removable_is_valid(struct device *dev)
+{
+	return dev->removable != DEVICE_REMOVABLE_NOT_SUPPORTED;
 }
 
 /*

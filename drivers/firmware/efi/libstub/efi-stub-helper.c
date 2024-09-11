@@ -49,7 +49,7 @@ bool __pure __efi_soft_reserve_enabled(void)
 	return !efi_nosoftreserve;
 }
 
-void __pure set_nokaslr(int val)
+void set_nokaslr(int val)
 {
 	__nokaslr = val;
 }

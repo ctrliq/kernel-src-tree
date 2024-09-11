@@ -1063,19 +1063,6 @@ static int pl2303_carrier_raised(struct usb_serial_port *port)
 	return 0;
 }
 
-static int pl2303_get_serial(struct tty_struct *tty,
-			struct serial_struct *ss)
-{
-	struct usb_serial_port *port = tty->driver_data;
-
-	ss->type = PORT_16654;
-	ss->line = port->minor;
-	ss->close_delay = 50;
-	ss->closing_wait = 3000;
-
-	return 0;
-}
-
 static void pl2303_set_break(struct usb_serial_port *port, bool enable)
 {
 	struct usb_serial *serial = port->serial;
@@ -1259,7 +1246,6 @@ static struct usb_serial_driver pl2303_device = {
 	.close =		pl2303_close,
 	.dtr_rts =		pl2303_dtr_rts,
 	.carrier_raised =	pl2303_carrier_raised,
-	.get_serial =		pl2303_get_serial,
 	.break_ctl =		pl2303_break_ctl,
 	.set_termios =		pl2303_set_termios,
 	.tiocmget =		pl2303_tiocmget,

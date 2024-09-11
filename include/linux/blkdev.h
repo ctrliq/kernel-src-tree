@@ -658,7 +658,7 @@ struct request_queue {
 #define QUEUE_FLAG_PCI_P2PDMA  29	/* device supports PCI p2p requests */
 #define QUEUE_FLAG_ZONE_RESETALL 30	/* supports Zone Reset All */
 #define QUEUE_FLAG_NOWAIT      31	/* device supports NOWAIT */
-
+#define QUEUE_FLAG_STABLE_WRITES 32	/* don't modify blks until WB is done */
 #define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
 				 (1 << QUEUE_FLAG_SAME_COMP)	|	\
 				 (1 << QUEUE_FLAG_ADD_RANDOM))
@@ -681,6 +681,8 @@ bool blk_queue_flag_test_and_set(unsigned int flag, struct request_queue *q);
 #define blk_queue_unpriv_sgio(q) \
 	test_bit(QUEUE_FLAG_UNPRIV_SGIO, &(q)->queue_flags)
 #define blk_queue_nonrot(q)	test_bit(QUEUE_FLAG_NONROT, &(q)->queue_flags)
+#define blk_queue_stable_writes(q) \
+	test_bit(QUEUE_FLAG_STABLE_WRITES, &(q)->queue_flags)
 #define blk_queue_io_stat(q)	test_bit(QUEUE_FLAG_IO_STAT, &(q)->queue_flags)
 #define blk_queue_add_random(q)	test_bit(QUEUE_FLAG_ADD_RANDOM, &(q)->queue_flags)
 #define blk_queue_discard(q)	test_bit(QUEUE_FLAG_DISCARD, &(q)->queue_flags)

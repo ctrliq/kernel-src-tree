@@ -3220,6 +3220,11 @@ enum ieee80211_tdls_actioncode {
  */
 #define WLAN_EXT_CAPA3_MULTI_BSSID_SUPPORT	BIT(6)
 
+/* Timing Measurement protocol for time sync is set in the 7th bit of 3rd byte
+ * of the @WLAN_EID_EXT_CAPABILITY information element
+ */
+#define WLAN_EXT_CAPA3_TIMING_MEASUREMENT_SUPPORT	BIT(7)
+
 /* TDLS capabilities in the 4th byte of @WLAN_EID_EXT_CAPABILITY */
 #define WLAN_EXT_CAPA4_TDLS_BUFFER_STA		BIT(4)
 #define WLAN_EXT_CAPA4_TDLS_PEER_PSM		BIT(5)

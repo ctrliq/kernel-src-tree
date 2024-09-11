@@ -3208,12 +3208,10 @@ static void skb_warn_bad_offload(const struct sk_buff *skb)
 		else
 			name = netdev_name(dev);
 	}
-	WARN(1, "%s: caps=(%pNF, %pNF) len=%d data_len=%d gso_size=%d "
-	     "gso_type=%d ip_summed=%d\n",
+	skb_dump(KERN_WARNING, skb, false);
+	WARN(1, "%s: caps=(%pNF, %pNF)\n",
 	     name, dev ? &dev->features : &null_features,
-	     skb->sk ? &skb->sk->sk_route_caps : &null_features,
-	     skb->len, skb->data_len, skb_shinfo(skb)->gso_size,
-	     skb_shinfo(skb)->gso_type, skb->ip_summed);
+	     skb->sk ? &skb->sk->sk_route_caps : &null_features);
 }
 
 /*
@@ -3428,10 +3426,11 @@ EXPORT_SYMBOL(__skb_gso_segment);
 
 /* Take action when hardware reception checksum errors are detected. */
 #ifdef CONFIG_BUG
-void netdev_rx_csum_fault(struct net_device *dev)
+void netdev_rx_csum_fault(struct net_device *dev, struct sk_buff *skb)
 {
 	if (net_ratelimit()) {
 		pr_err("%s: hw csum failure\n", dev ? dev->name : "<unknown>");
+		skb_dump(KERN_ERR, skb, true);
 		dump_stack();
 	}
 }
@@ -5759,7 +5758,7 @@ static void gro_pull_from_frag0(struct sk_buff *skb, int grow)
 	skb->data_len -= grow;
 	skb->tail += grow;
 
-	pinfo->frags[0].page_offset += grow;
+	skb_frag_off_add(&pinfo->frags[0], grow);
 	skb_frag_size_sub(&pinfo->frags[0], grow);
 
 	if (unlikely(!skb_frag_size(&pinfo->frags[0]))) {
@@ -6102,7 +6101,7 @@ __sum16 __skb_gro_checksum_complete(struct sk_buff *skb)
 	if (likely(!sum)) {
 		if (unlikely(skb->ip_summed == CHECKSUM_COMPLETE) &&
 		    !skb->csum_complete_sw)
-			netdev_rx_csum_fault(skb->dev);
+			netdev_rx_csum_fault(skb->dev, skb);
 	}
 
 	NAPI_GRO_CB(skb)->csum = wsum;

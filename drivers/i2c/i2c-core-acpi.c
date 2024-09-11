@@ -263,8 +263,8 @@ static acpi_status i2c_acpi_add_device(acpi_handle handle, u32 level,
  */
 void i2c_acpi_register_devices(struct i2c_adapter *adap)
 {
+	struct acpi_device *adev;
 	acpi_status status;
-	acpi_handle handle;
 
 	if (!has_acpi_companion(&adap->dev))
 		return;
@@ -279,11 +279,11 @@ void i2c_acpi_register_devices(struct i2c_adapter *adap)
 	if (!adap->dev.parent)
 		return;
 
-	handle = ACPI_HANDLE(adap->dev.parent);
-	if (!handle)
+	adev = ACPI_COMPANION(adap->dev.parent);
+	if (!adev)
 		return;
 
-	acpi_walk_dep_device_list(handle);
+	acpi_dev_clear_dependencies(adev);
 }
 
 const struct acpi_device_id *

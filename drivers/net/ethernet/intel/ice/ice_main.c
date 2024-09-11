@@ -69,7 +69,7 @@ bool netif_is_ice(struct net_device *dev)
  * ice_get_tx_pending - returns number of Tx descriptors not processed
  * @ring: the ring of descriptors
  */
-static u16 ice_get_tx_pending(struct ice_ring *ring)
+static u16 ice_get_tx_pending(struct ice_tx_ring *ring)
 {
 	u16 head, tail;
 
@@ -108,8 +108,8 @@ static void ice_check_for_hang_subtask(struct ice_pf *pf)
 
 	hw = &vsi->back->hw;
 
-	for (i = 0; i < vsi->num_txq; i++) {
-		struct ice_ring *tx_ring = vsi->tx_rings[i];
+	ice_for_each_txq(vsi, i) {
+		struct ice_tx_ring *tx_ring = vsi->tx_rings[i];
 
 		if (tx_ring && tx_ring->desc) {
 			/* If packet counter has not changed the queue is
@@ -494,7 +494,7 @@ ice_prepare_for_reset(struct ice_pf *pf)
 	ice_pf_dis_all_vsi(pf, false);
 
 	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
-		ice_ptp_release(pf);
+		ice_ptp_prepare_for_reset(pf);
 
 	if (hw->port_info)
 		ice_sched_clear_port(hw->port_info);
@@ -2314,14 +2314,14 @@ static int ice_vsi_req_irq_msix(struct ice_vsi *vsi, char *basename)
 
 		irq_num = pf->msix_entries[base + vector].vector;
 
-		if (q_vector->tx.ring && q_vector->rx.ring) {
+		if (q_vector->tx.tx_ring && q_vector->rx.rx_ring) {
 			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
 				 "%s-%s-%d", basename, "TxRx", rx_int_idx++);
 			tx_int_idx++;
-		} else if (q_vector->rx.ring) {
+		} else if (q_vector->rx.rx_ring) {
 			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
 				 "%s-%s-%d", basename, "rx", rx_int_idx++);
-		} else if (q_vector->tx.ring) {
+		} else if (q_vector->tx.tx_ring) {
 			snprintf(q_vector->name, sizeof(q_vector->name) - 1,
 				 "%s-%s-%d", basename, "tx", tx_int_idx++);
 		} else {
@@ -2381,9 +2381,9 @@ static int ice_xdp_alloc_setup_rings(struct ice_vsi *vsi)
 	struct device *dev = ice_pf_to_dev(vsi->back);
 	int i;
 
-	for (i = 0; i < vsi->num_xdp_txq; i++) {
+	ice_for_each_xdp_txq(vsi, i) {
 		u16 xdp_q_idx = vsi->alloc_txq + i;
-		struct ice_ring *xdp_ring;
+		struct ice_tx_ring *xdp_ring;
 
 		xdp_ring = kzalloc(sizeof(*xdp_ring), GFP_KERNEL);
 
@@ -2400,7 +2400,7 @@ static int ice_xdp_alloc_setup_rings(struct ice_vsi *vsi)
 		if (ice_setup_tx_ring(xdp_ring))
 			goto free_xdp_rings;
 		ice_set_ring_xdp(xdp_ring);
-		xdp_ring->xsk_pool = ice_xsk_pool(xdp_ring);
+		xdp_ring->xsk_pool = ice_tx_xsk_pool(xdp_ring);
 	}
 
 	return 0;
@@ -2479,11 +2479,11 @@ int ice_prepare_xdp_rings(struct ice_vsi *vsi, struct bpf_prog *prog)
 		q_base = vsi->num_xdp_txq - xdp_rings_rem;
 
 		for (q_id = q_base; q_id < (q_base + xdp_rings_per_v); q_id++) {
-			struct ice_ring *xdp_ring = vsi->xdp_rings[q_id];
+			struct ice_tx_ring *xdp_ring = vsi->xdp_rings[q_id];
 
 			xdp_ring->q_vector = q_vector;
-			xdp_ring->next = q_vector->tx.ring;
-			q_vector->tx.ring = xdp_ring;
+			xdp_ring->next = q_vector->tx.tx_ring;
+			q_vector->tx.tx_ring = xdp_ring;
 		}
 		xdp_rings_rem -= xdp_rings_per_v;
 	}
@@ -2512,7 +2512,7 @@ int ice_prepare_xdp_rings(struct ice_vsi *vsi, struct bpf_prog *prog)
 
 	return 0;
 clear_xdp_rings:
-	for (i = 0; i < vsi->num_xdp_txq; i++)
+	ice_for_each_xdp_txq(vsi, i)
 		if (vsi->xdp_rings[i]) {
 			kfree_rcu(vsi->xdp_rings[i], rcu);
 			vsi->xdp_rings[i] = NULL;
@@ -2520,7 +2520,7 @@ clear_xdp_rings:
 
 err_map_xdp:
 	mutex_lock(&pf->avail_q_mutex);
-	for (i = 0; i < vsi->num_xdp_txq; i++) {
+	ice_for_each_xdp_txq(vsi, i) {
 		clear_bit(vsi->txq_map[i + vsi->alloc_txq], pf->avail_txqs);
 		vsi->txq_map[i + vsi->alloc_txq] = ICE_INVAL_Q_INDEX;
 	}
@@ -2553,25 +2553,25 @@ int ice_destroy_xdp_rings(struct ice_vsi *vsi)
 
 	ice_for_each_q_vector(vsi, v_idx) {
 		struct ice_q_vector *q_vector = vsi->q_vectors[v_idx];
-		struct ice_ring *ring;
+		struct ice_tx_ring *ring;
 
-		ice_for_each_ring(ring, q_vector->tx)
+		ice_for_each_tx_ring(ring, q_vector->tx)
 			if (!ring->tx_buf || !ice_ring_is_xdp(ring))
 				break;
 
 		/* restore the value of last node prior to XDP setup */
-		q_vector->tx.ring = ring;
+		q_vector->tx.tx_ring = ring;
 	}
 
 free_qmap:
 	mutex_lock(&pf->avail_q_mutex);
-	for (i = 0; i < vsi->num_xdp_txq; i++) {
+	ice_for_each_xdp_txq(vsi, i) {
 		clear_bit(vsi->txq_map[i + vsi->alloc_txq], pf->avail_txqs);
 		vsi->txq_map[i + vsi->alloc_txq] = ICE_INVAL_Q_INDEX;
 	}
 	mutex_unlock(&pf->avail_q_mutex);
 
-	for (i = 0; i < vsi->num_xdp_txq; i++)
+	ice_for_each_xdp_txq(vsi, i)
 		if (vsi->xdp_rings[i]) {
 			if (vsi->xdp_rings[i]->desc)
 				ice_free_tx_ring(vsi->xdp_rings[i]);
@@ -2609,7 +2609,7 @@ static void ice_vsi_rx_napi_schedule(struct ice_vsi *vsi)
 	int i;
 
 	ice_for_each_rxq(vsi, i) {
-		struct ice_ring *rx_ring = vsi->rx_rings[i];
+		struct ice_rx_ring *rx_ring = vsi->rx_rings[i];
 
 		if (rx_ring->xsk_pool)
 			napi_schedule(&rx_ring->q_vector->napi);
@@ -4269,11 +4269,7 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 
 	pf->msg_enable = netif_msg_init(debug, ICE_DFLT_NETIF_M);
 
-	err = ice_devlink_register(pf);
-	if (err) {
-		dev_err(dev, "ice_devlink_register failed: %d\n", err);
-		goto err_exit_unroll;
-	}
+	ice_devlink_register(pf);
 
 #ifndef CONFIG_DYNAMIC_DEBUG
 	if (debug < -1)
@@ -4286,6 +4282,8 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 		err = -EIO;
 		goto err_exit_unroll;
 	}
+
+	ice_init_feature_support(pf);
 
 	ice_request_fw(pf);
 
@@ -5429,77 +5427,59 @@ int ice_vsi_cfg(struct ice_vsi *vsi)
 }
 
 /* THEORY OF MODERATION:
- * The below code creates custom DIM profiles for use by this driver, because
- * the ice driver hardware works differently than the hardware that DIMLIB was
+ * The ice driver hardware works differently than the hardware that DIMLIB was
  * originally made for. ice hardware doesn't have packet count limits that
  * can trigger an interrupt, but it *does* have interrupt rate limit support,
- * and this code adds that capability to be used by the driver when it's using
- * DIMLIB. The DIMLIB code was always designed to be a suggestion to the driver
- * for how to "respond" to traffic and interrupts, so this driver uses a
- * slightly different set of moderation parameters to get best performance.
+ * which is hard-coded to a limit of 250,000 ints/second.
+ * If not using dynamic moderation, the INTRL value can be modified
+ * by ethtool rx-usecs-high.
  */
 struct ice_dim {
 	/* the throttle rate for interrupts, basically worst case delay before
 	 * an initial interrupt fires, value is stored in microseconds.
 	 */
 	u16 itr;
-	/* the rate limit for interrupts, which can cap a delay from a small
-	 * ITR at a certain amount of interrupts per second. f.e. a 2us ITR
-	 * could yield as much as 500,000 interrupts per second, but with a
-	 * 10us rate limit, it limits to 100,000 interrupts per second. Value
-	 * is stored in microseconds.
-	 */
-	u16 intrl;
 };
 
 /* Make a different profile for Rx that doesn't allow quite so aggressive
- * moderation at the high end (it maxes out at 128us or about 8k interrupts a
- * second. The INTRL/rate parameters here are only useful to cap small ITR
- * values, which is why for larger ITR's - like 128, which can only generate
- * 8k interrupts per second, there is no point to rate limit and the values
- * are set to zero. The rate limit values do affect latency, and so must
- * be reasonably small so to not impact latency sensitive tests.
+ * moderation at the high end (it maxes out at 126us or about 8k interrupts a
+ * second.
  */
 static const struct ice_dim rx_profile[] = {
-	{2, 10},
-	{8, 16},
-	{32, 0},
-	{96, 0},
-	{128, 0}
+	{2},    /* 500,000 ints/s, capped at 250K by INTRL */
+	{8},    /* 125,000 ints/s */
+	{16},   /*  62,500 ints/s */
+	{62},   /*  16,129 ints/s */
+	{126}   /*   7,936 ints/s */
 };
 
 /* The transmit profile, which has the same sorts of values
  * as the previous struct
  */
 static const struct ice_dim tx_profile[] = {
-	{2, 10},
-	{8, 16},
-	{64, 0},
-	{128, 0},
-	{256, 0}
+	{2},    /* 500,000 ints/s, capped at 250K by INTRL */
+	{8},    /* 125,000 ints/s */
+	{40},   /*  16,125 ints/s */
+	{128},  /*   7,812 ints/s */
+	{256}   /*   3,906 ints/s */
 };
 
 static void ice_tx_dim_work(struct work_struct *work)
 {
 	struct ice_ring_container *rc;
-	struct ice_q_vector *q_vector;
 	struct dim *dim;
-	u16 itr, intrl;
+	u16 itr;
 
 	dim = container_of(work, struct dim, work);
-	rc = container_of(dim, struct ice_ring_container, dim);
-	q_vector = container_of(rc, struct ice_q_vector, tx);
+	rc = (struct ice_ring_container *)dim->priv;
 
-	if (dim->profile_ix >= ARRAY_SIZE(tx_profile))
-		dim->profile_ix = ARRAY_SIZE(tx_profile) - 1;
+	WARN_ON(dim->profile_ix >= ARRAY_SIZE(tx_profile));
 
 	/* look up the values in our local table */
 	itr = tx_profile[dim->profile_ix].itr;
-	intrl = tx_profile[dim->profile_ix].intrl;
 
-	ice_trace(tx_dim_work, q_vector, dim);
+	ice_trace(tx_dim_work, container_of(rc, struct ice_q_vector, tx), dim);
 	ice_write_itr(rc, itr);
-	ice_write_intrl(q_vector, intrl);
 
 	dim->state = DIM_START_MEASURE;
 }
@@ -5507,26 +5487,63 @@ static void ice_tx_dim_work(struct work_struct *work)
 static void ice_rx_dim_work(struct work_struct *work)
 {
 	struct ice_ring_container *rc;
-	struct ice_q_vector *q_vector;
 	struct dim *dim;
-	u16 itr, intrl;
+	u16 itr;
 
 	dim = container_of(work, struct dim, work);
-	rc = container_of(dim, struct ice_ring_container, dim);
-	q_vector = container_of(rc, struct ice_q_vector, rx);
+	rc = (struct ice_ring_container *)dim->priv;
 
-	if (dim->profile_ix >= ARRAY_SIZE(rx_profile))
-		dim->profile_ix = ARRAY_SIZE(rx_profile) - 1;
+	WARN_ON(dim->profile_ix >= ARRAY_SIZE(rx_profile));
 
 	/* look up the values in our local table */
 	itr = rx_profile[dim->profile_ix].itr;
-	intrl = rx_profile[dim->profile_ix].intrl;
 
-	ice_trace(rx_dim_work, q_vector, dim);
+	ice_trace(rx_dim_work, container_of(rc, struct ice_q_vector, rx), dim);
 	ice_write_itr(rc, itr);
-	ice_write_intrl(q_vector, intrl);
 
 	dim->state = DIM_START_MEASURE;
+}
+
+#define ICE_DIM_DEFAULT_PROFILE_IX 1
+
+/**
+ * ice_init_moderation - set up interrupt moderation
+ * @q_vector: the vector containing rings to be configured
+ *
+ * Set up interrupt moderation registers, with the intent to do the right thing
+ * when called from reset or from probe, and whether or not dynamic moderation
+ * is enabled or not. Take special care to write all the registers in both
+ * dynamic moderation mode or not in order to make sure hardware is in a known
+ * state.
+ */
+static void ice_init_moderation(struct ice_q_vector *q_vector)
+{
+	struct ice_ring_container *rc;
+	bool tx_dynamic, rx_dynamic;
+
+	rc = &q_vector->tx;
+	INIT_WORK(&rc->dim.work, ice_tx_dim_work);
+	rc->dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+	rc->dim.profile_ix = ICE_DIM_DEFAULT_PROFILE_IX;
+	rc->dim.priv = rc;
+	tx_dynamic = ITR_IS_DYNAMIC(rc);
+
+	/* set the initial TX ITR to match the above */
+	ice_write_itr(rc, tx_dynamic ?
+		      tx_profile[rc->dim.profile_ix].itr : rc->itr_setting);
+
+	rc = &q_vector->rx;
+	INIT_WORK(&rc->dim.work, ice_rx_dim_work);
+	rc->dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+	rc->dim.profile_ix = ICE_DIM_DEFAULT_PROFILE_IX;
+	rc->dim.priv = rc;
+	rx_dynamic = ITR_IS_DYNAMIC(rc);
+
+	/* set the initial RX ITR to match the above */
+	ice_write_itr(rc, rx_dynamic ? rx_profile[rc->dim.profile_ix].itr :
+				       rc->itr_setting);
+
+	ice_set_q_vector_intrl(q_vector);
 }
 
 /**
@@ -5543,13 +5560,9 @@ static void ice_napi_enable_all(struct ice_vsi *vsi)
 	ice_for_each_q_vector(vsi, q_idx) {
 		struct ice_q_vector *q_vector = vsi->q_vectors[q_idx];
 
-		INIT_WORK(&q_vector->tx.dim.work, ice_tx_dim_work);
-		q_vector->tx.dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
+		ice_init_moderation(q_vector);
 
-		INIT_WORK(&q_vector->rx.dim.work, ice_rx_dim_work);
-		q_vector->rx.dim.mode = DIM_CQ_PERIOD_MODE_START_FROM_EQE;
-
-		if (q_vector->rx.ring || q_vector->tx.ring)
+		if (q_vector->rx.rx_ring || q_vector->tx.tx_ring)
 			napi_enable(&q_vector->napi);
 	}
 }
@@ -5609,7 +5622,8 @@ int ice_up(struct ice_vsi *vsi)
 
 /**
  * ice_fetch_u64_stats_per_ring - get packets and bytes stats per ring
- * @ring: Tx or Rx ring to read stats from
+ * @syncp: pointer to u64_stats_sync
+ * @stats: stats that pkts and bytes count will be taken from
  * @pkts: packets stats counter
  * @bytes: bytes stats counter
  *
@@ -5617,19 +5631,16 @@ int ice_up(struct ice_vsi *vsi)
  * that needs to be performed to read u64 values in 32 bit machine.
  */
 static void
-ice_fetch_u64_stats_per_ring(struct ice_ring *ring, u64 *pkts, u64 *bytes)
+ice_fetch_u64_stats_per_ring(struct u64_stats_sync *syncp, struct ice_q_stats stats,
+			     u64 *pkts, u64 *bytes)
 {
 	unsigned int start;
-	*pkts = 0;
-	*bytes = 0;
 
-	if (!ring)
-		return;
 	do {
-		start = u64_stats_fetch_begin_irq(&ring->syncp);
-		*pkts = ring->stats.pkts;
-		*bytes = ring->stats.bytes;
-	} while (u64_stats_fetch_retry_irq(&ring->syncp, start));
+		start = u64_stats_fetch_begin_irq(syncp);
+		*pkts = stats.pkts;
+		*bytes = stats.bytes;
+	} while (u64_stats_fetch_retry_irq(syncp, start));
 }
 
 /**
@@ -5639,18 +5650,19 @@ ice_fetch_u64_stats_per_ring(struct ice_ring *ring, u64 *pkts, u64 *bytes)
  * @count: number of rings
  */
 static void
-ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi, struct ice_ring **rings,
+ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi, struct ice_tx_ring **rings,
 			     u16 count)
 {
 	struct rtnl_link_stats64 *vsi_stats = &vsi->net_stats;
 	u16 i;
 
 	for (i = 0; i < count; i++) {
-		struct ice_ring *ring;
-		u64 pkts, bytes;
+		struct ice_tx_ring *ring;
+		u64 pkts = 0, bytes = 0;
 
 		ring = READ_ONCE(rings[i]);
-		ice_fetch_u64_stats_per_ring(ring, &pkts, &bytes);
+		if (ring)
+			ice_fetch_u64_stats_per_ring(&ring->syncp, ring->stats, &pkts, &bytes);
 		vsi_stats->tx_packets += pkts;
 		vsi_stats->tx_bytes += bytes;
 		vsi->tx_restart += ring->tx_stats.restart_q;
@@ -5689,9 +5701,9 @@ static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
 
 	/* update Rx rings counters */
 	ice_for_each_rxq(vsi, i) {
-		struct ice_ring *ring = READ_ONCE(vsi->rx_rings[i]);
+		struct ice_rx_ring *ring = READ_ONCE(vsi->rx_rings[i]);
 
-		ice_fetch_u64_stats_per_ring(ring, &pkts, &bytes);
+		ice_fetch_u64_stats_per_ring(&ring->syncp, ring->stats, &pkts, &bytes);
 		vsi_stats->rx_packets += pkts;
 		vsi_stats->rx_bytes += bytes;
 		vsi->rx_buf_failed += ring->rx_stats.alloc_buf_failed;
@@ -5955,7 +5967,7 @@ static void ice_napi_disable_all(struct ice_vsi *vsi)
 	ice_for_each_q_vector(vsi, q_idx) {
 		struct ice_q_vector *q_vector = vsi->q_vectors[q_idx];
 
-		if (q_vector->rx.ring || q_vector->tx.ring)
+		if (q_vector->rx.rx_ring || q_vector->tx.tx_ring)
 			napi_disable(&q_vector->napi);
 
 		cancel_work_sync(&q_vector->tx.dim.work);
@@ -6038,7 +6050,7 @@ int ice_vsi_setup_tx_rings(struct ice_vsi *vsi)
 	}
 
 	ice_for_each_txq(vsi, i) {
-		struct ice_ring *ring = vsi->tx_rings[i];
+		struct ice_tx_ring *ring = vsi->tx_rings[i];
 
 		if (!ring)
 			return -EINVAL;
@@ -6069,7 +6081,7 @@ int ice_vsi_setup_rx_rings(struct ice_vsi *vsi)
 	}
 
 	ice_for_each_rxq(vsi, i) {
-		struct ice_ring *ring = vsi->rx_rings[i];
+		struct ice_rx_ring *ring = vsi->rx_rings[i];
 
 		if (!ring)
 			return -EINVAL;
@@ -6409,7 +6421,7 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 	 * fail.
 	 */
 	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
-		ice_ptp_init(pf);
+		ice_ptp_reset(pf);
 
 	/* rebuild PF VSI */
 	err = ice_vsi_rebuild_by_type(pf, ICE_VSI_PF);
@@ -6417,6 +6429,10 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 		dev_err(dev, "PF VSI rebuild failed: %d\n", err);
 		goto err_vsi_rebuild;
 	}
+
+	/* configure PTP timestamping after VSI rebuild */
+	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
+		ice_ptp_cfg_timestamp(pf, false);
 
 	/* If Flow Director is active */
 	if (test_bit(ICE_FLAG_FD_ENA, pf->flags)) {
@@ -6964,7 +6980,7 @@ ice_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
 static void ice_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 {
 	struct ice_netdev_priv *np = netdev_priv(netdev);
-	struct ice_ring *tx_ring = NULL;
+	struct ice_tx_ring *tx_ring = NULL;
 	struct ice_vsi *vsi = np->vsi;
 	struct ice_pf *pf = vsi->back;
 	u32 i;
@@ -6982,7 +6998,7 @@ static void ice_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 	}
 
 	/* now that we have an index, find the tx_ring struct */
-	for (i = 0; i < vsi->num_txq; i++)
+	ice_for_each_txq(vsi, i)
 		if (vsi->tx_rings[i] && vsi->tx_rings[i]->desc)
 			if (txqueue == vsi->tx_rings[i]->q_index) {
 				tx_ring = vsi->tx_rings[i];

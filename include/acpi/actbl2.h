@@ -2008,7 +2008,7 @@ struct acpi_sdev_pcie_path {
 /*******************************************************************************
  *
  * SVKL - Storage Volume Key Location Table (ACPI 6.4)
- *        From: "Guest-Host-Communication Interface (GHCI) for Intel
+ *        Author: "Guest-Host-Communication Interface (GHCI) for Intel
  *        Trust Domain Extensions (Intel TDX)".
  *        Version 1
  *

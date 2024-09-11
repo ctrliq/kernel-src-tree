@@ -311,7 +311,7 @@ static int ena_xdp_xmit_frame(struct ena_ring *xdp_ring,
 
 	rc = ena_xdp_tx_map_frame(xdp_ring, tx_info, xdpf, &ena_tx_ctx);
 	if (unlikely(rc))
-		goto error_drop_packet;
+		return rc;
 
 	ena_tx_ctx.req_id = req_id;
 
@@ -335,8 +335,6 @@ static int ena_xdp_xmit_frame(struct ena_ring *xdp_ring,
 error_unmap_dma:
 	ena_unmap_tx_buff(xdp_ring, tx_info);
 	tx_info->xdpf = NULL;
-error_drop_packet:
-	xdp_return_frame(xdpf);
 	return rc;
 }
 
@@ -344,8 +342,8 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
 			struct xdp_frame **frames, u32 flags)
 {
 	struct ena_adapter *adapter = netdev_priv(dev);
-	int qid, i, err, drops = 0;
 	struct ena_ring *xdp_ring;
+	int qid, i, nxmit = 0;
 
 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
 		return -EINVAL;
@@ -365,12 +363,9 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
 	spin_lock(&xdp_ring->xdp_tx_lock);
 
 	for (i = 0; i < n; i++) {
-		err = ena_xdp_xmit_frame(xdp_ring, dev, frames[i], 0);
-		/* The descriptor is freed by ena_xdp_xmit_frame in case
-		 * of an error.
-		 */
-		if (err)
-			drops++;
+		if (ena_xdp_xmit_frame(xdp_ring, dev, frames[i], 0))
+			break;
+		nxmit++;
 	}
 
 	/* Ring doorbell to make device aware of the packets */
@@ -380,7 +375,7 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
 	spin_unlock(&xdp_ring->xdp_tx_lock);
 
 	/* Return number of packets sent */
-	return n - drops;
+	return nxmit;
 }
 
 static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
@@ -414,7 +409,9 @@ static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
 		/* The XDP queues are shared between XDP_TX and XDP_REDIRECT */
 		spin_lock(&xdp_ring->xdp_tx_lock);
 
-		ena_xdp_xmit_frame(xdp_ring, rx_ring->netdev, xdpf, XDP_XMIT_FLUSH);
+		if (ena_xdp_xmit_frame(xdp_ring, rx_ring->netdev, xdpf,
+				       XDP_XMIT_FLUSH))
+			xdp_return_frame(xdpf);
 
 		spin_unlock(&xdp_ring->xdp_tx_lock);
 		xdp_stat = &rx_ring->rx_stats.xdp_tx;
@@ -4088,7 +4085,7 @@ static void ena_set_conf_feat_params(struct ena_adapter *adapter,
 		ether_addr_copy(adapter->mac_addr, netdev->dev_addr);
 	} else {
 		ether_addr_copy(adapter->mac_addr, feat->dev_attr.mac_addr);
-		ether_addr_copy(netdev->dev_addr, adapter->mac_addr);
+		eth_hw_addr_set(netdev, adapter->mac_addr);
 	}
 
 	/* Set offload features */

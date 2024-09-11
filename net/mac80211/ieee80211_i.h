@@ -946,6 +946,7 @@ struct ieee80211_sub_if_data {
 
 	struct work_struct work;
 	struct sk_buff_head skb_queue;
+	struct sk_buff_head status_queue;
 
 	u8 needed_rx_chains;
 	enum ieee80211_smps_mode smps_mode;
@@ -1457,10 +1458,6 @@ struct ieee80211_local {
 
 	/* extended capabilities provided by mac80211 */
 	u8 ext_capa[8];
-
-	/* TDLS channel switch */
-	struct work_struct tdls_chsw_work;
-	struct sk_buff_head skb_queue_tdls_chsw;
 };
 
 static inline struct ieee80211_sub_if_data *
@@ -2087,6 +2084,11 @@ ieee80211_he_op_ie_to_bss_conf(struct ieee80211_vif *vif,
 
 /* S1G */
 void ieee80211_s1g_sta_rate_init(struct sta_info *sta);
+bool ieee80211_s1g_is_twt_setup(struct sk_buff *skb);
+void ieee80211_s1g_rx_twt_action(struct ieee80211_sub_if_data *sdata,
+				 struct sk_buff *skb);
+void ieee80211_s1g_status_twt_action(struct ieee80211_sub_if_data *sdata,
+				     struct sk_buff *skb);
 
 /* Spectrum management */
 void ieee80211_process_measurement_req(struct ieee80211_sub_if_data *sdata,
@@ -2464,9 +2466,13 @@ void ieee80211_tdls_cancel_channel_switch(struct wiphy *wiphy,
 					  struct net_device *dev,
 					  const u8 *addr);
 void ieee80211_teardown_tdls_peers(struct ieee80211_sub_if_data *sdata);
-void ieee80211_tdls_chsw_work(struct work_struct *wk);
 void ieee80211_tdls_handle_disconnect(struct ieee80211_sub_if_data *sdata,
 				      const u8 *peer, u16 reason);
+void
+ieee80211_process_tdls_channel_switch(struct ieee80211_sub_if_data *sdata,
+				      struct sk_buff *skb);
+
+
 const char *ieee80211_get_reason_code_string(u16 reason_code);
 u16 ieee80211_encode_usf(int val);
 u8 *ieee80211_get_bssid(struct ieee80211_hdr *hdr, size_t len,

@@ -1460,8 +1460,8 @@ static int axienet_probe(struct platform_device *pdev)
 	struct device_node *np;
 	struct axienet_local *lp;
 	struct net_device *ndev;
-	const void *mac_addr;
 	struct resource *ethres, dmares;
+	u8 mac_addr[ETH_ALEN];
 	u32 value;
 
 	ndev = alloc_etherdev(sizeof(*lp));
@@ -1602,12 +1602,14 @@ static int axienet_probe(struct platform_device *pdev)
 	}
 
 	/* Retrieve the MAC address */
-	mac_addr = of_get_mac_address(pdev->dev.of_node);
-	if (!mac_addr) {
-		dev_err(&pdev->dev, "could not find MAC address\n");
-		goto free_netdev;
+	ret = of_get_mac_address(pdev->dev.of_node, mac_addr);
+	if (!ret) {
+		axienet_set_mac_address(ndev, mac_addr);
+	} else {
+		dev_warn(&pdev->dev, "could not find MAC address property: %d\n",
+			 ret);
+		axienet_set_mac_address(ndev, NULL);
 	}
-	axienet_set_mac_address(ndev, mac_addr);
 
 	lp->coalesce_count_rx = XAXIDMA_DFT_RX_THRESHOLD;
 	lp->coalesce_count_tx = XAXIDMA_DFT_TX_THRESHOLD;

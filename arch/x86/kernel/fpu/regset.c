@@ -5,13 +5,14 @@
 #include <linux/sched/task_stack.h>
 #include <linux/vmalloc.h>
 
-#include <asm/fpu/internal.h>
+#include <asm/fpu/api.h>
 #include <asm/fpu/signal.h>
 #include <asm/fpu/regset.h>
-#include <asm/fpu/xstate.h>
 
 #include "context.h"
 #include "internal.h"
+#include "legacy.h"
+#include "xstate.h"
 
 /*
  * The xstateregs_active() routine is the same as the regset_fpregs_active() routine,
@@ -152,7 +153,7 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
 	/*
 	 * A whole standard-format XSAVE buffer is needed:
 	 */
-	if (pos != 0 || count != fpu_user_xstate_size)
+	if (pos != 0 || count != fpu_user_cfg.max_size)
 		return -EFAULT;
 
 	if (!kbuf) {
@@ -167,8 +168,7 @@ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
 	}
 
 	fpu_force_restore(fpu);
-	ret = copy_uabi_from_kernel_to_xstate(&fpu->fpstate->regs.xsave,
-					      kbuf ?: tmpbuf);
+	ret = copy_uabi_from_kernel_to_xstate(fpu->fpstate, kbuf ?: tmpbuf);
 
 out:
 	vfree(tmpbuf);

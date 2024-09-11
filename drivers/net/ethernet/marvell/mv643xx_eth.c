@@ -2721,7 +2721,6 @@ static int mv643xx_eth_shared_of_add_port(struct platform_device *pdev,
 	struct platform_device *ppdev;
 	struct mv643xx_eth_platform_data ppd;
 	struct resource res;
-	const char *mac_addr;
 	int ret;
 	int dev_num = 0;
 
@@ -2752,9 +2751,7 @@ static int mv643xx_eth_shared_of_add_port(struct platform_device *pdev,
 		return -EINVAL;
 	}
 
-	mac_addr = of_get_mac_address(pnp);
-	if (mac_addr)
-		memcpy(ppd.mac_addr, mac_addr, ETH_ALEN);
+	of_get_mac_address(pnp, ppd.mac_addr);
 
 	mv643xx_eth_property(pnp, "tx-queue-size", ppd.tx_queue_size);
 	mv643xx_eth_property(pnp, "tx-sram-addr", ppd.tx_sram_addr);

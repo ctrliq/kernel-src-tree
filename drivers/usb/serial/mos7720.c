@@ -1200,7 +1200,7 @@ static int mos7720_write_room(struct tty_struct *tty)
 
 	mos7720_port = usb_get_serial_port_data(port);
 	if (mos7720_port == NULL)
-		return -ENODEV;
+		return 0;
 
 	/* FIXME: Locking */
 	for (i = 0; i < NUM_URBS; ++i) {
@@ -1792,19 +1792,6 @@ static int mos7720_tiocmset(struct tty_struct *tty,
 	return 0;
 }
 
-static int get_serial_info(struct tty_struct *tty,
-			   struct serial_struct *ss)
-{
-	struct usb_serial_port *port = tty->driver_data;
-
-	ss->type		= PORT_16550A;
-	ss->line		= port->minor;
-	ss->close_delay		= 50;
-	ss->closing_wait	= 3000;
-
-	return 0;
-}
-
 static int mos7720_ioctl(struct tty_struct *tty,
 			 unsigned int cmd, unsigned long arg)
 {
@@ -1952,7 +1939,6 @@ static struct usb_serial_driver moschip7720_2port_driver = {
 	.ioctl			= mos7720_ioctl,
 	.tiocmget		= mos7720_tiocmget,
 	.tiocmset		= mos7720_tiocmset,
-	.get_serial		= get_serial_info,
 	.set_termios		= mos7720_set_termios,
 	.write			= mos7720_write,
 	.write_room		= mos7720_write_room,

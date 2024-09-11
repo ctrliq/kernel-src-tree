@@ -93,6 +93,7 @@
 #include <linux/livepatch.h>
 #include <linux/thread_info.h>
 #include <linux/scs.h>
+#include <linux/kasan.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -221,6 +222,9 @@ static unsigned long *alloc_thread_stack_node(struct task_struct *tsk, int node)
 
 		if (!s)
 			continue;
+
+		/* Mark stack accessible for KASAN. */
+		kasan_unpoison_range(s->addr, THREAD_SIZE);
 
 		/* Clear stale pointers from reused stack. */
 		memset(s->addr, 0, THREAD_SIZE);
@@ -1079,6 +1083,8 @@ struct mm_struct *mm_alloc(void)
 		return NULL;
 
 	memset(mm, 0, sizeof(*mm));
+	mm->mm_rh = (struct mm_struct_rh *)((unsigned long)mm + sizeof(struct mm_struct) +
+					    cpumask_size());
 	return mm_init(mm, current, current_user_ns());
 }
 
@@ -2131,7 +2137,7 @@ static __latent_entropy struct task_struct *copy_process(
 	 */
 
 	p->start_time = ktime_get_ns();
-	p->real_start_time = ktime_get_boot_ns();
+	p->real_start_time = ktime_get_boottime_ns();
 
 	/*
 	 * Make it visible to the rest of the system, but dont wake it up yet.
@@ -2550,13 +2556,14 @@ void __init proc_caches_init(void)
 	 * dynamically sized based on the maximum CPU number this system
 	 * can have, taking hotplug into account (nr_cpu_ids).
 	 */
-	mm_size = sizeof(struct mm_struct) + cpumask_size();
+	mm_size = sizeof(struct mm_struct) + cpumask_size() + sizeof(struct mm_struct_rh);
 
 	mm_cachep = kmem_cache_create_usercopy("mm_struct",
 			mm_size, ARCH_MIN_MMSTRUCT_ALIGN,
 			SLAB_HWCACHE_ALIGN|SLAB_PANIC|SLAB_ACCOUNT,
-			offsetof(struct mm_struct, saved_auxv),
-			sizeof_field(struct mm_struct, saved_auxv),
+			sizeof(struct mm_struct) + cpumask_size() +
+				offsetof(struct mm_struct_rh, saved_auxv),
+			sizeof_field(struct mm_struct_rh, saved_auxv),
 			NULL);
 	vm_area_cachep = KMEM_CACHE(vm_area_struct, SLAB_PANIC|SLAB_ACCOUNT);
 	mmap_init();

@@ -1384,24 +1384,6 @@ static int mos7840_get_lsr_info(struct tty_struct *tty,
 }
 
 /*****************************************************************************
- * mos7840_get_serial_info
- *      function to get information about serial port
- *****************************************************************************/
-
-static int mos7840_get_serial_info(struct tty_struct *tty,
-				   struct serial_struct *ss)
-{
-	struct usb_serial_port *port = tty->driver_data;
-
-	ss->type = PORT_16550A;
-	ss->line = port->minor;
-	ss->close_delay = 50;
-	ss->closing_wait = 3000;
-
-	return 0;
-}
-
-/*****************************************************************************
  * SerialIoctl
  *	this function handles any ioctl calls to the driver
  *****************************************************************************/
@@ -1781,7 +1763,6 @@ static struct usb_serial_driver moschip7840_4port_device = {
 	.probe = mos7840_probe,
 	.attach = mos7840_attach,
 	.ioctl = mos7840_ioctl,
-	.get_serial = mos7840_get_serial_info,
 	.set_termios = mos7840_set_termios,
 	.break_ctl = mos7840_break,
 	.tiocmget = mos7840_tiocmget,

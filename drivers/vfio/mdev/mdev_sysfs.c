@@ -282,3 +282,17 @@ void mdev_remove_sysfs_files(struct device *dev, struct mdev_type *type)
 	sysfs_remove_link(&dev->kobj, "mdev_type");
 	sysfs_remove_link(type->devices_kobj, dev_name(dev));
 }
+
+int mdev_type_kobj_to_group_id(struct kobject *kobj)
+{
+	struct mdev_type *type = to_mdev_type(kobj);
+	int i;
+
+	for (i = 0; type->parent->ops->supported_type_groups[i]; i++) {
+		if (type->group == type->parent->ops->supported_type_groups[i])
+			return i;
+	}
+
+	return -1;
+}
+EXPORT_SYMBOL(mdev_type_kobj_to_group_id);

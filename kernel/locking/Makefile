@@ -36,10 +36,11 @@ obj-$(CONFIG_LOCK_EVENT_COUNTS) += lock_events.o
 #
 # Generate RHEL8 specific file for __init_rwsem() function to perserve kABI.
 #
-$(src)/rwsem_init.c: $(src)/rwsem.c
+$(obj)/rwsem_init.c: $(src)/rwsem.c
 	@(echo "#include <linux/sched/signal.h>";	\
 	  echo "#include <linux/rwsem.h>";		\
-	  echo "#ifndef CONFIG_PREEMPT_RT") >> $(src)/rwsem_init.c
+	  echo "#ifndef CONFIG_PREEMPT_RT") > $(obj)/rwsem_init.c
 	@sed -n -e "/^void __init_rwsem(/,/^EXPORT_SYMBOL(__init_rwsem)/p" \
-		-e "/^EXPORT_SYMBOL(__init_rwsem)/q" $(src)/rwsem.c >> $(src)/rwsem_init.c
-	@echo "#endif" >> $(src)/rwsem_init.c
+		-e "/^EXPORT_SYMBOL(__init_rwsem)/q" $(srctree)/$(src)/rwsem.c \
+		>> $(obj)/rwsem_init.c
+	@echo "#endif" >> $(obj)/rwsem_init.c

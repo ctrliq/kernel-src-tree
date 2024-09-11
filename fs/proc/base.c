@@ -1010,9 +1010,9 @@ static ssize_t auxv_read(struct file *file, char __user *buf,
 		return 0;
 	do {
 		nwords += 2;
-	} while (mm->saved_auxv[nwords - 2] != 0); /* AT_NULL */
-	return simple_read_from_buffer(buf, count, ppos, mm->saved_auxv,
-				       nwords * sizeof(mm->saved_auxv[0]));
+	} while (mm->mm_rh->saved_auxv[nwords - 2] != 0); /* AT_NULL */
+	return simple_read_from_buffer(buf, count, ppos, mm->mm_rh->saved_auxv,
+				       nwords * sizeof(mm->mm_rh->saved_auxv[0]));
 }
 
 static const struct file_operations proc_auxv_operations = {

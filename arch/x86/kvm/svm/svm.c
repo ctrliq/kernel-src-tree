@@ -36,6 +36,7 @@
 #include <asm/spec-ctrl.h>
 #include <asm/cpu_device_id.h>
 #include <asm/traps.h>
+#include <asm/fpu/api.h>
 
 #include <asm/virtext.h>
 #include "trace.h"
@@ -1379,10 +1380,10 @@ static int svm_create_vcpu(struct kvm_vcpu *vcpu)
 		/*
 		 * SEV-ES guests maintain an encrypted version of their FPU
 		 * state which is restored and saved on VMRUN and VMEXIT.
-		 * Free the fpu structure to prevent KVM from attempting to
-		 * access the FPU state.
+		 * Mark vcpu->arch.guest_fpu->fpstate as scratch so it won't
+		 * do xsave/xrstor on it.
 		 */
-		kvm_free_guest_fpu(vcpu);
+		fpstate_set_confidential(&vcpu->arch.guest_fpu);
 	}
 
 	err = avic_init_vcpu(svm);
@@ -1405,7 +1406,7 @@ static int svm_create_vcpu(struct kvm_vcpu *vcpu)
 	svm->vmcb01.pa = __sme_set(page_to_pfn(vmcb01_page) << PAGE_SHIFT);
 
 	if (vmsa_page)
-		svm->vmsa = page_address(vmsa_page);
+		svm->sev_es.vmsa = page_address(vmsa_page);
 
 	svm->guest_state_loaded = false;
 
@@ -2795,11 +2796,11 @@ static int svm_get_msr(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 static int svm_complete_emulated_msr(struct kvm_vcpu *vcpu, int err)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
-	if (!err || !sev_es_guest(vcpu->kvm) || WARN_ON_ONCE(!svm->ghcb))
+	if (!err || !sev_es_guest(vcpu->kvm) || WARN_ON_ONCE(!svm->sev_es.ghcb))
 		return kvm_complete_insn_gp(vcpu, err);
 
-	ghcb_set_sw_exit_info_1(svm->ghcb, 1);
-	ghcb_set_sw_exit_info_2(svm->ghcb,
+	ghcb_set_sw_exit_info_1(svm->sev_es.ghcb, 1);
+	ghcb_set_sw_exit_info_2(svm->sev_es.ghcb,
 				X86_TRAP_GP |
 				SVM_EVTINJ_TYPE_EXEPT |
 				SVM_EVTINJ_VALID);

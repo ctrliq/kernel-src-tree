@@ -310,7 +310,7 @@ struct usb_serial_driver {
 	/* Called by the generic write implementation */
 	int (*prepare_write_buffer)(struct usb_serial_port *port,
 						void *dest, size_t size);
-	RH_KABI_EXTEND(int  (*get_serial)(struct tty_struct *tty, struct serial_struct *ss))
+	RH_KABI_EXTEND(void  (*get_serial)(struct tty_struct *tty, struct serial_struct *ss))
 	RH_KABI_EXTEND(int  (*set_serial)(struct tty_struct *tty, struct serial_struct *ss))
 };
 #define to_usb_serial_driver(d) \

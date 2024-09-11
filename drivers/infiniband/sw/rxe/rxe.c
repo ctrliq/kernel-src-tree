@@ -285,7 +285,7 @@ static int __init rxe_module_init(void)
 {
 	int err;
 
-	mark_driver_unsupported("Soft-RoCE Transport Driver");
+	mark_driver_deprecated(THIS_MODULE->name);
 
 	err = rxe_net_init();
 	if (err)

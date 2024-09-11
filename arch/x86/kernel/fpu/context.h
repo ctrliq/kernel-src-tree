@@ -61,8 +61,6 @@ static inline void fpregs_restore_userregs(void)
 		return;
 
 	if (!fpregs_state_valid(fpu, cpu)) {
-		u64 mask;
-
 		/*
 		 * This restores _all_ xstate which has not been
 		 * established yet.
@@ -71,10 +69,10 @@ static inline void fpregs_restore_userregs(void)
 		 * correct because it was either set in switch_to() or in
 		 * flush_thread(). So it is excluded because it might be
 		 * not up to date in current->thread.fpu.xsave state.
+		 *
+		 * XFD state is handled in restore_fpregs_from_fpstate().
 		 */
-		mask = xfeatures_mask_restore_user() |
-			xfeatures_mask_supervisor();
-		restore_fpregs_from_fpstate(&fpu->state, mask);
+		restore_fpregs_from_fpstate(fpu->fpstate, XFEATURE_MASK_FPSTATE);
 
 		fpregs_activate(fpu);
 		fpu->last_cpu = cpu;

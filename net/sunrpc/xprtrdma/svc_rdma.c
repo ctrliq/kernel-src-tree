@@ -116,7 +116,7 @@ enum {
 };
 
 static int svcrdma_counter_handler(struct ctl_table *table, int write,
-				   void *buffer, size_t *lenp, loff_t *ppos)
+				   void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	struct percpu_counter *stat = (struct percpu_counter *)table->data;
 	char tmp[SVCRDMA_COUNTER_BUFSIZ + 1];
@@ -139,8 +139,8 @@ static int svcrdma_counter_handler(struct ctl_table *table, int write,
 	len -= *ppos;
 	if (len > *lenp)
 		len = *lenp;
-	if (len)
-		memcpy(buffer, tmp, len);
+	if (len && copy_to_user(buffer, tmp, len))
+		return -EFAULT;
 	*lenp = len;
 	*ppos += len;
 

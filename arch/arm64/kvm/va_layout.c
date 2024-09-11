@@ -35,7 +35,7 @@ static u64 va_mask;
 
 /*
  * We want to generate a hyp VA with the following format (with V ==
- * VA_BITS):
+ * vabits_actual):
  *
  *  63 ... V |     V-1    | V-2 .. tag_lsb | tag_lsb - 1 .. 0
  *  ---------------------------------------------------------
@@ -50,8 +50,8 @@ __init void kvm_compute_layout(void)
 	u64 hyp_va_msb;
 
 	/* Where is my RAM region? */
-	hyp_va_msb  = idmap_addr & BIT(VA_BITS - 1);
-	hyp_va_msb ^= BIT(VA_BITS - 1);
+	hyp_va_msb  = idmap_addr & BIT(vabits_actual - 1);
+	hyp_va_msb ^= BIT(vabits_actual - 1);
 
 	tag_lsb = fls64((u64)phys_to_virt(memblock_start_of_DRAM()) ^
 			(u64)(high_memory - 1));
@@ -59,9 +59,10 @@ __init void kvm_compute_layout(void)
 	va_mask = GENMASK_ULL(tag_lsb - 1, 0);
 	tag_val = hyp_va_msb;
 
-	if (tag_lsb != (VA_BITS - 1)) {
+	if (tag_lsb != (vabits_actual - 1)) {
 		/* We have some free bits to insert a random tag. */
-		tag_val |= get_random_long() & GENMASK_ULL(VA_BITS - 2, tag_lsb);
+		tag_val |= get_random_long() & GENMASK_ULL(vabits_actual - 2,
+							tag_lsb);
 	}
 	tag_val >>= tag_lsb;
 }

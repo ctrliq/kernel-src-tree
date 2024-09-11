@@ -405,31 +405,7 @@ raw_copy_in_user(void __user *to, const void __user *from, unsigned long n)
 static inline unsigned long raw_copy_from_user(void *to,
 		const void __user *from, unsigned long n)
 {
-	unsigned long ret;
-	if (__builtin_constant_p(n) && (n <= 8)) {
-		ret = 1;
-
-		switch (n) {
-		case 1:
-			barrier_nospec();
-			__get_user_size(*(u8 *)to, from, 1, ret);
-			break;
-		case 2:
-			barrier_nospec();
-			__get_user_size(*(u16 *)to, from, 2, ret);
-			break;
-		case 4:
-			barrier_nospec();
-			__get_user_size(*(u32 *)to, from, 4, ret);
-			break;
-		case 8:
-			barrier_nospec();
-			__get_user_size(*(u64 *)to, from, 8, ret);
-			break;
-		}
-		if (ret == 0)
-			return 0;
-	}
+        unsigned long ret;
 
 	barrier_nospec();
 	allow_read_from_user(from, n);
@@ -441,33 +417,7 @@ static inline unsigned long raw_copy_from_user(void *to,
 static inline unsigned long raw_copy_to_user(void __user *to,
 		const void *from, unsigned long n)
 {
-	unsigned long ret;
-
-	if (__builtin_constant_p(n) && (n <= 8)) {
-		ret = 1;
-
-		switch (n) {
-		case 1:
-			__put_user_size_allowed(*(u8 *)from, (u8 __user *)to, 1, ret);
-			break;
-		case 2:
-			__put_user_size_allowed(*(u16 *)from, (u16 __user *)to, 2, ret);
-			break;
-		case 4:
-			__put_user_size_allowed(*(u32 *)from, (u32 __user *)to, 4, ret);
-			break;
-		case 8:
-			__put_user_size_allowed(*(u64 *)from, (u64 __user *)to, 8, ret);
-			break;
-		}
-		if (ret == 0)
-			return 0;
-	}
-
-	allow_write_to_user(to, n);
-	ret = __copy_tofrom_user(to, (__force const void __user *)from, n);
-	prevent_write_to_user(to, n);
-	return ret;
+	return __copy_tofrom_user(to, (__force const void __user *)from, n);
 }
 
 static __always_inline unsigned long __must_check

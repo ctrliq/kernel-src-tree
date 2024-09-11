@@ -88,6 +88,8 @@ struct cpuinfo_x86_extended_rh {
 	u16			cpu_die_id;
 	u16			logical_die_id;
 	int                     x86_cache_mbm_width_offset;
+	/*  Is SMT active on this core? */
+	bool			smt_active;
 #ifdef CONFIG_X86_VMX_FEATURE_NAMES
 	__u32			vmx_capability[NVMXINTS];
 #endif
@@ -143,8 +145,6 @@ struct cpuinfo_x86 {
 	u16			cpu_core_id;
 	/* Index into per_cpu list: */
 	u16			cpu_index;
-	/*  Is SMT active on this core? */
-	bool			smt_active;
 	u32			microcode;
 	/* Address space bits used by the cache internally */
 	u8			x86_cache_bits;
@@ -450,9 +450,6 @@ DECLARE_PER_CPU_ALIGNED(struct stack_canary, stack_canary);
 DECLARE_PER_CPU(struct irq_stack *, softirq_stack_ptr);
 #endif	/* X86_64 */
 
-extern unsigned int fpu_kernel_xstate_size;
-extern unsigned int fpu_user_xstate_size;
-
 struct perf_event;
 
 typedef struct {
@@ -520,12 +517,12 @@ struct thread_struct {
 	 */
 };
 
-/* Whitelist the FPU state from the task_struct for hardened usercopy. */
+extern void fpu_thread_struct_whitelist(unsigned long *offset, unsigned long *size);
+
 static inline void arch_thread_struct_whitelist(unsigned long *offset,
 						unsigned long *size)
 {
-	*offset = offsetof(struct thread_struct, fpu.state);
-	*size = fpu_kernel_xstate_size;
+	fpu_thread_struct_whitelist(offset, size);
 }
 
 /*
@@ -878,6 +875,8 @@ static inline int mpx_disable_management(void)
 	return -EINVAL;
 }
 #endif /* CONFIG_X86_INTEL_MPX */
+
+extern u16 get_llc_id(unsigned int cpu);
 
 #ifdef CONFIG_CPU_SUP_AMD
 extern u32 amd_get_nodes_per_socket(void);

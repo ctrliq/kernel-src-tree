@@ -2048,7 +2048,7 @@ int sta_info_move_state(struct sta_info *sta,
 	case IEEE80211_STA_ASSOC:
 		if (sta->sta_state == IEEE80211_STA_AUTH) {
 			set_bit(WLAN_STA_ASSOC, &sta->_flags);
-			sta->assoc_at = ktime_get_boot_ns();
+			sta->assoc_at = ktime_get_boottime_ns();
 			ieee80211_recalc_min_chandef(sta->sdata);
 			if (!sta->sta.support_p2p_ps)
 				ieee80211_recalc_p2p_go_ps_allowed(sta->sdata);

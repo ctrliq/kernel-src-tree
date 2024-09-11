@@ -4,7 +4,7 @@
  * the allocated memory contains normal pages in the direct kernel mapping.
  */
 #include <linux/dma-contiguous.h>
-#include <linux/dma-noncoherent.h>
+#include <linux/dma-map-ops.h>
 
 static struct page *dma_common_vaddr_to_page(void *cpu_addr)
 {

@@ -731,18 +731,18 @@ struct uvc_driver {
  * Debugging, printing and logging
  */
 
-#define UVC_TRACE_PROBE		(1 << 0)
-#define UVC_TRACE_DESCR		(1 << 1)
-#define UVC_TRACE_CONTROL	(1 << 2)
-#define UVC_TRACE_FORMAT	(1 << 3)
-#define UVC_TRACE_CAPTURE	(1 << 4)
-#define UVC_TRACE_CALLS		(1 << 5)
-#define UVC_TRACE_FRAME		(1 << 7)
-#define UVC_TRACE_SUSPEND	(1 << 8)
-#define UVC_TRACE_STATUS	(1 << 9)
-#define UVC_TRACE_VIDEO		(1 << 10)
-#define UVC_TRACE_STATS		(1 << 11)
-#define UVC_TRACE_CLOCK		(1 << 12)
+#define UVC_DBG_PROBE		(1 << 0)
+#define UVC_DBG_DESCR		(1 << 1)
+#define UVC_DBG_CONTROL		(1 << 2)
+#define UVC_DBG_FORMAT		(1 << 3)
+#define UVC_DBG_CAPTURE		(1 << 4)
+#define UVC_DBG_CALLS		(1 << 5)
+#define UVC_DBG_FRAME		(1 << 7)
+#define UVC_DBG_SUSPEND		(1 << 8)
+#define UVC_DBG_STATUS		(1 << 9)
+#define UVC_DBG_VIDEO		(1 << 10)
+#define UVC_DBG_STATS		(1 << 11)
+#define UVC_DBG_CLOCK		(1 << 12)
 
 #define UVC_WARN_MINMAX		0
 #define UVC_WARN_PROBE_DEF	1
@@ -750,24 +750,28 @@ struct uvc_driver {
 
 extern unsigned int uvc_clock_param;
 extern unsigned int uvc_no_drop_param;
-extern unsigned int uvc_trace_param;
+extern unsigned int uvc_dbg_param;
 extern unsigned int uvc_timeout_param;
 extern unsigned int uvc_hw_timestamps_param;
 
-#define uvc_trace(flag, msg...) \
-	do { \
-		if (uvc_trace_param & flag) \
-			printk(KERN_DEBUG "uvcvideo: " msg); \
-	} while (0)
+#define uvc_dbg(_dev, flag, fmt, ...)					\
+do {									\
+	if (uvc_dbg_param & UVC_DBG_##flag)				\
+		dev_printk(KERN_DEBUG, &(_dev)->udev->dev, fmt,		\
+			   ##__VA_ARGS__);				\
+} while (0)
 
-#define uvc_warn_once(dev, warn, msg...) \
-	do { \
-		if (!test_and_set_bit(warn, &dev->warnings)) \
-			printk(KERN_INFO "uvcvideo: " msg); \
-	} while (0)
+#define uvc_dbg_cont(flag, fmt, ...)					\
+do {									\
+	if (uvc_dbg_param & UVC_DBG_##flag)				\
+		pr_cont(fmt, ##__VA_ARGS__);				\
+} while (0)
 
-#define uvc_printk(level, msg...) \
-	printk(level "uvcvideo: " msg)
+#define uvc_warn_once(_dev, warn, fmt, ...)				\
+do {									\
+	if (!test_and_set_bit(warn, &(_dev)->warnings))			\
+		dev_info(&(_dev)->udev->dev, fmt, ##__VA_ARGS__);	\
+} while (0)
 
 /* --------------------------------------------------------------------------
  * Internal functions.
@@ -813,6 +817,12 @@ int uvc_queue_allocated(struct uvc_video_queue *queue);
 static inline int uvc_queue_streaming(struct uvc_video_queue *queue)
 {
 	return vb2_is_streaming(&queue->queue);
+}
+
+static inline struct uvc_streaming *
+uvc_queue_to_stream(struct uvc_video_queue *queue)
+{
+	return container_of(queue, struct uvc_streaming, queue);
 }
 
 /* V4L2 interface */

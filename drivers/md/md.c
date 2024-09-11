@@ -456,9 +456,7 @@ EXPORT_SYMBOL(md_handle_request);
 static blk_qc_t md_make_request(struct request_queue *q, struct bio *bio)
 {
 	const int rw = bio_data_dir(bio);
-	const int sgrp = op_stat_group(bio_op(bio));
 	struct mddev *mddev = bio->bi_disk->private_data;
-	unsigned int sectors;
 
 	if (mddev == NULL || mddev->pers == NULL) {
 		bio_io_error(bio);
@@ -479,20 +477,10 @@ static blk_qc_t md_make_request(struct request_queue *q, struct bio *bio)
 		return BLK_QC_T_NONE;
 	}
 
-	/*
-	 * save the sectors now since our bio can
-	 * go away inside make_request
-	 */
-	sectors = bio_sectors(bio);
 	/* bio could be mergeable after passing to underlayer */
 	bio->bi_opf &= ~REQ_NOMERGE;
 
 	md_handle_request(mddev, bio);
-
-	part_stat_lock();
-	part_stat_inc(&mddev->gendisk->part0, ios[sgrp]);
-	part_stat_add(&mddev->gendisk->part0, sectors[sgrp], sectors);
-	part_stat_unlock();
 
 	return BLK_QC_T_NONE;
 }
@@ -2384,7 +2372,15 @@ int md_integrity_register(struct mddev *mddev)
 			       bdev_get_integrity(reference->bdev));
 
 	pr_debug("md: data integrity enabled on %s\n", mdname(mddev));
-	if (bioset_integrity_create(&mddev->bio_set, BIO_POOL_SIZE)) {
+	if (bioset_integrity_create(&mddev->bio_set, BIO_POOL_SIZE) ||
+	    (mddev->level != 1 && mddev->level != 10 &&
+	     bioset_integrity_create(&mddev->io_acct_set, BIO_POOL_SIZE))) {
+		/*
+		 * No need to handle the failure of bioset_integrity_create,
+		 * because the function is called by md_run() -> pers->run(),
+		 * md_run calls bioset_exit -> bioset_integrity_free in case
+		 * of failure case.
+		 */
 		pr_err("md: failed to create integrity pool for %s\n",
 		       mdname(mddev));
 		return -EINVAL;
@@ -5619,6 +5615,8 @@ static void md_free(struct kobject *ko)
 
 	bioset_exit(&mddev->bio_set);
 	bioset_exit(&mddev->sync_set);
+	if (mddev->level != 1 && mddev->level != 10)
+		bioset_exit(&mddev->io_acct_set);
 	kfree(mddev);
 }
 
@@ -5910,7 +5908,14 @@ int md_run(struct mddev *mddev)
 	if (!bioset_initialized(&mddev->sync_set)) {
 		err = bioset_init(&mddev->sync_set, BIO_POOL_SIZE, 0, BIOSET_NEED_BVECS);
 		if (err)
-			return err;
+			goto exit_bio_set;
+	}
+	if (mddev->level != 1 && mddev->level != 10 &&
+	    !bioset_initialized(&mddev->io_acct_set)) {
+		err = bioset_init(&mddev->io_acct_set, BIO_POOL_SIZE,
+				  offsetof(struct md_io_acct, bio_clone), 0);
+		if (err)
+			goto exit_sync_set;
 	}
 
 	spin_lock(&pers_lock);
@@ -6040,6 +6045,7 @@ int md_run(struct mddev *mddev)
 			blk_queue_flag_clear(QUEUE_FLAG_NONROT, mddev->queue);
 		mddev->queue->backing_dev_info->congested_data = mddev;
 		mddev->queue->backing_dev_info->congested_fn = md_congested;
+		blk_queue_flag_set(QUEUE_FLAG_IO_STAT, mddev->queue);
 	}
 	if (pers->sync_request) {
 		if (mddev->kobj.sd &&
@@ -6089,8 +6095,12 @@ bitmap_abort:
 	module_put(pers->owner);
 	md_bitmap_destroy(mddev);
 abort:
-	bioset_exit(&mddev->bio_set);
+	if (mddev->level != 1 && mddev->level != 10)
+		bioset_exit(&mddev->io_acct_set);
+exit_sync_set:
 	bioset_exit(&mddev->sync_set);
+exit_bio_set:
+	bioset_exit(&mddev->bio_set);
 	return err;
 }
 EXPORT_SYMBOL_GPL(md_run);
@@ -6315,6 +6325,8 @@ void md_stop(struct mddev *mddev)
 	__md_stop(mddev);
 	bioset_exit(&mddev->bio_set);
 	bioset_exit(&mddev->sync_set);
+	if (mddev->level != 1 && mddev->level != 10)
+		bioset_exit(&mddev->io_acct_set);
 }
 
 EXPORT_SYMBOL_GPL(md_stop);
@@ -8633,6 +8645,41 @@ void md_submit_discard_bio(struct mddev *mddev, struct md_rdev *rdev,
 	generic_make_request(discard_bio);
 }
 EXPORT_SYMBOL_GPL(md_submit_discard_bio);
+
+static void md_end_io_acct(struct bio *bio)
+{
+	struct md_io_acct *md_io_acct = bio->bi_private;
+	struct bio *orig_bio = md_io_acct->orig_bio;
+
+	orig_bio->bi_status = bio->bi_status;
+
+	bio_end_io_acct(orig_bio, md_io_acct->start_time);
+	bio_put(bio);
+	bio_endio(orig_bio);
+}
+
+/*
+ * Used by personalities that don't already clone the bio and thus can't
+ * easily add the timestamp to their extended bio structure.
+ */
+void md_account_bio(struct mddev *mddev, struct bio **bio)
+{
+	struct md_io_acct *md_io_acct;
+	struct bio *clone;
+
+	if (!blk_queue_io_stat((*bio)->bi_disk->queue))
+		return;
+
+	clone = bio_clone_fast(*bio, GFP_NOIO, &mddev->io_acct_set);
+	md_io_acct = container_of(clone, struct md_io_acct, bio_clone);
+	md_io_acct->orig_bio = *bio;
+	md_io_acct->start_time = bio_start_io_acct(*bio);
+
+	clone->bi_end_io = md_end_io_acct;
+	clone->bi_private = md_io_acct;
+	*bio = clone;
+}
+EXPORT_SYMBOL_GPL(md_account_bio);
 
 /* md_allow_write(mddev)
  * Calling this ensures that the array is marked 'active' so that writes

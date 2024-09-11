@@ -7400,7 +7400,7 @@ static int megasas_probe_one(struct pci_dev *pdev,
 	struct megasas_instance *instance;
 	u16 control = 0;
 
-	check_unsupported_pci_hardware(unsupported_ids_table, pdev);
+	pci_hw_deprecated(unsupported_ids_table, pdev);
 
 	switch (pdev->device) {
 	case PCI_DEVICE_ID_LSI_AERO_10E0:

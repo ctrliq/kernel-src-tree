@@ -2816,7 +2816,7 @@ void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb);
  * for devices that support offload of data packets (e.g. ARP responses).
  *
  * Mac80211 drivers should set the @NL80211_EXT_FEATURE_CAN_REPLACE_PTK0 flag
- * when they are able to replace in-use PTK keys according to to following
+ * when they are able to replace in-use PTK keys according to the following
  * requirements:
  * 1) They do not hand over frames decrypted with the old key to mac80211
       once the call to set_key() with command %DISABLE_KEY has been completed,
@@ -3926,6 +3926,13 @@ struct ieee80211_prep_tx_info {
  * @set_sar_specs: Update the SAR (TX power) settings.
  * @sta_set_decap_offload: Called to notify the driver when a station is allowed
  *	to use rx decapsulation offload
+ * @add_twt_setup: Update hw with TWT agreement parameters received from the peer.
+ *	This callback allows the hw to check if requested parameters
+ *	are supported and if there is enough room for a new agreement.
+ *	The hw is expected to set agreement result in the req_type field of
+ *	twt structure.
+ * @twt_teardown_request: Update the hw with TWT teardown request received
+ *	from the peer.
  */
 struct ieee80211_ops {
 	void (*tx)(struct ieee80211_hw *hw,
@@ -4249,6 +4256,11 @@ struct ieee80211_ops {
 	void (*sta_set_decap_offload)(struct ieee80211_hw *hw,
 				      struct ieee80211_vif *vif,
 				      struct ieee80211_sta *sta, bool enabled);
+	void (*add_twt_setup)(struct ieee80211_hw *hw,
+			      struct ieee80211_sta *sta,
+			      struct ieee80211_twt_setup *twt);
+	void (*twt_teardown_request)(struct ieee80211_hw *hw,
+				     struct ieee80211_sta *sta, u8 flowid);
 };
 
 /**

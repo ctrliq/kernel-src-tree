@@ -852,9 +852,9 @@ int mana_gd_verify_vf_version(struct pci_dev *pdev)
 
 	req.drv_ver = 0;	/* Unused*/
 	req.os_type = 0x10;	/* Linux */
-	req.os_ver_major = LINUX_VERSION_MAJOR;
-	req.os_ver_minor = LINUX_VERSION_PATCHLEVEL;
-	req.os_ver_build = LINUX_VERSION_SUBLEVEL;
+	req.os_ver_major = (u8)((LINUX_VERSION_CODE >> 16) & 0xff);
+	req.os_ver_minor = (u8)((LINUX_VERSION_CODE >> 8) & 0xff);
+	req.os_ver_build = (u16)(LINUX_VERSION_CODE & 0xff);
 	strscpy(req.os_ver_str1, utsname()->sysname, sizeof(req.os_ver_str1));
 	strscpy(req.os_ver_str2, utsname()->release, sizeof(req.os_ver_str2));
 	strscpy(req.os_ver_str3, utsname()->version, sizeof(req.os_ver_str3));
