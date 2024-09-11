@@ -141,9 +141,9 @@ static int aq_nic_update_link_status(struct aq_nic_s *self)
 		return err;
 
 	if (self->link_status.mbps != self->aq_hw->aq_link_status.mbps) {
-		pr_info("%s: link change old %d new %d\n",
-			AQ_CFG_DRV_NAME, self->link_status.mbps,
-			self->aq_hw->aq_link_status.mbps);
+		netdev_info(self->ndev, "%s: link change old %d new %d\n",
+			    AQ_CFG_DRV_NAME, self->link_status.mbps,
+			    self->aq_hw->aq_link_status.mbps);
 		aq_nic_update_interrupt_moderation_settings(self);
 
 		/* Driver has to update flow control settings on RX block
@@ -293,6 +293,7 @@ void aq_nic_ndev_init(struct aq_nic_s *self)
 	self->ndev->priv_flags = aq_hw_caps->hw_priv_flags;
 	self->ndev->priv_flags |= IFF_LIVE_ADDR_CHANGE;
 
+	self->msg_enable = NETIF_MSG_DRV | NETIF_MSG_LINK;
 	self->ndev->mtu = aq_nic_cfg->mtu - ETH_HLEN;
 	self->ndev->max_mtu = aq_hw_caps->mtu - ETH_FCS_LEN - ETH_HLEN;
 
