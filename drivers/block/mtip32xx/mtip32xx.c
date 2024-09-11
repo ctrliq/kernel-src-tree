@@ -2725,7 +2725,7 @@ static void mtip_softirq_done_fn(struct request *rq)
 	blk_mq_end_request(rq, cmd->status);
 }
 
-static void mtip_abort_cmd(struct request *req, void *data, bool reserved)
+static bool mtip_abort_cmd(struct request *req, void *data, bool reserved)
 {
 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(req);
 	struct driver_data *dd = data;
@@ -2735,14 +2735,16 @@ static void mtip_abort_cmd(struct request *req, void *data, bool reserved)
 	clear_bit(req->tag, dd->port->cmds_to_issue);
 	cmd->status = BLK_STS_IOERR;
 	mtip_softirq_done_fn(req);
+	return true;
 }
 
-static void mtip_queue_cmd(struct request *req, void *data, bool reserved)
+static bool mtip_queue_cmd(struct request *req, void *data, bool reserved)
 {
 	struct driver_data *dd = data;
 
 	set_bit(req->tag, dd->port->cmds_to_issue);
 	blk_abort_request(req);
+	return true;
 }
 
 /*
@@ -3937,12 +3939,13 @@ protocol_init_error:
 	return rv;
 }
 
-static void mtip_no_dev_cleanup(struct request *rq, void *data, bool reserv)
+static bool mtip_no_dev_cleanup(struct request *rq, void *data, bool reserv)
 {
 	struct mtip_cmd *cmd = blk_mq_rq_to_pdu(rq);
 
 	cmd->status = BLK_STS_IOERR;
 	blk_mq_complete_request(rq);
+	return true;
 }
 
 /*
