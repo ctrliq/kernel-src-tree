@@ -1,0 +1,162 @@
+ip: fail fast on IP defrag errors
+
+jira LE-1907
+cve CVE-2018-5391
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Peter Oskolkov <posk@google.com>
+commit 0ff89efb524631ac9901b81446b453c29711c376
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0ff89efb.failed
+
+The current behavior of IP defragmentation is inconsistent:
+- some overlapping/wrong length fragments are dropped without
+  affecting the queue;
+- most overlapping fragments cause the whole frag queue to be dropped.
+
+This patch brings consistency: if a bad fragment is detected,
+the whole frag queue is dropped. Two major benefits:
+- fail fast: corrupted frag queues are cleared immediately, instead of
+  by timeout;
+- testing of overlapping fragments is now much easier: any kind of
+  random fragment length mutation now leads to the frag queue being
+  discarded (IP packet dropped); before this patch, some overlaps were
+  "corrected", with tests not seeing expected packet drops.
+
+Note that in one case (see "if (end&7)" conditional) the current
+behavior is preserved as there are concerns that this could be
+legitimate padding.
+
+	Signed-off-by: Peter Oskolkov <posk@google.com>
+	Reviewed-by: Eric Dumazet <edumazet@google.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0ff89efb524631ac9901b81446b453c29711c376)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/ip_fragment.c
+diff --cc net/ipv4/ip_fragment.c
+index 66f94663ccf8,330f62353b11..000000000000
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@@ -390,60 -407,64 +390,100 @@@ static int ip_frag_queue(struct ipq *qp
+  
+  	err = pskb_trim_rcsum(skb, end - offset);
+  	if (err)
+- 		goto err;
++ 		goto discard_qp;
+  
+ -	/* Note : skb->rbnode and skb->dev share the same location. */
+ -	dev = skb->dev;
+ -	/* Makes sure compiler wont do silly aliasing games */
+ -	barrier();
+ +	/* Find out which fragments are in front and at the back of us
+ +	 * in the chain of fragments so far.  We must know where to put
+ +	 * this fragment, right?
+ +	 */
+ +	prev = qp->q.fragments_tail;
+ +	if (!prev || prev->ip_defrag_offset < offset) {
+ +		next = NULL;
+ +		goto found;
+ +	}
+ +	prev = NULL;
+ +	for (next = qp->q.fragments; next != NULL; next = next->next) {
+ +		if (next->ip_defrag_offset >= offset)
+ +			break;	/* bingo! */
+ +		prev = next;
+ +	}
+  
+ +found:
+  	/* RFC5722, Section 4, amended by Errata ID : 3089
+  	 *                          When reassembling an IPv6 datagram, if
+  	 *   one or more its constituent fragments is determined to be an
+  	 *   overlapping fragment, the entire datagram (and any constituent
+  	 *   fragments) MUST be silently discarded.
+  	 *
+ -	 * We do the same here for IPv4 (and increment an snmp counter).
+ +	 * We do the same here for IPv4.
+  	 */
+  
+++<<<<<<< HEAD
+ +	/* Is there an overlap with the previous fragment? */
+ +	if (prev &&
+ +	    (prev->ip_defrag_offset + prev->len) > offset)
+ +		goto discard_qp;
+++=======
++ 	err = -EINVAL;
++ 	/* Find out where to put this fragment.  */
++ 	prev_tail = qp->q.fragments_tail;
++ 	if (!prev_tail)
++ 		ip4_frag_create_run(&qp->q, skb);  /* First fragment. */
++ 	else if (prev_tail->ip_defrag_offset + prev_tail->len < end) {
++ 		/* This is the common case: skb goes to the end. */
++ 		/* Detect and discard overlaps. */
++ 		if (offset < prev_tail->ip_defrag_offset + prev_tail->len)
++ 			goto overlap;
++ 		if (offset == prev_tail->ip_defrag_offset + prev_tail->len)
++ 			ip4_frag_append_to_last_run(&qp->q, skb);
++ 		else
++ 			ip4_frag_create_run(&qp->q, skb);
++ 	} else {
++ 		/* Binary search. Note that skb can become the first fragment,
++ 		 * but not the last (covered above).
++ 		 */
++ 		rbn = &qp->q.rb_fragments.rb_node;
++ 		do {
++ 			parent = *rbn;
++ 			skb1 = rb_to_skb(parent);
++ 			if (end <= skb1->ip_defrag_offset)
++ 				rbn = &parent->rb_left;
++ 			else if (offset >= skb1->ip_defrag_offset +
++ 						FRAG_CB(skb1)->frag_run_len)
++ 				rbn = &parent->rb_right;
++ 			else /* Found an overlap with skb1. */
++ 				goto overlap;
++ 		} while (*rbn);
++ 		/* Here we have parent properly set, and rbn pointing to
++ 		 * one of its NULL left/right children. Insert skb.
++ 		 */
++ 		ip4_frag_init_run(skb);
++ 		rb_link_node(&skb->rbnode, parent, rbn);
++ 		rb_insert_color(&skb->rbnode, &qp->q.rb_fragments);
++ 	}
+++>>>>>>> 0ff89efb5246 (ip: fail fast on IP defrag errors)
+  
+ +	/* Is there an overlap with the next fragment? */
+ +	if (next && next->ip_defrag_offset < end)
+ +		goto discard_qp;
+ +
+ +	/* Note : skb->ip_defrag_offset and skb->dev share the same location */
+ +	dev = skb->dev;
+  	if (dev)
+  		qp->iif = dev->ifindex;
+ +	/* Makes sure compiler wont do silly aliasing games */
+ +	barrier();
+  	skb->ip_defrag_offset = offset;
+  
+ +	/* Insert this fragment in the chain of fragments. */
+ +	skb->next = next;
+ +	if (!next)
+ +		qp->q.fragments_tail = skb;
+ +	if (prev)
+ +		prev->next = skb;
+ +	else
+ +		qp->q.fragments = skb;
+ +
+  	qp->q.stamp = skb->tstamp;
+  	qp->q.meat += skb->len;
+  	qp->ecn |= ecn;
+@@@ -465,8 -486,10 +505,10 @@@
+  		unsigned long orefdst = skb->_skb_refdst;
+  
+  		skb->_skb_refdst = 0UL;
+ -		err = ip_frag_reasm(qp, skb, prev_tail, dev);
+ +		err = ip_frag_reasm(qp, prev, dev);
+  		skb->_skb_refdst = orefdst;
++ 		if (err)
++ 			inet_frag_kill(&qp->q);
+  		return err;
+  	}
+  
+* Unmerged path net/ipv4/ip_fragment.c
