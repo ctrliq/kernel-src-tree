@@ -4208,7 +4208,7 @@ H_GET_CPU_CHARACTERISTICS hypercall.
 
 :Capability: basic
 :Architectures: x86
-:Type: system
+:Type: vm
 :Parameters: an opaque platform specific structure (in/out)
 :Returns: 0 on success; -1 on error
 
