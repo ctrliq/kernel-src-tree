@@ -1,0 +1,219 @@
+ip: support SO_MARK cmsg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Willem de Bruijn <willemb@google.com>
+commit c6af0c227a22bb6bb8ff72f043e0fb6d99fd6515
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/c6af0c22.failed
+
+Enable setting skb->mark for UDP and RAW sockets using cmsg.
+
+This is analogous to existing support for TOS, TTL, txtime, etc.
+
+Packet sockets already support this as of commit c7d39e32632e
+("packet: support per-packet fwmark for af_packet sendmsg").
+
+Similar to other fields, implement by
+1. initialize the sockcm_cookie.mark from socket option sk_mark
+2. optionally overwrite this in ip_cmsg_send/ip6_datagram_send_ctl
+3. initialize inet_cork.mark from sockcm_cookie.mark
+4. initialize each (usually just one) skb->mark from inet_cork.mark
+
+Step 1 is handled in one location for most protocols by ipcm_init_sk
+as of commit 351782067b6b ("ipv4: ipcm_cookie initializers").
+
+	Signed-off-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c6af0c227a22bb6bb8ff72f043e0fb6d99fd6515)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/ip.h
+#	net/ipv6/ip6_output.c
+#	net/ipv6/raw.c
+#	net/ipv6/udp.c
+diff --cc include/net/ip.h
+index f61e0dd9a8e3,95bb77f95bcc..000000000000
+--- a/include/net/ip.h
++++ b/include/net/ip.h
+@@@ -79,6 -78,22 +79,25 @@@ struct ipcm_cookie 
+  	__u16			gso_size;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static inline void ipcm_init(struct ipcm_cookie *ipcm)
++ {
++ 	*ipcm = (struct ipcm_cookie) { .tos = -1 };
++ }
++ 
++ static inline void ipcm_init_sk(struct ipcm_cookie *ipcm,
++ 				const struct inet_sock *inet)
++ {
++ 	ipcm_init(ipcm);
++ 
++ 	ipcm->sockc.mark = inet->sk.sk_mark;
++ 	ipcm->sockc.tsflags = inet->sk.sk_tsflags;
++ 	ipcm->oif = inet->sk.sk_bound_dev_if;
++ 	ipcm->addr = inet->inet_saddr;
++ }
++ 
+++>>>>>>> c6af0c227a22 (ip: support SO_MARK cmsg)
+  #define IPCB(skb) ((struct inet_skb_parm*)((skb)->cb))
+  #define PKTINFO_SKB_CB(skb) ((struct in_pktinfo *)((skb)->cb))
+  
+diff --cc net/ipv6/ip6_output.c
+index ce8b1db50df5,89a4c7c2e25d..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -1354,8 -1292,10 +1354,15 @@@ static int ip6_setup_cork(struct sock *
+  	if (mtu < IPV6_MIN_MTU)
+  		return -EINVAL;
+  	cork->base.fragsize = mtu;
+++<<<<<<< HEAD
+ +	cork->base.gso_size = sk->sk_type == SOCK_DGRAM &&
+ +			      sk->sk_protocol == IPPROTO_UDP ? ipc6->gso_size : 0;
+++=======
++ 	cork->base.gso_size = ipc6->gso_size;
++ 	cork->base.tx_flags = 0;
++ 	cork->base.mark = ipc6->sockc.mark;
++ 	sock_tx_timestamp(sk, ipc6->sockc.tsflags, &cork->base.tx_flags);
+++>>>>>>> c6af0c227a22 (ip: support SO_MARK cmsg)
+  
+  	if (dst_allfrag(xfrm_dst_path(&rt->dst)))
+  		cork->base.flags |= IPCORK_ALLFRAG;
+diff --cc net/ipv6/raw.c
+index 05c2ee29fa59,6e1888ee4036..000000000000
+--- a/net/ipv6/raw.c
++++ b/net/ipv6/raw.c
+@@@ -814,10 -808,9 +814,16 @@@ static int rawv6_sendmsg(struct sock *s
+  	fl6.flowi6_mark = sk->sk_mark;
+  	fl6.flowi6_uid = sk->sk_uid;
+  
+++<<<<<<< HEAD
+ +	ipc6.hlimit = -1;
+ +	ipc6.tclass = -1;
+ +	ipc6.dontfrag = -1;
+ +	ipc6.opt = NULL;
+++=======
++ 	ipcm6_init(&ipc6);
++ 	ipc6.sockc.tsflags = sk->sk_tsflags;
++ 	ipc6.sockc.mark = sk->sk_mark;
+++>>>>>>> c6af0c227a22 (ip: support SO_MARK cmsg)
+  
+  	if (sin6) {
+  		if (addr_len < SIN6_LEN_RFC2133)
+diff --cc net/ipv6/udp.c
+index 90eaa68c0c2c,2c8beb3896d1..000000000000
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@@ -1326,14 -1226,11 +1326,21 @@@ int udpv6_sendmsg(struct sock *sk, stru
+  	int err;
+  	int is_udplite = IS_UDPLITE(sk);
+  	int (*getfrag)(void *, char *, int, int, int, struct sk_buff *);
+ -
+ +	struct sockcm_cookie sockc;
+ +
+++<<<<<<< HEAD
+ +	ipc6.hlimit = -1;
+ +	ipc6.tclass = -1;
+ +	ipc6.dontfrag = -1;
+ +	ipc6.gso_size = READ_ONCE(up->gso_size);
+ +	sockc.tsflags = sk->sk_tsflags;
+ +	sockc.transmit_time = 0;
+++=======
++ 	ipcm6_init(&ipc6);
++ 	ipc6.gso_size = up->gso_size;
++ 	ipc6.sockc.tsflags = sk->sk_tsflags;
++ 	ipc6.sockc.mark = sk->sk_mark;
+++>>>>>>> c6af0c227a22 (ip: support SO_MARK cmsg)
+  
+  	/* destination address check */
+  	if (sin6) {
+diff --git a/include/net/inet_sock.h b/include/net/inet_sock.h
+index 296466858882..c98a56174087 100644
+--- a/include/net/inet_sock.h
++++ b/include/net/inet_sock.h
+@@ -164,6 +164,7 @@ struct inet_cork {
+ 	char			priority;
+ 	__u16			gso_size;
+ 	u64			transmit_time;
++	u32			mark;
+ };
+ 
+ struct inet_cork_full {
+* Unmerged path include/net/ip.h
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index e18239b9a992..32300394fe69 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -1180,6 +1180,7 @@ static int ip_setup_cork(struct sock *sk, struct inet_cork *cork,
+ 	cork->length = 0;
+ 	cork->ttl = ipc->ttl;
+ 	cork->tos = ipc->tos;
++	cork->mark = ipc->sockc.mark;
+ 	cork->priority = ipc->priority;
+ 	cork->tx_flags = ipc->tx_flags;
+ 	cork->transmit_time = ipc->sockc.transmit_time;
+@@ -1442,7 +1443,7 @@ struct sk_buff *__ip_make_skb(struct sock *sk,
+ 	}
+ 
+ 	skb->priority = (cork->tos != -1) ? cork->priority: sk->sk_priority;
+-	skb->mark = sk->sk_mark;
++	skb->mark = cork->mark;
+ 	skb->tstamp = cork->transmit_time;
+ 	/*
+ 	 * Steal rt from cork.dst to avoid a pair of atomic_inc/atomic_dec
+diff --git a/net/ipv4/ping.c b/net/ipv4/ping.c
+index 9be046de601c..d870b17039fe 100644
+--- a/net/ipv4/ping.c
++++ b/net/ipv4/ping.c
+@@ -797,7 +797,7 @@ static int ping_v4_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 	} else if (!ipc.oif)
+ 		ipc.oif = inet->uc_index;
+ 
+-	flowi4_init_output(&fl4, ipc.oif, sk->sk_mark, tos,
++	flowi4_init_output(&fl4, ipc.oif, ipc.sockc.mark, tos,
+ 			   RT_SCOPE_UNIVERSE, sk->sk_protocol,
+ 			   inet_sk_flowi_flags(sk), faddr, saddr, 0, 0,
+ 			   sk->sk_uid);
+diff --git a/net/ipv4/raw.c b/net/ipv4/raw.c
+index d6d68213fbd5..c82e367216b0 100644
+--- a/net/ipv4/raw.c
++++ b/net/ipv4/raw.c
+@@ -380,7 +380,7 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
+ 	skb_reserve(skb, hlen);
+ 
+ 	skb->priority = sk->sk_priority;
+-	skb->mark = sk->sk_mark;
++	skb->mark = sockc->mark;
+ 	skb->tstamp = sockc->transmit_time;
+ 	skb_dst_set(skb, &rt->dst);
+ 	*rtp = NULL;
+@@ -635,7 +635,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 		}
+ 	}
+ 
+-	flowi4_init_output(&fl4, ipc.oif, sk->sk_mark, tos,
++	flowi4_init_output(&fl4, ipc.oif, ipc.sockc.mark, tos,
+ 			   RT_SCOPE_UNIVERSE,
+ 			   hdrincl ? IPPROTO_RAW : sk->sk_protocol,
+ 			   inet_sk_flowi_flags(sk) |
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index dd3faf1644ad..40164db1a7ce 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -1225,7 +1225,7 @@ int udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
+ 
+ 		fl4 = &fl4_stack;
+ 
+-		flowi4_init_output(fl4, ipc.oif, sk->sk_mark, tos,
++		flowi4_init_output(fl4, ipc.oif, ipc.sockc.mark, tos,
+ 				   RT_SCOPE_UNIVERSE, sk->sk_protocol,
+ 				   flow_flags,
+ 				   faddr, saddr, dport, inet->inet_sport,
+* Unmerged path net/ipv6/ip6_output.c
+* Unmerged path net/ipv6/raw.c
+* Unmerged path net/ipv6/udp.c
