@@ -53,6 +53,7 @@ FILES=                                          \
          test-sdt.bin                           \
          test-cxx.bin                           \
          test-jvmti.bin				\
+         test-jvmti-cmlr.bin			\
          test-sched_getcpu.bin			\
          test-setns.bin				\
          test-libopencsd.bin			\
@@ -257,6 +258,9 @@ $(OUTPUT)test-cxx.bin:
 	$(BUILDXX) -std=gnu++11
 
 $(OUTPUT)test-jvmti.bin:
+	$(BUILD)
+
+$(OUTPUT)test-jvmti-cmlr.bin:
 	$(BUILD)
 
 $(OUTPUT)test-llvm.bin:
