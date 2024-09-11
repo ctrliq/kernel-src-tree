@@ -1,0 +1,516 @@
+RDMA/uverbs: Convert the write interface to use uverbs_api
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit d120c3c91871650699ac8e71795925cc98358c3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d120c3c9.failed
+
+This organizes the write commands into objects and links them to the
+uverbs_api data structure. The command path is reworked to use uapi
+instead of its internal structures.
+
+The command mask is moved from a runtime check to a registration time
+check in the uapi.
+
+Since the write interface does not have the object ID as part of the
+command, the radix bins are converted into linear lists to support the
+lookup.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit d120c3c91871650699ac8e71795925cc98358c3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs.h
+#	drivers/infiniband/core/uverbs_main.c
+#	drivers/infiniband/core/uverbs_uapi.c
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,f9039cfb28b4..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,102 +113,105 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ struct uverbs_api_object {
++ 	const struct uverbs_obj_type *type_attrs;
++ 	const struct uverbs_obj_type_class *type_class;
++ 	u8 disabled:1;
++ };
++ 
++ struct uverbs_api_ioctl_method {
++ 	int (__rcu *handler)(struct ib_uverbs_file *ufile,
++ 			     struct uverbs_attr_bundle *ctx);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_write_method {
++ 	ssize_t (*handler)(struct ib_uverbs_file *file, const char __user *buf,
++ 			   int in_len, int out_len);
++ 	int (*handler_ex)(struct ib_uverbs_file *file, struct ib_udata *ucore,
++ 			  struct ib_udata *uhw);
++ 	u8 disabled:1;
++ 	u8 is_ex:1;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ 
++ 	unsigned int num_write;
++ 	unsigned int num_write_ex;
++ 	struct uverbs_api_write_method notsupp_method;
++ 	const struct uverbs_api_write_method **write_methods;
++ 	const struct uverbs_api_write_method **write_ex_methods;
++ };
++ 
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	return radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ extern const struct uapi_definition uverbs_def_write_intf[];
++ 
++ static inline const struct uverbs_api_write_method *
++ uapi_get_method(const struct uverbs_api *uapi, u32 command)
++ {
++ 	u32 cmd_idx = command & IB_USER_VERBS_CMD_COMMAND_MASK;
++ 
++ 	if (command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
++ 			     IB_USER_VERBS_CMD_COMMAND_MASK))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (command & IB_USER_VERBS_CMD_FLAG_EXTENDED) {
++ 		if (cmd_idx >= uapi->num_write_ex)
++ 			return ERR_PTR(-EOPNOTSUPP);
++ 		return uapi->write_ex_methods[cmd_idx];
++ 	}
++ 
++ 	if (cmd_idx >= uapi->num_write)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	return uapi->write_methods[cmd_idx];
++ }
++ 
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs.h
+index 55f338e6340d,f5bc99eae222..000000000000
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@@ -144,6 -148,19 +144,22 @@@ struct ib_uverbs_file 
+  	struct ib_uverbs_async_event_file       *async_file;
+  	struct list_head			list;
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * To access the uobjects list hw_destroy_rwsem must be held for write
++ 	 * OR hw_destroy_rwsem held for read AND uobjects_lock held.
++ 	 * hw_destroy_rwsem should be called across any destruction of the HW
++ 	 * object of an associated uobject.
++ 	 */
++ 	struct rw_semaphore	hw_destroy_rwsem;
++ 	spinlock_t		uobjects_lock;
++ 	struct list_head	uobjects;
++ 
++ 	struct mutex umap_lock;
++ 	struct list_head umaps;
++ 
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  	struct idr		idr;
+  	/* spinlock protects write access to idr */
+  	spinlock_t		idr_lock;
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 495189811c27,6a1284c8a07d..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -74,67 -73,7 +74,71 @@@ enum 
+  static dev_t dynamic_uverbs_dev;
+  static struct class *uverbs_class;
+  
+++<<<<<<< HEAD
+ +static DECLARE_BITMAP(dev_map, IB_UVERBS_MAX_DEVICES);
+ +
+ +static ssize_t (*uverbs_cmd_table[])(struct ib_uverbs_file *file,
+ +				     struct ib_device *ib_dev,
+ +				     const char __user *buf, int in_len,
+ +				     int out_len) = {
+ +	[IB_USER_VERBS_CMD_GET_CONTEXT]		= ib_uverbs_get_context,
+ +	[IB_USER_VERBS_CMD_QUERY_DEVICE]	= ib_uverbs_query_device,
+ +	[IB_USER_VERBS_CMD_QUERY_PORT]		= ib_uverbs_query_port,
+ +	[IB_USER_VERBS_CMD_ALLOC_PD]		= ib_uverbs_alloc_pd,
+ +	[IB_USER_VERBS_CMD_DEALLOC_PD]		= ib_uverbs_dealloc_pd,
+ +	[IB_USER_VERBS_CMD_REG_MR]		= ib_uverbs_reg_mr,
+ +	[IB_USER_VERBS_CMD_REREG_MR]		= ib_uverbs_rereg_mr,
+ +	[IB_USER_VERBS_CMD_DEREG_MR]		= ib_uverbs_dereg_mr,
+ +	[IB_USER_VERBS_CMD_ALLOC_MW]		= ib_uverbs_alloc_mw,
+ +	[IB_USER_VERBS_CMD_DEALLOC_MW]		= ib_uverbs_dealloc_mw,
+ +	[IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL] = ib_uverbs_create_comp_channel,
+ +	[IB_USER_VERBS_CMD_CREATE_CQ]		= ib_uverbs_create_cq,
+ +	[IB_USER_VERBS_CMD_RESIZE_CQ]		= ib_uverbs_resize_cq,
+ +	[IB_USER_VERBS_CMD_POLL_CQ]		= ib_uverbs_poll_cq,
+ +	[IB_USER_VERBS_CMD_REQ_NOTIFY_CQ]	= ib_uverbs_req_notify_cq,
+ +	[IB_USER_VERBS_CMD_DESTROY_CQ]		= ib_uverbs_destroy_cq,
+ +	[IB_USER_VERBS_CMD_CREATE_QP]		= ib_uverbs_create_qp,
+ +	[IB_USER_VERBS_CMD_QUERY_QP]		= ib_uverbs_query_qp,
+ +	[IB_USER_VERBS_CMD_MODIFY_QP]		= ib_uverbs_modify_qp,
+ +	[IB_USER_VERBS_CMD_DESTROY_QP]		= ib_uverbs_destroy_qp,
+ +	[IB_USER_VERBS_CMD_POST_SEND]		= ib_uverbs_post_send,
+ +	[IB_USER_VERBS_CMD_POST_RECV]		= ib_uverbs_post_recv,
+ +	[IB_USER_VERBS_CMD_POST_SRQ_RECV]	= ib_uverbs_post_srq_recv,
+ +	[IB_USER_VERBS_CMD_CREATE_AH]		= ib_uverbs_create_ah,
+ +	[IB_USER_VERBS_CMD_DESTROY_AH]		= ib_uverbs_destroy_ah,
+ +	[IB_USER_VERBS_CMD_ATTACH_MCAST]	= ib_uverbs_attach_mcast,
+ +	[IB_USER_VERBS_CMD_DETACH_MCAST]	= ib_uverbs_detach_mcast,
+ +	[IB_USER_VERBS_CMD_CREATE_SRQ]		= ib_uverbs_create_srq,
+ +	[IB_USER_VERBS_CMD_MODIFY_SRQ]		= ib_uverbs_modify_srq,
+ +	[IB_USER_VERBS_CMD_QUERY_SRQ]		= ib_uverbs_query_srq,
+ +	[IB_USER_VERBS_CMD_DESTROY_SRQ]		= ib_uverbs_destroy_srq,
+ +	[IB_USER_VERBS_CMD_OPEN_XRCD]		= ib_uverbs_open_xrcd,
+ +	[IB_USER_VERBS_CMD_CLOSE_XRCD]		= ib_uverbs_close_xrcd,
+ +	[IB_USER_VERBS_CMD_CREATE_XSRQ]		= ib_uverbs_create_xsrq,
+ +	[IB_USER_VERBS_CMD_OPEN_QP]		= ib_uverbs_open_qp,
+ +};
+ +
+ +static int (*uverbs_ex_cmd_table[])(struct ib_uverbs_file *file,
+ +				    struct ib_device *ib_dev,
+ +				    struct ib_udata *ucore,
+ +				    struct ib_udata *uhw) = {
+ +	[IB_USER_VERBS_EX_CMD_CREATE_FLOW]	= ib_uverbs_ex_create_flow,
+ +	[IB_USER_VERBS_EX_CMD_DESTROY_FLOW]	= ib_uverbs_ex_destroy_flow,
+ +	[IB_USER_VERBS_EX_CMD_QUERY_DEVICE]	= ib_uverbs_ex_query_device,
+ +	[IB_USER_VERBS_EX_CMD_CREATE_CQ]	= ib_uverbs_ex_create_cq,
+ +	[IB_USER_VERBS_EX_CMD_CREATE_QP]        = ib_uverbs_ex_create_qp,
+ +	[IB_USER_VERBS_EX_CMD_CREATE_WQ]        = ib_uverbs_ex_create_wq,
+ +	[IB_USER_VERBS_EX_CMD_MODIFY_WQ]        = ib_uverbs_ex_modify_wq,
+ +	[IB_USER_VERBS_EX_CMD_DESTROY_WQ]       = ib_uverbs_ex_destroy_wq,
+ +	[IB_USER_VERBS_EX_CMD_CREATE_RWQ_IND_TBL] = ib_uverbs_ex_create_rwq_ind_table,
+ +	[IB_USER_VERBS_EX_CMD_DESTROY_RWQ_IND_TBL] = ib_uverbs_ex_destroy_rwq_ind_table,
+ +	[IB_USER_VERBS_EX_CMD_MODIFY_QP]        = ib_uverbs_ex_modify_qp,
+ +	[IB_USER_VERBS_EX_CMD_MODIFY_CQ]        = ib_uverbs_ex_modify_cq,
+ +};
+ +
+++=======
++ static DEFINE_IDA(uverbs_ida);
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  static void ib_uverbs_add_one(struct ib_device *device);
+  static void ib_uverbs_remove_one(struct ib_device *device, void *client_data);
+  
+@@@ -638,41 -588,6 +642,44 @@@ err_put_refs
+  	return filp;
+  }
+  
+++<<<<<<< HEAD
+ +static bool verify_command_mask(struct ib_device *ib_dev,
+ +				u32 command, bool extended)
+ +{
+ +	if (!extended)
+ +		return ib_dev->uverbs_cmd_mask & BIT_ULL(command);
+ +
+ +	return ib_dev->uverbs_ex_cmd_mask & BIT_ULL(command);
+ +}
+ +
+ +static bool verify_command_idx(u32 command, bool extended)
+ +{
+ +	if (extended)
+ +		return command < ARRAY_SIZE(uverbs_ex_cmd_table) &&
+ +		       uverbs_ex_cmd_table[command];
+ +
+ +	return command < ARRAY_SIZE(uverbs_cmd_table) &&
+ +	       uverbs_cmd_table[command];
+ +}
+ +
+ +static ssize_t process_hdr(struct ib_uverbs_cmd_hdr *hdr,
+ +			   u32 *command, bool *extended)
+ +{
+ +	if (hdr->command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
+ +				   IB_USER_VERBS_CMD_COMMAND_MASK))
+ +		return -EINVAL;
+ +
+ +	*command = hdr->command & IB_USER_VERBS_CMD_COMMAND_MASK;
+ +	*extended = hdr->command & IB_USER_VERBS_CMD_FLAG_EXTENDED;
+ +
+ +	if (!verify_command_idx(*command, *extended))
+ +		return -EOPNOTSUPP;
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  static ssize_t verify_hdr(struct ib_uverbs_cmd_hdr *hdr,
+  			  struct ib_uverbs_ex_cmd_hdr *ex_hdr,
+  			  size_t count, bool extended)
+@@@ -713,12 -628,11 +720,12 @@@ static ssize_t ib_uverbs_write(struct f
+  			     size_t count, loff_t *pos)
+  {
+  	struct ib_uverbs_file *file = filp->private_data;
++ 	const struct uverbs_api_write_method *method_elm;
++ 	struct uverbs_api *uapi = file->device->uapi;
+  	struct ib_uverbs_ex_cmd_hdr ex_hdr;
+ +	struct ib_device *ib_dev;
+  	struct ib_uverbs_cmd_hdr hdr;
+- 	bool extended;
+  	int srcu_key;
+- 	u32 command;
+  	ssize_t ret;
+  
+  	if (!ib_safe_file_access(filp)) {
+@@@ -749,34 -663,12 +756,42 @@@
+  		return ret;
+  
+  	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		ret = -EIO;
+ +		goto out;
+ +	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Must be after the ib_dev check, as once the RCU clears ib_dev ==
+ +	 * NULL means ucontext == NULL
+ +	 */
+ +	if (!file->ucontext &&
+ +	    (command != IB_USER_VERBS_CMD_GET_CONTEXT || extended)) {
+ +		ret = -EINVAL;
+ +		goto out;
+ +	}
+ +
+ +	if (!verify_command_mask(ib_dev, command, extended)) {
+ +		ret = -EOPNOTSUPP;
+ +		goto out;
+ +	}
+ +
+ +	buf += sizeof(hdr);
+ +
+ +	if (!extended) {
+ +		ret = uverbs_cmd_table[command](file, ib_dev, buf,
+ +						hdr.in_words * 4,
+ +						hdr.out_words * 4);
+++=======
++ 	buf += sizeof(hdr);
++ 
++ 	if (!method_elm->is_ex) {
++ 		ret = method_elm->handler(file, buf, hdr.in_words * 4,
++ 					  hdr.out_words * 4);
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  	} else {
+  		struct ib_udata ucore;
+  		struct ib_udata uhw;
+@@@ -793,7 -685,7 +808,11 @@@
+  					ex_hdr.provider_in_words * 8,
+  					ex_hdr.provider_out_words * 8);
+  
+++<<<<<<< HEAD
+ +		ret = uverbs_ex_cmd_table[command](file, ib_dev, &ucore, &uhw);
+++=======
++ 		ret = method_elm->handler_ex(file, &ucore, &uhw);
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  		ret = (ret) ? : count;
+  	}
+  
+@@@ -892,6 -1002,8 +910,11 @@@ static int ib_uverbs_open(struct inode 
+  	mutex_unlock(&dev->lists_mutex);
+  	srcu_read_unlock(&dev->disassociate_srcu, srcu_key);
+  
+++<<<<<<< HEAD
+++=======
++ 	setup_ufile_idr_uobject(file);
++ 
+++>>>>>>> d120c3c91871 (RDMA/uverbs: Convert the write interface to use uverbs_api)
+  	return nonseekable_open(inode, filp);
+  
+  err_module:
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs.h
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8..d7e33f443f87 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -4204,3 +4204,135 @@ int ib_uverbs_ex_modify_cq(struct ib_uverbs_file *file,
+ 
+ 	return ret;
+ }
++
++const struct uapi_definition uverbs_def_write_intf[] = {
++	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT_AH,
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_AH,
++						   ib_uverbs_create_ah),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DESTROY_AH,
++						   ib_uverbs_destroy_ah)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_COMP_CHANNEL,
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_COMP_CHANNEL,
++				     ib_uverbs_create_comp_channel)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_CQ,
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_CQ,
++				     ib_uverbs_create_cq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DESTROY_CQ,
++				     ib_uverbs_destroy_cq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_POLL_CQ,
++				     ib_uverbs_poll_cq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_REQ_NOTIFY_CQ,
++				     ib_uverbs_req_notify_cq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_RESIZE_CQ,
++				     ib_uverbs_resize_cq),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_CREATE_CQ,
++					ib_uverbs_ex_create_cq),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_MODIFY_CQ,
++					ib_uverbs_ex_modify_cq)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_DEVICE,
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_GET_CONTEXT,
++				     ib_uverbs_get_context),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_QUERY_DEVICE,
++				     ib_uverbs_query_device),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_QUERY_PORT,
++				     ib_uverbs_query_port),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_QUERY_DEVICE,
++					ib_uverbs_ex_query_device)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_FLOW,
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_CREATE_FLOW,
++					ib_uverbs_ex_create_flow),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_DESTROY_FLOW,
++					ib_uverbs_ex_destroy_flow)),
++
++	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT_MR,
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DEREG_MR,
++						   ib_uverbs_dereg_mr),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_REG_MR,
++						   ib_uverbs_reg_mr),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_REREG_MR,
++						   ib_uverbs_rereg_mr)),
++
++	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT_MW,
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_ALLOC_MW,
++						   ib_uverbs_alloc_mw),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DEALLOC_MW,
++						   ib_uverbs_dealloc_mw)),
++
++	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT_PD,
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_ALLOC_PD,
++						   ib_uverbs_alloc_pd),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DEALLOC_PD,
++						   ib_uverbs_dealloc_pd)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_QP,
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_ATTACH_MCAST,
++				     ib_uverbs_attach_mcast),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_QP,
++				     ib_uverbs_create_qp),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DESTROY_QP,
++				     ib_uverbs_destroy_qp),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DETACH_MCAST,
++				     ib_uverbs_detach_mcast),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_MODIFY_QP,
++				     ib_uverbs_modify_qp),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_POST_RECV,
++				     ib_uverbs_post_recv),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_POST_SEND,
++				     ib_uverbs_post_send),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_QUERY_QP,
++				     ib_uverbs_query_qp),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_CREATE_QP,
++					ib_uverbs_ex_create_qp),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_MODIFY_QP,
++					ib_uverbs_ex_modify_qp)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_RWQ_IND_TBL,
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_CREATE_RWQ_IND_TBL,
++					ib_uverbs_ex_create_rwq_ind_table),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_DESTROY_RWQ_IND_TBL,
++					ib_uverbs_ex_destroy_rwq_ind_table)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_WQ,
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_CREATE_WQ,
++					ib_uverbs_ex_create_wq),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_DESTROY_WQ,
++					ib_uverbs_ex_destroy_wq),
++		DECLARE_UVERBS_WRITE_EX(IB_USER_VERBS_EX_CMD_MODIFY_WQ,
++					ib_uverbs_ex_modify_wq)),
++
++	DECLARE_UVERBS_OBJECT(
++		UVERBS_OBJECT_SRQ,
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_SRQ,
++				     ib_uverbs_create_srq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CREATE_XSRQ,
++				     ib_uverbs_create_xsrq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_DESTROY_SRQ,
++				     ib_uverbs_destroy_srq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_MODIFY_SRQ,
++				     ib_uverbs_modify_srq),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_POST_SRQ_RECV,
++				     ib_uverbs_post_srq_recv),
++		DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_QUERY_SRQ,
++				     ib_uverbs_query_srq)),
++
++	DECLARE_UVERBS_OBJECT(UVERBS_OBJECT_XRCD,
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_CLOSE_XRCD,
++						   ib_uverbs_close_xrcd),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_OPEN_QP,
++						   ib_uverbs_open_qp),
++			      DECLARE_UVERBS_WRITE(IB_USER_VERBS_CMD_OPEN_XRCD,
++						   ib_uverbs_open_xrcd)),
++
++	{},
++};
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+* Unmerged path drivers/infiniband/core/uverbs_uapi.c
