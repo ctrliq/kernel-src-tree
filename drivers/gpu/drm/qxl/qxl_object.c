@@ -148,6 +148,8 @@ int qxl_bo_kmap(struct qxl_bo *bo, void **ptr)
 	bool is_iomem;
 	int r;
 
+	dma_resv_assert_held(bo->tbo.base.resv);
+
 	if (bo->kptr) {
 		if (ptr)
 			*ptr = bo->kptr;
@@ -197,6 +199,8 @@ fallback:
 
 void qxl_bo_kunmap(struct qxl_bo *bo)
 {
+	dma_resv_assert_held(bo->tbo.base.resv);
+
 	if (bo->kptr == NULL)
 		return;
 	bo->map_count--;
