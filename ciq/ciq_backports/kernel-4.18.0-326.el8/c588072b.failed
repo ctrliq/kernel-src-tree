@@ -1,0 +1,647 @@
+iommu/vt-d: Convert intel iommu driver to the iommu ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Tom Murphy <murphyt7@tcd.ie>
+commit c588072bba6b54b4b946485228b0409f23cd68a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c588072b.failed
+
+Convert the intel iommu driver to the dma-iommu api. Remove the iova
+handling and reserve region code from the intel iommu driver.
+
+	Signed-off-by: Tom Murphy <murphyt7@tcd.ie>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Tested-by: Logan Gunthorpe <logang@deltatee.com>
+Link: https://lore.kernel.org/r/20201124082057.2614359-7-baolu.lu@linux.intel.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit c588072bba6b54b4b946485228b0409f23cd68a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/iommu.c
+diff --cc drivers/iommu/intel/iommu.c
+index 4e72a75d609f,30f69097264f..000000000000
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@@ -3434,591 -3370,6 +3370,594 @@@ error
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +/* This takes a number of _MM_ pages, not VTD pages */
+ +static unsigned long intel_alloc_iova(struct device *dev,
+ +				     struct dmar_domain *domain,
+ +				     unsigned long nrpages, uint64_t dma_mask)
+ +{
+ +	unsigned long iova_pfn;
+ +
+ +	/*
+ +	 * Restrict dma_mask to the width that the iommu can handle.
+ +	 * First-level translation restricts the input-address to a
+ +	 * canonical address (i.e., address bits 63:N have the same
+ +	 * value as address bit [N-1], where N is 48-bits with 4-level
+ +	 * paging and 57-bits with 5-level paging). Hence, skip bit
+ +	 * [N-1].
+ +	 */
+ +	if (domain_use_first_level(domain))
+ +		dma_mask = min_t(uint64_t, DOMAIN_MAX_ADDR(domain->gaw - 1),
+ +				 dma_mask);
+ +	else
+ +		dma_mask = min_t(uint64_t, DOMAIN_MAX_ADDR(domain->gaw),
+ +				 dma_mask);
+ +
+ +	/* Ensure we reserve the whole size-aligned region */
+ +	nrpages = __roundup_pow_of_two(nrpages);
+ +
+ +	if (!dmar_forcedac && dma_mask > DMA_BIT_MASK(32)) {
+ +		/*
+ +		 * First try to allocate an io virtual address in
+ +		 * DMA_BIT_MASK(32) and if that fails then try allocating
+ +		 * from higher range
+ +		 */
+ +		iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
+ +					   IOVA_PFN(DMA_BIT_MASK(32)), false);
+ +		if (iova_pfn)
+ +			return iova_pfn;
+ +	}
+ +	iova_pfn = alloc_iova_fast(&domain->iovad, nrpages,
+ +				   IOVA_PFN(dma_mask), true);
+ +	if (unlikely(!iova_pfn)) {
+ +		dev_err_once(dev, "Allocating %ld-page iova failed\n",
+ +			     nrpages);
+ +		return 0;
+ +	}
+ +
+ +	return iova_pfn;
+ +}
+ +
+ +static dma_addr_t __intel_map_single(struct device *dev, phys_addr_t paddr,
+ +				     size_t size, int dir, u64 dma_mask)
+ +{
+ +	struct dmar_domain *domain;
+ +	phys_addr_t start_paddr;
+ +	unsigned long iova_pfn;
+ +	int prot = 0;
+ +	int ret;
+ +	struct intel_iommu *iommu;
+ +	unsigned long paddr_pfn = paddr >> PAGE_SHIFT;
+ +
+ +	BUG_ON(dir == DMA_NONE);
+ +
+ +	if (unlikely(attach_deferred(dev)))
+ +		do_deferred_attach(dev);
+ +
+ +	domain = find_domain(dev);
+ +	if (!domain)
+ +		return DMA_MAPPING_ERROR;
+ +
+ +	iommu = domain_get_iommu(domain);
+ +	size = aligned_nrpages(paddr, size);
+ +
+ +	iova_pfn = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size), dma_mask);
+ +	if (!iova_pfn)
+ +		goto error;
+ +
+ +	/*
+ +	 * Check if DMAR supports zero-length reads on write only
+ +	 * mappings..
+ +	 */
+ +	if (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL || \
+ +			!cap_zlr(iommu->cap))
+ +		prot |= DMA_PTE_READ;
+ +	if (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL)
+ +		prot |= DMA_PTE_WRITE;
+ +	/*
+ +	 * paddr - (paddr + size) might be partial page, we should map the whole
+ +	 * page.  Note: if two part of one page are separately mapped, we
+ +	 * might have two guest_addr mapping to the same host paddr, but this
+ +	 * is not a big problem
+ +	 */
+ +	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova_pfn),
+ +				 mm_to_dma_pfn(paddr_pfn), size, prot);
+ +	if (ret)
+ +		goto error;
+ +
+ +	start_paddr = (phys_addr_t)iova_pfn << PAGE_SHIFT;
+ +	start_paddr += paddr & ~PAGE_MASK;
+ +
+ +	trace_map_single(dev, start_paddr, paddr, size << VTD_PAGE_SHIFT);
+ +
+ +	return start_paddr;
+ +
+ +error:
+ +	if (iova_pfn)
+ +		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(size));
+ +	dev_err(dev, "Device request: %zx@%llx dir %d --- failed\n",
+ +		size, (unsigned long long)paddr, dir);
+ +	return DMA_MAPPING_ERROR;
+ +}
+ +
+ +static dma_addr_t intel_map_page(struct device *dev, struct page *page,
+ +				 unsigned long offset, size_t size,
+ +				 enum dma_data_direction dir,
+ +				 unsigned long attrs)
+ +{
+ +	return __intel_map_single(dev, page_to_phys(page) + offset,
+ +				  size, dir, *dev->dma_mask);
+ +}
+ +
+ +static dma_addr_t intel_map_resource(struct device *dev, phys_addr_t phys_addr,
+ +				     size_t size, enum dma_data_direction dir,
+ +				     unsigned long attrs)
+ +{
+ +	return __intel_map_single(dev, phys_addr, size, dir, *dev->dma_mask);
+ +}
+ +
+ +static void intel_unmap(struct device *dev, dma_addr_t dev_addr, size_t size)
+ +{
+ +	struct dmar_domain *domain;
+ +	unsigned long start_pfn, last_pfn;
+ +	unsigned long nrpages;
+ +	unsigned long iova_pfn;
+ +	struct intel_iommu *iommu;
+ +	struct page *freelist;
+ +	struct pci_dev *pdev = NULL;
+ +
+ +	domain = find_domain(dev);
+ +	BUG_ON(!domain);
+ +
+ +	iommu = domain_get_iommu(domain);
+ +
+ +	iova_pfn = IOVA_PFN(dev_addr);
+ +
+ +	nrpages = aligned_nrpages(dev_addr, size);
+ +	start_pfn = mm_to_dma_pfn(iova_pfn);
+ +	last_pfn = start_pfn + nrpages - 1;
+ +
+ +	if (dev_is_pci(dev))
+ +		pdev = to_pci_dev(dev);
+ +
+ +	freelist = domain_unmap(domain, start_pfn, last_pfn);
+ +	if (intel_iommu_strict || (pdev && pdev->untrusted) ||
+ +			!has_iova_flush_queue(&domain->iovad)) {
+ +		iommu_flush_iotlb_psi(iommu, domain, start_pfn,
+ +				      nrpages, !freelist, 0);
+ +		/* free iova */
+ +		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(nrpages));
+ +		dma_free_pagelist(freelist);
+ +	} else {
+ +		queue_iova(&domain->iovad, iova_pfn, nrpages,
+ +			   (unsigned long)freelist);
+ +		/*
+ +		 * queue up the release of the unmap to save the 1/6th of the
+ +		 * cpu used up by the iotlb flush operation...
+ +		 */
+ +	}
+ +
+ +	trace_unmap_single(dev, dev_addr, size);
+ +}
+ +
+ +static void intel_unmap_page(struct device *dev, dma_addr_t dev_addr,
+ +			     size_t size, enum dma_data_direction dir,
+ +			     unsigned long attrs)
+ +{
+ +	intel_unmap(dev, dev_addr, size);
+ +}
+ +
+ +static void intel_unmap_resource(struct device *dev, dma_addr_t dev_addr,
+ +		size_t size, enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	intel_unmap(dev, dev_addr, size);
+ +}
+ +
+ +static void *intel_alloc_coherent(struct device *dev, size_t size,
+ +				  dma_addr_t *dma_handle, gfp_t flags,
+ +				  unsigned long attrs)
+ +{
+ +	struct page *page = NULL;
+ +	int order;
+ +
+ +	if (unlikely(attach_deferred(dev)))
+ +		do_deferred_attach(dev);
+ +
+ +	size = PAGE_ALIGN(size);
+ +	order = get_order(size);
+ +
+ +	if (gfpflags_allow_blocking(flags)) {
+ +		unsigned int count = size >> PAGE_SHIFT;
+ +
+ +		page = dma_alloc_from_contiguous(dev, count, order,
+ +						 flags & __GFP_NOWARN);
+ +	}
+ +
+ +	if (!page)
+ +		page = alloc_pages(flags, order);
+ +	if (!page)
+ +		return NULL;
+ +	memset(page_address(page), 0, size);
+ +
+ +	*dma_handle = __intel_map_single(dev, page_to_phys(page), size,
+ +					 DMA_BIDIRECTIONAL,
+ +					 dev->coherent_dma_mask);
+ +	if (*dma_handle != DMA_MAPPING_ERROR)
+ +		return page_address(page);
+ +	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
+ +		__free_pages(page, order);
+ +
+ +	return NULL;
+ +}
+ +
+ +static void intel_free_coherent(struct device *dev, size_t size, void *vaddr,
+ +				dma_addr_t dma_handle, unsigned long attrs)
+ +{
+ +	int order;
+ +	struct page *page = virt_to_page(vaddr);
+ +
+ +	size = PAGE_ALIGN(size);
+ +	order = get_order(size);
+ +
+ +	intel_unmap(dev, dma_handle, size);
+ +	if (!dma_release_from_contiguous(dev, page, size >> PAGE_SHIFT))
+ +		__free_pages(page, order);
+ +}
+ +
+ +static void intel_unmap_sg(struct device *dev, struct scatterlist *sglist,
+ +			   int nelems, enum dma_data_direction dir,
+ +			   unsigned long attrs)
+ +{
+ +	dma_addr_t startaddr = sg_dma_address(sglist) & PAGE_MASK;
+ +	unsigned long nrpages = 0;
+ +	struct scatterlist *sg;
+ +	int i;
+ +
+ +	for_each_sg(sglist, sg, nelems, i) {
+ +		nrpages += aligned_nrpages(sg_dma_address(sg), sg_dma_len(sg));
+ +	}
+ +
+ +	intel_unmap(dev, startaddr, nrpages << VTD_PAGE_SHIFT);
+ +
+ +	trace_unmap_sg(dev, startaddr, nrpages << VTD_PAGE_SHIFT);
+ +}
+ +
+ +static int intel_map_sg(struct device *dev, struct scatterlist *sglist, int nelems,
+ +			enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	int i;
+ +	struct dmar_domain *domain;
+ +	size_t size = 0;
+ +	int prot = 0;
+ +	unsigned long iova_pfn;
+ +	int ret;
+ +	struct scatterlist *sg;
+ +	unsigned long start_vpfn;
+ +	struct intel_iommu *iommu;
+ +
+ +	BUG_ON(dir == DMA_NONE);
+ +
+ +	if (unlikely(attach_deferred(dev)))
+ +		do_deferred_attach(dev);
+ +
+ +	domain = find_domain(dev);
+ +	if (!domain)
+ +		return 0;
+ +
+ +	iommu = domain_get_iommu(domain);
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		size += aligned_nrpages(sg->offset, sg->length);
+ +
+ +	iova_pfn = intel_alloc_iova(dev, domain, dma_to_mm_pfn(size),
+ +				*dev->dma_mask);
+ +	if (!iova_pfn) {
+ +		sglist->dma_length = 0;
+ +		return 0;
+ +	}
+ +
+ +	/*
+ +	 * Check if DMAR supports zero-length reads on write only
+ +	 * mappings..
+ +	 */
+ +	if (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL || \
+ +			!cap_zlr(iommu->cap))
+ +		prot |= DMA_PTE_READ;
+ +	if (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL)
+ +		prot |= DMA_PTE_WRITE;
+ +
+ +	start_vpfn = mm_to_dma_pfn(iova_pfn);
+ +
+ +	ret = domain_sg_mapping(domain, start_vpfn, sglist, size, prot);
+ +	if (unlikely(ret)) {
+ +		dma_pte_free_pagetable(domain, start_vpfn,
+ +				       start_vpfn + size - 1,
+ +				       agaw_to_level(domain->agaw) + 1);
+ +		free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(size));
+ +		return 0;
+ +	}
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		trace_map_sg(dev, i + 1, nelems, sg);
+ +
+ +	return nelems;
+ +}
+ +
+ +static u64 intel_get_required_mask(struct device *dev)
+ +{
+ +	return DMA_BIT_MASK(32);
+ +}
+ +
+ +static const struct dma_map_ops intel_dma_ops = {
+ +	.alloc = intel_alloc_coherent,
+ +	.free = intel_free_coherent,
+ +	.map_sg = intel_map_sg,
+ +	.unmap_sg = intel_unmap_sg,
+ +	.map_page = intel_map_page,
+ +	.unmap_page = intel_unmap_page,
+ +	.map_resource = intel_map_resource,
+ +	.unmap_resource = intel_unmap_resource,
+ +	.dma_supported = dma_direct_supported,
+ +	.mmap = dma_common_mmap,
+ +	.get_sgtable = dma_common_get_sgtable,
+ +	.get_required_mask = intel_get_required_mask,
+ +};
+ +
+ +static void
+ +bounce_sync_single(struct device *dev, dma_addr_t addr, size_t size,
+ +		   enum dma_data_direction dir, enum dma_sync_target target)
+ +{
+ +	struct dmar_domain *domain;
+ +	phys_addr_t tlb_addr;
+ +
+ +	domain = find_domain(dev);
+ +	if (WARN_ON(!domain))
+ +		return;
+ +
+ +	tlb_addr = intel_iommu_iova_to_phys(&domain->domain, addr);
+ +	if (is_swiotlb_buffer(tlb_addr))
+ +		swiotlb_tbl_sync_single(dev, tlb_addr, size, dir, target);
+ +}
+ +
+ +static dma_addr_t
+ +bounce_map_single(struct device *dev, phys_addr_t paddr, size_t size,
+ +		  enum dma_data_direction dir, unsigned long attrs,
+ +		  u64 dma_mask)
+ +{
+ +	size_t aligned_size = ALIGN(size, VTD_PAGE_SIZE);
+ +	struct dmar_domain *domain;
+ +	struct intel_iommu *iommu;
+ +	unsigned long iova_pfn;
+ +	unsigned long nrpages;
+ +	phys_addr_t tlb_addr;
+ +	int prot = 0;
+ +	int ret;
+ +
+ +	if (unlikely(attach_deferred(dev)))
+ +		do_deferred_attach(dev);
+ +
+ +	domain = find_domain(dev);
+ +
+ +	if (WARN_ON(dir == DMA_NONE || !domain))
+ +		return DMA_MAPPING_ERROR;
+ +
+ +	iommu = domain_get_iommu(domain);
+ +	if (WARN_ON(!iommu))
+ +		return DMA_MAPPING_ERROR;
+ +
+ +	nrpages = aligned_nrpages(0, size);
+ +	iova_pfn = intel_alloc_iova(dev, domain,
+ +				    dma_to_mm_pfn(nrpages), dma_mask);
+ +	if (!iova_pfn)
+ +		return DMA_MAPPING_ERROR;
+ +
+ +	/*
+ +	 * Check if DMAR supports zero-length reads on write only
+ +	 * mappings..
+ +	 */
+ +	if (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL ||
+ +			!cap_zlr(iommu->cap))
+ +		prot |= DMA_PTE_READ;
+ +	if (dir == DMA_FROM_DEVICE || dir == DMA_BIDIRECTIONAL)
+ +		prot |= DMA_PTE_WRITE;
+ +
+ +	/*
+ +	 * If both the physical buffer start address and size are
+ +	 * page aligned, we don't need to use a bounce page.
+ +	 */
+ +	if (!IS_ALIGNED(paddr | size, VTD_PAGE_SIZE)) {
+ +		tlb_addr = swiotlb_tbl_map_single(dev,
+ +				__phys_to_dma(dev, io_tlb_start),
+ +				paddr, size, aligned_size, dir, attrs);
+ +		if (tlb_addr == DMA_MAPPING_ERROR) {
+ +			goto swiotlb_error;
+ +		} else {
+ +			/* Cleanup the padding area. */
+ +			void *padding_start = phys_to_virt(tlb_addr);
+ +			size_t padding_size = aligned_size;
+ +
+ +			if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
+ +			    (dir == DMA_TO_DEVICE ||
+ +			     dir == DMA_BIDIRECTIONAL)) {
+ +				padding_start += size;
+ +				padding_size -= size;
+ +			}
+ +
+ +			memset(padding_start, 0, padding_size);
+ +		}
+ +	} else {
+ +		tlb_addr = paddr;
+ +	}
+ +
+ +	ret = domain_pfn_mapping(domain, mm_to_dma_pfn(iova_pfn),
+ +				 tlb_addr >> VTD_PAGE_SHIFT, nrpages, prot);
+ +	if (ret)
+ +		goto mapping_error;
+ +
+ +	trace_bounce_map_single(dev, iova_pfn << PAGE_SHIFT, paddr, size);
+ +
+ +	return (phys_addr_t)iova_pfn << PAGE_SHIFT;
+ +
+ +mapping_error:
+ +	if (is_swiotlb_buffer(tlb_addr))
+ +		swiotlb_tbl_unmap_single(dev, tlb_addr, size,
+ +					 aligned_size, dir, attrs);
+ +swiotlb_error:
+ +	free_iova_fast(&domain->iovad, iova_pfn, dma_to_mm_pfn(nrpages));
+ +	dev_err(dev, "Device bounce map: %zx@%llx dir %d --- failed\n",
+ +		size, (unsigned long long)paddr, dir);
+ +
+ +	return DMA_MAPPING_ERROR;
+ +}
+ +
+ +static void
+ +bounce_unmap_single(struct device *dev, dma_addr_t dev_addr, size_t size,
+ +		    enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	size_t aligned_size = ALIGN(size, VTD_PAGE_SIZE);
+ +	struct dmar_domain *domain;
+ +	phys_addr_t tlb_addr;
+ +
+ +	domain = find_domain(dev);
+ +	if (WARN_ON(!domain))
+ +		return;
+ +
+ +	tlb_addr = intel_iommu_iova_to_phys(&domain->domain, dev_addr);
+ +	if (WARN_ON(!tlb_addr))
+ +		return;
+ +
+ +	intel_unmap(dev, dev_addr, size);
+ +	if (is_swiotlb_buffer(tlb_addr))
+ +		swiotlb_tbl_unmap_single(dev, tlb_addr, size,
+ +					 aligned_size, dir, attrs);
+ +
+ +	trace_bounce_unmap_single(dev, dev_addr, size);
+ +}
+ +
+ +static dma_addr_t
+ +bounce_map_page(struct device *dev, struct page *page, unsigned long offset,
+ +		size_t size, enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	return bounce_map_single(dev, page_to_phys(page) + offset,
+ +				 size, dir, attrs, *dev->dma_mask);
+ +}
+ +
+ +static dma_addr_t
+ +bounce_map_resource(struct device *dev, phys_addr_t phys_addr, size_t size,
+ +		    enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	return bounce_map_single(dev, phys_addr, size,
+ +				 dir, attrs, *dev->dma_mask);
+ +}
+ +
+ +static void
+ +bounce_unmap_page(struct device *dev, dma_addr_t dev_addr, size_t size,
+ +		  enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	bounce_unmap_single(dev, dev_addr, size, dir, attrs);
+ +}
+ +
+ +static void
+ +bounce_unmap_resource(struct device *dev, dma_addr_t dev_addr, size_t size,
+ +		      enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	bounce_unmap_single(dev, dev_addr, size, dir, attrs);
+ +}
+ +
+ +static void
+ +bounce_unmap_sg(struct device *dev, struct scatterlist *sglist, int nelems,
+ +		enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	struct scatterlist *sg;
+ +	int i;
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		bounce_unmap_page(dev, sg->dma_address,
+ +				  sg_dma_len(sg), dir, attrs);
+ +}
+ +
+ +static int
+ +bounce_map_sg(struct device *dev, struct scatterlist *sglist, int nelems,
+ +	      enum dma_data_direction dir, unsigned long attrs)
+ +{
+ +	int i;
+ +	struct scatterlist *sg;
+ +
+ +	for_each_sg(sglist, sg, nelems, i) {
+ +		sg->dma_address = bounce_map_page(dev, sg_page(sg),
+ +						  sg->offset, sg->length,
+ +						  dir, attrs);
+ +		if (sg->dma_address == DMA_MAPPING_ERROR)
+ +			goto out_unmap;
+ +		sg_dma_len(sg) = sg->length;
+ +	}
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		trace_bounce_map_sg(dev, i + 1, nelems, sg);
+ +
+ +	return nelems;
+ +
+ +out_unmap:
+ +	bounce_unmap_sg(dev, sglist, i, dir, attrs | DMA_ATTR_SKIP_CPU_SYNC);
+ +	return 0;
+ +}
+ +
+ +static void
+ +bounce_sync_single_for_cpu(struct device *dev, dma_addr_t addr,
+ +			   size_t size, enum dma_data_direction dir)
+ +{
+ +	bounce_sync_single(dev, addr, size, dir, SYNC_FOR_CPU);
+ +}
+ +
+ +static void
+ +bounce_sync_single_for_device(struct device *dev, dma_addr_t addr,
+ +			      size_t size, enum dma_data_direction dir)
+ +{
+ +	bounce_sync_single(dev, addr, size, dir, SYNC_FOR_DEVICE);
+ +}
+ +
+ +static void
+ +bounce_sync_sg_for_cpu(struct device *dev, struct scatterlist *sglist,
+ +		       int nelems, enum dma_data_direction dir)
+ +{
+ +	struct scatterlist *sg;
+ +	int i;
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		bounce_sync_single(dev, sg_dma_address(sg),
+ +				   sg_dma_len(sg), dir, SYNC_FOR_CPU);
+ +}
+ +
+ +static void
+ +bounce_sync_sg_for_device(struct device *dev, struct scatterlist *sglist,
+ +			  int nelems, enum dma_data_direction dir)
+ +{
+ +	struct scatterlist *sg;
+ +	int i;
+ +
+ +	for_each_sg(sglist, sg, nelems, i)
+ +		bounce_sync_single(dev, sg_dma_address(sg),
+ +				   sg_dma_len(sg), dir, SYNC_FOR_DEVICE);
+ +}
+ +
+ +static const struct dma_map_ops bounce_dma_ops = {
+ +	.alloc			= intel_alloc_coherent,
+ +	.free			= intel_free_coherent,
+ +	.map_sg			= bounce_map_sg,
+ +	.unmap_sg		= bounce_unmap_sg,
+ +	.map_page		= bounce_map_page,
+ +	.unmap_page		= bounce_unmap_page,
+ +	.sync_single_for_cpu	= bounce_sync_single_for_cpu,
+ +	.sync_single_for_device	= bounce_sync_single_for_device,
+ +	.sync_sg_for_cpu	= bounce_sync_sg_for_cpu,
+ +	.sync_sg_for_device	= bounce_sync_sg_for_device,
+ +	.map_resource		= bounce_map_resource,
+ +	.unmap_resource		= bounce_unmap_resource,
+ +	.dma_supported		= dma_direct_supported,
+ +};
+ +
+++=======
+++>>>>>>> c588072bba6b (iommu/vt-d: Convert intel iommu driver to the iommu ops)
+  static inline int iommu_domain_cache_init(void)
+  {
+  	int ret = 0;
+@@@ -6111,6 -5465,8 +6041,11 @@@ const struct iommu_ops intel_iommu_ops 
+  	.aux_get_pasid		= intel_iommu_aux_get_pasid,
+  	.map			= intel_iommu_map,
+  	.unmap			= intel_iommu_unmap,
+++<<<<<<< HEAD
+++=======
++ 	.flush_iotlb_all        = intel_flush_iotlb_all,
++ 	.iotlb_sync		= intel_iommu_tlb_sync,
+++>>>>>>> c588072bba6b (iommu/vt-d: Convert intel iommu driver to the iommu ops)
+  	.iova_to_phys		= intel_iommu_iova_to_phys,
+  	.probe_device		= intel_iommu_probe_device,
+  	.probe_finalize		= intel_iommu_probe_finalize,
+diff --git a/drivers/iommu/intel/Kconfig b/drivers/iommu/intel/Kconfig
+index bf3aaf35c508..60976e68bf3f 100644
+--- a/drivers/iommu/intel/Kconfig
++++ b/drivers/iommu/intel/Kconfig
+@@ -12,6 +12,7 @@ config INTEL_IOMMU
+ 	select DMAR_TABLE
+ 	select SWIOTLB
+ 	select IOASID
++	select IOMMU_DMA
+ 	help
+ 	  DMA remapping (DMAR) devices support enables independent address
+ 	  translations for Direct Memory Access (DMA) from devices.
+* Unmerged path drivers/iommu/intel/iommu.c
