@@ -258,7 +258,7 @@ gov_attr_rw(ignore_nice_load);
 gov_attr_rw(down_threshold);
 gov_attr_rw(freq_step);
 
-static struct attribute *cs_attributes[] = {
+static struct attribute *cs_attrs[] = {
 	&sampling_rate.attr,
 	&sampling_down_factor.attr,
 	&up_threshold.attr,
@@ -267,6 +267,7 @@ static struct attribute *cs_attributes[] = {
 	&freq_step.attr,
 	NULL
 };
+ATTRIBUTE_GROUPS(cs);
 
 /************************** sysfs end ************************/
 
@@ -316,7 +317,7 @@ static void cs_start(struct cpufreq_policy *policy)
 
 static struct dbs_governor cs_governor = {
 	.gov = CPUFREQ_DBS_GOVERNOR_INITIALIZER("conservative"),
-	.kobj_type = { .default_attrs = cs_attributes },
+	.kobj_type = { .default_groups = cs_groups },
 	.gov_dbs_update = cs_dbs_update,
 	.alloc = cs_alloc,
 	.free = cs_free,
