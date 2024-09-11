@@ -197,6 +197,11 @@ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq)
 
 		wqe_counter = be16_to_cpu(cqe->wqe_counter);
 
+		if (unlikely(get_cqe_opcode(cqe) != MLX5_CQE_REQ))
+			netdev_WARN_ONCE(sq->channel->netdev,
+					 "Bad OP in XDPSQ CQE: 0x%x\n",
+					 get_cqe_opcode(cqe));
+
 		do {
 			struct mlx5e_xdp_info *xdpi;
 			u16 ci;
