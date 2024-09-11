@@ -1,0 +1,152 @@
+bpf: notify offload JITs about optimizations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 08ca90afba255d05dc3253caa44056e7aecbe8c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/08ca90af.failed
+
+Let offload JITs know when instructions are replaced and optimized
+out, so they can update their state appropriately.  The optimizations
+are best effort, if JIT returns an error from any callback verifier
+will stop notifying it as state may now be out of sync, but the
+verifier continues making progress.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Quentin Monnet <quentin.monnet@netronome.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 08ca90afba255d05dc3253caa44056e7aecbe8c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index eb7ba8694d53,3851529062ec..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -272,12 -268,18 +272,25 @@@ struct bpf_verifier_ops 
+  };
+  
+  struct bpf_prog_offload_ops {
++ 	/* verifier basic callbacks */
+  	int (*insn_hook)(struct bpf_verifier_env *env,
+  			 int insn_idx, int prev_insn_idx);
+++<<<<<<< HEAD
+ +	RH_KABI_EXTEND(int (*finalize)(struct bpf_verifier_env *env))
+ +	RH_KABI_EXTEND(int (*prepare)(struct bpf_prog *prog))
+ +	RH_KABI_EXTEND(int (*translate)(struct bpf_prog *prog))
+ +	RH_KABI_EXTEND(void (*destroy)(struct bpf_prog *prog))
+++=======
++ 	int (*finalize)(struct bpf_verifier_env *env);
++ 	/* verifier optimization callbacks (called after .finalize) */
++ 	int (*replace_insn)(struct bpf_verifier_env *env, u32 off,
++ 			    struct bpf_insn *insn);
++ 	int (*remove_insns)(struct bpf_verifier_env *env, u32 off, u32 cnt);
++ 	/* program management callbacks */
++ 	int (*prepare)(struct bpf_prog *prog);
++ 	int (*translate)(struct bpf_prog *prog);
++ 	void (*destroy)(struct bpf_prog *prog);
+++>>>>>>> 08ca90afba25 (bpf: notify offload JITs about optimizations)
+  };
+  
+  struct bpf_prog_offload {
+@@@ -288,7 -289,7 +301,11 @@@
+  	void			*dev_priv;
+  	struct list_head	offloads;
+  	bool			dev_state;
+++<<<<<<< HEAD
+ +	const struct bpf_prog_offload_ops *dev_ops;
+++=======
++ 	bool			opt_failed;
+++>>>>>>> 08ca90afba25 (bpf: notify offload JITs about optimizations)
+  	void			*jited_image;
+  	u32			jited_len;
+  };
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index f3ae00ee5516..0620e418dde5 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -266,5 +266,10 @@ int bpf_prog_offload_verifier_prep(struct bpf_prog *prog);
+ int bpf_prog_offload_verify_insn(struct bpf_verifier_env *env,
+ 				 int insn_idx, int prev_insn_idx);
+ int bpf_prog_offload_finalize(struct bpf_verifier_env *env);
++void
++bpf_prog_offload_replace_insn(struct bpf_verifier_env *env, u32 off,
++			      struct bpf_insn *insn);
++void
++bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt);
+ 
+ #endif /* _LINUX_BPF_VERIFIER_H */
+diff --git a/kernel/bpf/offload.c b/kernel/bpf/offload.c
+index 54cf2b9c44a4..39dba8c90331 100644
+--- a/kernel/bpf/offload.c
++++ b/kernel/bpf/offload.c
+@@ -173,6 +173,41 @@ int bpf_prog_offload_finalize(struct bpf_verifier_env *env)
+ 	return ret;
+ }
+ 
++void
++bpf_prog_offload_replace_insn(struct bpf_verifier_env *env, u32 off,
++			      struct bpf_insn *insn)
++{
++	const struct bpf_prog_offload_ops *ops;
++	struct bpf_prog_offload *offload;
++	int ret = -EOPNOTSUPP;
++
++	down_read(&bpf_devs_lock);
++	offload = env->prog->aux->offload;
++	if (offload) {
++		ops = offload->offdev->ops;
++		if (!offload->opt_failed && ops->replace_insn)
++			ret = ops->replace_insn(env, off, insn);
++		offload->opt_failed |= ret;
++	}
++	up_read(&bpf_devs_lock);
++}
++
++void
++bpf_prog_offload_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
++{
++	struct bpf_prog_offload *offload;
++	int ret = -EOPNOTSUPP;
++
++	down_read(&bpf_devs_lock);
++	offload = env->prog->aux->offload;
++	if (offload) {
++		if (!offload->opt_failed && offload->offdev->ops->remove_insns)
++			ret = offload->offdev->ops->remove_insns(env, off, cnt);
++		offload->opt_failed |= ret;
++	}
++	up_read(&bpf_devs_lock);
++}
++
+ static void __bpf_prog_offload_destroy(struct bpf_prog *prog)
+ {
+ 	struct bpf_prog_offload *offload = prog->aux->offload;
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index c31b3b786a54..95d993efbcd1 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -6555,6 +6555,9 @@ static int verifier_remove_insns(struct bpf_verifier_env *env, u32 off, u32 cnt)
+ 	unsigned int orig_prog_len = env->prog->len;
+ 	int err;
+ 
++	if (bpf_prog_is_dev_bound(env->prog->aux))
++		bpf_prog_offload_remove_insns(env, off, cnt);
++
+ 	err = bpf_remove_insns(env->prog, off, cnt);
+ 	if (err)
+ 		return err;
+@@ -6629,6 +6632,9 @@ static void opt_hard_wire_dead_code_branches(struct bpf_verifier_env *env)
+ 		else
+ 			continue;
+ 
++		if (bpf_prog_is_dev_bound(env->prog->aux))
++			bpf_prog_offload_replace_insn(env, i, &ja);
++
+ 		memcpy(insn, &ja, sizeof(ja));
+ 	}
+ }
