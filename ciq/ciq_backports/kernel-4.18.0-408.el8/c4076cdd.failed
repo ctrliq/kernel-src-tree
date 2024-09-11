@@ -1,0 +1,200 @@
+net: switchdev: introduce switchdev_handle_port_obj_{add,del} for foreign interfaces
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit c4076cdd21f8d68a96f1e7124bd8915c7e31a474
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c4076cdd.failed
+
+The switchdev_handle_port_obj_add() helper is good for replicating a
+port object on the lower interfaces of @dev, if that object was emitted
+on a bridge, or on a bridge port that is a LAG.
+
+However, drivers that use this helper limit themselves to a box from
+which they can no longer intercept port objects notified on neighbor
+ports ("foreign interfaces").
+
+One such driver is DSA, where software bridging with foreign interfaces
+such as standalone NICs or Wi-Fi APs is an important use case. There, a
+VLAN installed on a neighbor bridge port roughly corresponds to a
+forwarding VLAN installed on the DSA switch's CPU port.
+
+To support this use case while also making use of the benefits of the
+switchdev_handle_* replication helper for port objects, introduce a new
+variant of these functions that crawls through the neighbor ports of
+@dev, in search of potentially compatible switchdev ports that are
+interested in the event.
+
+The strategy is identical to switchdev_handle_fdb_event_to_device():
+if @dev wasn't a switchdev interface, then go one step upper, and
+recursively call this function on the bridge that this port belongs to.
+At the next recursion step, __switchdev_handle_port_obj_add() will
+iterate through the bridge's lower interfaces. Among those, some will be
+switchdev interfaces, and one will be the original @dev that we came
+from. To prevent infinite recursion, we must suppress reentry into the
+original @dev, and just call the @add_cb for the switchdev_interfaces.
+
+It looks like this:
+
+                br0
+               / | \
+              /  |  \
+             /   |   \
+           swp0 swp1 eth0
+
+1. __switchdev_handle_port_obj_add(eth0)
+   -> check_cb(eth0) returns false
+   -> eth0 has no lower interfaces
+   -> eth0's bridge is br0
+   -> switchdev_lower_dev_find(br0, check_cb, foreign_dev_check_cb))
+      finds br0
+
+2. __switchdev_handle_port_obj_add(br0)
+   -> check_cb(br0) returns false
+   -> netdev_for_each_lower_dev
+      -> check_cb(swp0) returns true, so we don't skip this interface
+
+3. __switchdev_handle_port_obj_add(swp0)
+   -> check_cb(swp0) returns true, so we call add_cb(swp0)
+
+(back to netdev_for_each_lower_dev from 2)
+      -> check_cb(swp1) returns true, so we don't skip this interface
+
+4. __switchdev_handle_port_obj_add(swp1)
+   -> check_cb(swp1) returns true, so we call add_cb(swp1)
+
+(back to netdev_for_each_lower_dev from 2)
+      -> check_cb(eth0) returns false, so we skip this interface to
+         avoid infinite recursion
+
+Note: eth0 could have been a LAG, and we don't want to suppress the
+recursion through its lowers if those exist, so when check_cb() returns
+false, we still call switchdev_lower_dev_find() to estimate whether
+there's anything worth a recursion beneath that LAG. Using check_cb()
+and foreign_dev_check_cb(), switchdev_lower_dev_find() not only figures
+out whether the lowers of the LAG are switchdev, but also whether they
+actively offload the LAG or not (whether the LAG is "foreign" to the
+switchdev interface or not).
+
+The port_obj_info->orig_dev is preserved across recursive calls, so
+switchdev drivers still know on which device was this notification
+originally emitted.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c4076cdd21f8d68a96f1e7124bd8915c7e31a474)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/switchdev/switchdev.c
+diff --cc net/switchdev/switchdev.c
+index df9f6f6dc3fa,6a00c390547b..000000000000
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@@ -428,8 -429,29 +428,34 @@@ switchdev_lower_dev_find_rcu(struct net
+  	return switchdev_priv.lower_dev;
+  }
+  
+++<<<<<<< HEAD
+ +static int __switchdev_handle_fdb_add_to_device(struct net_device *dev,
+ +		const struct net_device *orig_dev,
+++=======
++ static struct net_device *
++ switchdev_lower_dev_find(struct net_device *dev,
++ 			 bool (*check_cb)(const struct net_device *dev),
++ 			 bool (*foreign_dev_check_cb)(const struct net_device *dev,
++ 						      const struct net_device *foreign_dev))
++ {
++ 	struct switchdev_nested_priv switchdev_priv = {
++ 		.check_cb = check_cb,
++ 		.foreign_dev_check_cb = foreign_dev_check_cb,
++ 		.dev = dev,
++ 		.lower_dev = NULL,
++ 	};
++ 	struct netdev_nested_priv priv = {
++ 		.data = &switchdev_priv,
++ 	};
++ 
++ 	netdev_walk_all_lower_dev(dev, switchdev_lower_dev_walk, &priv);
++ 
++ 	return switchdev_priv.lower_dev;
++ }
++ 
++ static int __switchdev_handle_fdb_event_to_device(struct net_device *dev,
++ 		struct net_device *orig_dev, unsigned long event,
+++>>>>>>> c4076cdd21f8 (net: switchdev: introduce switchdev_handle_port_obj_{add,del} for foreign interfaces)
+  		const struct switchdev_notifier_fdb_info *fdb_info,
+  		bool (*check_cb)(const struct net_device *dev),
+  		bool (*foreign_dev_check_cb)(const struct net_device *dev,
+diff --git a/include/net/switchdev.h b/include/net/switchdev.h
+index fc7036c5869e..6146a8ec4741 100644
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@ -399,11 +399,26 @@ int switchdev_handle_port_obj_add(struct net_device *dev,
+ 			int (*add_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj,
+ 				      struct netlink_ext_ack *extack));
++int switchdev_handle_port_obj_add_foreign(struct net_device *dev,
++			struct switchdev_notifier_port_obj_info *port_obj_info,
++			bool (*check_cb)(const struct net_device *dev),
++			bool (*foreign_dev_check_cb)(const struct net_device *dev,
++						     const struct net_device *foreign_dev),
++			int (*add_cb)(struct net_device *dev, const void *ctx,
++				      const struct switchdev_obj *obj,
++				      struct netlink_ext_ack *extack));
+ int switchdev_handle_port_obj_del(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+ 			bool (*check_cb)(const struct net_device *dev),
+ 			int (*del_cb)(struct net_device *dev, const void *ctx,
+ 				      const struct switchdev_obj *obj));
++int switchdev_handle_port_obj_del_foreign(struct net_device *dev,
++			struct switchdev_notifier_port_obj_info *port_obj_info,
++			bool (*check_cb)(const struct net_device *dev),
++			bool (*foreign_dev_check_cb)(const struct net_device *dev,
++						     const struct net_device *foreign_dev),
++			int (*del_cb)(struct net_device *dev, const void *ctx,
++				      const struct switchdev_obj *obj));
+ 
+ RH_KABI_FORCE_CHANGE(1)
+ int switchdev_handle_port_attr_set(struct net_device *dev,
+@@ -539,6 +554,18 @@ switchdev_handle_port_obj_add(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static inline int switchdev_handle_port_obj_add_foreign(struct net_device *dev,
++			struct switchdev_notifier_port_obj_info *port_obj_info,
++			bool (*check_cb)(const struct net_device *dev),
++			bool (*foreign_dev_check_cb)(const struct net_device *dev,
++						     const struct net_device *foreign_dev),
++			int (*add_cb)(struct net_device *dev, const void *ctx,
++				      const struct switchdev_obj *obj,
++				      struct netlink_ext_ack *extack))
++{
++	return 0;
++}
++
+ static inline int
+ switchdev_handle_port_obj_del(struct net_device *dev,
+ 			struct switchdev_notifier_port_obj_info *port_obj_info,
+@@ -549,6 +576,18 @@ switchdev_handle_port_obj_del(struct net_device *dev,
+ 	return 0;
+ }
+ 
++static inline int
++switchdev_handle_port_obj_del_foreign(struct net_device *dev,
++			struct switchdev_notifier_port_obj_info *port_obj_info,
++			bool (*check_cb)(const struct net_device *dev),
++			bool (*foreign_dev_check_cb)(const struct net_device *dev,
++						     const struct net_device *foreign_dev),
++			int (*del_cb)(struct net_device *dev, const void *ctx,
++				      const struct switchdev_obj *obj))
++{
++	return 0;
++}
++
+ static inline int
+ switchdev_handle_port_attr_set(struct net_device *dev,
+ 			struct switchdev_notifier_port_attr_info *port_attr_info,
+* Unmerged path net/switchdev/switchdev.c
