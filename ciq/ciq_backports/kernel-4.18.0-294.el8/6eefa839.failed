@@ -1,0 +1,174 @@
+RDMA/mlx5: Protect from kernel crash if XRC_TGT doesn't have udata
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 6eefa839c4dddf2149e9f5f6f1aa3e1191c8db9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6eefa839.failed
+
+Don't deref udata if it is NULL
+
+  BUG: kernel NULL pointer dereference, address: 0000000000000030
+  #PF: supervisor read access in kernel mode
+  #PF: error_code(0x0000) - not-present page
+  PGD 0 P4D 0
+  Oops: 0000   SMP PTI
+  CPU: 2 PID: 1592 Comm: python3 Not tainted 5.7.0-rc6+ #1
+  Hardware name: QEMU Standard PC (Q35 + ICH9, 2009), BIOS rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.org 04/01/2014
+  RIP: 0010:create_qp+0x39e/0xae0 [mlx5_ib]
+  Code: c0 0d 00 00 bf 10 01 00 00 e8 be a9 e4 e0 48 85 c0 49 89 c2 0f 84 0c 07 00 00 41 8b 85 74 63 01 00 0f c8 a9 00 00 00 10 74 0a <41> 8b 46 30 0f c8 41 89 42 14 41 8b 52 18 41 0f b6 4a 1c 0f ca 89
+  RSP: 0018:ffffc9000067f8b0 EFLAGS: 00010206
+  RAX: 0000000010170000 RBX: ffff888441313000 RCX: 0000000000000000
+  RDX: 0000000000000200 RSI: 0000000000000000 RDI: ffff88845b1d4400
+  RBP: ffffc9000067fa60 R08: 0000000000000200 R09: ffff88845b1d4200
+  R10: ffff88845b1d4200 R11: ffff888441313000 R12: ffffc9000067f950
+  R13: ffff88846ac00140 R14: 0000000000000000 R15: ffff88846c2bc000
+  FS:  00007faa1a3c0540(0000) GS:ffff88846fd00000(0000) knlGS:0000000000000000
+  CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+  CR2: 0000000000000030 CR3: 0000000446dca003 CR4: 0000000000760ea0
+  DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+  DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+  PKRU: 55555554
+  Call Trace:
+   ? __switch_to_asm+0x40/0x70
+   ? __switch_to_asm+0x34/0x70
+   mlx5_ib_create_qp+0x897/0xfa0 [mlx5_ib]
+   ib_create_qp+0x9e/0x300 [ib_core]
+   create_qp+0x92d/0xb20 [ib_uverbs]
+   ? ib_uverbs_cq_event_handler+0x30/0x30 [ib_uverbs]
+   ? release_resource+0x30/0x30
+   ib_uverbs_create_qp+0xc4/0xe0 [ib_uverbs]
+   ib_uverbs_handler_UVERBS_METHOD_INVOKE_WRITE+0xc8/0xf0 [ib_uverbs]
+   ib_uverbs_run_method+0x223/0x770 [ib_uverbs]
+   ? track_pfn_remap+0xa7/0x100
+   ? uverbs_disassociate_api+0xd0/0xd0 [ib_uverbs]
+   ? remap_pfn_range+0x358/0x490
+   ib_uverbs_cmd_verbs.isra.6+0x19b/0x370 [ib_uverbs]
+   ? rdma_umap_priv_init+0x82/0xe0 [ib_core]
+   ? vm_mmap_pgoff+0xec/0x120
+   ib_uverbs_ioctl+0xc0/0x120 [ib_uverbs]
+   ksys_ioctl+0x92/0xb0
+   __x64_sys_ioctl+0x16/0x20
+   do_syscall_64+0x48/0x130
+   entry_SYSCALL_64_after_hwframe+0x44/0xa9
+
+Fixes: e383085c2425 ("RDMA/mlx5: Set ECE options during QP create")
+Link: https://lore.kernel.org/r/20200621115959.60126-1-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 6eefa839c4dddf2149e9f5f6f1aa3e1191c8db9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 886e16185f47,f939c9b769f0..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -1960,15 -1837,95 +1960,93 @@@ static int get_atomic_mode(struct mlx5_
+  	return atomic_mode;
+  }
+  
+ -static int create_xrc_tgt_qp(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ -			     struct mlx5_create_qp_params *params)
+ +static inline bool check_flags_mask(uint64_t input, uint64_t supported)
+  {
+++<<<<<<< HEAD
+ +	return (input & ~supported) == 0;
+++=======
++ 	struct mlx5_ib_create_qp *ucmd = params->ucmd;
++ 	struct ib_qp_init_attr *attr = params->attr;
++ 	u32 uidx = params->uidx;
++ 	struct mlx5_ib_resources *devr = &dev->devr;
++ 	u32 out[MLX5_ST_SZ_DW(create_qp_out)] = {};
++ 	int inlen = MLX5_ST_SZ_BYTES(create_qp_in);
++ 	struct mlx5_core_dev *mdev = dev->mdev;
++ 	struct mlx5_ib_qp_base *base;
++ 	unsigned long flags;
++ 	void *qpc;
++ 	u32 *in;
++ 	int err;
++ 
++ 	mutex_init(&qp->mutex);
++ 
++ 	if (attr->sq_sig_type == IB_SIGNAL_ALL_WR)
++ 		qp->sq_signal_bits = MLX5_WQE_CTRL_CQ_UPDATE;
++ 
++ 	in = kvzalloc(inlen, GFP_KERNEL);
++ 	if (!in)
++ 		return -ENOMEM;
++ 
++ 	if (MLX5_CAP_GEN(mdev, ece_support) && ucmd)
++ 		MLX5_SET(create_qp_in, in, ece, ucmd->ece_options);
++ 	qpc = MLX5_ADDR_OF(create_qp_in, in, qpc);
++ 
++ 	MLX5_SET(qpc, qpc, st, MLX5_QP_ST_XRC);
++ 	MLX5_SET(qpc, qpc, pm_state, MLX5_QP_PM_MIGRATED);
++ 	MLX5_SET(qpc, qpc, pd, to_mpd(devr->p0)->pdn);
++ 
++ 	if (qp->flags & IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK)
++ 		MLX5_SET(qpc, qpc, block_lb_mc, 1);
++ 	if (qp->flags & IB_QP_CREATE_CROSS_CHANNEL)
++ 		MLX5_SET(qpc, qpc, cd_master, 1);
++ 	if (qp->flags & IB_QP_CREATE_MANAGED_SEND)
++ 		MLX5_SET(qpc, qpc, cd_slave_send, 1);
++ 	if (qp->flags & IB_QP_CREATE_MANAGED_RECV)
++ 		MLX5_SET(qpc, qpc, cd_slave_receive, 1);
++ 
++ 	MLX5_SET(qpc, qpc, rq_type, MLX5_SRQ_RQ);
++ 	MLX5_SET(qpc, qpc, no_sq, 1);
++ 	MLX5_SET(qpc, qpc, cqn_rcv, to_mcq(devr->c0)->mcq.cqn);
++ 	MLX5_SET(qpc, qpc, cqn_snd, to_mcq(devr->c0)->mcq.cqn);
++ 	MLX5_SET(qpc, qpc, srqn_rmpn_xrqn, to_msrq(devr->s0)->msrq.srqn);
++ 	MLX5_SET(qpc, qpc, xrcd, to_mxrcd(attr->xrcd)->xrcdn);
++ 	MLX5_SET64(qpc, qpc, dbr_addr, qp->db.dma);
++ 
++ 	/* 0xffffff means we ask to work with cqe version 0 */
++ 	if (MLX5_CAP_GEN(mdev, cqe_version) == MLX5_CQE_VERSION_V1)
++ 		MLX5_SET(qpc, qpc, user_index, uidx);
++ 
++ 	if (qp->flags & IB_QP_CREATE_PCI_WRITE_END_PADDING) {
++ 		MLX5_SET(qpc, qpc, end_padding_mode,
++ 			 MLX5_WQ_END_PAD_MODE_ALIGN);
++ 		/* Special case to clean flag */
++ 		qp->flags &= ~IB_QP_CREATE_PCI_WRITE_END_PADDING;
++ 	}
++ 
++ 	base = &qp->trans_qp.base;
++ 	err = mlx5_qpc_create_qp(dev, &base->mqp, in, inlen, out);
++ 	kvfree(in);
++ 	if (err)
++ 		return err;
++ 
++ 	base->container_mibqp = qp;
++ 	base->mqp.event = mlx5_ib_qp_event;
++ 	if (MLX5_CAP_GEN(mdev, ece_support))
++ 		params->resp.ece_options = MLX5_GET(create_qp_out, out, ece);
++ 
++ 	spin_lock_irqsave(&dev->reset_flow_resource_lock, flags);
++ 	list_add_tail(&qp->qps_list, &dev->qp_list);
++ 	spin_unlock_irqrestore(&dev->reset_flow_resource_lock, flags);
++ 
++ 	qp->trans_qp.xrcdn = to_mxrcd(attr->xrcd)->xrcdn;
++ 	return 0;
+++>>>>>>> 6eefa839c4dd (RDMA/mlx5: Protect from kernel crash if XRC_TGT doesn't have udata)
+  }
+  
+ -static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ -			  struct mlx5_ib_qp *qp,
+ -			  struct mlx5_create_qp_params *params)
+ +static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ +			    struct ib_qp_init_attr *init_attr,
+ +			    struct ib_udata *udata, struct mlx5_ib_qp *qp)
+  {
+ -	struct ib_qp_init_attr *init_attr = params->attr;
+ -	struct mlx5_ib_create_qp *ucmd = params->ucmd;
+ -	u32 out[MLX5_ST_SZ_DW(create_qp_out)] = {};
+ -	struct ib_udata *udata = params->udata;
+ -	u32 uidx = params->uidx;
+  	struct mlx5_ib_resources *devr = &dev->devr;
+  	int inlen = MLX5_ST_SZ_BYTES(create_qp_in);
+  	struct mlx5_core_dev *mdev = dev->mdev;
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
