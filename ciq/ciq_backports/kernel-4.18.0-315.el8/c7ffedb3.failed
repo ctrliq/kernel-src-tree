@@ -1,0 +1,237 @@
+scsi: smartpqi: Add stream detection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Don Brace <don.brace@microchip.com>
+commit c7ffedb3a774a835450a518566639254534e72c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/c7ffedb3.failed
+
+Enhance performance by adding sequential stream detection for RAID5/RAID6
+sequential write requests. Reduce stripe lock contention with full-stripe
+write operations.
+
+There is one common stripe lock for each RAID volume that can be set by
+either the RAID engine or the AIO engine. The AIO path has I/O request
+sizes well below the stripe size resulting in many Read-Modify-Write
+operations.
+
+Sending the request to the RAID engine allows for coalescing requests into
+full stripe operations resulting in reduced Read-Modify-Write operations.
+
+Link: https://lore.kernel.org/r/161549375693.25025.2962141451773219796.stgit@brunhilda
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Reviewed-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit c7ffedb3a774a835450a518566639254534e72c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 2a82a166f773,976bfd8c5192..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -908,8 -991,65 +908,15 @@@ struct raid_map 
+  
+  #pragma pack()
+  
+ -struct pqi_scsi_dev_raid_map_data {
+ -	bool	is_write;
+ -	u8	raid_level;
+ -	u32	map_index;
+ -	u64	first_block;
+ -	u64	last_block;
+ -	u32	data_length;
+ -	u32	block_cnt;
+ -	u32	blocks_per_row;
+ -	u64	first_row;
+ -	u64	last_row;
+ -	u32	first_row_offset;
+ -	u32	last_row_offset;
+ -	u32	first_column;
+ -	u32	last_column;
+ -	u64	r5or6_first_row;
+ -	u64	r5or6_last_row;
+ -	u32	r5or6_first_row_offset;
+ -	u32	r5or6_last_row_offset;
+ -	u32	r5or6_first_column;
+ -	u32	r5or6_last_column;
+ -	u16	data_disks_per_row;
+ -	u32	total_disks_per_row;
+ -	u16	layout_map_count;
+ -	u32	stripesize;
+ -	u16	strip_size;
+ -	u32	first_group;
+ -	u32	last_group;
+ -	u32	map_row;
+ -	u32	aio_handle;
+ -	u64	disk_block;
+ -	u32	disk_block_cnt;
+ -	u8	cdb[16];
+ -	u8	cdb_length;
+ -
+ -	/* RAID 1 specific */
+ -#define NUM_RAID1_MAP_ENTRIES	3
+ -	u32	num_it_nexus_entries;
+ -	u32	it_nexus[NUM_RAID1_MAP_ENTRIES];
+ -
+ -	/* RAID 5 / RAID 6 specific */
+ -	u32	p_parity_it_nexus;	/* aio_handle */
+ -	u32	q_parity_it_nexus;	/* aio_handle */
+ -	u8	xor_mult;
+ -	u64	row;
+ -	u64	stripe_lba;
+ -	u32	p_index;
+ -	u32	q_index;
+ -};
+ -
+  #define RAID_CTLR_LUNID		"\0\0\0\0\0\0\0\0"
+  
++ #define NUM_STREAMS_PER_LUN	8
++ 
++ struct pqi_stream_data {
++ 	u64	next_lba;
++ 	u32	last_accessed;
++ };
++ 
+  struct pqi_scsi_dev {
+  	int	devtype;		/* as reported by INQUIRY commmand */
+  	u8	device_type;		/* as reported by */
+@@@ -1156,8 -1298,20 +1164,25 @@@ struct pqi_ctrl_info 
+  	u8		pqi_mode_enabled : 1;
+  	u8		pqi_reset_quiesce_supported : 1;
+  	u8		soft_reset_handshake_supported : 1;
+++<<<<<<< HEAD
+ +	u8		raid_iu_timeout_supported: 1;
+ +	u8		tmf_iu_timeout_supported: 1;
+++=======
++ 	u8		raid_iu_timeout_supported : 1;
++ 	u8		tmf_iu_timeout_supported : 1;
++ 	u8		enable_r1_writes : 1;
++ 	u8		enable_r5_writes : 1;
++ 	u8		enable_r6_writes : 1;
++ 	u8		lv_drive_type_mix_valid : 1;
++ 	u8		enable_stream_detection : 1;
++ 
++ 	u8		ciss_report_log_flags;
++ 	u32		max_transfer_encrypted_sas_sata;
++ 	u32		max_transfer_encrypted_nvme;
++ 	u32		max_write_raid_5_6;
++ 	u32		max_write_raid_1_10_2drive;
++ 	u32		max_write_raid_1_10_3drive;
+++>>>>>>> c7ffedb3a774 (scsi: smartpqi: Add stream detection)
+  
+  	struct list_head scsi_device_list;
+  	spinlock_t	scsi_device_list_lock;
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+diff --git a/drivers/scsi/smartpqi/smartpqi_init.c b/drivers/scsi/smartpqi/smartpqi_init.c
+index 590c50864b81..c58c63aceb80 100644
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@ -5339,8 +5339,82 @@ void pqi_prep_for_scsi_done(struct scsi_cmnd *scmd)
+ 	atomic_dec(&device->scsi_cmds_outstanding);
+ }
+ 
+-static int pqi_scsi_queue_command(struct Scsi_Host *shost,
++static bool pqi_is_parity_write_stream(struct pqi_ctrl_info *ctrl_info,
+ 	struct scsi_cmnd *scmd)
++{
++	u32 oldest_jiffies;
++	u8 lru_index;
++	int i;
++	int rc;
++	struct pqi_scsi_dev *device;
++	struct pqi_stream_data *pqi_stream_data;
++	struct pqi_scsi_dev_raid_map_data rmd;
++
++	if (!ctrl_info->enable_stream_detection)
++		return false;
++
++	rc = pqi_get_aio_lba_and_block_count(scmd, &rmd);
++	if (rc)
++		return false;
++
++	/* Check writes only. */
++	if (!rmd.is_write)
++		return false;
++
++	device = scmd->device->hostdata;
++
++	/* Check for RAID 5/6 streams. */
++	if (device->raid_level != SA_RAID_5 && device->raid_level != SA_RAID_6)
++		return false;
++
++	/*
++	 * If controller does not support AIO RAID{5,6} writes, need to send
++	 * requests down non-AIO path.
++	 */
++	if ((device->raid_level == SA_RAID_5 && !ctrl_info->enable_r5_writes) ||
++		(device->raid_level == SA_RAID_6 && !ctrl_info->enable_r6_writes))
++		return true;
++
++	lru_index = 0;
++	oldest_jiffies = INT_MAX;
++	for (i = 0; i < NUM_STREAMS_PER_LUN; i++) {
++		pqi_stream_data = &device->stream_data[i];
++		/*
++		 * Check for adjacent request or request is within
++		 * the previous request.
++		 */
++		if ((pqi_stream_data->next_lba &&
++			rmd.first_block >= pqi_stream_data->next_lba) &&
++			rmd.first_block <= pqi_stream_data->next_lba +
++				rmd.block_cnt) {
++			pqi_stream_data->next_lba = rmd.first_block +
++				rmd.block_cnt;
++			pqi_stream_data->last_accessed = jiffies;
++			return true;
++		}
++
++		/* unused entry */
++		if (pqi_stream_data->last_accessed == 0) {
++			lru_index = i;
++			break;
++		}
++
++		/* Find entry with oldest last accessed time. */
++		if (pqi_stream_data->last_accessed <= oldest_jiffies) {
++			oldest_jiffies = pqi_stream_data->last_accessed;
++			lru_index = i;
++		}
++	}
++
++	/* Set LRU entry. */
++	pqi_stream_data = &device->stream_data[lru_index];
++	pqi_stream_data->last_accessed = jiffies;
++	pqi_stream_data->next_lba = rmd.first_block + rmd.block_cnt;
++
++	return false;
++}
++
++static int pqi_scsi_queue_command(struct Scsi_Host *shost, struct scsi_cmnd *scmd)
+ {
+ 	int rc;
+ 	struct pqi_ctrl_info *ctrl_info;
+@@ -5386,11 +5460,12 @@ static int pqi_scsi_queue_command(struct Scsi_Host *shost,
+ 		raid_bypassed = false;
+ 		if (device->raid_bypass_enabled &&
+ 			!blk_rq_is_passthrough(scmd->request)) {
+-			rc = pqi_raid_bypass_submit_scsi_cmd(ctrl_info, device,
+-				scmd, queue_group);
+-			if (rc == 0 || rc == SCSI_MLQUEUE_HOST_BUSY) {
+-				raid_bypassed = true;
+-				atomic_inc(&device->raid_bypass_cnt);
++			if (!pqi_is_parity_write_stream(ctrl_info, scmd)) {
++				rc = pqi_raid_bypass_submit_scsi_cmd(ctrl_info, device, scmd, queue_group);
++				if (rc == 0 || rc == SCSI_MLQUEUE_HOST_BUSY) {
++					raid_bypassed = true;
++					atomic_inc(&device->raid_bypass_cnt);
++				}
+ 			}
+ 		}
+ 		if (!raid_bypassed)
