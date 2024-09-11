@@ -1,0 +1,146 @@
+skbuff: queue NAPI_MERGED_FREE skbs into NAPI cache instead of freeing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Alexander Lobakin <alobakin@pm.me>
+commit 9243adfc311a20371c3f4d8eaf0af4b135e6fac3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/9243adfc.failed
+
+napi_frags_finish() and napi_skb_finish() can only be called inside
+NAPI Rx context, so we can feed NAPI cache with skbuff_heads that
+got NAPI_MERGED_FREE verdict instead of immediate freeing.
+Replace __kfree_skb() with __kfree_skb_defer() in napi_skb_finish()
+and move napi_skb_free_stolen_head() to skbuff.c, so it can drop skbs
+to NAPI cache.
+As many drivers call napi_alloc_skb()/napi_get_frags() on their
+receive path, this becomes especially useful.
+
+	Signed-off-by: Alexander Lobakin <alobakin@pm.me>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9243adfc311a20371c3f4d8eaf0af4b135e6fac3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/core/skbuff.c
+diff --cc net/core/dev.c
+index f6f216484c56,ea9b46318d23..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5903,19 -6095,9 +5903,25 @@@ struct packet_offload *gro_find_complet
+  }
+  EXPORT_SYMBOL(gro_find_complete_by_type);
+  
+++<<<<<<< HEAD
+ +static void napi_skb_free_stolen_head(struct sk_buff *skb)
+ +{
+ +	if (unlikely(skb->slow_gro)) {
+ +		nf_reset(skb);
+ +		skb_dst_drop(skb);
+ +		skb_ext_put(skb);
+ +		skb_orphan(skb);
+ +		skb->slow_gro = 0;
+ +	}
+ +	kmem_cache_free(skbuff_head_cache, skb);
+ +}
+ +
+ +static gro_result_t napi_skb_finish(gro_result_t ret, struct sk_buff *skb)
+++=======
++ static gro_result_t napi_skb_finish(struct napi_struct *napi,
++ 				    struct sk_buff *skb,
++ 				    gro_result_t ret)
+++>>>>>>> 9243adfc311a (skbuff: queue NAPI_MERGED_FREE skbs into NAPI cache instead of freeing)
+  {
+  	switch (ret) {
+  	case GRO_NORMAL:
+diff --cc net/core/skbuff.c
+index 1b69926c298e,545a472273a5..000000000000
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@@ -864,31 -911,36 +864,47 @@@ void __consume_stateless_skb(struct sk_
+  	kfree_skbmem(skb);
+  }
+  
+ -static void napi_skb_cache_put(struct sk_buff *skb)
+ +static inline void _kfree_skb_defer(struct sk_buff *skb)
+  {
+  	struct napi_alloc_cache *nc = this_cpu_ptr(&napi_alloc_cache);
+ -	u32 i;
+  
+++<<<<<<< HEAD
+ +	/* drop skb->head and call any destructors for packet */
+ +	skb_release_all(skb);
+ +
+ +	/* record skb to CPU local list */
+++=======
++ 	kasan_poison_object_data(skbuff_head_cache, skb);
+++>>>>>>> 9243adfc311a (skbuff: queue NAPI_MERGED_FREE skbs into NAPI cache instead of freeing)
+  	nc->skb_cache[nc->skb_count++] = skb;
+  
+ -	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ -		for (i = NAPI_SKB_CACHE_HALF; i < NAPI_SKB_CACHE_SIZE; i++)
+ -			kasan_unpoison_object_data(skbuff_head_cache,
+ -						   nc->skb_cache[i]);
+ +#ifdef CONFIG_SLUB
+ +	/* SLUB writes into objects when freeing */
+ +	prefetchw(skb);
+ +#endif
+  
+ -		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_HALF,
+ -				     nc->skb_cache + NAPI_SKB_CACHE_HALF);
+ -		nc->skb_count = NAPI_SKB_CACHE_HALF;
+ +	/* flush skb_cache if it is filled */
+ +	if (unlikely(nc->skb_count == NAPI_SKB_CACHE_SIZE)) {
+ +		kmem_cache_free_bulk(skbuff_head_cache, NAPI_SKB_CACHE_SIZE,
+ +				     nc->skb_cache);
+ +		nc->skb_count = 0;
+  	}
+  }
+ -
+  void __kfree_skb_defer(struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	_kfree_skb_defer(skb);
+++=======
++ 	skb_release_all(skb);
++ 	napi_skb_cache_put(skb);
++ }
++ 
++ void napi_skb_free_stolen_head(struct sk_buff *skb)
++ {
++ 	skb_dst_drop(skb);
++ 	skb_ext_put(skb);
++ 	napi_skb_cache_put(skb);
+++>>>>>>> 9243adfc311a (skbuff: queue NAPI_MERGED_FREE skbs into NAPI cache instead of freeing)
+  }
+  
+  void napi_consume_skb(struct sk_buff *skb, int budget)
+@@@ -914,7 -965,8 +930,12 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	_kfree_skb_defer(skb);
+++=======
++ 	skb_release_all(skb);
++ 	napi_skb_cache_put(skb);
+++>>>>>>> 9243adfc311a (skbuff: queue NAPI_MERGED_FREE skbs into NAPI cache instead of freeing)
+  }
+  EXPORT_SYMBOL(napi_consume_skb);
+  
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index bf8a1376dfd7..33b0bdc01181 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -2941,6 +2941,7 @@ static inline struct sk_buff *napi_alloc_skb(struct napi_struct *napi,
+ }
+ void napi_consume_skb(struct sk_buff *skb, int budget);
+ 
++void napi_skb_free_stolen_head(struct sk_buff *skb);
+ void __kfree_skb_defer(struct sk_buff *skb);
+ 
+ /**
+* Unmerged path net/core/dev.c
+* Unmerged path net/core/skbuff.c
