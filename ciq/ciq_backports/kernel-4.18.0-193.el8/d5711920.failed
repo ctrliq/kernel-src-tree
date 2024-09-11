@@ -1,0 +1,135 @@
+Revert "NFSv4/flexfiles: Abort I/O early if the layout segment was invalidated"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit d5711920ec6e578f51db95caa6f185f5090b865e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d5711920.failed
+
+This reverts commit a79f194aa4879e9baad118c3f8bb2ca24dbef765.
+The mechanism for aborting I/O is racy, since we are not guaranteed that
+the request is asleep while we're changing both task->tk_status and
+task->tk_action.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Cc: stable@vger.kernel.org # v5.1
+(cherry picked from commit d5711920ec6e578f51db95caa6f185f5090b865e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index c4d4cd12e49e,2e71f5455c6c..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -995,63 -1380,62 +995,81 @@@ void xprt_end_transmit(struct rpc_task 
+  }
+  
+  /**
+ - * xprt_request_transmit - send an RPC request on a transport
+ - * @req: pointer to request to transmit
+ - * @snd_task: RPC task that owns the transport lock
+ + * xprt_transmit - send an RPC request on a transport
+ + * @task: controlling RPC task
+   *
+ - * This performs the transmission of a single request.
+ - * Note that if the request is not the same as snd_task, then it
+ - * does need to be pinned.
+ - * Returns '0' on success.
+ + * We have to copy the iovec because sendmsg fiddles with its contents.
+   */
+ -static int
+ -xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+ +void xprt_transmit(struct rpc_task *task)
+  {
+ -	struct rpc_xprt *xprt = req->rq_xprt;
+ -	struct rpc_task *task = req->rq_task;
+ +	struct rpc_rqst	*req = task->tk_rqstp;
+ +	struct rpc_xprt	*xprt = req->rq_xprt;
+  	unsigned int connect_cookie;
+ -	int is_retrans = RPC_WAS_SENT(task);
+  	int status;
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task)) {
++ 			status = 0;
++ 			goto out_dequeue;
++ 		}
++ 		/* Verify that our message lies in the RPCSEC_GSS window */
++ 		if (rpcauth_xmit_need_reencode(task)) {
++ 			status = -EBADMSG;
++ 			goto out_dequeue;
++ 		}
++ 		if (RPC_SIGNALLED(task)) {
++ 			status = -ERESTARTSYS;
++ 			goto out_dequeue;
++ 		}
++ 	}
+++>>>>>>> d5711920ec6e (Revert "NFSv4/flexfiles: Abort I/O early if the layout segment was invalidated")
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +	if (!req->rq_reply_bytes_recvd) {
+ +
+ +		/* Verify that our message lies in the RPCSEC_GSS window */
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+ +		}
+ +
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+ -	status = xprt->ops->send_request(req);
+ +	status = xprt->ops->send_request(req, task);
+ +	trace_xprt_transmit(xprt, req->rq_xid, status);
+  	if (status != 0) {
+ -		req->rq_ntrans--;
+ -		trace_xprt_transmit(req, status);
+ -		return status;
+ +		task->tk_status = status;
+ +		return;
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+ +	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+ +	clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+  	task->tk_flags |= RPC_TASK_SENT;
+ -	spin_lock(&xprt->transport_lock);
+ +	spin_lock_bh(&xprt->transport_lock);
+ +
+ +	xprt->ops->set_retrans_timeout(task);
+  
+  	xprt->stat.sends++;
+  	xprt->stat.req_u += xprt->stat.sends - xprt->stat.recvs;
+* Unmerged path net/sunrpc/xprt.c
