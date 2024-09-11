@@ -1,0 +1,117 @@
+kvm: arm: Skip stage2 huge mappings for unaligned ipa backed by THP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Suzuki K Poulose <suzuki.poulose@arm.com>
+commit 2e8010bb71b39ff18aac9fb209b3c3093f4c4783
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2e8010bb.failed
+
+With commit a80868f398554842b14, we no longer ensure that the
+THP page is properly aligned in the guest IPA. Skip the stage2
+huge mapping for unaligned IPA backed by transparent hugepages.
+
+Fixes: a80868f398554842b14 ("KVM: arm/arm64: Enforce PTE mappings at stage2 when needed")
+	Reported-by: Eric Auger <eric.auger@redhat.com>
+	Cc: Marc Zyngier <marc.zyngier@arm.com>
+	Cc: Chirstoffer Dall <christoffer.dall@arm.com>
+	Cc: Zenghui Yu <yuzenghui@huawei.com>
+	Cc: Zheng Xiang <zhengxiang9@huawei.com>
+	Cc: Andrew Murray <andrew.murray@arm.com>
+	Cc: Eric Auger <eric.auger@redhat.com>
+	Signed-off-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Signed-off-by: Marc Zyngier <marc.zyngier@arm.com>
+(cherry picked from commit 2e8010bb71b39ff18aac9fb209b3c3093f4c4783)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/arm/mmu.c
+diff --cc virt/kvm/arm/mmu.c
+index 07ca5de32432,a39dcfdbcc65..000000000000
+--- a/virt/kvm/arm/mmu.c
++++ b/virt/kvm/arm/mmu.c
+@@@ -1609,28 -1776,61 +1609,44 @@@ static int user_mem_abort(struct kvm_vc
+  	if (mmu_notifier_retry(kvm, mmu_seq))
+  		goto out_unlock;
+  
+++<<<<<<< HEAD
+ +	if (!hugetlb && !force_pte)
+ +		hugetlb = transparent_hugepage_adjust(&pfn, &fault_ipa);
+++=======
++ 	if (vma_pagesize == PAGE_SIZE && !force_pte) {
++ 		/*
++ 		 * Only PMD_SIZE transparent hugepages(THP) are
++ 		 * currently supported. This code will need to be
++ 		 * updated to support other THP sizes.
++ 		 *
++ 		 * Make sure the host VA and the guest IPA are sufficiently
++ 		 * aligned and that the block is contained within the memslot.
++ 		 */
++ 		if (fault_supports_stage2_huge_mapping(memslot, hva, PMD_SIZE) &&
++ 		    transparent_hugepage_adjust(&pfn, &fault_ipa))
++ 			vma_pagesize = PMD_SIZE;
++ 	}
+++>>>>>>> 2e8010bb71b3 (kvm: arm: Skip stage2 huge mappings for unaligned ipa backed by THP)
+  
+ -	if (writable)
+ -		kvm_set_pfn_dirty(pfn);
+ -
+ -	if (fault_status != FSC_PERM)
+ -		clean_dcache_guest_page(pfn, vma_pagesize);
+ -
+ -	if (exec_fault)
+ -		invalidate_icache_guest_page(pfn, vma_pagesize);
+ -
+ -	/*
+ -	 * If we took an execution fault we have made the
+ -	 * icache/dcache coherent above and should now let the s2
+ -	 * mapping be executable.
+ -	 *
+ -	 * Write faults (!exec_fault && FSC_PERM) are orthogonal to
+ -	 * execute permissions, and we preserve whatever we have.
+ -	 */
+ -	needs_exec = exec_fault ||
+ -		(fault_status == FSC_PERM && stage2_is_exec(kvm, fault_ipa));
+ -
+ -	if (vma_pagesize == PUD_SIZE) {
+ -		pud_t new_pud = kvm_pfn_pud(pfn, mem_type);
+ -
+ -		new_pud = kvm_pud_mkhuge(new_pud);
+ -		if (writable)
+ -			new_pud = kvm_s2pud_mkwrite(new_pud);
+ -
+ -		if (needs_exec)
+ -			new_pud = kvm_s2pud_mkexec(new_pud);
+ -
+ -		ret = stage2_set_pud_huge(kvm, memcache, fault_ipa, &new_pud);
+ -	} else if (vma_pagesize == PMD_SIZE) {
+ -		pmd_t new_pmd = kvm_pfn_pmd(pfn, mem_type);
+ -
+ -		new_pmd = kvm_pmd_mkhuge(new_pmd);
+ -
+ -		if (writable)
+ +	if (hugetlb) {
+ +		pmd_t new_pmd = pfn_pmd(pfn, mem_type);
+ +		new_pmd = pmd_mkhuge(new_pmd);
+ +		if (writable) {
+  			new_pmd = kvm_s2pmd_mkwrite(new_pmd);
+ +			kvm_set_pfn_dirty(pfn);
+ +		}
+  
+ -		if (needs_exec)
+ +		if (fault_status != FSC_PERM)
+ +			clean_dcache_guest_page(pfn, PMD_SIZE);
+ +
+ +		if (exec_fault) {
+  			new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +			invalidate_icache_guest_page(pfn, PMD_SIZE);
+ +		} else if (fault_status == FSC_PERM) {
+ +			/* Preserve execute if XN was already cleared */
+ +			if (stage2_is_exec(kvm, fault_ipa))
+ +				new_pmd = kvm_s2pmd_mkexec(new_pmd);
+ +		}
+  
+  		ret = stage2_set_pmd_huge(kvm, memcache, fault_ipa, &new_pmd);
+  	} else {
+* Unmerged path virt/kvm/arm/mmu.c
