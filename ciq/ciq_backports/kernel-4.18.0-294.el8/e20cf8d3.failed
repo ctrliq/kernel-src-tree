@@ -1,0 +1,231 @@
+udp: implement GRO for plain UDP sockets.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit e20cf8d3f1f763ad28a9cb3b41305b8a8a42653e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e20cf8d3.failed
+
+This is the RX counterpart of commit bec1f6f69736 ("udp: generate gso
+with UDP_SEGMENT"). When UDP_GRO is enabled, such socket is also
+eligible for GRO in the rx path: UDP segments directed to such socket
+are assembled into a larger GSO_UDP_L4 packet.
+
+The core UDP GRO support is enabled with setsockopt(UDP_GRO).
+
+Initial benchmark numbers:
+
+Before:
+udp rx:   1079 MB/s   769065 calls/s
+
+After:
+udp rx:   1466 MB/s    24877 calls/s
+
+This change introduces a side effect in respect to UDP tunnels:
+after a UDP tunnel creation, now the kernel performs a lookup per ingress
+UDP packet, while before such lookup happened only if the ingress packet
+carried a valid internal header csum.
+
+rfc v2 -> rfc v3:
+ - fixed typos in macro name and comments
+ - really enforce UDP_GRO_CNT_MAX, instead of UDP_GRO_CNT_MAX + 1
+ - acquire socket lock in UDP_GRO setsockopt
+
+rfc v1 -> rfc v2:
+ - use a new option to enable UDP GRO
+ - use static keys to protect the UDP GRO socket lookup
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e20cf8d3f1f763ad28a9cb3b41305b8a8a42653e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/udp_offload.c
+diff --cc net/ipv4/udp_offload.c
+index b081620854e2,0646d61f4fa8..000000000000
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@@ -349,8 -343,54 +349,59 @@@ out
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+ +INDIRECT_CALLABLE_DECLARE(struct sock *udp6_lib_lookup_skb(struct sk_buff *skb,
+ +						   __be16 sport, __be16 dport));
+++=======
++ #define UDP_GRO_CNT_MAX 64
++ static struct sk_buff *udp_gro_receive_segment(struct list_head *head,
++ 					       struct sk_buff *skb)
++ {
++ 	struct udphdr *uh = udp_hdr(skb);
++ 	struct sk_buff *pp = NULL;
++ 	struct udphdr *uh2;
++ 	struct sk_buff *p;
++ 
++ 	/* requires non zero csum, for symmetry with GSO */
++ 	if (!uh->check) {
++ 		NAPI_GRO_CB(skb)->flush = 1;
++ 		return NULL;
++ 	}
++ 
++ 	/* pull encapsulating udp header */
++ 	skb_gro_pull(skb, sizeof(struct udphdr));
++ 	skb_gro_postpull_rcsum(skb, uh, sizeof(struct udphdr));
++ 
++ 	list_for_each_entry(p, head, list) {
++ 		if (!NAPI_GRO_CB(p)->same_flow)
++ 			continue;
++ 
++ 		uh2 = udp_hdr(p);
++ 
++ 		/* Match ports only, as csum is always non zero */
++ 		if ((*(u32 *)&uh->source != *(u32 *)&uh2->source)) {
++ 			NAPI_GRO_CB(p)->same_flow = 0;
++ 			continue;
++ 		}
++ 
++ 		/* Terminate the flow on len mismatch or if it grow "too much".
++ 		 * Under small packet flood GRO count could elsewhere grow a lot
++ 		 * leading to execessive truesize values
++ 		 */
++ 		if (!skb_gro_receive(p, skb) &&
++ 		    NAPI_GRO_CB(p)->count >= UDP_GRO_CNT_MAX)
++ 			pp = p;
++ 		else if (uh->len != uh2->len)
++ 			pp = p;
++ 
++ 		return pp;
++ 	}
++ 
++ 	/* mismatch, but we never need to flush */
++ 	return NULL;
++ }
++ 
+++>>>>>>> e20cf8d3f1f7 (udp: implement GRO for plain UDP sockets.)
+  struct sk_buff *udp_gro_receive(struct list_head *head, struct sk_buff *skb,
+  				struct udphdr *uh, udp_lookup_t lookup)
+  {
+@@@ -370,15 -422,6 +433,18 @@@
+  	/* mark that this skb passed once through the tunnel gro layer */
+  	NAPI_GRO_CB(skb)->encap_mark = 1;
+  
+++<<<<<<< HEAD
+ +	rcu_read_lock();
+ +	sk = INDIRECT_CALL_INET(lookup, udp6_lib_lookup_skb,
+ +				udp4_lib_lookup_skb, skb, uh->source, uh->dest);
+ +
+ +	if (sk && udp_sk(sk)->gro_receive)
+ +		goto unflush;
+ +	goto out_unlock;
+ +
+ +unflush:
+++=======
+++>>>>>>> e20cf8d3f1f7 (udp: implement GRO for plain UDP sockets.)
+  	flush = 0;
+  
+  	list_for_each_entry(p, head, list) {
+@@@ -446,17 -501,21 +524,27 @@@ int udp_gro_complete(struct sk_buff *sk
+  
+  	uh->len = newlen;
+  
+- 	/* Set encapsulation before calling into inner gro_complete() functions
+- 	 * to make them set up the inner offsets.
+- 	 */
+- 	skb->encapsulation = 1;
+- 
+  	rcu_read_lock();
+++<<<<<<< HEAD
+ +	sk = INDIRECT_CALL_INET(lookup, udp6_lib_lookup_skb,
+ +				udp4_lib_lookup_skb, skb, uh->source, uh->dest);
+ +	if (sk && udp_sk(sk)->gro_complete)
+++=======
++ 	sk = (*lookup)(skb, uh->source, uh->dest);
++ 	if (sk && udp_sk(sk)->gro_enabled) {
++ 		err = udp_gro_complete_segment(skb);
++ 	} else if (sk && udp_sk(sk)->gro_complete) {
++ 		skb_shinfo(skb)->gso_type = uh->check ? SKB_GSO_UDP_TUNNEL_CSUM
++ 					: SKB_GSO_UDP_TUNNEL;
++ 
++ 		/* Set encapsulation before calling into inner gro_complete()
++ 		 * functions to make them set up the inner offsets.
++ 		 */
++ 		skb->encapsulation = 1;
+++>>>>>>> e20cf8d3f1f7 (udp: implement GRO for plain UDP sockets.)
+  		err = udp_sk(sk)->gro_complete(sk, skb,
+  				nhoff + sizeof(struct udphdr));
++ 	}
+  	rcu_read_unlock();
+  
+  	if (skb->remcsum_offload)
+diff --git a/include/linux/udp.h b/include/linux/udp.h
+index 9d747644c14b..c300d9d76b11 100644
+--- a/include/linux/udp.h
++++ b/include/linux/udp.h
+@@ -50,11 +50,12 @@ struct udp_sock {
+ 	__u8		 encap_type;	/* Is this an Encapsulation socket? */
+ 	unsigned char	 no_check6_tx:1,/* Send zero UDP6 checksums on TX? */
+ 			 no_check6_rx:1,/* Allow zero UDP6 checksums on RX? */
+-			 encap_enabled:1; /* This socket enabled encap
++			 encap_enabled:1, /* This socket enabled encap
+ 					   * processing; UDP tunnels and
+ 					   * different encapsulation layer set
+ 					   * this
+ 					   */
++			 gro_enabled:1;	/* Can accept GRO packets */
+ 	/*
+ 	 * Following member retains the information to create a UDP header
+ 	 * when the socket is uncorked.
+diff --git a/include/uapi/linux/udp.h b/include/uapi/linux/udp.h
+index 9ce1167f331f..07daf9ed2dcd 100644
+--- a/include/uapi/linux/udp.h
++++ b/include/uapi/linux/udp.h
+@@ -33,6 +33,7 @@ struct udphdr {
+ #define UDP_NO_CHECK6_TX 101	/* Disable sending checksum for UDP6X */
+ #define UDP_NO_CHECK6_RX 102	/* Disable accpeting checksum for UDP6 */
+ #define UDP_SEGMENT	103	/* Set GSO segmentation size */
++#define UDP_GRO		104	/* This socket can receive UDP GRO packets */
+ 
+ /* UDP encapsulation types */
+ #define UDP_ENCAP_ESPINUDP_NON_IKE	1 /* draft-ietf-ipsec-nat-t-ike-00/01 */
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index 05aeba1e5acb..7831e971f231 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2556,6 +2556,14 @@ int udp_lib_setsockopt(struct sock *sk, int level, int optname,
+ 		up->gso_size = val;
+ 		break;
+ 
++	case UDP_GRO:
++		lock_sock(sk);
++		if (valbool)
++			udp_tunnel_encap_enable(sk->sk_socket);
++		up->gro_enabled = valbool;
++		release_sock(sk);
++		break;
++
+ 	/*
+ 	 * 	UDP-Lite's partial checksum coverage (RFC 3828).
+ 	 */
+* Unmerged path net/ipv4/udp_offload.c
+diff --git a/net/ipv6/udp_offload.c b/net/ipv6/udp_offload.c
+index c25277706074..83b11d0ac091 100644
+--- a/net/ipv6/udp_offload.c
++++ b/net/ipv6/udp_offload.c
+@@ -148,13 +148,9 @@ INDIRECT_CALLABLE_SCOPE int udp6_gro_complete(struct sk_buff *skb, int nhoff)
+ 	const struct ipv6hdr *ipv6h = ipv6_hdr(skb);
+ 	struct udphdr *uh = (struct udphdr *)(skb->data + nhoff);
+ 
+-	if (uh->check) {
+-		skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_TUNNEL_CSUM;
++	if (uh->check)
+ 		uh->check = ~udp_v6_check(skb->len - nhoff, &ipv6h->saddr,
+ 					  &ipv6h->daddr, 0);
+-	} else {
+-		skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_TUNNEL;
+-	}
+ 
+ 	return udp_gro_complete(skb, nhoff, udp6_lib_lookup_skb);
+ }
