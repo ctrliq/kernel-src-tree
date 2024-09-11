@@ -927,6 +927,7 @@ __acquires(oxu->lock)
 	switch (urb->status) {
 	case -EINPROGRESS:		/* success */
 		urb->status = 0;
+		break;
 	default:			/* fault */
 		break;
 	case -EREMOTEIO:		/* fault or normal */
