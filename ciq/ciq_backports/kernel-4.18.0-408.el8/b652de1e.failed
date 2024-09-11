@@ -1,0 +1,345 @@
+KVM: SVM: Disable preemption across AVIC load/put during APICv refresh
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit b652de1e3dfb3b49e539e88a684a68e333e1bd7c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/b652de1e.failed
+
+Disable preemption when loading/putting the AVIC during an APICv refresh.
+If the vCPU task is preempted and migrated ot a different pCPU, the
+unprotected avic_vcpu_load() could set the wrong pCPU in the physical ID
+cache/table.
+
+Pull the necessary code out of avic_vcpu_{,un}blocking() and into a new
+helper to reduce the probability of introducing this exact bug a third
+time.
+
+Fixes: df7e4827c549 ("KVM: SVM: call avic_vcpu_load/avic_vcpu_put when enabling/disabling AVIC")
+	Cc: stable@vger.kernel.org
+	Reported-by: Maxim Levitsky <mlevitsk@redhat.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b652de1e3dfb3b49e539e88a684a68e333e1bd7c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/avic.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/avic.c
+index ad8f64f31198,1afde44b1252..000000000000
+--- a/arch/x86/kvm/svm/avic.c
++++ b/arch/x86/kvm/svm/avic.c
+@@@ -628,92 -616,6 +628,95 @@@ out
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +void svm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
+ +{
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	struct vmcb *vmcb = svm->vmcb01.ptr;
+ +	bool activated = kvm_vcpu_apicv_active(vcpu);
+ +
+ +	if (!enable_apicv)
+ +		return;
+ +
+ +	if (activated) {
+ +		/**
+ +		 * During AVIC temporary deactivation, guest could update
+ +		 * APIC ID, DFR and LDR registers, which would not be trapped
+ +		 * by avic_unaccelerated_access_interception(). In this case,
+ +		 * we need to check and update the AVIC logical APIC ID table
+ +		 * accordingly before re-activating.
+ +		 */
+ +		avic_post_state_restore(vcpu);
+ +		vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
+ +	} else {
+ +		vmcb->control.int_ctl &= ~AVIC_ENABLE_MASK;
+ +	}
+ +	vmcb_mark_dirty(vmcb, VMCB_AVIC);
+ +
+ +	if (activated)
+ +		avic_vcpu_load(vcpu, vcpu->cpu);
+ +	else
+ +		avic_vcpu_put(vcpu);
+ +
+ +	svm_set_pi_irte_mode(vcpu, activated);
+ +}
+ +
+ +void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap)
+ +{
+ +	return;
+ +}
+ +
+ +int svm_deliver_avic_intr(struct kvm_vcpu *vcpu, int vec)
+ +{
+ +	if (!vcpu->arch.apicv_active)
+ +		return -1;
+ +
+ +	/*
+ +	 * Pairs with the smp_mb_*() after setting vcpu->guest_mode in
+ +	 * vcpu_enter_guest() to ensure the write to the vIRR is ordered before
+ +	 * the read of guest_mode, which guarantees that either VMRUN will see
+ +	 * and process the new vIRR entry, or that the below code will signal
+ +	 * the doorbell if the vCPU is already running in the guest.
+ +	 */
+ +	smp_mb__after_atomic();
+ +
+ +	/*
+ +	 * Signal the doorbell to tell hardware to inject the IRQ if the vCPU
+ +	 * is in the guest.  If the vCPU is not in the guest, hardware will
+ +	 * automatically process AVIC interrupts at VMRUN.
+ +	 */
+ +	if (vcpu->mode == IN_GUEST_MODE) {
+ +		int cpu = READ_ONCE(vcpu->cpu);
+ +
+ +		/*
+ +		 * Note, the vCPU could get migrated to a different pCPU at any
+ +		 * point, which could result in signalling the wrong/previous
+ +		 * pCPU.  But if that happens the vCPU is guaranteed to do a
+ +		 * VMRUN (after being migrated) and thus will process pending
+ +		 * interrupts, i.e. a doorbell is not needed (and the spurious
+ +		 * one is harmless).
+ +		 */
+ +		if (cpu != get_cpu())
+ +			wrmsrl(SVM_AVIC_DOORBELL, kvm_cpu_get_apicid(cpu));
+ +		put_cpu();
+ +	} else {
+ +		/*
+ +		 * Wake the vCPU if it was blocking.  KVM will then detect the
+ +		 * pending IRQ when checking if the vCPU has a wake event.
+ +		 */
+ +		kvm_vcpu_wake_up(vcpu);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +bool svm_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu)
+ +{
+ +	return false;
+ +}
+ +
+++=======
+++>>>>>>> b652de1e3dfb (KVM: SVM: Disable preemption across AVIC load/put during APICv refresh)
+  static void svm_ir_list_del(struct vcpu_svm *svm, struct amd_iommu_pi_data *pi)
+  {
+  	unsigned long flags;
+@@@ -965,10 -867,10 +968,10 @@@ out
+  	return ret;
+  }
+  
+- void avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
++ void __avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+  {
+  	u64 entry;
+ -	/* ID = 0xff (broadcast), ID > 0xff (reserved) */
+ +
+  	int h_physical_id = kvm_cpu_get_apicid(cpu);
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+@@@ -980,17 -898,13 +983,17 @@@
+  
+  	entry &= ~AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK;
+  	entry |= (h_physical_id & AVIC_PHYSICAL_ID_ENTRY_HOST_PHYSICAL_ID_MASK);
+ -	entry |= AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
+ +
+ +	entry &= ~AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
+ +	if (svm->avic_is_running)
+ +		entry |= AVIC_PHYSICAL_ID_ENTRY_IS_RUNNING_MASK;
+  
+  	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
+ -	avic_update_iommu_vcpu_affinity(vcpu, h_physical_id, true);
+ +	avic_update_iommu_vcpu_affinity(vcpu, h_physical_id,
+ +					svm->avic_is_running);
+  }
+  
+- void avic_vcpu_put(struct kvm_vcpu *vcpu)
++ void __avic_vcpu_put(struct kvm_vcpu *vcpu)
+  {
+  	u64 entry;
+  	struct vcpu_svm *svm = to_svm(vcpu);
+@@@ -1003,32 -923,83 +1006,113 @@@
+  	WRITE_ONCE(*(svm->avic_physical_id_cache), entry);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * This function is called during VCPU halt/unhalt.
+ + */
+ +static void avic_set_running(struct kvm_vcpu *vcpu, bool is_run)
+++=======
++ static void avic_vcpu_load(struct kvm_vcpu *vcpu)
++ {
++ 	int cpu = get_cpu();
++ 
++ 	WARN_ON(cpu != vcpu->cpu);
++ 
++ 	__avic_vcpu_load(vcpu, cpu);
++ 
++ 	put_cpu();
++ }
++ 
++ static void avic_vcpu_put(struct kvm_vcpu *vcpu)
++ {
++ 	preempt_disable();
++ 
++ 	__avic_vcpu_put(vcpu);
++ 
++ 	preempt_enable();
++ }
++ 
++ void avic_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	struct vmcb *vmcb = svm->vmcb01.ptr;
++ 	bool activated = kvm_vcpu_apicv_active(vcpu);
++ 
++ 	if (!enable_apicv)
++ 		return;
++ 
++ 	if (activated) {
++ 		/**
++ 		 * During AVIC temporary deactivation, guest could update
++ 		 * APIC ID, DFR and LDR registers, which would not be trapped
++ 		 * by avic_unaccelerated_access_interception(). In this case,
++ 		 * we need to check and update the AVIC logical APIC ID table
++ 		 * accordingly before re-activating.
++ 		 */
++ 		avic_apicv_post_state_restore(vcpu);
++ 		vmcb->control.int_ctl |= AVIC_ENABLE_MASK;
++ 	} else {
++ 		vmcb->control.int_ctl &= ~AVIC_ENABLE_MASK;
++ 	}
++ 	vmcb_mark_dirty(vmcb, VMCB_AVIC);
++ 
++ 	if (activated)
++ 		avic_vcpu_load(vcpu);
++ 	else
++ 		avic_vcpu_put(vcpu);
++ 
++ 	avic_set_pi_irte_mode(vcpu, activated);
++ }
++ 
++ void avic_vcpu_blocking(struct kvm_vcpu *vcpu)
+++>>>>>>> b652de1e3dfb (KVM: SVM: Disable preemption across AVIC load/put during APICv refresh)
+  {
+ -	if (!kvm_vcpu_apicv_active(vcpu))
+ -		return;
+ +	struct vcpu_svm *svm = to_svm(vcpu);
+ +	int cpu = get_cpu();
+ +
+++<<<<<<< HEAD
+ +	WARN_ON(cpu != vcpu->cpu);
+ +	svm->avic_is_running = is_run;
+  
+ +	if (kvm_vcpu_apicv_active(vcpu)) {
+ +		if (is_run)
+ +			avic_vcpu_load(vcpu, cpu);
+ +		else
+ +			avic_vcpu_put(vcpu);
+ +	}
+ +	put_cpu();
+++=======
++        /*
++         * Unload the AVIC when the vCPU is about to block, _before_
++         * the vCPU actually blocks.
++         *
++         * Any IRQs that arrive before IsRunning=0 will not cause an
++         * incomplete IPI vmexit on the source, therefore vIRR will also
++         * be checked by kvm_vcpu_check_block() before blocking.  The
++         * memory barrier implicit in set_current_state orders writing
++         * IsRunning=0 before reading the vIRR.  The processor needs a
++         * matching memory barrier on interrupt delivery between writing
++         * IRR and reading IsRunning; the lack of this barrier might be
++         * the cause of errata #1235).
++         */
++ 	avic_vcpu_put(vcpu);
++ }
++ 
++ void avic_vcpu_unblocking(struct kvm_vcpu *vcpu)
++ {
++ 	if (!kvm_vcpu_apicv_active(vcpu))
++ 		return;
++ 
++ 	avic_vcpu_load(vcpu);
+++>>>>>>> b652de1e3dfb (KVM: SVM: Disable preemption across AVIC load/put during APICv refresh)
+ +}
+ +
+ +void svm_vcpu_blocking(struct kvm_vcpu *vcpu)
+ +{
+ +	avic_set_running(vcpu, false);
+ +}
+ +
+ +void svm_vcpu_unblocking(struct kvm_vcpu *vcpu)
+ +{
+ +	avic_set_running(vcpu, true);
+  }
+diff --cc arch/x86/kvm/svm/svm.h
+index b72dd1b3a3c6,e45b5645d5e0..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -583,21 -576,20 +583,38 @@@ void avic_init_vmcb(struct vcpu_svm *sv
+  int avic_incomplete_ipi_interception(struct kvm_vcpu *vcpu);
+  int avic_unaccelerated_access_interception(struct kvm_vcpu *vcpu);
+  int avic_init_vcpu(struct vcpu_svm *svm);
+++<<<<<<< HEAD
+ +void avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu);
+ +void avic_vcpu_put(struct kvm_vcpu *vcpu);
+ +void avic_post_state_restore(struct kvm_vcpu *vcpu);
+ +void svm_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
+ +void svm_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu);
+ +bool svm_check_apicv_inhibit_reasons(ulong bit);
+ +void svm_load_eoi_exitmap(struct kvm_vcpu *vcpu, u64 *eoi_exit_bitmap);
+ +void svm_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr);
+ +void svm_hwapic_isr_update(struct kvm_vcpu *vcpu, int max_isr);
+ +int svm_deliver_avic_intr(struct kvm_vcpu *vcpu, int vec);
+ +bool svm_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu);
+ +int svm_update_pi_irte(struct kvm *kvm, unsigned int host_irq,
+ +		       uint32_t guest_irq, bool set);
+ +void svm_vcpu_blocking(struct kvm_vcpu *vcpu);
+ +void svm_vcpu_unblocking(struct kvm_vcpu *vcpu);
+++=======
++ void __avic_vcpu_load(struct kvm_vcpu *vcpu, int cpu);
++ void __avic_vcpu_put(struct kvm_vcpu *vcpu);
++ void avic_apicv_post_state_restore(struct kvm_vcpu *vcpu);
++ void avic_set_virtual_apic_mode(struct kvm_vcpu *vcpu);
++ void avic_refresh_apicv_exec_ctrl(struct kvm_vcpu *vcpu);
++ bool avic_check_apicv_inhibit_reasons(ulong bit);
++ void avic_hwapic_irr_update(struct kvm_vcpu *vcpu, int max_irr);
++ void avic_hwapic_isr_update(struct kvm_vcpu *vcpu, int max_isr);
++ bool avic_dy_apicv_has_pending_interrupt(struct kvm_vcpu *vcpu);
++ int avic_pi_update_irte(struct kvm *kvm, unsigned int host_irq,
++ 			uint32_t guest_irq, bool set);
++ void avic_vcpu_blocking(struct kvm_vcpu *vcpu);
++ void avic_vcpu_unblocking(struct kvm_vcpu *vcpu);
++ void avic_ring_doorbell(struct kvm_vcpu *vcpu);
+++>>>>>>> b652de1e3dfb (KVM: SVM: Disable preemption across AVIC load/put during APICv refresh)
+  
+  /* sev.c */
+  
+* Unmerged path arch/x86/kvm/svm/avic.c
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 9b0fddf02548..154bfee7c65e 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -1323,13 +1323,13 @@ static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 		indirect_branch_prediction_barrier();
+ 	}
+ 	if (kvm_vcpu_apicv_active(vcpu))
+-		avic_vcpu_load(vcpu, cpu);
++		__avic_vcpu_load(vcpu, cpu);
+ }
+ 
+ static void svm_vcpu_put(struct kvm_vcpu *vcpu)
+ {
+ 	if (kvm_vcpu_apicv_active(vcpu))
+-		avic_vcpu_put(vcpu);
++		__avic_vcpu_put(vcpu);
+ 
+ 	svm_prepare_host_switch(vcpu);
+ 
+* Unmerged path arch/x86/kvm/svm/svm.h
