@@ -1,0 +1,208 @@
+block: create the request_queue debugfs_dir on registration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Luis Chamberlain <mcgrof@kernel.org>
+commit 85e0cbbb8a79537dbc465e9deb449a08b2b092a6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/85e0cbbb.failed
+
+We were only creating the request_queue debugfs_dir only
+for make_request block drivers (multiqueue), but never for
+request-based block drivers. We did this as we were only
+creating non-blktrace additional debugfs files on that directory
+for make_request drivers. However, since blktrace *always* creates
+that directory anyway, we special-case the use of that directory
+on blktrace. Other than this being an eye-sore, this exposes
+request-based block drivers to the same debugfs fragile
+race that used to exist with make_request block drivers
+where if we start adding files onto that directory we can later
+run a race with a double removal of dentries on the directory
+if we don't deal with this carefully on blktrace.
+
+Instead, just simplify things by always creating the request_queue
+debugfs_dir on request_queue registration. Rename the mutex also to
+reflect the fact that this is used outside of the blktrace context.
+
+	Signed-off-by: Luis Chamberlain <mcgrof@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 85e0cbbb8a79537dbc465e9deb449a08b2b092a6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-debugfs.c
+#	block/blk-sysfs.c
+#	include/linux/blkdev.h
+#	kernel/trace/blktrace.c
+diff --cc block/blk-mq-debugfs.c
+index f61f4c4b53ed,a2800bc56fb4..000000000000
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@@ -834,17 -824,7 +834,21 @@@ int blk_mq_debugfs_register(struct requ
+  	struct blk_mq_hw_ctx *hctx;
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (!blk_debugfs_root)
+ +		return -ENOENT;
+ +
+ +	q->debugfs_dir = debugfs_create_dir(kobject_name(q->kobj.parent),
+ +					    blk_debugfs_root);
+ +	if (!q->debugfs_dir)
+ +		return -ENOMEM;
+ +
+ +	if (!debugfs_create_files(q->debugfs_dir, q,
+ +				  blk_mq_debugfs_queue_attrs))
+ +		goto err;
+++=======
++ 	debugfs_create_files(q->debugfs_dir, q, blk_mq_debugfs_queue_attrs);
+++>>>>>>> 85e0cbbb8a79 (block: create the request_queue debugfs_dir on registration)
+  
+  	/*
+  	 * blk_mq_init_sched() attempted to do this already, but q->debugfs_dir
+@@@ -881,13 -854,11 +885,11 @@@ err
+  
+  void blk_mq_debugfs_unregister(struct request_queue *q)
+  {
+- 	debugfs_remove_recursive(q->debugfs_dir);
+  	q->sched_debugfs_dir = NULL;
+- 	q->debugfs_dir = NULL;
+  }
+  
+ -static void blk_mq_debugfs_register_ctx(struct blk_mq_hw_ctx *hctx,
+ -					struct blk_mq_ctx *ctx)
+ +static int blk_mq_debugfs_register_ctx(struct blk_mq_hw_ctx *hctx,
+ +				       struct blk_mq_ctx *ctx)
+  {
+  	struct dentry *ctx_dir;
+  	char name[20];
+diff --cc block/blk-sysfs.c
+index 3e55b90f29b0,be67952e7be2..000000000000
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@@ -987,6 -985,19 +991,22 @@@ int blk_register_queue(struct gendisk *
+  		goto unlock;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = sysfs_create_group(&q->kobj, &queue_attr_group);
++ 	if (ret) {
++ 		blk_trace_remove_sysfs(dev);
++ 		kobject_del(&q->kobj);
++ 		kobject_put(&dev->kobj);
++ 		goto unlock;
++ 	}
++ 
++ 	mutex_lock(&q->debugfs_mutex);
++ 	q->debugfs_dir = debugfs_create_dir(kobject_name(q->kobj.parent),
++ 					    blk_debugfs_root);
++ 	mutex_unlock(&q->debugfs_mutex);
++ 
+++>>>>>>> 85e0cbbb8a79 (block: create the request_queue debugfs_dir on registration)
+  	if (queue_is_mq(q)) {
+  		__blk_mq_register_dev(dev, q);
+  		blk_mq_debugfs_register(q);
+diff --cc include/linux/blkdev.h
+index 43b1486e0588,c0701237116d..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -541,9 -528,9 +541,14 @@@ struct request_queue 
+  	unsigned int		sg_timeout;
+  	unsigned int		sg_reserved_size;
+  	int			node;
++ 	struct mutex		debugfs_mutex;
+  #ifdef CONFIG_BLK_DEV_IO_TRACE
+++<<<<<<< HEAD
+ +	struct blk_trace RH_KABI_ADD_MODIFIER(__rcu) *blk_trace;
+ +	struct mutex		blk_trace_mutex;
+++=======
++ 	struct blk_trace __rcu	*blk_trace;
+++>>>>>>> 85e0cbbb8a79 (block: create the request_queue debugfs_dir on registration)
+  #endif
+  	/*
+  	 * for flush operations
+@@@ -576,9 -574,11 +581,10 @@@
+  	struct list_head	tag_set_list;
+  	struct bio_set		bio_split;
+  
+- #ifdef CONFIG_BLK_DEBUG_FS
+  	struct dentry		*debugfs_dir;
++ 
++ #ifdef CONFIG_BLK_DEBUG_FS
+  	struct dentry		*sched_debugfs_dir;
+ -	struct dentry		*rqos_debugfs_dir;
+  #endif
+  
+  	bool			mq_sysfs_init_done;
+diff --cc kernel/trace/blktrace.c
+index 79885a66a0f5,c086c38f4954..000000000000
+--- a/kernel/trace/blktrace.c
++++ b/kernel/trace/blktrace.c
+@@@ -1927,7 -1915,7 +1921,11 @@@ static ssize_t sysfs_blk_trace_attr_sto
+  	if (bt == NULL) {
+  		ret = blk_trace_setup_queue(q, bdev);
+  		bt = rcu_dereference_protected(q->blk_trace,
+++<<<<<<< HEAD
+ +				       lockdep_is_held(&q->blk_trace_mutex));
+++=======
++ 				lockdep_is_held(&q->debugfs_mutex));
+++>>>>>>> 85e0cbbb8a79 (block: create the request_queue debugfs_dir on registration)
+  	}
+  
+  	if (ret == 0) {
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9aabbc020a34..26bb799b31a0 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -46,9 +46,7 @@
+ #include "blk-pm.h"
+ #include "blk-rq-qos.h"
+ 
+-#ifdef CONFIG_DEBUG_FS
+ struct dentry *blk_debugfs_root;
+-#endif
+ 
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_remap);
+ EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
+@@ -527,9 +525,7 @@ struct request_queue *blk_alloc_queue_node(gfp_t gfp_mask, int node_id)
+ 
+ 	kobject_init(&q->kobj, &blk_queue_ktype);
+ 
+-#ifdef CONFIG_BLK_DEV_IO_TRACE
+-	mutex_init(&q->blk_trace_mutex);
+-#endif
++	mutex_init(&q->debugfs_mutex);
+ 	mutex_init(&q->sysfs_lock);
+ 	mutex_init(&q->sysfs_dir_lock);
+ 	spin_lock_init(&q->queue_lock);
+@@ -1768,9 +1764,7 @@ int __init blk_dev_init(void)
+ 	blk_requestq_cachep = kmem_cache_create("request_queue",
+ 			sizeof(struct request_queue), 0, SLAB_PANIC, NULL);
+ 
+-#ifdef CONFIG_DEBUG_FS
+ 	blk_debugfs_root = debugfs_create_dir("block", NULL);
+-#endif
+ 
+ 	return 0;
+ }
+* Unmerged path block/blk-mq-debugfs.c
+* Unmerged path block/blk-sysfs.c
+diff --git a/block/blk.h b/block/blk.h
+index 0fea53c91ae4..074eba2efa67 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -11,9 +11,7 @@
+ /* Max future timer expiry for timeouts */
+ #define BLK_MAX_TIMEOUT		(5 * HZ)
+ 
+-#ifdef CONFIG_DEBUG_FS
+ extern struct dentry *blk_debugfs_root;
+-#endif
+ 
+ struct blk_flush_queue {
+ 	unsigned int		flush_pending_idx:1;
+* Unmerged path include/linux/blkdev.h
+* Unmerged path kernel/trace/blktrace.c
