@@ -1,0 +1,216 @@
+powerpc/powernv/npu: Convert NPU IOMMU helpers to iommu_table_group_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit 83fb8ccf975138283c7f6d3685d9c5e2292381dd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/83fb8ccf.failed
+
+At the moment NPU IOMMU is manipulated directly from the IODA2 PCI
+PE code; PCI PE acts as a master to NPU PE. Soon we will have compound
+IOMMU groups with several PEs from several different PHB (such as
+interconnected GPUs and NPUs) so there will be no single master but
+a one big IOMMU group.
+
+This makes a first step and converts an NPU PE with a set of extern
+function to a table group.
+
+This should cause no behavioral change. Note that
+pnv_npu_release_ownership() has never been implemented.
+
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 83fb8ccf975138283c7f6d3685d9c5e2292381dd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/powernv/pci.h
+diff --cc arch/powerpc/platforms/powernv/pci.h
+index 0020937fc694,534b8cee081b..000000000000
+--- a/arch/powerpc/platforms/powernv/pci.h
++++ b/arch/powerpc/platforms/powernv/pci.h
+@@@ -240,22 -214,6 +240,25 @@@ extern void pe_level_printk(const struc
+  extern void pnv_npu_try_dma_set_bypass(struct pci_dev *gpdev, bool bypass);
+  extern void pnv_pci_ioda2_tce_invalidate_entire(struct pnv_phb *phb, bool rm);
+  extern struct pnv_ioda_pe *pnv_pci_npu_setup_iommu(struct pnv_ioda_pe *npe);
+++<<<<<<< HEAD
+ +extern long pnv_npu_set_window(struct pnv_ioda_pe *npe, int num,
+ +		struct iommu_table *tbl);
+ +extern long pnv_npu_unset_window(struct pnv_ioda_pe *npe, int num);
+ +extern void pnv_npu_take_ownership(struct pnv_ioda_pe *npe);
+ +extern void pnv_npu_release_ownership(struct pnv_ioda_pe *npe);
+ +extern int pnv_npu2_init(struct pnv_phb *phb);
+ +
+ +/* cxl functions */
+ +extern bool pnv_cxl_enable_device_hook(struct pci_dev *dev);
+ +extern void pnv_cxl_disable_device(struct pci_dev *dev);
+ +extern int pnv_cxl_cx4_setup_msi_irqs(struct pci_dev *pdev, int nvec, int type);
+ +extern void pnv_cxl_cx4_teardown_msi_irqs(struct pci_dev *pdev);
+ +
+ +
+ +/* phb ops (cxl switches these when enabling the kernel api on the phb) */
+ +extern const struct pci_controller_ops pnv_cxl_cx4_ioda_controller_ops;
+++=======
+++>>>>>>> 83fb8ccf9751 (powerpc/powernv/npu: Convert NPU IOMMU helpers to iommu_table_group_ops)
+  
+  /* pci-ioda-tce.c */
+  #define POWERNV_IOMMU_DEFAULT_LEVELS	1
+diff --git a/arch/powerpc/platforms/powernv/npu-dma.c b/arch/powerpc/platforms/powernv/npu-dma.c
+index 7c8fc584b8ac..d52407db037f 100644
+--- a/arch/powerpc/platforms/powernv/npu-dma.c
++++ b/arch/powerpc/platforms/powernv/npu-dma.c
+@@ -190,9 +190,14 @@ static struct pnv_ioda_pe *get_gpu_pci_dev_and_pe(struct pnv_ioda_pe *npe,
+ 	return pe;
+ }
+ 
+-long pnv_npu_set_window(struct pnv_ioda_pe *npe, int num,
++static long pnv_npu_unset_window(struct iommu_table_group *table_group,
++		int num);
++
++static long pnv_npu_set_window(struct iommu_table_group *table_group, int num,
+ 		struct iommu_table *tbl)
+ {
++	struct pnv_ioda_pe *npe = container_of(table_group, struct pnv_ioda_pe,
++			table_group);
+ 	struct pnv_phb *phb = npe->phb;
+ 	int64_t rc;
+ 	const unsigned long size = tbl->it_indirect_levels ?
+@@ -203,7 +208,7 @@ long pnv_npu_set_window(struct pnv_ioda_pe *npe, int num,
+ 
+ 	/* NPU has just one TVE so if there is another table, remove it first */
+ 	if (npe->table_group.tables[num2])
+-		pnv_npu_unset_window(npe, num2);
++		pnv_npu_unset_window(&npe->table_group, num2);
+ 
+ 	pe_info(npe, "Setting up window %llx..%llx pg=%lx\n",
+ 			start_addr, start_addr + win_size - 1,
+@@ -229,8 +234,10 @@ long pnv_npu_set_window(struct pnv_ioda_pe *npe, int num,
+ 	return 0;
+ }
+ 
+-long pnv_npu_unset_window(struct pnv_ioda_pe *npe, int num)
++static long pnv_npu_unset_window(struct iommu_table_group *table_group, int num)
+ {
++	struct pnv_ioda_pe *npe = container_of(table_group, struct pnv_ioda_pe,
++			table_group);
+ 	struct pnv_phb *phb = npe->phb;
+ 	int64_t rc;
+ 
+@@ -275,7 +282,8 @@ static void pnv_npu_dma_set_32(struct pnv_ioda_pe *npe)
+ 	if (!gpe)
+ 		return;
+ 
+-	rc = pnv_npu_set_window(npe, 0, gpe->table_group.tables[0]);
++	rc = pnv_npu_set_window(&npe->table_group, 0,
++			gpe->table_group.tables[0]);
+ 
+ 	/*
+ 	 * We don't initialise npu_pe->tce32_table as we always use
+@@ -299,7 +307,7 @@ static int pnv_npu_dma_set_bypass(struct pnv_ioda_pe *npe)
+ 	if (phb->type != PNV_PHB_NPU_NVLINK || !npe->pdev)
+ 		return -EINVAL;
+ 
+-	rc = pnv_npu_unset_window(npe, 0);
++	rc = pnv_npu_unset_window(&npe->table_group, 0);
+ 	if (rc != OPAL_SUCCESS)
+ 		return rc;
+ 
+@@ -352,9 +360,12 @@ void pnv_npu_try_dma_set_bypass(struct pci_dev *gpdev, bool bypass)
+ 	}
+ }
+ 
++#ifdef CONFIG_IOMMU_API
+ /* Switch ownership from platform code to external user (e.g. VFIO) */
+-void pnv_npu_take_ownership(struct pnv_ioda_pe *npe)
++static void pnv_npu_take_ownership(struct iommu_table_group *table_group)
+ {
++	struct pnv_ioda_pe *npe = container_of(table_group, struct pnv_ioda_pe,
++			table_group);
+ 	struct pnv_phb *phb = npe->phb;
+ 	int64_t rc;
+ 
+@@ -365,7 +376,7 @@ void pnv_npu_take_ownership(struct pnv_ioda_pe *npe)
+ 	 * if it was enabled at the moment of ownership change.
+ 	 */
+ 	if (npe->table_group.tables[0]) {
+-		pnv_npu_unset_window(npe, 0);
++		pnv_npu_unset_window(&npe->table_group, 0);
+ 		return;
+ 	}
+ 
+@@ -380,6 +391,12 @@ void pnv_npu_take_ownership(struct pnv_ioda_pe *npe)
+ 	pnv_pci_ioda2_tce_invalidate_entire(npe->phb, false);
+ }
+ 
++static struct iommu_table_group_ops pnv_pci_npu_ops = {
++	.set_window = pnv_npu_set_window,
++	.unset_window = pnv_npu_unset_window,
++	.take_ownership = pnv_npu_take_ownership,
++};
++
+ struct pnv_ioda_pe *pnv_pci_npu_setup_iommu(struct pnv_ioda_pe *npe)
+ {
+ 	struct pnv_phb *phb = npe->phb;
+@@ -390,6 +407,8 @@ struct pnv_ioda_pe *pnv_pci_npu_setup_iommu(struct pnv_ioda_pe *npe)
+ 	if (!gpe || !gpdev)
+ 		return NULL;
+ 
++	npe->table_group.ops = &pnv_pci_npu_ops;
++
+ 	list_for_each_entry(npdev, &pbus->devices, bus_list) {
+ 		gptmp = pnv_pci_get_gpu_dev(npdev);
+ 
+@@ -402,6 +421,7 @@ struct pnv_ioda_pe *pnv_pci_npu_setup_iommu(struct pnv_ioda_pe *npe)
+ 
+ 	return gpe;
+ }
++#endif /* !CONFIG_IOMMU_API */
+ 
+ /* Maximum number of nvlinks per npu */
+ #define NV_MAX_LINKS 6
+diff --git a/arch/powerpc/platforms/powernv/pci-ioda.c b/arch/powerpc/platforms/powernv/pci-ioda.c
+index ef463c498398..ab248ba9d073 100644
+--- a/arch/powerpc/platforms/powernv/pci-ioda.c
++++ b/arch/powerpc/platforms/powernv/pci-ioda.c
+@@ -2683,12 +2683,13 @@ static struct pnv_ioda_pe *gpe_table_group_to_npe(
+ static long pnv_pci_ioda2_npu_set_window(struct iommu_table_group *table_group,
+ 		int num, struct iommu_table *tbl)
+ {
++	struct pnv_ioda_pe *npe = gpe_table_group_to_npe(table_group);
+ 	long ret = pnv_pci_ioda2_set_window(table_group, num, tbl);
+ 
+ 	if (ret)
+ 		return ret;
+ 
+-	ret = pnv_npu_set_window(gpe_table_group_to_npe(table_group), num, tbl);
++	ret = npe->table_group.ops->set_window(&npe->table_group, num, tbl);
+ 	if (ret)
+ 		pnv_pci_ioda2_unset_window(table_group, num);
+ 
+@@ -2699,17 +2700,20 @@ static long pnv_pci_ioda2_npu_unset_window(
+ 		struct iommu_table_group *table_group,
+ 		int num)
+ {
++	struct pnv_ioda_pe *npe = gpe_table_group_to_npe(table_group);
+ 	long ret = pnv_pci_ioda2_unset_window(table_group, num);
+ 
+ 	if (ret)
+ 		return ret;
+ 
+-	return pnv_npu_unset_window(gpe_table_group_to_npe(table_group), num);
++	return npe->table_group.ops->unset_window(&npe->table_group, num);
+ }
+ 
+ static void pnv_ioda2_npu_take_ownership(struct iommu_table_group *table_group)
+ {
+-	pnv_npu_take_ownership(gpe_table_group_to_npe(table_group));
++	struct pnv_ioda_pe *npe = gpe_table_group_to_npe(table_group);
++
++	npe->table_group.ops->take_ownership(&npe->table_group);
+ 	pnv_ioda2_take_ownership(table_group);
+ }
+ 
+* Unmerged path arch/powerpc/platforms/powernv/pci.h
