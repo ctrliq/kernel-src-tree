@@ -1,0 +1,75 @@
+KVM: x86/mmu: Formalize TDP MMU's (unintended?) deferred TLB flush logic
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit db01416b22d98b8c8474a418a97cdacfd947469d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/db01416b.failed
+
+Explicitly ignore the result of zap_gfn_range() when putting the last
+reference to a TDP MMU root, and add a pile of comments to formalize the
+TDP MMU's behavior of deferring TLB flushes to alloc/reuse.  Note, this
+only affects the !shared case, as zap_gfn_range() subtly never returns
+true for "flush" as the flush is handled by tdp_mmu_zap_spte_atomic().
+
+Putting the root without a flush is ok because even if there are stale
+references to the root in the TLB, they are unreachable because KVM will
+not run the guest with the same ASID without first flushing (where ASID
+in this context refers to both SVM's explicit ASID and Intel's implicit
+ASID that is constructed from VPID+PCID+EPT4A+etc...).
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220226001546.360188-5-seanjc@google.com>
+	Reviewed-by: Mingwei Zhang <mizhang@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit db01416b22d98b8c8474a418a97cdacfd947469d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index abdf98ed849c,921fa386df99..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -81,7 -93,15 +81,19 @@@ void kvm_tdp_mmu_put_root(struct kvm *k
+  	list_del_rcu(&root->link);
+  	spin_unlock(&kvm->arch.tdp_mmu_pages_lock);
+  
+++<<<<<<< HEAD
+ +	zap_gfn_range(kvm, root, 0, max_gfn, false, false);
+++=======
++ 	/*
++ 	 * A TLB flush is not necessary as KVM performs a local TLB flush when
++ 	 * allocating a new root (see kvm_mmu_load()), and when migrating vCPU
++ 	 * to a different pCPU.  Note, the local TLB flush on reuse also
++ 	 * invalidates any paging-structure-cache entries, i.e. TLB entries for
++ 	 * intermediate paging structures, that may be zapped, as such entries
++ 	 * are associated with the ASID on both VMX and SVM.
++ 	 */
++ 	(void)zap_gfn_range(kvm, root, 0, -1ull, false, false, shared);
+++>>>>>>> db01416b22d9 (KVM: x86/mmu: Formalize TDP MMU's (unintended?) deferred TLB flush logic)
+  
+  	call_rcu(&root->rcu_head, tdp_mmu_free_sp_rcu_callback);
+  }
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index ad983809b045..99519b5fda52 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -5046,6 +5046,14 @@ int kvm_mmu_load(struct kvm_vcpu *vcpu)
+ 	kvm_mmu_sync_roots(vcpu);
+ 
+ 	kvm_mmu_load_pgd(vcpu);
++
++	/*
++	 * Flush any TLB entries for the new root, the provenance of the root
++	 * is unknown.  Even if KVM ensures there are no stale TLB entries
++	 * for a freed root, in theory another hypervisor could have left
++	 * stale entries.  Flushing on alloc also allows KVM to skip the TLB
++	 * flush when freeing a root (see kvm_tdp_mmu_put_root()).
++	 */
+ 	static_call(kvm_x86_flush_tlb_current)(vcpu);
+ out:
+ 	return r;
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
