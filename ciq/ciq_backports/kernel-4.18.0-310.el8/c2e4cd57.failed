@@ -1,0 +1,299 @@
+block: lift setting the readahead size into the block layer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit c2e4cd57cfa1f627b786c764d185fff85fd12be9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c2e4cd57.failed
+
+Drivers shouldn't really mess with the readahead size, as that is a VM
+concept.  Instead set it based on the optimal I/O size by lifting the
+algorithm from the md driver when registering the disk.  Also set
+bdi->io_pages there as well by applying the same scheme based on
+max_sectors.  To ensure the limits work well for stacking drivers a
+new helper is added to update the readahead limits from the block
+limits, which is also called from disk_stack_limits.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Mike Snitzer <snitzer@redhat.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Acked-by: Coly Li <colyli@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c2e4cd57cfa1f627b786c764d185fff85fd12be9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/drbd/drbd_nl.c
+#	drivers/md/bcache/super.c
+#	drivers/nvme/host/core.c
+diff --cc drivers/block/drbd/drbd_nl.c
+index 682a3696a535,54a4930c04fe..000000000000
+--- a/drivers/block/drbd/drbd_nl.c
++++ b/drivers/block/drbd/drbd_nl.c
+@@@ -1332,18 -1361,11 +1332,23 @@@ static void drbd_setup_queue_param(stru
+  	decide_on_write_same_support(device, q, b, o, disable_write_same);
+  
+  	if (b) {
+++<<<<<<< HEAD
+ +		blk_queue_stack_limits(q, b);
+ +
+ +		if (q->backing_dev_info->ra_pages !=
+ +		    b->backing_dev_info->ra_pages) {
+ +			drbd_info(device, "Adjusting my ra_pages to backing device's (%lu -> %lu)\n",
+ +				 q->backing_dev_info->ra_pages,
+ +				 b->backing_dev_info->ra_pages);
+ +			q->backing_dev_info->ra_pages =
+ +						b->backing_dev_info->ra_pages;
+ +		}
+++=======
++ 		blk_stack_limits(&q->limits, &b->limits, 0);
++ 		blk_queue_update_readahead(q);
+++>>>>>>> c2e4cd57cfa1 (block: lift setting the readahead size into the block layer)
+  	}
+  	fixup_discard_if_not_supported(q);
+ -	fixup_write_zeroes(device, q);
+  }
+  
+  void drbd_reconsider_queue_parameters(struct drbd_device *device, struct drbd_backing_dev *bdev, struct o_qlim *o)
+diff --cc drivers/md/bcache/super.c
+index fab4f47eb41b,6bfa77167362..000000000000
+--- a/drivers/md/bcache/super.c
++++ b/drivers/md/bcache/super.c
+@@@ -1238,9 -1427,8 +1238,14 @@@ static int cached_dev_init(struct cache
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	dc->disk.disk->queue->backing_dev_info->ra_pages =
+ +		max(dc->disk.disk->queue->backing_dev_info->ra_pages,
+ +		    q->backing_dev_info->ra_pages);
+++=======
++ 	blk_queue_io_opt(dc->disk.disk->queue,
++ 		max(queue_io_opt(dc->disk.disk->queue), queue_io_opt(q)));
+++>>>>>>> c2e4cd57cfa1 (block: lift setting the readahead size into the block layer)
+  
+  	atomic_set(&dc->io_errors, 0);
+  	dc->io_disable = false;
+diff --cc drivers/nvme/host/core.c
+index b9d19e246c73,741c9bfa8e14..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2130,8 -2145,10 +2130,15 @@@ static int __nvme_revalidate_disk(struc
+  #ifdef CONFIG_NVME_MULTIPATH
+  	if (ns->head->disk) {
+  		nvme_update_disk_info(ns->head->disk, ns, id);
+++<<<<<<< HEAD
+ +		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
+ +		nvme_mpath_update_disk_size(ns->head->disk);
+++=======
++ 		blk_stack_limits(&ns->head->disk->queue->limits,
++ 				 &ns->queue->limits, 0);
++ 		blk_queue_update_readahead(ns->head->disk->queue);
++ 		nvme_update_bdev_size(ns->head->disk);
+++>>>>>>> c2e4cd57cfa1 (block: lift setting the readahead size into the block layer)
+  	}
+  #endif
+  	return 0;
+diff --git a/block/blk-settings.c b/block/blk-settings.c
+index 45b734bb5751..a496f842704c 100644
+--- a/block/blk-settings.c
++++ b/block/blk-settings.c
+@@ -404,6 +404,19 @@ void blk_queue_alignment_offset(struct request_queue *q, unsigned int offset)
+ }
+ EXPORT_SYMBOL(blk_queue_alignment_offset);
+ 
++void blk_queue_update_readahead(struct request_queue *q)
++{
++	/*
++	 * For read-ahead of large files to be effective, we need to read ahead
++	 * at least twice the optimal I/O size.
++	 */
++	q->backing_dev_info->ra_pages =
++		max(queue_io_opt(q) * 2 / PAGE_SIZE, VM_READAHEAD_PAGES);
++	q->backing_dev_info->io_pages =
++		queue_max_sectors(q) >> (PAGE_SHIFT - 9);
++}
++EXPORT_SYMBOL_GPL(blk_queue_update_readahead);
++
+ /**
+  * blk_limits_io_min - set minimum request size for a device
+  * @limits: the queue limits
+@@ -482,6 +495,8 @@ EXPORT_SYMBOL(blk_limits_io_opt);
+ void blk_queue_io_opt(struct request_queue *q, unsigned int opt)
+ {
+ 	blk_limits_io_opt(&q->limits, opt);
++	q->backing_dev_info->ra_pages =
++		max(queue_io_opt(q) * 2 / PAGE_SIZE, VM_READAHEAD_PAGES);
+ }
+ EXPORT_SYMBOL(blk_queue_io_opt);
+ 
+@@ -699,8 +714,7 @@ void disk_stack_limits(struct gendisk *disk, struct block_device *bdev,
+ 		       top, bottom);
+ 	}
+ 
+-	t->backing_dev_info->io_pages =
+-		t->limits.max_sectors >> (PAGE_SHIFT - 9);
++	blk_queue_update_readahead(disk->queue);
+ }
+ EXPORT_SYMBOL(disk_stack_limits);
+ 
+diff --git a/block/blk-sysfs.c b/block/blk-sysfs.c
+index f4c2eed1df16..b4a9e83766e2 100644
+--- a/block/blk-sysfs.c
++++ b/block/blk-sysfs.c
+@@ -992,6 +992,8 @@ int blk_register_queue(struct gendisk *disk)
+ 		percpu_ref_switch_to_percpu(&q->q_usage_counter);
+ 	}
+ 
++	blk_queue_update_readahead(q);
++
+ 	ret = blk_trace_init_sysfs(dev);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/block/aoe/aoeblk.c b/drivers/block/aoe/aoeblk.c
+index 1919c307e192..bdfa6ac43d6d 100644
+--- a/drivers/block/aoe/aoeblk.c
++++ b/drivers/block/aoe/aoeblk.c
+@@ -419,7 +419,6 @@ aoeblk_gdalloc(void *vp)
+ 	WARN_ON(d->gd);
+ 	WARN_ON(d->flags & DEVFL_UP);
+ 	blk_queue_max_hw_sectors(q, BLK_DEF_MAX_SECTORS);
+-	q->backing_dev_info->ra_pages = SZ_2M / PAGE_SIZE;
+ 	blk_queue_io_opt(q, SZ_2M);
+ 	d->bufpool = mp;
+ 	d->blkq = gd->queue = q;
+* Unmerged path drivers/block/drbd/drbd_nl.c
+* Unmerged path drivers/md/bcache/super.c
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 27df037ce2ef..28d2e1b2d139 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1905,8 +1905,7 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	}
+ #endif
+ 
+-	/* Allow reads to exceed readahead limits */
+-	q->backing_dev_info->io_pages = limits->max_sectors >> (PAGE_SHIFT - 9);
++	blk_queue_update_readahead(q);
+ }
+ 
+ unsigned int dm_table_get_num_targets(struct dm_table *t)
+diff --git a/drivers/md/raid0.c b/drivers/md/raid0.c
+index c45e4b18de24..0b088168c90c 100644
+--- a/drivers/md/raid0.c
++++ b/drivers/md/raid0.c
+@@ -432,22 +432,6 @@ static int raid0_run(struct mddev *mddev)
+ 		 mdname(mddev),
+ 		 (unsigned long long)mddev->array_sectors);
+ 
+-	if (mddev->queue) {
+-		/* calculate the max read-ahead size.
+-		 * For read-ahead of large files to be effective, we need to
+-		 * readahead at least twice a whole stripe. i.e. number of devices
+-		 * multiplied by chunk size times 2.
+-		 * If an individual device has an ra_pages greater than the
+-		 * chunk size, then we will not drive that device as hard as it
+-		 * wants.  We consider this a configuration error: a larger
+-		 * chunksize should be used in that case.
+-		 */
+-		int stripe = mddev->raid_disks *
+-			(mddev->chunk_sectors << 9) / PAGE_SIZE;
+-		if (mddev->queue->backing_dev_info->ra_pages < 2* stripe)
+-			mddev->queue->backing_dev_info->ra_pages = 2* stripe;
+-	}
+-
+ 	dump_zones(mddev);
+ 
+ 	ret = md_integrity_register(mddev);
+diff --git a/drivers/md/raid10.c b/drivers/md/raid10.c
+index 826fde489f28..9f0d90cc1638 100644
+--- a/drivers/md/raid10.c
++++ b/drivers/md/raid10.c
+@@ -3907,19 +3907,6 @@ static int raid10_run(struct mddev *mddev)
+ 	mddev->resync_max_sectors = size;
+ 	set_bit(MD_FAILFAST_SUPPORTED, &mddev->flags);
+ 
+-	if (mddev->queue) {
+-		int stripe = conf->geo.raid_disks *
+-			((mddev->chunk_sectors << 9) / PAGE_SIZE);
+-
+-		/* Calculate max read-ahead size.
+-		 * We need to readahead at least twice a whole stripe....
+-		 * maybe...
+-		 */
+-		stripe /= conf->geo.near_copies;
+-		if (mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+-			mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
+-	}
+-
+ 	if (md_integrity_register(mddev))
+ 		goto out_free_conf;
+ 
+@@ -4757,17 +4744,8 @@ static void end_reshape(struct r10conf *conf)
+ 	conf->reshape_safe = MaxSector;
+ 	spin_unlock_irq(&conf->device_lock);
+ 
+-	/* read-ahead size must cover two whole stripes, which is
+-	 * 2 * (datadisks) * chunksize where 'n' is the number of raid devices
+-	 */
+-	if (conf->mddev->queue) {
+-		int stripe = conf->geo.raid_disks *
+-			((conf->mddev->chunk_sectors << 9) / PAGE_SIZE);
+-		stripe /= conf->geo.near_copies;
+-		if (conf->mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+-			conf->mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
++	if (conf->mddev->queue)
+ 		raid10_set_io_opt(conf);
+-	}
+ 	conf->fullsync = 0;
+ }
+ 
+diff --git a/drivers/md/raid5.c b/drivers/md/raid5.c
+index 9b6cfe0a7313..ee258e6c9853 100644
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@ -7553,8 +7553,6 @@ static int raid5_run(struct mddev *mddev)
+ 		int data_disks = conf->previous_raid_disks - conf->max_degraded;
+ 		int stripe = data_disks *
+ 			((mddev->chunk_sectors << 9) / PAGE_SIZE);
+-		if (mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+-			mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
+ 
+ 		chunk_size = mddev->chunk_sectors << 9;
+ 		blk_queue_io_min(mddev->queue, chunk_size);
+@@ -8142,17 +8140,8 @@ static void end_reshape(struct r5conf *conf)
+ 		spin_unlock_irq(&conf->device_lock);
+ 		wake_up(&conf->wait_for_overlap);
+ 
+-		/* read-ahead size must cover two whole stripes, which is
+-		 * 2 * (datadisks) * chunksize where 'n' is the number of raid devices
+-		 */
+-		if (conf->mddev->queue) {
+-			int data_disks = conf->raid_disks - conf->max_degraded;
+-			int stripe = data_disks * ((conf->chunk_sectors << 9)
+-						   / PAGE_SIZE);
+-			if (conf->mddev->queue->backing_dev_info->ra_pages < 2 * stripe)
+-				conf->mddev->queue->backing_dev_info->ra_pages = 2 * stripe;
++		if (conf->mddev->queue)
+ 			raid5_set_io_opt(conf);
+-		}
+ 	}
+ }
+ 
+* Unmerged path drivers/nvme/host/core.c
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index 69b3d02ca933..7f4794c8d168 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -1140,6 +1140,7 @@ extern void blk_queue_max_zone_append_sectors(struct request_queue *q,
+ extern void blk_queue_physical_block_size(struct request_queue *, unsigned int);
+ extern void blk_queue_alignment_offset(struct request_queue *q,
+ 				       unsigned int alignment);
++void blk_queue_update_readahead(struct request_queue *q);
+ extern void blk_limits_io_min(struct queue_limits *limits, unsigned int min);
+ extern void blk_queue_io_min(struct request_queue *q, unsigned int min);
+ extern void blk_limits_io_opt(struct queue_limits *limits, unsigned int opt);
