@@ -873,13 +873,12 @@ errout:
 static struct in_ifaddr *find_matching_ifa(struct in_ifaddr *ifa)
 {
 	struct in_device *in_dev = ifa->ifa_dev;
-	struct in_ifaddr *ifa1, **ifap;
+	struct in_ifaddr *ifa1;
 
 	if (!ifa->ifa_local)
 		return NULL;
 
-	for (ifap = &in_dev->ifa_list; (ifa1 = *ifap) != NULL;
-	     ifap = &ifa1->ifa_next) {
+	in_dev_for_each_ifa_rtnl(ifa1, in_dev) {
 		if (ifa1->ifa_mask == ifa->ifa_mask &&
 		    inet_ifa_match(ifa1->ifa_address, ifa) &&
 		    ifa1->ifa_local == ifa->ifa_local)
@@ -1207,7 +1206,7 @@ out:
 static int inet_gifconf(struct net_device *dev, char __user *buf, int len, int size)
 {
 	struct in_device *in_dev = __in_dev_get_rtnl(dev);
-	struct in_ifaddr *ifa;
+	const struct in_ifaddr *ifa;
 	struct ifreq ifr;
 	int done = 0;
 
@@ -1217,7 +1216,7 @@ static int inet_gifconf(struct net_device *dev, char __user *buf, int len, int s
 	if (!in_dev)
 		goto out;
 
-	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next) {
+	in_dev_for_each_ifa_rtnl(ifa, in_dev) {
 		if (!buf) {
 			done += size;
 			continue;
@@ -1320,10 +1319,11 @@ EXPORT_SYMBOL(inet_select_addr);
 static __be32 confirm_addr_indev(struct in_device *in_dev, __be32 dst,
 			      __be32 local, int scope)
 {
-	int same = 0;
+	const struct in_ifaddr *ifa;
 	__be32 addr = 0;
+	int same = 0;
 
-	for_ifa(in_dev) {
+	in_dev_for_each_ifa_rcu(ifa, in_dev) {
 		if (!addr &&
 		    (local == ifa->ifa_local || !local) &&
 		    ifa->ifa_scope <= scope) {
@@ -1349,7 +1349,7 @@ static __be32 confirm_addr_indev(struct in_device *in_dev, __be32 dst,
 				same = 0;
 			}
 		}
-	} endfor_ifa(in_dev);
+	}
 
 	return same ? addr : 0;
 }
@@ -1423,7 +1423,7 @@ static void inetdev_changename(struct net_device *dev, struct in_device *in_dev)
 	struct in_ifaddr *ifa;
 	int named = 0;
 
-	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next) {
+	in_dev_for_each_ifa_rtnl(ifa, in_dev) {
 		char old[IFNAMSIZ], *dot;
 
 		memcpy(old, ifa->ifa_label, IFNAMSIZ);
@@ -1453,10 +1453,9 @@ static void inetdev_send_gratuitous_arp(struct net_device *dev,
 					struct in_device *in_dev)
 
 {
-	struct in_ifaddr *ifa;
+	const struct in_ifaddr *ifa;
 
-	for (ifa = in_dev->ifa_list; ifa;
-	     ifa = ifa->ifa_next) {
+	in_dev_for_each_ifa_rtnl(ifa, in_dev) {
 		arp_send(ARPOP_REQUEST, ETH_P_ARP,
 			 ifa->ifa_local, dev,
 			 ifa->ifa_local, NULL,
@@ -1726,15 +1725,17 @@ static int in_dev_dump_addr(struct in_device *in_dev, struct sk_buff *skb,
 	int ip_idx = 0;
 	int err;
 
-	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next, ip_idx++) {
-		if (ip_idx < s_ip_idx)
+	in_dev_for_each_ifa_rcu(ifa, in_dev) {
+		if (ip_idx < s_ip_idx) {
+			ip_idx++;
 			continue;
-
+		}
 		err = inet_fill_ifaddr(skb, ifa, fillargs);
 		if (err < 0)
 			goto done;
 
 		nl_dump_check_consistent(cb, nlmsg_hdr(skb));
+		ip_idx++;
 	}
 	err = 0;
 
