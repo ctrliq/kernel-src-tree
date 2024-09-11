@@ -1,0 +1,102 @@
+sched: Limit the amount of NUMA imbalance that can exist at fork time
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 23e6082a522e32232f7377540b4d42d8304253b8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/23e6082a.failed
+
+At fork time currently, a local node can be allowed to fill completely
+and allow the periodic load balancer to fix the problem. This can be
+problematic in cases where a task creates lots of threads that idle until
+woken as part of a worker poll causing a memory bandwidth problem.
+
+However, a "real" workload suffers badly from this behaviour. The workload
+in question is mostly NUMA aware but spawns large numbers of threads
+that act as a worker pool that can be called from anywhere. These need
+to spread early to get reasonable behaviour.
+
+This patch limits how much a local node can fill before spilling over
+to another node and it will not be a universal win. Specifically,
+very short-lived workloads that fit within a NUMA node would prefer
+the memory bandwidth.
+
+As I cannot describe the "real" workload, the best proxy measure I found
+for illustration was a page fault microbenchmark. It's not representative
+of the workload but demonstrates the hazard of the current behaviour.
+
+pft timings
+                                 5.10.0-rc2             5.10.0-rc2
+                          imbalancefloat-v2          forkspread-v2
+Amean     elapsed-1        46.37 (   0.00%)       46.05 *   0.69%*
+Amean     elapsed-4        12.43 (   0.00%)       12.49 *  -0.47%*
+Amean     elapsed-7         7.61 (   0.00%)        7.55 *   0.81%*
+Amean     elapsed-12        4.79 (   0.00%)        4.80 (  -0.17%)
+Amean     elapsed-21        3.13 (   0.00%)        2.89 *   7.74%*
+Amean     elapsed-30        3.65 (   0.00%)        2.27 *  37.62%*
+Amean     elapsed-48        3.08 (   0.00%)        2.13 *  30.69%*
+Amean     elapsed-79        2.00 (   0.00%)        1.90 *   4.95%*
+Amean     elapsed-80        2.00 (   0.00%)        1.90 *   4.70%*
+
+This is showing the time to fault regions belonging to threads. The target
+machine has 80 logical CPUs and two nodes. Note the ~30% gain when the
+machine is approximately the point where one node becomes fully utilised.
+The slower results are borderline noise.
+
+Kernel building shows similar benefits around the same balance point.
+Generally performance was either neutral or better in the tests conducted.
+The main consideration with this patch is the point where fork stops
+spreading a task so some workloads may benefit from different balance
+points but it would be a risky tuning parameter.
+
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Vincent Guittot <vincent.guittot@linaro.org>
+Link: https://lkml.kernel.org/r/20201120090630.3286-5-mgorman@techsingularity.net
+(cherry picked from commit 23e6082a522e32232f7377540b4d42d8304253b8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/fair.c
+diff --cc kernel/sched/fair.c
+index f6a2a903388f,2e8aadeac3a7..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -8904,21 -9007,19 +8914,30 @@@ next_group
+  
+  #define NUMA_IMBALANCE_MIN 2
+  
+ -static inline long adjust_numa_imbalance(int imbalance,
+ -				int dst_running, int dst_weight)
+ +static inline long adjust_numa_imbalance(int imbalance, int dst_running)
+  {
+++<<<<<<< HEAD
+ +/* RHEL only: This is crippled because it causes performance losses on some 
+ + * workloads. */
+ +#if 0
+ +	unsigned int imbalance_min;
+++=======
++ 	if (!allow_numa_imbalance(dst_running, dst_weight))
++ 		return imbalance;
+++>>>>>>> 23e6082a522e (sched: Limit the amount of NUMA imbalance that can exist at fork time)
+  
+  	/*
+  	 * Allow a small imbalance based on a simple pair of communicating
+ -	 * tasks that remain local when the destination is lightly loaded.
+ +	 * tasks that remain local when the source domain is almost idle.
+  	 */
+++<<<<<<< HEAD
+ +	imbalance_min = NUMA_IMBALANCE_MIN;
+ +	if (dst_running <= imbalance_min)
+++=======
++ 	if (imbalance <= NUMA_IMBALANCE_MIN)
+++>>>>>>> 23e6082a522e (sched: Limit the amount of NUMA imbalance that can exist at fork time)
+  		return 0;
+ -
+ +#endif
+  	return imbalance;
+  }
+  
+* Unmerged path kernel/sched/fair.c
