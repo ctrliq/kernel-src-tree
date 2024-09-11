@@ -1,0 +1,116 @@
+io_uring: fix lockup with timeouts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit f0e20b8943509d81200cef5e30af2adfddba0f5c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f0e20b89.failed
+
+There is a recipe to deadlock the kernel: submit a timeout sqe with a
+linked_timeout (e.g.  test_single_link_timeout_ception() from liburing),
+and SIGKILL the process.
+
+Then, io_kill_timeouts() takes @ctx->completion_lock, but the timeout
+isn't flagged with REQ_F_COMP_LOCKED, and will try to double grab it
+during io_put_free() to cancel the linked timeout. Probably, the same
+can happen with another io_kill_timeout() call site, that is
+io_commit_cqring().
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit f0e20b8943509d81200cef5e30af2adfddba0f5c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,c06082bb039a..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -466,21 -926,94 +466,73 @@@ static void __io_commit_cqring(struct i
+  	}
+  }
+  
+ -static inline bool io_prep_async_work(struct io_kiocb *req,
+ -				      struct io_kiocb **link)
+ +static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ +				       struct io_kiocb *req)
+  {
+ -	const struct io_op_def *def = &io_op_defs[req->opcode];
+ -	bool do_hashed = false;
+ +	int rw = 0;
+  
+ -	if (req->flags & REQ_F_ISREG) {
+ -		if (def->hash_reg_file)
+ -			do_hashed = true;
+ -	} else {
+ -		if (def->unbound_nonreg_file)
+ -			req->work.flags |= IO_WQ_WORK_UNBOUND;
+ +	if (req->submit.sqe) {
+ +		switch (req->submit.sqe->opcode) {
+ +		case IORING_OP_WRITEV:
+ +		case IORING_OP_WRITE_FIXED:
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+ +			break;
+ +		}
+  	}
+  
+++<<<<<<< HEAD
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+++=======
++ 	io_req_work_grab_env(req, def);
++ 
++ 	*link = io_prep_linked_timeout(req);
++ 	return do_hashed;
++ }
++ 
++ static inline void io_queue_async_work(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *link;
++ 	bool do_hashed;
++ 
++ 	do_hashed = io_prep_async_work(req, &link);
++ 
++ 	trace_io_uring_queue_async_work(ctx, do_hashed, req, &req->work,
++ 					req->flags);
++ 	if (!do_hashed) {
++ 		io_wq_enqueue(ctx->io_wq, &req->work);
++ 	} else {
++ 		io_wq_enqueue_hashed(ctx->io_wq, &req->work,
++ 					file_inode(req->file));
++ 	}
++ 
++ 	if (link)
++ 		io_queue_linked_timeout(link);
++ }
++ 
++ static void io_kill_timeout(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
++ 	if (ret != -1) {
++ 		atomic_inc(&req->ctx->cq_timeouts);
++ 		list_del_init(&req->list);
++ 		req->flags |= REQ_F_COMP_LOCKED;
++ 		io_cqring_fill_event(req, 0);
++ 		io_put_req(req);
++ 	}
++ }
++ 
++ static void io_kill_timeouts(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req, *tmp;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
++ 		io_kill_timeout(req);
++ 	spin_unlock_irq(&ctx->completion_lock);
+++>>>>>>> f0e20b894350 (io_uring: fix lockup with timeouts)
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+* Unmerged path fs/io_uring.c
