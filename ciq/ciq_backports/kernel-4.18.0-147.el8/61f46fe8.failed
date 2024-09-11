@@ -1,0 +1,291 @@
+vxlan: Allow vetoing of FDB notifications
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Petr Machata <petrm@mellanox.com>
+commit 61f46fe8c646c1cc7810ee0963d7870b6d901a96
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/61f46fe8.failed
+
+Change vxlan_fdb_switchdev_call_notifiers() to return the result from
+calling switchdev notifiers. Propagate the error number up the stack.
+
+In vxlan_fdb_update_existing() and vxlan_fdb_update_create() add
+rollbacks to clean up the work that was done before the veto.
+
+	Signed-off-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 61f46fe8c646c1cc7810ee0963d7870b6d901a96)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/vxlan.c
+diff --cc drivers/net/vxlan.c
+index 4ecaa83ef765,92904ee16053..000000000000
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@@ -355,10 -358,27 +355,34 @@@ errout
+  		rtnl_set_sk_err(net, RTNLGRP_NEIGH, err);
+  }
+  
+++<<<<<<< HEAD
+ +static void vxlan_fdb_switchdev_call_notifiers(struct vxlan_dev *vxlan,
+ +					       struct vxlan_fdb *fdb,
+ +					       struct vxlan_rdst *rd,
+ +					       bool adding)
+++=======
++ static void vxlan_fdb_switchdev_notifier_info(const struct vxlan_dev *vxlan,
++ 			    const struct vxlan_fdb *fdb,
++ 			    const struct vxlan_rdst *rd,
++ 			    struct switchdev_notifier_vxlan_fdb_info *fdb_info)
++ {
++ 	fdb_info->info.dev = vxlan->dev;
++ 	fdb_info->info.extack = NULL;
++ 	fdb_info->remote_ip = rd->remote_ip;
++ 	fdb_info->remote_port = rd->remote_port;
++ 	fdb_info->remote_vni = rd->remote_vni;
++ 	fdb_info->remote_ifindex = rd->remote_ifindex;
++ 	memcpy(fdb_info->eth_addr, fdb->eth_addr, ETH_ALEN);
++ 	fdb_info->vni = fdb->vni;
++ 	fdb_info->offloaded = rd->offloaded;
++ 	fdb_info->added_by_user = fdb->flags & NTF_VXLAN_ADDED_BY_USER;
++ }
++ 
++ static int vxlan_fdb_switchdev_call_notifiers(struct vxlan_dev *vxlan,
++ 					      struct vxlan_fdb *fdb,
++ 					      struct vxlan_rdst *rd,
++ 					      bool adding)
+++>>>>>>> 61f46fe8c646 (vxlan: Allow vetoing of FDB notifications)
+  {
+  	struct switchdev_notifier_vxlan_fdb_info info;
+  	enum switchdev_notifier_type notifier_type;
+@@@ -368,31 -389,30 +393,58 @@@
+  
+  	notifier_type = adding ? SWITCHDEV_VXLAN_FDB_ADD_TO_DEVICE
+  			       : SWITCHDEV_VXLAN_FDB_DEL_TO_DEVICE;
+++<<<<<<< HEAD
+ +
+ +	info = (struct switchdev_notifier_vxlan_fdb_info){
+ +		.remote_ip = rd->remote_ip,
+ +		.remote_port = rd->remote_port,
+ +		.remote_vni = rd->remote_vni,
+ +		.remote_ifindex = rd->remote_ifindex,
+ +		.vni = fdb->vni,
+ +		.offloaded = rd->offloaded,
+ +	};
+ +	memcpy(info.eth_addr, fdb->eth_addr, ETH_ALEN);
+ +
+ +	call_switchdev_notifiers(notifier_type, vxlan->dev,
+ +				 &info.info);
+ +}
+ +
+ +static void vxlan_fdb_notify(struct vxlan_dev *vxlan, struct vxlan_fdb *fdb,
+ +			     struct vxlan_rdst *rd, int type)
+ +{
+ +	switch (type) {
+ +	case RTM_NEWNEIGH:
+ +		vxlan_fdb_switchdev_call_notifiers(vxlan, fdb, rd, true);
+ +		break;
+ +	case RTM_DELNEIGH:
+ +		vxlan_fdb_switchdev_call_notifiers(vxlan, fdb, rd, false);
+ +		break;
+++=======
++ 	vxlan_fdb_switchdev_notifier_info(vxlan, fdb, rd, &info);
++ 	ret = call_switchdev_notifiers(notifier_type, vxlan->dev,
++ 				       &info.info);
++ 	return notifier_to_errno(ret);
++ }
++ 
++ static int vxlan_fdb_notify(struct vxlan_dev *vxlan, struct vxlan_fdb *fdb,
++ 			    struct vxlan_rdst *rd, int type, bool swdev_notify)
++ {
++ 	int err;
++ 
++ 	if (swdev_notify) {
++ 		switch (type) {
++ 		case RTM_NEWNEIGH:
++ 			err = vxlan_fdb_switchdev_call_notifiers(vxlan, fdb, rd,
++ 								 true);
++ 			if (err)
++ 				return err;
++ 			break;
++ 		case RTM_DELNEIGH:
++ 			vxlan_fdb_switchdev_call_notifiers(vxlan, fdb, rd,
++ 							   false);
++ 			break;
++ 		}
+++>>>>>>> 61f46fe8c646 (vxlan: Allow vetoing of FDB notifications)
+  	}
+  
+  	__vxlan_fdb_notify(vxlan, fdb, rd, type);
+@@@ -934,6 -863,147 +987,150 @@@ static void vxlan_fdb_destroy(struct vx
+  	call_rcu(&f->rcu, vxlan_fdb_free);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int vxlan_fdb_update_existing(struct vxlan_dev *vxlan,
++ 				     union vxlan_addr *ip,
++ 				     __u16 state, __u16 flags,
++ 				     __be16 port, __be32 vni,
++ 				     __u32 ifindex, __u16 ndm_flags,
++ 				     struct vxlan_fdb *f,
++ 				     bool swdev_notify)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_rdst *rd = NULL;
++ 	struct vxlan_rdst oldrd;
++ 	int notify = 0;
++ 	int rc = 0;
++ 	int err;
++ 
++ 	/* Do not allow an externally learned entry to take over an entry added
++ 	 * by the user.
++ 	 */
++ 	if (!(fdb_flags & NTF_EXT_LEARNED) ||
++ 	    !(f->flags & NTF_VXLAN_ADDED_BY_USER)) {
++ 		if (f->state != state) {
++ 			f->state = state;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 		if (f->flags != fdb_flags) {
++ 			f->flags = fdb_flags;
++ 			f->updated = jiffies;
++ 			notify = 1;
++ 		}
++ 	}
++ 
++ 	if ((flags & NLM_F_REPLACE)) {
++ 		/* Only change unicasts */
++ 		if (!(is_multicast_ether_addr(f->eth_addr) ||
++ 		      is_zero_ether_addr(f->eth_addr))) {
++ 			rc = vxlan_fdb_replace(f, ip, port, vni,
++ 					       ifindex, &oldrd);
++ 			notify |= rc;
++ 		} else {
++ 			return -EOPNOTSUPP;
++ 		}
++ 	}
++ 	if ((flags & NLM_F_APPEND) &&
++ 	    (is_multicast_ether_addr(f->eth_addr) ||
++ 	     is_zero_ether_addr(f->eth_addr))) {
++ 		rc = vxlan_fdb_append(f, ip, port, vni, ifindex, &rd);
++ 
++ 		if (rc < 0)
++ 			return rc;
++ 		notify |= rc;
++ 	}
++ 
++ 	if (ndm_flags & NTF_USE)
++ 		f->used = jiffies;
++ 
++ 	if (notify) {
++ 		if (rd == NULL)
++ 			rd = first_remote_rtnl(f);
++ 
++ 		err = vxlan_fdb_notify(vxlan, f, rd, RTM_NEWNEIGH,
++ 				       swdev_notify);
++ 		if (err)
++ 			goto err_notify;
++ 	}
++ 
++ 	return 0;
++ 
++ err_notify:
++ 	if ((flags & NLM_F_REPLACE) && rc)
++ 		*rd = oldrd;
++ 	else if ((flags & NLM_F_APPEND) && rc)
++ 		list_del_rcu(&rd->list);
++ 	return err;
++ }
++ 
++ static int vxlan_fdb_update_create(struct vxlan_dev *vxlan,
++ 				   const u8 *mac, union vxlan_addr *ip,
++ 				   __u16 state, __u16 flags,
++ 				   __be16 port, __be32 src_vni, __be32 vni,
++ 				   __u32 ifindex, __u16 ndm_flags,
++ 				   bool swdev_notify)
++ {
++ 	__u16 fdb_flags = (ndm_flags & ~NTF_USE);
++ 	struct vxlan_fdb *f;
++ 	int rc;
++ 
++ 	/* Disallow replace to add a multicast entry */
++ 	if ((flags & NLM_F_REPLACE) &&
++ 	    (is_multicast_ether_addr(mac) || is_zero_ether_addr(mac)))
++ 		return -EOPNOTSUPP;
++ 
++ 	netdev_dbg(vxlan->dev, "add %pM -> %pIS\n", mac, ip);
++ 	rc = vxlan_fdb_create(vxlan, mac, ip, state, port, src_vni,
++ 			      vni, ifindex, fdb_flags, &f);
++ 	if (rc < 0)
++ 		return rc;
++ 
++ 	rc = vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f), RTM_NEWNEIGH,
++ 			      swdev_notify);
++ 	if (rc)
++ 		goto err_notify;
++ 
++ 	return 0;
++ 
++ err_notify:
++ 	vxlan_fdb_destroy(vxlan, f, false, false);
++ 	return rc;
++ }
++ 
++ /* Add new entry to forwarding table -- assumes lock held */
++ static int vxlan_fdb_update(struct vxlan_dev *vxlan,
++ 			    const u8 *mac, union vxlan_addr *ip,
++ 			    __u16 state, __u16 flags,
++ 			    __be16 port, __be32 src_vni, __be32 vni,
++ 			    __u32 ifindex, __u16 ndm_flags,
++ 			    bool swdev_notify)
++ {
++ 	struct vxlan_fdb *f;
++ 
++ 	f = __vxlan_find_mac(vxlan, mac, src_vni);
++ 	if (f) {
++ 		if (flags & NLM_F_EXCL) {
++ 			netdev_dbg(vxlan->dev,
++ 				   "lost race to create %pM\n", mac);
++ 			return -EEXIST;
++ 		}
++ 
++ 		return vxlan_fdb_update_existing(vxlan, ip, state, flags, port,
++ 						 vni, ifindex, ndm_flags, f,
++ 						 swdev_notify);
++ 	} else {
++ 		if (!(flags & NLM_F_CREATE))
++ 			return -ENOENT;
++ 
++ 		return vxlan_fdb_update_create(vxlan, mac, ip, state, flags,
++ 					       port, src_vni, vni, ifindex,
++ 					       ndm_flags, swdev_notify);
++ 	}
++ }
++ 
+++>>>>>>> 61f46fe8c646 (vxlan: Allow vetoing of FDB notifications)
+  static void vxlan_dst_free(struct rcu_head *head)
+  {
+  	struct vxlan_rdst *rd = container_of(head, struct vxlan_rdst, rcu);
+@@@ -3369,8 -3540,12 +3566,17 @@@ static int __vxlan_dev_create(struct ne
+  		goto errout;
+  
+  	/* notify default fdb entry */
+++<<<<<<< HEAD
+ +	if (f)
+ +		vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f), RTM_NEWNEIGH);
+++=======
++ 	if (f) {
++ 		err = vxlan_fdb_notify(vxlan, f, first_remote_rtnl(f),
++ 				       RTM_NEWNEIGH, true);
++ 		if (err)
++ 			goto errout;
++ 	}
+++>>>>>>> 61f46fe8c646 (vxlan: Allow vetoing of FDB notifications)
+  
+  	list_add(&vxlan->next, &vn->vxlan_list);
+  	return 0;
+* Unmerged path drivers/net/vxlan.c
