@@ -1,0 +1,183 @@
+net: sched: unlock rules update API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] sched: unlock rules update API (Ivan Vecera) [1688236 1687456]
+Rebuild_FUZZ: 92.31%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 470502de5bdb1ed0def643a4458593a40b8f6b66
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/470502de.failed
+
+Register netlink protocol handlers for message types RTM_NEWTFILTER,
+RTM_DELTFILTER, RTM_GETTFILTER as unlocked. Set rtnl_held variable that
+tracks rtnl mutex state to be false by default.
+
+Introduce tcf_proto_is_unlocked() helper that is used to check
+tcf_proto_ops->flag to determine if ops can be called without taking rtnl
+lock. Manually lookup Qdisc, class and block in rule update handlers.
+Verify that both Qdisc ops and proto ops are unlocked before using any of
+their callbacks, and obtain rtnl lock otherwise.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 470502de5bdb1ed0def643a4458593a40b8f6b66)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_api.c
+diff --cc net/sched/cls_api.c
+index e9697b633bb0,266fcb34fefe..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -152,8 -163,26 +152,25 @@@ static inline u32 tcf_auto_prio(struct 
+  	return TC_H_MAJ(first);
+  }
+  
++ static bool tcf_proto_is_unlocked(const char *kind)
++ {
++ 	const struct tcf_proto_ops *ops;
++ 	bool ret;
++ 
++ 	ops = tcf_proto_lookup_ops(kind, false, NULL);
++ 	/* On error return false to take rtnl lock. Proto lookup/create
++ 	 * functions will perform lookup again and properly handle errors.
++ 	 */
++ 	if (IS_ERR(ops))
++ 		return false;
++ 
++ 	ret = !!(ops->flags & TCF_PROTO_OPS_DOIT_UNLOCKED);
++ 	module_put(ops->owner);
++ 	return ret;
++ }
++ 
+  static struct tcf_proto *tcf_proto_create(const char *kind, u32 protocol,
+  					  u32 prio, struct tcf_chain *chain,
+ -					  bool rtnl_held,
+  					  struct netlink_ext_ack *extack)
+  {
+  	struct tcf_proto *tp;
+@@@ -1293,13 -1323,18 +1310,17 @@@ errout
+  	return ERR_PTR(err);
+  }
+  
+ -static void tcf_block_release(struct Qdisc *q, struct tcf_block *block,
+ -			      bool rtnl_held)
+ +static void tcf_block_release(struct Qdisc *q, struct tcf_block *block)
+  {
+  	if (!IS_ERR_OR_NULL(block))
+ -		tcf_block_refcnt_put(block, rtnl_held);
+ +		tcf_block_refcnt_put(block);
+  
+- 	if (q)
+- 		qdisc_put(q);
++ 	if (q) {
++ 		if (rtnl_held)
++ 			qdisc_put(q);
++ 		else
++ 			qdisc_put_unlocked(q);
++ 	}
+  }
+  
+  struct tcf_block_owner_item {
+@@@ -1945,6 -1987,7 +1966,10 @@@ static int tc_new_tfilter(struct sk_buf
+  	void *fh;
+  	int err;
+  	int tp_created;
+++<<<<<<< HEAD
+++=======
++ 	bool rtnl_held = false;
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  
+  	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
+  		return -EPERM;
+@@@ -2098,10 -2163,19 +2143,24 @@@ errout_tp
+  		if (!tp_created)
+  			tcf_chain_put(chain);
+  	}
+++<<<<<<< HEAD
+ +	tcf_block_release(q, block);
+ +	if (err == -EAGAIN)
+++=======
++ 	tcf_block_release(q, block, rtnl_held);
++ 
++ 	if (rtnl_held)
++ 		rtnl_unlock();
++ 
++ 	if (err == -EAGAIN) {
++ 		/* Take rtnl lock in case EAGAIN is caused by concurrent flush
++ 		 * of target chain.
++ 		 */
++ 		rtnl_held = true;
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  		/* Replay the request. */
+  		goto replay;
++ 	}
+  	return err;
+  
+  errout_locked:
+@@@ -2127,6 -2201,7 +2186,10 @@@ static int tc_del_tfilter(struct sk_buf
+  	unsigned long cl = 0;
+  	void *fh = NULL;
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	bool rtnl_held = false;
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  
+  	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN))
+  		return -EPERM;
+@@@ -2225,10 -2320,14 +2307,18 @@@
+  errout:
+  	if (chain) {
+  		if (tp && !IS_ERR(tp))
+ -			tcf_proto_put(tp, rtnl_held, NULL);
+ +			tcf_proto_put(tp, NULL);
+  		tcf_chain_put(chain);
+  	}
+++<<<<<<< HEAD
+ +	tcf_block_release(q, block);
+++=======
++ 	tcf_block_release(q, block, rtnl_held);
++ 
++ 	if (rtnl_held)
++ 		rtnl_unlock();
++ 
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  	return err;
+  
+  errout_locked:
+@@@ -2254,6 -2353,7 +2344,10 @@@ static int tc_get_tfilter(struct sk_buf
+  	unsigned long cl = 0;
+  	void *fh = NULL;
+  	int err;
+++<<<<<<< HEAD
+++=======
++ 	bool rtnl_held = false;
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  
+  	err = nlmsg_parse(n, sizeof(*t), tca, TCA_MAX, rtm_tca_policy, extack);
+  	if (err < 0)
+@@@ -2321,10 -2439,14 +2433,18 @@@
+  errout:
+  	if (chain) {
+  		if (tp && !IS_ERR(tp))
+ -			tcf_proto_put(tp, rtnl_held, NULL);
+ +			tcf_proto_put(tp, NULL);
+  		tcf_chain_put(chain);
+  	}
+++<<<<<<< HEAD
+ +	tcf_block_release(q, block);
+++=======
++ 	tcf_block_release(q, block, rtnl_held);
++ 
++ 	if (rtnl_held)
++ 		rtnl_unlock();
++ 
+++>>>>>>> 470502de5bdb (net: sched: unlock rules update API)
+  	return err;
+  }
+  
+* Unmerged path net/sched/cls_api.c
