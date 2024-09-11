@@ -929,10 +929,8 @@ generic_make_request_checks(struct bio *bio)
 	if (unlikely(!current->io_context))
 		create_task_io_context(current, GFP_ATOMIC, q->node);
 
-	if (blk_throtl_bio(bio)) {
-		blkcg_bio_issue_init(bio);
+	if (blk_throtl_bio(bio))
 		return false;
-	}
 
 	blk_cgroup_bio_start(bio);
 	blkcg_bio_issue_init(bio);
