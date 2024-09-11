@@ -1667,6 +1667,14 @@ void sev_vm_destroy(struct kvm *kvm)
 	sev_asid_free(sev->asid);
 }
 
+void __init sev_set_cpu_caps(void)
+{
+	if (!sev)
+		kvm_cpu_cap_clear(X86_FEATURE_SEV);
+	if (!sev_es)
+		kvm_cpu_cap_clear(X86_FEATURE_SEV_ES);
+}
+
 void __init sev_hardware_setup(void)
 {
 	unsigned int eax, ebx, ecx, edx;
