@@ -1,0 +1,157 @@
+hugetlbfs: Use i_mmap_rwsem to address page fault/truncate race
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit 87bf91d39bb52b688fb411d668fbe7df278b29ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/87bf91d3.failed
+
+hugetlbfs page faults can race with truncate and hole punch operations.
+Current code in the page fault path attempts to handle this by 'backing
+out' operations if we encounter the race.  One obvious omission in the
+current code is removing a page newly added to the page cache.  This is
+pretty straight forward to address, but there is a more subtle and
+difficult issue of backing out hugetlb reservations.  To handle this
+correctly, the 'reservation state' before page allocation needs to be
+noted so that it can be properly backed out.  There are four distinct
+possibilities for reservation state: shared/reserved, shared/no-resv,
+private/reserved and private/no-resv.  Backing out a reservation may
+require memory allocation which could fail so that needs to be taken
+into account as well.
+
+Instead of writing the required complicated code for this rare
+occurrence, just eliminate the race.  i_mmap_rwsem is now held in read
+mode for the duration of page fault processing.  Hold i_mmap_rwsem in
+write mode when modifying i_size.  In this way, truncation can not
+proceed when page faults are being processed.  In addition, i_size
+will not change during fault processing so a single check can be made
+to ensure faults are not beyond (proposed) end of file.  Faults can
+still race with hole punch, but that race is handled by existing code
+and the use of hugetlb_fault_mutex.
+
+With this modification, checks for races with truncation in the page
+fault path can be simplified and removed.  remove_inode_hugepages no
+longer needs to take hugetlb_fault_mutex in the case of truncation.
+Comments are expanded to explain reasoning behind locking.
+
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Davidlohr Bueso <dave@stgolabs.net>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Naoya Horiguchi <n-horiguchi@ah.jp.nec.com>
+	Cc: Prakash Sangappa <prakash.sangappa@oracle.com>
+Link: http://lkml.kernel.org/r/20200316205756.146666-3-mike.kravetz@oracle.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 87bf91d39bb52b688fb411d668fbe7df278b29ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 75fa4469cb29,e1c523dba80a..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -4223,8 -4146,24 +4220,22 @@@ vm_fault_t hugetlb_fault(struct mm_stru
+  			return VM_FAULT_OOM;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Acquire i_mmap_rwsem before calling huge_pte_alloc and hold
++ 	 * until finished with ptep.  This serves two purposes:
++ 	 * 1) It prevents huge_pmd_unshare from being called elsewhere
++ 	 *    and making the ptep no longer valid.
++ 	 * 2) It synchronizes us with i_size modifications during truncation.
++ 	 *
++ 	 * ptep could have already be assigned via huge_pte_offset.  That
++ 	 * is OK, as huge_pte_alloc will return the same value unless
++ 	 * something has changed.
++ 	 */
+++>>>>>>> 87bf91d39bb5 (hugetlbfs: Use i_mmap_rwsem to address page fault/truncate race)
+  	mapping = vma->vm_file->f_mapping;
+ -	i_mmap_lock_read(mapping);
+ -	ptep = huge_pte_alloc(mm, haddr, huge_page_size(h));
+ -	if (!ptep) {
+ -		i_mmap_unlock_read(mapping);
+ -		return VM_FAULT_OOM;
+ -	}
+ +	idx = vma_hugecache_offset(h, vma, haddr);
+  
+  	/*
+  	 * Serialize hugepage allocation and instantiation, so that we don't
+diff --git a/fs/hugetlbfs/inode.c b/fs/hugetlbfs/inode.c
+index 33cd497167db..d358339df1ed 100644
+--- a/fs/hugetlbfs/inode.c
++++ b/fs/hugetlbfs/inode.c
+@@ -393,10 +393,9 @@ hugetlb_vmdelete_list(struct rb_root_cached *root, pgoff_t start, pgoff_t end)
+  *	In this case, we first scan the range and release found pages.
+  *	After releasing pages, hugetlb_unreserve_pages cleans up region/reserv
+  *	maps and global counts.  Page faults can not race with truncation
+- *	in this routine.  hugetlb_no_page() prevents page faults in the
+- *	truncated range.  It checks i_size before allocation, and again after
+- *	with the page table lock for the page held.  The same lock must be
+- *	acquired to unmap a page.
++ *	in this routine.  hugetlb_no_page() holds i_mmap_rwsem and prevents
++ *	page faults in the truncated range by checking i_size.  i_size is
++ *	modified while holding i_mmap_rwsem.
+  * hole punch is indicated if end is not LLONG_MAX
+  *	In the hole punch case we scan the range and release found pages.
+  *	Only when releasing a page is the associated region/reserv map
+@@ -437,7 +436,15 @@ static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
+ 
+ 			index = page->index;
+ 			hash = hugetlb_fault_mutex_hash(mapping, index);
+-			mutex_lock(&hugetlb_fault_mutex_table[hash]);
++			if (!truncate_op) {
++				/*
++				 * Only need to hold the fault mutex in the
++				 * hole punch case.  This prevents races with
++				 * page faults.  Races are not possible in the
++				 * case of truncation.
++				 */
++				mutex_lock(&hugetlb_fault_mutex_table[hash]);
++			}
+ 
+ 			/*
+ 			 * If page is mapped, it was faulted in after being
+@@ -478,7 +485,8 @@ static void remove_inode_hugepages(struct inode *inode, loff_t lstart,
+ 			}
+ 
+ 			unlock_page(page);
+-			mutex_unlock(&hugetlb_fault_mutex_table[hash]);
++			if (!truncate_op)
++				mutex_unlock(&hugetlb_fault_mutex_table[hash]);
+ 		}
+ 		huge_pagevec_release(&pvec);
+ 		cond_resched();
+@@ -509,8 +517,8 @@ static int hugetlb_vmtruncate(struct inode *inode, loff_t offset)
+ 	BUG_ON(offset & ~huge_page_mask(h));
+ 	pgoff = offset >> PAGE_SHIFT;
+ 
+-	i_size_write(inode, offset);
+ 	i_mmap_lock_write(mapping);
++	i_size_write(inode, offset);
+ 	if (!RB_EMPTY_ROOT(&mapping->i_mmap.rb_root))
+ 		hugetlb_vmdelete_list(&mapping->i_mmap, pgoff, 0);
+ 	i_mmap_unlock_write(mapping);
+@@ -633,7 +641,11 @@ static long hugetlbfs_fallocate(struct file *file, int mode, loff_t offset,
+ 		/* addr is the offset within the file (zero based) */
+ 		addr = index * hpage_size;
+ 
+-		/* mutex taken here, fault path and hole punch */
++		/*
++		 * fault mutex taken here, protects against fault path
++		 * and hole punch.  inode_lock previously taken protects
++		 * against truncation.
++		 */
+ 		hash = hugetlb_fault_mutex_hash(mapping, index);
+ 		mutex_lock(&hugetlb_fault_mutex_table[hash]);
+ 
+* Unmerged path mm/hugetlb.c
