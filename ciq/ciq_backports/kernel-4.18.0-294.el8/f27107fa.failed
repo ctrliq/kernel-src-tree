@@ -1,0 +1,178 @@
+tracing/irqsoff: Handle preempt_count for different configs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit f27107fa20ad531ace5fd580473ff8dd0c6b9ca9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f27107fa.failed
+
+I was hitting the following warning:
+
+WARNING: CPU: 0 PID: 1 at kernel/trace/trace_irqsoff.c:631 tracer_hardirqs_off+0x15/0x2a
+
+Modules linked in:
+CPU: 0 PID: 1 Comm: swapper/0 Not tainted 4.18.0-rc6-test+ #13
+Hardware name: MSI MS-7823/CSM-H87M-G43 (MS-7823), BIOS V1.6 02/22/2014
+EIP: tracer_hardirqs_off+0x15/0x2a
+Code: ff 85 c0 74 0e 8b 45 00 8b 50 04 8b 45 04 e8 35 ff ff ff 5d c3 55 64 a1 cc 37 51 c1 a9 ff ff ff 7f 89 e5 53 89 d3 89 ca 75 02 <0f> 0b e8 90 fc ff ff 85 c0 74 07 89 d8 e8 0c ff ff ff 5b 5d c3 55
+EAX: 80000000 EBX: c04337f0 ECX: c04338e3 EDX: c04338e3
+ESI: c04337f0 EDI: c04338e3 EBP: f2aa1d68 ESP: f2aa1d64
+DS: 007b ES: 007b FS: 00d8 GS: 00e0 SS: 0068 EFLAGS: 00210046
+CR0: 80050033 CR2: 00000000 CR3: 01668000 CR4: 001406f0
+Call Trace:
+ trace_irq_disable_rcuidle+0x63/0x6c
+ trace_hardirqs_off+0x26/0x30
+ default_send_IPI_mask_allbutself_logical+0x31/0x93
+ default_send_IPI_allbutself+0x37/0x48
+ native_send_call_func_ipi+0x4d/0x6a
+ smp_call_function_many+0x165/0x19d
+ ? add_nops+0x34/0x34
+ ? trace_hardirqs_on_caller+0x2d/0x2d
+ ? add_nops+0x34/0x34
+ smp_call_function+0x1f/0x23
+ on_each_cpu+0x15/0x43
+ ? trace_hardirqs_on_caller+0x2d/0x2d
+ ? trace_hardirqs_on_caller+0x2d/0x2d
+ ? trace_irq_disable_rcuidle+0x1/0x6c
+ text_poke_bp+0xa0/0xc2
+ ? trace_hardirqs_on_caller+0x2d/0x2d
+ arch_jump_label_transform+0xa7/0xcb
+ ? trace_irq_disable_rcuidle+0x5/0x6c
+ __jump_label_update+0x3e/0x6d
+ jump_label_update+0x7d/0x81
+ static_key_slow_inc_cpuslocked+0x58/0x6d
+ static_key_slow_inc+0x19/0x20
+ tracepoint_probe_register_prio+0x19e/0x1d1
+ ? start_critical_timings+0x1c/0x1c
+ tracepoint_probe_register+0xf/0x11
+ irqsoff_tracer_init+0x21/0xf2
+ tracer_init+0x16/0x1a
+ trace_selftest_startup_irqsoff+0x25/0xc4
+ run_tracer_selftest+0xca/0x131
+ register_tracer+0xd5/0x172
+ ? trace_event_define_fields_preemptirq_template+0x45/0x45
+ init_irqsoff_tracer+0xd/0x11
+ do_one_initcall+0xab/0x1e8
+ ? rcu_read_lock_sched_held+0x3d/0x44
+ ? trace_initcall_level+0x52/0x86
+ kernel_init_freeable+0x195/0x21a
+ ? rest_init+0xb4/0xb4
+ kernel_init+0xd/0xe4
+ ret_from_fork+0x2e/0x38
+
+It is due to running a CONFIG_PREEMPT_VOLUNTARY kernel, which would trigger
+this warning every time:
+
+	WARN_ON_ONCE(preempt_count());
+
+Because on CONFIG_PREEMPT_VOLUNTARY, preempt_count() is always zero.
+
+This warning is to make sure preempt_count is set because
+tracer_hardirqs_on() does a preempt_enable_notrace() to make the
+preempt_trace() work properly, as being called by a trace event, the trace
+event code disables preemption, and the tracer wants to know what the
+preemption was before it was called.
+
+Instead of enabling preemption like this, just record the preempt_count,
+subtract PREEMPT_DISABLE_OFFSET from it (which is zero with !CONFIG_PREEMPT
+set), and pass that value to the necessary functions, which should use the
+passed in parameter instead of calling preempt_count() directly.
+
+Fixes: da5b3ebb45277 ("tracing: irqsoff: Account for additional preempt_disable")
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit f27107fa20ad531ace5fd580473ff8dd0c6b9ca9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/trace/trace_irqsoff.c
+diff --cc kernel/trace/trace_irqsoff.c
+index f8daa754cce2,4af990e9c594..000000000000
+--- a/kernel/trace/trace_irqsoff.c
++++ b/kernel/trace/trace_irqsoff.c
+@@@ -659,6 -602,47 +663,50 @@@ static void irqsoff_tracer_stop(struct 
+  }
+  
+  #ifdef CONFIG_IRQSOFF_TRACER
+++<<<<<<< HEAD
+++=======
++ /*
++  * We are only interested in hardirq on/off events:
++  */
++ static void tracer_hardirqs_on(void *none, unsigned long a0, unsigned long a1)
++ {
++ 	unsigned int pc = preempt_count();
++ 
++ 	/*
++ 	 * Tracepoint probes are expected to be called with preempt disabled,
++ 	 * We don't care about being called with preempt disabled but we need
++ 	 * to know in the future if that changes so we can remove the next
++ 	 * preempt_enable.
++ 	 */
++ 	WARN_ON_ONCE(pc < PREEMPT_DISABLE_OFFSET);
++ 
++ 	/* Use PREEMPT_DISABLE_OFFSET to handle !CONFIG_PREEMPT cases */
++ 	pc -= PREEMPT_DISABLE_OFFSET;
++ 
++ 	if (!preempt_trace(pc) && irq_trace())
++ 		stop_critical_timing(a0, a1, pc);
++ }
++ 
++ static void tracer_hardirqs_off(void *none, unsigned long a0, unsigned long a1)
++ {
++ 	unsigned int pc = preempt_count();
++ 
++ 	/*
++ 	 * Tracepoint probes are expected to be called with preempt disabled,
++ 	 * We don't care about being called with preempt disabled but we need
++ 	 * to know in the future if that changes so we can remove the next
++ 	 * preempt_enable.
++ 	 */
++ 	WARN_ON_ONCE(pc < PREEMPT_DISABLE_OFFSET);
++ 
++ 	/* Use PREEMPT_DISABLE_OFFSET to handle !CONFIG_PREEMPT cases */
++ 	pc -= PREEMPT_DISABLE_OFFSET;
++ 
++ 	if (!preempt_trace(pc) && irq_trace())
++ 		start_critical_timing(a0, a1, pc);
++ }
++ 
+++>>>>>>> f27107fa20ad (tracing/irqsoff: Handle preempt_count for different configs)
+  static int irqsoff_tracer_init(struct trace_array *tr)
+  {
+  	trace_type = TRACER_IRQS_OFF;
+@@@ -690,12 -678,25 +738,31 @@@ static struct tracer irqsoff_tracer __r
+  	.allow_instances = true,
+  	.use_max_tr	= true,
+  };
+ -#endif /*  CONFIG_IRQSOFF_TRACER */
+ +# define register_irqsoff(trace) register_tracer(&trace)
+ +#else
+ +# define register_irqsoff(trace) do { } while (0)
+ +#endif
+  
+  #ifdef CONFIG_PREEMPT_TRACER
+++<<<<<<< HEAD
+++=======
++ static void tracer_preempt_on(void *none, unsigned long a0, unsigned long a1)
++ {
++ 	int pc = preempt_count();
++ 
++ 	if (preempt_trace(pc) && !irq_trace())
++ 		stop_critical_timing(a0, a1, pc);
++ }
++ 
++ static void tracer_preempt_off(void *none, unsigned long a0, unsigned long a1)
++ {
++ 	int pc = preempt_count();
++ 
++ 	if (preempt_trace(pc) && !irq_trace())
++ 		start_critical_timing(a0, a1, pc);
++ }
++ 
+++>>>>>>> f27107fa20ad (tracing/irqsoff: Handle preempt_count for different configs)
+  static int preemptoff_tracer_init(struct trace_array *tr)
+  {
+  	trace_type = TRACER_PREEMPT_OFF;
+* Unmerged path kernel/trace/trace_irqsoff.c
