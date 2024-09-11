@@ -1,0 +1,259 @@
+net: sched: change action API to use array of pointers to actions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] sched: change action API to use array of pointers to actions (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 96.00%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 90b73b77d08ec395311411b545c756ca710aae59
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/90b73b77.failed
+
+Act API used linked list to pass set of actions to functions. It is
+intrusive data structure that stores list nodes inside action structure
+itself, which means it is not safe to modify such list concurrently.
+However, action API doesn't use any linked list specific operations on this
+set of actions, so it can be safely refactored into plain pointer array.
+
+Refactor action API to use array of pointers to tc_actions instead of
+linked list. Change argument 'actions' type of exported action init,
+destroy and dump functions.
+
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90b73b77d08ec395311411b545c756ca710aae59)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_api.c
+#	net/sched/cls_api.c
+diff --cc net/sched/act_api.c
+index d445f144d9dc,bf1c35f3deb6..000000000000
+--- a/net/sched/act_api.c
++++ b/net/sched/act_api.c
+@@@ -609,6 -676,24 +611,27 @@@ int tcf_action_destroy(struct tc_actio
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_action_put(struct tc_action *p)
++ {
++ 	return __tcf_action_put(p, false);
++ }
++ 
++ static void tcf_action_put_many(struct tc_action *actions[])
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < TCA_ACT_MAX_PRIO && actions[i]; i++) {
++ 		struct tc_action *a = actions[i];
++ 		const struct tc_action_ops *ops = a->ops;
++ 
++ 		if (tcf_action_put(a))
++ 			module_put(ops->owner);
++ 	}
++ }
++ 
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  int
+  tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int bind, int ref)
+  {
+@@@ -817,16 -902,7 +840,20 @@@ err_out
+  	return ERR_PTR(err);
+  }
+  
+++<<<<<<< HEAD
+ +static void cleanup_a(struct list_head *actions, int ovr)
+ +{
+ +	struct tc_action *a;
+ +
+ +	if (!ovr)
+ +		return;
+ +
+ +	list_for_each_entry(a, actions, list)
+ +		a->tcfa_refcnt--;
+ +}
+++=======
++ /* Returns numbers of initialized actions or negative error. */
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  
+  int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+  		    struct nlattr *est, char *name, int ovr, int bind,
+@@@ -852,18 -928,12 +879,27 @@@
+  		}
+  		act->order = i;
+  		sz += tcf_action_fill_size(act);
+++<<<<<<< HEAD
+ +		if (ovr)
+ +			act->tcfa_refcnt++;
+ +		list_add_tail(&act->list, actions);
+ +	}
+ +
+ +	*attr_size = tcf_action_full_attrs_size(sz);
+ +
+ +	/* Remove the temp refcnt which was necessary to protect against
+ +	 * destroying an existing action which was being replaced
+ +	 */
+ +	cleanup_a(actions, ovr);
+ +	return 0;
+++=======
++ 		/* Start from index 0 */
++ 		actions[i - 1] = act;
++ 	}
++ 
++ 	*attr_size = tcf_action_full_attrs_size(sz);
++ 	return i - 1;
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  
+  err:
+  	tcf_action_destroy(actions, bind);
+@@@ -1086,9 -1156,41 +1122,44 @@@ err_out
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tcf_action_delete(struct net *net, struct tc_action *actions[],
++ 			     int *acts_deleted, struct netlink_ext_ack *extack)
++ {
++ 	u32 act_index;
++ 	int ret, i;
++ 
++ 	for (i = 0; i < TCA_ACT_MAX_PRIO && actions[i]; i++) {
++ 		struct tc_action *a = actions[i];
++ 		const struct tc_action_ops *ops = a->ops;
++ 
++ 		/* Actions can be deleted concurrently so we must save their
++ 		 * type and id to search again after reference is released.
++ 		 */
++ 		act_index = a->tcfa_index;
++ 
++ 		if (tcf_action_put(a)) {
++ 			/* last reference, action was deleted concurrently */
++ 			module_put(ops->owner);
++ 		} else  {
++ 			/* now do the delete */
++ 			ret = ops->delete(net, act_index);
++ 			if (ret < 0) {
++ 				*acts_deleted = i + 1;
++ 				return ret;
++ 			}
++ 		}
++ 	}
++ 	*acts_deleted = i;
++ 	return 0;
++ }
++ 
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  static int
+- tcf_del_notify(struct net *net, struct nlmsghdr *n, struct list_head *actions,
+- 	       u32 portid, size_t attr_size, struct netlink_ext_ack *extack)
++ tcf_del_notify(struct net *net, struct nlmsghdr *n, struct tc_action *actions[],
++ 	       int *acts_deleted, u32 portid, size_t attr_size,
++ 	       struct netlink_ext_ack *extack)
+  {
+  	int ret;
+  	struct sk_buff *skb;
+@@@ -1106,7 -1208,7 +1177,11 @@@
+  	}
+  
+  	/* now do the delete */
+++<<<<<<< HEAD
+ +	ret = tcf_action_destroy(actions, 0);
+++=======
++ 	ret = tcf_action_delete(net, actions, acts_deleted, extack);
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  	if (ret < 0) {
+  		NL_SET_ERR_MSG(extack, "Failed to delete TC action");
+  		kfree_skb(skb);
+@@@ -1164,8 -1268,7 +1241,12 @@@ tca_action_gd(struct net *net, struct n
+  		return ret;
+  	}
+  err:
+++<<<<<<< HEAD
+ +	if (event != RTM_GETACTION)
+ +		tcf_action_destroy(&actions, 0);
+++=======
++ 	tcf_action_put_many(&actions[acts_deleted]);
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  	return ret;
+  }
+  
+@@@ -1201,14 -1304,17 +1282,20 @@@ static int tcf_action_add(struct net *n
+  {
+  	size_t attr_size = 0;
+  	int ret = 0;
+- 	LIST_HEAD(actions);
++ 	struct tc_action *actions[TCA_ACT_MAX_PRIO] = {};
+  
+- 	ret = tcf_action_init(net, NULL, nla, NULL, NULL, ovr, 0, &actions,
++ 	ret = tcf_action_init(net, NULL, nla, NULL, NULL, ovr, 0, actions,
+  			      &attr_size, true, extack);
+- 	if (ret)
++ 	if (ret < 0)
+  		return ret;
+++<<<<<<< HEAD
+++=======
++ 	ret = tcf_add_notify(net, n, actions, portid, attr_size, extack);
++ 	if (ovr)
++ 		tcf_action_put_many(actions);
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  
+ -	return ret;
+ +	return tcf_add_notify(net, n, &actions, portid, attr_size, extack);
+  }
+  
+  static u32 tcaa_root_flags_allowed = TCA_FLAG_LARGE_DUMP_ON;
+diff --cc net/sched/cls_api.c
+index 5f21c8808404,73d9967c3739..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -1609,11 -1609,7 +1609,15 @@@ out
+  void tcf_exts_destroy(struct tcf_exts *exts)
+  {
+  #ifdef CONFIG_NET_CLS_ACT
+++<<<<<<< HEAD
+ +	LIST_HEAD(actions);
+ +
+ +	ASSERT_RTNL();
+ +	tcf_exts_to_list(exts, &actions);
+ +	tcf_action_destroy(&actions, TCA_ACT_UNBIND);
+++=======
++ 	tcf_action_destroy(exts->actions, TCA_ACT_UNBIND);
+++>>>>>>> 90b73b77d08e (net: sched: change action API to use array of pointers to actions)
+  	kfree(exts->actions);
+  	exts->nr_actions = 0;
+  #endif
+diff --git a/include/net/act_api.h b/include/net/act_api.h
+index eb868a54cfdd..65cb5fad9ca4 100644
+--- a/include/net/act_api.h
++++ b/include/net/act_api.h
+@@ -164,19 +164,20 @@ static inline int tcf_idr_release(struct tc_action *a, bool bind)
+ int tcf_register_action(struct tc_action_ops *a, struct pernet_operations *ops);
+ int tcf_unregister_action(struct tc_action_ops *a,
+ 			  struct pernet_operations *ops);
+-int tcf_action_destroy(struct list_head *actions, int bind);
++int tcf_action_destroy(struct tc_action *actions[], int bind);
+ int tcf_action_exec(struct sk_buff *skb, struct tc_action **actions,
+ 		    int nr_actions, struct tcf_result *res);
+ int tcf_action_init(struct net *net, struct tcf_proto *tp, struct nlattr *nla,
+ 		    struct nlattr *est, char *name, int ovr, int bind,
+-		    struct list_head *actions, size_t *attr_size,
++		    struct tc_action *actions[], size_t *attr_size,
+ 		    bool rtnl_held, struct netlink_ext_ack *extack);
+ struct tc_action *tcf_action_init_1(struct net *net, struct tcf_proto *tp,
+ 				    struct nlattr *nla, struct nlattr *est,
+ 				    char *name, int ovr, int bind,
+ 				    bool rtnl_held,
+ 				    struct netlink_ext_ack *extack);
+-int tcf_action_dump(struct sk_buff *skb, struct list_head *, int, int);
++int tcf_action_dump(struct sk_buff *skb, struct tc_action *actions[], int bind,
++		    int ref);
+ int tcf_action_dump_old(struct sk_buff *skb, struct tc_action *a, int, int);
+ int tcf_action_dump_1(struct sk_buff *skb, struct tc_action *a, int, int);
+ int tcf_action_copy_stats(struct sk_buff *, struct tc_action *, int);
+* Unmerged path net/sched/act_api.c
+* Unmerged path net/sched/cls_api.c
