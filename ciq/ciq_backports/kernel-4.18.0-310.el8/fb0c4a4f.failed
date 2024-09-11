@@ -1,0 +1,127 @@
+KVM: SVM: move VMLOAD/VMSAVE to C code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit fb0c4a4fee5a35b4e531b57e42231868d1fedb18
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/fb0c4a4f.failed
+
+Thanks to the new macros that handle exception handling for SVM
+instructions, it is easier to just do the VMLOAD/VMSAVE in C.
+This is safe, as shown by the fact that the host reload is
+already done outside the assembly source.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fb0c4a4fee5a35b4e531b57e42231868d1fedb18)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+diff --cc arch/x86/kvm/svm/svm.c
+index dd9e65c2714d,e91b2288f60b..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -3668,9 -3688,63 +3668,65 @@@ static fastpath_t svm_exit_handlers_fas
+  	return EXIT_FASTPATH_NONE;
+  }
+  
+ -static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu)
+ -{
+ -	struct vcpu_svm *svm = to_svm(vcpu);
+ +void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+  
+++<<<<<<< HEAD
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++=======
++ 	/*
++ 	 * VMENTER enables interrupts (host state), but the kernel state is
++ 	 * interrupts disabled when this is invoked. Also tell RCU about
++ 	 * it. This is the same logic as for exit_to_user_mode().
++ 	 *
++ 	 * This ensures that e.g. latency analysis on the host observes
++ 	 * guest mode as interrupt enabled.
++ 	 *
++ 	 * guest_enter_irqoff() informs context tracking about the
++ 	 * transition to guest mode and if enabled adjusts RCU state
++ 	 * accordingly.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_on_prepare();
++ 	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 	instrumentation_end();
++ 
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	if (sev_es_guest(vcpu->kvm)) {
++ 		__svm_sev_es_vcpu_run(svm->vmcb_pa);
++ 	} else {
++ 		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
++ 
++ 		vmload(svm->vmcb_pa);
++ 		__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&vcpu->arch.regs);
++ 		vmsave(svm->vmcb_pa);
++ 
++ 		vmload(__sme_page_pa(sd->save_area));
++ 	}
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++>>>>>>> fb0c4a4fee5a (KVM: SVM: move VMLOAD/VMSAVE to C code)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+* Unmerged path arch/x86/kvm/svm/svm.c
+diff --git a/arch/x86/kvm/svm/vmenter.S b/arch/x86/kvm/svm/vmenter.S
+index 850bdb9dc08c..6eeab11c006f 100644
+--- a/arch/x86/kvm/svm/vmenter.S
++++ b/arch/x86/kvm/svm/vmenter.S
+@@ -79,12 +79,6 @@ ENTRY(__svm_vcpu_run)
+ 
+ 	/* Enter guest mode */
+ 	sti
+-1:	vmload %_ASM_AX
+-	jmp 3f
+-2:	cmpb $0, kvm_rebooting
+-	jne 3f
+-	ud2
+-	_ASM_EXTABLE(1b, 2b)
+ 
+ 3:	vmrun %_ASM_AX
+ 	jmp 5f
+@@ -93,13 +87,7 @@ ENTRY(__svm_vcpu_run)
+ 	ud2
+ 	_ASM_EXTABLE(3b, 4b)
+ 
+-5:	vmsave %_ASM_AX
+-	jmp 7f
+-6:	cmpb $0, kvm_rebooting
+-	jne 7f
+-	ud2
+-	_ASM_EXTABLE(5b, 6b)
+-7:
++5:
+ 	cli
+ 
+ #ifdef CONFIG_RETPOLINE
