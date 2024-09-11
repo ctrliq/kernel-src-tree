@@ -1,0 +1,98 @@
+tcp_bbr: adjust TCP BBR for departure time pacing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Neal Cardwell <ncardwell@google.com>
+commit a87c83d5ee25cf7208279819642ae7bd218e3782
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a87c83d5.failed
+
+Adjust TCP BBR for the new departure time pacing model in the recent
+commit ab408b6dc7449 ("tcp: switch tcp and sch_fq to new earliest
+departure time model").
+
+With TSQ and pacing at lower layers, there are often several skbs
+queued in the pacing layer, and thus there is less data "in the
+network" than "in flight".
+
+With departure time pacing at lower layers (e.g. fq or potential
+future NICs), the data in the pacing layer now has a pre-scheduled
+("baked-in") departure time that cannot be changed, even if the
+congestion control algorithm decides to use a new pacing rate.
+
+This means that there can be a non-trivial lag between when BBR makes
+a pacing rate change and when the inter-skb pacing delays
+change. After a pacing rate change, the number of packets in the
+network can gradually evolve to be higher or lower, depending on
+whether the sending rate is higher or lower than the delivery
+rate. Thus ignoring this lag can cause significant overshoot, with the
+flow ending up with too many or too few packets in the network.
+
+This commit changes BBR to adapt its pacing rate based on the amount
+of data in the network that it estimates has already been "baked in"
+by previous departure time decisions. We estimate the number of our
+packets that will be in the network at the earliest departure time
+(EDT) for the next skb scheduled as:
+
+   in_network_at_edt = inflight_at_edt - (EDT - now) * bw
+
+If we're increasing the amount of data in the network ("in_network"),
+then we want to know if the transmit of the EDT skb will push
+in_network above the target, so our answer includes
+bbr_tso_segs_goal() from the skb departing at EDT. If we're decreasing
+in_network, then we want to know if in_network will sink too low just
+before the EDT transmit, so our answer does not include the segments
+from the skb departing at EDT.
+
+Why do we treat pacing_gain > 1.0 case and pacing_gain < 1.0 case
+differently? The in_network curve is a step function: in_network goes
+up on transmits, and down on ACKs. To accurately predict when
+in_network will go beyond our target value, this will happen on
+different events, depending on whether we're concerned about
+in_network potentially going too high or too low:
+
+ o if pushing in_network up (pacing_gain > 1.0),
+   then in_network goes above target upon a transmit event
+
+ o if pushing in_network down (pacing_gain < 1.0),
+   then in_network goes below target upon an ACK event
+
+This commit changes the BBR state machine to use this estimated
+"packets in network" value to make its decisions.
+
+	Signed-off-by: Neal Cardwell <ncardwell@google.com>
+	Signed-off-by: Yuchung Cheng <ycheng@google.com>
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a87c83d5ee25cf7208279819642ae7bd218e3782)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bbr.c
+diff --cc net/ipv4/tcp_bbr.c
+index c75c19bf9668,4cc2223d2cd5..000000000000
+--- a/net/ipv4/tcp_bbr.c
++++ b/net/ipv4/tcp_bbr.c
+@@@ -747,12 -768,14 +780,17 @@@ static void bbr_check_drain(struct soc
+  
+  	if (bbr->mode == BBR_STARTUP && bbr_full_bw_reached(sk)) {
+  		bbr->mode = BBR_DRAIN;	/* drain queue we created */
+ -		bbr->pacing_gain = bbr_drain_gain;	/* pace slow to drain */
+ -		bbr->cwnd_gain = bbr_high_gain;	/* maintain cwnd */
+  		tcp_sk(sk)->snd_ssthresh =
+ -				bbr_target_cwnd(sk, bbr_max_bw(sk), BBR_UNIT);
+ +				bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT);
+  	}	/* fall through to check if in-flight is already small: */
+  	if (bbr->mode == BBR_DRAIN &&
+++<<<<<<< HEAD
+ +	    tcp_packets_in_flight(tcp_sk(sk)) <=
+ +	    bbr_inflight(sk, bbr_max_bw(sk), BBR_UNIT))
+++=======
++ 	    bbr_packets_in_net_at_edt(sk, tcp_packets_in_flight(tcp_sk(sk))) <=
++ 	    bbr_target_cwnd(sk, bbr_max_bw(sk), BBR_UNIT))
+++>>>>>>> a87c83d5ee25 (tcp_bbr: adjust TCP BBR for departure time pacing)
+  		bbr_reset_probe_bw_mode(sk);  /* we estimate queue is drained */
+  }
+  
+* Unmerged path net/ipv4/tcp_bbr.c
