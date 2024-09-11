@@ -1,0 +1,260 @@
+net: phy: aquantia: add downshift support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] phy: aquantia: add downshift support (Petr Oros) [1772010]
+Rebuild_FUZZ: 93.51%
+commit-author Heiner Kallweit <hkallweit1@gmail.com>
+commit 110a2432c5203d62e5df31180aa0cbd21ea76f82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/110a2432.failed
+
+Aquantia PHY's of the AQR107 family support the downshift feature.
+Add support for it as standard PHY tunable so that it can be controlled
+via ethtool.
+The AQCS109 supports a proprietary 2-pair 1Gbps mode. If two such PHY's
+are connected to each other with a 2-pair cable, they may not be able
+to establish a link if both advertise modes > 1Gbps.
+
+v2:
+- add downshift event detection
+- warn if downshift occurred
+- read downshifted rate from vendor register
+- enable downshift per default on all AQR107 family members
+
+	Signed-off-by: Heiner Kallweit <hkallweit1@gmail.com>
+	Reviewed-by: Florian Fainelli <f.fainelli@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 110a2432c5203d62e5df31180aa0cbd21ea76f82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/phy/aquantia_main.c
+diff --cc drivers/net/phy/aquantia_main.c
+index ce43883caa6d,f71d4b8e44f7..000000000000
+--- a/drivers/net/phy/aquantia_main.c
++++ b/drivers/net/phy/aquantia_main.c
+@@@ -176,6 -192,190 +182,193 @@@ static int aqr_read_status(struct phy_d
+  	return genphy_c45_read_status(phydev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int aqr107_read_downshift_event(struct phy_device *phydev)
++ {
++ 	int val;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_TX_VEND_INT_STATUS1);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	return !!(val & MDIO_AN_TX_VEND_INT_STATUS1_DOWNSHIFT);
++ }
++ 
++ static int aqr107_read_rate(struct phy_device *phydev)
++ {
++ 	int val;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_TX_VEND_STATUS1);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	switch (FIELD_GET(MDIO_AN_TX_VEND_STATUS1_RATE_MASK, val)) {
++ 	case MDIO_AN_TX_VEND_STATUS1_10BASET:
++ 		phydev->speed = SPEED_10;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_100BASETX:
++ 		phydev->speed = SPEED_100;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_1000BASET:
++ 		phydev->speed = SPEED_1000;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_2500BASET:
++ 		phydev->speed = SPEED_2500;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_5000BASET:
++ 		phydev->speed = SPEED_5000;
++ 		break;
++ 	case MDIO_AN_TX_VEND_STATUS1_10GBASET:
++ 		phydev->speed = SPEED_10000;
++ 		break;
++ 	default:
++ 		phydev->speed = SPEED_UNKNOWN;
++ 		break;
++ 	}
++ 
++ 	if (val & MDIO_AN_TX_VEND_STATUS1_FULL_DUPLEX)
++ 		phydev->duplex = DUPLEX_FULL;
++ 	else
++ 		phydev->duplex = DUPLEX_HALF;
++ 
++ 	return 0;
++ }
++ 
++ static int aqr107_read_status(struct phy_device *phydev)
++ {
++ 	int val, ret;
++ 
++ 	ret = aqr_read_status(phydev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!phydev->link || phydev->autoneg == AUTONEG_DISABLE)
++ 		return 0;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_PHYXS, MDIO_PHYXS_VEND_IF_STATUS);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	switch (FIELD_GET(MDIO_PHYXS_VEND_IF_STATUS_TYPE_MASK, val)) {
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_KR:
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_XFI:
++ 		phydev->interface = PHY_INTERFACE_MODE_10GKR;
++ 		break;
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_SGMII:
++ 		phydev->interface = PHY_INTERFACE_MODE_SGMII;
++ 		break;
++ 	case MDIO_PHYXS_VEND_IF_STATUS_TYPE_OCSGMII:
++ 		phydev->interface = PHY_INTERFACE_MODE_2500BASEX;
++ 		break;
++ 	default:
++ 		phydev->interface = PHY_INTERFACE_MODE_NA;
++ 		break;
++ 	}
++ 
++ 	val = aqr107_read_downshift_event(phydev);
++ 	if (val <= 0)
++ 		return val;
++ 
++ 	phydev_warn(phydev, "Downshift occurred! Cabling may be defective.\n");
++ 
++ 	/* Read downshifted rate from vendor register */
++ 	return aqr107_read_rate(phydev);
++ }
++ 
++ static int aqr107_get_downshift(struct phy_device *phydev, u8 *data)
++ {
++ 	int val, cnt, enable;
++ 
++ 	val = phy_read_mmd(phydev, MDIO_MMD_AN, MDIO_AN_VEND_PROV);
++ 	if (val < 0)
++ 		return val;
++ 
++ 	enable = FIELD_GET(MDIO_AN_VEND_PROV_DOWNSHIFT_EN, val);
++ 	cnt = FIELD_GET(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, val);
++ 
++ 	*data = enable && cnt ? cnt : DOWNSHIFT_DEV_DISABLE;
++ 
++ 	return 0;
++ }
++ 
++ static int aqr107_set_downshift(struct phy_device *phydev, u8 cnt)
++ {
++ 	int val = 0;
++ 
++ 	if (!FIELD_FIT(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, cnt))
++ 		return -E2BIG;
++ 
++ 	if (cnt != DOWNSHIFT_DEV_DISABLE) {
++ 		val = MDIO_AN_VEND_PROV_DOWNSHIFT_EN;
++ 		val |= FIELD_PREP(MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, cnt);
++ 	}
++ 
++ 	return phy_modify_mmd(phydev, MDIO_MMD_AN, MDIO_AN_VEND_PROV,
++ 			      MDIO_AN_VEND_PROV_DOWNSHIFT_EN |
++ 			      MDIO_AN_VEND_PROV_DOWNSHIFT_MASK, val);
++ }
++ 
++ static int aqr107_get_tunable(struct phy_device *phydev,
++ 			      struct ethtool_tunable *tuna, void *data)
++ {
++ 	switch (tuna->id) {
++ 	case ETHTOOL_PHY_DOWNSHIFT:
++ 		return aqr107_get_downshift(phydev, data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int aqr107_set_tunable(struct phy_device *phydev,
++ 			      struct ethtool_tunable *tuna, const void *data)
++ {
++ 	switch (tuna->id) {
++ 	case ETHTOOL_PHY_DOWNSHIFT:
++ 		return aqr107_set_downshift(phydev, *(const u8 *)data);
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ }
++ 
++ static int aqr107_config_init(struct phy_device *phydev)
++ {
++ 	/* Check that the PHY interface type is compatible */
++ 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_10GKR)
++ 		return -ENODEV;
++ 
++ 	/* ensure that a latched downshift event is cleared */
++ 	aqr107_read_downshift_event(phydev);
++ 
++ 	return aqr107_set_downshift(phydev, MDIO_AN_VEND_PROV_DOWNSHIFT_DFLT);
++ }
++ 
++ static int aqcs109_config_init(struct phy_device *phydev)
++ {
++ 	int ret;
++ 
++ 	/* Check that the PHY interface type is compatible */
++ 	if (phydev->interface != PHY_INTERFACE_MODE_SGMII &&
++ 	    phydev->interface != PHY_INTERFACE_MODE_2500BASEX)
++ 		return -ENODEV;
++ 
++ 	/* AQCS109 belongs to a chip family partially supporting 10G and 5G.
++ 	 * PMA speed ability bits are the same for all members of the family,
++ 	 * AQCS109 however supports speeds up to 2.5G only.
++ 	 */
++ 	ret = phy_set_max_speed(phydev, SPEED_2500);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* ensure that a latched downshift event is cleared */
++ 	aqr107_read_downshift_event(phydev);
++ 
++ 	return aqr107_set_downshift(phydev, MDIO_AN_VEND_PROV_DOWNSHIFT_DFLT);
++ }
++ 
+++>>>>>>> 110a2432c520 (net: phy: aquantia: add downshift support)
+  static struct phy_driver aqr_driver[] = {
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQ1202),
+@@@ -230,7 -424,12 +423,13 @@@
+  	.config_aneg    = aqr_config_aneg,
+  	.config_intr	= aqr_config_intr,
+  	.ack_interrupt	= aqr_ack_interrupt,
+++<<<<<<< HEAD
+ +	.read_status	= aqr_read_status,
+++=======
++ 	.read_status	= aqr107_read_status,
++ 	.get_tunable    = aqr107_get_tunable,
++ 	.set_tunable    = aqr107_set_tunable,
+++>>>>>>> 110a2432c520 (net: phy: aquantia: add downshift support)
+  },
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQCS109),
+@@@ -240,7 -438,12 +439,13 @@@
+  	.config_aneg    = aqr_config_aneg,
+  	.config_intr	= aqr_config_intr,
+  	.ack_interrupt	= aqr_ack_interrupt,
+++<<<<<<< HEAD
+ +	.read_status	= aqr_read_status,
+++=======
++ 	.read_status	= aqr107_read_status,
++ 	.get_tunable    = aqr107_get_tunable,
++ 	.set_tunable    = aqr107_set_tunable,
+++>>>>>>> 110a2432c520 (net: phy: aquantia: add downshift support)
+  },
+  {
+  	PHY_ID_MATCH_MODEL(PHY_ID_AQR405),
+* Unmerged path drivers/net/phy/aquantia_main.c
