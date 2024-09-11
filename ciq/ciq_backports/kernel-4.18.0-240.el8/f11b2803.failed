@@ -1,0 +1,187 @@
+perf trace: Allow choosing how to augment the tracepoint arguments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Arnaldo Carvalho de Melo <acme@redhat.com>
+commit f11b2803bb88655d90b88c787710b53100913bff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f11b2803.failed
+
+So far we used the libtraceevent printing routines when showing
+tracepoint arguments, but since 'perf trace' has a lot of beautifiers
+for syscall arguments, and since some of those can be used to augment
+tracepoint arguments, add a routine to make use of those beautifiers
+and allow the user to choose which one to use.
+
+The default now is to use the same beautifiers used for the strace-like
+sys_enter+sys_exit lines, but the user can choose the libtraceevent ones
+by either using the:
+
+    perf trace --libtraceevent_print
+
+command line option, or by setting:
+
+  # cat ~/.perfconfig
+  [trace]
+	tracepoint_beautifiers = libtraceevent
+
+For instance, here are some examples:
+
+  # perf trace -e sched:*switch,*sleep,sched:*wakeup,exit*,sched:*exit sleep 1
+       0.000 sched:sched_wakeup(comm: "perf", pid: 5273 (perf), prio: 120, success: 1, target_cpu: 6)
+       0.621 nanosleep(rqtp: 0x7ffdd06d1140, rmtp: NULL) ...
+       0.628 sched:sched_switch(prev_comm: "sleep", prev_pid: 5273 (sleep), prev_prio: 120, prev_state: 1, next_comm: "swapper/6", next_pid: 0, next_prio: 120)
+    1000.879 sched:sched_wakeup(comm: "sleep", pid: 5273 (sleep), prio: 120, success: 1, target_cpu: 6)
+       0.621  ... [continued]: nanosleep())          = 0
+    1001.026 exit_group(error_code: 0)               = ?
+    1001.216 sched:sched_process_exit(comm: "sleep", pid: 5273 (sleep), prio: 120)
+  #
+
+And then using libtraceevent, as before:
+
+  # perf trace --libtraceevent_print -e sched:*switch,*sleep,sched:*wakeup,exit*,sched:*exit sleep 1
+       0.000 sched:sched_wakeup(comm=perf pid=5288 prio=120 target_cpu=001)
+       0.739 nanosleep(rqtp: 0x7ffeba6c2f40, rmtp: NULL) ...
+       0.747 sched:sched_switch(prev_comm=sleep prev_pid=5288 prev_prio=120 prev_state=S ==> next_comm=swapper/1 next_pid=0 next_prio=120)
+    1000.902 sched:sched_wakeup(comm=sleep pid=5288 prio=120 target_cpu=001)
+       0.739  ... [continued]: nanosleep())          = 0
+    1001.012 exit_group(error_code: 0)               = ?
+  #
+
+The new default allocates an array of 'struct syscall_arg_fmt' for the
+tracepoint arguments and, just like with syscall arguments, tries to
+find suitable syscall_arg__scnprintf_NAME() routines to augment those
+tracepoint arguments based on their type (as in the tracefs "format"
+file), or even in their name + type, for instance arguntents with names
+ending in "fd" with type "int" get the fd scnprintf beautifier attached,
+etc.
+
+Soon this will take advantage of the kernel BTF information to augment
+enumerations based on the tracefs "format" type info.
+
+	Cc: Adrian Hunter <adrian.hunter@intel.com>
+	Cc: Jiri Olsa <jolsa@kernel.org>
+	Cc: Luis Cláudio Gonçalves <lclaudio@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+Link: https://lkml.kernel.org/n/tip-o8qdluotkcb3b1x2gjqrejcl@git.kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit f11b2803bb88655d90b88c787710b53100913bff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/builtin-trace.c
+diff --cc tools/perf/builtin-trace.c
+index f1f7b2ccf9b0,8303d83cb93c..000000000000
+--- a/tools/perf/builtin-trace.c
++++ b/tools/perf/builtin-trace.c
+@@@ -2387,7 -2398,72 +2388,76 @@@ static void bpf_output__fprintf(struct 
+  	++trace->nr_events_printed;
+  }
+  
+++<<<<<<< HEAD
+ +static int trace__event_handler(struct trace *trace, struct perf_evsel *evsel,
+++=======
++ static size_t trace__fprintf_tp_fields(struct trace *trace, struct evsel *evsel, struct perf_sample *sample,
++ 				       struct thread *thread, void *augmented_args, int augmented_args_size)
++ {
++ 	char bf[2048];
++ 	size_t size = sizeof(bf);
++ 	struct tep_format_field *field = evsel->tp_format->format.fields;
++ 	struct syscall_arg_fmt *arg = evsel->priv;
++ 	size_t printed = 0;
++ 	unsigned long val;
++ 	u8 bit = 1;
++ 	struct syscall_arg syscall_arg = {
++ 		.augmented = {
++ 			.size = augmented_args_size,
++ 			.args = augmented_args,
++ 		},
++ 		.idx	= 0,
++ 		.mask	= 0,
++ 		.trace  = trace,
++ 		.thread = thread,
++ 		.show_string_prefix = trace->show_string_prefix,
++ 	};
++ 
++ 	for (; field && arg; field = field->next, ++syscall_arg.idx, bit <<= 1, ++arg) {
++ 		if (syscall_arg.mask & bit)
++ 			continue;
++ 
++ 		syscall_arg.fmt = arg;
++ 		if (field->flags & TEP_FIELD_IS_ARRAY)
++ 			val = (uintptr_t)(sample->raw_data + field->offset);
++ 		else
++ 			val = format_field__intval(field, sample, evsel->needs_swap);
++ 		/*
++ 		 * Some syscall args need some mask, most don't and
++ 		 * return val untouched.
++ 		 */
++ 		val = syscall_arg_fmt__mask_val(arg, &syscall_arg, val);
++ 
++ 		/*
++ 		 * Suppress this argument if its value is zero and
++ 		 * and we don't have a string associated in an
++ 		 * strarray for it.
++ 		 */
++ 		if (val == 0 &&
++ 		    !trace->show_zeros &&
++ 		    !((arg->show_zero ||
++ 		       arg->scnprintf == SCA_STRARRAY ||
++ 		       arg->scnprintf == SCA_STRARRAYS) &&
++ 		      arg->parm))
++ 			continue;
++ 
++ 		printed += scnprintf(bf + printed, size - printed, "%s", printed ? ", " : "");
++ 
++ 		/*
++ 		 * XXX Perhaps we should have a show_tp_arg_names,
++ 		 * leaving show_arg_names just for syscalls?
++ 		 */
++ 		if (1 || trace->show_arg_names)
++ 			printed += scnprintf(bf + printed, size - printed, "%s: ", field->name);
++ 
++ 		printed += syscall_arg_fmt__scnprintf_val(arg, bf + printed, size - printed, &syscall_arg, val);
++ 	}
++ 
++ 	return printed + fprintf(trace->output, "%s", bf);
++ }
++ 
++ static int trace__event_handler(struct trace *trace, struct evsel *evsel,
+++>>>>>>> f11b2803bb88 (perf trace: Allow choosing how to augment the tracepoint arguments)
+  				union perf_event *event __maybe_unused,
+  				struct perf_sample *sample)
+  {
+diff --git a/tools/perf/Documentation/perf-config.txt b/tools/perf/Documentation/perf-config.txt
+index c599623a1f3d..c4dd23c4b478 100644
+--- a/tools/perf/Documentation/perf-config.txt
++++ b/tools/perf/Documentation/perf-config.txt
+@@ -561,6 +561,11 @@ trace.*::
+ 	trace.show_zeros::
+ 		Do not suppress syscall arguments that are equal to zero.
+ 
++	trace.tracepoint_beautifiers::
++		Use "libtraceevent" to use that library to augment the tracepoint arguments,
++		"libbeauty", the default, to use the same argument beautifiers used in the
++		strace-like sys_enter+sys_exit lines.
++
+ llvm.*::
+ 	llvm.clang-path::
+ 		Path to clang. If omit, search it from $PATH.
+diff --git a/tools/perf/Documentation/perf-trace.txt b/tools/perf/Documentation/perf-trace.txt
+index 25b74fdb36fa..ba16cd5b680f 100644
+--- a/tools/perf/Documentation/perf-trace.txt
++++ b/tools/perf/Documentation/perf-trace.txt
+@@ -219,6 +219,11 @@ the thread executes on the designated CPUs. Default is to monitor all CPUs.
+ 	may happen, for instance, when a thread gets migrated to a different CPU
+ 	while processing a syscall.
+ 
++--libtraceevent_print::
++	Use libtraceevent to print tracepoint arguments. By default 'perf trace' uses
++	the same beautifiers used in the strace-like enter+exit lines to augment the
++	tracepoint arguments.
++
+ --map-dump::
+ 	Dump BPF maps setup by events passed via -e, for instance the augmented_raw_syscalls
+ 	living in tools/perf/examples/bpf/augmented_raw_syscalls.c. For now this
+* Unmerged path tools/perf/builtin-trace.c
