@@ -1,0 +1,761 @@
+IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit c5ae1954c47d3fd8815bd5a592aba18702c93f33
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c5ae1954.failed
+
+To prevent a hardware memory leak when a DEVX DCT object is destroyed
+without calling DRAIN DCT before, (e.g. under cleanup flow), need to
+manage its creation and destruction via mlx5 core.
+
+In that case the DRAIN DCT command will be called and only once that it
+will be completed the DESTROY DCT command will be called.  Otherwise, the
+DESTROY DCT may fail and a hardware leak may occur.
+
+As of that change the DRAIN DCT command should not be exposed any more
+from DEVX, it's managed internally by the driver to work as expected by
+the device specification.
+
+Fixes: 7efce3691d33 ("IB/mlx5: Add obj create and destroy functionality")
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c5ae1954c47d3fd8815bd5a592aba18702c93f33)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+#	drivers/net/ethernet/mellanox/mlx5/core/qp.c
+diff --cc drivers/infiniband/hw/mlx5/devx.c
+index c7f8859c08ee,9e08df7914aa..000000000000
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@@ -16,20 -18,57 +16,46 @@@
+  #define UVERBS_MODULE_NAME mlx5_ib
+  #include <rdma/uverbs_named_ioctl.h>
+  
+++<<<<<<< HEAD
+++=======
++ enum devx_obj_flags {
++ 	DEVX_OBJ_FLAGS_INDIRECT_MKEY = 1 << 0,
++ 	DEVX_OBJ_FLAGS_DCT = 1 << 1,
++ };
++ 
++ struct devx_async_data {
++ 	struct mlx5_ib_dev *mdev;
++ 	struct list_head list;
++ 	struct ib_uobject *fd_uobj;
++ 	struct mlx5_async_work cb_work;
++ 	u16 cmd_out_len;
++ 	/* must be last field in this structure */
++ 	struct mlx5_ib_uapi_devx_async_cmd_hdr hdr;
++ };
++ 
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  #define MLX5_MAX_DESTROY_INBOX_SIZE_DW MLX5_ST_SZ_DW(delete_fte_in)
+  struct devx_obj {
+  	struct mlx5_core_dev	*mdev;
+ -	u64			obj_id;
+ +	u32			obj_id;
+  	u32			dinlen; /* destroy inbox length */
+  	u32			dinbox[MLX5_MAX_DESTROY_INBOX_SIZE_DW];
+++<<<<<<< HEAD
+++=======
++ 	u32			flags;
++ 	union {
++ 		struct mlx5_ib_devx_mr	devx_mr;
++ 		struct mlx5_core_dct	core_dct;
++ 	};
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  };
+  
+ -struct devx_umem {
+ -	struct mlx5_core_dev		*mdev;
+ -	struct ib_umem			*umem;
+ -	u32				page_offset;
+ -	int				page_shift;
+ -	int				ncont;
+ -	u32				dinlen;
+ -	u32				dinbox[MLX5_ST_SZ_DW(general_obj_in_cmd_hdr)];
+ -};
+ -
+ -struct devx_umem_reg_cmd {
+ -	void				*in;
+ -	u32				inlen;
+ -	u32				out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)];
+ -};
+ -
+ -static struct mlx5_ib_ucontext *
+ -devx_ufile2uctx(const struct uverbs_attr_bundle *attrs)
+ +static struct mlx5_ib_ucontext *devx_ufile2uctx(struct ib_uverbs_file *file)
+  {
+ -	return to_mucontext(ib_uverbs_get_ucontext(attrs));
+ +	return to_mucontext(ib_uverbs_get_ucontext(file));
+  }
+  
+ -int mlx5_ib_devx_create(struct mlx5_ib_dev *dev, bool is_user)
+ +int mlx5_ib_devx_create(struct mlx5_ib_dev *dev, struct mlx5_ib_ucontext *context)
+  {
+  	u32 in[MLX5_ST_SZ_DW(create_uctx_in)] = {0};
+  	u32 out[MLX5_ST_SZ_DW(general_obj_out_cmd_hdr)] = {0};
+@@@ -71,7 -108,358 +97,362 @@@ void mlx5_ib_devx_destroy(struct mlx5_i
+  	mlx5_cmd_exec(dev->mdev, in, sizeof(in), out, sizeof(out));
+  }
+  
+++<<<<<<< HEAD
+ +static bool devx_is_obj_create_cmd(const void *in)
+++=======
++ bool mlx5_ib_devx_is_flow_dest(void *obj, int *dest_id, int *dest_type)
++ {
++ 	struct devx_obj *devx_obj = obj;
++ 	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, devx_obj->dinbox, opcode);
++ 
++ 	switch (opcode) {
++ 	case MLX5_CMD_OP_DESTROY_TIR:
++ 		*dest_type = MLX5_FLOW_DESTINATION_TYPE_TIR;
++ 		*dest_id = MLX5_GET(general_obj_in_cmd_hdr, devx_obj->dinbox,
++ 				    obj_id);
++ 		return true;
++ 
++ 	case MLX5_CMD_OP_DESTROY_FLOW_TABLE:
++ 		*dest_type = MLX5_FLOW_DESTINATION_TYPE_FLOW_TABLE;
++ 		*dest_id = MLX5_GET(destroy_flow_table_in, devx_obj->dinbox,
++ 				    table_id);
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ bool mlx5_ib_devx_is_flow_counter(void *obj, u32 *counter_id)
++ {
++ 	struct devx_obj *devx_obj = obj;
++ 	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, devx_obj->dinbox, opcode);
++ 
++ 	if (opcode == MLX5_CMD_OP_DEALLOC_FLOW_COUNTER) {
++ 		*counter_id = MLX5_GET(dealloc_flow_counter_in,
++ 				       devx_obj->dinbox,
++ 				       flow_counter_id);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ /*
++  * As the obj_id in the firmware is not globally unique the object type
++  * must be considered upon checking for a valid object id.
++  * For that the opcode of the creator command is encoded as part of the obj_id.
++  */
++ static u64 get_enc_obj_id(u16 opcode, u32 obj_id)
++ {
++ 	return ((u64)opcode << 32) | obj_id;
++ }
++ 
++ static u64 devx_get_obj_id(const void *in)
++ {
++ 	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
++ 	u64 obj_id;
++ 
++ 	switch (opcode) {
++ 	case MLX5_CMD_OP_MODIFY_GENERAL_OBJECT:
++ 	case MLX5_CMD_OP_QUERY_GENERAL_OBJECT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_GENERAL_OBJECT,
++ 					MLX5_GET(general_obj_in_cmd_hdr, in,
++ 						 obj_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_MKEY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_MKEY,
++ 					MLX5_GET(query_mkey_in, in,
++ 						 mkey_index));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_CQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_CQ,
++ 					MLX5_GET(query_cq_in, in, cqn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_CQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_CQ,
++ 					MLX5_GET(modify_cq_in, in, cqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_SQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_SQ,
++ 					MLX5_GET(query_sq_in, in, sqn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_SQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_SQ,
++ 					MLX5_GET(modify_sq_in, in, sqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_RQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RQ,
++ 					MLX5_GET(query_rq_in, in, rqn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_RQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RQ,
++ 					MLX5_GET(modify_rq_in, in, rqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_RMP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RMP,
++ 					MLX5_GET(query_rmp_in, in, rmpn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_RMP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RMP,
++ 					MLX5_GET(modify_rmp_in, in, rmpn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_RQT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RQT,
++ 					MLX5_GET(query_rqt_in, in, rqtn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_RQT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RQT,
++ 					MLX5_GET(modify_rqt_in, in, rqtn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_TIR:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_TIR,
++ 					MLX5_GET(query_tir_in, in, tirn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_TIR:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_TIR,
++ 					MLX5_GET(modify_tir_in, in, tirn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_TIS:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_TIS,
++ 					MLX5_GET(query_tis_in, in, tisn));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_TIS:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_TIS,
++ 					MLX5_GET(modify_tis_in, in, tisn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_FLOW_TABLE:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_FLOW_TABLE,
++ 					MLX5_GET(query_flow_table_in, in,
++ 						 table_id));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_FLOW_TABLE:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_FLOW_TABLE,
++ 					MLX5_GET(modify_flow_table_in, in,
++ 						 table_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_FLOW_GROUP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_FLOW_GROUP,
++ 					MLX5_GET(query_flow_group_in, in,
++ 						 group_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_FLOW_TABLE_ENTRY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY,
++ 					MLX5_GET(query_fte_in, in,
++ 						 flow_index));
++ 		break;
++ 	case MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY,
++ 					MLX5_GET(set_fte_in, in, flow_index));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_Q_COUNTER:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_ALLOC_Q_COUNTER,
++ 					MLX5_GET(query_q_counter_in, in,
++ 						 counter_set_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_FLOW_COUNTER:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_ALLOC_FLOW_COUNTER,
++ 					MLX5_GET(query_flow_counter_in, in,
++ 						 flow_counter_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_MODIFY_HEADER_CONTEXT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_ALLOC_MODIFY_HEADER_CONTEXT,
++ 					MLX5_GET(general_obj_in_cmd_hdr, in,
++ 						 obj_id));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_SCHEDULING_ELEMENT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_SCHEDULING_ELEMENT,
++ 					MLX5_GET(query_scheduling_element_in,
++ 						 in, scheduling_element_id));
++ 		break;
++ 	case MLX5_CMD_OP_MODIFY_SCHEDULING_ELEMENT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_SCHEDULING_ELEMENT,
++ 					MLX5_GET(modify_scheduling_element_in,
++ 						 in, scheduling_element_id));
++ 		break;
++ 	case MLX5_CMD_OP_ADD_VXLAN_UDP_DPORT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_ADD_VXLAN_UDP_DPORT,
++ 					MLX5_GET(add_vxlan_udp_dport_in, in,
++ 						 vxlan_udp_port));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_L2_TABLE_ENTRY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_SET_L2_TABLE_ENTRY,
++ 					MLX5_GET(query_l2_table_entry_in, in,
++ 						 table_index));
++ 		break;
++ 	case MLX5_CMD_OP_SET_L2_TABLE_ENTRY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_SET_L2_TABLE_ENTRY,
++ 					MLX5_GET(set_l2_table_entry_in, in,
++ 						 table_index));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(query_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_RST2INIT_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(rst2init_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_INIT2RTR_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(init2rtr_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_RTR2RTS_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(rtr2rts_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_RTS2RTS_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(rts2rts_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_SQERR2RTS_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(sqerr2rts_qp_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_2ERR_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(qp_2err_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_2RST_QP:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 					MLX5_GET(qp_2rst_in, in, qpn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_DCT:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_DCT,
++ 					MLX5_GET(query_dct_in, in, dctn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_XRQ:
++ 	case MLX5_CMD_OP_QUERY_XRQ_DC_PARAMS_ENTRY:
++ 	case MLX5_CMD_OP_QUERY_XRQ_ERROR_PARAMS:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_XRQ,
++ 					MLX5_GET(query_xrq_in, in, xrqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_XRC_SRQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_XRC_SRQ,
++ 					MLX5_GET(query_xrc_srq_in, in,
++ 						 xrc_srqn));
++ 		break;
++ 	case MLX5_CMD_OP_ARM_XRC_SRQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_XRC_SRQ,
++ 					MLX5_GET(arm_xrc_srq_in, in, xrc_srqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_SRQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_SRQ,
++ 					MLX5_GET(query_srq_in, in, srqn));
++ 		break;
++ 	case MLX5_CMD_OP_ARM_RQ:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_RQ,
++ 					MLX5_GET(arm_rq_in, in, srq_number));
++ 		break;
++ 	case MLX5_CMD_OP_ARM_DCT_FOR_KEY_VIOLATION:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_DCT,
++ 					MLX5_GET(drain_dct_in, in, dctn));
++ 		break;
++ 	case MLX5_CMD_OP_ARM_XRQ:
++ 	case MLX5_CMD_OP_SET_XRQ_DC_PARAMS_ENTRY:
++ 		obj_id = get_enc_obj_id(MLX5_CMD_OP_CREATE_XRQ,
++ 					MLX5_GET(arm_xrq_in, in, xrqn));
++ 		break;
++ 	case MLX5_CMD_OP_QUERY_PACKET_REFORMAT_CONTEXT:
++ 		obj_id = get_enc_obj_id
++ 				(MLX5_CMD_OP_ALLOC_PACKET_REFORMAT_CONTEXT,
++ 				 MLX5_GET(query_packet_reformat_context_in,
++ 					  in, packet_reformat_id));
++ 		break;
++ 	default:
++ 		obj_id = 0;
++ 	}
++ 
++ 	return obj_id;
++ }
++ 
++ static bool devx_is_valid_obj_id(struct ib_uobject *uobj, const void *in)
++ {
++ 	u64 obj_id = devx_get_obj_id(in);
++ 
++ 	if (!obj_id)
++ 		return false;
++ 
++ 	switch (uobj_get_object_id(uobj)) {
++ 	case UVERBS_OBJECT_CQ:
++ 		return get_enc_obj_id(MLX5_CMD_OP_CREATE_CQ,
++ 				      to_mcq(uobj->object)->mcq.cqn) ==
++ 				      obj_id;
++ 
++ 	case UVERBS_OBJECT_SRQ:
++ 	{
++ 		struct mlx5_core_srq *srq = &(to_msrq(uobj->object)->msrq);
++ 		struct mlx5_ib_dev *dev = to_mdev(uobj->context->device);
++ 		u16 opcode;
++ 
++ 		switch (srq->common.res) {
++ 		case MLX5_RES_XSRQ:
++ 			opcode = MLX5_CMD_OP_CREATE_XRC_SRQ;
++ 			break;
++ 		case MLX5_RES_XRQ:
++ 			opcode = MLX5_CMD_OP_CREATE_XRQ;
++ 			break;
++ 		default:
++ 			if (!dev->mdev->issi)
++ 				opcode = MLX5_CMD_OP_CREATE_SRQ;
++ 			else
++ 				opcode = MLX5_CMD_OP_CREATE_RMP;
++ 		}
++ 
++ 		return get_enc_obj_id(opcode,
++ 				      to_msrq(uobj->object)->msrq.srqn) ==
++ 				      obj_id;
++ 	}
++ 
++ 	case UVERBS_OBJECT_QP:
++ 	{
++ 		struct mlx5_ib_qp *qp = to_mqp(uobj->object);
++ 		enum ib_qp_type	qp_type = qp->ibqp.qp_type;
++ 
++ 		if (qp_type == IB_QPT_RAW_PACKET ||
++ 		    (qp->flags & MLX5_IB_QP_UNDERLAY)) {
++ 			struct mlx5_ib_raw_packet_qp *raw_packet_qp =
++ 							 &qp->raw_packet_qp;
++ 			struct mlx5_ib_rq *rq = &raw_packet_qp->rq;
++ 			struct mlx5_ib_sq *sq = &raw_packet_qp->sq;
++ 
++ 			return (get_enc_obj_id(MLX5_CMD_OP_CREATE_RQ,
++ 					       rq->base.mqp.qpn) == obj_id ||
++ 				get_enc_obj_id(MLX5_CMD_OP_CREATE_SQ,
++ 					       sq->base.mqp.qpn) == obj_id ||
++ 				get_enc_obj_id(MLX5_CMD_OP_CREATE_TIR,
++ 					       rq->tirn) == obj_id ||
++ 				get_enc_obj_id(MLX5_CMD_OP_CREATE_TIS,
++ 					       sq->tisn) == obj_id);
++ 		}
++ 
++ 		if (qp_type == MLX5_IB_QPT_DCT)
++ 			return get_enc_obj_id(MLX5_CMD_OP_CREATE_DCT,
++ 					      qp->dct.mdct.mqp.qpn) == obj_id;
++ 
++ 		return get_enc_obj_id(MLX5_CMD_OP_CREATE_QP,
++ 				      qp->ibqp.qp_num) == obj_id;
++ 	}
++ 
++ 	case UVERBS_OBJECT_WQ:
++ 		return get_enc_obj_id(MLX5_CMD_OP_CREATE_RQ,
++ 				      to_mrwq(uobj->object)->core_qp.qpn) ==
++ 				      obj_id;
++ 
++ 	case UVERBS_OBJECT_RWQ_IND_TBL:
++ 		return get_enc_obj_id(MLX5_CMD_OP_CREATE_RQT,
++ 				      to_mrwq_ind_table(uobj->object)->rqtn) ==
++ 				      obj_id;
++ 
++ 	case MLX5_IB_OBJECT_DEVX_OBJ:
++ 		return ((struct devx_obj *)uobj->object)->obj_id == obj_id;
++ 
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static void devx_set_umem_valid(const void *in)
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  {
+  	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
+  
+@@@ -116,7 -595,86 +497,90 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static bool devx_is_general_cmd(const void *in)
+++=======
++ static bool devx_is_obj_modify_cmd(const void *in)
++ {
++ 	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
++ 
++ 	switch (opcode) {
++ 	case MLX5_CMD_OP_MODIFY_GENERAL_OBJECT:
++ 	case MLX5_CMD_OP_MODIFY_CQ:
++ 	case MLX5_CMD_OP_MODIFY_RMP:
++ 	case MLX5_CMD_OP_MODIFY_SQ:
++ 	case MLX5_CMD_OP_MODIFY_RQ:
++ 	case MLX5_CMD_OP_MODIFY_RQT:
++ 	case MLX5_CMD_OP_MODIFY_TIR:
++ 	case MLX5_CMD_OP_MODIFY_TIS:
++ 	case MLX5_CMD_OP_MODIFY_FLOW_TABLE:
++ 	case MLX5_CMD_OP_MODIFY_SCHEDULING_ELEMENT:
++ 	case MLX5_CMD_OP_ADD_VXLAN_UDP_DPORT:
++ 	case MLX5_CMD_OP_SET_L2_TABLE_ENTRY:
++ 	case MLX5_CMD_OP_RST2INIT_QP:
++ 	case MLX5_CMD_OP_INIT2RTR_QP:
++ 	case MLX5_CMD_OP_RTR2RTS_QP:
++ 	case MLX5_CMD_OP_RTS2RTS_QP:
++ 	case MLX5_CMD_OP_SQERR2RTS_QP:
++ 	case MLX5_CMD_OP_2ERR_QP:
++ 	case MLX5_CMD_OP_2RST_QP:
++ 	case MLX5_CMD_OP_ARM_XRC_SRQ:
++ 	case MLX5_CMD_OP_ARM_RQ:
++ 	case MLX5_CMD_OP_ARM_DCT_FOR_KEY_VIOLATION:
++ 	case MLX5_CMD_OP_ARM_XRQ:
++ 	case MLX5_CMD_OP_SET_XRQ_DC_PARAMS_ENTRY:
++ 		return true;
++ 	case MLX5_CMD_OP_SET_FLOW_TABLE_ENTRY:
++ 	{
++ 		u16 op_mod = MLX5_GET(set_fte_in, in, op_mod);
++ 
++ 		if (op_mod == 1)
++ 			return true;
++ 		return false;
++ 	}
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static bool devx_is_obj_query_cmd(const void *in)
++ {
++ 	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
++ 
++ 	switch (opcode) {
++ 	case MLX5_CMD_OP_QUERY_GENERAL_OBJECT:
++ 	case MLX5_CMD_OP_QUERY_MKEY:
++ 	case MLX5_CMD_OP_QUERY_CQ:
++ 	case MLX5_CMD_OP_QUERY_RMP:
++ 	case MLX5_CMD_OP_QUERY_SQ:
++ 	case MLX5_CMD_OP_QUERY_RQ:
++ 	case MLX5_CMD_OP_QUERY_RQT:
++ 	case MLX5_CMD_OP_QUERY_TIR:
++ 	case MLX5_CMD_OP_QUERY_TIS:
++ 	case MLX5_CMD_OP_QUERY_Q_COUNTER:
++ 	case MLX5_CMD_OP_QUERY_FLOW_TABLE:
++ 	case MLX5_CMD_OP_QUERY_FLOW_GROUP:
++ 	case MLX5_CMD_OP_QUERY_FLOW_TABLE_ENTRY:
++ 	case MLX5_CMD_OP_QUERY_FLOW_COUNTER:
++ 	case MLX5_CMD_OP_QUERY_MODIFY_HEADER_CONTEXT:
++ 	case MLX5_CMD_OP_QUERY_SCHEDULING_ELEMENT:
++ 	case MLX5_CMD_OP_QUERY_L2_TABLE_ENTRY:
++ 	case MLX5_CMD_OP_QUERY_QP:
++ 	case MLX5_CMD_OP_QUERY_SRQ:
++ 	case MLX5_CMD_OP_QUERY_XRC_SRQ:
++ 	case MLX5_CMD_OP_QUERY_DCT:
++ 	case MLX5_CMD_OP_QUERY_XRQ:
++ 	case MLX5_CMD_OP_QUERY_XRQ_DC_PARAMS_ENTRY:
++ 	case MLX5_CMD_OP_QUERY_XRQ_ERROR_PARAMS:
++ 	case MLX5_CMD_OP_QUERY_PACKET_REFORMAT_CONTEXT:
++ 		return true;
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static bool devx_is_whitelist_cmd(void *in)
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  {
+  	u16 opcode = MLX5_GET(general_obj_in_cmd_hdr, in, opcode);
+  
+@@@ -356,10 -1123,25 +820,22 @@@ static int devx_obj_cleanup(struct ib_u
+  	struct devx_obj *obj = uobject->object;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = mlx5_cmd_exec(obj->mdev, obj->dinbox, obj->dinlen, out, sizeof(out));
+ +	if (ret && why == RDMA_REMOVE_DESTROY)
+++=======
++ 	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY)
++ 		devx_cleanup_mkey(obj);
++ 
++ 	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
++ 		ret = mlx5_core_destroy_dct(obj->mdev, &obj->core_dct);
++ 	else
++ 		ret = mlx5_cmd_exec(obj->mdev, obj->dinbox, obj->dinlen, out,
++ 				    sizeof(out));
++ 	if (ib_is_destroy_retryable(ret, why, uobject))
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  		return ret;
+  
+ -	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY) {
+ -		struct mlx5_ib_dev *dev = to_mdev(uobject->context->device);
+ -
+ -		call_srcu(&dev->mr_srcu, &obj->devx_mr.rcu,
+ -			  devx_free_indirect_mkey);
+ -		return ret;
+ -	}
+ -
+  	kfree(obj);
+  	return ret;
+  }
+@@@ -395,34 -1182,57 +871,60 @@@ static int UVERBS_HANDLER(MLX5_IB_METHO
+  	if (!obj)
+  		return -ENOMEM;
+  
+ -	MLX5_SET(general_obj_in_cmd_hdr, cmd_in, uid, uid);
+ -	if (opcode == MLX5_CMD_OP_CREATE_MKEY) {
+ -		err = devx_handle_mkey_create(dev, obj, cmd_in, cmd_in_len);
+ -		if (err)
+ -			goto obj_free;
+ -	} else {
+ -		devx_set_umem_valid(cmd_in);
+ +	cmd_out = kvzalloc(cmd_out_len, GFP_KERNEL);
+ +	if (!cmd_out) {
+ +		err = -ENOMEM;
+ +		goto obj_free;
+  	}
+  
+++<<<<<<< HEAD
+ +	MLX5_SET(general_obj_in_cmd_hdr, cmd_in, uid, c->devx_uid);
+ +	err = mlx5_cmd_exec(dev->mdev, cmd_in,
+ +			    uverbs_attr_get_len(attrs, MLX5_IB_ATTR_DEVX_OBJ_CREATE_CMD_IN),
+ +			    cmd_out, cmd_out_len);
+++=======
++ 	if (opcode == MLX5_CMD_OP_CREATE_DCT) {
++ 		obj->flags |= DEVX_OBJ_FLAGS_DCT;
++ 		err = mlx5_core_create_dct(dev->mdev, &obj->core_dct,
++ 					   cmd_in, cmd_in_len,
++ 					   cmd_out, cmd_out_len);
++ 	} else {
++ 		err = mlx5_cmd_exec(dev->mdev, cmd_in,
++ 				    cmd_in_len,
++ 				    cmd_out, cmd_out_len);
++ 	}
++ 
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  	if (err)
+ -		goto obj_free;
+ +		goto cmd_free;
+  
+ +	uobj = uverbs_attr_get_uobject(attrs, MLX5_IB_ATTR_DEVX_OBJ_CREATE_HANDLE);
+  	uobj->object = obj;
+  	obj->mdev = dev->mdev;
+ -	devx_obj_build_destroy_cmd(cmd_in, cmd_out, obj->dinbox, &obj->dinlen,
+ -				   &obj_id);
+ +	devx_obj_build_destroy_cmd(cmd_in, cmd_out, obj->dinbox, &obj->dinlen, &obj->obj_id);
+  	WARN_ON(obj->dinlen > MLX5_MAX_DESTROY_INBOX_SIZE_DW * sizeof(u32));
+  
+ -	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY) {
+ -		err = devx_handle_mkey_indirect(obj, dev, cmd_in, cmd_out);
+ -		if (err)
+ -			goto obj_destroy;
+ -	}
+ -
+  	err = uverbs_copy_to(attrs, MLX5_IB_ATTR_DEVX_OBJ_CREATE_CMD_OUT, cmd_out, cmd_out_len);
+  	if (err)
+ -		goto err_copy;
+ +		goto cmd_free;
+  
+ -	obj->obj_id = get_enc_obj_id(opcode, obj_id);
+ +	kvfree(cmd_out);
+  	return 0;
+  
+++<<<<<<< HEAD
+ +cmd_free:
+ +	kvfree(cmd_out);
+++=======
++ err_copy:
++ 	if (obj->flags & DEVX_OBJ_FLAGS_INDIRECT_MKEY)
++ 		devx_cleanup_mkey(obj);
++ obj_destroy:
++ 	if (obj->flags & DEVX_OBJ_FLAGS_DCT)
++ 		mlx5_core_destroy_dct(obj->mdev, &obj->core_dct);
++ 	else
++ 		mlx5_cmd_exec(obj->mdev, obj->dinbox, obj->dinlen, out,
++ 			      sizeof(out));
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  obj_free:
+  	kfree(obj);
+  	return err;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/qp.c
+index d5bdd62c21bb,b8ba74de9555..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/qp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/qp.c
+@@@ -192,13 -230,42 +192,17 @@@ static void destroy_resource_common(str
+  	wait_for_completion(&qp->common.free);
+  }
+  
+ -static int _mlx5_core_destroy_dct(struct mlx5_core_dev *dev,
+ -				  struct mlx5_core_dct *dct, bool need_cleanup)
+ -{
+ -	u32 out[MLX5_ST_SZ_DW(destroy_dct_out)] = {0};
+ -	u32 in[MLX5_ST_SZ_DW(destroy_dct_in)]   = {0};
+ -	struct mlx5_core_qp *qp = &dct->mqp;
+ -	int err;
+ -
+ -	err = mlx5_core_drain_dct(dev, dct);
+ -	if (err) {
+ -		if (dev->state == MLX5_DEVICE_STATE_INTERNAL_ERROR) {
+ -			goto destroy;
+ -		} else {
+ -			mlx5_core_warn(
+ -				dev, "failed drain DCT 0x%x with error 0x%x\n",
+ -				qp->qpn, err);
+ -			return err;
+ -		}
+ -	}
+ -	wait_for_completion(&dct->drained);
+ -destroy:
+ -	if (need_cleanup)
+ -		destroy_resource_common(dev, &dct->mqp);
+ -	MLX5_SET(destroy_dct_in, in, opcode, MLX5_CMD_OP_DESTROY_DCT);
+ -	MLX5_SET(destroy_dct_in, in, dctn, qp->qpn);
+ -	MLX5_SET(destroy_dct_in, in, uid, qp->uid);
+ -	err = mlx5_cmd_exec(dev, (void *)&in, sizeof(in),
+ -			    (void *)&out, sizeof(out));
+ -	return err;
+ -}
+ -
+  int mlx5_core_create_dct(struct mlx5_core_dev *dev,
+  			 struct mlx5_core_dct *dct,
+- 			 u32 *in, int inlen)
++ 			 u32 *in, int inlen,
++ 			 u32 *out, int outlen)
+  {
+++<<<<<<< HEAD
+ +	u32 out[MLX5_ST_SZ_DW(create_dct_out)]   = {0};
+ +	u32 din[MLX5_ST_SZ_DW(destroy_dct_in)]   = {0};
+ +	u32 dout[MLX5_ST_SZ_DW(destroy_dct_out)] = {0};
+++=======
+++>>>>>>> c5ae1954c47d (IB/mlx5: Use mlx5 core to create/destroy a DEVX DCT)
+  	struct mlx5_core_qp *qp = &dct->mqp;
+  	int err;
+  
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index f8232c3294c8..3e5c9322a879 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -3593,6 +3593,7 @@ static int mlx5_ib_modify_dct(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 
+ 	} else if (cur_state == IB_QPS_INIT && new_state == IB_QPS_RTR) {
+ 		struct mlx5_ib_modify_qp_resp resp = {};
++		u32 out[MLX5_ST_SZ_DW(create_dct_out)] = {0};
+ 		u32 min_resp_len = offsetof(typeof(resp), dctn) +
+ 				   sizeof(resp.dctn);
+ 
+@@ -3611,7 +3612,8 @@ static int mlx5_ib_modify_dct(struct ib_qp *ibqp, struct ib_qp_attr *attr,
+ 		MLX5_SET(dctc, dctc, hop_limit, attr->ah_attr.grh.hop_limit);
+ 
+ 		err = mlx5_core_create_dct(dev->mdev, &qp->dct.mdct, qp->dct.in,
+-					   MLX5_ST_SZ_BYTES(create_dct_in));
++					   MLX5_ST_SZ_BYTES(create_dct_in), out,
++					   sizeof(out));
+ 		if (err)
+ 			return err;
+ 		resp.dctn = qp->dct.mdct.mqp.qpn;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/qp.c
+diff --git a/include/linux/mlx5/qp.h b/include/linux/mlx5/qp.h
+index b26ea9077384..0343c81d4c5f 100644
+--- a/include/linux/mlx5/qp.h
++++ b/include/linux/mlx5/qp.h
+@@ -557,7 +557,8 @@ static inline struct mlx5_core_mkey *__mlx5_mr_lookup(struct mlx5_core_dev *dev,
+ 
+ int mlx5_core_create_dct(struct mlx5_core_dev *dev,
+ 			 struct mlx5_core_dct *qp,
+-			 u32 *in, int inlen);
++			 u32 *in, int inlen,
++			 u32 *out, int outlen);
+ int mlx5_core_create_qp(struct mlx5_core_dev *dev,
+ 			struct mlx5_core_qp *qp,
+ 			u32 *in,
