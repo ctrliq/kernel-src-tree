@@ -1,0 +1,301 @@
+net: ensure correct skb->tstamp in various fragmenters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] ensure correct skb->tstamp in various fragmenters (Antoine Tenart) [1905897]
+Rebuild_FUZZ: 95.15%
+commit-author Eric Dumazet <edumazet@google.com>
+commit 9669fffc1415bb0c30e5d2ec98a8e1c3a418cb9c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9669fffc.failed
+
+Thomas found that some forwarded packets would be stuck
+in FQ packet scheduler because their skb->tstamp contained
+timestamps far in the future.
+
+We thought we addressed this point in commit 8203e2d844d3
+("net: clear skb->tstamp in forwarding paths") but there
+is still an issue when/if a packet needs to be fragmented.
+
+In order to meet EDT requirements, we have to make sure all
+fragments get the original skb->tstamp.
+
+Note that this original skb->tstamp should be zero in
+forwarding path, but might have a non zero value in
+output path if user decided so.
+
+Fixes: fb420d5d91c1 ("tcp/fq: move back to CLOCK_MONOTONIC")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Reported-by: Thomas Bartschies <Thomas.Bartschies@cvk.de>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9669fffc1415bb0c30e5d2ec98a8e1c3a418cb9c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/netfilter/nf_conntrack_bridge.c
+#	net/ipv4/ip_output.c
+#	net/ipv6/ip6_output.c
+#	net/ipv6/netfilter.c
+diff --cc net/ipv4/ip_output.c
+index 9fb5b2ef480e,814b9b8882a0..000000000000
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@@ -586,12 -767,12 +586,19 @@@ int ip_do_fragment(struct net *net, str
+  		   int (*output)(struct net *, struct sock *, struct sk_buff *))
+  {
+  	struct iphdr *iph;
+ +	int ptr;
+  	struct sk_buff *skb2;
+ +	unsigned int mtu, hlen, left, len, ll_rs;
+ +	int offset;
+ +	__be16 not_last_frag;
+  	struct rtable *rt = skb_rtable(skb);
+++<<<<<<< HEAD
+++=======
++ 	unsigned int mtu, hlen, ll_rs;
++ 	struct ip_fraglist_iter iter;
++ 	ktime_t tstamp = skb->tstamp;
++ 	struct ip_frag_state state;
+++>>>>>>> 9669fffc1415 (net: ensure correct skb->tstamp in various fragmenters)
+  	int err = 0;
+  
+  	/* for offloaded checksums cleanup checksum before fragmentation */
+@@@ -670,25 -842,12 +677,26 @@@
+  		for (;;) {
+  			/* Prepare header of the next frame,
+  			 * before previous one went down. */
+ -			if (iter.frag) {
+ -				ip_fraglist_ipcb_prepare(skb, &iter);
+ -				ip_fraglist_prepare(skb, &iter);
+ +			if (frag) {
+ +				frag->ip_summed = CHECKSUM_NONE;
+ +				skb_reset_transport_header(frag);
+ +				__skb_push(frag, hlen);
+ +				skb_reset_network_header(frag);
+ +				memcpy(skb_network_header(frag), iph, hlen);
+ +				iph = ip_hdr(frag);
+ +				iph->tot_len = htons(frag->len);
+ +				ip_copy_metadata(frag, skb);
+ +				if (offset == 0)
+ +					ip_options_fragment(frag);
+ +				offset += skb->len - hlen;
+ +				iph->frag_off = htons(offset>>3);
+ +				if (frag->next)
+ +					iph->frag_off |= htons(IP_MF);
+ +				/* Ready, complete checksum */
+ +				ip_send_check(iph);
+  			}
+  
++ 			skb->tstamp = tstamp;
+  			err = output(net, sk, skb);
+  
+  			if (!err)
+@@@ -820,10 -902,7 +828,14 @@@ slow_path
+  		/*
+  		 *	Put this fragment into the sending queue.
+  		 */
+++<<<<<<< HEAD
+ +		iph->tot_len = htons(len + hlen);
+ +
+ +		ip_send_check(iph);
+ +
+++=======
++ 		skb2->tstamp = tstamp;
+++>>>>>>> 9669fffc1415 (net: ensure correct skb->tstamp in various fragmenters)
+  		err = output(net, sk, skb2);
+  		if (err)
+  			goto fail;
+diff --cc net/ipv6/ip6_output.c
+index 30baeddf3ca0,71827b56c006..000000000000
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@@ -602,12 -766,11 +602,19 @@@ int ip6_fragment(struct net *net, struc
+  	struct rt6_info *rt = (struct rt6_info *)skb_dst(skb);
+  	struct ipv6_pinfo *np = skb->sk && !dev_recursion_level() ?
+  				inet6_sk(skb->sk) : NULL;
+++<<<<<<< HEAD
+ +	struct ipv6hdr *tmp_hdr;
+ +	struct frag_hdr *fh;
+ +	unsigned int mtu, hlen, left, len, nexthdr_offset;
+ +	int hroom, troom;
+++=======
++ 	struct ip6_frag_state state;
++ 	unsigned int mtu, hlen, nexthdr_offset;
++ 	ktime_t tstamp = skb->tstamp;
++ 	int hroom, err = 0;
+++>>>>>>> 9669fffc1415 (net: ensure correct skb->tstamp in various fragmenters)
+  	__be32 frag_id;
+ +	int ptr, offset = 0, err = 0;
+  	u8 *prevhdr, nexthdr = 0;
+  
+  	err = ip6_find_1stfragopt(skb, &prevhdr);
+@@@ -714,27 -853,10 +721,28 @@@
+  		for (;;) {
+  			/* Prepare header of the next frame,
+  			 * before previous one went down. */
+ -			if (iter.frag)
+ -				ip6_fraglist_prepare(skb, &iter);
+ +			if (frag) {
+ +				frag->ip_summed = CHECKSUM_NONE;
+ +				skb_reset_transport_header(frag);
+ +				fh = __skb_push(frag, sizeof(struct frag_hdr));
+ +				__skb_push(frag, hlen);
+ +				skb_reset_network_header(frag);
+ +				memcpy(skb_network_header(frag), tmp_hdr,
+ +				       hlen);
+ +				offset += skb->len - hlen - sizeof(struct frag_hdr);
+ +				fh->nexthdr = nexthdr;
+ +				fh->reserved = 0;
+ +				fh->frag_off = htons(offset);
+ +				if (frag->next)
+ +					fh->frag_off |= htons(IP6_MF);
+ +				fh->identification = frag_id;
+ +				ipv6_hdr(frag)->payload_len =
+ +						htons(frag->len -
+ +						      sizeof(struct ipv6hdr));
+ +				ip6_copy_metadata(frag, skb);
+ +			}
+  
++ 			skb->tstamp = tstamp;
+  			err = output(net, sk, skb);
+  			if (!err)
+  				IP6_INC_STATS(net, ip6_dst_idev(&rt->dst),
+diff --cc net/ipv6/netfilter.c
+index 1240ccd57f39,409e79b84a83..000000000000
+--- a/net/ipv6/netfilter.c
++++ b/net/ipv6/netfilter.c
+@@@ -109,6 -112,125 +109,128 @@@ int __nf_ip6_route(struct net *net, str
+  }
+  EXPORT_SYMBOL_GPL(__nf_ip6_route);
+  
+++<<<<<<< HEAD
+++=======
++ int br_ip6_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
++ 		    struct nf_bridge_frag_data *data,
++ 		    int (*output)(struct net *, struct sock *sk,
++ 				  const struct nf_bridge_frag_data *data,
++ 				  struct sk_buff *))
++ {
++ 	int frag_max_size = BR_INPUT_SKB_CB(skb)->frag_max_size;
++ 	ktime_t tstamp = skb->tstamp;
++ 	struct ip6_frag_state state;
++ 	u8 *prevhdr, nexthdr = 0;
++ 	unsigned int mtu, hlen;
++ 	int hroom, err = 0;
++ 	__be32 frag_id;
++ 
++ 	err = ip6_find_1stfragopt(skb, &prevhdr);
++ 	if (err < 0)
++ 		goto blackhole;
++ 	hlen = err;
++ 	nexthdr = *prevhdr;
++ 
++ 	mtu = skb->dev->mtu;
++ 	if (frag_max_size > mtu ||
++ 	    frag_max_size < IPV6_MIN_MTU)
++ 		goto blackhole;
++ 
++ 	mtu = frag_max_size;
++ 	if (mtu < hlen + sizeof(struct frag_hdr) + 8)
++ 		goto blackhole;
++ 	mtu -= hlen + sizeof(struct frag_hdr);
++ 
++ 	frag_id = ipv6_select_ident(net, &ipv6_hdr(skb)->daddr,
++ 				    &ipv6_hdr(skb)->saddr);
++ 
++ 	if (skb->ip_summed == CHECKSUM_PARTIAL &&
++ 	    (err = skb_checksum_help(skb)))
++ 		goto blackhole;
++ 
++ 	hroom = LL_RESERVED_SPACE(skb->dev);
++ 	if (skb_has_frag_list(skb)) {
++ 		unsigned int first_len = skb_pagelen(skb);
++ 		struct ip6_fraglist_iter iter;
++ 		struct sk_buff *frag2;
++ 
++ 		if (first_len - hlen > mtu ||
++ 		    skb_headroom(skb) < (hroom + sizeof(struct frag_hdr)))
++ 			goto blackhole;
++ 
++ 		if (skb_cloned(skb))
++ 			goto slow_path;
++ 
++ 		skb_walk_frags(skb, frag2) {
++ 			if (frag2->len > mtu ||
++ 			    skb_headroom(frag2) < (hlen + hroom + sizeof(struct frag_hdr)))
++ 				goto blackhole;
++ 
++ 			/* Partially cloned skb? */
++ 			if (skb_shared(frag2))
++ 				goto slow_path;
++ 		}
++ 
++ 		err = ip6_fraglist_init(skb, hlen, prevhdr, nexthdr, frag_id,
++ 					&iter);
++ 		if (err < 0)
++ 			goto blackhole;
++ 
++ 		for (;;) {
++ 			/* Prepare header of the next frame,
++ 			 * before previous one went down.
++ 			 */
++ 			if (iter.frag)
++ 				ip6_fraglist_prepare(skb, &iter);
++ 
++ 			skb->tstamp = tstamp;
++ 			err = output(net, sk, data, skb);
++ 			if (err || !iter.frag)
++ 				break;
++ 
++ 			skb = ip6_fraglist_next(&iter);
++ 		}
++ 
++ 		kfree(iter.tmp_hdr);
++ 		if (!err)
++ 			return 0;
++ 
++ 		kfree_skb_list(iter.frag);
++ 		return err;
++ 	}
++ slow_path:
++ 	/* This is a linearized skbuff, the original geometry is lost for us.
++ 	 * This may also be a clone skbuff, we could preserve the geometry for
++ 	 * the copies but probably not worth the effort.
++ 	 */
++ 	ip6_frag_init(skb, hlen, mtu, skb->dev->needed_tailroom,
++ 		      LL_RESERVED_SPACE(skb->dev), prevhdr, nexthdr, frag_id,
++ 		      &state);
++ 
++ 	while (state.left > 0) {
++ 		struct sk_buff *skb2;
++ 
++ 		skb2 = ip6_frag_next(skb, &state);
++ 		if (IS_ERR(skb2)) {
++ 			err = PTR_ERR(skb2);
++ 			goto blackhole;
++ 		}
++ 
++ 		skb2->tstamp = tstamp;
++ 		err = output(net, sk, data, skb2);
++ 		if (err)
++ 			goto blackhole;
++ 	}
++ 	consume_skb(skb);
++ 	return err;
++ 
++ blackhole:
++ 	kfree_skb(skb);
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(br_ip6_fragment);
++ 
+++>>>>>>> 9669fffc1415 (net: ensure correct skb->tstamp in various fragmenters)
+  static const struct nf_ipv6_ops ipv6ops = {
+  #if IS_MODULE(CONFIG_IPV6)
+  	.chk_addr		= ipv6_chk_addr,
+* Unmerged path net/bridge/netfilter/nf_conntrack_bridge.c
+* Unmerged path net/bridge/netfilter/nf_conntrack_bridge.c
+* Unmerged path net/ipv4/ip_output.c
+* Unmerged path net/ipv6/ip6_output.c
+* Unmerged path net/ipv6/netfilter.c
