@@ -61,7 +61,8 @@ FILES=                                          \
          test-clang.bin				\
          test-llvm.bin				\
          test-llvm-version.bin			\
-         test-libaio.bin
+         test-libaio.bin			\
+         test-libzstd.bin
 
 FILES := $(addprefix $(OUTPUT),$(FILES))
 
@@ -296,6 +297,9 @@ $(OUTPUT)test-clang.bin:
 
 $(OUTPUT)test-libaio.bin:
 	$(BUILD) -lrt
+
+$(OUTPUT)test-libzstd.bin:
+	$(BUILD) -lzstd
 
 ###############################
 
