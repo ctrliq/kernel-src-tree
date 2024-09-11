@@ -1741,7 +1741,7 @@ ff_layout_read_pagelist(struct nfs_pgio_header *hdr)
 	if (!ds_cred)
 		goto out_failed;
 
-	vers = nfs4_ff_layout_ds_version(lseg, idx);
+	vers = nfs4_ff_layout_ds_version(mirror);
 
 	dprintk("%s USE DS: %s cl_count %d vers %d\n", __func__,
 		ds->ds_remotestr, refcount_read(&ds->ds_clp->cl_count), vers);
@@ -1804,7 +1804,7 @@ ff_layout_write_pagelist(struct nfs_pgio_header *hdr, int sync)
 	if (!ds_cred)
 		goto out_failed;
 
-	vers = nfs4_ff_layout_ds_version(lseg, idx);
+	vers = nfs4_ff_layout_ds_version(mirror);
 
 	dprintk("%s ino %lu sync %d req %zu@%llu DS: %s cl_count %d vers %d\n",
 		__func__, hdr->inode->i_ino, sync, (size_t) hdr->args.count,
@@ -1887,7 +1887,7 @@ static int ff_layout_initiate_commit(struct nfs_commit_data *data, int how)
 	if (!ds_cred)
 		goto out_err;
 
-	vers = nfs4_ff_layout_ds_version(lseg, idx);
+	vers = nfs4_ff_layout_ds_version(mirror);
 
 	dprintk("%s ino %lu, how %d cl_count %d vers %d\n", __func__,
 		data->inode->i_ino, how, refcount_read(&ds->ds_clp->cl_count),
