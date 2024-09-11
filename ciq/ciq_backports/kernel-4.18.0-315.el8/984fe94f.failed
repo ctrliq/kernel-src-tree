@@ -1,0 +1,202 @@
+bpf: Mutex protect used_maps array and count
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author YiFei Zhu <zhuyifei@google.com>
+commit 984fe94f94756dacb3c8cc52904a23adf9e04da1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/984fe94f.failed
+
+To support modifying the used_maps array, we use a mutex to protect
+the use of the counter and the array. The mutex is initialized right
+after the prog aux is allocated, and destroyed right before prog
+aux is freed. This way we guarantee it's initialized for both cBPF
+and eBPF.
+
+	Signed-off-by: YiFei Zhu <zhuyifei@google.com>
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Cc: YiFei Zhu <zhuyifei1999@gmail.com>
+Link: https://lore.kernel.org/bpf/20200915234543.3220146-2-sdf@google.com
+(cherry picked from commit 984fe94f94756dacb3c8cc52904a23adf9e04da1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/core.c
+diff --cc kernel/bpf/core.c
+index c308210cab4e,2a20c2833996..000000000000
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@@ -102,7 -98,7 +102,11 @@@ struct bpf_prog *bpf_prog_alloc_no_stat
+  	fp->jit_requested = ebpf_jit_enabled();
+  
+  	INIT_LIST_HEAD_RCU(&fp->aux->ksym.lnode);
+++<<<<<<< HEAD
+ +	mutex_init(&fp->aux->dst_mutex);
+++=======
++ 	mutex_init(&fp->aux->used_maps_mutex);
+++>>>>>>> 984fe94f9475 (bpf: Mutex protect used_maps array and count)
+  
+  	return fp;
+  }
+@@@ -258,7 -254,7 +262,11 @@@ struct bpf_prog *bpf_prog_realloc(struc
+  void __bpf_prog_free(struct bpf_prog *fp)
+  {
+  	if (fp->aux) {
+++<<<<<<< HEAD
+ +		mutex_destroy(&fp->aux->dst_mutex);
+++=======
++ 		mutex_destroy(&fp->aux->used_maps_mutex);
+++>>>>>>> 984fe94f9475 (bpf: Mutex protect used_maps array and count)
+  		free_percpu(fp->aux->stats);
+  		kfree(fp->aux->poke_tab);
+  		kfree(fp->aux);
+diff --git a/drivers/net/ethernet/netronome/nfp/bpf/offload.c b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+index ac02369174a9..53851853562c 100644
+--- a/drivers/net/ethernet/netronome/nfp/bpf/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/bpf/offload.c
+@@ -111,7 +111,9 @@ static int
+ nfp_map_ptrs_record(struct nfp_app_bpf *bpf, struct nfp_prog *nfp_prog,
+ 		    struct bpf_prog *prog)
+ {
+-	int i, cnt, err;
++	int i, cnt, err = 0;
++
++	mutex_lock(&prog->aux->used_maps_mutex);
+ 
+ 	/* Quickly count the maps we will have to remember */
+ 	cnt = 0;
+@@ -119,13 +121,15 @@ nfp_map_ptrs_record(struct nfp_app_bpf *bpf, struct nfp_prog *nfp_prog,
+ 		if (bpf_map_offload_neutral(prog->aux->used_maps[i]))
+ 			cnt++;
+ 	if (!cnt)
+-		return 0;
++		goto out;
+ 
+ 	nfp_prog->map_records = kmalloc_array(cnt,
+ 					      sizeof(nfp_prog->map_records[0]),
+ 					      GFP_KERNEL);
+-	if (!nfp_prog->map_records)
+-		return -ENOMEM;
++	if (!nfp_prog->map_records) {
++		err = -ENOMEM;
++		goto out;
++	}
+ 
+ 	for (i = 0; i < prog->aux->used_map_cnt; i++)
+ 		if (bpf_map_offload_neutral(prog->aux->used_maps[i])) {
+@@ -133,12 +137,14 @@ nfp_map_ptrs_record(struct nfp_app_bpf *bpf, struct nfp_prog *nfp_prog,
+ 						 prog->aux->used_maps[i]);
+ 			if (err) {
+ 				nfp_map_ptrs_forget(bpf, nfp_prog);
+-				return err;
++				goto out;
+ 			}
+ 		}
+ 	WARN_ON(cnt != nfp_prog->map_records_cnt);
+ 
+-	return 0;
++out:
++	mutex_unlock(&prog->aux->used_maps_mutex);
++	return err;
+ }
+ 
+ static int
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 3f26f919575f..0383ebfb495a 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -756,6 +756,7 @@ struct bpf_prog_aux {
+ 	RH_KABI_BROKEN_INSERT(struct bpf_ksym ksym)
+ 	const struct bpf_prog_ops *ops;
+ 	struct bpf_map **used_maps;
++	struct mutex used_maps_mutex; /* mutex for used_maps and used_map_cnt */
+ 	struct bpf_prog *prog;
+ 	struct user_struct *user;
+ 	u64 load_time; /* ns since boottime */
+* Unmerged path kernel/bpf/core.c
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 70e6c7e995cb..a60267756f87 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -3306,21 +3306,25 @@ static const struct bpf_map *bpf_map_from_imm(const struct bpf_prog *prog,
+ 	const struct bpf_map *map;
+ 	int i;
+ 
++	mutex_lock(&prog->aux->used_maps_mutex);
+ 	for (i = 0, *off = 0; i < prog->aux->used_map_cnt; i++) {
+ 		map = prog->aux->used_maps[i];
+ 		if (map == (void *)addr) {
+ 			*type = BPF_PSEUDO_MAP_FD;
+-			return map;
++			goto out;
+ 		}
+ 		if (!map->ops->map_direct_value_meta)
+ 			continue;
+ 		if (!map->ops->map_direct_value_meta(map, addr, off)) {
+ 			*type = BPF_PSEUDO_MAP_VALUE;
+-			return map;
++			goto out;
+ 		}
+ 	}
++	map = NULL;
+ 
+-	return NULL;
++out:
++	mutex_unlock(&prog->aux->used_maps_mutex);
++	return map;
+ }
+ 
+ static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog,
+@@ -3438,6 +3442,7 @@ static int bpf_prog_get_info_by_fd(struct file *file,
+ 	memcpy(info.tag, prog->tag, sizeof(prog->tag));
+ 	memcpy(info.name, prog->aux->name, sizeof(prog->aux->name));
+ 
++	mutex_lock(&prog->aux->used_maps_mutex);
+ 	ulen = info.nr_map_ids;
+ 	info.nr_map_ids = prog->aux->used_map_cnt;
+ 	ulen = min_t(u32, info.nr_map_ids, ulen);
+@@ -3447,9 +3452,12 @@ static int bpf_prog_get_info_by_fd(struct file *file,
+ 
+ 		for (i = 0; i < ulen; i++)
+ 			if (put_user(prog->aux->used_maps[i]->id,
+-				     &user_map_ids[i]))
++				     &user_map_ids[i])) {
++				mutex_unlock(&prog->aux->used_maps_mutex);
+ 				return -EFAULT;
++			}
+ 	}
++	mutex_unlock(&prog->aux->used_maps_mutex);
+ 
+ 	err = set_info_rec_size(&info);
+ 	if (err)
+diff --git a/net/core/dev.c b/net/core/dev.c
+index e720f3b7827e..82c38c2390e4 100644
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@ -5189,15 +5189,20 @@ static int generic_xdp_install(struct net_device *dev, struct netdev_bpf *xdp)
+ 	if (new) {
+ 		u32 i;
+ 
++		mutex_lock(&new->aux->used_maps_mutex);
++
+ 		/* generic XDP does not work with DEVMAPs that can
+ 		 * have a bpf_prog installed on an entry
+ 		 */
+ 		for (i = 0; i < new->aux->used_map_cnt; i++) {
+-			if (dev_map_can_have_prog(new->aux->used_maps[i]))
+-				return -EINVAL;
+-			if (cpu_map_prog_allowed(new->aux->used_maps[i]))
++			if (dev_map_can_have_prog(new->aux->used_maps[i]) ||
++			    cpu_map_prog_allowed(new->aux->used_maps[i])) {
++				mutex_unlock(&new->aux->used_maps_mutex);
+ 				return -EINVAL;
++			}
+ 		}
++
++		mutex_unlock(&new->aux->used_maps_mutex);
+ 	}
+ 
+ 	switch (xdp->command) {
