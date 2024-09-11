@@ -1,0 +1,189 @@
+net/mlx5: Support enable_eth devlink dev param
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit a17beb28ed9dfd69e00ecd13cbd945fba8af4550
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/a17beb28.failed
+
+Enable user to disable Ethernet auxiliary device so that when it is not
+required, user can disable it.
+
+For example,
+
+$ devlink dev param set pci/0000:06:00.0 \
+              name enable_eth value false cmode driverinit
+$ devlink dev reload pci/0000:06:00.0
+
+At this point devlink instance do not create mlx5_core.eth.2 auxiliary
+device for the Ethernet functionality.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a17beb28ed9dfd69e00ecd13cbd945fba8af4550)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+index 9dee693eb638,557973c9212f..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@@ -659,10 -692,18 +705,14 @@@ int mlx5_devlink_register(struct devlin
+  	err = devlink_params_register(devlink, mlx5_devlink_params,
+  				      ARRAY_SIZE(mlx5_devlink_params));
+  	if (err)
+ -		goto params_reg_err;
+ +		return err;
+ +
+  	mlx5_devlink_set_params_init_values(devlink);
+ -	devlink_params_publish(devlink);
+  
++ 	err = mlx5_devlink_auxdev_params_register(devlink);
++ 	if (err)
++ 		goto auxdev_reg_err;
++ 
+  	err = mlx5_devlink_traps_register(devlink);
+  	if (err)
+  		goto traps_reg_err;
+@@@ -671,14 -711,21 +721,21 @@@
+  	return 0;
+  
+  traps_reg_err:
++ 	mlx5_devlink_auxdev_params_unregister(devlink);
++ auxdev_reg_err:
+  	devlink_params_unregister(devlink, mlx5_devlink_params,
+  				  ARRAY_SIZE(mlx5_devlink_params));
+ -params_reg_err:
+ -	devlink_unregister(devlink);
+  	return err;
+  }
+  
+  void mlx5_devlink_unregister(struct devlink *devlink)
+  {
+  	mlx5_devlink_traps_unregister(devlink);
+++<<<<<<< HEAD
+++=======
++ 	mlx5_devlink_auxdev_params_unregister(devlink);
++ 	devlink_params_unpublish(devlink);
+++>>>>>>> a17beb28ed9d (net/mlx5: Support enable_eth devlink dev param)
+  	devlink_params_unregister(devlink, mlx5_devlink_params,
+  				  ARRAY_SIZE(mlx5_devlink_params));
+ -	devlink_unregister(devlink);
+  }
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/dev.c b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+index 20bb37266254..22bd354223dc 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@ -53,7 +53,7 @@ static bool is_eth_rep_supported(struct mlx5_core_dev *dev)
+ 	return true;
+ }
+ 
+-static bool is_eth_supported(struct mlx5_core_dev *dev)
++bool mlx5_eth_supported(struct mlx5_core_dev *dev)
+ {
+ 	if (!IS_ENABLED(CONFIG_MLX5_CORE_EN))
+ 		return false;
+@@ -105,6 +105,17 @@ static bool is_eth_supported(struct mlx5_core_dev *dev)
+ 	return true;
+ }
+ 
++static bool is_eth_enabled(struct mlx5_core_dev *dev)
++{
++	union devlink_param_value val;
++	int err;
++
++	err = devlink_param_driverinit_value_get(priv_to_devlink(dev),
++						 DEVLINK_PARAM_GENERIC_ID_ENABLE_ETH,
++						 &val);
++	return err ? false : val.vbool;
++}
++
+ static bool is_vnet_supported(struct mlx5_core_dev *dev)
+ {
+ 	if (!IS_ENABLED(CONFIG_MLX5_VDPA_NET))
+@@ -201,13 +212,15 @@ enum {
+ static const struct mlx5_adev_device {
+ 	const char *suffix;
+ 	bool (*is_supported)(struct mlx5_core_dev *dev);
++	bool (*is_enabled)(struct mlx5_core_dev *dev);
+ } mlx5_adev_devices[] = {
+ 	[MLX5_INTERFACE_PROTOCOL_VNET] = { .suffix = "vnet",
+ 					   .is_supported = &is_vnet_supported },
+ 	[MLX5_INTERFACE_PROTOCOL_IB] = { .suffix = "rdma",
+ 					 .is_supported = &is_ib_supported },
+ 	[MLX5_INTERFACE_PROTOCOL_ETH] = { .suffix = "eth",
+-					  .is_supported = &is_eth_supported },
++					  .is_supported = &mlx5_eth_supported,
++					  .is_enabled = &is_eth_enabled },
+ 	[MLX5_INTERFACE_PROTOCOL_ETH_REP] = { .suffix = "eth-rep",
+ 					   .is_supported = &is_eth_rep_supported },
+ 	[MLX5_INTERFACE_PROTOCOL_IB_REP] = { .suffix = "rdma-rep",
+@@ -308,6 +321,14 @@ int mlx5_attach_device(struct mlx5_core_dev *dev)
+ 		if (!priv->adev[i]) {
+ 			bool is_supported = false;
+ 
++			if (mlx5_adev_devices[i].is_enabled) {
++				bool enabled;
++
++				enabled = mlx5_adev_devices[i].is_enabled(dev);
++				if (!enabled)
++					continue;
++			}
++
+ 			if (mlx5_adev_devices[i].is_supported)
+ 				is_supported = mlx5_adev_devices[i].is_supported(dev);
+ 
+@@ -360,6 +381,14 @@ void mlx5_detach_device(struct mlx5_core_dev *dev)
+ 		if (!priv->adev[i])
+ 			continue;
+ 
++		if (mlx5_adev_devices[i].is_enabled) {
++			bool enabled;
++
++			enabled = mlx5_adev_devices[i].is_enabled(dev);
++			if (!enabled)
++				goto skip_suspend;
++		}
++
+ 		adev = &priv->adev[i]->adev;
+ 		/* Auxiliary driver was unbind manually through sysfs */
+ 		if (!adev->dev.driver)
+@@ -447,12 +476,21 @@ static void delete_drivers(struct mlx5_core_dev *dev)
+ 		if (!priv->adev[i])
+ 			continue;
+ 
++		if (mlx5_adev_devices[i].is_enabled) {
++			bool enabled;
++
++			enabled = mlx5_adev_devices[i].is_enabled(dev);
++			if (!enabled)
++				goto del_adev;
++		}
++
+ 		if (mlx5_adev_devices[i].is_supported && !delete_all)
+ 			is_supported = mlx5_adev_devices[i].is_supported(dev);
+ 
+ 		if (is_supported)
+ 			continue;
+ 
++del_adev:
+ 		del_adev(&priv->adev[i]->adev);
+ 		priv->adev[i] = NULL;
+ 	}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index ca6363198a67..da532adc73cd 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@ -277,4 +277,7 @@ static inline u32 mlx5_sriov_get_vf_total_msix(struct pci_dev *pdev)
+ 
+ 	return MLX5_CAP_GEN_MAX(dev, num_total_dynamic_vf_msix);
+ }
++
++bool mlx5_eth_supported(struct mlx5_core_dev *dev);
++
+ #endif /* __MLX5_CORE_H__ */
