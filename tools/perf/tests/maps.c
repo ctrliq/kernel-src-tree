@@ -33,7 +33,7 @@ static int check_maps(struct map_def *merged, unsigned int size, struct map_grou
 	return TEST_OK;
 }
 
-int test__map_groups__merge_in(struct test *t __maybe_unused, int subtest __maybe_unused)
+int test__maps__merge_in(struct test *t __maybe_unused, int subtest __maybe_unused)
 {
 	struct map_groups mg;
 	unsigned int i;
