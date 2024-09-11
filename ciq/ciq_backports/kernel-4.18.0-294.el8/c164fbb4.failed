@@ -1,0 +1,454 @@
+x86/mm: thread pgprot_t through init_memory_mapping()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Logan Gunthorpe <logang@deltatee.com>
+commit c164fbb40c43f8041f4d05ec9996d8ee343c92b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c164fbb4.failed
+
+In preparation to support a pgprot_t argument for arch_add_memory().
+
+It's required to move the prototype of init_memory_mapping() seeing the
+original location came before the definition of pgprot_t.
+
+	Signed-off-by: Logan Gunthorpe <logang@deltatee.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Borislav Petkov <bp@alien8.de>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Benjamin Herrenschmidt <benh@kernel.crashing.org>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Eric Badger <ebadger@gigaio.com>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Paul Mackerras <paulus@samba.org>
+	Cc: Will Deacon <will@kernel.org>
+Link: http://lkml.kernel.org/r/20200306170846.9333-4-logang@deltatee.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c164fbb40c43f8041f4d05ec9996d8ee343c92b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/platform/uv/bios_uv.c
+diff --cc arch/x86/platform/uv/bios_uv.c
+index 6fbaf03c6d74,c60255da5a6c..000000000000
+--- a/arch/x86/platform/uv/bios_uv.c
++++ b/arch/x86/platform/uv/bios_uv.c
+@@@ -221,4 -217,164 +221,168 @@@ int uv_bios_init(void
+  	pr_info("UV: UVsystab: Revision:%x\n", uv_systab->revision);
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ static void __init early_code_mapping_set_exec(int executable)
++ {
++ 	efi_memory_desc_t *md;
++ 
++ 	if (!(__supported_pte_mask & _PAGE_NX))
++ 		return;
++ 
++ 	/* Make EFI service code area executable */
++ 	for_each_efi_memory_desc(md) {
++ 		if (md->type == EFI_RUNTIME_SERVICES_CODE ||
++ 		    md->type == EFI_BOOT_SERVICES_CODE)
++ 			efi_set_executable(md, executable);
++ 	}
++ }
++ 
++ void __init efi_uv1_memmap_phys_epilog(pgd_t *save_pgd)
++ {
++ 	/*
++ 	 * After the lock is released, the original page table is restored.
++ 	 */
++ 	int pgd_idx, i;
++ 	int nr_pgds;
++ 	pgd_t *pgd;
++ 	p4d_t *p4d;
++ 	pud_t *pud;
++ 
++ 	nr_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
++ 
++ 	for (pgd_idx = 0; pgd_idx < nr_pgds; pgd_idx++) {
++ 		pgd = pgd_offset_k(pgd_idx * PGDIR_SIZE);
++ 		set_pgd(pgd_offset_k(pgd_idx * PGDIR_SIZE), save_pgd[pgd_idx]);
++ 
++ 		if (!pgd_present(*pgd))
++ 			continue;
++ 
++ 		for (i = 0; i < PTRS_PER_P4D; i++) {
++ 			p4d = p4d_offset(pgd,
++ 					 pgd_idx * PGDIR_SIZE + i * P4D_SIZE);
++ 
++ 			if (!p4d_present(*p4d))
++ 				continue;
++ 
++ 			pud = (pud_t *)p4d_page_vaddr(*p4d);
++ 			pud_free(&init_mm, pud);
++ 		}
++ 
++ 		p4d = (p4d_t *)pgd_page_vaddr(*pgd);
++ 		p4d_free(&init_mm, p4d);
++ 	}
++ 
++ 	kfree(save_pgd);
++ 
++ 	__flush_tlb_all();
++ 	early_code_mapping_set_exec(0);
++ }
++ 
++ pgd_t * __init efi_uv1_memmap_phys_prolog(void)
++ {
++ 	unsigned long vaddr, addr_pgd, addr_p4d, addr_pud;
++ 	pgd_t *save_pgd, *pgd_k, *pgd_efi;
++ 	p4d_t *p4d, *p4d_k, *p4d_efi;
++ 	pud_t *pud;
++ 
++ 	int pgd;
++ 	int n_pgds, i, j;
++ 
++ 	early_code_mapping_set_exec(1);
++ 
++ 	n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT), PGDIR_SIZE);
++ 	save_pgd = kmalloc_array(n_pgds, sizeof(*save_pgd), GFP_KERNEL);
++ 	if (!save_pgd)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Build 1:1 identity mapping for UV1 memmap usage. Note that
++ 	 * PAGE_OFFSET is PGDIR_SIZE aligned when KASLR is disabled, while
++ 	 * it is PUD_SIZE ALIGNED with KASLR enabled. So for a given physical
++ 	 * address X, the pud_index(X) != pud_index(__va(X)), we can only copy
++ 	 * PUD entry of __va(X) to fill in pud entry of X to build 1:1 mapping.
++ 	 * This means here we can only reuse the PMD tables of the direct mapping.
++ 	 */
++ 	for (pgd = 0; pgd < n_pgds; pgd++) {
++ 		addr_pgd = (unsigned long)(pgd * PGDIR_SIZE);
++ 		vaddr = (unsigned long)__va(pgd * PGDIR_SIZE);
++ 		pgd_efi = pgd_offset_k(addr_pgd);
++ 		save_pgd[pgd] = *pgd_efi;
++ 
++ 		p4d = p4d_alloc(&init_mm, pgd_efi, addr_pgd);
++ 		if (!p4d) {
++ 			pr_err("Failed to allocate p4d table!\n");
++ 			goto out;
++ 		}
++ 
++ 		for (i = 0; i < PTRS_PER_P4D; i++) {
++ 			addr_p4d = addr_pgd + i * P4D_SIZE;
++ 			p4d_efi = p4d + p4d_index(addr_p4d);
++ 
++ 			pud = pud_alloc(&init_mm, p4d_efi, addr_p4d);
++ 			if (!pud) {
++ 				pr_err("Failed to allocate pud table!\n");
++ 				goto out;
++ 			}
++ 
++ 			for (j = 0; j < PTRS_PER_PUD; j++) {
++ 				addr_pud = addr_p4d + j * PUD_SIZE;
++ 
++ 				if (addr_pud > (max_pfn << PAGE_SHIFT))
++ 					break;
++ 
++ 				vaddr = (unsigned long)__va(addr_pud);
++ 
++ 				pgd_k = pgd_offset_k(vaddr);
++ 				p4d_k = p4d_offset(pgd_k, vaddr);
++ 				pud[j] = *pud_offset(p4d_k, vaddr);
++ 			}
++ 		}
++ 		pgd_offset_k(pgd * PGDIR_SIZE)->pgd &= ~_PAGE_NX;
++ 	}
++ 
++ 	__flush_tlb_all();
++ 	return save_pgd;
++ out:
++ 	efi_uv1_memmap_phys_epilog(save_pgd);
++ 	return NULL;
++ }
++ 
++ void __iomem *__init efi_ioremap(unsigned long phys_addr, unsigned long size,
++ 				 u32 type, u64 attribute)
++ {
++ 	unsigned long last_map_pfn;
++ 
++ 	if (type == EFI_MEMORY_MAPPED_IO)
++ 		return ioremap(phys_addr, size);
++ 
++ 	last_map_pfn = init_memory_mapping(phys_addr, phys_addr + size,
++ 					   PAGE_KERNEL);
++ 	if ((last_map_pfn << PAGE_SHIFT) < phys_addr + size) {
++ 		unsigned long top = last_map_pfn << PAGE_SHIFT;
++ 		efi_ioremap(top, size - (top - phys_addr), type, attribute);
++ 	}
++ 
++ 	if (!(attribute & EFI_MEMORY_WB))
++ 		efi_memory_uc((u64)(unsigned long)__va(phys_addr), size);
++ 
++ 	return (void __iomem *)__va(phys_addr);
++ }
++ 
++ static int __init arch_parse_efi_cmdline(char *str)
++ {
++ 	if (!str) {
++ 		pr_warn("need at least one option\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!efi_is_mixed() && parse_option_str(str, "old_map"))
++ 		set_bit(EFI_UV1_MEMMAP, &efi.flags);
++ 
++ 	return 0;
++ }
++ early_param("efi", arch_parse_efi_cmdline);
+++>>>>>>> c164fbb40c43 (x86/mm: thread pgprot_t through init_memory_mapping())
+diff --git a/arch/x86/include/asm/page_types.h b/arch/x86/include/asm/page_types.h
+index c85e15010f48..bf7aa2e290ef 100644
+--- a/arch/x86/include/asm/page_types.h
++++ b/arch/x86/include/asm/page_types.h
+@@ -73,9 +73,6 @@ static inline phys_addr_t get_max_mapped(void)
+ 
+ bool pfn_range_is_mapped(unsigned long start_pfn, unsigned long end_pfn);
+ 
+-extern unsigned long init_memory_mapping(unsigned long start,
+-					 unsigned long end);
+-
+ extern void initmem_init(void);
+ 
+ #endif	/* !__ASSEMBLY__ */
+diff --git a/arch/x86/include/asm/pgtable.h b/arch/x86/include/asm/pgtable.h
+index bd5e9f663e09..cb126ff4b1c9 100644
+--- a/arch/x86/include/asm/pgtable.h
++++ b/arch/x86/include/asm/pgtable.h
+@@ -1017,6 +1017,9 @@ static inline void __meminit init_trampoline_default(void)
+ 
+ void __init poking_init(void);
+ 
++unsigned long init_memory_mapping(unsigned long start,
++				  unsigned long end, pgprot_t prot);
++
+ # ifdef CONFIG_RANDOMIZE_MEMORY
+ void __meminit init_trampoline(void);
+ # else
+diff --git a/arch/x86/kernel/amd_gart_64.c b/arch/x86/kernel/amd_gart_64.c
+index b08582600278..d4b7817cca72 100644
+--- a/arch/x86/kernel/amd_gart_64.c
++++ b/arch/x86/kernel/amd_gart_64.c
+@@ -749,7 +749,8 @@ int __init gart_iommu_init(void)
+ 
+ 	start_pfn = PFN_DOWN(aper_base);
+ 	if (!pfn_range_is_mapped(start_pfn, end_pfn))
+-		init_memory_mapping(start_pfn<<PAGE_SHIFT, end_pfn<<PAGE_SHIFT);
++		init_memory_mapping(start_pfn<<PAGE_SHIFT, end_pfn<<PAGE_SHIFT,
++				    PAGE_KERNEL);
+ 
+ 	pr_info("PCI-DMA: using GART IOMMU.\n");
+ 	iommu_size = check_iommu_size(info.aper_base, aper_size);
+diff --git a/arch/x86/mm/init.c b/arch/x86/mm/init.c
+index ea2eebacf5fa..75c74cd157fb 100644
+--- a/arch/x86/mm/init.c
++++ b/arch/x86/mm/init.c
+@@ -460,7 +460,7 @@ bool pfn_range_is_mapped(unsigned long start_pfn, unsigned long end_pfn)
+  * the physical memory. To access them they are temporarily mapped.
+  */
+ unsigned long __ref init_memory_mapping(unsigned long start,
+-					       unsigned long end)
++					unsigned long end, pgprot_t prot)
+ {
+ 	struct map_range mr[NR_RANGE_MR];
+ 	unsigned long ret = 0;
+@@ -474,7 +474,8 @@ unsigned long __ref init_memory_mapping(unsigned long start,
+ 
+ 	for (i = 0; i < nr_range; i++)
+ 		ret = kernel_physical_mapping_init(mr[i].start, mr[i].end,
+-						   mr[i].page_size_mask);
++						   mr[i].page_size_mask,
++						   prot);
+ 
+ 	add_pfn_range_mapped(start >> PAGE_SHIFT, ret >> PAGE_SHIFT);
+ 
+@@ -514,7 +515,7 @@ static unsigned long __init init_range_memory_mapping(
+ 		 */
+ 		can_use_brk_pgt = max(start, (u64)pgt_buf_end<<PAGE_SHIFT) >=
+ 				    min(end, (u64)pgt_buf_top<<PAGE_SHIFT);
+-		init_memory_mapping(start, end);
++		init_memory_mapping(start, end, PAGE_KERNEL);
+ 		mapped_ram_size += end - start;
+ 		can_use_brk_pgt = true;
+ 	}
+@@ -654,7 +655,7 @@ void __init init_mem_mapping(void)
+ #endif
+ 
+ 	/* the ISA range is always mapped regardless of memory holes */
+-	init_memory_mapping(0, ISA_END_ADDRESS);
++	init_memory_mapping(0, ISA_END_ADDRESS, PAGE_KERNEL);
+ 
+ 	/* Init the trampoline, possibly with KASLR memory offset */
+ 	init_trampoline();
+diff --git a/arch/x86/mm/init_32.c b/arch/x86/mm/init_32.c
+index a97fb2a9390b..ba97da07308f 100644
+--- a/arch/x86/mm/init_32.c
++++ b/arch/x86/mm/init_32.c
+@@ -255,7 +255,8 @@ static inline int __is_kernel_text(unsigned long addr)
+ unsigned long __init
+ kernel_physical_mapping_init(unsigned long start,
+ 			     unsigned long end,
+-			     unsigned long page_size_mask)
++			     unsigned long page_size_mask,
++			     pgprot_t prot)
+ {
+ 	int use_pse = page_size_mask == (1<<PG_LEVEL_2M);
+ 	unsigned long last_map_addr = end;
+diff --git a/arch/x86/mm/init_64.c b/arch/x86/mm/init_64.c
+index 05348c61e15d..fe9e5472a230 100644
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@ -584,7 +584,7 @@ phys_pmd_init(pmd_t *pmd_page, unsigned long paddr, unsigned long paddr_end,
+  */
+ static unsigned long __meminit
+ phys_pud_init(pud_t *pud_page, unsigned long paddr, unsigned long paddr_end,
+-	      unsigned long page_size_mask, bool init)
++	      unsigned long page_size_mask, pgprot_t _prot, bool init)
+ {
+ 	unsigned long pages = 0, paddr_next;
+ 	unsigned long paddr_last = paddr_end;
+@@ -594,7 +594,7 @@ phys_pud_init(pud_t *pud_page, unsigned long paddr, unsigned long paddr_end,
+ 	for (; i < PTRS_PER_PUD; i++, paddr = paddr_next) {
+ 		pud_t *pud;
+ 		pmd_t *pmd;
+-		pgprot_t prot = PAGE_KERNEL;
++		pgprot_t prot = _prot;
+ 
+ 		vaddr = (unsigned long)__va(paddr);
+ 		pud = pud_page + pud_index(vaddr);
+@@ -643,9 +643,12 @@ phys_pud_init(pud_t *pud_page, unsigned long paddr, unsigned long paddr_end,
+ 		if (page_size_mask & (1<<PG_LEVEL_1G)) {
+ 			pages++;
+ 			spin_lock(&init_mm.page_table_lock);
++
++			prot = __pgprot(pgprot_val(prot) | __PAGE_KERNEL_LARGE);
++
+ 			set_pte_init((pte_t *)pud,
+ 				     pfn_pte((paddr & PUD_MASK) >> PAGE_SHIFT,
+-					     PAGE_KERNEL_LARGE),
++					     prot),
+ 				     init);
+ 			spin_unlock(&init_mm.page_table_lock);
+ 			paddr_last = paddr_next;
+@@ -668,7 +671,7 @@ phys_pud_init(pud_t *pud_page, unsigned long paddr, unsigned long paddr_end,
+ 
+ static unsigned long __meminit
+ phys_p4d_init(p4d_t *p4d_page, unsigned long paddr, unsigned long paddr_end,
+-	      unsigned long page_size_mask, bool init)
++	      unsigned long page_size_mask, pgprot_t prot, bool init)
+ {
+ 	unsigned long vaddr, vaddr_end, vaddr_next, paddr_next, paddr_last;
+ 
+@@ -678,7 +681,7 @@ phys_p4d_init(p4d_t *p4d_page, unsigned long paddr, unsigned long paddr_end,
+ 
+ 	if (!pgtable_l5_enabled())
+ 		return phys_pud_init((pud_t *) p4d_page, paddr, paddr_end,
+-				     page_size_mask, init);
++				     page_size_mask, prot, init);
+ 
+ 	for (; vaddr < vaddr_end; vaddr = vaddr_next) {
+ 		p4d_t *p4d = p4d_page + p4d_index(vaddr);
+@@ -701,13 +704,13 @@ phys_p4d_init(p4d_t *p4d_page, unsigned long paddr, unsigned long paddr_end,
+ 		if (!p4d_none(*p4d)) {
+ 			pud = pud_offset(p4d, 0);
+ 			paddr_last = phys_pud_init(pud, paddr, __pa(vaddr_end),
+-					page_size_mask, init);
++					page_size_mask, prot, init);
+ 			continue;
+ 		}
+ 
+ 		pud = alloc_low_page();
+ 		paddr_last = phys_pud_init(pud, paddr, __pa(vaddr_end),
+-					   page_size_mask, init);
++					   page_size_mask, prot, init);
+ 
+ 		spin_lock(&init_mm.page_table_lock);
+ 		p4d_populate_init(&init_mm, p4d, pud, init);
+@@ -721,7 +724,7 @@ static unsigned long __meminit
+ __kernel_physical_mapping_init(unsigned long paddr_start,
+ 			       unsigned long paddr_end,
+ 			       unsigned long page_size_mask,
+-			       bool init)
++			       pgprot_t prot, bool init)
+ {
+ 	bool pgd_changed = false;
+ 	unsigned long vaddr, vaddr_start, vaddr_end, vaddr_next, paddr_last;
+@@ -742,13 +745,13 @@ __kernel_physical_mapping_init(unsigned long paddr_start,
+ 			paddr_last = phys_p4d_init(p4d, __pa(vaddr),
+ 						   __pa(vaddr_end),
+ 						   page_size_mask,
+-						   init);
++						   prot, init);
+ 			continue;
+ 		}
+ 
+ 		p4d = alloc_low_page();
+ 		paddr_last = phys_p4d_init(p4d, __pa(vaddr), __pa(vaddr_end),
+-					   page_size_mask, init);
++					   page_size_mask, prot, init);
+ 
+ 		spin_lock(&init_mm.page_table_lock);
+ 		if (pgtable_l5_enabled())
+@@ -777,10 +780,10 @@ __kernel_physical_mapping_init(unsigned long paddr_start,
+ unsigned long __meminit
+ kernel_physical_mapping_init(unsigned long paddr_start,
+ 			     unsigned long paddr_end,
+-			     unsigned long page_size_mask)
++			     unsigned long page_size_mask, pgprot_t prot)
+ {
+ 	return __kernel_physical_mapping_init(paddr_start, paddr_end,
+-					      page_size_mask, true);
++					      page_size_mask, prot, true);
+ }
+ 
+ /*
+@@ -795,7 +798,8 @@ kernel_physical_mapping_change(unsigned long paddr_start,
+ 			       unsigned long page_size_mask)
+ {
+ 	return __kernel_physical_mapping_init(paddr_start, paddr_end,
+-					      page_size_mask, false);
++					      page_size_mask, PAGE_KERNEL,
++					      false);
+ }
+ 
+ #ifndef CONFIG_NUMA
+@@ -863,7 +867,7 @@ int arch_add_memory(int nid, u64 start, u64 size,
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+ 
+-	init_memory_mapping(start, start + size);
++	init_memory_mapping(start, start + size, PAGE_KERNEL);
+ 
+ 	return add_pages(nid, start_pfn, nr_pages, restrictions);
+ }
+diff --git a/arch/x86/mm/mm_internal.h b/arch/x86/mm/mm_internal.h
+index f773443ff056..20e21246f930 100644
+--- a/arch/x86/mm/mm_internal.h
++++ b/arch/x86/mm/mm_internal.h
+@@ -12,7 +12,8 @@ void early_ioremap_page_table_range_init(void);
+ 
+ unsigned long kernel_physical_mapping_init(unsigned long start,
+ 					     unsigned long end,
+-					     unsigned long page_size_mask);
++					     unsigned long page_size_mask,
++					     pgprot_t prot);
+ unsigned long kernel_physical_mapping_change(unsigned long start,
+ 					     unsigned long end,
+ 					     unsigned long page_size_mask);
+* Unmerged path arch/x86/platform/uv/bios_uv.c
