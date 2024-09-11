@@ -87,6 +87,7 @@ static int soc_rtd_trigger(struct snd_soc_pcm_runtime *rtd,
  * PCM runtime components
  * @rtd: ASoC PCM runtime that is activated
  * @stream: Direction of the PCM stream
+ * @action: Activate stream if 1. Deactivate if -1.
  *
  * Increments/Decrements the active count for all the DAIs and components
  * attached to a PCM runtime.
