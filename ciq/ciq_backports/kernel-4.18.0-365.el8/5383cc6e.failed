@@ -1,0 +1,251 @@
+arm64: mm: Introduce vabits_actual
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Steve Capper <steve.capper@arm.com>
+commit 5383cc6efed13784ddb3cff2cc183b6b8c50c8db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/5383cc6e.failed
+
+In order to support 52-bit kernel addresses detectable at boot time, one
+needs to know the actual VA_BITS detected. A new variable vabits_actual
+is introduced in this commit and employed for the KVM hypervisor layout,
+KASAN, fault handling and phys-to/from-virt translation where there
+would normally be compile time constants.
+
+In order to maintain performance in phys_to_virt, another variable
+physvirt_offset is introduced.
+
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Steve Capper <steve.capper@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 5383cc6efed13784ddb3cff2cc183b6b8c50c8db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kasan.h
+#	arch/arm64/kvm/va_layout.c
+#	arch/arm64/mm/init.c
+diff --cc arch/arm64/include/asm/kasan.h
+index b52aacd2c526,b0dc4abc3589..000000000000
+--- a/arch/arm64/include/asm/kasan.h
++++ b/arch/arm64/include/asm/kasan.h
+@@@ -33,8 -30,8 +33,13 @@@
+   *      KASAN_SHADOW_OFFSET = KASAN_SHADOW_END -
+   *				(1ULL << (64 - KASAN_SHADOW_SCALE_SHIFT))
+   */
+++<<<<<<< HEAD
+ +#define KASAN_SHADOW_OFFSET     (KASAN_SHADOW_END - (1ULL << \
+ +					(64 - KASAN_SHADOW_SCALE_SHIFT)))
+++=======
++ #define _KASAN_SHADOW_START(va)	(KASAN_SHADOW_END - (1UL << ((va) - KASAN_SHADOW_SCALE_SHIFT)))
++ #define KASAN_SHADOW_START      _KASAN_SHADOW_START(vabits_actual)
+++>>>>>>> 5383cc6efed1 (arm64: mm: Introduce vabits_actual)
+  
+  void kasan_init(void);
+  void kasan_copy_shadow(pgd_t *pgdir);
+diff --cc arch/arm64/kvm/va_layout.c
+index 75a9840c0768,2cf7d4b606c3..000000000000
+--- a/arch/arm64/kvm/va_layout.c
++++ b/arch/arm64/kvm/va_layout.c
+@@@ -48,22 -26,39 +48,48 @@@ __init void kvm_compute_layout(void
+  {
+  	phys_addr_t idmap_addr = __pa_symbol(__hyp_idmap_text_start);
+  	u64 hyp_va_msb;
+ -	int kva_msb;
+  
+  	/* Where is my RAM region? */
+- 	hyp_va_msb  = idmap_addr & BIT(VA_BITS - 1);
+- 	hyp_va_msb ^= BIT(VA_BITS - 1);
++ 	hyp_va_msb  = idmap_addr & BIT(vabits_actual - 1);
++ 	hyp_va_msb ^= BIT(vabits_actual - 1);
+  
+ -	kva_msb = fls64((u64)phys_to_virt(memblock_start_of_DRAM()) ^
+ +	tag_lsb = fls64((u64)phys_to_virt(memblock_start_of_DRAM()) ^
+  			(u64)(high_memory - 1));
+  
+++<<<<<<< HEAD
+ +	va_mask = GENMASK_ULL(tag_lsb - 1, 0);
+ +	tag_val = hyp_va_msb;
+ +
+ +	if (tag_lsb != (VA_BITS - 1)) {
+ +		/* We have some free bits to insert a random tag. */
+ +		tag_val |= get_random_long() & GENMASK_ULL(VA_BITS - 2, tag_lsb);
+++=======
++ 	if (kva_msb == (vabits_actual - 1)) {
++ 		/*
++ 		 * No space in the address, let's compute the mask so
++ 		 * that it covers (vabits_actual - 1) bits, and the region
++ 		 * bit. The tag stays set to zero.
++ 		 */
++ 		va_mask  = BIT(vabits_actual - 1) - 1;
++ 		va_mask |= hyp_va_msb;
++ 	} else {
++ 		/*
++ 		 * We do have some free bits to insert a random tag.
++ 		 * Hyp VAs are now created from kernel linear map VAs
++ 		 * using the following formula (with V == vabits_actual):
++ 		 *
++ 		 *  63 ... V |     V-1    | V-2 .. tag_lsb | tag_lsb - 1 .. 0
++ 		 *  ---------------------------------------------------------
++ 		 * | 0000000 | hyp_va_msb |    random tag  |  kern linear VA |
++ 		 */
++ 		tag_lsb = kva_msb;
++ 		va_mask = GENMASK_ULL(tag_lsb - 1, 0);
++ 		tag_val = get_random_long() & GENMASK_ULL(vabits_actual - 2, tag_lsb);
++ 		tag_val |= hyp_va_msb;
++ 		tag_val >>= tag_lsb;
+++>>>>>>> 5383cc6efed1 (arm64: mm: Introduce vabits_actual)
+  	}
+ +	tag_val >>= tag_lsb;
+  }
+  
+  static u32 compute_instruction(int n, u32 rd, u32 rn)
+diff --cc arch/arm64/mm/init.c
+index 49bc8730c5b8,e752f46d430e..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -61,25 -50,10 +61,32 @@@
+  s64 memstart_addr __ro_after_init = -1;
+  EXPORT_SYMBOL(memstart_addr);
+  
+++<<<<<<< HEAD
+ +phys_addr_t arm64_dma32_phys_limit __ro_after_init;
+ +
+ +#ifdef CONFIG_BLK_DEV_INITRD
+ +static int __init early_initrd(char *p)
+ +{
+ +	unsigned long start, size;
+ +	char *endp;
+ +
+ +	start = memparse(p, &endp);
+ +	if (*endp == ',') {
+ +		size = memparse(endp + 1, NULL);
+ +
+ +		initrd_start = start;
+ +		initrd_end = start + size;
+ +	}
+ +	return 0;
+ +}
+ +early_param("initrd", early_initrd);
+ +#endif
+++=======
++ s64 physvirt_offset __ro_after_init;
++ EXPORT_SYMBOL(physvirt_offset);
++ 
++ phys_addr_t arm64_dma_phys_limit __ro_after_init;
+++>>>>>>> 5383cc6efed1 (arm64: mm: Introduce vabits_actual)
+  
+  #ifdef CONFIG_KEXEC_CORE
+  /*
+* Unmerged path arch/arm64/include/asm/kasan.h
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index 4f7a83123dad..5b05e14d6a6e 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -57,8 +57,6 @@
+  * VA_START - the first kernel virtual address.
+  */
+ #define VA_BITS			(CONFIG_ARM64_VA_BITS)
+-#define VA_START		(UL(0xffffffffffffffff) - \
+-	(UL(1) << (VA_BITS - 1)) + 1)
+ #define PAGE_OFFSET		(UL(0xffffffffffffffff) - \
+ 	(UL(1) << VA_BITS) + 1)
+ #define KIMAGE_VADDR		(MODULES_END)
+@@ -185,10 +183,13 @@
+ #endif
+ 
+ #ifndef __ASSEMBLY__
++extern u64			vabits_actual;
++#define VA_START		(_VA_START(vabits_actual))
+ 
+ #include <linux/bitops.h>
+ #include <linux/mmdebug.h>
+ 
++extern s64			physvirt_offset;
+ extern s64			memstart_addr;
+ /* PHYS_OFFSET - the physical address of the start of memory. */
+ #define PHYS_OFFSET		({ VM_BUG_ON(memstart_addr & 1); memstart_addr; })
+@@ -265,9 +266,9 @@ static inline const void *__tag_set(const void *addr, u8 tag)
+  * space. Testing the top bit for the start of the region is a
+  * sufficient check.
+  */
+-#define __is_lm_address(addr)	(!((addr) & BIT(VA_BITS - 1)))
++#define __is_lm_address(addr)	(!((addr) & BIT(vabits_actual - 1)))
+ 
+-#define __lm_to_phys(addr)	(((addr) & ~PAGE_OFFSET) + PHYS_OFFSET)
++#define __lm_to_phys(addr)	(((addr) + physvirt_offset))
+ #define __kimg_to_phys(addr)	((addr) - kimage_voffset)
+ 
+ #define __virt_to_phys_nodebug(x) ({					\
+@@ -286,7 +287,7 @@ extern phys_addr_t __phys_addr_symbol(unsigned long x);
+ #define __phys_addr_symbol(x)	__pa_symbol_nodebug(x)
+ #endif
+ 
+-#define __phys_to_virt(x)	((unsigned long)((x) - PHYS_OFFSET) | PAGE_OFFSET)
++#define __phys_to_virt(x)	((unsigned long)((x) - physvirt_offset))
+ #define __phys_to_kimg(x)	((unsigned long)((x) + kimage_voffset))
+ 
+ /*
+diff --git a/arch/arm64/include/asm/mmu_context.h b/arch/arm64/include/asm/mmu_context.h
+index 0f4179030d72..184a45ec6672 100644
+--- a/arch/arm64/include/asm/mmu_context.h
++++ b/arch/arm64/include/asm/mmu_context.h
+@@ -106,7 +106,7 @@ static inline void __cpu_set_tcr_t0sz(unsigned long t0sz)
+ 	isb();
+ }
+ 
+-#define cpu_set_default_tcr_t0sz()	__cpu_set_tcr_t0sz(TCR_T0SZ(VA_BITS))
++#define cpu_set_default_tcr_t0sz()	__cpu_set_tcr_t0sz(TCR_T0SZ(vabits_actual))
+ #define cpu_set_idmap_tcr_t0sz()	__cpu_set_tcr_t0sz(idmap_t0sz)
+ 
+ /*
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 04d29898ce46..111aba24cbd4 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -332,6 +332,11 @@ __create_page_tables:
+ 	dmb	sy
+ 	dc	ivac, x6		// Invalidate potentially stale cache line
+ 
++	adr_l	x6, vabits_actual
++	str	x5, [x6]
++	dmb	sy
++	dc	ivac, x6		// Invalidate potentially stale cache line
++
+ 	/*
+ 	 * VA_BITS may be too small to allow for an ID mapping to be created
+ 	 * that covers system RAM if that is located sufficiently high in the
+* Unmerged path arch/arm64/kvm/va_layout.c
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 9216265c0f74..259006bba232 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -171,9 +171,9 @@ void show_pte(unsigned long addr)
+ 		return;
+ 	}
+ 
+-	pr_alert("%s pgtable: %luk pages, %u-bit VAs, pgdp=%016lx\n",
++	pr_alert("%s pgtable: %luk pages, %llu-bit VAs, pgdp=%016lx\n",
+ 		 mm == &init_mm ? "swapper" : "user", PAGE_SIZE / SZ_1K,
+-		 mm == &init_mm ? VA_BITS : (int)vabits_user,
++		 mm == &init_mm ? vabits_actual : (int)vabits_user,
+ 		 (unsigned long)virt_to_phys(mm->pgd));
+ 	pgdp = pgd_offset(mm, addr);
+ 	pgd = READ_ONCE(*pgdp);
+* Unmerged path arch/arm64/mm/init.c
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index 89b746333b14..a4cf3e91df2f 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -56,6 +56,9 @@ u64 idmap_ptrs_per_pgd = PTRS_PER_PGD;
+ u64 vabits_user __ro_after_init;
+ EXPORT_SYMBOL(vabits_user);
+ 
++u64 __section(".mmuoff.data.write") vabits_actual;
++EXPORT_SYMBOL(vabits_actual);
++
+ u64 kimage_voffset __ro_after_init;
+ EXPORT_SYMBOL(kimage_voffset);
+ 
