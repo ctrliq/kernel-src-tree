@@ -1,0 +1,645 @@
+KVM: x86/mmu: Use an rwlock for the x86 MMU
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-301.1.el8
+commit-author Ben Gardon <bgardon@google.com>
+commit 531810caa9f4bc99ffbb90e09256792c56a6b07a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-301.1.el8/531810ca.failed
+
+Add a read / write lock to be used in place of the MMU spinlock on x86.
+The rwlock will enable the TDP MMU to handle page faults, and other
+operations in parallel in future commits.
+
+	Reviewed-by: Peter Feiner <pfeiner@google.com>
+	Signed-off-by: Ben Gardon <bgardon@google.com>
+
+Message-Id: <20210202185734.1680553-19-bgardon@google.com>
+[Introduce virt/kvm/mmu_lock.h - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 531810caa9f4bc99ffbb90e09256792c56a6b07a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/dirty_ring.c
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 63d2ae5e46a4,48ccdf4e3d04..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -491,9 -492,10 +494,14 @@@ static void kvm_mmu_notifier_invalidate
+  	if (need_tlb_flush || kvm->tlbs_dirty)
+  		kvm_flush_remote_tlbs(kvm);
+  
+++<<<<<<< HEAD
+ +	spin_unlock(&kvm->mmu_lock);
+++=======
++ 	KVM_MMU_UNLOCK(kvm);
++ 	srcu_read_unlock(&kvm->srcu, idx);
+++>>>>>>> 531810caa9f4 (KVM: x86/mmu: Use an rwlock for the x86 MMU)
+  
+ -	return 0;
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+  static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+* Unmerged path virt/kvm/dirty_ring.c
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 77d928778b79..15e6a654d1cd 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -340,6 +340,8 @@ struct kvm_mmu_root_info {
+ 
+ #define KVM_MMU_NUM_PREV_ROOTS 3
+ 
++#define KVM_HAVE_MMU_RWLOCK
++
+ struct kvm_mmu_page;
+ 
+ /*
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 817f867018a4..aca5af3beca7 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -2007,9 +2007,9 @@ static void mmu_sync_children(struct kvm_vcpu *vcpu,
+ 			flush |= kvm_sync_page(vcpu, sp, &invalid_list);
+ 			mmu_pages_clear_parents(&parents);
+ 		}
+-		if (need_resched() || spin_needbreak(&vcpu->kvm->mmu_lock)) {
++		if (need_resched() || rwlock_needbreak(&vcpu->kvm->mmu_lock)) {
+ 			kvm_mmu_flush_or_zap(vcpu, &invalid_list, false, flush);
+-			cond_resched_lock(&vcpu->kvm->mmu_lock);
++			cond_resched_rwlock_write(&vcpu->kvm->mmu_lock);
+ 			flush = false;
+ 		}
+ 	}
+@@ -2461,7 +2461,7 @@ static int make_mmu_pages_available(struct kvm_vcpu *vcpu)
+  */
+ void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned long goal_nr_mmu_pages)
+ {
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 
+ 	if (kvm->arch.n_used_mmu_pages > goal_nr_mmu_pages) {
+ 		kvm_mmu_zap_oldest_mmu_pages(kvm, kvm->arch.n_used_mmu_pages -
+@@ -2472,7 +2472,7 @@ void kvm_mmu_change_mmu_pages(struct kvm *kvm, unsigned long goal_nr_mmu_pages)
+ 
+ 	kvm->arch.n_max_mmu_pages = goal_nr_mmu_pages;
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ 
+ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn)
+@@ -2483,7 +2483,7 @@ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn)
+ 
+ 	pgprintk("%s: looking for gfn %llx\n", __func__, gfn);
+ 	r = 0;
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	for_each_gfn_indirect_valid_sp(kvm, sp, gfn) {
+ 		pgprintk("%s: gfn %llx role %x\n", __func__, gfn,
+ 			 sp->role.word);
+@@ -2491,7 +2491,7 @@ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn)
+ 		kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list);
+ 	}
+ 	kvm_mmu_commit_zap_page(kvm, &invalid_list);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	return r;
+ }
+@@ -3183,7 +3183,7 @@ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ 			return;
+ 	}
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 
+ 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+ 		if (roots_to_free & KVM_MMU_ROOT_PREVIOUS(i))
+@@ -3206,7 +3206,7 @@ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ 	}
+ 
+ 	kvm_mmu_commit_zap_page(kvm, &invalid_list);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_free_roots);
+ 
+@@ -3227,16 +3227,16 @@ static hpa_t mmu_alloc_root(struct kvm_vcpu *vcpu, gfn_t gfn, gva_t gva,
+ {
+ 	struct kvm_mmu_page *sp;
+ 
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 
+ 	if (make_mmu_pages_available(vcpu)) {
+-		spin_unlock(&vcpu->kvm->mmu_lock);
++		write_unlock(&vcpu->kvm->mmu_lock);
+ 		return INVALID_PAGE;
+ 	}
+ 	sp = kvm_mmu_get_page(vcpu, gfn, gva, level, direct, ACC_ALL);
+ 	++sp->root_count;
+ 
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ 	return __pa(sp->spt);
+ }
+ 
+@@ -3407,17 +3407,17 @@ void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu)
+ 		    !smp_load_acquire(&sp->unsync_children))
+ 			return;
+ 
+-		spin_lock(&vcpu->kvm->mmu_lock);
++		write_lock(&vcpu->kvm->mmu_lock);
+ 		kvm_mmu_audit(vcpu, AUDIT_PRE_SYNC);
+ 
+ 		mmu_sync_children(vcpu, sp);
+ 
+ 		kvm_mmu_audit(vcpu, AUDIT_POST_SYNC);
+-		spin_unlock(&vcpu->kvm->mmu_lock);
++		write_unlock(&vcpu->kvm->mmu_lock);
+ 		return;
+ 	}
+ 
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 	kvm_mmu_audit(vcpu, AUDIT_PRE_SYNC);
+ 
+ 	for (i = 0; i < 4; ++i) {
+@@ -3431,7 +3431,7 @@ void kvm_mmu_sync_roots(struct kvm_vcpu *vcpu)
+ 	}
+ 
+ 	kvm_mmu_audit(vcpu, AUDIT_POST_SYNC);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ EXPORT_SYMBOL_GPL(kvm_mmu_sync_roots);
+ 
+@@ -3715,7 +3715,7 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 		return r;
+ 
+ 	r = RET_PF_RETRY;
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+ 	r = make_mmu_pages_available(vcpu);
+@@ -3730,7 +3730,7 @@ static int direct_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+ 				 prefault, is_tdp);
+ 
+ out_unlock:
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+ 	return r;
+ }
+@@ -4989,7 +4989,7 @@ static void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 	 */
+ 	mmu_topup_memory_caches(vcpu, true);
+ 
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 
+ 	gentry = mmu_pte_write_fetch_gpte(vcpu, &gpa, &bytes);
+ 
+@@ -5025,7 +5025,7 @@ static void kvm_mmu_pte_write(struct kvm_vcpu *vcpu, gpa_t gpa,
+ 	}
+ 	kvm_mmu_flush_or_zap(vcpu, &invalid_list, remote_flush, local_flush);
+ 	kvm_mmu_audit(vcpu, AUDIT_POST_PTE_WRITE);
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ 
+ int kvm_mmu_unprotect_page_virt(struct kvm_vcpu *vcpu, gva_t gva)
+@@ -5223,14 +5223,14 @@ slot_handle_level_range(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 		if (iterator.rmap)
+ 			flush |= fn(kvm, iterator.rmap);
+ 
+-		if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+ 			if (flush && lock_flush_tlb) {
+ 				kvm_flush_remote_tlbs_with_address(kvm,
+ 						start_gfn,
+ 						iterator.gfn - start_gfn + 1);
+ 				flush = false;
+ 			}
+-			cond_resched_lock(&kvm->mmu_lock);
++			cond_resched_rwlock_write(&kvm->mmu_lock);
+ 		}
+ 	}
+ 
+@@ -5380,7 +5380,7 @@ static void kvm_zap_obsolete_pages(struct kvm *kvm)
+ 		 * be in active use by the guest.
+ 		 */
+ 		if (batch >= BATCH_ZAP_PAGES &&
+-		    cond_resched_lock(&kvm->mmu_lock)) {
++		    cond_resched_rwlock_write(&kvm->mmu_lock)) {
+ 			batch = 0;
+ 			goto restart;
+ 		}
+@@ -5413,7 +5413,7 @@ static void kvm_mmu_zap_all_fast(struct kvm *kvm)
+ {
+ 	lockdep_assert_held(&kvm->slots_lock);
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	trace_kvm_mmu_zap_all_fast(kvm);
+ 
+ 	/*
+@@ -5440,7 +5440,7 @@ static void kvm_mmu_zap_all_fast(struct kvm *kvm)
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		kvm_tdp_mmu_zap_all(kvm);
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ 
+ static bool kvm_has_zapped_obsolete_pages(struct kvm *kvm)
+@@ -5482,7 +5482,7 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+ 	int i;
+ 	bool flush;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+ 		slots = __kvm_memslots(kvm, i);
+ 		kvm_for_each_memslot(memslot, slots) {
+@@ -5506,7 +5506,7 @@ void kvm_zap_gfn_range(struct kvm *kvm, gfn_t gfn_start, gfn_t gfn_end)
+ 			kvm_flush_remote_tlbs(kvm);
+ 	}
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ 
+ static bool slot_rmap_write_protect(struct kvm *kvm,
+@@ -5521,12 +5521,12 @@ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+ {
+ 	bool flush;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ 				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, PG_LEVEL_4K);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	/*
+ 	 * We can flush all the TLBs out of the mmu lock without TLB
+@@ -5586,13 +5586,13 @@ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot)
+ {
+ 	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	slot_handle_leaf(kvm, (struct kvm_memory_slot *)memslot,
+ 			 kvm_mmu_zap_collapsible_spte, true);
+ 
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		kvm_tdp_mmu_zap_collapsible_sptes(kvm, memslot);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ 
+ void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
+@@ -5615,11 +5615,11 @@ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+ {
+ 	bool flush;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	/*
+ 	 * It's also safe to flush TLBs out of mmu lock here as currently this
+@@ -5637,12 +5637,12 @@ void kvm_mmu_slot_largepage_remove_write_access(struct kvm *kvm,
+ {
+ 	bool flush;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_large_level(kvm, memslot, slot_rmap_write_protect,
+ 					false);
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, PG_LEVEL_2M);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	if (flush)
+ 		kvm_arch_flush_remote_tlbs_memslot(kvm, memslot);
+@@ -5654,11 +5654,11 @@ void kvm_mmu_slot_set_dirty(struct kvm *kvm,
+ {
+ 	bool flush;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	flush = slot_handle_all_level(kvm, memslot, __rmap_set_dirty, false);
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		flush |= kvm_tdp_mmu_slot_set_dirty(kvm, memslot);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	if (flush)
+ 		kvm_arch_flush_remote_tlbs_memslot(kvm, memslot);
+@@ -5671,14 +5671,14 @@ void kvm_mmu_zap_all(struct kvm *kvm)
+ 	LIST_HEAD(invalid_list);
+ 	int ign;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ restart:
+ 	list_for_each_entry_safe(sp, node, &kvm->arch.active_mmu_pages, link) {
+ 		if (WARN_ON(sp->role.invalid))
+ 			continue;
+ 		if (__kvm_mmu_prepare_zap_page(kvm, sp, &invalid_list, &ign))
+ 			goto restart;
+-		if (cond_resched_lock(&kvm->mmu_lock))
++		if (cond_resched_rwlock_write(&kvm->mmu_lock))
+ 			goto restart;
+ 	}
+ 
+@@ -5687,7 +5687,7 @@ void kvm_mmu_zap_all(struct kvm *kvm)
+ 	if (kvm->arch.tdp_mmu_enabled)
+ 		kvm_tdp_mmu_zap_all(kvm);
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ 
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen)
+@@ -5747,7 +5747,7 @@ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ 			continue;
+ 
+ 		idx = srcu_read_lock(&kvm->srcu);
+-		spin_lock(&kvm->mmu_lock);
++		write_lock(&kvm->mmu_lock);
+ 
+ 		if (kvm_has_zapped_obsolete_pages(kvm)) {
+ 			kvm_mmu_commit_zap_page(kvm,
+@@ -5758,7 +5758,7 @@ mmu_shrink_scan(struct shrinker *shrink, struct shrink_control *sc)
+ 		freed = kvm_mmu_zap_oldest_mmu_pages(kvm, sc->nr_to_scan);
+ 
+ unlock:
+-		spin_unlock(&kvm->mmu_lock);
++		write_unlock(&kvm->mmu_lock);
+ 		srcu_read_unlock(&kvm->srcu, idx);
+ 
+ 		/*
+@@ -5978,7 +5978,7 @@ static void kvm_recover_nx_lpages(struct kvm *kvm)
+ 	ulong to_zap;
+ 
+ 	rcu_idx = srcu_read_lock(&kvm->srcu);
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 
+ 	ratio = READ_ONCE(nx_huge_pages_recovery_ratio);
+ 	to_zap = ratio ? DIV_ROUND_UP(kvm->stat.nx_lpage_splits, ratio) : 0;
+@@ -6003,14 +6003,14 @@ static void kvm_recover_nx_lpages(struct kvm *kvm)
+ 			WARN_ON_ONCE(sp->lpage_disallowed);
+ 		}
+ 
+-		if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+ 			kvm_mmu_commit_zap_page(kvm, &invalid_list);
+-			cond_resched_lock(&kvm->mmu_lock);
++			cond_resched_rwlock_write(&kvm->mmu_lock);
+ 		}
+ 	}
+ 	kvm_mmu_commit_zap_page(kvm, &invalid_list);
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 	srcu_read_unlock(&kvm->srcu, rcu_idx);
+ }
+ 
+diff --git a/arch/x86/kvm/mmu/page_track.c b/arch/x86/kvm/mmu/page_track.c
+index 8443a675715b..34bb0ec69bd8 100644
+--- a/arch/x86/kvm/mmu/page_track.c
++++ b/arch/x86/kvm/mmu/page_track.c
+@@ -184,9 +184,9 @@ kvm_page_track_register_notifier(struct kvm *kvm,
+ 
+ 	head = &kvm->arch.track_notifier_head;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	hlist_add_head_rcu(&n->node, &head->track_notifier_list);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ }
+ EXPORT_SYMBOL_GPL(kvm_page_track_register_notifier);
+ 
+@@ -202,9 +202,9 @@ kvm_page_track_unregister_notifier(struct kvm *kvm,
+ 
+ 	head = &kvm->arch.track_notifier_head;
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 	hlist_del_rcu(&n->node);
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 	synchronize_srcu(&head->track_srcu);
+ }
+ EXPORT_SYMBOL_GPL(kvm_page_track_unregister_notifier);
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index fdbc4c83e7d5..e11b88451477 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -868,7 +868,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gpa_t addr, u32 error_code,
+ 	}
+ 
+ 	r = RET_PF_RETRY;
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 	if (mmu_notifier_retry(vcpu->kvm, mmu_seq))
+ 		goto out_unlock;
+ 
+@@ -881,7 +881,7 @@ static int FNAME(page_fault)(struct kvm_vcpu *vcpu, gpa_t addr, u32 error_code,
+ 	kvm_mmu_audit(vcpu, AUDIT_POST_PAGE_FAULT);
+ 
+ out_unlock:
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ 	kvm_release_pfn_clean(pfn);
+ 	return r;
+ }
+@@ -919,7 +919,7 @@ static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa)
+ 		return;
+ 	}
+ 
+-	spin_lock(&vcpu->kvm->mmu_lock);
++	write_lock(&vcpu->kvm->mmu_lock);
+ 	for_each_shadow_entry_using_root(vcpu, root_hpa, gva, iterator) {
+ 		level = iterator.level;
+ 		sptep = iterator.sptep;
+@@ -954,7 +954,7 @@ static void FNAME(invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa)
+ 		if (!is_shadow_present_pte(*sptep) || !sp->unsync_children)
+ 			break;
+ 	}
+-	spin_unlock(&vcpu->kvm->mmu_lock);
++	write_unlock(&vcpu->kvm->mmu_lock);
+ }
+ 
+ /* Note, @addr is a GPA when gva_to_gpa() translates an L2 GPA to an L1 GPA. */
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 934798456219..a93a7b438ed6 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -59,7 +59,7 @@ static void tdp_mmu_put_root(struct kvm *kvm, struct kvm_mmu_page *root)
+ static inline bool tdp_mmu_next_root_valid(struct kvm *kvm,
+ 					   struct kvm_mmu_page *root)
+ {
+-	lockdep_assert_held(&kvm->mmu_lock);
++	lockdep_assert_held_write(&kvm->mmu_lock);
+ 
+ 	if (list_entry_is_head(root, &kvm->arch.tdp_mmu_roots, link))
+ 		return false;
+@@ -117,7 +117,7 @@ void kvm_tdp_mmu_free_root(struct kvm *kvm, struct kvm_mmu_page *root)
+ {
+ 	gfn_t max_gfn = 1ULL << (shadow_phys_bits - PAGE_SHIFT);
+ 
+-	lockdep_assert_held(&kvm->mmu_lock);
++	lockdep_assert_held_write(&kvm->mmu_lock);
+ 
+ 	WARN_ON(root->root_count);
+ 	WARN_ON(!root->tdp_mmu_page);
+@@ -170,13 +170,13 @@ static struct kvm_mmu_page *get_tdp_mmu_vcpu_root(struct kvm_vcpu *vcpu)
+ 
+ 	role = page_role_for_level(vcpu, vcpu->arch.mmu->shadow_root_level);
+ 
+-	spin_lock(&kvm->mmu_lock);
++	write_lock(&kvm->mmu_lock);
+ 
+ 	/* Check for an existing root before allocating a new one. */
+ 	for_each_tdp_mmu_root(kvm, root) {
+ 		if (root->role.word == role.word) {
+ 			kvm_mmu_get_root(kvm, root);
+-			spin_unlock(&kvm->mmu_lock);
++			write_unlock(&kvm->mmu_lock);
+ 			return root;
+ 		}
+ 	}
+@@ -186,7 +186,7 @@ static struct kvm_mmu_page *get_tdp_mmu_vcpu_root(struct kvm_vcpu *vcpu)
+ 
+ 	list_add(&root->link, &kvm->arch.tdp_mmu_roots);
+ 
+-	spin_unlock(&kvm->mmu_lock);
++	write_unlock(&kvm->mmu_lock);
+ 
+ 	return root;
+ }
+@@ -421,7 +421,7 @@ static inline void __tdp_mmu_set_spte(struct kvm *kvm, struct tdp_iter *iter,
+ 	struct kvm_mmu_page *root = sptep_to_sp(root_pt);
+ 	int as_id = kvm_mmu_page_as_id(root);
+ 
+-	lockdep_assert_held(&kvm->mmu_lock);
++	lockdep_assert_held_write(&kvm->mmu_lock);
+ 
+ 	WRITE_ONCE(*rcu_dereference(iter->sptep), new_spte);
+ 
+@@ -492,13 +492,13 @@ static inline bool tdp_mmu_iter_cond_resched(struct kvm *kvm,
+ 	if (iter->next_last_level_gfn == iter->yielded_gfn)
+ 		return false;
+ 
+-	if (need_resched() || spin_needbreak(&kvm->mmu_lock)) {
++	if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+ 		rcu_read_unlock();
+ 
+ 		if (flush)
+ 			kvm_flush_remote_tlbs(kvm);
+ 
+-		cond_resched_lock(&kvm->mmu_lock);
++		cond_resched_rwlock_write(&kvm->mmu_lock);
+ 		rcu_read_lock();
+ 
+ 		WARN_ON(iter->gfn > iter->next_last_level_gfn);
+@@ -1103,7 +1103,7 @@ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ 	struct kvm_mmu_page *root;
+ 	int root_as_id;
+ 
+-	lockdep_assert_held(&kvm->mmu_lock);
++	lockdep_assert_held_write(&kvm->mmu_lock);
+ 	for_each_tdp_mmu_root(kvm, root) {
+ 		root_as_id = kvm_mmu_page_as_id(root);
+ 		if (root_as_id != slot->as_id)
+@@ -1268,7 +1268,7 @@ bool kvm_tdp_mmu_write_protect_gfn(struct kvm *kvm,
+ 	int root_as_id;
+ 	bool spte_set = false;
+ 
+-	lockdep_assert_held(&kvm->mmu_lock);
++	lockdep_assert_held_write(&kvm->mmu_lock);
+ 	for_each_tdp_mmu_root(kvm, root) {
+ 		root_as_id = kvm_mmu_page_as_id(root);
+ 		if (root_as_id != slot->as_id)
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 36909288c4d4..4479d63814d4 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -7071,9 +7071,9 @@ static bool reexecute_instruction(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
+ 	if (vcpu->arch.mmu->direct_map) {
+ 		unsigned int indirect_shadow_pages;
+ 
+-		spin_lock(&vcpu->kvm->mmu_lock);
++		write_lock(&vcpu->kvm->mmu_lock);
+ 		indirect_shadow_pages = vcpu->kvm->arch.indirect_shadow_pages;
+-		spin_unlock(&vcpu->kvm->mmu_lock);
++		write_unlock(&vcpu->kvm->mmu_lock);
+ 
+ 		if (indirect_shadow_pages)
+ 			kvm_mmu_unprotect_page(vcpu->kvm, gpa_to_gfn(gpa));
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 92d2d95f168e..58082aa0e3a1 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -447,7 +447,12 @@ struct kvm_memslots {
+ };
+ 
+ struct kvm {
++#ifdef KVM_HAVE_MMU_RWLOCK
++	rwlock_t mmu_lock;
++#else
+ 	spinlock_t mmu_lock;
++#endif /* KVM_HAVE_MMU_RWLOCK */
++
+ 	struct mutex slots_lock;
+ 	struct mm_struct *mm; /* userspace tied to this vm */
+ 	struct kvm_memslots __rcu *memslots[KVM_ADDRESS_SPACE_NUM];
+* Unmerged path virt/kvm/dirty_ring.c
+* Unmerged path virt/kvm/kvm_main.c
+diff --git a/virt/kvm/mmu_lock.h b/virt/kvm/mmu_lock.h
+new file mode 100644
+index 000000000000..9e1308f9734c
+--- /dev/null
++++ b/virt/kvm/mmu_lock.h
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: GPL-2.0-only
++
++#ifndef KVM_MMU_LOCK_H
++#define KVM_MMU_LOCK_H 1
++
++/*
++ * Architectures can choose whether to use an rwlock or spinlock
++ * for the mmu_lock.  These macros, for use in common code
++ * only, avoids using #ifdefs in places that must deal with
++ * multiple architectures.
++ */
++
++#ifdef KVM_HAVE_MMU_RWLOCK
++#define KVM_MMU_LOCK_INIT(kvm) rwlock_init(&(kvm)->mmu_lock)
++#define KVM_MMU_LOCK(kvm)      write_lock(&(kvm)->mmu_lock)
++#define KVM_MMU_UNLOCK(kvm)    write_unlock(&(kvm)->mmu_lock)
++#else
++#define KVM_MMU_LOCK_INIT(kvm) spin_lock_init(&(kvm)->mmu_lock)
++#define KVM_MMU_LOCK(kvm)      spin_lock(&(kvm)->mmu_lock)
++#define KVM_MMU_UNLOCK(kvm)    spin_unlock(&(kvm)->mmu_lock)
++#endif /* KVM_HAVE_MMU_RWLOCK */
++
++#endif
