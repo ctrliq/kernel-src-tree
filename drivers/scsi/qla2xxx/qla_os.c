@@ -4973,14 +4973,14 @@ qla2x00_do_work(struct scsi_qla_host *vha)
 	struct qla_work_evt *e, *tmp;
 	unsigned long flags;
 	LIST_HEAD(work);
+	int rc;
 
 	spin_lock_irqsave(&vha->work_lock, flags);
 	list_splice_init(&vha->work_list, &work);
 	spin_unlock_irqrestore(&vha->work_lock, flags);
 
 	list_for_each_entry_safe(e, tmp, &work, list) {
-		list_del_init(&e->list);
-
+		rc = QLA_SUCCESS;
 		switch (e->type) {
 		case QLA_EVT_AEN:
 			fc_host_post_event(vha->host, fc_get_event_number(),
@@ -4994,7 +4994,7 @@ qla2x00_do_work(struct scsi_qla_host *vha)
 			    e->u.logio.data);
 			break;
 		case QLA_EVT_ASYNC_LOGOUT:
-			qla2x00_async_logout(vha, e->u.logio.fcport);
+			rc = qla2x00_async_logout(vha, e->u.logio.fcport);
 			break;
 		case QLA_EVT_ASYNC_LOGOUT_DONE:
 			qla2x00_async_logout_done(vha, e->u.logio.fcport,
@@ -5042,7 +5042,7 @@ qla2x00_do_work(struct scsi_qla_host *vha)
 			qla24xx_do_nack_work(vha, e);
 			break;
 		case QLA_EVT_ASYNC_PRLO:
-			qla2x00_async_prlo(vha, e->u.logio.fcport);
+			rc = qla2x00_async_prlo(vha, e->u.logio.fcport);
 			break;
 		case QLA_EVT_ASYNC_PRLO_DONE:
 			qla2x00_async_prlo_done(vha, e->u.logio.fcport,
@@ -5071,6 +5071,15 @@ qla2x00_do_work(struct scsi_qla_host *vha)
 			qla_do_iidma_work(vha, e->u.fcport.fcport);
 			break;
 		}
+
+		if (rc == EAGAIN) {
+			/* put 'work' at head of 'vha->work_list' */
+			spin_lock_irqsave(&vha->work_lock, flags);
+			list_splice(&work, &vha->work_list);
+			spin_unlock_irqrestore(&vha->work_lock, flags);
+			break;
+		}
+		list_del_init(&e->list);
 		if (e->flags & QLA_EVT_FLAG_FREE)
 			kfree(e);
 
