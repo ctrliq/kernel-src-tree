@@ -1,0 +1,136 @@
+iommu: Switch gather->end to the inclusive end
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Yong Wu <yong.wu@mediatek.com>
+commit 862c3715de8f3e5350489240c951d697f04bd8c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/862c3715.failed
+
+Currently gather->end is "unsigned long" which may be overflow in
+arch32 in the corner case: 0xfff00000 + 0x100000(iova + size).
+Although it doesn't affect the size(end - start), it affects the checking
+"gather->end < end"
+
+This patch changes this "end" to the real end address
+(end = start + size - 1). Correspondingly, update the length to
+"end - start + 1".
+
+Fixes: a7d20dc19d9e ("iommu: Introduce struct iommu_iotlb_gather for batching TLB flushes")
+	Signed-off-by: Yong Wu <yong.wu@mediatek.com>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20210107122909.16317-5-yong.wu@mediatek.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 862c3715de8f3e5350489240c951d697f04bd8c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-v3.c
+#	drivers/iommu/mtk_iommu.c
+#	drivers/iommu/tegra-gart.c
+diff --cc drivers/iommu/arm-smmu-v3.c
+index 97ca17f430f0,c70d6e79f534..000000000000
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@@ -2843,9 -2280,8 +2843,14 @@@ static void arm_smmu_iotlb_sync(struct 
+  {
+  	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+  
+++<<<<<<< HEAD:drivers/iommu/arm-smmu-v3.c
+ +	arm_smmu_tlb_inv_range_domain(gather->start,
+ +				      gather->end - gather->start,
+ +				      gather->pgsize, true, smmu_domain);
+++=======
++ 	arm_smmu_tlb_inv_range(gather->start, gather->end - gather->start + 1,
++ 			       gather->pgsize, true, smmu_domain);
+++>>>>>>> 862c3715de8f (iommu: Switch gather->end to the inclusive end):drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3.c
+  }
+  
+  static phys_addr_t
+diff --cc drivers/iommu/mtk_iommu.c
+index 38aceac865e2,66a00a2cb445..000000000000
+--- a/drivers/iommu/mtk_iommu.c
++++ b/drivers/iommu/mtk_iommu.c
+@@@ -423,7 -442,22 +423,26 @@@ static void mtk_iommu_flush_iotlb_all(s
+  static void mtk_iommu_iotlb_sync(struct iommu_domain *domain,
+  				 struct iommu_iotlb_gather *gather)
+  {
+++<<<<<<< HEAD
+ +	mtk_iommu_tlb_sync(mtk_iommu_get_m4u_data());
+++=======
++ 	struct mtk_iommu_data *data = mtk_iommu_get_m4u_data();
++ 	size_t length = gather->end - gather->start + 1;
++ 
++ 	if (gather->start == ULONG_MAX)
++ 		return;
++ 
++ 	mtk_iommu_tlb_flush_range_sync(gather->start, length, gather->pgsize,
++ 				       data);
++ }
++ 
++ static void mtk_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
++ 			       size_t size)
++ {
++ 	struct mtk_iommu_data *data = mtk_iommu_get_m4u_data();
++ 
++ 	mtk_iommu_tlb_flush_range_sync(iova, size, size, data);
+++>>>>>>> 862c3715de8f (iommu: Switch gather->end to the inclusive end)
+  }
+  
+  static phys_addr_t mtk_iommu_iova_to_phys(struct iommu_domain *domain,
+diff --cc drivers/iommu/tegra-gart.c
+index 55ec647f9891,6f130e51f072..000000000000
+--- a/drivers/iommu/tegra-gart.c
++++ b/drivers/iommu/tegra-gart.c
+@@@ -361,10 -258,21 +361,22 @@@ static int gart_iommu_add_device(struc
+  	return 0;
+  }
+  
+ -static void gart_iommu_sync_map(struct iommu_domain *domain, unsigned long iova,
+ -				size_t size)
+ +static void gart_iommu_remove_device(struct device *dev)
+  {
+++<<<<<<< HEAD
+ +	iommu_group_remove_device(dev);
+ +	iommu_device_unlink(&gart_handle->iommu, dev);
+++=======
++ 	FLUSH_GART_REGS(gart_handle);
++ }
++ 
++ static void gart_iommu_sync(struct iommu_domain *domain,
++ 			    struct iommu_iotlb_gather *gather)
++ {
++ 	size_t length = gather->end - gather->start + 1;
++ 
++ 	gart_iommu_sync_map(domain, gather->start, length);
+++>>>>>>> 862c3715de8f (iommu: Switch gather->end to the inclusive end)
+  }
+  
+  static const struct iommu_ops gart_iommu_ops = {
+* Unmerged path drivers/iommu/arm-smmu-v3.c
+* Unmerged path drivers/iommu/mtk_iommu.c
+* Unmerged path drivers/iommu/tegra-gart.c
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 8cdbd24b3c57..d3c2ce08b23b 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -185,7 +185,7 @@ enum iommu_dev_features {
+  * struct iommu_iotlb_gather - Range information for a pending IOTLB flush
+  *
+  * @start: IOVA representing the start of the range to be flushed
+- * @end: IOVA representing the end of the range to be flushed (exclusive)
++ * @end: IOVA representing the end of the range to be flushed (inclusive)
+  * @pgsize: The interval at which to perform the flush
+  *
+  * This structure is intended to be updated by multiple calls to the
+@@ -564,7 +564,7 @@ static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+ 					       struct iommu_iotlb_gather *gather,
+ 					       unsigned long iova, size_t size)
+ {
+-	unsigned long start = iova, end = start + size;
++	unsigned long start = iova, end = start + size - 1;
+ 
+ 	/*
+ 	 * If the new page is disjoint from the current range or is mapped at
