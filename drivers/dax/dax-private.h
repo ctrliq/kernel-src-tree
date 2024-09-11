@@ -20,7 +20,6 @@
  */
 struct dax_region {
 	int id;
-	struct ida ida;
 	void *base;
 	struct kref kref;
 	struct device *dev;
@@ -34,7 +33,6 @@ struct dax_region {
  * @region - parent region
  * @dax_dev - core dax functionality
  * @dev - device core
- * @id - child id in the region
  * @num_resources - number of physical address extents in this device
  * @res - array of physical address ranges
  */
@@ -42,7 +40,6 @@ struct dev_dax {
 	struct dax_region *region;
 	struct dax_device *dax_dev;
 	struct device dev;
-	int id;
 	int num_resources;
 	struct resource res[0];
 };
