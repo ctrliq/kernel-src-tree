@@ -1,0 +1,240 @@
+stacktrace: Unbreak stack_trace_save_tsk_reliable()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Joe Lawrence <joe.lawrence@redhat.com>
+commit 7eaf51a2e094229b75cc0c315f1cbbe2f3960058
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7eaf51a2.failed
+
+Miroslav reported that the livepatch self-tests were failing, specifically
+a case in which the consistency model ensures that a current executing
+function is not allowed to be patched, "TEST: busy target module".
+
+Recent renovations of stack_trace_save_tsk_reliable() left it returning
+only an -ERRNO success indication in some configuration combinations:
+
+  klp_check_stack()
+    ret = stack_trace_save_tsk_reliable()
+      #ifdef CONFIG_ARCH_STACKWALK && CONFIG_HAVE_RELIABLE_STACKTRACE
+        stack_trace_save_tsk_reliable()
+          ret = arch_stack_walk_reliable()
+            return 0
+            return -EINVAL
+          ...
+          return ret;
+    ...
+    if (ret < 0)
+      /* stack_trace_save_tsk_reliable error */
+    nr_entries = ret;                               << 0
+
+Previously (and currently for !CONFIG_ARCH_STACKWALK &&
+CONFIG_HAVE_RELIABLE_STACKTRACE) stack_trace_save_tsk_reliable() returned
+the number of entries that it consumed in the passed storage array.
+
+In the case of the above config and trace, be sure to return the
+stacktrace_cookie.len on stack_trace_save_tsk_reliable() success.
+
+Fixes: 25e39e32b0a3f ("livepatch: Simplify stack trace retrieval")
+	Reported-by: Miroslav Benes <mbenes@suse.cz>
+	Signed-off-by: Joe Lawrence <joe.lawrence@redhat.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Kamalesh Babulal <kamalesh@linux.vnet.ibm.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: live-patching@vger.kernel.org
+	Cc: jikos@kernel.org
+	Cc: pmladek@suse.com
+Link: https://lkml.kernel.org/r/20190517185117.24642-1-joe.lawrence@redhat.com
+
+(cherry picked from commit 7eaf51a2e094229b75cc0c315f1cbbe2f3960058)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/stacktrace.c
+diff --cc kernel/stacktrace.c
+index f8edee9c792d,90d3e0bf0302..000000000000
+--- a/kernel/stacktrace.c
++++ b/kernel/stacktrace.c
+@@@ -51,7 -66,176 +51,180 @@@ int snprint_stack_trace(char *buf, size
+  
+  	return total;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL_GPL(snprint_stack_trace);
+++=======
++ EXPORT_SYMBOL_GPL(stack_trace_snprint);
++ 
++ #ifdef CONFIG_ARCH_STACKWALK
++ 
++ struct stacktrace_cookie {
++ 	unsigned long	*store;
++ 	unsigned int	size;
++ 	unsigned int	skip;
++ 	unsigned int	len;
++ };
++ 
++ static bool stack_trace_consume_entry(void *cookie, unsigned long addr,
++ 				      bool reliable)
++ {
++ 	struct stacktrace_cookie *c = cookie;
++ 
++ 	if (c->len >= c->size)
++ 		return false;
++ 
++ 	if (c->skip > 0) {
++ 		c->skip--;
++ 		return true;
++ 	}
++ 	c->store[c->len++] = addr;
++ 	return c->len < c->size;
++ }
++ 
++ static bool stack_trace_consume_entry_nosched(void *cookie, unsigned long addr,
++ 					      bool reliable)
++ {
++ 	if (in_sched_functions(addr))
++ 		return true;
++ 	return stack_trace_consume_entry(cookie, addr, reliable);
++ }
++ 
++ /**
++  * stack_trace_save - Save a stack trace into a storage array
++  * @store:	Pointer to storage array
++  * @size:	Size of the storage array
++  * @skipnr:	Number of entries to skip at the start of the stack trace
++  *
++  * Return: Number of trace entries stored.
++  */
++ unsigned int stack_trace_save(unsigned long *store, unsigned int size,
++ 			      unsigned int skipnr)
++ {
++ 	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
++ 	struct stacktrace_cookie c = {
++ 		.store	= store,
++ 		.size	= size,
++ 		.skip	= skipnr + 1,
++ 	};
++ 
++ 	arch_stack_walk(consume_entry, &c, current, NULL);
++ 	return c.len;
++ }
++ EXPORT_SYMBOL_GPL(stack_trace_save);
++ 
++ /**
++  * stack_trace_save_tsk - Save a task stack trace into a storage array
++  * @task:	The task to examine
++  * @store:	Pointer to storage array
++  * @size:	Size of the storage array
++  * @skipnr:	Number of entries to skip at the start of the stack trace
++  *
++  * Return: Number of trace entries stored.
++  */
++ unsigned int stack_trace_save_tsk(struct task_struct *tsk, unsigned long *store,
++ 				  unsigned int size, unsigned int skipnr)
++ {
++ 	stack_trace_consume_fn consume_entry = stack_trace_consume_entry_nosched;
++ 	struct stacktrace_cookie c = {
++ 		.store	= store,
++ 		.size	= size,
++ 		.skip	= skipnr + 1,
++ 	};
++ 
++ 	if (!try_get_task_stack(tsk))
++ 		return 0;
++ 
++ 	arch_stack_walk(consume_entry, &c, tsk, NULL);
++ 	put_task_stack(tsk);
++ 	return c.len;
++ }
++ 
++ /**
++  * stack_trace_save_regs - Save a stack trace based on pt_regs into a storage array
++  * @regs:	Pointer to pt_regs to examine
++  * @store:	Pointer to storage array
++  * @size:	Size of the storage array
++  * @skipnr:	Number of entries to skip at the start of the stack trace
++  *
++  * Return: Number of trace entries stored.
++  */
++ unsigned int stack_trace_save_regs(struct pt_regs *regs, unsigned long *store,
++ 				   unsigned int size, unsigned int skipnr)
++ {
++ 	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
++ 	struct stacktrace_cookie c = {
++ 		.store	= store,
++ 		.size	= size,
++ 		.skip	= skipnr,
++ 	};
++ 
++ 	arch_stack_walk(consume_entry, &c, current, regs);
++ 	return c.len;
++ }
++ 
++ #ifdef CONFIG_HAVE_RELIABLE_STACKTRACE
++ /**
++  * stack_trace_save_tsk_reliable - Save task stack with verification
++  * @tsk:	Pointer to the task to examine
++  * @store:	Pointer to storage array
++  * @size:	Size of the storage array
++  *
++  * Return:	An error if it detects any unreliable features of the
++  *		stack. Otherwise it guarantees that the stack trace is
++  *		reliable and returns the number of entries stored.
++  *
++  * If the task is not 'current', the caller *must* ensure the task is inactive.
++  */
++ int stack_trace_save_tsk_reliable(struct task_struct *tsk, unsigned long *store,
++ 				  unsigned int size)
++ {
++ 	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
++ 	struct stacktrace_cookie c = {
++ 		.store	= store,
++ 		.size	= size,
++ 	};
++ 	int ret;
++ 
++ 	/*
++ 	 * If the task doesn't have a stack (e.g., a zombie), the stack is
++ 	 * "reliably" empty.
++ 	 */
++ 	if (!try_get_task_stack(tsk))
++ 		return 0;
++ 
++ 	ret = arch_stack_walk_reliable(consume_entry, &c, tsk);
++ 	put_task_stack(tsk);
++ 	return ret ? ret : c.len;
++ }
++ #endif
++ 
++ #ifdef CONFIG_USER_STACKTRACE_SUPPORT
++ /**
++  * stack_trace_save_user - Save a user space stack trace into a storage array
++  * @store:	Pointer to storage array
++  * @size:	Size of the storage array
++  *
++  * Return: Number of trace entries stored.
++  */
++ unsigned int stack_trace_save_user(unsigned long *store, unsigned int size)
++ {
++ 	stack_trace_consume_fn consume_entry = stack_trace_consume_entry;
++ 	struct stacktrace_cookie c = {
++ 		.store	= store,
++ 		.size	= size,
++ 	};
++ 
++ 	/* Trace user stack if not a kernel thread */
++ 	if (!current->mm)
++ 		return 0;
++ 
++ 	arch_stack_walk_user(consume_entry, &c, task_pt_regs(current));
++ 	return c.len;
++ }
++ #endif
++ 
++ #else /* CONFIG_ARCH_STACKWALK */
+++>>>>>>> 7eaf51a2e094 (stacktrace: Unbreak stack_trace_save_tsk_reliable())
+  
+  /*
+   * Architectures that do not implement save_stack_trace_*()
+* Unmerged path kernel/stacktrace.c
