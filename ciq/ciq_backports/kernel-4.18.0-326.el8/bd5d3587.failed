@@ -1,0 +1,112 @@
+mm/hmm: return error for non-vma snapshots
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit bd5d3587b218d33d70a835582dfe1d8f8498e702
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/bd5d3587.failed
+
+The pagewalker does not call most ops with NULL vma, those are all routed
+to hmm_vma_walk_hole() via ops->pte_hole instead.
+
+Thus hmm_vma_fault() is only called with a NULL vma from
+hmm_vma_walk_hole(), so hoist the NULL vma check to there.
+
+Now it is clear that snapshotting with no vma is a HMM_PFN_ERROR as
+without a vma we have no path to call hmm_vma_fault().
+
+Link: https://lore.kernel.org/r/20200327200021.29372-10-jgg@ziepe.ca
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit bd5d3587b218d33d70a835582dfe1d8f8498e702)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index 3233a7437881,280585833adf..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -352,37 -73,30 +352,44 @@@ static int hmm_pfns_bad(unsigned long a
+   * This function will be called whenever pmd_none() or pte_none() returns true,
+   * or whenever there is no page directory covering the virtual address range.
+   */
+ -static int hmm_vma_fault(unsigned long addr, unsigned long end,
+ -			 unsigned int required_fault, struct mm_walk *walk)
+ +static int hmm_vma_walk_hole_(unsigned long addr, unsigned long end,
+ +			      bool fault, bool write_fault,
+ +			      struct mm_walk *walk)
+  {
+  	struct hmm_vma_walk *hmm_vma_walk = walk->private;
+ -	struct vm_area_struct *vma = walk->vma;
+ -	unsigned int fault_flags = FAULT_FLAG_REMOTE;
+ +	struct hmm_range *range = hmm_vma_walk->range;
+ +	uint64_t *pfns = range->pfns;
+ +	unsigned long i, page_size;
+  
+ -	WARN_ON_ONCE(!required_fault);
+  	hmm_vma_walk->last = addr;
+ -
+ +	page_size = hmm_range_page_size(range);
+ +	i = (addr - range->start) >> range->page_shift;
+ +
+++<<<<<<< HEAD
+ +	for (; addr < end; addr += page_size, i++) {
+ +		pfns[i] = range->values[HMM_PFN_NONE];
+ +		if (fault || write_fault) {
+ +			int ret;
+ +
+ +			ret = hmm_vma_do_fault(walk, addr, write_fault,
+ +					       &pfns[i]);
+ +			if (ret != -EBUSY)
+ +				return ret;
+ +		}
+++=======
++ 	if (required_fault & HMM_NEED_WRITE_FAULT) {
++ 		if (!(vma->vm_flags & VM_WRITE))
++ 			return -EPERM;
++ 		fault_flags |= FAULT_FLAG_WRITE;
+++>>>>>>> bd5d3587b218 (mm/hmm: return error for non-vma snapshots)
+  	}
+  
+ -	for (; addr < end; addr += PAGE_SIZE)
+ -		if (handle_mm_fault(vma, addr, fault_flags) & VM_FAULT_ERROR)
+ -			return -EFAULT;
+ -	return -EBUSY;
+ +	return (fault || write_fault) ? -EBUSY : 0;
+  }
+  
+ -static unsigned int hmm_pte_need_fault(const struct hmm_vma_walk *hmm_vma_walk,
+ -				       uint64_t pfns, uint64_t cpu_flags)
+ +static inline void hmm_pte_need_fault(const struct hmm_vma_walk *hmm_vma_walk,
+ +				      uint64_t pfns, uint64_t cpu_flags,
+ +				      bool *fault, bool *write_fault)
+  {
+  	struct hmm_range *range = hmm_vma_walk->range;
+  
+@@@ -457,9 -166,16 +464,22 @@@ static int hmm_vma_walk_hole(unsigned l
+  	i = (addr - range->start) >> PAGE_SHIFT;
+  	npages = (end - addr) >> PAGE_SHIFT;
+  	pfns = &range->pfns[i];
+++<<<<<<< HEAD
+ +	hmm_range_need_fault(hmm_vma_walk, pfns, npages,
+ +			     0, &fault, &write_fault);
+ +	return hmm_vma_walk_hole_(addr, end, fault, write_fault, walk);
+++=======
++ 	required_fault = hmm_range_need_fault(hmm_vma_walk, pfns, npages, 0);
++ 	if (!walk->vma) {
++ 		if (required_fault)
++ 			return -EFAULT;
++ 		return hmm_pfns_fill(addr, end, range, HMM_PFN_ERROR);
++ 	}
++ 	if (required_fault)
++ 		return hmm_vma_fault(addr, end, required_fault, walk);
++ 	hmm_vma_walk->last = addr;
++ 	return hmm_pfns_fill(addr, end, range, HMM_PFN_NONE);
+++>>>>>>> bd5d3587b218 (mm/hmm: return error for non-vma snapshots)
+  }
+  
+  static inline uint64_t pmd_to_hmm_pfn_flags(struct hmm_range *range, pmd_t pmd)
+* Unmerged path mm/hmm.c
