@@ -1,0 +1,130 @@
+x86/kdump: Fall back to reserve high crashkernel memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Young <dyoung@redhat.com>
+commit b9ac3849af412fd3887d7652bdbabf29d2aecc16
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b9ac3849.failed
+
+crashkernel=xM tries to reserve memory for the crash kernel under 4G,
+which is enough, usually. But this could fail sometimes, for example
+when one tries to reserve a big chunk like 2G, for example.
+
+So let the crashkernel=xM just fall back to use high memory in case it
+fails to find a suitable low range. Do not set the ,high as default
+because it allocates extra low memory for DMA buffers and swiotlb, and
+this is not always necessary for all machines.
+
+Typically, crashkernel=128M usually works with low reservation under 4G,
+so keep <4G as default.
+
+ [ bp: Massage. ]
+
+	Signed-off-by: Dave Young <dyoung@redhat.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Ingo Molnar <mingo@kernel.org>
+	Acked-by: Baoquan He <bhe@redhat.com>
+	Cc: Dave Young <dyoung@redhat.com>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: Eric Biederman <ebiederm@xmission.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: "H. Peter Anvin" <hpa@zytor.com>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Jiri Kosina <jkosina@suse.cz>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Juergen Gross <jgross@suse.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Cc: linux-doc@vger.kernel.org
+	Cc: "Paul E. McKenney" <paulmck@linux.ibm.com>
+	Cc: Petr Tesarik <ptesarik@suse.cz>
+	Cc: piliu@redhat.com
+	Cc: Ram Pai <linuxram@us.ibm.com>
+	Cc: Sinan Kaya <okaya@codeaurora.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: Thymo van Beers <thymovanbeers@gmail.com>
+	Cc: vgoyal@redhat.com
+	Cc: x86-ml <x86@kernel.org>
+	Cc: Yinghai Lu <yinghai@kernel.org>
+	Cc: Zhimin Gu <kookoo.gu@intel.com>
+Link: https://lkml.kernel.org/r/20190422031905.GA8387@dhcp-128-65.nay.redhat.com
+(cherry picked from commit b9ac3849af412fd3887d7652bdbabf29d2aecc16)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/setup.c
+diff --cc arch/x86/kernel/setup.c
+index ea7dc2507221,c15f362a2516..000000000000
+--- a/arch/x86/kernel/setup.c
++++ b/arch/x86/kernel/setup.c
+@@@ -543,32 -541,23 +543,46 @@@ static void __init reserve_crashkernel(
+  	}
+  
+  	/* 0 means: find the address automatically */
+- 	if (crash_base <= 0) {
++ 	if (!crash_base) {
+  		/*
+  		 * Set CRASH_ADDR_LOW_MAX upper bound for crash memory,
+- 		 * as old kexec-tools loads bzImage below that, unless
+- 		 * "crashkernel=size[KMG],high" is specified.
++ 		 * crashkernel=x,high reserves memory over 4G, also allocates
++ 		 * 256M extra low memory for DMA buffers and swiotlb.
++ 		 * But the extra memory is not required for all machines.
++ 		 * So try low memory first and fall back to high memory
++ 		 * unless "crashkernel=size[KMG],high" is specified.
+  		 */
+++<<<<<<< HEAD
+ +		crash_base = memblock_find_in_range(CRASH_ALIGN,
+ +						    high ? CRASH_ADDR_HIGH_MAX
+ +							 : CRASH_ADDR_LOW_MAX,
+ +						    crash_size, CRASH_ALIGN);
+ +#ifdef CONFIG_X86_64
+ +		/*
+ +		 * crashkernel=X reserve below 896M fails? Try below 4G
+ +		 */
+ +		if (!high && !crash_base)
+ +			crash_base = memblock_find_in_range(CRASH_ALIGN,
+ +						(1ULL << 32),
+ +						crash_size, CRASH_ALIGN);
+ +		/*
+ +		 * crashkernel=X reserve below 4G fails? Try MAXMEM
+ +		 */
+ +		if (!high && !crash_base)
+ +			crash_base = memblock_find_in_range(CRASH_ALIGN,
+ +						CRASH_ADDR_HIGH_MAX,
+ +						crash_size, CRASH_ALIGN);
+ +#endif
+++=======
++ 		if (!high)
++ 			crash_base = memblock_find_in_range(CRASH_ALIGN,
++ 						CRASH_ADDR_LOW_MAX,
++ 						crash_size, CRASH_ALIGN);
++ 		if (!crash_base)
++ 			crash_base = memblock_find_in_range(CRASH_ALIGN,
++ 						CRASH_ADDR_HIGH_MAX,
++ 						crash_size, CRASH_ALIGN);
+++>>>>>>> b9ac3849af41 (x86/kdump: Fall back to reserve high crashkernel memory)
+  		if (!crash_base) {
+  			pr_info("crashkernel reservation failed - No suitable area found.\n");
+  			return;
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index e6e62e7744f7..bc7e46196ffa 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -692,8 +692,11 @@
+ 			upon panic. This parameter reserves the physical
+ 			memory region [offset, offset + size] for that kernel
+ 			image. If '@offset' is omitted, then a suitable offset
+-			is selected automatically. Check
+-			Documentation/kdump/kdump.txt for further details.
++			is selected automatically.
++			[KNL, x86_64] select a region under 4G first, and
++			fall back to reserve region above 4G when '@offset'
++			hasn't been specified.
++			See Documentation/kdump/kdump.txt for further details.
+ 
+ 	crashkernel=range1:size1[,range2:size2,...][@offset]
+ 			[KNL] Same as above, but depends on the memory
+* Unmerged path arch/x86/kernel/setup.c
