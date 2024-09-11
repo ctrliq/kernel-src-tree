@@ -1,0 +1,191 @@
+intel_idle: Add module parameter to prevent ACPI _CST from being used
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit 4ec32d9e8e5b6d6eb491eeee3938665d8a2388fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4ec32d9e.failed
+
+Add a new module parameter called "no_acpi" to the intel_idle driver
+to allow the driver to be prevented from using ACPI _CST via kernel
+command line.
+
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 4ec32d9e8e5b6d6eb491eeee3938665d8a2388fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/idle/intel_idle.c
+diff --cc drivers/idle/intel_idle.c
+index 076189997131,26fe383bb921..000000000000
+--- a/drivers/idle/intel_idle.c
++++ b/drivers/idle/intel_idle.c
+@@@ -1107,6 -1118,162 +1107,165 @@@ static const struct x86_cpu_id intel_id
+  	{}
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define INTEL_CPU_FAM6_MWAIT \
++ 	{ X86_VENDOR_INTEL, 6, X86_MODEL_ANY, X86_FEATURE_MWAIT, 0 }
++ 
++ static const struct x86_cpu_id intel_mwait_ids[] __initconst = {
++ 	INTEL_CPU_FAM6_MWAIT,
++ 	{}
++ };
++ 
++ static bool intel_idle_max_cstate_reached(int cstate)
++ {
++ 	if (cstate + 1 > max_cstate) {
++ 		pr_info("max_cstate %d reached\n", max_cstate);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ 
++ #ifdef CONFIG_ACPI_PROCESSOR_CSTATE
++ #include <acpi/processor.h>
++ 
++ static bool no_acpi __read_mostly;
++ module_param(no_acpi, bool, 0444);
++ MODULE_PARM_DESC(no_acpi, "Do not use ACPI _CST for building the idle states list");
++ 
++ static struct acpi_processor_power acpi_state_table;
++ 
++ /**
++  * intel_idle_cst_usable - Check if the _CST information can be used.
++  *
++  * Check if all of the C-states listed by _CST in the max_cstate range are
++  * ACPI_CSTATE_FFH, which means that they should be entered via MWAIT.
++  */
++ static bool intel_idle_cst_usable(void)
++ {
++ 	int cstate, limit;
++ 
++ 	limit = min_t(int, min_t(int, CPUIDLE_STATE_MAX, max_cstate + 1),
++ 		      acpi_state_table.count);
++ 
++ 	for (cstate = 1; cstate < limit; cstate++) {
++ 		struct acpi_processor_cx *cx = &acpi_state_table.states[cstate];
++ 
++ 		if (cx->entry_method != ACPI_CSTATE_FFH)
++ 			return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool intel_idle_acpi_cst_extract(void)
++ {
++ 	unsigned int cpu;
++ 
++ 	if (no_acpi) {
++ 		pr_debug("Not allowed to use ACPI _CST\n");
++ 		return false;
++ 	}
++ 
++ 	for_each_possible_cpu(cpu) {
++ 		struct acpi_processor *pr = per_cpu(processors, cpu);
++ 
++ 		if (!pr)
++ 			continue;
++ 
++ 		if (acpi_processor_evaluate_cst(pr->handle, cpu, &acpi_state_table))
++ 			continue;
++ 
++ 		acpi_state_table.count++;
++ 
++ 		if (!intel_idle_cst_usable())
++ 			continue;
++ 
++ 		if (!acpi_processor_claim_cst_control()) {
++ 			acpi_state_table.count = 0;
++ 			return false;
++ 		}
++ 
++ 		return true;
++ 	}
++ 
++ 	pr_debug("ACPI _CST not found or not usable\n");
++ 	return false;
++ }
++ 
++ static void intel_idle_init_cstates_acpi(struct cpuidle_driver *drv)
++ {
++ 	int cstate, limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
++ 
++ 	/*
++ 	 * If limit > 0, intel_idle_cst_usable() has returned 'true', so all of
++ 	 * the interesting states are ACPI_CSTATE_FFH.
++ 	 */
++ 	for (cstate = 1; cstate < limit; cstate++) {
++ 		struct acpi_processor_cx *cx;
++ 		struct cpuidle_state *state;
++ 
++ 		if (intel_idle_max_cstate_reached(cstate))
++ 			break;
++ 
++ 		cx = &acpi_state_table.states[cstate];
++ 
++ 		state = &drv->states[drv->state_count++];
++ 
++ 		snprintf(state->name, CPUIDLE_NAME_LEN, "C%d_ACPI", cstate);
++ 		strlcpy(state->desc, cx->desc, CPUIDLE_DESC_LEN);
++ 		state->exit_latency = cx->latency;
++ 		/*
++ 		 * For C1-type C-states use the same number for both the exit
++ 		 * latency and target residency, because that is the case for
++ 		 * C1 in the majority of the static C-states tables above.
++ 		 * For the other types of C-states, however, set the target
++ 		 * residency to 3 times the exit latency which should lead to
++ 		 * a reasonable balance between energy-efficiency and
++ 		 * performance in the majority of interesting cases.
++ 		 */
++ 		state->target_residency = cx->latency;
++ 		if (cx->type > ACPI_STATE_C1)
++ 			state->target_residency *= 3;
++ 
++ 		state->flags = MWAIT2flg(cx->address);
++ 		if (cx->type > ACPI_STATE_C2)
++ 			state->flags |= CPUIDLE_FLAG_TLB_FLUSHED;
++ 
++ 		state->enter = intel_idle;
++ 		state->enter_s2idle = intel_idle_s2idle;
++ 	}
++ }
++ 
++ static bool intel_idle_off_by_default(u32 mwait_hint)
++ {
++ 	int cstate, limit;
++ 
++ 	/*
++ 	 * If there are no _CST C-states, do not disable any C-states by
++ 	 * default.
++ 	 */
++ 	if (!acpi_state_table.count)
++ 		return false;
++ 
++ 	limit = min_t(int, CPUIDLE_STATE_MAX, acpi_state_table.count);
++ 	/*
++ 	 * If limit > 0, intel_idle_cst_usable() has returned 'true', so all of
++ 	 * the interesting states are ACPI_CSTATE_FFH.
++ 	 */
++ 	for (cstate = 1; cstate < limit; cstate++) {
++ 		if (acpi_state_table.states[cstate].address == mwait_hint)
++ 			return false;
++ 	}
++ 	return true;
++ }
++ #else /* !CONFIG_ACPI_PROCESSOR_CSTATE */
++ static inline bool intel_idle_acpi_cst_extract(void) { return false; }
++ static inline void intel_idle_init_cstates_acpi(struct cpuidle_driver *drv) { }
++ static inline bool intel_idle_off_by_default(u32 mwait_hint) { return false; }
++ #endif /* !CONFIG_ACPI_PROCESSOR_CSTATE */
++ 
+++>>>>>>> 4ec32d9e8e5b (intel_idle: Add module parameter to prevent ACPI _CST from being used)
+  /*
+   * intel_idle_probe()
+   */
+* Unmerged path drivers/idle/intel_idle.c
