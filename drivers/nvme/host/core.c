@@ -1919,11 +1919,9 @@ static int nvme_open(struct block_device *bdev, fmode_t mode)
 {
 	struct nvme_ns *ns = bdev->bd_disk->private_data;
 
-#ifdef CONFIG_NVME_MULTIPATH
 	/* should never be called due to GENHD_FL_HIDDEN */
-	if (WARN_ON_ONCE(ns->head->disk))
+	if (WARN_ON_ONCE(nvme_ns_head_multipath(ns->head)))
 		goto fail;
-#endif
 	if (!kref_get_unless_zero(&ns->kref))
 		goto fail;
 	if (!try_module_get(ns->ctrl->ops->module))
@@ -2286,15 +2284,13 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
 			return ret;
 	}
 
-#ifdef CONFIG_NVME_MULTIPATH
-	if (ns->head->disk) {
+	if (nvme_ns_head_multipath(ns->head)) {
 		blk_mq_freeze_queue(ns->head->disk->queue);
 		nvme_update_disk_info(ns->head->disk, ns, id);
 		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
 		blk_queue_update_readahead(ns->head->disk->queue);
 		blk_mq_unfreeze_queue(ns->head->disk->queue);
 	}
-#endif
 	return 0;
 
 out_unfreeze:
