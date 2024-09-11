@@ -364,7 +364,7 @@ static bool check_device(struct device *dev)
 {
 	int devid;
 
-	if (!dev || !dev->dma_mask)
+	if (!dev)
 		return false;
 
 	devid = get_device_id(dev);
