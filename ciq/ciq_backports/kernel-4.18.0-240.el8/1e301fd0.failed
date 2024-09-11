@@ -1,0 +1,293 @@
+ipv4: Encapsulate function arguments in a struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 1e301fd04eaaa5b1e3c202450d86864e6714d783
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1e301fd0.failed
+
+fib_dump_info() is used to prepare RTM_{NEW,DEL}ROUTE netlink messages
+using the passed arguments. Currently, the function takes 11 arguments,
+6 of which are attributes of the route being dumped (e.g., prefix, TOS).
+
+The next patch will need the function to also dump to user space an
+indication if the route is present in hardware or not. Instead of
+passing yet another argument, change the function to take a struct
+containing the different route attributes.
+
+v2:
+* Name last argument of fib_dump_info()
+* Move 'struct fib_rt_info' to include/net/ip_fib.h so that it could
+  later be passed to fib_alias_hw_flags_set()
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: David Ahern <dsahern@gmail.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1e301fd04eaaa5b1e3c202450d86864e6714d783)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/fib_semantics.c
+diff --cc net/ipv4/fib_semantics.c
+index a0c8cdcf0152,3ed1349be428..000000000000
+--- a/net/ipv4/fib_semantics.c
++++ b/net/ipv4/fib_semantics.c
+@@@ -1288,10 -1586,155 +1293,15 @@@ failure
+  	return ERR_PTR(err);
+  }
+  
+ -int fib_nexthop_info(struct sk_buff *skb, const struct fib_nh_common *nhc,
+ -		     u8 rt_family, unsigned char *flags, bool skip_oif)
+ -{
+ -	if (nhc->nhc_flags & RTNH_F_DEAD)
+ -		*flags |= RTNH_F_DEAD;
+ -
+ -	if (nhc->nhc_flags & RTNH_F_LINKDOWN) {
+ -		*flags |= RTNH_F_LINKDOWN;
+ -
+ -		rcu_read_lock();
+ -		switch (nhc->nhc_family) {
+ -		case AF_INET:
+ -			if (ip_ignore_linkdown(nhc->nhc_dev))
+ -				*flags |= RTNH_F_DEAD;
+ -			break;
+ -		case AF_INET6:
+ -			if (ip6_ignore_linkdown(nhc->nhc_dev))
+ -				*flags |= RTNH_F_DEAD;
+ -			break;
+ -		}
+ -		rcu_read_unlock();
+ -	}
+ -
+ -	switch (nhc->nhc_gw_family) {
+ -	case AF_INET:
+ -		if (nla_put_in_addr(skb, RTA_GATEWAY, nhc->nhc_gw.ipv4))
+ -			goto nla_put_failure;
+ -		break;
+ -	case AF_INET6:
+ -		/* if gateway family does not match nexthop family
+ -		 * gateway is encoded as RTA_VIA
+ -		 */
+ -		if (rt_family != nhc->nhc_gw_family) {
+ -			int alen = sizeof(struct in6_addr);
+ -			struct nlattr *nla;
+ -			struct rtvia *via;
+ -
+ -			nla = nla_reserve(skb, RTA_VIA, alen + 2);
+ -			if (!nla)
+ -				goto nla_put_failure;
+ -
+ -			via = nla_data(nla);
+ -			via->rtvia_family = AF_INET6;
+ -			memcpy(via->rtvia_addr, &nhc->nhc_gw.ipv6, alen);
+ -		} else if (nla_put_in6_addr(skb, RTA_GATEWAY,
+ -					    &nhc->nhc_gw.ipv6) < 0) {
+ -			goto nla_put_failure;
+ -		}
+ -		break;
+ -	}
+ -
+ -	*flags |= (nhc->nhc_flags & RTNH_F_ONLINK);
+ -	if (nhc->nhc_flags & RTNH_F_OFFLOAD)
+ -		*flags |= RTNH_F_OFFLOAD;
+ -
+ -	if (!skip_oif && nhc->nhc_dev &&
+ -	    nla_put_u32(skb, RTA_OIF, nhc->nhc_dev->ifindex))
+ -		goto nla_put_failure;
+ -
+ -	if (nhc->nhc_lwtstate &&
+ -	    lwtunnel_fill_encap(skb, nhc->nhc_lwtstate,
+ -				RTA_ENCAP, RTA_ENCAP_TYPE) < 0)
+ -		goto nla_put_failure;
+ -
+ -	return 0;
+ -
+ -nla_put_failure:
+ -	return -EMSGSIZE;
+ -}
+ -EXPORT_SYMBOL_GPL(fib_nexthop_info);
+ -
+ -#if IS_ENABLED(CONFIG_IP_ROUTE_MULTIPATH) || IS_ENABLED(CONFIG_IPV6)
+ -int fib_add_nexthop(struct sk_buff *skb, const struct fib_nh_common *nhc,
+ -		    int nh_weight, u8 rt_family)
+ -{
+ -	const struct net_device *dev = nhc->nhc_dev;
+ -	struct rtnexthop *rtnh;
+ -	unsigned char flags = 0;
+ -
+ -	rtnh = nla_reserve_nohdr(skb, sizeof(*rtnh));
+ -	if (!rtnh)
+ -		goto nla_put_failure;
+ -
+ -	rtnh->rtnh_hops = nh_weight - 1;
+ -	rtnh->rtnh_ifindex = dev ? dev->ifindex : 0;
+ -
+ -	if (fib_nexthop_info(skb, nhc, rt_family, &flags, true) < 0)
+ -		goto nla_put_failure;
+ -
+ -	rtnh->rtnh_flags = flags;
+ -
+ -	/* length of rtnetlink header + attributes */
+ -	rtnh->rtnh_len = nlmsg_get_pos(skb) - (void *)rtnh;
+ -
+ -	return 0;
+ -
+ -nla_put_failure:
+ -	return -EMSGSIZE;
+ -}
+ -EXPORT_SYMBOL_GPL(fib_add_nexthop);
+ -#endif
+ -
+ -#ifdef CONFIG_IP_ROUTE_MULTIPATH
+ -static int fib_add_multipath(struct sk_buff *skb, struct fib_info *fi)
+ -{
+ -	struct nlattr *mp;
+ -
+ -	mp = nla_nest_start_noflag(skb, RTA_MULTIPATH);
+ -	if (!mp)
+ -		goto nla_put_failure;
+ -
+ -	if (unlikely(fi->nh)) {
+ -		if (nexthop_mpath_fill_node(skb, fi->nh, AF_INET) < 0)
+ -			goto nla_put_failure;
+ -		goto mp_end;
+ -	}
+ -
+ -	for_nexthops(fi) {
+ -		if (fib_add_nexthop(skb, &nh->nh_common, nh->fib_nh_weight,
+ -				    AF_INET) < 0)
+ -			goto nla_put_failure;
+ -#ifdef CONFIG_IP_ROUTE_CLASSID
+ -		if (nh->nh_tclassid &&
+ -		    nla_put_u32(skb, RTA_FLOW, nh->nh_tclassid))
+ -			goto nla_put_failure;
+ -#endif
+ -	} endfor_nexthops(fi);
+ -
+ -mp_end:
+ -	nla_nest_end(skb, mp);
+ -
+ -	return 0;
+ -
+ -nla_put_failure:
+ -	return -EMSGSIZE;
+ -}
+ -#else
+ -static int fib_add_multipath(struct sk_buff *skb, struct fib_info *fi)
+ -{
+ -	return 0;
+ -}
+ -#endif
+ -
+  int fib_dump_info(struct sk_buff *skb, u32 portid, u32 seq, int event,
+- 		  u32 tb_id, u8 type, __be32 dst, int dst_len, u8 tos,
+- 		  struct fib_info *fi, unsigned int flags)
++ 		  struct fib_rt_info *fri, unsigned int flags)
+  {
+++<<<<<<< HEAD
+++=======
++ 	unsigned int nhs = fib_info_num_path(fri->fi);
++ 	struct fib_info *fi = fri->fi;
++ 	u32 tb_id = fri->tb_id;
+++>>>>>>> 1e301fd04eaa (ipv4: Encapsulate function arguments in a struct)
+  	struct nlmsghdr *nlh;
+  	struct rtmsg *rtm;
+  
+diff --git a/include/net/ip_fib.h b/include/net/ip_fib.h
+index cf0696685354..4bff9ff0f82e 100644
+--- a/include/net/ip_fib.h
++++ b/include/net/ip_fib.h
+@@ -187,6 +187,15 @@ __be32 fib_info_update_nh_saddr(struct net *net, struct fib_nh *nh);
+ #define FIB_RES_PREFSRC(net, res)	((res).fi->fib_prefsrc ? : \
+ 					 FIB_RES_SADDR(net, res))
+ 
++struct fib_rt_info {
++	struct fib_info		*fi;
++	u32			tb_id;
++	__be32			dst;
++	int			dst_len;
++	u8			tos;
++	u8			type;
++};
++
+ struct fib_entry_notifier_info {
+ 	struct fib_notifier_info info; /* must be first */
+ 	u32 dst;
+diff --git a/net/ipv4/fib_lookup.h b/net/ipv4/fib_lookup.h
+index e6ff282bb7f4..873e2ea394a4 100644
+--- a/net/ipv4/fib_lookup.h
++++ b/net/ipv4/fib_lookup.h
+@@ -34,9 +34,8 @@ struct fib_info *fib_create_info(struct fib_config *cfg,
+ int fib_nh_match(struct fib_config *cfg, struct fib_info *fi,
+ 		 struct netlink_ext_ack *extack);
+ bool fib_metrics_match(struct fib_config *cfg, struct fib_info *fi);
+-int fib_dump_info(struct sk_buff *skb, u32 pid, u32 seq, int event, u32 tb_id,
+-		  u8 type, __be32 dst, int dst_len, u8 tos, struct fib_info *fi,
+-		  unsigned int);
++int fib_dump_info(struct sk_buff *skb, u32 pid, u32 seq, int event,
++		  struct fib_rt_info *fri, unsigned int flags);
+ void rtmsg_fib(int event, __be32 key, struct fib_alias *fa, int dst_len,
+ 	       u32 tb_id, const struct nl_info *info, unsigned int nlm_flags);
+ 
+* Unmerged path net/ipv4/fib_semantics.c
+diff --git a/net/ipv4/fib_trie.c b/net/ipv4/fib_trie.c
+index 011339ee20a0..d481f26b2906 100644
+--- a/net/ipv4/fib_trie.c
++++ b/net/ipv4/fib_trie.c
+@@ -2116,14 +2116,18 @@ static int fn_trie_dump_leaf(struct key_vector *l, struct fib_table *tb,
+ 
+ 		if (filter->dump_routes) {
+ 			if (!s_fa) {
++				struct fib_rt_info fri;
++
++				fri.fi = fi;
++				fri.tb_id = tb->tb_id;
++				fri.dst = xkey;
++				fri.dst_len = KEYLENGTH - fa->fa_slen;
++				fri.tos = fa->fa_tos;
++				fri.type = fa->fa_type;
+ 				err = fib_dump_info(skb,
+ 						    NETLINK_CB(cb->skb).portid,
+ 						    cb->nlh->nlmsg_seq,
+-						    RTM_NEWROUTE,
+-						    tb->tb_id, fa->fa_type,
+-						    xkey,
+-						    KEYLENGTH - fa->fa_slen,
+-						    fa->fa_tos, fi, flags);
++						    RTM_NEWROUTE, &fri, flags);
+ 				if (err < 0)
+ 					goto stop;
+ 			}
+diff --git a/net/ipv4/route.c b/net/ipv4/route.c
+index ba9644ed198b..167eb1e4e6ff 100644
+--- a/net/ipv4/route.c
++++ b/net/ipv4/route.c
+@@ -3077,16 +3077,22 @@ static int inet_rtm_getroute(struct sk_buff *in_skb, struct nlmsghdr *nlh,
+ 	skb_reset_mac_header(skb);
+ 
+ 	if (rtm->rtm_flags & RTM_F_FIB_MATCH) {
++		struct fib_rt_info fri;
++
+ 		if (!res.fi) {
+ 			err = fib_props[res.type].error;
+ 			if (!err)
+ 				err = -EHOSTUNREACH;
+ 			goto errout_rcu;
+ 		}
++		fri.fi = res.fi;
++		fri.tb_id = table_id;
++		fri.dst = res.prefix;
++		fri.dst_len = res.prefixlen;
++		fri.tos = fl4.flowi4_tos;
++		fri.type = rt->rt_type;
+ 		err = fib_dump_info(skb, NETLINK_CB(in_skb).portid,
+-				    nlh->nlmsg_seq, RTM_NEWROUTE, table_id,
+-				    rt->rt_type, res.prefix, res.prefixlen,
+-				    fl4.flowi4_tos, res.fi, 0);
++				    nlh->nlmsg_seq, RTM_NEWROUTE, &fri, 0);
+ 	} else {
+ 		err = rt_fill_info(net, dst, src, rt, table_id, &fl4, skb,
+ 				   NETLINK_CB(in_skb).portid,
