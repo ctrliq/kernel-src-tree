@@ -27,6 +27,7 @@
 #include "hist.h"
 #include "sort.h"
 #include "tool.h"
+#include "cacheline.h"
 #include "data.h"
 #include "event.h"
 #include "evlist.h"
