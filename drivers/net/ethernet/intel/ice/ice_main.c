@@ -2614,7 +2614,7 @@ static int ice_up_complete(struct ice_vsi *vsi)
 
 	ice_service_task_schedule(pf);
 
-	return err;
+	return 0;
 }
 
 /**
