@@ -1,0 +1,500 @@
+mtd: Remove dev_err() usage after platform_get_irq()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mt76: Remove dev_err() usage after platform_get_irq() (Jarod Wilson) [1776606]
+Rebuild_FUZZ: 97.14%
+commit-author Stephen Boyd <swboyd@chromium.org>
+commit aab478ca0f7ada511088039c6e2c8fdcb09139db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/aab478ca.failed
+
+We don't need dev_err() messages when platform_get_irq() fails now that
+platform_get_irq() prints an error message itself when something goes
+wrong. Let's remove these prints with a simple semantic patch.
+
+// <smpl>
+@@
+expression ret;
+struct platform_device *E;
+@@
+
+ret =
+(
+platform_get_irq(E, ...)
+|
+platform_get_irq_byname(E, ...)
+);
+
+if ( \( ret < 0 \| ret <= 0 \) )
+{
+(
+-if (ret != -EPROBE_DEFER)
+-{ ...
+-dev_err(...);
+-... }
+|
+...
+-dev_err(...);
+)
+...
+}
+// </smpl>
+
+While we're here, remove braces on if statements that only have one
+statement (manually).
+
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Cc: Brian Norris <computersforpeace@gmail.com>
+	Cc: Marek Vasut <marek.vasut@gmail.com>
+	Cc: Miquel Raynal <miquel.raynal@bootlin.com>
+	Cc: Richard Weinberger <richard@nod.at>
+	Cc: Vignesh Raghavendra <vigneshr@ti.com>
+	Cc: linux-mtd@lists.infradead.org
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Stephen Boyd <swboyd@chromium.org>
+	Signed-off-by: Miquel Raynal <miquel.raynal@bootlin.com>
+(cherry picked from commit aab478ca0f7ada511088039c6e2c8fdcb09139db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/mtd/nand/raw/denali_dt.c
+#	drivers/mtd/nand/raw/meson_nand.c
+#	drivers/mtd/nand/raw/omap2.c
+#	drivers/mtd/nand/raw/stm32_fmc2_nand.c
+diff --cc drivers/mtd/nand/raw/denali_dt.c
+index 5869e90cc14b,df992554a66f..000000000000
+--- a/drivers/mtd/nand/raw/denali_dt.c
++++ b/drivers/mtd/nand/raw/denali_dt.c
+@@@ -97,15 -165,13 +97,18 @@@ static int denali_dt_probe(struct platf
+  		denali->ecc_caps = data->ecc_caps;
+  	}
+  
+ -	denali->dev = dev;
+ +	denali->dev = &pdev->dev;
+  	denali->irq = platform_get_irq(pdev, 0);
+++<<<<<<< HEAD
+ +	if (denali->irq < 0) {
+ +		dev_err(&pdev->dev, "no irq defined\n");
+++=======
++ 	if (denali->irq < 0)
+++>>>>>>> aab478ca0f7a (mtd: Remove dev_err() usage after platform_get_irq())
+  		return denali->irq;
+- 	}
+  
+  	res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "denali_reg");
+ -	denali->reg = devm_ioremap_resource(dev, res);
+ +	denali->reg = devm_ioremap_resource(&pdev->dev, res);
+  	if (IS_ERR(denali->reg))
+  		return PTR_ERR(denali->reg);
+  
+diff --cc drivers/mtd/nand/raw/omap2.c
+index e50c64adc3c8,ad77c112a78a..000000000000
+--- a/drivers/mtd/nand/raw/omap2.c
++++ b/drivers/mtd/nand/raw/omap2.c
+@@@ -1915,6 -1909,263 +1915,266 @@@ static const struct mtd_ooblayout_ops o
+  	.free = omap_sw_ooblayout_free,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static int omap_nand_attach_chip(struct nand_chip *chip)
++ {
++ 	struct mtd_info *mtd = nand_to_mtd(chip);
++ 	struct omap_nand_info *info = mtd_to_omap(mtd);
++ 	struct device *dev = &info->pdev->dev;
++ 	int min_oobbytes = BADBLOCK_MARKER_LENGTH;
++ 	int oobbytes_per_step;
++ 	dma_cap_mask_t mask;
++ 	int err;
++ 
++ 	if (chip->bbt_options & NAND_BBT_USE_FLASH)
++ 		chip->bbt_options |= NAND_BBT_NO_OOB;
++ 	else
++ 		chip->options |= NAND_SKIP_BBTSCAN;
++ 
++ 	/* Re-populate low-level callbacks based on xfer modes */
++ 	switch (info->xfer_type) {
++ 	case NAND_OMAP_PREFETCH_POLLED:
++ 		chip->legacy.read_buf = omap_read_buf_pref;
++ 		chip->legacy.write_buf = omap_write_buf_pref;
++ 		break;
++ 
++ 	case NAND_OMAP_POLLED:
++ 		/* Use nand_base defaults for {read,write}_buf */
++ 		break;
++ 
++ 	case NAND_OMAP_PREFETCH_DMA:
++ 		dma_cap_zero(mask);
++ 		dma_cap_set(DMA_SLAVE, mask);
++ 		info->dma = dma_request_chan(dev->parent, "rxtx");
++ 
++ 		if (IS_ERR(info->dma)) {
++ 			dev_err(dev, "DMA engine request failed\n");
++ 			return PTR_ERR(info->dma);
++ 		} else {
++ 			struct dma_slave_config cfg;
++ 
++ 			memset(&cfg, 0, sizeof(cfg));
++ 			cfg.src_addr = info->phys_base;
++ 			cfg.dst_addr = info->phys_base;
++ 			cfg.src_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++ 			cfg.dst_addr_width = DMA_SLAVE_BUSWIDTH_4_BYTES;
++ 			cfg.src_maxburst = 16;
++ 			cfg.dst_maxburst = 16;
++ 			err = dmaengine_slave_config(info->dma, &cfg);
++ 			if (err) {
++ 				dev_err(dev,
++ 					"DMA engine slave config failed: %d\n",
++ 					err);
++ 				return err;
++ 			}
++ 			chip->legacy.read_buf = omap_read_buf_dma_pref;
++ 			chip->legacy.write_buf = omap_write_buf_dma_pref;
++ 		}
++ 		break;
++ 
++ 	case NAND_OMAP_PREFETCH_IRQ:
++ 		info->gpmc_irq_fifo = platform_get_irq(info->pdev, 0);
++ 		if (info->gpmc_irq_fifo <= 0)
++ 			return -ENODEV;
++ 		err = devm_request_irq(dev, info->gpmc_irq_fifo,
++ 				       omap_nand_irq, IRQF_SHARED,
++ 				       "gpmc-nand-fifo", info);
++ 		if (err) {
++ 			dev_err(dev, "Requesting IRQ %d, error %d\n",
++ 				info->gpmc_irq_fifo, err);
++ 			info->gpmc_irq_fifo = 0;
++ 			return err;
++ 		}
++ 
++ 		info->gpmc_irq_count = platform_get_irq(info->pdev, 1);
++ 		if (info->gpmc_irq_count <= 0)
++ 			return -ENODEV;
++ 		err = devm_request_irq(dev, info->gpmc_irq_count,
++ 				       omap_nand_irq, IRQF_SHARED,
++ 				       "gpmc-nand-count", info);
++ 		if (err) {
++ 			dev_err(dev, "Requesting IRQ %d, error %d\n",
++ 				info->gpmc_irq_count, err);
++ 			info->gpmc_irq_count = 0;
++ 			return err;
++ 		}
++ 
++ 		chip->legacy.read_buf = omap_read_buf_irq_pref;
++ 		chip->legacy.write_buf = omap_write_buf_irq_pref;
++ 
++ 		break;
++ 
++ 	default:
++ 		dev_err(dev, "xfer_type %d not supported!\n", info->xfer_type);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (!omap2_nand_ecc_check(info))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * Bail out earlier to let NAND_ECC_SOFT code create its own
++ 	 * ooblayout instead of using ours.
++ 	 */
++ 	if (info->ecc_opt == OMAP_ECC_HAM1_CODE_SW) {
++ 		chip->ecc.mode = NAND_ECC_SOFT;
++ 		chip->ecc.algo = NAND_ECC_HAMMING;
++ 		return 0;
++ 	}
++ 
++ 	/* Populate MTD interface based on ECC scheme */
++ 	switch (info->ecc_opt) {
++ 	case OMAP_ECC_HAM1_CODE_HW:
++ 		dev_info(dev, "nand: using OMAP_ECC_HAM1_CODE_HW\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.bytes		= 3;
++ 		chip->ecc.size		= 512;
++ 		chip->ecc.strength	= 1;
++ 		chip->ecc.calculate	= omap_calculate_ecc;
++ 		chip->ecc.hwctl		= omap_enable_hwecc;
++ 		chip->ecc.correct	= omap_correct_data;
++ 		mtd_set_ooblayout(mtd, &omap_ooblayout_ops);
++ 		oobbytes_per_step	= chip->ecc.bytes;
++ 
++ 		if (!(chip->options & NAND_BUSWIDTH_16))
++ 			min_oobbytes	= 1;
++ 
++ 		break;
++ 
++ 	case OMAP_ECC_BCH4_CODE_HW_DETECTION_SW:
++ 		pr_info("nand: using OMAP_ECC_BCH4_CODE_HW_DETECTION_SW\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.size		= 512;
++ 		chip->ecc.bytes		= 7;
++ 		chip->ecc.strength	= 4;
++ 		chip->ecc.hwctl		= omap_enable_hwecc_bch;
++ 		chip->ecc.correct	= nand_bch_correct_data;
++ 		chip->ecc.calculate	= omap_calculate_ecc_bch_sw;
++ 		mtd_set_ooblayout(mtd, &omap_sw_ooblayout_ops);
++ 		/* Reserve one byte for the OMAP marker */
++ 		oobbytes_per_step	= chip->ecc.bytes + 1;
++ 		/* Software BCH library is used for locating errors */
++ 		chip->ecc.priv		= nand_bch_init(mtd);
++ 		if (!chip->ecc.priv) {
++ 			dev_err(dev, "Unable to use BCH library\n");
++ 			return -EINVAL;
++ 		}
++ 		break;
++ 
++ 	case OMAP_ECC_BCH4_CODE_HW:
++ 		pr_info("nand: using OMAP_ECC_BCH4_CODE_HW ECC scheme\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.size		= 512;
++ 		/* 14th bit is kept reserved for ROM-code compatibility */
++ 		chip->ecc.bytes		= 7 + 1;
++ 		chip->ecc.strength	= 4;
++ 		chip->ecc.hwctl		= omap_enable_hwecc_bch;
++ 		chip->ecc.correct	= omap_elm_correct_data;
++ 		chip->ecc.read_page	= omap_read_page_bch;
++ 		chip->ecc.write_page	= omap_write_page_bch;
++ 		chip->ecc.write_subpage	= omap_write_subpage_bch;
++ 		mtd_set_ooblayout(mtd, &omap_ooblayout_ops);
++ 		oobbytes_per_step	= chip->ecc.bytes;
++ 
++ 		err = elm_config(info->elm_dev, BCH4_ECC,
++ 				 mtd->writesize / chip->ecc.size,
++ 				 chip->ecc.size, chip->ecc.bytes);
++ 		if (err < 0)
++ 			return err;
++ 		break;
++ 
++ 	case OMAP_ECC_BCH8_CODE_HW_DETECTION_SW:
++ 		pr_info("nand: using OMAP_ECC_BCH8_CODE_HW_DETECTION_SW\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.size		= 512;
++ 		chip->ecc.bytes		= 13;
++ 		chip->ecc.strength	= 8;
++ 		chip->ecc.hwctl		= omap_enable_hwecc_bch;
++ 		chip->ecc.correct	= nand_bch_correct_data;
++ 		chip->ecc.calculate	= omap_calculate_ecc_bch_sw;
++ 		mtd_set_ooblayout(mtd, &omap_sw_ooblayout_ops);
++ 		/* Reserve one byte for the OMAP marker */
++ 		oobbytes_per_step	= chip->ecc.bytes + 1;
++ 		/* Software BCH library is used for locating errors */
++ 		chip->ecc.priv		= nand_bch_init(mtd);
++ 		if (!chip->ecc.priv) {
++ 			dev_err(dev, "unable to use BCH library\n");
++ 			return -EINVAL;
++ 		}
++ 		break;
++ 
++ 	case OMAP_ECC_BCH8_CODE_HW:
++ 		pr_info("nand: using OMAP_ECC_BCH8_CODE_HW ECC scheme\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.size		= 512;
++ 		/* 14th bit is kept reserved for ROM-code compatibility */
++ 		chip->ecc.bytes		= 13 + 1;
++ 		chip->ecc.strength	= 8;
++ 		chip->ecc.hwctl		= omap_enable_hwecc_bch;
++ 		chip->ecc.correct	= omap_elm_correct_data;
++ 		chip->ecc.read_page	= omap_read_page_bch;
++ 		chip->ecc.write_page	= omap_write_page_bch;
++ 		chip->ecc.write_subpage	= omap_write_subpage_bch;
++ 		mtd_set_ooblayout(mtd, &omap_ooblayout_ops);
++ 		oobbytes_per_step	= chip->ecc.bytes;
++ 
++ 		err = elm_config(info->elm_dev, BCH8_ECC,
++ 				 mtd->writesize / chip->ecc.size,
++ 				 chip->ecc.size, chip->ecc.bytes);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		break;
++ 
++ 	case OMAP_ECC_BCH16_CODE_HW:
++ 		pr_info("Using OMAP_ECC_BCH16_CODE_HW ECC scheme\n");
++ 		chip->ecc.mode		= NAND_ECC_HW;
++ 		chip->ecc.size		= 512;
++ 		chip->ecc.bytes		= 26;
++ 		chip->ecc.strength	= 16;
++ 		chip->ecc.hwctl		= omap_enable_hwecc_bch;
++ 		chip->ecc.correct	= omap_elm_correct_data;
++ 		chip->ecc.read_page	= omap_read_page_bch;
++ 		chip->ecc.write_page	= omap_write_page_bch;
++ 		chip->ecc.write_subpage	= omap_write_subpage_bch;
++ 		mtd_set_ooblayout(mtd, &omap_ooblayout_ops);
++ 		oobbytes_per_step	= chip->ecc.bytes;
++ 
++ 		err = elm_config(info->elm_dev, BCH16_ECC,
++ 				 mtd->writesize / chip->ecc.size,
++ 				 chip->ecc.size, chip->ecc.bytes);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		break;
++ 	default:
++ 		dev_err(dev, "Invalid or unsupported ECC scheme\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check if NAND device's OOB is enough to store ECC signatures */
++ 	min_oobbytes += (oobbytes_per_step *
++ 			 (mtd->writesize / chip->ecc.size));
++ 	if (mtd->oobsize < min_oobbytes) {
++ 		dev_err(dev,
++ 			"Not enough OOB bytes: required = %d, available=%d\n",
++ 			min_oobbytes, mtd->oobsize);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static const struct nand_controller_ops omap_nand_controller_ops = {
++ 	.attach_chip = omap_nand_attach_chip,
++ };
++ 
++ /* Shared among all NAND instances to synchronize access to the ECC Engine */
++ static struct nand_controller omap_gpmc_controller;
++ static bool omap_gpmc_controller_initialized;
++ 
+++>>>>>>> aab478ca0f7a (mtd: Remove dev_err() usage after platform_get_irq())
+  static int omap_nand_probe(struct platform_device *pdev)
+  {
+  	struct omap_nand_info		*info;
+* Unmerged path drivers/mtd/nand/raw/meson_nand.c
+* Unmerged path drivers/mtd/nand/raw/stm32_fmc2_nand.c
+diff --git a/drivers/mtd/devices/spear_smi.c b/drivers/mtd/devices/spear_smi.c
+index 986f81d2f93e..7f6f6f1d965f 100644
+--- a/drivers/mtd/devices/spear_smi.c
++++ b/drivers/mtd/devices/spear_smi.c
+@@ -933,7 +933,6 @@ static int spear_smi_probe(struct platform_device *pdev)
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0) {
+ 		ret = -ENODEV;
+-		dev_err(&pdev->dev, "invalid smi irq\n");
+ 		goto err;
+ 	}
+ 
+* Unmerged path drivers/mtd/nand/raw/denali_dt.c
+diff --git a/drivers/mtd/nand/raw/hisi504_nand.c b/drivers/mtd/nand/raw/hisi504_nand.c
+index a1e009c8e556..a6f82f95ce0b 100644
+--- a/drivers/mtd/nand/raw/hisi504_nand.c
++++ b/drivers/mtd/nand/raw/hisi504_nand.c
+@@ -729,10 +729,8 @@ static int hisi_nfc_probe(struct platform_device *pdev)
+ 	mtd  = nand_to_mtd(chip);
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "no IRQ resource defined\n");
++	if (irq < 0)
+ 		return -ENXIO;
+-	}
+ 
+ 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+ 	host->iobase = devm_ioremap_resource(dev, res);
+diff --git a/drivers/mtd/nand/raw/lpc32xx_mlc.c b/drivers/mtd/nand/raw/lpc32xx_mlc.c
+index 052d123a8304..99775c6bb28e 100644
+--- a/drivers/mtd/nand/raw/lpc32xx_mlc.c
++++ b/drivers/mtd/nand/raw/lpc32xx_mlc.c
+@@ -781,7 +781,6 @@ static int lpc32xx_nand_probe(struct platform_device *pdev)
+ 
+ 	host->irq = platform_get_irq(pdev, 0);
+ 	if (host->irq < 0) {
+-		dev_err(&pdev->dev, "failed to get platform irq\n");
+ 		res = -EINVAL;
+ 		goto release_dma_chan;
+ 	}
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index ebb1d141b900..b680f4bf49e8 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -2753,10 +2753,8 @@ static int marvell_nfc_probe(struct platform_device *pdev)
+ 		return PTR_ERR(nfc->regs);
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "failed to retrieve irq\n");
++	if (irq < 0)
+ 		return irq;
+-	}
+ 
+ 	nfc->core_clk = devm_clk_get(&pdev->dev, "core");
+ 
+* Unmerged path drivers/mtd/nand/raw/meson_nand.c
+diff --git a/drivers/mtd/nand/raw/mtk_ecc.c b/drivers/mtd/nand/raw/mtk_ecc.c
+index 6432bd70c3b3..e3a01ecb8e4b 100644
+--- a/drivers/mtd/nand/raw/mtk_ecc.c
++++ b/drivers/mtd/nand/raw/mtk_ecc.c
+@@ -531,10 +531,8 @@ static int mtk_ecc_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "failed to get irq: %d\n", irq);
++	if (irq < 0)
+ 		return irq;
+-	}
+ 
+ 	ret = dma_set_mask(dev, DMA_BIT_MASK(32));
+ 	if (ret) {
+diff --git a/drivers/mtd/nand/raw/mtk_nand.c b/drivers/mtd/nand/raw/mtk_nand.c
+index 75c845adb050..2590ddf37d4b 100644
+--- a/drivers/mtd/nand/raw/mtk_nand.c
++++ b/drivers/mtd/nand/raw/mtk_nand.c
+@@ -1481,7 +1481,6 @@ static int mtk_nfc_probe(struct platform_device *pdev)
+ 
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq < 0) {
+-		dev_err(dev, "no nfi irq resource\n");
+ 		ret = -EINVAL;
+ 		goto clk_disable;
+ 	}
+* Unmerged path drivers/mtd/nand/raw/omap2.c
+diff --git a/drivers/mtd/nand/raw/sh_flctl.c b/drivers/mtd/nand/raw/sh_flctl.c
+index c7abceffcc40..b79381e46391 100644
+--- a/drivers/mtd/nand/raw/sh_flctl.c
++++ b/drivers/mtd/nand/raw/sh_flctl.c
+@@ -1137,10 +1137,8 @@ static int flctl_probe(struct platform_device *pdev)
+ 	flctl->fifo = res->start + 0x24; /* FLDTFIFO */
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(&pdev->dev, "failed to get flste irq data: %d\n", irq);
++	if (irq < 0)
+ 		return irq;
+-	}
+ 
+ 	ret = devm_request_irq(&pdev->dev, irq, flctl_handle_flste, IRQF_SHARED,
+ 			       "flste", flctl);
+* Unmerged path drivers/mtd/nand/raw/stm32_fmc2_nand.c
+diff --git a/drivers/mtd/nand/raw/sunxi_nand.c b/drivers/mtd/nand/raw/sunxi_nand.c
+index d831a141a196..000cb86e66dc 100644
+--- a/drivers/mtd/nand/raw/sunxi_nand.c
++++ b/drivers/mtd/nand/raw/sunxi_nand.c
+@@ -2021,10 +2021,8 @@ static int sunxi_nfc_probe(struct platform_device *pdev)
+ 		return PTR_ERR(nfc->regs);
+ 
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "failed to retrieve irq\n");
++	if (irq < 0)
+ 		return irq;
+-	}
+ 
+ 	nfc->ahb_clk = devm_clk_get(dev, "ahb");
+ 	if (IS_ERR(nfc->ahb_clk)) {
+diff --git a/drivers/mtd/spi-nor/cadence-quadspi.c b/drivers/mtd/spi-nor/cadence-quadspi.c
+index d7e10b36a0b9..b5f5918c7c0d 100644
+--- a/drivers/mtd/spi-nor/cadence-quadspi.c
++++ b/drivers/mtd/spi-nor/cadence-quadspi.c
+@@ -1349,10 +1349,8 @@ static int cqspi_probe(struct platform_device *pdev)
+ 
+ 	/* Obtain IRQ line. */
+ 	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0) {
+-		dev_err(dev, "Cannot obtain IRQ.\n");
++	if (irq < 0)
+ 		return -ENXIO;
+-	}
+ 
+ 	pm_runtime_enable(dev);
+ 	ret = pm_runtime_get_sync(dev);
