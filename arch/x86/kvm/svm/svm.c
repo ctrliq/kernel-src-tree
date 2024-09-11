@@ -193,7 +193,7 @@ module_param(sev, int, 0444);
 static bool __read_mostly dump_invalid_vmcb = 0;
 module_param(dump_invalid_vmcb, bool, 0644);
 
-bool svm_gp_erratum_intercept = true;
+static bool svm_gp_erratum_intercept = true;
 
 static u8 rsm_ins_bytes[] = "\x0f\xaa";
 
