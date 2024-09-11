@@ -1,0 +1,123 @@
+udp: fixup csum for GSO receive slow path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 000ac44da7d0adfc5e62e6c019246a4afeeffd04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/000ac44d.failed
+
+When UDP packets generated locally by a socket with UDP_SEGMENT
+traverse the following path:
+
+UDP tunnel(xmit) -> veth (segmentation) -> veth (gro) ->
+	UDP tunnel (rx) -> UDP socket (no UDP_GRO)
+
+ip_summed will be set to CHECKSUM_PARTIAL at creation time and
+such checksum mode will be preserved in the above path up to the
+UDP tunnel receive code where we have:
+
+ __iptunnel_pull_header() -> skb_pull_rcsum() ->
+skb_postpull_rcsum() -> __skb_postpull_rcsum()
+
+The latter will convert the skb to CHECKSUM_NONE.
+
+The UDP GSO packet will be later segmented as part of the rx socket
+receive operation, and will present a CHECKSUM_NONE after segmentation.
+
+Additionally the segmented packets UDP CB still refers to the original
+GSO packet len. Overall that causes unexpected/wrong csum validation
+errors later in the UDP receive path.
+
+We could possibly address the issue with some additional checks and
+csum mangling in the UDP tunnel code. Since the issue affects only
+this UDP receive slow path, let's set a suitable csum status there.
+
+Note that SKB_GSO_UDP_L4 or SKB_GSO_FRAGLIST packets lacking an UDP
+encapsulation present a valid checksum when landing to udp_queue_rcv_skb(),
+as the UDP checksum has been validated by the GRO engine.
+
+v2 -> v3:
+ - even more verbose commit message and comments
+
+v1 -> v2:
+ - restrict the csum update to the packets strictly needing them
+ - hopefully clarify the commit message and code comments
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Willem de Bruijn <willemb@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 000ac44da7d0adfc5e62e6c019246a4afeeffd04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/udp.h
+diff --cc include/net/udp.h
+index c6f52bc35751,adf2ff8ac87c..000000000000
+--- a/include/net/udp.h
++++ b/include/net/udp.h
+@@@ -502,9 -515,32 +502,36 @@@ static inline struct sk_buff *udp_rcv_s
+  	return segs;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_BPF_STREAM_PARSER
+++=======
++ static inline void udp_post_segment_fix_csum(struct sk_buff *skb)
++ {
++ 	/* UDP-lite can't land here - no GRO */
++ 	WARN_ON_ONCE(UDP_SKB_CB(skb)->partial_cov);
++ 
++ 	/* UDP packets generated with UDP_SEGMENT and traversing:
++ 	 *
++ 	 * UDP tunnel(xmit) -> veth (segmentation) -> veth (gro) -> UDP tunnel (rx)
++ 	 *
++ 	 * can reach an UDP socket with CHECKSUM_NONE, because
++ 	 * __iptunnel_pull_header() converts CHECKSUM_PARTIAL into NONE.
++ 	 * SKB_GSO_UDP_L4 or SKB_GSO_FRAGLIST packets with no UDP tunnel will
++ 	 * have a valid checksum, as the GRO engine validates the UDP csum
++ 	 * before the aggregation and nobody strips such info in between.
++ 	 * Instead of adding another check in the tunnel fastpath, we can force
++ 	 * a valid csum after the segmentation.
++ 	 * Additionally fixup the UDP CB.
++ 	 */
++ 	UDP_SKB_CB(skb)->cscov = skb->len;
++ 	if (skb->ip_summed == CHECKSUM_NONE && !skb->csum_valid)
++ 		skb->csum_valid = 1;
++ }
++ 
++ #ifdef CONFIG_BPF_SYSCALL
+++>>>>>>> 000ac44da7d0 (udp: fixup csum for GSO receive slow path)
+  struct sk_psock;
+  struct proto *udp_bpf_get_proto(struct sock *sk, struct sk_psock *psock);
+ -#endif
+ +#endif /* BPF_STREAM_PARSER */
+  
+  #endif	/* _UDP_H */
+* Unmerged path include/net/udp.h
+diff --git a/net/ipv4/udp.c b/net/ipv4/udp.c
+index fcf45cd0a19e..20f7b1450fa0 100644
+--- a/net/ipv4/udp.c
++++ b/net/ipv4/udp.c
+@@ -2138,6 +2138,8 @@ static int udp_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+ 	for (skb = segs; skb; skb = next) {
+ 		next = skb->next;
+ 		__skb_pull(skb, skb_transport_offset(skb));
++
++		udp_post_segment_fix_csum(skb);
+ 		ret = udp_queue_rcv_one_skb(sk, skb);
+ 		if (ret > 0)
+ 			ip_protocol_deliver_rcu(dev_net(skb->dev), skb, ret);
+diff --git a/net/ipv6/udp.c b/net/ipv6/udp.c
+index ce21cb783201..d0f7b2cd6e96 100644
+--- a/net/ipv6/udp.c
++++ b/net/ipv6/udp.c
+@@ -728,6 +728,7 @@ static int udpv6_queue_rcv_skb(struct sock *sk, struct sk_buff *skb)
+ 		next = skb->next;
+ 		__skb_pull(skb, skb_transport_offset(skb));
+ 
++		udp_post_segment_fix_csum(skb);
+ 		ret = udpv6_queue_rcv_one_skb(sk, skb);
+ 		if (ret > 0)
+ 			ip6_protocol_deliver_rcu(dev_net(skb->dev), skb, ret,
