@@ -1544,10 +1544,13 @@ done:
 		return DM_MAPIO_SUBMITTED;
 
 	case WC_MAP_ERROR:
-	default:
 		wc_unlock(wc);
 		bio_io_error(bio);
 		return DM_MAPIO_SUBMITTED;
+
+	default:
+		BUG();
+		return -1;
 	}
 }
 
