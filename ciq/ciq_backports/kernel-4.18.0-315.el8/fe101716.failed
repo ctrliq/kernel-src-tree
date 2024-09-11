@@ -1,0 +1,117 @@
+rtw88: replace tx tasklet with work queue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Po-Hao Huang <phhuang@realtek.com>
+commit fe101716c7c9d2ce53a73c7e897be0e8fdfc476b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/fe101716.failed
+
+Replace tasklet so we can do tx scheduling in parallel. Since throughput
+is delay-sensitive in most cases, we allocate a dedicated, high priority
+wq for our needs.
+
+	Signed-off-by: Po-Hao Huang <phhuang@realtek.com>
+	Signed-off-by: Ping-Ke Shih <pkshih@realtek.com>
+	Reviewed-by: Brian Norris <briannorris@chromium.org>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/20210209070755.23019-5-pkshih@realtek.com
+(cherry picked from commit fe101716c7c9d2ce53a73c7e897be0e8fdfc476b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/realtek/rtw88/main.c
+#	drivers/net/wireless/realtek/rtw88/tx.c
+#	drivers/net/wireless/realtek/rtw88/tx.h
+diff --cc drivers/net/wireless/realtek/rtw88/main.c
+index d05b4d91583c,e6989c0525cc..000000000000
+--- a/drivers/net/wireless/realtek/rtw88/main.c
++++ b/drivers/net/wireless/realtek/rtw88/main.c
+@@@ -1658,8 -1658,7 +1658,12 @@@ int rtw_core_init(struct rtw_dev *rtwde
+  
+  	timer_setup(&rtwdev->tx_report.purge_timer,
+  		    rtw_tx_report_purge_timer, 0);
+++<<<<<<< HEAD
+ +	tasklet_init(&rtwdev->tx_tasklet, rtw_tx_tasklet,
+ +		     (unsigned long)rtwdev);
+++=======
++ 	rtwdev->tx_wq = alloc_workqueue("rtw_tx_wq", WQ_UNBOUND | WQ_HIGHPRI, 0);
+++>>>>>>> fe101716c7c9 (rtw88: replace tx tasklet with work queue)
+  
+  	INIT_DELAYED_WORK(&rtwdev->watch_dog_work, rtw_watch_dog_work);
+  	INIT_DELAYED_WORK(&coex->bt_relink_work, rtw_coex_bt_relink_work);
+diff --cc drivers/net/wireless/realtek/rtw88/tx.c
+index bcfeabfe769c,0193708fc013..000000000000
+--- a/drivers/net/wireless/realtek/rtw88/tx.c
++++ b/drivers/net/wireless/realtek/rtw88/tx.c
+@@@ -592,9 -592,9 +592,15 @@@ static void rtw_txq_push(struct rtw_de
+  	rcu_read_unlock();
+  }
+  
+++<<<<<<< HEAD
+ +void rtw_tx_tasklet(unsigned long data)
+ +{
+ +	struct rtw_dev *rtwdev = (void *)data;
+++=======
++ void rtw_tx_work(struct work_struct *w)
++ {
++ 	struct rtw_dev *rtwdev = container_of(w, struct rtw_dev, tx_work);
+++>>>>>>> fe101716c7c9 (rtw88: replace tx tasklet with work queue)
+  	struct rtw_txq *rtwtxq, *tmp;
+  
+  	spin_lock_bh(&rtwdev->txq_lock);
+diff --cc drivers/net/wireless/realtek/rtw88/tx.h
+index f88ee7f6cbb9,56371eff9f7f..000000000000
+--- a/drivers/net/wireless/realtek/rtw88/tx.h
++++ b/drivers/net/wireless/realtek/rtw88/tx.h
+@@@ -98,7 -98,7 +98,11 @@@ void rtw_tx(struct rtw_dev *rtwdev
+  	    struct sk_buff *skb);
+  void rtw_txq_init(struct rtw_dev *rtwdev, struct ieee80211_txq *txq);
+  void rtw_txq_cleanup(struct rtw_dev *rtwdev, struct ieee80211_txq *txq);
+++<<<<<<< HEAD
+ +void rtw_tx_tasklet(unsigned long data);
+++=======
++ void rtw_tx_work(struct work_struct *w);
+++>>>>>>> fe101716c7c9 (rtw88: replace tx tasklet with work queue)
+  void rtw_tx_pkt_info_update(struct rtw_dev *rtwdev,
+  			    struct rtw_tx_pkt_info *pkt_info,
+  			    struct ieee80211_sta *sta,
+diff --git a/drivers/net/wireless/realtek/rtw88/mac80211.c b/drivers/net/wireless/realtek/rtw88/mac80211.c
+index 1f1b639cd124..2351dfb0d2e2 100644
+--- a/drivers/net/wireless/realtek/rtw88/mac80211.c
++++ b/drivers/net/wireless/realtek/rtw88/mac80211.c
+@@ -42,7 +42,7 @@ static void rtw_ops_wake_tx_queue(struct ieee80211_hw *hw,
+ 		list_add_tail(&rtwtxq->list, &rtwdev->txqs);
+ 	spin_unlock_bh(&rtwdev->txq_lock);
+ 
+-	tasklet_schedule(&rtwdev->tx_tasklet);
++	queue_work(rtwdev->tx_wq, &rtwdev->tx_work);
+ }
+ 
+ static int rtw_ops_start(struct ieee80211_hw *hw)
+* Unmerged path drivers/net/wireless/realtek/rtw88/main.c
+diff --git a/drivers/net/wireless/realtek/rtw88/main.h b/drivers/net/wireless/realtek/rtw88/main.h
+index bb4cd7885b0f..73fe47c38fc6 100644
+--- a/drivers/net/wireless/realtek/rtw88/main.h
++++ b/drivers/net/wireless/realtek/rtw88/main.h
+@@ -13,6 +13,7 @@
+ #include <linux/bitfield.h>
+ #include <linux/iopoll.h>
+ #include <linux/interrupt.h>
++#include <linux/workqueue.h>
+ 
+ #include "util.h"
+ 
+@@ -1761,7 +1762,8 @@ struct rtw_dev {
+ 	/* used to protect txqs list */
+ 	spinlock_t txq_lock;
+ 	struct list_head txqs;
+-	struct tasklet_struct tx_tasklet;
++	struct workqueue_struct *tx_wq;
++	struct work_struct tx_work;
+ 	struct work_struct ba_work;
+ 
+ 	struct rtw_tx_report tx_report;
+* Unmerged path drivers/net/wireless/realtek/rtw88/tx.c
+* Unmerged path drivers/net/wireless/realtek/rtw88/tx.h
