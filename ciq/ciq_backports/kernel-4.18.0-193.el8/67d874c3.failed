@@ -1,0 +1,126 @@
+cpufreq: Register notifiers with the PM QoS framework
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [cpufreq] Register notifiers with the PM QoS framework (Al Stone) [1739729 1725581]
+Rebuild_FUZZ: 90.72%
+commit-author Viresh Kumar <viresh.kumar@linaro.org>
+commit 67d874c3b2c69d65274fa5ce44ba939788d5729d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/67d874c3.failed
+
+Register notifiers for min/max frequency constraints with the PM QoS
+framework. The constraints are also taken into consideration in
+cpufreq_set_policy().
+
+This also relocates cpufreq_policy_put_kobj() as it is required to be
+called from cpufreq_policy_alloc() now.
+
+refresh_frequency_limits() is updated to avoid calling
+cpufreq_set_policy() for inactive policies and handle_update() is
+updated to have proper locking in place.
+
+No constraints are added until now though.
+
+	Reviewed-by: Matthias Kaehlcke <mka@chromium.org>
+	Reviewed-by: Ulf Hansson <ulf.hansson@linaro.org>
+	Signed-off-by: Viresh Kumar <viresh.kumar@linaro.org>
+	Tested-by: Pavel Machek <pavel@ucw.cz>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit 67d874c3b2c69d65274fa5ce44ba939788d5729d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/cpufreq/cpufreq.c
+diff --cc drivers/cpufreq/cpufreq.c
+index 55c2ce0958e0,b96ef6db1bfe..000000000000
+--- a/drivers/cpufreq/cpufreq.c
++++ b/drivers/cpufreq/cpufreq.c
+@@@ -1133,54 -1136,27 +1136,63 @@@ static void handle_update(struct work_s
+  		container_of(work, struct cpufreq_policy, update);
+  
+  	pr_debug("handle_update for cpu %u called\n", policy->cpu);
++ 	down_write(&policy->rwsem);
+  	refresh_frequency_limits(policy);
++ 	up_write(&policy->rwsem);
+  }
+  
+- static struct cpufreq_policy *cpufreq_policy_alloc(unsigned int cpu)
++ static int cpufreq_notifier_min(struct notifier_block *nb, unsigned long freq,
++ 				void *data)
+  {
+- 	struct cpufreq_policy *policy;
+- 	int ret;
++ 	struct cpufreq_policy *policy = container_of(nb, struct cpufreq_policy, nb_min);
+  
+- 	policy = kzalloc(sizeof(*policy), GFP_KERNEL);
+- 	if (!policy)
+- 		return NULL;
++ 	schedule_work(&policy->update);
++ 	return 0;
++ }
+  
+- 	if (!alloc_cpumask_var(&policy->cpus, GFP_KERNEL))
+- 		goto err_free_policy;
++ static int cpufreq_notifier_max(struct notifier_block *nb, unsigned long freq,
++ 				void *data)
++ {
++ 	struct cpufreq_policy *policy = container_of(nb, struct cpufreq_policy, nb_max);
+  
+++<<<<<<< HEAD
+ +	if (!zalloc_cpumask_var(&policy->related_cpus, GFP_KERNEL))
+ +		goto err_free_cpumask;
+ +
+ +	if (!zalloc_cpumask_var(&policy->real_cpus, GFP_KERNEL))
+ +		goto err_free_rcpumask;
+ +
+ +	ret = kobject_init_and_add(&policy->kobj, &ktype_cpufreq,
+ +				   cpufreq_global_kobject, "policy%u", cpu);
+ +	if (ret) {
+ +		pr_err("%s: failed to init policy->kobj: %d\n", __func__, ret);
+ +		goto err_free_real_cpus;
+ +	}
+ +
+ +	INIT_LIST_HEAD(&policy->policy_list);
+ +	init_rwsem(&policy->rwsem);
+ +	spin_lock_init(&policy->transition_lock);
+ +	init_waitqueue_head(&policy->transition_wait);
+ +	init_completion(&policy->kobj_unregister);
+ +	INIT_WORK(&policy->update, handle_update);
+ +
+ +	policy->cpu = cpu;
+ +	return policy;
+ +
+ +err_free_real_cpus:
+ +	free_cpumask_var(policy->real_cpus);
+ +err_free_rcpumask:
+ +	free_cpumask_var(policy->related_cpus);
+ +err_free_cpumask:
+ +	free_cpumask_var(policy->cpus);
+ +err_free_policy:
+ +	kfree(policy);
+ +
+ +	return NULL;
+++=======
++ 	schedule_work(&policy->update);
++ 	return 0;
+++>>>>>>> 67d874c3b2c6 (cpufreq: Register notifiers with the PM QoS framework)
+  }
+  
+  static void cpufreq_policy_put_kobj(struct cpufreq_policy *policy)
+* Unmerged path drivers/cpufreq/cpufreq.c
+diff --git a/include/linux/cpufreq.h b/include/linux/cpufreq.h
+index 9fe6897a20d2..d30271c59096 100644
+--- a/include/linux/cpufreq.h
++++ b/include/linux/cpufreq.h
+@@ -147,6 +147,9 @@ struct cpufreq_policy {
+ 
+ 	/* Pointer to the cooling device if used for thermal mitigation */
+ 	struct thermal_cooling_device *cdev;
++
++	struct notifier_block nb_min;
++	struct notifier_block nb_max;
+ };
+ 
+ struct cpufreq_freqs {
