@@ -1,0 +1,156 @@
+IB/mlx5: Unify e-switch representors load approach between uplink and VFs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Mark Bloch <markb@mellanox.com>
+commit 06cc74af05c33091a9877b54f1821966b446003c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/06cc74af.failed
+
+When in switchdev mode and the add function is called by the core
+level driver, make sure we only register the callbacks, but don't
+create the mlx5 IB device or initialize anything. With this change
+all the IB devices in switchdev mode are created only once the load
+callback is invoked by the e-switch core sub-module. This follows
+the design paradigm under which the all the Eth representors must
+be loaded before any of IB reprs is loaded.
+
+	Signed-off-by: Mark Bloch <markb@mellanox.com>
+	Acked-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 06cc74af05c33091a9877b54f1821966b446003c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/main.c
+diff --cc drivers/infiniband/hw/mlx5/main.c
+index 12a75511c956,4a4200a88957..000000000000
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@@ -5878,31 -6214,32 +5878,60 @@@ static void mlx5_ib_stage_delay_drop_cl
+  	cancel_delay_drop(dev);
+  }
+  
+++<<<<<<< HEAD
+ +int mlx5_ib_stage_class_attr_init(struct mlx5_ib_dev *dev)
+ +{
+ +	int err;
+ +	int i;
+ +
+ +	for (i = 0; i < ARRAY_SIZE(mlx5_class_attributes); i++) {
+ +		err = device_create_file(&dev->ib_dev.dev,
+ +					 mlx5_class_attributes[i]);
+ +		if (err)
+ +			return err;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int mlx5_ib_stage_rep_reg_init(struct mlx5_ib_dev *dev)
+ +{
+ +	mlx5_ib_register_vport_reps(dev);
+ +
+ +	return 0;
+ +}
+ +
+ +static void mlx5_ib_stage_rep_reg_cleanup(struct mlx5_ib_dev *dev)
+ +{
+ +	mlx5_ib_unregister_vport_reps(dev);
+++=======
++ static int mlx5_ib_stage_dev_notifier_init(struct mlx5_ib_dev *dev)
++ {
++ 	dev->mdev_events.notifier_call = mlx5_ib_event;
++ 	mlx5_notifier_register(dev->mdev, &dev->mdev_events);
++ 	return 0;
++ }
++ 
++ static void mlx5_ib_stage_dev_notifier_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	mlx5_notifier_unregister(dev->mdev, &dev->mdev_events);
++ }
++ 
++ static int mlx5_ib_stage_devx_init(struct mlx5_ib_dev *dev)
++ {
++ 	int uid;
++ 
++ 	uid = mlx5_ib_devx_create(dev);
++ 	if (uid > 0)
++ 		dev->devx_whitelist_uid = uid;
++ 
++ 	return 0;
++ }
++ static void mlx5_ib_stage_devx_cleanup(struct mlx5_ib_dev *dev)
++ {
++ 	if (dev->devx_whitelist_uid)
++ 		mlx5_ib_devx_destroy(dev, dev->devx_whitelist_uid);
+++>>>>>>> 06cc74af05c3 (IB/mlx5: Unify e-switch representors load approach between uplink and VFs)
+  }
+  
+  void __mlx5_ib_remove(struct mlx5_ib_dev *dev,
+@@@ -6038,12 -6385,6 +6065,15 @@@ static const struct mlx5_ib_profile nic
+  	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
+  		     mlx5_ib_stage_post_ib_reg_umr_init,
+  		     NULL),
+++<<<<<<< HEAD
+ +	STAGE_CREATE(MLX5_IB_STAGE_CLASS_ATTR,
+ +		     mlx5_ib_stage_class_attr_init,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_REP_REG,
+ +		     mlx5_ib_stage_rep_reg_init,
+ +		     mlx5_ib_stage_rep_reg_cleanup),
+++=======
+++>>>>>>> 06cc74af05c3 (IB/mlx5: Unify e-switch representors load approach between uplink and VFs)
+  };
+  
+  static void *mlx5_ib_add_slave_port(struct mlx5_core_dev *mdev)
+diff --git a/drivers/infiniband/hw/mlx5/ib_rep.c b/drivers/infiniband/hw/mlx5/ib_rep.c
+index cd36662145c2..b705714f2d48 100644
+--- a/drivers/infiniband/hw/mlx5/ib_rep.c
++++ b/drivers/infiniband/hw/mlx5/ib_rep.c
+@@ -47,13 +47,21 @@ static const struct mlx5_ib_profile rep_profile = {
+ static int
+ mlx5_ib_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ {
++	struct mlx5_ib_dev *ibdev;
++
++	ibdev = mlx5_ib_rep_to_dev(rep);
++	if (!__mlx5_ib_add(ibdev, ibdev->profile))
++		return -EINVAL;
+ 	return 0;
+ }
+ 
+ static void
+ mlx5_ib_nic_rep_unload(struct mlx5_eswitch_rep *rep)
+ {
+-	rep->rep_if[REP_IB].priv = NULL;
++	struct mlx5_ib_dev *ibdev;
++
++	ibdev = mlx5_ib_rep_to_dev(rep);
++	__mlx5_ib_remove(ibdev, ibdev->profile, MLX5_IB_STAGE_MAX);
+ }
+ 
+ static int
+@@ -88,6 +96,7 @@ mlx5_ib_vport_rep_unload(struct mlx5_eswitch_rep *rep)
+ 	dev = mlx5_ib_rep_to_dev(rep);
+ 	__mlx5_ib_remove(dev, dev->profile, MLX5_IB_STAGE_MAX);
+ 	rep->rep_if[REP_IB].priv = NULL;
++	ib_dealloc_device(&dev->ib_dev);
+ }
+ 
+ static void *mlx5_ib_vport_get_proto_dev(struct mlx5_eswitch_rep *rep)
+* Unmerged path drivers/infiniband/hw/mlx5/main.c
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index 2c8fea140d3d..1464492843d1 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -766,7 +766,6 @@ enum mlx5_ib_stages {
+ 	MLX5_IB_STAGE_POST_IB_REG_UMR,
+ 	MLX5_IB_STAGE_DELAY_DROP,
+ 	MLX5_IB_STAGE_CLASS_ATTR,
+-	MLX5_IB_STAGE_REP_REG,
+ 	MLX5_IB_STAGE_MAX,
+ };
+ 
