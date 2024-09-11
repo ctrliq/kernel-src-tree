@@ -1,0 +1,163 @@
+KVM: x86: Add fixed counters to PMU filter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Eric Hankland <ehankland@google.com>
+commit 30cd8604323dbaf20a80e797fe7057f5b02e394d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/30cd8604.failed
+
+Updates KVM_CAP_PMU_EVENT_FILTER so it can also whitelist or blacklist
+fixed counters.
+
+	Signed-off-by: Eric Hankland <ehankland@google.com>
+[No need to check padding fields for zero. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 30cd8604323dbaf20a80e797fe7057f5b02e394d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virtual/kvm/api.txt
+#	arch/x86/include/uapi/asm/kvm.h
+#	arch/x86/kvm/pmu.c
+diff --cc Documentation/virtual/kvm/api.txt
+index ffb9718c32c1,e54a3f51ddc5..000000000000
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@@ -4065,6 -4081,37 +4065,40 @@@ KVM_ARM_VCPU_FINALIZE call
+  See KVM_ARM_VCPU_INIT for details of vcpu features that require finalization
+  using this ioctl.
+  
+++<<<<<<< HEAD
+++=======
++ 4.120 KVM_SET_PMU_EVENT_FILTER
++ 
++ Capability: KVM_CAP_PMU_EVENT_FILTER
++ Architectures: x86
++ Type: vm ioctl
++ Parameters: struct kvm_pmu_event_filter (in)
++ Returns: 0 on success, -1 on error
++ 
++ struct kvm_pmu_event_filter {
++ 	__u32 action;
++ 	__u32 nevents;
++ 	__u32 fixed_counter_bitmap;
++ 	__u32 flags;
++ 	__u32 pad[4];
++ 	__u64 events[0];
++ };
++ 
++ This ioctl restricts the set of PMU events that the guest can program.
++ The argument holds a list of events which will be allowed or denied.
++ The eventsel+umask of each event the guest attempts to program is compared
++ against the events field to determine whether the guest should have access.
++ The events field only controls general purpose counters; fixed purpose
++ counters are controlled by the fixed_counter_bitmap.
++ 
++ No flags are defined yet, the field must be zero.
++ 
++ Valid values for 'action':
++ #define KVM_PMU_EVENT_ALLOW 0
++ #define KVM_PMU_EVENT_DENY 1
++ 
++ 
+++>>>>>>> 30cd8604323d (KVM: x86: Add fixed counters to PMU filter)
+  5. The kvm_run structure
+  ------------------------
+  
+diff --cc arch/x86/include/uapi/asm/kvm.h
+index 4a9184f8e57e,503d3f42da16..000000000000
+--- a/arch/x86/include/uapi/asm/kvm.h
++++ b/arch/x86/include/uapi/asm/kvm.h
+@@@ -433,4 -433,17 +433,20 @@@ struct kvm_nested_state 
+  	} data;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* for KVM_CAP_PMU_EVENT_FILTER */
++ struct kvm_pmu_event_filter {
++ 	__u32 action;
++ 	__u32 nevents;
++ 	__u32 fixed_counter_bitmap;
++ 	__u32 flags;
++ 	__u32 pad[4];
++ 	__u64 events[0];
++ };
++ 
++ #define KVM_PMU_EVENT_ALLOW 0
++ #define KVM_PMU_EVENT_DENY 1
++ 
+++>>>>>>> 30cd8604323d (KVM: x86: Add fixed counters to PMU filter)
+  #endif /* _ASM_X86_KVM_H */
+diff --cc arch/x86/kvm/pmu.c
+index ccefaf5218c7,46875bbd0419..000000000000
+--- a/arch/x86/kvm/pmu.c
++++ b/arch/x86/kvm/pmu.c
+@@@ -22,6 -19,9 +22,12 @@@
+  #include "lapic.h"
+  #include "pmu.h"
+  
+++<<<<<<< HEAD
+++=======
++ /* This is enough to filter the vast majority of currently defined events. */
++ #define KVM_PMU_EVENT_FILTER_MAX_EVENTS 300
++ 
+++>>>>>>> 30cd8604323d (KVM: x86: Add fixed counters to PMU filter)
+  /* NOTE:
+   * - Each perf counter is defined as "struct kvm_pmc";
+   * - There are two types of perf counters: general purpose (gp) and fixed.
+@@@ -351,3 -383,46 +369,49 @@@ void kvm_pmu_destroy(struct kvm_vcpu *v
+  {
+  	kvm_pmu_reset(vcpu);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int kvm_vm_ioctl_set_pmu_event_filter(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_pmu_event_filter tmp, *filter;
++ 	size_t size;
++ 	int r;
++ 
++ 	if (copy_from_user(&tmp, argp, sizeof(tmp)))
++ 		return -EFAULT;
++ 
++ 	if (tmp.action != KVM_PMU_EVENT_ALLOW &&
++ 	    tmp.action != KVM_PMU_EVENT_DENY)
++ 		return -EINVAL;
++ 
++ 	if (tmp.flags != 0)
++ 		return -EINVAL;
++ 
++ 	if (tmp.nevents > KVM_PMU_EVENT_FILTER_MAX_EVENTS)
++ 		return -E2BIG;
++ 
++ 	size = struct_size(filter, events, tmp.nevents);
++ 	filter = kmalloc(size, GFP_KERNEL_ACCOUNT);
++ 	if (!filter)
++ 		return -ENOMEM;
++ 
++ 	r = -EFAULT;
++ 	if (copy_from_user(filter, argp, size))
++ 		goto cleanup;
++ 
++ 	/* Ensure nevents can't be changed between the user copies. */
++ 	*filter = tmp;
++ 
++ 	mutex_lock(&kvm->lock);
++ 	rcu_swap_protected(kvm->arch.pmu_event_filter, filter,
++ 			   mutex_is_locked(&kvm->lock));
++ 	mutex_unlock(&kvm->lock);
++ 
++ 	synchronize_srcu_expedited(&kvm->srcu);
++ 	r = 0;
++ cleanup:
++ 	kfree(filter);
++ 	return r;
++ }
+++>>>>>>> 30cd8604323d (KVM: x86: Add fixed counters to PMU filter)
+* Unmerged path Documentation/virtual/kvm/api.txt
+* Unmerged path arch/x86/include/uapi/asm/kvm.h
+* Unmerged path arch/x86/kvm/pmu.c
