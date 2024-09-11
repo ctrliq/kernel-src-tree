@@ -1,0 +1,324 @@
+s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 48cae940c31d2407d860d87c41d5f9871c0521db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/48cae940.failed
+
+Refresh the guest's APCB by filtering the APQNs and control domain numbers
+assigned to the matrix mdev.
+
+Filtering of APQNs:
+-----------------
+APQNs that do not reference an AP queue device bound to the vfio_ap device
+driver must be filtered from the APQNs assigned to the matrix mdev before
+they can be assigned to the guest's APCB. Given that the APQNs are
+configured in the guest's APCB as a matrix of APIDs (adapters) and APQIs
+(domains), it is not possible to filter an individual APQN. For example,
+suppose the matrix of APQNs is structured as follows:
+
+                   APIDs
+             3      4      5
+        0  (3,0)  (4,0)  (5,0)
+APQIs   1  (3,1)  (4,1)  (5,1)
+        2  (3,2)  (4,2)  (5,2)
+
+Now suppose APQN (4,1) does not reference a queue device bound to the
+vfio_ap device driver. If we filter APID 4, the APQNs (4,0), (4,1) and
+(4,2) will be removed. Similarly, if we filter domain 1, APQNs (3,1),
+(4,1) and (5,1) will be removed.
+
+To resolve this dilemma, the choice was made to filter the APID - in this
+case 4 - from the guest's APCB. The reason for this design decision is
+because the APID references an AP adapter which is a real hardware device
+that can be physically installed, removed, enabled or disabled; whereas, a
+domain is a partition within the adapter. It therefore better reflects
+reality to remove the APID from the guest's APCB.
+
+Filtering of control domains:
+----------------------------
+Any control domains that are not assigned to the host's AP configuration
+will be filtered from those assigned to the matrix mdev before assigning
+them to the guest's APCB.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 48cae940c31d2407d860d87c41d5f9871c0521db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,c9439ba2ff85..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -322,9 -447,72 +322,75 @@@ static void vfio_ap_matrix_init(struct 
+  	matrix->adm_max = info->apxa ? info->Nd : 15;
+  }
+  
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_create(struct kobject *kobj, struct mdev_device *mdev)
+++=======
++ static void vfio_ap_mdev_filter_cdoms(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	bitmap_and(matrix_mdev->shadow_apcb.adm, matrix_mdev->matrix.adm,
++ 		   (unsigned long *)matrix_dev->info.adm, AP_DOMAINS);
++ }
++ 
++ /*
++  * vfio_ap_mdev_filter_matrix - filter the APQNs assigned to the matrix mdev
++  *				to ensure no queue devices are passed through to
++  *				the guest that are not bound to the vfio_ap
++  *				device driver.
++  *
++  * @matrix_mdev: the matrix mdev whose matrix is to be filtered.
++  *
++  * Note: If an APQN referencing a queue device that is not bound to the vfio_ap
++  *	 driver, its APID will be filtered from the guest's APCB. The matrix
++  *	 structure precludes filtering an individual APQN, so its APID will be
++  *	 filtered.
++  */
++ static void vfio_ap_mdev_filter_matrix(unsigned long *apm, unsigned long *aqm,
++ 				       struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	int ret;
++ 	unsigned long apid, apqi, apqn;
++ 
++ 	ret = ap_qci(&matrix_dev->info);
++ 	if (ret)
++ 		return;
++ 
++ 	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->shadow_apcb);
++ 
++ 	/*
++ 	 * Copy the adapters, domains and control domains to the shadow_apcb
++ 	 * from the matrix mdev, but only those that are assigned to the host's
++ 	 * AP configuration.
++ 	 */
++ 	bitmap_and(matrix_mdev->shadow_apcb.apm, matrix_mdev->matrix.apm,
++ 		   (unsigned long *)matrix_dev->info.apm, AP_DEVICES);
++ 	bitmap_and(matrix_mdev->shadow_apcb.aqm, matrix_mdev->matrix.aqm,
++ 		   (unsigned long *)matrix_dev->info.aqm, AP_DOMAINS);
++ 
++ 	for_each_set_bit_inv(apid, apm, AP_DEVICES) {
++ 		for_each_set_bit_inv(apqi, aqm, AP_DOMAINS) {
++ 			/*
++ 			 * If the APQN is not bound to the vfio_ap device
++ 			 * driver, then we can't assign it to the guest's
++ 			 * AP configuration. The AP architecture won't
++ 			 * allow filtering of a single APQN, so let's filter
++ 			 * the APID since an adapter represents a physical
++ 			 * hardware device.
++ 			 */
++ 			apqn = AP_MKQID(apid, apqi);
++ 
++ 			if (!vfio_ap_mdev_get_queue(matrix_mdev, apqn)) {
++ 				clear_bit_inv(apid,
++ 					      matrix_mdev->shadow_apcb.apm);
++ 				break;
++ 			}
++ 		}
++ 	}
++ }
++ 
++ static int vfio_ap_mdev_probe(struct mdev_device *mdev)
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  {
+  	struct ap_matrix_mdev *matrix_mdev;
+ -	int ret;
+  
+  	if ((atomic_dec_if_positive(&matrix_dev->available_instances) < 0))
+  		return -EPERM;
+@@@ -596,8 -864,9 +662,14 @@@ static ssize_t assign_adapter_store(str
+  {
+  	int ret;
+  	unsigned long apid;
+++<<<<<<< HEAD
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+++=======
++ 	DECLARE_BITMAP(apm_delta, AP_DEVICES);
++ 
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  
+  	mutex_lock(&matrix_dev->lock);
+  
+@@@ -631,6 -900,11 +703,14 @@@
+  	if (ret)
+  		goto share_err;
+  
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_link_adapter(matrix_mdev, apid);
++ 	memset(apm_delta, 0, sizeof(apm_delta));
++ 	set_bit_inv(apid, apm_delta);
++ 	vfio_ap_mdev_filter_matrix(apm_delta,
++ 				   matrix_mdev->matrix.aqm, matrix_mdev);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  	ret = count;
+  	goto done;
+  
+@@@ -685,6 -972,11 +765,14 @@@ static ssize_t unassign_adapter_store(s
+  	}
+  
+  	clear_bit_inv((unsigned long)apid, matrix_mdev->matrix.apm);
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_unlink_adapter(matrix_mdev, apid);
++ 
++ 	if (test_bit_inv(apid, matrix_mdev->shadow_apcb.apm))
++ 		clear_bit_inv(apid, matrix_mdev->shadow_apcb.apm);
++ 
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  	ret = count;
+  done:
+  	mutex_unlock(&matrix_dev->lock);
+@@@ -748,8 -1050,8 +836,13 @@@ static ssize_t assign_domain_store(stru
+  {
+  	int ret;
+  	unsigned long apqi;
+++<<<<<<< HEAD
+ +	struct mdev_device *mdev = mdev_from_dev(dev);
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+++=======
++ 	DECLARE_BITMAP(aqm_delta, AP_DOMAINS);
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(dev);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  	unsigned long max_apqi = matrix_mdev->matrix.aqm_max;
+  
+  	mutex_lock(&matrix_dev->lock);
+@@@ -778,6 -1080,11 +871,14 @@@
+  	if (ret)
+  		goto share_err;
+  
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_link_domain(matrix_mdev, apqi);
++ 	memset(aqm_delta, 0, sizeof(aqm_delta));
++ 	set_bit_inv(apqi, aqm_delta);
++ 	vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm, aqm_delta,
++ 				   matrix_mdev);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  	ret = count;
+  	goto done;
+  
+@@@ -833,6 -1152,11 +934,14 @@@ static ssize_t unassign_domain_store(st
+  	}
+  
+  	clear_bit_inv((unsigned long)apqi, matrix_mdev->matrix.aqm);
+++<<<<<<< HEAD
+++=======
++ 	vfio_ap_mdev_unlink_domain(matrix_mdev, apqi);
++ 
++ 	if (test_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm))
++ 		clear_bit_inv(apqi, matrix_mdev->shadow_apcb.aqm);
++ 
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  	ret = count;
+  
+  done:
+@@@ -1077,10 -1395,9 +1191,16 @@@ static int vfio_ap_mdev_set_kvm(struct 
+  
+  		kvm_get_kvm(kvm);
+  		matrix_mdev->kvm = kvm;
+++<<<<<<< HEAD
+ +		kvm_arch_crypto_set_masks(kvm,
+ +					  matrix_mdev->matrix.apm,
+ +					  matrix_mdev->matrix.aqm,
+ +					  matrix_mdev->matrix.adm);
+++=======
++ 		kvm_arch_crypto_set_masks(kvm, matrix_mdev->shadow_apcb.apm,
++ 					  matrix_mdev->shadow_apcb.aqm,
++ 					  matrix_mdev->shadow_apcb.adm);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  
+  		mutex_unlock(&kvm->lock);
+  		mutex_unlock(&matrix_dev->lock);
+@@@ -1383,4 -1729,78 +1503,81 @@@ int vfio_ap_mdev_register(void
+  void vfio_ap_mdev_unregister(void)
+  {
+  	mdev_unregister_device(&matrix_dev->device);
+++<<<<<<< HEAD
+++=======
++ 	mdev_unregister_driver(&vfio_ap_matrix_driver);
++ }
++ 
++ /*
++  * vfio_ap_queue_link_mdev
++  *
++  * @q: The queue to link with the matrix mdev.
++  *
++  * Links @q with the matrix mdev to which the queue's APQN is assigned.
++  */
++ static void vfio_ap_queue_link_mdev(struct vfio_ap_queue *q)
++ {
++ 	unsigned long apid = AP_QID_CARD(q->apqn);
++ 	unsigned long apqi = AP_QID_QUEUE(q->apqn);
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
++ 		if (test_bit_inv(apid, matrix_mdev->matrix.apm) &&
++ 		    test_bit_inv(apqi, matrix_mdev->matrix.aqm)) {
++ 			vfio_ap_mdev_link_queue(matrix_mdev, q);
++ 			break;
++ 		}
++ 	}
++ }
++ 
++ int vfio_ap_mdev_probe_queue(struct ap_device *apdev)
++ {
++ 	int ret;
++ 	struct vfio_ap_queue *q;
++ 
++ 	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
++ 	if (ret)
++ 		return ret;
++ 
++ 	q = kzalloc(sizeof(*q), GFP_KERNEL);
++ 	if (!q)
++ 		return -ENOMEM;
++ 
++ 	mutex_lock(&matrix_dev->lock);
++ 	q->apqn = to_ap_queue(&apdev->device)->qid;
++ 	q->saved_isc = VFIO_AP_ISC_INVALID;
++ 	vfio_ap_queue_link_mdev(q);
++ 	if (q->matrix_mdev) {
++ 		vfio_ap_mdev_filter_matrix(q->matrix_mdev->matrix.apm,
++ 					   q->matrix_mdev->matrix.aqm,
++ 					   q->matrix_mdev);
++ 	}
++ 	dev_set_drvdata(&apdev->device, q);
++ 	mutex_unlock(&matrix_dev->lock);
++ 
++ 	return 0;
++ }
++ 
++ void vfio_ap_mdev_remove_queue(struct ap_device *apdev)
++ {
++ 	unsigned long apid;
++ 	struct vfio_ap_queue *q;
++ 
++ 	mutex_lock(&matrix_dev->lock);
++ 	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
++ 	q = dev_get_drvdata(&apdev->device);
++ 
++ 	if (q->matrix_mdev) {
++ 		vfio_ap_unlink_queue_fr_mdev(q);
++ 
++ 		apid = AP_QID_CARD(q->apqn);
++ 		if (test_bit_inv(apid, q->matrix_mdev->shadow_apcb.apm))
++ 			clear_bit_inv(apid, q->matrix_mdev->shadow_apcb.apm);
++ 	}
++ 
++ 	vfio_ap_mdev_reset_queue(q, 1);
++ 	dev_set_drvdata(&apdev->device, NULL);
++ 	kfree(q);
++ 	mutex_unlock(&matrix_dev->lock);
+++>>>>>>> 48cae940c31d (s390/vfio-ap: refresh guest's APCB by filtering AP resources assigned to mdev)
+  }
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
