@@ -1663,9 +1663,9 @@ static int soc_probe_link_dais(struct snd_soc_card *card,
 	return 0;
 }
 
-static int soc_bind_aux_dev(struct snd_soc_card *card, int num)
+static int soc_bind_aux_dev(struct snd_soc_card *card,
+			    struct snd_soc_aux_dev *aux_dev)
 {
-	struct snd_soc_aux_dev *aux_dev = &card->aux_dev[num];
 	struct snd_soc_component *component;
 	const char *name;
 	struct device_node *codec_of_node;
@@ -1692,6 +1692,7 @@ static int soc_bind_aux_dev(struct snd_soc_card *card, int num)
 	}
 
 	component->init = aux_dev->init;
+	/* see for_each_card_auxs */
 	list_add(&component->card_aux_list, &card->aux_comp_list);
 
 	return 0;
@@ -1708,7 +1709,7 @@ static int soc_probe_aux_devices(struct snd_soc_card *card)
 	int ret;
 
 	for_each_comp_order(order) {
-		list_for_each_entry(comp, &card->aux_comp_list, card_aux_list) {
+		for_each_card_auxs(card, comp) {
 			if (comp->driver->probe_order == order) {
 				ret = soc_probe_component(card,	comp);
 				if (ret < 0) {
@@ -1730,8 +1731,7 @@ static void soc_remove_aux_devices(struct snd_soc_card *card)
 	int order;
 
 	for_each_comp_order(order) {
-		list_for_each_entry_safe(comp, _comp,
-			&card->aux_comp_list, card_aux_list) {
+		for_each_card_auxs_safe(card, comp, _comp) {
 
 			if (comp->driver->remove_order == order) {
 				soc_remove_component(comp);
@@ -2066,6 +2066,7 @@ static int snd_soc_instantiate_card(struct snd_soc_card *card)
 {
 	struct snd_soc_pcm_runtime *rtd;
 	struct snd_soc_dai_link *dai_link;
+	struct snd_soc_aux_dev *aux;
 	int ret, i, order;
 
 	mutex_lock(&client_mutex);
@@ -2097,8 +2098,8 @@ static int snd_soc_instantiate_card(struct snd_soc_card *card)
 	}
 
 	/* bind aux_devs too */
-	for (i = 0; i < card->num_aux_devs; i++) {
-		ret = soc_bind_aux_dev(card, i);
+	for_each_card_pre_auxs(card, i, aux) {
+		ret = soc_bind_aux_dev(card, aux);
 		if (ret != 0)
 			goto probe_end;
 	}
