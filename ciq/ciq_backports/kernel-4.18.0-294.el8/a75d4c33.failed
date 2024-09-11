@@ -1,0 +1,191 @@
+filemap: kill page_cache_read usage in filemap_fault
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Josef Bacik <josef@toxicpanda.com>
+commit a75d4c33377277b6034dd1e2663bce444f952c14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a75d4c33.failed
+
+Patch series "drop the mmap_sem when doing IO in the fault path", v6.
+
+Now that we have proper isolation in place with cgroups2 we have started
+going through and fixing the various priority inversions.  Most are all
+gone now, but this one is sort of weird since it's not necessarily a
+priority inversion that happens within the kernel, but rather because of
+something userspace does.
+
+We have giant applications that we want to protect, and parts of these
+giant applications do things like watch the system state to determine how
+healthy the box is for load balancing and such.  This involves running
+'ps' or other such utilities.  These utilities will often walk
+/proc/<pid>/whatever, and these files can sometimes need to
+down_read(&task->mmap_sem).  Not usually a big deal, but we noticed when
+we are stress testing that sometimes our protected application has latency
+spikes trying to get the mmap_sem for tasks that are in lower priority
+cgroups.
+
+This is because any down_write() on a semaphore essentially turns it into
+a mutex, so even if we currently have it held for reading, any new readers
+will not be allowed on to keep from starving the writer.  This is fine,
+except a lower priority task could be stuck doing IO because it has been
+throttled to the point that its IO is taking much longer than normal.  But
+because a higher priority group depends on this completing it is now stuck
+behind lower priority work.
+
+In order to avoid this particular priority inversion we want to use the
+existing retry mechanism to stop from holding the mmap_sem at all if we
+are going to do IO.  This already exists in the read case sort of, but
+needed to be extended for more than just grabbing the page lock.  With
+io.latency we throttle at submit_bio() time, so the readahead stuff can
+block and even page_cache_read can block, so all these paths need to have
+the mmap_sem dropped.
+
+The other big thing is ->page_mkwrite.  btrfs is particularly shitty here
+because we have to reserve space for the dirty page, which can be a very
+expensive operation.  We use the same retry method as the read path, and
+simply cache the page and verify the page is still setup properly the next
+pass through ->page_mkwrite().
+
+I've tested these patches with xfstests and there are no regressions.
+
+This patch (of 3):
+
+If we do not have a page at filemap_fault time we'll do this weird forced
+page_cache_read thing to populate the page, and then drop it again and
+loop around and find it.  This makes for 2 ways we can read a page in
+filemap_fault, and it's not really needed.  Instead add a FGP_FOR_MMAP
+flag so that pagecache_get_page() will return a unlocked page that's in
+pagecache.  Then use the normal page locking and readpage logic already in
+filemap_fault.  This simplifies the no page in page cache case
+significantly.
+
+[akpm@linux-foundation.org: fix comment text]
+[josef@toxicpanda.com: don't unlock null page in FGP_FOR_MMAP case]
+  Link: http://lkml.kernel.org/r/20190312201742.22935-1-josef@toxicpanda.com
+Link: http://lkml.kernel.org/r/20181211173801.29535-2-josef@toxicpanda.com
+	Signed-off-by: Josef Bacik <josef@toxicpanda.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Cc: Rik van Riel <riel@redhat.com>
+	Cc: "Kirill A. Shutemov" <kirill@shutemov.name>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit a75d4c33377277b6034dd1e2663bce444f952c14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/filemap.c
+diff --cc mm/filemap.c
+index c5561788ab4c,64d014f940e9..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -1584,7 -1586,10 +1584,14 @@@ EXPORT_SYMBOL(find_lock_entry)
+   * - FGP_CREAT: If page is not present then a new page is allocated using
+   *   @gfp_mask and added to the page cache and the VM's LRU
+   *   list. The page is returned locked and with an increased
+++<<<<<<< HEAD
+ + *   refcount. Otherwise, NULL is returned.
+++=======
++  *   refcount.
++  * - FGP_FOR_MMAP: Similar to FGP_CREAT, only we want to allow the caller to do
++  *   its own locking dance if the page is already in cache, or unlock the page
++  *   before returning if we had to add the page to pagecache.
+++>>>>>>> a75d4c333772 (filemap: kill page_cache_read usage in filemap_fault)
+   *
+   * If FGP_LOCK or FGP_CREAT are specified then the function may sleep even
+   * if the GFP flags specified for FGP_CREAT are atomic.
+@@@ -2375,39 -2389,6 +2389,42 @@@ out
+  EXPORT_SYMBOL(generic_file_read_iter);
+  
+  #ifdef CONFIG_MMU
+++<<<<<<< HEAD
+ +/**
+ + * page_cache_read - adds requested page to the page cache if not already there
+ + * @file:	file to read
+ + * @offset:	page index
+ + * @gfp_mask:	memory allocation flags
+ + *
+ + * This adds the requested page to the page cache if it isn't already there,
+ + * and schedules an I/O to read in its contents from disk.
+ + */
+ +static int page_cache_read(struct file *file, pgoff_t offset, gfp_t gfp_mask)
+ +{
+ +	struct address_space *mapping = file->f_mapping;
+ +	struct page *page;
+ +	int ret;
+ +
+ +	do {
+ +		page = __page_cache_alloc(gfp_mask);
+ +		if (!page)
+ +			return -ENOMEM;
+ +
+ +		ret = add_to_page_cache_lru(page, mapping, offset, gfp_mask);
+ +		if (ret == 0)
+ +			ret = mapping->a_ops->readpage(file, page);
+ +		else if (ret == -EEXIST)
+ +			ret = 0; /* losing race to add is OK */
+ +
+ +		put_page(page);
+ +
+ +	} while (ret == AOP_TRUNCATED_PAGE);
+ +
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> a75d4c333772 (filemap: kill page_cache_read usage in filemap_fault)
+  #define MMAP_LOTSAMISS  (100)
+  
+  /*
+@@@ -2570,30 -2555,6 +2589,33 @@@ retry_find
+  	vmf->page = page;
+  	return ret | VM_FAULT_LOCKED;
+  
+++<<<<<<< HEAD
+ +no_cached_page:
+ +	/*
+ +	 * We're only likely to ever get here if MADV_RANDOM is in
+ +	 * effect.
+ +	 */
+ +	error = page_cache_read(file, offset, vmf->gfp_mask);
+ +
+ +	/*
+ +	 * The page we want has now been added to the page cache.
+ +	 * In the unlikely event that someone removed it in the
+ +	 * meantime, we'll just come back here and read it again.
+ +	 */
+ +	if (error >= 0)
+ +		goto retry_find;
+ +
+ +	/*
+ +	 * An error return from page_cache_read can result if the
+ +	 * system is low on memory, or a problem occurs while trying
+ +	 * to schedule I/O.
+ +	 */
+ +	if (error == -ENOMEM)
+ +		return VM_FAULT_OOM;
+ +	return VM_FAULT_SIGBUS;
+ +
+++=======
+++>>>>>>> a75d4c333772 (filemap: kill page_cache_read usage in filemap_fault)
+  page_not_uptodate:
+  	/*
+  	 * Umm, take care of errors if the page isn't up-to-date.
+diff --git a/include/linux/pagemap.h b/include/linux/pagemap.h
+index aa04b06417e2..941edf1c37ba 100644
+--- a/include/linux/pagemap.h
++++ b/include/linux/pagemap.h
+@@ -239,6 +239,7 @@ pgoff_t page_cache_prev_miss(struct address_space *mapping,
+ #define FGP_WRITE		0x00000008
+ #define FGP_NOFS		0x00000010
+ #define FGP_NOWAIT		0x00000020
++#define FGP_FOR_MMAP		0x00000040
+ 
+ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+ 		int fgp_flags, gfp_t cache_gfp_mask);
+* Unmerged path mm/filemap.c
