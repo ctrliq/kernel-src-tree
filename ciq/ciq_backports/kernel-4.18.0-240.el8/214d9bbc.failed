@@ -1,0 +1,319 @@
+s390/mm: provide memory management functions for protected KVM guests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Claudio Imbrenda <imbrenda@linux.ibm.com>
+commit 214d9bbcd3a67230b932f6cea83c078ab34d9e70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/214d9bbc.failed
+
+This provides the basic ultravisor calls and page table handling to cope
+with secure guests:
+- provide arch_make_page_accessible
+- make pages accessible after unmapping of secure guests
+- provide the ultravisor commands convert to/from secure
+- provide the ultravisor commands pin/unpin shared
+- provide callbacks to make pages secure (inacccessible)
+ - we check for the expected pin count to only make pages secure if the
+   host is not accessing them
+ - we fence hugetlbfs for secure pages
+- add missing radix-tree include into gmap.h
+
+The basic idea is that a page can have 3 states: secure, normal or
+shared. The hypervisor can call into a firmware function called
+ultravisor that allows to change the state of a page: convert from/to
+secure. The convert from secure will encrypt the page and make it
+available to the host and host I/O. The convert to secure will remove
+the host capability to access this page.
+The design is that on convert to secure we will wait until writeback and
+page refs are indicating no host usage. At the same time the convert
+from secure (export to host) will be called in common code when the
+refcount or the writeback bit is already set. This avoids races between
+convert from and to secure.
+
+Then there is also the concept of shared pages. Those are kind of secure
+where the host can still access those pages. We need to be notified when
+the guest "unshares" such a page, basically doing a convert to secure by
+then. There is a call "pin shared page" that we use instead of convert
+from secure when possible.
+
+We do use PG_arch_1 as an optimization to minimize the convert from
+secure/pin shared.
+
+Several comments have been added in the code to explain the logic in
+the relevant places.
+
+Co-developed-by: Ulrich Weigand <Ulrich.Weigand@de.ibm.com>
+	Signed-off-by: Ulrich Weigand <Ulrich.Weigand@de.ibm.com>
+	Signed-off-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Acked-by: Cornelia Huck <cohuck@redhat.com>
+	Reviewed-by: Christian Borntraeger <borntraeger@de.ibm.com>
+[borntraeger@de.ibm.com: patch merging, splitting, fixing]
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit 214d9bbcd3a67230b932f6cea83c078ab34d9e70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/gmap.h
+#	arch/s390/include/asm/uv.h
+#	arch/s390/kernel/uv.c
+diff --cc arch/s390/include/asm/gmap.h
+index fcbd638fb9f4,3c4926aa78f4..000000000000
+--- a/arch/s390/include/asm/gmap.h
++++ b/arch/s390/include/asm/gmap.h
+@@@ -9,6 -9,9 +9,12 @@@
+  #ifndef _ASM_S390_GMAP_H
+  #define _ASM_S390_GMAP_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <linux/radix-tree.h>
++ #include <linux/refcount.h>
++ 
+++>>>>>>> 214d9bbcd3a6 (s390/mm: provide memory management functions for protected KVM guests)
+  /* Generic bits for GMAP notification on DAT table entry changes. */
+  #define GMAP_NOTIFY_SHADOW	0x2
+  #define GMAP_NOTIFY_MPROT	0x1
+diff --cc arch/s390/include/asm/uv.h
+index 4093a2856929,d089a960b3e2..000000000000
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@@ -23,14 -24,24 +24,30 @@@
+  #define UVC_RC_NO_RESUME	0x0007
+  
+  #define UVC_CMD_QUI			0x0001
+++<<<<<<< HEAD
+++=======
++ #define UVC_CMD_INIT_UV			0x000f
++ #define UVC_CMD_CONV_TO_SEC_STOR	0x0200
++ #define UVC_CMD_CONV_FROM_SEC_STOR	0x0201
++ #define UVC_CMD_PIN_PAGE_SHARED		0x0341
++ #define UVC_CMD_UNPIN_PAGE_SHARED	0x0342
+++>>>>>>> 214d9bbcd3a6 (s390/mm: provide memory management functions for protected KVM guests)
+  #define UVC_CMD_SET_SHARED_ACCESS	0x1000
+  #define UVC_CMD_REMOVE_SHARED_ACCESS	0x1001
+  
+  /* Bits in installed uv calls */
+  enum uv_cmds_inst {
+  	BIT_UVC_CMD_QUI = 0,
+++<<<<<<< HEAD
+++=======
++ 	BIT_UVC_CMD_INIT_UV = 1,
++ 	BIT_UVC_CMD_CONV_TO_SEC_STOR = 6,
++ 	BIT_UVC_CMD_CONV_FROM_SEC_STOR = 7,
+++>>>>>>> 214d9bbcd3a6 (s390/mm: provide memory management functions for protected KVM guests)
+  	BIT_UVC_CMD_SET_SHARED_ACCESS = 8,
+  	BIT_UVC_CMD_REMOVE_SHARED_ACCESS = 9,
++ 	BIT_UVC_CMD_PIN_PAGE_SHARED = 21,
++ 	BIT_UVC_CMD_UNPIN_PAGE_SHARED = 22,
+  };
+  
+  struct uv_cb_header {
+@@@ -44,9 -55,42 +61,22 @@@ struct uv_cb_qui 
+  	struct uv_cb_header header;
+  	u64 reserved08;
+  	u64 inst_calls_list[4];
+ -	u64 reserved30[2];
+ -	u64 uv_base_stor_len;
+ -	u64 reserved48;
+ -	u64 conf_base_phys_stor_len;
+ -	u64 conf_base_virt_stor_len;
+ -	u64 conf_virt_var_stor_len;
+ -	u64 cpu_stor_len;
+ -	u32 reserved70[3];
+ -	u32 max_num_sec_conf;
+ -	u64 max_guest_stor_addr;
+ -	u8  reserved88[158 - 136];
+ -	u16 max_guest_cpus;
+ -	u8  reserveda0[200 - 160];
+ -} __packed __aligned(8);
+ -
+ -struct uv_cb_init {
+ -	struct uv_cb_header header;
+ -	u64 reserved08[2];
+ -	u64 stor_origin;
+ -	u64 stor_len;
+ -	u64 reserved28[4];
+ +	u64 reserved30[15];
+  } __packed __aligned(8);
+  
++ struct uv_cb_cts {
++ 	struct uv_cb_header header;
++ 	u64 reserved08[2];
++ 	u64 guest_handle;
++ 	u64 gaddr;
++ } __packed __aligned(8);
++ 
++ struct uv_cb_cfs {
++ 	struct uv_cb_header header;
++ 	u64 reserved08[2];
++ 	u64 paddr;
++ } __packed __aligned(8);
++ 
+  struct uv_cb_share {
+  	struct uv_cb_header header;
+  	u64 reserved08[3];
+@@@ -126,6 -183,36 +156,39 @@@ void uv_query_info(void)
+  #define is_prot_virt_guest() 0
+  static inline int uv_set_shared(unsigned long addr) { return 0; }
+  static inline int uv_remove_shared(unsigned long addr) { return 0; }
+++<<<<<<< HEAD
+++=======
++ #endif
++ 
++ #if IS_ENABLED(CONFIG_KVM)
++ extern int prot_virt_host;
++ 
++ static inline int is_prot_virt_host(void)
++ {
++ 	return prot_virt_host;
++ }
++ 
++ int gmap_make_secure(struct gmap *gmap, unsigned long gaddr, void *uvcb);
++ int uv_convert_from_secure(unsigned long paddr);
++ int gmap_convert_to_secure(struct gmap *gmap, unsigned long gaddr);
++ 
++ void setup_uv(void);
++ void adjust_to_uv_max(unsigned long *vmax);
++ #else
++ #define is_prot_virt_host() 0
++ static inline void setup_uv(void) {}
++ static inline void adjust_to_uv_max(unsigned long *vmax) {}
++ 
++ static inline int uv_convert_from_secure(unsigned long paddr)
++ {
++ 	return 0;
++ }
++ #endif
++ 
++ #if defined(CONFIG_PROTECTED_VIRTUALIZATION_GUEST) || IS_ENABLED(CONFIG_KVM)
++ void uv_query_info(void);
++ #else
+++>>>>>>> 214d9bbcd3a6 (s390/mm: provide memory management functions for protected KVM guests)
+  static inline void uv_query_info(void) {}
+  #endif
+  
+* Unmerged path arch/s390/kernel/uv.c
+* Unmerged path arch/s390/include/asm/gmap.h
+diff --git a/arch/s390/include/asm/mmu.h b/arch/s390/include/asm/mmu.h
+index 728d66a70318..2cecffaa40ea 100644
+--- a/arch/s390/include/asm/mmu.h
++++ b/arch/s390/include/asm/mmu.h
+@@ -18,6 +18,8 @@ typedef struct {
+ 	unsigned long asce;
+ 	unsigned long asce_limit;
+ 	unsigned long vdso_base;
++	/* The mmu context belongs to a secure guest. */
++	atomic_t is_protected;
+ 	/*
+ 	 * The following bitfields need a down_write on the mm
+ 	 * semaphore when they are written to. As they are only
+diff --git a/arch/s390/include/asm/mmu_context.h b/arch/s390/include/asm/mmu_context.h
+index f1ab9420ccfb..8fdba6c529a7 100644
+--- a/arch/s390/include/asm/mmu_context.h
++++ b/arch/s390/include/asm/mmu_context.h
+@@ -23,6 +23,7 @@ static inline int init_new_context(struct task_struct *tsk,
+ 	INIT_LIST_HEAD(&mm->context.gmap_list);
+ 	cpumask_clear(&mm->context.cpu_attach_mask);
+ 	atomic_set(&mm->context.flush_count, 0);
++	atomic_set(&mm->context.is_protected, 0);
+ 	mm->context.gmap_asce = 0;
+ 	mm->context.flush_mm = 0;
+ #ifdef CONFIG_PGSTE
+diff --git a/arch/s390/include/asm/page.h b/arch/s390/include/asm/page.h
+index 85e944f04c70..4ebcf891ff3c 100644
+--- a/arch/s390/include/asm/page.h
++++ b/arch/s390/include/asm/page.h
+@@ -153,6 +153,11 @@ static inline int devmem_is_allowed(unsigned long pfn)
+ #define HAVE_ARCH_FREE_PAGE
+ #define HAVE_ARCH_ALLOC_PAGE
+ 
++#if IS_ENABLED(CONFIG_PGSTE)
++int arch_make_page_accessible(struct page *page);
++#define HAVE_ARCH_MAKE_PAGE_ACCESSIBLE
++#endif
++
+ #endif /* !__ASSEMBLY__ */
+ 
+ #define __PAGE_OFFSET		0x0UL
+diff --git a/arch/s390/include/asm/pgtable.h b/arch/s390/include/asm/pgtable.h
+index 78d1a7110bc1..f02b83773628 100644
+--- a/arch/s390/include/asm/pgtable.h
++++ b/arch/s390/include/asm/pgtable.h
+@@ -19,6 +19,7 @@
+ #include <linux/atomic.h>
+ #include <asm/bug.h>
+ #include <asm/page.h>
++#include <asm/uv.h>
+ 
+ extern pgd_t swapper_pg_dir[];
+ extern void paging_init(void);
+@@ -521,6 +522,15 @@ static inline int mm_has_pgste(struct mm_struct *mm)
+ 	return 0;
+ }
+ 
++static inline int mm_is_protected(struct mm_struct *mm)
++{
++#ifdef CONFIG_PGSTE
++	if (unlikely(atomic_read(&mm->context.is_protected)))
++		return 1;
++#endif
++	return 0;
++}
++
+ static inline int mm_alloc_pgste(struct mm_struct *mm)
+ {
+ #ifdef CONFIG_PGSTE
+@@ -1076,7 +1086,12 @@ static inline int ptep_clear_flush_young(struct vm_area_struct *vma,
+ static inline pte_t ptep_get_and_clear(struct mm_struct *mm,
+ 				       unsigned long addr, pte_t *ptep)
+ {
+-	return ptep_xchg_lazy(mm, addr, ptep, __pte(_PAGE_INVALID));
++	pte_t res;
++
++	res = ptep_xchg_lazy(mm, addr, ptep, __pte(_PAGE_INVALID));
++	if (mm_is_protected(mm) && pte_present(res))
++		uv_convert_from_secure(pte_val(res) & PAGE_MASK);
++	return res;
+ }
+ 
+ #define __HAVE_ARCH_PTEP_MODIFY_PROT_TRANSACTION
+@@ -1087,7 +1102,12 @@ void ptep_modify_prot_commit(struct mm_struct *, unsigned long, pte_t *, pte_t);
+ static inline pte_t ptep_clear_flush(struct vm_area_struct *vma,
+ 				     unsigned long addr, pte_t *ptep)
+ {
+-	return ptep_xchg_direct(vma->vm_mm, addr, ptep, __pte(_PAGE_INVALID));
++	pte_t res;
++
++	res = ptep_xchg_direct(vma->vm_mm, addr, ptep, __pte(_PAGE_INVALID));
++	if (mm_is_protected(vma->vm_mm) && pte_present(res))
++		uv_convert_from_secure(pte_val(res) & PAGE_MASK);
++	return res;
+ }
+ 
+ /*
+@@ -1102,12 +1122,17 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
+ 					    unsigned long addr,
+ 					    pte_t *ptep, int full)
+ {
++	pte_t res;
++
+ 	if (full) {
+-		pte_t pte = *ptep;
++		res = *ptep;
+ 		*ptep = __pte(_PAGE_INVALID);
+-		return pte;
++	} else {
++		res = ptep_xchg_lazy(mm, addr, ptep, __pte(_PAGE_INVALID));
+ 	}
+-	return ptep_xchg_lazy(mm, addr, ptep, __pte(_PAGE_INVALID));
++	if (mm_is_protected(mm) && pte_present(res))
++		uv_convert_from_secure(pte_val(res) & PAGE_MASK);
++	return res;
+ }
+ 
+ #define __HAVE_ARCH_PTEP_SET_WRPROTECT
+* Unmerged path arch/s390/include/asm/uv.h
+* Unmerged path arch/s390/kernel/uv.c
