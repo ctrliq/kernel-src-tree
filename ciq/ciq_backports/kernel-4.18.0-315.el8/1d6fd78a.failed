@@ -1,0 +1,247 @@
+xsk: Fix null check on error return path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Gustavo A. R. Silva <gustavoars@kernel.org>
+commit 1d6fd78a213ee3874f46bdce083b7a41d208886d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/1d6fd78a.failed
+
+Currently, dma_map is being checked, when the right object identifier
+to be null-checked is dma_map->dma_pages, instead.
+
+Fix this by null-checking dma_map->dma_pages.
+
+Fixes: 921b68692abb ("xsk: Enable sharing of dma mappings")
+Addresses-Coverity-ID: 1496811 ("Logically dead code")
+	Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/20200902150750.GA7257@embeddedor
+(cherry picked from commit 1d6fd78a213ee3874f46bdce083b7a41d208886d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/xdp/xsk_buff_pool.c
+diff --cc net/xdp/xsk_buff_pool.c
+index a2044c245215,5b00bc5707f2..000000000000
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@@ -86,7 -104,211 +86,215 @@@ void xp_set_rxq_info(struct xsk_buff_po
+  }
+  EXPORT_SYMBOL(xp_set_rxq_info);
+  
+++<<<<<<< HEAD
+ +void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
+++=======
++ static void xp_disable_drv_zc(struct xsk_buff_pool *pool)
++ {
++ 	struct netdev_bpf bpf;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (pool->umem->zc) {
++ 		bpf.command = XDP_SETUP_XSK_POOL;
++ 		bpf.xsk.pool = NULL;
++ 		bpf.xsk.queue_id = pool->queue_id;
++ 
++ 		err = pool->netdev->netdev_ops->ndo_bpf(pool->netdev, &bpf);
++ 
++ 		if (err)
++ 			WARN(1, "Failed to disable zero-copy!\n");
++ 	}
++ }
++ 
++ static int __xp_assign_dev(struct xsk_buff_pool *pool,
++ 			   struct net_device *netdev, u16 queue_id, u16 flags)
++ {
++ 	bool force_zc, force_copy;
++ 	struct netdev_bpf bpf;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	force_zc = flags & XDP_ZEROCOPY;
++ 	force_copy = flags & XDP_COPY;
++ 
++ 	if (force_zc && force_copy)
++ 		return -EINVAL;
++ 
++ 	if (xsk_get_pool_from_qid(netdev, queue_id))
++ 		return -EBUSY;
++ 
++ 	pool->netdev = netdev;
++ 	pool->queue_id = queue_id;
++ 	err = xsk_reg_pool_at_qid(netdev, pool, queue_id);
++ 	if (err)
++ 		return err;
++ 
++ 	if (flags & XDP_USE_NEED_WAKEUP) {
++ 		pool->uses_need_wakeup = true;
++ 		/* Tx needs to be explicitly woken up the first time.
++ 		 * Also for supporting drivers that do not implement this
++ 		 * feature. They will always have to call sendto().
++ 		 */
++ 		pool->cached_need_wakeup = XDP_WAKEUP_TX;
++ 	}
++ 
++ 	dev_hold(netdev);
++ 
++ 	if (force_copy)
++ 		/* For copy-mode, we are done. */
++ 		return 0;
++ 
++ 	if (!netdev->netdev_ops->ndo_bpf ||
++ 	    !netdev->netdev_ops->ndo_xsk_wakeup) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_unreg_pool;
++ 	}
++ 
++ 	bpf.command = XDP_SETUP_XSK_POOL;
++ 	bpf.xsk.pool = pool;
++ 	bpf.xsk.queue_id = queue_id;
++ 
++ 	err = netdev->netdev_ops->ndo_bpf(netdev, &bpf);
++ 	if (err)
++ 		goto err_unreg_pool;
++ 
++ 	if (!pool->dma_pages) {
++ 		WARN(1, "Driver did not DMA map zero-copy buffers");
++ 		goto err_unreg_xsk;
++ 	}
++ 	pool->umem->zc = true;
++ 	return 0;
++ 
++ err_unreg_xsk:
++ 	xp_disable_drv_zc(pool);
++ err_unreg_pool:
++ 	if (!force_zc)
++ 		err = 0; /* fallback to copy mode */
++ 	if (err)
++ 		xsk_clear_pool_at_qid(netdev, queue_id);
++ 	return err;
++ }
++ 
++ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
++ 		  u16 queue_id, u16 flags)
++ {
++ 	return __xp_assign_dev(pool, dev, queue_id, flags);
++ }
++ 
++ int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_umem *umem,
++ 			 struct net_device *dev, u16 queue_id)
++ {
++ 	u16 flags;
++ 
++ 	/* One fill and completion ring required for each queue id. */
++ 	if (!pool->fq || !pool->cq)
++ 		return -EINVAL;
++ 
++ 	flags = umem->zc ? XDP_ZEROCOPY : XDP_COPY;
++ 	if (pool->uses_need_wakeup)
++ 		flags |= XDP_USE_NEED_WAKEUP;
++ 
++ 	return __xp_assign_dev(pool, dev, queue_id, flags);
++ }
++ 
++ void xp_clear_dev(struct xsk_buff_pool *pool)
++ {
++ 	if (!pool->netdev)
++ 		return;
++ 
++ 	xp_disable_drv_zc(pool);
++ 	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id);
++ 	dev_put(pool->netdev);
++ 	pool->netdev = NULL;
++ }
++ 
++ static void xp_release_deferred(struct work_struct *work)
++ {
++ 	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
++ 						  work);
++ 
++ 	rtnl_lock();
++ 	xp_clear_dev(pool);
++ 	rtnl_unlock();
++ 
++ 	if (pool->fq) {
++ 		xskq_destroy(pool->fq);
++ 		pool->fq = NULL;
++ 	}
++ 
++ 	if (pool->cq) {
++ 		xskq_destroy(pool->cq);
++ 		pool->cq = NULL;
++ 	}
++ 
++ 	xdp_put_umem(pool->umem);
++ 	xp_destroy(pool);
++ }
++ 
++ void xp_get_pool(struct xsk_buff_pool *pool)
++ {
++ 	refcount_inc(&pool->users);
++ }
++ 
++ void xp_put_pool(struct xsk_buff_pool *pool)
++ {
++ 	if (!pool)
++ 		return;
++ 
++ 	if (refcount_dec_and_test(&pool->users)) {
++ 		INIT_WORK(&pool->work, xp_release_deferred);
++ 		schedule_work(&pool->work);
++ 	}
++ }
++ 
++ static struct xsk_dma_map *xp_find_dma_map(struct xsk_buff_pool *pool)
++ {
++ 	struct xsk_dma_map *dma_map;
++ 
++ 	list_for_each_entry(dma_map, &pool->umem->xsk_dma_list, list) {
++ 		if (dma_map->netdev == pool->netdev)
++ 			return dma_map;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct xsk_dma_map *xp_create_dma_map(struct device *dev, struct net_device *netdev,
++ 					     u32 nr_pages, struct xdp_umem *umem)
++ {
++ 	struct xsk_dma_map *dma_map;
++ 
++ 	dma_map = kzalloc(sizeof(*dma_map), GFP_KERNEL);
++ 	if (!dma_map)
++ 		return NULL;
++ 
++ 	dma_map->dma_pages = kvcalloc(nr_pages, sizeof(*dma_map->dma_pages), GFP_KERNEL);
++ 	if (!dma_map->dma_pages) {
++ 		kfree(dma_map);
++ 		return NULL;
++ 	}
++ 
++ 	dma_map->netdev = netdev;
++ 	dma_map->dev = dev;
++ 	dma_map->dma_need_sync = false;
++ 	dma_map->dma_pages_cnt = nr_pages;
++ 	refcount_set(&dma_map->users, 0);
++ 	list_add(&dma_map->list, &umem->xsk_dma_list);
++ 	return dma_map;
++ }
++ 
++ static void xp_destroy_dma_map(struct xsk_dma_map *dma_map)
++ {
++ 	list_del(&dma_map->list);
++ 	kvfree(dma_map->dma_pages);
++ 	kfree(dma_map);
++ }
++ 
++ static void __xp_dma_unmap(struct xsk_dma_map *dma_map, unsigned long attrs)
+++>>>>>>> 1d6fd78a213e (xsk: Fix null check on error return path)
+  {
+  	dma_addr_t *dma;
+  	u32 i;
+* Unmerged path net/xdp/xsk_buff_pool.c
