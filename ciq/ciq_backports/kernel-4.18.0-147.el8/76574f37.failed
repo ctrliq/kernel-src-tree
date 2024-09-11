@@ -1,0 +1,92 @@
+nvmet: add interface to update error-log page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit 76574f37bf4caa7150ea1559cd98e3017b9752d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/76574f37.failed
+
+This patch adds nvmet_req based interface to the nvmet-core so that
+we can update the error log page. We update error log page in
+the request completion path when status is not set to NVME_SC_SUCCESS.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 76574f37bf4caa7150ea1559cd98e3017b9752d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/nvmet.h
+diff --cc drivers/nvme/target/nvmet.h
+index 79e9206ddeb8,a2a7fd69b66a..000000000000
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@@ -297,10 -325,7 +297,14 @@@ struct nvmet_req 
+  	u64			error_slba;
+  };
+  
+++<<<<<<< HEAD
+ +static inline void nvmet_set_status(struct nvmet_req *req, u16 status)
+ +{
+ +	req->rsp->status = cpu_to_le16(status << 1);
+ +}
+++=======
++ extern struct workqueue_struct *buffered_io_wq;
+++>>>>>>> 76574f37bf4c (nvmet: add interface to update error-log page)
+  
+  static inline void nvmet_set_result(struct nvmet_req *req, u32 result)
+  {
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index 628b8f0276bd..687ff5e9d7c1 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -561,14 +561,44 @@ static void nvmet_update_sq_head(struct nvmet_req *req)
+ 	req->rsp->sq_head = cpu_to_le16(req->sq->sqhd & 0x0000FFFF);
+ }
+ 
++static void nvmet_set_error(struct nvmet_req *req, u16 status)
++{
++	struct nvmet_ctrl *ctrl = req->sq->ctrl;
++	struct nvme_error_slot *new_error_slot;
++	unsigned long flags;
++
++	req->rsp->status = cpu_to_le16(status << 1);
++
++	if (!ctrl || req->error_loc == -1)
++		return;
++
++	spin_lock_irqsave(&ctrl->error_lock, flags);
++	ctrl->err_counter++;
++	new_error_slot =
++		&ctrl->slots[ctrl->err_counter % NVMET_ERROR_LOG_SLOTS];
++
++	new_error_slot->error_count = cpu_to_le64(ctrl->err_counter);
++	new_error_slot->sqid = cpu_to_le16(req->sq->qid);
++	new_error_slot->cmdid = cpu_to_le16(req->cmd->common.command_id);
++	new_error_slot->status_field = cpu_to_le16(status << 1);
++	new_error_slot->param_error_location = cpu_to_le16(req->error_loc);
++	new_error_slot->lba = cpu_to_le64(req->error_slba);
++	new_error_slot->nsid = req->cmd->common.nsid;
++	spin_unlock_irqrestore(&ctrl->error_lock, flags);
++
++	/* set the more bit for this request */
++	req->rsp->status |= cpu_to_le16(1 << 14);
++}
++
+ static void __nvmet_req_complete(struct nvmet_req *req, u16 status)
+ {
+ 	if (!req->sq->sqhd_disabled)
+ 		nvmet_update_sq_head(req);
+ 	req->rsp->sq_id = cpu_to_le16(req->sq->qid);
+ 	req->rsp->command_id = req->cmd->common.command_id;
++
+ 	if (unlikely(status))
+-		nvmet_set_status(req, status);
++		nvmet_set_error(req, status);
+ 	if (req->ns)
+ 		nvmet_put_namespace(req->ns);
+ 	req->ops->queue_response(req);
+* Unmerged path drivers/nvme/target/nvmet.h
