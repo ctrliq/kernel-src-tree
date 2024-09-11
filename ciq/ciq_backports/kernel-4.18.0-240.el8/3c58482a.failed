@@ -1,0 +1,111 @@
+bpf: Provide bpf_prog_run_pin_on_cpu() helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 3c58482a382bae89410439247152eb342e9872f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3c58482a.failed
+
+BPF programs require to run on one CPU to completion as they use per CPU
+storage, but according to Alexei they don't need reentrancy protection as
+obviously BPF programs running in thread context can always be 'preempted'
+by hard and soft interrupts and instrumentation and the same program can
+run concurrently on a different CPU.
+
+The currently used mechanism to ensure CPUness is to wrap the invocation
+into a preempt_disable/enable() pair. Disabling preemption is also
+disabling migration for a task.
+
+preempt_disable/enable() is used because there is no explicit way to
+reliably disable only migration.
+
+Provide a separate macro to invoke a BPF program which can be used in
+migrateable task context.
+
+It wraps BPF_PROG_RUN() in a migrate_disable/enable() pair which maps on
+non RT enabled kernels to preempt_disable/enable(). On RT enabled kernels
+this merely disables migration. Both methods ensure that the invoked BPF
+program runs on one CPU to completion.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200224145643.474592620@linutronix.de
+(cherry picked from commit 3c58482a382bae89410439247152eb342e9872f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/filter.h
+diff --cc include/linux/filter.h
+index b3373f2e5cac,38f60188bb26..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -566,23 -559,48 +566,51 @@@ struct sk_filter 
+  
+  DECLARE_STATIC_KEY_FALSE(bpf_stats_enabled_key);
+  
+ -#define __BPF_PROG_RUN(prog, ctx, dfunc)	({			\
+ -	u32 ret;							\
+ -	cant_sleep();							\
+ -	if (static_branch_unlikely(&bpf_stats_enabled_key)) {		\
+ -		struct bpf_prog_stats *stats;				\
+ -		u64 start = sched_clock();				\
+ -		ret = dfunc(ctx, (prog)->insnsi, (prog)->bpf_func);	\
+ -		stats = this_cpu_ptr(prog->aux->stats);			\
+ -		u64_stats_update_begin(&stats->syncp);			\
+ -		stats->cnt++;						\
+ -		stats->nsecs += sched_clock() - start;			\
+ -		u64_stats_update_end(&stats->syncp);			\
+ -	} else {							\
+ -		ret = dfunc(ctx, (prog)->insnsi, (prog)->bpf_func);	\
+ -	}								\
+ +#define BPF_PROG_RUN(prog, ctx)	({				\
+ +	u32 ret;						\
+ +	cant_sleep();						\
+ +	if (static_branch_unlikely(&bpf_stats_enabled_key)) {	\
+ +		struct bpf_prog_stats *stats;			\
+ +		u64 start = sched_clock();			\
+ +		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
+ +		stats = this_cpu_ptr(prog->aux->stats);		\
+ +		u64_stats_update_begin(&stats->syncp);		\
+ +		stats->cnt++;					\
+ +		stats->nsecs += sched_clock() - start;		\
+ +		u64_stats_update_end(&stats->syncp);		\
+ +	} else {						\
+ +		ret = (*(prog)->bpf_func)(ctx, (prog)->insnsi);	\
+ +	}							\
+  	ret; })
+  
+++<<<<<<< HEAD
+++=======
++ #define BPF_PROG_RUN(prog, ctx)						\
++ 	__BPF_PROG_RUN(prog, ctx, bpf_dispatcher_nopfunc)
++ 
++ /*
++  * Use in preemptible and therefore migratable context to make sure that
++  * the execution of the BPF program runs on one CPU.
++  *
++  * This uses migrate_disable/enable() explicitly to document that the
++  * invocation of a BPF program does not require reentrancy protection
++  * against a BPF program which is invoked from a preempting task.
++  *
++  * For non RT enabled kernels migrate_disable/enable() maps to
++  * preempt_disable/enable(), i.e. it disables also preemption.
++  */
++ static inline u32 bpf_prog_run_pin_on_cpu(const struct bpf_prog *prog,
++ 					  const void *ctx)
++ {
++ 	u32 ret;
++ 
++ 	migrate_disable();
++ 	ret = __BPF_PROG_RUN(prog, ctx, bpf_dispatcher_nopfunc);
++ 	migrate_enable();
++ 	return ret;
++ }
++ 
+++>>>>>>> 3c58482a382b (bpf: Provide bpf_prog_run_pin_on_cpu() helper)
+  #define BPF_SKB_CB_LEN QDISC_CB_PRIV_LEN
+  
+  struct bpf_skb_data_end {
+* Unmerged path include/linux/filter.h
