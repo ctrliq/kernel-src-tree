@@ -1,0 +1,460 @@
+NFS: Attach supplementary error information to fs_context.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [fs] NFS: Attach supplementary error information to fs_context (Scott Mayhew) [1622041]
+Rebuild_FUZZ: 99.13%
+commit-author Scott Mayhew <smayhew@redhat.com>
+commit ce8866f0913ff157edc098f06bad07763ad317e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ce8866f0.failed
+
+Split out from commit "NFS: Add fs_context support."
+
+Add wrappers nfs_errorf(), nfs_invalf(), and nfs_warnf() which log error
+information to the fs_context.  Convert some printk's to use these new
+wrappers instead.
+
+	Signed-off-by: Scott Mayhew <smayhew@redhat.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit ce8866f0913ff157edc098f06bad07763ad317e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/fs_context.c
+#	fs/nfs/getroot.c
+#	fs/nfs/internal.h
+#	fs/nfs/namespace.c
+#	fs/nfs/nfs4super.c
+#	fs/nfs/super.c
+diff --cc fs/nfs/getroot.c
+index 92c05a76348e,b012c2668a1f..000000000000
+--- a/fs/nfs/getroot.c
++++ b/fs/nfs/getroot.c
+@@@ -85,71 -80,55 +85,88 @@@ struct dentry *nfs_get_root(struct supe
+  
+  	/* get the actual root for this mount */
+  	fsinfo.fattr = nfs_alloc_fattr();
+ -	if (fsinfo.fattr == NULL)
+ -		goto out_name;
+ +	if (fsinfo.fattr == NULL) {
+ +		kfree(name);
+ +		return ERR_PTR(-ENOMEM);
+ +	}
+ +
+ +	fsinfo.fattr->label = nfs4_label_alloc(server, GFP_KERNEL);
+ +	if (IS_ERR(fsinfo.fattr->label)) {
+ +		ret = ERR_CAST(fsinfo.fattr->label);
+ +		goto out;
+ +	}
+  
+ -	error = server->nfs_client->rpc_ops->getroot(server, ctx->mntfh, &fsinfo);
+ +	error = server->nfs_client->rpc_ops->getroot(server, mntfh, &fsinfo);
+  	if (error < 0) {
+  		dprintk("nfs_get_root: getattr error = %d\n", -error);
+++<<<<<<< HEAD
+ +		ret = ERR_PTR(error);
+ +		goto out_label;
+++=======
++ 		nfs_errorf(fc, "NFS: Couldn't getattr on root");
++ 		goto out_fattr;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  	}
+  
+ -	inode = nfs_fhget(s, ctx->mntfh, fsinfo.fattr, NULL);
+ +	inode = nfs_fhget(sb, mntfh, fsinfo.fattr, NULL);
+  	if (IS_ERR(inode)) {
+  		dprintk("nfs_get_root: get root inode failed\n");
+++<<<<<<< HEAD
+ +		ret = ERR_CAST(inode);
+ +		goto out_label;
+++=======
++ 		error = PTR_ERR(inode);
++ 		nfs_errorf(fc, "NFS: Couldn't get root inode");
++ 		goto out_fattr;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  	}
+  
+ -	error = nfs_superblock_set_dummy_root(s, inode);
+ -	if (error != 0)
+ -		goto out_fattr;
+ +	error = nfs_superblock_set_dummy_root(sb, inode);
+ +	if (error != 0) {
+ +		ret = ERR_PTR(error);
+ +		goto out_label;
+ +	}
+  
+  	/* root dentries normally start off anonymous and get spliced in later
+  	 * if the dentry tree reaches them; however if the dentry already
+  	 * exists, we'll pick it up at this point and use it as the root
+  	 */
+ -	root = d_obtain_root(inode);
+ -	if (IS_ERR(root)) {
+ +	ret = d_obtain_root(inode);
+ +	if (IS_ERR(ret)) {
+  		dprintk("nfs_get_root: get root dentry failed\n");
+++<<<<<<< HEAD
+ +		goto out_label;
+++=======
++ 		error = PTR_ERR(root);
++ 		nfs_errorf(fc, "NFS: Couldn't get root dentry");
++ 		goto out_fattr;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  	}
+  
+ -	security_d_instantiate(root, inode);
+ -	spin_lock(&root->d_lock);
+ -	if (IS_ROOT(root) && !root->d_fsdata &&
+ -	    !(root->d_flags & DCACHE_NFSFS_RENAMED)) {
+ -		root->d_fsdata = name;
+ +	security_d_instantiate(ret, inode);
+ +	spin_lock(&ret->d_lock);
+ +	if (IS_ROOT(ret) && !ret->d_fsdata &&
+ +	    !(ret->d_flags & DCACHE_NFSFS_RENAMED)) {
+ +		ret->d_fsdata = name;
+  		name = NULL;
+  	}
+ -	spin_unlock(&root->d_lock);
+ -	fc->root = root;
+ -	error = 0;
+ +	spin_unlock(&ret->d_lock);
+  
+ -out_fattr:
+ -	nfs_free_fattr(fsinfo.fattr);
+ -out_name:
+ -	kfree(name);
+ +	error = mount_info->set_security(sb, ret, mount_info);
+ +	if (error)
+ +		goto error_splat_root;
+ +
+ +	nfs_setsecurity(inode, fsinfo.fattr, fsinfo.fattr->label);
+ +
+ +out_label:
+ +	nfs4_label_free(fsinfo.fattr->label);
+  out:
+ -	return error;
+ +	kfree(name);
+ +	nfs_free_fattr(fsinfo.fattr);
+ +	return ret;
+ +
+ +error_splat_root:
+ +	dput(ret);
+ +	ret = ERR_PTR(error);
+ +	goto out_label;
+  }
+diff --cc fs/nfs/internal.h
+index feae10c2f600,c0257411e158..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -114,12 -117,31 +114,24 @@@ struct nfs_parsed_mount_data 
+  		int			port;
+  		unsigned short		protocol;
+  		unsigned short		nconnect;
+ -		unsigned short		export_path_len;
+  	} nfs_server;
+  
+ -	struct nfs_fh		*mntfh;
+ -	struct nfs_server	*server;
+ -	struct nfs_subversion	*nfs_mod;
+ -
+ -	/* Information for a cloned mount. */
+ -	struct nfs_clone_mount {
+ -		struct super_block	*sb;
+ -		struct dentry		*dentry;
+ -		struct nfs_fattr	*fattr;
+ -		unsigned int		inherited_bsize;
+ -	} clone_data;
+ +	struct security_mnt_opts lsm_opts;
+ +	struct net		*net;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define nfs_errorf(fc, fmt, ...) errorf(fc, fmt, ## __VA_ARGS__)
++ #define nfs_invalf(fc, fmt, ...) invalf(fc, fmt, ## __VA_ARGS__)
++ #define nfs_warnf(fc, fmt, ...) warnf(fc, fmt, ## __VA_ARGS__)
++ 
++ static inline struct nfs_fs_context *nfs_fc2context(const struct fs_context *fc)
++ {
++ 	return fc->fs_private;
++ }
++ 
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  /* mount_clnt.c */
+  struct nfs_mount_request {
+  	struct sockaddr		*sap;
+diff --cc fs/nfs/namespace.c
+index 0dbf0e798502,4fd22c0d730c..000000000000
+--- a/fs/nfs/namespace.c
++++ b/fs/nfs/namespace.c
+@@@ -223,47 -253,43 +223,64 @@@ void nfs_release_automount_timer(void
+   * @authflavor: security flavor to use when performing the mount
+   *
+   */
+ -int nfs_do_submount(struct fs_context *fc)
+ +struct vfsmount *nfs_do_submount(struct dentry *dentry, struct nfs_fh *fh,
+ +				 struct nfs_fattr *fattr, rpc_authflavor_t authflavor)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	struct dentry *dentry = ctx->clone_data.dentry;
+ +	struct super_block *sb = dentry->d_sb;
+ +	struct nfs_clone_mount mountdata = {
+ +		.sb = sb,
+ +		.dentry = dentry,
+ +		.authflavor = authflavor,
+ +	};
+ +	struct nfs_mount_info mount_info = {
+ +		.inherited_bsize = sb->s_blocksize_bits,
+ +		.set_security = nfs_clone_sb_security,
+ +		.cloned = &mountdata,
+ +		.mntfh = fh,
+ +		.nfs_mod = NFS_SB(sb)->nfs_client->cl_nfs_mod,
+ +	};
+  	struct nfs_server *server;
+ -	char *buffer, *p;
+ -	int ret;
+ +	struct vfsmount *mnt;
+ +	char *page = (char *) __get_free_page(GFP_USER);
+ +	char *devname;
+  
+ -	/* create a new volume representation */
+ -	server = ctx->nfs_mod->rpc_ops->clone_server(NFS_SB(ctx->clone_data.sb),
+ -						     ctx->mntfh,
+ -						     ctx->clone_data.fattr,
+ -						     ctx->selected_flavor);
+ +	if (page == NULL)
+ +		return ERR_PTR(-ENOMEM);
+  
+ +	server = mount_info.nfs_mod->rpc_ops->clone_server(NFS_SB(sb), fh,
+ +							   fattr, authflavor);
+  	if (IS_ERR(server))
+ -		return PTR_ERR(server);
+ +		return ERR_CAST(server);
+  
+ -	ctx->server = server;
+ +	mount_info.server = server;
+  
+ -	buffer = kmalloc(4096, GFP_USER);
+ -	if (!buffer)
+ -		return -ENOMEM;
+ +	devname = nfs_devname(dentry, page, PAGE_SIZE);
+ +	if (IS_ERR(devname))
+ +		mnt = ERR_CAST(devname);
+ +	else
+ +		mnt = vfs_submount(dentry, &nfs_prepared_fs_type, devname, &mount_info);
+  
+++<<<<<<< HEAD
+ +	if (mount_info.server)
+ +		nfs_free_server(mount_info.server);
+ +	free_page((unsigned long)page);
+ +	return mnt;
+++=======
++ 	ctx->internal		= true;
++ 	ctx->clone_data.inherited_bsize = ctx->clone_data.sb->s_blocksize_bits;
++ 
++ 	p = nfs_devname(dentry, buffer, 4096);
++ 	if (IS_ERR(p)) {
++ 		nfs_errorf(fc, "NFS: Couldn't determine submount pathname");
++ 		ret = PTR_ERR(p);
++ 	} else {
++ 		ret = vfs_parse_fs_string(fc, "source", p, buffer + 4096 - p);
++ 		if (!ret)
++ 			ret = vfs_get_tree(fc);
++ 	}
++ 	kfree(buffer);
++ 	return ret;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  }
+  EXPORT_SYMBOL_GPL(nfs_do_submount);
+  
+diff --cc fs/nfs/nfs4super.c
+index b5c4630cd799,1475f932d7da..000000000000
+--- a/fs/nfs/nfs4super.c
++++ b/fs/nfs/nfs4super.c
+@@@ -191,28 -204,33 +191,44 @@@ static struct dentry *do_nfs4_mount(str
+  	dentry = mount_subtree(root_mnt, export_path);
+  	nfs_referral_loop_unprotect();
+  
+ -	if (IS_ERR(dentry))
+ -		return PTR_ERR(dentry);
+ -
+ -	fc->root = dentry;
+ -	return 0;
+ +	return dentry;
+  }
+  
+ -int nfs4_try_get_tree(struct fs_context *fc)
+ +struct dentry *nfs4_try_mount(int flags, const char *dev_name,
+ +			      struct nfs_mount_info *mount_info)
+  {
+ -	struct nfs_fs_context *ctx = nfs_fc2context(fc);
+ -	int err;
+ +	struct nfs_parsed_mount_data *data = mount_info->parsed;
+ +	struct dentry *res;
+ +
+ +	mount_info->set_security = nfs_set_sb_security;
+ +
+++<<<<<<< HEAD
+ +	dfprintk(MOUNT, "--> nfs4_try_mount()\n");
+  
+ -	dfprintk(MOUNT, "--> nfs4_try_get_tree()\n");
+ +	res = do_nfs4_mount(nfs4_create_server(mount_info),
+ +			    flags, mount_info,
+ +			    data->nfs_server.hostname,
+ +			    data->nfs_server.export_path);
+  
+ +	dfprintk(MOUNT, "<-- nfs4_try_mount() = %d%s\n",
+ +		 PTR_ERR_OR_ZERO(res),
+ +		 IS_ERR(res) ? " [error]" : "");
+ +	return res;
+++=======
++ 	/* We create a mount for the server's root, walk to the requested
++ 	 * location and then create another mount for that.
++ 	 */
++ 	err= do_nfs4_mount(nfs4_create_server(fc),
++ 			   fc, ctx->nfs_server.hostname,
++ 			   ctx->nfs_server.export_path);
++ 	if (err) {
++ 		nfs_errorf(fc, "NFS4: Couldn't follow remote path");
++ 		dfprintk(MOUNT, "<-- nfs4_try_get_tree() = %d [error]\n", err);
++ 	} else {
++ 		dfprintk(MOUNT, "<-- nfs4_try_get_tree() = 0\n");
++ 	}
++ 	return err;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  }
+  
+  /*
+@@@ -231,23 -243,19 +247,37 @@@ static struct dentry *nfs4_referral_mou
+  
+  	dprintk("--> nfs4_referral_mount()\n");
+  
+++<<<<<<< HEAD
+ +	mount_info.mntfh = nfs_alloc_fhandle();
+ +	if (!mount_info.mntfh)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	res = do_nfs4_mount(nfs4_create_referral_server(mount_info.cloned,
+ +							mount_info.mntfh),
+ +			    flags, &mount_info, data->hostname, data->mnt_path);
+ +
+ +	dprintk("<-- nfs4_referral_mount() = %d%s\n",
+ +		PTR_ERR_OR_ZERO(res),
+ +		IS_ERR(res) ? " [error]" : "");
+ +
+ +	nfs_free_fhandle(mount_info.mntfh);
+ +	return res;
+++=======
++ 	/* create a new volume representation */
++ 	err = do_nfs4_mount(nfs4_create_referral_server(fc),
++ 			    fc, ctx->nfs_server.hostname,
++ 			    ctx->nfs_server.export_path);
++ 	if (err) {
++ 		nfs_errorf(fc, "NFS4: Couldn't follow remote path");
++ 		dfprintk(MOUNT, "<-- nfs4_get_referral_tree() = %d [error]\n", err);
++ 	} else {
++ 		dfprintk(MOUNT, "<-- nfs4_get_referral_tree() = 0\n");
++ 	}
++ 	return err;
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  }
+  
+ +
+  static int __init init_nfs_v4(void)
+  {
+  	int err;
+diff --cc fs/nfs/super.c
+index 5a0a0d311ce8,76e0198adcfa..000000000000
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@@ -2629,17 -1190,22 +2629,22 @@@ static struct dentry *nfs_fs_mount_comm
+  
+  	/* -o noac implies -o sync */
+  	if (server->flags & NFS_MOUNT_NOAC)
+ -		fc->sb_flags |= SB_SYNCHRONOUS;
+ -
+ -	if (ctx->clone_data.sb)
+ -		if (ctx->clone_data.sb->s_flags & SB_SYNCHRONOUS)
+ -			fc->sb_flags |= SB_SYNCHRONOUS;
+ +		sb_mntdata.mntflags |= SB_SYNCHRONOUS;
+  
+ -	if (server->caps & NFS_CAP_SECURITY_LABEL)
+ -		fc->lsm_flags |= SECURITY_LSM_NATIVE_LABELS;
+ +	if (mount_info->cloned != NULL && mount_info->cloned->sb != NULL)
+ +		if (mount_info->cloned->sb->s_flags & SB_SYNCHRONOUS)
+ +			sb_mntdata.mntflags |= SB_SYNCHRONOUS;
+  
+  	/* Get a superblock - note that we may end up sharing one that already exists */
+ -	fc->s_fs_info = server;
+ -	s = sget_fc(fc, compare_super, nfs_set_super);
+ -	fc->s_fs_info = NULL;
+ +	s = sget(mount_info->nfs_mod->nfs_fs, compare_super, nfs_set_super,
+ +		 flags, &sb_mntdata);
+  	if (IS_ERR(s)) {
+++<<<<<<< HEAD
+ +		mntroot = ERR_CAST(s);
+++=======
++ 		error = PTR_ERR(s);
++ 		nfs_errorf(fc, "NFS: Couldn't get superblock");
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  		goto out_err_nosb;
+  	}
+  
+@@@ -2665,19 -1229,40 +2670,25 @@@
+  			s->s_blocksize_bits = bsize;
+  			s->s_blocksize = 1U << bsize;
+  		}
+ -		nfs_get_cache_cookie(s, ctx);
+ +		nfs_get_cache_cookie(s, mount_info->parsed, mount_info->cloned);
+ +		if (!(server->flags & NFS_MOUNT_UNSHARED))
+ +			s->s_iflags |= SB_I_MULTIROOT;
+  	}
+  
+++<<<<<<< HEAD
+ +	mntroot = nfs_get_root(s, mount_info, dev_name);
+ +	if (IS_ERR(mntroot))
+++=======
++ 	error = nfs_get_root(s, fc);
++ 	if (error < 0) {
++ 		nfs_errorf(fc, "NFS: Couldn't get root dentry");
+++>>>>>>> ce8866f0913f (NFS: Attach supplementary error information to fs_context.)
+  		goto error_splat_super;
+ -	}
+ -
+ -	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL)
+ -		kflags |= SECURITY_LSM_NATIVE_LABELS;
+ -	if (ctx->clone_data.sb) {
+ -		if (d_inode(fc->root)->i_fop != &nfs_dir_operations) {
+ -			error = -ESTALE;
+ -			goto error_splat_root;
+ -		}
+ -		/* clone any lsm security options from the parent to the new sb */
+ -		error = security_sb_clone_mnt_opts(ctx->clone_data.sb, s, kflags,
+ -				&kflags_out);
+ -	} else {
+ -		error = security_sb_set_mnt_opts(s, fc->security,
+ -							kflags, &kflags_out);
+ -	}
+ -	if (error)
+ -		goto error_splat_root;
+ -	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL &&
+ -		!(kflags_out & SECURITY_LSM_NATIVE_LABELS))
+ -		NFS_SB(s)->caps &= ~NFS_CAP_SECURITY_LABEL;
+  
+  	s->s_flags |= SB_ACTIVE;
+ -	error = 0;
+  
+  out:
+ -	return error;
+ +	return mntroot;
+  
+  out_err_nosb:
+  	nfs_free_server(server);
+* Unmerged path fs/nfs/fs_context.c
+* Unmerged path fs/nfs/fs_context.c
+* Unmerged path fs/nfs/getroot.c
+* Unmerged path fs/nfs/internal.h
+* Unmerged path fs/nfs/namespace.c
+* Unmerged path fs/nfs/nfs4super.c
+* Unmerged path fs/nfs/super.c
