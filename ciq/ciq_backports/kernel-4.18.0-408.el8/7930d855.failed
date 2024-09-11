@@ -1,0 +1,474 @@
+dmaengine: idxd: add knob for enqcmds retries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 7930d85535751bc8b05c6731c6b79d874671f13c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/7930d855.failed
+
+Add a sysfs knob to allow tuning of retries for the kernel ENQCMDS
+descriptor submission. While on host, it is not as likely that ENQCMDS
+return busy during normal operations due to the driver controlling the
+number of descriptors allocated for submission. However, when the driver is
+operating as a guest driver, the chance of retry goes up significantly due
+to sharing a wq with multiple VMs. A default value is provided with the
+system admin being able to tune the value on a per WQ basis.
+
+	Suggested-by: Sanjay Kumar <sanjay.k.kumar@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/163820629464.2702134.7577370098568297574.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 7930d85535751bc8b05c6731c6b79d874671f13c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/init.c
+#	drivers/dma/idxd/irq.c
+#	drivers/dma/idxd/submit.c
+diff --cc drivers/dma/idxd/init.c
+index b9299e45c20d,8b3afce9ea67..000000000000
+--- a/drivers/dma/idxd/init.c
++++ b/drivers/dma/idxd/init.c
+@@@ -233,11 -245,13 +233,18 @@@ static int idxd_setup_wqs(struct idxd_d
+  		mutex_init(&wq->wq_lock);
+  		init_waitqueue_head(&wq->err_queue);
+  		init_completion(&wq->wq_dead);
+++<<<<<<< HEAD
+ +		wq->max_xfer_bytes = idxd->max_xfer_bytes;
+ +		wq->max_batch_size = idxd->max_batch_size;
+++=======
++ 		init_completion(&wq->wq_resurrect);
++ 		wq->max_xfer_bytes = WQ_DEFAULT_MAX_XFER;
++ 		wq->max_batch_size = WQ_DEFAULT_MAX_BATCH;
++ 		wq->enqcmds_retries = IDXD_ENQCMDS_RETRIES;
+++>>>>>>> 7930d8553575 (dmaengine: idxd: add knob for enqcmds retries)
+  		wq->wqcfg = kzalloc_node(idxd->wqcfg_size, GFP_KERNEL, dev_to_node(dev));
+  		if (!wq->wqcfg) {
+ -			put_device(conf_dev);
+ +			put_device(&wq->conf_dev);
+  			rc = -ENOMEM;
+  			goto err;
+  		}
+diff --cc drivers/dma/idxd/irq.c
+index 7a2cf0512501,0b0055a0ad2a..000000000000
+--- a/drivers/dma/idxd/irq.c
++++ b/drivers/dma/idxd/irq.c
+@@@ -62,44 -66,157 +62,64 @@@ static void idxd_device_reinit(struct w
+  	idxd_device_clear_state(idxd);
+  }
+  
+ -/*
+ - * The function sends a drain descriptor for the interrupt handle. The drain ensures
+ - * all descriptors with this interrupt handle is flushed and the interrupt
+ - * will allow the cleanup of the outstanding descriptors.
+ - */
+ -static void idxd_int_handle_revoke_drain(struct idxd_irq_entry *ie)
+ +static void idxd_device_fault_work(struct work_struct *work)
+  {
+ -	struct idxd_wq *wq = ie->wq;
+ -	struct idxd_device *idxd = ie->idxd;
+ -	struct device *dev = &idxd->pdev->dev;
+ -	struct dsa_hw_desc desc = {};
+ -	void __iomem *portal;
+ -	int rc;
+ -
+ -	/* Issue a simple drain operation with interrupt but no completion record */
+ -	desc.flags = IDXD_OP_FLAG_RCI;
+ -	desc.opcode = DSA_OPCODE_DRAIN;
+ -	desc.priv = 1;
+ +	struct idxd_fault *fault = container_of(work, struct idxd_fault, work);
+ +	struct idxd_irq_entry *ie;
+ +	int i;
+ +	int processed;
+ +	int irqcnt = fault->idxd->num_wq_irqs + 1;
+ +
+ +	for (i = 1; i < irqcnt; i++) {
+ +		ie = &fault->idxd->irq_entries[i];
+ +		irq_process_work_list(ie, IRQ_WORK_PROCESS_FAULT,
+ +				      &processed, fault->addr);
+ +		if (processed)
+ +			break;
+  
+++<<<<<<< HEAD
+ +		irq_process_pending_llist(ie, IRQ_WORK_PROCESS_FAULT,
+ +					  &processed, fault->addr);
+ +		if (processed)
+ +			break;
+++=======
++ 	if (ie->pasid != INVALID_IOASID)
++ 		desc.pasid = ie->pasid;
++ 	desc.int_handle = ie->int_handle;
++ 	portal = idxd_wq_portal_addr(wq);
++ 
++ 	/*
++ 	 * The wmb() makes sure that the descriptor is all there before we
++ 	 * issue.
++ 	 */
++ 	wmb();
++ 	if (wq_dedicated(wq)) {
++ 		iosubmit_cmds512(portal, &desc, 1);
++ 	} else {
++ 		rc = idxd_enqcmds(wq, portal, &desc);
++ 		/* This should not fail unless hardware failed. */
++ 		if (rc < 0)
++ 			dev_warn(dev, "Failed to submit drain desc on wq %d\n", wq->id);
+++>>>>>>> 7930d8553575 (dmaengine: idxd: add knob for enqcmds retries)
+  	}
+ -}
+ -
+ -static void idxd_abort_invalid_int_handle_descs(struct idxd_irq_entry *ie)
+ -{
+ -	LIST_HEAD(flist);
+ -	struct idxd_desc *d, *t;
+ -	struct llist_node *head;
+ -
+ -	spin_lock(&ie->list_lock);
+ -	head = llist_del_all(&ie->pending_llist);
+ -	if (head) {
+ -		llist_for_each_entry_safe(d, t, head, llnode)
+ -			list_add_tail(&d->list, &ie->work_list);
+ -	}
+ -
+ -	list_for_each_entry_safe(d, t, &ie->work_list, list) {
+ -		if (d->completion->status == DSA_COMP_INT_HANDLE_INVAL)
+ -			list_move_tail(&d->list, &flist);
+ -	}
+ -	spin_unlock(&ie->list_lock);
+  
+ -	list_for_each_entry_safe(d, t, &flist, list) {
+ -		list_del(&d->list);
+ -		idxd_dma_complete_txd(d, IDXD_COMPLETE_ABORT, true);
+ -	}
+ +	kfree(fault);
+  }
+  
+ -static void idxd_int_handle_revoke(struct work_struct *work)
+ +static int idxd_device_schedule_fault_process(struct idxd_device *idxd,
+ +					      u64 fault_addr)
+  {
+ -	struct idxd_int_handle_revoke *revoke =
+ -		container_of(work, struct idxd_int_handle_revoke, work);
+ -	struct idxd_device *idxd = revoke->idxd;
+ -	struct pci_dev *pdev = idxd->pdev;
+ -	struct device *dev = &pdev->dev;
+ -	int i, new_handle, rc;
+ -
+ -	if (!idxd->request_int_handles) {
+ -		kfree(revoke);
+ -		dev_warn(dev, "Unexpected int handle refresh interrupt.\n");
+ -		return;
+ -	}
+ -
+ -	/*
+ -	 * The loop attempts to acquire new interrupt handle for all interrupt
+ -	 * vectors that supports a handle. If a new interrupt handle is acquired and the
+ -	 * wq is kernel type, the driver will kill the percpu_ref to pause all
+ -	 * ongoing descriptor submissions. The interrupt handle is then changed.
+ -	 * After change, the percpu_ref is revived and all the pending submissions
+ -	 * are woken to try again. A drain is sent to for the interrupt handle
+ -	 * at the end to make sure all invalid int handle descriptors are processed.
+ -	 */
+ -	for (i = 1; i < idxd->irq_cnt; i++) {
+ -		struct idxd_irq_entry *ie = &idxd->irq_entries[i];
+ -		struct idxd_wq *wq = ie->wq;
+ +	struct idxd_fault *fault;
+  
+ -		rc = idxd_device_request_int_handle(idxd, i, &new_handle, IDXD_IRQ_MSIX);
+ -		if (rc < 0) {
+ -			dev_warn(dev, "get int handle %d failed: %d\n", i, rc);
+ -			/*
+ -			 * Failed to acquire new interrupt handle. Kill the WQ
+ -			 * and release all the pending submitters. The submitters will
+ -			 * get error return code and handle appropriately.
+ -			 */
+ -			ie->int_handle = INVALID_INT_HANDLE;
+ -			idxd_wq_quiesce(wq);
+ -			idxd_abort_invalid_int_handle_descs(ie);
+ -			continue;
+ -		}
+ -
+ -		/* No change in interrupt handle, nothing needs to be done */
+ -		if (ie->int_handle == new_handle)
+ -			continue;
+ +	fault = kmalloc(sizeof(*fault), GFP_ATOMIC);
+ +	if (!fault)
+ +		return -ENOMEM;
+  
+ -		if (wq->state != IDXD_WQ_ENABLED || wq->type != IDXD_WQT_KERNEL) {
+ -			/*
+ -			 * All the MSIX interrupts are allocated at once during probe.
+ -			 * Therefore we need to update all interrupts even if the WQ
+ -			 * isn't supporting interrupt operations.
+ -			 */
+ -			ie->int_handle = new_handle;
+ -			continue;
+ -		}
+ -
+ -		mutex_lock(&wq->wq_lock);
+ -		reinit_completion(&wq->wq_resurrect);
+ -
+ -		/* Kill percpu_ref to pause additional descriptor submissions */
+ -		percpu_ref_kill(&wq->wq_active);
+ -
+ -		/* Wait for all submitters quiesce before we change interrupt handle */
+ -		wait_for_completion(&wq->wq_dead);
+ -
+ -		ie->int_handle = new_handle;
+ -
+ -		/* Revive percpu ref and wake up all the waiting submitters */
+ -		percpu_ref_reinit(&wq->wq_active);
+ -		complete_all(&wq->wq_resurrect);
+ -		mutex_unlock(&wq->wq_lock);
+ -
+ -		/*
+ -		 * The delay here is to wait for all possible MOVDIR64B that
+ -		 * are issued before percpu_ref_kill() has happened to have
+ -		 * reached the PCIe domain before the drain is issued. The driver
+ -		 * needs to ensure that the drain descriptor issued does not pass
+ -		 * all the other issued descriptors that contain the invalid
+ -		 * interrupt handle in order to ensure that the drain descriptor
+ -		 * interrupt will allow the cleanup of all the descriptors with
+ -		 * invalid interrupt handle.
+ -		 */
+ -		if (wq_dedicated(wq))
+ -			udelay(100);
+ -		idxd_int_handle_revoke_drain(ie);
+ -	}
+ -	kfree(revoke);
+ +	fault->addr = fault_addr;
+ +	fault->idxd = idxd;
+ +	INIT_WORK(&fault->work, idxd_device_fault_work);
+ +	queue_work(idxd->wq, &fault->work);
+ +	return 0;
+  }
+  
+  static int process_misc_interrupts(struct idxd_device *idxd, u32 cause)
+diff --cc drivers/dma/idxd/submit.c
+index 0afcd1322339,569815a84e95..000000000000
+--- a/drivers/dma/idxd/submit.c
++++ b/drivers/dma/idxd/submit.c
+@@@ -88,6 -70,82 +88,85 @@@ void idxd_free_desc(struct idxd_wq *wq
+  	sbitmap_queue_clear(&wq->sbq, desc->id, cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 					 struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *n;
++ 
++ 	lockdep_assert_held(&ie->list_lock);
++ 	list_for_each_entry_safe(d, n, &ie->work_list, list) {
++ 		if (d == desc) {
++ 			list_del(&d->list);
++ 			return d;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * At this point, the desc needs to be aborted is held by the completion
++ 	 * handler where it has taken it off the pending list but has not added to the
++ 	 * work list. It will be cleaned up by the interrupt handler when it sees the
++ 	 * IDXD_COMP_DESC_ABORT for completion status.
++ 	 */
++ 	return NULL;
++ }
++ 
++ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 			     struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *t, *found = NULL;
++ 	struct llist_node *head;
++ 
++ 	desc->completion->status = IDXD_COMP_DESC_ABORT;
++ 	/*
++ 	 * Grab the list lock so it will block the irq thread handler. This allows the
++ 	 * abort code to locate the descriptor need to be aborted.
++ 	 */
++ 	spin_lock(&ie->list_lock);
++ 	head = llist_del_all(&ie->pending_llist);
++ 	if (head) {
++ 		llist_for_each_entry_safe(d, t, head, llnode) {
++ 			if (d == desc) {
++ 				found = desc;
++ 				continue;
++ 			}
++ 			list_add_tail(&desc->list, &ie->work_list);
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		found = list_abort_desc(wq, ie, desc);
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	if (found)
++ 		idxd_dma_complete_txd(found, IDXD_COMPLETE_ABORT, false);
++ }
++ 
++ /*
++  * ENQCMDS typically fail when the WQ is inactive or busy. On host submission, the driver
++  * has better control of number of descriptors being submitted to a shared wq by limiting
++  * the number of driver allocated descriptors to the wq size. However, when the swq is
++  * exported to a guest kernel, it may be shared with multiple guest kernels. This means
++  * the likelihood of getting busy returned on the swq when submitting goes significantly up.
++  * Having a tunable retry mechanism allows the driver to keep trying for a bit before giving
++  * up. The sysfs knob can be tuned by the system administrator.
++  */
++ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
++ {
++ 	int rc, retries = 0;
++ 
++ 	do {
++ 		rc = enqcmds(portal, desc);
++ 		if (rc == 0)
++ 			break;
++ 		cpu_relax();
++ 	} while (retries++ < wq->enqcmds_retries);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 7930d8553575 (dmaengine: idxd: add knob for enqcmds retries)
+  int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+  {
+  	struct idxd_device *idxd = wq->idxd;
+@@@ -111,15 -174,27 +190,9 @@@
+  	if (wq_dedicated(wq)) {
+  		iosubmit_cmds512(portal, desc->hw, 1);
+  	} else {
+- 		/*
+- 		 * It's not likely that we would receive queue full rejection
+- 		 * since the descriptor allocation gates at wq size. If we
+- 		 * receive a -EAGAIN, that means something went wrong such as the
+- 		 * device is not accepting descriptor at all.
+- 		 */
+- 		rc = enqcmds(portal, desc->hw);
++ 		rc = idxd_enqcmds(wq, portal, desc->hw);
+  		if (rc < 0) {
+  			percpu_ref_put(&wq->wq_active);
+ -			/* abort operation frees the descriptor */
+ -			if (ie)
+ -				llist_abort_desc(wq, ie, desc);
+  			return rc;
+  		}
+  	}
+diff --git a/Documentation/ABI/stable/sysfs-driver-dma-idxd b/Documentation/ABI/stable/sysfs-driver-dma-idxd
+index ebd521314803..dd229034840f 100644
+--- a/Documentation/ABI/stable/sysfs-driver-dma-idxd
++++ b/Documentation/ABI/stable/sysfs-driver-dma-idxd
+@@ -218,6 +218,13 @@ Contact:	dmaengine@vger.kernel.org
+ Description:	Show the current number of entries in this WQ if WQ Occupancy
+ 		Support bit WQ capabilities is 1.
+ 
++What:		/sys/bus/dsa/devices/wq<m>.<n>/enqcmds_retries
++Date		Oct 29, 2021
++KernelVersion:	5.17.0
++Contact:	dmaengine@vger.kernel.org
++Description:	Indicate the number of retires for an enqcmds submission on a shared wq.
++		A max value to set attribute is capped at 64.
++
+ What:           /sys/bus/dsa/devices/engine<m>.<n>/group_id
+ Date:           Oct 25, 2019
+ KernelVersion:  5.6.0
+diff --git a/drivers/dma/idxd/device.c b/drivers/dma/idxd/device.c
+index eadb0129f3b6..c63343591b2e 100644
+--- a/drivers/dma/idxd/device.c
++++ b/drivers/dma/idxd/device.c
+@@ -389,6 +389,7 @@ static void idxd_wq_disable_cleanup(struct idxd_wq *wq)
+ 	wq->threshold = 0;
+ 	wq->priority = 0;
+ 	wq->ats_dis = 0;
++	wq->enqcmds_retries = IDXD_ENQCMDS_RETRIES;
+ 	clear_bit(WQ_FLAG_DEDICATED, &wq->flags);
+ 	clear_bit(WQ_FLAG_BLOCK_ON_FAULT, &wq->flags);
+ 	memset(wq->name, 0, WQ_NAME_SIZE);
+diff --git a/drivers/dma/idxd/idxd.h b/drivers/dma/idxd/idxd.h
+index 03dc70e1f4d4..238a8c6b6775 100644
+--- a/drivers/dma/idxd/idxd.h
++++ b/drivers/dma/idxd/idxd.h
+@@ -35,6 +35,9 @@ enum idxd_type {
+ #define IDXD_NAME_SIZE		128
+ #define IDXD_PMU_EVENT_MAX	64
+ 
++#define IDXD_ENQCMDS_RETRIES		32
++#define IDXD_ENQCMDS_MAX_RETRIES	64
++
+ struct idxd_device_driver {
+ 	const char *name;
+ 	struct device_driver drv;
+@@ -140,6 +143,7 @@ struct idxd_dma_chan {
+ struct idxd_wq {
+ 	void __iomem *portal;
+ 	u32 portal_offset;
++	unsigned int enqcmds_retries;
+ 	struct percpu_ref wq_active;
+ 	struct completion wq_dead;
+ 	struct device conf_dev;
+@@ -473,6 +477,7 @@ int idxd_wq_init_percpu_ref(struct idxd_wq *wq);
+ int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc);
+ struct idxd_desc *idxd_alloc_desc(struct idxd_wq *wq, enum idxd_op_type optype);
+ void idxd_free_desc(struct idxd_wq *wq, struct idxd_desc *desc);
++int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc);
+ 
+ /* dmaengine */
+ int idxd_register_dma_device(struct idxd_device *idxd);
+* Unmerged path drivers/dma/idxd/init.c
+* Unmerged path drivers/dma/idxd/irq.c
+* Unmerged path drivers/dma/idxd/submit.c
+diff --git a/drivers/dma/idxd/sysfs.c b/drivers/dma/idxd/sysfs.c
+index 4cfaba0faeca..473ae309a126 100644
+--- a/drivers/dma/idxd/sysfs.c
++++ b/drivers/dma/idxd/sysfs.c
+@@ -1249,6 +1249,41 @@ static ssize_t wq_occupancy_show(struct device *dev, struct device_attribute *at
+ static struct device_attribute dev_attr_wq_occupancy =
+ 		__ATTR(occupancy, 0444, wq_occupancy_show, NULL);
+ 
++static ssize_t wq_enqcmds_retries_show(struct device *dev,
++				       struct device_attribute *attr, char *buf)
++{
++	struct idxd_wq *wq = confdev_to_wq(dev);
++
++	if (wq_dedicated(wq))
++		return -EOPNOTSUPP;
++
++	return sysfs_emit(buf, "%u\n", wq->enqcmds_retries);
++}
++
++static ssize_t wq_enqcmds_retries_store(struct device *dev, struct device_attribute *attr,
++					const char *buf, size_t count)
++{
++	struct idxd_wq *wq = confdev_to_wq(dev);
++	int rc;
++	unsigned int retries;
++
++	if (wq_dedicated(wq))
++		return -EOPNOTSUPP;
++
++	rc = kstrtouint(buf, 10, &retries);
++	if (rc < 0)
++		return rc;
++
++	if (retries > IDXD_ENQCMDS_MAX_RETRIES)
++		retries = IDXD_ENQCMDS_MAX_RETRIES;
++
++	wq->enqcmds_retries = retries;
++	return count;
++}
++
++static struct device_attribute dev_attr_wq_enqcmds_retries =
++		__ATTR(enqcmds_retries, 0644, wq_enqcmds_retries_show, wq_enqcmds_retries_store);
++
+ static struct attribute *idxd_wq_attributes[] = {
+ 	&dev_attr_wq_clients.attr,
+ 	&dev_attr_wq_state.attr,
+@@ -1265,6 +1300,7 @@ static struct attribute *idxd_wq_attributes[] = {
+ 	&dev_attr_wq_max_batch_size.attr,
+ 	&dev_attr_wq_ats_disable.attr,
+ 	&dev_attr_wq_occupancy.attr,
++	&dev_attr_wq_enqcmds_retries.attr,
+ 	NULL,
+ };
+ 
