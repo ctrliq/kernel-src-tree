@@ -1,0 +1,214 @@
+KVM: x86: Handle triple fault in L2 without killing L1
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit cb6a32c2b8777ad31a02e585584d869251a790e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/cb6a32c2.failed
+
+Synthesize a nested VM-Exit if L2 triggers an emulated triple fault
+instead of exiting to userspace, which likely will kill L1.  Any flow
+that does KVM_REQ_TRIPLE_FAULT is suspect, but the most common scenario
+for L2 killing L1 is if L0 (KVM) intercepts a contributory exception that
+is _not_intercepted by L1.  E.g. if KVM is intercepting #GPs for the
+VMware backdoor, a #GP that occurs in L2 while vectoring an injected #DF
+will cause KVM to emulate triple fault.
+
+	Cc: Boris Ostrovsky <boris.ostrovsky@oracle.com>
+	Cc: Jim Mattson <jmattson@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210302174515.2812275-2-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cb6a32c2b8777ad31a02e585584d869251a790e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+diff --cc arch/x86/kvm/svm/nested.c
+index e8796fbe795c,348e1f979dbe..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -609,16 -655,19 +609,23 @@@ void nested_svm_vmloadsave(struct vmcb 
+  
+  int nested_svm_vmexit(struct vcpu_svm *svm)
+  {
+ -	struct kvm_vcpu *vcpu = &svm->vcpu;
+ +	int rc;
+  	struct vmcb *vmcb12;
+ +	struct vmcb *hsave = svm->nested.hsave;
+  	struct vmcb *vmcb = svm->vmcb;
+  	struct kvm_host_map map;
+ -	int rc;
+  
+++<<<<<<< HEAD
+ +	rc = kvm_vcpu_map(&svm->vcpu, gpa_to_gfn(svm->nested.vmcb12_gpa), &map);
+++=======
++ 	/* Triple faults in L2 should never escape. */
++ 	WARN_ON_ONCE(kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu));
++ 
++ 	rc = kvm_vcpu_map(vcpu, gpa_to_gfn(svm->nested.vmcb12_gpa), &map);
+++>>>>>>> cb6a32c2b877 (KVM: x86: Handle triple fault in L2 without killing L1)
+  	if (rc) {
+  		if (rc == -EINVAL)
+ -			kvm_inject_gp(vcpu, 0);
+ +			kvm_inject_gp(&svm->vcpu, 0);
+  		return 1;
+  	}
+  
+@@@ -739,9 -785,19 +746,19 @@@
+  	return 0;
+  }
+  
++ static void nested_svm_triple_fault(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 
++ 	svm->vmcb->control.exit_code   = SVM_EXIT_SHUTDOWN;
++ 	svm->vmcb->control.exit_info_1 = 0;
++ 	svm->vmcb->control.exit_info_2 = 0;
++ 	nested_svm_vmexit(svm);
++ }
++ 
+  int svm_allocate_nested(struct vcpu_svm *svm)
+  {
+ -	struct page *vmcb02_page;
+ +	struct page *hsave_page;
+  
+  	if (svm->nested.initialized)
+  		return 0;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index b3a59b5f9bb5..43994e643ece 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1341,6 +1341,7 @@ struct kvm_x86_ops {
+ struct kvm_x86_nested_ops {
+ 	int (*check_events)(struct kvm_vcpu *vcpu);
+ 	bool (*hv_timer_pending)(struct kvm_vcpu *vcpu);
++	void (*triple_fault)(struct kvm_vcpu *vcpu);
+ 	int (*get_state)(struct kvm_vcpu *vcpu,
+ 			 struct kvm_nested_state __user *user_kvm_nested_state,
+ 			 unsigned user_data_size);
+diff --git a/arch/x86/kvm/lapic.c b/arch/x86/kvm/lapic.c
+index c970cc8af3c7..dc806d0a5510 100644
+--- a/arch/x86/kvm/lapic.c
++++ b/arch/x86/kvm/lapic.c
+@@ -2868,7 +2868,7 @@ void kvm_apic_accept_events(struct kvm_vcpu *vcpu)
+ 		return;
+ 
+ 	if (is_guest_mode(vcpu)) {
+-		r = kvm_x86_ops.nested_ops->check_events(vcpu);
++		r = kvm_check_nested_events(vcpu);
+ 		if (r < 0)
+ 			return;
+ 		/*
+* Unmerged path arch/x86/kvm/svm/nested.c
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index cce43ff17d8b..78470bc9744a 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -4444,6 +4444,9 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 	/* trying to cancel vmlaunch/vmresume is a bug */
+ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
+ 
++	/* Similarly, triple faults in L2 should never escape. */
++	WARN_ON_ONCE(kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu));
++
+ 	kvm_clear_request(KVM_REQ_GET_NESTED_STATE_PAGES, vcpu);
+ 
+ 	/* Service the TLB flush request for L2 before switching to L1. */
+@@ -4575,6 +4578,11 @@ void nested_vmx_vmexit(struct kvm_vcpu *vcpu, u32 vm_exit_reason,
+ 	vmx->fail = 0;
+ }
+ 
++static void nested_vmx_triple_fault(struct kvm_vcpu *vcpu)
++{
++	nested_vmx_vmexit(vcpu, EXIT_REASON_TRIPLE_FAULT, 0, 0);
++}
++
+ /*
+  * Decode the memory-address operand of a vmx instruction, as recorded on an
+  * exit caused by such an instruction (run by a guest hypervisor).
+@@ -6623,6 +6631,7 @@ __init int nested_vmx_hardware_setup(int (*exit_handlers[])(struct kvm_vcpu *))
+ struct kvm_x86_nested_ops vmx_nested_ops = {
+ 	.check_events = vmx_check_nested_events,
+ 	.hv_timer_pending = nested_vmx_preemption_timer_pending,
++	.triple_fault = nested_vmx_triple_fault,
+ 	.get_state = vmx_get_nested_state,
+ 	.set_state = vmx_set_nested_state,
+ 	.get_nested_state_pages = vmx_get_nested_state_pages,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 703d0876830f..2899ec253353 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -8230,6 +8230,19 @@ static void update_cr8_intercept(struct kvm_vcpu *vcpu)
+ 	kvm_x86_ops.update_cr8_intercept(vcpu, tpr, max_irr);
+ }
+ 
++int kvm_check_nested_events(struct kvm_vcpu *vcpu)
++{
++	if (WARN_ON_ONCE(!is_guest_mode(vcpu)))
++		return -EIO;
++
++	if (kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
++		kvm_x86_ops.nested_ops->triple_fault(vcpu);
++		return 1;
++	}
++
++	return kvm_x86_ops.nested_ops->check_events(vcpu);
++}
++
+ static void inject_pending_event(struct kvm_vcpu *vcpu, bool *req_immediate_exit)
+ {
+ 	int r;
+@@ -8275,7 +8288,7 @@ static void inject_pending_event(struct kvm_vcpu *vcpu, bool *req_immediate_exit
+ 	 * from L2 to L1.
+ 	 */
+ 	if (is_guest_mode(vcpu)) {
+-		r = kvm_x86_ops.nested_ops->check_events(vcpu);
++		r = kvm_check_nested_events(vcpu);
+ 		if (r < 0)
+ 			goto busy;
+ 	}
+@@ -8826,10 +8839,14 @@ static int vcpu_enter_guest(struct kvm_vcpu *vcpu)
+ 			goto out;
+ 		}
+ 		if (kvm_check_request(KVM_REQ_TRIPLE_FAULT, vcpu)) {
+-			vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
+-			vcpu->mmio_needed = 0;
+-			r = 0;
+-			goto out;
++			if (is_guest_mode(vcpu)) {
++				kvm_x86_ops.nested_ops->triple_fault(vcpu);
++			} else {
++				vcpu->run->exit_reason = KVM_EXIT_SHUTDOWN;
++				vcpu->mmio_needed = 0;
++				r = 0;
++				goto out;
++			}
+ 		}
+ 		if (kvm_check_request(KVM_REQ_APF_HALT, vcpu)) {
+ 			/* Page is swapped out. Do synthetic halt */
+@@ -9111,7 +9128,7 @@ static inline int vcpu_block(struct kvm *kvm, struct kvm_vcpu *vcpu)
+ static inline bool kvm_vcpu_running(struct kvm_vcpu *vcpu)
+ {
+ 	if (is_guest_mode(vcpu))
+-		kvm_x86_ops.nested_ops->check_events(vcpu);
++		kvm_check_nested_events(vcpu);
+ 
+ 	return (vcpu->arch.mp_state == KVM_MP_STATE_RUNNABLE &&
+ 		!vcpu->arch.apf.halted);
+diff --git a/arch/x86/kvm/x86.h b/arch/x86/kvm/x86.h
+index 62aa3f330384..c5e4fcc404ef 100644
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@ -55,6 +55,8 @@ static inline unsigned int __shrink_ple_window(unsigned int val,
+ 
+ #define MSR_IA32_CR_PAT_DEFAULT  0x0007040600070406ULL
+ 
++int kvm_check_nested_events(struct kvm_vcpu *vcpu);
++
+ static inline void kvm_clear_exception_queue(struct kvm_vcpu *vcpu)
+ {
+ 	vcpu->arch.exception.pending = false;
