@@ -52,6 +52,7 @@
 #define MDIO_AN_TX_VEND_INT_STATUS1_DOWNSHIFT	BIT(1)
 
 #define MDIO_AN_TX_VEND_INT_STATUS2		0xcc01
+#define MDIO_AN_TX_VEND_INT_STATUS2_MASK	BIT(0)
 
 #define MDIO_AN_TX_VEND_INT_MASK2		0xd401
 #define MDIO_AN_TX_VEND_INT_MASK2_LINK		BIT(0)
@@ -268,6 +269,25 @@ static int aqr_ack_interrupt(struct phy_device *phydev)
 	reg = phy_read_mmd(phydev, MDIO_MMD_AN,
 			   MDIO_AN_TX_VEND_INT_STATUS2);
 	return (reg < 0) ? reg : 0;
+}
+
+static irqreturn_t aqr_handle_interrupt(struct phy_device *phydev)
+{
+	int irq_status;
+
+	irq_status = phy_read_mmd(phydev, MDIO_MMD_AN,
+				  MDIO_AN_TX_VEND_INT_STATUS2);
+	if (irq_status < 0) {
+		phy_error(phydev);
+		return IRQ_NONE;
+	}
+
+	if (!(irq_status & MDIO_AN_TX_VEND_INT_STATUS2_MASK))
+		return IRQ_NONE;
+
+	phy_trigger_machine(phydev);
+
+	return IRQ_HANDLED;
 }
 
 static int aqr_read_status(struct phy_device *phydev)
@@ -582,6 +602,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr_read_status,
 },
 {
@@ -590,6 +611,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr_read_status,
 },
 {
@@ -598,6 +620,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr_read_status,
 	.suspend	= aqr107_suspend,
 	.resume		= aqr107_resume,
@@ -608,6 +631,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr_read_status,
 },
 {
@@ -618,6 +642,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr107_read_status,
 	.get_tunable    = aqr107_get_tunable,
 	.set_tunable    = aqr107_set_tunable,
@@ -636,6 +661,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr107_read_status,
 	.get_tunable    = aqr107_get_tunable,
 	.set_tunable    = aqr107_set_tunable,
@@ -652,6 +678,7 @@ static struct phy_driver aqr_driver[] = {
 	.config_aneg    = aqr_config_aneg,
 	.config_intr	= aqr_config_intr,
 	.ack_interrupt	= aqr_ack_interrupt,
+	.handle_interrupt = aqr_handle_interrupt,
 	.read_status	= aqr_read_status,
 },
 };
