@@ -1,0 +1,492 @@
+scsi: lpfc: Add reporting capability for Link Degrade Signaling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author James Smart <jsmart2021@gmail.com>
+commit dbb1e2ff87a63b665e93ffee54b46076e9c73d5f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/dbb1e2ff.failed
+
+Firmware reports link degrade signaling via ACQES.
+
+Handlers and new additions to the SET_FEATURES mbox command are implemented
+so that link degrade parameters for 64GB capable links are reported through
+EDC ELS frames.
+
+Link: https://lore.kernel.org/r/20220911221505.117655-12-jsmart2021@gmail.com
+Co-developed-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: Justin Tee <justin.tee@broadcom.com>
+	Signed-off-by: James Smart <jsmart2021@gmail.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit dbb1e2ff87a63b665e93ffee54b46076e9c73d5f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/lpfc/lpfc.h
+#	drivers/scsi/lpfc/lpfc_els.c
+diff --cc drivers/scsi/lpfc/lpfc.h
+index eacaefc7d160,9ad233b40a9e..000000000000
+--- a/drivers/scsi/lpfc/lpfc.h
++++ b/drivers/scsi/lpfc/lpfc.h
+@@@ -1594,10 -1597,11 +1595,18 @@@ struct lpfc_hba 
+  
+  	char os_host_name[MAXHOSTNAMELEN];
+  
+++<<<<<<< HEAD
+ +	/* SCSI host template information - for physical port */
+ +	struct scsi_host_template port_template;
+ +	/* SCSI host template information - for all vports */
+ +	struct scsi_host_template vport_template;
+++=======
++ 	/* LD Signaling */
++ 	u32 degrade_activate_threshold;
++ 	u32 degrade_deactivate_threshold;
++ 	u32 fec_degrade_interval;
++ 
+++>>>>>>> dbb1e2ff87a6 (scsi: lpfc: Add reporting capability for Link Degrade Signaling)
+  	atomic_t dbg_log_idx;
+  	atomic_t dbg_log_cnt;
+  	atomic_t dbg_log_dmping;
+diff --cc drivers/scsi/lpfc/lpfc_els.c
+index 45f7974bc4d8,863b2125fed6..000000000000
+--- a/drivers/scsi/lpfc/lpfc_els.c
++++ b/drivers/scsi/lpfc/lpfc_els.c
+@@@ -4177,17 -4256,21 +4217,21 @@@ lpfc_issue_els_edc(struct lpfc_vport *v
+  		goto try_rdf;
+  
+  	/* Configure the payload for the supported Diagnostics capabilities. */
+ -	pcmd = (u8 *)elsiocb->cmd_dmabuf->virt;
+ +	pcmd = (u8 *)(((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+  	memset(pcmd, 0, cmdsize);
+- 	edc_req = (struct lpfc_els_edc_req *)pcmd;
+- 	edc_req->edc.desc_len = cpu_to_be32(cgn_desc_size);
+- 	edc_req->edc.edc_cmd = ELS_EDC;
+- 
+- 	cgn_desc = &edc_req->cgn_desc;
++ 	edc_req = (struct fc_els_edc *)pcmd;
++ 	edc_req->desc_len = cpu_to_be32(cgn_desc_size + lft_desc_size);
++ 	edc_req->edc_cmd = ELS_EDC;
++ 	tlv = edc_req->desc;
+  
+- 	lpfc_format_edc_cgn_desc(phba, cgn_desc);
++ 	if (cgn_desc_size) {
++ 		lpfc_format_edc_cgn_desc(phba, tlv);
++ 		phba->cgn_sig_freq = lpfc_fabric_cgn_frequency;
++ 		tlv = fc_tlv_next_desc(tlv);
++ 	}
+  
+- 	phba->cgn_sig_freq = lpfc_fabric_cgn_frequency;
++ 	if (lft_desc_size)
++ 		lpfc_format_edc_lft_desc(phba, tlv);
+  
+  	lpfc_printf_vlog(vport, KERN_INFO, LOG_ELS | LOG_CGN_MGMT,
+  			 "4623 Xmit EDC to remote "
+@@@ -5671,34 -5824,55 +5715,49 @@@ lpfc_issue_els_edc_rsp(struct lpfc_vpor
+  		       struct lpfc_nodelist *ndlp)
+  {
+  	struct lpfc_hba  *phba = vport->phba;
+- 	struct lpfc_els_edc_rsp *edc_rsp;
++ 	struct fc_els_edc_resp *edc_rsp;
++ 	struct fc_tlv_desc *tlv;
+  	struct lpfc_iocbq *elsiocb;
+  	IOCB_t *icmd, *cmd;
+++<<<<<<< HEAD
+++=======
++ 	union lpfc_wqe128 *wqe;
++ 	u32 cgn_desc_size, lft_desc_size;
++ 	u16 cmdsize;
+++>>>>>>> dbb1e2ff87a6 (scsi: lpfc: Add reporting capability for Link Degrade Signaling)
+  	uint8_t *pcmd;
+- 	int cmdsize, rc;
++ 	int rc;
+  
+- 	cmdsize = sizeof(struct lpfc_els_edc_rsp);
++ 	cmdsize = sizeof(struct fc_els_edc_resp);
++ 	cgn_desc_size = sizeof(struct fc_diag_cg_sig_desc);
++ 	lft_desc_size = (lpfc_link_is_lds_capable(phba)) ?
++ 				sizeof(struct fc_diag_lnkflt_desc) : 0;
++ 	cmdsize += cgn_desc_size + lft_desc_size;
+  	elsiocb = lpfc_prep_els_iocb(vport, 0, cmdsize, cmdiocb->retry,
+  				     ndlp, ndlp->nlp_DID, ELS_CMD_ACC);
+  	if (!elsiocb)
+  		return 1;
+  
+ -	if (phba->sli_rev == LPFC_SLI_REV4) {
+ -		wqe = &elsiocb->wqe;
+ -		bf_set(wqe_ctxt_tag, &wqe->generic.wqe_com,
+ -		       get_job_ulpcontext(phba, cmdiocb)); /* Xri / rx_id */
+ -		bf_set(wqe_rcvoxid, &wqe->xmit_els_rsp.wqe_com,
+ -		       get_job_rcvoxid(phba, cmdiocb));
+ -	} else {
+ -		icmd = &elsiocb->iocb;
+ -		cmd = &cmdiocb->iocb;
+ -		icmd->ulpContext = cmd->ulpContext; /* Xri / rx_id */
+ -		icmd->unsli3.rcvsli3.ox_id = cmd->unsli3.rcvsli3.ox_id;
+ -	}
+ -
+ -	pcmd = elsiocb->cmd_dmabuf->virt;
+ +	icmd = &elsiocb->iocb;
+ +	cmd = &cmdiocb->iocb;
+ +	icmd->ulpContext = cmd->ulpContext;     /* Xri / rx_id */
+ +	icmd->unsli3.rcvsli3.ox_id = cmd->unsli3.rcvsli3.ox_id;
+ +	pcmd = (((struct lpfc_dmabuf *)elsiocb->context2)->virt);
+  	memset(pcmd, 0, cmdsize);
+  
+- 	edc_rsp = (struct lpfc_els_edc_rsp *)pcmd;
+- 	edc_rsp->edc_rsp.acc_hdr.la_cmd = ELS_LS_ACC;
+- 	edc_rsp->edc_rsp.desc_list_len = cpu_to_be32(
+- 		FC_TLV_DESC_LENGTH_FROM_SZ(struct lpfc_els_edc_rsp));
+- 	edc_rsp->edc_rsp.lsri.desc_tag = cpu_to_be32(ELS_DTAG_LS_REQ_INFO);
+- 	edc_rsp->edc_rsp.lsri.desc_len = cpu_to_be32(
++ 	edc_rsp = (struct fc_els_edc_resp *)pcmd;
++ 	edc_rsp->acc_hdr.la_cmd = ELS_LS_ACC;
++ 	edc_rsp->desc_list_len = cpu_to_be32(sizeof(struct fc_els_lsri_desc) +
++ 						cgn_desc_size + lft_desc_size);
++ 	edc_rsp->lsri.desc_tag = cpu_to_be32(ELS_DTAG_LS_REQ_INFO);
++ 	edc_rsp->lsri.desc_len = cpu_to_be32(
+  		FC_TLV_DESC_LENGTH_FROM_SZ(struct fc_els_lsri_desc));
+- 	edc_rsp->edc_rsp.lsri.rqst_w0.cmd = ELS_EDC;
+- 	lpfc_format_edc_cgn_desc(phba, &edc_rsp->cgn_desc);
++ 	edc_rsp->lsri.rqst_w0.cmd = ELS_EDC;
++ 	tlv = edc_rsp->desc;
++ 	lpfc_format_edc_cgn_desc(phba, tlv);
++ 	tlv = fc_tlv_next_desc(tlv);
++ 	if (lft_desc_size)
++ 		lpfc_format_edc_lft_desc(phba, tlv);
+  
+  	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_RSP,
+  			      "Issue EDC ACC:      did:x%x flg:x%x refcnt %d",
+@@@ -8826,9 -9137,9 +8885,9 @@@ lpfc_els_rcv_edc(struct lpfc_vport *vpo
+  	uint32_t *ptr, dtag;
+  	const char *dtag_nm;
+  	int desc_cnt = 0, bytes_remain;
+- 	bool rcv_cap_desc = false;
++ 	struct fc_diag_lnkflt_desc *plnkflt;
+  
+ -	payload = cmdiocb->cmd_dmabuf->virt;
+ +	payload = ((struct lpfc_dmabuf *)cmdiocb->context2)->virt;
+  
+  	edc_req = (struct fc_els_edc *)payload;
+  	bytes_remain = be32_to_cpu(edc_req->desc_len);
+* Unmerged path drivers/scsi/lpfc/lpfc.h
+diff --git a/drivers/scsi/lpfc/lpfc_crtn.h b/drivers/scsi/lpfc/lpfc_crtn.h
+index f3efd979fbb5..f5b67f4f0396 100644
+--- a/drivers/scsi/lpfc/lpfc_crtn.h
++++ b/drivers/scsi/lpfc/lpfc_crtn.h
+@@ -76,6 +76,7 @@ int lpfc_init_iocb_list(struct lpfc_hba *phba, int cnt);
+ void lpfc_free_iocb_list(struct lpfc_hba *phba);
+ int lpfc_post_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hrq,
+ 			struct lpfc_queue *drq, int count, int idx);
++int lpfc_read_lds_params(struct lpfc_hba *phba);
+ uint32_t lpfc_calc_cmf_latency(struct lpfc_hba *phba);
+ void lpfc_cmf_signal_init(struct lpfc_hba *phba);
+ void lpfc_cmf_start(struct lpfc_hba *phba);
+* Unmerged path drivers/scsi/lpfc/lpfc_els.c
+diff --git a/drivers/scsi/lpfc/lpfc_hbadisc.c b/drivers/scsi/lpfc/lpfc_hbadisc.c
+index 25f5d184cfe4..5c0cdd79d1e6 100644
+--- a/drivers/scsi/lpfc/lpfc_hbadisc.c
++++ b/drivers/scsi/lpfc/lpfc_hbadisc.c
+@@ -1239,6 +1239,8 @@ lpfc_linkdown(struct lpfc_hba *phba)
+ 			phba->trunk_link.link1.state = 0;
+ 			phba->trunk_link.link2.state = 0;
+ 			phba->trunk_link.link3.state = 0;
++			phba->trunk_link.phy_lnk_speed =
++						LPFC_LINK_SPEED_UNKNOWN;
+ 			phba->sli4_hba.link_state.logical_speed =
+ 						LPFC_LINK_SPEED_UNKNOWN;
+ 		}
+@@ -3825,6 +3827,9 @@ lpfc_mbx_cmpl_read_topology(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 		if (phba->cmf_active_mode != LPFC_CFG_OFF)
+ 			lpfc_cmf_signal_init(phba);
+ 
++		if (phba->lmt & LMT_64Gb)
++			lpfc_read_lds_params(phba);
++
+ 	} else if (attn_type == LPFC_ATT_LINK_DOWN ||
+ 		   attn_type == LPFC_ATT_UNEXP_WWPN) {
+ 		phba->fc_stat.LinkDown++;
+@@ -4473,8 +4478,11 @@ lpfc_mbx_cmpl_ns_reg_login(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ 			rc = lpfc_issue_els_edc(vport, 0);
+ 			lpfc_printf_log(phba, KERN_INFO,
+ 					LOG_INIT | LOG_ELS | LOG_DISCOVERY,
+-					"4220 EDC issue error x%x, Data: x%x\n",
++					"4220 Issue EDC status x%x Data x%x\n",
+ 					rc, phba->cgn_init_reg_signal);
++		} else if (phba->lmt & LMT_64Gb) {
++			/* may send link fault capability descriptor */
++			lpfc_issue_els_edc(vport, 0);
+ 		} else {
+ 			lpfc_issue_els_rdf(vport, 0);
+ 		}
+diff --git a/drivers/scsi/lpfc/lpfc_hw4.h b/drivers/scsi/lpfc/lpfc_hw4.h
+index 6595df8e6063..afb2ce17869d 100644
+--- a/drivers/scsi/lpfc/lpfc_hw4.h
++++ b/drivers/scsi/lpfc/lpfc_hw4.h
+@@ -3448,9 +3448,10 @@ struct lpfc_sli4_parameters {
+ 
+ #define LPFC_SET_UE_RECOVERY		0x10
+ #define LPFC_SET_MDS_DIAGS		0x12
+-#define LPFC_SET_CGN_SIGNAL		0x1f
+ #define LPFC_SET_DUAL_DUMP		0x1e
++#define LPFC_SET_CGN_SIGNAL		0x1f
+ #define LPFC_SET_ENABLE_MI		0x21
++#define LPFC_SET_LD_SIGNAL		0x23
+ #define LPFC_SET_ENABLE_CMF		0x24
+ struct lpfc_mbx_set_feature {
+ 	struct mbox_header header;
+@@ -3481,13 +3482,17 @@ struct lpfc_mbx_set_feature {
+ #define lpfc_mbx_set_feature_cmf_SHIFT		0
+ #define lpfc_mbx_set_feature_cmf_MASK		0x00000001
+ #define lpfc_mbx_set_feature_cmf_WORD		word6
++#define lpfc_mbx_set_feature_lds_qry_SHIFT	0
++#define lpfc_mbx_set_feature_lds_qry_MASK	0x00000001
++#define lpfc_mbx_set_feature_lds_qry_WORD	word6
++#define LPFC_QUERY_LDS_OP		1
+ #define lpfc_mbx_set_feature_mi_SHIFT		0
+ #define lpfc_mbx_set_feature_mi_MASK		0x0000ffff
+ #define lpfc_mbx_set_feature_mi_WORD		word6
+ #define lpfc_mbx_set_feature_milunq_SHIFT	16
+ #define lpfc_mbx_set_feature_milunq_MASK	0x0000ffff
+ #define lpfc_mbx_set_feature_milunq_WORD	word6
+-	uint32_t word7;
++	u32 word7;
+ #define lpfc_mbx_set_feature_UERP_SHIFT 0
+ #define lpfc_mbx_set_feature_UERP_MASK  0x0000ffff
+ #define lpfc_mbx_set_feature_UERP_WORD  word7
+@@ -3501,6 +3506,8 @@ struct lpfc_mbx_set_feature {
+ #define lpfc_mbx_set_feature_CGN_acqe_freq_SHIFT 0
+ #define lpfc_mbx_set_feature_CGN_acqe_freq_MASK  0x000000ff
+ #define lpfc_mbx_set_feature_CGN_acqe_freq_WORD  word8
++	u32 word9;
++	u32 word10;
+ };
+ 
+ 
+@@ -4278,7 +4285,7 @@ struct lpfc_acqe_cgn_signal {
+ struct lpfc_acqe_sli {
+ 	uint32_t event_data1;
+ 	uint32_t event_data2;
+-	uint32_t reserved;
++	uint32_t event_data3;
+ 	uint32_t trailer;
+ #define LPFC_SLI_EVENT_TYPE_PORT_ERROR		0x1
+ #define LPFC_SLI_EVENT_TYPE_OVER_TEMP		0x2
+@@ -4291,6 +4298,7 @@ struct lpfc_acqe_sli {
+ #define LPFC_SLI_EVENT_TYPE_MISCONF_FAWWN	0xF
+ #define LPFC_SLI_EVENT_TYPE_EEPROM_FAILURE	0x10
+ #define LPFC_SLI_EVENT_TYPE_CGN_SIGNAL		0x11
++#define LPFC_SLI_EVENT_TYPE_RD_SIGNAL           0x12
+ };
+ 
+ /*
+@@ -5015,22 +5023,6 @@ struct lpfc_grp_hdr {
+ 	{ FPIN_CONGN_SEVERITY_ERROR,		"Alarm" },	\
+ }
+ 
+-/* EDC supports two descriptors.  When allocated, it is the
+- * size of this structure plus each supported descriptor.
+- */
+-struct lpfc_els_edc_req {
+-	struct fc_els_edc               edc;       /* hdr up to descriptors */
+-	struct fc_diag_cg_sig_desc      cgn_desc;  /* 1st descriptor */
+-};
+-
+-/* Minimum structure defines for the EDC response.
+- * Balance is in buffer.
+- */
+-struct lpfc_els_edc_rsp {
+-	struct fc_els_edc_resp          edc_rsp;   /* hdr up to descriptors */
+-	struct fc_diag_cg_sig_desc      cgn_desc;  /* 1st descriptor */
+-};
+-
+ /* Used for logging FPIN messages */
+ #define LPFC_FPIN_WWPN_LINE_SZ  128
+ #define LPFC_FPIN_WWPN_LINE_CNT 6
+diff --git a/drivers/scsi/lpfc/lpfc_init.c b/drivers/scsi/lpfc/lpfc_init.c
+index 27993b9450b4..a37af5955a50 100644
+--- a/drivers/scsi/lpfc/lpfc_init.c
++++ b/drivers/scsi/lpfc/lpfc_init.c
+@@ -5972,6 +5972,7 @@ lpfc_update_trunk_link_status(struct lpfc_hba *phba,
+ {
+ 	uint8_t port_fault = bf_get(lpfc_acqe_fc_la_trunk_linkmask, acqe_fc);
+ 	uint8_t err = bf_get(lpfc_acqe_fc_la_trunk_fault, acqe_fc);
++	u8 cnt = 0;
+ 
+ 	phba->sli4_hba.link_state.speed =
+ 		lpfc_sli4_port_speed_parse(phba, LPFC_TRAILER_CODE_FC,
+@@ -5990,26 +5991,36 @@ lpfc_update_trunk_link_status(struct lpfc_hba *phba,
+ 			bf_get(lpfc_acqe_fc_la_trunk_link_status_port0, acqe_fc)
+ 			? LPFC_LINK_UP : LPFC_LINK_DOWN;
+ 		phba->trunk_link.link0.fault = port_fault & 0x1 ? err : 0;
++		cnt++;
+ 	}
+ 	if (bf_get(lpfc_acqe_fc_la_trunk_config_port1, acqe_fc)) {
+ 		phba->trunk_link.link1.state =
+ 			bf_get(lpfc_acqe_fc_la_trunk_link_status_port1, acqe_fc)
+ 			? LPFC_LINK_UP : LPFC_LINK_DOWN;
+ 		phba->trunk_link.link1.fault = port_fault & 0x2 ? err : 0;
++		cnt++;
+ 	}
+ 	if (bf_get(lpfc_acqe_fc_la_trunk_config_port2, acqe_fc)) {
+ 		phba->trunk_link.link2.state =
+ 			bf_get(lpfc_acqe_fc_la_trunk_link_status_port2, acqe_fc)
+ 			? LPFC_LINK_UP : LPFC_LINK_DOWN;
+ 		phba->trunk_link.link2.fault = port_fault & 0x4 ? err : 0;
++		cnt++;
+ 	}
+ 	if (bf_get(lpfc_acqe_fc_la_trunk_config_port3, acqe_fc)) {
+ 		phba->trunk_link.link3.state =
+ 			bf_get(lpfc_acqe_fc_la_trunk_link_status_port3, acqe_fc)
+ 			? LPFC_LINK_UP : LPFC_LINK_DOWN;
+ 		phba->trunk_link.link3.fault = port_fault & 0x8 ? err : 0;
++		cnt++;
+ 	}
+ 
++	if (cnt)
++		phba->trunk_link.phy_lnk_speed =
++			phba->sli4_hba.link_state.logical_speed / (cnt * 1000);
++	else
++		phba->trunk_link.phy_lnk_speed = LPFC_LINK_SPEED_UNKNOWN;
++
+ 	lpfc_printf_log(phba, KERN_ERR, LOG_TRACE_EVENT,
+ 			"2910 Async FC Trunking Event - Speed:%d\n"
+ 			"\tLogical speed:%d "
+@@ -6088,7 +6099,7 @@ lpfc_sli4_async_fc_evt(struct lpfc_hba *phba, struct lpfc_acqe_fc_la *acqe_fc)
+ 	if (bf_get(lpfc_acqe_fc_la_att_type, acqe_fc) ==
+ 	    LPFC_FC_LA_TYPE_LINK_DOWN)
+ 		phba->sli4_hba.link_state.logical_speed = 0;
+-	else if	(!phba->sli4_hba.conf_trunk)
++	else if (!phba->sli4_hba.conf_trunk)
+ 		phba->sli4_hba.link_state.logical_speed =
+ 				bf_get(lpfc_acqe_fc_la_llink_spd, acqe_fc) * 10;
+ 
+@@ -6216,7 +6227,7 @@ lpfc_sli4_async_sli_evt(struct lpfc_hba *phba, struct lpfc_acqe_sli *acqe_sli)
+ 			"2901 Async SLI event - Type:%d, Event Data: x%08x "
+ 			"x%08x x%08x x%08x\n", evt_type,
+ 			acqe_sli->event_data1, acqe_sli->event_data2,
+-			acqe_sli->reserved, acqe_sli->trailer);
++			acqe_sli->event_data3, acqe_sli->trailer);
+ 
+ 	port_name = phba->Port[0];
+ 	if (port_name == 0x00)
+@@ -6245,7 +6256,7 @@ lpfc_sli4_async_sli_evt(struct lpfc_hba *phba, struct lpfc_acqe_sli *acqe_sli)
+ 		temp_event_data.event_code = LPFC_NORMAL_TEMP;
+ 		temp_event_data.data = (uint32_t)acqe_sli->event_data1;
+ 
+-		lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
++		lpfc_printf_log(phba, KERN_INFO, LOG_SLI | LOG_LDS_EVENT,
+ 				"3191 Normal Temperature:%d Celsius - Port Name %c\n",
+ 				acqe_sli->event_data1, port_name);
+ 
+@@ -6423,6 +6434,15 @@ lpfc_sli4_async_sli_evt(struct lpfc_hba *phba, struct lpfc_acqe_sli *acqe_sli)
+ 			}
+ 		}
+ 		break;
++	case LPFC_SLI_EVENT_TYPE_RD_SIGNAL:
++		/* May be accompanied by a temperature event */
++		lpfc_printf_log(phba, KERN_INFO,
++				LOG_SLI | LOG_LINK_EVENT | LOG_LDS_EVENT,
++				"2902 Remote Degrade Signaling: x%08x x%08x "
++				"x%08x\n",
++				acqe_sli->event_data1, acqe_sli->event_data2,
++				acqe_sli->event_data3);
++		break;
+ 	default:
+ 		lpfc_printf_log(phba, KERN_INFO, LOG_SLI,
+ 				"3193 Unrecognized SLI event, type: 0x%x",
+diff --git a/drivers/scsi/lpfc/lpfc_logmsg.h b/drivers/scsi/lpfc/lpfc_logmsg.h
+index 4d455da9cd69..b39cefcd8703 100644
+--- a/drivers/scsi/lpfc/lpfc_logmsg.h
++++ b/drivers/scsi/lpfc/lpfc_logmsg.h
+@@ -35,7 +35,7 @@
+ #define LOG_FCP_ERROR	0x00001000	/* log errors, not underruns */
+ #define LOG_LIBDFC	0x00002000	/* Libdfc events */
+ #define LOG_VPORT	0x00004000	/* NPIV events */
+-#define LOG_SECURITY	0x00008000	/* Security events */
++#define LOG_LDS_EVENT	0x00008000	/* Link Degrade Signaling events */
+ #define LOG_EVENT	0x00010000	/* CT,TEMP,DUMP, logging */
+ #define LOG_FIP		0x00020000	/* FIP events */
+ #define LOG_FCP_UNDER	0x00040000	/* FCP underruns errors */
+diff --git a/drivers/scsi/lpfc/lpfc_sli.c b/drivers/scsi/lpfc/lpfc_sli.c
+index 1bc928fe09aa..3cf5df50a1e5 100644
+--- a/drivers/scsi/lpfc/lpfc_sli.c
++++ b/drivers/scsi/lpfc/lpfc_sli.c
+@@ -6770,8 +6770,13 @@ lpfc_set_features(struct lpfc_hba *phba, LPFC_MBOXQ_t *mbox,
+ 		bf_set(lpfc_mbx_set_feature_mi, &mbox->u.mqe.un.set_feature,
+ 		       phba->sli4_hba.pc_sli4_params.mi_ver);
+ 		break;
++	case LPFC_SET_LD_SIGNAL:
++		mbox->u.mqe.un.set_feature.feature = LPFC_SET_LD_SIGNAL;
++		mbox->u.mqe.un.set_feature.param_len = 16;
++		bf_set(lpfc_mbx_set_feature_lds_qry,
++		       &mbox->u.mqe.un.set_feature, LPFC_QUERY_LDS_OP);
++		break;
+ 	case LPFC_SET_ENABLE_CMF:
+-		bf_set(lpfc_mbx_set_feature_dd, &mbox->u.mqe.un.set_feature, 1);
+ 		mbox->u.mqe.un.set_feature.feature = LPFC_SET_ENABLE_CMF;
+ 		mbox->u.mqe.un.set_feature.param_len = 4;
+ 		bf_set(lpfc_mbx_set_feature_cmf,
+@@ -7767,6 +7772,62 @@ lpfc_post_rq_buffer(struct lpfc_hba *phba, struct lpfc_queue *hrq,
+ 	return 1;
+ }
+ 
++static void
++lpfc_mbx_cmpl_read_lds_params(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
++{
++	union lpfc_sli4_cfg_shdr *shdr;
++	u32 shdr_status, shdr_add_status;
++
++	shdr = (union lpfc_sli4_cfg_shdr *)
++		&pmb->u.mqe.un.sli4_config.header.cfg_shdr;
++	shdr_status = bf_get(lpfc_mbox_hdr_status, &shdr->response);
++	shdr_add_status = bf_get(lpfc_mbox_hdr_add_status, &shdr->response);
++	if (shdr_status || shdr_add_status || pmb->u.mb.mbxStatus) {
++		lpfc_printf_log(phba, KERN_INFO, LOG_LDS_EVENT | LOG_MBOX,
++				"4622 SET_FEATURE (x%x) mbox failed, "
++				"status x%x add_status x%x, mbx status x%x\n",
++				LPFC_SET_LD_SIGNAL, shdr_status,
++				shdr_add_status, pmb->u.mb.mbxStatus);
++		phba->degrade_activate_threshold = 0;
++		phba->degrade_deactivate_threshold = 0;
++		phba->fec_degrade_interval = 0;
++		goto out;
++	}
++
++	phba->degrade_activate_threshold = pmb->u.mqe.un.set_feature.word7;
++	phba->degrade_deactivate_threshold = pmb->u.mqe.un.set_feature.word8;
++	phba->fec_degrade_interval = pmb->u.mqe.un.set_feature.word10;
++
++	lpfc_printf_log(phba, KERN_INFO, LOG_LDS_EVENT,
++			"4624 Success: da x%x dd x%x interval x%x\n",
++			phba->degrade_activate_threshold,
++			phba->degrade_deactivate_threshold,
++			phba->fec_degrade_interval);
++out:
++	mempool_free(pmb, phba->mbox_mem_pool);
++}
++
++int
++lpfc_read_lds_params(struct lpfc_hba *phba)
++{
++	LPFC_MBOXQ_t *mboxq;
++	int rc;
++
++	mboxq = (LPFC_MBOXQ_t *)mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
++	if (!mboxq)
++		return -ENOMEM;
++
++	lpfc_set_features(phba, mboxq, LPFC_SET_LD_SIGNAL);
++	mboxq->vport = phba->pport;
++	mboxq->mbox_cmpl = lpfc_mbx_cmpl_read_lds_params;
++	rc = lpfc_sli_issue_mbox(phba, mboxq, MBX_NOWAIT);
++	if (rc == MBX_NOT_FINISHED) {
++		mempool_free(mboxq, phba->mbox_mem_pool);
++		return -EIO;
++	}
++	return 0;
++}
++
+ static void
+ lpfc_mbx_cmpl_cgn_set_ftrs(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmb)
+ {
