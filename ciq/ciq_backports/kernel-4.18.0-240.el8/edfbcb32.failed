@@ -1,0 +1,134 @@
+usb: add a hcd_uses_dma helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit edfbcb321faf07ca970e4191abe061deeb7d3788
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/edfbcb32.failed
+
+The USB buffer allocation code is the only place in the usb core (and in
+fact the whole kernel) that uses is_device_dma_capable, while the URB
+mapping code uses the uses_dma flag in struct usb_bus.  Switch the buffer
+allocation to use the uses_dma flag used by the rest of the USB code,
+and create a helper in hcd.h that checks this flag as well as the
+CONFIG_HAS_DMA to simplify the caller a bit.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+Link: https://lore.kernel.org/r/20190811080520.21712-3-hch@lst.de
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit edfbcb321faf07ca970e4191abe061deeb7d3788)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/core/buffer.c
+diff --cc drivers/usb/core/buffer.c
+index d2064ad7ad14,6cf22c27f2d2..000000000000
+--- a/drivers/usb/core/buffer.c
++++ b/drivers/usb/core/buffer.c
+@@@ -66,9 -66,7 +66,13 @@@ int hcd_buffer_create(struct usb_hcd *h
+  	char		name[16];
+  	int		i, size;
+  
+++<<<<<<< HEAD
+ +	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+ +	    (!is_device_dma_capable(hcd->self.sysdev) &&
+ +	     !(hcd->driver->flags & HCD_LOCAL_MEM)))
+++=======
++ 	if (hcd->localmem_pool || !hcd_uses_dma(hcd))
+++>>>>>>> edfbcb321faf (usb: add a hcd_uses_dma helper)
+  		return 0;
+  
+  	for (i = 0; i < HCD_BUFFER_POOLS; i++) {
+@@@ -129,9 -127,7 +133,13 @@@ void *hcd_buffer_alloc
+  		return gen_pool_dma_alloc(hcd->localmem_pool, size, dma);
+  
+  	/* some USB hosts just use PIO */
+++<<<<<<< HEAD
+ +	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+ +	    (!is_device_dma_capable(bus->sysdev) &&
+ +	     !(hcd->driver->flags & HCD_LOCAL_MEM))) {
+++=======
++ 	if (!hcd_uses_dma(hcd)) {
+++>>>>>>> edfbcb321faf (usb: add a hcd_uses_dma helper)
+  		*dma = ~(dma_addr_t) 0;
+  		return kmalloc(size, mem_flags);
+  	}
+@@@ -161,9 -157,7 +169,13 @@@ void hcd_buffer_free
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+ +	    (!is_device_dma_capable(bus->sysdev) &&
+ +	     !(hcd->driver->flags & HCD_LOCAL_MEM))) {
+++=======
++ 	if (!hcd_uses_dma(hcd)) {
+++>>>>>>> edfbcb321faf (usb: add a hcd_uses_dma helper)
+  		kfree(addr);
+  		return;
+  	}
+* Unmerged path drivers/usb/core/buffer.c
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index c351844f5b2c..decf84798b4f 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1415,7 +1415,7 @@ int usb_hcd_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 	if (usb_endpoint_xfer_control(&urb->ep->desc)) {
+ 		if (hcd->self.uses_pio_for_control)
+ 			return ret;
+-		if (IS_ENABLED(CONFIG_HAS_DMA) && hcd->self.uses_dma) {
++		if (hcd_uses_dma(hcd)) {
+ 			if (is_vmalloc_addr(urb->setup_packet)) {
+ 				WARN_ONCE(1, "setup packet is not dma capable\n");
+ 				return -EAGAIN;
+@@ -1449,7 +1449,7 @@ int usb_hcd_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 	dir = usb_urb_dir_in(urb) ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
+ 	if (urb->transfer_buffer_length != 0
+ 	    && !(urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
+-		if (IS_ENABLED(CONFIG_HAS_DMA) && hcd->self.uses_dma) {
++		if (hcd_uses_dma(hcd)) {
+ 			if (urb->num_sgs) {
+ 				int n;
+ 
+diff --git a/drivers/usb/dwc2/hcd.c b/drivers/usb/dwc2/hcd.c
+index ee144ff8af5b..111787a137ee 100644
+--- a/drivers/usb/dwc2/hcd.c
++++ b/drivers/usb/dwc2/hcd.c
+@@ -4608,7 +4608,7 @@ static int _dwc2_hcd_urb_enqueue(struct usb_hcd *hcd, struct urb *urb,
+ 
+ 	buf = urb->transfer_buffer;
+ 
+-	if (hcd->self.uses_dma) {
++	if (hcd_uses_dma(hcd)) {
+ 		if (!buf && (urb->transfer_dma & 3)) {
+ 			dev_err(hsotg->dev,
+ 				"%s: unaligned transfer with no transfer_buffer",
+diff --git a/include/linux/usb.h b/include/linux/usb.h
+index 83d35d993e8c..e87826e23d59 100644
+--- a/include/linux/usb.h
++++ b/include/linux/usb.h
+@@ -1457,7 +1457,7 @@ typedef void (*usb_complete_t)(struct urb *);
+  * field rather than determining a dma address themselves.
+  *
+  * Note that transfer_buffer must still be set if the controller
+- * does not support DMA (as indicated by bus.uses_dma) and when talking
++ * does not support DMA (as indicated by hcd_uses_dma()) and when talking
+  * to root hub. If you have to trasfer between highmem zone and the device
+  * on such controller, create a bounce buffer or bail out with an error.
+  * If transfer_buffer cannot be set (is in highmem) and the controller is DMA
+diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
+index 127560a4bfa0..f115904cafb6 100644
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -423,6 +423,9 @@ static inline bool hcd_periodic_completion_in_progress(struct usb_hcd *hcd,
+ 	return hcd->high_prio_bh.completing_ep == ep;
+ }
+ 
++#define hcd_uses_dma(hcd) \
++	(IS_ENABLED(CONFIG_HAS_DMA) && (hcd)->self.uses_dma)
++
+ extern int usb_hcd_link_urb_to_ep(struct usb_hcd *hcd, struct urb *urb);
+ extern int usb_hcd_check_unlink_urb(struct usb_hcd *hcd, struct urb *urb,
+ 		int status);
