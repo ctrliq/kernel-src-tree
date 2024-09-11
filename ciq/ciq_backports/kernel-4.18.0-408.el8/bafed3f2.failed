@@ -1,0 +1,601 @@
+bnxt_en: implement hw health reporter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+commit bafed3f231f7037ce881de2278c14a679ee9c937
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/bafed3f2.failed
+
+This reporter will report NVM errors which are non-fatal.
+When we receive these NVM error events, we'll report it
+through this new hw health reporter.
+
+	Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bafed3f231f7037ce881de2278c14a679ee9c937)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 7c97be1d1085,fa0df43ddc1a..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1516,6 -1543,36 +1531,39 @@@ struct bnxt_ctx_mem_info 
+  	struct bnxt_mem_init	mem_init[BNXT_CTX_MEM_INIT_MAX];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum bnxt_hw_err {
++ 	BNXT_HW_STATUS_HEALTHY		= 0x0,
++ 	BNXT_HW_STATUS_NVM_WRITE_ERR	= 0x1,
++ 	BNXT_HW_STATUS_NVM_ERASE_ERR	= 0x2,
++ 	BNXT_HW_STATUS_NVM_UNKNOWN_ERR	= 0x3,
++ };
++ 
++ struct bnxt_hw_health {
++ 	u32 nvm_err_address;
++ 	u32 nvm_write_errors;
++ 	u32 nvm_erase_errors;
++ 	u8 synd;
++ 	struct devlink_health_reporter *hw_reporter;
++ };
++ 
++ enum bnxt_health_severity {
++ 	SEVERITY_NORMAL = 0,
++ 	SEVERITY_WARNING,
++ 	SEVERITY_RECOVERABLE,
++ 	SEVERITY_FATAL,
++ };
++ 
++ enum bnxt_health_remedy {
++ 	REMEDY_DEVLINK_RECOVER,
++ 	REMEDY_POWER_CYCLE_DEVICE,
++ 	REMEDY_POWER_CYCLE_HOST,
++ 	REMEDY_FW_UPDATE,
++ 	REMEDY_HW_REPLACE,
++ };
++ 
+++>>>>>>> bafed3f231f7 (bnxt_en: implement hw health reporter)
+  struct bnxt_fw_health {
+  	u32 flags;
+  	u32 polling_dsecs;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 449597f7c74c,a802bbda1c27..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -83,205 -236,298 +83,294 @@@ static int bnxt_fw_reporter_diagnose(st
+  
+  static const struct devlink_health_reporter_ops bnxt_dl_fw_reporter_ops = {
+  	.name = "fw",
+ -	.diagnose = bnxt_fw_diagnose,
+ -	.dump = bnxt_fw_dump,
+ -	.recover = bnxt_fw_recover,
+ +	.diagnose = bnxt_fw_reporter_diagnose,
+  };
+  
+++<<<<<<< HEAD
+ +static int bnxt_fw_reset_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+++=======
++ static int bnxt_hw_recover(struct devlink_health_reporter *reporter,
++ 			   void *priv_ctx,
++ 			   struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	struct bnxt_hw_health *hw_health = &bp->hw_health;
++ 
++ 	hw_health->synd = BNXT_HW_STATUS_HEALTHY;
++ 	return 0;
++ }
++ 
++ static const char *hw_err_str(u8 synd)
++ {
++ 	switch (synd) {
++ 	case BNXT_HW_STATUS_HEALTHY:
++ 		return "healthy";
++ 	case BNXT_HW_STATUS_NVM_WRITE_ERR:
++ 		return "nvm write error";
++ 	case BNXT_HW_STATUS_NVM_ERASE_ERR:
++ 		return "nvm erase error";
++ 	case BNXT_HW_STATUS_NVM_UNKNOWN_ERR:
++ 		return "unrecognized nvm error";
++ 	default:
++ 		return "unknown hw error";
++ 	}
++ }
++ 
++ static int bnxt_hw_diagnose(struct devlink_health_reporter *reporter,
++ 			    struct devlink_fmsg *fmsg,
++ 			    struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	struct bnxt_hw_health *h = &bp->hw_health;
++ 	int rc;
++ 
++ 	rc = devlink_fmsg_string_pair_put(fmsg, "Status", hw_err_str(h->synd));
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_write_errors", h->nvm_write_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_erase_errors", h->nvm_erase_errors);
++ 	if (rc)
++ 		return rc;
++ 	return 0;
++ }
++ 
++ void bnxt_devlink_health_hw_report(struct bnxt *bp)
++ {
++ 	struct bnxt_hw_health *hw_health = &bp->hw_health;
++ 
++ 	netdev_warn(bp->dev, "%s reported at address 0x%x\n", hw_err_str(hw_health->synd),
++ 		    hw_health->nvm_err_address);
++ 
++ 	devlink_health_report(hw_health->hw_reporter, hw_err_str(hw_health->synd), NULL);
++ }
++ 
++ static const struct devlink_health_reporter_ops bnxt_dl_hw_reporter_ops = {
++ 	.name = "hw",
++ 	.diagnose = bnxt_hw_diagnose,
++ 	.recover = bnxt_hw_recover,
++ };
++ 
++ static struct devlink_health_reporter *
++ __bnxt_dl_reporter_create(struct bnxt *bp,
++ 			  const struct devlink_health_reporter_ops *ops)
+++>>>>>>> bafed3f231f7 (bnxt_en: implement hw health reporter)
+  {
+ -	struct devlink_health_reporter *reporter;
+ +	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+  
+ -	reporter = devlink_health_reporter_create(bp->dl, ops, 0, bp);
+ -	if (IS_ERR(reporter)) {
+ -		netdev_warn(bp->dev, "Failed to create %s health reporter, rc = %ld\n",
+ -			    ops->name, PTR_ERR(reporter));
+ -		return NULL;
+ -	}
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+ +
+ +	bnxt_fw_reset(bp);
+ +	return -EINPROGRESS;
+ +}
+ +
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_reset_reporter_ops = {
+ +	.name = "fw_reset",
+ +	.recover = bnxt_fw_reset_recover,
+ +};
+ +
+ +static int bnxt_fw_fatal_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+ +{
+ +	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+ +	struct bnxt_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
+ +	unsigned long event;
+ +
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+  
+ -	return reporter;
+ +	bp->fw_health->fatal = true;
+ +	event = fw_reporter_ctx->sp_event;
+ +	if (event == BNXT_FW_RESET_NOTIFY_SP_EVENT)
+ +		bnxt_fw_reset(bp);
+ +	else if (event == BNXT_FW_EXCEPTION_SP_EVENT)
+ +		bnxt_fw_exception(bp);
+ +
+ +	return -EINPROGRESS;
+  }
+  
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_fatal_reporter_ops = {
+ +	.name = "fw_fatal",
+ +	.recover = bnxt_fw_fatal_recover,
+ +};
+ +
+  void bnxt_dl_fw_reporters_create(struct bnxt *bp)
+  {
+++<<<<<<< HEAD
+ +	struct bnxt_fw_health *health = bp->fw_health;
+++=======
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	struct bnxt_hw_health *hw_health = &bp->hw_health;
++ 
++ 	if (!hw_health->hw_reporter)
++ 		hw_health->hw_reporter = __bnxt_dl_reporter_create(bp, &bnxt_dl_hw_reporter_ops);
+++>>>>>>> bafed3f231f7 (bnxt_en: implement hw health reporter)
+  
+ -	if (fw_health && !fw_health->fw_reporter)
+ -		fw_health->fw_reporter = __bnxt_dl_reporter_create(bp, &bnxt_dl_fw_reporter_ops);
+ -}
+ +	if (!health)
+ +		return;
+  
+++<<<<<<< HEAD
+ +	if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET) || health->fw_reset_reporter)
+ +		goto err_recovery;
+++=======
++ void bnxt_dl_fw_reporters_destroy(struct bnxt *bp)
++ {
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	struct bnxt_hw_health *hw_health = &bp->hw_health;
++ 
++ 	if (hw_health->hw_reporter) {
++ 		devlink_health_reporter_destroy(hw_health->hw_reporter);
++ 		hw_health->hw_reporter = NULL;
++ 	}
+++>>>>>>> bafed3f231f7 (bnxt_en: implement hw health reporter)
+  
+ -	if (fw_health && fw_health->fw_reporter) {
+ -		devlink_health_reporter_destroy(fw_health->fw_reporter);
+ -		fw_health->fw_reporter = NULL;
+ +	health->fw_reset_reporter =
+ +		devlink_health_reporter_create(bp->dl,
+ +					       &bnxt_dl_fw_reset_reporter_ops,
+ +					       0, bp);
+ +	if (IS_ERR(health->fw_reset_reporter)) {
+ +		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
+ +			    PTR_ERR(health->fw_reset_reporter));
+ +		health->fw_reset_reporter = NULL;
+ +		bp->fw_cap &= ~BNXT_FW_CAP_HOT_RESET;
+  	}
+ -}
+ -
+ -void bnxt_devlink_health_fw_report(struct bnxt *bp)
+ -{
+ -	struct bnxt_fw_health *fw_health = bp->fw_health;
+ -	int rc;
+  
+ -	if (!fw_health)
+ +err_recovery:
+ +	if (!(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
+  		return;
+  
+ -	if (!fw_health->fw_reporter) {
+ -		__bnxt_fw_recover(bp);
+ -		return;
+ +	if (!health->fw_reporter) {
+ +		health->fw_reporter =
+ +			devlink_health_reporter_create(bp->dl,
+ +						       &bnxt_dl_fw_reporter_ops,
+ +						       0, bp);
+ +		if (IS_ERR(health->fw_reporter)) {
+ +			netdev_warn(bp->dev, "Failed to create FW health reporter, rc = %ld\n",
+ +				    PTR_ERR(health->fw_reporter));
+ +			health->fw_reporter = NULL;
+ +			bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
+ +			return;
+ +		}
+  	}
+  
+ -	mutex_lock(&fw_health->lock);
+ -	fw_health->severity = SEVERITY_RECOVERABLE;
+ -	fw_health->remedy = REMEDY_DEVLINK_RECOVER;
+ -	mutex_unlock(&fw_health->lock);
+ -	rc = devlink_health_report(fw_health->fw_reporter, "FW error reported",
+ -				   fw_health);
+ -	if (rc == -ECANCELED)
+ -		__bnxt_fw_recover(bp);
+ -}
+ -
+ -void bnxt_dl_health_fw_status_update(struct bnxt *bp, bool healthy)
+ -{
+ -	struct bnxt_fw_health *fw_health = bp->fw_health;
+ -	u8 state;
+ +	if (health->fw_fatal_reporter)
+ +		return;
+  
+ -	mutex_lock(&fw_health->lock);
+ -	if (healthy) {
+ -		fw_health->severity = SEVERITY_NORMAL;
+ -		state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;
+ -	} else {
+ -		fw_health->severity = SEVERITY_FATAL;
+ -		fw_health->remedy = REMEDY_POWER_CYCLE_DEVICE;
+ -		state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
+ +	health->fw_fatal_reporter =
+ +		devlink_health_reporter_create(bp->dl,
+ +					       &bnxt_dl_fw_fatal_reporter_ops,
+ +					       0, bp);
+ +	if (IS_ERR(health->fw_fatal_reporter)) {
+ +		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
+ +			    PTR_ERR(health->fw_fatal_reporter));
+ +		health->fw_fatal_reporter = NULL;
+ +		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
+  	}
+ -	mutex_unlock(&fw_health->lock);
+ -	devlink_health_reporter_state_update(fw_health->fw_reporter, state);
+  }
+  
+ -void bnxt_dl_health_fw_recovery_done(struct bnxt *bp)
+ +void bnxt_dl_fw_reporters_destroy(struct bnxt *bp, bool all)
+  {
+ -	struct bnxt_dl *dl = devlink_priv(bp->dl);
+ +	struct bnxt_fw_health *health = bp->fw_health;
+  
+ -	devlink_health_reporter_recovery_done(bp->fw_health->fw_reporter);
+ -	bnxt_hwrm_remote_dev_reset_set(bp, dl->remote_reset);
+ -}
+ +	if (!health)
+ +		return;
+  
+ -static int bnxt_dl_info_get(struct devlink *dl, struct devlink_info_req *req,
+ -			    struct netlink_ext_ack *extack);
+ +	if ((all || !(bp->fw_cap & BNXT_FW_CAP_HOT_RESET)) &&
+ +	    health->fw_reset_reporter) {
+ +		devlink_health_reporter_destroy(health->fw_reset_reporter);
+ +		health->fw_reset_reporter = NULL;
+ +	}
+  
+ -static void
+ -bnxt_dl_livepatch_report_err(struct bnxt *bp, struct netlink_ext_ack *extack,
+ -			     struct hwrm_fw_livepatch_output *resp)
+ -{
+ -	int err = ((struct hwrm_err_output *)resp)->cmd_err;
+ +	if ((bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY) && !all)
+ +		return;
+  
+ -	switch (err) {
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_OPCODE:
+ -		netdev_err(bp->dev, "Illegal live patch opcode");
+ -		NL_SET_ERR_MSG_MOD(extack, "Invalid opcode");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_SUPPORTED:
+ -		NL_SET_ERR_MSG_MOD(extack, "Live patch operation not supported");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_INSTALLED:
+ -		NL_SET_ERR_MSG_MOD(extack, "Live patch not found");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_PATCHED:
+ -		NL_SET_ERR_MSG_MOD(extack,
+ -				   "Live patch deactivation failed. Firmware not patched.");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_AUTH_FAIL:
+ -		NL_SET_ERR_MSG_MOD(extack, "Live patch not authenticated");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_HEADER:
+ -		NL_SET_ERR_MSG_MOD(extack, "Incompatible live patch");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_SIZE:
+ -		NL_SET_ERR_MSG_MOD(extack, "Live patch has invalid size");
+ -		break;
+ -	case FW_LIVEPATCH_CMD_ERR_CODE_ALREADY_PATCHED:
+ -		NL_SET_ERR_MSG_MOD(extack, "Live patch already applied");
+ -		break;
+ -	default:
+ -		netdev_err(bp->dev, "Unexpected live patch error: %d\n", err);
+ -		NL_SET_ERR_MSG_MOD(extack, "Failed to activate live patch");
+ -		break;
+ +	if (health->fw_reporter) {
+ +		devlink_health_reporter_destroy(health->fw_reporter);
+ +		health->fw_reporter = NULL;
+  	}
+ -}
+  
+ -/* Live patch status in NVM */
+ -#define BNXT_LIVEPATCH_NOT_INSTALLED	0
+ -#define BNXT_LIVEPATCH_INSTALLED	FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_INSTALL
+ -#define BNXT_LIVEPATCH_REMOVED		FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_ACTIVE
+ -#define BNXT_LIVEPATCH_MASK		(FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_INSTALL | \
+ -					 FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_ACTIVE)
+ -#define BNXT_LIVEPATCH_ACTIVATED	BNXT_LIVEPATCH_MASK
+ -
+ -#define BNXT_LIVEPATCH_STATE(flags)	((flags) & BNXT_LIVEPATCH_MASK)
+ +	if (health->fw_fatal_reporter) {
+ +		devlink_health_reporter_destroy(health->fw_fatal_reporter);
+ +		health->fw_fatal_reporter = NULL;
+ +	}
+ +}
+  
+ -static int
+ -bnxt_dl_livepatch_activate(struct bnxt *bp, struct netlink_ext_ack *extack)
+ +void bnxt_devlink_health_report(struct bnxt *bp, unsigned long event)
+  {
+ -	struct hwrm_fw_livepatch_query_output *query_resp;
+ -	struct hwrm_fw_livepatch_query_input *query_req;
+ -	struct hwrm_fw_livepatch_output *patch_resp;
+ -	struct hwrm_fw_livepatch_input *patch_req;
+ -	u16 flags, live_patch_state;
+ -	bool activated = false;
+ -	u32 installed = 0;
+ -	u8 target;
+ -	int rc;
+ +	struct bnxt_fw_health *fw_health = bp->fw_health;
+ +	struct bnxt_fw_reporter_ctx fw_reporter_ctx;
+ +
+ +	fw_reporter_ctx.sp_event = event;
+ +	switch (event) {
+ +	case BNXT_FW_RESET_NOTIFY_SP_EVENT:
+ +		if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state)) {
+ +			if (!fw_health->fw_fatal_reporter)
+ +				return;
+ +
+ +			devlink_health_report(fw_health->fw_fatal_reporter,
+ +					      "FW fatal async event received",
+ +					      &fw_reporter_ctx);
+ +			return;
+ +		}
+ +		if (!fw_health->fw_reset_reporter)
+ +			return;
+  
+ -	if (~bp->fw_cap & BNXT_FW_CAP_LIVEPATCH) {
+ -		NL_SET_ERR_MSG_MOD(extack, "Device does not support live patch");
+ -		return -EOPNOTSUPP;
+ -	}
+ +		devlink_health_report(fw_health->fw_reset_reporter,
+ +				      "FW non-fatal reset event received",
+ +				      &fw_reporter_ctx);
+ +		return;
+  
+ -	rc = hwrm_req_init(bp, query_req, HWRM_FW_LIVEPATCH_QUERY);
+ -	if (rc)
+ -		return rc;
+ -	query_resp = hwrm_req_hold(bp, query_req);
+ +	case BNXT_FW_EXCEPTION_SP_EVENT:
+ +		if (!fw_health->fw_fatal_reporter)
+ +			return;
+  
+ -	rc = hwrm_req_init(bp, patch_req, HWRM_FW_LIVEPATCH);
+ -	if (rc) {
+ -		hwrm_req_drop(bp, query_req);
+ -		return rc;
+ +		devlink_health_report(fw_health->fw_fatal_reporter,
+ +				      "FW fatal error reported",
+ +				      &fw_reporter_ctx);
+ +		return;
+  	}
+ -	patch_req->loadtype = FW_LIVEPATCH_REQ_LOADTYPE_NVM_INSTALL;
+ -	patch_resp = hwrm_req_hold(bp, patch_req);
+ -
+ -	for (target = 1; target <= FW_LIVEPATCH_REQ_FW_TARGET_LAST; target++) {
+ -		query_req->fw_target = target;
+ -		rc = hwrm_req_send(bp, query_req);
+ -		if (rc) {
+ -			NL_SET_ERR_MSG_MOD(extack, "Failed to query packages");
+ -			break;
+ -		}
+ +}
+  
+ -		flags = le16_to_cpu(query_resp->status_flags);
+ -		live_patch_state = BNXT_LIVEPATCH_STATE(flags);
+ +void bnxt_dl_health_status_update(struct bnxt *bp, bool healthy)
+ +{
+ +	struct bnxt_fw_health *health = bp->fw_health;
+ +	u8 state;
+  
+ -		if (live_patch_state == BNXT_LIVEPATCH_NOT_INSTALLED)
+ -			continue;
+ +	if (healthy)
+ +		state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;
+ +	else
+ +		state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
+  
+ -		if (live_patch_state == BNXT_LIVEPATCH_ACTIVATED) {
+ -			activated = true;
+ -			continue;
+ -		}
+ +	if (health->fatal)
+ +		devlink_health_reporter_state_update(health->fw_fatal_reporter,
+ +						     state);
+ +	else
+ +		devlink_health_reporter_state_update(health->fw_reset_reporter,
+ +						     state);
+  
+ -		if (live_patch_state == BNXT_LIVEPATCH_INSTALLED)
+ -			patch_req->opcode = FW_LIVEPATCH_REQ_OPCODE_ACTIVATE;
+ -		else if (live_patch_state == BNXT_LIVEPATCH_REMOVED)
+ -			patch_req->opcode = FW_LIVEPATCH_REQ_OPCODE_DEACTIVATE;
+ +	health->fatal = false;
+ +}
+  
+ -		patch_req->fw_target = target;
+ -		rc = hwrm_req_send(bp, patch_req);
+ -		if (rc) {
+ -			bnxt_dl_livepatch_report_err(bp, extack, patch_resp);
+ -			break;
+ -		}
+ -		installed++;
+ -	}
+ +void bnxt_dl_health_recovery_done(struct bnxt *bp)
+ +{
+ +	struct bnxt_fw_health *hlth = bp->fw_health;
+  
+ -	if (!rc && !installed) {
+ -		if (activated) {
+ -			NL_SET_ERR_MSG_MOD(extack, "Live patch already activated");
+ -			rc = -EEXIST;
+ -		} else {
+ -			NL_SET_ERR_MSG_MOD(extack, "No live patches found");
+ -			rc = -ENOENT;
+ -		}
+ -	}
+ -	hwrm_req_drop(bp, query_req);
+ -	hwrm_req_drop(bp, patch_req);
+ -	return rc;
+ +	if (hlth->fatal)
+ +		devlink_health_reporter_recovery_done(hlth->fw_fatal_reporter);
+ +	else
+ +		devlink_health_reporter_recovery_done(hlth->fw_reset_reporter);
+  }
+  
+ +static int bnxt_dl_info_get(struct devlink *dl, struct devlink_info_req *req,
+ +			    struct netlink_ext_ack *extack);
+ +
+  static int bnxt_dl_reload_down(struct devlink *dl, bool netns_change,
+  			       enum devlink_reload_action action,
+  			       enum devlink_reload_limit limit,
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+index 406dc655a5fc,056962e4b177..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
+@@@ -53,11 -71,12 +53,18 @@@ enum bnxt_dl_version_type 
+  	BNXT_VERSION_STORED,
+  };
+  
+++<<<<<<< HEAD
+ +void bnxt_devlink_health_report(struct bnxt *bp, unsigned long event);
+ +void bnxt_dl_health_status_update(struct bnxt *bp, bool healthy);
+ +void bnxt_dl_health_recovery_done(struct bnxt *bp);
+++=======
++ void bnxt_devlink_health_fw_report(struct bnxt *bp);
++ void bnxt_dl_health_fw_status_update(struct bnxt *bp, bool healthy);
++ void bnxt_dl_health_fw_recovery_done(struct bnxt *bp);
++ void bnxt_devlink_health_hw_report(struct bnxt *bp);
+++>>>>>>> bafed3f231f7 (bnxt_en: implement hw health reporter)
+  void bnxt_dl_fw_reporters_create(struct bnxt *bp);
+ -void bnxt_dl_fw_reporters_destroy(struct bnxt *bp);
+ +void bnxt_dl_fw_reporters_destroy(struct bnxt *bp, bool all);
+  int bnxt_dl_register(struct bnxt *bp);
+  void bnxt_dl_unregister(struct bnxt *bp);
+  
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt.c b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 48a415455c5e..d5f63aa61c73 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@ -2061,6 +2061,22 @@ static void bnxt_event_error_report(struct bnxt *bp, u32 data1, u32 data2)
+ 	case ASYNC_EVENT_CMPL_ERROR_REPORT_BASE_EVENT_DATA1_ERROR_TYPE_DOORBELL_DROP_THRESHOLD:
+ 		netdev_warn(bp->dev, "One or more MMIO doorbells dropped by the device!\n");
+ 		break;
++	case ASYNC_EVENT_CMPL_ERROR_REPORT_BASE_EVENT_DATA1_ERROR_TYPE_NVM: {
++		struct bnxt_hw_health *hw_health = &bp->hw_health;
++
++		hw_health->nvm_err_address = EVENT_DATA2_NVM_ERR_ADDR(data2);
++		if (EVENT_DATA1_NVM_ERR_TYPE_WRITE(data1)) {
++			hw_health->synd = BNXT_HW_STATUS_NVM_WRITE_ERR;
++			hw_health->nvm_write_errors++;
++		} else if (EVENT_DATA1_NVM_ERR_TYPE_ERASE(data1)) {
++			hw_health->synd = BNXT_HW_STATUS_NVM_ERASE_ERR;
++			hw_health->nvm_erase_errors++;
++		} else {
++			hw_health->synd = BNXT_HW_STATUS_NVM_UNKNOWN_ERR;
++		}
++		set_bit(BNXT_FW_NVM_ERR_SP_EVENT, &bp->sp_event);
++		break;
++	}
+ 	default:
+ 		netdev_err(bp->dev, "FW reported unknown error type %u\n",
+ 			   err_type);
+@@ -11834,6 +11850,9 @@ static void bnxt_sp_task(struct work_struct *work)
+ 	if (test_and_clear_bit(BNXT_FW_ECHO_REQUEST_SP_EVENT, &bp->sp_event))
+ 		bnxt_fw_echo_reply(bp);
+ 
++	if (test_and_clear_bit(BNXT_FW_NVM_ERR_SP_EVENT, &bp->sp_event))
++		bnxt_devlink_health_hw_report(bp);
++
+ 	/* These functions below will clear BNXT_STATE_IN_SP_TASK.  They
+ 	 * must be the last functions to be called before exiting.
+ 	 */
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.h
