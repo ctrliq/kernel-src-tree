@@ -1,0 +1,199 @@
+powerpc/mm/iommu: allow large IOMMU page size only for hugetlb backing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [powerpc] mm/iommu: allow large IOMMU page size only for hugetlb backing (David Gibson) [1629531]
+Rebuild_FUZZ: 93.94%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 7f18825174203526a47c127c12a50f897ee0b511
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/7f188251.failed
+
+THP pages can get split during different code paths.  An incremented
+reference count does imply we will not split the compound page.  But the
+pmd entry can be converted to level 4 pte entries.  Keep the code
+simpler by allowing large IOMMU page size only if the guest ram is
+backed by hugetlb pages.
+
+Link: http://lkml.kernel.org/r/20190114095438.32470-6-aneesh.kumar@linux.ibm.com
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: David Gibson <david@gibson.dropbear.id.au>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7f18825174203526a47c127c12a50f897ee0b511)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mmu_context_iommu.c
+diff --cc arch/powerpc/mm/mmu_context_iommu.c
+index ce8cc69f7901,e7a9c4f6bfca..000000000000
+--- a/arch/powerpc/mm/mmu_context_iommu.c
++++ b/arch/powerpc/mm/mmu_context_iommu.c
+@@@ -78,63 -91,13 +78,66 @@@ bool mm_iommu_preregistered(struct mm_s
+  }
+  EXPORT_SYMBOL_GPL(mm_iommu_preregistered);
+  
+ -static long mm_iommu_do_alloc(struct mm_struct *mm, unsigned long ua,
+ -			      unsigned long entries, unsigned long dev_hpa,
+ -			      struct mm_iommu_table_group_mem_t **pmem)
+ +/*
+ + * Taken from alloc_migrate_target with changes to remove CMA allocations
+ + */
+ +struct page *new_iommu_non_cma_page(struct page *page, unsigned long private)
+ +{
+ +	gfp_t gfp_mask = GFP_USER;
+ +	struct page *new_page;
+ +
+ +	if (PageCompound(page))
+ +		return NULL;
+ +
+ +	if (PageHighMem(page))
+ +		gfp_mask |= __GFP_HIGHMEM;
+ +
+ +	/*
+ +	 * We don't want the allocation to force an OOM if possibe
+ +	 */
+ +	new_page = alloc_page(gfp_mask | __GFP_NORETRY | __GFP_NOWARN);
+ +	return new_page;
+ +}
+ +
+ +static int mm_iommu_move_page_from_cma(struct page *page)
+ +{
+ +	int ret = 0;
+ +	LIST_HEAD(cma_migrate_pages);
+ +
+ +	/* Ignore huge pages for now */
+ +	if (PageCompound(page))
+ +		return -EBUSY;
+ +
+ +	lru_add_drain();
+ +	ret = isolate_lru_page(page);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_add(&page->lru, &cma_migrate_pages);
+ +	put_page(page); /* Drop the gup reference */
+ +
+ +	ret = migrate_pages(&cma_migrate_pages, new_iommu_non_cma_page,
+ +				NULL, 0, MIGRATE_SYNC, MR_CONTIG_RANGE);
+ +	if (ret) {
+ +		if (!list_empty(&cma_migrate_pages))
+ +			putback_movable_pages(&cma_migrate_pages);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ +		struct mm_iommu_table_group_mem_t **pmem)
+  {
+  	struct mm_iommu_table_group_mem_t *mem;
+ -	long i, ret, locked_entries = 0;
+ +	long i, j, ret = 0, locked_entries = 0;
+  	unsigned int pageshift;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	unsigned long cur_ua;
+ +	struct page *page = NULL;
+++=======
+++>>>>>>> 7f1882517420 (powerpc/mm/iommu: allow large IOMMU page size only for hugetlb backing)
+  
+  	mutex_lock(&mem_list_mutex);
+  
+@@@ -175,58 -147,38 +178,58 @@@
+  		goto unlock_exit;
+  	}
+  
+ -	down_read(&mm->mmap_sem);
+ -	ret = get_user_pages_longterm(ua, entries, FOLL_WRITE, mem->hpages, NULL);
+ -	up_read(&mm->mmap_sem);
+ -	if (ret != entries) {
+ -		/* free the reference taken */
+ -		for (i = 0; i < ret; i++)
+ -			put_page(mem->hpages[i]);
+ -
+ -		vfree(mem->hpas);
+ -		kfree(mem);
+ -		ret = -EFAULT;
+ -		goto unlock_exit;
+ -	}
+ -
+ -	pageshift = PAGE_SHIFT;
+  	for (i = 0; i < entries; ++i) {
+++<<<<<<< HEAD
+ +		cur_ua = ua + (i << PAGE_SHIFT);
+ +		if (1 != get_user_pages_fast(cur_ua,
+ +					1/* pages */, 1/* iswrite */, &page)) {
+ +			ret = -EFAULT;
+ +			for (j = 0; j < i; ++j)
+ +				put_page(pfn_to_page(mem->hpas[j] >>
+ +						PAGE_SHIFT));
+ +			vfree(mem->hpas);
+ +			kfree(mem);
+ +			goto unlock_exit;
+ +		}
+ +		/*
+ +		 * If we get a page from the CMA zone, since we are going to
+ +		 * be pinning these entries, we might as well move them out
+ +		 * of the CMA zone if possible. NOTE: faulting in + migration
+ +		 * can be expensive. Batching can be considered later
+ +		 */
+ +		if (is_migrate_cma_page(page)) {
+ +			if (mm_iommu_move_page_from_cma(page))
+ +				goto populate;
+ +			if (1 != get_user_pages_fast(cur_ua,
+ +						1/* pages */, 1/* iswrite */,
+ +						&page)) {
+ +				ret = -EFAULT;
+ +				for (j = 0; j < i; ++j)
+ +					put_page(pfn_to_page(mem->hpas[j] >>
+ +								PAGE_SHIFT));
+ +				vfree(mem->hpas);
+ +				kfree(mem);
+ +				goto unlock_exit;
+ +			}
+ +		}
+ +populate:
+ +		pageshift = PAGE_SHIFT;
+ +		if (mem->pageshift > PAGE_SHIFT && PageCompound(page)) {
+ +			pte_t *pte;
+++=======
++ 		struct page *page = mem->hpages[i];
++ 
++ 		/*
++ 		 * Allow to use larger than 64k IOMMU pages. Only do that
++ 		 * if we are backed by hugetlb.
++ 		 */
++ 		if ((mem->pageshift > PAGE_SHIFT) && PageHuge(page)) {
+++>>>>>>> 7f1882517420 (powerpc/mm/iommu: allow large IOMMU page size only for hugetlb backing)
+  			struct page *head = compound_head(page);
+- 			unsigned int compshift = compound_order(head);
+- 			unsigned int pteshift;
+- 
+- 			local_irq_save(flags); /* disables as well */
+- 			pte = find_linux_pte(mm->pgd, cur_ua, NULL, &pteshift);
+- 
+- 			/* Double check it is still the same pinned page */
+- 			if (pte && pte_page(*pte) == head &&
+- 			    pteshift == compshift + PAGE_SHIFT)
+- 				pageshift = max_t(unsigned int, pteshift,
+- 						PAGE_SHIFT);
+- 			local_irq_restore(flags);
++ 
++ 			pageshift = compound_order(head) + PAGE_SHIFT;
+  		}
+  		mem->pageshift = min(mem->pageshift, pageshift);
+ -		/*
+ -		 * We don't need struct page reference any more, switch
+ -		 * to physical address.
+ -		 */
+  		mem->hpas[i] = page_to_pfn(page) << PAGE_SHIFT;
+  	}
+  
+* Unmerged path arch/powerpc/mm/mmu_context_iommu.c
