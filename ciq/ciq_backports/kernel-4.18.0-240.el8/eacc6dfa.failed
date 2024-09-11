@@ -1,0 +1,85 @@
+io_uring: remove punt of short reads to async context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit eacc6dfaea963ef61540abb31ad7829be5eff284
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/eacc6dfa.failed
+
+We currently punt any short read on a regular file to async context,
+but this fails if the short read is due to running into EOF. This is
+especially problematic since we only do the single prep for commands
+now, as we don't reset kiocb->ki_pos. This can result in a 4k read on
+a 1k file returning zero, as we detect the short read and then retry
+from async context. At the time of retry, the position is now 1k, and
+we end up reading nothing, and hence return 0.
+
+Instead of trying to patch around the fact that short reads can be
+legitimate and won't succeed in case of retry, remove the logic to punt
+a short read to async context. Simply return it.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit eacc6dfaea963ef61540abb31ad7829be5eff284)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index ab99aea677bc,38b54051facd..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1361,35 -1858,26 +1361,38 @@@ static int io_read(struct io_kiocb *req
+  	if (!ret) {
+  		ssize_t ret2;
+  
+ -		if (req->file->f_op->read_iter)
+ -			ret2 = call_read_iter(req->file, kiocb, &iter);
+ +		if (file->f_op->read_iter)
+ +			ret2 = call_read_iter(file, kiocb, &iter);
+  		else
+ -			ret2 = loop_rw_iter(READ, req->file, kiocb, &iter);
+ +			ret2 = loop_rw_iter(READ, file, kiocb, &iter);
+  
+++<<<<<<< HEAD
+ +		/*
+ +		 * In case of a short read, punt to async. This can happen
+ +		 * if we have data partially cached. Alternatively we can
+ +		 * return the short read, in which case the application will
+ +		 * need to issue another SQE and wait for it. That SQE will
+ +		 * need async punt anyway, so it's more efficient to do it
+ +		 * here.
+ +		 */
+ +		if (force_nonblock && ret2 > 0 && ret2 < read_size)
+ +			ret2 = -EAGAIN;
+++=======
+++>>>>>>> eacc6dfaea96 (io_uring: remove punt of short reads to async context)
+  		/* Catch -EAGAIN return for forced non-blocking submission */
+  		if (!force_nonblock || ret2 != -EAGAIN) {
+ -			kiocb_done(kiocb, ret2, nxt, req->in_async);
+ +			io_rw_done(kiocb, ret2);
+  		} else {
+ -copy_iov:
+ -			ret = io_setup_async_rw(req, io_size, iovec,
+ -						inline_vecs, &iter);
+ -			if (ret)
+ -				goto out_free;
+ -			return -EAGAIN;
+ +			/*
+ +			 * If ->needs_lock is true, we're already in async
+ +			 * context.
+ +			 */
+ +			if (!s->needs_lock)
+ +				io_async_list_note(READ, req, iov_count);
+ +			ret = -EAGAIN;
+  		}
+  	}
+ -out_free:
+ -	if (!io_wq_current_is_worker())
+ -		kfree(iovec);
+ +	kfree(iovec);
+  	return ret;
+  }
+  
+* Unmerged path fs/io_uring.c
