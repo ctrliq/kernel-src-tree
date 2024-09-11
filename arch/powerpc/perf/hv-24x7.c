@@ -450,6 +450,12 @@ static ssize_t device_show_string(struct device *dev,
 	return sprintf(buf, "%s\n", (char *)d->var);
 }
 
+static ssize_t cpumask_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return cpumap_print_to_pagebuf(true, buf, &hv_24x7_cpumask);
+}
+
 static ssize_t sockets_show(struct device *dev,
 			    struct device_attribute *attr, char *buf)
 {
@@ -1117,6 +1123,7 @@ static DEVICE_ATTR_RO(domains);
 static DEVICE_ATTR_RO(sockets);
 static DEVICE_ATTR_RO(chipspersocket);
 static DEVICE_ATTR_RO(coresperchip);
+static DEVICE_ATTR_RO(cpumask);
 
 static struct bin_attribute *if_bin_attrs[] = {
 	&bin_attr_catalog,
@@ -1130,6 +1137,7 @@ static struct attribute *if_attrs[] = {
 	&dev_attr_sockets.attr,
 	&dev_attr_chipspersocket.attr,
 	&dev_attr_coresperchip.attr,
+	&dev_attr_cpumask.attr,
 	NULL,
 };
 
