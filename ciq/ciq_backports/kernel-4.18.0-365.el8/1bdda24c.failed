@@ -1,0 +1,147 @@
+signal: Add an optional check for altstack size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 1bdda24c4af64cd2d65dec5192ab624c5fee7ca0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/1bdda24c.failed
+
+New x86 FPU features will be very large, requiring ~10k of stack in
+signal handlers.  These new features require a new approach called
+"dynamic features".
+
+The kernel currently tries to ensure that altstacks are reasonably
+sized. Right now, on x86, sys_sigaltstack() requires a size of >=2k.
+However, that 2k is a constant. Simply raising that 2k requirement
+to >10k for the new features would break existing apps which have a
+compiled-in size of 2k.
+
+Instead of universally enforcing a larger stack, prohibit a process from
+using dynamic features without properly-sized altstacks. This must be
+enforced in two places:
+
+ * A dynamic feature can not be enabled without an large-enough altstack
+   for each process thread.
+ * Once a dynamic feature is enabled, any request to install a too-small
+   altstack will be rejected
+
+The dynamic feature enabling code must examine each thread in a
+process to ensure that the altstacks are large enough. Add a new lock
+(sigaltstack_lock()) to ensure that threads can not race and change
+their altstack after being examined.
+
+Add the infrastructure in form of a config option and provide empty
+stubs for architectures which do not need dynamic altstack size checks.
+
+This implementation will be fleshed out for x86 in a future patch called
+
+  x86/arch_prctl: Add controls for dynamic XSTATE components
+
+  [dhansen: commit message. ]
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Chang S. Bae <chang.seok.bae@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021225527.10184-2-chang.seok.bae@intel.com
+(cherry picked from commit 1bdda24c4af64cd2d65dec5192ab624c5fee7ca0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/signal.c
+diff --cc kernel/signal.c
+index 1bf5aa228f8c,9278f5291ed6..000000000000
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@@ -3904,10 -4151,29 +3904,28 @@@ int do_sigaction(int sig, struct k_siga
+  	return 0;
+  }
+  
++ #ifdef CONFIG_DYNAMIC_SIGFRAME
++ static inline void sigaltstack_lock(void)
++ 	__acquires(&current->sighand->siglock)
++ {
++ 	spin_lock_irq(&current->sighand->siglock);
++ }
++ 
++ static inline void sigaltstack_unlock(void)
++ 	__releases(&current->sighand->siglock)
++ {
++ 	spin_unlock_irq(&current->sighand->siglock);
++ }
++ #else
++ static inline void sigaltstack_lock(void) { }
++ static inline void sigaltstack_unlock(void) { }
++ #endif
++ 
+  static int
+ -do_sigaltstack (const stack_t *ss, stack_t *oss, unsigned long sp,
+ -		size_t min_ss_size)
+ +do_sigaltstack (const stack_t *ss, stack_t *oss, unsigned long sp)
+  {
+  	struct task_struct *t = current;
++ 	int ret = 0;
+  
+  	if (oss) {
+  		memset(oss, 0, sizeof(stack_t));
+@@@ -3935,15 -4202,19 +3954,24 @@@
+  			ss_size = 0;
+  			ss_sp = NULL;
+  		} else {
+++<<<<<<< HEAD
+ +			if (unlikely(ss_size < MINSIGSTKSZ))
+ +				return -ENOMEM;
+++=======
++ 			if (unlikely(ss_size < min_ss_size))
++ 				ret = -ENOMEM;
++ 			if (!sigaltstack_size_valid(ss_size))
++ 				ret = -ENOMEM;
+++>>>>>>> 1bdda24c4af6 (signal: Add an optional check for altstack size)
+  		}
+- 
+- 		t->sas_ss_sp = (unsigned long) ss_sp;
+- 		t->sas_ss_size = ss_size;
+- 		t->sas_ss_flags = ss_flags;
++ 		if (!ret) {
++ 			t->sas_ss_sp = (unsigned long) ss_sp;
++ 			t->sas_ss_size = ss_size;
++ 			t->sas_ss_flags = ss_flags;
++ 		}
++ 		sigaltstack_unlock();
+  	}
+- 	return 0;
++ 	return ret;
+  }
+  
+  SYSCALL_DEFINE2(sigaltstack,const stack_t __user *,uss, stack_t __user *,uoss)
+diff --git a/arch/Kconfig b/arch/Kconfig
+index 9daac07317f6..9c4d122e3297 100644
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -1065,4 +1065,7 @@ config ARCH_SUPPORTS_DEBUG_PAGEALLOC
+ config HAVE_STATIC_CALL
+ 	bool
+ 
++config DYNAMIC_SIGFRAME
++	bool
++
+ source "kernel/gcov/Kconfig"
+diff --git a/include/linux/signal.h b/include/linux/signal.h
+index 008b49e545a8..d1da32fb6c8e 100644
+--- a/include/linux/signal.h
++++ b/include/linux/signal.h
+@@ -452,6 +452,12 @@ int __save_altstack(stack_t __user *, unsigned long);
+ 		sas_ss_reset(t); \
+ } while (0);
+ 
++#ifdef CONFIG_DYNAMIC_SIGFRAME
++bool sigaltstack_size_valid(size_t ss_size);
++#else
++static inline bool sigaltstack_size_valid(size_t size) { return true; }
++#endif /* !CONFIG_DYNAMIC_SIGFRAME */
++
+ #ifdef CONFIG_PROC_FS
+ struct seq_file;
+ extern void render_sigset_t(struct seq_file *, const char *, sigset_t *);
+* Unmerged path kernel/signal.c
