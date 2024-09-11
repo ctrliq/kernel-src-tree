@@ -1,0 +1,157 @@
+SUNRPC: Remove xprt_connect_status()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit abc13275771fac77e2d7b129c289522dacb644b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/abc13275.failed
+
+Over the years, xprt_connect_status() has been superseded by
+call_connect_status(), which now handles all the errors that
+xprt_connect_status() does and more. Since the latter converts
+all errors that it doesn't recognise to EIO, then it is time
+for it to be retired.
+
+	Reported-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+	Tested-by: Chuck Lever <chuck.lever@oracle.com>
+(cherry picked from commit abc13275771fac77e2d7b129c289522dacb644b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/xprt.c
+index c4d4cd12e49e,73547d17d3c6..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -67,9 -67,6 +67,12 @@@
+   */
+  static void	 xprt_init(struct rpc_xprt *xprt, struct net *net);
+  static __be32	xprt_alloc_xid(struct rpc_xprt *xprt);
+++<<<<<<< HEAD
+ +static void	xprt_connect_status(struct rpc_task *task);
+ +static int      __xprt_get_cong(struct rpc_xprt *, struct rpc_task *);
+ +static void     __xprt_put_cong(struct rpc_xprt *, struct rpc_rqst *);
+++=======
+++>>>>>>> abc13275771f (SUNRPC: Remove xprt_connect_status())
+  static void	 xprt_destroy(struct rpc_xprt *xprt);
+  
+  static DEFINE_SPINLOCK(xprt_list_lock);
+@@@ -762,10 -819,9 +765,10 @@@ void xprt_connect(struct rpc_task *task
+  		xprt->ops->close(xprt);
+  
+  	if (!xprt_connected(xprt)) {
+ +		task->tk_rqstp->rq_bytes_sent = 0;
+  		task->tk_timeout = task->tk_rqstp->rq_timeout;
+  		task->tk_rqstp->rq_connect_cookie = xprt->connect_cookie;
+- 		rpc_sleep_on(&xprt->pending, task, xprt_connect_status);
++ 		rpc_sleep_on(&xprt->pending, task, NULL);
+  
+  		if (test_bit(XPRT_CLOSING, &xprt->state))
+  			return;
+@@@ -784,32 -840,73 +787,102 @@@
+  	xprt_release_write(xprt, task);
+  }
+  
+++<<<<<<< HEAD
+ +static void xprt_connect_status(struct rpc_task *task)
+ +{
+ +	switch (task->tk_status) {
+ +	case 0:
+ +		dprintk("RPC: %5u xprt_connect_status: connection established\n",
+ +				task->tk_pid);
+ +		break;
+ +	case -ECONNREFUSED:
+ +	case -ECONNRESET:
+ +	case -ECONNABORTED:
+ +	case -ENETUNREACH:
+ +	case -EHOSTUNREACH:
+ +	case -EPIPE:
+ +	case -EAGAIN:
+ +		dprintk("RPC: %5u xprt_connect_status: retrying\n", task->tk_pid);
+ +		break;
+ +	case -ETIMEDOUT:
+ +		dprintk("RPC: %5u xprt_connect_status: connect attempt timed "
+ +				"out\n", task->tk_pid);
+ +		break;
+ +	default:
+ +		dprintk("RPC: %5u xprt_connect_status: error %d connecting to "
+ +				"server %s\n", task->tk_pid, -task->tk_status,
+ +				task->tk_rqstp->rq_xprt->servername);
+ +		task->tk_status = -EIO;
+ +	}
+++=======
++ enum xprt_xid_rb_cmp {
++ 	XID_RB_EQUAL,
++ 	XID_RB_LEFT,
++ 	XID_RB_RIGHT,
++ };
++ static enum xprt_xid_rb_cmp
++ xprt_xid_cmp(__be32 xid1, __be32 xid2)
++ {
++ 	if (xid1 == xid2)
++ 		return XID_RB_EQUAL;
++ 	if ((__force u32)xid1 < (__force u32)xid2)
++ 		return XID_RB_LEFT;
++ 	return XID_RB_RIGHT;
++ }
++ 
++ static struct rpc_rqst *
++ xprt_request_rb_find(struct rpc_xprt *xprt, __be32 xid)
++ {
++ 	struct rb_node *n = xprt->recv_queue.rb_node;
++ 	struct rpc_rqst *req;
++ 
++ 	while (n != NULL) {
++ 		req = rb_entry(n, struct rpc_rqst, rq_recv);
++ 		switch (xprt_xid_cmp(xid, req->rq_xid)) {
++ 		case XID_RB_LEFT:
++ 			n = n->rb_left;
++ 			break;
++ 		case XID_RB_RIGHT:
++ 			n = n->rb_right;
++ 			break;
++ 		case XID_RB_EQUAL:
++ 			return req;
++ 		}
++ 	}
++ 	return NULL;
++ }
++ 
++ static void
++ xprt_request_rb_insert(struct rpc_xprt *xprt, struct rpc_rqst *new)
++ {
++ 	struct rb_node **p = &xprt->recv_queue.rb_node;
++ 	struct rb_node *n = NULL;
++ 	struct rpc_rqst *req;
++ 
++ 	while (*p != NULL) {
++ 		n = *p;
++ 		req = rb_entry(n, struct rpc_rqst, rq_recv);
++ 		switch(xprt_xid_cmp(new->rq_xid, req->rq_xid)) {
++ 		case XID_RB_LEFT:
++ 			p = &n->rb_left;
++ 			break;
++ 		case XID_RB_RIGHT:
++ 			p = &n->rb_right;
++ 			break;
++ 		case XID_RB_EQUAL:
++ 			WARN_ON_ONCE(new != req);
++ 			return;
++ 		}
++ 	}
++ 	rb_link_node(&new->rq_recv, n, p);
++ 	rb_insert_color(&new->rq_recv, &xprt->recv_queue);
++ }
++ 
++ static void
++ xprt_request_rb_remove(struct rpc_xprt *xprt, struct rpc_rqst *req)
++ {
++ 	rb_erase(&req->rq_recv, &xprt->recv_queue);
+++>>>>>>> abc13275771f (SUNRPC: Remove xprt_connect_status())
+  }
+  
+  /**
+* Unmerged path net/sunrpc/xprt.c
