@@ -1,0 +1,83 @@
+s390/qeth: reject oversized SNMP requests
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 292a50e3fc2cf699587ea282e6253e0d6ae3cdc1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/292a50e3.failed
+
+Commit d4c08afafa04 ("s390/qeth: streamline SNMP cmd code") removed
+the bounds checking for req_len, under the assumption that the check in
+qeth_alloc_cmd() would suffice.
+
+But that code path isn't sufficiently robust to handle a user-provided
+data_length, which could overflow (when adding the cmd header overhead)
+before being checked against QETH_BUFSIZE. We end up allocating just a
+tiny iob, and the subsequent copy_from_user() writes past the end of
+that iob.
+
+Special-case this path and add a coarse bounds check, to protect against
+maliciuous requests. This let's the subsequent code flow do its normal
+job and precise checking, without risk of overflow.
+
+Fixes: d4c08afafa04 ("s390/qeth: streamline SNMP cmd code")
+	Reported-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 292a50e3fc2cf699587ea282e6253e0d6ae3cdc1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,6502b148541e..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -4536,22 -4369,28 +4536,41 @@@ static int qeth_snmp_command(struct qet
+  	    IS_LAYER3(card))
+  		return -EOPNOTSUPP;
+  
+++<<<<<<< HEAD
+ +	/* skip 4 bytes (data_len struct member) to get req_len */
+ +	if (copy_from_user(&req_len, udata + sizeof(int), sizeof(int)))
+++=======
++ 	ureq = (struct qeth_snmp_ureq __user *) udata;
++ 	if (get_user(qinfo.udata_len, &ureq->hdr.data_len) ||
++ 	    get_user(req_len, &ureq->hdr.req_len))
++ 		return -EFAULT;
++ 
++ 	/* Sanitize user input, to avoid overflows in iob size calculation: */
++ 	if (req_len > QETH_BUFSIZE)
++ 		return -EINVAL;
++ 
++ 	iob = qeth_get_adapter_cmd(card, IPA_SETADP_SET_SNMP_CONTROL, req_len);
++ 	if (!iob)
++ 		return -ENOMEM;
++ 
++ 	if (copy_from_user(&__ipa_cmd(iob)->data.setadapterparms.data.snmp,
++ 			   &ureq->cmd, req_len)) {
++ 		qeth_put_cmd(iob);
+++>>>>>>> 292a50e3fc2c (s390/qeth: reject oversized SNMP requests)
+  		return -EFAULT;
+ +	if (req_len > (QETH_BUFSIZE - IPA_PDU_HEADER_SIZE -
+ +		       sizeof(struct qeth_ipacmd_hdr) -
+ +		       sizeof(struct qeth_ipacmd_setadpparms_hdr)))
+ +		return -EINVAL;
+ +	ureq = memdup_user(udata, req_len + sizeof(struct qeth_snmp_ureq_hdr));
+ +	if (IS_ERR(ureq)) {
+ +		QETH_CARD_TEXT(card, 2, "snmpnome");
+ +		return PTR_ERR(ureq);
+  	}
+ -
+ +	qinfo.udata_len = ureq->hdr.data_len;
+  	qinfo.udata = kzalloc(qinfo.udata_len, GFP_KERNEL);
+  	if (!qinfo.udata) {
+ -		qeth_put_cmd(iob);
+ +		kfree(ureq);
+  		return -ENOMEM;
+  	}
+  	qinfo.udata_offset = sizeof(struct qeth_snmp_ureq_hdr);
+* Unmerged path drivers/s390/net/qeth_core_main.c
