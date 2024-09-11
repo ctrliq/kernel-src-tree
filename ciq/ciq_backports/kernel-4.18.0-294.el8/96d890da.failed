@@ -1,0 +1,140 @@
+mptcp: add msk interations helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 96d890daad05a3e47e914451f07b79275b325c95
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/96d890da.failed
+
+mptcp_token_iter_next() allow traversing all the MPTCP
+sockets inside the token container belonging to the given
+network namespace with a quite standard iterator semantic.
+
+That will be used by the next patch, but keep the API generic,
+as we plan to use this later for PM's sake.
+
+Additionally export mptcp_token_get_sock(), as it also
+will be used by the diag module.
+
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 96d890daad05a3e47e914451f07b79275b325c95)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/protocol.h
+index d755af8e07e9,e5baaef5ec89..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -385,12 -379,21 +385,18 @@@ bool mptcp_finish_join(struct sock *sk)
+  void mptcp_data_acked(struct sock *sk);
+  void mptcp_subflow_eof(struct sock *sk);
+  
+ -void __init mptcp_token_init(void);
+ -static inline void mptcp_token_init_request(struct request_sock *req)
+ -{
+ -	mptcp_subflow_rsk(req)->token_node.pprev = NULL;
+ -}
+ -
+  int mptcp_token_new_request(struct request_sock *req);
+ -void mptcp_token_destroy_request(struct request_sock *req);
+ +void mptcp_token_destroy_request(u32 token);
+  int mptcp_token_new_connect(struct sock *sk);
+ -void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
+ -			struct mptcp_sock *msk);
+ +int mptcp_token_new_accept(u32 token, struct sock *conn);
+  struct mptcp_sock *mptcp_token_get_sock(u32 token);
+++<<<<<<< HEAD
+ +void mptcp_token_destroy(u32 token);
+++=======
++ struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
++ 					 long *s_num);
++ void mptcp_token_destroy(struct mptcp_sock *msk);
+++>>>>>>> 96d890daad05 (mptcp: add msk interations helper)
+  
+  void mptcp_crypto_key_sha(u64 key, u32 *token, u64 *idsn);
+  static inline void mptcp_crypto_key_gen_sha(u64 *key, u32 *token, u64 *idsn)
+* Unmerged path net/mptcp/protocol.h
+diff --git a/net/mptcp/token.c b/net/mptcp/token.c
+index 179079c1f2a3..55a128058f05 100644
+--- a/net/mptcp/token.c
++++ b/net/mptcp/token.c
+@@ -167,6 +167,66 @@ struct mptcp_sock *mptcp_token_get_sock(u32 token)
+ 
+ 	return mptcp_sk(conn);
+ }
++EXPORT_SYMBOL_GPL(mptcp_token_get_sock);
++
++/**
++ * mptcp_token_iter_next - iterate over the token container from given pos
++ * @net: namespace to be iterated
++ * @s_slot: start slot number
++ * @s_num: start number inside the given lock
++ *
++ * This function returns the first mptcp connection structure found inside the
++ * token container starting from the specified position, or NULL.
++ *
++ * On successful iteration, the iterator is move to the next position and the
++ * the acquires a reference to the returned socket.
++ */
++struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
++					 long *s_num)
++{
++	struct mptcp_sock *ret = NULL;
++	struct hlist_nulls_node *pos;
++	int slot, num;
++
++	for (slot = *s_slot; slot <= token_mask; *s_num = 0, slot++) {
++		struct token_bucket *bucket = &token_hash[slot];
++		struct sock *sk;
++
++		num = 0;
++
++		if (hlist_nulls_empty(&bucket->msk_chain))
++			continue;
++
++		rcu_read_lock();
++		sk_nulls_for_each_rcu(sk, pos, &bucket->msk_chain) {
++			++num;
++			if (!net_eq(sock_net(sk), net))
++				continue;
++
++			if (num <= *s_num)
++				continue;
++
++			if (!refcount_inc_not_zero(&sk->sk_refcnt))
++				continue;
++
++			if (!net_eq(sock_net(sk), net)) {
++				sock_put(sk);
++				continue;
++			}
++
++			ret = mptcp_sk(sk);
++			rcu_read_unlock();
++			goto out;
++		}
++		rcu_read_unlock();
++	}
++
++out:
++	*s_slot = slot;
++	*s_num = num;
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mptcp_token_iter_next);
+ 
+ /**
+  * mptcp_token_destroy_request - remove mptcp connection/token
+@@ -199,7 +259,6 @@ void mptcp_token_destroy(u32 token)
+ EXPORT_SYMBOL_GPL(mptcp_token_new_request);
+ EXPORT_SYMBOL_GPL(mptcp_token_new_connect);
+ EXPORT_SYMBOL_GPL(mptcp_token_accept);
+-EXPORT_SYMBOL_GPL(mptcp_token_get_sock);
+ EXPORT_SYMBOL_GPL(mptcp_token_destroy_request);
+ EXPORT_SYMBOL_GPL(mptcp_token_destroy);
+ #endif
