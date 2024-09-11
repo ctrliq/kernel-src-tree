@@ -1,0 +1,145 @@
+net: ethtool: Add infrastructure for reporting cable test results
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrew Lunn <andrew@lunn.ch>
+commit 1dd3f212af30b42c90ba252c165f2f6d2ddf5230
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1dd3f212.failed
+
+Provide infrastructure for PHY drivers to report the cable test
+results.  A netlink skb is associated to the phydev. Helpers will be
+added which can add results to this skb. Once the test has finished
+the results are sent to user space.
+
+When netlink ethtool is not part of the kernel configuration stubs are
+provided. It is also impossible to trigger a cable test, so the error
+code returned by the alloc function is of no consequence.
+
+v2:
+Include the status complete in the netlink notification message
+
+v4:
+Replace -EINVAL with -EMSGSIZE
+
+	Signed-off-by: Andrew Lunn <andrew@lunn.ch>
+	Reviewed-by: Michal Kubecek <mkubecek@suse.cz>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 1dd3f212af30b42c90ba252c165f2f6d2ddf5230)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ethtool_netlink.h
+#	include/linux/phy.h
+#	net/ethtool/cabletest.c
+diff --cc include/linux/phy.h
+index c0384427f3d6,169fae4249a9..000000000000
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@@ -518,8 -519,16 +518,20 @@@ struct phy_device 
+  	/* For use by PHYs to maintain extra state */
+  	void *priv;
+  
+++<<<<<<< HEAD
+++=======
++ 	/* shared data pointer */
++ 	/* For use by PHYs inside the same package that need a shared state. */
++ 	struct phy_package_shared *shared;
++ 
++ 	/* Reporting cable test results */
++ 	struct sk_buff *skb;
++ 	void *ehdr;
++ 	struct nlattr *nest;
++ 
+++>>>>>>> 1dd3f212af30 (net: ethtool: Add infrastructure for reporting cable test results)
+  	/* Interrupt and Polling infrastructure */
+ +	RH_KABI_DEPRECATE(struct work_struct, phy_queue)
+  	struct delayed_work state_queue;
+  
+  	struct mutex lock;
+* Unmerged path include/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/cabletest.c
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index ae8e63279b97..eedf335c6115 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -22,6 +22,7 @@
+ #include <linux/module.h>
+ #include <linux/mii.h>
+ #include <linux/ethtool.h>
++#include <linux/ethtool_netlink.h>
+ #include <linux/phy.h>
+ #include <linux/phy_led_triggers.h>
+ #include <linux/sfp.h>
+@@ -30,6 +31,9 @@
+ #include <linux/io.h>
+ #include <linux/uaccess.h>
+ #include <linux/atomic.h>
++#include <net/netlink.h>
++#include <net/genetlink.h>
++#include <net/sock.h>
+ 
+ #define PHY_STATE_TIME	HZ
+ 
+@@ -476,6 +480,8 @@ static void phy_abort_cable_test(struct phy_device *phydev)
+ {
+ 	int err;
+ 
++	ethnl_cable_test_finished(phydev);
++
+ 	err = phy_init_hw(phydev);
+ 	if (err)
+ 		phydev_err(phydev, "Error while aborting cable test");
+@@ -484,7 +490,7 @@ static void phy_abort_cable_test(struct phy_device *phydev)
+ int phy_start_cable_test(struct phy_device *phydev,
+ 			 struct netlink_ext_ack *extack)
+ {
+-	int err;
++	int err = -ENOMEM;
+ 
+ 	if (!(phydev->drv &&
+ 	      phydev->drv->cable_test_start &&
+@@ -510,19 +516,30 @@ int phy_start_cable_test(struct phy_device *phydev,
+ 		goto out;
+ 	}
+ 
++	err = ethnl_cable_test_alloc(phydev);
++	if (err)
++		goto out;
++
+ 	/* Mark the carrier down until the test is complete */
+ 	phy_link_down(phydev, true);
+ 
+ 	err = phydev->drv->cable_test_start(phydev);
+ 	if (err) {
+ 		phy_link_up(phydev);
+-		goto out;
++		goto out_free;
+ 	}
+ 
+ 	phydev->state = PHY_CABLETEST;
+ 
+ 	if (phy_polling_mode(phydev))
+ 		phy_trigger_machine(phydev);
++
++	mutex_unlock(&phydev->lock);
++
++	return 0;
++
++out_free:
++	ethnl_cable_test_free(phydev);
+ out:
+ 	mutex_unlock(&phydev->lock);
+ 
+@@ -964,6 +981,7 @@ void phy_state_machine(struct work_struct *work)
+ 		}
+ 
+ 		if (finished) {
++			ethnl_cable_test_finished(phydev);
+ 			needs_aneg = true;
+ 			phydev->state = PHY_UP;
+ 		}
+* Unmerged path include/linux/ethtool_netlink.h
+* Unmerged path include/linux/phy.h
+* Unmerged path net/ethtool/cabletest.c
