@@ -1,0 +1,335 @@
+net/tls: move TOE-related code to a separate file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] tls: move TOE-related code to a separate file (Sabrina Dubroca) [1819627]
+Rebuild_FUZZ: 95.74%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit 08700dab816847d5e600ef263155fb04ea4b312d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/08700dab.failed
+
+Move tls_hw_* functions to a new, separate source file
+to avoid confusion with normal, non-TOE offload.
+
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: John Hurley <john.hurley@netronome.com>
+	Reviewed-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 08700dab816847d5e600ef263155fb04ea4b312d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls_toe.h
+#	net/tls/tls_main.c
+diff --cc net/tls/tls_main.c
+index f7a147ae7fd3,9d0cf14b2f7e..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -58,8 -59,6 +58,11 @@@ static struct proto *saved_tcpv6_prot
+  static DEFINE_MUTEX(tcpv6_prot_mutex);
+  static struct proto *saved_tcpv4_prot;
+  static DEFINE_MUTEX(tcpv4_prot_mutex);
+++<<<<<<< HEAD
+ +static LIST_HEAD(device_list);
+ +static DEFINE_MUTEX(device_mutex);
+++=======
+++>>>>>>> 08700dab8168 (net/tls: move TOE-related code to a separate file)
+  static struct proto tls_prots[TLS_NUM_PROTS][TLS_NUM_CONFIG][TLS_NUM_CONFIG];
+  static struct proto_ops tls_sw_proto_ops;
+  static void build_protos(struct proto prot[TLS_NUM_CONFIG][TLS_NUM_CONFIG],
+@@@ -646,89 -642,6 +649,92 @@@ static void tls_build_proto(struct soc
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void tls_hw_sk_destruct(struct sock *sk)
+ +{
+ +	struct tls_context *ctx = tls_get_ctx(sk);
+ +	struct inet_connection_sock *icsk = inet_csk(sk);
+ +
+ +	ctx->sk_destruct(sk);
+ +	/* Free ctx */
+ +	rcu_assign_pointer(icsk->icsk_ulp_data, NULL);
+ +	tls_ctx_free(sk, ctx);
+ +}
+ +
+ +static int tls_hw_prot(struct sock *sk)
+ +{
+ +	struct tls_context *ctx;
+ +	struct tls_device *dev;
+ +	int rc = 0;
+ +
+ +	/* RHEL: fix up the locking below after commit df9d4a178022 is
+ +	 * backported */
+ +	mutex_lock(&device_mutex);
+ +	list_for_each_entry(dev, &device_list, dev_list) {
+ +		if (dev->feature && dev->feature(dev)) {
+ +			ctx = create_ctx(sk);
+ +			if (!ctx)
+ +				goto out;
+ +
+ +#if 0
+ +			spin_unlock_bh(&device_spinlock);
+ +#endif
+ +			tls_build_proto(sk);
+ +			ctx->hash = sk->sk_prot->hash;
+ +			ctx->unhash = sk->sk_prot->unhash;
+ +			ctx->sk_proto_close = sk->sk_prot->close;
+ +			ctx->sk_destruct = sk->sk_destruct;
+ +			sk->sk_destruct = tls_hw_sk_destruct;
+ +			ctx->rx_conf = TLS_HW_RECORD;
+ +			ctx->tx_conf = TLS_HW_RECORD;
+ +			update_sk_prot(sk, ctx);
+ +#if 0
+ +			spin_lock_bh(&device_spinlock);
+ +#endif
+ +			rc = 1;
+ +			break;
+ +		}
+ +	}
+ +out:
+ +	mutex_unlock(&device_mutex);
+ +	return rc;
+ +}
+ +
+ +static void tls_hw_unhash(struct sock *sk)
+ +{
+ +	struct tls_context *ctx = tls_get_ctx(sk);
+ +	struct tls_device *dev;
+ +
+ +	mutex_lock(&device_mutex);
+ +	list_for_each_entry(dev, &device_list, dev_list) {
+ +		if (dev->unhash)
+ +			dev->unhash(dev, sk);
+ +	}
+ +	mutex_unlock(&device_mutex);
+ +	ctx->unhash(sk);
+ +}
+ +
+ +static int tls_hw_hash(struct sock *sk)
+ +{
+ +	struct tls_context *ctx = tls_get_ctx(sk);
+ +	struct tls_device *dev;
+ +	int err;
+ +
+ +	err = ctx->hash(sk);
+ +	mutex_lock(&device_mutex);
+ +	list_for_each_entry(dev, &device_list, dev_list) {
+ +		if (dev->hash)
+ +			err |= dev->hash(dev, sk);
+ +	}
+ +	mutex_unlock(&device_mutex);
+ +
+ +	if (err)
+ +		tls_hw_unhash(sk);
+ +	return err;
+ +}
+ +
+++=======
+++>>>>>>> 08700dab8168 (net/tls: move TOE-related code to a separate file)
+  static void build_protos(struct proto prot[TLS_NUM_CONFIG][TLS_NUM_CONFIG],
+  			 struct proto *base)
+  {
+@@@ -885,22 -792,6 +891,25 @@@ static size_t tls_get_info_size(const s
+  	return size;
+  }
+  
+++<<<<<<< HEAD
+ +void tls_register_device(struct tls_device *device)
+ +{
+ +	mutex_lock(&device_mutex);
+ +	list_add_tail(&device->dev_list, &device_list);
+ +	mutex_unlock(&device_mutex);
+ +}
+ +EXPORT_SYMBOL(tls_register_device);
+ +
+ +void tls_unregister_device(struct tls_device *device)
+ +{
+ +	mutex_lock(&device_mutex);
+ +	list_del(&device->dev_list);
+ +	mutex_unlock(&device_mutex);
+ +}
+ +EXPORT_SYMBOL(tls_unregister_device);
+ +
+++=======
+++>>>>>>> 08700dab8168 (net/tls: move TOE-related code to a separate file)
+  static struct tcp_ulp_ops tcp_tls_ulp_ops __read_mostly = {
+  	.name			= "tls",
+  	.owner			= THIS_MODULE,
+* Unmerged path include/net/tls_toe.h
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 355cc88fb8ed..168b6c99aad4 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -345,7 +345,10 @@ struct tls_offload_context_rx {
+ #define TLS_OFFLOAD_CONTEXT_SIZE_RX					\
+ 	(sizeof(struct tls_offload_context_rx) + TLS_DRIVER_STATE_SIZE_RX)
+ 
++struct tls_context *tls_ctx_create(struct sock *sk);
+ void tls_ctx_free(struct sock *sk, struct tls_context *ctx);
++void update_sk_prot(struct sock *sk, struct tls_context *ctx);
++
+ int wait_on_pending_writer(struct sock *sk, long *timeo);
+ int tls_sk_query(struct sock *sk, int optname, char __user *optval,
+ 		int __user *optlen);
+* Unmerged path include/net/tls_toe.h
+diff --git a/net/tls/Makefile b/net/tls/Makefile
+index 4d6b728a67d0..e320021779af 100644
+--- a/net/tls/Makefile
++++ b/net/tls/Makefile
+@@ -4,6 +4,6 @@
+ 
+ obj-$(CONFIG_TLS) += tls.o
+ 
+-tls-y := tls_main.o tls_sw.o
++tls-y := tls_main.o tls_sw.o tls_toe.o
+ 
+ tls-$(CONFIG_TLS_DEVICE) += tls_device.o tls_device_fallback.o
+* Unmerged path net/tls/tls_main.c
+diff --git a/net/tls/tls_toe.c b/net/tls/tls_toe.c
+new file mode 100644
+index 000000000000..89a7014a05f7
+--- /dev/null
++++ b/net/tls/tls_toe.c
+@@ -0,0 +1,139 @@
++/*
++ * Copyright (c) 2016-2017, Mellanox Technologies. All rights reserved.
++ * Copyright (c) 2016-2017, Dave Watson <davejwatson@fb.com>. All rights reserved.
++ *
++ * This software is available to you under a choice of one of two
++ * licenses.  You may choose to be licensed under the terms of the GNU
++ * General Public License (GPL) Version 2, available from the file
++ * COPYING in the main directory of this source tree, or the
++ * OpenIB.org BSD license below:
++ *
++ *     Redistribution and use in source and binary forms, with or
++ *     without modification, are permitted provided that the following
++ *     conditions are met:
++ *
++ *      - Redistributions of source code must retain the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer.
++ *
++ *      - Redistributions in binary form must reproduce the above
++ *        copyright notice, this list of conditions and the following
++ *        disclaimer in the documentation and/or other materials
++ *        provided with the distribution.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
++ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
++ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
++ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
++ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
++ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
++ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++ * SOFTWARE.
++ */
++
++#include <linux/list.h>
++#include <linux/rcupdate.h>
++#include <linux/spinlock.h>
++#include <net/inet_connection_sock.h>
++#include <net/tls.h>
++#include <net/tls_toe.h>
++
++static LIST_HEAD(device_list);
++static DEFINE_SPINLOCK(device_spinlock);
++
++static void tls_hw_sk_destruct(struct sock *sk)
++{
++	struct inet_connection_sock *icsk = inet_csk(sk);
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	ctx->sk_destruct(sk);
++	/* Free ctx */
++	rcu_assign_pointer(icsk->icsk_ulp_data, NULL);
++	tls_ctx_free(sk, ctx);
++}
++
++int tls_hw_prot(struct sock *sk)
++{
++	struct tls_toe_device *dev;
++	struct tls_context *ctx;
++	int rc = 0;
++
++	spin_lock_bh(&device_spinlock);
++	list_for_each_entry(dev, &device_list, dev_list) {
++		if (dev->feature && dev->feature(dev)) {
++			ctx = tls_ctx_create(sk);
++			if (!ctx)
++				goto out;
++
++			ctx->sk_destruct = sk->sk_destruct;
++			sk->sk_destruct = tls_hw_sk_destruct;
++			ctx->rx_conf = TLS_HW_RECORD;
++			ctx->tx_conf = TLS_HW_RECORD;
++			update_sk_prot(sk, ctx);
++			rc = 1;
++			break;
++		}
++	}
++out:
++	spin_unlock_bh(&device_spinlock);
++	return rc;
++}
++
++void tls_hw_unhash(struct sock *sk)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct tls_toe_device *dev;
++
++	spin_lock_bh(&device_spinlock);
++	list_for_each_entry(dev, &device_list, dev_list) {
++		if (dev->unhash) {
++			kref_get(&dev->kref);
++			spin_unlock_bh(&device_spinlock);
++			dev->unhash(dev, sk);
++			kref_put(&dev->kref, dev->release);
++			spin_lock_bh(&device_spinlock);
++		}
++	}
++	spin_unlock_bh(&device_spinlock);
++	ctx->sk_proto->unhash(sk);
++}
++
++int tls_hw_hash(struct sock *sk)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++	struct tls_toe_device *dev;
++	int err;
++
++	err = ctx->sk_proto->hash(sk);
++	spin_lock_bh(&device_spinlock);
++	list_for_each_entry(dev, &device_list, dev_list) {
++		if (dev->hash) {
++			kref_get(&dev->kref);
++			spin_unlock_bh(&device_spinlock);
++			err |= dev->hash(dev, sk);
++			kref_put(&dev->kref, dev->release);
++			spin_lock_bh(&device_spinlock);
++		}
++	}
++	spin_unlock_bh(&device_spinlock);
++
++	if (err)
++		tls_hw_unhash(sk);
++	return err;
++}
++
++void tls_toe_register_device(struct tls_toe_device *device)
++{
++	spin_lock_bh(&device_spinlock);
++	list_add_tail(&device->dev_list, &device_list);
++	spin_unlock_bh(&device_spinlock);
++}
++EXPORT_SYMBOL(tls_toe_register_device);
++
++void tls_toe_unregister_device(struct tls_toe_device *device)
++{
++	spin_lock_bh(&device_spinlock);
++	list_del(&device->dev_list);
++	spin_unlock_bh(&device_spinlock);
++}
++EXPORT_SYMBOL(tls_toe_unregister_device);
