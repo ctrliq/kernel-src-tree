@@ -1777,6 +1777,10 @@ static void mlx5_vdpa_set_status(struct vdpa_device *vdev, u8 status)
 		ndev->mvdev.status = 0;
 		ndev->mvdev.mlx_features = 0;
 		++mvdev->generation;
+		if (MLX5_CAP_GEN(mvdev->mdev, umem_uid_0)) {
+			if (mlx5_vdpa_create_mr(mvdev, NULL))
+				mlx5_vdpa_warn(mvdev, "create MR failed\n");
+		}
 		return;
 	}
 
@@ -1857,6 +1861,7 @@ static void mlx5_vdpa_free(struct vdpa_device *vdev)
 	ndev = to_mlx5_vdpa_ndev(mvdev);
 
 	free_resources(ndev);
+	mlx5_vdpa_destroy_mr(mvdev);
 	if (!is_zero_ether_addr(ndev->config.mac)) {
 		pfmdev = pci_get_drvdata(pci_physfn(mvdev->mdev->pdev));
 		mlx5_mpfs_del_mac(pfmdev, ndev->config.mac);
@@ -2024,9 +2029,15 @@ static int mlx5v_probe(struct auxiliary_device *adev,
 	if (err)
 		goto err_mpfs;
 
+	if (MLX5_CAP_GEN(mvdev->mdev, umem_uid_0)) {
+		err = mlx5_vdpa_create_mr(mvdev, NULL);
+		if (err)
+			goto err_res;
+	}
+
 	err = alloc_resources(ndev);
 	if (err)
-		goto err_res;
+		goto err_mr;
 
 	err = vdpa_register_device(&mvdev->vdev);
 	if (err)
@@ -2037,6 +2048,8 @@ static int mlx5v_probe(struct auxiliary_device *adev,
 
 err_reg:
 	free_resources(ndev);
+err_mr:
+	mlx5_vdpa_destroy_mr(mvdev);
 err_res:
 	mlx5_vdpa_free_resources(&ndev->mvdev);
 err_mpfs:
