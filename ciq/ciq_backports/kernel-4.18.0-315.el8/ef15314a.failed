@@ -1,0 +1,152 @@
+bpf: Add BPF_PROG_BIND_MAP syscall
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author YiFei Zhu <zhuyifei@google.com>
+commit ef15314aa5de955c6afd87d512e8b00f5ac08d06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/ef15314a.failed
+
+This syscall binds a map to a program. Returns success if the map is
+already bound to the program.
+
+	Signed-off-by: YiFei Zhu <zhuyifei@google.com>
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Cc: YiFei Zhu <zhuyifei1999@gmail.com>
+Link: https://lore.kernel.org/bpf/20200915234543.3220146-3-sdf@google.com
+(cherry picked from commit ef15314aa5de955c6afd87d512e8b00f5ac08d06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index b8e52d3559d6,a22812561064..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -673,7 -659,12 +674,16 @@@ union bpf_attr 
+  		__u32		flags;
+  	} iter_create;
+  
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	struct { /* struct used by BPF_PROG_BIND_MAP command */
++ 		__u32		prog_fd;
++ 		__u32		map_fd;
++ 		__u32		flags;		/* extra flags */
++ 	} prog_bind_map;
++ 
+++>>>>>>> ef15314aa5de (bpf: Add BPF_PROG_BIND_MAP syscall)
+  } __attribute__((aligned(8)));
+  
+  /* The description below is an attempt at providing documentation to eBPF
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 70e6c7e995cb..3df014247637 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -4311,6 +4311,66 @@ static int bpf_iter_create(union bpf_attr *attr)
+ 	return err;
+ }
+ 
++#define BPF_PROG_BIND_MAP_LAST_FIELD prog_bind_map.flags
++
++static int bpf_prog_bind_map(union bpf_attr *attr)
++{
++	struct bpf_prog *prog;
++	struct bpf_map *map;
++	struct bpf_map **used_maps_old, **used_maps_new;
++	int i, ret = 0;
++
++	if (CHECK_ATTR(BPF_PROG_BIND_MAP))
++		return -EINVAL;
++
++	if (attr->prog_bind_map.flags)
++		return -EINVAL;
++
++	prog = bpf_prog_get(attr->prog_bind_map.prog_fd);
++	if (IS_ERR(prog))
++		return PTR_ERR(prog);
++
++	map = bpf_map_get(attr->prog_bind_map.map_fd);
++	if (IS_ERR(map)) {
++		ret = PTR_ERR(map);
++		goto out_prog_put;
++	}
++
++	mutex_lock(&prog->aux->used_maps_mutex);
++
++	used_maps_old = prog->aux->used_maps;
++
++	for (i = 0; i < prog->aux->used_map_cnt; i++)
++		if (used_maps_old[i] == map)
++			goto out_unlock;
++
++	used_maps_new = kmalloc_array(prog->aux->used_map_cnt + 1,
++				      sizeof(used_maps_new[0]),
++				      GFP_KERNEL);
++	if (!used_maps_new) {
++		ret = -ENOMEM;
++		goto out_unlock;
++	}
++
++	memcpy(used_maps_new, used_maps_old,
++	       sizeof(used_maps_old[0]) * prog->aux->used_map_cnt);
++	used_maps_new[prog->aux->used_map_cnt] = map;
++
++	prog->aux->used_map_cnt++;
++	prog->aux->used_maps = used_maps_new;
++
++	kfree(used_maps_old);
++
++out_unlock:
++	mutex_unlock(&prog->aux->used_maps_mutex);
++
++	if (ret)
++		bpf_map_put(map);
++out_prog_put:
++	bpf_prog_put(prog);
++	return ret;
++}
++
+ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, size)
+ {
+ 	union bpf_attr attr;
+@@ -4444,6 +4504,9 @@ SYSCALL_DEFINE3(bpf, int, cmd, union bpf_attr __user *, uattr, unsigned int, siz
+ 	case BPF_LINK_DETACH:
+ 		err = link_detach(&attr);
+ 		break;
++	case BPF_PROG_BIND_MAP:
++		err = bpf_prog_bind_map(&attr);
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 		break;
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index f947db4eb922..8080f1e0ef2b 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -124,6 +124,7 @@ enum bpf_cmd {
+ 	BPF_ENABLE_STATS,
+ 	BPF_ITER_CREATE,
+ 	BPF_LINK_DETACH,
++	BPF_PROG_BIND_MAP,
+ };
+ 
+ enum bpf_map_type {
+@@ -654,6 +655,12 @@ union bpf_attr {
+ 		__u32		flags;
+ 	} iter_create;
+ 
++	struct { /* struct used by BPF_PROG_BIND_MAP command */
++		__u32		prog_fd;
++		__u32		map_fd;
++		__u32		flags;		/* extra flags */
++	} prog_bind_map;
++
+ } __attribute__((aligned(8)));
+ 
+ /* The description below is an attempt at providing documentation to eBPF
