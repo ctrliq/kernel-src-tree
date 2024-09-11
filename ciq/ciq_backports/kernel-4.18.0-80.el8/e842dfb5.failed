@@ -1,0 +1,163 @@
+arm64: mm: Offset TTBR1 to allow 52-bit PTRS_PER_PGD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Steve Capper <steve.capper@arm.com>
+commit e842dfb5a2d3b4c43766508ef89a4eb67471d53a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/e842dfb5.failed
+
+Enabling 52-bit VAs on arm64 requires that the PGD table expands from 64
+entries (for the 48-bit case) to 1024 entries. This quantity,
+PTRS_PER_PGD is used as follows to compute which PGD entry corresponds
+to a given virtual address, addr:
+
+pgd_index(addr) -> (addr >> PGDIR_SHIFT) & (PTRS_PER_PGD - 1)
+
+Userspace addresses are prefixed by 0's, so for a 48-bit userspace
+address, uva, the following is true:
+(uva >> PGDIR_SHIFT) & (1024 - 1) == (uva >> PGDIR_SHIFT) & (64 - 1)
+
+In other words, a 48-bit userspace address will have the same pgd_index
+when using PTRS_PER_PGD = 64 and 1024.
+
+Kernel addresses are prefixed by 1's so, given a 48-bit kernel address,
+kva, we have the following inequality:
+(kva >> PGDIR_SHIFT) & (1024 - 1) != (kva >> PGDIR_SHIFT) & (64 - 1)
+
+In other words a 48-bit kernel virtual address will have a different
+pgd_index when using PTRS_PER_PGD = 64 and 1024.
+
+If, however, we note that:
+kva = 0xFFFF << 48 + lower (where lower[63:48] == 0b)
+and, PGDIR_SHIFT = 42 (as we are dealing with 64KB PAGE_SIZE)
+
+We can consider:
+(kva >> PGDIR_SHIFT) & (1024 - 1) - (kva >> PGDIR_SHIFT) & (64 - 1)
+ = (0xFFFF << 6) & 0x3FF - (0xFFFF << 6) & 0x3F	// "lower" cancels out
+ = 0x3C0
+
+In other words, one can switch PTRS_PER_PGD to the 52-bit value globally
+provided that they increment ttbr1_el1 by 0x3C0 * 8 = 0x1E00 bytes when
+running with 48-bit kernel VAs (TCR_EL1.T1SZ = 16).
+
+For kernel configuration where 52-bit userspace VAs are possible, this
+patch offsets ttbr1_el1 and sets PTRS_PER_PGD corresponding to the
+52-bit value.
+
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Suggested-by: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Steve Capper <steve.capper@arm.com>
+[will: added comment to TTBR1_BADDR_4852_OFFSET calculation]
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit e842dfb5a2d3b4c43766508ef89a4eb67471d53a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/proc.S
+diff --cc arch/arm64/mm/proc.S
+index 03646e6a2ef4,2db1c491d45d..000000000000
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@@ -194,8 -201,8 +195,13 @@@ ENTRY(idmap_cpu_replace_ttbr1
+  
+  	__idmap_cpu_set_reserved_ttbr1 x1, x3
+  
+++<<<<<<< HEAD
+ +	phys_to_ttbr x3, x0
+ +	msr	ttbr1_el1, x3
+++=======
++ 	offset_ttbr1 x0
++ 	msr	ttbr1_el1, x0
+++>>>>>>> e842dfb5a2d3 (arm64: mm: Offset TTBR1 to allow 52-bit PTRS_PER_PGD)
+  	isb
+  
+  	restore_daif x2
+diff --git a/arch/arm64/include/asm/assembler.h b/arch/arm64/include/asm/assembler.h
+index 0bcc98dbba56..0e3b363f64cb 100644
+--- a/arch/arm64/include/asm/assembler.h
++++ b/arch/arm64/include/asm/assembler.h
+@@ -516,6 +516,29 @@ USER(\label, ic	ivau, \tmp2)			// invalidate I line PoU
+ 	mrs	\rd, sp_el0
+ 	.endm
+ 
++/*
++ * Offset ttbr1 to allow for 48-bit kernel VAs set with 52-bit PTRS_PER_PGD.
++ * orr is used as it can cover the immediate value (and is idempotent).
++ * In future this may be nop'ed out when dealing with 52-bit kernel VAs.
++ * 	ttbr: Value of ttbr to set, modified.
++ */
++	.macro	offset_ttbr1, ttbr
++#ifdef CONFIG_ARM64_52BIT_VA
++	orr	\ttbr, \ttbr, #TTBR1_BADDR_4852_OFFSET
++#endif
++	.endm
++
++/*
++ * Perform the reverse of offset_ttbr1.
++ * bic is used as it can cover the immediate value and, in future, won't need
++ * to be nop'ed out when dealing with 52-bit kernel VAs.
++ */
++	.macro	restore_ttbr1, ttbr
++#ifdef CONFIG_ARM64_52BIT_VA
++	bic	\ttbr, \ttbr, #TTBR1_BADDR_4852_OFFSET
++#endif
++	.endm
++
+ /*
+  * Arrange a physical address in a TTBR register, taking care of 52-bit
+  * addresses.
+diff --git a/arch/arm64/include/asm/pgtable-hwdef.h b/arch/arm64/include/asm/pgtable-hwdef.h
+index fd208eac9f2a..759299f4587a 100644
+--- a/arch/arm64/include/asm/pgtable-hwdef.h
++++ b/arch/arm64/include/asm/pgtable-hwdef.h
+@@ -80,7 +80,11 @@
+ #define PGDIR_SHIFT		ARM64_HW_PGTABLE_LEVEL_SHIFT(4 - CONFIG_PGTABLE_LEVELS)
+ #define PGDIR_SIZE		(_AC(1, UL) << PGDIR_SHIFT)
+ #define PGDIR_MASK		(~(PGDIR_SIZE-1))
++#ifdef CONFIG_ARM64_52BIT_VA
++#define PTRS_PER_PGD		(1 << (52 - PGDIR_SHIFT))
++#else
+ #define PTRS_PER_PGD		(1 << (VA_BITS - PGDIR_SHIFT))
++#endif
+ 
+ /*
+  * Section address mask and size definitions.
+@@ -304,4 +308,10 @@
+ #define TTBR_BADDR_MASK_52	(((UL(1) << 46) - 1) << 2)
+ #endif
+ 
++#ifdef CONFIG_ARM64_52BIT_VA
++/* Must be at least 64-byte aligned to prevent corruption of the TTBR */
++#define TTBR1_BADDR_4852_OFFSET	(((UL(1) << (52 - PGDIR_SHIFT)) - \
++				 (UL(1) << (48 - PGDIR_SHIFT))) * 8)
++#endif
++
+ #endif
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index 4471f570a295..f60081be9a1b 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -769,6 +769,7 @@ ENTRY(__enable_mmu)
+ 	phys_to_ttbr x1, x1
+ 	phys_to_ttbr x2, x2
+ 	msr	ttbr0_el1, x2			// load TTBR0
++	offset_ttbr1 x1
+ 	msr	ttbr1_el1, x1			// load TTBR1
+ 	isb
+ 	msr	sctlr_el1, x0
+diff --git a/arch/arm64/kernel/hibernate-asm.S b/arch/arm64/kernel/hibernate-asm.S
+index dd14ab8c9f72..fe36d85c60bd 100644
+--- a/arch/arm64/kernel/hibernate-asm.S
++++ b/arch/arm64/kernel/hibernate-asm.S
+@@ -40,6 +40,7 @@
+ 	tlbi	vmalle1
+ 	dsb	nsh
+ 	phys_to_ttbr \tmp, \page_table
++	offset_ttbr1 \tmp
+ 	msr	ttbr1_el1, \tmp
+ 	isb
+ .endm
+* Unmerged path arch/arm64/mm/proc.S
