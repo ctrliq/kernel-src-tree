@@ -1,0 +1,217 @@
+KVM: Call kvm_arch_flush_shadow_memslot() on the old slot in kvm_invalidate_memslot()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+commit bcb63dcde829945487bad4917b614c28aaa59141
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/bcb63dcd.failed
+
+kvm_invalidate_memslot() calls kvm_arch_flush_shadow_memslot() on the
+active, but KVM_MEMSLOT_INVALID slot.
+Do it on the inactive (but valid) old slot instead since arch code really
+should not get passed such invalid slot.
+
+Note that this means that the "arch" field of the slot provided to
+kvm_arch_flush_shadow_memslot() may have stale data since this function
+is called with slots_arch_lock released.
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Maciej S. Szmigiero <maciej.szmigiero@oracle.com>
+	Reviewed-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <813595ecc193d6ae39a87709899d4251523b05f8.1638817641.git.maciej.szmigiero@oracle.com>
+(cherry picked from commit bcb63dcde829945487bad4917b614c28aaa59141)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index b1373f69ce5e,130eaf1c5711..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -1356,37 -1571,158 +1356,146 @@@ static size_t kvm_memslots_size(int slo
+  }
+  
+  /*
+ - * Activate @new, which must be installed in the inactive slots by the caller,
+ - * by swapping the active slots and then propagating @new to @old once @old is
+ - * unreachable and can be safely modified.
+ - *
+ - * With NULL @old this simply adds @new to @active (while swapping the sets).
+ - * With NULL @new this simply removes @old from @active and frees it
+ - * (while also swapping the sets).
+ + * Note, at a minimum, the current number of used slots must be allocated, even
+ + * when deleting a memslot, as we need a complete duplicate of the memslots for
+ + * use when invalidating a memslot prior to deleting/moving the memslot.
+   */
+ -static void kvm_activate_memslot(struct kvm *kvm,
+ -				 struct kvm_memory_slot *old,
+ -				 struct kvm_memory_slot *new)
+ +static struct kvm_memslots *kvm_dup_memslots(struct kvm_memslots *old,
+ +					     enum kvm_mr_change change)
+  {
+ -	int as_id = kvm_memslots_get_as_id(old, new);
+ +	struct kvm_memslots *slots;
+ +	size_t new_size;
+  
+ -	kvm_swap_active_memslots(kvm, as_id);
+ +	if (change == KVM_MR_CREATE)
+ +		new_size = kvm_memslots_size(old->used_slots + 1);
+ +	else
+ +		new_size = kvm_memslots_size(old->used_slots);
+  
+ -	/* Propagate the new memslot to the now inactive memslots. */
+ -	kvm_replace_memslot(kvm, old, new);
+ -}
+ +	slots = kvzalloc(new_size, GFP_KERNEL_ACCOUNT);
+ +	if (likely(slots))
+ +		memcpy(slots, old, kvm_memslots_size(old->used_slots));
+  
+ -static void kvm_copy_memslot(struct kvm_memory_slot *dest,
+ -			     const struct kvm_memory_slot *src)
+ -{
+ -	dest->base_gfn = src->base_gfn;
+ -	dest->npages = src->npages;
+ -	dest->dirty_bitmap = src->dirty_bitmap;
+ -	dest->arch = src->arch;
+ -	dest->userspace_addr = src->userspace_addr;
+ -	dest->flags = src->flags;
+ -	dest->id = src->id;
+ -	dest->as_id = src->as_id;
+ +	return slots;
+  }
+  
+ -static void kvm_invalidate_memslot(struct kvm *kvm,
+ -				   struct kvm_memory_slot *old,
+ -				   struct kvm_memory_slot *working_slot)
+ +static void kvm_copy_memslots_arch(struct kvm_memslots *to,
+ +				   struct kvm_memslots *from)
+  {
+ -	/*
+ -	 * Mark the current slot INVALID.  As with all memslot modifications,
+ -	 * this must be done on an unreachable slot to avoid modifying the
+ -	 * current slot in the active tree.
+ -	 */
+ -	kvm_copy_memslot(working_slot, old);
+ -	working_slot->flags |= KVM_MEMSLOT_INVALID;
+ -	kvm_replace_memslot(kvm, old, working_slot);
+ +	int i;
+ +
+ +	WARN_ON_ONCE(to->used_slots != from->used_slots);
+  
+++<<<<<<< HEAD
+ +	for (i = 0; i < from->used_slots; i++)
+ +		to->memslots[i].arch = from->memslots[i].arch;
+++=======
++ 	/*
++ 	 * Activate the slot that is now marked INVALID, but don't propagate
++ 	 * the slot to the now inactive slots. The slot is either going to be
++ 	 * deleted or recreated as a new slot.
++ 	 */
++ 	kvm_swap_active_memslots(kvm, old->as_id);
++ 
++ 	/*
++ 	 * From this point no new shadow pages pointing to a deleted, or moved,
++ 	 * memslot will be created.  Validation of sp->gfn happens in:
++ 	 *	- gfn_to_hva (kvm_read_guest, gfn_to_pfn)
++ 	 *	- kvm_is_visible_gfn (mmu_check_root)
++ 	 */
++ 	kvm_arch_flush_shadow_memslot(kvm, old);
++ 
++ 	/* Was released by kvm_swap_active_memslots, reacquire. */
++ 	mutex_lock(&kvm->slots_arch_lock);
++ 
++ 	/*
++ 	 * Copy the arch-specific field of the newly-installed slot back to the
++ 	 * old slot as the arch data could have changed between releasing
++ 	 * slots_arch_lock in install_new_memslots() and re-acquiring the lock
++ 	 * above.  Writers are required to retrieve memslots *after* acquiring
++ 	 * slots_arch_lock, thus the active slot's data is guaranteed to be fresh.
++ 	 */
++ 	old->arch = working_slot->arch;
++ }
++ 
++ static void kvm_create_memslot(struct kvm *kvm,
++ 			       const struct kvm_memory_slot *new,
++ 			       struct kvm_memory_slot *working)
++ {
++ 	/*
++ 	 * Add the new memslot to the inactive set as a copy of the
++ 	 * new memslot data provided by userspace.
++ 	 */
++ 	kvm_copy_memslot(working, new);
++ 	kvm_replace_memslot(kvm, NULL, working);
++ 	kvm_activate_memslot(kvm, NULL, working);
++ }
++ 
++ static void kvm_delete_memslot(struct kvm *kvm,
++ 			       struct kvm_memory_slot *old,
++ 			       struct kvm_memory_slot *invalid_slot)
++ {
++ 	/*
++ 	 * Remove the old memslot (in the inactive memslots) by passing NULL as
++ 	 * the "new" slot.
++ 	 */
++ 	kvm_replace_memslot(kvm, old, NULL);
++ 
++ 	/* And do the same for the invalid version in the active slot. */
++ 	kvm_activate_memslot(kvm, invalid_slot, NULL);
++ 
++ 	/* Free the invalid slot, the caller will clean up the old slot. */
++ 	kfree(invalid_slot);
++ }
++ 
++ static struct kvm_memory_slot *kvm_move_memslot(struct kvm *kvm,
++ 						struct kvm_memory_slot *old,
++ 						const struct kvm_memory_slot *new,
++ 						struct kvm_memory_slot *invalid_slot)
++ {
++ 	struct kvm_memslots *slots = kvm_get_inactive_memslots(kvm, old->as_id);
++ 
++ 	/*
++ 	 * The memslot's gfn is changing, remove it from the inactive tree, it
++ 	 * will be re-added with its updated gfn. Because its range is
++ 	 * changing, an in-place replace is not possible.
++ 	 */
++ 	kvm_erase_gfn_node(slots, old);
++ 
++ 	/*
++ 	 * The old slot is now fully disconnected, reuse its memory for the
++ 	 * persistent copy of "new".
++ 	 */
++ 	kvm_copy_memslot(old, new);
++ 
++ 	/* Re-add to the gfn tree with the updated gfn */
++ 	kvm_insert_gfn_node(slots, old);
++ 
++ 	/* Replace the current INVALID slot with the updated memslot. */
++ 	kvm_activate_memslot(kvm, invalid_slot, old);
++ 
++ 	/*
++ 	 * Clear the INVALID flag so that the invalid_slot is now a perfect
++ 	 * copy of the old slot.  Return it for cleanup in the caller.
++ 	 */
++ 	WARN_ON_ONCE(!(invalid_slot->flags & KVM_MEMSLOT_INVALID));
++ 	invalid_slot->flags &= ~KVM_MEMSLOT_INVALID;
++ 	return invalid_slot;
++ }
++ 
++ static void kvm_update_flags_memslot(struct kvm *kvm,
++ 				     struct kvm_memory_slot *old,
++ 				     const struct kvm_memory_slot *new,
++ 				     struct kvm_memory_slot *working_slot)
++ {
++ 	/*
++ 	 * Similar to the MOVE case, but the slot doesn't need to be zapped as
++ 	 * an intermediate step. Instead, the old memslot is simply replaced
++ 	 * with a new, updated copy in both memslot sets.
++ 	 */
++ 	kvm_copy_memslot(working_slot, new);
++ 	kvm_replace_memslot(kvm, old, working_slot);
++ 	kvm_activate_memslot(kvm, old, working_slot);
+++>>>>>>> bcb63dcde829 (KVM: Call kvm_arch_flush_shadow_memslot() on the old slot in kvm_invalidate_memslot())
+  }
+  
+  static int kvm_set_memslot(struct kvm *kvm,
+* Unmerged path virt/kvm/kvm_main.c
