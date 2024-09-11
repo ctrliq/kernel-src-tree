@@ -1,0 +1,128 @@
+nvmet: allow host connect even if no allowed subsystems are exported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Sagi Grimberg <sagi@grimberg.me>
+commit 253928eec61a52935584777f0dfba6cdb63967b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/253928ee.failed
+
+It is perfectly valid that a host connects to a discovery subsystem
+and gets an empty discovery log page since no subsystems are
+provisioned to it. No reason to disallow connecting to the discovery
+subsystem all together.
+
+	Signed-off-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Jay Sternberg <jay.e.sternberg@intel.com>
+	Reviewed-by: Phil Cayton <phil.cayton@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 253928eec61a52935584777f0dfba6cdb63967b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/nvmet.h
+diff --cc drivers/nvme/target/nvmet.h
+index 71edbd0ba324,05b98f25d65c..000000000000
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@@ -406,10 -461,14 +406,18 @@@ int __init nvmet_init_discovery(void)
+  void nvmet_exit_discovery(void);
+  
+  extern struct nvmet_subsys *nvmet_disc_subsys;
+ -extern u64 nvmet_genctr;
+  extern struct rw_semaphore nvmet_config_sem;
+  
+++<<<<<<< HEAD
+ +bool nvmet_host_allowed(struct nvmet_req *req, struct nvmet_subsys *subsys,
+ +		const char *hostnqn);
+++=======
++ extern u32 nvmet_ana_group_enabled[NVMET_MAX_ANAGRPS + 1];
++ extern u64 nvmet_ana_chgcnt;
++ extern struct rw_semaphore nvmet_ana_sem;
++ 
++ bool nvmet_host_allowed(struct nvmet_subsys *subsys, const char *hostnqn);
+++>>>>>>> 253928eec61a (nvmet: allow host connect even if no allowed subsystems are exported)
+  
+  int nvmet_bdev_ns_enable(struct nvmet_ns *ns);
+  int nvmet_file_ns_enable(struct nvmet_ns *ns);
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index f78277df01ea..af8a66f6d054 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -947,14 +947,18 @@ u16 nvmet_check_ctrl_status(struct nvmet_req *req, struct nvme_command *cmd)
+ 	return 0;
+ }
+ 
+-static bool __nvmet_host_allowed(struct nvmet_subsys *subsys,
+-		const char *hostnqn)
++bool nvmet_host_allowed(struct nvmet_subsys *subsys, const char *hostnqn)
+ {
+ 	struct nvmet_host_link *p;
+ 
++	lockdep_assert_held(&nvmet_config_sem);
++
+ 	if (subsys->allow_any_host)
+ 		return true;
+ 
++	if (subsys->type == NVME_NQN_DISC) /* allow all access to disc subsys */
++		return true;
++
+ 	list_for_each_entry(p, &subsys->hosts, entry) {
+ 		if (!strcmp(nvmet_host_name(p->host), hostnqn))
+ 			return true;
+@@ -963,30 +967,6 @@ static bool __nvmet_host_allowed(struct nvmet_subsys *subsys,
+ 	return false;
+ }
+ 
+-static bool nvmet_host_discovery_allowed(struct nvmet_req *req,
+-		const char *hostnqn)
+-{
+-	struct nvmet_subsys_link *s;
+-
+-	list_for_each_entry(s, &req->port->subsystems, entry) {
+-		if (__nvmet_host_allowed(s->subsys, hostnqn))
+-			return true;
+-	}
+-
+-	return false;
+-}
+-
+-bool nvmet_host_allowed(struct nvmet_req *req, struct nvmet_subsys *subsys,
+-		const char *hostnqn)
+-{
+-	lockdep_assert_held(&nvmet_config_sem);
+-
+-	if (subsys->type == NVME_NQN_DISC)
+-		return nvmet_host_discovery_allowed(req, hostnqn);
+-	else
+-		return __nvmet_host_allowed(subsys, hostnqn);
+-}
+-
+ /*
+  * Note: ctrl->subsys->lock should be held when calling this function
+  */
+@@ -1037,7 +1017,7 @@ u16 nvmet_alloc_ctrl(const char *subsysnqn, const char *hostnqn,
+ 
+ 	status = NVME_SC_CONNECT_INVALID_PARAM | NVME_SC_DNR;
+ 	down_read(&nvmet_config_sem);
+-	if (!nvmet_host_allowed(req, subsys, hostnqn)) {
++	if (!nvmet_host_allowed(subsys, hostnqn)) {
+ 		pr_info("connect by host %s for subsystem %s not allowed\n",
+ 			hostnqn, subsysnqn);
+ 		req->rsp->result.u32 = IPO_IATTR_CONNECT_DATA(hostnqn);
+diff --git a/drivers/nvme/target/discovery.c b/drivers/nvme/target/discovery.c
+index 60a4baacdfd3..fabbdd1d56d7 100644
+--- a/drivers/nvme/target/discovery.c
++++ b/drivers/nvme/target/discovery.c
+@@ -107,7 +107,7 @@ static void nvmet_execute_get_disc_log_page(struct nvmet_req *req)
+ 
+ 	down_read(&nvmet_config_sem);
+ 	list_for_each_entry(p, &req->port->subsystems, entry) {
+-		if (!nvmet_host_allowed(req, p->subsys, ctrl->hostnqn))
++		if (!nvmet_host_allowed(p->subsys, ctrl->hostnqn))
+ 			continue;
+ 		if (residual_len >= entry_size) {
+ 			char traddr[NVMF_TRADDR_SIZE];
+* Unmerged path drivers/nvme/target/nvmet.h
