@@ -333,7 +333,7 @@ enum em28xx_usb_audio_type {
 };
 
 /**
- * em28xx_amux - describes the type of audio input used by em28xx
+ * enum em28xx_amux - describes the type of audio input used by em28xx
  *
  * @EM28XX_AMUX_UNUSED:
  *	Used only on em28xx dev->map field, in order to mark an entry
