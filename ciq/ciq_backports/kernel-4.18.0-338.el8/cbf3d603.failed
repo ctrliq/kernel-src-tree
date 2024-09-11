@@ -1,0 +1,120 @@
+ch_ktls: lock is not freed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit cbf3d60329c4e11edcecac0c8fc6767b0f05e3a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/cbf3d603.failed
+
+Currently lock gets freed only if timeout expires, but missed a
+case when HW returns failure and goes for cleanup.
+
+Fixes: efca3878a5fb ("ch_ktls: Issue if connection offload fails")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+Link: https://lore.kernel.org/r/20201125072626.10861-1-rohitm@chelsio.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit cbf3d60329c4e11edcecac0c8fc6767b0f05e3a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 7f91252315ab,7f90b828d159..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -540,23 -531,78 +540,40 @@@ int chcr_ktls_dev_add(struct net_devic
+  	/* create a filter and call cxgb4_l2t_send to send the packet out, which
+  	 * will take care of updating l2t entry in hw if not already done.
+  	 */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ +	ret = chcr_setup_connection(sk, tx_info);
+ +	if (ret)
+ +		goto out2;
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +	/* Driver shouldn't be removed until any single connection exists */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -EINVAL;
+ +		goto out2;
+++=======
++ 	if (chcr_setup_connection(sk, tx_info))
++ 		goto put_module;
++ 
++ 	/* Wait for reply */
++ 	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
++ 	spin_lock_bh(&tx_info->lock);
++ 	if (tx_info->open_state) {
++ 		/* need to wait for hw response, can't free tx_info yet. */
++ 		if (tx_info->open_state == CH_KTLS_OPEN_PENDING)
++ 			tx_info->pending_close = true;
++ 		else
++ 			spin_unlock_bh(&tx_info->lock);
++ 		/* if in pending close, free the lock after the cleanup */
++ 		goto put_module;
+++>>>>>>> cbf3d60329c4 (ch_ktls: lock is not freed):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	/* initialize tcb */
+ -	reinit_completion(&tx_info->completion);
+ -	/* mark it pending for hw response */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_init_tcb_fields(tx_info))
+ -		goto free_tid;
+ -
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		tx_info->pending_close = true;
+ -		/* free the lock after cleanup */
+ -		goto free_tid;
+ -	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	if (!cxgb4_check_l2t_valid(tx_info->l2te))
+ -		goto free_tid;
+ -
+ -	atomic64_inc(&port_stats->ktls_tx_ctx);
+ -	tx_ctx->chcr_info = tx_info;
+  
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_open);
+  	return 0;
+ -
+ -free_tid:
+ -	chcr_ktls_mark_tcb_close(tx_info);
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	/* clear clip entry */
+ -	if (tx_info->ip_family == AF_INET6)
+ -		cxgb4_clip_release(netdev, (const u32 *)
+ -				   &sk->sk_v6_rcv_saddr,
+ -				   1);
+ -#endif
+ -	cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
+ -			 tx_info->tid, tx_info->ip_family);
+ -
+ -put_module:
+ -	/* release module refcount */
+ -	module_put(THIS_MODULE);
+ -free_l2t:
+ -	cxgb4_l2t_release(tx_info->l2te);
+ -free_tx_info:
+ -	if (tx_info->pending_close)
+ -		spin_unlock_bh(&tx_info->lock);
+ -	else
+ -		kvfree(tx_info);
+ +out2:
+ +	kvfree(tx_info);
+  out:
+ -	atomic64_inc(&port_stats->ktls_tx_connection_fail);
+ -	return -1;
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_fail);
+ +	return ret;
+  }
+  
+  /*
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
