@@ -1,0 +1,294 @@
+nvme: introduce generic per-namespace chardev
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Minwoo Im <minwoo.im.dev@gmail.com>
+commit 2637baed78010eeaae274feb5b99ce90933fadfb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2637baed.failed
+
+Userspace has not been allowed to I/O to device that's failed to
+be initialized.  This patch introduces generic per-namespace character
+device to allow userspace to I/O regardless the block device is there or
+not.
+
+The chardev naming convention will similar to the existing blkdev naming,
+using a ng prefix instead of nvme, i.e.
+
+	- /dev/ngXnY
+
+It also supports multipath which means it will not expose chardev for the
+hidden namespace blkdevs (e.g., nvmeXcYnZ).  If /dev/ngXnY is created for
+a ns_head, then I/O request will be routed to a specific controller
+selected by the iopolicy of the subsystem.
+
+	Signed-off-by: Minwoo Im <minwoo.im.dev@gmail.com>
+	Signed-off-by: Javier González <javier.gonz@samsung.com>
+	Reviewed-by: Keith Busch <kbusch@kernel.org>
+	Tested-by: Kanchan Joshi <joshi.k@samsung.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2637baed78010eeaae274feb5b99ce90933fadfb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/ioctl.c
+#	drivers/nvme/host/multipath.c
+#	drivers/nvme/host/nvme.h
+diff --cc drivers/nvme/host/multipath.c
+index c4c5d694fcd4,0d0de3433f37..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -350,6 -334,71 +350,74 @@@ static blk_qc_t nvme_ns_head_make_reque
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nvme_ns_head_open(struct block_device *bdev, fmode_t mode)
++ {
++ 	if (!nvme_tryget_ns_head(bdev->bd_disk->private_data))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static void nvme_ns_head_release(struct gendisk *disk, fmode_t mode)
++ {
++ 	nvme_put_ns_head(disk->private_data);
++ }
++ 
++ const struct block_device_operations nvme_ns_head_ops = {
++ 	.owner		= THIS_MODULE,
++ 	.submit_bio	= nvme_ns_head_submit_bio,
++ 	.open		= nvme_ns_head_open,
++ 	.release	= nvme_ns_head_release,
++ 	.ioctl		= nvme_ns_head_ioctl,
++ 	.getgeo		= nvme_getgeo,
++ 	.report_zones	= nvme_report_zones,
++ 	.pr_ops		= &nvme_pr_ops,
++ };
++ 
++ static inline struct nvme_ns_head *cdev_to_ns_head(struct cdev *cdev)
++ {
++ 	return container_of(cdev, struct nvme_ns_head, cdev);
++ }
++ 
++ static int nvme_ns_head_chr_open(struct inode *inode, struct file *file)
++ {
++ 	if (!nvme_tryget_ns_head(cdev_to_ns_head(inode->i_cdev)))
++ 		return -ENXIO;
++ 	return 0;
++ }
++ 
++ static int nvme_ns_head_chr_release(struct inode *inode, struct file *file)
++ {
++ 	nvme_put_ns_head(cdev_to_ns_head(inode->i_cdev));
++ 	return 0;
++ }
++ 
++ static const struct file_operations nvme_ns_head_chr_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.open		= nvme_ns_head_chr_open,
++ 	.release	= nvme_ns_head_chr_release,
++ 	.unlocked_ioctl	= nvme_ns_head_chr_ioctl,
++ 	.compat_ioctl	= compat_ptr_ioctl,
++ };
++ 
++ static int nvme_add_ns_head_cdev(struct nvme_ns_head *head)
++ {
++ 	int ret;
++ 
++ 	head->cdev_device.parent = &head->subsys->dev;
++ 	ret = dev_set_name(&head->cdev_device, "ng%dn%d",
++ 			   head->subsys->instance, head->instance);
++ 	if (ret)
++ 		return ret;
++ 	ret = nvme_cdev_add(&head->cdev, &head->cdev_device,
++ 			    &nvme_ns_head_chr_fops, THIS_MODULE);
++ 	if (ret)
++ 		kfree_const(head->cdev_device.kobj.name);
++ 	return ret;
++ }
++ 
+++>>>>>>> 2637baed7801 (nvme: introduce generic per-namespace chardev)
+  static void nvme_requeue_work(struct work_struct *work)
+  {
+  	struct nvme_ns_head *head =
+diff --cc drivers/nvme/host/nvme.h
+index 7d87bfacb56d,773dde5b231d..000000000000
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@@ -649,8 -662,25 +656,27 @@@ int nvme_get_log(struct nvme_ctrl *ctrl
+  struct nvme_ns *nvme_get_ns_from_disk(struct gendisk *disk,
+  		struct nvme_ns_head **head, int *srcu_idx);
+  void nvme_put_ns_from_disk(struct nvme_ns_head *head, int idx);
+++<<<<<<< HEAD
+++=======
++ bool nvme_tryget_ns_head(struct nvme_ns_head *head);
++ void nvme_put_ns_head(struct nvme_ns_head *head);
++ struct nvme_ctrl *nvme_find_get_live_ctrl(struct nvme_subsystem *subsys);
++ int nvme_cdev_add(struct cdev *cdev, struct device *cdev_device,
++ 		const struct file_operations *fops, struct module *owner);
++ void nvme_cdev_del(struct cdev *cdev, struct device *cdev_device);
++ int nvme_ioctl(struct block_device *bdev, fmode_t mode,
++ 		unsigned int cmd, unsigned long arg);
++ long nvme_ns_chr_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
++ int nvme_ns_head_ioctl(struct block_device *bdev, fmode_t mode,
++ 		unsigned int cmd, unsigned long arg);
++ long nvme_ns_head_chr_ioctl(struct file *file, unsigned int cmd,
++ 		unsigned long arg);
++ long nvme_dev_ioctl(struct file *file, unsigned int cmd,
++ 		unsigned long arg);
++ int nvme_getgeo(struct block_device *bdev, struct hd_geometry *geo);
+++>>>>>>> 2637baed7801 (nvme: introduce generic per-namespace chardev)
+  
+  extern const struct attribute_group *nvme_ns_id_attr_groups[];
+ -extern const struct pr_ops nvme_pr_ops;
+  extern const struct block_device_operations nvme_ns_head_ops;
+  
+  #ifdef CONFIG_NVME_MULTIPATH
+* Unmerged path drivers/nvme/host/ioctl.c
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 0e1b405e0026..e3c521263de7 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -89,6 +89,10 @@ static dev_t nvme_ctrl_base_chr_devt;
+ static struct class *nvme_class;
+ static struct class *nvme_subsys_class;
+ 
++static DEFINE_IDA(nvme_ns_chr_minor_ida);
++static dev_t nvme_ns_chr_devt;
++static struct class *nvme_ns_chr_class;
++
+ static void nvme_put_subsystem(struct nvme_subsystem *subsys);
+ static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
+ 					   unsigned nsid);
+@@ -3883,6 +3887,66 @@ static int __nvme_check_ids(struct nvme_subsystem *subsys,
+ 	return 0;
+ }
+ 
++void nvme_cdev_del(struct cdev *cdev, struct device *cdev_device)
++{
++	cdev_device_del(cdev, cdev_device);
++	ida_simple_remove(&nvme_ns_chr_minor_ida, MINOR(cdev_device->devt));
++}
++
++int nvme_cdev_add(struct cdev *cdev, struct device *cdev_device,
++		const struct file_operations *fops, struct module *owner)
++{
++	int minor, ret;
++
++	minor = ida_simple_get(&nvme_ns_chr_minor_ida, 0, 0, GFP_KERNEL);
++	if (minor < 0)
++		return minor;
++	cdev_device->devt = MKDEV(MAJOR(nvme_ns_chr_devt), minor);
++	cdev_device->class = nvme_ns_chr_class;
++	device_initialize(cdev_device);
++	cdev_init(cdev, fops);
++	cdev->owner = owner;
++	ret = cdev_device_add(cdev, cdev_device);
++	if (ret)
++		ida_simple_remove(&nvme_ns_chr_minor_ida, minor);
++	return ret;
++}
++
++static int nvme_ns_chr_open(struct inode *inode, struct file *file)
++{
++	return nvme_ns_open(container_of(inode->i_cdev, struct nvme_ns, cdev));
++}
++
++static int nvme_ns_chr_release(struct inode *inode, struct file *file)
++{
++	nvme_ns_release(container_of(inode->i_cdev, struct nvme_ns, cdev));
++	return 0;
++}
++
++static const struct file_operations nvme_ns_chr_fops = {
++	.owner		= THIS_MODULE,
++	.open		= nvme_ns_chr_open,
++	.release	= nvme_ns_chr_release,
++	.unlocked_ioctl	= nvme_ns_chr_ioctl,
++	.compat_ioctl	= compat_ptr_ioctl,
++};
++
++static int nvme_add_ns_cdev(struct nvme_ns *ns)
++{
++	int ret;
++
++	ns->cdev_device.parent = ns->ctrl->device;
++	ret = dev_set_name(&ns->cdev_device, "ng%dn%d",
++			   ns->ctrl->instance, ns->head->instance);
++	if (ret)
++		return ret;
++	ret = nvme_cdev_add(&ns->cdev, &ns->cdev_device, &nvme_ns_chr_fops,
++			    ns->ctrl->ops->module);
++	if (ret)
++		kfree_const(ns->cdev_device.kobj.name);
++	return ret;
++}
++
+ static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
+ 		unsigned nsid, struct nvme_ns_ids *ids)
+ {
+@@ -4085,6 +4149,8 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid,
+ 	nvme_get_ctrl(ctrl);
+ 
+ 	device_add_disk(ctrl->device, ns->disk, nvme_ns_id_attr_groups);
++	if (!nvme_ns_head_multipath(ns->head))
++		nvme_add_ns_cdev(ns);
+ 
+ 	nvme_mpath_add_disk(ns, id);
+ 	nvme_fault_inject_init(&ns->fault_inject, ns->disk->disk_name);
+@@ -4129,6 +4195,8 @@ static void nvme_ns_remove(struct nvme_ns *ns)
+ 	synchronize_srcu(&ns->head->srcu); /* wait for concurrent submissions */
+ 
+ 	if (ns->disk->flags & GENHD_FL_UP) {
++		if (!nvme_ns_head_multipath(ns->head))
++			nvme_cdev_del(&ns->cdev, &ns->cdev_device);
+ 		del_gendisk(ns->disk);
+ 		blk_cleanup_queue(ns->queue);
+ 		if (blk_get_integrity(ns->disk))
+@@ -4919,8 +4987,24 @@ static int __init nvme_core_init(void)
+ 		result = PTR_ERR(nvme_subsys_class);
+ 		goto destroy_class;
+ 	}
++
++	result = alloc_chrdev_region(&nvme_ns_chr_devt, 0, NVME_MINORS,
++				     "nvme-generic");
++	if (result < 0)
++		goto destroy_subsys_class;
++
++	nvme_ns_chr_class = class_create(THIS_MODULE, "nvme-generic");
++	if (IS_ERR(nvme_ns_chr_class)) {
++		result = PTR_ERR(nvme_ns_chr_class);
++		goto unregister_generic_ns;
++	}
++
+ 	return 0;
+ 
++unregister_generic_ns:
++	unregister_chrdev_region(nvme_ns_chr_devt, NVME_MINORS);
++destroy_subsys_class:
++	class_destroy(nvme_subsys_class);
+ destroy_class:
+ 	class_destroy(nvme_class);
+ unregister_chrdev:
+@@ -4937,12 +5021,15 @@ static int __init nvme_core_init(void)
+ 
+ static void __exit nvme_core_exit(void)
+ {
++	class_destroy(nvme_ns_chr_class);
+ 	class_destroy(nvme_subsys_class);
+ 	class_destroy(nvme_class);
++	unregister_chrdev_region(nvme_ns_chr_devt, NVME_MINORS);
+ 	unregister_chrdev_region(nvme_ctrl_base_chr_devt, NVME_MINORS);
+ 	destroy_workqueue(nvme_delete_wq);
+ 	destroy_workqueue(nvme_reset_wq);
+ 	destroy_workqueue(nvme_wq);
++	ida_destroy(&nvme_ns_chr_minor_ida);
+ 	ida_destroy(&nvme_instance_ida);
+ }
+ 
+* Unmerged path drivers/nvme/host/ioctl.c
+* Unmerged path drivers/nvme/host/multipath.c
+* Unmerged path drivers/nvme/host/nvme.h
