@@ -388,6 +388,8 @@ enum phy_state {
 };
 #endif /* __GENKSYMS__ */
 
+#define MDIO_MMD_NUM 32
+
 /**
  * struct phy_c45_device_ids - 802.3-c45 Device Identifiers
  * @devices_in_package: Bit vector of devices present.
