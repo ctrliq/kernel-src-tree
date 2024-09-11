@@ -1,0 +1,150 @@
+libbpf: Refactor BTF map definition parsing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Andrii Nakryiko <andrii@kernel.org>
+commit c7ef5ec9573f05535370d8716576263681cabec7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/c7ef5ec9.failed
+
+Refactor BTF-defined maps parsing logic to allow it to be nicely reused by BPF
+static linker. Further, at least for BPF static linker, it's important to know
+which attributes of a BPF map were defined explicitly, so provide a bit set
+for each known portion of BTF map definition. This allows BPF static linker to
+do a simple check when dealing with extern map declarations.
+
+The same capabilities allow to distinguish attributes explicitly set to zero
+(e.g., __uint(max_entries, 0)) vs the case of not specifying it at all (no
+max_entries attribute at all). Libbpf is currently not utilizing that, but it
+could be useful for backwards compatibility reasons later.
+
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20210423181348.1801389-7-andrii@kernel.org
+(cherry picked from commit c7ef5ec9573f05535370d8716576263681cabec7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 3954f0c3bd25,4f8335fc0bc9..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -2201,56 -2189,34 +2189,49 @@@ int parse_btf_map_def(const char *map_n
+  				return -EINVAL;
+  			}
+  
+++<<<<<<< HEAD
+ +			map->inner_map = calloc(1, sizeof(*map->inner_map));
+ +			if (!map->inner_map)
+ +				return -ENOMEM;
+ +			map->inner_map->sec_idx = obj->efile.btf_maps_shndx;
+ +			map->inner_map->name = malloc(strlen(map->name) +
+ +						      sizeof(".inner") + 1);
+ +			if (!map->inner_map->name)
+ +				return -ENOMEM;
+ +			sprintf(map->inner_map->name, "%s.inner", map->name);
+ +
+ +			err = parse_btf_map_def(obj, map->inner_map, t, strict,
+ +						true /* is_inner */, NULL);
+++=======
++ 			snprintf(inner_map_name, sizeof(inner_map_name), "%s.inner", map_name);
++ 			err = parse_btf_map_def(inner_map_name, btf, t, strict, inner_def, NULL);
+++>>>>>>> c7ef5ec9573f (libbpf: Refactor BTF map definition parsing)
+  			if (err)
+  				return err;
++ 
++ 			map_def->parts |= MAP_DEF_INNER_MAP;
+  		} else if (strcmp(name, "pinning") == 0) {
+  			__u32 val;
+- 			int err;
+  
+  			if (is_inner) {
+- 				pr_debug("map '%s': inner def can't be pinned.\n",
+- 					 map->name);
++ 				pr_warn("map '%s': inner def can't be pinned.\n", map_name);
+  				return -EINVAL;
+  			}
+- 			if (!get_map_field_int(map->name, obj->btf, m, &val))
++ 			if (!get_map_field_int(map_name, btf, m, &val))
+  				return -EINVAL;
+- 			pr_debug("map '%s': found pinning = %u.\n",
+- 				 map->name, val);
+- 
+- 			if (val != LIBBPF_PIN_NONE &&
+- 			    val != LIBBPF_PIN_BY_NAME) {
++ 			if (val != LIBBPF_PIN_NONE && val != LIBBPF_PIN_BY_NAME) {
+  				pr_warn("map '%s': invalid pinning value %u.\n",
+- 					map->name, val);
++ 					map_name, val);
+  				return -EINVAL;
+  			}
+- 			if (val == LIBBPF_PIN_BY_NAME) {
+- 				err = build_map_pin_path(map, pin_root_path);
+- 				if (err) {
+- 					pr_warn("map '%s': couldn't build pin path.\n",
+- 						map->name);
+- 					return err;
+- 				}
+- 			}
++ 			map_def->pinning = val;
++ 			map_def->parts |= MAP_DEF_PINNING;
+  		} else {
+  			if (strict) {
+- 				pr_warn("map '%s': unknown field '%s'.\n",
+- 					map->name, name);
++ 				pr_warn("map '%s': unknown field '%s'.\n", map_name, name);
+  				return -ENOTSUP;
+  			}
+- 			pr_debug("map '%s': ignoring unknown field '%s'.\n",
+- 				 map->name, name);
++ 			pr_debug("map '%s': ignoring unknown field '%s'.\n", map_name, name);
+  		}
+  	}
+  
+* Unmerged path tools/lib/bpf/libbpf.c
+diff --git a/tools/lib/bpf/libbpf_internal.h b/tools/lib/bpf/libbpf_internal.h
+index 92b7eae10c6d..17883073710c 100644
+--- a/tools/lib/bpf/libbpf_internal.h
++++ b/tools/lib/bpf/libbpf_internal.h
+@@ -138,6 +138,38 @@ static inline __u32 btf_type_info(int kind, int vlen, int kflag)
+ 	return (kflag << 31) | (kind << 24) | vlen;
+ }
+ 
++enum map_def_parts {
++	MAP_DEF_MAP_TYPE	= 0x001,
++	MAP_DEF_KEY_TYPE	= 0x002,
++	MAP_DEF_KEY_SIZE	= 0x004,
++	MAP_DEF_VALUE_TYPE	= 0x008,
++	MAP_DEF_VALUE_SIZE	= 0x010,
++	MAP_DEF_MAX_ENTRIES	= 0x020,
++	MAP_DEF_MAP_FLAGS	= 0x040,
++	MAP_DEF_NUMA_NODE	= 0x080,
++	MAP_DEF_PINNING		= 0x100,
++	MAP_DEF_INNER_MAP	= 0x200,
++
++	MAP_DEF_ALL		= 0x3ff, /* combination of all above */
++};
++
++struct btf_map_def {
++	enum map_def_parts parts;
++	__u32 map_type;
++	__u32 key_type_id;
++	__u32 key_size;
++	__u32 value_type_id;
++	__u32 value_size;
++	__u32 max_entries;
++	__u32 map_flags;
++	__u32 numa_node;
++	__u32 pinning;
++};
++
++int parse_btf_map_def(const char *map_name, struct btf *btf,
++		      const struct btf_type *def_t, bool strict,
++		      struct btf_map_def *map_def, struct btf_map_def *inner_def);
++
+ void *libbpf_add_mem(void **data, size_t *cap_cnt, size_t elem_sz,
+ 		     size_t cur_cnt, size_t max_cnt, size_t add_cnt);
+ int libbpf_ensure_mem(void **data, size_t *cap_cnt, size_t elem_sz, size_t need_cnt);
