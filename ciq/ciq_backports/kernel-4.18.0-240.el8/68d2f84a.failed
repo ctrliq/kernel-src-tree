@@ -1,0 +1,165 @@
+net: gro: properly remove skb from list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] gro: properly remove skb from list (Ivan Vecera) [1805302]
+Rebuild_FUZZ: 93.15%
+commit-author Prashant Bhole <bhole_prashant_q7@lab.ntt.co.jp>
+commit 68d2f84a1368cc5d4ccbbbfc6821f159d27681c9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/68d2f84a.failed
+
+Following crash occurs in validate_xmit_skb_list() when same skb is
+iterated multiple times in the loop and consume_skb() is called.
+
+The root cause is calling list_del_init(&skb->list) and not clearing
+skb->next in d4546c2509b1. list_del_init(&skb->list) sets skb->next
+to point to skb itself. skb->next needs to be cleared because other
+parts of network stack uses another kind of SKB lists.
+validate_xmit_skb_list() uses such list.
+
+A similar type of bugfix was reported by Jesper Dangaard Brouer.
+https://patchwork.ozlabs.org/patch/942541/
+
+This patch clears skb->next and changes list_del_init() to list_del()
+so that list->prev will maintain the list poison.
+
+[  148.185511] ==================================================================
+[  148.187865] BUG: KASAN: use-after-free in validate_xmit_skb_list+0x4b/0xa0
+[  148.190158] Read of size 8 at addr ffff8801e52eefc0 by task swapper/1/0
+[  148.192940]
+[  148.193642] CPU: 1 PID: 0 Comm: swapper/1 Not tainted 4.18.0-rc3+ #25
+[  148.195423] Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20180531_142017-buildhw-08.phx2.fedoraproject.org-1.fc28 04/01/2014
+[  148.199129] Call Trace:
+[  148.200565]  <IRQ>
+[  148.201911]  dump_stack+0xc6/0x14c
+[  148.203572]  ? dump_stack_print_info.cold.1+0x2f/0x2f
+[  148.205083]  ? kmsg_dump_rewind_nolock+0x59/0x59
+[  148.206307]  ? validate_xmit_skb+0x2c6/0x560
+[  148.207432]  ? debug_show_held_locks+0x30/0x30
+[  148.208571]  ? validate_xmit_skb_list+0x4b/0xa0
+[  148.211144]  print_address_description+0x6c/0x23c
+[  148.212601]  ? validate_xmit_skb_list+0x4b/0xa0
+[  148.213782]  kasan_report.cold.6+0x241/0x2fd
+[  148.214958]  validate_xmit_skb_list+0x4b/0xa0
+[  148.216494]  sch_direct_xmit+0x1b0/0x680
+[  148.217601]  ? dev_watchdog+0x4e0/0x4e0
+[  148.218675]  ? do_raw_spin_trylock+0x10/0x120
+[  148.219818]  ? do_raw_spin_lock+0xe0/0xe0
+[  148.221032]  __dev_queue_xmit+0x1167/0x1810
+[  148.222155]  ? sched_clock+0x5/0x10
+[...]
+
+[  148.474257] Allocated by task 0:
+[  148.475363]  kasan_kmalloc+0xbf/0xe0
+[  148.476503]  kmem_cache_alloc+0xb4/0x1b0
+[  148.477654]  __build_skb+0x91/0x250
+[  148.478677]  build_skb+0x67/0x180
+[  148.479657]  e1000_clean_rx_irq+0x542/0x8a0
+[  148.480757]  e1000_clean+0x652/0xd10
+[  148.481772]  net_rx_action+0x4ea/0xc20
+[  148.482808]  __do_softirq+0x1f9/0x574
+[  148.483831]
+[  148.484575] Freed by task 0:
+[  148.485504]  __kasan_slab_free+0x12e/0x180
+[  148.486589]  kmem_cache_free+0xb4/0x240
+[  148.487634]  kfree_skbmem+0xed/0x150
+[  148.488648]  consume_skb+0x146/0x250
+[  148.489665]  validate_xmit_skb+0x2b7/0x560
+[  148.490754]  validate_xmit_skb_list+0x70/0xa0
+[  148.491897]  sch_direct_xmit+0x1b0/0x680
+[  148.493949]  __dev_queue_xmit+0x1167/0x1810
+[  148.495103]  br_dev_queue_push_xmit+0xce/0x250
+[  148.496196]  br_forward_finish+0x276/0x280
+[  148.497234]  __br_forward+0x44f/0x520
+[  148.498260]  br_forward+0x19f/0x1b0
+[  148.499264]  br_handle_frame_finish+0x65e/0x980
+[  148.500398]  NF_HOOK.constprop.10+0x290/0x2a0
+[  148.501522]  br_handle_frame+0x417/0x640
+[  148.502582]  __netif_receive_skb_core+0xaac/0x18f0
+[  148.503753]  __netif_receive_skb_one_core+0x98/0x120
+[  148.504958]  netif_receive_skb_internal+0xe3/0x330
+[  148.506154]  napi_gro_complete+0x190/0x2a0
+[  148.507243]  dev_gro_receive+0x9f7/0x1100
+[  148.508316]  napi_gro_receive+0xcb/0x260
+[  148.509387]  e1000_clean_rx_irq+0x2fc/0x8a0
+[  148.510501]  e1000_clean+0x652/0xd10
+[  148.511523]  net_rx_action+0x4ea/0xc20
+[  148.512566]  __do_softirq+0x1f9/0x574
+[  148.513598]
+[  148.514346] The buggy address belongs to the object at ffff8801e52eefc0
+[  148.514346]  which belongs to the cache skbuff_head_cache of size 232
+[  148.517047] The buggy address is located 0 bytes inside of
+[  148.517047]  232-byte region [ffff8801e52eefc0, ffff8801e52ef0a8)
+[  148.519549] The buggy address belongs to the page:
+[  148.520726] page:ffffea000794bb00 count:1 mapcount:0 mapping:ffff880106f4dfc0 index:0xffff8801e52ee840 compound_mapcount: 0
+[  148.524325] flags: 0x17ffffc0008100(slab|head)
+[  148.525481] raw: 0017ffffc0008100 ffff880106b938d0 ffff880106b938d0 ffff880106f4dfc0
+[  148.527503] raw: ffff8801e52ee840 0000000000190011 00000001ffffffff 0000000000000000
+[  148.529547] page dumped because: kasan: bad access detected
+
+Fixes: d4546c2509b1 ("net: Convert GRO SKB handling to list_head.")
+	Signed-off-by: Prashant Bhole <bhole_prashant_q7@lab.ntt.co.jp>
+	Reported-by: Tyler Hicks <tyhicks@canonical.com>
+	Tested-by: Tyler Hicks <tyhicks@canonical.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68d2f84a1368cc5d4ccbbbfc6821f159d27681c9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index cd8bd05e0222,14a748ee8cc9..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5177,7 -5271,24 +5177,28 @@@ out
+  	return netif_receive_skb_internal(skb);
+  }
+  
+++<<<<<<< HEAD
+ +/* napi->gro_list contains packets ordered by age.
+++=======
++ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
++ 				   bool flush_old)
++ {
++ 	struct list_head *head = &napi->gro_hash[index].list;
++ 	struct sk_buff *skb, *p;
++ 
++ 	list_for_each_entry_safe_reverse(skb, p, head, list) {
++ 		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
++ 			return;
++ 		list_del(&skb->list);
++ 		skb->next = NULL;
++ 		napi_gro_complete(skb);
++ 		napi->gro_count--;
++ 		napi->gro_hash[index].count--;
++ 	}
++ }
++ 
++ /* napi->gro_hash[].list contains packets ordered by age.
+++>>>>>>> 68d2f84a1368 (net: gro: properly remove skb from list)
+   * youngest packets at the head of it.
+   * Complete skbs in reverse order to reduce latencies.
+   */
+@@@ -5349,12 -5462,11 +5370,18 @@@ static enum gro_result dev_gro_receive(
+  	ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
+  
+  	if (pp) {
+++<<<<<<< HEAD
+ +		struct sk_buff *nskb = *pp;
+ +
+ +		*pp = nskb->next;
+ +		nskb->next = NULL;
+ +		napi_gro_complete(nskb);
+++=======
++ 		list_del(&pp->list);
++ 		pp->next = NULL;
++ 		napi_gro_complete(pp);
+++>>>>>>> 68d2f84a1368 (net: gro: properly remove skb from list)
+  		napi->gro_count--;
+ -		napi->gro_hash[hash].count--;
+  	}
+  
+  	if (same_flow)
+* Unmerged path net/core/dev.c
