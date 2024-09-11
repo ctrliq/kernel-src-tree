@@ -1,0 +1,1233 @@
+bpf: implement getsockopt and setsockopt hooks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 0d01da6afc5402f60325c5da31b22f7d56689b49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0d01da6a.failed
+
+Implement new BPF_PROG_TYPE_CGROUP_SOCKOPT program type and
+BPF_CGROUP_{G,S}ETSOCKOPT cgroup hooks.
+
+BPF_CGROUP_SETSOCKOPT can modify user setsockopt arguments before
+passing them down to the kernel or bypass kernel completely.
+BPF_CGROUP_GETSOCKOPT can can inspect/modify getsockopt arguments that
+kernel returns.
+Both hooks reuse existing PTR_TO_PACKET{,_END} infrastructure.
+
+The buffer memory is pre-allocated (because I don't think there is
+a precedent for working with __user memory from bpf). This might be
+slow to do for each {s,g}etsockopt call, that's why I've added
+__cgroup_bpf_prog_array_is_empty that exits early if there is nothing
+attached to a cgroup. Note, however, that there is a race between
+__cgroup_bpf_prog_array_is_empty and BPF_PROG_RUN_ARRAY where cgroup
+program layout might have changed; this should not be a problem
+because in general there is a race between multiple calls to
+{s,g}etsocktop and user adding/removing bpf progs from a cgroup.
+
+The return code of the BPF program is handled as follows:
+* 0: EPERM
+* 1: success, continue with next BPF program in the cgroup chain
+
+v9:
+* allow overwriting setsockopt arguments (Alexei Starovoitov):
+  * use set_fs (same as kernel_setsockopt)
+  * buffer is always kzalloc'd (no small on-stack buffer)
+
+v8:
+* use s32 for optlen (Andrii Nakryiko)
+
+v7:
+* return only 0 or 1 (Alexei Starovoitov)
+* always run all progs (Alexei Starovoitov)
+* use optval=0 as kernel bypass in setsockopt (Alexei Starovoitov)
+  (decided to use optval=-1 instead, optval=0 might be a valid input)
+* call getsockopt hook after kernel handlers (Alexei Starovoitov)
+
+v6:
+* rework cgroup chaining; stop as soon as bpf program returns
+  0 or 2; see patch with the documentation for the details
+* drop Andrii's and Martin's Acked-by (not sure they are comfortable
+  with the new state of things)
+
+v5:
+* skip copy_to_user() and put_user() when ret == 0 (Martin Lau)
+
+v4:
+* don't export bpf_sk_fullsock helper (Martin Lau)
+* size != sizeof(__u64) for uapi pointers (Martin Lau)
+* offsetof instead of bpf_ctx_range when checking ctx access (Martin Lau)
+
+v3:
+* typos in BPF_PROG_CGROUP_SOCKOPT_RUN_ARRAY comments (Andrii Nakryiko)
+* reverse christmas tree in BPF_PROG_CGROUP_SOCKOPT_RUN_ARRAY (Andrii
+  Nakryiko)
+* use __bpf_md_ptr instead of __u32 for optval{,_end} (Martin Lau)
+* use BPF_FIELD_SIZEOF() for consistency (Martin Lau)
+* new CG_SOCKOPT_ACCESS macro to wrap repeated parts
+
+v2:
+* moved bpf_sockopt_kern fields around to remove a hole (Martin Lau)
+* aligned bpf_sockopt_kern->buf to 8 bytes (Martin Lau)
+* bpf_prog_array_is_empty instead of bpf_prog_array_length (Martin Lau)
+* added [0,2] return code check to verifier (Martin Lau)
+* dropped unused buf[64] from the stack (Martin Lau)
+* use PTR_TO_SOCKET for bpf_sockopt->sk (Martin Lau)
+* dropped bpf_target_off from ctx rewrites (Martin Lau)
+* use return code for kernel bypass (Martin Lau & Andrii Nakryiko)
+
+	Cc: Andrii Nakryiko <andriin@fb.com>
+	Cc: Martin Lau <kafai@fb.com>
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 0d01da6afc5402f60325c5da31b22f7d56689b49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf-cgroup.h
+#	include/linux/bpf.h
+#	include/linux/bpf_types.h
+#	include/linux/filter.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/cgroup.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf-cgroup.h
+index 92c9852d2197,169fd25f6bc2..000000000000
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@@ -150,6 -118,20 +150,23 @@@ int __cgroup_bpf_run_filter_sock_ops(st
+  int __cgroup_bpf_check_dev_permission(short dev_type, u32 major, u32 minor,
+  				      short access, enum bpf_attach_type type);
+  
+++<<<<<<< HEAD
+++=======
++ int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++ 				   struct ctl_table *table, int write,
++ 				   void __user *buf, size_t *pcount,
++ 				   loff_t *ppos, void **new_buf,
++ 				   enum bpf_attach_type type);
++ 
++ int __cgroup_bpf_run_filter_setsockopt(struct sock *sock, int *level,
++ 				       int *optname, char __user *optval,
++ 				       int *optlen, char **kernel_optval);
++ int __cgroup_bpf_run_filter_getsockopt(struct sock *sk, int level,
++ 				       int optname, char __user *optval,
++ 				       int __user *optlen, int max_optlen,
++ 				       int retval);
++ 
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  static inline enum bpf_cgroup_storage_type cgroup_storage_type(
+  	struct bpf_map *map)
+  {
+@@@ -294,6 -282,50 +311,53 @@@ int bpf_percpu_cgroup_storage_update(st
+  									      \
+  	__ret;								      \
+  })
+++<<<<<<< HEAD
+++=======
++ 
++ 
++ #define BPF_CGROUP_RUN_PROG_SYSCTL(head, table, write, buf, count, pos, nbuf)  \
++ ({									       \
++ 	int __ret = 0;							       \
++ 	if (cgroup_bpf_enabled)						       \
++ 		__ret = __cgroup_bpf_run_filter_sysctl(head, table, write,     \
++ 						       buf, count, pos, nbuf,  \
++ 						       BPF_CGROUP_SYSCTL);     \
++ 	__ret;								       \
++ })
++ 
++ #define BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock, level, optname, optval, optlen,   \
++ 				       kernel_optval)			       \
++ ({									       \
++ 	int __ret = 0;							       \
++ 	if (cgroup_bpf_enabled)						       \
++ 		__ret = __cgroup_bpf_run_filter_setsockopt(sock, level,	       \
++ 							   optname, optval,    \
++ 							   optlen,	       \
++ 							   kernel_optval);     \
++ 	__ret;								       \
++ })
++ 
++ #define BPF_CGROUP_GETSOCKOPT_MAX_OPTLEN(optlen)			       \
++ ({									       \
++ 	int __ret = 0;							       \
++ 	if (cgroup_bpf_enabled)						       \
++ 		get_user(__ret, optlen);				       \
++ 	__ret;								       \
++ })
++ 
++ #define BPF_CGROUP_RUN_PROG_GETSOCKOPT(sock, level, optname, optval, optlen,   \
++ 				       max_optlen, retval)		       \
++ ({									       \
++ 	int __ret = retval;						       \
++ 	if (cgroup_bpf_enabled)						       \
++ 		__ret = __cgroup_bpf_run_filter_getsockopt(sock, level,	       \
++ 							   optname, optval,    \
++ 							   optlen, max_optlen, \
++ 							   retval);	       \
++ 	__ret;								       \
++ })
++ 
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  int cgroup_bpf_prog_attach(const union bpf_attr *attr,
+  			   enum bpf_prog_type ptype, struct bpf_prog *prog);
+  int cgroup_bpf_prog_detach(const union bpf_attr *attr,
+@@@ -360,8 -392,16 +424,17 @@@ static inline int bpf_percpu_cgroup_sto
+  #define BPF_CGROUP_RUN_PROG_INET6_CONNECT_LOCK(sk, uaddr) ({ 0; })
+  #define BPF_CGROUP_RUN_PROG_UDP4_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
+  #define BPF_CGROUP_RUN_PROG_UDP6_SENDMSG_LOCK(sk, uaddr, t_ctx) ({ 0; })
+ -#define BPF_CGROUP_RUN_PROG_UDP4_RECVMSG_LOCK(sk, uaddr) ({ 0; })
+ -#define BPF_CGROUP_RUN_PROG_UDP6_RECVMSG_LOCK(sk, uaddr) ({ 0; })
+  #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops) ({ 0; })
+  #define BPF_CGROUP_RUN_PROG_DEVICE_CGROUP(type,major,minor,access) ({ 0; })
+++<<<<<<< HEAD
+++=======
++ #define BPF_CGROUP_RUN_PROG_SYSCTL(head,table,write,buf,count,pos,nbuf) ({ 0; })
++ #define BPF_CGROUP_GETSOCKOPT_MAX_OPTLEN(optlen) ({ 0; })
++ #define BPF_CGROUP_RUN_PROG_GETSOCKOPT(sock, level, optname, optval, \
++ 				       optlen, max_optlen, retval) ({ retval; })
++ #define BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock, level, optname, optval, optlen, \
++ 				       kernel_optval) ({ 0; })
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  
+  #define for_each_cgroup_storage_type(stype) for (; false; )
+  
+diff --cc include/linux/bpf.h
+index f496f5cf851c,18f4cc2c6acd..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -1026,6 -1050,9 +1027,12 @@@ extern const struct bpf_func_proto bpf_
+  extern const struct bpf_func_proto bpf_spin_lock_proto;
+  extern const struct bpf_func_proto bpf_spin_unlock_proto;
+  extern const struct bpf_func_proto bpf_get_local_storage_proto;
+++<<<<<<< HEAD
+++=======
++ extern const struct bpf_func_proto bpf_strtol_proto;
++ extern const struct bpf_func_proto bpf_strtoul_proto;
++ extern const struct bpf_func_proto bpf_tcp_sock_proto;
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  
+  /* Shared helpers among cBPF and eBPF. */
+  void bpf_user_rnd_init_once(void);
+diff --cc include/linux/bpf_types.h
+index 08bf2f1fe553,eec5aeeeaf92..000000000000
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@@ -28,6 -28,9 +28,11 @@@ BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPO
+  #endif
+  #ifdef CONFIG_CGROUP_BPF
+  BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_DEVICE, cg_dev)
+++<<<<<<< HEAD
+++=======
++ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SYSCTL, cg_sysctl)
++ BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCKOPT, cg_sockopt)
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  #endif
+  #ifdef CONFIG_BPF_LIRC_MODE2
+  BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2)
+diff --cc include/linux/filter.h
+index b35700aa7ce4,340f7d648974..000000000000
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@@ -1176,4 -1185,28 +1176,31 @@@ struct bpf_sock_ops_kern 
+  					 */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct bpf_sysctl_kern {
++ 	struct ctl_table_header *head;
++ 	struct ctl_table *table;
++ 	void *cur_val;
++ 	size_t cur_len;
++ 	void *new_val;
++ 	size_t new_len;
++ 	int new_updated;
++ 	int write;
++ 	loff_t *ppos;
++ 	/* Temporary "register" for indirect stores to ppos. */
++ 	u64 tmp_reg;
++ };
++ 
++ struct bpf_sockopt_kern {
++ 	struct sock	*sk;
++ 	u8		*optval;
++ 	u8		*optval_end;
++ 	s32		level;
++ 	s32		optname;
++ 	s32		optlen;
++ 	s32		retval;
++ };
++ 
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  #endif /* __LINUX_FILTER_H__ */
+diff --cc include/uapi/linux/bpf.h
+index 9357d7e2c929,a396b516a2b2..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -167,10 -166,11 +167,16 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_CGROUP_SOCK_ADDR,
+  	BPF_PROG_TYPE_LWT_SEG6LOCAL,
+  	BPF_PROG_TYPE_LIRC_MODE2,
+ +#ifndef __GENKSYMS__
+  	BPF_PROG_TYPE_SK_REUSEPORT,
+  	BPF_PROG_TYPE_FLOW_DISSECTOR,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_CGROUP_SYSCTL,
++ 	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
++ 	BPF_PROG_TYPE_CGROUP_SOCKOPT,
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  };
+  
+  enum bpf_attach_type {
+@@@ -191,9 -191,12 +197,17 @@@
+  	BPF_CGROUP_UDP4_SENDMSG,
+  	BPF_CGROUP_UDP6_SENDMSG,
+  	BPF_LIRC_MODE2,
+ +#ifndef __GENKSYMS__
+  	BPF_FLOW_DISSECTOR,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_CGROUP_SYSCTL,
++ 	BPF_CGROUP_UDP4_RECVMSG,
++ 	BPF_CGROUP_UDP6_RECVMSG,
++ 	BPF_CGROUP_GETSOCKOPT,
++ 	BPF_CGROUP_SETSOCKOPT,
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  	__MAX_BPF_ATTACH_TYPE
+  };
+  
+@@@ -3279,4 -3534,25 +3293,28 @@@ struct bpf_line_info 
+  struct bpf_spin_lock {
+  	__u32	val;
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ struct bpf_sysctl {
++ 	__u32	write;		/* Sysctl is being read (= 0) or written (= 1).
++ 				 * Allows 1,2,4-byte read, but no write.
++ 				 */
++ 	__u32	file_pos;	/* Sysctl file position to read from, write to.
++ 				 * Allows 1,2,4-byte read an 4-byte write.
++ 				 */
++ };
++ 
++ struct bpf_sockopt {
++ 	__bpf_md_ptr(struct bpf_sock *, sk);
++ 	__bpf_md_ptr(void *, optval);
++ 	__bpf_md_ptr(void *, optval_end);
++ 
++ 	__s32	level;
++ 	__s32	optname;
++ 	__s32	optlen;
++ 	__s32	retval;
++ };
++ 
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  #endif /* _UAPI__LINUX_BPF_H__ */
+diff --cc kernel/bpf/cgroup.c
+index 2dc2cddbbfde,76fa0076f20d..000000000000
+--- a/kernel/bpf/cgroup.c
++++ b/kernel/bpf/cgroup.c
+@@@ -15,8 -13,11 +15,9 @@@
+  #include <linux/bpf.h>
+  #include <linux/bpf-cgroup.h>
+  #include <net/sock.h>
++ #include <net/bpf_sk_storage.h>
+  
+ -#include "../cgroup/cgroup-internal.h"
+ +#include <linux/rh_features.h>
+  
+  DEFINE_STATIC_KEY_FALSE(cgroup_bpf_enabled_key);
+  EXPORT_SYMBOL(cgroup_bpf_enabled_key);
+@@@ -832,3 -846,688 +833,691 @@@ const struct bpf_verifier_ops cg_dev_ve
+  	.get_func_proto		= cgroup_dev_func_proto,
+  	.is_valid_access	= cgroup_dev_is_valid_access,
+  };
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * __cgroup_bpf_run_filter_sysctl - Run a program on sysctl
++  *
++  * @head: sysctl table header
++  * @table: sysctl table
++  * @write: sysctl is being read (= 0) or written (= 1)
++  * @buf: pointer to buffer passed by user space
++  * @pcount: value-result argument: value is size of buffer pointed to by @buf,
++  *	result is size of @new_buf if program set new value, initial value
++  *	otherwise
++  * @ppos: value-result argument: value is position at which read from or write
++  *	to sysctl is happening, result is new position if program overrode it,
++  *	initial value otherwise
++  * @new_buf: pointer to pointer to new buffer that will be allocated if program
++  *	overrides new value provided by user space on sysctl write
++  *	NOTE: it's caller responsibility to free *new_buf if it was set
++  * @type: type of program to be executed
++  *
++  * Program is run when sysctl is being accessed, either read or written, and
++  * can allow or deny such access.
++  *
++  * This function will return %-EPERM if an attached program is found and
++  * returned value != 1 during execution. In all other cases 0 is returned.
++  */
++ int __cgroup_bpf_run_filter_sysctl(struct ctl_table_header *head,
++ 				   struct ctl_table *table, int write,
++ 				   void __user *buf, size_t *pcount,
++ 				   loff_t *ppos, void **new_buf,
++ 				   enum bpf_attach_type type)
++ {
++ 	struct bpf_sysctl_kern ctx = {
++ 		.head = head,
++ 		.table = table,
++ 		.write = write,
++ 		.ppos = ppos,
++ 		.cur_val = NULL,
++ 		.cur_len = PAGE_SIZE,
++ 		.new_val = NULL,
++ 		.new_len = 0,
++ 		.new_updated = 0,
++ 	};
++ 	struct cgroup *cgrp;
++ 	int ret;
++ 
++ 	ctx.cur_val = kmalloc_track_caller(ctx.cur_len, GFP_KERNEL);
++ 	if (ctx.cur_val) {
++ 		mm_segment_t old_fs;
++ 		loff_t pos = 0;
++ 
++ 		old_fs = get_fs();
++ 		set_fs(KERNEL_DS);
++ 		if (table->proc_handler(table, 0, (void __user *)ctx.cur_val,
++ 					&ctx.cur_len, &pos)) {
++ 			/* Let BPF program decide how to proceed. */
++ 			ctx.cur_len = 0;
++ 		}
++ 		set_fs(old_fs);
++ 	} else {
++ 		/* Let BPF program decide how to proceed. */
++ 		ctx.cur_len = 0;
++ 	}
++ 
++ 	if (write && buf && *pcount) {
++ 		/* BPF program should be able to override new value with a
++ 		 * buffer bigger than provided by user.
++ 		 */
++ 		ctx.new_val = kmalloc_track_caller(PAGE_SIZE, GFP_KERNEL);
++ 		ctx.new_len = min_t(size_t, PAGE_SIZE, *pcount);
++ 		if (!ctx.new_val ||
++ 		    copy_from_user(ctx.new_val, buf, ctx.new_len))
++ 			/* Let BPF program decide how to proceed. */
++ 			ctx.new_len = 0;
++ 	}
++ 
++ 	rcu_read_lock();
++ 	cgrp = task_dfl_cgroup(current);
++ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[type], &ctx, BPF_PROG_RUN);
++ 	rcu_read_unlock();
++ 
++ 	kfree(ctx.cur_val);
++ 
++ 	if (ret == 1 && ctx.new_updated) {
++ 		*new_buf = ctx.new_val;
++ 		*pcount = ctx.new_len;
++ 	} else {
++ 		kfree(ctx.new_val);
++ 	}
++ 
++ 	return ret == 1 ? 0 : -EPERM;
++ }
++ EXPORT_SYMBOL(__cgroup_bpf_run_filter_sysctl);
++ 
++ static bool __cgroup_bpf_prog_array_is_empty(struct cgroup *cgrp,
++ 					     enum bpf_attach_type attach_type)
++ {
++ 	struct bpf_prog_array *prog_array;
++ 	bool empty;
++ 
++ 	rcu_read_lock();
++ 	prog_array = rcu_dereference(cgrp->bpf.effective[attach_type]);
++ 	empty = bpf_prog_array_is_empty(prog_array);
++ 	rcu_read_unlock();
++ 
++ 	return empty;
++ }
++ 
++ static int sockopt_alloc_buf(struct bpf_sockopt_kern *ctx, int max_optlen)
++ {
++ 	if (unlikely(max_optlen > PAGE_SIZE) || max_optlen < 0)
++ 		return -EINVAL;
++ 
++ 	ctx->optval = kzalloc(max_optlen, GFP_USER);
++ 	if (!ctx->optval)
++ 		return -ENOMEM;
++ 
++ 	ctx->optval_end = ctx->optval + max_optlen;
++ 	ctx->optlen = max_optlen;
++ 
++ 	return 0;
++ }
++ 
++ static void sockopt_free_buf(struct bpf_sockopt_kern *ctx)
++ {
++ 	kfree(ctx->optval);
++ }
++ 
++ int __cgroup_bpf_run_filter_setsockopt(struct sock *sk, int *level,
++ 				       int *optname, char __user *optval,
++ 				       int *optlen, char **kernel_optval)
++ {
++ 	struct cgroup *cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
++ 	struct bpf_sockopt_kern ctx = {
++ 		.sk = sk,
++ 		.level = *level,
++ 		.optname = *optname,
++ 	};
++ 	int ret;
++ 
++ 	/* Opportunistic check to see whether we have any BPF program
++ 	 * attached to the hook so we don't waste time allocating
++ 	 * memory and locking the socket.
++ 	 */
++ 	if (!cgroup_bpf_enabled ||
++ 	    __cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_SETSOCKOPT))
++ 		return 0;
++ 
++ 	ret = sockopt_alloc_buf(&ctx, *optlen);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (copy_from_user(ctx.optval, optval, *optlen) != 0) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	lock_sock(sk);
++ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[BPF_CGROUP_SETSOCKOPT],
++ 				 &ctx, BPF_PROG_RUN);
++ 	release_sock(sk);
++ 
++ 	if (!ret) {
++ 		ret = -EPERM;
++ 		goto out;
++ 	}
++ 
++ 	if (ctx.optlen == -1) {
++ 		/* optlen set to -1, bypass kernel */
++ 		ret = 1;
++ 	} else if (ctx.optlen > *optlen || ctx.optlen < -1) {
++ 		/* optlen is out of bounds */
++ 		ret = -EFAULT;
++ 	} else {
++ 		/* optlen within bounds, run kernel handler */
++ 		ret = 0;
++ 
++ 		/* export any potential modifications */
++ 		*level = ctx.level;
++ 		*optname = ctx.optname;
++ 		*optlen = ctx.optlen;
++ 		*kernel_optval = ctx.optval;
++ 	}
++ 
++ out:
++ 	if (ret)
++ 		sockopt_free_buf(&ctx);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(__cgroup_bpf_run_filter_setsockopt);
++ 
++ int __cgroup_bpf_run_filter_getsockopt(struct sock *sk, int level,
++ 				       int optname, char __user *optval,
++ 				       int __user *optlen, int max_optlen,
++ 				       int retval)
++ {
++ 	struct cgroup *cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
++ 	struct bpf_sockopt_kern ctx = {
++ 		.sk = sk,
++ 		.level = level,
++ 		.optname = optname,
++ 		.retval = retval,
++ 	};
++ 	int ret;
++ 
++ 	/* Opportunistic check to see whether we have any BPF program
++ 	 * attached to the hook so we don't waste time allocating
++ 	 * memory and locking the socket.
++ 	 */
++ 	if (!cgroup_bpf_enabled ||
++ 	    __cgroup_bpf_prog_array_is_empty(cgrp, BPF_CGROUP_GETSOCKOPT))
++ 		return retval;
++ 
++ 	ret = sockopt_alloc_buf(&ctx, max_optlen);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!retval) {
++ 		/* If kernel getsockopt finished successfully,
++ 		 * copy whatever was returned to the user back
++ 		 * into our temporary buffer. Set optlen to the
++ 		 * one that kernel returned as well to let
++ 		 * BPF programs inspect the value.
++ 		 */
++ 
++ 		if (get_user(ctx.optlen, optlen)) {
++ 			ret = -EFAULT;
++ 			goto out;
++ 		}
++ 
++ 		if (ctx.optlen > max_optlen)
++ 			ctx.optlen = max_optlen;
++ 
++ 		if (copy_from_user(ctx.optval, optval, ctx.optlen) != 0) {
++ 			ret = -EFAULT;
++ 			goto out;
++ 		}
++ 	}
++ 
++ 	lock_sock(sk);
++ 	ret = BPF_PROG_RUN_ARRAY(cgrp->bpf.effective[BPF_CGROUP_GETSOCKOPT],
++ 				 &ctx, BPF_PROG_RUN);
++ 	release_sock(sk);
++ 
++ 	if (!ret) {
++ 		ret = -EPERM;
++ 		goto out;
++ 	}
++ 
++ 	if (ctx.optlen > max_optlen) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	/* BPF programs only allowed to set retval to 0, not some
++ 	 * arbitrary value.
++ 	 */
++ 	if (ctx.retval != 0 && ctx.retval != retval) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	if (copy_to_user(optval, ctx.optval, ctx.optlen) ||
++ 	    put_user(ctx.optlen, optlen)) {
++ 		ret = -EFAULT;
++ 		goto out;
++ 	}
++ 
++ 	ret = ctx.retval;
++ 
++ out:
++ 	sockopt_free_buf(&ctx);
++ 	return ret;
++ }
++ EXPORT_SYMBOL(__cgroup_bpf_run_filter_getsockopt);
++ 
++ static ssize_t sysctl_cpy_dir(const struct ctl_dir *dir, char **bufp,
++ 			      size_t *lenp)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (dir->header.parent) {
++ 		tmp_ret = sysctl_cpy_dir(dir->header.parent, bufp, lenp);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(*bufp, dir->header.ctl_table[0].procname, *lenp);
++ 	if (ret < 0)
++ 		return ret;
++ 	*bufp += ret;
++ 	*lenp -= ret;
++ 	ret += tmp_ret;
++ 
++ 	/* Avoid leading slash. */
++ 	if (!ret)
++ 		return ret;
++ 
++ 	tmp_ret = strscpy(*bufp, "/", *lenp);
++ 	if (tmp_ret < 0)
++ 		return tmp_ret;
++ 	*bufp += tmp_ret;
++ 	*lenp -= tmp_ret;
++ 
++ 	return ret + tmp_ret;
++ }
++ 
++ BPF_CALL_4(bpf_sysctl_get_name, struct bpf_sysctl_kern *, ctx, char *, buf,
++ 	   size_t, buf_len, u64, flags)
++ {
++ 	ssize_t tmp_ret = 0, ret;
++ 
++ 	if (!buf)
++ 		return -EINVAL;
++ 
++ 	if (!(flags & BPF_F_SYSCTL_BASE_NAME)) {
++ 		if (!ctx->head)
++ 			return -EINVAL;
++ 		tmp_ret = sysctl_cpy_dir(ctx->head->parent, &buf, &buf_len);
++ 		if (tmp_ret < 0)
++ 			return tmp_ret;
++ 	}
++ 
++ 	ret = strscpy(buf, ctx->table->procname, buf_len);
++ 
++ 	return ret < 0 ? ret : tmp_ret + ret;
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_name_proto = {
++ 	.func		= bpf_sysctl_get_name,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ 	.arg4_type	= ARG_ANYTHING,
++ };
++ 
++ static int copy_sysctl_value(char *dst, size_t dst_len, char *src,
++ 			     size_t src_len)
++ {
++ 	if (!dst)
++ 		return -EINVAL;
++ 
++ 	if (!dst_len)
++ 		return -E2BIG;
++ 
++ 	if (!src || !src_len) {
++ 		memset(dst, 0, dst_len);
++ 		return -EINVAL;
++ 	}
++ 
++ 	memcpy(dst, src, min(dst_len, src_len));
++ 
++ 	if (dst_len > src_len) {
++ 		memset(dst + src_len, '\0', dst_len - src_len);
++ 		return src_len;
++ 	}
++ 
++ 	dst[dst_len - 1] = '\0';
++ 
++ 	return -E2BIG;
++ }
++ 
++ BPF_CALL_3(bpf_sysctl_get_current_value, struct bpf_sysctl_kern *, ctx,
++ 	   char *, buf, size_t, buf_len)
++ {
++ 	return copy_sysctl_value(buf, buf_len, ctx->cur_val, ctx->cur_len);
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_current_value_proto = {
++ 	.func		= bpf_sysctl_get_current_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_3(bpf_sysctl_get_new_value, struct bpf_sysctl_kern *, ctx, char *, buf,
++ 	   size_t, buf_len)
++ {
++ 	if (!ctx->write) {
++ 		if (buf && buf_len)
++ 			memset(buf, '\0', buf_len);
++ 		return -EINVAL;
++ 	}
++ 	return copy_sysctl_value(buf, buf_len, ctx->new_val, ctx->new_len);
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_get_new_value_proto = {
++ 	.func		= bpf_sysctl_get_new_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_UNINIT_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ BPF_CALL_3(bpf_sysctl_set_new_value, struct bpf_sysctl_kern *, ctx,
++ 	   const char *, buf, size_t, buf_len)
++ {
++ 	if (!ctx->write || !ctx->new_val || !ctx->new_len || !buf || !buf_len)
++ 		return -EINVAL;
++ 
++ 	if (buf_len > PAGE_SIZE - 1)
++ 		return -E2BIG;
++ 
++ 	memcpy(ctx->new_val, buf, buf_len);
++ 	ctx->new_len = buf_len;
++ 	ctx->new_updated = 1;
++ 
++ 	return 0;
++ }
++ 
++ static const struct bpf_func_proto bpf_sysctl_set_new_value_proto = {
++ 	.func		= bpf_sysctl_set_new_value,
++ 	.gpl_only	= false,
++ 	.ret_type	= RET_INTEGER,
++ 	.arg1_type	= ARG_PTR_TO_CTX,
++ 	.arg2_type	= ARG_PTR_TO_MEM,
++ 	.arg3_type	= ARG_CONST_SIZE,
++ };
++ 
++ static const struct bpf_func_proto *
++ sysctl_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_strtol:
++ 		return &bpf_strtol_proto;
++ 	case BPF_FUNC_strtoul:
++ 		return &bpf_strtoul_proto;
++ 	case BPF_FUNC_sysctl_get_name:
++ 		return &bpf_sysctl_get_name_proto;
++ 	case BPF_FUNC_sysctl_get_current_value:
++ 		return &bpf_sysctl_get_current_value_proto;
++ 	case BPF_FUNC_sysctl_get_new_value:
++ 		return &bpf_sysctl_get_new_value_proto;
++ 	case BPF_FUNC_sysctl_set_new_value:
++ 		return &bpf_sysctl_set_new_value_proto;
++ 	default:
++ 		return cgroup_base_func_proto(func_id, prog);
++ 	}
++ }
++ 
++ static bool sysctl_is_valid_access(int off, int size, enum bpf_access_type type,
++ 				   const struct bpf_prog *prog,
++ 				   struct bpf_insn_access_aux *info)
++ {
++ 	const int size_default = sizeof(__u32);
++ 
++ 	if (off < 0 || off + size > sizeof(struct bpf_sysctl) || off % size)
++ 		return false;
++ 
++ 	switch (off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		if (type != BPF_READ)
++ 			return false;
++ 		bpf_ctx_record_field_size(info, size_default);
++ 		return bpf_ctx_narrow_access_ok(off, size, size_default);
++ 	case offsetof(struct bpf_sysctl, file_pos):
++ 		if (type == BPF_READ) {
++ 			bpf_ctx_record_field_size(info, size_default);
++ 			return bpf_ctx_narrow_access_ok(off, size, size_default);
++ 		} else {
++ 			return size == size_default;
++ 		}
++ 	default:
++ 		return false;
++ 	}
++ }
++ 
++ static u32 sysctl_convert_ctx_access(enum bpf_access_type type,
++ 				     const struct bpf_insn *si,
++ 				     struct bpf_insn *insn_buf,
++ 				     struct bpf_prog *prog, u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sysctl, write):
++ 		*insn++ = BPF_LDX_MEM(
++ 			BPF_SIZE(si->code), si->dst_reg, si->src_reg,
++ 			bpf_target_off(struct bpf_sysctl_kern, write,
++ 				       FIELD_SIZEOF(struct bpf_sysctl_kern,
++ 						    write),
++ 				       target_size));
++ 		break;
++ 	case offsetof(struct bpf_sysctl, file_pos):
++ 		/* ppos is a pointer so it should be accessed via indirect
++ 		 * loads and stores. Also for stores additional temporary
++ 		 * register is used since neither src_reg nor dst_reg can be
++ 		 * overridden.
++ 		 */
++ 		if (type == BPF_WRITE) {
++ 			int treg = BPF_REG_9;
++ 
++ 			if (si->src_reg == treg || si->dst_reg == treg)
++ 				--treg;
++ 			if (si->src_reg == treg || si->dst_reg == treg)
++ 				--treg;
++ 			*insn++ = BPF_STX_MEM(
++ 				BPF_DW, si->dst_reg, treg,
++ 				offsetof(struct bpf_sysctl_kern, tmp_reg));
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_FIELD_SIZEOF(struct bpf_sysctl_kern, ppos),
++ 				treg, si->dst_reg,
++ 				offsetof(struct bpf_sysctl_kern, ppos));
++ 			*insn++ = BPF_STX_MEM(
++ 				BPF_SIZEOF(u32), treg, si->src_reg, 0);
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_DW, treg, si->dst_reg,
++ 				offsetof(struct bpf_sysctl_kern, tmp_reg));
++ 		} else {
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_FIELD_SIZEOF(struct bpf_sysctl_kern, ppos),
++ 				si->dst_reg, si->src_reg,
++ 				offsetof(struct bpf_sysctl_kern, ppos));
++ 			*insn++ = BPF_LDX_MEM(
++ 				BPF_SIZE(si->code), si->dst_reg, si->dst_reg, 0);
++ 		}
++ 		*target_size = sizeof(u32);
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ const struct bpf_verifier_ops cg_sysctl_verifier_ops = {
++ 	.get_func_proto		= sysctl_func_proto,
++ 	.is_valid_access	= sysctl_is_valid_access,
++ 	.convert_ctx_access	= sysctl_convert_ctx_access,
++ };
++ 
++ const struct bpf_prog_ops cg_sysctl_prog_ops = {
++ };
++ 
++ static const struct bpf_func_proto *
++ cg_sockopt_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++ {
++ 	switch (func_id) {
++ 	case BPF_FUNC_sk_storage_get:
++ 		return &bpf_sk_storage_get_proto;
++ 	case BPF_FUNC_sk_storage_delete:
++ 		return &bpf_sk_storage_delete_proto;
++ #ifdef CONFIG_INET
++ 	case BPF_FUNC_tcp_sock:
++ 		return &bpf_tcp_sock_proto;
++ #endif
++ 	default:
++ 		return cgroup_base_func_proto(func_id, prog);
++ 	}
++ }
++ 
++ static bool cg_sockopt_is_valid_access(int off, int size,
++ 				       enum bpf_access_type type,
++ 				       const struct bpf_prog *prog,
++ 				       struct bpf_insn_access_aux *info)
++ {
++ 	const int size_default = sizeof(__u32);
++ 
++ 	if (off < 0 || off >= sizeof(struct bpf_sockopt))
++ 		return false;
++ 
++ 	if (off % size != 0)
++ 		return false;
++ 
++ 	if (type == BPF_WRITE) {
++ 		switch (off) {
++ 		case offsetof(struct bpf_sockopt, retval):
++ 			if (size != size_default)
++ 				return false;
++ 			return prog->expected_attach_type ==
++ 				BPF_CGROUP_GETSOCKOPT;
++ 		case offsetof(struct bpf_sockopt, optname):
++ 			/* fallthrough */
++ 		case offsetof(struct bpf_sockopt, level):
++ 			if (size != size_default)
++ 				return false;
++ 			return prog->expected_attach_type ==
++ 				BPF_CGROUP_SETSOCKOPT;
++ 		case offsetof(struct bpf_sockopt, optlen):
++ 			return size == size_default;
++ 		default:
++ 			return false;
++ 		}
++ 	}
++ 
++ 	switch (off) {
++ 	case offsetof(struct bpf_sockopt, sk):
++ 		if (size != sizeof(__u64))
++ 			return false;
++ 		info->reg_type = PTR_TO_SOCKET;
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optval):
++ 		if (size != sizeof(__u64))
++ 			return false;
++ 		info->reg_type = PTR_TO_PACKET;
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optval_end):
++ 		if (size != sizeof(__u64))
++ 			return false;
++ 		info->reg_type = PTR_TO_PACKET_END;
++ 		break;
++ 	case offsetof(struct bpf_sockopt, retval):
++ 		if (size != size_default)
++ 			return false;
++ 		return prog->expected_attach_type == BPF_CGROUP_GETSOCKOPT;
++ 	default:
++ 		if (size != size_default)
++ 			return false;
++ 		break;
++ 	}
++ 	return true;
++ }
++ 
++ #define CG_SOCKOPT_ACCESS_FIELD(T, F)					\
++ 	T(BPF_FIELD_SIZEOF(struct bpf_sockopt_kern, F),			\
++ 	  si->dst_reg, si->src_reg,					\
++ 	  offsetof(struct bpf_sockopt_kern, F))
++ 
++ static u32 cg_sockopt_convert_ctx_access(enum bpf_access_type type,
++ 					 const struct bpf_insn *si,
++ 					 struct bpf_insn *insn_buf,
++ 					 struct bpf_prog *prog,
++ 					 u32 *target_size)
++ {
++ 	struct bpf_insn *insn = insn_buf;
++ 
++ 	switch (si->off) {
++ 	case offsetof(struct bpf_sockopt, sk):
++ 		*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, sk);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, level):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_STX_MEM, level);
++ 		else
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, level);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optname):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_STX_MEM, optname);
++ 		else
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, optname);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optlen):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_STX_MEM, optlen);
++ 		else
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, optlen);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, retval):
++ 		if (type == BPF_WRITE)
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_STX_MEM, retval);
++ 		else
++ 			*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, retval);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optval):
++ 		*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, optval);
++ 		break;
++ 	case offsetof(struct bpf_sockopt, optval_end):
++ 		*insn++ = CG_SOCKOPT_ACCESS_FIELD(BPF_LDX_MEM, optval_end);
++ 		break;
++ 	}
++ 
++ 	return insn - insn_buf;
++ }
++ 
++ static int cg_sockopt_get_prologue(struct bpf_insn *insn_buf,
++ 				   bool direct_write,
++ 				   const struct bpf_prog *prog)
++ {
++ 	/* Nothing to do for sockopt argument. The data is kzalloc'ated.
++ 	 */
++ 	return 0;
++ }
++ 
++ const struct bpf_verifier_ops cg_sockopt_verifier_ops = {
++ 	.get_func_proto		= cg_sockopt_func_proto,
++ 	.is_valid_access	= cg_sockopt_is_valid_access,
++ 	.convert_ctx_access	= cg_sockopt_convert_ctx_access,
++ 	.gen_prologue		= cg_sockopt_get_prologue,
++ };
++ 
++ const struct bpf_prog_ops cg_sockopt_prog_ops = {
++ };
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+diff --cc kernel/bpf/syscall.c
+index ec2d27382d4b,b0f545e07425..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1886,6 -1918,13 +1895,16 @@@ static int bpf_prog_attach(const union 
+  	case BPF_FLOW_DISSECTOR:
+  		ptype = BPF_PROG_TYPE_FLOW_DISSECTOR;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case BPF_CGROUP_SYSCTL:
++ 		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
++ 		break;
++ 	case BPF_CGROUP_GETSOCKOPT:
++ 	case BPF_CGROUP_SETSOCKOPT:
++ 		ptype = BPF_PROG_TYPE_CGROUP_SOCKOPT;
++ 		break;
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  	default:
+  		return -EINVAL;
+  	}
+@@@ -1964,6 -2005,13 +1983,16 @@@ static int bpf_prog_detach(const union 
+  		return lirc_prog_detach(attr);
+  	case BPF_FLOW_DISSECTOR:
+  		return skb_flow_dissector_bpf_prog_detach(attr);
+++<<<<<<< HEAD
+++=======
++ 	case BPF_CGROUP_SYSCTL:
++ 		ptype = BPF_PROG_TYPE_CGROUP_SYSCTL;
++ 		break;
++ 	case BPF_CGROUP_GETSOCKOPT:
++ 	case BPF_CGROUP_SETSOCKOPT:
++ 		ptype = BPF_PROG_TYPE_CGROUP_SOCKOPT;
++ 		break;
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  	default:
+  		return -EINVAL;
+  	}
+@@@ -1995,8 -2043,13 +2024,14 @@@ static int bpf_prog_query(const union b
+  	case BPF_CGROUP_INET6_CONNECT:
+  	case BPF_CGROUP_UDP4_SENDMSG:
+  	case BPF_CGROUP_UDP6_SENDMSG:
+ -	case BPF_CGROUP_UDP4_RECVMSG:
+ -	case BPF_CGROUP_UDP6_RECVMSG:
+  	case BPF_CGROUP_SOCK_OPS:
+  	case BPF_CGROUP_DEVICE:
+++<<<<<<< HEAD
+++=======
++ 	case BPF_CGROUP_SYSCTL:
++ 	case BPF_CGROUP_GETSOCKOPT:
++ 	case BPF_CGROUP_SETSOCKOPT:
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  		break;
+  	case BPF_LIRC_MODE2:
+  		return lirc_prog_query(attr, uattr);
+diff --cc kernel/bpf/verifier.c
+index dcbce0fb2ff6,6b5623d320f9..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -5984,9 -6070,10 +5991,14 @@@ static int check_return_code(struct bpf
+  			enforce_attach_type_range = tnum_range(2, 3);
+  		}
+  	case BPF_PROG_TYPE_CGROUP_SOCK:
+ +	case BPF_PROG_TYPE_CGROUP_SOCK_ADDR:
+  	case BPF_PROG_TYPE_SOCK_OPS:
+  	case BPF_PROG_TYPE_CGROUP_DEVICE:
+++<<<<<<< HEAD
+++=======
++ 	case BPF_PROG_TYPE_CGROUP_SYSCTL:
++ 	case BPF_PROG_TYPE_CGROUP_SOCKOPT:
+++>>>>>>> 0d01da6afc54 (bpf: implement getsockopt and setsockopt hooks)
+  		break;
+  	default:
+  		return 0;
+* Unmerged path include/linux/bpf-cgroup.h
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/bpf_types.h
+* Unmerged path include/linux/filter.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/cgroup.c
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 363c7c6e9fa7..8a207153dc6c 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -1785,6 +1785,15 @@ int bpf_prog_array_length(struct bpf_prog_array *array)
+ 	return cnt;
+ }
+ 
++bool bpf_prog_array_is_empty(struct bpf_prog_array *array)
++{
++	struct bpf_prog_array_item *item;
++
++	for (item = array->items; item->prog; item++)
++		if (item->prog != &dummy_bpf_prog.prog)
++			return false;
++	return true;
++}
+ 
+ static bool bpf_prog_array_copy_core(struct bpf_prog_array *array,
+ 				     u32 *prog_ids,
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index f5f71f2e4cb7..fe8f5cf5db6a 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -5524,7 +5524,7 @@ BPF_CALL_1(bpf_tcp_sock, struct sock *, sk)
+ 	return (unsigned long)NULL;
+ }
+ 
+-static const struct bpf_func_proto bpf_tcp_sock_proto = {
++const struct bpf_func_proto bpf_tcp_sock_proto = {
+ 	.func		= bpf_tcp_sock,
+ 	.gpl_only	= false,
+ 	.ret_type	= RET_PTR_TO_TCP_SOCK_OR_NULL,
+diff --git a/net/socket.c b/net/socket.c
+index e2e8f53e2ca4..46e8f29d445b 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -2010,6 +2010,8 @@ SYSCALL_DEFINE4(recv, int, fd, void __user *, ubuf, size_t, size,
+ static int __sys_setsockopt(int fd, int level, int optname,
+ 			    char __user *optval, int optlen)
+ {
++	mm_segment_t oldfs = get_fs();
++	char *kernel_optval = NULL;
+ 	int err, fput_needed;
+ 	struct socket *sock;
+ 
+@@ -2022,6 +2024,22 @@ static int __sys_setsockopt(int fd, int level, int optname,
+ 		if (err)
+ 			goto out_put;
+ 
++		err = BPF_CGROUP_RUN_PROG_SETSOCKOPT(sock->sk, &level,
++						     &optname, optval, &optlen,
++						     &kernel_optval);
++
++		if (err < 0) {
++			goto out_put;
++		} else if (err > 0) {
++			err = 0;
++			goto out_put;
++		}
++
++		if (kernel_optval) {
++			set_fs(KERNEL_DS);
++			optval = (char __user __force *)kernel_optval;
++		}
++
+ 		if (level == SOL_SOCKET)
+ 			err =
+ 			    sock_setsockopt(sock, level, optname, optval,
+@@ -2030,6 +2048,11 @@ static int __sys_setsockopt(int fd, int level, int optname,
+ 			err =
+ 			    sock->ops->setsockopt(sock, level, optname, optval,
+ 						  optlen);
++
++		if (kernel_optval) {
++			set_fs(oldfs);
++			kfree(kernel_optval);
++		}
+ out_put:
+ 		fput_light(sock->file, fput_needed);
+ 	}
+@@ -2052,6 +2075,7 @@ static int __sys_getsockopt(int fd, int level, int optname,
+ {
+ 	int err, fput_needed;
+ 	struct socket *sock;
++	int max_optlen;
+ 
+ 	sock = sockfd_lookup_light(fd, &err, &fput_needed);
+ 	if (sock != NULL) {
+@@ -2059,6 +2083,8 @@ static int __sys_getsockopt(int fd, int level, int optname,
+ 		if (err)
+ 			goto out_put;
+ 
++		max_optlen = BPF_CGROUP_GETSOCKOPT_MAX_OPTLEN(optlen);
++
+ 		if (level == SOL_SOCKET)
+ 			err =
+ 			    sock_getsockopt(sock, level, optname, optval,
+@@ -2067,6 +2093,10 @@ static int __sys_getsockopt(int fd, int level, int optname,
+ 			err =
+ 			    sock->ops->getsockopt(sock, level, optname, optval,
+ 						  optlen);
++
++		err = BPF_CGROUP_RUN_PROG_GETSOCKOPT(sock->sk, level, optname,
++						     optval, optlen,
++						     max_optlen, err);
+ out_put:
+ 		fput_light(sock->file, fput_needed);
+ 	}
