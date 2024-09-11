@@ -1,0 +1,151 @@
+libbpf: Split BTF presence checks into libbpf- and kernel-specific parts
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit b35f14f410416f06ec54d187dedc372405757290
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b35f14f4.failed
+
+Needs for application BTF being present differs between user-space libbpf needs and kernel
+needs. Currently, BTF is mandatory only in kernel only when BPF application is
+using STRUCT_OPS. While libbpf itself relies more heavily on presense of BTF:
+  - for BTF-defined maps;
+  - for Kconfig externs;
+  - for STRUCT_OPS as well.
+
+Thus, checks for presence and validness of bpf_object's BPF needs to be
+performed separately, which is patch does.
+
+Fixes: 5327644614a1 ("libbpf: Relax check whether BTF is mandatory")
+	Reported-by: Michal Rostecki <mrostecki@opensuse.org>
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Martin KaFai Lau <kafai@fb.com>
+	Cc: Quentin Monnet <quentin@isovalent.com>
+Link: https://lore.kernel.org/bpf/20200312185033.736911-1-andriin@fb.com
+(cherry picked from commit b35f14f410416f06ec54d187dedc372405757290)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 6ed9ef84b398,1a787a2faf58..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -1534,12 -2284,18 +1534,22 @@@ static void bpf_object__sanitize_btf_ex
+  	}
+  }
+  
+- static bool bpf_object__is_btf_mandatory(const struct bpf_object *obj)
++ static bool libbpf_needs_btf(const struct bpf_object *obj)
+  {
+  	return obj->efile.btf_maps_shndx >= 0 ||
+++<<<<<<< HEAD
+++	       obj->nr_extern > 0;
+++=======
++ 	       obj->efile.st_ops_shndx >= 0 ||
+  	       obj->nr_extern > 0;
+  }
+  
++ static bool kernel_needs_btf(const struct bpf_object *obj)
++ {
++ 	return obj->efile.st_ops_shndx >= 0;
+++>>>>>>> b35f14f41041 (libbpf: Split BTF presence checks into libbpf- and kernel-specific parts)
++ }
++ 
+  static int bpf_object__init_btf(struct bpf_object *obj,
+  				Elf_Data *btf_data,
+  				Elf_Data *btf_ext_data)
+@@@ -1576,22 -2329,72 +1586,88 @@@
+  		}
+  	}
+  out:
+++<<<<<<< HEAD
+ +	if (err || IS_ERR(obj->btf)) {
+ +		if (btf_required)
+ +			err = err ? : PTR_ERR(obj->btf);
+ +		else
+ +			err = 0;
+ +		if (!IS_ERR_OR_NULL(obj->btf))
+ +			btf__free(obj->btf);
+ +		obj->btf = NULL;
+ +	}
+ +	if (btf_required && !obj->btf) {
+++=======
++ 	if (err && libbpf_needs_btf(obj)) {
+++>>>>>>> b35f14f41041 (libbpf: Split BTF presence checks into libbpf- and kernel-specific parts)
+  		pr_warn("BTF is required, but is missing or corrupted.\n");
+ -		return err;
+ +		return err == 0 ? -ENOENT : err;
+  	}
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_object__finalize_btf(struct bpf_object *obj)
++ {
++ 	int err;
++ 
++ 	if (!obj->btf)
++ 		return 0;
++ 
++ 	err = btf__finalize_data(obj, obj->btf);
++ 	if (!err)
++ 		return 0;
++ 
++ 	pr_warn("Error finalizing %s: %d.\n", BTF_ELF_SEC, err);
++ 	btf__free(obj->btf);
++ 	obj->btf = NULL;
++ 	btf_ext__free(obj->btf_ext);
++ 	obj->btf_ext = NULL;
++ 
++ 	if (libbpf_needs_btf(obj)) {
++ 		pr_warn("BTF is required, but is missing or corrupted.\n");
++ 		return -ENOENT;
++ 	}
++ 	return 0;
++ }
++ 
++ static inline bool libbpf_prog_needs_vmlinux_btf(struct bpf_program *prog)
++ {
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return true;
++ 
++ 	/* BPF_PROG_TYPE_TRACING programs which do not attach to other programs
++ 	 * also need vmlinux BTF
++ 	 */
++ 	if (prog->type == BPF_PROG_TYPE_TRACING && !prog->attach_prog_fd)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ static int bpf_object__load_vmlinux_btf(struct bpf_object *obj)
++ {
++ 	struct bpf_program *prog;
++ 	int err;
++ 
++ 	bpf_object__for_each_program(prog, obj) {
++ 		if (libbpf_prog_needs_vmlinux_btf(prog)) {
++ 			obj->btf_vmlinux = libbpf_find_kernel_btf();
++ 			if (IS_ERR(obj->btf_vmlinux)) {
++ 				err = PTR_ERR(obj->btf_vmlinux);
++ 				pr_warn("Error loading vmlinux BTF: %d\n", err);
++ 				obj->btf_vmlinux = NULL;
++ 				return err;
++ 			}
++ 			return 0;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> b35f14f41041 (libbpf: Split BTF presence checks into libbpf- and kernel-specific parts)
+  static int bpf_object__sanitize_and_load_btf(struct bpf_object *obj)
+  {
+  	int err = 0;
+* Unmerged path tools/lib/bpf/libbpf.c
