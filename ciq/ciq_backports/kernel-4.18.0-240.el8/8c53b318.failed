@@ -1,0 +1,163 @@
+ACPI/sleep: Convert acpi_wakeup_address into a function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 8c53b318b222eff55d2900b554094a099b1a30f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8c53b318.failed
+
+Convert acpi_wakeup_address from a raw variable into a function so that
+x86 can wrap its dereference of the real mode boot header in a function
+instead of broadcasting it to the world via a #define.  This sets the
+stage for a future patch to move x86's definition of the new function,
+acpi_get_wakeup_address(), out of asm/acpi.h and thus break acpi.h's
+dependency on asm/realmode.h.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Link: https://lkml.kernel.org/r/20191126165417.22423-12-sean.j.christopherson@intel.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit 8c53b318b222eff55d2900b554094a099b1a30f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/kernel/acpi.c
+diff --cc arch/ia64/kernel/acpi.c
+index 0ad2bb4d6043,a5636524af76..000000000000
+--- a/arch/ia64/kernel/acpi.c
++++ b/arch/ia64/kernel/acpi.c
+@@@ -60,79 -42,6 +60,82 @@@ int acpi_lapic
+  unsigned int acpi_cpei_override;
+  unsigned int acpi_cpei_phys_cpuid;
+  
+++<<<<<<< HEAD
+ +unsigned long acpi_wakeup_address = 0;
+ +
+ +#ifdef CONFIG_IA64_GENERIC
+ +static unsigned long __init acpi_find_rsdp(void)
+ +{
+ +	unsigned long rsdp_phys = 0;
+ +
+ +	if (efi.acpi20 != EFI_INVALID_TABLE_ADDR)
+ +		rsdp_phys = efi.acpi20;
+ +	else if (efi.acpi != EFI_INVALID_TABLE_ADDR)
+ +		printk(KERN_WARNING PREFIX
+ +		       "v1.0/r0.71 tables no longer supported\n");
+ +	return rsdp_phys;
+ +}
+ +
+ +const char __init *
+ +acpi_get_sysname(void)
+ +{
+ +	unsigned long rsdp_phys;
+ +	struct acpi_table_rsdp *rsdp;
+ +	struct acpi_table_xsdt *xsdt;
+ +	struct acpi_table_header *hdr;
+ +#ifdef CONFIG_INTEL_IOMMU
+ +	u64 i, nentries;
+ +#endif
+ +
+ +	rsdp_phys = acpi_find_rsdp();
+ +	if (!rsdp_phys) {
+ +		printk(KERN_ERR
+ +		       "ACPI 2.0 RSDP not found, default to \"dig\"\n");
+ +		return "dig";
+ +	}
+ +
+ +	rsdp = (struct acpi_table_rsdp *)__va(rsdp_phys);
+ +	if (strncmp(rsdp->signature, ACPI_SIG_RSDP, sizeof(ACPI_SIG_RSDP) - 1)) {
+ +		printk(KERN_ERR
+ +		       "ACPI 2.0 RSDP signature incorrect, default to \"dig\"\n");
+ +		return "dig";
+ +	}
+ +
+ +	xsdt = (struct acpi_table_xsdt *)__va(rsdp->xsdt_physical_address);
+ +	hdr = &xsdt->header;
+ +	if (strncmp(hdr->signature, ACPI_SIG_XSDT, sizeof(ACPI_SIG_XSDT) - 1)) {
+ +		printk(KERN_ERR
+ +		       "ACPI 2.0 XSDT signature incorrect, default to \"dig\"\n");
+ +		return "dig";
+ +	}
+ +
+ +	if (!strcmp(hdr->oem_id, "HP")) {
+ +		return "hpzx1";
+ +	} else if (!strcmp(hdr->oem_id, "SGI")) {
+ +		if (!strcmp(hdr->oem_table_id + 4, "UV"))
+ +			return "uv";
+ +		else
+ +			return "sn2";
+ +	}
+ +
+ +#ifdef CONFIG_INTEL_IOMMU
+ +	/* Look for Intel IOMMU */
+ +	nentries = (hdr->length - sizeof(*hdr)) /
+ +			 sizeof(xsdt->table_offset_entry[0]);
+ +	for (i = 0; i < nentries; i++) {
+ +		hdr = __va(xsdt->table_offset_entry[i]);
+ +		if (strncmp(hdr->signature, ACPI_SIG_DMAR,
+ +			sizeof(ACPI_SIG_DMAR) - 1) == 0)
+ +			return "dig_vtd";
+ +	}
+ +#endif
+ +
+ +	return "dig";
+ +}
+ +#endif /* CONFIG_IA64_GENERIC */
+ +
+++=======
+++>>>>>>> 8c53b318b222 (ACPI/sleep: Convert acpi_wakeup_address into a function)
+  #define ACPI_MAX_PLATFORM_INTERRUPTS	256
+  
+  /* Array to record platform interrupt vectors for generic interrupt routing. */
+diff --git a/arch/ia64/include/asm/acpi.h b/arch/ia64/include/asm/acpi.h
+index a3d0211970e9..43f56b3a0fab 100644
+--- a/arch/ia64/include/asm/acpi.h
++++ b/arch/ia64/include/asm/acpi.h
+@@ -79,7 +79,10 @@ int acpi_gsi_to_irq (u32 gsi, unsigned int *irq);
+ /* Low-level suspend routine. */
+ extern int acpi_suspend_lowlevel(void);
+ 
+-extern unsigned long acpi_wakeup_address;
++static inline unsigned long acpi_get_wakeup_address(void)
++{
++	return 0;
++}
+ 
+ /*
+  * Record the cpei override flag and current logical cpu. This is
+* Unmerged path arch/ia64/kernel/acpi.c
+diff --git a/arch/x86/include/asm/acpi.h b/arch/x86/include/asm/acpi.h
+index 2f01eb4d6208..b007cceb4bdc 100644
+--- a/arch/x86/include/asm/acpi.h
++++ b/arch/x86/include/asm/acpi.h
+@@ -79,7 +79,10 @@ static inline void acpi_disable_pci(void)
+ extern int (*acpi_suspend_lowlevel)(void);
+ 
+ /* Physical address to resume after wakeup */
+-#define acpi_wakeup_address ((unsigned long)(real_mode_header->wakeup_start))
++static inline unsigned long acpi_get_wakeup_address(void)
++{
++	return ((unsigned long)(real_mode_header->wakeup_start));
++}
+ 
+ /*
+  * Check if the CPU can handle C2 and deeper
+diff --git a/drivers/acpi/sleep.c b/drivers/acpi/sleep.c
+index 2eac02c4c5b9..9aaba8d1e1ce 100644
+--- a/drivers/acpi/sleep.c
++++ b/drivers/acpi/sleep.c
+@@ -63,8 +63,11 @@ static struct notifier_block tts_notifier = {
+ static int acpi_sleep_prepare(u32 acpi_state)
+ {
+ #ifdef CONFIG_ACPI_SLEEP
++	unsigned long acpi_wakeup_address;
++
+ 	/* do we have a wakeup address for S2 and S3? */
+ 	if (acpi_state == ACPI_STATE_S3) {
++		acpi_wakeup_address = acpi_get_wakeup_address();
+ 		if (!acpi_wakeup_address)
+ 			return -EFAULT;
+ 		acpi_set_waking_vector(acpi_wakeup_address);
