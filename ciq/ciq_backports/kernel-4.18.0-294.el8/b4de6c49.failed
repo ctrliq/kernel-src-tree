@@ -1,0 +1,121 @@
+net: atlantic: unify MAC generation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mark Starovoytov <mstarovoitov@marvell.com>
+commit b4de6c49e569c7ca91bf0d4c25cdb6eeca9c9529
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b4de6c49.failed
+
+This patch unifies invalid MAC address handling with other drivers.
+
+Basically we've switched to using standard APIs (is_valid_ether_addr /
+eth_hw_addr_random) where possible.
+It's worth noting that some of engineering Aquantia NICs might be
+provisioned with a partially zeroed out MAC, which is still invalid,
+but not caught by is_valid_ether_addr(), so we've added a special
+handling for this case.
+
+Also adding a warning in case of fallback to random MAC, because
+this shouldn't be needed on production NICs, they should all be
+provisioned with unique MAC.
+
+NB! Default systemd/udevd configuration is 'MACAddressPolicy=persistent'.
+    This causes MAC address to be persisted across driver reloads and
+    reboots. We had to change it to 'none' for verification purposes.
+
+	Signed-off-by: Mark Starovoytov <mstarovoitov@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit b4de6c49e569c7ca91bf0d4c25cdb6eeca9c9529)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+#	drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_utils_fw.c
+diff --cc drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+index 103608a7664f,eeedd8c90067..000000000000
+--- a/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
++++ b/drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+@@@ -247,11 -280,9 +247,14 @@@ static int aq_fw2x_update_link_status(s
+  
+  static int aq_fw2x_get_mac_permanent(struct aq_hw_s *self, u8 *mac)
+  {
+ -	u32 efuse_addr = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_EFUSE_ADDR);
+ -	u32 mac_addr[2] = { 0 };
+  	int err = 0;
+++<<<<<<< HEAD
+ +	u32 h = 0U;
+ +	u32 l = 0U;
+ +	u32 mac_addr[2] = { 0 };
+ +	u32 efuse_addr = aq_hw_read_reg(self, HW_ATL_FW2X_MPI_EFUSE_ADDR);
+++=======
+++>>>>>>> b4de6c49e569 (net: atlantic: unify MAC generation)
+  
+  	if (efuse_addr != 0) {
+  		err = hw_atl_utils_fw_downld_dwords(self,
+@@@ -266,25 -297,6 +269,28 @@@
+  
+  	ether_addr_copy(mac, (u8 *)mac_addr);
+  
+++<<<<<<< HEAD
+ +	if ((mac[0] & 0x01U) || ((mac[0] | mac[1] | mac[2]) == 0x00U)) {
+ +		unsigned int rnd = 0;
+ +
+ +		get_random_bytes(&rnd, sizeof(unsigned int));
+ +
+ +		l = 0xE3000000U | (0xFFFFU & rnd) | (0x00 << 16);
+ +		h = 0x8001300EU;
+ +
+ +		mac[5] = (u8)(0xFFU & l);
+ +		l >>= 8;
+ +		mac[4] = (u8)(0xFFU & l);
+ +		l >>= 8;
+ +		mac[3] = (u8)(0xFFU & l);
+ +		l >>= 8;
+ +		mac[2] = (u8)(0xFFU & l);
+ +		mac[1] = (u8)(0xFFU & h);
+ +		h >>= 8;
+ +		mac[0] = (u8)(0xFFU & h);
+ +	}
+++=======
+++>>>>>>> b4de6c49e569 (net: atlantic: unify MAC generation)
+  	return err;
+  }
+  
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_utils_fw.c
+diff --git a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+index ed7d344e3ed7..8644e976a93b 100644
+--- a/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
++++ b/drivers/net/ethernet/aquantia/atlantic/aq_nic.c
+@@ -245,6 +245,14 @@ static int aq_nic_hw_prepare(struct aq_nic_s *self)
+ 	return err;
+ }
+ 
++static bool aq_nic_is_valid_ether_addr(const u8 *addr)
++{
++	/* Some engineering samples of Aquantia NICs are provisioned with a
++	 * partially populated MAC, which is still invalid.
++	 */
++	return !(addr[0] == 0 && addr[1] == 0 && addr[2] == 0);
++}
++
+ int aq_nic_ndev_register(struct aq_nic_s *self)
+ {
+ 	int err = 0;
+@@ -265,6 +273,12 @@ int aq_nic_ndev_register(struct aq_nic_s *self)
+ 	if (err)
+ 		goto err_exit;
+ 
++	if (!is_valid_ether_addr(self->ndev->dev_addr) ||
++	    !aq_nic_is_valid_ether_addr(self->ndev->dev_addr)) {
++		netdev_warn(self->ndev, "MAC is invalid, will use random.");
++		eth_hw_addr_random(self->ndev);
++	}
++
+ #if defined(AQ_CFG_MAC_ADDR_PERMANENT)
+ 	{
+ 		static u8 mac_addr_permanent[] = AQ_CFG_MAC_ADDR_PERMANENT;
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl/hw_atl_utils_fw2x.c
+* Unmerged path drivers/net/ethernet/aquantia/atlantic/hw_atl2/hw_atl2_utils_fw.c
