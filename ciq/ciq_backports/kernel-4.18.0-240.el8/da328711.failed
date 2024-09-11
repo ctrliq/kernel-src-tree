@@ -1,0 +1,190 @@
+net: qed: fix buffer overflow on ethtool -d
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexander Lobakin <alobakin@marvell.com>
+commit da3287111ab43b32cec54d7ca6b48640f210a196
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/da328711.failed
+
+When generating debug dump, driver firstly collects all data in binary
+form, and then performs per-feature formatting to human-readable if it
+is supported.
+
+For ethtool -d, this is roughly incorrect for two reasons. First of all,
+drivers should always provide only original raw dumps to Ethtool without
+any changes.
+The second, and more critical, is that Ethtool's output buffer size is
+strictly determined by ethtool_ops::get_regs_len(), and all data *must*
+fit in it. The current version of driver always returns the size of raw
+data, but the size of the formatted buffer exceeds it in most cases.
+This leads to out-of-bound writes and memory corruption.
+
+Address both issues by adding an option to return original, non-formatted
+debug data, and using it for Ethtool case.
+
+v2:
+ - Expand commit message to make it more clear;
+ - No functional changes.
+
+Fixes: c965db444629 ("qed: Add support for debug data collection")
+	Signed-off-by: Alexander Lobakin <alobakin@marvell.com>
+	Signed-off-by: Igor Russkikh <irusskikh@marvell.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit da3287111ab43b32cec54d7ca6b48640f210a196)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qed/qed.h
+#	drivers/net/ethernet/qlogic/qed/qed_debug.c
+diff --cc drivers/net/ethernet/qlogic/qed/qed.h
+index c2d0f2a1da2b,6c2f9ff4a53e..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed.h
++++ b/drivers/net/ethernet/qlogic/qed/qed.h
+@@@ -877,6 -873,11 +877,14 @@@ struct qed_dev 
+  	struct qed_cb_ll2_info		*ll2;
+  	u8				ll2_mac_address[ETH_ALEN];
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	struct qed_dbg_feature dbg_features[DBG_FEATURE_NUM];
++ 	u8 engine_for_debug;
++ 	bool disable_ilt_dump;
++ 	bool				dbg_bin_dump;
++ 
+++>>>>>>> da3287111ab4 (net: qed: fix buffer overflow on ethtool -d)
+  	DECLARE_HASHTABLE(connections, 10);
+  	const struct firmware		*firmware;
+  
+diff --cc drivers/net/ethernet/qlogic/qed/qed_debug.c
+index ebc2551812ac,cb80863d5a77..000000000000
+--- a/drivers/net/ethernet/qlogic/qed/qed_debug.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_debug.c
+@@@ -7836,9 -7503,15 +7836,15 @@@ static enum dbg_status format_feature(s
+  		text_buf[i] = '\n';
+  
+  	/* Dump printable feature to log */
+ -	if (p_hwfn->cdev->print_dbg_data)
+ +	if (p_hwfn->cdev->dbg_params.print_data)
+  		qed_dbg_print_feature(text_buf, text_size_bytes);
+  
++ 	/* Just return the original binary buffer if requested */
++ 	if (p_hwfn->cdev->dbg_bin_dump) {
++ 		vfree(text_buf);
++ 		return DBG_STATUS_OK;
++ 	}
++ 
+  	/* Free the old dump_buf and point the dump_buf to the newly allocagted
+  	 * and formatted text buffer.
+  	 */
+@@@ -8040,9 -7736,19 +8046,17 @@@ int qed_dbg_mcp_trace_size(struct qed_d
+   * feature buffer.
+   */
+  #define REGDUMP_HEADER_SIZE			sizeof(u32)
+ -#define REGDUMP_HEADER_SIZE_SHIFT		0
+ -#define REGDUMP_HEADER_SIZE_MASK		0xffffff
+  #define REGDUMP_HEADER_FEATURE_SHIFT		24
+++<<<<<<< HEAD
+++=======
++ #define REGDUMP_HEADER_FEATURE_MASK		0x1f
++ #define REGDUMP_HEADER_BIN_DUMP_SHIFT		29
++ #define REGDUMP_HEADER_BIN_DUMP_MASK		0x1
++ #define REGDUMP_HEADER_OMIT_ENGINE_SHIFT	30
++ #define REGDUMP_HEADER_OMIT_ENGINE_MASK		0x1
+++>>>>>>> da3287111ab4 (net: qed: fix buffer overflow on ethtool -d)
+  #define REGDUMP_HEADER_ENGINE_SHIFT		31
+ -#define REGDUMP_HEADER_ENGINE_MASK		0x1
+ -#define REGDUMP_MAX_SIZE			0x1000000
+ -#define ILT_DUMP_MAX_SIZE			(1024 * 1024 * 15)
+ -
+ +#define REGDUMP_HEADER_OMIT_ENGINE_SHIFT	30
+  enum debug_print_features {
+  	OLD_MODE = 0,
+  	IDLE_CHK = 1,
+@@@ -8056,17 -7762,28 +8070,34 @@@
+  	NVM_CFG1 = 9,
+  	DEFAULT_CFG = 10,
+  	NVM_META = 11,
+ -	MDUMP = 12,
+ -	ILT_DUMP = 13,
+  };
+  
+ -static u32 qed_calc_regdump_header(struct qed_dev *cdev,
+ -				   enum debug_print_features feature,
+ +static u32 qed_calc_regdump_header(enum debug_print_features feature,
+  				   int engine, u32 feature_size, u8 omit_engine)
+  {
+++<<<<<<< HEAD
+ +	/* Insert the engine, feature and mode inside the header and combine it
+ +	 * with feature size.
+ +	 */
+ +	return feature_size | (feature << REGDUMP_HEADER_FEATURE_SHIFT) |
+ +	       (omit_engine << REGDUMP_HEADER_OMIT_ENGINE_SHIFT) |
+ +	       (engine << REGDUMP_HEADER_ENGINE_SHIFT);
+++=======
++ 	u32 res = 0;
++ 
++ 	SET_FIELD(res, REGDUMP_HEADER_SIZE, feature_size);
++ 	if (res != feature_size)
++ 		DP_NOTICE(cdev,
++ 			  "Feature %d is too large (size 0x%x) and will corrupt the dump\n",
++ 			  feature, feature_size);
++ 
++ 	SET_FIELD(res, REGDUMP_HEADER_FEATURE, feature);
++ 	SET_FIELD(res, REGDUMP_HEADER_BIN_DUMP, 1);
++ 	SET_FIELD(res, REGDUMP_HEADER_OMIT_ENGINE, omit_engine);
++ 	SET_FIELD(res, REGDUMP_HEADER_ENGINE, engine);
++ 
++ 	return res;
+++>>>>>>> da3287111ab4 (net: qed: fix buffer overflow on ethtool -d)
+  }
+  
+  int qed_dbg_all_data(struct qed_dev *cdev, void *buffer)
+@@@ -8082,9 -7799,12 +8113,15 @@@
+  	for (i = 0; i < MAX_DBG_GRC_PARAMS; i++)
+  		grc_params[i] = dev_data->grc.param_val[i];
+  
+ -	if (!QED_IS_CMT(cdev))
+ +	if (cdev->num_hwfns == 1)
+  		omit_engine = 1;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&qed_dbg_lock);
++ 	cdev->dbg_bin_dump = true;
++ 
+++>>>>>>> da3287111ab4 (net: qed: fix buffer overflow on ethtool -d)
+  	org_engine = qed_get_debug_engine(cdev);
+  	for (cur_engine = 0; cur_engine < cdev->num_hwfns; cur_engine++) {
+  		/* Collect idle_chks and grcDump for each hw function */
+@@@ -8246,6 -7988,24 +8283,27 @@@
+  		       QED_NVM_IMAGE_NVM_META, "QED_NVM_IMAGE_NVM_META", rc);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* nvm mdump */
++ 	rc = qed_dbg_nvm_image(cdev, (u8 *)buffer + offset +
++ 			       REGDUMP_HEADER_SIZE, &feature_size,
++ 			       QED_NVM_IMAGE_MDUMP);
++ 	if (!rc) {
++ 		*(u32 *)((u8 *)buffer + offset) =
++ 			qed_calc_regdump_header(cdev, MDUMP, cur_engine,
++ 						feature_size, omit_engine);
++ 		offset += (feature_size + REGDUMP_HEADER_SIZE);
++ 	} else if (rc != -ENOENT) {
++ 		DP_ERR(cdev,
++ 		       "qed_dbg_nvm_image failed for image %d (%s), rc = %d\n",
++ 		       QED_NVM_IMAGE_MDUMP, "QED_NVM_IMAGE_MDUMP", rc);
++ 	}
++ 
++ 	cdev->dbg_bin_dump = false;
++ 	mutex_unlock(&qed_dbg_lock);
++ 
+++>>>>>>> da3287111ab4 (net: qed: fix buffer overflow on ethtool -d)
+  	return 0;
+  }
+  
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed.h
+* Unmerged path drivers/net/ethernet/qlogic/qed/qed_debug.c
