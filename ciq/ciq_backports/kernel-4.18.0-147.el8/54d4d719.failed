@@ -1,0 +1,1305 @@
+drm/i915: Overcome display engine stride limits via GTT remapping
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ville Syrjälä <ville.syrjala@linux.intel.com>
+commit 54d4d719fa119c1738f97adc242c05fff224c845
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/54d4d719.failed
+
+The display engine stride limits are getting in our way. On SKL+
+we are limited to 8k pixels, which is easily exceeded with three
+4k displays. To overcome this limitation we can remap the pages
+in the GTT to provide the display engine with a view of memory
+with a smaller stride.
+
+The code is mostly already there as We already play tricks with
+the plane surface address and x/y offsets.
+
+A few caveats apply:
+* linear buffers need the fb stride to be page aligned, as
+  otherwise the remapped lines wouldn't start at the same
+  spot
+* compressed buffers can't be remapped due to the new
+  ccs hash mode causing the virtual address of the pages
+  to affect the interpretation of the compressed data. IIRC
+  the old hash was limited to the low 12 bits so if we were
+  using that mode we could remap. As it stands we just refuse
+  to remapp with compressed fbs.
+* no remapping gen2/3 as we'd need a fence for the remapped
+  vma, which we currently don't have. Need to deal with the
+  fence POT requirements, and do something about the gen2
+  gtt page size vs tile size difference
+
+v2: Rebase due to is_ccs_modifier()
+    Fix up the skl+ stride_mult mess
+    memset() the gtt_view because otherwise we could leave
+    junk in plane[1] when going from 2 plane to 1 plane format
+v3: intel_check_plane_stride() was split out
+v4: Drop the aligned viewport stuff, it was meant for ccs which
+    can't be remapped anyway
+v5: Introduce intel_plane_can_remap()
+    Reorder the code so that plane_state->view gets filled
+    even for invisible planes, otherwise we'd keep using
+    stale values and could explode during remapping. The new
+    logic never remaps invisible planes since we don't have
+    a viewport, and instead pins the full fb instead
+v6: Fix plane src coord checks after remapping by moving
+    plane_state->base.src to the final plane x/y offsets.
+    Allow intel_plane_check_stride() to fail even with
+    remapping (can happen at least with a linear 64bpp
+    fb with a 4k plane and a suitably inconvenient src
+    coordinates).
+    Improve aux plane FIXME (Daniel)
+    Move some code shuffling into a separate patch (Daniel)
+
+Testcase: igt/kms_big_fb
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Signed-off-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190509122159.24376-6-ville.syrjala@linux.intel.com
+	Reviewed-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+(cherry picked from commit 54d4d719fa119c1738f97adc242c05fff224c845)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/intel_display.c
+#	drivers/gpu/drm/i915/intel_display.h
+#	drivers/gpu/drm/i915/intel_sprite.c
+diff --cc drivers/gpu/drm/i915/intel_display.c
+index 98867581a27e,a9f8e52d4b6e..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@@ -1964,9 -1915,9 +1964,9 @@@ intel_tile_width_bytes(const struct drm
+  
+  	switch (fb->modifier) {
+  	case DRM_FORMAT_MOD_LINEAR:
+- 		return cpp;
++ 		return intel_tile_size(dev_priv);
+  	case I915_FORMAT_MOD_X_TILED:
+ -		if (IS_GEN(dev_priv, 2))
+ +		if (IS_GEN2(dev_priv))
+  			return 128;
+  		else
+  			return 512;
+@@@ -2005,13 -1956,10 +2005,18 @@@
+  }
+  
+  static unsigned int
+ -intel_tile_height(const struct drm_framebuffer *fb, int color_plane)
+ +intel_tile_height(const struct drm_framebuffer *fb, int plane)
+  {
+++<<<<<<< HEAD
+ +	if (fb->modifier == DRM_FORMAT_MOD_LINEAR)
+ +		return 1;
+ +	else
+ +		return intel_tile_size(to_i915(fb->dev)) /
+ +			intel_tile_width_bytes(fb, plane);
+++=======
++ 	return intel_tile_size(to_i915(fb->dev)) /
++ 		intel_tile_width_bytes(fb, color_plane);
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  }
+  
+  /* Return the tile dimensions in pixel units */
+@@@ -2255,28 -2214,20 +2260,33 @@@ u32 intel_fb_xy_to_linear(int x, int y
+   */
+  void intel_add_fb_offsets(int *x, int *y,
+  			  const struct intel_plane_state *state,
+ -			  int color_plane)
+ +			  int plane)
+  
+  {
+++<<<<<<< HEAD
+ +	const struct intel_framebuffer *intel_fb = to_intel_framebuffer(state->base.fb);
+ +	unsigned int rotation = state->base.rotation;
+ +
+ +	if (drm_rotation_90_or_270(rotation)) {
+ +		*x += intel_fb->rotated[plane].x;
+ +		*y += intel_fb->rotated[plane].y;
+ +	} else {
+ +		*x += intel_fb->normal[plane].x;
+ +		*y += intel_fb->normal[plane].y;
+ +	}
+++=======
++ 	*x += state->color_plane[color_plane].x;
++ 	*y += state->color_plane[color_plane].y;
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  }
+  
+ -static u32 intel_adjust_tile_offset(int *x, int *y,
+ -				    unsigned int tile_width,
+ -				    unsigned int tile_height,
+ -				    unsigned int tile_size,
+ -				    unsigned int pitch_tiles,
+ -				    u32 old_offset,
+ -				    u32 new_offset)
+ +static u32 __intel_adjust_tile_offset(int *x, int *y,
+ +				      unsigned int tile_width,
+ +				      unsigned int tile_height,
+ +				      unsigned int tile_size,
+ +				      unsigned int pitch_tiles,
+ +				      u32 old_offset,
+ +				      u32 new_offset)
+  {
+  	unsigned int pitch_pixels = pitch_tiles * tile_width;
+  	unsigned int tiles;
+@@@ -2515,6 -2492,128 +2525,131 @@@ intel_get_format_info(const struct drm_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ bool is_ccs_modifier(u64 modifier)
++ {
++ 	return modifier == I915_FORMAT_MOD_Y_TILED_CCS ||
++ 	       modifier == I915_FORMAT_MOD_Yf_TILED_CCS;
++ }
++ 
++ static
++ u32 intel_plane_fb_max_stride(struct drm_i915_private *dev_priv,
++ 			      u32 pixel_format, u64 modifier)
++ {
++ 	struct intel_crtc *crtc;
++ 	struct intel_plane *plane;
++ 
++ 	/*
++ 	 * We assume the primary plane for pipe A has
++ 	 * the highest stride limits of them all.
++ 	 */
++ 	crtc = intel_get_crtc_for_pipe(dev_priv, PIPE_A);
++ 	plane = to_intel_plane(crtc->base.primary);
++ 
++ 	return plane->max_stride(plane, pixel_format, modifier,
++ 				 DRM_MODE_ROTATE_0);
++ }
++ 
++ static
++ u32 intel_fb_max_stride(struct drm_i915_private *dev_priv,
++ 			u32 pixel_format, u64 modifier)
++ {
++ 	return intel_plane_fb_max_stride(dev_priv, pixel_format, modifier);
++ }
++ 
++ static u32
++ intel_fb_stride_alignment(const struct drm_framebuffer *fb, int color_plane)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(fb->dev);
++ 
++ 	if (fb->modifier == DRM_FORMAT_MOD_LINEAR) {
++ 		u32 max_stride = intel_plane_fb_max_stride(dev_priv,
++ 							   fb->format->format,
++ 							   fb->modifier);
++ 
++ 		/*
++ 		 * To make remapping with linear generally feasible
++ 		 * we need the stride to be page aligned.
++ 		 */
++ 		if (fb->pitches[color_plane] > max_stride)
++ 			return intel_tile_size(dev_priv);
++ 		else
++ 			return 64;
++ 	} else {
++ 		return intel_tile_width_bytes(fb, color_plane);
++ 	}
++ }
++ 
++ bool intel_plane_can_remap(const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	int i;
++ 
++ 	/* We don't want to deal with remapping with cursors */
++ 	if (plane->id == PLANE_CURSOR)
++ 		return false;
++ 
++ 	/*
++ 	 * The display engine limits already match/exceed the
++ 	 * render engine limits, so not much point in remapping.
++ 	 * Would also need to deal with the fence POT alignment
++ 	 * and gen2 2KiB GTT tile size.
++ 	 */
++ 	if (INTEL_GEN(dev_priv) < 4)
++ 		return false;
++ 
++ 	/*
++ 	 * The new CCS hash mode isn't compatible with remapping as
++ 	 * the virtual address of the pages affects the compressed data.
++ 	 */
++ 	if (is_ccs_modifier(fb->modifier))
++ 		return false;
++ 
++ 	/* Linear needs a page aligned stride for remapping */
++ 	if (fb->modifier == DRM_FORMAT_MOD_LINEAR) {
++ 		unsigned int alignment = intel_tile_size(dev_priv) - 1;
++ 
++ 		for (i = 0; i < fb->format->num_planes; i++) {
++ 			if (fb->pitches[i] & alignment)
++ 				return false;
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static bool intel_plane_needs_remap(const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	unsigned int rotation = plane_state->base.rotation;
++ 	u32 stride, max_stride;
++ 
++ 	/*
++ 	 * No remapping for invisible planes since we don't have
++ 	 * an actual source viewport to remap.
++ 	 */
++ 	if (!plane_state->base.visible)
++ 		return false;
++ 
++ 	if (!intel_plane_can_remap(plane_state))
++ 		return false;
++ 
++ 	/*
++ 	 * FIXME: aux plane limits on gen9+ are
++ 	 * unclear in Bspec, for now no checking.
++ 	 */
++ 	stride = intel_fb_pitch(fb, 0, rotation);
++ 	max_stride = plane->max_stride(plane, fb->format->format,
++ 				       fb->modifier, rotation);
++ 
++ 	return stride > max_stride;
++ }
++ 
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  static int
+  intel_fill_fb_info(struct drm_i915_private *dev_priv,
+  		   struct drm_framebuffer *fb)
+@@@ -3111,33 -3435,18 +3408,41 @@@ static int skl_check_main_surface(cons
+  		}
+  	}
+  
+ -	plane_state->color_plane[0].offset = offset;
+ -	plane_state->color_plane[0].x = x;
+ -	plane_state->color_plane[0].y = y;
+ +	plane_state->main.offset = offset;
+ +	plane_state->main.x = x;
+ +	plane_state->main.y = y;
+ +
+ +	return 0;
+ +}
+ +
+ +static int
+ +skl_check_nv12_surface(const struct intel_crtc_state *crtc_state,
+ +		       struct intel_plane_state *plane_state)
+ +{
+ +	/* Display WA #1106 */
+ +	if (plane_state->base.rotation !=
+ +	    (DRM_MODE_REFLECT_X | DRM_MODE_ROTATE_90) &&
+ +	    plane_state->base.rotation != DRM_MODE_ROTATE_270)
+ +		return 0;
+ +
+ +	/*
+ +	 * src coordinates are rotated here.
+ +	 * We check height but report it as width
+ +	 */
+ +	if (((drm_rect_height(&plane_state->base.src) >> 16) % 4) != 0) {
+ +		DRM_DEBUG_KMS("src width must be multiple "
+ +			      "of 4 for rotated NV12\n");
+ +		return -EINVAL;
+ +	}
+  
++ 	/*
++ 	 * Put the final coordinates back so that the src
++ 	 * coordinate checks will see the right values.
++ 	 */
++ 	drm_rect_translate(&plane_state->base.src,
++ 			   (x << 16) - plane_state->base.src.x1,
++ 			   (y << 16) - plane_state->base.src.y1);
++ 
+  	return 0;
+  }
+  
+@@@ -3197,18 -3500,14 +3502,23 @@@ static int skl_check_ccs_aux_surface(st
+  	return 0;
+  }
+  
+ -int skl_check_plane_surface(struct intel_plane_state *plane_state)
+ +int skl_check_plane_surface(const struct intel_crtc_state *crtc_state,
+ +			    struct intel_plane_state *plane_state)
+  {
+  	const struct drm_framebuffer *fb = plane_state->base.fb;
+- 	unsigned int rotation = plane_state->base.rotation;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	if (rotation & DRM_MODE_REFLECT_X &&
+ +	    fb->modifier == DRM_FORMAT_MOD_LINEAR) {
+ +		DRM_DEBUG_KMS("horizontal flip is not supported with linear surface formats\n");
+ +		return -EINVAL;
+ +	}
+++=======
++ 	ret = intel_plane_compute_gtt(plane_state);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  
+  	if (!plane_state->base.visible)
+  		return 0;
+@@@ -3314,9 -3641,19 +3618,25 @@@ int i9xx_check_plane_surface(struct int
+  {
+  	struct drm_i915_private *dev_priv =
+  		to_i915(plane_state->base.plane->dev);
+++<<<<<<< HEAD
+ +	int src_x = plane_state->base.src.x1 >> 16;
+ +	int src_y = plane_state->base.src.y1 >> 16;
+ +	u32 offset;
+++=======
++ 	int src_x, src_y;
++ 	u32 offset;
++ 	int ret;
++ 
++ 	ret = intel_plane_compute_gtt(plane_state);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	src_x = plane_state->base.src.x1 >> 16;
++ 	src_y = plane_state->base.src.y1 >> 16;
+  
+  	intel_add_fb_offsets(&src_x, &src_y, plane_state, 0);
+  
+@@@ -3340,9 -3685,43 +3668,49 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	plane_state->main.offset = offset;
+ +	plane_state->main.x = src_x;
+ +	plane_state->main.y = src_y;
+++=======
++ 	plane_state->color_plane[0].offset = offset;
++ 	plane_state->color_plane[0].x = src_x;
++ 	plane_state->color_plane[0].y = src_y;
++ 
++ 	return 0;
++ }
++ 
++ static int
++ i9xx_plane_check(struct intel_crtc_state *crtc_state,
++ 		 struct intel_plane_state *plane_state)
++ {
++ 	int ret;
++ 
++ 	ret = chv_plane_check_rotation(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = drm_atomic_helper_check_plane_state(&plane_state->base,
++ 						  &crtc_state->base,
++ 						  DRM_PLANE_HELPER_NO_SCALING,
++ 						  DRM_PLANE_HELPER_NO_SCALING,
++ 						  false, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = i9xx_check_plane_surface(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	ret = intel_plane_check_src_coordinates(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	plane_state->ctl = i9xx_plane_ctl(crtc_state, plane_state);
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  
+  	return 0;
+  }
+@@@ -9539,6 -10282,36 +9907,39 @@@ static bool intel_cursor_size_ok(const 
+  		height > 0 && height <= config->cursor_height;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int intel_cursor_check_surface(struct intel_plane_state *plane_state)
++ {
++ 	int src_x, src_y;
++ 	u32 offset;
++ 	int ret;
++ 
++ 	ret = intel_plane_compute_gtt(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	src_x = plane_state->base.src_x >> 16;
++ 	src_y = plane_state->base.src_y >> 16;
++ 
++ 	intel_add_fb_offsets(&src_x, &src_y, plane_state, 0);
++ 	offset = intel_plane_compute_aligned_offset(&src_x, &src_y,
++ 						    plane_state, 0);
++ 
++ 	if (src_x != 0 || src_y != 0) {
++ 		DRM_DEBUG_KMS("Arbitrary cursor panning not supported\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	plane_state->color_plane[0].offset = offset;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  static int intel_check_cursor(struct intel_crtc_state *crtc_state,
+  			      struct intel_plane_state *plane_state)
+  {
+@@@ -9555,28 -10331,36 +9956,39 @@@
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (!fb)
+++=======
++ 	ret = intel_cursor_check_surface(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  		return 0;
+  
+ -	ret = intel_plane_check_src_coordinates(plane_state);
+ -	if (ret)
+ -		return ret;
+ +	if (fb->modifier != DRM_FORMAT_MOD_LINEAR) {
+ +		DRM_DEBUG_KMS("cursor cannot be tiled\n");
+ +		return -EINVAL;
+ +	}
+  
+ -	return 0;
+ -}
+++<<<<<<< HEAD
+ +	src_x = plane_state->base.src_x >> 16;
+ +	src_y = plane_state->base.src_y >> 16;
+  
+ -static unsigned int
+ -i845_cursor_max_stride(struct intel_plane *plane,
+ -		       u32 pixel_format, u64 modifier,
+ -		       unsigned int rotation)
+ -{
+ -	return 2048;
+ -}
+ +	intel_add_fb_offsets(&src_x, &src_y, plane_state, 0);
+ +	offset = intel_compute_tile_offset(&src_x, &src_y, plane_state, 0);
+  
+ -static u32 i845_cursor_ctl_crtc(const struct intel_crtc_state *crtc_state)
+ -{
+ -	u32 cntl = 0;
+ +	if (src_x != 0 || src_y != 0) {
+ +		DRM_DEBUG_KMS("Arbitrary cursor panning not supported\n");
+ +		return -EINVAL;
+ +	}
+  
+ -	if (crtc_state->gamma_enable)
+ -		cntl |= CURSOR_GAMMA_ENABLE;
+ +	plane_state->main.offset = offset;
+  
+ -	return cntl;
+++=======
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+ +	return 0;
+  }
+  
+  static u32 i845_cursor_ctl(const struct intel_crtc_state *crtc_state,
+diff --cc drivers/gpu/drm/i915/intel_display.h
+index 2ef31617614a,2626a78e7601..000000000000
+--- a/drivers/gpu/drm/i915/intel_display.h
++++ b/drivers/gpu/drm/i915/intel_display.h
+@@@ -25,6 -25,33 +25,36 @@@
+  #ifndef _INTEL_DISPLAY_H_
+  #define _INTEL_DISPLAY_H_
+  
+++<<<<<<< HEAD
+++=======
++ #include <drm/drm_util.h>
++ #include <drm/i915_drm.h>
++ 
++ struct drm_i915_private;
++ struct intel_plane_state;
++ 
++ enum i915_gpio {
++ 	GPIOA,
++ 	GPIOB,
++ 	GPIOC,
++ 	GPIOD,
++ 	GPIOE,
++ 	GPIOF,
++ 	GPIOG,
++ 	GPIOH,
++ 	__GPIOI_UNUSED,
++ 	GPIOJ,
++ 	GPIOK,
++ 	GPIOL,
++ 	GPIOM,
++ };
++ 
++ /*
++  * Keep the pipe enum values fixed: the code assumes that PIPE_A=0, the
++  * rest have consecutive values and match the enum values of transcoders
++  * with a 1:1 transcoder -> pipe mapping.
++  */
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  enum pipe {
+  	INVALID_PIPE = -1,
+  
+@@@ -333,9 -421,21 +363,16 @@@ struct intel_link_m_n 
+  	     (__i)++) \
+  		for_each_if(plane)
+  
+ -#define for_each_oldnew_intel_crtc_in_state(__state, crtc, old_crtc_state, new_crtc_state, __i) \
+ -	for ((__i) = 0; \
+ -	     (__i) < (__state)->base.dev->mode_config.num_crtc && \
+ -		     ((crtc) = to_intel_crtc((__state)->base.crtcs[__i].ptr), \
+ -		      (old_crtc_state) = to_intel_crtc_state((__state)->base.crtcs[__i].old_state), \
+ -		      (new_crtc_state) = to_intel_crtc_state((__state)->base.crtcs[__i].new_state), 1); \
+ -	     (__i)++) \
+ -		for_each_if(crtc)
+ -
+ -void intel_link_compute_m_n(u16 bpp, int nlanes,
+ +void intel_link_compute_m_n(int bpp, int nlanes,
+  			    int pixel_clock, int link_clock,
+  			    struct intel_link_m_n *m_n,
+++<<<<<<< HEAD
+ +			    bool reduce_m_n);
+++=======
++ 			    bool constant_n);
++ bool is_ccs_modifier(u64 modifier);
++ void lpt_disable_clkout_dp(struct drm_i915_private *dev_priv);
++ bool intel_plane_can_remap(const struct intel_plane_state *plane_state);
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  
+  #endif
+diff --cc drivers/gpu/drm/i915/intel_sprite.c
+index ee23613f9fd4,91b461be70be..000000000000
+--- a/drivers/gpu/drm/i915/intel_sprite.c
++++ b/drivers/gpu/drm/i915/intel_sprite.c
+@@@ -230,7 -249,369 +230,373 @@@ void intel_pipe_update_end(struct intel
+  #endif
+  }
+  
+++<<<<<<< HEAD
+ +void
+++=======
++ int intel_plane_check_stride(const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	unsigned int rotation = plane_state->base.rotation;
++ 	u32 stride, max_stride;
++ 
++ 	/*
++ 	 * We ignore stride for all invisible planes that
++ 	 * can be remapped. Otherwise we could end up
++ 	 * with a false positive when the remapping didn't
++ 	 * kick in due the plane being invisible.
++ 	 */
++ 	if (intel_plane_can_remap(plane_state) &&
++ 	    !plane_state->base.visible)
++ 		return 0;
++ 
++ 	/* FIXME other color planes? */
++ 	stride = plane_state->color_plane[0].stride;
++ 	max_stride = plane->max_stride(plane, fb->format->format,
++ 				       fb->modifier, rotation);
++ 
++ 	if (stride > max_stride) {
++ 		DRM_DEBUG_KMS("[FB:%d] stride (%d) exceeds [PLANE:%d:%s] max stride (%d)\n",
++ 			      fb->base.id, stride,
++ 			      plane->base.base.id, plane->base.name, max_stride);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int intel_plane_check_src_coordinates(struct intel_plane_state *plane_state)
++ {
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	struct drm_rect *src = &plane_state->base.src;
++ 	u32 src_x, src_y, src_w, src_h, hsub, vsub;
++ 	bool rotated = drm_rotation_90_or_270(plane_state->base.rotation);
++ 
++ 	/*
++ 	 * Hardware doesn't handle subpixel coordinates.
++ 	 * Adjust to (macro)pixel boundary, but be careful not to
++ 	 * increase the source viewport size, because that could
++ 	 * push the downscaling factor out of bounds.
++ 	 */
++ 	src_x = src->x1 >> 16;
++ 	src_w = drm_rect_width(src) >> 16;
++ 	src_y = src->y1 >> 16;
++ 	src_h = drm_rect_height(src) >> 16;
++ 
++ 	src->x1 = src_x << 16;
++ 	src->x2 = (src_x + src_w) << 16;
++ 	src->y1 = src_y << 16;
++ 	src->y2 = (src_y + src_h) << 16;
++ 
++ 	if (!fb->format->is_yuv)
++ 		return 0;
++ 
++ 	/* YUV specific checks */
++ 	if (!rotated) {
++ 		hsub = fb->format->hsub;
++ 		vsub = fb->format->vsub;
++ 	} else {
++ 		hsub = vsub = max(fb->format->hsub, fb->format->vsub);
++ 	}
++ 
++ 	if (src_x % hsub || src_w % hsub) {
++ 		DRM_DEBUG_KMS("src x/w (%u, %u) must be a multiple of %u for %sYUV planes\n",
++ 			      src_x, src_w, hsub, rotated ? "rotated " : "");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (src_y % vsub || src_h % vsub) {
++ 		DRM_DEBUG_KMS("src y/h (%u, %u) must be a multiple of %u for %sYUV planes\n",
++ 			      src_y, src_h, vsub, rotated ? "rotated " : "");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static unsigned int
++ skl_plane_max_stride(struct intel_plane *plane,
++ 		     u32 pixel_format, u64 modifier,
++ 		     unsigned int rotation)
++ {
++ 	int cpp = drm_format_plane_cpp(pixel_format, 0);
++ 
++ 	/*
++ 	 * "The stride in bytes must not exceed the
++ 	 * of the size of 8K pixels and 32K bytes."
++ 	 */
++ 	if (drm_rotation_90_or_270(rotation))
++ 		return min(8192, 32768 / cpp);
++ 	else
++ 		return min(8192 * cpp, 32768);
++ }
++ 
++ static void
++ skl_program_scaler(struct intel_plane *plane,
++ 		   const struct intel_crtc_state *crtc_state,
++ 		   const struct intel_plane_state *plane_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	enum pipe pipe = plane->pipe;
++ 	int scaler_id = plane_state->scaler_id;
++ 	const struct intel_scaler *scaler =
++ 		&crtc_state->scaler_state.scalers[scaler_id];
++ 	int crtc_x = plane_state->base.dst.x1;
++ 	int crtc_y = plane_state->base.dst.y1;
++ 	u32 crtc_w = drm_rect_width(&plane_state->base.dst);
++ 	u32 crtc_h = drm_rect_height(&plane_state->base.dst);
++ 	u16 y_hphase, uv_rgb_hphase;
++ 	u16 y_vphase, uv_rgb_vphase;
++ 	int hscale, vscale;
++ 
++ 	hscale = drm_rect_calc_hscale(&plane_state->base.src,
++ 				      &plane_state->base.dst,
++ 				      0, INT_MAX);
++ 	vscale = drm_rect_calc_vscale(&plane_state->base.src,
++ 				      &plane_state->base.dst,
++ 				      0, INT_MAX);
++ 
++ 	/* TODO: handle sub-pixel coordinates */
++ 	if (is_planar_yuv_format(plane_state->base.fb->format->format) &&
++ 	    !icl_is_hdr_plane(dev_priv, plane->id)) {
++ 		y_hphase = skl_scaler_calc_phase(1, hscale, false);
++ 		y_vphase = skl_scaler_calc_phase(1, vscale, false);
++ 
++ 		/* MPEG2 chroma siting convention */
++ 		uv_rgb_hphase = skl_scaler_calc_phase(2, hscale, true);
++ 		uv_rgb_vphase = skl_scaler_calc_phase(2, vscale, false);
++ 	} else {
++ 		/* not used */
++ 		y_hphase = 0;
++ 		y_vphase = 0;
++ 
++ 		uv_rgb_hphase = skl_scaler_calc_phase(1, hscale, false);
++ 		uv_rgb_vphase = skl_scaler_calc_phase(1, vscale, false);
++ 	}
++ 
++ 	I915_WRITE_FW(SKL_PS_CTRL(pipe, scaler_id),
++ 		      PS_SCALER_EN | PS_PLANE_SEL(plane->id) | scaler->mode);
++ 	I915_WRITE_FW(SKL_PS_VPHASE(pipe, scaler_id),
++ 		      PS_Y_PHASE(y_vphase) | PS_UV_RGB_PHASE(uv_rgb_vphase));
++ 	I915_WRITE_FW(SKL_PS_HPHASE(pipe, scaler_id),
++ 		      PS_Y_PHASE(y_hphase) | PS_UV_RGB_PHASE(uv_rgb_hphase));
++ 	I915_WRITE_FW(SKL_PS_WIN_POS(pipe, scaler_id), (crtc_x << 16) | crtc_y);
++ 	I915_WRITE_FW(SKL_PS_WIN_SZ(pipe, scaler_id), (crtc_w << 16) | crtc_h);
++ }
++ 
++ /* Preoffset values for YUV to RGB Conversion */
++ #define PREOFF_YUV_TO_RGB_HI		0x1800
++ #define PREOFF_YUV_TO_RGB_ME		0x1F00
++ #define PREOFF_YUV_TO_RGB_LO		0x1800
++ 
++ #define  ROFF(x)          (((x) & 0xffff) << 16)
++ #define  GOFF(x)          (((x) & 0xffff) << 0)
++ #define  BOFF(x)          (((x) & 0xffff) << 16)
++ 
++ static void
++ icl_program_input_csc(struct intel_plane *plane,
++ 		      const struct intel_crtc_state *crtc_state,
++ 		      const struct intel_plane_state *plane_state)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	enum pipe pipe = plane->pipe;
++ 	enum plane_id plane_id = plane->id;
++ 
++ 	static const u16 input_csc_matrix[][9] = {
++ 		/*
++ 		 * BT.601 full range YCbCr -> full range RGB
++ 		 * The matrix required is :
++ 		 * [1.000, 0.000, 1.371,
++ 		 *  1.000, -0.336, -0.698,
++ 		 *  1.000, 1.732, 0.0000]
++ 		 */
++ 		[DRM_COLOR_YCBCR_BT601] = {
++ 			0x7AF8, 0x7800, 0x0,
++ 			0x8B28, 0x7800, 0x9AC0,
++ 			0x0, 0x7800, 0x7DD8,
++ 		},
++ 		/*
++ 		 * BT.709 full range YCbCr -> full range RGB
++ 		 * The matrix required is :
++ 		 * [1.000, 0.000, 1.574,
++ 		 *  1.000, -0.187, -0.468,
++ 		 *  1.000, 1.855, 0.0000]
++ 		 */
++ 		[DRM_COLOR_YCBCR_BT709] = {
++ 			0x7C98, 0x7800, 0x0,
++ 			0x9EF8, 0x7800, 0xABF8,
++ 			0x0, 0x7800,  0x7ED8,
++ 		},
++ 	};
++ 
++ 	/* Matrix for Limited Range to Full Range Conversion */
++ 	static const u16 input_csc_matrix_lr[][9] = {
++ 		/*
++ 		 * BT.601 Limted range YCbCr -> full range RGB
++ 		 * The matrix required is :
++ 		 * [1.164384, 0.000, 1.596370,
++ 		 *  1.138393, -0.382500, -0.794598,
++ 		 *  1.138393, 1.971696, 0.0000]
++ 		 */
++ 		[DRM_COLOR_YCBCR_BT601] = {
++ 			0x7CC8, 0x7950, 0x0,
++ 			0x8CB8, 0x7918, 0x9C40,
++ 			0x0, 0x7918, 0x7FC8,
++ 		},
++ 		/*
++ 		 * BT.709 Limited range YCbCr -> full range RGB
++ 		 * The matrix required is :
++ 		 * [1.164, 0.000, 1.833671,
++ 		 *  1.138393, -0.213249, -0.532909,
++ 		 *  1.138393, 2.112402, 0.0000]
++ 		 */
++ 		[DRM_COLOR_YCBCR_BT709] = {
++ 			0x7EA8, 0x7950, 0x0,
++ 			0x8888, 0x7918, 0xADA8,
++ 			0x0, 0x7918,  0x6870,
++ 		},
++ 	};
++ 	const u16 *csc;
++ 
++ 	if (plane_state->base.color_range == DRM_COLOR_YCBCR_FULL_RANGE)
++ 		csc = input_csc_matrix[plane_state->base.color_encoding];
++ 	else
++ 		csc = input_csc_matrix_lr[plane_state->base.color_encoding];
++ 
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 0), ROFF(csc[0]) |
++ 		      GOFF(csc[1]));
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 1), BOFF(csc[2]));
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 2), ROFF(csc[3]) |
++ 		      GOFF(csc[4]));
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 3), BOFF(csc[5]));
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 4), ROFF(csc[6]) |
++ 		      GOFF(csc[7]));
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_COEFF(pipe, plane_id, 5), BOFF(csc[8]));
++ 
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_PREOFF(pipe, plane_id, 0),
++ 		      PREOFF_YUV_TO_RGB_HI);
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_PREOFF(pipe, plane_id, 1),
++ 		      PREOFF_YUV_TO_RGB_ME);
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_PREOFF(pipe, plane_id, 2),
++ 		      PREOFF_YUV_TO_RGB_LO);
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_POSTOFF(pipe, plane_id, 0), 0x0);
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_POSTOFF(pipe, plane_id, 1), 0x0);
++ 	I915_WRITE_FW(PLANE_INPUT_CSC_POSTOFF(pipe, plane_id, 2), 0x0);
++ }
++ 
++ static void
++ skl_program_plane(struct intel_plane *plane,
++ 		  const struct intel_crtc_state *crtc_state,
++ 		  const struct intel_plane_state *plane_state,
++ 		  int color_plane, bool slave, u32 plane_ctl)
++ {
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	enum plane_id plane_id = plane->id;
++ 	enum pipe pipe = plane->pipe;
++ 	const struct drm_intel_sprite_colorkey *key = &plane_state->ckey;
++ 	u32 surf_addr = plane_state->color_plane[color_plane].offset;
++ 	u32 stride = skl_plane_stride(plane_state, color_plane);
++ 	u32 aux_stride = skl_plane_stride(plane_state, 1);
++ 	int crtc_x = plane_state->base.dst.x1;
++ 	int crtc_y = plane_state->base.dst.y1;
++ 	u32 x = plane_state->color_plane[color_plane].x;
++ 	u32 y = plane_state->color_plane[color_plane].y;
++ 	u32 src_w = drm_rect_width(&plane_state->base.src) >> 16;
++ 	u32 src_h = drm_rect_height(&plane_state->base.src) >> 16;
++ 	struct intel_plane *linked = plane_state->linked_plane;
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	u8 alpha = plane_state->base.alpha >> 8;
++ 	u32 plane_color_ctl = 0;
++ 	unsigned long irqflags;
++ 	u32 keymsk, keymax;
++ 
++ 	plane_ctl |= skl_plane_ctl_crtc(crtc_state);
++ 
++ 	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
++ 		plane_color_ctl = plane_state->color_ctl |
++ 			glk_plane_color_ctl_crtc(crtc_state);
++ 
++ 	/* Sizes are 0 based */
++ 	src_w--;
++ 	src_h--;
++ 
++ 	keymax = (key->max_value & 0xffffff) | PLANE_KEYMAX_ALPHA(alpha);
++ 
++ 	keymsk = key->channel_mask & 0x7ffffff;
++ 	if (alpha < 0xff)
++ 		keymsk |= PLANE_KEYMSK_ALPHA_ENABLE;
++ 
++ 	/* The scaler will handle the output position */
++ 	if (plane_state->scaler_id >= 0) {
++ 		crtc_x = 0;
++ 		crtc_y = 0;
++ 	}
++ 
++ 	spin_lock_irqsave(&dev_priv->uncore.lock, irqflags);
++ 
++ 	I915_WRITE_FW(PLANE_STRIDE(pipe, plane_id), stride);
++ 	I915_WRITE_FW(PLANE_POS(pipe, plane_id), (crtc_y << 16) | crtc_x);
++ 	I915_WRITE_FW(PLANE_SIZE(pipe, plane_id), (src_h << 16) | src_w);
++ 	I915_WRITE_FW(PLANE_AUX_DIST(pipe, plane_id),
++ 		      (plane_state->color_plane[1].offset - surf_addr) | aux_stride);
++ 
++ 	if (icl_is_hdr_plane(dev_priv, plane_id)) {
++ 		u32 cus_ctl = 0;
++ 
++ 		if (linked) {
++ 			/* Enable and use MPEG-2 chroma siting */
++ 			cus_ctl = PLANE_CUS_ENABLE |
++ 				PLANE_CUS_HPHASE_0 |
++ 				PLANE_CUS_VPHASE_SIGN_NEGATIVE |
++ 				PLANE_CUS_VPHASE_0_25;
++ 
++ 			if (linked->id == PLANE_SPRITE5)
++ 				cus_ctl |= PLANE_CUS_PLANE_7;
++ 			else if (linked->id == PLANE_SPRITE4)
++ 				cus_ctl |= PLANE_CUS_PLANE_6;
++ 			else
++ 				MISSING_CASE(linked->id);
++ 		}
++ 
++ 		I915_WRITE_FW(PLANE_CUS_CTL(pipe, plane_id), cus_ctl);
++ 	}
++ 
++ 	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
++ 		I915_WRITE_FW(PLANE_COLOR_CTL(pipe, plane_id), plane_color_ctl);
++ 
++ 	if (fb->format->is_yuv && icl_is_hdr_plane(dev_priv, plane_id))
++ 		icl_program_input_csc(plane, crtc_state, plane_state);
++ 
++ 	skl_write_plane_wm(plane, crtc_state);
++ 
++ 	I915_WRITE_FW(PLANE_KEYVAL(pipe, plane_id), key->min_value);
++ 	I915_WRITE_FW(PLANE_KEYMSK(pipe, plane_id), keymsk);
++ 	I915_WRITE_FW(PLANE_KEYMAX(pipe, plane_id), keymax);
++ 
++ 	I915_WRITE_FW(PLANE_OFFSET(pipe, plane_id), (y << 16) | x);
++ 
++ 	if (INTEL_GEN(dev_priv) < 11)
++ 		I915_WRITE_FW(PLANE_AUX_OFFSET(pipe, plane_id),
++ 			      (plane_state->color_plane[1].y << 16) |
++ 			      plane_state->color_plane[1].x);
++ 
++ 	/*
++ 	 * The control register self-arms if the plane was previously
++ 	 * disabled. Try to make the plane enable atomic by writing
++ 	 * the control register just before the surface register.
++ 	 */
++ 	I915_WRITE_FW(PLANE_CTL(pipe, plane_id), plane_ctl);
++ 	I915_WRITE_FW(PLANE_SURF(pipe, plane_id),
++ 		      intel_plane_ggtt_offset(plane_state) + surf_addr);
++ 
++ 	if (!slave && plane_state->scaler_id >= 0)
++ 		skl_program_scaler(plane, crtc_state, plane_state);
++ 
++ 	spin_unlock_irqrestore(&dev_priv->uncore.lock, irqflags);
++ }
++ 
++ static void
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  skl_update_plane(struct intel_plane *plane,
+  		 const struct intel_crtc_state *crtc_state,
+  		 const struct intel_plane_state *plane_state)
+@@@ -987,86 -1427,256 +1353,299 @@@ intel_check_sprite_plane(struct intel_p
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (state->base.visible) {
+ +		struct drm_rect *src = &state->base.src;
+ +		struct drm_rect *dst = &state->base.dst;
+ +		unsigned int crtc_w = drm_rect_width(dst);
+ +		unsigned int crtc_h = drm_rect_height(dst);
+ +		uint32_t src_x, src_y, src_w, src_h;
+++=======
++ 	ret = i9xx_check_plane_surface(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	ret = intel_plane_check_src_coordinates(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = g4x_sprite_check_scaling(crtc_state, plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (INTEL_GEN(dev_priv) >= 7)
++ 		plane_state->ctl = ivb_sprite_ctl(crtc_state, plane_state);
++ 	else
++ 		plane_state->ctl = g4x_sprite_ctl(crtc_state, plane_state);
++ 
++ 	return 0;
++ }
++ 
++ int chv_plane_check_rotation(const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	unsigned int rotation = plane_state->base.rotation;
++ 
++ 	/* CHV ignores the mirror bit when the rotate bit is set :( */
++ 	if (IS_CHERRYVIEW(dev_priv) &&
++ 	    rotation & DRM_MODE_ROTATE_180 &&
++ 	    rotation & DRM_MODE_REFLECT_X) {
++ 		DRM_DEBUG_KMS("Cannot rotate and reflect at the same time\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int
++ vlv_sprite_check(struct intel_crtc_state *crtc_state,
++ 		 struct intel_plane_state *plane_state)
++ {
++ 	int ret;
++ 
++ 	ret = chv_plane_check_rotation(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = drm_atomic_helper_check_plane_state(&plane_state->base,
++ 						  &crtc_state->base,
++ 						  DRM_PLANE_HELPER_NO_SCALING,
++ 						  DRM_PLANE_HELPER_NO_SCALING,
++ 						  true, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = i9xx_check_plane_surface(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	ret = intel_plane_check_src_coordinates(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	plane_state->ctl = vlv_sprite_ctl(crtc_state, plane_state);
++ 
++ 	return 0;
++ }
++ 
++ static int skl_plane_check_fb(const struct intel_crtc_state *crtc_state,
++ 			      const struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	unsigned int rotation = plane_state->base.rotation;
++ 	struct drm_format_name_buf format_name;
++ 
++ 	if (!fb)
++ 		return 0;
++ 
++ 	if (rotation & ~(DRM_MODE_ROTATE_0 | DRM_MODE_ROTATE_180) &&
++ 	    is_ccs_modifier(fb->modifier)) {
++ 		DRM_DEBUG_KMS("RC support only with 0/180 degree rotation (%x)\n",
++ 			      rotation);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (rotation & DRM_MODE_REFLECT_X &&
++ 	    fb->modifier == DRM_FORMAT_MOD_LINEAR) {
++ 		DRM_DEBUG_KMS("horizontal flip is not supported with linear surface formats\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (drm_rotation_90_or_270(rotation)) {
++ 		if (fb->modifier != I915_FORMAT_MOD_Y_TILED &&
++ 		    fb->modifier != I915_FORMAT_MOD_Yf_TILED) {
++ 			DRM_DEBUG_KMS("Y/Yf tiling required for 90/270!\n");
++ 			return -EINVAL;
++ 		}
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  
+  		/*
+ -		 * 90/270 is not allowed with RGB64 16:16:16:16 and
+ -		 * Indexed 8-bit. RGB 16-bit 5:6:5 is allowed gen11 onwards.
+ +		 * Hardware doesn't handle subpixel coordinates.
+ +		 * Adjust to (macro)pixel boundary, but be careful not to
+ +		 * increase the source viewport size, because that could
+ +		 * push the downscaling factor out of bounds.
+  		 */
+ -		switch (fb->format->format) {
+ -		case DRM_FORMAT_RGB565:
+ -			if (INTEL_GEN(dev_priv) >= 11)
+ -				break;
+ -			/* fall through */
+ -		case DRM_FORMAT_C8:
+ -		case DRM_FORMAT_XRGB16161616F:
+ -		case DRM_FORMAT_XBGR16161616F:
+ -		case DRM_FORMAT_ARGB16161616F:
+ -		case DRM_FORMAT_ABGR16161616F:
+ -		case DRM_FORMAT_Y210:
+ -		case DRM_FORMAT_Y212:
+ -		case DRM_FORMAT_Y216:
+ -		case DRM_FORMAT_XVYU12_16161616:
+ -		case DRM_FORMAT_XVYU16161616:
+ -			DRM_DEBUG_KMS("Unsupported pixel format %s for 90/270!\n",
+ -				      drm_get_format_name(fb->format->format,
+ -							  &format_name));
+ +		src_x = src->x1 >> 16;
+ +		src_w = drm_rect_width(src) >> 16;
+ +		src_y = src->y1 >> 16;
+ +		src_h = drm_rect_height(src) >> 16;
+ +
+ +		src->x1 = src_x << 16;
+ +		src->x2 = (src_x + src_w) << 16;
+ +		src->y1 = src_y << 16;
+ +		src->y2 = (src_y + src_h) << 16;
+ +
+ +		if (intel_format_is_yuv(fb->format->format) &&
+ +    		    fb->format->format != DRM_FORMAT_NV12 &&
+ +		    (src_x % 2 || src_w % 2)) {
+ +			DRM_DEBUG_KMS("src x/w (%u, %u) must be a multiple of 2 for YUV planes\n",
+ +				      src_x, src_w);
+  			return -EINVAL;
+ -		default:
+ -			break;
+ +		}
+ +
+ +		/* Check size restrictions when scaling */
+ +		if (src_w != crtc_w || src_h != crtc_h) {
+ +			unsigned int width_bytes;
+ +			int cpp = fb->format->cpp[0];
+ +
+ +			WARN_ON(!can_scale);
+ +
+ +			width_bytes = ((src_x * cpp) & 63) + src_w * cpp;
+ +
+ +			/* FIXME interlacing min height is 6 */
+ +			if (INTEL_GEN(dev_priv) < 9 && (
+ +			     src_w < 3 || src_h < 3 ||
+ +			     src_w > 2048 || src_h > 2048 ||
+ +			     crtc_w < 3 || crtc_h < 3 ||
+ +			     width_bytes > 4096 || fb->pitches[0] > 4096)) {
+ +				DRM_DEBUG_KMS("Source dimensions exceed hardware limits\n");
+ +				return -EINVAL;
+ +			}
+  		}
+  	}
+  
+ -	/* Y-tiling is not supported in IF-ID Interlace mode */
+ -	if (crtc_state->base.enable &&
+ -	    crtc_state->base.adjusted_mode.flags & DRM_MODE_FLAG_INTERLACE &&
+ -	    (fb->modifier == I915_FORMAT_MOD_Y_TILED ||
+ -	     fb->modifier == I915_FORMAT_MOD_Yf_TILED ||
+ -	     fb->modifier == I915_FORMAT_MOD_Y_TILED_CCS ||
+ -	     fb->modifier == I915_FORMAT_MOD_Yf_TILED_CCS)) {
+ -		DRM_DEBUG_KMS("Y/Yf tiling not supported in IF-ID mode\n");
+ -		return -EINVAL;
+ +	if (INTEL_GEN(dev_priv) >= 9) {
+ +		ret = skl_check_plane_surface(crtc_state, state);
+ +		if (ret)
+ +			return ret;
+ +
+ +		state->ctl = skl_plane_ctl(crtc_state, state);
+ +	} else if (IS_VALLEYVIEW(dev_priv) || IS_CHERRYVIEW(dev_priv)) {
+ +		ret = i9xx_check_plane_surface(state);
+ +		if (ret)
+ +			return ret;
+ +
+ +		state->ctl = vlv_sprite_ctl(crtc_state, state);
+ +	} else if (INTEL_GEN(dev_priv) >= 7) {
+ +		ret = i9xx_check_plane_surface(state);
+ +		if (ret)
+ +			return ret;
+ +
+ +		state->ctl = ivb_sprite_ctl(crtc_state, state);
+ +	} else {
+ +		ret = i9xx_check_plane_surface(state);
+ +		if (ret)
+ +			return ret;
+ +
+ +		state->ctl = g4x_sprite_ctl(crtc_state, state);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	return 0;
++ }
++ 
++ static int skl_plane_check_dst_coordinates(const struct intel_crtc_state *crtc_state,
++ 					   const struct intel_plane_state *plane_state)
++ {
++ 	struct drm_i915_private *dev_priv =
++ 		to_i915(plane_state->base.plane->dev);
++ 	int crtc_x = plane_state->base.dst.x1;
++ 	int crtc_w = drm_rect_width(&plane_state->base.dst);
++ 	int pipe_src_w = crtc_state->pipe_src_w;
++ 
++ 	/*
++ 	 * Display WA #1175: cnl,glk
++ 	 * Planes other than the cursor may cause FIFO underflow and display
++ 	 * corruption if starting less than 4 pixels from the right edge of
++ 	 * the screen.
++ 	 * Besides the above WA fix the similar problem, where planes other
++ 	 * than the cursor ending less than 4 pixels from the left edge of the
++ 	 * screen may cause FIFO underflow and display corruption.
++ 	 */
++ 	if ((IS_GEMINILAKE(dev_priv) || IS_CANNONLAKE(dev_priv)) &&
++ 	    (crtc_x + crtc_w < 4 || crtc_x > pipe_src_w - 4)) {
++ 		DRM_DEBUG_KMS("requested plane X %s position %d invalid (valid range %d-%d)\n",
++ 			      crtc_x + crtc_w < 4 ? "end" : "start",
++ 			      crtc_x + crtc_w < 4 ? crtc_x + crtc_w : crtc_x,
++ 			      4, pipe_src_w - 4);
++ 		return -ERANGE;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int skl_plane_check_nv12_rotation(const struct intel_plane_state *plane_state)
++ {
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	unsigned int rotation = plane_state->base.rotation;
++ 	int src_w = drm_rect_width(&plane_state->base.src) >> 16;
++ 
++ 	/* Display WA #1106 */
++ 	if (is_planar_yuv_format(fb->format->format) && src_w & 3 &&
++ 	    (rotation == DRM_MODE_ROTATE_270 ||
++ 	     rotation == (DRM_MODE_REFLECT_X | DRM_MODE_ROTATE_90))) {
++ 		DRM_DEBUG_KMS("src width must be multiple of 4 for rotated planar YUV\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int skl_plane_check(struct intel_crtc_state *crtc_state,
++ 			   struct intel_plane_state *plane_state)
++ {
++ 	struct intel_plane *plane = to_intel_plane(plane_state->base.plane);
++ 	struct drm_i915_private *dev_priv = to_i915(plane->base.dev);
++ 	const struct drm_framebuffer *fb = plane_state->base.fb;
++ 	int min_scale = DRM_PLANE_HELPER_NO_SCALING;
++ 	int max_scale = DRM_PLANE_HELPER_NO_SCALING;
++ 	int ret;
++ 
++ 	ret = skl_plane_check_fb(crtc_state, plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* use scaler when colorkey is not required */
++ 	if (!plane_state->ckey.flags && intel_fb_scalable(fb)) {
++ 		min_scale = 1;
++ 		max_scale = skl_max_scale(crtc_state, fb->format->format);
++ 	}
++ 
++ 	ret = drm_atomic_helper_check_plane_state(&plane_state->base,
++ 						  &crtc_state->base,
++ 						  min_scale, max_scale,
++ 						  true, true);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = skl_check_plane_surface(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!plane_state->base.visible)
++ 		return 0;
++ 
++ 	ret = skl_plane_check_dst_coordinates(crtc_state, plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = intel_plane_check_src_coordinates(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	ret = skl_plane_check_nv12_rotation(plane_state);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* HW only has 8 bits pixel precision, disable plane if invisible */
++ 	if (!(plane_state->base.alpha >> 8))
++ 		plane_state->base.visible = false;
++ 
++ 	plane_state->ctl = skl_plane_ctl(crtc_state, plane_state);
++ 
+++>>>>>>> 54d4d719fa11 (drm/i915: Overcome display engine stride limits via GTT remapping)
+  	if (INTEL_GEN(dev_priv) >= 10 || IS_GEMINILAKE(dev_priv))
+ -		plane_state->color_ctl = glk_plane_color_ctl(crtc_state,
+ -							     plane_state);
+ +		state->color_ctl = glk_plane_color_ctl(crtc_state, state);
+  
+  	return 0;
+  }
+* Unmerged path drivers/gpu/drm/i915/intel_display.c
+* Unmerged path drivers/gpu/drm/i915/intel_display.h
+* Unmerged path drivers/gpu/drm/i915/intel_sprite.c
