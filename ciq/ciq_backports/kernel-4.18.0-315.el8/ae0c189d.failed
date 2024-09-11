@@ -1,0 +1,189 @@
+scsi: smartpqi: Remove timeouts from internal cmds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Kevin Barnett <kevin.barnett@microchip.com>
+commit ae0c189db4f1f763b3b1e9190bed06f81ad668fd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/ae0c189d.failed
+
+Remove timeouts for driver-initiated commands. Responses to internal
+requests can take longer than hard coded timeout values and the driver will
+still have an outstanding request that may complete in the future with no
+context.
+
+Link: https://lore.kernel.org/r/161549377451.25025.12306492868851801623.stgit@brunhilda
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit ae0c189db4f1f763b3b1e9190bed06f81ad668fd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi.h
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi.h
+index 2a82a166f773,8e5e2543c7cf..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi.h
++++ b/drivers/scsi/smartpqi/smartpqi.h
+@@@ -129,10 -129,13 +129,18 @@@ struct pqi_iu_header 
+  	__le16	iu_length;	/* in bytes - does not include the length */
+  				/* of this header */
+  	__le16	response_queue_id;	/* specifies the OQ where the */
+++<<<<<<< HEAD
+ +					/*   response IU is to be delivered */
+ +	u8	work_area[2];	/* reserved for driver use */
+++=======
++ 					/* response IU is to be delivered */
++ 	u16	driver_flags;	/* reserved for driver use */
+++>>>>>>> ae0c189db4f1 (scsi: smartpqi: Remove timeouts from internal cmds)
+  };
+  
++ /* manifest constants for pqi_iu_header.driver_flags */
++ #define PQI_DRIVER_NONBLOCKABLE_REQUEST		0x1
++ 
+  /*
+   * According to the PQI spec, the IU header is only the first 4 bytes of our
+   * pqi_iu_header structure.
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index f21839c52ced,d442aabf8fe8..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -687,6 -671,103 +668,106 @@@ static int pqi_identify_physical_device
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u32 pqi_aio_limit_to_bytes(__le16 *limit)
++ {
++ 	u32 bytes;
++ 
++ 	bytes = get_unaligned_le16(limit);
++ 	if (bytes == 0)
++ 		bytes = ~0;
++ 	else
++ 		bytes *= 1024;
++ 
++ 	return bytes;
++ }
++ 
++ #pragma pack(1)
++ 
++ struct bmic_sense_feature_buffer {
++ 	struct bmic_sense_feature_buffer_header header;
++ 	struct bmic_sense_feature_io_page_aio_subpage aio_subpage;
++ };
++ 
++ #pragma pack()
++ 
++ #define MINIMUM_AIO_SUBPAGE_BUFFER_LENGTH	\
++ 	offsetofend(struct bmic_sense_feature_buffer, \
++ 		aio_subpage.max_write_raid_1_10_3drive)
++ 
++ #define MINIMUM_AIO_SUBPAGE_LENGTH	\
++ 	(offsetofend(struct bmic_sense_feature_io_page_aio_subpage, \
++ 		max_write_raid_1_10_3drive) - \
++ 		sizeof_field(struct bmic_sense_feature_io_page_aio_subpage, header))
++ 
++ static int pqi_get_advanced_raid_bypass_config(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	int rc;
++ 	enum dma_data_direction dir;
++ 	struct pqi_raid_path_request request;
++ 	struct bmic_sense_feature_buffer *buffer;
++ 
++ 	buffer = kmalloc(sizeof(*buffer), GFP_KERNEL);
++ 	if (!buffer)
++ 		return -ENOMEM;
++ 
++ 	rc = pqi_build_raid_path_request(ctrl_info, &request, BMIC_SENSE_FEATURE, RAID_CTLR_LUNID,
++ 		buffer, sizeof(*buffer), 0, &dir);
++ 	if (rc)
++ 		goto error;
++ 
++ 	request.cdb[2] = BMIC_SENSE_FEATURE_IO_PAGE;
++ 	request.cdb[3] = BMIC_SENSE_FEATURE_IO_PAGE_AIO_SUBPAGE;
++ 
++ 	rc = pqi_submit_raid_request_synchronous(ctrl_info, &request.header, 0, NULL);
++ 
++ 	pqi_pci_unmap(ctrl_info->pci_dev, request.sg_descriptors, 1, dir);
++ 
++ 	if (rc)
++ 		goto error;
++ 
++ 	if (buffer->header.page_code != BMIC_SENSE_FEATURE_IO_PAGE ||
++ 		buffer->header.subpage_code !=
++ 			BMIC_SENSE_FEATURE_IO_PAGE_AIO_SUBPAGE ||
++ 		get_unaligned_le16(&buffer->header.buffer_length) <
++ 			MINIMUM_AIO_SUBPAGE_BUFFER_LENGTH ||
++ 		buffer->aio_subpage.header.page_code !=
++ 			BMIC_SENSE_FEATURE_IO_PAGE ||
++ 		buffer->aio_subpage.header.subpage_code !=
++ 			BMIC_SENSE_FEATURE_IO_PAGE_AIO_SUBPAGE ||
++ 		get_unaligned_le16(&buffer->aio_subpage.header.page_length) <
++ 			MINIMUM_AIO_SUBPAGE_LENGTH) {
++ 		goto error;
++ 	}
++ 
++ 	ctrl_info->max_transfer_encrypted_sas_sata =
++ 		pqi_aio_limit_to_bytes(
++ 			&buffer->aio_subpage.max_transfer_encrypted_sas_sata);
++ 
++ 	ctrl_info->max_transfer_encrypted_nvme =
++ 		pqi_aio_limit_to_bytes(
++ 			&buffer->aio_subpage.max_transfer_encrypted_nvme);
++ 
++ 	ctrl_info->max_write_raid_5_6 =
++ 		pqi_aio_limit_to_bytes(
++ 			&buffer->aio_subpage.max_write_raid_5_6);
++ 
++ 	ctrl_info->max_write_raid_1_10_2drive =
++ 		pqi_aio_limit_to_bytes(
++ 			&buffer->aio_subpage.max_write_raid_1_10_2drive);
++ 
++ 	ctrl_info->max_write_raid_1_10_3drive =
++ 		pqi_aio_limit_to_bytes(
++ 			&buffer->aio_subpage.max_write_raid_1_10_3drive);
++ 
++ error:
++ 	kfree(buffer);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> ae0c189db4f1 (scsi: smartpqi: Remove timeouts from internal cmds)
+  static int pqi_flush_cache(struct pqi_ctrl_info *ctrl_info,
+  	enum bmic_flush_cache_shutdown_event shutdown_event)
+  {
+@@@ -4123,22 -4247,10 +4182,11 @@@ static int pqi_submit_raid_request_sync
+  	io_request->io_complete_callback = pqi_raid_synchronous_complete;
+  	io_request->context = &wait;
+  
+ -	pqi_start_io(ctrl_info, &ctrl_info->queue_groups[PQI_DEFAULT_QUEUE_GROUP], RAID_PATH,
+ +	pqi_start_io(ctrl_info,
+ +		&ctrl_info->queue_groups[PQI_DEFAULT_QUEUE_GROUP], RAID_PATH,
+  		io_request);
+  
+- 	pqi_ctrl_unbusy(ctrl_info);
+- 
+- 	if (timeout_msecs == NO_TIMEOUT) {
+- 		pqi_wait_for_completion_io(ctrl_info, &wait);
+- 	} else {
+- 		if (!wait_for_completion_io_timeout(&wait,
+- 			msecs_to_jiffies(timeout_msecs))) {
+- 			dev_warn(&ctrl_info->pci_dev->dev,
+- 				"command timed out\n");
+- 			rc = -ETIMEDOUT;
+- 		}
+- 	}
++ 	pqi_wait_for_completion_io(ctrl_info, &wait);
+  
+  	if (error_info) {
+  		if (io_request->error_info)
+* Unmerged path drivers/scsi/smartpqi/smartpqi.h
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
