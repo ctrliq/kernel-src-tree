@@ -1,0 +1,260 @@
+xfs: Add xfs_has_attr and subroutines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Allison Collins <allison.henderson@oracle.com>
+commit 07120f1abdff80f3d1351f733661abe28d609535
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/07120f1a.failed
+
+This patch adds a new functions to check for the existence of an
+attribute. Subroutines are also added to handle the cases of leaf
+blocks, nodes or shortform. Common code that appears in existing attr
+add and remove functions have been factored out to help reduce the
+appearance of duplicated code.  We will need these routines later for
+delayed attributes since delayed operations cannot return error codes.
+
+	Signed-off-by: Allison Collins <allison.henderson@oracle.com>
+	Reviewed-by: Chandan Rajendra <chandanrlinux@gmail.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+[darrick: fix a leak-on-error bug reported by Dan Carpenter]
+[darrick: fix unused variable warning reported by 0day]
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Acked-by: Dave Chinner <dchinner@redhat.com>
+	Reported-by: dan.carpenter@oracle.com
+	Reported-by: kernel test robot <lkp@intel.com>
+(cherry picked from commit 07120f1abdff80f3d1351f733661abe28d609535)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index e4fe3dca9883,f7f796ea11fd..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -748,12 -825,7 +826,15 @@@ xfs_attr_node_addname
+  	 * Fill in bucket of arguments/results/context to carry around.
+  	 */
+  	dp = args->dp;
+ +	mp = dp->i_mount;
+  restart:
+++<<<<<<< HEAD
+ +	state = xfs_da_state_alloc();
+ +	state->args = args;
+ +	state->mp = mp;
+ +
+++=======
+++>>>>>>> 07120f1abdff (xfs: Add xfs_has_attr and subroutines)
+  	/*
+  	 * Search to see if name already exists, and get back a pointer
+  	 * to where it should go.
+@@@ -971,23 -1043,9 +1053,27 @@@ xfs_attr_node_removename
+  
+  	trace_xfs_attr_node_removename(args);
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Tie a string around our finger to remind us where we are.
+ +	 */
+ +	dp = args->dp;
+ +	state = xfs_da_state_alloc();
+ +	state->args = args;
+ +	state->mp = dp->i_mount;
+ +
+ +	/*
+ +	 * Search to see if name exists, and get back a pointer to it.
+ +	 */
+ +	error = xfs_da3_node_lookup_int(state, &retval);
+ +	if (error || (retval != -EEXIST)) {
+ +		if (error == 0)
+ +			error = retval;
+++=======
++ 	error = xfs_attr_node_hasname(args, &state);
++ 	if (error != -EEXIST)
+++>>>>>>> 07120f1abdff (xfs: Add xfs_has_attr and subroutines)
+  		goto out;
+- 	}
+  
+  	/*
+  	 * If there is an out-of-line value, de-allocate the blocks.
+@@@ -1207,10 -1267,6 +1295,13 @@@ xfs_attr_node_get
+  
+  	trace_xfs_attr_node_get(args);
+  
+++<<<<<<< HEAD
+ +	state = xfs_da_state_alloc();
+ +	state->args = args;
+ +	state->mp = args->dp->i_mount;
+ +
+++=======
+++>>>>>>> 07120f1abdff (xfs: Add xfs_has_attr and subroutines)
+  	/*
+  	 * Search to see if name exists, and get back a pointer to it.
+  	 */
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
+diff --git a/fs/xfs/libxfs/xfs_attr.h b/fs/xfs/libxfs/xfs_attr.h
+index db4717657ca1..3e97a935e712 100644
+--- a/fs/xfs/libxfs/xfs_attr.h
++++ b/fs/xfs/libxfs/xfs_attr.h
+@@ -89,6 +89,7 @@ int xfs_attr_get_ilocked(struct xfs_da_args *args);
+ int xfs_attr_get(struct xfs_da_args *args);
+ int xfs_attr_set(struct xfs_da_args *args);
+ int xfs_attr_set_args(struct xfs_da_args *args);
++int xfs_has_attr(struct xfs_da_args *args);
+ int xfs_attr_remove_args(struct xfs_da_args *args);
+ bool xfs_attr_namecheck(const void *name, size_t length);
+ 
+diff --git a/fs/xfs/libxfs/xfs_attr_leaf.c b/fs/xfs/libxfs/xfs_attr_leaf.c
+index a48406bb242e..33090e998167 100644
+--- a/fs/xfs/libxfs/xfs_attr_leaf.c
++++ b/fs/xfs/libxfs/xfs_attr_leaf.c
+@@ -662,19 +662,66 @@ xfs_attr_shortform_create(xfs_da_args_t *args)
+ 	xfs_trans_log_inode(args->trans, dp, XFS_ILOG_CORE | XFS_ILOG_ADATA);
+ }
+ 
++/*
++ * Return -EEXIST if attr is found, or -ENOATTR if not
++ * args:  args containing attribute name and namelen
++ * sfep:  If not null, pointer will be set to the last attr entry found on
++	  -EEXIST.  On -ENOATTR pointer is left at the last entry in the list
++ * basep: If not null, pointer is set to the byte offset of the entry in the
++ *	  list on -EEXIST.  On -ENOATTR, pointer is left at the byte offset of
++ *	  the last entry in the list
++ */
++int
++xfs_attr_sf_findname(
++	struct xfs_da_args	 *args,
++	struct xfs_attr_sf_entry **sfep,
++	unsigned int		 *basep)
++{
++	struct xfs_attr_shortform *sf;
++	struct xfs_attr_sf_entry *sfe;
++	unsigned int		base = sizeof(struct xfs_attr_sf_hdr);
++	int			size = 0;
++	int			end;
++	int			i;
++
++	sf = (struct xfs_attr_shortform *)args->dp->i_afp->if_u1.if_data;
++	sfe = &sf->list[0];
++	end = sf->hdr.count;
++	for (i = 0; i < end; sfe = XFS_ATTR_SF_NEXTENTRY(sfe),
++			     base += size, i++) {
++		size = XFS_ATTR_SF_ENTSIZE(sfe);
++		if (!xfs_attr_match(args, sfe->namelen, sfe->nameval,
++				    sfe->flags))
++			continue;
++		break;
++	}
++
++	if (sfep != NULL)
++		*sfep = sfe;
++
++	if (basep != NULL)
++		*basep = base;
++
++	if (i == end)
++		return -ENOATTR;
++	return -EEXIST;
++}
++
+ /*
+  * Add a name/value pair to the shortform attribute list.
+  * Overflow from the inode has already been checked for.
+  */
+ void
+-xfs_attr_shortform_add(xfs_da_args_t *args, int forkoff)
++xfs_attr_shortform_add(
++	struct xfs_da_args		*args,
++	int				forkoff)
+ {
+-	xfs_attr_shortform_t *sf;
+-	xfs_attr_sf_entry_t *sfe;
+-	int i, offset, size;
+-	xfs_mount_t *mp;
+-	xfs_inode_t *dp;
+-	struct xfs_ifork *ifp;
++	struct xfs_attr_shortform	*sf;
++	struct xfs_attr_sf_entry	*sfe;
++	int				offset, size;
++	struct xfs_mount		*mp;
++	struct xfs_inode		*dp;
++	struct xfs_ifork		*ifp;
+ 
+ 	trace_xfs_attr_sf_add(args);
+ 
+@@ -685,11 +732,8 @@ xfs_attr_shortform_add(xfs_da_args_t *args, int forkoff)
+ 	ifp = dp->i_afp;
+ 	ASSERT(ifp->if_flags & XFS_IFINLINE);
+ 	sf = (xfs_attr_shortform_t *)ifp->if_u1.if_data;
+-	sfe = &sf->list[0];
+-	for (i = 0; i < sf->hdr.count; sfe = XFS_ATTR_SF_NEXTENTRY(sfe), i++) {
+-		ASSERT(!xfs_attr_match(args, sfe->namelen, sfe->nameval,
+-			sfe->flags));
+-	}
++	if (xfs_attr_sf_findname(args, &sfe, NULL) == -EEXIST)
++		ASSERT(0);
+ 
+ 	offset = (char *)sfe - (char *)sf;
+ 	size = XFS_ATTR_SF_ENTSIZE_BYNAME(args->namelen, args->valuelen);
+@@ -732,31 +776,27 @@ xfs_attr_fork_remove(
+  * Remove an attribute from the shortform attribute list structure.
+  */
+ int
+-xfs_attr_shortform_remove(xfs_da_args_t *args)
++xfs_attr_shortform_remove(
++	struct xfs_da_args		*args)
+ {
+-	xfs_attr_shortform_t *sf;
+-	xfs_attr_sf_entry_t *sfe;
+-	int base, size=0, end, totsize, i;
+-	xfs_mount_t *mp;
+-	xfs_inode_t *dp;
++	struct xfs_attr_shortform	*sf;
++	struct xfs_attr_sf_entry	*sfe;
++	int				size = 0, end, totsize;
++	unsigned int			base;
++	struct xfs_mount		*mp;
++	struct xfs_inode		*dp;
++	int				error;
+ 
+ 	trace_xfs_attr_sf_remove(args);
+ 
+ 	dp = args->dp;
+ 	mp = dp->i_mount;
+-	base = sizeof(xfs_attr_sf_hdr_t);
+ 	sf = (xfs_attr_shortform_t *)dp->i_afp->if_u1.if_data;
+-	sfe = &sf->list[0];
+-	end = sf->hdr.count;
+-	for (i = 0; i < end; sfe = XFS_ATTR_SF_NEXTENTRY(sfe),
+-					base += size, i++) {
+-		size = XFS_ATTR_SF_ENTSIZE(sfe);
+-		if (xfs_attr_match(args, sfe->namelen, sfe->nameval,
+-				sfe->flags))
+-			break;
+-	}
+-	if (i == end)
+-		return -ENOATTR;
++
++	error = xfs_attr_sf_findname(args, &sfe, &base);
++	if (error != -EEXIST)
++		return error;
++	size = XFS_ATTR_SF_ENTSIZE(sfe);
+ 
+ 	/*
+ 	 * Fix up the attribute fork data, covering the hole
+diff --git a/fs/xfs/libxfs/xfs_attr_leaf.h b/fs/xfs/libxfs/xfs_attr_leaf.h
+index 5be6be309302..9b1c59f40a26 100644
+--- a/fs/xfs/libxfs/xfs_attr_leaf.h
++++ b/fs/xfs/libxfs/xfs_attr_leaf.h
+@@ -52,6 +52,9 @@ int	xfs_attr_shortform_getvalue(struct xfs_da_args *args);
+ int	xfs_attr_shortform_to_leaf(struct xfs_da_args *args,
+ 			struct xfs_buf **leaf_bp);
+ int	xfs_attr_shortform_remove(struct xfs_da_args *args);
++int	xfs_attr_sf_findname(struct xfs_da_args *args,
++			     struct xfs_attr_sf_entry **sfep,
++			     unsigned int *basep);
+ int	xfs_attr_shortform_allfit(struct xfs_buf *bp, struct xfs_inode *dp);
+ int	xfs_attr_shortform_bytesfit(struct xfs_inode *dp, int bytes);
+ xfs_failaddr_t xfs_attr_shortform_verify(struct xfs_inode *ip);
