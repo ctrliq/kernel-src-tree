@@ -1,0 +1,276 @@
+hmm: use mmu_notifier_get/put for 'struct hmm'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit c7d8b7824ff9de866a356e1892dbe9f191aa5d06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/c7d8b782.failed
+
+This is a significant simplification, it eliminates all the remaining
+'hmm' stuff in mm_struct, eliminates krefing along the critical notifier
+paths, and takes away all the ugly locking and abuse of page_table_lock.
+
+mmu_notifier_get() provides the single struct hmm per struct mm which
+eliminates mm->hmm.
+
+It also directly guarantees that no mmu_notifier op callback is callable
+while concurrent free is possible, this eliminates all the krefs inside
+the mmu_notifier callbacks.
+
+The remaining krefs in the range code were overly cautious, drivers are
+already not permitted to free the mirror while a range exists.
+
+Link: https://lore.kernel.org/r/20190806231548.25242-6-jgg@ziepe.ca
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit c7d8b7824ff9de866a356e1892dbe9f191aa5d06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/hmm.h
+#	include/linux/mm_types.h
+#	mm/hmm.c
+diff --cc include/linux/hmm.h
+index 6a8157d67186,3fec513b9c00..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -106,13 -88,10 +105,11 @@@ struct hmm 
+  	spinlock_t		ranges_lock;
+  	struct list_head	ranges;
+  	struct list_head	mirrors;
+- 	struct mmu_notifier	mmu_notifier;
+  	struct rw_semaphore	mirrors_sem;
+  	wait_queue_head_t	wq;
+- 	struct rcu_head		rcu;
+  	long			notifiers;
+  };
+ +#endif
+  
+  /*
+   * hmm_pfn_flag_e - HMM flag enums
+@@@ -504,14 -407,5 +501,17 @@@ long hmm_range_dma_unmap(struct hmm_ran
+  #define HMM_RANGE_DEFAULT_TIMEOUT 1000
+  
+  #endif /* IS_ENABLED(CONFIG_HMM_MIRROR) */
+++<<<<<<< HEAD
+ +
+ +/* Below are for HMM internal use only! Not to be used by device driver! */
+ +static inline void hmm_mm_init(struct mm_struct *mm)
+ +{
+ +	mm->hmm = NULL;
+ +}
+ +#else /* IS_ENABLED(CONFIG_HMM) */
+ +static inline void hmm_mm_init(struct mm_struct *mm) {}
+ +#endif /* IS_ENABLED(CONFIG_HMM) */
+++=======
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  
+  #endif /* LINUX_HMM_H */
+diff --cc include/linux/mm_types.h
+index 713a008717dc,525d25d93330..000000000000
+--- a/include/linux/mm_types.h
++++ b/include/linux/mm_types.h
+@@@ -28,8 -25,6 +28,11 @@@
+  
+  struct address_space;
+  struct mem_cgroup;
+++<<<<<<< HEAD
+ +struct hmm;
+ +struct dev_pagemap;
+++=======
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  
+  /*
+   * Each physical page in the system has a struct page associated with
+@@@ -550,40 -501,8 +553,43 @@@ struct mm_struct 
+  		atomic_long_t hugetlb_usage;
+  #endif
+  		struct work_struct async_put_work;
+++<<<<<<< HEAD
+ +
+ +#if IS_ENABLED(CONFIG_HMM)
+ +		/* HMM needs to track a few things per mm */
+ +		struct hmm *hmm;
+ +#endif
+++=======
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  	} __randomize_layout;
+  
+ +#if defined(CONFIG_IOMMU_SUPPORT)
+ +	RH_KABI_USE(1, u32 pasid)
+ +#else
+ +	RH_KABI_RESERVE(1)
+ +#endif
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +
+ +#if defined(CONFIG_PPC64) && defined (CONFIG_PPC_VAS)
+ +	/*
+ +	 * In upstream vas_windows is defined in arch specific mm_context struct
+ +	 * (arch/powerpc/include/asm/mmu.h).
+ +	 * To fix kABI breakage, adding here but will be defined only for powerpc.
+ +	 * Though used only on powerNV and P9 (or later) right now, will be needed
+ +	 * in future when we add NX-GZIP support on powerVM.
+ +	 * Leaving first 7 reserves for arch independent elements if needed in future
+ +	 * so that will be placed in same location for all archs.
+ +	 */
+ +	RH_KABI_USE(8, atomic_t vas_windows)
+ +#else
+ +	RH_KABI_RESERVE(8)
+ +#endif
+ +
+  	/*
+  	 * The mm_cpumask needs to be at the end of mm_struct, because it
+  	 * is dynamically sized based on nr_cpu_ids.
+diff --cc mm/hmm.c
+index e19a0812813a,49eace16f9f8..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -35,37 -26,14 +35,46 @@@
+  #include <linux/mmu_notifier.h>
+  #include <linux/memory_hotplug.h>
+  
+++<<<<<<< HEAD
+ +#if IS_ENABLED(CONFIG_HMM_MIRROR)
+ +static const struct mmu_notifier_ops hmm_mmu_notifier_ops;
+ +
+ +/**
+ + * hmm_get_or_create - register HMM against an mm (HMM internal)
+ + *
+ + * @mm: mm struct to attach to
+ + * Return: an HMM object, either by referencing the existing
+ + *          (per-process) object, or by creating a new one.
+ + *
+ + * This is not intended to be used directly by device drivers. If mm already
+ + * has an HMM struct then it get a reference on it and returns it. Otherwise
+ + * it allocates an HMM struct, initializes it, associate it with the mm and
+ + * returns it.
+ + */
+ +static struct hmm *hmm_get_or_create(struct mm_struct *mm)
+ +{
+ +	struct hmm *hmm;
+ +
+ +	lockdep_assert_held_exclusive(&mm->mmap_sem);
+ +
+ +	/* Abuse the page_table_lock to also protect mm->hmm. */
+ +	spin_lock(&mm->page_table_lock);
+ +	hmm = mm->hmm;
+ +	if (mm->hmm && kref_get_unless_zero(&mm->hmm->kref))
+ +		goto out_unlock;
+ +	spin_unlock(&mm->page_table_lock);
+ +
+ +	hmm = kmalloc(sizeof(*hmm), GFP_KERNEL);
+++=======
++ static struct mmu_notifier *hmm_alloc_notifier(struct mm_struct *mm)
++ {
++ 	struct hmm *hmm;
++ 
++ 	hmm = kzalloc(sizeof(*hmm), GFP_KERNEL);
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  	if (!hmm)
+- 		return NULL;
++ 		return ERR_PTR(-ENOMEM);
++ 
+  	init_waitqueue_head(&hmm->wq);
+  	INIT_LIST_HEAD(&hmm->mirrors);
+  	init_rwsem(&hmm->mirrors_sem);
+@@@ -182,14 -103,6 +147,17 @@@ static void hmm_invalidate_range_start(
+  	unsigned long flags;
+  	int ret = 0;
+  
+++<<<<<<< HEAD
+ +	if (!kref_get_unless_zero(&hmm->kref))
+ +		return;
+ +
+ +	update.start = start;
+ +	update.end = end;
+ +	update.event = HMM_UPDATE_INVALIDATE;
+ +	update.blockable = true;
+ +
+++=======
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  	spin_lock_irqsave(&hmm->ranges_lock, flags);
+  	hmm->notifiers++;
+  	list_for_each_entry(range, &hmm->ranges, list) {
+@@@ -222,7 -137,7 +190,11 @@@
+  out:
+  	if (ret)
+  		notifiers_decrement(hmm);
+++<<<<<<< HEAD
+ +	hmm_put(hmm);
+++=======
++ 	return ret;
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  }
+  
+  static void hmm_invalidate_range_end(struct mmu_notifier *mn,
+@@@ -257,7 -174,9 +233,13 @@@ static const struct mmu_notifier_ops hm
+   */
+  int hmm_mirror_register(struct hmm_mirror *mirror, struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	lockdep_assert_held_exclusive(&mm->mmap_sem);
+++=======
++ 	struct mmu_notifier *mn;
++ 
++ 	lockdep_assert_held_write(&mm->mmap_sem);
+++>>>>>>> c7d8b7824ff9 (hmm: use mmu_notifier_get/put for 'struct hmm')
+  
+  	/* Sanity check */
+  	if (!mm || !mirror || !mirror->ops)
+@@@ -910,17 -785,13 +893,17 @@@ int hmm_range_register(struct hmm_rang
+  	range->valid = false;
+  	range->hmm = NULL;
+  
+ -	if ((range->start & (PAGE_SIZE - 1)) || (range->end & (PAGE_SIZE - 1)))
+ +	if ((start & mask) || (end & mask))
+  		return -EINVAL;
+ -	if (range->start >= range->end)
+ +	if (start >= end)
+  		return -EINVAL;
+  
+ +	range->page_shift = page_shift;
+ +	range->start = start;
+ +	range->end = end;
+ +
+  	/* Prevent hmm_release() from running while the range is valid */
+- 	if (!mmget_not_zero(hmm->mm))
++ 	if (!mmget_not_zero(hmm->mmu_notifier.mm))
+  		return -EFAULT;
+  
+  	/* Initialize range to track CPU page table updates. */
+@@@ -1082,9 -876,10 +1063,9 @@@ long hmm_range_fault(struct hmm_range *
+  	struct hmm_vma_walk hmm_vma_walk;
+  	struct hmm *hmm = range->hmm;
+  	struct vm_area_struct *vma;
+ -	struct mm_walk mm_walk;
+  	int ret;
+  
+- 	lockdep_assert_held(&hmm->mm->mmap_sem);
++ 	lockdep_assert_held(&hmm->mmu_notifier.mm->mmap_sem);
+  
+  	do {
+  		/* If range is no longer valid force retry. */
+* Unmerged path include/linux/hmm.h
+* Unmerged path include/linux/mm_types.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 49643d403a07..9b3f8050133e 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1028,7 +1028,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
+ 	mm_init_owner(mm, p);
+ 	RCU_INIT_POINTER(mm->exe_file, NULL);
+ 	mmu_notifier_mm_init(mm);
+-	hmm_mm_init(mm);
+ 	init_tlb_flush_pending(mm);
+ #if defined(CONFIG_TRANSPARENT_HUGEPAGE) && !USE_SPLIT_PMD_PTLOCKS
+ 	mm->pmd_huge_pte = NULL;
+* Unmerged path mm/hmm.c
