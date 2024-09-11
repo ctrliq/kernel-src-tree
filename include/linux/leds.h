@@ -297,6 +297,12 @@ extern void led_trigger_set(struct led_classdev *led_cdev,
 			struct led_trigger *trigger);
 extern void led_trigger_remove(struct led_classdev *led_cdev);
 
+static inline void led_set_trigger_data(struct led_classdev *led_cdev,
+					void *trigger_data)
+{
+	led_cdev->trigger_data = trigger_data;
+}
+
 static inline void *led_get_trigger_data(struct led_classdev *led_cdev)
 {
 	return led_cdev->trigger_data;
@@ -342,6 +348,7 @@ static inline void led_trigger_set_default(struct led_classdev *led_cdev) {}
 static inline void led_trigger_set(struct led_classdev *led_cdev,
 				struct led_trigger *trigger) {}
 static inline void led_trigger_remove(struct led_classdev *led_cdev) {}
+static inline void led_set_trigger_data(struct led_classdev *led_cdev) {}
 static inline void *led_get_trigger_data(struct led_classdev *led_cdev)
 {
 	return NULL;
