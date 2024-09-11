@@ -2325,7 +2325,7 @@ static int filename_lookup(int dfd, struct filename *name, unsigned flags,
 		retval = path_lookupat(&nd, flags | LOOKUP_REVAL, path);
 
 	if (likely(!retval))
-		audit_inode(name, path->dentry, flags & LOOKUP_PARENT);
+		audit_inode(name, path->dentry, 0);
 	restore_nameidata();
 	putname(name);
 	return retval;
