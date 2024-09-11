@@ -1,0 +1,258 @@
+device property: move mac addr helpers to eth.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 433baf0719d6a81d0587ea27545a120a3880abf6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/433baf07.failed
+
+Move the mac address helpers out, eth.c already contains
+a bunch of similar helpers.
+
+	Suggested-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+	Acked-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 433baf0719d6a81d0587ea27545a120a3880abf6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/etherdevice.h
+#	net/ethernet/eth.c
+diff --cc include/linux/etherdevice.h
+index d76c6b361d63,39f0758274ae..000000000000
+--- a/include/linux/etherdevice.h
++++ b/include/linux/etherdevice.h
+@@@ -31,9 -26,16 +31,20 @@@
+  
+  #ifdef __KERNEL__
+  struct device;
++ struct fwnode_handle;
++ 
+  int eth_platform_get_mac_address(struct device *dev, u8 *mac_addr);
+  unsigned char *arch_get_platform_mac_address(void);
+++<<<<<<< HEAD
+ +u32 eth_get_headlen(const struct net_device *dev, void *data, unsigned int len);
+++=======
++ int nvmem_get_mac_address(struct device *dev, void *addrbuf);
++ void *device_get_mac_address(struct device *dev, char *addr, int alen);
++ void *fwnode_get_mac_address(struct fwnode_handle *fwnode,
++ 			     char *addr, int alen);
++ 
++ u32 eth_get_headlen(const struct net_device *dev, const void *data, u32 len);
+++>>>>>>> 433baf0719d6 (device property: move mac addr helpers to eth.c)
+  __be16 eth_type_trans(struct sk_buff *skb, struct net_device *dev);
+  extern const struct header_ops eth_header_ops;
+  
+diff --cc net/ethernet/eth.c
+index 7856f07680f6,9ea45aae04ee..000000000000
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@@ -558,3 -522,102 +559,105 @@@ int eth_platform_get_mac_address(struc
+  	return 0;
+  }
+  EXPORT_SYMBOL(eth_platform_get_mac_address);
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * nvmem_get_mac_address - Obtain the MAC address from an nvmem cell named
++  * 'mac-address' associated with given device.
++  *
++  * @dev:	Device with which the mac-address cell is associated.
++  * @addrbuf:	Buffer to which the MAC address will be copied on success.
++  *
++  * Returns 0 on success or a negative error number on failure.
++  */
++ int nvmem_get_mac_address(struct device *dev, void *addrbuf)
++ {
++ 	struct nvmem_cell *cell;
++ 	const void *mac;
++ 	size_t len;
++ 
++ 	cell = nvmem_cell_get(dev, "mac-address");
++ 	if (IS_ERR(cell))
++ 		return PTR_ERR(cell);
++ 
++ 	mac = nvmem_cell_read(cell, &len);
++ 	nvmem_cell_put(cell);
++ 
++ 	if (IS_ERR(mac))
++ 		return PTR_ERR(mac);
++ 
++ 	if (len != ETH_ALEN || !is_valid_ether_addr(mac)) {
++ 		kfree(mac);
++ 		return -EINVAL;
++ 	}
++ 
++ 	ether_addr_copy(addrbuf, mac);
++ 	kfree(mac);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(nvmem_get_mac_address);
++ 
++ static void *fwnode_get_mac_addr(struct fwnode_handle *fwnode,
++ 				 const char *name, char *addr,
++ 				 int alen)
++ {
++ 	int ret = fwnode_property_read_u8_array(fwnode, name, addr, alen);
++ 
++ 	if (ret == 0 && alen == ETH_ALEN && is_valid_ether_addr(addr))
++ 		return addr;
++ 	return NULL;
++ }
++ 
++ /**
++  * fwnode_get_mac_address - Get the MAC from the firmware node
++  * @fwnode:	Pointer to the firmware node
++  * @addr:	Address of buffer to store the MAC in
++  * @alen:	Length of the buffer pointed to by addr, should be ETH_ALEN
++  *
++  * Search the firmware node for the best MAC address to use.  'mac-address' is
++  * checked first, because that is supposed to contain to "most recent" MAC
++  * address. If that isn't set, then 'local-mac-address' is checked next,
++  * because that is the default address.  If that isn't set, then the obsolete
++  * 'address' is checked, just in case we're using an old device tree.
++  *
++  * Note that the 'address' property is supposed to contain a virtual address of
++  * the register set, but some DTS files have redefined that property to be the
++  * MAC address.
++  *
++  * All-zero MAC addresses are rejected, because those could be properties that
++  * exist in the firmware tables, but were not updated by the firmware.  For
++  * example, the DTS could define 'mac-address' and 'local-mac-address', with
++  * zero MAC addresses.  Some older U-Boots only initialized 'local-mac-address'.
++  * In this case, the real MAC is in 'local-mac-address', and 'mac-address'
++  * exists but is all zeros.
++  */
++ void *fwnode_get_mac_address(struct fwnode_handle *fwnode, char *addr, int alen)
++ {
++ 	char *res;
++ 
++ 	res = fwnode_get_mac_addr(fwnode, "mac-address", addr, alen);
++ 	if (res)
++ 		return res;
++ 
++ 	res = fwnode_get_mac_addr(fwnode, "local-mac-address", addr, alen);
++ 	if (res)
++ 		return res;
++ 
++ 	return fwnode_get_mac_addr(fwnode, "address", addr, alen);
++ }
++ EXPORT_SYMBOL(fwnode_get_mac_address);
++ 
++ /**
++  * device_get_mac_address - Get the MAC for a given device
++  * @dev:	Pointer to the device
++  * @addr:	Address of buffer to store the MAC in
++  * @alen:	Length of the buffer pointed to by addr, should be ETH_ALEN
++  */
++ void *device_get_mac_address(struct device *dev, char *addr, int alen)
++ {
++ 	return fwnode_get_mac_address(dev_fwnode(dev), addr, alen);
++ }
++ EXPORT_SYMBOL(device_get_mac_address);
+++>>>>>>> 433baf0719d6 (device property: move mac addr helpers to eth.c)
+diff --git a/drivers/base/property.c b/drivers/base/property.c
+index 8e24103c1ab3..c47ddff8fb27 100644
+--- a/drivers/base/property.c
++++ b/drivers/base/property.c
+@@ -15,7 +15,6 @@
+ #include <linux/of_graph.h>
+ #include <linux/of_irq.h>
+ #include <linux/property.h>
+-#include <linux/etherdevice.h>
+ #include <linux/phy.h>
+ 
+ struct fwnode_handle *dev_fwnode(struct device *dev)
+@@ -935,68 +934,6 @@ int device_get_phy_mode(struct device *dev)
+ }
+ EXPORT_SYMBOL_GPL(device_get_phy_mode);
+ 
+-static void *fwnode_get_mac_addr(struct fwnode_handle *fwnode,
+-				 const char *name, char *addr,
+-				 int alen)
+-{
+-	int ret = fwnode_property_read_u8_array(fwnode, name, addr, alen);
+-
+-	if (ret == 0 && alen == ETH_ALEN && is_valid_ether_addr(addr))
+-		return addr;
+-	return NULL;
+-}
+-
+-/**
+- * fwnode_get_mac_address - Get the MAC from the firmware node
+- * @fwnode:	Pointer to the firmware node
+- * @addr:	Address of buffer to store the MAC in
+- * @alen:	Length of the buffer pointed to by addr, should be ETH_ALEN
+- *
+- * Search the firmware node for the best MAC address to use.  'mac-address' is
+- * checked first, because that is supposed to contain to "most recent" MAC
+- * address. If that isn't set, then 'local-mac-address' is checked next,
+- * because that is the default address.  If that isn't set, then the obsolete
+- * 'address' is checked, just in case we're using an old device tree.
+- *
+- * Note that the 'address' property is supposed to contain a virtual address of
+- * the register set, but some DTS files have redefined that property to be the
+- * MAC address.
+- *
+- * All-zero MAC addresses are rejected, because those could be properties that
+- * exist in the firmware tables, but were not updated by the firmware.  For
+- * example, the DTS could define 'mac-address' and 'local-mac-address', with
+- * zero MAC addresses.  Some older U-Boots only initialized 'local-mac-address'.
+- * In this case, the real MAC is in 'local-mac-address', and 'mac-address'
+- * exists but is all zeros.
+-*/
+-void *fwnode_get_mac_address(struct fwnode_handle *fwnode, char *addr, int alen)
+-{
+-	char *res;
+-
+-	res = fwnode_get_mac_addr(fwnode, "mac-address", addr, alen);
+-	if (res)
+-		return res;
+-
+-	res = fwnode_get_mac_addr(fwnode, "local-mac-address", addr, alen);
+-	if (res)
+-		return res;
+-
+-	return fwnode_get_mac_addr(fwnode, "address", addr, alen);
+-}
+-EXPORT_SYMBOL(fwnode_get_mac_address);
+-
+-/**
+- * device_get_mac_address - Get the MAC for a given device
+- * @dev:	Pointer to the device
+- * @addr:	Address of buffer to store the MAC in
+- * @alen:	Length of the buffer pointed to by addr, should be ETH_ALEN
+- */
+-void *device_get_mac_address(struct device *dev, char *addr, int alen)
+-{
+-	return fwnode_get_mac_address(dev_fwnode(dev), addr, alen);
+-}
+-EXPORT_SYMBOL(device_get_mac_address);
+-
+ /**
+  * fwnode_irq_get - Get IRQ directly from a fwnode
+  * @fwnode:	Pointer to the firmware node
+* Unmerged path include/linux/etherdevice.h
+diff --git a/include/linux/property.h b/include/linux/property.h
+index 123ccef15bc2..82370bc4b508 100644
+--- a/include/linux/property.h
++++ b/include/linux/property.h
+@@ -379,11 +379,7 @@ const void *device_get_match_data(struct device *dev);
+ 
+ int device_get_phy_mode(struct device *dev);
+ 
+-void *device_get_mac_address(struct device *dev, char *addr, int alen);
+-
+ int fwnode_get_phy_mode(struct fwnode_handle *fwnode);
+-void *fwnode_get_mac_address(struct fwnode_handle *fwnode,
+-			     char *addr, int alen);
+ struct fwnode_handle *fwnode_graph_get_next_endpoint(
+ 	const struct fwnode_handle *fwnode, struct fwnode_handle *prev);
+ struct fwnode_handle *
+* Unmerged path net/ethernet/eth.c
