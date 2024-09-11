@@ -10,11 +10,6 @@
 #include <keys/system_keyring.h>
 #include "../integrity.h"
 
-static efi_guid_t efi_cert_x509_guid __initdata = EFI_CERT_X509_GUID;
-static efi_guid_t efi_cert_x509_sha256_guid __initdata =
-	EFI_CERT_X509_SHA256_GUID;
-static efi_guid_t efi_cert_sha256_guid __initdata = EFI_CERT_SHA256_GUID;
-
 /*
  * Look to see if a UEFI variable called MokIgnoreDB exists and return true if
  * it does.
