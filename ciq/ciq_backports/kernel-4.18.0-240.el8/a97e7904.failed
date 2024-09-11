@@ -1,0 +1,290 @@
+mm: Convert workingset to XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit a97e7904c0806309fd77103005bb7820c3f1c5e4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a97e7904.failed
+
+We construct an XA_STATE and use it to delete the node with
+xas_store() rather than adding a special function for this unique
+use case.  Includes a test that simulates this usage for the
+test suite.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit a97e7904c0806309fd77103005bb7820c3f1c5e4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/test_xarray.c
+#	mm/workingset.c
+diff --cc lib/test_xarray.c
+index 0436f0c804e5,128c6489082f..000000000000
+--- a/lib/test_xarray.c
++++ b/lib/test_xarray.c
+@@@ -1210,124 -863,67 +1210,188 @@@ static noinline void check_create_range
+  	check_create_range_3();
+  }
+  
+++<<<<<<< HEAD
+ +static noinline void __check_store_range(struct xarray *xa, unsigned long first,
+ +		unsigned long last)
+ +{
+ +#ifdef CONFIG_XARRAY_MULTI
+ +	xa_store_range(xa, first, last, xa_mk_index(first), GFP_KERNEL);
+ +
+ +	XA_BUG_ON(xa, xa_load(xa, first) != xa_mk_index(first));
+ +	XA_BUG_ON(xa, xa_load(xa, last) != xa_mk_index(first));
+ +	XA_BUG_ON(xa, xa_load(xa, first - 1) != NULL);
+ +	XA_BUG_ON(xa, xa_load(xa, last + 1) != NULL);
+ +
+ +	xa_store_range(xa, first, last, NULL, GFP_KERNEL);
+ +#endif
+ +
+ +	XA_BUG_ON(xa, !xa_empty(xa));
+ +}
+ +
+ +static noinline void check_store_range(struct xarray *xa)
+ +{
+ +	unsigned long i, j;
+ +
+ +	for (i = 0; i < 128; i++) {
+ +		for (j = i; j < 128; j++) {
+ +			__check_store_range(xa, i, j);
+ +			__check_store_range(xa, 128 + i, 128 + j);
+ +			__check_store_range(xa, 4095 + i, 4095 + j);
+ +			__check_store_range(xa, 4096 + i, 4096 + j);
+ +			__check_store_range(xa, 123456 + i, 123456 + j);
+ +			__check_store_range(xa, (1 << 24) + i, (1 << 24) + j);
+ +		}
+ +	}
+ +}
+ +
+ +static void check_align_1(struct xarray *xa, char *name)
+ +{
+ +	int i;
+ +	unsigned int id;
+ +	unsigned long index;
+ +	void *entry;
+ +
+ +	for (i = 0; i < 8; i++) {
+ +		XA_BUG_ON(xa, xa_alloc(xa, &id, name + i, xa_limit_32b,
+ +					GFP_KERNEL) != 0);
+ +		XA_BUG_ON(xa, id != i);
+ +	}
+ +	xa_for_each(xa, index, entry)
+ +		XA_BUG_ON(xa, xa_is_err(entry));
+ +	xa_destroy(xa);
+ +}
+ +
+ +/*
+ + * We should always be able to store without allocating memory after
+ + * reserving a slot.
+ + */
+ +static void check_align_2(struct xarray *xa, char *name)
+ +{
+ +	int i;
+ +
+ +	XA_BUG_ON(xa, !xa_empty(xa));
+ +
+ +	for (i = 0; i < 8; i++) {
+ +		XA_BUG_ON(xa, xa_store(xa, 0, name + i, GFP_KERNEL) != NULL);
+ +		xa_erase(xa, 0);
+ +	}
+ +
+ +	for (i = 0; i < 8; i++) {
+ +		XA_BUG_ON(xa, xa_reserve(xa, 0, GFP_KERNEL) != 0);
+ +		XA_BUG_ON(xa, xa_store(xa, 0, name + i, 0) != NULL);
+ +		xa_erase(xa, 0);
+ +	}
+ +
+ +	XA_BUG_ON(xa, !xa_empty(xa));
+ +}
+ +
+ +static noinline void check_align(struct xarray *xa)
+ +{
+ +	char name[] = "Motorola 68000";
+ +
+ +	check_align_1(xa, name);
+ +	check_align_1(xa, name + 1);
+ +	check_align_1(xa, name + 2);
+ +	check_align_1(xa, name + 3);
+ +	check_align_2(xa, name);
+ +}
+ +
+ +/*
+ + * Check that the pointer / value / sibling entries are accounted the
+ + * way we expect them to be.
+ + */
+ +static noinline void check_account(struct xarray *xa)
+ +{
+ +#ifdef CONFIG_XARRAY_MULTI
+ +	unsigned int order;
+ +
+ +	for (order = 1; order < 12; order++) {
+ +		XA_STATE(xas, xa, 1 << order);
+ +
+ +		xa_store_order(xa, 0, order, xa, GFP_KERNEL);
+ +		rcu_read_lock();
+ +		xas_load(&xas);
+ +		XA_BUG_ON(xa, xas.xa_node->count == 0);
+ +		XA_BUG_ON(xa, xas.xa_node->count > (1 << order));
+ +		XA_BUG_ON(xa, xas.xa_node->nr_values != 0);
+ +		rcu_read_unlock();
+ +
+ +		xa_store_order(xa, 1 << order, order, xa_mk_index(1UL << order),
+ +				GFP_KERNEL);
+ +		XA_BUG_ON(xa, xas.xa_node->count != xas.xa_node->nr_values * 2);
+ +
+ +		xa_erase(xa, 1 << order);
+ +		XA_BUG_ON(xa, xas.xa_node->nr_values != 0);
+ +
+ +		xa_erase(xa, 0);
+ +		XA_BUG_ON(xa, !xa_empty(xa));
+ +	}
+ +#endif
+ +}
+ +
+++=======
++ static LIST_HEAD(shadow_nodes);
++ 
++ static void test_update_node(struct xa_node *node)
++ {
++ 	if (node->count && node->count == node->nr_values) {
++ 		if (list_empty(&node->private_list))
++ 			list_add(&shadow_nodes, &node->private_list);
++ 	} else {
++ 		if (!list_empty(&node->private_list))
++ 			list_del_init(&node->private_list);
++ 	}
++ }
++ 
++ static noinline void shadow_remove(struct xarray *xa)
++ {
++ 	struct xa_node *node;
++ 
++ 	xa_lock(xa);
++ 	while ((node = list_first_entry_or_null(&shadow_nodes,
++ 					struct xa_node, private_list))) {
++ 		XA_STATE(xas, node->array, 0);
++ 		XA_BUG_ON(xa, node->array != xa);
++ 		list_del_init(&node->private_list);
++ 		xas.xa_node = xa_parent_locked(node->array, node);
++ 		xas.xa_offset = node->offset;
++ 		xas.xa_shift = node->shift + XA_CHUNK_SHIFT;
++ 		xas_set_update(&xas, test_update_node);
++ 		xas_store(&xas, NULL);
++ 	}
++ 	xa_unlock(xa);
++ }
++ 
++ static noinline void check_workingset(struct xarray *xa, unsigned long index)
++ {
++ 	XA_STATE(xas, xa, index);
++ 	xas_set_update(&xas, test_update_node);
++ 
++ 	do {
++ 		xas_lock(&xas);
++ 		xas_store(&xas, xa_mk_value(0));
++ 		xas_next(&xas);
++ 		xas_store(&xas, xa_mk_value(1));
++ 		xas_unlock(&xas);
++ 	} while (xas_nomem(&xas, GFP_KERNEL));
++ 
++ 	XA_BUG_ON(xa, list_empty(&shadow_nodes));
++ 
++ 	xas_lock(&xas);
++ 	xas_next(&xas);
++ 	xas_store(&xas, &xas);
++ 	XA_BUG_ON(xa, !list_empty(&shadow_nodes));
++ 
++ 	xas_store(&xas, xa_mk_value(2));
++ 	xas_unlock(&xas);
++ 	XA_BUG_ON(xa, list_empty(&shadow_nodes));
++ 
++ 	shadow_remove(xa);
++ 	XA_BUG_ON(xa, !list_empty(&shadow_nodes));
++ 	XA_BUG_ON(xa, !xa_empty(xa));
++ }
++ 
+++>>>>>>> a97e7904c080 (mm: Convert workingset to XArray)
+  static noinline void check_destroy(struct xarray *xa)
+  {
+  	unsigned long index;
+@@@ -1381,10 -975,12 +1445,14 @@@ static int xarray_checks(void
+  	check_destroy(&array);
+  	check_move(&array);
+  	check_create_range(&array);
+ +	check_store_range(&array);
+  	check_store_iter(&array);
+ +	check_align(&xa0);
+  
++ 	check_workingset(&array, 0);
++ 	check_workingset(&array, 64);
++ 	check_workingset(&array, 4096);
++ 
+  	printk("XArray: %u of %u tests passed\n", tests_passed, tests_run);
+  	return (tests_run == tests_passed) ? 0 : -EINVAL;
+  }
+diff --cc mm/workingset.c
+index 150faf16ec79,5cfb29ec3fd9..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -414,22 -387,16 +414,32 @@@ static unsigned long count_shadow_nodes
+  	 * each, this will reclaim shadow entries when they consume
+  	 * ~1.8% of available memory:
+  	 *
+- 	 * PAGE_SIZE / radix_tree_nodes / node_entries * 8 / PAGE_SIZE
++ 	 * PAGE_SIZE / xa_nodes / node_entries * 8 / PAGE_SIZE
+  	 */
+ +#ifdef CONFIG_MEMCG
+  	if (sc->memcg) {
+++<<<<<<< HEAD
+ +		struct lruvec *lruvec;
+ +
+ +		pages = mem_cgroup_node_nr_lru_pages(sc->memcg, sc->nid,
+ +						     LRU_ALL);
+ +		lruvec = mem_cgroup_lruvec(NODE_DATA(sc->nid), sc->memcg);
+ +		pages += lruvec_page_state(lruvec, NR_SLAB_RECLAIMABLE);
+ +		pages += lruvec_page_state(lruvec, NR_SLAB_UNRECLAIMABLE);
+ +	} else
+ +#endif
+ +		pages = node_present_pages(sc->nid);
+ +
+ +	max_nodes = pages >> (RADIX_TREE_MAP_SHIFT - 3);
+++=======
++ 		cache = mem_cgroup_node_nr_lru_pages(sc->memcg, sc->nid,
++ 						     LRU_ALL_FILE);
++ 	} else {
++ 		cache = node_page_state(NODE_DATA(sc->nid), NR_ACTIVE_FILE) +
++ 			node_page_state(NODE_DATA(sc->nid), NR_INACTIVE_FILE);
++ 	}
++ 	max_nodes = cache >> (XA_CHUNK_SHIFT - 3);
+++>>>>>>> a97e7904c080 (mm: Convert workingset to XArray)
+  
+  	if (!nodes)
+  		return SHRINK_EMPTY;
+diff --git a/include/linux/swap.h b/include/linux/swap.h
+index 4a135f6cab71..9ca0891cb4b1 100644
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@ -313,15 +313,6 @@ void workingset_update_node(struct xa_node *node);
+ 		xas_set_update(xas, workingset_update_node);		\
+ } while (0)
+ 
+-/* Returns workingset_update_node() if the mapping has shadow entries. */
+-#define workingset_lookup_update(mapping)				\
+-({									\
+-	radix_tree_update_node_t __helper = workingset_update_node;	\
+-	if (dax_mapping(mapping) || shmem_mapping(mapping))		\
+-		__helper = NULL;					\
+-	__helper;							\
+-})
+-
+ /* linux/mm/page_alloc.c */
+ extern unsigned long totalram_pages;
+ extern unsigned long totalreserve_pages;
+* Unmerged path lib/test_xarray.c
+* Unmerged path mm/workingset.c
