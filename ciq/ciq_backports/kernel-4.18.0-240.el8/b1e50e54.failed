@@ -1,0 +1,273 @@
+io_uring: alloc req only after getting sqe
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit b1e50e549b1372d9742509230dc4af7dd521d984
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b1e50e54.failed
+
+As io_get_sqe() split into 2 stage get/consume, get an sqe before
+allocating io_kiocb, so no free_req*() for a failure case is needed,
+and inline back __io_req_do_free(), which has only 1 user.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit b1e50e549b1372d9742509230dc4af7dd521d984)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,845c173d9282..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -612,26 -1345,125 +612,54 @@@ out
+  	return NULL;
+  }
+  
+ -static inline void io_put_file(struct io_kiocb *req, struct file *file,
+ -			  bool fixed)
+ +static void io_free_req_many(struct io_ring_ctx *ctx, void **reqs, int *nr)
+  {
+++<<<<<<< HEAD
+ +	if (*nr) {
+ +		kmem_cache_free_bulk(req_cachep, *nr, reqs);
+ +		percpu_ref_put_many(&ctx->refs, *nr);
+ +		*nr = 0;
+ +	}
+++=======
++ 	if (fixed)
++ 		percpu_ref_put(req->fixed_file_refs);
++ 	else
++ 		fput(file);
++ }
++ 
++ static void __io_req_aux_free(struct io_kiocb *req)
++ {
++ 	if (req->flags & REQ_F_NEED_CLEANUP)
++ 		io_cleanup_req(req);
++ 
++ 	kfree(req->io);
++ 	if (req->file)
++ 		io_put_file(req, req->file, (req->flags & REQ_F_FIXED_FILE));
++ 	if (req->task)
++ 		put_task_struct(req->task);
++ 
++ 	io_req_work_drop_env(req);
+++>>>>>>> b1e50e549b13 (io_uring: alloc req only after getting sqe)
+  }
+  
+  static void __io_free_req(struct io_kiocb *req)
+  {
+ -	__io_req_aux_free(req);
+ -
+ -	if (req->flags & REQ_F_INFLIGHT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		list_del(&req->inflight_entry);
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -	}
+ -
+ +	if (req->file && !(req->flags & REQ_F_FIXED_FILE))
+ +		fput(req->file);
+  	percpu_ref_put(&req->ctx->refs);
+++<<<<<<< HEAD
+ +	kmem_cache_free(req_cachep, req);
+++=======
++ 	if (likely(!io_is_fallback_req(req)))
++ 		kmem_cache_free(req_cachep, req);
++ 	else
++ 		clear_bit_unlock(0, (unsigned long *) req->ctx->fallback_req);
+++>>>>>>> b1e50e549b13 (io_uring: alloc req only after getting sqe)
+  }
+  
+ -struct req_batch {
+ -	void *reqs[IO_IOPOLL_BATCH];
+ -	int to_free;
+ -	int need_iter;
+ -};
+ -
+ -static void io_free_req_many(struct io_ring_ctx *ctx, struct req_batch *rb)
+ -{
+ -	if (!rb->to_free)
+ -		return;
+ -	if (rb->need_iter) {
+ -		int i, inflight = 0;
+ -		unsigned long flags;
+ -
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_FIXED_FILE) {
+ -				req->file = NULL;
+ -				percpu_ref_put(req->fixed_file_refs);
+ -			}
+ -			if (req->flags & REQ_F_INFLIGHT)
+ -				inflight++;
+ -			__io_req_aux_free(req);
+ -		}
+ -		if (!inflight)
+ -			goto do_free;
+ -
+ -		spin_lock_irqsave(&ctx->inflight_lock, flags);
+ -		for (i = 0; i < rb->to_free; i++) {
+ -			struct io_kiocb *req = rb->reqs[i];
+ -
+ -			if (req->flags & REQ_F_INFLIGHT) {
+ -				list_del(&req->inflight_entry);
+ -				if (!--inflight)
+ -					break;
+ -			}
+ -		}
+ -		spin_unlock_irqrestore(&ctx->inflight_lock, flags);
+ -
+ -		if (waitqueue_active(&ctx->inflight_wait))
+ -			wake_up(&ctx->inflight_wait);
+ -	}
+ -do_free:
+ -	kmem_cache_free_bulk(req_cachep, rb->to_free, rb->reqs);
+ -	percpu_ref_put_many(&ctx->refs, rb->to_free);
+ -	rb->to_free = rb->need_iter = 0;
+ -}
+ -
+ -static bool io_link_cancel_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	int ret;
+ -
+ -	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
+ -	if (ret != -1) {
+ -		io_cqring_fill_event(req, -ECANCELED);
+ -		io_commit_cqring(ctx);
+ -		req->flags &= ~REQ_F_LINK;
+ -		io_put_req(req);
+ -		return true;
+ -	}
+ -
+ -	return false;
+ -}
+ -
+ -static void io_req_link_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
+ +static void io_req_link_next(struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	bool wake_ev = false;
+ -
+ -	/* Already got next link */
+ -	if (req->flags & REQ_F_LINK_NEXT)
+ -		return;
+ +	struct io_kiocb *nxt;
+  
+  	/*
+  	 * The list should never be empty when we are called here. But could
+@@@ -2448,45 -5831,71 +2476,64 @@@ static int io_submit_sqes(struct io_rin
+  		statep = &state;
+  	}
+  
+ -	ctx->ring_fd = ring_fd;
+ -	ctx->ring_file = ring_file;
+ -
+  	for (i = 0; i < nr; i++) {
+++<<<<<<< HEAD
+++=======
++ 		const struct io_uring_sqe *sqe;
++ 		struct io_kiocb *req;
++ 		int err;
++ 
++ 		sqe = io_get_sqe(ctx);
++ 		if (unlikely(!sqe)) {
++ 			io_consume_sqe(ctx);
++ 			break;
++ 		}
++ 		req = io_get_req(ctx, statep);
++ 		if (unlikely(!req)) {
++ 			if (!submitted)
++ 				submitted = -EAGAIN;
++ 			break;
++ 		}
++ 
+++>>>>>>> b1e50e549b13 (io_uring: alloc req only after getting sqe)
+  		/*
+ -		 * All io need record the previous position, if LINK vs DARIN,
+ -		 * it can be used to mark the position of the first IO in the
+ -		 * link list.
+ +		 * If previous wasn't linked and we have a linked command,
+ +		 * that's the end of the chain. Submit the previous link.
+  		 */
+ -		req->sequence = ctx->cached_sq_head;
+ -		req->opcode = READ_ONCE(sqe->opcode);
+ -		req->user_data = READ_ONCE(sqe->user_data);
+ -		io_consume_sqe(ctx);
+ -
+ -		/* will complete beyond this point, count as submitted */
+ -		submitted++;
+ -
+ -		if (unlikely(req->opcode >= IORING_OP_LAST)) {
+ -			err = -EINVAL;
+ -fail_req:
+ -			io_cqring_add_event(req, err);
+ -			io_double_put_req(req);
+ -			break;
+ +		if (!prev_was_link && link) {
+ +			io_queue_link_head(ctx, link, &link->submit, shadow_req,
+ +						true);
+ +			link = NULL;
+ +			shadow_req = NULL;
+  		}
+ -
+ -		if (io_op_defs[req->opcode].needs_mm && !*mm) {
+ -			mm_fault = mm_fault || !mmget_not_zero(ctx->sqo_mm);
+ -			if (unlikely(mm_fault)) {
+ -				err = -EFAULT;
+ -				goto fail_req;
+ +		prev_was_link = (sqes[i].sqe->flags & IOSQE_IO_LINK) != 0;
+ +
+ +		if (link && (sqes[i].sqe->flags & IOSQE_IO_DRAIN)) {
+ +			if (!shadow_req) {
+ +				shadow_req = io_get_req(ctx, NULL);
+ +				if (unlikely(!shadow_req))
+ +					goto out;
+ +				shadow_req->flags |= (REQ_F_IO_DRAIN | REQ_F_SHADOW_DRAIN);
+ +				refcount_dec(&shadow_req->refs);
+  			}
+ -			use_mm(ctx->sqo_mm);
+ -			*mm = ctx->sqo_mm;
+ +			shadow_req->sequence = sqes[i].sequence;
+  		}
+  
+ -		req->needs_fixed_file = async;
+ -		trace_io_uring_submit_sqe(ctx, req->opcode, req->user_data,
+ -						true, async);
+ -		if (!io_submit_sqe(req, sqe, statep, &link))
+ -			break;
+ +out:
+ +		if (unlikely(mm_fault)) {
+ +			io_cqring_add_event(ctx, sqes[i].sqe->user_data,
+ +						-EFAULT);
+ +		} else {
+ +			sqes[i].has_user = has_user;
+ +			sqes[i].needs_lock = true;
+ +			sqes[i].needs_fixed_file = true;
+ +			io_submit_sqe(ctx, &sqes[i], statep, &link, true);
+ +			submitted++;
+ +		}
+  	}
+  
+ -	if (unlikely(submitted != nr)) {
+ -		int ref_used = (submitted == -EAGAIN) ? 0 : submitted;
+ -
+ -		percpu_ref_put_many(&ctx->refs, nr - ref_used);
+ -	}
+  	if (link)
+ -		io_queue_link_head(link);
+ +		io_queue_link_head(ctx, link, &link->submit, shadow_req, true);
+  	if (statep)
+  		io_submit_state_end(&state);
+  
+* Unmerged path fs/io_uring.c
