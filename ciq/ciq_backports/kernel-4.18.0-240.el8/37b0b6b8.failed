@@ -1,0 +1,100 @@
+ext4: potential crash on allocation error in ext4_alloc_flex_bg_array()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Dan Carpenter <dan.carpenter@oracle.com>
+commit 37b0b6b8b99c0e1c1f11abbe7cf49b6d03795b3f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/37b0b6b8.failed
+
+If sbi->s_flex_groups_allocated is zero and the first allocation fails
+then this code will crash.  The problem is that "i--" will set "i" to
+-1 but when we compare "i >= sbi->s_flex_groups_allocated" then the -1
+is type promoted to unsigned and becomes UINT_MAX.  Since UINT_MAX
+is more than zero, the condition is true so we call kvfree(new_groups[-1]).
+The loop will carry on freeing invalid memory until it crashes.
+
+Fixes: 7c990728b99e ("ext4: fix potential race between s_flex_groups online resizing and access")
+	Reviewed-by: Suraj Jitindar Singh <surajjs@amazon.com>
+	Signed-off-by: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: stable@kernel.org
+Link: https://lore.kernel.org/r/20200228092142.7irbc44yaz3by7nb@kili.mountain
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit 37b0b6b8b99c0e1c1f11abbe7cf49b6d03795b3f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/super.c
+diff --cc fs/ext4/super.c
+index bf896a38322a,0c7c4adb664e..000000000000
+--- a/fs/ext4/super.c
++++ b/fs/ext4/super.c
+@@@ -2301,8 -2390,8 +2301,13 @@@ done
+  int ext4_alloc_flex_bg_array(struct super_block *sb, ext4_group_t ngroup)
+  {
+  	struct ext4_sb_info *sbi = EXT4_SB(sb);
+++<<<<<<< HEAD
+ +	struct flex_groups *new_groups;
+ +	int size;
+++=======
++ 	struct flex_groups **old_groups, **new_groups;
++ 	int size, i, j;
+++>>>>>>> 37b0b6b8b99c (ext4: potential crash on allocation error in ext4_alloc_flex_bg_array())
+  
+  	if (!sbi->s_log_groups_per_flex)
+  		return 0;
+@@@ -2311,22 -2400,37 +2316,42 @@@
+  	if (size <= sbi->s_flex_groups_allocated)
+  		return 0;
+  
+ -	new_groups = kvzalloc(roundup_pow_of_two(size *
+ -			      sizeof(*sbi->s_flex_groups)), GFP_KERNEL);
+ +	size = roundup_pow_of_two(size * sizeof(struct flex_groups));
+ +	new_groups = kvzalloc(size, GFP_KERNEL);
+  	if (!new_groups) {
+ -		ext4_msg(sb, KERN_ERR,
+ -			 "not enough memory for %d flex group pointers", size);
+ +		ext4_msg(sb, KERN_ERR, "not enough memory for %d flex groups",
+ +			 size / (int) sizeof(struct flex_groups));
+  		return -ENOMEM;
+  	}
+++<<<<<<< HEAD
+ +
+ +	if (sbi->s_flex_groups) {
+ +		memcpy(new_groups, sbi->s_flex_groups,
+++=======
++ 	for (i = sbi->s_flex_groups_allocated; i < size; i++) {
++ 		new_groups[i] = kvzalloc(roundup_pow_of_two(
++ 					 sizeof(struct flex_groups)),
++ 					 GFP_KERNEL);
++ 		if (!new_groups[i]) {
++ 			for (j = sbi->s_flex_groups_allocated; j < i; j++)
++ 				kvfree(new_groups[j]);
++ 			kvfree(new_groups);
++ 			ext4_msg(sb, KERN_ERR,
++ 				 "not enough memory for %d flex groups", size);
++ 			return -ENOMEM;
++ 		}
++ 	}
++ 	rcu_read_lock();
++ 	old_groups = rcu_dereference(sbi->s_flex_groups);
++ 	if (old_groups)
++ 		memcpy(new_groups, old_groups,
+++>>>>>>> 37b0b6b8b99c (ext4: potential crash on allocation error in ext4_alloc_flex_bg_array())
+  		       (sbi->s_flex_groups_allocated *
+ -			sizeof(struct flex_groups *)));
+ -	rcu_read_unlock();
+ -	rcu_assign_pointer(sbi->s_flex_groups, new_groups);
+ -	sbi->s_flex_groups_allocated = size;
+ -	if (old_groups)
+ -		ext4_kvfree_array_rcu(old_groups);
+ +			sizeof(struct flex_groups)));
+ +		kvfree(sbi->s_flex_groups);
+ +	}
+ +	sbi->s_flex_groups = new_groups;
+ +	sbi->s_flex_groups_allocated = size / sizeof(struct flex_groups);
+  	return 0;
+  }
+  
+* Unmerged path fs/ext4/super.c
