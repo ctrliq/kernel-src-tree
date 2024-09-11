@@ -1,0 +1,117 @@
+tpm: check event log version before reading final events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Loïc Yhuel <loic.yhuel@gmail.com>
+commit b4f1874c62168159fdb419ced4afc77c1b51c475
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b4f1874c.failed
+
+This fixes the boot issues since 5.3 on several Dell models when the TPM
+is enabled. Depending on the exact grub binary, booting the kernel would
+freeze early, or just report an error parsing the final events log.
+
+We get an event log in the SHA-1 format, which doesn't have a
+tcg_efi_specid_event_head in the first event, and there is a final events
+table which doesn't match the crypto agile format.
+__calc_tpm2_event_size reads bad "count" and "efispecid->num_algs", and
+either fails, or loops long enough for the machine to be appear frozen.
+
+So we now only parse the final events table, which is per the spec always
+supposed to be in the crypto agile format, when we got a event log in this
+format.
+
+Fixes: c46f3405692de ("tpm: Reserve the TPM final events table")
+Fixes: 166a2809d65b2 ("tpm: Don't duplicate events from the final event log in the TCG2 log")
+Bugzilla: https://bugzilla.redhat.com/show_bug.cgi?id=1779611
+	Signed-off-by: Loïc Yhuel <loic.yhuel@gmail.com>
+Link: https://lore.kernel.org/r/20200512040113.277768-1-loic.yhuel@gmail.com
+	Reviewed-by: Javier Martinez Canillas <javierm@redhat.com>
+	Reviewed-by: Jerry Snitselaar <jsnitsel@redhat.com>
+	Reviewed-by: Matthew Garrett <mjg59@google.com>
+[ardb: warn when final events table is missing or in the wrong format]
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+(cherry picked from commit b4f1874c62168159fdb419ced4afc77c1b51c475)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/firmware/efi/libstub/tpm.c
+#	drivers/firmware/efi/tpm.c
+diff --cc drivers/firmware/efi/libstub/tpm.c
+index de075be0b6b2,e9a684637b70..000000000000
+--- a/drivers/firmware/efi/libstub/tpm.c
++++ b/drivers/firmware/efi/libstub/tpm.c
+@@@ -142,8 -127,8 +142,13 @@@ void efi_retrieve_tpm2_eventlog(efi_sys
+  	 * Figure out whether any events have already been logged to the
+  	 * final events structure, and if so how much space they take up
+  	 */
+++<<<<<<< HEAD
+ +	final_events_table = get_efi_config_table(sys_table_arg,
+ +						LINUX_EFI_TPM_FINAL_LOG_GUID);
+++=======
++ 	if (version == EFI_TCG2_EVENT_LOG_FORMAT_TCG_2)
++ 		final_events_table = get_efi_config_table(LINUX_EFI_TPM_FINAL_LOG_GUID);
+++>>>>>>> b4f1874c6216 (tpm: check event log version before reading final events)
+  	if (final_events_table && final_events_table->nr_events) {
+  		struct tcg_pcr_event2_head *header;
+  		int offset;
+diff --cc drivers/firmware/efi/tpm.c
+index 0cbeb3d46b18,0543fbf60222..000000000000
+--- a/drivers/firmware/efi/tpm.c
++++ b/drivers/firmware/efi/tpm.c
+@@@ -34,7 -61,48 +34,51 @@@ int __init efi_tpm_eventlog_init(void
+  
+  	tbl_size = sizeof(*log_tbl) + log_tbl->size;
+  	memblock_reserve(efi.tpm_log, tbl_size);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (efi.tpm_final_log == EFI_INVALID_TABLE_ADDR ||
++ 	    log_tbl->version != EFI_TCG2_EVENT_LOG_FORMAT_TCG_2) {
++ 		pr_warn(FW_BUG "TPM Final Events table missing or invalid\n");
++ 		goto out;
++ 	}
++ 
++ 	final_tbl = early_memremap(efi.tpm_final_log, sizeof(*final_tbl));
++ 
++ 	if (!final_tbl) {
++ 		pr_err("Failed to map TPM Final Event Log table @ 0x%lx\n",
++ 		       efi.tpm_final_log);
++ 		efi.tpm_final_log = EFI_INVALID_TABLE_ADDR;
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	tbl_size = 0;
++ 	if (final_tbl->nr_events != 0) {
++ 		void *events = (void *)efi.tpm_final_log
++ 				+ sizeof(final_tbl->version)
++ 				+ sizeof(final_tbl->nr_events);
++ 
++ 		tbl_size = tpm2_calc_event_log_size(events,
++ 						    final_tbl->nr_events,
++ 						    log_tbl->log);
++ 	}
++ 
++ 	if (tbl_size < 0) {
++ 		pr_err(FW_BUG "Failed to parse event in TPM Final Events Log\n");
++ 		ret = -EINVAL;
++ 		goto out_calc;
++ 	}
++ 
++ 	memblock_reserve((unsigned long)final_tbl,
++ 			 tbl_size + sizeof(*final_tbl));
++ 	efi_tpm_final_log_size = tbl_size;
++ 
++ out_calc:
++ 	early_memunmap(final_tbl, sizeof(*final_tbl));
++ out:
+++>>>>>>> b4f1874c6216 (tpm: check event log version before reading final events)
+  	early_memunmap(log_tbl, sizeof(*log_tbl));
+ -	return ret;
+ +	return 0;
+  }
+  
+* Unmerged path drivers/firmware/efi/libstub/tpm.c
+* Unmerged path drivers/firmware/efi/tpm.c
