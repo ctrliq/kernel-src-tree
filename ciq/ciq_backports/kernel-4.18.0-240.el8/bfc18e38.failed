@@ -1,0 +1,909 @@
+atomics/treewide: Rename __atomic_add_unless() => atomic_fetch_add_unless()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit bfc18e389c7a09fbbbed6bf4032396685b14246e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bfc18e38.failed
+
+While __atomic_add_unless() was originally intended as a building-block
+for atomic_add_unless(), it's now used in a number of places around the
+kernel. It's the only common atomic operation named __atomic*(), rather
+than atomic_*(), and for consistency it would be better named
+atomic_fetch_add_unless().
+
+This lack of consistency is slightly confusing, and gets in the way of
+scripting atomics. Given that, let's clean things up and promote it to
+an official part of the atomics API, in the form of
+atomic_fetch_add_unless().
+
+This patch converts definitions and invocations over to the new name,
+including the instrumented version, using the following script:
+
+  ----
+  git grep -w __atomic_add_unless | while read line; do
+  sed -i '{s/\<__atomic_add_unless\>/atomic_fetch_add_unless/}' "${line%%:*}";
+  done
+  git grep -w __arch_atomic_add_unless | while read line; do
+  sed -i '{s/\<__arch_atomic_add_unless\>/arch_atomic_fetch_add_unless/}' "${line%%:*}";
+  done
+  ----
+
+Note that we do not have atomic{64,_long}_fetch_add_unless(), which will
+be introduced by later patches.
+
+There should be no functional change as a result of this patch.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Reviewed-by: Will Deacon <will.deacon@arm.com>
+	Acked-by: Geert Uytterhoeven <geert@linux-m68k.org>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Acked-by: Palmer Dabbelt <palmer@sifive.com>
+	Cc: Boqun Feng <boqun.feng@gmail.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lore.kernel.org/lkml/20180621121321.4761-2-mark.rutland@arm.com
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+(cherry picked from commit bfc18e389c7a09fbbbed6bf4032396685b14246e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.c
+diff --cc drivers/infiniband/core/rdma_core.c
+index 588ea8724300,475910ffbcb6..000000000000
+--- a/drivers/infiniband/core/rdma_core.c
++++ b/drivers/infiniband/core/rdma_core.c
+@@@ -42,236 -41,98 +42,241 @@@
+  #include "core_priv.h"
+  #include "rdma_core.h"
+  
+ -int uverbs_ns_idx(u16 *id, unsigned int ns_count)
+ +static void uverbs_uobject_free(struct kref *ref)
+  {
+ -	int ret = (*id & UVERBS_ID_NS_MASK) >> UVERBS_ID_NS_SHIFT;
+ +	kfree_rcu(container_of(ref, struct ib_uobject, ref), rcu);
+ +}
+  
+ -	if (ret >= ns_count)
+ -		return -EINVAL;
+ +/*
+ + * In order to indicate we no longer needs this uobject, uverbs_uobject_put
+ + * is called. When the reference count is decreased, the uobject is freed.
+ + * For example, this is used when attaching a completion channel to a CQ.
+ + */
+ +void uverbs_uobject_put(struct ib_uobject *uobject)
+ +{
+ +	kref_put(&uobject->ref, uverbs_uobject_free);
+ +}
+ +EXPORT_SYMBOL(uverbs_uobject_put);
+  
+ -	*id &= ~UVERBS_ID_NS_MASK;
+ -	return ret;
+ +static int uverbs_try_lock_object(struct ib_uobject *uobj,
+ +				  enum rdma_lookup_mode mode)
+ +{
+ +	/*
+ +	 * When a shared access is required, we use a positive counter. Each
+ +	 * shared access request checks that the value != -1 and increment it.
+ +	 * Exclusive access is required for operations like write or destroy.
+ +	 * In exclusive access mode, we check that the counter is zero (nobody
+ +	 * claimed this object) and we set it to -1. Releasing a shared access
+ +	 * lock is done simply by decreasing the counter. As for exclusive
+ +	 * access locks, since only a single one of them is is allowed
+ +	 * concurrently, setting the counter to zero is enough for releasing
+ +	 * this lock.
+ +	 */
+++<<<<<<< HEAD
+ +	switch (mode) {
+ +	case UVERBS_LOOKUP_READ:
+ +		return __atomic_add_unless(&uobj->usecnt, 1, -1) == -1 ?
+++=======
+++	if (!exclusive)
+++		return atomic_fetch_add_unless(&uobj->usecnt, 1, -1) == -1 ?
+++>>>>>>> bfc18e389c7a (atomics/treewide: Rename __atomic_add_unless() => atomic_fetch_add_unless())
+ +			-EBUSY : 0;
+ +	case UVERBS_LOOKUP_WRITE:
+ +		/* lock is exclusive */
+ +		return atomic_cmpxchg(&uobj->usecnt, 0, -1) == 0 ? 0 : -EBUSY;
+ +	case UVERBS_LOOKUP_DESTROY:
+ +		return 0;
+ +	}
+ +	return 0;
+ +}
+ +
+ +static void assert_uverbs_usecnt(struct ib_uobject *uobj,
+ +				 enum rdma_lookup_mode mode)
+ +{
+ +#ifdef CONFIG_LOCKDEP
+ +	switch (mode) {
+ +	case UVERBS_LOOKUP_READ:
+ +		WARN_ON(atomic_read(&uobj->usecnt) <= 0);
+ +		break;
+ +	case UVERBS_LOOKUP_WRITE:
+ +		WARN_ON(atomic_read(&uobj->usecnt) != -1);
+ +		break;
+ +	case UVERBS_LOOKUP_DESTROY:
+ +		break;
+ +	}
+ +#endif
+  }
+  
+ -const struct uverbs_object_spec *uverbs_get_object(const struct ib_device *ibdev,
+ -						   uint16_t object)
+ +/*
+ + * This must be called with the hw_destroy_rwsem locked for read or write,
+ + * also the uobject itself must be locked for write.
+ + *
+ + * Upon return the HW object is guaranteed to be destroyed.
+ + *
+ + * For RDMA_REMOVE_ABORT, the hw_destroy_rwsem is not required to be held,
+ + * however the type's allocat_commit function cannot have been called and the
+ + * uobject cannot be on the uobjects_lists
+ + *
+ + * For RDMA_REMOVE_DESTROY the caller shold be holding a kref (eg via
+ + * rdma_lookup_get_uobject) and the object is left in a state where the caller
+ + * needs to call rdma_lookup_put_uobject.
+ + *
+ + * For all other destroy modes this function internally unlocks the uobject
+ + * and consumes the kref on the uobj.
+ + */
+ +static int uverbs_destroy_uobject(struct ib_uobject *uobj,
+ +				  enum rdma_remove_reason reason,
+ +				  struct uverbs_attr_bundle *attrs)
+  {
+ -	const struct uverbs_root_spec *object_hash = ibdev->specs_root;
+ -	const struct uverbs_object_spec_hash *objects;
+ -	int ret = uverbs_ns_idx(&object, object_hash->num_buckets);
+ +	struct ib_uverbs_file *ufile = attrs->ufile;
+ +	unsigned long flags;
+ +	int ret;
+  
+ -	if (ret < 0)
+ -		return NULL;
+ +	lockdep_assert_held(&ufile->hw_destroy_rwsem);
+ +	assert_uverbs_usecnt(uobj, UVERBS_LOOKUP_WRITE);
+ +
+ +	if (reason == RDMA_REMOVE_ABORT) {
+ +		WARN_ON(!list_empty(&uobj->list));
+ +		WARN_ON(!uobj->context);
+ +		uobj->uapi_object->type_class->alloc_abort(uobj);
+ +	} else if (uobj->object) {
+ +		ret = uobj->uapi_object->type_class->destroy_hw(uobj, reason,
+ +								attrs);
+ +		if (ret) {
+ +			if (ib_is_destroy_retryable(ret, reason, uobj))
+ +				return ret;
+ +
+ +			/* Nothing to be done, dangle the memory and move on */
+ +			WARN(true,
+ +			     "ib_uverbs: failed to remove uobject id %d, driver err=%d",
+ +			     uobj->id, ret);
+ +		}
+  
+ -	objects = object_hash->object_buckets[ret];
+ +		uobj->object = NULL;
+ +	}
+  
+ -	if (object >= objects->num_objects)
+ -		return NULL;
+ +	uobj->context = NULL;
+  
+ -	return objects->objects[object];
+ -}
+ +	/*
+ +	 * For DESTROY the usecnt is held write locked, the caller is expected
+ +	 * to put it unlock and put the object when done with it. Only DESTROY
+ +	 * can remove the IDR handle.
+ +	 */
+ +	if (reason != RDMA_REMOVE_DESTROY)
+ +		atomic_set(&uobj->usecnt, 0);
+ +	else
+ +		uobj->uapi_object->type_class->remove_handle(uobj);
+  
+ -const struct uverbs_method_spec *uverbs_get_method(const struct uverbs_object_spec *object,
+ -						   uint16_t method)
+ -{
+ -	const struct uverbs_method_spec_hash *methods;
+ -	int ret = uverbs_ns_idx(&method, object->num_buckets);
+ +	if (!list_empty(&uobj->list)) {
+ +		spin_lock_irqsave(&ufile->uobjects_lock, flags);
+ +		list_del_init(&uobj->list);
+ +		spin_unlock_irqrestore(&ufile->uobjects_lock, flags);
+  
+ -	if (ret < 0)
+ -		return NULL;
+ +		/*
+ +		 * Pairs with the get in rdma_alloc_commit_uobject(), could
+ +		 * destroy uobj.
+ +		 */
+ +		uverbs_uobject_put(uobj);
+ +	}
+  
+ -	methods = object->method_buckets[ret];
+ -	if (method >= methods->num_methods)
+ -		return NULL;
+ +	/*
+ +	 * When aborting the stack kref remains owned by the core code, and is
+ +	 * not transferred into the type. Pairs with the get in alloc_uobj
+ +	 */
+ +	if (reason == RDMA_REMOVE_ABORT)
+ +		uverbs_uobject_put(uobj);
+  
+ -	return methods->methods[method];
+ +	return 0;
+  }
+  
+ -void uverbs_uobject_get(struct ib_uobject *uobject)
+ +/*
+ + * This calls uverbs_destroy_uobject() using the RDMA_REMOVE_DESTROY
+ + * sequence. It should only be used from command callbacks. On success the
+ + * caller must pair this with rdma_lookup_put_uobject(LOOKUP_WRITE). This
+ + * version requires the caller to have already obtained an
+ + * LOOKUP_DESTROY uobject kref.
+ + */
+ +int uobj_destroy(struct ib_uobject *uobj, struct uverbs_attr_bundle *attrs)
+  {
+ -	kref_get(&uobject->ref);
+ -}
+ +	struct ib_uverbs_file *ufile = attrs->ufile;
+ +	int ret;
+  
+ -static void uverbs_uobject_free(struct kref *ref)
+ -{
+ -	struct ib_uobject *uobj =
+ -		container_of(ref, struct ib_uobject, ref);
+ +	down_read(&ufile->hw_destroy_rwsem);
+  
+ -	if (uobj->type->type_class->needs_kfree_rcu)
+ -		kfree_rcu(uobj, rcu);
+ -	else
+ -		kfree(uobj);
+ +	ret = uverbs_try_lock_object(uobj, UVERBS_LOOKUP_WRITE);
+ +	if (ret)
+ +		goto out_unlock;
+ +
+ +	ret = uverbs_destroy_uobject(uobj, RDMA_REMOVE_DESTROY, attrs);
+ +	if (ret) {
+ +		atomic_set(&uobj->usecnt, 0);
+ +		goto out_unlock;
+ +	}
+ +
+ +out_unlock:
+ +	up_read(&ufile->hw_destroy_rwsem);
+ +	return ret;
+  }
+  
+ -void uverbs_uobject_put(struct ib_uobject *uobject)
+ +/*
+ + * uobj_get_destroy destroys the HW object and returns a handle to the uobj
+ + * with a NULL object pointer. The caller must pair this with
+ + * uverbs_put_destroy.
+ + */
+ +struct ib_uobject *__uobj_get_destroy(const struct uverbs_api_object *obj,
+ +				      u32 id, struct uverbs_attr_bundle *attrs)
+  {
+ -	kref_put(&uobject->ref, uverbs_uobject_free);
+ +	struct ib_uobject *uobj;
+ +	int ret;
+ +
+ +	uobj = rdma_lookup_get_uobject(obj, attrs->ufile, id,
+ +				       UVERBS_LOOKUP_DESTROY, attrs);
+ +	if (IS_ERR(uobj))
+ +		return uobj;
+ +
+ +	ret = uobj_destroy(uobj, attrs);
+ +	if (ret) {
+ +		rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_DESTROY);
+ +		return ERR_PTR(ret);
+ +	}
+ +
+ +	return uobj;
+  }
+  
+ -static int uverbs_try_lock_object(struct ib_uobject *uobj, bool exclusive)
+ +/*
+ + * Does both uobj_get_destroy() and uobj_put_destroy().  Returns 0 on success
+ + * (negative errno on failure). For use by callers that do not need the uobj.
+ + */
+ +int __uobj_perform_destroy(const struct uverbs_api_object *obj, u32 id,
+ +			   struct uverbs_attr_bundle *attrs)
+  {
+ -	/*
+ -	 * When a shared access is required, we use a positive counter. Each
+ -	 * shared access request checks that the value != -1 and increment it.
+ -	 * Exclusive access is required for operations like write or destroy.
+ -	 * In exclusive access mode, we check that the counter is zero (nobody
+ -	 * claimed this object) and we set it to -1. Releasing a shared access
+ -	 * lock is done simply by decreasing the counter. As for exclusive
+ -	 * access locks, since only a single one of them is is allowed
+ -	 * concurrently, setting the counter to zero is enough for releasing
+ -	 * this lock.
+ -	 */
+ -	if (!exclusive)
+ -		return atomic_fetch_add_unless(&uobj->usecnt, 1, -1) == -1 ?
+ -			-EBUSY : 0;
+ +	struct ib_uobject *uobj;
+ +
+ +	uobj = __uobj_get_destroy(obj, id, attrs);
+ +	if (IS_ERR(uobj))
+ +		return PTR_ERR(uobj);
+  
+ -	/* lock is either WRITE or DESTROY - should be exclusive */
+ -	return atomic_cmpxchg(&uobj->usecnt, 0, -1) == 0 ? 0 : -EBUSY;
+ +	rdma_lookup_put_uobject(uobj, UVERBS_LOOKUP_WRITE);
+ +	return 0;
+  }
+  
+ -static struct ib_uobject *alloc_uobj(struct ib_ucontext *context,
+ -				     const struct uverbs_obj_type *type)
+ +/* alloc_uobj must be undone by uverbs_destroy_uobject() */
+ +static struct ib_uobject *alloc_uobj(struct uverbs_attr_bundle *attrs,
+ +				     const struct uverbs_api_object *obj)
+  {
+ -	struct ib_uobject *uobj = kzalloc(type->obj_size, GFP_KERNEL);
+ +	struct ib_uverbs_file *ufile = attrs->ufile;
+ +	struct ib_uobject *uobj;
+  
+ +	if (!attrs->context) {
+ +		struct ib_ucontext *ucontext =
+ +			ib_uverbs_get_ucontext_file(ufile);
+ +
+ +		if (IS_ERR(ucontext))
+ +			return ERR_CAST(ucontext);
+ +		attrs->context = ucontext;
+ +	}
+ +
+ +	uobj = kzalloc(obj->type_attrs->obj_size, GFP_KERNEL);
+  	if (!uobj)
+  		return ERR_PTR(-ENOMEM);
+  	/*
+diff --git a/arch/alpha/include/asm/atomic.h b/arch/alpha/include/asm/atomic.h
+index 767bfdd42992..392b15a4dd4f 100644
+--- a/arch/alpha/include/asm/atomic.h
++++ b/arch/alpha/include/asm/atomic.h
+@@ -206,7 +206,7 @@ ATOMIC_OPS(xor, xor)
+ #define atomic_xchg(v, new) (xchg(&((v)->counter), new))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -214,7 +214,7 @@ ATOMIC_OPS(xor, xor)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, new, old;
+ 	smp_mb();
+diff --git a/arch/arc/include/asm/atomic.h b/arch/arc/include/asm/atomic.h
+index 11859287c52a..67121b5ff3a3 100644
+--- a/arch/arc/include/asm/atomic.h
++++ b/arch/arc/include/asm/atomic.h
+@@ -309,7 +309,7 @@ ATOMIC_OPS(xor, ^=, CTOP_INST_AXOR_DI_R2_R2_R3)
+ #undef ATOMIC_OP
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -317,7 +317,7 @@ ATOMIC_OPS(xor, ^=, CTOP_INST_AXOR_DI_R2_R2_R3)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v
+  */
+-#define __atomic_add_unless(v, a, u)					\
++#define atomic_fetch_add_unless(v, a, u)					\
+ ({									\
+ 	int c, old;							\
+ 									\
+diff --git a/arch/arm/include/asm/atomic.h b/arch/arm/include/asm/atomic.h
+index 66d0e215a773..9d56d0727c9b 100644
+--- a/arch/arm/include/asm/atomic.h
++++ b/arch/arm/include/asm/atomic.h
+@@ -130,7 +130,7 @@ static inline int atomic_cmpxchg_relaxed(atomic_t *ptr, int old, int new)
+ }
+ #define atomic_cmpxchg_relaxed		atomic_cmpxchg_relaxed
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int oldval, newval;
+ 	unsigned long tmp;
+@@ -215,7 +215,7 @@ static inline int atomic_cmpxchg(atomic_t *v, int old, int new)
+ 	return ret;
+ }
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 
+diff --git a/arch/arm64/include/asm/atomic.h b/arch/arm64/include/asm/atomic.h
+index c0235e0ff849..264d20339f74 100644
+--- a/arch/arm64/include/asm/atomic.h
++++ b/arch/arm64/include/asm/atomic.h
+@@ -125,7 +125,7 @@
+ #define atomic_dec_and_test(v)		(atomic_dec_return(v) == 0)
+ #define atomic_sub_and_test(i, v)	(atomic_sub_return((i), (v)) == 0)
+ #define atomic_add_negative(i, v)	(atomic_add_return((i), (v)) < 0)
+-#define __atomic_add_unless(v, a, u)	___atomic_add_unless(v, a, u,)
++#define atomic_fetch_add_unless(v, a, u)	___atomic_add_unless(v, a, u,)
+ #define atomic_andnot			atomic_andnot
+ 
+ /*
+diff --git a/arch/h8300/include/asm/atomic.h b/arch/h8300/include/asm/atomic.h
+index 941e7554e886..4465cfc30a3a 100644
+--- a/arch/h8300/include/asm/atomic.h
++++ b/arch/h8300/include/asm/atomic.h
+@@ -94,7 +94,7 @@ static inline int atomic_cmpxchg(atomic_t *v, int old, int new)
+ 	return ret;
+ }
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int ret;
+ 	h8300flags flags;
+diff --git a/arch/hexagon/include/asm/atomic.h b/arch/hexagon/include/asm/atomic.h
+index fb3dfb2a667e..287aa9f394f3 100644
+--- a/arch/hexagon/include/asm/atomic.h
++++ b/arch/hexagon/include/asm/atomic.h
+@@ -164,7 +164,7 @@ ATOMIC_OPS(xor)
+ #undef ATOMIC_OP
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer to value
+  * @a: amount to add
+  * @u: unless value is equal to u
+@@ -173,7 +173,7 @@ ATOMIC_OPS(xor)
+  *
+  */
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int __oldval;
+ 	register int tmp;
+diff --git a/arch/ia64/include/asm/atomic.h b/arch/ia64/include/asm/atomic.h
+index 2524fb60fbc2..9d2ddde5f9d5 100644
+--- a/arch/ia64/include/asm/atomic.h
++++ b/arch/ia64/include/asm/atomic.h
+@@ -215,7 +215,7 @@ ATOMIC64_FETCH_OP(xor, ^)
+ 	(cmpxchg(&((v)->counter), old, new))
+ #define atomic64_xchg(v, new) (xchg(&((v)->counter), new))
+ 
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/m68k/include/asm/atomic.h b/arch/m68k/include/asm/atomic.h
+index e993e2860ee1..8022d9ea1213 100644
+--- a/arch/m68k/include/asm/atomic.h
++++ b/arch/m68k/include/asm/atomic.h
+@@ -211,7 +211,7 @@ static inline int atomic_add_negative(int i, atomic_t *v)
+ 	return c != 0;
+ }
+ 
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/mips/include/asm/atomic.h b/arch/mips/include/asm/atomic.h
+index 0ab176bdb8e8..02fc1553cf9b 100644
+--- a/arch/mips/include/asm/atomic.h
++++ b/arch/mips/include/asm/atomic.h
+@@ -275,7 +275,7 @@ static __inline__ int atomic_sub_if_positive(int i, atomic_t * v)
+ #define atomic_xchg(v, new) (xchg(&((v)->counter), (new)))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -283,7 +283,7 @@ static __inline__ int atomic_sub_if_positive(int i, atomic_t * v)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/openrisc/include/asm/atomic.h b/arch/openrisc/include/asm/atomic.h
+index 146e1660f00e..b589fac39b92 100644
+--- a/arch/openrisc/include/asm/atomic.h
++++ b/arch/openrisc/include/asm/atomic.h
+@@ -100,7 +100,7 @@ ATOMIC_OP(xor)
+  *
+  * This is often used through atomic_inc_not_zero()
+  */
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int old, tmp;
+ 
+@@ -119,7 +119,7 @@ static inline int __atomic_add_unless(atomic_t *v, int a, int u)
+ 
+ 	return old;
+ }
+-#define __atomic_add_unless	__atomic_add_unless
++#define atomic_fetch_add_unless	atomic_fetch_add_unless
+ 
+ #include <asm-generic/atomic.h>
+ 
+diff --git a/arch/parisc/include/asm/atomic.h b/arch/parisc/include/asm/atomic.h
+index 88bae6676c9b..7748abced766 100644
+--- a/arch/parisc/include/asm/atomic.h
++++ b/arch/parisc/include/asm/atomic.h
+@@ -78,7 +78,7 @@ static __inline__ int atomic_read(const atomic_t *v)
+ #define atomic_xchg(v, new) (xchg(&((v)->counter), new))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -86,7 +86,7 @@ static __inline__ int atomic_read(const atomic_t *v)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/powerpc/include/asm/atomic.h b/arch/powerpc/include/asm/atomic.h
+index 682b3e6a1e21..1483261080a1 100644
+--- a/arch/powerpc/include/asm/atomic.h
++++ b/arch/powerpc/include/asm/atomic.h
+@@ -218,7 +218,7 @@ static __inline__ int atomic_dec_return_relaxed(atomic_t *v)
+ #define atomic_xchg_relaxed(v, new) xchg_relaxed(&((v)->counter), (new))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -226,13 +226,13 @@ static __inline__ int atomic_dec_return_relaxed(atomic_t *v)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int t;
+ 
+ 	__asm__ __volatile__ (
+ 	PPC_ATOMIC_ENTRY_BARRIER
+-"1:	lwarx	%0,0,%1		# __atomic_add_unless\n\
++"1:	lwarx	%0,0,%1		# atomic_fetch_add_unless\n\
+ 	cmpw	0,%0,%3 \n\
+ 	beq	2f \n\
+ 	add	%0,%2,%0 \n"
+@@ -538,7 +538,7 @@ static __inline__ int atomic64_add_unless(atomic64_t *v, long a, long u)
+ 
+ 	__asm__ __volatile__ (
+ 	PPC_ATOMIC_ENTRY_BARRIER
+-"1:	ldarx	%0,0,%1		# __atomic_add_unless\n\
++"1:	ldarx	%0,0,%1		# atomic_fetch_add_unless\n\
+ 	cmpd	0,%0,%3 \n\
+ 	beq	2f \n\
+ 	add	%0,%2,%0 \n"
+diff --git a/arch/riscv/include/asm/atomic.h b/arch/riscv/include/asm/atomic.h
+index 855115ace98c..739e810c857e 100644
+--- a/arch/riscv/include/asm/atomic.h
++++ b/arch/riscv/include/asm/atomic.h
+@@ -332,7 +332,7 @@ ATOMIC_OP(dec_and_test, dec, ==, 0, 64)
+ #undef ATOMIC_OP
+ 
+ /* This is required to provide a full barrier on success. */
+-static __always_inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static __always_inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+        int prev, rc;
+ 
+@@ -381,7 +381,7 @@ static __always_inline int atomic64_add_unless(atomic64_t *v, long a, long u)
+  */
+ static __always_inline int atomic_inc_not_zero(atomic_t *v)
+ {
+-        return __atomic_add_unless(v, 1, 0);
++        return atomic_fetch_add_unless(v, 1, 0);
+ }
+ 
+ #ifndef CONFIG_GENERIC_ATOMIC64
+diff --git a/arch/s390/include/asm/atomic.h b/arch/s390/include/asm/atomic.h
+index 4b55532f15c4..c2858cdd8c29 100644
+--- a/arch/s390/include/asm/atomic.h
++++ b/arch/s390/include/asm/atomic.h
+@@ -90,7 +90,7 @@ static inline int atomic_cmpxchg(atomic_t *v, int old, int new)
+ 	return __atomic_cmpxchg(&v->counter, old, new);
+ }
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/sh/include/asm/atomic.h b/arch/sh/include/asm/atomic.h
+index 0fd0099f43cc..ef45931ebac5 100644
+--- a/arch/sh/include/asm/atomic.h
++++ b/arch/sh/include/asm/atomic.h
+@@ -46,7 +46,7 @@
+ #define atomic_cmpxchg(v, o, n)		(cmpxchg(&((v)->counter), (o), (n)))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -54,7 +54,7 @@
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/sparc/include/asm/atomic_32.h b/arch/sparc/include/asm/atomic_32.h
+index d13ce517f4b9..a58f4b43bcc7 100644
+--- a/arch/sparc/include/asm/atomic_32.h
++++ b/arch/sparc/include/asm/atomic_32.h
+@@ -27,7 +27,7 @@ int atomic_fetch_or(int, atomic_t *);
+ int atomic_fetch_xor(int, atomic_t *);
+ int atomic_cmpxchg(atomic_t *, int, int);
+ int atomic_xchg(atomic_t *, int);
+-int __atomic_add_unless(atomic_t *, int, int);
++int atomic_fetch_add_unless(atomic_t *, int, int);
+ void atomic_set(atomic_t *, int);
+ 
+ #define atomic_set_release(v, i)	atomic_set((v), (i))
+diff --git a/arch/sparc/include/asm/atomic_64.h b/arch/sparc/include/asm/atomic_64.h
+index 28db058d471b..f416fd3d2708 100644
+--- a/arch/sparc/include/asm/atomic_64.h
++++ b/arch/sparc/include/asm/atomic_64.h
+@@ -89,7 +89,7 @@ static inline int atomic_xchg(atomic_t *v, int new)
+ 	return xchg(&v->counter, new);
+ }
+ 
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/arch/sparc/lib/atomic32.c b/arch/sparc/lib/atomic32.c
+index 465a901a0ada..281fa634bb1a 100644
+--- a/arch/sparc/lib/atomic32.c
++++ b/arch/sparc/lib/atomic32.c
+@@ -95,7 +95,7 @@ int atomic_cmpxchg(atomic_t *v, int old, int new)
+ }
+ EXPORT_SYMBOL(atomic_cmpxchg);
+ 
+-int __atomic_add_unless(atomic_t *v, int a, int u)
++int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int ret;
+ 	unsigned long flags;
+@@ -107,7 +107,7 @@ int __atomic_add_unless(atomic_t *v, int a, int u)
+ 	spin_unlock_irqrestore(ATOMIC_HASH(v), flags);
+ 	return ret;
+ }
+-EXPORT_SYMBOL(__atomic_add_unless);
++EXPORT_SYMBOL(atomic_fetch_add_unless);
+ 
+ /* Atomic operations are already serializing */
+ void atomic_set(atomic_t *v, int i)
+diff --git a/arch/x86/include/asm/atomic.h b/arch/x86/include/asm/atomic.h
+index 7cf580771c57..fed08a0079fa 100644
+--- a/arch/x86/include/asm/atomic.h
++++ b/arch/x86/include/asm/atomic.h
+@@ -254,7 +254,7 @@ static inline int arch_atomic_fetch_xor(int i, atomic_t *v)
+ }
+ 
+ /**
+- * __arch_atomic_add_unless - add unless the number is already a given value
++ * arch_atomic_fetch_add_unless - add unless the number is already a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -262,7 +262,7 @@ static inline int arch_atomic_fetch_xor(int i, atomic_t *v)
+  * Atomically adds @a to @v, so long as @v was not already @u.
+  * Returns the old value of @v.
+  */
+-static __always_inline int __arch_atomic_add_unless(atomic_t *v, int a, int u)
++static __always_inline int arch_atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c = arch_atomic_read(v);
+ 
+diff --git a/arch/xtensa/include/asm/atomic.h b/arch/xtensa/include/asm/atomic.h
+index e7a23f2a519a..4188e56c06c9 100644
+--- a/arch/xtensa/include/asm/atomic.h
++++ b/arch/xtensa/include/asm/atomic.h
+@@ -275,7 +275,7 @@ ATOMIC_OPS(xor)
+ #define atomic_xchg(v, new) (xchg(&((v)->counter), new))
+ 
+ /**
+- * __atomic_add_unless - add unless the number is a given value
++ * atomic_fetch_add_unless - add unless the number is a given value
+  * @v: pointer of type atomic_t
+  * @a: the amount to add to v...
+  * @u: ...unless v is equal to u.
+@@ -283,7 +283,7 @@ ATOMIC_OPS(xor)
+  * Atomically adds @a to @v, so long as it was not @u.
+  * Returns the old value of @v.
+  */
+-static __inline__ int __atomic_add_unless(atomic_t *v, int a, int u)
++static __inline__ int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/drivers/block/rbd.c b/drivers/block/rbd.c
+index 7fe57422bd47..f36115533eb8 100644
+--- a/drivers/block/rbd.c
++++ b/drivers/block/rbd.c
+@@ -61,7 +61,7 @@ static int atomic_inc_return_safe(atomic_t *v)
+ {
+ 	unsigned int counter;
+ 
+-	counter = (unsigned int)__atomic_add_unless(v, 1, 0);
++	counter = (unsigned int)atomic_fetch_add_unless(v, 1, 0);
+ 	if (counter <= (unsigned int)INT_MAX)
+ 		return (int)counter;
+ 
+* Unmerged path drivers/infiniband/core/rdma_core.c
+diff --git a/fs/afs/rxrpc.c b/fs/afs/rxrpc.c
+index 2c47a6c0af65..a6db33802353 100644
+--- a/fs/afs/rxrpc.c
++++ b/fs/afs/rxrpc.c
+@@ -647,7 +647,7 @@ static void afs_wake_up_async_call(struct sock *sk, struct rxrpc_call *rxcall,
+ 	trace_afs_notify_call(rxcall, call);
+ 	call->need_attention = true;
+ 
+-	u = __atomic_add_unless(&call->usage, 1, 0);
++	u = atomic_fetch_add_unless(&call->usage, 1, 0);
+ 	if (u != 0) {
+ 		trace_afs_call(call, afs_call_trace_wake, u,
+ 			       atomic_read(&call->net->nr_outstanding_calls),
+diff --git a/include/asm-generic/atomic-instrumented.h b/include/asm-generic/atomic-instrumented.h
+index ec07f23678ea..b8b14cc2df6c 100644
+--- a/include/asm-generic/atomic-instrumented.h
++++ b/include/asm-generic/atomic-instrumented.h
+@@ -84,10 +84,10 @@ static __always_inline bool atomic64_try_cmpxchg(atomic64_t *v, s64 *old, s64 ne
+ }
+ #endif
+ 
+-static __always_inline int __atomic_add_unless(atomic_t *v, int a, int u)
++static __always_inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	kasan_check_write(v, sizeof(*v));
+-	return __arch_atomic_add_unless(v, a, u);
++	return arch_atomic_fetch_add_unless(v, a, u);
+ }
+ 
+ 
+diff --git a/include/asm-generic/atomic.h b/include/asm-generic/atomic.h
+index abe6dd9ca2a8..10051ed6d088 100644
+--- a/include/asm-generic/atomic.h
++++ b/include/asm-generic/atomic.h
+@@ -221,8 +221,8 @@ static inline void atomic_dec(atomic_t *v)
+ #define atomic_xchg(ptr, v)		(xchg(&(ptr)->counter, (v)))
+ #define atomic_cmpxchg(v, old, new)	(cmpxchg(&((v)->counter), (old), (new)))
+ 
+-#ifndef __atomic_add_unless
+-static inline int __atomic_add_unless(atomic_t *v, int a, int u)
++#ifndef atomic_fetch_add_unless
++static inline int atomic_fetch_add_unless(atomic_t *v, int a, int u)
+ {
+ 	int c, old;
+ 	c = atomic_read(v);
+diff --git a/include/linux/atomic.h b/include/linux/atomic.h
+index 01ce3997cb42..9cc982936675 100644
+--- a/include/linux/atomic.h
++++ b/include/linux/atomic.h
+@@ -530,7 +530,7 @@
+  */
+ static inline int atomic_add_unless(atomic_t *v, int a, int u)
+ {
+-	return __atomic_add_unless(v, a, u) != u;
++	return atomic_fetch_add_unless(v, a, u) != u;
+ }
+ 
+ /**
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index dd68cbc967e7..0c0b14089364 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -721,7 +721,7 @@ static struct bpf_map *__bpf_map_inc_not_zero(struct bpf_map *map,
+ {
+ 	int refold;
+ 
+-	refold = __atomic_add_unless(&map->refcnt, 1, 0);
++	refold = atomic_fetch_add_unless(&map->refcnt, 1, 0);
+ 
+ 	if (refold >= BPF_MAX_REFCNT) {
+ 		__bpf_map_put(map, false);
+@@ -1548,7 +1548,7 @@ struct bpf_prog *bpf_prog_inc_not_zero(struct bpf_prog *prog)
+ {
+ 	int refold;
+ 
+-	refold = __atomic_add_unless(&prog->aux->refcnt, 1, 0);
++	refold = atomic_fetch_add_unless(&prog->aux->refcnt, 1, 0);
+ 
+ 	if (refold >= BPF_MAX_REFCNT) {
+ 		__bpf_prog_put(prog, false);
+diff --git a/net/rxrpc/call_object.c b/net/rxrpc/call_object.c
+index f6734d8cb01a..9486293fef5c 100644
+--- a/net/rxrpc/call_object.c
++++ b/net/rxrpc/call_object.c
+@@ -415,7 +415,7 @@ void rxrpc_incoming_call(struct rxrpc_sock *rx,
+ bool rxrpc_queue_call(struct rxrpc_call *call)
+ {
+ 	const void *here = __builtin_return_address(0);
+-	int n = __atomic_add_unless(&call->usage, 1, 0);
++	int n = atomic_fetch_add_unless(&call->usage, 1, 0);
+ 	if (n == 0)
+ 		return false;
+ 	if (rxrpc_queue_work(&call->processor))
+diff --git a/net/rxrpc/conn_object.c b/net/rxrpc/conn_object.c
+index 4c77a78a252a..77440a356b14 100644
+--- a/net/rxrpc/conn_object.c
++++ b/net/rxrpc/conn_object.c
+@@ -266,7 +266,7 @@ void rxrpc_kill_connection(struct rxrpc_connection *conn)
+ bool rxrpc_queue_conn(struct rxrpc_connection *conn)
+ {
+ 	const void *here = __builtin_return_address(0);
+-	int n = __atomic_add_unless(&conn->usage, 1, 0);
++	int n = atomic_fetch_add_unless(&conn->usage, 1, 0);
+ 	if (n == 0)
+ 		return false;
+ 	if (rxrpc_queue_work(&conn->processor))
+@@ -309,7 +309,7 @@ rxrpc_get_connection_maybe(struct rxrpc_connection *conn)
+ 	const void *here = __builtin_return_address(0);
+ 
+ 	if (conn) {
+-		int n = __atomic_add_unless(&conn->usage, 1, 0);
++		int n = atomic_fetch_add_unless(&conn->usage, 1, 0);
+ 		if (n > 0)
+ 			trace_rxrpc_conn(conn, rxrpc_conn_got, n + 1, here);
+ 		else
+diff --git a/net/rxrpc/local_object.c b/net/rxrpc/local_object.c
+index b493e6b62740..777c3ed4cfc0 100644
+--- a/net/rxrpc/local_object.c
++++ b/net/rxrpc/local_object.c
+@@ -305,7 +305,7 @@ struct rxrpc_local *rxrpc_get_local_maybe(struct rxrpc_local *local)
+ 	const void *here = __builtin_return_address(0);
+ 
+ 	if (local) {
+-		int n = __atomic_add_unless(&local->usage, 1, 0);
++		int n = atomic_fetch_add_unless(&local->usage, 1, 0);
+ 		if (n > 0)
+ 			trace_rxrpc_local(local, rxrpc_local_got, n + 1, here);
+ 		else
+diff --git a/net/rxrpc/peer_object.c b/net/rxrpc/peer_object.c
+index 24ec7cdcf332..1dc7648e3eff 100644
+--- a/net/rxrpc/peer_object.c
++++ b/net/rxrpc/peer_object.c
+@@ -406,7 +406,7 @@ struct rxrpc_peer *rxrpc_get_peer_maybe(struct rxrpc_peer *peer)
+ 	const void *here = __builtin_return_address(0);
+ 
+ 	if (peer) {
+-		int n = __atomic_add_unless(&peer->usage, 1, 0);
++		int n = atomic_fetch_add_unless(&peer->usage, 1, 0);
+ 		if (n > 0)
+ 			trace_rxrpc_peer(peer, rxrpc_peer_got, n + 1, here);
+ 		else
