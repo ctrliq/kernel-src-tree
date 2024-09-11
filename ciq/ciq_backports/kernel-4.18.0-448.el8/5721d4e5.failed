@@ -1,0 +1,108 @@
+dm verity: Add optional "try_verify_in_tasklet" feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Nathan Huckleberry <nhuck@google.com>
+commit 5721d4e5a9cdb148f681a004ae5748890a0e2d90
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5721d4e5.failed
+
+Using tasklets for disk verification can reduce IO latency. When there
+are accelerated hash instructions it is often better to compute the
+hash immediately using a tasklet rather than deferring verification to
+a work-queue. This reduces time spent waiting to schedule work-queue
+jobs, but requires spending slightly more time in interrupt context.
+
+If the dm-bufio cache does not have the required hashes we fallback to
+the work-queue implementation. FEC is only possible using work-queue
+because code to support the FEC feature may sleep.
+
+The following shows a speed comparison of random reads on a dm-verity
+device. The dm-verity device uses a 1G ramdisk for data and a 1G
+ramdisk for hashes. One test was run using tasklets and one test was
+run using the existing work-queue solution. Both tests were run when
+the dm-bufio cache was hot. The tasklet implementation performs
+significantly better since there is no time spent waiting for
+work-queue jobs to be scheduled.
+
+   READ: bw=181MiB/s (190MB/s), 181MiB/s-181MiB/s (190MB/s-190MB/s),
+   io=512MiB (537MB), run=2827-2827msec
+   READ: bw=23.6MiB/s (24.8MB/s), 23.6MiB/s-23.6MiB/s (24.8MB/s-24.8MB/s),
+   io=512MiB (537MB), run=21688-21688msec
+
+	Signed-off-by: Nathan Huckleberry <nhuck@google.com>
+	Signed-off-by: Mike Snitzer <snitzer@kernel.org>
+(cherry picked from commit 5721d4e5a9cdb148f681a004ae5748890a0e2d90)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-verity-target.c
+diff --cc drivers/md/dm-verity-target.c
+index 8f0dc33763bb,44af4faa30ab..000000000000
+--- a/drivers/md/dm-verity-target.c
++++ b/drivers/md/dm-verity-target.c
+@@@ -700,11 -758,9 +758,9 @@@ static int verity_map(struct dm_target 
+  	bio->bi_private = io;
+  	io->iter = bio->bi_iter;
+  
+- 	verity_fec_init_io(io);
+- 
+  	verity_submit_prefetch(v, io);
+  
+ -	submit_bio_noacct(bio);
+ +	generic_make_request(bio);
+  
+  	return DM_MAPIO_SUBMITTED;
+  }
+@@@ -1223,7 -1333,8 +1291,12 @@@ static int verity_ctr(struct dm_target 
+  
+  	v->bufio = dm_bufio_client_create(v->hash_dev->bdev,
+  		1 << v->hash_dev_block_bits, 1, sizeof(struct buffer_aux),
+++<<<<<<< HEAD
+ +		dm_bufio_alloc_callback, NULL);
+++=======
++ 		dm_bufio_alloc_callback, NULL,
++ 		v->use_tasklet ? DM_BUFIO_CLIENT_NO_SLEEP : 0);
+++>>>>>>> 5721d4e5a9cd (dm verity: Add optional "try_verify_in_tasklet" feature)
+  	if (IS_ERR(v->bufio)) {
+  		ti->error = "Cannot initialize dm-bufio";
+  		r = PTR_ERR(v->bufio);
+* Unmerged path drivers/md/dm-verity-target.c
+diff --git a/drivers/md/dm-verity.h b/drivers/md/dm-verity.h
+index df751990174b..650c65b0688f 100644
+--- a/drivers/md/dm-verity.h
++++ b/drivers/md/dm-verity.h
+@@ -14,6 +14,7 @@
+ 
+ #include <linux/dm-bufio.h>
+ #include <linux/device-mapper.h>
++#include <linux/interrupt.h>
+ #include <crypto/hash.h>
+ 
+ #define DM_VERITY_MAX_LEVELS		63
+@@ -52,9 +53,10 @@ struct dm_verity {
+ 	unsigned char hash_per_block_bits;	/* log2(hashes in hash block) */
+ 	unsigned char levels;	/* the number of tree levels */
+ 	unsigned char version;
++	bool hash_failed:1;	/* set if hash of any block failed */
++	bool use_tasklet:1;	/* try to verify in tasklet before work-queue */
+ 	unsigned digest_size;	/* digest size for the current hash algorithm */
+ 	unsigned int ahash_reqsize;/* the size of temporary space for crypto */
+-	int hash_failed;	/* set to 1 if hash of any block failed */
+ 	enum verity_mode mode;	/* mode for handling verification errors */
+ 	unsigned corrupted_errs;/* Number of errors for corrupted blocks */
+ 
+@@ -77,10 +79,12 @@ struct dm_verity_io {
+ 
+ 	sector_t block;
+ 	unsigned n_blocks;
++	bool in_tasklet;
+ 
+ 	struct bvec_iter iter;
+ 
+ 	struct work_struct work;
++	struct tasklet_struct tasklet;
+ 
+ 	/*
+ 	 * Three variably-size fields follow this struct:
