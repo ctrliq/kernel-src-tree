@@ -1,0 +1,313 @@
+mm: vmscan: reclaim writepage is IO cost
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 96f8bf4fb1dd2656ae3e92326be9ebf003bbfd45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/96f8bf4f.failed
+
+The VM tries to balance reclaim pressure between anon and file so as to
+reduce the amount of IO incurred due to the memory shortage.  It already
+counts refaults and swapins, but in addition it should also count
+writepage calls during reclaim.
+
+For swap, this is obvious: it's IO that wouldn't have occurred if the
+anonymous memory hadn't been under memory pressure.  From a relative
+balancing point of view this makes sense as well: even if anon is cold and
+reclaimable, a cache that isn't thrashing may have equally cold pages that
+don't require IO to reclaim.
+
+For file writeback, it's trickier: some of the reclaim writepage IO would
+have likely occurred anyway due to dirty expiration.  But not all of it -
+premature writeback reduces batching and generates additional writes.
+Since the flushers are already woken up by the time the VM starts writing
+cache pages one by one, let's assume that we'e likely causing writes that
+wouldn't have happened without memory pressure.  In addition, the per-page
+cost of IO would have probably been much cheaper if written in larger
+batches from the flusher thread rather than the single-page-writes from
+kswapd.
+
+For our purposes - getting the trend right to accelerate convergence on a
+stable state that doesn't require paging at all - this is sufficiently
+accurate.  If we later wanted to optimize for sustained thrashing, we can
+still refine the measurements.
+
+Count all writepage calls from kswapd as IO cost toward the LRU that the
+page belongs to.
+
+Why do this dynamically?  Don't we know in advance that anon pages require
+IO to reclaim, and so could build in a static bias?
+
+First, scanning is not the same as reclaiming.  If all the anon pages are
+referenced, we may not swap for a while just because we're scanning the
+anon list.  During this time, however, it's important that we age
+anonymous memory and the page cache at the same rate so that their
+hot-cold gradients are comparable.  Everything else being equal, we still
+want to reclaim the coldest memory overall.
+
+Second, we keep copies in swap unless the page changes.  If there is
+swap-backed data that's mostly read (tmpfs file) and has been swapped out
+before, we can reclaim it without incurring additional IO.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-14-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 96f8bf4fb1dd2656ae3e92326be9ebf003bbfd45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/swap.h
+#	mm/swap.c
+#	mm/swap_state.c
+#	mm/vmscan.c
+#	mm/workingset.c
+diff --cc include/linux/swap.h
+index 8552871db183,4c5974bb9ba9..000000000000
+--- a/include/linux/swap.h
++++ b/include/linux/swap.h
+@@@ -325,9 -334,10 +325,15 @@@ extern unsigned long nr_free_pagecache_
+  
+  
+  /* linux/mm/swap.c */
+++<<<<<<< HEAD
+++=======
++ extern void lru_note_cost(struct lruvec *lruvec, bool file,
++ 			  unsigned int nr_pages);
++ extern void lru_note_cost_page(struct page *);
+++>>>>>>> 96f8bf4fb1dd (mm: vmscan: reclaim writepage is IO cost)
+  extern void lru_cache_add(struct page *);
+ +extern void lru_cache_add_anon(struct page *page);
+ +extern void lru_cache_add_file(struct page *page);
+  extern void lru_add_page_tail(struct page *page, struct page *page_tail,
+  			 struct lruvec *lruvec, struct list_head *head);
+  extern void activate_page(struct page *);
+diff --cc mm/swap.c
+index 70728521e27e,343675d629ae..000000000000
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@@ -261,14 -278,41 +261,52 @@@ void rotate_reclaimable_page(struct pag
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void update_page_reclaim_stat(struct lruvec *lruvec,
+ +				     int file, int rotated)
+ +{
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+ +
+ +	reclaim_stat->recent_scanned[file]++;
+ +	if (rotated)
+ +		reclaim_stat->recent_rotated[file]++;
+++=======
++ void lru_note_cost(struct lruvec *lruvec, bool file, unsigned int nr_pages)
++ {
++ 	do {
++ 		unsigned long lrusize;
++ 
++ 		/* Record cost event */
++ 		if (file)
++ 			lruvec->file_cost += nr_pages;
++ 		else
++ 			lruvec->anon_cost += nr_pages;
++ 
++ 		/*
++ 		 * Decay previous events
++ 		 *
++ 		 * Because workloads change over time (and to avoid
++ 		 * overflow) we keep these statistics as a floating
++ 		 * average, which ends up weighing recent refaults
++ 		 * more than old ones.
++ 		 */
++ 		lrusize = lruvec_page_state(lruvec, NR_INACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_ANON) +
++ 			  lruvec_page_state(lruvec, NR_INACTIVE_FILE) +
++ 			  lruvec_page_state(lruvec, NR_ACTIVE_FILE);
++ 
++ 		if (lruvec->file_cost + lruvec->anon_cost > lrusize / 4) {
++ 			lruvec->file_cost /= 2;
++ 			lruvec->anon_cost /= 2;
++ 		}
++ 	} while ((lruvec = parent_lruvec(lruvec)));
+++>>>>>>> 96f8bf4fb1dd (mm: vmscan: reclaim writepage is IO cost)
++ }
++ 
++ void lru_note_cost_page(struct page *page)
++ {
++ 	lru_note_cost(mem_cgroup_page_lruvec(page, page_pgdat(page)),
++ 		      page_is_file_lru(page), hpage_nr_pages(page));
+  }
+  
+  static void __activate_page(struct page *page, struct lruvec *lruvec,
+diff --cc mm/swap_state.c
+index e2aded84261e,9d20b00627af..000000000000
+--- a/mm/swap_state.c
++++ b/mm/swap_state.c
+@@@ -430,47 -405,56 +430,83 @@@ struct page *__read_swap_cache_async(sw
+  		 * Swap entry may have been freed since our caller observed it.
+  		 */
+  		err = swapcache_prepare(entry);
+ -		if (!err)
+ +		if (err == -EEXIST) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * We might race against get_swap_page() and stumble
+ +			 * across a SWAP_HAS_CACHE swap_map entry whose page
+ +			 * has not been brought into the swapcache yet.
+ +			 */
+ +			cond_resched();
+ +			continue;
+ +		}
+ +		if (err) {		/* swp entry is obsolete ? */
+ +			radix_tree_preload_end();
+  			break;
+ +		}
+  
+ -		put_page(page);
+ -		if (err != -EEXIST)
+ -			return NULL;
+ -
+ +		/* May fail (-ENOMEM) if radix-tree node allocation failed. */
+ +		__SetPageLocked(new_page);
+ +		__SetPageSwapBacked(new_page);
+ +		err = __add_to_swap_cache(new_page, entry);
+ +		if (likely(!err)) {
+ +			radix_tree_preload_end();
+ +			/*
+ +			 * Initiate read into locked page and return.
+ +			 */
+ +			SetPageWorkingset(new_page);
+ +			lru_cache_add_anon(new_page);
+ +			*new_page_allocated = true;
+ +			return new_page;
+ +		}
+ +		radix_tree_preload_end();
+ +		__ClearPageLocked(new_page);
+  		/*
+ -		 * We might race against __delete_from_swap_cache(), and
+ -		 * stumble across a swap_map entry whose SWAP_HAS_CACHE
+ -		 * has not yet been cleared.  Or race against another
+ -		 * __read_swap_cache_async(), which has set SWAP_HAS_CACHE
+ -		 * in swap_map, but not yet added its page to swap cache.
+ +		 * add_to_swap_cache() doesn't return -EEXIST, so we can safely
+ +		 * clear SWAP_HAS_CACHE flag.
+  		 */
+ -		cond_resched();
+ -	}
+ -
+ +		put_swap_page(new_page, entry);
+ +	} while (err != -ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	if (new_page)
+ +		put_page(new_page);
+ +	return found_page;
+++=======
++ 	/*
++ 	 * The swap entry is ours to swap in. Prepare the new page.
++ 	 */
++ 
++ 	__SetPageLocked(page);
++ 	__SetPageSwapBacked(page);
++ 
++ 	/* May fail (-ENOMEM) if XArray node allocation failed. */
++ 	if (add_to_swap_cache(page, entry, gfp_mask & GFP_KERNEL)) {
++ 		put_swap_page(page, entry);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	if (mem_cgroup_charge(page, NULL, gfp_mask)) {
++ 		delete_from_swap_cache(page);
++ 		goto fail_unlock;
++ 	}
++ 
++ 	/* XXX: Move to lru_cache_add() when it supports new vs putback */
++ 	spin_lock_irq(&page_pgdat(page)->lru_lock);
++ 	lru_note_cost_page(page);
++ 	spin_unlock_irq(&page_pgdat(page)->lru_lock);
++ 
++ 	/* Caller will initiate read into locked page */
++ 	SetPageWorkingset(page);
++ 	lru_cache_add(page);
++ 	*new_page_allocated = true;
++ 	return page;
++ 
++ fail_unlock:
++ 	unlock_page(page);
++ 	put_page(page);
++ 	return NULL;
+++>>>>>>> 96f8bf4fb1dd (mm: vmscan: reclaim writepage is IO cost)
+  }
+  
+  /*
+diff --cc mm/vmscan.c
+index 709a0e80e054,14ffe9ccf7ef..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -1933,16 -1963,15 +1935,23 @@@ shrink_inactive_list(unsigned long nr_t
+  
+  	spin_lock_irq(&pgdat->lru_lock);
+  
+++<<<<<<< HEAD
+++=======
++ 	move_pages_to_lru(lruvec, &page_list);
++ 
++ 	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
++ 	lru_note_cost(lruvec, file, stat.nr_pageout);
+++>>>>>>> 96f8bf4fb1dd (mm: vmscan: reclaim writepage is IO cost)
+  	item = current_is_kswapd() ? PGSTEAL_KSWAPD : PGSTEAL_DIRECT;
+ -	if (!cgroup_reclaim(sc))
+ +	if (global_reclaim(sc))
+  		__count_vm_events(item, nr_reclaimed);
+  	__count_memcg_events(lruvec_memcg(lruvec), item, nr_reclaimed);
+ -	__count_vm_events(PGSTEAL_ANON + file, nr_reclaimed);
+ +	reclaim_stat->recent_rotated[0] += stat.nr_activate[0];
+ +	reclaim_stat->recent_rotated[1] += stat.nr_activate[1];
+ +
+ +	putback_inactive_pages(lruvec, &page_list);
+ +
+ +	__mod_node_page_state(pgdat, NR_ISOLATED_ANON + file, -nr_taken);
+  
+  	spin_unlock_irq(&pgdat->lru_lock);
+  
+diff --cc mm/workingset.c
+index 44c5c225f293,d481ea452eeb..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -365,6 -365,10 +365,13 @@@ void workingset_refault(struct page *pa
+  	/* Page was active prior to eviction */
+  	if (workingset) {
+  		SetPageWorkingset(page);
+++<<<<<<< HEAD
+++=======
++ 		/* XXX: Move to lru_cache_add() when it supports new vs putback */
++ 		spin_lock_irq(&page_pgdat(page)->lru_lock);
++ 		lru_note_cost_page(page);
++ 		spin_unlock_irq(&page_pgdat(page)->lru_lock);
+++>>>>>>> 96f8bf4fb1dd (mm: vmscan: reclaim writepage is IO cost)
+  		inc_lruvec_state(lruvec, WORKINGSET_RESTORE);
+  	}
+  out:
+* Unmerged path include/linux/swap.h
+diff --git a/include/linux/vmstat.h b/include/linux/vmstat.h
+index baaee766f778..76137ed380e8 100644
+--- a/include/linux/vmstat.h
++++ b/include/linux/vmstat.h
+@@ -26,6 +26,7 @@ struct reclaim_stat {
+ 	unsigned nr_congested;
+ 	unsigned nr_writeback;
+ 	unsigned nr_immediate;
++	unsigned nr_pageout;
+ 	unsigned nr_activate[2];
+ 	unsigned nr_ref_keep;
+ 	unsigned nr_unmap_fail;
+* Unmerged path mm/swap.c
+* Unmerged path mm/swap_state.c
+* Unmerged path mm/vmscan.c
+* Unmerged path mm/workingset.c
