@@ -1,0 +1,192 @@
+gfs2: Smarter iopen glock waiting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andreas Gruenbacher <agruenba@redhat.com>
+commit 9e8990dea9266af68a668b1503dc6f55c56f1bb6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9e8990de.failed
+
+When trying to upgrade the iopen glock from a shared to an exclusive lock in
+gfs2_evict_inode, abort the wait if there is contention on the corresponding
+inode glock: in that case, the inode must still be in active use on another
+node, and we're not guaranteed to get the iopen glock anytime soon.
+
+To make this work even better, when we notice contention on the iopen glock and
+we can't evict the corresponsing inode and release the iopen glock immediately,
+poke the inode glock.  The other node(s) trying to acquire the lock can then
+abort instead of timing out.
+
+Thanks to Heinz Mauelshagen for pointing out a locking bug in a previous
+version of this patch.
+
+	Signed-off-by: Andreas Gruenbacher <agruenba@redhat.com>
+(cherry picked from commit 9e8990dea9266af68a668b1503dc6f55c56f1bb6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/gfs2/glock.c
+diff --cc fs/gfs2/glock.c
+index b23a1f8e46fb,71091e35f83d..000000000000
+--- a/fs/gfs2/glock.c
++++ b/fs/gfs2/glock.c
+@@@ -678,9 -764,86 +678,88 @@@ out_unlock
+  	return;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void gfs2_inode_remember_delete(struct gfs2_glock *gl, u64 generation)
++ {
++ 	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++ 
++ 	if (ri->ri_magic == 0)
++ 		ri->ri_magic = cpu_to_be32(GFS2_MAGIC);
++ 	if (ri->ri_magic == cpu_to_be32(GFS2_MAGIC))
++ 		ri->ri_generation_deleted = cpu_to_be64(generation);
++ }
++ 
++ bool gfs2_inode_already_deleted(struct gfs2_glock *gl, u64 generation)
++ {
++ 	struct gfs2_inode_lvb *ri = (void *)gl->gl_lksb.sb_lvbptr;
++ 
++ 	if (ri->ri_magic != cpu_to_be32(GFS2_MAGIC))
++ 		return false;
++ 	return generation <= be64_to_cpu(ri->ri_generation_deleted);
++ }
++ 
++ static void gfs2_glock_poke(struct gfs2_glock *gl)
++ {
++ 	int flags = LM_FLAG_TRY_1CB | LM_FLAG_ANY | GL_SKIP;
++ 	struct gfs2_holder gh;
++ 	int error;
++ 
++ 	error = gfs2_glock_nq_init(gl, LM_ST_SHARED, flags, &gh);
++ 	if (!error)
++ 		gfs2_glock_dq(&gh);
++ }
++ 
++ static bool gfs2_try_evict(struct gfs2_glock *gl)
++ {
++ 	struct gfs2_inode *ip;
++ 	bool evicted = false;
++ 
++ 	/*
++ 	 * If there is contention on the iopen glock and we have an inode, try
++ 	 * to grab and release the inode so that it can be evicted.  This will
++ 	 * allow the remote node to go ahead and delete the inode without us
++ 	 * having to do it, which will avoid rgrp glock thrashing.
++ 	 *
++ 	 * The remote node is likely still holding the corresponding inode
++ 	 * glock, so it will run before we get to verify that the delete has
++ 	 * happened below.
++ 	 */
++ 	spin_lock(&gl->gl_lockref.lock);
++ 	ip = gl->gl_object;
++ 	if (ip && !igrab(&ip->i_inode))
++ 		ip = NULL;
++ 	spin_unlock(&gl->gl_lockref.lock);
++ 	if (ip) {
++ 		struct gfs2_glock *inode_gl = NULL;
++ 
++ 		gl->gl_no_formal_ino = ip->i_no_formal_ino;
++ 		set_bit(GIF_DEFERRED_DELETE, &ip->i_flags);
++ 		d_prune_aliases(&ip->i_inode);
++ 		iput(&ip->i_inode);
++ 
++ 		/* If the inode was evicted, gl->gl_object will now be NULL. */
++ 		spin_lock(&gl->gl_lockref.lock);
++ 		ip = gl->gl_object;
++ 		if (ip) {
++ 			inode_gl = ip->i_gl;
++ 			lockref_get(&inode_gl->gl_lockref);
++ 			clear_bit(GIF_DEFERRED_DELETE, &ip->i_flags);
++ 		}
++ 		spin_unlock(&gl->gl_lockref.lock);
++ 		if (inode_gl) {
++ 			gfs2_glock_poke(inode_gl);
++ 			gfs2_glock_put(inode_gl);
++ 		}
++ 		evicted = !ip;
++ 	}
++ 	return evicted;
++ }
++ 
+++>>>>>>> 9e8990dea926 (gfs2: Smarter iopen glock waiting)
+  static void delete_work_func(struct work_struct *work)
+  {
+ -	struct delayed_work *dwork = to_delayed_work(work);
+ -	struct gfs2_glock *gl = container_of(dwork, struct gfs2_glock, gl_delete);
+ +	struct gfs2_glock *gl = container_of(work, struct gfs2_glock, gl_delete);
+  	struct gfs2_sbd *sdp = gl->gl_name.ln_sbd;
+  	struct inode *inode;
+  	u64 no_addr = gl->gl_name.ln_number;
+@@@ -691,7 -858,33 +770,37 @@@
+  	if (test_bit(GLF_INODE_CREATING, &gl->gl_flags))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	inode = gfs2_lookup_by_inum(sdp, no_addr, NULL, GFS2_BLKST_UNLINKED);
+++=======
++ 	if (test_bit(GLF_DEMOTE, &gl->gl_flags)) {
++ 		/*
++ 		 * If we can evict the inode, give the remote node trying to
++ 		 * delete the inode some time before verifying that the delete
++ 		 * has happened.  Otherwise, if we cause contention on the inode glock
++ 		 * immediately, the remote node will think that we still have
++ 		 * the inode in use, and so it will give up waiting.
++ 		 *
++ 		 * If we can't evict the inode, signal to the remote node that
++ 		 * the inode is still in use.  We'll later try to delete the
++ 		 * inode locally in gfs2_evict_inode.
++ 		 *
++ 		 * FIXME: We only need to verify that the remote node has
++ 		 * deleted the inode because nodes before this remote delete
++ 		 * rework won't cooperate.  At a later time, when we no longer
++ 		 * care about compatibility with such nodes, we can skip this
++ 		 * step entirely.
++ 		 */
++ 		if (gfs2_try_evict(gl)) {
++ 			if (gfs2_queue_delete_work(gl, 5 * HZ))
++ 				return;
++ 		}
++ 		goto out;
++ 	}
++ 
++ 	inode = gfs2_lookup_by_inum(sdp, no_addr, gl->gl_no_formal_ino,
++ 				    GFS2_BLKST_UNLINKED);
+++>>>>>>> 9e8990dea926 (gfs2: Smarter iopen glock waiting)
+  	if (!IS_ERR_OR_NULL(inode)) {
+  		d_prune_aliases(inode);
+  		iput(inode);
+* Unmerged path fs/gfs2/glock.c
+diff --git a/fs/gfs2/super.c b/fs/gfs2/super.c
+index afb6b213b346..dd7bae90bda2 100644
+--- a/fs/gfs2/super.c
++++ b/fs/gfs2/super.c
+@@ -1562,8 +1562,12 @@ static bool gfs2_upgrade_iopen_glock(struct inode *inode)
+ 	 * If there are no other lock holders, we'll get the lock immediately.
+ 	 * Otherwise, the other nodes holding the lock will be notified about
+ 	 * our locking request.  If they don't have the inode open, they'll
+-	 * evict the cached inode and release the lock.  As a last resort,
+-	 * we'll eventually time out.
++	 * evict the cached inode and release the lock.  Otherwise, if they
++	 * poke the inode glock, we'll take this as an indication that they
++	 * still need the iopen glock and that they'll take care of deleting
++	 * the inode when they're done.  As a last resort, if another node
++	 * keeps holding the iopen glock without showing any activity on the
++	 * inode glock, we'll eventually time out.
+ 	 *
+ 	 * Note that we're passing the LM_FLAG_TRY_1CB flag to the first
+ 	 * locking request as an optimization to notify lock holders as soon as
+@@ -1582,7 +1586,8 @@ static bool gfs2_upgrade_iopen_glock(struct inode *inode)
+ 		return false;
+ 
+ 	timeout = wait_event_interruptible_timeout(sdp->sd_async_glock_wait,
+-		!test_bit(HIF_WAIT, &gh->gh_iflags),
++		!test_bit(HIF_WAIT, &gh->gh_iflags) ||
++		test_bit(GLF_DEMOTE, &ip->i_gl->gl_flags),
+ 		timeout);
+ 	if (!test_bit(HIF_HOLDER, &gh->gh_iflags)) {
+ 		gfs2_glock_dq(gh);
