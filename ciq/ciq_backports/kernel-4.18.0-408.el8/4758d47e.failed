@@ -1,0 +1,119 @@
+KVM: MMU: inline set_spte in FNAME(sync_page)
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 4758d47e0d685c5e2ee999c355c52d25210c2fbc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/4758d47e.failed
+
+Since the two callers of set_spte do different things with the results,
+inlining it actually makes the code simpler to reason about.  For example,
+FNAME(sync_page) already has a struct kvm_mmu_page *, but set_spte had to
+fish it back out of sptep's private page data.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 4758d47e0d685c5e2ee999c355c52d25210c2fbc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 8ec545b124be,19c2fd2189a3..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -2652,30 -2674,6 +2652,33 @@@ int mmu_try_to_unsync_pages(struct kvm_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+ +		    unsigned int pte_access, int level,
+ +		    gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+ +		    bool can_unsync, bool host_writable)
+ +{
+ +	u64 spte;
+ +	struct kvm_mmu_page *sp;
+ +	int ret;
+ +
+ +	sp = sptep_to_sp(sptep);
+ +
+ +	ret = make_spte(vcpu, pte_access, level, gfn, pfn, *sptep, speculative,
+ +			can_unsync, host_writable, sp_ad_disabled(sp), &spte);
+ +
+ +	if (spte & PT_WRITABLE_MASK)
+ +		kvm_vcpu_mark_page_dirty(vcpu, gfn);
+ +
+ +	if (*sptep == spte)
+ +		ret |= SET_SPTE_SPURIOUS;
+ +	else if (mmu_spte_update(sptep, spte))
+ +		ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
+ +	return ret;
+ +}
+ +
+++=======
+++>>>>>>> 4758d47e0d68 (KVM: MMU: inline set_spte in FNAME(sync_page))
+  static int mmu_set_spte(struct kvm_vcpu *vcpu, u64 *sptep,
+  			unsigned int pte_access, bool write_fault, int level,
+  			gfn_t gfn, kvm_pfn_t pfn, bool speculative,
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index de3ee26beb48..5d0fa2632469 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -1070,7 +1070,7 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 	int i;
+ 	bool host_writable;
+ 	gpa_t first_pte_gpa;
+-	int set_spte_ret = 0;
++	bool flush = false;
+ 
+ 	/*
+ 	 * Ignore various flags when verifying that it's safe to sync a shadow
+@@ -1100,6 +1100,7 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 	first_pte_gpa = FNAME(get_level1_sp_gpa)(sp);
+ 
+ 	for (i = 0; i < PT64_ENT_PER_PAGE; i++) {
++		u64 *sptep, spte;
+ 		unsigned pte_access;
+ 		pt_element_t gpte;
+ 		gpa_t pte_gpa;
+@@ -1115,7 +1116,7 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 			return -1;
+ 
+ 		if (FNAME(prefetch_invalid_gpte)(vcpu, sp, &sp->spt[i], gpte)) {
+-			set_spte_ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
++			flush = true;
+ 			continue;
+ 		}
+ 
+@@ -1129,19 +1130,21 @@ static int FNAME(sync_page)(struct kvm_vcpu *vcpu, struct kvm_mmu_page *sp)
+ 
+ 		if (gfn != sp->gfns[i]) {
+ 			drop_spte(vcpu->kvm, &sp->spt[i]);
+-			set_spte_ret |= SET_SPTE_NEED_REMOTE_TLB_FLUSH;
++			flush = true;
+ 			continue;
+ 		}
+ 
+-		host_writable = sp->spt[i] & shadow_host_writable_mask;
++		sptep = &sp->spt[i];
++		spte = *sptep;
++		host_writable = spte & shadow_host_writable_mask;
++		make_spte(vcpu, pte_access, PG_LEVEL_4K, gfn,
++			  spte_to_pfn(spte), spte, true, false,
++			  host_writable, sp_ad_disabled(sp), &spte);
+ 
+-		set_spte_ret |= set_spte(vcpu, &sp->spt[i],
+-					 pte_access, PG_LEVEL_4K,
+-					 gfn, spte_to_pfn(sp->spt[i]),
+-					 true, false, host_writable);
++		flush |= mmu_spte_update(sptep, spte);
+ 	}
+ 
+-	return set_spte_ret & SET_SPTE_NEED_REMOTE_TLB_FLUSH;
++	return flush;
+ }
+ 
+ #undef pt_element_t
