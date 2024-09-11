@@ -182,8 +182,6 @@ static int nft_dynset_init(const struct nft_ctx *ctx,
 	if (tb[NFTA_DYNSET_EXPR] != NULL) {
 		if (!(set->flags & NFT_SET_EVAL))
 			return -EINVAL;
-		if (!nft_set_is_anonymous(set))
-			return -EOPNOTSUPP;
 
 		priv->expr = nft_set_elem_expr_alloc(ctx, set,
 						     tb[NFTA_DYNSET_EXPR]);
