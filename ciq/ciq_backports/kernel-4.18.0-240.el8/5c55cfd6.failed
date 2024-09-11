@@ -1,0 +1,219 @@
+RDMA/core: Use READ_ONCE for ib_ufile.async_file
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 5c55cfd6a553d008fcd54e4a4e3fed1340ee5090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5c55cfd6.failed
+
+The writer for async_file holds the ucontext_lock, while the readers are
+left unlocked. Most readers rely on an implicit locking, either by having
+a uobject (which cannot be created before a context) or by holding the
+ib_ufile kref.
+
+However ib_uverbs_free_hw_resources() has no implicit lock and has a
+possible race. Make this all clear and sane by using READ_ONCE
+consistently.
+
+Link: https://lore.kernel.org/r/1578504126-9400-15-git-send-email-yishaih@mellanox.com
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5c55cfd6a553d008fcd54e4a4e3fed1340ee5090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 124314ce24bb,1f279b0a8e49..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -123,17 -123,10 +123,22 @@@ static void ib_uverbs_release_dev(struc
+  	kfree(dev);
+  }
+  
+++<<<<<<< HEAD
+ +static void ib_uverbs_release_async_event_file(struct kref *ref)
+ +{
+ +	struct ib_uverbs_async_event_file *file =
+ +		container_of(ref, struct ib_uverbs_async_event_file, ref);
+ +
+ +	kfree(file);
+ +}
+ +
+ +void ib_uverbs_release_ucq(struct ib_uverbs_file *file,
+ +			  struct ib_uverbs_completion_event_file *ev_file,
+ +			  struct ib_ucq_object *uobj)
+++=======
++ void ib_uverbs_release_ucq(struct ib_uverbs_completion_event_file *ev_file,
++ 			   struct ib_ucq_object *uobj)
+++>>>>>>> 5c55cfd6a553 (RDMA/core: Use READ_ONCE for ib_ufile.async_file)
+  {
+  	struct ib_uverbs_event *evt, *tmp;
+  
+@@@ -507,45 -467,23 +513,53 @@@ void ib_uverbs_init_event_queue(struct 
+  	ev_queue->async_queue = NULL;
+  }
+  
+ -void ib_uverbs_init_async_event_file(
+ -	struct ib_uverbs_async_event_file *async_file)
+ +struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file,
+ +					      struct ib_device	*ib_dev)
+  {
+ -	struct ib_uverbs_file *uverbs_file = async_file->uobj.ufile;
+ -	struct ib_device *ib_dev = async_file->uobj.context->device;
+ -
+ -	ib_uverbs_init_event_queue(&async_file->ev_queue);
+ -
+ +	struct ib_uverbs_async_event_file *ev_file;
+ +	struct file *filp;
+ +
+ +	ev_file = kzalloc(sizeof(*ev_file), GFP_KERNEL);
+ +	if (!ev_file)
+ +		return ERR_PTR(-ENOMEM);
+ +
+++<<<<<<< HEAD
+ +	ib_uverbs_init_event_queue(&ev_file->ev_queue);
+ +	ev_file->uverbs_file = uverbs_file;
+ +	kref_get(&ev_file->uverbs_file->ref);
+ +	kref_init(&ev_file->ref);
+ +	filp = anon_inode_getfile("[infinibandevent]", &uverbs_async_event_fops,
+ +				  ev_file, O_RDONLY);
+ +	if (IS_ERR(filp))
+ +		goto err_put_refs;
+++=======
++ 	if (!WARN_ON(uverbs_file->async_file)) {
++ 		/* Pairs with the put in ib_uverbs_release_file */
++ 		uverbs_uobject_get(&async_file->uobj);
++ 		smp_store_release(&uverbs_file->async_file, async_file);
++ 	}
+ -
+ -	INIT_IB_EVENT_HANDLER(&async_file->event_handler, ib_dev,
+++>>>>>>> 5c55cfd6a553 (RDMA/core: Use READ_ONCE for ib_ufile.async_file)
+ +
+ +	mutex_lock(&uverbs_file->device->lists_mutex);
+ +	list_add_tail(&ev_file->list,
+ +		      &uverbs_file->device->uverbs_events_file_list);
+ +	mutex_unlock(&uverbs_file->device->lists_mutex);
+ +
+ +	WARN_ON(uverbs_file->async_file);
+ +	uverbs_file->async_file = ev_file;
+ +	kref_get(&uverbs_file->async_file->ref);
+ +	INIT_IB_EVENT_HANDLER(&uverbs_file->event_handler,
+ +			      ib_dev,
+  			      ib_uverbs_event_handler);
+ -	ib_register_event_handler(&async_file->event_handler);
+ +	ib_register_event_handler(&uverbs_file->event_handler);
+ +	/* At that point async file stuff was fully set */
+ +
+ +	return filp;
+ +
+ +err_put_refs:
+ +	kref_put(&ev_file->uverbs_file->ref, ib_uverbs_release_file);
+ +	kref_put(&ev_file->ref, ib_uverbs_release_async_event_file);
+ +	return filp;
+  }
+  
+  static ssize_t verify_hdr(struct ib_uverbs_cmd_hdr *hdr,
+@@@ -1279,8 -1156,6 +1293,11 @@@ static void ib_uverbs_free_hw_resources
+  					struct ib_device *ib_dev)
+  {
+  	struct ib_uverbs_file *file;
+++<<<<<<< HEAD
+ +	struct ib_uverbs_async_event_file *event_file;
+ +	struct ib_event event;
+++=======
+++>>>>>>> 5c55cfd6a553 (RDMA/core: Use READ_ONCE for ib_ufile.async_file)
+  
+  	/* Pending running commands to terminate */
+  	uverbs_disassociate_api_pre(uverbs_dev);
+@@@ -1302,7 -1174,9 +1316,13 @@@
+  		 */
+  		mutex_unlock(&uverbs_dev->lists_mutex);
+  
+++<<<<<<< HEAD
+ +		ib_uverbs_event_handler(&file->event_handler, &event);
+++=======
++ 		ib_uverbs_async_handler(READ_ONCE(file->async_file), 0,
++ 					IB_EVENT_DEVICE_FATAL, NULL, NULL);
++ 
+++>>>>>>> 5c55cfd6a553 (RDMA/core: Use READ_ONCE for ib_ufile.async_file)
+  		uverbs_destroy_ufile_hw(file, RDMA_REMOVE_DRIVER_REMOVE);
+  		kref_put(&file->ref, ib_uverbs_release_file);
+  
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index 8384b66b661c..85ceb2afc987 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -223,11 +223,9 @@ struct file *ib_uverbs_alloc_async_event_file(struct ib_uverbs_file *uverbs_file
+ void ib_uverbs_free_async_event_file(struct ib_uverbs_file *uverbs_file);
+ void ib_uverbs_flow_resources_free(struct ib_uflow_resources *uflow_res);
+ 
+-void ib_uverbs_release_ucq(struct ib_uverbs_file *file,
+-			   struct ib_uverbs_completion_event_file *ev_file,
++void ib_uverbs_release_ucq(struct ib_uverbs_completion_event_file *ev_file,
+ 			   struct ib_ucq_object *uobj);
+-void ib_uverbs_release_uevent(struct ib_uverbs_file *file,
+-			      struct ib_uevent_object *uobj);
++void ib_uverbs_release_uevent(struct ib_uevent_object *uobj);
+ void ib_uverbs_release_file(struct kref *ref);
+ 
+ void ib_uverbs_comp_handler(struct ib_cq *cq, void *cq_context);
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 02e8d5c9eabc..773c20bdd827 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -1065,7 +1065,7 @@ static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+ 	kfree(cq);
+ err_file:
+ 	if (ev_file)
+-		ib_uverbs_release_ucq(attrs->ufile, ev_file, obj);
++		ib_uverbs_release_ucq(ev_file, obj);
+ 
+ err:
+ 	uobj_alloc_abort(&obj->uevent.uobject, attrs);
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+diff --git a/drivers/infiniband/core/uverbs_std_types.c b/drivers/infiniband/core/uverbs_std_types.c
+index def038a0fe77..28f1ed3bd41c 100644
+--- a/drivers/infiniband/core/uverbs_std_types.c
++++ b/drivers/infiniband/core/uverbs_std_types.c
+@@ -105,7 +105,7 @@ static int uverbs_free_qp(struct ib_uobject *uobject,
+ 	if (uqp->uxrcd)
+ 		atomic_dec(&uqp->uxrcd->refcnt);
+ 
+-	ib_uverbs_release_uevent(attrs->ufile, &uqp->uevent);
++	ib_uverbs_release_uevent(&uqp->uevent);
+ 	return ret;
+ }
+ 
+@@ -138,7 +138,7 @@ static int uverbs_free_wq(struct ib_uobject *uobject,
+ 	if (ib_is_destroy_retryable(ret, why, uobject))
+ 		return ret;
+ 
+-	ib_uverbs_release_uevent(attrs->ufile, &uwq->uevent);
++	ib_uverbs_release_uevent(&uwq->uevent);
+ 	return ret;
+ }
+ 
+@@ -163,7 +163,7 @@ static int uverbs_free_srq(struct ib_uobject *uobject,
+ 		atomic_dec(&us->uxrcd->refcnt);
+ 	}
+ 
+-	ib_uverbs_release_uevent(attrs->ufile, uevent);
++	ib_uverbs_release_uevent(uevent);
+ 	return ret;
+ }
+ 
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index a41c758042cc..da4110a0eea2 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -49,7 +49,6 @@ static int uverbs_free_cq(struct ib_uobject *uobject,
+ 		return ret;
+ 
+ 	ib_uverbs_release_ucq(
+-		attrs->ufile,
+ 		ev_queue ? container_of(ev_queue,
+ 					struct ib_uverbs_completion_event_file,
+ 					ev_queue) :
