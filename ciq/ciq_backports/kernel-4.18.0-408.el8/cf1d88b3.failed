@@ -1,0 +1,406 @@
+KVM: Remove dirty handling from gfn_to_pfn_cache completely
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author David Woodhouse <dwmw@amazon.co.uk>
+commit cf1d88b36ba7e83bdaa50bccc4c47864e8f08cbe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/cf1d88b3.failed
+
+It isn't OK to cache the dirty status of a page in internal structures
+for an indefinite period of time.
+
+Any time a vCPU exits the run loop to userspace might be its last; the
+VMM might do its final check of the dirty log, flush the last remaining
+dirty pages to the destination and complete a live migration. If we
+have internal 'dirty' state which doesn't get flushed until the vCPU
+is finally destroyed on the source after migration is complete, then
+we have lost data because that will escape the final copy.
+
+This problem already exists with the use of kvm_vcpu_unmap() to mark
+pages dirty in e.g. VMX nesting.
+
+Note that the actual Linux MM already considers the page to be dirty
+since we have a writeable mapping of it. This is just about the KVM
+dirty logging.
+
+For the nesting-style use cases (KVM_GUEST_USES_PFN) we will need to
+track which gfn_to_pfn_caches have been used and explicitly mark the
+corresponding pages dirty before returning to userspace. But we would
+have needed external tracking of that anyway, rather than walking the
+full list of GPCs to find those belonging to this vCPU which are dirty.
+
+So let's rely *solely* on that external tracking, and keep it simple
+rather than laying a tempting trap for callers to fall into.
+
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-Id: <20220303154127.202856-3-dwmw2@infradead.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit cf1d88b36ba7e83bdaa50bccc4c47864e8f08cbe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/xen.c
+#	include/linux/kvm_host.h
+#	include/linux/kvm_types.h
+#	virt/kvm/pfncache.c
+diff --cc arch/x86/kvm/xen.c
+index 302b37ed2e8d,bf6cc25eee76..000000000000
+--- a/arch/x86/kvm/xen.c
++++ b/arch/x86/kvm/xen.c
+@@@ -38,8 -39,8 +38,13 @@@ static int kvm_xen_shared_info_init(str
+  	}
+  
+  	do {
+++<<<<<<< HEAD
+ +		ret = kvm_gfn_to_pfn_cache_init(kvm, gpc, NULL, false, true,
+ +						gpa, PAGE_SIZE, false);
+++=======
++ 		ret = kvm_gfn_to_pfn_cache_init(kvm, gpc, NULL, KVM_HOST_USES_PFN,
++ 						gpa, PAGE_SIZE);
+++>>>>>>> cf1d88b36ba7 (KVM: Remove dirty handling from gfn_to_pfn_cache completely)
+  		if (ret)
+  			goto out;
+  
+@@@ -811,3 -881,178 +816,181 @@@ int kvm_xen_hypercall(struct kvm_vcpu *
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline int max_evtchn_port(struct kvm *kvm)
++ {
++ 	if (IS_ENABLED(CONFIG_64BIT) && kvm->arch.xen.long_mode)
++ 		return EVTCHN_2L_NR_CHANNELS;
++ 	else
++ 		return COMPAT_EVTCHN_2L_NR_CHANNELS;
++ }
++ 
++ /*
++  * This follows the kvm_set_irq() API, so it returns:
++  *  < 0   Interrupt was ignored (masked or not delivered for other reasons)
++  *  = 0   Interrupt was coalesced (previous irq is still pending)
++  *  > 0   Number of CPUs interrupt was delivered to
++  */
++ int kvm_xen_set_evtchn_fast(struct kvm_kernel_irq_routing_entry *e,
++ 			    struct kvm *kvm)
++ {
++ 	struct gfn_to_pfn_cache *gpc = &kvm->arch.xen.shinfo_cache;
++ 	struct kvm_vcpu *vcpu;
++ 	unsigned long *pending_bits, *mask_bits;
++ 	unsigned long flags;
++ 	int port_word_bit;
++ 	bool kick_vcpu = false;
++ 	int idx;
++ 	int rc;
++ 
++ 	vcpu = kvm_get_vcpu_by_id(kvm, e->xen_evtchn.vcpu);
++ 	if (!vcpu)
++ 		return -1;
++ 
++ 	if (!vcpu->arch.xen.vcpu_info_set)
++ 		return -1;
++ 
++ 	if (e->xen_evtchn.port >= max_evtchn_port(kvm))
++ 		return -1;
++ 
++ 	rc = -EWOULDBLOCK;
++ 	read_lock_irqsave(&gpc->lock, flags);
++ 
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 	if (!kvm_gfn_to_pfn_cache_check(kvm, gpc, gpc->gpa, PAGE_SIZE))
++ 		goto out_rcu;
++ 
++ 	if (IS_ENABLED(CONFIG_64BIT) && kvm->arch.xen.long_mode) {
++ 		struct shared_info *shinfo = gpc->khva;
++ 		pending_bits = (unsigned long *)&shinfo->evtchn_pending;
++ 		mask_bits = (unsigned long *)&shinfo->evtchn_mask;
++ 		port_word_bit = e->xen_evtchn.port / 64;
++ 	} else {
++ 		struct compat_shared_info *shinfo = gpc->khva;
++ 		pending_bits = (unsigned long *)&shinfo->evtchn_pending;
++ 		mask_bits = (unsigned long *)&shinfo->evtchn_mask;
++ 		port_word_bit = e->xen_evtchn.port / 32;
++ 	}
++ 
++ 	/*
++ 	 * If this port wasn't already set, and if it isn't masked, then
++ 	 * we try to set the corresponding bit in the in-kernel shadow of
++ 	 * evtchn_pending_sel for the target vCPU. And if *that* wasn't
++ 	 * already set, then we kick the vCPU in question to write to the
++ 	 * *real* evtchn_pending_sel in its own guest vcpu_info struct.
++ 	 */
++ 	if (test_and_set_bit(e->xen_evtchn.port, pending_bits)) {
++ 		rc = 0; /* It was already raised */
++ 	} else if (test_bit(e->xen_evtchn.port, mask_bits)) {
++ 		rc = -1; /* Masked */
++ 	} else {
++ 		rc = 1; /* Delivered. But was the vCPU waking already? */
++ 		if (!test_and_set_bit(port_word_bit, &vcpu->arch.xen.evtchn_pending_sel))
++ 			kick_vcpu = true;
++ 	}
++ 
++  out_rcu:
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 	read_unlock_irqrestore(&gpc->lock, flags);
++ 
++ 	if (kick_vcpu) {
++ 		kvm_make_request(KVM_REQ_EVENT, vcpu);
++ 		kvm_vcpu_kick(vcpu);
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ /* This is the version called from kvm_set_irq() as the .set function */
++ static int evtchn_set_fn(struct kvm_kernel_irq_routing_entry *e, struct kvm *kvm,
++ 			 int irq_source_id, int level, bool line_status)
++ {
++ 	bool mm_borrowed = false;
++ 	int rc;
++ 
++ 	if (!level)
++ 		return -1;
++ 
++ 	rc = kvm_xen_set_evtchn_fast(e, kvm);
++ 	if (rc != -EWOULDBLOCK)
++ 		return rc;
++ 
++ 	if (current->mm != kvm->mm) {
++ 		/*
++ 		 * If not on a thread which already belongs to this KVM,
++ 		 * we'd better be in the irqfd workqueue.
++ 		 */
++ 		if (WARN_ON_ONCE(current->mm))
++ 			return -EINVAL;
++ 
++ 		kthread_use_mm(kvm->mm);
++ 		mm_borrowed = true;
++ 	}
++ 
++ 	/*
++ 	 * For the irqfd workqueue, using the main kvm->lock mutex is
++ 	 * fine since this function is invoked from kvm_set_irq() with
++ 	 * no other lock held, no srcu. In future if it will be called
++ 	 * directly from a vCPU thread (e.g. on hypercall for an IPI)
++ 	 * then it may need to switch to using a leaf-node mutex for
++ 	 * serializing the shared_info mapping.
++ 	 */
++ 	mutex_lock(&kvm->lock);
++ 
++ 	/*
++ 	 * It is theoretically possible for the page to be unmapped
++ 	 * and the MMU notifier to invalidate the shared_info before
++ 	 * we even get to use it. In that case, this looks like an
++ 	 * infinite loop. It was tempting to do it via the userspace
++ 	 * HVA instead... but that just *hides* the fact that it's
++ 	 * an infinite loop, because if a fault occurs and it waits
++ 	 * for the page to come back, it can *still* immediately
++ 	 * fault and have to wait again, repeatedly.
++ 	 *
++ 	 * Conversely, the page could also have been reinstated by
++ 	 * another thread before we even obtain the mutex above, so
++ 	 * check again *first* before remapping it.
++ 	 */
++ 	do {
++ 		struct gfn_to_pfn_cache *gpc = &kvm->arch.xen.shinfo_cache;
++ 		int idx;
++ 
++ 		rc = kvm_xen_set_evtchn_fast(e, kvm);
++ 		if (rc != -EWOULDBLOCK)
++ 			break;
++ 
++ 		idx = srcu_read_lock(&kvm->srcu);
++ 		rc = kvm_gfn_to_pfn_cache_refresh(kvm, gpc, gpc->gpa, PAGE_SIZE);
++ 		srcu_read_unlock(&kvm->srcu, idx);
++ 	} while(!rc);
++ 
++ 	mutex_unlock(&kvm->lock);
++ 
++ 	if (mm_borrowed)
++ 		kthread_unuse_mm(kvm->mm);
++ 
++ 	return rc;
++ }
++ 
++ int kvm_xen_setup_evtchn(struct kvm *kvm,
++ 			 struct kvm_kernel_irq_routing_entry *e,
++ 			 const struct kvm_irq_routing_entry *ue)
++ 
++ {
++ 	if (ue->u.xen_evtchn.port >= max_evtchn_port(kvm))
++ 		return -EINVAL;
++ 
++ 	/* We only support 2 level event channels for now */
++ 	if (ue->u.xen_evtchn.priority != KVM_IRQ_ROUTING_XEN_EVTCHN_PRIO_2LEVEL)
++ 		return -EINVAL;
++ 
++ 	e->xen_evtchn.port = ue->u.xen_evtchn.port;
++ 	e->xen_evtchn.vcpu = ue->u.xen_evtchn.vcpu;
++ 	e->xen_evtchn.priority = ue->u.xen_evtchn.priority;
++ 	e->set = evtchn_set_fn;
++ 
++ 	return 0;
++ }
+++>>>>>>> cf1d88b36ba7 (KVM: Remove dirty handling from gfn_to_pfn_cache completely)
+diff --cc include/linux/kvm_host.h
+index 905b4457d163,3f9b22c4983a..000000000000
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@@ -914,6 -1223,101 +914,104 @@@ int kvm_vcpu_write_guest(struct kvm_vcp
+  			 unsigned long len);
+  void kvm_vcpu_mark_page_dirty(struct kvm_vcpu *vcpu, gfn_t gfn);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * kvm_gfn_to_pfn_cache_init - prepare a cached kernel mapping and HPA for a
++  *                             given guest physical address.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @vcpu:	   vCPU to be used for marking pages dirty and to be woken on
++  *		   invalidation.
++  * @usage:	   indicates if the resulting host physical PFN is used while
++  *		   the @vcpu is IN_GUEST_MODE (in which case invalidation of 
++  *		   the cache from MMU notifiers---but not for KVM memslot
++  *		   changes!---will also force @vcpu to exit the guest and
++  *		   refresh the cache); and/or if the PFN used directly
++  *		   by KVM (and thus needs a kernel virtual mapping).
++  * @gpa:	   guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This primes a gfn_to_pfn_cache and links it into the @kvm's list for
++  * invalidations to be processed.  Callers are required to use
++  * kvm_gfn_to_pfn_cache_check() to ensure that the cache is valid before
++  * accessing the target page.
++  */
++ int kvm_gfn_to_pfn_cache_init(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 			      struct kvm_vcpu *vcpu, enum pfn_cache_usage usage,
++ 			      gpa_t gpa, unsigned long len);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_check - check validity of a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   current guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  *
++  * @return:	   %true if the cache is still valid and the address matches.
++  *		   %false if the cache is not valid.
++  *
++  * Callers outside IN_GUEST_MODE context should hold a read lock on @gpc->lock
++  * while calling this function, and then continue to hold the lock until the
++  * access is complete.
++  *
++  * Callers in IN_GUEST_MODE may do so without locking, although they should
++  * still hold a read lock on kvm->scru for the memslot checks.
++  */
++ bool kvm_gfn_to_pfn_cache_check(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				gpa_t gpa, unsigned long len);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_refresh - update a previously initialized cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  * @gpa:	   updated guest physical address to map.
++  * @len:	   sanity check; the range being access must fit a single page.
++  *
++  * @return:	   0 for success.
++  *		   -EINVAL for a mapping which would cross a page boundary.
++  *                 -EFAULT for an untranslatable guest physical address.
++  *
++  * This will attempt to refresh a gfn_to_pfn_cache. Note that a successful
++  * returm from this function does not mean the page can be immediately
++  * accessed because it may have raced with an invalidation. Callers must
++  * still lock and check the cache status, as this function does not return
++  * with the lock still held to permit access.
++  */
++ int kvm_gfn_to_pfn_cache_refresh(struct kvm *kvm, struct gfn_to_pfn_cache *gpc,
++ 				 gpa_t gpa, unsigned long len);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_unmap - temporarily unmap a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This unmaps the referenced page. The cache is left in the invalid state
++  * but at least the mapping from GPA to userspace HVA will remain cached
++  * and can be reused on a subsequent refresh.
++  */
++ void kvm_gfn_to_pfn_cache_unmap(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
++ /**
++  * kvm_gfn_to_pfn_cache_destroy - destroy and unlink a gfn_to_pfn_cache.
++  *
++  * @kvm:	   pointer to kvm instance.
++  * @gpc:	   struct gfn_to_pfn_cache object.
++  *
++  * This removes a cache from the @kvm's list to be processed on MMU notifier
++  * invocation.
++  */
++ void kvm_gfn_to_pfn_cache_destroy(struct kvm *kvm, struct gfn_to_pfn_cache *gpc);
++ 
+++>>>>>>> cf1d88b36ba7 (KVM: Remove dirty handling from gfn_to_pfn_cache completely)
+  void kvm_sigset_activate(struct kvm_vcpu *vcpu);
+  void kvm_sigset_deactivate(struct kvm_vcpu *vcpu);
+  
+diff --cc include/linux/kvm_types.h
+index e65323751d08,ac1ebb37a0ff..000000000000
+--- a/include/linux/kvm_types.h
++++ b/include/linux/kvm_types.h
+@@@ -67,6 -61,21 +67,24 @@@ struct gfn_to_hva_cache 
+  	struct kvm_memory_slot *memslot;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct gfn_to_pfn_cache {
++ 	u64 generation;
++ 	gpa_t gpa;
++ 	unsigned long uhva;
++ 	struct kvm_memory_slot *memslot;
++ 	struct kvm_vcpu *vcpu;
++ 	struct list_head list;
++ 	rwlock_t lock;
++ 	void *khva;
++ 	kvm_pfn_t pfn;
++ 	enum pfn_cache_usage usage;
++ 	bool active;
++ 	bool valid;
++ };
++ 
+++>>>>>>> cf1d88b36ba7 (KVM: Remove dirty handling from gfn_to_pfn_cache completely)
+  #ifdef KVM_ARCH_NR_OBJS_PER_MEMORY_CACHE
+  /*
+   * Memory caches are used to preallocate memory ahead of various MMU flows,
+* Unmerged path virt/kvm/pfncache.c
+diff --git a/Documentation/virt/kvm/api.rst b/Documentation/virt/kvm/api.rst
+index bf465229a63e..c40e0669c7b4 100644
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@ -5017,6 +5017,10 @@ type values:
+ 
+ KVM_XEN_VCPU_ATTR_TYPE_VCPU_INFO
+   Sets the guest physical address of the vcpu_info for a given vCPU.
++  As with the shared_info page for the VM, the corresponding page may be
++  dirtied at any time if event channel interrupt delivery is enabled, so
++  userspace should always assume that the page is dirty without relying
++  on dirty logging.
+ 
+ KVM_XEN_VCPU_ATTR_TYPE_VCPU_TIME_INFO
+   Sets the guest physical address of an additional pvclock structure
+* Unmerged path arch/x86/kvm/xen.c
+* Unmerged path include/linux/kvm_host.h
+* Unmerged path include/linux/kvm_types.h
+* Unmerged path virt/kvm/pfncache.c
