@@ -1,0 +1,472 @@
+mm/memory_hotplug: shrink zones when offlining memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] memory_hotplug: shrink zones when offlining memory (Christoph von Recklinghausen) [1766491]
+Rebuild_FUZZ: 97.09%
+commit-author David Hildenbrand <david@redhat.com>
+commit feee6b2989165631b17ac6d4ccdbf6759254e85a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/feee6b29.failed
+
+We currently try to shrink a single zone when removing memory.  We use
+the zone of the first page of the memory we are removing.  If that
+memmap was never initialized (e.g., memory was never onlined), we will
+read garbage and can trigger kernel BUGs (due to a stale pointer):
+
+    BUG: unable to handle page fault for address: 000000000000353d
+    #PF: supervisor write access in kernel mode
+    #PF: error_code(0x0002) - not-present page
+    PGD 0 P4D 0
+    Oops: 0002 [#1] SMP PTI
+    CPU: 1 PID: 7 Comm: kworker/u8:0 Not tainted 5.3.0-rc5-next-20190820+ #317
+    Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS rel-1.12.1-0-ga5cab58e9a3f-prebuilt.qemu.4
+    Workqueue: kacpi_hotplug acpi_hotplug_work_fn
+    RIP: 0010:clear_zone_contiguous+0x5/0x10
+    Code: 48 89 c6 48 89 c3 e8 2a fe ff ff 48 85 c0 75 cf 5b 5d c3 c6 85 fd 05 00 00 01 5b 5d c3 0f 1f 840
+    RSP: 0018:ffffad2400043c98 EFLAGS: 00010246
+    RAX: 0000000000000000 RBX: 0000000200000000 RCX: 0000000000000000
+    RDX: 0000000000200000 RSI: 0000000000140000 RDI: 0000000000002f40
+    RBP: 0000000140000000 R08: 0000000000000000 R09: 0000000000000001
+    R10: 0000000000000000 R11: 0000000000000000 R12: 0000000000140000
+    R13: 0000000000140000 R14: 0000000000002f40 R15: ffff9e3e7aff3680
+    FS:  0000000000000000(0000) GS:ffff9e3e7bb00000(0000) knlGS:0000000000000000
+    CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+    CR2: 000000000000353d CR3: 0000000058610000 CR4: 00000000000006e0
+    DR0: 0000000000000000 DR1: 0000000000000000 DR2: 0000000000000000
+    DR3: 0000000000000000 DR6: 00000000fffe0ff0 DR7: 0000000000000400
+    Call Trace:
+     __remove_pages+0x4b/0x640
+     arch_remove_memory+0x63/0x8d
+     try_remove_memory+0xdb/0x130
+     __remove_memory+0xa/0x11
+     acpi_memory_device_remove+0x70/0x100
+     acpi_bus_trim+0x55/0x90
+     acpi_device_hotplug+0x227/0x3a0
+     acpi_hotplug_work_fn+0x1a/0x30
+     process_one_work+0x221/0x550
+     worker_thread+0x50/0x3b0
+     kthread+0x105/0x140
+     ret_from_fork+0x3a/0x50
+    Modules linked in:
+    CR2: 000000000000353d
+
+Instead, shrink the zones when offlining memory or when onlining failed.
+Introduce and use remove_pfn_range_from_zone(() for that.  We now
+properly shrink the zones, even if we have DIMMs whereby
+
+ - Some memory blocks fall into no zone (never onlined)
+
+ - Some memory blocks fall into multiple zones (offlined+re-onlined)
+
+ - Multiple memory blocks that fall into different zones
+
+Drop the zone parameter (with a potential dubious value) from
+__remove_pages() and __remove_section().
+
+Link: http://lkml.kernel.org/r/20191006085646.5768-6-david@redhat.com
+Fixes: f1dd2cd13c4b ("mm, memory_hotplug: do not associate hotadded memory to zones until online")	[visible after d0dc12e86b319]
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: "Aneesh Kumar K.V" <aneesh.kumar@linux.ibm.com>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: <stable@vger.kernel.org>	[5.0+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit feee6b2989165631b17ac6d4ccdbf6759254e85a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/ia64/mm/init.c
+#	arch/powerpc/mm/mem.c
+#	arch/s390/mm/init.c
+#	arch/sh/mm/init.c
+#	arch/x86/mm/init_32.c
+#	arch/x86/mm/init_64.c
+#	include/linux/memory_hotplug.h
+#	mm/memory_hotplug.c
+#	mm/memremap.c
+diff --cc arch/ia64/mm/init.c
+index b54d0ee74b53,b01d68a2d5d9..000000000000
+--- a/arch/ia64/mm/init.c
++++ b/arch/ia64/mm/init.c
+@@@ -666,16 -689,7 +666,21 @@@ int arch_remove_memory(int nid, u64 sta
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct zone *zone;
+ +	int ret;
+ +
+ +	zone = page_zone(pfn_to_page(start_pfn));
+ +	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ +	if (ret)
+ +		pr_warn("%s: Problem encountered in __remove_pages() as"
+ +			" ret=%d\n", __func__,  ret);
+ +
+ +	return ret;
+++=======
++ 
++ 	__remove_pages(start_pfn, nr_pages, altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  }
+  #endif
+ +#endif
+diff --cc arch/powerpc/mm/mem.c
+index 8fba58c32115,f5535eae637f..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -145,20 -151,9 +145,26 @@@ int __meminit arch_remove_memory(int ni
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct page *page;
+ +	int ret;
+ +
+ +	/*
+ +	 * If we have an altmap then we need to skip over any reserved PFNs
+ +	 * when querying the zone.
+ +	 */
+ +	page = pfn_to_page(start_pfn);
+ +	if (altmap)
+ +		page += vmem_altmap_offset(altmap);
+ +
+ +	ret = __remove_pages(page_zone(page), start_pfn, nr_pages, altmap);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	int ret;
++ 
++ 	__remove_pages(start_pfn, nr_pages, altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  
+  	/* Remove htab bolted mappings for this section of memory */
+  	start = (unsigned long)__va(start);
+diff --cc arch/s390/mm/init.c
+index b139eb700b1f,ac44bd76db4b..000000000000
+--- a/arch/s390/mm/init.c
++++ b/arch/s390/mm/init.c
+@@@ -300,15 -287,13 +300,23 @@@ int arch_add_memory(int nid, u64 start
+  	return rc;
+  }
+  
+ -void arch_remove_memory(int nid, u64 start, u64 size,
+ -			struct vmem_altmap *altmap)
+ +#ifdef CONFIG_MEMORY_HOTREMOVE
+ +int arch_remove_memory(int nid, u64 start, u64 size, struct vmem_altmap *altmap)
+  {
+++<<<<<<< HEAD
+ +	/*
+ +	 * There is no hardware or firmware interface which could trigger a
+ +	 * hot memory remove on s390. So there is nothing that needs to be
+ +	 * implemented.
+ +	 */
+ +	return -EBUSY;
+++=======
++ 	unsigned long start_pfn = start >> PAGE_SHIFT;
++ 	unsigned long nr_pages = size >> PAGE_SHIFT;
++ 
++ 	__remove_pages(start_pfn, nr_pages, altmap);
++ 	vmem_remove_mapping(start, size);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  }
+ +#endif
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --cc arch/sh/mm/init.c
+index 55c740ab861b,d1b1ff2be17a..000000000000
+--- a/arch/sh/mm/init.c
++++ b/arch/sh/mm/init.c
+@@@ -458,16 -434,7 +458,21 @@@ int arch_remove_memory(int nid, u64 sta
+  {
+  	unsigned long start_pfn = PFN_DOWN(start);
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct zone *zone;
+ +	int ret;
+ +
+ +	zone = page_zone(pfn_to_page(start_pfn));
+ +	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ +	if (unlikely(ret))
+ +		pr_warn("%s: Failed, __remove_pages() == %d\n", __func__,
+ +			ret);
+ +
+ +	return ret;
+++=======
++ 
++ 	__remove_pages(start_pfn, nr_pages, altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  }
+ +#endif
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --cc arch/x86/mm/init_32.c
+index 3988185cef60,0a74407ef92e..000000000000
+--- a/arch/x86/mm/init_32.c
++++ b/arch/x86/mm/init_32.c
+@@@ -865,13 -865,10 +865,16 @@@ int arch_remove_memory(int nid, u64 sta
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+- 	struct zone *zone;
+  
+++<<<<<<< HEAD
+ +	zone = page_zone(pfn_to_page(start_pfn));
+ +	return __remove_pages(zone, start_pfn, nr_pages, altmap);
+++=======
++ 	__remove_pages(start_pfn, nr_pages, altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  }
+  #endif
+ +#endif
+  
+  int kernel_set_to_readonly __read_mostly;
+  
+diff --cc arch/x86/mm/init_64.c
+index 823e60f719f3,bcfede46fe02..000000000000
+--- a/arch/x86/mm/init_64.c
++++ b/arch/x86/mm/init_64.c
+@@@ -1213,21 -1212,10 +1213,26 @@@ int __ref arch_remove_memory(int nid, u
+  {
+  	unsigned long start_pfn = start >> PAGE_SHIFT;
+  	unsigned long nr_pages = size >> PAGE_SHIFT;
+++<<<<<<< HEAD
+ +	struct page *page = pfn_to_page(start_pfn);
+ +	struct zone *zone;
+ +	int ret;
+ +
+ +	/* With altmap the first mapped page is offset from @start */
+ +	if (altmap)
+ +		page += vmem_altmap_offset(altmap);
+ +	zone = page_zone(page);
+ +	ret = __remove_pages(zone, start_pfn, nr_pages, altmap);
+ +	WARN_ON_ONCE(ret);
+++=======
++ 
++ 	__remove_pages(start_pfn, nr_pages, altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  	kernel_physical_mapping_remove(start, start + size);
+ +
+ +	return ret;
+  }
+ +#endif
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+  
+  static struct kcore_list kcore_vsyscall;
+diff --cc include/linux/memory_hotplug.h
+index 4408664ab5ca,ba0dca6aac6e..000000000000
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@@ -108,12 -120,10 +108,19 @@@ static inline bool movable_node_is_enab
+  	return movable_node_enabled;
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_MEMORY_HOTREMOVE
+ +extern int arch_remove_memory(int nid, u64 start, u64 size,
+ +				struct vmem_altmap *altmap);
+ +extern int __remove_pages(struct zone *zone, unsigned long start_pfn,
+ +	unsigned long nr_pages, struct vmem_altmap *altmap);
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+++=======
++ extern void arch_remove_memory(int nid, u64 start, u64 size,
++ 			       struct vmem_altmap *altmap);
++ extern void __remove_pages(unsigned long start_pfn, unsigned long nr_pages,
++ 			   struct vmem_altmap *altmap);
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  
+  /* reasonably generic interface to expand the physical pages */
+  extern int __add_pages(int nid, unsigned long start_pfn, unsigned long nr_pages,
+@@@ -332,14 -340,16 +339,17 @@@ extern int walk_memory_range(unsigned l
+  extern int __add_memory(int nid, u64 start, u64 size);
+  extern int add_memory(int nid, u64 start, u64 size);
+  extern int add_memory_resource(int nid, struct resource *resource);
+ +extern int arch_add_memory(int nid, u64 start, u64 size,
+ +		struct vmem_altmap *altmap, bool want_memblock);
+  extern void move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+  		unsigned long nr_pages, struct vmem_altmap *altmap);
++ extern void remove_pfn_range_from_zone(struct zone *zone,
++ 				       unsigned long start_pfn,
++ 				       unsigned long nr_pages);
+  extern bool is_memblock_offlined(struct memory_block *mem);
+ -extern int sparse_add_section(int nid, unsigned long pfn,
+ -		unsigned long nr_pages, struct vmem_altmap *altmap);
+ -extern void sparse_remove_section(struct mem_section *ms,
+ -		unsigned long pfn, unsigned long nr_pages,
+ +extern int sparse_add_one_section(int nid, unsigned long start_pfn,
+ +				  struct vmem_altmap *altmap);
+ +extern void sparse_remove_one_section(struct mem_section *ms,
+  		unsigned long map_offset, struct vmem_altmap *altmap);
+  extern struct page *sparse_decode_mem_map(unsigned long coded_mem_map,
+  					  unsigned long pnum);
+diff --cc mm/memory_hotplug.c
+index a3e9f0ce7c23,a91a072f2b2c..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -463,10 -483,11 +463,16 @@@ static void update_pgdat_span(struct pg
+  	pgdat->node_spanned_pages = node_end_pfn - node_start_pfn;
+  }
+  
+++<<<<<<< HEAD
+ +static void __remove_zone(struct zone *zone, unsigned long start_pfn)
+++=======
++ void __ref remove_pfn_range_from_zone(struct zone *zone,
++ 				      unsigned long start_pfn,
++ 				      unsigned long nr_pages)
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  {
+  	struct pglist_data *pgdat = zone->zone_pgdat;
+ +	int nr_pages = PAGES_PER_SECTION;
+  	unsigned long flags;
+  
+  #ifdef CONFIG_ZONE_DEVICE
+@@@ -483,9 -506,11 +491,15 @@@
+  	shrink_zone_span(zone, start_pfn, start_pfn + nr_pages);
+  	update_pgdat_span(pgdat);
+  	pgdat_resize_unlock(zone->zone_pgdat, &flags);
++ 
++ 	set_zone_contiguous(zone);
+  }
+  
+++<<<<<<< HEAD
+ +static void __remove_section(struct zone *zone, struct mem_section *ms,
+++=======
++ static void __remove_section(unsigned long pfn, unsigned long nr_pages,
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  			     unsigned long map_offset,
+  			     struct vmem_altmap *altmap)
+  {
+@@@ -495,19 -519,12 +509,28 @@@
+  	if (WARN_ON_ONCE(!valid_section(ms)))
+  		return;
+  
+++<<<<<<< HEAD
+ +	unregister_memory_section(ms);
+ +
+ +	scn_nr = __section_nr(ms);
+ +	start_pfn = section_nr_to_pfn((unsigned long)scn_nr);
+ +	__remove_zone(zone, start_pfn);
+ +
+ +	sparse_remove_one_section(ms, map_offset, altmap);
+ +}
+ +
+ +/**
+ + * __remove_pages() - remove sections of pages from a zone
+ + * @zone: zone from which pages need to be removed
+ + * @phys_start_pfn: starting pageframe (must be aligned to start of a section)
+++=======
++ 	sparse_remove_section(ms, pfn, nr_pages, map_offset, altmap);
++ }
++ 
++ /**
++  * __remove_pages() - remove sections of pages
++  * @pfn: starting pageframe (must be aligned to start of a section)
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+   * @nr_pages: number of pages to remove (must be multiple of section size)
+   * @altmap: alternative device page map or %NULL if default memmap is used
+   *
+@@@ -516,41 -533,31 +539,61 @@@
+   * sure that pages are marked reserved and zones are adjust properly by
+   * calling offline_pages().
+   */
+++<<<<<<< HEAD
+ +int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
+ +		 unsigned long nr_pages, struct vmem_altmap *altmap)
+++=======
++ void __remove_pages(unsigned long pfn, unsigned long nr_pages,
++ 		    struct vmem_altmap *altmap)
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  {
+ +	unsigned long i;
+  	unsigned long map_offset = 0;
+ -	unsigned long nr, start_sec, end_sec;
+ +	int sections_to_remove;
+ +
+ +	/* In the ZONE_DEVICE case device driver owns the memory region */
+ +	if (is_dev_zone(zone)) {
+ +		if (altmap)
+ +			map_offset = vmem_altmap_offset(altmap);
+ +	}
+  
+ -	map_offset = vmem_altmap_offset(altmap);
+++<<<<<<< HEAD
+ +	clear_zone_contiguous(zone);
+  
+ +	/*
+ +	 * We can only remove entire sections
+ +	 */
+ +	BUG_ON(phys_start_pfn & ~PAGE_SECTION_MASK);
+ +	BUG_ON(nr_pages % PAGES_PER_SECTION);
+++=======
++ 	if (check_pfn_span(pfn, nr_pages, "remove"))
++ 		return;
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  
+ -	start_sec = pfn_to_section_nr(pfn);
+ -	end_sec = pfn_to_section_nr(pfn + nr_pages - 1);
+ -	for (nr = start_sec; nr <= end_sec; nr++) {
+ -		unsigned long pfns;
+ +	sections_to_remove = nr_pages / PAGES_PER_SECTION;
+ +	for (i = 0; i < sections_to_remove; i++) {
+ +		unsigned long pfn = phys_start_pfn + i*PAGES_PER_SECTION;
+  
+  		cond_resched();
+++<<<<<<< HEAD
+ +		__remove_section(zone, __pfn_to_section(pfn), map_offset,
+ +				 altmap);
+ +		map_offset = 0;
+ +	}
+ +
+ +	set_zone_contiguous(zone);
+ +	return 0;
+++=======
++ 		pfns = min(nr_pages, PAGES_PER_SECTION
++ 				- (pfn & ~PAGE_SECTION_MASK));
++ 		__remove_section(pfn, pfns, map_offset, altmap);
++ 		pfn += pfns;
++ 		nr_pages -= pfns;
++ 		map_offset = 0;
++ 	}
+++>>>>>>> feee6b298916 (mm/memory_hotplug: shrink zones when offlining memory)
+  }
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+  
+  int set_online_page_callback(online_page_callback_t callback)
+  {
+* Unmerged path mm/memremap.c
+diff --git a/arch/arm64/mm/mmu.c b/arch/arm64/mm/mmu.c
+index e9b4ea5bfb90..c1f2c8b2fe42 100644
+--- a/arch/arm64/mm/mmu.c
++++ b/arch/arm64/mm/mmu.c
+@@ -1066,7 +1066,6 @@ void arch_remove_memory(int nid, u64 start, u64 size,
+ {
+ 	unsigned long start_pfn = start >> PAGE_SHIFT;
+ 	unsigned long nr_pages = size >> PAGE_SHIFT;
+-	struct zone *zone;
+ 
+ 	/*
+ 	 * FIXME: Cleanup page tables (also in arch_add_memory() in case
+@@ -1075,8 +1074,7 @@ void arch_remove_memory(int nid, u64 start, u64 size,
+ 	 * unplug. ARCH_ENABLE_MEMORY_HOTREMOVE must not be
+ 	 * unlocked yet.
+ 	 */
+-	zone = page_zone(pfn_to_page(start_pfn));
+-	__remove_pages(zone, start_pfn, nr_pages, altmap);
++	__remove_pages(start_pfn, nr_pages, altmap);
+ }
+ #endif
+ #endif
+* Unmerged path arch/ia64/mm/init.c
+* Unmerged path arch/powerpc/mm/mem.c
+* Unmerged path arch/s390/mm/init.c
+* Unmerged path arch/sh/mm/init.c
+* Unmerged path arch/x86/mm/init_32.c
+* Unmerged path arch/x86/mm/init_64.c
+* Unmerged path include/linux/memory_hotplug.h
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/memremap.c
