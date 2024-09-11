@@ -1,0 +1,124 @@
+net: ipv6: add skb drop reasons to TLV parse
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Menglong Dong <imagedong@tencent.com>
+commit 7d9dbdfbfdc5e52131bea94a7318ee35b15a5f19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/7d9dbdfb.failed
+
+Replace kfree_skb() used in TLV encoded option header parsing with
+kfree_skb_reason(). Following functions are involved:
+
+ip6_parse_tlv()
+ipv6_hop_ra()
+ipv6_hop_ioam()
+ipv6_hop_jumbo()
+ipv6_hop_calipso()
+ipv6_dest_hao()
+
+Most skb drops during this process are regarded as 'InHdrErrors',
+as 'IPSTATS_MIB_INHDRERRORS' is used when ip6_parse_tlv() fails,
+which make we use 'SKB_DROP_REASON_IP_INHDR' correspondingly.
+
+However, 'IP_INHDR' is a relatively general reason. Therefore, we
+can use other reasons with higher priority in some cases. For example,
+'SKB_DROP_REASON_UNHANDLED_PROTO' is used for unknown TLV options.
+
+	Signed-off-by: Menglong Dong <imagedong@tencent.com>
+	Reviewed-by: Jiang Biao <benbjiang@tencent.com>
+	Reviewed-by: Hao Peng <flyingpeng@tencent.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 7d9dbdfbfdc5e52131bea94a7318ee35b15a5f19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv6/exthdrs.c
+diff --cc net/ipv6/exthdrs.c
+index de0e024ee749,a8d961d3a477..000000000000
+--- a/net/ipv6/exthdrs.c
++++ b/net/ipv6/exthdrs.c
+@@@ -101,9 -88,10 +101,10 @@@ static bool ip6_tlvopt_unknown(struct s
+  		 */
+  		if (ipv6_addr_is_multicast(&ipv6_hdr(skb)->daddr))
+  			break;
+ -		fallthrough;
+ +		/* fall through */
+  	case 2: /* send ICMP PARM PROB regardless and drop packet */
+- 		icmpv6_param_prob(skb, ICMPV6_UNK_OPTION, optoff);
++ 		icmpv6_param_prob_reason(skb, ICMPV6_UNK_OPTION, optoff,
++ 					 SKB_DROP_REASON_UNHANDLED_PROTO);
+  		return false;
+  	}
+  
+@@@ -730,10 -937,64 +736,67 @@@ static bool ipv6_hop_ra(struct sk_buff 
+  	}
+  	net_dbg_ratelimited("ipv6_hop_ra: wrong RA length %d\n",
+  			    nh[optoff + 1]);
+- 	kfree_skb(skb);
++ 	kfree_skb_reason(skb, SKB_DROP_REASON_IP_INHDR);
++ 	return false;
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ /* IOAM */
++ 
++ static bool ipv6_hop_ioam(struct sk_buff *skb, int optoff)
++ {
++ 	struct ioam6_trace_hdr *trace;
++ 	struct ioam6_namespace *ns;
++ 	struct ioam6_hdr *hdr;
++ 
++ 	/* Bad alignment (must be 4n-aligned) */
++ 	if (optoff & 3)
++ 		goto drop;
++ 
++ 	/* Ignore if IOAM is not enabled on ingress */
++ 	if (!__in6_dev_get(skb->dev)->cnf.ioam6_enabled)
++ 		goto ignore;
++ 
++ 	/* Truncated Option header */
++ 	hdr = (struct ioam6_hdr *)(skb_network_header(skb) + optoff);
++ 	if (hdr->opt_len < 2)
++ 		goto drop;
++ 
++ 	switch (hdr->type) {
++ 	case IOAM6_TYPE_PREALLOC:
++ 		/* Truncated Pre-allocated Trace header */
++ 		if (hdr->opt_len < 2 + sizeof(*trace))
++ 			goto drop;
++ 
++ 		/* Malformed Pre-allocated Trace header */
++ 		trace = (struct ioam6_trace_hdr *)((u8 *)hdr + sizeof(*hdr));
++ 		if (hdr->opt_len < 2 + sizeof(*trace) + trace->remlen * 4)
++ 			goto drop;
++ 
++ 		/* Ignore if the IOAM namespace is unknown */
++ 		ns = ioam6_namespace(ipv6_skb_net(skb), trace->namespace_id);
++ 		if (!ns)
++ 			goto ignore;
++ 
++ 		if (!skb_valid_dst(skb))
++ 			ip6_route_input(skb);
++ 
++ 		ioam6_fill_trace_data(skb, ns, trace, true);
++ 		break;
++ 	default:
++ 		break;
++ 	}
++ 
++ ignore:
++ 	return true;
++ 
++ drop:
++ 	kfree_skb_reason(skb, SKB_DROP_REASON_IP_INHDR);
+  	return false;
+  }
+  
+++>>>>>>> 7d9dbdfbfdc5 (net: ipv6: add skb drop reasons to TLV parse)
+  /* Jumbo payload */
+  
+  static bool ipv6_hop_jumbo(struct sk_buff *skb, int optoff)
+* Unmerged path net/ipv6/exthdrs.c
