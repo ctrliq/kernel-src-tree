@@ -1,0 +1,128 @@
+nvme: ignore zone validate errors on subsequent scans
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Keith Busch <kbusch@kernel.org>
+commit 8685699c28d7452ff06d62b4692df985eb7301f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/8685699c.failed
+
+Revalidating nvme zoned namespaces requires IO commands, and there are
+controller states that prevent IO. For example, a sanitize in progress
+is required to fail all IO, but we don't want to remove a namespace
+we've previously added just because the controller is in such a state.
+Suppress the error in this case.
+
+	Reported-by: Michael Nguyen <michael.nguyen@wdc.com>
+	Signed-off-by: Keith Busch <kbusch@kernel.org>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 8685699c28d7452ff06d62b4692df985eb7301f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index f7db72db297a,376096bfc54a..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -2080,66 -2101,43 +2080,78 @@@ static void nvme_set_chunk_sectors(stru
+  	blk_queue_chunk_sectors(ns->queue, iob);
+  }
+  
+ -static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
+ +static int __nvme_revalidate_disk(struct gendisk *disk, struct nvme_id_ns *id)
+  {
+ -	unsigned lbaf = id->flbas & NVME_NS_FLBAS_LBA_MASK;
+ -	int ret;
+ +	struct nvme_ns *ns = disk->private_data;
+ +	struct nvme_ctrl *ctrl = ns->ctrl;
+  
+ -	blk_mq_freeze_queue(ns->disk->queue);
+ -	ns->lba_shift = id->lbaf[lbaf].ds;
+ -	nvme_set_queue_limits(ns->ctrl, ns->queue);
+ +	/*
+ +	 * If identify namespace failed, use default 512 byte block size so
+ +	 * block layer can use before failing read/write for 0 capacity.
+ +	 */
+ +	ns->lba_shift = id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ds;
+ +	if (ns->lba_shift == 0)
+ +		ns->lba_shift = 9;
+  
+ -	if (ns->head->ids.csi == NVME_CSI_ZNS) {
+ -		ret = nvme_update_zone_info(ns, lbaf);
+ -		if (ret)
+ -			goto out_unfreeze;
+ +	switch (ns->head->ids.csi) {
+ +	case NVME_CSI_NVM:
+ +		break;
+ +	default:
+ +		dev_warn(ctrl->device, "unknown csi:%d ns:%d\n",
+ +			ns->head->ids.csi, ns->head->ns_id);
+ +		return -ENODEV;
+ +	}
+ +
+ +	ns->features = 0;
+ +	ns->ms = le16_to_cpu(id->lbaf[id->flbas & NVME_NS_FLBAS_LBA_MASK].ms);
+ +	/* the PI implementation requires metadata equal t10 pi tuple size */
+ +	if (ns->ms == sizeof(struct t10_pi_tuple))
+ +		ns->pi_type = id->dps & NVME_NS_DPS_PI_MASK;
+ +	else
+ +		ns->pi_type = 0;
+ +
+ +	if (ns->ms) {
+ +		/*
+ +		 * For PCIe only the separate metadata pointer is supported,
+ +		 * as the block layer supplies metadata in a separate bio_vec
+ +		 * chain. For Fabrics, only metadata as part of extended data
+ +		 * LBA is supported on the wire per the Fabrics specification,
+ +		 * but the HBA/HCA will do the remapping from the separate
+ +		 * metadata buffers for us.
+ +		 */
+ +		if (id->flbas & NVME_NS_FLBAS_META_EXT) {
+ +			ns->features |= NVME_NS_EXT_LBAS;
+ +			if ((ctrl->ops->flags & NVME_F_FABRICS) &&
+ +			    (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED) &&
+ +			    ctrl->max_integrity_segments)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		} else {
+ +			if (WARN_ON_ONCE(ctrl->ops->flags & NVME_F_FABRICS))
+ +				return -EINVAL;
+ +			if (ctrl->ops->flags & NVME_F_METADATA_SUPPORTED)
+ +				ns->features |= NVME_NS_METADATA_SUPPORTED;
+ +		}
+  	}
+  
+ -	ret = nvme_configure_metadata(ns, id);
+ -	if (ret)
+ -		goto out_unfreeze;
+  	nvme_set_chunk_sectors(ns, id);
+++<<<<<<< HEAD
+ +	nvme_update_disk_info(disk, ns, id);
+++=======
++ 	nvme_update_disk_info(ns->disk, ns, id);
++ 	blk_mq_unfreeze_queue(ns->disk->queue);
++ 
++ 	if (blk_queue_is_zoned(ns->queue)) {
++ 		ret = nvme_revalidate_zones(ns);
++ 		if (ret && !nvme_first_scan(ns->disk))
++ 			return ret;
++ 	}
++ 
+++>>>>>>> 8685699c28d7 (nvme: ignore zone validate errors on subsequent scans)
+  #ifdef CONFIG_NVME_MULTIPATH
+  	if (ns->head->disk) {
+ -		blk_mq_freeze_queue(ns->head->disk->queue);
+  		nvme_update_disk_info(ns->head->disk, ns, id);
+ -		blk_stack_limits(&ns->head->disk->queue->limits,
+ -				 &ns->queue->limits, 0);
+ -		blk_queue_update_readahead(ns->head->disk->queue);
+ -		nvme_update_bdev_size(ns->head->disk);
+ -		blk_mq_unfreeze_queue(ns->head->disk->queue);
+ +		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
+ +		nvme_mpath_update_disk_size(ns->head->disk);
+  	}
+  #endif
+  	return 0;
+* Unmerged path drivers/nvme/host/core.c
