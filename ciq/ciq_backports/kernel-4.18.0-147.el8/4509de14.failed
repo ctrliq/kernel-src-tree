@@ -1,0 +1,1144 @@
+net/tls: Move protocol constants from cipher context to tls context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: Move protocol constants from cipher context to tls context (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 96.92%
+commit-author Vakul Garg <vakul.garg@nxp.com>
+commit 4509de14680084141d3514c3b87bd9d070fc366d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4509de14.failed
+
+Each tls context maintains two cipher contexts (one each for tx and rx
+directions). For each tls session, the constants such as protocol
+version, ciphersuite, iv size, associated data size etc are same for
+both the directions and need to be stored only once per tls context.
+Hence these are moved from 'struct cipher_context' to 'struct
+tls_prot_info' and stored only once in 'struct tls_context'.
+
+	Signed-off-by: Vakul Garg <vakul.garg@nxp.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4509de14680084141d3514c3b87bd9d070fc366d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/tls.h
+#	net/tls/tls_device.c
+#	net/tls/tls_sw.c
+diff --cc include/net/tls.h
+index d1f6db15d1de,a8b37226a287..000000000000
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@@ -188,35 -199,33 +188,47 @@@ enum 
+  };
+  
+  struct cipher_context {
+- 	u16 prepend_size;
+- 	u16 tag_size;
+- 	u16 overhead_size;
+- 	u16 iv_size;
+  	char *iv;
+- 	u16 rec_seq_size;
+  	char *rec_seq;
+++<<<<<<< HEAD
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+++=======
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  };
+  
+ +/* Note: this sizeof(struct tls12_crypto_info_aes_gcm_128) + 32 at rhel8 GA */
+ +#define RH_KABI_TLS_CRYPT_CONTEXT_SIZE		72
+ +
+  union tls_crypto_context {
+  	struct tls_crypto_info info;
+ -	union {
+ -		struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ -		struct tls12_crypto_info_aes_gcm_256 aes_gcm_256;
+ -	};
+ +	struct tls12_crypto_info_aes_gcm_128 aes_gcm_128;
+ +
+ +	/* RHEL: new alternative ciphers must be added under KABI_EXTEND(),
+ +	 * build time checks in tls_register() will ensure tls_crypto_context
+ +	 * does not exceed the padding storage
+ +	 */
+ +	char rh_kabi_padding[RH_KABI_TLS_CRYPT_CONTEXT_SIZE];
+  };
+  
++ struct tls_prot_info {
++ 	u16 version;
++ 	u16 cipher_type;
++ 	u16 prepend_size;
++ 	u16 tag_size;
++ 	u16 overhead_size;
++ 	u16 iv_size;
++ 	u16 rec_seq_size;
++ 	u16 aad_size;
++ 	u16 tail_size;
++ };
++ 
+  struct tls_context {
++ 	struct tls_prot_info prot_info;
++ 
+  	union tls_crypto_context crypto_send;
+  	union tls_crypto_context crypto_recv;
+  
+@@@ -399,23 -408,45 +411,52 @@@ static inline bool tls_bigint_increment
+  	return (i == -1);
+  }
+  
++ static inline struct tls_context *tls_get_ctx(const struct sock *sk)
++ {
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	return icsk->icsk_ulp_data;
++ }
++ 
+  static inline void tls_advance_record_sn(struct sock *sk,
+ -					 struct cipher_context *ctx,
+ -					 int version)
+ +					 struct cipher_context *ctx)
+  {
+- 	if (tls_bigint_increment(ctx->rec_seq, ctx->rec_seq_size))
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
++ 
++ 	if (tls_bigint_increment(ctx->rec_seq, prot->rec_seq_size))
+  		tls_err_abort(sk, EBADMSG);
+++<<<<<<< HEAD
+ +	tls_bigint_increment(ctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
+ +			     ctx->iv_size);
+++=======
++ 
++ 	if (version != TLS_1_3_VERSION) {
++ 		tls_bigint_increment(ctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
++ 				     prot->iv_size);
++ 	}
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  }
+  
+  static inline void tls_fill_prepend(struct tls_context *ctx,
+  			     char *buf,
+  			     size_t plaintext_len,
+ -			     unsigned char record_type,
+ -			     int version)
+ +			     unsigned char record_type)
+  {
+- 	size_t pkt_len, iv_size = ctx->tx.iv_size;
++ 	struct tls_prot_info *prot = &ctx->prot_info;
++ 	size_t pkt_len, iv_size = prot->iv_size;
+  
+++<<<<<<< HEAD
+ +	pkt_len = plaintext_len + iv_size + ctx->tx.tag_size;
+++=======
++ 	pkt_len = plaintext_len + prot->tag_size;
++ 	if (version != TLS_1_3_VERSION) {
++ 		pkt_len += iv_size;
++ 
++ 		memcpy(buf + TLS_NONCE_OFFSET,
++ 		       ctx->tx.iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, iv_size);
++ 	}
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	/* we cover nonce explicit here as well, so buf should be of
+  	 * size KTLS_DTLS_HEADER_SIZE + KTLS_DTLS_NONCE_EXPLICIT_SIZE
+@@@ -434,23 -465,34 +475,17 @@@ static inline void tls_make_aad(char *b
+  				size_t size,
+  				char *record_sequence,
+  				int record_sequence_size,
+ -				unsigned char record_type,
+ -				int version)
+ +				unsigned char record_type)
+  {
+ -	if (version != TLS_1_3_VERSION) {
+ -		memcpy(buf, record_sequence, record_sequence_size);
+ -		buf += 8;
+ -	} else {
+ -		size += TLS_CIPHER_AES_GCM_128_TAG_SIZE;
+ -	}
+ +	memcpy(buf, record_sequence, record_sequence_size);
+  
+ -	buf[0] = version == TLS_1_3_VERSION ?
+ -		  TLS_RECORD_TYPE_DATA : record_type;
+ -	buf[1] = TLS_1_2_VERSION_MAJOR;
+ -	buf[2] = TLS_1_2_VERSION_MINOR;
+ -	buf[3] = size >> 8;
+ -	buf[4] = size & 0xFF;
+ -}
+ -
+ -static inline void xor_iv_with_seq(int version, char *iv, char *seq)
+ -{
+ -	int i;
+ -
+ -	if (version == TLS_1_3_VERSION) {
+ -		for (i = 0; i < 8; i++)
+ -			iv[i + 4] ^= seq[i];
+ -	}
+ +	buf[8] = record_type;
+ +	buf[9] = TLS_1_2_VERSION_MAJOR;
+ +	buf[10] = TLS_1_2_VERSION_MINOR;
+ +	buf[11] = size >> 8;
+ +	buf[12] = size & 0xFF;
+  }
+  
+- static inline struct tls_context *tls_get_ctx(const struct sock *sk)
+- {
+- 	struct inet_connection_sock *icsk = inet_csk(sk);
+- 
+- 	return icsk->icsk_ulp_data;
+- }
+  
+  static inline struct tls_sw_context_rx *tls_sw_ctx_rx(
+  		const struct tls_context *tls_ctx)
+diff --cc net/tls/tls_device.c
+index 12733b7f423c,a5c17c47d08a..000000000000
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@@ -256,8 -257,9 +257,14 @@@ static int tls_push_record(struct sock 
+  	frag = &record->frags[0];
+  	tls_fill_prepend(ctx,
+  			 skb_frag_address(frag),
+++<<<<<<< HEAD
+ +			 record->len - ctx->tx.prepend_size,
+ +			 record_type);
+++=======
++ 			 record->len - prot->prepend_size,
++ 			 record_type,
++ 			 ctx->crypto_send.info.version);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	/* HW doesn't care about the data in the tag, because it fills it. */
+  	dummy_tag_frag.page = skb_frag_page(frag);
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,71be8acfbc9b..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -119,12 -120,42 +119,44 @@@ static int skb_nsg(struct sk_buff *skb
+          return __skb_nsg(skb, offset, len, 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int padding_length(struct tls_sw_context_rx *ctx,
++ 			  struct tls_context *tls_ctx, struct sk_buff *skb)
++ {
++ 	struct strp_msg *rxm = strp_msg(skb);
++ 	int sub = 0;
++ 
++ 	/* Determine zero-padding length */
++ 	if (tls_ctx->prot_info.version == TLS_1_3_VERSION) {
++ 		char content_type = 0;
++ 		int err;
++ 		int back = 17;
++ 
++ 		while (content_type == 0) {
++ 			if (back > rxm->full_len)
++ 				return -EBADMSG;
++ 			err = skb_copy_bits(skb,
++ 					    rxm->offset + rxm->full_len - back,
++ 					    &content_type, 1);
++ 			if (content_type)
++ 				break;
++ 			sub++;
++ 			back++;
++ 		}
++ 		ctx->control = content_type;
++ 	}
++ 	return sub;
++ }
++ 
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  static void tls_decrypt_done(struct crypto_async_request *req, int err)
+  {
+  	struct aead_request *aead_req = (struct aead_request *)req;
+  	struct scatterlist *sgout = aead_req->dst;
+ -	struct scatterlist *sgin = aead_req->src;
+  	struct tls_sw_context_rx *ctx;
+  	struct tls_context *tls_ctx;
++ 	struct tls_prot_info *prot;
+  	struct scatterlist *sg;
+  	struct sk_buff *skb;
+  	unsigned int pages;
+@@@ -133,12 -164,17 +165,24 @@@
+  	skb = (struct sk_buff *)req->data;
+  	tls_ctx = tls_get_ctx(skb->sk);
+  	ctx = tls_sw_ctx_rx(tls_ctx);
+++<<<<<<< HEAD
+ +	pending = atomic_dec_return(&ctx->decrypt_pending);
+++=======
++ 	prot = &tls_ctx->prot_info;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	/* Propagate if there was an err */
+  	if (err) {
+  		ctx->async_wait.err = err;
+  		tls_err_abort(skb->sk, err);
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		struct strp_msg *rxm = strp_msg(skb);
++ 		rxm->full_len -= padding_length(ctx, tls_ctx, skb);
++ 		rxm->offset += prot->prepend_size;
++ 		rxm->full_len -= prot->overhead_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	}
+  
+  	/* After using skb->sk to propagate sk through crypto async callback
+@@@ -176,9 -216,9 +221,13 @@@ static int tls_do_decryption(struct soc
+  	int ret;
+  
+  	aead_request_set_tfm(aead_req, ctx->aead_recv);
+++<<<<<<< HEAD
+ +	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
+++=======
++ 	aead_request_set_ad(aead_req, prot->aad_size);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	aead_request_set_crypt(aead_req, sgin, sgout,
+- 			       data_len + tls_ctx->rx.tag_size,
++ 			       data_len + prot->tag_size,
+  			       (u8 *)iv_recv);
+  
+  	if (async) {
+@@@ -213,153 -253,90 +262,202 @@@
+  	return ret;
+  }
+  
+ -static void tls_trim_both_msgs(struct sock *sk, int target_size)
+ +static void trim_sg(struct sock *sk, struct scatterlist *sg,
+ +		    int *sg_num_elem, unsigned int *sg_size, int target_size)
+ +{
+ +	int i = *sg_num_elem - 1;
+ +	int trim = *sg_size - target_size;
+ +
+ +	if (trim <= 0) {
+ +		WARN_ON(trim < 0);
+ +		return;
+ +	}
+ +
+ +	*sg_size = target_size;
+ +	while (trim >= sg[i].length) {
+ +		trim -= sg[i].length;
+ +		sk_mem_uncharge(sk, sg[i].length);
+ +		put_page(sg_page(&sg[i]));
+ +		i--;
+ +
+ +		if (i < 0)
+ +			goto out;
+ +	}
+ +
+ +	sg[i].length -= trim;
+ +	sk_mem_uncharge(sk, trim);
+ +
+ +out:
+ +	*sg_num_elem = i + 1;
+ +}
+ +
+ +static void trim_both_sgl(struct sock *sk, int target_size)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+  
+ -	sk_msg_trim(sk, &rec->msg_plaintext, target_size);
+ +	trim_sg(sk, &rec->sg_plaintext_data[1],
+ +		&rec->sg_plaintext_num_elem,
+ +		&rec->sg_plaintext_size,
+ +		target_size);
+ +
+  	if (target_size > 0)
+++<<<<<<< HEAD
+ +		target_size += tls_ctx->tx.overhead_size;
+ +
+ +	trim_sg(sk, &rec->sg_encrypted_data[1],
+ +		&rec->sg_encrypted_num_elem,
+ +		&rec->sg_encrypted_size,
+ +		target_size);
+++=======
++ 		target_size += prot->overhead_size;
++ 	sk_msg_trim(sk, &rec->msg_encrypted, target_size);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  }
+  
+ -static int tls_alloc_encrypted_msg(struct sock *sk, int len)
+ +static int alloc_encrypted_sg(struct sock *sk, int len)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ +	int rc = 0;
+ +
+ +	rc = sk_alloc_sg(sk, len,
+ +			 &rec->sg_encrypted_data[1], 0,
+ +			 &rec->sg_encrypted_num_elem,
+ +			 &rec->sg_encrypted_size, 0);
+  
+ -	return sk_msg_alloc(sk, msg_en, len, 0);
+ +	if (rc == -ENOSPC)
+ +		rec->sg_encrypted_num_elem =
+ +			ARRAY_SIZE(rec->sg_encrypted_data) - 1;
+ +
+ +	return rc;
+  }
+  
+ -static int tls_clone_plaintext_msg(struct sock *sk, int required)
+ +static int move_to_plaintext_sg(struct sock *sk, int required_size)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_pl = &rec->msg_plaintext;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ +	struct scatterlist *plain_sg = &rec->sg_plaintext_data[1];
+ +	struct scatterlist *enc_sg = &rec->sg_encrypted_data[1];
+ +	int enc_sg_idx = 0;
+  	int skip, len;
+  
+ -	/* We add page references worth len bytes from encrypted sg
+ -	 * at the end of plaintext sg. It is guaranteed that msg_en
+ +	if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +		return -ENOSPC;
+ +
+ +	/* We add page references worth len bytes from enc_sg at the
+ +	 * end of plain_sg. It is guaranteed that sg_encrypted_data
+  	 * has enough required room (ensured by caller).
+  	 */
+ -	len = required - msg_pl->sg.size;
+ +	len = required_size - rec->sg_plaintext_size;
+  
+ -	/* Skip initial bytes in msg_en's data to be able to use
+ -	 * same offset of both plain and encrypted data.
+ +	/* Skip initial bytes in sg_encrypted_data to be able
+ +	 * to use same offset of both plain and encrypted data.
+  	 */
+++<<<<<<< HEAD
+ +	skip = tls_ctx->tx.prepend_size + rec->sg_plaintext_size;
+++=======
++ 	skip = prot->prepend_size + msg_pl->sg.size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+ -	return sk_msg_clone(sk, msg_pl, msg_en, skip, len);
+ +	while (enc_sg_idx < rec->sg_encrypted_num_elem) {
+ +		if (enc_sg[enc_sg_idx].length > skip)
+ +			break;
+ +
+ +		skip -= enc_sg[enc_sg_idx].length;
+ +		enc_sg_idx++;
+ +	}
+ +
+ +	/* unmark the end of plain_sg*/
+ +	sg_unmark_end(plain_sg + rec->sg_plaintext_num_elem - 1);
+ +
+ +	while (len) {
+ +		struct page *page = sg_page(&enc_sg[enc_sg_idx]);
+ +		int bytes = enc_sg[enc_sg_idx].length - skip;
+ +		int offset = enc_sg[enc_sg_idx].offset + skip;
+ +
+ +		if (bytes > len)
+ +			bytes = len;
+ +		else
+ +			enc_sg_idx++;
+ +
+ +		/* Skipping is required only one time */
+ +		skip = 0;
+ +
+ +		/* Increment page reference */
+ +		get_page(page);
+ +
+ +		sg_set_page(&plain_sg[rec->sg_plaintext_num_elem], page,
+ +			    bytes, offset);
+ +
+ +		sk_mem_charge(sk, bytes);
+ +
+ +		len -= bytes;
+ +		rec->sg_plaintext_size += bytes;
+ +
+ +		rec->sg_plaintext_num_elem++;
+ +
+ +		if (rec->sg_plaintext_num_elem == MAX_SKB_FRAGS)
+ +			return -ENOSPC;
+ +	}
+ +
+ +	return 0;
+  }
+  
+ -static struct tls_rec *tls_get_rec(struct sock *sk)
+ +static void free_sg(struct sock *sk, struct scatterlist *sg,
+ +		    int *sg_num_elem, unsigned int *sg_size)
+  {
+++<<<<<<< HEAD
+ +	int i, n = *sg_num_elem;
+ +
+ +	for (i = 0; i < n; ++i) {
+ +		sk_mem_uncharge(sk, sg[i].length);
+ +		put_page(sg_page(&sg[i]));
+ +	}
+ +	*sg_num_elem = 0;
+ +	*sg_size = 0;
+++=======
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct sk_msg *msg_pl, *msg_en;
++ 	struct tls_rec *rec;
++ 	int mem_size;
++ 
++ 	mem_size = sizeof(struct tls_rec) + crypto_aead_reqsize(ctx->aead_send);
++ 
++ 	rec = kzalloc(mem_size, sk->sk_allocation);
++ 	if (!rec)
++ 		return NULL;
++ 
++ 	msg_pl = &rec->msg_plaintext;
++ 	msg_en = &rec->msg_encrypted;
++ 
++ 	sk_msg_init(msg_pl);
++ 	sk_msg_init(msg_en);
++ 
++ 	sg_init_table(rec->sg_aead_in, 2);
++ 	sg_set_buf(&rec->sg_aead_in[0], rec->aad_space, prot->aad_size);
++ 	sg_unmark_end(&rec->sg_aead_in[1]);
++ 
++ 	sg_init_table(rec->sg_aead_out, 2);
++ 	sg_set_buf(&rec->sg_aead_out[0], rec->aad_space, prot->aad_size);
++ 	sg_unmark_end(&rec->sg_aead_out[1]);
++ 
++ 	return rec;
++ }
++ 
++ static void tls_free_rec(struct sock *sk, struct tls_rec *rec)
++ {
++ 	sk_msg_free(sk, &rec->msg_encrypted);
++ 	sk_msg_free(sk, &rec->msg_plaintext);
++ 	kfree(rec);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  }
+  
+  static void tls_free_open_rec(struct sock *sk)
+@@@ -450,16 -415,20 +548,23 @@@ static void tls_encrypt_done(struct cry
+  	struct aead_request *aead_req = (struct aead_request *)req;
+  	struct sock *sk = req->data;
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ -	struct scatterlist *sge;
+ -	struct sk_msg *msg_en;
+  	struct tls_rec *rec;
+  	bool ready = false;
+  	int pending;
+  
+  	rec = container_of(aead_req, struct tls_rec, aead_req);
+ -	msg_en = &rec->msg_encrypted;
+  
+++<<<<<<< HEAD
+ +	rec->sg_encrypted_data[1].offset -= tls_ctx->tx.prepend_size;
+ +	rec->sg_encrypted_data[1].length += tls_ctx->tx.prepend_size;
+ +
+++=======
++ 	sge = sk_msg_elem(msg_en, msg_en->sg.curr);
++ 	sge->offset -= prot->prepend_size;
++ 	sge->length += prot->prepend_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	/* Check if error is previously set on socket */
+  	if (err || sk->sk_err) {
+@@@ -504,25 -473,28 +609,43 @@@ static int tls_do_encryption(struct soc
+  			     struct tls_context *tls_ctx,
+  			     struct tls_sw_context_tx *ctx,
+  			     struct aead_request *aead_req,
+ -			     size_t data_len, u32 start)
+ +			     size_t data_len)
+  {
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_rec *rec = ctx->open_rec;
+ -	struct sk_msg *msg_en = &rec->msg_encrypted;
+ -	struct scatterlist *sge = sk_msg_elem(msg_en, start);
+ +	struct scatterlist *plain_sg = rec->sg_plaintext_data;
+ +	struct scatterlist *enc_sg = rec->sg_encrypted_data;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	/* Skip the first index as it contains AAD data */
+ +	rec->sg_encrypted_data[1].offset += tls_ctx->tx.prepend_size;
+ +	rec->sg_encrypted_data[1].length -= tls_ctx->tx.prepend_size;
+ +
+ +	/* If it is inplace crypto, then pass same SG list as both src, dst */
+ +	if (rec->inplace_crypto)
+ +		plain_sg = enc_sg;
+ +
+ +	aead_request_set_tfm(aead_req, ctx->aead_send);
+ +	aead_request_set_ad(aead_req, TLS_AAD_SPACE_SIZE);
+ +	aead_request_set_crypt(aead_req, plain_sg, enc_sg,
+ +			       data_len, tls_ctx->tx.iv);
+++=======
++ 	memcpy(rec->iv_data, tls_ctx->tx.iv, sizeof(rec->iv_data));
++ 	xor_iv_with_seq(prot->version, rec->iv_data,
++ 			tls_ctx->tx.rec_seq);
++ 
++ 	sge->offset += prot->prepend_size;
++ 	sge->length -= prot->prepend_size;
++ 
++ 	msg_en->sg.curr = start;
++ 
++ 	aead_request_set_tfm(aead_req, ctx->aead_send);
++ 	aead_request_set_ad(aead_req, prot->aad_size);
++ 	aead_request_set_crypt(aead_req, rec->sg_aead_in,
++ 			       rec->sg_aead_out,
++ 			       data_len, rec->iv_data);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	aead_request_set_callback(aead_req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+  				  tls_encrypt_done, sk);
+@@@ -534,8 -506,8 +657,13 @@@
+  	rc = crypto_aead_encrypt(aead_req);
+  	if (!rc || rc != -EINPROGRESS) {
+  		atomic_dec(&ctx->encrypt_pending);
+++<<<<<<< HEAD
+ +		rec->sg_encrypted_data[1].offset -= tls_ctx->tx.prepend_size;
+ +		rec->sg_encrypted_data[1].length += tls_ctx->tx.prepend_size;
+++=======
++ 		sge->offset -= prot->prepend_size;
++ 		sge->length += prot->prepend_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	}
+  
+  	if (!rc) {
+@@@ -547,7 -519,7 +675,11 @@@
+  
+  	/* Unhook the record from context if encryption is not failure */
+  	ctx->open_rec = NULL;
+++<<<<<<< HEAD
+ +	tls_advance_record_sn(sk, &tls_ctx->tx);
+++=======
++ 	tls_advance_record_sn(sk, &tls_ctx->tx, prot->version);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	return rc;
+  }
+  
+@@@ -555,38 -645,91 +687,105 @@@ static int tls_push_record(struct sock 
+  			   unsigned char record_type)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ -	struct tls_rec *rec = ctx->open_rec, *tmp = NULL;
+ -	u32 i, split_point, uninitialized_var(orig_end);
+ -	struct sk_msg *msg_pl, *msg_en;
+ +	struct tls_rec *rec = ctx->open_rec;
+  	struct aead_request *req;
+ -	bool split;
+  	int rc;
+  
+  	if (!rec)
+  		return 0;
+  
+++<<<<<<< HEAD
+++=======
++ 	msg_pl = &rec->msg_plaintext;
++ 	msg_en = &rec->msg_encrypted;
++ 
++ 	split_point = msg_pl->apply_bytes;
++ 	split = split_point && split_point < msg_pl->sg.size;
++ 	if (split) {
++ 		rc = tls_split_open_record(sk, rec, &tmp, msg_pl, msg_en,
++ 					   split_point, prot->overhead_size,
++ 					   &orig_end);
++ 		if (rc < 0)
++ 			return rc;
++ 		sk_msg_trim(sk, msg_en, msg_pl->sg.size +
++ 			    prot->overhead_size);
++ 	}
++ 
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	rec->tx_flags = flags;
+  	req = &rec->aead_req;
+  
+ -	i = msg_pl->sg.end;
+ -	sk_msg_iter_var_prev(i);
+ +	sg_mark_end(rec->sg_plaintext_data + rec->sg_plaintext_num_elem);
+ +	sg_mark_end(rec->sg_encrypted_data + rec->sg_encrypted_num_elem);
+ +
+++<<<<<<< HEAD
+ +	tls_make_aad(rec->aad_space, rec->sg_plaintext_size,
+ +		     tls_ctx->tx.rec_seq, tls_ctx->tx.rec_seq_size,
+ +		     record_type);
+  
+ +	tls_fill_prepend(tls_ctx,
+ +			 page_address(sg_page(&rec->sg_encrypted_data[1])) +
+ +			 rec->sg_encrypted_data[1].offset,
+ +			 rec->sg_plaintext_size, record_type);
+++=======
++ 	rec->content_type = record_type;
++ 	if (prot->version == TLS_1_3_VERSION) {
++ 		/* Add content type to end of message.  No padding added */
++ 		sg_set_buf(&rec->sg_content_type, &rec->content_type, 1);
++ 		sg_mark_end(&rec->sg_content_type);
++ 		sg_chain(msg_pl->sg.data, msg_pl->sg.end + 1,
++ 			 &rec->sg_content_type);
++ 	} else {
++ 		sg_mark_end(sk_msg_elem(msg_pl, i));
++ 	}
++ 
++ 	i = msg_pl->sg.start;
++ 	sg_chain(rec->sg_aead_in, 2, rec->inplace_crypto ?
++ 		 &msg_en->sg.data[i] : &msg_pl->sg.data[i]);
++ 
++ 	i = msg_en->sg.end;
++ 	sk_msg_iter_var_prev(i);
++ 	sg_mark_end(sk_msg_elem(msg_en, i));
++ 
++ 	i = msg_en->sg.start;
++ 	sg_chain(rec->sg_aead_out, 2, &msg_en->sg.data[i]);
++ 
++ 	tls_make_aad(rec->aad_space, msg_pl->sg.size + prot->tail_size,
++ 		     tls_ctx->tx.rec_seq, prot->rec_seq_size,
++ 		     record_type, prot->version);
++ 
++ 	tls_fill_prepend(tls_ctx,
++ 			 page_address(sg_page(&msg_en->sg.data[i])) +
++ 			 msg_en->sg.data[i].offset,
++ 			 msg_pl->sg.size + prot->tail_size,
++ 			 record_type, prot->version);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+ -	tls_ctx->pending_open_record_frags = false;
+ +	tls_ctx->pending_open_record_frags = 0;
+  
+ +	rc = tls_do_encryption(sk, tls_ctx, ctx, req, rec->sg_plaintext_size);
+ +	if (rc == -EINPROGRESS)
+ +		return -EINPROGRESS;
+ +
+++<<<<<<< HEAD
+++=======
++ 	rc = tls_do_encryption(sk, tls_ctx, ctx, req,
++ 			       msg_pl->sg.size + prot->tail_size, i);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	if (rc < 0) {
+ -		if (rc != -EINPROGRESS) {
+ -			tls_err_abort(sk, EBADMSG);
+ -			if (split) {
+ -				tls_ctx->pending_open_record_frags = true;
+ -				tls_merge_open_record(sk, rec, tmp, orig_end);
+ -			}
+ -		}
+ -		ctx->async_capable = 1;
+ +		tls_err_abort(sk, EBADMSG);
+  		return rc;
+++<<<<<<< HEAD
+++=======
++ 	} else if (split) {
++ 		msg_pl = &tmp->msg_plaintext;
++ 		msg_en = &tmp->msg_encrypted;
++ 		sk_msg_trim(sk, msg_en, msg_pl->sg.size + prot->overhead_size);
++ 		tls_ctx->pending_open_record_frags = true;
++ 		ctx->open_rec = tmp;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	}
+  
+  	return tls_tx_records(sk, flags);
+@@@ -728,13 -862,14 +927,14 @@@ int tls_sw_sendmsg(struct sock *sk, str
+  {
+  	long timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+ -	bool async_capable = ctx->async_capable;
+ +	struct crypto_tfm *tfm = crypto_aead_tfm(ctx->aead_send);
+ +	bool async_capable = tfm->__crt_alg->cra_flags & CRYPTO_ALG_ASYNC;
+  	unsigned char record_type = TLS_RECORD_TYPE_DATA;
+ -	bool is_kvec = iov_iter_is_kvec(&msg->msg_iter);
+ +	bool is_kvec = msg->msg_iter.type & ITER_KVEC;
+  	bool eor = !(msg->msg_flags & MSG_MORE);
+  	size_t try_to_copy, copied = 0;
+ -	struct sk_msg *msg_pl, *msg_en;
+  	struct tls_rec *rec;
+  	int required_size;
+  	int num_async = 0;
+@@@ -787,8 -928,8 +987,13 @@@
+  			full_record = true;
+  		}
+  
+++<<<<<<< HEAD
+ +		required_size = rec->sg_plaintext_size + try_to_copy +
+ +				tls_ctx->tx.overhead_size;
+++=======
++ 		required_size = msg_pl->sg.size + try_to_copy +
++ 				prot->overhead_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  		if (!sk_stream_memory_free(sk))
+  			goto wait_for_sndbuf;
+@@@ -848,23 -996,28 +1053,28 @@@ fallback_to_reg_send
+  			 * actually allocated. The difference is due
+  			 * to max sg elements limit
+  			 */
+ -			try_to_copy -= required_size - msg_pl->sg.size;
+ +			try_to_copy -= required_size - rec->sg_plaintext_size;
+  			full_record = true;
+++<<<<<<< HEAD
+ +
+ +			trim_sg(sk, &rec->sg_encrypted_data[1],
+ +				&rec->sg_encrypted_num_elem,
+ +				&rec->sg_encrypted_size,
+ +				rec->sg_plaintext_size +
+ +				tls_ctx->tx.overhead_size);
+++=======
++ 			sk_msg_trim(sk, msg_en,
++ 				    msg_pl->sg.size + prot->overhead_size);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  		}
+  
+ -		if (try_to_copy) {
+ -			ret = sk_msg_memcopy_from_iter(sk, &msg->msg_iter,
+ -						       msg_pl, try_to_copy);
+ -			if (ret < 0)
+ -				goto trim_sgl;
+ -		}
+ +		ret = memcopy_from_iter(sk, &msg->msg_iter, try_to_copy);
+ +		if (ret)
+ +			goto trim_sgl;
+  
+ -		/* Open records defined only if successfully copied, otherwise
+ -		 * we would trim the sg but not reset the open record frags.
+ -		 */
+ -		tls_ctx->pending_open_record_frags = true;
+  		copied += try_to_copy;
+  		if (full_record || eor) {
+ -			ret = bpf_exec_tx_verdict(msg_pl, sk, full_record,
+ -						  record_type, &copied,
+ -						  msg->msg_flags);
+ +			ret = tls_push_record(sk, msg->msg_flags, record_type);
+  			if (ret) {
+  				if (ret == -EINPROGRESS)
+  					num_async++;
+@@@ -927,11 -1085,12 +1137,12 @@@ int tls_sw_sendpage(struct sock *sk, st
+  	long timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	unsigned char record_type = TLS_RECORD_TYPE_DATA;
+ -	struct sk_msg *msg_pl;
+ +	size_t orig_size = size;
+ +	struct scatterlist *sg;
+  	struct tls_rec *rec;
+  	int num_async = 0;
+ -	size_t copied = 0;
+  	bool full_record;
+  	int record_room;
+  	int ret = 0;
+@@@ -977,8 -1134,8 +1188,13 @@@
+  			copy = record_room;
+  			full_record = true;
+  		}
+++<<<<<<< HEAD
+ +		required_size = rec->sg_plaintext_size + copy +
+ +			      tls_ctx->tx.overhead_size;
+++=======
++ 
++ 		required_size = msg_pl->sg.size + copy + prot->overhead_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  		if (!sk_stream_memory_free(sk))
+  			goto wait_for_sndbuf;
+@@@ -1114,7 -1342,8 +1331,12 @@@ static int decrypt_internal(struct soc
+  	u8 *aad, *iv, *mem = NULL;
+  	struct scatterlist *sgin = NULL;
+  	struct scatterlist *sgout = NULL;
+++<<<<<<< HEAD
+ +	const int data_len = rxm->full_len - tls_ctx->rx.overhead_size;
+++=======
++ 	const int data_len = rxm->full_len - prot->overhead_size +
++ 			     prot->tail_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	if (*zc && (out_iov || out_sg)) {
+  		if (out_iov)
+@@@ -1139,7 -1368,7 +1361,11 @@@
+  
+  	aead_size = sizeof(*aead_req) + crypto_aead_reqsize(ctx->aead_recv);
+  	mem_size = aead_size + (nsg * sizeof(struct scatterlist));
+++<<<<<<< HEAD
+ +	mem_size = mem_size + TLS_AAD_SPACE_SIZE;
+++=======
++ 	mem_size = mem_size + prot->aad_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	mem_size = mem_size + crypto_aead_ivsize(ctx->aead_recv);
+  
+  	/* Allocate a single block of memory which contains
+@@@ -1155,7 -1384,7 +1381,11 @@@
+  	sgin = (struct scatterlist *)(mem + aead_size);
+  	sgout = sgin + n_sgin;
+  	aad = (u8 *)(sgout + n_sgout);
+++<<<<<<< HEAD
+ +	iv = aad + TLS_AAD_SPACE_SIZE;
+++=======
++ 	iv = aad + prot->aad_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  	/* Prepare IV */
+  	err = skb_copy_bits(skb, rxm->offset + TLS_HEADER_SIZE,
+@@@ -1165,19 -1394,25 +1395,38 @@@
+  		kfree(mem);
+  		return err;
+  	}
+++<<<<<<< HEAD
+ +	memcpy(iv, tls_ctx->rx.iv, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+ +
+ +	/* Prepare AAD */
+ +	tls_make_aad(aad, rxm->full_len - tls_ctx->rx.overhead_size,
+ +		     tls_ctx->rx.rec_seq, tls_ctx->rx.rec_seq_size,
+ +		     ctx->control);
+ +
+ +	/* Prepare sgin */
+ +	sg_init_table(sgin, n_sgin);
+ +	sg_set_buf(&sgin[0], aad, TLS_AAD_SPACE_SIZE);
+++=======
++ 	if (prot->version == TLS_1_3_VERSION)
++ 		memcpy(iv, tls_ctx->rx.iv, crypto_aead_ivsize(ctx->aead_recv));
++ 	else
++ 		memcpy(iv, tls_ctx->rx.iv, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
++ 
++ 	xor_iv_with_seq(prot->version, iv, tls_ctx->rx.rec_seq);
++ 
++ 	/* Prepare AAD */
++ 	tls_make_aad(aad, rxm->full_len - prot->overhead_size +
++ 		     prot->tail_size,
++ 		     tls_ctx->rx.rec_seq, prot->rec_seq_size,
++ 		     ctx->control, prot->version);
++ 
++ 	/* Prepare sgin */
++ 	sg_init_table(sgin, n_sgin);
++ 	sg_set_buf(&sgin[0], aad, prot->aad_size);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	err = skb_to_sgvec(skb, &sgin[1],
+- 			   rxm->offset + tls_ctx->rx.prepend_size,
+- 			   rxm->full_len - tls_ctx->rx.prepend_size);
++ 			   rxm->offset + prot->prepend_size,
++ 			   rxm->full_len - prot->prepend_size);
+  	if (err < 0) {
+  		kfree(mem);
+  		return err;
+@@@ -1186,12 -1421,12 +1435,16 @@@
+  	if (n_sgout) {
+  		if (out_iov) {
+  			sg_init_table(sgout, n_sgout);
+++<<<<<<< HEAD
+ +			sg_set_buf(&sgout[0], aad, TLS_AAD_SPACE_SIZE);
+++=======
++ 			sg_set_buf(&sgout[0], aad, prot->aad_size);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  
+  			*chunk = 0;
+ -			err = tls_setup_from_iter(sk, out_iov, data_len,
+ -						  &pages, chunk, &sgout[1],
+ -						  (n_sgout - 1));
+ +			err = zerocopy_from_iter(sk, out_iov, data_len, &pages,
+ +						 chunk, &sgout[1],
+ +						 (n_sgout - 1), false);
+  			if (err < 0)
+  				goto fallback_to_reg_recv;
+  		} else if (out_sg) {
+@@@ -1226,6 -1462,8 +1479,11 @@@ static int decrypt_skb_update(struct so
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+++<<<<<<< HEAD
+++=======
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
++ 	int version = prot->version;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	struct strp_msg *rxm = strp_msg(skb);
+  	int err = 0;
+  
+@@@ -1242,6 -1481,14 +1500,17 @@@
+  
+  			return err;
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		rxm->full_len -= padding_length(ctx, tls_ctx, skb);
++ 
++ 		rxm->offset += prot->prepend_size;
++ 		rxm->full_len -= prot->overhead_size;
++ 		tls_advance_record_sn(sk, &tls_ctx->rx, version);
++ 		ctx->decrypted = true;
++ 		ctx->saved_data_ready(sk);
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	} else {
+  		*zc = false;
+  	}
+@@@ -1297,7 -1609,10 +1566,14 @@@ int tls_sw_recvmsg(struct sock *sk
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+++<<<<<<< HEAD
+ +	unsigned char control;
+++=======
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
++ 	struct sk_psock *psock;
++ 	unsigned char control = 0;
++ 	ssize_t decrypted = 0;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	struct strp_msg *rxm;
+  	struct sk_buff *skb;
+  	ssize_t copied = 0;
+@@@ -1327,6 -1671,30 +1603,32 @@@
+  
+  		rxm = strp_msg(skb);
+  
+++<<<<<<< HEAD
+++=======
++ 		to_decrypt = rxm->full_len - prot->overhead_size;
++ 
++ 		if (to_decrypt <= len && !is_kvec && !is_peek &&
++ 		    ctx->control == TLS_RECORD_TYPE_DATA &&
++ 		    prot->version != TLS_1_3_VERSION)
++ 			zc = true;
++ 
++ 		/* Do not use async mode if record is non-data */
++ 		if (ctx->control == TLS_RECORD_TYPE_DATA)
++ 			async = ctx->async_capable;
++ 		else
++ 			async = false;
++ 
++ 		err = decrypt_skb_update(sk, skb, &msg->msg_iter,
++ 					 &chunk, &zc, async);
++ 		if (err < 0 && err != -EINPROGRESS) {
++ 			tls_err_abort(sk, EBADMSG);
++ 			goto recv_end;
++ 		}
++ 
++ 		if (err == -EINPROGRESS)
++ 			num_async++;
++ 
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  		if (!cmsg) {
+  			int cerr;
+  
+@@@ -1526,9 -1907,12 +1829,18 @@@ static int tls_read_size(struct strpars
+  
+  	data_len = ((header[4] & 0xFF) | (header[3] << 8));
+  
+++<<<<<<< HEAD
+ +	cipher_overhead = tls_ctx->rx.tag_size + tls_ctx->rx.iv_size;
+ +
+ +	if (data_len > TLS_MAX_PAYLOAD_SIZE + cipher_overhead) {
+++=======
++ 	cipher_overhead = prot->tag_size;
++ 	if (prot->version != TLS_1_3_VERSION)
++ 		cipher_overhead += prot->iv_size;
++ 
++ 	if (data_len > TLS_MAX_PAYLOAD_SIZE + cipher_overhead +
++ 	    prot->tail_size) {
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  		ret = -EMSGSIZE;
+  		goto read_failure;
+  	}
+@@@ -1693,8 -2072,11 +2005,10 @@@ static void tx_work_handler(struct work
+  
+  int tls_set_sw_offload(struct sock *sk, struct tls_context *ctx, int tx)
+  {
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_prot_info *prot = &tls_ctx->prot_info;
+  	struct tls_crypto_info *crypto_info;
+  	struct tls12_crypto_info_aes_gcm_128 *gcm_128_info;
+ -	struct tls12_crypto_info_aes_gcm_256 *gcm_256_info;
+  	struct tls_sw_context_tx *sw_ctx_tx = NULL;
+  	struct tls_sw_context_rx *sw_ctx_rx = NULL;
+  	struct cipher_context *cctx;
+@@@ -1764,19 -2177,32 +2078,38 @@@
+  		goto free_priv;
+  	}
+  
+++<<<<<<< HEAD
+ +	cctx->prepend_size = TLS_HEADER_SIZE + nonce_size;
+ +	cctx->tag_size = tag_size;
+ +	cctx->overhead_size = cctx->prepend_size + cctx->tag_size;
+ +	cctx->iv_size = iv_size;
+++=======
++ 	if (crypto_info->version == TLS_1_3_VERSION) {
++ 		nonce_size = 0;
++ 		prot->aad_size = TLS_HEADER_SIZE;
++ 		prot->tail_size = 1;
++ 	} else {
++ 		prot->aad_size = TLS_AAD_SPACE_SIZE;
++ 		prot->tail_size = 0;
++ 	}
++ 
++ 	prot->version = crypto_info->version;
++ 	prot->cipher_type = crypto_info->cipher_type;
++ 	prot->prepend_size = TLS_HEADER_SIZE + nonce_size;
++ 	prot->tag_size = tag_size;
++ 	prot->overhead_size = prot->prepend_size +
++ 			      prot->tag_size + prot->tail_size;
++ 	prot->iv_size = iv_size;
+++>>>>>>> 4509de146800 (net/tls: Move protocol constants from cipher context to tls context)
+  	cctx->iv = kmalloc(iv_size + TLS_CIPHER_AES_GCM_128_SALT_SIZE,
+  			   GFP_KERNEL);
+  	if (!cctx->iv) {
+  		rc = -ENOMEM;
+  		goto free_priv;
+  	}
+ -	/* Note: 128 & 256 bit salt are the same size */
+ -	memcpy(cctx->iv, salt, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+ +	memcpy(cctx->iv, gcm_128_info->salt, TLS_CIPHER_AES_GCM_128_SALT_SIZE);
+  	memcpy(cctx->iv + TLS_CIPHER_AES_GCM_128_SALT_SIZE, iv, iv_size);
+- 	cctx->rec_seq_size = rec_seq_size;
++ 	prot->rec_seq_size = rec_seq_size;
+  	cctx->rec_seq = kmemdup(rec_seq, rec_seq_size, GFP_KERNEL);
+  	if (!cctx->rec_seq) {
+  		rc = -ENOMEM;
+* Unmerged path include/net/tls.h
+* Unmerged path net/tls/tls_device.c
+diff --git a/net/tls/tls_main.c b/net/tls/tls_main.c
+index a3694e64e12d..ef02474327f3 100644
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@ -402,6 +402,7 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 				  unsigned int optlen, int tx)
+ {
+ 	struct tls_crypto_info *crypto_info;
++	struct tls_crypto_info *alt_crypto_info;
+ 	struct tls_context *ctx = tls_get_ctx(sk);
+ 	int rc = 0;
+ 	int conf;
+@@ -411,10 +412,13 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 		goto out;
+ 	}
+ 
+-	if (tx)
++	if (tx) {
+ 		crypto_info = &ctx->crypto_send.info;
+-	else
++		alt_crypto_info = &ctx->crypto_recv.info;
++	} else {
+ 		crypto_info = &ctx->crypto_recv.info;
++		alt_crypto_info = &ctx->crypto_send.info;
++	}
+ 
+ 	/* Currently we don't support set crypto info more than one time */
+ 	if (TLS_CRYPTO_INFO_READY(crypto_info)) {
+@@ -434,6 +438,15 @@ static int do_tls_setsockopt_conf(struct sock *sk, char __user *optval,
+ 		goto err_crypto_info;
+ 	}
+ 
++	/* Ensure that TLS version and ciphers are same in both directions */
++	if (TLS_CRYPTO_INFO_READY(alt_crypto_info)) {
++		if (alt_crypto_info->version != crypto_info->version ||
++		    alt_crypto_info->cipher_type != crypto_info->cipher_type) {
++			rc = -EINVAL;
++			goto err_crypto_info;
++		}
++	}
++
+ 	switch (crypto_info->cipher_type) {
+ 	case TLS_CIPHER_AES_GCM_128: {
+ 		if (optlen != sizeof(struct tls12_crypto_info_aes_gcm_128)) {
+* Unmerged path net/tls/tls_sw.c
