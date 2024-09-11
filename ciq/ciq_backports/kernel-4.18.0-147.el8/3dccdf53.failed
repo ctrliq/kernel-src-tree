@@ -1,0 +1,120 @@
+scsi: core: avoid preallocating big SGL for data
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [scsi] scsi: core: avoid pre-allocating big SGL for data (Ewan Milne) [1698297]
+Rebuild_FUZZ: 98.97%
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 3dccdf53c2f38399b11085ded4447ce1467f006c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/3dccdf53.failed
+
+scsi_mq_setup_tags() preallocates a big buffer for the IO SGL. The size is
+based on scsi_mq_sgl_size() which is determined based on
+shost->sg_tablesize and SG_CHUNK_SIZE.
+
+Modern DMA engines are often capable of dealing with very big segments so
+the resulting scsi_mq_sgl_size() is often too big. SG_CHUNK_SIZE results in
+a static 4KB SGL allocation per command.
+
+If an HBA has lots of deep queues, preallocation for the sg list can
+consume substantial amounts of memory. For lpfc, nr_hw_queues can be 70
+and each queue's depth 3781. This means the resulting preallocation for
+the data SGL is 70*3781*2K = 517MB.
+
+Switch to runtime allocation for SGL for lists longer than 2 entries. This
+is the approach used by NVMe PCI so it should be reasonable for SCSI as
+well. Runtime SGL allocation has always been the case for the legacy I/O
+path so this is nothing new.
+
+[mkp: attempted to clarify commit desc]
+
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Bart Van Assche <bvanassche@acm.org>
+	Cc: Ewan D. Milne <emilne@redhat.com>
+	Cc: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 3dccdf53c2f38399b11085ded4447ce1467f006c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_lib.c
+diff --cc drivers/scsi/scsi_lib.c
+index 5528cb747bda,45b43e97505c..000000000000
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@@ -39,6 -39,14 +39,17 @@@
+  #include "scsi_priv.h"
+  #include "scsi_logging.h"
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Size of integrity metadata is usually small, 1 inline sg should
++  * cover normal cases.
++  */
++ #define  SCSI_INLINE_PROT_SG_CNT  1
++ 
++ #define  SCSI_INLINE_SG_CNT  2
++ 
+++>>>>>>> 3dccdf53c2f3 (scsi: core: avoid preallocating big SGL for data)
+  static struct kmem_cache *scsi_sdb_cache;
+  static struct kmem_cache *scsi_sense_cache;
+  static struct kmem_cache *scsi_sense_isadma_cache;
+@@@ -556,17 -548,12 +567,22 @@@ static void scsi_uninit_cmd(struct scsi
+  
+  static void scsi_mq_free_sgtables(struct scsi_cmnd *cmd)
+  {
+ +	struct scsi_data_buffer *sdb;
+ +
+  	if (cmd->sdb.table.nents)
+++<<<<<<< HEAD
+ +		sg_free_table_chained(&cmd->sdb.table, true);
+ +	if (cmd->request->next_rq) {
+ +		sdb = cmd->request->next_rq->special;
+ +		if (sdb)
+ +			sg_free_table_chained(&sdb->table, true);
+ +	}
+++=======
++ 		sg_free_table_chained(&cmd->sdb.table,
++ 				SCSI_INLINE_SG_CNT);
+++>>>>>>> 3dccdf53c2f3 (scsi: core: avoid preallocating big SGL for data)
+  	if (scsi_prot_sg_count(cmd))
+ -		sg_free_table_chained(&cmd->prot_sdb->table,
+ -				SCSI_INLINE_PROT_SG_CNT);
+ +		sg_free_table_chained(&cmd->prot_sdb->table, true);
+  }
+  
+  static void scsi_mq_uninit_cmd(struct scsi_cmnd *cmd)
+@@@ -1023,7 -986,8 +1039,12 @@@ static blk_status_t scsi_init_sgtable(s
+  	 * If sg table allocation fails, requeue request later.
+  	 */
+  	if (unlikely(sg_alloc_table_chained(&sdb->table,
+++<<<<<<< HEAD
+ +			blk_rq_nr_phys_segments(req), sdb->table.sgl)))
+++=======
++ 			blk_rq_nr_phys_segments(req), sdb->table.sgl,
++ 			SCSI_INLINE_SG_CNT)))
+++>>>>>>> 3dccdf53c2f3 (scsi: core: avoid preallocating big SGL for data)
+  		return BLK_STS_RESOURCE;
+  
+  	/* 
+@@@ -1892,10 -1831,11 +1913,10 @@@ int scsi_mq_setup_tags(struct Scsi_Hos
+  {
+  	unsigned int cmd_size, sgl_size;
+  
+- 	sgl_size = scsi_mq_sgl_size(shost);
++ 	sgl_size = scsi_mq_inline_sgl_size(shost);
+  	cmd_size = sizeof(struct scsi_cmnd) + shost->hostt->cmd_size + sgl_size;
+  	if (scsi_host_get_prot(shost))
+ -		cmd_size += sizeof(struct scsi_data_buffer) +
+ -			sizeof(struct scatterlist) * SCSI_INLINE_PROT_SG_CNT;
+ +		cmd_size += sizeof(struct scsi_data_buffer) + sgl_size;
+  
+  	memset(&shost->tag_set, 0, sizeof(shost->tag_set));
+  	shost->tag_set.ops = &scsi_mq_ops;
+* Unmerged path drivers/scsi/scsi_lib.c
