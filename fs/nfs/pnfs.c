@@ -1908,12 +1908,6 @@ lookup_again:
 		goto out_unlock;
 	}
 
-	if (!nfs4_valid_open_stateid(ctx->state)) {
-		trace_pnfs_update_layout(ino, pos, count, iomode, lo, lseg,
-				PNFS_UPDATE_LAYOUT_INVALID_OPEN);
-		goto out_unlock;
-	}
-
 	/*
 	 * Choose a stateid for the LAYOUTGET. If we don't have a layout
 	 * stateid, or it has been invalidated, then we must use the open
@@ -1944,6 +1938,7 @@ lookup_again:
 					iomode == IOMODE_RW ? FMODE_WRITE : FMODE_READ,
 					NULL, &stateid, NULL);
 		if (status != 0) {
+			lseg = ERR_PTR(status);
 			trace_pnfs_update_layout(ino, pos, count,
 					iomode, lo, lseg,
 					PNFS_UPDATE_LAYOUT_INVALID_OPEN);
