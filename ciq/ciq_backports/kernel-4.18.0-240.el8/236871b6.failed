@@ -1,0 +1,138 @@
+KVM: nVMX: Move nested VM-Exit tracepoint into nested_vmx_reflect_vmexit()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 236871b6744a6b3c8f9653a429cc041bba8908d5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/236871b6.failed
+
+Move the tracepoint for nested VM-Exits in preparation of splitting the
+reflection logic into L1 wants the exit vs. L0 always handles the exit.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200415175519.14230-5-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 236871b6744a6b3c8f9653a429cc041bba8908d5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx/nested.c
+diff --cc arch/x86/kvm/vmx/nested.c
+index 760296c07825,de122ef3eeed..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -5580,41 -5646,11 +5580,44 @@@ static bool nested_vmx_exit_handled_mtf
+   * should handle it ourselves in L0 (and then continue L2). Only call this
+   * when in is_guest_mode (L2).
+   */
+ -static bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
+ +bool nested_vmx_exit_reflected(struct kvm_vcpu *vcpu, u32 exit_reason)
+  {
+- 	u32 intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
+  	struct vcpu_vmx *vmx = to_vmx(vcpu);
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+++<<<<<<< HEAD
+ +
+ +	if (vmx->nested.nested_run_pending)
+ +		return false;
+ +
+ +	if (unlikely(vmx->fail)) {
+ +		trace_kvm_nested_vmenter_failed(
+ +			"hardware VM-instruction error: ",
+ +			vmcs_read32(VM_INSTRUCTION_ERROR));
+ +		return true;
+ +	}
+ +
+ +	/*
+ +	 * The host physical addresses of some pages of guest memory
+ +	 * are loaded into the vmcs02 (e.g. vmcs12's Virtual APIC
+ +	 * Page). The CPU may write to these pages via their host
+ +	 * physical address while L2 is running, bypassing any
+ +	 * address-translation-based dirty tracking (e.g. EPT write
+ +	 * protection).
+ +	 *
+ +	 * Mark them dirty on every exit from L2 to prevent them from
+ +	 * getting out of sync with dirty tracking.
+ +	 */
+ +	nested_mark_vmcs12_pages_dirty(vcpu);
+ +
+ +	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason,
+ +				vmcs_readl(EXIT_QUALIFICATION),
+ +				vmx->idt_vectoring_info,
+ +				intr_info,
+ +				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
+ +				KVM_ISA_VMX);
+++=======
++ 	u32 intr_info;
+++>>>>>>> 236871b6744a (KVM: nVMX: Move nested VM-Exit tracepoint into nested_vmx_reflect_vmexit())
+  
+  	switch (exit_reason) {
+  	case EXIT_REASON_EXCEPTION_NMI:
+@@@ -5761,6 -5798,61 +5765,64 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Conditionally reflect a VM-Exit into L1.  Returns %true if the VM-Exit was
++  * reflected into L1.
++  */
++ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu, u32 exit_reason)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u32 exit_intr_info, exit_qual;
++ 
++ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
++ 
++ 	/*
++ 	 * Late nested VM-Fail shares the same flow as nested VM-Exit since KVM
++ 	 * has already loaded L2's state.
++ 	 */
++ 	if (unlikely(vmx->fail)) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"hardware VM-instruction error: ",
++ 			vmcs_read32(VM_INSTRUCTION_ERROR));
++ 		exit_intr_info = 0;
++ 		exit_qual = 0;
++ 		goto reflect_vmexit;
++ 	}
++ 
++ 	exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 	exit_qual = vmcs_readl(EXIT_QUALIFICATION);
++ 
++ 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason, exit_qual,
++ 				vmx->idt_vectoring_info, exit_intr_info,
++ 				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++ 				KVM_ISA_VMX);
++ 
++ 	if (!nested_vmx_exit_reflected(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/*
++ 	 * At this point, the exit interruption info in exit_intr_info
++ 	 * is only valid for EXCEPTION_NMI exits.  For EXTERNAL_INTERRUPT
++ 	 * we need to query the in-kernel LAPIC.
++ 	 */
++ 	WARN_ON(exit_reason == EXIT_REASON_EXTERNAL_INTERRUPT);
++ 
++ 	if ((exit_intr_info &
++ 	     (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) ==
++ 	    (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) {
++ 		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 		vmcs12->vm_exit_intr_error_code =
++ 			vmcs_read32(VM_EXIT_INTR_ERROR_CODE);
++ 	}
++ 
++ reflect_vmexit:
++ 	nested_vmx_vmexit(vcpu, exit_reason, exit_intr_info, exit_qual);
++ 	return true;
++ }
+++>>>>>>> 236871b6744a (KVM: nVMX: Move nested VM-Exit tracepoint into nested_vmx_reflect_vmexit())
+  
+  static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
+  				struct kvm_nested_state __user *user_kvm_nested_state,
+* Unmerged path arch/x86/kvm/vmx/nested.c
