@@ -1,0 +1,146 @@
+net/mlx5e: XDP, Precede XDP-related operations in RQ poll by a loaded program check
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Tariq Toukan <tariqt@mellanox.com>
+commit 4fb2f516186ea25dea326f97880431e14a5b9e9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/4fb2f516.failed
+
+At the end of the RQ polling loop, some XDP-related operations
+might be required. Before checking them one by one, check if
+an XDP program is even loaded.
+Combine all the checks and operations in a single function in xdp files.
+
+This saves unnecessary checks for non-XDP flows.
+
+	Signed-off-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 4fb2f516186ea25dea326f97880431e14a5b9e9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index 5fb323256d41,cf22ea529c53..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@@ -238,3 -253,70 +238,73 @@@ void mlx5e_free_xdpsq_descs(struct mlx5
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
++ 		   u32 flags)
++ {
++ 	struct mlx5e_priv *priv = netdev_priv(dev);
++ 	struct mlx5e_xdpsq *sq;
++ 	int drops = 0;
++ 	int sq_num;
++ 	int i;
++ 
++ 	if (unlikely(!test_bit(MLX5E_STATE_OPENED, &priv->state)))
++ 		return -ENETDOWN;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	sq_num = smp_processor_id();
++ 
++ 	if (unlikely(sq_num >= priv->channels.num))
++ 		return -ENXIO;
++ 
++ 	sq = &priv->channels.c[sq_num]->xdpsq;
++ 
++ 	if (unlikely(!test_bit(MLX5E_SQ_STATE_ENABLED, &sq->state)))
++ 		return -ENETDOWN;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdpf = frames[i];
++ 		struct mlx5e_xdp_info xdpi;
++ 
++ 		xdpi.dma_addr = dma_map_single(sq->pdev, xdpf->data, xdpf->len,
++ 					       DMA_TO_DEVICE);
++ 		if (unlikely(dma_mapping_error(sq->pdev, xdpi.dma_addr))) {
++ 			xdp_return_frame_rx_napi(xdpf);
++ 			drops++;
++ 			continue;
++ 		}
++ 
++ 		xdpi.xdpf = xdpf;
++ 
++ 		if (unlikely(!mlx5e_xmit_xdp_frame(sq, &xdpi))) {
++ 			dma_unmap_single(sq->pdev, xdpi.dma_addr,
++ 					 xdpf->len, DMA_TO_DEVICE);
++ 			xdp_return_frame_rx_napi(xdpf);
++ 			drops++;
++ 		}
++ 	}
++ 
++ 	if (flags & XDP_XMIT_FLUSH)
++ 		mlx5e_xmit_xdp_doorbell(sq);
++ 
++ 	return n - drops;
++ }
++ 
++ void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq)
++ {
++ 	struct mlx5e_xdpsq *xdpsq = &rq->xdpsq;
++ 
++ 	if (xdpsq->doorbell) {
++ 		mlx5e_xmit_xdp_doorbell(xdpsq);
++ 		xdpsq->doorbell = false;
++ 	}
++ 
++ 	if (xdpsq->redirect_flush) {
++ 		xdp_do_flush_map();
++ 		xdpsq->redirect_flush = false;
++ 	}
++ }
+++>>>>>>> 4fb2f516186e (net/mlx5e: XDP, Precede XDP-related operations in RQ poll by a loaded program check)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+index 81739aad0188..82f13ba841a5 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@ -44,7 +44,7 @@ bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+ 		      void *va, u16 *rx_headroom, u32 *len);
+ bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
+ void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+-
++void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq);
+ bool mlx5e_xmit_xdp_frame(struct mlx5e_xdpsq *sq, struct mlx5e_xdp_info *xdpi);
+ 
+ static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index cdce30a95c60..1d0bb5ff8c26 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -1190,7 +1190,6 @@ void mlx5e_handle_rx_cqe_mpwrq(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
+ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+ {
+ 	struct mlx5e_rq *rq = container_of(cq, struct mlx5e_rq, cq);
+-	struct mlx5e_xdpsq *xdpsq = &rq->xdpsq;
+ 	struct mlx5_cqe64 *cqe;
+ 	int work_done = 0;
+ 
+@@ -1221,15 +1220,8 @@ int mlx5e_poll_rx_cq(struct mlx5e_cq *cq, int budget)
+ 	} while ((++work_done < budget) && (cqe = mlx5_cqwq_get_cqe(&cq->wq)));
+ 
+ out:
+-	if (xdpsq->doorbell) {
+-		mlx5e_xmit_xdp_doorbell(xdpsq);
+-		xdpsq->doorbell = false;
+-	}
+-
+-	if (xdpsq->redirect_flush) {
+-		xdp_do_flush_map();
+-		xdpsq->redirect_flush = false;
+-	}
++	if (rq->xdp_prog)
++		mlx5e_xdp_rx_poll_complete(rq);
+ 
+ 	mlx5_cqwq_update_db_record(&cq->wq);
+ 
