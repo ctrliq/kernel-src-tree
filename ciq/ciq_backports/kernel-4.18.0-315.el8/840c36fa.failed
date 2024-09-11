@@ -1,0 +1,117 @@
+ath11k: dp: stop rx pktlog before suspend
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Carl Huang <cjhuang@codeaurora.org>
+commit 840c36fa727aea13a2401a5d1d33b722b79df5af
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/840c36fa.failed
+
+Stop dp rx pktlog when entering suspend and reap the mon_status buffer to keep
+it empty. During resume restart the reap timer.
+
+Tested-on: QCA6390 hw2.0 PCI WLAN.HST.1.0.1-01740-QCAHSTSWPLZ_V2_TO_X86-1
+
+	Signed-off-by: Carl Huang <cjhuang@codeaurora.org>
+	Signed-off-by: Kalle Valo <kvalo@codeaurora.org>
+Link: https://lore.kernel.org/r/1607708150-21066-7-git-send-email-kvalo@codeaurora.org
+(cherry picked from commit 840c36fa727aea13a2401a5d1d33b722b79df5af)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/ath/ath11k/dp.h
+#	drivers/net/wireless/ath/ath11k/dp_rx.c
+diff --cc drivers/net/wireless/ath/ath11k/dp.h
+index d694b3810aca,1d9e2d6de3ae..000000000000
+--- a/drivers/net/wireless/ath/ath11k/dp.h
++++ b/drivers/net/wireless/ath/ath11k/dp.h
+@@@ -40,6 -40,8 +40,11 @@@ struct dp_rx_tid 
+  
+  #define DP_REO_DESC_FREE_THRESHOLD  64
+  #define DP_REO_DESC_FREE_TIMEOUT_MS 1000
+++<<<<<<< HEAD
+++=======
++ #define DP_MON_PURGE_TIMEOUT_MS     100
++ #define DP_MON_SERVICE_BUDGET       128
+++>>>>>>> 840c36fa727a (ath11k: dp: stop rx pktlog before suspend)
+  
+  struct dp_reo_cache_flush_elem {
+  	struct list_head list;
+diff --cc drivers/net/wireless/ath/ath11k/dp_rx.c
+index 9456e8b753d2,205c0f1a40e9..000000000000
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.c
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.c
+@@@ -262,6 -262,40 +262,43 @@@ static u32 ath11k_dp_rxdesc_get_ppduid(
+  	return __le16_to_cpu(rx_desc->mpdu_start.phy_ppdu_id);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void ath11k_dp_service_mon_ring(struct timer_list *t)
++ {
++ 	struct ath11k_base *ab = from_timer(ab, t, mon_reap_timer);
++ 	int i;
++ 
++ 	for (i = 0; i < ab->hw_params.num_rxmda_per_pdev; i++)
++ 		ath11k_dp_rx_process_mon_rings(ab, i, NULL, DP_MON_SERVICE_BUDGET);
++ 
++ 	mod_timer(&ab->mon_reap_timer, jiffies +
++ 		  msecs_to_jiffies(ATH11K_MON_TIMER_INTERVAL));
++ }
++ 
++ static int ath11k_dp_purge_mon_ring(struct ath11k_base *ab)
++ {
++ 	int i, reaped = 0;
++ 	unsigned long timeout = jiffies + msecs_to_jiffies(DP_MON_PURGE_TIMEOUT_MS);
++ 
++ 	do {
++ 		for (i = 0; i < ab->hw_params.num_rxmda_per_pdev; i++)
++ 			reaped += ath11k_dp_rx_process_mon_rings(ab, i,
++ 								 NULL,
++ 								 DP_MON_SERVICE_BUDGET);
++ 
++ 		/* nothing more to reap */
++ 		if (reaped < DP_MON_SERVICE_BUDGET)
++ 			return 0;
++ 
++ 	} while (time_before(jiffies, timeout));
++ 
++ 	ath11k_warn(ab, "dp mon ring purge timeout");
++ 
++ 	return -ETIMEDOUT;
++ }
++ 
+++>>>>>>> 840c36fa727a (ath11k: dp: stop rx pktlog before suspend)
+  /* Returns number of Rx buffers replenished */
+  int ath11k_dp_rxbufs_replenish(struct ath11k_base *ab, int mac_id,
+  			       struct dp_rxdma_ring *rx_ring,
+* Unmerged path drivers/net/wireless/ath/ath11k/dp.h
+* Unmerged path drivers/net/wireless/ath/ath11k/dp_rx.c
+diff --git a/drivers/net/wireless/ath/ath11k/dp_rx.h b/drivers/net/wireless/ath/ath11k/dp_rx.h
+index fbea45f79c9b..bf399312b5ff 100644
+--- a/drivers/net/wireless/ath/ath11k/dp_rx.h
++++ b/drivers/net/wireless/ath/ath11k/dp_rx.h
+@@ -91,4 +91,7 @@ int ath11k_dp_rx_pdev_mon_detach(struct ath11k *ar);
+ int ath11k_dp_rx_pdev_mon_attach(struct ath11k *ar);
+ int ath11k_peer_rx_frag_setup(struct ath11k *ar, const u8 *peer_mac, int vdev_id);
+ 
++int ath11k_dp_rx_pktlog_start(struct ath11k_base *ab);
++int ath11k_dp_rx_pktlog_stop(struct ath11k_base *ab, bool stop_timer);
++
+ #endif /* ATH11K_DP_RX_H */
+diff --git a/drivers/net/wireless/ath/ath11k/mac.c b/drivers/net/wireless/ath/ath11k/mac.c
+index 4e8304f22476..2159f4278562 100644
+--- a/drivers/net/wireless/ath/ath11k/mac.c
++++ b/drivers/net/wireless/ath/ath11k/mac.c
+@@ -4145,6 +4145,10 @@ static int ath11k_mac_config_mon_status_default(struct ath11k *ar, bool enable)
+ 						       &tlv_filter);
+ 	}
+ 
++	if (enable && !ar->ab->hw_params.rxdma1_enable)
++		mod_timer(&ar->ab->mon_reap_timer, jiffies +
++			  msecs_to_jiffies(ATH11K_MON_TIMER_INTERVAL));
++
+ 	return ret;
+ }
+ 
