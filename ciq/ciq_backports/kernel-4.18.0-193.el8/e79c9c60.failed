@@ -1,0 +1,232 @@
+IB/mlx5: Remove references to uboject->context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit e79c9c60622a59a814c54a1ee70298afe544441a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e79c9c60.failed
+
+These should all go through udata now. Add mlx5_udata_to_mdev to convert
+a udata into the struct mlx5_ib_dev as these call sites require.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit e79c9c60622a59a814c54a1ee70298afe544441a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+diff --cc drivers/infiniband/hw/mlx5/devx.c
+index 3ca20aa30408,d468f11a81d1..000000000000
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@@ -1331,6 -1353,7 +1333,10 @@@ static int UVERBS_HANDLER(MLX5_IB_METHO
+  
+  	struct ib_uobject *uobj = uverbs_attr_get_uobject(
+  		attrs, MLX5_IB_ATTR_DEVX_ASYNC_CMD_FD_ALLOC_HANDLE);
+++<<<<<<< HEAD
+++=======
++ 	struct mlx5_ib_dev *mdev = mlx5_udata_to_mdev(&attrs->driver_udata);
+++>>>>>>> e79c9c60622a (IB/mlx5: Remove references to uboject->context)
+  
+  	ev_file = container_of(uobj, struct devx_async_cmd_event_file,
+  			       uobj);
+@@@ -1338,6 -1361,116 +1344,118 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void devx_query_callback(int status, struct mlx5_async_work *context)
++ {
++ 	struct devx_async_data *async_data =
++ 		container_of(context, struct devx_async_data, cb_work);
++ 	struct ib_uobject *fd_uobj = async_data->fd_uobj;
++ 	struct devx_async_cmd_event_file *ev_file;
++ 	struct devx_async_event_queue *ev_queue;
++ 	unsigned long flags;
++ 
++ 	ev_file = container_of(fd_uobj, struct devx_async_cmd_event_file,
++ 			       uobj);
++ 	ev_queue = &ev_file->ev_queue;
++ 
++ 	spin_lock_irqsave(&ev_queue->lock, flags);
++ 	list_add_tail(&async_data->list, &ev_queue->event_list);
++ 	spin_unlock_irqrestore(&ev_queue->lock, flags);
++ 
++ 	wake_up_interruptible(&ev_queue->poll_wait);
++ 	fput(fd_uobj->object);
++ }
++ 
++ #define MAX_ASYNC_BYTES_IN_USE (1024 * 1024) /* 1MB */
++ 
++ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_OBJ_ASYNC_QUERY)(
++ 	struct uverbs_attr_bundle *attrs)
++ {
++ 	void *cmd_in = uverbs_attr_get_alloced_ptr(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_CMD_IN);
++ 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
++ 				attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_HANDLE);
++ 	u16 cmd_out_len;
++ 	struct mlx5_ib_ucontext *c = rdma_udata_to_drv_context(
++ 		&attrs->driver_udata, struct mlx5_ib_ucontext, ibucontext);
++ 	struct ib_uobject *fd_uobj;
++ 	int err;
++ 	int uid;
++ 	struct mlx5_ib_dev *mdev = to_mdev(c->ibucontext.device);
++ 	struct devx_async_cmd_event_file *ev_file;
++ 	struct devx_async_data *async_data;
++ 
++ 	uid = devx_get_uid(c, cmd_in);
++ 	if (uid < 0)
++ 		return uid;
++ 
++ 	if (!devx_is_obj_query_cmd(cmd_in))
++ 		return -EINVAL;
++ 
++ 	err = uverbs_get_const(&cmd_out_len, attrs,
++ 			       MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_OUT_LEN);
++ 	if (err)
++ 		return err;
++ 
++ 	if (!devx_is_valid_obj_id(attrs, uobj, cmd_in))
++ 		return -EINVAL;
++ 
++ 	fd_uobj = uverbs_attr_get_uobject(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_FD);
++ 	if (IS_ERR(fd_uobj))
++ 		return PTR_ERR(fd_uobj);
++ 
++ 	ev_file = container_of(fd_uobj, struct devx_async_cmd_event_file,
++ 			       uobj);
++ 
++ 	if (atomic_add_return(cmd_out_len, &ev_file->ev_queue.bytes_in_use) >
++ 			MAX_ASYNC_BYTES_IN_USE) {
++ 		atomic_sub(cmd_out_len, &ev_file->ev_queue.bytes_in_use);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	async_data = kvzalloc(struct_size(async_data, hdr.out_data,
++ 					  cmd_out_len), GFP_KERNEL);
++ 	if (!async_data) {
++ 		err = -ENOMEM;
++ 		goto sub_bytes;
++ 	}
++ 
++ 	err = uverbs_copy_from(&async_data->hdr.wr_id, attrs,
++ 			       MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_WR_ID);
++ 	if (err)
++ 		goto free_async;
++ 
++ 	async_data->cmd_out_len = cmd_out_len;
++ 	async_data->mdev = mdev;
++ 	async_data->fd_uobj = fd_uobj;
++ 
++ 	get_file(fd_uobj->object);
++ 	MLX5_SET(general_obj_in_cmd_hdr, cmd_in, uid, uid);
++ 	err = mlx5_cmd_exec_cb(&ev_file->async_ctx, cmd_in,
++ 		    uverbs_attr_get_len(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_CMD_IN),
++ 		    async_data->hdr.out_data,
++ 		    async_data->cmd_out_len,
++ 		    devx_query_callback, &async_data->cb_work);
++ 
++ 	if (err)
++ 		goto cb_err;
++ 
++ 	return 0;
++ 
++ cb_err:
++ 	fput(fd_uobj->object);
++ free_async:
++ 	kvfree(async_data);
++ sub_bytes:
++ 	atomic_sub(cmd_out_len, &ev_file->ev_queue.bytes_in_use);
++ 	return err;
++ }
++ 
+++>>>>>>> e79c9c60622a (IB/mlx5: Remove references to uboject->context)
+  static int devx_umem_get(struct mlx5_ib_dev *dev, struct ib_ucontext *ucontext,
+  			 struct uverbs_attr_bundle *attrs,
+  			 struct devx_umem *obj)
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
+diff --git a/drivers/infiniband/hw/mlx5/flow.c b/drivers/infiniband/hw/mlx5/flow.c
+index 798591a18484..6ca0cb02d9b6 100644
+--- a/drivers/infiniband/hw/mlx5/flow.c
++++ b/drivers/infiniband/hw/mlx5/flow.c
+@@ -75,7 +75,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_CREATE_FLOW)(
+ 	struct ib_qp *qp = NULL;
+ 	struct ib_uobject *uobj =
+ 		uverbs_attr_get_uobject(attrs, MLX5_IB_ATTR_CREATE_FLOW_HANDLE);
+-	struct mlx5_ib_dev *dev = to_mdev(uobj->context->device);
++	struct mlx5_ib_dev *dev = mlx5_udata_to_mdev(&attrs->driver_udata);
+ 	int len, ret, i;
+ 	u32 counter_id = 0;
+ 
+@@ -207,7 +207,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_MATCHER_CREATE)(
+ {
+ 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
+ 		attrs, MLX5_IB_ATTR_FLOW_MATCHER_CREATE_HANDLE);
+-	struct mlx5_ib_dev *dev = to_mdev(uobj->context->device);
++	struct mlx5_ib_dev *dev = mlx5_udata_to_mdev(&attrs->driver_udata);
+ 	struct mlx5_ib_flow_matcher *obj;
+ 	u32 flags;
+ 	int err;
+@@ -326,7 +326,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_MODIFY_HEADER)(
+ {
+ 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
+ 		attrs, MLX5_IB_ATTR_CREATE_MODIFY_HEADER_HANDLE);
+-	struct mlx5_ib_dev *mdev = to_mdev(uobj->context->device);
++	struct mlx5_ib_dev *mdev = mlx5_udata_to_mdev(&attrs->driver_udata);
+ 	enum mlx5_ib_uapi_flow_table_type ft_type;
+ 	struct ib_flow_action *action;
+ 	int num_actions;
+@@ -353,7 +353,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_MODIFY_HEADER)(
+ 	if (IS_ERR(action))
+ 		return PTR_ERR(action);
+ 
+-	uverbs_flow_action_fill_action(action, uobj, uobj->context->device,
++	uverbs_flow_action_fill_action(action, uobj, &mdev->ib_dev,
+ 				       IB_FLOW_ACTION_UNSPECIFIED);
+ 
+ 	return 0;
+@@ -445,7 +445,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_PACKET_REFORMAT)(
+ {
+ 	struct ib_uobject *uobj = uverbs_attr_get_uobject(attrs,
+ 		MLX5_IB_ATTR_CREATE_PACKET_REFORMAT_HANDLE);
+-	struct mlx5_ib_dev *mdev = to_mdev(uobj->context->device);
++	struct mlx5_ib_dev *mdev = mlx5_udata_to_mdev(&attrs->driver_udata);
+ 	enum mlx5_ib_uapi_flow_action_packet_reformat_type dv_prt;
+ 	enum mlx5_ib_uapi_flow_table_type ft_type;
+ 	struct mlx5_ib_flow_action *maction;
+@@ -493,8 +493,7 @@ static int UVERBS_HANDLER(MLX5_IB_METHOD_FLOW_ACTION_CREATE_PACKET_REFORMAT)(
+ 			goto free_maction;
+ 	}
+ 
+-	uverbs_flow_action_fill_action(&maction->ib_action, uobj,
+-				       uobj->context->device,
++	uverbs_flow_action_fill_action(&maction->ib_action, uobj, &mdev->ib_dev,
+ 				       IB_FLOW_ACTION_UNSPECIFIED);
+ 	return 0;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/mlx5_ib.h b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+index d77f0cb4a75e..b8ea81318fe5 100644
+--- a/drivers/infiniband/hw/mlx5/mlx5_ib.h
++++ b/drivers/infiniband/hw/mlx5/mlx5_ib.h
+@@ -971,6 +971,14 @@ static inline struct mlx5_ib_dev *to_mdev(struct ib_device *ibdev)
+ 	return container_of(ibdev, struct mlx5_ib_dev, ib_dev);
+ }
+ 
++static inline struct mlx5_ib_dev *mlx5_udata_to_mdev(struct ib_udata *udata)
++{
++	struct mlx5_ib_ucontext *context = rdma_udata_to_drv_context(
++		udata, struct mlx5_ib_ucontext, ibucontext);
++
++	return to_mdev(context->ibucontext.device);
++}
++
+ static inline struct mlx5_ib_cq *to_mcq(struct ib_cq *ibcq)
+ {
+ 	return container_of(ibcq, struct mlx5_ib_cq, ibcq);
