@@ -1,0 +1,209 @@
+tools/bpf: bpftool: add btf percpu map formated dump
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Yonghong Song <yhs@fb.com>
+commit 1a86ad89da1c06b2a326953309dcb99f0d079a32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/1a86ad89.failed
+
+The btf pretty print is added to percpu arraymap,
+percpu hashmap and percpu lru hashmap.
+For each <key, value> pair, the following will be
+added to plain/json output:
+
+   {
+       "key": <pretty_print_key>,
+       "values": [{
+             "cpu": 0,
+             "value": <pretty_print_value_on_cpu0>
+          },{
+             "cpu": 1,
+             "value": <pretty_print_value_on_cpu1>
+          },{
+          ....
+          },{
+             "cpu": n,
+             "value": <pretty_print_value_on_cpun>
+          }
+       ]
+   }
+
+For example, the following could be part of plain or json formatted
+output:
+    {
+        "key": 0,
+        "values": [{
+                "cpu": 0,
+                "value": {
+                    "ui32": 0,
+                    "ui16": 0,
+                }
+            },{
+                "cpu": 1,
+                "value": {
+                    "ui32": 1,
+                    "ui16": 0,
+                }
+            },{
+                "cpu": 2,
+                "value": {
+                    "ui32": 2,
+                    "ui16": 0,
+                }
+            },{
+                "cpu": 3,
+                "value": {
+                    "ui32": 3,
+                    "ui16": 0,
+                }
+            }
+        ]
+    }
+
+	Signed-off-by: Yonghong Song <yhs@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 1a86ad89da1c06b2a326953309dcb99f0d079a32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/bpf/bpftool/map.c
+diff --cc tools/bpf/bpftool/map.c
+index 7f6955e6cc1f,df175bc33c5d..000000000000
+--- a/tools/bpf/bpftool/map.c
++++ b/tools/bpf/bpftool/map.c
+@@@ -151,8 -154,128 +151,131 @@@ int map_parse_fd_and_info(int *argc, ch
+  	return fd;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int do_dump_btf(const struct btf_dumper *d,
++ 		       struct bpf_map_info *map_info, void *key,
++ 		       void *value)
++ {
++ 	int ret;
++ 
++ 	/* start of key-value pair */
++ 	jsonw_start_object(d->jw);
++ 
++ 	jsonw_name(d->jw, "key");
++ 
++ 	ret = btf_dumper_type(d, map_info->btf_key_type_id, key);
++ 	if (ret)
++ 		goto err_end_obj;
++ 
++ 	if (!map_is_per_cpu(map_info->type)) {
++ 		jsonw_name(d->jw, "value");
++ 		ret = btf_dumper_type(d, map_info->btf_value_type_id, value);
++ 	} else {
++ 		unsigned int i, n, step;
++ 
++ 		jsonw_name(d->jw, "values");
++ 		jsonw_start_array(d->jw);
++ 		n = get_possible_cpus();
++ 		step = round_up(map_info->value_size, 8);
++ 		for (i = 0; i < n; i++) {
++ 			jsonw_start_object(d->jw);
++ 			jsonw_int_field(d->jw, "cpu", i);
++ 			jsonw_name(d->jw, "value");
++ 			ret = btf_dumper_type(d, map_info->btf_value_type_id,
++ 					      value + i * step);
++ 			jsonw_end_object(d->jw);
++ 			if (ret)
++ 				break;
++ 		}
++ 		jsonw_end_array(d->jw);
++ 	}
++ 
++ err_end_obj:
++ 	/* end of key-value pair */
++ 	jsonw_end_object(d->jw);
++ 
++ 	return ret;
++ }
++ 
++ static int get_btf(struct bpf_map_info *map_info, struct btf **btf)
++ {
++ 	struct bpf_btf_info btf_info = { 0 };
++ 	__u32 len = sizeof(btf_info);
++ 	__u32 last_size;
++ 	int btf_fd;
++ 	void *ptr;
++ 	int err;
++ 
++ 	err = 0;
++ 	*btf = NULL;
++ 	btf_fd = bpf_btf_get_fd_by_id(map_info->btf_id);
++ 	if (btf_fd < 0)
++ 		return 0;
++ 
++ 	/* we won't know btf_size until we call bpf_obj_get_info_by_fd(). so
++ 	 * let's start with a sane default - 4KiB here - and resize it only if
++ 	 * bpf_obj_get_info_by_fd() needs a bigger buffer.
++ 	 */
++ 	btf_info.btf_size = 4096;
++ 	last_size = btf_info.btf_size;
++ 	ptr = malloc(last_size);
++ 	if (!ptr) {
++ 		err = -ENOMEM;
++ 		goto exit_free;
++ 	}
++ 
++ 	bzero(ptr, last_size);
++ 	btf_info.btf = ptr_to_u64(ptr);
++ 	err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 
++ 	if (!err && btf_info.btf_size > last_size) {
++ 		void *temp_ptr;
++ 
++ 		last_size = btf_info.btf_size;
++ 		temp_ptr = realloc(ptr, last_size);
++ 		if (!temp_ptr) {
++ 			err = -ENOMEM;
++ 			goto exit_free;
++ 		}
++ 		ptr = temp_ptr;
++ 		bzero(ptr, last_size);
++ 		btf_info.btf = ptr_to_u64(ptr);
++ 		err = bpf_obj_get_info_by_fd(btf_fd, &btf_info, &len);
++ 	}
++ 
++ 	if (err || btf_info.btf_size > last_size) {
++ 		err = errno;
++ 		goto exit_free;
++ 	}
++ 
++ 	*btf = btf__new((__u8 *)btf_info.btf, btf_info.btf_size, NULL);
++ 	if (IS_ERR(*btf)) {
++ 		err = PTR_ERR(*btf);
++ 		*btf = NULL;
++ 	}
++ 
++ exit_free:
++ 	close(btf_fd);
++ 	free(ptr);
++ 
++ 	return err;
++ }
++ 
++ static json_writer_t *get_btf_writer(void)
++ {
++ 	json_writer_t *jw = jsonw_new(stdout);
++ 
++ 	if (!jw)
++ 		return NULL;
++ 	jsonw_pretty(jw, true);
++ 
++ 	return jw;
++ }
++ 
+++>>>>>>> 1a86ad89da1c (tools/bpf: bpftool: add btf percpu map formated dump)
+  static void print_entry_json(struct bpf_map_info *info, unsigned char *key,
+ -			     unsigned char *value, struct btf *btf)
+ +			     unsigned char *value)
+  {
+  	jsonw_start_object(json_wtr);
+  
+* Unmerged path tools/bpf/bpftool/map.c
