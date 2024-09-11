@@ -1,0 +1,464 @@
+bnxt_en: add an nvm test for hw diagnose
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Vikas Gupta <vikas.gupta@broadcom.com>
+commit 22f5dba5065d4149cf5186da6255894ed119179d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/22f5dba5.failed
+
+Add an NVM test function for devlink hw reporter.
+In this function an NVM VPD area is read followed by
+a write. Test result is cached and if it is successful then
+the next test can be conducted only after HW_RETEST_MIN_TIME to
+avoid frequent writes to the NVM.
+
+	Reviewed-by: Edwin Peer <edwin.peer@broadcom.com>
+	Signed-off-by: Vikas Gupta <vikas.gupta@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 22f5dba5065d4149cf5186da6255894ed119179d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 7c97be1d1085,9dd878def3c2..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1516,6 -1543,48 +1516,51 @@@ struct bnxt_ctx_mem_info 
+  	struct bnxt_mem_init	mem_init[BNXT_CTX_MEM_INIT_MAX];
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum bnxt_hw_err {
++ 	BNXT_HW_STATUS_HEALTHY			= 0x0,
++ 	BNXT_HW_STATUS_NVM_WRITE_ERR		= 0x1,
++ 	BNXT_HW_STATUS_NVM_ERASE_ERR		= 0x2,
++ 	BNXT_HW_STATUS_NVM_UNKNOWN_ERR		= 0x3,
++ 	BNXT_HW_STATUS_NVM_TEST_VPD_ENT_ERR	= 0x4,
++ 	BNXT_HW_STATUS_NVM_TEST_VPD_READ_ERR	= 0x5,
++ 	BNXT_HW_STATUS_NVM_TEST_VPD_WRITE_ERR	= 0x6,
++ 	BNXT_HW_STATUS_NVM_TEST_INCMPL_ERR	= 0x7,
++ };
++ 
++ struct bnxt_hw_health {
++ 	u32 nvm_err_address;
++ 	u32 nvm_write_errors;
++ 	u32 nvm_erase_errors;
++ 	u32 nvm_test_vpd_ent_errors;
++ 	u32 nvm_test_vpd_read_errors;
++ 	u32 nvm_test_vpd_write_errors;
++ 	u32 nvm_test_incmpl_errors;
++ 	u8 synd;
++ 	/* max a test in a day if previous test was successful */
++ #define HW_RETEST_MIN_TIME	(1000 * 3600 * 24)
++ 	u8 nvm_test_result;
++ 	unsigned long nvm_test_timestamp;
++ 	struct devlink_health_reporter *hw_reporter;
++ };
++ 
++ enum bnxt_health_severity {
++ 	SEVERITY_NORMAL = 0,
++ 	SEVERITY_WARNING,
++ 	SEVERITY_RECOVERABLE,
++ 	SEVERITY_FATAL,
++ };
++ 
++ enum bnxt_health_remedy {
++ 	REMEDY_DEVLINK_RECOVER,
++ 	REMEDY_POWER_CYCLE_DEVICE,
++ 	REMEDY_POWER_CYCLE_HOST,
++ 	REMEDY_FW_UPDATE,
++ 	REMEDY_HW_REPLACE,
++ };
++ 
+++>>>>>>> 22f5dba5065d (bnxt_en: add an nvm test for hw diagnose)
+  struct bnxt_fw_health {
+  	u32 flags;
+  	u32 polling_dsecs;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 449597f7c74c,77e55105d645..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -18,6 -19,17 +18,20 @@@
+  #include "bnxt_ethtool.h"
+  #include "bnxt_ulp.h"
+  #include "bnxt_ptp.h"
+++<<<<<<< HEAD
+++=======
++ #include "bnxt_coredump.h"
++ #include "bnxt_nvm_defs.h"	/* NVRAM content constant and structure defs */
++ 
++ static void __bnxt_fw_recover(struct bnxt *bp)
++ {
++ 	if (test_bit(BNXT_STATE_FW_FATAL_COND, &bp->state) ||
++ 	    test_bit(BNXT_STATE_FW_NON_FATAL_COND, &bp->state))
++ 		bnxt_fw_reset(bp);
++ 	else
++ 		bnxt_fw_exception(bp);
++ }
+++>>>>>>> 22f5dba5065d (bnxt_en: add an nvm test for hw diagnose)
+  
+  static int
+  bnxt_dl_flash_update(struct devlink *dl,
+@@@ -83,106 -237,194 +97,238 @@@ static int bnxt_fw_reporter_diagnose(st
+  
+  static const struct devlink_health_reporter_ops bnxt_dl_fw_reporter_ops = {
+  	.name = "fw",
+ -	.diagnose = bnxt_fw_diagnose,
+ -	.dump = bnxt_fw_dump,
+ -	.recover = bnxt_fw_recover,
+ +	.diagnose = bnxt_fw_reporter_diagnose,
+  };
+  
+ -static int bnxt_hw_recover(struct devlink_health_reporter *reporter,
+ -			   void *priv_ctx,
+ -			   struct netlink_ext_ack *extack)
+ +static int bnxt_fw_reset_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+  {
+  	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+ -	struct bnxt_hw_health *hw_health = &bp->hw_health;
+  
+ -	hw_health->synd = BNXT_HW_STATUS_HEALTHY;
+ -	return 0;
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+ +
+ +	bnxt_fw_reset(bp);
+ +	return -EINPROGRESS;
+  }
+  
+++<<<<<<< HEAD
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_reset_reporter_ops = {
+ +	.name = "fw_reset",
+ +	.recover = bnxt_fw_reset_recover,
+++=======
++ static const char *hw_err_str(u8 synd)
++ {
++ 	switch (synd) {
++ 	case BNXT_HW_STATUS_HEALTHY:
++ 		return "healthy";
++ 	case BNXT_HW_STATUS_NVM_WRITE_ERR:
++ 		return "nvm write error";
++ 	case BNXT_HW_STATUS_NVM_ERASE_ERR:
++ 		return "nvm erase error";
++ 	case BNXT_HW_STATUS_NVM_UNKNOWN_ERR:
++ 		return "unrecognized nvm error";
++ 	case BNXT_HW_STATUS_NVM_TEST_VPD_ENT_ERR:
++ 		return "nvm test vpd entry error";
++ 	case BNXT_HW_STATUS_NVM_TEST_VPD_READ_ERR:
++ 		return "nvm test vpd read error";
++ 	case BNXT_HW_STATUS_NVM_TEST_VPD_WRITE_ERR:
++ 		return "nvm test vpd write error";
++ 	case BNXT_HW_STATUS_NVM_TEST_INCMPL_ERR:
++ 		return "nvm test incomplete error";
++ 	default:
++ 		return "unknown hw error";
++ 	}
++ }
++ 
++ static void bnxt_nvm_test(struct bnxt *bp)
++ {
++ 	struct bnxt_hw_health *h = &bp->hw_health;
++ 	u32 datalen;
++ 	u16 index;
++ 	u8 *buf;
++ 
++ 	if (!h->nvm_test_result) {
++ 		if (!h->nvm_test_timestamp ||
++ 		    time_after(jiffies, h->nvm_test_timestamp +
++ 					msecs_to_jiffies(HW_RETEST_MIN_TIME)))
++ 			h->nvm_test_timestamp = jiffies;
++ 		else
++ 			return;
++ 	}
++ 
++ 	if (bnxt_find_nvram_item(bp->dev, BNX_DIR_TYPE_VPD,
++ 				 BNX_DIR_ORDINAL_FIRST, BNX_DIR_EXT_NONE,
++ 				 &index, NULL, &datalen) || !datalen) {
++ 		h->nvm_test_result = BNXT_HW_STATUS_NVM_TEST_VPD_ENT_ERR;
++ 		h->nvm_test_vpd_ent_errors++;
++ 		return;
++ 	}
++ 
++ 	buf = kzalloc(datalen, GFP_KERNEL);
++ 	if (!buf) {
++ 		h->nvm_test_result = BNXT_HW_STATUS_NVM_TEST_INCMPL_ERR;
++ 		h->nvm_test_incmpl_errors++;
++ 		return;
++ 	}
++ 
++ 	if (bnxt_get_nvram_item(bp->dev, index, 0, datalen, buf)) {
++ 		h->nvm_test_result = BNXT_HW_STATUS_NVM_TEST_VPD_READ_ERR;
++ 		h->nvm_test_vpd_read_errors++;
++ 		goto err;
++ 	}
++ 
++ 	if (bnxt_flash_nvram(bp->dev, BNX_DIR_TYPE_VPD, BNX_DIR_ORDINAL_FIRST,
++ 			     BNX_DIR_EXT_NONE, 0, 0, buf, datalen)) {
++ 		h->nvm_test_result = BNXT_HW_STATUS_NVM_TEST_VPD_WRITE_ERR;
++ 		h->nvm_test_vpd_write_errors++;
++ 	}
++ 
++ err:
++ 	kfree(buf);
++ }
++ 
++ static int bnxt_hw_diagnose(struct devlink_health_reporter *reporter,
++ 			    struct devlink_fmsg *fmsg,
++ 			    struct netlink_ext_ack *extack)
++ {
++ 	struct bnxt *bp = devlink_health_reporter_priv(reporter);
++ 	struct bnxt_hw_health *h = &bp->hw_health;
++ 	u8 synd = h->synd;
++ 	int rc;
++ 
++ 	bnxt_nvm_test(bp);
++ 	if (h->nvm_test_result) {
++ 		synd = h->nvm_test_result;
++ 		devlink_health_report(h->hw_reporter, hw_err_str(synd), NULL);
++ 	}
++ 
++ 	rc = devlink_fmsg_string_pair_put(fmsg, "Status", hw_err_str(synd));
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_write_errors", h->nvm_write_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_erase_errors", h->nvm_erase_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_test_vpd_ent_errors",
++ 				       h->nvm_test_vpd_ent_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_test_vpd_read_errors",
++ 				       h->nvm_test_vpd_read_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_test_vpd_write_errors",
++ 				       h->nvm_test_vpd_write_errors);
++ 	if (rc)
++ 		return rc;
++ 	rc = devlink_fmsg_u32_pair_put(fmsg, "nvm_test_incomplete_errors",
++ 				       h->nvm_test_incmpl_errors);
++ 	if (rc)
++ 		return rc;
++ 
++ 	return 0;
++ }
++ 
++ void bnxt_devlink_health_hw_report(struct bnxt *bp)
++ {
++ 	struct bnxt_hw_health *hw_health = &bp->hw_health;
++ 
++ 	netdev_warn(bp->dev, "%s reported at address 0x%x\n", hw_err_str(hw_health->synd),
++ 		    hw_health->nvm_err_address);
++ 
++ 	devlink_health_report(hw_health->hw_reporter, hw_err_str(hw_health->synd), NULL);
++ }
++ 
++ static const struct devlink_health_reporter_ops bnxt_dl_hw_reporter_ops = {
++ 	.name = "hw",
++ 	.diagnose = bnxt_hw_diagnose,
++ 	.recover = bnxt_hw_recover,
+++>>>>>>> 22f5dba5065d (bnxt_en: add an nvm test for hw diagnose)
+  };
+  
+ -static struct devlink_health_reporter *
+ -__bnxt_dl_reporter_create(struct bnxt *bp,
+ -			  const struct devlink_health_reporter_ops *ops)
+ +static int bnxt_fw_fatal_recover(struct devlink_health_reporter *reporter,
+ +				 void *priv_ctx,
+ +				 struct netlink_ext_ack *extack)
+  {
+ -	struct devlink_health_reporter *reporter;
+ +	struct bnxt *bp = devlink_health_reporter_priv(reporter);
+ +	struct bnxt_fw_reporter_ctx *fw_reporter_ctx = priv_ctx;
+ +	unsigned long event;
+  
+ -	reporter = devlink_health_reporter_create(bp->dl, ops, 0, bp);
+ -	if (IS_ERR(reporter)) {
+ -		netdev_warn(bp->dev, "Failed to create %s health reporter, rc = %ld\n",
+ -			    ops->name, PTR_ERR(reporter));
+ -		return NULL;
+ -	}
+ +	if (!priv_ctx)
+ +		return -EOPNOTSUPP;
+ +
+ +	bp->fw_health->fatal = true;
+ +	event = fw_reporter_ctx->sp_event;
+ +	if (event == BNXT_FW_RESET_NOTIFY_SP_EVENT)
+ +		bnxt_fw_reset(bp);
+ +	else if (event == BNXT_FW_EXCEPTION_SP_EVENT)
+ +		bnxt_fw_exception(bp);
+  
+ -	return reporter;
+ +	return -EINPROGRESS;
+  }
+  
+ +static const
+ +struct devlink_health_reporter_ops bnxt_dl_fw_fatal_reporter_ops = {
+ +	.name = "fw_fatal",
+ +	.recover = bnxt_fw_fatal_recover,
+ +};
+ +
+  void bnxt_dl_fw_reporters_create(struct bnxt *bp)
+  {
+ -	struct bnxt_fw_health *fw_health = bp->fw_health;
+ -	struct bnxt_hw_health *hw_health = &bp->hw_health;
+ +	struct bnxt_fw_health *health = bp->fw_health;
+  
+ -	if (!hw_health->hw_reporter)
+ -		hw_health->hw_reporter = __bnxt_dl_reporter_create(bp, &bnxt_dl_hw_reporter_ops);
+ +	if (!health)
+ +		return;
+  
+ -	if (fw_health && !fw_health->fw_reporter)
+ -		fw_health->fw_reporter = __bnxt_dl_reporter_create(bp, &bnxt_dl_fw_reporter_ops);
+ -}
+ +	if (!(bp->fw_cap & BNXT_FW_CAP_HOT_RESET) || health->fw_reset_reporter)
+ +		goto err_recovery;
+ +
+ +	health->fw_reset_reporter =
+ +		devlink_health_reporter_create(bp->dl,
+ +					       &bnxt_dl_fw_reset_reporter_ops,
+ +					       0, bp);
+ +	if (IS_ERR(health->fw_reset_reporter)) {
+ +		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
+ +			    PTR_ERR(health->fw_reset_reporter));
+ +		health->fw_reset_reporter = NULL;
+ +		bp->fw_cap &= ~BNXT_FW_CAP_HOT_RESET;
+ +	}
+  
+ -void bnxt_dl_fw_reporters_destroy(struct bnxt *bp)
+ -{
+ -	struct bnxt_fw_health *fw_health = bp->fw_health;
+ -	struct bnxt_hw_health *hw_health = &bp->hw_health;
+ +err_recovery:
+ +	if (!(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
+ +		return;
+  
+ -	if (hw_health->hw_reporter) {
+ -		devlink_health_reporter_destroy(hw_health->hw_reporter);
+ -		hw_health->hw_reporter = NULL;
+ +	if (!health->fw_reporter) {
+ +		health->fw_reporter =
+ +			devlink_health_reporter_create(bp->dl,
+ +						       &bnxt_dl_fw_reporter_ops,
+ +						       0, bp);
+ +		if (IS_ERR(health->fw_reporter)) {
+ +			netdev_warn(bp->dev, "Failed to create FW health reporter, rc = %ld\n",
+ +				    PTR_ERR(health->fw_reporter));
+ +			health->fw_reporter = NULL;
+ +			bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
+ +			return;
+ +		}
+  	}
+  
+ -	if (fw_health && fw_health->fw_reporter) {
+ -		devlink_health_reporter_destroy(fw_health->fw_reporter);
+ -		fw_health->fw_reporter = NULL;
+ +	if (health->fw_fatal_reporter)
+ +		return;
+ +
+ +	health->fw_fatal_reporter =
+ +		devlink_health_reporter_create(bp->dl,
+ +					       &bnxt_dl_fw_fatal_reporter_ops,
+ +					       0, bp);
+ +	if (IS_ERR(health->fw_fatal_reporter)) {
+ +		netdev_warn(bp->dev, "Failed to create FW fatal health reporter, rc = %ld\n",
+ +			    PTR_ERR(health->fw_fatal_reporter));
+ +		health->fw_fatal_reporter = NULL;
+ +		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
+  	}
+  }
+  
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+index df9617aeea34,2593e0049582..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+@@@ -49,10 -49,20 +49,21 @@@ u32 bnxt_get_rxfh_indir_size(struct net
+  u32 _bnxt_fw_to_ethtool_adv_spds(u16, u8);
+  u32 bnxt_fw_to_ethtool_speed(u16);
+  u16 bnxt_get_fw_auto_link_speeds(u32);
+ -int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
+ -			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info);
+ -int bnxt_hwrm_firmware_reset(struct net_device *dev, u8 proc_type,
+ -			     u8 self_reset, u8 flags);
+  int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware *fw,
+  				   u32 install_type);
+++<<<<<<< HEAD
+ +int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
+ +			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info);
+++=======
++ int bnxt_get_pkginfo(struct net_device *dev, char *ver, int size);
++ int bnxt_find_nvram_item(struct net_device *dev, u16 type, u16 ordinal, u16 ext,
++ 			 u16 *index, u32 *item_length, u32 *data_length);
++ int bnxt_get_nvram_item(struct net_device *dev, u32 index, u32 offset,
++ 			u32 length, u8 *data);
++ int bnxt_flash_nvram(struct net_device *dev, u16 dir_type, u16 dir_ordinal,
++ 		     u16 dir_ext, u16 dir_attr, u32 dir_item_len,
++ 		     const u8 *data, size_t data_len);
+++>>>>>>> 22f5dba5065d (bnxt_en: add an nvm test for hw diagnose)
+  void bnxt_ethtool_init(struct bnxt *bp);
+  void bnxt_ethtool_free(struct bnxt *bp);
+  
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index acea2c24428a..cdbcda2b0402 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2161,14 +2161,10 @@ static void bnxt_print_admin_err(struct bnxt *bp)
+ 	netdev_info(bp->dev, "PF does not have admin privileges to flash or reset the device\n");
+ }
+ 
+-static int bnxt_find_nvram_item(struct net_device *dev, u16 type, u16 ordinal,
+-				u16 ext, u16 *index, u32 *item_length,
+-				u32 *data_length);
+-
+-static int bnxt_flash_nvram(struct net_device *dev, u16 dir_type,
+-			    u16 dir_ordinal, u16 dir_ext, u16 dir_attr,
+-			    u32 dir_item_len, const u8 *data,
+-			    size_t data_len)
++int bnxt_flash_nvram(struct net_device *dev, u16 dir_type,
++		     u16 dir_ordinal, u16 dir_ext, u16 dir_attr,
++		     u32 dir_item_len, const u8 *data,
++		     size_t data_len)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	struct hwrm_nvm_write_input *req;
+@@ -2807,8 +2803,8 @@ static int bnxt_get_nvram_directory(struct net_device *dev, u32 len, u8 *data)
+ 	return rc;
+ }
+ 
+-static int bnxt_get_nvram_item(struct net_device *dev, u32 index, u32 offset,
+-			       u32 length, u8 *data)
++int bnxt_get_nvram_item(struct net_device *dev, u32 index, u32 offset,
++			u32 length, u8 *data)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	int rc;
+@@ -2842,9 +2838,9 @@ static int bnxt_get_nvram_item(struct net_device *dev, u32 index, u32 offset,
+ 	return rc;
+ }
+ 
+-static int bnxt_find_nvram_item(struct net_device *dev, u16 type, u16 ordinal,
+-				u16 ext, u16 *index, u32 *item_length,
+-				u32 *data_length)
++int bnxt_find_nvram_item(struct net_device *dev, u16 type, u16 ordinal,
++			 u16 ext, u16 *index, u32 *item_length,
++			 u32 *data_length)
+ {
+ 	struct hwrm_nvm_find_dir_entry_output *output;
+ 	struct hwrm_nvm_find_dir_entry_input *req;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
