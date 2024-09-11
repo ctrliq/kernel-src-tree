@@ -1,0 +1,147 @@
+powerpc/pseries/cmm: Drop page array
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 4a1745c5bf92232f115e28296475dc42254b1c7d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4a1745c5.failed
+
+We can simply store the pages in a list (page->lru), no need for a
+separate data structure (+ complicated handling). This is how most
+other balloon drivers store allocated pages without additional
+tracking data.
+
+For the notifiers, use page_to_pfn() to check if a page is in the
+applicable range. Use page_to_phys() in plpar_page_set_loaned() and
+plpar_page_set_active() (I assume due to the __pa() that's the right
+thing to do).
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191031142933.10779-5-david@redhat.com
+(cherry picked from commit 4a1745c5bf92232f115e28296475dc42254b1c7d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/cmm.c
+diff --cc arch/powerpc/platforms/pseries/cmm.c
+index 317181692fcb,33d31e48ec15..000000000000
+--- a/arch/powerpc/platforms/pseries/cmm.c
++++ b/arch/powerpc/platforms/pseries/cmm.c
+@@@ -206,9 -162,9 +176,9 @@@ static long cmm_alloc_pages(long nr
+  			break;
+  		}
+  
+- 		pa->page[pa->index++] = addr;
++ 		list_add(&page->lru, &cmm_page_list);
+  		loaned_pages++;
+ -		totalram_pages_dec();
+ +		totalram_pages--;
+  		spin_unlock(&cmm_lock);
+  		nr--;
+  	}
+@@@ -231,23 -186,15 +200,15 @@@ static long cmm_free_pages(long nr
+  
+  	cmm_dbg("Begin free of %ld pages.\n", nr);
+  	spin_lock(&cmm_lock);
+- 	pa = cmm_page_list;
+- 	while (nr) {
+- 		if (!pa || pa->index <= 0)
++ 	list_for_each_entry_safe(page, tmp, &cmm_page_list, lru) {
++ 		if (!nr)
+  			break;
+- 		addr = pa->page[--pa->index];
+- 
+- 		if (pa->index == 0) {
+- 			pa = pa->next;
+- 			free_page((unsigned long) cmm_page_list);
+- 			cmm_page_list = pa;
+- 		}
+- 
+- 		plpar_page_set_active(__pa(addr));
+- 		free_page(addr);
++ 		plpar_page_set_active(page);
++ 		list_del(&page->lru);
++ 		__free_page(page);
+  		loaned_pages--;
+  		nr--;
+ -		totalram_pages_inc();
+ +		totalram_pages++;
+  	}
+  	spin_unlock(&cmm_lock);
+  	cmm_dbg("End request with %ld pages unfulfilled\n", nr);
+@@@ -575,58 -512,16 +526,71 @@@ static int cmm_mem_going_offline(void *
+  	spin_lock(&cmm_lock);
+  
+  	/* Search the page list for pages in the range to be offlined */
+++<<<<<<< HEAD
+ +	pa_last = pa_curr = cmm_page_list;
+ +	while (pa_curr) {
+ +		for (idx = (pa_curr->index - 1); (idx + 1) > 0; idx--) {
+ +			if ((pa_curr->page[idx] < start_page) ||
+ +			    (pa_curr->page[idx] >= end_page))
+ +				continue;
+ +
+ +			plpar_page_set_active(__pa(pa_curr->page[idx]));
+ +			free_page(pa_curr->page[idx]);
+ +			freed++;
+ +			loaned_pages--;
+ +			totalram_pages++;
+ +			pa_curr->page[idx] = pa_last->page[--pa_last->index];
+ +			if (pa_last->index == 0) {
+ +				if (pa_curr == pa_last)
+ +					pa_curr = pa_last->next;
+ +				pa_last = pa_last->next;
+ +				free_page((unsigned long)cmm_page_list);
+ +				cmm_page_list = pa_last;
+ +			}
+ +		}
+ +		pa_curr = pa_curr->next;
+ +	}
+ +
+ +	/* Search for page list structures in the range to be offlined */
+ +	pa_last = NULL;
+ +	pa_curr = cmm_page_list;
+ +	while (pa_curr) {
+ +		if (((unsigned long)pa_curr >= start_page) &&
+ +				((unsigned long)pa_curr < end_page)) {
+ +			npa = (struct cmm_page_array *)__get_free_page(
+ +					GFP_NOIO | __GFP_NOWARN |
+ +					__GFP_NORETRY | __GFP_NOMEMALLOC);
+ +			if (!npa) {
+ +				spin_unlock(&cmm_lock);
+ +				cmm_dbg("Failed to allocate memory for list "
+ +						"management. Memory hotplug "
+ +						"failed.\n");
+ +				return -ENOMEM;
+ +			}
+ +			memcpy(npa, pa_curr, PAGE_SIZE);
+ +			if (pa_curr == cmm_page_list)
+ +				cmm_page_list = npa;
+ +			if (pa_last)
+ +				pa_last->next = npa;
+ +			free_page((unsigned long) pa_curr);
+ +			freed++;
+ +			pa_curr = npa;
+ +		}
+ +
+ +		pa_last = pa_curr;
+ +		pa_curr = pa_curr->next;
+++=======
++ 	list_for_each_entry_safe(page, tmp, &cmm_page_list, lru) {
++ 		if (page_to_pfn(page) < marg->start_pfn ||
++ 		    page_to_pfn(page) >= marg->start_pfn + marg->nr_pages)
++ 			continue;
++ 		plpar_page_set_active(page);
++ 		list_del(&page->lru);
++ 		__free_page(page);
++ 		freed++;
++ 		loaned_pages--;
++ 		totalram_pages_inc();
+++>>>>>>> 4a1745c5bf92 (powerpc/pseries/cmm: Drop page array)
+  	}
+  
+  	spin_unlock(&cmm_lock);
+* Unmerged path arch/powerpc/platforms/pseries/cmm.c
