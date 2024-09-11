@@ -1,0 +1,319 @@
+xsk: Fix possible memory leak at socket close
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Magnus Karlsson <magnus.karlsson@intel.com>
+commit e5e1a4bc916d29958c3b587354293738fcb984d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/e5e1a4bc.failed
+
+Fix a possible memory leak at xsk socket close that is caused by the
+refcounting of the umem object being wrong. The reference count of the
+umem was decremented only after the pool had been freed. Note that if
+the buffer pool is destroyed, it is important that the umem is
+destroyed after the pool, otherwise the umem would disappear while the
+driver is still running. And as the buffer pool needs to be destroyed
+in a work queue, the umem is also (if its refcount reaches zero)
+destroyed after the buffer pool in that same work queue.
+
+What was missing is that the refcount also needs to be decremented
+when the pool is not freed and when the pool has not even been
+created. The first case happens when the refcount of the pool is
+higher than 1, i.e. it is still being used by some other socket using
+the same device and queue id. In this case, it is safe to decrement
+the refcount of the umem outside of the work queue as the umem will
+never be freed because the refcount of the umem is always greater than
+or equal to the refcount of the buffer pool. The second case is if the
+buffer pool has not been created yet, i.e. the socket was closed
+before it was bound but after the umem was created. In this case, it
+is safe to destroy the umem outside of the work queue, since there is
+no pool that can use it by definition.
+
+Fixes: 1c1efc2af158 ("xsk: Create and free buffer pool independently from umem")
+	Reported-by: syzbot+eb71df123dc2be2c1456@syzkaller.appspotmail.com
+	Signed-off-by: Magnus Karlsson <magnus.karlsson@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/1603801921-2712-1-git-send-email-magnus.karlsson@gmail.com
+(cherry picked from commit e5e1a4bc916d29958c3b587354293738fcb984d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xsk_buff_pool.h
+#	net/xdp/xsk.c
+#	net/xdp/xsk_buff_pool.c
+diff --cc include/net/xsk_buff_pool.h
+index 48c9f3494e0f,01755b838c74..000000000000
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@@ -48,12 -77,19 +48,20 @@@ struct xsk_buff_pool 
+  };
+  
+  /* AF_XDP core. */
+ -struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
+ -						struct xdp_umem *umem);
+ -int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
+ -		  u16 queue_id, u16 flags);
+ -int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_umem *umem,
+ -			 struct net_device *dev, u16 queue_id);
+ +struct xsk_buff_pool *xp_create(struct page **pages, u32 nr_pages, u32 chunks,
+ +				u32 chunk_size, u32 headroom, u64 size,
+ +				bool unaligned);
+ +void xp_set_fq(struct xsk_buff_pool *pool, struct xsk_queue *fq);
+  void xp_destroy(struct xsk_buff_pool *pool);
+  void xp_release(struct xdp_buff_xsk *xskb);
+++<<<<<<< HEAD
+++=======
++ void xp_get_pool(struct xsk_buff_pool *pool);
++ bool xp_put_pool(struct xsk_buff_pool *pool);
++ void xp_clear_dev(struct xsk_buff_pool *pool);
++ void xp_add_xsk(struct xsk_buff_pool *pool, struct xdp_sock *xs);
++ void xp_del_xsk(struct xsk_buff_pool *pool, struct xdp_sock *xs);
+++>>>>>>> e5e1a4bc916d (xsk: Fix possible memory leak at socket close)
+  
+  /* AF_XDP, and XDP core. */
+  void xp_free(struct xdp_buff_xsk *xskb);
+diff --cc net/xdp/xsk.c
+index 10c97cce9e3d,cfbec3989a76..000000000000
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@@ -1075,7 -1146,8 +1075,12 @@@ static void xsk_destruct(struct sock *s
+  	if (!sock_flag(sk, SOCK_DEAD))
+  		return;
+  
+++<<<<<<< HEAD
+ +	xdp_put_umem(xs->umem);
+++=======
++ 	if (!xp_put_pool(xs->pool))
++ 		xdp_put_umem(xs->umem);
+++>>>>>>> e5e1a4bc916d (xsk: Fix possible memory leak at socket close)
+  
+  	sk_refcnt_debug_dec(sk);
+  }
+diff --cc net/xdp/xsk_buff_pool.c
+index a2044c245215,8a3bf4e1318e..000000000000
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@@ -86,7 -101,214 +86,218 @@@ void xp_set_rxq_info(struct xsk_buff_po
+  }
+  EXPORT_SYMBOL(xp_set_rxq_info);
+  
+++<<<<<<< HEAD
+ +void xp_dma_unmap(struct xsk_buff_pool *pool, unsigned long attrs)
+++=======
++ static void xp_disable_drv_zc(struct xsk_buff_pool *pool)
++ {
++ 	struct netdev_bpf bpf;
++ 	int err;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	if (pool->umem->zc) {
++ 		bpf.command = XDP_SETUP_XSK_POOL;
++ 		bpf.xsk.pool = NULL;
++ 		bpf.xsk.queue_id = pool->queue_id;
++ 
++ 		err = pool->netdev->netdev_ops->ndo_bpf(pool->netdev, &bpf);
++ 
++ 		if (err)
++ 			WARN(1, "Failed to disable zero-copy!\n");
++ 	}
++ }
++ 
++ static int __xp_assign_dev(struct xsk_buff_pool *pool,
++ 			   struct net_device *netdev, u16 queue_id, u16 flags)
++ {
++ 	bool force_zc, force_copy;
++ 	struct netdev_bpf bpf;
++ 	int err = 0;
++ 
++ 	ASSERT_RTNL();
++ 
++ 	force_zc = flags & XDP_ZEROCOPY;
++ 	force_copy = flags & XDP_COPY;
++ 
++ 	if (force_zc && force_copy)
++ 		return -EINVAL;
++ 
++ 	if (xsk_get_pool_from_qid(netdev, queue_id))
++ 		return -EBUSY;
++ 
++ 	pool->netdev = netdev;
++ 	pool->queue_id = queue_id;
++ 	err = xsk_reg_pool_at_qid(netdev, pool, queue_id);
++ 	if (err)
++ 		return err;
++ 
++ 	if (flags & XDP_USE_NEED_WAKEUP) {
++ 		pool->uses_need_wakeup = true;
++ 		/* Tx needs to be explicitly woken up the first time.
++ 		 * Also for supporting drivers that do not implement this
++ 		 * feature. They will always have to call sendto().
++ 		 */
++ 		pool->cached_need_wakeup = XDP_WAKEUP_TX;
++ 	}
++ 
++ 	dev_hold(netdev);
++ 
++ 	if (force_copy)
++ 		/* For copy-mode, we are done. */
++ 		return 0;
++ 
++ 	if (!netdev->netdev_ops->ndo_bpf ||
++ 	    !netdev->netdev_ops->ndo_xsk_wakeup) {
++ 		err = -EOPNOTSUPP;
++ 		goto err_unreg_pool;
++ 	}
++ 
++ 	bpf.command = XDP_SETUP_XSK_POOL;
++ 	bpf.xsk.pool = pool;
++ 	bpf.xsk.queue_id = queue_id;
++ 
++ 	err = netdev->netdev_ops->ndo_bpf(netdev, &bpf);
++ 	if (err)
++ 		goto err_unreg_pool;
++ 
++ 	if (!pool->dma_pages) {
++ 		WARN(1, "Driver did not DMA map zero-copy buffers");
++ 		goto err_unreg_xsk;
++ 	}
++ 	pool->umem->zc = true;
++ 	return 0;
++ 
++ err_unreg_xsk:
++ 	xp_disable_drv_zc(pool);
++ err_unreg_pool:
++ 	if (!force_zc)
++ 		err = 0; /* fallback to copy mode */
++ 	if (err)
++ 		xsk_clear_pool_at_qid(netdev, queue_id);
++ 	return err;
++ }
++ 
++ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
++ 		  u16 queue_id, u16 flags)
++ {
++ 	return __xp_assign_dev(pool, dev, queue_id, flags);
++ }
++ 
++ int xp_assign_dev_shared(struct xsk_buff_pool *pool, struct xdp_umem *umem,
++ 			 struct net_device *dev, u16 queue_id)
++ {
++ 	u16 flags;
++ 
++ 	/* One fill and completion ring required for each queue id. */
++ 	if (!pool->fq || !pool->cq)
++ 		return -EINVAL;
++ 
++ 	flags = umem->zc ? XDP_ZEROCOPY : XDP_COPY;
++ 	if (pool->uses_need_wakeup)
++ 		flags |= XDP_USE_NEED_WAKEUP;
++ 
++ 	return __xp_assign_dev(pool, dev, queue_id, flags);
++ }
++ 
++ void xp_clear_dev(struct xsk_buff_pool *pool)
++ {
++ 	if (!pool->netdev)
++ 		return;
++ 
++ 	xp_disable_drv_zc(pool);
++ 	xsk_clear_pool_at_qid(pool->netdev, pool->queue_id);
++ 	dev_put(pool->netdev);
++ 	pool->netdev = NULL;
++ }
++ 
++ static void xp_release_deferred(struct work_struct *work)
++ {
++ 	struct xsk_buff_pool *pool = container_of(work, struct xsk_buff_pool,
++ 						  work);
++ 
++ 	rtnl_lock();
++ 	xp_clear_dev(pool);
++ 	rtnl_unlock();
++ 
++ 	if (pool->fq) {
++ 		xskq_destroy(pool->fq);
++ 		pool->fq = NULL;
++ 	}
++ 
++ 	if (pool->cq) {
++ 		xskq_destroy(pool->cq);
++ 		pool->cq = NULL;
++ 	}
++ 
++ 	xdp_put_umem(pool->umem);
++ 	xp_destroy(pool);
++ }
++ 
++ void xp_get_pool(struct xsk_buff_pool *pool)
++ {
++ 	refcount_inc(&pool->users);
++ }
++ 
++ bool xp_put_pool(struct xsk_buff_pool *pool)
++ {
++ 	if (!pool)
++ 		return false;
++ 
++ 	if (refcount_dec_and_test(&pool->users)) {
++ 		INIT_WORK(&pool->work, xp_release_deferred);
++ 		schedule_work(&pool->work);
++ 		return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static struct xsk_dma_map *xp_find_dma_map(struct xsk_buff_pool *pool)
++ {
++ 	struct xsk_dma_map *dma_map;
++ 
++ 	list_for_each_entry(dma_map, &pool->umem->xsk_dma_list, list) {
++ 		if (dma_map->netdev == pool->netdev)
++ 			return dma_map;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct xsk_dma_map *xp_create_dma_map(struct device *dev, struct net_device *netdev,
++ 					     u32 nr_pages, struct xdp_umem *umem)
++ {
++ 	struct xsk_dma_map *dma_map;
++ 
++ 	dma_map = kzalloc(sizeof(*dma_map), GFP_KERNEL);
++ 	if (!dma_map)
++ 		return NULL;
++ 
++ 	dma_map->dma_pages = kvcalloc(nr_pages, sizeof(*dma_map->dma_pages), GFP_KERNEL);
++ 	if (!dma_map->dma_pages) {
++ 		kfree(dma_map);
++ 		return NULL;
++ 	}
++ 
++ 	dma_map->netdev = netdev;
++ 	dma_map->dev = dev;
++ 	dma_map->dma_need_sync = false;
++ 	dma_map->dma_pages_cnt = nr_pages;
++ 	refcount_set(&dma_map->users, 1);
++ 	list_add(&dma_map->list, &umem->xsk_dma_list);
++ 	return dma_map;
++ }
++ 
++ static void xp_destroy_dma_map(struct xsk_dma_map *dma_map)
++ {
++ 	list_del(&dma_map->list);
++ 	kvfree(dma_map->dma_pages);
++ 	kfree(dma_map);
++ }
++ 
++ static void __xp_dma_unmap(struct xsk_dma_map *dma_map, unsigned long attrs)
+++>>>>>>> e5e1a4bc916d (xsk: Fix possible memory leak at socket close)
+  {
+  	dma_addr_t *dma;
+  	u32 i;
+* Unmerged path include/net/xsk_buff_pool.h
+* Unmerged path net/xdp/xsk.c
+* Unmerged path net/xdp/xsk_buff_pool.c
