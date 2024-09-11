@@ -1,0 +1,125 @@
+RDMA/core: Introduce ib_map_mr_sg_pi to map data/protection sgl's
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit 2cdfcdd8677b277b32d32ef8976802dc5d5f883f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/2cdfcdd8.failed
+
+This function will map the previously dma mapped SG lists for PI
+(protection information) and data to an appropriate memory region for
+future registration.
+The given MR must be allocated as IB_MR_TYPE_INTEGRITY.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 2cdfcdd8677b277b32d32ef8976802dc5d5f883f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+diff --cc drivers/infiniband/core/verbs.c
+index 93994714b1cd,c892022aa8ea..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -2006,7 -2029,51 +2006,55 @@@ struct ib_mr *ib_alloc_mr(struct ib_pd 
+  
+  	return mr;
+  }
+++<<<<<<< HEAD
+ +EXPORT_SYMBOL(ib_alloc_mr);
+++=======
++ EXPORT_SYMBOL(ib_alloc_mr_user);
++ 
++ /**
++  * ib_alloc_mr_integrity() - Allocates an integrity memory region
++  * @pd:                      protection domain associated with the region
++  * @max_num_data_sg:         maximum data sg entries available for registration
++  * @max_num_meta_sg:         maximum metadata sg entries available for
++  *                           registration
++  *
++  * Notes:
++  * Memory registration page/sg lists must not exceed max_num_sg,
++  * also the integrity page/sg lists must not exceed max_num_meta_sg.
++  *
++  */
++ struct ib_mr *ib_alloc_mr_integrity(struct ib_pd *pd,
++ 				    u32 max_num_data_sg,
++ 				    u32 max_num_meta_sg)
++ {
++ 	struct ib_mr *mr;
++ 
++ 	if (!pd->device->ops.alloc_mr_integrity ||
++ 	    !pd->device->ops.map_mr_sg_pi)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (!max_num_meta_sg)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	mr = pd->device->ops.alloc_mr_integrity(pd, max_num_data_sg,
++ 						max_num_meta_sg);
++ 	if (IS_ERR(mr))
++ 		return mr;
++ 
++ 	mr->device = pd->device;
++ 	mr->pd = pd;
++ 	mr->dm = NULL;
++ 	mr->uobject = NULL;
++ 	atomic_inc(&pd->usecnt);
++ 	mr->need_inval = false;
++ 	mr->res.type = RDMA_RESTRACK_MR;
++ 	rdma_restrack_kadd(&mr->res);
++ 	mr->type = IB_MR_TYPE_INTEGRITY;
++ 
++ 	return mr;
++ }
++ EXPORT_SYMBOL(ib_alloc_mr_integrity);
+++>>>>>>> 2cdfcdd8677b (RDMA/core: Introduce ib_map_mr_sg_pi to map data/protection sgl's)
+  
+  /* "Fast" memory regions */
+  
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index ec96a7b1c811..734a75a1b992 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -1323,6 +1323,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, get_vf_stats);
+ 	SET_DEVICE_OP(dev_ops, init_port);
+ 	SET_DEVICE_OP(dev_ops, map_mr_sg);
++	SET_DEVICE_OP(dev_ops, map_mr_sg_pi);
+ 	SET_DEVICE_OP(dev_ops, map_phys_fmr);
+ 	SET_DEVICE_OP(dev_ops, mmap);
+ 	SET_DEVICE_OP(dev_ops, modify_ah);
+* Unmerged path drivers/infiniband/core/verbs.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index c2e75b869e71..37fdd8ffc043 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2393,6 +2393,11 @@ struct ib_device_ops {
+ 	int (*read_counters)(struct ib_counters *counters,
+ 			     struct ib_counters_read_attr *counters_read_attr,
+ 			     struct uverbs_attr_bundle *attrs);
++	int (*map_mr_sg_pi)(struct ib_mr *mr, struct scatterlist *data_sg,
++			    int data_sg_nents, unsigned int *data_sg_offset,
++			    struct scatterlist *meta_sg, int meta_sg_nents,
++			    unsigned int *meta_sg_offset);
++
+ 	/**
+ 	 * alloc_hw_stats - Allocate a struct rdma_hw_stats and fill in the
+ 	 *   driver initialized data.  The struct is kfree()'ed by the sysfs
+@@ -3868,6 +3873,10 @@ int ib_destroy_rwq_ind_table(struct ib_rwq_ind_table *wq_ind_table);
+ 
+ int ib_map_mr_sg(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
+ 		 unsigned int *sg_offset, unsigned int page_size);
++int ib_map_mr_sg_pi(struct ib_mr *mr, struct scatterlist *data_sg,
++		    int data_sg_nents, unsigned int *data_sg_offset,
++		    struct scatterlist *meta_sg, int meta_sg_nents,
++		    unsigned int *meta_sg_offset, unsigned int page_size);
+ 
+ static inline int
+ ib_map_mr_sg_zbva(struct ib_mr *mr, struct scatterlist *sg, int sg_nents,
