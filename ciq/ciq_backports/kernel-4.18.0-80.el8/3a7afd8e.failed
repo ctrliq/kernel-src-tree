@@ -1,0 +1,77 @@
+nvme-pci: remove the CQ lock for interrupt driven queues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 3a7afd8ee42a68d4f24ab9c947a4ef82d4d52375
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/3a7afd8e.failed
+
+Now that we can't poll regular, interrupt driven I/O queues there
+is almost nothing that can race with an interrupt.  The only
+possible other contexts polling a CQ are the error handler and
+queue shutdown, and both are so far off in the slow path that
+we can simply use the big hammer of disabling interrupts.
+
+With that we can stop taking the cq_lock for normal queues.
+
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3a7afd8ee42a68d4f24ab9c947a4ef82d4d52375)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/pci.c
+diff --cc drivers/nvme/host/pci.c
+index e63d03795df8,4ccb4ea22ac6..000000000000
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@@ -1086,13 -1084,24 +1091,24 @@@ static irqreturn_t nvme_irq_check(int i
+   */
+  static int nvme_poll_irqdisable(struct nvme_queue *nvmeq, unsigned int tag)
+  {
+- 	unsigned long flags;
++ 	struct pci_dev *pdev = to_pci_dev(nvmeq->dev->dev);
+  	u16 start, end;
+ -	int found;
+ +	bool found;
+  
+- 	spin_lock_irqsave(&nvmeq->cq_lock, flags);
++ 	/*
++ 	 * For a poll queue we need to protect against the polling thread
++ 	 * using the CQ lock.  For normal interrupt driven threads we have
++ 	 * to disable the interrupt to avoid racing with it.
++ 	 */
++ 	if (nvmeq->cq_vector == -1)
++ 		spin_lock(&nvmeq->cq_poll_lock);
++ 	else
++ 		disable_irq(pci_irq_vector(pdev, nvmeq->cq_vector));
+  	found = nvme_process_cq(nvmeq, &start, &end, tag);
+- 	spin_unlock_irqrestore(&nvmeq->cq_lock, flags);
++ 	if (nvmeq->cq_vector == -1)
++ 		spin_unlock(&nvmeq->cq_poll_lock);
++ 	else
++ 		enable_irq(pci_irq_vector(pdev, nvmeq->cq_vector));
+  
+  	nvme_complete_cqes(nvmeq, start, end);
+  	return found;
+@@@ -1114,9 -1116,9 +1130,15 @@@ static int nvme_poll_noirq(struct blk_m
+  	if (!nvme_cqe_pending(nvmeq))
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	spin_lock(&nvmeq->cq_lock);
+ +	found = nvme_process_cq(nvmeq, &start, &end, tag);
+ +	spin_unlock(&nvmeq->cq_lock);
+++=======
++ 	spin_lock(&nvmeq->cq_poll_lock);
++ 	found = nvme_process_cq(nvmeq, &start, &end, -1);
++ 	spin_unlock(&nvmeq->cq_poll_lock);
+++>>>>>>> 3a7afd8ee42a (nvme-pci: remove the CQ lock for interrupt driven queues)
+  
+  	nvme_complete_cqes(nvmeq, start, end);
+  	return found;
+* Unmerged path drivers/nvme/host/pci.c
