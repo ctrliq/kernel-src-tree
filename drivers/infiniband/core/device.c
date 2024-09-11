@@ -1269,6 +1269,8 @@ static void disable_device(struct ib_device *device)
 		remove_client_context(device, cid);
 	}
 
+	ib_cq_pool_destroy(device);
+
 	/* Pairs with refcount_set in enable_device */
 	ib_device_put(device);
 	wait_for_completion(&device->unreg_completion);
@@ -1311,6 +1313,8 @@ static int enable_device_and_get(struct ib_device *device)
 		if (ret)
 			goto out;
 	}
+
+	ib_cq_pool_init(device);
 
 	down_read(&clients_rwsem);
 	xa_for_each_marked (&clients, index, client, CLIENT_REGISTERED) {
