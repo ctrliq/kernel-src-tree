@@ -1,0 +1,191 @@
+powerpc/watchpoint: Use builtin ALIGN*() macros
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit e68ef121c1f4c38edf87a3354661ceb99d522729
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e68ef121.failed
+
+Currently we calculate hw aligned start and end addresses manually.
+Replace them with builtin ALIGN_DOWN() and ALIGN() macros.
+
+So far end_addr was inclusive but this patch makes it exclusive (by
+avoiding -1) for better readability.
+
+	Suggested-by: Christophe Leroy <christophe.leroy@c-s.fr>
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+	Reviewed-by: Michael Neuling <mikey@neuling.org>
+Link: https://lore.kernel.org/r/20200514111741.97993-13-ravi.bangoria@linux.ibm.com
+(cherry picked from commit e68ef121c1f4c38edf87a3354661ceb99d522729)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/hw_breakpoint.h
+#	arch/powerpc/kernel/hw_breakpoint.c
+#	arch/powerpc/kernel/process.c
+#	arch/powerpc/kernel/ptrace/ptrace-noadv.c
+diff --cc arch/powerpc/include/asm/hw_breakpoint.h
+index 27d6e3c8fde9,add5aa076919..000000000000
+--- a/arch/powerpc/include/asm/hw_breakpoint.h
++++ b/arch/powerpc/include/asm/hw_breakpoint.h
+@@@ -47,6 -34,21 +47,24 @@@ struct arch_hw_breakpoint 
+  #define HW_BRK_TYPE_PRIV_ALL	(HW_BRK_TYPE_USER | HW_BRK_TYPE_KERNEL | \
+  				 HW_BRK_TYPE_HYP)
+  
+++<<<<<<< HEAD
+++=======
++ /* Minimum granularity */
++ #ifdef CONFIG_PPC_8xx
++ #define HW_BREAKPOINT_SIZE  0x4
++ #else
++ #define HW_BREAKPOINT_SIZE  0x8
++ #endif
++ 
++ #define DABR_MAX_LEN	8
++ #define DAWR_MAX_LEN	512
++ 
++ static inline int nr_wp_slots(void)
++ {
++ 	return HBP_NUM_MAX;
++ }
++ 
+++>>>>>>> e68ef121c1f4 (powerpc/watchpoint: Use builtin ALIGN*() macros)
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  #include <linux/kdebug.h>
+  #include <asm/reg.h>
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 3f3554b2c00f,4366bd0c90c4..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -142,6 -133,52 +142,55 @@@ int arch_bp_generic_fields(int type, in
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Watchpoint match range is always doubleword(8 bytes) aligned on
++  * powerpc. If the given range is crossing doubleword boundary, we
++  * need to increase the length such that next doubleword also get
++  * covered. Ex,
++  *
++  *          address   len = 6 bytes
++  *                |=========.
++  *   |------------v--|------v--------|
++  *   | | | | | | | | | | | | | | | | |
++  *   |---------------|---------------|
++  *    <---8 bytes--->
++  *
++  * In this case, we should configure hw as:
++  *   start_addr = address & ~(HW_BREAKPOINT_SIZE - 1)
++  *   len = 16 bytes
++  *
++  * @start_addr is inclusive but @end_addr is exclusive.
++  */
++ static int hw_breakpoint_validate_len(struct arch_hw_breakpoint *hw)
++ {
++ 	u16 max_len = DABR_MAX_LEN;
++ 	u16 hw_len;
++ 	unsigned long start_addr, end_addr;
++ 
++ 	start_addr = ALIGN_DOWN(hw->address, HW_BREAKPOINT_SIZE);
++ 	end_addr = ALIGN(hw->address + hw->len, HW_BREAKPOINT_SIZE);
++ 	hw_len = end_addr - start_addr;
++ 
++ 	if (dawr_enabled()) {
++ 		max_len = DAWR_MAX_LEN;
++ 		/* DAWR region can't cross 512 bytes boundary */
++ 		if (ALIGN(start_addr, SZ_512M) != ALIGN(end_addr - 1, SZ_512M))
++ 			return -EINVAL;
++ 	} else if (IS_ENABLED(CONFIG_PPC_8xx)) {
++ 		/* 8xx can setup a range without limitation */
++ 		max_len = U16_MAX;
++ 	}
++ 
++ 	if (hw_len > max_len)
++ 		return -EINVAL;
++ 
++ 	hw->hw_len = hw_len;
++ 	return 0;
++ }
++ 
++ /*
+++>>>>>>> e68ef121c1f4 (powerpc/watchpoint: Use builtin ALIGN*() macros)
+   * Validate the arch-specific HW Breakpoint register settings
+   */
+  int hw_breakpoint_arch_parse(struct perf_event *bp,
+diff --cc arch/powerpc/kernel/process.c
+index 6ca2453dede4,9b11575dcb8a..000000000000
+--- a/arch/powerpc/kernel/process.c
++++ b/arch/powerpc/kernel/process.c
+@@@ -775,31 -795,36 +775,61 @@@ static inline int set_dabr(struct arch_
+  	return __set_dabr(dabr, dabrx);
+  }
+  
+ -static inline int set_breakpoint_8xx(struct arch_hw_breakpoint *brk)
+ -{
+ +static inline int set_dawr(struct arch_hw_breakpoint *brk)
+ +{
+++<<<<<<< HEAD
+ +	unsigned long dawr, dawrx, mrd;
+ +
+ +	dawr = brk->address;
+ +
+ +	dawrx  = (brk->type & (HW_BRK_TYPE_READ | HW_BRK_TYPE_WRITE)) \
+ +		                   << (63 - 58); //* read/write bits */
+ +	dawrx |= ((brk->type & (HW_BRK_TYPE_TRANSLATE)) >> 2) \
+ +		                   << (63 - 59); //* translate */
+ +	dawrx |= (brk->type & (HW_BRK_TYPE_PRIV_ALL)) \
+ +		                   >> 3; //* PRIM bits */
+ +	/* dawr length is stored in field MDR bits 48:53.  Matches range in
+ +	   doublewords (64 bits) baised by -1 eg. 0b000000=1DW and
+ +	   0b111111=64DW.
+ +	   brk->len is in bytes.
+ +	   This aligns up to double word size, shifts and does the bias.
+ +	*/
+ +	mrd = ((brk->len + 7) >> 3) - 1;
+ +	dawrx |= (mrd & 0x3f) << (63 - 53);
+++=======
++ 	unsigned long lctrl1 = LCTRL1_CTE_GT | LCTRL1_CTF_LT | LCTRL1_CRWE_RW |
++ 			       LCTRL1_CRWF_RW;
++ 	unsigned long lctrl2 = LCTRL2_LW0EN | LCTRL2_LW0LADC | LCTRL2_SLW0EN;
++ 	unsigned long start_addr = ALIGN_DOWN(brk->address, HW_BREAKPOINT_SIZE);
++ 	unsigned long end_addr = ALIGN(brk->address + brk->len, HW_BREAKPOINT_SIZE);
++ 
++ 	if (start_addr == 0)
++ 		lctrl2 |= LCTRL2_LW0LA_F;
++ 	else if (end_addr == 0)
++ 		lctrl2 |= LCTRL2_LW0LA_E;
++ 	else
++ 		lctrl2 |= LCTRL2_LW0LA_EandF;
++ 
++ 	mtspr(SPRN_LCTRL2, 0);
++ 
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == 0)
++ 		return 0;
++ 
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == HW_BRK_TYPE_READ)
++ 		lctrl1 |= LCTRL1_CRWE_RO | LCTRL1_CRWF_RO;
++ 	if ((brk->type & HW_BRK_TYPE_RDWR) == HW_BRK_TYPE_WRITE)
++ 		lctrl1 |= LCTRL1_CRWE_WO | LCTRL1_CRWF_WO;
++ 
++ 	mtspr(SPRN_CMPE, start_addr - 1);
++ 	mtspr(SPRN_CMPF, end_addr);
++ 	mtspr(SPRN_LCTRL1, lctrl1);
++ 	mtspr(SPRN_LCTRL2, lctrl2);
+++>>>>>>> e68ef121c1f4 (powerpc/watchpoint: Use builtin ALIGN*() macros)
+  
+ +	if (ppc_md.set_dawr)
+ +		return ppc_md.set_dawr(dawr, dawrx);
+ +	mtspr(SPRN_DAWR, dawr);
+ +	mtspr(SPRN_DAWRX, dawrx);
+  	return 0;
+  }
+  
+* Unmerged path arch/powerpc/kernel/ptrace/ptrace-noadv.c
+* Unmerged path arch/powerpc/include/asm/hw_breakpoint.h
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
+* Unmerged path arch/powerpc/kernel/process.c
+* Unmerged path arch/powerpc/kernel/ptrace/ptrace-noadv.c
