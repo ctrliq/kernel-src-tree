@@ -636,7 +636,7 @@ struct netdev_queue {
 	struct dql		dql;
 #endif
 
-	RH_KABI_USE(1, struct xdp_umem	*umem)
+	RH_KABI_USE(1, struct xsk_buff_pool	*pool)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -759,7 +759,7 @@ struct netdev_rx_queue {
 	struct net_device		*dev;
 	RH_KABI_EXCLUDE(struct xdp_rxq_info	xdp_rxq)
 
-	RH_KABI_USE(1, struct xdp_umem	*umem)
+	RH_KABI_USE(1, struct xsk_buff_pool	*pool)
 	RH_KABI_RESERVE(2)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
@@ -894,8 +894,7 @@ enum bpf_netdev_command {
 	/* BPF program for offload callbacks, invoked at program load time. */
 	BPF_OFFLOAD_MAP_ALLOC,
 	BPF_OFFLOAD_MAP_FREE,
-	XDP_QUERY_XSK_UMEM,
-	XDP_SETUP_XSK_UMEM,
+	XDP_SETUP_XSK_POOL,
 };
 
 struct bpf_prog_offload_ops;
@@ -929,10 +928,10 @@ struct netdev_bpf {
 		struct {
 			struct bpf_offloaded_map *offmap;
 		};
-		/* XDP_QUERY_XSK_UMEM, XDP_SETUP_XSK_UMEM */
+		/* XDP_SETUP_XSK_POOL */
 		struct {
-			struct xdp_umem *umem; /* out for query*/
-			u16 queue_id; /* in for query */
+			struct xsk_buff_pool *pool;
+			u16 queue_id;
 		} xsk;
 	};
 };
@@ -1338,6 +1337,9 @@ struct devlink;
  *	Get devlink port instance associated with a given netdev.
  *	Called with a reference on the netdevice and devlink locks only,
  *	rtnl_lock is not held.
+ * struct net_device *(*ndo_get_peer_dev)(struct net_device *dev);
+ *	If a device is paired with a peer device, return the peer instance.
+ *	The caller must be under RCU read context.
  */
 struct net_device_ops {
 	int			(*ndo_init)(struct net_device *dev);
@@ -1559,7 +1561,7 @@ struct net_device_ops {
 								bool all_slaves))
 	RH_KABI_USE(6, struct net_device*	(*ndo_sk_get_lower_dev)(struct net_device *dev,
 							struct sock *sk))
-	RH_KABI_RESERVE(7)
+	RH_KABI_USE(7, struct net_device *(*ndo_get_peer_dev)(struct net_device *dev))
 	RH_KABI_RESERVE(8)
 	RH_KABI_RESERVE(9)
 	RH_KABI_RESERVE(10)

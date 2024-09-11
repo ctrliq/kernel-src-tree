@@ -149,7 +149,16 @@ static struct res_config spr_cfg = {
 	.support_ddr5		= true,
 };
 
+/* RHEL only: because of 38eb638a57a88d, we need to keep both structs */
 static const struct x86_cpu_id i10nm_cpuids[] = {
+	X86_MATCH_INTEL_FAM6_MODEL(ATOM_TREMONT_D,	&i10nm_cfg0),
+	X86_MATCH_INTEL_FAM6_MODEL(ICELAKE_X,		&i10nm_cfg0),
+	X86_MATCH_INTEL_FAM6_MODEL(ICELAKE_D,		&i10nm_cfg1),
+	X86_MATCH_INTEL_FAM6_MODEL(SAPPHIRERAPIDS_X,	&spr_cfg),
+	{}
+};
+
+static const struct x86_cpu_id_v2 i10nm_cpuids_v2[] = {
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ATOM_TREMONT_D,	X86_STEPPINGS(0x0, 0x3), &i10nm_cfg0),
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ATOM_TREMONT_D,	X86_STEPPINGS(0x4, 0xf), &i10nm_cfg1),
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(ICELAKE_X,		X86_STEPPINGS(0x0, 0x3), &i10nm_cfg0),
@@ -266,7 +275,7 @@ static inline void teardown_i10nm_debug(void) {}
 static int __init i10nm_init(void)
 {
 	u8 mc = 0, src_id = 0, node_id = 0;
-	const struct x86_cpu_id *id;
+	const struct x86_cpu_id_v2 *id;
 	struct res_config *cfg;
 	const char *owner;
 	struct skx_dev *d;
@@ -279,7 +288,7 @@ static int __init i10nm_init(void)
 	if (owner && strncmp(owner, EDAC_MOD_STR, sizeof(EDAC_MOD_STR)))
 		return -EBUSY;
 
-	id = x86_match_cpu(i10nm_cpuids);
+	id = x86_match_cpu_v2(i10nm_cpuids_v2);
 	if (!id)
 		return -ENODEV;
 

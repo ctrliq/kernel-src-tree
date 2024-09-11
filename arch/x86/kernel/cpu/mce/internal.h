@@ -117,7 +117,6 @@ struct mca_config {
 	      bios_cmci_threshold	: 1,
 	      __reserved		: 59;
 
-	u8 banks;
 	s8 bootlog;
 	int tolerant;
 	int monarch_timeout;
@@ -126,6 +125,7 @@ struct mca_config {
 };
 
 extern struct mca_config mca_cfg;
+DECLARE_PER_CPU_READ_MOSTLY(unsigned int, mce_num_banks);
 
 struct mce_vendor_flags {
 	/*
@@ -164,5 +164,11 @@ extern struct mca_msr_regs msr_ops;
 
 /* Decide whether to add MCE record to MCE event pool or filter it out. */
 extern bool filter_mce(struct mce *m);
+
+#ifdef CONFIG_X86_MCE_AMD
+extern bool amd_filter_mce(struct mce *m);
+#else
+static inline bool amd_filter_mce(struct mce *m)			{ return false; };
+#endif
 
 #endif /* __X86_MCE_INTERNAL_H__ */

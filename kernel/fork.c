@@ -841,6 +841,7 @@ bool dup_rh_task_struct(struct task_struct *dst, struct task_struct *src, int no
 	memcpy(dst->task_struct_rh,
 	       src->task_struct_rh,
 	       sizeof(struct task_struct_rh));
+	dst->task_struct_rh->task_struct = dst;
 
 	return true;
 }
@@ -1673,9 +1674,9 @@ static inline void rcu_copy_process(struct task_struct *p)
 	p->rcu_tasks_idle_cpu = -1;
 #endif /* #ifdef CONFIG_TASKS_RCU */
 #ifdef CONFIG_TASKS_TRACE_RCU
-	p->trc_reader_nesting = 0;
-	p->trc_reader_special.s = 0;
-	INIT_LIST_HEAD(&p->trc_holdout_list);
+	p->task_struct_rh->trc_reader_nesting = 0;
+	p->task_struct_rh->trc_reader_special.s = 0;
+	INIT_LIST_HEAD(&p->task_struct_rh->trc_holdout_list);
 #endif /* #ifdef CONFIG_TASKS_TRACE_RCU */
 }
 

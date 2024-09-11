@@ -20,9 +20,11 @@
 #ifndef __LINUX_BVEC_ITER_H
 #define __LINUX_BVEC_ITER_H
 
-#include <linux/kernel.h>
 #include <linux/bug.h>
 #include <linux/errno.h>
+#include <linux/limits.h>
+#include <linux/minmax.h>
+#include <linux/types.h>
 
 /**
  * struct bio_vec - a contiguous range of physical memory addresses

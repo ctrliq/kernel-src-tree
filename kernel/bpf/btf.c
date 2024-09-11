@@ -188,11 +188,6 @@
 	     i < btf_type_vlen(struct_type);				\
 	     i++, member++)
 
-#define for_each_vsi(i, struct_type, member)			\
-	for (i = 0, member = btf_type_var_secinfo(struct_type);	\
-	     i < btf_type_vlen(struct_type);			\
-	     i++, member++)
-
 #define for_each_vsi_from(i, from, struct_type, member)				\
 	for (i = from, member = btf_type_var_secinfo(struct_type) + from;	\
 	     i < btf_type_vlen(struct_type);					\
@@ -596,11 +591,6 @@ static const struct btf_enum *btf_type_enum(const struct btf_type *t)
 static const struct btf_var *btf_type_var(const struct btf_type *t)
 {
 	return (const struct btf_var *)(t + 1);
-}
-
-static const struct btf_var_secinfo *btf_type_var_secinfo(const struct btf_type *t)
-{
-	return (const struct btf_var_secinfo *)(t + 1);
 }
 
 static const struct btf_kind_operations *btf_type_ops(const struct btf_type *t)
@@ -1119,8 +1109,9 @@ static void *btf_show_obj_safe(struct btf_show *show,
 		size_left = btf_show_obj_size_left(show, data);
 		if (size_left > BTF_SHOW_OBJ_SAFE_SIZE)
 			size_left = BTF_SHOW_OBJ_SAFE_SIZE;
-		show->state.status = copy_from_kernel_nofault(show->obj.safe,
-							      data, size_left);
+		/* RH: upstream uses copy_from_kernel_nofault() */
+		show->state.status = probe_kernel_read(show->obj.safe,
+						       data, size_left);
 		if (!show->state.status) {
 			show->obj.data = data;
 			safe = show->obj.safe;
@@ -4907,19 +4898,6 @@ again:
 	return true;
 }
 
-int btf_resolve_helper_id(struct bpf_verifier_log *log,
-			  const struct bpf_func_proto *fn, int arg)
-{
-	int id;
-
-	if (fn->arg_type[arg] != ARG_PTR_TO_BTF_ID)
-		return -EINVAL;
-	id = fn->btf_id[arg];
-	if (!id || id > btf_vmlinux->nr_types)
-		return -EINVAL;
-	return id;
-}
-
 static int __get_type_size(struct btf *btf, u32 btf_id,
 			   const struct btf_type **bad_type)
 {
@@ -5351,8 +5329,8 @@ static void btf_seq_show(struct btf_show *show, const char *fmt,
 	seq_vprintf((struct seq_file *)show->target, fmt, args);
 }
 
-static int btf_type_seq_show_flags(const struct btf *btf, u32 type_id,
-				   void *obj, struct seq_file *m, u64 flags)
+int btf_type_seq_show_flags(const struct btf *btf, u32 type_id,
+			    void *obj, struct seq_file *m, u64 flags)
 {
 	struct btf_show sseq;
 

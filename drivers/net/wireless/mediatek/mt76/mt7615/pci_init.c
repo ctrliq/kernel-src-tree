@@ -40,12 +40,15 @@ static int mt7615_init_hardware(struct mt7615_dev *dev)
 	mt76_wr(dev, MT_INT_SOURCE_CSR, ~0);
 
 	INIT_WORK(&dev->mcu_work, mt7615_pci_init_work);
-	spin_lock_init(&dev->token_lock);
-	idr_init(&dev->token);
-
 	ret = mt7615_eeprom_init(dev, addr);
 	if (ret < 0)
 		return ret;
+
+	if (is_mt7663(&dev->mt76)) {
+		/* Reset RGU */
+		mt76_clear(dev, MT_MCU_CIRQ_IRQ_SEL(4), BIT(1));
+		mt76_set(dev, MT_MCU_CIRQ_IRQ_SEL(4), BIT(1));
+	}
 
 	ret = mt7615_dma_init(dev);
 	if (ret)
@@ -128,6 +131,7 @@ int mt7615_register_device(struct mt7615_dev *dev)
 	int ret;
 
 	mt7615_init_device(dev);
+	INIT_WORK(&dev->reset_work, mt7615_mac_reset_work);
 
 	/* init led callbacks */
 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {

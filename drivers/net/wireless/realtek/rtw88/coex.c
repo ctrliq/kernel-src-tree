@@ -8,6 +8,7 @@
 #include "ps.h"
 #include "debug.h"
 #include "reg.h"
+#include "phy.h"
 
 static u8 rtw_coex_next_rssi_state(struct rtw_dev *rtwdev, u8 pre_state,
 				   u8 rssi, u8 rssi_thresh)
@@ -318,7 +319,7 @@ static void rtw_coex_tdma_timer_base(struct rtw_dev *rtwdev, u8 type)
 	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], tbtt_interval = %d\n",
 		tbtt_interval);
 
-	if (type == TDMA_TIMER_TYPE_4SLOT) {
+	if (type == TDMA_TIMER_TYPE_4SLOT && tbtt_interval < 120) {
 		para[1] = PARA1_H2C69_TDMA_4SLOT; /* 4-slot */
 	} else if (tbtt_interval < 80 && tbtt_interval > 0) {
 		times = 100 / tbtt_interval;
@@ -428,6 +429,10 @@ static void rtw_coex_check_rfk(struct rtw_dev *rtwdev)
 
 			if (!btk && !wlk)
 				break;
+
+			rtw_dbg(rtwdev, RTW_DBG_COEX,
+				"[BTCoex], (Before Ant Setup) wlk = %d, btk = %d\n",
+				wlk, btk);
 
 			mdelay(COEX_MIN_DELAY);
 		} while (++cnt < wait_cnt);
@@ -757,6 +762,7 @@ static void rtw_coex_update_bt_link_info(struct rtw_dev *rtwdev)
 		coex_dm->bt_status = COEX_BTSTATUS_INQ_PAGE;
 	} else if (!(coex_stat->bt_info_lb2 & COEX_INFO_CONNECTION)) {
 		coex_dm->bt_status = COEX_BTSTATUS_NCON_IDLE;
+		coex_stat->bt_multi_link_remain = false;
 	} else if (coex_stat->bt_info_lb2 == COEX_INFO_CONNECTION) {
 		coex_dm->bt_status = COEX_BTSTATUS_CON_IDLE;
 	} else if ((coex_stat->bt_info_lb2 & COEX_INFO_SCO_ESCO) ||
@@ -864,7 +870,7 @@ static void rtw_coex_set_rf_para(struct rtw_dev *rtwdev,
 	struct rtw_coex_stat *coex_stat = &coex->stat;
 	u8 offset = 0;
 
-	if (coex->freerun && coex_stat->wl_noisy_level <= 1)
+	if (coex->freerun && coex_stat->cnt_wl[COEX_CNT_WL_SCANAP] <= 5)
 		offset = 3;
 
 	rtw_coex_set_wl_tx_power(rtwdev, para.wl_pwr_dec_lvl);
@@ -930,6 +936,69 @@ static void rtw_coex_set_gnt_wl(struct rtw_dev *rtwdev, u8 state)
 	rtw_coex_write_indirect_reg(rtwdev, LTE_COEX_CTRL, 0x0300, state);
 }
 
+static void rtw_btc_wltoggle_table_a(struct rtw_dev *rtwdev, bool force,
+				     u8 table_case)
+{
+	struct rtw_chip_info *chip = rtwdev->chip;
+	struct rtw_efuse *efuse = &rtwdev->efuse;
+	u8 h2c_para[6] = {0};
+	u32 table_wl = 0x5a5a5a5a;
+
+	h2c_para[0] = COEX_H2C69_TOGGLE_TABLE_A;
+	/* no definition */
+	h2c_para[1] = 0x1;
+
+	if (efuse->share_ant) {
+		if (table_case < chip->table_sant_num)
+			table_wl = chip->table_sant[table_case].wl;
+	} else {
+		if (table_case < chip->table_nsant_num)
+			table_wl = chip->table_nsant[table_case].wl;
+	}
+
+	/* tell WL FW WL slot toggle table-A*/
+	h2c_para[2] = (u8)u32_get_bits(table_wl, GENMASK(7, 0));
+	h2c_para[3] = (u8)u32_get_bits(table_wl, GENMASK(15, 8));
+	h2c_para[4] = (u8)u32_get_bits(table_wl, GENMASK(23, 16));
+	h2c_para[5] = (u8)u32_get_bits(table_wl, GENMASK(31, 24));
+
+	rtw_fw_bt_wifi_control(rtwdev, h2c_para[0], &h2c_para[1]);
+
+	rtw_dbg(rtwdev, RTW_DBG_COEX,
+		"[BTCoex], %s(): H2C = [%02x %02x %02x %02x %02x %02x]\n",
+		__func__, h2c_para[0], h2c_para[1], h2c_para[2],
+		h2c_para[3], h2c_para[4], h2c_para[5]);
+}
+
+#define COEX_WL_SLOT_TOGLLE 0x5a5a5aaa
+static void rtw_btc_wltoggle_table_b(struct rtw_dev *rtwdev, bool force,
+				     u8 interval, u32 table)
+{
+	struct rtw_coex *coex = &rtwdev->coex;
+	struct rtw_coex_stat *coex_stat = &coex->stat;
+	u8 cur_h2c_para[6] = {0};
+	u8 i;
+
+	cur_h2c_para[0] = COEX_H2C69_TOGGLE_TABLE_B;
+	cur_h2c_para[1] = interval;
+	cur_h2c_para[2] = (u8)u32_get_bits(table, GENMASK(7, 0));
+	cur_h2c_para[3] = (u8)u32_get_bits(table, GENMASK(15, 8));
+	cur_h2c_para[4] = (u8)u32_get_bits(table, GENMASK(23, 16));
+	cur_h2c_para[5] = (u8)u32_get_bits(table, GENMASK(31, 24));
+
+	coex_stat->wl_toggle_interval = interval;
+
+	for (i = 0; i <= 5; i++)
+		coex_stat->wl_toggle_para[i] = cur_h2c_para[i];
+
+	rtw_fw_bt_wifi_control(rtwdev, cur_h2c_para[0], &cur_h2c_para[1]);
+
+	rtw_dbg(rtwdev, RTW_DBG_COEX,
+		"[BTCoex], %s(): H2C = [%02x %02x %02x %02x %02x %02x]\n",
+		__func__, cur_h2c_para[0], cur_h2c_para[1], cur_h2c_para[2],
+		cur_h2c_para[3], cur_h2c_para[4], cur_h2c_para[5]);
+}
+
 static void rtw_coex_set_table(struct rtw_dev *rtwdev, bool force, u32 table0,
 			       u32 table1)
 {
@@ -958,6 +1027,7 @@ static void rtw_coex_table(struct rtw_dev *rtwdev, bool force, u8 type)
 	struct rtw_coex_dm *coex_dm = &coex->dm;
 	struct rtw_chip_info *chip = rtwdev->chip;
 	struct rtw_efuse *efuse = &rtwdev->efuse;
+	struct rtw_coex_stat *coex_stat = &coex->stat;
 
 	coex_dm->cur_table = type;
 
@@ -975,6 +1045,8 @@ static void rtw_coex_table(struct rtw_dev *rtwdev, bool force, u8 type)
 					   chip->table_nsant[type].bt,
 					   chip->table_nsant[type].wl);
 	}
+	if (coex_stat->wl_slot_toggle_change)
+		rtw_btc_wltoggle_table_a(rtwdev, true, type);
 }
 
 static void rtw_coex_ignore_wlan_act(struct rtw_dev *rtwdev, bool enable)
@@ -1024,6 +1096,7 @@ static void rtw_coex_set_tdma(struct rtw_dev *rtwdev, u8 byte1, u8 byte2,
 	struct rtw_coex *coex = &rtwdev->coex;
 	struct rtw_coex_dm *coex_dm = &coex->dm;
 	struct rtw_chip_info *chip = rtwdev->chip;
+	struct rtw_coex_stat *coex_stat = &coex->stat;
 	u8 ps_type = COEX_PS_WIFI_NATIVE;
 	bool ap_enable = false;
 
@@ -1065,6 +1138,14 @@ static void rtw_coex_set_tdma(struct rtw_dev *rtwdev, u8 byte1, u8 byte2,
 	coex_dm->ps_tdma_para[4] = byte5;
 
 	rtw_fw_coex_tdma_type(rtwdev, byte1, byte2, byte3, byte4, byte5);
+
+	if (byte1 & BIT(2)) {
+		coex_stat->wl_slot_toggle = true;
+		coex_stat->wl_slot_toggle_change = false;
+	} else {
+		coex_stat->wl_slot_toggle_change = coex_stat->wl_slot_toggle;
+		coex_stat->wl_slot_toggle = false;
+	}
 }
 
 static void rtw_coex_tdma(struct rtw_dev *rtwdev, bool force, u32 tcase)
@@ -1096,11 +1177,6 @@ static void rtw_coex_tdma(struct rtw_dev *rtwdev, bool force, u32 tcase)
 
 		return;
 	}
-
-	/* enable TBTT interrupt */
-	if (turn_on)
-		rtw_write8_set(rtwdev, REG_BCN_CTRL, BIT_EN_BCN_FUNCTION);
-
 	wl_busy = test_bit(RTW_FLAG_BUSY_TRAFFIC, rtwdev->flags);
 
 	if ((coex_stat->bt_a2dp_exist &&
@@ -1109,6 +1185,10 @@ static void rtw_coex_tdma(struct rtw_dev *rtwdev, bool force, u32 tcase)
 		rtw_coex_write_scbd(rtwdev, COEX_SCBD_TDMA, false);
 	else
 		rtw_coex_write_scbd(rtwdev, COEX_SCBD_TDMA, true);
+
+	/* update pre state */
+	coex_dm->cur_ps_tdma_on = turn_on;
+	coex_dm->cur_ps_tdma = type;
 
 	if (efuse->share_ant) {
 		if (type < chip->tdma_sant_num)
@@ -1129,17 +1209,16 @@ static void rtw_coex_tdma(struct rtw_dev *rtwdev, bool force, u32 tcase)
 					  chip->tdma_nsant[n].para[4]);
 	}
 
-	/* update pre state */
-	coex_dm->cur_ps_tdma_on = turn_on;
-	coex_dm->cur_ps_tdma = type;
 
-	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], coex tdma type (%d)\n", type);
+	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], coex tdma type(%s, %d)\n",
+		turn_on ? "on" : "off", type);
 }
 
 static void rtw_coex_set_ant_path(struct rtw_dev *rtwdev, bool force, u8 phase)
 {
 	struct rtw_coex *coex = &rtwdev->coex;
 	struct rtw_coex_stat *coex_stat = &coex->stat;
+	struct rtw_coex_rfe *coex_rfe = &coex->rfe;
 	struct rtw_coex_dm *coex_dm = &coex->dm;
 	u8 ctrl_type = COEX_SWITCH_CTRL_MAX;
 	u8 pos_type = COEX_SWITCH_TO_MAX;
@@ -1235,8 +1314,8 @@ static void rtw_coex_set_ant_path(struct rtw_dev *rtwdev, bool force, u8 phase)
 		rtw_dbg(rtwdev, RTW_DBG_COEX,
 			"[BTCoex], %s() - PHASE_5G_RUNTIME\n", __func__);
 
-		/* set GNT_BT to PTA */
-		rtw_coex_set_gnt_bt(rtwdev, COEX_GNT_SET_SW_HIGH);
+		/* set GNT_BT to HW PTA */
+		rtw_coex_set_gnt_bt(rtwdev, COEX_GNT_SET_HW_PTA);
 
 		/* set GNT_WL to SW high */
 		rtw_coex_set_gnt_wl(rtwdev, COEX_GNT_SET_SW_HIGH);
@@ -1251,8 +1330,8 @@ static void rtw_coex_set_ant_path(struct rtw_dev *rtwdev, bool force, u8 phase)
 		rtw_dbg(rtwdev, RTW_DBG_COEX,
 			"[BTCoex], %s() - PHASE_2G_FREERUN\n", __func__);
 
-		/* set GNT_BT to SW high */
-		rtw_coex_set_gnt_bt(rtwdev, COEX_GNT_SET_SW_HIGH);
+		/* set GNT_BT to HW PTA */
+		rtw_coex_set_gnt_bt(rtwdev, COEX_GNT_SET_HW_PTA);
 
 		/* Set GNT_WL to SW high */
 		rtw_coex_set_gnt_wl(rtwdev, COEX_GNT_SET_SW_HIGH);
@@ -1283,7 +1362,8 @@ static void rtw_coex_set_ant_path(struct rtw_dev *rtwdev, bool force, u8 phase)
 		return;
 	}
 
-	if (ctrl_type < COEX_SWITCH_CTRL_MAX && pos_type < COEX_SWITCH_TO_MAX)
+	if (ctrl_type < COEX_SWITCH_CTRL_MAX && pos_type < COEX_SWITCH_TO_MAX &&
+	    coex_rfe->ant_switch_exist)
 		rtw_coex_set_ant_switch(rtwdev, ctrl_type, pos_type);
 }
 
@@ -1521,27 +1601,42 @@ static void rtw_coex_action_bt_whql_test(struct rtw_dev *rtwdev)
 
 static void rtw_coex_action_bt_relink(struct rtw_dev *rtwdev)
 {
+	struct rtw_coex *coex = &rtwdev->coex;
+	struct rtw_coex_stat *coex_stat = &coex->stat;
 	struct rtw_efuse *efuse = &rtwdev->efuse;
 	struct rtw_chip_info *chip = rtwdev->chip;
 	u8 table_case, tdma_case;
+	u32 slot_type = 0;
 
 	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s()\n", __func__);
 
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
 	rtw_coex_set_rf_para(rtwdev, chip->wl_rf_para_rx[0]);
 
-	if (efuse->share_ant) {
-		/* Shared-Ant */
-		table_case = 1;
-		tdma_case = 0;
-	} else {
-		/* Non-Shared-Ant */
-		table_case = 100;
+	if (efuse->share_ant) { /* Shared-Ant */
+		if (coex_stat->wl_gl_busy) {
+			table_case = 26;
+			if (coex_stat->bt_hid_exist &&
+			    coex_stat->bt_profile_num == 1) {
+				slot_type = TDMA_4SLOT;
+				tdma_case = 20;
+			} else {
+				tdma_case = 20;
+			}
+		} else {
+			table_case = 1;
+			tdma_case = 0;
+		}
+	} else { /* Non-Shared-Ant */
+		if (coex_stat->wl_gl_busy)
+			table_case = 115;
+		else
+			table_case = 100;
 		tdma_case = 100;
 	}
 
 	rtw_coex_table(rtwdev, false, table_case);
-	rtw_coex_tdma(rtwdev, false, tdma_case);
+	rtw_coex_tdma(rtwdev, false, tdma_case | slot_type);
 }
 
 static void rtw_coex_action_bt_idle(struct rtw_dev *rtwdev)
@@ -1560,7 +1655,8 @@ static void rtw_coex_action_bt_idle(struct rtw_dev *rtwdev)
 	if (coex_rfe->ant_switch_with_bt &&
 	    coex_dm->bt_status == COEX_BTSTATUS_NCON_IDLE) {
 		if (efuse->share_ant &&
-		    COEX_RSSI_HIGH(coex_dm->wl_rssi_state[1])) {
+		    COEX_RSSI_HIGH(coex_dm->wl_rssi_state[3]) &&
+		    coex_stat->wl_gl_busy) {
 			table_case = 0;
 			tdma_case = 0;
 		} else if (!efuse->share_ant) {
@@ -1571,9 +1667,7 @@ static void rtw_coex_action_bt_idle(struct rtw_dev *rtwdev)
 
 	if (table_case != 0xff && tdma_case != 0xff) {
 		rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G_FREERUN);
-		rtw_coex_table(rtwdev, false, table_case);
-		rtw_coex_tdma(rtwdev, false, tdma_case);
-		return;
+		goto exit;
 	}
 
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
@@ -1584,8 +1678,12 @@ static void rtw_coex_action_bt_idle(struct rtw_dev *rtwdev)
 			table_case = 10;
 			tdma_case = 3;
 		} else if (coex_dm->bt_status == COEX_BTSTATUS_NCON_IDLE) {
-			table_case = 6;
-			tdma_case = 7;
+			table_case = 11;
+
+			if (coex_stat->lo_pri_rx + coex_stat->lo_pri_tx > 250)
+				tdma_case = 17;
+			else
+				tdma_case = 7;
 		} else {
 			table_case = 12;
 			tdma_case = 7;
@@ -1605,6 +1703,7 @@ static void rtw_coex_action_bt_idle(struct rtw_dev *rtwdev)
 		}
 	}
 
+exit:
 	rtw_coex_table(rtwdev, false, table_case);
 	rtw_coex_tdma(rtwdev, false, tdma_case);
 }
@@ -1633,6 +1732,7 @@ static void rtw_coex_action_bt_inquiry(struct rtw_dev *rtwdev)
 			rtw_dbg(rtwdev, RTW_DBG_COEX,
 				"[BTCoex], bt inq/page +  wifi hi-pri task\n");
 			table_case = 15;
+
 			if (coex_stat->bt_profile_num > 0)
 				tdma_case = 10;
 			else if (coex_stat->wl_hi_pri_task1)
@@ -1642,6 +1742,8 @@ static void rtw_coex_action_bt_inquiry(struct rtw_dev *rtwdev)
 			else
 				tdma_case = 9;
 		} else if (coex_stat->wl_gl_busy) {
+			rtw_dbg(rtwdev, RTW_DBG_COEX,
+				"[BTCoex], bt inq/page + wifi busy\n");
 			if (coex_stat->bt_profile_num == 0) {
 				table_case = 12;
 				tdma_case = 18;
@@ -1671,23 +1773,25 @@ static void rtw_coex_action_bt_inquiry(struct rtw_dev *rtwdev)
 		if (wl_hi_pri) {
 			rtw_dbg(rtwdev, RTW_DBG_COEX,
 				"[BTCoex], bt inq/page +  wifi hi-pri task\n");
-			table_case = 113;
-			if (coex_stat->bt_a2dp_exist &&
-			    !coex_stat->bt_pan_exist)
-				tdma_case = 111;
+			table_case = 114;
+
+			if (coex_stat->bt_profile_num > 0)
+				tdma_case = 110;
 			else if (coex_stat->wl_hi_pri_task1)
 				tdma_case = 106;
 			else if (!coex_stat->bt_page)
 				tdma_case = 108;
 			else
 				tdma_case = 109;
-		} else if (coex_stat->wl_gl_busy) {
+		}  else if (coex_stat->wl_gl_busy) {
+			rtw_dbg(rtwdev, RTW_DBG_COEX,
+				"[BTCoex], bt inq/page + wifi busy\n");
 			table_case = 114;
 			tdma_case = 121;
 		} else if (coex_stat->wl_connected) {
 			rtw_dbg(rtwdev, RTW_DBG_COEX,
 				"[BTCoex], bt inq/page +  wifi connected\n");
-			table_case = 100;
+			table_case = 101;
 			tdma_case = 100;
 		} else {
 			rtw_dbg(rtwdev, RTW_DBG_COEX,
@@ -1747,63 +1851,67 @@ static void rtw_coex_action_bt_hid(struct rtw_dev *rtwdev)
 	struct rtw_efuse *efuse = &rtwdev->efuse;
 	struct rtw_chip_info *chip = rtwdev->chip;
 	u8 table_case, tdma_case;
-	u32 wl_bw;
 	u32 slot_type = 0;
+	bool bt_multi_link_remain = false, is_toggle_table = false;
 
 	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s()\n", __func__);
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
 	rtw_coex_set_rf_para(rtwdev, chip->wl_rf_para_rx[0]);
 
-	wl_bw = rtwdev->hal.current_band_width;
-
 	if (efuse->share_ant) {
 		/* Shared-Ant */
 		if (coex_stat->bt_ble_exist) {
 			/* RCU */
-			if (!coex_stat->wl_gl_busy)
-				table_case = 14;
-			else
-				table_case = 15;
-
-			if (coex_stat->bt_a2dp_active || wl_bw == 0)
-				tdma_case = 18;
-			else if (coex_stat->wl_gl_busy)
-				tdma_case = 8;
-			else
-				tdma_case = 4;
-		} else {
-			if (coex_stat->bt_a2dp_active || wl_bw == 0) {
-				table_case = 8;
-				tdma_case = 4;
+			if (coex_stat->cnt_wl[COEX_CNT_WL_SCANAP] > 5) {
+				table_case = 26;
+				tdma_case = 2;
 			} else {
-				/* for 4/18 HID */
-				if (coex_stat->bt_418_hid_exist &&
-				    coex_stat->wl_gl_busy) {
-					table_case = 12;
-					tdma_case = 4;
-				} else if (coex_stat->bt_ble_hid_exist &&
-					   coex_stat->wl_gl_busy) {
-					table_case = 32;
-					tdma_case = 9;
-				} else {
-					table_case = 10;
-					tdma_case = 4;
-				}
+				table_case = 27;
+				tdma_case = 9;
+			}
+		} else {
+			/* Legacy HID  */
+			if (coex_stat->bt_profile_num == 1 &&
+			    (coex_stat->bt_multi_link ||
+			    (coex_stat->lo_pri_rx +
+			     coex_stat->lo_pri_tx > 360) ||
+			     coex_stat->bt_slave ||
+			     bt_multi_link_remain)) {
+				slot_type = TDMA_4SLOT;
+				table_case = 12;
+				tdma_case = 20;
+			} else if (coex_stat->bt_a2dp_active) {
+				table_case = 9;
+				tdma_case = 18;
+			} else if (coex_stat->bt_418_hid_exist &&
+				   coex_stat->wl_gl_busy) {
+				is_toggle_table = true;
+				slot_type = TDMA_4SLOT;
+				table_case = 9;
+				tdma_case = 24;
+			} else if (coex_stat->bt_ble_hid_exist &&
+				   coex_stat->wl_gl_busy) {
+				table_case = 32;
+				tdma_case = 9;
+			} else {
+				table_case = 9;
+				tdma_case = 9;
 			}
 		}
 	} else {
 		/* Non-Shared-Ant */
-		if (coex_stat->bt_a2dp_active) {
+		if (coex_stat->bt_ble_exist) {
+			/* BLE */
+			if (coex_stat->cnt_wl[COEX_CNT_WL_SCANAP] > 5) {
+				table_case = 121;
+				tdma_case = 102;
+			} else {
+				table_case = 122;
+				tdma_case = 109;
+			}
+		} else if (coex_stat->bt_a2dp_active) {
 			table_case = 113;
 			tdma_case = 118;
-		} else if (coex_stat->bt_ble_exist) {
-			/* BLE */
-			table_case = 113;
-
-			if (coex_stat->wl_gl_busy)
-				tdma_case = 106;
-			else
-				tdma_case = 104;
 		} else {
 			table_case = 113;
 			tdma_case = 104;
@@ -1811,6 +1919,11 @@ static void rtw_coex_action_bt_hid(struct rtw_dev *rtwdev)
 	}
 
 	rtw_coex_table(rtwdev, false, table_case);
+	if (is_toggle_table) {
+		rtw_btc_wltoggle_table_a(rtwdev, true, table_case);
+		rtw_btc_wltoggle_table_b(rtwdev, false, 1, COEX_WL_SLOT_TOGLLE);
+	}
+
 	rtw_coex_tdma(rtwdev, false, tdma_case | slot_type);
 }
 
@@ -1829,12 +1942,12 @@ static void rtw_coex_action_bt_a2dp(struct rtw_dev *rtwdev)
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
 	rtw_coex_set_rf_para(rtwdev, chip->wl_rf_para_rx[0]);
 
+	slot_type = TDMA_4SLOT;
+
 	if (efuse->share_ant) {
 		/* Shared-Ant */
-		slot_type = TDMA_4SLOT;
-
 		if (coex_stat->wl_gl_busy && coex_stat->wl_noisy_level == 0)
-			table_case = 11;
+			table_case = 12;
 		else
 			table_case = 9;
 
@@ -1917,7 +2030,7 @@ static void rtw_coex_action_bt_pan(struct rtw_dev *rtwdev)
 		if (coex_stat->wl_gl_busy)
 			tdma_case = 17;
 		else
-			tdma_case = 19;
+			tdma_case = 20;
 	} else {
 		/* Non-Shared-Ant */
 		table_case = 112;
@@ -1939,8 +2052,11 @@ static void rtw_coex_action_bt_a2dp_hid(struct rtw_dev *rtwdev)
 	struct rtw_coex_dm *coex_dm = &coex->dm;
 	struct rtw_efuse *efuse = &rtwdev->efuse;
 	struct rtw_chip_info *chip = rtwdev->chip;
-	u8 table_case, tdma_case;
+	u8 table_case, tdma_case, interval = 0;
 	u32 slot_type = 0;
+	bool is_toggle_table = false;
+
+	slot_type = TDMA_4SLOT;
 
 	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s()\n", __func__);
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
@@ -1948,17 +2064,23 @@ static void rtw_coex_action_bt_a2dp_hid(struct rtw_dev *rtwdev)
 
 	if (efuse->share_ant) {
 		/* Shared-Ant */
-		slot_type = TDMA_4SLOT;
-
-		if (coex_stat->bt_ble_exist)
-			table_case = 26;
-		else
+		if (coex_stat->bt_ble_exist) {
+			table_case = 26; /* for RCU */
+		} else if (coex_stat->bt_418_hid_exist) {
 			table_case = 9;
+			interval = 1;
+		} else {
+			table_case = 9;
+		}
 
-		if (coex_stat->wl_gl_busy)
-			tdma_case = 13;
-		else
+		if (coex_stat->wl_connecting || !coex_stat->wl_gl_busy) {
 			tdma_case = 14;
+		} else if (coex_stat->bt_418_hid_exist) {
+			is_toggle_table = true;
+			tdma_case = 23;
+		} else {
+			tdma_case = 13;
+		}
 	} else {
 		/* Non-Shared-Ant */
 		if (coex_stat->bt_ble_exist)
@@ -1973,6 +2095,10 @@ static void rtw_coex_action_bt_a2dp_hid(struct rtw_dev *rtwdev)
 	}
 
 	rtw_coex_table(rtwdev, false, table_case);
+	if (is_toggle_table) {
+		rtw_btc_wltoggle_table_a(rtwdev, true, table_case);
+		rtw_btc_wltoggle_table_b(rtwdev, false, interval, COEX_WL_SLOT_TOGLLE);
+	}
 	rtw_coex_tdma(rtwdev, false, tdma_case | slot_type);
 }
 
@@ -2195,8 +2321,7 @@ static void rtw_coex_action_wl_linkscan(struct rtw_dev *rtwdev)
 	rtw_coex_set_ant_path(rtwdev, false, COEX_SET_ANT_2G);
 	rtw_coex_set_rf_para(rtwdev, chip->wl_rf_para_rx[0]);
 
-	if (efuse->share_ant) {
-		/* Shared-Ant */
+	if (efuse->share_ant) { /* Shared-Ant */
 		if (coex_stat->bt_a2dp_exist) {
 			slot_type = TDMA_4SLOT;
 			tdma_case = 11;
@@ -2208,9 +2333,9 @@ static void rtw_coex_action_wl_linkscan(struct rtw_dev *rtwdev)
 			table_case = 9;
 			tdma_case = 7;
 		}
-	} else {
-		/* Non-Shared-Ant */
+	} else { /* Non-Shared-Ant */
 		if (coex_stat->bt_a2dp_exist) {
+			slot_type = TDMA_4SLOT;
 			table_case = 112;
 			tdma_case = 111;
 		} else {
@@ -2359,7 +2484,7 @@ static void rtw_coex_run_coex(struct rtw_dev *rtwdev, u8 reason)
 
 	rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], WiFi is single-port 2G!!\n");
 	coex_stat->wl_coex_mode = COEX_WLINK_2G1PORT;
-	rtw_coex_write_scbd(rtwdev, COEX_SCBD_FIX2M, false);
+
 	if (coex_stat->bt_disabled) {
 		if (coex_stat->wl_connected && rf4ce_en)
 			rtw_coex_action_rf4ce(rtwdev);
@@ -2397,15 +2522,18 @@ static void rtw_coex_run_coex(struct rtw_dev *rtwdev, u8 reason)
 		goto exit;
 	}
 
-	if (coex_stat->wl_linkscan_proc) {
+	if (coex_stat->wl_linkscan_proc && !coex->freerun) {
 		rtw_coex_action_wl_linkscan(rtwdev);
 		goto exit;
 	}
 
-	if (coex_stat->wl_connected)
+	if (coex_stat->wl_connected) {
 		rtw_coex_action_wl_connected(rtwdev);
-	else
+		goto exit;
+	} else {
 		rtw_coex_action_wl_not_connected(rtwdev);
+		goto exit;
+	}
 
 exit:
 	rtw_coex_gnt_workaround(rtwdev, false, coex_stat->wl_coex_mode);
@@ -2578,6 +2706,7 @@ void rtw_coex_lps_notify(struct rtw_dev *rtwdev, u8 type)
 		} else {
 			/* for native ps */
 			rtw_coex_write_scbd(rtwdev, COEX_SCBD_ACTIVE, false);
+			rtw_coex_write_scbd(rtwdev, COEX_SCBD_WLBUSY, false);
 
 			rtw_coex_run_coex(rtwdev, COEX_RSN_LPS);
 		}
@@ -2623,6 +2752,12 @@ void rtw_coex_scan_notify(struct rtw_dev *rtwdev, u8 type)
 		rtw_coex_set_ant_path(rtwdev, true, COEX_SET_ANT_2G);
 		rtw_coex_run_coex(rtwdev, COEX_RSN_2GSCANSTART);
 	} else {
+		coex_stat->cnt_wl[COEX_CNT_WL_SCANAP] = 30; /* To do */
+
+		rtw_dbg(rtwdev, RTW_DBG_COEX,
+			"[BTCoex], SCAN FINISH notify (Scan-AP = %d)\n",
+			coex_stat->cnt_wl[COEX_CNT_WL_SCANAP]);
+
 		coex_stat->wl_hi_pri_task2 = false;
 		rtw_coex_run_coex(rtwdev, COEX_RSN_SCANFINISH);
 	}
@@ -2678,6 +2813,7 @@ void rtw_coex_connect_notify(struct rtw_dev *rtwdev, u8 type)
 		rtw_coex_run_coex(rtwdev, COEX_RSN_5GCONFINISH);
 	} else if (type == COEX_ASSOCIATE_START) {
 		coex_stat->wl_hi_pri_task1 = true;
+		coex_stat->wl_connecting = true;
 		coex_stat->cnt_wl[COEX_CNT_WL_CONNPKT] = 2;
 		coex_stat->wl_connecting = true;
 		ieee80211_queue_delayed_work(rtwdev->hw,
@@ -2699,6 +2835,7 @@ void rtw_coex_connect_notify(struct rtw_dev *rtwdev, u8 type)
 	} else {
 		coex_stat->wl_hi_pri_task1 = false;
 		coex->freeze = false;
+		coex_stat->wl_connecting = false;
 
 		rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s(): 2G finish\n",
 			__func__);
@@ -2710,7 +2847,6 @@ void rtw_coex_media_status_notify(struct rtw_dev *rtwdev, u8 type)
 {
 	struct rtw_coex *coex = &rtwdev->coex;
 	struct rtw_coex_stat *coex_stat = &coex->stat;
-	u8 para[6] = {0};
 
 	if (coex->manual_control || coex->stop_dm)
 		return;
@@ -2725,6 +2861,8 @@ void rtw_coex_media_status_notify(struct rtw_dev *rtwdev, u8 type)
 	} else if (type == COEX_MEDIA_CONNECT) {
 		rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s(): 2G\n", __func__);
 
+		coex_stat->wl_connecting = false;
+
 		rtw_coex_write_scbd(rtwdev, COEX_SCBD_ACTIVE, true);
 
 		/* Force antenna setup for no scan result issue */
@@ -2732,15 +2870,8 @@ void rtw_coex_media_status_notify(struct rtw_dev *rtwdev, u8 type)
 
 		/* Set CCK Rx high Pri */
 		rtw_coex_set_wl_pri_mask(rtwdev, COEX_WLPRI_RX_CCK, 1);
-
-		/* always enable 5ms extend if connect */
-		para[0] = COEX_H2C69_WL_LEAKAP;
-		para[1] = PARA1_H2C69_EN_5MS; /* enable 5ms extend */
-		rtw_fw_bt_wifi_control(rtwdev, para[0], &para[1]);
-		coex_stat->wl_slot_extend = true;
 		rtw_coex_run_coex(rtwdev, COEX_RSN_2GMEDIA);
 	} else {
-		rtw_coex_write_scbd(rtwdev, COEX_SCBD_ACTIVE, false);
 		rtw_dbg(rtwdev, RTW_DBG_COEX, "[BTCoex], %s(): disconnect!!\n",
 			__func__);
 		rtw_coex_set_wl_pri_mask(rtwdev, COEX_WLPRI_RX_CCK, 0);
@@ -2873,21 +3004,38 @@ void rtw_coex_bt_info_notify(struct rtw_dev *rtwdev, u8 *buf, u8 length)
 						     4 * HZ);
 	}
 	coex_stat->bt_acl_busy = ((coex_stat->bt_info_lb2 & BIT(3)) == BIT(3));
-	if (coex_stat->bt_info_lb2 & BIT(5)) {
-		if (coex_stat->bt_info_hb1 & BIT(0)) {
-			/*BLE HID*/
-			coex_stat->bt_ble_hid_exist = true;
+	if (chip->ble_hid_profile_support) {
+		if (coex_stat->bt_info_lb2 & BIT(5)) {
+			if (coex_stat->bt_info_hb1 & BIT(0)) {
+				/*BLE HID*/
+				coex_stat->bt_ble_hid_exist = true;
+			} else {
+				coex_stat->bt_ble_hid_exist = false;
+			}
+			coex_stat->bt_ble_exist = false;
+		} else if (coex_stat->bt_info_hb1 & BIT(0)) {
+			/*RCU*/
+			coex_stat->bt_ble_hid_exist = false;
+			coex_stat->bt_ble_exist = true;
 		} else {
 			coex_stat->bt_ble_hid_exist = false;
+			coex_stat->bt_ble_exist = false;
 		}
-		coex_stat->bt_ble_exist = false;
-	} else if (coex_stat->bt_info_hb1 & BIT(0)) {
-		/*RCU*/
-		coex_stat->bt_ble_hid_exist = false;
-		coex_stat->bt_ble_exist = true;
 	} else {
-		coex_stat->bt_ble_hid_exist = false;
-		coex_stat->bt_ble_exist = false;
+		if (coex_stat->bt_info_hb1 & BIT(0)) {
+			if (coex_stat->bt_hid_slot == 1 &&
+			    coex_stat->hi_pri_rx + 100 < coex_stat->hi_pri_tx &&
+			    coex_stat->hi_pri_rx < 100) {
+				coex_stat->bt_ble_hid_exist = true;
+				coex_stat->bt_ble_exist = false;
+			} else {
+				coex_stat->bt_ble_hid_exist = false;
+				coex_stat->bt_ble_exist = true;
+			}
+		} else {
+			coex_stat->bt_ble_hid_exist = false;
+			coex_stat->bt_ble_exist = false;
+		}
 	}
 
 	coex_stat->cnt_bt[COEX_CNT_BT_RETRY] = coex_stat->bt_info_lb3 & 0xf;
@@ -2924,7 +3072,7 @@ void rtw_coex_bt_info_notify(struct rtw_dev *rtwdev, u8 *buf, u8 length)
 		if (coex_stat->bt_reenable)
 			bt_relink_time = 6 * HZ;
 		else
-			bt_relink_time = 2 * HZ;
+			bt_relink_time = 1 * HZ;
 
 		ieee80211_queue_delayed_work(rtwdev->hw,
 					     &coex->bt_relink_work,
@@ -2983,7 +3131,7 @@ void rtw_coex_bt_info_notify(struct rtw_dev *rtwdev, u8 *buf, u8 length)
 	coex_stat->bt_hid_pair_num = (coex_stat->bt_info_hb2 & 0xc0) >> 6;
 	if (coex_stat->bt_hid_pair_num > 0 && coex_stat->bt_hid_slot >= 2)
 		coex_stat->bt_418_hid_exist = true;
-	else if (coex_stat->bt_hid_pair_num == 0)
+	else if (coex_stat->bt_hid_pair_num == 0 || coex_stat->bt_hid_slot == 1)
 		coex_stat->bt_418_hid_exist = false;
 
 	if ((coex_stat->bt_info_lb2 & 0x49) == 0x49)
@@ -3170,6 +3318,81 @@ static const char *rtw_coex_get_reason_string(u8 reason)
 	default:
 		return "Unknown";
 	}
+}
+
+static u8 rtw_coex_get_table_index(struct rtw_dev *rtwdev, u32 wl_reg_6c0,
+				   u32 wl_reg_6c4)
+{
+	struct rtw_chip_info *chip = rtwdev->chip;
+	struct rtw_efuse *efuse = &rtwdev->efuse;
+	u8 ans = 0xFF;
+	u8 n, i;
+	u32 load_bt_val;
+	u32 load_wl_val;
+	bool share_ant = efuse->share_ant;
+
+	if (share_ant)
+		n = chip->table_sant_num;
+	else
+		n = chip->table_nsant_num;
+
+	for (i = 0; i < n; i++) {
+		if (share_ant) {
+			load_bt_val = chip->table_sant[i].bt;
+			load_wl_val = chip->table_sant[i].wl;
+		} else {
+			load_bt_val = chip->table_nsant[i].bt;
+			load_wl_val = chip->table_nsant[i].wl;
+		}
+
+		if (wl_reg_6c0 == load_bt_val &&
+		    wl_reg_6c4 == load_wl_val) {
+			ans = i;
+			if (!share_ant)
+				ans += 100;
+			break;
+		}
+	}
+
+	return ans;
+}
+
+static u8 rtw_coex_get_tdma_index(struct rtw_dev *rtwdev, u8 *tdma_para)
+{
+	struct rtw_efuse *efuse = &rtwdev->efuse;
+	struct rtw_chip_info *chip = rtwdev->chip;
+	u8 ans = 0xFF;
+	u8 n, i, j;
+	u8 load_cur_tab_val;
+	bool valid = false;
+	bool share_ant = efuse->share_ant;
+
+	if (share_ant)
+		n = chip->tdma_sant_num;
+	else
+		n = chip->tdma_nsant_num;
+
+	for (i = 0; i < n; i++) {
+		valid = false;
+		for (j = 0; j < 5; j++) {
+			if (share_ant)
+				load_cur_tab_val = chip->tdma_sant[i].para[j];
+			else
+				load_cur_tab_val = chip->tdma_nsant[i].para[j];
+
+			if (*(tdma_para + j) != load_cur_tab_val)
+				break;
+
+			if (j == 4)
+				valid = true;
+		}
+		if (valid) {
+			ans = i;
+			break;
+		}
+	}
+
+	return ans;
 }
 
 static int rtw_coex_addr_info(struct rtw_dev *rtwdev,
@@ -3461,6 +3684,13 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 	bt_lo_pri = rtw_read32(rtwdev, REG_BT_ACT_STATISTICS_1);
 	rtw_write8(rtwdev, REG_BT_COEX_ENH_INTR_CTRL,
 		   BIT_R_GRANTALL_WLMASK | BIT_STATIS_BT_EN);
+
+	coex_stat->hi_pri_tx = FIELD_GET(MASKLWORD, bt_hi_pri);
+	coex_stat->hi_pri_rx = FIELD_GET(MASKHWORD, bt_hi_pri);
+
+	coex_stat->lo_pri_tx = FIELD_GET(MASKLWORD, bt_lo_pri);
+	coex_stat->lo_pri_rx = FIELD_GET(MASKHWORD, bt_lo_pri);
+
 	sys_lte = rtw_read8(rtwdev, 0x73);
 	lte_coex = rtw_coex_read_indirect_reg(rtwdev, 0x38);
 	bt_coex = rtw_coex_read_indirect_reg(rtwdev, 0x54);
@@ -3512,15 +3742,17 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 		   coex_stat->bt_slave ? "Slave" : "Master",
 		   coex_stat->cnt_bt[COEX_CNT_BT_ROLESWITCH],
 		   coex_dm->ignore_wl_act);
-	seq_printf(m, "%-40s = %u.%u/ 0x%x/ %c\n",
-		   "WL FW/ BT FW/ KT",
+	seq_printf(m, "%-40s = %u.%u/ 0x%x/ 0x%x/ %c\n",
+		   "WL FW/ BT FW/ BT FW Desired/ KT",
 		   fw->version, fw->sub_version,
-		   coex_stat->patch_ver, coex_stat->kt_ver + 65);
+		   coex_stat->patch_ver,
+		   chip->wl_fw_desired_ver, coex_stat->kt_ver + 65);
 	seq_printf(m, "%-40s = %u/ %u/ %u/ ch-(%u)\n",
 		   "AFH Map",
 		   coex_dm->wl_ch_info[0], coex_dm->wl_ch_info[1],
 		   coex_dm->wl_ch_info[2], hal->current_channel);
 
+	rtw_debugfs_get_simple_phy_info(m);
 	seq_printf(m, "**********************************************\n");
 	seq_printf(m, "\t\tBT Status\n");
 	seq_printf(m, "**********************************************\n");
@@ -3564,8 +3796,8 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 		   score_board_WB, score_board_BW);
 	seq_printf(m, "%-40s = %u/%u, %u/%u\n",
 		   "Hi-Pri TX/RX, Lo-Pri TX/RX",
-		   bt_hi_pri & 0xffff, bt_hi_pri >> 16,
-		   bt_lo_pri & 0xffff, bt_lo_pri >> 16);
+		   coex_stat->hi_pri_tx, coex_stat->hi_pri_rx,
+		   coex_stat->lo_pri_tx, coex_stat->lo_pri_rx);
 	for (i = 0; i < COEX_BTINFO_SRC_BT_IQK; i++)
 		seq_printf(m, "%-40s = %7ph\n",
 			   rtw_coex_get_bt_info_src_string(i),
@@ -3594,9 +3826,11 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 		seq_printf(m, "**********************************************\n");
 		seq_printf(m, "\t\tMechanism (Under Manual)\n");
 		seq_printf(m, "**********************************************\n");
-		seq_printf(m, "%-40s = %5ph\n",
+		seq_printf(m, "%-40s = %5ph (%d)\n",
 			   "TDMA Now",
-			   coex_dm->fw_tdma_para);
+			   coex_dm->fw_tdma_para,
+			   rtw_coex_get_tdma_index(rtwdev,
+						   &coex_dm->fw_tdma_para[0]));
 	} else {
 		seq_printf(m, "**********************************************\n");
 		seq_printf(m, "\t\tMechanism\n");
@@ -3610,9 +3844,11 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 		   rtw_coex_get_wl_coex_mode(coex_stat->wl_coex_mode),
 		   coex->freerun ? "Yes" : "No",
 		   coex_stat->tdma_timer_base);
-	seq_printf(m, "%-40s = %d/ 0x%08x/ 0x%08x/ 0x%08x\n",
+	seq_printf(m, "%-40s = %d(%d)/ 0x%08x/ 0x%08x/ 0x%08x\n",
 		   "Table/ 0x6c0/ 0x6c4/ 0x6c8",
-		   coex_dm->cur_table, wl_reg_6c0, wl_reg_6c4, wl_reg_6c8);
+		   coex_dm->cur_table,
+		   rtw_coex_get_table_index(rtwdev, wl_reg_6c0, wl_reg_6c4),
+		   wl_reg_6c0, wl_reg_6c4, wl_reg_6c8);
 	seq_printf(m, "%-40s = 0x%08x/ 0x%08x/ %d/ reason (%s)\n",
 		   "0x778/ 0x6cc/ Run Count/ Reason",
 		   wl_reg_778, wl_reg_6cc,
@@ -3676,5 +3912,22 @@ void rtw_coex_display_coex_info(struct rtw_dev *rtwdev, struct seq_file *m)
 		   coex_stat->wl_noisy_level);
 
 	rtw_coex_set_coexinfo_hw(rtwdev, m);
+	seq_printf(m, "%-40s = %d/ %d/ %d/ %d\n",
+		   "EVM A/ EVM B/ SNR A/ SNR B",
+		   -dm_info->rx_evm_dbm[RF_PATH_A],
+		   -dm_info->rx_evm_dbm[RF_PATH_B],
+		   -dm_info->rx_snr[RF_PATH_A],
+		   -dm_info->rx_snr[RF_PATH_B]);
+	seq_printf(m, "%-40s = %d/ %d/ %d/ %d\n",
+		   "CCK-CCA/CCK-FA/OFDM-CCA/OFDM-FA",
+		   dm_info->cck_cca_cnt, dm_info->cck_fa_cnt,
+		   dm_info->ofdm_cca_cnt, dm_info->ofdm_fa_cnt);
+	seq_printf(m, "%-40s = %d/ %d/ %d/ %d\n", "CRC OK CCK/11g/11n/11ac",
+		   dm_info->cck_ok_cnt, dm_info->ofdm_ok_cnt,
+		   dm_info->ht_ok_cnt, dm_info->vht_ok_cnt);
+	seq_printf(m, "%-40s = %d/ %d/ %d/ %d\n", "CRC Err CCK/11g/11n/11ac",
+		   dm_info->cck_err_cnt, dm_info->ofdm_err_cnt,
+		   dm_info->ht_err_cnt, dm_info->vht_err_cnt);
+
 }
 #endif /* CONFIG_RTW88_DEBUGFS */

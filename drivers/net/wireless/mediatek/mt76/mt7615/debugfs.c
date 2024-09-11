@@ -21,6 +21,20 @@ mt7615_radar_pattern_set(void *data, u64 val)
 DEFINE_DEBUGFS_ATTRIBUTE(fops_radar_pattern, NULL,
 			 mt7615_radar_pattern_set, "%lld\n");
 
+static int mt7615_config(void *data, u64 val)
+{
+	struct mt7615_dev *dev = data;
+	int ret;
+
+	mt7615_mutex_acquire(dev);
+	ret = mt76_connac_mcu_chip_config(&dev->mt76);
+	mt7615_mutex_release(dev);
+
+	return ret;
+}
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_config, NULL, mt7615_config, "%lld\n");
+
 static int
 mt7615_scs_set(void *data, u64 val)
 {
@@ -55,6 +69,7 @@ static int
 mt7615_pm_set(void *data, u64 val)
 {
 	struct mt7615_dev *dev = data;
+	struct mt76_connac_pm *pm = &dev->pm;
 	int ret = 0;
 
 	if (!mt7615_wait_for_mcu_init(dev))
@@ -63,6 +78,9 @@ mt7615_pm_set(void *data, u64 val)
 	if (!mt7615_firmware_offload(dev) || !mt76_is_mmio(&dev->mt76))
 		return -EOPNOTSUPP;
 
+	if (val == pm->enable)
+		return 0;
+
 	mt7615_mutex_acquire(dev);
 
 	if (dev->phy.n_beacon_vif) {
@@ -70,7 +88,11 @@ mt7615_pm_set(void *data, u64 val)
 		goto out;
 	}
 
-	dev->pm.enable = val;
+	if (!pm->enable) {
+		pm->stats.last_wake_event = jiffies;
+		pm->stats.last_doze_event = jiffies;
+	}
+	pm->enable = val;
 out:
 	mt7615_mutex_release(dev);
 
@@ -88,6 +110,26 @@ mt7615_pm_get(void *data, u64 *val)
 }
 
 DEFINE_DEBUGFS_ATTRIBUTE(fops_pm, mt7615_pm_get, mt7615_pm_set, "%lld\n");
+
+static int
+mt7615_pm_stats(struct seq_file *s, void *data)
+{
+	struct mt7615_dev *dev = dev_get_drvdata(s->private);
+	struct mt76_connac_pm *pm = &dev->pm;
+	unsigned long awake_time = pm->stats.awake_time;
+	unsigned long doze_time = pm->stats.doze_time;
+
+	if (!test_bit(MT76_STATE_PM, &dev->mphy.state))
+		awake_time += jiffies - pm->stats.last_wake_event;
+	else
+		doze_time += jiffies - pm->stats.last_doze_event;
+
+	seq_printf(s, "awake time: %14u\ndoze time: %15u\n",
+		   jiffies_to_msecs(awake_time),
+		   jiffies_to_msecs(doze_time));
+
+	return 0;
+}
 
 static int
 mt7615_pm_idle_timeout_set(void *data, u64 val)
@@ -187,7 +229,7 @@ mt7615_reset_test_set(void *data, u64 val)
 	skb_put(skb, 1);
 
 	mt7615_mutex_acquire(dev);
-	mt76_tx_queue_skb_raw(dev, dev->mt76.q_tx[0], skb, 0);
+	mt76_tx_queue_skb_raw(dev, dev->mphy.q_tx[0], skb, 0);
 	mt7615_mutex_release(dev);
 
 	return 0;
@@ -336,7 +378,7 @@ mt7615_queues_read(struct seq_file *s, void *data)
 		struct mt76_queue *q;
 		char *queue;
 	} queue_map[] = {
-		{ dev->mt76.q_tx[MT_TXQ_BE], "PDMA0" },
+		{ dev->mphy.q_tx[MT_TXQ_BE], "PDMA0" },
 		{ dev->mt76.q_mcu[MT_MCUQ_WM], "MCUQ" },
 		{ dev->mt76.q_mcu[MT_MCUQ_FWDL], "MCUFWQ" },
 	};
@@ -501,6 +543,8 @@ int mt7615_init_debugfs(struct mt7615_dev *dev)
 	debugfs_create_file("runtime-pm", 0600, dir, dev, &fops_pm);
 	debugfs_create_file("idle-timeout", 0600, dir, dev,
 			    &fops_pm_idle_timeout);
+	debugfs_create_devm_seqfile(dev->mt76.dev, "runtime_pm_stats", dir,
+				    mt7615_pm_stats);
 	debugfs_create_devm_seqfile(dev->mt76.dev, "radio", dir,
 				    mt7615_radio_read);
 
@@ -530,6 +574,9 @@ int mt7615_init_debugfs(struct mt7615_dev *dev)
 	debugfs_create_u32("rf_regidx", 0600, dir, &dev->debugfs_rf_reg);
 	debugfs_create_file_unsafe("rf_regval", 0600, dir, dev,
 				   &fops_rf_reg);
+	if (is_mt7663(&dev->mt76))
+		debugfs_create_file("chip_config", 0600, dir, dev,
+				    &fops_config);
 	if (mt76_is_sdio(&dev->mt76))
 		debugfs_create_devm_seqfile(dev->mt76.dev, "sched-quota", dir,
 					    mt7663s_sched_quota_read);

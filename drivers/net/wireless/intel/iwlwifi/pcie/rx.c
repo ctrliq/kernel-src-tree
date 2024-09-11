@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2003-2014, 2018-2020 Intel Corporation
+ * Copyright (C) 2003-2014, 2018-2021 Intel Corporation
  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
  */
@@ -207,10 +207,10 @@ static void iwl_pcie_rxq_check_wrptr(struct iwl_trans *trans)
 
 		if (!rxq->need_update)
 			continue;
-		spin_lock(&rxq->lock);
+		spin_lock_bh(&rxq->lock);
 		iwl_pcie_rxq_inc_wr_ptr(trans, rxq);
 		rxq->need_update = false;
-		spin_unlock(&rxq->lock);
+		spin_unlock_bh(&rxq->lock);
 	}
 }
 
@@ -255,7 +255,7 @@ static void iwl_pcie_rxmq_restock(struct iwl_trans *trans,
 	if (!test_bit(STATUS_DEVICE_ENABLED, &trans->status))
 		return;
 
-	spin_lock(&rxq->lock);
+	spin_lock_bh(&rxq->lock);
 	while (rxq->free_count) {
 		/* Get next free Rx buffer, remove from free list */
 		rxb = list_first_entry(&rxq->rx_free, struct iwl_rx_mem_buffer,
@@ -269,16 +269,16 @@ static void iwl_pcie_rxmq_restock(struct iwl_trans *trans,
 		rxq->write = (rxq->write + 1) & (rxq->queue_size - 1);
 		rxq->free_count--;
 	}
-	spin_unlock(&rxq->lock);
+	spin_unlock_bh(&rxq->lock);
 
 	/*
 	 * If we've added more space for the firmware to place data, tell it.
 	 * Increment device's write pointer in multiples of 8.
 	 */
 	if (rxq->write_actual != (rxq->write & ~0x7)) {
-		spin_lock(&rxq->lock);
+		spin_lock_bh(&rxq->lock);
 		iwl_pcie_rxq_inc_wr_ptr(trans, rxq);
-		spin_unlock(&rxq->lock);
+		spin_unlock_bh(&rxq->lock);
 	}
 }
 
@@ -514,10 +514,10 @@ static void iwl_pcie_rx_allocator(struct iwl_trans *trans)
 	IWL_DEBUG_TPT(trans, "Pending allocation requests = %d\n", pending);
 
 	/* If we were scheduled - there is at least one request */
-	spin_lock(&rba->lock);
+	spin_lock_bh(&rba->lock);
 	/* swap out the rba->rbd_empty to a local list */
 	list_replace_init(&rba->rbd_empty, &local_empty);
-	spin_unlock(&rba->lock);
+	spin_unlock_bh(&rba->lock);
 
 	while (pending) {
 		int i;
@@ -577,21 +577,21 @@ static void iwl_pcie_rx_allocator(struct iwl_trans *trans)
 					      pending);
 		}
 
-		spin_lock(&rba->lock);
+		spin_lock_bh(&rba->lock);
 		/* add the allocated rbds to the allocator allocated list */
 		list_splice_tail(&local_allocated, &rba->rbd_allocated);
 		/* get more empty RBDs for current pending requests */
 		list_splice_tail_init(&rba->rbd_empty, &local_empty);
-		spin_unlock(&rba->lock);
+		spin_unlock_bh(&rba->lock);
 
 		atomic_inc(&rba->req_ready);
 
 	}
 
-	spin_lock(&rba->lock);
+	spin_lock_bh(&rba->lock);
 	/* return unused rbds to the allocator empty list */
 	list_splice_tail(&local_empty, &rba->rbd_empty);
-	spin_unlock(&rba->lock);
+	spin_unlock_bh(&rba->lock);
 
 	IWL_DEBUG_TPT(trans, "%s, exit.\n", __func__);
 }
@@ -1009,10 +1009,65 @@ void iwl_pcie_rx_init_rxb_lists(struct iwl_rxq *rxq)
 	rxq->used_count = 0;
 }
 
-int iwl_pcie_dummy_napi_poll(struct napi_struct *napi, int budget)
+static int iwl_pcie_rx_handle(struct iwl_trans *trans, int queue, int budget);
+
+static int iwl_pcie_napi_poll(struct napi_struct *napi, int budget)
 {
-	WARN_ON(1);
-	return 0;
+	struct iwl_rxq *rxq = container_of(napi, struct iwl_rxq, napi);
+	struct iwl_trans_pcie *trans_pcie;
+	struct iwl_trans *trans;
+	int ret;
+
+	trans_pcie = container_of(napi->dev, struct iwl_trans_pcie, napi_dev);
+	trans = trans_pcie->trans;
+
+	ret = iwl_pcie_rx_handle(trans, rxq->id, budget);
+
+	IWL_DEBUG_ISR(trans, "[%d] handled %d, budget %d\n",
+		      rxq->id, ret, budget);
+
+	if (ret < budget) {
+		spin_lock(&trans_pcie->irq_lock);
+		if (test_bit(STATUS_INT_ENABLED, &trans->status))
+			_iwl_enable_interrupts(trans);
+		spin_unlock(&trans_pcie->irq_lock);
+
+		napi_complete_done(&rxq->napi, ret);
+	}
+
+	return ret;
+}
+
+static int iwl_pcie_napi_poll_msix(struct napi_struct *napi, int budget)
+{
+	struct iwl_rxq *rxq = container_of(napi, struct iwl_rxq, napi);
+	struct iwl_trans_pcie *trans_pcie;
+	struct iwl_trans *trans;
+	int ret;
+
+	trans_pcie = container_of(napi->dev, struct iwl_trans_pcie, napi_dev);
+	trans = trans_pcie->trans;
+
+	ret = iwl_pcie_rx_handle(trans, rxq->id, budget);
+	IWL_DEBUG_ISR(trans, "[%d] handled %d, budget %d\n", rxq->id, ret,
+		      budget);
+
+	if (ret < budget) {
+		int irq_line = rxq->id;
+
+		/* FIRST_RSS is shared with line 0 */
+		if (trans_pcie->shared_vec_mask & IWL_SHARED_IRQ_FIRST_RSS &&
+		    rxq->id == 1)
+			irq_line = 0;
+
+		spin_lock(&trans_pcie->irq_lock);
+		iwl_pcie_clear_irq(trans, irq_line);
+		spin_unlock(&trans_pcie->irq_lock);
+
+		napi_complete_done(&rxq->napi, ret);
+	}
+
+	return ret;
 }
 
 static int _iwl_pcie_rx_init(struct iwl_trans *trans)
@@ -1031,12 +1086,12 @@ static int _iwl_pcie_rx_init(struct iwl_trans *trans)
 
 	cancel_work_sync(&rba->rx_alloc);
 
-	spin_lock(&rba->lock);
+	spin_lock_bh(&rba->lock);
 	atomic_set(&rba->req_pending, 0);
 	atomic_set(&rba->req_ready, 0);
 	INIT_LIST_HEAD(&rba->rbd_allocated);
 	INIT_LIST_HEAD(&rba->rbd_empty);
-	spin_unlock(&rba->lock);
+	spin_unlock_bh(&rba->lock);
 
 	/* free all first - we might be reconfigured for a different size */
 	iwl_pcie_free_rbs_pool(trans);
@@ -1063,11 +1118,19 @@ static int _iwl_pcie_rx_init(struct iwl_trans *trans)
 
 		iwl_pcie_rx_init_rxb_lists(rxq);
 
-		if (!rxq->napi.poll)
-			netif_napi_add(&trans_pcie->napi_dev, &rxq->napi,
-				       iwl_pcie_dummy_napi_poll, 64);
-
 		spin_unlock_bh(&rxq->lock);
+
+		if (!rxq->napi.poll) {
+			int (*poll)(struct napi_struct *, int) = iwl_pcie_napi_poll;
+
+			if (trans_pcie->msix_enabled)
+				poll = iwl_pcie_napi_poll_msix;
+
+			netif_napi_add(&trans_pcie->napi_dev, &rxq->napi,
+				       poll, NAPI_POLL_WEIGHT);
+			napi_enable(&rxq->napi);
+		}
+
 	}
 
 	/* move the pool to the default queue and allocator ownerships */
@@ -1164,8 +1227,10 @@ void iwl_pcie_rx_free(struct iwl_trans *trans)
 
 		iwl_pcie_free_rxq_dma(trans, rxq);
 
-		if (rxq->napi.poll)
+		if (rxq->napi.poll) {
+			napi_disable(&rxq->napi);
 			netif_napi_del(&rxq->napi);
+		}
 	}
 	kfree(trans_pcie->rx_pool);
 	kfree(trans_pcie->global_table);
@@ -1418,15 +1483,15 @@ out_err:
 /*
  * iwl_pcie_rx_handle - Main entry function for receiving responses from fw
  */
-static void iwl_pcie_rx_handle(struct iwl_trans *trans, int queue)
+static int iwl_pcie_rx_handle(struct iwl_trans *trans, int queue, int budget)
 {
 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
 	struct iwl_rxq *rxq;
-	u32 r, i, count = 0;
+	u32 r, i, count = 0, handled = 0;
 	bool emergency = false;
 
 	if (WARN_ON_ONCE(!trans_pcie->rxq || !trans_pcie->rxq[queue].bd))
-		return;
+		return budget;
 
 	rxq = &trans_pcie->rxq[queue];
 
@@ -1444,7 +1509,7 @@ restart:
 	if (i == r)
 		IWL_DEBUG_RX(trans, "Q %d: HW = SW = %d\n", rxq->id, r);
 
-	while (i != r) {
+	while (i != r && ++handled < budget) {
 		struct iwl_rb_allocator *rba = &trans_pcie->rba;
 		struct iwl_rx_mem_buffer *rxb;
 		/* number of RBDs still waiting for page allocation */
@@ -1545,10 +1610,9 @@ out:
 	if (unlikely(emergency && count))
 		iwl_pcie_rxq_alloc_rbs(trans, GFP_ATOMIC, rxq);
 
-	if (rxq->napi.poll)
-		napi_gro_flush(&rxq->napi, false);
-
 	iwl_pcie_rxq_restock(trans, rxq);
+
+	return handled;
 }
 
 static struct iwl_trans_pcie *iwl_pcie_get_trans_pcie(struct msix_entry *entry)
@@ -1568,22 +1632,27 @@ irqreturn_t iwl_pcie_irq_rx_msix_handler(int irq, void *dev_id)
 	struct msix_entry *entry = dev_id;
 	struct iwl_trans_pcie *trans_pcie = iwl_pcie_get_trans_pcie(entry);
 	struct iwl_trans *trans = trans_pcie->trans;
+	struct iwl_rxq *rxq = &trans_pcie->rxq[entry->entry];
 
 	trace_iwlwifi_dev_irq_msix(trans->dev, entry, false, 0, 0);
 
 	if (WARN_ON(entry->entry >= trans->num_rx_queues))
 		return IRQ_NONE;
 
-	if (WARN_ONCE(!rxq, "Got MSI-X interrupt before we have Rx queues"))
+	if (WARN_ONCE(!rxq,
+		      "[%d] Got MSI-X interrupt before we have Rx queues",
+		      entry->entry))
 		return IRQ_NONE;
 
 	lock_map_acquire(&trans->sync_cmd_lockdep_map);
+	IWL_DEBUG_ISR(trans, "[%d] Got interrupt\n", entry->entry);
 
 	local_bh_disable();
-	iwl_pcie_rx_handle(trans, entry->entry);
+	if (napi_schedule_prep(&rxq->napi))
+		__napi_schedule(&rxq->napi);
+	else
+		iwl_pcie_clear_irq(trans, entry->entry);
 	local_bh_enable();
-
-	iwl_pcie_clear_irq(trans, entry);
 
 	lock_map_release(&trans->sync_cmd_lockdep_map);
 
@@ -1751,10 +1820,11 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 	struct isr_statistics *isr_stats = &trans_pcie->isr_stats;
 	u32 inta = 0;
 	u32 handled = 0;
+	bool polling = false;
 
 	lock_map_acquire(&trans->sync_cmd_lockdep_map);
 
-	spin_lock(&trans_pcie->irq_lock);
+	spin_lock_bh(&trans_pcie->irq_lock);
 
 	/* dram interrupt table not set yet,
 	 * use legacy interrupt.
@@ -1791,7 +1861,7 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 		 */
 		if (test_bit(STATUS_INT_ENABLED, &trans->status))
 			_iwl_enable_interrupts(trans);
-		spin_unlock(&trans_pcie->irq_lock);
+		spin_unlock_bh(&trans_pcie->irq_lock);
 		lock_map_release(&trans->sync_cmd_lockdep_map);
 		return IRQ_NONE;
 	}
@@ -1802,7 +1872,7 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 		 * already raised an interrupt.
 		 */
 		IWL_WARN(trans, "HARDWARE GONE?? INTA == 0x%08x\n", inta);
-		spin_unlock(&trans_pcie->irq_lock);
+		spin_unlock_bh(&trans_pcie->irq_lock);
 		goto out;
 	}
 
@@ -1823,7 +1893,7 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 		IWL_DEBUG_ISR(trans, "inta 0x%08x, enabled 0x%08x\n",
 			      inta, iwl_read32(trans, CSR_INT_MASK));
 
-	spin_unlock(&trans_pcie->irq_lock);
+	spin_unlock_bh(&trans_pcie->irq_lock);
 
 	/* Now service all interrupt bits discovered above. */
 	if (inta & CSR_INT_BIT_HW_ERR) {
@@ -1943,7 +2013,10 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 		isr_stats->rx++;
 
 		local_bh_disable();
-		iwl_pcie_rx_handle(trans, 0);
+		if (napi_schedule_prep(&trans_pcie->rxq[0].napi)) {
+			polling = true;
+			__napi_schedule(&trans_pcie->rxq[0].napi);
+		}
 		local_bh_enable();
 	}
 
@@ -1968,20 +2041,22 @@ irqreturn_t iwl_pcie_irq_handler(int irq, void *dev_id)
 			 inta & ~trans_pcie->inta_mask);
 	}
 
-	spin_lock(&trans_pcie->irq_lock);
-	/* only Re-enable all interrupt if disabled by irq */
-	if (test_bit(STATUS_INT_ENABLED, &trans->status))
-		_iwl_enable_interrupts(trans);
-	/* we are loading the firmware, enable FH_TX interrupt only */
-	else if (handled & CSR_INT_BIT_FH_TX)
-		iwl_enable_fw_load_int(trans);
-	/* Re-enable RF_KILL if it occurred */
-	else if (handled & CSR_INT_BIT_RF_KILL)
-		iwl_enable_rfkill_int(trans);
-	/* Re-enable the ALIVE / Rx interrupt if it occurred */
-	else if (handled & (CSR_INT_BIT_ALIVE | CSR_INT_BIT_FH_RX))
-		iwl_enable_fw_load_int_ctx_info(trans);
-	spin_unlock(&trans_pcie->irq_lock);
+	if (!polling) {
+		spin_lock_bh(&trans_pcie->irq_lock);
+		/* only Re-enable all interrupt if disabled by irq */
+		if (test_bit(STATUS_INT_ENABLED, &trans->status))
+			_iwl_enable_interrupts(trans);
+		/* we are loading the firmware, enable FH_TX interrupt only */
+		else if (handled & CSR_INT_BIT_FH_TX)
+			iwl_enable_fw_load_int(trans);
+		/* Re-enable RF_KILL if it occurred */
+		else if (handled & CSR_INT_BIT_RF_KILL)
+			iwl_enable_rfkill_int(trans);
+		/* Re-enable the ALIVE / Rx interrupt if it occurred */
+		else if (handled & (CSR_INT_BIT_ALIVE | CSR_INT_BIT_FH_RX))
+			iwl_enable_fw_load_int_ctx_info(trans);
+		spin_unlock_bh(&trans_pcie->irq_lock);
+	}
 
 out:
 	lock_map_release(&trans->sync_cmd_lockdep_map);
@@ -2043,7 +2118,7 @@ void iwl_pcie_reset_ict(struct iwl_trans *trans)
 	if (!trans_pcie->ict_tbl)
 		return;
 
-	spin_lock(&trans_pcie->irq_lock);
+	spin_lock_bh(&trans_pcie->irq_lock);
 	_iwl_disable_interrupts(trans);
 
 	memset(trans_pcie->ict_tbl, 0, ICT_SIZE);
@@ -2061,7 +2136,7 @@ void iwl_pcie_reset_ict(struct iwl_trans *trans)
 	trans_pcie->ict_index = 0;
 	iwl_write32(trans, CSR_INT, trans_pcie->inta_mask);
 	_iwl_enable_interrupts(trans);
-	spin_unlock(&trans_pcie->irq_lock);
+	spin_unlock_bh(&trans_pcie->irq_lock);
 }
 
 /* Device is going down disable ict interrupt usage */
@@ -2069,9 +2144,9 @@ void iwl_pcie_disable_ict(struct iwl_trans *trans)
 {
 	struct iwl_trans_pcie *trans_pcie = IWL_TRANS_GET_PCIE_TRANS(trans);
 
-	spin_lock(&trans_pcie->irq_lock);
+	spin_lock_bh(&trans_pcie->irq_lock);
 	trans_pcie->use_ict = false;
-	spin_unlock(&trans_pcie->irq_lock);
+	spin_unlock_bh(&trans_pcie->irq_lock);
 }
 
 irqreturn_t iwl_pcie_isr(int irq, void *data)
@@ -2104,6 +2179,7 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 	struct isr_statistics *isr_stats = &trans_pcie->isr_stats;
 	u32 inta_fh_msk = ~MSIX_FH_INT_CAUSES_DATA_QUEUE;
 	u32 inta_fh, inta_hw;
+	bool polling = false;
 
 	if (trans_pcie->shared_vec_mask & IWL_SHARED_IRQ_NON_RX)
 		inta_fh_msk |= MSIX_FH_INT_CAUSES_Q0;
@@ -2113,7 +2189,7 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 
 	lock_map_acquire(&trans->sync_cmd_lockdep_map);
 
-	spin_lock(&trans_pcie->irq_lock);
+	spin_lock_bh(&trans_pcie->irq_lock);
 	inta_fh = iwl_read32(trans, CSR_MSIX_FH_INT_CAUSES_AD);
 	inta_hw = iwl_read32(trans, CSR_MSIX_HW_INT_CAUSES_AD);
 	/*
@@ -2121,7 +2197,7 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 	 */
 	iwl_write32(trans, CSR_MSIX_FH_INT_CAUSES_AD, inta_fh & inta_fh_msk);
 	iwl_write32(trans, CSR_MSIX_HW_INT_CAUSES_AD, inta_hw);
-	spin_unlock(&trans_pcie->irq_lock);
+	spin_unlock_bh(&trans_pcie->irq_lock);
 
 	trace_iwlwifi_dev_irq_msix(trans->dev, entry, true, inta_fh, inta_hw);
 
@@ -2133,8 +2209,8 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 
 	if (iwl_have_debug_level(IWL_DL_ISR)) {
 		IWL_DEBUG_ISR(trans,
-			      "ISR inta_fh 0x%08x, enabled (sw) 0x%08x (hw) 0x%08x\n",
-			      inta_fh, trans_pcie->fh_mask,
+			      "ISR[%d] inta_fh 0x%08x, enabled (sw) 0x%08x (hw) 0x%08x\n",
+			      entry->entry, inta_fh, trans_pcie->fh_mask,
 			      iwl_read32(trans, CSR_MSIX_FH_INT_MASK_AD));
 		if (inta_fh & ~trans_pcie->fh_mask)
 			IWL_DEBUG_ISR(trans,
@@ -2147,14 +2223,20 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 	if ((trans_pcie->shared_vec_mask & IWL_SHARED_IRQ_NON_RX) &&
 	    inta_fh & MSIX_FH_INT_CAUSES_Q0) {
 		local_bh_disable();
-		iwl_pcie_rx_handle(trans, 0);
+		if (napi_schedule_prep(&trans_pcie->rxq[0].napi)) {
+			polling = true;
+			__napi_schedule(&trans_pcie->rxq[0].napi);
+		}
 		local_bh_enable();
 	}
 
 	if ((trans_pcie->shared_vec_mask & IWL_SHARED_IRQ_FIRST_RSS) &&
 	    inta_fh & MSIX_FH_INT_CAUSES_Q1) {
 		local_bh_disable();
-		iwl_pcie_rx_handle(trans, 1);
+		if (napi_schedule_prep(&trans_pcie->rxq[1].napi)) {
+			polling = true;
+			__napi_schedule(&trans_pcie->rxq[1].napi);
+		}
 		local_bh_enable();
 	}
 
@@ -2183,8 +2265,8 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 	/* After checking FH register check HW register */
 	if (iwl_have_debug_level(IWL_DL_ISR)) {
 		IWL_DEBUG_ISR(trans,
-			      "ISR inta_hw 0x%08x, enabled (sw) 0x%08x (hw) 0x%08x\n",
-			      inta_hw, trans_pcie->hw_mask,
+			      "ISR[%d] inta_hw 0x%08x, enabled (sw) 0x%08x (hw) 0x%08x\n",
+			      entry->entry, inta_hw, trans_pcie->hw_mask,
 			      iwl_read32(trans, CSR_MSIX_HW_INT_MASK_AD));
 		if (inta_hw & ~trans_pcie->hw_mask)
 			IWL_DEBUG_ISR(trans,
@@ -2249,7 +2331,8 @@ irqreturn_t iwl_pcie_irq_msix_handler(int irq, void *dev_id)
 		wake_up(&trans_pcie->fw_reset_waitq);
 	}
 
-	iwl_pcie_clear_irq(trans, entry);
+	if (!polling)
+		iwl_pcie_clear_irq(trans, entry->entry);
 
 	lock_map_release(&trans->sync_cmd_lockdep_map);
 

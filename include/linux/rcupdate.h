@@ -167,11 +167,12 @@ void synchronize_rcu_tasks(void);
 # endif
 
 # ifdef CONFIG_TASKS_RCU_TRACE
-# define rcu_tasks_trace_qs(t)						\
+# define rcu_tasks_trace_qs(t)					\
 	do {								\
-		if (!likely(READ_ONCE((t)->trc_reader_checked)) &&	\
-		    !unlikely(READ_ONCE((t)->trc_reader_nesting))) {	\
-			smp_store_release(&(t)->trc_reader_checked, true); \
+		struct task_struct_rh *t_rh = (t)->task_struct_rh;	\
+		if (!likely(READ_ONCE(t_rh->trc_reader_checked)) &&	\
+		    !unlikely(READ_ONCE(t_rh->trc_reader_nesting))) {	\
+			smp_store_release(&t_rh->trc_reader_checked, true); \
 			smp_mb(); /* Readers partitioned by store. */	\
 		}							\
 	} while (0)

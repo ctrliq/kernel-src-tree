@@ -162,6 +162,7 @@ static const struct ath11k_hw_params ath11k_hw_params[] = {
 		.single_pdev_only = false,
 		.qmi_service_ins_id = ATH11K_QMI_WLFW_SERVICE_INS_ID_V01_QCN9074,
 		.hw_ops = &qcn9074_ops,
+		.ring_mask = &ath11k_hw_ring_mask_qcn9074,
 		.internal_sleep_clock = false,
 		.regs = &qcn9074_regs,
 		.host_ce_config = ath11k_host_ce_config_qcn9074,
@@ -1095,6 +1096,9 @@ struct ath11k_base *ath11k_core_alloc(struct device *dev, size_t priv_size,
 	init_waitqueue_head(&ab->qmi.cold_boot_waitq);
 	INIT_WORK(&ab->restart_work, ath11k_core_restart);
 	timer_setup(&ab->rx_replenish_retry, ath11k_ce_rx_replenish_retry, 0);
+	init_completion(&ab->htc_suspend);
+	init_completion(&ab->wow.wakeup_completed);
+
 	ab->dev = dev;
 	ab->bus_params = *bus_params;
 	ab->hif.bus = bus;

@@ -11,6 +11,7 @@
 #include <linux/genhd.h>
 #include <linux/list.h>
 #include <linux/llist.h>
+#include <linux/minmax.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <linux/pagemap.h>
@@ -28,6 +29,7 @@
 #include <linux/scatterlist.h>
 #include <linux/blkzoned.h>
 #include <linux/pm.h>
+#include <linux/sbitmap.h>
 
 struct module;
 struct scsi_ioctl_command;
@@ -615,6 +617,9 @@ struct request_queue {
 	RH_KABI_EXTEND(struct mutex		debugfs_mutex)
 
 	RH_KABI_EXTEND(atomic_t		nr_active_requests_shared_sbitmap)
+
+	RH_KABI_EXTEND(struct sbitmap_queue	sched_bitmap_tags)
+	RH_KABI_EXTEND(struct sbitmap_queue	sched_breserved_tags)
 };
 
 /* Keep blk_queue_flag_name[] in sync with the definitions below */

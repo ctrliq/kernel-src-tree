@@ -497,7 +497,7 @@ static u32 get_block_address(u32 current_addr, u32 low, u32 high,
 {
 	u32 addr = 0, offset = 0;
 
-	if ((bank >= mca_cfg.banks) || (block >= NR_BLOCKS))
+	if ((bank >= per_cpu(mce_num_banks, cpu)) || (block >= NR_BLOCKS))
 		return addr;
 
 	if (mce_flags.smca)
@@ -566,33 +566,59 @@ out:
 	return offset;
 }
 
-/*
- * Turn off MC4_MISC thresholding banks on all family 0x15 models since
- * they're not supported there.
- */
-void disable_err_thresholding(struct cpuinfo_x86 *c)
+bool amd_filter_mce(struct mce *m)
 {
-	int i;
+	enum smca_bank_types bank_type = smca_get_bank_type(m->bank);
+	struct cpuinfo_x86 *c = &boot_cpu_data;
+	u8 xec = (m->status >> 16) & 0x3F;
+
+	/* See Family 17h Models 10h-2Fh Erratum #1114. */
+	if (c->x86 == 0x17 &&
+	    c->x86_model >= 0x10 && c->x86_model <= 0x2F &&
+	    bank_type == SMCA_IF && xec == 10)
+		return true;
+
+	return false;
+}
+
+/*
+ * Turn off thresholding banks for the following conditions:
+ * - MC4_MISC thresholding is not supported on Family 0x15.
+ * - Prevent possible spurious interrupts from the IF bank on Family 0x17
+ *   Models 0x10-0x2F due to Erratum #1114.
+ */
+void disable_err_thresholding(struct cpuinfo_x86 *c, unsigned int bank)
+{
+	int i, num_msrs;
 	u64 hwcr;
 	bool need_toggle;
-	u32 msrs[] = {
-		0x00000413, /* MC4_MISC0 */
-		0xc0000408, /* MC4_MISC1 */
-	};
+	u32 msrs[NR_BLOCKS];
 
-	if (c->x86 != 0x15)
+	if (c->x86 == 0x15 && bank == 4) {
+		msrs[0] = 0x00000413; /* MC4_MISC0 */
+		msrs[1] = 0xc0000408; /* MC4_MISC1 */
+		num_msrs = 2;
+	} else if (c->x86 == 0x17 &&
+		   (c->x86_model >= 0x10 && c->x86_model <= 0x2F)) {
+
+		if (smca_get_bank_type(bank) != SMCA_IF)
+			return;
+
+		msrs[0] = MSR_AMD64_SMCA_MCx_MISC(bank);
+		num_msrs = 1;
+	} else {
 		return;
+	}
 
 	rdmsrl(MSR_K7_HWCR, hwcr);
 
 	/* McStatusWrEn has to be set */
 	need_toggle = !(hwcr & BIT(18));
-
 	if (need_toggle)
 		wrmsrl(MSR_K7_HWCR, hwcr | BIT(18));
 
 	/* Clear CntP bit safely */
-	for (i = 0; i < ARRAY_SIZE(msrs); i++)
+	for (i = 0; i < num_msrs; i++)
 		msr_clear_bit(msrs[i], 62);
 
 	/* restore old settings */
@@ -603,15 +629,16 @@ void disable_err_thresholding(struct cpuinfo_x86 *c)
 /* cpu init entry point, called from mce.c with preempt off */
 void mce_amd_feature_init(struct cpuinfo_x86 *c)
 {
-	u32 low = 0, high = 0, address = 0;
 	unsigned int bank, block, cpu = smp_processor_id();
+	u32 low = 0, high = 0, address = 0;
 	int offset = -1;
 
-	disable_err_thresholding(c);
 
-	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+	for (bank = 0; bank < this_cpu_read(mce_num_banks); ++bank) {
 		if (mce_flags.smca)
 			smca_configure(bank, cpu);
+
+		disable_err_thresholding(c, bank);
 
 		for (block = 0; block < NR_BLOCKS; ++block) {
 			address = get_block_address(address, low, high, bank, block, cpu);
@@ -952,7 +979,7 @@ static void amd_deferred_error_interrupt(void)
 {
 	unsigned int bank;
 
-	for (bank = 0; bank < mca_cfg.banks; ++bank)
+	for (bank = 0; bank < this_cpu_read(mce_num_banks); ++bank)
 		log_error_deferred(bank);
 }
 
@@ -993,7 +1020,7 @@ static void amd_threshold_interrupt(void)
 	struct threshold_block *first_block = NULL, *block = NULL, *tmp = NULL;
 	unsigned int bank, cpu = smp_processor_id();
 
-	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+	for (bank = 0; bank < this_cpu_read(mce_num_banks); ++bank) {
 		if (!(per_cpu(bank_map, cpu) & (1 << bank)))
 			continue;
 
@@ -1180,7 +1207,7 @@ static int allocate_threshold_blocks(unsigned int cpu, unsigned int bank,
 	u32 low, high;
 	int err;
 
-	if ((bank >= mca_cfg.banks) || (block >= NR_BLOCKS))
+	if ((bank >= per_cpu(mce_num_banks, cpu)) || (block >= NR_BLOCKS))
 		return 0;
 
 	if (rdmsr_safe_on_cpu(cpu, address, &low, &high))
@@ -1289,7 +1316,7 @@ static int threshold_create_bank(unsigned int cpu, unsigned int bank)
 		return -ENODEV;
 
 	if (is_shared_bank(bank)) {
-		nb = node_to_amd_nb(amd_get_nb_id(cpu));
+		nb = node_to_amd_nb(topology_die_id(cpu));
 
 		/* threshold descriptor already initialized on this node? */
 		if (nb && nb->bank4) {
@@ -1396,7 +1423,7 @@ static void threshold_remove_bank(unsigned int cpu, int bank)
 			 * the last CPU on this node using the shared bank is
 			 * going away, remove that bank now.
 			 */
-			nb = node_to_amd_nb(amd_get_nb_id(cpu));
+			nb = node_to_amd_nb(topology_die_id(cpu));
 			nb->bank4 = NULL;
 		}
 	}
@@ -1414,7 +1441,7 @@ int mce_threshold_remove_device(unsigned int cpu)
 {
 	unsigned int bank;
 
-	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+	for (bank = 0; bank < per_cpu(mce_num_banks, cpu); ++bank) {
 		if (!(per_cpu(bank_map, cpu) & (1 << bank)))
 			continue;
 		threshold_remove_bank(cpu, bank);
@@ -1435,14 +1462,14 @@ int mce_threshold_create_device(unsigned int cpu)
 	if (bp)
 		return 0;
 
-	bp = kcalloc(mca_cfg.banks, sizeof(struct threshold_bank *),
+	bp = kcalloc(per_cpu(mce_num_banks, cpu), sizeof(struct threshold_bank *),
 		     GFP_KERNEL);
 	if (!bp)
 		return -ENOMEM;
 
 	per_cpu(threshold_banks, cpu) = bp;
 
-	for (bank = 0; bank < mca_cfg.banks; ++bank) {
+	for (bank = 0; bank < per_cpu(mce_num_banks, cpu); ++bank) {
 		if (!(per_cpu(bank_map, cpu) & (1 << bank)))
 			continue;
 		err = threshold_create_bank(cpu, bank);

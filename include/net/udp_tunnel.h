@@ -229,7 +229,14 @@ enum udp_tunnel_nic_info_flags {
 };
 
 struct udp_tunnel_nic_info_rh {
+	struct udp_tunnel_nic_shared *shared;
 };
+
+#define RH_UDP_TUNNEL_NIC_INFO_AUX(info, field) \
+	(((info)->flags & __RH_UDP_TUNNEL_NIC_INFO_EXTENDED) && \
+	 RH_KABI_AUX((info), udp_tunnel_nic_info, field))
+#define RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, field, ifnotset) \
+	(RH_UDP_TUNNEL_NIC_INFO_AUX(info, field) ? (info)->_rh.field : (ifnotset))
 
 struct udp_tunnel_nic;
 
@@ -286,8 +293,6 @@ struct udp_tunnel_nic_info {
 
 	/* all at once */
 	int (*sync_table)(struct net_device *dev, unsigned int table);
-
-	struct udp_tunnel_nic_shared *shared;
 
 	unsigned int flags;
 

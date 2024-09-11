@@ -582,6 +582,8 @@ struct wake_q_node {
 	struct wake_q_node *next;
 };
 
+struct task_struct;
+
 struct task_struct_rh {
 	/* Empty if CONFIG_POSIX_CPUTIMERS=n */
 	struct posix_cputimers posix_cputimers;
@@ -597,6 +599,13 @@ struct task_struct_rh {
 					mce_whole_page : 1,
 					__mce_reserved : 62;
 #endif
+	/* pointer back to the main task_struct */
+	struct task_struct		*task_struct;
+	int				trc_reader_nesting;
+	int				trc_ipi_to_cpu;
+	union rcu_special		trc_reader_special;
+	bool				trc_reader_checked;
+	struct list_head		trc_holdout_list;
 };
 
 struct task_struct {
@@ -686,6 +695,7 @@ struct task_struct {
 	struct list_head		rcu_tasks_holdout_list;
 #endif /* #ifdef CONFIG_TASKS_RCU */
 
+#if 0  /* RHEL: moved to task_struct_rh */
 #ifdef CONFIG_TASKS_TRACE_RCU
 	int				trc_reader_nesting;
 	int				trc_ipi_to_cpu;
@@ -693,6 +703,7 @@ struct task_struct {
 	bool				trc_reader_checked;
 	struct list_head		trc_holdout_list;
 #endif /* #ifdef CONFIG_TASKS_TRACE_RCU */
+#endif /* RHEL */
 
 	struct sched_info		sched_info;
 

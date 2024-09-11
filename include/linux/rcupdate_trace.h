@@ -47,7 +47,7 @@ void rcu_read_unlock_trace_special(struct task_struct *t, int nesting);
  */
 static inline void rcu_read_lock_trace(void)
 {
-	struct task_struct *t = current;
+	struct task_struct_rh *t = current->task_struct_rh;
 
 	WRITE_ONCE(t->trc_reader_nesting, READ_ONCE(t->trc_reader_nesting) + 1);
 	barrier();
@@ -70,14 +70,15 @@ static inline void rcu_read_unlock_trace(void)
 {
 	int nesting;
 	struct task_struct *t = current;
+	struct task_struct_rh *t_rh = t->task_struct_rh;
 
 	rcu_lock_release(&rcu_trace_lock_map);
-	nesting = READ_ONCE(t->trc_reader_nesting) - 1;
+	nesting = READ_ONCE(t_rh->trc_reader_nesting) - 1;
 	barrier(); // Critical section before disabling.
 	// Disable IPI-based setting of .need_qs.
-	WRITE_ONCE(t->trc_reader_nesting, INT_MIN);
-	if (likely(!READ_ONCE(t->trc_reader_special.s)) || nesting) {
-		WRITE_ONCE(t->trc_reader_nesting, nesting);
+	WRITE_ONCE(t_rh->trc_reader_nesting, INT_MIN);
+	if (likely(!READ_ONCE(t_rh->trc_reader_special.s)) || nesting) {
+		WRITE_ONCE(t_rh->trc_reader_nesting, nesting);
 		return;  // We assume shallow reader nesting.
 	}
 	rcu_read_unlock_trace_special(t, nesting);

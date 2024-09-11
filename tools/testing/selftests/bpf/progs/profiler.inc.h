@@ -196,7 +196,7 @@ static INLINE void populate_ancestors(struct task_struct* task,
 			break;
 		ancestors_data->ancestor_pids[num_ancestors] = ppid;
 		ancestors_data->ancestor_exec_ids[num_ancestors] =
-			BPF_CORE_READ(parent, self_exec_id);
+			BPF_CORE_READ(parent, prio /* RHEL */);
 		ancestors_data->ancestor_start_times[num_ancestors] =
 			BPF_CORE_READ(parent, start_time);
 		ancestors_data->num_ancestors = num_ancestors;
@@ -340,7 +340,7 @@ static INLINE void* populate_var_metadata(struct var_metadata_t* metadata,
 	metadata->uid = (u32)uid_gid;
 	metadata->gid = uid_gid >> 32;
 	metadata->pid = pid;
-	metadata->exec_id = BPF_CORE_READ(task, self_exec_id);
+	metadata->exec_id = BPF_CORE_READ(task, prio /* RHEL */);
 	metadata->start_time = BPF_CORE_READ(task, start_time);
 	metadata->comm_length = 0;
 
@@ -714,7 +714,7 @@ int raw_tracepoint__sched_process_exec(struct bpf_raw_tracepoint_args* ctx)
 	struct task_struct* parent_task = BPF_CORE_READ(task, real_parent);
 	proc_exec_data->parent_pid = BPF_CORE_READ(parent_task, tgid);
 	proc_exec_data->parent_uid = BPF_CORE_READ(parent_task, real_cred, uid.val);
-	proc_exec_data->parent_exec_id = BPF_CORE_READ(parent_task, self_exec_id);
+	proc_exec_data->parent_exec_id = BPF_CORE_READ(parent_task, prio /* RHEL */);
 	proc_exec_data->parent_start_time = BPF_CORE_READ(parent_task, start_time);
 
 	const char* filename = BPF_CORE_READ(bprm, filename);
@@ -962,7 +962,7 @@ int raw_tracepoint__sched_process_fork(struct bpf_raw_tracepoint_args* ctx)
 	void* payload = populate_var_metadata(&fork_data->meta, child,
 					      BPF_CORE_READ(child, pid), fork_data->payload);
 	fork_data->parent_pid = BPF_CORE_READ(parent, pid);
-	fork_data->parent_exec_id = BPF_CORE_READ(parent, self_exec_id);
+	fork_data->parent_exec_id = BPF_CORE_READ(parent, prio /* RHEL */);
 	fork_data->parent_start_time = BPF_CORE_READ(parent, start_time);
 	bpf_stats_pre_submit_var_perf_event(&stats_ctx, &fork_data->meta);
 

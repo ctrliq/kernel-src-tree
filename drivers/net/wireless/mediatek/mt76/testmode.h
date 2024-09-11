@@ -21,7 +21,7 @@
  * @MT76_TM_ATTR_TX_COUNT: configured number of frames to send when setting
  *	state to MT76_TM_STATE_TX_FRAMES (u32)
  * @MT76_TM_ATTR_TX_PENDING: pending frames during MT76_TM_STATE_TX_FRAMES (u32)
- * @MT76_TM_ATTR_TX_LENGTH: packet tx msdu length (u32)
+ * @MT76_TM_ATTR_TX_LENGTH: packet tx mpdu length (u32)
  * @MT76_TM_ATTR_TX_RATE_MODE: packet tx mode (u8, see &enum mt76_testmode_tx_mode)
  * @MT76_TM_ATTR_TX_RATE_NSS: packet tx number of spatial streams (u8)
  * @MT76_TM_ATTR_TX_RATE_IDX: packet tx rate/MCS index (u8)
@@ -37,6 +37,13 @@
  * @MT76_TM_ATTR_FREQ_OFFSET: RF frequency offset (u32)
  *
  * @MT76_TM_ATTR_STATS: statistics (nested, see &enum mt76_testmode_stats_attr)
+ *
+ * @MT76_TM_ATTR_TX_SPE_IDX: tx spatial extension index (u8)
+ *
+ * @MT76_TM_ATTR_TX_DUTY_CYCLE: packet tx duty cycle (u8)
+ * @MT76_TM_ATTR_TX_IPG: tx inter-packet gap, in unit of us (u32)
+ * @MT76_TM_ATTR_TX_TIME: packet transmission time, in unit of us (u32)
+ *
  */
 enum mt76_testmode_attr {
 	MT76_TM_ATTR_UNSPEC,
@@ -64,6 +71,12 @@ enum mt76_testmode_attr {
 	MT76_TM_ATTR_FREQ_OFFSET,
 
 	MT76_TM_ATTR_STATS,
+
+	MT76_TM_ATTR_TX_SPE_IDX,
+
+	MT76_TM_ATTR_TX_DUTY_CYCLE,
+	MT76_TM_ATTR_TX_IPG,
+	MT76_TM_ATTR_TX_TIME,
 
 	/* keep last */
 	NUM_MT76_TM_ATTRS,

@@ -25,7 +25,6 @@ static struct mhi_channel_config ath11k_mhi_channels_qca6390[] = {
 		.offload_channel = false,
 		.doorbell_mode_switch = false,
 		.auto_queue = false,
-		.auto_start = false,
 	},
 	{
 		.num = 1,
@@ -40,7 +39,6 @@ static struct mhi_channel_config ath11k_mhi_channels_qca6390[] = {
 		.offload_channel = false,
 		.doorbell_mode_switch = false,
 		.auto_queue = false,
-		.auto_start = false,
 	},
 	{
 		.num = 20,
@@ -55,7 +53,6 @@ static struct mhi_channel_config ath11k_mhi_channels_qca6390[] = {
 		.offload_channel = false,
 		.doorbell_mode_switch = false,
 		.auto_queue = false,
-		.auto_start = true,
 	},
 	{
 		.num = 21,
@@ -70,7 +67,6 @@ static struct mhi_channel_config ath11k_mhi_channels_qca6390[] = {
 		.offload_channel = false,
 		.doorbell_mode_switch = false,
 		.auto_queue = true,
-		.auto_start = true,
 	},
 };
 

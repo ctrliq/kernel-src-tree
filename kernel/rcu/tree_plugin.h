@@ -2587,7 +2587,7 @@ static void rcu_dynticks_task_trace_enter(void)
 {
 #ifdef CONFIG_TASKS_RCU_TRACE
 	if (IS_ENABLED(CONFIG_TASKS_TRACE_RCU_READ_MB))
-		current->trc_reader_special.b.need_mb = true;
+		current->task_struct_rh->trc_reader_special.b.need_mb = true;
 #endif /* #ifdef CONFIG_TASKS_RCU_TRACE */
 }
 
@@ -2596,6 +2596,6 @@ static void rcu_dynticks_task_trace_exit(void)
 {
 #ifdef CONFIG_TASKS_RCU_TRACE
 	if (IS_ENABLED(CONFIG_TASKS_TRACE_RCU_READ_MB))
-		current->trc_reader_special.b.need_mb = false;
+		current->task_struct_rh->trc_reader_special.b.need_mb = false;
 #endif /* #ifdef CONFIG_TASKS_RCU_TRACE */
 }

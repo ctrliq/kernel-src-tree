@@ -151,7 +151,13 @@ static struct res_config skx_cfg = {
 	.busno_cfg_offset	= 0xcc,
 };
 
+/* RHEL only: because of 38eb638a57a88d, we need to keep both structs */
 static const struct x86_cpu_id skx_cpuids[] = {
+	X86_MATCH_INTEL_FAM6_MODEL(SKYLAKE_X,	&skx_cfg),
+	{ }
+};
+
+static const struct x86_cpu_id_v2 skx_cpuids_v2[] = {
 	X86_MATCH_INTEL_FAM6_MODEL_STEPPINGS(SKYLAKE_X, X86_STEPPINGS(0x0, 0xf), &skx_cfg),
 	{ }
 };
@@ -598,7 +604,7 @@ static inline void teardown_skx_debug(void) {}
  */
 static int __init skx_init(void)
 {
-	const struct x86_cpu_id *id;
+	const struct x86_cpu_id_v2 *id;
 	struct res_config *cfg;
 	const struct munit *m;
 	const char *owner;
@@ -612,7 +618,7 @@ static int __init skx_init(void)
 	if (owner && strncmp(owner, EDAC_MOD_STR, sizeof(EDAC_MOD_STR)))
 		return -EBUSY;
 
-	id = x86_match_cpu(skx_cpuids);
+	id = x86_match_cpu_v2(skx_cpuids_v2);
 	if (!id)
 		return -ENODEV;
 

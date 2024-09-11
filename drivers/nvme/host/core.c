@@ -3789,9 +3789,9 @@ static struct attribute *nvme_dev_attrs[] = {
 	&dev_attr_hostnqn.attr,
 	&dev_attr_hostid.attr,
 	&dev_attr_ctrl_loss_tmo.attr,
+	&dev_attr_kato.attr,
 	&dev_attr_reconnect_delay.attr,
 	&dev_attr_fast_io_fail_tmo.attr,
-	&dev_attr_kato.attr,
 	NULL
 };
 

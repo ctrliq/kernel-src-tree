@@ -13,6 +13,7 @@
 #include <linux/bitfield.h>
 #include <linux/iopoll.h>
 #include <linux/interrupt.h>
+#include <linux/workqueue.h>
 
 #include "util.h"
 
@@ -1187,6 +1188,7 @@ struct rtw_chip_info {
 	u8 bt_desired_ver;
 	bool scbd_support;
 	bool new_scbd10_def; /* true: fix 2M(8822c) */
+	bool ble_hid_profile_support;
 	u8 pstdma_type; /* 0: LPSoff, 1:LPSon */
 	u8 bt_rssi_type;
 	u8 ant_isolation;
@@ -1211,6 +1213,7 @@ struct rtw_chip_info {
 	const struct coex_5g_afh_map *afh_5g;
 	const struct rtw_hw_reg *btg_reg;
 	const struct rtw_reg_domain *coex_info_hw_regs;
+	u32 wl_fw_desired_ver;
 };
 
 enum rtw_coex_bt_state_cnt {
@@ -1346,9 +1349,15 @@ struct rtw_coex_stat {
 	bool wl_cck_lock_pre;
 	bool wl_cck_lock_ever;
 	bool wl_connecting;
+	bool wl_slot_toggle;
+	bool wl_slot_toggle_change; /* if toggle to no-toggle */
 
 	u32 bt_supported_version;
 	u32 bt_supported_feature;
+	u32 hi_pri_tx;
+	u32 hi_pri_rx;
+	u32 lo_pri_tx;
+	u32 lo_pri_rx;
 	u32 patch_ver;
 	u16 bt_reg_vendor_ae;
 	u16 bt_reg_vendor_ac;
@@ -1381,6 +1390,9 @@ struct rtw_coex_stat {
 	u8 wl_iot_peer;
 	u8 ampdu_max_time;
 	u8 wl_tput_dir;
+
+	u8 wl_toggle_para[6];
+	u8 wl_toggle_interval;
 
 	u16 score_board;
 	u16 retry_limit;
@@ -1808,7 +1820,8 @@ struct rtw_dev {
 	/* used to protect txqs list */
 	spinlock_t txq_lock;
 	struct list_head txqs;
-	struct tasklet_struct tx_tasklet;
+	struct workqueue_struct *tx_wq;
+	struct work_struct tx_work;
 	struct work_struct ba_work;
 
 	struct rtw_tx_report tx_report;

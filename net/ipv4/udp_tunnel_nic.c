@@ -690,10 +690,10 @@ udp_tunnel_nic_replay(struct net_device *dev, struct udp_tunnel_nic *utn)
 	utn->missed = 0;
 	utn->need_replay = 0;
 
-	if (!info->shared) {
+	if (!RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false)) {
 		udp_tunnel_get_rx_info(dev);
 	} else {
-		list_for_each_entry(node, &info->shared->devices, list)
+		list_for_each_entry(node, &info->_rh.shared->devices, list)
 			udp_tunnel_get_rx_info(node->dev);
 	}
 
@@ -780,7 +780,7 @@ static int udp_tunnel_nic_register(struct net_device *dev)
 	    WARN_ON(!info->tables[0].n_entries))
 		return -EINVAL;
 
-	if (WARN_ON(info->shared &&
+	if (WARN_ON(RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false) &&
 		    info->flags & UDP_TUNNEL_NIC_INFO_OPEN_ONLY))
 		return -EINVAL;
 
@@ -795,7 +795,7 @@ static int udp_tunnel_nic_register(struct net_device *dev)
 	}
 
 	/* Create UDP tunnel state structures */
-	if (info->shared) {
+	if (RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false)) {
 		node = kzalloc(sizeof(*node), GFP_KERNEL);
 		if (!node)
 			return -ENOMEM;
@@ -803,8 +803,9 @@ static int udp_tunnel_nic_register(struct net_device *dev)
 		node->dev = dev;
 	}
 
-	if (info->shared && info->shared->udp_tunnel_nic_info) {
-		utn = info->shared->udp_tunnel_nic_info;
+	if (RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false) &&
+	    info->_rh.shared->udp_tunnel_nic_info) {
+		utn = info->_rh.shared->udp_tunnel_nic_info;
 	} else {
 		utn = udp_tunnel_nic_alloc(info, n_tables);
 		if (!utn) {
@@ -813,13 +814,13 @@ static int udp_tunnel_nic_register(struct net_device *dev)
 		}
 	}
 
-	if (info->shared) {
-		if (!info->shared->udp_tunnel_nic_info) {
-			INIT_LIST_HEAD(&info->shared->devices);
-			info->shared->udp_tunnel_nic_info = utn;
+	if (RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false)) {
+		if (!info->_rh.shared->udp_tunnel_nic_info) {
+			INIT_LIST_HEAD(&info->_rh.shared->devices);
+			info->_rh.shared->udp_tunnel_nic_info = utn;
 		}
 
-		list_add_tail(&node->list, &info->shared->devices);
+		list_add_tail(&node->list, &info->_rh.shared->devices);
 	}
 
 	utn->dev = dev;
@@ -840,10 +841,10 @@ udp_tunnel_nic_unregister(struct net_device *dev, struct udp_tunnel_nic *utn)
 	/* For a shared table remove this dev from the list of sharing devices
 	 * and if there are other devices just detach.
 	 */
-	if (info->shared) {
+	if (RH_UDP_TUNNEL_NIC_INFO_AUX_GET(info, shared, false)) {
 		struct udp_tunnel_nic_shared_node *node, *first;
 
-		list_for_each_entry(node, &info->shared->devices, list)
+		list_for_each_entry(node, &info->_rh.shared->devices, list)
 			if (node->dev == dev)
 				break;
 		if (node->dev != dev)
@@ -852,7 +853,7 @@ udp_tunnel_nic_unregister(struct net_device *dev, struct udp_tunnel_nic *utn)
 		list_del(&node->list);
 		kfree(node);
 
-		first = list_first_entry_or_null(&info->shared->devices,
+		first = list_first_entry_or_null(&info->_rh.shared->devices,
 						 typeof(*first), list);
 		if (first) {
 			udp_tunnel_drop_rx_info(dev);
@@ -860,7 +861,7 @@ udp_tunnel_nic_unregister(struct net_device *dev, struct udp_tunnel_nic *utn)
 			goto release_dev;
 		}
 
-		info->shared->udp_tunnel_nic_info = NULL;
+		info->_rh.shared->udp_tunnel_nic_info = NULL;
 	}
 
 	/* Flush before we check work, so we don't waste time adding entries

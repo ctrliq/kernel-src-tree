@@ -91,6 +91,7 @@ static const struct udp_tunnel_nic_info nsim_udp_tunnel_info = {
 	.set_port	= nsim_udp_tunnel_set_port,
 	.unset_port	= nsim_udp_tunnel_unset_port,
 	.sync_table	= nsim_udp_tunnel_sync_table,
+	.flags		= __RH_UDP_TUNNEL_NIC_INFO_EXTENDED,
 
 	.tables = {
 		{
@@ -103,6 +104,7 @@ static const struct udp_tunnel_nic_info nsim_udp_tunnel_info = {
 					  UDP_TUNNEL_TYPE_VXLAN_GPE,
 		},
 	},
+	RH_KABI_AUX_INIT_SIZE(udp_tunnel_nic_info)
 };
 
 static ssize_t
@@ -186,7 +188,7 @@ int nsim_udp_tunnels_info_create(struct nsim_dev *nsim_dev,
 	if (nsim_dev->udp_ports.ipv4_only)
 		info->flags |= UDP_TUNNEL_NIC_INFO_IPV4_ONLY;
 	if (nsim_dev->udp_ports.shared)
-		info->shared = &nsim_dev->udp_ports.utn_shared;
+		info->_rh.shared = &nsim_dev->udp_ports.utn_shared;
 	if (nsim_dev->udp_ports.static_iana_vxlan)
 		info->flags |= UDP_TUNNEL_NIC_INFO_STATIC_IANA_VXLAN;
 

@@ -775,15 +775,16 @@ static DEFINE_IRQ_WORK(rcu_tasks_trace_iw, rcu_read_unlock_iw);
 /* If we are the last reader, wake up the grace-period kthread. */
 void rcu_read_unlock_trace_special(struct task_struct *t, int nesting)
 {
-	int nq = t->trc_reader_special.b.need_qs;
+	struct task_struct_rh *t_rh = t->task_struct_rh;
+	int nq = t_rh->trc_reader_special.b.need_qs;
 
 	if (IS_ENABLED(CONFIG_TASKS_TRACE_RCU_READ_MB) &&
-	    t->trc_reader_special.b.need_mb)
+	    t_rh->trc_reader_special.b.need_mb)
 		smp_mb(); // Pairs with update-side barriers.
 	// Update .need_qs before ->trc_reader_nesting for irq/NMI handlers.
 	if (nq)
-		WRITE_ONCE(t->trc_reader_special.b.need_qs, false);
-	WRITE_ONCE(t->trc_reader_nesting, nesting);
+		WRITE_ONCE(t_rh->trc_reader_special.b.need_qs, false);
+	WRITE_ONCE(t_rh->trc_reader_nesting, nesting);
 	if (nq && atomic_dec_and_test(&trc_n_readers_need_end))
 		irq_work_queue(&rcu_tasks_trace_iw);
 }
@@ -792,17 +793,21 @@ EXPORT_SYMBOL_GPL(rcu_read_unlock_trace_special);
 /* Add a task to the holdout list, if it is not already on the list. */
 static void trc_add_holdout(struct task_struct *t, struct list_head *bhp)
 {
-	if (list_empty(&t->trc_holdout_list)) {
+	struct task_struct_rh *t_rh = t->task_struct_rh;
+
+	if (list_empty(&t_rh->trc_holdout_list)) {
 		get_task_struct(t);
-		list_add(&t->trc_holdout_list, bhp);
+		list_add(&t_rh->trc_holdout_list, bhp);
 	}
 }
 
 /* Remove a task from the holdout list, if it is in fact present. */
 static void trc_del_holdout(struct task_struct *t)
 {
-	if (!list_empty(&t->trc_holdout_list)) {
-		list_del_init(&t->trc_holdout_list);
+	struct task_struct_rh *t_rh = t->task_struct_rh;
+
+	if (!list_empty(&t_rh->trc_holdout_list)) {
+		list_del_init(&t_rh->trc_holdout_list);
 		put_task_struct(t);
 	}
 }
@@ -811,6 +816,7 @@ static void trc_del_holdout(struct task_struct *t)
 static void trc_read_check_handler(void *t_in)
 {
 	struct task_struct *t = current;
+	struct task_struct_rh *t_rh = t->task_struct_rh;
 	struct task_struct *texp = t_in;
 
 	// If the task is no longer running on this CPU, leave.
@@ -822,39 +828,40 @@ static void trc_read_check_handler(void *t_in)
 
 	// If the task is not in a read-side critical section, and
 	// if this is the last reader, awaken the grace-period kthread.
-	if (likely(!t->trc_reader_nesting)) {
+	if (likely(!t_rh->trc_reader_nesting)) {
 		if (WARN_ON_ONCE(atomic_dec_and_test(&trc_n_readers_need_end)))
 			wake_up(&trc_wait);
 		// Mark as checked after decrement to avoid false
 		// positives on the above WARN_ON_ONCE().
-		WRITE_ONCE(t->trc_reader_checked, true);
+		WRITE_ONCE(t_rh->trc_reader_checked, true);
 		goto reset_ipi;
 	}
 	// If we are racing with an rcu_read_unlock_trace(), try again later.
-	if (unlikely(t->trc_reader_nesting < 0)) {
+	if (unlikely(t_rh->trc_reader_nesting < 0)) {
 		if (WARN_ON_ONCE(atomic_dec_and_test(&trc_n_readers_need_end)))
 			wake_up(&trc_wait);
 		goto reset_ipi;
 	}
-	WRITE_ONCE(t->trc_reader_checked, true);
+	WRITE_ONCE(t_rh->trc_reader_checked, true);
 
 	// Get here if the task is in a read-side critical section.  Set
 	// its state so that it will awaken the grace-period kthread upon
 	// exit from that critical section.
-	WARN_ON_ONCE(t->trc_reader_special.b.need_qs);
-	WRITE_ONCE(t->trc_reader_special.b.need_qs, true);
+	WARN_ON_ONCE(t_rh->trc_reader_special.b.need_qs);
+	WRITE_ONCE(t_rh->trc_reader_special.b.need_qs, true);
 
 reset_ipi:
 	// Allow future IPIs to be sent on CPU and for task.
 	// Also order this IPI handler against any later manipulations of
 	// the intended task.
 	smp_store_release(&per_cpu(trc_ipi_to_cpu, smp_processor_id()), false); // ^^^
-	smp_store_release(&texp->trc_ipi_to_cpu, -1); // ^^^
+	smp_store_release(&texp->task_struct_rh->trc_ipi_to_cpu, -1); // ^^^
 }
 
 /* Callback function for scheduler to check locked-down task.  */
 static bool trc_inspect_reader(struct task_struct *t, void *arg)
 {
+	struct task_struct_rh *t_rh = t->task_struct_rh;
 	int cpu = task_cpu(t);
 	bool in_qs = false;
 	bool ofl = cpu_is_offline(cpu);
@@ -871,19 +878,19 @@ static bool trc_inspect_reader(struct task_struct *t, void *arg)
 		// However, we cannot safely change its state.
 		n_heavy_reader_attempts++;
 		if (!ofl && // Check for "running" idle tasks on offline CPUs.
-		    !rcu_dynticks_zero_in_eqs(cpu, &t->trc_reader_nesting))
+		    !rcu_dynticks_zero_in_eqs(cpu, &t_rh->trc_reader_nesting))
 			return false; // No quiescent state, do it the hard way.
 		n_heavy_reader_updates++;
 		if (ofl)
 			n_heavy_reader_ofl_updates++;
 		in_qs = true;
 	} else {
-		in_qs = likely(!t->trc_reader_nesting);
+		in_qs = likely(!t_rh->trc_reader_nesting);
 	}
 
 	// Mark as checked.  Because this is called from the grace-period
 	// kthread, also remove the task from the holdout list.
-	t->trc_reader_checked = true;
+	t_rh->trc_reader_checked = true;
 	trc_del_holdout(t);
 
 	if (in_qs)
@@ -893,8 +900,8 @@ static bool trc_inspect_reader(struct task_struct *t, void *arg)
 	// state so that it will awaken the grace-period kthread upon exit
 	// from that critical section.
 	atomic_inc(&trc_n_readers_need_end); // One more to wait on.
-	WARN_ON_ONCE(t->trc_reader_special.b.need_qs);
-	WRITE_ONCE(t->trc_reader_special.b.need_qs, true);
+	WARN_ON_ONCE(t_rh->trc_reader_special.b.need_qs);
+	WRITE_ONCE(t_rh->trc_reader_special.b.need_qs, true);
 	return true;
 }
 
@@ -902,17 +909,18 @@ static bool trc_inspect_reader(struct task_struct *t, void *arg)
 static void trc_wait_for_one_reader(struct task_struct *t,
 				    struct list_head *bhp)
 {
+	struct task_struct_rh *t_rh = t->task_struct_rh;
 	int cpu;
 
 	// If a previous IPI is still in flight, let it complete.
-	if (smp_load_acquire(&t->trc_ipi_to_cpu) != -1) // Order IPI
+	if (smp_load_acquire(&t_rh->trc_ipi_to_cpu) != -1) // Order IPI
 		return;
 
 	// The current task had better be in a quiescent state.
 	if (t == current) {
-		t->trc_reader_checked = true;
+		t_rh->trc_reader_checked = true;
 		trc_del_holdout(t);
-		WARN_ON_ONCE(t->trc_reader_nesting);
+		WARN_ON_ONCE(t_rh->trc_reader_nesting);
 		return;
 	}
 
@@ -932,12 +940,12 @@ static void trc_wait_for_one_reader(struct task_struct *t,
 		cpu = task_cpu(t);
 
 		// If there is already an IPI outstanding, let it happen.
-		if (per_cpu(trc_ipi_to_cpu, cpu) || t->trc_ipi_to_cpu >= 0)
+		if (per_cpu(trc_ipi_to_cpu, cpu) || t_rh->trc_ipi_to_cpu >= 0)
 			return;
 
 		atomic_inc(&trc_n_readers_need_end);
 		per_cpu(trc_ipi_to_cpu, cpu) = true;
-		t->trc_ipi_to_cpu = cpu;
+		t_rh->trc_ipi_to_cpu = cpu;
 		rcu_tasks_trace.n_ipis++;
 		if (smp_call_function_single(cpu,
 					     trc_read_check_handler, t, 0)) {
@@ -945,7 +953,7 @@ static void trc_wait_for_one_reader(struct task_struct *t,
 			// failure than the target CPU being offline.
 			rcu_tasks_trace.n_ipis_fails++;
 			per_cpu(trc_ipi_to_cpu, cpu) = false;
-			t->trc_ipi_to_cpu = cpu;
+			t_rh->trc_ipi_to_cpu = cpu;
 			if (atomic_dec_and_test(&trc_n_readers_need_end)) {
 				WARN_ON_ONCE(1);
 				wake_up(&trc_wait);
@@ -975,9 +983,11 @@ static void rcu_tasks_trace_pregp_step(void)
 static void rcu_tasks_trace_pertask(struct task_struct *t,
 				    struct list_head *hop)
 {
-	WRITE_ONCE(t->trc_reader_special.b.need_qs, false);
-	WRITE_ONCE(t->trc_reader_checked, false);
-	t->trc_ipi_to_cpu = -1;
+	struct task_struct_rh *t_rh = t->task_struct_rh;
+
+	WRITE_ONCE(t_rh->trc_reader_special.b.need_qs, false);
+	WRITE_ONCE(t_rh->trc_reader_checked, false);
+	t_rh->trc_ipi_to_cpu = -1;
 	trc_wait_for_one_reader(t, hop);
 }
 
@@ -1004,6 +1014,7 @@ static void rcu_tasks_trace_postscan(struct list_head *hop)
 /* Show the state of a task stalling the current RCU tasks trace GP. */
 static void show_stalled_task_trace(struct task_struct *t, bool *firstreport)
 {
+	struct task_struct_rh *t_rh = t->task_struct_rh;
 	int cpu;
 
 	if (*firstreport) {
@@ -1014,11 +1025,11 @@ static void show_stalled_task_trace(struct task_struct *t, bool *firstreport)
 	cpu = task_cpu(t);
 	pr_alert("P%d: %c%c%c nesting: %d%c cpu: %d\n",
 		 t->pid,
-		 ".I"[READ_ONCE(t->trc_ipi_to_cpu) > 0],
+		 ".I"[READ_ONCE(t_rh->trc_ipi_to_cpu) > 0],
 		 ".i"[is_idle_task(t)],
 		 ".N"[cpu > 0 && tick_nohz_full_cpu(cpu)],
-		 t->trc_reader_nesting,
-		 " N"[!!t->trc_reader_special.b.need_qs],
+		 t_rh->trc_reader_nesting,
+		 " N"[!!t_rh->trc_reader_special.b.need_qs],
 		 cpu);
 	sched_show_task(t);
 }
@@ -1037,19 +1048,21 @@ static void show_stalled_ipi_trace(void)
 static void check_all_holdout_tasks_trace(struct list_head *hop,
 					  bool needreport, bool *firstreport)
 {
-	struct task_struct *g, *t;
+	struct task_struct_rh *g, *t_rh;
 
 	// Disable CPU hotplug across the holdout list scan.
 	cpus_read_lock();
 
-	list_for_each_entry_safe(t, g, hop, trc_holdout_list) {
+	list_for_each_entry_safe(t_rh, g, hop, trc_holdout_list) {
+		struct task_struct *t = t_rh->task_struct;
+
 		// If safe and needed, try to check the current task.
-		if (READ_ONCE(t->trc_ipi_to_cpu) == -1 &&
-		    !READ_ONCE(t->trc_reader_checked))
+		if (READ_ONCE(t_rh->trc_ipi_to_cpu) == -1 &&
+		    !READ_ONCE(t_rh->trc_reader_checked))
 			trc_wait_for_one_reader(t, hop);
 
 		// If check succeeded, remove this task from the list.
-		if (READ_ONCE(t->trc_reader_checked))
+		if (READ_ONCE(t_rh->trc_reader_checked))
 			trc_del_holdout(t);
 		else if (needreport)
 			show_stalled_task_trace(t, firstreport);
@@ -1070,6 +1083,7 @@ static void rcu_tasks_trace_postgp(struct rcu_tasks *rtp)
 {
 	bool firstreport;
 	struct task_struct *g, *t;
+	struct task_struct_rh *g_rh, *t_rh;
 	LIST_HEAD(holdouts);
 	long ret;
 
@@ -1090,12 +1104,13 @@ static void rcu_tasks_trace_postgp(struct rcu_tasks *rtp)
 		// Stall warning time, so make a list of the offenders.
 		rcu_read_lock();
 		for_each_process_thread(g, t)
-			if (READ_ONCE(t->trc_reader_special.b.need_qs))
+			if (READ_ONCE(t->task_struct_rh->trc_reader_special.b.need_qs))
 				trc_add_holdout(t, &holdouts);
 		rcu_read_unlock();
 		firstreport = true;
-		list_for_each_entry_safe(t, g, &holdouts, trc_holdout_list) {
-			if (READ_ONCE(t->trc_reader_special.b.need_qs))
+		list_for_each_entry_safe(t_rh, g_rh, &holdouts, trc_holdout_list) {
+			t = t_rh->task_struct;
+			if (READ_ONCE(t_rh->trc_reader_special.b.need_qs))
 				show_stalled_task_trace(t, &firstreport);
 			trc_del_holdout(t); // Release task_struct reference.
 		}
@@ -1111,10 +1126,12 @@ static void rcu_tasks_trace_postgp(struct rcu_tasks *rtp)
 /* Report any needed quiescent state for this exiting task. */
 static void exit_tasks_rcu_finish_trace(struct task_struct *t)
 {
-	WRITE_ONCE(t->trc_reader_checked, true);
-	WARN_ON_ONCE(t->trc_reader_nesting);
-	WRITE_ONCE(t->trc_reader_nesting, 0);
-	if (WARN_ON_ONCE(READ_ONCE(t->trc_reader_special.b.need_qs)))
+	struct task_struct_rh *t_rh = t->task_struct_rh;
+
+	WRITE_ONCE(t_rh->trc_reader_checked, true);
+	WARN_ON_ONCE(t_rh->trc_reader_nesting);
+	WRITE_ONCE(t_rh->trc_reader_nesting, 0);
+	if (WARN_ON_ONCE(READ_ONCE(t_rh->trc_reader_special.b.need_qs)))
 		rcu_read_unlock_trace_special(t, 0);
 }
 

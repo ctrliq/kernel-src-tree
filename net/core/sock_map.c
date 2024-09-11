@@ -416,7 +416,7 @@ static void *sock_map_lookup_sys(struct bpf_map *map, void *key)
 	if (!sk)
 		return ERR_PTR(-ENOENT);
 
-	sock_gen_cookie(sk);
+	__sock_gen_cookie(sk);
 	return &sk->sk_cookie;
 }
 
@@ -831,6 +831,7 @@ static const struct bpf_iter_seq_info sock_map_iter_seq_info = {
 
 static int sock_map_btf_id;
 const struct bpf_map_ops sock_map_ops = {
+	.map_meta_equal		= bpf_map_meta_equal,
 	.map_alloc		= sock_map_alloc,
 	.map_free		= sock_map_free,
 	.map_get_next_key	= sock_map_get_next_key,
@@ -1227,7 +1228,7 @@ static void *sock_hash_lookup_sys(struct bpf_map *map, void *key)
 	if (!sk)
 		return ERR_PTR(-ENOENT);
 
-	sock_gen_cookie(sk);
+	__sock_gen_cookie(sk);
 	return &sk->sk_cookie;
 }
 
@@ -1442,6 +1443,7 @@ static const struct bpf_iter_seq_info sock_hash_iter_seq_info = {
 
 static int sock_hash_map_btf_id;
 const struct bpf_map_ops sock_hash_ops = {
+	.map_meta_equal		= bpf_map_meta_equal,
 	.map_alloc		= sock_hash_alloc,
 	.map_free		= sock_hash_free,
 	.map_get_next_key	= sock_hash_get_next_key,

@@ -26,6 +26,7 @@ Contents:
    filter
    mptcp-sysctl
    statistics
+   vxlan
 
 .. only::  subproject
 

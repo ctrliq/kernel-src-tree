@@ -238,7 +238,7 @@ struct sock_common {
 	/* public: */
 };
 
-struct bpf_sk_storage;
+struct bpf_local_storage;
 
 /**
   *	struct sock - network layer representation of sockets
@@ -510,7 +510,7 @@ struct sock {
 	RH_KABI_EXCLUDE(struct sock_reuseport __rcu	*sk_reuseport_cb)
 	struct rcu_head		sk_rcu;
 
-	RH_KABI_USE(1, struct bpf_sk_storage __rcu     *sk_bpf_storage)
+	RH_KABI_USE(1, struct bpf_local_storage __rcu     *sk_bpf_storage)
 	RH_KABI_USE(2, struct sk_buff                  *sk_tx_skb_cache)
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)

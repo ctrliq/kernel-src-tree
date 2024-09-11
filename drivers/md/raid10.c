@@ -100,7 +100,7 @@ static inline struct r10bio *get_resync_r10bio(struct bio *bio)
 static void * r10bio_pool_alloc(gfp_t gfp_flags, void *data)
 {
 	struct r10conf *conf = data;
-	int size = offsetof(struct r10bio, devs[conf->copies]);
+	int size = offsetof(struct r10bio, devs[conf->geo.raid_disks]);
 
 	/* allocate a r10bio with room for raid_disks entries in the
 	 * bios array */
@@ -247,7 +247,7 @@ static void put_all_bios(struct r10conf *conf, struct r10bio *r10_bio)
 {
 	int i;
 
-	for (i = 0; i < conf->copies; i++) {
+	for (i = 0; i < conf->geo.raid_disks; i++) {
 		struct bio **bio = & r10_bio->devs[i].bio;
 		if (!BIO_SPECIAL(*bio))
 			bio_put(*bio);
@@ -336,7 +336,7 @@ static int find_bio_disk(struct r10conf *conf, struct r10bio *r10_bio,
 	int slot;
 	int repl = 0;
 
-	for (slot = 0; slot < conf->copies; slot++) {
+	for (slot = 0; slot < conf->geo.raid_disks; slot++) {
 		if (r10_bio->devs[slot].bio == bio)
 			break;
 		if (r10_bio->devs[slot].repl_bio == bio) {
@@ -345,7 +345,6 @@ static int find_bio_disk(struct r10conf *conf, struct r10bio *r10_bio,
 		}
 	}
 
-	BUG_ON(slot == conf->copies);
 	update_head_pos(slot, r10_bio);
 
 	if (slotp)
@@ -1546,30 +1545,13 @@ static void __make_request(struct mddev *mddev, struct bio *bio, int sectors)
 	r10_bio->sector = bio->bi_iter.bi_sector;
 	r10_bio->state = 0;
 	r10_bio->read_slot = -1;
-	memset(r10_bio->devs, 0, sizeof(r10_bio->devs[0]) * conf->copies);
+	memset(r10_bio->devs, 0, sizeof(r10_bio->devs[0]) *
+			conf->geo.raid_disks);
 
 	if (bio_data_dir(bio) == READ)
 		raid10_read_request(mddev, bio, r10_bio);
 	else
 		raid10_write_request(mddev, bio, r10_bio);
-}
-
-static struct bio *raid10_split_bio(struct r10conf *conf,
-			struct bio *bio, sector_t sectors, bool want_first)
-{
-	struct bio *split;
-
-	split = bio_split(bio, sectors,	GFP_NOIO, &conf->bio_split);
-	bio_chain(split, bio);
-	allow_barrier(conf);
-	if (want_first) {
-		submit_bio_noacct(bio);
-		bio = split;
-	} else
-		submit_bio_noacct(split);
-	wait_barrier(conf);
-
-	return bio;
 }
 
 static void raid_end_discard_bio(struct r10bio *r10bio)
@@ -1612,7 +1594,8 @@ static void raid10_end_discard_request(struct bio *bio)
 	if (repl)
 		rdev = conf->mirrors[dev].replacement;
 	if (!rdev) {
-		/* raid10_remove_disk uses smp_mb to make sure rdev is set to
+		/*
+		 * raid10_remove_disk uses smp_mb to make sure rdev is set to
 		 * replacement before setting replacement to NULL. It can read
 		 * rdev first without barrier protect even replacment is NULL
 		 */
@@ -1624,7 +1607,8 @@ static void raid10_end_discard_request(struct bio *bio)
 	rdev_dec_pending(rdev, conf->mddev);
 }
 
-/* There are some limitations to handle discard bio
+/*
+ * There are some limitations to handle discard bio
  * 1st, the discard size is bigger than stripe_size*2.
  * 2st, if the discard bio spans reshape progress, we use the old way to
  * handle discard bio
@@ -1633,15 +1617,15 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 {
 	struct r10conf *conf = mddev->private;
 	struct geom *geo = &conf->geo;
-	struct r10bio *r10_bio, *first_r10bio;
 	int far_copies = geo->far_copies;
 	bool first_copy = true;
-
+	struct r10bio *r10_bio, *first_r10bio;
+	struct bio *split;
 	int disk;
 	sector_t chunk;
 	unsigned int stripe_size;
+	unsigned int stripe_data_disks;
 	sector_t split_size;
-
 	sector_t bio_start, bio_end;
 	sector_t first_stripe_index, last_stripe_index;
 	sector_t start_disk_offset;
@@ -1655,43 +1639,65 @@ static int raid10_handle_discard(struct mddev *mddev, struct bio *bio)
 
 	wait_barrier(conf);
 
-	/* Check reshape again to avoid reshape happens after checking
+	/*
+	 * Check reshape again to avoid reshape happens after checking
 	 * MD_RECOVERY_RESHAPE and before wait_barrier
 	 */
 	if (test_bit(MD_RECOVERY_RESHAPE, &mddev->recovery))
 		goto out;
 
-	stripe_size = geo->raid_disks << geo->chunk_shift;
+	if (geo->near_copies)
+		stripe_data_disks = geo->raid_disks / geo->near_copies +
+					geo->raid_disks % geo->near_copies;
+	else
+		stripe_data_disks = geo->raid_disks;
+
+	stripe_size = stripe_data_disks << geo->chunk_shift;
+
 	bio_start = bio->bi_iter.bi_sector;
 	bio_end = bio_end_sector(bio);
 
-	/* Maybe one discard bio is smaller than strip size or across one stripe
-	 * and discard region is larger than one stripe size. For far offset layout,
-	 * if the discard region is not aligned with stripe size, there is hole
-	 * when we submit discard bio to member disk. For simplicity, we only
-	 * handle discard bio which discard region is bigger than stripe_size*2
+	/*
+	 * Maybe one discard bio is smaller than strip size or across one
+	 * stripe and discard region is larger than one stripe size. For far
+	 * offset layout, if the discard region is not aligned with stripe
+	 * size, there is hole when we submit discard bio to member disk.
+	 * For simplicity, we only handle discard bio which discard region
+	 * is bigger than stripe_size * 2
 	 */
 	if (bio_sectors(bio) < stripe_size*2)
 		goto out;
 
-	/* For far and far offset layout, if bio is not aligned with stripe size,
-	 * it splits the part that is not aligned with strip size.
+	/*
+	 * Keep bio aligned with strip size.
 	 */
 	div_u64_rem(bio_start, stripe_size, &remainder);
-	if ((far_copies > 1) && remainder) {
+	if (remainder) {
 		split_size = stripe_size - remainder;
-		bio = raid10_split_bio(conf, bio, split_size, false);
+		split = bio_split(bio, split_size, GFP_NOIO, &conf->bio_split);
+		bio_chain(split, bio);
+		allow_barrier(conf);
+		/* Resend the fist split part */
+		generic_make_request(split);
+		wait_barrier(conf);
 	}
 	div_u64_rem(bio_end, stripe_size, &remainder);
-	if ((far_copies > 1) && remainder) {
+	if (remainder) {
 		split_size = bio_sectors(bio) - remainder;
-		bio = raid10_split_bio(conf, bio, split_size, true);
+		split = bio_split(bio, split_size, GFP_NOIO, &conf->bio_split);
+		bio_chain(split, bio);
+		allow_barrier(conf);
+		/* Resend the second split part */
+		generic_make_request(bio);
+		bio = split;
+		wait_barrier(conf);
 	}
 
 	bio_start = bio->bi_iter.bi_sector;
 	bio_end = bio_end_sector(bio);
 
-	/* raid10 uses chunk as the unit to store data. It's similar like raid0.
+	/*
+	 * Raid10 uses chunk as the unit to store data. It's similar like raid0.
 	 * One stripe contains the chunks from all member disk (one chunk from
 	 * one disk at the same HBA address). For layout detail, see 'man md 4'
 	 */
@@ -1721,7 +1727,8 @@ retry_discard:
 	memset(r10_bio->devs, 0, sizeof(r10_bio->devs[0]) * geo->raid_disks);
 	wait_blocked_dev(mddev, r10_bio);
 
-	/* For far layout it needs more than one r10bio to cover all regions.
+	/*
+	 * For far layout it needs more than one r10bio to cover all regions.
 	 * Inspired by raid10_sync_request, we can use the first r10bio->master_bio
 	 * to record the discard bio. Other r10bio->master_bio record the first
 	 * r10bio. The first r10bio only release after all other r10bios finish.
@@ -1796,7 +1803,8 @@ retry_discard:
 		else
 			dev_end = end_disk_offset;
 
-		/* It only handles discard bio which size is >= stripe size, so
+		/*
+		 * It only handles discard bio which size is >= stripe size, so
 		 * dev_end > dev_start all the time
 		 */
 		if (r10_bio->devs[disk].bio) {

@@ -12,7 +12,7 @@
 #ifndef __ASSEMBLY__
 #include <linux/bits.h>
 #include <linux/compiler.h>
-#include <linux/kernel.h>
+#include <linux/minmax.h>
 #include <linux/types.h>
 #include <linux/rh_kabi.h>
 

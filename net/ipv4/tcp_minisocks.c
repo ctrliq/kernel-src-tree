@@ -479,7 +479,6 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 
 	tcp_init_wl(newtp, treq->rcv_isn);
 
-	newtp->mdev_us = jiffies_to_usecs(TCP_TIMEOUT_INIT);
 	minmax_reset(&newtp->rtt_min, tcp_jiffies32, ~0U);
 	newicsk->icsk_ack.lrcvtime = tcp_jiffies32;
 
@@ -487,24 +486,8 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	newsk->sk_txhash = treq->txhash;
 	newtp->total_retrans = req->num_retrans;
 
-	/* So many TCP implementations out there (incorrectly) count the
-	 * initial SYN frame in their delayed-ACK and congestion control
-	 * algorithms that we must have the following bandaid to talk
-	 * efficiently to them.  -DaveM
-	 */
-	newtp->snd_cwnd = TCP_INIT_CWND;
-	newtp->snd_cwnd_cnt = 0;
-
-	/* There's a bubble in the pipe until at least the first ACK. */
-	newtp->app_limited = ~0U;
-
 	tcp_init_xmit_timers(newsk);
 	WRITE_ONCE(newtp->write_seq, newtp->pushed_seq = treq->snt_isn + 1);
-
-	newtp->rx_opt.saw_tstamp = 0;
-
-	newtp->rx_opt.dsack = 0;
-	newtp->rx_opt.num_sacks = 0;
 
 	if (sock_flag(newsk, SOCK_KEEPOPEN))
 		inet_csk_reset_keepalive_timer(newsk,
@@ -546,13 +529,6 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
 	tcp_ecn_openreq_child(newtp, req);
 	newtp->fastopen_req = NULL;
 	RCU_INIT_POINTER(newtp->fastopen_rsk, NULL);
-	newtp->syn_data_acked = 0;
-	newtp->rack.mstamp = 0;
-	newtp->rack.advanced = 0;
-	newtp->rack.reo_wnd_steps = 1;
-	newtp->rack.last_delivered = 0;
-	newtp->rack.reo_wnd_persist = 0;
-	newtp->rack.dsack_seen = 0;
 
 	tcp_bpf_clone(sk, newsk);
 
