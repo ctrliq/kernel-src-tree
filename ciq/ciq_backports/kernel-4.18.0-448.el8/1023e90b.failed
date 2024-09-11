@@ -1,0 +1,256 @@
+cifs: avoid starvation when refreshing dfs cache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Paulo Alcantara <pc@cjr.nz>
+commit 1023e90b733acd1da98ba7067aa0fa8b998eed19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/1023e90b.failed
+
+When refreshing the DFS cache, keep SMB2 IOCTL calls as much outside
+critical sections as possible and avoid read/write starvation when
+getting new DFS referrals by using broken or slow connections.
+
+	Signed-off-by: Paulo Alcantara (SUSE) <pc@cjr.nz>
+	Reviewed-by: Aurelien Aptel <aaptel@suse.com>
+	Signed-off-by: Steve French <stfrench@microsoft.com>
+(cherry picked from commit 1023e90b733acd1da98ba7067aa0fa8b998eed19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/cifs/dfs_cache.c
+diff --cc fs/cifs/dfs_cache.c
+index d4a72c7183f5,775dbc7b0d7a..000000000000
+--- a/fs/cifs/dfs_cache.c
++++ b/fs/cifs/dfs_cache.c
+@@@ -558,12 -579,24 +560,27 @@@ static void remove_oldest_entry_locked(
+  }
+  
+  /* Add a new DFS cache entry */
+ -static int add_cache_entry_locked(struct dfs_info3_param *refs, int numrefs)
+ +static int add_cache_entry_locked(const char *path, unsigned int hash,
+ +				  struct dfs_info3_param *refs, int numrefs)
+  {
+ -	int rc;
+  	struct cache_entry *ce;
+ -	unsigned int hash;
+  
+++<<<<<<< HEAD
+ +	ce = alloc_cache_entry(path, refs, numrefs);
+++=======
++ 	WARN_ON(!rwsem_is_locked(&htable_rw_lock));
++ 
++ 	if (atomic_read(&cache_count) >= CACHE_MAX_ENTRIES) {
++ 		cifs_dbg(FYI, "%s: reached max cache size (%d)\n", __func__, CACHE_MAX_ENTRIES);
++ 		remove_oldest_entry_locked();
++ 	}
++ 
++ 	rc = cache_entry_hash(refs[0].path_name, strlen(refs[0].path_name), &hash);
++ 	if (rc)
++ 		return rc;
++ 
++ 	ce = alloc_cache_entry(refs, numrefs);
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  	if (IS_ERR(ce))
+  		return PTR_ERR(ce);
+  
+@@@ -693,12 -733,9 +712,15 @@@ static int update_cache_entry_locked(st
+  				     int numrefs)
+  {
+  	int rc;
+- 	struct cache_entry *ce;
+  	char *s, *th = NULL;
+  
+++<<<<<<< HEAD
+ +	ce = lookup_cache_entry(path, NULL);
+ +	if (IS_ERR(ce))
+ +		return PTR_ERR(ce);
+++=======
++ 	WARN_ON(!rwsem_is_locked(&htable_rw_lock));
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  
+  	if (ce->tgthint) {
+  		s = ce->tgthint->name;
+@@@ -717,23 -754,31 +739,38 @@@
+  	return rc;
+  }
+  
+ -static int get_dfs_referral(const unsigned int xid, struct cifs_ses *ses, const char *path,
+ -			    struct dfs_info3_param **refs, int *numrefs)
+ +static int get_dfs_referral(const unsigned int xid, struct cifs_ses *ses,
+ +			    const struct nls_table *nls_codepage, int remap,
+ +			    const char *path,  struct dfs_info3_param **refs,
+ +			    int *numrefs)
+  {
++ 	int rc;
++ 	int i;
++ 
+  	cifs_dbg(FYI, "%s: get an DFS referral for %s\n", __func__, path);
+  
++ 	*refs = NULL;
++ 	*numrefs = 0;
++ 
+  	if (!ses || !ses->server || !ses->server->ops->get_dfs_refer)
+  		return -EOPNOTSUPP;
+ -	if (unlikely(!cache_cp))
+ +	if (unlikely(!nls_codepage))
+  		return -EINVAL;
+  
+- 	*refs = NULL;
+- 	*numrefs = 0;
++ 	rc =  ses->server->ops->get_dfs_refer(xid, ses, path, refs, numrefs, cache_cp,
++ 					      NO_MAP_UNI_RSVD);
++ 	if (!rc) {
++ 		struct dfs_info3_param *ref = *refs;
+  
+++<<<<<<< HEAD
+ +	return ses->server->ops->get_dfs_refer(xid, ses, path, refs, numrefs,
+ +					       nls_codepage, remap);
+++=======
++ 		for (i = 0; i < *numrefs; i++)
++ 			convert_delimiter(ref[i].path_name, '\\');
++ 	}
++ 	return rc;
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  }
+  
+  /*
+@@@ -786,14 -828,7 +823,18 @@@ static int cache_refresh_path(const uns
+  		goto out_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (atomic_read(&cache_count) >= CACHE_MAX_ENTRIES) {
+ +		cifs_dbg(FYI, "%s: reached max cache size (%d)\n", __func__, CACHE_MAX_ENTRIES);
+ +		remove_oldest_entry_locked();
+ +	}
+ +
+ +	rc = add_cache_entry_locked(path, hash, refs, numrefs);
+ +	if (!rc)
+ +		atomic_inc(&cache_count);
+++=======
++ 	rc = add_cache_entry_locked(refs, numrefs);
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  
+  out_unlock:
+  	up_write(&htable_rw_lock);
+@@@ -1317,12 -1330,36 +1362,43 @@@ static void refresh_mounts(struct cifs_
+  		int rc = 0;
+  
+  		list_del_init(&tcon->ulist);
++ 
+  		ses = find_ipc_from_server_path(sessions, path);
+++<<<<<<< HEAD
+ +		if (!IS_ERR(ses)) {
+ +			xid = get_xid();
+ +			cache_refresh_path(xid, ses, cache_nlsc, tcon->remap, path);
+ +			free_xid(xid);
+++=======
++ 		if (IS_ERR(ses))
++ 			goto next_tcon;
++ 
++ 		down_read(&htable_rw_lock);
++ 		ce = lookup_cache_entry(path);
++ 		needs_refresh = IS_ERR(ce) || cache_entry_expired(ce);
++ 		up_read(&htable_rw_lock);
++ 
++ 		if (!needs_refresh)
++ 			goto next_tcon;
++ 
++ 		xid = get_xid();
++ 		rc = get_dfs_referral(xid, ses, path, &refs, &numrefs);
++ 		free_xid(xid);
++ 
++ 		/* Create or update a cache entry with the new referral */
++ 		if (!rc) {
++ 			down_write(&htable_rw_lock);
++ 			ce = lookup_cache_entry(path);
++ 			if (IS_ERR(ce))
++ 				add_cache_entry_locked(refs, numrefs);
++ 			else if (cache_entry_expired(ce))
++ 				update_cache_entry_locked(ce, refs, numrefs);
++ 			up_write(&htable_rw_lock);
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  		}
++ 
++ next_tcon:
++ 		free_dfs_info_array(refs, numrefs);
+  		cifs_put_tcon(tcon);
+  	}
+  }
+@@@ -1344,29 -1385,51 +1424,68 @@@ static void refresh_cache(struct cifs_s
+  		struct hlist_head *l = &cache_htable[i];
+  
+  		hlist_for_each_entry(ce, l, hlist) {
+- 			struct dfs_info3_param *refs = NULL;
+- 			int numrefs = 0;
+- 
+- 			if (hlist_unhashed(&ce->hlist) || !cache_entry_expired(ce))
++ 			if (count == ARRAY_SIZE(ref_paths))
++ 				goto out_unlock;
++ 			if (hlist_unhashed(&ce->hlist) || !cache_entry_expired(ce) ||
++ 			    IS_ERR(find_ipc_from_server_path(sessions, ce->path)))
+  				continue;
+++<<<<<<< HEAD
+ +
+ +			ses = find_ipc_from_server_path(sessions, ce->path);
+ +			if (IS_ERR(ses))
+ +				continue;
+ +
+ +			xid = get_xid();
+ +			rc = get_dfs_referral(xid, ses, cache_nlsc, NO_MAP_UNI_RSVD, ce->path,
+ +					      &refs, &numrefs);
+ +			free_xid(xid);
+ +
+ +			if (!rc)
+ +				update_cache_entry_locked(ce->path, refs, numrefs);
+ +
+ +			free_dfs_info_array(refs, numrefs);
+++=======
++ 			ref_paths[count++] = kstrdup(ce->path, GFP_ATOMIC);
+++>>>>>>> 1023e90b733a (cifs: avoid starvation when refreshing dfs cache)
+  		}
+  	}
+- 	up_write(&htable_rw_lock);
++ 
++ out_unlock:
++ 	up_read(&htable_rw_lock);
++ 
++ 	for (i = 0; i < count; i++) {
++ 		char *path = ref_paths[i];
++ 		struct dfs_info3_param *refs = NULL;
++ 		int numrefs = 0;
++ 		int rc = 0;
++ 
++ 		if (!path)
++ 			continue;
++ 
++ 		ses = find_ipc_from_server_path(sessions, path);
++ 		if (IS_ERR(ses))
++ 			goto next_referral;
++ 
++ 		xid = get_xid();
++ 		rc = get_dfs_referral(xid, ses, path, &refs, &numrefs);
++ 		free_xid(xid);
++ 
++ 		if (!rc) {
++ 			down_write(&htable_rw_lock);
++ 			ce = lookup_cache_entry(path);
++ 			/*
++ 			 * We need to re-check it because other tasks might have it deleted or
++ 			 * updated.
++ 			 */
++ 			if (!IS_ERR(ce) && cache_entry_expired(ce))
++ 				update_cache_entry_locked(ce, refs, numrefs);
++ 			up_write(&htable_rw_lock);
++ 		}
++ 
++ next_referral:
++ 		kfree(path);
++ 		free_dfs_info_array(refs, numrefs);
++ 	}
+  }
+  
+  /*
+* Unmerged path fs/cifs/dfs_cache.c
