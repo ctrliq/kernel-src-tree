@@ -1,0 +1,109 @@
+mptcp: more strict state checking for acks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 20bc80b6f582ad1151c52ca09ab66b472768c9c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/20bc80b6.failed
+
+Syzkaller found a way to trigger division by zero
+in mptcp_subflow_cleanup_rbuf().
+
+The current checks implemented into tcp_can_send_ack()
+are too week, let's be more accurate.
+
+	Reported-by: Christoph Paasch <cpaasch@apple.com>
+Fixes: ea4ca586b16f ("mptcp: refine MPTCP-level ack scheduling")
+Fixes: fd8976790a6c ("mptcp: be careful on MPTCP-level ack.")
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 20bc80b6f582ad1151c52ca09ab66b472768c9c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index 509aa48ee70d,2ff8c7caf74f..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -262,7 -412,72 +262,76 @@@ static void mptcp_set_timeout(const str
+  	mptcp_sk(sk)->timer_ival = tout > 0 ? tout : TCP_RTO_MIN;
+  }
+  
+++<<<<<<< HEAD
+ +static void mptcp_check_data_fin(struct sock *sk)
+++=======
++ static bool mptcp_subflow_active(struct mptcp_subflow_context *subflow)
++ {
++ 	struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 	/* can't send if JOIN hasn't completed yet (i.e. is usable for mptcp) */
++ 	if (subflow->request_join && !subflow->fully_established)
++ 		return false;
++ 
++ 	/* only send if our side has not closed yet */
++ 	return ((1 << ssk->sk_state) & (TCPF_ESTABLISHED | TCPF_CLOSE_WAIT));
++ }
++ 
++ static bool tcp_can_send_ack(const struct sock *ssk)
++ {
++ 	return !((1 << inet_sk_state_load(ssk)) &
++ 	       (TCPF_SYN_SENT | TCPF_SYN_RECV | TCPF_TIME_WAIT | TCPF_CLOSE | TCPF_LISTEN));
++ }
++ 
++ static void mptcp_send_ack(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	mptcp_for_each_subflow(msk, subflow) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		lock_sock(ssk);
++ 		if (tcp_can_send_ack(ssk))
++ 			tcp_send_ack(ssk);
++ 		release_sock(ssk);
++ 	}
++ }
++ 
++ static bool mptcp_subflow_cleanup_rbuf(struct sock *ssk)
++ {
++ 	int ret;
++ 
++ 	lock_sock(ssk);
++ 	ret = tcp_can_send_ack(ssk);
++ 	if (ret)
++ 		tcp_cleanup_rbuf(ssk, 1);
++ 	release_sock(ssk);
++ 	return ret;
++ }
++ 
++ static void mptcp_cleanup_rbuf(struct mptcp_sock *msk)
++ {
++ 	struct sock *ack_hint = READ_ONCE(msk->ack_hint);
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	/* if the hinted ssk is still active, try to use it */
++ 	if (likely(ack_hint)) {
++ 		mptcp_for_each_subflow(msk, subflow) {
++ 			struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 			if (ack_hint == ssk && mptcp_subflow_cleanup_rbuf(ssk))
++ 				return;
++ 		}
++ 	}
++ 
++ 	/* otherwise pick the first active subflow */
++ 	mptcp_for_each_subflow(msk, subflow)
++ 		if (mptcp_subflow_cleanup_rbuf(mptcp_subflow_tcp_sock(subflow)))
++ 			return;
++ }
++ 
++ static bool mptcp_check_data_fin(struct sock *sk)
+++>>>>>>> 20bc80b6f582 (mptcp: more strict state checking for acks)
+  {
+  	struct mptcp_sock *msk = mptcp_sk(sk);
+  	u64 rcv_data_fin_seq;
+* Unmerged path net/mptcp/protocol.c
