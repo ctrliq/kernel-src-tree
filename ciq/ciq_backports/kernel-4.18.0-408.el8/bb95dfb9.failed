@@ -1,0 +1,226 @@
+KVM: x86/mmu: Defer TLB flush to caller when freeing TDP MMU shadow pages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit bb95dfb9e2dfbe6b3f5eb5e8a20e0259dadbe906
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/bb95dfb9.failed
+
+Defer TLB flushes to the caller when freeing TDP MMU shadow pages instead
+of immediately flushing.  Because the shadow pages are freed in an RCU
+callback, so long as at least one CPU holds RCU, all CPUs are protected.
+For vCPUs running in the guest, i.e. consuming TLB entries, KVM only
+needs to ensure the caller services the pending TLB flush before dropping
+its RCU protections.  I.e. use the caller's RCU as a proxy for all vCPUs
+running in the guest.
+
+Deferring the flushes allows batching flushes, e.g. when installing a
+1gb hugepage and zapping a pile of SPs.  And when zapping an entire root,
+deferring flushes allows skipping the flush entirely (because flushes are
+not needed in that case).
+
+Avoiding flushes when zapping an entire root is especially important as
+synchronizing with other CPUs via IPI after zapping every shadow page can
+cause significant performance issues for large VMs.  The issue is
+exacerbated by KVM zapping entire top-level entries without dropping
+RCU protection, which can lead to RCU stalls even when zapping roots
+backing relatively "small" amounts of guest memory, e.g. 2tb.  Removing
+the IPI bottleneck largely mitigates the RCU issues, though it's likely
+still a problem for 5-level paging.  A future patch will further address
+the problem by zapping roots in multiple passes to avoid holding RCU for
+an extended duration.
+
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20220226001546.360188-20-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit bb95dfb9e2dfbe6b3f5eb5e8a20e0259dadbe906)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,5038de0c872d..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -700,11 -733,101 +697,105 @@@ static inline bool __must_check tdp_mmu
+  	return iter->yielded;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline gfn_t tdp_mmu_max_gfn_host(void)
++ {
++ 	/*
++ 	 * Bound TDP MMU walks at host.MAXPHYADDR, guest accesses beyond that
++ 	 * will hit a #PF(RSVD) and never hit an EPT Violation/Misconfig / #NPF,
++ 	 * and so KVM will never install a SPTE for such addresses.
++ 	 */
++ 	return 1ULL << (shadow_phys_bits - PAGE_SHIFT);
++ }
++ 
++ static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
++ 			     bool shared)
++ {
++ 	bool root_is_unreachable = !refcount_read(&root->tdp_mmu_root_count);
++ 	struct tdp_iter iter;
++ 
++ 	gfn_t end = tdp_mmu_max_gfn_host();
++ 	gfn_t start = 0;
++ 
++ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ 
++ 	rcu_read_lock();
++ 
++ 	/*
++ 	 * No need to try to step down in the iterator when zapping an entire
++ 	 * root, zapping an upper-level SPTE will recurse on its children.
++ 	 */
++ 	for_each_tdp_pte_min_level(iter, root, root->role.level, start, end) {
++ retry:
++ 		/*
++ 		 * Yielding isn't allowed when zapping an unreachable root as
++ 		 * the root won't be processed by mmu_notifier callbacks.  When
++ 		 * handling an unmap/release mmu_notifier command, KVM must
++ 		 * drop all references to relevant pages prior to completing
++ 		 * the callback.  Dropping mmu_lock can result in zapping SPTEs
++ 		 * for an unreachable root after a relevant callback completes,
++ 		 * which leads to use-after-free as zapping a SPTE triggers
++ 		 * "writeback" of dirty/accessed bits to the SPTE's associated
++ 		 * struct page.
++ 		 */
++ 		if (!root_is_unreachable &&
++ 		    tdp_mmu_iter_cond_resched(kvm, &iter, false, shared))
++ 			continue;
++ 
++ 		if (!is_shadow_present_pte(iter.old_spte))
++ 			continue;
++ 
++ 		if (!shared) {
++ 			tdp_mmu_set_spte(kvm, &iter, 0);
++ 		} else if (tdp_mmu_set_spte_atomic(kvm, &iter, 0)) {
++ 			/*
++ 			 * cmpxchg() shouldn't fail if the root is unreachable.
++ 			 * Retry so as not to leak the page and its children.
++ 			 */
++ 			WARN_ONCE(root_is_unreachable,
++ 				  "Contended TDP MMU SPTE in unreachable root.");
++ 			goto retry;
++ 		}
++ 
++ 		/*
++ 		 * WARN if the root is invalid and is unreachable, all SPTEs
++ 		 * should've been zapped by kvm_tdp_mmu_zap_invalidated_roots(),
++ 		 * and inserting new SPTEs under an invalid root is a KVM bug.
++ 		 */
++ 		WARN_ON_ONCE(root_is_unreachable && root->role.invalid);
++ 	}
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
++ {
++ 	u64 old_spte;
++ 
++ 	/*
++ 	 * This helper intentionally doesn't allow zapping a root shadow page,
++ 	 * which doesn't have a parent page table and thus no associated entry.
++ 	 */
++ 	if (WARN_ON_ONCE(!sp->ptep))
++ 		return false;
++ 
++ 	old_spte = kvm_tdp_mmu_read_spte(sp->ptep);
++ 	if (WARN_ON_ONCE(!is_shadow_present_pte(old_spte)))
++ 		return false;
++ 
++ 	__tdp_mmu_set_spte(kvm, kvm_mmu_page_as_id(sp), sp->ptep, old_spte, 0,
++ 			   sp->gfn, sp->role.level + 1, true, true);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> bb95dfb9e2df (KVM: x86/mmu: Defer TLB flush to caller when freeing TDP MMU shadow pages)
+  /*
+ - * Zap leafs SPTEs for the range of gfns, [start, end). Returns true if SPTEs
+ - * have been cleared and a TLB flush is needed before releasing the MMU lock.
+ - *
+ + * Tears down the mappings for the range of gfns, [start, end), and frees the
+ + * non-root pages mapping GFNs strictly within that range. Returns true if
+ + * SPTEs have been cleared and a TLB flush is needed before releasing the
+ + * MMU lock.
+   * If can_yield is true, will release the MMU lock and reschedule if the
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+@@@ -903,8 -1030,12 +999,12 @@@ static int tdp_mmu_map_handle_target_le
+  
+  	if (new_spte == iter->old_spte)
+  		ret = RET_PF_SPURIOUS;
+ -	else if (tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
+ +	else if (!tdp_mmu_set_spte_atomic(vcpu->kvm, iter, new_spte))
+  		return RET_PF_RETRY;
++ 	else if (is_shadow_present_pte(iter->old_spte) &&
++ 		 !is_last_spte(iter->old_spte, iter->level))
++ 		kvm_flush_remote_tlbs_with_address(vcpu->kvm, sp->gfn,
++ 						   KVM_PAGES_PER_HPAGE(iter->level + 1));
+  
+  	/*
+  	 * If the page fault was caused by a write but the page is write
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index ad983809b045..8651d0004482 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -6186,6 +6186,13 @@ static void kvm_recover_nx_lpages(struct kvm *kvm)
+ 	rcu_idx = srcu_read_lock(&kvm->srcu);
+ 	write_lock(&kvm->mmu_lock);
+ 
++	/*
++	 * Zapping TDP MMU shadow pages, including the remote TLB flush, must
++	 * be done under RCU protection, because the pages are freed via RCU
++	 * callback.
++	 */
++	rcu_read_lock();
++
+ 	ratio = READ_ONCE(nx_huge_pages_recovery_ratio);
+ 	to_zap = ratio ? DIV_ROUND_UP(nx_lpage_splits, ratio) : 0;
+ 	for ( ; to_zap; --to_zap) {
+@@ -6210,12 +6217,18 @@ static void kvm_recover_nx_lpages(struct kvm *kvm)
+ 
+ 		if (need_resched() || rwlock_needbreak(&kvm->mmu_lock)) {
+ 			kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
++			rcu_read_unlock();
++
+ 			cond_resched_rwlock_write(&kvm->mmu_lock);
+ 			flush = false;
++
++			rcu_read_lock();
+ 		}
+ 	}
+ 	kvm_mmu_remote_flush_or_zap(kvm, &invalid_list, flush);
+ 
++	rcu_read_unlock();
++
+ 	write_unlock(&kvm->mmu_lock);
+ 	srcu_read_unlock(&kvm->srcu, rcu_idx);
+ }
+diff --git a/arch/x86/kvm/mmu/tdp_iter.h b/arch/x86/kvm/mmu/tdp_iter.h
+index a8673c625c04..c50b7c1e4afb 100644
+--- a/arch/x86/kvm/mmu/tdp_iter.h
++++ b/arch/x86/kvm/mmu/tdp_iter.h
+@@ -11,10 +11,9 @@ typedef u64 __rcu *tdp_ptep_t;
+ 
+ /*
+  * TDP MMU SPTEs are RCU protected to allow paging structures (non-leaf SPTEs)
+- * to be zapped while holding mmu_lock for read.  Holding RCU isn't required for
+- * correctness if mmu_lock is held for write, but plumbing "struct kvm" down to
+- * the lower depths of the TDP MMU just to make lockdep happy is a nightmare, so
+- * all accesses to SPTEs are done under RCU protection.
++ * to be zapped while holding mmu_lock for read, and to allow TLB flushes to be
++ * batched without having to collect the list of zapped SPs.  Flows that can
++ * remove SPs must service pending TLB flushes prior to dropping RCU protection.
+  */
+ static inline u64 kvm_tdp_mmu_read_spte(tdp_ptep_t sptep)
+ {
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
