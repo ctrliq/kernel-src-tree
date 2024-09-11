@@ -202,7 +202,7 @@ err:
 int tipc_msg_append(struct tipc_msg *_hdr, struct msghdr *m, int dlen,
 		    int mss, struct sk_buff_head *txq)
 {
-	struct sk_buff *skb, *prev;
+	struct sk_buff *skb;
 	int accounted, total, curr;
 	int mlen, cpy, rem = dlen;
 	struct tipc_msg *hdr;
@@ -213,7 +213,6 @@ int tipc_msg_append(struct tipc_msg *_hdr, struct msghdr *m, int dlen,
 
 	do {
 		if (!skb || skb->len >= mss) {
-			prev = skb;
 			skb = tipc_buf_acquire(mss, GFP_KERNEL);
 			if (unlikely(!skb))
 				return -ENOMEM;
