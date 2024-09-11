@@ -1,0 +1,202 @@
+qede: use ethtool_rx_flow_rule() to remove duplicated parser code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit 37c5d3efd7f801091d1470d7682be474e0ea2bd0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/37c5d3ef.failed
+
+The qede driver supports for ethtool_rx_flow_spec and flower, both
+codebases look very similar.
+
+This patch uses the ethtool_rx_flow_rule() infrastructure to remove the
+duplicated ethtool_rx_flow_spec parser and consolidate ACL offload
+support around the flow_rule infrastructure.
+
+Furthermore, more code can be consolidated by merging
+qede_add_cls_rule() and qede_add_tc_flower_fltr(), these two functions
+also look very similar.
+
+This driver currently provides simple ACL support, such as 5-tuple
+matching, drop policy and queue to CPU.
+
+Drivers that support more features can benefit from this infrastructure
+to save even more redundant codebase.
+
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 37c5d3efd7f801091d1470d7682be474e0ea2bd0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/qlogic/qede/qede_filter.c
+diff --cc drivers/net/ethernet/qlogic/qede/qede_filter.c
+index 2c875276f288,add922b93d2c..000000000000
+--- a/drivers/net/ethernet/qlogic/qede/qede_filter.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_filter.c
+@@@ -1872,49 -1746,47 +1746,77 @@@ unlock
+  }
+  
+  static int qede_parse_actions(struct qede_dev *edev,
+ -			      struct flow_action *flow_action)
+ +			      struct tcf_exts *exts)
+  {
+++<<<<<<< HEAD
+ +	int rc = -EINVAL, num_act = 0;
+ +	const struct tc_action *a;
+ +	bool is_drop = false;
+ +	LIST_HEAD(actions);
+ +
+ +	if (!tcf_exts_has_actions(exts)) {
+ +		DP_NOTICE(edev, "No tc actions received\n");
+ +		return rc;
+ +	}
+ +
+ +	tcf_exts_to_list(exts, &actions);
+ +	list_for_each_entry(a, &actions, list) {
+ +		num_act++;
+ +
+ +		if (is_tcf_gact_shot(a))
+ +			is_drop = true;
+++=======
++ 	const struct flow_action_entry *act;
++ 	int i;
++ 
++ 	if (!flow_action_has_entries(flow_action)) {
++ 		DP_NOTICE(edev, "No actions received\n");
++ 		return -EINVAL;
+  	}
+  
+- 	if (num_act == 1 && is_drop)
+- 		return 0;
++ 	flow_action_for_each(i, act, flow_action) {
++ 		switch (act->id) {
++ 		case FLOW_ACTION_DROP:
++ 			break;
++ 		case FLOW_ACTION_QUEUE:
++ 			if (act->queue.vf)
++ 				break;
+  
+- 	return rc;
++ 			if (act->queue.index >= QEDE_RSS_COUNT(edev)) {
++ 				DP_INFO(edev, "Queue out-of-bounds\n");
++ 				return -EINVAL;
++ 			}
++ 			break;
++ 		default:
++ 			return -EINVAL;
++ 		}
+++>>>>>>> 37c5d3efd7f8 (qede: use ethtool_rx_flow_rule() to remove duplicated parser code)
++ 	}
++ 
++ 	return 0;
+  }
+  
+  static int
+- qede_tc_parse_ports(struct qede_dev *edev,
+- 		    struct tc_cls_flower_offload *f,
+- 		    struct qede_arfs_tuple *t)
++ qede_flow_parse_ports(struct qede_dev *edev, struct flow_rule *rule,
++ 		      struct qede_arfs_tuple *t)
+  {
+++<<<<<<< HEAD
+ +	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_PORTS)) {
+ +		struct flow_dissector_key_ports *key, *mask;
+ +
+ +		key = skb_flow_dissector_target(f->dissector,
+ +						FLOW_DISSECTOR_KEY_PORTS,
+ +						f->key);
+ +		mask = skb_flow_dissector_target(f->dissector,
+ +						 FLOW_DISSECTOR_KEY_PORTS,
+ +						 f->mask);
+++=======
++ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS)) {
++ 		struct flow_match_ports match;
+++>>>>>>> 37c5d3efd7f8 (qede: use ethtool_rx_flow_rule() to remove duplicated parser code)
+  
+ -		flow_rule_match_ports(rule, &match);
+ -		if ((match.key->src && match.mask->src != U16_MAX) ||
+ -		    (match.key->dst && match.mask->dst != U16_MAX)) {
+ +		if ((key->src && mask->src != U16_MAX) ||
+ +		    (key->dst && mask->dst != U16_MAX)) {
+  			DP_NOTICE(edev, "Do not support ports masks\n");
+  			return -EINVAL;
+  		}
+@@@ -1955,42 -1820,35 +1856,46 @@@ qede_flow_parse_v6_common(struct qede_d
+  			return -EINVAL;
+  		}
+  
+ -		memcpy(&t->src_ipv6, &match.key->src, sizeof(addr));
+ -		memcpy(&t->dst_ipv6, &match.key->dst, sizeof(addr));
+ +		memcpy(&t->src_ipv6, &key->src, sizeof(addr));
+ +		memcpy(&t->dst_ipv6, &key->dst, sizeof(addr));
+  	}
+  
+- 	if (qede_tc_parse_ports(edev, f, t))
++ 	if (qede_flow_parse_ports(edev, rule, t))
+  		return -EINVAL;
+  
+  	return qede_set_v6_tuple_to_profile(edev, t, &zero_addr);
+  }
+  
+  static int
+- qede_tc_parse_v4_common(struct qede_dev *edev,
+- 			struct tc_cls_flower_offload *f,
++ qede_flow_parse_v4_common(struct qede_dev *edev, struct flow_rule *rule,
+  			struct qede_arfs_tuple *t)
+  {
+++<<<<<<< HEAD
+ +	if (dissector_uses_key(f->dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
+ +		struct flow_dissector_key_ipv4_addrs *key, *mask;
+ +
+ +		key = skb_flow_dissector_target(f->dissector,
+ +						FLOW_DISSECTOR_KEY_IPV4_ADDRS,
+ +						f->key);
+ +		mask = skb_flow_dissector_target(f->dissector,
+ +						 FLOW_DISSECTOR_KEY_IPV4_ADDRS,
+ +						 f->mask);
+++=======
++ 	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_IPV4_ADDRS)) {
++ 		struct flow_match_ipv4_addrs match;
+++>>>>>>> 37c5d3efd7f8 (qede: use ethtool_rx_flow_rule() to remove duplicated parser code)
+  
+ -		flow_rule_match_ipv4_addrs(rule, &match);
+ -		if ((match.key->src && match.mask->src != U32_MAX) ||
+ -		    (match.key->dst && match.mask->dst != U32_MAX)) {
+ +		if ((key->src && mask->src != U32_MAX) ||
+ +		    (key->dst && mask->dst != U32_MAX)) {
+  			DP_NOTICE(edev, "Do not support ipv4 prefix/masks\n");
+  			return -EINVAL;
+  		}
+  
+ -		t->src_ipv4 = match.key->src;
+ -		t->dst_ipv4 = match.key->dst;
+ +		t->src_ipv4 = key->src;
+ +		t->dst_ipv4 = key->dst;
+  	}
+  
+- 	if (qede_tc_parse_ports(edev, f, t))
++ 	if (qede_flow_parse_ports(edev, rule, t))
+  		return -EINVAL;
+  
+  	return qede_set_v4_tuple_to_profile(edev, t);
+@@@ -2041,10 -1895,10 +1942,13 @@@ qede_flow_parse_udp_v4(struct qede_dev 
+  }
+  
+  static int
+- qede_parse_flower_attr(struct qede_dev *edev, __be16 proto,
+- 		       struct tc_cls_flower_offload *f,
+- 		       struct qede_arfs_tuple *tuple)
++ qede_parse_flow_attr(struct qede_dev *edev, __be16 proto,
++ 		     struct flow_rule *rule, struct qede_arfs_tuple *tuple)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct flow_dissector *dissector = rule->match.dissector;
+++>>>>>>> 37c5d3efd7f8 (qede: use ethtool_rx_flow_rule() to remove duplicated parser code)
+  	int rc = -EINVAL;
+  	u8 ip_proto = 0;
+  
+* Unmerged path drivers/net/ethernet/qlogic/qede/qede_filter.c
