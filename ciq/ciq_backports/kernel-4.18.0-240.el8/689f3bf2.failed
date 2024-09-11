@@ -1,0 +1,189 @@
+KVM: x86: unify callbacks to load paging root
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 689f3bf2162895cf0b847f36584309064887c966
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/689f3bf2.failed
+
+Similar to what kvm-intel.ko is doing, provide a single callback that
+merges svm_set_cr3, set_tdp_cr3 and nested_svm_set_tdp_cr3.
+
+This lets us unify the set_cr3 and set_tdp_cr3 entries in kvm_x86_ops.
+I'm doing that in this same patch because splitting it adds quite a bit
+of churn due to the need for forward declarations.  For the same reason
+the assignment to vcpu->arch.mmu->set_cr3 is moved to kvm_init_shadow_mmu
+from init_kvm_softmmu and nested_svm_init_mmu_context.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 689f3bf2162895cf0b847f36584309064887c966)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 57bbfbf61b11,c3e4e764a291..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1147,14 -1154,7 +1146,17 @@@ struct kvm_x86_ops 
+  	int (*set_identity_map_addr)(struct kvm *kvm, u64 ident_addr);
+  	int (*get_tdp_level)(struct kvm_vcpu *vcpu);
+  	u64 (*get_mt_mask)(struct kvm_vcpu *vcpu, gfn_t gfn, bool is_mmio);
+ +	int (*get_lpage_level)(void);
+ +	bool (*rdtscp_supported)(void);
+ +	bool (*invpcid_supported)(void);
+ +
+++<<<<<<< HEAD
+ +	void (*set_tdp_cr3)(struct kvm_vcpu *vcpu, unsigned long cr3);
+ +
+ +	void (*set_supported_cpuid)(u32 func, struct kvm_cpuid_entry2 *entry);
+  
+++=======
+++>>>>>>> 689f3bf21628 (KVM: x86: unify callbacks to load paging root)
+  	bool (*has_wbinvd_exit)(void);
+  
+  	u64 (*read_l1_tsc_offset)(struct kvm_vcpu *vcpu);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/mmu.h b/arch/x86/kvm/mmu.h
+index a647601c9e1c..27d2c892bdbf 100644
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@ -95,11 +95,11 @@ static inline unsigned long kvm_get_active_pcid(struct kvm_vcpu *vcpu)
+ 	return kvm_get_pcid(vcpu, kvm_read_cr3(vcpu));
+ }
+ 
+-static inline void kvm_mmu_load_cr3(struct kvm_vcpu *vcpu)
++static inline void kvm_mmu_load_pgd(struct kvm_vcpu *vcpu)
+ {
+ 	if (VALID_PAGE(vcpu->arch.mmu->root_hpa))
+-		vcpu->arch.mmu->set_cr3(vcpu, vcpu->arch.mmu->root_hpa |
+-					      kvm_get_active_pcid(vcpu));
++		kvm_x86_ops->set_cr3(vcpu, vcpu->arch.mmu->root_hpa |
++				     kvm_get_active_pcid(vcpu));
+ }
+ 
+ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u32 error_code,
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 7b990f5b5c82..ab0a55649d0f 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4989,7 +4989,6 @@ static void init_kvm_tdp_mmu(struct kvm_vcpu *vcpu)
+ 	context->update_pte = nonpaging_update_pte;
+ 	context->shadow_root_level = kvm_x86_ops->get_tdp_level(vcpu);
+ 	context->direct_map = true;
+-	context->set_cr3 = kvm_x86_ops->set_tdp_cr3;
+ 	context->get_guest_pgd = get_cr3;
+ 	context->get_pdptr = kvm_pdptr_read;
+ 	context->inject_page_fault = kvm_inject_page_fault;
+@@ -5136,7 +5135,6 @@ static void init_kvm_softmmu(struct kvm_vcpu *vcpu)
+ 	struct kvm_mmu *context = vcpu->arch.mmu;
+ 
+ 	kvm_init_shadow_mmu(vcpu);
+-	context->set_cr3           = kvm_x86_ops->set_cr3;
+ 	context->get_guest_pgd     = get_cr3;
+ 	context->get_pdptr         = kvm_pdptr_read;
+ 	context->inject_page_fault = kvm_inject_page_fault;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index 720353d5a356..2d94220751c9 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -3012,15 +3012,6 @@ static u64 nested_svm_get_tdp_pdptr(struct kvm_vcpu *vcpu, int index)
+ 	return pdpte;
+ }
+ 
+-static void nested_svm_set_tdp_cr3(struct kvm_vcpu *vcpu,
+-				   unsigned long root)
+-{
+-	struct vcpu_svm *svm = to_svm(vcpu);
+-
+-	svm->vmcb->control.nested_cr3 = __sme_set(root);
+-	mark_dirty(svm->vmcb, VMCB_NPT);
+-}
+-
+ static void nested_svm_inject_npf_exit(struct kvm_vcpu *vcpu,
+ 				       struct x86_exception *fault)
+ {
+@@ -3056,7 +3047,6 @@ static void nested_svm_init_mmu_context(struct kvm_vcpu *vcpu)
+ 
+ 	vcpu->arch.mmu = &vcpu->arch.guest_mmu;
+ 	kvm_init_shadow_mmu(vcpu);
+-	vcpu->arch.mmu->set_cr3           = nested_svm_set_tdp_cr3;
+ 	vcpu->arch.mmu->get_guest_pgd     = nested_svm_get_tdp_cr3;
+ 	vcpu->arch.mmu->get_pdptr         = nested_svm_get_tdp_pdptr;
+ 	vcpu->arch.mmu->inject_page_fault = nested_svm_inject_npf_exit;
+@@ -5955,21 +5945,27 @@ STACK_FRAME_NON_STANDARD(svm_vcpu_run);
+ static void svm_set_cr3(struct kvm_vcpu *vcpu, unsigned long root)
+ {
+ 	struct vcpu_svm *svm = to_svm(vcpu);
++	bool update_guest_cr3 = true;
++	unsigned long cr3;
+ 
+-	svm->vmcb->save.cr3 = __sme_set(root);
+-	mark_dirty(svm->vmcb, VMCB_CR);
+-}
+-
+-static void set_tdp_cr3(struct kvm_vcpu *vcpu, unsigned long root)
+-{
+-	struct vcpu_svm *svm = to_svm(vcpu);
++	cr3 = __sme_set(root);
++	if (npt_enabled) {
++		svm->vmcb->control.nested_cr3 = cr3;
++		mark_dirty(svm->vmcb, VMCB_NPT);
+ 
+-	svm->vmcb->control.nested_cr3 = __sme_set(root);
+-	mark_dirty(svm->vmcb, VMCB_NPT);
++		/* Loading L2's CR3 is handled by enter_svm_guest_mode.  */
++		if (is_guest_mode(vcpu))
++			update_guest_cr3 = false;
++		else if (test_bit(VCPU_EXREG_CR3, (ulong *)&vcpu->arch.regs_avail))
++			cr3 = vcpu->arch.cr3;
++		else /* CR3 is already up-to-date.  */
++			update_guest_cr3 = false;
++	}
+ 
+-	/* Also sync guest cr3 here in case we live migrate */
+-	svm->vmcb->save.cr3 = kvm_read_cr3(vcpu);
+-	mark_dirty(svm->vmcb, VMCB_CR);
++	if (update_guest_cr3) {
++		svm->vmcb->save.cr3 = cr3;
++		mark_dirty(svm->vmcb, VMCB_CR);
++	}
+ }
+ 
+ static int is_disabled(void)
+@@ -7474,8 +7470,6 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.read_l1_tsc_offset = svm_read_l1_tsc_offset,
+ 	.write_l1_tsc_offset = svm_write_l1_tsc_offset,
+ 
+-	.set_tdp_cr3 = set_tdp_cr3,
+-
+ 	.check_intercept = svm_check_intercept,
+ 	.handle_exit_irqoff = svm_handle_exit_irqoff,
+ 
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index 04723b1103e1..5eaf2d0414ab 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -354,7 +354,6 @@ static void nested_ept_init_mmu_context(struct kvm_vcpu *vcpu)
+ 			VMX_EPT_EXECUTE_ONLY_BIT,
+ 			nested_ept_ad_enabled(vcpu),
+ 			nested_ept_get_eptp(vcpu));
+-	vcpu->arch.mmu->set_cr3           = vmx_set_cr3;
+ 	vcpu->arch.mmu->get_guest_pgd     = nested_ept_get_eptp;
+ 	vcpu->arch.mmu->inject_page_fault = nested_ept_inject_page_fault;
+ 	vcpu->arch.mmu->get_pdptr         = kvm_pdptr_read;
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 81f81c6fe900..e78d7fd91ef5 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7981,8 +7981,6 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.read_l1_tsc_offset = vmx_read_l1_tsc_offset,
+ 	.write_l1_tsc_offset = vmx_write_l1_tsc_offset,
+ 
+-	.set_tdp_cr3 = vmx_set_cr3,
+-
+ 	.check_intercept = vmx_check_intercept,
+ 	.handle_exit_irqoff = vmx_handle_exit_irqoff,
+ 	.mpx_supported = vmx_mpx_supported,
