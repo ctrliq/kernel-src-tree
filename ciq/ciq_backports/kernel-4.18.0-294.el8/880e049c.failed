@@ -1,0 +1,132 @@
+mm/kasan: Simplify stacktrace handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 880e049c9ce9020384ce305c71375aa1cb54addb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/880e049c.failed
+
+Replace the indirection through struct stack_trace by using the storage
+array based interfaces.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Acked-by: Dmitry Vyukov <dvyukov@google.com>
+	Acked-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Andy Lutomirski <luto@kernel.org>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: kasan-dev@googlegroups.com
+	Cc: linux-mm@kvack.org
+	Cc: Steven Rostedt <rostedt@goodmis.org>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: Akinobu Mita <akinobu.mita@gmail.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: iommu@lists.linux-foundation.org
+	Cc: Robin Murphy <robin.murphy@arm.com>
+	Cc: Marek Szyprowski <m.szyprowski@samsung.com>
+	Cc: Johannes Thumshirn <jthumshirn@suse.de>
+	Cc: David Sterba <dsterba@suse.com>
+	Cc: Chris Mason <clm@fb.com>
+	Cc: Josef Bacik <josef@toxicpanda.com>
+	Cc: linux-btrfs@vger.kernel.org
+	Cc: dm-devel@redhat.com
+	Cc: Mike Snitzer <snitzer@redhat.com>
+	Cc: Alasdair Kergon <agk@redhat.com>
+	Cc: Daniel Vetter <daniel@ffwll.ch>
+	Cc: intel-gfx@lists.freedesktop.org
+	Cc: Joonas Lahtinen <joonas.lahtinen@linux.intel.com>
+	Cc: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+	Cc: dri-devel@lists.freedesktop.org
+	Cc: David Airlie <airlied@linux.ie>
+	Cc: Jani Nikula <jani.nikula@linux.intel.com>
+	Cc: Rodrigo Vivi <rodrigo.vivi@intel.com>
+	Cc: Tom Zanussi <tom.zanussi@linux.intel.com>
+	Cc: Miroslav Benes <mbenes@suse.cz>
+	Cc: linux-arch@vger.kernel.org
+Link: https://lkml.kernel.org/r/20190425094801.963261479@linutronix.de
+
+(cherry picked from commit 880e049c9ce9020384ce305c71375aa1cb54addb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/kasan.c
+diff --cc mm/kasan/kasan.c
+index d79269dd4b58,303a7379d2a3..000000000000
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@@ -40,6 -40,44 +40,47 @@@
+  #include "kasan.h"
+  #include "../slab.h"
+  
+++<<<<<<< HEAD:mm/kasan/kasan.c
+++=======
++ static inline int in_irqentry_text(unsigned long ptr)
++ {
++ 	return (ptr >= (unsigned long)&__irqentry_text_start &&
++ 		ptr < (unsigned long)&__irqentry_text_end) ||
++ 		(ptr >= (unsigned long)&__softirqentry_text_start &&
++ 		 ptr < (unsigned long)&__softirqentry_text_end);
++ }
++ 
++ static inline unsigned int filter_irq_stacks(unsigned long *entries,
++ 					     unsigned int nr_entries)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < nr_entries; i++) {
++ 		if (in_irqentry_text(entries[i])) {
++ 			/* Include the irqentry function into the stack. */
++ 			return i + 1;
++ 		}
++ 	}
++ 	return nr_entries;
++ }
++ 
++ static inline depot_stack_handle_t save_stack(gfp_t flags)
++ {
++ 	unsigned long entries[KASAN_STACK_DEPTH];
++ 	unsigned int nr_entries;
++ 
++ 	nr_entries = stack_trace_save(entries, ARRAY_SIZE(entries), 0);
++ 	nr_entries = filter_irq_stacks(entries, nr_entries);
++ 	return stack_depot_save(entries, nr_entries, flags);
++ }
++ 
++ static inline void set_track(struct kasan_track *track, gfp_t flags)
++ {
++ 	track->pid = current->pid;
++ 	track->stack = save_stack(flags);
++ }
++ 
+++>>>>>>> 880e049c9ce9 (mm/kasan: Simplify stacktrace handling):mm/kasan/common.c
+  void kasan_enable_current(void)
+  {
+  	current->kasan_depth++;
+* Unmerged path mm/kasan/kasan.c
+diff --git a/mm/kasan/report.c b/mm/kasan/report.c
+index 5c169aa688fd..9c81daeccbbe 100644
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@ -185,10 +185,11 @@ static void print_track(struct kasan_track *track, const char *prefix)
+ {
+ 	pr_err("%s by task %u:\n", prefix, track->pid);
+ 	if (track->stack) {
+-		struct stack_trace trace;
++		unsigned long *entries;
++		unsigned int nr_entries;
+ 
+-		depot_fetch_stack(track->stack, &trace);
+-		print_stack_trace(&trace, 0);
++		nr_entries = stack_depot_fetch(track->stack, &entries);
++		stack_trace_print(entries, nr_entries, 0);
+ 	} else {
+ 		pr_err("(stack is not available)\n");
+ 	}
