@@ -1,0 +1,183 @@
+netfilter: bridge: add pre_exit hooks for ebtable unregistration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 7ee3c61dcd28bf6e290e06ad382f13511dc790e9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/7ee3c61d.failed
+
+Just like ip/ip6/arptables, the hooks have to be removed, then
+synchronize_rcu() has to be called to make sure no more packets are being
+processed before the ruleset data is released.
+
+Place the hook unregistration in the pre_exit hook, then call the new
+ebtables pre_exit function from there.
+
+Years ago, when first netns support got added for netfilter+ebtables,
+this used an older (now removed) netfilter hook unregister API, that did
+a unconditional synchronize_rcu().
+
+Now that all is done with call_rcu, ebtable_{filter,nat,broute} pernet exit
+handlers may free the ebtable ruleset while packets are still in flight.
+
+This can only happens on module removal, not during netns exit.
+
+The new function expects the table name, not the table struct.
+
+This is because upcoming patch set (targeting -next) will remove all
+net->xt.{nat,filter,broute}_table instances, this makes it necessary
+to avoid external references to those member variables.
+
+The existing APIs will be converted, so follow the upcoming scheme of
+passing name + hook type instead.
+
+Fixes: aee12a0a3727e ("ebtables: remove nf_hook_register usage")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 7ee3c61dcd28bf6e290e06ad382f13511dc790e9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/netfilter/ebtable_broute.c
+#	net/bridge/netfilter/ebtables.c
+diff --cc net/bridge/netfilter/ebtable_broute.c
+index 276b60262981,32bc2821027f..000000000000
+--- a/net/bridge/netfilter/ebtable_broute.c
++++ b/net/bridge/netfilter/ebtable_broute.c
+@@@ -69,9 -105,14 +69,18 @@@ static int __net_init broute_net_init(s
+  				  &net->xt.broute_table);
+  }
+  
++ static void __net_exit broute_net_pre_exit(struct net *net)
++ {
++ 	ebt_unregister_table_pre_exit(net, "broute", &ebt_ops_broute);
++ }
++ 
+  static void __net_exit broute_net_exit(struct net *net)
+  {
+++<<<<<<< HEAD
+ +	ebt_unregister_table(net, net->xt.broute_table, NULL);
+++=======
++ 	ebt_unregister_table(net, net->xt.broute_table);
+++>>>>>>> 7ee3c61dcd28 (netfilter: bridge: add pre_exit hooks for ebtable unregistration)
+  }
+  
+  static struct pernet_operations broute_net_ops = {
+diff --cc net/bridge/netfilter/ebtables.c
+index 97a5e883618d,d481ff24a150..000000000000
+--- a/net/bridge/netfilter/ebtables.c
++++ b/net/bridge/netfilter/ebtables.c
+@@@ -1286,11 -1232,34 +1286,39 @@@ out
+  	return ret;
+  }
+  
+- void ebt_unregister_table(struct net *net, struct ebt_table *table,
+- 			  const struct nf_hook_ops *ops)
++ static struct ebt_table *__ebt_find_table(struct net *net, const char *name)
+  {
++ 	struct ebt_table *t;
++ 
++ 	mutex_lock(&ebt_mutex);
++ 
++ 	list_for_each_entry(t, &net->xt.tables[NFPROTO_BRIDGE], list) {
++ 		if (strcmp(t->name, name) == 0) {
++ 			mutex_unlock(&ebt_mutex);
++ 			return t;
++ 		}
++ 	}
++ 
++ 	mutex_unlock(&ebt_mutex);
++ 	return NULL;
++ }
++ 
++ void ebt_unregister_table_pre_exit(struct net *net, const char *name, const struct nf_hook_ops *ops)
++ {
++ 	struct ebt_table *table = __ebt_find_table(net, name);
++ 
++ 	if (table)
++ 		nf_unregister_net_hooks(net, ops, hweight32(table->valid_hooks));
++ }
++ EXPORT_SYMBOL(ebt_unregister_table_pre_exit);
++ 
++ void ebt_unregister_table(struct net *net, struct ebt_table *table)
++ {
+++<<<<<<< HEAD
+ +	if (ops)
+ +		nf_unregister_net_hooks(net, ops, hweight32(table->valid_hooks));
+++=======
+++>>>>>>> 7ee3c61dcd28 (netfilter: bridge: add pre_exit hooks for ebtable unregistration)
+  	__ebt_unregister_table(net, table);
+  }
+  
+diff --git a/include/linux/netfilter_bridge/ebtables.h b/include/linux/netfilter_bridge/ebtables.h
+index c6935be7c6ca..a4591ac12468 100644
+--- a/include/linux/netfilter_bridge/ebtables.h
++++ b/include/linux/netfilter_bridge/ebtables.h
+@@ -109,8 +109,9 @@ extern int ebt_register_table(struct net *net,
+ 			      const struct ebt_table *table,
+ 			      const struct nf_hook_ops *ops,
+ 			      struct ebt_table **res);
+-extern void ebt_unregister_table(struct net *net, struct ebt_table *table,
+-				 const struct nf_hook_ops *);
++extern void ebt_unregister_table(struct net *net, struct ebt_table *table);
++void ebt_unregister_table_pre_exit(struct net *net, const char *tablename,
++				   const struct nf_hook_ops *ops);
+ extern unsigned int ebt_do_table(struct sk_buff *skb,
+ 				 const struct nf_hook_state *state,
+ 				 struct ebt_table *table);
+* Unmerged path net/bridge/netfilter/ebtable_broute.c
+diff --git a/net/bridge/netfilter/ebtable_filter.c b/net/bridge/netfilter/ebtable_filter.c
+index c41da5fac84f..699c735032ff 100644
+--- a/net/bridge/netfilter/ebtable_filter.c
++++ b/net/bridge/netfilter/ebtable_filter.c
+@@ -97,14 +97,20 @@ static int __net_init frame_filter_net_init(struct net *net)
+ 				  &net->xt.frame_filter);
+ }
+ 
++static void __net_exit frame_filter_net_pre_exit(struct net *net)
++{
++	ebt_unregister_table_pre_exit(net, "filter", ebt_ops_filter);
++}
++
+ static void __net_exit frame_filter_net_exit(struct net *net)
+ {
+-	ebt_unregister_table(net, net->xt.frame_filter, ebt_ops_filter);
++	ebt_unregister_table(net, net->xt.frame_filter);
+ }
+ 
+ static struct pernet_operations frame_filter_net_ops = {
+ 	.init = frame_filter_net_init,
+ 	.exit = frame_filter_net_exit,
++	.pre_exit = frame_filter_net_pre_exit,
+ };
+ 
+ static int __init ebtable_filter_init(void)
+diff --git a/net/bridge/netfilter/ebtable_nat.c b/net/bridge/netfilter/ebtable_nat.c
+index 08df7406ecb3..c31fd15e868f 100644
+--- a/net/bridge/netfilter/ebtable_nat.c
++++ b/net/bridge/netfilter/ebtable_nat.c
+@@ -97,14 +97,20 @@ static int __net_init frame_nat_net_init(struct net *net)
+ 				  &net->xt.frame_nat);
+ }
+ 
++static void __net_exit frame_nat_net_pre_exit(struct net *net)
++{
++	ebt_unregister_table_pre_exit(net, "nat", ebt_ops_nat);
++}
++
+ static void __net_exit frame_nat_net_exit(struct net *net)
+ {
+-	ebt_unregister_table(net, net->xt.frame_nat, ebt_ops_nat);
++	ebt_unregister_table(net, net->xt.frame_nat);
+ }
+ 
+ static struct pernet_operations frame_nat_net_ops = {
+ 	.init = frame_nat_net_init,
+ 	.exit = frame_nat_net_exit,
++	.pre_exit = frame_nat_net_pre_exit,
+ };
+ 
+ static int __init ebtable_nat_init(void)
+* Unmerged path net/bridge/netfilter/ebtables.c
