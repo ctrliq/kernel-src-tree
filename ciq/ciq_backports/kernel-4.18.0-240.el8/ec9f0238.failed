@@ -1,0 +1,347 @@
+mm: workingset: fix vmstat counters for shadow nodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit ec9f02384f6053f2a5417e82b65078edc5364a8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/ec9f0238.failed
+
+Memcg counters for shadow nodes are broken because the memcg pointer is
+obtained in a wrong way. The following approach is used:
+        virt_to_page(xa_node)->mem_cgroup
+
+Since commit 4d96ba353075 ("mm: memcg/slab: stop setting
+page->mem_cgroup pointer for slab pages") page->mem_cgroup pointer isn't
+set for slab pages, so memcg_from_slab_page() should be used instead.
+
+Also I doubt that it ever worked correctly: virt_to_head_page() should
+be used instead of virt_to_page().  Otherwise objects residing on tail
+pages are not accounted, because only the head page contains a valid
+mem_cgroup pointer.  That was a case since the introduction of these
+counters by the commit 68d48e6a2df5 ("mm: workingset: add vmstat counter
+for shadow nodes").
+
+Link: http://lkml.kernel.org/r/20190801233532.138743-1-guro@fb.com
+Fixes: 4d96ba353075 ("mm: memcg/slab: stop setting page->mem_cgroup pointer for slab pages")
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Vladimir Davydov <vdavydov.dev@gmail.com>
+	Cc: Shakeel Butt <shakeelb@google.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit ec9f02384f6053f2a5417e82b65078edc5364a8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/memcontrol.h
+#	mm/memcontrol.c
+#	mm/workingset.c
+diff --cc include/linux/memcontrol.h
+index edfd7c1e1c27,2cd4359cb38c..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -654,31 -646,29 +654,37 @@@ static inline unsigned long lruvec_page
+  	return x;
+  }
+  
+ -static inline unsigned long lruvec_page_state_local(struct lruvec *lruvec,
+ -						    enum node_stat_item idx)
+ +static inline void __mod_lruvec_state(struct lruvec *lruvec,
+ +				      enum node_stat_item idx, int val)
+  {
+  	struct mem_cgroup_per_node *pn;
+ -	long x = 0;
+ -	int cpu;
+ +	long x;
+ +
+ +	/* Update node */
+ +	__mod_node_page_state(lruvec_pgdat(lruvec), idx, val);
+  
+  	if (mem_cgroup_disabled())
+ -		return node_page_state(lruvec_pgdat(lruvec), idx);
+ +		return;
+  
+  	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
+ -	for_each_possible_cpu(cpu)
+ -		x += per_cpu(pn->lruvec_stat_local->count[idx], cpu);
+ -#ifdef CONFIG_SMP
+ -	if (x < 0)
+ +
+++<<<<<<< HEAD
+ +	/* Update memcg */
+ +	__mod_memcg_state(pn->memcg, idx, val);
+ +
+ +	/* Update lruvec */
+ +	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
+ +	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
+ +		atomic_long_add(x, &pn->lruvec_stat[idx]);
+  		x = 0;
+ -#endif
+ -	return x;
+ +	}
+ +	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
+  }
+ -
+++=======
++ void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++ 			int val);
++ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val);
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  
+  static inline void mod_lruvec_state(struct lruvec *lruvec,
+  				    enum node_stat_item idx, int val)
+diff --cc mm/memcontrol.c
+index df2be32bfb7a,6f5c0c517c49..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -683,10 -682,155 +683,154 @@@ mem_cgroup_largest_soft_limit_node(stru
+  	return mz;
+  }
+  
+ -/**
+ - * __mod_memcg_state - update cgroup memory statistics
+ - * @memcg: the memory cgroup
+ - * @idx: the stat item - can be enum memcg_stat_item or enum node_stat_item
+ - * @val: delta to add to the counter, can be negative
+ - */
+ -void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val)
+ +static unsigned long memcg_sum_events(struct mem_cgroup *memcg,
+ +				      int event)
+  {
+++<<<<<<< HEAD
+ +	return atomic_long_read(&memcg->events[event]);
+++=======
++ 	long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = val + __this_cpu_read(memcg->vmstats_percpu->stat[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->stat[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmstats[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->stat[idx], x);
++ }
++ 
++ static struct mem_cgroup_per_node *
++ parent_nodeinfo(struct mem_cgroup_per_node *pn, int nid)
++ {
++ 	struct mem_cgroup *parent;
++ 
++ 	parent = parent_mem_cgroup(pn->memcg);
++ 	if (!parent)
++ 		return NULL;
++ 	return mem_cgroup_nodeinfo(parent, nid);
++ }
++ 
++ /**
++  * __mod_lruvec_state - update lruvec memory statistics
++  * @lruvec: the lruvec
++  * @idx: the stat item
++  * @val: delta to add to the counter, can be negative
++  *
++  * The lruvec is the intersection of the NUMA node and a cgroup. This
++  * function updates the all three counters that are affected by a
++  * change of state at this level: per-node, per-cgroup, per-lruvec.
++  */
++ void __mod_lruvec_state(struct lruvec *lruvec, enum node_stat_item idx,
++ 			int val)
++ {
++ 	pg_data_t *pgdat = lruvec_pgdat(lruvec);
++ 	struct mem_cgroup_per_node *pn;
++ 	struct mem_cgroup *memcg;
++ 	long x;
++ 
++ 	/* Update node */
++ 	__mod_node_page_state(pgdat, idx, val);
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	pn = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
++ 	memcg = pn->memcg;
++ 
++ 	/* Update memcg */
++ 	__mod_memcg_state(memcg, idx, val);
++ 
++ 	x = val + __this_cpu_read(pn->lruvec_stat_cpu->count[idx]);
++ 	if (unlikely(abs(x) > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup_per_node *pi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(pn->lruvec_stat_local->count[idx], x);
++ 		for (pi = pn; pi; pi = parent_nodeinfo(pi, pgdat->node_id))
++ 			atomic_long_add(x, &pi->lruvec_stat[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(pn->lruvec_stat_cpu->count[idx], x);
++ }
++ 
++ void __mod_lruvec_slab_state(void *p, enum node_stat_item idx, int val)
++ {
++ 	struct page *page = virt_to_head_page(p);
++ 	pg_data_t *pgdat = page_pgdat(page);
++ 	struct mem_cgroup *memcg;
++ 	struct lruvec *lruvec;
++ 
++ 	rcu_read_lock();
++ 	memcg = memcg_from_slab_page(page);
++ 
++ 	/* Untracked pages have no memcg, no lruvec. Update only the node */
++ 	if (!memcg || memcg == root_mem_cgroup) {
++ 		__mod_node_page_state(pgdat, idx, val);
++ 	} else {
++ 		lruvec = mem_cgroup_lruvec(pgdat, memcg);
++ 		__mod_lruvec_state(lruvec, idx, val);
++ 	}
++ 	rcu_read_unlock();
++ }
++ 
++ /**
++  * __count_memcg_events - account VM events in a cgroup
++  * @memcg: the memory cgroup
++  * @idx: the event item
++  * @count: the number of events that occured
++  */
++ void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
++ 			  unsigned long count)
++ {
++ 	unsigned long x;
++ 
++ 	if (mem_cgroup_disabled())
++ 		return;
++ 
++ 	x = count + __this_cpu_read(memcg->vmstats_percpu->events[idx]);
++ 	if (unlikely(x > MEMCG_CHARGE_BATCH)) {
++ 		struct mem_cgroup *mi;
++ 
++ 		/*
++ 		 * Batch local counters to keep them in sync with
++ 		 * the hierarchical ones.
++ 		 */
++ 		__this_cpu_add(memcg->vmstats_local->events[idx], x);
++ 		for (mi = memcg; mi; mi = parent_mem_cgroup(mi))
++ 			atomic_long_add(x, &mi->vmevents[idx]);
++ 		x = 0;
++ 	}
++ 	__this_cpu_write(memcg->vmstats_percpu->events[idx], x);
++ }
++ 
++ static unsigned long memcg_events(struct mem_cgroup *memcg, int event)
++ {
++ 	return atomic_long_read(&memcg->vmevents[event]);
++ }
++ 
++ static unsigned long memcg_events_local(struct mem_cgroup *memcg, int event)
++ {
++ 	long x = 0;
++ 	int cpu;
++ 
++ 	for_each_possible_cpu(cpu)
++ 		x += per_cpu(memcg->vmstats_local->events[event], cpu);
++ 	return x;
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  }
+  
+  static void mem_cgroup_charge_statistics(struct mem_cgroup *memcg,
+diff --cc mm/workingset.c
+index 0f2aa579e95f,c963831d354f..000000000000
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@@ -376,12 -375,18 +376,22 @@@ void workingset_update_node(struct radi
+  	 * already where they should be. The list_empty() test is safe
+  	 * as node->private_list is protected by the i_pages lock.
+  	 */
+ -	VM_WARN_ON_ONCE(!irqs_disabled());  /* For __inc_lruvec_page_state */
+ -
+  	if (node->count && node->count == node->nr_values) {
+ -		if (list_empty(&node->private_list)) {
+ +		if (list_empty(&node->private_list))
+  			list_lru_add(&shadow_nodes, &node->private_list);
+++<<<<<<< HEAD
+++=======
++ 			__inc_lruvec_slab_state(node, WORKINGSET_NODES);
++ 		}
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  	} else {
+ -		if (!list_empty(&node->private_list)) {
+ +		if (!list_empty(&node->private_list))
+  			list_lru_del(&shadow_nodes, &node->private_list);
+++<<<<<<< HEAD
+++=======
++ 			__dec_lruvec_slab_state(node, WORKINGSET_NODES);
++ 		}
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  	}
+  }
+  
+@@@ -472,6 -478,8 +482,11 @@@ static enum lru_status shadow_lru_isola
+  	}
+  
+  	list_lru_isolate(lru, item);
+++<<<<<<< HEAD
+++=======
++ 	__dec_lruvec_slab_state(node, WORKINGSET_NODES);
++ 
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  	spin_unlock(lru_lock);
+  
+  	/*
+@@@ -483,25 -491,17 +498,39 @@@
+  		goto out_invalid;
+  	if (WARN_ON_ONCE(node->count != node->nr_values))
+  		goto out_invalid;
+++<<<<<<< HEAD
+ +	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+ +		if (node->slots[i]) {
+ +			if (WARN_ON_ONCE(!xa_is_value(node->slots[i])))
+ +				goto out_invalid;
+ +			if (WARN_ON_ONCE(!node->nr_values))
+ +				goto out_invalid;
+ +			if (WARN_ON_ONCE(!mapping->nrexceptional))
+ +				goto out_invalid;
+ +			node->slots[i] = NULL;
+ +			node->nr_values--;
+ +			node->count--;
+ +			mapping->nrexceptional--;
+ +		}
+ +	}
+ +	if (WARN_ON_ONCE(node->nr_values))
+ +		goto out_invalid;
+ +	__inc_lruvec_page_state(virt_to_page(node), WORKINGSET_NODERECLAIM);
+ +	__radix_tree_delete_node(&mapping->i_pages, node,
+ +				 workingset_lookup_update(mapping));
+++=======
++ 	mapping->nrexceptional -= node->nr_values;
++ 	xas.xa_node = xa_parent_locked(&mapping->i_pages, node);
++ 	xas.xa_offset = node->offset;
++ 	xas.xa_shift = node->shift + XA_CHUNK_SHIFT;
++ 	xas_set_update(&xas, workingset_update_node);
++ 	/*
++ 	 * We could store a shadow entry here which was the minimum of the
++ 	 * shadow entries we were tracking ...
++ 	 */
++ 	xas_store(&xas, NULL);
++ 	__inc_lruvec_slab_state(node, WORKINGSET_NODERECLAIM);
+++>>>>>>> ec9f02384f60 (mm: workingset: fix vmstat counters for shadow nodes)
+  
+  out_invalid:
+  	xa_unlock_irq(&mapping->i_pages);
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path mm/memcontrol.c
+* Unmerged path mm/workingset.c
