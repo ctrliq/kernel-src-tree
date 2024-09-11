@@ -1,0 +1,232 @@
+rcu/tree: Make debug_objects logic independent of rcu_head
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Joel Fernandes (Google) <joel@joelfernandes.org>
+commit 446044eb9c9c335d3ae1be4665193ab43ebb284e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/446044eb.failed
+
+kfree_rcu()'s debug_objects logic uses the address of the object's
+embedded rcu_head to queue/unqueue. Instead of this, make use of the
+object's address itself as preparation for future headless kfree_rcu()
+support.
+
+	Reviewed-by: Uladzislau Rezki <urezki@gmail.com>
+	Signed-off-by: Uladzislau Rezki (Sony) <urezki@gmail.com>
+	Signed-off-by: Joel Fernandes (Google) <joel@joelfernandes.org>
+	Signed-off-by: Paul E. McKenney <paulmck@kernel.org>
+(cherry picked from commit 446044eb9c9c335d3ae1be4665193ab43ebb284e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/rcu/tree.c
+diff --cc kernel/rcu/tree.c
+index 4aa7b6bbcde6,143c1e9265b6..000000000000
+--- a/kernel/rcu/tree.c
++++ b/kernel/rcu/tree.c
+@@@ -2682,6 -2958,25 +2682,28 @@@ EXPORT_SYMBOL_GPL(call_rcu)
+  #define KFREE_DRAIN_JIFFIES (HZ / 50)
+  #define KFREE_N_BATCHES 2
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This macro defines how many entries the "records" array
++  * will contain. It is based on the fact that the size of
++  * kfree_rcu_bulk_data structure becomes exactly one page.
++  */
++ #define KFREE_BULK_MAX_ENTR ((PAGE_SIZE / sizeof(void *)) - 3)
++ 
++ /**
++  * struct kfree_rcu_bulk_data - single block to store kfree_rcu() pointers
++  * @nr_records: Number of active pointers in the array
++  * @records: Array of the kfree_rcu() pointers
++  * @next: Next bulk object in the block chain
++  */
++ struct kfree_rcu_bulk_data {
++ 	unsigned long nr_records;
++ 	void *records[KFREE_BULK_MAX_ENTR];
++ 	struct kfree_rcu_bulk_data *next;
++ };
++ 
+++>>>>>>> 446044eb9c9c (rcu/tree: Make debug_objects logic independent of rcu_head)
+  /**
+   * struct kfree_rcu_cpu_work - single batch of kfree_rcu() requests
+   * @rcu_work: Let queue_rcu_work() invoke workqueue handler after grace period
+@@@ -2720,9 -3023,20 +2742,23 @@@ struct kfree_rcu_cpu 
+  
+  static DEFINE_PER_CPU(struct kfree_rcu_cpu, krc);
+  
+++<<<<<<< HEAD
+++=======
++ static __always_inline void
++ debug_rcu_bhead_unqueue(struct kfree_rcu_bulk_data *bhead)
++ {
++ #ifdef CONFIG_DEBUG_OBJECTS_RCU_HEAD
++ 	int i;
++ 
++ 	for (i = 0; i < bhead->nr_records; i++)
++ 		debug_rcu_head_unqueue((struct rcu_head *)(bhead->records[i]));
++ #endif
++ }
++ 
+++>>>>>>> 446044eb9c9c (rcu/tree: Make debug_objects logic independent of rcu_head)
+  /*
+   * This function is invoked in workqueue context after a grace period.
+ - * It frees all the objects queued on ->bhead_free or ->head_free.
+ + * It frees all the objects queued on ->head_free.
+   */
+  static void kfree_rcu_work(struct work_struct *work)
+  {
+@@@ -2734,17 -3049,50 +2770,57 @@@
+  	krwp = container_of(to_rcu_work(work),
+  			    struct kfree_rcu_cpu_work, rcu_work);
+  	krcp = krwp->krcp;
+ -	raw_spin_lock_irqsave(&krcp->lock, flags);
+ +	spin_lock_irqsave(&krcp->lock, flags);
+  	head = krwp->head_free;
+  	krwp->head_free = NULL;
+ -	bhead = krwp->bhead_free;
+ -	krwp->bhead_free = NULL;
+ -	raw_spin_unlock_irqrestore(&krcp->lock, flags);
+ +	spin_unlock_irqrestore(&krcp->lock, flags);
+  
+++<<<<<<< HEAD
+ +	// List "head" is now private, so traverse locklessly.
+ +	for (; head; head = next) {
+ +		next = head->next;
+ +		// Potentially optimize with kfree_bulk in future.
+ +		debug_rcu_head_unqueue(head);
+ +		__rcu_reclaim(rcu_state.name, head);
+++=======
++ 	/* "bhead" is now private, so traverse locklessly. */
++ 	for (; bhead; bhead = bnext) {
++ 		bnext = bhead->next;
++ 
++ 		debug_rcu_bhead_unqueue(bhead);
++ 
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kfree_bulk_callback(rcu_state.name,
++ 			bhead->nr_records, bhead->records);
++ 
++ 		kfree_bulk(bhead->nr_records, bhead->records);
++ 		rcu_lock_release(&rcu_callback_map);
++ 
++ 		if (cmpxchg(&krcp->bcached, NULL, bhead))
++ 			free_page((unsigned long) bhead);
++ 
++ 		cond_resched_tasks_rcu_qs();
++ 	}
++ 
++ 	/*
++ 	 * Emergency case only. It can happen under low memory
++ 	 * condition when an allocation gets failed, so the "bulk"
++ 	 * path can not be temporary maintained.
++ 	 */
++ 	for (; head; head = next) {
++ 		unsigned long offset = (unsigned long)head->func;
++ 		void *ptr = (void *)head - offset;
++ 
++ 		next = head->next;
++ 		debug_rcu_head_unqueue((struct rcu_head *)ptr);
++ 		rcu_lock_acquire(&rcu_callback_map);
++ 		trace_rcu_invoke_kfree_callback(rcu_state.name, head, offset);
++ 
++ 		if (!WARN_ON_ONCE(!__is_kfree_rcu_offset(offset)))
++ 			kfree(ptr);
++ 
++ 		rcu_lock_release(&rcu_callback_map);
+++>>>>>>> 446044eb9c9c (rcu/tree: Make debug_objects logic independent of rcu_head)
+  		cond_resched_tasks_rcu_qs();
+  	}
+  }
+@@@ -2810,7 -3185,60 +2886,64 @@@ static void kfree_rcu_monitor(struct wo
+  	if (krcp->monitor_todo)
+  		kfree_rcu_drain_unlock(krcp, flags);
+  	else
+++<<<<<<< HEAD
+ +		spin_unlock_irqrestore(&krcp->lock, flags);
+++=======
++ 		raw_spin_unlock_irqrestore(&krcp->lock, flags);
++ }
++ 
++ static inline bool
++ kfree_call_rcu_add_ptr_to_bulk(struct kfree_rcu_cpu *krcp,
++ 	struct rcu_head *head, rcu_callback_t func)
++ {
++ 	struct kfree_rcu_bulk_data *bnode;
++ 
++ 	if (unlikely(!krcp->initialized))
++ 		return false;
++ 
++ 	lockdep_assert_held(&krcp->lock);
++ 
++ 	/* Check if a new block is required. */
++ 	if (!krcp->bhead ||
++ 			krcp->bhead->nr_records == KFREE_BULK_MAX_ENTR) {
++ 		bnode = xchg(&krcp->bcached, NULL);
++ 		if (!bnode) {
++ 			WARN_ON_ONCE(sizeof(struct kfree_rcu_bulk_data) > PAGE_SIZE);
++ 
++ 			/*
++ 			 * To keep this path working on raw non-preemptible
++ 			 * sections, prevent the optional entry into the
++ 			 * allocator as it uses sleeping locks. In fact, even
++ 			 * if the caller of kfree_rcu() is preemptible, this
++ 			 * path still is not, as krcp->lock is a raw spinlock.
++ 			 * With additional page pre-allocation in the works,
++ 			 * hitting this return is going to be much less likely.
++ 			 */
++ 			if (IS_ENABLED(CONFIG_PREEMPT_RT))
++ 				return false;
++ 
++ 			bnode = (struct kfree_rcu_bulk_data *)
++ 				__get_free_page(GFP_NOWAIT | __GFP_NOWARN);
++ 		}
++ 
++ 		/* Switch to emergency path. */
++ 		if (unlikely(!bnode))
++ 			return false;
++ 
++ 		/* Initialize the new block. */
++ 		bnode->nr_records = 0;
++ 		bnode->next = krcp->bhead;
++ 
++ 		/* Attach it to the head. */
++ 		krcp->bhead = bnode;
++ 	}
++ 
++ 	/* Finally insert. */
++ 	krcp->bhead->records[krcp->bhead->nr_records++] =
++ 		(void *) head - (unsigned long) func;
++ 
++ 	return true;
+++>>>>>>> 446044eb9c9c (rcu/tree: Make debug_objects logic independent of rcu_head)
+  }
+  
+  /*
+@@@ -2841,16 -3257,17 +2974,19 @@@ void kfree_call_rcu(struct rcu_head *he
+  {
+  	unsigned long flags;
+  	struct kfree_rcu_cpu *krcp;
++ 	void *ptr;
+  
+ +	head->func = func;
+ +
+  	local_irq_save(flags);	// For safely calling this_cpu_ptr().
+  	krcp = this_cpu_ptr(&krc);
+  	if (krcp->initialized)
+ -		raw_spin_lock(&krcp->lock);
+ +		spin_lock(&krcp->lock);
+  
++ 	ptr = (void *)head - (unsigned long)func;
++ 
+  	// Queue the object but don't yet schedule the batch.
+- 	if (debug_rcu_head_queue(head)) {
++ 	if (debug_rcu_head_queue(ptr)) {
+  		// Probable double kfree_rcu(), just leak.
+  		WARN_ONCE(1, "%s(): Double-freed call. rcu_head %p\n",
+  			  __func__, head);
+* Unmerged path kernel/rcu/tree.c
