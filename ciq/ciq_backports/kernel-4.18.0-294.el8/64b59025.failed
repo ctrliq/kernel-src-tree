@@ -1,0 +1,190 @@
+xdp: Add xdp_txq_info to xdp_buff
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Ahern <dsahern@kernel.org>
+commit 64b59025c15b244c0954cf52b24fbabfcf5ed8f6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/64b59025.failed
+
+Add xdp_txq_info as the Tx counterpart to xdp_rxq_info. At the
+moment only the device is added. Other fields (queue_index)
+can be added as use cases arise.
+
+>From a UAPI perspective, add egress_ifindex to xdp context for
+bpf programs to see the Tx device.
+
+Update the verifier to only allow accesses to egress_ifindex by
+XDP programs with BPF_XDP_DEVMAP expected attach type.
+
+	Signed-off-by: David Ahern <dsahern@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20200529220716.75383-4-dsahern@kernel.org
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit 64b59025c15b244c0954cf52b24fbabfcf5ed8f6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xdp.h
+#	kernel/bpf/devmap.c
+diff --cc include/net/xdp.h
+index 6368152dc76c,d54022959491..000000000000
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@@ -63,31 -59,32 +63,40 @@@ struct xdp_rxq_info 
+  	u32 queue_index;
+  	u32 reg_state;
+  	struct xdp_mem_info mem;
+ +	/* RHEL: This structure is not considered part of the kABI
+ +	 * whitelist. However, it is embedded in struct netdev_rx_queue
+ +	 * which is referenced from struct net_device::_rx as an array.
+ +	 * Therefore, we need to protect the size of struct xdp_rxq_info. */
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	/* Note that there is more space available after the reserved fields
+ +	 * due to the cache alignment of this structure. Be sure to verify
+ +	 * the result with pahole on all supported archs before using the
+ +	 * padding, though. */
+  } ____cacheline_aligned; /* perf critical, avoid false-sharing */
+  
++ struct xdp_txq_info {
++ 	struct net_device *dev;
++ };
++ 
+  struct xdp_buff {
+  	void *data;
+  	void *data_end;
+  	void *data_meta;
+  	void *data_hard_start;
+ +	unsigned long handle;
+  	struct xdp_rxq_info *rxq;
+++<<<<<<< HEAD
+++=======
++ 	struct xdp_txq_info *txq;
++ 	u32 frame_sz; /* frame size to deduce data_hard_end/reserved tailroom*/
+++>>>>>>> 64b59025c15b (xdp: Add xdp_txq_info to xdp_buff)
+  };
+  
+ -/* Reserve memory area at end-of data area.
+ - *
+ - * This macro reserves tailroom in the XDP buffer by limiting the
+ - * XDP/BPF data access to data_hard_end.  Notice same area (and size)
+ - * is used for XDP_PASS, when constructing the SKB via build_skb().
+ - */
+ -#define xdp_data_hard_end(xdp)				\
+ -	((xdp)->data_hard_start + (xdp)->frame_sz -	\
+ -	 SKB_DATA_ALIGN(sizeof(struct skb_shared_info)))
+ -
+  struct xdp_frame {
+  	void *data;
+  	u16 len;
+diff --cc kernel/bpf/devmap.c
+index 2c33953067b1,c04fb1c72f5e..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -457,6 -472,33 +457,36 @@@ static inline int __xdp_enqueue(struct 
+  	return bq_enqueue(dev, xdpf, dev_rx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct xdp_buff *dev_map_run_prog(struct net_device *dev,
++ 					 struct xdp_buff *xdp,
++ 					 struct bpf_prog *xdp_prog)
++ {
++ 	struct xdp_txq_info txq = { .dev = dev };
++ 	u32 act;
++ 
++ 	xdp->txq = &txq;
++ 
++ 	act = bpf_prog_run_xdp(xdp_prog, xdp);
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		return xdp;
++ 	case XDP_DROP:
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(dev, xdp_prog, act);
++ 		break;
++ 	}
++ 
++ 	xdp_return_buff(xdp);
++ 	return NULL;
++ }
++ 
+++>>>>>>> 64b59025c15b (xdp: Add xdp_txq_info to xdp_buff)
+  int dev_xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
+  		    struct net_device *dev_rx)
+  {
+* Unmerged path include/net/xdp.h
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index af3754a78dbd..05c5964ec0e1 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -3593,6 +3593,8 @@ struct xdp_md {
+ 	/* Below access go through struct xdp_rxq_info */
+ 	__u32 ingress_ifindex; /* rxq->dev->ifindex */
+ 	__u32 rx_queue_index;  /* rxq->queue_index  */
++
++	__u32 egress_ifindex;  /* txq->dev->ifindex */
+ };
+ 
+ enum sk_action {
+* Unmerged path kernel/bpf/devmap.c
+diff --git a/net/core/filter.c b/net/core/filter.c
+index b98ab51bd7dc..b21d3257ac0d 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -6983,6 +6983,13 @@ static bool xdp_is_valid_access(int off, int size,
+ 				const struct bpf_prog *prog,
+ 				struct bpf_insn_access_aux *info)
+ {
++	if (prog->expected_attach_type != BPF_XDP_DEVMAP) {
++		switch (off) {
++		case offsetof(struct xdp_md, egress_ifindex):
++			return false;
++		}
++	}
++
+ 	if (type == BPF_WRITE) {
+ 		if (bpf_prog_is_dev_bound(prog->aux)) {
+ 			switch (off) {
+@@ -7955,6 +7962,16 @@ static u32 xdp_convert_ctx_access(enum bpf_access_type type,
+ 				      offsetof(struct xdp_rxq_info,
+ 					       queue_index));
+ 		break;
++	case offsetof(struct xdp_md, egress_ifindex):
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_buff, txq),
++				      si->dst_reg, si->src_reg,
++				      offsetof(struct xdp_buff, txq));
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct xdp_txq_info, dev),
++				      si->dst_reg, si->dst_reg,
++				      offsetof(struct xdp_txq_info, dev));
++		*insn++ = BPF_LDX_MEM(BPF_W, si->dst_reg, si->dst_reg,
++				      offsetof(struct net_device, ifindex));
++		break;
+ 	}
+ 
+ 	return insn - insn_buf;
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index fc883a643880..d11dea50e908 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -3565,6 +3565,8 @@ struct xdp_md {
+ 	/* Below access go through struct xdp_rxq_info */
+ 	__u32 ingress_ifindex; /* rxq->dev->ifindex */
+ 	__u32 rx_queue_index;  /* rxq->queue_index  */
++
++	__u32 egress_ifindex;  /* txq->dev->ifindex */
+ };
+ 
+ enum sk_action {
