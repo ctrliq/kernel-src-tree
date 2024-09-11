@@ -1,0 +1,214 @@
+KVM: nSVM: improve SYSENTER emulation on AMD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Maxim Levitsky <mlevitsk@redhat.com>
+commit adc2a23734acd607bdf30dc08ba8ffc5ee2a8c9d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/adc2a237.failed
+
+Currently to support Intel->AMD migration, if CPU vendor is GenuineIntel,
+we emulate the full 64 value for MSR_IA32_SYSENTER_{EIP|ESP}
+msrs, and we also emulate the sysenter/sysexit instruction in long mode.
+
+(Emulator does still refuse to emulate sysenter in 64 bit mode, on the
+ground that the code for that wasn't tested and likely has no users)
+
+However when virtual vmload/vmsave is enabled, the vmload instruction will
+update these 32 bit msrs without triggering their msr intercept,
+which will lead to having stale values in kvm's shadow copy of these msrs,
+which relies on the intercept to be up to date.
+
+Fix/optimize this by doing the following:
+
+1. Enable the MSR intercepts for SYSENTER MSRs iff vendor=GenuineIntel
+   (This is both a tiny optimization and also ensures that in case
+   the guest cpu vendor is AMD, the msrs will be 32 bit wide as
+   AMD defined).
+
+2. Store only high 32 bit part of these msrs on interception and combine
+   it with hardware msr value on intercepted read/writes
+   iff vendor=GenuineIntel.
+
+3. Disable vmload/vmsave virtualization if vendor=GenuineIntel.
+   (It is somewhat insane to set vendor=GenuineIntel and still enable
+   SVM for the guest but well whatever).
+   Then zero the high 32 bit parts when kvm intercepts and emulates vmload.
+
+Thanks a lot to Paulo Bonzini for helping me with fixing this in the most
+correct way.
+
+This patch fixes nested migration of 32 bit nested guests, that was
+broken because incorrect cached values of SYSENTER msrs were stored in
+the migration stream if L1 changed these msrs with
+vmload prior to L2 entry.
+
+	Signed-off-by: Maxim Levitsky <mlevitsk@redhat.com>
+Message-Id: <20210401111928.996871-3-mlevitsk@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit adc2a23734acd607bdf30dc08ba8ffc5ee2a8c9d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/svm.c
+index b60ae08fb034,6c39b0cd6ec6..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1251,19 -1250,16 +1253,9 @@@ static void init_vmcb(struct vcpu_svm *
+  
+  	svm_check_invpcid(svm);
+  
+ -	/*
+ -	 * If the host supports V_SPEC_CTRL then disable the interception
+ -	 * of MSR_IA32_SPEC_CTRL.
+ -	 */
+ -	if (boot_cpu_has(X86_FEATURE_V_SPEC_CTRL))
+ -		set_msr_interception(vcpu, svm->msrpm, MSR_IA32_SPEC_CTRL, 1, 1);
+ -
+ -	if (kvm_vcpu_apicv_active(vcpu))
+ +	if (kvm_vcpu_apicv_active(&svm->vcpu))
+  		avic_init_vmcb(svm);
+  
+- 	/*
+- 	 * If hardware supports Virtual VMLOAD VMSAVE then enable it
+- 	 * in VMCB and clear intercepts to avoid #VMEXIT.
+- 	 */
+- 	if (vls) {
+- 		svm_clr_intercept(svm, INTERCEPT_VMLOAD);
+- 		svm_clr_intercept(svm, INTERCEPT_VMSAVE);
+- 		svm->vmcb->control.virt_ext |= VIRTUAL_VMLOAD_VMSAVE_ENABLE_MASK;
+- 	}
+- 
+  	if (vgif) {
+  		svm_clr_intercept(svm, INTERCEPT_STGI);
+  		svm_clr_intercept(svm, INTERCEPT_CLGI);
+@@@ -2075,12 -2121,18 +2067,23 @@@ static int vmload_interception(struct v
+  		return 1;
+  	}
+  
+ -	vmcb12 = map.hva;
+ +	nested_vmcb = map.hva;
+  
+ -	ret = kvm_skip_emulated_instruction(vcpu);
+ +	ret = kvm_skip_emulated_instruction(&svm->vcpu);
+  
+++<<<<<<< HEAD
+ +	nested_svm_vmloadsave(nested_vmcb, svm->vmcb);
+ +	kvm_vcpu_unmap(&svm->vcpu, &map, true);
+++=======
++ 	if (vmload) {
++ 		nested_svm_vmloadsave(vmcb12, svm->vmcb);
++ 		svm->sysenter_eip_hi = 0;
++ 		svm->sysenter_esp_hi = 0;
++ 	} else
++ 		nested_svm_vmloadsave(svm->vmcb, vmcb12);
++ 
++ 	kvm_vcpu_unmap(vcpu, &map, true);
+++>>>>>>> adc2a23734ac (KVM: nSVM: improve SYSENTER emulation on AMD)
+  
+  	return ret;
+  }
+@@@ -2676,13 -2668,17 +2679,17 @@@ static int svm_get_msr(struct kvm_vcpu 
+  		break;
+  #endif
+  	case MSR_IA32_SYSENTER_CS:
+ -		msr_info->data = svm->vmcb01.ptr->save.sysenter_cs;
+ +		msr_info->data = svm->vmcb->save.sysenter_cs;
+  		break;
+  	case MSR_IA32_SYSENTER_EIP:
+- 		msr_info->data = svm->sysenter_eip;
++ 		msr_info->data = (u32)svm->vmcb01.ptr->save.sysenter_eip;
++ 		if (guest_cpuid_is_intel(vcpu))
++ 			msr_info->data |= (u64)svm->sysenter_eip_hi << 32;
+  		break;
+  	case MSR_IA32_SYSENTER_ESP:
+- 		msr_info->data = svm->sysenter_esp;
++ 		msr_info->data = svm->vmcb01.ptr->save.sysenter_esp;
++ 		if (guest_cpuid_is_intel(vcpu))
++ 			msr_info->data |= (u64)svm->sysenter_esp_hi << 32;
+  		break;
+  	case MSR_TSC_AUX:
+  		if (!boot_cpu_has(X86_FEATURE_RDTSCP))
+@@@ -2867,15 -2880,22 +2874,31 @@@ static int svm_set_msr(struct kvm_vcpu 
+  		break;
+  #endif
+  	case MSR_IA32_SYSENTER_CS:
+ -		svm->vmcb01.ptr->save.sysenter_cs = data;
+ +		svm->vmcb->save.sysenter_cs = data;
+  		break;
+  	case MSR_IA32_SYSENTER_EIP:
+++<<<<<<< HEAD
+ +		svm->sysenter_eip = data;
+ +		svm->vmcb->save.sysenter_eip = data;
+ +		break;
+ +	case MSR_IA32_SYSENTER_ESP:
+ +		svm->sysenter_esp = data;
+ +		svm->vmcb->save.sysenter_esp = data;
+++=======
++ 		svm->vmcb01.ptr->save.sysenter_eip = (u32)data;
++ 		/*
++ 		 * We only intercept the MSR_IA32_SYSENTER_{EIP|ESP} msrs
++ 		 * when we spoof an Intel vendor ID (for cross vendor migration).
++ 		 * In this case we use this intercept to track the high
++ 		 * 32 bit part of these msrs to support Intel's
++ 		 * implementation of SYSENTER/SYSEXIT.
++ 		 */
++ 		svm->sysenter_eip_hi = guest_cpuid_is_intel(vcpu) ? (data >> 32) : 0;
++ 		break;
++ 	case MSR_IA32_SYSENTER_ESP:
++ 		svm->vmcb01.ptr->save.sysenter_esp = (u32)data;
++ 		svm->sysenter_esp_hi = guest_cpuid_is_intel(vcpu) ? (data >> 32) : 0;
+++>>>>>>> adc2a23734ac (KVM: nSVM: improve SYSENTER emulation on AMD)
+  		break;
+  	case MSR_TSC_AUX:
+  		if (!boot_cpu_has(X86_FEATURE_RDTSCP))
+diff --cc arch/x86/kvm/svm/svm.h
+index de600f536464,fffdd5fb446d..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -23,17 -24,11 +23,21 @@@
+  #define __sme_page_pa(x) __sme_set(page_to_pfn(x) << PAGE_SHIFT)
+  
+  static const u32 host_save_user_msrs[] = {
+ +#ifdef CONFIG_X86_64
+ +	MSR_STAR, MSR_LSTAR, MSR_CSTAR, MSR_SYSCALL_MASK, MSR_KERNEL_GS_BASE,
+ +	MSR_FS_BASE,
+ +#endif
+ +	MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP, MSR_IA32_SYSENTER_EIP,
+  	MSR_TSC_AUX,
+  };
+ +
+  #define NR_HOST_SAVE_USER_MSRS ARRAY_SIZE(host_save_user_msrs)
+  
+++<<<<<<< HEAD
+ +#define MAX_DIRECT_ACCESS_MSRS	15
+++=======
++ #define MAX_DIRECT_ACCESS_MSRS	20
+++>>>>>>> adc2a23734ac (KVM: nSVM: improve SYSENTER emulation on AMD)
+  #define MSRPM_OFFSETS	16
+  extern u32 msrpm_offsets[MSRPM_OFFSETS] __read_mostly;
+  extern bool npt_enabled;
+@@@ -107,11 -112,12 +111,16 @@@ struct vcpu_svm 
+  	struct kvm_vcpu vcpu;
+  	struct vmcb *vmcb;
+  	unsigned long vmcb_pa;
+ -	struct kvm_vmcb_info vmcb01;
+ -	struct kvm_vmcb_info *current_vmcb;
+  	struct svm_cpu_data *svm_data;
+  	u32 asid;
+++<<<<<<< HEAD
+ +	uint64_t asid_generation;
+ +	uint64_t sysenter_esp;
+ +	uint64_t sysenter_eip;
+++=======
++ 	u32 sysenter_esp_hi;
++ 	u32 sysenter_eip_hi;
+++>>>>>>> adc2a23734ac (KVM: nSVM: improve SYSENTER emulation on AMD)
+  	uint64_t tsc_aux;
+  
+  	u64 msr_decfg;
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
