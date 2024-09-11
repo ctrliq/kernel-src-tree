@@ -1,0 +1,261 @@
+printk: consolidate kmsg_dump_get_buffer/syslog_print_all code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 4260e0e5510158d704898603331e5365ebe957de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4260e0e5.failed
+
+The logic for finding records to fit into a buffer is the same for
+kmsg_dump_get_buffer() and syslog_print_all(). Introduce a helper
+function find_first_fitting_seq() to handle this logic.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-7-john.ogness@linutronix.de
+(cherry picked from commit 4260e0e5510158d704898603331e5365ebe957de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,9a5f9ccc46ea..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1381,10 -1404,72 +1381,74 @@@ static size_t msg_print_text(const stru
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static size_t get_record_print_text_size(struct printk_info *info,
++ 					 unsigned int line_count,
++ 					 bool syslog, bool time)
++ {
++ 	char prefix[PREFIX_MAX];
++ 	size_t prefix_len;
++ 
++ 	prefix_len = info_print_prefix(info, syslog, time, prefix);
++ 
++ 	/*
++ 	 * Each line will be preceded with a prefix. The intermediate
++ 	 * newlines are already within the text, but a final trailing
++ 	 * newline will be added.
++ 	 */
++ 	return ((prefix_len * line_count) + info->text_len + 1);
++ }
++ 
++ /*
++  * Beginning with @start_seq, find the first record where it and all following
++  * records up to (but not including) @max_seq fit into @size.
++  *
++  * @max_seq is simply an upper bound and does not need to exist. If the caller
++  * does not require an upper bound, -1 can be used for @max_seq.
++  */
++ static u64 find_first_fitting_seq(u64 start_seq, u64 max_seq, size_t size,
++ 				  bool syslog, bool time)
++ {
++ 	struct printk_info info;
++ 	unsigned int line_count;
++ 	size_t len = 0;
++ 	u64 seq;
++ 
++ 	/* Determine the size of the records up to @max_seq. */
++ 	prb_for_each_info(start_seq, prb, seq, &info, &line_count) {
++ 		if (info.seq >= max_seq)
++ 			break;
++ 		len += get_record_print_text_size(&info, line_count, syslog, time);
++ 	}
++ 
++ 	/*
++ 	 * Adjust the upper bound for the next loop to avoid subtracting
++ 	 * lengths that were never added.
++ 	 */
++ 	if (seq < max_seq)
++ 		max_seq = seq;
++ 
++ 	/*
++ 	 * Move first record forward until length fits into the buffer. Ignore
++ 	 * newest messages that were not counted in the above cycle. Messages
++ 	 * might appear and get lost in the meantime. This is a best effort
++ 	 * that prevents an infinite loop that could occur with a retry.
++ 	 */
++ 	prb_for_each_info(start_seq, prb, seq, &info, &line_count) {
++ 		if (len <= size || info.seq >= max_seq)
++ 			break;
++ 		len -= get_record_print_text_size(&info, line_count, syslog, time);
++ 	}
++ 
++ 	return seq;
++ }
++ 
+++>>>>>>> 4260e0e55101 (printk: consolidate kmsg_dump_get_buffer/syslog_print_all code)
+  static int syslog_print(char __user *buf, int size)
+  {
+ -	struct printk_info info;
+ -	struct printk_record r;
+  	char *text;
+ +	struct printk_log *msg;
+  	int len = 0;
+  
+  	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
+@@@ -1452,11 -1535,11 +1516,16 @@@
+  
+  static int syslog_print_all(char __user *buf, int size, bool clear)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct printk_info info;
++ 	struct printk_record r;
+++>>>>>>> 4260e0e55101 (printk: consolidate kmsg_dump_get_buffer/syslog_print_all code)
+  	char *text;
+  	int len = 0;
+ +	u64 next_seq;
+  	u64 seq;
+ +	u32 idx;
+  	bool time;
+  
+  	text = kmalloc(LOG_LINE_MAX + PREFIX_MAX, GFP_KERNEL);
+@@@ -1469,38 -1552,20 +1538,42 @@@
+  	 * Find first record that fits, including all following records,
+  	 * into the user-provided buffer for this dump.
+  	 */
+++<<<<<<< HEAD
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		len += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+++=======
++ 	seq = find_first_fitting_seq(clear_seq, -1, size, true, time);
+++>>>>>>> 4260e0e55101 (printk: consolidate kmsg_dump_get_buffer/syslog_print_all code)
+  
+ -	prb_rec_init_rd(&r, &info, text, LOG_LINE_MAX + PREFIX_MAX);
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (len > size && seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		int textlen;
+ +		len -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ -		textlen = record_print_text(&r, true, time);
+ +	/* last message fitting into this dump */
+ +	next_seq = log_next_seq;
+  
+ -		if (len + textlen > size) {
+ -			seq--;
+ -			break;
+ -		}
+ +	len = 0;
+ +	while (len >= 0 && seq < next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +		int textlen = msg_print_text(msg, true, time, text,
+ +					     LOG_LINE_MAX + PREFIX_MAX);
+ +
+ +		idx = log_next(idx);
+ +		seq++;
+  
+  		logbuf_unlock_irq();
+  		if (copy_to_user(buf + len, text, textlen))
+@@@ -3311,14 -3452,14 +3384,19 @@@ EXPORT_SYMBOL_GPL(kmsg_dump_get_line)
+   * read.
+   */
+  bool kmsg_dump_get_buffer(struct kmsg_dumper *dumper, bool syslog,
+ -			  char *buf, size_t size, size_t *len_out)
+ +			  char *buf, size_t size, size_t *len)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct printk_info info;
++ 	struct printk_record r;
+++>>>>>>> 4260e0e55101 (printk: consolidate kmsg_dump_get_buffer/syslog_print_all code)
+  	unsigned long flags;
+  	u64 seq;
+ +	u32 idx;
+  	u64 next_seq;
+ -	size_t len = 0;
+ +	u32 next_idx;
+ +	size_t l = 0;
+  	bool ret = false;
+  	bool time = printk_time;
+  
+@@@ -3338,39 -3480,32 +3416,50 @@@
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* calculate length of entire buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		l += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (l >= size && seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +
+ +		l -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+++=======
++ 	/*
++ 	 * Find first record that fits, including all following records,
++ 	 * into the user-provided buffer for this dump. Pass in size-1
++ 	 * because this function (by way of record_print_text()) will
++ 	 * not write more than size-1 bytes of text into @buf.
++ 	 */
++ 	seq = find_first_fitting_seq(dumper->cur_seq, dumper->next_seq,
++ 				     size - 1, syslog, time);
+++>>>>>>> 4260e0e55101 (printk: consolidate kmsg_dump_get_buffer/syslog_print_all code)
+  
+ -	/*
+ -	 * Next kmsg_dump_get_buffer() invocation will dump block of
+ -	 * older records stored right before this one.
+ -	 */
+ +	/* last message in next interation */
+  	next_seq = seq;
+ +	next_idx = idx;
+  
+ -	prb_rec_init_rd(&r, &info, buf, size);
+ +	l = 0;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		if (r.info->seq >= dumper->next_seq)
+ -			break;
+ -
+ -		len += record_print_text(&r, syslog, time);
+ -
+ -		/* Adjust record to store to remaining buffer space. */
+ -		prb_rec_init_rd(&r, &info, buf + len, size - len);
+ +		l += msg_print_text(msg, syslog, time, buf + l, size - l);
+ +		idx = log_next(idx);
+ +		seq++;
+  	}
+  
+  	dumper->next_seq = next_seq;
+* Unmerged path kernel/printk/printk.c
