@@ -1,0 +1,125 @@
+move mount_capable() further out
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit c3aabf0780a506225b53bfe2b5177dd5dfec093d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c3aabf07.failed
+
+Call graph of vfs_get_tree():
+	vfs_fsconfig_locked()	# neither kernmount, nor submount
+	do_new_mount()		# neither kernmount, nor submount
+	fc_mount()
+		afs_mntpt_do_automount()	# submount
+		mount_one_hugetlbfs()		# kernmount
+		pid_ns_prepare_proc()		# kernmount
+		mq_create_mount()		# kernmount
+		vfs_kern_mount()
+			simple_pin_fs()		# kernmount
+			vfs_submount()		# submount
+			kern_mount()		# kernmount
+			init_mount_tree()
+			btrfs_mount()
+			nfs_do_root_mount()
+
+	The first two need the check (unconditionally).
+init_mount_tree() is setting rootfs up; any capability
+checks make zero sense for that one.  And btrfs_mount()/
+nfs_do_root_mount() have the checks already done in their
+callers.
+
+	IOW, we can shift mount_capable() handling into
+the two callers - one in the normal case of mount(2),
+another - in fsconfig(2) handling of FSCONFIG_CMD_CREATE.
+I.e. the syscalls that set a new filesystem up.
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit c3aabf0780a506225b53bfe2b5177dd5dfec093d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fsopen.c
+#	fs/super.c
+diff --cc fs/super.c
+index 72596c26684f,72b4a5afcfd6..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -1238,29 -1399,39 +1238,46 @@@ struct dentry *mount_single(struct file
+  }
+  EXPORT_SYMBOL(mount_single);
+  
+ -/**
+ - * vfs_get_tree - Get the mountable root
+ - * @fc: The superblock configuration context.
+ - *
+ - * The filesystem is invoked to get or create a superblock which can then later
+ - * be used for mounting.  The filesystem places a pointer to the root to be
+ - * used for mounting in @fc->root.
+ - */
+ -int vfs_get_tree(struct fs_context *fc)
+ +struct dentry *
+ +mount_fs(struct file_system_type *type, int flags, const char *name, void *data)
+  {
+ +	struct dentry *root;
+  	struct super_block *sb;
+ -	int error;
+ +	int error = -ENOMEM;
+ +	struct security_mnt_opts opts;
+  
+ -	if (fc->root)
+ -		return -EBUSY;
+ +	security_init_mnt_opts(&opts);
+ +
+++<<<<<<< HEAD
+ +	if (data && !(type->fs_flags & FS_BINARY_MOUNTDATA)) {
+ +		error = security_sb_eat_lsm_opts(data, &opts);
+ +		if (error)
+ +			return ERR_PTR(error);
+ +	}
+  
+ +	root = type->mount(type, flags, name, data);
+ +	if (IS_ERR(root)) {
+ +		error = PTR_ERR(root);
+ +		goto out_free_secdata;
+++=======
++ 	/* Get the mountable root in fc->root, with a ref on the root and a ref
++ 	 * on the superblock.
++ 	 */
++ 	error = fc->ops->get_tree(fc);
++ 	if (error < 0)
++ 		return error;
++ 
++ 	if (!fc->root) {
++ 		pr_err("Filesystem %s get_tree() didn't set fc->root\n",
++ 		       fc->fs_type->name);
++ 		/* We don't know what the locking state of the superblock is -
++ 		 * if there is a superblock.
++ 		 */
++ 		BUG();
+++>>>>>>> c3aabf0780a5 (move mount_capable() further out)
+  	}
+ -
+ -	sb = fc->root->d_sb;
+ +	sb = root->d_sb;
+ +	BUG_ON(!sb);
+  	WARN_ON(!sb->s_bdi);
+  
+  	if (fc->subtype && !sb->s_subtype) {
+* Unmerged path fs/fsopen.c
+* Unmerged path fs/fsopen.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index f136970f49f7..5cd0654f67d2 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2546,6 +2546,8 @@ static int do_new_mount(struct path *path, const char *fstype, int sb_flags,
+ 	}
+ 	if (!err)
+ 		err = parse_monolithic_mount_data(fc, data);
++	if (!err && !mount_capable(fc))
++		err = -EPERM;
+ 	if (!err)
+ 		err = vfs_get_tree(fc);
+ 	if (!err)
+* Unmerged path fs/super.c
