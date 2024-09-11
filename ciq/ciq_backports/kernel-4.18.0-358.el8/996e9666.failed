@@ -1,0 +1,748 @@
+printk: remove logbuf_lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit 996e966640ddea7b535cbe7b749e87a3b24f37e8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/996e9666.failed
+
+Since the ringbuffer is lockless, there is no need for it to be
+protected by @logbuf_lock. Remove @logbuf_lock.
+
+@console_seq, @exclusive_console_stop_seq, @console_dropped are
+protected by @console_lock.
+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210303101528.29901-14-john.ogness@linutronix.de
+(cherry picked from commit 996e966640ddea7b535cbe7b749e87a3b24f37e8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/internal.h
+#	kernel/printk/printk.c
+#	kernel/printk/printk_safe.c
+diff --cc kernel/printk/internal.h
+index c27d47058841,e7acc2888c8e..000000000000
+--- a/kernel/printk/internal.h
++++ b/kernel/printk/internal.h
+@@@ -18,15 -6,15 +18,19 @@@
+  
+  #ifdef CONFIG_PRINTK
+  
+ -#define PRINTK_SAFE_CONTEXT_MASK	0x007ffffff
+ -#define PRINTK_NMI_DIRECT_CONTEXT_MASK	0x008000000
+ -#define PRINTK_NMI_CONTEXT_MASK		0xff0000000
+ +#define PRINTK_SAFE_CONTEXT_MASK	 0x3fffffff
+ +#define PRINTK_NMI_DIRECT_CONTEXT_MASK	 0x40000000
+ +#define PRINTK_NMI_CONTEXT_MASK		 0x80000000
+  
+ -#define PRINTK_NMI_CONTEXT_OFFSET	0x010000000
+++<<<<<<< HEAD
+ +extern raw_spinlock_t logbuf_lock;
+  
+ +__printf(5, 0)
+++=======
++ __printf(4, 0)
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  int vprintk_store(int facility, int level,
+ -		  const struct dev_printk_info *dev_info,
+ +		  const char *dict, size_t dictlen,
+  		  const char *fmt, va_list args);
+  
+  __printf(1, 0) int vprintk_default(const char *fmt, va_list args);
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,8994bc192b88..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -365,57 -355,8 +365,62 @@@ enum log_flags 
+  	LOG_CONT	= 8,	/* text is a fragment of a continuation line */
+  };
+  
+++<<<<<<< HEAD
+ +struct printk_log {
+ +	u64 ts_nsec;		/* timestamp in nanoseconds */
+ +	u16 len;		/* length of entire record */
+ +	u16 text_len;		/* length of text buffer */
+ +	u16 dict_len;		/* length of dictionary buffer */
+ +	u8 facility;		/* syslog facility */
+ +	u8 flags:5;		/* internal record flags */
+ +	u8 level:3;		/* syslog level */
+ +#ifdef CONFIG_PRINTK_CALLER
+ +	u32 caller_id;            /* thread id or processor id */
+ +#endif
+ +}
+ +#ifdef CONFIG_HAVE_EFFICIENT_UNALIGNED_ACCESS
+ +__packed __aligned(4)
+ +#endif
+ +;
+ +
+ +/*
+ + * The logbuf_lock protects kmsg buffer, indices, counters.  This can be taken
+ + * within the scheduler's rq lock. It must be released before calling
+ + * console_unlock() or anything else that might wake up a process.
+ + */
+ +DEFINE_RAW_SPINLOCK(logbuf_lock);
+ +
+ +/*
+ + * Helper macros to lock/unlock logbuf_lock and switch between
+ + * printk-safe/unsafe modes.
+ + */
+ +#define logbuf_lock_irq()				\
+ +	do {						\
+ +		printk_safe_enter_irq();		\
+ +		raw_spin_lock(&logbuf_lock);		\
+ +	} while (0)
+ +
+ +#define logbuf_unlock_irq()				\
+ +	do {						\
+ +		raw_spin_unlock(&logbuf_lock);		\
+ +		printk_safe_exit_irq();			\
+ +	} while (0)
+ +
+ +#define logbuf_lock_irqsave(flags)			\
+ +	do {						\
+ +		printk_safe_enter_irqsave(flags);	\
+ +		raw_spin_lock(&logbuf_lock);		\
+ +	} while (0)
+ +
+ +#define logbuf_unlock_irqrestore(flags)		\
+ +	do {						\
+ +		raw_spin_unlock(&logbuf_lock);		\
+ +		printk_safe_exit_irqrestore(flags);	\
+ +	} while (0)
+++=======
++ /* syslog_lock protects syslog_* variables and write access to clear_seq. */
++ static DEFINE_RAW_SPINLOCK(syslog_lock);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  
+  #ifdef CONFIG_PRINTK
+  DECLARE_WAIT_QUEUE_HEAD(log_wait);
+@@@ -425,22 -366,27 +430,26 @@@ static u32 syslog_idx
+  static size_t syslog_partial;
+  static bool syslog_time;
+  
+++<<<<<<< HEAD
+ +/* index and sequence number of the first record stored in the buffer */
+ +static u64 log_first_seq;
+ +static u32 log_first_idx;
+ +
+ +/* index and sequence number of the next record to store in the buffer */
+ +static u64 log_next_seq;
+ +static u32 log_next_idx;
+ +
+++=======
++ /* All 3 protected by @console_sem. */
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  /* the next printk record to write to the console */
+  static u64 console_seq;
+ +static u32 console_idx;
+  static u64 exclusive_console_stop_seq;
+ -static unsigned long console_dropped;
+ -
+ -struct latched_seq {
+ -	seqcount_latch_t	latch;
+ -	u64			val[2];
+ -};
+  
+ -/*
+ - * The next printk record to read after the last 'clear' command. There are
+ - * two copies (updated with seqcount_latch) so that reads can locklessly
+ - * access a valid value. Writers are synchronized by @syslog_lock.
+ - */
+ -static struct latched_seq clear_seq = {
+ -	.latch		= SEQCNT_LATCH_ZERO(clear_seq.latch),
+ -	.val[0]		= 0,
+ -	.val[1]		= 0,
+ -};
+ +/* the next printk record to read after the last 'clear' command */
+ +static u64 clear_seq;
+ +static u32 clear_idx;
+  
+  #ifdef CONFIG_PRINTK_CALLER
+  #define PREFIX_MAX		48
+@@@ -891,41 -732,37 +900,51 @@@ static ssize_t devkmsg_read(struct fil
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irq();
+ +	while (user->seq == log_next_seq) {
+++=======
++ 	printk_safe_enter_irq();
++ 	if (!prb_read_valid(prb, atomic64_read(&user->seq), r)) {
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  		if (file->f_flags & O_NONBLOCK) {
+  			ret = -EAGAIN;
+- 			logbuf_unlock_irq();
++ 			printk_safe_exit_irq();
+  			goto out;
+  		}
+  
+- 		logbuf_unlock_irq();
++ 		printk_safe_exit_irq();
+  		ret = wait_event_interruptible(log_wait,
+ -				prb_read_valid(prb, atomic64_read(&user->seq), r));
+ +					       user->seq != log_next_seq);
+  		if (ret)
+  			goto out;
+- 		logbuf_lock_irq();
++ 		printk_safe_enter_irq();
+  	}
+  
+ -	if (r->info->seq != atomic64_read(&user->seq)) {
+ +	if (user->seq < log_first_seq) {
+  		/* our last seen message is gone, return error and reset */
+ -		atomic64_set(&user->seq, r->info->seq);
+ +		user->idx = log_first_idx;
+ +		user->seq = log_first_seq;
+  		ret = -EPIPE;
+- 		logbuf_unlock_irq();
++ 		printk_safe_exit_irq();
+  		goto out;
+  	}
+  
+ -	len = info_print_ext_header(user->buf, sizeof(user->buf), r->info);
+ +	msg = log_from_idx(user->idx);
+ +	len = msg_print_ext_header(user->buf, sizeof(user->buf),
+ +				   msg, user->seq);
+  	len += msg_print_ext_body(user->buf + len, sizeof(user->buf) - len,
+ -				  &r->text_buf[0], r->info->text_len,
+ -				  &r->info->dev_info);
+ -
+ +				  log_dict(msg), msg->dict_len,
+ +				  log_text(msg), msg->text_len);
+ +
+++<<<<<<< HEAD
+ +	user->idx = log_next(user->idx);
+ +	user->seq++;
+ +	logbuf_unlock_irq();
+++=======
++ 	atomic64_set(&user->seq, r->info->seq + 1);
++ 	printk_safe_exit_irq();
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  
+  	if (len > count) {
+  		ret = -EINVAL;
+@@@ -990,10 -833,10 +1009,15 @@@ static __poll_t devkmsg_poll(struct fil
+  
+  	poll_wait(file, &log_wait, wait);
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irq();
+ +	if (user->seq < log_next_seq) {
+++=======
++ 	printk_safe_enter_irq();
++ 	if (prb_read_valid_info(prb, atomic64_read(&user->seq), &info, NULL)) {
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  		/* return error when data has vanished underneath us */
+ -		if (info.seq != atomic64_read(&user->seq))
+ +		if (user->seq < log_first_seq)
+  			ret = EPOLLIN|EPOLLRDNORM|EPOLLERR|EPOLLPRI;
+  		else
+  			ret = EPOLLIN|EPOLLRDNORM;
+@@@ -1028,10 -871,12 +1052,19 @@@ static int devkmsg_open(struct inode *i
+  
+  	mutex_init(&user->lock);
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irq();
+ +	user->idx = log_first_idx;
+ +	user->seq = log_first_seq;
+ +	logbuf_unlock_irq();
+++=======
++ 	prb_rec_init_rd(&user->record, &user->info,
++ 			&user->text_buf[0], sizeof(user->text_buf));
++ 
++ 	printk_safe_enter_irq();
++ 	atomic64_set(&user->seq, prb_first_valid_seq(prb));
++ 	printk_safe_exit_irq();
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  
+  	file->private_data = user;
+  	return 0;
+@@@ -1395,17 -1498,18 +1428,25 @@@ static int syslog_print(char __user *bu
+  		size_t n;
+  		size_t skip;
+  
+++<<<<<<< HEAD
+ +		logbuf_lock_irq();
+ +		if (syslog_seq < log_first_seq) {
+ +			/* messages are gone, move to first one */
+ +			syslog_seq = log_first_seq;
+ +			syslog_idx = log_first_idx;
+ +			syslog_partial = 0;
+ +		}
+ +		if (syslog_seq == log_next_seq) {
+ +			logbuf_unlock_irq();
+++=======
++ 		printk_safe_enter_irq();
++ 		raw_spin_lock(&syslog_lock);
++ 		if (!prb_read_valid(prb, syslog_seq, &r)) {
++ 			raw_spin_unlock(&syslog_lock);
++ 			printk_safe_exit_irq();
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  			break;
+  		}
+ -		if (r.info->seq != syslog_seq) {
+ -			/* message is gone, move to next valid one */
+ -			syslog_seq = r.info->seq;
+ -			syslog_partial = 0;
+ -		}
+  
+  		/*
+  		 * To keep reading/counting partial line consistent,
+@@@ -1430,7 -1531,8 +1471,12 @@@
+  			syslog_partial += n;
+  		} else
+  			n = 0;
+++<<<<<<< HEAD
+ +		logbuf_unlock_irq();
+++=======
++ 		raw_spin_unlock(&syslog_lock);
++ 		printk_safe_exit_irq();
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  
+  		if (!n)
+  			break;
+@@@ -1469,58 -1571,39 +1515,58 @@@ static int syslog_print_all(char __use
+  	 * Find first record that fits, including all following records,
+  	 * into the user-provided buffer for this dump.
+  	 */
+ -	seq = find_first_fitting_seq(latched_seq_read_nolock(&clear_seq), -1,
+ -				     size, true, time);
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	prb_rec_init_rd(&r, &info, text, CONSOLE_LOG_MAX);
+ +		len += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ -	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		int textlen;
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = clear_seq;
+ +	idx = clear_idx;
+ +	while (len > size && seq < log_next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -		textlen = record_print_text(&r, true, time);
+ +		len -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ -		if (len + textlen > size) {
+ -			seq--;
+ -			break;
+ -		}
+ +	/* last message fitting into this dump */
+ +	next_seq = log_next_seq;
+ +
+ +	len = 0;
+ +	while (len >= 0 && seq < next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+ +		int textlen = msg_print_text(msg, true, time, text,
+ +					     LOG_LINE_MAX + PREFIX_MAX);
+ +
+ +		idx = log_next(idx);
+ +		seq++;
+  
+- 		logbuf_unlock_irq();
++ 		printk_safe_exit_irq();
+  		if (copy_to_user(buf + len, text, textlen))
+  			len = -EFAULT;
+  		else
+  			len += textlen;
+- 		logbuf_lock_irq();
++ 		printk_safe_enter_irq();
+  
+ -		if (len < 0)
+ -			break;
+ +		if (seq < log_first_seq) {
+ +			/* messages are gone, move to next one */
+ +			seq = log_first_seq;
+ +			idx = log_first_idx;
+ +		}
+  	}
+  
+  	if (clear) {
+ -		raw_spin_lock(&syslog_lock);
+ -		latched_seq_write(&clear_seq, seq);
+ -		raw_spin_unlock(&syslog_lock);
+ +		clear_seq = log_next_seq;
+ +		clear_idx = log_next_idx;
+  	}
+- 	logbuf_unlock_irq();
++ 	printk_safe_exit_irq();
+  
+  	kfree(text);
+  	return len;
+@@@ -1528,10 -1611,23 +1574,18 @@@
+  
+  static void syslog_clear(void)
+  {
+++<<<<<<< HEAD
+ +	logbuf_lock_irq();
+ +	clear_seq = log_next_seq;
+ +	clear_idx = log_next_idx;
+ +	logbuf_unlock_irq();
+++=======
++ 	printk_safe_enter_irq();
++ 	raw_spin_lock(&syslog_lock);
++ 	latched_seq_write(&clear_seq, prb_next_seq(prb));
++ 	raw_spin_unlock(&syslog_lock);
++ 	printk_safe_exit_irq();
+ -}
+ -
+ -/* Return a consistent copy of @syslog_seq. */
+ -static u64 read_syslog_seq_irq(void)
+ -{
+ -	u64 seq;
+ -
+ -	raw_spin_lock_irq(&syslog_lock);
+ -	seq = syslog_seq;
+ -	raw_spin_unlock_irq(&syslog_lock);
+ -
+ -	return seq;
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  }
+  
+  int do_syslog(int type, char __user *buf, int len, int source)
+@@@ -1605,11 -1703,17 +1659,23 @@@
+  		break;
+  	/* Number of chars in the log buffer */
+  	case SYSLOG_ACTION_SIZE_UNREAD:
+++<<<<<<< HEAD
+ +		logbuf_lock_irq();
+ +		if (syslog_seq < log_first_seq) {
+++=======
++ 		printk_safe_enter_irq();
++ 		raw_spin_lock(&syslog_lock);
++ 		if (!prb_read_valid_info(prb, syslog_seq, &info, NULL)) {
++ 			/* No unread messages. */
++ 			raw_spin_unlock(&syslog_lock);
++ 			printk_safe_exit_irq();
++ 			return 0;
++ 		}
++ 		if (info.seq != syslog_seq) {
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  			/* messages are gone, move to first one */
+ -			syslog_seq = info.seq;
+ +			syslog_seq = log_first_seq;
+ +			syslog_idx = log_first_idx;
+  			syslog_partial = 0;
+  		}
+  		if (source == SYSLOG_FROM_PROC) {
+@@@ -1635,7 -1736,8 +1701,12 @@@
+  			}
+  			error -= syslog_partial;
+  		}
+++<<<<<<< HEAD
+ +		logbuf_unlock_irq();
+++=======
++ 		raw_spin_unlock(&syslog_lock);
++ 		printk_safe_exit_irq();
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  		break;
+  	/* Size of the log buffer */
+  	case SYSLOG_ACTION_SIZE_BUFFER:
+@@@ -2443,24 -2593,16 +2514,27 @@@ again
+  		size_t len;
+  
+  		printk_safe_enter_irqsave(flags);
+ -skip:
+ -		if (!prb_read_valid(prb, console_seq, &r))
+ -			break;
+++<<<<<<< HEAD
+ +		raw_spin_lock(&logbuf_lock);
+ +		if (console_seq < log_first_seq) {
+ +			len = snprintf(text, sizeof(text),
+ +				       "** %llu printk messages dropped **\n",
+ +				       log_first_seq - console_seq);
+  
+ -		if (console_seq != r.info->seq) {
+ -			console_dropped += r.info->seq - console_seq;
+ -			console_seq = r.info->seq;
+ +			/* messages are gone, move to first one */
+ +			console_seq = log_first_seq;
+ +			console_idx = log_first_idx;
+ +		} else {
+ +			len = 0;
+  		}
+++=======
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+ +skip:
+ +		if (console_seq == log_next_seq)
+ +			break;
+  
+ -		if (suppress_message_printing(r.info->level)) {
+ +		msg = log_from_idx(console_idx);
+ +		if (suppress_message_printing(msg->level)) {
+  			/*
+  			 * Skip record we have buffered and already printed
+  			 * directly to the console when we received it, and
+@@@ -2477,21 -2618,24 +2551,20 @@@
+  			exclusive_console = NULL;
+  		}
+  
+ -		/*
+ -		 * Handle extended console text first because later
+ -		 * record_print_text() will modify the record buffer in-place.
+ -		 */
+ +		len += msg_print_text(msg,
+ +				console_msg_format & MSG_FORMAT_SYSLOG,
+ +				printk_time, text + len, sizeof(text) - len);
+  		if (nr_ext_console_drivers) {
+ -			ext_len = info_print_ext_header(ext_text,
+ +			ext_len = msg_print_ext_header(ext_text,
+  						sizeof(ext_text),
+ -						r.info);
+ +						msg, console_seq);
+  			ext_len += msg_print_ext_body(ext_text + ext_len,
+  						sizeof(ext_text) - ext_len,
+ -						&r.text_buf[0],
+ -						r.info->text_len,
+ -						&r.info->dev_info);
+ +						log_dict(msg), msg->dict_len,
+ +						log_text(msg), msg->text_len);
+  		}
+ -		len = record_print_text(&r,
+ -				console_msg_format & MSG_FORMAT_SYSLOG,
+ -				printk_time);
+ +		console_idx = log_next(console_idx);
+  		console_seq++;
+- 		raw_spin_unlock(&logbuf_lock);
+  
+  		/*
+  		 * While actively printing out messages, if another printk()
+@@@ -2528,9 -2670,7 +2599,13 @@@
+  	 * there's a new owner and the console_unlock() from them will do the
+  	 * flush, no worries.
+  	 */
+++<<<<<<< HEAD
+ +	raw_spin_lock(&logbuf_lock);
+ +	retry = console_seq != log_next_seq;
+ +	raw_spin_unlock(&logbuf_lock);
+++=======
++ 	retry = prb_read_valid(prb, console_seq, NULL);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  	printk_safe_exit_irqrestore(flags);
+  
+  	if (retry && console_trylock())
+@@@ -2597,10 -2737,9 +2672,16 @@@ void console_flush_on_panic(enum con_fl
+  	if (mode == CONSOLE_REPLAY_ALL) {
+  		unsigned long flags;
+  
+++<<<<<<< HEAD
+ +		logbuf_lock_irqsave(flags);
+ +		console_seq = log_first_seq;
+ +		console_idx = log_first_idx;
+ +		logbuf_unlock_irqrestore(flags);
+++=======
++ 		printk_safe_enter_irqsave(flags);
++ 		console_seq = prb_first_valid_seq(prb);
++ 		printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  	}
+  	console_unlock();
+  }
+@@@ -2843,9 -2980,13 +2924,15 @@@ void register_console(struct console *n
+  		 */
+  		exclusive_console = newcon;
+  		exclusive_console_stop_seq = console_seq;
+ -
+ -		/* Get a consistent copy of @syslog_seq. */
+ -		raw_spin_lock(&syslog_lock);
+  		console_seq = syslog_seq;
+++<<<<<<< HEAD
+ +		console_idx = syslog_idx;
+ +		logbuf_unlock_irqrestore(flags);
+++=======
++ 		raw_spin_unlock(&syslog_lock);
++ 
++ 		printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  	}
+  	console_unlock();
+  	console_sysfs_notify();
+@@@ -3283,9 -3452,9 +3370,15 @@@ bool kmsg_dump_get_line(struct kmsg_dum
+  	unsigned long flags;
+  	bool ret;
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irqsave(flags);
+ +	ret = kmsg_dump_get_line_nolock(dumper, syslog, line, size, len);
+ +	logbuf_unlock_irqrestore(flags);
+++=======
++ 	printk_safe_enter_irqsave(flags);
++ 	ret = kmsg_dump_get_line_nolock(iter, syslog, line, size, len);
++ 	printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  
+  	return ret;
+  }
+@@@ -3322,64 -3492,60 +3415,81 @@@ bool kmsg_dump_get_buffer(struct kmsg_d
+  	bool ret = false;
+  	bool time = printk_time;
+  
+ -	if (!buf || !size)
+ +	if (!dumper->active)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irqsave(flags);
+ +	if (dumper->cur_seq < log_first_seq) {
+ +		/* messages are gone, move to first available one */
+ +		dumper->cur_seq = log_first_seq;
+ +		dumper->cur_idx = log_first_idx;
+ +	}
+ +
+ +	/* last entry */
+ +	if (dumper->cur_seq >= dumper->next_seq) {
+ +		logbuf_unlock_irqrestore(flags);
+++=======
++ 	if (iter->cur_seq < min_seq)
++ 		iter->cur_seq = min_seq;
++ 
++ 	printk_safe_enter_irqsave(flags);
++ 	if (prb_read_valid_info(prb, iter->cur_seq, &info, NULL)) {
++ 		if (info.seq != iter->cur_seq) {
++ 			/* messages are gone, move to first available one */
++ 			iter->cur_seq = info.seq;
++ 		}
++ 	}
++ 
++ 	/* last entry */
++ 	if (iter->cur_seq >= iter->next_seq) {
++ 		printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  		goto out;
+  	}
+  
+ -	/*
+ -	 * Find first record that fits, including all following records,
+ -	 * into the user-provided buffer for this dump. Pass in size-1
+ -	 * because this function (by way of record_print_text()) will
+ -	 * not write more than size-1 bytes of text into @buf.
+ -	 */
+ -	seq = find_first_fitting_seq(iter->cur_seq, iter->next_seq,
+ -				     size - 1, syslog, time);
+ +	/* calculate length of entire buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	/*
+ -	 * Next kmsg_dump_get_buffer() invocation will dump block of
+ -	 * older records stored right before this one.
+ -	 */
+ -	next_seq = seq;
+ +		l += msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+  
+ -	prb_rec_init_rd(&r, &info, buf, size);
+ +	/* move first record forward until length fits into the buffer */
+ +	seq = dumper->cur_seq;
+ +	idx = dumper->cur_idx;
+ +	while (l >= size && seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -	len = 0;
+ -	prb_for_each_record(seq, prb, seq, &r) {
+ -		if (r.info->seq >= iter->next_seq)
+ -			break;
+ +		l -= msg_print_text(msg, true, time, NULL, 0);
+ +		idx = log_next(idx);
+ +		seq++;
+ +	}
+ +
+ +	/* last message in next interation */
+ +	next_seq = seq;
+ +	next_idx = idx;
+  
+ -		len += record_print_text(&r, syslog, time);
+ +	l = 0;
+ +	while (seq < dumper->next_seq) {
+ +		struct printk_log *msg = log_from_idx(idx);
+  
+ -		/* Adjust record to store to remaining buffer space. */
+ -		prb_rec_init_rd(&r, &info, buf + len, size - len);
+ +		l += msg_print_text(msg, syslog, time, buf + l, size - l);
+ +		idx = log_next(idx);
+ +		seq++;
+  	}
+  
+ -	iter->next_seq = next_seq;
+ +	dumper->next_seq = next_seq;
+ +	dumper->next_idx = next_idx;
+  	ret = true;
+- 	logbuf_unlock_irqrestore(flags);
++ 	printk_safe_exit_irqrestore(flags);
+  out:
+ -	if (len_out)
+ -		*len_out = len;
+ +	if (len)
+ +		*len = l;
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(kmsg_dump_get_buffer);
+@@@ -3414,9 -3578,9 +3524,15 @@@ void kmsg_dump_rewind(struct kmsg_dumpe
+  {
+  	unsigned long flags;
+  
+++<<<<<<< HEAD
+ +	logbuf_lock_irqsave(flags);
+ +	kmsg_dump_rewind_nolock(dumper);
+ +	logbuf_unlock_irqrestore(flags);
+++=======
++ 	printk_safe_enter_irqsave(flags);
++ 	kmsg_dump_rewind_nolock(iter);
++ 	printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  }
+  EXPORT_SYMBOL_GPL(kmsg_dump_rewind);
+  
+diff --cc kernel/printk/printk_safe.c
+index 47e3b474f70d,bbf5c1993636..000000000000
+--- a/kernel/printk/printk_safe.c
++++ b/kernel/printk/printk_safe.c
+@@@ -372,15 -366,16 +362,21 @@@ __printf(1, 0) int vprintk_func(const c
+  #endif
+  
+  	/*
+- 	 * Try to use the main logbuf even in NMI. But avoid calling console
++ 	 * Use the main logbuf even in NMI. But avoid calling console
+  	 * drivers that might have their own locks.
+  	 */
+- 	if ((this_cpu_read(printk_context) & PRINTK_NMI_DIRECT_CONTEXT_MASK) &&
+- 	    raw_spin_trylock(&logbuf_lock)) {
++ 	if ((this_cpu_read(printk_context) & PRINTK_NMI_DIRECT_CONTEXT_MASK)) {
++ 		unsigned long flags;
+  		int len;
+  
+++<<<<<<< HEAD
+ +		len = vprintk_store(0, LOGLEVEL_DEFAULT, NULL, 0, fmt, args);
+ +		raw_spin_unlock(&logbuf_lock);
+++=======
++ 		printk_safe_enter_irqsave(flags);
++ 		len = vprintk_store(0, LOGLEVEL_DEFAULT, NULL, fmt, args);
++ 		printk_safe_exit_irqrestore(flags);
+++>>>>>>> 996e966640dd (printk: remove logbuf_lock)
+  		defer_console_output();
+  		return len;
+  	}
+* Unmerged path kernel/printk/internal.h
+* Unmerged path kernel/printk/printk.c
+* Unmerged path kernel/printk/printk_safe.c
