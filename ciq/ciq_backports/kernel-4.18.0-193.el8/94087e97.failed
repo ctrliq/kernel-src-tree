@@ -1,0 +1,287 @@
+xprtrdma: Aggregate the inline settings in struct rpcrdma_ep
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 94087e978e9b645e07cc0fbdcf4140dda02f3d81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/94087e97.failed
+
+Clean up.
+
+The inline settings are actually a characteristic of the endpoint,
+and not related to the device. They are also modified after the
+transport instance is created, so they do not belong in the cdata
+structure either.
+
+Lastly, let's use names that are more natural to RDMA than to NFS:
+inline_write -> inline_send and inline_read -> inline_recv. The
+/proc files retain their names to avoid breaking user space.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 94087e978e9b645e07cc0fbdcf4140dda02f3d81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/backchannel.c
+diff --cc net/sunrpc/xprtrdma/backchannel.c
+index b25cce6c9556,ce986591f213..000000000000
+--- a/net/sunrpc/xprtrdma/backchannel.c
++++ b/net/sunrpc/xprtrdma/backchannel.c
+@@@ -231,6 -160,43 +231,46 @@@ void xprt_rdma_bc_free_rqst(struct rpc_
+  	spin_unlock(&xprt->bc_pa_lock);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rpc_rqst *rpcrdma_bc_rqst_get(struct rpcrdma_xprt *r_xprt)
++ {
++ 	struct rpc_xprt *xprt = &r_xprt->rx_xprt;
++ 	struct rpcrdma_req *req;
++ 	struct rpc_rqst *rqst;
++ 	size_t size;
++ 
++ 	spin_lock(&xprt->bc_pa_lock);
++ 	rqst = list_first_entry_or_null(&xprt->bc_pa_list, struct rpc_rqst,
++ 					rq_bc_pa_list);
++ 	if (!rqst)
++ 		goto create_req;
++ 	list_del(&rqst->rq_bc_pa_list);
++ 	spin_unlock(&xprt->bc_pa_lock);
++ 	return rqst;
++ 
++ create_req:
++ 	spin_unlock(&xprt->bc_pa_lock);
++ 
++ 	/* Set a limit to prevent a remote from overrunning our resources.
++ 	 */
++ 	if (xprt->bc_alloc_count >= RPCRDMA_BACKWARD_WRS)
++ 		return NULL;
++ 
++ 	size = min_t(size_t, r_xprt->rx_ep.rep_inline_recv, PAGE_SIZE);
++ 	req = rpcrdma_req_create(r_xprt, size, GFP_KERNEL);
++ 	if (!req)
++ 		return NULL;
++ 
++ 	xprt->bc_alloc_count++;
++ 	rqst = &req->rl_slot;
++ 	rqst->rq_xprt = xprt;
++ 	__set_bit(RPC_BC_PA_IN_USE, &rqst->rq_bc_pa_state);
++ 	xdr_buf_init(&rqst->rq_snd_buf, rdmab_data(req->rl_sendbuf), size);
++ 	return rqst;
++ }
++ 
+++>>>>>>> 94087e978e9b (xprtrdma: Aggregate the inline settings in struct rpcrdma_ep)
+  /**
+   * rpcrdma_bc_receive_call - Handle a backward direction call
+   * @r_xprt: transport receiving the call
+* Unmerged path net/sunrpc/xprtrdma/backchannel.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 52d6699bd244..61d2f1613524 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -105,16 +105,23 @@ static unsigned int rpcrdma_max_reply_header_size(unsigned int maxsegs)
+ 	return size;
+ }
+ 
++/**
++ * rpcrdma_set_max_header_sizes - Initialize inline payload sizes
++ * @r_xprt: transport instance to initialize
++ *
++ * The max_inline fields contain the maximum size of an RPC message
++ * so the marshaling code doesn't have to repeat this calculation
++ * for every RPC.
++ */
+ void rpcrdma_set_max_header_sizes(struct rpcrdma_xprt *r_xprt)
+ {
+-	struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
+-	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+-	unsigned int maxsegs = ia->ri_max_segs;
+-
+-	ia->ri_max_inline_write = cdata->inline_wsize -
+-				  rpcrdma_max_call_header_size(maxsegs);
+-	ia->ri_max_inline_read = cdata->inline_rsize -
+-				 rpcrdma_max_reply_header_size(maxsegs);
++	unsigned int maxsegs = r_xprt->rx_ia.ri_max_segs;
++	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
++
++	ep->rep_max_inline_send =
++		ep->rep_inline_send - rpcrdma_max_call_header_size(maxsegs);
++	ep->rep_max_inline_recv =
++		ep->rep_inline_recv - rpcrdma_max_reply_header_size(maxsegs);
+ }
+ 
+ /* The client can send a request inline as long as the RPCRDMA header
+@@ -131,7 +138,7 @@ static bool rpcrdma_args_inline(struct rpcrdma_xprt *r_xprt,
+ 	struct xdr_buf *xdr = &rqst->rq_snd_buf;
+ 	unsigned int count, remaining, offset;
+ 
+-	if (xdr->len > r_xprt->rx_ia.ri_max_inline_write)
++	if (xdr->len > r_xprt->rx_ep.rep_max_inline_send)
+ 		return false;
+ 
+ 	if (xdr->page_len) {
+@@ -159,9 +166,7 @@ static bool rpcrdma_args_inline(struct rpcrdma_xprt *r_xprt,
+ static bool rpcrdma_results_inline(struct rpcrdma_xprt *r_xprt,
+ 				   struct rpc_rqst *rqst)
+ {
+-	struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+-
+-	return rqst->rq_rcv_buf.buflen <= ia->ri_max_inline_read;
++	return rqst->rq_rcv_buf.buflen <= r_xprt->rx_ep.rep_max_inline_recv;
+ }
+ 
+ /* The client is required to provide a Reply chunk if the maximum
+@@ -173,10 +178,9 @@ rpcrdma_nonpayload_inline(const struct rpcrdma_xprt *r_xprt,
+ 			  const struct rpc_rqst *rqst)
+ {
+ 	const struct xdr_buf *buf = &rqst->rq_rcv_buf;
+-	const struct rpcrdma_ia *ia = &r_xprt->rx_ia;
+ 
+-	return buf->head[0].iov_len + buf->tail[0].iov_len <
+-		ia->ri_max_inline_read;
++	return (buf->head[0].iov_len + buf->tail[0].iov_len) <
++		r_xprt->rx_ep.rep_max_inline_recv;
+ }
+ 
+ /* Split @vec on page boundaries into SGEs. FMR registers pages, not
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index 189afd4026fc..09d9347b291b 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -70,7 +70,7 @@
+ 
+ static unsigned int xprt_rdma_slot_table_entries = RPCRDMA_DEF_SLOT_TABLE;
+ unsigned int xprt_rdma_max_inline_read = RPCRDMA_DEF_INLINE;
+-static unsigned int xprt_rdma_max_inline_write = RPCRDMA_DEF_INLINE;
++unsigned int xprt_rdma_max_inline_write = RPCRDMA_DEF_INLINE;
+ unsigned int xprt_rdma_memreg_strategy		= RPCRDMA_FRWR;
+ int xprt_rdma_pad_optimize;
+ 
+@@ -350,8 +350,6 @@ xprt_setup_rdma(struct xprt_create *args)
+ 	xprt_rdma_format_addresses(xprt, sap);
+ 
+ 	cdata.max_requests = xprt_rdma_slot_table_entries;
+-	cdata.inline_wsize = xprt_rdma_max_inline_write;
+-	cdata.inline_rsize = xprt_rdma_max_inline_read;
+ 
+ 	/*
+ 	 * Create new transport instance, which includes initialized
+diff --git a/net/sunrpc/xprtrdma/verbs.c b/net/sunrpc/xprtrdma/verbs.c
+index 4b69d5e2e3f7..573936ae5534 100644
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@ -188,7 +188,6 @@ static void
+ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
+ 			       struct rdma_conn_param *param)
+ {
+-	struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
+ 	const struct rpcrdma_connect_private *pmsg = param->private_data;
+ 	unsigned int rsize, wsize;
+ 
+@@ -205,12 +204,13 @@ rpcrdma_update_connect_private(struct rpcrdma_xprt *r_xprt,
+ 		wsize = rpcrdma_decode_buffer_size(pmsg->cp_recv_size);
+ 	}
+ 
+-	if (rsize < cdata->inline_rsize)
+-		cdata->inline_rsize = rsize;
+-	if (wsize < cdata->inline_wsize)
+-		cdata->inline_wsize = wsize;
+-	dprintk("RPC:       %s: max send %u, max recv %u\n",
+-		__func__, cdata->inline_wsize, cdata->inline_rsize);
++	if (rsize < r_xprt->rx_ep.rep_inline_recv)
++		r_xprt->rx_ep.rep_inline_recv = rsize;
++	if (wsize < r_xprt->rx_ep.rep_inline_send)
++		r_xprt->rx_ep.rep_inline_send = wsize;
++	dprintk("RPC:       %s: max send %u, max recv %u\n", __func__,
++		r_xprt->rx_ep.rep_inline_send,
++		r_xprt->rx_ep.rep_inline_recv);
+ 	rpcrdma_set_max_header_sizes(r_xprt);
+ }
+ 
+@@ -488,6 +488,9 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 	unsigned int max_sge;
+ 	int rc;
+ 
++	ep->rep_inline_send = xprt_rdma_max_inline_write;
++	ep->rep_inline_recv = xprt_rdma_max_inline_read;
++
+ 	max_sge = min_t(unsigned int, ia->ri_id->device->attrs.max_send_sge,
+ 			RPCRDMA_MAX_SEND_SGES);
+ 	if (max_sge < RPCRDMA_MIN_SEND_SGES) {
+@@ -550,8 +553,8 @@ rpcrdma_ep_create(struct rpcrdma_ep *ep, struct rpcrdma_ia *ia,
+ 	pmsg->cp_magic = rpcrdma_cmp_magic;
+ 	pmsg->cp_version = RPCRDMA_CMP_VERSION;
+ 	pmsg->cp_flags |= RPCRDMA_CMP_F_SND_W_INV_OK;
+-	pmsg->cp_send_size = rpcrdma_encode_buffer_size(cdata->inline_wsize);
+-	pmsg->cp_recv_size = rpcrdma_encode_buffer_size(cdata->inline_rsize);
++	pmsg->cp_send_size = rpcrdma_encode_buffer_size(ep->rep_inline_send);
++	pmsg->cp_recv_size = rpcrdma_encode_buffer_size(ep->rep_inline_recv);
+ 	ep->rep_remote_cma.private_data = pmsg;
+ 	ep->rep_remote_cma.private_data_len = sizeof(*pmsg);
+ 
+@@ -1044,7 +1047,6 @@ struct rpcrdma_req *rpcrdma_req_create(struct rpcrdma_xprt *r_xprt, size_t size,
+ 
+ static bool rpcrdma_rep_create(struct rpcrdma_xprt *r_xprt, bool temp)
+ {
+-	struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
+ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+ 	struct rpcrdma_rep *rep;
+ 
+@@ -1052,7 +1054,7 @@ static bool rpcrdma_rep_create(struct rpcrdma_xprt *r_xprt, bool temp)
+ 	if (rep == NULL)
+ 		goto out;
+ 
+-	rep->rr_rdmabuf = rpcrdma_regbuf_alloc(cdata->inline_rsize,
++	rep->rr_rdmabuf = rpcrdma_regbuf_alloc(r_xprt->rx_ep.rep_inline_recv,
+ 					       DMA_FROM_DEVICE, GFP_KERNEL);
+ 	if (!rep->rr_rdmabuf)
+ 		goto out_free;
+diff --git a/net/sunrpc/xprtrdma/xprt_rdma.h b/net/sunrpc/xprtrdma/xprt_rdma.h
+index d2fe3ed9ca67..b740651b8fd0 100644
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@ -71,8 +71,6 @@ struct rpcrdma_ia {
+ 	int			ri_async_rc;
+ 	unsigned int		ri_max_segs;
+ 	unsigned int		ri_max_frwr_depth;
+-	unsigned int		ri_max_inline_write;
+-	unsigned int		ri_max_inline_read;
+ 	unsigned int		ri_max_send_sges;
+ 	bool			ri_implicit_roundup;
+ 	enum ib_mr_type		ri_mrtype;
+@@ -92,11 +90,15 @@ enum {
+ struct rpcrdma_ep {
+ 	unsigned int		rep_send_count;
+ 	unsigned int		rep_send_batch;
++	unsigned int		rep_max_inline_send;
++	unsigned int		rep_max_inline_recv;
+ 	int			rep_connected;
+ 	struct ib_qp_init_attr	rep_attr;
+ 	wait_queue_head_t 	rep_connect_wait;
+ 	struct rpcrdma_connect_private	rep_cm_private;
+ 	struct rdma_conn_param	rep_remote_cma;
++	unsigned int		rep_inline_send;	/* negotiated */
++	unsigned int		rep_inline_recv;	/* negotiated */
+ 	int			rep_receive_count;
+ };
+ 
+@@ -419,8 +421,6 @@ enum {
+  */
+ struct rpcrdma_create_data_internal {
+ 	unsigned int	max_requests;	/* max requests (slots) in flight */
+-	unsigned int	inline_rsize;	/* max non-rdma read data payload */
+-	unsigned int	inline_wsize;	/* max non-rdma write data payload */
+ };
+ 
+ /*
+@@ -631,6 +631,7 @@ static inline void rpcrdma_set_xdrlen(struct xdr_buf *xdr, size_t len)
+ /* RPC/RDMA module init - xprtrdma/transport.c
+  */
+ extern unsigned int xprt_rdma_max_inline_read;
++extern unsigned int xprt_rdma_max_inline_write;
+ void xprt_rdma_format_addresses(struct rpc_xprt *xprt, struct sockaddr *sap);
+ void xprt_rdma_free_addresses(struct rpc_xprt *xprt);
+ void xprt_rdma_close(struct rpc_xprt *xprt);
