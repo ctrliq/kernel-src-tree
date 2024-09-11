@@ -1,0 +1,247 @@
+PCI: Add support for ACPI _RST reset method
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Shanker Donthineni <sdonthineni@nvidia.com>
+commit 6937b7dd434962377e00efc04adac0390c287199
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6937b7dd.failed
+
+_RST is a standard ACPI method that performs a function level reset of a
+device (ACPI v6.3, sec 7.3.25).
+
+Add pci_dev_acpi_reset() to probe for _RST method and execute if present.
+The default priority of this reset is set to below device-specific and
+above hardware resets.
+
+	Suggested-by: Alex Williamson <alex.williamson@redhat.com>
+Link: https://lore.kernel.org/r/20210817180500.1253-9-ameynarkhede03@gmail.com
+	Signed-off-by: Shanker Donthineni <sdonthineni@nvidia.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+	Reviewed-by: Sinan Kaya <okaya@kernel.org>
+	Reviewed-by: Alex Williamson <alex.williamson@redhat.com>
+(cherry picked from commit 6937b7dd434962377e00efc04adac0390c287199)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/pci/pci.c
+#	include/linux/pci.h
+diff --cc drivers/pci/pci.c
+index c3df2812af1a,4d9828160c48..000000000000
+--- a/drivers/pci/pci.c
++++ b/drivers/pci/pci.c
+@@@ -5088,6 -5122,139 +5088,142 @@@ static void pci_dev_restore(struct pci_
+  		err_handler->reset_done(dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* dev->reset_methods[] is a 0-terminated list of indices into this array */
++ static const struct pci_reset_fn_method pci_reset_fn_methods[] = {
++ 	{ },
++ 	{ pci_dev_specific_reset, .name = "device_specific" },
++ 	{ pci_dev_acpi_reset, .name = "acpi" },
++ 	{ pcie_reset_flr, .name = "flr" },
++ 	{ pci_af_flr, .name = "af_flr" },
++ 	{ pci_pm_reset, .name = "pm" },
++ 	{ pci_reset_bus_function, .name = "bus" },
++ };
++ 
++ static ssize_t reset_method_show(struct device *dev,
++ 				 struct device_attribute *attr, char *buf)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(dev);
++ 	ssize_t len = 0;
++ 	int i, m;
++ 
++ 	for (i = 0; i < PCI_NUM_RESET_METHODS; i++) {
++ 		m = pdev->reset_methods[i];
++ 		if (!m)
++ 			break;
++ 
++ 		len += sysfs_emit_at(buf, len, "%s%s", len ? " " : "",
++ 				     pci_reset_fn_methods[m].name);
++ 	}
++ 
++ 	if (len)
++ 		len += sysfs_emit_at(buf, len, "\n");
++ 
++ 	return len;
++ }
++ 
++ static int reset_method_lookup(const char *name)
++ {
++ 	int m;
++ 
++ 	for (m = 1; m < PCI_NUM_RESET_METHODS; m++) {
++ 		if (sysfs_streq(name, pci_reset_fn_methods[m].name))
++ 			return m;
++ 	}
++ 
++ 	return 0;	/* not found */
++ }
++ 
++ static ssize_t reset_method_store(struct device *dev,
++ 				  struct device_attribute *attr,
++ 				  const char *buf, size_t count)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(dev);
++ 	char *options, *name;
++ 	int m, n;
++ 	u8 reset_methods[PCI_NUM_RESET_METHODS] = { 0 };
++ 
++ 	if (sysfs_streq(buf, "")) {
++ 		pdev->reset_methods[0] = 0;
++ 		pci_warn(pdev, "All device reset methods disabled by user");
++ 		return count;
++ 	}
++ 
++ 	if (sysfs_streq(buf, "default")) {
++ 		pci_init_reset_methods(pdev);
++ 		return count;
++ 	}
++ 
++ 	options = kstrndup(buf, count, GFP_KERNEL);
++ 	if (!options)
++ 		return -ENOMEM;
++ 
++ 	n = 0;
++ 	while ((name = strsep(&options, " ")) != NULL) {
++ 		if (sysfs_streq(name, ""))
++ 			continue;
++ 
++ 		name = strim(name);
++ 
++ 		m = reset_method_lookup(name);
++ 		if (!m) {
++ 			pci_err(pdev, "Invalid reset method '%s'", name);
++ 			goto error;
++ 		}
++ 
++ 		if (pci_reset_fn_methods[m].reset_fn(pdev, 1)) {
++ 			pci_err(pdev, "Unsupported reset method '%s'", name);
++ 			goto error;
++ 		}
++ 
++ 		if (n == PCI_NUM_RESET_METHODS - 1) {
++ 			pci_err(pdev, "Too many reset methods\n");
++ 			goto error;
++ 		}
++ 
++ 		reset_methods[n++] = m;
++ 	}
++ 
++ 	reset_methods[n] = 0;
++ 
++ 	/* Warn if dev-specific supported but not highest priority */
++ 	if (pci_reset_fn_methods[1].reset_fn(pdev, 1) == 0 &&
++ 	    reset_methods[0] != 1)
++ 		pci_warn(pdev, "Device-specific reset disabled/de-prioritized by user");
++ 	memcpy(pdev->reset_methods, reset_methods, sizeof(pdev->reset_methods));
++ 	kfree(options);
++ 	return count;
++ 
++ error:
++ 	/* Leave previous methods unchanged */
++ 	kfree(options);
++ 	return -EINVAL;
++ }
++ static DEVICE_ATTR_RW(reset_method);
++ 
++ static struct attribute *pci_dev_reset_method_attrs[] = {
++ 	&dev_attr_reset_method.attr,
++ 	NULL,
++ };
++ 
++ static umode_t pci_dev_reset_method_attr_is_visible(struct kobject *kobj,
++ 						    struct attribute *a, int n)
++ {
++ 	struct pci_dev *pdev = to_pci_dev(kobj_to_dev(kobj));
++ 
++ 	if (!pci_reset_supported(pdev))
++ 		return 0;
++ 
++ 	return a->mode;
++ }
++ 
++ const struct attribute_group pci_dev_reset_method_attr_group = {
++ 	.attrs = pci_dev_reset_method_attrs,
++ 	.is_visible = pci_dev_reset_method_attr_is_visible,
++ };
++ 
+++>>>>>>> 6937b7dd4349 (PCI: Add support for ACPI _RST reset method)
+  /**
+   * __pci_reset_function_locked - reset a PCI device function while holding
+   * the @dev mutex lock.
+diff --cc include/linux/pci.h
+index 0b97f3c12e39,98718f46a61c..000000000000
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@@ -51,6 -49,9 +51,12 @@@
+  			       PCI_STATUS_SIG_TARGET_ABORT | \
+  			       PCI_STATUS_PARITY)
+  
+++<<<<<<< HEAD
+++=======
++ /* Number of reset methods used in pci_reset_fn_methods array in pci.c */
++ #define PCI_NUM_RESET_METHODS 7
++ 
+++>>>>>>> 6937b7dd4349 (PCI: Add support for ACPI _RST reset method)
+  /*
+   * The PCI interface treats multi-function devices as independent
+   * devices.  The slot/function address of each device is encoded
+diff --git a/drivers/pci/pci-acpi.c b/drivers/pci/pci-acpi.c
+index c33c87c0729f..8a1b862a5478 100644
+--- a/drivers/pci/pci-acpi.c
++++ b/drivers/pci/pci-acpi.c
+@@ -941,6 +941,29 @@ void pci_set_acpi_fwnode(struct pci_dev *dev)
+ 				   acpi_pci_find_companion(&dev->dev));
+ }
+ 
++/**
++ * pci_dev_acpi_reset - do a function level reset using _RST method
++ * @dev: device to reset
++ * @probe: check if _RST method is included in the acpi_device context.
++ */
++int pci_dev_acpi_reset(struct pci_dev *dev, int probe)
++{
++	acpi_handle handle = ACPI_HANDLE(&dev->dev);
++
++	if (!handle || !acpi_has_method(handle, "_RST"))
++		return -ENOTTY;
++
++	if (probe)
++		return 0;
++
++	if (ACPI_FAILURE(acpi_evaluate_object(handle, "_RST", NULL, NULL))) {
++		pci_warn(dev, "ACPI _RST failed\n");
++		return -ENOTTY;
++	}
++
++	return 0;
++}
++
+ static bool acpi_pci_power_manageable(struct pci_dev *dev)
+ {
+ 	struct acpi_device *adev = ACPI_COMPANION(&dev->dev);
+* Unmerged path drivers/pci/pci.c
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index ff387d8e7bf8..f8b024df615a 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -707,7 +707,13 @@ static inline int pci_aer_raw_clear_status(struct pci_dev *dev) { return -EINVAL
+ int pci_acpi_program_hp_params(struct pci_dev *dev);
+ extern const struct attribute_group pci_dev_acpi_attr_group;
+ void pci_set_acpi_fwnode(struct pci_dev *dev);
++int pci_dev_acpi_reset(struct pci_dev *dev, int probe);
+ #else
++static inline int pci_dev_acpi_reset(struct pci_dev *dev, int probe)
++{
++	return -ENOTTY;
++}
++
+ static inline void pci_set_acpi_fwnode(struct pci_dev *dev) {}
+ static inline int pci_acpi_program_hp_params(struct pci_dev *dev)
+ {
+* Unmerged path include/linux/pci.h
