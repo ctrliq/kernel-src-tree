@@ -1,0 +1,220 @@
+net: add sysfs attribute to control napi threaded mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-331.el8
+commit-author Wei Wang <weiwan@google.com>
+commit 5fdd2f0e5c64846bf3066689b73fc3b8dddd1c74
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-331.el8/5fdd2f0e.failed
+
+This patch adds a new sysfs attribute to the network device class.
+Said attribute provides a per-device control to enable/disable the
+threaded mode for all the napi instances of the given network device,
+without the need for a device up/down.
+User sets it to 1 or 0 to enable or disable threaded mode.
+Note: when switching between threaded and the current softirq based mode
+for a napi instance, it will not immediately take effect if the napi is
+currently being polled. The mode switch will happen for the next time
+napi_schedule() is called.
+
+Co-developed-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+Co-developed-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+	Signed-off-by: Hannes Frederic Sowa <hannes@stressinduktion.org>
+Co-developed-by: Felix Fietkau <nbd@nbd.name>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+	Signed-off-by: Wei Wang <weiwan@google.com>
+	Reviewed-by: Alexander Duyck <alexanderduyck@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5fdd2f0e5c64846bf3066689b73fc3b8dddd1c74)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+diff --cc net/core/dev.c
+index a223efdd8606,7647278e46f0..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4117,6 -4287,22 +4117,25 @@@ int dev_tx_weight __read_mostly = 64
+  static inline void ____napi_schedule(struct softnet_data *sd,
+  				     struct napi_struct *napi)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct task_struct *thread;
++ 
++ 	if (test_bit(NAPI_STATE_THREADED, &napi->state)) {
++ 		/* Paired with smp_mb__before_atomic() in
++ 		 * napi_enable()/dev_set_threaded().
++ 		 * Use READ_ONCE() to guarantee a complete
++ 		 * read on napi->thread. Only call
++ 		 * wake_up_process() when it's not NULL.
++ 		 */
++ 		thread = READ_ONCE(napi->thread);
++ 		if (thread) {
++ 			wake_up_process(thread);
++ 			return;
++ 		}
++ 	}
++ 
+++>>>>>>> 5fdd2f0e5c64 (net: add sysfs attribute to control napi threaded mode)
+  	list_add_tail(&napi->poll_list, &sd->poll_list);
+  	__raise_softirq_irqoff(NET_RX_SOFTIRQ);
+  }
+@@@ -6324,10 -6730,58 +6343,53 @@@ static enum hrtimer_restart napi_watchd
+  
+  static void init_gro_hash(struct napi_struct *napi)
+  {
+ -	int i;
+ -
+ -	for (i = 0; i < GRO_HASH_BUCKETS; i++) {
+ -		INIT_LIST_HEAD(&napi->gro_hash[i].list);
+ -		napi->gro_hash[i].count = 0;
+ -	}
+ -	napi->gro_bitmask = 0;
+ +	INIT_LIST_HEAD(&napi->gro_list);
+ +	napi->gro_count = 0;
+  }
+  
++ int dev_set_threaded(struct net_device *dev, bool threaded)
++ {
++ 	struct napi_struct *napi;
++ 	int err = 0;
++ 
++ 	if (dev->threaded == threaded)
++ 		return 0;
++ 
++ 	if (threaded) {
++ 		list_for_each_entry(napi, &dev->napi_list, dev_list) {
++ 			if (!napi->thread) {
++ 				err = napi_kthread_create(napi);
++ 				if (err) {
++ 					threaded = false;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	dev->threaded = threaded;
++ 
++ 	/* Make sure kthread is created before THREADED bit
++ 	 * is set.
++ 	 */
++ 	smp_mb__before_atomic();
++ 
++ 	/* Setting/unsetting threaded mode on a napi might not immediately
++ 	 * take effect, if the current napi instance is actively being
++ 	 * polled. In this case, the switch between threaded mode and
++ 	 * softirq mode will happen in the next round of napi_schedule().
++ 	 * This should not cause hiccups/stalls to the live traffic.
++ 	 */
++ 	list_for_each_entry(napi, &dev->napi_list, dev_list) {
++ 		if (threaded)
++ 			set_bit(NAPI_STATE_THREADED, &napi->state);
++ 		else
++ 			clear_bit(NAPI_STATE_THREADED, &napi->state);
++ 	}
++ 
++ 	return err;
++ }
++ 
+  void netif_napi_add(struct net_device *dev, struct napi_struct *napi,
+  		    int (*poll)(struct napi_struct *, int), int weight)
+  {
+diff --git a/Documentation/ABI/testing/sysfs-class-net b/Documentation/ABI/testing/sysfs-class-net
+index 35bda4570898..449ddf6681c1 100644
+--- a/Documentation/ABI/testing/sysfs-class-net
++++ b/Documentation/ABI/testing/sysfs-class-net
+@@ -296,3 +296,18 @@ Contact:	netdev@vger.kernel.org
+ Description:
+ 		32-bit unsigned integer counting the number of times the link has
+ 		been down
++
++What:		/sys/class/net/<iface>/threaded
++Date:		Jan 2021
++KernelVersion:	5.12
++Contact:	netdev@vger.kernel.org
++Description:
++		Boolean value to control the threaded mode per device. User could
++		set this value to enable/disable threaded mode for all napi
++		belonging to this device, without the need to do device up/down.
++
++		Possible values:
++		== ==================================
++		0  threaded mode disabled for this dev
++		1  threaded mode enabled for this dev
++		== ==================================
+diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
+index 4a78471bc3fe..afd6ed0d4601 100644
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -499,6 +499,8 @@ static inline bool napi_complete(struct napi_struct *n)
+ 	return napi_complete_done(n, 0);
+ }
+ 
++int dev_set_threaded(struct net_device *dev, bool threaded);
++
+ /**
+  *	napi_disable - prevent NAPI from scheduling
+  *	@n: NAPI context
+* Unmerged path net/core/dev.c
+diff --git a/net/core/net-sysfs.c b/net/core/net-sysfs.c
+index a8d95a6bb4de..564c5b2fbab2 100644
+--- a/net/core/net-sysfs.c
++++ b/net/core/net-sysfs.c
+@@ -542,6 +542,45 @@ static ssize_t phys_switch_id_show(struct device *dev,
+ }
+ static DEVICE_ATTR_RO(phys_switch_id);
+ 
++static ssize_t threaded_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct net_device *netdev = to_net_dev(dev);
++	ssize_t ret = -EINVAL;
++
++	if (!rtnl_trylock())
++		return restart_syscall();
++
++	if (dev_isalive(netdev))
++		ret = sprintf(buf, fmt_dec, netdev->threaded);
++
++	rtnl_unlock();
++	return ret;
++}
++
++static int modify_napi_threaded(struct net_device *dev, unsigned long val)
++{
++	int ret;
++
++	if (list_empty(&dev->napi_list))
++		return -EOPNOTSUPP;
++
++	if (val != 0 && val != 1)
++		return -EOPNOTSUPP;
++
++	ret = dev_set_threaded(dev, val);
++
++	return ret;
++}
++
++static ssize_t threaded_store(struct device *dev,
++			      struct device_attribute *attr,
++			      const char *buf, size_t len)
++{
++	return netdev_store(dev, attr, buf, len, modify_napi_threaded);
++}
++static DEVICE_ATTR_RW(threaded);
++
+ static struct attribute *net_class_attrs[] __ro_after_init = {
+ 	&dev_attr_netdev_group.attr,
+ 	&dev_attr_type.attr,
+@@ -574,6 +613,7 @@ static struct attribute *net_class_attrs[] __ro_after_init = {
+ 	&dev_attr_proto_down.attr,
+ 	&dev_attr_carrier_up_count.attr,
+ 	&dev_attr_carrier_down_count.attr,
++	&dev_attr_threaded.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(net_class);
