@@ -1,0 +1,136 @@
+mm: factor out a devm_request_free_mem_region helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 0092908d16c604b8207c2141ec64b0fa4473bb03
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0092908d.failed
+
+Keep the physical address allocation that hmm_add_device does with the
+rest of the resource code, and allow future reuse of it without the hmm
+wrapper.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 0092908d16c604b8207c2141ec64b0fa4473bb03)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index d619765bfdc2,48574f8485bb..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -1045,36 -1427,10 +1042,43 @@@ struct hmm_devmem *hmm_devmem_add(cons
+  	if (ret)
+  		return ERR_PTR(ret);
+  
+++<<<<<<< HEAD
+ +	ret = devm_add_action_or_reset(device, hmm_devmem_ref_exit, &devmem->ref);
+ +	if (ret)
+ +		return ERR_PTR(ret);
+ +
+ +	size = ALIGN(size, PA_SECTION_SIZE);
+ +	addr = min((unsigned long)iomem_resource.end,
+ +		   (1UL << MAX_PHYSMEM_BITS) - 1);
+ +	addr = addr - size + 1UL;
+ +
+ +	/*
+ +	 * FIXME add a new helper to quickly walk resource tree and find free
+ +	 * range
+ +	 *
+ +	 * FIXME what about ioport_resource resource ?
+ +	 */
+ +	for (; addr > size && addr >= iomem_resource.start; addr -= size) {
+ +		ret = region_intersects(addr, size, 0, IORES_DESC_NONE);
+ +		if (ret != REGION_DISJOINT)
+ +			continue;
+ +
+ +		devmem->resource = devm_request_mem_region(device, addr, size,
+ +							   dev_name(device));
+ +		if (!devmem->resource)
+ +			return ERR_PTR(-ENOMEM);
+ +		break;
+ +	}
+ +	if (!devmem->resource)
+ +		return ERR_PTR(-ERANGE);
+ +
+ +	devmem->resource->desc = IORES_DESC_DEVICE_PRIVATE_MEMORY;
+++=======
++ 	devmem->resource = devm_request_free_mem_region(device, &iomem_resource,
++ 			size);
++ 	if (IS_ERR(devmem->resource))
++ 		return ERR_CAST(devmem->resource);
+++>>>>>>> 0092908d16c6 (mm: factor out a devm_request_free_mem_region helper)
+  	devmem->pfn_first = devmem->resource->start >> PAGE_SHIFT;
+  	devmem->pfn_last = devmem->pfn_first +
+  			   (resource_size(devmem->resource) >> PAGE_SHIFT);
+diff --git a/include/linux/ioport.h b/include/linux/ioport.h
+index d61a807f81e5..2681381f6032 100644
+--- a/include/linux/ioport.h
++++ b/include/linux/ioport.h
+@@ -302,6 +302,8 @@ static inline bool resource_overlaps(struct resource *r1, struct resource *r2)
+        return (r1->start <= r2->end && r1->end >= r2->start);
+ }
+ 
++struct resource *devm_request_free_mem_region(struct device *dev,
++		struct resource *base, unsigned long size);
+ 
+ #endif /* __ASSEMBLY__ */
+ #endif	/* _LINUX_IOPORT_H */
+diff --git a/kernel/resource.c b/kernel/resource.c
+index d3cf60f2e333..1cbf0f118d61 100644
+--- a/kernel/resource.c
++++ b/kernel/resource.c
+@@ -1599,6 +1599,45 @@ void resource_list_free(struct list_head *head)
+ }
+ EXPORT_SYMBOL(resource_list_free);
+ 
++#ifdef CONFIG_DEVICE_PRIVATE
++/**
++ * devm_request_free_mem_region - find free region for device private memory
++ *
++ * @dev: device struct to bind the resource to
++ * @size: size in bytes of the device memory to add
++ * @base: resource tree to look in
++ *
++ * This function tries to find an empty range of physical address big enough to
++ * contain the new resource, so that it can later be hotplugged as ZONE_DEVICE
++ * memory, which in turn allocates struct pages.
++ */
++struct resource *devm_request_free_mem_region(struct device *dev,
++		struct resource *base, unsigned long size)
++{
++	resource_size_t end, addr;
++	struct resource *res;
++
++	size = ALIGN(size, 1UL << PA_SECTION_SHIFT);
++	end = min_t(unsigned long, base->end, (1UL << MAX_PHYSMEM_BITS) - 1);
++	addr = end - size + 1UL;
++
++	for (; addr > size && addr >= base->start; addr -= size) {
++		if (region_intersects(addr, size, 0, IORES_DESC_NONE) !=
++				REGION_DISJOINT)
++			continue;
++
++		res = devm_request_mem_region(dev, addr, size, dev_name(dev));
++		if (!res)
++			return ERR_PTR(-ENOMEM);
++		res->desc = IORES_DESC_DEVICE_PRIVATE_MEMORY;
++		return res;
++	}
++
++	return ERR_PTR(-ERANGE);
++}
++EXPORT_SYMBOL_GPL(devm_request_free_mem_region);
++#endif /* CONFIG_DEVICE_PRIVATE */
++
+ static int __init strict_iomem(char *str)
+ {
+ 	if (strstr(str, "relaxed"))
+* Unmerged path mm/hmm.c
