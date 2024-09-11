@@ -1,0 +1,155 @@
+null_blk: create a helper for zoned devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+commit fceb5d1b19cbe6263f09dbe8e8138edf02eb6e6b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/fceb5d1b.failed
+
+This patch creates a helper function for handling zoned block device
+operations.
+
+This patch also restructured the code for null_blk_zoned.c and uses the
+pattern to return blk_status_t and catch the error in the function
+null_handle_cmd() into cmd->error variable instead of setting it up in
+the deeper layer just like the way it is done for flush, badblocks and
+memory backed case in the null_handle_cmd(). We also move
+null_handle_zoned() to the null_blk_zoned.c to keep the zoned code
+separate.
+
+	Signed-off-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fceb5d1b19cbe6263f09dbe8e8138edf02eb6e6b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/block/null_blk.h
+diff --cc drivers/block/null_blk.h
+index 34b22d6523ba,4895c02e0c65..000000000000
+--- a/drivers/block/null_blk.h
++++ b/drivers/block/null_blk.h
+@@@ -89,11 -89,10 +89,18 @@@ struct nullb 
+  int null_zone_init(struct nullb_device *dev);
+  void null_zone_exit(struct nullb_device *dev);
+  int null_zone_report(struct gendisk *disk, sector_t sector,
+++<<<<<<< HEAD
+ +		     struct blk_zone *zones, unsigned int *nr_zones,
+ +		     gfp_t gfp_mask);
+ +void null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ +			unsigned int nr_sectors);
+ +void null_zone_reset(struct nullb_cmd *cmd, sector_t sector);
+++=======
++ 		     struct blk_zone *zones, unsigned int *nr_zones);
++ inline blk_status_t null_handle_zoned(struct nullb_cmd *cmd,
++ 				      enum req_opf op, sector_t sector,
++ 				      sector_t nr_sectors);
+++>>>>>>> fceb5d1b19cb (null_blk: create a helper for zoned devices)
+  #else
+  static inline int null_zone_init(struct nullb_device *dev)
+  {
+* Unmerged path drivers/block/null_blk.h
+diff --git a/drivers/block/null_blk_main.c b/drivers/block/null_blk_main.c
+index 0343c91111b0..a6beab5cdc31 100644
+--- a/drivers/block/null_blk_main.c
++++ b/drivers/block/null_blk_main.c
+@@ -1208,14 +1208,9 @@ static blk_status_t null_handle_cmd(struct nullb_cmd *cmd, sector_t sector,
+ 	if (dev->memory_backed)
+ 		cmd->error = null_handle_memory_backed(cmd, op);
+ 
+-	if (!cmd->error && dev->zoned) {
+-		if (op == REQ_OP_WRITE)
+-			null_zone_write(cmd, sector, nr_sectors);
+-		else if (op == REQ_OP_ZONE_RESET)
+-			null_zone_reset(cmd, sector);
+-		else if (op == REQ_OP_ZONE_RESET_ALL)
+-			null_zone_reset(cmd, 0);
+-	}
++	if (!cmd->error && dev->zoned)
++		cmd->error = null_handle_zoned(cmd, op, sector, nr_sectors);
++
+ out:
+ 	/* Complete IO by inline, softirq or timer */
+ 	switch (dev->irqmode) {
+diff --git a/drivers/block/null_blk_zoned.c b/drivers/block/null_blk_zoned.c
+index b703eec0cc7e..f105ee84c9ce 100644
+--- a/drivers/block/null_blk_zoned.c
++++ b/drivers/block/null_blk_zoned.c
+@@ -85,7 +85,7 @@ int null_zone_report(struct gendisk *disk, sector_t sector,
+ 	return 0;
+ }
+ 
+-void null_zone_write(struct nullb_cmd *cmd, sector_t sector,
++static blk_status_t null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ 		     unsigned int nr_sectors)
+ {
+ 	struct nullb_device *dev = cmd->nq->dev;
+@@ -96,14 +96,12 @@ void null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ 	case BLK_ZONE_COND_FULL:
+ 		/* Cannot write to a full zone */
+ 		cmd->error = BLK_STS_IOERR;
+-		break;
++		return BLK_STS_IOERR;
+ 	case BLK_ZONE_COND_EMPTY:
+ 	case BLK_ZONE_COND_IMP_OPEN:
+ 		/* Writes must be at the write pointer position */
+-		if (sector != zone->wp) {
+-			cmd->error = BLK_STS_IOERR;
+-			break;
+-		}
++		if (sector != zone->wp)
++			return BLK_STS_IOERR;
+ 
+ 		if (zone->cond == BLK_ZONE_COND_EMPTY)
+ 			zone->cond = BLK_ZONE_COND_IMP_OPEN;
+@@ -116,12 +114,12 @@ void null_zone_write(struct nullb_cmd *cmd, sector_t sector,
+ 		break;
+ 	default:
+ 		/* Invalid zone condition */
+-		cmd->error = BLK_STS_IOERR;
+-		break;
++		return BLK_STS_IOERR;
+ 	}
++	return BLK_STS_OK;
+ }
+ 
+-void null_zone_reset(struct nullb_cmd *cmd, sector_t sector)
++static blk_status_t null_zone_reset(struct nullb_cmd *cmd, sector_t sector)
+ {
+ 	struct nullb_device *dev = cmd->nq->dev;
+ 	unsigned int zno = null_zone_no(dev, sector);
+@@ -138,10 +136,8 @@ void null_zone_reset(struct nullb_cmd *cmd, sector_t sector)
+ 		}
+ 		break;
+ 	case REQ_OP_ZONE_RESET:
+-		if (zone->type == BLK_ZONE_TYPE_CONVENTIONAL) {
+-			cmd->error = BLK_STS_IOERR;
+-			return;
+-		}
++		if (zone->type == BLK_ZONE_TYPE_CONVENTIONAL)
++			return BLK_STS_IOERR;
+ 
+ 		zone->cond = BLK_ZONE_COND_EMPTY;
+ 		zone->wp = zone->start;
+@@ -150,4 +146,20 @@ void null_zone_reset(struct nullb_cmd *cmd, sector_t sector)
+ 		cmd->error = BLK_STS_NOTSUPP;
+ 		break;
+ 	}
++	return BLK_STS_OK;
++}
++
++inline blk_status_t null_handle_zoned(struct nullb_cmd *cmd,
++				       enum req_opf op, sector_t sector,
++				       sector_t nr_sectors)
++{
++	switch (op) {
++	case REQ_OP_WRITE:
++		return null_zone_write(cmd, sector, nr_sectors);
++	case REQ_OP_ZONE_RESET:
++	case REQ_OP_ZONE_RESET_ALL:
++		return null_zone_reset(cmd, sector);
++	default:
++		return BLK_STS_OK;
++	}
+ }
