@@ -1,0 +1,185 @@
+signal: support CLONE_PIDFD with pidfd_send_signal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christian Brauner <christian@brauner.io>
+commit 2151ad1b067275730de1b38c7257478cae47d29e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2151ad1b.failed
+
+Let pidfd_send_signal() use pidfds retrieved via CLONE_PIDFD.  With this
+patch pidfd_send_signal() becomes independent of procfs.  This fullfils
+the request made when we merged the pidfd_send_signal() patchset.  The
+pidfd_send_signal() syscall is now always available allowing for it to
+be used by users without procfs mounted or even users without procfs
+support compiled into the kernel.
+
+	Signed-off-by: Christian Brauner <christian@brauner.io>
+Co-developed-by: Jann Horn <jannh@google.com>
+	Signed-off-by: Jann Horn <jannh@google.com>
+	Acked-by: Oleg Nesterov <oleg@redhat.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: "Eric W. Biederman" <ebiederm@xmission.com>
+	Cc: Kees Cook <keescook@chromium.org>
+	Cc: Thomas Gleixner <tglx@linutronix.de>
+	Cc: David Howells <dhowells@redhat.com>
+	Cc: "Michael Kerrisk (man-pages)" <mtk.manpages@gmail.com>
+	Cc: Andy Lutomirsky <luto@kernel.org>
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Aleksa Sarai <cyphar@cyphar.com>
+	Cc: Linus Torvalds <torvalds@linux-foundation.org>
+	Cc: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 2151ad1b067275730de1b38c7257478cae47d29e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/signal.c
+#	kernel/sys_ni.c
+diff --cc kernel/signal.c
+index 0770041a0f5a,1581140f2d99..000000000000
+--- a/kernel/signal.c
++++ b/kernel/signal.c
+@@@ -3543,6 -3513,121 +3543,124 @@@ SYSCALL_DEFINE2(kill, pid_t, pid, int, 
+  	return kill_something_info(sig, &info, pid);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Verify that the signaler and signalee either are in the same pid namespace
++  * or that the signaler's pid namespace is an ancestor of the signalee's pid
++  * namespace.
++  */
++ static bool access_pidfd_pidns(struct pid *pid)
++ {
++ 	struct pid_namespace *active = task_active_pid_ns(current);
++ 	struct pid_namespace *p = ns_of_pid(pid);
++ 
++ 	for (;;) {
++ 		if (!p)
++ 			return false;
++ 		if (p == active)
++ 			break;
++ 		p = p->parent;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int copy_siginfo_from_user_any(kernel_siginfo_t *kinfo, siginfo_t *info)
++ {
++ #ifdef CONFIG_COMPAT
++ 	/*
++ 	 * Avoid hooking up compat syscalls and instead handle necessary
++ 	 * conversions here. Note, this is a stop-gap measure and should not be
++ 	 * considered a generic solution.
++ 	 */
++ 	if (in_compat_syscall())
++ 		return copy_siginfo_from_user32(
++ 			kinfo, (struct compat_siginfo __user *)info);
++ #endif
++ 	return copy_siginfo_from_user(kinfo, info);
++ }
++ 
++ static struct pid *pidfd_to_pid(const struct file *file)
++ {
++ 	if (file->f_op == &pidfd_fops)
++ 		return file->private_data;
++ 
++ 	return tgid_pidfd_to_pid(file);
++ }
++ 
++ /**
++  * sys_pidfd_send_signal - send a signal to a process through a task file
++  *                          descriptor
++  * @pidfd:  the file descriptor of the process
++  * @sig:    signal to be sent
++  * @info:   the signal info
++  * @flags:  future flags to be passed
++  *
++  * The syscall currently only signals via PIDTYPE_PID which covers
++  * kill(<positive-pid>, <signal>. It does not signal threads or process
++  * groups.
++  * In order to extend the syscall to threads and process groups the @flags
++  * argument should be used. In essence, the @flags argument will determine
++  * what is signaled and not the file descriptor itself. Put in other words,
++  * grouping is a property of the flags argument not a property of the file
++  * descriptor.
++  *
++  * Return: 0 on success, negative errno on failure
++  */
++ SYSCALL_DEFINE4(pidfd_send_signal, int, pidfd, int, sig,
++ 		siginfo_t __user *, info, unsigned int, flags)
++ {
++ 	int ret;
++ 	struct fd f;
++ 	struct pid *pid;
++ 	kernel_siginfo_t kinfo;
++ 
++ 	/* Enforce flags be set to 0 until we add an extension. */
++ 	if (flags)
++ 		return -EINVAL;
++ 
++ 	f = fdget_raw(pidfd);
++ 	if (!f.file)
++ 		return -EBADF;
++ 
++ 	/* Is this a pidfd? */
++ 	pid = pidfd_to_pid(f.file);
++ 	if (IS_ERR(pid)) {
++ 		ret = PTR_ERR(pid);
++ 		goto err;
++ 	}
++ 
++ 	ret = -EINVAL;
++ 	if (!access_pidfd_pidns(pid))
++ 		goto err;
++ 
++ 	if (info) {
++ 		ret = copy_siginfo_from_user_any(&kinfo, info);
++ 		if (unlikely(ret))
++ 			goto err;
++ 
++ 		ret = -EINVAL;
++ 		if (unlikely(sig != kinfo.si_signo))
++ 			goto err;
++ 
++ 		/* Only allow sending arbitrary signals to yourself. */
++ 		ret = -EPERM;
++ 		if ((task_pid(current) != pid) &&
++ 		    (kinfo.si_code >= 0 || kinfo.si_code == SI_TKILL))
++ 			goto err;
++ 	} else {
++ 		prepare_kill_siginfo(sig, &kinfo);
++ 	}
++ 
++ 	ret = kill_pid_info(sig, &kinfo, pid);
++ 
++ err:
++ 	fdput(f);
++ 	return ret;
++ }
++ 
+++>>>>>>> 2151ad1b0672 (signal: support CLONE_PIDFD with pidfd_send_signal)
+  static int
+  do_send_specific(pid_t tgid, pid_t pid, int sig, struct kernel_siginfo *info)
+  {
+diff --cc kernel/sys_ni.c
+index 8cfc5dd43bf0,4d9ae5ea6caf..000000000000
+--- a/kernel/sys_ni.c
++++ b/kernel/sys_ni.c
+@@@ -165,8 -167,6 +165,11 @@@ COND_SYSCALL(syslog)
+  
+  /* kernel/sched/core.c */
+  
+++<<<<<<< HEAD
+ +/* kernel/signal.c */
+ +
+++=======
+++>>>>>>> 2151ad1b0672 (signal: support CLONE_PIDFD with pidfd_send_signal)
+  /* kernel/sys.c */
+  COND_SYSCALL(setregid);
+  COND_SYSCALL(setgid);
+* Unmerged path kernel/signal.c
+* Unmerged path kernel/sys_ni.c
