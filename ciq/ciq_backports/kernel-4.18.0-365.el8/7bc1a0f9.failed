@@ -1,0 +1,145 @@
+arm64: mm: use single quantity to represent the PA to VA translation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 7bc1a0f9e1765830e945669c99c59c35cf9bca82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/7bc1a0f9.failed
+
+On arm64, the global variable memstart_addr represents the physical
+address of PAGE_OFFSET, and so physical to virtual translations or
+vice versa used to come down to simple additions or subtractions
+involving the values of PAGE_OFFSET and memstart_addr.
+
+When support for 52-bit virtual addressing was introduced, we had to
+deal with PAGE_OFFSET potentially being outside of the region that
+can be covered by the virtual range (as the 52-bit VA capable build
+needs to be able to run on systems that are only 48-bit VA capable),
+and for this reason, another translation was introduced, and recorded
+in the global variable physvirt_offset.
+
+However, if we go back to the original definition of memstart_addr,
+i.e., the physical address of PAGE_OFFSET, it turns out that there is
+no need for two separate translations: instead, we can simply subtract
+the size of the unaddressable VA space from memstart_addr to make the
+available physical memory appear in the 48-bit addressable VA region.
+
+This simplifies things, but also fixes a bug on KASLR builds, which
+may update memstart_addr later on in arm64_memblock_init(), but fails
+to update vmemmap and physvirt_offset accordingly.
+
+Fixes: 5383cc6efed1 ("arm64: mm: Introduce vabits_actual")
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Reviewed-by: Steve Capper <steve.capper@arm.com>
+Link: https://lore.kernel.org/r/20201008153602.9467-2-ardb@kernel.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 7bc1a0f9e1765830e945669c99c59c35cf9bca82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/memory.h
+#	arch/arm64/include/asm/pgtable.h
+#	arch/arm64/mm/init.c
+diff --cc arch/arm64/include/asm/memory.h
+index 630eaf618e50,cd61239bae8c..000000000000
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@@ -194,8 -161,14 +194,14 @@@
+  #ifndef __ASSEMBLY__
+  
+  #include <linux/bitops.h>
+ -#include <linux/compiler.h>
+  #include <linux/mmdebug.h>
+ -#include <linux/types.h>
+ -#include <asm/bug.h>
+  
+++<<<<<<< HEAD
+++=======
++ extern u64			vabits_actual;
++ #define PAGE_END		(_PAGE_END(vabits_actual))
++ 
+++>>>>>>> 7bc1a0f9e176 (arm64: mm: use single quantity to represent the PA to VA translation)
+  extern s64			memstart_addr;
+  /* PHYS_OFFSET - the physical address of the start of memory. */
+  #define PHYS_OFFSET		({ VM_BUG_ON(memstart_addr & 1); memstart_addr; })
+diff --cc arch/arm64/include/asm/pgtable.h
+index d4a2e93735be,4ff12a7adcfd..000000000000
+--- a/arch/arm64/include/asm/pgtable.h
++++ b/arch/arm64/include/asm/pgtable.h
+@@@ -46,10 -36,23 +46,30 @@@
+  #include <linux/mm_types.h>
+  #include <linux/sched.h>
+  
+++<<<<<<< HEAD
+ +extern void __pte_error(const char *file, int line, unsigned long val);
+ +extern void __pmd_error(const char *file, int line, unsigned long val);
+ +extern void __pud_error(const char *file, int line, unsigned long val);
+ +extern void __pgd_error(const char *file, int line, unsigned long val);
+++=======
++ #ifdef CONFIG_TRANSPARENT_HUGEPAGE
++ #define __HAVE_ARCH_FLUSH_PMD_TLB_RANGE
++ 
++ /* Set stride and tlb_level in flush_*_tlb_range */
++ #define flush_pmd_tlb_range(vma, addr, end)	\
++ 	__flush_tlb_range(vma, addr, end, PMD_SIZE, false, 2)
++ #define flush_pud_tlb_range(vma, addr, end)	\
++ 	__flush_tlb_range(vma, addr, end, PUD_SIZE, false, 1)
++ #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
++ 
++ /*
++  * Outside of a few very special situations (e.g. hibernation), we always
++  * use broadcast TLB invalidation instructions, therefore a spurious page
++  * fault on one CPU which has been handled concurrently by another CPU
++  * does not need to perform additional invalidation.
++  */
++ #define flush_tlb_fix_spurious_fault(vma, address) do { } while (0)
+++>>>>>>> 7bc1a0f9e176 (arm64: mm: use single quantity to represent the PA to VA translation)
+  
+  /*
+   * ZERO_PAGE is a global shared page that is always zero: used
+diff --cc arch/arm64/mm/init.c
+index 49bc8730c5b8,324f0e0894f6..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -61,25 -54,14 +61,36 @@@
+  s64 memstart_addr __ro_after_init = -1;
+  EXPORT_SYMBOL(memstart_addr);
+  
+++<<<<<<< HEAD
+ +phys_addr_t arm64_dma32_phys_limit __ro_after_init;
+ +
+ +#ifdef CONFIG_BLK_DEV_INITRD
+ +static int __init early_initrd(char *p)
+ +{
+ +	unsigned long start, size;
+ +	char *endp;
+ +
+ +	start = memparse(p, &endp);
+ +	if (*endp == ',') {
+ +		size = memparse(endp + 1, NULL);
+ +
+ +		initrd_start = start;
+ +		initrd_end = start + size;
+ +	}
+ +	return 0;
+ +}
+ +early_param("initrd", early_initrd);
+ +#endif
+++=======
++ /*
++  * We create both ZONE_DMA and ZONE_DMA32. ZONE_DMA covers the first 1G of
++  * memory as some devices, namely the Raspberry Pi 4, have peripherals with
++  * this limited view of the memory. ZONE_DMA32 will cover the rest of the 32
++  * bit addressable memory area.
++  */
++ phys_addr_t arm64_dma_phys_limit __ro_after_init;
++ static phys_addr_t arm64_dma32_phys_limit __ro_after_init;
+++>>>>>>> 7bc1a0f9e176 (arm64: mm: use single quantity to represent the PA to VA translation)
+  
+  #ifdef CONFIG_KEXEC_CORE
+  /*
+* Unmerged path arch/arm64/include/asm/memory.h
+* Unmerged path arch/arm64/include/asm/pgtable.h
+* Unmerged path arch/arm64/mm/init.c
