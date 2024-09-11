@@ -1,0 +1,143 @@
+NFSv4.2: query the server for extended attribute support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Frank van der Linden <fllinden@amazon.com>
+commit b78ef845c35dbae25e57b598901a65b13d940c81
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/b78ef845.failed
+
+Query the server for extended attribute support, and record it
+as the NFS_CAP_XATTR flag in the server capabilities.
+
+	Signed-off-by: Frank van der Linden <fllinden@amazon.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit b78ef845c35dbae25e57b598901a65b13d940c81)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/client.c
+#	include/linux/nfs_fs_sb.h
+diff --cc fs/nfs/client.c
+index 1c6787d82fc3,4b8cc93913f7..000000000000
+--- a/fs/nfs/client.c
++++ b/fs/nfs/client.c
+@@@ -795,6 -798,21 +795,24 @@@ static void nfs_server_set_fsinfo(struc
+  	server->clone_blksize = fsinfo->clone_blksize;
+  	/* We're airborne Set socket buffersize */
+  	rpc_setbufsize(server->client, server->wsize + 100, server->rsize + 100);
+++<<<<<<< HEAD
+++=======
++ 
++ #ifdef CONFIG_NFS_V4_2
++ 	/*
++ 	 * Defaults until limited by the session parameters.
++ 	 */
++ 	server->gxasize = min_t(unsigned int, raw_max_rpc_payload,
++ 				XATTR_SIZE_MAX);
++ 	server->sxasize = min_t(unsigned int, raw_max_rpc_payload,
++ 				XATTR_SIZE_MAX);
++ 	server->lxasize = min_t(unsigned int, raw_max_rpc_payload,
++ 				nfs42_listxattr_xdrsize(XATTR_LIST_MAX));
++ 
++ 	if (fsinfo->xattr_support)
++ 		server->caps |= NFS_CAP_XATTR;
++ #endif
+++>>>>>>> b78ef845c35d (NFSv4.2: query the server for extended attribute support)
+  }
+  
+  /*
+diff --cc include/linux/nfs_fs_sb.h
+index df61ff8981e8,7eae72a8762e..000000000000
+--- a/include/linux/nfs_fs_sb.h
++++ b/include/linux/nfs_fs_sb.h
+@@@ -279,5 -285,7 +279,10 @@@ struct nfs_server 
+  #define NFS_CAP_COPY		(1U << 24)
+  #define NFS_CAP_OFFLOAD_CANCEL	(1U << 25)
+  #define NFS_CAP_LAYOUTERROR	(1U << 26)
+++<<<<<<< HEAD
+++=======
++ #define NFS_CAP_COPY_NOTIFY	(1U << 27)
++ #define NFS_CAP_XATTR		(1U << 28)
+++>>>>>>> b78ef845c35d (NFSv4.2: query the server for extended attribute support)
+  
+  #endif
+* Unmerged path fs/nfs/client.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 80363f387640..eff571dcb091 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -257,6 +257,7 @@ const u32 nfs4_fsinfo_bitmap[3] = { FATTR4_WORD0_MAXFILESIZE
+ 			| FATTR4_WORD1_FS_LAYOUT_TYPES,
+ 			FATTR4_WORD2_LAYOUT_BLKSIZE
+ 			| FATTR4_WORD2_CLONE_BLKSIZE
++			| FATTR4_WORD2_XATTR_SUPPORT
+ };
+ 
+ const u32 nfs4_fs_locations_bitmap[3] = {
+@@ -3673,7 +3674,7 @@ static void nfs4_close_context(struct nfs_open_context *ctx, int is_sync)
+ 
+ #define FATTR4_WORD1_NFS40_MASK (2*FATTR4_WORD1_MOUNTED_ON_FILEID - 1UL)
+ #define FATTR4_WORD2_NFS41_MASK (2*FATTR4_WORD2_SUPPATTR_EXCLCREAT - 1UL)
+-#define FATTR4_WORD2_NFS42_MASK (2*FATTR4_WORD2_MODE_UMASK - 1UL)
++#define FATTR4_WORD2_NFS42_MASK (2*FATTR4_WORD2_XATTR_SUPPORT - 1UL)
+ 
+ static int _nfs4_server_capabilities(struct nfs_server *server, struct nfs_fh *fhandle)
+ {
+diff --git a/fs/nfs/nfs4xdr.c b/fs/nfs/nfs4xdr.c
+index f96377691326..99d98ab1aa4a 100644
+--- a/fs/nfs/nfs4xdr.c
++++ b/fs/nfs/nfs4xdr.c
+@@ -4205,6 +4205,26 @@ static int decode_attr_time_modify(struct xdr_stream *xdr, uint32_t *bitmap, str
+ 	return status;
+ }
+ 
++static int decode_attr_xattrsupport(struct xdr_stream *xdr, uint32_t *bitmap,
++				    uint32_t *res)
++{
++	__be32 *p;
++
++	*res = 0;
++	if (unlikely(bitmap[2] & (FATTR4_WORD2_XATTR_SUPPORT - 1U)))
++		return -EIO;
++	if (likely(bitmap[2] & FATTR4_WORD2_XATTR_SUPPORT)) {
++		p = xdr_inline_decode(xdr, 4);
++		if (unlikely(!p))
++			return -EIO;
++		*res = be32_to_cpup(p);
++		bitmap[2] &= ~FATTR4_WORD2_XATTR_SUPPORT;
++	}
++	dprintk("%s: XATTR support=%s\n", __func__,
++		*res == 0 ? "false" : "true");
++	return 0;
++}
++
+ static int verify_attr_len(struct xdr_stream *xdr, unsigned int savep, uint32_t attrlen)
+ {
+ 	unsigned int attrwords = XDR_QUADLEN(attrlen);
+@@ -4859,6 +4879,11 @@ static int decode_fsinfo(struct xdr_stream *xdr, struct nfs_fsinfo *fsinfo)
+ 	if (status)
+ 		goto xdr_error;
+ 
++	status = decode_attr_xattrsupport(xdr, bitmap,
++					  &fsinfo->xattr_support);
++	if (status)
++		goto xdr_error;
++
+ 	status = verify_attr_len(xdr, savep, attrlen);
+ xdr_error:
+ 	dprintk("%s: xdr returned %d!\n", __func__, -status);
+* Unmerged path include/linux/nfs_fs_sb.h
+diff --git a/include/linux/nfs_xdr.h b/include/linux/nfs_xdr.h
+index d33860bd0e9e..35c12a0f18b4 100644
+--- a/include/linux/nfs_xdr.h
++++ b/include/linux/nfs_xdr.h
+@@ -150,6 +150,7 @@ struct nfs_fsinfo {
+ 	__u32			layouttype[NFS_MAX_LAYOUT_TYPES]; /* supported pnfs layout driver */
+ 	__u32			blksize; /* preferred pnfs io block size */
+ 	__u32			clone_blksize; /* granularity of a CLONE operation */
++	__u32			xattr_support; /* User xattrs supported */
+ };
+ 
+ struct nfs_fsstat {
