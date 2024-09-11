@@ -1,0 +1,399 @@
+RDMA/bnxt_re: Refactor command queue management code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Devesh Sharma <devesh.sharma@broadcom.com>
+commit cee0c7bba4869170fd471758053406784eba35a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/cee0c7bb.failed
+
+Refactoring the command queue (rcfw) management code. A new data-structure
+is introduced to describe the bar register.  each object which deals with
+mmio space should have a descriptor structure. This structure specifically
+hold DB register information.  Thus, slow path creq structure now hold a
+bar register descriptor.
+
+Further cleanup the rcfw structure to introduce the command queue context
+and command response event queue context structures. Rest of the rcfw
+related code has been touched to incorporate these three structures.
+
+Link: https://lore.kernel.org/r/1581786665-23705-6-git-send-email-devesh.sharma@broadcom.com
+	Signed-off-by: Naresh Kumar PBS <nareshkumar.pbs@broadcom.com>
+	Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Signed-off-by: Devesh Sharma <devesh.sharma@broadcom.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit cee0c7bba4869170fd471758053406784eba35a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+diff --cc drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+index c6b6e8363eb8,119113ecfb64..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+@@@ -696,71 -735,127 +735,164 @@@ int bnxt_qplib_rcfw_start_irq(struct bn
+  	return 0;
+  }
+  
+- int bnxt_qplib_enable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw,
+- 				   int msix_vector,
+- 				   int cp_bar_reg_off, int virt_fn,
+- 				   int (*aeq_handler)(struct bnxt_qplib_rcfw *,
+- 						      void *, void *))
++ static int bnxt_qplib_map_cmdq_mbox(struct bnxt_qplib_rcfw *rcfw, bool is_vf)
+  {
+- 	resource_size_t res_base;
+- 	struct cmdq_init init;
++ 	struct bnxt_qplib_cmdq_mbox *mbox;
++ 	resource_size_t bar_reg;
+  	struct pci_dev *pdev;
+- 	u16 bmap_size;
+- 	int rc;
++ 	u16 prod_offt;
++ 	int rc = 0;
+  
+- 	/* General */
+  	pdev = rcfw->pdev;
+- 	rcfw->seq_num = 0;
+- 	set_bit(FIRMWARE_FIRST_FLAG, &rcfw->flags);
+- 	bmap_size = BITS_TO_LONGS(rcfw->cmdq_depth) * sizeof(unsigned long);
+- 	rcfw->cmdq_bitmap = kzalloc(bmap_size, GFP_KERNEL);
+- 	if (!rcfw->cmdq_bitmap)
++ 	mbox = &rcfw->cmdq.cmdq_mbox;
++ 
++ 	mbox->reg.bar_id = RCFW_COMM_PCI_BAR_REGION;
++ 	mbox->reg.len = RCFW_COMM_SIZE;
++ 	mbox->reg.bar_base = pci_resource_start(pdev, mbox->reg.bar_id);
++ 	if (!mbox->reg.bar_base) {
++ 		dev_err(&pdev->dev,
++ 			"QPLIB: CMDQ BAR region %d resc start is 0!\n",
++ 			mbox->reg.bar_id);
+  		return -ENOMEM;
+- 	rcfw->bmap_size = bmap_size;
++ 	}
+  
+- 	/* CMDQ */
+- 	rcfw->cmdq_bar_reg = RCFW_COMM_PCI_BAR_REGION;
+- 	res_base = pci_resource_start(pdev, rcfw->cmdq_bar_reg);
+- 	if (!res_base)
++ 	bar_reg = mbox->reg.bar_base + RCFW_COMM_BASE_OFFSET;
++ 	mbox->reg.len = RCFW_COMM_SIZE;
++ 	mbox->reg.bar_reg = ioremap(bar_reg, mbox->reg.len);
++ 	if (!mbox->reg.bar_reg) {
++ 		dev_err(&pdev->dev,
++ 			"QPLIB: CMDQ BAR region %d mapping failed\n",
++ 			mbox->reg.bar_id);
+  		return -ENOMEM;
++ 	}
++ 
++ 	prod_offt = is_vf ? RCFW_VF_COMM_PROD_OFFSET :
++ 			    RCFW_PF_COMM_PROD_OFFSET;
++ 	mbox->prod = (void  __iomem *)(mbox->reg.bar_reg + prod_offt);
++ 	mbox->db = (void __iomem *)(mbox->reg.bar_reg + RCFW_COMM_TRIG_OFFSET);
++ 	return rc;
++ }
++ 
++ static int bnxt_qplib_map_creq_db(struct bnxt_qplib_rcfw *rcfw, u32 reg_offt)
++ {
++ 	struct bnxt_qplib_creq_db *creq_db;
++ 	resource_size_t bar_reg;
++ 	struct pci_dev *pdev;
++ 
++ 	pdev = rcfw->pdev;
++ 	creq_db = &rcfw->creq.creq_db;
+  
++ 	creq_db->reg.bar_id = RCFW_COMM_CONS_PCI_BAR_REGION;
++ 	creq_db->reg.bar_base = pci_resource_start(pdev, creq_db->reg.bar_id);
++ 	if (!creq_db->reg.bar_id)
++ 		dev_err(&pdev->dev,
++ 			"QPLIB: CREQ BAR region %d resc start is 0!",
++ 			creq_db->reg.bar_id);
++ 
++ 	bar_reg = creq_db->reg.bar_base + reg_offt;
++ 	/* Unconditionally map 8 bytes to support 57500 series */
++ 	creq_db->reg.len = 8;
++ 	creq_db->reg.bar_reg = ioremap(bar_reg, creq_db->reg.len);
++ 	if (!creq_db->reg.bar_reg) {
++ 		dev_err(&pdev->dev,
++ 			"QPLIB: CREQ BAR region %d mapping failed",
++ 			creq_db->reg.bar_id);
++ 		return -ENOMEM;
++ 	}
++ 	creq_db->db = creq_db->reg.bar_reg;
++ 	return 0;
++ }
++ 
++ static void bnxt_qplib_start_rcfw(struct bnxt_qplib_rcfw *rcfw)
++ {
++ 	struct bnxt_qplib_cmdq_ctx *cmdq;
++ 	struct bnxt_qplib_creq_ctx *creq;
++ 	struct bnxt_qplib_cmdq_mbox *mbox;
++ 	struct cmdq_init init = {0};
++ 
++ 	cmdq = &rcfw->cmdq;
++ 	creq = &rcfw->creq;
++ 	mbox = &cmdq->cmdq_mbox;
++ 
++ 	init.cmdq_pbl = cpu_to_le64(cmdq->hwq.pbl[PBL_LVL_0].pg_map_arr[0]);
++ 	init.cmdq_size_cmdq_lvl =
++ 			cpu_to_le16(((rcfw->cmdq_depth <<
++ 				      CMDQ_INIT_CMDQ_SIZE_SFT) &
++ 				    CMDQ_INIT_CMDQ_SIZE_MASK) |
++ 				    ((cmdq->hwq.level <<
++ 				      CMDQ_INIT_CMDQ_LVL_SFT) &
++ 				    CMDQ_INIT_CMDQ_LVL_MASK));
++ 	init.creq_ring_id = cpu_to_le16(creq->ring_id);
++ 	/* Write to the Bono mailbox register */
++ 	__iowrite32_copy(mbox->reg.bar_reg, &init, sizeof(init) / 4);
++ }
++ 
++ int bnxt_qplib_enable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw,
++ 				   int msix_vector,
++ 				   int cp_bar_reg_off, int virt_fn,
++ 				   aeq_handler_t aeq_handler)
++ {
++ 	struct bnxt_qplib_cmdq_ctx *cmdq;
++ 	struct bnxt_qplib_creq_ctx *creq;
++ 	int rc;
++ 
++ 	cmdq = &rcfw->cmdq;
++ 	creq = &rcfw->creq;
++ 
++ 	/* Clear to defaults */
++ 
+++<<<<<<< HEAD
+ +	rcfw->cmdq_bar_reg_iomem = ioremap_nocache(res_base +
+ +					      RCFW_COMM_BASE_OFFSET,
+ +					      RCFW_COMM_SIZE);
+ +	if (!rcfw->cmdq_bar_reg_iomem) {
+ +		dev_err(&rcfw->pdev->dev, "CMDQ BAR region %d mapping failed\n",
+ +			rcfw->cmdq_bar_reg);
+ +		return -ENOMEM;
+ +	}
+++=======
++ 	cmdq->seq_num = 0;
++ 	set_bit(FIRMWARE_FIRST_FLAG, &cmdq->flags);
++ 	init_waitqueue_head(&cmdq->waitq);
+++>>>>>>> cee0c7bba486 (RDMA/bnxt_re: Refactor command queue management code)
+  
+- 	rcfw->cmdq_bar_reg_prod_off = virt_fn ? RCFW_VF_COMM_PROD_OFFSET :
+- 					RCFW_PF_COMM_PROD_OFFSET;
++ 	creq->stats.creq_qp_event_processed = 0;
++ 	creq->stats.creq_func_event_processed = 0;
++ 	creq->aeq_handler = aeq_handler;
+  
+- 	rcfw->cmdq_bar_reg_trig_off = RCFW_COMM_TRIG_OFFSET;
++ 	rc = bnxt_qplib_map_cmdq_mbox(rcfw, virt_fn);
++ 	if (rc)
++ 		return rc;
+  
+++<<<<<<< HEAD
+ +	/* CREQ */
+ +	rcfw->creq_bar_reg = RCFW_COMM_CONS_PCI_BAR_REGION;
+ +	res_base = pci_resource_start(pdev, rcfw->creq_bar_reg);
+ +	if (!res_base)
+ +		dev_err(&rcfw->pdev->dev,
+ +			"CREQ BAR region %d resc start is 0!\n",
+ +			rcfw->creq_bar_reg);
+ +	/* Unconditionally map 8 bytes to support 57500 series */
+ +	rcfw->creq_bar_reg_iomem = ioremap_nocache(res_base + cp_bar_reg_off,
+ +						   8);
+ +	if (!rcfw->creq_bar_reg_iomem) {
+ +		dev_err(&rcfw->pdev->dev, "CREQ BAR region %d mapping failed\n",
+ +			rcfw->creq_bar_reg);
+ +		iounmap(rcfw->cmdq_bar_reg_iomem);
+ +		rcfw->cmdq_bar_reg_iomem = NULL;
+ +		return -ENOMEM;
+ +	}
+ +	rcfw->creq_qp_event_processed = 0;
+ +	rcfw->creq_func_event_processed = 0;
+ +
+ +	if (aeq_handler)
+ +		rcfw->aeq_handler = aeq_handler;
+ +	init_waitqueue_head(&rcfw->waitq);
+++=======
++ 	rc = bnxt_qplib_map_creq_db(rcfw, cp_bar_reg_off);
++ 	if (rc)
++ 		return rc;
+++>>>>>>> cee0c7bba486 (RDMA/bnxt_re: Refactor command queue management code)
+  
+  	rc = bnxt_qplib_rcfw_start_irq(rcfw, msix_vector, true);
+  	if (rc) {
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 161346b6a3a8..391e8fd44a0c 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -1345,7 +1345,7 @@ static void bnxt_re_ib_unreg(struct bnxt_re_dev *rdev)
+ 		bnxt_qplib_free_ctx(&rdev->qplib_res, &rdev->qplib_ctx);
+ 		bnxt_qplib_disable_rcfw_channel(&rdev->rcfw);
+ 		type = bnxt_qplib_get_ring_type(rdev->chip_ctx);
+-		bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id, type);
++		bnxt_re_net_ring_free(rdev, rdev->rcfw.creq.ring_id, type);
+ 		bnxt_qplib_free_rcfw_channel(&rdev->rcfw);
+ 	}
+ 	if (test_and_clear_bit(BNXT_RE_FLAG_GOT_MSIX, &rdev->flags)) {
+@@ -1376,6 +1376,7 @@ static void bnxt_re_worker(struct work_struct *work)
+ 
+ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
+ {
++	struct bnxt_qplib_creq_ctx *creq;
+ 	struct bnxt_re_ring_attr rattr;
+ 	u32 db_offt;
+ 	bool locked;
+@@ -1428,13 +1429,14 @@ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
+ 	}
+ 
+ 	type = bnxt_qplib_get_ring_type(rdev->chip_ctx);
+-	rattr.dma_arr = rdev->rcfw.creq.pbl[PBL_LVL_0].pg_map_arr;
+-	rattr.pages = rdev->rcfw.creq.pbl[rdev->rcfw.creq.level].pg_count;
++	creq = &rdev->rcfw.creq;
++	rattr.dma_arr = creq->hwq.pbl[PBL_LVL_0].pg_map_arr;
++	rattr.pages = creq->hwq.pbl[creq->hwq.level].pg_count;
+ 	rattr.type = type;
+ 	rattr.mode = RING_ALLOC_REQ_INT_MODE_MSIX;
+ 	rattr.depth = BNXT_QPLIB_CREQE_MAX_CNT - 1;
+ 	rattr.lrid = rdev->msix_entries[BNXT_RE_AEQ_IDX].ring_idx;
+-	rc = bnxt_re_net_ring_alloc(rdev, &rattr, &rdev->rcfw.creq_ring_id);
++	rc = bnxt_re_net_ring_alloc(rdev, &rattr, &creq->ring_id);
+ 	if (rc) {
+ 		pr_err("Failed to allocate CREQ: %#x\n", rc);
+ 		goto free_rcfw;
+@@ -1528,7 +1530,7 @@ static int bnxt_re_ib_reg(struct bnxt_re_dev *rdev)
+ 	bnxt_qplib_disable_rcfw_channel(&rdev->rcfw);
+ free_ring:
+ 	type = bnxt_qplib_get_ring_type(rdev->chip_ctx);
+-	bnxt_re_net_ring_free(rdev, rdev->rcfw.creq_ring_id, type);
++	bnxt_re_net_ring_free(rdev, rdev->rcfw.creq.ring_id, type);
+ free_rcfw:
+ 	bnxt_qplib_free_rcfw_channel(&rdev->rcfw);
+ fail:
+* Unmerged path drivers/infiniband/hw/bnxt_re/qplib_rcfw.c
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+index ab1531c7e27f..1aff6d458ac5 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_rcfw.h
+@@ -206,8 +206,9 @@ static inline void bnxt_qplib_ring_creq_db(void __iomem *db, u32 raw_cons,
+ #define CREQ_ENTRY_POLL_BUDGET		0x100
+ 
+ /* HWQ */
++typedef int (*aeq_handler_t)(struct bnxt_qplib_rcfw *, void *, void *);
+ 
+-struct bnxt_qplib_crsq {
++struct bnxt_qplib_crsqe {
+ 	struct creq_qp_event	*resp;
+ 	u32			req_size;
+ };
+@@ -225,41 +226,53 @@ struct bnxt_qplib_qp_node {
+ 
+ #define BNXT_QPLIB_OOS_COUNT_MASK 0xFFFFFFFF
+ 
++#define FIRMWARE_INITIALIZED_FLAG	(0)
++#define FIRMWARE_FIRST_FLAG		(31)
++#define FIRMWARE_TIMED_OUT		(3)
++struct bnxt_qplib_cmdq_mbox {
++	struct bnxt_qplib_reg_desc	reg;
++	void __iomem			*prod;
++	void __iomem			*db;
++};
++
++struct bnxt_qplib_cmdq_ctx {
++	struct bnxt_qplib_hwq		hwq;
++	struct bnxt_qplib_cmdq_mbox	cmdq_mbox;
++	wait_queue_head_t		waitq;
++	unsigned long			flags;
++	unsigned long			*cmdq_bitmap;
++	u32				bmap_size;
++	u32				seq_num;
++};
++
++struct bnxt_qplib_creq_db {
++	struct bnxt_qplib_reg_desc	reg;
++	void __iomem			*db;
++};
++
++struct bnxt_qplib_creq_stat {
++	u64	creq_qp_event_processed;
++	u64	creq_func_event_processed;
++};
++
++struct bnxt_qplib_creq_ctx {
++	struct bnxt_qplib_hwq		hwq;
++	struct bnxt_qplib_creq_db	creq_db;
++	struct bnxt_qplib_creq_stat	stats;
++	struct tasklet_struct		creq_tasklet;
++	aeq_handler_t			aeq_handler;
++	u16				ring_id;
++	int				msix_vec;
++	bool				requested; /*irq handler installed */
++};
++
+ /* RCFW Communication Channels */
+ struct bnxt_qplib_rcfw {
+ 	struct pci_dev		*pdev;
+ 	struct bnxt_qplib_res	*res;
+-	int			vector;
+-	struct tasklet_struct	worker;
+-	bool			requested;
+-	unsigned long		*cmdq_bitmap;
+-	u32			bmap_size;
+-	unsigned long		flags;
+-#define FIRMWARE_INITIALIZED_FLAG	0
+-#define FIRMWARE_FIRST_FLAG		31
+-#define FIRMWARE_TIMED_OUT		3
+-	wait_queue_head_t	waitq;
+-	int			(*aeq_handler)(struct bnxt_qplib_rcfw *,
+-					       void *, void *);
+-	u32			seq_num;
+-
+-	/* Bar region info */
+-	void __iomem		*cmdq_bar_reg_iomem;
+-	u16			cmdq_bar_reg;
+-	u16			cmdq_bar_reg_prod_off;
+-	u16			cmdq_bar_reg_trig_off;
+-	u16			creq_ring_id;
+-	u16			creq_bar_reg;
+-	void __iomem		*creq_bar_reg_iomem;
+-
+-	/* Cmd-Resp and Async Event notification queue */
+-	struct bnxt_qplib_hwq	creq;
+-	u64			creq_qp_event_processed;
+-	u64			creq_func_event_processed;
+-
+-	/* Actual Cmd and Resp Queues */
+-	struct bnxt_qplib_hwq	cmdq;
+-	struct bnxt_qplib_crsq	*crsqe_tbl;
++	struct bnxt_qplib_cmdq_ctx	cmdq;
++	struct bnxt_qplib_creq_ctx	creq;
++	struct bnxt_qplib_crsqe		*crsqe_tbl;
+ 	int qp_tbl_size;
+ 	struct bnxt_qplib_qp_node *qp_tbl;
+ 	u64 oos_prev;
+@@ -279,8 +292,7 @@ int bnxt_qplib_rcfw_start_irq(struct bnxt_qplib_rcfw *rcfw, int msix_vector,
+ int bnxt_qplib_enable_rcfw_channel(struct bnxt_qplib_rcfw *rcfw,
+ 				   int msix_vector,
+ 				   int cp_bar_reg_off, int virt_fn,
+-				   int (*aeq_handler)(struct bnxt_qplib_rcfw *,
+-						      void *aeqe, void *obj));
++				   aeq_handler_t aeq_handler);
+ 
+ struct bnxt_qplib_rcfw_sbuf *bnxt_qplib_rcfw_alloc_sbuf(
+ 				struct bnxt_qplib_rcfw *rcfw,
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_res.h b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+index fe8a6dd7aeb1..5fa278e744eb 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_res.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_res.h
+@@ -80,6 +80,13 @@ enum bnxt_qplib_pbl_lvl {
+ #define ROCE_PG_SIZE_8M		(8 * 1024 * 1024)
+ #define ROCE_PG_SIZE_1G		(1024 * 1024 * 1024)
+ 
++struct bnxt_qplib_reg_desc {
++	u8		bar_id;
++	resource_size_t	bar_base;
++	void __iomem	*bar_reg;
++	size_t		len;
++};
++
+ struct bnxt_qplib_pbl {
+ 	u32				pg_count;
+ 	u32				pg_size;
