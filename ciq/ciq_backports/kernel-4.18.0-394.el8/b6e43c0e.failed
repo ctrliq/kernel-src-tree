@@ -1,0 +1,316 @@
+arm64: remove __exception annotations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author James Morse <james.morse@arm.com>
+commit b6e43c0e3129ffe87e65c85f20fcbdf0eb86fba0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/b6e43c0e.failed
+
+Since commit 732674980139 ("arm64: unwind: reference pt_regs via embedded
+stack frame") arm64 has not used the __exception annotation to dump
+the pt_regs during stack tracing. in_exception_text() has no callers.
+
+This annotation is only used to blacklist kprobes, it means the same as
+__kprobes.
+
+Section annotations like this require the functions to be grouped
+together between the start/end markers, and placed according to
+the linker script. For kprobes we also have NOKPROBE_SYMBOL() which
+logs the symbol address in a section that kprobes parses and
+blacklists at boot.
+
+Using NOKPROBE_SYMBOL() instead lets kprobes publish the list of
+blacklisted symbols, and saves us from having an arm64 specific
+spelling of __kprobes.
+
+do_debug_exception() already has a NOKPROBE_SYMBOL() annotation.
+
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Acked-by: Mark Rutland <mark.rutland@arm.com>
+	Acked-by: Masami Hiramatsu <mhiramat@kernel.org>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit b6e43c0e3129ffe87e65c85f20fcbdf0eb86fba0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/probes/kprobes.c
+diff --cc arch/arm64/kernel/probes/kprobes.c
+index 6a1742aeefa9,d1c95dcf1d78..000000000000
+--- a/arch/arm64/kernel/probes/kprobes.c
++++ b/arch/arm64/kernel/probes/kprobes.c
+@@@ -443,26 -434,38 +443,48 @@@ kprobe_breakpoint_handler(struct pt_reg
+  	return DBG_HOOK_HANDLED;
+  }
+  
+ -static struct break_hook kprobes_break_hook = {
+ -	.imm = KPROBES_BRK_IMM,
+ -	.fn = kprobe_breakpoint_handler,
+ -};
+ -
+ -/*
+ - * Provide a blacklist of symbols identifying ranges which cannot be kprobed.
+ - * This blacklist is exposed to userspace via debugfs (kprobes/blacklist).
+ - */
+ -int __init arch_populate_kprobe_blacklist(void)
+ +bool arch_within_kprobe_blacklist(unsigned long addr)
+  {
+ -	int ret;
+ +	if ((addr >= (unsigned long)__kprobes_text_start &&
+ +	    addr < (unsigned long)__kprobes_text_end) ||
+ +	    (addr >= (unsigned long)__entry_text_start &&
+ +	    addr < (unsigned long)__entry_text_end) ||
+ +	    (addr >= (unsigned long)__idmap_text_start &&
+ +	    addr < (unsigned long)__idmap_text_end) ||
+ +	    (addr >= (unsigned long)__hyp_text_start &&
+ +	    addr < (unsigned long)__hyp_text_end) ||
+ +	    in_exception_text(addr))
+ +		return true;
+ +
+++<<<<<<< HEAD
+ +	if (!is_kernel_in_hyp_mode()) {
+ +		if ((addr >= (unsigned long)__hyp_idmap_text_start &&
+ +		    addr < (unsigned long)__hyp_idmap_text_end))
+ +			return true;
+ +	}
+  
+ +	return false;
+++=======
++ 	ret = kprobe_add_area_blacklist((unsigned long)__entry_text_start,
++ 					(unsigned long)__entry_text_end);
++ 	if (ret)
++ 		return ret;
++ 	ret = kprobe_add_area_blacklist((unsigned long)__irqentry_text_start,
++ 					(unsigned long)__irqentry_text_end);
++ 	if (ret)
++ 		return ret;
++ 	ret = kprobe_add_area_blacklist((unsigned long)__idmap_text_start,
++ 					(unsigned long)__idmap_text_end);
++ 	if (ret)
++ 		return ret;
++ 	ret = kprobe_add_area_blacklist((unsigned long)__hyp_text_start,
++ 					(unsigned long)__hyp_text_end);
++ 	if (ret || is_kernel_in_hyp_mode())
++ 		return ret;
++ 	ret = kprobe_add_area_blacklist((unsigned long)__hyp_idmap_text_start,
++ 					(unsigned long)__hyp_idmap_text_end);
++ 	return ret;
+++>>>>>>> b6e43c0e3129 (arm64: remove __exception annotations)
+  }
+  
+  void __kprobes __used *trampoline_probe_handler(struct pt_regs *regs)
+diff --git a/arch/arm64/include/asm/exception.h b/arch/arm64/include/asm/exception.h
+index 55a461d97487..96b6a682a3d7 100644
+--- a/arch/arm64/include/asm/exception.h
++++ b/arch/arm64/include/asm/exception.h
+@@ -19,14 +19,14 @@
+ #define __ASM_EXCEPTION_H
+ 
+ #include <asm/esr.h>
++#include <asm/kprobes.h>
+ 
+ #include <linux/interrupt.h>
+ 
+-#define __exception	__attribute__((section(".exception.text")))
+ #ifdef CONFIG_FUNCTION_GRAPH_TRACER
+ #define __exception_irq_entry	__irq_entry
+ #else
+-#define __exception_irq_entry	__exception
++#define __exception_irq_entry	__kprobes
+ #endif
+ 
+ static inline u32 disr_to_esr(u64 disr)
+diff --git a/arch/arm64/include/asm/traps.h b/arch/arm64/include/asm/traps.h
+index f9c1aa6167d2..5378564664a5 100644
+--- a/arch/arm64/include/asm/traps.h
++++ b/arch/arm64/include/asm/traps.h
+@@ -53,16 +53,6 @@ static inline int __in_irqentry_text(unsigned long ptr)
+ 	       ptr < (unsigned long)&__irqentry_text_end;
+ }
+ 
+-static inline int in_exception_text(unsigned long ptr)
+-{
+-	int in;
+-
+-	in = ptr >= (unsigned long)&__exception_text_start &&
+-	     ptr < (unsigned long)&__exception_text_end;
+-
+-	return in ? : __in_irqentry_text(ptr);
+-}
+-
+ static inline int in_entry_text(unsigned long ptr)
+ {
+ 	return ptr >= (unsigned long)&__entry_text_start &&
+* Unmerged path arch/arm64/kernel/probes/kprobes.c
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index ccfd884c601f..ede68f5696b6 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -46,6 +46,7 @@
+ #include <asm/debug-monitors.h>
+ #include <asm/esr.h>
+ #include <asm/insn.h>
++#include <asm/kprobes.h>
+ #include <asm/traps.h>
+ #include <asm/smp.h>
+ #include <asm/stack_pointer.h>
+@@ -402,7 +403,7 @@ void arm64_notify_segfault(unsigned long addr)
+ 	force_signal_inject(SIGSEGV, code, addr);
+ }
+ 
+-asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
++asmlinkage void do_undefinstr(struct pt_regs *regs)
+ {
+ 	/* check for AArch32 breakpoint instructions */
+ 	if (!aarch32_break_handler(regs))
+@@ -414,6 +415,7 @@ asmlinkage void __exception do_undefinstr(struct pt_regs *regs)
+ 	force_signal_inject(SIGILL, ILL_ILLOPC, regs->pc);
+ 	BUG_ON(!user_mode(regs));
+ }
++NOKPROBE_SYMBOL(do_undefinstr);
+ 
+ #define __user_cache_maint(insn, address, res)			\
+ 	if (address >= user_addr_max()) {			\
+@@ -685,7 +687,7 @@ static const struct sys64_hook cp15_64_hooks[] = {
+ 	{},
+ };
+ 
+-asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
++asmlinkage void do_cp15instr(unsigned int esr, struct pt_regs *regs)
+ {
+ 	const struct sys64_hook *hook, *hook_base;
+ 
+@@ -723,9 +725,10 @@ asmlinkage void __exception do_cp15instr(unsigned int esr, struct pt_regs *regs)
+ 	 */
+ 	do_undefinstr(regs);
+ }
++NOKPROBE_SYMBOL(do_cp15instr);
+ #endif
+ 
+-asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
++asmlinkage void do_sysinstr(unsigned int esr, struct pt_regs *regs)
+ {
+ 	const struct sys64_hook *hook;
+ 
+@@ -742,6 +745,7 @@ asmlinkage void __exception do_sysinstr(unsigned int esr, struct pt_regs *regs)
+ 	 */
+ 	do_undefinstr(regs);
+ }
++NOKPROBE_SYMBOL(do_sysinstr);
+ 
+ static const char *esr_class_str[] = {
+ 	[0 ... ESR_ELx_EC_MAX]		= "UNRECOGNIZED EC",
+diff --git a/arch/arm64/kernel/vmlinux.lds.S b/arch/arm64/kernel/vmlinux.lds.S
+index 92838a4c10a6..812ebbc7e772 100644
+--- a/arch/arm64/kernel/vmlinux.lds.S
++++ b/arch/arm64/kernel/vmlinux.lds.S
+@@ -118,9 +118,6 @@ SECTIONS
+ 	}
+ 	.text : {			/* Real text segment		*/
+ 		_stext = .;		/* Text and read-only data	*/
+-			__exception_text_start = .;
+-			*(.exception.text)
+-			__exception_text_end = .;
+ 			IRQENTRY_TEXT
+ 			SOFTIRQENTRY_TEXT
+ 			ENTRY_TEXT
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index a1fbfca74da1..44749da2c356 100644
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -44,6 +44,7 @@
+ #include <asm/debug-monitors.h>
+ #include <asm/esr.h>
+ #include <asm/kasan.h>
++#include <asm/kprobes.h>
+ #include <asm/sysreg.h>
+ #include <asm/system_misc.h>
+ #include <asm/pgtable.h>
+@@ -761,8 +762,8 @@ static const struct fault_info fault_info[] = {
+ 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 63"			},
+ };
+ 
+-asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
+-					 struct pt_regs *regs)
++asmlinkage void do_mem_abort(unsigned long addr, unsigned int esr,
++			     struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf = esr_to_fault_info(esr);
+ 
+@@ -778,16 +779,17 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
+ 	arm64_notify_die(inf->name, regs,
+ 			 inf->sig, inf->code, (void __user *)addr, esr);
+ }
++NOKPROBE_SYMBOL(do_mem_abort);
+ 
+-asmlinkage void __exception do_el0_irq_bp_hardening(void)
++asmlinkage void do_el0_irq_bp_hardening(void)
+ {
+ 	/* PC has already been checked in entry.S */
+ 	arm64_apply_bp_hardening();
+ }
++NOKPROBE_SYMBOL(do_el0_irq_bp_hardening);
+ 
+-asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
+-						   unsigned int esr,
+-						   struct pt_regs *regs)
++asmlinkage void do_el0_ia_bp_hardening(unsigned long addr,  unsigned int esr,
++				       struct pt_regs *regs)
+ {
+ 	/*
+ 	 * We've taken an instruction abort from userspace and not yet
+@@ -800,11 +802,10 @@ asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
+ 	local_daif_restore(DAIF_PROCCTX);
+ 	do_mem_abort(addr, esr, regs);
+ }
++NOKPROBE_SYMBOL(do_el0_ia_bp_hardening);
+ 
+-
+-asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
+-					   unsigned int esr,
+-					   struct pt_regs *regs)
++asmlinkage void do_sp_pc_abort(unsigned long addr, unsigned int esr,
++			       struct pt_regs *regs)
+ {
+ 	if (user_mode(regs)) {
+ 		if (!is_ttbr0_addr(instruction_pointer(regs)))
+@@ -815,6 +816,7 @@ asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
+ 	arm64_notify_die("SP/PC alignment exception", regs,
+ 			 SIGBUS, BUS_ADRALN, (void __user *)addr, esr);
+ }
++NOKPROBE_SYMBOL(do_sp_pc_abort);
+ 
+ int __init early_brk64(unsigned long addr, unsigned int esr,
+ 		       struct pt_regs *regs);
+@@ -850,8 +852,7 @@ void __init hook_debug_fault_code(int nr,
+ #ifdef CONFIG_ARM64_ERRATUM_1463225
+ DECLARE_PER_CPU(int, __in_cortex_a76_erratum_1463225_wa);
+ 
+-static int __exception
+-cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++static int cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
+ {
+ 	if (user_mode(regs))
+ 		return 0;
+@@ -870,16 +871,15 @@ cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
+ 	return 1;
+ }
+ #else
+-static int __exception
+-cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
++static int cortex_a76_erratum_1463225_debug_handler(struct pt_regs *regs)
+ {
+ 	return 0;
+ }
+ #endif /* CONFIG_ARM64_ERRATUM_1463225 */
++NOKPROBE_SYMBOL(cortex_a76_erratum_1463225_debug_handler);
+ 
+-asmlinkage void __exception do_debug_exception(unsigned long addr_if_watchpoint,
+-					       unsigned int esr,
+-					       struct pt_regs *regs)
++asmlinkage void do_debug_exception(unsigned long addr_if_watchpoint,
++				   unsigned int esr, struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf = esr_to_debug_fault_info(esr);
+ 	unsigned long pc = instruction_pointer(regs);
