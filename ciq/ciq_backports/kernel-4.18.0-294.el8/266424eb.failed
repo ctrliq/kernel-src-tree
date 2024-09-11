@@ -1,0 +1,578 @@
+RDMA/mlx5: Promote RSS RAW QP attribute check in higher level
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 266424eba6c90ab8b12cf73aae00f1b08c0619cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/266424eb.failed
+
+Perform check of attributes of RAW PACKET QP in separate function.
+
+Link: https://lore.kernel.org/r/20200427154636.381474-22-leon@kernel.org
+	Reviewed-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 266424eba6c90ab8b12cf73aae00f1b08c0619cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/qp.c
+diff --cc drivers/infiniband/hw/mlx5/qp.c
+index 745e3ea1cb8f,454433a18b97..000000000000
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@@ -1656,12 -1645,6 +1656,15 @@@ static int create_rss_raw_qp_tir(struc
+  	size_t required_cmd_sz;
+  	u8 lb_flag = 0;
+  
+++<<<<<<< HEAD
+ +	if (init_attr->qp_type != IB_QPT_RAW_PACKET)
+ +		return -EOPNOTSUPP;
+ +
+ +	if (init_attr->create_flags || init_attr->send_cq)
+ +		return -EINVAL;
+ +
+++=======
+++>>>>>>> 266424eba6c9 (RDMA/mlx5: Promote RSS RAW QP attribute check in higher level)
+  	min_resp_len = offsetof(typeof(resp), bfreg_index) + sizeof(resp.bfreg_index);
+  	if (udata->outlen < min_resp_len)
+  		return -EINVAL;
+@@@ -2618,172 -2396,404 +2621,181 @@@ static struct ib_qp *mlx5_ib_create_dct
+  
+  	qp->state = IB_QPS_RESET;
+  
+ -	return 0;
+ -}
+ -
+ -static int check_qp_type(struct mlx5_ib_dev *dev, struct ib_qp_init_attr *attr,
+ -			 enum ib_qp_type *type)
+ -{
+ -	if (attr->qp_type == IB_QPT_DRIVER && !MLX5_CAP_GEN(dev->mdev, dct))
+ -		goto out;
+ -
+ -	switch (attr->qp_type) {
+ -	case IB_QPT_XRC_TGT:
+ -	case IB_QPT_XRC_INI:
+ -		if (!MLX5_CAP_GEN(dev->mdev, xrc))
+ -			goto out;
+ -		fallthrough;
+ -	case IB_QPT_RAW_PACKET:
+ -	case IB_QPT_RC:
+ -	case IB_QPT_UC:
+ -	case IB_QPT_UD:
+ -	case IB_QPT_SMI:
+ -	case MLX5_IB_QPT_HW_GSI:
+ -	case MLX5_IB_QPT_REG_UMR:
+ -	case IB_QPT_DRIVER:
+ -	case IB_QPT_GSI:
+ -		break;
+ -	default:
+ -		goto out;
+ -	}
+ -
+ -	*type = attr->qp_type;
+ -	return 0;
+ -
+ -out:
+ -	mlx5_ib_dbg(dev, "Unsupported QP type %d\n", attr->qp_type);
+ -	return -EOPNOTSUPP;
+ +	return &qp->ibqp;
+ +err_free:
+ +	kfree(qp);
+ +	return ERR_PTR(err);
+  }
+  
+ -static int check_valid_flow(struct mlx5_ib_dev *dev, struct ib_pd *pd,
+ -			    struct ib_qp_init_attr *attr,
+ -			    struct ib_udata *udata)
+ +static int set_mlx_qp_type(struct mlx5_ib_dev *dev,
+ +			   struct ib_qp_init_attr *init_attr,
+ +			   struct mlx5_ib_create_qp *ucmd,
+ +			   struct ib_udata *udata)
+  {
+ -	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
+ -		udata, struct mlx5_ib_ucontext, ibucontext);
+ -
+ -	if (!udata) {
+ -		/* Kernel create_qp callers */
+ -		if (attr->rwq_ind_tbl)
+ -			return -EOPNOTSUPP;
+ -
+ -		switch (attr->qp_type) {
+ -		case IB_QPT_RAW_PACKET:
+ -		case IB_QPT_DRIVER:
+ -			return -EOPNOTSUPP;
+ -		default:
+ -			return 0;
+ -		}
+ -	}
+ -
+ -	/* Userspace create_qp callers */
+ -	if (attr->qp_type == IB_QPT_RAW_PACKET && !ucontext->cqe_version) {
+ -		mlx5_ib_dbg(dev,
+ -			"Raw Packet QP is only supported for CQE version > 0\n");
+ -		return -EINVAL;
+ -	}
+ +	enum { MLX_QP_FLAGS = MLX5_QP_FLAG_TYPE_DCT | MLX5_QP_FLAG_TYPE_DCI };
+ +	int err;
+  
+ -	if (attr->qp_type != IB_QPT_RAW_PACKET && attr->rwq_ind_tbl) {
+ -		mlx5_ib_dbg(dev,
+ -			    "Wrong QP type %d for the RWQ indirect table\n",
+ -			    attr->qp_type);
+ +	if (!udata)
+  		return -EINVAL;
+ -	}
+  
+ -	switch (attr->qp_type) {
+ -	case IB_QPT_SMI:
+ -	case MLX5_IB_QPT_HW_GSI:
+ -	case MLX5_IB_QPT_REG_UMR:
+ -	case IB_QPT_GSI:
+ -		mlx5_ib_dbg(dev, "Kernel doesn't support QP type %d\n",
+ -			    attr->qp_type);
+ +	if (udata->inlen < sizeof(*ucmd)) {
+ +		mlx5_ib_dbg(dev, "create_qp user command is smaller than expected\n");
+  		return -EINVAL;
+ -	default:
+ -		break;
+ -	}
+ -
+ -	/*
+ -	 * We don't need to see this warning, it means that kernel code
+ -	 * missing ib_pd. Placed here to catch developer's mistakes.
+ -	 */
+ -	WARN_ONCE(!pd && attr->qp_type != IB_QPT_XRC_TGT,
+ -		  "There is a missing PD pointer assignment\n");
+ -	return 0;
+ -}
+ -
+ -static void process_vendor_flag(struct mlx5_ib_dev *dev, int *flags, int flag,
+ -				bool cond, struct mlx5_ib_qp *qp)
+ -{
+ -	if (!(*flags & flag))
+ -		return;
+ -
+ -	if (cond) {
+ -		qp->flags_en |= flag;
+ -		*flags &= ~flag;
+ -		return;
+  	}
+ +	err = ib_copy_from_udata(ucmd, udata, sizeof(*ucmd));
+ +	if (err)
+ +		return err;
+  
+ -	if (flag == MLX5_QP_FLAG_SCATTER_CQE) {
+ -		/*
+ -		 * We don't return error if this flag was provided,
+ -		 * and mlx5 doesn't have right capability.
+ -		 */
+ -		*flags &= ~MLX5_QP_FLAG_SCATTER_CQE;
+ -		return;
+ -	}
+ -	mlx5_ib_dbg(dev, "Vendor create QP flag 0x%X is not supported\n", flag);
+ -}
+ -
+ -static int process_vendor_flags(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ -				struct mlx5_ib_create_qp *ucmd)
+ -{
+ -	struct mlx5_core_dev *mdev = dev->mdev;
+ -	int flags = ucmd->flags;
+ -	bool cond;
+ -
+ -	switch (flags & (MLX5_QP_FLAG_TYPE_DCT | MLX5_QP_FLAG_TYPE_DCI)) {
+ -	case MLX5_QP_FLAG_TYPE_DCI:
+ -		qp->type = MLX5_IB_QPT_DCI;
+ -		break;
+ -	case MLX5_QP_FLAG_TYPE_DCT:
+ -		qp->type = MLX5_IB_QPT_DCT;
+ -		break;
+ -	default:
+ -		if (qp->type != IB_QPT_DRIVER)
+ -			break;
+ -		/*
+ -		 * It is IB_QPT_DRIVER and or no subtype or
+ -		 * wrong subtype were provided.
+ -		 */
+ -		return -EINVAL;
+ +	if ((ucmd->flags & MLX_QP_FLAGS) == MLX5_QP_FLAG_TYPE_DCI) {
+ +		init_attr->qp_type = MLX5_IB_QPT_DCI;
+ +	} else {
+ +		if ((ucmd->flags & MLX_QP_FLAGS) == MLX5_QP_FLAG_TYPE_DCT) {
+ +			init_attr->qp_type = MLX5_IB_QPT_DCT;
+ +		} else {
+ +			mlx5_ib_dbg(dev, "Invalid QP flags\n");
+ +			return -EINVAL;
+ +		}
+  	}
+  
+ -	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_TYPE_DCI, true, qp);
+ -	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_TYPE_DCT, true, qp);
+ -
+ -	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_SIGNATURE, true, qp);
+ -	process_vendor_flag(dev, &flags, MLX5_QP_FLAG_SCATTER_CQE,
+ -			    MLX5_CAP_GEN(mdev, sctr_data_cqe), qp);
+ -
+ -	if (qp->type == IB_QPT_RAW_PACKET) {
+ -		cond = MLX5_CAP_ETH(mdev, tunnel_stateless_vxlan) ||
+ -		       MLX5_CAP_ETH(mdev, tunnel_stateless_gre) ||
+ -		       MLX5_CAP_ETH(mdev, tunnel_stateless_geneve_rx);
+ -		process_vendor_flag(dev, &flags, MLX5_QP_FLAG_TUNNEL_OFFLOADS,
+ -				    cond, qp);
+ -		process_vendor_flag(dev, &flags,
+ -				    MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_UC, true,
+ -				    qp);
+ -		process_vendor_flag(dev, &flags,
+ -				    MLX5_QP_FLAG_TIR_ALLOW_SELF_LB_MC, true,
+ -				    qp);
+ +	if (!MLX5_CAP_GEN(dev->mdev, dct)) {
+ +		mlx5_ib_dbg(dev, "DC transport is not supported\n");
+ +		return -EOPNOTSUPP;
+  	}
+  
+ -	if (qp->type == IB_QPT_RC)
+ -		process_vendor_flag(dev, &flags,
+ -				    MLX5_QP_FLAG_PACKET_BASED_CREDIT_MODE,
+ -				    MLX5_CAP_GEN(mdev, qp_packet_based), qp);
+ -
+ -	if (flags)
+ -		mlx5_ib_dbg(dev, "udata has unsupported flags 0x%X\n", flags);
+ -
+ -	return (flags) ? -EINVAL : 0;
+ +	return 0;
+  }
+  
+ -static void process_create_flag(struct mlx5_ib_dev *dev, int *flags, int flag,
+ -				bool cond, struct mlx5_ib_qp *qp)
+ +struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+ +				struct ib_qp_init_attr *verbs_init_attr,
+ +				struct ib_udata *udata)
+  {
+ -	if (!(*flags & flag))
+ -		return;
+ -
+ -	if (cond) {
+ -		qp->flags |= flag;
+ -		*flags &= ~flag;
+ -		return;
+ -	}
+ +	struct mlx5_ib_dev *dev;
+ +	struct mlx5_ib_qp *qp;
+ +	u16 xrcdn = 0;
+ +	int err;
+ +	struct ib_qp_init_attr mlx_init_attr;
+ +	struct ib_qp_init_attr *init_attr = verbs_init_attr;
+ +	struct mlx5_ib_ucontext *ucontext = rdma_udata_to_drv_context(
+ +		udata, struct mlx5_ib_ucontext, ibucontext);
+  
+ -	if (flag == MLX5_IB_QP_CREATE_WC_TEST) {
+ -		/*
+ -		 * Special case, if condition didn't meet, it won't be error,
+ -		 * just different in-kernel flow.
+ -		 */
+ -		*flags &= ~MLX5_IB_QP_CREATE_WC_TEST;
+ -		return;
+ +	if (pd) {
+ +		dev = to_mdev(pd->device);
+ +
+ +		if (init_attr->qp_type == IB_QPT_RAW_PACKET) {
+ +			if (!ucontext) {
+ +				mlx5_ib_dbg(dev, "Raw Packet QP is not supported for kernel consumers\n");
+ +				return ERR_PTR(-EINVAL);
+ +			} else if (!ucontext->cqe_version) {
+ +				mlx5_ib_dbg(dev, "Raw Packet QP is only supported for CQE version > 0\n");
+ +				return ERR_PTR(-EINVAL);
+ +			}
+ +		}
+ +	} else {
+ +		/* being cautious here */
+ +		if (init_attr->qp_type != IB_QPT_XRC_TGT &&
+ +		    init_attr->qp_type != MLX5_IB_QPT_REG_UMR) {
+ +			pr_warn("%s: no PD for transport %s\n", __func__,
+ +				ib_qp_type_str(init_attr->qp_type));
+ +			return ERR_PTR(-EINVAL);
+ +		}
+ +		dev = to_mdev(to_mxrcd(init_attr->xrcd)->ibxrcd.device);
+  	}
+ -	mlx5_ib_dbg(dev, "Verbs create QP flag 0x%X is not supported\n", flag);
+ -}
+  
+ -static int process_create_flags(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ -				struct ib_qp_init_attr *attr)
+ -{
+ -	enum ib_qp_type qp_type = qp->type;
+ -	struct mlx5_core_dev *mdev = dev->mdev;
+ -	int create_flags = attr->create_flags;
+ -	bool cond;
+ +	if (init_attr->qp_type == IB_QPT_DRIVER) {
+ +		struct mlx5_ib_create_qp ucmd;
+  
+ -	if (qp_type == MLX5_IB_QPT_DCT)
+ -		return (create_flags) ? -EINVAL : 0;
+ -
+ -	if (qp_type == IB_QPT_RAW_PACKET && attr->rwq_ind_tbl)
+ -		return (create_flags) ? -EINVAL : 0;
+ -
+ -	process_create_flag(dev, &create_flags,
+ -			    IB_QP_CREATE_BLOCK_MULTICAST_LOOPBACK,
+ -			    MLX5_CAP_GEN(mdev, block_lb_mc), qp);
+ -	process_create_flag(dev, &create_flags, IB_QP_CREATE_CROSS_CHANNEL,
+ -			    MLX5_CAP_GEN(mdev, cd), qp);
+ -	process_create_flag(dev, &create_flags, IB_QP_CREATE_MANAGED_SEND,
+ -			    MLX5_CAP_GEN(mdev, cd), qp);
+ -	process_create_flag(dev, &create_flags, IB_QP_CREATE_MANAGED_RECV,
+ -			    MLX5_CAP_GEN(mdev, cd), qp);
+ -
+ -	if (qp_type == IB_QPT_UD) {
+ -		process_create_flag(dev, &create_flags,
+ -				    IB_QP_CREATE_IPOIB_UD_LSO,
+ -				    MLX5_CAP_GEN(mdev, ipoib_basic_offloads),
+ -				    qp);
+ -		cond = MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_IB;
+ -		process_create_flag(dev, &create_flags, IB_QP_CREATE_SOURCE_QPN,
+ -				    cond, qp);
+ -	}
+ -
+ -	if (qp_type == IB_QPT_RAW_PACKET) {
+ -		cond = MLX5_CAP_GEN(mdev, eth_net_offloads) &&
+ -		       MLX5_CAP_ETH(mdev, scatter_fcs);
+ -		process_create_flag(dev, &create_flags,
+ -				    IB_QP_CREATE_SCATTER_FCS, cond, qp);
+ +		init_attr = &mlx_init_attr;
+ +		memcpy(init_attr, verbs_init_attr, sizeof(*verbs_init_attr));
+ +		err = set_mlx_qp_type(dev, init_attr, &ucmd, udata);
+ +		if (err)
+ +			return ERR_PTR(err);
+  
+ -		cond = MLX5_CAP_GEN(mdev, eth_net_offloads) &&
+ -		       MLX5_CAP_ETH(mdev, vlan_cap);
+ -		process_create_flag(dev, &create_flags,
+ -				    IB_QP_CREATE_CVLAN_STRIPPING, cond, qp);
+ +		if (init_attr->qp_type == MLX5_IB_QPT_DCI) {
+ +			if (init_attr->cap.max_recv_wr ||
+ +			    init_attr->cap.max_recv_sge) {
+ +				mlx5_ib_dbg(dev, "DCI QP requires zero size receive queue\n");
+ +				return ERR_PTR(-EINVAL);
+ +			}
+ +		} else {
+ +			return mlx5_ib_create_dct(pd, init_attr, &ucmd, udata);
+ +		}
+  	}
+  
+ -	process_create_flag(dev, &create_flags,
+ -			    IB_QP_CREATE_PCI_WRITE_END_PADDING,
+ -			    MLX5_CAP_GEN(mdev, end_pad), qp);
+ -
+ -	process_create_flag(dev, &create_flags, MLX5_IB_QP_CREATE_WC_TEST,
+ -			    qp_type != MLX5_IB_QPT_REG_UMR, qp);
+ -	process_create_flag(dev, &create_flags, MLX5_IB_QP_CREATE_SQPN_QP1,
+ -			    true, qp);
+ -
+ -	if (create_flags)
+ -		mlx5_ib_dbg(dev, "Create QP has unsupported flags 0x%X\n",
+ -			    create_flags);
+ -
+ -	return (create_flags) ? -EINVAL : 0;
+ -}
+ -
+ -static size_t process_udata_size(struct ib_qp_init_attr *attr,
+ -				 struct ib_udata *udata)
+ -{
+ -	size_t ucmd = sizeof(struct mlx5_ib_create_qp);
+ -
+ -	if (attr->qp_type == IB_QPT_DRIVER)
+ -		return (udata->inlen < ucmd) ? 0 : ucmd;
+ +	switch (init_attr->qp_type) {
+ +	case IB_QPT_XRC_TGT:
+ +	case IB_QPT_XRC_INI:
+ +		if (!MLX5_CAP_GEN(dev->mdev, xrc)) {
+ +			mlx5_ib_dbg(dev, "XRC not supported\n");
+ +			return ERR_PTR(-ENOSYS);
+ +		}
+ +		init_attr->recv_cq = NULL;
+ +		if (init_attr->qp_type == IB_QPT_XRC_TGT) {
+ +			xrcdn = to_mxrcd(init_attr->xrcd)->xrcdn;
+ +			init_attr->send_cq = NULL;
+ +		}
+  
+ -	return ucmd;
+ -}
+ +		/* fall through */
+ +	case IB_QPT_RAW_PACKET:
+ +	case IB_QPT_RC:
+ +	case IB_QPT_UC:
+ +	case IB_QPT_UD:
+ +	case IB_QPT_SMI:
+ +	case MLX5_IB_QPT_HW_GSI:
+ +	case MLX5_IB_QPT_REG_UMR:
+ +	case MLX5_IB_QPT_DCI:
+ +		qp = kzalloc(sizeof(*qp), GFP_KERNEL);
+ +		if (!qp)
+ +			return ERR_PTR(-ENOMEM);
+  
+ -static int create_raw_qp(struct ib_pd *pd, struct mlx5_ib_qp *qp,
+ -			 struct ib_qp_init_attr *attr,
+ -			 struct mlx5_ib_create_qp *ucmd, struct ib_udata *udata)
+ -{
+ -	struct mlx5_ib_dev *dev = to_mdev(pd->device);
+ +		err = create_qp_common(dev, pd, init_attr, udata, qp);
+ +		if (err) {
+ +			mlx5_ib_dbg(dev, "create_qp_common failed\n");
+ +			kfree(qp);
+ +			return ERR_PTR(err);
+ +		}
+  
+ -	if (attr->rwq_ind_tbl)
+ -		return create_rss_raw_qp_tir(pd, qp, attr, udata);
+ +		if (is_qp0(init_attr->qp_type))
+ +			qp->ibqp.qp_num = 0;
+ +		else if (is_qp1(init_attr->qp_type))
+ +			qp->ibqp.qp_num = 1;
+ +		else
+ +			qp->ibqp.qp_num = qp->trans_qp.base.mqp.qpn;
+  
+ -	return create_qp_common(dev, pd, attr, ucmd, udata, qp);
+ -}
+ +		mlx5_ib_dbg(dev, "ib qpnum 0x%x, mlx qpn 0x%x, rcqn 0x%x, scqn 0x%x\n",
+ +			    qp->ibqp.qp_num, qp->trans_qp.base.mqp.qpn,
+ +			    init_attr->recv_cq ? to_mcq(init_attr->recv_cq)->mcq.cqn : -1,
+ +			    init_attr->send_cq ? to_mcq(init_attr->send_cq)->mcq.cqn : -1);
+  
+ -static int check_qp_attr(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
+ -			 struct ib_qp_init_attr *attr)
+ -{
+ -	int ret = 0;
+ +		qp->trans_qp.xrcdn = xrcdn;
+  
+ -	switch (qp->type) {
+ -	case MLX5_IB_QPT_DCT:
+ -		ret = (!attr->srq || !attr->recv_cq) ? -EINVAL : 0;
+ -		break;
+ -	case MLX5_IB_QPT_DCI:
+ -		ret = (attr->cap.max_recv_wr || attr->cap.max_recv_sge) ?
+ -			      -EINVAL :
+ -			      0;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case IB_QPT_RAW_PACKET:
++ 		ret = (attr->rwq_ind_tbl && attr->send_cq) ? -EINVAL : 0;
++ 		break;
++ 	default:
++ 		break;
++ 	}
+++>>>>>>> 266424eba6c9 (RDMA/mlx5: Promote RSS RAW QP attribute check in higher level)
+  
+ -	if (ret)
+ -		mlx5_ib_dbg(dev, "QP type %d has wrong attributes\n", qp->type);
+ -
+ -	return ret;
+ -}
+ -
+ -struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+ -				struct ib_qp_init_attr *init_attr,
+ -				struct ib_udata *udata)
+ -{
+ -	struct mlx5_ib_create_qp ucmd = {};
+ -	struct mlx5_ib_dev *dev;
+ -	struct mlx5_ib_qp *qp;
+ -	enum ib_qp_type type;
+ -	u16 xrcdn = 0;
+ -	int err;
+ -
+ -	dev = pd ? to_mdev(pd->device) :
+ -		   to_mdev(to_mxrcd(init_attr->xrcd)->ibxrcd.device);
+ -
+ -	err = check_qp_type(dev, init_attr, &type);
+ -	if (err) {
+ -		mlx5_ib_dbg(dev, "Unsupported QP type %d\n",
+ -			    init_attr->qp_type);
+ -		return ERR_PTR(err);
+ -	}
+ -
+ -	err = check_valid_flow(dev, pd, init_attr, udata);
+ -	if (err)
+ -		return ERR_PTR(err);
+ -
+ -	if (init_attr->qp_type == IB_QPT_GSI)
+ +	case IB_QPT_GSI:
+  		return mlx5_ib_gsi_create_qp(pd, init_attr);
+  
+ -	if (udata && !init_attr->rwq_ind_tbl) {
+ -		size_t inlen =
+ -			process_udata_size(init_attr, udata);
+ -
+ -		if (!inlen)
+ -			return ERR_PTR(-EINVAL);
+ -
+ -		err = ib_copy_from_udata(&ucmd, udata, inlen);
+ -		if (err)
+ -			return ERR_PTR(err);
+ -	}
+ -
+ -	qp = kzalloc(sizeof(*qp), GFP_KERNEL);
+ -	if (!qp)
+ -		return ERR_PTR(-ENOMEM);
+ -
+ -	qp->type = type;
+ -	if (udata) {
+ -		err = process_vendor_flags(dev, qp, &ucmd);
+ -		if (err)
+ -			goto free_qp;
+ -	}
+ -	err = process_create_flags(dev, qp, init_attr);
+ -	if (err)
+ -		goto free_qp;
+ -
+ -	if (qp->type == IB_QPT_XRC_TGT)
+ -		xrcdn = to_mxrcd(init_attr->xrcd)->xrcdn;
+ -
+ -	err = check_qp_attr(dev, qp, init_attr);
+ -	if (err)
+ -		goto free_qp;
+ -
+ -	switch (qp->type) {
+ -	case IB_QPT_RAW_PACKET:
+ -		err = create_raw_qp(pd, qp, init_attr, &ucmd, udata);
+ -		break;
+ -	case MLX5_IB_QPT_DCT:
+ -		err = create_dct(pd, qp, init_attr, &ucmd, udata);
+ -		break;
+ +	case IB_QPT_RAW_IPV6:
+ +	case IB_QPT_RAW_ETHERTYPE:
+ +	case IB_QPT_MAX:
+  	default:
+ -		err = create_qp_common(dev, pd, init_attr,
+ -				       (udata) ? &ucmd : NULL, udata, qp);
+ -	}
+ -	if (err) {
+ -		mlx5_ib_dbg(dev, "create_qp_common failed\n");
+ -		goto free_qp;
+ +		mlx5_ib_dbg(dev, "unsupported qp type %d\n",
+ +			    init_attr->qp_type);
+ +		/* Don't support raw QPs */
+ +		return ERR_PTR(-EINVAL);
+  	}
+  
+ -	if (is_qp0(init_attr->qp_type))
+ -		qp->ibqp.qp_num = 0;
+ -	else if (is_qp1(init_attr->qp_type))
+ -		qp->ibqp.qp_num = 1;
+ -	else
+ -		qp->ibqp.qp_num = qp->trans_qp.base.mqp.qpn;
+ -
+ -	qp->trans_qp.xrcdn = xrcdn;
+ +	if (verbs_init_attr->qp_type == IB_QPT_DRIVER)
+ +		qp->qp_sub_type = init_attr->qp_type;
+  
+  	return &qp->ibqp;
+ -
+ -free_qp:
+ -	kfree(qp);
+ -	return ERR_PTR(err);
+  }
+  
+  static int mlx5_ib_destroy_dct(struct mlx5_ib_qp *mqp)
+* Unmerged path drivers/infiniband/hw/mlx5/qp.c
