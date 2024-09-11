@@ -1,0 +1,146 @@
+s390/pci: make better use of zpci_dbg() levels
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 52c79e636a58da6650cec632e5e6d46467feefcb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/52c79e63.failed
+
+While the zpci_dbg() macro offers a level parameter this is currently
+largely unused. The only instance with higher importance than 3 is the
+UID checking change debug message which is not actually more important
+as the UID uniqueness guarantee is already exposed in sysfs so this
+should rather be 3 as well.
+
+On the other hand the "add ..." message which shows what devices are
+visible at the lowest level is essential during problem determination.
+By setting its level to 1, lowering the debug level can act as a filter
+to only show the available functions.
+
+On the error side the default level is set to 6 while all existing
+messages are printed at level 0. This is inconsistent and means there is
+no room for having messages be invisible on the default level so instead
+set the default level to 3 like for errors matching the default for
+debug messages.
+
+	Reviewed-by: Matthew Rosato <mjrosato@linux.ibm.com>
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 52c79e636a58da6650cec632e5e6d46467feefcb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+diff --cc arch/s390/pci/pci.c
+index 028424f063d3,bc980fd313d5..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -741,11 -751,71 +741,77 @@@ int zpci_create_device(struct zpci_dev 
+  {
+  	int rc;
+  
+++<<<<<<< HEAD
+++=======
++ 	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
++ 	if (zdev_enabled(zdev)) {
++ 		/* Disables device access, DMAs and IRQs (reset state) */
++ 		rc = zpci_disable_device(zdev);
++ 		/*
++ 		 * Due to a z/VM vs LPAR inconsistency in the error state the
++ 		 * FH may indicate an enabled device but disable says the
++ 		 * device is already disabled don't treat it as an error here.
++ 		 */
++ 		if (rc == -EINVAL)
++ 			rc = 0;
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = zpci_enable_device(zdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (zdev->dma_table)
++ 		rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 					virt_to_phys(zdev->dma_table));
++ 	else
++ 		rc = zpci_dma_init_device(zdev);
++ 	if (rc) {
++ 		zpci_disable_device(zdev);
++ 		return rc;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * zpci_create_device() - Create a new zpci_dev and add it to the zbus
++  * @fid: Function ID of the device to be created
++  * @fh: Current Function Handle of the device to be created
++  * @state: Initial state after creation either Standby or Configured
++  *
++  * Creates a new zpci device and adds it to its, possibly newly created, zbus
++  * as well as zpci_list.
++  *
++  * Returns: the zdev on success or an error pointer otherwise
++  */
++ struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
++ {
++ 	struct zpci_dev *zdev;
++ 	int rc;
++ 
++ 	zpci_dbg(1, "add fid:%x, fh:%x, c:%d\n", fid, fh, state);
++ 	zdev = kzalloc(sizeof(*zdev), GFP_KERNEL);
++ 	if (!zdev)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/* FID and Function Handle are the static/dynamic identifiers */
++ 	zdev->fid = fid;
++ 	zdev->fh = fh;
++ 
++ 	/* Query function properties and update zdev */
++ 	rc = clp_query_pci_fn(zdev);
++ 	if (rc)
++ 		goto error;
++ 	zdev->state =  state;
++ 
+++>>>>>>> 52c79e636a58 (s390/pci: make better use of zpci_dbg() levels)
+  	kref_init(&zdev->kref);
+ -	mutex_init(&zdev->lock);
+ +
+ +	spin_lock(&zpci_list_lock);
+ +	list_add_tail(&zdev->entry, &zpci_list);
+ +	spin_unlock(&zpci_list_lock);
+  
+  	rc = zpci_init_iommu(zdev);
+  	if (rc)
+* Unmerged path arch/s390/pci/pci.c
+diff --git a/arch/s390/pci/pci_clp.c b/arch/s390/pci/pci_clp.c
+index 45c5438cc74b..8f781c83719f 100644
+--- a/arch/s390/pci/pci_clp.c
++++ b/arch/s390/pci/pci_clp.c
+@@ -27,7 +27,7 @@ bool zpci_unique_uid;
+ void update_uid_checking(bool new)
+ {
+ 	if (zpci_unique_uid != new)
+-		zpci_dbg(1, "uid checking:%d\n", new);
++		zpci_dbg(3, "uid checking:%d\n", new);
+ 
+ 	zpci_unique_uid = new;
+ }
+diff --git a/arch/s390/pci/pci_debug.c b/arch/s390/pci/pci_debug.c
+index 6b48ca7760a7..2dec8136cc16 100644
+--- a/arch/s390/pci/pci_debug.c
++++ b/arch/s390/pci/pci_debug.c
+@@ -196,7 +196,7 @@ int __init zpci_debug_init(void)
+ 	if (!pci_debug_err_id)
+ 		return -EINVAL;
+ 	debug_register_view(pci_debug_err_id, &debug_hex_ascii_view);
+-	debug_set_level(pci_debug_err_id, 6);
++	debug_set_level(pci_debug_err_id, 3);
+ 
+ 	debugfs_root = debugfs_create_dir("pci", NULL);
+ 	return 0;
