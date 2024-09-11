@@ -781,7 +781,8 @@ fail_gunlock2:
 fail_free_inode:
 	if (ip->i_gl) {
 		glock_clear_object(ip->i_gl, ip);
-		gfs2_glock_put(ip->i_gl);
+		if (free_vfs_inode) /* else evict will do the put for us */
+			gfs2_glock_put(ip->i_gl);
 	}
 	gfs2_rsqa_delete(ip, NULL);
 fail_free_acls:
