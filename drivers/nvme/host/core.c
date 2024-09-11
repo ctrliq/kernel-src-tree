@@ -3899,7 +3899,7 @@ static inline void _nvme_check_size(void)
 }
 
 
-int __init nvme_core_init(void)
+static int __init nvme_core_init(void)
 {
 	int result = -ENOMEM;
 
@@ -3951,7 +3951,7 @@ out:
 	return result;
 }
 
-void __exit nvme_core_exit(void)
+static void __exit nvme_core_exit(void)
 {
 	ida_destroy(&nvme_subsystems_ida);
 	class_destroy(nvme_subsys_class);
