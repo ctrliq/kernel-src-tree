@@ -1,0 +1,131 @@
+KVM: x86: Fix potential race in KVM_GET_CLOCK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Oliver Upton <oupton@google.com>
+commit 55c0cefbdbdaca7347e20a2b91320b418abc617e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/55c0cefb.failed
+
+Sean noticed that KVM_GET_CLOCK was checking kvm_arch.use_master_clock
+outside of the pvclock sync lock. This is problematic, as the clock
+value written to the user may or may not actually correspond to a stable
+TSC.
+
+Fix the race by populating the entire kvm_clock_data structure behind
+the pvclock_gtod_sync_lock.
+
+	Suggested-by: Sean Christopherson <seanjc@google.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+Message-Id: <20210916181538.968978-4-oupton@google.com>
+	Reviewed-by: Marcelo Tosatti <mtosatti@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 55c0cefbdbdaca7347e20a2b91320b418abc617e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 87d165bd834e,79535fe83a04..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2837,25 -2771,33 +2837,31 @@@ static void kvm_gen_update_masterclock(
+  	/* guest entries allowed */
+  	kvm_for_each_vcpu(i, vcpu, kvm)
+  		kvm_clear_request(KVM_REQ_MCLOCK_INPROGRESS, vcpu);
+ -}
+ -
+ -static void kvm_update_masterclock(struct kvm *kvm)
+ -{
+ -	kvm_hv_invalidate_tsc_page(kvm);
+ -	kvm_start_pvclock_update(kvm);
+ -	pvclock_update_vm_gtod_copy(kvm);
+ -	kvm_end_pvclock_update(kvm);
+ +#endif
+  }
+  
+- u64 get_kvmclock_ns(struct kvm *kvm)
++ static void get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
+  {
+  	struct kvm_arch *ka = &kvm->arch;
+  	struct pvclock_vcpu_time_info hv_clock;
+  	unsigned long flags;
+- 	u64 ret;
+  
+ -	spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ +	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+  	if (!ka->use_master_clock) {
+++<<<<<<< HEAD
+ +		raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+ +		return get_kvmclock_base_ns() + ka->kvmclock_offset;
+++=======
++ 		spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
++ 		data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
++ 		return;
+++>>>>>>> 55c0cefbdbda (KVM: x86: Fix potential race in KVM_GET_CLOCK)
+  	}
+  
++ 	data->flags |= KVM_CLOCK_TSC_STABLE;
+  	hv_clock.tsc_timestamp = ka->master_cycle_now;
+  	hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+ -	spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+ +	raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+  
+  	/* both __this_cpu_read() and rdtsc() should be on the same cpu */
+  	get_cpu();
+@@@ -6013,6 -5831,50 +6032,53 @@@ int kvm_arch_pm_notifier(struct kvm *kv
+  }
+  #endif /* CONFIG_HAVE_KVM_PM_NOTIFIER */
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_vm_ioctl_get_clock(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_clock_data data;
++ 
++ 	memset(&data, 0, sizeof(data));
++ 	get_kvmclock(kvm, &data);
++ 	if (copy_to_user(argp, &data, sizeof(data)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	struct kvm_clock_data data;
++ 	u64 now_ns;
++ 
++ 	if (copy_from_user(&data, argp, sizeof(data)))
++ 		return -EFAULT;
++ 
++ 	if (data.flags)
++ 		return -EINVAL;
++ 
++ 	kvm_hv_invalidate_tsc_page(kvm);
++ 	kvm_start_pvclock_update(kvm);
++ 	pvclock_update_vm_gtod_copy(kvm);
++ 
++ 	/*
++ 	 * This pairs with kvm_guest_time_update(): when masterclock is
++ 	 * in use, we use master_kernel_ns + kvmclock_offset to set
++ 	 * unsigned 'system_time' so if we use get_kvmclock_ns() (which
++ 	 * is slightly ahead) here we risk going negative on unsigned
++ 	 * 'system_time' when 'data.clock' is very small.
++ 	 */
++ 	if (kvm->arch.use_master_clock)
++ 		now_ns = ka->master_kernel_ns;
++ 	else
++ 		now_ns = get_kvmclock_base_ns();
++ 	ka->kvmclock_offset = data.clock - now_ns;
++ 	kvm_end_pvclock_update(kvm);
++ 	return 0;
++ }
++ 
+++>>>>>>> 55c0cefbdbda (KVM: x86: Fix potential race in KVM_GET_CLOCK)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+* Unmerged path arch/x86/kvm/x86.c
