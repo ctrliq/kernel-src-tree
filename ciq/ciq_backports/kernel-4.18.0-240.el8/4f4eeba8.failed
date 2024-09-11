@@ -1,0 +1,334 @@
+io_uring: don't use kiocb.private to store buf_index
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+commit 4f4eeba87cc731b200bff9372d14a80f5996b277
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/4f4eeba8.failed
+
+kiocb.private is used in iomap_dio_rw() so store buf_index separately.
+
+	Signed-off-by: Bijan Mottahedeh <bijan.mottahedeh@oracle.com>
+
+Move 'buf_index' to a hole in io_kiocb.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 4f4eeba87cc731b200bff9372d14a80f5996b277)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 047c6a5f549f,d43f7e98e07a..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -317,26 -596,37 +317,28 @@@ struct io_poll_iocb 
+  struct io_kiocb {
+  	union {
+  		struct file		*file;
+ -		struct io_rw		rw;
+ +		struct kiocb		rw;
+  		struct io_poll_iocb	poll;
+ -		struct io_accept	accept;
+ -		struct io_sync		sync;
+ -		struct io_cancel	cancel;
+ -		struct io_timeout	timeout;
+ -		struct io_connect	connect;
+ -		struct io_sr_msg	sr_msg;
+ -		struct io_open		open;
+ -		struct io_close		close;
+ -		struct io_files_update	files_update;
+ -		struct io_fadvise	fadvise;
+ -		struct io_madvise	madvise;
+ -		struct io_epoll		epoll;
+ -		struct io_splice	splice;
+ -		struct io_provide_buf	pbuf;
+  	};
+  
+ -	struct io_async_ctx		*io;
+ -	int				cflags;
+ -	bool				needs_fixed_file;
+ -	u8				opcode;
+ +	struct sqe_submit	submit;
+  
++ 	u16				buf_index;
++ 
+  	struct io_ring_ctx	*ctx;
+  	struct list_head	list;
+ +	struct list_head	link_list;
+  	unsigned int		flags;
+  	refcount_t		refs;
+ -	struct task_struct	*task;
+ -	unsigned long		fsize;
+ +#define REQ_F_NOWAIT		1	/* must not punt to workers */
+ +#define REQ_F_IOPOLL_COMPLETED	2	/* polled IO has completed */
+ +#define REQ_F_FIXED_FILE	4	/* ctx owns file */
+ +#define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+ +#define REQ_F_IO_DRAINED	32	/* drain done */
+ +#define REQ_F_LINK		64	/* linked sqes */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+ +#define REQ_F_FAIL_LINK		256	/* fail rest of links */
+ +#define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -1089,6 -2100,10 +1091,13 @@@ static int io_prep_rw(struct io_kiocb *
+  			return -EINVAL;
+  		kiocb->ki_complete = io_complete_rw;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	req->rw.addr = READ_ONCE(sqe->addr);
++ 	req->rw.len = READ_ONCE(sqe->len);
++ 	req->buf_index = READ_ONCE(sqe->buf_index);
+++>>>>>>> 4f4eeba87cc7 (io_uring: don't use kiocb.private to store buf_index)
+  	return 0;
+  }
+  
+@@@ -1113,13 -2128,25 +1122,13 @@@ static inline void io_rw_done(struct ki
+  	}
+  }
+  
+ -static void kiocb_done(struct kiocb *kiocb, ssize_t ret)
+ -{
+ -	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
+ -
+ -	if (req->flags & REQ_F_CUR_POS)
+ -		req->file->f_pos = kiocb->ki_pos;
+ -	if (ret >= 0 && kiocb->ki_complete == io_complete_rw)
+ -		io_complete_rw(kiocb, ret, 0);
+ -	else
+ -		io_rw_done(kiocb, ret);
+ -}
+ -
+ -static ssize_t io_import_fixed(struct io_kiocb *req, int rw,
+ -			       struct iov_iter *iter)
+ +static int io_import_fixed(struct io_ring_ctx *ctx, int rw,
+ +			   const struct io_uring_sqe *sqe,
+ +			   struct iov_iter *iter)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	size_t len = req->rw.len;
+ +	size_t len = READ_ONCE(sqe->len);
+  	struct io_mapped_ubuf *imu;
+- 	unsigned index, buf_index;
++ 	u16 index, buf_index;
+  	size_t offset;
+  	u64 buf_addr;
+  
+@@@ -1127,7 -2154,7 +1136,11 @@@
+  	if (unlikely(!ctx->user_bufs))
+  		return -EFAULT;
+  
+++<<<<<<< HEAD
+ +	buf_index = READ_ONCE(sqe->buf_index);
+++=======
++ 	buf_index = req->buf_index;
+++>>>>>>> 4f4eeba87cc7 (io_uring: don't use kiocb.private to store buf_index)
+  	if (unlikely(buf_index >= ctx->nr_user_bufs))
+  		return -EFAULT;
+  
+@@@ -1183,32 -2211,173 +1196,175 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	/* don't drop a reference to these pages */
+ +	iter->type |= ITER_BVEC_FLAG_NO_REF;
+++=======
++ 	return len;
++ }
++ 
++ static void io_ring_submit_unlock(struct io_ring_ctx *ctx, bool needs_lock)
++ {
++ 	if (needs_lock)
++ 		mutex_unlock(&ctx->uring_lock);
++ }
++ 
++ static void io_ring_submit_lock(struct io_ring_ctx *ctx, bool needs_lock)
++ {
++ 	/*
++ 	 * "Normal" inline submissions always hold the uring_lock, since we
++ 	 * grab it from the system call. Same is true for the SQPOLL offload.
++ 	 * The only exception is when we've detached the request and issue it
++ 	 * from an async worker thread, grab the lock for that case.
++ 	 */
++ 	if (needs_lock)
++ 		mutex_lock(&ctx->uring_lock);
++ }
++ 
++ static struct io_buffer *io_buffer_select(struct io_kiocb *req, size_t *len,
++ 					  int bgid, struct io_buffer *kbuf,
++ 					  bool needs_lock)
++ {
++ 	struct io_buffer *head;
++ 
++ 	if (req->flags & REQ_F_BUFFER_SELECTED)
++ 		return kbuf;
++ 
++ 	io_ring_submit_lock(req->ctx, needs_lock);
++ 
++ 	lockdep_assert_held(&req->ctx->uring_lock);
++ 
++ 	head = idr_find(&req->ctx->io_buffer_idr, bgid);
++ 	if (head) {
++ 		if (!list_empty(&head->list)) {
++ 			kbuf = list_last_entry(&head->list, struct io_buffer,
++ 							list);
++ 			list_del(&kbuf->list);
++ 		} else {
++ 			kbuf = head;
++ 			idr_remove(&req->ctx->io_buffer_idr, bgid);
++ 		}
++ 		if (*len > kbuf->len)
++ 			*len = kbuf->len;
++ 	} else {
++ 		kbuf = ERR_PTR(-ENOBUFS);
++ 	}
++ 
++ 	io_ring_submit_unlock(req->ctx, needs_lock);
++ 
++ 	return kbuf;
++ }
++ 
++ static void __user *io_rw_buffer_select(struct io_kiocb *req, size_t *len,
++ 					bool needs_lock)
++ {
++ 	struct io_buffer *kbuf;
++ 	u16 bgid;
++ 
++ 	kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
++ 	bgid = req->buf_index;
++ 	kbuf = io_buffer_select(req, len, bgid, kbuf, needs_lock);
++ 	if (IS_ERR(kbuf))
++ 		return kbuf;
++ 	req->rw.addr = (u64) (unsigned long) kbuf;
++ 	req->flags |= REQ_F_BUFFER_SELECTED;
++ 	return u64_to_user_ptr(kbuf->addr);
++ }
++ 
++ #ifdef CONFIG_COMPAT
++ static ssize_t io_compat_import(struct io_kiocb *req, struct iovec *iov,
++ 				bool needs_lock)
++ {
++ 	struct compat_iovec __user *uiov;
++ 	compat_ssize_t clen;
++ 	void __user *buf;
++ 	ssize_t len;
++ 
++ 	uiov = u64_to_user_ptr(req->rw.addr);
++ 	if (!access_ok(uiov, sizeof(*uiov)))
++ 		return -EFAULT;
++ 	if (__get_user(clen, &uiov->iov_len))
++ 		return -EFAULT;
++ 	if (clen < 0)
++ 		return -EINVAL;
++ 
++ 	len = clen;
++ 	buf = io_rw_buffer_select(req, &len, needs_lock);
++ 	if (IS_ERR(buf))
++ 		return PTR_ERR(buf);
++ 	iov[0].iov_base = buf;
++ 	iov[0].iov_len = (compat_size_t) len;
++ 	return 0;
++ }
++ #endif
++ 
++ static ssize_t __io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
++ 				      bool needs_lock)
++ {
++ 	struct iovec __user *uiov = u64_to_user_ptr(req->rw.addr);
++ 	void __user *buf;
++ 	ssize_t len;
++ 
++ 	if (copy_from_user(iov, uiov, sizeof(*uiov)))
++ 		return -EFAULT;
++ 
++ 	len = iov[0].iov_len;
++ 	if (len < 0)
++ 		return -EINVAL;
++ 	buf = io_rw_buffer_select(req, &len, needs_lock);
++ 	if (IS_ERR(buf))
++ 		return PTR_ERR(buf);
++ 	iov[0].iov_base = buf;
++ 	iov[0].iov_len = len;
+++>>>>>>> 4f4eeba87cc7 (io_uring: don't use kiocb.private to store buf_index)
+  	return 0;
+  }
+  
+ -static ssize_t io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
+ -				    bool needs_lock)
+ -{
+ -	if (req->flags & REQ_F_BUFFER_SELECTED)
+ -		return 0;
+ -	if (!req->rw.len)
+ -		return 0;
+ -	else if (req->rw.len > 1)
+ -		return -EINVAL;
+ -
+ -#ifdef CONFIG_COMPAT
+ -	if (req->ctx->compat)
+ -		return io_compat_import(req, iov, needs_lock);
+ -#endif
+ -
+ -	return __io_iov_buffer_select(req, iov, needs_lock);
+ -}
+ -
+ -static ssize_t io_import_iovec(int rw, struct io_kiocb *req,
+ -			       struct iovec **iovec, struct iov_iter *iter,
+ -			       bool needs_lock)
+ +static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
+ +			       const struct sqe_submit *s, struct iovec **iovec,
+ +			       struct iov_iter *iter)
+  {
+ -	void __user *buf = u64_to_user_ptr(req->rw.addr);
+ -	size_t sqe_len = req->rw.len;
+ -	ssize_t ret;
+ +	const struct io_uring_sqe *sqe = s->sqe;
+ +	void __user *buf = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ +	size_t sqe_len = READ_ONCE(sqe->len);
+  	u8 opcode;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We're reading ->opcode for the second time, but the first read
+ +	 * doesn't care whether it's _FIXED or not, so it doesn't matter
+ +	 * whether ->opcode changes concurrently. The first read does care
+ +	 * about whether it is a READ or a WRITE, so we don't trust this read
+ +	 * for that purpose and instead let the caller pass in the read/write
+ +	 * flag.
+ +	 */
+ +	opcode = READ_ONCE(sqe->opcode);
+ +	if (opcode == IORING_OP_READ_FIXED ||
+ +	    opcode == IORING_OP_WRITE_FIXED) {
+ +		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
+++=======
++ 	opcode = req->opcode;
++ 	if (opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_WRITE_FIXED) {
++ 		*iovec = NULL;
++ 		return io_import_fixed(req, rw, iter);
++ 	}
++ 
++ 	/* buffer index only valid with fixed read/write, or buffer select  */
++ 	if (req->buf_index && !(req->flags & REQ_F_BUFFER_SELECT))
++ 		return -EINVAL;
++ 
++ 	if (opcode == IORING_OP_READ || opcode == IORING_OP_WRITE) {
++ 		if (req->flags & REQ_F_BUFFER_SELECT) {
++ 			buf = io_rw_buffer_select(req, &sqe_len, needs_lock);
++ 			if (IS_ERR(buf)) {
++ 				*iovec = NULL;
++ 				return PTR_ERR(buf);
++ 			}
++ 			req->rw.len = sqe_len;
++ 		}
++ 
++ 		ret = import_single_range(rw, buf, sqe_len, *iovec, iter);
+++>>>>>>> 4f4eeba87cc7 (io_uring: don't use kiocb.private to store buf_index)
+  		*iovec = NULL;
+  		return ret < 0 ? ret : sqe_len;
+  	}
+* Unmerged path fs/io_uring.c
