@@ -1,0 +1,428 @@
+s390/qeth: add TX NAPI support for IQD devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit e53edf743d26b39dfd78af43ff97620a4ac13ffc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e53edf74.failed
+
+Due to their large MTU and potentially low utilization of TX buffers,
+IQD devices in particular require fast TX recycling. This makes them
+a prime candidate for a TX NAPI path in qeth.
+
+qeth_tx_poll() uses the recently introduced qdio_inspect_queue() helper
+to poll the TX queue for completed buffers. To avoid hogging the CPU for
+too long, we yield to the stack after completing an entire queue's worth
+of buffers.
+While IQD is expected to transfer its buffers synchronously (and thus
+doesn't support TX interrupts), a timer covers for the odd case where a
+TX buffer doesn't complete synchronously. Currently this timer should
+only ever fire for
+(1) the mcast queue,
+(2) the occasional race, where the NAPI poll code observes an update to
+    queue->used_buffers while the TX doorbell hasn't been issued yet.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e53edf743d26b39dfd78af43ff97620a4ac13ffc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_ethtool.c
+diff --cc drivers/s390/net/qeth_core.h
+index dcbcb3b4d38f,ae2ae17e3e76..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -461,6 -441,52 +462,55 @@@ enum qeth_out_q_states 
+         QETH_OUT_Q_LOCKED_FLUSH,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define QETH_CARD_STAT_ADD(_c, _stat, _val)	((_c)->stats._stat += (_val))
++ #define QETH_CARD_STAT_INC(_c, _stat)		QETH_CARD_STAT_ADD(_c, _stat, 1)
++ 
++ #define QETH_TXQ_STAT_ADD(_q, _stat, _val)	((_q)->stats._stat += (_val))
++ #define QETH_TXQ_STAT_INC(_q, _stat)		QETH_TXQ_STAT_ADD(_q, _stat, 1)
++ 
++ struct qeth_card_stats {
++ 	u64 rx_bufs;
++ 	u64 rx_skb_csum;
++ 	u64 rx_sg_skbs;
++ 	u64 rx_sg_frags;
++ 	u64 rx_sg_alloc_page;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 rx_packets;
++ 	u64 rx_bytes;
++ 	u64 rx_errors;
++ 	u64 rx_dropped;
++ 	u64 rx_multicast;
++ };
++ 
++ struct qeth_out_q_stats {
++ 	u64 bufs;
++ 	u64 bufs_pack;
++ 	u64 buf_elements;
++ 	u64 skbs_pack;
++ 	u64 skbs_sg;
++ 	u64 skbs_csum;
++ 	u64 skbs_tso;
++ 	u64 skbs_linearized;
++ 	u64 skbs_linearized_fail;
++ 	u64 tso_bytes;
++ 	u64 packing_mode_switch;
++ 	u64 stopped;
++ 	u64 completion_yield;
++ 	u64 completion_timer;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 tx_packets;
++ 	u64 tx_bytes;
++ 	u64 tx_errors;
++ 	u64 tx_dropped;
++ };
++ 
++ #define QETH_TX_TIMER_USECS		500
++ 
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  struct qeth_qdio_out_q {
+  	struct qdio_buffer *qdio_bufs[QDIO_MAX_BUFFERS_PER_Q];
+  	struct qeth_qdio_out_buffer *bufs[QDIO_MAX_BUFFERS_PER_Q];
+@@@ -480,8 -505,34 +530,37 @@@
+  	atomic_t used_buffers;
+  	/* indicates whether PCI flag must be set (or if one is outstanding) */
+  	atomic_t set_pci_flags_count;
++ 	struct napi_struct napi;
++ 	struct timer_list timer;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define qeth_for_each_output_queue(card, q, i)		\
++ 	for (i = 0; i < card->qdio.no_out_queues &&	\
++ 		    (q = card->qdio.out_qs[i]); i++)
++ 
++ #define	qeth_napi_to_out_queue(n) container_of(n, struct qeth_qdio_out_q, napi)
++ 
++ static inline void qeth_tx_arm_timer(struct qeth_qdio_out_q *queue)
++ {
++ 	if (timer_pending(&queue->timer))
++ 		return;
++ 	mod_timer(&queue->timer, usecs_to_jiffies(QETH_TX_TIMER_USECS) +
++ 				 jiffies);
++ }
++ 
++ static inline bool qeth_out_queue_is_full(struct qeth_qdio_out_q *queue)
++ {
++ 	return atomic_read(&queue->used_buffers) >= QDIO_MAX_BUFFERS_PER_Q;
++ }
++ 
++ static inline bool qeth_out_queue_is_empty(struct qeth_qdio_out_q *queue)
++ {
++ 	return atomic_read(&queue->used_buffers) == 0;
++ }
++ 
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  struct qeth_qdio_info {
+  	atomic_t state;
+  	/* input */
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,3223ad80998c..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -2437,17 -2313,22 +2445,29 @@@ static int qeth_alloc_qdio_queues(struc
+  
+  	/* outbound */
+  	for (i = 0; i < card->qdio.no_out_queues; ++i) {
+- 		card->qdio.out_qs[i] = qeth_alloc_output_queue();
+- 		if (!card->qdio.out_qs[i])
++ 		struct qeth_qdio_out_q *queue;
++ 
++ 		queue = qeth_alloc_output_queue();
++ 		if (!queue)
+  			goto out_freeoutq;
+++<<<<<<< HEAD
+ +		QETH_DBF_TEXT_(SETUP, 2, "outq %i", i);
+ +		QETH_DBF_HEX(SETUP, 2, &card->qdio.out_qs[i], sizeof(void *));
+ +		card->qdio.out_qs[i]->card = card;
+ +		card->qdio.out_qs[i]->queue_no = i;
+++=======
++ 		QETH_CARD_TEXT_(card, 2, "outq %i", i);
++ 		QETH_CARD_HEX(card, 2, &queue, sizeof(void *));
++ 		card->qdio.out_qs[i] = queue;
++ 		queue->card = card;
++ 		queue->queue_no = i;
++ 		timer_setup(&queue->timer, qeth_tx_completion_timer, 0);
++ 
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  		/* give outbound qeth_qdio_buffers their qdio_buffers */
+  		for (j = 0; j < QDIO_MAX_BUFFERS_PER_Q; ++j) {
+- 			WARN_ON(card->qdio.out_qs[i]->bufs[j] != NULL);
+- 			if (qeth_init_qdio_out_buf(card->qdio.out_qs[i], j))
++ 			WARN_ON(queue->bufs[j]);
++ 			if (qeth_init_qdio_out_buf(queue, j))
+  				goto out_freeoutqbufs;
+  		}
+  	}
+@@@ -3414,11 -3286,14 +3435,16 @@@ static void qeth_flush_buffers(struct q
+  	qdio_flags = QDIO_FLAG_SYNC_OUTPUT;
+  	if (atomic_read(&queue->set_pci_flags_count))
+  		qdio_flags |= QDIO_FLAG_PCI_OUT;
+ +	atomic_add(count, &queue->used_buffers);
+  	rc = do_QDIO(CARD_DDEV(queue->card), qdio_flags,
+  		     queue->queue_no, index, count);
++ 
++ 	/* Fake the TX completion interrupt: */
++ 	if (IS_IQD(card))
++ 		napi_schedule(&queue->napi);
++ 
+  	if (rc) {
+ +		queue->card->stats.tx_errors += count;
+  		/* ignore temporary SIGA errors without busy condition */
+  		if (rc == -ENOBUFS)
+  			return;
+@@@ -3599,47 -3471,19 +3625,60 @@@ static void qeth_qdio_output_handler(st
+  		int bidx = i % QDIO_MAX_BUFFERS_PER_Q;
+  		buffer = queue->bufs[bidx];
+  		qeth_handle_send_error(card, buffer, qdio_error);
+++<<<<<<< HEAD
+ +
+ +		if (queue->bufstates &&
+ +		    (queue->bufstates[bidx].flags &
+ +		     QDIO_OUTBUF_STATE_FLAG_PENDING) != 0) {
+ +			WARN_ON_ONCE(card->options.cq != QETH_CQ_ENABLED);
+ +
+ +			if (atomic_cmpxchg(&buffer->state,
+ +					   QETH_QDIO_BUF_PRIMED,
+ +					   QETH_QDIO_BUF_PENDING) ==
+ +				QETH_QDIO_BUF_PRIMED) {
+ +				qeth_notify_skbs(queue, buffer,
+ +						 TX_NOTIFY_PENDING);
+ +			}
+ +			QETH_CARD_TEXT_(queue->card, 5, "pel%d", bidx);
+ +
+ +			/* prepare the queue slot for re-use: */
+ +			qeth_scrub_qdio_buffer(buffer->buffer,
+ +					       QETH_MAX_BUFFER_ELEMENTS(card));
+ +			if (qeth_init_qdio_out_buf(queue, bidx)) {
+ +				QETH_CARD_TEXT(card, 2, "outofbuf");
+ +				qeth_schedule_recovery(card);
+ +			}
+ +		} else {
+ +			if (card->options.cq == QETH_CQ_ENABLED) {
+ +				enum iucv_tx_notify n;
+ +
+ +				n = qeth_compute_cq_notification(
+ +					buffer->buffer->element[15].sflags, 0);
+ +				qeth_notify_skbs(queue, buffer, n);
+ +			}
+ +
+ +			qeth_clear_output_buffer(queue, buffer);
+ +		}
+ +		qeth_cleanup_handled_pending(queue, bidx, 0);
+++=======
++ 		qeth_clear_output_buffer(queue, buffer, qdio_error);
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  	}
+- 	atomic_sub(count, &queue->used_buffers);
+- 	/* check if we need to do something on this outbound queue */
+- 	if (!IS_IQD(card))
+- 		qeth_check_outbound_queue(queue);
+  
+++<<<<<<< HEAD
+ +	netif_wake_queue(queue->card->dev);
+++=======
++ 	atomic_sub(count, &queue->used_buffers);
++ 	qeth_check_outbound_queue(queue);
++ 
++ 	txq = netdev_get_tx_queue(dev, __queue);
++ 	/* xmit may have observed the full-condition, but not yet stopped the
++ 	 * txq. In which case the code below won't trigger. So before returning,
++ 	 * xmit will re-check the txq's fill level and wake it up if needed.
++ 	 */
++ 	if (netif_tx_queue_stopped(txq) && !qeth_out_queue_is_full(queue))
++ 		netif_tx_wake_queue(txq);
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  }
+  
+  /**
+@@@ -6246,11 -6198,27 +6389,35 @@@ int qeth_stop(struct net_device *dev
+  	struct qeth_card *card = dev->ml_priv;
+  
+  	QETH_CARD_TEXT(card, 4, "qethstop");
+++<<<<<<< HEAD
+ +	netif_tx_disable(dev);
+ +	if (card->state == CARD_STATE_UP) {
+ +		card->state = CARD_STATE_SOFTSETUP;
+ +		napi_disable(&card->napi);
+ +	}
+++=======
++ 	if (IS_IQD(card)) {
++ 		struct qeth_qdio_out_q *queue;
++ 		unsigned int i;
++ 
++ 		/* Quiesce the NAPI instances: */
++ 		qeth_for_each_output_queue(card, queue, i) {
++ 			napi_disable(&queue->napi);
++ 			del_timer_sync(&queue->timer);
++ 		}
++ 
++ 		/* Stop .ndo_start_xmit, might still access queue->napi. */
++ 		netif_tx_disable(dev);
++ 
++ 		/* Queues may get re-allocated, so remove the NAPIs here. */
++ 		qeth_for_each_output_queue(card, queue, i)
++ 			netif_napi_del(&queue->napi);
++ 	} else {
++ 		netif_tx_disable(dev);
++ 	}
++ 
++ 	napi_disable(&card->napi);
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(qeth_stop);
+diff --cc drivers/s390/net/qeth_ethtool.c
+index 31474f66f6bf,096698df3886..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -9,43 -9,85 +9,101 @@@
+  #include <linux/ethtool.h>
+  #include "qeth_core.h"
+  
+ -
+ -#define QETH_TXQ_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_out_q_stats, _stat) \
+ -}
+ -
+ -#define QETH_CARD_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_card_stats, _stat) \
+ -}
+ -
+ -struct qeth_stats {
+ -	char name[ETH_GSTRING_LEN];
+ -	unsigned int offset;
+ +static struct {
+ +	const char str[ETH_GSTRING_LEN];
+ +} qeth_ethtool_stats_keys[] = {
+ +/*  0 */{"rx skbs"},
+ +	{"rx buffers"},
+ +	{"tx skbs"},
+ +	{"tx buffers"},
+ +	{"tx skbs no packing"},
+ +	{"tx buffers no packing"},
+ +	{"tx skbs packing"},
+ +	{"tx buffers packing"},
+ +	{"tx sg skbs"},
+ +	{"tx buffer elements"},
+ +/* 10 */{"rx sg skbs"},
+ +	{"rx sg frags"},
+ +	{"rx sg page allocs"},
+ +	{"tx large kbytes"},
+ +	{"tx large count"},
+ +	{"tx pk state ch n->p"},
+ +	{"tx pk state ch p->n"},
+ +	{"tx pk watermark low"},
+ +	{"tx pk watermark high"},
+ +	{"queue 0 buffer usage"},
+ +/* 20 */{"queue 1 buffer usage"},
+ +	{"queue 2 buffer usage"},
+ +	{"queue 3 buffer usage"},
+ +	{"tx csum"},
+ +	{"tx lin"},
+ +	{"tx linfail"},
+ +	{"rx csum"}
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qeth_stats txq_stats[] = {
++ 	QETH_TXQ_STAT("IO buffers", bufs),
++ 	QETH_TXQ_STAT("IO buffer elements", buf_elements),
++ 	QETH_TXQ_STAT("packed IO buffers", bufs_pack),
++ 	QETH_TXQ_STAT("skbs", tx_packets),
++ 	QETH_TXQ_STAT("packed skbs", skbs_pack),
++ 	QETH_TXQ_STAT("SG skbs", skbs_sg),
++ 	QETH_TXQ_STAT("HW csum skbs", skbs_csum),
++ 	QETH_TXQ_STAT("TSO skbs", skbs_tso),
++ 	QETH_TXQ_STAT("linearized skbs", skbs_linearized),
++ 	QETH_TXQ_STAT("linearized+error skbs", skbs_linearized_fail),
++ 	QETH_TXQ_STAT("TSO bytes", tso_bytes),
++ 	QETH_TXQ_STAT("Packing mode switches", packing_mode_switch),
++ 	QETH_TXQ_STAT("Queue stopped", stopped),
++ 	QETH_TXQ_STAT("Completion yield", completion_yield),
++ 	QETH_TXQ_STAT("Completion timer", completion_timer),
++ };
++ 
++ static const struct qeth_stats card_stats[] = {
++ 	QETH_CARD_STAT("rx0 IO buffers", rx_bufs),
++ 	QETH_CARD_STAT("rx0 HW csum skbs", rx_skb_csum),
++ 	QETH_CARD_STAT("rx0 SG skbs", rx_sg_skbs),
++ 	QETH_CARD_STAT("rx0 SG page frags", rx_sg_frags),
++ 	QETH_CARD_STAT("rx0 SG page allocs", rx_sg_alloc_page),
++ };
++ 
++ #define TXQ_STATS_LEN	ARRAY_SIZE(txq_stats)
++ #define CARD_STATS_LEN	ARRAY_SIZE(card_stats)
++ 
++ static void qeth_add_stat_data(u64 **dst, void *src,
++ 			       const struct qeth_stats stats[],
++ 			       unsigned int size)
++ {
++ 	unsigned int i;
++ 	char *stat;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		stat = (char *)src + stats[i].offset;
++ 		**dst = *(u64 *)stat;
++ 		(*dst)++;
++ 	}
++ }
++ 
++ static void qeth_add_stat_strings(u8 **data, const char *prefix,
++ 				  const struct qeth_stats stats[],
++ 				  unsigned int size)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		snprintf(*data, ETH_GSTRING_LEN, "%s%s", prefix, stats[i].name);
++ 		*data += ETH_GSTRING_LEN;
++ 	}
++ }
++ 
+++>>>>>>> e53edf743d26 (s390/qeth: add TX NAPI support for IQD devices)
+  static int qeth_get_sset_count(struct net_device *dev, int stringset)
+  {
+ -	struct qeth_card *card = dev->ml_priv;
+ -
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+ -		return CARD_STATS_LEN +
+ -		       card->qdio.no_out_queues * TXQ_STATS_LEN;
+ +		return (sizeof(qeth_ethtool_stats_keys) / ETH_GSTRING_LEN);
+  	default:
+  		return -EINVAL;
+  	}
+diff --git a/arch/s390/include/asm/qdio.h b/arch/s390/include/asm/qdio.h
+index 5e54280a822a..2453991b23a0 100644
+--- a/arch/s390/include/asm/qdio.h
++++ b/arch/s390/include/asm/qdio.h
+@@ -16,6 +16,7 @@
+ #define QDIO_MAX_QUEUES_PER_IRQ		4
+ #define QDIO_MAX_BUFFERS_PER_Q		128
+ #define QDIO_MAX_BUFFERS_MASK		(QDIO_MAX_BUFFERS_PER_Q - 1)
++#define QDIO_BUFNR(num)			((num) & QDIO_MAX_BUFFERS_MASK)
+ #define QDIO_MAX_ELEMENTS_PER_BUFFER	16
+ #define QDIO_SBAL_SIZE			256
+ 
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_ethtool.c
