@@ -1,0 +1,524 @@
+xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit 1d233886dd904edbf239eeffe435c3308ae97625
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1d233886.failed
+
+Since the bulk queue used by XDP_REDIRECT now lives in struct net_device,
+we can re-use the bulking for the non-map version of the bpf_redirect()
+helper. This is a simple matter of having xdp_do_redirect_slow() queue the
+frame on the bulk queue instead of sending it out with __bpf_tx_xdp().
+
+Unfortunately we can't make the bpf_redirect() helper return an error if
+the ifindex doesn't exit (as bpf_redirect_map() does), because we don't
+have a reference to the network namespace of the ingress device at the time
+the helper is called. So we have to leave it as-is and keep the device
+lookup in xdp_do_redirect_slow().
+
+Since this leaves less reason to have the non-map redirect code in a
+separate function, so we get rid of the xdp_do_redirect_slow() function
+entirely. This does lose us the tracepoint disambiguation, but fortunately
+the xdp_redirect and xdp_redirect_map tracepoints use the same tracepoint
+entry structures. This means both can contain a map index, so we can just
+amend the tracepoint definitions so we always emit the xdp_redirect(_err)
+tracepoints, but with the map ID only populated if a map is present. This
+means we retire the xdp_redirect_map(_err) tracepoints entirely, but keep
+the definitions around in case someone is still listening for them.
+
+With this change, the performance of the xdp_redirect sample program goes
+from 5Mpps to 8.4Mpps (a 68% increase).
+
+Since the flush functions are no longer map-specific, rename the flush()
+functions to drop _map from their names. One of the renamed functions is
+the xdp_do_flush_map() callback used in all the xdp-enabled drivers. To
+keep from having to update all drivers, use a #define to keep the old name
+working, and only update the virtual drivers in this patch.
+
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/157918768505.1458396.17518057312953572912.stgit@toke.dk
+(cherry picked from commit 1d233886dd904edbf239eeffe435c3308ae97625)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/trace/events/xdp.h
+#	kernel/bpf/devmap.c
+#	net/core/filter.c
+diff --cc include/linux/bpf.h
+index 602dd6841705,8e3b8f4ad183..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -753,7 -1055,10 +753,14 @@@ struct xdp_buff
+  struct sk_buff;
+  
+  struct bpf_dtab_netdev *__dev_map_lookup_elem(struct bpf_map *map, u32 key);
+++<<<<<<< HEAD
+ +void __dev_map_flush(struct bpf_map *map);
+++=======
++ struct bpf_dtab_netdev *__dev_map_hash_lookup_elem(struct bpf_map *map, u32 key);
++ void __dev_flush(void);
++ int dev_xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
++ 		    struct net_device *dev_rx);
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
+  		    struct net_device *dev_rx);
+  int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
+@@@ -847,7 -1165,13 +854,17 @@@ static inline struct net_device  *__dev
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static inline void __dev_map_flush(struct bpf_map *map)
+++=======
++ static inline struct net_device  *__dev_map_hash_lookup_elem(struct bpf_map *map,
++ 							     u32 key)
++ {
++ 	return NULL;
++ }
++ 
++ static inline void __dev_flush(void)
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  {
+  }
+  
+diff --cc include/trace/events/xdp.h
+index 42362fb56f08,b680973687b4..000000000000
+--- a/include/trace/events/xdp.h
++++ b/include/trace/events/xdp.h
+@@@ -132,60 -146,34 +146,56 @@@ DEFINE_EVENT(xdp_redirect_template, xdp
+  );
+  
+  #define _trace_xdp_redirect(dev, xdp, to)		\
+- 	 trace_xdp_redirect(dev, xdp, to, 0, NULL, 0);
++ 	 trace_xdp_redirect(dev, xdp, NULL, 0, NULL, to);
+  
+  #define _trace_xdp_redirect_err(dev, xdp, to, err)	\
+- 	 trace_xdp_redirect_err(dev, xdp, to, err, NULL, 0);
++ 	 trace_xdp_redirect_err(dev, xdp, NULL, err, NULL, to);
++ 
++ #define _trace_xdp_redirect_map(dev, xdp, to, map, index)		\
++ 	 trace_xdp_redirect(dev, xdp, to, 0, map, index);
+  
+- DEFINE_EVENT_PRINT(xdp_redirect_template, xdp_redirect_map,
++ #define _trace_xdp_redirect_map_err(dev, xdp, to, map, index, err)	\
++ 	 trace_xdp_redirect_err(dev, xdp, to, err, map, index);
++ 
++ /* not used anymore, but kept around so as not to break old programs */
++ DEFINE_EVENT(xdp_redirect_template, xdp_redirect_map,
+  	TP_PROTO(const struct net_device *dev,
+  		 const struct bpf_prog *xdp,
+- 		 int to_ifindex, int err,
+- 		 const struct bpf_map *map, u32 map_index),
+- 	TP_ARGS(dev, xdp, to_ifindex, err, map, map_index),
+- 	TP_printk("prog_id=%d action=%s ifindex=%d to_ifindex=%d err=%d"
+- 		  " map_id=%d map_index=%d",
+- 		  __entry->prog_id,
+- 		  __print_symbolic(__entry->act, __XDP_ACT_SYM_TAB),
+- 		  __entry->ifindex, __entry->to_ifindex,
+- 		  __entry->err,
+- 		  __entry->map_id, __entry->map_index)
++ 		 const void *tgt, int err,
++ 		 const struct bpf_map *map, u32 index),
++ 	TP_ARGS(dev, xdp, tgt, err, map, index)
+  );
+  
+- DEFINE_EVENT_PRINT(xdp_redirect_template, xdp_redirect_map_err,
++ DEFINE_EVENT(xdp_redirect_template, xdp_redirect_map_err,
+  	TP_PROTO(const struct net_device *dev,
+  		 const struct bpf_prog *xdp,
+- 		 int to_ifindex, int err,
+- 		 const struct bpf_map *map, u32 map_index),
+- 	TP_ARGS(dev, xdp, to_ifindex, err, map, map_index),
+- 	TP_printk("prog_id=%d action=%s ifindex=%d to_ifindex=%d err=%d"
+- 		  " map_id=%d map_index=%d",
+- 		  __entry->prog_id,
+- 		  __print_symbolic(__entry->act, __XDP_ACT_SYM_TAB),
+- 		  __entry->ifindex, __entry->to_ifindex,
+- 		  __entry->err,
+- 		  __entry->map_id, __entry->map_index)
++ 		 const void *tgt, int err,
++ 		 const struct bpf_map *map, u32 index),
++ 	TP_ARGS(dev, xdp, tgt, err, map, index)
+  );
+  
+++<<<<<<< HEAD
+ +#ifndef __DEVMAP_OBJ_TYPE
+ +#define __DEVMAP_OBJ_TYPE
+ +struct _bpf_dtab_netdev {
+ +	struct net_device *dev;
+ +};
+ +#endif /* __DEVMAP_OBJ_TYPE */
+ +
+ +#define devmap_ifindex(fwd, map)				\
+ +	((map->map_type == BPF_MAP_TYPE_DEVMAP) ?		\
+ +	  ((struct _bpf_dtab_netdev *)fwd)->dev->ifindex : 0)
+ +
+ +#define _trace_xdp_redirect_map(dev, xdp, fwd, map, idx)		\
+ +	 trace_xdp_redirect_map(dev, xdp, devmap_ifindex(fwd, map),	\
+ +				0, map, idx)
+ +
+ +#define _trace_xdp_redirect_map_err(dev, xdp, fwd, map, idx, err)	\
+ +	 trace_xdp_redirect_map_err(dev, xdp, devmap_ifindex(fwd, map),	\
+ +				    err, map, idx)
+ +
+++=======
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  TRACE_EVENT(xdp_cpumap_kthread,
+  
+  	TP_PROTO(int map_id, unsigned int processed,  unsigned int drops,
+diff --cc kernel/bpf/devmap.c
+index cfc445b29247,d5311009953f..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -75,11 -71,17 +75,15 @@@ struct bpf_dtab_netdev 
+  
+  struct bpf_dtab {
+  	struct bpf_map map;
+ -	struct bpf_dtab_netdev **netdev_map; /* DEVMAP type only */
+ +	struct bpf_dtab_netdev **netdev_map;
+ +	struct list_head __percpu *flush_list;
+  	struct list_head list;
+ -
+ -	/* these are only used for DEVMAP_HASH type maps */
+ -	struct hlist_head *dev_index_head;
+ -	spinlock_t index_lock;
+ -	unsigned int items;
+ -	u32 n_buckets;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static DEFINE_PER_CPU(struct list_head, dev_flush_list);
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  static DEFINE_SPINLOCK(dev_map_lock);
+  static LIST_HEAD(dev_map_list);
+  
+@@@ -282,11 -364,10 +286,18 @@@ error
+   * net device can be torn down. On devmap tear down we ensure the flush list
+   * is empty before completing to ensure all flush operations have completed.
+   */
+++<<<<<<< HEAD
+ +void __dev_map_flush(struct bpf_map *map)
+ +{
+ +	struct bpf_dtab *dtab = container_of(map, struct bpf_dtab, map);
+ +	struct list_head *flush_list = this_cpu_ptr(dtab->flush_list);
+ +	struct xdp_bulk_queue *bq, *tmp;
+++=======
++ void __dev_flush(void)
++ {
++ 	struct list_head *flush_list = this_cpu_ptr(&dev_flush_list);
++ 	struct xdp_dev_bulk_queue *bq, *tmp;
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  
+  	rcu_read_lock();
+  	list_for_each_entry_safe(bq, tmp, flush_list, flush_node)
+@@@ -313,15 -394,14 +324,19 @@@ struct bpf_dtab_netdev *__dev_map_looku
+  /* Runs under RCU-read-side, plus in softirq under NAPI protection.
+   * Thus, safe percpu variable access.
+   */
+ -static int bq_enqueue(struct net_device *dev, struct xdp_frame *xdpf,
+ +static int bq_enqueue(struct bpf_dtab_netdev *obj, struct xdp_frame *xdpf,
+  		      struct net_device *dev_rx)
+- 
+  {
+++<<<<<<< HEAD
+ +	struct list_head *flush_list = this_cpu_ptr(obj->dtab->flush_list);
+ +	struct xdp_bulk_queue *bq = this_cpu_ptr(obj->bulkq);
+++=======
++ 	struct list_head *flush_list = this_cpu_ptr(&dev_flush_list);
++ 	struct xdp_dev_bulk_queue *bq = this_cpu_ptr(dev->xdp_bulkq);
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  
+  	if (unlikely(bq->count == DEV_MAP_BULK_SIZE))
+ -		bq_xmit_all(bq, 0);
+ +		bq_xmit_all(bq, 0, true);
+  
+  	/* Ingress dev_rx will be the same for all xdp_frame's in
+  	 * bulk_queue, because bq stored per-CPU and must be flushed
+@@@ -356,9 -435,23 +370,23 @@@ static inline int __xdp_enqueue(struct 
+  	if (unlikely(!xdpf))
+  		return -EOVERFLOW;
+  
+ -	return bq_enqueue(dev, xdpf, dev_rx);
+ +	return bq_enqueue(dst, xdpf, dev_rx);
+  }
+  
++ int dev_xdp_enqueue(struct net_device *dev, struct xdp_buff *xdp,
++ 		    struct net_device *dev_rx)
++ {
++ 	return __xdp_enqueue(dev, xdp, dev_rx);
++ }
++ 
++ int dev_map_enqueue(struct bpf_dtab_netdev *dst, struct xdp_buff *xdp,
++ 		    struct net_device *dev_rx)
++ {
++ 	struct net_device *dev = dst->dev;
++ 
++ 	return __xdp_enqueue(dev, xdp, dev_rx);
++ }
++ 
+  int dev_map_generic_redirect(struct bpf_dtab_netdev *dst, struct sk_buff *skb,
+  			     struct bpf_prog *xdp_prog)
+  {
+@@@ -566,6 -772,9 +594,12 @@@ static int __init dev_map_init(void
+  	BUILD_BUG_ON(offsetof(struct bpf_dtab_netdev, dev) !=
+  		     offsetof(struct _bpf_dtab_netdev, dev));
+  	register_netdevice_notifier(&dev_map_notifier);
+++<<<<<<< HEAD
+++=======
++ 
++ 	for_each_possible_cpu(cpu)
++ 		INIT_LIST_HEAD(&per_cpu(dev_flush_list, cpu));
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  	return 0;
+  }
+  
+diff --cc net/core/filter.c
+index 80b28d966162,17de6747d9e3..000000000000
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@@ -3471,116 -3458,30 +3471,70 @@@ static const struct bpf_func_proto bpf_
+  	.arg2_type	= ARG_ANYTHING,
+  };
+  
+- static int __bpf_tx_xdp(struct net_device *dev,
+- 			struct bpf_map *map,
+- 			struct xdp_buff *xdp,
+- 			u32 index)
+- {
+- 	struct xdp_frame *xdpf;
+- 	int err, sent;
+- 
+- 	if (!dev->netdev_ops->ndo_xdp_xmit) {
+- 		return -EOPNOTSUPP;
+- 	}
+- 
+- 	err = xdp_ok_fwd_dev(dev, xdp->data_end - xdp->data);
+- 	if (unlikely(err))
+- 		return err;
+- 
+- 	xdpf = convert_to_xdp_frame(xdp);
+- 	if (unlikely(!xdpf))
+- 		return -EOVERFLOW;
+- 
+- 	sent = dev->netdev_ops->ndo_xdp_xmit(dev, 1, &xdpf, XDP_XMIT_FLUSH);
+- 	if (sent <= 0)
+- 		return sent;
+- 	return 0;
+- }
+- 
+- static noinline int
+- xdp_do_redirect_slow(struct net_device *dev, struct xdp_buff *xdp,
+- 		     struct bpf_prog *xdp_prog, struct bpf_redirect_info *ri)
+- {
+- 	struct net_device *fwd;
+- 	u32 index = ri->tgt_index;
+- 	int err;
+- 
+- 	fwd = dev_get_by_index_rcu(dev_net(dev), index);
+- 	ri->tgt_index = 0;
+- 	if (unlikely(!fwd)) {
+- 		err = -EINVAL;
+- 		goto err;
+- 	}
+- 
+- 	err = __bpf_tx_xdp(fwd, NULL, xdp, 0);
+- 	if (unlikely(err))
+- 		goto err;
+- 
+- 	_trace_xdp_redirect(dev, xdp_prog, index);
+- 	return 0;
+- err:
+- 	_trace_xdp_redirect_err(dev, xdp_prog, index, err);
+- 	return err;
+- }
+- 
+  static int __bpf_tx_xdp_map(struct net_device *dev_rx, void *fwd,
+ -			    struct bpf_map *map, struct xdp_buff *xdp)
+ +			    struct bpf_map *map,
+ +			    struct xdp_buff *xdp)
+  {
+ +	int err;
+ +
+  	switch (map->map_type) {
+ -	case BPF_MAP_TYPE_DEVMAP:
+ -	case BPF_MAP_TYPE_DEVMAP_HASH:
+ -		return dev_map_enqueue(fwd, xdp, dev_rx);
+ -	case BPF_MAP_TYPE_CPUMAP:
+ -		return cpu_map_enqueue(fwd, xdp, dev_rx);
+ -	case BPF_MAP_TYPE_XSKMAP:
+ -		return __xsk_map_redirect(fwd, xdp);
+ +	case BPF_MAP_TYPE_DEVMAP: {
+ +		struct bpf_dtab_netdev *dst = fwd;
+ +
+ +		err = dev_map_enqueue(dst, xdp, dev_rx);
+ +		if (unlikely(err))
+ +			return err;
+ +		break;
+ +	}
+ +	case BPF_MAP_TYPE_CPUMAP: {
+ +		struct bpf_cpu_map_entry *rcpu = fwd;
+ +
+ +		err = cpu_map_enqueue(rcpu, xdp, dev_rx);
+ +		if (unlikely(err))
+ +			return err;
+ +		break;
+ +	}
+ +	case BPF_MAP_TYPE_XSKMAP: {
+ +		struct xdp_sock *xs = fwd;
+ +
+ +		err = __xsk_map_redirect(xs, xdp);
+ +		return err;
+ +	}
+  	default:
+  		return -EBADRQC;
+  	}
+  	return 0;
+  }
+  
+- void xdp_do_flush_map(void)
++ void xdp_do_flush(void)
+  {
+++<<<<<<< HEAD
+ +	struct bpf_redirect_info *ri = this_cpu_ptr(&bpf_redirect_info);
+ +	struct bpf_map *map = ri->map_to_flush;
+ +
+ +	ri->map_to_flush = NULL;
+ +	if (map) {
+ +		switch (map->map_type) {
+ +		case BPF_MAP_TYPE_DEVMAP:
+ +			__dev_map_flush(map);
+ +			break;
+ +		case BPF_MAP_TYPE_CPUMAP:
+ +			__cpu_map_flush();
+ +			break;
+ +		case BPF_MAP_TYPE_XSKMAP:
+ +			__xsk_map_flush();
+ +			break;
+ +		default:
+ +			break;
+ +		}
+ +	}
+++=======
++ 	__dev_flush();
++ 	__cpu_map_flush();
++ 	__xsk_map_flush();
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  }
+- EXPORT_SYMBOL_GPL(xdp_do_flush_map);
++ EXPORT_SYMBOL_GPL(xdp_do_flush);
+  
+  static inline void *__xdp_map_lookup_elem(struct bpf_map *map, u32 index)
+  {
+@@@ -3625,10 -3529,18 +3580,25 @@@ int xdp_do_redirect(struct net_device *
+  	ri->tgt_value = NULL;
+  	WRITE_ONCE(ri->map, NULL);
+  
+++<<<<<<< HEAD
+ +	if (ri->map_to_flush && unlikely(ri->map_to_flush != map))
+ +		xdp_do_flush_map();
+ +
+ +	err = __bpf_tx_xdp_map(dev, fwd, map, xdp);
+++=======
++ 	if (unlikely(!map)) {
++ 		fwd = dev_get_by_index_rcu(dev_net(dev), index);
++ 		if (unlikely(!fwd)) {
++ 			err = -EINVAL;
++ 			goto err;
++ 		}
++ 
++ 		err = dev_xdp_enqueue(fwd, xdp, dev);
++ 	} else {
++ 		err = __bpf_tx_xdp_map(dev, fwd, map, xdp);
++ 	}
++ 
+++>>>>>>> 1d233886dd90 (xdp: Use bulking for non-map XDP_REDIRECT and consolidate code paths)
+  	if (unlikely(err))
+  		goto err;
+  
+diff --git a/drivers/net/tun.c b/drivers/net/tun.c
+index b974786bb433..078404c28256 100644
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@ -1763,7 +1763,7 @@ static struct sk_buff *tun_build_skb(struct tun_struct *tun,
+ 		if (err < 0)
+ 			goto err_xdp;
+ 		if (err == XDP_REDIRECT)
+-			xdp_do_flush_map();
++			xdp_do_flush();
+ 		if (err != XDP_PASS)
+ 			goto out;
+ 
+@@ -2587,7 +2587,7 @@ static int tun_sendmsg(struct socket *sock, struct msghdr *m, size_t total_len)
+ 		}
+ 
+ 		if (flush)
+-			xdp_do_flush_map();
++			xdp_do_flush();
+ 
+ 		rcu_read_unlock();
+ 		local_bh_enable();
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 013947869d96..b95ca5a16cdc 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -789,7 +789,7 @@ static int veth_poll(struct napi_struct *napi, int budget)
+ 	if (xdp_xmit & VETH_XDP_TX)
+ 		veth_xdp_flush(rq->dev, &bq);
+ 	if (xdp_xmit & VETH_XDP_REDIR)
+-		xdp_do_flush_map();
++		xdp_do_flush();
+ 	xdp_clear_return_frame_no_direct();
+ 
+ 	return done;
+diff --git a/drivers/net/virtio_net.c b/drivers/net/virtio_net.c
+index 588a175a355f..a3e5e2373e0d 100644
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@ -1355,7 +1355,7 @@ static int virtnet_poll(struct napi_struct *napi, int budget)
+ 		virtqueue_napi_complete(napi, rq->vq, received);
+ 
+ 	if (xdp_xmit & VIRTIO_XDP_REDIR)
+-		xdp_do_flush_map();
++		xdp_do_flush();
+ 
+ 	if (xdp_xmit & VIRTIO_XDP_TX) {
+ 		qp = vi->curr_queue_pairs - vi->xdp_queue_pairs +
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index a07ba7ea0d4d..1eb99069e906 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -912,7 +912,7 @@ static inline int xdp_ok_fwd_dev(const struct net_device *fwd,
+ 	return 0;
+ }
+ 
+-/* The pair of xdp_do_redirect and xdp_do_flush_map MUST be called in the
++/* The pair of xdp_do_redirect and xdp_do_flush MUST be called in the
+  * same cpu context. Further for best results no more than a single map
+  * for the do_redirect/do_flush pair should be used. This limitation is
+  * because we only track one map and force a flush when the map changes.
+@@ -923,7 +923,13 @@ int xdp_do_generic_redirect(struct net_device *dev, struct sk_buff *skb,
+ int xdp_do_redirect(struct net_device *dev,
+ 		    struct xdp_buff *xdp,
+ 		    struct bpf_prog *prog);
+-void xdp_do_flush_map(void);
++void xdp_do_flush(void);
++
++/* The xdp_do_flush_map() helper has been renamed to drop the _map suffix, as
++ * it is no longer only flushing maps. Keep this define for compatibility
++ * until all drivers are updated - do not use xdp_do_flush_map() in new code!
++ */
++#define xdp_do_flush_map xdp_do_flush
+ 
+ void bpf_warn_invalid_xdp_action(u32 act);
+ 
+* Unmerged path include/trace/events/xdp.h
+* Unmerged path kernel/bpf/devmap.c
+* Unmerged path net/core/filter.c
