@@ -1,0 +1,439 @@
+xfs: refactor quota expiration timer modification
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 11d8a9190275855f79d62093d789e962cc7228fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/11d8a919.failed
+
+Define explicit limits on the range of quota grace period expiration
+timeouts and refactor the code that modifies the timeouts into helpers
+that clamp the values appropriately.  Note that we'll refactor the
+default grace period timer separately.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Allison Collins <allison.henderson@oracle.com>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 11d8a9190275855f79d62093d789e962cc7228fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_dquot.c
+#	fs/xfs/xfs_qm_syscalls.c
+diff --cc fs/xfs/xfs_dquot.c
+index f02c86042c85,efe8a71998fc..000000000000
+--- a/fs/xfs/xfs_dquot.c
++++ b/fs/xfs/xfs_dquot.c
+@@@ -98,7 -98,44 +98,47 @@@ xfs_qm_adjust_dqlimits
+  		xfs_dquot_set_prealloc_limits(dq);
+  }
+  
++ /* Set the expiration time of a quota's grace period. */
++ time64_t
++ xfs_dquot_set_timeout(
++ 	struct xfs_mount	*mp,
++ 	time64_t		timeout)
++ {
++ 	struct xfs_quotainfo	*qi = mp->m_quotainfo;
++ 
++ 	return clamp_t(time64_t, timeout, qi->qi_expiry_min,
++ 					  qi->qi_expiry_max);
++ }
++ 
++ /*
+++<<<<<<< HEAD
+++=======
++  * Determine if this quota counter is over either limit and set the quota
++  * timers as appropriate.
++  */
++ static inline void
++ xfs_qm_adjust_res_timer(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_dquot_res	*res,
++ 	struct xfs_quota_limits	*qlim)
++ {
++ 	ASSERT(res->hardlimit == 0 || res->softlimit <= res->hardlimit);
++ 
++ 	if ((res->softlimit && res->count > res->softlimit) ||
++ 	    (res->hardlimit && res->count > res->hardlimit)) {
++ 		if (res->timer == 0)
++ 			res->timer = xfs_dquot_set_timeout(mp,
++ 					ktime_get_real_seconds() + qlim->time);
++ 	} else {
++ 		if (res->timer == 0)
++ 			res->warnings = 0;
++ 		else
++ 			res->timer = 0;
++ 	}
++ }
++ 
+  /*
+++>>>>>>> 11d8a9190275 (xfs: refactor quota expiration timer modification)
+   * Check the limits and timers of a dquot and start or reset timers
+   * if necessary.
+   * This gets called even when quota enforcement is OFF, which makes our
+@@@ -122,71 -159,9 +162,77 @@@ xfs_qm_adjust_dqtimers
+  	ASSERT(dq->q_id);
+  	defq = xfs_get_defquota(qi, xfs_dquot_type(dq));
+  
+++<<<<<<< HEAD
+ +#ifdef DEBUG
+ +	if (dq->q_blk.hardlimit)
+ +		ASSERT(dq->q_blk.softlimit <= dq->q_blk.hardlimit);
+ +	if (dq->q_ino.hardlimit)
+ +		ASSERT(dq->q_ino.softlimit <= dq->q_ino.hardlimit);
+ +	if (dq->q_rtb.hardlimit)
+ +		ASSERT(dq->q_rtb.softlimit <= dq->q_rtb.hardlimit);
+ +#endif
+ +
+ +	if (!dq->q_blk.timer) {
+ +		if ((dq->q_blk.softlimit &&
+ +		     (dq->q_blk.count > dq->q_blk.softlimit)) ||
+ +		    (dq->q_blk.hardlimit &&
+ +		     (dq->q_blk.count > dq->q_blk.hardlimit))) {
+ +			dq->q_blk.timer = ktime_get_real_seconds() +
+ +					defq->btimelimit;
+ +		} else {
+ +			dq->q_blk.warnings = 0;
+ +		}
+ +	} else {
+ +		if ((!dq->q_blk.softlimit ||
+ +		     (dq->q_blk.count <= dq->q_blk.softlimit)) &&
+ +		    (!dq->q_blk.hardlimit ||
+ +		    (dq->q_blk.count <= dq->q_blk.hardlimit))) {
+ +			dq->q_blk.timer = 0;
+ +		}
+ +	}
+ +
+ +	if (!dq->q_ino.timer) {
+ +		if ((dq->q_ino.softlimit &&
+ +		     (dq->q_ino.count > dq->q_ino.softlimit)) ||
+ +		    (dq->q_ino.hardlimit &&
+ +		     (dq->q_ino.count > dq->q_ino.hardlimit))) {
+ +			dq->q_ino.timer = ktime_get_real_seconds() +
+ +					defq->itimelimit;
+ +		} else {
+ +			dq->q_ino.warnings = 0;
+ +		}
+ +	} else {
+ +		if ((!dq->q_ino.softlimit ||
+ +		     (dq->q_ino.count <= dq->q_ino.softlimit))  &&
+ +		    (!dq->q_ino.hardlimit ||
+ +		     (dq->q_ino.count <= dq->q_ino.hardlimit))) {
+ +			dq->q_ino.timer = 0;
+ +		}
+ +	}
+ +
+ +	if (!dq->q_rtb.timer) {
+ +		if ((dq->q_rtb.softlimit &&
+ +		     (dq->q_rtb.count > dq->q_rtb.softlimit)) ||
+ +		    (dq->q_rtb.hardlimit &&
+ +		     (dq->q_rtb.count > dq->q_rtb.hardlimit))) {
+ +			dq->q_rtb.timer = ktime_get_real_seconds() +
+ +					defq->rtbtimelimit;
+ +		} else {
+ +			dq->q_rtb.warnings = 0;
+ +		}
+ +	} else {
+ +		if ((!dq->q_rtb.softlimit ||
+ +		     (dq->q_rtb.count <= dq->q_rtb.softlimit)) &&
+ +		    (!dq->q_rtb.hardlimit ||
+ +		     (dq->q_rtb.count <= dq->q_rtb.hardlimit))) {
+ +			dq->q_rtb.timer = 0;
+ +		}
+ +	}
+++=======
++ 	xfs_qm_adjust_res_timer(dq->q_mount, &dq->q_blk, &defq->blk);
++ 	xfs_qm_adjust_res_timer(dq->q_mount, &dq->q_ino, &defq->ino);
++ 	xfs_qm_adjust_res_timer(dq->q_mount, &dq->q_rtb, &defq->rtb);
+++>>>>>>> 11d8a9190275 (xfs: refactor quota expiration timer modification)
+  }
+  
+  /*
+diff --cc fs/xfs/xfs_qm_syscalls.c
+index 6a5fe01070c6,750f775ae915..000000000000
+--- a/fs/xfs/xfs_qm_syscalls.c
++++ b/fs/xfs/xfs_qm_syscalls.c
+@@@ -437,6 -437,64 +437,67 @@@ xfs_qm_scall_quotaon
+  	(QC_LIMIT_MASK | QC_TIMER_MASK | QC_WARNS_MASK)
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Adjust limits of this quota, and the defaults if passed in.  Returns true
++  * if the new limits made sense and were applied, false otherwise.
++  */
++ static inline bool
++ xfs_setqlim_limits(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_dquot_res	*res,
++ 	struct xfs_quota_limits	*qlim,
++ 	xfs_qcnt_t		hard,
++ 	xfs_qcnt_t		soft,
++ 	const char		*tag)
++ {
++ 	/* The hard limit can't be less than the soft limit. */
++ 	if (hard != 0 && hard < soft) {
++ 		xfs_debug(mp, "%shard %lld < %ssoft %lld", tag, hard, tag,
++ 				soft);
++ 		return false;
++ 	}
++ 
++ 	res->hardlimit = hard;
++ 	res->softlimit = soft;
++ 	if (qlim) {
++ 		qlim->hard = hard;
++ 		qlim->soft = soft;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static inline void
++ xfs_setqlim_warns(
++ 	struct xfs_dquot_res	*res,
++ 	struct xfs_quota_limits	*qlim,
++ 	int			warns)
++ {
++ 	res->warnings = warns;
++ 	if (qlim)
++ 		qlim->warn = warns;
++ }
++ 
++ static inline void
++ xfs_setqlim_timer(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_dquot_res	*res,
++ 	struct xfs_quota_limits	*qlim,
++ 	s64			timer)
++ {
++ 	if (qlim) {
++ 		/* Set the length of the default grace period. */
++ 		res->timer = timer;
++ 		qlim->time = timer;
++ 	} else {
++ 		/* Set the grace period expiration on a quota. */
++ 		res->timer = xfs_dquot_set_timeout(mp, timer);
++ 	}
++ }
++ 
++ /*
+++>>>>>>> 11d8a9190275 (xfs: refactor quota expiration timer modification)
+   * Adjust quota limits, and start/stop timers accordingly.
+   */
+  int
+@@@ -497,94 -572,47 +558,130 @@@ xfs_qm_scall_setqlim
+  	soft = (newlim->d_fieldmask & QC_SPC_SOFT) ?
+  		(xfs_qcnt_t) XFS_B_TO_FSB(mp, newlim->d_spc_softlimit) :
+  			dqp->q_blk.softlimit;
+ -	res = &dqp->q_blk;
+ -	qlim = id == 0 ? &defq->blk : NULL;
+ -
+ -	if (xfs_setqlim_limits(mp, res, qlim, hard, soft, "blk"))
+ +	if (hard == 0 || hard >= soft) {
+ +		dqp->q_blk.hardlimit = hard;
+ +		dqp->q_blk.softlimit = soft;
+  		xfs_dquot_set_prealloc_limits(dqp);
+ +		if (id == 0) {
+ +			defq->bhardlimit = hard;
+ +			defq->bsoftlimit = soft;
+ +		}
+ +	} else {
+ +		xfs_debug(mp, "blkhard %Ld < blksoft %Ld", hard, soft);
+ +	}
+ +	hard = (newlim->d_fieldmask & QC_RT_SPC_HARD) ?
+ +		(xfs_qcnt_t) XFS_B_TO_FSB(mp, newlim->d_rt_spc_hardlimit) :
+ +			dqp->q_rtb.hardlimit;
+ +	soft = (newlim->d_fieldmask & QC_RT_SPC_SOFT) ?
+ +		(xfs_qcnt_t) XFS_B_TO_FSB(mp, newlim->d_rt_spc_softlimit) :
+ +			dqp->q_rtb.softlimit;
+ +	if (hard == 0 || hard >= soft) {
+ +		dqp->q_rtb.hardlimit = hard;
+ +		dqp->q_rtb.softlimit = soft;
+ +		if (id == 0) {
+ +			defq->rtbhardlimit = hard;
+ +			defq->rtbsoftlimit = soft;
+ +		}
+ +	} else {
+ +		xfs_debug(mp, "rtbhard %Ld < rtbsoft %Ld", hard, soft);
+ +	}
+ +
+ +	hard = (newlim->d_fieldmask & QC_INO_HARD) ?
+ +		(xfs_qcnt_t) newlim->d_ino_hardlimit :
+ +			dqp->q_ino.hardlimit;
+ +	soft = (newlim->d_fieldmask & QC_INO_SOFT) ?
+ +		(xfs_qcnt_t) newlim->d_ino_softlimit :
+ +			dqp->q_ino.softlimit;
+ +	if (hard == 0 || hard >= soft) {
+ +		dqp->q_ino.hardlimit = hard;
+ +		dqp->q_ino.softlimit = soft;
+ +		if (id == 0) {
+ +			defq->ihardlimit = hard;
+ +			defq->isoftlimit = soft;
+ +		}
+ +	} else {
+ +		xfs_debug(mp, "ihard %Ld < isoft %Ld", hard, soft);
+ +	}
+ +
+ +	/*
+ +	 * Update warnings counter(s) if requested
+ +	 */
+  	if (newlim->d_fieldmask & QC_SPC_WARNS)
+ -		xfs_setqlim_warns(res, qlim, newlim->d_spc_warns);
+ +		dqp->q_blk.warnings = newlim->d_spc_warns;
+ +	if (newlim->d_fieldmask & QC_INO_WARNS)
+ +		dqp->q_ino.warnings = newlim->d_ino_warns;
+ +	if (newlim->d_fieldmask & QC_RT_SPC_WARNS)
+ +		dqp->q_rtb.warnings = newlim->d_rt_spc_warns;
+ +
+ +	if (id == 0) {
+ +		if (newlim->d_fieldmask & QC_SPC_WARNS)
+ +			defq->bwarnlimit = newlim->d_spc_warns;
+ +		if (newlim->d_fieldmask & QC_INO_WARNS)
+ +			defq->iwarnlimit = newlim->d_ino_warns;
+ +		if (newlim->d_fieldmask & QC_RT_SPC_WARNS)
+ +			defq->rtbwarnlimit = newlim->d_rt_spc_warns;
+ +	}
+ +
+ +	/*
+ +	 * Timelimits for the super user set the relative time the other users
+ +	 * can be over quota for this file system. If it is zero a default is
+ +	 * used.  Ditto for the default soft and hard limit values (already
+ +	 * done, above), and for warnings.
+ +	 *
+ +	 * For other IDs, userspace can bump out the grace period if over
+ +	 * the soft limit.
+ +	 */
+  	if (newlim->d_fieldmask & QC_SPC_TIMER)
+++<<<<<<< HEAD
+ +		dqp->q_blk.timer = newlim->d_spc_timer;
+ +	if (newlim->d_fieldmask & QC_INO_TIMER)
+ +		dqp->q_ino.timer = newlim->d_ino_timer;
+ +	if (newlim->d_fieldmask & QC_RT_SPC_TIMER)
+ +		dqp->q_rtb.timer = newlim->d_rt_spc_timer;
+ +
+ +	if (id == 0) {
+ +		if (newlim->d_fieldmask & QC_SPC_TIMER)
+ +			defq->btimelimit = newlim->d_spc_timer;
+ +		if (newlim->d_fieldmask & QC_INO_TIMER)
+ +			defq->itimelimit = newlim->d_ino_timer;
+ +		if (newlim->d_fieldmask & QC_RT_SPC_TIMER)
+ +			defq->rtbtimelimit = newlim->d_rt_spc_timer;
+ +	}
+++=======
++ 		xfs_setqlim_timer(mp, res, qlim, newlim->d_spc_timer);
++ 
++ 	/* Blocks on the realtime device. */
++ 	hard = (newlim->d_fieldmask & QC_RT_SPC_HARD) ?
++ 		(xfs_qcnt_t) XFS_B_TO_FSB(mp, newlim->d_rt_spc_hardlimit) :
++ 			dqp->q_rtb.hardlimit;
++ 	soft = (newlim->d_fieldmask & QC_RT_SPC_SOFT) ?
++ 		(xfs_qcnt_t) XFS_B_TO_FSB(mp, newlim->d_rt_spc_softlimit) :
++ 			dqp->q_rtb.softlimit;
++ 	res = &dqp->q_rtb;
++ 	qlim = id == 0 ? &defq->rtb : NULL;
++ 
++ 	xfs_setqlim_limits(mp, res, qlim, hard, soft, "rtb");
++ 	if (newlim->d_fieldmask & QC_RT_SPC_WARNS)
++ 		xfs_setqlim_warns(res, qlim, newlim->d_rt_spc_warns);
++ 	if (newlim->d_fieldmask & QC_RT_SPC_TIMER)
++ 		xfs_setqlim_timer(mp, res, qlim, newlim->d_rt_spc_timer);
++ 
++ 	/* Inodes */
++ 	hard = (newlim->d_fieldmask & QC_INO_HARD) ?
++ 		(xfs_qcnt_t) newlim->d_ino_hardlimit :
++ 			dqp->q_ino.hardlimit;
++ 	soft = (newlim->d_fieldmask & QC_INO_SOFT) ?
++ 		(xfs_qcnt_t) newlim->d_ino_softlimit :
++ 			dqp->q_ino.softlimit;
++ 	res = &dqp->q_ino;
++ 	qlim = id == 0 ? &defq->ino : NULL;
++ 
++ 	xfs_setqlim_limits(mp, res, qlim, hard, soft, "ino");
++ 	if (newlim->d_fieldmask & QC_INO_WARNS)
++ 		xfs_setqlim_warns(res, qlim, newlim->d_ino_warns);
++ 	if (newlim->d_fieldmask & QC_INO_TIMER)
++ 		xfs_setqlim_timer(mp, res, qlim, newlim->d_ino_timer);
+++>>>>>>> 11d8a9190275 (xfs: refactor quota expiration timer modification)
+  
+  	if (id != 0) {
+  		/*
+diff --git a/fs/xfs/libxfs/xfs_format.h b/fs/xfs/libxfs/xfs_format.h
+index e15c62640885..27a5f35b45f1 100644
+--- a/fs/xfs/libxfs/xfs_format.h
++++ b/fs/xfs/libxfs/xfs_format.h
+@@ -1188,6 +1188,30 @@ static inline void xfs_dinode_put_rdev(struct xfs_dinode *dip, xfs_dev_t rdev)
+ #define XFS_DQUOT_MAGIC		0x4451		/* 'DQ' */
+ #define XFS_DQUOT_VERSION	(uint8_t)0x01	/* latest version number */
+ 
++/*
++ * XFS Quota Timers
++ * ================
++ *
++ * Traditional quota grace period expiration timers are an unsigned 32-bit
++ * seconds counter; time zero is the Unix epoch, Jan  1 00:00:01 UTC 1970.
++ * Note that an expiration value of zero means that the quota limit has not
++ * been reached, and therefore no expiration has been set.  Therefore, the
++ * ondisk min and max defined here can be used directly to constrain the incore
++ * quota expiration timestamps on a Unix system.
++ */
++
++/*
++ * Smallest possible ondisk quota expiration value with traditional timestamps.
++ * This corresponds exactly with the incore expiration Jan  1 00:00:01 UTC 1970.
++ */
++#define XFS_DQ_LEGACY_EXPIRY_MIN	((int64_t)1)
++
++/*
++ * Largest possible ondisk quota expiration value with traditional timestamps.
++ * This corresponds exactly with the incore expiration Feb  7 06:28:15 UTC 2106.
++ */
++#define XFS_DQ_LEGACY_EXPIRY_MAX	((int64_t)U32_MAX)
++
+ /*
+  * This is the main portion of the on-disk representation of quota information
+  * for a user.  We pad this with some more expansion room to construct the on
+* Unmerged path fs/xfs/xfs_dquot.c
+diff --git a/fs/xfs/xfs_dquot.h b/fs/xfs/xfs_dquot.h
+index 0a5b0b61e7b1..e803e4cef7d2 100644
+--- a/fs/xfs/xfs_dquot.h
++++ b/fs/xfs/xfs_dquot.h
+@@ -219,4 +219,6 @@ typedef int (*xfs_qm_dqiterate_fn)(struct xfs_dquot *dq, uint dqtype,
+ int xfs_qm_dqiterate(struct xfs_mount *mp, uint dqtype,
+ 		xfs_qm_dqiterate_fn iter_fn, void *priv);
+ 
++time64_t xfs_dquot_set_timeout(struct xfs_mount *mp, time64_t timeout);
++
+ #endif /* __XFS_DQUOT_H__ */
+diff --git a/fs/xfs/xfs_qm.c b/fs/xfs/xfs_qm.c
+index ebb106499144..7946f7a972ca 100644
+--- a/fs/xfs/xfs_qm.c
++++ b/fs/xfs/xfs_qm.c
+@@ -661,6 +661,8 @@ xfs_qm_init_quotainfo(
+ 	/* Precalc some constants */
+ 	qinf->qi_dqchunklen = XFS_FSB_TO_BB(mp, XFS_DQUOT_CLUSTER_SIZE_FSB);
+ 	qinf->qi_dqperchunk = xfs_calc_dquots_per_chunk(qinf->qi_dqchunklen);
++	qinf->qi_expiry_min = XFS_DQ_LEGACY_EXPIRY_MIN;
++	qinf->qi_expiry_max = XFS_DQ_LEGACY_EXPIRY_MAX;
+ 
+ 	mp->m_qflags |= (mp->m_sb.sb_qflags & XFS_ALL_QUOTA_CHKD);
+ 
+diff --git a/fs/xfs/xfs_qm.h b/fs/xfs/xfs_qm.h
+index bf0a60ecbd0b..f008c63eabeb 100644
+--- a/fs/xfs/xfs_qm.h
++++ b/fs/xfs/xfs_qm.h
+@@ -67,6 +67,10 @@ struct xfs_quotainfo {
+ 	struct xfs_def_quota	qi_grp_default;
+ 	struct xfs_def_quota	qi_prj_default;
+ 	struct shrinker		qi_shrinker;
++
++	/* Minimum and maximum quota expiration timestamp values. */
++	time64_t		qi_expiry_min;
++	time64_t		qi_expiry_max;
+ };
+ 
+ static inline struct radix_tree_root *
+* Unmerged path fs/xfs/xfs_qm_syscalls.c
