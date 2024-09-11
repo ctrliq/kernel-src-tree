@@ -1,0 +1,115 @@
+NFS: Replace use of NFS_INO_REVAL_PAGECACHE when checking cache validity
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 13c0b082b6a90b1b87b5fb100983d05bcc75d9b6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/13c0b082.failed
+
+When checking cache validity, be more specific than just 'we want to
+check the page cache validity'. In almost all cases, we want to check
+that change attribute, and possibly also the size.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 13c0b082b6a90b1b87b5fb100983d05bcc75d9b6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/inode.c
+diff --cc fs/nfs/inode.c
+index b46b42e1ef8c,aec402d048eb..000000000000
+--- a/fs/nfs/inode.c
++++ b/fs/nfs/inode.c
+@@@ -800,18 -787,28 +785,37 @@@ static void nfs_readdirplus_parent_cach
+  	dput(parent);
+  }
+  
+ -static u32 nfs_get_valid_attrmask(struct inode *inode)
+ +static bool nfs_need_revalidate_inode(struct inode *inode)
+  {
+++<<<<<<< HEAD
+ +	if (NFS_I(inode)->cache_validity &
+ +			(NFS_INO_INVALID_ATTR|NFS_INO_INVALID_LABEL))
+ +		return true;
+ +	if (nfs_attribute_cache_expired(inode))
+ +		return true;
+ +	return false;
+++=======
++ 	unsigned long cache_validity = READ_ONCE(NFS_I(inode)->cache_validity);
++ 	u32 reply_mask = STATX_INO | STATX_TYPE;
++ 
++ 	if (!(cache_validity & NFS_INO_INVALID_ATIME))
++ 		reply_mask |= STATX_ATIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_CTIME))
++ 		reply_mask |= STATX_CTIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_MTIME))
++ 		reply_mask |= STATX_MTIME;
++ 	if (!(cache_validity & NFS_INO_INVALID_SIZE))
++ 		reply_mask |= STATX_SIZE;
++ 	if (!(cache_validity & NFS_INO_INVALID_OTHER))
++ 		reply_mask |= STATX_UID | STATX_GID | STATX_MODE | STATX_NLINK;
++ 	if (!(cache_validity & NFS_INO_INVALID_BLOCKS))
++ 		reply_mask |= STATX_BLOCKS;
++ 	return reply_mask;
+++>>>>>>> 13c0b082b6a9 (NFS: Replace use of NFS_INO_REVAL_PAGECACHE when checking cache validity)
+  }
+  
+ -int nfs_getattr(struct user_namespace *mnt_userns, const struct path *path,
+ -		struct kstat *stat, u32 request_mask, unsigned int query_flags)
+ +int nfs_getattr(const struct path *path, struct kstat *stat,
+ +		u32 request_mask, unsigned int query_flags)
+  {
+  	struct inode *inode = d_inode(path->dentry);
+  	struct nfs_server *server = NFS_SERVER(inode);
+diff --git a/fs/nfs/file.c b/fs/nfs/file.c
+index 925256d3e755..b4e3277df290 100644
+--- a/fs/nfs/file.c
++++ b/fs/nfs/file.c
+@@ -104,7 +104,7 @@ static int nfs_revalidate_file_size(struct inode *inode, struct file *filp)
+ 
+ 	if (filp->f_flags & O_DIRECT)
+ 		goto force_reval;
+-	if (nfs_check_cache_invalid(inode, NFS_INO_REVAL_PAGECACHE))
++	if (nfs_check_cache_invalid(inode, NFS_INO_INVALID_SIZE))
+ 		goto force_reval;
+ 	return 0;
+ force_reval:
+* Unmerged path fs/nfs/inode.c
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 906340a7f612..938b2b12ea71 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -5400,7 +5400,7 @@ static void nfs4_bitmask_set(__u32 bitmask[NFS4_BITMASK_SZ], const __u32 *src,
+ 
+ 	memcpy(bitmask, src, sizeof(*bitmask) * NFS4_BITMASK_SZ);
+ 
+-	if (cache_validity & (NFS_INO_INVALID_CHANGE | NFS_INO_REVAL_PAGECACHE))
++	if (cache_validity & NFS_INO_INVALID_CHANGE)
+ 		bitmask[0] |= FATTR4_WORD0_CHANGE;
+ 	if (cache_validity & NFS_INO_INVALID_ATIME)
+ 		bitmask[1] |= FATTR4_WORD1_TIME_ACCESS;
+@@ -5420,8 +5420,7 @@ static void nfs4_bitmask_set(__u32 bitmask[NFS4_BITMASK_SZ], const __u32 *src,
+ 	if (nfs4_have_delegation(inode, FMODE_READ) &&
+ 	    !(cache_validity & NFS_INO_REVAL_FORCED))
+ 		bitmask[0] &= ~FATTR4_WORD0_SIZE;
+-	else if (cache_validity &
+-		 (NFS_INO_INVALID_SIZE | NFS_INO_REVAL_PAGECACHE))
++	else if (cache_validity & NFS_INO_INVALID_SIZE)
+ 		bitmask[0] |= FATTR4_WORD0_SIZE;
+ 
+ 	for (i = 0; i < NFS4_BITMASK_SZ; i++)
+diff --git a/fs/nfs/write.c b/fs/nfs/write.c
+index 4cfbae489405..f6692309f10e 100644
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@ -1282,7 +1282,7 @@ static bool nfs_write_pageuptodate(struct page *page, struct inode *inode,
+ 	if (nfs_have_delegated_attributes(inode))
+ 		goto out;
+ 	if (nfsi->cache_validity &
+-	    (NFS_INO_REVAL_PAGECACHE | NFS_INO_INVALID_SIZE))
++	    (NFS_INO_INVALID_CHANGE | NFS_INO_INVALID_SIZE))
+ 		return false;
+ 	smp_rmb();
+ 	if (test_bit(NFS_INO_INVALIDATING, &nfsi->flags) && pagelen != 0)
