@@ -1,0 +1,1416 @@
+SUNRPC: Introduce trace points in rpc_auth_gss.ko
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 0c77668ddb4e7bdfbca462c6185d154d0b8889ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/0c77668d.failed
+
+Add infrastructure for trace points in the RPC_AUTH_GSS kernel
+module, and add a few sample trace points. These report exceptional
+or unexpected events, and observe the assignment of GSS sequence
+numbers.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 0c77668ddb4e7bdfbca462c6185d154d0b8889ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/auth_gss/auth_gss.c
+#	net/sunrpc/xprt.c
+diff --cc net/sunrpc/auth_gss/auth_gss.c
+index 6e951620fbcd,3d1fbd6d3370..000000000000
+--- a/net/sunrpc/auth_gss/auth_gss.c
++++ b/net/sunrpc/auth_gss/auth_gss.c
+@@@ -1542,22 -1522,32 +1520,37 @@@ gss_marshal(struct rpc_task *task, __be
+  	struct xdr_netobj mic;
+  	struct kvec	iov;
+  	struct xdr_buf	verf_buf;
++ 	int status;
+  
+- 	dprintk("RPC: %5u %s\n", task->tk_pid, __func__);
+- 
+++<<<<<<< HEAD
+ +	*p++ = htonl(RPC_AUTH_GSS);
+++=======
++ 	/* Credential */
++ 
++ 	p = xdr_reserve_space(xdr, 7 * sizeof(*p) +
++ 			      ctx->gc_wire_ctx.len);
++ 	if (!p)
++ 		goto marshal_failed;
++ 	*p++ = rpc_auth_gss;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	cred_len = p++;
+  
+  	spin_lock(&ctx->gc_seq_lock);
+ -	req->rq_seqno = (ctx->gc_seq < MAXSEQ) ? ctx->gc_seq++ : MAXSEQ;
+ +	req->rq_seqno = ctx->gc_seq++;
+  	spin_unlock(&ctx->gc_seq_lock);
+++<<<<<<< HEAD
+++=======
++ 	if (req->rq_seqno == MAXSEQ)
++ 		goto expired;
++ 	trace_rpcgss_seqno(task);
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  
+ -	*p++ = cpu_to_be32(RPC_GSS_VERSION);
+ -	*p++ = cpu_to_be32(ctx->gc_proc);
+ -	*p++ = cpu_to_be32(req->rq_seqno);
+ -	*p++ = cpu_to_be32(gss_cred->gc_service);
+ +	*p++ = htonl((u32) RPC_GSS_VERSION);
+ +	*p++ = htonl((u32) ctx->gc_proc);
+ +	*p++ = htonl((u32) req->rq_seqno);
+ +	*p++ = htonl((u32) gss_cred->gc_service);
+  	p = xdr_encode_netobj(p, &ctx->gc_wire_ctx);
+ -	*cred_len = cpu_to_be32((p - (cred_len + 1)) << 2);
+ -
+ -	/* Verifier */
+ +	*cred_len = htonl((p - (cred_len + 1)) << 2);
+  
+  	/* We compute the checksum for the verifier over the xdr-encoded bytes
+  	 * starting with the xid and ending at the end of the credential: */
+@@@ -1565,23 -1555,33 +1558,53 @@@
+  	iov.iov_len = (u8 *)p - (u8 *)iov.iov_base;
+  	xdr_buf_from_iov(&iov, &verf_buf);
+  
+++<<<<<<< HEAD
+ +	/* set verifier flavor*/
+ +	*p++ = htonl(RPC_AUTH_GSS);
+ +
+ +	mic.data = (u8 *)(p + 1);
+ +	maj_stat = gss_get_mic(ctx->gc_gss_ctx, &verf_buf, &mic);
+ +	if (maj_stat == GSS_S_CONTEXT_EXPIRED) {
+ +		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+ +	} else if (maj_stat != 0) {
+ +		printk("gss_marshal: gss_get_mic FAILED (%d)\n", maj_stat);
+ +		goto out_put_ctx;
+ +	}
+ +	p = xdr_encode_opaque(p, NULL, mic.len);
+ +	gss_put_ctx(ctx);
+ +	return p;
+ +out_put_ctx:
+ +	gss_put_ctx(ctx);
+ +	return NULL;
+++=======
++ 	p = xdr_reserve_space(xdr, sizeof(*p));
++ 	if (!p)
++ 		goto marshal_failed;
++ 	*p++ = rpc_auth_gss;
++ 	mic.data = (u8 *)(p + 1);
++ 	maj_stat = gss_get_mic(ctx->gc_gss_ctx, &verf_buf, &mic);
++ 	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
++ 		goto expired;
++ 	else if (maj_stat != 0)
++ 		goto bad_mic;
++ 	if (xdr_stream_encode_opaque_inline(xdr, (void **)&p, mic.len) < 0)
++ 		goto marshal_failed;
++ 	status = 0;
++ out:
++ 	gss_put_ctx(ctx);
++ 	return status;
++ expired:
++ 	clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
++ 	status = -EKEYEXPIRED;
++ 	goto out;
++ marshal_failed:
++ 	status = -EMSGSIZE;
++ 	goto out;
++ bad_mic:
++ 	trace_rpcgss_get_mic(task, maj_stat);
++ 	status = -EIO;
++ 	goto out;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  }
+  
+  static int gss_renew_cred(struct rpc_task *task)
+@@@ -1697,74 -1697,63 +1720,99 @@@ gss_validate(struct rpc_task *task, __b
+  	/* We leave it to unwrap to calculate au_rslack. For now we just
+  	 * calculate the length of the verifier: */
+  	cred->cr_auth->au_verfsize = XDR_QUADLEN(len) + 2;
+ -	status = 0;
+ -out:
+  	gss_put_ctx(ctx);
+ +	dprintk("RPC: %5u %s: gss_verify_mic succeeded.\n",
+ +			task->tk_pid, __func__);
+ +	kfree(seq);
+++<<<<<<< HEAD
+ +	return p + XDR_QUADLEN(len);
+ +out_bad:
+ +	gss_put_ctx(ctx);
+ +	dprintk("RPC: %5u %s failed ret %ld.\n", task->tk_pid, __func__,
+ +		PTR_ERR(ret));
+  	kfree(seq);
+ +	return ret;
+++=======
++ 	return status;
++ 
++ validate_failed:
++ 	status = -EIO;
++ 	goto out;
++ bad_mic:
++ 	trace_rpcgss_verify_mic(task, maj_stat);
++ 	status = -EACCES;
++ 	goto out;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+ +}
+ +
+ +static void gss_wrap_req_encode(kxdreproc_t encode, struct rpc_rqst *rqstp,
+ +				__be32 *p, void *obj)
+ +{
+ +	struct xdr_stream xdr;
+ +
+ +	xdr_init_encode(&xdr, &rqstp->rq_snd_buf, p, rqstp);
+ +	encode(rqstp, &xdr, obj);
+  }
+  
+ -static int gss_wrap_req_integ(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ -			      struct rpc_task *task, struct xdr_stream *xdr)
+ +static inline int
+ +gss_wrap_req_integ(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ +		   kxdreproc_t encode, struct rpc_rqst *rqstp,
+ +		   __be32 *p, void *obj)
+  {
+ -	struct rpc_rqst *rqstp = task->tk_rqstp;
+ -	struct xdr_buf integ_buf, *snd_buf = &rqstp->rq_snd_buf;
+ +	struct xdr_buf	*snd_buf = &rqstp->rq_snd_buf;
+ +	struct xdr_buf	integ_buf;
+ +	__be32          *integ_len = NULL;
+  	struct xdr_netobj mic;
+ -	__be32 *p, *integ_len;
+ -	u32 offset, maj_stat;
+ +	u32		offset;
+ +	__be32		*q;
+ +	struct kvec	*iov;
+ +	u32             maj_stat = 0;
+ +	int		status = -EIO;
+  
+ -	p = xdr_reserve_space(xdr, 2 * sizeof(*p));
+ -	if (!p)
+ -		goto wrap_failed;
+  	integ_len = p++;
+ -	*p = cpu_to_be32(rqstp->rq_seqno);
+ +	offset = (u8 *)p - (u8 *)snd_buf->head[0].iov_base;
+ +	*p++ = htonl(rqstp->rq_seqno);
+  
+ -	if (rpcauth_wrap_req_encode(task, xdr))
+ -		goto wrap_failed;
+ +	gss_wrap_req_encode(encode, rqstp, p, obj);
+  
+ -	offset = (u8 *)p - (u8 *)snd_buf->head[0].iov_base;
+  	if (xdr_buf_subsegment(snd_buf, &integ_buf,
+  				offset, snd_buf->len - offset))
+ -		goto wrap_failed;
+ -	*integ_len = cpu_to_be32(integ_buf.len);
+ +		return status;
+ +	*integ_len = htonl(integ_buf.len);
+  
+ -	p = xdr_reserve_space(xdr, 0);
+ -	if (!p)
+ -		goto wrap_failed;
+ +	/* guess whether we're in the head or the tail: */
+ +	if (snd_buf->page_len || snd_buf->tail[0].iov_len)
+ +		iov = snd_buf->tail;
+ +	else
+ +		iov = snd_buf->head;
+ +	p = iov->iov_base + iov->iov_len;
+  	mic.data = (u8 *)(p + 1);
+ +
+  	maj_stat = gss_get_mic(ctx->gc_gss_ctx, &integ_buf, &mic);
+ +	status = -EIO; /* XXX? */
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	else if (maj_stat)
+++<<<<<<< HEAD
+ +		return status;
+ +	q = xdr_encode_opaque(p, NULL, mic.len);
+ +
+ +	offset = (u8 *)q - (u8 *)p;
+ +	iov->iov_len += offset;
+ +	snd_buf->len += offset;
+ +	return 0;
+++=======
++ 		goto bad_mic;
++ 	/* Check that the trailing MIC fit in the buffer, after the fact */
++ 	if (xdr_stream_encode_opaque_inline(xdr, (void **)&p, mic.len) < 0)
++ 		goto wrap_failed;
++ 	return 0;
++ wrap_failed:
++ 	return -EMSGSIZE;
++ bad_mic:
++ 	trace_rpcgss_get_mic(task, maj_stat);
++ 	return -EIO;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  }
+  
+  static void
+@@@ -1857,19 -1846,20 +1905,27 @@@ gss_wrap_req_priv(struct rpc_cred *cred
+  		memcpy(tmp, snd_buf->tail[0].iov_base, snd_buf->tail[0].iov_len);
+  		snd_buf->tail[0].iov_base = tmp;
+  	}
+++<<<<<<< HEAD
+++=======
++ 	offset = (u8 *)p - (u8 *)snd_buf->head[0].iov_base;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	maj_stat = gss_wrap(ctx->gc_gss_ctx, offset, snd_buf, inpages);
+  	/* slack space should prevent this ever happening: */
+ -	if (unlikely(snd_buf->len > snd_buf->buflen))
+ -		goto wrap_failed;
+ +	BUG_ON(snd_buf->len > snd_buf->buflen);
+ +	status = -EIO;
+  	/* We're assuming that when GSS_S_CONTEXT_EXPIRED, the encryption was
+  	 * done anyway, so it's safe to put the request on the wire: */
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	else if (maj_stat)
+++<<<<<<< HEAD
+ +		return status;
+++=======
++ 		goto bad_wrap;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  
+ -	*opaque_len = cpu_to_be32(snd_buf->len - offset);
+ -	/* guess whether the pad goes into the head or the tail: */
+ +	*opaque_len = htonl(snd_buf->len - offset);
+ +	/* guess whether we're in the head or the tail: */
+  	if (snd_buf->page_len || snd_buf->tail[0].iov_len)
+  		iov = snd_buf->tail;
+  	else
+@@@ -1881,19 -1871,22 +1937,31 @@@
+  	snd_buf->len += pad;
+  
+  	return 0;
+++<<<<<<< HEAD
+++=======
++ wrap_failed:
++ 	return status;
++ bad_wrap:
++ 	trace_rpcgss_wrap(task, maj_stat);
++ 	return -EIO;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  }
+  
+ -static int gss_wrap_req(struct rpc_task *task, struct xdr_stream *xdr)
+ +static int
+ +gss_wrap_req(struct rpc_task *task,
+ +	     kxdreproc_t encode, void *rqstp, __be32 *p, void *obj)
+  {
+  	struct rpc_cred *cred = task->tk_rqstp->rq_cred;
+  	struct gss_cred	*gss_cred = container_of(cred, struct gss_cred,
+  			gc_base);
+  	struct gss_cl_ctx *ctx = gss_cred_get_ctx(cred);
+ -	int status;
+ +	int             status = -EIO;
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u %s\n", task->tk_pid, __func__);
+++=======
++ 	status = -EIO;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	if (ctx->gc_proc != RPC_GSS_PROC_DATA) {
+  		/* The spec seems a little ambiguous here, but I think that not
+  		 * wrapping context destruction requests makes the most sense.
+@@@ -1904,95 -1896,122 +1972,153 @@@
+  	}
+  	switch (gss_cred->gc_service) {
+  	case RPC_GSS_SVC_NONE:
+ -		status = rpcauth_wrap_req_encode(task, xdr);
+ +		gss_wrap_req_encode(encode, rqstp, p, obj);
+ +		status = 0;
+  		break;
+  	case RPC_GSS_SVC_INTEGRITY:
+ -		status = gss_wrap_req_integ(cred, ctx, task, xdr);
+ +		status = gss_wrap_req_integ(cred, ctx, encode, rqstp, p, obj);
+  		break;
+  	case RPC_GSS_SVC_PRIVACY:
+ -		status = gss_wrap_req_priv(cred, ctx, task, xdr);
+ +		status = gss_wrap_req_priv(cred, ctx, encode, rqstp, p, obj);
+  		break;
++ 	default:
++ 		status = -EIO;
+  	}
+  out:
+  	gss_put_ctx(ctx);
+  	return status;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int
+ +gss_unwrap_resp_integ(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ +		struct rpc_rqst *rqstp, __be32 **p)
+++=======
++ static int
++ gss_unwrap_resp_auth(struct rpc_cred *cred)
++ {
++ 	cred->cr_auth->au_rslack = cred->cr_auth->au_verfsize;
++ 	return 0;
++ }
++ 
++ static int
++ gss_unwrap_resp_integ(struct rpc_task *task, struct rpc_cred *cred,
++ 		      struct gss_cl_ctx *ctx, struct rpc_rqst *rqstp,
++ 		      struct xdr_stream *xdr)
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  {
+ -	struct xdr_buf integ_buf, *rcv_buf = &rqstp->rq_rcv_buf;
+ -	u32 data_offset, mic_offset, integ_len, maj_stat;
+ +	struct xdr_buf	*rcv_buf = &rqstp->rq_rcv_buf;
+ +	struct xdr_buf integ_buf;
+  	struct xdr_netobj mic;
+ -	__be32 *p;
+ +	u32 data_offset, mic_offset;
+ +	u32 integ_len;
+ +	u32 maj_stat;
+ +	int status = -EIO;
+  
+ -	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
+ -	if (unlikely(!p))
+ -		goto unwrap_failed;
+ -	integ_len = be32_to_cpup(p++);
+ +	integ_len = ntohl(*(*p)++);
+  	if (integ_len & 3)
+ -		goto unwrap_failed;
+ -	data_offset = (u8 *)(p) - (u8 *)rcv_buf->head[0].iov_base;
+ +		return status;
+ +	data_offset = (u8 *)(*p) - (u8 *)rcv_buf->head[0].iov_base;
+  	mic_offset = integ_len + data_offset;
+  	if (mic_offset > rcv_buf->len)
+++<<<<<<< HEAD
+ +		return status;
+ +	if (ntohl(*(*p)++) != rqstp->rq_seqno)
+ +		return status;
+ +
+ +	if (xdr_buf_subsegment(rcv_buf, &integ_buf, data_offset,
+ +				mic_offset - data_offset))
+ +		return status;
+++=======
++ 		goto unwrap_failed;
++ 	if (be32_to_cpup(p) != rqstp->rq_seqno)
++ 		goto bad_seqno;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  
+ -	if (xdr_buf_subsegment(rcv_buf, &integ_buf, data_offset, integ_len))
+ -		goto unwrap_failed;
+  	if (xdr_buf_read_netobj(rcv_buf, &mic, mic_offset))
+ -		goto unwrap_failed;
+ +		return status;
+ +
+  	maj_stat = gss_verify_mic(ctx->gc_gss_ctx, &integ_buf, &mic);
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	if (maj_stat != GSS_S_COMPLETE)
+ -		goto bad_mic;
+ -
+ -	cred->cr_auth->au_rslack = cred->cr_auth->au_verfsize + 2 +
+ -				   1 + XDR_QUADLEN(mic.len);
+ +		return status;
+  	return 0;
+++<<<<<<< HEAD
+ +}
+ +
+ +static inline int
+ +gss_unwrap_resp_priv(struct rpc_cred *cred, struct gss_cl_ctx *ctx,
+ +		struct rpc_rqst *rqstp, __be32 **p)
+++=======
++ unwrap_failed:
++ 	trace_rpcgss_unwrap_failed(task);
++ 	return -EIO;
++ bad_seqno:
++ 	trace_rpcgss_bad_seqno(task, rqstp->rq_seqno, be32_to_cpup(p));
++ 	return -EIO;
++ bad_mic:
++ 	trace_rpcgss_verify_mic(task, maj_stat);
++ 	return -EIO;
++ }
++ 
++ static int
++ gss_unwrap_resp_priv(struct rpc_task *task, struct rpc_cred *cred,
++ 		     struct gss_cl_ctx *ctx, struct rpc_rqst *rqstp,
++ 		     struct xdr_stream *xdr)
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  {
+ -	struct xdr_buf *rcv_buf = &rqstp->rq_rcv_buf;
+ -	struct kvec *head = rqstp->rq_rcv_buf.head;
+ -	unsigned int savedlen = rcv_buf->len;
+ -	u32 offset, opaque_len, maj_stat;
+ -	__be32 *p;
+ +	struct xdr_buf  *rcv_buf = &rqstp->rq_rcv_buf;
+ +	u32 offset;
+ +	u32 opaque_len;
+ +	u32 maj_stat;
+ +	int status = -EIO;
+  
+ -	p = xdr_inline_decode(xdr, 2 * sizeof(*p));
+ -	if (unlikely(!p))
+ -		goto unwrap_failed;
+ -	opaque_len = be32_to_cpup(p++);
+ -	offset = (u8 *)(p) - (u8 *)head->iov_base;
+ +	opaque_len = ntohl(*(*p)++);
+ +	offset = (u8 *)(*p) - (u8 *)rcv_buf->head[0].iov_base;
+  	if (offset + opaque_len > rcv_buf->len)
+ -		goto unwrap_failed;
+ +		return status;
+ +	/* remove padding: */
+  	rcv_buf->len = offset + opaque_len;
+  
+  	maj_stat = gss_unwrap(ctx->gc_gss_ctx, offset, rcv_buf);
+  	if (maj_stat == GSS_S_CONTEXT_EXPIRED)
+  		clear_bit(RPCAUTH_CRED_UPTODATE, &cred->cr_flags);
+  	if (maj_stat != GSS_S_COMPLETE)
+++<<<<<<< HEAD
+ +		return status;
+ +	if (ntohl(*(*p)++) != rqstp->rq_seqno)
+ +		return status;
+++=======
++ 		goto bad_unwrap;
++ 	/* gss_unwrap decrypted the sequence number */
++ 	if (be32_to_cpup(p++) != rqstp->rq_seqno)
++ 		goto bad_seqno;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  
+ -	/* gss_unwrap redacts the opaque blob from the head iovec.
+ -	 * rcv_buf has changed, thus the stream needs to be reset.
+ -	 */
+ -	xdr_init_decode(xdr, rcv_buf, p, rqstp);
+ -
+ -	cred->cr_auth->au_rslack = cred->cr_auth->au_verfsize + 2 +
+ -				   XDR_QUADLEN(savedlen - rcv_buf->len);
+  	return 0;
+++<<<<<<< HEAD
+ +}
+ +
+ +static int
+ +gss_unwrap_req_decode(kxdrdproc_t decode, struct rpc_rqst *rqstp,
+ +		      __be32 *p, void *obj)
+ +{
+ +	struct xdr_stream xdr;
+ +
+ +	xdr_init_decode(&xdr, &rqstp->rq_rcv_buf, p, rqstp);
+ +	return decode(rqstp, &xdr, obj);
+++=======
++ unwrap_failed:
++ 	trace_rpcgss_unwrap_failed(task);
++ 	return -EIO;
++ bad_seqno:
++ 	trace_rpcgss_bad_seqno(task, rqstp->rq_seqno, be32_to_cpup(--p));
++ 	return -EIO;
++ bad_unwrap:
++ 	trace_rpcgss_unwrap(task, maj_stat);
++ 	return -EIO;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  }
+  
+  static bool
+@@@ -2052,27 -2071,22 +2181,32 @@@ gss_unwrap_resp(struct rpc_task *task
+  		goto out_decode;
+  	switch (gss_cred->gc_service) {
+  	case RPC_GSS_SVC_NONE:
+ -		status = gss_unwrap_resp_auth(cred);
+  		break;
+  	case RPC_GSS_SVC_INTEGRITY:
+++<<<<<<< HEAD
+ +		status = gss_unwrap_resp_integ(cred, ctx, rqstp, &p);
+ +		if (status)
+ +			goto out;
+ +		break;
+ +	case RPC_GSS_SVC_PRIVACY:
+ +		status = gss_unwrap_resp_priv(cred, ctx, rqstp, &p);
+ +		if (status)
+ +			goto out;
+++=======
++ 		status = gss_unwrap_resp_integ(task, cred, ctx, rqstp, xdr);
++ 		break;
++ 	case RPC_GSS_SVC_PRIVACY:
++ 		status = gss_unwrap_resp_priv(task, cred, ctx, rqstp, xdr);
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  		break;
+  	}
+ -	if (status)
+ -		goto out;
+ -
+ +	/* take into account extra slack for integrity and privacy cases: */
+ +	cred->cr_auth->au_rslack = cred->cr_auth->au_verfsize + (p - savedp)
+ +						+ (savedlen - head->iov_len);
+  out_decode:
+ -	status = rpcauth_unwrap_resp_decode(task, xdr);
+ +	status = gss_unwrap_req_decode(decode, rqstp, p, obj);
+  out:
+  	gss_put_ctx(ctx);
+- 	dprintk("RPC: %5u %s returning %d\n",
+- 		task->tk_pid, __func__, status);
+  	return status;
+  }
+  
+diff --cc net/sunrpc/xprt.c
+index c4d4cd12e49e,bc7489f1fe55..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -953,6 -1100,177 +953,180 @@@ static void xprt_timer(struct rpc_task 
+  }
+  
+  /**
+++<<<<<<< HEAD
+++=======
++  * xprt_request_wait_receive - wait for the reply to an RPC request
++  * @task: RPC task about to send a request
++  *
++  */
++ void xprt_request_wait_receive(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (!test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate))
++ 		return;
++ 	/*
++ 	 * Sleep on the pending queue if we're expecting a reply.
++ 	 * The spinlock ensures atomicity between the test of
++ 	 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
++ 	 */
++ 	spin_lock(&xprt->queue_lock);
++ 	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
++ 		xprt->ops->set_retrans_timeout(task);
++ 		rpc_sleep_on(&xprt->pending, task, xprt_timer);
++ 		/*
++ 		 * Send an extra queue wakeup call if the
++ 		 * connection was dropped in case the call to
++ 		 * rpc_sleep_on() raced.
++ 		 */
++ 		if (xprt_request_retransmit_after_disconnect(task))
++ 			rpc_wake_up_queued_task_set_status(&xprt->pending,
++ 					task, -ENOTCONN);
++ 	}
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ static bool
++ xprt_request_need_enqueue_transmit(struct rpc_task *task, struct rpc_rqst *req)
++ {
++ 	return !test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ }
++ 
++ /**
++  * xprt_request_enqueue_transmit - queue a task for transmission
++  * @task: pointer to rpc_task
++  *
++  * Add a task to the transmission queue.
++  */
++ void
++ xprt_request_enqueue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *pos, *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (xprt_request_need_enqueue_transmit(task, req)) {
++ 		req->rq_bytes_sent = 0;
++ 		spin_lock(&xprt->queue_lock);
++ 		/*
++ 		 * Requests that carry congestion control credits are added
++ 		 * to the head of the list to avoid starvation issues.
++ 		 */
++ 		if (req->rq_cong) {
++ 			xprt_clear_congestion_window_wait(xprt);
++ 			list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 				if (pos->rq_cong)
++ 					continue;
++ 				/* Note: req is added _before_ pos */
++ 				list_add_tail(&req->rq_xmit, &pos->rq_xmit);
++ 				INIT_LIST_HEAD(&req->rq_xmit2);
++ 				trace_xprt_enq_xmit(task, 1);
++ 				goto out;
++ 			}
++ 		} else if (RPC_IS_SWAPPER(task)) {
++ 			list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 				if (pos->rq_cong || pos->rq_bytes_sent)
++ 					continue;
++ 				if (RPC_IS_SWAPPER(pos->rq_task))
++ 					continue;
++ 				/* Note: req is added _before_ pos */
++ 				list_add_tail(&req->rq_xmit, &pos->rq_xmit);
++ 				INIT_LIST_HEAD(&req->rq_xmit2);
++ 				trace_xprt_enq_xmit(task, 2);
++ 				goto out;
++ 			}
++ 		} else if (!req->rq_seqno) {
++ 			list_for_each_entry(pos, &xprt->xmit_queue, rq_xmit) {
++ 				if (pos->rq_task->tk_owner != task->tk_owner)
++ 					continue;
++ 				list_add_tail(&req->rq_xmit2, &pos->rq_xmit2);
++ 				INIT_LIST_HEAD(&req->rq_xmit);
++ 				trace_xprt_enq_xmit(task, 3);
++ 				goto out;
++ 			}
++ 		}
++ 		list_add_tail(&req->rq_xmit, &xprt->xmit_queue);
++ 		INIT_LIST_HEAD(&req->rq_xmit2);
++ 		trace_xprt_enq_xmit(task, 4);
++ out:
++ 		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ 		spin_unlock(&xprt->queue_lock);
++ 	}
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit_locked - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  * Caller must hold xprt->queue_lock
++  */
++ static void
++ xprt_request_dequeue_transmit_locked(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 
++ 	if (!test_and_clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 		return;
++ 	if (!list_empty(&req->rq_xmit)) {
++ 		list_del(&req->rq_xmit);
++ 		if (!list_empty(&req->rq_xmit2)) {
++ 			struct rpc_rqst *next = list_first_entry(&req->rq_xmit2,
++ 					struct rpc_rqst, rq_xmit2);
++ 			list_del(&req->rq_xmit2);
++ 			list_add_tail(&next->rq_xmit, &next->rq_xprt->xmit_queue);
++ 		}
++ 	} else
++ 		list_del(&req->rq_xmit2);
++ }
++ 
++ /**
++  * xprt_request_dequeue_transmit - remove a task from the transmission queue
++  * @task: pointer to rpc_task
++  *
++  * Remove a task from the transmission queue
++  */
++ static void
++ xprt_request_dequeue_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *req = task->tk_rqstp;
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	xprt_request_dequeue_transmit_locked(task);
++ 	spin_unlock(&xprt->queue_lock);
++ }
++ 
++ /**
++  * xprt_request_prepare - prepare an encoded request for transport
++  * @req: pointer to rpc_rqst
++  *
++  * Calls into the transport layer to do whatever is needed to prepare
++  * the request for transmission or receive.
++  */
++ void
++ xprt_request_prepare(struct rpc_rqst *req)
++ {
++ 	struct rpc_xprt *xprt = req->rq_xprt;
++ 
++ 	if (xprt->ops->prepare_request)
++ 		xprt->ops->prepare_request(req);
++ }
++ 
++ /**
++  * xprt_request_need_retransmit - Test if a task needs retransmission
++  * @task: pointer to rpc_task
++  *
++  * Test for whether a connection breakage requires the task to retransmit
++  */
++ bool
++ xprt_request_need_retransmit(struct rpc_task *task)
++ {
++ 	return xprt_request_retransmit_after_disconnect(task);
++ }
++ 
++ /**
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+   * xprt_prepare_transmit - reserve the transport before sending a request
+   * @task: RPC task about to send a request
+   *
+@@@ -995,59 -1299,56 +1169,84 @@@ void xprt_end_transmit(struct rpc_task 
+  }
+  
+  /**
+ - * xprt_request_transmit - send an RPC request on a transport
+ - * @req: pointer to request to transmit
+ - * @snd_task: RPC task that owns the transport lock
+ + * xprt_transmit - send an RPC request on a transport
+ + * @task: controlling RPC task
+   *
+ - * This performs the transmission of a single request.
+ - * Note that if the request is not the same as snd_task, then it
+ - * does need to be pinned.
+ - * Returns '0' on success.
+ + * We have to copy the iovec because sendmsg fiddles with its contents.
+   */
+ -static int
+ -xprt_request_transmit(struct rpc_rqst *req, struct rpc_task *snd_task)
+ +void xprt_transmit(struct rpc_task *task)
+  {
+ -	struct rpc_xprt *xprt = req->rq_xprt;
+ -	struct rpc_task *task = req->rq_task;
+ +	struct rpc_rqst	*req = task->tk_rqstp;
+ +	struct rpc_xprt	*xprt = req->rq_xprt;
+  	unsigned int connect_cookie;
+ -	int is_retrans = RPC_WAS_SENT(task);
+  	int status;
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u xprt_transmit(%u)\n", task->tk_pid, req->rq_slen);
+ +
+ +	if (!req->rq_reply_bytes_recvd) {
+++=======
++ 	if (!req->rq_bytes_sent) {
++ 		if (xprt_request_data_received(task)) {
++ 			status = 0;
++ 			goto out_dequeue;
++ 		}
++ 		/* Verify that our message lies in the RPCSEC_GSS window */
++ 		if (rpcauth_xmit_need_reencode(task)) {
++ 			status = -EBADMSG;
++ 			goto out_dequeue;
++ 		}
++ 	}
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  
+ -	/*
+ -	 * Update req->rq_ntrans before transmitting to avoid races with
+ -	 * xprt_update_rtt(), which needs to know that it is recording a
+ -	 * reply to the first transmission.
+ -	 */
+ -	req->rq_ntrans++;
+ +		/* Verify that our message lies in the RPCSEC_GSS window */
+ +		if (!req->rq_bytes_sent && rpcauth_xmit_need_reencode(task)) {
+ +			task->tk_status = -EBADMSG;
+ +			return;
+ +		}
+ +
+ +		if (list_empty(&req->rq_list) && rpc_reply_expected(task)) {
+ +			/*
+ +			 * Add to the list only if we're expecting a reply
+ +			 */
+ +			/* Update the softirq receive buffer */
+ +			memcpy(&req->rq_private_buf, &req->rq_rcv_buf,
+ +					sizeof(req->rq_private_buf));
+ +			/* Add request to the receive list */
+ +			spin_lock(&xprt->recv_lock);
+ +			list_add_tail(&req->rq_list, &xprt->recv);
+ +			set_bit(RPC_TASK_NEED_RECV, &task->tk_runstate);
+ +			spin_unlock(&xprt->recv_lock);
+ +			xprt_reset_majortimeo(req);
+ +			/* Turn off autodisconnect */
+ +			del_singleshot_timer_sync(&xprt->timer);
+ +		}
+ +	} else if (xprt_request_data_received(task) && !req->rq_bytes_sent)
+ +		return;
+  
+  	connect_cookie = xprt->connect_cookie;
+++<<<<<<< HEAD
+ +	status = xprt->ops->send_request(req, task);
+ +	trace_xprt_transmit(xprt, req->rq_xid, status);
+ +	if (status != 0) {
+ +		task->tk_status = status;
+ +		return;
+++=======
++ 	status = xprt->ops->send_request(req);
++ 	if (status != 0) {
++ 		req->rq_ntrans--;
++ 		trace_xprt_transmit(req, status);
++ 		return status;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	}
+  
+ -	if (is_retrans)
+ -		task->tk_client->cl_stats->rpcretrans++;
+ -
+  	xprt_inject_disconnect(xprt);
+  
+++<<<<<<< HEAD
+ +	dprintk("RPC: %5u xmit complete\n", task->tk_pid);
+ +	clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+++=======
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	task->tk_flags |= RPC_TASK_SENT;
+  	spin_lock_bh(&xprt->transport_lock);
+  
+@@@ -1061,22 -1360,50 +1260,67 @@@
+  	spin_unlock_bh(&xprt->transport_lock);
+  
+  	req->rq_connect_cookie = connect_cookie;
+++<<<<<<< HEAD
+ +	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +		/*
+ +		 * Sleep on the pending queue if we're expecting a reply.
+ +		 * The spinlock ensures atomicity between the test of
+ +		 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
+ +		 */
+ +		spin_lock(&xprt->recv_lock);
+ +		if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +			rpc_sleep_on(&xprt->pending, task, xprt_timer);
+ +			/* Wake up immediately if the connection was dropped */
+ +			if (!xprt_connected(xprt))
+ +				rpc_wake_up_queued_task_set_status(&xprt->pending,
+ +						task, -ENOTCONN);
+ +		}
+ +		spin_unlock(&xprt->recv_lock);
+++=======
++ out_dequeue:
++ 	trace_xprt_transmit(req, status);
++ 	xprt_request_dequeue_transmit(task);
++ 	rpc_wake_up_queued_task_set_status(&xprt->sending, task, status);
++ 	return status;
++ }
++ 
++ /**
++  * xprt_transmit - send an RPC request on a transport
++  * @task: controlling RPC task
++  *
++  * Attempts to drain the transmit queue. On exit, either the transport
++  * signalled an error that needs to be handled before transmission can
++  * resume, or @task finished transmitting, and detected that it already
++  * received a reply.
++  */
++ void
++ xprt_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *next, *req = task->tk_rqstp;
++ 	struct rpc_xprt	*xprt = req->rq_xprt;
++ 	int status;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	while (!list_empty(&xprt->xmit_queue)) {
++ 		next = list_first_entry(&xprt->xmit_queue,
++ 				struct rpc_rqst, rq_xmit);
++ 		xprt_pin_rqst(next);
++ 		spin_unlock(&xprt->queue_lock);
++ 		status = xprt_request_transmit(next, task);
++ 		if (status == -EBADMSG && next != req)
++ 			status = 0;
++ 		cond_resched();
++ 		spin_lock(&xprt->queue_lock);
++ 		xprt_unpin_rqst(next);
++ 		if (status == 0) {
++ 			if (!xprt_request_data_received(task) ||
++ 			    test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 				continue;
++ 		} else if (test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 			task->tk_status = status;
++ 		break;
+++>>>>>>> 0c77668ddb4e (SUNRPC: Introduce trace points in rpc_auth_gss.ko)
+  	}
+ -	spin_unlock(&xprt->queue_lock);
+  }
+  
+  static void xprt_add_backlog(struct rpc_xprt *xprt, struct rpc_task *task)
+diff --git a/include/trace/events/rpcgss.h b/include/trace/events/rpcgss.h
+new file mode 100644
+index 000000000000..d1f7fe1b6fe4
+--- /dev/null
++++ b/include/trace/events/rpcgss.h
+@@ -0,0 +1,361 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++/*
++ * Copyright (c) 2018 Oracle.  All rights reserved.
++ *
++ * Trace point definitions for the "rpcgss" subsystem.
++ */
++
++#undef TRACE_SYSTEM
++#define TRACE_SYSTEM rpcgss
++
++#if !defined(_TRACE_RPCRDMA_H) || defined(TRACE_HEADER_MULTI_READ)
++#define _TRACE_RPCGSS_H
++
++#include <linux/tracepoint.h>
++
++/**
++ ** GSS-API related trace events
++ **/
++
++TRACE_DEFINE_ENUM(GSS_S_BAD_MECH);
++TRACE_DEFINE_ENUM(GSS_S_BAD_NAME);
++TRACE_DEFINE_ENUM(GSS_S_BAD_NAMETYPE);
++TRACE_DEFINE_ENUM(GSS_S_BAD_BINDINGS);
++TRACE_DEFINE_ENUM(GSS_S_BAD_STATUS);
++TRACE_DEFINE_ENUM(GSS_S_BAD_SIG);
++TRACE_DEFINE_ENUM(GSS_S_NO_CRED);
++TRACE_DEFINE_ENUM(GSS_S_NO_CONTEXT);
++TRACE_DEFINE_ENUM(GSS_S_DEFECTIVE_TOKEN);
++TRACE_DEFINE_ENUM(GSS_S_DEFECTIVE_CREDENTIAL);
++TRACE_DEFINE_ENUM(GSS_S_CREDENTIALS_EXPIRED);
++TRACE_DEFINE_ENUM(GSS_S_CONTEXT_EXPIRED);
++TRACE_DEFINE_ENUM(GSS_S_FAILURE);
++TRACE_DEFINE_ENUM(GSS_S_BAD_QOP);
++TRACE_DEFINE_ENUM(GSS_S_UNAUTHORIZED);
++TRACE_DEFINE_ENUM(GSS_S_UNAVAILABLE);
++TRACE_DEFINE_ENUM(GSS_S_DUPLICATE_ELEMENT);
++TRACE_DEFINE_ENUM(GSS_S_NAME_NOT_MN);
++TRACE_DEFINE_ENUM(GSS_S_CONTINUE_NEEDED);
++TRACE_DEFINE_ENUM(GSS_S_DUPLICATE_TOKEN);
++TRACE_DEFINE_ENUM(GSS_S_OLD_TOKEN);
++TRACE_DEFINE_ENUM(GSS_S_UNSEQ_TOKEN);
++TRACE_DEFINE_ENUM(GSS_S_GAP_TOKEN);
++
++#define show_gss_status(x)						\
++	__print_flags(x, "|",						\
++		{ GSS_S_BAD_MECH, "GSS_S_BAD_MECH" },			\
++		{ GSS_S_BAD_NAME, "GSS_S_BAD_NAME" },			\
++		{ GSS_S_BAD_NAMETYPE, "GSS_S_BAD_NAMETYPE" },		\
++		{ GSS_S_BAD_BINDINGS, "GSS_S_BAD_BINDINGS" },		\
++		{ GSS_S_BAD_STATUS, "GSS_S_BAD_STATUS" },		\
++		{ GSS_S_BAD_SIG, "GSS_S_BAD_SIG" },			\
++		{ GSS_S_NO_CRED, "GSS_S_NO_CRED" },			\
++		{ GSS_S_NO_CONTEXT, "GSS_S_NO_CONTEXT" },		\
++		{ GSS_S_DEFECTIVE_TOKEN, "GSS_S_DEFECTIVE_TOKEN" },	\
++		{ GSS_S_DEFECTIVE_CREDENTIAL, "GSS_S_DEFECTIVE_CREDENTIAL" }, \
++		{ GSS_S_CREDENTIALS_EXPIRED, "GSS_S_CREDENTIALS_EXPIRED" }, \
++		{ GSS_S_CONTEXT_EXPIRED, "GSS_S_CONTEXT_EXPIRED" },	\
++		{ GSS_S_FAILURE, "GSS_S_FAILURE" },			\
++		{ GSS_S_BAD_QOP, "GSS_S_BAD_QOP" },			\
++		{ GSS_S_UNAUTHORIZED, "GSS_S_UNAUTHORIZED" },		\
++		{ GSS_S_UNAVAILABLE, "GSS_S_UNAVAILABLE" },		\
++		{ GSS_S_DUPLICATE_ELEMENT, "GSS_S_DUPLICATE_ELEMENT" },	\
++		{ GSS_S_NAME_NOT_MN, "GSS_S_NAME_NOT_MN" },		\
++		{ GSS_S_CONTINUE_NEEDED, "GSS_S_CONTINUE_NEEDED" },	\
++		{ GSS_S_DUPLICATE_TOKEN, "GSS_S_DUPLICATE_TOKEN" },	\
++		{ GSS_S_OLD_TOKEN, "GSS_S_OLD_TOKEN" },			\
++		{ GSS_S_UNSEQ_TOKEN, "GSS_S_UNSEQ_TOKEN" },		\
++		{ GSS_S_GAP_TOKEN, "GSS_S_GAP_TOKEN" })
++
++
++DECLARE_EVENT_CLASS(rpcgss_gssapi_event,
++	TP_PROTO(
++		const struct rpc_task *task,
++		u32 maj_stat
++	),
++
++	TP_ARGS(task, maj_stat),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, maj_stat)
++
++	),
++
++	TP_fast_assign(
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++		__entry->maj_stat = maj_stat;
++	),
++
++	TP_printk("task:%u@%u maj_stat=%s",
++		__entry->task_id, __entry->client_id,
++		__entry->maj_stat == 0 ?
++		"GSS_S_COMPLETE" : show_gss_status(__entry->maj_stat))
++);
++
++#define DEFINE_GSSAPI_EVENT(name)					\
++	DEFINE_EVENT(rpcgss_gssapi_event, rpcgss_##name,		\
++			TP_PROTO(					\
++				const struct rpc_task *task,		\
++				u32 maj_stat				\
++			),						\
++			TP_ARGS(task, maj_stat))
++
++TRACE_EVENT(rpcgss_import_ctx,
++	TP_PROTO(
++		int status
++	),
++
++	TP_ARGS(status),
++
++	TP_STRUCT__entry(
++		__field(int, status)
++	),
++
++	TP_fast_assign(
++		__entry->status = status;
++	),
++
++	TP_printk("status=%d", __entry->status)
++);
++
++DEFINE_GSSAPI_EVENT(get_mic);
++DEFINE_GSSAPI_EVENT(verify_mic);
++DEFINE_GSSAPI_EVENT(wrap);
++DEFINE_GSSAPI_EVENT(unwrap);
++
++
++/**
++ ** GSS auth unwrap failures
++ **/
++
++TRACE_EVENT(rpcgss_unwrap_failed,
++	TP_PROTO(
++		const struct rpc_task *task
++	),
++
++	TP_ARGS(task),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++	),
++
++	TP_printk("task:%u@%u", __entry->task_id, __entry->client_id)
++);
++
++TRACE_EVENT(rpcgss_bad_seqno,
++	TP_PROTO(
++		const struct rpc_task *task,
++		u32 expected,
++		u32 received
++	),
++
++	TP_ARGS(task, expected, received),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, expected)
++		__field(u32, received)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++		__entry->expected = expected;
++		__entry->received = received;
++	),
++
++	TP_printk("task:%u@%u expected seqno %u, received seqno %u",
++		__entry->task_id, __entry->client_id,
++		__entry->expected, __entry->received)
++);
++
++TRACE_EVENT(rpcgss_seqno,
++	TP_PROTO(
++		const struct rpc_task *task
++	),
++
++	TP_ARGS(task),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++		__field(u32, seqno)
++	),
++
++	TP_fast_assign(
++		const struct rpc_rqst *rqst = task->tk_rqstp;
++
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(rqst->rq_xid);
++		__entry->seqno = rqst->rq_seqno;
++	),
++
++	TP_printk("task:%u@%u xid=0x%08x seqno=%u",
++		__entry->task_id, __entry->client_id,
++		__entry->xid, __entry->seqno)
++);
++
++TRACE_EVENT(rpcgss_need_reencode,
++	TP_PROTO(
++		const struct rpc_task *task,
++		u32 seq_xmit,
++		bool ret
++	),
++
++	TP_ARGS(task, seq_xmit, ret),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++		__field(u32, seq_xmit)
++		__field(u32, seqno)
++		__field(bool, ret)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
++		__entry->seq_xmit = seq_xmit;
++		__entry->seqno = task->tk_rqstp->rq_seqno;
++		__entry->ret = ret;
++	),
++
++	TP_printk("task:%u@%u xid=0x%08x rq_seqno=%u seq_xmit=%u reencode %sneeded",
++		__entry->task_id, __entry->client_id,
++		__entry->xid, __entry->seqno, __entry->seq_xmit,
++		__entry->ret ? "" : "un")
++);
++
++/**
++ ** gssd upcall related trace events
++ **/
++
++TRACE_EVENT(rpcgss_upcall_msg,
++	TP_PROTO(
++		const char *buf
++	),
++
++	TP_ARGS(buf),
++
++	TP_STRUCT__entry(
++		__string(msg, buf)
++	),
++
++	TP_fast_assign(
++		__assign_str(msg, buf)
++	),
++
++	TP_printk("msg='%s'", __get_str(msg))
++);
++
++TRACE_EVENT(rpcgss_upcall_result,
++	TP_PROTO(
++		u32 uid,
++		int result
++	),
++
++	TP_ARGS(uid, result),
++
++	TP_STRUCT__entry(
++		__field(u32, uid)
++		__field(int, result)
++
++	),
++
++	TP_fast_assign(
++		__entry->uid = uid;
++		__entry->result = result;
++	),
++
++	TP_printk("for uid %u, result=%d", __entry->uid, __entry->result)
++);
++
++TRACE_EVENT(rpcgss_context,
++	TP_PROTO(
++		unsigned long expiry,
++		unsigned long now,
++		unsigned int timeout,
++		unsigned int len,
++		const u8 *data
++	),
++
++	TP_ARGS(expiry, now, timeout, len, data),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, expiry)
++		__field(unsigned long, now)
++		__field(unsigned int, timeout)
++		__field(int, len)
++		__string(acceptor, data)
++	),
++
++	TP_fast_assign(
++		__entry->expiry = expiry;
++		__entry->now = now;
++		__entry->timeout = timeout;
++		__entry->len = len;
++		strncpy(__get_str(acceptor), data, len);
++	),
++
++	TP_printk("gc_expiry=%lu now=%lu timeout=%u acceptor=%.*s",
++		__entry->expiry, __entry->now, __entry->timeout,
++		__entry->len, __get_str(acceptor))
++);
++
++
++/**
++ ** Miscellaneous events
++ */
++
++TRACE_DEFINE_ENUM(RPC_AUTH_GSS_KRB5);
++TRACE_DEFINE_ENUM(RPC_AUTH_GSS_KRB5I);
++TRACE_DEFINE_ENUM(RPC_AUTH_GSS_KRB5P);
++
++#define show_pseudoflavor(x)						\
++	__print_symbolic(x,						\
++		{ RPC_AUTH_GSS_KRB5, "RPC_AUTH_GSS_KRB5" },		\
++		{ RPC_AUTH_GSS_KRB5I, "RPC_AUTH_GSS_KRB5I" },		\
++		{ RPC_AUTH_GSS_KRB5P, "RPC_AUTH_GSS_KRB5P" })
++
++
++TRACE_EVENT(rpcgss_createauth,
++	TP_PROTO(
++		unsigned int flavor,
++		int error
++	),
++
++	TP_ARGS(flavor, error),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, flavor)
++		__field(int, error)
++
++	),
++
++	TP_fast_assign(
++		__entry->flavor = flavor;
++		__entry->error = error;
++	),
++
++	TP_printk("flavor=%s error=%d",
++		show_pseudoflavor(__entry->flavor), __entry->error)
++);
++
++
++#endif	/* _TRACE_RPCGSS_H */
++
++#include <trace/define_trace.h>
+diff --git a/include/trace/events/rpcrdma.h b/include/trace/events/rpcrdma.h
+index 399b1aedc927..962975b4313f 100644
+--- a/include/trace/events/rpcrdma.h
++++ b/include/trace/events/rpcrdma.h
+@@ -521,12 +521,18 @@ TRACE_EVENT(xprtrdma_post_send,
+ 
+ 	TP_STRUCT__entry(
+ 		__field(const void *, req)
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
+ 		__field(int, num_sge)
+ 		__field(int, signaled)
+ 		__field(int, status)
+ 	),
+ 
+ 	TP_fast_assign(
++		const struct rpc_rqst *rqst = &req->rl_slot;
++
++		__entry->task_id = rqst->rq_task->tk_pid;
++		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
+ 		__entry->req = req;
+ 		__entry->num_sge = req->rl_sendctx->sc_wr.num_sge;
+ 		__entry->signaled = req->rl_sendctx->sc_wr.send_flags &
+@@ -534,9 +540,11 @@ TRACE_EVENT(xprtrdma_post_send,
+ 		__entry->status = status;
+ 	),
+ 
+-	TP_printk("req=%p, %d SGEs%s, status=%d",
++	TP_printk("task:%u@%u req=%p (%d SGE%s) %sstatus=%d",
++		__entry->task_id, __entry->client_id,
+ 		__entry->req, __entry->num_sge,
+-		(__entry->signaled ? ", signaled" : ""),
++		(__entry->num_sge == 1 ? "" : "s"),
++		(__entry->signaled ? "signaled " : ""),
+ 		__entry->status
+ 	)
+ );
+diff --git a/include/trace/events/sunrpc.h b/include/trace/events/sunrpc.h
+index 42376a2afcb8..4e145f640f6a 100644
+--- a/include/trace/events/sunrpc.h
++++ b/include/trace/events/sunrpc.h
+@@ -448,9 +448,68 @@ DECLARE_EVENT_CLASS(rpc_xprt_event,
+ 
+ DEFINE_RPC_XPRT_EVENT(timer);
+ DEFINE_RPC_XPRT_EVENT(lookup_rqst);
+-DEFINE_RPC_XPRT_EVENT(transmit);
+ DEFINE_RPC_XPRT_EVENT(complete_rqst);
+ 
++TRACE_EVENT(xprt_transmit,
++	TP_PROTO(
++		const struct rpc_rqst *rqst,
++		int status
++	),
++
++	TP_ARGS(rqst, status),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++		__field(u32, seqno)
++		__field(int, status)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = rqst->rq_task->tk_pid;
++		__entry->client_id = rqst->rq_task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(rqst->rq_xid);
++		__entry->seqno = rqst->rq_seqno;
++		__entry->status = status;
++	),
++
++	TP_printk(
++		"task:%u@%u xid=0x%08x seqno=%u status=%d",
++		__entry->task_id, __entry->client_id, __entry->xid,
++		__entry->seqno, __entry->status)
++);
++
++TRACE_EVENT(xprt_enq_xmit,
++	TP_PROTO(
++		const struct rpc_task *task,
++		int stage
++	),
++
++	TP_ARGS(task, stage),
++
++	TP_STRUCT__entry(
++		__field(unsigned int, task_id)
++		__field(unsigned int, client_id)
++		__field(u32, xid)
++		__field(u32, seqno)
++		__field(int, stage)
++	),
++
++	TP_fast_assign(
++		__entry->task_id = task->tk_pid;
++		__entry->client_id = task->tk_client->cl_clid;
++		__entry->xid = be32_to_cpu(task->tk_rqstp->rq_xid);
++		__entry->seqno = task->tk_rqstp->rq_seqno;
++		__entry->stage = stage;
++	),
++
++	TP_printk(
++		"task:%u@%u xid=0x%08x seqno=%u stage=%d",
++		__entry->task_id, __entry->client_id, __entry->xid,
++		__entry->seqno, __entry->stage)
++);
++
+ TRACE_EVENT(xprt_ping,
+ 	TP_PROTO(const struct rpc_xprt *xprt, int status),
+ 
+diff --git a/net/sunrpc/auth_gss/Makefile b/net/sunrpc/auth_gss/Makefile
+index c374268b008f..4a29f4c5dac4 100644
+--- a/net/sunrpc/auth_gss/Makefile
++++ b/net/sunrpc/auth_gss/Makefile
+@@ -7,7 +7,7 @@ obj-$(CONFIG_SUNRPC_GSS) += auth_rpcgss.o
+ 
+ auth_rpcgss-y := auth_gss.o gss_generic_token.o \
+ 	gss_mech_switch.o svcauth_gss.o \
+-	gss_rpc_upcall.o gss_rpc_xdr.o
++	gss_rpc_upcall.o gss_rpc_xdr.o trace.o
+ 
+ obj-$(CONFIG_RPCSEC_GSS_KRB5) += rpcsec_gss_krb5.o
+ 
+* Unmerged path net/sunrpc/auth_gss/auth_gss.c
+diff --git a/net/sunrpc/auth_gss/trace.c b/net/sunrpc/auth_gss/trace.c
+new file mode 100644
+index 000000000000..5576f1e66de9
+--- /dev/null
++++ b/net/sunrpc/auth_gss/trace.c
+@@ -0,0 +1,11 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (c) 2018, 2019 Oracle. All rights reserved.
++ */
++
++#include <linux/sunrpc/clnt.h>
++#include <linux/sunrpc/sched.h>
++#include <linux/sunrpc/gss_err.h>
++
++#define CREATE_TRACE_POINTS
++#include <trace/events/rpcgss.h>
+* Unmerged path net/sunrpc/xprt.c
