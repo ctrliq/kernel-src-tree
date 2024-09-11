@@ -1,0 +1,109 @@
+RDMA: Add dedicated QP resource tracker function
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Maor Gottlieb <maorg@mellanox.com>
+commit 5cc34116ccec60032dbaa92768f41e95ce2d8ec7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/5cc34116.failed
+
+In order to avoid double multiplexing of the resource when it is a QP, add
+a dedicated callback function.
+
+Link: https://lore.kernel.org/r/20200623113043.1228482-7-leon@kernel.org
+	Signed-off-by: Maor Gottlieb <maorg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 5cc34116ccec60032dbaa92768f41e95ce2d8ec7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+index ab603a2f475e,c84aa7c937f1..000000000000
+--- a/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
++++ b/drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+@@@ -1111,6 -1056,8 +1111,11 @@@ struct c4iw_wr_wait *c4iw_alloc_wr_wait
+  typedef int c4iw_restrack_func(struct sk_buff *msg,
+  			       struct rdma_restrack_entry *res);
+  int c4iw_fill_res_mr_entry(struct sk_buff *msg, struct ib_mr *ibmr);
+++<<<<<<< HEAD
+++=======
++ int c4iw_fill_res_cq_entry(struct sk_buff *msg, struct ib_cq *ibcq);
++ int c4iw_fill_res_qp_entry(struct sk_buff *msg, struct ib_qp *ibqp);
+++>>>>>>> 5cc34116ccec (RDMA: Add dedicated QP resource tracker function)
+  extern c4iw_restrack_func *c4iw_restrack_funcs[RDMA_RESTRACK_MAX];
+  
+  #endif
+diff --cc include/rdma/ib_verbs.h
+index f21dc2571341,4e8519ac7363..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2592,6 -2584,8 +2592,11 @@@ struct ib_device_ops 
+  	int (*fill_res_entry)(struct sk_buff *msg,
+  			      struct rdma_restrack_entry *entry);
+  	int (*fill_res_mr_entry)(struct sk_buff *msg, struct ib_mr *ibmr);
+++<<<<<<< HEAD
+++=======
++ 	int (*fill_res_cq_entry)(struct sk_buff *msg, struct ib_cq *ibcq);
++ 	int (*fill_res_qp_entry)(struct sk_buff *msg, struct ib_qp *ibqp);
+++>>>>>>> 5cc34116ccec (RDMA: Add dedicated QP resource tracker function)
+  
+  	/* Device lifecycle callbacks */
+  	/*
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index a0fc4c9c3c66..e19a9a58b545 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -2607,6 +2607,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, enable_driver);
+ 	SET_DEVICE_OP(dev_ops, fill_res_entry);
+ 	SET_DEVICE_OP(dev_ops, fill_res_mr_entry);
++	SET_DEVICE_OP(dev_ops, fill_res_qp_entry);
+ 	SET_DEVICE_OP(dev_ops, fill_stat_mr_entry);
+ 	SET_DEVICE_OP(dev_ops, get_dev_fw_str);
+ 	SET_DEVICE_OP(dev_ops, get_dma_mr);
+diff --git a/drivers/infiniband/core/nldev.c b/drivers/infiniband/core/nldev.c
+index a4f3f838d6fe..387aea8fc985 100644
+--- a/drivers/infiniband/core/nldev.c
++++ b/drivers/infiniband/core/nldev.c
+@@ -507,9 +507,8 @@ static int fill_res_qp_entry(struct sk_buff *msg, bool has_cap_net_admin,
+ 	if (fill_res_name_pid(msg, res))
+ 		goto err;
+ 
+-	if (fill_res_entry(dev, msg, res))
+-		goto err;
+-
++	if (dev->ops.fill_res_qp_entry)
++		return dev->ops.fill_res_qp_entry(msg, qp);
+ 	return 0;
+ 
+ err:	return -EMSGSIZE;
+* Unmerged path drivers/infiniband/hw/cxgb4/iw_cxgb4.h
+diff --git a/drivers/infiniband/hw/cxgb4/restrack.c b/drivers/infiniband/hw/cxgb4/restrack.c
+index 9a5ca9192c1c..ffc02f3f09db 100644
+--- a/drivers/infiniband/hw/cxgb4/restrack.c
++++ b/drivers/infiniband/hw/cxgb4/restrack.c
+@@ -134,10 +134,8 @@ static int fill_swsqes(struct sk_buff *msg, struct t4_sq *sq,
+ 	return -EMSGSIZE;
+ }
+ 
+-static int fill_res_qp_entry(struct sk_buff *msg,
+-			     struct rdma_restrack_entry *res)
++int c4iw_fill_res_qp_entry(struct sk_buff *msg, struct ib_qp *ibqp)
+ {
+-	struct ib_qp *ibqp = container_of(res, struct ib_qp, res);
+ 	struct t4_swsqe *fsp = NULL, *lsp = NULL;
+ 	struct c4iw_qp *qhp = to_c4iw_qp(ibqp);
+ 	u16 first_sq_idx = 0, last_sq_idx = 0;
+@@ -492,7 +490,6 @@ int c4iw_fill_res_mr_entry(struct sk_buff *msg, struct ib_mr *ibmr)
+ }
+ 
+ c4iw_restrack_func *c4iw_restrack_funcs[RDMA_RESTRACK_MAX] = {
+-	[RDMA_RESTRACK_QP]	= fill_res_qp_entry,
+ 	[RDMA_RESTRACK_CM_ID]	= fill_res_ep_entry,
+ 	[RDMA_RESTRACK_CQ]	= fill_res_cq_entry,
+ };
+* Unmerged path include/rdma/ib_verbs.h
