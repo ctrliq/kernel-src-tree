@@ -1,0 +1,386 @@
+bpf: Move stack_map_get_build_id into lib
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit bd7525dacd7e204f8cae061941fb9001c89d6988
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/bd7525da.failed
+
+Moving stack_map_get_build_id into lib with
+declaration in linux/buildid.h header:
+
+  int build_id_parse(struct vm_area_struct *vma, unsigned char *build_id);
+
+This function returns build id for given struct vm_area_struct.
+There is no functional change to stack_map_get_build_id function.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20210114134044.1418404-2-jolsa@kernel.org
+(cherry picked from commit bd7525dacd7e204f8cae061941fb9001c89d6988)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Makefile
+diff --cc lib/Makefile
+index 028e9d7630dd,a6b160c3a4fa..000000000000
+--- a/lib/Makefile
++++ b/lib/Makefile
+@@@ -35,10 -36,10 +35,15 @@@ lib-y := ctype.o string.o vsprintf.o cm
+  	 flex_proportions.o ratelimit.o show_mem.o \
+  	 is_single_threaded.o plist.o decompress.o kobject_uevent.o \
+  	 earlycpio.o seq_buf.o siphash.o dec_and_lock.o \
+++<<<<<<< HEAD
+ +	 nmi_backtrace.o nodemask.o win_minmax.o
+++=======
++ 	 nmi_backtrace.o nodemask.o win_minmax.o memcat_p.o \
++ 	 buildid.o
+++>>>>>>> bd7525dacd7e (bpf: Move stack_map_get_build_id into lib)
+  
+  lib-$(CONFIG_PRINTK) += dump_stack.o
+ +lib-$(CONFIG_MMU) += ioremap.o
+  lib-$(CONFIG_SMP) += cpumask.o
+  
+  lib-y	+= kobject.o klist.o
+diff --git a/include/linux/buildid.h b/include/linux/buildid.h
+new file mode 100644
+index 000000000000..08028a212589
+--- /dev/null
++++ b/include/linux/buildid.h
+@@ -0,0 +1,11 @@
++/* SPDX-License-Identifier: GPL-2.0 */
++#ifndef _LINUX_BUILDID_H
++#define _LINUX_BUILDID_H
++
++#include <linux/mm_types.h>
++
++#define BUILD_ID_SIZE_MAX 20
++
++int build_id_parse(struct vm_area_struct *vma, unsigned char *build_id);
++
++#endif
+diff --git a/kernel/bpf/stackmap.c b/kernel/bpf/stackmap.c
+index 7932cdc9c0e9..7e4b4820d7d6 100644
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@ -7,10 +7,9 @@
+ #include <linux/kernel.h>
+ #include <linux/stacktrace.h>
+ #include <linux/perf_event.h>
+-#include <linux/elf.h>
+-#include <linux/pagemap.h>
+ #include <linux/irq_work.h>
+ #include <linux/btf_ids.h>
++#include <linux/buildid.h>
+ #include "percpu_freelist.h"
+ 
+ #define STACK_CREATE_FLAG_MASK					\
+@@ -145,140 +144,6 @@ static struct bpf_map *stack_map_alloc(union bpf_attr *attr)
+ 	return ERR_PTR(err);
+ }
+ 
+-#define BPF_BUILD_ID 3
+-/*
+- * Parse build id from the note segment. This logic can be shared between
+- * 32-bit and 64-bit system, because Elf32_Nhdr and Elf64_Nhdr are
+- * identical.
+- */
+-static inline int stack_map_parse_build_id(void *page_addr,
+-					   unsigned char *build_id,
+-					   void *note_start,
+-					   Elf32_Word note_size)
+-{
+-	Elf32_Word note_offs = 0, new_offs;
+-
+-	/* check for overflow */
+-	if (note_start < page_addr || note_start + note_size < note_start)
+-		return -EINVAL;
+-
+-	/* only supports note that fits in the first page */
+-	if (note_start + note_size > page_addr + PAGE_SIZE)
+-		return -EINVAL;
+-
+-	while (note_offs + sizeof(Elf32_Nhdr) < note_size) {
+-		Elf32_Nhdr *nhdr = (Elf32_Nhdr *)(note_start + note_offs);
+-
+-		if (nhdr->n_type == BPF_BUILD_ID &&
+-		    nhdr->n_namesz == sizeof("GNU") &&
+-		    nhdr->n_descsz > 0 &&
+-		    nhdr->n_descsz <= BPF_BUILD_ID_SIZE) {
+-			memcpy(build_id,
+-			       note_start + note_offs +
+-			       ALIGN(sizeof("GNU"), 4) + sizeof(Elf32_Nhdr),
+-			       nhdr->n_descsz);
+-			memset(build_id + nhdr->n_descsz, 0,
+-			       BPF_BUILD_ID_SIZE - nhdr->n_descsz);
+-			return 0;
+-		}
+-		new_offs = note_offs + sizeof(Elf32_Nhdr) +
+-			ALIGN(nhdr->n_namesz, 4) + ALIGN(nhdr->n_descsz, 4);
+-		if (new_offs <= note_offs)  /* overflow */
+-			break;
+-		note_offs = new_offs;
+-	}
+-	return -EINVAL;
+-}
+-
+-/* Parse build ID from 32-bit ELF */
+-static int stack_map_get_build_id_32(void *page_addr,
+-				     unsigned char *build_id)
+-{
+-	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)page_addr;
+-	Elf32_Phdr *phdr;
+-	int i;
+-
+-	/* only supports phdr that fits in one page */
+-	if (ehdr->e_phnum >
+-	    (PAGE_SIZE - sizeof(Elf32_Ehdr)) / sizeof(Elf32_Phdr))
+-		return -EINVAL;
+-
+-	phdr = (Elf32_Phdr *)(page_addr + sizeof(Elf32_Ehdr));
+-
+-	for (i = 0; i < ehdr->e_phnum; ++i) {
+-		if (phdr[i].p_type == PT_NOTE &&
+-		    !stack_map_parse_build_id(page_addr, build_id,
+-					      page_addr + phdr[i].p_offset,
+-					      phdr[i].p_filesz))
+-			return 0;
+-	}
+-	return -EINVAL;
+-}
+-
+-/* Parse build ID from 64-bit ELF */
+-static int stack_map_get_build_id_64(void *page_addr,
+-				     unsigned char *build_id)
+-{
+-	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)page_addr;
+-	Elf64_Phdr *phdr;
+-	int i;
+-
+-	/* only supports phdr that fits in one page */
+-	if (ehdr->e_phnum >
+-	    (PAGE_SIZE - sizeof(Elf64_Ehdr)) / sizeof(Elf64_Phdr))
+-		return -EINVAL;
+-
+-	phdr = (Elf64_Phdr *)(page_addr + sizeof(Elf64_Ehdr));
+-
+-	for (i = 0; i < ehdr->e_phnum; ++i) {
+-		if (phdr[i].p_type == PT_NOTE &&
+-		    !stack_map_parse_build_id(page_addr, build_id,
+-					      page_addr + phdr[i].p_offset,
+-					      phdr[i].p_filesz))
+-			return 0;
+-	}
+-	return -EINVAL;
+-}
+-
+-/* Parse build ID of ELF file mapped to vma */
+-static int stack_map_get_build_id(struct vm_area_struct *vma,
+-				  unsigned char *build_id)
+-{
+-	Elf32_Ehdr *ehdr;
+-	struct page *page;
+-	void *page_addr;
+-	int ret;
+-
+-	/* only works for page backed storage  */
+-	if (!vma->vm_file)
+-		return -EINVAL;
+-
+-	page = find_get_page(vma->vm_file->f_mapping, 0);
+-	if (!page)
+-		return -EFAULT;	/* page not mapped */
+-
+-	ret = -EINVAL;
+-	page_addr = kmap_atomic(page);
+-	ehdr = (Elf32_Ehdr *)page_addr;
+-
+-	/* compare magic x7f "ELF" */
+-	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0)
+-		goto out;
+-
+-	/* only support executable file and shared object file */
+-	if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN)
+-		goto out;
+-
+-	if (ehdr->e_ident[EI_CLASS] == ELFCLASS32)
+-		ret = stack_map_get_build_id_32(page_addr, build_id);
+-	else if (ehdr->e_ident[EI_CLASS] == ELFCLASS64)
+-		ret = stack_map_get_build_id_64(page_addr, build_id);
+-out:
+-	kunmap_atomic(page_addr);
+-	put_page(page);
+-	return ret;
+-}
+-
+ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 					  u64 *ips, u32 trace_nr, bool user)
+ {
+@@ -319,18 +184,18 @@ static void stack_map_get_build_id_offset(struct bpf_stack_build_id *id_offs,
+ 		for (i = 0; i < trace_nr; i++) {
+ 			id_offs[i].status = BPF_STACK_BUILD_ID_IP;
+ 			id_offs[i].ip = ips[i];
+-			memset(id_offs[i].build_id, 0, BPF_BUILD_ID_SIZE);
++			memset(id_offs[i].build_id, 0, BUILD_ID_SIZE_MAX);
+ 		}
+ 		return;
+ 	}
+ 
+ 	for (i = 0; i < trace_nr; i++) {
+ 		vma = find_vma(current->mm, ips[i]);
+-		if (!vma || stack_map_get_build_id(vma, id_offs[i].build_id)) {
++		if (!vma || build_id_parse(vma, id_offs[i].build_id)) {
+ 			/* per entry fall back to ips */
+ 			id_offs[i].status = BPF_STACK_BUILD_ID_IP;
+ 			id_offs[i].ip = ips[i];
+-			memset(id_offs[i].build_id, 0, BPF_BUILD_ID_SIZE);
++			memset(id_offs[i].build_id, 0, BUILD_ID_SIZE_MAX);
+ 			continue;
+ 		}
+ 		id_offs[i].offset = (vma->vm_pgoff << PAGE_SHIFT) + ips[i]
+* Unmerged path lib/Makefile
+diff --git a/lib/buildid.c b/lib/buildid.c
+new file mode 100644
+index 000000000000..4a4f520c0e29
+--- /dev/null
++++ b/lib/buildid.c
+@@ -0,0 +1,136 @@
++// SPDX-License-Identifier: GPL-2.0
++
++#include <linux/buildid.h>
++#include <linux/elf.h>
++#include <linux/pagemap.h>
++
++#define BUILD_ID 3
++/*
++ * Parse build id from the note segment. This logic can be shared between
++ * 32-bit and 64-bit system, because Elf32_Nhdr and Elf64_Nhdr are
++ * identical.
++ */
++static inline int parse_build_id(void *page_addr,
++				 unsigned char *build_id,
++				 void *note_start,
++				 Elf32_Word note_size)
++{
++	Elf32_Word note_offs = 0, new_offs;
++
++	/* check for overflow */
++	if (note_start < page_addr || note_start + note_size < note_start)
++		return -EINVAL;
++
++	/* only supports note that fits in the first page */
++	if (note_start + note_size > page_addr + PAGE_SIZE)
++		return -EINVAL;
++
++	while (note_offs + sizeof(Elf32_Nhdr) < note_size) {
++		Elf32_Nhdr *nhdr = (Elf32_Nhdr *)(note_start + note_offs);
++
++		if (nhdr->n_type == BUILD_ID &&
++		    nhdr->n_namesz == sizeof("GNU") &&
++		    nhdr->n_descsz > 0 &&
++		    nhdr->n_descsz <= BUILD_ID_SIZE_MAX) {
++			memcpy(build_id,
++			       note_start + note_offs +
++			       ALIGN(sizeof("GNU"), 4) + sizeof(Elf32_Nhdr),
++			       nhdr->n_descsz);
++			memset(build_id + nhdr->n_descsz, 0,
++			       BUILD_ID_SIZE_MAX - nhdr->n_descsz);
++			return 0;
++		}
++		new_offs = note_offs + sizeof(Elf32_Nhdr) +
++			ALIGN(nhdr->n_namesz, 4) + ALIGN(nhdr->n_descsz, 4);
++		if (new_offs <= note_offs)  /* overflow */
++			break;
++		note_offs = new_offs;
++	}
++	return -EINVAL;
++}
++
++/* Parse build ID from 32-bit ELF */
++static int get_build_id_32(void *page_addr, unsigned char *build_id)
++{
++	Elf32_Ehdr *ehdr = (Elf32_Ehdr *)page_addr;
++	Elf32_Phdr *phdr;
++	int i;
++
++	/* only supports phdr that fits in one page */
++	if (ehdr->e_phnum >
++	    (PAGE_SIZE - sizeof(Elf32_Ehdr)) / sizeof(Elf32_Phdr))
++		return -EINVAL;
++
++	phdr = (Elf32_Phdr *)(page_addr + sizeof(Elf32_Ehdr));
++
++	for (i = 0; i < ehdr->e_phnum; ++i) {
++		if (phdr[i].p_type == PT_NOTE &&
++		    !parse_build_id(page_addr, build_id,
++				    page_addr + phdr[i].p_offset,
++				    phdr[i].p_filesz))
++			return 0;
++	}
++	return -EINVAL;
++}
++
++/* Parse build ID from 64-bit ELF */
++static int get_build_id_64(void *page_addr, unsigned char *build_id)
++{
++	Elf64_Ehdr *ehdr = (Elf64_Ehdr *)page_addr;
++	Elf64_Phdr *phdr;
++	int i;
++
++	/* only supports phdr that fits in one page */
++	if (ehdr->e_phnum >
++	    (PAGE_SIZE - sizeof(Elf64_Ehdr)) / sizeof(Elf64_Phdr))
++		return -EINVAL;
++
++	phdr = (Elf64_Phdr *)(page_addr + sizeof(Elf64_Ehdr));
++
++	for (i = 0; i < ehdr->e_phnum; ++i) {
++		if (phdr[i].p_type == PT_NOTE &&
++		    !parse_build_id(page_addr, build_id,
++				    page_addr + phdr[i].p_offset,
++				    phdr[i].p_filesz))
++			return 0;
++	}
++	return -EINVAL;
++}
++
++/* Parse build ID of ELF file mapped to vma */
++int build_id_parse(struct vm_area_struct *vma, unsigned char *build_id)
++{
++	Elf32_Ehdr *ehdr;
++	struct page *page;
++	void *page_addr;
++	int ret;
++
++	/* only works for page backed storage  */
++	if (!vma->vm_file)
++		return -EINVAL;
++
++	page = find_get_page(vma->vm_file->f_mapping, 0);
++	if (!page)
++		return -EFAULT;	/* page not mapped */
++
++	ret = -EINVAL;
++	page_addr = kmap_atomic(page);
++	ehdr = (Elf32_Ehdr *)page_addr;
++
++	/* compare magic x7f "ELF" */
++	if (memcmp(ehdr->e_ident, ELFMAG, SELFMAG) != 0)
++		goto out;
++
++	/* only support executable file and shared object file */
++	if (ehdr->e_type != ET_EXEC && ehdr->e_type != ET_DYN)
++		goto out;
++
++	if (ehdr->e_ident[EI_CLASS] == ELFCLASS32)
++		ret = get_build_id_32(page_addr, build_id);
++	else if (ehdr->e_ident[EI_CLASS] == ELFCLASS64)
++		ret = get_build_id_64(page_addr, build_id);
++out:
++	kunmap_atomic(page_addr);
++	put_page(page);
++	return ret;
++}
