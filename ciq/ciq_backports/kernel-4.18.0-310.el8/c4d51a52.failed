@@ -1,0 +1,87 @@
+sched/wait: Add add_wait_queue_priority()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author David Woodhouse <dwmw@amazon.co.uk>
+commit c4d51a52c67a1e3a0fa3006e5ec21cdc07649cd6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/c4d51a52.failed
+
+This allows an exclusive wait_queue_entry to be added at the head of the
+queue, instead of the tail as normal. Thus, it gets to consume events
+first without allowing non-exclusive waiters to be woken at all.
+
+The (first) intended use is for KVM IRQFD, which currently has
+inconsistent behaviour depending on whether posted interrupts are
+available or not. If they are, KVM will bypass the eventfd completely
+and deliver interrupts directly to the appropriate vCPU. If not, events
+are delivered through the eventfd and userspace will receive them when
+polling on the eventfd.
+
+By using add_wait_queue_priority(), KVM will be able to consistently
+consume events within the kernel without accidentally exposing them
+to userspace when they're supposed to be bypassed. This, in turn, means
+that userspace doesn't have to jump through hoops to avoid listening
+on the erroneously noisy eventfd and injecting duplicate interrupts.
+
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+Message-Id: <20201027143944.648769-2-dwmw2@infradead.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c4d51a52c67a1e3a0fa3006e5ec21cdc07649cd6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/wait.h
+diff --cc include/linux/wait.h
+index c4925ec5b8a8,fe10e8570a52..000000000000
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@@ -21,6 -21,8 +21,11 @@@ int default_wake_function(struct wait_q
+  #define WQ_FLAG_WOKEN		0x02
+  #define WQ_FLAG_BOOKMARK	0x04
+  #define WQ_FLAG_CUSTOM		0x08
+++<<<<<<< HEAD
+++=======
++ #define WQ_FLAG_DONE		0x10
++ #define WQ_FLAG_PRIORITY	0x20
+++>>>>>>> c4d51a52c67a (sched/wait: Add add_wait_queue_priority())
+  
+  /*
+   * A single wait-queue entry structure:
+* Unmerged path include/linux/wait.h
+diff --git a/kernel/sched/wait.c b/kernel/sched/wait.c
+index d34f7f13d443..7d9a1bbf55af 100644
+--- a/kernel/sched/wait.c
++++ b/kernel/sched/wait.c
+@@ -36,6 +36,17 @@ void add_wait_queue_exclusive(struct wait_queue_head *wq_head, struct wait_queue
+ }
+ EXPORT_SYMBOL(add_wait_queue_exclusive);
+ 
++void add_wait_queue_priority(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
++{
++	unsigned long flags;
++
++	wq_entry->flags |= WQ_FLAG_EXCLUSIVE | WQ_FLAG_PRIORITY;
++	spin_lock_irqsave(&wq_head->lock, flags);
++	__add_wait_queue(wq_head, wq_entry);
++	spin_unlock_irqrestore(&wq_head->lock, flags);
++}
++EXPORT_SYMBOL_GPL(add_wait_queue_priority);
++
+ void remove_wait_queue(struct wait_queue_head *wq_head, struct wait_queue_entry *wq_entry)
+ {
+ 	unsigned long flags;
+@@ -56,7 +67,11 @@ EXPORT_SYMBOL(remove_wait_queue);
+ /*
+  * The core wakeup function. Non-exclusive wakeups (nr_exclusive == 0) just
+  * wake everything up. If it's an exclusive wakeup (nr_exclusive == small +ve
+- * number) then we wake all the non-exclusive tasks and one exclusive task.
++ * number) then we wake that number of exclusive tasks, and potentially all
++ * the non-exclusive tasks. Normally, exclusive tasks will be at the end of
++ * the list and any non-exclusive tasks will be woken first. A priority task
++ * may be at the head of the list, and can consume the event without any other
++ * tasks being woken.
+  *
+  * There are circumstances in which we can try to wake a task which has already
+  * started to run but is not in state TASK_RUNNING. try_to_wake_up() returns
