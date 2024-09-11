@@ -1,0 +1,153 @@
+iommu: Keep a list of allocated groups in __iommu_probe_device()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 41df6dcc0a3ff4fb654c3d969ab96ba9c4f0e796
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/41df6dcc.failed
+
+This is needed to defer default_domain allocation for new IOMMU groups
+until all devices have been added to the group.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Tested-by: Marek Szyprowski <m.szyprowski@samsung.com>
+	Acked-by: Marek Szyprowski <m.szyprowski@samsung.com>
+Link: https://lore.kernel.org/r/20200429133712.31431-10-joro@8bytes.org
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 41df6dcc0a3ff4fb654c3d969ab96ba9c4f0e796)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/iommu.c
+diff --cc drivers/iommu/iommu.c
+index 7997fcb701e0,18eb3623bd00..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -161,17 -161,116 +162,108 @@@ void iommu_device_unregister(struct iom
+  	list_del(&iommu->list);
+  	spin_unlock(&iommu_device_lock);
+  }
+++<<<<<<< HEAD
+++=======
++ EXPORT_SYMBOL_GPL(iommu_device_unregister);
++ 
++ static struct dev_iommu *dev_iommu_get(struct device *dev)
++ {
++ 	struct dev_iommu *param = dev->iommu;
++ 
++ 	if (param)
++ 		return param;
++ 
++ 	param = kzalloc(sizeof(*param), GFP_KERNEL);
++ 	if (!param)
++ 		return NULL;
++ 
++ 	mutex_init(&param->lock);
++ 	dev->iommu = param;
++ 	return param;
++ }
++ 
++ static void dev_iommu_free(struct device *dev)
++ {
++ 	kfree(dev->iommu);
++ 	dev->iommu = NULL;
++ }
++ 
++ static int __iommu_probe_device(struct device *dev, struct list_head *group_list)
++ {
++ 	const struct iommu_ops *ops = dev->bus->iommu_ops;
++ 	struct iommu_device *iommu_dev;
++ 	struct iommu_group *group;
++ 	int ret;
++ 
++ 	iommu_dev = ops->probe_device(dev);
++ 	if (IS_ERR(iommu_dev))
++ 		return PTR_ERR(iommu_dev);
++ 
++ 	dev->iommu->iommu_dev = iommu_dev;
++ 
++ 	group = iommu_group_get_for_dev(dev);
++ 	if (!IS_ERR(group)) {
++ 		ret = PTR_ERR(group);
++ 		goto out_release;
++ 	}
++ 	iommu_group_put(group);
++ 
++ 	if (group_list && !group->default_domain && list_empty(&group->entry))
++ 		list_add_tail(&group->entry, group_list);
++ 
++ 	iommu_device_link(iommu_dev, dev);
++ 
++ 	return 0;
++ 
++ out_release:
++ 	ops->release_device(dev);
++ 
++ 	return ret;
++ }
+++>>>>>>> 41df6dcc0a3f (iommu: Keep a list of allocated groups in __iommu_probe_device())
+  
+  int iommu_probe_device(struct device *dev)
+  {
+  	const struct iommu_ops *ops = dev->bus->iommu_ops;
+ -	int ret;
+ +	int ret = -EINVAL;
+  
+  	WARN_ON(dev->iommu_group);
+ -	if (!ops)
+ -		return -EINVAL;
+  
+++<<<<<<< HEAD
+ +	if (ops)
+++=======
++ 	if (!dev_iommu_get(dev))
++ 		return -ENOMEM;
++ 
++ 	if (!try_module_get(ops->owner)) {
++ 		ret = -EINVAL;
++ 		goto err_free_dev_param;
++ 	}
++ 
++ 	if (ops->probe_device) {
++ 		struct iommu_group *group;
++ 
++ 		ret = __iommu_probe_device(dev, NULL);
++ 
++ 		/*
++ 		 * Try to allocate a default domain - needs support from the
++ 		 * IOMMU driver. There are still some drivers which don't
++ 		 * support default domains, so the return value is not yet
++ 		 * checked.
++ 		 */
++ 		if (!ret)
++ 			iommu_alloc_default_domain(dev);
++ 
++ 		group = iommu_group_get(dev);
++ 		if (group && group->default_domain) {
++ 			ret = __iommu_attach_device(group->default_domain, dev);
++ 			iommu_group_put(group);
++ 		}
++ 
++ 	} else {
+++>>>>>>> 41df6dcc0a3f (iommu: Keep a list of allocated groups in __iommu_probe_device())
+  		ret = ops->add_device(dev);
+ -	}
+ -
+ -	if (ret)
+ -		goto err_module_put;
+ -
+ -	if (ops->probe_finalize)
+ -		ops->probe_finalize(dev);
+ -
+ -	return 0;
+  
+ -err_module_put:
+ -	module_put(ops->owner);
+ -err_free_dev_param:
+ -	dev_iommu_free(dev);
+  	return ret;
+  }
+  
+* Unmerged path drivers/iommu/iommu.c
