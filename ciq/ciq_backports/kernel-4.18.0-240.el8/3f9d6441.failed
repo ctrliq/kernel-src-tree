@@ -1,0 +1,135 @@
+io_uring: fix truncated async read/readv and write/writev retry
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 3f9d64415fdaa73017fcb168930006648617b488
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3f9d6441.failed
+
+Ensure we keep the truncated value, if we did truncate it. If not, we
+might read/write more than the registered buffer size.
+
+Also for retry, ensure that we return the truncated mapped value for
+the vectorized versions of the read/write commands.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 3f9d64415fdaa73017fcb168930006648617b488)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,55afae6f0cf4..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -1164,36 -2316,80 +1164,82 @@@ static int io_import_fixed(struct io_ri
+  	return 0;
+  }
+  
+ -static ssize_t io_iov_buffer_select(struct io_kiocb *req, struct iovec *iov,
+ -				    bool needs_lock)
+ -{
+ -	if (req->flags & REQ_F_BUFFER_SELECTED)
+ -		return 0;
+ -	if (!req->rw.len)
+ -		return 0;
+ -	else if (req->rw.len > 1)
+ -		return -EINVAL;
+ -
+ -#ifdef CONFIG_COMPAT
+ -	if (req->ctx->compat)
+ -		return io_compat_import(req, iov, needs_lock);
+ -#endif
+ -
+ -	return __io_iov_buffer_select(req, iov, needs_lock);
+ -}
+ -
+ -static ssize_t io_import_iovec(int rw, struct io_kiocb *req,
+ -			       struct iovec **iovec, struct iov_iter *iter,
+ -			       bool needs_lock)
+ +static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
+ +			       const struct sqe_submit *s, struct iovec **iovec,
+ +			       struct iov_iter *iter)
+  {
+ -	void __user *buf = u64_to_user_ptr(req->rw.addr);
+ -	size_t sqe_len = req->rw.len;
+ -	ssize_t ret;
+ +	const struct io_uring_sqe *sqe = s->sqe;
+ +	void __user *buf = u64_to_user_ptr(READ_ONCE(sqe->addr));
+ +	size_t sqe_len = READ_ONCE(sqe->len);
+  	u8 opcode;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * We're reading ->opcode for the second time, but the first read
+ +	 * doesn't care whether it's _FIXED or not, so it doesn't matter
+ +	 * whether ->opcode changes concurrently. The first read does care
+ +	 * about whether it is a READ or a WRITE, so we don't trust this read
+ +	 * for that purpose and instead let the caller pass in the read/write
+ +	 * flag.
+ +	 */
+ +	opcode = READ_ONCE(sqe->opcode);
+ +	if (opcode == IORING_OP_READ_FIXED ||
+ +	    opcode == IORING_OP_WRITE_FIXED) {
+ +		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
+++=======
++ 	opcode = req->opcode;
++ 	if (opcode == IORING_OP_READ_FIXED || opcode == IORING_OP_WRITE_FIXED) {
++ 		*iovec = NULL;
++ 		return io_import_fixed(req, rw, iter);
++ 	}
++ 
++ 	/* buffer index only valid with fixed read/write, or buffer select  */
++ 	if (req->rw.kiocb.private && !(req->flags & REQ_F_BUFFER_SELECT))
++ 		return -EINVAL;
++ 
++ 	if (opcode == IORING_OP_READ || opcode == IORING_OP_WRITE) {
++ 		if (req->flags & REQ_F_BUFFER_SELECT) {
++ 			buf = io_rw_buffer_select(req, &sqe_len, needs_lock);
++ 			if (IS_ERR(buf)) {
++ 				*iovec = NULL;
++ 				return PTR_ERR(buf);
++ 			}
++ 			req->rw.len = sqe_len;
++ 		}
++ 
++ 		ret = import_single_range(rw, buf, sqe_len, *iovec, iter);
+++>>>>>>> 3f9d64415fda (io_uring: fix truncated async read/readv and write/writev retry)
+  		*iovec = NULL;
+  		return ret < 0 ? ret : sqe_len;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!s->has_user)
+ +		return -EFAULT;
+++=======
++ 	if (req->io) {
++ 		struct io_async_rw *iorw = &req->io->rw;
++ 
++ 		*iovec = iorw->iov;
++ 		iov_iter_init(iter, rw, *iovec, iorw->nr_segs, iorw->size);
++ 		if (iorw->iov == iorw->fast_iov)
++ 			*iovec = NULL;
++ 		return iorw->size;
++ 	}
++ 
++ 	if (req->flags & REQ_F_BUFFER_SELECT) {
++ 		ret = io_iov_buffer_select(req, *iovec, needs_lock);
++ 		if (!ret) {
++ 			ret = (*iovec)->iov_len;
++ 			iov_iter_init(iter, rw, *iovec, 1, ret);
++ 		}
++ 		*iovec = NULL;
++ 		return ret;
++ 	}
+++>>>>>>> 3f9d64415fda (io_uring: fix truncated async read/readv and write/writev retry)
+  
+  #ifdef CONFIG_COMPAT
+ -	if (req->ctx->compat)
+ +	if (ctx->compat)
+  		return compat_import_iovec(rw, buf, sqe_len, UIO_FASTIOV,
+  						iovec, iter);
+  #endif
+* Unmerged path fs/io_uring.c
