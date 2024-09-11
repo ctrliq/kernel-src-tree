@@ -1,0 +1,426 @@
+mm, slub: allocate private object map for debugfs listings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit b3fd64e1451b5efd94aa0ebc755e02558e6f3ca1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b3fd64e1.failed
+
+Slub has a static spinlock protected bitmap for marking which objects are on
+freelist when it wants to list them, for situations where dynamically
+allocating such map can lead to recursion or locking issues, and on-stack
+bitmap would be too large.
+
+The handlers of debugfs files alloc_traces and free_traces also currently use this
+shared bitmap, but their syscall context makes it straightforward to allocate a
+private map before entering locked sections, so switch these processing paths
+to use a private bitmap.
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Christoph Lameter <cl@linux.com>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+(cherry picked from commit b3fd64e1451b5efd94aa0ebc755e02558e6f3ca1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index e4751a240249,fb603fdf58cb..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -445,6 -454,38 +445,41 @@@ static inline bool cmpxchg_double_slab(
+  static unsigned long object_map[BITS_TO_LONGS(MAX_OBJS_PER_PAGE)];
+  static DEFINE_SPINLOCK(object_map_lock);
+  
+++<<<<<<< HEAD
+++=======
++ static void __fill_map(unsigned long *obj_map, struct kmem_cache *s,
++ 		       struct page *page)
++ {
++ 	void *addr = page_address(page);
++ 	void *p;
++ 
++ 	bitmap_zero(obj_map, page->objects);
++ 
++ 	for (p = page->freelist; p; p = get_freepointer(s, p))
++ 		set_bit(__obj_to_index(s, addr, p), obj_map);
++ }
++ 
++ #if IS_ENABLED(CONFIG_KUNIT)
++ static bool slab_add_kunit_errors(void)
++ {
++ 	struct kunit_resource *resource;
++ 
++ 	if (likely(!current->kunit_test))
++ 		return false;
++ 
++ 	resource = kunit_find_named_resource(current->kunit_test, "slab_errors");
++ 	if (!resource)
++ 		return false;
++ 
++ 	(*(int *)resource->data)++;
++ 	kunit_put_resource(resource);
++ 	return true;
++ }
++ #else
++ static inline bool slab_add_kunit_errors(void) { return false; }
++ #endif
++ 
+++>>>>>>> b3fd64e1451b (mm, slub: allocate private object map for debugfs listings)
+  /*
+   * Determine a map of object in use on a page.
+   *
+@@@ -452,10 -493,8 +487,7 @@@
+   * not vanish from under us.
+   */
+  static unsigned long *get_map(struct kmem_cache *s, struct page *page)
+ -	__acquires(&object_map_lock)
+  {
+- 	void *p;
+- 	void *addr = page_address(page);
+- 
+  	VM_BUG_ON(!irqs_disabled());
+  
+  	spin_lock(&object_map_lock);
+@@@ -4754,152 -4890,16 +4784,151 @@@ static void process_slab(struct loc_tra
+  {
+  	void *addr = page_address(page);
+  	void *p;
+- 	unsigned long *map;
+  
+- 	map = get_map(s, page);
++ 	__fill_map(obj_map, s, page);
++ 
+  	for_each_object(p, s, addr, page->objects)
+- 		if (!test_bit(__obj_to_index(s, addr, p), map))
++ 		if (!test_bit(__obj_to_index(s, addr, p), obj_map))
+  			add_location(t, s, get_track(s, p, alloc));
+- 	put_map(map);
+  }
+ -#endif  /* CONFIG_DEBUG_FS   */
+ +
+ +static int list_locations(struct kmem_cache *s, char *buf,
+ +			  enum track_item alloc)
+ +{
+ +	int len = 0;
+ +	unsigned long i;
+ +	struct loc_track t = { 0, 0, NULL };
+ +	int node;
+ +	struct kmem_cache_node *n;
+ +
+ +	if (!alloc_loc_track(&t, PAGE_SIZE / sizeof(struct location),
+ +			     GFP_KERNEL)) {
+ +		return sysfs_emit(buf, "Out of memory\n");
+ +	}
+ +	/* Push back cpu slabs */
+ +	flush_all(s);
+ +
+ +	for_each_kmem_cache_node(s, node, n) {
+ +		unsigned long flags;
+ +		struct page *page;
+ +
+ +		if (!atomic_long_read(&n->nr_slabs))
+ +			continue;
+ +
+ +		spin_lock_irqsave(&n->list_lock, flags);
+ +		list_for_each_entry(page, &n->partial, slab_list)
+ +			process_slab(&t, s, page, alloc);
+ +		list_for_each_entry(page, &n->full, slab_list)
+ +			process_slab(&t, s, page, alloc);
+ +		spin_unlock_irqrestore(&n->list_lock, flags);
+ +	}
+ +
+ +	for (i = 0; i < t.count; i++) {
+ +		struct location *l = &t.loc[i];
+ +
+ +		len += sysfs_emit_at(buf, len, "%7ld ", l->count);
+ +
+ +		if (l->addr)
+ +			len += sysfs_emit_at(buf, len, "%pS", (void *)l->addr);
+ +		else
+ +			len += sysfs_emit_at(buf, len, "<not-available>");
+ +
+ +		if (l->sum_time != l->min_time)
+ +			len += sysfs_emit_at(buf, len, " age=%ld/%ld/%ld",
+ +					     l->min_time,
+ +					     (long)div_u64(l->sum_time,
+ +							   l->count),
+ +					     l->max_time);
+ +		else
+ +			len += sysfs_emit_at(buf, len, " age=%ld", l->min_time);
+ +
+ +		if (l->min_pid != l->max_pid)
+ +			len += sysfs_emit_at(buf, len, " pid=%ld-%ld",
+ +					     l->min_pid, l->max_pid);
+ +		else
+ +			len += sysfs_emit_at(buf, len, " pid=%ld",
+ +					     l->min_pid);
+ +
+ +		if (num_online_cpus() > 1 &&
+ +		    !cpumask_empty(to_cpumask(l->cpus)))
+ +			len += sysfs_emit_at(buf, len, " cpus=%*pbl",
+ +					     cpumask_pr_args(to_cpumask(l->cpus)));
+ +
+ +		if (nr_online_nodes > 1 && !nodes_empty(l->nodes))
+ +			len += sysfs_emit_at(buf, len, " nodes=%*pbl",
+ +					     nodemask_pr_args(&l->nodes));
+ +
+ +		len += sysfs_emit_at(buf, len, "\n");
+ +	}
+ +
+ +	free_loc_track(&t);
+ +	if (!t.count)
+ +		len += sysfs_emit_at(buf, len, "No data\n");
+ +
+ +	return len;
+ +}
+  #endif	/* CONFIG_SLUB_DEBUG */
+  
+ +#ifdef SLUB_RESILIENCY_TEST
+ +static void __init resiliency_test(void)
+ +{
+ +	u8 *p;
+ +	int type = KMALLOC_NORMAL;
+ +
+ +	BUILD_BUG_ON(KMALLOC_MIN_SIZE > 16 || KMALLOC_SHIFT_HIGH < 10);
+ +
+ +	pr_err("SLUB resiliency testing\n");
+ +	pr_err("-----------------------\n");
+ +	pr_err("A. Corruption after allocation\n");
+ +
+ +	p = kzalloc(16, GFP_KERNEL);
+ +	p[16] = 0x12;
+ +	pr_err("\n1. kmalloc-16: Clobber Redzone/next pointer 0x12->0x%p\n\n",
+ +	       p + 16);
+ +
+ +	validate_slab_cache(kmalloc_caches[type][4]);
+ +
+ +	/* Hmmm... The next two are dangerous */
+ +	p = kzalloc(32, GFP_KERNEL);
+ +	p[32 + sizeof(void *)] = 0x34;
+ +	pr_err("\n2. kmalloc-32: Clobber next pointer/next slab 0x34 -> -0x%p\n",
+ +	       p);
+ +	pr_err("If allocated object is overwritten then not detectable\n\n");
+ +
+ +	validate_slab_cache(kmalloc_caches[type][5]);
+ +	p = kzalloc(64, GFP_KERNEL);
+ +	p += 64 + (get_cycles() & 0xff) * sizeof(void *);
+ +	*p = 0x56;
+ +	pr_err("\n3. kmalloc-64: corrupting random byte 0x56->0x%p\n",
+ +	       p);
+ +	pr_err("If allocated object is overwritten then not detectable\n\n");
+ +	validate_slab_cache(kmalloc_caches[type][6]);
+ +
+ +	pr_err("\nB. Corruption after free\n");
+ +	p = kzalloc(128, GFP_KERNEL);
+ +	kfree(p);
+ +	*p = 0x78;
+ +	pr_err("1. kmalloc-128: Clobber first word 0x78->0x%p\n\n", p);
+ +	validate_slab_cache(kmalloc_caches[type][7]);
+ +
+ +	p = kzalloc(256, GFP_KERNEL);
+ +	kfree(p);
+ +	p[50] = 0x9a;
+ +	pr_err("\n2. kmalloc-256: Clobber 50th byte 0x9a->0x%p\n\n", p);
+ +	validate_slab_cache(kmalloc_caches[type][8]);
+ +
+ +	p = kzalloc(512, GFP_KERNEL);
+ +	kfree(p);
+ +	p[512] = 0xab;
+ +	pr_err("\n3. kmalloc-512: Clobber redzone 0xab->0x%p\n\n", p);
+ +	validate_slab_cache(kmalloc_caches[type][9]);
+ +}
+ +#else
+ +#ifdef CONFIG_SYSFS
+ +static void resiliency_test(void) {};
+ +#endif
+ +#endif	/* SLUB_RESILIENCY_TEST */
+ +
+  #ifdef CONFIG_SYSFS
+  enum slab_stat_type {
+  	SL_ALL,			/* All slabs */
+@@@ -5755,6 -5737,178 +5784,181 @@@ static int __init slab_sysfs_init(void
+  __initcall(slab_sysfs_init);
+  #endif /* CONFIG_SYSFS */
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_SLUB_DEBUG) && defined(CONFIG_DEBUG_FS)
++ static int slab_debugfs_show(struct seq_file *seq, void *v)
++ {
++ 
++ 	struct location *l;
++ 	unsigned int idx = *(unsigned int *)v;
++ 	struct loc_track *t = seq->private;
++ 
++ 	if (idx < t->count) {
++ 		l = &t->loc[idx];
++ 
++ 		seq_printf(seq, "%7ld ", l->count);
++ 
++ 		if (l->addr)
++ 			seq_printf(seq, "%pS", (void *)l->addr);
++ 		else
++ 			seq_puts(seq, "<not-available>");
++ 
++ 		if (l->sum_time != l->min_time) {
++ 			seq_printf(seq, " age=%ld/%llu/%ld",
++ 				l->min_time, div_u64(l->sum_time, l->count),
++ 				l->max_time);
++ 		} else
++ 			seq_printf(seq, " age=%ld", l->min_time);
++ 
++ 		if (l->min_pid != l->max_pid)
++ 			seq_printf(seq, " pid=%ld-%ld", l->min_pid, l->max_pid);
++ 		else
++ 			seq_printf(seq, " pid=%ld",
++ 				l->min_pid);
++ 
++ 		if (num_online_cpus() > 1 && !cpumask_empty(to_cpumask(l->cpus)))
++ 			seq_printf(seq, " cpus=%*pbl",
++ 				 cpumask_pr_args(to_cpumask(l->cpus)));
++ 
++ 		if (nr_online_nodes > 1 && !nodes_empty(l->nodes))
++ 			seq_printf(seq, " nodes=%*pbl",
++ 				 nodemask_pr_args(&l->nodes));
++ 
++ 		seq_puts(seq, "\n");
++ 	}
++ 
++ 	if (!idx && !t->count)
++ 		seq_puts(seq, "No data\n");
++ 
++ 	return 0;
++ }
++ 
++ static void slab_debugfs_stop(struct seq_file *seq, void *v)
++ {
++ }
++ 
++ static void *slab_debugfs_next(struct seq_file *seq, void *v, loff_t *ppos)
++ {
++ 	struct loc_track *t = seq->private;
++ 
++ 	v = ppos;
++ 	++*ppos;
++ 	if (*ppos <= t->count)
++ 		return v;
++ 
++ 	return NULL;
++ }
++ 
++ static void *slab_debugfs_start(struct seq_file *seq, loff_t *ppos)
++ {
++ 	return ppos;
++ }
++ 
++ static const struct seq_operations slab_debugfs_sops = {
++ 	.start  = slab_debugfs_start,
++ 	.next   = slab_debugfs_next,
++ 	.stop   = slab_debugfs_stop,
++ 	.show   = slab_debugfs_show,
++ };
++ 
++ static int slab_debug_trace_open(struct inode *inode, struct file *filep)
++ {
++ 
++ 	struct kmem_cache_node *n;
++ 	enum track_item alloc;
++ 	int node;
++ 	struct loc_track *t = __seq_open_private(filep, &slab_debugfs_sops,
++ 						sizeof(struct loc_track));
++ 	struct kmem_cache *s = file_inode(filep)->i_private;
++ 	unsigned long *obj_map;
++ 
++ 	obj_map = bitmap_alloc(oo_objects(s->oo), GFP_KERNEL);
++ 	if (!obj_map)
++ 		return -ENOMEM;
++ 
++ 	if (strcmp(filep->f_path.dentry->d_name.name, "alloc_traces") == 0)
++ 		alloc = TRACK_ALLOC;
++ 	else
++ 		alloc = TRACK_FREE;
++ 
++ 	if (!alloc_loc_track(t, PAGE_SIZE / sizeof(struct location), GFP_KERNEL)) {
++ 		bitmap_free(obj_map);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	for_each_kmem_cache_node(s, node, n) {
++ 		unsigned long flags;
++ 		struct page *page;
++ 
++ 		if (!atomic_long_read(&n->nr_slabs))
++ 			continue;
++ 
++ 		spin_lock_irqsave(&n->list_lock, flags);
++ 		list_for_each_entry(page, &n->partial, slab_list)
++ 			process_slab(t, s, page, alloc, obj_map);
++ 		list_for_each_entry(page, &n->full, slab_list)
++ 			process_slab(t, s, page, alloc, obj_map);
++ 		spin_unlock_irqrestore(&n->list_lock, flags);
++ 	}
++ 
++ 	bitmap_free(obj_map);
++ 	return 0;
++ }
++ 
++ static int slab_debug_trace_release(struct inode *inode, struct file *file)
++ {
++ 	struct seq_file *seq = file->private_data;
++ 	struct loc_track *t = seq->private;
++ 
++ 	free_loc_track(t);
++ 	return seq_release_private(inode, file);
++ }
++ 
++ static const struct file_operations slab_debugfs_fops = {
++ 	.open    = slab_debug_trace_open,
++ 	.read    = seq_read,
++ 	.llseek  = seq_lseek,
++ 	.release = slab_debug_trace_release,
++ };
++ 
++ static void debugfs_slab_add(struct kmem_cache *s)
++ {
++ 	struct dentry *slab_cache_dir;
++ 
++ 	if (unlikely(!slab_debugfs_root))
++ 		return;
++ 
++ 	slab_cache_dir = debugfs_create_dir(s->name, slab_debugfs_root);
++ 
++ 	debugfs_create_file("alloc_traces", 0400,
++ 		slab_cache_dir, s, &slab_debugfs_fops);
++ 
++ 	debugfs_create_file("free_traces", 0400,
++ 		slab_cache_dir, s, &slab_debugfs_fops);
++ }
++ 
++ void debugfs_slab_release(struct kmem_cache *s)
++ {
++ 	debugfs_remove_recursive(debugfs_lookup(s->name, slab_debugfs_root));
++ }
++ 
++ static int __init slab_debugfs_init(void)
++ {
++ 	struct kmem_cache *s;
++ 
++ 	slab_debugfs_root = debugfs_create_dir("slab", NULL);
++ 
++ 	list_for_each_entry(s, &slab_caches, list)
++ 		if (s->flags & SLAB_STORE_USER)
++ 			debugfs_slab_add(s);
++ 
++ 	return 0;
++ 
++ }
++ __initcall(slab_debugfs_init);
++ #endif
+++>>>>>>> b3fd64e1451b (mm, slub: allocate private object map for debugfs listings)
+  /*
+   * The /proc/slabinfo ABI
+   */
+* Unmerged path mm/slub.c
