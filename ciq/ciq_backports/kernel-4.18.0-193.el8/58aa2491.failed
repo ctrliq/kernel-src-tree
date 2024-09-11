@@ -1,0 +1,132 @@
+s390/qeth: extract helper to determine L2 cast type
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 58aa2491aa615d9618ffc764cc3eaf689053c7a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/58aa2491.failed
+
+This de-duplicates the L2 and L3 cast-type code, and makes the L2 code
+a bit more robust by removing the fragile assumption that skb->data
+always points to the Ethernet Header. This would break in code paths
+where we pushed the HW header onto the skb.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 58aa2491aa615d9618ffc764cc3eaf689053c7a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_l2_main.c
+diff --cc drivers/s390/net/qeth_l2_main.c
+index ec11b4223905,218801232ca2..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -160,23 -159,11 +160,29 @@@ static void qeth_l2_del_all_macs(struc
+  		hash_del(&mac->hnode);
+  		kfree(mac);
+  	}
+ +	spin_unlock_bh(&card->mclock);
+  }
+  
+++<<<<<<< HEAD
+ +static int qeth_l2_get_cast_type(struct qeth_card *card, struct sk_buff *skb)
+ +{
+ +	if (card->info.type == QETH_CARD_TYPE_OSN)
+ +		return RTN_UNICAST;
+ +	if (is_broadcast_ether_addr(skb->data))
+ +		return RTN_BROADCAST;
+ +	if (is_multicast_ether_addr(skb->data))
+ +		return RTN_MULTICAST;
+ +	return RTN_UNICAST;
+ +}
+ +
+ +static void qeth_l2_fill_header(struct qeth_card *card, struct qeth_hdr *hdr,
+ +				struct sk_buff *skb, int ipv, int cast_type,
+ +				unsigned int data_len)
+++=======
++ static void qeth_l2_fill_header(struct qeth_qdio_out_q *queue,
++ 				struct qeth_hdr *hdr, struct sk_buff *skb,
++ 				int ipv, int cast_type, unsigned int data_len)
+++>>>>>>> 58aa2491aa61 (s390/qeth: extract helper to determine L2 cast type)
+  {
+  	struct vlan_ethhdr *veth = vlan_eth_hdr(skb);
+  
+@@@ -621,7 -601,8 +627,12 @@@ static netdev_tx_t qeth_l2_hard_start_x
+  	if (IS_OSN(card))
+  		rc = qeth_l2_xmit_osn(card, skb, queue);
+  	else
+++<<<<<<< HEAD
+ +		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+++=======
++ 		rc = qeth_xmit(card, skb, queue, qeth_get_ip_version(skb),
++ 			       qeth_get_ether_cast_type(skb),
+++>>>>>>> 58aa2491aa61 (s390/qeth: extract helper to determine L2 cast type)
+  			       qeth_l2_fill_header);
+  
+  	if (!rc) {
+@@@ -640,6 -616,18 +651,21 @@@ tx_drop
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u16 qeth_l2_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 				struct net_device *sb_dev)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 
++ 	if (IS_IQD(card))
++ 		return qeth_iqd_select_queue(dev, skb,
++ 					     qeth_get_ether_cast_type(skb),
++ 					     sb_dev);
++ 	return qeth_get_priority_queue(card, skb);
++ }
++ 
+++>>>>>>> 58aa2491aa61 (s390/qeth: extract helper to determine L2 cast type)
+  static const struct device_type qeth_l2_devtype = {
+  	.name = "qeth_layer2",
+  	.groups = qeth_l2_attr_groups,
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index e9aab93585dd..d3d52934b618 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -849,6 +849,16 @@ static inline int qeth_get_ip_version(struct sk_buff *skb)
+ 	}
+ }
+ 
++static inline int qeth_get_ether_cast_type(struct sk_buff *skb)
++{
++	u8 *addr = eth_hdr(skb)->h_dest;
++
++	if (is_multicast_ether_addr(addr))
++		return is_broadcast_ether_addr(addr) ? RTN_BROADCAST :
++						       RTN_MULTICAST;
++	return RTN_UNICAST;
++}
++
+ static inline void qeth_rx_csum(struct qeth_card *card, struct sk_buff *skb,
+ 				u8 flags)
+ {
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index 0333c6406fca..5108f00a5df6 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -1915,13 +1915,7 @@ static int qeth_l3_get_cast_type(struct sk_buff *skb)
+ 				RTN_MULTICAST : RTN_UNICAST;
+ 	default:
+ 		/* ... and MAC address */
+-		if (ether_addr_equal_64bits(eth_hdr(skb)->h_dest,
+-					    skb->dev->broadcast))
+-			return RTN_BROADCAST;
+-		if (is_multicast_ether_addr(eth_hdr(skb)->h_dest))
+-			return RTN_MULTICAST;
+-		/* default to unicast */
+-		return RTN_UNICAST;
++		return qeth_get_ether_cast_type(skb);
+ 	}
+ }
+ 
