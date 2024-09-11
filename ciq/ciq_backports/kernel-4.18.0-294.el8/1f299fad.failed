@@ -1,0 +1,408 @@
+efi/x86: Limit EFI old memory map to SGI UV machines
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ard Biesheuvel <ardb@kernel.org>
+commit 1f299fad1e312947c974c6a1d8a3a484f27a6111
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1f299fad.failed
+
+We carry a quirk in the x86 EFI code to switch back to an older
+method of mapping the EFI runtime services memory regions, because
+it was deemed risky at the time to implement a new method without
+providing a fallback to the old method in case problems arose.
+
+Such problems did arise, but they appear to be limited to SGI UV1
+machines, and so these are the only ones for which the fallback gets
+enabled automatically (via a DMI quirk). The fallback can be enabled
+manually as well, by passing efi=old_map, but there is very little
+evidence that suggests that this is something that is being relied
+upon in the field.
+
+Given that UV1 support is not enabled by default by the distros
+(Ubuntu, Fedora), there is no point in carrying this fallback code
+all the time if there are no other users. So let's move it into the
+UV support code, and document that efi=old_map now requires this
+support code to be enabled.
+
+Note that efi=old_map has been used in the past on other SGI UV
+machines to work around kernel regressions in production, so we
+keep the option to enable it by hand, but only if the kernel was
+built with UV support.
+
+	Signed-off-by: Ard Biesheuvel <ardb@kernel.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200113172245.27925-8-ardb@kernel.org
+(cherry picked from commit 1f299fad1e312947c974c6a1d8a3a484f27a6111)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/efi.h
+#	arch/x86/platform/efi/efi.c
+#	arch/x86/platform/efi/efi_64.c
+#	arch/x86/platform/uv/bios_uv.c
+diff --cc arch/x86/include/asm/efi.h
+index e676caad5ea2,86169a24b0d8..000000000000
+--- a/arch/x86/include/asm/efi.h
++++ b/arch/x86/include/asm/efi.h
+@@@ -80,11 -119,10 +83,11 @@@ struct efi_scratch 
+  #define arch_efi_call_virt_setup()					\
+  ({									\
+  	efi_sync_low_kernel_mappings();					\
+ -	kernel_fpu_begin();						\
+ +	preempt_disable();						\
+ +	__kernel_fpu_begin();						\
+  	firmware_restrict_branch_speculation_start();			\
+  									\
+- 	if (!efi_enabled(EFI_OLD_MEMMAP))				\
++ 	if (!efi_have_uv1_memmap())					\
+  		efi_switch_mm(&efi_mm);					\
+  })
+  
+@@@ -138,7 -175,8 +141,12 @@@ extern void efi_delete_dummy_variable(v
+  extern void efi_switch_mm(struct mm_struct *mm);
+  extern void efi_recover_from_page_fault(unsigned long phys_addr);
+  extern void efi_free_boot_services(void);
+++<<<<<<< HEAD
+ +extern void efi_reserve_boot_services(void);
+++=======
++ extern pgd_t * __init efi_uv1_memmap_phys_prolog(void);
++ extern void __init efi_uv1_memmap_phys_epilog(pgd_t *save_pgd);
+++>>>>>>> 1f299fad1e31 (efi/x86: Limit EFI old memory map to SGI UV machines)
+  
+  struct efi_setup_data {
+  	u64 fw_vendor;
+@@@ -164,13 -208,9 +172,10 @@@ static inline bool efi_runtime_supporte
+  	if (IS_ENABLED(CONFIG_X86_64) == efi_enabled(EFI_64BIT))
+  		return true;
+  
+- 	if (IS_ENABLED(CONFIG_EFI_MIXED) && !efi_enabled(EFI_OLD_MEMMAP))
+- 		return true;
+- 
+- 	return false;
++ 	return IS_ENABLED(CONFIG_EFI_MIXED);
+  }
+  
+ +extern struct console early_efi_console;
+  extern void parse_efi_setup(u64 phys_addr, u32 data_len);
+  
+  extern void efifb_setup_from_dmi(struct screen_info *si, const char *opt);
+diff --cc arch/x86/platform/efi/efi.c
+index 0204ffe2d898,4e46d2d24352..000000000000
+--- a/arch/x86/platform/efi/efi.c
++++ b/arch/x86/platform/efi/efi.c
+@@@ -1048,16 -980,16 +1052,32 @@@ void __init efi_enter_virtual_mode(void
+  	efi_dump_pagetable();
+  }
+  
+++<<<<<<< HEAD
+ +static int __init arch_parse_efi_cmdline(char *str)
+ +{
+ +	if (!str) {
+ +		pr_warn("need at least one option\n");
+ +		return -EINVAL;
+ +	}
+ +
+ +	if (parse_option_str(str, "old_map"))
+ +		set_bit(EFI_OLD_MEMMAP, &efi.flags);
+ +
+ +	return 0;
+ +}
+ +early_param("efi", arch_parse_efi_cmdline);
+++=======
++ bool efi_is_table_address(unsigned long phys_addr)
++ {
++ 	unsigned int i;
++ 
++ 	if (phys_addr == EFI_INVALID_TABLE_ADDR)
++ 		return false;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(efi_tables); i++)
++ 		if (*(efi_tables[i]) == phys_addr)
++ 			return true;
++ 
++ 	return false;
++ }
+++>>>>>>> 1f299fad1e31 (efi/x86: Limit EFI old memory map to SGI UV machines)
+diff --cc arch/x86/platform/efi/efi_64.c
+index 1616a135eea2,8d1869ff1033..000000000000
+--- a/arch/x86/platform/efi/efi_64.c
++++ b/arch/x86/platform/efi/efi_64.c
+@@@ -1015,8 -891,14 +867,19 @@@ efi_status_t __init efi_set_virtual_add
+  	unsigned long flags;
+  	pgd_t *save_pgd = NULL;
+  
+++<<<<<<< HEAD
+ +	if (efi_enabled(EFI_OLD_MEMMAP)) {
+ +		save_pgd = efi_old_memmap_phys_prolog();
+++=======
++ 	if (efi_is_mixed())
++ 		return efi_thunk_set_virtual_address_map(memory_map_size,
++ 							 descriptor_size,
++ 							 descriptor_version,
++ 							 virtual_map);
++ 
++ 	if (efi_have_uv1_memmap()) {
++ 		save_pgd = efi_uv1_memmap_phys_prolog();
+++>>>>>>> 1f299fad1e31 (efi/x86: Limit EFI old memory map to SGI UV machines)
+  		if (!save_pgd)
+  			return EFI_ABORTED;
+  	} else {
+diff --cc arch/x86/platform/uv/bios_uv.c
+index 6fbaf03c6d74,7c2b8c5d0b49..000000000000
+--- a/arch/x86/platform/uv/bios_uv.c
++++ b/arch/x86/platform/uv/bios_uv.c
+@@@ -221,4 -217,163 +221,167 @@@ int uv_bios_init(void
+  	pr_info("UV: UVsystab: Revision:%x\n", uv_systab->revision);
+  	return 0;
+  }
+++<<<<<<< HEAD
+ +#endif
+++=======
++ 
++ static void __init early_code_mapping_set_exec(int executable)
++ {
++ 	efi_memory_desc_t *md;
++ 
++ 	if (!(__supported_pte_mask & _PAGE_NX))
++ 		return;
++ 
++ 	/* Make EFI service code area executable */
++ 	for_each_efi_memory_desc(md) {
++ 		if (md->type == EFI_RUNTIME_SERVICES_CODE ||
++ 		    md->type == EFI_BOOT_SERVICES_CODE)
++ 			efi_set_executable(md, executable);
++ 	}
++ }
++ 
++ void __init efi_uv1_memmap_phys_epilog(pgd_t *save_pgd)
++ {
++ 	/*
++ 	 * After the lock is released, the original page table is restored.
++ 	 */
++ 	int pgd_idx, i;
++ 	int nr_pgds;
++ 	pgd_t *pgd;
++ 	p4d_t *p4d;
++ 	pud_t *pud;
++ 
++ 	nr_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT) , PGDIR_SIZE);
++ 
++ 	for (pgd_idx = 0; pgd_idx < nr_pgds; pgd_idx++) {
++ 		pgd = pgd_offset_k(pgd_idx * PGDIR_SIZE);
++ 		set_pgd(pgd_offset_k(pgd_idx * PGDIR_SIZE), save_pgd[pgd_idx]);
++ 
++ 		if (!pgd_present(*pgd))
++ 			continue;
++ 
++ 		for (i = 0; i < PTRS_PER_P4D; i++) {
++ 			p4d = p4d_offset(pgd,
++ 					 pgd_idx * PGDIR_SIZE + i * P4D_SIZE);
++ 
++ 			if (!p4d_present(*p4d))
++ 				continue;
++ 
++ 			pud = (pud_t *)p4d_page_vaddr(*p4d);
++ 			pud_free(&init_mm, pud);
++ 		}
++ 
++ 		p4d = (p4d_t *)pgd_page_vaddr(*pgd);
++ 		p4d_free(&init_mm, p4d);
++ 	}
++ 
++ 	kfree(save_pgd);
++ 
++ 	__flush_tlb_all();
++ 	early_code_mapping_set_exec(0);
++ }
++ 
++ pgd_t * __init efi_uv1_memmap_phys_prolog(void)
++ {
++ 	unsigned long vaddr, addr_pgd, addr_p4d, addr_pud;
++ 	pgd_t *save_pgd, *pgd_k, *pgd_efi;
++ 	p4d_t *p4d, *p4d_k, *p4d_efi;
++ 	pud_t *pud;
++ 
++ 	int pgd;
++ 	int n_pgds, i, j;
++ 
++ 	early_code_mapping_set_exec(1);
++ 
++ 	n_pgds = DIV_ROUND_UP((max_pfn << PAGE_SHIFT), PGDIR_SIZE);
++ 	save_pgd = kmalloc_array(n_pgds, sizeof(*save_pgd), GFP_KERNEL);
++ 	if (!save_pgd)
++ 		return NULL;
++ 
++ 	/*
++ 	 * Build 1:1 identity mapping for UV1 memmap usage. Note that
++ 	 * PAGE_OFFSET is PGDIR_SIZE aligned when KASLR is disabled, while
++ 	 * it is PUD_SIZE ALIGNED with KASLR enabled. So for a given physical
++ 	 * address X, the pud_index(X) != pud_index(__va(X)), we can only copy
++ 	 * PUD entry of __va(X) to fill in pud entry of X to build 1:1 mapping.
++ 	 * This means here we can only reuse the PMD tables of the direct mapping.
++ 	 */
++ 	for (pgd = 0; pgd < n_pgds; pgd++) {
++ 		addr_pgd = (unsigned long)(pgd * PGDIR_SIZE);
++ 		vaddr = (unsigned long)__va(pgd * PGDIR_SIZE);
++ 		pgd_efi = pgd_offset_k(addr_pgd);
++ 		save_pgd[pgd] = *pgd_efi;
++ 
++ 		p4d = p4d_alloc(&init_mm, pgd_efi, addr_pgd);
++ 		if (!p4d) {
++ 			pr_err("Failed to allocate p4d table!\n");
++ 			goto out;
++ 		}
++ 
++ 		for (i = 0; i < PTRS_PER_P4D; i++) {
++ 			addr_p4d = addr_pgd + i * P4D_SIZE;
++ 			p4d_efi = p4d + p4d_index(addr_p4d);
++ 
++ 			pud = pud_alloc(&init_mm, p4d_efi, addr_p4d);
++ 			if (!pud) {
++ 				pr_err("Failed to allocate pud table!\n");
++ 				goto out;
++ 			}
++ 
++ 			for (j = 0; j < PTRS_PER_PUD; j++) {
++ 				addr_pud = addr_p4d + j * PUD_SIZE;
++ 
++ 				if (addr_pud > (max_pfn << PAGE_SHIFT))
++ 					break;
++ 
++ 				vaddr = (unsigned long)__va(addr_pud);
++ 
++ 				pgd_k = pgd_offset_k(vaddr);
++ 				p4d_k = p4d_offset(pgd_k, vaddr);
++ 				pud[j] = *pud_offset(p4d_k, vaddr);
++ 			}
++ 		}
++ 		pgd_offset_k(pgd * PGDIR_SIZE)->pgd &= ~_PAGE_NX;
++ 	}
++ 
++ 	__flush_tlb_all();
++ 	return save_pgd;
++ out:
++ 	efi_uv1_memmap_phys_epilog(save_pgd);
++ 	return NULL;
++ }
++ 
++ void __iomem *__init efi_ioremap(unsigned long phys_addr, unsigned long size,
++ 				 u32 type, u64 attribute)
++ {
++ 	unsigned long last_map_pfn;
++ 
++ 	if (type == EFI_MEMORY_MAPPED_IO)
++ 		return ioremap(phys_addr, size);
++ 
++ 	last_map_pfn = init_memory_mapping(phys_addr, phys_addr + size);
++ 	if ((last_map_pfn << PAGE_SHIFT) < phys_addr + size) {
++ 		unsigned long top = last_map_pfn << PAGE_SHIFT;
++ 		efi_ioremap(top, size - (top - phys_addr), type, attribute);
++ 	}
++ 
++ 	if (!(attribute & EFI_MEMORY_WB))
++ 		efi_memory_uc((u64)(unsigned long)__va(phys_addr), size);
++ 
++ 	return (void __iomem *)__va(phys_addr);
++ }
++ 
++ static int __init arch_parse_efi_cmdline(char *str)
++ {
++ 	if (!str) {
++ 		pr_warn("need at least one option\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (parse_option_str(str, "old_map"))
++ 		set_bit(EFI_UV1_MEMMAP, &efi.flags);
++ 
++ 	return 0;
++ }
++ early_param("efi", arch_parse_efi_cmdline);
+++>>>>>>> 1f299fad1e31 (efi/x86: Limit EFI old memory map to SGI UV machines)
+diff --git a/Documentation/admin-guide/kernel-parameters.txt b/Documentation/admin-guide/kernel-parameters.txt
+index 364acc6154e5..d4da30d64947 100644
+--- a/Documentation/admin-guide/kernel-parameters.txt
++++ b/Documentation/admin-guide/kernel-parameters.txt
+@@ -1151,8 +1151,7 @@
+ 			Format: { "old_map", "nochunk", "noruntime", "debug",
+ 				  "nosoftreserve" }
+ 			old_map [X86-64]: switch to the old ioremap-based EFI
+-			runtime services mapping. 32-bit still uses this one by
+-			default.
++			runtime services mapping. [Needs CONFIG_X86_UV=y]
+ 			nochunk: disable reading files in "chunks" in the EFI
+ 			boot stub, as chunking can cause problems with some
+ 			firmware implementations.
+* Unmerged path arch/x86/include/asm/efi.h
+diff --git a/arch/x86/kernel/kexec-bzimage64.c b/arch/x86/kernel/kexec-bzimage64.c
+index 192f327f3d93..28fac2aeb7cc 100644
+--- a/arch/x86/kernel/kexec-bzimage64.c
++++ b/arch/x86/kernel/kexec-bzimage64.c
+@@ -179,7 +179,7 @@ setup_efi_state(struct boot_params *params, unsigned long params_load_addr,
+ 	 * acpi_rsdp=<addr> on kernel command line to make second kernel boot
+ 	 * without efi.
+ 	 */
+-	if (efi_enabled(EFI_OLD_MEMMAP))
++	if (efi_have_uv1_memmap())
+ 		return 0;
+ 
+ 	params->secure_boot = boot_params.secure_boot;
+* Unmerged path arch/x86/platform/efi/efi.c
+* Unmerged path arch/x86/platform/efi/efi_64.c
+diff --git a/arch/x86/platform/efi/quirks.c b/arch/x86/platform/efi/quirks.c
+index 4ccb57c20f71..f4af8d364053 100644
+--- a/arch/x86/platform/efi/quirks.c
++++ b/arch/x86/platform/efi/quirks.c
+@@ -379,10 +379,10 @@ static void __init efi_unmap_pages(efi_memory_desc_t *md)
+ 
+ 	/*
+ 	 * To Do: Remove this check after adding functionality to unmap EFI boot
+-	 * services code/data regions from direct mapping area because
+-	 * "efi=old_map" maps EFI regions in swapper_pg_dir.
++	 * services code/data regions from direct mapping area because the UV1
++	 * memory map maps EFI regions in swapper_pg_dir.
+ 	 */
+-	if (efi_enabled(EFI_OLD_MEMMAP))
++	if (efi_have_uv1_memmap())
+ 		return;
+ 
+ 	/*
+@@ -550,7 +550,7 @@ int __init efi_reuse_config(u64 tables, int nr_tables)
+ 	return ret;
+ }
+ 
+-static const struct dmi_system_id sgi_uv1_dmi[] = {
++static const struct dmi_system_id sgi_uv1_dmi[] __initconst = {
+ 	{ NULL, "SGI UV1",
+ 		{	DMI_MATCH(DMI_PRODUCT_NAME,	"Stoutland Platform"),
+ 			DMI_MATCH(DMI_PRODUCT_VERSION,	"1.0"),
+@@ -573,8 +573,15 @@ void __init efi_apply_memmap_quirks(void)
+ 	}
+ 
+ 	/* UV2+ BIOS has a fix for this issue.  UV1 still needs the quirk. */
+-	if (dmi_check_system(sgi_uv1_dmi))
+-		set_bit(EFI_OLD_MEMMAP, &efi.flags);
++	if (dmi_check_system(sgi_uv1_dmi)) {
++		if (IS_ENABLED(CONFIG_X86_UV)) {
++			set_bit(EFI_UV1_MEMMAP, &efi.flags);
++		} else {
++			pr_warn("EFI runtime disabled, needs CONFIG_X86_UV=y on UV1\n");
++			clear_bit(EFI_RUNTIME_SERVICES, &efi.flags);
++			efi_memmap_unmap();
++		}
++	}
+ }
+ 
+ /*
+@@ -709,7 +716,7 @@ void efi_recover_from_page_fault(unsigned long phys_addr)
+ 	/*
+ 	 * Make sure that an efi runtime service caused the page fault.
+ 	 * "efi_mm" cannot be used to check if the page fault had occurred
+-	 * in the firmware context because efi=old_map doesn't use efi_pgd.
++	 * in the firmware context because the UV1 memmap doesn't use efi_pgd.
+ 	 */
+ 	if (efi_rts_work.efi_rts_id == NONE)
+ 		return;
+* Unmerged path arch/x86/platform/uv/bios_uv.c
