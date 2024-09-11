@@ -1,0 +1,153 @@
+net: phy: simplify phy_link_change arguments
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Doug Berger <opendmb@gmail.com>
+commit a307593a644443db12888f45eed0dafb5869e2cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a307593a.failed
+
+This function was introduced to allow for different handling of
+link up and link down events particularly with regard to the
+netif_carrier. The third argument do_carrier allowed the flag to
+be left unchanged.
+
+Since then the phylink has introduced an implementation that
+completely ignores the third parameter since it never wants to
+change the flag and the phylib always sets the third parameter
+to true so the flag is always changed.
+
+Therefore the third argument (i.e. do_carrier) is no longer
+necessary and can be removed. This also means that the phylib
+phy_link_down() function no longer needs its second argument.
+
+	Signed-off-by: Doug Berger <opendmb@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a307593a644443db12888f45eed0dafb5869e2cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/phy.h
+diff --cc include/linux/phy.h
+index c0384427f3d6,467aa8bf9f64..000000000000
+--- a/include/linux/phy.h
++++ b/include/linux/phy.h
+@@@ -541,19 -543,13 +541,23 @@@ struct phy_device 
+  	u8 mdix;
+  	u8 mdix_ctrl;
+  
+++<<<<<<< HEAD
+ +	/* RHEL specific: further changes here need to be accompanied by
+ +	 * increasing the RH_KABI_FORCE_CHANGE version of
+ +	 * phy_driver[s]_register.
+ +	 */
+ +	RH_KABI_BROKEN_INSERT_BLOCK(
+ +	__ETHTOOL_DECLARE_LINK_MODE_MASK(supported);
+ +	__ETHTOOL_DECLARE_LINK_MODE_MASK(advertising);
+ +	__ETHTOOL_DECLARE_LINK_MODE_MASK(lp_advertising);
+ +	__ETHTOOL_DECLARE_LINK_MODE_MASK(adv_old);
+ +	) /* RH_KABI_BROKEN_INSERT_BLOCK */
+ +
+ +	void (*phy_link_change)(struct phy_device *, bool up, bool do_carrier);
+++=======
++ 	void (*phy_link_change)(struct phy_device *phydev, bool up);
+++>>>>>>> a307593a6444 (net: phy: simplify phy_link_change arguments)
+  	void (*adjust_link)(struct net_device *dev);
+ -
+ -#if IS_ENABLED(CONFIG_MACSEC)
+ -	/* MACsec management functions */
+ -	const struct macsec_ops *macsec_ops;
+ -#endif
+  };
+  #define to_phy_device(d) container_of(to_mdio_device(d), \
+  				      struct phy_device, mdio)
+diff --git a/drivers/net/phy/phy.c b/drivers/net/phy/phy.c
+index 77d051ca5bab..a7a93d3b584a 100644
+--- a/drivers/net/phy/phy.c
++++ b/drivers/net/phy/phy.c
+@@ -54,13 +54,13 @@ static const char *phy_state_to_str(enum phy_state st)
+ 
+ static void phy_link_up(struct phy_device *phydev)
+ {
+-	phydev->phy_link_change(phydev, true, true);
++	phydev->phy_link_change(phydev, true);
+ 	phy_led_trigger_change_speed(phydev);
+ }
+ 
+-static void phy_link_down(struct phy_device *phydev, bool do_carrier)
++static void phy_link_down(struct phy_device *phydev)
+ {
+-	phydev->phy_link_change(phydev, false, do_carrier);
++	phydev->phy_link_change(phydev, false);
+ 	phy_led_trigger_change_speed(phydev);
+ }
+ 
+@@ -511,7 +511,7 @@ int phy_start_cable_test(struct phy_device *phydev,
+ 	}
+ 
+ 	/* Mark the carrier down until the test is complete */
+-	phy_link_down(phydev, true);
++	phy_link_down(phydev);
+ 
+ 	err = phydev->drv->cable_test_start(phydev);
+ 	if (err) {
+@@ -573,7 +573,7 @@ static int phy_check_link_status(struct phy_device *phydev)
+ 		phy_link_up(phydev);
+ 	} else if (!phydev->link && phydev->state != PHY_NOLINK) {
+ 		phydev->state = PHY_NOLINK;
+-		phy_link_down(phydev, true);
++		phy_link_down(phydev);
+ 	}
+ 
+ 	return 0;
+@@ -971,7 +971,7 @@ void phy_state_machine(struct work_struct *work)
+ 	case PHY_HALTED:
+ 		if (phydev->link) {
+ 			phydev->link = 0;
+-			phy_link_down(phydev, true);
++			phy_link_down(phydev);
+ 		}
+ 		do_suspend = true;
+ 		break;
+diff --git a/drivers/net/phy/phy_device.c b/drivers/net/phy/phy_device.c
+index edd049f1d9b6..ea45f7e7abd4 100644
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -916,16 +916,14 @@ struct phy_device *phy_find_first(struct mii_bus *bus)
+ }
+ EXPORT_SYMBOL(phy_find_first);
+ 
+-static void phy_link_change(struct phy_device *phydev, bool up, bool do_carrier)
++static void phy_link_change(struct phy_device *phydev, bool up)
+ {
+ 	struct net_device *netdev = phydev->attached_dev;
+ 
+-	if (do_carrier) {
+-		if (up)
+-			netif_carrier_on(netdev);
+-		else
+-			netif_carrier_off(netdev);
+-	}
++	if (up)
++		netif_carrier_on(netdev);
++	else
++		netif_carrier_off(netdev);
+ 	phydev->adjust_link(netdev);
+ 	if (phydev->mii_ts && phydev->mii_ts->link_state)
+ 		phydev->mii_ts->link_state(phydev->mii_ts, phydev);
+diff --git a/drivers/net/phy/phylink.c b/drivers/net/phy/phylink.c
+index 32faefa967a4..562ada6393d7 100644
+--- a/drivers/net/phy/phylink.c
++++ b/drivers/net/phy/phylink.c
+@@ -760,8 +760,7 @@ void phylink_destroy(struct phylink *pl)
+ }
+ EXPORT_SYMBOL_GPL(phylink_destroy);
+ 
+-static void phylink_phy_change(struct phy_device *phydev, bool up,
+-			       bool do_carrier)
++static void phylink_phy_change(struct phy_device *phydev, bool up)
+ {
+ 	struct phylink *pl = phydev->phylink;
+ 	bool tx_pause, rx_pause;
+* Unmerged path include/linux/phy.h
