@@ -1,0 +1,276 @@
+selftests/vm: gup_test: introduce the dump_pages() sub-test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit f4f9bda418ab8b4dbc5372e9e2a28162f7777154
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f4f9bda4.failed
+
+For quite a while, I was doing a quick hack to gup_test.c (previously,
+gup_benchmark.c) whenever I wanted to try out my changes to dump_page().
+This makes that hack unnecessary, and instead allows anyone to easily get
+the same coverage from a user space program.  That saves a lot of time
+because you don't have to change the kernel, in order to test different
+pages and options.
+
+The new sub-test takes advantage of the existing gup_test infrastructure,
+which already provides a simple user space program, some allocated user
+space pages, an ioctl call, pinning of those pages (via either
+get_user_pages or pin_user_pages) and a corresponding kernel-side test
+invocation.  There's not much more required, mainly just a couple of
+inputs from the user.
+
+In fact, the new test re-uses the existing command line options in order
+to get various helpful combinations (THP or normal, _fast or slow gup, gup
+vs.  pup, and more).
+
+New command line options are: which pages to dump, and what type of
+"get/pin" to use.
+
+In order to figure out which pages to dump, the logic is:
+
+* If the user doesn't specify anything, the page 0 (the first page in
+  the address range that the program sets up for testing) is dumped.
+
+* Or, the user can type up to 8 page indices anywhere on the command
+  line.  If you type more than 8, then it uses the first 8 and ignores the
+  remaining items.
+
+For example:
+
+    ./gup_test -ct -F 1 0 19 0x1000
+
+Meaning:
+    -c:          dump pages sub-test
+    -t:          use THP pages
+    -F 1:        use pin_user_pages() instead of get_user_pages()
+    0 19 0x1000: dump pages 0, 19, and 4096
+
+Link: https://lkml.kernel.org/r/20201026064021.3545418-7-jhubbard@nvidia.com
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f4f9bda418ab8b4dbc5372e9e2a28162f7777154)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/Kconfig
+#	mm/gup_benchmark.c
+#	mm/gup_test.h
+#	tools/testing/selftests/vm/gup_benchmark.c
+diff --cc mm/Kconfig
+index 01b290fad284,350f2e23a94a..000000000000
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@@ -714,13 -821,24 +714,27 @@@ config PERCPU_STAT
+  	  information includes global and per chunk statistics, which can
+  	  be used to help understand percpu memory usage.
+  
+ -config GUP_TEST
+ -	bool "Enable infrastructure for get_user_pages()-related unit tests"
+ +config GUP_BENCHMARK
+ +	bool "Enable infrastructure for get_user_pages() and related calls benchmarking"
+  	help
+ -	  Provides /sys/kernel/debug/gup_test, which in turn provides a way
+ -	  to make ioctl calls that can launch kernel-based unit tests for
+ -	  the get_user_pages*() and pin_user_pages*() family of API calls.
+ +	  Provides /sys/kernel/debug/gup_benchmark that helps with testing
+ +	  performance of get_user_pages() and related calls.
+  
+++<<<<<<< HEAD
+ +	  See tools/testing/selftests/vm/gup_benchmark.c
+++=======
++ 	  These tests include benchmark testing of the _fast variants of
++ 	  get_user_pages*() and pin_user_pages*(), as well as smoke tests of
++ 	  the non-_fast variants.
++ 
++ 	  There is also a sub-test that allows running dump_page() on any
++ 	  of up to eight pages (selected by command line args) within the
++ 	  range of user-space addresses. These pages are either pinned via
++ 	  pin_user_pages*(), or pinned via get_user_pages*(), as specified
++ 	  by other command line arguments.
++ 
++ 	  See tools/testing/selftests/vm/gup_test.c
+++>>>>>>> f4f9bda418ab (selftests/vm: gup_test: introduce the dump_pages() sub-test)
+  
+  config GUP_GET_PTE_LOW_HIGH
+  	bool
+diff --cc mm/gup_benchmark.c
+index 464cae1fa3ea,087ddaf30eb4..000000000000
+--- a/mm/gup_benchmark.c
++++ b/mm/gup_benchmark.c
+@@@ -4,25 -4,10 +4,25 @@@
+  #include <linux/uaccess.h>
+  #include <linux/ktime.h>
+  #include <linux/debugfs.h>
+ -#include "gup_test.h"
+ +
+ +#define GUP_FAST_BENCHMARK	_IOWR('g', 1, struct gup_benchmark)
+ +#define GUP_BENCHMARK		_IOWR('g', 2, struct gup_benchmark)
+ +#define PIN_FAST_BENCHMARK	_IOWR('g', 3, struct gup_benchmark)
+ +#define PIN_BENCHMARK		_IOWR('g', 4, struct gup_benchmark)
+ +#define PIN_LONGTERM_BENCHMARK	_IOWR('g', 5, struct gup_benchmark)
+ +
+ +struct gup_benchmark {
+ +	__u64 get_delta_usec;
+ +	__u64 put_delta_usec;
+ +	__u64 addr;
+ +	__u64 size;
+ +	__u32 nr_pages_per_call;
+ +	__u32 flags;
+ +	__u64 expansion[10];	/* For future use */
+ +};
+  
+  static void put_back_pages(unsigned int cmd, struct page **pages,
+- 			   unsigned long nr_pages)
++ 			   unsigned long nr_pages, unsigned int gup_test_flags)
+  {
+  	unsigned long i;
+  
+@@@ -64,8 -58,39 +73,44 @@@ static void verify_dma_pinned(unsigned 
+  	}
+  }
+  
+++<<<<<<< HEAD:mm/gup_benchmark.c
+ +static int __gup_benchmark_ioctl(unsigned int cmd,
+ +		struct gup_benchmark *gup)
+++=======
++ static void dump_pages_test(struct gup_test *gup, struct page **pages,
++ 			    unsigned long nr_pages)
++ {
++ 	unsigned int index_to_dump;
++ 	unsigned int i;
++ 
++ 	/*
++ 	 * Zero out any user-supplied page index that is out of range. Remember:
++ 	 * .which_pages[] contains a 1-based set of page indices.
++ 	 */
++ 	for (i = 0; i < GUP_TEST_MAX_PAGES_TO_DUMP; i++) {
++ 		if (gup->which_pages[i] > nr_pages) {
++ 			pr_warn("ZEROING due to out of range: .which_pages[%u]: %u\n",
++ 				i, gup->which_pages[i]);
++ 			gup->which_pages[i] = 0;
++ 		}
++ 	}
++ 
++ 	for (i = 0; i < GUP_TEST_MAX_PAGES_TO_DUMP; i++) {
++ 		index_to_dump = gup->which_pages[i];
++ 
++ 		if (index_to_dump) {
++ 			index_to_dump--; // Decode from 1-based, to 0-based
++ 			pr_info("---- page #%u, starting from user virt addr: 0x%llx\n",
++ 				index_to_dump, gup->addr);
++ 			dump_page(pages[index_to_dump],
++ 				  "gup_test: dump_pages() test");
++ 		}
++ 	}
++ }
++ 
++ static int __gup_test_ioctl(unsigned int cmd,
++ 		struct gup_test *gup)
+++>>>>>>> f4f9bda418ab (selftests/vm: gup_test: introduce the dump_pages() sub-test):mm/gup_test.c
+  {
+  	ktime_t start_time, end_time;
+  	unsigned long i, nr_pages, addr, next;
+@@@ -119,10 -151,17 +164,18 @@@
+  					    gup->flags | FOLL_LONGTERM,
+  					    pages + i, NULL);
+  			break;
++ 		case DUMP_USER_PAGES_TEST:
++ 			if (gup->flags & GUP_TEST_FLAG_DUMP_PAGES_USE_PIN)
++ 				nr = pin_user_pages(addr, nr, gup->flags,
++ 						    pages + i, NULL);
++ 			else
++ 				nr = get_user_pages(addr, nr, gup->flags,
++ 						    pages + i, NULL);
++ 			break;
+  		default:
+ +			kvfree(pages);
+  			ret = -EINVAL;
+ -			goto unlock;
+ +			goto out;
+  		}
+  
+  		if (nr <= 0)
+@@@ -163,10 -208,11 +219,16 @@@ static long gup_benchmark_ioctl(struct 
+  
+  	switch (cmd) {
+  	case GUP_FAST_BENCHMARK:
+ +	case GUP_BENCHMARK:
+  	case PIN_FAST_BENCHMARK:
+ +	case PIN_BENCHMARK:
+  	case PIN_LONGTERM_BENCHMARK:
+++<<<<<<< HEAD:mm/gup_benchmark.c
+++=======
++ 	case GUP_BASIC_TEST:
++ 	case PIN_BASIC_TEST:
++ 	case DUMP_USER_PAGES_TEST:
+++>>>>>>> f4f9bda418ab (selftests/vm: gup_test: introduce the dump_pages() sub-test):mm/gup_test.c
+  		break;
+  	default:
+  		return -EINVAL;
+diff --cc tools/testing/selftests/vm/gup_benchmark.c
+index 31f8bb086907,6c6336dd3b7f..000000000000
+--- a/tools/testing/selftests/vm/gup_benchmark.c
++++ b/tools/testing/selftests/vm/gup_benchmark.c
+@@@ -25,22 -14,32 +25,47 @@@
+  /* Just the flags we need, copied from mm.h: */
+  #define FOLL_WRITE	0x01	/* check pte is writable */
+  
+++<<<<<<< HEAD:tools/testing/selftests/vm/gup_benchmark.c
+ +struct gup_benchmark {
+ +	__u64 get_delta_usec;
+ +	__u64 put_delta_usec;
+ +	__u64 addr;
+ +	__u64 size;
+ +	__u32 nr_pages_per_call;
+ +	__u32 flags;
+ +	__u64 expansion[10];	/* For future use */
+ +};
+ +
+ +int main(int argc, char **argv)
+ +{
+ +	struct gup_benchmark gup;
+++=======
++ static char *cmd_to_str(unsigned long cmd)
++ {
++ 	switch (cmd) {
++ 	case GUP_FAST_BENCHMARK:
++ 		return "GUP_FAST_BENCHMARK";
++ 	case PIN_FAST_BENCHMARK:
++ 		return "PIN_FAST_BENCHMARK";
++ 	case PIN_LONGTERM_BENCHMARK:
++ 		return "PIN_LONGTERM_BENCHMARK";
++ 	case GUP_BASIC_TEST:
++ 		return "GUP_BASIC_TEST";
++ 	case PIN_BASIC_TEST:
++ 		return "PIN_BASIC_TEST";
++ 	case DUMP_USER_PAGES_TEST:
++ 		return "DUMP_USER_PAGES_TEST";
++ 	}
++ 	return "Unknown command";
++ }
++ 
++ int main(int argc, char **argv)
++ {
++ 	struct gup_test gup = { 0 };
+++>>>>>>> f4f9bda418ab (selftests/vm: gup_test: introduce the dump_pages() sub-test):tools/testing/selftests/vm/gup_test.c
+  	unsigned long size = 128 * MB;
+  	int i, fd, filed, opt, nr_pages = 1, thp = -1, repeats = 1, write = 0;
+ -	unsigned long cmd = GUP_FAST_BENCHMARK;
+ -	int flags = MAP_PRIVATE;
+ +	int cmd = GUP_FAST_BENCHMARK, flags = MAP_PRIVATE;
+  	char *file = "/dev/zero";
+  	char *p;
+  
+* Unmerged path mm/gup_test.h
+* Unmerged path mm/Kconfig
+* Unmerged path mm/gup_benchmark.c
+* Unmerged path mm/gup_test.h
+* Unmerged path tools/testing/selftests/vm/gup_benchmark.c
