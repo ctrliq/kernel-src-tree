@@ -1,0 +1,137 @@
+mm, slab/slub: improve error reporting and overhead of cache_from_obj()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit e42f174e43e47b623d9dbf814521c4961000c962
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e42f174e.failed
+
+cache_from_obj() was added by commit b9ce5ef49f00 ("sl[au]b: always get
+the cache from its page in kmem_cache_free()") to support kmemcg, where
+per-memcg cache can be different from the root one, so we can't use the
+kmem_cache pointer given to kmem_cache_free().
+
+Prior to that commit, SLUB already had debugging check+warning that could
+be enabled to compare the given kmem_cache pointer to one referenced by
+the slab page where the object-to-be-freed resides.  This check was moved
+to cache_from_obj().  Later the check was also enabled for
+SLAB_FREELIST_HARDENED configs by commit 598a0717a816 ("mm/slab: validate
+cache membership under freelist hardening").
+
+These checks and warnings can be useful especially for the debugging,
+which can be improved.  Commit 598a0717a816 changed the pr_err() with
+WARN_ON_ONCE() to WARN_ONCE() so only the first hit is now reported,
+others are silent.  This patch changes it to WARN() so that all errors are
+reported.
+
+It's also useful to print SLUB allocation/free tracking info for the
+offending object, if tracking is enabled.  Thus, export the SLUB
+print_tracking() function and provide an empty one for SLAB.
+
+For SLUB we can also benefit from the static key check in
+kmem_cache_debug_flags(), but we need to move this function to slab.h and
+declare the static key there.
+
+[1] https://lore.kernel.org/r/20200608230654.828134-18-guro@fb.com
+
+[vbabka@suse.cz: avoid bogus WARN()]
+  Link: https://lore.kernel.org/r/20200623090213.GW5535@shao2-debian
+  Link: http://lkml.kernel.org/r/b33e0fa7-cd28-4788-9e54-5927846329ef@suse.cz
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Kees Cook <keescook@chromium.org>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Pekka Enberg <penberg@kernel.org>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Matthew Garrett <mjg59@google.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Vijayanand Jitta <vjitta@codeaurora.org>
+	Cc: Vinayak Menon <vinmenon@codeaurora.org>
+Link: http://lkml.kernel.org/r/afeda7ac-748b-33d8-a905-56b708148ad5@suse.cz
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e42f174e43e47b623d9dbf814521c4961000c962)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.h
+#	mm/slub.c
+diff --cc mm/slab.h
+index 45ad57de9d88,fceb4341ba91..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -433,25 -535,17 +461,39 @@@ static __always_inline void uncharge_sl
+  static inline struct kmem_cache *cache_from_obj(struct kmem_cache *s, void *x)
+  {
+  	struct kmem_cache *cachep;
+++<<<<<<< HEAD
+ +	struct page *page;
+ +
+ +	/*
+ +	 * When kmemcg is not being used, both assignments should return the
+ +	 * same value. but we don't want to pay the assignment price in that
+ +	 * case. If it is not compiled in, the compiler should be smart enough
+ +	 * to not do even the assignment. In that case, slab_equal_or_root
+ +	 * will also be a constant.
+ +	 */
+ +	if (!memcg_kmem_enabled() &&
+ +	    !IS_ENABLED(CONFIG_SLAB_FREELIST_HARDENED) &&
+ +	    !unlikely(s->flags & SLAB_CONSISTENCY_CHECKS))
+ +		return s;
+ +
+ +	page = virt_to_head_page(x);
+ +	cachep = page->slab_cache;
+ +	WARN_ONCE(!slab_equal_or_root(cachep, s),
+ +		  "%s: Wrong slab cache. %s but object is from %s\n",
+ +		  __func__, s->name, cachep->name);
+++=======
++ 
++ 	if (!IS_ENABLED(CONFIG_SLAB_FREELIST_HARDENED) &&
++ 	    !memcg_kmem_enabled() &&
++ 	    !kmem_cache_debug_flags(s, SLAB_CONSISTENCY_CHECKS))
++ 		return s;
++ 
++ 	cachep = virt_to_cache(x);
++ 	if (WARN(cachep && !slab_equal_or_root(cachep, s),
++ 		  "%s: Wrong slab cache. %s but object is from %s\n",
++ 		  __func__, s->name, cachep->name))
++ 		print_tracking(cachep, x);
+++>>>>>>> e42f174e43e4 (mm, slab/slub: improve error reporting and overhead of cache_from_obj())
+  	return cachep;
+  }
+  
+diff --cc mm/slub.c
+index 135072f4c635,629a58b56728..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -116,13 -114,17 +116,21 @@@
+   * 			the fast path and disables lockless freelists.
+   */
+  
+ +static inline int kmem_cache_debug(struct kmem_cache *s)
+ +{
+  #ifdef CONFIG_SLUB_DEBUG
+ -#ifdef CONFIG_SLUB_DEBUG_ON
+ -DEFINE_STATIC_KEY_TRUE(slub_debug_enabled);
+ +	return unlikely(s->flags & SLAB_DEBUG_FLAGS);
+  #else
+ -DEFINE_STATIC_KEY_FALSE(slub_debug_enabled);
+ +	return 0;
+  #endif
+++<<<<<<< HEAD
+++=======
++ #endif
++ 
++ static inline bool kmem_cache_debug(struct kmem_cache *s)
++ {
++ 	return kmem_cache_debug_flags(s, SLAB_DEBUG_FLAGS);
+++>>>>>>> e42f174e43e4 (mm, slab/slub: improve error reporting and overhead of cache_from_obj())
+  }
+  
+  void *fixup_red_left(struct kmem_cache *s, void *p)
+* Unmerged path mm/slab.h
+* Unmerged path mm/slub.c
