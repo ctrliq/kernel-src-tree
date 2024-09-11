@@ -1,0 +1,511 @@
+RDMA/providers: Fix return value when QP type isn't supported
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Kamal Heib <kamalheib1@gmail.com>
+commit bb8865f435d81223596f1abd6dec0b12ed122af0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bb8865f4.failed
+
+The proper return code is "-EOPNOTSUPP" when the requested QP type is
+not supported by the provider.
+
+Link: https://lore.kernel.org/r/20200130082049.463-1-kamalheib1@gmail.com
+	Signed-off-by: Kamal Heib <kamalheib1@gmail.com>
+	Reviewed-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit bb8865f435d81223596f1abd6dec0b12ed122af0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/ib_verbs.c
+#	drivers/infiniband/hw/hns/hns_roce_qp.c
+diff --cc drivers/infiniband/hw/bnxt_re/ib_verbs.c
+index b112e2a357d2,47b0b50b71e7..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/ib_verbs.c
++++ b/drivers/infiniband/hw/bnxt_re/ib_verbs.c
+@@@ -998,6 -1015,316 +998,319 @@@ fail
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_re_init_rq_attr(struct bnxt_re_qp *qp,
++ 				struct ib_qp_init_attr *init_attr)
++ {
++ 	struct bnxt_qplib_dev_attr *dev_attr;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	struct bnxt_re_dev *rdev;
++ 	int entries;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 	dev_attr = &rdev->dev_attr;
++ 
++ 	if (init_attr->srq) {
++ 		struct bnxt_re_srq *srq;
++ 
++ 		srq = container_of(init_attr->srq, struct bnxt_re_srq, ib_srq);
++ 		if (!srq) {
++ 			ibdev_err(&rdev->ibdev, "SRQ not found");
++ 			return -EINVAL;
++ 		}
++ 		qplqp->srq = &srq->qplib_srq;
++ 		qplqp->rq.max_wqe = 0;
++ 	} else {
++ 		/* Allocate 1 more than what's provided so posting max doesn't
++ 		 * mean empty.
++ 		 */
++ 		entries = roundup_pow_of_two(init_attr->cap.max_recv_wr + 1);
++ 		qplqp->rq.max_wqe = min_t(u32, entries,
++ 					  dev_attr->max_qp_wqes + 1);
++ 
++ 		qplqp->rq.q_full_delta = qplqp->rq.max_wqe -
++ 					 init_attr->cap.max_recv_wr;
++ 		qplqp->rq.max_sge = init_attr->cap.max_recv_sge;
++ 		if (qplqp->rq.max_sge > dev_attr->max_qp_sges)
++ 			qplqp->rq.max_sge = dev_attr->max_qp_sges;
++ 	}
++ 	qplqp->rq.sg_info.pgsize = PAGE_SIZE;
++ 	qplqp->rq.sg_info.pgshft = PAGE_SHIFT;
++ 
++ 	return 0;
++ }
++ 
++ static void bnxt_re_adjust_gsi_rq_attr(struct bnxt_re_qp *qp)
++ {
++ 	struct bnxt_qplib_dev_attr *dev_attr;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	struct bnxt_re_dev *rdev;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 	dev_attr = &rdev->dev_attr;
++ 
++ 	qplqp->rq.max_sge = dev_attr->max_qp_sges;
++ 	if (qplqp->rq.max_sge > dev_attr->max_qp_sges)
++ 		qplqp->rq.max_sge = dev_attr->max_qp_sges;
++ 	qplqp->rq.max_sge = 6;
++ }
++ 
++ static void bnxt_re_init_sq_attr(struct bnxt_re_qp *qp,
++ 				 struct ib_qp_init_attr *init_attr,
++ 				 struct ib_udata *udata)
++ {
++ 	struct bnxt_qplib_dev_attr *dev_attr;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	struct bnxt_re_dev *rdev;
++ 	int entries;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 	dev_attr = &rdev->dev_attr;
++ 
++ 	qplqp->sq.max_sge = init_attr->cap.max_send_sge;
++ 	if (qplqp->sq.max_sge > dev_attr->max_qp_sges)
++ 		qplqp->sq.max_sge = dev_attr->max_qp_sges;
++ 	/*
++ 	 * Change the SQ depth if user has requested minimum using
++ 	 * configfs. Only supported for kernel consumers
++ 	 */
++ 	entries = init_attr->cap.max_send_wr;
++ 	/* Allocate 128 + 1 more than what's provided */
++ 	entries = roundup_pow_of_two(entries + BNXT_QPLIB_RESERVED_QP_WRS + 1);
++ 	qplqp->sq.max_wqe = min_t(u32, entries, dev_attr->max_qp_wqes +
++ 			BNXT_QPLIB_RESERVED_QP_WRS + 1);
++ 	qplqp->sq.q_full_delta = BNXT_QPLIB_RESERVED_QP_WRS + 1;
++ 	/*
++ 	 * Reserving one slot for Phantom WQE. Application can
++ 	 * post one extra entry in this case. But allowing this to avoid
++ 	 * unexpected Queue full condition
++ 	 */
++ 	qplqp->sq.q_full_delta -= 1;
++ 	qplqp->sq.sg_info.pgsize = PAGE_SIZE;
++ 	qplqp->sq.sg_info.pgshft = PAGE_SHIFT;
++ }
++ 
++ static void bnxt_re_adjust_gsi_sq_attr(struct bnxt_re_qp *qp,
++ 				       struct ib_qp_init_attr *init_attr)
++ {
++ 	struct bnxt_qplib_dev_attr *dev_attr;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	struct bnxt_re_dev *rdev;
++ 	int entries;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 	dev_attr = &rdev->dev_attr;
++ 
++ 	entries = roundup_pow_of_two(init_attr->cap.max_send_wr + 1);
++ 	qplqp->sq.max_wqe = min_t(u32, entries, dev_attr->max_qp_wqes + 1);
++ 	qplqp->sq.q_full_delta = qplqp->sq.max_wqe -
++ 				 init_attr->cap.max_send_wr;
++ 	qplqp->sq.max_sge++; /* Need one extra sge to put UD header */
++ 	if (qplqp->sq.max_sge > dev_attr->max_qp_sges)
++ 		qplqp->sq.max_sge = dev_attr->max_qp_sges;
++ }
++ 
++ static int bnxt_re_init_qp_type(struct bnxt_re_dev *rdev,
++ 				struct ib_qp_init_attr *init_attr)
++ {
++ 	struct bnxt_qplib_chip_ctx *chip_ctx;
++ 	int qptype;
++ 
++ 	chip_ctx = rdev->chip_ctx;
++ 
++ 	qptype = __from_ib_qp_type(init_attr->qp_type);
++ 	if (qptype == IB_QPT_MAX) {
++ 		ibdev_err(&rdev->ibdev, "QP type 0x%x not supported", qptype);
++ 		qptype = -EOPNOTSUPP;
++ 		goto out;
++ 	}
++ 
++ 	if (bnxt_qplib_is_chip_gen_p5(chip_ctx) &&
++ 	    init_attr->qp_type == IB_QPT_GSI)
++ 		qptype = CMDQ_CREATE_QP_TYPE_GSI;
++ out:
++ 	return qptype;
++ }
++ 
++ static int bnxt_re_init_qp_attr(struct bnxt_re_qp *qp, struct bnxt_re_pd *pd,
++ 				struct ib_qp_init_attr *init_attr,
++ 				struct ib_udata *udata)
++ {
++ 	struct bnxt_qplib_dev_attr *dev_attr;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	struct bnxt_re_dev *rdev;
++ 	struct bnxt_re_cq *cq;
++ 	int rc = 0, qptype;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 	dev_attr = &rdev->dev_attr;
++ 
++ 	/* Setup misc params */
++ 	ether_addr_copy(qplqp->smac, rdev->netdev->dev_addr);
++ 	qplqp->pd = &pd->qplib_pd;
++ 	qplqp->qp_handle = (u64)qplqp;
++ 	qplqp->max_inline_data = init_attr->cap.max_inline_data;
++ 	qplqp->sig_type = ((init_attr->sq_sig_type == IB_SIGNAL_ALL_WR) ?
++ 			    true : false);
++ 	qptype = bnxt_re_init_qp_type(rdev, init_attr);
++ 	if (qptype < 0) {
++ 		rc = qptype;
++ 		goto out;
++ 	}
++ 	qplqp->type = (u8)qptype;
++ 
++ 	if (init_attr->qp_type == IB_QPT_RC) {
++ 		qplqp->max_rd_atomic = dev_attr->max_qp_rd_atom;
++ 		qplqp->max_dest_rd_atomic = dev_attr->max_qp_init_rd_atom;
++ 	}
++ 	qplqp->mtu = ib_mtu_enum_to_int(iboe_get_mtu(rdev->netdev->mtu));
++ 	qplqp->dpi = &rdev->dpi_privileged; /* Doorbell page */
++ 	if (init_attr->create_flags)
++ 		ibdev_dbg(&rdev->ibdev,
++ 			  "QP create flags 0x%x not supported",
++ 			  init_attr->create_flags);
++ 
++ 	/* Setup CQs */
++ 	if (init_attr->send_cq) {
++ 		cq = container_of(init_attr->send_cq, struct bnxt_re_cq, ib_cq);
++ 		if (!cq) {
++ 			ibdev_err(&rdev->ibdev, "Send CQ not found");
++ 			rc = -EINVAL;
++ 			goto out;
++ 		}
++ 		qplqp->scq = &cq->qplib_cq;
++ 		qp->scq = cq;
++ 	}
++ 
++ 	if (init_attr->recv_cq) {
++ 		cq = container_of(init_attr->recv_cq, struct bnxt_re_cq, ib_cq);
++ 		if (!cq) {
++ 			ibdev_err(&rdev->ibdev, "Receive CQ not found");
++ 			rc = -EINVAL;
++ 			goto out;
++ 		}
++ 		qplqp->rcq = &cq->qplib_cq;
++ 		qp->rcq = cq;
++ 	}
++ 
++ 	/* Setup RQ/SRQ */
++ 	rc = bnxt_re_init_rq_attr(qp, init_attr);
++ 	if (rc)
++ 		goto out;
++ 	if (init_attr->qp_type == IB_QPT_GSI)
++ 		bnxt_re_adjust_gsi_rq_attr(qp);
++ 
++ 	/* Setup SQ */
++ 	bnxt_re_init_sq_attr(qp, init_attr, udata);
++ 	if (init_attr->qp_type == IB_QPT_GSI)
++ 		bnxt_re_adjust_gsi_sq_attr(qp, init_attr);
++ 
++ 	if (udata) /* This will update DPI and qp_handle */
++ 		rc = bnxt_re_init_user_qp(rdev, pd, qp, udata);
++ out:
++ 	return rc;
++ }
++ 
++ static int bnxt_re_create_shadow_gsi(struct bnxt_re_qp *qp,
++ 				     struct bnxt_re_pd *pd)
++ {
++ 	struct bnxt_re_sqp_entries *sqp_tbl = NULL;
++ 	struct bnxt_re_dev *rdev;
++ 	struct bnxt_re_qp *sqp;
++ 	struct bnxt_re_ah *sah;
++ 	int rc = 0;
++ 
++ 	rdev = qp->rdev;
++ 	/* Create a shadow QP to handle the QP1 traffic */
++ 	sqp_tbl = kzalloc(sizeof(*sqp_tbl) * BNXT_RE_MAX_GSI_SQP_ENTRIES,
++ 			  GFP_KERNEL);
++ 	if (!sqp_tbl)
++ 		return -ENOMEM;
++ 	rdev->gsi_ctx.sqp_tbl = sqp_tbl;
++ 
++ 	sqp = bnxt_re_create_shadow_qp(pd, &rdev->qplib_res, &qp->qplib_qp);
++ 	if (!sqp) {
++ 		rc = -ENODEV;
++ 		ibdev_err(&rdev->ibdev, "Failed to create Shadow QP for QP1");
++ 		goto out;
++ 	}
++ 	rdev->gsi_ctx.gsi_sqp = sqp;
++ 
++ 	sqp->rcq = qp->rcq;
++ 	sqp->scq = qp->scq;
++ 	sah = bnxt_re_create_shadow_qp_ah(pd, &rdev->qplib_res,
++ 					  &qp->qplib_qp);
++ 	if (!sah) {
++ 		bnxt_qplib_destroy_qp(&rdev->qplib_res,
++ 				      &sqp->qplib_qp);
++ 		rc = -ENODEV;
++ 		ibdev_err(&rdev->ibdev,
++ 			  "Failed to create AH entry for ShadowQP");
++ 		goto out;
++ 	}
++ 	rdev->gsi_ctx.gsi_sah = sah;
++ 
++ 	return 0;
++ out:
++ 	kfree(sqp_tbl);
++ 	return rc;
++ }
++ 
++ static int bnxt_re_create_gsi_qp(struct bnxt_re_qp *qp, struct bnxt_re_pd *pd,
++ 				 struct ib_qp_init_attr *init_attr)
++ {
++ 	struct bnxt_re_dev *rdev;
++ 	struct bnxt_qplib_qp *qplqp;
++ 	int rc = 0;
++ 
++ 	rdev = qp->rdev;
++ 	qplqp = &qp->qplib_qp;
++ 
++ 	qplqp->rq_hdr_buf_size = BNXT_QPLIB_MAX_QP1_RQ_HDR_SIZE_V2;
++ 	qplqp->sq_hdr_buf_size = BNXT_QPLIB_MAX_QP1_SQ_HDR_SIZE_V2;
++ 
++ 	rc = bnxt_qplib_create_qp1(&rdev->qplib_res, qplqp);
++ 	if (rc) {
++ 		ibdev_err(&rdev->ibdev, "create HW QP1 failed!");
++ 		goto out;
++ 	}
++ 
++ 	rc = bnxt_re_create_shadow_gsi(qp, pd);
++ out:
++ 	return rc;
++ }
++ 
++ static bool bnxt_re_test_qp_limits(struct bnxt_re_dev *rdev,
++ 				   struct ib_qp_init_attr *init_attr,
++ 				   struct bnxt_qplib_dev_attr *dev_attr)
++ {
++ 	bool rc = true;
++ 
++ 	if (init_attr->cap.max_send_wr > dev_attr->max_qp_wqes ||
++ 	    init_attr->cap.max_recv_wr > dev_attr->max_qp_wqes ||
++ 	    init_attr->cap.max_send_sge > dev_attr->max_qp_sges ||
++ 	    init_attr->cap.max_recv_sge > dev_attr->max_qp_sges ||
++ 	    init_attr->cap.max_inline_data > dev_attr->max_inline_data) {
++ 		ibdev_err(&rdev->ibdev,
++ 			  "Create QP failed - max exceeded! 0x%x/0x%x 0x%x/0x%x 0x%x/0x%x 0x%x/0x%x 0x%x/0x%x",
++ 			  init_attr->cap.max_send_wr, dev_attr->max_qp_wqes,
++ 			  init_attr->cap.max_recv_wr, dev_attr->max_qp_wqes,
++ 			  init_attr->cap.max_send_sge, dev_attr->max_qp_sges,
++ 			  init_attr->cap.max_recv_sge, dev_attr->max_qp_sges,
++ 			  init_attr->cap.max_inline_data,
++ 			  dev_attr->max_inline_data);
++ 		rc = false;
++ 	}
++ 	return rc;
++ }
++ 
+++>>>>>>> bb8865f435d8 (RDMA/providers: Fix return value when QP type isn't supported)
+  struct ib_qp *bnxt_re_create_qp(struct ib_pd *ib_pd,
+  				struct ib_qp_init_attr *qp_init_attr,
+  				struct ib_udata *udata)
+diff --cc drivers/infiniband/hw/hns/hns_roce_qp.c
+index ed2735cb5400,7bec0ceb160b..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_qp.c
++++ b/drivers/infiniband/hw/hns/hns_roce_qp.c
+@@@ -909,8 -1259,9 +909,14 @@@ struct ib_qp *hns_roce_create_qp(struc
+  		break;
+  	}
+  	default:{
+++<<<<<<< HEAD
+ +		dev_err(dev, "not support QP type %d\n", init_attr->qp_type);
+ +		return ERR_PTR(-EINVAL);
+++=======
++ 		ibdev_err(ibdev, "not support QP type %d\n",
++ 			  init_attr->qp_type);
++ 		return ERR_PTR(-EOPNOTSUPP);
+++>>>>>>> bb8865f435d8 (RDMA/providers: Fix return value when QP type isn't supported)
+  	}
+  	}
+  
+* Unmerged path drivers/infiniband/hw/bnxt_re/ib_verbs.c
+diff --git a/drivers/infiniband/hw/cxgb4/qp.c b/drivers/infiniband/hw/cxgb4/qp.c
+index 22f16be0c452..6a7999aed165 100644
+--- a/drivers/infiniband/hw/cxgb4/qp.c
++++ b/drivers/infiniband/hw/cxgb4/qp.c
+@@ -2129,7 +2129,7 @@ struct ib_qp *c4iw_create_qp(struct ib_pd *pd, struct ib_qp_init_attr *attrs,
+ 	pr_debug("ib_pd %p\n", pd);
+ 
+ 	if (attrs->qp_type != IB_QPT_RC)
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 
+ 	php = to_c4iw_pd(pd);
+ 	rhp = php->rhp;
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_qp.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index 512e99559c51..272109088508 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -618,7 +618,7 @@ static struct ib_qp *i40iw_create_qp(struct ib_pd *ibpd,
+ 	iwqp->ctx_info.qp_compl_ctx = (uintptr_t)qp;
+ 
+ 	if (init_attr->qp_type != IB_QPT_RC) {
+-		err_code = -EINVAL;
++		err_code = -EOPNOTSUPP;
+ 		goto error;
+ 	}
+ 	if (iwdev->push_mode)
+diff --git a/drivers/infiniband/hw/mlx4/qp.c b/drivers/infiniband/hw/mlx4/qp.c
+index e4387ebb6c01..c2cfcc9fe832 100644
+--- a/drivers/infiniband/hw/mlx4/qp.c
++++ b/drivers/infiniband/hw/mlx4/qp.c
+@@ -1636,7 +1636,7 @@ static struct ib_qp *_mlx4_ib_create_qp(struct ib_pd *pd,
+ 	}
+ 	default:
+ 		/* Don't support raw QPs */
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	return &qp->ibqp;
+diff --git a/drivers/infiniband/hw/mlx5/qp.c b/drivers/infiniband/hw/mlx5/qp.c
+index 68514ccf4084..10f336fd65cd 100644
+--- a/drivers/infiniband/hw/mlx5/qp.c
++++ b/drivers/infiniband/hw/mlx5/qp.c
+@@ -2791,7 +2791,7 @@ struct ib_qp *mlx5_ib_create_qp(struct ib_pd *pd,
+ 		mlx5_ib_dbg(dev, "unsupported qp type %d\n",
+ 			    init_attr->qp_type);
+ 		/* Don't support raw QPs */
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	if (verbs_init_attr->qp_type == IB_QPT_DRIVER)
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index 23554d8bf241..2470b443c24d 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -561,7 +561,7 @@ static struct ib_qp *mthca_create_qp(struct ib_pd *pd,
+ 	}
+ 	default:
+ 		/* Don't support raw QPs */
+-		return ERR_PTR(-ENOSYS);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	if (err) {
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+index 526753f8d872..13f22bafbf0b 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_verbs.c
+@@ -1117,7 +1117,7 @@ static int ocrdma_check_qp_params(struct ib_pd *ibpd, struct ocrdma_dev *dev,
+ 	    (attrs->qp_type != IB_QPT_UD)) {
+ 		pr_err("%s(%d) unsupported qp type=0x%x requested\n",
+ 		       __func__, dev->id, attrs->qp_type);
+-		return -EINVAL;
++		return -EOPNOTSUPP;
+ 	}
+ 	/* Skip the check for QP1 to support CM size of 128 */
+ 	if ((attrs->qp_type != IB_QPT_GSI) &&
+diff --git a/drivers/infiniband/hw/qedr/verbs.c b/drivers/infiniband/hw/qedr/verbs.c
+index a55e4fee7b7d..7a373b36eefe 100644
+--- a/drivers/infiniband/hw/qedr/verbs.c
++++ b/drivers/infiniband/hw/qedr/verbs.c
+@@ -1187,7 +1187,7 @@ static int qedr_check_qp_attrs(struct ib_pd *ibpd, struct qedr_dev *dev,
+ 		DP_DEBUG(dev, QEDR_MSG_QP,
+ 			 "create qp: unsupported qp type=0x%x requested\n",
+ 			 attrs->qp_type);
+-		return -EINVAL;
++		return -EOPNOTSUPP;
+ 	}
+ 
+ 	if (attrs->cap.max_send_wr > qattr->max_sqe) {
+diff --git a/drivers/infiniband/hw/usnic/usnic_ib_verbs.c b/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+index 61f8a37e115f..e66e2405a53c 100644
+--- a/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_verbs.c
+@@ -514,7 +514,7 @@ struct ib_qp *usnic_ib_create_qp(struct ib_pd *pd,
+ 	if (init_attr->qp_type != IB_QPT_UD) {
+ 		usnic_err("%s asked to make a non-UD QP: %d\n",
+ 			  dev_name(&us_ibdev->ib_dev.dev), init_attr->qp_type);
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	trans_spec = cmd.spec;
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+index 22daf2389d95..748b0455883e 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_qp.c
+@@ -217,7 +217,7 @@ struct ib_qp *pvrdma_create_qp(struct ib_pd *pd,
+ 	    init_attr->qp_type != IB_QPT_GSI) {
+ 		dev_warn(&dev->pdev->dev, "queuepair type %d not supported\n",
+ 			 init_attr->qp_type);
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	if (is_srq && !dev->dsr->caps.max_srq) {
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index 2c702e1b9a2c..500a7ee04c44 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -1220,7 +1220,7 @@ struct ib_qp *rvt_create_qp(struct ib_pd *ibpd,
+ 
+ 	default:
+ 		/* Don't support raw QPs */
+-		return ERR_PTR(-EINVAL);
++		return ERR_PTR(-EOPNOTSUPP);
+ 	}
+ 
+ 	init_attr->cap.max_inline_data = 0;
+diff --git a/drivers/infiniband/sw/siw/siw_verbs.c b/drivers/infiniband/sw/siw/siw_verbs.c
+index d5390d498c61..aeb842bc7a1e 100644
+--- a/drivers/infiniband/sw/siw/siw_verbs.c
++++ b/drivers/infiniband/sw/siw/siw_verbs.c
+@@ -323,7 +323,7 @@ struct ib_qp *siw_create_qp(struct ib_pd *pd,
+ 	}
+ 	if (attrs->qp_type != IB_QPT_RC) {
+ 		siw_dbg(base_dev, "only RC QP's supported\n");
+-		rv = -EINVAL;
++		rv = -EOPNOTSUPP;
+ 		goto err_out;
+ 	}
+ 	if ((attrs->cap.max_send_wr > SIW_MAX_QP_WR) ||
