@@ -1,0 +1,422 @@
+powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+commit edc8dd99b29e4d705c45e2a3a6c01b096ee056db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/edc8dd99.failed
+
+Power10 hw has multiple DAWRs but hw doesn't tell which DAWR caused
+the exception. So we have a sw logic to detect that in hw_breakpoint.c.
+But hw_breakpoint.c gets compiled only with CONFIG_HAVE_HW_BREAKPOINT=Y.
+Move DAWR detection logic outside of hw_breakpoint.c so that it can be
+reused when CONFIG_HAVE_HW_BREAKPOINT is not set.
+
+	Signed-off-by: Ravi Bangoria <ravi.bangoria@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200902042945.129369-5-ravi.bangoria@linux.ibm.com
+(cherry picked from commit edc8dd99b29e4d705c45e2a3a6c01b096ee056db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/hw_breakpoint.h
+#	arch/powerpc/kernel/Makefile
+#	arch/powerpc/kernel/hw_breakpoint.c
+diff --cc arch/powerpc/include/asm/hw_breakpoint.h
+index f0b028781c74,81872c420476..000000000000
+--- a/arch/powerpc/include/asm/hw_breakpoint.h
++++ b/arch/powerpc/include/asm/hw_breakpoint.h
+@@@ -23,6 -9,9 +23,12 @@@
+  #ifndef _PPC_BOOK3S_64_HW_BREAKPOINT_H
+  #define _PPC_BOOK3S_64_HW_BREAKPOINT_H
+  
+++<<<<<<< HEAD
+++=======
++ #include <asm/cpu_has_feature.h>
++ #include <asm/inst.h>
++ 
+++>>>>>>> edc8dd99b29e (powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c)
+  #ifdef	__KERNEL__
+  struct arch_hw_breakpoint {
+  	unsigned long	address;
+@@@ -47,6 -37,29 +53,32 @@@
+  #define HW_BRK_TYPE_PRIV_ALL	(HW_BRK_TYPE_USER | HW_BRK_TYPE_KERNEL | \
+  				 HW_BRK_TYPE_HYP)
+  
+++<<<<<<< HEAD
+++=======
++ /* Minimum granularity */
++ #ifdef CONFIG_PPC_8xx
++ #define HW_BREAKPOINT_SIZE  0x4
++ #else
++ #define HW_BREAKPOINT_SIZE  0x8
++ #endif
++ #define HW_BREAKPOINT_SIZE_QUADWORD	0x10
++ 
++ #define DABR_MAX_LEN	8
++ #define DAWR_MAX_LEN	512
++ 
++ static inline int nr_wp_slots(void)
++ {
++ 	return cpu_has_feature(CPU_FTR_DAWR1) ? 2 : 1;
++ }
++ 
++ bool wp_check_constraints(struct pt_regs *regs, struct ppc_inst instr,
++ 			  unsigned long ea, int type, int size,
++ 			  struct arch_hw_breakpoint *info);
++ 
++ void wp_get_instr_detail(struct pt_regs *regs, struct ppc_inst *instr,
++ 			 int *type, int *size, unsigned long *ea);
++ 
+++>>>>>>> edc8dd99b29e (powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c)
+  #ifdef CONFIG_HAVE_HW_BREAKPOINT
+  #include <linux/kdebug.h>
+  #include <asm/reg.h>
+diff --cc arch/powerpc/kernel/Makefile
+index 07b9f49bc695,a5550c2b24c4..000000000000
+--- a/arch/powerpc/kernel/Makefile
++++ b/arch/powerpc/kernel/Makefile
+@@@ -36,11 -45,12 +36,20 @@@ obj-y				:= cputable.o ptrace.o syscall
+  				   signal.o sysfs.o cacheinfo.o time.o \
+  				   prom.o traps.o setup-common.o \
+  				   udbg.o misc.o io.o misc_$(BITS).o \
+++<<<<<<< HEAD
+ +				   of_platform.o prom_parse.o \
+ +				   dma-common.o
+ +obj-$(CONFIG_PPC64)		+= setup_64.o sys_ppc32.o \
+ +				   signal_64.o ptrace32.o \
+ +				   paca.o nvram_64.o firmware.o note.o
+++=======
++ 				   of_platform.o prom_parse.o firmware.o \
++ 				   hw_breakpoint_constraints.o
++ obj-y				+= ptrace/
++ obj-$(CONFIG_PPC64)		+= setup_64.o \
++ 				   paca.o nvram_64.o note.o syscall_64.o
++ obj-$(CONFIG_COMPAT)		+= sys_ppc32.o signal_32.o
+++>>>>>>> edc8dd99b29e (powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c)
+  obj-$(CONFIG_VDSO32)		+= vdso32/
+  obj-$(CONFIG_PPC_WATCHDOG)	+= watchdog.o
+  obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
+diff --cc arch/powerpc/kernel/hw_breakpoint.c
+index 90c5c77a5704,f4e8f21046f5..000000000000
+--- a/arch/powerpc/kernel/hw_breakpoint.c
++++ b/arch/powerpc/kernel/hw_breakpoint.c
+@@@ -421,58 -477,52 +421,90 @@@ int hw_breakpoint_arch_parse(struct per
+  void thread_change_pc(struct task_struct *tsk, struct pt_regs *regs)
+  {
+  	struct arch_hw_breakpoint *info;
+ -	int i;
+  
+ -	for (i = 0; i < nr_wp_slots(); i++) {
+ -		if (unlikely(tsk->thread.last_hit_ubp[i]))
+ -			goto reset;
+ -	}
+ -	return;
+ +	if (likely(!tsk->thread.last_hit_ubp))
+ +		return;
+  
+ -reset:
+ +	info = counter_arch_bp(tsk->thread.last_hit_ubp);
+  	regs->msr &= ~MSR_SE;
+ -	for (i = 0; i < nr_wp_slots(); i++) {
+ -		info = counter_arch_bp(__this_cpu_read(bp_per_reg[i]));
+ -		__set_breakpoint(i, info);
+ -		tsk->thread.last_hit_ubp[i] = NULL;
+ -	}
+ +	__set_breakpoint(info);
+ +	tsk->thread.last_hit_ubp = NULL;
+ +}
+ +
+++<<<<<<< HEAD
+ +static bool dar_within_range(unsigned long dar, struct arch_hw_breakpoint *info)
+ +{
+ +	return ((info->address <= dar) && (dar - info->address < info->len));
+ +}
+ +
+ +static bool
+ +dar_range_overlaps(unsigned long dar, int size, struct arch_hw_breakpoint *info)
+ +{
+ +	return ((dar <= info->address + info->len - 1) &&
+ +		(dar + size - 1 >= info->address));
+  }
+  
+ +/*
+ + * Handle debug exception notifications.
+ + */
+ +static bool stepping_handler(struct pt_regs *regs, struct perf_event *bp,
+ +			     struct arch_hw_breakpoint *info)
+ +{
+ +	unsigned int instr = 0;
+ +	int ret, type, size;
+ +	struct instruction_op op;
+ +	unsigned long addr = info->address;
+ +
+ +	if (__get_user_inatomic(instr, (unsigned int *)regs->nip))
+ +		goto fail;
+ +
+ +	ret = analyse_instr(&op, regs, instr);
+ +	type = GETTYPE(op.type);
+ +	size = GETSIZE(op.type);
+ +
+ +	if (!ret && (type == LARX || type == STCX)) {
+ +		printk_ratelimited("Breakpoint hit on instruction that can't be emulated."
+ +				   " Breakpoint at 0x%lx will be disabled.\n", addr);
+ +		goto disable;
+ +	}
+ +
+ +	/*
+ +	 * If it's extraneous event, we still need to emulate/single-
+ +	 * step the instruction, but we don't generate an event.
+ +	 */
+ +	if (size && !dar_range_overlaps(regs->dar, size, info))
+ +		info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
+++=======
++ static bool is_larx_stcx_instr(int type)
++ {
++ 	return type == LARX || type == STCX;
++ }
++ 
++ /*
++  * We've failed in reliably handling the hw-breakpoint. Unregister
++  * it and throw a warning message to let the user know about it.
++  */
++ static void handler_error(struct perf_event *bp, struct arch_hw_breakpoint *info)
++ {
++ 	WARN(1, "Unable to handle hardware breakpoint. Breakpoint at 0x%lx will be disabled.",
++ 	     info->address);
++ 	perf_event_disable_inatomic(bp);
++ }
++ 
++ static void larx_stcx_err(struct perf_event *bp, struct arch_hw_breakpoint *info)
++ {
++ 	printk_ratelimited("Breakpoint hit on instruction that can't be emulated. Breakpoint at 0x%lx will be disabled.\n",
++ 			   info->address);
++ 	perf_event_disable_inatomic(bp);
++ }
++ 
++ static bool stepping_handler(struct pt_regs *regs, struct perf_event **bp,
++ 			     struct arch_hw_breakpoint **info, int *hit,
++ 			     struct ppc_inst instr)
++ {
++ 	int i;
++ 	int stepped;
+++>>>>>>> edc8dd99b29e (powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c)
+  
+  	/* Do not emulate user-space instructions, instead single-step them */
+  	if (user_mode(regs)) {
+@@@ -517,8 -576,37 +549,42 @@@ int hw_breakpoint_handler(struct die_ar
+  	 */
+  	rcu_read_lock();
+  
+++<<<<<<< HEAD
+ +	bp = __this_cpu_read(bp_per_reg);
+ +	if (!bp) {
+++=======
++ 	if (!IS_ENABLED(CONFIG_PPC_8xx))
++ 		wp_get_instr_detail(regs, &instr, &type, &size, &ea);
++ 
++ 	for (i = 0; i < nr_wp_slots(); i++) {
++ 		bp[i] = __this_cpu_read(bp_per_reg[i]);
++ 		if (!bp[i])
++ 			continue;
++ 
++ 		info[i] = counter_arch_bp(bp[i]);
++ 		info[i]->type &= ~HW_BRK_TYPE_EXTRANEOUS_IRQ;
++ 
++ 		if (wp_check_constraints(regs, instr, ea, type, size, info[i])) {
++ 			if (!IS_ENABLED(CONFIG_PPC_8xx) &&
++ 			    ppc_inst_equal(instr, ppc_inst(0))) {
++ 				handler_error(bp[i], info[i]);
++ 				info[i] = NULL;
++ 				err = 1;
++ 				continue;
++ 			}
++ 
++ 			if (is_ptrace_bp(bp[i]))
++ 				ptrace_bp = true;
++ 			hit[i] = 1;
++ 			nr_hit++;
++ 		}
++ 	}
++ 
++ 	if (err)
++ 		goto reset;
++ 
++ 	if (!nr_hit) {
+++>>>>>>> edc8dd99b29e (powerpc/watchpoint: Move DAWR detection logic outside of hw_breakpoint.c)
+  		rc = NOTIFY_DONE;
+  		goto out;
+  	}
+* Unmerged path arch/powerpc/include/asm/hw_breakpoint.h
+* Unmerged path arch/powerpc/kernel/Makefile
+* Unmerged path arch/powerpc/kernel/hw_breakpoint.c
+diff --git a/arch/powerpc/kernel/hw_breakpoint_constraints.c b/arch/powerpc/kernel/hw_breakpoint_constraints.c
+new file mode 100644
+index 000000000000..867ee4aa026a
+--- /dev/null
++++ b/arch/powerpc/kernel/hw_breakpoint_constraints.c
+@@ -0,0 +1,162 @@
++// SPDX-License-Identifier: GPL-2.0+
++#include <linux/kernel.h>
++#include <linux/uaccess.h>
++#include <linux/sched.h>
++#include <asm/hw_breakpoint.h>
++#include <asm/sstep.h>
++#include <asm/cache.h>
++
++static bool dar_in_user_range(unsigned long dar, struct arch_hw_breakpoint *info)
++{
++	return ((info->address <= dar) && (dar - info->address < info->len));
++}
++
++static bool ea_user_range_overlaps(unsigned long ea, int size,
++				   struct arch_hw_breakpoint *info)
++{
++	return ((ea < info->address + info->len) &&
++		(ea + size > info->address));
++}
++
++static bool dar_in_hw_range(unsigned long dar, struct arch_hw_breakpoint *info)
++{
++	unsigned long hw_start_addr, hw_end_addr;
++
++	hw_start_addr = ALIGN_DOWN(info->address, HW_BREAKPOINT_SIZE);
++	hw_end_addr = ALIGN(info->address + info->len, HW_BREAKPOINT_SIZE);
++
++	return ((hw_start_addr <= dar) && (hw_end_addr > dar));
++}
++
++static bool ea_hw_range_overlaps(unsigned long ea, int size,
++				 struct arch_hw_breakpoint *info)
++{
++	unsigned long hw_start_addr, hw_end_addr;
++	unsigned long align_size = HW_BREAKPOINT_SIZE;
++
++	/*
++	 * On p10 predecessors, quadword is handle differently then
++	 * other instructions.
++	 */
++	if (!cpu_has_feature(CPU_FTR_ARCH_31) && size == 16)
++		align_size = HW_BREAKPOINT_SIZE_QUADWORD;
++
++	hw_start_addr = ALIGN_DOWN(info->address, align_size);
++	hw_end_addr = ALIGN(info->address + info->len, align_size);
++
++	return ((ea < hw_end_addr) && (ea + size > hw_start_addr));
++}
++
++/*
++ * If hw has multiple DAWR registers, we also need to check all
++ * dawrx constraint bits to confirm this is _really_ a valid event.
++ * If type is UNKNOWN, but privilege level matches, consider it as
++ * a positive match.
++ */
++static bool check_dawrx_constraints(struct pt_regs *regs, int type,
++				    struct arch_hw_breakpoint *info)
++{
++	if (OP_IS_LOAD(type) && !(info->type & HW_BRK_TYPE_READ))
++		return false;
++
++	/*
++	 * The Cache Management instructions other than dcbz never
++	 * cause a match. i.e. if type is CACHEOP, the instruction
++	 * is dcbz, and dcbz is treated as Store.
++	 */
++	if ((OP_IS_STORE(type) || type == CACHEOP) && !(info->type & HW_BRK_TYPE_WRITE))
++		return false;
++
++	if (is_kernel_addr(regs->nip) && !(info->type & HW_BRK_TYPE_KERNEL))
++		return false;
++
++	if (user_mode(regs) && !(info->type & HW_BRK_TYPE_USER))
++		return false;
++
++	return true;
++}
++
++/*
++ * Return true if the event is valid wrt dawr configuration,
++ * including extraneous exception. Otherwise return false.
++ */
++bool wp_check_constraints(struct pt_regs *regs, struct ppc_inst instr,
++			  unsigned long ea, int type, int size,
++			  struct arch_hw_breakpoint *info)
++{
++	bool in_user_range = dar_in_user_range(regs->dar, info);
++	bool dawrx_constraints;
++
++	/*
++	 * 8xx supports only one breakpoint and thus we can
++	 * unconditionally return true.
++	 */
++	if (IS_ENABLED(CONFIG_PPC_8xx)) {
++		if (!in_user_range)
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++		return true;
++	}
++
++	if (unlikely(ppc_inst_equal(instr, ppc_inst(0)))) {
++		if (cpu_has_feature(CPU_FTR_ARCH_31) &&
++		    !dar_in_hw_range(regs->dar, info))
++			return false;
++
++		return true;
++	}
++
++	dawrx_constraints = check_dawrx_constraints(regs, type, info);
++
++	if (type == UNKNOWN) {
++		if (cpu_has_feature(CPU_FTR_ARCH_31) &&
++		    !dar_in_hw_range(regs->dar, info))
++			return false;
++
++		return dawrx_constraints;
++	}
++
++	if (ea_user_range_overlaps(ea, size, info))
++		return dawrx_constraints;
++
++	if (ea_hw_range_overlaps(ea, size, info)) {
++		if (dawrx_constraints) {
++			info->type |= HW_BRK_TYPE_EXTRANEOUS_IRQ;
++			return true;
++		}
++	}
++	return false;
++}
++
++static int cache_op_size(void)
++{
++#ifdef __powerpc64__
++	return ppc64_caches.l1d.block_size;
++#else
++	return L1_CACHE_BYTES;
++#endif
++}
++
++void wp_get_instr_detail(struct pt_regs *regs, struct ppc_inst *instr,
++			 int *type, int *size, unsigned long *ea)
++{
++	struct instruction_op op;
++
++	if (__get_user_instr_inatomic(*instr, (void __user *)regs->nip))
++		return;
++
++	analyse_instr(&op, regs, *instr);
++	*type = GETTYPE(op.type);
++	*ea = op.ea;
++#ifdef __powerpc64__
++	if (!(regs->msr & MSR_64BIT))
++		*ea &= 0xffffffffUL;
++#endif
++
++	*size = GETSIZE(op.type);
++	if (*type == CACHEOP) {
++		*size = cache_op_size();
++		*ea &= ~(*size - 1);
++	} else if (*type == LOAD_VMX || *type == STORE_VMX) {
++		*ea &= ~(*size - 1);
++	}
++}
