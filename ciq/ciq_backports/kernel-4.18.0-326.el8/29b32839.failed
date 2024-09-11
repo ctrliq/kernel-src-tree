@@ -1,0 +1,127 @@
+iommu/vt-d: Do not use flush-queue when caching-mode is on
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Nadav Amit <namit@vmware.com>
+commit 29b32839725f8c89a41cb6ee054c85f3116ea8b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/29b32839.failed
+
+When an Intel IOMMU is virtualized, and a physical device is
+passed-through to the VM, changes of the virtual IOMMU need to be
+propagated to the physical IOMMU. The hypervisor therefore needs to
+monitor PTE mappings in the IOMMU page-tables. Intel specifications
+provide "caching-mode" capability that a virtual IOMMU uses to report
+that the IOMMU is virtualized and a TLB flush is needed after mapping to
+allow the hypervisor to propagate virtual IOMMU mappings to the physical
+IOMMU. To the best of my knowledge no real physical IOMMU reports
+"caching-mode" as turned on.
+
+Synchronizing the virtual and the physical IOMMU tables is expensive if
+the hypervisor is unaware which PTEs have changed, as the hypervisor is
+required to walk all the virtualized tables and look for changes.
+Consequently, domain flushes are much more expensive than page-specific
+flushes on virtualized IOMMUs with passthrough devices. The kernel
+therefore exploited the "caching-mode" indication to avoid domain
+flushing and use page-specific flushing in virtualized environments. See
+commit 78d5f0f500e6 ("intel-iommu: Avoid global flushes with caching
+mode.")
+
+This behavior changed after commit 13cf01744608 ("iommu/vt-d: Make use
+of iova deferred flushing"). Now, when batched TLB flushing is used (the
+default), full TLB domain flushes are performed frequently, requiring
+the hypervisor to perform expensive synchronization between the virtual
+TLB and the physical one.
+
+Getting batched TLB flushes to use page-specific invalidations again in
+such circumstances is not easy, since the TLB invalidation scheme
+assumes that "full" domain TLB flushes are performed for scalability.
+
+Disable batched TLB flushes when caching-mode is on, as the performance
+benefit from using batched TLB invalidations is likely to be much
+smaller than the overhead of the virtual-to-physical IOMMU page-tables
+synchronization.
+
+Fixes: 13cf01744608 ("iommu/vt-d: Make use of iova deferred flushing")
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+	Cc: David Woodhouse <dwmw2@infradead.org>
+	Cc: Lu Baolu <baolu.lu@linux.intel.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Will Deacon <will@kernel.org>
+	Cc: stable@vger.kernel.org
+
+	Acked-by: Lu Baolu <baolu.lu@linux.intel.com>
+Link: https://lore.kernel.org/r/20210127175317.1600473-1-namit@vmware.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 29b32839725f8c89a41cb6ee054c85f3116ea8b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel/iommu.c
+diff --cc drivers/iommu/intel/iommu.c
+index 57ba53b4fb58,06b00b5363d8..000000000000
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@@ -6150,6 -5440,57 +6150,60 @@@ intel_iommu_domain_set_attr(struct iomm
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool domain_use_flush_queue(void)
++ {
++ 	struct dmar_drhd_unit *drhd;
++ 	struct intel_iommu *iommu;
++ 	bool r = true;
++ 
++ 	if (intel_iommu_strict)
++ 		return false;
++ 
++ 	/*
++ 	 * The flush queue implementation does not perform page-selective
++ 	 * invalidations that are required for efficient TLB flushes in virtual
++ 	 * environments. The benefit of batching is likely to be much lower than
++ 	 * the overhead of synchronizing the virtual and physical IOMMU
++ 	 * page-tables.
++ 	 */
++ 	rcu_read_lock();
++ 	for_each_active_iommu(iommu, drhd) {
++ 		if (!cap_caching_mode(iommu->cap))
++ 			continue;
++ 
++ 		pr_warn_once("IOMMU batching is disabled due to virtualization");
++ 		r = false;
++ 		break;
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return r;
++ }
++ 
++ static int
++ intel_iommu_domain_get_attr(struct iommu_domain *domain,
++ 			    enum iommu_attr attr, void *data)
++ {
++ 	switch (domain->type) {
++ 	case IOMMU_DOMAIN_UNMANAGED:
++ 		return -ENODEV;
++ 	case IOMMU_DOMAIN_DMA:
++ 		switch (attr) {
++ 		case DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE:
++ 			*(int *)data = domain_use_flush_queue();
++ 			return 0;
++ 		default:
++ 			return -ENODEV;
++ 		}
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
+++>>>>>>> 29b32839725f (iommu/vt-d: Do not use flush-queue when caching-mode is on)
+  /*
+   * Check that the device does not live on an external facing PCI port that is
+   * marked as untrusted. Such devices should not be able to apply quirks and
+* Unmerged path drivers/iommu/intel/iommu.c
