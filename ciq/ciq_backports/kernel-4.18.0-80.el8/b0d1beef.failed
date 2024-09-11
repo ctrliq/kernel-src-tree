@@ -1,0 +1,131 @@
+xdp: implement convert_to_xdp_frame for MEM_TYPE_ZERO_COPY
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit b0d1beeff2a97a0cf1965ea8f1d13b8973f22582
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/b0d1beef.failed
+
+This commit adds proper MEM_TYPE_ZERO_COPY support for
+convert_to_xdp_frame. Converting a MEM_TYPE_ZERO_COPY xdp_buff to an
+xdp_frame is done by transforming the MEM_TYPE_ZERO_COPY buffer into a
+MEM_TYPE_PAGE_ORDER0 frame. This is costly, and in the future it might
+make sense to implement a more sophisticated thread-safe alloc/free
+scheme for MEM_TYPE_ZERO_COPY, so that no allocation and copy is
+required in the fast-path.
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit b0d1beeff2a97a0cf1965ea8f1d13b8973f22582)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/xdp.c
+diff --cc net/core/xdp.c
+index 6771f1855b96,be6cb2f0e722..000000000000
+--- a/net/core/xdp.c
++++ b/net/core/xdp.c
+@@@ -371,3 -367,73 +371,76 @@@ void xdp_return_buff(struct xdp_buff *x
+  	__xdp_return(xdp->data, &xdp->rxq->mem, true, xdp->handle);
+  }
+  EXPORT_SYMBOL_GPL(xdp_return_buff);
+++<<<<<<< HEAD
+++=======
++ 
++ int xdp_attachment_query(struct xdp_attachment_info *info,
++ 			 struct netdev_bpf *bpf)
++ {
++ 	bpf->prog_id = info->prog ? info->prog->aux->id : 0;
++ 	bpf->prog_flags = info->prog ? info->flags : 0;
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(xdp_attachment_query);
++ 
++ bool xdp_attachment_flags_ok(struct xdp_attachment_info *info,
++ 			     struct netdev_bpf *bpf)
++ {
++ 	if (info->prog && (bpf->flags ^ info->flags) & XDP_FLAGS_MODES) {
++ 		NL_SET_ERR_MSG(bpf->extack,
++ 			       "program loaded with different flags");
++ 		return false;
++ 	}
++ 	return true;
++ }
++ EXPORT_SYMBOL_GPL(xdp_attachment_flags_ok);
++ 
++ void xdp_attachment_setup(struct xdp_attachment_info *info,
++ 			  struct netdev_bpf *bpf)
++ {
++ 	if (info->prog)
++ 		bpf_prog_put(info->prog);
++ 	info->prog = bpf->prog;
++ 	info->flags = bpf->flags;
++ }
++ EXPORT_SYMBOL_GPL(xdp_attachment_setup);
++ 
++ struct xdp_frame *xdp_convert_zc_to_xdp_frame(struct xdp_buff *xdp)
++ {
++ 	unsigned int metasize, headroom, totsize;
++ 	void *addr, *data_to_copy;
++ 	struct xdp_frame *xdpf;
++ 	struct page *page;
++ 
++ 	/* Clone into a MEM_TYPE_PAGE_ORDER0 xdp_frame. */
++ 	metasize = xdp_data_meta_unsupported(xdp) ? 0 :
++ 		   xdp->data - xdp->data_meta;
++ 	headroom = xdp->data - xdp->data_hard_start;
++ 	totsize = xdp->data_end - xdp->data + metasize;
++ 
++ 	if (sizeof(*xdpf) + totsize > PAGE_SIZE)
++ 		return NULL;
++ 
++ 	page = dev_alloc_page();
++ 	if (!page)
++ 		return NULL;
++ 
++ 	addr = page_to_virt(page);
++ 	xdpf = addr;
++ 	memset(xdpf, 0, sizeof(*xdpf));
++ 
++ 	addr += sizeof(*xdpf);
++ 	data_to_copy = metasize ? xdp->data_meta : xdp->data;
++ 	memcpy(addr, data_to_copy, totsize);
++ 
++ 	xdpf->data = addr + metasize;
++ 	xdpf->len = totsize - metasize;
++ 	xdpf->headroom = 0;
++ 	xdpf->metasize = metasize;
++ 	xdpf->mem.type = MEM_TYPE_PAGE_ORDER0;
++ 
++ 	xdp_return_buff(xdp);
++ 	return xdpf;
++ }
++ EXPORT_SYMBOL_GPL(xdp_convert_zc_to_xdp_frame);
+++>>>>>>> b0d1beeff2a9 (xdp: implement convert_to_xdp_frame for MEM_TYPE_ZERO_COPY)
+diff --git a/include/net/xdp.h b/include/net/xdp.h
+index 2be29dc0aee7..717467cbb7dd 100644
+--- a/include/net/xdp.h
++++ b/include/net/xdp.h
+@@ -91,6 +91,8 @@ static inline void xdp_scrub_frame(struct xdp_frame *frame)
+ 	frame->dev_rx = NULL;
+ }
+ 
++struct xdp_frame *xdp_convert_zc_to_xdp_frame(struct xdp_buff *xdp);
++
+ /* Convert xdp_buff to xdp_frame */
+ static inline
+ struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
+@@ -99,9 +101,8 @@ struct xdp_frame *convert_to_xdp_frame(struct xdp_buff *xdp)
+ 	int metasize;
+ 	int headroom;
+ 
+-	/* TODO: implement clone, copy, use "native" MEM_TYPE */
+ 	if (xdp->rxq->mem.type == MEM_TYPE_ZERO_COPY)
+-		return NULL;
++		return xdp_convert_zc_to_xdp_frame(xdp);
+ 
+ 	/* Assure headroom is available for storing info */
+ 	headroom = xdp->data - xdp->data_hard_start;
+* Unmerged path net/core/xdp.c
