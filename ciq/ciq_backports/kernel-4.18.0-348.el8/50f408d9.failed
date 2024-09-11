@@ -1,0 +1,220 @@
+x86/fpu/xstate: Add helpers for LBR dynamic supervisor feature
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-348.el8
+commit-author Kan Liang <kan.liang@linux.intel.com>
+commit 50f408d96d4d1a945d2c50c5fd8ed400883edf0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-348.el8/50f408d9.failed
+
+The perf subsystem will only need to save/restore the LBR state.
+However, the existing helpers save all supported supervisor states to a
+kernel buffer, which will be unnecessary. Two helpers are introduced to
+only save/restore requested dynamic supervisor states. The supervisor
+features in XFEATURE_MASK_SUPERVISOR_SUPPORTED and
+XFEATURE_MASK_SUPERVISOR_UNSUPPORTED mask cannot be saved/restored using
+these helpers.
+
+The helpers will be used in the following patch.
+
+	Signed-off-by: Kan Liang <kan.liang@linux.intel.com>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Dave Hansen <dave.hansen@intel.com>
+Link: https://lkml.kernel.org/r/1593780569-62993-22-git-send-email-kan.liang@linux.intel.com
+(cherry picked from commit 50f408d96d4d1a945d2c50c5fd8ed400883edf0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 401e69619a86,b0c22b7dae0a..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -1362,59 -1360,120 +1362,141 @@@ void copy_supervisor_to_kernel(struct x
+  			xstate_sizes[i]);
+  	}
+  }
+++<<<<<<< HEAD
+ +#ifdef CONFIG_IOMMU_SUPPORT
+ +void update_pasid(void)
+++=======
++ 
++ /**
++  * copy_dynamic_supervisor_to_kernel() - Save dynamic supervisor states to
++  *                                       an xsave area
++  * @xstate: A pointer to an xsave area
++  * @mask: Represent the dynamic supervisor features saved into the xsave area
++  *
++  * Only the dynamic supervisor states sets in the mask are saved into the xsave
++  * area (See the comment in XFEATURE_MASK_DYNAMIC for the details of dynamic
++  * supervisor feature). Besides the dynamic supervisor states, the legacy
++  * region and XSAVE header are also saved into the xsave area. The supervisor
++  * features in the XFEATURE_MASK_SUPERVISOR_SUPPORTED and
++  * XFEATURE_MASK_SUPERVISOR_UNSUPPORTED are not saved.
++  *
++  * The xsave area must be 64-bytes aligned.
++  */
++ void copy_dynamic_supervisor_to_kernel(struct xregs_state *xstate, u64 mask)
++ {
++ 	u64 dynamic_mask = xfeatures_mask_dynamic() & mask;
++ 	u32 lmask, hmask;
++ 	int err;
++ 
++ 	if (WARN_ON_FPU(!boot_cpu_has(X86_FEATURE_XSAVES)))
++ 		return;
++ 
++ 	if (WARN_ON_FPU(!dynamic_mask))
++ 		return;
++ 
++ 	lmask = dynamic_mask;
++ 	hmask = dynamic_mask >> 32;
++ 
++ 	XSTATE_OP(XSAVES, xstate, lmask, hmask, err);
++ 
++ 	/* Should never fault when copying to a kernel buffer */
++ 	WARN_ON_FPU(err);
++ }
++ 
++ /**
++  * copy_kernel_to_dynamic_supervisor() - Restore dynamic supervisor states from
++  *                                       an xsave area
++  * @xstate: A pointer to an xsave area
++  * @mask: Represent the dynamic supervisor features restored from the xsave area
++  *
++  * Only the dynamic supervisor states sets in the mask are restored from the
++  * xsave area (See the comment in XFEATURE_MASK_DYNAMIC for the details of
++  * dynamic supervisor feature). Besides the dynamic supervisor states, the
++  * legacy region and XSAVE header are also restored from the xsave area. The
++  * supervisor features in the XFEATURE_MASK_SUPERVISOR_SUPPORTED and
++  * XFEATURE_MASK_SUPERVISOR_UNSUPPORTED are not restored.
++  *
++  * The xsave area must be 64-bytes aligned.
++  */
++ void copy_kernel_to_dynamic_supervisor(struct xregs_state *xstate, u64 mask)
++ {
++ 	u64 dynamic_mask = xfeatures_mask_dynamic() & mask;
++ 	u32 lmask, hmask;
++ 	int err;
++ 
++ 	if (WARN_ON_FPU(!boot_cpu_has(X86_FEATURE_XSAVES)))
++ 		return;
++ 
++ 	if (WARN_ON_FPU(!dynamic_mask))
++ 		return;
++ 
++ 	lmask = dynamic_mask;
++ 	hmask = dynamic_mask >> 32;
++ 
++ 	XSTATE_OP(XRSTORS, xstate, lmask, hmask, err);
++ 
++ 	/* Should never fault when copying from a kernel buffer */
++ 	WARN_ON_FPU(err);
++ }
++ 
++ #ifdef CONFIG_PROC_PID_ARCH_STATUS
++ /*
++  * Report the amount of time elapsed in millisecond since last AVX512
++  * use in the task.
++  */
++ static void avx512_status(struct seq_file *m, struct task_struct *task)
+++>>>>>>> 50f408d96d4d (x86/fpu/xstate: Add helpers for LBR dynamic supervisor feature)
+  {
+ -	unsigned long timestamp = READ_ONCE(task->thread.fpu.avx512_timestamp);
+ -	long delta;
+ +	u64 pasid_state;
+ +	u32 pasid;
+  
+ -	if (!timestamp) {
+ -		/*
+ -		 * Report -1 if no AVX512 usage
+ -		 */
+ -		delta = -1;
+ -	} else {
+ -		delta = (long)(jiffies - timestamp);
+ -		/*
+ -		 * Cap to LONG_MAX if time difference > LONG_MAX
+ -		 */
+ -		if (delta < 0)
+ -			delta = LONG_MAX;
+ -		delta = jiffies_to_msecs(delta);
+ -	}
+ +	if (!cpu_feature_enabled(X86_FEATURE_ENQCMD))
+ +		return;
+  
+ -	seq_put_decimal_ll(m, "AVX512_elapsed_ms:\t", delta);
+ -	seq_putc(m, '\n');
+ -}
+ +	if (!current->mm)
+ +		return;
+ +
+ +	pasid = READ_ONCE(current->mm->pasid);
+ +	/* Set the valid bit in the PASID MSR/state only for valid pasid. */
+ +	pasid_state = pasid == PASID_DISABLED ?
+ +		      pasid : pasid | MSR_IA32_PASID_VALID;
+  
+ -/*
+ - * Report architecture specific information
+ - */
+ -int proc_pid_arch_status(struct seq_file *m, struct pid_namespace *ns,
+ -			struct pid *pid, struct task_struct *task)
+ -{
+  	/*
+ -	 * Report AVX512 state if the processor and build option supported.
+ +	 * No need to hold fregs_lock() since the task's fpstate won't
+ +	 * be changed by others (e.g. ptrace) while the task is being
+ +	 * switched to or is in IPI.
+  	 */
+ -	if (cpu_feature_enabled(X86_FEATURE_AVX512F))
+ -		avx512_status(m, task);
+ +	if (!test_thread_flag(TIF_NEED_FPU_LOAD)) {
+ +		/* The MSR is active and can be directly updated. */
+ +		wrmsrl(MSR_IA32_PASID, pasid_state);
+ +	} else {
+ +		struct fpu *fpu = &current->thread.fpu;
+ +		struct ia32_pasid_state *ppasid_state;
+ +		struct xregs_state *xsave;
+  
+ -	return 0;
+ +		/*
+ +		 * The CPU's xstate registers are not currently active. Just
+ +		 * update the PASID state in the memory buffer here. The
+ +		 * PASID MSR will be loaded when returning to user mode.
+ +		 */
+ +		xsave = &fpu->state.xsave;
+ +		xsave->header.xfeatures |= XFEATURE_MASK_PASID;
+ +		ppasid_state = get_xsave_addr(xsave, XFEATURE_PASID);
+ +		/*
+ +		 * Since XFEATURE_MASK_PASID is set in xfeatures, ppasid_state
+ +		 * won't be NULL and no need to check its value.
+ +		 *
+ +		 * Only update the task's PASID state when it's different
+ +		 * from the mm's pasid.
+ +		 */
+ +		if (ppasid_state->pasid != pasid_state) {
+ +			/*
+ +			 * Invalid fpregs so that state restoring will pick up
+ +			 * the PASID state.
+ +			 */
+ +			__fpu_invalidate_fpregs_state(fpu);
+ +			ppasid_state->pasid = pasid_state;
+ +		}
+ +	}
+  }
+ -#endif /* CONFIG_PROC_PID_ARCH_STATUS */
+ +#endif /* CONFIG_IOMMU_SUPPORT */
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index eb690e810b95..6f6c9c2a02c9 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -77,6 +77,9 @@ int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned i
+ int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+ int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
+ void copy_supervisor_to_kernel(struct xregs_state *xsave);
++void copy_dynamic_supervisor_to_kernel(struct xregs_state *xstate, u64 mask);
++void copy_kernel_to_dynamic_supervisor(struct xregs_state *xstate, u64 mask);
++
+ 
+ /* Validate an xstate header supplied by userspace (ptrace or sigreturn) */
+ int validate_user_xstate_header(const struct xstate_header *hdr);
+* Unmerged path arch/x86/kernel/fpu/xstate.c
