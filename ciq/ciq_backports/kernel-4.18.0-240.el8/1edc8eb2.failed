@@ -1,0 +1,70 @@
+fs: call fsnotify_sb_delete after evict_inodes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eric Sandeen <sandeen@redhat.com>
+commit 1edc8eb2e93130e36ac74ac9c80913815a57d413
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1edc8eb2.failed
+
+When a filesystem is unmounted, we currently call fsnotify_sb_delete()
+before evict_inodes(), which means that fsnotify_unmount_inodes()
+must iterate over all inodes on the superblock looking for any inodes
+with watches.  This is inefficient and can lead to livelocks as it
+iterates over many unwatched inodes.
+
+At this point, SB_ACTIVE is gone and dropping refcount to zero kicks
+the inode out out immediately, so anything processed by
+fsnotify_sb_delete / fsnotify_unmount_inodes gets evicted in that loop.
+
+After that, the call to evict_inodes will evict everything else with a
+zero refcount.
+
+This should speed things up overall, and avoid livelocks in
+fsnotify_unmount_inodes().
+
+	Signed-off-by: Eric Sandeen <sandeen@redhat.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 1edc8eb2e93130e36ac74ac9c80913815a57d413)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/super.c
+diff --cc fs/super.c
+index f3a8c008e164,cd352530eca9..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -442,10 -448,12 +442,16 @@@ void generic_shutdown_super(struct supe
+  		sync_filesystem(sb);
+  		sb->s_flags &= ~SB_ACTIVE;
+  
+++<<<<<<< HEAD
+ +		fsnotify_unmount_inodes(sb);
+++=======
+++>>>>>>> 1edc8eb2e931 (fs: call fsnotify_sb_delete after evict_inodes)
+  		cgroup_writeback_umount();
+  
++ 		/* evict all inodes with zero refcount */
+  		evict_inodes(sb);
++ 		/* only nonzero refcount inodes can have marks */
++ 		fsnotify_sb_delete(sb);
+  
+  		if (sb->s_dio_done_wq) {
+  			destroy_workqueue(sb->s_dio_done_wq);
+diff --git a/fs/notify/fsnotify.c b/fs/notify/fsnotify.c
+index 9f293affaa22..fd1e8c7393b7 100644
+--- a/fs/notify/fsnotify.c
++++ b/fs/notify/fsnotify.c
+@@ -70,6 +70,9 @@ void fsnotify_unmount_inodes(struct super_block *sb)
+ 		 * doing an __iget/iput with SB_ACTIVE clear would actually
+ 		 * evict all inodes with zero i_count from icache which is
+ 		 * unnecessarily violent and may in fact be illegal to do.
++		 * However, we should have been called /after/ evict_inodes
++		 * removed all zero refcount inodes, in any case.  Test to
++		 * be sure.
+ 		 */
+ 		if (!atomic_read(&inode->i_count)) {
+ 			spin_unlock(&inode->i_lock);
+* Unmerged path fs/super.c
