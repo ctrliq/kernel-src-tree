@@ -1,0 +1,160 @@
+arm64: perf: Don't register user access sysctl handler multiple times
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Will Deacon <will@kernel.org>
+commit 3da4390bcdf4dcea5eb7961f1ba05f75c642a39d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3da4390b.failed
+
+Commit e2012600810c ("arm64: perf: Add userspace counter access disable
+switch") introduced a new 'perf_user_access' sysctl file to enable and
+disable direct userspace access to the PMU counters. Sadly, Geert
+reports that on his big.LITTLE SoC ('Renesas Salvator-XS w/ R-Car H3'),
+the file is created for each PMU type probed, resulting in a splat
+during boot:
+
+  | hw perfevents: enabled with armv8_cortex_a53 PMU driver, 7 counters available
+  | sysctl duplicate entry: /kernel//perf_user_access
+  | CPU: 0 PID: 1 Comm: swapper/0 Not tainted 5.16.0-rc3-arm64-renesas-00003-ge2012600810c #1420
+  | Hardware name: Renesas Salvator-X 2nd version board based on r8a77951 (DT)
+  | Call trace:
+  |  dump_backtrace+0x0/0x190
+  |  show_stack+0x14/0x20
+  |  dump_stack_lvl+0x88/0xb0
+  |  dump_stack+0x14/0x2c
+  |  __register_sysctl_table+0x384/0x818
+  |  register_sysctl+0x20/0x28
+  |  armv8_pmu_init.constprop.0+0x118/0x150
+  |  armv8_a57_pmu_init+0x1c/0x28
+  |  arm_pmu_device_probe+0x1b4/0x558
+  |  armv8_pmu_device_probe+0x18/0x20
+  |  platform_probe+0x64/0xd0
+  |  hw perfevents: enabled with armv8_cortex_a57 PMU driver, 7 counters available
+
+Introduce a state variable to track creation of the sysctl file and
+ensure that it is only created once.
+
+	Reported-by: Geert Uytterhoeven <geert@linux-m68k.org>
+Fixes: e2012600810c ("arm64: perf: Add userspace counter access disable switch")
+Link: https://lore.kernel.org/r/CAMuHMdVcDxR9sGzc5pcnORiotonERBgc6dsXZXMd6wTvLGA9iw@mail.gmail.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 3da4390bcdf4dcea5eb7961f1ba05f75c642a39d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/perf_event.c
+diff --cc arch/arm64/kernel/perf_event.c
+index 7b0baffd784b,cab678ed6618..000000000000
+--- a/arch/arm64/kernel/perf_event.c
++++ b/arch/arm64/kernel/perf_event.c
+@@@ -1002,7 -1185,48 +1002,52 @@@ static int armv8pmu_probe_pmu(struct ar
+  	return probe.present ? 0 : -ENODEV;
+  }
+  
+++<<<<<<< HEAD
+ +static int armv8_pmu_init(struct arm_pmu *cpu_pmu)
+++=======
++ static void armv8pmu_disable_user_access_ipi(void *unused)
++ {
++ 	armv8pmu_disable_user_access();
++ }
++ 
++ static int armv8pmu_proc_user_access_handler(struct ctl_table *table, int write,
++ 		void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++ 	if (ret || !write || sysctl_perf_user_access)
++ 		return ret;
++ 
++ 	on_each_cpu(armv8pmu_disable_user_access_ipi, NULL, 1);
++ 	return 0;
++ }
++ 
++ static struct ctl_table armv8_pmu_sysctl_table[] = {
++ 	{
++ 		.procname       = "perf_user_access",
++ 		.data		= &sysctl_perf_user_access,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode           = 0644,
++ 		.proc_handler	= armv8pmu_proc_user_access_handler,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ 	{ }
++ };
++ 
++ static void armv8_pmu_register_sysctl_table(void)
++ {
++ 	static u32 tbl_registered = 0;
++ 
++ 	if (!cmpxchg_relaxed(&tbl_registered, 0, 1))
++ 		register_sysctl("kernel", armv8_pmu_sysctl_table);
++ }
++ 
++ static int armv8_pmu_init(struct arm_pmu *cpu_pmu, char *name,
++ 			  int (*map_event)(struct perf_event *event),
++ 			  const struct attribute_group *events,
++ 			  const struct attribute_group *format,
++ 			  const struct attribute_group *caps)
+++>>>>>>> 3da4390bcdf4 (arm64: perf: Don't register user access sysctl handler multiple times)
+  {
+  	int ret = armv8pmu_probe_pmu(cpu_pmu);
+  	if (ret)
+@@@ -1024,21 -1248,50 +1069,25 @@@
+  	return 0;
+  }
+  
+ -static int armv8_pmu_init_nogroups(struct arm_pmu *cpu_pmu, char *name,
+ -				   int (*map_event)(struct perf_event *event))
+ +static int armv8_pmuv3_init(struct arm_pmu *cpu_pmu)
+  {
+ -	return armv8_pmu_init(cpu_pmu, name, map_event, NULL, NULL, NULL);
+ -}
+ -
+ -#define PMUV3_INIT_SIMPLE(name)						\
+ -static int name##_pmu_init(struct arm_pmu *cpu_pmu)			\
+ -{									\
+ -	return armv8_pmu_init_nogroups(cpu_pmu, #name, armv8_pmuv3_map_event);\
+ -}
+ -
+ -PMUV3_INIT_SIMPLE(armv8_pmuv3)
+ +	int ret = armv8_pmu_init(cpu_pmu);
+ +	if (ret)
+ +		return ret;
+  
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a34)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a55)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a65)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a75)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a76)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a77)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_a78)
+ -PMUV3_INIT_SIMPLE(armv9_cortex_a510)
+ -PMUV3_INIT_SIMPLE(armv9_cortex_a710)
+ -PMUV3_INIT_SIMPLE(armv8_cortex_x1)
+ -PMUV3_INIT_SIMPLE(armv9_cortex_x2)
+ -PMUV3_INIT_SIMPLE(armv8_neoverse_e1)
+ -PMUV3_INIT_SIMPLE(armv8_neoverse_n1)
+ -PMUV3_INIT_SIMPLE(armv9_neoverse_n2)
+ -PMUV3_INIT_SIMPLE(armv8_neoverse_v1)
+++<<<<<<< HEAD
+ +	cpu_pmu->name			= "armv8_pmuv3";
+ +	cpu_pmu->map_event		= armv8_pmuv3_map_event;
+ +	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] =
+ +		&armv8_pmuv3_events_attr_group;
+ +	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] =
+ +		&armv8_pmuv3_format_attr_group;
+  
+ -PMUV3_INIT_SIMPLE(armv8_nvidia_carmel)
+ -PMUV3_INIT_SIMPLE(armv8_nvidia_denver)
+++=======
+++	armv8_pmu_register_sysctl_table();
+++>>>>>>> 3da4390bcdf4 (arm64: perf: Don't register user access sysctl handler multiple times)
+ +	return 0;
+ +}
+  
+  static int armv8_a35_pmu_init(struct arm_pmu *cpu_pmu)
+  {
+* Unmerged path arch/arm64/kernel/perf_event.c
