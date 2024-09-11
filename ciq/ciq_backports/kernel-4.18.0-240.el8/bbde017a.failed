@@ -1,0 +1,275 @@
+io_uring: add memory barrier to synchronize io_kiocb's result and iopoll_completed
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit bbde017a32b32d2fa8d5fddca25fade20132abf8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bbde017a.failed
+
+In io_complete_rw_iopoll(), stores to io_kiocb's result and iopoll
+completed are two independent store operations, to ensure that once
+iopoll_completed is ture and then req->result must been perceived by
+the cpu executing io_do_iopoll(), proper memory barrier should be used.
+
+And in io_do_iopoll(), we check whether req->result is EAGAIN, if it is,
+we'll need to issue this io request using io-wq again. In order to just
+issue a single smp_rmb() on the completion side, move the re-submit work
+to io_iopoll_complete().
+
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+[axboe: don't set ->iopoll_completed for -EAGAIN retry]
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit bbde017a32b32d2fa8d5fddca25fade20132abf8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 0b681a205810,9d2ae9aa8b45..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -694,62 -1648,155 +694,84 @@@ static void io_put_req(struct io_kiocb 
+  		io_free_req(req);
+  }
+  
+ -static void io_steal_work(struct io_kiocb *req,
+ -			  struct io_wq_work **workptr)
+ +static unsigned io_cqring_events(struct io_cq_ring *ring)
+  {
+ -	/*
+ -	 * It's in an io-wq worker, so there always should be at least
+ -	 * one reference, which will be dropped in io_put_work() just
+ -	 * after the current handler returns.
+ -	 *
+ -	 * It also means, that if the counter dropped to 1, then there is
+ -	 * no asynchronous users left, so it's safe to steal the next work.
+ -	 */
+ -	if (refcount_read(&req->refs) == 1) {
+ -		struct io_kiocb *nxt = NULL;
+ -
+ -		io_req_find_next(req, &nxt);
+ -		if (nxt)
+ -			io_wq_assign_next(workptr, nxt);
+ -	}
+ +	/* See comment at the top of this file */
+ +	smp_rmb();
+ +	return READ_ONCE(ring->r.tail) - READ_ONCE(ring->r.head);
+  }
+  
+ -/*
+ - * Must only be used if we don't need to care about links, usually from
+ - * within the completion handling itself.
+ - */
+ -static void __io_double_put_req(struct io_kiocb *req)
+++static void io_iopoll_queue(struct list_head *again)
++ {
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		__io_free_req(req);
+ -}
+++	struct io_kiocb *req;
++ 
+ -static void io_double_put_req(struct io_kiocb *req)
+ -{
+ -	/* drop both submit and complete references */
+ -	if (refcount_sub_and_test(2, &req->refs))
+ -		io_free_req(req);
+++	do {
+++		req = list_first_entry(again, struct io_kiocb, list);
+++		list_del(&req->list);
+++		refcount_inc(&req->refs);
+++		io_queue_async_work(req);
+++	} while (!list_empty(again));
++ }
++ 
+ -static unsigned io_cqring_events(struct io_ring_ctx *ctx, bool noflush)
+ +/*
+ + * Find and free completed poll iocbs
+ + */
+ +static void io_iopoll_complete(struct io_ring_ctx *ctx, unsigned int *nr_events,
+ +			       struct list_head *done)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	if (test_bit(0, &ctx->cq_check_overflow)) {
+ -		/*
+ -		 * noflush == true is from the waitqueue handler, just ensure
+ -		 * we wake up the task, and the next invocation will flush the
+ -		 * entries. We cannot safely to it from here.
+ -		 */
+ -		if (noflush && !list_empty(&ctx->cq_overflow_list))
+ -			return -1U;
+ -
+ -		io_cqring_overflow_flush(ctx, false);
+ -	}
+ -
+ -	/* See comment at the top of this file */
+ -	smp_rmb();
+ -	return ctx->cached_cq_tail - READ_ONCE(rings->cq.head);
+ -}
+ -
+ -static inline unsigned int io_sqring_entries(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_rings *rings = ctx->rings;
+ -
+ -	/* make sure SQ entry isn't read before tail */
+ -	return smp_load_acquire(&rings->sq.tail) - ctx->cached_sq_head;
+ -}
+ -
+ -static inline bool io_req_multi_free(struct req_batch *rb, struct io_kiocb *req)
+ -{
+ -	if ((req->flags & REQ_F_LINK_HEAD) || io_is_fallback_req(req))
+ -		return false;
+ -
+ -	if (req->file || req->io)
+ -		rb->need_iter++;
+ -
+ -	rb->reqs[rb->to_free++] = req;
+ -	if (unlikely(rb->to_free == ARRAY_SIZE(rb->reqs)))
+ -		io_free_req_many(req->ctx, rb);
+ -	return true;
+ -}
+ -
+ -static int io_put_kbuf(struct io_kiocb *req)
+ -{
+ -	struct io_buffer *kbuf;
+ -	int cflags;
+ -
+ -	kbuf = (struct io_buffer *) (unsigned long) req->rw.addr;
+ -	cflags = kbuf->bid << IORING_CQE_BUFFER_SHIFT;
+ -	cflags |= IORING_CQE_F_BUFFER;
+ -	req->rw.addr = 0;
+ -	kfree(kbuf);
+ -	return cflags;
+ -}
+ -
+ -static void io_iopoll_queue(struct list_head *again)
+ -{
+ -	struct io_kiocb *req;
+ -
+ -	do {
+ -		req = list_first_entry(again, struct io_kiocb, list);
+ -		list_del(&req->list);
+ -		refcount_inc(&req->refs);
+ -		io_queue_async_work(req);
+ -	} while (!list_empty(again));
+ -}
+ -
+ -/*
+ - * Find and free completed poll iocbs
+ - */
+ -static void io_iopoll_complete(struct io_ring_ctx *ctx, unsigned int *nr_events,
+ -			       struct list_head *done)
+ -{
+ -	struct req_batch rb;
+ +	void *reqs[IO_IOPOLL_BATCH];
+  	struct io_kiocb *req;
+++<<<<<<< HEAD
+ +	int to_free;
+++=======
++ 	LIST_HEAD(again);
++ 
++ 	/* order with ->result store in io_complete_rw_iopoll() */
++ 	smp_rmb();
+++>>>>>>> bbde017a32b3 (io_uring: add memory barrier to synchronize io_kiocb's result and iopoll_completed)
+  
+ -	rb.to_free = rb.need_iter = 0;
+ +	to_free = 0;
+  	while (!list_empty(done)) {
+ -		int cflags = 0;
+ -
+  		req = list_first_entry(done, struct io_kiocb, list);
++ 		if (READ_ONCE(req->result) == -EAGAIN) {
++ 			req->iopoll_completed = 0;
++ 			list_move_tail(&req->list, &again);
++ 			continue;
++ 		}
+  		list_del(&req->list);
+  
+ -		if (req->flags & REQ_F_BUFFER_SELECTED)
+ -			cflags = io_put_kbuf(req);
+ -
+ -		__io_cqring_fill_event(req, req->result, cflags);
+ +		io_cqring_fill_event(ctx, req->user_data, req->result);
+  		(*nr_events)++;
+  
+ -		if (refcount_dec_and_test(&req->refs) &&
+ -		    !io_req_multi_free(&rb, req))
+ -			io_free_req(req);
+ +		if (refcount_dec_and_test(&req->refs)) {
+ +			/* If we're not using fixed files, we have to pair the
+ +			 * completion part with the file put. Use regular
+ +			 * completions for those, only batch free for fixed
+ +			 * file and non-linked commands.
+ +			 */
+ +			if ((req->flags & (REQ_F_FIXED_FILE|REQ_F_LINK)) ==
+ +			    REQ_F_FIXED_FILE) {
+ +				reqs[to_free++] = req;
+ +				if (to_free == ARRAY_SIZE(reqs))
+ +					io_free_req_many(ctx, reqs, &to_free);
+ +			} else {
+ +				io_free_req(req);
+ +			}
+ +		}
+  	}
+  
+  	io_commit_cqring(ctx);
+++<<<<<<< HEAD
+ +	io_free_req_many(ctx, reqs, &to_free);
+ +}
+++=======
++ 	if (ctx->flags & IORING_SETUP_SQPOLL)
++ 		io_cqring_ev_posted(ctx);
++ 	io_free_req_many(ctx, &rb);
+++>>>>>>> bbde017a32b3 (io_uring: add memory barrier to synchronize io_kiocb's result and iopoll_completed)
+  
+- static void io_iopoll_queue(struct list_head *again)
+- {
+- 	struct io_kiocb *req;
+- 
+- 	do {
+- 		req = list_first_entry(again, struct io_kiocb, list);
+- 		list_del(&req->list);
+- 		refcount_inc(&req->refs);
+- 		io_queue_async_work(req);
+- 	} while (!list_empty(again));
++ 	if (!list_empty(&again))
++ 		io_iopoll_queue(&again);
+  }
+  
+  static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
+@@@ -932,15 -1984,20 +943,27 @@@ static void io_complete_rw(struct kioc
+  
+  static void io_complete_rw_iopoll(struct kiocb *kiocb, long res, long res2)
+  {
+ -	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw.kiocb);
+ +	struct io_kiocb *req = container_of(kiocb, struct io_kiocb, rw);
+  
+ -	if (kiocb->ki_flags & IOCB_WRITE)
+ -		kiocb_end_write(req);
+ +	kiocb_end_write(kiocb);
+  
+++<<<<<<< HEAD
+ +	if ((req->flags & REQ_F_LINK) && res != req->result)
+ +		req->flags |= REQ_F_FAIL_LINK;
+ +	req->result = res;
+ +	if (res != -EAGAIN)
+ +		req->flags |= REQ_F_IOPOLL_COMPLETED;
+++=======
++ 	if (res != -EAGAIN && res != req->result)
++ 		req_set_fail_links(req);
++ 
++ 	WRITE_ONCE(req->result, res);
++ 	/* order with io_poll_complete() checking ->result */
++ 	if (res != -EAGAIN) {
++ 		smp_wmb();
++ 		WRITE_ONCE(req->iopoll_completed, 1);
++ 	}
+++>>>>>>> bbde017a32b3 (io_uring: add memory barrier to synchronize io_kiocb's result and iopoll_completed)
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
