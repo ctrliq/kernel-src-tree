@@ -1,0 +1,124 @@
+arm64: simplify ptrauth initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit 62a679cb2825488387f458c16dff32be41eb3d32
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/62a679cb.failed
+
+Currently __cpu_setup conditionally initializes the address
+authentication keys and enables them in SCTLR_EL1, doing so differently
+for the primary CPU and secondary CPUs, and skipping this work for CPUs
+returning from an idle state. For the latter case, cpu_do_resume
+restores the keys and SCTLR_EL1 value after the MMU has been enabled.
+
+This flow is rather difficult to follow, so instead let's move the
+primary and secondary CPU initialization into their respective boot
+paths. By following the example of cpu_do_resume and doing so once the
+MMU is enabled, we can always initialize the keys from the values in
+thread_struct, and avoid the machinery necessary to pass the keys in
+secondary_data or open-coding initialization for the boot CPU.
+
+This means we perform an additional RMW of SCTLR_EL1, but we already do
+this in the cpu_do_resume path, and for other features in cpufeature.c,
+so this isn't a major concern in a bringup path. Note that even while
+the enable bits are clear, the key registers are accessible.
+
+As this now renders the argument to __cpu_setup redundant, let's also
+remove that entirely. Future extensions can follow a similar approach to
+initialize values that differ for primary/secondary CPUs.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Tested-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+	Reviewed-by: Amit Daniel Kachhap <amit.kachhap@arm.com>
+	Cc: Amit Daniel Kachhap <amit.kachhap@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: James Morse <james.morse@arm.com>
+	Cc: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Cc: Will Deacon <will@kernel.org>
+Link: https://lore.kernel.org/r/20200423101606.37601-3-mark.rutland@arm.com
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 62a679cb2825488387f458c16dff32be41eb3d32)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/asm_pointer_auth.h
+#	arch/arm64/mm/proc.S
+diff --cc arch/arm64/mm/proc.S
+index 768b1405972d,7d3bf1afba0c..000000000000
+--- a/arch/arm64/mm/proc.S
++++ b/arch/arm64/mm/proc.S
+@@@ -420,11 -384,13 +420,18 @@@ ENDPROC(idmap_kpti_install_ng_mappings
+  /*
+   *	__cpu_setup
+   *
+++<<<<<<< HEAD
+ + *	Initialise the processor for turning the MMU on.  Return in x0 the
+ + *	value of the SCTLR_EL1 register.
+++=======
++  *	Initialise the processor for turning the MMU on.
++  *
++  * Output:
++  *	Return in x0 the value of the SCTLR_EL1 register.
+++>>>>>>> 62a679cb2825 (arm64: simplify ptrauth initialization)
+   */
+  	.pushsection ".idmap.text", "awx"
+ -SYM_FUNC_START(__cpu_setup)
+ +ENTRY(__cpu_setup)
+  	tlbi	vmalle1				// Invalidate local TLB
+  	dsb	nsh
+  
+@@@ -482,5 -444,9 +489,12 @@@
+  1:
+  #endif	/* CONFIG_ARM64_HW_AFDBM */
+  	msr	tcr_el1, x10
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * Prepare SCTLR
++ 	 */
++ 	mov_q	x0, SCTLR_EL1_SET
+++>>>>>>> 62a679cb2825 (arm64: simplify ptrauth initialization)
+  	ret					// return to head.S
+ -SYM_FUNC_END(__cpu_setup)
+ +ENDPROC(__cpu_setup)
+* Unmerged path arch/arm64/include/asm/asm_pointer_auth.h
+* Unmerged path arch/arm64/include/asm/asm_pointer_auth.h
+diff --git a/arch/arm64/kernel/head.S b/arch/arm64/kernel/head.S
+index da8499d7eefb..49230391ab4f 100644
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@ -24,6 +24,7 @@
+ #include <linux/init.h>
+ #include <linux/irqchip/arm-gic-v3.h>
+ 
++#include <asm/asm_pointer_auth.h>
+ #include <asm/assembler.h>
+ #include <asm/boot.h>
+ #include <asm/ptrace.h>
+@@ -425,6 +426,10 @@ __primary_switched:
+ 	adr_l	x5, init_task
+ 	msr	sp_el0, x5			// Save thread_info
+ 
++#ifdef CONFIG_ARM64_PTR_AUTH
++	__ptrauth_keys_init_cpu	x5, x6, x7, x8
++#endif
++
+ 	adr_l	x8, vectors			// load VBAR_EL1 with virtual
+ 	msr	vbar_el1, x8			// vector table address
+ 	isb
+@@ -746,6 +751,11 @@ __secondary_switched:
+ 	msr	sp_el0, x2
+ 	mov	x29, #0
+ 	mov	x30, #0
++
++#ifdef CONFIG_ARM64_PTR_AUTH
++	ptrauth_keys_init_cpu x2, x3, x4, x5
++#endif
++
+ 	b	secondary_start_kernel
+ ENDPROC(__secondary_switched)
+ 
+* Unmerged path arch/arm64/mm/proc.S
