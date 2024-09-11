@@ -1,0 +1,615 @@
+devlink: move request_firmware out of driver
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jacob Keller <jacob.e.keller@intel.com>
+commit b44cfd4f5b912454387a4bf735d42eb4e7078ca8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b44cfd4f.failed
+
+All drivers which implement the devlink flash update support, with the
+exception of netdevsim, use either request_firmware or
+request_firmware_direct to locate the firmware file. Rather than having
+each driver do this separately as part of its .flash_update
+implementation, perform the request_firmware within net/core/devlink.c
+
+Replace the file_name parameter in the struct devlink_flash_update_params
+with a pointer to the fw object.
+
+Use request_firmware rather than request_firmware_direct. Although most
+Linux distributions today do not have the fallback mechanism
+implemented, only about half the drivers used the _direct request, as
+compared to the generic request_firmware. In the event that
+a distribution does support the fallback mechanism, the devlink flash
+update ought to be able to use it to provide the firmware contents. For
+distributions which do not support the fallback userspace mechanism,
+there should be essentially no difference between request_firmware and
+request_firmware_direct.
+
+	Signed-off-by: Jacob Keller <jacob.e.keller@intel.com>
+	Acked-by: Shannon Nelson <snelson@pensando.io>
+	Acked-by: Vasundhara Volam <vasundhara-v.volam@broadcom.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit b44cfd4f5b912454387a4bf735d42eb4e7078ca8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+#	drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+#	drivers/net/ethernet/intel/ice/ice_devlink.c
+#	drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+#	drivers/net/ethernet/mellanox/mlxsw/core.c
+#	drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+#	drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+#	include/net/devlink.h
+#	net/core/devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 3a854195d5b0,4ebae8a236fd..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -33,15 -31,12 +33,20 @@@ bnxt_dl_flash_update(struct devlink *dl
+  	}
+  
+  	devlink_flash_update_begin_notify(dl);
+++<<<<<<< HEAD
+ +	devlink_flash_update_status_notify(dl, "Preparing to flash", region, 0,
+ +					   0);
+ +	rc = bnxt_flash_package_from_file(bp->dev, filename, 0);
+++=======
++ 	devlink_flash_update_status_notify(dl, "Preparing to flash", NULL, 0, 0);
++ 	rc = bnxt_flash_package_from_fw_obj(bp->dev, params->fw, 0);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  	if (!rc)
+ -		devlink_flash_update_status_notify(dl, "Flashing done", NULL, 0, 0);
+ +		devlink_flash_update_status_notify(dl, "Flashing done", region,
+ +						   0, 0);
+  	else
+ -		devlink_flash_update_status_notify(dl, "Flashing failed", NULL, 0, 0);
+ +		devlink_flash_update_status_notify(dl, "Flashing failed",
+ +						   region, 0, 0);
+  	devlink_flash_update_end_notify(dl);
+  	return rc;
+  }
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+index 34f44ddfad79,0a57cb6a4a4b..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+@@@ -92,8 -92,10 +92,15 @@@ u32 bnxt_get_rxfh_indir_size(struct net
+  u32 _bnxt_fw_to_ethtool_adv_spds(u16, u8);
+  u32 bnxt_fw_to_ethtool_speed(u16);
+  u16 bnxt_get_fw_auto_link_speeds(u32);
+++<<<<<<< HEAD
+ +int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
+ +				 u32 install_type);
+++=======
++ int bnxt_hwrm_nvm_get_dev_info(struct bnxt *bp,
++ 			       struct hwrm_nvm_get_dev_info_output *nvm_dev_info);
++ int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware *fw,
++ 				   u32 install_type);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  void bnxt_ethtool_init(struct bnxt *bp);
+  void bnxt_ethtool_free(struct bnxt *bp);
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_devlink.c
+index eed153081c7a,0036d3e7df0b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@@ -243,18 -242,29 +243,21 @@@ static int ice_devlink_info_get(struct 
+   * Returns: zero on success, or an error code on failure.
+   */
+  static int
+ -ice_devlink_flash_update(struct devlink *devlink,
+ -			 struct devlink_flash_update_params *params,
+ -			 struct netlink_ext_ack *extack)
+ +ice_devlink_flash_update(struct devlink *devlink, const char *path,
+ +			 const char *component, struct netlink_ext_ack *extack)
+  {
+  	struct ice_pf *pf = devlink_priv(devlink);
+- 	struct device *dev = &pf->pdev->dev;
+  	struct ice_hw *hw = &pf->hw;
+++<<<<<<< HEAD
+ +	const struct firmware *fw;
+++=======
++ 	u8 preservation;
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  	int err;
+  
+ -	if (!params->overwrite_mask) {
+ -		/* preserve all settings and identifiers */
+ -		preservation = ICE_AQC_NVM_PRESERVE_ALL;
+ -	} else if (params->overwrite_mask == DEVLINK_FLASH_OVERWRITE_SETTINGS) {
+ -		/* overwrite settings, but preserve the vital device identifiers */
+ -		preservation = ICE_AQC_NVM_PRESERVE_SELECTED;
+ -	} else if (params->overwrite_mask == (DEVLINK_FLASH_OVERWRITE_SETTINGS |
+ -					      DEVLINK_FLASH_OVERWRITE_IDENTIFIERS)) {
+ -		/* overwrite both settings and identifiers, preserve nothing */
+ -		preservation = ICE_AQC_NVM_NO_PRESERVATION;
+ -	} else {
+ -		NL_SET_ERR_MSG_MOD(extack, "Requested overwrite mask is not supported");
+ +	/* individual component update is not yet supported */
+ +	if (component)
+  		return -EOPNOTSUPP;
+ -	}
+  
+  	if (!hw->dev_caps.common_cap.nvm_unified_update) {
+  		NL_SET_ERR_MSG_MOD(extack, "Current firmware does not support unified update");
+@@@ -265,22 -275,11 +268,26 @@@
+  	if (err)
+  		return err;
+  
+++<<<<<<< HEAD
+ +	err = request_firmware(&fw, path, dev);
+ +	if (err) {
+ +		NL_SET_ERR_MSG_MOD(extack, "Unable to read file from disk");
+ +		return err;
+ +	}
+ +
+ +	dev_dbg(dev, "Beginning flash update with file '%s'\n", params->file_name);
+ +
+ +	devlink_flash_update_begin_notify(devlink);
+ +	devlink_flash_update_status_notify(devlink, "Preparing to flash",
+ +					   component, 0, 0);
+ +	err = ice_flash_pldm_image(pf, fw, extack);
+++=======
++ 	devlink_flash_update_begin_notify(devlink);
++ 	devlink_flash_update_status_notify(devlink, "Preparing to flash", NULL, 0, 0);
++ 	err = ice_flash_pldm_image(pf, params->fw, preservation, extack);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  	devlink_flash_update_end_notify(devlink);
+  
+- 	release_firmware(fw);
+- 
+  	return err;
+  }
+  
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+index fcd4875639de,e2ed341648e4..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@@ -13,20 -13,8 +13,22 @@@ static int mlx5_devlink_flash_update(st
+  				     struct netlink_ext_ack *extack)
+  {
+  	struct mlx5_core_dev *dev = devlink_priv(devlink);
+- 	const struct firmware *fw;
+- 	int err;
+  
+++<<<<<<< HEAD
+ +	if (component)
+ +		return -EOPNOTSUPP;
+ +
+ +	err = request_firmware_direct(&fw, file_name, &dev->pdev->dev);
+ +	if (err)
+ +		return err;
+ +
+ +	err = mlx5_firmware_flash(dev, fw, extack);
+ +	release_firmware(fw);
+ +
+ +	return err;
+++=======
++ 	return mlx5_firmware_flash(dev, params->fw, extack);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  }
+  
+  static u8 mlx5_fw_ver_major(u32 version)
+diff --cc drivers/net/ethernet/mellanox/mlxsw/core.c
+index 4238bb46a635,630109f139a0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@@ -1114,22 -1114,10 +1114,26 @@@ static int mlxsw_core_fw_rev_validate(s
+  }
+  
+  static int mlxsw_core_fw_flash_update(struct mlxsw_core *mlxsw_core,
+ -				      struct devlink_flash_update_params *params,
+ +				      const char *file_name, const char *component,
+  				      struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	const struct firmware *firmware;
+ +	int err;
+ +
+ +	if (component)
+ +		return -EOPNOTSUPP;
+ +
+ +	err = request_firmware_direct(&firmware, file_name, mlxsw_core->bus_info->dev);
+ +	if (err)
+ +		return err;
+ +	err = mlxsw_core_fw_flash(mlxsw_core, firmware, extack);
+ +	release_firmware(firmware);
+ +
+ +	return err;
+++=======
++ 	return mlxsw_core_fw_flash(mlxsw_core, params->fw, extack);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  }
+  
+  static int mlxsw_core_devlink_param_fw_load_policy_validate(struct devlink *devlink, u32 id,
+diff --cc drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+index be52510d446b,713ee3041d49..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+@@@ -329,12 -329,11 +329,16 @@@ err_close_nsp
+  }
+  
+  static int
+ -nfp_devlink_flash_update(struct devlink *devlink,
+ -			 struct devlink_flash_update_params *params,
+ -			 struct netlink_ext_ack *extack)
+ +nfp_devlink_flash_update(struct devlink *devlink, const char *path,
+ +			 const char *component, struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	if (component)
+ +		return -EOPNOTSUPP;
+ +	return nfp_flash_update_common(devlink_priv(devlink), path, extack);
+++=======
++ 	return nfp_flash_update_common(devlink_priv(devlink), params->fw, extack);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  }
+  
+  const struct devlink_ops nfp_devlink_ops = {
+diff --cc drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+index 5348f05ebc32,b41301a5b0df..000000000000
+--- a/drivers/net/ethernet/pensando/ionic/ionic_devlink.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+@@@ -16,10 -15,7 +16,14 @@@ static int ionic_dl_flash_update(struc
+  {
+  	struct ionic *ionic = devlink_priv(dl);
+  
+++<<<<<<< HEAD
+ +	if (component)
+ +		return -EOPNOTSUPP;
+ +
+ +	return ionic_firmware_update(ionic->lif, fwname, extack);
+++=======
++ 	return ionic_firmware_update(ionic->lif, params->fw, extack);
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  }
+  
+  static int ionic_dl_info_get(struct devlink *dl, struct devlink_info_req *req,
+diff --cc include/net/devlink.h
+index afa4470aeeea,d1d125a33322..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -23,7 -19,16 +23,8 @@@
+  #include <net/flow_offload.h>
+  #include <uapi/linux/devlink.h>
+  #include <linux/xarray.h>
++ #include <linux/firmware.h>
+  
+ -#define DEVLINK_RELOAD_STATS_ARRAY_SIZE \
+ -	(__DEVLINK_RELOAD_LIMIT_MAX * __DEVLINK_RELOAD_ACTION_MAX)
+ -
+ -struct devlink_dev_stats {
+ -	u32 reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
+ -	u32 remote_reload_stats[DEVLINK_RELOAD_STATS_ARRAY_SIZE];
+ -};
+ -
+  struct devlink_ops;
+  
+  struct devlink {
+@@@ -550,6 -565,24 +551,27 @@@ enum devlink_param_generic_id 
+  /* Firmware bundle identifier */
+  #define DEVLINK_INFO_VERSION_GENERIC_FW_BUNDLE_ID	"fw.bundle_id"
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * struct devlink_flash_update_params - Flash Update parameters
++  * @fw: pointer to the firmware data to update from
++  * @component: the flash component to update
++  *
++  * With the exception of fw, drivers must opt-in to parameters by
++  * setting the appropriate bit in the supported_flash_update_params field in
++  * their devlink_ops structure.
++  */
++ struct devlink_flash_update_params {
++ 	const struct firmware *fw;
++ 	const char *component;
++ 	u32 overwrite_mask;
++ };
++ 
++ #define DEVLINK_SUPPORT_FLASH_UPDATE_COMPONENT		BIT(0)
++ #define DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK	BIT(1)
++ 
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  struct devlink_region;
+  struct devlink_info_req;
+  
+diff --cc net/core/devlink.c
+index f205b9e289c8,7c5a5da8e338..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -3153,22 -3431,57 +3153,65 @@@ EXPORT_SYMBOL_GPL(devlink_flash_update_
+  static int devlink_nl_cmd_flash_update(struct sk_buff *skb,
+  				       struct genl_info *info)
+  {
+++<<<<<<< HEAD
+ +	struct devlink *devlink = info->user_ptr[0];
+ +	const char *file_name, *component;
+ +	struct nlattr *nla_component;
+++=======
++ 	struct nlattr *nla_component, *nla_overwrite_mask, *nla_file_name;
++ 	struct devlink_flash_update_params params = {};
++ 	struct devlink *devlink = info->user_ptr[0];
++ 	const char *file_name;
++ 	u32 supported_params;
++ 	int ret;
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  
+  	if (!devlink->ops->flash_update)
+  		return -EOPNOTSUPP;
+  
+  	if (!info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME])
+  		return -EINVAL;
+++<<<<<<< HEAD
+ +	file_name = nla_data(info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME]);
+++=======
++ 
++ 	supported_params = devlink->ops->supported_flash_update_params;
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  
+  	nla_component = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_COMPONENT];
+ -	if (nla_component) {
+ -		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_COMPONENT)) {
+ -			NL_SET_ERR_MSG_ATTR(info->extack, nla_component,
+ -					    "component update is not supported by this device");
+ -			return -EOPNOTSUPP;
+ -		}
+ -		params.component = nla_data(nla_component);
+ -	}
+ +	component = nla_component ? nla_data(nla_component) : NULL;
+  
+++<<<<<<< HEAD
+ +	return devlink->ops->flash_update(devlink, file_name, component,
+ +					  info->extack);
+++=======
++ 	nla_overwrite_mask = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_OVERWRITE_MASK];
++ 	if (nla_overwrite_mask) {
++ 		struct nla_bitfield32 sections;
++ 
++ 		if (!(supported_params & DEVLINK_SUPPORT_FLASH_UPDATE_OVERWRITE_MASK)) {
++ 			NL_SET_ERR_MSG_ATTR(info->extack, nla_overwrite_mask,
++ 					    "overwrite settings are not supported by this device");
++ 			return -EOPNOTSUPP;
++ 		}
++ 		sections = nla_get_bitfield32(nla_overwrite_mask);
++ 		params.overwrite_mask = sections.value & sections.selector;
++ 	}
++ 
++ 	nla_file_name = info->attrs[DEVLINK_ATTR_FLASH_UPDATE_FILE_NAME];
++ 	file_name = nla_data(nla_file_name);
++ 	ret = request_firmware(&params.fw, file_name, devlink->dev);
++ 	if (ret) {
++ 		NL_SET_ERR_MSG_ATTR(info->extack, nla_file_name, "failed to locate the requested firmware file");
++ 		return ret;
++ 	}
++ 
++ 	ret = devlink->ops->flash_update(devlink, &params, info->extack);
++ 
++ 	release_firmware(params.fw);
++ 
++ 	return ret;
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  }
+  
+  static const struct devlink_param devlink_param_generic[] = {
+@@@ -9684,10 -10239,16 +9727,19 @@@ int devlink_compat_flash_update(struct 
+  		goto out;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	ret = request_firmware(&params.fw, file_name, devlink->dev);
++ 	if (ret)
++ 		goto out;
++ 
+++>>>>>>> b44cfd4f5b91 (devlink: move request_firmware out of driver)
+  	mutex_lock(&devlink->lock);
+ -	ret = devlink->ops->flash_update(devlink, &params, NULL);
+ +	ret = devlink->ops->flash_update(devlink, file_name, NULL, NULL);
+  	mutex_unlock(&devlink->lock);
+  
++ 	release_firmware(params.fw);
++ 
+  out:
+  	rtnl_lock();
+  	dev_put(dev);
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+index 1ad210a2313d..f626a111f751 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.c
+@@ -2161,13 +2161,12 @@ static int bnxt_flash_firmware_from_file(struct net_device *dev,
+ 	return rc;
+ }
+ 
+-int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
+-				 u32 install_type)
++int bnxt_flash_package_from_fw_obj(struct net_device *dev, const struct firmware *fw,
++				   u32 install_type)
+ {
+ 	struct bnxt *bp = netdev_priv(dev);
+ 	struct hwrm_nvm_install_update_output *resp = bp->hwrm_cmd_resp_addr;
+ 	struct hwrm_nvm_install_update_input install = {0};
+-	const struct firmware *fw;
+ 	u32 item_len;
+ 	int rc = 0;
+ 	u16 index;
+@@ -2182,13 +2181,6 @@ int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
+ 		return rc;
+ 	}
+ 
+-	rc = request_firmware(&fw, filename, &dev->dev);
+-	if (rc != 0) {
+-		netdev_err(dev, "PKG error %d requesting file: %s\n",
+-			   rc, filename);
+-		return rc;
+-	}
+-
+ 	if (fw->size > item_len) {
+ 		netdev_err(dev, "PKG insufficient update area in nvram: %lu\n",
+ 			   (unsigned long)fw->size);
+@@ -2220,7 +2212,6 @@ int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
+ 					  dma_handle);
+ 		}
+ 	}
+-	release_firmware(fw);
+ 	if (rc)
+ 		goto err_exit;
+ 
+@@ -2259,6 +2250,26 @@ int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
+ 	return rc;
+ }
+ 
++static int bnxt_flash_package_from_file(struct net_device *dev, const char *filename,
++					u32 install_type)
++{
++	const struct firmware *fw;
++	int rc;
++
++	rc = request_firmware(&fw, filename, &dev->dev);
++	if (rc != 0) {
++		netdev_err(dev, "PKG error %d requesting file: %s\n",
++			   rc, filename);
++		return rc;
++	}
++
++	rc = bnxt_flash_package_from_fw_obj(dev, fw, install_type);
++
++	release_firmware(fw);
++
++	return rc;
++}
++
+ static int bnxt_flash_device(struct net_device *dev,
+ 			     struct ethtool_flash *flash)
+ {
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_ethtool.h
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/core.c
+* Unmerged path drivers/net/ethernet/netronome/nfp/nfp_devlink.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.c b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+index 7ff2ccbd43b0..d0835af1a577 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@ -301,11 +301,10 @@ static int nfp_pcie_sriov_configure(struct pci_dev *pdev, int num_vfs)
+ 		return nfp_pcie_sriov_enable(pdev, num_vfs);
+ }
+ 
+-int nfp_flash_update_common(struct nfp_pf *pf, const char *path,
++int nfp_flash_update_common(struct nfp_pf *pf, const struct firmware *fw,
+ 			    struct netlink_ext_ack *extack)
+ {
+ 	struct device *dev = &pf->pdev->dev;
+-	const struct firmware *fw;
+ 	struct nfp_nsp *nsp;
+ 	int err;
+ 
+@@ -319,24 +318,12 @@ int nfp_flash_update_common(struct nfp_pf *pf, const char *path,
+ 		return err;
+ 	}
+ 
+-	err = request_firmware_direct(&fw, path, dev);
+-	if (err) {
+-		NL_SET_ERR_MSG_MOD(extack,
+-				   "unable to read flash file from disk");
+-		goto exit_close_nsp;
+-	}
+-
+-	dev_info(dev, "Please be patient while writing flash image: %s\n",
+-		 path);
+-
+ 	err = nfp_nsp_write_flash(nsp, fw);
+ 	if (err < 0)
+-		goto exit_release_fw;
++		goto exit_close_nsp;
+ 	dev_info(dev, "Finished writing flash image\n");
+ 	err = 0;
+ 
+-exit_release_fw:
+-	release_firmware(fw);
+ exit_close_nsp:
+ 	nfp_nsp_close(nsp);
+ 	return err;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.h b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+index fa6b13a05941..a7dede946a33 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.h
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.h
+@@ -166,7 +166,7 @@ nfp_pf_map_rtsym(struct nfp_pf *pf, const char *name, const char *sym_fmt,
+ 		 unsigned int min_size, struct nfp_cpp_area **area);
+ int nfp_mbox_cmd(struct nfp_pf *pf, u32 cmd, void *in_data, u64 in_length,
+ 		 void *out_data, u64 out_length);
+-int nfp_flash_update_common(struct nfp_pf *pf, const char *path,
++int nfp_flash_update_common(struct nfp_pf *pf, const struct firmware *fw,
+ 			    struct netlink_ext_ack *extack);
+ 
+ enum nfp_dump_diag {
+* Unmerged path drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_devlink.h b/drivers/net/ethernet/pensando/ionic/ionic_devlink.h
+index 5c01a9e306d8..0a77e8e810c5 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_devlink.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_devlink.h
+@@ -6,7 +6,7 @@
+ 
+ #include <net/devlink.h>
+ 
+-int ionic_firmware_update(struct ionic_lif *lif, const char *fw_name,
++int ionic_firmware_update(struct ionic_lif *lif, const struct firmware *fw,
+ 			  struct netlink_ext_ack *extack);
+ 
+ struct ionic *ionic_devlink_alloc(struct device *dev);
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_fw.c b/drivers/net/ethernet/pensando/ionic/ionic_fw.c
+index d7bbf336c6f6..8922c316abe3 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_fw.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_fw.c
+@@ -91,7 +91,7 @@ static int ionic_fw_status_long_wait(struct ionic *ionic,
+ 	return err;
+ }
+ 
+-int ionic_firmware_update(struct ionic_lif *lif, const char *fw_name,
++int ionic_firmware_update(struct ionic_lif *lif, const struct firmware *fw,
+ 			  struct netlink_ext_ack *extack)
+ {
+ 	struct ionic_dev *idev = &lif->ionic->idev;
+@@ -99,24 +99,17 @@ int ionic_firmware_update(struct ionic_lif *lif, const char *fw_name,
+ 	struct ionic *ionic = lif->ionic;
+ 	union ionic_dev_cmd_comp comp;
+ 	u32 buf_sz, copy_sz, offset;
+-	const struct firmware *fw;
+ 	struct devlink *dl;
+ 	int next_interval;
+ 	int err = 0;
+ 	u8 fw_slot;
+ 
+-	netdev_info(netdev, "Installing firmware %s\n", fw_name);
++	netdev_info(netdev, "Installing firmware\n");
+ 
+ 	dl = priv_to_devlink(ionic);
+ 	devlink_flash_update_begin_notify(dl);
+ 	devlink_flash_update_status_notify(dl, "Preparing to flash", NULL, 0, 0);
+ 
+-	err = request_firmware(&fw, fw_name, ionic->dev);
+-	if (err) {
+-		NL_SET_ERR_MSG_MOD(extack, "Unable to find firmware file");
+-		goto err_out;
+-	}
+-
+ 	buf_sz = sizeof(idev->dev_cmd_regs->data);
+ 
+ 	netdev_dbg(netdev,
+@@ -200,7 +193,6 @@ int ionic_firmware_update(struct ionic_lif *lif, const char *fw_name,
+ 		devlink_flash_update_status_notify(dl, "Flash failed", NULL, 0, 0);
+ 	else
+ 		devlink_flash_update_status_notify(dl, "Flash done", NULL, 0, 0);
+-	release_firmware(fw);
+ 	devlink_flash_update_end_notify(dl);
+ 	return err;
+ }
+* Unmerged path include/net/devlink.h
+* Unmerged path net/core/devlink.c
