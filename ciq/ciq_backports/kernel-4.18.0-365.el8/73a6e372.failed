@@ -1,0 +1,219 @@
+igc: Refactor __igc_xdp_run_prog()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andre Guedes <andre.guedes@intel.com>
+commit 73a6e3721261524567eb5e319d5dc8e37b5f18dc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/73a6e372.failed
+
+Refactor __igc_xdp_run_prog() helper from igc_xdp_run_prog(),
+preparing the code for AF_XDP zero-copy support which is added
+by upcoming patches.
+
+The existing igc_xdp_run_prog() caters to regular XDP rx path
+which has to verify if bpf_prog is not NULL. Zero-copy
+path assumes that bpf_prog is not NULL and hence this check is
+not required. Therefore it makes sense to refactor the common
+code into a helper function, to avoid code duplication.
+
+	Signed-off-by: Andre Guedes <andre.guedes@intel.com>
+	Signed-off-by: Vedang Patel <vedang.patel@intel.com>
+	Signed-off-by: Jithu Joseph <jithu.joseph@intel.com>
+	Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: Dvora Fuxbrumer <dvorax.fuxbrumer@linux.intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 73a6e3721261524567eb5e319d5dc8e37b5f18dc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 261f28037c1a,1961cc667c3b..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -1885,6 -1925,179 +1885,182 @@@ static void igc_alloc_rx_buffers(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int igc_xdp_init_tx_buffer(struct igc_tx_buffer *buffer,
++ 				  struct xdp_frame *xdpf,
++ 				  struct igc_ring *ring)
++ {
++ 	dma_addr_t dma;
++ 
++ 	dma = dma_map_single(ring->dev, xdpf->data, xdpf->len, DMA_TO_DEVICE);
++ 	if (dma_mapping_error(ring->dev, dma)) {
++ 		netdev_err_once(ring->netdev, "Failed to map DMA for TX\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	buffer->xdpf = xdpf;
++ 	buffer->tx_flags = IGC_TX_FLAGS_XDP;
++ 	buffer->protocol = 0;
++ 	buffer->bytecount = xdpf->len;
++ 	buffer->gso_segs = 1;
++ 	buffer->time_stamp = jiffies;
++ 	dma_unmap_len_set(buffer, len, xdpf->len);
++ 	dma_unmap_addr_set(buffer, dma, dma);
++ 	return 0;
++ }
++ 
++ /* This function requires __netif_tx_lock is held by the caller. */
++ static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
++ 				      struct xdp_frame *xdpf)
++ {
++ 	struct igc_tx_buffer *buffer;
++ 	union igc_adv_tx_desc *desc;
++ 	u32 cmd_type, olinfo_status;
++ 	int err;
++ 
++ 	if (!igc_desc_unused(ring))
++ 		return -EBUSY;
++ 
++ 	buffer = &ring->tx_buffer_info[ring->next_to_use];
++ 	err = igc_xdp_init_tx_buffer(buffer, xdpf, ring);
++ 	if (err)
++ 		return err;
++ 
++ 	cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
++ 		   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
++ 		   buffer->bytecount;
++ 	olinfo_status = buffer->bytecount << IGC_ADVTXD_PAYLEN_SHIFT;
++ 
++ 	desc = IGC_TX_DESC(ring, ring->next_to_use);
++ 	desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 	desc->read.olinfo_status = cpu_to_le32(olinfo_status);
++ 	desc->read.buffer_addr = cpu_to_le64(dma_unmap_addr(buffer, dma));
++ 
++ 	netdev_tx_sent_queue(txring_txq(ring), buffer->bytecount);
++ 
++ 	buffer->next_to_watch = desc;
++ 
++ 	ring->next_to_use++;
++ 	if (ring->next_to_use == ring->count)
++ 		ring->next_to_use = 0;
++ 
++ 	return 0;
++ }
++ 
++ static struct igc_ring *igc_xdp_get_tx_ring(struct igc_adapter *adapter,
++ 					    int cpu)
++ {
++ 	int index = cpu;
++ 
++ 	if (unlikely(index < 0))
++ 		index = 0;
++ 
++ 	while (index >= adapter->num_tx_queues)
++ 		index -= adapter->num_tx_queues;
++ 
++ 	return adapter->tx_ring[index];
++ }
++ 
++ static int igc_xdp_xmit_back(struct igc_adapter *adapter, struct xdp_buff *xdp)
++ {
++ 	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	struct igc_ring *ring;
++ 	int res;
++ 
++ 	if (unlikely(!xdpf))
++ 		return -EFAULT;
++ 
++ 	ring = igc_xdp_get_tx_ring(adapter, cpu);
++ 	nq = txring_txq(ring);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	res = igc_xdp_init_tx_descriptor(ring, xdpf);
++ 	__netif_tx_unlock(nq);
++ 	return res;
++ }
++ 
++ /* This function assumes rcu_read_lock() is held by the caller. */
++ static int __igc_xdp_run_prog(struct igc_adapter *adapter,
++ 			      struct bpf_prog *prog,
++ 			      struct xdp_buff *xdp)
++ {
++ 	u32 act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		return IGC_XDP_PASS;
++ 	case XDP_TX:
++ 		return igc_xdp_xmit_back(adapter, xdp) < 0 ?
++ 			IGC_XDP_CONSUMED : IGC_XDP_TX;
++ 	case XDP_REDIRECT:
++ 		return xdp_do_redirect(adapter->netdev, xdp, prog) < 0 ?
++ 			IGC_XDP_CONSUMED : IGC_XDP_REDIRECT;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(adapter->netdev, prog, act);
++ 		fallthrough;
++ 	case XDP_DROP:
++ 		return IGC_XDP_CONSUMED;
++ 	}
++ }
++ 
++ static struct sk_buff *igc_xdp_run_prog(struct igc_adapter *adapter,
++ 					struct xdp_buff *xdp)
++ {
++ 	struct bpf_prog *prog;
++ 	int res;
++ 
++ 	rcu_read_lock();
++ 
++ 	prog = READ_ONCE(adapter->xdp_prog);
++ 	if (!prog) {
++ 		res = IGC_XDP_PASS;
++ 		goto unlock;
++ 	}
++ 
++ 	res = __igc_xdp_run_prog(adapter, prog, xdp);
++ 
++ unlock:
++ 	rcu_read_unlock();
++ 	return ERR_PTR(-res);
++ }
++ 
++ /* This function assumes __netif_tx_lock is held by the caller. */
++ static void igc_flush_tx_descriptors(struct igc_ring *ring)
++ {
++ 	/* Once tail pointer is updated, hardware can fetch the descriptors
++ 	 * any time so we issue a write membar here to ensure all memory
++ 	 * writes are complete before the tail pointer is updated.
++ 	 */
++ 	wmb();
++ 	writel(ring->next_to_use, ring->tail);
++ }
++ 
++ static void igc_finalize_xdp(struct igc_adapter *adapter, int status)
++ {
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	struct igc_ring *ring;
++ 
++ 	if (status & IGC_XDP_TX) {
++ 		ring = igc_xdp_get_tx_ring(adapter, cpu);
++ 		nq = txring_txq(ring);
++ 
++ 		__netif_tx_lock(nq, cpu);
++ 		igc_flush_tx_descriptors(ring);
++ 		__netif_tx_unlock(nq);
++ 	}
++ 
++ 	if (status & IGC_XDP_REDIRECT)
++ 		xdp_do_flush();
++ }
++ 
+++>>>>>>> 73a6e3721261 (igc: Refactor __igc_xdp_run_prog())
+  static int igc_clean_rx_irq(struct igc_q_vector *q_vector, const int budget)
+  {
+  	unsigned int total_bytes = 0, total_packets = 0;
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
