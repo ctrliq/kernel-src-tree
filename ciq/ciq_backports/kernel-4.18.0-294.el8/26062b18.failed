@@ -1,0 +1,166 @@
+xsk: Explicitly inline functions and move definitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Björn Töpel <bjorn.topel@intel.com>
+commit 26062b185eee49142adc45f9aa187d909d02d961
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/26062b18.failed
+
+In order to reduce the number of function calls, the struct
+xsk_buff_pool definition is moved to xsk_buff_pool.h. The functions
+xp_get_dma(), xp_dma_sync_for_cpu(), xp_dma_sync_for_device(),
+xp_validate_desc() and various helper functions are explicitly
+inlined.
+
+Further, move xp_get_handle() and xp_release() to xsk.c, to allow for
+the compiler to perform inlining.
+
+rfc->v1: Make sure xp_validate_desc() is inlined for Tx perf. (Maxim)
+
+	Signed-off-by: Björn Töpel <bjorn.topel@intel.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200520192103.355233-15-bjorn.topel@gmail.com
+(cherry picked from commit 26062b185eee49142adc45f9aa187d909d02d961)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xsk_buff_pool.h
+#	net/xdp/xsk.c
+#	net/xdp/xsk_buff_pool.c
+diff --cc net/xdp/xsk.c
+index 6a30422ca010,b6c0f08bd80d..000000000000
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@@ -119,25 -99,51 +119,44 @@@ bool xsk_umem_uses_need_wakeup(struct x
+  }
+  EXPORT_SYMBOL(xsk_umem_uses_need_wakeup);
+  
+++<<<<<<< HEAD
+ +/* If a buffer crosses a page boundary, we need to do 2 memcpy's, one for
+ + * each page. This is only required in copy mode.
+ + */
+ +static void __xsk_rcv_memcpy(struct xdp_umem *umem, u64 addr, void *from_buf,
+ +			     u32 len, u32 metalen)
+++=======
++ void xp_release(struct xdp_buff_xsk *xskb)
++ {
++ 	xskb->pool->free_heads[xskb->pool->free_heads_cnt++] = xskb;
++ }
++ 
++ static u64 xp_get_handle(struct xdp_buff_xsk *xskb)
++ {
++ 	u64 offset = xskb->xdp.data - xskb->xdp.data_hard_start;
++ 
++ 	offset += xskb->pool->headroom;
++ 	if (!xskb->pool->unaligned)
++ 		return xskb->orig_addr + offset;
++ 	return xskb->orig_addr + (offset << XSK_UNALIGNED_BUF_OFFSET_SHIFT);
++ }
++ 
++ static int __xsk_rcv_zc(struct xdp_sock *xs, struct xdp_buff *xdp, u32 len)
+++>>>>>>> 26062b185eee (xsk: Explicitly inline functions and move definitions)
+  {
+ -	struct xdp_buff_xsk *xskb = container_of(xdp, struct xdp_buff_xsk, xdp);
+ -	u64 addr;
+ -	int err;
+ +	void *to_buf = xdp_umem_get_data(umem, addr);
+  
+ -	addr = xp_get_handle(xskb);
+ -	err = xskq_prod_reserve_desc(xs->rx, addr, len);
+ -	if (err) {
+ -		xs->rx_dropped++;
+ -		return err;
+ -	}
+ +	addr = xsk_umem_add_offset_to_addr(addr);
+ +	if (xskq_cons_crosses_non_contig_pg(umem, addr, len + metalen)) {
+ +		void *next_pg_addr = umem->pages[(addr >> PAGE_SHIFT) + 1].addr;
+ +		u64 page_start = addr & ~(PAGE_SIZE - 1);
+ +		u64 first_len = PAGE_SIZE - (addr - page_start);
+  
+ -	xp_release(xskb);
+ -	return 0;
+ -}
+ +		memcpy(to_buf, from_buf, first_len);
+ +		memcpy(next_pg_addr, from_buf + first_len,
+ +		       len + metalen - first_len);
+  
+ -static void xsk_copy_xdp(struct xdp_buff *to, struct xdp_buff *from, u32 len)
+ -{
+ -	void *from_buf, *to_buf;
+ -	u32 metalen;
+ -
+ -	if (unlikely(xdp_data_meta_unsupported(from))) {
+ -		from_buf = from->data;
+ -		to_buf = to->data;
+ -		metalen = 0;
+ -	} else {
+ -		from_buf = from->data_meta;
+ -		metalen = from->data - from->data_meta;
+ -		to_buf = to->data - metalen;
+ +		return;
+  	}
+  
+  	memcpy(to_buf, from_buf, len + metalen);
+* Unmerged path include/net/xsk_buff_pool.h
+* Unmerged path net/xdp/xsk_buff_pool.c
+* Unmerged path include/net/xsk_buff_pool.h
+* Unmerged path net/xdp/xsk.c
+* Unmerged path net/xdp/xsk_buff_pool.c
+diff --git a/net/xdp/xsk_queue.h b/net/xdp/xsk_queue.h
+index a322a7dac58c..3e4c4d9cae8b 100644
+--- a/net/xdp/xsk_queue.h
++++ b/net/xdp/xsk_queue.h
+@@ -172,6 +172,51 @@ static inline bool xskq_cons_read_addr(struct xsk_queue *q, u64 *addr,
+ 	return false;
+ }
+ 
++static inline bool xp_aligned_validate_desc(struct xsk_buff_pool *pool,
++					    struct xdp_desc *desc)
++{
++	u64 chunk, chunk_end;
++
++	chunk = xp_aligned_extract_addr(pool, desc->addr);
++	chunk_end = xp_aligned_extract_addr(pool, desc->addr + desc->len);
++	if (chunk != chunk_end)
++		return false;
++
++	if (chunk >= pool->addrs_cnt)
++		return false;
++
++	if (desc->options)
++		return false;
++	return true;
++}
++
++static inline bool xp_unaligned_validate_desc(struct xsk_buff_pool *pool,
++					      struct xdp_desc *desc)
++{
++	u64 addr, base_addr;
++
++	base_addr = xp_unaligned_extract_addr(desc->addr);
++	addr = xp_unaligned_add_offset_to_addr(desc->addr);
++
++	if (desc->len > pool->chunk_size)
++		return false;
++
++	if (base_addr >= pool->addrs_cnt || addr >= pool->addrs_cnt ||
++	    xp_desc_crosses_non_contig_pg(pool, addr, desc->len))
++		return false;
++
++	if (desc->options)
++		return false;
++	return true;
++}
++
++static inline bool xp_validate_desc(struct xsk_buff_pool *pool,
++				    struct xdp_desc *desc)
++{
++	return pool->unaligned ? xp_unaligned_validate_desc(pool, desc) :
++		xp_aligned_validate_desc(pool, desc);
++}
++
+ static inline bool xskq_cons_is_valid_desc(struct xsk_queue *q,
+ 					   struct xdp_desc *d,
+ 					   struct xdp_umem *umem)
