@@ -1,0 +1,608 @@
+netfilter: conntrack: fix IPV6=n builds
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 81e01647fd2c6dcd592c4a005f47ba9ed5a52847
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/81e01647.failed
+
+Stephen Rothwell reports:
+ After merging the netfilter-next tree, today's linux-next build
+ (powerpc ppc64_defconfig) failed like this:
+
+ ERROR: "nf_conntrack_invert_icmpv6_tuple" [nf_conntrack.ko] undefined!
+ ERROR: "nf_conntrack_icmpv6_packet" [nf_conntrack.ko] undefined!
+ ERROR: "nf_conntrack_icmpv6_init_net" [nf_conntrack.ko] undefined!
+ ERROR: "icmpv6_pkt_to_tuple" [nf_conntrack.ko] undefined!
+ ERROR: "nf_ct_gre_keymap_destroy" [nf_conntrack.ko] undefined!
+
+icmpv6 related errors are due to lack of IS_ENABLED(CONFIG_IPV6) (no
+icmpv6 support is builtin if kernel has CONFIG_IPV6=n), the
+nf_ct_gre_keymap_destroy error is due to lack of PROTO_GRE check.
+
+Fixes: a47c54048162 ("netfilter: conntrack: handle builtin l4proto packet functions via direct calls")
+Fixes: e2e48b471634 ("netfilter: conntrack: handle icmp pkt_to_tuple helper via direct calls")
+Fixes: 197c4300aec0 ("netfilter: conntrack: remove invert_tuple callback")
+Fixes: 2a389de86e4a ("netfilter: conntrack: remove l4proto init and get_net callbacks")
+Fixes: e56894356f60 ("netfilter: conntrack: remove l4proto destroy hook")
+	Reported-by: Stephen Rothwell <sfr@canb.auug.org.au>
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 81e01647fd2c6dcd592c4a005f47ba9ed5a52847)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+#	net/netfilter/nf_conntrack_proto.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index 680e0b0d92a5,a3e5232c2088..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -275,8 -273,18 +275,23 @@@ nf_ct_get_tuple(const struct sk_buff *s
+  	tuple->dst.protonum = protonum;
+  	tuple->dst.dir = IP_CT_DIR_ORIGINAL;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(l4proto->pkt_to_tuple))
+ +		return l4proto->pkt_to_tuple(skb, dataoff, net, tuple);
+++=======
++ 	switch (protonum) {
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case IPPROTO_ICMPV6:
++ 		return icmpv6_pkt_to_tuple(skb, dataoff, net, tuple);
++ #endif
++ 	case IPPROTO_ICMP:
++ 		return icmp_pkt_to_tuple(skb, dataoff, net, tuple);
++ #ifdef CONFIG_NF_CT_PROTO_GRE
++ 	case IPPROTO_GRE:
++ 		return gre_pkt_to_tuple(skb, dataoff, net, tuple);
++ #endif
++ 	}
+++>>>>>>> 81e01647fd2c (netfilter: conntrack: fix IPV6=n builds)
+  
+  	/* Actually only need first 4 bytes to get ports. */
+  	inet_hdr = skb_header_pointer(skb, dataoff, sizeof(_inet_hdr), &_inet_hdr);
+@@@ -343,8 -411,14 +358,19 @@@ nf_ct_invert_tuple(struct nf_conntrack_
+  
+  	inverse->dst.protonum = orig->dst.protonum;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(l4proto->invert_tuple))
+ +		return l4proto->invert_tuple(inverse, orig);
+++=======
++ 	switch (orig->dst.protonum) {
++ 	case IPPROTO_ICMP:
++ 		return nf_conntrack_invert_icmp_tuple(inverse, orig);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case IPPROTO_ICMPV6:
++ 		return nf_conntrack_invert_icmpv6_tuple(inverse, orig);
++ #endif
++ 	}
+++>>>>>>> 81e01647fd2c (netfilter: conntrack: fix IPV6=n builds)
+  
+  	inverse->src.u.all = orig->dst.u.all;
+  	inverse->dst.u.all = orig->src.u.all;
+@@@ -488,6 -528,16 +514,19 @@@ void nf_ct_tmpl_free(struct nf_conn *tm
+  }
+  EXPORT_SYMBOL_GPL(nf_ct_tmpl_free);
+  
+++<<<<<<< HEAD
+++=======
++ static void destroy_gre_conntrack(struct nf_conn *ct)
++ {
++ #ifdef CONFIG_NF_CT_PROTO_GRE
++ 	struct nf_conn *master = ct->master;
++ 
++ 	if (master)
++ 		nf_ct_gre_keymap_destroy(master);
++ #endif
++ }
++ 
+++>>>>>>> 81e01647fd2c (netfilter: conntrack: fix IPV6=n builds)
+  static void
+  destroy_conntrack(struct nf_conntrack *nfct)
+  {
+@@@ -1479,18 -1498,103 +1518,111 @@@ resolve_normal_ct(struct net *net, stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * icmp packets need special treatment to handle error messages that are
++  * related to a connection.
++  *
++  * Callers need to check if skb has a conntrack assigned when this
++  * helper returns; in such case skb belongs to an already known connection.
++  */
++ static unsigned int __cold
++ nf_conntrack_handle_icmp(struct nf_conn *tmpl,
++ 			 struct sk_buff *skb,
++ 			 unsigned int dataoff,
++ 			 u8 protonum,
++ 			 const struct nf_hook_state *state)
++ {
++ 	int ret;
++ 
++ 	if (state->pf == NFPROTO_IPV4 && protonum == IPPROTO_ICMP)
++ 		ret = nf_conntrack_icmpv4_error(tmpl, skb, dataoff, state);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	else if (state->pf == NFPROTO_IPV6 && protonum == IPPROTO_ICMPV6)
++ 		ret = nf_conntrack_icmpv6_error(tmpl, skb, dataoff, state);
++ #endif
++ 	else
++ 		return NF_ACCEPT;
++ 
++ 	if (ret <= 0) {
++ 		NF_CT_STAT_INC_ATOMIC(state->net, error);
++ 		NF_CT_STAT_INC_ATOMIC(state->net, invalid);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int generic_packet(struct nf_conn *ct, struct sk_buff *skb,
++ 			  enum ip_conntrack_info ctinfo)
++ {
++ 	const unsigned int *timeout = nf_ct_timeout_lookup(ct);
++ 
++ 	if (!timeout)
++ 		timeout = &nf_generic_pernet(nf_ct_net(ct))->timeout;
++ 
++ 	nf_ct_refresh_acct(ct, ctinfo, skb, *timeout);
++ 	return NF_ACCEPT;
++ }
++ 
++ /* Returns verdict for packet, or -1 for invalid. */
++ static int nf_conntrack_handle_packet(struct nf_conn *ct,
++ 				      struct sk_buff *skb,
++ 				      unsigned int dataoff,
++ 				      enum ip_conntrack_info ctinfo,
++ 				      const struct nf_hook_state *state)
++ {
++ 	switch (nf_ct_protonum(ct)) {
++ 	case IPPROTO_TCP:
++ 		return nf_conntrack_tcp_packet(ct, skb, dataoff,
++ 					       ctinfo, state);
++ 	case IPPROTO_UDP:
++ 		return nf_conntrack_udp_packet(ct, skb, dataoff,
++ 					       ctinfo, state);
++ 	case IPPROTO_ICMP:
++ 		return nf_conntrack_icmp_packet(ct, skb, ctinfo, state);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case IPPROTO_ICMPV6:
++ 		return nf_conntrack_icmpv6_packet(ct, skb, ctinfo, state);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_UDPLITE
++ 	case IPPROTO_UDPLITE:
++ 		return nf_conntrack_udplite_packet(ct, skb, dataoff,
++ 						   ctinfo, state);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_SCTP
++ 	case IPPROTO_SCTP:
++ 		return nf_conntrack_sctp_packet(ct, skb, dataoff,
++ 						ctinfo, state);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_DCCP
++ 	case IPPROTO_DCCP:
++ 		return nf_conntrack_dccp_packet(ct, skb, dataoff,
++ 						ctinfo, state);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_GRE
++ 	case IPPROTO_GRE:
++ 		return nf_conntrack_gre_packet(ct, skb, dataoff,
++ 					       ctinfo, state);
++ #endif
++ 	}
++ 
++ 	return generic_packet(ct, skb, ctinfo);
++ }
++ 
+++>>>>>>> 81e01647fd2c (netfilter: conntrack: fix IPV6=n builds)
+  unsigned int
+ -nf_conntrack_in(struct sk_buff *skb, const struct nf_hook_state *state)
+ +nf_conntrack_in(struct net *net, u_int8_t pf, unsigned int hooknum,
+ +		struct sk_buff *skb)
+  {
+ -	enum ip_conntrack_info ctinfo;
+ +	const struct nf_conntrack_l3proto *l3proto;
+ +	const struct nf_conntrack_l4proto *l4proto;
+  	struct nf_conn *ct, *tmpl;
+ +	enum ip_conntrack_info ctinfo;
+ +	unsigned int *timeouts;
+ +	unsigned int dataoff;
+  	u_int8_t protonum;
+ -	int dataoff, ret;
+ +	int ret;
+  
+  	tmpl = nf_ct_get(skb, &ctinfo);
+  	if (tmpl || ctinfo == IP_CT_UNTRACKED) {
+diff --cc net/netfilter/nf_conntrack_proto.c
+index baa1f4cdedbb,b9403a266a2e..000000000000
+--- a/net/netfilter/nf_conntrack_proto.c
++++ b/net/netfilter/nf_conntrack_proto.c
+@@@ -253,340 -559,56 +253,358 @@@ void nf_ct_netns_put(struct net *net, u
+  }
+  EXPORT_SYMBOL_GPL(nf_ct_netns_put);
+  
+ -int nf_conntrack_proto_init(void)
+ +const struct nf_conntrack_l4proto *
+ +nf_ct_l4proto_find_get(u_int16_t l3num, u_int8_t l4num)
+  {
+ -	int ret;
+ +	const struct nf_conntrack_l4proto *p;
+  
+ -	ret = nf_register_sockopt(&so_getorigdst);
+ -	if (ret < 0)
+ -		return ret;
+ +	rcu_read_lock();
+ +	p = __nf_ct_l4proto_find(l3num, l4num);
+ +	if (!try_module_get(p->me))
+ +		p = &nf_conntrack_l4proto_generic;
+ +	rcu_read_unlock();
+  
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	ret = nf_register_sockopt(&so_getorigdst6);
+ -	if (ret < 0)
+ -		goto cleanup_sockopt;
+ -#endif
+ +	return p;
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_find_get);
+  
+ -	return ret;
+ +void nf_ct_l4proto_put(const struct nf_conntrack_l4proto *p)
+ +{
+ +	module_put(p->me);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_put);
+  
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -cleanup_sockopt:
+ -	nf_unregister_sockopt(&so_getorigdst6);
+ -#endif
+ -	return ret;
+ +static int kill_l3proto(struct nf_conn *i, void *data)
+ +{
+ +	return nf_ct_l3num(i) == ((const struct nf_conntrack_l3proto *)data)->l3proto;
+  }
+  
+ -void nf_conntrack_proto_fini(void)
+ +static int kill_l4proto(struct nf_conn *i, void *data)
+  {
+ -	nf_unregister_sockopt(&so_getorigdst);
+ -#if IS_ENABLED(CONFIG_IPV6)
+ -	nf_unregister_sockopt(&so_getorigdst6);
+ -#endif
+ +	const struct nf_conntrack_l4proto *l4proto;
+ +	l4proto = data;
+ +	return nf_ct_protonum(i) == l4proto->l4proto &&
+ +	       nf_ct_l3num(i) == l4proto->l3proto;
+  }
+  
+ -void nf_conntrack_proto_pernet_init(struct net *net)
+ +int nf_ct_l3proto_register(const struct nf_conntrack_l3proto *proto)
+  {
+++<<<<<<< HEAD
+ +	int ret = 0;
+ +	struct nf_conntrack_l3proto *old;
+ +
+ +	if (proto->l3proto >= NFPROTO_NUMPROTO)
+ +		return -EBUSY;
+ +#if IS_ENABLED(CONFIG_NF_CT_NETLINK)
+ +	if (proto->tuple_to_nlattr && proto->nla_size == 0)
+ +		return -EINVAL;
+++=======
++ 	nf_conntrack_generic_init_net(net);
++ 	nf_conntrack_udp_init_net(net);
++ 	nf_conntrack_tcp_init_net(net);
++ 	nf_conntrack_icmp_init_net(net);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	nf_conntrack_icmpv6_init_net(net);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_DCCP
++ 	nf_conntrack_dccp_init_net(net);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_SCTP
++ 	nf_conntrack_sctp_init_net(net);
++ #endif
++ #ifdef CONFIG_NF_CT_PROTO_GRE
++ 	nf_conntrack_gre_init_net(net);
+++>>>>>>> 81e01647fd2c (netfilter: conntrack: fix IPV6=n builds)
+  #endif
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	old = rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
+ +					lockdep_is_held(&nf_ct_proto_mutex));
+ +	if (old != &nf_conntrack_l3proto_generic) {
+ +		ret = -EBUSY;
+ +		goto out_unlock;
+ +	}
+ +
+ +	rcu_assign_pointer(nf_ct_l3protos[proto->l3proto], proto);
+ +
+ +out_unlock:
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +	return ret;
+ +
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l3proto_register);
+ +
+ +void nf_ct_l3proto_unregister(const struct nf_conntrack_l3proto *proto)
+ +{
+ +	BUG_ON(proto->l3proto >= NFPROTO_NUMPROTO);
+ +
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	BUG_ON(rcu_dereference_protected(nf_ct_l3protos[proto->l3proto],
+ +					 lockdep_is_held(&nf_ct_proto_mutex)
+ +					 ) != proto);
+ +	rcu_assign_pointer(nf_ct_l3protos[proto->l3proto],
+ +			   &nf_conntrack_l3proto_generic);
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +
+ +	synchronize_rcu();
+ +	/* Remove all contrack entries for this protocol */
+ +	nf_ct_iterate_destroy(kill_l3proto, (void*)proto);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l3proto_unregister);
+ +
+ +static struct nf_proto_net *nf_ct_l4proto_net(struct net *net,
+ +				const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	if (l4proto->get_net_proto) {
+ +		/* statically built-in protocols use static per-net */
+ +		return l4proto->get_net_proto(net);
+ +	} else if (l4proto->net_id) {
+ +		/* ... and loadable protocols use dynamic per-net */
+ +		return net_generic(net, *l4proto->net_id);
+ +	}
+ +	return NULL;
+ +}
+ +
+ +static
+ +int nf_ct_l4proto_register_sysctl(struct net *net,
+ +				  struct nf_proto_net *pn,
+ +				  const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	int err = 0;
+ +
+ +#ifdef CONFIG_SYSCTL
+ +	if (pn->ctl_table != NULL) {
+ +		err = nf_ct_register_sysctl(net,
+ +					    &pn->ctl_table_header,
+ +					    "net/netfilter",
+ +					    pn->ctl_table);
+ +		if (err < 0) {
+ +			if (!pn->users) {
+ +				kfree(pn->ctl_table);
+ +				pn->ctl_table = NULL;
+ +			}
+ +		}
+ +	}
+ +#endif /* CONFIG_SYSCTL */
+ +	return err;
+ +}
+ +
+ +static
+ +void nf_ct_l4proto_unregister_sysctl(struct net *net,
+ +				struct nf_proto_net *pn,
+ +				const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +#ifdef CONFIG_SYSCTL
+ +	if (pn->ctl_table_header != NULL)
+ +		nf_ct_unregister_sysctl(&pn->ctl_table_header,
+ +					&pn->ctl_table,
+ +					pn->users);
+ +#endif /* CONFIG_SYSCTL */
+ +}
+ +
+ +/* FIXME: Allow NULL functions and sub in pointers to generic for
+ +   them. --RR */
+ +int nf_ct_l4proto_register_one(const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	int ret = 0;
+ +
+ +	if (l4proto->l3proto >= ARRAY_SIZE(nf_ct_protos))
+ +		return -EBUSY;
+ +
+ +	if ((l4proto->to_nlattr && l4proto->nlattr_size == 0) ||
+ +	    (l4proto->tuple_to_nlattr && !l4proto->nlattr_tuple_size))
+ +		return -EINVAL;
+ +
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	if (!nf_ct_protos[l4proto->l3proto]) {
+ +		/* l3proto may be loaded latter. */
+ +		struct nf_conntrack_l4proto __rcu **proto_array;
+ +		int i;
+ +
+ +		proto_array =
+ +			kmalloc_array(MAX_NF_CT_PROTO,
+ +				      sizeof(struct nf_conntrack_l4proto *),
+ +				      GFP_KERNEL);
+ +		if (proto_array == NULL) {
+ +			ret = -ENOMEM;
+ +			goto out_unlock;
+ +		}
+ +
+ +		for (i = 0; i < MAX_NF_CT_PROTO; i++)
+ +			RCU_INIT_POINTER(proto_array[i],
+ +					 &nf_conntrack_l4proto_generic);
+ +
+ +		/* Before making proto_array visible to lockless readers,
+ +		 * we must make sure its content is committed to memory.
+ +		 */
+ +		smp_wmb();
+ +
+ +		nf_ct_protos[l4proto->l3proto] = proto_array;
+ +	} else if (rcu_dereference_protected(
+ +			nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
+ +			lockdep_is_held(&nf_ct_proto_mutex)
+ +			) != &nf_conntrack_l4proto_generic) {
+ +		ret = -EBUSY;
+ +		goto out_unlock;
+ +	}
+ +
+ +	rcu_assign_pointer(nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
+ +			   l4proto);
+ +out_unlock:
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_register_one);
+ +
+ +int nf_ct_l4proto_pernet_register_one(struct net *net,
+ +				const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	int ret = 0;
+ +	struct nf_proto_net *pn = NULL;
+ +
+ +	if (l4proto->init_net) {
+ +		ret = l4proto->init_net(net);
+ +		if (ret < 0)
+ +			goto out;
+ +	}
+ +
+ +	pn = nf_ct_l4proto_net(net, l4proto);
+ +	if (pn == NULL)
+ +		goto out;
+ +
+ +	ret = nf_ct_l4proto_register_sysctl(net, pn, l4proto);
+ +	if (ret < 0)
+ +		goto out;
+ +
+ +	pn->users++;
+ +out:
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_pernet_register_one);
+ +
+ +static void __nf_ct_l4proto_unregister_one(const struct nf_conntrack_l4proto *l4proto)
+ +
+ +{
+ +	BUG_ON(l4proto->l3proto >= ARRAY_SIZE(nf_ct_protos));
+ +
+ +	BUG_ON(rcu_dereference_protected(
+ +			nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
+ +			lockdep_is_held(&nf_ct_proto_mutex)
+ +			) != l4proto);
+ +	rcu_assign_pointer(nf_ct_protos[l4proto->l3proto][l4proto->l4proto],
+ +			   &nf_conntrack_l4proto_generic);
+ +}
+ +
+ +void nf_ct_l4proto_unregister_one(const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	__nf_ct_l4proto_unregister_one(l4proto);
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +
+ +	synchronize_net();
+ +	/* Remove all contrack entries for this protocol */
+ +	nf_ct_iterate_destroy(kill_l4proto, (void *)l4proto);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_unregister_one);
+ +
+ +void nf_ct_l4proto_pernet_unregister_one(struct net *net,
+ +				const struct nf_conntrack_l4proto *l4proto)
+ +{
+ +	struct nf_proto_net *pn = nf_ct_l4proto_net(net, l4proto);
+ +
+ +	if (pn == NULL)
+ +		return;
+ +
+ +	pn->users--;
+ +	nf_ct_l4proto_unregister_sysctl(net, pn, l4proto);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_pernet_unregister_one);
+ +
+ +int nf_ct_l4proto_register(const struct nf_conntrack_l4proto * const l4proto[],
+ +			   unsigned int num_proto)
+ +{
+ +	int ret = -EINVAL, ver;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < num_proto; i++) {
+ +		ret = nf_ct_l4proto_register_one(l4proto[i]);
+ +		if (ret < 0)
+ +			break;
+ +	}
+ +	if (i != num_proto) {
+ +		ver = l4proto[i]->l3proto == PF_INET6 ? 6 : 4;
+ +		pr_err("nf_conntrack_ipv%d: can't register l4 %d proto.\n",
+ +		       ver, l4proto[i]->l4proto);
+ +		nf_ct_l4proto_unregister(l4proto, i);
+ +	}
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_register);
+ +
+ +int nf_ct_l4proto_pernet_register(struct net *net,
+ +				  const struct nf_conntrack_l4proto *const l4proto[],
+ +				  unsigned int num_proto)
+ +{
+ +	int ret = -EINVAL;
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < num_proto; i++) {
+ +		ret = nf_ct_l4proto_pernet_register_one(net, l4proto[i]);
+ +		if (ret < 0)
+ +			break;
+ +	}
+ +	if (i != num_proto) {
+ +		pr_err("nf_conntrack_proto_%d %d: pernet registration failed\n",
+ +		       l4proto[i]->l4proto,
+ +		       l4proto[i]->l3proto == PF_INET6 ? 6 : 4);
+ +		nf_ct_l4proto_pernet_unregister(net, l4proto, i);
+ +	}
+ +	return ret;
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_pernet_register);
+ +
+ +void nf_ct_l4proto_unregister(const struct nf_conntrack_l4proto * const l4proto[],
+ +			      unsigned int num_proto)
+ +{
+ +	int i;
+ +
+ +	mutex_lock(&nf_ct_proto_mutex);
+ +	for (i = 0; i < num_proto; i++)
+ +		__nf_ct_l4proto_unregister_one(l4proto[i]);
+ +	mutex_unlock(&nf_ct_proto_mutex);
+ +
+ +	synchronize_net();
+ +
+ +	for (i = 0; i < num_proto; i++)
+ +		nf_ct_iterate_destroy(kill_l4proto, (void *)l4proto[i]);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_unregister);
+ +
+ +void nf_ct_l4proto_pernet_unregister(struct net *net,
+ +				const struct nf_conntrack_l4proto *const l4proto[],
+ +				unsigned int num_proto)
+ +{
+ +	while (num_proto-- != 0)
+ +		nf_ct_l4proto_pernet_unregister_one(net, l4proto[num_proto]);
+ +}
+ +EXPORT_SYMBOL_GPL(nf_ct_l4proto_pernet_unregister);
+ +
+ +int nf_conntrack_proto_pernet_init(struct net *net)
+ +{
+ +	int err;
+ +	struct nf_proto_net *pn = nf_ct_l4proto_net(net,
+ +					&nf_conntrack_l4proto_generic);
+ +
+ +	err = nf_conntrack_l4proto_generic.init_net(net);
+ +	if (err < 0)
+ +		return err;
+ +	err = nf_ct_l4proto_register_sysctl(net,
+ +					    pn,
+ +					    &nf_conntrack_l4proto_generic);
+ +	if (err < 0)
+ +		return err;
+ +
+ +	pn->users++;
+ +	return 0;
+  }
+  
+  void nf_conntrack_proto_pernet_fini(struct net *net)
+* Unmerged path net/netfilter/nf_conntrack_core.c
+* Unmerged path net/netfilter/nf_conntrack_proto.c
