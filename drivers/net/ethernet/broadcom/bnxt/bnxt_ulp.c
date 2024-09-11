@@ -487,3 +487,4 @@ struct bnxt_en_dev *bnxt_ulp_probe(struct net_device *dev)
 	}
 	return bp->edev;
 }
+EXPORT_SYMBOL(bnxt_ulp_probe);
