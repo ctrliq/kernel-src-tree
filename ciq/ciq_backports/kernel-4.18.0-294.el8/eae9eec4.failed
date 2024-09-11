@@ -1,0 +1,140 @@
+powerpc/pseries/svm: Allocate SWIOTLB buffer anywhere in memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thiago Jung Bauermann <bauerman@linux.ibm.com>
+commit eae9eec476d13fad9af6da1f44a054ee02b7b161
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/eae9eec4.failed
+
+POWER secure guests (i.e., guests which use the Protected Execution
+Facility) need to use SWIOTLB to be able to do I/O with the
+hypervisor, but they don't need the SWIOTLB memory to be in low
+addresses since the hypervisor doesn't have any addressing limitation.
+
+This solves a SWIOTLB initialization problem we are seeing in secure
+guests with 128 GB of RAM: they are configured with 4 GB of
+crashkernel reserved memory, which leaves no space for SWIOTLB in low
+addresses.
+
+To do this, we use mostly the same code as swiotlb_init(), but
+allocate the buffer using memblock_alloc() instead of
+memblock_alloc_low().
+
+Fixes: 2efbc58f157a ("powerpc/pseries/svm: Force SWIOTLB for secure guests")
+	Signed-off-by: Thiago Jung Bauermann <bauerman@linux.ibm.com>
+	Reviewed-by: Konrad Rzeszutek Wilk <konrad.wilk@oracle.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200818221126.391073-1-bauerman@linux.ibm.com
+(cherry picked from commit eae9eec476d13fad9af6da1f44a054ee02b7b161)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mem.c
+diff --cc arch/powerpc/mm/mem.c
+index fa9ce75915ae,ddc32cc1b6cf..000000000000
+--- a/arch/powerpc/mm/mem.c
++++ b/arch/powerpc/mm/mem.c
+@@@ -54,6 -48,8 +54,11 @@@
+  #include <asm/fixmap.h>
+  #include <asm/swiotlb.h>
+  #include <asm/rtas.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/kasan.h>
++ #include <asm/svm.h>
+++>>>>>>> eae9eec476d1 (powerpc/pseries/svm: Allocate SWIOTLB buffer anywhere in memory)
+  
+  #include <mm/mmu_decl.h>
+  
+@@@ -335,7 -275,18 +340,22 @@@ void __init mem_init(void
+  	BUILD_BUG_ON(MMU_PAGE_COUNT > 16);
+  
+  #ifdef CONFIG_SWIOTLB
+++<<<<<<< HEAD
+ +	swiotlb_init(0);
+++=======
++ 	/*
++ 	 * Some platforms (e.g. 85xx) limit DMA-able memory way below
++ 	 * 4G. We force memblock to bottom-up mode to ensure that the
++ 	 * memory allocated in swiotlb_init() is DMA-able.
++ 	 * As it's the last memblock allocation, no need to reset it
++ 	 * back to to-down.
++ 	 */
++ 	memblock_set_bottom_up(true);
++ 	if (is_secure_guest())
++ 		svm_swiotlb_init();
++ 	else
++ 		swiotlb_init(0);
+++>>>>>>> eae9eec476d1 (powerpc/pseries/svm: Allocate SWIOTLB buffer anywhere in memory)
+  #endif
+  
+  	high_memory = (void *) __va(max_low_pfn * PAGE_SIZE);
+diff --git a/arch/powerpc/include/asm/svm.h b/arch/powerpc/include/asm/svm.h
+index 85580b30aba4..7546402d796a 100644
+--- a/arch/powerpc/include/asm/svm.h
++++ b/arch/powerpc/include/asm/svm.h
+@@ -15,6 +15,8 @@ static inline bool is_secure_guest(void)
+ 	return mfmsr() & MSR_S;
+ }
+ 
++void __init svm_swiotlb_init(void);
++
+ void dtl_cache_ctor(void *addr);
+ #define get_dtl_cache_ctor()	(is_secure_guest() ? dtl_cache_ctor : NULL)
+ 
+@@ -25,6 +27,8 @@ static inline bool is_secure_guest(void)
+ 	return false;
+ }
+ 
++static inline void svm_swiotlb_init(void) {}
++
+ #define get_dtl_cache_ctor() NULL
+ 
+ #endif /* CONFIG_PPC_SVM */
+* Unmerged path arch/powerpc/mm/mem.c
+diff --git a/arch/powerpc/platforms/pseries/svm.c b/arch/powerpc/platforms/pseries/svm.c
+index e6d7a344d9f2..7b739cc7a8a9 100644
+--- a/arch/powerpc/platforms/pseries/svm.c
++++ b/arch/powerpc/platforms/pseries/svm.c
+@@ -7,6 +7,7 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <linux/memblock.h>
+ #include <asm/machdep.h>
+ #include <asm/svm.h>
+ #include <asm/swiotlb.h>
+@@ -35,6 +36,31 @@ static int __init init_svm(void)
+ }
+ machine_early_initcall(pseries, init_svm);
+ 
++/*
++ * Initialize SWIOTLB. Essentially the same as swiotlb_init(), except that it
++ * can allocate the buffer anywhere in memory. Since the hypervisor doesn't have
++ * any addressing limitation, we don't need to allocate it in low addresses.
++ */
++void __init svm_swiotlb_init(void)
++{
++	unsigned char *vstart;
++	unsigned long bytes, io_tlb_nslabs;
++
++	io_tlb_nslabs = (swiotlb_size_or_default() >> IO_TLB_SHIFT);
++	io_tlb_nslabs = ALIGN(io_tlb_nslabs, IO_TLB_SEGSIZE);
++
++	bytes = io_tlb_nslabs << IO_TLB_SHIFT;
++
++	vstart = memblock_alloc(PAGE_ALIGN(bytes), PAGE_SIZE);
++	if (vstart && !swiotlb_init_with_tbl(vstart, io_tlb_nslabs, false))
++		return;
++
++	if (io_tlb_start)
++		memblock_free_early(io_tlb_start,
++				    PAGE_ALIGN(io_tlb_nslabs << IO_TLB_SHIFT));
++	panic("SVM: Cannot allocate SWIOTLB buffer");
++}
++
+ int set_memory_encrypted(unsigned long addr, int numpages)
+ {
+ 	if (!PAGE_ALIGNED(addr))
