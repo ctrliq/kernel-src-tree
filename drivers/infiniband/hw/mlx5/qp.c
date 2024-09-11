@@ -885,7 +885,6 @@ static int create_user_rq(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		goto err_umem;
 	}
 
-	rwq->create_type = MLX5_WQ_USER;
 	return 0;
 
 err_umem:
@@ -1017,7 +1016,6 @@ static int create_user_qp(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		mlx5_ib_dbg(dev, "copy failed\n");
 		goto err_unmap;
 	}
-	qp->create_type = MLX5_QP_USER;
 
 	return 0;
 
@@ -1192,7 +1190,6 @@ static int create_kernel_qp(struct mlx5_ib_dev *dev,
 		err = -ENOMEM;
 		goto err_wrid;
 	}
-	qp->create_type = MLX5_QP_KERNEL;
 
 	return 0;
 
@@ -1219,8 +1216,10 @@ static void destroy_qp_kernel(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp)
 	kvfree(qp->sq.wrid);
 	kvfree(qp->sq.wr_data);
 	kvfree(qp->rq.wrid);
-	mlx5_db_free(dev->mdev, &qp->db);
-	mlx5_frag_buf_free(dev->mdev, &qp->buf);
+	if (qp->db.db)
+		mlx5_db_free(dev->mdev, &qp->db);
+	if (qp->buf.frags)
+		mlx5_frag_buf_free(dev->mdev, &qp->buf);
 }
 
 static u32 get_rx_type(struct mlx5_ib_qp *qp, struct ib_qp_init_attr *attr)
@@ -2188,8 +2187,6 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		in = kvzalloc(inlen, GFP_KERNEL);
 		if (!in)
 			return -ENOMEM;
-
-		qp->create_type = MLX5_QP_EMPTY;
 	}
 
 	if (is_sqp(init_attr->qp_type))
@@ -2352,9 +2349,9 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 	return 0;
 
 err_create:
-	if (qp->create_type == MLX5_QP_USER)
+	if (udata)
 		destroy_qp_user(dev, pd, qp, base, udata);
-	else if (qp->create_type == MLX5_QP_KERNEL)
+	else
 		destroy_qp_kernel(dev, qp);
 
 err:
@@ -2512,7 +2509,7 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 	if (recv_cq)
 		list_del(&qp->cq_recv_list);
 
-	if (qp->create_type == MLX5_QP_KERNEL) {
+	if (!udata) {
 		__mlx5_ib_cq_clean(recv_cq, base->mqp.qpn,
 				   qp->ibqp.srq ? to_msrq(qp->ibqp.srq) : NULL);
 		if (send_cq != recv_cq)
@@ -2532,10 +2529,10 @@ static void destroy_qp_common(struct mlx5_ib_dev *dev, struct mlx5_ib_qp *qp,
 				     base->mqp.qpn);
 	}
 
-	if (qp->create_type == MLX5_QP_KERNEL)
-		destroy_qp_kernel(dev, qp);
-	else if (qp->create_type == MLX5_QP_USER)
+	if (udata)
 		destroy_qp_user(dev, &get_pd(qp)->ibpd, qp, base, udata);
+	else
+		destroy_qp_kernel(dev, qp);
 }
 
 static const char *ib_qp_type_str(enum ib_qp_type type)
