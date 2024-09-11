@@ -1,0 +1,382 @@
+bpf: sk_msg, sock{map|hash} redirect through ULP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author John Fastabend <john.fastabend@gmail.com>
+commit 0608c69c9a805c6264689d7eab4203eab88cf1da
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0608c69c.failed
+
+A sockmap program that redirects through a kTLS ULP enabled socket
+will not work correctly because the ULP layer is skipped. This
+fixes the behavior to call through the ULP layer on redirect to
+ensure any operations required on the data stream at the ULP layer
+continue to be applied.
+
+To do this we add an internal flag MSG_SENDPAGE_NOPOLICY to avoid
+calling the BPF layer on a redirected message. This is
+required to avoid calling the BPF layer multiple times (possibly
+recursively) which is not the current/expected behavior without
+ULPs. In the future we may add a redirect flag if users _do_
+want the policy applied again but this would need to work for both
+ULP and non-ULP sockets and be opt-in to avoid breaking existing
+programs.
+
+Also to avoid polluting the flag space with an internal flag we
+reuse the flag space overlapping MSG_SENDPAGE_NOPOLICY with
+MSG_WAITFORONE. Here WAITFORONE is specific to recv path and
+SENDPAGE_NOPOLICY is only used for sendpage hooks. The last thing
+to verify is user space API is masked correctly to ensure the flag
+can not be set by user. (Note this needs to be true regardless
+because we have internal flags already in-use that user space
+should not be able to set). But for completeness we have two UAPI
+paths into sendpage, sendfile and splice.
+
+In the sendfile case the function do_sendfile() zero's flags,
+
+./fs/read_write.c:
+ static ssize_t do_sendfile(int out_fd, int in_fd, loff_t *ppos,
+		   	    size_t count, loff_t max)
+ {
+   ...
+   fl = 0;
+#if 0
+   /*
+    * We need to debate whether we can enable this or not. The
+    * man page documents EAGAIN return for the output at least,
+    * and the application is arguably buggy if it doesn't expect
+    * EAGAIN on a non-blocking file descriptor.
+    */
+    if (in.file->f_flags & O_NONBLOCK)
+	fl = SPLICE_F_NONBLOCK;
+#endif
+    file_start_write(out.file);
+    retval = do_splice_direct(in.file, &pos, out.file, &out_pos, count, fl);
+ }
+
+In the splice case the pipe_to_sendpage "actor" is used which
+masks flags with SPLICE_F_MORE.
+
+./fs/splice.c:
+ static int pipe_to_sendpage(struct pipe_inode_info *pipe,
+			    struct pipe_buffer *buf, struct splice_desc *sd)
+ {
+   ...
+   more = (sd->flags & SPLICE_F_MORE) ? MSG_MORE : 0;
+   ...
+ }
+
+Confirming what we expect that internal flags  are in fact internal
+to socket side.
+
+Fixes: d3b18ad31f93 ("tls: add bpf support to sk_msg handling")
+	Signed-off-by: John Fastabend <john.fastabend@gmail.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 0608c69c9a805c6264689d7eab4203eab88cf1da)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_bpf.c
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 79112fc82343,5aee9ae5ca53..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -445,77 -676,110 +445,177 @@@ static int tls_push_record(struct sock 
+  	return tls_tx_records(sk, flags);
+  }
+  
+ -static int bpf_exec_tx_verdict(struct sk_msg *msg, struct sock *sk,
+ -			       bool full_record, u8 record_type,
+ -			       size_t *copied, int flags)
+ +static int tls_sw_push_pending_record(struct sock *sk, int flags)
+  {
+++<<<<<<< HEAD
+ +	return tls_push_record(sk, flags, TLS_RECORD_TYPE_DATA);
+++=======
++ 	struct tls_context *tls_ctx = tls_get_ctx(sk);
++ 	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
++ 	struct sk_msg msg_redir = { };
++ 	struct sk_psock *psock;
++ 	struct sock *sk_redir;
++ 	struct tls_rec *rec;
++ 	bool enospc, policy;
++ 	int err = 0, send;
++ 	u32 delta = 0;
++ 
++ 	policy = !(flags & MSG_SENDPAGE_NOPOLICY);
++ 	psock = sk_psock_get(sk);
++ 	if (!psock || !policy)
++ 		return tls_push_record(sk, flags, record_type);
++ more_data:
++ 	enospc = sk_msg_full(msg);
++ 	if (psock->eval == __SK_NONE) {
++ 		delta = msg->sg.size;
++ 		psock->eval = sk_psock_msg_verdict(sk, psock, msg);
++ 		if (delta < msg->sg.size)
++ 			delta -= msg->sg.size;
++ 		else
++ 			delta = 0;
++ 	}
++ 	if (msg->cork_bytes && msg->cork_bytes > msg->sg.size &&
++ 	    !enospc && !full_record) {
++ 		err = -ENOSPC;
++ 		goto out_err;
++ 	}
++ 	msg->cork_bytes = 0;
++ 	send = msg->sg.size;
++ 	if (msg->apply_bytes && msg->apply_bytes < send)
++ 		send = msg->apply_bytes;
++ 
++ 	switch (psock->eval) {
++ 	case __SK_PASS:
++ 		err = tls_push_record(sk, flags, record_type);
++ 		if (err < 0) {
++ 			*copied -= sk_msg_free(sk, msg);
++ 			tls_free_open_rec(sk);
++ 			goto out_err;
++ 		}
++ 		break;
++ 	case __SK_REDIRECT:
++ 		sk_redir = psock->sk_redir;
++ 		memcpy(&msg_redir, msg, sizeof(*msg));
++ 		if (msg->apply_bytes < send)
++ 			msg->apply_bytes = 0;
++ 		else
++ 			msg->apply_bytes -= send;
++ 		sk_msg_return_zero(sk, msg, send);
++ 		msg->sg.size -= send;
++ 		release_sock(sk);
++ 		err = tcp_bpf_sendmsg_redir(sk_redir, &msg_redir, send, flags);
++ 		lock_sock(sk);
++ 		if (err < 0) {
++ 			*copied -= sk_msg_free_nocharge(sk, &msg_redir);
++ 			msg->sg.size = 0;
++ 		}
++ 		if (msg->sg.size == 0)
++ 			tls_free_open_rec(sk);
++ 		break;
++ 	case __SK_DROP:
++ 	default:
++ 		sk_msg_free_partial(sk, msg, send);
++ 		if (msg->apply_bytes < send)
++ 			msg->apply_bytes = 0;
++ 		else
++ 			msg->apply_bytes -= send;
++ 		if (msg->sg.size == 0)
++ 			tls_free_open_rec(sk);
++ 		*copied -= (send + delta);
++ 		err = -EACCES;
++ 	}
++ 
++ 	if (likely(!err)) {
++ 		bool reset_eval = !ctx->open_rec;
++ 
++ 		rec = ctx->open_rec;
++ 		if (rec) {
++ 			msg = &rec->msg_plaintext;
++ 			if (!msg->apply_bytes)
++ 				reset_eval = true;
++ 		}
++ 		if (reset_eval) {
++ 			psock->eval = __SK_NONE;
++ 			if (psock->sk_redir) {
++ 				sock_put(psock->sk_redir);
++ 				psock->sk_redir = NULL;
++ 			}
++ 		}
++ 		if (rec)
++ 			goto more_data;
++ 	}
++  out_err:
++ 	sk_psock_put(sk, psock);
++ 	return err;
+++>>>>>>> 0608c69c9a80 (bpf: sk_msg, sock{map|hash} redirect through ULP)
+  }
+  
+ -static int tls_sw_push_pending_record(struct sock *sk, int flags)
+ +static int zerocopy_from_iter(struct sock *sk, struct iov_iter *from,
+ +			      int length, int *pages_used,
+ +			      unsigned int *size_used,
+ +			      struct scatterlist *to, int to_max_pages,
+ +			      bool charge)
+ +{
+ +	struct page *pages[MAX_SKB_FRAGS];
+ +
+ +	size_t offset;
+ +	ssize_t copied, use;
+ +	int i = 0;
+ +	unsigned int size = *size_used;
+ +	int num_elem = *pages_used;
+ +	int rc = 0;
+ +	int maxpages;
+ +
+ +	while (length > 0) {
+ +		i = 0;
+ +		maxpages = to_max_pages - num_elem;
+ +		if (maxpages == 0) {
+ +			rc = -EFAULT;
+ +			goto out;
+ +		}
+ +		copied = iov_iter_get_pages(from, pages,
+ +					    length,
+ +					    maxpages, &offset);
+ +		if (copied <= 0) {
+ +			rc = -EFAULT;
+ +			goto out;
+ +		}
+ +
+ +		iov_iter_advance(from, copied);
+ +
+ +		length -= copied;
+ +		size += copied;
+ +		while (copied) {
+ +			use = min_t(int, copied, PAGE_SIZE - offset);
+ +
+ +			sg_set_page(&to[num_elem],
+ +				    pages[i], use, offset);
+ +			sg_unmark_end(&to[num_elem]);
+ +			if (charge)
+ +				sk_mem_charge(sk, use);
+ +
+ +			offset = 0;
+ +			copied -= use;
+ +
+ +			++i;
+ +			++num_elem;
+ +		}
+ +	}
+ +
+ +	/* Mark the end in the last sg entry if newly added */
+ +	if (num_elem > *pages_used)
+ +		sg_mark_end(&to[num_elem - 1]);
+ +out:
+ +	if (rc)
+ +		iov_iter_revert(from, size - *size_used);
+ +	*size_used = size;
+ +	*pages_used = num_elem;
+ +
+ +	return rc;
+ +}
+ +
+ +static int memcopy_from_iter(struct sock *sk, struct iov_iter *from,
+ +			     int bytes)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+@@@ -781,24 -1025,16 +881,16 @@@ int tls_sw_do_sendpage(struct sock *sk
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+  	unsigned char record_type = TLS_RECORD_TYPE_DATA;
+ -	struct sk_msg *msg_pl;
+ +	size_t orig_size = size;
+ +	struct scatterlist *sg;
+  	struct tls_rec *rec;
+  	int num_async = 0;
+ -	size_t copied = 0;
+  	bool full_record;
+  	int record_room;
+ -	int ret = 0;
+  	bool eor;
+ +	int ret;
+  
+- 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
+- 		      MSG_SENDPAGE_NOTLAST))
+- 		return -ENOTSUPP;
+- 
+- 	/* No MSG_EOR from splice, only look at MSG_MORE */
+  	eor = !(flags & (MSG_MORE | MSG_SENDPAGE_NOTLAST));
+- 
+- 	lock_sock(sk);
+- 
+  	sk_clear_bit(SOCKWQ_ASYNC_NOSPACE, sk);
+  
+  	/* Wait till there is any pending write on socket */
+@@@ -895,17 -1137,37 +987,51 @@@ wait_for_memory
+  		}
+  	}
+  sendpage_end:
+++<<<<<<< HEAD
+ +	if (orig_size > size)
+ +		ret = orig_size - size;
+ +	else
+ +		ret = sk_stream_error(sk, flags, ret);
+ +
+ +	release_sock(sk);
+ +	return ret;
+ +}
+ +
+ +static struct sk_buff *tls_wait_data(struct sock *sk, int flags,
+ +				     long timeo, int *err)
+++=======
++ 	ret = sk_stream_error(sk, flags, ret);
++ 	return copied ? copied : ret;
++ }
++ 
++ int tls_sw_sendpage_locked(struct sock *sk, struct page *page,
++ 			   int offset, size_t size, int flags)
++ {
++ 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
++ 		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
++ 		return -ENOTSUPP;
++ 
++ 	return tls_sw_do_sendpage(sk, page, offset, size, flags);
++ }
++ 
++ int tls_sw_sendpage(struct sock *sk, struct page *page,
++ 		    int offset, size_t size, int flags)
++ {
++ 	int ret;
++ 
++ 	if (flags & ~(MSG_MORE | MSG_DONTWAIT | MSG_NOSIGNAL |
++ 		      MSG_SENDPAGE_NOTLAST | MSG_SENDPAGE_NOPOLICY))
++ 		return -ENOTSUPP;
++ 
++ 	lock_sock(sk);
++ 	ret = tls_sw_do_sendpage(sk, page, offset, size, flags);
++ 	release_sock(sk);
++ 	return ret;
++ }
++ 
++ static struct sk_buff *tls_wait_data(struct sock *sk, struct sk_psock *psock,
++ 				     int flags, long timeo, int *err)
+++>>>>>>> 0608c69c9a80 (bpf: sk_msg, sock{map|hash} redirect through ULP)
+  {
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_rx *ctx = tls_sw_ctx_rx(tls_ctx);
+* Unmerged path net/ipv4/tcp_bpf.c
+diff --git a/include/linux/socket.h b/include/linux/socket.h
+index 7ed4713d5337..f44f87c4263f 100644
+--- a/include/linux/socket.h
++++ b/include/linux/socket.h
+@@ -286,6 +286,7 @@ struct ucred {
+ #define MSG_NOSIGNAL	0x4000	/* Do not generate SIGPIPE */
+ #define MSG_MORE	0x8000	/* Sender will send more */
+ #define MSG_WAITFORONE	0x10000	/* recvmmsg(): block until 1+ packets avail */
++#define MSG_SENDPAGE_NOPOLICY 0x10000 /* sendpage() internal : do no apply policy */
+ #define MSG_SENDPAGE_NOTLAST 0x20000 /* sendpage() internal : not the last page */
+ #define MSG_BATCH	0x40000 /* sendmmsg(): more messages coming */
+ #define MSG_EOF         MSG_FIN
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 6da19b6e6db1..f46f7f8bee59 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -468,6 +468,15 @@ tls_offload_ctx_tx(const struct tls_context *tls_ctx)
+ 	return (struct tls_offload_context_tx *)tls_ctx->priv_ctx_tx;
+ }
+ 
++static inline bool tls_sw_has_ctx_tx(const struct sock *sk)
++{
++	struct tls_context *ctx = tls_get_ctx(sk);
++
++	if (!ctx)
++		return false;
++	return !!tls_sw_ctx_tx(ctx);
++}
++
+ static inline struct tls_offload_context_rx *
+ tls_offload_ctx_rx(const struct tls_context *tls_ctx)
+ {
+* Unmerged path net/ipv4/tcp_bpf.c
+* Unmerged path net/tls/tls_sw.c
