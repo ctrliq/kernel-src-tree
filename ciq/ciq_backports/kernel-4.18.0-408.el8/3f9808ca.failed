@@ -1,0 +1,270 @@
+selftests: KVM: Introduce system counter offset test
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Oliver Upton <oupton@google.com>
+commit 3f9808cac06c8dd4f800101e04f84fe3180198b0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/3f9808ca.failed
+
+Introduce a KVM selftest to verify that userspace manipulation of the
+TSC (via the new vCPU attribute) results in the correct behavior within
+the guest.
+
+	Reviewed-by: Andrew Jones <drjones@redhat.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+Message-Id: <20210916181555.973085-6-oupton@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3f9808cac06c8dd4f800101e04f84fe3180198b0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/.gitignore
+diff --cc tools/testing/selftests/kvm/.gitignore
+index 875fd0bd2081,fdd13fbdcc8f..000000000000
+--- a/tools/testing/selftests/kvm/.gitignore
++++ b/tools/testing/selftests/kvm/.gitignore
+@@@ -17,5 -40,18 +17,19 @@@
+  /x86_64/xen_shinfo_test
+  /x86_64/xen_vmcall_test
+  /x86_64/xss_msr_test
+ -/x86_64/vmx_pmu_msrs_test
+ -/access_tracking_perf_test
+ -/demand_paging_test
+ +/clear_dirty_log_test
+  /dirty_log_test
+++<<<<<<< HEAD
+++=======
++ /dirty_log_perf_test
++ /hardware_disable_test
++ /kvm_create_max_vcpus
++ /kvm_page_table_test
++ /memslot_modification_stress_test
++ /memslot_perf_test
++ /rseq_test
++ /set_memory_region_test
++ /steal_time
++ /kvm_binary_stats_test
++ /system_counter_offset_test
+++>>>>>>> 3f9808cac06c (selftests: KVM: Introduce system counter offset test)
+diff --git a/Documentation/virt/kvm/devices/vcpu.rst b/Documentation/virt/kvm/devices/vcpu.rst
+index 310cebe28af4..0b7bec9aa405 100644
+--- a/Documentation/virt/kvm/devices/vcpu.rst
++++ b/Documentation/virt/kvm/devices/vcpu.rst
+@@ -135,37 +135,50 @@ TSC is then derived by the following equation:
+ 
+   guest_tsc = host_tsc + KVM_VCPU_TSC_OFFSET
+ 
+-This attribute is useful for the precise migration of a guest's TSC. The
+-following describes a possible algorithm to use for the migration of a
+-guest's TSC:
++This attribute is useful to adjust the guest's TSC on live migration,
++so that the TSC counts the time during which the VM was paused. The
++following describes a possible algorithm to use for this purpose.
+ 
+ From the source VMM process:
+ 
+-1. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_0),
+-   kvmclock nanoseconds (k_0), and realtime nanoseconds (r_0).
++1. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (tsc_src),
++   kvmclock nanoseconds (guest_src), and host CLOCK_REALTIME nanoseconds
++   (host_src).
+ 
+ 2. Read the KVM_VCPU_TSC_OFFSET attribute for every vCPU to record the
+-   guest TSC offset (off_n).
++   guest TSC offset (ofs_src[i]).
+ 
+ 3. Invoke the KVM_GET_TSC_KHZ ioctl to record the frequency of the
+    guest's TSC (freq).
+ 
+ From the destination VMM process:
+ 
+-4. Invoke the KVM_SET_CLOCK ioctl, providing the kvmclock nanoseconds
+-   (k_0) and realtime nanoseconds (r_0) in their respective fields.
+-   Ensure that the KVM_CLOCK_REALTIME flag is set in the provided
+-   structure. KVM will advance the VM's kvmclock to account for elapsed
+-   time since recording the clock values.
++4. Invoke the KVM_SET_CLOCK ioctl, providing the source nanoseconds from
++   kvmclock (guest_src) and CLOCK_REALTIME (host_src) in their respective
++   fields.  Ensure that the KVM_CLOCK_REALTIME flag is set in the provided
++   structure.
+ 
+-5. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (t_1) and
+-   kvmclock nanoseconds (k_1).
++   KVM will advance the VM's kvmclock to account for elapsed time since
++   recording the clock values.  Note that this will cause problems in
++   the guest (e.g., timeouts) unless CLOCK_REALTIME is synchronized
++   between the source and destination, and a reasonably short time passes
++   between the source pausing the VMs and the destination executing
++   steps 4-7.
++
++5. Invoke the KVM_GET_CLOCK ioctl to record the host TSC (tsc_dest) and
++   kvmclock nanoseconds (guest_dest).
+ 
+ 6. Adjust the guest TSC offsets for every vCPU to account for (1) time
+    elapsed since recording state and (2) difference in TSCs between the
+    source and destination machine:
+ 
+-   new_off_n = t_0 + off_n + (k_1 - k_0) * freq - t_1
++   ofs_dst[i] = ofs_src[i] -
++     (guest_src - guest_dest) * freq +
++     (tsc_src - tsc_dest)
++
++   ("ofs[i] + tsc - guest * freq" is the guest TSC value corresponding to
++   a time of 0 in kvmclock.  The above formula ensures that it is the
++   same on the destination as it was on the source).
+ 
+ 7. Write the KVM_VCPU_TSC_OFFSET attribute for every vCPU with the
+    respective value derived in the previous step.
+* Unmerged path tools/testing/selftests/kvm/.gitignore
+diff --git a/tools/testing/selftests/kvm/Makefile b/tools/testing/selftests/kvm/Makefile
+index 89c308b6d33f..d99a6797a205 100644
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@ -86,6 +86,7 @@ TEST_GEN_PROGS_x86_64 += rseq_test
+ TEST_GEN_PROGS_x86_64 += set_memory_region_test
+ TEST_GEN_PROGS_x86_64 += steal_time
+ TEST_GEN_PROGS_x86_64 += kvm_binary_stats_test
++TEST_GEN_PROGS_x86_64 += system_counter_offset_test
+ 
+ TEST_GEN_PROGS_aarch64 += aarch64/arch_timer
+ TEST_GEN_PROGS_aarch64 += aarch64/debug-exceptions
+diff --git a/tools/testing/selftests/kvm/system_counter_offset_test.c b/tools/testing/selftests/kvm/system_counter_offset_test.c
+new file mode 100644
+index 000000000000..b337bbbfa41f
+--- /dev/null
++++ b/tools/testing/selftests/kvm/system_counter_offset_test.c
+@@ -0,0 +1,132 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Copyright (C) 2021, Google LLC.
++ *
++ * Tests for adjusting the system counter from userspace
++ */
++#include <asm/kvm_para.h>
++#include <stdint.h>
++#include <string.h>
++#include <sys/stat.h>
++#include <time.h>
++
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++
++#define VCPU_ID 0
++
++#ifdef __x86_64__
++
++struct test_case {
++	uint64_t tsc_offset;
++};
++
++static struct test_case test_cases[] = {
++	{ 0 },
++	{ 180 * NSEC_PER_SEC },
++	{ -180 * NSEC_PER_SEC },
++};
++
++static void check_preconditions(struct kvm_vm *vm)
++{
++	if (!_vcpu_has_device_attr(vm, VCPU_ID, KVM_VCPU_TSC_CTRL, KVM_VCPU_TSC_OFFSET))
++		return;
++
++	print_skip("KVM_VCPU_TSC_OFFSET not supported; skipping test");
++	exit(KSFT_SKIP);
++}
++
++static void setup_system_counter(struct kvm_vm *vm, struct test_case *test)
++{
++	vcpu_access_device_attr(vm, VCPU_ID, KVM_VCPU_TSC_CTRL,
++				KVM_VCPU_TSC_OFFSET, &test->tsc_offset, true);
++}
++
++static uint64_t guest_read_system_counter(struct test_case *test)
++{
++	return rdtsc();
++}
++
++static uint64_t host_read_guest_system_counter(struct test_case *test)
++{
++	return rdtsc() + test->tsc_offset;
++}
++
++#else /* __x86_64__ */
++
++#error test not implemented for this architecture!
++
++#endif
++
++#define GUEST_SYNC_CLOCK(__stage, __val)			\
++		GUEST_SYNC_ARGS(__stage, __val, 0, 0, 0)
++
++static void guest_main(void)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(test_cases); i++) {
++		struct test_case *test = &test_cases[i];
++
++		GUEST_SYNC_CLOCK(i, guest_read_system_counter(test));
++	}
++}
++
++static void handle_sync(struct ucall *uc, uint64_t start, uint64_t end)
++{
++	uint64_t obs = uc->args[2];
++
++	TEST_ASSERT(start <= obs && obs <= end,
++		    "unexpected system counter value: %"PRIu64" expected range: [%"PRIu64", %"PRIu64"]",
++		    obs, start, end);
++
++	pr_info("system counter value: %"PRIu64" expected range [%"PRIu64", %"PRIu64"]\n",
++		obs, start, end);
++}
++
++static void handle_abort(struct ucall *uc)
++{
++	TEST_FAIL("%s at %s:%ld", (const char *)uc->args[0],
++		  __FILE__, uc->args[1]);
++}
++
++static void enter_guest(struct kvm_vm *vm)
++{
++	uint64_t start, end;
++	struct ucall uc;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(test_cases); i++) {
++		struct test_case *test = &test_cases[i];
++
++		setup_system_counter(vm, test);
++		start = host_read_guest_system_counter(test);
++		vcpu_run(vm, VCPU_ID);
++		end = host_read_guest_system_counter(test);
++
++		switch (get_ucall(vm, VCPU_ID, &uc)) {
++		case UCALL_SYNC:
++			handle_sync(&uc, start, end);
++			break;
++		case UCALL_ABORT:
++			handle_abort(&uc);
++			return;
++		default:
++			TEST_ASSERT(0, "unhandled ucall %ld\n",
++				    get_ucall(vm, VCPU_ID, &uc));
++		}
++	}
++}
++
++int main(void)
++{
++	struct kvm_vm *vm;
++
++	vm = vm_create_default(VCPU_ID, 0, guest_main);
++	check_preconditions(vm);
++	ucall_init(vm, NULL);
++
++	enter_guest(vm);
++	kvm_vm_free(vm);
++}
