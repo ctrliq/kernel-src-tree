@@ -1,0 +1,240 @@
+nvmet: support configuring ANA groups
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 62ac0d32f74ea511d5813be728dc589d03f866a3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/62ac0d32.failed
+
+Allow creating non-default ANA groups (group ID > 1).  Groups are created
+either by assigning the group ID to a namespace, or by creating a configfs
+group object under a specific port.  All namespaces assigned to a group
+that doesn't have a configfs object for a given port are marked as
+inaccessible.
+
+Allow changing the ANA state on a per-port basis by creating an
+ana_groups directory under each port, and another directory with an
+ana_state file in it.  The default ANA group 1 directory is created
+automatically for each port.
+
+For all changes in ANA configuration the ANA change AEN is sent.  We only
+keep a global changecount instead of additional per-group changecounts to
+keep the implementation as simple as possible.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Keith Busch <keith.busch@intel.com>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Johannes Thumshirn <jthumshirn@suse.de>
+(cherry picked from commit 62ac0d32f74ea511d5813be728dc589d03f866a3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/target/admin-cmd.c
+#	drivers/nvme/target/configfs.c
+#	drivers/nvme/target/nvmet.h
+diff --cc drivers/nvme/target/admin-cmd.c
+index 16a9b24270f9,d1de639786ee..000000000000
+--- a/drivers/nvme/target/admin-cmd.c
++++ b/drivers/nvme/target/admin-cmd.c
+@@@ -182,6 -182,70 +182,73 @@@ out
+  	nvmet_req_complete(req, status);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 nvmet_format_ana_group(struct nvmet_req *req, u32 grpid,
++ 		struct nvme_ana_group_desc *desc)
++ {
++ 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
++ 	struct nvmet_ns *ns;
++ 	u32 count = 0;
++ 
++ 	if (!(req->cmd->get_log_page.lsp & NVME_ANA_LOG_RGO)) {
++ 		rcu_read_lock();
++ 		list_for_each_entry_rcu(ns, &ctrl->subsys->namespaces, dev_link)
++ 			if (ns->anagrpid == grpid)
++ 				desc->nsids[count++] = cpu_to_le32(ns->nsid);
++ 		rcu_read_unlock();
++ 	}
++ 
++ 	desc->grpid = cpu_to_le32(grpid);
++ 	desc->nnsids = cpu_to_le32(count);
++ 	desc->chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
++ 	desc->state = req->port->ana_state[grpid];
++ 	memset(desc->rsvd17, 0, sizeof(desc->rsvd17));
++ 	return sizeof(struct nvme_ana_group_desc) + count * sizeof(__le32);
++ }
++ 
++ static void nvmet_execute_get_log_page_ana(struct nvmet_req *req)
++ {
++ 	struct nvme_ana_rsp_hdr hdr = { 0, };
++ 	struct nvme_ana_group_desc *desc;
++ 	size_t offset = sizeof(struct nvme_ana_rsp_hdr); /* start beyond hdr */
++ 	size_t len;
++ 	u32 grpid;
++ 	u16 ngrps = 0;
++ 	u16 status;
++ 
++ 	status = NVME_SC_INTERNAL;
++ 	desc = kmalloc(sizeof(struct nvme_ana_group_desc) +
++ 			NVMET_MAX_NAMESPACES * sizeof(__le32), GFP_KERNEL);
++ 	if (!desc)
++ 		goto out;
++ 
++ 	down_read(&nvmet_ana_sem);
++ 	for (grpid = 1; grpid <= NVMET_MAX_ANAGRPS; grpid++) {
++ 		if (!nvmet_ana_group_enabled[grpid])
++ 			continue;
++ 		len = nvmet_format_ana_group(req, grpid, desc);
++ 		status = nvmet_copy_to_sgl(req, offset, desc, len);
++ 		if (status)
++ 			break;
++ 		offset += len;
++ 		ngrps++;
++ 	}
++ 
++ 	hdr.chgcnt = cpu_to_le64(nvmet_ana_chgcnt);
++ 	hdr.ngrps = cpu_to_le16(ngrps);
++ 	clear_bit(NVME_AEN_CFG_ANA_CHANGE, &req->sq->ctrl->aen_masked);
++ 	up_read(&nvmet_ana_sem);
++ 
++ 	kfree(desc);
++ 
++ 	/* copy the header last once we know the number of groups */
++ 	status = nvmet_copy_to_sgl(req, 0, &hdr, sizeof(hdr));
++ out:
++ 	nvmet_req_complete(req, status);
++ }
++ 
+++>>>>>>> 62ac0d32f74e (nvmet: support configuring ANA groups)
+  static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
+  {
+  	struct nvmet_ctrl *ctrl = req->sq->ctrl;
+diff --cc drivers/nvme/target/configfs.c
+index ebed21c35410,51f5a8c092b4..000000000000
+--- a/drivers/nvme/target/configfs.c
++++ b/drivers/nvme/target/configfs.c
+@@@ -489,10 -501,9 +522,11 @@@ static struct configfs_attribute *nvmet
+  	&nvmet_ns_attr_device_path,
+  	&nvmet_ns_attr_device_nguid,
+  	&nvmet_ns_attr_device_uuid,
++ 	&nvmet_ns_attr_ana_grpid,
+  	&nvmet_ns_attr_enable,
+ -	&nvmet_ns_attr_buffered_io,
+ +#ifdef CONFIG_PCI_P2PDMA
+ +	&nvmet_ns_attr_p2pmem,
+ +#endif
+  	NULL,
+  };
+  
+@@@ -982,6 -1123,20 +1145,23 @@@ static struct config_group *nvmet_ports
+  	if (!port)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+++=======
++ 	port->ana_state = kcalloc(NVMET_MAX_ANAGRPS + 1,
++ 			sizeof(*port->ana_state), GFP_KERNEL);
++ 	if (!port->ana_state) {
++ 		kfree(port);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	for (i = 1; i <= NVMET_MAX_ANAGRPS; i++) {
++ 		if (i == NVMET_DEFAULT_ANA_GRPID)
++ 			port->ana_state[1] = NVME_ANA_OPTIMIZED;
++ 		else
++ 			port->ana_state[i] = NVME_ANA_INACCESSIBLE;
++ 	}
++ 
+++>>>>>>> 62ac0d32f74e (nvmet: support configuring ANA groups)
+  	INIT_LIST_HEAD(&port->entry);
+  	INIT_LIST_HEAD(&port->subsystems);
+  	INIT_LIST_HEAD(&port->referrals);
+diff --cc drivers/nvme/target/nvmet.h
+index 89c4b1275043,22941045f46e..000000000000
+--- a/drivers/nvme/target/nvmet.h
++++ b/drivers/nvme/target/nvmet.h
+@@@ -123,6 -127,9 +134,12 @@@ struct nvmet_port 
+  	struct list_head		subsystems;
+  	struct config_group		referrals_group;
+  	struct list_head		referrals;
+++<<<<<<< HEAD
+++=======
++ 	struct config_group		ana_groups_group;
++ 	struct nvmet_ana_group		ana_default_group;
++ 	enum nvme_ana_state		*ana_state;
+++>>>>>>> 62ac0d32f74e (nvmet: support configuring ANA groups)
+  	void				*priv;
+  	bool				enabled;
+  	int				inline_data_size;
+@@@ -376,6 -389,22 +404,25 @@@ u32 nvmet_get_log_page_len(struct nvme_
+  #define NVMET_QUEUE_SIZE	1024
+  #define NVMET_NR_QUEUES		128
+  #define NVMET_MAX_CMD		NVMET_QUEUE_SIZE
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Nice round number that makes a list of nsids fit into a page.
++  * Should become tunable at some point in the future.
++  */
++ #define NVMET_MAX_NAMESPACES	1024
++ 
++ /*
++  * 0 is not a valid ANA group ID, so we start numbering at 1.
++  *
++  * ANA Group 1 exists without manual intervention, has namespaces assigned to it
++  * by default, and is available in an optimized state through all ports.
++  */
++ #define NVMET_MAX_ANAGRPS	128
++ #define NVMET_DEFAULT_ANA_GRPID	1
++ 
+++>>>>>>> 62ac0d32f74e (nvmet: support configuring ANA groups)
+  #define NVMET_KAS		10
+  #define NVMET_DISC_KATO		120
+  
+* Unmerged path drivers/nvme/target/admin-cmd.c
+* Unmerged path drivers/nvme/target/configfs.c
+diff --git a/drivers/nvme/target/core.c b/drivers/nvme/target/core.c
+index cbb053d0f927..5a442ecc9e63 100644
+--- a/drivers/nvme/target/core.c
++++ b/drivers/nvme/target/core.c
+@@ -190,6 +190,33 @@ static void nvmet_ns_changed(struct nvmet_subsys *subsys, u32 nsid)
+ 	}
+ }
+ 
++void nvmet_send_ana_event(struct nvmet_subsys *subsys,
++		struct nvmet_port *port)
++{
++	struct nvmet_ctrl *ctrl;
++
++	mutex_lock(&subsys->lock);
++	list_for_each_entry(ctrl, &subsys->ctrls, subsys_entry) {
++		if (port && ctrl->port != port)
++			continue;
++		if (nvmet_aen_disabled(ctrl, NVME_AEN_CFG_ANA_CHANGE))
++			continue;
++		nvmet_add_async_event(ctrl, NVME_AER_TYPE_NOTICE,
++				NVME_AER_NOTICE_ANA, NVME_LOG_ANA);
++	}
++	mutex_unlock(&subsys->lock);
++}
++
++void nvmet_port_send_ana_event(struct nvmet_port *port)
++{
++	struct nvmet_subsys_link *p;
++
++	down_read(&nvmet_config_sem);
++	list_for_each_entry(p, &port->subsystems, entry)
++		nvmet_send_ana_event(p->subsys, port);
++	up_read(&nvmet_config_sem);
++}
++
+ int nvmet_register_transport(const struct nvmet_fabrics_ops *ops)
+ {
+ 	int ret = 0;
+* Unmerged path drivers/nvme/target/nvmet.h
