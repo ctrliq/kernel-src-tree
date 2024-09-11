@@ -253,7 +253,6 @@ void fuse_put_request(struct fuse_conn *fc, struct fuse_req *req)
 		fuse_request_free(req);
 	}
 }
-EXPORT_SYMBOL_GPL(fuse_put_request);
 
 unsigned int fuse_len_args(unsigned int numargs, struct fuse_arg *args)
 {
