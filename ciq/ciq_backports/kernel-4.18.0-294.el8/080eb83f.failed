@@ -1,0 +1,121 @@
+kasan: initialize shadow to 0xff for tag-based mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 080eb83f54cf5b96ae5b6ce3c1896e35c341aff9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/080eb83f.failed
+
+A tag-based KASAN shadow memory cell contains a memory tag, that
+corresponds to the tag in the top byte of the pointer, that points to that
+memory.  The native top byte value of kernel pointers is 0xff, so with
+tag-based KASAN we need to initialize shadow memory to 0xff.
+
+[cai@lca.pw: arm64: skip kmemleak for KASAN again\
+  Link: http://lkml.kernel.org/r/20181226020550.63712-1-cai@lca.pw
+Link: http://lkml.kernel.org/r/5cc1b789aad7c99cf4f3ec5b328b147ad53edb40.1544099024.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 080eb83f54cf5b96ae5b6ce3c1896e35c341aff9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+diff --cc include/linux/kasan.h
+index fa457ffe3494,c56af24bd3e7..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -155,4 -151,24 +155,27 @@@ static inline size_t kasan_metadata_siz
+  
+  #endif /* CONFIG_KASAN */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_GENERIC
++ 
++ #define KASAN_SHADOW_INIT 0
++ 
++ void kasan_cache_shrink(struct kmem_cache *cache);
++ void kasan_cache_shutdown(struct kmem_cache *cache);
++ 
++ #else /* CONFIG_KASAN_GENERIC */
++ 
++ static inline void kasan_cache_shrink(struct kmem_cache *cache) {}
++ static inline void kasan_cache_shutdown(struct kmem_cache *cache) {}
++ 
++ #endif /* CONFIG_KASAN_GENERIC */
++ 
++ #ifdef CONFIG_KASAN_SW_TAGS
++ 
++ #define KASAN_SHADOW_INIT 0xFF
++ 
++ #endif /* CONFIG_KASAN_SW_TAGS */
++ 
+++>>>>>>> 080eb83f54cf (kasan: initialize shadow to 0xff for tag-based mode)
+  #endif /* LINUX_KASAN_H */
+diff --git a/arch/arm64/mm/kasan_init.c b/arch/arm64/mm/kasan_init.c
+index 26fefff7f86f..062a4bc8295f 100644
+--- a/arch/arm64/mm/kasan_init.c
++++ b/arch/arm64/mm/kasan_init.c
+@@ -43,6 +43,14 @@ static phys_addr_t __init kasan_alloc_zeroed_page(int node)
+ 	return __pa(p);
+ }
+ 
++static phys_addr_t __init kasan_alloc_raw_page(int node)
++{
++	void *p = memblock_alloc_try_nid_raw(PAGE_SIZE, PAGE_SIZE,
++						__pa(MAX_DMA_ADDRESS),
++						MEMBLOCK_ALLOC_KASAN, node);
++	return __pa(p);
++}
++
+ static pte_t *__init kasan_pte_offset(pmd_t *pmdp, unsigned long addr, int node,
+ 				      bool early)
+ {
+@@ -92,7 +100,9 @@ static void __init kasan_pte_populate(pmd_t *pmdp, unsigned long addr,
+ 	do {
+ 		phys_addr_t page_phys = early ?
+ 				__pa_symbol(kasan_early_shadow_page)
+-					: kasan_alloc_zeroed_page(node);
++					: kasan_alloc_raw_page(node);
++		if (!early)
++			memset(__va(page_phys), KASAN_SHADOW_INIT, PAGE_SIZE);
+ 		next = addr + PAGE_SIZE;
+ 		set_pte(ptep, pfn_pte(__phys_to_pfn(page_phys), PAGE_KERNEL));
+ 	} while (ptep++, addr = next, addr != end && pte_none(READ_ONCE(*ptep)));
+@@ -239,7 +249,7 @@ void __init kasan_init(void)
+ 			pfn_pte(sym_to_pfn(kasan_early_shadow_page),
+ 				PAGE_KERNEL_RO));
+ 
+-	memset(kasan_early_shadow_page, 0, PAGE_SIZE);
++	memset(kasan_early_shadow_page, KASAN_SHADOW_INIT, PAGE_SIZE);
+ 	cpu_replace_ttbr1(lm_alias(swapper_pg_dir));
+ 
+ 	/* At this point kasan is fully initialized. Enable error messages */
+* Unmerged path include/linux/kasan.h
+diff --git a/mm/kasan/kasan.c b/mm/kasan/kasan.c
+index 2913fdd4758a..df7bdb040aac 100644
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@ -635,11 +635,12 @@ int kasan_module_alloc(void *addr, size_t size)
+ 
+ 	ret = __vmalloc_node_range(shadow_size, 1, shadow_start,
+ 			shadow_start + shadow_size,
+-			GFP_KERNEL | __GFP_ZERO,
++			GFP_KERNEL,
+ 			PAGE_KERNEL, VM_NO_GUARD, NUMA_NO_NODE,
+ 			__builtin_return_address(0));
+ 
+ 	if (ret) {
++		__memset(ret, KASAN_SHADOW_INIT, shadow_size);
+ 		find_vm_area(addr)->flags |= VM_KASAN;
+ 		kmemleak_ignore(ret);
+ 		return 0;
