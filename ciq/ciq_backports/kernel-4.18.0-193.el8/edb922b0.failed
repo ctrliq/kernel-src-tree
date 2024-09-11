@@ -1,0 +1,236 @@
+drm/amd/display: Program DWB watermarks from correct state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Parkin <julian.parkin@amd.com>
+commit edb922b022c0c94805c4ffad202b3edff83d76f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/edb922b0.failed
+
+[Why]
+When diags adds a DWB via a stream update, we calculate MMHUBBUB
+paramaters, but dc->current_state has not yet been updated
+when the DWB programming happens. This leads to overflow on
+high bandwidth tests since the incorrect MMHUBBUB arbitration
+parameters are programmed.
+
+[How]
+Pass the updated context down to the (enable|update)_writeback functions
+so that they can use the correct watermarks when programming MMHUBBUB.
+
+	Signed-off-by: Julian Parkin <julian.parkin@amd.com>
+	Reviewed-by: Dmytro Laktyushkin <Dmytro.Laktyushkin@amd.com>
+	Acked-by: Bhawanpreet Lakha <Bhawanpreet.Lakha@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit edb922b022c0c94805c4ffad202b3edff83d76f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+#	drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+#	drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+diff --cc drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+index 996298c35f42,bb09243758fe..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+@@@ -295,6 -367,121 +295,124 @@@ bool dc_stream_set_cursor_position
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #if defined(CONFIG_DRM_AMD_DC_DCN2_0)
++ bool dc_stream_add_writeback(struct dc *dc,
++ 		struct dc_stream_state *stream,
++ 		struct dc_writeback_info *wb_info)
++ {
++ 	bool isDrc = false;
++ 	int i = 0;
++ 	struct dwbc *dwb;
++ 
++ 	if (stream == NULL) {
++ 		dm_error("DC: dc_stream is NULL!\n");
++ 		return false;
++ 	}
++ 
++ 	if (wb_info == NULL) {
++ 		dm_error("DC: dc_writeback_info is NULL!\n");
++ 		return false;
++ 	}
++ 
++ 	if (wb_info->dwb_pipe_inst >= MAX_DWB_PIPES) {
++ 		dm_error("DC: writeback pipe is invalid!\n");
++ 		return false;
++ 	}
++ 
++ 	wb_info->dwb_params.out_transfer_func = stream->out_transfer_func;
++ 
++ 	dwb = dc->res_pool->dwbc[wb_info->dwb_pipe_inst];
++ 	dwb->dwb_is_drc = false;
++ 
++ 	/* recalculate and apply DML parameters */
++ 
++ 	for (i = 0; i < stream->num_wb_info; i++) {
++ 		/*dynamic update*/
++ 		if (stream->writeback_info[i].wb_enabled &&
++ 			stream->writeback_info[i].dwb_pipe_inst == wb_info->dwb_pipe_inst) {
++ 			stream->writeback_info[i] = *wb_info;
++ 			isDrc = true;
++ 		}
++ 	}
++ 
++ 	if (!isDrc) {
++ 		stream->writeback_info[stream->num_wb_info++] = *wb_info;
++ 	}
++ 
++ 	if (!dc->hwss.update_bandwidth(dc, dc->current_state)) {
++ 		dm_error("DC: update_bandwidth failed!\n");
++ 		return false;
++ 	}
++ 
++ 	/* enable writeback */
++ 	if (dc->hwss.enable_writeback) {
++ 		struct dc_stream_status *stream_status = dc_stream_get_status(stream);
++ 		struct dwbc *dwb = dc->res_pool->dwbc[wb_info->dwb_pipe_inst];
++ 
++ 		if (dwb->funcs->is_enabled(dwb)) {
++ 			/* writeback pipe already enabled, only need to update */
++ 			dc->hwss.update_writeback(dc, stream_status, wb_info, dc->current_state);
++ 		} else {
++ 			/* Enable writeback pipe from scratch*/
++ 			dc->hwss.enable_writeback(dc, stream_status, wb_info, dc->current_state);
++ 		}
++ 	}
++ 
++ 	return true;
++ }
++ 
++ bool dc_stream_remove_writeback(struct dc *dc,
++ 		struct dc_stream_state *stream,
++ 		uint32_t dwb_pipe_inst)
++ {
++ 	int i = 0, j = 0;
++ 	if (stream == NULL) {
++ 		dm_error("DC: dc_stream is NULL!\n");
++ 		return false;
++ 	}
++ 
++ 	if (dwb_pipe_inst >= MAX_DWB_PIPES) {
++ 		dm_error("DC: writeback pipe is invalid!\n");
++ 		return false;
++ 	}
++ 
++ //	stream->writeback_info[dwb_pipe_inst].wb_enabled = false;
++ 	for (i = 0; i < stream->num_wb_info; i++) {
++ 		/*dynamic update*/
++ 		if (stream->writeback_info[i].wb_enabled &&
++ 			stream->writeback_info[i].dwb_pipe_inst == dwb_pipe_inst) {
++ 			stream->writeback_info[i].wb_enabled = false;
++ 		}
++ 	}
++ 
++ 	/* remove writeback info for disabled writeback pipes from stream */
++ 	for (i = 0, j = 0; i < stream->num_wb_info; i++) {
++ 		if (stream->writeback_info[i].wb_enabled) {
++ 			if (i != j)
++ 				/* trim the array */
++ 				stream->writeback_info[j] = stream->writeback_info[i];
++ 			j++;
++ 		}
++ 	}
++ 	stream->num_wb_info = j;
++ 
++ 	/* recalculate and apply DML parameters */
++ 	if (!dc->hwss.update_bandwidth(dc, dc->current_state)) {
++ 		dm_error("DC: update_bandwidth failed!\n");
++ 		return false;
++ 	}
++ 
++ 	/* disable writeback */
++ 	if (dc->hwss.disable_writeback)
++ 		dc->hwss.disable_writeback(dc, dwb_pipe_inst);
++ 
++ 	return true;
++ }
++ #endif
++ 
+++>>>>>>> edb922b022c0 (drm/amd/display: Program DWB watermarks from correct state)
+  uint32_t dc_stream_get_vblank_counter(const struct dc_stream_state *stream)
+  {
+  	uint8_t i;
+diff --cc drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+index 7676f25216b1,e775d7aa062f..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
++++ b/drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
+@@@ -231,6 -291,63 +231,66 @@@ struct hw_sequencer_funcs 
+  
+  	void (*setup_periodic_interrupt)(struct pipe_ctx *pipe_ctx, enum vline_select vline);
+  	void (*setup_vupdate_interrupt)(struct pipe_ctx *pipe_ctx);
+++<<<<<<< HEAD
+++=======
++ 	bool (*did_underflow_occur)(struct dc *dc, struct pipe_ctx *pipe_ctx);
++ 
++ 	void (*init_blank)(struct dc *dc, struct timing_generator *tg);
++ 	void (*disable_vga)(struct dce_hwseq *hws);
++ 	void (*bios_golden_init)(struct dc *dc);
++ 	void (*plane_atomic_power_down)(struct dc *dc,
++ 			struct dpp *dpp,
++ 			struct hubp *hubp);
++ 
++ 	void (*plane_atomic_disable)(
++ 			struct dc *dc, struct pipe_ctx *pipe_ctx);
++ 
++ 	void (*enable_power_gating_plane)(
++ 		struct dce_hwseq *hws,
++ 		bool enable);
++ 
++ 	void (*dpp_pg_control)(
++ 			struct dce_hwseq *hws,
++ 			unsigned int dpp_inst,
++ 			bool power_on);
++ 
++ 	void (*hubp_pg_control)(
++ 			struct dce_hwseq *hws,
++ 			unsigned int hubp_inst,
++ 			bool power_on);
++ 
++ 	void (*dsc_pg_control)(
++ 			struct dce_hwseq *hws,
++ 			unsigned int dsc_inst,
++ 			bool power_on);
++ 
++ 
++ #if defined(CONFIG_DRM_AMD_DC_DCN2_0)
++ 	void (*update_odm)(struct dc *dc, struct dc_state *context, struct pipe_ctx *pipe_ctx);
++ 	void (*program_all_writeback_pipes_in_tree)(
++ 			struct dc *dc,
++ 			const struct dc_stream_state *stream,
++ 			struct dc_state *context);
++ 	void (*update_writeback)(struct dc *dc,
++ 			const struct dc_stream_status *stream_status,
++ 			struct dc_writeback_info *wb_info,
++ 			struct dc_state *context);
++ 	void (*enable_writeback)(struct dc *dc,
++ 			const struct dc_stream_status *stream_status,
++ 			struct dc_writeback_info *wb_info,
++ 			struct dc_state *context);
++ 	void (*disable_writeback)(struct dc *dc,
++ 			unsigned int dwb_pipe_inst);
++ #endif
++ 	enum dc_status (*set_clock)(struct dc *dc,
++ 			enum dc_clock_type clock_type,
++ 			uint32_t clk_khz,
++ 			uint32_t stepping);
++ 
++ 	void (*get_clock)(struct dc *dc,
++ 			enum dc_clock_type clock_type,
++ 			struct dc_clock_config *clock_cfg);
+++>>>>>>> edb922b022c0 (drm/amd/display: Program DWB watermarks from correct state)
+  
+  };
+  
+* Unmerged path drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+* Unmerged path drivers/gpu/drm/amd/display/dc/core/dc_stream.c
+* Unmerged path drivers/gpu/drm/amd/display/dc/dcn20/dcn20_hwseq.c
+* Unmerged path drivers/gpu/drm/amd/display/dc/inc/hw_sequencer.h
