@@ -1,0 +1,478 @@
+powerpc/pseries: Avoid using addr_to_pfn in real mode
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ganesh Goudar <ganeshgr@linux.ibm.com>
+commit 4ff753feab021242144818b9a3ba011238218145
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4ff753fe.failed
+
+When an UE or memory error exception is encountered the MCE handler
+tries to find the pfn using addr_to_pfn() which takes effective
+address as an argument, later pfn is used to poison the page where
+memory error occurred, recent rework in this area made addr_to_pfn
+to run in real mode, which can be fatal as it may try to access
+memory outside RMO region.
+
+Have two helper functions to separate things to be done in real mode
+and virtual mode without changing any functionality. This also fixes
+the following error as the use of addr_to_pfn is now moved to virtual
+mode.
+
+Without this change following kernel crash is seen on hitting UE.
+
+[  485.128036] Oops: Kernel access of bad area, sig: 11 [#1]
+[  485.128040] LE SMP NR_CPUS=2048 NUMA pSeries
+[  485.128047] Modules linked in:
+[  485.128067] CPU: 15 PID: 6536 Comm: insmod Kdump: loaded Tainted: G OE 5.7.0 #22
+[  485.128074] NIP:  c00000000009b24c LR: c0000000000398d8 CTR: c000000000cd57c0
+[  485.128078] REGS: c000000003f1f970 TRAP: 0300   Tainted: G OE (5.7.0)
+[  485.128082] MSR:  8000000000001003 <SF,ME,RI,LE>  CR: 28008284  XER: 00000001
+[  485.128088] CFAR: c00000000009b190 DAR: c0000001fab00000 DSISR: 40000000 IRQMASK: 1
+[  485.128088] GPR00: 0000000000000001 c000000003f1fbf0 c000000001634300 0000b0fa01000000
+[  485.128088] GPR04: d000000002220000 0000000000000000 00000000fab00000 0000000000000022
+[  485.128088] GPR08: c0000001fab00000 0000000000000000 c0000001fab00000 c000000003f1fc14
+[  485.128088] GPR12: 0000000000000008 c000000003ff5880 d000000002100008 0000000000000000
+[  485.128088] GPR16: 000000000000ff20 000000000000fff1 000000000000fff2 d0000000021a1100
+[  485.128088] GPR20: d000000002200000 c00000015c893c50 c000000000d49b28 c00000015c893c50
+[  485.128088] GPR24: d0000000021a0d08 c0000000014e5da8 d0000000021a0818 000000000000000a
+[  485.128088] GPR28: 0000000000000008 000000000000000a c0000000017e2970 000000000000000a
+[  485.128125] NIP [c00000000009b24c] __find_linux_pte+0x11c/0x310
+[  485.128130] LR [c0000000000398d8] addr_to_pfn+0x138/0x170
+[  485.128133] Call Trace:
+[  485.128135] Instruction dump:
+[  485.128138] 3929ffff 7d4a3378 7c883c36 7d2907b4 794a1564 7d294038 794af082 3900ffff
+[  485.128144] 79291f24 790af00e 78e70020 7d095214 <7c69502a> 2fa30000 419e011c 70690040
+[  485.128152] ---[ end trace d34b27e29ae0e340 ]---
+
+Fixes: 9ca766f9891d ("powerpc/64s/pseries: machine check convert to use common event code")
+	Signed-off-by: Ganesh Goudar <ganeshgr@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200724063946.21378-1-ganeshgr@linux.ibm.com
+(cherry picked from commit 4ff753feab021242144818b9a3ba011238218145)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/ras.c
+diff --cc arch/powerpc/platforms/pseries/ras.c
+index fa1449d4c5f5,b2b245b25edb..000000000000
+--- a/arch/powerpc/platforms/pseries/ras.c
++++ b/arch/powerpc/platforms/pseries/ras.c
+@@@ -523,186 -521,232 +523,415 @@@ int pSeries_system_reset_exception(stru
+  	return 0; /* need to perform reset */
+  }
+  
+++<<<<<<< HEAD
+ +#define VAL_TO_STRING(ar, val)	\
+ +	(((val) < ARRAY_SIZE(ar)) ? ar[(val)] : "Unknown")
+ +
+ +static void pseries_print_mce_info(struct pt_regs *regs,
+ +				   struct rtas_error_log *errp)
+ +{
+ +	const char *level, *sevstr;
+ +	struct pseries_errorlog *pseries_log;
+ +	struct pseries_mc_errorlog *mce_log;
+ +	u8 error_type, err_sub_type;
+ +	u64 addr;
+ +	u8 initiator = rtas_error_initiator(errp);
+ +	int disposition = rtas_error_disposition(errp);
+ +
+ +	static const char * const initiators[] = {
+ +		[0] = "Unknown",
+ +		[1] = "CPU",
+ +		[2] = "PCI",
+ +		[3] = "ISA",
+ +		[4] = "Memory",
+ +		[5] = "Power Mgmt",
+ +	};
+ +	static const char * const mc_err_types[] = {
+ +		[0] = "UE",
+ +		[1] = "SLB",
+ +		[2] = "ERAT",
+ +		[3] = "Unknown",
+ +		[4] = "TLB",
+ +		[5] = "D-Cache",
+ +		[6] = "Unknown",
+ +		[7] = "I-Cache",
+ +	};
+ +	static const char * const mc_ue_types[] = {
+ +		[0] = "Indeterminate",
+ +		[1] = "Instruction fetch",
+ +		[2] = "Page table walk ifetch",
+ +		[3] = "Load/Store",
+ +		[4] = "Page table walk Load/Store",
+ +	};
+ +
+ +	/* SLB sub errors valid values are 0x0, 0x1, 0x2 */
+ +	static const char * const mc_slb_types[] = {
+ +		[0] = "Parity",
+ +		[1] = "Multihit",
+ +		[2] = "Indeterminate",
+ +	};
+ +
+ +	/* TLB and ERAT sub errors valid values are 0x1, 0x2, 0x3 */
+ +	static const char * const mc_soft_types[] = {
+ +		[0] = "Unknown",
+ +		[1] = "Parity",
+ +		[2] = "Multihit",
+ +		[3] = "Indeterminate",
+ +	};
+ +
+ +	if (!rtas_error_extended(errp)) {
+ +		pr_err("Machine check interrupt: Missing extended error log\n");
+ +		return;
+ +	}
+ +
+ +	pseries_log = get_pseries_errorlog(errp, PSERIES_ELOG_SECT_ID_MCE);
+ +	if (pseries_log == NULL)
+ +		return;
+ +
+ +	mce_log = (struct pseries_mc_errorlog *)pseries_log->data;
+ +
+ +	error_type = mce_log->error_type;
+ +	err_sub_type = rtas_mc_error_sub_type(mce_log);
+ +
+ +	switch (rtas_error_severity(errp)) {
+ +	case RTAS_SEVERITY_NO_ERROR:
+ +		level = KERN_INFO;
+ +		sevstr = "Harmless";
+ +		break;
+ +	case RTAS_SEVERITY_WARNING:
+ +		level = KERN_WARNING;
+ +		sevstr = "";
+ +		break;
+ +	case RTAS_SEVERITY_ERROR:
+ +	case RTAS_SEVERITY_ERROR_SYNC:
+ +		level = KERN_ERR;
+ +		sevstr = "Severe";
+ +		break;
+ +	case RTAS_SEVERITY_FATAL:
+ +	default:
+ +		level = KERN_ERR;
+ +		sevstr = "Fatal";
+ +		break;
+ +	}
+ +
+ +#ifdef CONFIG_PPC_BOOK3S_64
+ +	/* Display faulty slb contents for SLB errors. */
+ +	if (error_type == MC_ERROR_TYPE_SLB)
+ +		slb_dump_contents(local_paca->mce_faulty_slbs);
+ +#endif
+ +
+ +	printk("%s%s Machine check interrupt [%s]\n", level, sevstr,
+ +	       disposition == RTAS_DISP_FULLY_RECOVERED ?
+ +	       "Recovered" : "Not recovered");
+ +	if (user_mode(regs)) {
+ +		printk("%s  NIP: [%016lx] PID: %d Comm: %s\n", level,
+ +		       regs->nip, current->pid, current->comm);
+ +	} else {
+ +		printk("%s  NIP [%016lx]: %pS\n", level, regs->nip,
+ +		       (void *)regs->nip);
+ +	}
+ +	printk("%s  Initiator: %s\n", level,
+ +	       VAL_TO_STRING(initiators, initiator));
+ +
+ +	switch (error_type) {
+ +	case MC_ERROR_TYPE_UE:
+ +		printk("%s  Error type: %s [%s]\n", level,
+ +		       VAL_TO_STRING(mc_err_types, error_type),
+ +		       VAL_TO_STRING(mc_ue_types, err_sub_type));
+ +		break;
+ +	case MC_ERROR_TYPE_SLB:
+ +		printk("%s  Error type: %s [%s]\n", level,
+ +		       VAL_TO_STRING(mc_err_types, error_type),
+ +		       VAL_TO_STRING(mc_slb_types, err_sub_type));
+ +		break;
+ +	case MC_ERROR_TYPE_ERAT:
+ +	case MC_ERROR_TYPE_TLB:
+ +		printk("%s  Error type: %s [%s]\n", level,
+ +		       VAL_TO_STRING(mc_err_types, error_type),
+ +		       VAL_TO_STRING(mc_soft_types, err_sub_type));
+ +		break;
+ +	default:
+ +		printk("%s  Error type: %s\n", level,
+ +		       VAL_TO_STRING(mc_err_types, error_type));
+ +		break;
+ +	}
+ +
+ +	addr = rtas_mc_get_effective_addr(mce_log);
+ +	if (addr)
+ +		printk("%s    Effective address: %016llx\n", level, addr);
+ +}
+ +
+ +static int mce_handle_error(struct rtas_error_log *errp)
+ +{
+ +	struct pseries_errorlog *pseries_log;
+ +	struct pseries_mc_errorlog *mce_log;
+ +	int disposition = rtas_error_disposition(errp);
+ +	u8 error_type;
+ +
+ +	if (!rtas_error_extended(errp))
+ +		goto out;
+ +
+ +	pseries_log = get_pseries_errorlog(errp, PSERIES_ELOG_SECT_ID_MCE);
+ +	if (pseries_log == NULL)
+ +		goto out;
+ +
+ +	mce_log = (struct pseries_mc_errorlog *)pseries_log->data;
+ +	error_type = mce_log->error_type;
+ +
+ +#ifdef CONFIG_PPC_BOOK3S_64
+ +	if (disposition == RTAS_DISP_NOT_RECOVERED) {
+ +		switch (error_type) {
+ +		case	MC_ERROR_TYPE_SLB:
+ +		case	MC_ERROR_TYPE_ERAT:
+ +			/*
+ +			 * Store the old slb content in paca before flushing.
+ +			 * Print this when we go to virtual mode.
+ +			 * There are chances that we may hit MCE again if there
+ +			 * is a parity error on the SLB entry we trying to read
+ +			 * for saving. Hence limit the slb saving to single
+ +			 * level of recursion.
+ +			 */
+ +			if (local_paca->in_mce == 1)
+ +				slb_save_contents(local_paca->mce_faulty_slbs);
+ +			flush_and_reload_slb();
+ +			disposition = RTAS_DISP_FULLY_RECOVERED;
+ +			rtas_set_disposition_recovered(errp);
+ +			break;
+ +		default:
+ +			break;
+ +		}
+ +	}
+ +#endif
+ +
+ +out:
+++=======
++ static int mce_handle_err_realmode(int disposition, u8 error_type)
++ {
++ #ifdef CONFIG_PPC_BOOK3S_64
++ 	if (disposition == RTAS_DISP_NOT_RECOVERED) {
++ 		switch (error_type) {
++ 		case	MC_ERROR_TYPE_SLB:
++ 		case	MC_ERROR_TYPE_ERAT:
++ 			/*
++ 			 * Store the old slb content in paca before flushing.
++ 			 * Print this when we go to virtual mode.
++ 			 * There are chances that we may hit MCE again if there
++ 			 * is a parity error on the SLB entry we trying to read
++ 			 * for saving. Hence limit the slb saving to single
++ 			 * level of recursion.
++ 			 */
++ 			if (local_paca->in_mce == 1)
++ 				slb_save_contents(local_paca->mce_faulty_slbs);
++ 			flush_and_reload_slb();
++ 			disposition = RTAS_DISP_FULLY_RECOVERED;
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	} else if (disposition == RTAS_DISP_LIMITED_RECOVERY) {
++ 		/* Platform corrected itself but could be degraded */
++ 		pr_err("MCE: limited recovery, system may be degraded\n");
++ 		disposition = RTAS_DISP_FULLY_RECOVERED;
++ 	}
++ #endif
++ 	return disposition;
++ }
++ 
++ static int mce_handle_err_virtmode(struct pt_regs *regs,
++ 				   struct rtas_error_log *errp,
++ 				   struct pseries_mc_errorlog *mce_log,
++ 				   int disposition)
++ {
++ 	struct mce_error_info mce_err = { 0 };
++ 	int initiator = rtas_error_initiator(errp);
++ 	int severity = rtas_error_severity(errp);
++ 	unsigned long eaddr = 0, paddr = 0;
++ 	u8 error_type, err_sub_type;
++ 
++ 	if (!mce_log)
++ 		goto out;
++ 
++ 	error_type = mce_log->error_type;
++ 	err_sub_type = rtas_mc_error_sub_type(mce_log);
++ 
++ 	if (initiator == RTAS_INITIATOR_UNKNOWN)
++ 		mce_err.initiator = MCE_INITIATOR_UNKNOWN;
++ 	else if (initiator == RTAS_INITIATOR_CPU)
++ 		mce_err.initiator = MCE_INITIATOR_CPU;
++ 	else if (initiator == RTAS_INITIATOR_PCI)
++ 		mce_err.initiator = MCE_INITIATOR_PCI;
++ 	else if (initiator == RTAS_INITIATOR_ISA)
++ 		mce_err.initiator = MCE_INITIATOR_ISA;
++ 	else if (initiator == RTAS_INITIATOR_MEMORY)
++ 		mce_err.initiator = MCE_INITIATOR_MEMORY;
++ 	else if (initiator == RTAS_INITIATOR_POWERMGM)
++ 		mce_err.initiator = MCE_INITIATOR_POWERMGM;
++ 	else
++ 		mce_err.initiator = MCE_INITIATOR_UNKNOWN;
++ 
++ 	if (severity == RTAS_SEVERITY_NO_ERROR)
++ 		mce_err.severity = MCE_SEV_NO_ERROR;
++ 	else if (severity == RTAS_SEVERITY_EVENT)
++ 		mce_err.severity = MCE_SEV_WARNING;
++ 	else if (severity == RTAS_SEVERITY_WARNING)
++ 		mce_err.severity = MCE_SEV_WARNING;
++ 	else if (severity == RTAS_SEVERITY_ERROR_SYNC)
++ 		mce_err.severity = MCE_SEV_SEVERE;
++ 	else if (severity == RTAS_SEVERITY_ERROR)
++ 		mce_err.severity = MCE_SEV_SEVERE;
++ 	else if (severity == RTAS_SEVERITY_FATAL)
++ 		mce_err.severity = MCE_SEV_FATAL;
++ 	else
++ 		mce_err.severity = MCE_SEV_FATAL;
++ 
++ 	if (severity <= RTAS_SEVERITY_ERROR_SYNC)
++ 		mce_err.sync_error = true;
++ 	else
++ 		mce_err.sync_error = false;
++ 
++ 	mce_err.error_type = MCE_ERROR_TYPE_UNKNOWN;
++ 	mce_err.error_class = MCE_ECLASS_UNKNOWN;
++ 
++ 	switch (error_type) {
++ 	case MC_ERROR_TYPE_UE:
++ 		mce_err.error_type = MCE_ERROR_TYPE_UE;
++ 		mce_common_process_ue(regs, &mce_err);
++ 		if (mce_err.ignore_event)
++ 			disposition = RTAS_DISP_FULLY_RECOVERED;
++ 		switch (err_sub_type) {
++ 		case MC_ERROR_UE_IFETCH:
++ 			mce_err.u.ue_error_type = MCE_UE_ERROR_IFETCH;
++ 			break;
++ 		case MC_ERROR_UE_PAGE_TABLE_WALK_IFETCH:
++ 			mce_err.u.ue_error_type = MCE_UE_ERROR_PAGE_TABLE_WALK_IFETCH;
++ 			break;
++ 		case MC_ERROR_UE_LOAD_STORE:
++ 			mce_err.u.ue_error_type = MCE_UE_ERROR_LOAD_STORE;
++ 			break;
++ 		case MC_ERROR_UE_PAGE_TABLE_WALK_LOAD_STORE:
++ 			mce_err.u.ue_error_type = MCE_UE_ERROR_PAGE_TABLE_WALK_LOAD_STORE;
++ 			break;
++ 		case MC_ERROR_UE_INDETERMINATE:
++ 		default:
++ 			mce_err.u.ue_error_type = MCE_UE_ERROR_INDETERMINATE;
++ 			break;
++ 		}
++ 		if (mce_log->sub_err_type & UE_EFFECTIVE_ADDR_PROVIDED)
++ 			eaddr = be64_to_cpu(mce_log->effective_address);
++ 
++ 		if (mce_log->sub_err_type & UE_LOGICAL_ADDR_PROVIDED) {
++ 			paddr = be64_to_cpu(mce_log->logical_address);
++ 		} else if (mce_log->sub_err_type & UE_EFFECTIVE_ADDR_PROVIDED) {
++ 			unsigned long pfn;
++ 
++ 			pfn = addr_to_pfn(regs, eaddr);
++ 			if (pfn != ULONG_MAX)
++ 				paddr = pfn << PAGE_SHIFT;
++ 		}
++ 
++ 		break;
++ 	case MC_ERROR_TYPE_SLB:
++ 		mce_err.error_type = MCE_ERROR_TYPE_SLB;
++ 		switch (err_sub_type) {
++ 		case MC_ERROR_SLB_PARITY:
++ 			mce_err.u.slb_error_type = MCE_SLB_ERROR_PARITY;
++ 			break;
++ 		case MC_ERROR_SLB_MULTIHIT:
++ 			mce_err.u.slb_error_type = MCE_SLB_ERROR_MULTIHIT;
++ 			break;
++ 		case MC_ERROR_SLB_INDETERMINATE:
++ 		default:
++ 			mce_err.u.slb_error_type = MCE_SLB_ERROR_INDETERMINATE;
++ 			break;
++ 		}
++ 		if (mce_log->sub_err_type & 0x80)
++ 			eaddr = be64_to_cpu(mce_log->effective_address);
++ 		break;
++ 	case MC_ERROR_TYPE_ERAT:
++ 		mce_err.error_type = MCE_ERROR_TYPE_ERAT;
++ 		switch (err_sub_type) {
++ 		case MC_ERROR_ERAT_PARITY:
++ 			mce_err.u.erat_error_type = MCE_ERAT_ERROR_PARITY;
++ 			break;
++ 		case MC_ERROR_ERAT_MULTIHIT:
++ 			mce_err.u.erat_error_type = MCE_ERAT_ERROR_MULTIHIT;
++ 			break;
++ 		case MC_ERROR_ERAT_INDETERMINATE:
++ 		default:
++ 			mce_err.u.erat_error_type = MCE_ERAT_ERROR_INDETERMINATE;
++ 			break;
++ 		}
++ 		if (mce_log->sub_err_type & 0x80)
++ 			eaddr = be64_to_cpu(mce_log->effective_address);
++ 		break;
++ 	case MC_ERROR_TYPE_TLB:
++ 		mce_err.error_type = MCE_ERROR_TYPE_TLB;
++ 		switch (err_sub_type) {
++ 		case MC_ERROR_TLB_PARITY:
++ 			mce_err.u.tlb_error_type = MCE_TLB_ERROR_PARITY;
++ 			break;
++ 		case MC_ERROR_TLB_MULTIHIT:
++ 			mce_err.u.tlb_error_type = MCE_TLB_ERROR_MULTIHIT;
++ 			break;
++ 		case MC_ERROR_TLB_INDETERMINATE:
++ 		default:
++ 			mce_err.u.tlb_error_type = MCE_TLB_ERROR_INDETERMINATE;
++ 			break;
++ 		}
++ 		if (mce_log->sub_err_type & 0x80)
++ 			eaddr = be64_to_cpu(mce_log->effective_address);
++ 		break;
++ 	case MC_ERROR_TYPE_D_CACHE:
++ 		mce_err.error_type = MCE_ERROR_TYPE_DCACHE;
++ 		break;
++ 	case MC_ERROR_TYPE_I_CACHE:
++ 		mce_err.error_type = MCE_ERROR_TYPE_DCACHE;
++ 		break;
++ 	case MC_ERROR_TYPE_UNKNOWN:
++ 	default:
++ 		mce_err.error_type = MCE_ERROR_TYPE_UNKNOWN;
++ 		break;
++ 	}
++ out:
++ 	save_mce_event(regs, disposition == RTAS_DISP_FULLY_RECOVERED,
++ 		       &mce_err, regs->nip, eaddr, paddr);
++ 	return disposition;
++ }
++ 
++ static int mce_handle_error(struct pt_regs *regs, struct rtas_error_log *errp)
++ {
++ 	struct pseries_errorlog *pseries_log;
++ 	struct pseries_mc_errorlog *mce_log = NULL;
++ 	int disposition = rtas_error_disposition(errp);
++ 	u8 error_type;
++ 
++ 	if (!rtas_error_extended(errp))
++ 		goto out;
++ 
++ 	pseries_log = get_pseries_errorlog(errp, PSERIES_ELOG_SECT_ID_MCE);
++ 	if (!pseries_log)
++ 		goto out;
++ 
++ 	mce_log = (struct pseries_mc_errorlog *)pseries_log->data;
++ 	error_type = mce_log->error_type;
++ 
++ 	disposition = mce_handle_err_realmode(disposition, error_type);
++ 
++ 	/*
++ 	 * Enable translation as we will be accessing per-cpu variables
++ 	 * in save_mce_event() which may fall outside RMO region, also
++ 	 * leave it enabled because subsequently we will be queuing work
++ 	 * to workqueues where again per-cpu variables accessed, besides
++ 	 * fwnmi_release_errinfo() crashes when called in realmode on
++ 	 * pseries.
++ 	 * Note: All the realmode handling like flushing SLB entries for
++ 	 *       SLB multihit is done by now.
++ 	 */
++ out:
++ 	mtmsr(mfmsr() | MSR_IR | MSR_DR);
++ 	disposition = mce_handle_err_virtmode(regs, errp, mce_log,
++ 					      disposition);
+++>>>>>>> 4ff753feab02 (powerpc/pseries: Avoid using addr_to_pfn in real mode)
+  	return disposition;
+  }
+  
+* Unmerged path arch/powerpc/platforms/pseries/ras.c
