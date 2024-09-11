@@ -1,0 +1,225 @@
+x86/CPU/AMD: Remove amd_get_nb_id()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Yazen Ghannam <yazen.ghannam@amd.com>
+commit db970bd231c2264a062e0de4dcf4ead5e6669e7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/db970bd2.failed
+
+The Last Level Cache ID is returned by amd_get_nb_id(). In practice,
+this value is the same as the AMD NodeId for callers of this function.
+The NodeId is saved in struct cpuinfo_x86.cpu_die_id.
+
+Replace calls to amd_get_nb_id() with the logical CPU's cpu_die_id and
+remove the function.
+
+	Signed-off-by: Yazen Ghannam <yazen.ghannam@amd.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20201109210659.754018-3-Yazen.Ghannam@amd.com
+(cherry picked from commit db970bd231c2264a062e0de4dcf4ead5e6669e7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/mce/amd.c
+diff --cc arch/x86/kernel/cpu/mce/amd.c
+index 7e6703780093,e486f96b3cb3..000000000000
+--- a/arch/x86/kernel/cpu/mce/amd.c
++++ b/arch/x86/kernel/cpu/mce/amd.c
+@@@ -1374,40 -1427,34 +1374,50 @@@ static void __threshold_remove_blocks(s
+  		kobject_del(&pos->kobj);
+  }
+  
+ -static void threshold_remove_bank(struct threshold_bank *bank)
+ +static void threshold_remove_bank(unsigned int cpu, int bank)
+  {
+  	struct amd_northbridge *nb;
+ +	struct threshold_bank *b;
+  
+ -	if (!bank->blocks)
+ -		goto out_free;
+ +	b = per_cpu(threshold_banks, cpu)[bank];
+ +	if (!b)
+ +		return;
+++<<<<<<< HEAD
+  
+ -	if (!bank->shared)
+ -		goto out_dealloc;
+ +	if (!b->blocks)
+ +		goto free_out;
+  
+ -	if (!refcount_dec_and_test(&bank->cpus)) {
+ -		__threshold_remove_blocks(bank);
+ -		return;
+ +	if (is_shared_bank(bank)) {
+ +		if (!refcount_dec_and_test(&b->cpus)) {
+ +			__threshold_remove_blocks(b);
+ +			per_cpu(threshold_banks, cpu)[bank] = NULL;
+ +			return;
+ +		} else {
+ +			/*
+ +			 * the last CPU on this node using the shared bank is
+ +			 * going away, remove that bank now.
+ +			 */
+ +			nb = node_to_amd_nb(amd_get_nb_id(cpu));
+ +			nb->bank4 = NULL;
+ +		}
+++=======
++ 	} else {
++ 		/*
++ 		 * The last CPU on this node using the shared bank is going
++ 		 * away, remove that bank now.
++ 		 */
++ 		nb = node_to_amd_nb(topology_die_id(smp_processor_id()));
++ 		nb->bank4 = NULL;
+++>>>>>>> db970bd231c2 (x86/CPU/AMD: Remove amd_get_nb_id())
+  	}
+  
+ -out_dealloc:
+ -	deallocate_threshold_blocks(bank);
+ +	deallocate_threshold_block(cpu, bank);
+  
+ -out_free:
+ -	kobject_put(bank->kobj);
+ -	kfree(bank);
+ +free_out:
+ +	kobject_del(b->kobj);
+ +	kobject_put(b->kobj);
+ +	kfree(b);
+ +	per_cpu(threshold_banks, cpu)[bank] = NULL;
+  }
+  
+  int mce_threshold_remove_device(unsigned int cpu)
+diff --git a/arch/x86/events/amd/core.c b/arch/x86/events/amd/core.c
+index 4a20f68dddd1..fc84e3f05348 100644
+--- a/arch/x86/events/amd/core.c
++++ b/arch/x86/events/amd/core.c
+@@ -537,7 +537,7 @@ static void amd_pmu_cpu_starting(int cpu)
+ 	if (!x86_pmu.amd_nb_constraints)
+ 		return;
+ 
+-	nb_id = amd_get_nb_id(cpu);
++	nb_id = topology_die_id(cpu);
+ 	WARN_ON_ONCE(nb_id == BAD_APICID);
+ 
+ 	for_each_online_cpu(i) {
+diff --git a/arch/x86/include/asm/processor.h b/arch/x86/include/asm/processor.h
+index b84ad4b3cdef..a4c6cf6dd009 100644
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@ -877,11 +877,9 @@ static inline int mpx_disable_management(void)
+ #endif /* CONFIG_X86_INTEL_MPX */
+ 
+ #ifdef CONFIG_CPU_SUP_AMD
+-extern u16 amd_get_nb_id(int cpu);
+ extern u32 amd_get_nodes_per_socket(void);
+ extern u32 amd_get_highest_perf(void);
+ #else
+-static inline u16 amd_get_nb_id(int cpu)		{ return 0; }
+ static inline u32 amd_get_nodes_per_socket(void)	{ return 0; }
+ static inline u32 amd_get_highest_perf(void)		{ return 0; }
+ #endif
+diff --git a/arch/x86/kernel/amd_nb.c b/arch/x86/kernel/amd_nb.c
+index 251b9327aa62..ff5870caba13 100644
+--- a/arch/x86/kernel/amd_nb.c
++++ b/arch/x86/kernel/amd_nb.c
+@@ -345,7 +345,7 @@ struct resource *amd_get_mmconfig_range(struct resource *res)
+ 
+ int amd_get_subcaches(int cpu)
+ {
+-	struct pci_dev *link = node_to_amd_nb(amd_get_nb_id(cpu))->link;
++	struct pci_dev *link = node_to_amd_nb(topology_die_id(cpu))->link;
+ 	unsigned int mask;
+ 
+ 	if (!amd_nb_has_feature(AMD_NB_L3_PARTITIONING))
+@@ -359,7 +359,7 @@ int amd_get_subcaches(int cpu)
+ int amd_set_subcaches(int cpu, unsigned long mask)
+ {
+ 	static unsigned int reset, ban;
+-	struct amd_northbridge *nb = node_to_amd_nb(amd_get_nb_id(cpu));
++	struct amd_northbridge *nb = node_to_amd_nb(topology_die_id(cpu));
+ 	unsigned int reg;
+ 	int cuid;
+ 
+diff --git a/arch/x86/kernel/cpu/amd.c b/arch/x86/kernel/cpu/amd.c
+index 163e77a404f9..99f9eb4baf68 100644
+--- a/arch/x86/kernel/cpu/amd.c
++++ b/arch/x86/kernel/cpu/amd.c
+@@ -427,12 +427,6 @@ static void amd_detect_ppin(struct cpuinfo_x86 *c)
+ 	clear_cpu_cap(c, X86_FEATURE_AMD_PPIN);
+ }
+ 
+-u16 amd_get_nb_id(int cpu)
+-{
+-	return per_cpu(cpu_llc_id, cpu);
+-}
+-EXPORT_SYMBOL_GPL(amd_get_nb_id);
+-
+ u32 amd_get_nodes_per_socket(void)
+ {
+ 	return nodes_per_socket;
+diff --git a/arch/x86/kernel/cpu/cacheinfo.c b/arch/x86/kernel/cpu/cacheinfo.c
+index 0c5fcbd998cf..082b21c108bb 100644
+--- a/arch/x86/kernel/cpu/cacheinfo.c
++++ b/arch/x86/kernel/cpu/cacheinfo.c
+@@ -578,7 +578,7 @@ static void amd_init_l3_cache(struct _cpuid4_info_regs *this_leaf, int index)
+ 	if (index < 3)
+ 		return;
+ 
+-	node = amd_get_nb_id(smp_processor_id());
++	node = topology_die_id(smp_processor_id());
+ 	this_leaf->nb = node_to_amd_nb(node);
+ 	if (this_leaf->nb && !this_leaf->nb->l3_cache.indices)
+ 		amd_calc_l3_indices(this_leaf->nb);
+* Unmerged path arch/x86/kernel/cpu/mce/amd.c
+diff --git a/arch/x86/kernel/cpu/mce/inject.c b/arch/x86/kernel/cpu/mce/inject.c
+index 3f82afd0f46f..8734fb7480d8 100644
+--- a/arch/x86/kernel/cpu/mce/inject.c
++++ b/arch/x86/kernel/cpu/mce/inject.c
+@@ -529,8 +529,8 @@ static void do_inject(void)
+ 	if (static_cpu_has(X86_FEATURE_AMD_DCM) &&
+ 	    b == 4 &&
+ 	    boot_cpu_data.x86 < 0x17) {
+-		toggle_nb_mca_mst_cpu(amd_get_nb_id(cpu));
+-		cpu = get_nbc_for_node(amd_get_nb_id(cpu));
++		toggle_nb_mca_mst_cpu(topology_die_id(cpu));
++		cpu = get_nbc_for_node(topology_die_id(cpu));
+ 	}
+ 
+ 	get_online_cpus();
+diff --git a/drivers/edac/amd64_edac.c b/drivers/edac/amd64_edac.c
+index d9f50d47b3fe..9d08319c91e4 100644
+--- a/drivers/edac/amd64_edac.c
++++ b/drivers/edac/amd64_edac.c
+@@ -1133,7 +1133,7 @@ static int k8_early_channel_count(struct amd64_pvt *pvt)
+ /* On F10h and later ErrAddr is MC4_ADDR[47:1] */
+ static u64 get_error_address(struct amd64_pvt *pvt, struct mce *m)
+ {
+-	u16 mce_nid = amd_get_nb_id(m->extcpu);
++	u16 mce_nid = topology_die_id(m->extcpu);
+ 	struct mem_ctl_info *mci;
+ 	u8 start_bit = 1;
+ 	u8 end_bit   = 47;
+@@ -3024,7 +3024,7 @@ static void get_cpus_on_this_dct_cpumask(struct cpumask *mask, u16 nid)
+ 	int cpu;
+ 
+ 	for_each_online_cpu(cpu)
+-		if (amd_get_nb_id(cpu) == nid)
++		if (topology_die_id(cpu) == nid)
+ 			cpumask_set_cpu(cpu, mask);
+ }
+ 
+diff --git a/drivers/edac/mce_amd.c b/drivers/edac/mce_amd.c
+index e5718eeadad4..655561a92b24 100644
+--- a/drivers/edac/mce_amd.c
++++ b/drivers/edac/mce_amd.c
+@@ -866,7 +866,7 @@ static void decode_mc3_mce(struct mce *m)
+ static void decode_mc4_mce(struct mce *m)
+ {
+ 	unsigned int fam = x86_family(m->cpuid);
+-	int node_id = amd_get_nb_id(m->extcpu);
++	int node_id = topology_die_id(m->extcpu);
+ 	u16 ec = EC(m->status);
+ 	u8 xec = XEC(m->status, 0x1f);
+ 	u8 offset = 0;
