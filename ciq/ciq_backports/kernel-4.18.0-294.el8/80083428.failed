@@ -1,0 +1,108 @@
+bpf, arm64: Add BPF exception tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jean-Philippe Brucker <jean-philippe@linaro.org>
+commit 800834285361dcf8e98b018e891df876472a4fac
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/80083428.failed
+
+When a tracing BPF program attempts to read memory without using the
+bpf_probe_read() helper, the verifier marks the load instruction with
+the BPF_PROBE_MEM flag. Since the arm64 JIT does not currently recognize
+this flag it falls back to the interpreter.
+
+Add support for BPF_PROBE_MEM, by appending an exception table to the
+BPF program. If the load instruction causes a data abort, the fixup
+infrastructure finds the exception table and fixes up the fault, by
+clearing the destination register and jumping over the faulting
+instruction.
+
+To keep the compact exception table entry format, inspect the pc in
+fixup_exception(). A more generic solution would add a "handler" field
+to the table entry, like on x86 and s390.
+
+	Signed-off-by: Jean-Philippe Brucker <jean-philippe@linaro.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Song Liu <songliubraving@fb.com>
+Link: https://lore.kernel.org/bpf/20200728152122.1292756-2-jean-philippe@linaro.org
+(cherry picked from commit 800834285361dcf8e98b018e891df876472a4fac)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/net/bpf_jit_comp.c
+diff --cc arch/arm64/net/bpf_jit_comp.c
+index b9bc91c0abc9,f8912e45be7a..000000000000
+--- a/arch/arm64/net/bpf_jit_comp.c
++++ b/arch/arm64/net/bpf_jit_comp.c
+@@@ -388,6 -437,8 +451,11 @@@ static int build_insn(const struct bpf_
+  	const bool isdw = BPF_SIZE(code) == BPF_DW;
+  	u8 jmp_cond, reg;
+  	s32 jmp_offset;
+++<<<<<<< HEAD
+++=======
++ 	u32 a64_insn;
++ 	int ret;
+++>>>>>>> 800834285361 (bpf, arm64: Add BPF exception tables)
+  
+  #define check_imm(bits, imm) do {				\
+  	if ((((imm) > 0) && ((imm) >> (bits))) ||		\
+@@@ -1014,10 -1086,10 +1099,10 @@@ skip_init_ctx
+  	}
+  	prog->bpf_func = (void *)ctx.image;
+  	prog->jited = 1;
+- 	prog->jited_len = image_size;
++ 	prog->jited_len = prog_size;
+  
+  	if (!prog->is_func || extra_pass) {
+ -		bpf_prog_fill_jited_linfo(prog, ctx.offset);
+ +		bpf_prog_fill_jited_linfo(prog, ctx.offset + 1);
+  out_off:
+  		kfree(ctx.offset);
+  		kfree(jit_data);
+diff --git a/arch/arm64/include/asm/extable.h b/arch/arm64/include/asm/extable.h
+index 56a4f68b262e..840a35ed92ec 100644
+--- a/arch/arm64/include/asm/extable.h
++++ b/arch/arm64/include/asm/extable.h
+@@ -22,5 +22,17 @@ struct exception_table_entry
+ 
+ #define ARCH_HAS_RELATIVE_EXTABLE
+ 
++#ifdef CONFIG_BPF_JIT
++int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
++			      struct pt_regs *regs);
++#else /* !CONFIG_BPF_JIT */
++static inline
++int arm64_bpf_fixup_exception(const struct exception_table_entry *ex,
++			      struct pt_regs *regs)
++{
++	return 0;
++}
++#endif /* !CONFIG_BPF_JIT */
++
+ extern int fixup_exception(struct pt_regs *regs);
+ #endif
+diff --git a/arch/arm64/mm/extable.c b/arch/arm64/mm/extable.c
+index 81e694af5f8c..eee1732ab6cd 100644
+--- a/arch/arm64/mm/extable.c
++++ b/arch/arm64/mm/extable.c
+@@ -11,8 +11,14 @@ int fixup_exception(struct pt_regs *regs)
+ 	const struct exception_table_entry *fixup;
+ 
+ 	fixup = search_exception_tables(instruction_pointer(regs));
+-	if (fixup)
+-		regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
++	if (!fixup)
++		return 0;
+ 
+-	return fixup != NULL;
++	if (IS_ENABLED(CONFIG_BPF_JIT) &&
++	    regs->pc >= BPF_JIT_REGION_START &&
++	    regs->pc < BPF_JIT_REGION_END)
++		return arm64_bpf_fixup_exception(fixup, regs);
++
++	regs->pc = (unsigned long)&fixup->fixup + fixup->fixup;
++	return 1;
+ }
+* Unmerged path arch/arm64/net/bpf_jit_comp.c
