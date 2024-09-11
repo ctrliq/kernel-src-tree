@@ -1,0 +1,387 @@
+NFSD: Call NFSv2 encoders on error returns
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit f0af22101d9072c6488b8d20d6e33338669029fe
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/f0af2210.failed
+
+Remove special dispatcher logic for NFSv2 error responses. These are
+rare to the point of becoming extinct, but all NFS responses have to
+pay the cost of the extra conditional branches.
+
+With this change, the NFSv2 error cases now get proper
+xdr_ressize_check() calls.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: J. Bruce Fields <bfields@redhat.com>
+(cherry picked from commit f0af22101d9072c6488b8d20d6e33338669029fe)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfsd/nfsproc.c
+diff --cc fs/nfsd/nfsproc.c
+index ff76d2e1e4f4,526170319ecf..000000000000
+--- a/fs/nfsd/nfsproc.c
++++ b/fs/nfsd/nfsproc.c
+@@@ -233,12 -230,20 +230,29 @@@ nfsd_proc_write(struct svc_rqst *rqstp
+  
+  	nvecs = svc_fill_write_vector(rqstp, rqstp->rq_arg.pages,
+  				      &argp->first, cnt);
+++<<<<<<< HEAD
+ +	if (!nvecs)
+ +		return nfserr_io;
+ +	nfserr = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh),
+ +			    argp->offset, rqstp->rq_vec, nvecs,
+ +			    &cnt, NFS_DATA_SYNC);
+ +	return nfsd_return_attrs(nfserr, resp);
+++=======
++ 	if (!nvecs) {
++ 		resp->status = nfserr_io;
++ 		goto out;
++ 	}
++ 
++ 	resp->status = nfsd_write(rqstp, fh_copy(&resp->fh, &argp->fh),
++ 				  argp->offset, rqstp->rq_vec, nvecs,
++ 				  &cnt, NFS_DATA_SYNC, NULL);
++ 	if (resp->status != nfs_ok)
++ 		goto out;
++ 
++ 	resp->status = fh_getattr(&resp->fh, &resp->stat);
++ out:
++ 	return resp->status;
+++>>>>>>> f0af22101d90 (NFSD: Call NFSv2 encoders on error returns)
+  }
+  
+  /*
+diff --git a/fs/nfsd/nfs2acl.c b/fs/nfsd/nfs2acl.c
+index 3c8b9250dc4a..6f46afdb0616 100644
+--- a/fs/nfsd/nfs2acl.c
++++ b/fs/nfsd/nfs2acl.c
+@@ -14,7 +14,6 @@
+ #include "vfs.h"
+ 
+ #define NFSDDBG_FACILITY		NFSDDBG_PROC
+-#define RETURN_STATUS(st)	{ resp->status = (st); return (st); }
+ 
+ /*
+  * NULL call.
+@@ -35,24 +34,25 @@ static __be32 nfsacld_proc_getacl(struct svc_rqst *rqstp)
+ 	struct posix_acl *acl;
+ 	struct inode *inode;
+ 	svc_fh *fh;
+-	__be32 nfserr = 0;
+ 
+ 	dprintk("nfsd: GETACL(2acl)   %s\n", SVCFH_fmt(&argp->fh));
+ 
+ 	fh = fh_copy(&resp->fh, &argp->fh);
+-	nfserr = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_NOP);
+-	if (nfserr)
+-		RETURN_STATUS(nfserr);
++	resp->status = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_NOP);
++	if (resp->status != nfs_ok)
++		goto out;
+ 
+ 	inode = d_inode(fh->fh_dentry);
+ 
+-	if (argp->mask & ~NFS_ACL_MASK)
+-		RETURN_STATUS(nfserr_inval);
++	if (argp->mask & ~NFS_ACL_MASK) {
++		resp->status = nfserr_inval;
++		goto out;
++	}
+ 	resp->mask = argp->mask;
+ 
+-	nfserr = fh_getattr(fh, &resp->stat);
+-	if (nfserr)
+-		RETURN_STATUS(nfserr);
++	resp->status = fh_getattr(fh, &resp->stat);
++	if (resp->status != nfs_ok)
++		goto out;
+ 
+ 	if (resp->mask & (NFS_ACL|NFS_ACLCNT)) {
+ 		acl = get_acl(inode, ACL_TYPE_ACCESS);
+@@ -61,7 +61,7 @@ static __be32 nfsacld_proc_getacl(struct svc_rqst *rqstp)
+ 			acl = posix_acl_from_mode(inode->i_mode, GFP_KERNEL);
+ 		}
+ 		if (IS_ERR(acl)) {
+-			nfserr = nfserrno(PTR_ERR(acl));
++			resp->status = nfserrno(PTR_ERR(acl));
+ 			goto fail;
+ 		}
+ 		resp->acl_access = acl;
+@@ -71,19 +71,20 @@ static __be32 nfsacld_proc_getacl(struct svc_rqst *rqstp)
+ 		   of a non-directory! */
+ 		acl = get_acl(inode, ACL_TYPE_DEFAULT);
+ 		if (IS_ERR(acl)) {
+-			nfserr = nfserrno(PTR_ERR(acl));
++			resp->status = nfserrno(PTR_ERR(acl));
+ 			goto fail;
+ 		}
+ 		resp->acl_default = acl;
+ 	}
+ 
+ 	/* resp->acl_{access,default} are released in nfssvc_release_getacl. */
+-	RETURN_STATUS(0);
++out:
++	return resp->status;
+ 
+ fail:
+ 	posix_acl_release(resp->acl_access);
+ 	posix_acl_release(resp->acl_default);
+-	RETURN_STATUS(nfserr);
++	goto out;
+ }
+ 
+ /*
+@@ -95,14 +96,13 @@ static __be32 nfsacld_proc_setacl(struct svc_rqst *rqstp)
+ 	struct nfsd_attrstat *resp = rqstp->rq_resp;
+ 	struct inode *inode;
+ 	svc_fh *fh;
+-	__be32 nfserr = 0;
+ 	int error;
+ 
+ 	dprintk("nfsd: SETACL(2acl)   %s\n", SVCFH_fmt(&argp->fh));
+ 
+ 	fh = fh_copy(&resp->fh, &argp->fh);
+-	nfserr = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_SATTR);
+-	if (nfserr)
++	resp->status = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_SATTR);
++	if (resp->status != nfs_ok)
+ 		goto out;
+ 
+ 	inode = d_inode(fh->fh_dentry);
+@@ -124,19 +124,20 @@ static __be32 nfsacld_proc_setacl(struct svc_rqst *rqstp)
+ 
+ 	fh_drop_write(fh);
+ 
+-	nfserr = fh_getattr(fh, &resp->stat);
++	resp->status = fh_getattr(fh, &resp->stat);
+ 
+ out:
+ 	/* argp->acl_{access,default} may have been allocated in
+ 	   nfssvc_decode_setaclargs. */
+ 	posix_acl_release(argp->acl_access);
+ 	posix_acl_release(argp->acl_default);
+-	return nfserr;
++	return resp->status;
++
+ out_drop_lock:
+ 	fh_unlock(fh);
+ 	fh_drop_write(fh);
+ out_errno:
+-	nfserr = nfserrno(error);
++	resp->status = nfserrno(error);
+ 	goto out;
+ }
+ 
+@@ -147,15 +148,16 @@ static __be32 nfsacld_proc_getattr(struct svc_rqst *rqstp)
+ {
+ 	struct nfsd_fhandle *argp = rqstp->rq_argp;
+ 	struct nfsd_attrstat *resp = rqstp->rq_resp;
+-	__be32 nfserr;
++
+ 	dprintk("nfsd: GETATTR  %s\n", SVCFH_fmt(&argp->fh));
+ 
+ 	fh_copy(&resp->fh, &argp->fh);
+-	nfserr = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_NOP);
+-	if (nfserr)
+-		return nfserr;
+-	nfserr = fh_getattr(&resp->fh, &resp->stat);
+-	return nfserr;
++	resp->status = fh_verify(rqstp, &resp->fh, 0, NFSD_MAY_NOP);
++	if (resp->status != nfs_ok)
++		goto out;
++	resp->status = fh_getattr(&resp->fh, &resp->stat);
++out:
++	return resp->status;
+ }
+ 
+ /*
+@@ -165,7 +167,6 @@ static __be32 nfsacld_proc_access(struct svc_rqst *rqstp)
+ {
+ 	struct nfsd3_accessargs *argp = rqstp->rq_argp;
+ 	struct nfsd3_accessres *resp = rqstp->rq_resp;
+-	__be32 nfserr;
+ 
+ 	dprintk("nfsd: ACCESS(2acl)   %s 0x%x\n",
+ 			SVCFH_fmt(&argp->fh),
+@@ -173,11 +174,12 @@ static __be32 nfsacld_proc_access(struct svc_rqst *rqstp)
+ 
+ 	fh_copy(&resp->fh, &argp->fh);
+ 	resp->access = argp->access;
+-	nfserr = nfsd_access(rqstp, &resp->fh, &resp->access, NULL);
+-	if (nfserr)
+-		return nfserr;
+-	nfserr = fh_getattr(&resp->fh, &resp->stat);
+-	return nfserr;
++	resp->status = nfsd_access(rqstp, &resp->fh, &resp->access, NULL);
++	if (resp->status != nfs_ok)
++		goto out;
++	resp->status = fh_getattr(&resp->fh, &resp->stat);
++out:
++	return resp->status;
+ }
+ 
+ /*
+@@ -273,6 +275,9 @@ static int nfsaclsvc_encode_getaclres(struct svc_rqst *rqstp, __be32 *p)
+ 	int n;
+ 	int w;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	/*
+ 	 * Since this is version 2, the check for nfserr in
+ 	 * nfsd_dispatch actually ensures the following cannot happen.
+@@ -312,6 +317,9 @@ static int nfsaclsvc_encode_attrstatres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_attrstat *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	p = nfs2svc_encode_fattr(rqstp, p, &resp->fh, &resp->stat);
+ 	return xdr_ressize_check(rqstp, p);
+ }
+@@ -321,6 +329,9 @@ static int nfsaclsvc_encode_accessres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd3_accessres *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	p = nfs2svc_encode_fattr(rqstp, p, &resp->fh, &resp->stat);
+ 	*p++ = htonl(resp->access);
+ 	return xdr_ressize_check(rqstp, p);
+* Unmerged path fs/nfsd/nfsproc.c
+diff --git a/fs/nfsd/nfssvc.c b/fs/nfsd/nfssvc.c
+index 9d48b4255ed0..8ebe1827b287 100644
+--- a/fs/nfsd/nfssvc.c
++++ b/fs/nfsd/nfssvc.c
+@@ -1048,12 +1048,8 @@ int nfsd_dispatch(struct svc_rqst *rqstp, __be32 *statp)
+ 	if (rqstp->rq_proc != 0)
+ 		*nfserrp++ = nfserr;
+ 
+-	/*
+-	 * For NFSv2, additional info is never returned in case of an error.
+-	 */
+-	if (!(nfserr && rqstp->rq_vers == 2))
+-		if (!proc->pc_encode(rqstp, nfserrp))
+-			goto out_encode_err;
++	if (!proc->pc_encode(rqstp, nfserrp))
++		goto out_encode_err;
+ 
+ 	nfsd_cache_update(rqstp, rqstp->rq_cachetype, statp + 1);
+ out_cached_reply:
+diff --git a/fs/nfsd/nfsxdr.c b/fs/nfsd/nfsxdr.c
+index 39c004ec7d85..952e71c95d4e 100644
+--- a/fs/nfsd/nfsxdr.c
++++ b/fs/nfsd/nfsxdr.c
+@@ -434,6 +434,9 @@ nfssvc_encode_attrstat(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_attrstat *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	p = encode_fattr(rqstp, p, &resp->fh, &resp->stat);
+ 	return xdr_ressize_check(rqstp, p);
+ }
+@@ -443,6 +446,9 @@ nfssvc_encode_diropres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_diropres *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	p = encode_fh(p, &resp->fh);
+ 	p = encode_fattr(rqstp, p, &resp->fh, &resp->stat);
+ 	return xdr_ressize_check(rqstp, p);
+@@ -453,6 +459,9 @@ nfssvc_encode_readlinkres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_readlinkres *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	*p++ = htonl(resp->len);
+ 	xdr_ressize_check(rqstp, p);
+ 	rqstp->rq_res.page_len = resp->len;
+@@ -470,6 +479,9 @@ nfssvc_encode_readres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_readres *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	p = encode_fattr(rqstp, p, &resp->fh, &resp->stat);
+ 	*p++ = htonl(resp->count);
+ 	xdr_ressize_check(rqstp, p);
+@@ -490,6 +502,9 @@ nfssvc_encode_readdirres(struct svc_rqst *rqstp, __be32 *p)
+ {
+ 	struct nfsd_readdirres *resp = rqstp->rq_resp;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	xdr_ressize_check(rqstp, p);
+ 	p = resp->buffer;
+ 	*p++ = 0;			/* no more entries */
+@@ -505,6 +520,9 @@ nfssvc_encode_statfsres(struct svc_rqst *rqstp, __be32 *p)
+ 	struct nfsd_statfsres *resp = rqstp->rq_resp;
+ 	struct kstatfs	*stat = &resp->stats;
+ 
++	if (resp->status != nfs_ok)
++		return xdr_ressize_check(rqstp, p);
++
+ 	*p++ = htonl(NFSSVC_MAXBLKSIZE_V2);	/* max transfer size */
+ 	*p++ = htonl(stat->f_bsize);
+ 	*p++ = htonl(stat->f_blocks);
+diff --git a/fs/nfsd/xdr.h b/fs/nfsd/xdr.h
+index 3d3e16d48268..17221931815f 100644
+--- a/fs/nfsd/xdr.h
++++ b/fs/nfsd/xdr.h
+@@ -83,26 +83,32 @@ struct nfsd_readdirargs {
+ };
+ 
+ struct nfsd_attrstat {
++	__be32			status;
+ 	struct svc_fh		fh;
+ 	struct kstat		stat;
+ };
+ 
+ struct nfsd_diropres  {
++	__be32			status;
+ 	struct svc_fh		fh;
+ 	struct kstat		stat;
+ };
+ 
+ struct nfsd_readlinkres {
++	__be32			status;
+ 	int			len;
+ };
+ 
+ struct nfsd_readres {
++	__be32			status;
+ 	struct svc_fh		fh;
+ 	unsigned long		count;
+ 	struct kstat		stat;
+ };
+ 
+ struct nfsd_readdirres {
++	__be32			status;
++
+ 	int			count;
+ 
+ 	struct readdir_cd	common;
+@@ -112,6 +118,7 @@ struct nfsd_readdirres {
+ };
+ 
+ struct nfsd_statfsres {
++	__be32			status;
+ 	struct kstatfs		stats;
+ };
+ 
