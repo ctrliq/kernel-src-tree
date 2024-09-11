@@ -1,0 +1,152 @@
+iommu/arm-smmu-v3: Fix ATC invalidation ordering wrt main TLBs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] arm-smmu-v3: Fix ATC invalidation ordering wrt main TLBs (Jerry Snitselaar) [1729845]
+Rebuild_FUZZ: 94.92%
+commit-author Will Deacon <will@kernel.org>
+commit 353e3cf8590cf182a9f42e67993de3aca91e8090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/353e3cf8.failed
+
+When invalidating the ATC for an PCIe endpoint using ATS, we must take
+care to complete invalidation of the main SMMU TLBs beforehand, otherwise
+the device could immediately repopulate its ATC with stale translations.
+
+Hooking the ATC invalidation into ->unmap() as we currently do does the
+exact opposite: it ensures that the ATC is invalidated *before*  the
+main TLBs, which is bogus.
+
+Move ATC invalidation into the actual (leaf) invalidation routines so
+that it is always called after completing main TLB invalidation.
+
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 353e3cf8590cf182a9f42e67993de3aca91e8090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu-v3.c
+diff --cc drivers/iommu/arm-smmu-v3.c
+index b1d3e3c7e3eb,ca504a60312d..000000000000
+--- a/drivers/iommu/arm-smmu-v3.c
++++ b/drivers/iommu/arm-smmu-v3.c
+@@@ -1956,13 -1961,17 +1956,19 @@@ static void arm_smmu_tlb_inv_context(vo
+  	 */
+  	arm_smmu_cmdq_issue_cmd(smmu, &cmd);
+  	arm_smmu_cmdq_issue_sync(smmu);
++ 	arm_smmu_atc_inv_domain(smmu_domain, 0, 0, 0);
+  }
+  
+ -static void arm_smmu_tlb_inv_range(unsigned long iova, size_t size,
+ -				   size_t granule, bool leaf,
+ -				   struct arm_smmu_domain *smmu_domain)
+ +static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
+ +					  size_t granule, bool leaf, void *cookie)
+  {
+ -	u64 cmds[CMDQ_BATCH_ENTRIES * CMDQ_ENT_DWORDS];
+ +	struct arm_smmu_domain *smmu_domain = cookie;
+  	struct arm_smmu_device *smmu = smmu_domain->smmu;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long start = iova, end = iova + size;
++ 	int i = 0;
+++>>>>>>> 353e3cf8590c (iommu/arm-smmu-v3: Fix ATC invalidation ordering wrt main TLBs)
+  	struct arm_smmu_cmdq_ent cmd = {
+  		.tlbi = {
+  			.leaf	= leaf,
+@@@ -1981,16 -1989,54 +1987,38 @@@
+  		cmd.tlbi.vmid	= smmu_domain->s2_cfg.vmid;
+  	}
+  
+++<<<<<<< HEAD
+ +	do {
+ +		arm_smmu_cmdq_issue_cmd(smmu, &cmd);
+ +		cmd.tlbi.addr += granule;
+ +	} while (size -= granule);
+++=======
++ 	while (iova < end) {
++ 		if (i == CMDQ_BATCH_ENTRIES) {
++ 			arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, false);
++ 			i = 0;
++ 		}
++ 
++ 		cmd.tlbi.addr = iova;
++ 		arm_smmu_cmdq_build_cmd(&cmds[i * CMDQ_ENT_DWORDS], &cmd);
++ 		iova += granule;
++ 		i++;
++ 	}
++ 
++ 	arm_smmu_cmdq_issue_cmdlist(smmu, cmds, i, true);
++ 
++ 	/*
++ 	 * Unfortunately, this can't be leaf-only since we may have
++ 	 * zapped an entire table.
++ 	 */
++ 	arm_smmu_atc_inv_domain(smmu_domain, 0, start, size);
+++>>>>>>> 353e3cf8590c (iommu/arm-smmu-v3: Fix ATC invalidation ordering wrt main TLBs)
+  }
+  
+ -static void arm_smmu_tlb_inv_page_nosync(struct iommu_iotlb_gather *gather,
+ -					 unsigned long iova, size_t granule,
+ -					 void *cookie)
+ -{
+ -	struct arm_smmu_domain *smmu_domain = cookie;
+ -	struct iommu_domain *domain = &smmu_domain->domain;
+ -
+ -	iommu_iotlb_gather_add_page(domain, gather, iova, granule);
+ -}
+ -
+ -static void arm_smmu_tlb_inv_walk(unsigned long iova, size_t size,
+ -				  size_t granule, void *cookie)
+ -{
+ -	arm_smmu_tlb_inv_range(iova, size, granule, false, cookie);
+ -}
+ -
+ -static void arm_smmu_tlb_inv_leaf(unsigned long iova, size_t size,
+ -				  size_t granule, void *cookie)
+ -{
+ -	arm_smmu_tlb_inv_range(iova, size, granule, true, cookie);
+ -}
+ -
+ -static const struct iommu_flush_ops arm_smmu_flush_ops = {
+ +static const struct iommu_gather_ops arm_smmu_gather_ops = {
+  	.tlb_flush_all	= arm_smmu_tlb_inv_context,
+ -	.tlb_flush_walk = arm_smmu_tlb_inv_walk,
+ -	.tlb_flush_leaf = arm_smmu_tlb_inv_leaf,
+ -	.tlb_add_page	= arm_smmu_tlb_inv_page_nosync,
+ +	.tlb_add_flush	= arm_smmu_tlb_inv_range_nosync,
+ +	.tlb_sync	= arm_smmu_tlb_sync,
+  };
+  
+  /* IOMMU API */
+@@@ -2378,21 -2424,16 +2406,24 @@@ static int arm_smmu_map(struct iommu_do
+  	return ops->map(ops, iova, paddr, size, prot);
+  }
+  
+ -static size_t arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova,
+ -			     size_t size, struct iommu_iotlb_gather *gather)
+ +static size_t
+ +arm_smmu_unmap(struct iommu_domain *domain, unsigned long iova, size_t size)
+  {
+- 	int ret;
+  	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+  	struct io_pgtable_ops *ops = smmu_domain->pgtbl_ops;
+  
+  	if (!ops)
+  		return 0;
+  
+++<<<<<<< HEAD
+ +	ret = ops->unmap(ops, iova, size);
+ +	if (ret && arm_smmu_atc_inv_domain(smmu_domain, 0, iova, size))
+ +		return 0;
+ +
+ +	return ret;
+++=======
++ 	return ops->unmap(ops, iova, size, gather);
+++>>>>>>> 353e3cf8590c (iommu/arm-smmu-v3: Fix ATC invalidation ordering wrt main TLBs)
+  }
+  
+  static void arm_smmu_flush_iotlb_all(struct iommu_domain *domain)
+* Unmerged path drivers/iommu/arm-smmu-v3.c
