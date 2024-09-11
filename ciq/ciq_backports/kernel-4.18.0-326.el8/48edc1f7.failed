@@ -1,0 +1,186 @@
+bpf: Prepare for memcg-based memory accounting for bpf maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit 48edc1f78aabeba35ed00e40c36f211de89e0090
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/48edc1f7.failed
+
+Bpf maps can be updated from an interrupt context and in such
+case there is no process which can be charged. It makes the memory
+accounting of bpf maps non-trivial.
+
+Fortunately, after commit 4127c6504f25 ("mm: kmem: enable kernel
+memcg accounting from interrupt contexts") and commit b87d8cefe43c
+("mm, memcg: rework remote charging API to support nesting")
+it's finally possible.
+
+To make the ownership model simple and consistent, when the map
+is created, the memory cgroup of the current process is recorded.
+All subsequent allocations related to the bpf map are charged to
+the same memory cgroup. It includes allocations made by any processes
+(even if they do belong to a different cgroup) and from interrupts.
+
+This commit introduces 3 new helpers, which will be used by following
+commits to enable the accounting of bpf maps memory:
+  - bpf_map_kmalloc_node()
+  - bpf_map_kzalloc()
+  - bpf_map_alloc_percpu()
+
+They are wrapping popular memory allocation functions. They set
+the active memory cgroup to the map's memory cgroup and add
+__GFP_ACCOUNT to the passed gfp flags. Then they call into
+the corresponding memory allocation function and restore
+the original active memory cgroup.
+
+These helpers are supposed to use everywhere except the map creation
+path. During the map creation when the map structure is allocated by
+itself, it cannot be passed to those helpers. In those cases default
+memory allocation function will be used with the __GFP_ACCOUNT flag.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20201201215900.3569844-7-guro@fb.com
+(cherry picked from commit 48edc1f78aabeba35ed00e40c36f211de89e0090)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+diff --cc include/linux/bpf.h
+index e31890dda3c2,e1f2c95c15ec..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -36,6 -38,8 +38,11 @@@ struct seq_operations
+  struct bpf_iter_aux_info;
+  struct bpf_local_storage;
+  struct bpf_local_storage_map;
+++<<<<<<< HEAD
+++=======
++ struct kobject;
++ struct mem_cgroup;
+++>>>>>>> 48edc1f78aab (bpf: Prepare for memcg-based memory accounting for bpf maps)
+  
+  extern struct idr btf_idr;
+  extern spinlock_t btf_idr_lock;
+@@@ -163,11 -163,14 +170,22 @@@ struct bpf_map 
+  	u32 btf_key_type_id;
+  	u32 btf_value_type_id;
+  	struct btf *btf;
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(struct bpf_map_memory memory)
+ +	RH_KABI_BROKEN_INSERT(char name[BPF_OBJ_NAME_LEN])
+ +	RH_KABI_BROKEN_INSERT(u32 btf_vmlinux_value_type_id)
+ +	RH_KABI_REPLACE(bool unpriv_array, bool bypass_spec_v1)
+ +	RH_KABI_FILL_HOLE(bool frozen) /* write-once; write-protected by freeze_mutex*/
+++=======
++ 	struct bpf_map_memory memory;
++ #ifdef CONFIG_MEMCG_KMEM
++ 	struct mem_cgroup *memcg;
++ #endif
++ 	char name[BPF_OBJ_NAME_LEN];
++ 	u32 btf_vmlinux_value_type_id;
++ 	bool bypass_spec_v1;
++ 	bool frozen; /* write-once; write-protected by freeze_mutex */
+++>>>>>>> 48edc1f78aab (bpf: Prepare for memcg-based memory accounting for bpf maps)
+  	/* 22 bytes hole */
+  
+  	/* The 3rd and 4th cacheline with misc members to avoid false sharing
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 526b61397de6..15d3a5297656 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -39,6 +39,7 @@
+ #include <linux/poll.h>
+ #include <linux/bpf-netns.h>
+ #include <linux/rcupdate_trace.h>
++#include <linux/memcontrol.h>
+ 
+ #include <linux/rh_features.h>
+ 
+@@ -482,6 +483,65 @@ void bpf_map_free_id(struct bpf_map *map, bool do_idr_lock)
+ 		__release(&map_idr_lock);
+ }
+ 
++#ifdef CONFIG_MEMCG_KMEM
++static void bpf_map_save_memcg(struct bpf_map *map)
++{
++	map->memcg = get_mem_cgroup_from_mm(current->mm);
++}
++
++static void bpf_map_release_memcg(struct bpf_map *map)
++{
++	mem_cgroup_put(map->memcg);
++}
++
++void *bpf_map_kmalloc_node(const struct bpf_map *map, size_t size, gfp_t flags,
++			   int node)
++{
++	struct mem_cgroup *old_memcg;
++	void *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = kmalloc_node(size, flags | __GFP_ACCOUNT, node);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++void *bpf_map_kzalloc(const struct bpf_map *map, size_t size, gfp_t flags)
++{
++	struct mem_cgroup *old_memcg;
++	void *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = kzalloc(size, flags | __GFP_ACCOUNT);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++void __percpu *bpf_map_alloc_percpu(const struct bpf_map *map, size_t size,
++				    size_t align, gfp_t flags)
++{
++	struct mem_cgroup *old_memcg;
++	void __percpu *ptr;
++
++	old_memcg = set_active_memcg(map->memcg);
++	ptr = __alloc_percpu_gfp(size, align, flags | __GFP_ACCOUNT);
++	set_active_memcg(old_memcg);
++
++	return ptr;
++}
++
++#else
++static void bpf_map_save_memcg(struct bpf_map *map)
++{
++}
++
++static void bpf_map_release_memcg(struct bpf_map *map)
++{
++}
++#endif
++
+ /* called from workqueue */
+ static void bpf_map_free_deferred(struct work_struct *work)
+ {
+@@ -490,6 +550,7 @@ static void bpf_map_free_deferred(struct work_struct *work)
+ 
+ 	bpf_map_charge_move(&mem, &map->memory);
+ 	security_bpf_map_free(map);
++	bpf_map_release_memcg(map);
+ 	/* implementation dependent freeing */
+ 	map->ops->map_free(map);
+ 	bpf_map_charge_finish(&mem);
+@@ -900,6 +961,8 @@ static int map_create(union bpf_attr *attr)
+ 	if (err)
+ 		goto free_map_sec;
+ 
++	bpf_map_save_memcg(map);
++
+ 	err = bpf_map_new_fd(map, f_flags);
+ 	if (err < 0) {
+ 		/* failed to allocate fd.
