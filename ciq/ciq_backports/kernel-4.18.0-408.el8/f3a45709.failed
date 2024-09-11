@@ -1,0 +1,211 @@
+selftests/vm: hmm-tests: remove the libhugetlbfs dependency
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author John Hubbard <jhubbard@nvidia.com>
+commit f3a45709d2bb1b6cbab2899a6c8e75dfb8e4aad7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f3a45709.failed
+
+HMM selftests are incredibly useful, but they are only effective if people
+actually build and run them.  All the other tests in selftests/vm can be
+built with very standard, always-available libraries: libpthread, librt.
+The hmm-tests.c program, on the other hand, requires something that is
+(much) less readily available: libhugetlbfs.  And so the build will
+typically fail for many developers.
+
+A simple attempt to install libhugetlbfs will also run into complications
+on some common distros these days: Fedora and Arch Linux (yes, Arch AUR
+has it, but that's fragile, as always with AUR).  The library is not
+maintained actively enough at the moment, for distros to deal with it.  I
+had to build it from source, for Fedora, and that didn't go too smoothly
+either.
+
+It turns out that, out of 21 tests in hmm-tests.c, only 2 actually require
+functionality from libhugetlbfs.  Therefore, if libhugetlbfs is missing,
+simply ifdef those two tests out and allow the developer to at least have
+the other 19 tests, if they don't want to pause to work through the above
+issues.  Also issue a warning, so that it's clear that there is an
+imperfection in the build.
+
+In order to do that, a tiny shell script (check_config.sh) runs a quick
+compile (not link, that's too prone to false failures with library paths),
+and basically, if the compiler doesn't find hugetlbfs.h in its standard
+locations, then the script concludes that libhugetlbfs is not available.
+The output is in two files, one for inclusion in hmm-test.c
+(local_config.h), and one for inclusion in the Makefile (local_config.mk).
+
+Link: https://lkml.kernel.org/r/20201026064021.3545418-9-jhubbard@nvidia.com
+	Signed-off-by: John Hubbard <jhubbard@nvidia.com>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Shuah Khan <shuah@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f3a45709d2bb1b6cbab2899a6c8e75dfb8e4aad7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/vm/.gitignore
+#	tools/testing/selftests/vm/Makefile
+#	tools/testing/selftests/vm/hmm-tests.c
+diff --cc tools/testing/selftests/vm/.gitignore
+index 2f0218365e42,e90d28bcd518..000000000000
+--- a/tools/testing/selftests/vm/.gitignore
++++ b/tools/testing/selftests/vm/.gitignore
+@@@ -12,6 -15,9 +12,12 @@@ userfaultf
+  mlock-intersect-test
+  mlock-random-test
+  virtual_address_range
+ -gup_test
+ +gup_benchmark
+  va_128TBswitch
+  map_fixed_noreplace
+++<<<<<<< HEAD
+++=======
++ write_to_hugetlbfs
++ hmm-tests
++ local_config.*
+++>>>>>>> f3a45709d2bb (selftests/vm: hmm-tests: remove the libhugetlbfs dependency)
+diff --cc tools/testing/selftests/vm/Makefile
+index af96f445fd87,bdd3fe7fd086..000000000000
+--- a/tools/testing/selftests/vm/Makefile
++++ b/tools/testing/selftests/vm/Makefile
+@@@ -1,5 -1,10 +1,13 @@@
+  # SPDX-License-Identifier: GPL-2.0
+  # Makefile for vm selftests
+++<<<<<<< HEAD
+++=======
++ 
++ include local_config.mk
++ 
++ uname_M := $(shell uname -m 2>/dev/null || echo not)
++ MACHINE ?= $(shell echo $(uname_M) | sed -e 's/aarch64.*/arm64/')
+++>>>>>>> f3a45709d2bb (selftests/vm: hmm-tests: remove the libhugetlbfs dependency)
+  
+  # Without this, failed build products remain, with up-to-date timestamps,
+  # thus tricking Make (and you!) into believing that All Is Well, in subsequent
+@@@ -45,6 -83,74 +53,80 @@@ TEST_FILES := test_vmalloc.s
+  KSFT_KHDR_INSTALL := 1
+  include ../lib.mk
+  
+++<<<<<<< HEAD
+ +$(OUTPUT)/userfaultfd: LDLIBS += -lpthread
+ +
+ +$(OUTPUT)/mlock-random-test: LDLIBS += -lcap
+++=======
++ ifeq ($(ARCH),x86_64)
++ BINARIES_32 := $(patsubst %,$(OUTPUT)/%,$(BINARIES_32))
++ BINARIES_64 := $(patsubst %,$(OUTPUT)/%,$(BINARIES_64))
++ 
++ define gen-target-rule-32
++ $(1) $(1)_32: $(OUTPUT)/$(1)_32
++ .PHONY: $(1) $(1)_32
++ endef
++ 
++ define gen-target-rule-64
++ $(1) $(1)_64: $(OUTPUT)/$(1)_64
++ .PHONY: $(1) $(1)_64
++ endef
++ 
++ ifeq ($(CAN_BUILD_I386),1)
++ $(BINARIES_32): CFLAGS += -m32
++ $(BINARIES_32): LDLIBS += -lrt -ldl -lm
++ $(BINARIES_32): %_32: %.c
++ 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(notdir $^) $(LDLIBS) -o $@
++ $(foreach t,$(TARGETS),$(eval $(call gen-target-rule-32,$(t))))
++ endif
++ 
++ ifeq ($(CAN_BUILD_X86_64),1)
++ $(BINARIES_64): CFLAGS += -m64
++ $(BINARIES_64): LDLIBS += -lrt -ldl
++ $(BINARIES_64): %_64: %.c
++ 	$(CC) $(CFLAGS) $(EXTRA_CFLAGS) $(notdir $^) $(LDLIBS) -o $@
++ $(foreach t,$(TARGETS),$(eval $(call gen-target-rule-64,$(t))))
++ endif
++ 
++ # x86_64 users should be encouraged to install 32-bit libraries
++ ifeq ($(CAN_BUILD_I386)$(CAN_BUILD_X86_64),01)
++ all: warn_32bit_failure
++ 
++ warn_32bit_failure:
++ 	@echo "Warning: you seem to have a broken 32-bit build" 2>&1;		\
++ 	echo  "environment. This will reduce test coverage of 64-bit" 2>&1;	\
++ 	echo  "kernels. If you are using a Debian-like distribution," 2>&1;	\
++ 	echo  "try:"; 2>&1;							\
++ 	echo  "";								\
++ 	echo  "  apt-get install gcc-multilib libc6-i386 libc6-dev-i386";	\
++ 	echo  "";								\
++ 	echo  "If you are using a Fedora-like distribution, try:";		\
++ 	echo  "";								\
++ 	echo  "  yum install glibc-devel.*i686";				\
++ 	exit 0;
++ endif
++ endif
++ 
++ $(OUTPUT)/mlock-random-test: LDLIBS += -lcap
++ 
++ $(OUTPUT)/gup_test: ../../../../mm/gup_test.h
++ 
++ $(OUTPUT)/hmm-tests: local_config.h
++ 
++ # HMM_EXTRA_LIBS may get set in local_config.mk, or it may be left empty.
++ $(OUTPUT)/hmm-tests: LDLIBS += $(HMM_EXTRA_LIBS)
++ 
++ local_config.mk local_config.h: check_config.sh
++ 	/bin/sh ./check_config.sh $(CC)
++ 
++ EXTRA_CLEAN += local_config.mk local_config.h
++ 
++ ifeq ($(HMM_EXTRA_LIBS),)
++ all: warn_missing_hugelibs
++ 
++ warn_missing_hugelibs:
++ 	@echo ; \
++ 	echo "Warning: missing libhugetlbfs support. Some HMM tests will be skipped." ; \
++ 	echo
++ endif
+++>>>>>>> f3a45709d2bb (selftests/vm: hmm-tests: remove the libhugetlbfs dependency)
+* Unmerged path tools/testing/selftests/vm/hmm-tests.c
+* Unmerged path tools/testing/selftests/vm/.gitignore
+* Unmerged path tools/testing/selftests/vm/Makefile
+diff --git a/tools/testing/selftests/vm/check_config.sh b/tools/testing/selftests/vm/check_config.sh
+new file mode 100644
+index 000000000000..079c8a40b85d
+--- /dev/null
++++ b/tools/testing/selftests/vm/check_config.sh
+@@ -0,0 +1,31 @@
++#!/bin/sh
++# SPDX-License-Identifier: GPL-2.0
++#
++# Probe for libraries and create header files to record the results. Both C
++# header files and Makefile include fragments are created.
++
++OUTPUT_H_FILE=local_config.h
++OUTPUT_MKFILE=local_config.mk
++
++# libhugetlbfs
++tmpname=$(mktemp)
++tmpfile_c=${tmpname}.c
++tmpfile_o=${tmpname}.o
++
++echo "#include <sys/types.h>"        > $tmpfile_c
++echo "#include <hugetlbfs.h>"       >> $tmpfile_c
++echo "int func(void) { return 0; }" >> $tmpfile_c
++
++CC=${1:?"Usage: $0 <compiler> # example compiler: gcc"}
++$CC -c $tmpfile_c -o $tmpfile_o >/dev/null 2>&1
++
++if [ -f $tmpfile_o ]; then
++    echo "#define LOCAL_CONFIG_HAVE_LIBHUGETLBFS 1" > $OUTPUT_H_FILE
++    echo "HMM_EXTRA_LIBS = -lhugetlbfs"             > $OUTPUT_MKFILE
++else
++    echo "// No libhugetlbfs support found"      > $OUTPUT_H_FILE
++    echo "# No libhugetlbfs support found, so:"  > $OUTPUT_MKFILE
++    echo "HMM_EXTRA_LIBS = "                    >> $OUTPUT_MKFILE
++fi
++
++rm ${tmpname}.*
+* Unmerged path tools/testing/selftests/vm/hmm-tests.c
