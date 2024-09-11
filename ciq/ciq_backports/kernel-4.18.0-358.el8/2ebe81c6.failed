@@ -1,0 +1,140 @@
+x86/fpu: Dont restore PKRU in fpregs_restore_userspace()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2ebe81c6d800576e1213f9d7cf0068017ae610c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2ebe81c6.failed
+
+switch_to() and flush_thread() write the task's PKRU value eagerly so
+the PKRU value of current is always valid in the hardware.
+
+That means there is no point in restoring PKRU on exit to user or when
+reactivating the task's FPU registers in the signal frame setup path.
+
+This allows to remove all the xstate buffer updates with PKRU values once
+the PKRU state is stored in thread struct while a task is scheduled out.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121456.303919033@linutronix.de
+(cherry picked from commit 2ebe81c6d800576e1213f9d7cf0068017ae610c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/internal.h
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/core.c
+diff --cc arch/x86/include/asm/fpu/internal.h
+index 5a42546d89cb,521774320e6a..000000000000
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@@ -475,7 -457,21 +475,25 @@@ static inline void fpregs_restore_userr
+  		return;
+  
+  	if (!fpregs_state_valid(fpu, cpu)) {
+++<<<<<<< HEAD
+ +		copy_kernel_to_fpregs(&fpu->state);
+++=======
++ 		u64 mask;
++ 
++ 		/*
++ 		 * This restores _all_ xstate which has not been
++ 		 * established yet.
++ 		 *
++ 		 * If PKRU is enabled, then the PKRU value is already
++ 		 * correct because it was either set in switch_to() or in
++ 		 * flush_thread(). So it is excluded because it might be
++ 		 * not up to date in current->thread.fpu.xsave state.
++ 		 */
++ 		mask = xfeatures_mask_restore_user() |
++ 			xfeatures_mask_supervisor();
++ 		__restore_fpregs_from_fpstate(&fpu->state, mask);
++ 
+++>>>>>>> 2ebe81c6d800 (x86/fpu: Dont restore PKRU in fpregs_restore_userspace())
+  		fpregs_activate(fpu);
+  		fpu->last_cpu = cpu;
+  	}
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 1a0fecae6ef8,6a0aaafb93ec..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -88,12 -100,23 +96,27 @@@ static inline u64 xfeatures_mask_user(v
+  	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
+  }
+  
+++<<<<<<< HEAD
+ +static inline u64 xfeatures_mask_dynamic(void)
+++=======
++ /*
++  * The xfeatures which are restored by the kernel when returning to user
++  * mode. This is not necessarily the same as xfeatures_mask_uabi() as the
++  * kernel does not manage all XCR0 enabled features via xsave/xrstor as
++  * some of them have to be switched eagerly on context switch and exec().
++  */
++ static inline u64 xfeatures_mask_restore_user(void)
++ {
++ 	return xfeatures_mask_all & XFEATURE_MASK_USER_RESTORE;
++ }
++ 
++ static inline u64 xfeatures_mask_independent(void)
+++>>>>>>> 2ebe81c6d800 (x86/fpu: Dont restore PKRU in fpregs_restore_userspace())
+  {
+  	if (!boot_cpu_has(X86_FEATURE_ARCH_LBR))
+ -		return XFEATURE_MASK_INDEPENDENT & ~XFEATURE_MASK_LBR;
+ +		return XFEATURE_MASK_DYNAMIC & ~XFEATURE_MASK_LBR;
+  
+ -	return XFEATURE_MASK_INDEPENDENT;
+ +	return XFEATURE_MASK_DYNAMIC;
+  }
+  
+  extern u64 xstate_fx_sw_bytes[USER_XSTATE_FX_SW_WORDS];
+diff --cc arch/x86/kernel/fpu/core.c
+index d86fb6c58479,470576ced907..000000000000
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@@ -376,18 -394,25 +376,31 @@@ static void fpu__clear(struct fpu *fpu
+  		return;
+  	}
+  
+ -	/*
+ -	 * Ensure that current's supervisor states are loaded into their
+ -	 * corresponding registers.
+ -	 */
+ -	if (xfeatures_mask_supervisor() &&
+ -	    !fpregs_state_valid(fpu, smp_processor_id())) {
+ -		os_xrstor(&fpu->state.xsave, xfeatures_mask_supervisor());
+ +	fpregs_lock();
+ +
+ +	if (user_only) {
+ +		if (!fpregs_state_valid(fpu, smp_processor_id()) &&
+ +		    xfeatures_mask_supervisor())
+ +			copy_kernel_to_xregs(&fpu->state.xsave,
+ +					     xfeatures_mask_supervisor());
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_user());
+ +	} else {
+ +		copy_init_fpstate_to_fpregs(xfeatures_mask_all);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	/* Reset user states in registers. */
++ 	restore_fpregs_from_init_fpstate(xfeatures_mask_restore_user());
++ 
++ 	/*
++ 	 * Now all FPU registers have their desired values.  Inform the FPU
++ 	 * state machine that current's FPU registers are in the hardware
++ 	 * registers. The memory image does not need to be updated because
++ 	 * any operation relying on it has to save the registers first when
++ 	 * current's FPU is marked active.
++ 	 */
+++>>>>>>> 2ebe81c6d800 (x86/fpu: Dont restore PKRU in fpregs_restore_userspace())
+  	fpregs_mark_activate();
+  	fpregs_unlock();
+  }
+* Unmerged path arch/x86/include/asm/fpu/internal.h
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+* Unmerged path arch/x86/kernel/fpu/core.c
