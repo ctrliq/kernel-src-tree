@@ -1,0 +1,265 @@
+net/mlx5: Support enable_vnet devlink dev param
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit 70862a5d609d7dc8f0501983391f1df9eca6714f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/70862a5d.failed
+
+Enable user to disable VDPA net auxiliary device so that when it is not
+required, user can disable it.
+
+For example,
+
+$ devlink dev param set pci/0000:06:00.0 \
+              name enable_vnet value false cmode driverinit
+$ devlink dev reload pci/0000:06:00.0
+
+At this point devlink instance do not create auxiliary device
+mlx5_core.vnet.2 for the VDPA net functionality.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 70862a5d609d7dc8f0501983391f1df9eca6714f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/dev.c
+#	drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+#	drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/dev.c
+index 20bb37266254,ff6b03dc7e32..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/dev.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/dev.c
+@@@ -105,7 -105,18 +105,22 @@@ static bool is_eth_supported(struct mlx
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static bool is_vnet_supported(struct mlx5_core_dev *dev)
+++=======
++ static bool is_eth_enabled(struct mlx5_core_dev *dev)
++ {
++ 	union devlink_param_value val;
++ 	int err;
++ 
++ 	err = devlink_param_driverinit_value_get(priv_to_devlink(dev),
++ 						 DEVLINK_PARAM_GENERIC_ID_ENABLE_ETH,
++ 						 &val);
++ 	return err ? false : val.vbool;
++ }
++ 
++ bool mlx5_vnet_supported(struct mlx5_core_dev *dev)
+++>>>>>>> 70862a5d609d (net/mlx5: Support enable_vnet devlink dev param)
+  {
+  	if (!IS_ENABLED(CONFIG_MLX5_VDPA_NET))
+  		return false;
+@@@ -201,13 -234,17 +227,14 @@@ enum 
+  static const struct mlx5_adev_device {
+  	const char *suffix;
+  	bool (*is_supported)(struct mlx5_core_dev *dev);
+ -	bool (*is_enabled)(struct mlx5_core_dev *dev);
+  } mlx5_adev_devices[] = {
+  	[MLX5_INTERFACE_PROTOCOL_VNET] = { .suffix = "vnet",
+- 					   .is_supported = &is_vnet_supported },
++ 					   .is_supported = &mlx5_vnet_supported,
++ 					   .is_enabled = &is_vnet_enabled },
+  	[MLX5_INTERFACE_PROTOCOL_IB] = { .suffix = "rdma",
+ -					 .is_supported = &mlx5_rdma_supported,
+ -					 .is_enabled = &is_ib_enabled },
+ +					 .is_supported = &is_ib_supported },
+  	[MLX5_INTERFACE_PROTOCOL_ETH] = { .suffix = "eth",
+ -					  .is_supported = &mlx5_eth_supported,
+ -					  .is_enabled = &is_eth_enabled },
+ +					  .is_supported = &is_eth_supported },
+  	[MLX5_INTERFACE_PROTOCOL_ETH_REP] = { .suffix = "eth-rep",
+  					   .is_supported = &is_eth_rep_supported },
+  	[MLX5_INTERFACE_PROTOCOL_IB_REP] = { .suffix = "rdma-rep",
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+index 9dee693eb638,6f4d7c7f06e0..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@@ -609,6 -596,157 +609,160 @@@ static void mlx5_devlink_set_params_ini
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static const struct devlink_param enable_eth_param =
++ 	DEVLINK_PARAM_GENERIC(ENABLE_ETH, BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
++ 			      NULL, NULL, NULL);
++ 
++ static int mlx5_devlink_eth_param_register(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 	union devlink_param_value value;
++ 	int err;
++ 
++ 	if (!mlx5_eth_supported(dev))
++ 		return 0;
++ 
++ 	err = devlink_param_register(devlink, &enable_eth_param);
++ 	if (err)
++ 		return err;
++ 
++ 	value.vbool = true;
++ 	devlink_param_driverinit_value_set(devlink,
++ 					   DEVLINK_PARAM_GENERIC_ID_ENABLE_ETH,
++ 					   value);
++ 	devlink_param_publish(devlink, &enable_eth_param);
++ 	return 0;
++ }
++ 
++ static void mlx5_devlink_eth_param_unregister(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 
++ 	if (!mlx5_eth_supported(dev))
++ 		return;
++ 
++ 	devlink_param_unpublish(devlink, &enable_eth_param);
++ 	devlink_param_unregister(devlink, &enable_eth_param);
++ }
++ 
++ static int mlx5_devlink_enable_rdma_validate(struct devlink *devlink, u32 id,
++ 					     union devlink_param_value val,
++ 					     struct netlink_ext_ack *extack)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 	bool new_state = val.vbool;
++ 
++ 	if (new_state && !mlx5_rdma_supported(dev))
++ 		return -EOPNOTSUPP;
++ 	return 0;
++ }
++ 
++ static const struct devlink_param enable_rdma_param =
++ 	DEVLINK_PARAM_GENERIC(ENABLE_RDMA, BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
++ 			      NULL, NULL, mlx5_devlink_enable_rdma_validate);
++ 
++ static int mlx5_devlink_rdma_param_register(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 	union devlink_param_value value;
++ 	int err;
++ 
++ 	if (!IS_ENABLED(CONFIG_MLX5_INFINIBAND) || MLX5_ESWITCH_MANAGER(dev))
++ 		return 0;
++ 
++ 	err = devlink_param_register(devlink, &enable_rdma_param);
++ 	if (err)
++ 		return err;
++ 
++ 	value.vbool = true;
++ 	devlink_param_driverinit_value_set(devlink,
++ 					   DEVLINK_PARAM_GENERIC_ID_ENABLE_RDMA,
++ 					   value);
++ 	devlink_param_publish(devlink, &enable_rdma_param);
++ 	return 0;
++ }
++ 
++ static void mlx5_devlink_rdma_param_unregister(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 
++ 	if (!IS_ENABLED(CONFIG_MLX5_INFINIBAND) || MLX5_ESWITCH_MANAGER(dev))
++ 		return;
++ 
++ 	devlink_param_unpublish(devlink, &enable_rdma_param);
++ 	devlink_param_unregister(devlink, &enable_rdma_param);
++ }
++ 
++ static const struct devlink_param enable_vnet_param =
++ 	DEVLINK_PARAM_GENERIC(ENABLE_VNET, BIT(DEVLINK_PARAM_CMODE_DRIVERINIT),
++ 			      NULL, NULL, NULL);
++ 
++ static int mlx5_devlink_vnet_param_register(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 	union devlink_param_value value;
++ 	int err;
++ 
++ 	if (!mlx5_vnet_supported(dev))
++ 		return 0;
++ 
++ 	err = devlink_param_register(devlink, &enable_vnet_param);
++ 	if (err)
++ 		return err;
++ 
++ 	value.vbool = true;
++ 	devlink_param_driverinit_value_set(devlink,
++ 					   DEVLINK_PARAM_GENERIC_ID_ENABLE_VNET,
++ 					   value);
++ 	devlink_param_publish(devlink, &enable_rdma_param);
++ 	return 0;
++ }
++ 
++ static void mlx5_devlink_vnet_param_unregister(struct devlink *devlink)
++ {
++ 	struct mlx5_core_dev *dev = devlink_priv(devlink);
++ 
++ 	if (!mlx5_vnet_supported(dev))
++ 		return;
++ 
++ 	devlink_param_unpublish(devlink, &enable_vnet_param);
++ 	devlink_param_unregister(devlink, &enable_vnet_param);
++ }
++ 
++ static int mlx5_devlink_auxdev_params_register(struct devlink *devlink)
++ {
++ 	int err;
++ 
++ 	err = mlx5_devlink_eth_param_register(devlink);
++ 	if (err)
++ 		return err;
++ 
++ 	err = mlx5_devlink_rdma_param_register(devlink);
++ 	if (err)
++ 		goto rdma_err;
++ 
++ 	err = mlx5_devlink_vnet_param_register(devlink);
++ 	if (err)
++ 		goto vnet_err;
++ 	return 0;
++ 
++ vnet_err:
++ 	mlx5_devlink_rdma_param_unregister(devlink);
++ rdma_err:
++ 	mlx5_devlink_eth_param_unregister(devlink);
++ 	return err;
++ }
++ 
++ static void mlx5_devlink_auxdev_params_unregister(struct devlink *devlink)
++ {
++ 	mlx5_devlink_vnet_param_unregister(devlink);
++ 	mlx5_devlink_rdma_param_unregister(devlink);
++ 	mlx5_devlink_eth_param_unregister(devlink);
++ }
++ 
+++>>>>>>> 70862a5d609d (net/mlx5: Support enable_vnet devlink dev param)
+  #define MLX5_TRAP_DROP(_id, _group_id)					\
+  	DEVLINK_TRAP_GENERIC(DROP, DROP, _id,				\
+  			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group_id, \
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+index ca6363198a67,3d23c6f77ed1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
+@@@ -277,4 -272,9 +277,12 @@@ static inline u32 mlx5_sriov_get_vf_tot
+  
+  	return MLX5_CAP_GEN_MAX(dev, num_total_dynamic_vf_msix);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ bool mlx5_eth_supported(struct mlx5_core_dev *dev);
++ bool mlx5_rdma_supported(struct mlx5_core_dev *dev);
++ bool mlx5_vnet_supported(struct mlx5_core_dev *dev);
++ 
+++>>>>>>> 70862a5d609d (net/mlx5: Support enable_vnet devlink dev param)
+  #endif /* __MLX5_CORE_H__ */
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/dev.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/mlx5_core.h
