@@ -1,0 +1,111 @@
+KVM: PPC: Book3S HV: Radix changes for secure guest
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Bharata B Rao <bharata@linux.ibm.com>
+commit 008e359c76d85facb10d10fa21fd5bc8c3a4e5d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/008e359c.failed
+
+- After the guest becomes secure, when we handle a page fault of a page
+  belonging to SVM in HV, send that page to UV via UV_PAGE_IN.
+- Whenever a page is unmapped on the HV side, inform UV via UV_PAGE_INVAL.
+- Ensure all those routines that walk the secondary page tables of
+  the guest don't do so in case of secure VM. For secure guest, the
+  active secondary page tables are in secure memory and the secondary
+  page tables in HV are freed when guest becomes secure.
+
+	Signed-off-by: Bharata B Rao <bharata@linux.ibm.com>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+(cherry picked from commit 008e359c76d85facb10d10fa21fd5bc8c3a4e5d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s_uvmem.h
+#	arch/powerpc/include/asm/ultravisor-api.h
+#	arch/powerpc/include/asm/ultravisor.h
+#	arch/powerpc/kvm/book3s_hv_uvmem.c
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_uvmem.h
+* Unmerged path arch/powerpc/include/asm/ultravisor-api.h
+* Unmerged path arch/powerpc/include/asm/ultravisor.h
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_uvmem.h
+* Unmerged path arch/powerpc/include/asm/ultravisor-api.h
+* Unmerged path arch/powerpc/include/asm/ultravisor.h
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index 739cefd2ed03..d97c75a8b84e 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -21,6 +21,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/pgalloc.h>
+ #include <asm/pte-walk.h>
++#include <asm/ultravisor.h>
++#include <asm/kvm_book3s_uvmem.h>
+ 
+ /*
+  * Supported radix tree geometry.
+@@ -924,6 +926,9 @@ int kvmppc_book3s_radix_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	if (!(dsisr & DSISR_PRTABLE_FAULT))
+ 		gpa |= ea & 0xfff;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++		return kvmppc_send_page_to_uv(kvm, gfn);
++
+ 	/* Get the corresponding memslot */
+ 	memslot = gfn_to_memslot(kvm, gfn);
+ 
+@@ -981,6 +986,11 @@ int kvm_unmap_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 	unsigned long gpa = gfn << PAGE_SHIFT;
+ 	unsigned int shift;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE) {
++		uv_page_inval(kvm->arch.lpid, gpa, PAGE_SHIFT);
++		return 0;
++	}
++
+ 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+ 	if (ptep && pte_present(*ptep))
+ 		kvmppc_unmap_pte(kvm, ptep, gpa, shift, memslot,
+@@ -998,6 +1008,9 @@ int kvm_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 	int ref = 0;
+ 	unsigned long old, *rmapp;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++		return ref;
++
+ 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+ 	if (ptep && pte_present(*ptep) && pte_young(*ptep)) {
+ 		old = kvmppc_radix_update_pte(kvm, ptep, _PAGE_ACCESSED, 0,
+@@ -1022,6 +1035,9 @@ int kvm_test_age_radix(struct kvm *kvm, struct kvm_memory_slot *memslot,
+ 	unsigned int shift;
+ 	int ref = 0;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++		return ref;
++
+ 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+ 	if (ptep && pte_present(*ptep) && pte_young(*ptep))
+ 		ref = 1;
+@@ -1039,6 +1055,9 @@ static int kvm_radix_test_clear_dirty(struct kvm *kvm,
+ 	int ret = 0;
+ 	unsigned long old, *rmapp;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++		return ret;
++
+ 	ptep = __find_linux_pte(kvm->arch.pgtable, gpa, NULL, &shift);
+ 	if (ptep && pte_present(*ptep) && pte_dirty(*ptep)) {
+ 		ret = 1;
+@@ -1091,6 +1110,9 @@ void kvmppc_radix_flush_memslot(struct kvm *kvm,
+ 	unsigned long gpa;
+ 	unsigned int shift;
+ 
++	if (kvm->arch.secure_guest & KVMPPC_SECURE_INIT_DONE)
++		return;
++
+ 	gpa = memslot->base_gfn << PAGE_SHIFT;
+ 	spin_lock(&kvm->mmu_lock);
+ 	for (n = memslot->npages; n; --n) {
+* Unmerged path arch/powerpc/kvm/book3s_hv_uvmem.c
