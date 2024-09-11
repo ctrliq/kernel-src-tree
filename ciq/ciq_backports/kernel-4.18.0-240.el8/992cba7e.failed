@@ -1,0 +1,216 @@
+net: Add and use skb_list_del_init().
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] Add and use skb_list_del_init(). (Ivan Vecera) [1805302]
+Rebuild_FUZZ: 92.75%
+commit-author David S. Miller <davem@davemloft.net>
+commit 992cba7e276d438ac8b0a8c17b147b37c8c286f7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/992cba7e.failed
+
+It documents what is happening, and eliminates the spurious list
+pointer poisoning.
+
+In the long term, in order to get proper list head debugging, we
+might want to use the list poison value as the indicator that
+an SKB is a singleton and not on a list.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 992cba7e276d438ac8b0a8c17b147b37c8c286f7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/ipv4/ip_input.c
+diff --cc net/core/dev.c
+index cd8bd05e0222,0b2d777e5b9e..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -5177,7 -5286,25 +5177,29 @@@ out
+  	return netif_receive_skb_internal(skb);
+  }
+  
+++<<<<<<< HEAD
+ +/* napi->gro_list contains packets ordered by age.
+++=======
++ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
++ 				   bool flush_old)
++ {
++ 	struct list_head *head = &napi->gro_hash[index].list;
++ 	struct sk_buff *skb, *p;
++ 
++ 	list_for_each_entry_safe_reverse(skb, p, head, list) {
++ 		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
++ 			return;
++ 		skb_list_del_init(skb);
++ 		napi_gro_complete(skb);
++ 		napi->gro_hash[index].count--;
++ 	}
++ 
++ 	if (!napi->gro_hash[index].count)
++ 		__clear_bit(index, &napi->gro_bitmask);
++ }
++ 
++ /* napi->gro_hash[].list contains packets ordered by age.
+++>>>>>>> 992cba7e276d (net: Add and use skb_list_del_init().)
+   * youngest packets at the head of it.
+   * Complete skbs in reverse order to reduce latencies.
+   */
+@@@ -5349,12 -5480,9 +5371,18 @@@ static enum gro_result dev_gro_receive(
+  	ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
+  
+  	if (pp) {
+++<<<<<<< HEAD
+ +		struct sk_buff *nskb = *pp;
+ +
+ +		*pp = nskb->next;
+ +		nskb->next = NULL;
+ +		napi_gro_complete(nskb);
+ +		napi->gro_count--;
+++=======
++ 		skb_list_del_init(pp);
++ 		napi_gro_complete(pp);
++ 		napi->gro_hash[hash].count--;
+++>>>>>>> 992cba7e276d (net: Add and use skb_list_del_init().)
+  	}
+  
+  	if (same_flow)
+diff --cc net/ipv4/ip_input.c
+index e67a0ef5e8c7,35a786c0aaa0..000000000000
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@@ -508,5 -507,109 +508,113 @@@ inhdr_error
+  drop:
+  	kfree_skb(skb);
+  out:
+++<<<<<<< HEAD
+ +	return NET_RX_DROP;
+++=======
++ 	return NULL;
++ }
++ 
++ /*
++  * IP receive entry point
++  */
++ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
++ 	   struct net_device *orig_dev)
++ {
++ 	struct net *net = dev_net(dev);
++ 
++ 	skb = ip_rcv_core(skb, net);
++ 	if (skb == NULL)
++ 		return NET_RX_DROP;
++ 	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
++ 		       net, NULL, skb, dev, NULL,
++ 		       ip_rcv_finish);
++ }
++ 
++ static void ip_sublist_rcv_finish(struct list_head *head)
++ {
++ 	struct sk_buff *skb, *next;
++ 
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		skb_list_del_init(skb);
++ 		dst_input(skb);
++ 	}
++ }
++ 
++ static void ip_list_rcv_finish(struct net *net, struct sock *sk,
++ 			       struct list_head *head)
++ {
++ 	struct dst_entry *curr_dst = NULL;
++ 	struct sk_buff *skb, *next;
++ 	struct list_head sublist;
++ 
++ 	INIT_LIST_HEAD(&sublist);
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		struct dst_entry *dst;
++ 
++ 		list_del(&skb->list);
++ 		/* if ingress device is enslaved to an L3 master device pass the
++ 		 * skb to its handler for processing
++ 		 */
++ 		skb = l3mdev_ip_rcv(skb);
++ 		if (!skb)
++ 			continue;
++ 		if (ip_rcv_finish_core(net, sk, skb) == NET_RX_DROP)
++ 			continue;
++ 
++ 		dst = skb_dst(skb);
++ 		if (curr_dst != dst) {
++ 			/* dispatch old sublist */
++ 			if (!list_empty(&sublist))
++ 				ip_sublist_rcv_finish(&sublist);
++ 			/* start new sublist */
++ 			INIT_LIST_HEAD(&sublist);
++ 			curr_dst = dst;
++ 		}
++ 		list_add_tail(&skb->list, &sublist);
++ 	}
++ 	/* dispatch final sublist */
++ 	ip_sublist_rcv_finish(&sublist);
++ }
++ 
++ static void ip_sublist_rcv(struct list_head *head, struct net_device *dev,
++ 			   struct net *net)
++ {
++ 	NF_HOOK_LIST(NFPROTO_IPV4, NF_INET_PRE_ROUTING, net, NULL,
++ 		     head, dev, NULL, ip_rcv_finish);
++ 	ip_list_rcv_finish(net, NULL, head);
++ }
++ 
++ /* Receive a list of IP packets */
++ void ip_list_rcv(struct list_head *head, struct packet_type *pt,
++ 		 struct net_device *orig_dev)
++ {
++ 	struct net_device *curr_dev = NULL;
++ 	struct net *curr_net = NULL;
++ 	struct sk_buff *skb, *next;
++ 	struct list_head sublist;
++ 
++ 	INIT_LIST_HEAD(&sublist);
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		struct net_device *dev = skb->dev;
++ 		struct net *net = dev_net(dev);
++ 
++ 		list_del(&skb->list);
++ 		skb = ip_rcv_core(skb, net);
++ 		if (skb == NULL)
++ 			continue;
++ 
++ 		if (curr_dev != dev || curr_net != net) {
++ 			/* dispatch old sublist */
++ 			if (!list_empty(&sublist))
++ 				ip_sublist_rcv(&sublist, curr_dev, curr_net);
++ 			/* start new sublist */
++ 			INIT_LIST_HEAD(&sublist);
++ 			curr_dev = dev;
++ 			curr_net = net;
++ 		}
++ 		list_add_tail(&skb->list, &sublist);
++ 	}
++ 	/* dispatch final sublist */
++ 	ip_sublist_rcv(&sublist, curr_dev, curr_net);
+++>>>>>>> 992cba7e276d (net: Add and use skb_list_del_init().)
+  }
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index b56676cd0603..3679dd414497 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1535,6 +1535,12 @@ static inline void skb_mark_not_on_list(struct sk_buff *skb)
+ 	skb->next = NULL;
+ }
+ 
++static inline void skb_list_del_init(struct sk_buff *skb)
++{
++	__list_del_entry(&skb->list);
++	skb_mark_not_on_list(skb);
++}
++
+ /**
+  *	skb_queue_empty - check if a queue is empty
+  *	@list: queue head
+* Unmerged path net/core/dev.c
+* Unmerged path net/ipv4/ip_input.c
