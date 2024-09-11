@@ -293,7 +293,7 @@ static inline void clr_exception_intercept(struct vcpu_svm *svm, int bit)
 	recalc_intercepts(svm);
 }
 
-static inline void set_intercept(struct vcpu_svm *svm, int bit)
+static inline void svm_set_intercept(struct vcpu_svm *svm, int bit)
 {
 	struct vmcb *vmcb = get_host_vmcb(svm);
 
@@ -302,7 +302,7 @@ static inline void set_intercept(struct vcpu_svm *svm, int bit)
 	recalc_intercepts(svm);
 }
 
-static inline void clr_intercept(struct vcpu_svm *svm, int bit)
+static inline void svm_clr_intercept(struct vcpu_svm *svm, int bit)
 {
 	struct vmcb *vmcb = get_host_vmcb(svm);
 
@@ -311,7 +311,7 @@ static inline void clr_intercept(struct vcpu_svm *svm, int bit)
 	recalc_intercepts(svm);
 }
 
-static inline bool is_intercept(struct vcpu_svm *svm, int bit)
+static inline bool svm_is_intercept(struct vcpu_svm *svm, int bit)
 {
 	return (svm->vmcb->control.intercept & (1ULL << bit)) != 0;
 }
