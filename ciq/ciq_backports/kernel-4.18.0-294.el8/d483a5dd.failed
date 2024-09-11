@@ -1,0 +1,152 @@
+mm: vmscan: limit the range of LRU type balancing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit d483a5dd009a091d3dab3bc873335989e2cd5b08
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/d483a5dd.failed
+
+When LRU cost only shows up on one list, we abruptly stop scanning that
+list altogether.  That's an extreme reaction: by the time the other list
+starts thrashing and the pendulum swings back, we may have no recent age
+information on the first list anymore, and we could have significant
+latencies until the scanner has caught up.
+
+Soften this change in the feedback system by ensuring that no list
+receives less than a third of overall pressure, and only distribute the
+other 66% according to LRU cost.  This ensures that we maintain a minimum
+rate of aging on the entire workingset while it's being pressured, while
+still allowing a generous rate of convergence when the relative sizes of
+the lists need to adjust.
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Rik van Riel <riel@surriel.com>
+Link: http://lkml.kernel.org/r/20200520232525.798933-15-hannes@cmpxchg.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d483a5dd009a091d3dab3bc873335989e2cd5b08)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/vmscan.c
+diff --cc mm/vmscan.c
+index 709a0e80e054,3792dd19788c..000000000000
+--- a/mm/vmscan.c
++++ b/mm/vmscan.c
+@@@ -2299,17 -2233,15 +2299,26 @@@ enum scan_balance 
+   * nr[0] = anon inactive pages to scan; nr[1] = anon active pages to scan
+   * nr[2] = file inactive pages to scan; nr[3] = file active pages to scan
+   */
+ -static void get_scan_count(struct lruvec *lruvec, struct scan_control *sc,
+ -			   unsigned long *nr)
+ +static void get_scan_count(struct lruvec *lruvec, struct mem_cgroup *memcg,
+ +			   struct scan_control *sc, unsigned long *nr)
+  {
+++<<<<<<< HEAD
+++=======
++ 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
++ 	unsigned long anon_cost, file_cost, total_cost;
+++>>>>>>> d483a5dd009a (mm: vmscan: limit the range of LRU type balancing)
+  	int swappiness = mem_cgroup_swappiness(memcg);
+ +	struct zone_reclaim_stat *reclaim_stat = &lruvec->reclaim_stat;
+  	u64 fraction[2];
+  	u64 denominator = 0;	/* gcc */
+++<<<<<<< HEAD
+ +	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+ +	unsigned long anon_prio, file_prio;
+ +	enum scan_balance scan_balance;
+ +	unsigned long anon, file;
+++=======
++ 	enum scan_balance scan_balance;
+++>>>>>>> d483a5dd009a (mm: vmscan: limit the range of LRU type balancing)
+  	unsigned long ap, fp;
+  	enum lru_list lru;
+  
+@@@ -2399,53 -2291,31 +2408,79 @@@
+  	}
+  
+  	scan_balance = SCAN_FRACT;
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * With swappiness at 100, anonymous and file have the same priority.
+ +	 * This scanning priority is essentially the inverse of IO cost.
+++=======
++ 	 * Calculate the pressure balance between anon and file pages.
++ 	 *
++ 	 * The amount of pressure we put on each LRU is inversely
++ 	 * proportional to the cost of reclaiming each list, as
++ 	 * determined by the share of pages that are refaulting, times
++ 	 * the relative IO cost of bringing back a swapped out
++ 	 * anonymous page vs reloading a filesystem page (swappiness).
++ 	 *
++ 	 * Although we limit that influence to ensure no list gets
++ 	 * left behind completely: at least a third of the pressure is
++ 	 * applied, before swappiness.
++ 	 *
++ 	 * With swappiness at 100, anon and file have equal IO cost.
+++>>>>>>> d483a5dd009a (mm: vmscan: limit the range of LRU type balancing)
+  	 */
+- 	anon_prio = swappiness;
+- 	file_prio = 200 - anon_prio;
++ 	total_cost = sc->anon_cost + sc->file_cost;
++ 	anon_cost = total_cost + sc->anon_cost;
++ 	file_cost = total_cost + sc->file_cost;
++ 	total_cost = anon_cost + file_cost;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * OK, so we have swap space and a fair amount of page cache
+ +	 * pages.  We use the recently rotated / recently scanned
+ +	 * ratios to determine how valuable each cache is.
+ +	 *
+ +	 * Because workloads change over time (and to avoid overflow)
+ +	 * we keep these statistics as a floating average, which ends
+ +	 * up weighing recent references more than old ones.
+ +	 *
+ +	 * anon in [0], file in [1]
+ +	 */
+ +
+ +	anon  = lruvec_lru_size(lruvec, LRU_ACTIVE_ANON, MAX_NR_ZONES) +
+ +		lruvec_lru_size(lruvec, LRU_INACTIVE_ANON, MAX_NR_ZONES);
+ +	file  = lruvec_lru_size(lruvec, LRU_ACTIVE_FILE, MAX_NR_ZONES) +
+ +		lruvec_lru_size(lruvec, LRU_INACTIVE_FILE, MAX_NR_ZONES);
+ +
+ +	spin_lock_irq(&pgdat->lru_lock);
+ +	if (unlikely(reclaim_stat->recent_scanned[0] > anon / 4)) {
+ +		reclaim_stat->recent_scanned[0] /= 2;
+ +		reclaim_stat->recent_rotated[0] /= 2;
+ +	}
+ +
+ +	if (unlikely(reclaim_stat->recent_scanned[1] > file / 4)) {
+ +		reclaim_stat->recent_scanned[1] /= 2;
+ +		reclaim_stat->recent_rotated[1] /= 2;
+ +	}
+ +
+ +	/*
+ +	 * The amount of pressure on anon vs file pages is inversely
+ +	 * proportional to the fraction of recently scanned pages on
+ +	 * each list that were recently referenced and in active use.
+ +	 */
+ +	ap = anon_prio * (reclaim_stat->recent_scanned[0] + 1);
+ +	ap /= reclaim_stat->recent_rotated[0] + 1;
+ +
+ +	fp = file_prio * (reclaim_stat->recent_scanned[1] + 1);
+ +	fp /= reclaim_stat->recent_rotated[1] + 1;
+ +	spin_unlock_irq(&pgdat->lru_lock);
+++=======
++ 	ap = swappiness * (total_cost + 1);
++ 	ap /= anon_cost + 1;
++ 
++ 	fp = (200 - swappiness) * (total_cost + 1);
++ 	fp /= file_cost + 1;
+++>>>>>>> d483a5dd009a (mm: vmscan: limit the range of LRU type balancing)
+  
+  	fraction[0] = ap;
+  	fraction[1] = fp;
+* Unmerged path mm/vmscan.c
