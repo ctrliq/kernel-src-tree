@@ -1333,9 +1333,7 @@ slab_flags_t kmem_cache_flags(unsigned int object_size,
 		char *end, *glob;
 		size_t cmplen;
 
-		end = strchr(iter, ',');
-		if (!end)
-			end = iter + strlen(iter);
+		end = strchrnul(iter, ',');
 
 		glob = strnchr(iter, end - iter, '*');
 		if (glob)
