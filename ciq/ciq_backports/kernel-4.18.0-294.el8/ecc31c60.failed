@@ -1,0 +1,174 @@
+ethtool: Add link extended state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Amit Cohen <amitc@mellanox.com>
+commit ecc31c60240b9808a274befc5db6b8a249a6ade1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ecc31c60.failed
+
+Currently, drivers can only tell whether the link is up/down using
+LINKSTATE_GET, but no additional information is given.
+
+Add attributes to LINKSTATE_GET command in order to allow drivers
+to expose the user more information in addition to link state to ease
+the debug process, for example, reason for link down state.
+
+Extended state consists of two attributes - link_ext_state and
+link_ext_substate. The idea is to avoid 'vendor specific' states in order
+to prevent drivers to use specific link_ext_state that can be in the future
+common link_ext_state.
+
+The substates allows drivers to add more information to the common
+link_ext_state. For example, vendor can expose 'Autoneg' as link_ext_state
+and add 'No partner detected during force mode' as link_ext_substate.
+
+If a driver cannot pinpoint the extended state with the substate
+accuracy, it is free to expose only the extended state and omit the
+substate attribute.
+
+	Signed-off-by: Amit Cohen <amitc@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Reviewed-by: Petr Machata <petrm@mellanox.com>
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit ecc31c60240b9808a274befc5db6b8a249a6ade1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/ethtool_netlink.h
+#	net/ethtool/linkstate.c
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/linkstate.c
+diff --git a/include/linux/ethtool.h b/include/linux/ethtool.h
+index fa9398c8622d..05ec83821e6b 100644
+--- a/include/linux/ethtool.h
++++ b/include/linux/ethtool.h
+@@ -88,6 +88,22 @@ struct net_device;
+ u32 ethtool_op_get_link(struct net_device *dev);
+ int ethtool_op_get_ts_info(struct net_device *dev, struct ethtool_ts_info *eti);
+ 
++
++/**
++ * struct ethtool_link_ext_state_info - link extended state and substate.
++ */
++struct ethtool_link_ext_state_info {
++	enum ethtool_link_ext_state link_ext_state;
++	union {
++		enum ethtool_link_ext_substate_autoneg autoneg;
++		enum ethtool_link_ext_substate_link_training link_training;
++		enum ethtool_link_ext_substate_link_logical_mismatch link_logical_mismatch;
++		enum ethtool_link_ext_substate_bad_signal_integrity bad_signal_integrity;
++		enum ethtool_link_ext_substate_cable_issue cable_issue;
++		u8 __link_ext_substate;
++	};
++};
++
+ /**
+  * ethtool_rxfh_indir_default - get default value for RX flow hash indirection
+  * @index: Index in RX flow hash indirection table
+@@ -248,6 +264,11 @@ struct ethtool_ops_extended_rh {
+  * @get_link: Report whether physical link is up.  Will only be called if
+  *	the netdev is up.  Should usually be set to ethtool_op_get_link(),
+  *	which uses netif_carrier_ok().
++ * @get_link_ext_state: Report link extended state. Should set link_ext_state and
++ *	link_ext_substate (link_ext_substate of 0 means link_ext_substate is unknown,
++ *	do not attach ext_substate attribute to netlink message). If link_ext_state
++ *	and link_ext_substate are unknown, return -ENODATA. If not implemented,
++ *	link_ext_state and link_ext_substate will not be sent to userspace.
+  * @get_eeprom: Read data from the device EEPROM.
+  *	Should fill in the magic field.  Don't need to check len for zero
+  *	or wraparound.  Fill in the data argument with the eeprom values
+@@ -393,6 +414,8 @@ struct ethtool_ops {
+ 	void	(*set_msglevel)(struct net_device *, u32);
+ 	int	(*nway_reset)(struct net_device *);
+ 	u32	(*get_link)(struct net_device *);
++	int	(*get_link_ext_state)(struct net_device *,
++				      struct ethtool_link_ext_state_info *);
+ 	int	(*get_eeprom_len)(struct net_device *);
+ 	int	(*get_eeprom)(struct net_device *,
+ 			      struct ethtool_eeprom *, u8 *);
+diff --git a/include/uapi/linux/ethtool.h b/include/uapi/linux/ethtool.h
+index 30dc4eb925a3..c00e07d2e8da 100644
+--- a/include/uapi/linux/ethtool.h
++++ b/include/uapi/linux/ethtool.h
+@@ -583,6 +583,76 @@ struct ethtool_pauseparam {
+ 	__u32	tx_pause;
+ };
+ 
++/**
++ * enum ethtool_link_ext_state - link extended state
++ */
++enum ethtool_link_ext_state {
++	ETHTOOL_LINK_EXT_STATE_AUTONEG,
++	ETHTOOL_LINK_EXT_STATE_LINK_TRAINING_FAILURE,
++	ETHTOOL_LINK_EXT_STATE_LINK_LOGICAL_MISMATCH,
++	ETHTOOL_LINK_EXT_STATE_BAD_SIGNAL_INTEGRITY,
++	ETHTOOL_LINK_EXT_STATE_NO_CABLE,
++	ETHTOOL_LINK_EXT_STATE_CABLE_ISSUE,
++	ETHTOOL_LINK_EXT_STATE_EEPROM_ISSUE,
++	ETHTOOL_LINK_EXT_STATE_CALIBRATION_FAILURE,
++	ETHTOOL_LINK_EXT_STATE_POWER_BUDGET_EXCEEDED,
++	ETHTOOL_LINK_EXT_STATE_OVERHEAT,
++};
++
++/**
++ * enum ethtool_link_ext_substate_autoneg - more information in addition to
++ * ETHTOOL_LINK_EXT_STATE_AUTONEG.
++ */
++enum ethtool_link_ext_substate_autoneg {
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_NO_PARTNER_DETECTED = 1,
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_ACK_NOT_RECEIVED,
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_NEXT_PAGE_EXCHANGE_FAILED,
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_NO_PARTNER_DETECTED_FORCE_MODE,
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_FEC_MISMATCH_DURING_OVERRIDE,
++	ETHTOOL_LINK_EXT_SUBSTATE_AN_NO_HCD,
++};
++
++/**
++ * enum ethtool_link_ext_substate_link_training - more information in addition to
++ * ETHTOOL_LINK_EXT_STATE_LINK_TRAINING_FAILURE.
++ */
++enum ethtool_link_ext_substate_link_training {
++	ETHTOOL_LINK_EXT_SUBSTATE_LT_KR_FRAME_LOCK_NOT_ACQUIRED = 1,
++	ETHTOOL_LINK_EXT_SUBSTATE_LT_KR_LINK_INHIBIT_TIMEOUT,
++	ETHTOOL_LINK_EXT_SUBSTATE_LT_KR_LINK_PARTNER_DID_NOT_SET_RECEIVER_READY,
++	ETHTOOL_LINK_EXT_SUBSTATE_LT_REMOTE_FAULT,
++};
++
++/**
++ * enum ethtool_link_ext_substate_logical_mismatch - more information in addition
++ * to ETHTOOL_LINK_EXT_STATE_LINK_LOGICAL_MISMATCH.
++ */
++enum ethtool_link_ext_substate_link_logical_mismatch {
++	ETHTOOL_LINK_EXT_SUBSTATE_LLM_PCS_DID_NOT_ACQUIRE_BLOCK_LOCK = 1,
++	ETHTOOL_LINK_EXT_SUBSTATE_LLM_PCS_DID_NOT_ACQUIRE_AM_LOCK,
++	ETHTOOL_LINK_EXT_SUBSTATE_LLM_PCS_DID_NOT_GET_ALIGN_STATUS,
++	ETHTOOL_LINK_EXT_SUBSTATE_LLM_FC_FEC_IS_NOT_LOCKED,
++	ETHTOOL_LINK_EXT_SUBSTATE_LLM_RS_FEC_IS_NOT_LOCKED,
++};
++
++/**
++ * enum ethtool_link_ext_substate_bad_signal_integrity - more information in
++ * addition to ETHTOOL_LINK_EXT_STATE_BAD_SIGNAL_INTEGRITY.
++ */
++enum ethtool_link_ext_substate_bad_signal_integrity {
++	ETHTOOL_LINK_EXT_SUBSTATE_BSI_LARGE_NUMBER_OF_PHYSICAL_ERRORS = 1,
++	ETHTOOL_LINK_EXT_SUBSTATE_BSI_UNSUPPORTED_RATE,
++};
++
++/**
++ * enum ethtool_link_ext_substate_cable_issue - more information in
++ * addition to ETHTOOL_LINK_EXT_STATE_CABLE_ISSUE.
++ */
++enum ethtool_link_ext_substate_cable_issue {
++	ETHTOOL_LINK_EXT_SUBSTATE_CI_UNSUPPORTED_CABLE = 1,
++	ETHTOOL_LINK_EXT_SUBSTATE_CI_CABLE_TEST_FAILURE,
++};
++
+ #define ETH_GSTRING_LEN		32
+ 
+ /**
+* Unmerged path include/uapi/linux/ethtool_netlink.h
+* Unmerged path net/ethtool/linkstate.c
