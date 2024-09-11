@@ -669,7 +669,7 @@ static int load_image_and_restore(void)
 	error = swsusp_read(&flags);
 	swsusp_close(FMODE_READ);
 	if (!error)
-		hibernation_restore(flags & SF_PLATFORM_MODE);
+		error = hibernation_restore(flags & SF_PLATFORM_MODE);
 
 	pr_err("Failed to load hibernation image, recovering.\n");
 	swsusp_free();
