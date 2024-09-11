@@ -1,0 +1,344 @@
+KVM: const-ify all relevant uses of struct kvm_memory_slot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Hamza Mahfooz <someguy@effective-light.com>
+commit 269e9552d208179bc14ea7f80a9e3e8ae97795a2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/269e9552.failed
+
+As alluded to in commit f36f3f2846b5 ("KVM: add "new" argument to
+kvm_arch_commit_memory_region"), a bunch of other places where struct
+kvm_memory_slot is used, needs to be refactored to preserve the
+"const"ness of struct kvm_memory_slot across-the-board.
+
+	Signed-off-by: Hamza Mahfooz <someguy@effective-light.com>
+Message-Id: <20210713023338.57108-1-someguy@effective-light.com>
+[Do not touch body of slot_rmap_walk_init. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 269e9552d208179bc14ea7f80a9e3e8ae97795a2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/mmu.c
+diff --cc arch/x86/kvm/mmu/mmu.c
+index 4c612c0dc324,e702361b4409..000000000000
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@@ -1002,36 -998,8 +1002,36 @@@ static void pte_list_remove(struct kvm_
+  	__pte_list_remove(sptep, rmap_head);
+  }
+  
+ +/* Return true if rmap existed, false otherwise */
+ +static bool pte_list_destroy(struct kvm_rmap_head *rmap_head)
+ +{
+ +	struct pte_list_desc *desc, *next;
+ +	int i;
+ +
+ +	if (!rmap_head->val)
+ +		return false;
+ +
+ +	if (!(rmap_head->val & 1)) {
+ +		mmu_spte_clear_track_bits((u64 *)rmap_head->val);
+ +		goto out;
+ +	}
+ +
+ +	desc = (struct pte_list_desc *)(rmap_head->val & ~1ul);
+ +
+ +	for (; desc; desc = next) {
+ +		for (i = 0; i < desc->spte_count; i++)
+ +			mmu_spte_clear_track_bits(desc->sptes[i]);
+ +		next = desc->more;
+ +		mmu_free_pte_list_desc(desc);
+ +	}
+ +out:
+ +	/* rmap_head is meaningless now, remember to reset it */
+ +	rmap_head->val = 0;
+ +	return true;
+ +}
+ +
+  static struct kvm_rmap_head *__gfn_to_rmap(gfn_t gfn, int level,
+- 					   struct kvm_memory_slot *slot)
++ 					   const struct kvm_memory_slot *slot)
+  {
+  	unsigned long idx;
+  
+@@@ -1413,14 -1387,25 +1413,14 @@@ static bool rmap_write_protect(struct k
+  }
+  
+  static bool kvm_zap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+- 			  struct kvm_memory_slot *slot)
++ 			  const struct kvm_memory_slot *slot)
+  {
+ -	u64 *sptep;
+ -	struct rmap_iterator iter;
+ -	bool flush = false;
+ -
+ -	while ((sptep = rmap_get_first(rmap_head, &iter))) {
+ -		rmap_printk("spte %p %llx.\n", sptep, *sptep);
+ -
+ -		pte_list_remove(rmap_head, sptep);
+ -		flush = true;
+ -	}
+ -
+ -	return flush;
+ +	return pte_list_destroy(rmap_head);
+  }
+  
+ -static bool kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ -			    struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ -			    pte_t unused)
+ +static int kvm_unmap_rmapp(struct kvm *kvm, struct kvm_rmap_head *rmap_head,
+ +			   struct kvm_memory_slot *slot, gfn_t gfn, int level,
+ +			   unsigned long data)
+  {
+  	return kvm_zap_rmapp(kvm, rmap_head, slot);
+  }
+@@@ -5693,22 -5604,28 +5694,31 @@@ void kvm_zap_gfn_range(struct kvm *kvm
+  	int i;
+  	bool flush = false;
+  
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+ -			slots = __kvm_memslots(kvm, i);
+ -			kvm_for_each_memslot(memslot, slots) {
+ -				gfn_t start, end;
+ -
+ -				start = max(gfn_start, memslot->base_gfn);
+ -				end = min(gfn_end, memslot->base_gfn + memslot->npages);
+ -				if (start >= end)
+ -					continue;
+ +	write_lock(&kvm->mmu_lock);
+ +	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
+ +		slots = __kvm_memslots(kvm, i);
+ +		kvm_for_each_memslot(memslot, slots) {
+ +			gfn_t start, end;
+ +
+ +			start = max(gfn_start, memslot->base_gfn);
+ +			end = min(gfn_end, memslot->base_gfn + memslot->npages);
+ +			if (start >= end)
+ +				continue;
+  
+++<<<<<<< HEAD
+ +			flush = slot_handle_level_range(kvm, memslot, kvm_zap_rmapp,
+ +							PG_LEVEL_4K,
+ +							KVM_MAX_HUGEPAGE_LEVEL,
+ +							start, end - 1, true, flush);
+++=======
++ 				flush = slot_handle_level_range(kvm,
++ 						(const struct kvm_memory_slot *) memslot,
++ 						kvm_zap_rmapp, PG_LEVEL_4K,
++ 						KVM_MAX_HUGEPAGE_LEVEL, start,
++ 						end - 1, true, flush);
++ 			}
+++>>>>>>> 269e9552d208 (KVM: const-ify all relevant uses of struct kvm_memory_slot)
+  		}
+ -		if (flush)
+ -			kvm_flush_remote_tlbs_with_address(kvm, gfn_start, gfn_end);
+ -		write_unlock(&kvm->mmu_lock);
+  	}
+  
+  	if (is_tdp_mmu_enabled(kvm)) {
+@@@ -5731,17 -5651,24 +5741,17 @@@ static bool slot_rmap_write_protect(str
+  }
+  
+  void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+- 				      struct kvm_memory_slot *memslot,
++ 				      const struct kvm_memory_slot *memslot,
+  				      int start_level)
+  {
+ -	bool flush = false;
+ +	bool flush;
+  
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ -					  start_level, KVM_MAX_HUGEPAGE_LEVEL,
+ -					  false);
+ -		write_unlock(&kvm->mmu_lock);
+ -	}
+ -
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_level(kvm, memslot, slot_rmap_write_protect,
+ +				start_level, KVM_MAX_HUGEPAGE_LEVEL, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush |= kvm_tdp_mmu_wrprot_slot(kvm, memslot, start_level);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+  	 * We can flush all the TLBs out of the mmu lock without TLB
+@@@ -5799,22 -5726,25 +5809,20 @@@ restart
+  }
+  
+  void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+- 				   const struct kvm_memory_slot *memslot)
++ 				   const struct kvm_memory_slot *slot)
+  {
+- 	/* FIXME: const-ify all uses of struct kvm_memory_slot.  */
+- 	struct kvm_memory_slot *slot = (struct kvm_memory_slot *)memslot;
+  	bool flush = false;
+  
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
+ -		if (flush)
+ -			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ -		write_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, slot, kvm_mmu_zap_collapsible_spte, true);
+  
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush = kvm_tdp_mmu_zap_collapsible_sptes(kvm, slot, flush);
+ -		if (flush)
+ -			kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +
+ +	if (flush)
+ +		kvm_arch_flush_remote_tlbs_memslot(kvm, slot);
+ +
+ +	write_unlock(&kvm->mmu_lock);
+  }
+  
+  void kvm_arch_flush_remote_tlbs_memslot(struct kvm *kvm,
+@@@ -5833,15 -5763,22 +5841,15 @@@
+  }
+  
+  void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+- 				   struct kvm_memory_slot *memslot)
++ 				   const struct kvm_memory_slot *memslot)
+  {
+ -	bool flush = false;
+ -
+ -	if (kvm_memslots_have_rmaps(kvm)) {
+ -		write_lock(&kvm->mmu_lock);
+ -		flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty,
+ -					 false);
+ -		write_unlock(&kvm->mmu_lock);
+ -	}
+ +	bool flush;
+  
+ -	if (is_tdp_mmu_enabled(kvm)) {
+ -		read_lock(&kvm->mmu_lock);
+ +	write_lock(&kvm->mmu_lock);
+ +	flush = slot_handle_leaf(kvm, memslot, __rmap_clear_dirty, false);
+ +	if (is_tdp_mmu_enabled(kvm))
+  		flush |= kvm_tdp_mmu_clear_dirty_slot(kvm, memslot);
+ -		read_unlock(&kvm->mmu_lock);
+ -	}
+ +	write_unlock(&kvm->mmu_lock);
+  
+  	/*
+  	 * It's also safe to flush TLBs out of mmu lock here as currently this
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index c108053d930b..46343258eadf 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1553,12 +1553,12 @@ void kvm_mmu_uninit_vm(struct kvm *kvm);
+ void kvm_mmu_after_set_cpuid(struct kvm_vcpu *vcpu);
+ void kvm_mmu_reset_context(struct kvm_vcpu *vcpu);
+ void kvm_mmu_slot_remove_write_access(struct kvm *kvm,
+-				      struct kvm_memory_slot *memslot,
++				      const struct kvm_memory_slot *memslot,
+ 				      int start_level);
+ void kvm_mmu_zap_collapsible_sptes(struct kvm *kvm,
+ 				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_slot_leaf_clear_dirty(struct kvm *kvm,
+-				   struct kvm_memory_slot *memslot);
++				   const struct kvm_memory_slot *memslot);
+ void kvm_mmu_zap_all(struct kvm *kvm);
+ void kvm_mmu_invalidate_mmio_sptes(struct kvm *kvm, u64 gen);
+ unsigned long kvm_mmu_calculate_default_mmu_pages(struct kvm *kvm);
+* Unmerged path arch/x86/kvm/mmu/mmu.c
+diff --git a/arch/x86/kvm/mmu/mmu_internal.h b/arch/x86/kvm/mmu/mmu_internal.h
+index 5ac367b7f49f..8a455c26a5af 100644
+--- a/arch/x86/kvm/mmu/mmu_internal.h
++++ b/arch/x86/kvm/mmu/mmu_internal.h
+@@ -127,8 +127,8 @@ static inline bool is_nx_huge_page_enabled(void)
+ 
+ int mmu_try_to_unsync_pages(struct kvm_vcpu *vcpu, gfn_t gfn, bool can_unsync);
+ 
+-void kvm_mmu_gfn_disallow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
+-void kvm_mmu_gfn_allow_lpage(struct kvm_memory_slot *slot, gfn_t gfn);
++void kvm_mmu_gfn_disallow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
++void kvm_mmu_gfn_allow_lpage(const struct kvm_memory_slot *slot, gfn_t gfn);
+ bool kvm_mmu_slot_gfn_write_protect(struct kvm *kvm,
+ 				    struct kvm_memory_slot *slot, u64 gfn,
+ 				    int min_level);
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.c b/arch/x86/kvm/mmu/tdp_mmu.c
+index 506d3bdb9486..c7b3d82ffe5e 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@ -1252,8 +1252,8 @@ static bool wrprot_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+  * only affect leaf SPTEs down to min_level.
+  * Returns true if an SPTE has been changed and the TLBs need to be flushed.
+  */
+-bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			     int min_level)
++bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm,
++			     const struct kvm_memory_slot *slot, int min_level)
+ {
+ 	struct kvm_mmu_page *root;
+ 	bool spte_set = false;
+@@ -1312,7 +1312,8 @@ static bool clear_dirty_gfn_range(struct kvm *kvm, struct kvm_mmu_page *root,
+  * each SPTE. Returns true if an SPTE has been changed and the TLBs need to
+  * be flushed.
+  */
+-bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm, struct kvm_memory_slot *slot)
++bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm,
++				  const struct kvm_memory_slot *slot)
+ {
+ 	struct kvm_mmu_page *root;
+ 	bool spte_set = false;
+diff --git a/arch/x86/kvm/mmu/tdp_mmu.h b/arch/x86/kvm/mmu/tdp_mmu.h
+index 4a73a04d420c..a34bcd270e67 100644
+--- a/arch/x86/kvm/mmu/tdp_mmu.h
++++ b/arch/x86/kvm/mmu/tdp_mmu.h
+@@ -61,10 +61,10 @@ int kvm_tdp_mmu_test_age_hva(struct kvm *kvm, unsigned long hva);
+ int kvm_tdp_mmu_set_spte_hva(struct kvm *kvm, unsigned long address,
+ 			     pte_t *host_ptep);
+ 
+-bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm, struct kvm_memory_slot *slot,
+-			     int min_level);
++bool kvm_tdp_mmu_wrprot_slot(struct kvm *kvm,
++			     const struct kvm_memory_slot *slot, int min_level);
+ bool kvm_tdp_mmu_clear_dirty_slot(struct kvm *kvm,
+-				  struct kvm_memory_slot *slot);
++				  const struct kvm_memory_slot *slot);
+ void kvm_tdp_mmu_clear_dirty_pt_masked(struct kvm *kvm,
+ 				       struct kvm_memory_slot *slot,
+ 				       gfn_t gfn, unsigned long mask,
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 8637d2d61d5e..34b0131a8899 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11705,7 +11705,7 @@ static void kvm_mmu_update_cpu_dirty_logging(struct kvm *kvm, bool enable)
+ 
+ static void kvm_mmu_slot_apply_flags(struct kvm *kvm,
+ 				     struct kvm_memory_slot *old,
+-				     struct kvm_memory_slot *new,
++				     const struct kvm_memory_slot *new,
+ 				     enum kvm_mr_change change)
+ {
+ 	bool log_dirty_pages = new->flags & KVM_MEM_LOG_DIRTY_PAGES;
+@@ -11785,10 +11785,7 @@ void kvm_arch_commit_memory_region(struct kvm *kvm,
+ 		kvm_mmu_change_mmu_pages(kvm,
+ 				kvm_mmu_calculate_default_mmu_pages(kvm));
+ 
+-	/*
+-	 * FIXME: const-ify all uses of struct kvm_memory_slot.
+-	 */
+-	kvm_mmu_slot_apply_flags(kvm, old, (struct kvm_memory_slot *) new, change);
++	kvm_mmu_slot_apply_flags(kvm, old, new, change);
+ 
+ 	/* Free the arrays associated with the old memslot. */
+ 	if (change == KVM_MR_MOVE)
