@@ -1,0 +1,267 @@
+kvm: Add memcg accounting to KVM allocations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ben Gardon <bgardon@google.com>
+commit b12ce36a43f29dbff0bca14c5a51c276aea5662f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/b12ce36a.failed
+
+There are many KVM kernel memory allocations which are tied to the life of
+the VM process and should be charged to the VM process's cgroup. If the
+allocations aren't tied to the process, the OOM killer will not know
+that killing the process will free the associated kernel memory.
+Add __GFP_ACCOUNT flags to many of the allocations which are not yet being
+charged to the VM process's cgroup.
+
+Tested:
+	Ran all kvm-unit-tests on a 64 bit Haswell machine, the patch
+	introduced no new failures.
+	Ran a kernel memory accounting test which creates a VM to touch
+	memory and then checks that the kernel memory allocated for the
+	process is within certain bounds.
+	With this patch we account for much more of the vmalloc and slab memory
+	allocated for the VM.
+
+There remain a few allocations which should be charged to the VM's
+cgroup but are not. In they include:
+        vcpu->run
+        kvm->coalesced_mmio_ring
+There allocations are unaccounted in this patch because they are mapped
+to userspace, and accounting them to a cgroup causes problems. This
+should be addressed in a future patch.
+
+	Signed-off-by: Ben Gardon <bgardon@google.com>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b12ce36a43f29dbff0bca14c5a51c276aea5662f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/coalesced_mmio.c
+diff --cc virt/kvm/coalesced_mmio.c
+index 9e65feb6fa58,5294abb3f178..000000000000
+--- a/virt/kvm/coalesced_mmio.c
++++ b/virt/kvm/coalesced_mmio.c
+@@@ -140,7 -141,11 +140,15 @@@ int kvm_vm_ioctl_register_coalesced_mmi
+  	int ret;
+  	struct kvm_coalesced_mmio_dev *dev;
+  
+++<<<<<<< HEAD
+ +	dev = kzalloc(sizeof(struct kvm_coalesced_mmio_dev), GFP_KERNEL);
+++=======
++ 	if (zone->pio != 1 && zone->pio != 0)
++ 		return -EINVAL;
++ 
++ 	dev = kzalloc(sizeof(struct kvm_coalesced_mmio_dev),
++ 		      GFP_KERNEL_ACCOUNT);
+++>>>>>>> b12ce36a43f2 (kvm: Add memcg accounting to KVM allocations)
+  	if (!dev)
+  		return -ENOMEM;
+  
+* Unmerged path virt/kvm/coalesced_mmio.c
+diff --git a/virt/kvm/eventfd.c b/virt/kvm/eventfd.c
+index b20b751286fc..4325250afd72 100644
+--- a/virt/kvm/eventfd.c
++++ b/virt/kvm/eventfd.c
+@@ -297,7 +297,7 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+ 	if (!kvm_arch_intc_initialized(kvm))
+ 		return -EAGAIN;
+ 
+-	irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL);
++	irqfd = kzalloc(sizeof(*irqfd), GFP_KERNEL_ACCOUNT);
+ 	if (!irqfd)
+ 		return -ENOMEM;
+ 
+@@ -345,7 +345,8 @@ kvm_irqfd_assign(struct kvm *kvm, struct kvm_irqfd *args)
+ 		}
+ 
+ 		if (!irqfd->resampler) {
+-			resampler = kzalloc(sizeof(*resampler), GFP_KERNEL);
++			resampler = kzalloc(sizeof(*resampler),
++					    GFP_KERNEL_ACCOUNT);
+ 			if (!resampler) {
+ 				ret = -ENOMEM;
+ 				mutex_unlock(&kvm->irqfds.resampler_lock);
+@@ -797,7 +798,7 @@ static int kvm_assign_ioeventfd_idx(struct kvm *kvm,
+ 	if (IS_ERR(eventfd))
+ 		return PTR_ERR(eventfd);
+ 
+-	p = kzalloc(sizeof(*p), GFP_KERNEL);
++	p = kzalloc(sizeof(*p), GFP_KERNEL_ACCOUNT);
+ 	if (!p) {
+ 		ret = -ENOMEM;
+ 		goto fail;
+diff --git a/virt/kvm/irqchip.c b/virt/kvm/irqchip.c
+index b1286c4e0712..3547b0d8c91e 100644
+--- a/virt/kvm/irqchip.c
++++ b/virt/kvm/irqchip.c
+@@ -196,7 +196,7 @@ int kvm_set_irq_routing(struct kvm *kvm,
+ 	nr_rt_entries += 1;
+ 
+ 	new = kzalloc(sizeof(*new) + (nr_rt_entries * sizeof(struct hlist_head)),
+-		      GFP_KERNEL);
++		      GFP_KERNEL_ACCOUNT);
+ 
+ 	if (!new)
+ 		return -ENOMEM;
+@@ -208,7 +208,7 @@ int kvm_set_irq_routing(struct kvm *kvm,
+ 
+ 	for (i = 0; i < nr; ++i) {
+ 		r = -ENOMEM;
+-		e = kzalloc(sizeof(*e), GFP_KERNEL);
++		e = kzalloc(sizeof(*e), GFP_KERNEL_ACCOUNT);
+ 		if (!e)
+ 			goto out;
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index ed6cdc24b109..0f508d255fa4 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -525,7 +525,7 @@ static struct kvm_memslots *kvm_alloc_memslots(void)
+ 	int i;
+ 	struct kvm_memslots *slots;
+ 
+-	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL);
++	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL_ACCOUNT);
+ 	if (!slots)
+ 		return NULL;
+ 
+@@ -601,12 +601,12 @@ static int kvm_create_vm_debugfs(struct kvm *kvm, int fd)
+ 
+ 	kvm->debugfs_stat_data = kcalloc(kvm_debugfs_num_entries,
+ 					 sizeof(*kvm->debugfs_stat_data),
+-					 GFP_KERNEL);
++					 GFP_KERNEL_ACCOUNT);
+ 	if (!kvm->debugfs_stat_data)
+ 		return -ENOMEM;
+ 
+ 	for (p = debugfs_entries; p->name; p++) {
+-		stat_data = kzalloc(sizeof(*stat_data), GFP_KERNEL);
++		stat_data = kzalloc(sizeof(*stat_data), GFP_KERNEL_ACCOUNT);
+ 		if (!stat_data)
+ 			return -ENOMEM;
+ 
+@@ -671,7 +671,7 @@ static struct kvm *kvm_create_vm(unsigned long type)
+ 		goto out_err_no_irq_srcu;
+ 	for (i = 0; i < KVM_NR_BUSES; i++) {
+ 		rcu_assign_pointer(kvm->buses[i],
+-			kzalloc(sizeof(struct kvm_io_bus), GFP_KERNEL));
++			kzalloc(sizeof(struct kvm_io_bus), GFP_KERNEL_ACCOUNT));
+ 		if (!kvm->buses[i])
+ 			goto out_err;
+ 	}
+@@ -789,7 +789,7 @@ static int kvm_create_dirty_bitmap(struct kvm_memory_slot *memslot)
+ {
+ 	unsigned long dirty_bytes = 2 * kvm_dirty_bitmap_bytes(memslot);
+ 
+-	memslot->dirty_bitmap = kvzalloc(dirty_bytes, GFP_KERNEL);
++	memslot->dirty_bitmap = kvzalloc(dirty_bytes, GFP_KERNEL_ACCOUNT);
+ 	if (!memslot->dirty_bitmap)
+ 		return -ENOMEM;
+ 
+@@ -1019,7 +1019,7 @@ int __kvm_set_memory_region(struct kvm *kvm,
+ 			goto out_free;
+ 	}
+ 
+-	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL);
++	slots = kvzalloc(sizeof(struct kvm_memslots), GFP_KERNEL_ACCOUNT);
+ 	if (!slots)
+ 		goto out_free;
+ 	memcpy(slots, __kvm_memslots(kvm, as_id), sizeof(struct kvm_memslots));
+@@ -2602,7 +2602,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 		struct kvm_regs *kvm_regs;
+ 
+ 		r = -ENOMEM;
+-		kvm_regs = kzalloc(sizeof(struct kvm_regs), GFP_KERNEL);
++		kvm_regs = kzalloc(sizeof(struct kvm_regs), GFP_KERNEL_ACCOUNT);
+ 		if (!kvm_regs)
+ 			goto out;
+ 		r = kvm_arch_vcpu_ioctl_get_regs(vcpu, kvm_regs);
+@@ -2630,7 +2630,8 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 		break;
+ 	}
+ 	case KVM_GET_SREGS: {
+-		kvm_sregs = kzalloc(sizeof(struct kvm_sregs), GFP_KERNEL);
++		kvm_sregs = kzalloc(sizeof(struct kvm_sregs),
++				    GFP_KERNEL_ACCOUNT);
+ 		r = -ENOMEM;
+ 		if (!kvm_sregs)
+ 			goto out;
+@@ -2722,7 +2723,7 @@ static long kvm_vcpu_ioctl(struct file *filp,
+ 		break;
+ 	}
+ 	case KVM_GET_FPU: {
+-		fpu = kzalloc(sizeof(struct kvm_fpu), GFP_KERNEL);
++		fpu = kzalloc(sizeof(struct kvm_fpu), GFP_KERNEL_ACCOUNT);
+ 		r = -ENOMEM;
+ 		if (!fpu)
+ 			goto out;
+@@ -2899,7 +2900,7 @@ static int kvm_ioctl_create_device(struct kvm *kvm,
+ 	if (test)
+ 		return 0;
+ 
+-	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
++	dev = kzalloc(sizeof(*dev), GFP_KERNEL_ACCOUNT);
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
+@@ -3611,7 +3612,7 @@ int kvm_io_bus_register_dev(struct kvm *kvm, enum kvm_bus bus_idx, gpa_t addr,
+ 		return -ENOSPC;
+ 
+ 	new_bus = kmalloc(struct_size(bus, range, bus->dev_count + 1),
+-			  GFP_KERNEL);
++			  GFP_KERNEL_ACCOUNT);
+ 	if (!new_bus)
+ 		return -ENOMEM;
+ 
+@@ -3657,7 +3658,7 @@ void kvm_io_bus_unregister_dev(struct kvm *kvm, enum kvm_bus bus_idx,
+ 		return;
+ 
+ 	new_bus = kmalloc(struct_size(bus, range, bus->dev_count - 1),
+-			  GFP_KERNEL);
++			  GFP_KERNEL_ACCOUNT);
+ 	if (!new_bus)  {
+ 		pr_err("kvm: failed to shrink bus, removing it completely\n");
+ 		goto broken;
+@@ -3925,7 +3926,7 @@ static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
+ 	active = kvm_active_vms;
+ 	spin_unlock(&kvm_lock);
+ 
+-	env = kzalloc(sizeof(*env), GFP_KERNEL);
++	env = kzalloc(sizeof(*env), GFP_KERNEL_ACCOUNT);
+ 	if (!env)
+ 		return;
+ 
+@@ -3941,7 +3942,7 @@ static void kvm_uevent_notify_change(unsigned int type, struct kvm *kvm)
+ 	add_uevent_var(env, "PID=%d", kvm->userspace_pid);
+ 
+ 	if (kvm->debugfs_dentry) {
+-		char *tmp, *p = kmalloc(PATH_MAX, GFP_KERNEL);
++		char *tmp, *p = kmalloc(PATH_MAX, GFP_KERNEL_ACCOUNT);
+ 
+ 		if (p) {
+ 			tmp = dentry_path_raw(kvm->debugfs_dentry, p, PATH_MAX);
+diff --git a/virt/kvm/vfio.c b/virt/kvm/vfio.c
+index d99850c462a1..524cbd20379f 100644
+--- a/virt/kvm/vfio.c
++++ b/virt/kvm/vfio.c
+@@ -219,7 +219,7 @@ static int kvm_vfio_set_group(struct kvm_device *dev, long attr, u64 arg)
+ 			}
+ 		}
+ 
+-		kvg = kzalloc(sizeof(*kvg), GFP_KERNEL);
++		kvg = kzalloc(sizeof(*kvg), GFP_KERNEL_ACCOUNT);
+ 		if (!kvg) {
+ 			mutex_unlock(&kv->lock);
+ 			kvm_vfio_group_put_external_user(vfio_group);
+@@ -405,7 +405,7 @@ static int kvm_vfio_create(struct kvm_device *dev, u32 type)
+ 		if (tmp->ops == &kvm_vfio_ops)
+ 			return -EBUSY;
+ 
+-	kv = kzalloc(sizeof(*kv), GFP_KERNEL);
++	kv = kzalloc(sizeof(*kv), GFP_KERNEL_ACCOUNT);
+ 	if (!kv)
+ 		return -ENOMEM;
+ 
