@@ -523,10 +523,8 @@ void mt76_txq_schedule_all(struct mt76_phy *phy)
 }
 EXPORT_SYMBOL_GPL(mt76_txq_schedule_all);
 
-void mt76_tx_worker(struct mt76_worker *w)
+void mt76_tx_worker_run(struct mt76_dev *dev)
 {
-	struct mt76_dev *dev = container_of(w, struct mt76_dev, tx_worker);
-
 	mt76_txq_schedule_all(&dev->phy);
 	if (dev->phy2)
 		mt76_txq_schedule_all(dev->phy2);
@@ -535,6 +533,14 @@ void mt76_tx_worker(struct mt76_worker *w)
 	if (dev->test.tx_pending)
 		mt76_testmode_tx_pending(dev);
 #endif
+}
+EXPORT_SYMBOL_GPL(mt76_tx_worker_run);
+
+void mt76_tx_worker(struct mt76_worker *w)
+{
+	struct mt76_dev *dev = container_of(w, struct mt76_dev, tx_worker);
+
+	mt76_tx_worker_run(dev);
 }
 
 void mt76_stop_tx_queues(struct mt76_dev *dev, struct ieee80211_sta *sta,
