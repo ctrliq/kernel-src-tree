@@ -1,0 +1,287 @@
+mm/mmu_gather: invalidate TLB correctly on batch allocation failure and flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0ed1325967ab5f7a4549a2641c6ebe115f76e228
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0ed13259.failed
+
+Architectures for which we have hardware walkers of Linux page table
+should flush TLB on mmu gather batch allocation failures and batch flush.
+Some architectures like POWER supports multiple translation modes (hash
+and radix) and in the case of POWER only radix translation mode needs the
+above TLBI.  This is because for hash translation mode kernel wants to
+avoid this extra flush since there are no hardware walkers of linux page
+table.  With radix translation, the hardware also walks linux page table
+and with that, kernel needs to make sure to TLB invalidate page walk cache
+before page table pages are freed.
+
+More details in commit d86564a2f085 ("mm/tlb, x86/mm: Support invalidating
+TLB caches for RCU_TABLE_FREE")
+
+The changes to sparc are to make sure we keep the old behavior since we
+are now removing HAVE_RCU_TABLE_NO_INVALIDATE.  The default value for
+tlb_needs_table_invalidate is to always force an invalidate and sparc can
+avoid the table invalidate.  Hence we define tlb_needs_table_invalidate to
+false for sparc architecture.
+
+Link: http://lkml.kernel.org/r/20200116064531.483522-3-aneesh.kumar@linux.ibm.com
+Fixes: a46cc7a90fd8 ("powerpc/mm/radix: Improve TLB/PWC flushes")
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Acked-by: Michael Ellerman <mpe@ellerman.id.au>	[powerpc]
+	Cc: <stable@vger.kernel.org>	[4.14+]
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 0ed1325967ab5f7a4549a2641c6ebe115f76e228)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/Kconfig
+#	arch/powerpc/Kconfig
+#	include/asm-generic/tlb.h
+#	mm/mmu_gather.c
+diff --cc arch/Kconfig
+index c2142afcf45f,208aad121630..000000000000
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@@ -369,7 -396,10 +369,14 @@@ config HAVE_ARCH_JUMP_LABEL_RELATIV
+  config HAVE_RCU_TABLE_FREE
+  	bool
+  
+++<<<<<<< HEAD
+ +config HAVE_RCU_TABLE_INVALIDATE
+++=======
++ config HAVE_MMU_GATHER_PAGE_SIZE
++ 	bool
++ 
++ config HAVE_MMU_GATHER_NO_GATHER
+++>>>>>>> 0ed1325967ab (mm/mmu_gather: invalidate TLB correctly on batch allocation failure and flush)
+  	bool
+  
+  config ARCH_HAVE_NMI_SAFE_CMPXCHG
+diff --cc arch/powerpc/Kconfig
+index f95f7924e00e,c22ed1fe275d..000000000000
+--- a/arch/powerpc/Kconfig
++++ b/arch/powerpc/Kconfig
+@@@ -209,7 -222,8 +209,12 @@@ config PP
+  	select HAVE_HARDLOCKUP_DETECTOR_PERF	if PERF_EVENTS && HAVE_PERF_EVENTS_NMI && !HAVE_HARDLOCKUP_DETECTOR_ARCH
+  	select HAVE_PERF_REGS
+  	select HAVE_PERF_USER_STACK_DUMP
+++<<<<<<< HEAD
+ +	select HAVE_RCU_TABLE_FREE		if SMP
+++=======
++ 	select HAVE_RCU_TABLE_FREE
++ 	select HAVE_MMU_GATHER_PAGE_SIZE
+++>>>>>>> 0ed1325967ab (mm/mmu_gather: invalidate TLB correctly on batch allocation failure and flush)
+  	select HAVE_REGS_AND_STACK_ACCESS_API
+  	select HAVE_RELIABLE_STACKTRACE		if PPC_BOOK3S_64 && CPU_LITTLE_ENDIAN
+  	select HAVE_SYSCALL_TRACEPOINTS
+diff --cc include/asm-generic/tlb.h
+index 81db3c11bb11,9e22ac369d1d..000000000000
+--- a/include/asm-generic/tlb.h
++++ b/include/asm-generic/tlb.h
+@@@ -31,6 -28,120 +31,123 @@@
+  
+  #ifdef CONFIG_MMU
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Generic MMU-gather implementation.
++  *
++  * The mmu_gather data structure is used by the mm code to implement the
++  * correct and efficient ordering of freeing pages and TLB invalidations.
++  *
++  * This correct ordering is:
++  *
++  *  1) unhook page
++  *  2) TLB invalidate page
++  *  3) free page
++  *
++  * That is, we must never free a page before we have ensured there are no live
++  * translations left to it. Otherwise it might be possible to observe (or
++  * worse, change) the page content after it has been reused.
++  *
++  * The mmu_gather API consists of:
++  *
++  *  - tlb_gather_mmu() / tlb_finish_mmu(); start and finish a mmu_gather
++  *
++  *    Finish in particular will issue a (final) TLB invalidate and free
++  *    all (remaining) queued pages.
++  *
++  *  - tlb_start_vma() / tlb_end_vma(); marks the start / end of a VMA
++  *
++  *    Defaults to flushing at tlb_end_vma() to reset the range; helps when
++  *    there's large holes between the VMAs.
++  *
++  *  - tlb_remove_page() / __tlb_remove_page()
++  *  - tlb_remove_page_size() / __tlb_remove_page_size()
++  *
++  *    __tlb_remove_page_size() is the basic primitive that queues a page for
++  *    freeing. __tlb_remove_page() assumes PAGE_SIZE. Both will return a
++  *    boolean indicating if the queue is (now) full and a call to
++  *    tlb_flush_mmu() is required.
++  *
++  *    tlb_remove_page() and tlb_remove_page_size() imply the call to
++  *    tlb_flush_mmu() when required and has no return value.
++  *
++  *  - tlb_change_page_size()
++  *
++  *    call before __tlb_remove_page*() to set the current page-size; implies a
++  *    possible tlb_flush_mmu() call.
++  *
++  *  - tlb_flush_mmu() / tlb_flush_mmu_tlbonly()
++  *
++  *    tlb_flush_mmu_tlbonly() - does the TLB invalidate (and resets
++  *                              related state, like the range)
++  *
++  *    tlb_flush_mmu() - in addition to the above TLB invalidate, also frees
++  *			whatever pages are still batched.
++  *
++  *  - mmu_gather::fullmm
++  *
++  *    A flag set by tlb_gather_mmu() to indicate we're going to free
++  *    the entire mm; this allows a number of optimizations.
++  *
++  *    - We can ignore tlb_{start,end}_vma(); because we don't
++  *      care about ranges. Everything will be shot down.
++  *
++  *    - (RISC) architectures that use ASIDs can cycle to a new ASID
++  *      and delay the invalidation until ASID space runs out.
++  *
++  *  - mmu_gather::need_flush_all
++  *
++  *    A flag that can be set by the arch code if it wants to force
++  *    flush the entire TLB irrespective of the range. For instance
++  *    x86-PAE needs this when changing top-level entries.
++  *
++  * And allows the architecture to provide and implement tlb_flush():
++  *
++  * tlb_flush() may, in addition to the above mentioned mmu_gather fields, make
++  * use of:
++  *
++  *  - mmu_gather::start / mmu_gather::end
++  *
++  *    which provides the range that needs to be flushed to cover the pages to
++  *    be freed.
++  *
++  *  - mmu_gather::freed_tables
++  *
++  *    set when we freed page table pages
++  *
++  *  - tlb_get_unmap_shift() / tlb_get_unmap_size()
++  *
++  *    returns the smallest TLB entry size unmapped in this range.
++  *
++  * If an architecture does not provide tlb_flush() a default implementation
++  * based on flush_tlb_range() will be used, unless MMU_GATHER_NO_RANGE is
++  * specified, in which case we'll default to flush_tlb_mm().
++  *
++  * Additionally there are a few opt-in features:
++  *
++  *  HAVE_MMU_GATHER_PAGE_SIZE
++  *
++  *  This ensures we call tlb_flush() every time tlb_change_page_size() actually
++  *  changes the size and provides mmu_gather::page_size to tlb_flush().
++  *
++  *  HAVE_RCU_TABLE_FREE
++  *
++  *  This provides tlb_remove_table(), to be used instead of tlb_remove_page()
++  *  for page directores (__p*_free_tlb()). This provides separate freeing of
++  *  the page-table pages themselves in a semi-RCU fashion (see comment below).
++  *  Useful if your architecture doesn't use IPIs for remote TLB invalidates
++  *  and therefore doesn't naturally serialize with software page-table walkers.
++  *
++  *  When used, an architecture is expected to provide __tlb_remove_table()
++  *  which does the actual freeing of these pages.
++  *
++  *  MMU_GATHER_NO_RANGE
++  *
++  *  Use this if your architecture lacks an efficient flush_tlb_range().
++  */
++ 
+++>>>>>>> 0ed1325967ab (mm/mmu_gather: invalidate TLB correctly on batch allocation failure and flush)
+  #ifdef CONFIG_HAVE_RCU_TABLE_FREE
+  /*
+   * Semi RCU freeing of the page directories.
+@@@ -69,11 -180,26 +186,30 @@@ struct mmu_table_batch 
+  #define MAX_TABLE_BATCH		\
+  	((PAGE_SIZE - sizeof(struct mmu_table_batch)) / sizeof(void *))
+  
+ +extern void tlb_table_flush(struct mmu_gather *tlb);
+  extern void tlb_remove_table(struct mmu_gather *tlb, void *table);
+  
++ /*
++  * This allows an architecture that does not use the linux page-tables for
++  * hardware to skip the TLBI when freeing page tables.
++  */
++ #ifndef tlb_needs_table_invalidate
++ #define tlb_needs_table_invalidate() (true)
++ #endif
++ 
+++<<<<<<< HEAD
+++=======
++ #else
++ 
++ #ifdef tlb_needs_table_invalidate
++ #error tlb_needs_table_invalidate() requires HAVE_RCU_TABLE_FREE
+  #endif
+  
++ #endif /* CONFIG_HAVE_RCU_TABLE_FREE */
++ 
++ 
++ #ifndef CONFIG_HAVE_MMU_GATHER_NO_GATHER
+++>>>>>>> 0ed1325967ab (mm/mmu_gather: invalidate TLB correctly on batch allocation failure and flush)
+  /*
+   * If we can't allocate a page to make a big batch of page pointers
+   * to work on, then just handle a few from the on-stack structure.
+* Unmerged path mm/mmu_gather.c
+* Unmerged path arch/Kconfig
+* Unmerged path arch/powerpc/Kconfig
+diff --git a/arch/powerpc/include/asm/tlb.h b/arch/powerpc/include/asm/tlb.h
+index 4f07f175c7f8..c4c3e9caf72b 100644
+--- a/arch/powerpc/include/asm/tlb.h
++++ b/arch/powerpc/include/asm/tlb.h
+@@ -31,6 +31,17 @@
+ #define tlb_remove_check_page_size_change tlb_remove_check_page_size_change
+ 
+ extern void tlb_flush(struct mmu_gather *tlb);
++/*
++ * book3s:
++ * Hash does not use the linux page-tables, so we can avoid
++ * the TLB invalidate for page-table freeing, Radix otoh does use the
++ * page-tables and needs the TLBI.
++ *
++ * nohash:
++ * We still do TLB invalidate in the __pte_free_tlb routine before we
++ * add the page table pages to mmu gather table batch.
++ */
++#define tlb_needs_table_invalidate()	radix_enabled()
+ 
+ /* Get the generic bits... */
+ #include <asm-generic/tlb.h>
+diff --git a/arch/sparc/include/asm/tlb_64.h b/arch/sparc/include/asm/tlb_64.h
+index a2f3fa61ee36..8cb8f3833239 100644
+--- a/arch/sparc/include/asm/tlb_64.h
++++ b/arch/sparc/include/asm/tlb_64.h
+@@ -28,6 +28,15 @@ void flush_tlb_pending(void);
+ #define __tlb_remove_tlb_entry(tlb, ptep, address) do { } while (0)
+ #define tlb_flush(tlb)	flush_tlb_pending()
+ 
++/*
++ * SPARC64's hardware TLB fill does not use the Linux page-tables
++ * and therefore we don't need a TLBI when freeing page-table pages.
++ */
++
++#ifdef CONFIG_HAVE_RCU_TABLE_FREE
++#define tlb_needs_table_invalidate()	(false)
++#endif
++
+ #include <asm-generic/tlb.h>
+ 
+ #endif /* _SPARC64_TLB_H */
+* Unmerged path include/asm-generic/tlb.h
+* Unmerged path mm/mmu_gather.c
