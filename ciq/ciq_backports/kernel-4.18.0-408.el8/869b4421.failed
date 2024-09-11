@@ -1,0 +1,391 @@
+kvm: x86: protect masterclock with a seqcount
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 869b44211adc878be7149cc4ae57207f924f7390
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/869b4421.failed
+
+Protect the reference point for kvmclock with a seqcount, so that
+kvmclock updates for all vCPUs can proceed in parallel.  Xen runstate
+updates will also run in parallel and not bounce the kvmclock cacheline.
+
+Of the variables that were protected by pvclock_gtod_sync_lock,
+nr_vcpus_matched_tsc is different because it is updated outside
+pvclock_update_vm_gtod_copy and read inside it.  Therefore, we
+need to keep it protected by a spinlock.  In fact it must now
+be a raw spinlock, because pvclock_update_vm_gtod_copy, being the
+write-side of a seqcount, is non-preemptible.  Since we already
+have tsc_write_lock which is a raw spinlock, we can just use
+tsc_write_lock as the lock that protects the write-side of the
+seqcount.
+
+Co-developed-by: Oliver Upton <oupton@google.com>
+Message-Id: <20210916181538.968978-6-oupton@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 869b44211adc878be7149cc4ae57207f924f7390)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 45d5ce5def55,68ac06fef4fa..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1091,7 -1101,7 +1096,11 @@@ struct kvm_arch 
+  	u64 cur_tsc_generation;
+  	int nr_vcpus_matched_tsc;
+  
+++<<<<<<< HEAD
+ +	raw_spinlock_t pvclock_gtod_sync_lock;
+++=======
++ 	seqcount_raw_spinlock_t pvclock_sc;
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  	bool use_master_clock;
+  	u64 master_kernel_ns;
+  	u64 master_cycle_now;
+diff --cc arch/x86/kvm/x86.c
+index 1b1a9834002b,d7588f6c90c8..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2594,9 -2487,48 +2594,36 @@@ static void kvm_synchronize_tsc(struct 
+  			offset = kvm_compute_l1_tsc_offset(vcpu, data);
+  		}
+  		matched = true;
+ -		already_matched = (vcpu->arch.this_tsc_generation == kvm->arch.cur_tsc_generation);
+ -	} else {
+ -		/*
+ -		 * We split periods of matched TSC writes into generations.
+ -		 * For each generation, we track the original measured
+ -		 * nanosecond time, offset, and write, so if TSCs are in
+ -		 * sync, we can match exact offset, and if not, we can match
+ -		 * exact software computation in compute_guest_tsc()
+ -		 *
+ -		 * These values are tracked in kvm->arch.cur_xxx variables.
+ -		 */
+ -		kvm->arch.cur_tsc_generation++;
+ -		kvm->arch.cur_tsc_nsec = ns;
+ -		kvm->arch.cur_tsc_write = data;
+ -		kvm->arch.cur_tsc_offset = offset;
+ -		matched = false;
+  	}
+  
+++<<<<<<< HEAD
+ +	__kvm_synchronize_tsc(vcpu, offset, data, ns, matched);
+++=======
++ 	/*
++ 	 * We also track th most recent recorded KHZ, write and time to
++ 	 * allow the matching interval to be extended at each write.
++ 	 */
++ 	kvm->arch.last_tsc_nsec = ns;
++ 	kvm->arch.last_tsc_write = data;
++ 	kvm->arch.last_tsc_khz = vcpu->arch.virtual_tsc_khz;
++ 
++ 	vcpu->arch.last_guest_tsc = data;
++ 
++ 	/* Keep track of which generation this VCPU has synchronized to */
++ 	vcpu->arch.this_tsc_generation = kvm->arch.cur_tsc_generation;
++ 	vcpu->arch.this_tsc_nsec = kvm->arch.cur_tsc_nsec;
++ 	vcpu->arch.this_tsc_write = kvm->arch.cur_tsc_write;
++ 
++ 	kvm_vcpu_write_tsc_offset(vcpu, offset);
++ 
++ 	if (!matched) {
++ 		kvm->arch.nr_vcpus_matched_tsc = 0;
++ 	} else if (!already_matched) {
++ 		kvm->arch.nr_vcpus_matched_tsc++;
++ 	}
++ 
++ 	kvm_track_tsc_matching(vcpu);
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+  }
+  
+@@@ -2814,63 -2747,96 +2842,142 @@@ void kvm_make_mclock_inprogress_request
+  	kvm_make_all_cpus_request(kvm, KVM_REQ_MCLOCK_INPROGRESS);
+  }
+  
+++<<<<<<< HEAD
+ +static void kvm_gen_update_masterclock(struct kvm *kvm)
+ +{
+ +#ifdef CONFIG_X86_64
+ +	int i;
+ +	struct kvm_vcpu *vcpu;
+ +	struct kvm_arch *ka = &kvm->arch;
+ +	unsigned long flags;
+ +
+ +	kvm_hv_invalidate_tsc_page(kvm);
+ +
+ +	kvm_make_mclock_inprogress_request(kvm);
+ +
+ +	/* no guest entries from this point */
+ +	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ +	pvclock_update_vm_gtod_copy(kvm);
+ +	raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+ +
+++=======
++ static void __kvm_start_pvclock_update(struct kvm *kvm)
++ {
++ 	raw_spin_lock_irq(&kvm->arch.tsc_write_lock);
++ 	write_seqcount_begin(&kvm->arch.pvclock_sc);
++ }
++ 
++ static void kvm_start_pvclock_update(struct kvm *kvm)
++ {
++ 	kvm_make_mclock_inprogress_request(kvm);
++ 
++ 	/* no guest entries from this point */
++ 	__kvm_start_pvclock_update(kvm);
++ }
++ 
++ static void kvm_end_pvclock_update(struct kvm *kvm)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	struct kvm_vcpu *vcpu;
++ 	int i;
++ 
++ 	write_seqcount_end(&ka->pvclock_sc);
++ 	raw_spin_unlock_irq(&ka->tsc_write_lock);
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  	kvm_for_each_vcpu(i, vcpu, kvm)
+  		kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+  
+  	/* guest entries allowed */
+  	kvm_for_each_vcpu(i, vcpu, kvm)
+  		kvm_clear_request(KVM_REQ_MCLOCK_INPROGRESS, vcpu);
+ +#endif
+  }
+  
+++<<<<<<< HEAD
+ +u64 get_kvmclock_ns(struct kvm *kvm)
+ +{
+ +	struct kvm_arch *ka = &kvm->arch;
+ +	struct pvclock_vcpu_time_info hv_clock;
+ +	unsigned long flags;
+ +	u64 ret;
+ +
+ +	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ +	if (!ka->use_master_clock) {
+ +		raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+ +		return get_kvmclock_base_ns() + ka->kvmclock_offset;
+ +	}
+ +
+ +	hv_clock.tsc_timestamp = ka->master_cycle_now;
+ +	hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+ +	raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+++=======
++ static void kvm_update_masterclock(struct kvm *kvm)
++ {
++ 	kvm_hv_invalidate_tsc_page(kvm);
++ 	kvm_start_pvclock_update(kvm);
++ 	pvclock_update_vm_gtod_copy(kvm);
++ 	kvm_end_pvclock_update(kvm);
++ }
++ 
++ /* Called within read_seqcount_begin/retry for kvm->pvclock_sc.  */
++ static void __get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	struct pvclock_vcpu_time_info hv_clock;
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  
+  	/* both __this_cpu_read() and rdtsc() should be on the same cpu */
+  	get_cpu();
+  
+++<<<<<<< HEAD
+ +	if (__this_cpu_read(cpu_tsc_khz)) {
+++=======
++ 	data->flags = 0;
++ 	if (ka->use_master_clock && __this_cpu_read(cpu_tsc_khz)) {
++ #ifdef CONFIG_X86_64
++ 		struct timespec64 ts;
++ 
++ 		if (kvm_get_walltime_and_clockread(&ts, &data->host_tsc)) {
++ 			data->realtime = ts.tv_nsec + NSEC_PER_SEC * ts.tv_sec;
++ 			data->flags |= KVM_CLOCK_REALTIME | KVM_CLOCK_HOST_TSC;
++ 		} else
++ #endif
++ 		data->host_tsc = rdtsc();
++ 
++ 		data->flags |= KVM_CLOCK_TSC_STABLE;
++ 		hv_clock.tsc_timestamp = ka->master_cycle_now;
++ 		hv_clock.system_time = ka->master_kernel_ns + ka->kvmclock_offset;
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  		kvm_get_time_scale(NSEC_PER_SEC, __this_cpu_read(cpu_tsc_khz) * 1000LL,
+  				   &hv_clock.tsc_shift,
+  				   &hv_clock.tsc_to_system_mul);
+ -		data->clock = __pvclock_read_cycles(&hv_clock, data->host_tsc);
+ -	} else {
+ -		data->clock = get_kvmclock_base_ns() + ka->kvmclock_offset;
+ -	}
+ +		ret = __pvclock_read_cycles(&hv_clock, rdtsc());
+ +	} else
+ +		ret = get_kvmclock_base_ns() + ka->kvmclock_offset;
+  
+  	put_cpu();
+ -}
+  
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ static void get_kvmclock(struct kvm *kvm, struct kvm_clock_data *data)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	unsigned seq;
++ 
++ 	do {
++ 		seq = read_seqcount_begin(&ka->pvclock_sc);
++ 		__get_kvmclock(kvm, data);
++ 	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
++ }
++ 
++ u64 get_kvmclock_ns(struct kvm *kvm)
++ {
++ 	struct kvm_clock_data data;
++ 
++ 	get_kvmclock(kvm, &data);
++ 	return data.clock;
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  }
+  
+  static void kvm_setup_pvclock_page(struct kvm_vcpu *v,
+@@@ -2949,13 -2916,14 +3057,24 @@@ static int kvm_guest_time_update(struc
+  	 * If the host uses TSC clock, then passthrough TSC as stable
+  	 * to the guest.
+  	 */
+++<<<<<<< HEAD
+ +	raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+ +	use_master_clock = ka->use_master_clock;
+ +	if (use_master_clock) {
+ +		host_tsc = ka->master_cycle_now;
+ +		kernel_ns = ka->master_kernel_ns;
+ +	}
+ +	raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+++=======
++ 	do {
++ 		seq = read_seqcount_begin(&ka->pvclock_sc);
++ 		use_master_clock = ka->use_master_clock;
++ 		if (use_master_clock) {
++ 			host_tsc = ka->master_cycle_now;
++ 			kernel_ns = ka->master_kernel_ns;
++ 		}
++ 	} while (read_seqcount_retry(&ka->pvclock_sc, seq));
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  
+  	/* Keep irq disabled to prevent changes to the clock */
+  	local_irq_save(flags);
+@@@ -6013,6 -5844,63 +6132,66 @@@ int kvm_arch_pm_notifier(struct kvm *kv
+  }
+  #endif /* CONFIG_HAVE_KVM_PM_NOTIFIER */
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_vm_ioctl_get_clock(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_clock_data data = { 0 };
++ 
++ 	get_kvmclock(kvm, &data);
++ 	if (copy_to_user(argp, &data, sizeof(data)))
++ 		return -EFAULT;
++ 
++ 	return 0;
++ }
++ 
++ static int kvm_vm_ioctl_set_clock(struct kvm *kvm, void __user *argp)
++ {
++ 	struct kvm_arch *ka = &kvm->arch;
++ 	struct kvm_clock_data data;
++ 	u64 now_raw_ns;
++ 
++ 	if (copy_from_user(&data, argp, sizeof(data)))
++ 		return -EFAULT;
++ 
++ 	/*
++ 	 * Only KVM_CLOCK_REALTIME is used, but allow passing the
++ 	 * result of KVM_GET_CLOCK back to KVM_SET_CLOCK.
++ 	 */
++ 	if (data.flags & ~KVM_CLOCK_VALID_FLAGS)
++ 		return -EINVAL;
++ 
++ 	kvm_hv_invalidate_tsc_page(kvm);
++ 	kvm_start_pvclock_update(kvm);
++ 	pvclock_update_vm_gtod_copy(kvm);
++ 
++ 	/*
++ 	 * This pairs with kvm_guest_time_update(): when masterclock is
++ 	 * in use, we use master_kernel_ns + kvmclock_offset to set
++ 	 * unsigned 'system_time' so if we use get_kvmclock_ns() (which
++ 	 * is slightly ahead) here we risk going negative on unsigned
++ 	 * 'system_time' when 'data.clock' is very small.
++ 	 */
++ 	if (data.flags & KVM_CLOCK_REALTIME) {
++ 		u64 now_real_ns = ktime_get_real_ns();
++ 
++ 		/*
++ 		 * Avoid stepping the kvmclock backwards.
++ 		 */
++ 		if (now_real_ns > data.realtime)
++ 			data.clock += now_real_ns - data.realtime;
++ 	}
++ 
++ 	if (ka->use_master_clock)
++ 		now_raw_ns = ka->master_kernel_ns;
++ 	else
++ 		now_raw_ns = get_kvmclock_base_ns();
++ 	ka->kvmclock_offset = data.clock - now_raw_ns;
++ 	kvm_end_pvclock_update(kvm);
++ 	return 0;
++ }
++ 
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+@@@ -8343,18 -8160,11 +8522,22 @@@ static void kvm_hyperv_tsc_notifier(voi
+  	kvm_max_guest_tsc_khz = tsc_khz;
+  
+  	list_for_each_entry(kvm, &vm_list, vm_list) {
+++<<<<<<< HEAD
+ +		struct kvm_arch *ka = &kvm->arch;
+ +
+ +		raw_spin_lock_irqsave(&ka->pvclock_gtod_sync_lock, flags);
+++=======
++ 		__kvm_start_pvclock_update(kvm);
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  		pvclock_update_vm_gtod_copy(kvm);
+ -		kvm_end_pvclock_update(kvm);
+ -	}
+ +		raw_spin_unlock_irqrestore(&ka->pvclock_gtod_sync_lock, flags);
+  
+ +		kvm_for_each_vcpu(cpu, vcpu, kvm)
+ +			kvm_make_request(KVM_REQ_CLOCK_UPDATE, vcpu);
+ +
+ +		kvm_for_each_vcpu(cpu, vcpu, kvm)
+ +			kvm_clear_request(KVM_REQ_MCLOCK_INPROGRESS, vcpu);
+ +	}
+  	mutex_unlock(&kvm_lock);
+  }
+  #endif
+@@@ -11356,10 -11185,12 +11540,17 @@@ int kvm_arch_init_vm(struct kvm *kvm, u
+  
+  	raw_spin_lock_init(&kvm->arch.tsc_write_lock);
+  	mutex_init(&kvm->arch.apic_map_lock);
+++<<<<<<< HEAD
+ +	raw_spin_lock_init(&kvm->arch.pvclock_gtod_sync_lock);
+ +
+++=======
++ 	seqcount_raw_spinlock_init(&kvm->arch.pvclock_sc, &kvm->arch.tsc_write_lock);
+++>>>>>>> 869b44211adc (kvm: x86: protect masterclock with a seqcount)
+  	kvm->arch.kvmclock_offset = -get_kvmclock_base_ns();
++ 
++ 	raw_spin_lock_irqsave(&kvm->arch.tsc_write_lock, flags);
+  	pvclock_update_vm_gtod_copy(kvm);
++ 	raw_spin_unlock_irqrestore(&kvm->arch.tsc_write_lock, flags);
+  
+  	kvm->arch.guest_can_read_msr_platform_info = true;
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/x86.c
