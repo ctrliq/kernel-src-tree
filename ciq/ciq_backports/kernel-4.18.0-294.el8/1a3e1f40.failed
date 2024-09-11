@@ -1,0 +1,335 @@
+mm: memcontrol: decouple reference counting from page accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Johannes Weiner <hannes@cmpxchg.org>
+commit 1a3e1f40962c445b997151a542314f3c6097f8c3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/1a3e1f40.failed
+
+The reference counting of a memcg is currently coupled directly to how
+many 4k pages are charged to it.  This doesn't work well with Roman's new
+slab controller, which maintains pools of objects and doesn't want to keep
+an extra balance sheet for the pages backing those objects.
+
+This unusual refcounting design (reference counts usually track pointers
+to an object) is only for historical reasons: memcg used to not take any
+css references and simply stalled offlining until all charges had been
+reparented and the page counters had dropped to zero.  When we got rid of
+the reparenting requirement, the simple mechanical translation was to take
+a reference for every charge.
+
+More historical context can be found in commit e8ea14cc6ead ("mm:
+memcontrol: take a css reference for each charged page"), commit
+64f219938941 ("mm: memcontrol: remove obsolete kmemcg pinning tricks") and
+commit b2052564e66d ("mm: memcontrol: continue cache reclaim from offlined
+groups").
+
+The new slab controller exposes the limitations in this scheme, so let's
+switch it to a more idiomatic reference counting model based on actual
+kernel pointers to the memcg:
+
+- The per-cpu stock holds a reference to the memcg its caching
+
+- User pages hold a reference for their page->mem_cgroup. Transparent
+  huge pages will no longer acquire tail references in advance, we'll
+  get them if needed during the split.
+
+- Kernel pages hold a reference for their page->mem_cgroup
+
+- Pages allocated in the root cgroup will acquire and release css
+  references for simplicity. css_get() and css_put() optimize that.
+
+- The current memcg_charge_slab() already hacked around the per-charge
+  references; this change gets rid of that as well.
+
+- tcp accounting will handle reference in mem_cgroup_sk_{alloc,free}
+
+Roman:
+1) Rebased on top of the current mm tree: added css_get() in
+   mem_cgroup_charge(), dropped mem_cgroup_try_charge() part
+2) I've reformatted commit references in the commit log to make
+   checkpatch.pl happy.
+
+[hughd@google.com: remove css_put_many() from __mem_cgroup_clear_mc()]
+  Link: http://lkml.kernel.org/r/alpine.LSU.2.11.2007302011450.2347@eggly.anvils
+
+	Signed-off-by: Johannes Weiner <hannes@cmpxchg.org>
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Hugh Dickins <hughd@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Acked-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-6-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 1a3e1f40962c445b997151a542314f3c6097f8c3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memcontrol.c
+diff --cc mm/memcontrol.c
+index c41b3f883524,4f9a3f55db71..000000000000
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@@ -2692,55 -2660,12 +2695,53 @@@ static void cancel_charge(struct mem_cg
+  	page_counter_uncharge(&memcg->memory, nr_pages);
+  	if (do_memsw_account())
+  		page_counter_uncharge(&memcg->memsw, nr_pages);
+- 
+- 	css_put_many(&memcg->css, nr_pages);
+  }
+ -#endif
+  
+ -static void commit_charge(struct page *page, struct mem_cgroup *memcg)
+ +static void lock_page_lru(struct page *page, int *isolated)
+ +{
+ +	struct zone *zone = page_zone(page);
+ +
+ +	spin_lock_irq(zone_lru_lock(zone));
+ +	if (PageLRU(page)) {
+ +		struct lruvec *lruvec;
+ +
+ +		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
+ +		ClearPageLRU(page);
+ +		del_page_from_lru_list(page, lruvec, page_lru(page));
+ +		*isolated = 1;
+ +	} else
+ +		*isolated = 0;
+ +}
+ +
+ +static void unlock_page_lru(struct page *page, int isolated)
+ +{
+ +	struct zone *zone = page_zone(page);
+ +
+ +	if (isolated) {
+ +		struct lruvec *lruvec;
+ +
+ +		lruvec = mem_cgroup_page_lruvec(page, zone->zone_pgdat);
+ +		VM_BUG_ON_PAGE(PageLRU(page), page);
+ +		SetPageLRU(page);
+ +		add_page_to_lru_list(page, lruvec, page_lru(page));
+ +	}
+ +	spin_unlock_irq(zone_lru_lock(zone));
+ +}
+ +
+ +static void commit_charge(struct page *page, struct mem_cgroup *memcg,
+ +			  bool lrucare)
+  {
+ +	int isolated;
+ +
+  	VM_BUG_ON_PAGE(page->mem_cgroup, page);
+ +
+ +	/*
+ +	 * In some cases, SwapCache and FUSE(splice_buf->radixtree), the page
+ +	 * may already be on some other mem_cgroup's LRU.  Take care of it.
+ +	 */
+ +	if (lrucare)
+ +		lock_page_lru(page, &isolated);
+ +
+  	/*
+  	 * Any of the following ensures page->mem_cgroup stability:
+  	 *
+@@@ -3089,10 -3012,10 +3091,17 @@@ void mem_cgroup_split_huge_fixup(struc
+  	if (mem_cgroup_disabled())
+  		return;
+  
+++<<<<<<< HEAD
+ +	for (i = 1; i < HPAGE_PMD_NR; i++)
+ +		head[i].mem_cgroup = head->mem_cgroup;
+ +
+ +	__mod_memcg_state(head->mem_cgroup, MEMCG_RSS_HUGE, -HPAGE_PMD_NR);
+++=======
++ 	for (i = 1; i < HPAGE_PMD_NR; i++) {
++ 		css_get(&memcg->css);
++ 		head[i].mem_cgroup = memcg;
++ 	}
+++>>>>>>> 1a3e1f40962c (mm: memcontrol: decouple reference counting from page accounting)
+  }
+  #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+  
+@@@ -5356,14 -5442,26 +5365,23 @@@ static int mem_cgroup_move_account(stru
+  	}
+  
+  	/*
+ -	 * All state has been migrated, let's switch to the new memcg.
+ -	 *
+  	 * It is safe to change page->mem_cgroup here because the page
+ -	 * is referenced, charged, isolated, and locked: we can't race
+ -	 * with (un)charging, migration, LRU putback, or anything else
+ -	 * that would rely on a stable page->mem_cgroup.
+ -	 *
+ -	 * Note that lock_page_memcg is a memcg lock, not a page lock,
+ -	 * to save space. As soon as we switch page->mem_cgroup to a
+ -	 * new memcg that isn't locked, the above state can change
+ -	 * concurrently again. Make sure we're truly done with it.
+ +	 * is referenced, charged, and isolated - we can't race with
+ +	 * uncharging, charging, migration, or LRU putback.
+  	 */
+ -	smp_mb();
+  
+++<<<<<<< HEAD
+ +	/* caller should have done css_get */
+ +	page->mem_cgroup = to;
+ +	spin_unlock_irqrestore(&from->move_lock, flags);
+++=======
++ 	css_get(&to->css);
++ 	css_put(&from->css);
++ 
++ 	page->mem_cgroup = to;
++ 
++ 	__unlock_page_memcg(from);
+++>>>>>>> 1a3e1f40962c (mm: memcontrol: decouple reference counting from page accounting)
+  
+  	ret = 0;
+  
+@@@ -6353,65 -6504,14 +6369,70 @@@ int mem_cgroup_try_charge(struct page *
+  		memcg = get_mem_cgroup_from_mm(mm);
+  
+  	ret = try_charge(memcg, gfp_mask, nr_pages);
+ -	if (ret)
+ -		goto out_put;
+  
+++<<<<<<< HEAD
+ +	css_put(&memcg->css);
+ +out:
+ +	*memcgp = memcg;
+ +	return ret;
+ +}
+ +
+ +int mem_cgroup_try_charge_delay(struct page *page, struct mm_struct *mm,
+ +			  gfp_t gfp_mask, struct mem_cgroup **memcgp,
+ +			  bool compound)
+ +{
+ +	struct mem_cgroup *memcg;
+ +	int ret;
+ +
+ +	ret = mem_cgroup_try_charge(page, mm, gfp_mask, memcgp, compound);
+ +	memcg = *memcgp;
+ +	mem_cgroup_throttle_swaprate(memcg, page_to_nid(page), gfp_mask);
+ +	return ret;
+ +}
+ +
+ +/**
+ + * mem_cgroup_commit_charge - commit a page charge
+ + * @page: page to charge
+ + * @memcg: memcg to charge the page to
+ + * @lrucare: page might be on LRU already
+ + * @compound: charge the page as compound or small page
+ + *
+ + * Finalize a charge transaction started by mem_cgroup_try_charge(),
+ + * after page->mapping has been set up.  This must happen atomically
+ + * as part of the page instantiation, i.e. under the page table lock
+ + * for anonymous pages, under the page lock for page and swap cache.
+ + *
+ + * In addition, the page must not be on the LRU during the commit, to
+ + * prevent racing with task migration.  If it might be, use @lrucare.
+ + *
+ + * Use mem_cgroup_cancel_charge() to cancel the transaction instead.
+ + */
+ +void mem_cgroup_commit_charge(struct page *page, struct mem_cgroup *memcg,
+ +			      bool lrucare, bool compound)
+ +{
+ +	unsigned int nr_pages = compound ? hpage_nr_pages(page) : 1;
+ +
+ +	VM_BUG_ON_PAGE(!page->mapping, page);
+ +	VM_BUG_ON_PAGE(PageLRU(page) && !lrucare, page);
+ +
+ +	if (mem_cgroup_disabled())
+ +		return;
+ +	/*
+ +	 * Swap faults will attempt to charge the same page multiple
+ +	 * times.  But reuse_swap_page() might have removed the page
+ +	 * from swapcache already, so we can't check PageSwapCache().
+ +	 */
+ +	if (!memcg)
+ +		return;
+ +
+ +	commit_charge(page, memcg, lrucare);
+++=======
++ 	css_get(&memcg->css);
++ 	commit_charge(page, memcg);
+++>>>>>>> 1a3e1f40962c (mm: memcontrol: decouple reference counting from page accounting)
+  
+  	local_irq_disable();
+ -	mem_cgroup_charge_statistics(memcg, page, nr_pages);
+ +	mem_cgroup_charge_statistics(memcg, page, compound, nr_pages);
+  	memcg_check_events(memcg, page);
+  	local_irq_enable();
+  
+@@@ -6483,17 -6558,10 +6504,20 @@@ static void uncharge_batch(const struc
+  	}
+  
+  	local_irq_save(flags);
+ +	__mod_memcg_state(ug->memcg, MEMCG_RSS, -ug->nr_anon);
+ +	__mod_memcg_state(ug->memcg, MEMCG_CACHE, -ug->nr_file);
+ +	__mod_memcg_state(ug->memcg, MEMCG_RSS_HUGE, -ug->nr_huge);
+ +	__mod_memcg_state(ug->memcg, NR_SHMEM, -ug->nr_shmem);
+  	__count_memcg_events(ug->memcg, PGPGOUT, ug->pgpgout);
+ -	__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, ug->nr_pages);
+ +	__this_cpu_add(ug->memcg->vmstats_percpu->nr_page_events, nr_pages);
+  	memcg_check_events(ug->memcg, ug->dummy_page);
+  	local_irq_restore(flags);
+++<<<<<<< HEAD
+ +
+ +	if (!mem_cgroup_is_root(ug->memcg))
+ +		css_put_many(&ug->memcg->css, nr_pages);
+++=======
+++>>>>>>> 1a3e1f40962c (mm: memcontrol: decouple reference counting from page accounting)
+  }
+  
+  static void uncharge_page(struct page *page, struct uncharge_gather *ug)
+@@@ -6647,13 -6705,12 +6672,17 @@@ void mem_cgroup_migrate(struct page *ol
+  	page_counter_charge(&memcg->memory, nr_pages);
+  	if (do_memsw_account())
+  		page_counter_charge(&memcg->memsw, nr_pages);
+- 	css_get_many(&memcg->css, nr_pages);
+  
+++<<<<<<< HEAD
+ +	commit_charge(newpage, memcg, false);
+++=======
++ 	css_get(&memcg->css);
++ 	commit_charge(newpage, memcg);
+++>>>>>>> 1a3e1f40962c (mm: memcontrol: decouple reference counting from page accounting)
+  
+  	local_irq_save(flags);
+ -	mem_cgroup_charge_statistics(memcg, newpage, nr_pages);
+ +	mem_cgroup_charge_statistics(memcg, newpage, PageTransHuge(newpage),
+ +			nr_pages);
+  	memcg_check_events(memcg, newpage);
+  	local_irq_restore(flags);
+  }
+@@@ -6893,12 -6940,10 +6922,11 @@@ void mem_cgroup_swapout(struct page *pa
+  	 * only synchronisation we have for updating the per-CPU variables.
+  	 */
+  	VM_BUG_ON(!irqs_disabled());
+ -	mem_cgroup_charge_statistics(memcg, page, -nr_entries);
+ +	mem_cgroup_charge_statistics(memcg, page, PageTransHuge(page),
+ +				     -nr_entries);
+  	memcg_check_events(memcg, page);
+  
+- 	if (!mem_cgroup_is_root(memcg))
+- 		css_put_many(&memcg->css, nr_entries);
++ 	css_put(&memcg->css);
+  }
+  
+  /**
+* Unmerged path mm/memcontrol.c
+diff --git a/mm/slab.h b/mm/slab.h
+index 45ad57de9d88..34da173f97ab 100644
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@ -311,9 +311,7 @@ static __always_inline int memcg_charge_slab(struct page *page,
+ 	lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ 	mod_lruvec_state(lruvec, cache_vmstat_idx(s), nr_pages);
+ 
+-	/* transer try_charge() page references to kmem_cache */
+ 	percpu_ref_get_many(&s->memcg_params.refcnt, nr_pages);
+-	css_put_many(&memcg->css, nr_pages);
+ out:
+ 	css_put(&memcg->css);
+ 	return ret;
