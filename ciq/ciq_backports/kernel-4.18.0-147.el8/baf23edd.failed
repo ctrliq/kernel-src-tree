@@ -1,0 +1,129 @@
+scsi: qla2xxx: move IO flush to the front of NVME rport unregistration
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Quinn Tran <qutran@marvell.com>
+commit baf23eddbf2a4ba9bf2bdb342686c71a8042e39b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/baf23edd.failed
+
+On session deletion, current qla code would unregister an NVMe session
+before flushing IOs. This patch would move the unregistration of NVMe
+session after IO flush. This way FC-NVMe layer would not have to wait for
+stuck IOs. In addition, qla2xxx would stop accepting new IOs during session
+deletion.
+
+	Signed-off-by: Quinn Tran <qutran@marvell.com>
+	Signed-off-by: Himanshu Madhani <hmadhani@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit baf23eddbf2a4ba9bf2bdb342686c71a8042e39b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_nvme.c
+diff --cc drivers/scsi/qla2xxx/qla_nvme.c
+index fd5f4610435f,963094b3c300..000000000000
+--- a/drivers/scsi/qla2xxx/qla_nvme.c
++++ b/drivers/scsi/qla2xxx/qla_nvme.c
+@@@ -579,38 -642,8 +571,40 @@@ static struct nvme_fc_port_template qla
+  	.fcprqst_priv_sz = sizeof(struct nvme_private),
+  };
+  
+++<<<<<<< HEAD
+ +#define NVME_ABORT_POLLING_PERIOD    2
+ +static int qla_nvme_wait_on_command(srb_t *sp)
+ +{
+ +	int ret = QLA_SUCCESS;
+ +
+ +	wait_event_timeout(sp->nvme_ls_waitq, (atomic_read(&sp->ref_count) > 1),
+ +	    NVME_ABORT_POLLING_PERIOD*HZ);
+ +
+ +	if (atomic_read(&sp->ref_count) > 1)
+ +		ret = QLA_FUNCTION_FAILED;
+ +
+ +	return ret;
+ +}
+ +
+ +void qla_nvme_abort(struct qla_hw_data *ha, struct srb *sp, int res)
+ +{
+ +	int rval;
+ +
+ +	if (ha->flags.fw_started) {
+ +		rval = ha->isp_ops->abort_command(sp);
+ +		if (!rval && !qla_nvme_wait_on_command(sp))
+ +			ql_log(ql_log_warn, NULL, 0x2112,
+ +			    "timed out waiting on sp=%p\n", sp);
+ +	} else {
+ +		sp->done(sp, res);
+ +	}
+ +}
+ +
+ +static void qla_nvme_unregister_remote_port(struct work_struct *work)
+++=======
++ void qla_nvme_unregister_remote_port(struct fc_port *fcport)
+++>>>>>>> baf23eddbf2a (scsi: qla2xxx: move IO flush to the front of NVME rport unregistration)
+  {
+- 	struct fc_port *fcport = container_of(work, struct fc_port,
+- 	    nvme_del_work);
+  	int ret;
+  
+  	if (!IS_ENABLED(CONFIG_NVME_FC))
+diff --git a/drivers/scsi/qla2xxx/qla_def.h b/drivers/scsi/qla2xxx/qla_def.h
+index 446d27517aa5..2e996df4e107 100644
+--- a/drivers/scsi/qla2xxx/qla_def.h
++++ b/drivers/scsi/qla2xxx/qla_def.h
+@@ -2350,7 +2350,6 @@ typedef struct fc_port {
+ 	unsigned int id_changed:1;
+ 	unsigned int rscn_rcvd:1;
+ 
+-	struct work_struct nvme_del_work;
+ 	struct completion nvme_del_done;
+ 	uint32_t nvme_prli_service_param;
+ #define NVME_PRLI_SP_CONF       BIT_7
+diff --git a/drivers/scsi/qla2xxx/qla_gbl.h b/drivers/scsi/qla2xxx/qla_gbl.h
+index ca3f732c0824..57b40f9b3cc0 100644
+--- a/drivers/scsi/qla2xxx/qla_gbl.h
++++ b/drivers/scsi/qla2xxx/qla_gbl.h
+@@ -894,4 +894,6 @@ void qlt_update_host_map(struct scsi_qla_host *, port_id_t);
+ void qlt_remove_target_resources(struct qla_hw_data *);
+ void qlt_clr_qp_table(struct scsi_qla_host *vha);
+ 
++/* nvme.c */
++void qla_nvme_unregister_remote_port(struct fc_port *fcport);
+ #endif /* _QLA_GBL_H */
+* Unmerged path drivers/scsi/qla2xxx/qla_nvme.c
+diff --git a/drivers/scsi/qla2xxx/qla_target.c b/drivers/scsi/qla2xxx/qla_target.c
+index 93f50e9224ca..d1172e1217e4 100644
+--- a/drivers/scsi/qla2xxx/qla_target.c
++++ b/drivers/scsi/qla2xxx/qla_target.c
+@@ -1015,6 +1015,12 @@ void qlt_free_session_done(struct work_struct *work)
+ 				else
+ 					logout_started = true;
+ 			}
++		} /* if sess->logout_on_delete */
++
++		if (sess->nvme_flag & NVME_FLAG_REGISTERED &&
++		    !(sess->nvme_flag & NVME_FLAG_DELETING)) {
++			sess->nvme_flag |= NVME_FLAG_DELETING;
++			qla_nvme_unregister_remote_port(sess);
+ 		}
+ 	}
+ 
+@@ -1167,14 +1173,8 @@ void qlt_unreg_sess(struct fc_port *sess)
+ 	sess->last_rscn_gen = sess->rscn_gen;
+ 	sess->last_login_gen = sess->login_gen;
+ 
+-	if (sess->nvme_flag & NVME_FLAG_REGISTERED &&
+-	    !(sess->nvme_flag & NVME_FLAG_DELETING)) {
+-		sess->nvme_flag |= NVME_FLAG_DELETING;
+-		schedule_work(&sess->nvme_del_work);
+-	} else {
+-		INIT_WORK(&sess->free_work, qlt_free_session_done);
+-		schedule_work(&sess->free_work);
+-	}
++	INIT_WORK(&sess->free_work, qlt_free_session_done);
++	schedule_work(&sess->free_work);
+ }
+ EXPORT_SYMBOL(qlt_unreg_sess);
+ 
