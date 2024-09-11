@@ -1,0 +1,78 @@
+io_uring: io_uring_enter(2) don't poll while SETUP_IOPOLL|SETUP_SQPOLL enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+commit 32b2244a840a90ea94ba42392de5c48d53f521f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/32b2244a.failed
+
+When SETUP_IOPOLL and SETUP_SQPOLL are both enabled, applications don't need
+to do io completion events polling again, they can rely on io_sq_thread to do
+polling work, which can reduce cpu usage and uring_lock contention.
+
+I modify fio io_uring engine codes a bit to evaluate the performance:
+static int fio_ioring_getevents(struct thread_data *td, unsigned int min,
+                        continue;
+                }
+
+-               if (!o->sqpoll_thread) {
++               if (o->sqpoll_thread && o->hipri) {
+                        r = io_uring_enter(ld, 0, actual_min,
+                                                IORING_ENTER_GETEVENTS);
+                        if (r < 0) {
+
+and use "fio  -name=fiotest -filename=/dev/nvme0n1 -iodepth=$depth -thread
+-rw=read -ioengine=io_uring  -hipri=1 -sqthread_poll=1  -direct=1 -bs=4k
+-size=10G -numjobs=1  -time_based -runtime=120"
+
+original codes
+--------------------------------------------------------------------
+iodepth       |        4 |        8 |       16 |       32 |       64
+bw            | 1133MB/s | 1519MB/s | 2090MB/s | 2710MB/s | 3012MB/s
+fio cpu usage |     100% |     100% |     100% |     100% |     100%
+--------------------------------------------------------------------
+
+with patch
+--------------------------------------------------------------------
+iodepth       |        4 |        8 |       16 |       32 |       64
+bw            | 1196MB/s | 1721MB/s | 2351MB/s | 2977MB/s | 3357MB/s
+fio cpu usage |    63.8% |   74.4%% |    81.1% |    83.7% |    82.4%
+--------------------------------------------------------------------
+bw improve    |     5.5% |    13.2% |    12.3% |     9.8% |    11.5%
+--------------------------------------------------------------------
+
+From above test results, we can see that bw has above 5.5%~13%
+improvement, and fio process's cpu usage also drops much. Note this
+won't improve io_sq_thread's cpu usage when SETUP_IOPOLL|SETUP_SQPOLL
+are both enabled, in this case, io_sq_thread always has 100% cpu usage.
+I think this patch will be friendly to applications which will often use
+io_uring_wait_cqe() or similar from liburing.
+
+	Signed-off-by: Xiaoguang Wang <xiaoguang.wang@linux.alibaba.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 32b2244a840a90ea94ba42392de5c48d53f521f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,9f1a462eb780..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -736,7 -1732,9 +736,13 @@@ static void io_iopoll_complete(struct i
+  	}
+  
+  	io_commit_cqring(ctx);
+++<<<<<<< HEAD
+ +	io_free_req_many(ctx, reqs, &to_free);
+++=======
++ 	if (ctx->flags & IORING_SETUP_SQPOLL)
++ 		io_cqring_ev_posted(ctx);
++ 	io_free_req_many(ctx, &rb);
+++>>>>>>> 32b2244a840a (io_uring: io_uring_enter(2) don't poll while SETUP_IOPOLL|SETUP_SQPOLL enabled)
+  }
+  
+  static int io_do_iopoll(struct io_ring_ctx *ctx, unsigned int *nr_events,
+* Unmerged path fs/io_uring.c
