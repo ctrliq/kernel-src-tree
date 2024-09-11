@@ -1,0 +1,150 @@
+blk-mq: fix blk_mq_all_tag_iter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 22f614bc0f376e7a1bcf1a2cd912885f4a933045
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/22f614bc.failed
+
+blk_mq_all_tag_iter() is added to iterate all requests, so we should
+fetch the request from ->static_rqs][] instead of ->rqs[] which is for
+holding in-flight request only.
+
+Fix it by adding flag of BT_TAG_ITER_STATIC_RQS.
+
+Fixes: bf0beec0607d ("blk-mq: drain I/O when all CPUs in a hctx are offline")
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Tested-by: John Garry <john.garry@huawei.com>
+	Cc: Dongli Zhang <dongli.zhang@oracle.com>
+	Cc: Hannes Reinecke <hare@suse.de>
+	Cc: Daniel Wagner <dwagner@suse.de>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 22f614bc0f376e7a1bcf1a2cd912885f4a933045)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.c
+diff --cc block/blk-mq-tag.c
+index 0086c40c4411,44f3d0967cb4..000000000000
+--- a/block/blk-mq-tag.c
++++ b/block/blk-mq-tag.c
+@@@ -268,9 -291,13 +268,16 @@@ struct bt_tags_iter_data 
+  	struct blk_mq_tags *tags;
+  	busy_tag_iter_fn *fn;
+  	void *data;
+ -	unsigned int flags;
+ +	bool reserved;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define BT_TAG_ITER_RESERVED		(1 << 0)
++ #define BT_TAG_ITER_STARTED		(1 << 1)
++ #define BT_TAG_ITER_STATIC_RQS		(1 << 2)
++ 
+++>>>>>>> 22f614bc0f37 (blk-mq: fix blk_mq_all_tag_iter)
+  static bool bt_tags_iter(struct sbitmap *bitmap, unsigned int bitnr, void *data)
+  {
+  	struct bt_tags_iter_data *iter_data = data;
+@@@ -283,17 -310,34 +290,30 @@@
+  
+  	/*
+  	 * We can hit rq == NULL here, because the tagging functions
+- 	 * test and set the bit before assining ->rqs[].
++ 	 * test and set the bit before assigning ->rqs[].
+  	 */
+++<<<<<<< HEAD
+ +	rq = tags->rqs[bitnr];
+ +	if (rq && blk_mq_request_started(rq))
+ +		return iter_data->fn(rq, iter_data->data, reserved);
+ +
+ +	return true;
+++=======
++ 	if (iter_data->flags & BT_TAG_ITER_STATIC_RQS)
++ 		rq = tags->static_rqs[bitnr];
++ 	else
++ 		rq = tags->rqs[bitnr];
++ 	if (!rq)
++ 		return true;
++ 	if ((iter_data->flags & BT_TAG_ITER_STARTED) &&
++ 	    !blk_mq_request_started(rq))
++ 		return true;
++ 	return iter_data->fn(rq, iter_data->data, reserved);
+++>>>>>>> 22f614bc0f37 (blk-mq: fix blk_mq_all_tag_iter)
+  }
+  
+ -/**
+ - * bt_tags_for_each - iterate over the requests in a tag map
+ - * @tags:	Tag map to iterate over.
+ - * @bt:		sbitmap to examine. This is either the breserved_tags member
+ - *		or the bitmap_tags member of struct blk_mq_tags.
+ - * @fn:		Pointer to the function that will be called for each started
+ - *		request. @fn will be called as follows: @fn(rq, @data,
+ - *		@reserved) where rq is a pointer to a request. Return true
+ - *		to continue iterating tags, false to stop.
+ - * @data:	Will be passed as second argument to @fn.
+ - * @flags:	BT_TAG_ITER_*
+ - */
+  static void bt_tags_for_each(struct blk_mq_tags *tags, struct sbitmap_queue *bt,
+ -			     busy_tag_iter_fn *fn, void *data, unsigned int flags)
+ +			     busy_tag_iter_fn *fn, void *data, bool reserved)
+  {
+  	struct bt_tags_iter_data iter_data = {
+  		.tags = tags,
+@@@ -306,14 -350,45 +326,45 @@@
+  		sbitmap_for_each_set(&bt->sb, bt_tags_iter, &iter_data);
+  }
+  
+ -static void __blk_mq_all_tag_iter(struct blk_mq_tags *tags,
+ -		busy_tag_iter_fn *fn, void *priv, unsigned int flags)
+ +static void blk_mq_all_tag_busy_iter(struct blk_mq_tags *tags,
+ +		busy_tag_iter_fn *fn, void *priv)
+  {
+ -	WARN_ON_ONCE(flags & BT_TAG_ITER_RESERVED);
+ -
+  	if (tags->nr_reserved_tags)
+ -		bt_tags_for_each(tags, &tags->breserved_tags, fn, priv,
+ -				 flags | BT_TAG_ITER_RESERVED);
+ -	bt_tags_for_each(tags, &tags->bitmap_tags, fn, priv, flags);
+ +		bt_tags_for_each(tags, &tags->breserved_tags, fn, priv, true);
+ +	bt_tags_for_each(tags, &tags->bitmap_tags, fn, priv, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * blk_mq_all_tag_iter - iterate over all requests in a tag map
++  * @tags:	Tag map to iterate over.
++  * @fn:		Pointer to the function that will be called for each
++  *		request. @fn will be called as follows: @fn(rq, @priv,
++  *		reserved) where rq is a pointer to a request. 'reserved'
++  *		indicates whether or not @rq is a reserved request. Return
++  *		true to continue iterating tags, false to stop.
++  * @priv:	Will be passed as second argument to @fn.
++  *
++  * Caller has to pass the tag map from which requests are allocated.
++  */
++ void blk_mq_all_tag_iter(struct blk_mq_tags *tags, busy_tag_iter_fn *fn,
++ 		void *priv)
++ {
++ 	return __blk_mq_all_tag_iter(tags, fn, priv, BT_TAG_ITER_STATIC_RQS);
++ }
++ 
++ /**
++  * blk_mq_tagset_busy_iter - iterate over all started requests in a tag set
++  * @tagset:	Tag set to iterate over.
++  * @fn:		Pointer to the function that will be called for each started
++  *		request. @fn will be called as follows: @fn(rq, @priv,
++  *		reserved) where rq is a pointer to a request. 'reserved'
++  *		indicates whether or not @rq is a reserved request. Return
++  *		true to continue iterating tags, false to stop.
++  * @priv:	Will be passed as second argument to @fn.
++  */
+++>>>>>>> 22f614bc0f37 (blk-mq: fix blk_mq_all_tag_iter)
+  void blk_mq_tagset_busy_iter(struct blk_mq_tag_set *tagset,
+  		busy_tag_iter_fn *fn, void *priv)
+  {
+* Unmerged path block/blk-mq-tag.c
