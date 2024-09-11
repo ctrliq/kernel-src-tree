@@ -1,0 +1,145 @@
+ch_ktls: tcb close causes tls connection failure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+commit 21d8c25e3f4b9052a471ced8f47b531956eb9963
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/21d8c25e.failed
+
+HW doesn't need marking TCB closed. This TCB state change
+sometimes causes problem to the new connection which gets
+the same tid.
+
+Fixes: 34aba2c45024 ("cxgb4/chcr : Register to tls add and del callback")
+	Signed-off-by: Vinay Kumar Yadav <vinay.yadav@chelsio.com>
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 21d8c25e3f4b9052a471ced8f47b531956eb9963)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 887ecc2060e8,8559eec161f0..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -540,23 -512,77 +526,48 @@@ int chcr_ktls_dev_add(struct net_devic
+  	/* create a filter and call cxgb4_l2t_send to send the packet out, which
+  	 * will take care of updating l2t entry in hw if not already done.
+  	 */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_setup_connection(sk, tx_info))
+ -		goto put_module;
+ -
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		if (tx_info->open_state == CH_KTLS_OPEN_PENDING)
+ -			tx_info->pending_close = true;
+ -		else
+ -			spin_unlock_bh(&tx_info->lock);
+ -		/* if in pending close, free the lock after the cleanup */
+ -		goto put_module;
+ -	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	/* initialize tcb */
+ -	reinit_completion(&tx_info->completion);
+ -	/* mark it pending for hw response */
+ -	tx_info->open_state = CH_KTLS_OPEN_PENDING;
+ -
+ -	if (chcr_init_tcb_fields(tx_info))
+ -		goto free_tid;
+ +	ret = chcr_setup_connection(sk, tx_info);
+ +	if (ret)
+ +		goto out2;
+  
+ -	/* Wait for reply */
+ -	wait_for_completion_timeout(&tx_info->completion, 30 * HZ);
+ -	spin_lock_bh(&tx_info->lock);
+ -	if (tx_info->open_state) {
+ -		/* need to wait for hw response, can't free tx_info yet. */
+ -		tx_info->pending_close = true;
+ -		/* free the lock after cleanup */
+ -		goto free_tid;
+ +	/* Driver shouldn't be removed until any single connection exists */
+ +	if (!try_module_get(THIS_MODULE)) {
+ +		ret = -EINVAL;
+ +		goto out2;
+  	}
+ -	spin_unlock_bh(&tx_info->lock);
+ -
+ -	if (!cxgb4_check_l2t_valid(tx_info->l2te))
+ -		goto free_tid;
+ -
+ -	atomic64_inc(&port_stats->ktls_tx_ctx);
+ -	tx_ctx->chcr_info = tx_info;
+  
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_open);
+  	return 0;
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +out2:
+ +	kvfree(tx_info);
+++=======
++ 
++ free_tid:
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	/* clear clip entry */
++ 	if (tx_info->ip_family == AF_INET6)
++ 		cxgb4_clip_release(netdev, (const u32 *)
++ 				   &sk->sk_v6_rcv_saddr,
++ 				   1);
++ #endif
++ 	cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
++ 			 tx_info->tid, tx_info->ip_family);
++ 
++ put_module:
++ 	/* release module refcount */
++ 	module_put(THIS_MODULE);
++ free_l2t:
++ 	cxgb4_l2t_release(tx_info->l2te);
++ free_tx_info:
++ 	if (tx_info->pending_close)
++ 		spin_unlock_bh(&tx_info->lock);
++ 	else
++ 		kvfree(tx_info);
+++>>>>>>> 21d8c25e3f4b (ch_ktls: tcb close causes tls connection failure):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  out:
+ -	atomic64_inc(&port_stats->ktls_tx_connection_fail);
+ -	return -1;
+ +	atomic64_inc(&adap->chcr_stats.ktls_tx_connection_fail);
+ +	return ret;
+  }
+  
+  /*
+@@@ -622,6 -649,21 +633,24 @@@ int chcr_ktls_cpl_act_open_rpl(struct a
+  		return -1;
+  	}
+  
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+++=======
++ 	cxgb4_free_atid(t, atid);
++ 	tx_info->atid = -1;
++ 
++ 	spin_lock(&tx_info->lock);
++ 	/* HW response is very close, finish pending cleanup */
++ 	if (tx_info->pending_close) {
++ 		spin_unlock(&tx_info->lock);
++ 		if (!status) {
++ 			cxgb4_remove_tid(&tx_info->adap->tids, tx_info->tx_chan,
++ 					 tid, tx_info->ip_family);
++ 		}
++ 		kvfree(tx_info);
++ 		return 0;
++ 	}
++ 
+++>>>>>>> 21d8c25e3f4b (ch_ktls: tcb close causes tls connection failure):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  	if (!status) {
+  		tx_info->tid = tid;
+  		cxgb4_insert_tid(t, tx_info, tx_info->tid, tx_info->ip_family);
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
