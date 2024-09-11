@@ -1,0 +1,226 @@
+netfilter: nat: add inet family nat support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit d164385ec572cbe3335a635ac308760e126d4ec0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d164385e.failed
+
+We need minimal support from the nat core for this, as we do not
+want to register additional base hooks.
+
+When an inet hook is registered, interally register ipv4 and ipv6
+hooks for them and unregister those when inet hooks are removed.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit d164385ec572cbe3335a635ac308760e126d4ec0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netfilter/nf_nat.h
+#	net/netfilter/nf_nat_proto.c
+#	net/netfilter/nft_chain_nat.c
+diff --cc include/net/netfilter/nf_nat.h
+index 8aff77cafb8b,423cda2c6542..000000000000
+--- a/include/net/netfilter/nf_nat.h
++++ b/include/net/netfilter/nf_nat.h
+@@@ -71,8 -69,50 +71,53 @@@ static inline bool nf_nat_oif_changed(u
+  #endif
+  }
+  
+- int nf_nat_register_fn(struct net *net, const struct nf_hook_ops *ops,
++ int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+  		       const struct nf_hook_ops *nat_ops, unsigned int ops_count);
+- void nf_nat_unregister_fn(struct net *net, const struct nf_hook_ops *ops,
++ void nf_nat_unregister_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+  			  unsigned int ops_count);
+++<<<<<<< HEAD
+++=======
++ 
++ unsigned int nf_nat_packet(struct nf_conn *ct, enum ip_conntrack_info ctinfo,
++ 			   unsigned int hooknum, struct sk_buff *skb);
++ 
++ unsigned int nf_nat_manip_pkt(struct sk_buff *skb, struct nf_conn *ct,
++ 			      enum nf_nat_manip_type mtype,
++ 			      enum ip_conntrack_dir dir);
++ void nf_nat_csum_recalc(struct sk_buff *skb,
++ 			u8 nfproto, u8 proto, void *data, __sum16 *check,
++ 			int datalen, int oldlen);
++ 
++ int nf_nat_icmp_reply_translation(struct sk_buff *skb, struct nf_conn *ct,
++ 				  enum ip_conntrack_info ctinfo,
++ 				  unsigned int hooknum);
++ 
++ int nf_nat_icmpv6_reply_translation(struct sk_buff *skb, struct nf_conn *ct,
++ 				    enum ip_conntrack_info ctinfo,
++ 				    unsigned int hooknum, unsigned int hdrlen);
++ 
++ int nf_nat_ipv4_register_fn(struct net *net, const struct nf_hook_ops *ops);
++ void nf_nat_ipv4_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
++ 
++ int nf_nat_ipv6_register_fn(struct net *net, const struct nf_hook_ops *ops);
++ void nf_nat_ipv6_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
++ 
++ int nf_nat_inet_register_fn(struct net *net, const struct nf_hook_ops *ops);
++ void nf_nat_inet_unregister_fn(struct net *net, const struct nf_hook_ops *ops);
++ 
++ unsigned int
++ nf_nat_inet_fn(void *priv, struct sk_buff *skb,
++ 	       const struct nf_hook_state *state);
++ 
++ int nf_xfrm_me_harder(struct net *n, struct sk_buff *s, unsigned int family);
++ 
++ static inline int nf_nat_initialized(struct nf_conn *ct,
++ 				     enum nf_nat_manip_type manip)
++ {
++ 	if (manip == NF_NAT_MANIP_SRC)
++ 		return ct->status & IPS_SRC_NAT_DONE;
++ 	else
++ 		return ct->status & IPS_DST_NAT_DONE;
++ }
+++>>>>>>> d164385ec572 (netfilter: nat: add inet family nat support)
+  #endif
+* Unmerged path net/netfilter/nf_nat_proto.c
+* Unmerged path net/netfilter/nft_chain_nat.c
+* Unmerged path include/net/netfilter/nf_nat.h
+diff --git a/net/netfilter/nf_nat_core.c b/net/netfilter/nf_nat_core.c
+index 275265d75be2..c59e808099bc 100644
+--- a/net/netfilter/nf_nat_core.c
++++ b/net/netfilter/nf_nat_core.c
+@@ -910,7 +910,7 @@ static struct nf_ct_helper_expectfn follow_master_nat = {
+ 	.expectfn	= nf_nat_follow_master,
+ };
+ 
+-int nf_nat_register_fn(struct net *net, const struct nf_hook_ops *ops,
++int nf_nat_register_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
+ 		       const struct nf_hook_ops *orig_nat_ops, unsigned int ops_count)
+ {
+ 	struct nat_net *nat_net = net_generic(net, nat_net_id);
+@@ -920,14 +920,12 @@ int nf_nat_register_fn(struct net *net, const struct nf_hook_ops *ops,
+ 	struct nf_hook_ops *nat_ops;
+ 	int i, ret;
+ 
+-	if (WARN_ON_ONCE(ops->pf >= ARRAY_SIZE(nat_net->nat_proto_net)))
++	if (WARN_ON_ONCE(pf >= ARRAY_SIZE(nat_net->nat_proto_net)))
+ 		return -EINVAL;
+ 
+-	nat_proto_net = &nat_net->nat_proto_net[ops->pf];
++	nat_proto_net = &nat_net->nat_proto_net[pf];
+ 
+ 	for (i = 0; i < ops_count; i++) {
+-		if (WARN_ON(orig_nat_ops[i].pf != ops->pf))
+-			return -EINVAL;
+ 		if (orig_nat_ops[i].hooknum == hooknum) {
+ 			hooknum = i;
+ 			break;
+@@ -988,8 +986,8 @@ int nf_nat_register_fn(struct net *net, const struct nf_hook_ops *ops,
+ }
+ EXPORT_SYMBOL_GPL(nf_nat_register_fn);
+ 
+-void nf_nat_unregister_fn(struct net *net, const struct nf_hook_ops *ops,
+-		          unsigned int ops_count)
++void nf_nat_unregister_fn(struct net *net, u8 pf, const struct nf_hook_ops *ops,
++			  unsigned int ops_count)
+ {
+ 	struct nat_net *nat_net = net_generic(net, nat_net_id);
+ 	struct nf_nat_hooks_net *nat_proto_net;
+@@ -998,10 +996,10 @@ void nf_nat_unregister_fn(struct net *net, const struct nf_hook_ops *ops,
+ 	int hooknum = ops->hooknum;
+ 	int i;
+ 
+-	if (ops->pf >= ARRAY_SIZE(nat_net->nat_proto_net))
++	if (pf >= ARRAY_SIZE(nat_net->nat_proto_net))
+ 		return;
+ 
+-	nat_proto_net = &nat_net->nat_proto_net[ops->pf];
++	nat_proto_net = &nat_net->nat_proto_net[pf];
+ 
+ 	mutex_lock(&nf_nat_proto_mutex);
+ 	if (WARN_ON(nat_proto_net->users == 0))
+* Unmerged path net/netfilter/nf_nat_proto.c
+* Unmerged path net/netfilter/nft_chain_nat.c
+diff --git a/net/netfilter/nft_nat.c b/net/netfilter/nft_nat.c
+index c15807d10b91..f2104a29fea3 100644
+--- a/net/netfilter/nft_nat.c
++++ b/net/netfilter/nft_nat.c
+@@ -142,7 +142,7 @@ static int nft_nat_init(const struct nft_ctx *ctx, const struct nft_expr *expr,
+ 		return -EINVAL;
+ 
+ 	family = ntohl(nla_get_be32(tb[NFTA_NAT_FAMILY]));
+-	if (family != ctx->family)
++	if (ctx->family != NFPROTO_INET && ctx->family != family)
+ 		return -EOPNOTSUPP;
+ 
+ 	switch (family) {
+@@ -280,13 +280,67 @@ static struct nft_expr_type nft_nat_type __read_mostly = {
+ 	.owner          = THIS_MODULE,
+ };
+ 
++#ifdef CONFIG_NF_TABLES_INET
++static void nft_nat_inet_eval(const struct nft_expr *expr,
++			      struct nft_regs *regs,
++			      const struct nft_pktinfo *pkt)
++{
++	const struct nft_nat *priv = nft_expr_priv(expr);
++
++	if (priv->family == nft_pf(pkt))
++		nft_nat_eval(expr, regs, pkt);
++}
++
++static const struct nft_expr_ops nft_nat_inet_ops = {
++	.type           = &nft_nat_type,
++	.size           = NFT_EXPR_SIZE(sizeof(struct nft_nat)),
++	.eval           = nft_nat_inet_eval,
++	.init           = nft_nat_init,
++	.destroy        = nft_nat_destroy,
++	.dump           = nft_nat_dump,
++	.validate	= nft_nat_validate,
++};
++
++static struct nft_expr_type nft_inet_nat_type __read_mostly = {
++	.name           = "nat",
++	.family		= NFPROTO_INET,
++	.ops            = &nft_nat_inet_ops,
++	.policy         = nft_nat_policy,
++	.maxattr        = NFTA_NAT_MAX,
++	.owner          = THIS_MODULE,
++};
++
++static int nft_nat_inet_module_init(void)
++{
++	return nft_register_expr(&nft_inet_nat_type);
++}
++
++static void nft_nat_inet_module_exit(void)
++{
++	nft_unregister_expr(&nft_inet_nat_type);
++}
++#else
++static int nft_nat_inet_module_init(void) { return 0; }
++static void nft_nat_inet_module_exit(void) { }
++#endif
++
+ static int __init nft_nat_module_init(void)
+ {
+-	return nft_register_expr(&nft_nat_type);
++	int ret = nft_nat_inet_module_init();
++
++	if (ret)
++		return ret;
++
++	ret = nft_register_expr(&nft_nat_type);
++	if (ret)
++		nft_nat_inet_module_exit();
++
++	return ret;
+ }
+ 
+ static void __exit nft_nat_module_exit(void)
+ {
++	nft_nat_inet_module_exit();
+ 	nft_unregister_expr(&nft_nat_type);
+ }
+ 
