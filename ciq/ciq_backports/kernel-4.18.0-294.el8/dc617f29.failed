@@ -1,0 +1,149 @@
+vfs: don't allow writes to swap files
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit dc617f29dbe5ef0c8ced65ce62c464af1daaab3d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/dc617f29.failed
+
+Don't let userspace write to an active swap file because the kernel
+effectively has a long term lease on the storage and things could get
+seriously corrupted if we let this happen.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit dc617f29dbe5ef0c8ced65ce62c464af1daaab3d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs.h
+diff --cc include/linux/fs.h
+index 2fcb144c2f59,a2e3d446ba8e..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -3570,4 -3535,27 +3570,30 @@@ static inline struct sock *io_uring_get
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ int vfs_ioc_setflags_prepare(struct inode *inode, unsigned int oldflags,
++ 			     unsigned int flags);
++ 
++ int vfs_ioc_fssetxattr_check(struct inode *inode, const struct fsxattr *old_fa,
++ 			     struct fsxattr *fa);
++ 
++ static inline void simple_fill_fsxattr(struct fsxattr *fa, __u32 xflags)
++ {
++ 	memset(fa, 0, sizeof(*fa));
++ 	fa->fsx_xflags = xflags;
++ }
++ 
++ /*
++  * Flush file data before changing attributes.  Caller must hold any locks
++  * required to prevent further writes to this file until we're done setting
++  * flags.
++  */
++ static inline int inode_drain_writes(struct inode *inode)
++ {
++ 	inode_dio_wait(inode);
++ 	return filemap_write_and_wait(inode->i_mapping);
++ }
++ 
+++>>>>>>> dc617f29dbe5 (vfs: don't allow writes to swap files)
+  #endif /* _LINUX_FS_H */
+diff --git a/fs/block_dev.c b/fs/block_dev.c
+index d76583b580c4..34d88d8f13cd 100644
+--- a/fs/block_dev.c
++++ b/fs/block_dev.c
+@@ -2041,6 +2041,9 @@ ssize_t blkdev_write_iter(struct kiocb *iocb, struct iov_iter *from)
+ 	if (bdev_read_only(I_BDEV(bd_inode)))
+ 		return -EPERM;
+ 
++	if (IS_SWAPFILE(bd_inode))
++		return -ETXTBSY;
++
+ 	if (!iov_iter_count(from))
+ 		return 0;
+ 
+* Unmerged path include/linux/fs.h
+diff --git a/mm/filemap.c b/mm/filemap.c
+index af446efa3a95..b0d4dce42675 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -2960,6 +2960,9 @@ inline ssize_t generic_write_checks(struct kiocb *iocb, struct iov_iter *from)
+ 	loff_t count;
+ 	int ret;
+ 
++	if (IS_SWAPFILE(inode))
++		return -ETXTBSY;
++
+ 	if (!iov_iter_count(from))
+ 		return 0;
+ 
+diff --git a/mm/memory.c b/mm/memory.c
+index 583eb7e0dd7f..689b3ed66c67 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2485,6 +2485,10 @@ static vm_fault_t do_page_mkwrite(struct vm_fault *vmf)
+ 
+ 	vmf->flags = FAULT_FLAG_WRITE|FAULT_FLAG_MKWRITE;
+ 
++	if (vmf->vma->vm_file &&
++	    IS_SWAPFILE(vmf->vma->vm_file->f_mapping->host))
++		return VM_FAULT_SIGBUS;
++
+ 	ret = vmf->vma->vm_ops->page_mkwrite(vmf);
+ 	/* Restore original flags so that caller is not surprised */
+ 	vmf->flags = old_flags;
+diff --git a/mm/mmap.c b/mm/mmap.c
+index fe8e11099119..1c8e0332a0dc 100644
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -1452,8 +1452,12 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 		case MAP_SHARED_VALIDATE:
+ 			if (flags & ~flags_mask)
+ 				return -EOPNOTSUPP;
+-			if ((prot&PROT_WRITE) && !(file->f_mode&FMODE_WRITE))
+-				return -EACCES;
++			if (prot & PROT_WRITE) {
++				if (!(file->f_mode & FMODE_WRITE))
++					return -EACCES;
++				if (IS_SWAPFILE(file->f_mapping->host))
++					return -ETXTBSY;
++			}
+ 
+ 			/*
+ 			 * Make sure we don't allow writing to an append-only
+diff --git a/mm/swapfile.c b/mm/swapfile.c
+index 843f8ced36cf..d4f6012b2dd3 100644
+--- a/mm/swapfile.c
++++ b/mm/swapfile.c
+@@ -3390,6 +3390,17 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	if (error)
+ 		goto bad_swap;
+ 
++	/*
++	 * Flush any pending IO and dirty mappings before we start using this
++	 * swap device.
++	 */
++	inode->i_flags |= S_SWAPFILE;
++	error = inode_drain_writes(inode);
++	if (error) {
++		inode->i_flags &= ~S_SWAPFILE;
++		goto bad_swap;
++	}
++
+ 	mutex_lock(&swapon_mutex);
+ 	prio = -1;
+ 	if (swap_flags & SWAP_FLAG_PREFER)
+@@ -3410,7 +3421,6 @@ SYSCALL_DEFINE2(swapon, const char __user *, specialfile, int, swap_flags)
+ 	atomic_inc(&proc_poll_event);
+ 	wake_up_interruptible(&proc_poll_wait);
+ 
+-	inode->i_flags |= S_SWAPFILE;
+ 	error = 0;
+ 	goto out;
+ bad_swap:
