@@ -1,0 +1,284 @@
+mm/sparsemem: prepare for sub-section ranges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] sparsemem: prepare for sub-section ranges (Baoquan He) [1724969]
+Rebuild_FUZZ: 96.47%
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit 7ea6216049ff9cf250a6722cd766d99c8d1424e5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/7ea62160.failed
+
+Prepare the memory hot-{add,remove} paths for handling sub-section
+ranges by plumbing the starting page frame and number of pages being
+handled through arch_{add,remove}_memory() to
+sparse_{add,remove}_one_section().
+
+This is simply plumbing, small cleanups, and some identifier renames.
+No intended functional changes.
+
+Link: http://lkml.kernel.org/r/156092353780.979959.9713046515562743194.stgit@dwillia2-desk3.amr.corp.intel.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Tested-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>	[ppc64]
+	Reviewed-by: Oscar Salvador <osalvador@suse.de>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Logan Gunthorpe <logang@deltatee.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Jane Chu <jane.chu@oracle.com>
+	Cc: Jeff Moyer <jmoyer@redhat.com>
+	Cc: Jérôme Glisse <jglisse@redhat.com>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Mike Rapoport <rppt@linux.ibm.com>
+	Cc: Toshi Kani <toshi.kani@hpe.com>
+	Cc: Wei Yang <richardw.yang@linux.intel.com>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7ea6216049ff9cf250a6722cd766d99c8d1424e5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory_hotplug.c
+#	mm/sparse.c
+diff --cc mm/memory_hotplug.c
+index e466254573a3,3fbb2cfab126..000000000000
+--- a/mm/memory_hotplug.c
++++ b/mm/memory_hotplug.c
+@@@ -253,22 -252,43 +253,59 @@@ void __init register_page_bootmem_info_
+  }
+  #endif /* CONFIG_HAVE_BOOTMEM_INFO_NODE */
+  
+++<<<<<<< HEAD
+ +static int __meminit __add_section(int nid, unsigned long phys_start_pfn,
+ +		struct vmem_altmap *altmap, bool want_memblock)
+++=======
++ static int __meminit __add_section(int nid, unsigned long pfn,
++ 		unsigned long nr_pages,	struct vmem_altmap *altmap)
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  {
+  	int ret;
+  
+- 	if (pfn_valid(phys_start_pfn))
++ 	if (pfn_valid(pfn))
+  		return -EEXIST;
+  
+++<<<<<<< HEAD
+ +	ret = sparse_add_one_section(nid, phys_start_pfn, altmap);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	if (!want_memblock)
+ +		return 0;
+ +
+ +	return hotplug_memory_register(nid, __pfn_to_section(phys_start_pfn));
+++=======
++ 	ret = sparse_add_section(nid, pfn, nr_pages, altmap);
++ 	return ret < 0 ? ret : 0;
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
++ }
++ 
++ static int check_pfn_span(unsigned long pfn, unsigned long nr_pages,
++ 		const char *reason)
++ {
++ 	/*
++ 	 * Disallow all operations smaller than a sub-section and only
++ 	 * allow operations smaller than a section for
++ 	 * SPARSEMEM_VMEMMAP. Note that check_hotplug_memory_range()
++ 	 * enforces a larger memory_block_size_bytes() granularity for
++ 	 * memory that will be marked online, so this check should only
++ 	 * fire for direct arch_{add,remove}_memory() users outside of
++ 	 * add_memory_resource().
++ 	 */
++ 	unsigned long min_align;
++ 
++ 	if (IS_ENABLED(CONFIG_SPARSEMEM_VMEMMAP))
++ 		min_align = PAGES_PER_SUBSECTION;
++ 	else
++ 		min_align = PAGES_PER_SECTION;
++ 	if (!IS_ALIGNED(pfn, min_align)
++ 			|| !IS_ALIGNED(nr_pages, min_align)) {
++ 		WARN(1, "Misaligned __%s_pages start: %#lx end: #%lx\n",
++ 				reason, pfn, pfn + nr_pages - 1);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
+  }
+  
+  /*
+@@@ -277,17 -297,12 +314,22 @@@
+   * call this function after deciding the zone to which to
+   * add the new pages.
+   */
+++<<<<<<< HEAD
+ +int __ref __add_pages(int nid, unsigned long phys_start_pfn,
+ +		unsigned long nr_pages, struct vmem_altmap *altmap,
+ +		bool want_memblock)
+ +{
+ +	unsigned long i;
+ +	int err = 0;
+ +	int start_sec, end_sec;
+- 
+- 	/* during initialize mem_map, align hot-added range to section */
+- 	start_sec = pfn_to_section_nr(phys_start_pfn);
+- 	end_sec = pfn_to_section_nr(phys_start_pfn + nr_pages - 1);
+++=======
++ int __ref __add_pages(int nid, unsigned long pfn, unsigned long nr_pages,
++ 		struct mhp_restrictions *restrictions)
++ {
++ 	unsigned long i;
++ 	int start_sec, end_sec, err;
++ 	struct vmem_altmap *altmap = restrictions->altmap;
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  
+  	if (altmap) {
+  		/*
+@@@ -302,9 -316,20 +343,25 @@@
+  		altmap->alloc = 0;
+  	}
+  
++ 	err = check_pfn_span(pfn, nr_pages, "add");
++ 	if (err)
++ 		return err;
++ 
++ 	start_sec = pfn_to_section_nr(pfn);
++ 	end_sec = pfn_to_section_nr(pfn + nr_pages - 1);
+  	for (i = start_sec; i <= end_sec; i++) {
+++<<<<<<< HEAD
+ +		err = __add_section(nid, section_nr_to_pfn(i), altmap,
+ +				want_memblock);
+++=======
++ 		unsigned long pfns;
++ 
++ 		pfns = min(nr_pages, PAGES_PER_SECTION
++ 				- (pfn & ~PAGE_SECTION_MASK));
++ 		err = __add_section(nid, pfn, pfns, altmap);
++ 		pfn += pfns;
++ 		nr_pages -= pfns;
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  
+  		/*
+  		 * EEXIST is finally dealt with by ioresource collision
+@@@ -518,13 -540,8 +573,18 @@@ static void __remove_section(struct zon
+  	if (WARN_ON_ONCE(!valid_section(ms)))
+  		return;
+  
+++<<<<<<< HEAD
+ +	unregister_memory_section(ms);
+ +
+ +	scn_nr = __section_nr(ms);
+ +	start_pfn = section_nr_to_pfn((unsigned long)scn_nr);
+ +	__remove_zone(zone, start_pfn);
+ +
+ +	sparse_remove_one_section(ms, map_offset, altmap);
+++=======
++ 	__remove_zone(zone, pfn, nr_pages);
++ 	sparse_remove_one_section(ms, pfn, nr_pages, map_offset, altmap);
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  }
+  
+  /**
+@@@ -539,18 -556,13 +599,22 @@@
+   * sure that pages are marked reserved and zones are adjust properly by
+   * calling offline_pages().
+   */
+++<<<<<<< HEAD
+ +int __remove_pages(struct zone *zone, unsigned long phys_start_pfn,
+ +		 unsigned long nr_pages, struct vmem_altmap *altmap)
+++=======
++ void __remove_pages(struct zone *zone, unsigned long pfn,
++ 		    unsigned long nr_pages, struct vmem_altmap *altmap)
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  {
+- 	unsigned long i;
+  	unsigned long map_offset = 0;
+- 	int sections_to_remove;
++ 	int i, start_sec, end_sec;
+  
+ -	map_offset = vmem_altmap_offset(altmap);
+ +	/* In the ZONE_DEVICE case device driver owns the memory region */
+ +	if (is_dev_zone(zone)) {
+ +		if (altmap)
+ +			map_offset = vmem_altmap_offset(altmap);
+ +	}
+  
+  	clear_zone_contiguous(zone);
+  
+diff --cc mm/sparse.c
+index 02b5de3161a3,41579b66fff1..000000000000
+--- a/mm/sparse.c
++++ b/mm/sparse.c
+@@@ -669,13 -728,13 +669,13 @@@ static void free_map_bootmem(struct pag
+   * * -EEXIST	- Section has been present.
+   * * -ENOMEM	- Out of memory.
+   */
+- int __meminit sparse_add_one_section(int nid, unsigned long start_pfn,
+- 				     struct vmem_altmap *altmap)
++ int __meminit sparse_add_section(int nid, unsigned long start_pfn,
++ 		unsigned long nr_pages, struct vmem_altmap *altmap)
+  {
+  	unsigned long section_nr = pfn_to_section_nr(start_pfn);
+ -	struct mem_section_usage *usage;
+  	struct mem_section *ms;
+  	struct page *memmap;
+ +	unsigned long *usemap;
+  	int ret;
+  
+  	/*
+@@@ -769,23 -835,22 +769,29 @@@ static void free_section_usemap(struct 
+  		free_map_bootmem(memmap);
+  }
+  
+- void sparse_remove_one_section(struct mem_section *ms, unsigned long map_offset,
+- 			       struct vmem_altmap *altmap)
++ void sparse_remove_one_section(struct mem_section *ms, unsigned long pfn,
++ 		unsigned long nr_pages, unsigned long map_offset,
++ 		struct vmem_altmap *altmap)
+  {
+  	struct page *memmap = NULL;
+ -	struct mem_section_usage *usage = NULL;
+ +	unsigned long *usemap = NULL;
+  
+  	if (ms->section_mem_map) {
+ -		usage = ms->usage;
+ +		usemap = ms->pageblock_flags;
+  		memmap = sparse_decode_mem_map(ms->section_mem_map,
+  						__section_nr(ms));
+  		ms->section_mem_map = 0;
+ -		ms->usage = NULL;
+ +		ms->pageblock_flags = NULL;
+  	}
+  
+++<<<<<<< HEAD
+ +	clear_hwpoisoned_pages(memmap + map_offset,
+ +			PAGES_PER_SECTION - map_offset);
+ +	free_section_usemap(memmap, usemap, altmap);
+++=======
++ 	clear_hwpoisoned_pages(memmap + map_offset, nr_pages - map_offset);
++ 	free_section_usage(ms, memmap, usage, pfn, nr_pages, altmap);
+++>>>>>>> 7ea6216049ff (mm/sparsemem: prepare for sub-section ranges)
+  }
+ +#endif /* CONFIG_MEMORY_HOTREMOVE */
+  #endif /* CONFIG_MEMORY_HOTPLUG */
+diff --git a/include/linux/memory_hotplug.h b/include/linux/memory_hotplug.h
+index 4408664ab5ca..7c81a8acddab 100644
+--- a/include/linux/memory_hotplug.h
++++ b/include/linux/memory_hotplug.h
+@@ -337,9 +337,10 @@ extern int arch_add_memory(int nid, u64 start, u64 size,
+ extern void move_pfn_range_to_zone(struct zone *zone, unsigned long start_pfn,
+ 		unsigned long nr_pages, struct vmem_altmap *altmap);
+ extern bool is_memblock_offlined(struct memory_block *mem);
+-extern int sparse_add_one_section(int nid, unsigned long start_pfn,
+-				  struct vmem_altmap *altmap);
++extern int sparse_add_section(int nid, unsigned long pfn,
++		unsigned long nr_pages, struct vmem_altmap *altmap);
+ extern void sparse_remove_one_section(struct mem_section *ms,
++		unsigned long pfn, unsigned long nr_pages,
+ 		unsigned long map_offset, struct vmem_altmap *altmap);
+ extern struct page *sparse_decode_mem_map(unsigned long coded_mem_map,
+ 					  unsigned long pnum);
+* Unmerged path mm/memory_hotplug.c
+* Unmerged path mm/sparse.c
