@@ -1,0 +1,79 @@
+KVM: s390: Add skey emulation fault handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Janosch Frank <frankja@linux.ibm.com>
+commit bd096f6443194e57382686a3ac5f2ce4e82b55d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/bd096f64.failed
+
+When doing skey emulation for huge guests, we now need to fault in
+pmds, as we don't have PGSTES anymore to store them when we do not
+have valid table entries.
+
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+(cherry picked from commit bd096f6443194e57382686a3ac5f2ce4e82b55d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/priv.c
+diff --cc arch/s390/kvm/priv.c
+index c4da375553e8,cfc5a62329f6..000000000000
+--- a/arch/s390/kvm/priv.c
++++ b/arch/s390/kvm/priv.c
+@@@ -956,7 -987,7 +987,11 @@@ static int handle_pfmf(struct kvm_vcpu 
+  			return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+  
+  		if (vcpu->run->s.regs.gprs[reg1] & PFMF_CF) {
+++<<<<<<< HEAD
+ +			if (kvm_clear_guest(vcpu->kvm, start, PAGE_SIZE))
+++=======
++ 			if (clear_user((void __user *)vmaddr, PAGE_SIZE))
+++>>>>>>> bd096f644319 (KVM: s390: Add skey emulation fault handling)
+  				return kvm_s390_inject_program_int(vcpu, PGM_ADDRESSING);
+  		}
+  
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index 647dd253b4e3..8e0cf3b4e22d 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -1551,6 +1551,7 @@ static long kvm_s390_set_skeys(struct kvm *kvm, struct kvm_s390_skeys *args)
+ 	uint8_t *keys;
+ 	uint64_t hva;
+ 	int srcu_idx, i, r = 0;
++	bool unlocked;
+ 
+ 	if (args->flags != 0)
+ 		return -EINVAL;
+@@ -1575,9 +1576,11 @@ static long kvm_s390_set_skeys(struct kvm *kvm, struct kvm_s390_skeys *args)
+ 	if (r)
+ 		goto out;
+ 
++	i = 0;
+ 	down_read(&current->mm->mmap_sem);
+ 	srcu_idx = srcu_read_lock(&kvm->srcu);
+-	for (i = 0; i < args->count; i++) {
++        while (i < args->count) {
++		unlocked = false;
+ 		hva = gfn_to_hva(kvm, args->start_gfn + i);
+ 		if (kvm_is_error_hva(hva)) {
+ 			r = -EFAULT;
+@@ -1591,8 +1594,14 @@ static long kvm_s390_set_skeys(struct kvm *kvm, struct kvm_s390_skeys *args)
+ 		}
+ 
+ 		r = set_guest_storage_key(current->mm, hva, keys[i], 0);
+-		if (r)
+-			break;
++		if (r) {
++			r = fixup_user_fault(current, current->mm, hva,
++					     FAULT_FLAG_WRITE, &unlocked);
++			if (r)
++				break;
++		}
++		if (!r)
++			i++;
+ 	}
+ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
+ 	up_read(&current->mm->mmap_sem);
+* Unmerged path arch/s390/kvm/priv.c
