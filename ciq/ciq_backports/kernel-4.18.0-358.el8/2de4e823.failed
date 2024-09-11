@@ -1,0 +1,141 @@
+selftests/ptrace: add test cases for dead-locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Bernd Edlinger <bernd.edlinger@hotmail.de>
+commit 2de4e82318c7f9d34f4b08599a612cd4cd10bf0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2de4e823.failed
+
+This adds test cases for ptrace deadlocks.
+
+Additionally fixes a compile problem in get_syscall_info.c,
+observed with gcc-4.8.4:
+
+get_syscall_info.c: In function 'get_syscall_info':
+get_syscall_info.c:93:3: error: 'for' loop initial declarations are only
+                                 allowed in C99 mode
+   for (unsigned int i = 0; i < ARRAY_SIZE(args); ++i) {
+   ^
+get_syscall_info.c:93:3: note: use option -std=c99 or -std=gnu99 to compile
+                               your code
+
+	Signed-off-by: Bernd Edlinger <bernd.edlinger@hotmail.de>
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Eric W. Biederman <ebiederm@xmission.com>
+(cherry picked from commit 2de4e82318c7f9d34f4b08599a612cd4cd10bf0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/ptrace/Makefile
+diff --cc tools/testing/selftests/ptrace/Makefile
+index 8a2bc5562179,2f1f532c39db..000000000000
+--- a/tools/testing/selftests/ptrace/Makefile
++++ b/tools/testing/selftests/ptrace/Makefile
+@@@ -1,5 -1,6 +1,12 @@@
+++<<<<<<< HEAD
+ +CFLAGS += -iquote../../../../include/uapi -Wall
+ +
+ +TEST_GEN_PROGS := peeksiginfo
+++=======
++ # SPDX-License-Identifier: GPL-2.0-only
++ CFLAGS += -std=c99 -pthread -iquote../../../../include/uapi -Wall
++ 
++ TEST_GEN_PROGS := get_syscall_info peeksiginfo vmaccess
+++>>>>>>> 2de4e82318c7 (selftests/ptrace: add test cases for dead-locks)
+  
+  include ../lib.mk
+* Unmerged path tools/testing/selftests/ptrace/Makefile
+diff --git a/tools/testing/selftests/ptrace/vmaccess.c b/tools/testing/selftests/ptrace/vmaccess.c
+new file mode 100644
+index 000000000000..4db327b44586
+--- /dev/null
++++ b/tools/testing/selftests/ptrace/vmaccess.c
+@@ -0,0 +1,86 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Copyright (c) 2020 Bernd Edlinger <bernd.edlinger@hotmail.de>
++ * All rights reserved.
++ *
++ * Check whether /proc/$pid/mem can be accessed without causing deadlocks
++ * when de_thread is blocked with ->cred_guard_mutex held.
++ */
++
++#include "../kselftest_harness.h"
++#include <stdio.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <signal.h>
++#include <unistd.h>
++#include <sys/ptrace.h>
++
++static void *thread(void *arg)
++{
++	ptrace(PTRACE_TRACEME, 0, 0L, 0L);
++	return NULL;
++}
++
++TEST(vmaccess)
++{
++	int f, pid = fork();
++	char mm[64];
++
++	if (!pid) {
++		pthread_t pt;
++
++		pthread_create(&pt, NULL, thread, NULL);
++		pthread_join(pt, NULL);
++		execlp("true", "true", NULL);
++	}
++
++	sleep(1);
++	sprintf(mm, "/proc/%d/mem", pid);
++	f = open(mm, O_RDONLY);
++	ASSERT_GE(f, 0);
++	close(f);
++	f = kill(pid, SIGCONT);
++	ASSERT_EQ(f, 0);
++}
++
++TEST(attach)
++{
++	int s, k, pid = fork();
++
++	if (!pid) {
++		pthread_t pt;
++
++		pthread_create(&pt, NULL, thread, NULL);
++		pthread_join(pt, NULL);
++		execlp("sleep", "sleep", "2", NULL);
++	}
++
++	sleep(1);
++	k = ptrace(PTRACE_ATTACH, pid, 0L, 0L);
++	ASSERT_EQ(errno, EAGAIN);
++	ASSERT_EQ(k, -1);
++	k = waitpid(-1, &s, WNOHANG);
++	ASSERT_NE(k, -1);
++	ASSERT_NE(k, 0);
++	ASSERT_NE(k, pid);
++	ASSERT_EQ(WIFEXITED(s), 1);
++	ASSERT_EQ(WEXITSTATUS(s), 0);
++	sleep(1);
++	k = ptrace(PTRACE_ATTACH, pid, 0L, 0L);
++	ASSERT_EQ(k, 0);
++	k = waitpid(-1, &s, 0);
++	ASSERT_EQ(k, pid);
++	ASSERT_EQ(WIFSTOPPED(s), 1);
++	ASSERT_EQ(WSTOPSIG(s), SIGSTOP);
++	k = ptrace(PTRACE_DETACH, pid, 0L, 0L);
++	ASSERT_EQ(k, 0);
++	k = waitpid(-1, &s, 0);
++	ASSERT_EQ(k, pid);
++	ASSERT_EQ(WIFEXITED(s), 1);
++	ASSERT_EQ(WEXITSTATUS(s), 0);
++	k = waitpid(-1, NULL, 0);
++	ASSERT_EQ(k, -1);
++	ASSERT_EQ(errno, ECHILD);
++}
++
++TEST_HARNESS_MAIN
