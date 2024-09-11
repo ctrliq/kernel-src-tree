@@ -1,0 +1,180 @@
+scsi: smartpqi: Update soft reset management for OFA
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Kevin Barnett <kevin.barnett@microchip.com>
+commit 4ccc354bac14b03e13c1d20131fe6d5a8e2c2c45
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/4ccc354b.failed
+
+Cleanup soft reset code for Online Firmware Activation (OFA). OFA allows
+controller firmware updates without a reboot.
+
+OFA updates require an on-line controller reset to activate the updated
+firmware. There were some missing actions for some of the reset cases. The
+controller is first set back to sis mode before returning to pqi mode.
+Check to ensure the controller is in sis mode.
+
+Release QRM memory (OFA buffer) on OFA error conditions. Clean up
+controller state which can cause a kernel panic upon reboot after an
+unsuccessful OFA.
+
+Link: https://lore.kernel.org/r/161549379215.25025.10654441314249183621.stgit@brunhilda
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 4ccc354bac14b03e13c1d20131fe6d5a8e2c2c45)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index dbcd64ccf91b,41aa401e58eb..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -407,11 -393,7 +407,12 @@@ static inline u8 pqi_read_soft_reset_st
+  	return readb(ctrl_info->soft_reset_status);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void pqi_clear_soft_reset_status(struct pqi_ctrl_info *ctrl_info,
+ +	u8 clear)
+++=======
++ static inline void pqi_clear_soft_reset_status(struct pqi_ctrl_info *ctrl_info)
+++>>>>>>> 4ccc354bac14 (scsi: smartpqi: Update soft reset management for OFA)
+  {
+  	u8 status;
+  
+@@@ -3125,34 -3279,52 +3123,57 @@@ static enum pqi_soft_reset_status pqi_p
+  	}
+  }
+  
+- static void pqi_process_soft_reset(struct pqi_ctrl_info *ctrl_info,
+- 	enum pqi_soft_reset_status reset_status)
++ static void pqi_process_soft_reset(struct pqi_ctrl_info *ctrl_info)
+  {
+  	int rc;
++ 	enum pqi_soft_reset_status reset_status;
++ 
++ 	if (ctrl_info->soft_reset_handshake_supported)
++ 		reset_status = pqi_poll_for_soft_reset_status(ctrl_info);
++ 	else
++ 		reset_status = RESET_INITIATE_FIRMWARE;
+  
+  	switch (reset_status) {
+++<<<<<<< HEAD
+ +	case RESET_INITIATE_DRIVER:
+ +		/* fall through */
+++=======
+++>>>>>>> 4ccc354bac14 (scsi: smartpqi: Update soft reset management for OFA)
+  	case RESET_TIMEDOUT:
++ 		fallthrough;
++ 	case RESET_INITIATE_DRIVER:
+  		dev_info(&ctrl_info->pci_dev->dev,
+- 			"resetting controller %u\n", ctrl_info->ctrl_id);
++ 				"Online Firmware Activation: resetting controller\n");
+  		sis_soft_reset(ctrl_info);
+ -		fallthrough;
+ +		/* fall through */
+  	case RESET_INITIATE_FIRMWARE:
++ 		ctrl_info->pqi_mode_enabled = false;
++ 		pqi_save_ctrl_mode(ctrl_info, SIS_MODE);
+  		rc = pqi_ofa_ctrl_restart(ctrl_info);
+  		pqi_ofa_free_host_buffer(ctrl_info);
++ 		pqi_ctrl_ofa_done(ctrl_info);
+  		dev_info(&ctrl_info->pci_dev->dev,
+- 			"Online Firmware Activation for controller %u: %s\n",
+- 			ctrl_info->ctrl_id, rc == 0 ? "SUCCESS" : "FAILED");
++ 				"Online Firmware Activation: %s\n",
++ 				rc == 0 ? "SUCCESS" : "FAILED");
+  		break;
+  	case RESET_ABORT:
+- 		pqi_ofa_ctrl_unquiesce(ctrl_info);
+  		dev_info(&ctrl_info->pci_dev->dev,
+- 			"Online Firmware Activation for controller %u: %s\n",
+- 			ctrl_info->ctrl_id, "ABORTED");
++ 				"Online Firmware Activation ABORTED\n");
++ 		if (ctrl_info->soft_reset_handshake_supported)
++ 			pqi_clear_soft_reset_status(ctrl_info);
++ 		pqi_ofa_free_host_buffer(ctrl_info);
++ 		pqi_ctrl_ofa_done(ctrl_info);
++ 		pqi_ofa_ctrl_unquiesce(ctrl_info);
+  		break;
+  	case RESET_NORESPONSE:
++ 		fallthrough;
++ 	default:
++ 		dev_err(&ctrl_info->pci_dev->dev,
++ 			"unexpected Online Firmware Activation reset status: 0x%x\n",
++ 			reset_status);
+  		pqi_ofa_free_host_buffer(ctrl_info);
++ 		pqi_ctrl_ofa_done(ctrl_info);
++ 		pqi_ofa_ctrl_unquiesce(ctrl_info);
+  		pqi_take_ctrl_offline(ctrl_info);
+  		break;
+  	}
+@@@ -6897,16 -7407,28 +6910,17 @@@ static void pqi_ctrl_update_feature_fla
+  	struct pqi_firmware_feature *firmware_feature)
+  {
+  	switch (firmware_feature->feature_bit) {
+ -	case PQI_FIRMWARE_FEATURE_RAID_1_WRITE_BYPASS:
+ -		ctrl_info->enable_r1_writes = firmware_feature->enabled;
+ -		break;
+ -	case PQI_FIRMWARE_FEATURE_RAID_5_WRITE_BYPASS:
+ -		ctrl_info->enable_r5_writes = firmware_feature->enabled;
+ -		break;
+ -	case PQI_FIRMWARE_FEATURE_RAID_6_WRITE_BYPASS:
+ -		ctrl_info->enable_r6_writes = firmware_feature->enabled;
+ -		break;
+  	case PQI_FIRMWARE_FEATURE_SOFT_RESET_HANDSHAKE:
+  		ctrl_info->soft_reset_handshake_supported =
+- 			firmware_feature->enabled;
++ 			firmware_feature->enabled &&
++ 			pqi_read_soft_reset_status(ctrl_info);
+  		break;
+  	case PQI_FIRMWARE_FEATURE_RAID_IU_TIMEOUT:
+ -		ctrl_info->raid_iu_timeout_supported = firmware_feature->enabled;
+ +		ctrl_info->raid_iu_timeout_supported =
+ +			firmware_feature->enabled;
+  		break;
+  	case PQI_FIRMWARE_FEATURE_TMF_IU_TIMEOUT:
+ -		ctrl_info->tmf_iu_timeout_supported = firmware_feature->enabled;
+ -		break;
+ -	case PQI_FIRMWARE_FEATURE_UNIQUE_WWID_IN_REPORT_PHYS_LUN:
+ -		ctrl_info->unique_wwid_in_report_phys_lun_supported =
+ +		ctrl_info->tmf_iu_timeout_supported =
+  			firmware_feature->enabled;
+  		break;
+  	}
+@@@ -7033,6 -7610,24 +7047,27 @@@ static void pqi_process_firmware_featur
+  	mutex_unlock(&pqi_firmware_features_mutex);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Reset all controller settings that can be initialized during the processing
++  * of the PQI Configuration Table.
++  */
++ 
++ static void pqi_ctrl_reset_config(struct pqi_ctrl_info *ctrl_info)
++ {
++ 	ctrl_info->heartbeat_counter = NULL;
++ 	ctrl_info->soft_reset_status = NULL;
++ 	ctrl_info->soft_reset_handshake_supported = false;
++ 	ctrl_info->enable_r1_writes = false;
++ 	ctrl_info->enable_r5_writes = false;
++ 	ctrl_info->enable_r6_writes = false;
++ 	ctrl_info->raid_iu_timeout_supported = false;
++ 	ctrl_info->tmf_iu_timeout_supported = false;
++ 	ctrl_info->unique_wwid_in_report_phys_lun_supported = false;
++ }
++ 
+++>>>>>>> 4ccc354bac14 (scsi: smartpqi: Update soft reset management for OFA)
+  static int pqi_process_config_table(struct pqi_ctrl_info *ctrl_info)
+  {
+  	u32 table_length;
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
