@@ -1,0 +1,240 @@
+ASoC: soc-component: add mark for snd_soc_pcm_component_pm_runtime_get/put()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: soc-component: add mark for snd_soc_pcm_component_pm_runtime_get/put() (Jaroslav Kysela) [1783462]
+Rebuild_FUZZ: 96.20%
+commit-author Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+commit 939a5cfb2a5609d2d6f996b5cd853397a82a92b9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/939a5cfb.failed
+
+soc_pcm_open() does rollback when failed (A),
+but, it is almost same as soc_pcm_close().
+
+	static int soc_pcm_open(xxx)
+	{
+		...
+		if (ret < 0)
+			goto xxx_err;
+		...
+		return 0;
+
+ ^	config_err:
+ |		...
+ |	rtd_startup_err:
+(A)		...
+ |	component_err:
+ |		...
+ v		return ret;
+	}
+
+The difference is
+soc_pcm_close() is for all dai/component/substream,
+rollback        is for succeeded part only.
+
+This kind of duplicated code can be a hotbed of bugs,
+thus, we want to share soc_pcm_close() and rollback.
+
+Now, soc_pcm_open/close() are handling
+	1) snd_soc_dai_startup/shutdown()
+	2) snd_soc_link_startup/shutdown()
+	3) snd_soc_component_module_get/put()
+	4) snd_soc_component_open/close()
+=>	5) pm_runtime_put/get()
+
+This patch is for 5) pm_runtime_put/get().
+
+The idea of having bit-flag or counter is not enough for this purpose.
+For example if one DAI is used for 2xPlaybacks for some reasons,
+and if 1st Playback was succeeded but 2nd Playback was failed,
+2nd Playback rollback doesn't need to call shutdown.
+But it has succeeded bit-flag or counter via 1st Playback,
+thus, 2nd Playback rollback will call unneeded shutdown.
+And 1st Playback's necessary shutdown will not be called,
+because bit-flag or counter was cleared by wrong 2nd Playback rollback.
+
+To avoid such case, this patch marks substream pointer when get() was
+succeeded. If rollback needed, it will check rollback flag and marked
+substream pointer.
+
+One note here is that it cares *current* get() only now.
+but we might want to check *whole* marked substream in the future.
+This patch is using macro named "push/pop", so that it can be easily
+update.
+
+	Signed-off-by: Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+Link: https://lore.kernel.org/r/87h7ribwnb.wl-kuninori.morimoto.gx@renesas.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 939a5cfb2a5609d2d6f996b5cd853397a82a92b9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/sound/soc-component.h
+#	sound/soc/soc-compress.c
+diff --cc include/sound/soc-component.h
+index 2cb2446242d9,2c790ce95259..000000000000
+--- a/include/sound/soc-component.h
++++ b/include/sound/soc-component.h
+@@@ -217,6 -217,11 +217,14 @@@ struct snd_soc_component 
+  	/* machine specific init */
+  	int (*init)(struct snd_soc_component *component);
+  
+++<<<<<<< HEAD
+++=======
++ 	/* function mark */
++ 	struct snd_pcm_substream *mark_module;
++ 	struct snd_pcm_substream *mark_open;
++ 	void *mark_pm;
++ 
+++>>>>>>> 939a5cfb2a56 (ASoC: soc-component: add mark for snd_soc_pcm_component_pm_runtime_get/put())
+  #ifdef CONFIG_DEBUG_FS
+  	struct dentry *debugfs_root;
+  	const char *debugfs_prefix;
+diff --cc sound/soc/soc-compress.c
+index 1a83d7bd465d,3a6a60215e81..000000000000
+--- a/sound/soc/soc-compress.c
++++ b/sound/soc/soc-compress.c
+@@@ -72,18 -73,13 +72,19 @@@ static int soc_compr_components_free(st
+  static int soc_compr_open(struct snd_compr_stream *cstream)
+  {
+  	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
+++<<<<<<< HEAD
+ +	struct snd_soc_component *component, *save = NULL;
+ +	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+ +	int ret, i;
+++=======
++ 	struct snd_soc_component *component = NULL;
++ 	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
++ 	int ret;
+++>>>>>>> 939a5cfb2a56 (ASoC: soc-component: add mark for snd_soc_pcm_component_pm_runtime_get/put())
+  
+- 	for_each_rtd_components(rtd, i, component) {
+- 		ret = pm_runtime_get_sync(component->dev);
+- 		if (ret < 0 && ret != -EACCES) {
+- 			pm_runtime_put_noidle(component->dev);
+- 			save = component;
+- 			goto pm_err;
+- 		}
+- 	}
++ 	ret = snd_soc_pcm_component_pm_runtime_get(rtd, cstream);
++ 	if (ret < 0)
++ 		goto pm_err;
+  
+  	mutex_lock_nested(&rtd->card->pcm_mutex, rtd->card->pcm_subclass);
+  
+@@@ -215,10 -195,9 +211,16 @@@ be_err
+  static int soc_compr_free(struct snd_compr_stream *cstream)
+  {
+  	struct snd_soc_pcm_runtime *rtd = cstream->private_data;
+++<<<<<<< HEAD
+ +	struct snd_soc_component *component;
+ +	struct snd_soc_dai *cpu_dai = rtd->cpu_dai;
+ +	struct snd_soc_dai *codec_dai = rtd->codec_dai;
+ +	int stream, i;
+++=======
++ 	struct snd_soc_dai *cpu_dai = asoc_rtd_to_cpu(rtd, 0);
++ 	struct snd_soc_dai *codec_dai = asoc_rtd_to_codec(rtd, 0);
++ 	int stream;
+++>>>>>>> 939a5cfb2a56 (ASoC: soc-component: add mark for snd_soc_pcm_component_pm_runtime_get/put())
+  
+  	mutex_lock_nested(&rtd->card->pcm_mutex, rtd->card->pcm_subclass);
+  
+* Unmerged path include/sound/soc-component.h
+diff --git a/sound/soc/soc-component.c b/sound/soc/soc-component.c
+index 05dcb9c6e130..29b4fc5d51cc 100644
+--- a/sound/soc/soc-component.c
++++ b/sound/soc/soc-component.c
+@@ -6,6 +6,7 @@
+ // Kuninori Morimoto <kuninori.morimoto.gx@renesas.com>
+ //
+ #include <linux/module.h>
++#include <linux/pm_runtime.h>
+ #include <sound/soc.h>
+ 
+ #define soc_component_ret(dai, ret) _soc_component_ret(dai, __func__, ret)
+@@ -601,3 +602,40 @@ int snd_soc_pcm_component_trigger(struct snd_pcm_substream *substream,
+ 
+ 	return 0;
+ }
++
++int snd_soc_pcm_component_pm_runtime_get(struct snd_soc_pcm_runtime *rtd,
++					 void *stream)
++{
++	struct snd_soc_component *component;
++	int i, ret;
++
++	for_each_rtd_components(rtd, i, component) {
++		ret = pm_runtime_get_sync(component->dev);
++		if (ret < 0 && ret != -EACCES) {
++			pm_runtime_put_noidle(component->dev);
++			return soc_component_ret(component, ret);
++		}
++		/* mark stream if succeeded */
++		soc_component_mark_push(component, stream, pm);
++	}
++
++	return 0;
++}
++
++void snd_soc_pcm_component_pm_runtime_put(struct snd_soc_pcm_runtime *rtd,
++					  void *stream, int rollback)
++{
++	struct snd_soc_component *component;
++	int i;
++
++	for_each_rtd_components(rtd, i, component) {
++		if (rollback && !soc_component_mark_match(component, stream, pm))
++			continue;
++
++		pm_runtime_mark_last_busy(component->dev);
++		pm_runtime_put_autosuspend(component->dev);
++
++		/* remove marked stream */
++		soc_component_mark_pop(component, stream, pm);
++	}
++}
+* Unmerged path sound/soc/soc-compress.c
+diff --git a/sound/soc/soc-pcm.c b/sound/soc/soc-pcm.c
+index f3af956b9680..3d76f0613720 100644
+--- a/sound/soc/soc-pcm.c
++++ b/sound/soc/soc-pcm.c
+@@ -571,10 +571,7 @@ static int soc_pcm_close(struct snd_pcm_substream *substream)
+ 
+ 	mutex_unlock(&rtd->card->pcm_mutex);
+ 
+-	for_each_rtd_components(rtd, i, component) {
+-		pm_runtime_mark_last_busy(component->dev);
+-		pm_runtime_put_autosuspend(component->dev);
+-	}
++	snd_soc_pcm_component_pm_runtime_put(rtd, substream, 0);
+ 
+ 	for_each_rtd_components(rtd, i, component)
+ 		if (!component->active)
+@@ -601,8 +598,9 @@ static int soc_pcm_open(struct snd_pcm_substream *substream)
+ 	for_each_rtd_components(rtd, i, component)
+ 		pinctrl_pm_select_default_state(component->dev);
+ 
+-	for_each_rtd_components(rtd, i, component)
+-		pm_runtime_get_sync(component->dev);
++	ret = snd_soc_pcm_component_pm_runtime_get(rtd, substream);
++	if (ret < 0)
++		goto pm_err;
+ 
+ 	mutex_lock_nested(&rtd->card->pcm_mutex, rtd->card->pcm_subclass);
+ 
+@@ -702,11 +700,8 @@ static int soc_pcm_open(struct snd_pcm_substream *substream)
+ 	soc_pcm_components_close(substream);
+ component_err:
+ 	mutex_unlock(&rtd->card->pcm_mutex);
+-
+-	for_each_rtd_components(rtd, i, component) {
+-		pm_runtime_mark_last_busy(component->dev);
+-		pm_runtime_put_autosuspend(component->dev);
+-	}
++pm_err:
++	snd_soc_pcm_component_pm_runtime_put(rtd, substream, 1);
+ 
+ 	for_each_rtd_components(rtd, i, component)
+ 		if (!component->active)
