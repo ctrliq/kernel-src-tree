@@ -1493,7 +1493,6 @@ enum calc_target_result {
 
 static enum calc_target_result calc_target(struct ceph_osd_client *osdc,
 					   struct ceph_osd_request_target *t,
-					   struct ceph_connection *con,
 					   bool any_change)
 {
 	struct ceph_pg_pool_info *pi;
@@ -2273,7 +2272,7 @@ static void __submit_request(struct ceph_osd_request *req, bool wrlocked)
 	dout("%s req %p wrlocked %d\n", __func__, req, wrlocked);
 
 again:
-	ct_res = calc_target(osdc, &req->r_t, NULL, false);
+	ct_res = calc_target(osdc, &req->r_t, false);
 	if (ct_res == CALC_TARGET_POOL_DNE && !wrlocked)
 		goto promote;
 
@@ -3096,7 +3095,7 @@ static void linger_submit(struct ceph_osd_linger_request *lreq)
 		lreq->reg_req->r_ops[0].notify.cookie = lreq->linger_id;
 	}
 
-	calc_target(osdc, &lreq->t, NULL, false);
+	calc_target(osdc, &lreq->t, false);
 	osd = lookup_create_osd(osdc, lreq->t.osd, true);
 	link_linger(osd, lreq);
 
@@ -3713,7 +3712,7 @@ recalc_linger_target(struct ceph_osd_linger_request *lreq)
 	struct ceph_osd_client *osdc = lreq->osdc;
 	enum calc_target_result ct_res;
 
-	ct_res = calc_target(osdc, &lreq->t, NULL, true);
+	ct_res = calc_target(osdc, &lreq->t, true);
 	if (ct_res == CALC_TARGET_NEED_RESEND) {
 		struct ceph_osd *osd;
 
@@ -3785,8 +3784,7 @@ static void scan_requests(struct ceph_osd *osd,
 		n = rb_next(n); /* unlink_request(), check_pool_dne() */
 
 		dout("%s req %p tid %llu\n", __func__, req, req->r_tid);
-		ct_res = calc_target(osdc, &req->r_t, &req->r_osd->o_con,
-				     false);
+		ct_res = calc_target(osdc, &req->r_t, false);
 		switch (ct_res) {
 		case CALC_TARGET_NO_ACTION:
 			force_resend_writes = cleared_full ||
@@ -3895,7 +3893,7 @@ static void kick_requests(struct ceph_osd_client *osdc,
 		n = rb_next(n);
 
 		if (req->r_t.epoch < osdc->osdmap->epoch) {
-			ct_res = calc_target(osdc, &req->r_t, NULL, false);
+			ct_res = calc_target(osdc, &req->r_t, false);
 			if (ct_res == CALC_TARGET_POOL_DNE) {
 				erase_request(need_resend, req);
 				check_pool_dne(req);
