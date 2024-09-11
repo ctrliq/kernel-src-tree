@@ -1,0 +1,106 @@
+blk-mq: add mq_ops->commit_rqs()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit d666ba98f849ad44c4405ecc2180390ebe80f4f9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/d666ba98.failed
+
+blk-mq passes information to the hardware about any given request being
+the last that we will issue in this sequence. The point is that hardware
+can defer costly doorbell type writes to the last request. But if we run
+into errors issuing a sequence of requests, we may never send the request
+with bd->last == true set. For that case, we need a hook that tells the
+hardware that nothing else is coming right now.
+
+For failures returned by the drivers ->queue_rq() hook, the driver is
+responsible for flushing pending requests, if it uses bd->last to
+optimize that part. This works like before, no changes there.
+
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit d666ba98f849ad44c4405ecc2180390ebe80f4f9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blk-mq.h
+diff --cc include/linux/blk-mq.h
+index f7a641aa7f19,467f1dd21ccf..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -109,6 -117,9 +109,12 @@@ struct blk_mq_queue_data 
+  
+  typedef blk_status_t (queue_rq_fn)(struct blk_mq_hw_ctx *,
+  		const struct blk_mq_queue_data *);
+++<<<<<<< HEAD
+++=======
++ typedef void (commit_rqs_fn)(struct blk_mq_hw_ctx *);
++ /* takes rq->cmd_flags as input, returns a hardware type index */
++ typedef int (rq_flags_to_type_fn)(struct request_queue *, unsigned int);
+++>>>>>>> d666ba98f849 (blk-mq: add mq_ops->commit_rqs())
+  typedef bool (get_budget_fn)(struct blk_mq_hw_ctx *);
+  typedef void (put_budget_fn)(struct blk_mq_hw_ctx *);
+  typedef enum blk_eh_timer_return (timeout_fn)(struct request *, bool);
+@@@ -134,6 -146,20 +140,23 @@@ struct blk_mq_ops 
+  	queue_rq_fn		*queue_rq;
+  
+  	/*
+++<<<<<<< HEAD
+++=======
++ 	 * If a driver uses bd->last to judge when to submit requests to
++ 	 * hardware, it must define this function. In case of errors that
++ 	 * make us stop issuing further requests, this hook serves the
++ 	 * purpose of kicking the hardware (which the last request otherwise
++ 	 * would have done).
++ 	 */
++ 	commit_rqs_fn		*commit_rqs;
++ 
++ 	/*
++ 	 * Return a queue map type for the given request/bio flags
++ 	 */
++ 	rq_flags_to_type_fn	*rq_flags_to_type;
++ 
++ 	/*
+++>>>>>>> d666ba98f849 (blk-mq: add mq_ops->commit_rqs())
+  	 * Reserve budget before queue request, once .queue_rq is
+  	 * run, it is driver's responsibility to release the
+  	 * reserved budget. Also we have to handle failure case
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 519da1c104b3..315ab5ef7f05 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -1248,6 +1248,14 @@ bool blk_mq_dispatch_rq_list(struct request_queue *q, struct list_head *list,
+ 	if (!list_empty(list)) {
+ 		bool needs_restart;
+ 
++		/*
++		 * If we didn't flush the entire list, we could have told
++		 * the driver there was more coming, but that turned out to
++		 * be a lie.
++		 */
++		if (q->mq_ops->commit_rqs)
++			q->mq_ops->commit_rqs(hctx);
++
+ 		spin_lock(&hctx->lock);
+ 		list_splice_init(list, &hctx->dispatch);
+ 		spin_unlock(&hctx->lock);
+@@ -1852,6 +1860,14 @@ void blk_mq_try_issue_list_directly(struct blk_mq_hw_ctx *hctx,
+ 			blk_mq_end_request(rq, ret);
+ 		}
+ 	}
++
++	/*
++	 * If we didn't flush the entire list, we could have told
++	 * the driver there was more coming, but that turned out to
++	 * be a lie.
++	 */
++	if (!list_empty(list) && hctx->queue->mq_ops->commit_rqs)
++		hctx->queue->mq_ops->commit_rqs(hctx);
+ }
+ 
+ static blk_qc_t blk_mq_make_request(struct request_queue *q, struct bio *bio)
+* Unmerged path include/linux/blk-mq.h
