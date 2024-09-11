@@ -1,0 +1,246 @@
+x86/hpet: Use another crystalball to evaluate HPET usability
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6e3cd95234dc1eda488f4f487c281bac8fef4d9b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/6e3cd952.failed
+
+On recent Intel systems the HPET stops working when the system reaches PC10
+idle state.
+
+The approach of adding PCI ids to the early quirks to disable HPET on
+these systems is a whack a mole game which makes no sense.
+
+Check for PC10 instead and force disable HPET if supported. The check is
+overbroad as it does not take ACPI, intel_idle enablement and command
+line parameters into account. That's fine as long as there is at least
+PMTIMER available to calibrate the TSC frequency. The decision can be
+overruled by adding "hpet=force" on the kernel command line.
+
+Remove the related early PCI quirks for affected Ice Cake and Coffin Lake
+systems as they are not longer required. That should also cover all
+other systems, i.e. Tiger Rag and newer generations, which are most
+likely affected by this as well.
+
+Fixes: Yet another hardware trainwreck
+	Reported-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Rafael J. Wysocki <rafael@kernel.org>
+	Cc: stable@vger.kernel.org
+	Cc: Kai-Heng Feng <kai.heng.feng@canonical.com>
+	Cc: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 6e3cd95234dc1eda488f4f487c281bac8fef4d9b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/early-quirks.c
+#	arch/x86/kernel/hpet.c
+diff --cc arch/x86/kernel/early-quirks.c
+index 5ea2b2977ff8,391a4e2b8604..000000000000
+--- a/arch/x86/kernel/early-quirks.c
++++ b/arch/x86/kernel/early-quirks.c
+@@@ -714,8 -714,6 +714,11 @@@ static struct chipset early_qrk[] __ini
+  	 */
+  	{ PCI_VENDOR_ID_INTEL, 0x0f00,
+  		PCI_CLASS_BRIDGE_HOST, PCI_ANY_ID, 0, force_disable_hpet},
+++<<<<<<< HEAD
+ +	{ PCI_VENDOR_ID_INTEL, 0x3ec4,
+ +		PCI_CLASS_BRIDGE_HOST, PCI_ANY_ID, 0, force_disable_hpet},
+++=======
+++>>>>>>> 6e3cd95234dc (x86/hpet: Use another crystalball to evaluate HPET usability)
+  	{ PCI_VENDOR_ID_BROADCOM, 0x4331,
+  	  PCI_CLASS_NETWORK_OTHER, PCI_ANY_ID, 0, apple_airport_reset},
+  	{}
+diff --cc arch/x86/kernel/hpet.c
+index b0acb22e5a46,882213df3713..000000000000
+--- a/arch/x86/kernel/hpet.c
++++ b/arch/x86/kernel/hpet.c
+@@@ -1,35 -1,46 +1,36 @@@
+ -// SPDX-License-Identifier: GPL-2.0-only
+ +#include <linux/clocksource.h>
+  #include <linux/clockchips.h>
+  #include <linux/interrupt.h>
+ +#include <linux/irq.h>
+  #include <linux/export.h>
+  #include <linux/delay.h>
+ +#include <linux/errno.h>
+ +#include <linux/i8253.h>
+ +#include <linux/slab.h>
+  #include <linux/hpet.h>
+ +#include <linux/init.h>
+  #include <linux/cpu.h>
+ -#include <linux/irq.h>
+ +#include <linux/pm.h>
+ +#include <linux/io.h>
+  
+ -#include <asm/irq_remapping.h>
+ +#include <asm/cpufeature.h>
+ +#include <asm/irqdomain.h>
+ +#include <asm/fixmap.h>
+  #include <asm/hpet.h>
+  #include <asm/time.h>
++ #include <asm/mwait.h>
+  
+ -#undef  pr_fmt
+ -#define pr_fmt(fmt) "hpet: " fmt
+ -
+ -enum hpet_mode {
+ -	HPET_MODE_UNUSED,
+ -	HPET_MODE_LEGACY,
+ -	HPET_MODE_CLOCKEVT,
+ -	HPET_MODE_DEVICE,
+ -};
+ -
+ -struct hpet_channel {
+ -	struct clock_event_device	evt;
+ -	unsigned int			num;
+ -	unsigned int			cpu;
+ -	unsigned int			irq;
+ -	unsigned int			in_use;
+ -	enum hpet_mode			mode;
+ -	unsigned int			boot_cfg;
+ -	char				name[10];
+ -};
+ +#define HPET_MASK			CLOCKSOURCE_MASK(32)
+  
+ -struct hpet_base {
+ -	unsigned int			nr_channels;
+ -	unsigned int			nr_clockevents;
+ -	unsigned int			boot_cfg;
+ -	struct hpet_channel		*channels;
+ -};
+ +/* FSEC = 10^-15
+ +   NSEC = 10^-9 */
+ +#define FSEC_PER_NSEC			1000000L
+  
+ -#define HPET_MASK			CLOCKSOURCE_MASK(32)
+ +#define HPET_DEV_USED_BIT		2
+ +#define HPET_DEV_USED			(1 << HPET_DEV_USED_BIT)
+ +#define HPET_DEV_VALID			0x8
+ +#define HPET_DEV_FSB_CAP		0x1000
+ +#define HPET_DEV_PERI_CAP		0x2000
+  
+  #define HPET_MIN_CYCLES			128
+  #define HPET_MIN_PROG_DELTA		(HPET_MIN_CYCLES + (HPET_MIN_CYCLES >> 1))
+@@@ -884,17 -913,86 +885,96 @@@ static int hpet_clocksource_register(vo
+  		now = rdtsc();
+  	} while ((now - start) < 200000UL);
+  
+ -	pr_warn("Counter not counting. HPET disabled\n");
+ -	return false;
+ +	if (t1 == hpet_readl(HPET_COUNTER)) {
+ +		printk(KERN_WARNING
+ +		       "HPET counter not counting. HPET disabled\n");
+ +		return -ENODEV;
+ +	}
+ +
+ +	clocksource_register_hz(&clocksource_hpet, (u32)hpet_freq);
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static u32 *hpet_boot_cfg;
+++=======
++ static bool __init mwait_pc10_supported(void)
++ {
++ 	unsigned int eax, ebx, ecx, mwait_substates;
++ 
++ 	if (boot_cpu_data.x86_vendor != X86_VENDOR_INTEL)
++ 		return false;
++ 
++ 	if (!cpu_feature_enabled(X86_FEATURE_MWAIT))
++ 		return false;
++ 
++ 	if (boot_cpu_data.cpuid_level < CPUID_MWAIT_LEAF)
++ 		return false;
++ 
++ 	cpuid(CPUID_MWAIT_LEAF, &eax, &ebx, &ecx, &mwait_substates);
++ 
++ 	return (ecx & CPUID5_ECX_EXTENSIONS_SUPPORTED) &&
++ 	       (ecx & CPUID5_ECX_INTERRUPT_BREAK) &&
++ 	       (mwait_substates & (0xF << 28));
++ }
++ 
++ /*
++  * Check whether the system supports PC10. If so force disable HPET as that
++  * stops counting in PC10. This check is overbroad as it does not take any
++  * of the following into account:
++  *
++  *	- ACPI tables
++  *	- Enablement of intel_idle
++  *	- Command line arguments which limit intel_idle C-state support
++  *
++  * That's perfectly fine. HPET is a piece of hardware designed by committee
++  * and the only reasons why it is still in use on modern systems is the
++  * fact that it is impossible to reliably query TSC and CPU frequency via
++  * CPUID or firmware.
++  *
++  * If HPET is functional it is useful for calibrating TSC, but this can be
++  * done via PMTIMER as well which seems to be the last remaining timer on
++  * X86/INTEL platforms that has not been completely wreckaged by feature
++  * creep.
++  *
++  * In theory HPET support should be removed altogether, but there are older
++  * systems out there which depend on it because TSC and APIC timer are
++  * dysfunctional in deeper C-states.
++  *
++  * It's only 20 years now that hardware people have been asked to provide
++  * reliable and discoverable facilities which can be used for timekeeping
++  * and per CPU timer interrupts.
++  *
++  * The probability that this problem is going to be solved in the
++  * forseeable future is close to zero, so the kernel has to be cluttered
++  * with heuristics to keep up with the ever growing amount of hardware and
++  * firmware trainwrecks. Hopefully some day hardware people will understand
++  * that the approach of "This can be fixed in software" is not sustainable.
++  * Hope dies last...
++  */
++ static bool __init hpet_is_pc10_damaged(void)
++ {
++ 	unsigned long long pcfg;
++ 
++ 	/* Check whether PC10 substates are supported */
++ 	if (!mwait_pc10_supported())
++ 		return false;
++ 
++ 	/* Check whether PC10 is enabled in PKG C-state limit */
++ 	rdmsrl(MSR_PKG_CST_CONFIG_CONTROL, pcfg);
++ 	if ((pcfg & 0xF) < 8)
++ 		return false;
++ 
++ 	if (hpet_force_user) {
++ 		pr_warn("HPET force enabled via command line, but dysfunctional in PC10.\n");
++ 		return false;
++ 	}
++ 
++ 	pr_info("HPET dysfunctional in PC10. Force disabled.\n");
++ 	boot_hpet_disable = true;
++ 	return true;
++ }
+++>>>>>>> 6e3cd95234dc (x86/hpet: Use another crystalball to evaluate HPET usability)
+  
+  /**
+   * hpet_enable - Try to setup the HPET timer. Returns 1 on success.
+@@@ -908,7 -1007,16 +988,10 @@@ int __init hpet_enable(void
+  	if (!is_hpet_capable())
+  		return 0;
+  
++ 	if (hpet_is_pc10_damaged())
++ 		return 0;
++ 
+  	hpet_set_mapping();
+ -	if (!hpet_virt_address)
+ -		return 0;
+ -
+ -	/* Validate that the config register is working */
+ -	if (!hpet_cfg_working())
+ -		goto out_nohpet;
+  
+  	/*
+  	 * Read the period and check for a sane value:
+* Unmerged path arch/x86/kernel/early-quirks.c
+* Unmerged path arch/x86/kernel/hpet.c
