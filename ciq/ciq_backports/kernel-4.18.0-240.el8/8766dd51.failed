@@ -1,0 +1,275 @@
+io-wq: split hashing and enqueueing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 8766dd516c535abf04491dca674d0ef6c95d814f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8766dd51.failed
+
+It's a preparation patch removing io_wq_enqueue_hashed(), which
+now should be done by io_wq_hash_work() + io_wq_enqueue().
+
+Also, set hash value for dependant works, and do it as late as possible,
+because req->file can be unavailable before. This hash will be ignored
+by io-wq.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 8766dd516c535abf04491dca674d0ef6c95d814f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io-wq.c
+#	fs/io-wq.h
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,dfe40bf80adc..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -451,36 -965,135 +451,93 @@@ static struct io_kiocb *io_get_deferred
+  	return NULL;
+  }
+  
+ -static struct io_kiocb *io_get_timeout_req(struct io_ring_ctx *ctx)
+ -{
+ -	struct io_kiocb *req;
+ -
+ -	req = list_first_entry_or_null(&ctx->timeout_list, struct io_kiocb, list);
+ -	if (req) {
+ -		if (req->flags & REQ_F_TIMEOUT_NOSEQ)
+ -			return NULL;
+ -		if (!__req_need_defer(req)) {
+ -			list_del_init(&req->list);
+ -			return req;
+ -		}
+ -	}
+ -
+ -	return NULL;
+ -}
+ -
+  static void __io_commit_cqring(struct io_ring_ctx *ctx)
+  {
+ -	struct io_rings *rings = ctx->rings;
+ +	struct io_cq_ring *ring = ctx->cq_ring;
+  
+ -	/* order cqe stores with ring update */
+ -	smp_store_release(&rings->cq.tail, ctx->cached_cq_tail);
+ -
+ -	if (wq_has_sleeper(&ctx->cq_wait)) {
+ -		wake_up_interruptible(&ctx->cq_wait);
+ -		kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
+ -	}
+ -}
+ +	if (ctx->cached_cq_tail != READ_ONCE(ring->r.tail)) {
+ +		/* order cqe stores with ring update */
+ +		smp_store_release(&ring->r.tail, ctx->cached_cq_tail);
+  
+ -static inline void io_req_work_grab_env(struct io_kiocb *req,
+ -					const struct io_op_def *def)
+ -{
+ -	if (!req->work.mm && def->needs_mm) {
+ -		mmgrab(current->mm);
+ -		req->work.mm = current->mm;
+ -	}
+ -	if (!req->work.creds)
+ -		req->work.creds = get_current_cred();
+ -	if (!req->work.fs && def->needs_fs) {
+ -		spin_lock(&current->fs->lock);
+ -		if (!current->fs->in_exec) {
+ -			req->work.fs = current->fs;
+ -			req->work.fs->users++;
+ -		} else {
+ -			req->work.flags |= IO_WQ_WORK_CANCEL;
+ +		if (wq_has_sleeper(&ctx->cq_wait)) {
+ +			wake_up_interruptible(&ctx->cq_wait);
+ +			kill_fasync(&ctx->cq_fasync, SIGIO, POLL_IN);
+  		}
+ -		spin_unlock(&current->fs->lock);
+  	}
+ -	if (!req->work.task_pid)
+ -		req->work.task_pid = task_pid_vnr(current);
+  }
+  
+ -static inline void io_req_work_drop_env(struct io_kiocb *req)
+++<<<<<<< HEAD
+ +static inline void io_queue_async_work(struct io_ring_ctx *ctx,
+ +				       struct io_kiocb *req)
+  {
+ -	if (req->work.mm) {
+ -		mmdrop(req->work.mm);
+ -		req->work.mm = NULL;
+ -	}
+ -	if (req->work.creds) {
+ -		put_cred(req->work.creds);
+ -		req->work.creds = NULL;
+ -	}
+ -	if (req->work.fs) {
+ -		struct fs_struct *fs = req->work.fs;
+ -
+ -		spin_lock(&req->work.fs->lock);
+ -		if (--fs->users)
+ -			fs = NULL;
+ -		spin_unlock(&req->work.fs->lock);
+ -		if (fs)
+ -			free_fs_struct(fs);
+ +	int rw = 0;
+ +
+ +	if (req->submit.sqe) {
+ +		switch (req->submit.sqe->opcode) {
+ +		case IORING_OP_WRITEV:
+ +		case IORING_OP_WRITE_FIXED:
+ +			rw = !(req->rw.ki_flags & IOCB_DIRECT);
+ +			break;
+ +		}
+  	}
+ -}
+  
+ +	queue_work(ctx->sqo_wq[rw], &req->work);
+++=======
++ static inline void io_prep_async_work(struct io_kiocb *req,
++ 				      struct io_kiocb **link)
++ {
++ 	const struct io_op_def *def = &io_op_defs[req->opcode];
++ 
++ 	if (req->flags & REQ_F_ISREG) {
++ 		if (def->hash_reg_file)
++ 			io_wq_hash_work(&req->work, file_inode(req->file));
++ 	} else {
++ 		if (def->unbound_nonreg_file)
++ 			req->work.flags |= IO_WQ_WORK_UNBOUND;
++ 	}
++ 
++ 	io_req_work_grab_env(req, def);
++ 
++ 	*link = io_prep_linked_timeout(req);
++ }
++ 
++ static inline void io_queue_async_work(struct io_kiocb *req)
++ {
++ 	struct io_ring_ctx *ctx = req->ctx;
++ 	struct io_kiocb *link;
++ 
++ 	io_prep_async_work(req, &link);
++ 
++ 	trace_io_uring_queue_async_work(ctx, io_wq_is_hashed(&req->work), req,
++ 					&req->work, req->flags);
++ 	io_wq_enqueue(ctx->io_wq, &req->work);
++ 
++ 	if (link)
++ 		io_queue_linked_timeout(link);
++ }
++ 
++ static void io_kill_timeout(struct io_kiocb *req)
++ {
++ 	int ret;
++ 
++ 	ret = hrtimer_try_to_cancel(&req->io->timeout.timer);
++ 	if (ret != -1) {
++ 		atomic_inc(&req->ctx->cq_timeouts);
++ 		list_del_init(&req->list);
++ 		io_cqring_fill_event(req, 0);
++ 		io_put_req(req);
++ 	}
++ }
++ 
++ static void io_kill_timeouts(struct io_ring_ctx *ctx)
++ {
++ 	struct io_kiocb *req, *tmp;
++ 
++ 	spin_lock_irq(&ctx->completion_lock);
++ 	list_for_each_entry_safe(req, tmp, &ctx->timeout_list, list)
++ 		io_kill_timeout(req);
++ 	spin_unlock_irq(&ctx->completion_lock);
+++>>>>>>> 8766dd516c53 (io-wq: split hashing and enqueueing)
+  }
+  
+  static void io_commit_cqring(struct io_ring_ctx *ctx)
+@@@ -677,14 -1531,73 +734,58 @@@ static void io_free_req(struct io_kioc
+  	 * dependencies to the next request. In case of failure, fail the rest
+  	 * of the chain.
+  	 */
+ -	if (req->flags & REQ_F_FAIL_LINK) {
+ -		io_fail_links(req);
+ -	} else if ((req->flags & (REQ_F_LINK_TIMEOUT | REQ_F_COMP_LOCKED)) ==
+ -			REQ_F_LINK_TIMEOUT) {
+ -		struct io_ring_ctx *ctx = req->ctx;
+ -		unsigned long flags;
+ -
+ -		/*
+ -		 * If this is a timeout link, we could be racing with the
+ -		 * timeout timer. Grab the completion lock for this case to
+ -		 * protect against that.
+ -		 */
+ -		spin_lock_irqsave(&ctx->completion_lock, flags);
+ -		io_req_link_next(req, nxt);
+ -		spin_unlock_irqrestore(&ctx->completion_lock, flags);
+ -	} else {
+ -		io_req_link_next(req, nxt);
+ +	if (req->flags & REQ_F_LINK) {
+ +		if (req->flags & REQ_F_FAIL_LINK)
+ +			io_fail_links(req);
+ +		else
+ +			io_req_link_next(req);
+  	}
+ -}
+ -
+ -static void io_free_req(struct io_kiocb *req)
+ -{
+ -	struct io_kiocb *nxt = NULL;
+  
+ -	io_req_find_next(req, &nxt);
+  	__io_free_req(req);
+++<<<<<<< HEAD
+++=======
++ 
++ 	if (nxt)
++ 		io_queue_async_work(nxt);
++ }
++ 
++ static void io_link_work_cb(struct io_wq_work **workptr)
++ {
++ 	struct io_wq_work *work = *workptr;
++ 	struct io_kiocb *link = work->data;
++ 
++ 	io_queue_linked_timeout(link);
++ 	io_wq_submit_work(workptr);
++ }
++ 
++ static void io_wq_assign_next(struct io_wq_work **workptr, struct io_kiocb *nxt)
++ {
++ 	struct io_kiocb *link;
++ 	const struct io_op_def *def = &io_op_defs[nxt->opcode];
++ 
++ 	if ((nxt->flags & REQ_F_ISREG) && def->hash_reg_file)
++ 		io_wq_hash_work(&nxt->work, file_inode(nxt->file));
++ 
++ 	*workptr = &nxt->work;
++ 	link = io_prep_linked_timeout(nxt);
++ 	if (link) {
++ 		nxt->work.func = io_link_work_cb;
++ 		nxt->work.data = link;
++ 	}
++ }
++ 
++ /*
++  * Drop reference to request, return next in chain (if there is one) if this
++  * was the last reference to this request.
++  */
++ __attribute__((nonnull))
++ static void io_put_req_find_next(struct io_kiocb *req, struct io_kiocb **nxtptr)
++ {
++ 	if (refcount_dec_and_test(&req->refs)) {
++ 		io_req_find_next(req, nxtptr);
++ 		__io_free_req(req);
++ 	}
+++>>>>>>> 8766dd516c53 (io-wq: split hashing and enqueueing)
+  }
+  
+  static void io_put_req(struct io_kiocb *req)
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io-wq.c
+* Unmerged path fs/io-wq.h
+* Unmerged path fs/io_uring.c
