@@ -1,0 +1,290 @@
+memcg: fix a crash in wb_workfn when a device disappears
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Theodore Ts'o <tytso@mit.edu>
+commit 68f23b89067fdf187763e75a56087550624fdbee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/68f23b89.failed
+
+Without memcg, there is a one-to-one mapping between the bdi and
+bdi_writeback structures.  In this world, things are fairly
+straightforward; the first thing bdi_unregister() does is to shutdown
+the bdi_writeback structure (or wb), and part of that writeback ensures
+that no other work queued against the wb, and that the wb is fully
+drained.
+
+With memcg, however, there is a one-to-many relationship between the bdi
+and bdi_writeback structures; that is, there are multiple wb objects
+which can all point to a single bdi.  There is a refcount which prevents
+the bdi object from being released (and hence, unregistered).  So in
+theory, the bdi_unregister() *should* only get called once its refcount
+goes to zero (bdi_put will drop the refcount, and when it is zero,
+release_bdi gets called, which calls bdi_unregister).
+
+Unfortunately, del_gendisk() in block/gen_hd.c never got the memo about
+the Brave New memcg World, and calls bdi_unregister directly.  It does
+this without informing the file system, or the memcg code, or anything
+else.  This causes the root wb associated with the bdi to be
+unregistered, but none of the memcg-specific wb's are shutdown.  So when
+one of these wb's are woken up to do delayed work, they try to
+dereference their wb->bdi->dev to fetch the device name, but
+unfortunately bdi->dev is now NULL, thanks to the bdi_unregister()
+called by del_gendisk().  As a result, *boom*.
+
+Fortunately, it looks like the rest of the writeback path is perfectly
+happy with bdi->dev and bdi->owner being NULL, so the simplest fix is to
+create a bdi_dev_name() function which can handle bdi->dev being NULL.
+This also allows us to bulletproof the writeback tracepoints to prevent
+them from dereferencing a NULL pointer and crashing the kernel if one is
+tracing with memcg's enabled, and an iSCSI device dies or a USB storage
+stick is pulled.
+
+The most common way of triggering this will be hotremoval of a device
+while writeback with memcg enabled is going on.  It was triggering
+several times a day in a heavily loaded production environment.
+
+Google Bug Id: 145475544
+
+Link: https://lore.kernel.org/r/20191227194829.150110-1-tytso@mit.edu
+Link: http://lkml.kernel.org/r/20191228005211.163952-1-tytso@mit.edu
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+	Cc: Chris Mason <clm@fb.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 68f23b89067fdf187763e75a56087550624fdbee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/trace/events/writeback.h
+diff --cc include/trace/events/writeback.h
+index 2984fcc630df,d94def25e4dc..000000000000
+--- a/include/trace/events/writeback.h
++++ b/include/trace/events/writeback.h
+@@@ -163,6 -176,132 +162,135 @@@ static inline unsigned int __trace_wbc_
+  #endif	/* CONFIG_CGROUP_WRITEBACK */
+  #endif	/* CREATE_TRACE_POINTS */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CGROUP_WRITEBACK
++ TRACE_EVENT(inode_foreign_history,
++ 
++ 	TP_PROTO(struct inode *inode, struct writeback_control *wbc,
++ 		 unsigned int history),
++ 
++ 	TP_ARGS(inode, wbc, history),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		ino)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(unsigned int,	history)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name, bdi_dev_name(inode_to_bdi(inode)), 32);
++ 		__entry->ino		= inode->i_ino;
++ 		__entry->cgroup_ino	= __trace_wbc_assign_cgroup(wbc);
++ 		__entry->history	= history;
++ 	),
++ 
++ 	TP_printk("bdi %s: ino=%lu cgroup_ino=%lu history=0x%x",
++ 		__entry->name,
++ 		(unsigned long)__entry->ino,
++ 		(unsigned long)__entry->cgroup_ino,
++ 		__entry->history
++ 	)
++ );
++ 
++ TRACE_EVENT(inode_switch_wbs,
++ 
++ 	TP_PROTO(struct inode *inode, struct bdi_writeback *old_wb,
++ 		 struct bdi_writeback *new_wb),
++ 
++ 	TP_ARGS(inode, old_wb, new_wb),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		ino)
++ 		__field(ino_t,		old_cgroup_ino)
++ 		__field(ino_t,		new_cgroup_ino)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name,	bdi_dev_name(old_wb->bdi), 32);
++ 		__entry->ino		= inode->i_ino;
++ 		__entry->old_cgroup_ino	= __trace_wb_assign_cgroup(old_wb);
++ 		__entry->new_cgroup_ino	= __trace_wb_assign_cgroup(new_wb);
++ 	),
++ 
++ 	TP_printk("bdi %s: ino=%lu old_cgroup_ino=%lu new_cgroup_ino=%lu",
++ 		__entry->name,
++ 		(unsigned long)__entry->ino,
++ 		(unsigned long)__entry->old_cgroup_ino,
++ 		(unsigned long)__entry->new_cgroup_ino
++ 	)
++ );
++ 
++ TRACE_EVENT(track_foreign_dirty,
++ 
++ 	TP_PROTO(struct page *page, struct bdi_writeback *wb),
++ 
++ 	TP_ARGS(page, wb),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(u64,		bdi_id)
++ 		__field(ino_t,		ino)
++ 		__field(unsigned int,	memcg_id)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(ino_t,		page_cgroup_ino)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		struct address_space *mapping = page_mapping(page);
++ 		struct inode *inode = mapping ? mapping->host : NULL;
++ 
++ 		strncpy(__entry->name,	bdi_dev_name(wb->bdi), 32);
++ 		__entry->bdi_id		= wb->bdi->id;
++ 		__entry->ino		= inode ? inode->i_ino : 0;
++ 		__entry->memcg_id	= wb->memcg_css->id;
++ 		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
++ 		__entry->page_cgroup_ino = cgroup_ino(page->mem_cgroup->css.cgroup);
++ 	),
++ 
++ 	TP_printk("bdi %s[%llu]: ino=%lu memcg_id=%u cgroup_ino=%lu page_cgroup_ino=%lu",
++ 		__entry->name,
++ 		__entry->bdi_id,
++ 		(unsigned long)__entry->ino,
++ 		__entry->memcg_id,
++ 		(unsigned long)__entry->cgroup_ino,
++ 		(unsigned long)__entry->page_cgroup_ino
++ 	)
++ );
++ 
++ TRACE_EVENT(flush_foreign,
++ 
++ 	TP_PROTO(struct bdi_writeback *wb, unsigned int frn_bdi_id,
++ 		 unsigned int frn_memcg_id),
++ 
++ 	TP_ARGS(wb, frn_bdi_id, frn_memcg_id),
++ 
++ 	TP_STRUCT__entry(
++ 		__array(char,		name, 32)
++ 		__field(ino_t,		cgroup_ino)
++ 		__field(unsigned int,	frn_bdi_id)
++ 		__field(unsigned int,	frn_memcg_id)
++ 	),
++ 
++ 	TP_fast_assign(
++ 		strncpy(__entry->name,	bdi_dev_name(wb->bdi), 32);
++ 		__entry->cgroup_ino	= __trace_wb_assign_cgroup(wb);
++ 		__entry->frn_bdi_id	= frn_bdi_id;
++ 		__entry->frn_memcg_id	= frn_memcg_id;
++ 	),
++ 
++ 	TP_printk("bdi %s: cgroup_ino=%lu frn_bdi_id=%u frn_memcg_id=%u",
++ 		__entry->name,
++ 		(unsigned long)__entry->cgroup_ino,
++ 		__entry->frn_bdi_id,
++ 		__entry->frn_memcg_id
++ 	)
++ );
++ #endif
++ 
+++>>>>>>> 68f23b89067f (memcg: fix a crash in wb_workfn when a device disappears)
+  DECLARE_EVENT_CLASS(writeback_write_inode_template,
+  
+  	TP_PROTO(struct inode *inode, struct writeback_control *wbc),
+@@@ -218,12 -357,10 +346,10 @@@ DECLARE_EVENT_CLASS(writeback_work_clas
+  		__field(int, range_cyclic)
+  		__field(int, for_background)
+  		__field(int, reason)
+ -		__field(ino_t, cgroup_ino)
+ +		__field(unsigned int, cgroup_ino)
+  	),
+  	TP_fast_assign(
+- 		strscpy_pad(__entry->name,
+- 			    wb->bdi->dev ? dev_name(wb->bdi->dev) :
+- 			    "(unknown)", 32);
++ 		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+  		__entry->nr_pages = work->nr_pages;
+  		__entry->sb_dev = work->sb ? work->sb->s_dev : 0;
+  		__entry->sync_mode = work->sync_mode;
+@@@ -273,15 -410,15 +399,15 @@@ DECLARE_EVENT_CLASS(writeback_class
+  	TP_ARGS(wb),
+  	TP_STRUCT__entry(
+  		__array(char, name, 32)
+ -		__field(ino_t, cgroup_ino)
+ +		__field(unsigned int, cgroup_ino)
+  	),
+  	TP_fast_assign(
+- 		strscpy_pad(__entry->name, dev_name(wb->bdi->dev), 32);
++ 		strscpy_pad(__entry->name, bdi_dev_name(wb->bdi), 32);
+  		__entry->cgroup_ino = __trace_wb_assign_cgroup(wb);
+  	),
+ -	TP_printk("bdi %s: cgroup_ino=%lu",
+ +	TP_printk("bdi %s: cgroup_ino=%u",
+  		  __entry->name,
+ -		  (unsigned long)__entry->cgroup_ino
+ +		  __entry->cgroup_ino
+  	)
+  );
+  #define DEFINE_WRITEBACK_EVENT(name) \
+diff --git a/fs/fs-writeback.c b/fs/fs-writeback.c
+index af6a75703694..20d5166afb9f 100644
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@ -1983,7 +1983,7 @@ void wb_workfn(struct work_struct *work)
+ 						struct bdi_writeback, dwork);
+ 	long pages_written;
+ 
+-	set_worker_desc("flush-%s", dev_name(wb->bdi->dev));
++	set_worker_desc("flush-%s", bdi_dev_name(wb->bdi));
+ 	current->flags |= PF_SWAPWRITE;
+ 
+ 	if (likely(!current_is_workqueue_rescuer() ||
+diff --git a/include/linux/backing-dev.h b/include/linux/backing-dev.h
+index 02650b1253a2..9f6ceb57a1c1 100644
+--- a/include/linux/backing-dev.h
++++ b/include/linux/backing-dev.h
+@@ -13,6 +13,7 @@
+ #include <linux/fs.h>
+ #include <linux/sched.h>
+ #include <linux/blkdev.h>
++#include <linux/device.h>
+ #include <linux/writeback.h>
+ #include <linux/blk-cgroup.h>
+ #include <linux/backing-dev-defs.h>
+@@ -501,4 +502,13 @@ static inline int bdi_rw_congested(struct backing_dev_info *bdi)
+ 				  (1 << WB_async_congested));
+ }
+ 
++extern const char *bdi_unknown_name;
++
++static inline const char *bdi_dev_name(struct backing_dev_info *bdi)
++{
++	if (!bdi || !bdi->dev)
++		return bdi_unknown_name;
++	return dev_name(bdi->dev);
++}
++
+ #endif	/* _LINUX_BACKING_DEV_H */
+* Unmerged path include/trace/events/writeback.h
+diff --git a/mm/backing-dev.c b/mm/backing-dev.c
+index 00277c8855c6..2152e85891d1 100644
+--- a/mm/backing-dev.c
++++ b/mm/backing-dev.c
+@@ -19,6 +19,7 @@ struct backing_dev_info noop_backing_dev_info = {
+ EXPORT_SYMBOL_GPL(noop_backing_dev_info);
+ 
+ static struct class *bdi_class;
++const char *bdi_unknown_name = "(unknown)";
+ 
+ /*
+  * bdi_lock protects updates to bdi_list. bdi_list has RCU reader side
