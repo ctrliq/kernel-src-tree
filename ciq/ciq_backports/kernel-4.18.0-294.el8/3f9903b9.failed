@@ -1,0 +1,164 @@
+mm: remove the memory isolate notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 3f9903b9ca5e981b5862d7b10086d0e8caa20298
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3f9903b9.failed
+
+Luckily, we have no users left, so we can get rid of it.  Cleanup
+set_migratetype_isolate() a little bit.
+
+Link: http://lkml.kernel.org/r/20191114131911.11783-2-david@redhat.com
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Acked-by: Michal Hocko <mhocko@suse.com>
+	Cc: "Rafael J. Wysocki" <rafael@kernel.org>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Oscar Salvador <osalvador@suse.de>
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+	Cc: Pingfan Liu <kernelfans@gmail.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3f9903b9ca5e981b5862d7b10086d0e8caa20298)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/page_isolation.c
+diff --cc mm/page_isolation.c
+index 4be9ddcdf5eb,21af88b718aa..000000000000
+--- a/mm/page_isolation.c
++++ b/mm/page_isolation.c
+@@@ -15,13 -15,10 +15,11 @@@
+  #define CREATE_TRACE_POINTS
+  #include <trace/events/page_isolation.h>
+  
+ -static int set_migratetype_isolate(struct page *page, int migratetype, int isol_flags)
+ +static int set_migratetype_isolate(struct page *page, int migratetype,
+ +				bool skip_hwpoisoned_pages)
+  {
+  	struct zone *zone;
+- 	unsigned long flags, pfn;
+- 	struct memory_isolate_notify arg;
+- 	int notifier_ret;
++ 	unsigned long flags;
+  	int ret = -EBUSY;
+  
+  	zone = page_zone(page);
+@@@ -60,17 -37,7 +38,21 @@@
+  	 * FIXME: Now, memory hotplug doesn't call shrink_slab() by itself.
+  	 * We just check MOVABLE pages.
+  	 */
+++<<<<<<< HEAD
+ +	if (!has_unmovable_pages(zone, page, arg.pages_found, migratetype,
+ +				 skip_hwpoisoned_pages))
+ +		ret = 0;
+ +
+ +	/*
+ +	 * immobile means "not-on-lru" pages. If immobile is larger than
+ +	 * removable-by-driver pages reported by notifier, we'll fail.
+ +	 */
+ +
+ +out:
+ +	if (!ret) {
+++=======
++ 	if (!has_unmovable_pages(zone, page, 0, migratetype, isol_flags)) {
+++>>>>>>> 3f9903b9ca5e (mm: remove the memory isolate notifier)
+  		unsigned long nr_pages;
+  		int mt = get_pageblock_migratetype(page);
+  
+diff --git a/drivers/base/memory.c b/drivers/base/memory.c
+index f8dd5243275a..897422bdcc98 100644
+--- a/drivers/base/memory.c
++++ b/drivers/base/memory.c
+@@ -96,20 +96,6 @@ void unregister_memory_notifier(struct notifier_block *nb)
+ }
+ EXPORT_SYMBOL(unregister_memory_notifier);
+ 
+-static ATOMIC_NOTIFIER_HEAD(memory_isolate_chain);
+-
+-int register_memory_isolate_notifier(struct notifier_block *nb)
+-{
+-	return atomic_notifier_chain_register(&memory_isolate_chain, nb);
+-}
+-EXPORT_SYMBOL(register_memory_isolate_notifier);
+-
+-void unregister_memory_isolate_notifier(struct notifier_block *nb)
+-{
+-	atomic_notifier_chain_unregister(&memory_isolate_chain, nb);
+-}
+-EXPORT_SYMBOL(unregister_memory_isolate_notifier);
+-
+ static void memory_block_release(struct device *dev)
+ {
+ 	struct memory_block *mem = to_memory_block(dev);
+@@ -199,11 +185,6 @@ int memory_notify(unsigned long val, void *v)
+ 	return blocking_notifier_call_chain(&memory_chain, val, v);
+ }
+ 
+-int memory_isolate_notify(unsigned long val, void *v)
+-{
+-	return atomic_notifier_call_chain(&memory_isolate_chain, val, v);
+-}
+-
+ /*
+  * The probe routines leave the pages uninitialized, just as the bootmem code
+  * does. Make sure we do not access them, but instead use only information from
+diff --git a/include/linux/memory.h b/include/linux/memory.h
+index 4c75dae8dd29..de6bccb28f07 100644
+--- a/include/linux/memory.h
++++ b/include/linux/memory.h
+@@ -55,19 +55,6 @@ struct memory_notify {
+ 	int status_change_nid;
+ };
+ 
+-/*
+- * During pageblock isolation, count the number of pages within the
+- * range [start_pfn, start_pfn + nr_pages) which are owned by code
+- * in the notifier chain.
+- */
+-#define MEM_ISOLATE_COUNT	(1<<0)
+-
+-struct memory_isolate_notify {
+-	unsigned long start_pfn;	/* Start of range to check */
+-	unsigned int nr_pages;		/* # pages in range to check */
+-	unsigned int pages_found;	/* # pages owned found by callbacks */
+-};
+-
+ struct notifier_block;
+ struct mem_section;
+ 
+@@ -94,27 +81,13 @@ static inline int memory_notify(unsigned long val, void *v)
+ {
+ 	return 0;
+ }
+-static inline int register_memory_isolate_notifier(struct notifier_block *nb)
+-{
+-	return 0;
+-}
+-static inline void unregister_memory_isolate_notifier(struct notifier_block *nb)
+-{
+-}
+-static inline int memory_isolate_notify(unsigned long val, void *v)
+-{
+-	return 0;
+-}
+ #else
+ extern int register_memory_notifier(struct notifier_block *nb);
+ extern void unregister_memory_notifier(struct notifier_block *nb);
+-extern int register_memory_isolate_notifier(struct notifier_block *nb);
+-extern void unregister_memory_isolate_notifier(struct notifier_block *nb);
+ int create_memory_block_devices(unsigned long start, unsigned long size);
+ void remove_memory_block_devices(unsigned long start, unsigned long size);
+ extern void memory_dev_init(void);
+ extern int memory_notify(unsigned long val, void *v);
+-extern int memory_isolate_notify(unsigned long val, void *v);
+ extern struct memory_block *find_memory_block(struct mem_section *);
+ typedef int (*walk_memory_blocks_func_t)(struct memory_block *, void *);
+ extern int walk_memory_blocks(unsigned long start, unsigned long size,
+* Unmerged path mm/page_isolation.c
