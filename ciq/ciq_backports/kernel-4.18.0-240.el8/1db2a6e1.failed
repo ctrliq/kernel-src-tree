@@ -1,0 +1,154 @@
+x86/intel: Initialize IA32_FEAT_CTL MSR at boot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] intel: Initialize IA32_FEAT_CTL MSR at boot (Vitaly Kuznetsov) [1813987]
+Rebuild_FUZZ: 95.56%
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 1db2a6e1e29ff994443a9eef7cf3d26104c777a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1db2a6e1.failed
+
+Opportunistically initialize IA32_FEAT_CTL to enable VMX when the MSR is
+left unlocked by BIOS.  Configuring feature control at boot time paves
+the way for similar enabling of other features, e.g. Software Guard
+Extensions (SGX).
+
+Temporarily leave equivalent KVM code in place in order to avoid
+introducing a regression on Centaur and Zhaoxin CPUs, e.g. removing
+KVM's code would leave the MSR unlocked on those CPUs and would break
+existing functionality if people are loading kvm_intel on Centaur and/or
+Zhaoxin.  Defer enablement of the boot-time configuration on Centaur and
+Zhaoxin to future patches to aid bisection.
+
+Note, Local Machine Check Exceptions (LMCE) are also supported by the
+kernel and enabled via feature control, but the kernel currently uses
+LMCE if and only if the feature is explicitly enabled by BIOS.  Keep
+the current behavior to avoid introducing bugs, future patches can opt
+in to opportunistic enabling if it's deemed desirable to do so.
+
+Always lock IA32_FEAT_CTL if it exists, even if the CPU doesn't support
+VMX, so that other existing and future kernel code that queries the MSR
+can assume it's locked.
+
+Start from a clean slate when constructing the value to write to
+IA32_FEAT_CTL, i.e. ignore whatever value BIOS left in the MSR so as not
+to enable random features or fault on the WRMSR.
+
+	Suggested-by: Borislav Petkov <bp@suse.de>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20191221044513.21680-5-sean.j.christopherson@intel.com
+(cherry picked from commit 1db2a6e1e29ff994443a9eef7cf3d26104c777a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/Makefile
+diff --cc arch/x86/kernel/cpu/Makefile
+index 52959e4ba5f4,57652c603929..000000000000
+--- a/arch/x86/kernel/cpu/Makefile
++++ b/arch/x86/kernel/cpu/Makefile
+@@@ -29,8 -29,13 +29,16 @@@ obj-y			+= umwait.
+  obj-$(CONFIG_PROC_FS)	+= proc.o
+  obj-$(CONFIG_X86_FEATURE_NAMES) += capflags.o powerflags.o
+  
+++<<<<<<< HEAD
+ +obj-$(CONFIG_CPU_SUP_INTEL)		+= intel.o intel_pconfig.o tsx.o
+++=======
++ obj-$(CONFIG_IA32_FEAT_CTL) += feat_ctl.o
++ ifdef CONFIG_CPU_SUP_INTEL
++ obj-y			+= intel.o intel_pconfig.o tsx.o
++ obj-$(CONFIG_PM)	+= intel_epb.o
++ endif
+++>>>>>>> 1db2a6e1e29f (x86/intel: Initialize IA32_FEAT_CTL MSR at boot)
+  obj-$(CONFIG_CPU_SUP_AMD)		+= amd.o
+ -obj-$(CONFIG_CPU_SUP_HYGON)		+= hygon.o
+  obj-$(CONFIG_CPU_SUP_CYRIX_32)		+= cyrix.o
+  obj-$(CONFIG_CPU_SUP_CENTAUR)		+= centaur.o
+  obj-$(CONFIG_CPU_SUP_TRANSMETA_32)	+= transmeta.o
+diff --git a/arch/x86/Kconfig.cpu b/arch/x86/Kconfig.cpu
+index 638411f22267..3dc966df2f8a 100644
+--- a/arch/x86/Kconfig.cpu
++++ b/arch/x86/Kconfig.cpu
+@@ -380,6 +380,10 @@ config X86_DEBUGCTLMSR
+ 	def_bool y
+ 	depends on !(MK6 || MWINCHIPC6 || MWINCHIP3D || MCYRIXIII || M586MMX || M586TSC || M586 || M486) && !UML
+ 
++config IA32_FEAT_CTL
++	def_bool y
++	depends on CPU_SUP_INTEL
++
+ menuconfig PROCESSOR_SELECT
+ 	bool "Supported processor vendors" if EXPERT
+ 	---help---
+* Unmerged path arch/x86/kernel/cpu/Makefile
+diff --git a/arch/x86/kernel/cpu/cpu.h b/arch/x86/kernel/cpu/cpu.h
+index 5b308eb19fa4..78ed1c784d24 100644
+--- a/arch/x86/kernel/cpu/cpu.h
++++ b/arch/x86/kernel/cpu/cpu.h
+@@ -82,4 +82,8 @@ extern void x86_spec_ctrl_setup_ap(void);
+ 
+ extern u64 x86_read_arch_cap_msr(void);
+ 
++#ifdef CONFIG_IA32_FEAT_CTL
++void init_ia32_feat_ctl(struct cpuinfo_x86 *c);
++#endif
++
+ #endif /* ARCH_X86_CPU_H */
+diff --git a/arch/x86/kernel/cpu/feat_ctl.c b/arch/x86/kernel/cpu/feat_ctl.c
+new file mode 100644
+index 000000000000..c4f8f767853b
+--- /dev/null
++++ b/arch/x86/kernel/cpu/feat_ctl.c
+@@ -0,0 +1,37 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <linux/tboot.h>
++
++#include <asm/cpufeature.h>
++#include <asm/msr-index.h>
++#include <asm/processor.h>
++
++void init_ia32_feat_ctl(struct cpuinfo_x86 *c)
++{
++	u64 msr;
++
++	if (rdmsrl_safe(MSR_IA32_FEAT_CTL, &msr))
++		return;
++
++	if (msr & FEAT_CTL_LOCKED)
++		return;
++
++	/*
++	 * Ignore whatever value BIOS left in the MSR to avoid enabling random
++	 * features or faulting on the WRMSR.
++	 */
++	msr = FEAT_CTL_LOCKED;
++
++	/*
++	 * Enable VMX if and only if the kernel may do VMXON at some point,
++	 * i.e. KVM is enabled, to avoid unnecessarily adding an attack vector
++	 * for the kernel, e.g. using VMX to hide malicious code.
++	 */
++	if (cpu_has(c, X86_FEATURE_VMX) && IS_ENABLED(CONFIG_KVM_INTEL)) {
++		msr |= FEAT_CTL_VMX_ENABLED_OUTSIDE_SMX;
++
++		if (tboot_enabled())
++			msr |= FEAT_CTL_VMX_ENABLED_INSIDE_SMX;
++	}
++
++	wrmsrl(MSR_IA32_FEAT_CTL, msr);
++}
+diff --git a/arch/x86/kernel/cpu/intel.c b/arch/x86/kernel/cpu/intel.c
+index 451d2825e294..a8946a179512 100644
+--- a/arch/x86/kernel/cpu/intel.c
++++ b/arch/x86/kernel/cpu/intel.c
+@@ -749,6 +749,8 @@ static void init_intel(struct cpuinfo_x86 *c)
+ 	/* Work around errata */
+ 	srat_detect_node(c);
+ 
++	init_ia32_feat_ctl(c);
++
+ 	if (cpu_has(c, X86_FEATURE_VMX))
+ 		detect_vmx_virtcap(c);
+ 
