@@ -1245,6 +1245,7 @@ static int vhost_net_open(struct inode *inode, struct file *f)
 		kfree(vqs);
 		kvfree(n);
 		kfree(queue);
+		return -ENOMEM;
 	}
 	n->vqs[VHOST_NET_VQ_TX].xdp = xdp;
 
