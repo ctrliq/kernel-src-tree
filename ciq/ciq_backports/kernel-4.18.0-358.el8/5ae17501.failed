@@ -1,0 +1,109 @@
+scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Ewan D. Milne <emilne@redhat.com>
+commit 5ae17501bc62a49b0b193dcce003f16375f16654
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5ae17501.failed
+
+The changes to issue the abort from the scmd->abort_work instead of the EH
+thread introduced a problem if eh_deadline is used.  If aborting the
+command(s) is successful, and there are never any scmds added to the
+shost->eh_cmd_q, there is no code path which will reset the ->last_reset
+value back to zero.
+
+The effect of this is that after a successful abort with no EH thread
+activity, a subsequent timeout, perhaps a long time later, might
+immediately be considered past a user-set eh_deadline time, and the host
+will be reset with no attempt at recovery.
+
+Fix this by resetting ->last_reset back to zero in scmd_eh_abort_handler()
+if it is determined that the EH thread will not run to do this.
+
+Thanks to Gopinath Marappan for investigating this problem.
+
+Link: https://lore.kernel.org/r/20211029194311.17504-2-emilne@redhat.com
+Fixes: e494f6a72839 ("[SCSI] improved eh timeout handler")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: Ewan D. Milne <emilne@redhat.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 5ae17501bc62a49b0b193dcce003f16375f16654)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/scsi_error.c
+#	include/scsi/scsi_cmnd.h
+diff --cc drivers/scsi/scsi_error.c
+index 8ee4e3426552,bdf782d9cb86..000000000000
+--- a/drivers/scsi/scsi_error.c
++++ b/drivers/scsi/scsi_error.c
+@@@ -151,7 -166,8 +168,12 @@@ scmd_eh_abort_handler(struct work_struc
+  	struct scsi_cmnd *scmd =
+  		container_of(work, struct scsi_cmnd, abort_work.work);
+  	struct scsi_device *sdev = scmd->device;
+++<<<<<<< HEAD
+ +	int rtn;
+++=======
++ 	enum scsi_disposition rtn;
++ 	unsigned long flags;
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  
+  	if (scsi_host_eh_past_deadline(sdev->host)) {
+  		SCSI_LOG_ERROR_RECOVERY(3,
+diff --cc include/scsi/scsi_cmnd.h
+index dc6e247f851d,29ac40cf1aae..000000000000
+--- a/include/scsi/scsi_cmnd.h
++++ b/include/scsi/scsi_cmnd.h
+@@@ -71,8 -67,13 +71,12 @@@ struct scsi_pointer 
+  struct scsi_cmnd {
+  	struct scsi_request req;
+  	struct scsi_device *device;
+++<<<<<<< HEAD
+ +	struct list_head list;  /* scsi_cmnd participates in queue lists */
+ +	struct list_head eh_entry; /* entry for the host eh_cmd_q */
+++=======
++ 	struct list_head eh_entry; /* entry for the host eh_abort_list/eh_cmd_q */
+++>>>>>>> 5ae17501bc62 (scsi: core: Avoid leaving shost->last_reset with stale value if EH does not run)
+  	struct delayed_work abort_work;
+  
+  	struct rcu_head rcu;
+diff --git a/drivers/scsi/hosts.c b/drivers/scsi/hosts.c
+index e72dbb5c7a47..c700089fd470 100644
+--- a/drivers/scsi/hosts.c
++++ b/drivers/scsi/hosts.c
+@@ -388,6 +388,7 @@ struct Scsi_Host *scsi_host_alloc(struct scsi_host_template *sht, int privsize)
+ 	shost->shost_state = SHOST_CREATED;
+ 	INIT_LIST_HEAD(&shost->__devices);
+ 	INIT_LIST_HEAD(&shost->__targets);
++	INIT_LIST_HEAD(&shost->eh_abort_list);
+ 	INIT_LIST_HEAD(&shost->eh_cmd_q);
+ 	INIT_LIST_HEAD(&shost->starved_list);
+ 	init_waitqueue_head(&shost->host_wait);
+* Unmerged path drivers/scsi/scsi_error.c
+diff --git a/drivers/scsi/scsi_lib.c b/drivers/scsi/scsi_lib.c
+index 8feb06bd6be7..5144f6307f6a 100644
+--- a/drivers/scsi/scsi_lib.c
++++ b/drivers/scsi/scsi_lib.c
+@@ -1159,6 +1159,7 @@ void scsi_init_command(struct scsi_device *dev, struct scsi_cmnd *cmd)
+ 	cmd->sense_buffer = buf;
+ 	cmd->prot_sdb = prot;
+ 	cmd->flags = flags;
++	INIT_LIST_HEAD(&cmd->eh_entry);
+ 	INIT_DELAYED_WORK(&cmd->abort_work, scmd_eh_abort_handler);
+ 	cmd->jiffies_at_alloc = jiffies_at_alloc;
+ 	cmd->retries = retries;
+* Unmerged path include/scsi/scsi_cmnd.h
+diff --git a/include/scsi/scsi_host.h b/include/scsi/scsi_host.h
+index 5084971af338..edbf6ba871b7 100644
+--- a/include/scsi/scsi_host.h
++++ b/include/scsi/scsi_host.h
+@@ -552,6 +552,7 @@ struct Scsi_Host {
+ 
+ 	struct mutex		scan_mutex;/* serialize scanning activity */
+ 
++	struct list_head	eh_abort_list;
+ 	struct list_head	eh_cmd_q;
+ 	struct task_struct    * ehandler;  /* Error recovery thread. */
+ 	struct completion     * eh_action; /* Wait for specific actions on the
