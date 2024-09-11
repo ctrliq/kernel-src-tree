@@ -1306,11 +1306,8 @@ static int __neigh_update(struct neighbour *neigh, const u8 *lladdr,
 		neigh->arp_queue_len_bytes = 0;
 	}
 out:
-	if (update_isrouter) {
-		neigh->flags = (flags & NEIGH_UPDATE_F_ISROUTER) ?
-			(neigh->flags | NTF_ROUTER) :
-			(neigh->flags & ~NTF_ROUTER);
-	}
+	if (update_isrouter)
+		neigh_update_is_router(neigh, flags, &notify);
 	write_unlock_bh(&neigh->lock);
 
 	if (notify)
