@@ -1,0 +1,527 @@
+sched/pelt: Add a new runnable average signal
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vincent Guittot <vincent.guittot@linaro.org>
+commit 9f68395333ad7f5bfe2f83473fed363d4229f11c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/9f683953.failed
+
+Now that runnable_load_avg has been removed, we can replace it by a new
+signal that will highlight the runnable pressure on a cfs_rq. This signal
+track the waiting time of tasks on rq and can help to better define the
+state of rqs.
+
+At now, only util_avg is used to define the state of a rq:
+  A rq with more that around 80% of utilization and more than 1 tasks is
+  considered as overloaded.
+
+But the util_avg signal of a rq can become temporaly low after that a task
+migrated onto another rq which can bias the classification of the rq.
+
+When tasks compete for the same rq, their runnable average signal will be
+higher than util_avg as it will include the waiting time and we can use
+this signal to better classify cfs_rqs.
+
+The new runnable_avg will track the runnable time of a task which simply
+adds the waiting time to the running time. The runnable _avg of cfs_rq
+will be the /Sum of se's runnable_avg and the runnable_avg of group entity
+will follow the one of the rq similarly to util_avg.
+
+	Signed-off-by: Vincent Guittot <vincent.guittot@linaro.org>
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: "Dietmar Eggemann <dietmar.eggemann@arm.com>"
+	Acked-by: Peter Zijlstra <a.p.zijlstra@chello.nl>
+	Cc: Juri Lelli <juri.lelli@redhat.com>
+	Cc: Valentin Schneider <valentin.schneider@arm.com>
+	Cc: Phil Auld <pauld@redhat.com>
+	Cc: Hillf Danton <hdanton@sina.com>
+Link: https://lore.kernel.org/r/20200224095223.13361-9-mgorman@techsingularity.net
+(cherry picked from commit 9f68395333ad7f5bfe2f83473fed363d4229f11c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sched.h
+#	kernel/sched/debug.c
+#	kernel/sched/fair.c
+#	kernel/sched/pelt.c
+#	kernel/sched/sched.h
+diff --cc include/linux/sched.h
+index 52eb9c8aa465,2e9199bf947b..000000000000
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@@ -330,8 -356,8 +330,13 @@@ struct util_est 
+  } __attribute__((__aligned__(sizeof(u64))));
+  
+  /*
+++<<<<<<< HEAD
+ + * The load_avg/util_avg accumulates an infinite geometric series
+ + * (see __update_load_avg() in kernel/sched/fair.c).
+++=======
++  * The load/runnable/util_avg accumulates an infinite geometric series
++  * (see __update_load_avg_cfs_rq() in kernel/sched/pelt.c).
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+   *
+   * [load_avg definition]
+   *
+@@@ -375,11 -403,11 +382,19 @@@
+  struct sched_avg {
+  	u64				last_update_time;
+  	u64				load_sum;
+++<<<<<<< HEAD
+ +	u64				runnable_load_sum;
+ +	u32				util_sum;
+ +	u32				period_contrib;
+ +	unsigned long			load_avg;
+ +	unsigned long			runnable_load_avg;
+++=======
++ 	u64				runnable_sum;
++ 	u32				util_sum;
++ 	u32				period_contrib;
++ 	unsigned long			load_avg;
++ 	unsigned long			runnable_avg;
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	unsigned long			util_avg;
+  	struct util_est			util_est;
+  } ____cacheline_aligned;
+diff --cc kernel/sched/debug.c
+index dd5a97b7c7d8,8331bc04aea2..000000000000
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@@ -409,7 -405,7 +409,11 @@@ static void print_cfs_group_stats(struc
+  #ifdef CONFIG_SMP
+  	P(se->avg.load_avg);
+  	P(se->avg.util_avg);
+++<<<<<<< HEAD
+ +	P(se->avg.runnable_load_avg);
+++=======
++ 	P(se->avg.runnable_avg);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  #endif
+  
+  #undef PN_SCHEDSTAT
+@@@ -527,11 -523,10 +531,16 @@@ void print_cfs_rq(struct seq_file *m, i
+  	SEQ_printf(m, "  .%-30s: %d\n", "nr_running", cfs_rq->nr_running);
+  	SEQ_printf(m, "  .%-30s: %ld\n", "load", cfs_rq->load.weight);
+  #ifdef CONFIG_SMP
+ +	SEQ_printf(m, "  .%-30s: %ld\n", "runnable_weight", cfs_rq->runnable_weight);
+  	SEQ_printf(m, "  .%-30s: %lu\n", "load_avg",
+  			cfs_rq->avg.load_avg);
+++<<<<<<< HEAD
+ +	SEQ_printf(m, "  .%-30s: %lu\n", "runnable_load_avg",
+ +			cfs_rq->avg.runnable_load_avg);
+++=======
++ 	SEQ_printf(m, "  .%-30s: %lu\n", "runnable_avg",
++ 			cfs_rq->avg.runnable_avg);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	SEQ_printf(m, "  .%-30s: %lu\n", "util_avg",
+  			cfs_rq->avg.util_avg);
+  	SEQ_printf(m, "  .%-30s: %u\n", "util_est_enqueued",
+@@@ -952,13 -945,12 +961,20 @@@ void proc_sched_show_task(struct task_s
+  		   "nr_involuntary_switches", (long long)p->nivcsw);
+  
+  	P(se.load.weight);
+ +	P(se.runnable_weight);
+  #ifdef CONFIG_SMP
+  	P(se.avg.load_sum);
+++<<<<<<< HEAD
+ +	P(se.avg.runnable_load_sum);
+ +	P(se.avg.util_sum);
+ +	P(se.avg.load_avg);
+ +	P(se.avg.runnable_load_avg);
+++=======
++ 	P(se.avg.runnable_sum);
++ 	P(se.avg.util_sum);
++ 	P(se.avg.load_avg);
++ 	P(se.avg.runnable_avg);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	P(se.avg.util_avg);
+  	P(se.avg.last_update_time);
+  	P(se.avg.util_est.ewma);
+diff --cc kernel/sched/fair.c
+index 96ed6a414530,49b36d62cc35..000000000000
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@@ -3270,11 -3217,11 +3272,17 @@@ void set_task_rq_fair(struct sched_enti
+   * _IFF_ we look at the pure running and runnable sums. Because they
+   * represent the very same entity, just at different points in the hierarchy.
+   *
+++<<<<<<< HEAD
+ + * Per the above update_tg_cfs_util() is trivial and simply copies the running
+ + * sum over (but still wrong, because the group entity and group rq do not have
+ + * their PELT windows aligned).
+++=======
++  * Per the above update_tg_cfs_util() and update_tg_cfs_runnable() are trivial
++  * and simply copies the running/runnable sum over (but still wrong, because
++  * the group entity and group rq do not have their PELT windows aligned).
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+   *
+ - * However, update_tg_cfs_load() is more complex. So we have:
+ + * However, update_tg_cfs_runnable() is more complex. So we have:
+   *
+   *   ge->avg.load_avg = ge->load.weight * ge->avg.runnable_avg		(2)
+   *
+@@@ -3356,10 -3303,36 +3364,39 @@@ update_tg_cfs_util(struct cfs_rq *cfs_r
+  
+  static inline void
+  update_tg_cfs_runnable(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+++<<<<<<< HEAD
+++=======
++ {
++ 	long delta = gcfs_rq->avg.runnable_avg - se->avg.runnable_avg;
++ 
++ 	/* Nothing to update */
++ 	if (!delta)
++ 		return;
++ 
++ 	/*
++ 	 * The relation between sum and avg is:
++ 	 *
++ 	 *   LOAD_AVG_MAX - 1024 + sa->period_contrib
++ 	 *
++ 	 * however, the PELT windows are not aligned between grq and gse.
++ 	 */
++ 
++ 	/* Set new sched_entity's runnable */
++ 	se->avg.runnable_avg = gcfs_rq->avg.runnable_avg;
++ 	se->avg.runnable_sum = se->avg.runnable_avg * LOAD_AVG_MAX;
++ 
++ 	/* Update parent cfs_rq runnable */
++ 	add_positive(&cfs_rq->avg.runnable_avg, delta);
++ 	cfs_rq->avg.runnable_sum = cfs_rq->avg.runnable_avg * LOAD_AVG_MAX;
++ }
++ 
++ static inline void
++ update_tg_cfs_load(struct cfs_rq *cfs_rq, struct sched_entity *se, struct cfs_rq *gcfs_rq)
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  {
+  	long delta_avg, running_sum, runnable_sum = gcfs_rq->prop_runnable_sum;
+ -	unsigned long load_avg;
+ -	u64 load_sum = 0;
+ +	unsigned long runnable_load_avg, load_avg;
+ +	u64 runnable_load_sum, load_sum = 0;
+  	s64 delta_sum;
+  
+  	if (!runnable_sum)
+@@@ -3449,6 -3408,7 +3486,10 @@@ static inline int propagate_entity_load
+  
+  	update_tg_cfs_util(cfs_rq, se, gcfs_rq);
+  	update_tg_cfs_runnable(cfs_rq, se, gcfs_rq);
+++<<<<<<< HEAD
+++=======
++ 	update_tg_cfs_load(cfs_rq, se, gcfs_rq);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  
+  	trace_pelt_cfs_tp(cfs_rq);
+  	trace_pelt_se_tp(se);
+@@@ -4053,8 -4038,8 +4114,9 @@@ enqueue_entity(struct cfs_rq *cfs_rq, s
+  	 *   - Add its new weight to cfs_rq->load.weight
+  	 */
+  	update_load_avg(cfs_rq, se, UPDATE_TG | DO_ATTACH);
++ 	se_update_runnable(se);
+  	update_cfs_group(se);
+ +	enqueue_runnable_load_avg(cfs_rq, se);
+  	account_entity_enqueue(cfs_rq, se);
+  
+  	if (flags & ENQUEUE_WAKEUP)
+@@@ -4137,13 -4116,13 +4199,22 @@@ dequeue_entity(struct cfs_rq *cfs_rq, s
+  	/*
+  	 * When dequeuing a sched_entity, we must:
+  	 *   - Update loads to have both entity and cfs_rq synced with now.
+++<<<<<<< HEAD
+ +	 *   - Substract its load from the cfs_rq->runnable_avg.
+ +	 *   - Substract its previous weight from cfs_rq->load.weight.
+++=======
++ 	 *   - Subtract its load from the cfs_rq->runnable_avg.
++ 	 *   - Subtract its previous weight from cfs_rq->load.weight.
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	 *   - For group entity, update its weight to reflect the new share
+  	 *     of its group cfs_rq.
+  	 */
+  	update_load_avg(cfs_rq, se, UPDATE_TG);
+++<<<<<<< HEAD
+ +	dequeue_runnable_load_avg(cfs_rq, se);
+++=======
++ 	se_update_runnable(se);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  
+  	update_stats_dequeue(cfs_rq, se, flags);
+  
+@@@ -5327,7 -5288,12 +5398,8 @@@ enqueue_task_fair(struct rq *rq, struc
+  	for_each_sched_entity(se) {
+  		cfs_rq = cfs_rq_of(se);
+  
+ -		/* end evaluation on encountering a throttled cfs_rq */
+ -		if (cfs_rq_throttled(cfs_rq))
+ -			goto enqueue_throttle;
+ -
+  		update_load_avg(cfs_rq, se, UPDATE_TG);
++ 		se_update_runnable(se);
+  		update_cfs_group(se);
+  
+  		cfs_rq->h_nr_running++;
+@@@ -5430,7 -5386,12 +5502,8 @@@ static void dequeue_task_fair(struct r
+  	for_each_sched_entity(se) {
+  		cfs_rq = cfs_rq_of(se);
+  
+ -		/* end evaluation on encountering a throttled cfs_rq */
+ -		if (cfs_rq_throttled(cfs_rq))
+ -			goto dequeue_throttle;
+ -
+  		update_load_avg(cfs_rq, se, UPDATE_TG);
++ 		se_update_runnable(se);
+  		update_cfs_group(se);
+  
+  		cfs_rq->h_nr_running--;
+@@@ -7589,19 -7605,19 +7667,26 @@@ static bool __update_blocked_others(str
+  
+  static inline bool cfs_rq_is_decayed(struct cfs_rq *cfs_rq)
+  {
+ -	if (cfs_rq->load.weight)
+ -		return false;
+ +        if (cfs_rq->load.weight)
+ +                return false;
+  
+ -	if (cfs_rq->avg.load_sum)
+ -		return false;
+ +        if (cfs_rq->avg.load_sum)
+ +                return false;
+  
+ -	if (cfs_rq->avg.util_sum)
+ -		return false;
+ +        if (cfs_rq->avg.util_sum)
+ +                return false;
+ +
+++<<<<<<< HEAD
+ +        if (cfs_rq->avg.runnable_load_sum)
+ +                return false;
+  
+ +        return true;
+++=======
++ 	if (cfs_rq->avg.runnable_sum)
++ 		return false;
++ 
++ 	return true;
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  }
+  
+  static bool __update_blocked_fair(struct rq *rq, bool *done)
+diff --cc kernel/sched/pelt.c
+index bd006b79b360,c40d57a2a248..000000000000
+--- a/kernel/sched/pelt.c
++++ b/kernel/sched/pelt.c
+@@@ -121,8 -121,8 +121,13 @@@ accumulate_sum(u64 delta, struct sched_
+  	 */
+  	if (periods) {
+  		sa->load_sum = decay_load(sa->load_sum, periods);
+++<<<<<<< HEAD
+ +		sa->runnable_load_sum =
+ +			decay_load(sa->runnable_load_sum, periods);
+++=======
++ 		sa->runnable_sum =
++ 			decay_load(sa->runnable_sum, periods);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  		sa->util_sum = decay_load((u64)(sa->util_sum), periods);
+  
+  		/*
+@@@ -149,7 -149,7 +154,11 @@@
+  	if (load)
+  		sa->load_sum += load * contrib;
+  	if (runnable)
+++<<<<<<< HEAD
+ +		sa->runnable_load_sum += runnable * contrib;
+++=======
++ 		sa->runnable_sum += runnable * contrib << SCHED_CAPACITY_SHIFT;
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	if (running)
+  		sa->util_sum += contrib << SCHED_CAPACITY_SHIFT;
+  
+@@@ -246,7 -246,7 +255,11 @@@ ___update_load_avg(struct sched_avg *sa
+  	 * Step 2: update *_avg.
+  	 */
+  	sa->load_avg = div_u64(load * sa->load_sum, divider);
+++<<<<<<< HEAD
+ +	sa->runnable_load_avg =	div_u64(runnable * sa->runnable_load_sum, divider);
+++=======
++ 	sa->runnable_avg = div_u64(sa->runnable_sum, divider);
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  	WRITE_ONCE(sa->util_avg, sa->util_sum / divider);
+  }
+  
+@@@ -254,33 -254,32 +267,50 @@@
+   * sched_entity:
+   *
+   *   task:
+++<<<<<<< HEAD
+ + *     se_runnable() == se_weight()
+ + *
+ + *   group: [ see update_cfs_group() ]
+ + *     se_weight()   = tg->weight * grq->load_avg / tg->load_avg
+ + *     se_runnable() = se_weight(se) * grq->runnable_load_avg / grq->load_avg
+++=======
++  *     se_weight()   = se->load.weight
++  *     se_runnable() = !!on_rq
++  *
++  *   group: [ see update_cfs_group() ]
++  *     se_weight()   = tg->weight * grq->load_avg / tg->load_avg
++  *     se_runnable() = grq->h_nr_running
++  *
++  *   runnable_sum = se_runnable() * runnable = grq->runnable_sum
++  *   runnable_avg = runnable_sum
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+ + *
+ + *   load_sum := runnable_sum
+ + *   load_avg = se_weight(se) * runnable_avg
+   *
+ - *   load_sum := runnable
+ - *   load_avg = se_weight(se) * load_sum
+ + *   runnable_load_sum := runnable_sum
+ + *   runnable_load_avg = se_runnable(se) * runnable_avg
+   *
+-  * XXX collapse load_sum and runnable_load_sum
+-  *
+   * cfq_rq:
+   *
++  *   runnable_sum = \Sum se->avg.runnable_sum
++  *   runnable_avg = \Sum se->avg.runnable_avg
++  *
+   *   load_sum = \Sum se_weight(se) * se->avg.load_sum
+   *   load_avg = \Sum se->avg.load_avg
+ + *
+ + *   runnable_load_sum = \Sum se_runnable(se) * se->avg.runnable_load_sum
+ + *   runnable_load_avg = \Sum se->avg.runable_load_avg
+   */
+  
+  int __update_load_avg_blocked_se(u64 now, struct sched_entity *se)
+  {
+  	if (___update_load_sum(now, &se->avg, 0, 0, 0)) {
+++<<<<<<< HEAD
+ +		___update_load_avg(&se->avg, se_weight(se), se_runnable(se));
+++=======
++ 		___update_load_avg(&se->avg, se_weight(se));
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  		trace_pelt_se_tp(se);
+  		return 1;
+  	}
+@@@ -290,10 -289,10 +320,14 @@@
+  
+  int __update_load_avg_se(u64 now, struct cfs_rq *cfs_rq, struct sched_entity *se)
+  {
+++<<<<<<< HEAD
+ +	if (___update_load_sum(now, &se->avg, !!se->on_rq, !!se->on_rq,
+++=======
++ 	if (___update_load_sum(now, &se->avg, !!se->on_rq, se_runnable(se),
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  				cfs_rq->curr == se)) {
+  
+ -		___update_load_avg(&se->avg, se_weight(se));
+ +		___update_load_avg(&se->avg, se_weight(se), se_runnable(se));
+  		cfs_se_util_change(&se->avg);
+  		trace_pelt_se_tp(se);
+  		return 1;
+@@@ -306,10 -305,10 +340,14 @@@ int __update_load_avg_cfs_rq(u64 now, s
+  {
+  	if (___update_load_sum(now, &cfs_rq->avg,
+  				scale_load_down(cfs_rq->load.weight),
+++<<<<<<< HEAD
+ +				scale_load_down(cfs_rq->runnable_weight),
+++=======
++ 				cfs_rq->h_nr_running,
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  				cfs_rq->curr != NULL)) {
+  
+ -		___update_load_avg(&cfs_rq->avg, 1);
+ +		___update_load_avg(&cfs_rq->avg, 1, 1);
+  		trace_pelt_cfs_tp(cfs_rq);
+  		return 1;
+  	}
+@@@ -322,9 -321,9 +360,13 @@@
+   *
+   *   util_sum = \Sum se->avg.util_sum but se->avg.util_sum is not tracked
+   *   util_sum = cpu_scale * load_sum
+ - *   runnable_sum = util_sum
+ + *   runnable_load_sum = load_sum
+   *
+++<<<<<<< HEAD
+ + *   load_avg and runnable_load_avg are not supported and meaningless.
+++=======
++  *   load_avg and runnable_avg are not supported and meaningless.
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+   *
+   */
+  
+@@@ -348,7 -347,9 +390,13 @@@ int update_rt_rq_load_avg(u64 now, stru
+   *
+   *   util_sum = \Sum se->avg.util_sum but se->avg.util_sum is not tracked
+   *   util_sum = cpu_scale * load_sum
+++<<<<<<< HEAD
+ + *   runnable_load_sum = load_sum
+++=======
++  *   runnable_sum = util_sum
++  *
++  *   load_avg and runnable_avg are not supported and meaningless.
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+   *
+   */
+  
+@@@ -373,7 -374,9 +421,13 @@@ int update_dl_rq_load_avg(u64 now, stru
+   *
+   *   util_sum = \Sum se->avg.util_sum but se->avg.util_sum is not tracked
+   *   util_sum = cpu_scale * load_sum
+++<<<<<<< HEAD
+ + *   runnable_load_sum = load_sum
+++=======
++  *   runnable_sum = util_sum
++  *
++  *   load_avg and runnable_avg are not supported and meaningless.
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+   *
+   */
+  
+diff --cc kernel/sched/sched.h
+index b002c124556d,2a0caf394dd4..000000000000
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@@ -700,8 -687,30 +700,35 @@@ struct dl_rq 
+  #ifdef CONFIG_FAIR_GROUP_SCHED
+  /* An entity is a task if it doesn't "own" a runqueue */
+  #define entity_is_task(se)	(!se->my_q)
+++<<<<<<< HEAD
+ +#else
+ +#define entity_is_task(se)	1
+++=======
++ 
++ static inline void se_update_runnable(struct sched_entity *se)
++ {
++ 	if (!entity_is_task(se))
++ 		se->runnable_weight = se->my_q->h_nr_running;
++ }
++ 
++ static inline long se_runnable(struct sched_entity *se)
++ {
++ 	if (entity_is_task(se))
++ 		return !!se->on_rq;
++ 	else
++ 		return se->runnable_weight;
++ }
++ 
++ #else
++ #define entity_is_task(se)	1
++ 
++ static inline void se_update_runnable(struct sched_entity *se) {}
++ 
++ static inline long se_runnable(struct sched_entity *se)
++ {
++ 	return !!se->on_rq;
++ }
+++>>>>>>> 9f68395333ad (sched/pelt: Add a new runnable average signal)
+  #endif
+  
+  #ifdef CONFIG_SMP
+* Unmerged path include/linux/sched.h
+* Unmerged path kernel/sched/debug.c
+* Unmerged path kernel/sched/fair.c
+* Unmerged path kernel/sched/pelt.c
+* Unmerged path kernel/sched/sched.h
