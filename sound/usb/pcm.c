@@ -1382,6 +1382,7 @@ static int setup_hw_info(struct snd_pcm_runtime *runtime, struct snd_usb_substre
 
 	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
 				  hw_rule_rate, subs,
+				  SNDRV_PCM_HW_PARAM_RATE,
 				  SNDRV_PCM_HW_PARAM_FORMAT,
 				  SNDRV_PCM_HW_PARAM_CHANNELS,
 				  param_period_time_if_needed,
@@ -1392,6 +1393,7 @@ static int setup_hw_info(struct snd_pcm_runtime *runtime, struct snd_usb_substre
 add_extra_rules:
 	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_CHANNELS,
 				  hw_rule_channels, subs,
+				  SNDRV_PCM_HW_PARAM_CHANNELS,
 				  SNDRV_PCM_HW_PARAM_FORMAT,
 				  SNDRV_PCM_HW_PARAM_RATE,
 				  param_period_time_if_needed,
@@ -1400,6 +1402,7 @@ add_extra_rules:
 		return err;
 	err = snd_pcm_hw_rule_add(runtime, 0, SNDRV_PCM_HW_PARAM_FORMAT,
 				  hw_rule_format, subs,
+				  SNDRV_PCM_HW_PARAM_FORMAT,
 				  SNDRV_PCM_HW_PARAM_RATE,
 				  SNDRV_PCM_HW_PARAM_CHANNELS,
 				  param_period_time_if_needed,
