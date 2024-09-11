@@ -1,0 +1,297 @@
+scsi: sd: sd_zbc: Fix ZBC disk initialization
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 6c5dee18756b4721ac8518c69b22ee8ac0c9c442
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6c5dee18.failed
+
+Make sure to call sd_zbc_init_disk() when the sdkp->zoned field is known,
+that is, once sd_read_block_characteristics() is executed in
+sd_revalidate_disk(), so that host-aware disks also get initialized.  To do
+so, move sd_zbc_init_disk() call in sd_zbc_revalidate_zones() and make sure
+to execute it for all zoned disks, including for host-aware disks used as
+regular disks as these disk zoned model may be changed back to BLK_ZONED_HA
+when partitions are deleted.
+
+Link: https://lore.kernel.org/r/20200915073347.832424-3-damien.lemoal@wdc.com
+Fixes: 5795eb443060 ("scsi: sd_zbc: emulate ZONE_APPEND commands")
+	Cc: <stable@vger.kernel.org> # v5.8+
+	Reported-by: Borislav Petkov <bp@alien8.de>
+	Tested-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 6c5dee18756b4721ac8518c69b22ee8ac0c9c442)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/sd.c
+#	drivers/scsi/sd.h
+#	drivers/scsi/sd_zbc.c
+diff --cc drivers/scsi/sd.c
+index c228a78d6b07,16503e22691e..000000000000
+--- a/drivers/scsi/sd.c
++++ b/drivers/scsi/sd.c
+@@@ -3360,8 -3391,54 +3360,59 @@@ static int sd_probe(struct device *dev
+  	get_device(dev);
+  	dev_set_drvdata(dev, sdkp);
+  
+++<<<<<<< HEAD
+ +	get_device(&sdkp->dev);	/* prevent release before async_schedule */
+ +	async_schedule_domain(sd_probe_async, sdkp, &scsi_sd_probe_domain);
+++=======
++ 	gd->major = sd_major((index & 0xf0) >> 4);
++ 	gd->first_minor = ((index & 0xf) << 4) | (index & 0xfff00);
++ 
++ 	gd->fops = &sd_fops;
++ 	gd->private_data = &sdkp->driver;
++ 	gd->queue = sdkp->device->request_queue;
++ 
++ 	/* defaults, until the device tells us otherwise */
++ 	sdp->sector_size = 512;
++ 	sdkp->capacity = 0;
++ 	sdkp->media_present = 1;
++ 	sdkp->write_prot = 0;
++ 	sdkp->cache_override = 0;
++ 	sdkp->WCE = 0;
++ 	sdkp->RCD = 0;
++ 	sdkp->ATO = 0;
++ 	sdkp->first_scan = 1;
++ 	sdkp->max_medium_access_timeouts = SD_MAX_MEDIUM_TIMEOUTS;
++ 
++ 	sd_revalidate_disk(gd);
++ 
++ 	gd->flags = GENHD_FL_EXT_DEVT;
++ 	if (sdp->removable) {
++ 		gd->flags |= GENHD_FL_REMOVABLE;
++ 		gd->events |= DISK_EVENT_MEDIA_CHANGE;
++ 		gd->event_flags = DISK_EVENT_FLAG_POLL | DISK_EVENT_FLAG_UEVENT;
++ 	}
++ 
++ 	blk_pm_runtime_init(sdp->request_queue, dev);
++ 	if (sdp->rpm_autosuspend) {
++ 		pm_runtime_set_autosuspend_delay(dev,
++ 			sdp->host->hostt->rpm_autosuspend_delay);
++ 	}
++ 	device_add_disk(dev, gd, NULL);
++ 	if (sdkp->capacity)
++ 		sd_dif_config_host(sdkp);
++ 
++ 	sd_revalidate_disk(gd);
++ 
++ 	if (sdkp->security) {
++ 		sdkp->opal_dev = init_opal_dev(sdp, &sd_sec_submit);
++ 		if (sdkp->opal_dev)
++ 			sd_printk(KERN_NOTICE, sdkp, "supports TCG Opal\n");
++ 	}
++ 
++ 	sd_printk(KERN_NOTICE, sdkp, "Attached SCSI %sdisk\n",
++ 		  sdp->removable ? "removable " : "");
++ 	scsi_autopm_put_device(sdp);
+++>>>>>>> 6c5dee18756b (scsi: sd: sd_zbc: Fix ZBC disk initialization)
+  
+  	return 0;
+  
+diff --cc drivers/scsi/sd.h
+index 7927b03d75f1,a3aad608bc38..000000000000
+--- a/drivers/scsi/sd.h
++++ b/drivers/scsi/sd.h
+@@@ -279,17 -215,23 +279,28 @@@ static inline int sd_is_zoned(struct sc
+  
+  #ifdef CONFIG_BLK_DEV_ZONED
+  
+++<<<<<<< HEAD
+ +extern int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buffer);
+ +extern void sd_zbc_print_zones(struct scsi_disk *sdkp);
+++=======
++ void sd_zbc_release_disk(struct scsi_disk *sdkp);
++ int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buffer);
++ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp);
+++>>>>>>> 6c5dee18756b (scsi: sd: sd_zbc: Fix ZBC disk initialization)
+  blk_status_t sd_zbc_setup_zone_mgmt_cmnd(struct scsi_cmnd *cmd,
+  					 unsigned char op, bool all);
+ -unsigned int sd_zbc_complete(struct scsi_cmnd *cmd, unsigned int good_bytes,
+ -			     struct scsi_sense_hdr *sshdr);
+ +extern void sd_zbc_complete(struct scsi_cmnd *cmd, unsigned int good_bytes,
+ +			    struct scsi_sense_hdr *sshdr);
+  int sd_zbc_report_zones(struct gendisk *disk, sector_t sector,
+  		unsigned int nr_zones, report_zones_cb cb, void *data);
+  
+ -blk_status_t sd_zbc_prepare_zone_append(struct scsi_cmnd *cmd, sector_t *lba,
+ -				        unsigned int nr_blocks);
+ -
+  #else /* CONFIG_BLK_DEV_ZONED */
+  
+++<<<<<<< HEAD
+++=======
++ static inline void sd_zbc_release_disk(struct scsi_disk *sdkp) {}
++ 
+++>>>>>>> 6c5dee18756b (scsi: sd: sd_zbc: Fix ZBC disk initialization)
+  static inline int sd_zbc_read_zones(struct scsi_disk *sdkp,
+  				    unsigned char *buf)
+  {
+diff --cc drivers/scsi/sd_zbc.c
+index ff6699ce73e5,cf07b7f93579..000000000000
+--- a/drivers/scsi/sd_zbc.c
++++ b/drivers/scsi/sd_zbc.c
+@@@ -405,6 -634,126 +405,129 @@@ static int sd_zbc_check_zones(struct sc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void sd_zbc_print_zones(struct scsi_disk *sdkp)
++ {
++ 	if (!sd_is_zoned(sdkp) || !sdkp->capacity)
++ 		return;
++ 
++ 	if (sdkp->capacity & (sdkp->zone_blocks - 1))
++ 		sd_printk(KERN_NOTICE, sdkp,
++ 			  "%u zones of %u logical blocks + 1 runt zone\n",
++ 			  sdkp->nr_zones - 1,
++ 			  sdkp->zone_blocks);
++ 	else
++ 		sd_printk(KERN_NOTICE, sdkp,
++ 			  "%u zones of %u logical blocks\n",
++ 			  sdkp->nr_zones,
++ 			  sdkp->zone_blocks);
++ }
++ 
++ static int sd_zbc_init_disk(struct scsi_disk *sdkp)
++ {
++ 	sdkp->zones_wp_offset = NULL;
++ 	spin_lock_init(&sdkp->zones_wp_offset_lock);
++ 	sdkp->rev_wp_offset = NULL;
++ 	mutex_init(&sdkp->rev_mutex);
++ 	INIT_WORK(&sdkp->zone_wp_offset_work, sd_zbc_update_wp_offset_workfn);
++ 	sdkp->zone_wp_update_buf = kzalloc(SD_BUF_SIZE, GFP_KERNEL);
++ 	if (!sdkp->zone_wp_update_buf)
++ 		return -ENOMEM;
++ 
++ 	return 0;
++ }
++ 
++ void sd_zbc_release_disk(struct scsi_disk *sdkp)
++ {
++ 	kvfree(sdkp->zones_wp_offset);
++ 	sdkp->zones_wp_offset = NULL;
++ 	kfree(sdkp->zone_wp_update_buf);
++ 	sdkp->zone_wp_update_buf = NULL;
++ }
++ 
++ static void sd_zbc_revalidate_zones_cb(struct gendisk *disk)
++ {
++ 	struct scsi_disk *sdkp = scsi_disk(disk);
++ 
++ 	swap(sdkp->zones_wp_offset, sdkp->rev_wp_offset);
++ }
++ 
++ int sd_zbc_revalidate_zones(struct scsi_disk *sdkp)
++ {
++ 	struct gendisk *disk = sdkp->disk;
++ 	struct request_queue *q = disk->queue;
++ 	u32 zone_blocks = sdkp->rev_zone_blocks;
++ 	unsigned int nr_zones = sdkp->rev_nr_zones;
++ 	u32 max_append;
++ 	int ret = 0;
++ 
++ 	/*
++ 	 * For all zoned disks, initialize zone append emulation data if not
++ 	 * already done. This is necessary also for host-aware disks used as
++ 	 * regular disks due to the presence of partitions as these partitions
++ 	 * may be deleted and the disk zoned model changed back from
++ 	 * BLK_ZONED_NONE to BLK_ZONED_HA.
++ 	 */
++ 	if (sd_is_zoned(sdkp) && !sdkp->zone_wp_update_buf) {
++ 		ret = sd_zbc_init_disk(sdkp);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	/*
++ 	 * There is nothing to do for regular disks, including host-aware disks
++ 	 * that have partitions.
++ 	 */
++ 	if (!blk_queue_is_zoned(q))
++ 		return 0;
++ 
++ 	/*
++ 	 * Make sure revalidate zones are serialized to ensure exclusive
++ 	 * updates of the scsi disk data.
++ 	 */
++ 	mutex_lock(&sdkp->rev_mutex);
++ 
++ 	if (sdkp->zone_blocks == zone_blocks &&
++ 	    sdkp->nr_zones == nr_zones &&
++ 	    disk->queue->nr_zones == nr_zones)
++ 		goto unlock;
++ 
++ 	sdkp->zone_blocks = zone_blocks;
++ 	sdkp->nr_zones = nr_zones;
++ 	sdkp->rev_wp_offset = kvcalloc(nr_zones, sizeof(u32), GFP_NOIO);
++ 	if (!sdkp->rev_wp_offset) {
++ 		ret = -ENOMEM;
++ 		goto unlock;
++ 	}
++ 
++ 	ret = blk_revalidate_disk_zones(disk, sd_zbc_revalidate_zones_cb);
++ 
++ 	kvfree(sdkp->rev_wp_offset);
++ 	sdkp->rev_wp_offset = NULL;
++ 
++ 	if (ret) {
++ 		sdkp->zone_blocks = 0;
++ 		sdkp->nr_zones = 0;
++ 		sdkp->capacity = 0;
++ 		goto unlock;
++ 	}
++ 
++ 	max_append = min_t(u32, logical_to_sectors(sdkp->device, zone_blocks),
++ 			   q->limits.max_segments << (PAGE_SHIFT - 9));
++ 	max_append = min_t(u32, max_append, queue_max_hw_sectors(q));
++ 
++ 	blk_queue_max_zone_append_sectors(q, max_append);
++ 
++ 	sd_zbc_print_zones(sdkp);
++ 
++ unlock:
++ 	mutex_unlock(&sdkp->rev_mutex);
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> 6c5dee18756b (scsi: sd: sd_zbc: Fix ZBC disk initialization)
+  int sd_zbc_read_zones(struct scsi_disk *sdkp, unsigned char *buf)
+  {
+  	struct gendisk *disk = sdkp->disk;
+@@@ -470,20 -803,3 +593,23 @@@ err
+  
+  	return ret;
+  }
+++<<<<<<< HEAD
+ +
+ +void sd_zbc_print_zones(struct scsi_disk *sdkp)
+ +{
+ +	if (!sd_is_zoned(sdkp) || !sdkp->capacity)
+ +		return;
+ +
+ +	if (sdkp->capacity & (sdkp->zone_blocks - 1))
+ +		sd_printk(KERN_NOTICE, sdkp,
+ +			  "%u zones of %u logical blocks + 1 runt zone\n",
+ +			  sdkp->nr_zones - 1,
+ +			  sdkp->zone_blocks);
+ +	else
+ +		sd_printk(KERN_NOTICE, sdkp,
+ +			  "%u zones of %u logical blocks\n",
+ +			  sdkp->nr_zones,
+ +			  sdkp->zone_blocks);
+ +}
+++=======
+++>>>>>>> 6c5dee18756b (scsi: sd: sd_zbc: Fix ZBC disk initialization)
+* Unmerged path drivers/scsi/sd.c
+* Unmerged path drivers/scsi/sd.h
+* Unmerged path drivers/scsi/sd_zbc.c
