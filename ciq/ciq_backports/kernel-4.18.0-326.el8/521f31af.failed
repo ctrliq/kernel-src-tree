@@ -1,0 +1,332 @@
+net/mlx5e: Allow RQ outside of channel context
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Aya Levin <ayal@nvidia.com>
+commit 521f31af004ade74963d551a719a36ca7df0ba70
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/521f31af.failed
+
+In order to be able to create an RQ outside of a channel context, remove
+rq->channel direct pointer. This requires adding a direct pointer to:
+ICOSQ and priv in order to support RQs that are part of mlx5e_channel.
+Use channel_stats from the corresponding CQ.
+
+	Signed-off-by: Aya Levin <ayal@nvidia.com>
+	Signed-off-by: Eran Ben Elisha <eranbe@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 521f31af004ade74963d551a719a36ca7df0ba70)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 50452578fb33,5c0015024f62..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -1788,10 -1786,10 +1790,15 @@@ int mlx5e_rq_set_handlers(struct mlx5e_
+  		rq->post_wqes = mlx5e_post_rx_mpwqes;
+  		rq->dealloc_wqe = mlx5e_dealloc_rx_mpwqe;
+  
+- 		rq->handle_rx_cqe = c->priv->profile->rx_handlers->handle_rx_cqe_mpwqe;
++ 		rq->handle_rx_cqe = priv->profile->rx_handlers->handle_rx_cqe_mpwqe;
+  #ifdef CONFIG_MLX5_EN_IPSEC
+++<<<<<<< HEAD
+ +		if (mlx5_fpga_is_ipsec_device(mdev)) {
+ +			netdev_err(c->netdev, "MPWQE RQ with Innova IPSec offload not supported\n");
+++=======
++ 		if (MLX5_IPSEC_DEV(mdev)) {
++ 			netdev_err(netdev, "MPWQE RQ with IPSec offload not supported\n");
+++>>>>>>> 521f31af004a (net/mlx5e: Allow RQ outside of channel context)
+  			return -EINVAL;
+  		}
+  #endif
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 52ab762ee7de..206a10bb7aea 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -593,7 +593,6 @@ struct mlx5e_rq {
+ 		u8             map_dir;   /* dma map direction */
+ 	} buff;
+ 
+-	struct mlx5e_channel  *channel;
+ 	struct device         *pdev;
+ 	struct net_device     *netdev;
+ 	struct mlx5e_rq_stats *stats;
+@@ -602,6 +601,8 @@ struct mlx5e_rq {
+ 	struct mlx5e_page_cache page_cache;
+ 	struct hwtstamp_config *tstamp;
+ 	struct mlx5_clock      *clock;
++	struct mlx5e_icosq    *icosq;
++	struct mlx5e_priv     *priv;
+ 
+ 	mlx5e_fp_handle_rx_cqe handle_rx_cqe;
+ 	mlx5e_fp_post_rx_wqes  post_wqes;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/health.c b/drivers/net/ethernet/mellanox/mlx5/core/en/health.c
+index e03e78a35df0..ed8aeb2f6c4f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/health.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/health.c
+@@ -206,21 +206,22 @@ int mlx5e_health_recover_channels(struct mlx5e_priv *priv)
+ 	return err;
+ }
+ 
+-int mlx5e_health_channel_eq_recover(struct mlx5_eq_comp *eq, struct mlx5e_channel *channel)
++int mlx5e_health_channel_eq_recover(struct net_device *dev, struct mlx5_eq_comp *eq,
++				    struct mlx5e_ch_stats *stats)
+ {
+ 	u32 eqe_count;
+ 
+-	netdev_err(channel->netdev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
++	netdev_err(dev, "EQ 0x%x: Cons = 0x%x, irqn = 0x%x\n",
+ 		   eq->core.eqn, eq->core.cons_index, eq->core.irqn);
+ 
+ 	eqe_count = mlx5_eq_poll_irq_disabled(eq);
+ 	if (!eqe_count)
+ 		return -EIO;
+ 
+-	netdev_err(channel->netdev, "Recovered %d eqes on EQ 0x%x\n",
++	netdev_err(dev, "Recovered %d eqes on EQ 0x%x\n",
+ 		   eqe_count, eq->core.eqn);
+ 
+-	channel->stats->eq_rearm++;
++	stats->eq_rearm++;
+ 	return 0;
+ }
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/health.h b/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+index b9aadddfd000..48d0232ce654 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+@@ -43,7 +43,8 @@ struct mlx5e_err_ctx {
+ };
+ 
+ int mlx5e_health_sq_to_ready(struct mlx5e_channel *channel, u32 sqn);
+-int mlx5e_health_channel_eq_recover(struct mlx5_eq_comp *eq, struct mlx5e_channel *channel);
++int mlx5e_health_channel_eq_recover(struct net_device *dev, struct mlx5_eq_comp *eq,
++				    struct mlx5e_ch_stats *stats);
+ int mlx5e_health_recover_channels(struct mlx5e_priv *priv);
+ int mlx5e_health_report(struct mlx5e_priv *priv,
+ 			struct devlink_health_reporter *reporter, char *err_str,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+index 32ed1067e6dc..c2bc148df71b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+@@ -146,17 +146,16 @@ static int mlx5e_rx_reporter_err_rq_cqe_recover(void *ctx)
+ 
+ static int mlx5e_rx_reporter_timeout_recover(void *ctx)
+ {
+-	struct mlx5e_icosq *icosq;
+ 	struct mlx5_eq_comp *eq;
+ 	struct mlx5e_rq *rq;
+ 	int err;
+ 
+ 	rq = ctx;
+-	icosq = &rq->channel->icosq;
+ 	eq = rq->cq.mcq.eq;
+-	err = mlx5e_health_channel_eq_recover(eq, rq->channel);
+-	if (err)
+-		clear_bit(MLX5E_SQ_STATE_ENABLED, &icosq->state);
++
++	err = mlx5e_health_channel_eq_recover(rq->netdev, eq, rq->cq.ch_stats);
++	if (err && rq->icosq)
++		clear_bit(MLX5E_SQ_STATE_ENABLED, &rq->icosq->state);
+ 
+ 	return err;
+ }
+@@ -233,21 +232,13 @@ static int mlx5e_reporter_icosq_diagnose(struct mlx5e_icosq *icosq, u8 hw_state,
+ static int mlx5e_rx_reporter_build_diagnose_output(struct mlx5e_rq *rq,
+ 						   struct devlink_fmsg *fmsg)
+ {
+-	struct mlx5e_priv *priv = rq->channel->priv;
+-	struct mlx5e_icosq *icosq;
+-	u8 icosq_hw_state;
+ 	u16 wqe_counter;
+ 	int wqes_sz;
+ 	u8 hw_state;
+ 	u16 wq_head;
+ 	int err;
+ 
+-	icosq = &rq->channel->icosq;
+-	err = mlx5e_query_rq_state(priv->mdev, rq->rqn, &hw_state);
+-	if (err)
+-		return err;
+-
+-	err = mlx5_core_query_sq_state(priv->mdev, icosq->sqn, &icosq_hw_state);
++	err = mlx5e_query_rq_state(rq->mdev, rq->rqn, &hw_state);
+ 	if (err)
+ 		return err;
+ 
+@@ -259,7 +250,7 @@ static int mlx5e_rx_reporter_build_diagnose_output(struct mlx5e_rq *rq,
+ 	if (err)
+ 		return err;
+ 
+-	err = devlink_fmsg_u32_pair_put(fmsg, "channel ix", rq->channel->ix);
++	err = devlink_fmsg_u32_pair_put(fmsg, "channel ix", rq->ix);
+ 	if (err)
+ 		return err;
+ 
+@@ -295,9 +286,18 @@ static int mlx5e_rx_reporter_build_diagnose_output(struct mlx5e_rq *rq,
+ 	if (err)
+ 		return err;
+ 
+-	err = mlx5e_reporter_icosq_diagnose(icosq, icosq_hw_state, fmsg);
+-	if (err)
+-		return err;
++	if (rq->icosq) {
++		struct mlx5e_icosq *icosq = rq->icosq;
++		u8 icosq_hw_state;
++
++		err = mlx5_core_query_sq_state(rq->mdev, icosq->sqn, &icosq_hw_state);
++		if (err)
++			return err;
++
++		err = mlx5e_reporter_icosq_diagnose(icosq, icosq_hw_state, fmsg);
++		if (err)
++			return err;
++	}
+ 
+ 	err = devlink_fmsg_obj_nest_end(fmsg);
+ 	if (err)
+@@ -557,25 +557,29 @@ static int mlx5e_rx_reporter_dump(struct devlink_health_reporter *reporter,
+ 
+ void mlx5e_reporter_rx_timeout(struct mlx5e_rq *rq)
+ {
+-	struct mlx5e_icosq *icosq = &rq->channel->icosq;
+-	struct mlx5e_priv *priv = rq->channel->priv;
++	char icosq_str[MLX5E_REPORTER_PER_Q_MAX_LEN] = {};
+ 	char err_str[MLX5E_REPORTER_PER_Q_MAX_LEN];
++	struct mlx5e_icosq *icosq = rq->icosq;
++	struct mlx5e_priv *priv = rq->priv;
+ 	struct mlx5e_err_ctx err_ctx = {};
+ 
+ 	err_ctx.ctx = rq;
+ 	err_ctx.recover = mlx5e_rx_reporter_timeout_recover;
+ 	err_ctx.dump = mlx5e_rx_reporter_dump_rq;
++
++	if (icosq)
++		snprintf(icosq_str, sizeof(icosq_str), "ICOSQ: 0x%x, ", icosq->sqn);
+ 	snprintf(err_str, sizeof(err_str),
+-		 "RX timeout on channel: %d, ICOSQ: 0x%x RQ: 0x%x, CQ: 0x%x",
+-		 icosq->channel->ix, icosq->sqn, rq->rqn, rq->cq.mcq.cqn);
++		 "RX timeout on channel: %d, %sRQ: 0x%x, CQ: 0x%x",
++		 rq->ix, icosq_str, rq->rqn, rq->cq.mcq.cqn);
+ 
+ 	mlx5e_health_report(priv, priv->rx_reporter, err_str, &err_ctx);
+ }
+ 
+ void mlx5e_reporter_rq_cqe_err(struct mlx5e_rq *rq)
+ {
+-	struct mlx5e_priv *priv = rq->channel->priv;
+ 	char err_str[MLX5E_REPORTER_PER_Q_MAX_LEN];
++	struct mlx5e_priv *priv = rq->priv;
+ 	struct mlx5e_err_ctx err_ctx = {};
+ 
+ 	err_ctx.ctx = rq;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+index 826584380216..b990774a2562 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/reporter_tx.c
+@@ -100,7 +100,7 @@ static int mlx5e_tx_reporter_timeout_recover(void *ctx)
+ 	sq = to_ctx->sq;
+ 	eq = sq->cq.mcq.eq;
+ 	priv = sq->channel->priv;
+-	err = mlx5e_health_channel_eq_recover(eq, sq->channel);
++	err = mlx5e_health_channel_eq_recover(sq->channel->netdev, eq, sq->channel->stats);
+ 	if (!err) {
+ 		to_ctx->status = 0; /* this sq recovered */
+ 		return err;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 9b033c64111f..01684812c023 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -413,9 +413,10 @@ static int mlx5e_alloc_rq(struct mlx5e_channel *c,
+ 	rq->wq_type = params->rq_wq_type;
+ 	rq->pdev    = c->pdev;
+ 	rq->netdev  = c->netdev;
++	rq->priv    = c->priv;
+ 	rq->tstamp  = c->tstamp;
+ 	rq->clock   = &mdev->clock;
+-	rq->channel = c;
++	rq->icosq   = &c->icosq;
+ 	rq->ix      = c->ix;
+ 	rq->mdev    = mdev;
+ 	rq->hw_mtu  = MLX5E_SW2HW_MTU(params, params->sw_mtu);
+@@ -618,7 +619,7 @@ static void mlx5e_free_rq(struct mlx5e_rq *rq)
+ 	int i;
+ 
+ 	old_prog = rcu_dereference_protected(rq->xdp_prog,
+-					     lockdep_is_held(&rq->channel->priv->state_lock));
++					     lockdep_is_held(&rq->priv->state_lock));
+ 	if (old_prog)
+ 		bpf_prog_put(old_prog);
+ 
+@@ -718,9 +719,7 @@ int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state, int next_state)
+ 
+ static int mlx5e_modify_rq_scatter_fcs(struct mlx5e_rq *rq, bool enable)
+ {
+-	struct mlx5e_channel *c = rq->channel;
+-	struct mlx5e_priv *priv = c->priv;
+-	struct mlx5_core_dev *mdev = priv->mdev;
++	struct mlx5_core_dev *mdev = rq->mdev;
+ 
+ 	void *in;
+ 	void *rqc;
+@@ -749,8 +748,7 @@ static int mlx5e_modify_rq_scatter_fcs(struct mlx5e_rq *rq, bool enable)
+ 
+ static int mlx5e_modify_rq_vsd(struct mlx5e_rq *rq, bool vsd)
+ {
+-	struct mlx5e_channel *c = rq->channel;
+-	struct mlx5_core_dev *mdev = c->mdev;
++	struct mlx5_core_dev *mdev = rq->mdev;
+ 	void *in;
+ 	void *rqc;
+ 	int inlen;
+@@ -784,7 +782,6 @@ static void mlx5e_destroy_rq(struct mlx5e_rq *rq)
+ int mlx5e_wait_for_min_rx_wqes(struct mlx5e_rq *rq, int wait_time)
+ {
+ 	unsigned long exp_time = jiffies + msecs_to_jiffies(wait_time);
+-	struct mlx5e_channel *c = rq->channel;
+ 
+ 	u16 min_wqes = mlx5_min_rx_wqes(rq->wq_type, mlx5e_rqwq_get_size(rq));
+ 
+@@ -795,8 +792,8 @@ int mlx5e_wait_for_min_rx_wqes(struct mlx5e_rq *rq, int wait_time)
+ 		msleep(20);
+ 	} while (time_before(jiffies, exp_time));
+ 
+-	netdev_warn(c->netdev, "Failed to get min RX wqes on Channel[%d] RQN[0x%x] wq cur_sz(%d) min_rx_wqes(%d)\n",
+-		    c->ix, rq->rqn, mlx5e_rqwq_get_cur_sz(rq), min_wqes);
++	netdev_warn(rq->netdev, "Failed to get min RX wqes on Channel[%d] RQN[0x%x] wq cur_sz(%d) min_rx_wqes(%d)\n",
++		    rq->ix, rq->rqn, mlx5e_rqwq_get_cur_sz(rq), min_wqes);
+ 
+ 	mlx5e_reporter_rx_timeout(rq);
+ 	return -ETIMEDOUT;
+@@ -911,7 +908,7 @@ int mlx5e_open_rq(struct mlx5e_channel *c, struct mlx5e_params *params,
+ void mlx5e_activate_rq(struct mlx5e_rq *rq)
+ {
+ 	set_bit(MLX5E_RQ_STATE_ENABLED, &rq->state);
+-	mlx5e_trigger_irq(&rq->channel->icosq);
++	mlx5e_trigger_irq(rq->icosq);
+ }
+ 
+ void mlx5e_deactivate_rq(struct mlx5e_rq *rq)
+@@ -923,7 +920,7 @@ void mlx5e_deactivate_rq(struct mlx5e_rq *rq)
+ void mlx5e_close_rq(struct mlx5e_rq *rq)
+ {
+ 	cancel_work_sync(&rq->dim.work);
+-	cancel_work_sync(&rq->channel->icosq.recover_work);
++	cancel_work_sync(&rq->icosq->recover_work);
+ 	cancel_work_sync(&rq->recover_work);
+ 	mlx5e_destroy_rq(rq);
+ 	mlx5e_free_rx_descs(rq);
+@@ -4415,7 +4412,7 @@ static void mlx5e_rq_replace_xdp_prog(struct mlx5e_rq *rq, struct bpf_prog *prog
+ 	struct bpf_prog *old_prog;
+ 
+ 	old_prog = rcu_replace_pointer(rq->xdp_prog, prog,
+-				       lockdep_is_held(&rq->channel->priv->state_lock));
++				       lockdep_is_held(&rq->priv->state_lock));
+ 	if (old_prog)
+ 		bpf_prog_put(old_prog);
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
