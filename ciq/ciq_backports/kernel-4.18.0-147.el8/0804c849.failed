@@ -1,0 +1,158 @@
+kvm/x86 : add coalesced pio support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Peng Hao <peng.hao2@zte.com.cn>
+commit 0804c849f1df0992d39a37c4fc259f7f8b16f385
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/0804c849.failed
+
+Coalesced pio is based on coalesced mmio and can be used for some port
+like rtc port, pci-host config port and so on.
+
+Specially in case of rtc as coalesced pio, some versions of windows guest
+access rtc frequently because of rtc as system tick. guest access rtc like
+this: write register index to 0x70, then write or read data from 0x71.
+writing 0x70 port is just as index and do nothing else. So we can use
+coalesced pio to handle this scene to reduce VM-EXIT time.
+
+When starting and closing a virtual machine, it will access pci-host config
+port frequently. So setting these port as coalesced pio can reduce startup
+and shutdown time.
+
+without my patch, get the vm-exit time of accessing rtc 0x70 and piix 0xcf8
+using perf tools: (guest OS : windows 7 64bit)
+IO Port Access  Samples Samples%  Time%  Min Time  Max Time  Avg time
+0x70:POUT        86     30.99%    74.59%   9us      29us    10.75us (+- 3.41%)
+0xcf8:POUT     1119     2.60%     2.12%   2.79us    56.83us 3.41us (+- 2.23%)
+
+with my patch
+IO Port Access  Samples Samples%  Time%   Min Time  Max Time   Avg time
+0x70:POUT       106    32.02%    29.47%    0us      10us     1.57us (+- 7.38%)
+0xcf8:POUT      1065    1.67%     0.28%   0.41us    65.44us   0.66us (+- 10.55%)
+
+	Signed-off-by: Peng Hao <peng.hao2@zte.com.cn>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 0804c849f1df0992d39a37c4fc259f7f8b16f385)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+diff --cc include/uapi/linux/kvm.h
+index a76a9addaa2b,97780a0277fe..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -964,7 -961,8 +970,12 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_ARM_INJECT_SERROR_ESR 158
+  #define KVM_CAP_MSR_PLATFORM_INFO 159
+  #define KVM_CAP_PPC_NESTED_HV 160
+++<<<<<<< HEAD
+ +#define KVM_CAP_ARM_VM_IPA_SIZE 165
+++=======
++ #define KVM_CAP_HYPERV_SEND_IPI 161
++ #define KVM_CAP_COALESCED_PIO 162
+++>>>>>>> 0804c849f1df (kvm/x86 : add coalesced pio support)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+diff --git a/Documentation/virtual/kvm/api.txt b/Documentation/virtual/kvm/api.txt
+index 1a4ea564dd66..f2d65692f77b 100644
+--- a/Documentation/virtual/kvm/api.txt
++++ b/Documentation/virtual/kvm/api.txt
+@@ -3702,27 +3702,31 @@ the definition of struct kvm_nested_state, see KVM_GET_NESTED_STATE.
+ 
+ 4.116 KVM_(UN)REGISTER_COALESCED_MMIO
+ 
+-Capability: KVM_CAP_COALESCED_MMIO
++Capability: KVM_CAP_COALESCED_MMIO (for coalesced mmio)
++	    KVM_CAP_COALESCED_PIO (for coalesced pio)
+ Architectures: all
+ Type: vm ioctl
+ Parameters: struct kvm_coalesced_mmio_zone
+ Returns: 0 on success, < 0 on error
+ 
+-Coalesced mmio is a performance optimization that defers hardware
++Coalesced I/O is a performance optimization that defers hardware
+ register write emulation so that userspace exits are avoided.  It is
+ typically used to reduce the overhead of emulating frequently accessed
+ hardware registers.
+ 
+-When a hardware register is configured for coalesced mmio, write accesses
++When a hardware register is configured for coalesced I/O, write accesses
+ do not exit to userspace and their value is recorded in a ring buffer
+ that is shared between kernel and userspace.
+ 
+-Coalesced mmio is used if one or more write accesses to a hardware
++Coalesced I/O is used if one or more write accesses to a hardware
+ register can be deferred until a read or a write to another hardware
+ register on the same device.  This last access will cause a vmexit and
+ userspace will process accesses from the ring buffer before emulating
+-it. That will avoid exiting to userspace on repeated writes to the
+-first register.
++it. That will avoid exiting to userspace on repeated writes.
++
++Coalesced pio is based on coalesced mmio. There is little difference
++between coalesced mmio and pio except that coalesced pio records accesses
++to I/O ports.
+ 
+ 5. The kvm_run structure
+ ------------------------
+* Unmerged path include/uapi/linux/kvm.h
+diff --git a/virt/kvm/coalesced_mmio.c b/virt/kvm/coalesced_mmio.c
+index 9e65feb6fa58..3710342cf6ad 100644
+--- a/virt/kvm/coalesced_mmio.c
++++ b/virt/kvm/coalesced_mmio.c
+@@ -83,6 +83,7 @@ static int coalesced_mmio_write(struct kvm_vcpu *vcpu,
+ 	ring->coalesced_mmio[ring->last].phys_addr = addr;
+ 	ring->coalesced_mmio[ring->last].len = len;
+ 	memcpy(ring->coalesced_mmio[ring->last].data, val, len);
++	ring->coalesced_mmio[ring->last].pio = dev->zone.pio;
+ 	smp_wmb();
+ 	ring->last = (ring->last + 1) % KVM_COALESCED_MMIO_MAX;
+ 	spin_unlock(&dev->kvm->ring_lock);
+@@ -140,6 +141,9 @@ int kvm_vm_ioctl_register_coalesced_mmio(struct kvm *kvm,
+ 	int ret;
+ 	struct kvm_coalesced_mmio_dev *dev;
+ 
++	if (zone->pio != 1 && zone->pio != 0)
++		return -EINVAL;
++
+ 	dev = kzalloc(sizeof(struct kvm_coalesced_mmio_dev), GFP_KERNEL);
+ 	if (!dev)
+ 		return -ENOMEM;
+@@ -149,8 +153,9 @@ int kvm_vm_ioctl_register_coalesced_mmio(struct kvm *kvm,
+ 	dev->zone = *zone;
+ 
+ 	mutex_lock(&kvm->slots_lock);
+-	ret = kvm_io_bus_register_dev(kvm, KVM_MMIO_BUS, zone->addr,
+-				      zone->size, &dev->dev);
++	ret = kvm_io_bus_register_dev(kvm,
++				zone->pio ? KVM_PIO_BUS : KVM_MMIO_BUS,
++				zone->addr, zone->size, &dev->dev);
+ 	if (ret < 0)
+ 		goto out_free_dev;
+ 	list_add_tail(&dev->list, &kvm->coalesced_zones);
+@@ -174,7 +179,8 @@ int kvm_vm_ioctl_unregister_coalesced_mmio(struct kvm *kvm,
+ 
+ 	list_for_each_entry_safe(dev, tmp, &kvm->coalesced_zones, list)
+ 		if (coalesced_mmio_in_range(dev, zone->addr, zone->size)) {
+-			kvm_io_bus_unregister_dev(kvm, KVM_MMIO_BUS, &dev->dev);
++			kvm_io_bus_unregister_dev(kvm,
++				zone->pio ? KVM_PIO_BUS : KVM_MMIO_BUS, &dev->dev);
+ 			kvm_iodevice_destructor(&dev->dev);
+ 		}
+ 
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 3b72efd56774..0e65cd8ba518 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -2947,6 +2947,8 @@ static long kvm_vm_ioctl_check_extension_generic(struct kvm *kvm, long arg)
+ #ifdef CONFIG_KVM_MMIO
+ 	case KVM_CAP_COALESCED_MMIO:
+ 		return KVM_COALESCED_MMIO_PAGE_OFFSET;
++	case KVM_CAP_COALESCED_PIO:
++		return 1;
+ #endif
+ #ifdef CONFIG_HAVE_KVM_IRQ_ROUTING
+ 	case KVM_CAP_IRQ_ROUTING:
