@@ -1,0 +1,209 @@
+net/sched: act_ct: Offload established connections to flow table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [net] sched: act_ct: Offload established connections to flow table (Ivan Vecera) [1824071]
+Rebuild_FUZZ: 96.77%
+commit-author Paul Blakey <paulb@mellanox.com>
+commit 64ff70b80fd403110b67dd9f7184a604fdb0da43
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/64ff70b8.failed
+
+Add a ft entry when connections enter an established state and delete
+the connections when they leave the established state.
+
+The flow table assumes ownership of the connection. In the following
+patch act_ct will lookup the ct state from the FT. In future patches,
+drivers will register for callbacks for ft add/del events and will be
+able to use the information to offload the connections.
+
+Note that connection aging is managed by the FT.
+
+	Signed-off-by: Paul Blakey <paulb@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 64ff70b80fd403110b67dd9f7184a604fdb0da43)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/act_ct.c
+diff --cc net/sched/act_ct.c
+index f67211a791ce,2ab38431252f..000000000000
+--- a/net/sched/act_ct.c
++++ b/net/sched/act_ct.c
+@@@ -30,6 -31,170 +30,173 @@@
+  #include <net/netfilter/nf_conntrack_zones.h>
+  #include <net/netfilter/nf_conntrack_helper.h>
+  #include <net/netfilter/ipv6/nf_defrag_ipv6.h>
+++<<<<<<< HEAD
+++=======
++ #include <uapi/linux/netfilter/nf_nat.h>
++ 
++ static struct workqueue_struct *act_ct_wq;
++ static struct rhashtable zones_ht;
++ static DEFINE_SPINLOCK(zones_lock);
++ 
++ struct tcf_ct_flow_table {
++ 	struct rhash_head node; /* In zones tables */
++ 
++ 	struct rcu_work rwork;
++ 	struct nf_flowtable nf_ft;
++ 	u16 zone;
++ 	u32 ref;
++ 
++ 	bool dying;
++ };
++ 
++ static const struct rhashtable_params zones_params = {
++ 	.head_offset = offsetof(struct tcf_ct_flow_table, node),
++ 	.key_offset = offsetof(struct tcf_ct_flow_table, zone),
++ 	.key_len = sizeof_field(struct tcf_ct_flow_table, zone),
++ 	.automatic_shrinking = true,
++ };
++ 
++ static struct nf_flowtable_type flowtable_ct = {
++ 	.owner		= THIS_MODULE,
++ };
++ 
++ static int tcf_ct_flow_table_get(struct tcf_ct_params *params)
++ {
++ 	struct tcf_ct_flow_table *ct_ft;
++ 	int err = -ENOMEM;
++ 
++ 	spin_lock_bh(&zones_lock);
++ 	ct_ft = rhashtable_lookup_fast(&zones_ht, &params->zone, zones_params);
++ 	if (ct_ft)
++ 		goto take_ref;
++ 
++ 	ct_ft = kzalloc(sizeof(*ct_ft), GFP_ATOMIC);
++ 	if (!ct_ft)
++ 		goto err_alloc;
++ 
++ 	ct_ft->zone = params->zone;
++ 	err = rhashtable_insert_fast(&zones_ht, &ct_ft->node, zones_params);
++ 	if (err)
++ 		goto err_insert;
++ 
++ 	ct_ft->nf_ft.type = &flowtable_ct;
++ 	err = nf_flow_table_init(&ct_ft->nf_ft);
++ 	if (err)
++ 		goto err_init;
++ 
++ 	__module_get(THIS_MODULE);
++ take_ref:
++ 	params->ct_ft = ct_ft;
++ 	ct_ft->ref++;
++ 	spin_unlock_bh(&zones_lock);
++ 
++ 	return 0;
++ 
++ err_init:
++ 	rhashtable_remove_fast(&zones_ht, &ct_ft->node, zones_params);
++ err_insert:
++ 	kfree(ct_ft);
++ err_alloc:
++ 	spin_unlock_bh(&zones_lock);
++ 	return err;
++ }
++ 
++ static void tcf_ct_flow_table_cleanup_work(struct work_struct *work)
++ {
++ 	struct tcf_ct_flow_table *ct_ft;
++ 
++ 	ct_ft = container_of(to_rcu_work(work), struct tcf_ct_flow_table,
++ 			     rwork);
++ 	nf_flow_table_free(&ct_ft->nf_ft);
++ 	kfree(ct_ft);
++ 
++ 	module_put(THIS_MODULE);
++ }
++ 
++ static void tcf_ct_flow_table_put(struct tcf_ct_params *params)
++ {
++ 	struct tcf_ct_flow_table *ct_ft = params->ct_ft;
++ 
++ 	spin_lock_bh(&zones_lock);
++ 	if (--params->ct_ft->ref == 0) {
++ 		rhashtable_remove_fast(&zones_ht, &ct_ft->node, zones_params);
++ 		INIT_RCU_WORK(&ct_ft->rwork, tcf_ct_flow_table_cleanup_work);
++ 		queue_rcu_work(act_ct_wq, &ct_ft->rwork);
++ 	}
++ 	spin_unlock_bh(&zones_lock);
++ }
++ 
++ static void tcf_ct_flow_table_add(struct tcf_ct_flow_table *ct_ft,
++ 				  struct nf_conn *ct,
++ 				  bool tcp)
++ {
++ 	struct flow_offload *entry;
++ 	int err;
++ 
++ 	if (test_and_set_bit(IPS_OFFLOAD_BIT, &ct->status))
++ 		return;
++ 
++ 	entry = flow_offload_alloc(ct);
++ 	if (!entry) {
++ 		WARN_ON_ONCE(1);
++ 		goto err_alloc;
++ 	}
++ 
++ 	if (tcp) {
++ 		ct->proto.tcp.seen[0].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
++ 		ct->proto.tcp.seen[1].flags |= IP_CT_TCP_FLAG_BE_LIBERAL;
++ 	}
++ 
++ 	err = flow_offload_add(&ct_ft->nf_ft, entry);
++ 	if (err)
++ 		goto err_add;
++ 
++ 	return;
++ 
++ err_add:
++ 	flow_offload_free(entry);
++ err_alloc:
++ 	clear_bit(IPS_OFFLOAD_BIT, &ct->status);
++ }
++ 
++ static void tcf_ct_flow_table_process_conn(struct tcf_ct_flow_table *ct_ft,
++ 					   struct nf_conn *ct,
++ 					   enum ip_conntrack_info ctinfo)
++ {
++ 	bool tcp = false;
++ 
++ 	if (ctinfo != IP_CT_ESTABLISHED && ctinfo != IP_CT_ESTABLISHED_REPLY)
++ 		return;
++ 
++ 	switch (nf_ct_protonum(ct)) {
++ 	case IPPROTO_TCP:
++ 		tcp = true;
++ 		if (ct->proto.tcp.state != TCP_CONNTRACK_ESTABLISHED)
++ 			return;
++ 		break;
++ 	case IPPROTO_UDP:
++ 		break;
++ 	default:
++ 		return;
++ 	}
++ 
++ 	if (nf_ct_ext_exist(ct, NF_CT_EXT_HELPER) ||
++ 	    ct->status & IPS_SEQ_ADJUST)
++ 		return;
++ 
++ 	tcf_ct_flow_table_add(ct_ft, ct, tcp);
++ }
++ 
++ static int tcf_ct_flow_tables_init(void)
++ {
++ 	return rhashtable_init(&zones_ht, &zones_params);
++ }
++ 
++ static void tcf_ct_flow_tables_uninit(void)
++ {
++ 	rhashtable_destroy(&zones_ht);
++ }
+++>>>>>>> 64ff70b80fd4 (net/sched: act_ct: Offload established connections to flow table)
+  
+  static struct tc_action_ops act_ct_ops;
+  static unsigned int ct_net_id;
+* Unmerged path net/sched/act_ct.c
