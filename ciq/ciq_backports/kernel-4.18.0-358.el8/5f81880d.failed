@@ -1,0 +1,293 @@
+sysfs, kobject: allow creating kobject belonging to arbitrary users
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Dmitry Torokhov <dmitry.torokhov@gmail.com>
+commit 5f81880d5204ee2388fd9a75bb850ccd526885b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5f81880d.failed
+
+Normally kobjects and their sysfs representation belong to global root,
+however it is not necessarily the case for objects in separate namespaces.
+For example, objects in separate network namespace logically belong to the
+container's root and not global root.
+
+This change lays groundwork for allowing network namespace objects
+ownership to be transferred to container's root user by defining
+get_ownership() callback in ktype structure and using it in sysfs code to
+retrieve desired uid/gid when creating sysfs objects for given kobject.
+
+Co-Developed-by: Tyler Hicks <tyhicks@canonical.com>
+	Signed-off-by: Dmitry Torokhov <dmitry.torokhov@gmail.com>
+	Signed-off-by: Tyler Hicks <tyhicks@canonical.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5f81880d5204ee2388fd9a75bb850ccd526885b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/sysfs/group.c
+#	include/linux/kobject.h
+diff --cc fs/sysfs/group.c
+index ac03a9da900f,c7a716c4acc9..000000000000
+--- a/fs/sysfs/group.c
++++ b/fs/sysfs/group.c
+@@@ -119,23 -122,15 +123,34 @@@ static int internal_create_group(struc
+  			kobj->name, grp->name ?: "");
+  		return -EINVAL;
+  	}
++ 	kobject_get_ownership(kobj, &uid, &gid);
+  	if (grp->name) {
+++<<<<<<< HEAD
+ +		if (update) {
+ +			kn = kernfs_find_and_get(kobj->sd, grp->name);
+ +			if (!kn) {
+ +				pr_warn("Can't update unknown attr grp name: %s/%s\n",
+ +					kobj->name, grp->name);
+ +				return -EINVAL;
+ +			}
+ +		} else {
+ +			kn = kernfs_create_dir(kobj->sd, grp->name,
+ +					       S_IRWXU | S_IRUGO | S_IXUGO,
+ +					       kobj);
+ +			if (IS_ERR(kn)) {
+ +				if (PTR_ERR(kn) == -EEXIST)
+ +					sysfs_warn_dup(kobj->sd, grp->name);
+ +				return PTR_ERR(kn);
+ +			}
+++=======
++ 		kn = kernfs_create_dir_ns(kobj->sd, grp->name,
++ 					  S_IRWXU | S_IRUGO | S_IXUGO,
++ 					  uid, gid, kobj, NULL);
++ 		if (IS_ERR(kn)) {
++ 			if (PTR_ERR(kn) == -EEXIST)
++ 				sysfs_warn_dup(kobj->sd, grp->name);
++ 			return PTR_ERR(kn);
+++>>>>>>> 5f81880d5204 (sysfs, kobject: allow creating kobject belonging to arbitrary users)
+  		}
+  	} else
+  		kn = kobj->sd;
+diff --cc include/linux/kobject.h
+index 8a39cecb5c34,b49ff230beba..000000000000
+--- a/include/linux/kobject.h
++++ b/include/linux/kobject.h
+@@@ -26,7 -26,7 +26,11 @@@
+  #include <linux/wait.h>
+  #include <linux/atomic.h>
+  #include <linux/workqueue.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/uidgid.h>
+++>>>>>>> 5f81880d5204 (sysfs, kobject: allow creating kobject belonging to arbitrary users)
+  
+  #define UEVENT_HELPER_PATH_LEN		256
+  #define UEVENT_NUM_ENVP			32	/* number of env pointers */
+@@@ -119,35 -115,17 +123,41 @@@ extern struct kobject * __must_check ko
+  extern void kobject_put(struct kobject *kobj);
+  
+  extern const void *kobject_namespace(struct kobject *kobj);
++ extern void kobject_get_ownership(struct kobject *kobj,
++ 				  kuid_t *uid, kgid_t *gid);
+  extern char *kobject_get_path(struct kobject *kobj, gfp_t flag);
+  
+ +/**
+ + * kobject_has_children - Returns whether a kobject has children.
+ + * @kobj: the object to test
+ + *
+ + * This will return whether a kobject has other kobjects as children.
+ + *
+ + * It does NOT account for the presence of attribute files, only sub
+ + * directories. It also assumes there is no concurrent addition or
+ + * removal of such children, and thus relies on external locking.
+ + */
+ +static inline bool kobject_has_children(struct kobject *kobj)
+ +{
+ +	WARN_ON_ONCE(kref_read(&kobj->kref) == 0);
+ +
+ +	return kobj->sd && kobj->sd->dir.subdirs;
+ +}
+ +
+  struct kobj_type {
+  	void (*release)(struct kobject *kobj);
+  	const struct sysfs_ops *sysfs_ops;
+ -	struct attribute **default_attrs;
+ +	struct attribute **default_attrs;	/* use default_groups instead */
+  	const struct kobj_ns_type_operations *(*child_ns_type)(struct kobject *kobj);
+  	const void *(*namespace)(struct kobject *kobj);
+++<<<<<<< HEAD
+ +	RH_KABI_USE(1, const struct attribute_group **default_groups)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+++=======
++ 	void (*get_ownership)(struct kobject *kobj, kuid_t *uid, kgid_t *gid);
+++>>>>>>> 5f81880d5204 (sysfs, kobject: allow creating kobject belonging to arbitrary users)
+  };
+  
+  struct kobj_uevent_env {
+diff --git a/fs/sysfs/dir.c b/fs/sysfs/dir.c
+index e39b884f0867..feeae8081c22 100644
+--- a/fs/sysfs/dir.c
++++ b/fs/sysfs/dir.c
+@@ -40,6 +40,8 @@ void sysfs_warn_dup(struct kernfs_node *parent, const char *name)
+ int sysfs_create_dir_ns(struct kobject *kobj, const void *ns)
+ {
+ 	struct kernfs_node *parent, *kn;
++	kuid_t uid;
++	kgid_t gid;
+ 
+ 	BUG_ON(!kobj);
+ 
+@@ -51,9 +53,10 @@ int sysfs_create_dir_ns(struct kobject *kobj, const void *ns)
+ 	if (!parent)
+ 		return -ENOENT;
+ 
++	kobject_get_ownership(kobj, &uid, &gid);
++
+ 	kn = kernfs_create_dir_ns(parent, kobject_name(kobj),
+-				  S_IRWXU | S_IRUGO | S_IXUGO,
+-				  GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
++				  S_IRWXU | S_IRUGO | S_IXUGO, uid, gid,
+ 				  kobj, ns);
+ 	if (IS_ERR(kn)) {
+ 		if (PTR_ERR(kn) == -EEXIST)
+diff --git a/fs/sysfs/file.c b/fs/sysfs/file.c
+index b7acae7a668a..0f402ef7a3d2 100644
+--- a/fs/sysfs/file.c
++++ b/fs/sysfs/file.c
+@@ -246,7 +246,7 @@ static const struct kernfs_ops sysfs_bin_kfops_mmap = {
+ 
+ int sysfs_add_file_mode_ns(struct kernfs_node *parent,
+ 			   const struct attribute *attr, bool is_bin,
+-			   umode_t mode, const void *ns)
++			   umode_t mode, kuid_t uid, kgid_t gid, const void *ns)
+ {
+ 	struct lock_class_key *key = NULL;
+ 	const struct kernfs_ops *ops;
+@@ -303,8 +303,8 @@ int sysfs_add_file_mode_ns(struct kernfs_node *parent,
+ 	if (!attr->ignore_lockdep)
+ 		key = attr->key ?: (struct lock_class_key *)&attr->skey;
+ #endif
+-	kn = __kernfs_create_file(parent, attr->name,
+-				  mode & 0777, GLOBAL_ROOT_UID, GLOBAL_ROOT_GID,
++
++	kn = __kernfs_create_file(parent, attr->name, mode & 0777, uid, gid,
+ 				  size, ops, (void *)attr, ns, key);
+ 	if (IS_ERR(kn)) {
+ 		if (PTR_ERR(kn) == -EEXIST)
+@@ -314,12 +314,6 @@ int sysfs_add_file_mode_ns(struct kernfs_node *parent,
+ 	return 0;
+ }
+ 
+-int sysfs_add_file(struct kernfs_node *parent, const struct attribute *attr,
+-		   bool is_bin)
+-{
+-	return sysfs_add_file_mode_ns(parent, attr, is_bin, attr->mode, NULL);
+-}
+-
+ /**
+  * sysfs_create_file_ns - create an attribute file for an object with custom ns
+  * @kobj: object we're creating for
+@@ -329,9 +323,14 @@ int sysfs_add_file(struct kernfs_node *parent, const struct attribute *attr,
+ int sysfs_create_file_ns(struct kobject *kobj, const struct attribute *attr,
+ 			 const void *ns)
+ {
++	kuid_t uid;
++	kgid_t gid;
++
+ 	BUG_ON(!kobj || !kobj->sd || !attr);
+ 
+-	return sysfs_add_file_mode_ns(kobj->sd, attr, false, attr->mode, ns);
++	kobject_get_ownership(kobj, &uid, &gid);
++	return sysfs_add_file_mode_ns(kobj->sd, attr, false, attr->mode,
++				      uid, gid, ns);
+ 
+ }
+ EXPORT_SYMBOL_GPL(sysfs_create_file_ns);
+@@ -360,6 +359,8 @@ int sysfs_add_file_to_group(struct kobject *kobj,
+ 		const struct attribute *attr, const char *group)
+ {
+ 	struct kernfs_node *parent;
++	kuid_t uid;
++	kgid_t gid;
+ 	int error;
+ 
+ 	if (group) {
+@@ -372,7 +373,9 @@ int sysfs_add_file_to_group(struct kobject *kobj,
+ 	if (!parent)
+ 		return -ENOENT;
+ 
+-	error = sysfs_add_file(parent, attr, false);
++	kobject_get_ownership(kobj, &uid, &gid);
++	error = sysfs_add_file_mode_ns(kobj->sd, attr, false,
++				       attr->mode, uid, gid, NULL);
+ 	kernfs_put(parent);
+ 
+ 	return error;
+@@ -532,9 +535,14 @@ EXPORT_SYMBOL_GPL(sysfs_remove_file_from_group);
+ int sysfs_create_bin_file(struct kobject *kobj,
+ 			  const struct bin_attribute *attr)
+ {
++	kuid_t uid;
++	kgid_t gid;
++
+ 	BUG_ON(!kobj || !kobj->sd || !attr);
+ 
+-	return sysfs_add_file(kobj->sd, &attr->attr, true);
++	kobject_get_ownership(kobj, &uid, &gid);
++	return sysfs_add_file_mode_ns(kobj->sd, &attr->attr, true,
++				      attr->attr.mode, uid, gid, NULL);
+ }
+ EXPORT_SYMBOL_GPL(sysfs_create_bin_file);
+ 
+* Unmerged path fs/sysfs/group.c
+diff --git a/fs/sysfs/sysfs.h b/fs/sysfs/sysfs.h
+index d098e015fcc9..0050cc0c0236 100644
+--- a/fs/sysfs/sysfs.h
++++ b/fs/sysfs/sysfs.h
+@@ -27,11 +27,10 @@ void sysfs_warn_dup(struct kernfs_node *parent, const char *name);
+ /*
+  * file.c
+  */
+-int sysfs_add_file(struct kernfs_node *parent,
+-		   const struct attribute *attr, bool is_bin);
+ int sysfs_add_file_mode_ns(struct kernfs_node *parent,
+ 			   const struct attribute *attr, bool is_bin,
+-			   umode_t amode, const void *ns);
++			   umode_t amode, kuid_t uid, kgid_t gid,
++			   const void *ns);
+ 
+ /*
+  * symlink.c
+* Unmerged path include/linux/kobject.h
+diff --git a/lib/kobject.c b/lib/kobject.c
+index 5ca95dd2bc39..15af701724db 100644
+--- a/lib/kobject.c
++++ b/lib/kobject.c
+@@ -35,6 +35,25 @@ const void *kobject_namespace(struct kobject *kobj)
+ 	return kobj->ktype->namespace(kobj);
+ }
+ 
++/**
++ * kobject_get_ownership - get sysfs ownership data for @kobj
++ * @kobj: kobject in question
++ * @uid: kernel user ID for sysfs objects
++ * @gid: kernel group ID for sysfs objects
++ *
++ * Returns initial uid/gid pair that should be used when creating sysfs
++ * representation of given kobject. Normally used to adjust ownership of
++ * objects in a container.
++ */
++void kobject_get_ownership(struct kobject *kobj, kuid_t *uid, kgid_t *gid)
++{
++	*uid = GLOBAL_ROOT_UID;
++	*gid = GLOBAL_ROOT_GID;
++
++	if (kobj->ktype->get_ownership)
++		kobj->ktype->get_ownership(kobj, uid, gid);
++}
++
+ /*
+  * populate_dir - populate directory with attributes.
+  * @kobj: object we're working on.
