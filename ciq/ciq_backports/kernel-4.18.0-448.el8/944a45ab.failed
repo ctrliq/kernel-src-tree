@@ -1,0 +1,277 @@
+arm64: kdump: Reimplement crashkernel=X
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Chen Zhou <chenzhou10@huawei.com>
+commit 944a45abfabc171fd121315ff0d5e62b11cb5d6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/944a45ab.failed
+
+There are following issues in arm64 kdump:
+1. We use crashkernel=X to reserve crashkernel in DMA zone, which
+will fail when there is not enough low memory.
+2. If reserving crashkernel above DMA zone, in this case, crash dump
+kernel will fail to boot because there is no low memory available
+for allocation.
+
+To solve these issues, introduce crashkernel=X,[high,low].
+The "crashkernel=X,high" is used to select a region above DMA zone, and
+the "crashkernel=Y,low" is used to allocate specified size low memory.
+
+	Signed-off-by: Chen Zhou <chenzhou10@huawei.com>
+Co-developed-by: Zhen Lei <thunder.leizhen@huawei.com>
+	Signed-off-by: Zhen Lei <thunder.leizhen@huawei.com>
+Link: https://lore.kernel.org/r/20220506114402.365-4-thunder.leizhen@huawei.com
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 944a45abfabc171fd121315ff0d5e62b11cb5d6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/mm/init.c
+diff --cc arch/arm64/mm/init.c
+index 15e229211fdb,18ba66c90991..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -61,27 -55,67 +61,56 @@@
+  s64 memstart_addr __ro_after_init = -1;
+  EXPORT_SYMBOL(memstart_addr);
+  
+ -/*
+ - * If the corresponding config options are enabled, we create both ZONE_DMA
+ - * and ZONE_DMA32. By default ZONE_DMA covers the 32-bit addressable memory
+ - * unless restricted on specific platforms (e.g. 30-bit on Raspberry Pi 4).
+ - * In such case, ZONE_DMA32 covers the rest of the 32-bit addressable memory,
+ - * otherwise it is empty.
+ - *
+ - * Memory reservation for crash kernel either done early or deferred
+ - * depending on DMA memory zones configs (ZONE_DMA) --
+ - *
+ - * In absence of ZONE_DMA configs arm64_dma_phys_limit initialized
+ - * here instead of max_zone_phys().  This lets early reservation of
+ - * crash kernel memory which has a dependency on arm64_dma_phys_limit.
+ - * Reserving memory early for crash kernel allows linear creation of block
+ - * mappings (greater than page-granularity) for all the memory bank rangs.
+ - * In this scheme a comparatively quicker boot is observed.
+ - *
+ - * If ZONE_DMA configs are defined, crash kernel memory reservation
+ - * is delayed until DMA zone memory range size initialization performed in
+ - * zone_sizes_init().  The defer is necessary to steer clear of DMA zone
+ - * memory range to avoid overlap allocation.  So crash kernel memory boundaries
+ - * are not known when mapping all bank memory ranges, which otherwise means
+ - * not possible to exclude crash kernel range from creating block mappings
+ - * so page-granularity mappings are created for the entire memory range.
+ - * Hence a slightly slower boot is observed.
+ - *
+ - * Note: Page-granularity mappings are necessary for crash kernel memory
+ - * range for shrinking its size via /sys/kernel/kexec_crash_size interface.
+ - */
+ -#if IS_ENABLED(CONFIG_ZONE_DMA) || IS_ENABLED(CONFIG_ZONE_DMA32)
+ -phys_addr_t __ro_after_init arm64_dma_phys_limit;
+ -#else
+ -phys_addr_t __ro_after_init arm64_dma_phys_limit = PHYS_MASK + 1;
+ +phys_addr_t arm64_dma32_phys_limit __ro_after_init;
+ +
+ +#ifdef CONFIG_BLK_DEV_INITRD
+ +static int __init early_initrd(char *p)
+ +{
+ +	unsigned long start, size;
+ +	char *endp;
+ +
+ +	start = memparse(p, &endp);
+ +	if (*endp == ',') {
+ +		size = memparse(endp + 1, NULL);
+ +
+ +		initrd_start = start;
+ +		initrd_end = start + size;
+ +	}
+ +	return 0;
+ +}
+ +early_param("initrd", early_initrd);
+  #endif
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_KEXEC_CORE
+++=======
++ /* Current arm64 boot protocol requires 2MB alignment */
++ #define CRASH_ALIGN			SZ_2M
++ 
++ #define CRASH_ADDR_LOW_MAX		arm64_dma_phys_limit
++ #define CRASH_ADDR_HIGH_MAX		(PHYS_MASK + 1)
++ 
++ static int __init reserve_crashkernel_low(unsigned long long low_size)
++ {
++ 	unsigned long long low_base;
++ 
++ 	low_base = memblock_phys_alloc_range(low_size, CRASH_ALIGN, 0, CRASH_ADDR_LOW_MAX);
++ 	if (!low_base) {
++ 		pr_err("cannot allocate crashkernel low memory (size:0x%llx).\n", low_size);
++ 		return -ENOMEM;
++ 	}
++ 
++ 	pr_info("crashkernel low memory reserved: 0x%08llx - 0x%08llx (%lld MB)\n",
++ 		low_base, low_base + low_size, low_size >> 20);
++ 
++ 	crashk_low_res.start = low_base;
++ 	crashk_low_res.end   = low_base + low_size - 1;
++ 	insert_resource(&iomem_resource, &crashk_low_res);
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> 944a45abfabc (arm64: kdump: Reimplement crashkernel=X)
+  /*
+   * reserve_crashkernel() - reserves memory for crash kernel
+   *
+@@@ -92,47 -126,66 +121,100 @@@
+  static void __init reserve_crashkernel(void)
+  {
+  	unsigned long long crash_base, crash_size;
+++<<<<<<< HEAD
+ +	int ret;
+ +
+ +	ret = parse_crashkernel(boot_command_line, memblock_phys_mem_size(),
+++=======
++ 	unsigned long long crash_low_size = 0;
++ 	unsigned long long crash_max = CRASH_ADDR_LOW_MAX;
++ 	char *cmdline = boot_command_line;
++ 	int ret;
++ 
++ 	if (!IS_ENABLED(CONFIG_KEXEC_CORE))
++ 		return;
++ 
++ 	/* crashkernel=X[@offset] */
++ 	ret = parse_crashkernel(cmdline, memblock_phys_mem_size(),
+++>>>>>>> 944a45abfabc (arm64: kdump: Reimplement crashkernel=X)
+  				&crash_size, &crash_base);
+- 	/* no crashkernel= or invalid value specified */
+- 	if (ret || !crash_size)
++ 	if (ret == -ENOENT) {
++ 		ret = parse_crashkernel_high(cmdline, 0, &crash_size, &crash_base);
++ 		if (ret || !crash_size)
++ 			return;
++ 
++ 		/*
++ 		 * crashkernel=Y,low can be specified or not, but invalid value
++ 		 * is not allowed.
++ 		 */
++ 		ret = parse_crashkernel_low(cmdline, 0, &crash_low_size, &crash_base);
++ 		if (ret && (ret != -ENOENT))
++ 			return;
++ 
++ 		crash_max = CRASH_ADDR_HIGH_MAX;
++ 	} else if (ret || !crash_size) {
++ 		/* The specified value is invalid */
+  		return;
++ 	}
+  
+  	crash_size = PAGE_ALIGN(crash_size);
+  
+ -	/* User specifies base address explicitly. */
+ -	if (crash_base)
+ -		crash_max = crash_base + crash_size;
+ +	if (crash_base == 0) {
+ +		/* Current arm64 boot protocol requires 2MB alignment */
+ +		crash_base = memblock_find_in_range(0, ARCH_LOW_ADDRESS_LIMIT,
+ +				crash_size, SZ_2M);
+ +		if (crash_base == 0) {
+ +			pr_warn("cannot allocate crashkernel (size:0x%llx)\n",
+ +				crash_size);
+ +			return;
+ +		}
+ +	} else {
+ +		/* User specifies base address explicitly. */
+ +		if (!memblock_is_region_memory(crash_base, crash_size)) {
+ +			pr_warn("cannot reserve crashkernel: region is not memory\n");
+ +			return;
+ +		}
+  
+++<<<<<<< HEAD
+ +		if (memblock_is_region_reserved(crash_base, crash_size)) {
+ +			pr_warn("cannot reserve crashkernel: region overlaps reserved memory\n");
+ +			return;
+ +		}
+ +
+ +		if (!IS_ALIGNED(crash_base, SZ_2M)) {
+ +			pr_warn("cannot reserve crashkernel: base address is not 2MB aligned\n");
+ +			return;
+ +		}
+++=======
++ 	crash_base = memblock_phys_alloc_range(crash_size, CRASH_ALIGN,
++ 					       crash_base, crash_max);
++ 	if (!crash_base) {
++ 		pr_warn("cannot allocate crashkernel (size:0x%llx)\n",
++ 			crash_size);
++ 		return;
+++>>>>>>> 944a45abfabc (arm64: kdump: Reimplement crashkernel=X)
+  	}
+ +	memblock_reserve(crash_base, crash_size);
+  
++ 	if (crash_low_size && reserve_crashkernel_low(crash_low_size)) {
++ 		memblock_phys_free(crash_base, crash_size);
++ 		return;
++ 	}
++ 
+  	pr_info("crashkernel reserved: 0x%016llx - 0x%016llx (%lld MB)\n",
+  		crash_base, crash_base + crash_size, crash_size >> 20);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * The crashkernel memory will be removed from the kernel linear
++ 	 * map. Inform kmemleak so that it won't try to access it.
++ 	 */
++ 	kmemleak_ignore_phys(crash_base);
++ 	if (crashk_low_res.end)
++ 		kmemleak_ignore_phys(crashk_low_res.start);
++ 
+++>>>>>>> 944a45abfabc (arm64: kdump: Reimplement crashkernel=X)
+  	crashk_res.start = crash_base;
+  	crashk_res.end = crash_base + crash_size - 1;
+  	insert_resource(&iomem_resource, &crashk_res);
+diff --git a/arch/arm64/kernel/machine_kexec.c b/arch/arm64/kernel/machine_kexec.c
+index 661f193513dd..ded07ff09856 100644
+--- a/arch/arm64/kernel/machine_kexec.c
++++ b/arch/arm64/kernel/machine_kexec.c
+@@ -340,8 +340,13 @@ bool crash_is_nosave(unsigned long pfn)
+ 
+ 	/* in reserved memory? */
+ 	addr = __pfn_to_phys(pfn);
+-	if ((addr < crashk_res.start) || (crashk_res.end < addr))
+-		return false;
++	if ((addr < crashk_res.start) || (crashk_res.end < addr)) {
++		if (!crashk_low_res.end)
++			return false;
++
++		if ((addr < crashk_low_res.start) || (crashk_low_res.end < addr))
++			return false;
++	}
+ 
+ 	if (!kexec_crash_image)
+ 		return true;
+diff --git a/arch/arm64/kernel/machine_kexec_file.c b/arch/arm64/kernel/machine_kexec_file.c
+index ebbbd493d254..d2fb1ef24a65 100644
+--- a/arch/arm64/kernel/machine_kexec_file.c
++++ b/arch/arm64/kernel/machine_kexec_file.c
+@@ -220,10 +220,18 @@ static int prepare_elf_headers(void **addr, unsigned long *sz)
+ 
+ 	/* Exclude crashkernel region */
+ 	ret = crash_exclude_mem_range(cmem, crashk_res.start, crashk_res.end);
++	if (ret)
++		goto out;
+ 
+-	if (!ret)
+-		ret =  crash_prepare_elf64_headers(cmem, true, addr, sz);
++	if (crashk_low_res.end) {
++		ret = crash_exclude_mem_range(cmem, crashk_low_res.start, crashk_low_res.end);
++		if (ret)
++			goto out;
++	}
++
++	ret = crash_prepare_elf64_headers(cmem, true, addr, sz);
+ 
++out:
+ 	kfree(cmem);
+ 	return ret;
+ }
+* Unmerged path arch/arm64/mm/init.c
