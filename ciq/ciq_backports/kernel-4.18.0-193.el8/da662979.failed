@@ -1,0 +1,130 @@
+RDMA/core: Provide RDMA DIM support for ULPs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yamin Friedman <yaminf@mellanox.com>
+commit da6629793aa6944db6c8a908ca1a52d87f1489aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/da662979.failed
+
+Added the interface in the infiniband driver that applies the rdma_dim
+adaptive moderation. There is now a special function for allocating an
+ib_cq that uses rdma_dim.
+
+Performance improvement (ConnectX-5 100GbE, x86) running FIO benchmark over
+NVMf between two equal end-hosts with 56 cores across a Mellanox switch
+using null_blk device:
+
+READS without DIM:
+blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+512B     | 3.8GiB/s | 7.7M | 1401  usec               | 2442  usec
+4k       | 7.0GiB/s | 1.8M | 4817  usec               | 6587  usec
+64k      | 10.7GiB/s| 175k | 9896  usec               | 10028 usec
+
+IO WRITES without DIM:
+blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+512B     | 3.6GiB/s | 7.5M | 1434  usec               | 2474  usec
+4k       | 6.3GiB/s | 1.6M | 938   usec               | 1221  usec
+64k      | 10.7GiB/s| 175k | 8979  usec               | 12780 usec
+
+IO READS with DIM:
+blk size | BW       | IOPS | 99th percentile latency  | 99.99th latency
+512B     | 4GiB/s   | 8.2M | 816    usec              | 889   usec
+4k       | 10.1GiB/s| 2.65M| 3359   usec              | 5080  usec
+64k      | 10.7GiB/s| 175k | 9896   usec              | 10028 usec
+
+IO WRITES with DIM:
+blk size | BW       | IOPS  | 99th percentile latency | 99.99th latency
+512B     | 3.9GiB/s | 8.1M  | 799   usec              | 922   usec
+4k       | 9.6GiB/s | 2.5M  | 717   usec              | 1004  usec
+64k      | 10.7GiB/s| 176k  | 8586  usec              | 12256 usec
+
+The rdma_dim algorithm was designed to measure the effectiveness of
+moderation on the flow in a general way and thus should be appropriate
+for all RDMA storage protocols.
+
+rdma_dim is configured to be the default option based on performance
+improvement seen after extensive tests.
+
+	Signed-off-by: Yamin Friedman <yaminf@mellanox.com>
+	Reviewed-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit da6629793aa6944db6c8a908ca1a52d87f1489aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/cq.c
+diff --cc drivers/infiniband/core/cq.c
+index d0ebdb43d295,ffd6e24109d5..000000000000
+--- a/drivers/infiniband/core/cq.c
++++ b/drivers/infiniband/core/cq.c
+@@@ -162,8 -194,15 +202,10 @@@ struct ib_cq *__ib_alloc_cq(struct ib_d
+  
+  	cq->res.type = RDMA_RESTRACK_CQ;
+  	rdma_restrack_set_task(&cq->res, caller);
+ -
+ -	ret = dev->ops.create_cq(cq, &cq_attr, NULL);
+ -	if (ret)
+ -		goto out_free_wc;
+ -
+  	rdma_restrack_kadd(&cq->res);
+  
++ 	rdma_dim_init(cq);
++ 
+  	switch (cq->poll_ctx) {
+  	case IB_POLL_DIRECT:
+  		cq->comp_handler = ib_cq_completion_direct;
+@@@ -223,9 -263,12 +265,17 @@@ void ib_free_cq(struct ib_cq *cq
+  		WARN_ON_ONCE(1);
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	rdma_restrack_del(&cq->res);
++ 	cq->device->ops.destroy_cq(cq, udata);
++ 	if (cq->dim)
++ 		cancel_work_sync(&cq->dim->work);
++ 	kfree(cq->dim);
+++>>>>>>> da6629793aa6 (RDMA/core: Provide RDMA DIM support for ULPs)
+  	kfree(cq->wc);
+ -	kfree(cq);
+ +	rdma_restrack_del(&cq->res);
+ +	ret = cq->device->ops.destroy_cq(cq);
+ +	WARN_ON_ONCE(ret);
+  }
+ -EXPORT_SYMBOL(ib_free_cq_user);
+ +EXPORT_SYMBOL(ib_free_cq);
+* Unmerged path drivers/infiniband/core/cq.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 9a1c4c9437dd..6f5d55c0b9b9 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -61,6 +61,7 @@
+ #include <linux/cgroup_rdma.h>
+ #include <linux/irqflags.h>
+ #include <linux/preempt.h>
++#include <linux/dim.h>
+ #include <uapi/rdma/ib_user_verbs.h>
+ #include <rdma/restrack.h>
+ #include <rdma/signature.h>
+@@ -1493,6 +1494,7 @@ struct ib_cq {
+ 		struct work_struct	work;
+ 	};
+ 	struct workqueue_struct *comp_wq;
++	struct dim *dim;
+ 	/*
+ 	 * Implementation details of the RDMA core, don't use in drivers:
+ 	 */
+@@ -2475,6 +2477,8 @@ struct ib_device {
+ 	u16                          is_switch:1;
+ 	/* Indicates kernel verbs support, should not be used in drivers */
+ 	u16                          kverbs_provider:1;
++	/* CQ adaptive moderation (RDMA DIM) */
++	u16                          use_cq_dim:1;
+ 	u8                           node_type;
+ 	u8                           phys_port_cnt;
+ 	struct ib_device_attr        attrs;
