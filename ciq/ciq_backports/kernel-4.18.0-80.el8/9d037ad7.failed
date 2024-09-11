@@ -1,0 +1,177 @@
+block: remove req->timeout_list
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 9d037ad707ed6069fbea4e38e6ee37e027b13f1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/9d037ad7.failed
+
+Unused now that the legacy request path is gone.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 9d037ad707ed6069fbea4e38e6ee37e027b13f1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-timeout.c
+diff --cc block/blk-timeout.c
+index f2cfd56e1606,006cff4390c0..000000000000
+--- a/block/blk-timeout.c
++++ b/block/blk-timeout.c
+@@@ -68,80 -68,6 +68,83 @@@ ssize_t part_timeout_store(struct devic
+  
+  #endif /* CONFIG_FAIL_IO_TIMEOUT */
+  
+++<<<<<<< HEAD
+ +/*
+ + * blk_delete_timer - Delete/cancel timer for a given function.
+ + * @req:	request that we are canceling timer for
+ + *
+ + */
+ +void blk_delete_timer(struct request *req)
+ +{
+ +	list_del_init(&req->timeout_list);
+ +}
+ +
+ +static void blk_rq_timed_out(struct request *req)
+ +{
+ +	struct request_queue *q = req->q;
+ +	enum blk_eh_timer_return ret = BLK_EH_RESET_TIMER;
+ +
+ +	if (q->rq_timed_out_fn)
+ +		ret = q->rq_timed_out_fn(req);
+ +	switch (ret) {
+ +	case BLK_EH_RESET_TIMER:
+ +		blk_add_timer(req);
+ +		blk_clear_rq_complete(req);
+ +		break;
+ +	case BLK_EH_DONE:
+ +		/*
+ +		 * LLD handles this for now but in the future
+ +		 * we can send a request msg to abort the command
+ +		 * and we can move more of the generic scsi eh code to
+ +		 * the blk layer.
+ +		 */
+ +		break;
+ +	default:
+ +		printk(KERN_ERR "block: bad eh return: %d\n", ret);
+ +		break;
+ +	}
+ +}
+ +
+ +static void blk_rq_check_expired(struct request *rq, unsigned long *next_timeout,
+ +			  unsigned int *next_set)
+ +{
+ +	const unsigned long deadline = blk_rq_deadline(rq);
+ +
+ +	if (time_after_eq(jiffies, deadline)) {
+ +		list_del_init(&rq->timeout_list);
+ +
+ +		/*
+ +		 * Check if we raced with end io completion
+ +		 */
+ +		if (!blk_mark_rq_complete(rq))
+ +			blk_rq_timed_out(rq);
+ +	} else if (!*next_set || time_after(*next_timeout, deadline)) {
+ +		*next_timeout = deadline;
+ +		*next_set = 1;
+ +	}
+ +}
+ +
+ +void blk_timeout_work(struct work_struct *work)
+ +{
+ +	struct request_queue *q =
+ +		container_of(work, struct request_queue, timeout_work);
+ +	unsigned long flags, next = 0;
+ +	struct request *rq, *tmp;
+ +	int next_set = 0;
+ +
+ +	spin_lock_irqsave(q->queue_lock, flags);
+ +
+ +	list_for_each_entry_safe(rq, tmp, &q->timeout_list, timeout_list)
+ +		blk_rq_check_expired(rq, &next, &next_set);
+ +
+ +	if (next_set)
+ +		mod_timer(&q->timeout, round_jiffies_up(next));
+ +
+ +	spin_unlock_irqrestore(q->queue_lock, flags);
+ +}
+ +
+++=======
+++>>>>>>> 9d037ad707ed (block: remove req->timeout_list)
+  /**
+   * blk_abort_request -- Request request recovery for the specified command
+   * @req:	pointer to the request of interest
+@@@ -194,15 -113,6 +197,18 @@@ void blk_add_timer(struct request *req
+  	struct request_queue *q = req->q;
+  	unsigned long expiry;
+  
+++<<<<<<< HEAD
+ +	if (!q->mq_ops)
+ +		lockdep_assert_held(q->queue_lock);
+ +
+ +	/* blk-mq has its own handler, so we don't need ->rq_timed_out_fn */
+ +	if (!q->mq_ops && !q->rq_timed_out_fn)
+ +		return;
+ +
+ +	BUG_ON(!list_empty(&req->timeout_list));
+ +
+++=======
+++>>>>>>> 9d037ad707ed (block: remove req->timeout_list)
+  	/*
+  	 * Some LLDs, like scsi, peek at the timeout to prevent a
+  	 * command from being retried forever.
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 05801be43439..7b80fb3514ae 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -184,7 +184,6 @@ void blk_rq_init(struct request_queue *q, struct request *rq)
+ 	memset(rq, 0, sizeof(*rq));
+ 
+ 	INIT_LIST_HEAD(&rq->queuelist);
+-	INIT_LIST_HEAD(&rq->timeout_list);
+ 	rq->q = q;
+ 	rq->__sector = (sector_t) -1;
+ 	INIT_HLIST_NODE(&rq->hash);
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 033dfdac9ba9..ae6c5a558890 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -322,7 +322,6 @@ static struct request *blk_mq_rq_ctx_init(struct blk_mq_alloc_data *data,
+ 	rq->extra_len = 0;
+ 	rq->__deadline = 0;
+ 
+-	INIT_LIST_HEAD(&rq->timeout_list);
+ 	rq->timeout = 0;
+ 
+ 	rq->end_io = NULL;
+* Unmerged path block/blk-timeout.c
+diff --git a/block/blk.h b/block/blk.h
+index fc4461de2d5b..49cc6c49d0fb 100644
+--- a/block/blk.h
++++ b/block/blk.h
+@@ -235,8 +235,6 @@ static inline bool bio_integrity_endio(struct bio *bio)
+ void blk_timeout_work(struct work_struct *work);
+ unsigned long blk_rq_timeout(unsigned long timeout);
+ void blk_add_timer(struct request *req);
+-void blk_delete_timer(struct request *);
+-
+ 
+ bool bio_attempt_front_merge(struct request_queue *q, struct request *req,
+ 			     struct bio *bio);
+diff --git a/include/linux/blkdev.h b/include/linux/blkdev.h
+index f866412f46bc..89c6a6922276 100644
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@ -246,8 +246,6 @@ struct request {
+ 	/* access through blk_rq_set_deadline, blk_rq_deadline */
+ 	unsigned long __deadline;
+ 
+-	struct list_head timeout_list;
+-
+ 	union {
+ 		struct __call_single_data csd;
+ 		u64 fifo_time;
