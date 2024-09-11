@@ -1,0 +1,172 @@
+iommu/arm-smmu: Remove "leaf" indirection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Robin Murphy <robin.murphy@arm.com>
+commit 3370cb6bf64f6896a30eb7ad97721b9598c8fb10
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3370cb6b.failed
+
+Now that the "leaf" flag is no longer part of an external interface,
+there's no need to use it to infer a register offset at runtime when
+we can just as easily encode the offset directly in its place.
+
+	Signed-off-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 3370cb6bf64f6896a30eb7ad97721b9598c8fb10)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu.c
+diff --cc drivers/iommu/arm-smmu.c
+index c913cdd695bd,4edbe58a303a..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -526,46 -311,107 +526,141 @@@ static void arm_smmu_tlb_inv_context_s2
+  	arm_smmu_tlb_sync_global(smmu);
+  }
+  
+++<<<<<<< HEAD
+ +static void arm_smmu_tlb_inv_range_nosync(unsigned long iova, size_t size,
+ +					  size_t granule, bool leaf, void *cookie)
+++=======
++ static void arm_smmu_tlb_inv_range_s1(unsigned long iova, size_t size,
++ 				      size_t granule, void *cookie, int reg)
+++>>>>>>> 3370cb6bf64f (iommu/arm-smmu: Remove "leaf" indirection)
+  {
+  	struct arm_smmu_domain *smmu_domain = cookie;
+ -	struct arm_smmu_device *smmu = smmu_domain->smmu;
+  	struct arm_smmu_cfg *cfg = &smmu_domain->cfg;
+++<<<<<<< HEAD
+ +	bool stage1 = cfg->cbar != CBAR_TYPE_S2_TRANS;
+ +	void __iomem *reg = ARM_SMMU_CB(smmu_domain->smmu, cfg->cbndx);
+++=======
++ 	int idx = cfg->cbndx;
+++>>>>>>> 3370cb6bf64f (iommu/arm-smmu: Remove "leaf" indirection)
+  
+ -	if (smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
+ +	if (smmu_domain->smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
+  		wmb();
+  
+++<<<<<<< HEAD
+ +	if (stage1) {
+ +		reg += leaf ? ARM_SMMU_CB_S1_TLBIVAL : ARM_SMMU_CB_S1_TLBIVA;
+ +
+ +		if (cfg->fmt != ARM_SMMU_CTX_FMT_AARCH64) {
+ +			iova = (iova >> 12) << 12;
+ +			iova |= cfg->asid;
+ +			do {
+ +				writel_relaxed(iova, reg);
+ +				iova += granule;
+ +			} while (size -= granule);
+ +		} else {
+ +			iova >>= 12;
+ +			iova |= (u64)cfg->asid << 48;
+ +			do {
+ +				writeq_relaxed(iova, reg);
+ +				iova += granule >> 12;
+ +			} while (size -= granule);
+ +		}
+++=======
++ 	if (cfg->fmt != ARM_SMMU_CTX_FMT_AARCH64) {
++ 		iova = (iova >> 12) << 12;
++ 		iova |= cfg->asid;
++ 		do {
++ 			arm_smmu_cb_write(smmu, idx, reg, iova);
++ 			iova += granule;
++ 		} while (size -= granule);
+++>>>>>>> 3370cb6bf64f (iommu/arm-smmu: Remove "leaf" indirection)
+  	} else {
+ +		reg += leaf ? ARM_SMMU_CB_S2_TLBIIPAS2L :
+ +			      ARM_SMMU_CB_S2_TLBIIPAS2;
+  		iova >>= 12;
+ -		iova |= (u64)cfg->asid << 48;
+  		do {
+ -			arm_smmu_cb_writeq(smmu, idx, reg, iova);
+ +			smmu_write_atomic_lq(iova, reg);
+  			iova += granule >> 12;
+  		} while (size -= granule);
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void arm_smmu_tlb_inv_range_s2(unsigned long iova, size_t size,
++ 				      size_t granule, void *cookie, int reg)
++ {
++ 	struct arm_smmu_domain *smmu_domain = cookie;
++ 	struct arm_smmu_device *smmu = smmu_domain->smmu;
++ 	int idx = smmu_domain->cfg.cbndx;
++ 
++ 	if (smmu->features & ARM_SMMU_FEAT_COHERENT_WALK)
++ 		wmb();
++ 
++ 	iova >>= 12;
++ 	do {
++ 		if (smmu_domain->cfg.fmt == ARM_SMMU_CTX_FMT_AARCH64)
++ 			arm_smmu_cb_writeq(smmu, idx, reg, iova);
++ 		else
++ 			arm_smmu_cb_write(smmu, idx, reg, iova);
++ 		iova += granule >> 12;
++ 	} while (size -= granule);
++ }
++ 
++ static void arm_smmu_tlb_inv_walk_s1(unsigned long iova, size_t size,
++ 				     size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s1(iova, size, granule, cookie,
++ 				  ARM_SMMU_CB_S1_TLBIVA);
++ 	arm_smmu_tlb_sync_context(cookie);
++ }
++ 
++ static void arm_smmu_tlb_inv_leaf_s1(unsigned long iova, size_t size,
++ 				     size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s1(iova, size, granule, cookie,
++ 				  ARM_SMMU_CB_S1_TLBIVAL);
++ 	arm_smmu_tlb_sync_context(cookie);
++ }
++ 
++ static void arm_smmu_tlb_add_page_s1(struct iommu_iotlb_gather *gather,
++ 				     unsigned long iova, size_t granule,
++ 				     void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s1(iova, granule, granule, cookie,
++ 				  ARM_SMMU_CB_S1_TLBIVAL);
++ }
++ 
++ static void arm_smmu_tlb_inv_walk_s2(unsigned long iova, size_t size,
++ 				     size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s2(iova, size, granule, cookie,
++ 				  ARM_SMMU_CB_S2_TLBIIPAS2);
++ 	arm_smmu_tlb_sync_context(cookie);
++ }
++ 
++ static void arm_smmu_tlb_inv_leaf_s2(unsigned long iova, size_t size,
++ 				     size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s2(iova, size, granule, cookie,
++ 				  ARM_SMMU_CB_S2_TLBIIPAS2L);
++ 	arm_smmu_tlb_sync_context(cookie);
++ }
++ 
++ static void arm_smmu_tlb_add_page_s2(struct iommu_iotlb_gather *gather,
++ 				     unsigned long iova, size_t granule,
++ 				     void *cookie)
++ {
++ 	arm_smmu_tlb_inv_range_s2(iova, granule, granule, cookie,
++ 				  ARM_SMMU_CB_S2_TLBIIPAS2L);
++ }
++ 
++ static void arm_smmu_tlb_inv_any_s2_v1(unsigned long iova, size_t size,
++ 				       size_t granule, void *cookie)
++ {
++ 	arm_smmu_tlb_inv_context_s2(cookie);
++ }
+++>>>>>>> 3370cb6bf64f (iommu/arm-smmu: Remove "leaf" indirection)
+  /*
+   * On MMU-401 at least, the cost of firing off multiple TLBIVMIDs appears
+   * almost negligible, but the benefit of getting the first one in as far ahead
+* Unmerged path drivers/iommu/arm-smmu.c
