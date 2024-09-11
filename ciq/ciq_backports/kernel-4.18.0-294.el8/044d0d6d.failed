@@ -1,0 +1,154 @@
+lockdep: Only trace IRQ edges
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nicholas Piggin <npiggin@gmail.com>
+commit 044d0d6de9f50192f9697583504a382347ee95ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/044d0d6d.failed
+
+Problem:
+
+  raw_local_irq_save(); // software state on
+  local_irq_save(); // software state off
+  ...
+  local_irq_restore(); // software state still off, because we don't enable IRQs
+  raw_local_irq_restore(); // software state still off, *whoopsie*
+
+existing instances:
+
+ - lock_acquire()
+     raw_local_irq_save()
+     __lock_acquire()
+       arch_spin_lock(&graph_lock)
+         pv_wait() := kvm_wait() (same or worse for Xen/HyperV)
+           local_irq_save()
+
+ - trace_clock_global()
+     raw_local_irq_save()
+     arch_spin_lock()
+       pv_wait() := kvm_wait()
+	 local_irq_save()
+
+ - apic_retrigger_irq()
+     raw_local_irq_save()
+     apic->send_IPI() := default_send_IPI_single_phys()
+       local_irq_save()
+
+Possible solutions:
+
+ A) make it work by enabling the tracing inside raw_*()
+ B) make it work by keeping tracing disabled inside raw_*()
+ C) call it broken and clean it up now
+
+Now, given that the only reason to use the raw_* variant is because you don't
+want tracing. Therefore A) seems like a weird option (although it can be done).
+C) is tempting, but OTOH it ends up converting a _lot_ of code to raw just
+because there is one raw user, this strips the validation/tracing off for all
+the other users.
+
+So we pick B) and declare any code that ends up doing:
+
+	raw_local_irq_save()
+	local_irq_save()
+	lockdep_assert_irqs_disabled();
+
+broken. AFAICT this problem has existed forever, the only reason it came
+up is because commit: 859d069ee1dd ("lockdep: Prepare for NMI IRQ
+state tracking") changed IRQ tracing vs lockdep recursion and the
+first instance is fairly common, the other cases hardly ever happen.
+
+	Signed-off-by: Nicholas Piggin <npiggin@gmail.com>
+[rewrote changelog]
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Reviewed-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+	Tested-by: Marco Elver <elver@google.com>
+Link: https://lkml.kernel.org/r/20200723105615.1268126-1-npiggin@gmail.com
+(cherry picked from commit 044d0d6de9f50192f9697583504a382347ee95ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/irqflags.h
+diff --cc include/linux/irqflags.h
+index b53a9f136087,3ed4e8771b64..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -148,26 -182,33 +148,41 @@@ do {						
+   * if !TRACE_IRQFLAGS.
+   */
+  #ifdef CONFIG_TRACE_IRQFLAGS
+++<<<<<<< HEAD
+ +#define local_irq_enable() \
+ +	do { trace_hardirqs_on(); raw_local_irq_enable(); } while (0)
+ +#define local_irq_disable() \
+ +	do { raw_local_irq_disable(); trace_hardirqs_off(); } while (0)
+++=======
++ 
++ #define local_irq_enable()				\
++ 	do {						\
++ 		trace_hardirqs_on();			\
++ 		raw_local_irq_enable();			\
++ 	} while (0)
++ 
++ #define local_irq_disable()				\
++ 	do {						\
++ 		bool was_disabled = raw_irqs_disabled();\
++ 		raw_local_irq_disable();		\
++ 		if (!was_disabled)			\
++ 			trace_hardirqs_off();		\
++ 	} while (0)
++ 
+++>>>>>>> 044d0d6de9f5 (lockdep: Only trace IRQ edges)
+  #define local_irq_save(flags)				\
+  	do {						\
+  		raw_local_irq_save(flags);		\
+- 		trace_hardirqs_off();			\
++ 		if (!raw_irqs_disabled_flags(flags))	\
++ 			trace_hardirqs_off();		\
+  	} while (0)
+  
+ +
+  #define local_irq_restore(flags)			\
+  	do {						\
+- 		if (raw_irqs_disabled_flags(flags)) {	\
+- 			raw_local_irq_restore(flags);	\
+- 			trace_hardirqs_off();		\
+- 		} else {				\
++ 		if (!raw_irqs_disabled_flags(flags))	\
+  			trace_hardirqs_on();		\
+- 			raw_local_irq_restore(flags);	\
+- 		}					\
++ 		raw_local_irq_restore(flags);		\
+  	} while (0)
+  
+  #define safe_halt()				\
+diff --git a/arch/powerpc/include/asm/hw_irq.h b/arch/powerpc/include/asm/hw_irq.h
+index e151774cb577..327659f3cbd0 100644
+--- a/arch/powerpc/include/asm/hw_irq.h
++++ b/arch/powerpc/include/asm/hw_irq.h
+@@ -200,17 +200,14 @@ static inline bool arch_irqs_disabled(void)
+ #define powerpc_local_irq_pmu_save(flags)			\
+ 	 do {							\
+ 		raw_local_irq_pmu_save(flags);			\
+-		trace_hardirqs_off();				\
++		if (!raw_irqs_disabled_flags(flags))		\
++			trace_hardirqs_off();			\
+ 	} while(0)
+ #define powerpc_local_irq_pmu_restore(flags)			\
+ 	do {							\
+-		if (raw_irqs_disabled_flags(flags)) {		\
+-			raw_local_irq_pmu_restore(flags);	\
+-			trace_hardirqs_off();			\
+-		} else {					\
++		if (!raw_irqs_disabled_flags(flags))		\
+ 			trace_hardirqs_on();			\
+-			raw_local_irq_pmu_restore(flags);	\
+-		}						\
++		raw_local_irq_pmu_restore(flags);		\
+ 	} while(0)
+ #else
+ #define powerpc_local_irq_pmu_save(flags)			\
+* Unmerged path include/linux/irqflags.h
