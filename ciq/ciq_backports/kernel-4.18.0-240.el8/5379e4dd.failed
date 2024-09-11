@@ -1,0 +1,191 @@
+mm, drm/ttm: Fix vm page protection handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Thomas Hellstrom <thellstrom@vmware.com>
+commit 5379e4dd3220e23f68ce70b76b3a52a9a68cee05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5379e4dd.failed
+
+TTM graphics buffer objects may, transparently to user-space,  move
+between IO and system memory. When that happens, all PTEs pointing to the
+old location are zapped before the move and then faulted in again if
+needed. When that happens, the page protection caching mode- and
+encryption bits may change and be different from those of
+struct vm_area_struct::vm_page_prot.
+
+We were using an ugly hack to set the page protection correctly.
+Fix that and instead export and use vmf_insert_mixed_prot() or use
+vmf_insert_pfn_prot().
+Also get the default page protection from
+struct vm_area_struct::vm_page_prot rather than using vm_get_page_prot().
+This way we catch modifications done by the vm system for drivers that
+want write-notification.
+
+	Cc: Andrew Morton <akpm@linux-foundation.org>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: "Matthew Wilcox (Oracle)" <willy@infradead.org>
+	Cc: "Kirill A. Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: "Jérôme Glisse" <jglisse@redhat.com>
+	Cc: "Christian König" <christian.koenig@amd.com>
+	Signed-off-by: Thomas Hellstrom <thellstrom@vmware.com>
+	Reviewed-by: Christian König <christian.koenig@amd.com>
+	Acked-by: Andrew Morton <akpm@linux-foundation.org>
+(cherry picked from commit 5379e4dd3220e23f68ce70b76b3a52a9a68cee05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/ttm/ttm_bo_vm.c
+diff --cc drivers/gpu/drm/ttm/ttm_bo_vm.c
+index a77cd0344d22,389128b8c4dd..000000000000
+--- a/drivers/gpu/drm/ttm/ttm_bo_vm.c
++++ b/drivers/gpu/drm/ttm/ttm_bo_vm.c
+@@@ -106,25 -104,30 +106,29 @@@ static unsigned long ttm_bo_io_mem_pfn(
+  		+ page_offset;
+  }
+  
+ -/**
+ - * ttm_bo_vm_reserve - Reserve a buffer object in a retryable vm callback
+ - * @bo: The buffer object
+ - * @vmf: The fault structure handed to the callback
+ - *
+ - * vm callbacks like fault() and *_mkwrite() allow for the mm_sem to be dropped
+ - * during long waits, and after the wait the callback will be restarted. This
+ - * is to allow other threads using the same virtual memory space concurrent
+ - * access to map(), unmap() completely unrelated buffer objects. TTM buffer
+ - * object reservations sometimes wait for GPU and should therefore be
+ - * considered long waits. This function reserves the buffer object interruptibly
+ - * taking this into account. Starvation is avoided by the vm system not
+ - * allowing too many repeated restarts.
+ - * This function is intended to be used in customized fault() and _mkwrite()
+ - * handlers.
+ - *
+ - * Return:
+ - *    0 on success and the bo was reserved.
+ - *    VM_FAULT_RETRY if blocking wait.
+ - *    VM_FAULT_NOPAGE if blocking wait and retrying was not allowed.
+ - */
+ -vm_fault_t ttm_bo_vm_reserve(struct ttm_buffer_object *bo,
+ -			     struct vm_fault *vmf)
+ +static vm_fault_t ttm_bo_vm_fault(struct vm_fault *vmf)
+  {
+ +	struct vm_area_struct *vma = vmf->vma;
+++<<<<<<< HEAD
+ +	struct ttm_buffer_object *bo = (struct ttm_buffer_object *)
+ +	    vma->vm_private_data;
+++=======
+++	struct ttm_buffer_object *bo = vma->vm_private_data;
+++>>>>>>> 5379e4dd3220 (mm, drm/ttm: Fix vm page protection handling)
+ +	struct ttm_bo_device *bdev = bo->bdev;
+ +	unsigned long page_offset;
+ +	unsigned long page_last;
+ +	unsigned long pfn;
+ +	struct ttm_tt *ttm = NULL;
+ +	struct page *page;
+ +	int err;
+ +	int i;
+ +	vm_fault_t ret = VM_FAULT_NOPAGE;
+ +	unsigned long address = vmf->address;
+ +	struct ttm_mem_type_manager *man =
+ +		&bdev->man[bo->mem.mem_type];
+ +	struct vm_area_struct cvma;
+ +
+  	/*
+  	 * Work around locking order reversal in fault / nopfn
+  	 * between mmap_sem and bo_reserve: Perform a trylock operation
+@@@ -220,18 -249,8 +224,23 @@@
+  		goto out_io_unlock;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Make a local vma copy to modify the page_prot member
+ +	 * and vm_flags if necessary. The vma parameter is protected
+ +	 * by mmap_sem in write mode.
+ +	 */
+ +	cvma = *vma;
+ +	cvma.vm_page_prot = vm_get_page_prot(cvma.vm_flags);
+ +
+ +	if (bo->mem.bus.is_iomem) {
+ +		cvma.vm_page_prot = ttm_io_prot(bo->mem.placement,
+ +						cvma.vm_page_prot);
+ +	} else {
+++=======
++ 	prot = ttm_io_prot(bo->mem.placement, prot);
++ 	if (!bo->mem.bus.is_iomem) {
+++>>>>>>> 5379e4dd3220 (mm, drm/ttm: Fix vm page protection handling)
+  		struct ttm_operation_ctx ctx = {
+  			.interruptible = false,
+  			.no_wait_gpu = false,
+@@@ -248,6 -263,9 +257,12 @@@
+  			ret = VM_FAULT_OOM;
+  			goto out_io_unlock;
+  		}
+++<<<<<<< HEAD
+++=======
++ 	} else {
++ 		/* Iomem should not be marked encrypted */
++ 		prot = pgprot_decrypted(prot);
+++>>>>>>> 5379e4dd3220 (mm, drm/ttm: Fix vm page protection handling)
+  	}
+  
+  	/*
+@@@ -293,15 -318,35 +317,41 @@@
+  	ret = VM_FAULT_NOPAGE;
+  out_io_unlock:
+  	ttm_mem_io_unlock(man);
+ +out_unlock:
+ +	reservation_object_unlock(bo->resv);
+  	return ret;
+  }
+ -EXPORT_SYMBOL(ttm_bo_vm_fault_reserved);
+  
+ -vm_fault_t ttm_bo_vm_fault(struct vm_fault *vmf)
+ +static void ttm_bo_vm_open(struct vm_area_struct *vma)
+  {
+++<<<<<<< HEAD
+ +	struct ttm_buffer_object *bo =
+ +	    (struct ttm_buffer_object *)vma->vm_private_data;
+++=======
++ 	struct vm_area_struct *vma = vmf->vma;
++ 	pgprot_t prot;
++ 	struct ttm_buffer_object *bo = vma->vm_private_data;
++ 	vm_fault_t ret;
++ 
++ 	ret = ttm_bo_vm_reserve(bo, vmf);
++ 	if (ret)
++ 		return ret;
++ 
++ 	prot = vma->vm_page_prot;
++ 	ret = ttm_bo_vm_fault_reserved(vmf, prot, TTM_BO_VM_NUM_PREFAULT);
++ 	if (ret == VM_FAULT_RETRY && !(vmf->flags & FAULT_FLAG_RETRY_NOWAIT))
++ 		return ret;
++ 
++ 	dma_resv_unlock(bo->base.resv);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL(ttm_bo_vm_fault);
++ 
++ void ttm_bo_vm_open(struct vm_area_struct *vma)
++ {
++ 	struct ttm_buffer_object *bo = vma->vm_private_data;
+++>>>>>>> 5379e4dd3220 (mm, drm/ttm: Fix vm page protection handling)
+  
+  	WARN_ON(bo->bdev->dev_mapping != vma->vm_file->f_mapping);
+  
+* Unmerged path drivers/gpu/drm/ttm/ttm_bo_vm.c
+diff --git a/mm/memory.c b/mm/memory.c
+index 1456dcb3ced5..1eef41f92511 100644
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@ -2060,6 +2060,7 @@ vm_fault_t vmf_insert_mixed_prot(struct vm_area_struct *vma, unsigned long addr,
+ {
+ 	return __vm_insert_mixed(vma, addr, pfn, pgprot, false);
+ }
++EXPORT_SYMBOL(vmf_insert_mixed_prot);
+ 
+ vm_fault_t vmf_insert_mixed(struct vm_area_struct *vma, unsigned long addr,
+ 		pfn_t pfn)
