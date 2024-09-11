@@ -1,0 +1,213 @@
+mm/hmm: remove the legacy hmm_pfn_* APIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit f32471e2cf87112b8f5dc10469b27c39c1a41722
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/f32471e2.failed
+
+Switch the one remaining user in nouveau over to its replacement, and
+remove all the wrappers.
+
+Link: https://lore.kernel.org/r/20190724065258.16603-7-hch@lst.de
+	Tested-by: Ralph Campbell <rcampbell@nvidia.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Reviewed-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit f32471e2cf87112b8f5dc10469b27c39c1a41722)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/nouveau/nouveau_dmem.c
+#	include/linux/hmm.h
+diff --cc drivers/gpu/drm/nouveau/nouveau_dmem.c
+index 4e8112fde3e6,345c63cb752a..000000000000
+--- a/drivers/gpu/drm/nouveau/nouveau_dmem.c
++++ b/drivers/gpu/drm/nouveau/nouveau_dmem.c
+@@@ -646,58 -790,80 +646,102 @@@ nouveau_dmem_migrate_vma(struct nouveau
+  			 unsigned long start,
+  			 unsigned long end)
+  {
+ -	unsigned long *src_pfns, *dst_pfns, npages;
+ -	struct nouveau_migrate migrate = {0};
+ -	unsigned long i, c, max;
+ -	int ret = 0;
+ -
+ -	npages = (end - start) >> PAGE_SHIFT;
+ -	max = min(SG_MAX_SINGLE_ALLOC, npages);
+ -	src_pfns = kzalloc(sizeof(long) * max, GFP_KERNEL);
+ -	if (src_pfns == NULL)
+ -		return -ENOMEM;
+ -	dst_pfns = kzalloc(sizeof(long) * max, GFP_KERNEL);
+ -	if (dst_pfns == NULL) {
+ -		kfree(src_pfns);
+ -		return -ENOMEM;
+ -	}
+ +	unsigned long npages = (end - start) >> PAGE_SHIFT;
+ +	unsigned long max = min(SG_MAX_SINGLE_ALLOC, npages);
+ +	dma_addr_t *dma_addrs;
+ +	struct migrate_vma args = {
+ +		.vma		= vma,
+ +		.start		= start,
+ +		.pgmap_owner	= drm->dev,
+ +		.flags		= MIGRATE_VMA_SELECT_SYSTEM,
+ +	};
+ +	unsigned long i;
+ +	u64 *pfns;
+ +	int ret = -ENOMEM;
+ +
+ +	if (drm->dmem == NULL)
+ +		return -ENODEV;
+  
+ -	migrate.drm = drm;
+ -	migrate.vma = vma;
+ -	migrate.npages = npages;
+ -	for (i = 0; i < npages; i += c) {
+ -		unsigned long next;
+ +	args.src = kcalloc(max, sizeof(*args.src), GFP_KERNEL);
+ +	if (!args.src)
+ +		goto out;
+ +	args.dst = kcalloc(max, sizeof(*args.dst), GFP_KERNEL);
+ +	if (!args.dst)
+ +		goto out_free_src;
+  
+ -		c = min(SG_MAX_SINGLE_ALLOC, npages);
+ -		next = start + (c << PAGE_SHIFT);
+ -		ret = migrate_vma(&nouveau_dmem_migrate_ops, vma, start,
+ -				  next, src_pfns, dst_pfns, &migrate);
+ +	dma_addrs = kmalloc_array(max, sizeof(*dma_addrs), GFP_KERNEL);
+ +	if (!dma_addrs)
+ +		goto out_free_dst;
+ +
+ +	pfns = nouveau_pfns_alloc(max);
+ +	if (!pfns)
+ +		goto out_free_dma;
+ +
+ +	for (i = 0; i < npages; i += max) {
+ +		args.end = start + (max << PAGE_SHIFT);
+ +		ret = migrate_vma_setup(&args);
+  		if (ret)
+ -			goto out;
+ -		start = next;
+ +			goto out_free_pfns;
+ +
+ +		if (args.cpages)
+ +			nouveau_dmem_migrate_chunk(drm, svmm, &args, dma_addrs,
+ +						   pfns);
+ +		args.start = args.end;
+  	}
+  
+ +	ret = 0;
+ +out_free_pfns:
+ +	nouveau_pfns_free(pfns);
+ +out_free_dma:
+ +	kfree(dma_addrs);
+ +out_free_dst:
+ +	kfree(args.dst);
+ +out_free_src:
+ +	kfree(args.src);
+  out:
+ -	kfree(dst_pfns);
+ -	kfree(src_pfns);
+  	return ret;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static inline bool
++ nouveau_dmem_page(struct nouveau_drm *drm, struct page *page)
++ {
++ 	return is_device_private_page(page) && drm->dmem == page_to_dmem(page);
++ }
++ 
++ void
++ nouveau_dmem_convert_pfn(struct nouveau_drm *drm,
++ 			 struct hmm_range *range)
++ {
++ 	unsigned long i, npages;
++ 
++ 	npages = (range->end - range->start) >> PAGE_SHIFT;
++ 	for (i = 0; i < npages; ++i) {
++ 		struct nouveau_dmem_chunk *chunk;
++ 		struct page *page;
++ 		uint64_t addr;
++ 
++ 		page = hmm_device_entry_to_page(range, range->pfns[i]);
++ 		if (page == NULL)
++ 			continue;
++ 
++ 		if (!(range->pfns[i] & range->flags[HMM_PFN_DEVICE_PRIVATE])) {
++ 			continue;
++ 		}
++ 
++ 		if (!nouveau_dmem_page(drm, page)) {
++ 			WARN(1, "Some unknown device memory !\n");
++ 			range->pfns[i] = 0;
++ 			continue;
++ 		}
++ 
++ 		chunk = page->zone_device_data;
++ 		addr = page_to_pfn(page) - chunk->pfn_first;
++ 		addr = (addr + chunk->bo->bo.mem.start) << PAGE_SHIFT;
++ 
++ 		range->pfns[i] &= ((1UL << range->pfn_shift) - 1);
++ 		range->pfns[i] |= (addr >> PAGE_SHIFT) << range->pfn_shift;
++ 	}
++ }
+++>>>>>>> f32471e2cf87 (mm/hmm: remove the legacy hmm_pfn_* APIs)
+diff --cc include/linux/hmm.h
+index 6a8157d67186,9f32586684c9..000000000000
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@@ -309,43 -291,6 +309,46 @@@ static inline uint64_t hmm_device_entry
+  }
+  
+  /*
+++<<<<<<< HEAD
+ + * Old API:
+ + * hmm_pfn_to_page()
+ + * hmm_pfn_to_pfn()
+ + * hmm_pfn_from_page()
+ + * hmm_pfn_from_pfn()
+ + *
+ + * This are the OLD API please use new API, it is here to avoid cross-tree
+ + * merge painfullness ie we convert things to new API in stages.
+ + */
+ +static inline struct page *hmm_pfn_to_page(const struct hmm_range *range,
+ +					   uint64_t pfn)
+ +{
+ +	return hmm_device_entry_to_page(range, pfn);
+ +}
+ +
+ +static inline unsigned long hmm_pfn_to_pfn(const struct hmm_range *range,
+ +					   uint64_t pfn)
+ +{
+ +	return hmm_device_entry_to_pfn(range, pfn);
+ +}
+ +
+ +static inline uint64_t hmm_pfn_from_page(const struct hmm_range *range,
+ +					 struct page *page)
+ +{
+ +	return hmm_device_entry_from_page(range, page);
+ +}
+ +
+ +static inline uint64_t hmm_pfn_from_pfn(const struct hmm_range *range,
+ +					unsigned long pfn)
+ +{
+ +	return hmm_device_entry_from_pfn(range, pfn);
+ +}
+ +
+ +
+ +
+ +#if IS_ENABLED(CONFIG_HMM_MIRROR)
+ +/*
+++=======
+++>>>>>>> f32471e2cf87 (mm/hmm: remove the legacy hmm_pfn_* APIs)
+   * Mirroring: how to synchronize device page table with CPU page table.
+   *
+   * A device driver that is participating in HMM mirroring must always
+* Unmerged path drivers/gpu/drm/nouveau/nouveau_dmem.c
+* Unmerged path include/linux/hmm.h
