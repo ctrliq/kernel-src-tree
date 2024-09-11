@@ -1,0 +1,285 @@
+arm64: sysreg: Make mrs_s and msr_s macros work with Clang and LTO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [arm64] sysreg: Make mrs_s and msr_s macros work with Clang and LTO (Auger Eric) [1749501]
+Rebuild_FUZZ: 94.40%
+commit-author Kees Cook <keescook@chromium.org>
+commit be604c616ca71cbf5c860d0cfa4595128ab74189
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/be604c61.failed
+
+Clang's integrated assembler does not allow assembly macros defined
+in one inline asm block using the .macro directive to be used across
+separate asm blocks. LLVM developers consider this a feature and not a
+bug, recommending code refactoring:
+
+  https://bugs.llvm.org/show_bug.cgi?id=19749
+
+As binutils doesn't allow macros to be redefined, this change uses
+UNDEFINE_MRS_S and UNDEFINE_MSR_S to define corresponding macros
+in-place and workaround gcc and clang limitations on redefining macros
+across different assembler blocks.
+
+Specifically, the current state after preprocessing looks like this:
+
+asm volatile(".macro mXX_s ... .endm");
+void f()
+{
+	asm volatile("mXX_s a, b");
+}
+
+With GCC, it gives macro redefinition error because sysreg.h is included
+in multiple source files, and assembler code for all of them is later
+combined for LTO (I've seen an intermediate file with hundreds of
+identical definitions).
+
+With clang, it gives macro undefined error because clang doesn't allow
+sharing macros between inline asm statements.
+
+I also seem to remember catching another sort of undefined error with
+GCC due to reordering of macro definition asm statement and generated
+asm code for function that uses the macro.
+
+The solution with defining and undefining for each use, while certainly
+not elegant, satisfies both GCC and clang, LTO and non-LTO.
+
+Co-developed-by: Alex Matveev <alxmtvv@gmail.com>
+Co-developed-by: Yury Norov <ynorov@caviumnetworks.com>
+Co-developed-by: Sami Tolvanen <samitolvanen@google.com>
+	Reviewed-by: Nick Desaulniers <ndesaulniers@google.com>
+	Reviewed-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit be604c616ca71cbf5c860d0cfa4595128ab74189)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/irqflags.h
+diff --cc arch/arm64/include/asm/irqflags.h
+index 24692edf1a69,629963189085..000000000000
+--- a/arch/arm64/include/asm/irqflags.h
++++ b/arch/arm64/include/asm/irqflags.h
+@@@ -36,33 -38,27 +36,49 @@@
+  /*
+   * CPU interrupt mask handling.
+   */
+ +static inline unsigned long arch_local_irq_save(void)
+ +{
+ +	unsigned long flags;
+ +	asm volatile(
+ +		"mrs	%0, daif		// arch_local_irq_save\n"
+ +		"msr	daifset, #2"
+ +		: "=r" (flags)
+ +		:
+ +		: "memory");
+ +	return flags;
+ +}
+ +
+  static inline void arch_local_irq_enable(void)
+  {
+++<<<<<<< HEAD
+ +	asm volatile(
+ +		"msr	daifclr, #2		// arch_local_irq_enable"
+ +		:
+++=======
++ 	asm volatile(ALTERNATIVE(
++ 		"msr	daifclr, #2		// arch_local_irq_enable\n"
++ 		"nop",
++ 		__msr_s(SYS_ICC_PMR_EL1, "%0")
++ 		"dsb	sy",
++ 		ARM64_HAS_IRQ_PRIO_MASKING)
+++>>>>>>> be604c616ca7 (arm64: sysreg: Make mrs_s and msr_s macros work with Clang and LTO)
+  		:
+ -		: "r" ((unsigned long) GIC_PRIO_IRQON)
+  		: "memory");
+  }
+  
+  static inline void arch_local_irq_disable(void)
+  {
+++<<<<<<< HEAD
+ +	asm volatile(
+ +		"msr	daifset, #2		// arch_local_irq_disable"
+ +		:
+++=======
++ 	asm volatile(ALTERNATIVE(
++ 		"msr	daifset, #2		// arch_local_irq_disable",
++ 		__msr_s(SYS_ICC_PMR_EL1, "%0"),
++ 		ARM64_HAS_IRQ_PRIO_MASKING)
+++>>>>>>> be604c616ca7 (arm64: sysreg: Make mrs_s and msr_s macros work with Clang and LTO)
+  		:
+ -		: "r" ((unsigned long) GIC_PRIO_IRQOFF)
+  		: "memory");
+  }
+  
+@@@ -71,12 -67,44 +87,38 @@@
+   */
+  static inline unsigned long arch_local_save_flags(void)
+  {
+ -	unsigned long daif_bits;
+  	unsigned long flags;
+++<<<<<<< HEAD
+ +	asm volatile(
+ +		"mrs	%0, daif		// arch_local_save_flags"
+ +		: "=r" (flags)
+ +		:
+++=======
++ 
++ 	daif_bits = read_sysreg(daif);
++ 
++ 	/*
++ 	 * The asm is logically equivalent to:
++ 	 *
++ 	 * if (system_uses_irq_prio_masking())
++ 	 *	flags = (daif_bits & PSR_I_BIT) ?
++ 	 *			GIC_PRIO_IRQOFF :
++ 	 *			read_sysreg_s(SYS_ICC_PMR_EL1);
++ 	 * else
++ 	 *	flags = daif_bits;
++ 	 */
++ 	asm volatile(ALTERNATIVE(
++ 			"mov	%0, %1\n"
++ 			"nop\n"
++ 			"nop",
++ 			__mrs_s("%0", SYS_ICC_PMR_EL1)
++ 			"ands	%1, %1, " __stringify(PSR_I_BIT) "\n"
++ 			"csel	%0, %0, %2, eq",
++ 			ARM64_HAS_IRQ_PRIO_MASKING)
++ 		: "=&r" (flags), "+r" (daif_bits)
++ 		: "r" ((unsigned long) GIC_PRIO_IRQOFF)
+++>>>>>>> be604c616ca7 (arm64: sysreg: Make mrs_s and msr_s macros work with Clang and LTO)
+  		: "memory");
+ -
+ -	return flags;
+ -}
+ -
+ -static inline unsigned long arch_local_irq_save(void)
+ -{
+ -	unsigned long flags;
+ -
+ -	flags = arch_local_save_flags();
+ -
+ -	arch_local_irq_disable();
+ -
+  	return flags;
+  }
+  
+@@@ -85,11 -113,15 +127,23 @@@
+   */
+  static inline void arch_local_irq_restore(unsigned long flags)
+  {
+++<<<<<<< HEAD
+ +	asm volatile(
+ +		"msr	daif, %0		// arch_local_irq_restore"
+ +	:
+ +	: "r" (flags)
+ +	: "memory");
+++=======
++ 	asm volatile(ALTERNATIVE(
++ 			"msr	daif, %0\n"
++ 			"nop",
++ 			__msr_s(SYS_ICC_PMR_EL1, "%0")
++ 			"dsb	sy",
++ 			ARM64_HAS_IRQ_PRIO_MASKING)
++ 		: "+r" (flags)
++ 		:
++ 		: "memory");
+++>>>>>>> be604c616ca7 (arm64: sysreg: Make mrs_s and msr_s macros work with Clang and LTO)
+  }
+  
+  static inline int arch_irqs_disabled_flags(unsigned long flags)
+* Unmerged path arch/arm64/include/asm/irqflags.h
+diff --git a/arch/arm64/include/asm/kvm_hyp.h b/arch/arm64/include/asm/kvm_hyp.h
+index ef8b8394d3d1..09fe8bd15f6e 100644
+--- a/arch/arm64/include/asm/kvm_hyp.h
++++ b/arch/arm64/include/asm/kvm_hyp.h
+@@ -30,7 +30,7 @@
+ 	({								\
+ 		u64 reg;						\
+ 		asm volatile(ALTERNATIVE("mrs %0, " __stringify(r##nvh),\
+-					 "mrs_s %0, " __stringify(r##vh),\
++					 __mrs_s("%0", r##vh),		\
+ 					 ARM64_HAS_VIRT_HOST_EXTN)	\
+ 			     : "=r" (reg));				\
+ 		reg;							\
+@@ -40,7 +40,7 @@
+ 	do {								\
+ 		u64 __val = (u64)(v);					\
+ 		asm volatile(ALTERNATIVE("msr " __stringify(r##nvh) ", %x0",\
+-					 "msr_s " __stringify(r##vh) ", %x0",\
++					 __msr_s(r##vh, "%x0"),		\
+ 					 ARM64_HAS_VIRT_HOST_EXTN)	\
+ 					 : : "rZ" (__val));		\
+ 	} while (0)
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index d96f08867983..3b5783367753 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -739,20 +739,39 @@
+ #include <linux/build_bug.h>
+ #include <linux/types.h>
+ 
+-asm(
+-"	.irp	num,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30\n"
+-"	.equ	.L__reg_num_x\\num, \\num\n"
+-"	.endr\n"
++#define __DEFINE_MRS_MSR_S_REGNUM				\
++"	.irp	num,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30\n" \
++"	.equ	.L__reg_num_x\\num, \\num\n"			\
++"	.endr\n"						\
+ "	.equ	.L__reg_num_xzr, 31\n"
+-"\n"
+-"	.macro	mrs_s, rt, sreg\n"
+-	__emit_inst(0xd5200000|(\\sreg)|(.L__reg_num_\\rt))
++
++#define DEFINE_MRS_S						\
++	__DEFINE_MRS_MSR_S_REGNUM				\
++"	.macro	mrs_s, rt, sreg\n"				\
++	__emit_inst(0xd5200000|(\\sreg)|(.L__reg_num_\\rt))	\
+ "	.endm\n"
+-"\n"
+-"	.macro	msr_s, sreg, rt\n"
+-	__emit_inst(0xd5000000|(\\sreg)|(.L__reg_num_\\rt))
++
++#define DEFINE_MSR_S						\
++	__DEFINE_MRS_MSR_S_REGNUM				\
++"	.macro	msr_s, sreg, rt\n"				\
++	__emit_inst(0xd5000000|(\\sreg)|(.L__reg_num_\\rt))	\
+ "	.endm\n"
+-);
++
++#define UNDEFINE_MRS_S						\
++"	.purgem	mrs_s\n"
++
++#define UNDEFINE_MSR_S						\
++"	.purgem	msr_s\n"
++
++#define __mrs_s(v, r)						\
++	DEFINE_MRS_S						\
++"	mrs_s " v ", " __stringify(r) "\n"			\
++	UNDEFINE_MRS_S
++
++#define __msr_s(r, v)						\
++	DEFINE_MSR_S						\
++"	msr_s " __stringify(r) ", " v "\n"			\
++	UNDEFINE_MSR_S
+ 
+ /*
+  * Unlike read_cpuid, calls to read_sysreg are never expected to be
+@@ -780,13 +799,13 @@ asm(
+  */
+ #define read_sysreg_s(r) ({						\
+ 	u64 __val;							\
+-	asm volatile("mrs_s %0, " __stringify(r) : "=r" (__val));	\
++	asm volatile(__mrs_s("%0", r) : "=r" (__val));			\
+ 	__val;								\
+ })
+ 
+ #define write_sysreg_s(v, r) do {					\
+ 	u64 __val = (u64)(v);						\
+-	asm volatile("msr_s " __stringify(r) ", %x0" : : "rZ" (__val));	\
++	asm volatile(__msr_s(r, "%x0") : : "rZ" (__val));		\
+ } while (0)
+ 
+ /*
