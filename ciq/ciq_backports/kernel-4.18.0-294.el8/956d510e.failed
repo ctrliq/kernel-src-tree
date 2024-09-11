@@ -1,0 +1,127 @@
+block: add disk/bio-based accounting helpers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 956d510ee78caebc83c0eaeb892db5b239a36a06
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/956d510e.failed
+
+Add two new helpers to simplify I/O accounting for bio based drivers.
+Currently these drivers use the generic_start_io_acct and
+generic_end_io_acct helpers which have very cumbersome calling
+conventions, don't actually return the time they started accounting,
+and try to deal with accounting for partitions, which can't happen
+for bio based drivers.  The new helpers will be used to subsequently
+replace uses of the old helpers.
+
+The main API is the bio based wrappes in blkdev.h, but for zram
+which wants to account rw_page based I/O lower level routines are
+provided as well.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Konstantin Khlebnikov <khlebnikov@yandex-team.ru>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 956d510ee78caebc83c0eaeb892db5b239a36a06)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/blkdev.h
+diff --cc include/linux/blkdev.h
+index 43b1486e0588,6f7ff0fa8fcf..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -1884,15 -1892,32 +1884,46 @@@ static inline void blk_wake_io_task(str
+  		wake_up_process(waiter);
+  }
+  
+++<<<<<<< HEAD
+ +static inline void blk_io_schedule(void)
+ +{
+ +	/* Prevent hang_check timer from firing at us during very long I/O */
+ +	unsigned long timeout = sysctl_hung_task_timeout_secs * HZ / 2;
+ +
+ +	if (timeout)
+ +		io_schedule_timeout(timeout);
+ +	else
+ +		io_schedule();
+ +}
+ +
+++=======
++ unsigned long disk_start_io_acct(struct gendisk *disk, unsigned int sectors,
++ 		unsigned int op);
++ void disk_end_io_acct(struct gendisk *disk, unsigned int op,
++ 		unsigned long start_time);
++ 
++ #ifdef CONFIG_BLOCK
++ /**
++  * bio_start_io_acct - start I/O accounting for bio based drivers
++  * @bio:	bio to start account for
++  *
++  * Returns the start time that should be passed back to bio_end_io_acct().
++  */
++ static inline unsigned long bio_start_io_acct(struct bio *bio)
++ {
++ 	return disk_start_io_acct(bio->bi_disk, bio_sectors(bio), bio_op(bio));
++ }
++ 
++ /**
++  * bio_end_io_acct - end I/O accounting for bio based drivers
++  * @bio:	bio to end account for
++  * @start:	start time returned by bio_start_io_acct()
++  */
++ static inline void bio_end_io_acct(struct bio *bio, unsigned long start_time)
++ {
++ 	return disk_end_io_acct(bio->bi_disk, bio_op(bio), start_time);
++ }
++ #endif /* CONFIG_BLOCK */
++ 
+++>>>>>>> 956d510ee78c (block: add disk/bio-based accounting helpers)
+  #endif
+diff --git a/block/blk-core.c b/block/blk-core.c
+index 9aabbc020a34..d9b475caa9da 100644
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@ -1355,6 +1355,40 @@ void blk_account_io_start(struct request *rq, bool new_io)
+ 	part_stat_unlock();
+ }
+ 
++unsigned long disk_start_io_acct(struct gendisk *disk, unsigned int sectors,
++		unsigned int op)
++{
++	struct hd_struct *part = &disk->part0;
++	const int sgrp = op_stat_group(op);
++	unsigned long now = READ_ONCE(jiffies);
++
++	part_stat_lock();
++	update_io_ticks(part, now, false);
++	part_stat_inc(part, ios[sgrp]);
++	part_stat_add(part, sectors[sgrp], sectors);
++	part_stat_local_inc(part, in_flight[op_is_write(op)]);
++	part_stat_unlock();
++
++	return now;
++}
++EXPORT_SYMBOL(disk_start_io_acct);
++
++void disk_end_io_acct(struct gendisk *disk, unsigned int op,
++		unsigned long start_time)
++{
++	struct hd_struct *part = &disk->part0;
++	const int sgrp = op_stat_group(op);
++	unsigned long now = READ_ONCE(jiffies);
++	unsigned long duration = now - start_time;
++
++	part_stat_lock();
++	update_io_ticks(part, now, true);
++	part_stat_add(part, nsecs[sgrp], jiffies_to_nsecs(duration));
++	part_stat_local_dec(part, in_flight[op_is_write(op)]);
++	part_stat_unlock();
++}
++EXPORT_SYMBOL(disk_end_io_acct);
++
+ /*
+  * Steal bios from a request and add them to a bio list.
+  * The request must not have been partially completed before.
+* Unmerged path include/linux/blkdev.h
