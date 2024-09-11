@@ -21,7 +21,6 @@
 
 #include "internal.h"
 
-ACPI_MODULE_NAME("acpi_apd");
 struct apd_private_data;
 
 /**
