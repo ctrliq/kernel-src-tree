@@ -1,0 +1,103 @@
+net/tls: make sure offload also gets the keys wiped
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: make sure offload also gets the keys wiped (Sabrina Dubroca) [1739260]
+Rebuild_FUZZ: 95.92%
+commit-author Jakub Kicinski <jakub.kicinski@netronome.com>
+commit acd3e96d53a24d219f720ed4012b62723ae05da1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/acd3e96d.failed
+
+Commit 86029d10af18 ("tls: zero the crypto information from tls_context
+before freeing") added memzero_explicit() calls to clear the key material
+before freeing struct tls_context, but it missed tls_device.c has its
+own way of freeing this structure. Replace the missing free.
+
+Fixes: 86029d10af18 ("tls: zero the crypto information from tls_context before freeing")
+	Signed-off-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: Dirk van der Merwe <dirk.vandermerwe@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit acd3e96d53a24d219f720ed4012b62723ae05da1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_main.c
+diff --cc net/tls/tls_main.c
+index a3694e64e12d,4674e57e66b0..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -546,6 -610,43 +546,46 @@@ static struct tls_context *create_ctx(s
+  	return ctx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tls_build_proto(struct sock *sk)
++ {
++ 	int ip_ver = sk->sk_family == AF_INET6 ? TLSV6 : TLSV4;
++ 
++ 	/* Build IPv6 TLS whenever the address of tcpv6 _prot changes */
++ 	if (ip_ver == TLSV6 &&
++ 	    unlikely(sk->sk_prot != smp_load_acquire(&saved_tcpv6_prot))) {
++ 		mutex_lock(&tcpv6_prot_mutex);
++ 		if (likely(sk->sk_prot != saved_tcpv6_prot)) {
++ 			build_protos(tls_prots[TLSV6], sk->sk_prot);
++ 			smp_store_release(&saved_tcpv6_prot, sk->sk_prot);
++ 		}
++ 		mutex_unlock(&tcpv6_prot_mutex);
++ 	}
++ 
++ 	if (ip_ver == TLSV4 &&
++ 	    unlikely(sk->sk_prot != smp_load_acquire(&saved_tcpv4_prot))) {
++ 		mutex_lock(&tcpv4_prot_mutex);
++ 		if (likely(sk->sk_prot != saved_tcpv4_prot)) {
++ 			build_protos(tls_prots[TLSV4], sk->sk_prot);
++ 			smp_store_release(&saved_tcpv4_prot, sk->sk_prot);
++ 		}
++ 		mutex_unlock(&tcpv4_prot_mutex);
++ 	}
++ }
++ 
++ static void tls_hw_sk_destruct(struct sock *sk)
++ {
++ 	struct tls_context *ctx = tls_get_ctx(sk);
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	ctx->sk_destruct(sk);
++ 	/* Free ctx */
++ 	tls_ctx_free(ctx);
++ 	icsk->icsk_ulp_data = NULL;
++ }
++ 
+++>>>>>>> acd3e96d53a2 (net/tls: make sure offload also gets the keys wiped)
+  static int tls_hw_prot(struct sock *sk)
+  {
+  	struct tls_context *ctx;
+diff --git a/include/net/tls.h b/include/net/tls.h
+index 2eb5d4a087d6..01c0f40c6f91 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -271,6 +271,7 @@ struct tls_offload_context_rx {
+ 	(ALIGN(sizeof(struct tls_offload_context_rx), sizeof(void *)) + \
+ 	 TLS_DRIVER_STATE_SIZE)
+ 
++void tls_ctx_free(struct tls_context *ctx);
+ int wait_on_pending_writer(struct sock *sk, long *timeo);
+ int tls_sk_query(struct sock *sk, int optname, char __user *optval,
+ 		int __user *optlen);
+diff --git a/net/tls/tls_device.c b/net/tls/tls_device.c
+index c34eefa054f0..9575b4ceea4a 100644
+--- a/net/tls/tls_device.c
++++ b/net/tls/tls_device.c
+@@ -61,7 +61,7 @@ static void tls_device_free_ctx(struct tls_context *ctx)
+ 	if (ctx->rx_conf == TLS_HW)
+ 		kfree(tls_offload_ctx_rx(ctx));
+ 
+-	kfree(ctx);
++	tls_ctx_free(ctx);
+ }
+ 
+ static void tls_device_gc_task(struct work_struct *work)
+* Unmerged path net/tls/tls_main.c
