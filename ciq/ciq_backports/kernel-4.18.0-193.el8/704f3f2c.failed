@@ -1,0 +1,186 @@
+mm/hmm: use reference counting for HMM struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] hmm: use reference counting for HMM struct (Jerome Glisse) [1498655 1597758]
+Rebuild_FUZZ: 96.55%
+commit-author Jérôme Glisse <jglisse@redhat.com>
+commit 704f3f2cf63cdb76925ac2ff432182c73574b20b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/704f3f2c.failed
+
+Every time I read the code to check that the HMM structure does not vanish
+before it should thanks to the many lock protecting its removal i get a
+headache.  Switch to reference counting instead it is much easier to
+follow and harder to break.  This also remove some code that is no longer
+needed with refcounting.
+
+Link: http://lkml.kernel.org/r/20190403193318.16478-3-jglisse@redhat.com
+	Signed-off-by: Jérôme Glisse <jglisse@redhat.com>
+	Reviewed-by: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: John Hubbard <jhubbard@nvidia.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Arnd Bergmann <arnd@arndb.de>
+	Cc: Balbir Singh <bsingharora@gmail.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Souptick Joarder <jrdr.linux@gmail.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 704f3f2cf63cdb76925ac2ff432182c73574b20b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index 44ded4ba94ef,919d78fd21c5..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -51,8 -50,8 +51,9 @@@ static const struct mmu_notifier_ops hm
+   */
+  struct hmm {
+  	struct mm_struct	*mm;
++ 	struct kref		kref;
+  	spinlock_t		lock;
+ +	atomic_t		sequence;
+  	struct list_head	ranges;
+  	struct list_head	mirrors;
+  	struct mmu_notifier	mmu_notifier;
+@@@ -121,12 -129,44 +132,44 @@@ error
+  	return NULL;
+  }
+  
++ static void hmm_free(struct kref *kref)
++ {
++ 	struct hmm *hmm = container_of(kref, struct hmm, kref);
++ 	struct mm_struct *mm = hmm->mm;
++ 
++ 	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, mm);
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	if (mm->hmm == hmm)
++ 		mm->hmm = NULL;
++ 	spin_unlock(&mm->page_table_lock);
++ 
++ 	kfree(hmm);
++ }
++ 
++ static inline void hmm_put(struct hmm *hmm)
++ {
++ 	kref_put(&hmm->kref, hmm_free);
++ }
++ 
+  void hmm_mm_destroy(struct mm_struct *mm)
+  {
+- 	kfree(mm->hmm);
++ 	struct hmm *hmm;
++ 
++ 	spin_lock(&mm->page_table_lock);
++ 	hmm = mm_get_hmm(mm);
++ 	mm->hmm = NULL;
++ 	if (hmm) {
++ 		hmm->mm = NULL;
++ 		spin_unlock(&mm->page_table_lock);
++ 		hmm_put(hmm);
++ 		return;
++ 	}
++ 
++ 	spin_unlock(&mm->page_table_lock);
+  }
+  
+ -static int hmm_invalidate_range(struct hmm *hmm, bool device,
+ +static int hmm_invalidate_range(struct hmm *hmm,
+  				const struct hmm_update *update)
+  {
+  	struct hmm_mirror *mirror;
+@@@ -186,35 -229,42 +229,62 @@@ static void hmm_release(struct mmu_noti
+  						  struct hmm_mirror, list);
+  	}
+  	up_write(&hmm->mirrors_sem);
++ 
++ 	hmm_put(hmm);
+  }
+  
+ -static int hmm_invalidate_range_start(struct mmu_notifier *mn,
+ -			const struct mmu_notifier_range *range)
+ +static void hmm_invalidate_range_start(struct mmu_notifier *mn,
+ +				       struct mm_struct *mm,
+ +				       unsigned long start,
+ +				       unsigned long end)
+  {
+++<<<<<<< HEAD
+ +	struct hmm *hmm = mm->hmm;
+ +
+ +	VM_BUG_ON(!hmm);
+ +
+ +	atomic_inc(&hmm->sequence);
+++=======
++ 	struct hmm *hmm = mm_get_hmm(range->mm);
++ 	struct hmm_update update;
++ 	int ret;
++ 
++ 	VM_BUG_ON(!hmm);
++ 
++ 	update.start = range->start;
++ 	update.end = range->end;
++ 	update.event = HMM_UPDATE_INVALIDATE;
++ 	update.blockable = range->blockable;
++ 	ret = hmm_invalidate_range(hmm, true, &update);
++ 	hmm_put(hmm);
++ 	return ret;
+++>>>>>>> 704f3f2cf63c (mm/hmm: use reference counting for HMM struct)
+  }
+  
+  static void hmm_invalidate_range_end(struct mmu_notifier *mn,
+ -			const struct mmu_notifier_range *range)
+ +				     struct mm_struct *mm,
+ +				     unsigned long start,
+ +				     unsigned long end)
+  {
++ 	struct hmm *hmm = mm_get_hmm(range->mm);
+  	struct hmm_update update;
+++<<<<<<< HEAD
+ +	struct hmm *hmm = mm->hmm;
+++=======
+++>>>>>>> 704f3f2cf63c (mm/hmm: use reference counting for HMM struct)
+  
+  	VM_BUG_ON(!hmm);
+  
+ -	update.start = range->start;
+ -	update.end = range->end;
+ +	update.start = start;
+ +	update.end = end;
+  	update.event = HMM_UPDATE_INVALIDATE;
+  	update.blockable = true;
+++<<<<<<< HEAD
+ +	hmm_invalidate_range(hmm, &update);
+++=======
++ 	hmm_invalidate_range(hmm, false, &update);
++ 	hmm_put(hmm);
+++>>>>>>> 704f3f2cf63c (mm/hmm: use reference counting for HMM struct)
+  }
+  
+  static const struct mmu_notifier_ops hmm_mmu_notifier_ops = {
+diff --git a/include/linux/hmm.h b/include/linux/hmm.h
+index e51dc3e6210f..5fef289f0e97 100644
+--- a/include/linux/hmm.h
++++ b/include/linux/hmm.h
+@@ -130,6 +130,7 @@ enum hmm_pfn_value_e {
+ /*
+  * struct hmm_range - track invalidation lock on virtual address range
+  *
++ * @hmm: the core HMM structure this range is active against
+  * @vma: the vm area struct for the range
+  * @list: all range lock are on a list
+  * @start: range virtual start address (inclusive)
+@@ -141,6 +142,7 @@ enum hmm_pfn_value_e {
+  * @valid: pfns array did not change since it has been fill by an HMM function
+  */
+ struct hmm_range {
++	struct hmm		*hmm;
+ 	struct vm_area_struct	*vma;
+ 	struct list_head	list;
+ 	unsigned long		start;
+* Unmerged path mm/hmm.c
