@@ -64,7 +64,6 @@ static int acpi_apd_setup(struct apd_private_data *pdata)
 }
 
 #ifdef CONFIG_X86_AMD_PLATFORM_DEVICE
-
 static int misc_check_res(struct acpi_resource *ares, void *data)
 {
 	struct resource res;
@@ -135,7 +134,7 @@ static const struct apd_device_desc cz_uart_desc = {
 static const struct apd_device_desc st_misc_desc = {
 	.setup = st_misc_setup,
 };
-#endif
+#endif /* CONFIG_X86_AMD_PLATFORM_DEVICE */
 
 #ifdef CONFIG_ARM64
 static const struct apd_device_desc xgene_i2c_desc = {
@@ -177,13 +176,9 @@ static const struct apd_device_desc hip08_spi_desc = {
 	.setup = acpi_apd_setup,
 	.fixed_clk_rate = 250000000,
 };
+#endif /* CONFIG_ARM64 */
+
 #endif
-
-#else
-
-#define APD_ADDR(desc) (0UL)
-
-#endif /* CONFIG_X86_AMD_PLATFORM_DEVICE */
 
 /**
 * Create platform device during acpi scan attach handle.
