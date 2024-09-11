@@ -1,0 +1,247 @@
+s390/pci: use physical addresses in DMA tables
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Niklas Schnelle <schnelle@linux.ibm.com>
+commit 568de506e31749ae9140c1a804f3b1d1ab47b4c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/568de506.failed
+
+The entries in the DMA translation tables for our IOMMU must specify
+physical addresses of either the next level table or the final page
+to be mapped for DMA. Currently however the code simply passes the
+virtual addresses of both. On the other hand we still need to walk the
+tables via their virtual addresses so we need to do a phys_to_virt()
+when setting the entries and a virt_to_phys() when getting them.
+Similarly when passing the I/O translation anchor to the hardware we
+must also specify its physical address.
+
+As the DMA and IOMMU APIs we are implementing already use the correct
+phys_addr_t type for the address to be mapped let's also thread this
+through instead of treating it as just an unsigned long.
+
+Note: this currently doesn't fix a real bug, since virtual addresses
+are indentical to physical ones.
+
+	Reviewed-by: Pierre Morel <pmorel@linux.ibm.com>
+	Signed-off-by: Niklas Schnelle <schnelle@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit 568de506e31749ae9140c1a804f3b1d1ab47b4c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/pci/pci.c
+#	arch/s390/pci/pci_dma.c
+#	drivers/iommu/s390-iommu.c
+diff --cc arch/s390/pci/pci.c
+index 0442729136d5,792f8e0f2178..000000000000
+--- a/arch/s390/pci/pci.c
++++ b/arch/s390/pci/pci.c
+@@@ -741,11 -750,71 +741,77 @@@ int zpci_create_device(struct zpci_dev 
+  {
+  	int rc;
+  
+++<<<<<<< HEAD
+++=======
++ 	zpci_dbg(3, "rst fid:%x, fh:%x\n", zdev->fid, zdev->fh);
++ 	if (zdev_enabled(zdev)) {
++ 		/* Disables device access, DMAs and IRQs (reset state) */
++ 		rc = zpci_disable_device(zdev);
++ 		/*
++ 		 * Due to a z/VM vs LPAR inconsistency in the error state the
++ 		 * FH may indicate an enabled device but disable says the
++ 		 * device is already disabled don't treat it as an error here.
++ 		 */
++ 		if (rc == -EINVAL)
++ 			rc = 0;
++ 		if (rc)
++ 			return rc;
++ 	}
++ 
++ 	rc = zpci_enable_device(zdev);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (zdev->dma_table)
++ 		rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 					virt_to_phys(zdev->dma_table));
++ 	else
++ 		rc = zpci_dma_init_device(zdev);
++ 	if (rc) {
++ 		zpci_disable_device(zdev);
++ 		return rc;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /**
++  * zpci_create_device() - Create a new zpci_dev and add it to the zbus
++  * @fid: Function ID of the device to be created
++  * @fh: Current Function Handle of the device to be created
++  * @state: Initial state after creation either Standby or Configured
++  *
++  * Creates a new zpci device and adds it to its, possibly newly created, zbus
++  * as well as zpci_list.
++  *
++  * Returns: the zdev on success or an error pointer otherwise
++  */
++ struct zpci_dev *zpci_create_device(u32 fid, u32 fh, enum zpci_state state)
++ {
++ 	struct zpci_dev *zdev;
++ 	int rc;
++ 
++ 	zpci_dbg(3, "add fid:%x, fh:%x, c:%d\n", fid, fh, state);
++ 	zdev = kzalloc(sizeof(*zdev), GFP_KERNEL);
++ 	if (!zdev)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	/* FID and Function Handle are the static/dynamic identifiers */
++ 	zdev->fid = fid;
++ 	zdev->fh = fh;
++ 
++ 	/* Query function properties and update zdev */
++ 	rc = clp_query_pci_fn(zdev);
++ 	if (rc)
++ 		goto error;
++ 	zdev->state =  state;
++ 
+++>>>>>>> 568de506e317 (s390/pci: use physical addresses in DMA tables)
+  	kref_init(&zdev->kref);
+ -	mutex_init(&zdev->lock);
+ +
+ +	spin_lock(&zpci_list_lock);
+ +	list_add_tail(&zdev->entry, &zpci_list);
+ +	spin_unlock(&zpci_list_lock);
+  
+  	rc = zpci_init_iommu(zdev);
+  	if (rc)
+diff --cc arch/s390/pci/pci_dma.c
+index d50a2da05691,f46833a25526..000000000000
+--- a/arch/s390/pci/pci_dma.c
++++ b/arch/s390/pci/pci_dma.c
+@@@ -596,10 -597,11 +596,16 @@@ int zpci_dma_init_device(struct zpci_de
+  		}
+  
+  	}
+++<<<<<<< HEAD
+ +	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ +				(u64) zdev->dma_table);
+ +	if (rc)
+++=======
++ 	if (zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 			       virt_to_phys(zdev->dma_table))) {
++ 		rc = -EIO;
+++>>>>>>> 568de506e317 (s390/pci: use physical addresses in DMA tables)
+  		goto free_bitmap;
+ -	}
+  
+  	return 0;
+  free_bitmap:
+diff --cc drivers/iommu/s390-iommu.c
+index 6019e58ce4fb,50860ebdd087..000000000000
+--- a/drivers/iommu/s390-iommu.c
++++ b/drivers/iommu/s390-iommu.c
+@@@ -99,14 -99,21 +99,21 @@@ static int s390_iommu_attach_device(str
+  	if (!domain_device)
+  		return -ENOMEM;
+  
+ -	if (zdev->dma_table) {
+ -		cc = zpci_dma_exit_device(zdev);
+ -		if (cc) {
+ -			rc = -EIO;
+ -			goto out_free;
+ -		}
+ -	}
+ +	if (zdev->dma_table)
+ +		zpci_dma_exit_device(zdev);
+  
+  	zdev->dma_table = s390_domain->dma_table;
+++<<<<<<< HEAD
+ +	rc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
+ +				(u64) zdev->dma_table);
+ +	if (rc)
+++=======
++ 	cc = zpci_register_ioat(zdev, 0, zdev->start_dma, zdev->end_dma,
++ 				virt_to_phys(zdev->dma_table));
++ 	if (cc) {
++ 		rc = -EIO;
+++>>>>>>> 568de506e317 (s390/pci: use physical addresses in DMA tables)
+  		goto out_restore;
+ -	}
+  
+  	spin_lock_irqsave(&s390_domain->list_lock, flags);
+  	/* First device defines the DMA range limits */
+diff --git a/arch/s390/include/asm/pci_dma.h b/arch/s390/include/asm/pci_dma.h
+index f62cd3ed2d44..cbd0cbd68e9b 100644
+--- a/arch/s390/include/asm/pci_dma.h
++++ b/arch/s390/include/asm/pci_dma.h
+@@ -97,23 +97,23 @@ static inline unsigned int calc_px(dma_addr_t ptr)
+ 	return ((unsigned long) ptr >> PAGE_SHIFT) & ZPCI_PT_MASK;
+ }
+ 
+-static inline void set_pt_pfaa(unsigned long *entry, void *pfaa)
++static inline void set_pt_pfaa(unsigned long *entry, phys_addr_t pfaa)
+ {
+ 	*entry &= ZPCI_PTE_FLAG_MASK;
+-	*entry |= ((unsigned long) pfaa & ZPCI_PTE_ADDR_MASK);
++	*entry |= (pfaa & ZPCI_PTE_ADDR_MASK);
+ }
+ 
+-static inline void set_rt_sto(unsigned long *entry, void *sto)
++static inline void set_rt_sto(unsigned long *entry, phys_addr_t sto)
+ {
+ 	*entry &= ZPCI_RTE_FLAG_MASK;
+-	*entry |= ((unsigned long) sto & ZPCI_RTE_ADDR_MASK);
++	*entry |= (sto & ZPCI_RTE_ADDR_MASK);
+ 	*entry |= ZPCI_TABLE_TYPE_RTX;
+ }
+ 
+-static inline void set_st_pto(unsigned long *entry, void *pto)
++static inline void set_st_pto(unsigned long *entry, phys_addr_t pto)
+ {
+ 	*entry &= ZPCI_STE_FLAG_MASK;
+-	*entry |= ((unsigned long) pto & ZPCI_STE_ADDR_MASK);
++	*entry |= (pto & ZPCI_STE_ADDR_MASK);
+ 	*entry |= ZPCI_TABLE_TYPE_SX;
+ }
+ 
+@@ -169,16 +169,19 @@ static inline int pt_entry_isvalid(unsigned long entry)
+ 
+ static inline unsigned long *get_rt_sto(unsigned long entry)
+ {
+-	return ((entry & ZPCI_TABLE_TYPE_MASK) == ZPCI_TABLE_TYPE_RTX)
+-		? (unsigned long *) (entry & ZPCI_RTE_ADDR_MASK)
+-		: NULL;
++	if ((entry & ZPCI_TABLE_TYPE_MASK) == ZPCI_TABLE_TYPE_RTX)
++		return phys_to_virt(entry & ZPCI_RTE_ADDR_MASK);
++	else
++		return NULL;
++
+ }
+ 
+ static inline unsigned long *get_st_pto(unsigned long entry)
+ {
+-	return ((entry & ZPCI_TABLE_TYPE_MASK) == ZPCI_TABLE_TYPE_SX)
+-		? (unsigned long *) (entry & ZPCI_STE_ADDR_MASK)
+-		: NULL;
++	if ((entry & ZPCI_TABLE_TYPE_MASK) == ZPCI_TABLE_TYPE_SX)
++		return phys_to_virt(entry & ZPCI_STE_ADDR_MASK);
++	else
++		return NULL;
+ }
+ 
+ /* Prototypes */
+@@ -188,7 +191,7 @@ void dma_free_seg_table(unsigned long);
+ unsigned long *dma_alloc_cpu_table(void);
+ void dma_cleanup_tables(unsigned long *);
+ unsigned long *dma_walk_cpu_trans(unsigned long *rto, dma_addr_t dma_addr);
+-void dma_update_cpu_trans(unsigned long *entry, void *page_addr, int flags);
++void dma_update_cpu_trans(unsigned long *entry, phys_addr_t page_addr, int flags);
+ 
+ extern const struct dma_map_ops s390_pci_dma_ops;
+ 
+* Unmerged path arch/s390/pci/pci.c
+* Unmerged path arch/s390/pci/pci_dma.c
+* Unmerged path drivers/iommu/s390-iommu.c
