@@ -1,0 +1,165 @@
+powerpc/papr_scm: Fetch nvdimm health information from PHYP
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Vaibhav Jain <vaibhav@linux.ibm.com>
+commit b791abf3201d724ac372c2ba1fa6e90d192e1dbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b791abf3.failed
+
+Implement support for fetching nvdimm health information via
+H_SCM_HEALTH hcall as documented in Ref[1]. The hcall returns a pair
+of 64-bit bitmap, bitwise-and of which is then stored in
+'struct papr_scm_priv' and subsequently partially exposed to
+user-space via newly introduced dimm specific attribute
+'papr/flags'. Since the hcall is costly, the health information is
+cached and only re-queried, 60s after the previous successful hcall.
+
+The patch also adds a  documentation text describing flags reported by
+the the new sysfs attribute 'papr/flags' is also introduced at
+Documentation/ABI/testing/sysfs-bus-papr-pmem.
+
+[1] commit 58b278f568f0 ("powerpc: Provide initial documentation for
+PAPR hcalls")
+
+	Signed-off-by: Vaibhav Jain <vaibhav@linux.ibm.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Michael Ellerman <mpe@ellerman.id.au>
+	Cc: Ira Weiny <ira.weiny@intel.com>
+Link: https://lore.kernel.org/r/20200615124407.32596-4-vaibhav@linux.ibm.com
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit b791abf3201d724ac372c2ba1fa6e90d192e1dbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/papr_scm.c
+diff --cc arch/powerpc/platforms/pseries/papr_scm.c
+index 59f72b114087,0c091622b15e..000000000000
+--- a/arch/powerpc/platforms/pseries/papr_scm.c
++++ b/arch/powerpc/platforms/pseries/papr_scm.c
+@@@ -284,29 -389,63 +387,89 @@@ int papr_scm_ndctl(struct nvdimm_bus_de
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static const struct attribute_group *bus_attr_groups[] = {
+ +	&nvdimm_bus_attribute_group,
+ +	NULL,
+ +};
+ +
+ +static inline int papr_scm_node(int node)
+ +{
+ +	int min_dist = INT_MAX, dist;
+ +	int nid, min_node;
+ +
+ +	if ((node == NUMA_NO_NODE) || node_online(node))
+ +		return node;
+ +
+ +	min_node = first_online_node;
+ +	for_each_online_node(nid) {
+ +		dist = node_distance(node, nid);
+ +		if (dist < min_dist) {
+ +			min_dist = dist;
+ +			min_node = nid;
+ +		}
+ +	}
+ +	return min_node;
+ +}
+++=======
++ static ssize_t flags_show(struct device *dev,
++ 			  struct device_attribute *attr, char *buf)
++ {
++ 	struct nvdimm *dimm = to_nvdimm(dev);
++ 	struct papr_scm_priv *p = nvdimm_provider_data(dimm);
++ 	struct seq_buf s;
++ 	u64 health;
++ 	int rc;
++ 
++ 	rc = drc_pmem_query_health(p);
++ 	if (rc)
++ 		return rc;
++ 
++ 	/* Copy health_bitmap locally, check masks & update out buffer */
++ 	health = READ_ONCE(p->health_bitmap);
++ 
++ 	seq_buf_init(&s, buf, PAGE_SIZE);
++ 	if (health & PAPR_PMEM_UNARMED_MASK)
++ 		seq_buf_printf(&s, "not_armed ");
++ 
++ 	if (health & PAPR_PMEM_BAD_SHUTDOWN_MASK)
++ 		seq_buf_printf(&s, "flush_fail ");
++ 
++ 	if (health & PAPR_PMEM_BAD_RESTORE_MASK)
++ 		seq_buf_printf(&s, "restore_fail ");
++ 
++ 	if (health & PAPR_PMEM_ENCRYPTED)
++ 		seq_buf_printf(&s, "encrypted ");
++ 
++ 	if (health & PAPR_PMEM_SMART_EVENT_MASK)
++ 		seq_buf_printf(&s, "smart_notify ");
++ 
++ 	if (health & PAPR_PMEM_SCRUBBED_AND_LOCKED)
++ 		seq_buf_printf(&s, "scrubbed locked ");
++ 
++ 	if (seq_buf_used(&s))
++ 		seq_buf_printf(&s, "\n");
++ 
++ 	return seq_buf_used(&s);
++ }
++ DEVICE_ATTR_RO(flags);
++ 
++ /* papr_scm specific dimm attributes */
++ static struct attribute *papr_nd_attributes[] = {
++ 	&dev_attr_flags.attr,
++ 	NULL,
++ };
++ 
++ static struct attribute_group papr_nd_attribute_group = {
++ 	.name = "papr",
++ 	.attrs = papr_nd_attributes,
++ };
++ 
++ static const struct attribute_group *papr_nd_attr_groups[] = {
++ 	&papr_nd_attribute_group,
++ 	NULL,
++ };
+++>>>>>>> b791abf3201d (powerpc/papr_scm: Fetch nvdimm health information from PHYP)
+  
+  static int papr_scm_nvdimm_init(struct papr_scm_priv *p)
+  {
+diff --git a/Documentation/ABI/testing/sysfs-bus-papr-pmem b/Documentation/ABI/testing/sysfs-bus-papr-pmem
+new file mode 100644
+index 000000000000..5b10d036a8d4
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-bus-papr-pmem
+@@ -0,0 +1,27 @@
++What:		/sys/bus/nd/devices/nmemX/papr/flags
++Date:		Apr, 2020
++KernelVersion:	v5.8
++Contact:	linuxppc-dev <linuxppc-dev@lists.ozlabs.org>, linux-nvdimm@lists.01.org,
++Description:
++		(RO) Report flags indicating various states of a
++		papr-pmem NVDIMM device. Each flag maps to a one or
++		more bits set in the dimm-health-bitmap retrieved in
++		response to H_SCM_HEALTH hcall. The details of the bit
++		flags returned in response to this hcall is available
++		at 'Documentation/powerpc/papr_hcalls.rst' . Below are
++		the flags reported in this sysfs file:
++
++		* "not_armed"	: Indicates that NVDIMM contents will not
++				  survive a power cycle.
++		* "flush_fail"	: Indicates that NVDIMM contents
++				  couldn't be flushed during last
++				  shut-down event.
++		* "restore_fail": Indicates that NVDIMM contents
++				  couldn't be restored during NVDIMM
++				  initialization.
++		* "encrypted"	: NVDIMM contents are encrypted.
++		* "smart_notify": There is health event for the NVDIMM.
++		* "scrubbed"	: Indicating that contents of the
++				  NVDIMM have been scrubbed.
++		* "locked"	: Indicating that NVDIMM contents cant
++				  be modified until next power cycle.
+* Unmerged path arch/powerpc/platforms/pseries/papr_scm.c
