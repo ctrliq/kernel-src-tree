@@ -1,0 +1,112 @@
+block: propagate BLKROSET on the whole device to all partitions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 947139bf3cce097739380c9782a35de504f24203
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/947139bf.failed
+
+Change the policy so that a BLKROSET on the whole device also affects
+partitions.  To quote Martin K. Petersen:
+
+It's very common for database folks to twiddle the read-only state of
+block devices and partitions. I know that our users will find it very
+counter-intuitive that setting /dev/sda read-only won't prevent writes
+to /dev/sda1.
+
+The existing behavior is inconsistent in the sense that doing:
+
+  # blockdev --setro /dev/sda
+  # echo foo > /dev/sda1
+
+permits writes. But:
+
+  # blockdev --setro /dev/sda
+  <something triggers revalidate>
+  # echo foo > /dev/sda1
+
+doesn't.
+
+And a subsequent:
+
+  # blockdev --setrw /dev/sda
+  # echo foo > /dev/sda1
+
+doesn't work either since sda1's read-only policy has been inherited
+from the whole-disk device.
+
+You need to do:
+
+  # blockdev --rereadpt
+
+after setting the whole-disk device rw to effectuate the same change on
+the partitions, otherwise they are stuck being read-only indefinitely.
+
+However, setting the read-only policy on a partition does *not* require
+the revalidate step. As a matter of fact, doing the revalidate will blow
+away the policy setting you just made.
+
+So the user needs to take different actions depending on whether they
+are trying to read-protect a whole-disk device or a partition. Despite
+using the same ioctl. That is really confusing.
+
+I have lost count how many times our customers have had data clobbered
+because of ambiguity of the existing whole-disk device policy. The
+current behavior violates the principle of least surprise by letting the
+user think they write protected the whole disk when they actually
+didn't.
+
+	Suggested-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Martin K. Petersen <martin.petersen@oracle.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 947139bf3cce097739380c9782a35de504f24203)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/genhd.c
+diff --cc block/genhd.c
+index 18f6483e37be,ca5d880af512..000000000000
+--- a/block/genhd.c
++++ b/block/genhd.c
+@@@ -1961,32 -1661,10 +1961,36 @@@ EXPORT_SYMBOL(set_disk_ro)
+  
+  int bdev_read_only(struct block_device *bdev)
+  {
+++<<<<<<< HEAD
+ +	if (!bdev)
+ +		return 0;
+ +	return bdev->bd_part->policy;
+++=======
++ 	return bdev->bd_read_only || get_disk_ro(bdev->bd_disk);
+++>>>>>>> 947139bf3cce (block: propagate BLKROSET on the whole device to all partitions)
+  }
+ +
+  EXPORT_SYMBOL(bdev_read_only);
+  
+ +int invalidate_partition(struct gendisk *disk, int partno)
+ +{
+ +	int res = 0;
+ +	struct block_device *bdev = bdget_disk(disk, partno);
+ +	if (bdev) {
+ +		fsync_bdev(bdev);
+ +		res = __invalidate_device(bdev, true);
+ +		/*
+ +		 * Unhash the bdev inode for this device so that it gets evicted as soon
+ +		 * as last inode reference is dropped.
+ +		 */
+ +		remove_inode_hash(bdev->bd_inode);
+ +		bdput(bdev);
+ +	}
+ +	return res;
+ +}
+ +
+ +EXPORT_SYMBOL(invalidate_partition);
+ +
+  /*
+   * Disk events - monitor disk events like media change and eject request.
+   */
+* Unmerged path block/genhd.c
