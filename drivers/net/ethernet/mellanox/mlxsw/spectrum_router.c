@@ -1211,7 +1211,7 @@ mlxsw_sp_ipip_entry_find_decap(struct mlxsw_sp *mlxsw_sp,
 		saddr_len = 4;
 		saddr_prefix_len = 32;
 		break;
-	case MLXSW_SP_L3_PROTO_IPV6:
+	default:
 		WARN_ON(1);
 		return NULL;
 	}
@@ -1383,9 +1383,9 @@ static bool mlxsw_sp_netdevice_ipip_can_offload(struct mlxsw_sp *mlxsw_sp,
 static int mlxsw_sp_netdevice_ipip_ol_reg_event(struct mlxsw_sp *mlxsw_sp,
 						struct net_device *ol_dev)
 {
+	enum mlxsw_sp_ipip_type ipipt = MLXSW_SP_IPIP_TYPE_MAX;
 	struct mlxsw_sp_ipip_entry *ipip_entry;
 	enum mlxsw_sp_l3proto ul_proto;
-	enum mlxsw_sp_ipip_type ipipt;
 	union mlxsw_sp_l3addr saddr;
 	u32 ul_tb_id;
 
@@ -3223,7 +3223,6 @@ mlxsw_sp_nexthop_group_update(struct mlxsw_sp *mlxsw_sp,
 	u32 adj_index = nh_grp->adj_index; /* base */
 	struct mlxsw_sp_nexthop *nh;
 	int i;
-	int err;
 
 	for (i = 0; i < nh_grp->count; i++) {
 		nh = &nh_grp->nexthops[i];
@@ -3234,6 +3233,8 @@ mlxsw_sp_nexthop_group_update(struct mlxsw_sp *mlxsw_sp,
 		}
 
 		if (nh->update || reallocate) {
+			int err = 0;
+
 			switch (nh->type) {
 			case MLXSW_SP_NEXTHOP_TYPE_ETH:
 				err = mlxsw_sp_nexthop_update
