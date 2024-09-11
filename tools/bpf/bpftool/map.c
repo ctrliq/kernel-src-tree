@@ -95,7 +95,7 @@ static void *alloc_value(struct bpf_map_info *info)
 		return malloc(info->value_size);
 }
 
-static int map_parse_fd(int *argc, char ***argv)
+int map_parse_fd(int *argc, char ***argv)
 {
 	int fd;
 
@@ -828,7 +828,7 @@ static int do_help(int argc, char **argv)
 		"       %s %s event_pipe MAP [cpu N index M]\n"
 		"       %s %s help\n"
 		"\n"
-		"       MAP := { id MAP_ID | pinned FILE }\n"
+		"       " HELP_SPEC_MAP "\n"
 		"       DATA := { [hex] BYTES }\n"
 		"       " HELP_SPEC_PROGRAM "\n"
 		"       VALUE := { DATA | MAP | PROG }\n"
