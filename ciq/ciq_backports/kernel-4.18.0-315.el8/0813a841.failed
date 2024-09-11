@@ -1,0 +1,1073 @@
+bpf: tcp: Allow bpf prog to write and parse TCP header option
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Martin KaFai Lau <kafai@fb.com>
+commit 0813a841566f0962a5551be7749b43c45f0022a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/0813a841.failed
+
+[ Note: The TCP changes here is mainly to implement the bpf
+  pieces into the bpf_skops_*() functions introduced
+  in the earlier patches. ]
+
+The earlier effort in BPF-TCP-CC allows the TCP Congestion Control
+algorithm to be written in BPF.  It opens up opportunities to allow
+a faster turnaround time in testing/releasing new congestion control
+ideas to production environment.
+
+The same flexibility can be extended to writing TCP header option.
+It is not uncommon that people want to test new TCP header option
+to improve the TCP performance.  Another use case is for data-center
+that has a more controlled environment and has more flexibility in
+putting header options for internal only use.
+
+For example, we want to test the idea in putting maximum delay
+ACK in TCP header option which is similar to a draft RFC proposal [1].
+
+This patch introduces the necessary BPF API and use them in the
+TCP stack to allow BPF_PROG_TYPE_SOCK_OPS program to parse
+and write TCP header options.  It currently supports most of
+the TCP packet except RST.
+
+Supported TCP header option:
+───────────────────────────
+This patch allows the bpf-prog to write any option kind.
+Different bpf-progs can write its own option by calling the new helper
+bpf_store_hdr_opt().  The helper will ensure there is no duplicated
+option in the header.
+
+By allowing bpf-prog to write any option kind, this gives a lot of
+flexibility to the bpf-prog.  Different bpf-prog can write its
+own option kind.  It could also allow the bpf-prog to support a
+recently standardized option on an older kernel.
+
+Sockops Callback Flags:
+──────────────────────
+The bpf program will only be called to parse/write tcp header option
+if the following newly added callback flags are enabled
+in tp->bpf_sock_ops_cb_flags:
+BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG
+BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG
+BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG
+
+A few words on the PARSE CB flags.  When the above PARSE CB flags are
+turned on, the bpf-prog will be called on packets received
+at a sk that has at least reached the ESTABLISHED state.
+The parsing of the SYN-SYNACK-ACK will be discussed in the
+"3 Way HandShake" section.
+
+The default is off for all of the above new CB flags, i.e. the bpf prog
+will not be called to parse or write bpf hdr option.  There are
+details comment on these new cb flags in the UAPI bpf.h.
+
+sock_ops->skb_data and bpf_load_hdr_opt()
+─────────────────────────────────────────
+sock_ops->skb_data and sock_ops->skb_data_end covers the whole
+TCP header and its options.  They are read only.
+
+The new bpf_load_hdr_opt() helps to read a particular option "kind"
+from the skb_data.
+
+Please refer to the comment in UAPI bpf.h.  It has details
+on what skb_data contains under different sock_ops->op.
+
+3 Way HandShake
+───────────────
+The bpf-prog can learn if it is sending SYN or SYNACK by reading the
+sock_ops->skb_tcp_flags.
+
+* Passive side
+
+When writing SYNACK (i.e. sock_ops->op == BPF_SOCK_OPS_WRITE_HDR_OPT_CB),
+the received SYN skb will be available to the bpf prog.  The bpf prog can
+use the SYN skb (which may carry the header option sent from the remote bpf
+prog) to decide what bpf header option should be written to the outgoing
+SYNACK skb.  The SYN packet can be obtained by getsockopt(TCP_BPF_SYN*).
+More on this later.  Also, the bpf prog can learn if it is in syncookie
+mode (by checking sock_ops->args[0] == BPF_WRITE_HDR_TCP_SYNACK_COOKIE).
+
+The bpf prog can store the received SYN pkt by using the existing
+bpf_setsockopt(TCP_SAVE_SYN).  The example in a later patch does it.
+[ Note that the fullsock here is a listen sk, bpf_sk_storage
+  is not very useful here since the listen sk will be shared
+  by many concurrent connection requests.
+
+  Extending bpf_sk_storage support to request_sock will add weight
+  to the minisock and it is not necessary better than storing the
+  whole ~100 bytes SYN pkt. ]
+
+When the connection is established, the bpf prog will be called
+in the existing PASSIVE_ESTABLISHED_CB callback.  At that time,
+the bpf prog can get the header option from the saved syn and
+then apply the needed operation to the newly established socket.
+The later patch will use the max delay ack specified in the SYN
+header and set the RTO of this newly established connection
+as an example.
+
+The received ACK (that concludes the 3WHS) will also be available to
+the bpf prog during PASSIVE_ESTABLISHED_CB through the sock_ops->skb_data.
+It could be useful in syncookie scenario.  More on this later.
+
+There is an existing getsockopt "TCP_SAVED_SYN" to return the whole
+saved syn pkt which includes the IP[46] header and the TCP header.
+A few "TCP_BPF_SYN*" getsockopt has been added to allow specifying where to
+start getting from, e.g. starting from TCP header, or from IP[46] header.
+
+The new getsockopt(TCP_BPF_SYN*) will also know where it can get
+the SYN's packet from:
+  - (a) the just received syn (available when the bpf prog is writing SYNACK)
+        and it is the only way to get SYN during syncookie mode.
+  or
+  - (b) the saved syn (available in PASSIVE_ESTABLISHED_CB and also other
+        existing CB).
+
+The bpf prog does not need to know where the SYN pkt is coming from.
+The getsockopt(TCP_BPF_SYN*) will hide this details.
+
+Similarly, a flags "BPF_LOAD_HDR_OPT_TCP_SYN" is also added to
+bpf_load_hdr_opt() to read a particular header option from the SYN packet.
+
+* Fastopen
+
+Fastopen should work the same as the regular non fastopen case.
+This is a test in a later patch.
+
+* Syncookie
+
+For syncookie, the later example patch asks the active
+side's bpf prog to resend the header options in ACK.  The server
+can use bpf_load_hdr_opt() to look at the options in this
+received ACK during PASSIVE_ESTABLISHED_CB.
+
+* Active side
+
+The bpf prog will get a chance to write the bpf header option
+in the SYN packet during WRITE_HDR_OPT_CB.  The received SYNACK
+pkt will also be available to the bpf prog during the existing
+ACTIVE_ESTABLISHED_CB callback through the sock_ops->skb_data
+and bpf_load_hdr_opt().
+
+* Turn off header CB flags after 3WHS
+
+If the bpf prog does not need to write/parse header options
+beyond the 3WHS, the bpf prog can clear the bpf_sock_ops_cb_flags
+to avoid being called for header options.
+Or the bpf-prog can select to leave the UNKNOWN_HDR_OPT_CB_FLAG on
+so that the kernel will only call it when there is option that
+the kernel cannot handle.
+
+[1]: draft-wang-tcpm-low-latency-opt-00
+     https://tools.ietf.org/html/draft-wang-tcpm-low-latency-opt-00
+
+	Signed-off-by: Martin KaFai Lau <kafai@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20200820190104.2885895-1-kafai@fb.com
+(cherry picked from commit 0813a841566f0962a5551be7749b43c45f0022a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+#	net/ipv4/tcp_input.c
+#	net/ipv4/tcp_output.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 0a8b1917a074,f67ec5d9e57d..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -4224,8 -4320,51 +4371,54 @@@ enum 
+  	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+  	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+  	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
+++<<<<<<< HEAD
+++=======
++ 	/* Call bpf for all received TCP headers.  The bpf prog will be
++ 	 * called under sock_ops->op == BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 * for the header option related helpers that will be useful
++ 	 * to the bpf programs.
++ 	 *
++ 	 * It could be used at the client/active side (i.e. connect() side)
++ 	 * when the server told it that the server was in syncookie
++ 	 * mode and required the active side to resend the bpf-written
++ 	 * options.  The active side can keep writing the bpf-options until
++ 	 * it received a valid packet from the server side to confirm
++ 	 * the earlier packet (and options) has been received.  The later
++ 	 * example patch is using it like this at the active side when the
++ 	 * server is in syncookie mode.
++ 	 *
++ 	 * The bpf prog will usually turn this off in the common cases.
++ 	 */
++ 	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG	= (1<<4),
++ 	/* Call bpf when kernel has received a header option that
++ 	 * the kernel cannot handle.  The bpf prog will be called under
++ 	 * sock_ops->op == BPF_SOCK_OPS_PARSE_HDR_OPT_CB.
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 * for the header option related helpers that will be useful
++ 	 * to the bpf programs.
++ 	 */
++ 	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
++ 	/* Call bpf when the kernel is writing header options for the
++ 	 * outgoing packet.  The bpf prog will first be called
++ 	 * to reserve space in a skb under
++ 	 * sock_ops->op == BPF_SOCK_OPS_HDR_OPT_LEN_CB.  Then
++ 	 * the bpf prog will be called to write the header option(s)
++ 	 * under sock_ops->op == BPF_SOCK_OPS_WRITE_HDR_OPT_CB.
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_HDR_OPT_LEN_CB
++ 	 * and BPF_SOCK_OPS_WRITE_HDR_OPT_CB for the header option
++ 	 * related helpers that will be useful to the bpf programs.
++ 	 *
++ 	 * The kernel gets its chance to reserve space and write
++ 	 * options first before the BPF program does.
++ 	 */
++ 	BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG = (1<<6),
+++>>>>>>> 0813a841566f (bpf: tcp: Allow bpf prog to write and parse TCP header option)
+  /* Mask of all currently supported cb flags */
+ -	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x7F,
+ +	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
+  };
+  
+  /* List of known BPF sock_ops operators.
+diff --cc net/ipv4/tcp_input.c
+index 0a07f42fdf6f,319cc7fd5117..000000000000
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@@ -130,6 -130,75 +130,78 @@@ void clean_acked_data_disable(struct in
+  	icsk->icsk_clean_acked = NULL;
+  }
+  EXPORT_SYMBOL_GPL(clean_acked_data_disable);
+++<<<<<<< HEAD
+++=======
++ 
++ void clean_acked_data_flush(void)
++ {
++ 	static_key_deferred_flush(&clean_acked_data_enabled);
++ }
++ EXPORT_SYMBOL_GPL(clean_acked_data_flush);
++ #endif
++ 
++ #ifdef CONFIG_CGROUP_BPF
++ static void bpf_skops_parse_hdr(struct sock *sk, struct sk_buff *skb)
++ {
++ 	bool unknown_opt = tcp_sk(sk)->rx_opt.saw_unknown &&
++ 		BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk),
++ 				       BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG);
++ 	bool parse_all_opt = BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk),
++ 						    BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG);
++ 	struct bpf_sock_ops_kern sock_ops;
++ 
++ 	if (likely(!unknown_opt && !parse_all_opt))
++ 		return;
++ 
++ 	/* The skb will be handled in the
++ 	 * bpf_skops_established() or
++ 	 * bpf_skops_write_hdr_opt().
++ 	 */
++ 	switch (sk->sk_state) {
++ 	case TCP_SYN_RECV:
++ 	case TCP_SYN_SENT:
++ 	case TCP_LISTEN:
++ 		return;
++ 	}
++ 
++ 	sock_owned_by_me(sk);
++ 
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 	sock_ops.op = BPF_SOCK_OPS_PARSE_HDR_OPT_CB;
++ 	sock_ops.is_fullsock = 1;
++ 	sock_ops.sk = sk;
++ 	bpf_skops_init_skb(&sock_ops, skb, tcp_hdrlen(skb));
++ 
++ 	BPF_CGROUP_RUN_PROG_SOCK_OPS(&sock_ops);
++ }
++ 
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ 	struct bpf_sock_ops_kern sock_ops;
++ 
++ 	sock_owned_by_me(sk);
++ 
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 	sock_ops.op = bpf_op;
++ 	sock_ops.is_fullsock = 1;
++ 	sock_ops.sk = sk;
++ 	/* sk with TCP_REPAIR_ON does not have skb in tcp_finish_connect */
++ 	if (skb)
++ 		bpf_skops_init_skb(&sock_ops, skb, tcp_hdrlen(skb));
++ 
++ 	BPF_CGROUP_RUN_PROG_SOCK_OPS(&sock_ops);
++ }
++ #else
++ static void bpf_skops_parse_hdr(struct sock *sk, struct sk_buff *skb)
++ {
++ }
++ 
++ static void bpf_skops_established(struct sock *sk, int bpf_op,
++ 				  struct sk_buff *skb)
++ {
++ }
+++>>>>>>> 0813a841566f (bpf: tcp: Allow bpf prog to write and parse TCP header option)
+  #endif
+  
+  static void tcp_gro_dev_warn(struct sock *sk, const struct sk_buff *skb,
+diff --cc net/ipv4/tcp_output.c
+index 2a06236089f6,ab79d36ed07f..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -472,6 -453,145 +472,148 @@@ static void mptcp_options_write(__be32 
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_CGROUP_BPF
++ static int bpf_skops_write_hdr_opt_arg0(struct sk_buff *skb,
++ 					enum tcp_synack_type synack_type)
++ {
++ 	if (unlikely(!skb))
++ 		return BPF_WRITE_HDR_TCP_CURRENT_MSS;
++ 
++ 	if (unlikely(synack_type == TCP_SYNACK_COOKIE))
++ 		return BPF_WRITE_HDR_TCP_SYNACK_COOKIE;
++ 
++ 	return 0;
++ }
++ 
++ /* req, syn_skb and synack_type are used when writing synack */
++ static void bpf_skops_hdr_opt_len(struct sock *sk, struct sk_buff *skb,
++ 				  struct request_sock *req,
++ 				  struct sk_buff *syn_skb,
++ 				  enum tcp_synack_type synack_type,
++ 				  struct tcp_out_options *opts,
++ 				  unsigned int *remaining)
++ {
++ 	struct bpf_sock_ops_kern sock_ops;
++ 	int err;
++ 
++ 	if (likely(!BPF_SOCK_OPS_TEST_FLAG(tcp_sk(sk),
++ 					   BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG)) ||
++ 	    !*remaining)
++ 		return;
++ 
++ 	/* *remaining has already been aligned to 4 bytes, so *remaining >= 4 */
++ 
++ 	/* init sock_ops */
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 
++ 	sock_ops.op = BPF_SOCK_OPS_HDR_OPT_LEN_CB;
++ 
++ 	if (req) {
++ 		/* The listen "sk" cannot be passed here because
++ 		 * it is not locked.  It would not make too much
++ 		 * sense to do bpf_setsockopt(listen_sk) based
++ 		 * on individual connection request also.
++ 		 *
++ 		 * Thus, "req" is passed here and the cgroup-bpf-progs
++ 		 * of the listen "sk" will be run.
++ 		 *
++ 		 * "req" is also used here for fastopen even the "sk" here is
++ 		 * a fullsock "child" sk.  It is to keep the behavior
++ 		 * consistent between fastopen and non-fastopen on
++ 		 * the bpf programming side.
++ 		 */
++ 		sock_ops.sk = (struct sock *)req;
++ 		sock_ops.syn_skb = syn_skb;
++ 	} else {
++ 		sock_owned_by_me(sk);
++ 
++ 		sock_ops.is_fullsock = 1;
++ 		sock_ops.sk = sk;
++ 	}
++ 
++ 	sock_ops.args[0] = bpf_skops_write_hdr_opt_arg0(skb, synack_type);
++ 	sock_ops.remaining_opt_len = *remaining;
++ 	/* tcp_current_mss() does not pass a skb */
++ 	if (skb)
++ 		bpf_skops_init_skb(&sock_ops, skb, 0);
++ 
++ 	err = BPF_CGROUP_RUN_PROG_SOCK_OPS_SK(&sock_ops, sk);
++ 
++ 	if (err || sock_ops.remaining_opt_len == *remaining)
++ 		return;
++ 
++ 	opts->bpf_opt_len = *remaining - sock_ops.remaining_opt_len;
++ 	/* round up to 4 bytes */
++ 	opts->bpf_opt_len = (opts->bpf_opt_len + 3) & ~3;
++ 
++ 	*remaining -= opts->bpf_opt_len;
++ }
++ 
++ static void bpf_skops_write_hdr_opt(struct sock *sk, struct sk_buff *skb,
++ 				    struct request_sock *req,
++ 				    struct sk_buff *syn_skb,
++ 				    enum tcp_synack_type synack_type,
++ 				    struct tcp_out_options *opts)
++ {
++ 	u8 first_opt_off, nr_written, max_opt_len = opts->bpf_opt_len;
++ 	struct bpf_sock_ops_kern sock_ops;
++ 	int err;
++ 
++ 	if (likely(!max_opt_len))
++ 		return;
++ 
++ 	memset(&sock_ops, 0, offsetof(struct bpf_sock_ops_kern, temp));
++ 
++ 	sock_ops.op = BPF_SOCK_OPS_WRITE_HDR_OPT_CB;
++ 
++ 	if (req) {
++ 		sock_ops.sk = (struct sock *)req;
++ 		sock_ops.syn_skb = syn_skb;
++ 	} else {
++ 		sock_owned_by_me(sk);
++ 
++ 		sock_ops.is_fullsock = 1;
++ 		sock_ops.sk = sk;
++ 	}
++ 
++ 	sock_ops.args[0] = bpf_skops_write_hdr_opt_arg0(skb, synack_type);
++ 	sock_ops.remaining_opt_len = max_opt_len;
++ 	first_opt_off = tcp_hdrlen(skb) - max_opt_len;
++ 	bpf_skops_init_skb(&sock_ops, skb, first_opt_off);
++ 
++ 	err = BPF_CGROUP_RUN_PROG_SOCK_OPS_SK(&sock_ops, sk);
++ 
++ 	if (err)
++ 		nr_written = 0;
++ 	else
++ 		nr_written = max_opt_len - sock_ops.remaining_opt_len;
++ 
++ 	if (nr_written < max_opt_len)
++ 		memset(skb->data + first_opt_off + nr_written, TCPOPT_NOP,
++ 		       max_opt_len - nr_written);
++ }
++ #else
++ static void bpf_skops_hdr_opt_len(struct sock *sk, struct sk_buff *skb,
++ 				  struct request_sock *req,
++ 				  struct sk_buff *syn_skb,
++ 				  enum tcp_synack_type synack_type,
++ 				  struct tcp_out_options *opts,
++ 				  unsigned int *remaining)
++ {
++ }
++ 
++ static void bpf_skops_write_hdr_opt(struct sock *sk, struct sk_buff *skb,
++ 				    struct request_sock *req,
++ 				    struct sk_buff *syn_skb,
++ 				    enum tcp_synack_type synack_type,
++ 				    struct tcp_out_options *opts)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 0813a841566f (bpf: tcp: Allow bpf prog to write and parse TCP header option)
+  /* Write previously computed TCP options to the packet.
+   *
+   * Beware: Something in the Internet is very sensitive to the ordering of
+diff --cc tools/include/uapi/linux/bpf.h
+index 0dc0309df9c7,f67ec5d9e57d..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -4204,8 -4320,51 +4351,54 @@@ enum 
+  	BPF_SOCK_OPS_RETRANS_CB_FLAG	= (1<<1),
+  	BPF_SOCK_OPS_STATE_CB_FLAG	= (1<<2),
+  	BPF_SOCK_OPS_RTT_CB_FLAG	= (1<<3),
+++<<<<<<< HEAD
+++=======
++ 	/* Call bpf for all received TCP headers.  The bpf prog will be
++ 	 * called under sock_ops->op == BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 * for the header option related helpers that will be useful
++ 	 * to the bpf programs.
++ 	 *
++ 	 * It could be used at the client/active side (i.e. connect() side)
++ 	 * when the server told it that the server was in syncookie
++ 	 * mode and required the active side to resend the bpf-written
++ 	 * options.  The active side can keep writing the bpf-options until
++ 	 * it received a valid packet from the server side to confirm
++ 	 * the earlier packet (and options) has been received.  The later
++ 	 * example patch is using it like this at the active side when the
++ 	 * server is in syncookie mode.
++ 	 *
++ 	 * The bpf prog will usually turn this off in the common cases.
++ 	 */
++ 	BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG	= (1<<4),
++ 	/* Call bpf when kernel has received a header option that
++ 	 * the kernel cannot handle.  The bpf prog will be called under
++ 	 * sock_ops->op == BPF_SOCK_OPS_PARSE_HDR_OPT_CB.
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_PARSE_HDR_OPT_CB
++ 	 * for the header option related helpers that will be useful
++ 	 * to the bpf programs.
++ 	 */
++ 	BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG = (1<<5),
++ 	/* Call bpf when the kernel is writing header options for the
++ 	 * outgoing packet.  The bpf prog will first be called
++ 	 * to reserve space in a skb under
++ 	 * sock_ops->op == BPF_SOCK_OPS_HDR_OPT_LEN_CB.  Then
++ 	 * the bpf prog will be called to write the header option(s)
++ 	 * under sock_ops->op == BPF_SOCK_OPS_WRITE_HDR_OPT_CB.
++ 	 *
++ 	 * Please refer to the comment in BPF_SOCK_OPS_HDR_OPT_LEN_CB
++ 	 * and BPF_SOCK_OPS_WRITE_HDR_OPT_CB for the header option
++ 	 * related helpers that will be useful to the bpf programs.
++ 	 *
++ 	 * The kernel gets its chance to reserve space and write
++ 	 * options first before the BPF program does.
++ 	 */
++ 	BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG = (1<<6),
+++>>>>>>> 0813a841566f (bpf: tcp: Allow bpf prog to write and parse TCP header option)
+  /* Mask of all currently supported cb flags */
+ -	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0x7F,
+ +	BPF_SOCK_OPS_ALL_CB_FLAGS       = 0xF,
+  };
+  
+  /* List of known BPF sock_ops operators.
+diff --git a/include/linux/bpf-cgroup.h b/include/linux/bpf-cgroup.h
+index aebd012ad712..500520c3e29b 100644
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -309,6 +309,31 @@ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
+ #define BPF_CGROUP_RUN_PROG_UDP6_RECVMSG_LOCK(sk, uaddr)			\
+ 	BPF_CGROUP_RUN_SA_PROG_LOCK(sk, uaddr, BPF_CGROUP_UDP6_RECVMSG, NULL)
+ 
++/* The SOCK_OPS"_SK" macro should be used when sock_ops->sk is not a
++ * fullsock and its parent fullsock cannot be traced by
++ * sk_to_full_sk().
++ *
++ * e.g. sock_ops->sk is a request_sock and it is under syncookie mode.
++ * Its listener-sk is not attached to the rsk_listener.
++ * In this case, the caller holds the listener-sk (unlocked),
++ * set its sock_ops->sk to req_sk, and call this SOCK_OPS"_SK" with
++ * the listener-sk such that the cgroup-bpf-progs of the
++ * listener-sk will be run.
++ *
++ * Regardless of syncookie mode or not,
++ * calling bpf_setsockopt on listener-sk will not make sense anyway,
++ * so passing 'sock_ops->sk == req_sk' to the bpf prog is appropriate here.
++ */
++#define BPF_CGROUP_RUN_PROG_SOCK_OPS_SK(sock_ops, sk)			\
++({									\
++	int __ret = 0;							\
++	if (cgroup_bpf_enabled)						\
++		__ret = __cgroup_bpf_run_filter_sock_ops(sk,		\
++							 sock_ops,	\
++							 BPF_CGROUP_SOCK_OPS); \
++	__ret;								\
++})
++
+ #define BPF_CGROUP_RUN_PROG_SOCK_OPS(sock_ops)				       \
+ ({									       \
+ 	int __ret = 0;							       \
+diff --git a/include/linux/filter.h b/include/linux/filter.h
+index 32b2debf4aab..c98bae6ba0e8 100644
+--- a/include/linux/filter.h
++++ b/include/linux/filter.h
+@@ -1250,8 +1250,12 @@ struct bpf_sock_ops_kern {
+ 		u32 reply;
+ 		u32 replylong[4];
+ 	};
++	struct sk_buff	*syn_skb;
++	struct sk_buff	*skb;
++	void	*skb_data_end;
+ 	u8	op;
+ 	u8	is_fullsock;
++	u8	remaining_opt_len;
+ 	u64	temp;			/* temp and everything after is not
+ 					 * initialized to 0 before calling
+ 					 * the BPF program. New fields that
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index b92b04b1ecea..0103673d3b0e 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -2194,6 +2194,55 @@ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ 		      struct msghdr *msg, int len, int flags);
+ #endif /* CONFIG_NET_SOCK_MSG */
+ 
++#ifdef CONFIG_CGROUP_BPF
++/* Copy the listen sk's HDR_OPT_CB flags to its child.
++ *
++ * During 3-Way-HandShake, the synack is usually sent from
++ * the listen sk with the HDR_OPT_CB flags set so that
++ * bpf-prog will be called to write the BPF hdr option.
++ *
++ * In fastopen, the child sk is used to send synack instead
++ * of the listen sk.  Thus, inheriting the HDR_OPT_CB flags
++ * from the listen sk gives the bpf-prog a chance to write
++ * BPF hdr option in the synack pkt during fastopen.
++ *
++ * Both fastopen and non-fastopen child will inherit the
++ * HDR_OPT_CB flags to keep the bpf-prog having a consistent
++ * behavior when deciding to clear this cb flags (or not)
++ * during the PASSIVE_ESTABLISHED_CB.
++ *
++ * In the future, other cb flags could be inherited here also.
++ */
++static inline void bpf_skops_init_child(const struct sock *sk,
++					struct sock *child)
++{
++	tcp_sk(child)->bpf_sock_ops_cb_flags =
++		tcp_sk(sk)->bpf_sock_ops_cb_flags &
++		(BPF_SOCK_OPS_PARSE_ALL_HDR_OPT_CB_FLAG |
++		 BPF_SOCK_OPS_PARSE_UNKNOWN_HDR_OPT_CB_FLAG |
++		 BPF_SOCK_OPS_WRITE_HDR_OPT_CB_FLAG);
++}
++
++static inline void bpf_skops_init_skb(struct bpf_sock_ops_kern *skops,
++				      struct sk_buff *skb,
++				      unsigned int end_offset)
++{
++	skops->skb = skb;
++	skops->skb_data_end = skb->data + end_offset;
++}
++#else
++static inline void bpf_skops_init_child(const struct sock *sk,
++					struct sock *child)
++{
++}
++
++static inline void bpf_skops_init_skb(struct bpf_sock_ops_kern *skops,
++				      struct sk_buff *skb,
++				      unsigned int end_offset)
++{
++}
++#endif
++
+ /* Call BPF_SOCK_OPS program that returns an int. If the return value
+  * is < 0, then the BPF op failed (for example if the loaded BPF
+  * program does not support the chosen operation or there is no BPF
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/net/core/filter.c b/net/core/filter.c
+index a22f97d754fb..a2b4a072d80c 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -4714,9 +4714,82 @@ static const struct bpf_func_proto bpf_sock_ops_setsockopt_proto = {
+ 	.arg5_type	= ARG_CONST_SIZE,
+ };
+ 
++static int bpf_sock_ops_get_syn(struct bpf_sock_ops_kern *bpf_sock,
++				int optname, const u8 **start)
++{
++	struct sk_buff *syn_skb = bpf_sock->syn_skb;
++	const u8 *hdr_start;
++	int ret;
++
++	if (syn_skb) {
++		/* sk is a request_sock here */
++
++		if (optname == TCP_BPF_SYN) {
++			hdr_start = syn_skb->data;
++			ret = tcp_hdrlen(syn_skb);
++		} else {
++			/* optname == TCP_BPF_SYN_IP */
++			hdr_start = skb_network_header(syn_skb);
++			ret = skb_network_header_len(syn_skb) +
++				tcp_hdrlen(syn_skb);
++		}
++	} else {
++		struct sock *sk = bpf_sock->sk;
++		struct saved_syn *saved_syn;
++
++		if (sk->sk_state == TCP_NEW_SYN_RECV)
++			/* synack retransmit. bpf_sock->syn_skb will
++			 * not be available.  It has to resort to
++			 * saved_syn (if it is saved).
++			 */
++			saved_syn = inet_reqsk(sk)->saved_syn;
++		else
++			saved_syn = tcp_sk(sk)->saved_syn;
++
++		if (!saved_syn)
++			return -ENOENT;
++
++		if (optname == TCP_BPF_SYN) {
++			hdr_start = saved_syn->data +
++				saved_syn->network_hdrlen;
++			ret = saved_syn->tcp_hdrlen;
++		} else {
++			/* optname == TCP_BPF_SYN_IP */
++			hdr_start = saved_syn->data;
++			ret = saved_syn->network_hdrlen +
++				saved_syn->tcp_hdrlen;
++		}
++	}
++
++	*start = hdr_start;
++	return ret;
++}
++
+ BPF_CALL_5(bpf_sock_ops_getsockopt, struct bpf_sock_ops_kern *, bpf_sock,
+ 	   int, level, int, optname, char *, optval, int, optlen)
+ {
++	if (IS_ENABLED(CONFIG_INET) && level == SOL_TCP &&
++	    optname >= TCP_BPF_SYN && optname <= TCP_BPF_SYN_IP) {
++		int ret, copy_len = 0;
++		const u8 *start;
++
++		ret = bpf_sock_ops_get_syn(bpf_sock, optname, &start);
++		if (ret > 0) {
++			copy_len = ret;
++			if (optlen < copy_len) {
++				copy_len = optlen;
++				ret = -ENOSPC;
++			}
++
++			memcpy(optval, start, copy_len);
++		}
++
++		/* Zero out unused buffer at the end */
++		memset(optval + copy_len, 0, optlen - copy_len);
++
++		return ret;
++	}
++
+ 	return _bpf_getsockopt(bpf_sock->sk, level, optname, optval, optlen);
+ }
+ 
+@@ -6200,6 +6273,232 @@ static const struct bpf_func_proto bpf_sk_assign_proto = {
+ 	.arg3_type	= ARG_ANYTHING,
+ };
+ 
++static const u8 *bpf_search_tcp_opt(const u8 *op, const u8 *opend,
++				    u8 search_kind, const u8 *magic,
++				    u8 magic_len, bool *eol)
++{
++	u8 kind, kind_len;
++
++	*eol = false;
++
++	while (op < opend) {
++		kind = op[0];
++
++		if (kind == TCPOPT_EOL) {
++			*eol = true;
++			return ERR_PTR(-ENOMSG);
++		} else if (kind == TCPOPT_NOP) {
++			op++;
++			continue;
++		}
++
++		if (opend - op < 2 || opend - op < op[1] || op[1] < 2)
++			/* Something is wrong in the received header.
++			 * Follow the TCP stack's tcp_parse_options()
++			 * and just bail here.
++			 */
++			return ERR_PTR(-EFAULT);
++
++		kind_len = op[1];
++		if (search_kind == kind) {
++			if (!magic_len)
++				return op;
++
++			if (magic_len > kind_len - 2)
++				return ERR_PTR(-ENOMSG);
++
++			if (!memcmp(&op[2], magic, magic_len))
++				return op;
++		}
++
++		op += kind_len;
++	}
++
++	return ERR_PTR(-ENOMSG);
++}
++
++BPF_CALL_4(bpf_sock_ops_load_hdr_opt, struct bpf_sock_ops_kern *, bpf_sock,
++	   void *, search_res, u32, len, u64, flags)
++{
++	bool eol, load_syn = flags & BPF_LOAD_HDR_OPT_TCP_SYN;
++	const u8 *op, *opend, *magic, *search = search_res;
++	u8 search_kind, search_len, copy_len, magic_len;
++	int ret;
++
++	/* 2 byte is the minimal option len except TCPOPT_NOP and
++	 * TCPOPT_EOL which are useless for the bpf prog to learn
++	 * and this helper disallow loading them also.
++	 */
++	if (len < 2 || flags & ~BPF_LOAD_HDR_OPT_TCP_SYN)
++		return -EINVAL;
++
++	search_kind = search[0];
++	search_len = search[1];
++
++	if (search_len > len || search_kind == TCPOPT_NOP ||
++	    search_kind == TCPOPT_EOL)
++		return -EINVAL;
++
++	if (search_kind == TCPOPT_EXP || search_kind == 253) {
++		/* 16 or 32 bit magic.  +2 for kind and kind length */
++		if (search_len != 4 && search_len != 6)
++			return -EINVAL;
++		magic = &search[2];
++		magic_len = search_len - 2;
++	} else {
++		if (search_len)
++			return -EINVAL;
++		magic = NULL;
++		magic_len = 0;
++	}
++
++	if (load_syn) {
++		ret = bpf_sock_ops_get_syn(bpf_sock, TCP_BPF_SYN, &op);
++		if (ret < 0)
++			return ret;
++
++		opend = op + ret;
++		op += sizeof(struct tcphdr);
++	} else {
++		if (!bpf_sock->skb ||
++		    bpf_sock->op == BPF_SOCK_OPS_HDR_OPT_LEN_CB)
++			/* This bpf_sock->op cannot call this helper */
++			return -EPERM;
++
++		opend = bpf_sock->skb_data_end;
++		op = bpf_sock->skb->data + sizeof(struct tcphdr);
++	}
++
++	op = bpf_search_tcp_opt(op, opend, search_kind, magic, magic_len,
++				&eol);
++	if (IS_ERR(op))
++		return PTR_ERR(op);
++
++	copy_len = op[1];
++	ret = copy_len;
++	if (copy_len > len) {
++		ret = -ENOSPC;
++		copy_len = len;
++	}
++
++	memcpy(search_res, op, copy_len);
++	return ret;
++}
++
++static const struct bpf_func_proto bpf_sock_ops_load_hdr_opt_proto = {
++	.func		= bpf_sock_ops_load_hdr_opt,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++	.arg4_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_4(bpf_sock_ops_store_hdr_opt, struct bpf_sock_ops_kern *, bpf_sock,
++	   const void *, from, u32, len, u64, flags)
++{
++	u8 new_kind, new_kind_len, magic_len = 0, *opend;
++	const u8 *op, *new_op, *magic = NULL;
++	struct sk_buff *skb;
++	bool eol;
++
++	if (bpf_sock->op != BPF_SOCK_OPS_WRITE_HDR_OPT_CB)
++		return -EPERM;
++
++	if (len < 2 || flags)
++		return -EINVAL;
++
++	new_op = from;
++	new_kind = new_op[0];
++	new_kind_len = new_op[1];
++
++	if (new_kind_len > len || new_kind == TCPOPT_NOP ||
++	    new_kind == TCPOPT_EOL)
++		return -EINVAL;
++
++	if (new_kind_len > bpf_sock->remaining_opt_len)
++		return -ENOSPC;
++
++	/* 253 is another experimental kind */
++	if (new_kind == TCPOPT_EXP || new_kind == 253)  {
++		if (new_kind_len < 4)
++			return -EINVAL;
++		/* Match for the 2 byte magic also.
++		 * RFC 6994: the magic could be 2 or 4 bytes.
++		 * Hence, matching by 2 byte only is on the
++		 * conservative side but it is the right
++		 * thing to do for the 'search-for-duplication'
++		 * purpose.
++		 */
++		magic = &new_op[2];
++		magic_len = 2;
++	}
++
++	/* Check for duplication */
++	skb = bpf_sock->skb;
++	op = skb->data + sizeof(struct tcphdr);
++	opend = bpf_sock->skb_data_end;
++
++	op = bpf_search_tcp_opt(op, opend, new_kind, magic, magic_len,
++				&eol);
++	if (!IS_ERR(op))
++		return -EEXIST;
++
++	if (PTR_ERR(op) != -ENOMSG)
++		return PTR_ERR(op);
++
++	if (eol)
++		/* The option has been ended.  Treat it as no more
++		 * header option can be written.
++		 */
++		return -ENOSPC;
++
++	/* No duplication found.  Store the header option. */
++	memcpy(opend, from, new_kind_len);
++
++	bpf_sock->remaining_opt_len -= new_kind_len;
++	bpf_sock->skb_data_end += new_kind_len;
++
++	return 0;
++}
++
++static const struct bpf_func_proto bpf_sock_ops_store_hdr_opt_proto = {
++	.func		= bpf_sock_ops_store_hdr_opt,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_PTR_TO_MEM,
++	.arg3_type	= ARG_CONST_SIZE,
++	.arg4_type	= ARG_ANYTHING,
++};
++
++BPF_CALL_3(bpf_sock_ops_reserve_hdr_opt, struct bpf_sock_ops_kern *, bpf_sock,
++	   u32, len, u64, flags)
++{
++	if (bpf_sock->op != BPF_SOCK_OPS_HDR_OPT_LEN_CB)
++		return -EPERM;
++
++	if (flags || len < 2)
++		return -EINVAL;
++
++	if (len > bpf_sock->remaining_opt_len)
++		return -ENOSPC;
++
++	bpf_sock->remaining_opt_len -= len;
++
++	return 0;
++}
++
++static const struct bpf_func_proto bpf_sock_ops_reserve_hdr_opt_proto = {
++	.func		= bpf_sock_ops_reserve_hdr_opt,
++	.gpl_only	= false,
++	.ret_type	= RET_INTEGER,
++	.arg1_type	= ARG_PTR_TO_CTX,
++	.arg2_type	= ARG_ANYTHING,
++	.arg3_type	= ARG_ANYTHING,
++};
++
+ #endif /* CONFIG_INET */
+ 
+ bool bpf_helper_changes_pkt_data(void *func)
+@@ -6229,6 +6528,9 @@ bool bpf_helper_changes_pkt_data(void *func)
+ 	    func == bpf_lwt_seg6_store_bytes ||
+ 	    func == bpf_lwt_seg6_adjust_srh ||
+ 	    func == bpf_lwt_seg6_action ||
++#endif
++#ifdef CONFIG_INET
++	    func == bpf_sock_ops_store_hdr_opt ||
+ #endif
+ 	    func == bpf_lwt_in_push_encap ||
+ 	    func == bpf_lwt_xmit_push_encap)
+@@ -6601,6 +6903,12 @@ sock_ops_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ 	case BPF_FUNC_sk_storage_delete:
+ 		return &bpf_sk_storage_delete_proto;
+ #ifdef CONFIG_INET
++	case BPF_FUNC_load_hdr_opt:
++		return &bpf_sock_ops_load_hdr_opt_proto;
++	case BPF_FUNC_store_hdr_opt:
++		return &bpf_sock_ops_store_hdr_opt_proto;
++	case BPF_FUNC_reserve_hdr_opt:
++		return &bpf_sock_ops_reserve_hdr_opt_proto;
+ 	case BPF_FUNC_tcp_sock:
+ 		return &bpf_tcp_sock_proto;
+ #endif /* CONFIG_INET */
+@@ -7402,6 +7710,20 @@ static bool sock_ops_is_valid_access(int off, int size,
+ 				return false;
+ 			info->reg_type = PTR_TO_SOCKET_OR_NULL;
+ 			break;
++		case offsetof(struct bpf_sock_ops, skb_data):
++			if (size != sizeof(__u64))
++				return false;
++			info->reg_type = PTR_TO_PACKET;
++			break;
++		case offsetof(struct bpf_sock_ops, skb_data_end):
++			if (size != sizeof(__u64))
++				return false;
++			info->reg_type = PTR_TO_PACKET_END;
++			break;
++		case offsetof(struct bpf_sock_ops, skb_tcp_flags):
++			bpf_ctx_record_field_size(info, size_default);
++			return bpf_ctx_narrow_access_ok(off, size,
++							size_default);
+ 		default:
+ 			if (size != size_default)
+ 				return false;
+@@ -8749,6 +9071,49 @@ static u32 sock_ops_convert_ctx_access(enum bpf_access_type type,
+ 	case offsetof(struct bpf_sock_ops, sk):
+ 		SOCK_OPS_GET_SK();
+ 		break;
++	case offsetof(struct bpf_sock_ops, skb_data_end):
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,
++						       skb_data_end),
++				      si->dst_reg, si->src_reg,
++				      offsetof(struct bpf_sock_ops_kern,
++					       skb_data_end));
++		break;
++	case offsetof(struct bpf_sock_ops, skb_data):
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,
++						       skb),
++				      si->dst_reg, si->src_reg,
++				      offsetof(struct bpf_sock_ops_kern,
++					       skb));
++		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, data),
++				      si->dst_reg, si->dst_reg,
++				      offsetof(struct sk_buff, data));
++		break;
++	case offsetof(struct bpf_sock_ops, skb_len):
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,
++						       skb),
++				      si->dst_reg, si->src_reg,
++				      offsetof(struct bpf_sock_ops_kern,
++					       skb));
++		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct sk_buff, len),
++				      si->dst_reg, si->dst_reg,
++				      offsetof(struct sk_buff, len));
++		break;
++	case offsetof(struct bpf_sock_ops, skb_tcp_flags):
++		off = offsetof(struct sk_buff, cb);
++		off += offsetof(struct tcp_skb_cb, tcp_flags);
++		*target_size = sizeof_field(struct tcp_skb_cb, tcp_flags);
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct bpf_sock_ops_kern,
++						       skb),
++				      si->dst_reg, si->src_reg,
++				      offsetof(struct bpf_sock_ops_kern,
++					       skb));
++		*insn++ = BPF_JMP_IMM(BPF_JEQ, si->dst_reg, 0, 1);
++		*insn++ = BPF_LDX_MEM(BPF_FIELD_SIZEOF(struct tcp_skb_cb,
++						       tcp_flags),
++				      si->dst_reg, si->dst_reg, off);
++		break;
+ 	}
+ 	return insn - insn_buf;
+ }
+* Unmerged path net/ipv4/tcp_input.c
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index 079dc195a8be..838454a9ea44 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -554,6 +554,7 @@ struct sock *tcp_create_openreq_child(const struct sock *sk,
+ 	newtp->rack.reo_wnd_persist = 0;
+ 	newtp->rack.dsack_seen = 0;
+ 
++	bpf_skops_init_child(sk, newsk);
+ 	tcp_bpf_clone(sk, newsk);
+ 
+ 	__TCP_INC_STATS(sock_net(sk), TCP_MIB_PASSIVEOPENS);
+* Unmerged path net/ipv4/tcp_output.c
+* Unmerged path tools/include/uapi/linux/bpf.h
