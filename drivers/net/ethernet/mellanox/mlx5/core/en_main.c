@@ -5480,6 +5480,7 @@ static void mlx5e_remove(struct mlx5_core_dev *mdev, void *vpriv)
 	mlx5e_dcbnl_delete_app(priv);
 #endif
 	unregister_netdev(priv->netdev);
+	mlx5e_devlink_port_unregister(priv);
 	mlx5e_detach(mdev, vpriv);
 	mlx5e_destroy_netdev(priv);
 }
