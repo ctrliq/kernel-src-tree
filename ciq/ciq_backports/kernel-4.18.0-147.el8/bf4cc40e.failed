@@ -1,0 +1,203 @@
+net/{ipv4,ipv6}: Do not put target net if input nsid is invalid
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] {ipv4, ipv6}: Do not put target net if input nsid is invalid (Petr Oros) [1700306]
+Rebuild_FUZZ: 95.93%
+commit-author Bjørn Mork <bjorn@mork.no>
+commit bf4cc40e9343bbe6c7400ff6f4feb46fb9338087
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/bf4cc40e.failed
+
+The cleanup path will put the target net when netnsid is set.  So we must
+reset netnsid if the input is invalid.
+
+Fixes: d7e38611b81e ("net/ipv4: Put target net when address dump fails due to bad attributes")
+Fixes: 242afaa6968c ("net/ipv6: Put target net when address dump fails due to bad attributes")
+	Cc: David Ahern <dsahern@gmail.com>
+	Signed-off-by: Bjørn Mork <bjorn@mork.no>
+	Reviewed-by: David Ahern <dsahern@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bf4cc40e9343bbe6c7400ff6f4feb46fb9338087)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/devinet.c
+#	net/ipv6/addrconf.c
+diff --cc net/ipv4/devinet.c
+index 6c015dfe13b4,a34602ae27de..000000000000
+--- a/net/ipv4/devinet.c
++++ b/net/ipv4/devinet.c
+@@@ -1659,11 -1661,95 +1659,97 @@@ nla_put_failure
+  	return -EMSGSIZE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int inet_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
++ 				      struct inet_fill_args *fillargs,
++ 				      struct net **tgt_net, struct sock *sk,
++ 				      struct netlink_callback *cb)
++ {
++ 	struct netlink_ext_ack *extack = cb->extack;
++ 	struct nlattr *tb[IFA_MAX+1];
++ 	struct ifaddrmsg *ifm;
++ 	int err, i;
++ 
++ 	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
++ 		NL_SET_ERR_MSG(extack, "ipv4: Invalid header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ifm = nlmsg_data(nlh);
++ 	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
++ 		NL_SET_ERR_MSG(extack, "ipv4: Invalid values in header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	fillargs->ifindex = ifm->ifa_index;
++ 	if (fillargs->ifindex) {
++ 		cb->answer_flags |= NLM_F_DUMP_FILTERED;
++ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
++ 	}
++ 
++ 	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++ 				 ifa_ipv4_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	for (i = 0; i <= IFA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		if (i == IFA_TARGET_NETNSID) {
++ 			struct net *net;
++ 
++ 			fillargs->netnsid = nla_get_s32(tb[i]);
++ 
++ 			net = rtnl_get_net_ns_capable(sk, fillargs->netnsid);
++ 			if (IS_ERR(net)) {
++ 				fillargs->netnsid = -1;
++ 				NL_SET_ERR_MSG(extack, "ipv4: Invalid target network namespace id");
++ 				return PTR_ERR(net);
++ 			}
++ 			*tgt_net = net;
++ 		} else {
++ 			NL_SET_ERR_MSG(extack, "ipv4: Unsupported attribute in dump request");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int in_dev_dump_addr(struct in_device *in_dev, struct sk_buff *skb,
++ 			    struct netlink_callback *cb, int s_ip_idx,
++ 			    struct inet_fill_args *fillargs)
++ {
++ 	struct in_ifaddr *ifa;
++ 	int ip_idx = 0;
++ 	int err;
++ 
++ 	for (ifa = in_dev->ifa_list; ifa; ifa = ifa->ifa_next, ip_idx++) {
++ 		if (ip_idx < s_ip_idx)
++ 			continue;
++ 
++ 		err = inet_fill_ifaddr(skb, ifa, fillargs);
++ 		if (err < 0)
++ 			goto done;
++ 
++ 		nl_dump_check_consistent(cb, nlmsg_hdr(skb));
++ 	}
++ 	err = 0;
++ 
++ done:
++ 	cb->args[2] = ip_idx;
++ 
++ 	return err;
++ }
++ 
+++>>>>>>> bf4cc40e9343 (net/{ipv4,ipv6}: Do not put target net if input nsid is invalid)
+  static int inet_dump_ifaddr(struct sk_buff *skb, struct netlink_callback *cb)
+  {
+ -	const struct nlmsghdr *nlh = cb->nlh;
+  	struct inet_fill_args fillargs = {
+  		.portid = NETLINK_CB(cb->skb).portid,
+ -		.seq = nlh->nlmsg_seq,
+ +		.seq = cb->nlh->nlmsg_seq,
+  		.event = RTM_NEWADDR,
+  		.flags = NLM_F_MULTI,
+  		.netnsid = -1,
+diff --cc net/ipv6/addrconf.c
+index ff031adf9e83,63a808d5af15..000000000000
+--- a/net/ipv6/addrconf.c
++++ b/net/ipv6/addrconf.c
+@@@ -5019,6 -5016,62 +5019,65 @@@ next
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int inet6_valid_dump_ifaddr_req(const struct nlmsghdr *nlh,
++ 				       struct inet6_fill_args *fillargs,
++ 				       struct net **tgt_net, struct sock *sk,
++ 				       struct netlink_callback *cb)
++ {
++ 	struct netlink_ext_ack *extack = cb->extack;
++ 	struct nlattr *tb[IFA_MAX+1];
++ 	struct ifaddrmsg *ifm;
++ 	int err, i;
++ 
++ 	if (nlh->nlmsg_len < nlmsg_msg_size(sizeof(*ifm))) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Invalid header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	ifm = nlmsg_data(nlh);
++ 	if (ifm->ifa_prefixlen || ifm->ifa_flags || ifm->ifa_scope) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Invalid values in header for address dump request");
++ 		return -EINVAL;
++ 	}
++ 
++ 	fillargs->ifindex = ifm->ifa_index;
++ 	if (fillargs->ifindex) {
++ 		cb->answer_flags |= NLM_F_DUMP_FILTERED;
++ 		fillargs->flags |= NLM_F_DUMP_FILTERED;
++ 	}
++ 
++ 	err = nlmsg_parse_strict(nlh, sizeof(*ifm), tb, IFA_MAX,
++ 				 ifa_ipv6_policy, extack);
++ 	if (err < 0)
++ 		return err;
++ 
++ 	for (i = 0; i <= IFA_MAX; ++i) {
++ 		if (!tb[i])
++ 			continue;
++ 
++ 		if (i == IFA_TARGET_NETNSID) {
++ 			struct net *net;
++ 
++ 			fillargs->netnsid = nla_get_s32(tb[i]);
++ 			net = rtnl_get_net_ns_capable(sk, fillargs->netnsid);
++ 			if (IS_ERR(net)) {
++ 				fillargs->netnsid = -1;
++ 				NL_SET_ERR_MSG_MOD(extack, "Invalid target network namespace id");
++ 				return PTR_ERR(net);
++ 			}
++ 			*tgt_net = net;
++ 		} else {
++ 			NL_SET_ERR_MSG_MOD(extack, "Unsupported attribute in dump request");
++ 			return -EINVAL;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> bf4cc40e9343 (net/{ipv4,ipv6}: Do not put target net if input nsid is invalid)
+  static int inet6_dump_addr(struct sk_buff *skb, struct netlink_callback *cb,
+  			   enum addr_type_t type)
+  {
+* Unmerged path net/ipv4/devinet.c
+* Unmerged path net/ipv6/addrconf.c
