@@ -1,0 +1,259 @@
+x86/KVM/VMX: Initialize the vmx_l1d_flush_pages' content
+
+jira LE-1907
+cve CVE-2018-3646
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Nicolai Stange <nstange@suse.de>
+commit 288d152c23dcf3c09da46c5c481903ca10ebfef7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/288d152c.failed
+
+The slow path in vmx_l1d_flush() reads from vmx_l1d_flush_pages in order
+to evict the L1d cache.
+
+However, these pages are never cleared and, in theory, their data could be
+leaked.
+
+More importantly, KSM could merge a nested hypervisor's vmx_l1d_flush_pages
+to fewer than 1 << L1D_CACHE_ORDER host physical pages and this would break
+the L1d flushing algorithm: L1D on x86_64 is tagged by physical addresses.
+
+Fix this by initializing the individual vmx_l1d_flush_pages with a
+different pattern each.
+
+Rename the "empty_zp" asm constraint identifier in vmx_l1d_flush() to
+"flush_pages" to reflect this change.
+
+Fixes: a47dd5f06714 ("x86/KVM/VMX: Add L1D flush algorithm")
+	Signed-off-by: Nicolai Stange <nstange@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+(cherry picked from commit 288d152c23dcf3c09da46c5c481903ca10ebfef7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kvm/vmx.c
+index d9e0ef7725c0,b4b8e8cb4a7e..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -192,12 -188,140 +192,132 @@@ module_param(ple_window_max, uint, 0444
+  
+  extern const ulong vmx_return;
+  
+ -static DEFINE_STATIC_KEY_FALSE(vmx_l1d_should_flush);
+ -static DEFINE_STATIC_KEY_FALSE(vmx_l1d_flush_always);
+ -static DEFINE_MUTEX(vmx_l1d_flush_mutex);
+ -
+ -/* Storage for pre module init parameter parsing */
+ -static enum vmx_l1d_flush_state __read_mostly vmentry_l1d_flush_param = VMENTER_L1D_FLUSH_AUTO;
+ -
+ -static const struct {
+ -	const char *option;
+ -	enum vmx_l1d_flush_state cmd;
+ -} vmentry_l1d_param[] = {
+ -	{"auto",	VMENTER_L1D_FLUSH_AUTO},
+ -	{"never",	VMENTER_L1D_FLUSH_NEVER},
+ -	{"cond",	VMENTER_L1D_FLUSH_COND},
+ -	{"always",	VMENTER_L1D_FLUSH_ALWAYS},
+ +enum ept_pointers_status {
+ +	EPT_POINTERS_CHECK = 0,
+ +	EPT_POINTERS_MATCH = 1,
+ +	EPT_POINTERS_MISMATCH = 2
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static int vmx_setup_l1d_flush(enum vmx_l1d_flush_state l1tf)
++ {
++ 	struct page *page;
++ 	unsigned int i;
++ 
++ 	if (!enable_ept) {
++ 		l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_EPT_DISABLED;
++ 		return 0;
++ 	}
++ 
++ 	/* If set to auto use the default l1tf mitigation method */
++ 	if (l1tf == VMENTER_L1D_FLUSH_AUTO) {
++ 		switch (l1tf_mitigation) {
++ 		case L1TF_MITIGATION_OFF:
++ 			l1tf = VMENTER_L1D_FLUSH_NEVER;
++ 			break;
++ 		case L1TF_MITIGATION_FLUSH_NOWARN:
++ 		case L1TF_MITIGATION_FLUSH:
++ 		case L1TF_MITIGATION_FLUSH_NOSMT:
++ 			l1tf = VMENTER_L1D_FLUSH_COND;
++ 			break;
++ 		case L1TF_MITIGATION_FULL:
++ 		case L1TF_MITIGATION_FULL_FORCE:
++ 			l1tf = VMENTER_L1D_FLUSH_ALWAYS;
++ 			break;
++ 		}
++ 	} else if (l1tf_mitigation == L1TF_MITIGATION_FULL_FORCE) {
++ 		l1tf = VMENTER_L1D_FLUSH_ALWAYS;
++ 	}
++ 
++ 	if (l1tf != VMENTER_L1D_FLUSH_NEVER && !vmx_l1d_flush_pages &&
++ 	    !boot_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		page = alloc_pages(GFP_KERNEL, L1D_CACHE_ORDER);
++ 		if (!page)
++ 			return -ENOMEM;
++ 		vmx_l1d_flush_pages = page_address(page);
++ 
++ 		/*
++ 		 * Initialize each page with a different pattern in
++ 		 * order to protect against KSM in the nested
++ 		 * virtualization case.
++ 		 */
++ 		for (i = 0; i < 1u << L1D_CACHE_ORDER; ++i) {
++ 			memset(vmx_l1d_flush_pages + i * PAGE_SIZE, i + 1,
++ 			       PAGE_SIZE);
++ 		}
++ 	}
++ 
++ 	l1tf_vmx_mitigation = l1tf;
++ 
++ 	if (l1tf != VMENTER_L1D_FLUSH_NEVER)
++ 		static_branch_enable(&vmx_l1d_should_flush);
++ 	else
++ 		static_branch_disable(&vmx_l1d_should_flush);
++ 
++ 	if (l1tf == VMENTER_L1D_FLUSH_ALWAYS)
++ 		static_branch_enable(&vmx_l1d_flush_always);
++ 	else
++ 		static_branch_disable(&vmx_l1d_flush_always);
++ 	return 0;
++ }
++ 
++ static int vmentry_l1d_flush_parse(const char *s)
++ {
++ 	unsigned int i;
++ 
++ 	if (s) {
++ 		for (i = 0; i < ARRAY_SIZE(vmentry_l1d_param); i++) {
++ 			if (sysfs_streq(s, vmentry_l1d_param[i].option))
++ 				return vmentry_l1d_param[i].cmd;
++ 		}
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static int vmentry_l1d_flush_set(const char *s, const struct kernel_param *kp)
++ {
++ 	int l1tf, ret;
++ 
++ 	if (!boot_cpu_has(X86_BUG_L1TF))
++ 		return 0;
++ 
++ 	l1tf = vmentry_l1d_flush_parse(s);
++ 	if (l1tf < 0)
++ 		return l1tf;
++ 
++ 	/*
++ 	 * Has vmx_init() run already? If not then this is the pre init
++ 	 * parameter parsing. In that case just store the value and let
++ 	 * vmx_init() do the proper setup after enable_ept has been
++ 	 * established.
++ 	 */
++ 	if (l1tf_vmx_mitigation == VMENTER_L1D_FLUSH_AUTO) {
++ 		vmentry_l1d_flush_param = l1tf;
++ 		return 0;
++ 	}
++ 
++ 	mutex_lock(&vmx_l1d_flush_mutex);
++ 	ret = vmx_setup_l1d_flush(l1tf);
++ 	mutex_unlock(&vmx_l1d_flush_mutex);
++ 	return ret;
++ }
++ 
++ static int vmentry_l1d_flush_get(char *s, const struct kernel_param *kp)
++ {
++ 	return sprintf(s, "%s\n", vmentry_l1d_param[l1tf_vmx_mitigation].option);
++ }
++ 
++ static const struct kernel_param_ops vmentry_l1d_flush_ops = {
++ 	.set = vmentry_l1d_flush_set,
++ 	.get = vmentry_l1d_flush_get,
++ };
++ module_param_cb(vmentry_l1d_flush, &vmentry_l1d_flush_ops, NULL, 0644);
++ 
+++>>>>>>> 288d152c23dc (x86/KVM/VMX: Initialize the vmx_l1d_flush_pages' content)
+  struct kvm_vmx {
+  	struct kvm kvm;
+  
+@@@ -9950,6 -9671,66 +10070,69 @@@ static int vmx_handle_exit(struct kvm_v
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Software based L1D cache flush which is used when microcode providing
++  * the cache control MSR is not loaded.
++  *
++  * The L1D cache is 32 KiB on Nehalem and later microarchitectures, but to
++  * flush it is required to read in 64 KiB because the replacement algorithm
++  * is not exactly LRU. This could be sized at runtime via topology
++  * information but as all relevant affected CPUs have 32KiB L1D cache size
++  * there is no point in doing so.
++  */
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static void vmx_l1d_flush(struct kvm_vcpu *vcpu)
++ {
++ 	int size = PAGE_SIZE << L1D_CACHE_ORDER;
++ 
++ 	/*
++ 	 * This code is only executed when the the flush mode is 'cond' or
++ 	 * 'always'
++ 	 *
++ 	 * If 'flush always', keep the flush bit set, otherwise clear
++ 	 * it. The flush bit gets set again either from vcpu_run() or from
++ 	 * one of the unsafe VMEXIT handlers.
++ 	 */
++ 	if (static_branch_unlikely(&vmx_l1d_flush_always))
++ 		vcpu->arch.l1tf_flush_l1d = true;
++ 	else
++ 		vcpu->arch.l1tf_flush_l1d = false;
++ 
++ 	vcpu->stat.l1d_flush++;
++ 
++ 	if (static_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		wrmsrl(MSR_IA32_FLUSH_CMD, L1D_FLUSH);
++ 		return;
++ 	}
++ 
++ 	asm volatile(
++ 		/* First ensure the pages are in the TLB */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lpopulate_tlb:\n\t"
++ 		"movzbl	(%[flush_pages], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$4096, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lpopulate_tlb\n\t"
++ 		"xorl	%%eax, %%eax\n\t"
++ 		"cpuid\n\t"
++ 		/* Now fill the cache */
++ 		"xorl	%%eax, %%eax\n"
++ 		".Lfill_cache:\n"
++ 		"movzbl	(%[flush_pages], %%" _ASM_AX "), %%ecx\n\t"
++ 		"addl	$64, %%eax\n\t"
++ 		"cmpl	%%eax, %[size]\n\t"
++ 		"jne	.Lfill_cache\n\t"
++ 		"lfence\n"
++ 		:: [flush_pages] "r" (vmx_l1d_flush_pages),
++ 		    [size] "r" (size)
++ 		: "eax", "ebx", "ecx", "edx");
++ }
++ 
+++>>>>>>> 288d152c23dc (x86/KVM/VMX: Initialize the vmx_l1d_flush_pages' content)
+  static void update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
+  {
+  	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
+* Unmerged path arch/x86/kvm/vmx.c
