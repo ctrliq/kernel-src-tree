@@ -1,0 +1,121 @@
+netlink: add strict parsing for future attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 56738f460841761abc70347c919d5c45f6f05a42
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/56738f46.failed
+
+Unfortunately, we cannot add strict parsing for all attributes, as
+that would break existing userspace. We currently warn about it, but
+that's about all we can do.
+
+For new attributes, however, the story is better: nobody is using
+them, so we can reject bad sizes.
+
+Also, for new attributes, we need not accept them when the policy
+doesn't declare their usage.
+
+David Ahern and I went back and forth on how to best encode this, and
+the best way we found was to have a "boundary type", from which point
+on new attributes have all possible validation applied, and NLA_UNSPEC
+is rejected.
+
+As we didn't want to add another argument to all functions that get a
+netlink policy, the workaround is to encode that boundary in the first
+entry of the policy array (which is for type 0 and thus probably not
+really valid anyway). I put it into the validation union for the rare
+possibility that somebody is actually using attribute 0, which would
+continue to work fine unless they tried to use the extended validation,
+which isn't likely. We also didn't find any in-tree users with type 0.
+
+The reason for setting the "start strict here" attribute is that we
+never really need to start strict from 0, which is invalid anyway (or
+in legacy families where that isn't true, it cannot be set to strict),
+so we can thus reserve the value 0 for "don't do this check" and don't
+have to add the tag to all policies right now.
+
+Thus, policies can now opt in to this validation, which we should do
+for all existing policies, at least when adding new attributes.
+
+Note that entirely *new* policies won't need to set it, as the use
+of that should be using nla_parse()/nlmsg_parse() etc. which anyway
+do fully strict validation now, regardless of this.
+
+So in effect, this patch only covers the "existing command with new
+attribute" case.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 56738f460841761abc70347c919d5c45f6f05a42)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netlink.h
+diff --cc include/net/netlink.h
+index 01d3e027e7e1,679f649748d4..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -252,9 -289,35 +252,38 @@@ enum 
+   * };
+   */
+  struct nla_policy {
+ -	u8		type;
+ -	u8		validation_type;
+ +	u16		type;
+  	u16		len;
+++<<<<<<< HEAD
+ +	RH_KABI_CONST void     *validation_data;
+++=======
++ 	union {
++ 		const void *validation_data;
++ 		struct {
++ 			s16 min, max;
++ 		};
++ 		int (*validate)(const struct nlattr *attr,
++ 				struct netlink_ext_ack *extack);
++ 		/* This entry is special, and used for the attribute at index 0
++ 		 * only, and specifies special data about the policy, namely it
++ 		 * specifies the "boundary type" where strict length validation
++ 		 * starts for any attribute types >= this value, also, strict
++ 		 * nesting validation starts here.
++ 		 *
++ 		 * Additionally, it means that NLA_UNSPEC is actually NLA_REJECT
++ 		 * for any types >= this, so need to use NLA_MIN_LEN to get the
++ 		 * previous pure { .len = xyz } behaviour. The advantage of this
++ 		 * is that types not specified in the policy will be rejected.
++ 		 *
++ 		 * For completely new families it should be set to 1 so that the
++ 		 * validation is enforced for all attributes. For existing ones
++ 		 * it should be set at least when new attributes are added to
++ 		 * the enum used by the policy, and be set to the new value that
++ 		 * was added to enforce strict validation from thereon.
++ 		 */
++ 		u16 strict_start_type;
++ 	};
+++>>>>>>> 56738f460841 (netlink: add strict parsing for future attributes)
+  };
+  
+  #define NLA_POLICY_EXACT_LEN(_len)	{ .type = NLA_EXACT_LEN, .len = _len }
+* Unmerged path include/net/netlink.h
+diff --git a/lib/nlattr.c b/lib/nlattr.c
+index 17d86e6fbd3b..04eb67e3e3ce 100644
+--- a/lib/nlattr.c
++++ b/lib/nlattr.c
+@@ -99,10 +99,14 @@ static int validate_nla(const struct nlattr *nla, int maxtype,
+ 			const struct nla_policy *policy,
+ 			struct netlink_ext_ack *extack)
+ {
++	u16 strict_start_type = policy[0].strict_start_type;
+ 	const struct nla_policy *pt;
+ 	int minlen = 0, attrlen = nla_len(nla), type = nla_type(nla);
+ 	int err = -ERANGE;
+ 
++	if (strict_start_type && type >= strict_start_type)
++		validate |= NL_VALIDATE_STRICT;
++
+ 	if (type <= 0 || type > maxtype)
+ 		return 0;
+ 
