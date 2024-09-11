@@ -1757,6 +1757,9 @@ static const struct attribute_group *pci_dev_attr_groups[] = {
 #ifdef CONFIG_PCIEAER
 	&aer_stats_attr_group,
 #endif
+#ifdef CONFIG_PCIEASPM
+	&aspm_ctrl_attr_group,
+#endif
 	NULL,
 };
 
