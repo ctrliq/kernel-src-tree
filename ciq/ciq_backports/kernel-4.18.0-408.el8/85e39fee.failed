@@ -1,0 +1,228 @@
+NFSv4.1 identify and mark RPC tasks that can move between transports
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Olga Kornievskaia <kolga@netapp.com>
+commit 85e39feead948bdf8322c961d7a9bebc20d629f3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/85e39fee.failed
+
+In preparation for when we can re-try a task on a different transport,
+identify and mark such RPC tasks as moveable. Only 4.1+ operarations can
+be re-tried on a different transport.
+
+	Signed-off-by: Olga Kornievskaia <kolga@netapp.com>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 85e39feead948bdf8322c961d7a9bebc20d629f3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/write.c
+diff --cc fs/nfs/write.c
+index 11efda628fac,eae9bf114041..000000000000
+--- a/fs/nfs/write.c
++++ b/fs/nfs/write.c
+@@@ -1815,8 -1820,12 +1816,15 @@@ nfs_commit_list(struct inode *inode, st
+  
+  	/* Set up the argument struct */
+  	nfs_init_commit(data, head, NULL, cinfo);
+++<<<<<<< HEAD
+++=======
++ 	atomic_inc(&cinfo->mds->rpcs_out);
++ 	if (NFS_SERVER(inode)->nfs_client->cl_minorversion)
++ 		task_flags = RPC_TASK_MOVEABLE;
+++>>>>>>> 85e39feead94 (NFSv4.1 identify and mark RPC tasks that can move between transports)
+  	return nfs_initiate_commit(NFS_CLIENT(inode), data, NFS_PROTO(inode),
+- 				   data->mds_ops, how, RPC_TASK_CRED_NOREF);
++ 				   data->mds_ops, how,
++ 				   RPC_TASK_CRED_NOREF | task_flags);
+  }
+  
+  /*
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index 64f7f57769df..bf92ce54112a 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -1154,7 +1154,11 @@ static int nfs4_call_sync_sequence(struct rpc_clnt *clnt,
+ 				   struct nfs4_sequence_args *args,
+ 				   struct nfs4_sequence_res *res)
+ {
+-	return nfs4_do_call_sync(clnt, server, msg, args, res, 0);
++	unsigned short task_flags = 0;
++
++	if (server->nfs_client->cl_minorversion)
++		task_flags = RPC_TASK_MOVEABLE;
++	return nfs4_do_call_sync(clnt, server, msg, args, res, task_flags);
+ }
+ 
+ 
+@@ -2564,6 +2568,9 @@ static int nfs4_run_open_task(struct nfs4_opendata *data,
+ 	};
+ 	int status;
+ 
++	if (server->nfs_client->cl_minorversion)
++		task_setup_data.flags |= RPC_TASK_MOVEABLE;
++
+ 	kref_get(&data->kref);
+ 	data->rpc_done = false;
+ 	data->rpc_status = 0;
+@@ -3725,6 +3732,9 @@ int nfs4_do_close(struct nfs4_state *state, gfp_t gfp_mask, int wait)
+ 	};
+ 	int status = -ENOMEM;
+ 
++	if (server->nfs_client->cl_minorversion)
++		task_setup_data.flags |= RPC_TASK_MOVEABLE;
++
+ 	nfs4_state_protect(server->nfs_client, NFS_SP4_MACH_CRED_CLEANUP,
+ 		&task_setup_data.rpc_client, &msg);
+ 
+@@ -4163,6 +4173,9 @@ static int _nfs4_proc_getattr(struct nfs_server *server, struct nfs_fh *fhandle,
+ 	};
+ 	unsigned short task_flags = 0;
+ 
++	if (nfs4_has_session(server->nfs_client))
++		task_flags = RPC_TASK_MOVEABLE;
++
+ 	/* Is this is an attribute revalidation, subject to softreval? */
+ 	if (inode && (server->flags & NFS_MOUNT_SOFTREVAL))
+ 		task_flags |= RPC_TASK_TIMEOUT;
+@@ -4274,6 +4287,9 @@ static int _nfs4_proc_lookup(struct rpc_clnt *clnt, struct inode *dir,
+ 	};
+ 	unsigned short task_flags = 0;
+ 
++	if (server->nfs_client->cl_minorversion)
++		task_flags = RPC_TASK_MOVEABLE;
++
+ 	/* Is this is an attribute revalidation, subject to softreval? */
+ 	if (nfs_lookup_is_soft_revalidate(dentry))
+ 		task_flags |= RPC_TASK_TIMEOUT;
+@@ -6443,7 +6459,7 @@ static int _nfs4_proc_delegreturn(struct inode *inode, const struct cred *cred,
+ 		.rpc_client = server->client,
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_delegreturn_ops,
+-		.flags = RPC_TASK_ASYNC | RPC_TASK_TIMEOUT,
++		.flags = RPC_TASK_ASYNC | RPC_TASK_TIMEOUT | RPC_TASK_MOVEABLE,
+ 	};
+ 	int status = 0;
+ 
+@@ -6761,6 +6777,11 @@ static struct rpc_task *nfs4_do_unlck(struct file_lock *fl,
+ 		.workqueue = nfsiod_workqueue,
+ 		.flags = RPC_TASK_ASYNC,
+ 	};
++	struct nfs_client *client =
++		NFS_SERVER(lsp->ls_state->inode)->nfs_client;
++
++	if (client->cl_minorversion)
++		task_setup_data.flags |= RPC_TASK_MOVEABLE;
+ 
+ 	nfs4_state_protect(NFS_SERVER(lsp->ls_state->inode)->nfs_client,
+ 		NFS_SP4_MACH_CRED_CLEANUP, &task_setup_data.rpc_client, &msg);
+@@ -7030,6 +7051,10 @@ static int _nfs4_do_setlk(struct nfs4_state *state, int cmd, struct file_lock *f
+ 		.flags = RPC_TASK_ASYNC | RPC_TASK_CRED_NOREF,
+ 	};
+ 	int ret;
++	struct nfs_client *client = NFS_SERVER(state->inode)->nfs_client;
++
++	if (client->cl_minorversion)
++		task_setup_data.flags |= RPC_TASK_MOVEABLE;
+ 
+ 	data = nfs4_alloc_lockdata(fl, nfs_file_open_context(fl->fl_file),
+ 			fl->fl_u.nfs4_fl.owner,
+@@ -9107,7 +9132,7 @@ static struct rpc_task *_nfs41_proc_sequence(struct nfs_client *clp,
+ 		.rpc_client = clp->cl_rpcclient,
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs41_sequence_ops,
+-		.flags = RPC_TASK_ASYNC | RPC_TASK_TIMEOUT,
++		.flags = RPC_TASK_ASYNC | RPC_TASK_TIMEOUT | RPC_TASK_MOVEABLE,
+ 	};
+ 	struct rpc_task *ret;
+ 
+@@ -9419,7 +9444,8 @@ nfs4_proc_layoutget(struct nfs4_layoutget *lgp, long *timeout)
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_layoutget_call_ops,
+ 		.callback_data = lgp,
+-		.flags = RPC_TASK_ASYNC | RPC_TASK_CRED_NOREF,
++		.flags = RPC_TASK_ASYNC | RPC_TASK_CRED_NOREF |
++			 RPC_TASK_MOVEABLE,
+ 	};
+ 	struct pnfs_layout_segment *lseg = NULL;
+ 	struct nfs4_exception exception = {
+@@ -9549,6 +9575,7 @@ int nfs4_proc_layoutreturn(struct nfs4_layoutreturn *lrp, bool sync)
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_layoutreturn_call_ops,
+ 		.callback_data = lrp,
++		.flags = RPC_TASK_MOVEABLE,
+ 	};
+ 	int status = 0;
+ 
+@@ -9701,6 +9728,7 @@ nfs4_proc_layoutcommit(struct nfs4_layoutcommit_data *data, bool sync)
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs4_layoutcommit_ops,
+ 		.callback_data = data,
++		.flags = RPC_TASK_MOVEABLE,
+ 	};
+ 	struct rpc_task *task;
+ 	int status = 0;
+@@ -10031,7 +10059,7 @@ static int nfs41_free_stateid(struct nfs_server *server,
+ 		.rpc_client = server->client,
+ 		.rpc_message = &msg,
+ 		.callback_ops = &nfs41_free_stateid_ops,
+-		.flags = RPC_TASK_ASYNC,
++		.flags = RPC_TASK_ASYNC | RPC_TASK_MOVEABLE,
+ 	};
+ 	struct nfs_free_stateid_data *data;
+ 	struct rpc_task *task;
+diff --git a/fs/nfs/pagelist.c b/fs/nfs/pagelist.c
+index 85c603c9a246..591e2ecc6466 100644
+--- a/fs/nfs/pagelist.c
++++ b/fs/nfs/pagelist.c
+@@ -944,6 +944,7 @@ static int nfs_generic_pg_pgios(struct nfs_pageio_descriptor *desc)
+ {
+ 	struct nfs_pgio_header *hdr;
+ 	int ret;
++	unsigned short task_flags = 0;
+ 
+ 	hdr = nfs_pgio_header_alloc(desc->pg_rw_ops);
+ 	if (!hdr) {
+@@ -952,14 +953,17 @@ static int nfs_generic_pg_pgios(struct nfs_pageio_descriptor *desc)
+ 	}
+ 	nfs_pgheader_init(desc, hdr, nfs_pgio_header_free);
+ 	ret = nfs_generic_pgio(desc, hdr);
+-	if (ret == 0)
++	if (ret == 0) {
++		if (NFS_SERVER(hdr->inode)->nfs_client->cl_minorversion)
++			task_flags = RPC_TASK_MOVEABLE;
+ 		ret = nfs_initiate_pgio(NFS_CLIENT(hdr->inode),
+ 					hdr,
+ 					hdr->cred,
+ 					NFS_PROTO(hdr->inode),
+ 					desc->pg_rpc_callops,
+ 					desc->pg_ioflags,
+-					RPC_TASK_CRED_NOREF);
++					RPC_TASK_CRED_NOREF | task_flags);
++	}
+ 	return ret;
+ }
+ 
+* Unmerged path fs/nfs/write.c
+diff --git a/include/linux/sunrpc/sched.h b/include/linux/sunrpc/sched.h
+index 97fbf88d9745..db964bb63912 100644
+--- a/include/linux/sunrpc/sched.h
++++ b/include/linux/sunrpc/sched.h
+@@ -121,6 +121,7 @@ struct rpc_task_setup {
+  */
+ #define RPC_TASK_ASYNC		0x0001		/* is an async task */
+ #define RPC_TASK_SWAPPER	0x0002		/* is swapping in/out */
++#define RPC_TASK_MOVEABLE	0x0004		/* nfs4.1+ rpc tasks */
+ #define RPC_TASK_NULLCREDS	0x0010		/* Use AUTH_NULL credential */
+ #define RPC_CALL_MAJORSEEN	0x0020		/* major timeout seen */
+ #define RPC_TASK_ROOTCREDS	0x0040		/* force root creds */
+@@ -139,6 +140,7 @@ struct rpc_task_setup {
+ #define RPC_IS_SOFT(t)		((t)->tk_flags & (RPC_TASK_SOFT|RPC_TASK_TIMEOUT))
+ #define RPC_IS_SOFTCONN(t)	((t)->tk_flags & RPC_TASK_SOFTCONN)
+ #define RPC_WAS_SENT(t)		((t)->tk_flags & RPC_TASK_SENT)
++#define RPC_IS_MOVEABLE(t)	((t)->tk_flags & RPC_TASK_MOVEABLE)
+ 
+ #define RPC_TASK_RUNNING	0
+ #define RPC_TASK_QUEUED		1
