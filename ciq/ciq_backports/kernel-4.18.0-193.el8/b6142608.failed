@@ -1,0 +1,184 @@
+IB/mlx5: Implement VHCA tunnel mechanism in DEVX
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Max Gurtovoy <maxg@mellanox.com>
+commit b6142608e8069dda26398e65b0a14eda6ca4282d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b6142608.failed
+
+This mechanism will allow function-A to perform operations "on behalf" of
+function-B via tunnel object. Function-A will have privileges for creating
+and using this tunnel object.
+
+For example, in the device emulation feature presented in Bluefield-1 SoC,
+using device emulation capability, one can present NVMe function to the
+host OS.
+
+Since the NVMe function doesn't have a normal command interface to the HCA
+HW, here is a need to create a channel that will be able to issue commands
+"on behalf" of this function.
+
+This channel is the VHCA_TUNNEL general object. The emulation software
+will create this tunnel for every managed function and issue commands via
+devx general cmd interface using the appropriate tunnel ID. When devX
+context will receive a command with non-zero vhca_tunnel_id, it will pass
+the command as-is down to the HCA.
+
+All the validation, security and resource tracking of the commands and the
+created tunneled objects is in the responsibility of the HCA FW. When a
+VHCA_TUNNEL object destroyed, the device will issue an internal
+FLR (function level reset) to the emulated function associated with this
+tunnel. This will destroy all the created resources using the tunnel
+mechanism.
+
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b6142608e8069dda26398e65b0a14eda6ca4282d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/devx.c
+diff --cc drivers/infiniband/hw/mlx5/devx.c
+index b9841ad6052e,2aa833417492..000000000000
+--- a/drivers/infiniband/hw/mlx5/devx.c
++++ b/drivers/infiniband/hw/mlx5/devx.c
+@@@ -1282,8 -1309,11 +1292,11 @@@ static int UVERBS_HANDLER(MLX5_IB_METHO
+  	void *cmd_out;
+  	int err;
+  	int uid;
+ -	struct mlx5_ib_dev *mdev = to_mdev(c->ibucontext.device);
+ +	struct mlx5_ib_dev *mdev = to_mdev(uobj->context->device);
+  
++ 	if (MLX5_GET(general_obj_in_cmd_hdr, cmd_in, vhca_tunnel_id))
++ 		return -EINVAL;
++ 
+  	uid = devx_get_uid(c, cmd_in);
+  	if (uid < 0)
+  		return uid;
+@@@ -1341,6 -1377,119 +1354,121 @@@ static int UVERBS_HANDLER(MLX5_IB_METHO
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void devx_query_callback(int status, struct mlx5_async_work *context)
++ {
++ 	struct devx_async_data *async_data =
++ 		container_of(context, struct devx_async_data, cb_work);
++ 	struct ib_uobject *fd_uobj = async_data->fd_uobj;
++ 	struct devx_async_cmd_event_file *ev_file;
++ 	struct devx_async_event_queue *ev_queue;
++ 	unsigned long flags;
++ 
++ 	ev_file = container_of(fd_uobj, struct devx_async_cmd_event_file,
++ 			       uobj);
++ 	ev_queue = &ev_file->ev_queue;
++ 
++ 	spin_lock_irqsave(&ev_queue->lock, flags);
++ 	list_add_tail(&async_data->list, &ev_queue->event_list);
++ 	spin_unlock_irqrestore(&ev_queue->lock, flags);
++ 
++ 	wake_up_interruptible(&ev_queue->poll_wait);
++ 	fput(fd_uobj->object);
++ }
++ 
++ #define MAX_ASYNC_BYTES_IN_USE (1024 * 1024) /* 1MB */
++ 
++ static int UVERBS_HANDLER(MLX5_IB_METHOD_DEVX_OBJ_ASYNC_QUERY)(
++ 	struct uverbs_attr_bundle *attrs)
++ {
++ 	void *cmd_in = uverbs_attr_get_alloced_ptr(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_CMD_IN);
++ 	struct ib_uobject *uobj = uverbs_attr_get_uobject(
++ 				attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_HANDLE);
++ 	u16 cmd_out_len;
++ 	struct mlx5_ib_ucontext *c = rdma_udata_to_drv_context(
++ 		&attrs->driver_udata, struct mlx5_ib_ucontext, ibucontext);
++ 	struct ib_uobject *fd_uobj;
++ 	int err;
++ 	int uid;
++ 	struct mlx5_ib_dev *mdev = to_mdev(c->ibucontext.device);
++ 	struct devx_async_cmd_event_file *ev_file;
++ 	struct devx_async_data *async_data;
++ 
++ 	if (MLX5_GET(general_obj_in_cmd_hdr, cmd_in, vhca_tunnel_id))
++ 		return -EINVAL;
++ 
++ 	uid = devx_get_uid(c, cmd_in);
++ 	if (uid < 0)
++ 		return uid;
++ 
++ 	if (!devx_is_obj_query_cmd(cmd_in))
++ 		return -EINVAL;
++ 
++ 	err = uverbs_get_const(&cmd_out_len, attrs,
++ 			       MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_OUT_LEN);
++ 	if (err)
++ 		return err;
++ 
++ 	if (!devx_is_valid_obj_id(attrs, uobj, cmd_in))
++ 		return -EINVAL;
++ 
++ 	fd_uobj = uverbs_attr_get_uobject(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_FD);
++ 	if (IS_ERR(fd_uobj))
++ 		return PTR_ERR(fd_uobj);
++ 
++ 	ev_file = container_of(fd_uobj, struct devx_async_cmd_event_file,
++ 			       uobj);
++ 
++ 	if (atomic_add_return(cmd_out_len, &ev_file->ev_queue.bytes_in_use) >
++ 			MAX_ASYNC_BYTES_IN_USE) {
++ 		atomic_sub(cmd_out_len, &ev_file->ev_queue.bytes_in_use);
++ 		return -EAGAIN;
++ 	}
++ 
++ 	async_data = kvzalloc(struct_size(async_data, hdr.out_data,
++ 					  cmd_out_len), GFP_KERNEL);
++ 	if (!async_data) {
++ 		err = -ENOMEM;
++ 		goto sub_bytes;
++ 	}
++ 
++ 	err = uverbs_copy_from(&async_data->hdr.wr_id, attrs,
++ 			       MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_WR_ID);
++ 	if (err)
++ 		goto free_async;
++ 
++ 	async_data->cmd_out_len = cmd_out_len;
++ 	async_data->mdev = mdev;
++ 	async_data->fd_uobj = fd_uobj;
++ 
++ 	get_file(fd_uobj->object);
++ 	MLX5_SET(general_obj_in_cmd_hdr, cmd_in, uid, uid);
++ 	err = mlx5_cmd_exec_cb(&ev_file->async_ctx, cmd_in,
++ 		    uverbs_attr_get_len(attrs,
++ 				MLX5_IB_ATTR_DEVX_OBJ_QUERY_ASYNC_CMD_IN),
++ 		    async_data->hdr.out_data,
++ 		    async_data->cmd_out_len,
++ 		    devx_query_callback, &async_data->cb_work);
++ 
++ 	if (err)
++ 		goto cb_err;
++ 
++ 	return 0;
++ 
++ cb_err:
++ 	fput(fd_uobj->object);
++ free_async:
++ 	kvfree(async_data);
++ sub_bytes:
++ 	atomic_sub(cmd_out_len, &ev_file->ev_queue.bytes_in_use);
++ 	return err;
++ }
++ 
+++>>>>>>> b6142608e806 (IB/mlx5: Implement VHCA tunnel mechanism in DEVX)
+  static int devx_umem_get(struct mlx5_ib_dev *dev, struct ib_ucontext *ucontext,
+  			 struct uverbs_attr_bundle *attrs,
+  			 struct devx_umem *obj)
+* Unmerged path drivers/infiniband/hw/mlx5/devx.c
