@@ -1,0 +1,176 @@
+crypto: vmx - ghash: do nosimd fallback manually
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Daniel Axtens <dja@axtens.net>
+commit 357d065a44cdd77ed5ff35155a989f2a763e96ef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/357d065a.failed
+
+VMX ghash was using a fallback that did not support interleaving simd
+and nosimd operations, leading to failures in the extended test suite.
+
+If I understood correctly, Eric's suggestion was to use the same
+data format that the generic code uses, allowing us to call into it
+with the same contexts. I wasn't able to get that to work - I think
+there's a very different key structure and data layout being used.
+
+So instead steal the arm64 approach and perform the fallback
+operations directly if required.
+
+Fixes: cc333cd68dfa ("crypto: vmx - Adding GHASH routines for VMX module")
+	Cc: stable@vger.kernel.org # v4.1+
+	Reported-by: Eric Biggers <ebiggers@google.com>
+	Signed-off-by: Daniel Axtens <dja@axtens.net>
+	Acked-by: Ard Biesheuvel <ard.biesheuvel@linaro.org>
+	Tested-by: Michael Ellerman <mpe@ellerman.id.au>
+	Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit 357d065a44cdd77ed5ff35155a989f2a763e96ef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/vmx/ghash.c
+diff --cc drivers/crypto/vmx/ghash.c
+index 1c4b5b889fba,14807ac2e3b9..000000000000
+--- a/drivers/crypto/vmx/ghash.c
++++ b/drivers/crypto/vmx/ghash.c
+@@@ -101,9 -48,7 +49,13 @@@ static int p8_ghash_init(struct shash_d
+  
+  	dctx->bytes = 0;
+  	memset(dctx->shash, 0, GHASH_DIGEST_SIZE);
+++<<<<<<< HEAD
+ +	dctx->fallback_desc.tfm = ctx->fallback;
+ +	dctx->fallback_desc.flags = desc->flags;
+ +	return crypto_shash_init(&dctx->fallback_desc);
+++=======
++ 	return 0;
+++>>>>>>> 357d065a44cd (crypto: vmx - ghash: do nosimd fallback manually)
+  }
+  
+  static int p8_ghash_setkey(struct crypto_shash *tfm, const u8 *key,
+@@@ -131,49 -120,33 +127,47 @@@ static int p8_ghash_update(struct shash
+  	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(crypto_shash_tfm(desc->tfm));
+  	struct p8_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+  
+++<<<<<<< HEAD
+ +	if (IN_INTERRUPT) {
+ +		return crypto_shash_update(&dctx->fallback_desc, src,
+ +					   srclen);
+ +	} else {
+ +		if (dctx->bytes) {
+ +			if (dctx->bytes + srclen < GHASH_DIGEST_SIZE) {
+ +				memcpy(dctx->buffer + dctx->bytes, src,
+ +				       srclen);
+ +				dctx->bytes += srclen;
+ +				return 0;
+ +			}
+++=======
++ 	if (dctx->bytes) {
++ 		if (dctx->bytes + srclen < GHASH_DIGEST_SIZE) {
+++>>>>>>> 357d065a44cd (crypto: vmx - ghash: do nosimd fallback manually)
+  			memcpy(dctx->buffer + dctx->bytes, src,
+- 			       GHASH_DIGEST_SIZE - dctx->bytes);
+- 			preempt_disable();
+- 			pagefault_disable();
+- 			enable_kernel_vsx();
+- 			gcm_ghash_p8(dctx->shash, ctx->htable,
+- 				     dctx->buffer, GHASH_DIGEST_SIZE);
+- 			disable_kernel_vsx();
+- 			pagefault_enable();
+- 			preempt_enable();
+- 			src += GHASH_DIGEST_SIZE - dctx->bytes;
+- 			srclen -= GHASH_DIGEST_SIZE - dctx->bytes;
+- 			dctx->bytes = 0;
++ 				srclen);
++ 			dctx->bytes += srclen;
++ 			return 0;
+  		}
+- 		len = srclen & ~(GHASH_DIGEST_SIZE - 1);
+- 		if (len) {
+- 			preempt_disable();
+- 			pagefault_disable();
+- 			enable_kernel_vsx();
+- 			gcm_ghash_p8(dctx->shash, ctx->htable, src, len);
+- 			disable_kernel_vsx();
+- 			pagefault_enable();
+- 			preempt_enable();
+- 			src += len;
+- 			srclen -= len;
+- 		}
+- 		if (srclen) {
+- 			memcpy(dctx->buffer, src, srclen);
+- 			dctx->bytes = srclen;
+- 		}
+- 		return 0;
++ 		memcpy(dctx->buffer + dctx->bytes, src,
++ 			GHASH_DIGEST_SIZE - dctx->bytes);
++ 
++ 		__ghash_block(ctx, dctx);
++ 
++ 		src += GHASH_DIGEST_SIZE - dctx->bytes;
++ 		srclen -= GHASH_DIGEST_SIZE - dctx->bytes;
++ 		dctx->bytes = 0;
++ 	}
++ 	len = srclen & ~(GHASH_DIGEST_SIZE - 1);
++ 	if (len) {
++ 		__ghash_blocks(ctx, dctx, src, len);
++ 		src += len;
++ 		srclen -= len;
+  	}
++ 	if (srclen) {
++ 		memcpy(dctx->buffer, src, srclen);
++ 		dctx->bytes = srclen;
++ 	}
++ 	return 0;
+  }
+  
+  static int p8_ghash_final(struct shash_desc *desc, u8 *out)
+@@@ -182,25 -155,14 +176,35 @@@
+  	struct p8_ghash_ctx *ctx = crypto_tfm_ctx(crypto_shash_tfm(desc->tfm));
+  	struct p8_ghash_desc_ctx *dctx = shash_desc_ctx(desc);
+  
+++<<<<<<< HEAD
+ +	if (IN_INTERRUPT) {
+ +		return crypto_shash_final(&dctx->fallback_desc, out);
+ +	} else {
+ +		if (dctx->bytes) {
+ +			for (i = dctx->bytes; i < GHASH_DIGEST_SIZE; i++)
+ +				dctx->buffer[i] = 0;
+ +			preempt_disable();
+ +			pagefault_disable();
+ +			enable_kernel_vsx();
+ +			gcm_ghash_p8(dctx->shash, ctx->htable,
+ +				     dctx->buffer, GHASH_DIGEST_SIZE);
+ +			disable_kernel_vsx();
+ +			pagefault_enable();
+ +			preempt_enable();
+ +			dctx->bytes = 0;
+ +		}
+ +		memcpy(out, dctx->shash, GHASH_DIGEST_SIZE);
+ +		return 0;
+++=======
++ 	if (dctx->bytes) {
++ 		for (i = dctx->bytes; i < GHASH_DIGEST_SIZE; i++)
++ 			dctx->buffer[i] = 0;
++ 		__ghash_block(ctx, dctx);
++ 		dctx->bytes = 0;
+++>>>>>>> 357d065a44cd (crypto: vmx - ghash: do nosimd fallback manually)
+  	}
++ 	memcpy(out, dctx->shash, GHASH_DIGEST_SIZE);
++ 	return 0;
+  }
+  
+  struct shash_alg p8_ghash_alg = {
+@@@ -215,7 -177,6 +219,10 @@@
+  		 .cra_name = "ghash",
+  		 .cra_driver_name = "p8_ghash",
+  		 .cra_priority = 1000,
+++<<<<<<< HEAD
+ +		 .cra_flags = CRYPTO_ALG_TYPE_SHASH | CRYPTO_ALG_NEED_FALLBACK,
+++=======
+++>>>>>>> 357d065a44cd (crypto: vmx - ghash: do nosimd fallback manually)
+  		 .cra_blocksize = GHASH_BLOCK_SIZE,
+  		 .cra_ctxsize = sizeof(struct p8_ghash_ctx),
+  		 .cra_module = THIS_MODULE,
+* Unmerged path drivers/crypto/vmx/ghash.c
