@@ -1,0 +1,166 @@
+libbpf: Add function to set link XDP fd while specifying old program
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit bd5ca3ef93cd8fb7e913f15eeb78e67a0d802274
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/bd5ca3ef.failed
+
+This adds a new function to set the XDP fd while specifying the FD of the
+program to replace, using the newly added IFLA_XDP_EXPECTED_FD netlink
+parameter. The new function uses the opts struct mechanism to be extendable
+in the future.
+
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/158515700857.92963.7052131201257841700.stgit@toke.dk
+(cherry picked from commit bd5ca3ef93cd8fb7e913f15eeb78e67a0d802274)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.map
+diff --cc tools/lib/bpf/libbpf.map
+index 3ca7228af37e,dcc87db3ca8a..000000000000
+--- a/tools/lib/bpf/libbpf.map
++++ b/tools/lib/bpf/libbpf.map
+@@@ -188,9 -197,52 +188,53 @@@ LIBBPF_0.0.4 
+  		bpf_map__get_pin_path;
+  		bpf_map__is_pinned;
+  		bpf_map__set_pin_path;
+ -		bpf_object__open_file;
+ -		bpf_object__open_mem;
+ -		bpf_program__attach_trace;
+  		bpf_program__get_expected_attach_type;
+  		bpf_program__get_type;
+ -		bpf_program__is_tracing;
+ -		bpf_program__set_tracing;
+ +		bpf_get_link_xdp_info;
+  		bpf_program__size;
+++<<<<<<< HEAD
+ +		bpf_btf_get_next_id;
+ +} LIBBPF_0.0.3;
+++=======
++ 		btf__find_by_name_kind;
++ 		libbpf_find_vmlinux_btf_id;
++ } LIBBPF_0.0.5;
++ 
++ LIBBPF_0.0.7 {
++ 	global:
++ 		btf_dump__emit_type_decl;
++ 		bpf_link__disconnect;
++ 		bpf_map__attach_struct_ops;
++ 		bpf_map_delete_batch;
++ 		bpf_map_lookup_and_delete_batch;
++ 		bpf_map_lookup_batch;
++ 		bpf_map_update_batch;
++ 		bpf_object__find_program_by_name;
++ 		bpf_object__attach_skeleton;
++ 		bpf_object__destroy_skeleton;
++ 		bpf_object__detach_skeleton;
++ 		bpf_object__load_skeleton;
++ 		bpf_object__open_skeleton;
++ 		bpf_probe_large_insn_limit;
++ 		bpf_prog_attach_xattr;
++ 		bpf_program__attach;
++ 		bpf_program__name;
++ 		bpf_program__is_extension;
++ 		bpf_program__is_struct_ops;
++ 		bpf_program__set_extension;
++ 		bpf_program__set_struct_ops;
++ 		btf__align_of;
++ 		libbpf_find_kernel_btf;
++ } LIBBPF_0.0.6;
++ 
++ LIBBPF_0.0.8 {
++ 	global:
++ 		bpf_link__fd;
++ 		bpf_link__open;
++ 		bpf_link__pin;
++ 		bpf_link__pin_path;
++ 		bpf_link__unpin;
++ 		bpf_program__set_attach_target;
++ 		bpf_set_link_xdp_fd_opts;
++ } LIBBPF_0.0.7;
+++>>>>>>> bd5ca3ef93cd (libbpf: Add function to set link XDP fd while specifying old program)
+diff --git a/tools/lib/bpf/libbpf.h b/tools/lib/bpf/libbpf.h
+index e454ceec9fa2..095f025c24b2 100644
+--- a/tools/lib/bpf/libbpf.h
++++ b/tools/lib/bpf/libbpf.h
+@@ -407,7 +407,15 @@ struct xdp_link_info {
+ 	__u8 attach_mode;
+ };
+ 
++struct bpf_xdp_set_link_opts {
++	size_t sz;
++	__u32 old_fd;
++};
++#define bpf_xdp_set_link_opts__last_field old_fd
++
+ LIBBPF_API int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags);
++LIBBPF_API int bpf_set_link_xdp_fd_opts(int ifindex, int fd, __u32 flags,
++					const struct bpf_xdp_set_link_opts *opts);
+ LIBBPF_API int bpf_get_link_xdp_id(int ifindex, __u32 *prog_id, __u32 flags);
+ LIBBPF_API int bpf_get_link_xdp_info(int ifindex, struct xdp_link_info *info,
+ 				     size_t info_size, __u32 flags);
+* Unmerged path tools/lib/bpf/libbpf.map
+diff --git a/tools/lib/bpf/netlink.c b/tools/lib/bpf/netlink.c
+index 7839e8a70049..565a6735c7dc 100644
+--- a/tools/lib/bpf/netlink.c
++++ b/tools/lib/bpf/netlink.c
+@@ -129,7 +129,8 @@ static int bpf_netlink_recv(int sock, __u32 nl_pid, int seq,
+ 	return ret;
+ }
+ 
+-int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
++static int __bpf_set_link_xdp_fd_replace(int ifindex, int fd, int old_fd,
++					 __u32 flags)
+ {
+ 	int sock, seq = 0, ret;
+ 	struct nlattr *nla, *nla_xdp;
+@@ -175,6 +176,14 @@ int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
+ 		nla->nla_len += nla_xdp->nla_len;
+ 	}
+ 
++	if (flags & XDP_FLAGS_REPLACE) {
++		nla_xdp = (struct nlattr *)((char *)nla + nla->nla_len);
++		nla_xdp->nla_type = IFLA_XDP_EXPECTED_FD;
++		nla_xdp->nla_len = NLA_HDRLEN + sizeof(old_fd);
++		memcpy((char *)nla_xdp + NLA_HDRLEN, &old_fd, sizeof(old_fd));
++		nla->nla_len += nla_xdp->nla_len;
++	}
++
+ 	req.nh.nlmsg_len += NLA_ALIGN(nla->nla_len);
+ 
+ 	if (send(sock, &req, req.nh.nlmsg_len, 0) < 0) {
+@@ -188,6 +197,29 @@ int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
+ 	return ret;
+ }
+ 
++int bpf_set_link_xdp_fd_opts(int ifindex, int fd, __u32 flags,
++			     const struct bpf_xdp_set_link_opts *opts)
++{
++	int old_fd = -1;
++
++	if (!OPTS_VALID(opts, bpf_xdp_set_link_opts))
++		return -EINVAL;
++
++	if (OPTS_HAS(opts, old_fd)) {
++		old_fd = OPTS_GET(opts, old_fd, -1);
++		flags |= XDP_FLAGS_REPLACE;
++	}
++
++	return __bpf_set_link_xdp_fd_replace(ifindex, fd,
++					     old_fd,
++					     flags);
++}
++
++int bpf_set_link_xdp_fd(int ifindex, int fd, __u32 flags)
++{
++	return __bpf_set_link_xdp_fd_replace(ifindex, fd, 0, flags);
++}
++
+ static int __dump_link_nlmsg(struct nlmsghdr *nlh,
+ 			     libbpf_dump_nlmsg_t dump_link_nlmsg, void *cookie)
+ {
