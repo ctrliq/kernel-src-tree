@@ -1,0 +1,440 @@
+s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Tony Krowiak <akrowiak@linux.ibm.com>
+commit 2c1ee8983aa377fef4f725162f4f3aa5f9575d4a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/2c1ee898.failed
+
+The callback functions for probing and removing a queue device must take
+and release the locks required to perform a dynamic update of a guest's
+APCB in the proper order.
+
+The proper order for taking the locks is:
+
+        matrix_dev->guests_lock => kvm->lock => matrix_dev->mdevs_lock
+
+The proper order for releasing the locks is:
+
+        matrix_dev->mdevs_lock => kvm->lock => matrix_dev->guests_lock
+
+A new helper function is introduced to be used by the probe callback to
+acquire the required locks. Since the probe callback only has
+access to a queue device when it is called, the helper function will find
+the ap_matrix_mdev object to which the queue device's APQN is assigned and
+return it so the KVM guest to which the mdev is attached can be dynamically
+updated.
+
+Note that in order to find the ap_matrix_mdev (matrix_mdev) object, it is
+necessary to search the matrix_dev->mdev_list. This presents a
+locking order dilemma because the matrix_dev->mdevs_lock can't be taken to
+protect against changes to the list while searching for the matrix_mdev to
+which a queue device's APQN is assigned. This is due to the fact that the
+proper locking order requires that the matrix_dev->mdevs_lock be taken
+after both the matrix_mdev->kvm->lock and the matrix_dev->mdevs_lock.
+Consequently, the matrix_dev->guests_lock will be used to protect against
+removal of a matrix_mdev object from the list while a queue device is
+being probed. This necessitates changes to the mdev probe/remove
+callback functions to take the matrix_dev->guests_lock prior to removing
+a matrix_mdev object from the list.
+
+A new macro is also introduced to acquire the locks required to dynamically
+update the guest's APCB in the proper order when a queue device is
+removed.
+
+	Signed-off-by: Tony Krowiak <akrowiak@linux.ibm.com>
+	Reviewed-by: Jason J. Herne <jjherne@linux.ibm.com>
+	Signed-off-by: Alexander Gordeev <agordeev@linux.ibm.com>
+(cherry picked from commit 2c1ee8983aa377fef4f725162f4f3aa5f9575d4a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/crypto/vfio_ap_ops.c
+diff --cc drivers/s390/crypto/vfio_ap_ops.c
+index 69b05ef08538,fd0f0f241197..000000000000
+--- a/drivers/s390/crypto/vfio_ap_ops.c
++++ b/drivers/s390/crypto/vfio_ap_ops.c
+@@@ -24,21 -26,180 +24,176 @@@
+  #define VFIO_AP_MDEV_TYPE_HWVIRT "passthrough"
+  #define VFIO_AP_MDEV_NAME_HWVIRT "VFIO AP Passthrough Device"
+  
+ -#define AP_QUEUE_ASSIGNED "assigned"
+ -#define AP_QUEUE_UNASSIGNED "unassigned"
+ -#define AP_QUEUE_IN_USE "in use"
+ -
+ -static int vfio_ap_mdev_reset_queues(struct ap_matrix_mdev *matrix_mdev);
+ +static int vfio_ap_mdev_reset_queues(struct mdev_device *mdev);
+  static struct vfio_ap_queue *vfio_ap_find_queue(int apqn);
+ -static const struct vfio_device_ops vfio_ap_matrix_dev_ops;
+  
+  /**
+ - * get_update_locks_for_kvm: Acquire the locks required to dynamically update a
+ - *			     KVM guest's APCB in the proper order.
+ - *
+ - * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
+ + * vfio_ap_get_queue - retrieve a queue with a specific APQN from a list
+ + * @matrix_mdev: the associated mediated matrix
+ + * @apqn: The queue APQN
+   *
+ - * The proper locking order is:
+ - * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
+ - *			       guest's APCB.
+ - * 2. kvm->lock:	       required to update a guest's APCB
+ - * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
+ + * Retrieve a queue with a specific APQN from the list of the
+ + * devices of the vfio_ap_drv.
+ + * Verify that the APID and the APQI are set in the matrix.
+   *
+ - * Note: If @kvm is NULL, the KVM lock will not be taken.
+ + * Return: the pointer to the associated vfio_ap_queue
+   */
+++<<<<<<< HEAD
+ +static struct vfio_ap_queue *vfio_ap_get_queue(
+++=======
++ static inline void get_update_locks_for_kvm(struct kvm *kvm)
++ {
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	if (kvm)
++ 		mutex_lock(&kvm->lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ }
++ 
++ /**
++  * release_update_locks_for_kvm: Release the locks used to dynamically update a
++  *				 KVM guest's APCB in the proper order.
++  *
++  * @kvm: a pointer to a struct kvm object containing the KVM guest's APCB.
++  *
++  * The proper unlocking order is:
++  * 1. matrix_dev->mdevs_lock
++  * 2. kvm->lock
++  * 3. matrix_dev->guests_lock
++  *
++  * Note: If @kvm is NULL, the KVM lock will not be released.
++  */
++ static inline void release_update_locks_for_kvm(struct kvm *kvm)
++ {
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	if (kvm)
++ 		mutex_unlock(&kvm->lock);
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ }
++ 
++ /**
++  * get_update_locks_for_mdev: Acquire the locks required to dynamically update a
++  *			      KVM guest's APCB in the proper order.
++  *
++  * @matrix_mdev: a pointer to a struct ap_matrix_mdev object containing the AP
++  *		 configuration data to use to update a KVM guest's APCB.
++  *
++  * The proper locking order is:
++  * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
++  *			       guest's APCB.
++  * 2. matrix_mdev->kvm->lock:  required to update a guest's APCB
++  * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
++  *
++  * Note: If @matrix_mdev is NULL or is not attached to a KVM guest, the KVM
++  *	 lock will not be taken.
++  */
++ static inline void get_update_locks_for_mdev(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	if (matrix_mdev && matrix_mdev->kvm)
++ 		mutex_lock(&matrix_mdev->kvm->lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ }
++ 
++ /**
++  * release_update_locks_for_mdev: Release the locks used to dynamically update a
++  *				  KVM guest's APCB in the proper order.
++  *
++  * @matrix_mdev: a pointer to a struct ap_matrix_mdev object containing the AP
++  *		 configuration data to use to update a KVM guest's APCB.
++  *
++  * The proper unlocking order is:
++  * 1. matrix_dev->mdevs_lock
++  * 2. matrix_mdev->kvm->lock
++  * 3. matrix_dev->guests_lock
++  *
++  * Note: If @matrix_mdev is NULL or is not attached to a KVM guest, the KVM
++  *	 lock will not be released.
++  */
++ static inline void release_update_locks_for_mdev(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	if (matrix_mdev && matrix_mdev->kvm)
++ 		mutex_unlock(&matrix_mdev->kvm->lock);
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ }
++ 
++ /**
++  * get_update_locks_by_apqn: Find the mdev to which an APQN is assigned and
++  *			     acquire the locks required to update the APCB of
++  *			     the KVM guest to which the mdev is attached.
++  *
++  * @apqn: the APQN of a queue device.
++  *
++  * The proper locking order is:
++  * 1. matrix_dev->guests_lock: required to use the KVM pointer to update a KVM
++  *			       guest's APCB.
++  * 2. matrix_mdev->kvm->lock:  required to update a guest's APCB
++  * 3. matrix_dev->mdevs_lock:  required to access data stored in a matrix_mdev
++  *
++  * Note: If @apqn is not assigned to a matrix_mdev, the matrix_mdev->kvm->lock
++  *	 will not be taken.
++  *
++  * Return: the ap_matrix_mdev object to which @apqn is assigned or NULL if @apqn
++  *	   is not assigned to an ap_matrix_mdev.
++  */
++ static struct ap_matrix_mdev *get_update_locks_by_apqn(int apqn)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 
++ 	list_for_each_entry(matrix_mdev, &matrix_dev->mdev_list, node) {
++ 		if (test_bit_inv(AP_QID_CARD(apqn), matrix_mdev->matrix.apm) &&
++ 		    test_bit_inv(AP_QID_QUEUE(apqn), matrix_mdev->matrix.aqm)) {
++ 			if (matrix_mdev->kvm)
++ 				mutex_lock(&matrix_mdev->kvm->lock);
++ 
++ 			mutex_lock(&matrix_dev->mdevs_lock);
++ 
++ 			return matrix_mdev;
++ 		}
++ 	}
++ 
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * get_update_locks_for_queue: get the locks required to update the APCB of the
++  *			       KVM guest to which the matrix mdev linked to a
++  *			       vfio_ap_queue object is attached.
++  *
++  * @q: a pointer to a vfio_ap_queue object.
++  *
++  * The proper locking order is:
++  * 1. q->matrix_dev->guests_lock: required to use the KVM pointer to update a
++  *				  KVM guest's APCB.
++  * 2. q->matrix_mdev->kvm->lock:  required to update a guest's APCB
++  * 3. matrix_dev->mdevs_lock:	  required to access data stored in matrix_mdev
++  *
++  * Note: if @queue is not linked to an ap_matrix_mdev object, the KVM lock
++  *	  will not be taken.
++  */
++ static inline void get_update_locks_for_queue(struct vfio_ap_queue *q)
++ {
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	if (q->matrix_mdev && q->matrix_mdev->kvm)
++ 		mutex_lock(&q->matrix_mdev->kvm->lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ }
++ 
++ /**
++  * vfio_ap_mdev_get_queue - retrieve a queue with a specific APQN from a
++  *			    hash table of queues assigned to a matrix mdev
++  * @matrix_mdev: the matrix mdev
++  * @apqn: The APQN of a queue device
++  *
++  * Return: the pointer to the vfio_ap_queue struct representing the queue or
++  *	   NULL if the queue is not assigned to @matrix_mdev
++  */
++ static struct vfio_ap_queue *vfio_ap_mdev_get_queue(
+++>>>>>>> 2c1ee8983aa3 (s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove)
+  					struct ap_matrix_mdev *matrix_mdev,
+  					int apqn)
+  {
+@@@ -337,31 -683,98 +492,121 @@@ static int vfio_ap_mdev_create(struct k
+  
+  	matrix_mdev->mdev = mdev;
+  	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->matrix);
+ +	mdev_set_drvdata(mdev, matrix_mdev);
+  	matrix_mdev->pqap_hook = handle_pqap;
+++<<<<<<< HEAD
+ +	mutex_lock(&matrix_dev->lock);
+ +	list_add(&matrix_mdev->node, &matrix_dev->mdev_list);
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+++=======
++ 	vfio_ap_matrix_init(&matrix_dev->info, &matrix_mdev->shadow_apcb);
++ 	hash_init(matrix_mdev->qtable.queues);
++ 
++ 	ret = vfio_register_emulated_iommu_dev(&matrix_mdev->vdev);
++ 	if (ret)
++ 		goto err_list;
++ 	dev_set_drvdata(&mdev->dev, matrix_mdev);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 	list_add(&matrix_mdev->node, &matrix_dev->mdev_list);
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
+++>>>>>>> 2c1ee8983aa3 (s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove)
+  	return 0;
+ +}
+ +
+++<<<<<<< HEAD
+ +static int vfio_ap_mdev_remove(struct mdev_device *mdev)
+ +{
+ +	struct ap_matrix_mdev *matrix_mdev = mdev_get_drvdata(mdev);
+  
+ +	mutex_lock(&matrix_dev->lock);
+ +	vfio_ap_mdev_reset_queues(mdev);
+ +	list_del(&matrix_mdev->node);
+++=======
++ err_list:
++ 	vfio_uninit_group_dev(&matrix_mdev->vdev);
+++>>>>>>> 2c1ee8983aa3 (s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove)
+  	kfree(matrix_mdev);
+ -err_dec_available:
+ +	mdev_set_drvdata(mdev, NULL);
+  	atomic_inc(&matrix_dev->available_instances);
+ -	return ret;
+ +	mutex_unlock(&matrix_dev->lock);
+ +
+ +	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static ssize_t name_show(struct kobject *kobj, struct device *dev, char *buf)
+++=======
++ static void vfio_ap_mdev_link_queue(struct ap_matrix_mdev *matrix_mdev,
++ 				    struct vfio_ap_queue *q)
++ {
++ 	if (q) {
++ 		q->matrix_mdev = matrix_mdev;
++ 		hash_add(matrix_mdev->qtable.queues, &q->mdev_qnode, q->apqn);
++ 	}
++ }
++ 
++ static void vfio_ap_mdev_link_apqn(struct ap_matrix_mdev *matrix_mdev, int apqn)
++ {
++ 	struct vfio_ap_queue *q;
++ 
++ 	q = vfio_ap_find_queue(apqn);
++ 	vfio_ap_mdev_link_queue(matrix_mdev, q);
++ }
++ 
++ static void vfio_ap_unlink_queue_fr_mdev(struct vfio_ap_queue *q)
++ {
++ 	hash_del(&q->mdev_qnode);
++ }
++ 
++ static void vfio_ap_unlink_mdev_fr_queue(struct vfio_ap_queue *q)
++ {
++ 	q->matrix_mdev = NULL;
++ }
++ 
++ static void vfio_ap_mdev_unlink_queue(struct vfio_ap_queue *q)
++ {
++ 	vfio_ap_unlink_queue_fr_mdev(q);
++ 	vfio_ap_unlink_mdev_fr_queue(q);
++ }
++ 
++ static void vfio_ap_mdev_unlink_fr_queues(struct ap_matrix_mdev *matrix_mdev)
++ {
++ 	struct vfio_ap_queue *q;
++ 	unsigned long apid, apqi;
++ 
++ 	for_each_set_bit_inv(apid, matrix_mdev->matrix.apm, AP_DEVICES) {
++ 		for_each_set_bit_inv(apqi, matrix_mdev->matrix.aqm,
++ 				     AP_DOMAINS) {
++ 			q = vfio_ap_mdev_get_queue(matrix_mdev,
++ 						   AP_MKQID(apid, apqi));
++ 			if (q)
++ 				q->matrix_mdev = NULL;
++ 		}
++ 	}
++ }
++ 
++ static void vfio_ap_mdev_remove(struct mdev_device *mdev)
++ {
++ 	struct ap_matrix_mdev *matrix_mdev = dev_get_drvdata(&mdev->dev);
++ 
++ 	vfio_unregister_group_dev(&matrix_mdev->vdev);
++ 
++ 	mutex_lock(&matrix_dev->guests_lock);
++ 	mutex_lock(&matrix_dev->mdevs_lock);
++ 	vfio_ap_mdev_reset_queues(matrix_mdev);
++ 	vfio_ap_mdev_unlink_fr_queues(matrix_mdev);
++ 	list_del(&matrix_mdev->node);
++ 	mutex_unlock(&matrix_dev->mdevs_lock);
++ 	mutex_unlock(&matrix_dev->guests_lock);
++ 	vfio_uninit_group_dev(&matrix_mdev->vdev);
++ 	kfree(matrix_mdev);
++ 	atomic_inc(&matrix_dev->available_instances);
++ }
++ 
++ static ssize_t name_show(struct mdev_type *mtype,
++ 			 struct mdev_type_attribute *attr, char *buf)
+++>>>>>>> 2c1ee8983aa3 (s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove)
+  {
+  	return sprintf(buf, "%s\n", VFIO_AP_MDEV_NAME_HWVIRT);
+  }
+@@@ -1383,4 -1762,60 +1628,63 @@@ int vfio_ap_mdev_register(void
+  void vfio_ap_mdev_unregister(void)
+  {
+  	mdev_unregister_device(&matrix_dev->device);
+++<<<<<<< HEAD
+++=======
++ 	mdev_unregister_driver(&vfio_ap_matrix_driver);
++ }
++ 
++ int vfio_ap_mdev_probe_queue(struct ap_device *apdev)
++ {
++ 	int ret;
++ 	struct vfio_ap_queue *q;
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	ret = sysfs_create_group(&apdev->device.kobj, &vfio_queue_attr_group);
++ 	if (ret)
++ 		return ret;
++ 
++ 	q = kzalloc(sizeof(*q), GFP_KERNEL);
++ 	if (!q)
++ 		return -ENOMEM;
++ 
++ 	q->apqn = to_ap_queue(&apdev->device)->qid;
++ 	q->saved_isc = VFIO_AP_ISC_INVALID;
++ 	matrix_mdev = get_update_locks_by_apqn(q->apqn);
++ 
++ 	if (matrix_mdev) {
++ 		vfio_ap_mdev_link_queue(matrix_mdev, q);
++ 		vfio_ap_mdev_filter_matrix(matrix_mdev->matrix.apm,
++ 					   matrix_mdev->matrix.aqm,
++ 					   matrix_mdev);
++ 	}
++ 	dev_set_drvdata(&apdev->device, q);
++ 	release_update_locks_for_mdev(matrix_mdev);
++ 
++ 	return 0;
++ }
++ 
++ void vfio_ap_mdev_remove_queue(struct ap_device *apdev)
++ {
++ 	unsigned long apid;
++ 	struct vfio_ap_queue *q;
++ 	struct ap_matrix_mdev *matrix_mdev;
++ 
++ 	sysfs_remove_group(&apdev->device.kobj, &vfio_queue_attr_group);
++ 	q = dev_get_drvdata(&apdev->device);
++ 	get_update_locks_for_queue(q);
++ 	matrix_mdev = q->matrix_mdev;
++ 
++ 	if (matrix_mdev) {
++ 		vfio_ap_unlink_queue_fr_mdev(q);
++ 
++ 		apid = AP_QID_CARD(q->apqn);
++ 		if (test_bit_inv(apid, q->matrix_mdev->shadow_apcb.apm))
++ 			clear_bit_inv(apid, q->matrix_mdev->shadow_apcb.apm);
++ 	}
++ 
++ 	vfio_ap_mdev_reset_queue(q, 1);
++ 	dev_set_drvdata(&apdev->device, NULL);
++ 	kfree(q);
++ 	release_update_locks_for_mdev(matrix_mdev);
+++>>>>>>> 2c1ee8983aa3 (s390/vfio-ap: prepare for dynamic update of guest's APCB on queue probe/remove)
+  }
+* Unmerged path drivers/s390/crypto/vfio_ap_ops.c
