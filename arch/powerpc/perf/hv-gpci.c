@@ -98,7 +98,15 @@ static ssize_t kernel_version_show(struct device *dev,
 	return sprintf(page, "0x%x\n", COUNTER_INFO_VERSION_CURRENT);
 }
 
+static ssize_t cpumask_show(struct device *dev,
+			    struct device_attribute *attr, char *buf)
+{
+	return cpumap_print_to_pagebuf(true, buf, &hv_gpci_cpumask);
+}
+
 static DEVICE_ATTR_RO(kernel_version);
+static DEVICE_ATTR_RO(cpumask);
+
 HV_CAPS_ATTR(version, "0x%x\n");
 HV_CAPS_ATTR(ga, "%d\n");
 HV_CAPS_ATTR(expanded, "%d\n");
@@ -115,6 +123,15 @@ static struct attribute *interface_attrs[] = {
 	NULL,
 };
 
+static struct attribute *cpumask_attrs[] = {
+	&dev_attr_cpumask.attr,
+	NULL,
+};
+
+static struct attribute_group cpumask_attr_group = {
+	.attrs = cpumask_attrs,
+};
+
 static struct attribute_group interface_group = {
 	.name = "interface",
 	.attrs = interface_attrs,
@@ -124,6 +141,7 @@ static const struct attribute_group *attr_groups[] = {
 	&format_group,
 	&event_group,
 	&interface_group,
+	&cpumask_attr_group,
 	NULL,
 };
 
