@@ -1,0 +1,358 @@
+scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Benjamin Block <bblock@linux.ibm.com>
+commit 48910f8c35cfd250d806f3e03150d256f40b6d4c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/48910f8c.failed
+
+Replace the static define (ZFCP_DIAG_MAX_AGE) with a per-adapter variable
+(${adapter}->diagnostics->max_age). This new variable is exported via
+sysfs, along with other, already existing adapter variables, and can both
+be read and written. This way users can choose how much time should pass
+between refreshes of diagnostic buffers. The default value for the age
+remains to be five seconds.
+
+By setting this new variable to 0, the caching of diagnostic buffers for
+userspace accesses can also be completely removed.
+
+All diagnostic buffers of a given adapter are subject to this setting in
+the same way.
+
+Link: https://lore.kernel.org/r/b1d0977cc884b16dd4ca6418e4320c56a4c31d63.1572018132.git.bblock@linux.ibm.com
+	Reviewed-by: Steffen Maier <maier@linux.ibm.com>
+	Signed-off-by: Benjamin Block <bblock@linux.ibm.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 48910f8c35cfd250d806f3e03150d256f40b6d4c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/scsi/zfcp_diag.c
+#	drivers/s390/scsi/zfcp_diag.h
+#	drivers/s390/scsi/zfcp_sysfs.c
+diff --cc drivers/s390/scsi/zfcp_diag.c
+index d7d2db85b32e,67a8f4e57db1..000000000000
+--- a/drivers/s390/scsi/zfcp_diag.c
++++ b/drivers/s390/scsi/zfcp_diag.c
+@@@ -17,8 -19,7 +17,12 @@@
+  #include "zfcp_ext.h"
+  #include "zfcp_def.h"
+  
+++<<<<<<< HEAD
+ +/* Max age of data in a diagnostics buffer before it needs a refresh (in ms). */
+ +#define ZFCP_DIAG_MAX_AGE (5 * 1000)
+++=======
++ static DECLARE_WAIT_QUEUE_HEAD(__zfcp_diag_publish_wait);
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+  
+  /**
+   * zfcp_diag_adapter_setup() - Setup storage for adapter diagnostics.
+@@@ -101,3 -143,163 +106,166 @@@ void zfcp_diag_update_xdata(struct zfcp
+  out:
+  	spin_unlock_irqrestore(&hdr->access_lock, flags);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /**
++  * zfcp_diag_update_port_data_buffer() - Implementation of
++  *					 &typedef zfcp_diag_update_buffer_func
++  *					 to collect and update Port Data.
++  * @adapter: Adapter to collect Port Data from.
++  *
++  * This call is SYNCHRONOUS ! It blocks till the respective command has
++  * finished completely, or has failed in some way.
++  *
++  * Return:
++  * * 0		- Successfully retrieved new Diagnostics and Updated the buffer;
++  *		  this also includes cases where data was retrieved, but
++  *		  incomplete; you'll have to check the flag ``incomplete``
++  *		  of &struct zfcp_diag_header.
++  * * see zfcp_fsf_exchange_port_data_sync() for possible error-codes (
++  *   excluding -EAGAIN)
++  */
++ int zfcp_diag_update_port_data_buffer(struct zfcp_adapter *const adapter)
++ {
++ 	int rc;
++ 
++ 	rc = zfcp_fsf_exchange_port_data_sync(adapter->qdio, NULL);
++ 	if (rc == -EAGAIN)
++ 		rc = 0; /* signaling incomplete via struct zfcp_diag_header */
++ 
++ 	/* buffer-data was updated in zfcp_fsf_exchange_port_data_handler() */
++ 
++ 	return rc;
++ }
++ 
++ /**
++  * zfcp_diag_update_config_data_buffer() - Implementation of
++  *					   &typedef zfcp_diag_update_buffer_func
++  *					   to collect and update Config Data.
++  * @adapter: Adapter to collect Config Data from.
++  *
++  * This call is SYNCHRONOUS ! It blocks till the respective command has
++  * finished completely, or has failed in some way.
++  *
++  * Return:
++  * * 0		- Successfully retrieved new Diagnostics and Updated the buffer;
++  *		  this also includes cases where data was retrieved, but
++  *		  incomplete; you'll have to check the flag ``incomplete``
++  *		  of &struct zfcp_diag_header.
++  * * see zfcp_fsf_exchange_config_data_sync() for possible error-codes (
++  *   excluding -EAGAIN)
++  */
++ int zfcp_diag_update_config_data_buffer(struct zfcp_adapter *const adapter)
++ {
++ 	int rc;
++ 
++ 	rc = zfcp_fsf_exchange_config_data_sync(adapter->qdio, NULL);
++ 	if (rc == -EAGAIN)
++ 		rc = 0; /* signaling incomplete via struct zfcp_diag_header */
++ 
++ 	/* buffer-data was updated in zfcp_fsf_exchange_config_data_handler() */
++ 
++ 	return rc;
++ }
++ 
++ static int __zfcp_diag_update_buffer(struct zfcp_adapter *const adapter,
++ 				     struct zfcp_diag_header *const hdr,
++ 				     zfcp_diag_update_buffer_func buffer_update,
++ 				     unsigned long *const flags)
++ 	__must_hold(hdr->access_lock)
++ {
++ 	int rc;
++ 
++ 	if (hdr->updating == 1) {
++ 		rc = wait_event_interruptible_lock_irq(__zfcp_diag_publish_wait,
++ 						       hdr->updating == 0,
++ 						       hdr->access_lock);
++ 		rc = (rc == 0 ? -EAGAIN : -EINTR);
++ 	} else {
++ 		hdr->updating = 1;
++ 		spin_unlock_irqrestore(&hdr->access_lock, *flags);
++ 
++ 		/* unlocked, because update function sleeps */
++ 		rc = buffer_update(adapter);
++ 
++ 		spin_lock_irqsave(&hdr->access_lock, *flags);
++ 		hdr->updating = 0;
++ 
++ 		/*
++ 		 * every thread waiting here went via an interruptible wait,
++ 		 * so its fine to only wake those
++ 		 */
++ 		wake_up_interruptible_all(&__zfcp_diag_publish_wait);
++ 	}
++ 
++ 	return rc;
++ }
++ 
++ static bool
++ __zfcp_diag_test_buffer_age_isfresh(const struct zfcp_diag_adapter *const diag,
++ 				    const struct zfcp_diag_header *const hdr)
++ 	__must_hold(hdr->access_lock)
++ {
++ 	const unsigned long now = jiffies;
++ 
++ 	/*
++ 	 * Should not happen (data is from the future).. if it does, still
++ 	 * signal that it needs refresh
++ 	 */
++ 	if (!time_after_eq(now, hdr->timestamp))
++ 		return false;
++ 
++ 	if (jiffies_to_msecs(now - hdr->timestamp) >= diag->max_age)
++ 		return false;
++ 
++ 	return true;
++ }
++ 
++ /**
++  * zfcp_diag_update_buffer_limited() - Collect diagnostics and update a
++  *				       diagnostics buffer rate limited.
++  * @adapter: Adapter to collect the diagnostics from.
++  * @hdr: buffer-header for which to update with the collected diagnostics.
++  * @buffer_update: Specific implementation for collecting and updating.
++  *
++  * This function will cause an update of the given @hdr by calling the also
++  * given @buffer_update function. If called by multiple sources at the same
++  * time, it will synchornize the update by only allowing one source to call
++  * @buffer_update and the others to wait for that source to complete instead
++  * (the wait is interruptible).
++  *
++  * Additionally this version is rate-limited and will only exit if either the
++  * buffer is fresh enough (within the limit) - it will do nothing if the buffer
++  * is fresh enough to begin with -, or if the source/thread that started this
++  * update is the one that made the update (to prevent endless loops).
++  *
++  * Return:
++  * * 0		- If the update was successfully published and/or the buffer is
++  *		  fresh enough
++  * * -EINTR	- If the thread went into the wait-state and was interrupted
++  * * whatever @buffer_update returns
++  */
++ int zfcp_diag_update_buffer_limited(struct zfcp_adapter *const adapter,
++ 				    struct zfcp_diag_header *const hdr,
++ 				    zfcp_diag_update_buffer_func buffer_update)
++ {
++ 	unsigned long flags;
++ 	int rc;
++ 
++ 	spin_lock_irqsave(&hdr->access_lock, flags);
++ 
++ 	for (rc = 0;
++ 	     !__zfcp_diag_test_buffer_age_isfresh(adapter->diagnostics, hdr);
++ 	     rc = 0) {
++ 		rc = __zfcp_diag_update_buffer(adapter, hdr, buffer_update,
++ 					       &flags);
++ 		if (rc != -EAGAIN)
++ 			break;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&hdr->access_lock, flags);
++ 
++ 	return rc;
++ }
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+diff --cc drivers/s390/scsi/zfcp_diag.h
+index f354c8bd6f04,b9c93d15f67c..000000000000
+--- a/drivers/s390/scsi/zfcp_diag.h
++++ b/drivers/s390/scsi/zfcp_diag.h
+@@@ -40,6 -40,10 +40,13 @@@ struct zfcp_diag_header 
+  /**
+   * struct zfcp_diag_adapter - central storage for all diagnostics concerning an
+   *			      adapter.
+++<<<<<<< HEAD
+++=======
++  * @sysfs_established: flag showing that the associated sysfs-group was created
++  *		       during run of zfcp_adapter_enqueue().
++  * @max_age: maximum age of data in diagnostic buffers before they need to be
++  *	     refreshed (in ms).
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+   * @port_data: data retrieved using exchange port data.
+   * @port_data.header: header with metadata for the cache in @port_data.data.
+   * @port_data.data: cached QTCB Bottom of command exchange port data.
+@@@ -48,7 -52,11 +55,15 @@@
+   * @config_data.data: cached QTCB Bottom of command exchange config data.
+   */
+  struct zfcp_diag_adapter {
+++<<<<<<< HEAD
+ +	struct zfcp_diag_adapter_port_data {
+++=======
++ 	u64	sysfs_established	:1;
++ 
++ 	unsigned long	max_age;
++ 
++ 	struct {
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+  		struct zfcp_diag_header		header;
+  		struct fsf_qtcb_bottom_port	data;
+  	} port_data;
+diff --cc drivers/s390/scsi/zfcp_sysfs.c
+index 432e4f59b575,494b9fe9cc94..000000000000
+--- a/drivers/s390/scsi/zfcp_sysfs.c
++++ b/drivers/s390/scsi/zfcp_sysfs.c
+@@@ -337,41 -326,49 +337,86 @@@ static ssize_t zfcp_sysfs_port_remove_s
+  static ZFCP_DEV_ATTR(adapter, port_remove, S_IWUSR, NULL,
+  		     zfcp_sysfs_port_remove_store);
+  
+++<<<<<<< HEAD
+ +static ssize_t zfcp_sysfs_adapter_fc_security_show(
+ +	struct device *dev, struct device_attribute *attr, char *buf)
+ +{
+ +	struct ccw_device *cdev = to_ccwdev(dev);
+ +	struct zfcp_adapter *adapter = zfcp_ccw_adapter_by_cdev(cdev);
+ +	unsigned int status;
+ +	int i;
+++=======
++ static ssize_t
++ zfcp_sysfs_adapter_diag_max_age_show(struct device *dev,
++ 				     struct device_attribute *attr, char *buf)
++ {
++ 	struct zfcp_adapter *adapter = zfcp_ccw_adapter_by_cdev(to_ccwdev(dev));
++ 	ssize_t rc;
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+  
+  	if (!adapter)
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Adapter status COMMON_OPEN implies xconf data and xport data
+ +	 * was done. Adapter FC Endpoint Security capability remains
+ +	 * unchanged in case of COMMON_ERP_FAILED (e.g. due to local link
+ +	 * down).
+ +	 */
+ +	status = atomic_read(&adapter->status);
+ +	if (0 == (status & ZFCP_STATUS_COMMON_OPEN))
+ +		i = sprintf(buf, "unknown\n");
+ +	else if (!(adapter->adapter_features & FSF_FEATURE_FC_SECURITY))
+ +		i = sprintf(buf, "unsupported\n");
+ +	else {
+ +		i = zfcp_fsf_scnprint_fc_security(
+ +			buf, PAGE_SIZE - 1, adapter->fc_security_algorithms,
+ +			ZFCP_FSF_PRINT_FMT_LIST);
+ +		i += scnprintf(buf + i, PAGE_SIZE - i, "\n");
+ +	}
+ +
+ +	zfcp_ccw_adapter_put(adapter);
+ +	return i;
+ +}
+ +static ZFCP_DEV_ATTR(adapter, fc_security, S_IRUGO,
+ +		     zfcp_sysfs_adapter_fc_security_show,
+ +		     NULL);
+++=======
++ 	/* ceil(log(2^64 - 1) / log(10)) = 20 */
++ 	rc = scnprintf(buf, 20 + 2, "%lu\n", adapter->diagnostics->max_age);
++ 
++ 	zfcp_ccw_adapter_put(adapter);
++ 	return rc;
++ }
++ 
++ static ssize_t
++ zfcp_sysfs_adapter_diag_max_age_store(struct device *dev,
++ 				      struct device_attribute *attr,
++ 				      const char *buf, size_t count)
++ {
++ 	struct zfcp_adapter *adapter = zfcp_ccw_adapter_by_cdev(to_ccwdev(dev));
++ 	unsigned long max_age;
++ 	ssize_t rc;
++ 
++ 	if (!adapter)
++ 		return -ENODEV;
++ 
++ 	rc = kstrtoul(buf, 10, &max_age);
++ 	if (rc != 0)
++ 		goto out;
++ 
++ 	adapter->diagnostics->max_age = max_age;
++ 
++ 	rc = count;
++ out:
++ 	zfcp_ccw_adapter_put(adapter);
++ 	return rc;
++ }
++ static ZFCP_DEV_ATTR(adapter, diag_max_age, 0644,
++ 		     zfcp_sysfs_adapter_diag_max_age_show,
++ 		     zfcp_sysfs_adapter_diag_max_age_store);
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+  
+  static struct attribute *zfcp_adapter_attrs[] = {
+  	&dev_attr_adapter_failed.attr,
+@@@ -385,7 -382,7 +430,11 @@@
+  	&dev_attr_adapter_lic_version.attr,
+  	&dev_attr_adapter_status.attr,
+  	&dev_attr_adapter_hardware_version.attr,
+++<<<<<<< HEAD
+ +	&dev_attr_adapter_fc_security.attr,
+++=======
++ 	&dev_attr_adapter_diag_max_age.attr,
+++>>>>>>> 48910f8c35cf (scsi: zfcp: move maximum age of diagnostic buffers into a per-adapter variable)
+  	NULL
+  };
+  
+* Unmerged path drivers/s390/scsi/zfcp_diag.c
+* Unmerged path drivers/s390/scsi/zfcp_diag.h
+* Unmerged path drivers/s390/scsi/zfcp_sysfs.c
