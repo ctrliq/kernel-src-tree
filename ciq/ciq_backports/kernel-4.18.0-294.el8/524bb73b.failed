@@ -1,0 +1,182 @@
+x86/fpu/xstate: Separate user and supervisor xfeatures mask
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yu-cheng Yu <yu-cheng.yu@intel.com>
+commit 524bb73bc15c56f5587e33c817e103a259b019d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/524bb73b.failed
+
+Before the introduction of XSAVES supervisor states, 'xfeatures_mask' is
+used at various places to determine XSAVE buffer components and XCR0 bits.
+It contains only user xstates.  To support supervisor xstates, it is
+necessary to separate user and supervisor xstates:
+
+- First, change 'xfeatures_mask' to 'xfeatures_mask_all', which represents
+  the full set of bits that should ever be set in a kernel XSAVE buffer.
+- Introduce xfeatures_mask_supervisor() and xfeatures_mask_user() to
+  extract relevant xfeatures from xfeatures_mask_all.
+
+Co-developed-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Yu-cheng Yu <yu-cheng.yu@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+Link: https://lkml.kernel.org/r/20200512145444.15483-4-yu-cheng.yu@intel.com
+(cherry picked from commit 524bb73bc15c56f5587e33c817e103a259b019d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/xstate.c
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 59e66b3b5b95,fa71af643025..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -705,9 -709,9 +715,9 @@@ static int init_xstate_size(void
+   */
+  static void fpu__init_disable_system_xstate(void)
+  {
+- 	xfeatures_mask = 0;
++ 	xfeatures_mask_all = 0;
+  	cr4_clear_bits(X86_CR4_OSXSAVE);
+ -	setup_clear_cpu_cap(X86_FEATURE_XSAVE);
+ +	fpu__xstate_clear_all_cpu_caps();
+  }
+  
+  /*
+@@@ -848,10 -854,9 +862,14 @@@ void *get_xsave_addr(struct xregs_stat
+  
+  	/*
+  	 * We should not ever be requesting features that we
+++<<<<<<< HEAD
+ +	 * have not enabled.  Remember that pcntxt_mask is
+ +	 * what we write to the XCR0 register.
+++=======
++ 	 * have not enabled.
+++>>>>>>> 524bb73bc15c (x86/fpu/xstate: Separate user and supervisor xfeatures mask)
+  	 */
+- 	WARN_ONCE(!(xfeatures_mask & BIT_ULL(xfeature_nr)),
++ 	WARN_ONCE(!(xfeatures_mask_all & BIT_ULL(xfeature_nr)),
+  		  "get of unsupported state");
+  	/*
+  	 * This assumes the last 'xsave*' instruction to
+@@@ -1013,25 -1009,8 +1031,25 @@@ int copy_xstate_to_kernel(void *kbuf, s
+  	 */
+  	memset(&header, 0, sizeof(header));
+  	header.xfeatures = xsave->header.xfeatures;
+- 	header.xfeatures &= XFEATURE_MASK_USER_SUPPORTED;
++ 	header.xfeatures &= xfeatures_mask_user();
+  
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(0, off_mxcsr,
+ +			  &xsave->i387, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM))
+ +		copy_part(off_mxcsr, MXCSR_AND_FLAGS_SIZE,
+ +			  &xsave->i387.mxcsr, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_FP)
+ +		copy_part(offsetof(struct fxregs_state, st_space), 128,
+ +			  &xsave->i387.st_space, &kbuf, &offset_start, &count);
+ +	if (header.xfeatures & XFEATURE_MASK_SSE)
+ +		copy_part(xstate_offsets[XFEATURE_SSE], 256,
+ +			  &xsave->i387.xmm_space, &kbuf, &offset_start, &count);
+ +	/*
+ +	 * Fill xsave->i387.sw_reserved value for ptrace frame:
+ +	 */
+ +	copy_part(offsetof(struct fxregs_state, sw_reserved), 48,
+ +		  xstate_fx_sw_bytes, &kbuf, &offset_start, &count);
+  	/*
+  	 * Copy xregs_state->header:
+  	 */
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 5b53121601db..f701398bbb71 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -92,7 +92,7 @@ static inline void fpstate_init_xstate(struct xregs_state *xsave)
+ 	 * XRSTORS requires these bits set in xcomp_bv, or it will
+ 	 * trigger #GP:
+ 	 */
+-	xsave->header.xcomp_bv = XCOMP_BV_COMPACTED_FORMAT | xfeatures_mask;
++	xsave->header.xcomp_bv = XCOMP_BV_COMPACTED_FORMAT | xfeatures_mask_all;
+ }
+ 
+ static inline void fpstate_init_fxstate(struct fxregs_state *fx)
+diff --git a/arch/x86/include/asm/fpu/xstate.h b/arch/x86/include/asm/fpu/xstate.h
+index 9ba156a1547e..7c0f756f916d 100644
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@ -51,7 +51,18 @@
+ #define REX_PREFIX
+ #endif
+ 
+-extern u64 xfeatures_mask;
++extern u64 xfeatures_mask_all;
++
++static inline u64 xfeatures_mask_supervisor(void)
++{
++	return xfeatures_mask_all & XFEATURE_MASK_SUPERVISOR_SUPPORTED;
++}
++
++static inline u64 xfeatures_mask_user(void)
++{
++	return xfeatures_mask_all & XFEATURE_MASK_USER_SUPPORTED;
++}
++
+ extern u64 xstate_fx_sw_bytes[USER_XSTATE_FX_SW_WORDS];
+ 
+ extern void __init update_regset_xstate_info(unsigned int size,
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index d65a51301de4..6e7cb61ee30a 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -252,13 +252,17 @@ sanitize_restored_xstate(union fpregs_state *state,
+  */
+ static int copy_user_to_fpregs_zeroing(void __user *buf, u64 xbv, int fx_only)
+ {
++	u64 init_bv;
++
+ 	if (use_xsave()) {
+ 		if (fx_only) {
+-			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
++
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_fxregs(buf);
+ 		} else {
+-			u64 init_bv = xfeatures_mask & ~xbv;
++			init_bv = xfeatures_mask_user() & ~xbv;
++
+ 			if (unlikely(init_bv))
+ 				copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 			return copy_user_to_xregs(buf, xbv);
+@@ -357,7 +361,7 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ 
+ 	if (use_xsave() && !fx_only) {
+-		u64 init_bv = xfeatures_mask & ~xfeatures;
++		u64 init_bv = xfeatures_mask_user() & ~xfeatures;
+ 
+ 		if (using_compacted_format()) {
+ 			ret = copy_user_to_xstate(&fpu->state.xsave, buf_fx);
+@@ -388,7 +392,9 @@ static int __fpu__restore_sig(void __user *buf, void __user *buf_fx, int size)
+ 
+ 		fpregs_lock();
+ 		if (use_xsave()) {
+-			u64 init_bv = xfeatures_mask & ~XFEATURE_MASK_FPSSE;
++			u64 init_bv;
++
++			init_bv = xfeatures_mask_user() & ~XFEATURE_MASK_FPSSE;
+ 			copy_kernel_to_xregs(&init_fpstate.xsave, init_bv);
+ 		}
+ 
+@@ -462,7 +468,7 @@ void fpu__init_prepare_fx_sw_frame(void)
+ 
+ 	fx_sw_reserved.magic1 = FP_XSTATE_MAGIC1;
+ 	fx_sw_reserved.extended_size = size;
+-	fx_sw_reserved.xfeatures = xfeatures_mask;
++	fx_sw_reserved.xfeatures = xfeatures_mask_user();
+ 	fx_sw_reserved.xstate_size = fpu_user_xstate_size;
+ 
+ 	if (IS_ENABLED(CONFIG_IA32_EMULATION) ||
+* Unmerged path arch/x86/kernel/fpu/xstate.c
