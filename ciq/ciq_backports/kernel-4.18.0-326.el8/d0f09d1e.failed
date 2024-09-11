@@ -1,0 +1,123 @@
+ALSA: usb-audio: Refactoring endpoint URB deactivation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Takashi Iwai <tiwai@suse.de>
+commit d0f09d1e4a88647695739d2ff4268e9fdcf5b35d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/d0f09d1e.failed
+
+Minor code refactoring to consolidate the URB deactivation code in
+endpoint.c.  A slight behavior change is that the error handling in
+snd_usb_endpoint_start() leaves EP_FLAG_STOPPING now.  This should be
+synced with the later PCM sync_stop callback.
+
+	Tested-by: Keith Milner <kamilner@superlative.org>
+	Tested-by: Dylan Robinson <dylan_robinson@motu.com>
+Link: https://lore.kernel.org/r/20201123085347.19667-30-tiwai@suse.de
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit d0f09d1e4a88647695739d2ff4268e9fdcf5b35d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/usb/endpoint.c
+diff --cc sound/usb/endpoint.c
+index 208ac2aff462,35c84c2264e1..000000000000
+--- a/sound/usb/endpoint.c
++++ b/sound/usb/endpoint.c
+@@@ -1224,16 -1264,17 +1238,13 @@@ int snd_usb_endpoint_start(struct snd_u
+  	if (atomic_read(&ep->chip->shutdown))
+  		return -EBADFD;
+  
+ -	if (ep->sync_master)
+ -		WRITE_ONCE(ep->sync_master->sync_slave, ep);
+ -
+ -	usb_audio_dbg(ep->chip, "Starting %s EP 0x%x (running %d)\n",
+ -		      ep_type_name(ep->type), ep->ep_num,
+ -		      atomic_read(&ep->running));
+ +	usb_audio_dbg(ep->chip, "Starting %s EP 0x%x (count %d)\n",
+ +		      ep_type_name(ep->type), ep->ep_num, ep->use_count);
+  
+  	/* already running? */
+ -	if (atomic_inc_return(&ep->running) != 1)
+ +	if (++ep->use_count != 1)
+  		return 0;
+  
+- 	/* just to be sure */
+- 	deactivate_urbs(ep, false);
+- 
+  	ep->active_mask = 0;
+  	ep->unlink_mask = 0;
+  	ep->phase = 0;
+@@@ -1284,9 -1326,9 +1295,13 @@@
+  	return 0;
+  
+  __error:
+++<<<<<<< HEAD
+ +	clear_bit(EP_FLAG_RUNNING, &ep->flags);
+ +	ep->use_count--;
+ +	deactivate_urbs(ep, false);
+++=======
++ 	snd_usb_endpoint_stop(ep);
+++>>>>>>> d0f09d1e4a88 (ALSA: usb-audio: Refactoring endpoint URB deactivation)
+  	return -EPIPE;
+  }
+  
+@@@ -1309,43 -1351,18 +1324,51 @@@ void snd_usb_endpoint_stop(struct snd_u
+  	if (!ep)
+  		return;
+  
+ -	usb_audio_dbg(ep->chip, "Stopping %s EP 0x%x (running %d)\n",
+ -		      ep_type_name(ep->type), ep->ep_num,
+ -		      atomic_read(&ep->running));
+ +	usb_audio_dbg(ep->chip, "Stopping %s EP 0x%x (count %d)\n",
+ +		      ep_type_name(ep->type), ep->ep_num, ep->use_count);
+  
+ -	if (snd_BUG_ON(!atomic_read(&ep->running)))
+ +	if (snd_BUG_ON(ep->use_count == 0))
+  		return;
+  
+++<<<<<<< HEAD
+ +	if (--ep->use_count == 0) {
+ +		deactivate_urbs(ep, false);
+ +		set_bit(EP_FLAG_STOPPING, &ep->flags);
+ +	}
+++=======
++ 	if (ep->sync_master)
++ 		WRITE_ONCE(ep->sync_master->sync_slave, NULL);
++ 
++ 	if (!atomic_dec_return(&ep->running))
++ 		stop_and_unlink_urbs(ep, false, false);
+++>>>>>>> d0f09d1e4a88 (ALSA: usb-audio: Refactoring endpoint URB deactivation)
+ +}
+ +
+ +/**
+ + * snd_usb_endpoint_deactivate: deactivate an snd_usb_endpoint
+ + *
+ + * @ep: the endpoint to deactivate
+ + *
+ + * If the endpoint is not currently in use, this functions will
+ + * deactivate its associated URBs.
+ + *
+ + * In case of any active users, this functions does nothing.
+ + */
+ +void snd_usb_endpoint_deactivate(struct snd_usb_endpoint *ep)
+ +{
+ +	if (!ep)
+ +		return;
+ +
+ +	if (ep->use_count != 0)
+ +		return;
+ +
+ +	deactivate_urbs(ep, true);
+ +	wait_clear_urbs(ep);
+ +
+ +	/* clear the saved hw params */
+ +	spin_lock_irq(&ep->lock);
+ +	ep->cur_rate = 0;
+ +	spin_unlock_irq(&ep->lock);
+  }
+  
+  /**
+* Unmerged path sound/usb/endpoint.c
