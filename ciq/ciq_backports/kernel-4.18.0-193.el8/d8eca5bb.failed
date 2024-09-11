@@ -1,0 +1,321 @@
+bpf: implement lookup-free direct value access for maps
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Daniel Borkmann <daniel@iogearbox.net>
+commit d8eca5bbb2be9bc7546f9e733786fa2f1a594c67
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/d8eca5bb.failed
+
+This generic extension to BPF maps allows for directly loading
+an address residing inside a BPF map value as a single BPF
+ldimm64 instruction!
+
+The idea is similar to what BPF_PSEUDO_MAP_FD does today, which
+is a special src_reg flag for ldimm64 instruction that indicates
+that inside the first part of the double insns's imm field is a
+file descriptor which the verifier then replaces as a full 64bit
+address of the map into both imm parts. For the newly added
+BPF_PSEUDO_MAP_VALUE src_reg flag, the idea is the following:
+the first part of the double insns's imm field is again a file
+descriptor corresponding to the map, and the second part of the
+imm field is an offset into the value. The verifier will then
+replace both imm parts with an address that points into the BPF
+map value at the given value offset for maps that support this
+operation. Currently supported is array map with single entry.
+It is possible to support more than just single map element by
+reusing both 16bit off fields of the insns as a map index, so
+full array map lookup could be expressed that way. It hasn't
+been implemented here due to lack of concrete use case, but
+could easily be done so in future in a compatible way, since
+both off fields right now have to be 0 and would correctly
+denote a map index 0.
+
+The BPF_PSEUDO_MAP_VALUE is a distinct flag as otherwise with
+BPF_PSEUDO_MAP_FD we could not differ offset 0 between load of
+map pointer versus load of map's value at offset 0, and changing
+BPF_PSEUDO_MAP_FD's encoding into off by one to differ between
+regular map pointer and map value pointer would add unnecessary
+complexity and increases barrier for debugability thus less
+suitable. Using the second part of the imm field as an offset
+into the value does /not/ come with limitations since maximum
+possible value size is in u32 universe anyway.
+
+This optimization allows for efficiently retrieving an address
+to a map value memory area without having to issue a helper call
+which needs to prepare registers according to calling convention,
+etc, without needing the extra NULL test, and without having to
+add the offset in an additional instruction to the value base
+pointer. The verifier then treats the destination register as
+PTR_TO_MAP_VALUE with constant reg->off from the user passed
+offset from the second imm field, and guarantees that this is
+within bounds of the map value. Any subsequent operations are
+normally treated as typical map value handling without anything
+extra needed from verification side.
+
+The two map operations for direct value access have been added to
+array map for now. In future other types could be supported as
+well depending on the use case. The main use case for this commit
+is to allow for BPF loader support for global variables that
+reside in .data/.rodata/.bss sections such that we can directly
+load the address of them with minimal additional infrastructure
+required. Loader support has been added in subsequent commits for
+libbpf library.
+
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit d8eca5bbb2be9bc7546f9e733786fa2f1a594c67)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 481f28e18552,bd93a592dd29..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -54,12 -53,16 +54,25 @@@ struct bpf_map_ops 
+  	u32 (*map_fd_sys_lookup_elem)(void *ptr);
+  	void (*map_seq_show_elem)(struct bpf_map *map, void *key,
+  				  struct seq_file *m);
+++<<<<<<< HEAD
+ +	RH_KABI_REPLACE_UNSAFE(int (*map_check_btf)(const struct bpf_map *map, const struct btf *btf,
+ +						    u32 key_type_id, u32 value_type_id),
+ +			       int (*map_check_btf)(const struct bpf_map *map,
+ +						    const struct btf *btf,
+ +						    const struct btf_type *key_type,
+ +						    const struct btf_type *value_type))
+++=======
++ 	int (*map_check_btf)(const struct bpf_map *map,
++ 			     const struct btf *btf,
++ 			     const struct btf_type *key_type,
++ 			     const struct btf_type *value_type);
++ 
++ 	/* Direct value access helpers. */
++ 	int (*map_direct_value_addr)(const struct bpf_map *map,
++ 				     u64 *imm, u32 off);
++ 	int (*map_direct_value_meta)(const struct bpf_map *map,
++ 				     u64 imm, u32 *off);
+++>>>>>>> d8eca5bbb2be (bpf: implement lookup-free direct value access for maps)
+  };
+  
+  struct bpf_map {
+diff --cc kernel/bpf/verifier.c
+index 879efb43b475,6ab7a23fc924..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -6825,7 -6824,13 +6832,17 @@@ static int replace_map_fd_with_map_ptr(
+  				/* valid generic load 64-bit imm */
+  				goto next_insn;
+  
+++<<<<<<< HEAD
+ +			if (insn->src_reg != BPF_PSEUDO_MAP_FD) {
+++=======
++ 			/* In final convert_pseudo_ld_imm64() step, this is
++ 			 * converted into regular 64-bit imm load insn.
++ 			 */
++ 			if ((insn[0].src_reg != BPF_PSEUDO_MAP_FD &&
++ 			     insn[0].src_reg != BPF_PSEUDO_MAP_VALUE) ||
++ 			    (insn[0].src_reg == BPF_PSEUDO_MAP_FD &&
++ 			     insn[1].imm != 0)) {
+++>>>>>>> d8eca5bbb2be (bpf: implement lookup-free direct value access for maps)
+  				verbose(env,
+  					"unrecognized bpf_ld_imm64 insn\n");
+  				return -EINVAL;
+* Unmerged path include/linux/bpf.h
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index e5282906050b..2af225d58281 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -224,6 +224,10 @@ struct bpf_insn_aux_data {
+ 		unsigned long map_state;	/* pointer/poison value for maps */
+ 		s32 call_imm;			/* saved imm field of call insn */
+ 		u32 alu_limit;			/* limit for add/sub register with pointer */
++		struct {
++			u32 map_index;		/* index into used_maps[] */
++			u32 map_off;		/* offset from value base address */
++		};
+ 	};
+ 	int ctx_field_size; /* the ctx field size for load insn, maybe 0 */
+ 	int sanitize_stack_off; /* stack slot to be cleared */
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 94997042d01f..c60c30815568 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -261,8 +261,19 @@ enum bpf_attach_type {
+  */
+ #define BPF_F_ANY_ALIGNMENT	(1U << 1)
+ 
+-/* when bpf_ldimm64->src_reg == BPF_PSEUDO_MAP_FD, bpf_ldimm64->imm == fd */
++/* When BPF ldimm64's insn[0].src_reg != 0 then this can have
++ * two extensions:
++ *
++ * insn[0].src_reg:  BPF_PSEUDO_MAP_FD   BPF_PSEUDO_MAP_VALUE
++ * insn[0].imm:      map fd              map fd
++ * insn[1].imm:      0                   offset into value
++ * insn[0].off:      0                   0
++ * insn[1].off:      0                   0
++ * ldimm64 rewrite:  address of map      address of map[0]+offset
++ * verifier type:    CONST_PTR_TO_MAP    PTR_TO_MAP_VALUE
++ */
+ #define BPF_PSEUDO_MAP_FD	1
++#define BPF_PSEUDO_MAP_VALUE	2
+ 
+ /* when bpf_call->src_reg == BPF_PSEUDO_CALL, bpf_call->imm == pc-relative
+  * offset to another bpf function
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index 361ee5a4c611..624e5c824f54 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -152,6 +152,36 @@ static void *array_map_lookup_elem(struct bpf_map *map, void *key)
+ 	return array->value + array->elem_size * (index & array->index_mask);
+ }
+ 
++static int array_map_direct_value_addr(const struct bpf_map *map, u64 *imm,
++				       u32 off)
++{
++	struct bpf_array *array = container_of(map, struct bpf_array, map);
++
++	if (map->max_entries != 1)
++		return -ENOTSUPP;
++	if (off >= map->value_size)
++		return -EINVAL;
++
++	*imm = (unsigned long)array->value;
++	return 0;
++}
++
++static int array_map_direct_value_meta(const struct bpf_map *map, u64 imm,
++				       u32 *off)
++{
++	struct bpf_array *array = container_of(map, struct bpf_array, map);
++	u64 base = (unsigned long)array->value;
++	u64 range = array->elem_size;
++
++	if (map->max_entries != 1)
++		return -ENOTSUPP;
++	if (imm < base || imm >= base + range)
++		return -ENOENT;
++
++	*off = imm - base;
++	return 0;
++}
++
+ /* emit BPF instructions equivalent to C code of array_map_lookup_elem() */
+ static u32 array_map_gen_lookup(struct bpf_map *map, struct bpf_insn *insn_buf)
+ {
+@@ -411,6 +441,8 @@ const struct bpf_map_ops array_map_ops = {
+ 	.map_update_elem = array_map_update_elem,
+ 	.map_delete_elem = array_map_delete_elem,
+ 	.map_gen_lookup = array_map_gen_lookup,
++	.map_direct_value_addr = array_map_direct_value_addr,
++	.map_direct_value_meta = array_map_direct_value_meta,
+ 	.map_seq_show_elem = array_map_seq_show_elem,
+ 	.map_check_btf = array_map_check_btf,
+ };
+diff --git a/kernel/bpf/core.c b/kernel/bpf/core.c
+index 03edd666ca58..34ab63b8c7c0 100644
+--- a/kernel/bpf/core.c
++++ b/kernel/bpf/core.c
+@@ -263,7 +263,8 @@ int bpf_prog_calc_tag(struct bpf_prog *fp)
+ 		dst[i] = fp->insnsi[i];
+ 		if (!was_ld_map &&
+ 		    dst[i].code == (BPF_LD | BPF_IMM | BPF_DW) &&
+-		    dst[i].src_reg == BPF_PSEUDO_MAP_FD) {
++		    (dst[i].src_reg == BPF_PSEUDO_MAP_FD ||
++		     dst[i].src_reg == BPF_PSEUDO_MAP_VALUE)) {
+ 			was_ld_map = true;
+ 			dst[i].imm = 0;
+ 		} else if (was_ld_map &&
+diff --git a/kernel/bpf/disasm.c b/kernel/bpf/disasm.c
+index 678d65104590..b44d8c447afd 100644
+--- a/kernel/bpf/disasm.c
++++ b/kernel/bpf/disasm.c
+@@ -197,10 +197,11 @@ void print_bpf_insn(const struct bpf_insn_cbs *cbs,
+ 			 * part of the ldimm64 insn is accessible.
+ 			 */
+ 			u64 imm = ((u64)(insn + 1)->imm << 32) | (u32)insn->imm;
+-			bool map_ptr = insn->src_reg == BPF_PSEUDO_MAP_FD;
++			bool is_ptr = insn->src_reg == BPF_PSEUDO_MAP_FD ||
++				      insn->src_reg == BPF_PSEUDO_MAP_VALUE;
+ 			char tmp[64];
+ 
+-			if (map_ptr && !allow_ptr_leaks)
++			if (is_ptr && !allow_ptr_leaks)
+ 				imm = 0;
+ 
+ 			verbose(cbs->private_data, "(%02x) r%d = %s\n",
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 4fa856f62a43..b62e575f7ece 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -2057,13 +2057,26 @@ static int bpf_map_get_fd_by_id(const union bpf_attr *attr)
+ }
+ 
+ static const struct bpf_map *bpf_map_from_imm(const struct bpf_prog *prog,
+-					      unsigned long addr)
++					      unsigned long addr, u32 *off,
++					      u32 *type)
+ {
++	const struct bpf_map *map;
+ 	int i;
+ 
+-	for (i = 0; i < prog->aux->used_map_cnt; i++)
+-		if (prog->aux->used_maps[i] == (void *)addr)
+-			return prog->aux->used_maps[i];
++	for (i = 0, *off = 0; i < prog->aux->used_map_cnt; i++) {
++		map = prog->aux->used_maps[i];
++		if (map == (void *)addr) {
++			*type = BPF_PSEUDO_MAP_FD;
++			return map;
++		}
++		if (!map->ops->map_direct_value_meta)
++			continue;
++		if (!map->ops->map_direct_value_meta(map, addr, off)) {
++			*type = BPF_PSEUDO_MAP_VALUE;
++			return map;
++		}
++	}
++
+ 	return NULL;
+ }
+ 
+@@ -2071,6 +2084,7 @@ static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog)
+ {
+ 	const struct bpf_map *map;
+ 	struct bpf_insn *insns;
++	u32 off, type;
+ 	u64 imm;
+ 	int i;
+ 
+@@ -2098,11 +2112,11 @@ static struct bpf_insn *bpf_insn_prepare_dump(const struct bpf_prog *prog)
+ 			continue;
+ 
+ 		imm = ((u64)insns[i + 1].imm << 32) | (u32)insns[i].imm;
+-		map = bpf_map_from_imm(prog, imm);
++		map = bpf_map_from_imm(prog, imm, &off, &type);
+ 		if (map) {
+-			insns[i].src_reg = BPF_PSEUDO_MAP_FD;
++			insns[i].src_reg = type;
+ 			insns[i].imm = map->id;
+-			insns[i + 1].imm = 0;
++			insns[i + 1].imm = off;
+ 			continue;
+ 		}
+ 	}
+* Unmerged path kernel/bpf/verifier.c
+diff --git a/tools/bpf/bpftool/xlated_dumper.c b/tools/bpf/bpftool/xlated_dumper.c
+index 7073dbe1ff27..0bb17bf88b18 100644
+--- a/tools/bpf/bpftool/xlated_dumper.c
++++ b/tools/bpf/bpftool/xlated_dumper.c
+@@ -195,6 +195,9 @@ static const char *print_imm(void *private_data,
+ 	if (insn->src_reg == BPF_PSEUDO_MAP_FD)
+ 		snprintf(dd->scratch_buff, sizeof(dd->scratch_buff),
+ 			 "map[id:%u]", insn->imm);
++	else if (insn->src_reg == BPF_PSEUDO_MAP_VALUE)
++		snprintf(dd->scratch_buff, sizeof(dd->scratch_buff),
++			 "map[id:%u][0]+%u", insn->imm, (insn + 1)->imm);
+ 	else
+ 		snprintf(dd->scratch_buff, sizeof(dd->scratch_buff),
+ 			 "0x%llx", (unsigned long long)full_imm);
