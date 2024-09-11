@@ -1,0 +1,330 @@
+iommu/sva: Assign a PASID to mm on PASID allocation and free it on mm exit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Fenghua Yu <fenghua.yu@intel.com>
+commit 701fac40384f07197b106136012804c3cae0b3de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/701fac40.failed
+
+PASIDs are process-wide. It was attempted to use refcounted PASIDs to
+free them when the last thread drops the refcount. This turned out to
+be complex and error prone. Given the fact that the PASID space is 20
+bits, which allows up to 1M processes to have a PASID associated
+concurrently, PASID resource exhaustion is not a realistic concern.
+
+Therefore, it was decided to simplify the approach and stick with lazy
+on demand PASID allocation, but drop the eager free approach and make an
+allocated PASID's lifetime bound to the lifetime of the process.
+
+Get rid of the refcounting mechanisms and replace/rename the interfaces
+to reflect this new approach.
+
+  [ bp: Massage commit message. ]
+
+	Suggested-by: Dave Hansen <dave.hansen@linux.intel.com>
+	Signed-off-by: Fenghua Yu <fenghua.yu@intel.com>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Tony Luck <tony.luck@intel.com>
+	Reviewed-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Reviewed-by: Jacob Pan <jacob.jun.pan@linux.intel.com>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Joerg Roedel <jroedel@suse.de>
+Link: https://lore.kernel.org/r/20220207230254.3342514-6-fenghua.yu@intel.com
+(cherry picked from commit 701fac40384f07197b106136012804c3cae0b3de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/ioasid.c
+#	include/linux/sched/mm.h
+diff --cc drivers/iommu/ioasid.c
+index 50ee27bbd04e,a786c034907c..000000000000
+--- a/drivers/iommu/ioasid.c
++++ b/drivers/iommu/ioasid.c
+@@@ -348,34 -346,11 +346,32 @@@ exit_free
+  EXPORT_SYMBOL_GPL(ioasid_alloc);
+  
+  /**
+++<<<<<<< HEAD
+ + * ioasid_get - obtain a reference to the IOASID
+ + */
+ +void ioasid_get(ioasid_t ioasid)
+ +{
+ +	struct ioasid_data *ioasid_data;
+ +
+ +	spin_lock(&ioasid_allocator_lock);
+ +	ioasid_data = xa_load(&active_allocator->xa, ioasid);
+ +	if (ioasid_data)
+ +		refcount_inc(&ioasid_data->refs);
+ +	else
+ +		WARN_ON(1);
+ +	spin_unlock(&ioasid_allocator_lock);
+ +}
+ +EXPORT_SYMBOL_GPL(ioasid_get);
+ +
+ +/**
+ + * ioasid_put - Release a reference to an ioasid
+++=======
++  * ioasid_free - Free an ioasid
+++>>>>>>> 701fac40384f (iommu/sva: Assign a PASID to mm on PASID allocation and free it on mm exit)
+   * @ioasid: the ID to remove
+-  *
+-  * Put a reference to the IOASID, free it when the number of references drops to
+-  * zero.
+-  *
+-  * Return: %true if the IOASID was freed, %false otherwise.
+   */
+- bool ioasid_put(ioasid_t ioasid)
++ void ioasid_free(ioasid_t ioasid)
+  {
+- 	bool free = false;
+  	struct ioasid_data *ioasid_data;
+  
+  	spin_lock(&ioasid_allocator_lock);
+diff --cc include/linux/sched/mm.h
+index 90a82a903c06,a80356e9dc69..000000000000
+--- a/include/linux/sched/mm.h
++++ b/include/linux/sched/mm.h
+@@@ -403,6 -429,34 +403,37 @@@ static inline void membarrier_exec_mmap
+  static inline void membarrier_mm_sync_core_before_usermode(struct mm_struct *mm)
+  {
+  }
+++<<<<<<< HEAD
+++=======
++ static inline void membarrier_update_current_mm(struct mm_struct *next_mm)
++ {
++ }
++ #endif
++ 
++ #ifdef CONFIG_IOMMU_SVA
++ static inline void mm_pasid_init(struct mm_struct *mm)
++ {
++ 	mm->pasid = INVALID_IOASID;
++ }
++ 
++ /* Associate a PASID with an mm_struct: */
++ static inline void mm_pasid_set(struct mm_struct *mm, u32 pasid)
++ {
++ 	mm->pasid = pasid;
++ }
++ 
++ static inline void mm_pasid_drop(struct mm_struct *mm)
++ {
++ 	if (pasid_valid(mm->pasid)) {
++ 		ioasid_free(mm->pasid);
++ 		mm->pasid = INVALID_IOASID;
++ 	}
++ }
++ #else
++ static inline void mm_pasid_init(struct mm_struct *mm) {}
++ static inline void mm_pasid_set(struct mm_struct *mm, u32 pasid) {}
++ static inline void mm_pasid_drop(struct mm_struct *mm) {}
+++>>>>>>> 701fac40384f (iommu/sva: Assign a PASID to mm on PASID allocation and free it on mm exit)
+  #endif
+  
+  #endif /* _LINUX_SCHED_MM_H */
+diff --git a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+index ee66d1f4cb81..c153ffae5462 100644
+--- a/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
++++ b/drivers/iommu/arm/arm-smmu-v3/arm-smmu-v3-sva.c
+@@ -340,14 +340,12 @@ __arm_smmu_sva_bind(struct device *dev, struct mm_struct *mm)
+ 	bond->smmu_mn = arm_smmu_mmu_notifier_get(smmu_domain, mm);
+ 	if (IS_ERR(bond->smmu_mn)) {
+ 		ret = PTR_ERR(bond->smmu_mn);
+-		goto err_free_pasid;
++		goto err_free_bond;
+ 	}
+ 
+ 	list_add(&bond->list, &master->bonds);
+ 	return &bond->sva;
+ 
+-err_free_pasid:
+-	iommu_sva_free_pasid(mm);
+ err_free_bond:
+ 	kfree(bond);
+ 	return ERR_PTR(ret);
+@@ -377,7 +375,6 @@ void arm_smmu_sva_unbind(struct iommu_sva *handle)
+ 	if (refcount_dec_and_test(&bond->refs)) {
+ 		list_del(&bond->list);
+ 		arm_smmu_mmu_notifier_put(bond->smmu_mn);
+-		iommu_sva_free_pasid(bond->mm);
+ 		kfree(bond);
+ 	}
+ 	mutex_unlock(&sva_lock);
+diff --git a/drivers/iommu/intel/iommu.c b/drivers/iommu/intel/iommu.c
+index 97adc74b08c1..80449d8c5ab0 100644
+--- a/drivers/iommu/intel/iommu.c
++++ b/drivers/iommu/intel/iommu.c
+@@ -4628,7 +4628,7 @@ static int aux_domain_add_dev(struct dmar_domain *domain,
+ link_failed:
+ 	spin_unlock_irqrestore(&device_domain_lock, flags);
+ 	if (list_empty(&domain->subdevices) && domain->default_pasid > 0)
+-		ioasid_put(domain->default_pasid);
++		ioasid_free(domain->default_pasid);
+ 
+ 	return ret;
+ }
+@@ -4658,7 +4658,7 @@ static void aux_domain_remove_dev(struct dmar_domain *domain,
+ 	spin_unlock_irqrestore(&device_domain_lock, flags);
+ 
+ 	if (list_empty(&domain->subdevices) && domain->default_pasid > 0)
+-		ioasid_put(domain->default_pasid);
++		ioasid_free(domain->default_pasid);
+ }
+ 
+ static int prepare_domain_attach_device(struct iommu_domain *domain,
+diff --git a/drivers/iommu/intel/svm.c b/drivers/iommu/intel/svm.c
+index f052240dc75e..c303867a9d8e 100644
+--- a/drivers/iommu/intel/svm.c
++++ b/drivers/iommu/intel/svm.c
+@@ -538,11 +538,6 @@ static int intel_svm_alloc_pasid(struct device *dev, struct mm_struct *mm,
+ 	return iommu_sva_alloc_pasid(mm, PASID_MIN, max_pasid - 1);
+ }
+ 
+-static void intel_svm_free_pasid(struct mm_struct *mm)
+-{
+-	iommu_sva_free_pasid(mm);
+-}
+-
+ static struct iommu_sva *intel_svm_bind_mm(struct intel_iommu *iommu,
+ 					   struct device *dev,
+ 					   struct mm_struct *mm,
+@@ -693,8 +688,6 @@ static int intel_svm_unbind_mm(struct device *dev, u32 pasid)
+ 				kfree(svm);
+ 			}
+ 		}
+-		/* Drop a PASID reference and free it if no reference. */
+-		intel_svm_free_pasid(mm);
+ 	}
+ out:
+ 	return ret;
+@@ -1078,8 +1071,6 @@ struct iommu_sva *intel_svm_bind(struct device *dev, struct mm_struct *mm, void
+ 	}
+ 
+ 	sva = intel_svm_bind_mm(iommu, dev, mm, flags);
+-	if (IS_ERR_OR_NULL(sva))
+-		intel_svm_free_pasid(mm);
+ 	mutex_unlock(&pasid_mutex);
+ 
+ 	return sva;
+* Unmerged path drivers/iommu/ioasid.c
+diff --git a/drivers/iommu/iommu-sva-lib.c b/drivers/iommu/iommu-sva-lib.c
+index bd41405d34e9..106506143896 100644
+--- a/drivers/iommu/iommu-sva-lib.c
++++ b/drivers/iommu/iommu-sva-lib.c
+@@ -18,8 +18,7 @@ static DECLARE_IOASID_SET(iommu_sva_pasid);
+  *
+  * Try to allocate a PASID for this mm, or take a reference to the existing one
+  * provided it fits within the [@min, @max] range. On success the PASID is
+- * available in mm->pasid, and must be released with iommu_sva_free_pasid().
+- * @min must be greater than 0, because 0 indicates an unused mm->pasid.
++ * available in mm->pasid and will be available for the lifetime of the mm.
+  *
+  * Returns 0 on success and < 0 on error.
+  */
+@@ -33,38 +32,24 @@ int iommu_sva_alloc_pasid(struct mm_struct *mm, ioasid_t min, ioasid_t max)
+ 		return -EINVAL;
+ 
+ 	mutex_lock(&iommu_sva_lock);
+-	if (mm->pasid) {
+-		if (mm->pasid >= min && mm->pasid <= max)
+-			ioasid_get(mm->pasid);
+-		else
++	/* Is a PASID already associated with this mm? */
++	if (pasid_valid(mm->pasid)) {
++		if (mm->pasid < min || mm->pasid >= max)
+ 			ret = -EOVERFLOW;
+-	} else {
+-		pasid = ioasid_alloc(&iommu_sva_pasid, min, max, mm);
+-		if (pasid == INVALID_IOASID)
+-			ret = -ENOMEM;
+-		else
+-			mm->pasid = pasid;
++		goto out;
+ 	}
++
++	pasid = ioasid_alloc(&iommu_sva_pasid, min, max, mm);
++	if (!pasid_valid(pasid))
++		ret = -ENOMEM;
++	else
++		mm_pasid_set(mm, pasid);
++out:
+ 	mutex_unlock(&iommu_sva_lock);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(iommu_sva_alloc_pasid);
+ 
+-/**
+- * iommu_sva_free_pasid - Release the mm's PASID
+- * @mm: the mm
+- *
+- * Drop one reference to a PASID allocated with iommu_sva_alloc_pasid()
+- */
+-void iommu_sva_free_pasid(struct mm_struct *mm)
+-{
+-	mutex_lock(&iommu_sva_lock);
+-	if (ioasid_put(mm->pasid))
+-		mm->pasid = 0;
+-	mutex_unlock(&iommu_sva_lock);
+-}
+-EXPORT_SYMBOL_GPL(iommu_sva_free_pasid);
+-
+ /* ioasid_find getter() requires a void * argument */
+ static bool __mmget_not_zero(void *mm)
+ {
+diff --git a/drivers/iommu/iommu-sva-lib.h b/drivers/iommu/iommu-sva-lib.h
+index 031155010ca8..bd0f2326b6b3 100644
+--- a/drivers/iommu/iommu-sva-lib.h
++++ b/drivers/iommu/iommu-sva-lib.h
+@@ -9,7 +9,6 @@
+ #include <linux/mm_types.h>
+ 
+ int iommu_sva_alloc_pasid(struct mm_struct *mm, ioasid_t min, ioasid_t max);
+-void iommu_sva_free_pasid(struct mm_struct *mm);
+ struct mm_struct *iommu_sva_find(ioasid_t pasid);
+ 
+ /* I/O Page fault */
+diff --git a/include/linux/ioasid.h b/include/linux/ioasid.h
+index 2237f64dbaae..af1c9d62e642 100644
+--- a/include/linux/ioasid.h
++++ b/include/linux/ioasid.h
+@@ -34,8 +34,7 @@ struct ioasid_allocator_ops {
+ #if IS_ENABLED(CONFIG_IOASID)
+ ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min, ioasid_t max,
+ 		      void *private);
+-void ioasid_get(ioasid_t ioasid);
+-bool ioasid_put(ioasid_t ioasid);
++void ioasid_free(ioasid_t ioasid);
+ void *ioasid_find(struct ioasid_set *set, ioasid_t ioasid,
+ 		  bool (*getter)(void *));
+ int ioasid_register_allocator(struct ioasid_allocator_ops *allocator);
+@@ -53,14 +52,7 @@ static inline ioasid_t ioasid_alloc(struct ioasid_set *set, ioasid_t min,
+ 	return INVALID_IOASID;
+ }
+ 
+-static inline void ioasid_get(ioasid_t ioasid)
+-{
+-}
+-
+-static inline bool ioasid_put(ioasid_t ioasid)
+-{
+-	return false;
+-}
++static inline void ioasid_free(ioasid_t ioasid) { }
+ 
+ static inline void *ioasid_find(struct ioasid_set *set, ioasid_t ioasid,
+ 				bool (*getter)(void *))
+* Unmerged path include/linux/sched/mm.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 3a201a1bb372..7141d7ade144 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -1109,6 +1109,7 @@ static inline void __mmput(struct mm_struct *mm)
+ 	}
+ 	if (mm->binfmt)
+ 		module_put(mm->binfmt->module);
++	mm_pasid_drop(mm);
+ 	mmdrop(mm);
+ }
+ 
