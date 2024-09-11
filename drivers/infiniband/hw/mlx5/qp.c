@@ -2304,11 +2304,6 @@ static int create_qp_common(struct mlx5_ib_dev *dev, struct ib_pd *pd,
 		}
 	}
 
-	if (inlen < 0) {
-		err = -EINVAL;
-		goto err;
-	}
-
 	if (init_attr->qp_type == IB_QPT_RAW_PACKET ||
 	    qp->flags & MLX5_IB_QP_UNDERLAY) {
 		qp->raw_packet_qp.sq.ubuffer.buf_addr = ucmd.sq_buf_addr;
@@ -2353,8 +2348,6 @@ err_create:
 		destroy_qp_user(dev, pd, qp, base, udata);
 	else
 		destroy_qp_kernel(dev, qp);
-
-err:
 	kvfree(in);
 	return err;
 }
