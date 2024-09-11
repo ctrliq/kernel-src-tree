@@ -1,0 +1,144 @@
+mm, compaction: avoid rescanning the same pageblock multiple times
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mel Gorman <mgorman@techsingularity.net>
+commit 804d3121ba5f03af0ab225e2f688ee3ee669c0d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/804d3121.failed
+
+Pageblocks are marked for skip when no pages are isolated after a scan.
+However, it's possible to hit corner cases where the migration scanner
+gets stuck near the boundary between the source and target scanner.  Due
+to pages being migrated in blocks of COMPACT_CLUSTER_MAX, pages that are
+migrated can be reallocated before the pageblock is complete.  The
+pageblock is not necessarily skipped so it can be rescanned multiple
+times.  Similarly, a pageblock with some dirty/writeback pages may fail
+to migrate and be rescanned until writeback completes which is wasteful.
+
+This patch tracks if a pageblock is being rescanned.  If so, then the
+entire pageblock will be migrated as one operation.  This narrows the
+race window during which pages can be reallocated during migration.
+Secondly, if there are pages that cannot be isolated then the pageblock
+will still be fully scanned and marked for skipping.  On the second
+rescan, the pageblock skip is set and the migration scanner makes
+progress.
+
+                                     5.0.0-rc1              5.0.0-rc1
+                                findfree-v3r16         norescan-v3r16
+Amean     fault-both-1         0.00 (   0.00%)        0.00 *   0.00%*
+Amean     fault-both-3      3200.68 (   0.00%)     3002.07 (   6.21%)
+Amean     fault-both-5      4847.75 (   0.00%)     4684.47 (   3.37%)
+Amean     fault-both-7      6658.92 (   0.00%)     6815.54 (  -2.35%)
+Amean     fault-both-12    11077.62 (   0.00%)    10864.02 (   1.93%)
+Amean     fault-both-18    12403.97 (   0.00%)    12247.52 (   1.26%)
+Amean     fault-both-24    15607.10 (   0.00%)    15683.99 (  -0.49%)
+Amean     fault-both-30    18752.27 (   0.00%)    18620.02 (   0.71%)
+Amean     fault-both-32    21207.54 (   0.00%)    19250.28 *   9.23%*
+
+                                5.0.0-rc1              5.0.0-rc1
+                           findfree-v3r16         norescan-v3r16
+Percentage huge-3        96.86 (   0.00%)       95.00 (  -1.91%)
+Percentage huge-5        93.72 (   0.00%)       94.22 (   0.53%)
+Percentage huge-7        94.31 (   0.00%)       92.35 (  -2.08%)
+Percentage huge-12       92.66 (   0.00%)       91.90 (  -0.82%)
+Percentage huge-18       91.51 (   0.00%)       89.58 (  -2.11%)
+Percentage huge-24       90.50 (   0.00%)       90.03 (  -0.52%)
+Percentage huge-30       91.57 (   0.00%)       89.14 (  -2.65%)
+Percentage huge-32       91.00 (   0.00%)       90.58 (  -0.46%)
+
+Negligible difference but this was likely a case when the specific
+corner case was not hit.  A previous run of the same patch based on an
+earlier iteration of the series showed large differences where migration
+rates could be halved when the corner case was hit.
+
+The specific corner case where migration scan rates go through the roof
+was due to a dirty/writeback pageblock located at the boundary of the
+migration/free scanner did not happen in this case.  When it does
+happen, the scan rates multipled by massive margins.
+
+Link: http://lkml.kernel.org/r/20190118175136.31341-13-mgorman@techsingularity.net
+	Signed-off-by: Mel Gorman <mgorman@techsingularity.net>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Andrea Arcangeli <aarcange@redhat.com>
+	Cc: Dan Carpenter <dan.carpenter@oracle.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: YueHaibing <yuehaibing@huawei.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 804d3121ba5f03af0ab225e2f688ee3ee669c0d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/compaction.c
+diff --cc mm/compaction.c
+index 9d273235c740,00a5126b6548..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -933,11 -1000,18 +936,26 @@@ isolate_fail
+  		spin_unlock_irqrestore(zone_lru_lock(zone), flags);
+  
+  	/*
+++<<<<<<< HEAD
+ +	 * Update the pageblock-skip information and cached scanner pfn,
+ +	 * if the whole pageblock was scanned without isolating any page.
+ +	 */
+ +	if (low_pfn == end_pfn)
+ +		update_pageblock_skip(cc, valid_page, nr_isolated, true);
+++=======
++ 	 * Updated the cached scanner pfn once the pageblock has been scanned
++ 	 * Pages will either be migrated in which case there is no point
++ 	 * scanning in the near future or migration failed in which case the
++ 	 * failure reason may persist. The block is marked for skipping if
++ 	 * there were no pages isolated in the block or if the block is
++ 	 * rescanned twice in a row.
++ 	 */
++ 	if (low_pfn == end_pfn && (!nr_isolated || cc->rescan)) {
++ 		if (valid_page && !skip_updated)
++ 			set_pageblock_skip(valid_page);
++ 		update_cached_migrate(cc, low_pfn);
++ 	}
+++>>>>>>> 804d3121ba5f (mm, compaction: avoid rescanning the same pageblock multiple times)
+  
+  	trace_mm_compaction_isolate_migratepages(start_pfn, low_pfn,
+  						nr_scanned, nr_isolated);
+@@@ -1594,7 -2041,21 +1612,25 @@@ static enum compact_result compact_zone
+  		int err;
+  		unsigned long start_pfn = cc->migrate_pfn;
+  
+++<<<<<<< HEAD
+ +		switch (isolate_migratepages(zone, cc)) {
+++=======
++ 		/*
++ 		 * Avoid multiple rescans which can happen if a page cannot be
++ 		 * isolated (dirty/writeback in async mode) or if the migrated
++ 		 * pages are being allocated before the pageblock is cleared.
++ 		 * The first rescan will capture the entire pageblock for
++ 		 * migration. If it fails, it'll be marked skip and scanning
++ 		 * will proceed as normal.
++ 		 */
++ 		cc->rescan = false;
++ 		if (pageblock_start_pfn(last_migrated_pfn) ==
++ 		    pageblock_start_pfn(start_pfn)) {
++ 			cc->rescan = true;
++ 		}
++ 
++ 		switch (isolate_migratepages(cc->zone, cc)) {
+++>>>>>>> 804d3121ba5f (mm, compaction: avoid rescanning the same pageblock multiple times)
+  		case ISOLATE_ABORT:
+  			ret = COMPACT_CONTENDED;
+  			putback_movable_pages(&cc->migratepages);
+* Unmerged path mm/compaction.c
+diff --git a/mm/internal.h b/mm/internal.h
+index 9193c2ad54f9..d342d4f4b1f4 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -203,6 +203,7 @@ struct compact_control {
+ 	bool direct_compaction;		/* False from kcompactd or /proc/... */
+ 	bool whole_zone;		/* Whole zone should/has been scanned */
+ 	bool contended;			/* Signal lock or sched contention */
++	bool rescan;			/* Rescanning the same pageblock */
+ };
+ 
+ unsigned long
