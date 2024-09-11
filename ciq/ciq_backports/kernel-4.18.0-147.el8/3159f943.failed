@@ -1,0 +1,1181 @@
+xarray: Replace exceptional entries
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 3159f943aafdbacb2f94c38fdaadabf2bbde2a14
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/3159f943.failed
+
+Introduce xarray value entries and tagged pointers to replace radix
+tree exceptional entries.  This is a slight change in encoding to allow
+the use of an extra bit (we can now store BITS_PER_LONG - 1 bits in a
+value entry).  It is also a change in emphasis; exceptional entries are
+intimidating and different.  As the comment explains, you can choose
+to store values or pointers in the xarray and they are both first-class
+citizens.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Reviewed-by: Josef Bacik <jbacik@fb.com>
+(cherry picked from commit 3159f943aafdbacb2f94c38fdaadabf2bbde2a14)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/staging/erofs/utils.c
+#	fs/dax.c
+#	include/linux/radix-tree.h
+#	include/linux/xarray.h
+diff --cc fs/dax.c
+index 897b51e41d8f,ebcec36335eb..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -364,13 -392,90 +363,12 @@@ static struct page *dax_busy_page(void 
+  	return NULL;
+  }
+  
+ -static bool entry_wait_revalidate(void)
+ -{
+ -	rcu_read_unlock();
+ -	schedule();
+ -	rcu_read_lock();
+ -
+ -	/*
+ -	 * Tell __get_unlocked_mapping_entry() to take a break, we need
+ -	 * to revalidate page->mapping after dropping locks
+ -	 */
+ -	return true;
+ -}
+ -
+ -bool dax_lock_mapping_entry(struct page *page)
+ -{
+ -	pgoff_t index;
+ -	struct inode *inode;
+ -	bool did_lock = false;
+ -	void *entry = NULL, **slot;
+ -	struct address_space *mapping;
+ -
+ -	rcu_read_lock();
+ -	for (;;) {
+ -		mapping = READ_ONCE(page->mapping);
+ -
+ -		if (!dax_mapping(mapping))
+ -			break;
+ -
+ -		/*
+ -		 * In the device-dax case there's no need to lock, a
+ -		 * struct dev_pagemap pin is sufficient to keep the
+ -		 * inode alive, and we assume we have dev_pagemap pin
+ -		 * otherwise we would not have a valid pfn_to_page()
+ -		 * translation.
+ -		 */
+ -		inode = mapping->host;
+ -		if (S_ISCHR(inode->i_mode)) {
+ -			did_lock = true;
+ -			break;
+ -		}
+ -
+ -		xa_lock_irq(&mapping->i_pages);
+ -		if (mapping != page->mapping) {
+ -			xa_unlock_irq(&mapping->i_pages);
+ -			continue;
+ -		}
+ -		index = page->index;
+ -
+ -		entry = __get_unlocked_mapping_entry(mapping, index, &slot,
+ -				entry_wait_revalidate);
+ -		if (!entry) {
+ -			xa_unlock_irq(&mapping->i_pages);
+ -			break;
+ -		} else if (IS_ERR(entry)) {
+ -			WARN_ON_ONCE(PTR_ERR(entry) != -EAGAIN);
+ -			continue;
+ -		}
+ -		lock_slot(mapping, slot);
+ -		did_lock = true;
+ -		xa_unlock_irq(&mapping->i_pages);
+ -		break;
+ -	}
+ -	rcu_read_unlock();
+ -
+ -	return did_lock;
+ -}
+ -
+ -void dax_unlock_mapping_entry(struct page *page)
+ -{
+ -	struct address_space *mapping = page->mapping;
+ -	struct inode *inode = mapping->host;
+ -
+ -	if (S_ISCHR(inode->i_mode))
+ -		return;
+ -
+ -	unlock_mapping_entry(mapping, page->index);
+ -}
+ -
+  /*
+-  * Find radix tree entry at given index. If it points to an exceptional entry,
+-  * return it with the radix tree entry locked. If the radix tree doesn't
+-  * contain given index, create an empty exceptional entry for the index and
+-  * return with it locked.
++  * Find radix tree entry at given index. If it is a DAX entry, return it
++  * with the radix tree entry locked. If the radix tree doesn't contain the
++  * given index, create an empty entry for the index and return with it locked.
+   *
+-  * When requesting an entry with size RADIX_DAX_PMD, grab_mapping_entry() will
++  * When requesting an entry with size DAX_PMD, grab_mapping_entry() will
+   * either return that locked entry or will return an error.  This error will
+   * happen if there are any 4k entries within the 2MiB range that we are
+   * requesting.
+@@@ -1015,21 -1117,13 +1012,27 @@@ static vm_fault_t dax_load_hole(struct 
+  {
+  	struct inode *inode = mapping->host;
+  	unsigned long vaddr = vmf->address;
+ -	pfn_t pfn = pfn_to_pfn_t(my_zero_pfn(vaddr));
+ -	vm_fault_t ret;
+ +	vm_fault_t ret = VM_FAULT_NOPAGE;
+ +	struct page *zero_page;
+ +	pfn_t pfn;
+ +
+++<<<<<<< HEAD
+ +	zero_page = ZERO_PAGE(0);
+ +	if (unlikely(!zero_page)) {
+ +		ret = VM_FAULT_OOM;
+ +		goto out;
+ +	}
+  
+ +	pfn = page_to_pfn_t(zero_page);
+ +	dax_insert_mapping_entry(mapping, vmf, entry, pfn, RADIX_DAX_ZERO_PAGE,
+ +			false);
+++=======
++ 	dax_insert_mapping_entry(mapping, vmf, entry, pfn,
++ 			DAX_ZERO_PAGE, false);
++ 
+++>>>>>>> 3159f943aafd (xarray: Replace exceptional entries)
+  	ret = vmf_insert_mixed(vmf->vma, vaddr, pfn);
+ +out:
+  	trace_dax_load_hole(inode, vmf, ret);
+  	return ret;
+  }
+diff --cc include/linux/radix-tree.h
+index 8e57792d07fb,e9e76ab4fbbf..000000000000
+--- a/include/linux/radix-tree.h
++++ b/include/linux/radix-tree.h
+@@@ -28,7 -28,7 +28,11 @@@
+  #include <linux/rcupdate.h>
+  #include <linux/spinlock.h>
+  #include <linux/types.h>
+++<<<<<<< HEAD
+ +#include <linux/rh_kabi.h>
+++=======
++ #include <linux/xarray.h>
+++>>>>>>> 3159f943aafd (xarray: Replace exceptional entries)
+  
+  /*
+   * The bottom two bits of the slot determine how the remaining bits in the
+@@@ -82,19 -73,12 +77,18 @@@ static inline bool radix_tree_is_intern
+  #define RADIX_TREE_MAX_PATH (DIV_ROUND_UP(RADIX_TREE_INDEX_BITS, \
+  					  RADIX_TREE_MAP_SHIFT))
+  
+ +/**
+ + * struct radix_tree_node_rh  - Red Hat KABI extension struct
+ + */
+ +struct radix_tree_node_rh {
+ +};
+ +
+  /*
+   * @count is the count of every non-NULL element in the ->slots array
+-  * whether that is an exceptional entry, a retry entry, a user pointer,
++  * whether that is a value entry, a retry entry, a user pointer,
+   * a sibling entry or a pointer to the next level of the tree.
+   * @exceptional is the count of every element in ->slots which is
+-  * either radix_tree_exceptional_entry() or is a sibling entry for an
+-  * exceptional entry.
++  * either a value entry or a sibling of a value entry.
+   */
+  struct radix_tree_node {
+  	unsigned char	shift;		/* Bits remaining in each slot */
+diff --cc include/linux/xarray.h
+index 2dfc8006fe64,5c8acfc4ff55..000000000000
+--- a/include/linux/xarray.h
++++ b/include/linux/xarray.h
+@@@ -4,10 -4,112 +4,116 @@@
+  /*
+   * eXtensible Arrays
+   * Copyright (c) 2017 Microsoft Corporation
+++<<<<<<< HEAD
+ + * Author: Matthew Wilcox <mawilcox@microsoft.com>
+++=======
++  * Author: Matthew Wilcox <willy@infradead.org>
++  *
++  * See Documentation/core-api/xarray.rst for how to use the XArray.
+++>>>>>>> 3159f943aafd (xarray: Replace exceptional entries)
+   */
+  
++ #include <linux/bug.h>
+  #include <linux/spinlock.h>
++ #include <linux/types.h>
++ 
++ /*
++  * The bottom two bits of the entry determine how the XArray interprets
++  * the contents:
++  *
++  * 00: Pointer entry
++  * 10: Internal entry
++  * x1: Value entry or tagged pointer
++  *
++  * Attempting to store internal entries in the XArray is a bug.
++  */
++ 
++ #define BITS_PER_XA_VALUE	(BITS_PER_LONG - 1)
++ 
++ /**
++  * xa_mk_value() - Create an XArray entry from an integer.
++  * @v: Value to store in XArray.
++  *
++  * Context: Any context.
++  * Return: An entry suitable for storing in the XArray.
++  */
++ static inline void *xa_mk_value(unsigned long v)
++ {
++ 	WARN_ON((long)v < 0);
++ 	return (void *)((v << 1) | 1);
++ }
++ 
++ /**
++  * xa_to_value() - Get value stored in an XArray entry.
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: The value stored in the XArray entry.
++  */
++ static inline unsigned long xa_to_value(const void *entry)
++ {
++ 	return (unsigned long)entry >> 1;
++ }
++ 
++ /**
++  * xa_is_value() - Determine if an entry is a value.
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: True if the entry is a value, false if it is a pointer.
++  */
++ static inline bool xa_is_value(const void *entry)
++ {
++ 	return (unsigned long)entry & 1;
++ }
++ 
++ /**
++  * xa_tag_pointer() - Create an XArray entry for a tagged pointer.
++  * @p: Plain pointer.
++  * @tag: Tag value (0, 1 or 3).
++  *
++  * If the user of the XArray prefers, they can tag their pointers instead
++  * of storing value entries.  Three tags are available (0, 1 and 3).
++  * These are distinct from the xa_mark_t as they are not replicated up
++  * through the array and cannot be searched for.
++  *
++  * Context: Any context.
++  * Return: An XArray entry.
++  */
++ static inline void *xa_tag_pointer(void *p, unsigned long tag)
++ {
++ 	return (void *)((unsigned long)p | tag);
++ }
++ 
++ /**
++  * xa_untag_pointer() - Turn an XArray entry into a plain pointer.
++  * @entry: XArray entry.
++  *
++  * If you have stored a tagged pointer in the XArray, call this function
++  * to get the untagged version of the pointer.
++  *
++  * Context: Any context.
++  * Return: A pointer.
++  */
++ static inline void *xa_untag_pointer(void *entry)
++ {
++ 	return (void *)((unsigned long)entry & ~3UL);
++ }
++ 
++ /**
++  * xa_pointer_tag() - Get the tag stored in an XArray entry.
++  * @entry: XArray entry.
++  *
++  * If you have stored a tagged pointer in the XArray, call this function
++  * to get the tag of that pointer.
++  *
++  * Context: Any context.
++  * Return: A tag.
++  */
++ static inline unsigned int xa_pointer_tag(void *entry)
++ {
++ 	return (unsigned long)entry & 3UL;
++ }
+  
+  #define xa_trylock(xa)		spin_trylock(&(xa)->xa_lock)
+  #define xa_lock(xa)		spin_lock(&(xa)->xa_lock)
+* Unmerged path drivers/staging/erofs/utils.c
+diff --git a/arch/powerpc/include/asm/book3s/64/pgtable.h b/arch/powerpc/include/asm/book3s/64/pgtable.h
+index 2a2486526d1f..6ca2065e1c79 100644
+--- a/arch/powerpc/include/asm/book3s/64/pgtable.h
++++ b/arch/powerpc/include/asm/book3s/64/pgtable.h
+@@ -723,9 +723,7 @@ static inline bool pte_user(pte_t pte)
+ 	BUILD_BUG_ON(_PAGE_HPTEFLAGS & (0x1f << _PAGE_BIT_SWAP_TYPE)); \
+ 	BUILD_BUG_ON(_PAGE_HPTEFLAGS & _PAGE_SWP_SOFT_DIRTY);	\
+ 	} while (0)
+-/*
+- * on pte we don't need handle RADIX_TREE_EXCEPTIONAL_SHIFT;
+- */
++
+ #define SWP_TYPE_BITS 5
+ #define __swp_type(x)		(((x).val >> _PAGE_BIT_SWAP_TYPE) \
+ 				& ((1UL << SWP_TYPE_BITS) - 1))
+diff --git a/arch/powerpc/include/asm/nohash/64/pgtable.h b/arch/powerpc/include/asm/nohash/64/pgtable.h
+index dd0c7236208f..6752636bc457 100644
+--- a/arch/powerpc/include/asm/nohash/64/pgtable.h
++++ b/arch/powerpc/include/asm/nohash/64/pgtable.h
+@@ -322,9 +322,7 @@ static inline void __ptep_set_access_flags(struct vm_area_struct *vma,
+ #define MAX_SWAPFILES_CHECK() do { \
+ 	BUILD_BUG_ON(MAX_SWAPFILES_SHIFT > SWP_TYPE_BITS); \
+ 	} while (0)
+-/*
+- * on pte we don't need handle RADIX_TREE_EXCEPTIONAL_SHIFT;
+- */
++
+ #define SWP_TYPE_BITS 5
+ #define __swp_type(x)		(((x).val >> _PAGE_BIT_SWAP_TYPE) \
+ 				& ((1UL << SWP_TYPE_BITS) - 1))
+diff --git a/drivers/gpu/drm/i915/i915_gem.c b/drivers/gpu/drm/i915/i915_gem.c
+index 17c5097721e8..23597313ce31 100644
+--- a/drivers/gpu/drm/i915/i915_gem.c
++++ b/drivers/gpu/drm/i915/i915_gem.c
+@@ -5894,7 +5894,8 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 	count = __sg_page_count(sg);
+ 
+ 	while (idx + count <= n) {
+-		unsigned long exception, i;
++		void *entry;
++		unsigned long i;
+ 		int ret;
+ 
+ 		/* If we cannot allocate and insert this entry, or the
+@@ -5909,12 +5910,9 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 		if (ret && ret != -EEXIST)
+ 			goto scan;
+ 
+-		exception =
+-			RADIX_TREE_EXCEPTIONAL_ENTRY |
+-			idx << RADIX_TREE_EXCEPTIONAL_SHIFT;
++		entry = xa_mk_value(idx);
+ 		for (i = 1; i < count; i++) {
+-			ret = radix_tree_insert(&iter->radix, idx + i,
+-						(void *)exception);
++			ret = radix_tree_insert(&iter->radix, idx + i, entry);
+ 			if (ret && ret != -EEXIST)
+ 				goto scan;
+ 		}
+@@ -5952,15 +5950,14 @@ i915_gem_object_get_sg(struct drm_i915_gem_object *obj,
+ 	GEM_BUG_ON(!sg);
+ 
+ 	/* If this index is in the middle of multi-page sg entry,
+-	 * the radixtree will contain an exceptional entry that points
++	 * the radix tree will contain a value entry that points
+ 	 * to the start of that range. We will return the pointer to
+ 	 * the base page and the offset of this page within the
+ 	 * sg entry's range.
+ 	 */
+ 	*offset = 0;
+-	if (unlikely(radix_tree_exception(sg))) {
+-		unsigned long base =
+-			(unsigned long)sg >> RADIX_TREE_EXCEPTIONAL_SHIFT;
++	if (unlikely(xa_is_value(sg))) {
++		unsigned long base = xa_to_value(sg);
+ 
+ 		sg = radix_tree_lookup(&iter->radix, base);
+ 		GEM_BUG_ON(!sg);
+* Unmerged path drivers/staging/erofs/utils.c
+diff --git a/fs/btrfs/compression.c b/fs/btrfs/compression.c
+index d3e447b45bf7..8db29f791984 100644
+--- a/fs/btrfs/compression.c
++++ b/fs/btrfs/compression.c
+@@ -447,7 +447,7 @@ static noinline int add_ra_bio_pages(struct inode *inode,
+ 		rcu_read_lock();
+ 		page = radix_tree_lookup(&mapping->i_pages, pg_index);
+ 		rcu_read_unlock();
+-		if (page && !radix_tree_exceptional_entry(page)) {
++		if (page && !xa_is_value(page)) {
+ 			misses++;
+ 			if (misses > 4)
+ 				break;
+* Unmerged path fs/dax.c
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index 3437da437099..16ce6349420e 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -553,7 +553,7 @@ static void smaps_pte_entry(pte_t *pte, unsigned long addr,
+ 		if (!page)
+ 			return;
+ 
+-		if (radix_tree_exceptional_entry(page))
++		if (xa_is_value(page))
+ 			mss->swap += PAGE_SIZE;
+ 		else
+ 			put_page(page);
+* Unmerged path include/linux/radix-tree.h
+diff --git a/include/linux/swapops.h b/include/linux/swapops.h
+index 1d3877c39a00..9c0eb4d4f444 100644
+--- a/include/linux/swapops.h
++++ b/include/linux/swapops.h
+@@ -17,9 +17,8 @@
+  *
+  * swp_entry_t's are *never* stored anywhere in their arch-dependent format.
+  */
+-#define SWP_TYPE_SHIFT(e)	((sizeof(e.val) * 8) - \
+-			(MAX_SWAPFILES_SHIFT + RADIX_TREE_EXCEPTIONAL_SHIFT))
+-#define SWP_OFFSET_MASK(e)	((1UL << SWP_TYPE_SHIFT(e)) - 1)
++#define SWP_TYPE_SHIFT	(BITS_PER_XA_VALUE - MAX_SWAPFILES_SHIFT)
++#define SWP_OFFSET_MASK	((1UL << SWP_TYPE_SHIFT) - 1)
+ 
+ /*
+  * Store a type+offset into a swp_entry_t in an arch-independent format
+@@ -28,8 +27,7 @@ static inline swp_entry_t swp_entry(unsigned long type, pgoff_t offset)
+ {
+ 	swp_entry_t ret;
+ 
+-	ret.val = (type << SWP_TYPE_SHIFT(ret)) |
+-			(offset & SWP_OFFSET_MASK(ret));
++	ret.val = (type << SWP_TYPE_SHIFT) | (offset & SWP_OFFSET_MASK);
+ 	return ret;
+ }
+ 
+@@ -39,7 +37,7 @@ static inline swp_entry_t swp_entry(unsigned long type, pgoff_t offset)
+  */
+ static inline unsigned swp_type(swp_entry_t entry)
+ {
+-	return (entry.val >> SWP_TYPE_SHIFT(entry));
++	return (entry.val >> SWP_TYPE_SHIFT);
+ }
+ 
+ /*
+@@ -48,7 +46,7 @@ static inline unsigned swp_type(swp_entry_t entry)
+  */
+ static inline pgoff_t swp_offset(swp_entry_t entry)
+ {
+-	return entry.val & SWP_OFFSET_MASK(entry);
++	return entry.val & SWP_OFFSET_MASK;
+ }
+ 
+ #ifdef CONFIG_MMU
+@@ -89,16 +87,13 @@ static inline swp_entry_t radix_to_swp_entry(void *arg)
+ {
+ 	swp_entry_t entry;
+ 
+-	entry.val = (unsigned long)arg >> RADIX_TREE_EXCEPTIONAL_SHIFT;
++	entry.val = xa_to_value(arg);
+ 	return entry;
+ }
+ 
+ static inline void *swp_to_radix_entry(swp_entry_t entry)
+ {
+-	unsigned long value;
+-
+-	value = entry.val << RADIX_TREE_EXCEPTIONAL_SHIFT;
+-	return (void *)(value | RADIX_TREE_EXCEPTIONAL_ENTRY);
++	return xa_mk_value(entry.val);
+ }
+ 
+ #if IS_ENABLED(CONFIG_DEVICE_PRIVATE)
+* Unmerged path include/linux/xarray.h
+diff --git a/lib/idr.c b/lib/idr.c
+index 729e381e23b4..88419fbc5737 100644
+--- a/lib/idr.c
++++ b/lib/idr.c
+@@ -338,11 +338,8 @@ EXPORT_SYMBOL(idr_replace);
+  * by the number of bits in the leaf bitmap before doing a radix tree lookup.
+  *
+  * As an optimisation, if there are only a few low bits set in any given
+- * leaf, instead of allocating a 128-byte bitmap, we use the 'exceptional
+- * entry' functionality of the radix tree to store BITS_PER_LONG - 2 bits
+- * directly in the entry.  By being really tricksy, we could store
+- * BITS_PER_LONG - 1 bits, but there're diminishing returns after optimising
+- * for 0-3 allocated IDs.
++ * leaf, instead of allocating a 128-byte bitmap, we store the bits
++ * directly in the entry.
+  *
+  * We allow the radix tree 'exceptional' count to get out of date.  Nothing
+  * in the IDA nor the radix tree code checks it.  If it becomes important
+@@ -366,12 +363,11 @@ static int ida_get_new_above(struct ida *ida, int start)
+ 	struct radix_tree_iter iter;
+ 	struct ida_bitmap *bitmap;
+ 	unsigned long index;
+-	unsigned bit, ebit;
++	unsigned bit;
+ 	int new;
+ 
+ 	index = start / IDA_BITMAP_BITS;
+ 	bit = start % IDA_BITMAP_BITS;
+-	ebit = bit + RADIX_TREE_EXCEPTIONAL_SHIFT;
+ 
+ 	slot = radix_tree_iter_init(&iter, index);
+ 	for (;;) {
+@@ -386,25 +382,23 @@ static int ida_get_new_above(struct ida *ida, int start)
+ 				return PTR_ERR(slot);
+ 			}
+ 		}
+-		if (iter.index > index) {
++		if (iter.index > index)
+ 			bit = 0;
+-			ebit = RADIX_TREE_EXCEPTIONAL_SHIFT;
+-		}
+ 		new = iter.index * IDA_BITMAP_BITS;
+ 		bitmap = rcu_dereference_raw(*slot);
+-		if (radix_tree_exception(bitmap)) {
+-			unsigned long tmp = (unsigned long)bitmap;
+-			ebit = find_next_zero_bit(&tmp, BITS_PER_LONG, ebit);
+-			if (ebit < BITS_PER_LONG) {
+-				tmp |= 1UL << ebit;
+-				rcu_assign_pointer(*slot, (void *)tmp);
+-				return new + ebit -
+-					RADIX_TREE_EXCEPTIONAL_SHIFT;
++		if (xa_is_value(bitmap)) {
++			unsigned long tmp = xa_to_value(bitmap);
++			int vbit = find_next_zero_bit(&tmp, BITS_PER_XA_VALUE,
++							bit);
++			if (vbit < BITS_PER_XA_VALUE) {
++				tmp |= 1UL << vbit;
++				rcu_assign_pointer(*slot, xa_mk_value(tmp));
++				return new + vbit;
+ 			}
+ 			bitmap = this_cpu_xchg(ida_bitmap, NULL);
+ 			if (!bitmap)
+ 				return -EAGAIN;
+-			bitmap->bitmap[0] = tmp >> RADIX_TREE_EXCEPTIONAL_SHIFT;
++			bitmap->bitmap[0] = tmp;
+ 			rcu_assign_pointer(*slot, bitmap);
+ 		}
+ 
+@@ -425,17 +419,14 @@ static int ida_get_new_above(struct ida *ida, int start)
+ 			new += bit;
+ 			if (new < 0)
+ 				return -ENOSPC;
+-			if (ebit < BITS_PER_LONG) {
+-				bitmap = (void *)((1UL << ebit) |
+-						RADIX_TREE_EXCEPTIONAL_ENTRY);
+-				radix_tree_iter_replace(root, &iter, slot,
+-						bitmap);
+-				return new;
++			if (bit < BITS_PER_XA_VALUE) {
++				bitmap = xa_mk_value(1UL << bit);
++			} else {
++				bitmap = this_cpu_xchg(ida_bitmap, NULL);
++				if (!bitmap)
++					return -EAGAIN;
++				__set_bit(bit, bitmap->bitmap);
+ 			}
+-			bitmap = this_cpu_xchg(ida_bitmap, NULL);
+-			if (!bitmap)
+-				return -EAGAIN;
+-			__set_bit(bit, bitmap->bitmap);
+ 			radix_tree_iter_replace(root, &iter, slot, bitmap);
+ 		}
+ 
+@@ -457,9 +448,9 @@ static void ida_remove(struct ida *ida, int id)
+ 		goto err;
+ 
+ 	bitmap = rcu_dereference_raw(*slot);
+-	if (radix_tree_exception(bitmap)) {
++	if (xa_is_value(bitmap)) {
+ 		btmp = (unsigned long *)slot;
+-		offset += RADIX_TREE_EXCEPTIONAL_SHIFT;
++		offset += 1; /* Intimate knowledge of the value encoding */
+ 		if (offset >= BITS_PER_LONG)
+ 			goto err;
+ 	} else {
+@@ -470,9 +461,8 @@ static void ida_remove(struct ida *ida, int id)
+ 
+ 	__clear_bit(offset, btmp);
+ 	radix_tree_iter_tag_set(&ida->ida_rt, &iter, IDR_FREE);
+-	if (radix_tree_exception(bitmap)) {
+-		if (rcu_dereference_raw(*slot) ==
+-					(void *)RADIX_TREE_EXCEPTIONAL_ENTRY)
++	if (xa_is_value(bitmap)) {
++		if (xa_to_value(rcu_dereference_raw(*slot)) == 0)
+ 			radix_tree_iter_delete(&ida->ida_rt, &iter, slot);
+ 	} else if (bitmap_empty(btmp, IDA_BITMAP_BITS)) {
+ 		kfree(bitmap);
+@@ -503,7 +493,7 @@ void ida_destroy(struct ida *ida)
+ 	xa_lock_irqsave(&ida->ida_rt, flags);
+ 	radix_tree_for_each_slot(slot, &ida->ida_rt, &iter, 0) {
+ 		struct ida_bitmap *bitmap = rcu_dereference_raw(*slot);
+-		if (!radix_tree_exception(bitmap))
++		if (!xa_is_value(bitmap))
+ 			kfree(bitmap);
+ 		radix_tree_iter_delete(&ida->ida_rt, &iter, slot);
+ 	}
+diff --git a/lib/radix-tree.c b/lib/radix-tree.c
+index a904a8ddd174..b6c0e7f3a894 100644
+--- a/lib/radix-tree.c
++++ b/lib/radix-tree.c
+@@ -340,14 +340,12 @@ static void dump_ida_node(void *entry, unsigned long index)
+ 		for (i = 0; i < RADIX_TREE_MAP_SIZE; i++)
+ 			dump_ida_node(node->slots[i],
+ 					index | (i << node->shift));
+-	} else if (radix_tree_exceptional_entry(entry)) {
++	} else if (xa_is_value(entry)) {
+ 		pr_debug("ida excp: %p offset %d indices %lu-%lu data %lx\n",
+ 				entry, (int)(index & RADIX_TREE_MAP_MASK),
+ 				index * IDA_BITMAP_BITS,
+-				index * IDA_BITMAP_BITS + BITS_PER_LONG -
+-					RADIX_TREE_EXCEPTIONAL_SHIFT,
+-				(unsigned long)entry >>
+-					RADIX_TREE_EXCEPTIONAL_SHIFT);
++				index * IDA_BITMAP_BITS + BITS_PER_XA_VALUE,
++				xa_to_value(entry));
+ 	} else {
+ 		struct ida_bitmap *bitmap = entry;
+ 
+@@ -656,7 +654,7 @@ static int radix_tree_extend(struct radix_tree_root *root, gfp_t gfp,
+ 		BUG_ON(shift > BITS_PER_LONG);
+ 		if (radix_tree_is_internal_node(entry)) {
+ 			entry_to_node(entry)->parent = node;
+-		} else if (radix_tree_exceptional_entry(entry)) {
++		} else if (xa_is_value(entry)) {
+ 			/* Moving an exceptional root->rnode to a node */
+ 			node->exceptional = 1;
+ 		}
+@@ -955,12 +953,12 @@ static inline int insert_entries(struct radix_tree_node *node,
+ 					!is_sibling_entry(node, old) &&
+ 					(old != RADIX_TREE_RETRY))
+ 			radix_tree_free_nodes(old);
+-		if (radix_tree_exceptional_entry(old))
++		if (xa_is_value(old))
+ 			node->exceptional--;
+ 	}
+ 	if (node) {
+ 		node->count += n;
+-		if (radix_tree_exceptional_entry(item))
++		if (xa_is_value(item))
+ 			node->exceptional += n;
+ 	}
+ 	return n;
+@@ -974,7 +972,7 @@ static inline int insert_entries(struct radix_tree_node *node,
+ 	rcu_assign_pointer(*slot, item);
+ 	if (node) {
+ 		node->count++;
+-		if (radix_tree_exceptional_entry(item))
++		if (xa_is_value(item))
+ 			node->exceptional++;
+ 	}
+ 	return 1;
+@@ -1190,8 +1188,7 @@ void __radix_tree_replace(struct radix_tree_root *root,
+ 			  radix_tree_update_node_t update_node)
+ {
+ 	void *old = rcu_dereference_raw(*slot);
+-	int exceptional = !!radix_tree_exceptional_entry(item) -
+-				!!radix_tree_exceptional_entry(old);
++	int exceptional = !!xa_is_value(item) - !!xa_is_value(old);
+ 	int count = calculate_count(root, node, slot, item, old);
+ 
+ 	/*
+@@ -1992,7 +1989,7 @@ static bool __radix_tree_delete(struct radix_tree_root *root,
+ 				struct radix_tree_node *node, void __rcu **slot)
+ {
+ 	void *old = rcu_dereference_raw(*slot);
+-	int exceptional = radix_tree_exceptional_entry(old) ? -1 : 0;
++	int exceptional = xa_is_value(old) ? -1 : 0;
+ 	unsigned offset = get_slot_offset(node, slot);
+ 	int tag;
+ 
+diff --git a/mm/filemap.c b/mm/filemap.c
+index 37ff8063cee4..f999e71d4a45 100644
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@ -127,7 +127,7 @@ static int page_cache_tree_insert(struct address_space *mapping,
+ 
+ 		p = radix_tree_deref_slot_protected(slot,
+ 						    &mapping->i_pages.xa_lock);
+-		if (!radix_tree_exceptional_entry(p))
++		if (!xa_is_value(p))
+ 			return -EEXIST;
+ 
+ 		mapping->nrexceptional--;
+@@ -336,7 +336,7 @@ page_cache_tree_delete_batch(struct address_space *mapping,
+ 			break;
+ 		page = radix_tree_deref_slot_protected(slot,
+ 						       &mapping->i_pages.xa_lock);
+-		if (radix_tree_exceptional_entry(page))
++		if (xa_is_value(page))
+ 			continue;
+ 		if (!tail_pages) {
+ 			/*
+@@ -1413,7 +1413,7 @@ pgoff_t page_cache_next_hole(struct address_space *mapping,
+ 		struct page *page;
+ 
+ 		page = radix_tree_lookup(&mapping->i_pages, index);
+-		if (!page || radix_tree_exceptional_entry(page))
++		if (!page || xa_is_value(page))
+ 			break;
+ 		index++;
+ 		if (index == 0)
+@@ -1454,7 +1454,7 @@ pgoff_t page_cache_prev_hole(struct address_space *mapping,
+ 		struct page *page;
+ 
+ 		page = radix_tree_lookup(&mapping->i_pages, index);
+-		if (!page || radix_tree_exceptional_entry(page))
++		if (!page || xa_is_value(page))
+ 			break;
+ 		index--;
+ 		if (index == ULONG_MAX)
+@@ -1597,7 +1597,7 @@ struct page *pagecache_get_page(struct address_space *mapping, pgoff_t offset,
+ 
+ repeat:
+ 	page = find_get_entry(mapping, offset);
+-	if (radix_tree_exceptional_entry(page))
++	if (xa_is_value(page))
+ 		page = NULL;
+ 	if (!page)
+ 		goto no_page;
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index d7b2a4bf8671..d6992ba1f604 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -1368,7 +1368,7 @@ static void collapse_shmem(struct mm_struct *mm,
+ 
+ 		page = radix_tree_deref_slot_protected(slot,
+ 				&mapping->i_pages.xa_lock);
+-		if (radix_tree_exceptional_entry(page) || !PageUptodate(page)) {
++		if (xa_is_value(page) || !PageUptodate(page)) {
+ 			xa_unlock_irq(&mapping->i_pages);
+ 			/* swap in or instantiate fallocated page */
+ 			if (shmem_getpage(mapping->host, index, &page,
+diff --git a/mm/madvise.c b/mm/madvise.c
+index 8534ea2978c5..b26ce5aa3983 100644
+--- a/mm/madvise.c
++++ b/mm/madvise.c
+@@ -251,7 +251,7 @@ static void force_shm_swapin_readahead(struct vm_area_struct *vma,
+ 		index = ((start - vma->vm_start) >> PAGE_SHIFT) + vma->vm_pgoff;
+ 
+ 		page = find_get_entry(mapping, index);
+-		if (!radix_tree_exceptional_entry(page)) {
++		if (!xa_is_value(page)) {
+ 			if (page)
+ 				put_page(page);
+ 			continue;
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index b836e7f00309..298f0d41483d 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -4465,7 +4465,7 @@ static struct page *mc_handle_file_pte(struct vm_area_struct *vma,
+ 	/* shmem/tmpfs may report page out on swap: account for that too. */
+ 	if (shmem_mapping(mapping)) {
+ 		page = find_get_entry(mapping, pgoff);
+-		if (radix_tree_exceptional_entry(page)) {
++		if (xa_is_value(page)) {
+ 			swp_entry_t swp = radix_to_swp_entry(page);
+ 			if (do_memsw_account())
+ 				*entry = swp;
+diff --git a/mm/mincore.c b/mm/mincore.c
+index fc37afe226e6..4985965aa20a 100644
+--- a/mm/mincore.c
++++ b/mm/mincore.c
+@@ -66,7 +66,7 @@ static unsigned char mincore_page(struct address_space *mapping, pgoff_t pgoff)
+ 		 * shmem/tmpfs may return swap: account for swapcache
+ 		 * page too.
+ 		 */
+-		if (radix_tree_exceptional_entry(page)) {
++		if (xa_is_value(page)) {
+ 			swp_entry_t swp = radix_to_swp_entry(page);
+ 			page = find_get_page(swap_address_space(swp),
+ 					     swp_offset(swp));
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 4e630143a0ba..de657077d41d 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -179,7 +179,7 @@ unsigned int __do_page_cache_readahead(struct address_space *mapping,
+ 		rcu_read_lock();
+ 		page = radix_tree_lookup(&mapping->i_pages, page_offset);
+ 		rcu_read_unlock();
+-		if (page && !radix_tree_exceptional_entry(page)) {
++		if (page && !xa_is_value(page)) {
+ 			/*
+ 			 * Page already present?  Kick off the current batch of
+ 			 * contiguous pages before continuing with the next
+diff --git a/mm/shmem.c b/mm/shmem.c
+index f5653c247fb1..32084ddfb929 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -708,7 +708,7 @@ unsigned long shmem_partial_swap_usage(struct address_space *mapping,
+ 			continue;
+ 		}
+ 
+-		if (radix_tree_exceptional_entry(page))
++		if (xa_is_value(page))
+ 			swapped++;
+ 
+ 		if (need_resched()) {
+@@ -823,7 +823,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 			if (index >= end)
+ 				break;
+ 
+-			if (radix_tree_exceptional_entry(page)) {
++			if (xa_is_value(page)) {
+ 				if (unfalloc)
+ 					continue;
+ 				nr_swaps_freed += !shmem_free_swap(mapping,
+@@ -920,7 +920,7 @@ static void shmem_undo_range(struct inode *inode, loff_t lstart, loff_t lend,
+ 			if (index >= end)
+ 				break;
+ 
+-			if (radix_tree_exceptional_entry(page)) {
++			if (xa_is_value(page)) {
+ 				if (unfalloc)
+ 					continue;
+ 				if (shmem_free_swap(mapping, index, page)) {
+@@ -1642,7 +1642,7 @@ static int shmem_getpage_gfp(struct inode *inode, pgoff_t index,
+ repeat:
+ 	swap.val = 0;
+ 	page = find_lock_entry(mapping, index);
+-	if (radix_tree_exceptional_entry(page)) {
++	if (xa_is_value(page)) {
+ 		swap = radix_to_swp_entry(page);
+ 		page = NULL;
+ 	}
+@@ -2602,7 +2602,7 @@ static pgoff_t shmem_seek_hole_data(struct address_space *mapping,
+ 				index = indices[i];
+ 			}
+ 			page = pvec.pages[i];
+-			if (page && !radix_tree_exceptional_entry(page)) {
++			if (page && !xa_is_value(page)) {
+ 				if (!PageUptodate(page))
+ 					page = NULL;
+ 			}
+diff --git a/mm/swap.c b/mm/swap.c
+index 26fc9b5f1b6c..4c5c7fcc6e46 100644
+--- a/mm/swap.c
++++ b/mm/swap.c
+@@ -965,7 +965,7 @@ void pagevec_remove_exceptionals(struct pagevec *pvec)
+ 
+ 	for (i = 0, j = 0; i < pagevec_count(pvec); i++) {
+ 		struct page *page = pvec->pages[i];
+-		if (!radix_tree_exceptional_entry(page))
++		if (!xa_is_value(page))
+ 			pvec->pages[j++] = page;
+ 	}
+ 	pvec->nr = j;
+diff --git a/mm/truncate.c b/mm/truncate.c
+index 1d2fb2dca96f..ed778555c9f3 100644
+--- a/mm/truncate.c
++++ b/mm/truncate.c
+@@ -70,7 +70,7 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
+ 		return;
+ 
+ 	for (j = 0; j < pagevec_count(pvec); j++)
+-		if (radix_tree_exceptional_entry(pvec->pages[j]))
++		if (xa_is_value(pvec->pages[j]))
+ 			break;
+ 
+ 	if (j == pagevec_count(pvec))
+@@ -85,7 +85,7 @@ static void truncate_exceptional_pvec_entries(struct address_space *mapping,
+ 		struct page *page = pvec->pages[i];
+ 		pgoff_t index = indices[i];
+ 
+-		if (!radix_tree_exceptional_entry(page)) {
++		if (!xa_is_value(page)) {
+ 			pvec->pages[j++] = page;
+ 			continue;
+ 		}
+@@ -347,7 +347,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 			if (index >= end)
+ 				break;
+ 
+-			if (radix_tree_exceptional_entry(page))
++			if (xa_is_value(page))
+ 				continue;
+ 
+ 			if (!trylock_page(page))
+@@ -442,7 +442,7 @@ void truncate_inode_pages_range(struct address_space *mapping,
+ 				break;
+ 			}
+ 
+-			if (radix_tree_exceptional_entry(page))
++			if (xa_is_value(page))
+ 				continue;
+ 
+ 			lock_page(page);
+@@ -561,7 +561,7 @@ unsigned long invalidate_mapping_pages(struct address_space *mapping,
+ 			if (index > end)
+ 				break;
+ 
+-			if (radix_tree_exceptional_entry(page)) {
++			if (xa_is_value(page)) {
+ 				invalidate_exceptional_entry(mapping, index,
+ 							     page);
+ 				continue;
+@@ -692,7 +692,7 @@ int invalidate_inode_pages2_range(struct address_space *mapping,
+ 			if (index > end)
+ 				break;
+ 
+-			if (radix_tree_exceptional_entry(page)) {
++			if (xa_is_value(page)) {
+ 				if (!invalidate_exceptional_entry2(mapping,
+ 								   index, page))
+ 					ret = -EBUSY;
+diff --git a/mm/workingset.c b/mm/workingset.c
+index 40ee02c83978..3b9df0d5a5b8 100644
+--- a/mm/workingset.c
++++ b/mm/workingset.c
+@@ -155,8 +155,8 @@
+  * refault distance will immediately activate the refaulting page.
+  */
+ 
+-#define EVICTION_SHIFT	(RADIX_TREE_EXCEPTIONAL_ENTRY + \
+-			 NODES_SHIFT +	\
++#define EVICTION_SHIFT	((BITS_PER_LONG - BITS_PER_XA_VALUE) +	\
++			 NODES_SHIFT +				\
+ 			 MEM_CGROUP_ID_SHIFT)
+ #define EVICTION_MASK	(~0UL >> EVICTION_SHIFT)
+ 
+@@ -173,20 +173,19 @@ static unsigned int bucket_order __read_mostly;
+ static void *pack_shadow(int memcgid, pg_data_t *pgdat, unsigned long eviction)
+ {
+ 	eviction >>= bucket_order;
++	eviction &= EVICTION_MASK;
+ 	eviction = (eviction << MEM_CGROUP_ID_SHIFT) | memcgid;
+ 	eviction = (eviction << NODES_SHIFT) | pgdat->node_id;
+-	eviction = (eviction << RADIX_TREE_EXCEPTIONAL_SHIFT);
+ 
+-	return (void *)(eviction | RADIX_TREE_EXCEPTIONAL_ENTRY);
++	return xa_mk_value(eviction);
+ }
+ 
+ static void unpack_shadow(void *shadow, int *memcgidp, pg_data_t **pgdat,
+ 			  unsigned long *evictionp)
+ {
+-	unsigned long entry = (unsigned long)shadow;
++	unsigned long entry = xa_to_value(shadow);
+ 	int memcgid, nid;
+ 
+-	entry >>= RADIX_TREE_EXCEPTIONAL_SHIFT;
+ 	nid = entry & ((1UL << NODES_SHIFT) - 1);
+ 	entry >>= NODES_SHIFT;
+ 	memcgid = entry & ((1UL << MEM_CGROUP_ID_SHIFT) - 1);
+@@ -453,7 +452,7 @@ static enum lru_status shadow_lru_isolate(struct list_head *item,
+ 		goto out_invalid;
+ 	for (i = 0; i < RADIX_TREE_MAP_SIZE; i++) {
+ 		if (node->slots[i]) {
+-			if (WARN_ON_ONCE(!radix_tree_exceptional_entry(node->slots[i])))
++			if (WARN_ON_ONCE(!xa_is_value(node->slots[i])))
+ 				goto out_invalid;
+ 			if (WARN_ON_ONCE(!node->exceptional))
+ 				goto out_invalid;
+diff --git a/tools/testing/radix-tree/idr-test.c b/tools/testing/radix-tree/idr-test.c
+index f620c831a4b5..a5a4494922a6 100644
+--- a/tools/testing/radix-tree/idr-test.c
++++ b/tools/testing/radix-tree/idr-test.c
+@@ -19,7 +19,7 @@
+ 
+ #include "test.h"
+ 
+-#define DUMMY_PTR	((void *)0x12)
++#define DUMMY_PTR	((void *)0x10)
+ 
+ int item_idr_free(int id, void *p, void *data)
+ {
+@@ -411,11 +411,11 @@ void ida_check_conv_user(void)
+ 		int id = ida_alloc(&ida, GFP_NOWAIT);
+ 		if (id == -ENOMEM) {
+ 			IDA_BUG_ON(&ida, (i % IDA_BITMAP_BITS) !=
+-					BITS_PER_LONG - 2);
++					BITS_PER_XA_VALUE);
+ 			id = ida_alloc(&ida, GFP_KERNEL);
+ 		} else {
+ 			IDA_BUG_ON(&ida, (i % IDA_BITMAP_BITS) ==
+-					BITS_PER_LONG - 2);
++					BITS_PER_XA_VALUE);
+ 		}
+ 		IDA_BUG_ON(&ida, id != i);
+ 	}
+diff --git a/tools/testing/radix-tree/linux/radix-tree.h b/tools/testing/radix-tree/linux/radix-tree.h
+index 24f13d27a8da..d1635a5bef02 100644
+--- a/tools/testing/radix-tree/linux/radix-tree.h
++++ b/tools/testing/radix-tree/linux/radix-tree.h
+@@ -2,7 +2,6 @@
+ #ifndef _TEST_RADIX_TREE_H
+ #define _TEST_RADIX_TREE_H
+ 
+-#include "generated/map-shift.h"
+ #include "../../../../include/linux/radix-tree.h"
+ 
+ extern int kmalloc_verbose;
+diff --git a/tools/testing/radix-tree/multiorder.c b/tools/testing/radix-tree/multiorder.c
+index 7bf405638b0b..2b4f4dba1882 100644
+--- a/tools/testing/radix-tree/multiorder.c
++++ b/tools/testing/radix-tree/multiorder.c
+@@ -39,12 +39,11 @@ static void __multiorder_tag_test(int index, int order)
+ 
+ 	/*
+ 	 * Verify we get collisions for covered indices.  We try and fail to
+-	 * insert an exceptional entry so we don't leak memory via
++	 * insert a value entry so we don't leak memory via
+ 	 * item_insert_order().
+ 	 */
+ 	for_each_index(i, base, order) {
+-		err = __radix_tree_insert(&tree, i, order,
+-				(void *)(0xA0 | RADIX_TREE_EXCEPTIONAL_ENTRY));
++		err = __radix_tree_insert(&tree, i, order, xa_mk_value(0xA0));
+ 		assert(err == -EEXIST);
+ 	}
+ 
+@@ -380,8 +379,8 @@ static void multiorder_join1(unsigned long index,
+ }
+ 
+ /*
+- * Check that the accounting of exceptional entries is handled correctly
+- * by joining an exceptional entry to a normal pointer.
++ * Check that the accounting of value entries is handled correctly
++ * by joining a value entry to a normal pointer.
+  */
+ static void multiorder_join2(unsigned order1, unsigned order2)
+ {
+@@ -391,9 +390,9 @@ static void multiorder_join2(unsigned order1, unsigned order2)
+ 	void *item2;
+ 
+ 	item_insert_order(&tree, 0, order2);
+-	radix_tree_insert(&tree, 1 << order2, (void *)0x12UL);
++	radix_tree_insert(&tree, 1 << order2, xa_mk_value(5));
+ 	item2 = __radix_tree_lookup(&tree, 1 << order2, &node, NULL);
+-	assert(item2 == (void *)0x12UL);
++	assert(item2 == xa_mk_value(5));
+ 	assert(node->exceptional == 1);
+ 
+ 	item2 = radix_tree_lookup(&tree, 0);
+@@ -407,7 +406,7 @@ static void multiorder_join2(unsigned order1, unsigned order2)
+ }
+ 
+ /*
+- * This test revealed an accounting bug for exceptional entries at one point.
++ * This test revealed an accounting bug for value entries at one point.
+  * Nodes were being freed back into the pool with an elevated exception count
+  * by radix_tree_join() and then radix_tree_split() was failing to zero the
+  * count of exceptional entries.
+@@ -421,16 +420,16 @@ static void multiorder_join3(unsigned int order)
+ 	unsigned long i;
+ 
+ 	for (i = 0; i < (1 << order); i++) {
+-		radix_tree_insert(&tree, i, (void *)0x12UL);
++		radix_tree_insert(&tree, i, xa_mk_value(5));
+ 	}
+ 
+-	radix_tree_join(&tree, 0, order, (void *)0x16UL);
++	radix_tree_join(&tree, 0, order, xa_mk_value(7));
+ 	rcu_barrier();
+ 
+ 	radix_tree_split(&tree, 0, 0);
+ 
+ 	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+-		radix_tree_iter_replace(&tree, &iter, slot, (void *)0x12UL);
++		radix_tree_iter_replace(&tree, &iter, slot, xa_mk_value(5));
+ 	}
+ 
+ 	__radix_tree_lookup(&tree, 0, &node, NULL);
+@@ -517,10 +516,10 @@ static void __multiorder_split2(int old_order, int new_order)
+ 	struct radix_tree_node *node;
+ 	void *item;
+ 
+-	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
++	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ 
+ 	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+-	assert(item == (void *)0x12);
++	assert(item == xa_mk_value(5));
+ 	assert(node->exceptional > 0);
+ 
+ 	radix_tree_split(&tree, 0, new_order);
+@@ -530,7 +529,7 @@ static void __multiorder_split2(int old_order, int new_order)
+ 	}
+ 
+ 	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+-	assert(item != (void *)0x12);
++	assert(item != xa_mk_value(5));
+ 	assert(node->exceptional == 0);
+ 
+ 	item_kill_tree(&tree);
+@@ -544,40 +543,40 @@ static void __multiorder_split3(int old_order, int new_order)
+ 	struct radix_tree_node *node;
+ 	void *item;
+ 
+-	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
++	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ 
+ 	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+-	assert(item == (void *)0x12);
++	assert(item == xa_mk_value(5));
+ 	assert(node->exceptional > 0);
+ 
+ 	radix_tree_split(&tree, 0, new_order);
+ 	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+-		radix_tree_iter_replace(&tree, &iter, slot, (void *)0x16);
++		radix_tree_iter_replace(&tree, &iter, slot, xa_mk_value(7));
+ 	}
+ 
+ 	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+-	assert(item == (void *)0x16);
++	assert(item == xa_mk_value(7));
+ 	assert(node->exceptional > 0);
+ 
+ 	item_kill_tree(&tree);
+ 
+-	__radix_tree_insert(&tree, 0, old_order, (void *)0x12);
++	__radix_tree_insert(&tree, 0, old_order, xa_mk_value(5));
+ 
+ 	item = __radix_tree_lookup(&tree, 0, &node, NULL);
+-	assert(item == (void *)0x12);
++	assert(item == xa_mk_value(5));
+ 	assert(node->exceptional > 0);
+ 
+ 	radix_tree_split(&tree, 0, new_order);
+ 	radix_tree_for_each_slot(slot, &tree, &iter, 0) {
+ 		if (iter.index == (1 << new_order))
+ 			radix_tree_iter_replace(&tree, &iter, slot,
+-						(void *)0x16);
++						xa_mk_value(7));
+ 		else
+ 			radix_tree_iter_replace(&tree, &iter, slot, NULL);
+ 	}
+ 
+ 	item = __radix_tree_lookup(&tree, 1 << new_order, &node, NULL);
+-	assert(item == (void *)0x16);
++	assert(item == xa_mk_value(7));
+ 	assert(node->count == node->exceptional);
+ 	do {
+ 		node = node->parent;
+@@ -610,13 +609,13 @@ static void multiorder_account(void)
+ 
+ 	item_insert_order(&tree, 0, 5);
+ 
+-	__radix_tree_insert(&tree, 1 << 5, 5, (void *)0x12);
++	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
+ 	__radix_tree_lookup(&tree, 0, &node, NULL);
+ 	assert(node->count == node->exceptional * 2);
+ 	radix_tree_delete(&tree, 1 << 5);
+ 	assert(node->exceptional == 0);
+ 
+-	__radix_tree_insert(&tree, 1 << 5, 5, (void *)0x12);
++	__radix_tree_insert(&tree, 1 << 5, 5, xa_mk_value(5));
+ 	__radix_tree_lookup(&tree, 1 << 5, &node, &slot);
+ 	assert(node->count == node->exceptional * 2);
+ 	__radix_tree_replace(&tree, node, slot, NULL, NULL);
+diff --git a/tools/testing/radix-tree/test.c b/tools/testing/radix-tree/test.c
+index def6015570b2..62de66c314b7 100644
+--- a/tools/testing/radix-tree/test.c
++++ b/tools/testing/radix-tree/test.c
+@@ -295,7 +295,7 @@ void item_kill_tree(struct radix_tree_root *root)
+ 	int nfound;
+ 
+ 	radix_tree_for_each_slot(slot, root, &iter, 0) {
+-		if (radix_tree_exceptional_entry(*slot))
++		if (xa_is_value(*slot))
+ 			radix_tree_delete(root, iter.index);
+ 	}
+ 
