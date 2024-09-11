@@ -1,0 +1,199 @@
+KVM: X86: Remove mmu->translate_gpa
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Lai Jiangshan <laijs@linux.alibaba.com>
+commit c59a0f57fa32cfa77643daa17a8e55377cc9fe0b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/c59a0f57.failed
+
+Reduce an indirect function call (retpoline) and some intialization
+code.
+
+	Signed-off-by: Lai Jiangshan <laijs@linux.alibaba.com>
+Message-Id: <20211124122055.64424-4-jiangshanlai@gmail.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit c59a0f57fa32cfa77643daa17a8e55377cc9fe0b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu.h
+diff --cc arch/x86/kvm/mmu.h
+index cbd6163d9887,97e13c2988b3..000000000000
+--- a/arch/x86/kvm/mmu.h
++++ b/arch/x86/kvm/mmu.h
+@@@ -265,4 -304,64 +265,67 @@@ int kvm_arch_write_log_dirty(struct kvm
+  int kvm_mmu_post_init_vm(struct kvm *kvm);
+  void kvm_mmu_pre_destroy_vm(struct kvm *kvm);
+  
+++<<<<<<< HEAD
+++=======
++ static inline bool kvm_shadow_root_allocated(struct kvm *kvm)
++ {
++ 	/*
++ 	 * Read shadow_root_allocated before related pointers. Hence, threads
++ 	 * reading shadow_root_allocated in any lock context are guaranteed to
++ 	 * see the pointers. Pairs with smp_store_release in
++ 	 * mmu_first_shadow_root_alloc.
++ 	 */
++ 	return smp_load_acquire(&kvm->arch.shadow_root_allocated);
++ }
++ 
++ #ifdef CONFIG_X86_64
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return kvm->arch.tdp_mmu_enabled; }
++ #else
++ static inline bool is_tdp_mmu_enabled(struct kvm *kvm) { return false; }
++ #endif
++ 
++ static inline bool kvm_memslots_have_rmaps(struct kvm *kvm)
++ {
++ 	return !is_tdp_mmu_enabled(kvm) || kvm_shadow_root_allocated(kvm);
++ }
++ 
++ static inline gfn_t gfn_to_index(gfn_t gfn, gfn_t base_gfn, int level)
++ {
++ 	/* KVM_HPAGE_GFN_SHIFT(PG_LEVEL_4K) must be 0. */
++ 	return (gfn >> KVM_HPAGE_GFN_SHIFT(level)) -
++ 		(base_gfn >> KVM_HPAGE_GFN_SHIFT(level));
++ }
++ 
++ static inline unsigned long
++ __kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, unsigned long npages,
++ 		      int level)
++ {
++ 	return gfn_to_index(slot->base_gfn + npages - 1,
++ 			    slot->base_gfn, level) + 1;
++ }
++ 
++ static inline unsigned long
++ kvm_mmu_slot_lpages(struct kvm_memory_slot *slot, int level)
++ {
++ 	return __kvm_mmu_slot_lpages(slot, slot->npages, level);
++ }
++ 
++ static inline void kvm_update_page_stats(struct kvm *kvm, int level, int count)
++ {
++ 	atomic64_add(count, &kvm->stat.pages[level - 1]);
++ }
++ 
++ gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
++ 			   struct x86_exception *exception);
++ 
++ static inline gpa_t kvm_translate_gpa(struct kvm_vcpu *vcpu,
++ 				      struct kvm_mmu *mmu,
++ 				      gpa_t gpa, u32 access,
++ 				      struct x86_exception *exception)
++ {
++ 	if (mmu != &vcpu->arch.nested_mmu)
++ 		return gpa;
++ 	return translate_nested_gpa(vcpu, gpa, access, exception);
++ }
+++>>>>>>> c59a0f57fa32 (KVM: X86: Remove mmu->translate_gpa)
+  #endif
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index fe1b9e7c78cc..6370346afb44 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -429,8 +429,6 @@ struct kvm_mmu {
+ 	gpa_t (*gva_to_gpa)(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ 			    gpa_t gva_or_gpa, u32 access,
+ 			    struct x86_exception *exception);
+-	gpa_t (*translate_gpa)(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+-			       struct x86_exception *exception);
+ 	int (*sync_page)(struct kvm_vcpu *vcpu,
+ 			 struct kvm_mmu_page *sp);
+ 	void (*invlpg)(struct kvm_vcpu *vcpu, gva_t gva, hpa_t root_hpa);
+@@ -1748,8 +1746,6 @@ int kvm_mmu_unprotect_page(struct kvm *kvm, gfn_t gfn);
+ void kvm_mmu_free_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ 			ulong roots_to_free);
+ void kvm_mmu_free_guest_mode_roots(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu);
+-gpa_t translate_nested_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+-			   struct x86_exception *exception);
+ gpa_t kvm_mmu_gva_to_gpa_read(struct kvm_vcpu *vcpu, gva_t gva,
+ 			      struct x86_exception *exception);
+ gpa_t kvm_mmu_gva_to_gpa_fetch(struct kvm_vcpu *vcpu, gva_t gva,
+* Unmerged path arch/x86/kvm/mmu.h
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index ab19004c3958..8cdd22b2f915 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -335,12 +335,6 @@ static bool check_mmio_spte(struct kvm_vcpu *vcpu, u64 spte)
+ 	return likely(kvm_gen == spte_gen);
+ }
+ 
+-static gpa_t translate_gpa(struct kvm_vcpu *vcpu, gpa_t gpa, u32 access,
+-                                  struct x86_exception *exception)
+-{
+-        return gpa;
+-}
+-
+ static int is_cpuid_PSE36(void)
+ {
+ 	return 1;
+@@ -3704,7 +3698,7 @@ static gpa_t nonpaging_gva_to_gpa(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu,
+ {
+ 	if (exception)
+ 		exception->error_code = 0;
+-	return mmu->translate_gpa(vcpu, vaddr, access, exception);
++	return kvm_translate_gpa(vcpu, mmu, vaddr, access, exception);
+ }
+ 
+ static bool mmio_info_in_cache(struct kvm_vcpu *vcpu, u64 addr, bool direct)
+@@ -5454,7 +5448,6 @@ static int __kvm_mmu_create(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu)
+ 
+ 	mmu->root_hpa = INVALID_PAGE;
+ 	mmu->root_pgd = 0;
+-	mmu->translate_gpa = translate_gpa;
+ 	for (i = 0; i < KVM_MMU_NUM_PREV_ROOTS; i++)
+ 		mmu->prev_roots[i] = KVM_MMU_ROOT_INFO_INVALID;
+ 
+@@ -5516,8 +5509,6 @@ int kvm_mmu_create(struct kvm_vcpu *vcpu)
+ 	vcpu->arch.mmu = &vcpu->arch.root_mmu;
+ 	vcpu->arch.walk_mmu = &vcpu->arch.root_mmu;
+ 
+-	vcpu->arch.nested_mmu.translate_gpa = translate_nested_gpa;
+-
+ 	ret = __kvm_mmu_create(vcpu, &vcpu->arch.guest_mmu);
+ 	if (ret)
+ 		return ret;
+diff --git a/arch/x86/kvm/mmu/paging_tmpl.h b/arch/x86/kvm/mmu/paging_tmpl.h
+index 55af99407e31..ef98852cd6b7 100644
+--- a/arch/x86/kvm/mmu/paging_tmpl.h
++++ b/arch/x86/kvm/mmu/paging_tmpl.h
+@@ -403,9 +403,8 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 		walker->table_gfn[walker->level - 1] = table_gfn;
+ 		walker->pte_gpa[walker->level - 1] = pte_gpa;
+ 
+-		real_gpa = mmu->translate_gpa(vcpu, gfn_to_gpa(table_gfn),
+-					      nested_access,
+-					      &walker->fault);
++		real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(table_gfn),
++					     nested_access, &walker->fault);
+ 
+ 		/*
+ 		 * FIXME: This can happen if emulation (for of an INS/OUTS
+@@ -467,7 +466,7 @@ static int FNAME(walk_addr_generic)(struct guest_walker *walker,
+ 	if (PTTYPE == 32 && walker->level > PG_LEVEL_4K && is_cpuid_PSE36())
+ 		gfn += pse36_gfn_delta(pte);
+ 
+-	real_gpa = mmu->translate_gpa(vcpu, gfn_to_gpa(gfn), access, &walker->fault);
++	real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(gfn), access, &walker->fault);
+ 	if (real_gpa == UNMAPPED_GVA)
+ 		return 0;
+ 
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 7bc18d46c2a4..e87779abe901 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -809,8 +809,8 @@ int load_pdptrs(struct kvm_vcpu *vcpu, struct kvm_mmu *mmu, unsigned long cr3)
+ 	 * If the MMU is nested, CR3 holds an L2 GPA and needs to be translated
+ 	 * to an L1 GPA.
+ 	 */
+-	real_gpa = mmu->translate_gpa(vcpu, gfn_to_gpa(pdpt_gfn),
+-				      PFERR_USER_MASK | PFERR_WRITE_MASK, NULL);
++	real_gpa = kvm_translate_gpa(vcpu, mmu, gfn_to_gpa(pdpt_gfn),
++				     PFERR_USER_MASK | PFERR_WRITE_MASK, NULL);
+ 	if (real_gpa == UNMAPPED_GVA)
+ 		return 0;
+ 
