@@ -1,0 +1,316 @@
+RDMA/core: Split port and device counter sysfs attributes
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jason Gunthorpe <jgg@nvidia.com>
+commit 467f432a521a284c418e3d521ee51840a5e23424
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/467f432a.failed
+
+This code creates a 'struct hw_stats_attribute' for each sysfs entry that
+contains a naked 'struct attribute' inside.
+
+It then proceeds to attach this same structure to a 'struct device' kobj
+and a 'struct ib_port' kobj. However, this violates the typing
+requirements.  'struct device' requires the attribute to be a 'struct
+device_attribute' and 'struct ib_port' requires the attribute to be
+'struct port_attribute'.
+
+This happens to work because the show/store function pointers in all three
+structures happen to be at the same offset and happen to be nearly the
+same signature. This means when container_of() was used to go between the
+wrong two types it still managed to work.
+
+However clang CFI detection notices that the function pointers have a
+slightly different signature. As with show/store this was only working
+because the device and port struct layouts happened to have the kobj at
+the front.
+
+Correct this by have two independent sets of data structures for the port
+and device case. The two different attributes correctly include the
+port/device_attribute struct and everything from there up is kept
+split. The show/store function call chains start with device/port unique
+functions that invoke a common show/store function pointer.
+
+Link: https://lore.kernel.org/r/a8b3864b4e722aed3657512af6aa47dc3c5033be.1623427137.git.leonro@nvidia.com
+	Reported-by: Nathan Chancellor <nathan@kernel.org>
+	Tested-by: Nathan Chancellor <nathan@kernel.org>
+	Cc: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 467f432a521a284c418e3d521ee51840a5e23424)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/sysfs.c
+diff --cc drivers/infiniband/core/sysfs.c
+index 1ae9eecb09be,114fecda9764..000000000000
+--- a/drivers/infiniband/core/sysfs.c
++++ b/drivers/infiniband/core/sysfs.c
+@@@ -60,9 -60,8 +60,14 @@@ struct ib_port 
+  	struct attribute_group gid_group;
+  	struct attribute_group *pkey_group;
+  	const struct attribute_group *pma_table;
+++<<<<<<< HEAD
+ +	struct attribute_group *hw_stats_ag;
+ +	struct rdma_hw_stats   *hw_stats;
+ +	u8                     port_num;
+++=======
++ 	struct hw_stats_port_data *hw_stats_data;
++ 	u32                     port_num;
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  };
+  
+  struct port_attribute {
+@@@ -85,16 -84,35 +90,48 @@@ struct port_table_attribute 
+  	__be16			attr_id;
+  };
+  
+++<<<<<<< HEAD
+ +struct hw_stats_attribute {
+ +	struct attribute	attr;
+ +	ssize_t			(*show)(struct kobject *kobj,
+ +					struct attribute *attr, char *buf);
+ +	ssize_t			(*store)(struct kobject *kobj,
+ +					 struct attribute *attr,
+ +					 const char *buf,
+ +					 size_t count);
+ +	int			index;
+ +	u8			port_num;
+++=======
++ struct hw_stats_device_attribute {
++ 	struct device_attribute attr;
++ 	ssize_t (*show)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			unsigned int index, unsigned int port_num, char *buf);
++ 	ssize_t (*store)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			 unsigned int index, unsigned int port_num,
++ 			 const char *buf, size_t count);
++ };
++ 
++ struct hw_stats_port_attribute {
++ 	struct port_attribute attr;
++ 	ssize_t (*show)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			unsigned int index, unsigned int port_num, char *buf);
++ 	ssize_t (*store)(struct ib_device *ibdev, struct rdma_hw_stats *stats,
++ 			 unsigned int index, unsigned int port_num,
++ 			 const char *buf, size_t count);
++ };
++ 
++ struct hw_stats_device_data {
++ 	struct attribute_group group;
++ 	const struct attribute_group *groups[2];
++ 	struct rdma_hw_stats *stats;
++ 	struct hw_stats_device_attribute attrs[];
++ };
++ 
++ struct hw_stats_port_data {
++ 	struct attribute_group group;
++ 	struct rdma_hw_stats *stats;
++ 	struct hw_stats_port_attribute attrs[];
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  };
+  
+  static ssize_t port_attr_show(struct kobject *kobj,
+@@@ -824,33 -897,20 +908,20 @@@ static ssize_t print_hw_stat(struct ib_
+  {
+  	u64 v = rdma_counter_get_hwstat_value(dev, port_num, index);
+  
+ -	return sysfs_emit(buf, "%llu\n", stats->value[index] + v);
+ +	return sprintf(buf, "%llu\n", stats->value[index] + v);
+  }
+  
+- static ssize_t show_hw_stats(struct kobject *kobj, struct attribute *attr,
+- 			     char *buf)
++ static ssize_t show_hw_stats(struct ib_device *ibdev,
++ 			     struct rdma_hw_stats *stats, unsigned int index,
++ 			     unsigned int port_num, char *buf)
+  {
+- 	struct ib_device *dev;
+- 	struct ib_port *port;
+- 	struct hw_stats_attribute *hsa;
+- 	struct rdma_hw_stats *stats;
+  	int ret;
+  
+- 	hsa = container_of(attr, struct hw_stats_attribute, attr);
+- 	if (!hsa->port_num) {
+- 		dev = container_of((struct device *)kobj,
+- 				   struct ib_device, dev);
+- 		stats = dev->hw_stats;
+- 	} else {
+- 		port = container_of(kobj, struct ib_port, kobj);
+- 		dev = port->ibdev;
+- 		stats = port->hw_stats;
+- 	}
+  	mutex_lock(&stats->lock);
+- 	ret = update_hw_stats(dev, stats, hsa->port_num, hsa->index);
++ 	ret = update_hw_stats(ibdev, stats, port_num, index);
+  	if (ret)
+  		goto unlock;
+- 	ret = print_hw_stat(dev, hsa->port_num, stats, hsa->index, buf);
++ 	ret = print_hw_stat(ibdev, port_num, stats, index, buf);
+  unlock:
+  	mutex_unlock(&stats->lock);
+  
+@@@ -881,15 -928,14 +939,14 @@@ static ssize_t show_stats_lifespan(stru
+  	msecs = jiffies_to_msecs(stats->lifespan);
+  	mutex_unlock(&stats->lock);
+  
+ -	return sysfs_emit(buf, "%d\n", msecs);
+ +	return sprintf(buf, "%d\n", msecs);
+  }
+  
+- static ssize_t set_stats_lifespan(struct kobject *kobj,
+- 				  struct attribute *attr,
+- 				  const char *buf, size_t count)
++ static ssize_t set_stats_lifespan(struct ib_device *ibdev,
++ 				   struct rdma_hw_stats *stats,
++ 				   unsigned int index, unsigned int port_num,
++ 				   const char *buf, size_t count)
+  {
+- 	struct hw_stats_attribute *hsa;
+- 	struct rdma_hw_stats *stats;
+  	int msecs;
+  	int jiffies;
+  	int ret;
+@@@ -919,65 -954,17 +965,74 @@@
+  	return count;
+  }
+  
+- static void free_hsag(struct kobject *kobj, struct attribute_group *attr_group)
++ static struct hw_stats_device_data *
++ alloc_hw_stats_device(struct ib_device *ibdev)
+  {
+++<<<<<<< HEAD
+ +	struct attribute **attr;
+ +
+ +	sysfs_remove_group(kobj, attr_group);
+ +
+ +	for (attr = attr_group->attrs; *attr; attr++)
+ +		kfree(*attr);
+ +	kfree(attr_group);
+ +}
+ +
+ +static struct attribute *alloc_hsa(int index, u8 port_num, const char *name)
+ +{
+ +	struct hw_stats_attribute *hsa;
+ +
+ +	hsa = kmalloc(sizeof(*hsa), GFP_KERNEL);
+ +	if (!hsa)
+ +		return NULL;
+ +
+ +	hsa->attr.name = (char *)name;
+ +	hsa->attr.mode = S_IRUGO;
+ +	hsa->show = show_hw_stats;
+ +	hsa->store = NULL;
+ +	hsa->index = index;
+ +	hsa->port_num = port_num;
+ +
+ +	return &hsa->attr;
+ +}
+ +
+ +static struct attribute *alloc_hsa_lifespan(char *name, u8 port_num)
+ +{
+ +	struct hw_stats_attribute *hsa;
+ +
+ +	hsa = kmalloc(sizeof(*hsa), GFP_KERNEL);
+ +	if (!hsa)
+ +		return NULL;
+ +
+ +	hsa->attr.name = name;
+ +	hsa->attr.mode = S_IWUSR | S_IRUGO;
+ +	hsa->show = show_stats_lifespan;
+ +	hsa->store = set_stats_lifespan;
+ +	hsa->index = 0;
+ +	hsa->port_num = port_num;
+ +
+ +	return &hsa->attr;
+ +}
+ +
+ +static void setup_hw_stats(struct ib_device *device, struct ib_port *port,
+ +			   u8 port_num)
+ +{
+ +	struct attribute_group *hsag;
+++=======
++ 	struct hw_stats_device_data *data;
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  	struct rdma_hw_stats *stats;
+- 	int i, ret;
+  
+++<<<<<<< HEAD
+ +	stats = device->ops.alloc_hw_stats(device, port_num);
+ +
+++=======
++ 	if (!ibdev->ops.alloc_hw_device_stats)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	stats = ibdev->ops.alloc_hw_device_stats(ibdev);
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  	if (!stats)
+- 		return;
+- 
++ 		return ERR_PTR(-ENOMEM);
+  	if (!stats->names || stats->num_counters <= 0)
+  		goto err_free_stats;
+  
+@@@ -1155,17 -1294,9 +1362,20 @@@ static int add_port(struct ib_core_devi
+  	if (device->ops.init_port && is_full_dev) {
+  		ret = device->ops.init_port(device, port_num, &p->kobj);
+  		if (ret)
+- 			goto err_remove_pkey;
++ 			goto err_remove_stats;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If port == 0, it means hw_counters are per device and not per
+ +	 * port, so holder should be device. Therefore skip per port conunter
+ +	 * initialization.
+ +	 */
+ +	if (device->ops.alloc_hw_stats && port_num && is_full_dev)
+ +		setup_hw_stats(device, p, port_num);
+ +
+++=======
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  	list_add_tail(&p->kobj.entry, &coredev->port_list);
+  	if (device->port_data && is_full_dev)
+  		device->port_data[port_num].sysfs = p;
+@@@ -1393,8 -1541,11 +1604,16 @@@ int ib_device_register_sysfs(struct ib_
+  	if (ret)
+  		return ret;
+  
+++<<<<<<< HEAD
+ +	if (device->ops.alloc_hw_stats)
+ +		setup_hw_stats(device, NULL, 0);
+++=======
++ 	ret = setup_hw_device_stats(device);
++ 	if (ret && ret != -EOPNOTSUPP) {
++ 		ib_free_port_attrs(&device->coredev);
++ 		return ret;
++ 	}
+++>>>>>>> 467f432a521a (RDMA/core: Split port and device counter sysfs attributes)
+  
+  	return 0;
+  }
+* Unmerged path drivers/infiniband/core/sysfs.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index bfcbec0959ce..2cfa6514e746 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -50,6 +50,7 @@ struct ib_usrq_object;
+ struct ib_uwq_object;
+ struct rdma_cm_id;
+ struct ib_port;
++struct hw_stats_device_data;
+ 
+ extern struct workqueue_struct *ib_wq;
+ extern struct workqueue_struct *ib_comp_wq;
+@@ -2694,8 +2695,7 @@ struct ib_device {
+ 	u8                           node_type;
+ 	u8                           phys_port_cnt;
+ 	struct ib_device_attr        attrs;
+-	struct attribute_group	     *hw_stats_ag;
+-	struct rdma_hw_stats         *hw_stats;
++	struct hw_stats_device_data *hw_stats_data;
+ 
+ #ifdef CONFIG_CGROUP_RDMA
+ 	struct rdmacg_device         cg_device;
