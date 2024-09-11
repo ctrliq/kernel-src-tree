@@ -1,0 +1,437 @@
+LSM: hide struct security_mnt_opts from any generic code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 204cc0ccf1d49c6292aeef4c8edd1b3d10ff933c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/204cc0cc.failed
+
+Keep void * instead, allocate on demand (in parse_str_opts, at the
+moment).  Eventually both selinux and smack will be better off
+with private structures with several strings in those, rather than
+this "counter and two pointers to dynamically allocated arrays"
+ugliness.  This commit allows to do that at leisure, without
+disrupting anything outside of given module.
+
+Changes:
+	* instead of struct security_mnt_opt use an opaque pointer
+initialized to NULL.
+	* security_sb_eat_lsm_opts(), security_sb_parse_opts_str() and
+security_free_mnt_opts() take it as var argument (i.e. as void **);
+call sites are unchanged.
+	* security_sb_set_mnt_opts() and security_sb_remount() take
+it by value (i.e. as void *).
+	* new method: ->sb_free_mnt_opts().  Takes void *, does
+whatever freeing that needs to be done.
+	* ->sb_set_mnt_opts() and ->sb_remount() might get NULL as
+mnt_opts argument, meaning "empty".
+
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 204cc0ccf1d49c6292aeef4c8edd1b3d10ff933c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/btrfs/super.c
+#	fs/super.c
+#	include/linux/lsm_hooks.h
+#	include/linux/security.h
+#	security/security.c
+#	security/selinux/hooks.c
+#	security/smack/smack_lsm.c
+diff --cc fs/btrfs/super.c
+index 2306e92c1361,e90c4616ed6a..000000000000
+--- a/fs/btrfs/super.c
++++ b/fs/btrfs/super.c
+@@@ -1504,24 -1469,18 +1504,27 @@@ static struct dentry *btrfs_mount_root(
+  {
+  	struct block_device *bdev = NULL;
+  	struct super_block *s;
+ -	struct btrfs_device *device = NULL;
+  	struct btrfs_fs_devices *fs_devices = NULL;
+  	struct btrfs_fs_info *fs_info = NULL;
+- 	struct security_mnt_opts new_sec_opts;
++ 	void *new_sec_opts = NULL;
+  	fmode_t mode = FMODE_READ;
+  	int error = 0;
+  
+  	if (!(flags & SB_RDONLY))
+  		mode |= FMODE_WRITE;
+  
+++<<<<<<< HEAD
+ +	error = btrfs_parse_early_options(data, mode, fs_type,
+ +					  &fs_devices);
+ +	if (error) {
+ +		return ERR_PTR(error);
+ +	}
+ +
+ +	security_init_mnt_opts(&new_sec_opts);
+++=======
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	if (data) {
+ -		error = security_sb_eat_lsm_opts(data, &new_sec_opts);
+ +		error = parse_security_options(data, &new_sec_opts);
+  		if (error)
+  			return ERR_PTR(error);
+  	}
+@@@ -1579,16 -1549,12 +1582,22 @@@
+  		btrfs_sb(s)->bdev_holder = fs_type;
+  		error = btrfs_fill_super(s, fs_devices, data);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (!error)
++ 		error = security_sb_set_mnt_opts(s, new_sec_opts, 0, NULL);
++ 	security_free_mnt_opts(&new_sec_opts);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	if (error) {
+  		deactivate_locked_super(s);
+ -		return ERR_PTR(error);
+ +		goto error_sec_opts;
+ +	}
+ +
+ +	fs_info = btrfs_sb(s);
+ +	error = setup_security_options(fs_info, s, &new_sec_opts);
+ +	if (error) {
+ +		deactivate_locked_super(s);
+ +		goto error_sec_opts;
+  	}
+  
+  	return dget(s->s_root);
+@@@ -1757,18 -1723,14 +1766,25 @@@ static int btrfs_remount(struct super_b
+  	btrfs_remount_prepare(fs_info);
+  
+  	if (data) {
+- 		struct security_mnt_opts new_sec_opts;
++ 		void *new_sec_opts = NULL;
+  
+++<<<<<<< HEAD
+ +		security_init_mnt_opts(&new_sec_opts);
+ +		ret = parse_security_options(data, &new_sec_opts);
+++=======
++ 		ret = security_sb_eat_lsm_opts(data, &new_sec_opts);
++ 		if (!ret)
++ 			ret = security_sb_remount(sb, new_sec_opts);
++ 		security_free_mnt_opts(&new_sec_opts);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  		if (ret)
+  			goto restore;
+ +		ret = setup_security_options(fs_info, sb,
+ +					     &new_sec_opts);
+ +		if (ret) {
+ +			security_free_mnt_opts(&new_sec_opts);
+ +			goto restore;
+ +		}
+  	}
+  
+  	ret = btrfs_parse_options(fs_info, data, *flags);
+diff --cc fs/super.c
+index ddb8d35441c7,a5511c4ba69b..000000000000
+--- a/fs/super.c
++++ b/fs/super.c
+@@@ -1278,7 -1273,7 +1276,11 @@@ mount_fs(struct file_system_type *type
+  	smp_wmb();
+  	sb->s_flags |= SB_BORN;
+  
+++<<<<<<< HEAD
+ +	error = security_sb_kern_mount(sb, flags, &opts);
+++=======
++ 	error = security_sb_set_mnt_opts(sb, sec_opts, 0, NULL);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	if (error)
+  		goto out_sb;
+  
+diff --cc include/linux/lsm_hooks.h
+index b8d4d4fd9a29,a9c541f5732e..000000000000
+--- a/include/linux/lsm_hooks.h
++++ b/include/linux/lsm_hooks.h
+@@@ -1471,11 -1461,10 +1471,18 @@@ union security_list_options 
+  
+  	int (*sb_alloc_security)(struct super_block *sb);
+  	void (*sb_free_security)(struct super_block *sb);
+++<<<<<<< HEAD
+ +	int (*sb_copy_data)(char *orig, char *copy);
+ +	int (*sb_remount)(struct super_block *sb,
+ +			  struct security_mnt_opts *opts);
+ +	int (*sb_kern_mount)(struct super_block *sb, int flags,
+ +			     struct security_mnt_opts *opts);
+++=======
++ 	void (*sb_free_mnt_opts)(void *mnt_opts);
++ 	int (*sb_eat_lsm_opts)(char *orig, void **mnt_opts);
++ 	int (*sb_remount)(struct super_block *sb, void *mnt_opts);
++ 	int (*sb_kern_mount)(struct super_block *sb);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	int (*sb_show_options)(struct seq_file *m, struct super_block *sb);
+  	int (*sb_statfs)(struct dentry *dentry);
+  	int (*sb_mount)(const char *dev_name, const struct path *path,
+@@@ -1814,7 -1801,8 +1821,12 @@@ struct security_hook_heads 
+  	struct hlist_head bprm_committed_creds;
+  	struct hlist_head sb_alloc_security;
+  	struct hlist_head sb_free_security;
+++<<<<<<< HEAD
+ +	struct hlist_head sb_copy_data;
+++=======
++ 	struct hlist_head sb_free_mnt_opts;
++ 	struct hlist_head sb_eat_lsm_opts;
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	struct hlist_head sb_remount;
+  	struct hlist_head sb_kern_mount;
+  	struct hlist_head sb_show_options;
+diff --cc include/linux/security.h
+index 4da4c9d220c8,4bca0be95b7a..000000000000
+--- a/include/linux/security.h
++++ b/include/linux/security.h
+@@@ -252,10 -228,10 +232,17 @@@ void security_bprm_committing_creds(str
+  void security_bprm_committed_creds(struct linux_binprm *bprm);
+  int security_sb_alloc(struct super_block *sb);
+  void security_sb_free(struct super_block *sb);
+++<<<<<<< HEAD
+ +int security_sb_eat_lsm_opts(char *options, struct security_mnt_opts *opts);
+ +int security_sb_remount(struct super_block *sb, struct security_mnt_opts *opts);
+ +int security_sb_kern_mount(struct super_block *sb, int flags,
+ +			   struct security_mnt_opts *opts);
+++=======
++ void security_free_mnt_opts(void **mnt_opts);
++ int security_sb_eat_lsm_opts(char *options, void **mnt_opts);
++ int security_sb_remount(struct super_block *sb, void *mnt_opts);
++ int security_sb_kern_mount(struct super_block *sb);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  int security_sb_show_options(struct seq_file *m, struct super_block *sb);
+  int security_sb_statfs(struct dentry *dentry);
+  int security_sb_mount(const char *dev_name, const struct path *path,
+diff --cc security/security.c
+index 7eaa4e984e36,b7a5a0051807..000000000000
+--- a/security/security.c
++++ b/security/security.c
+@@@ -367,31 -384,31 +367,44 @@@ void security_sb_free(struct super_bloc
+  	call_void_hook(sb_free_security, sb);
+  }
+  
+- int security_sb_eat_lsm_opts(char *options, struct security_mnt_opts *opts)
++ void security_free_mnt_opts(void **mnt_opts)
+  {
+++<<<<<<< HEAD
+ +	char *s = (char *)get_zeroed_page(GFP_KERNEL);
+ +	int err;
+ +
+ +	if (!s)
+ +		return -ENOMEM;
+ +	err = call_int_hook(sb_copy_data, 0, options, s);
+ +	if (!err)
+ +		err = call_int_hook(sb_parse_opts_str, 0, s, opts);
+ +	free_page((unsigned long)s);
+ +	return err;
+++=======
++ 	if (!*mnt_opts)
++ 		return;
++ 	call_void_hook(sb_free_mnt_opts, *mnt_opts);
++ 	*mnt_opts = NULL;
++ }
++ EXPORT_SYMBOL(security_free_mnt_opts);
++ 
++ int security_sb_eat_lsm_opts(char *options, void **mnt_opts)
++ {
++ 	return call_int_hook(sb_eat_lsm_opts, 0, options, mnt_opts);
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  }
+  EXPORT_SYMBOL(security_sb_eat_lsm_opts);
+  
+  int security_sb_remount(struct super_block *sb,
+- 			struct security_mnt_opts *opts)
++ 			void *mnt_opts)
+  {
+- 	return call_int_hook(sb_remount, 0, sb, opts);
++ 	return call_int_hook(sb_remount, 0, sb, mnt_opts);
+  }
+ -EXPORT_SYMBOL(security_sb_remount);
+  
+ -int security_sb_kern_mount(struct super_block *sb)
+ +int security_sb_kern_mount(struct super_block *sb, int flags,
+ +			   struct security_mnt_opts *opts)
+  {
+ -	return call_int_hook(sb_kern_mount, 0, sb);
+ +	return call_int_hook(sb_kern_mount, 0, sb, flags, opts);
+  }
+  
+  int security_sb_show_options(struct seq_file *m, struct super_block *sb)
+diff --cc security/selinux/hooks.c
+index 42145010da10,caf7ca7abfc1..000000000000
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@@ -2761,9 -2736,23 +2783,28 @@@ out
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+ +static int selinux_sb_remount(struct super_block *sb,
+ +			      struct security_mnt_opts *opts)
+++=======
++ static int selinux_sb_eat_lsm_opts(char *options, void **mnt_opts)
+  {
++ 	char *s = (char *)get_zeroed_page(GFP_KERNEL);
++ 	int err;
++ 
++ 	if (!s)
++ 		return -ENOMEM;
++ 	err = selinux_sb_copy_data(options, s);
++ 	if (!err)
++ 		err = selinux_parse_opts_str(s, mnt_opts);
++ 	free_page((unsigned long)s);
++ 	return err;
++ }
++ 
++ static int selinux_sb_remount(struct super_block *sb, void *mnt_opts)
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
++ {
++ 	struct security_mnt_opts *opts = mnt_opts;
+  	int i, *flags;
+  	char **mount_options;
+  	struct superblock_security_struct *sbsec = sb->s_security;
+@@@ -6952,8 -6804,10 +6996,13 @@@ static struct security_hook_list selinu
+  	LSM_HOOK_INIT(bprm_committing_creds, selinux_bprm_committing_creds),
+  	LSM_HOOK_INIT(bprm_committed_creds, selinux_bprm_committed_creds),
+  
+ -	LSM_HOOK_INIT(sb_alloc_security, selinux_sb_alloc_security),
+  	LSM_HOOK_INIT(sb_free_security, selinux_sb_free_security),
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(sb_copy_data, selinux_sb_copy_data),
+++=======
++ 	LSM_HOOK_INIT(sb_eat_lsm_opts, selinux_sb_eat_lsm_opts),
++ 	LSM_HOOK_INIT(sb_free_mnt_opts, selinux_free_mnt_opts),
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	LSM_HOOK_INIT(sb_remount, selinux_sb_remount),
+  	LSM_HOOK_INIT(sb_kern_mount, selinux_sb_kern_mount),
+  	LSM_HOOK_INIT(sb_show_options, selinux_sb_show_options),
+diff --cc security/smack/smack_lsm.c
+index 77b0bfb018e5,81a8112975d4..000000000000
+--- a/security/smack/smack_lsm.c
++++ b/security/smack/smack_lsm.c
+@@@ -732,9 -755,24 +752,30 @@@ out_err
+  	kfree(fshat);
+  	kfree(fsroot);
+  	kfree(fstransmute);
+++<<<<<<< HEAD
+ +	return rc;
+ +}
+ +
+++=======
++ 	security_free_mnt_opts(mnt_opts);
++ 	return rc;
++ }
++ 
++ static int smack_sb_eat_lsm_opts(char *options, void **mnt_opts)
++ {
++ 	char *s = (char *)get_zeroed_page(GFP_KERNEL);
++ 	int err;
++ 
++ 	if (!s)
++ 		return -ENOMEM;
++ 	err = smack_sb_copy_data(options, s);
++ 	if (!err)
++ 		err = smack_parse_opts_str(s, mnt_opts);
++ 	free_page((unsigned long)s);
++ 	return err;
++ }
++ 
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  /**
+   * smack_set_mnt_opts - set Smack specific mount options
+   * @sb: the file system superblock
+@@@ -4631,8 -4672,8 +4673,13 @@@ static struct security_hook_list smack_
+  
+  	LSM_HOOK_INIT(sb_alloc_security, smack_sb_alloc_security),
+  	LSM_HOOK_INIT(sb_free_security, smack_sb_free_security),
+++<<<<<<< HEAD
+ +	LSM_HOOK_INIT(sb_copy_data, smack_sb_copy_data),
+ +	LSM_HOOK_INIT(sb_kern_mount, smack_sb_kern_mount),
+++=======
++ 	LSM_HOOK_INIT(sb_free_mnt_opts, smack_free_mnt_opts),
++ 	LSM_HOOK_INIT(sb_eat_lsm_opts, smack_sb_eat_lsm_opts),
+++>>>>>>> 204cc0ccf1d4 (LSM: hide struct security_mnt_opts from any generic code)
+  	LSM_HOOK_INIT(sb_statfs, smack_sb_statfs),
+  	LSM_HOOK_INIT(sb_set_mnt_opts, smack_set_mnt_opts),
+  	LSM_HOOK_INIT(sb_parse_opts_str, smack_parse_opts_str),
+* Unmerged path fs/btrfs/super.c
+diff --git a/fs/namespace.c b/fs/namespace.c
+index 8bec2f35c65e..c4557071fa34 100644
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -2298,7 +2298,7 @@ static int do_remount(struct path *path, int ms_flags, int sb_flags,
+ 	int err;
+ 	struct super_block *sb = path->mnt->mnt_sb;
+ 	struct mount *mnt = real_mount(path->mnt);
+-	struct security_mnt_opts opts;
++	void *sec_opts = NULL;
+ 
+ 	if (!check_mnt(mnt))
+ 		return -EINVAL;
+@@ -2309,14 +2309,13 @@ static int do_remount(struct path *path, int ms_flags, int sb_flags,
+ 	if (!can_change_locked_flags(mnt, mnt_flags))
+ 		return -EPERM;
+ 
+-	security_init_mnt_opts(&opts);
+ 	if (data && !(sb->s_type->fs_flags & FS_BINARY_MOUNTDATA)) {
+-		err = security_sb_eat_lsm_opts(data, &opts);
++		err = security_sb_eat_lsm_opts(data, &sec_opts);
+ 		if (err)
+ 			return err;
+ 	}
+-	err = security_sb_remount(sb, &opts);
+-	security_free_mnt_opts(&opts);
++	err = security_sb_remount(sb, sec_opts);
++	security_free_mnt_opts(&sec_opts);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/fs/nfs/internal.h b/fs/nfs/internal.h
+index 5893f659a983..1cf54faa959e 100644
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@ -118,7 +118,7 @@ struct nfs_parsed_mount_data {
+ 		unsigned short		nconnect;
+ 	} nfs_server;
+ 
+-	struct security_mnt_opts lsm_opts;
++	void			*lsm_opts;
+ 	struct net		*net;
+ };
+ 
+diff --git a/fs/nfs/super.c b/fs/nfs/super.c
+index 155ae97b9aeb..db0021c7dcc4 100644
+--- a/fs/nfs/super.c
++++ b/fs/nfs/super.c
+@@ -949,7 +949,7 @@ static struct nfs_parsed_mount_data *nfs_alloc_parsed_mount_data(void)
+ 		data->minorversion	= 0;
+ 		data->need_mount	= true;
+ 		data->net		= current->nsproxy->net_ns;
+-		security_init_mnt_opts(&data->lsm_opts);
++		data->lsm_opts		= NULL;
+ 	}
+ 	return data;
+ }
+@@ -2331,7 +2331,7 @@ nfs_remount(struct super_block *sb, int *flags, char *raw_data)
+ 	/* compare new mount options with old ones */
+ 	error = nfs_compare_remount_data(nfss, data);
+ 	if (!error)
+-		error = security_sb_remount(sb, &data->lsm_opts);
++		error = security_sb_remount(sb, data->lsm_opts);
+ out:
+ 	nfs_free_parsed_mount_data(data);
+ 	return error;
+@@ -2605,7 +2605,7 @@ int nfs_set_sb_security(struct super_block *s, struct dentry *mntroot,
+ 	if (NFS_SB(s)->caps & NFS_CAP_SECURITY_LABEL)
+ 		kflags |= SECURITY_LSM_NATIVE_LABELS;
+ 
+-	error = security_sb_set_mnt_opts(s, &mount_info->parsed->lsm_opts,
++	error = security_sb_set_mnt_opts(s, mount_info->parsed->lsm_opts,
+ 						kflags, &kflags_out);
+ 	if (error)
+ 		goto err;
+* Unmerged path fs/super.c
+* Unmerged path include/linux/lsm_hooks.h
+* Unmerged path include/linux/security.h
+* Unmerged path security/security.c
+* Unmerged path security/selinux/hooks.c
+* Unmerged path security/smack/smack_lsm.c
