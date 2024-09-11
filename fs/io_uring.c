@@ -3663,6 +3663,9 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		mutex_lock(&ctx->uring_lock);
 		submitted = io_ring_submit(ctx, to_submit, block_for_last);
 		mutex_unlock(&ctx->uring_lock);
+
+		if (submitted != to_submit)
+			goto out;
 	}
 	if (flags & IORING_ENTER_GETEVENTS) {
 		unsigned nr_events = 0;
@@ -3676,6 +3679,7 @@ SYSCALL_DEFINE6(io_uring_enter, unsigned int, fd, u32, to_submit,
 		}
 	}
 
+out:
 	percpu_ref_put(&ctx->refs);
 out_fput:
 	fdput(f);
