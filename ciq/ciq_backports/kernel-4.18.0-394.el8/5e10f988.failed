@@ -1,0 +1,281 @@
+arm64: mm: Fix TLBI vs ASID rollover
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Will Deacon <will@kernel.org>
+commit 5e10f9887ed85d4f59266d5c60dd09be96b5dbd4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/5e10f988.failed
+
+When switching to an 'mm_struct' for the first time following an ASID
+rollover, a new ASID may be allocated and assigned to 'mm->context.id'.
+This reassignment can happen concurrently with other operations on the
+mm, such as unmapping pages and subsequently issuing TLB invalidation.
+
+Consequently, we need to ensure that (a) accesses to 'mm->context.id'
+are atomic and (b) all page-table updates made prior to a TLBI using the
+old ASID are guaranteed to be visible to CPUs running with the new ASID.
+
+This was found by inspection after reviewing the VMID changes from
+Shameer but it looks like a real (yet hard to hit) bug.
+
+	Cc: <stable@vger.kernel.org>
+	Cc: Marc Zyngier <maz@kernel.org>
+	Cc: Jade Alglave <jade.alglave@arm.com>
+	Cc: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+	Signed-off-by: Will Deacon <will@kernel.org>
+	Reviewed-by: Catalin Marinas <catalin.marinas@arm.com>
+Link: https://lore.kernel.org/r/20210806113109.2475-2-will@kernel.org
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 5e10f9887ed85d4f59266d5c60dd09be96b5dbd4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/mmu.h
+#	arch/arm64/include/asm/tlbflush.h
+diff --cc arch/arm64/include/asm/mmu.h
+index bbbb4f4dbe31,e9c30859f80c..000000000000
+--- a/arch/arm64/include/asm/mmu.h
++++ b/arch/arm64/include/asm/mmu.h
+@@@ -39,12 -27,32 +39,37 @@@ typedef struct 
+  } mm_context_t;
+  
+  /*
+-  * This macro is only used by the TLBI and low-level switch_mm() code,
+-  * neither of which can race with an ASID change. We therefore don't
+-  * need to reload the counter using atomic64_read().
++  * We use atomic64_read() here because the ASID for an 'mm_struct' can
++  * be reallocated when scheduling one of its threads following a
++  * rollover event (see new_context() and flush_context()). In this case,
++  * a concurrent TLBI (e.g. via try_to_unmap_one() and ptep_clear_flush())
++  * may use a stale ASID. This is fine in principle as the new ASID is
++  * guaranteed to be clean in the TLB, but the TLBI routines have to take
++  * care to handle the following race:
++  *
++  *    CPU 0                    CPU 1                          CPU 2
++  *
++  *    // ptep_clear_flush(mm)
++  *    xchg_relaxed(pte, 0)
++  *    DSB ISHST
++  *    old = ASID(mm)
++  *         |                                                  <rollover>
++  *         |                   new = new_context(mm)
++  *         \-----------------> atomic_set(mm->context.id, new)
++  *                             cpu_switch_mm(mm)
++  *                             // Hardware walk of pte using new ASID
++  *    TLBI(old)
++  *
++  * In this scenario, the barrier on CPU 0 and the dependency on CPU 1
++  * ensure that the page-table walker on CPU 1 *must* see the invalid PTE
++  * written by CPU 0.
+   */
+++<<<<<<< HEAD
+ +#define __ASID(asid)	((asid) & 0xffff)
+ +#define ASID(mm)	__ASID((mm)->context.id.counter)
+++=======
++ #define ASID(mm)	(atomic64_read(&(mm)->context.id) & 0xffff)
+++>>>>>>> 5e10f9887ed8 (arm64: mm: Fix TLBI vs ASID rollover)
+  
+  static inline bool arm64_kernel_unmapped_at_el0(void)
+  {
+diff --cc arch/arm64/include/asm/tlbflush.h
+index 46dc4e177907,412a3b9a3c25..000000000000
+--- a/arch/arm64/include/asm/tlbflush.h
++++ b/arch/arm64/include/asm/tlbflush.h
+@@@ -272,44 -243,15 +272,54 @@@ static inline void flush_tlb_all(void
+  	isb();
+  }
+  
+ +DECLARE_PER_CPU(bool, cpu_not_lazy_tlb);
+ +
+ +enum tlb_flush_types {
+ +	TLB_FLUSH_NO,
+ +	TLB_FLUSH_LOCAL,
+ +	TLB_FLUSH_BROADCAST,
+ +};
+ +extern enum tlb_flush_types tlb_flush_check(struct mm_struct *mm,
+ +					    unsigned int cpu);
+ +
+  static inline void flush_tlb_mm(struct mm_struct *mm)
+  {
+++<<<<<<< HEAD
+ +	unsigned long asid = __TLBI_VADDR(0, ASID(mm));
+ +	enum tlb_flush_types flush;
+ +
+ +	flush = tlb_flush_check(mm, get_cpu());
+ +	switch (flush) {
+ +	case TLB_FLUSH_LOCAL:
+ +
+ +		dsb(nshst);
+ +		__tlbi(aside1, asid);
+ +		__tlbi_user(aside1, asid);
+ +		dsb(nsh);
+ +
+ +		/* fall through */
+ +	case TLB_FLUSH_NO:
+ +		put_cpu();
+ +		break;
+ +	case TLB_FLUSH_BROADCAST:
+ +		put_cpu();
+ +
+ +		dsb(ishst);
+ +		__tlbi(aside1is, asid);
+ +		__tlbi_user(aside1is, asid);
+ +		dsb(ish);
+ +
+ +		break;
+ +	}
+++=======
++ 	unsigned long asid;
++ 
++ 	dsb(ishst);
++ 	asid = __TLBI_VADDR(0, ASID(mm));
++ 	__tlbi(aside1is, asid);
++ 	__tlbi_user(aside1is, asid);
++ 	dsb(ish);
+++>>>>>>> 5e10f9887ed8 (arm64: mm: Fix TLBI vs ASID rollover)
+  }
+  
+  static inline void flush_tlb_page_nosync(struct vm_area_struct *vma,
+@@@ -362,15 -280,12 +373,19 @@@ static inline void flush_tlb_page(struc
+  
+  static inline void __flush_tlb_range(struct vm_area_struct *vma,
+  				     unsigned long start, unsigned long end,
+ -				     unsigned long stride, bool last_level,
+ -				     int tlb_level)
+ +				     unsigned long stride, bool last_level)
+  {
+ +	struct mm_struct *mm = vma->vm_mm;
+  	int num = 0;
+  	int scale = 0;
+++<<<<<<< HEAD
+ +	unsigned long asid = ASID(mm);
+ +	unsigned long addr;
+ +	unsigned long pages;
+ +	enum tlb_flush_types flush;
+++=======
++ 	unsigned long asid, addr, pages;
+++>>>>>>> 5e10f9887ed8 (arm64: mm: Fix TLBI vs ASID rollover)
+  
+  	start = round_down(start, stride);
+  	end = round_up(end, stride);
+@@@ -389,68 -304,60 +404,73 @@@
+  		return;
+  	}
+  
+++<<<<<<< HEAD
+ +	flush = tlb_flush_check(mm, get_cpu());
+ +	switch (flush) {
+ +	case TLB_FLUSH_LOCAL:
+ +		stride >>= PAGE_SHIFT;
+++=======
++ 	dsb(ishst);
++ 	asid = ASID(vma->vm_mm);
+++>>>>>>> 5e10f9887ed8 (arm64: mm: Fix TLBI vs ASID rollover)
+  
+ -	/*
+ -	 * When the CPU does not support TLB range operations, flush the TLB
+ -	 * entries one by one at the granularity of 'stride'. If the TLB
+ -	 * range ops are supported, then:
+ -	 *
+ -	 * 1. If 'pages' is odd, flush the first page through non-range
+ -	 *    operations;
+ -	 *
+ -	 * 2. For remaining pages: the minimum range granularity is decided
+ -	 *    by 'scale', so multiple range TLBI operations may be required.
+ -	 *    Start from scale = 0, flush the corresponding number of pages
+ -	 *    ((num+1)*2^(5*scale+1) starting from 'addr'), then increase it
+ -	 *    until no pages left.
+ -	 *
+ -	 * Note that certain ranges can be represented by either num = 31 and
+ -	 * scale or num = 0 and scale + 1. The loop below favours the latter
+ -	 * since num is limited to 30 by the __TLBI_RANGE_NUM() macro.
+ -	 */
+ -	while (pages > 0) {
+ -		if (!system_supports_tlb_range() ||
+ -		    pages % 2 == 1) {
+ -			addr = __TLBI_VADDR(start, asid);
+ +		start = __TLBI_VADDR(start, asid);
+ +		end = __TLBI_VADDR(end, asid);
+ +
+ +		dsb(nshst);
+ +		for (addr = start; addr < end; addr += stride) {
+  			if (last_level) {
+ -				__tlbi_level(vale1is, addr, tlb_level);
+ -				__tlbi_user_level(vale1is, addr, tlb_level);
+ +				__tlbi(vale1, addr);
+ +				__tlbi_user(vale1, addr);
+  			} else {
+ -				__tlbi_level(vae1is, addr, tlb_level);
+ -				__tlbi_user_level(vae1is, addr, tlb_level);
+ +				__tlbi(vae1, addr);
+ +				__tlbi_user(vae1, addr);
+  			}
+ -			start += stride;
+ -			pages -= stride >> PAGE_SHIFT;
+ -			continue;
+  		}
+ -
+ -		num = __TLBI_RANGE_NUM(pages, scale);
+ -		if (num >= 0) {
+ -			addr = __TLBI_VADDR_RANGE(start, asid, scale,
+ -						  num, tlb_level);
+ -			if (last_level) {
+ -				__tlbi(rvale1is, addr);
+ -				__tlbi_user(rvale1is, addr);
+ +		dsb(nsh);
+ +
+ +		/* fall through */
+ +	case TLB_FLUSH_NO:
+ +		put_cpu();
+ +		break;
+ +	case TLB_FLUSH_BROADCAST:
+ +		put_cpu();
+ +
+ +		dsb(ishst);
+ +		while (pages > 0) {
+ +			if (!system_supports_tlb_range() ||
+ +			    pages % 2 == 1) {
+ +			        addr = __TLBI_VADDR(start, asid);
+ +				if (last_level) {
+ +					__tlbi(vale1is, addr);
+ +					__tlbi_user(vale1is, addr);
+ +				} else {
+ +					__tlbi(vae1is, addr);
+ +					__tlbi_user(vae1is, addr);
+ +				}
+ +				start += stride;
+ +				pages -= stride >> PAGE_SHIFT;
+  			} else {
+ -				__tlbi(rvae1is, addr);
+ -				__tlbi_user(rvae1is, addr);
+ +				num = __TLBI_RANGE_NUM(pages, scale);
+ +				if (num >= 0) {
+ +					addr = __TLBI_VADDR_RANGE(start, asid, scale,
+ +								  num, 0);
+ +					if (last_level) {
+ +						 __tlbi(rvale1is, addr);
+ +						 __tlbi_user(rvale1is, addr);
+ +					} else {
+ +						__tlbi(rvae1is, addr);
+ +						__tlbi_user(rvae1is, addr);
+ +					}
+ +					start += __TLBI_RANGE_PAGES(num, scale) << PAGE_SHIFT;
+ +					pages -= __TLBI_RANGE_PAGES(num, scale);
+ +				}
+ +				scale++;
+  			}
+ -			start += __TLBI_RANGE_PAGES(num, scale) << PAGE_SHIFT;
+ -			pages -= __TLBI_RANGE_PAGES(num, scale);
+  		}
+ -		scale++;
+ +		dsb(ish);
+ +		break;
+  	}
+ -	dsb(ish);
+  }
+  
+  static inline void flush_tlb_range(struct vm_area_struct *vma,
+* Unmerged path arch/arm64/include/asm/mmu.h
+* Unmerged path arch/arm64/include/asm/tlbflush.h
