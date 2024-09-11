@@ -1,0 +1,416 @@
+mm: proactive compaction
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Nitin Gupta <nigupta@nvidia.com>
+commit facdaa917c4d5a376d09d25865f5a863f906234a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/facdaa91.failed
+
+For some applications, we need to allocate almost all memory as hugepages.
+However, on a running system, higher-order allocations can fail if the
+memory is fragmented.  Linux kernel currently does on-demand compaction as
+we request more hugepages, but this style of compaction incurs very high
+latency.  Experiments with one-time full memory compaction (followed by
+hugepage allocations) show that kernel is able to restore a highly
+fragmented memory state to a fairly compacted memory state within <1 sec
+for a 32G system.  Such data suggests that a more proactive compaction can
+help us allocate a large fraction of memory as hugepages keeping
+allocation latencies low.
+
+For a more proactive compaction, the approach taken here is to define a
+new sysctl called 'vm.compaction_proactiveness' which dictates bounds for
+external fragmentation which kcompactd tries to maintain.
+
+The tunable takes a value in range [0, 100], with a default of 20.
+
+Note that a previous version of this patch [1] was found to introduce too
+many tunables (per-order extfrag{low, high}), but this one reduces them to
+just one sysctl.  Also, the new tunable is an opaque value instead of
+asking for specific bounds of "external fragmentation", which would have
+been difficult to estimate.  The internal interpretation of this opaque
+value allows for future fine-tuning.
+
+Currently, we use a simple translation from this tunable to [low, high]
+"fragmentation score" thresholds (low=100-proactiveness, high=low+10%).
+The score for a node is defined as weighted mean of per-zone external
+fragmentation.  A zone's present_pages determines its weight.
+
+To periodically check per-node score, we reuse per-node kcompactd threads,
+which are woken up every 500 milliseconds to check the same.  If a node's
+score exceeds its high threshold (as derived from user-provided
+proactiveness value), proactive compaction is started until its score
+reaches its low threshold value.  By default, proactiveness is set to 20,
+which implies threshold values of low=80 and high=90.
+
+This patch is largely based on ideas from Michal Hocko [2].  See also the
+LWN article [3].
+
+Performance data
+================
+
+System: x64_64, 1T RAM, 80 CPU threads.
+Kernel: 5.6.0-rc3 + this patch
+
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
+echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/defrag
+
+Before starting the driver, the system was fragmented from a userspace
+program that allocates all memory and then for each 2M aligned section,
+frees 3/4 of base pages using munmap.  The workload is mainly anonymous
+userspace pages, which are easy to move around.  I intentionally avoided
+unmovable pages in this test to see how much latency we incur when
+hugepage allocations hit direct compaction.
+
+1. Kernel hugepage allocation latencies
+
+With the system in such a fragmented state, a kernel driver then allocates
+as many hugepages as possible and measures allocation latency:
+
+(all latency values are in microseconds)
+
+- With vanilla 5.6.0-rc3
+
+  percentile latency
+  –––––––––– –––––––
+	   5    7894
+	  10    9496
+	  25   12561
+	  30   15295
+	  40   18244
+	  50   21229
+	  60   27556
+	  75   30147
+	  80   31047
+	  90   32859
+	  95   33799
+
+Total 2M hugepages allocated = 383859 (749G worth of hugepages out of 762G
+total free => 98% of free memory could be allocated as hugepages)
+
+- With 5.6.0-rc3 + this patch, with proactiveness=20
+
+sysctl -w vm.compaction_proactiveness=20
+
+  percentile latency
+  –––––––––– –––––––
+	   5       2
+	  10       2
+	  25       3
+	  30       3
+	  40       3
+	  50       4
+	  60       4
+	  75       4
+	  80       4
+	  90       5
+	  95     429
+
+Total 2M hugepages allocated = 384105 (750G worth of hugepages out of 762G
+total free => 98% of free memory could be allocated as hugepages)
+
+2. JAVA heap allocation
+
+In this test, we first fragment memory using the same method as for (1).
+
+Then, we start a Java process with a heap size set to 700G and request the
+heap to be allocated with THP hugepages.  We also set THP to madvise to
+allow hugepage backing of this heap.
+
+/usr/bin/time
+ java -Xms700G -Xmx700G -XX:+UseTransparentHugePages -XX:+AlwaysPreTouch
+
+The above command allocates 700G of Java heap using hugepages.
+
+- With vanilla 5.6.0-rc3
+
+17.39user 1666.48system 27:37.89elapsed
+
+- With 5.6.0-rc3 + this patch, with proactiveness=20
+
+8.35user 194.58system 3:19.62elapsed
+
+Elapsed time remains around 3:15, as proactiveness is further increased.
+
+Note that proactive compaction happens throughout the runtime of these
+workloads.  The situation of one-time compaction, sufficient to supply
+hugepages for following allocation stream, can probably happen for more
+extreme proactiveness values, like 80 or 90.
+
+In the above Java workload, proactiveness is set to 20.  The test starts
+with a node's score of 80 or higher, depending on the delay between the
+fragmentation step and starting the benchmark, which gives more-or-less
+time for the initial round of compaction.  As t he benchmark consumes
+hugepages, node's score quickly rises above the high threshold (90) and
+proactive compaction starts again, which brings down the score to the low
+threshold level (80).  Repeat.
+
+bpftrace also confirms proactive compaction running 20+ times during the
+runtime of this Java benchmark.  kcompactd threads consume 100% of one of
+the CPUs while it tries to bring a node's score within thresholds.
+
+Backoff behavior
+================
+
+Above workloads produce a memory state which is easy to compact.  However,
+if memory is filled with unmovable pages, proactive compaction should
+essentially back off.  To test this aspect:
+
+- Created a kernel driver that allocates almost all memory as hugepages
+  followed by freeing first 3/4 of each hugepage.
+- Set proactiveness=40
+- Note that proactive_compact_node() is deferred maximum number of times
+  with HPAGE_FRAG_CHECK_INTERVAL_MSEC of wait between each check
+  (=> ~30 seconds between retries).
+
+[1] https://patchwork.kernel.org/patch/11098289/
+[2] https://lore.kernel.org/linux-mm/20161230131412.GI13301@dhcp22.suse.cz/
+[3] https://lwn.net/Articles/817905/
+
+	Signed-off-by: Nitin Gupta <nigupta@nvidia.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Oleksandr Natalenko <oleksandr@redhat.com>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Khalid Aziz <khalid.aziz@oracle.com>
+	Reviewed-by: Oleksandr Natalenko <oleksandr@redhat.com>
+	Cc: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Khalid Aziz <khalid.aziz@oracle.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Mel Gorman <mgorman@techsingularity.net>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Joonsoo Kim <iamjoonsoo.kim@lge.com>
+	Cc: David Rientjes <rientjes@google.com>
+	Cc: Nitin Gupta <ngupta@nitingupta.dev>
+	Cc: Oleksandr Natalenko <oleksandr@redhat.com>
+Link: http://lkml.kernel.org/r/20200616204527.19185-1-nigupta@nvidia.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit facdaa917c4d5a376d09d25865f5a863f906234a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/sysctl/vm.txt
+#	mm/compaction.c
+diff --cc Documentation/sysctl/vm.txt
+index 5e866027a092,4b9d2e8e9142..000000000000
+--- a/Documentation/sysctl/vm.txt
++++ b/Documentation/sysctl/vm.txt
+@@@ -111,9 -119,24 +111,27 @@@ all zones are compacted such that free 
+  blocks where possible. This can be important for example in the allocation of
+  huge pages although processes will also directly compact memory as required.
+  
+++<<<<<<< HEAD:Documentation/sysctl/vm.txt
+ +==============================================================
+++=======
++ compaction_proactiveness
++ ========================
++ 
++ This tunable takes a value in the range [0, 100] with a default value of
++ 20. This tunable determines how aggressively compaction is done in the
++ background. Setting it to 0 disables proactive compaction.
++ 
++ Note that compaction has a non-trivial system-wide impact as pages
++ belonging to different processes are moved around, which could also lead
++ to latency spikes in unsuspecting applications. The kernel employs
++ various heuristics to avoid wasting CPU cycles if it detects that
++ proactive compaction is not being effective.
++ 
++ Be careful when setting it to extreme values like 100, as that may
++ cause excessive background compaction activity.
+++>>>>>>> facdaa917c4d (mm: proactive compaction):Documentation/admin-guide/sysctl/vm.rst
+  
+  compact_unevictable_allowed
+ -===========================
+  
+  Available only when CONFIG_COMPACTION is set. When set to 1, compaction is
+  allowed to examine the unevictable lru (mlocked pages) for pages to compact.
+diff --cc mm/compaction.c
+index 35fc5ff5f321,544a98811c82..000000000000
+--- a/mm/compaction.c
++++ b/mm/compaction.c
+@@@ -1313,8 -1875,77 +1331,82 @@@ static inline bool is_via_compact_memor
+  	return order == -1;
+  }
+  
+++<<<<<<< HEAD
+ +static enum compact_result __compact_finished(struct zone *zone,
+ +						struct compact_control *cc)
+++=======
++ static bool kswapd_is_running(pg_data_t *pgdat)
++ {
++ 	return pgdat->kswapd && (pgdat->kswapd->state == TASK_RUNNING);
++ }
++ 
++ /*
++  * A zone's fragmentation score is the external fragmentation wrt to the
++  * COMPACTION_HPAGE_ORDER scaled by the zone's size. It returns a value
++  * in the range [0, 100].
++  *
++  * The scaling factor ensures that proactive compaction focuses on larger
++  * zones like ZONE_NORMAL, rather than smaller, specialized zones like
++  * ZONE_DMA32. For smaller zones, the score value remains close to zero,
++  * and thus never exceeds the high threshold for proactive compaction.
++  */
++ static int fragmentation_score_zone(struct zone *zone)
++ {
++ 	unsigned long score;
++ 
++ 	score = zone->present_pages *
++ 			extfrag_for_order(zone, COMPACTION_HPAGE_ORDER);
++ 	return div64_ul(score, zone->zone_pgdat->node_present_pages + 1);
++ }
++ 
++ /*
++  * The per-node proactive (background) compaction process is started by its
++  * corresponding kcompactd thread when the node's fragmentation score
++  * exceeds the high threshold. The compaction process remains active till
++  * the node's score falls below the low threshold, or one of the back-off
++  * conditions is met.
++  */
++ static int fragmentation_score_node(pg_data_t *pgdat)
++ {
++ 	unsigned long score = 0;
++ 	int zoneid;
++ 
++ 	for (zoneid = 0; zoneid < MAX_NR_ZONES; zoneid++) {
++ 		struct zone *zone;
++ 
++ 		zone = &pgdat->node_zones[zoneid];
++ 		score += fragmentation_score_zone(zone);
++ 	}
++ 
++ 	return score;
++ }
++ 
++ static int fragmentation_score_wmark(pg_data_t *pgdat, bool low)
++ {
++ 	int wmark_low;
++ 
++ 	/*
++ 	 * Cap the low watermak to avoid excessive compaction
++ 	 * activity in case a user sets the proactivess tunable
++ 	 * close to 100 (maximum).
++ 	 */
++ 	wmark_low = max(100 - sysctl_compaction_proactiveness, 5);
++ 	return low ? wmark_low : min(wmark_low + 10, 100);
++ }
++ 
++ static bool should_proactive_compact_node(pg_data_t *pgdat)
++ {
++ 	int wmark_high;
++ 
++ 	if (!sysctl_compaction_proactiveness || kswapd_is_running(pgdat))
++ 		return false;
++ 
++ 	wmark_high = fragmentation_score_wmark(pgdat, false);
++ 	return fragmentation_score_node(pgdat) > wmark_high;
++ }
++ 
++ static enum compact_result __compact_finished(struct compact_control *cc)
+++>>>>>>> facdaa917c4d (mm: proactive compaction)
+  {
+  	unsigned int order;
+  	const int migratetype = cc->migratetype;
+@@@ -1398,11 -2048,14 +1509,19 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	return COMPACT_NO_SUITABLE_PAGE;
+++=======
++ out:
++ 	if (cc->contended || fatal_signal_pending(current))
++ 		ret = COMPACT_CONTENDED;
++ 
++ 	return ret;
+++>>>>>>> facdaa917c4d (mm: proactive compaction)
+  }
+  
+ -static enum compact_result compact_finished(struct compact_control *cc)
+ +static enum compact_result compact_finished(struct zone *zone,
+ +			struct compact_control *cc)
+  {
+  	int ret;
+  
+* Unmerged path Documentation/sysctl/vm.txt
+diff --git a/include/linux/compaction.h b/include/linux/compaction.h
+index 2184076d18b0..24b3feaa44ce 100644
+--- a/include/linux/compaction.h
++++ b/include/linux/compaction.h
+@@ -85,11 +85,13 @@ static inline unsigned long compact_gap(unsigned int order)
+ 
+ #ifdef CONFIG_COMPACTION
+ extern int sysctl_compact_memory;
++extern int sysctl_compaction_proactiveness;
+ extern int sysctl_compaction_handler(struct ctl_table *table, int write,
+ 			void __user *buffer, size_t *length, loff_t *ppos);
+ extern int sysctl_extfrag_threshold;
+ extern int sysctl_compact_unevictable_allowed;
+ 
++extern int extfrag_for_order(struct zone *zone, unsigned int order);
+ extern int fragmentation_index(struct zone *zone, unsigned int order);
+ extern enum compact_result try_to_compact_pages(gfp_t gfp_mask,
+ 		unsigned int order, unsigned int alloc_flags,
+diff --git a/kernel/sysctl.c b/kernel/sysctl.c
+index d9e0aff1f72d..fc28b3d680ca 100644
+--- a/kernel/sysctl.c
++++ b/kernel/sysctl.c
+@@ -1443,6 +1443,15 @@ static struct ctl_table vm_table[] = {
+ 		.mode		= 0200,
+ 		.proc_handler	= sysctl_compaction_handler,
+ 	},
++	{
++		.procname	= "compaction_proactiveness",
++		.data		= &sysctl_compaction_proactiveness,
++		.maxlen		= sizeof(int),
++		.mode		= 0644,
++		.proc_handler	= proc_dointvec_minmax,
++		.extra1		= SYSCTL_ZERO,
++		.extra2		= &one_hundred,
++	},
+ 	{
+ 		.procname	= "extfrag_threshold",
+ 		.data		= &sysctl_extfrag_threshold,
+* Unmerged path mm/compaction.c
+diff --git a/mm/internal.h b/mm/internal.h
+index fa1dc73550bd..4a1d64decf14 100644
+--- a/mm/internal.h
++++ b/mm/internal.h
+@@ -201,6 +201,7 @@ struct compact_control {
+ 	bool no_set_skip_hint;		/* Don't mark blocks for skipping */
+ 	bool ignore_block_suitable;	/* Scan blocks considered unsuitable */
+ 	bool direct_compaction;		/* False from kcompactd or /proc/... */
++	bool proactive_compaction;	/* kcompactd proactive compaction */
+ 	bool whole_zone;		/* Whole zone should/has been scanned */
+ 	bool contended;			/* Signal lock or sched contention */
+ };
+diff --git a/mm/vmstat.c b/mm/vmstat.c
+index 8285022e8e12..d85c07771f0f 100644
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@ -1073,6 +1073,24 @@ static int __fragmentation_index(unsigned int order, struct contig_page_info *in
+ 	return 1000 - div_u64( (1000+(div_u64(info->free_pages * 1000ULL, requested))), info->free_blocks_total);
+ }
+ 
++/*
++ * Calculates external fragmentation within a zone wrt the given order.
++ * It is defined as the percentage of pages found in blocks of size
++ * less than 1 << order. It returns values in range [0, 100].
++ */
++int extfrag_for_order(struct zone *zone, unsigned int order)
++{
++	struct contig_page_info info;
++
++	fill_contig_page_info(zone, order, &info);
++	if (info.free_pages == 0)
++		return 0;
++
++	return div_u64((info.free_pages -
++			(info.free_blocks_suitable << order)) * 100,
++			info.free_pages);
++}
++
+ /* Same as __fragmentation index but allocs contig_page_info on stack */
+ int fragmentation_index(struct zone *zone, unsigned int order)
+ {
