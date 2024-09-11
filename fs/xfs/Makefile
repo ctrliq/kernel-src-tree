@@ -142,6 +142,7 @@ xfs-y				+= $(addprefix scrub/, \
 				   common.o \
 				   dabtree.o \
 				   dir.o \
+				   health.o \
 				   ialloc.o \
 				   inode.o \
 				   parent.o \
