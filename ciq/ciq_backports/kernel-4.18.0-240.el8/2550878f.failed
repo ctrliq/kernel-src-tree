@@ -1,0 +1,164 @@
+io_uring: remove extra io_wq_current_is_worker()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 2550878f8421f7912fdd56b38c630b797f95c749
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2550878f.failed
+
+io_wq workers use io_issue_sqe() to forward sqes and never
+io_queue_sqe(). Remove extra check for io_wq_current_is_worker()
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2550878f8421f7912fdd56b38c630b797f95c749)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 28a601d08266,0d083811ccb9..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -2228,94 -4358,68 +2228,106 @@@ static int io_queue_sqe(struct io_ring_
+  {
+  	int ret;
+  
+ -	if (unlikely(req->ctx->drain_next)) {
+ -		req->flags |= REQ_F_IO_DRAIN;
+ -		req->ctx->drain_next = false;
+ -	}
+ -	req->ctx->drain_next = (req->flags & REQ_F_DRAIN_LINK);
+ -
+ -	ret = io_req_defer(req, sqe);
+ +	ret = io_req_defer(ctx, req, s->sqe);
+  	if (ret) {
+  		if (ret != -EIOCBQUEUED) {
+ -			io_cqring_add_event(req, ret);
+ -			req_set_fail_links(req);
+ -			io_double_put_req(req);
+ +			io_free_req(req);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+  		}
+++<<<<<<< HEAD
+ +		return 0;
+++=======
++ 	} else if (req->flags & REQ_F_FORCE_ASYNC) {
++ 		/*
++ 		 * Never try inline submit of IOSQE_ASYNC is set, go straight
++ 		 * to async execution.
++ 		 */
++ 		req->work.flags |= IO_WQ_WORK_CONCURRENT;
++ 		io_queue_async_work(req);
++ 	} else {
++ 		__io_queue_sqe(req, sqe);
+++>>>>>>> 2550878f8421 (io_uring: remove extra io_wq_current_is_worker())
+  	}
+ +
+ +	return __io_queue_sqe(ctx, req, s, force_nonblock);
+  }
+  
+ -static inline void io_queue_link_head(struct io_kiocb *req)
+ +static int io_queue_link_head(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			      struct sqe_submit *s, struct io_kiocb *shadow,
+ +			      bool force_nonblock)
+  {
+ -	if (unlikely(req->flags & REQ_F_FAIL_LINK)) {
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_double_put_req(req);
+ -	} else
+ -		io_queue_sqe(req, NULL);
+ +	int ret;
+ +	int need_submit = false;
+ +
+ +	if (!shadow)
+ +		return io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	/*
+ +	 * Mark the first IO in link list as DRAIN, let all the following
+ +	 * IOs enter the defer list. all IO needs to be completed before link
+ +	 * list.
+ +	 */
+ +	req->flags |= REQ_F_IO_DRAIN;
+ +	ret = io_req_defer(ctx, req, s->sqe);
+ +	if (ret) {
+ +		if (ret != -EIOCBQUEUED) {
+ +			io_free_req(req);
+ +			__io_free_req(shadow);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +			return 0;
+ +		}
+ +	} else {
+ +		/*
+ +		 * If ret == 0 means that all IOs in front of link io are
+ +		 * running done. let's queue link head.
+ +		 */
+ +		need_submit = true;
+ +	}
+ +
+ +	/* Insert shadow req to defer_list, blocking next IOs */
+ +	spin_lock_irq(&ctx->completion_lock);
+ +	list_add_tail(&shadow->list, &ctx->defer_list);
+ +	spin_unlock_irq(&ctx->completion_lock);
+ +
+ +	if (need_submit)
+ +		return __io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	return 0;
+  }
+  
+ -#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK|	\
+ -				IOSQE_IO_HARDLINK | IOSQE_ASYNC)
+ +#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK)
+  
+ -static bool io_submit_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -			  struct io_submit_state *state, struct io_kiocb **link)
+ +static void io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
+ +			  struct io_submit_state *state, struct io_kiocb **link,
+ +			  bool force_nonblock)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	unsigned int sqe_flags;
+ +	struct io_uring_sqe *sqe_copy;
+ +	struct io_kiocb *req;
+  	int ret;
+  
+ -	sqe_flags = READ_ONCE(sqe->flags);
+ -
+  	/* enforce forwards compatibility on users */
+ -	if (unlikely(sqe_flags & ~SQE_VALID_FLAGS)) {
+ +	if (unlikely(s->sqe->flags & ~SQE_VALID_FLAGS)) {
+  		ret = -EINVAL;
+ -		goto err_req;
+ +		goto err;
+  	}
+ -	if (sqe_flags & IOSQE_ASYNC)
+ -		req->flags |= REQ_F_FORCE_ASYNC;
+  
+ -	ret = io_req_set_file(state, req, sqe);
+ +	req = io_get_req(ctx, state);
+ +	if (unlikely(!req)) {
+ +		ret = -EAGAIN;
+ +		goto err;
+ +	}
+ +
+ +	ret = io_req_set_file(ctx, s, state, req);
+  	if (unlikely(ret)) {
+  err_req:
+ -		io_cqring_add_event(req, ret);
+ -		io_double_put_req(req);
+ -		return false;
+ +		io_free_req(req);
+ +err:
+ +		io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		return;
+  	}
+  
+ +	req->user_data = s->sqe->user_data;
+ +
+  	/*
+  	 * If we already have a head request, queue this one for async
+  	 * submittal once the head completes. If we don't have a head but
+* Unmerged path fs/io_uring.c
