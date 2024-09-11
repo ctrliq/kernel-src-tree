@@ -1,0 +1,367 @@
+net: bridge: mcast: make sure querier port/address updates are consistent
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nikolay Aleksandrov <nikolay@nvidia.com>
+commit 67b746f94ff39d8b998c4ea9493c6ab2d6c225d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/67b746f9.failed
+
+Use a sequence counter to make sure port/address updates can be read
+consistently without requiring the bridge multicast_lock. We need to
+zero out the port and address when the other querier has expired and
+we're about to select ourselves as querier. br_multicast_read_querier
+will be used later when dumping querier state. Updates are done only
+with the multicast spinlock and softirqs disabled, while reads are done
+from process context and from softirqs (due to notifications).
+
+	Signed-off-by: Nikolay Aleksandrov <nikolay@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 67b746f94ff39d8b998c4ea9493c6ab2d6c225d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/bridge/br_multicast.c
+#	net/bridge/br_private.h
+diff --cc net/bridge/br_multicast.c
+index def6f1840985,701cf46b89de..000000000000
+--- a/net/bridge/br_multicast.c
++++ b/net/bridge/br_multicast.c
+@@@ -1073,8 -1659,34 +1073,39 @@@ again_under_lmqt
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +static void br_multicast_send_query(struct net_bridge *br,
+ +				    struct net_bridge_port *port,
+++=======
++ static void br_multicast_read_querier(const struct bridge_mcast_querier *querier,
++ 				      struct bridge_mcast_querier *dest)
++ {
++ 	unsigned int seq;
++ 
++ 	memset(dest, 0, sizeof(*dest));
++ 	do {
++ 		seq = read_seqcount_begin(&querier->seq);
++ 		dest->port_ifidx = querier->port_ifidx;
++ 		memcpy(&dest->addr, &querier->addr, sizeof(struct br_ip));
++ 	} while (read_seqcount_retry(&querier->seq, seq));
++ }
++ 
++ static void br_multicast_update_querier(struct net_bridge_mcast *brmctx,
++ 					struct bridge_mcast_querier *querier,
++ 					int ifindex,
++ 					struct br_ip *saddr)
++ {
++ 	lockdep_assert_held_once(&brmctx->br->multicast_lock);
++ 
++ 	write_seqcount_begin(&querier->seq);
++ 	querier->port_ifidx = ifindex;
++ 	memcpy(&querier->addr, saddr, sizeof(*saddr));
++ 	write_seqcount_end(&querier->seq);
++ }
++ 
++ static void br_multicast_send_query(struct net_bridge_mcast *brmctx,
++ 				    struct net_bridge_mcast_port *pmctx,
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  				    struct bridge_mcast_own_query *own_query)
+  {
+  	struct bridge_mcast_other_query *other_query = NULL;
+@@@ -1081,20 -1694,22 +1113,32 @@@
+  	struct br_ip br_group;
+  	unsigned long time;
+  
+ -	if (!br_multicast_ctx_should_use(brmctx, pmctx) ||
+ -	    !br_opt_get(brmctx->br, BROPT_MULTICAST_ENABLED) ||
+ -	    !brmctx->multicast_querier)
+ +	if (!netif_running(br->dev) ||
+ +	    !br_opt_get(br, BROPT_MULTICAST_ENABLED) ||
+ +	    !br_opt_get(br, BROPT_MULTICAST_QUERIER))
+  		return;
+  
+ -	memset(&br_group.dst, 0, sizeof(br_group.dst));
+ +	memset(&br_group.u, 0, sizeof(br_group.u));
+  
+++<<<<<<< HEAD
+ +	if (port ? (own_query == &port->ip4_own_query) :
+ +		   (own_query == &br->ip4_own_query)) {
+ +		other_query = &br->ip4_other_query;
+ +		br_group.proto = htons(ETH_P_IP);
+ +#if IS_ENABLED(CONFIG_IPV6)
+ +	} else {
+ +		other_query = &br->ip6_other_query;
+++=======
++ 	if (pmctx ? (own_query == &pmctx->ip4_own_query) :
++ 		    (own_query == &brmctx->ip4_own_query)) {
++ 		querier = &brmctx->ip4_querier;
++ 		other_query = &brmctx->ip4_other_query;
++ 		br_group.proto = htons(ETH_P_IP);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	} else {
++ 		querier = &brmctx->ip6_querier;
++ 		other_query = &brmctx->ip6_other_query;
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		br_group.proto = htons(ETH_P_IPV6);
+  #endif
+  	}
+@@@ -1102,13 -1717,20 +1146,25 @@@
+  	if (!other_query || timer_pending(&other_query->timer))
+  		return;
+  
+++<<<<<<< HEAD
+ +	__br_multicast_send_query(br, port, NULL, NULL, &br_group, false, 0,
+ +				  NULL);
+++=======
++ 	/* we're about to select ourselves as querier */
++ 	if (!pmctx && querier->port_ifidx) {
++ 		struct br_ip zeroip = {};
++ 
++ 		br_multicast_update_querier(brmctx, querier, 0, &zeroip);
++ 	}
++ 
++ 	__br_multicast_send_query(brmctx, pmctx, NULL, NULL, &br_group, false,
++ 				  0, NULL);
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  
+  	time = jiffies;
+ -	time += own_query->startup_sent < brmctx->multicast_startup_query_count ?
+ -		brmctx->multicast_startup_query_interval :
+ -		brmctx->multicast_query_interval;
+ +	time += own_query->startup_sent < br->multicast_startup_query_count ?
+ +		br->multicast_startup_query_interval :
+ +		br->multicast_query_interval;
+  	mod_timer(&own_query->timer, time);
+  }
+  
+@@@ -2070,50 -2864,51 +2126,90 @@@ unlock_continue
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +static bool br_ip4_multicast_select_querier(struct net_bridge *br,
+ +					    struct net_bridge_port *port,
+ +					    __be32 saddr)
+ +{
+ +	if (!timer_pending(&br->ip4_own_query.timer) &&
+ +	    !timer_pending(&br->ip4_other_query.timer))
+++=======
++ static bool br_ip4_multicast_select_querier(struct net_bridge_mcast *brmctx,
++ 					    struct net_bridge_mcast_port *pmctx,
++ 					    struct br_ip *saddr)
++ {
++ 	int port_ifidx = pmctx ? pmctx->port->dev->ifindex : 0;
++ 
++ 	if (!timer_pending(&brmctx->ip4_own_query.timer) &&
++ 	    !timer_pending(&brmctx->ip4_other_query.timer))
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		goto update;
+  
+ -	if (!brmctx->ip4_querier.addr.src.ip4)
+ +	if (!br->ip4_querier.addr.src.ip4)
+  		goto update;
+  
+++<<<<<<< HEAD
+ +	if (ntohl(saddr) <= ntohl(br->ip4_querier.addr.src.ip4))
+++=======
++ 	if (ntohl(saddr->src.ip4) <= ntohl(brmctx->ip4_querier.addr.src.ip4))
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		goto update;
+  
+  	return false;
+  
+  update:
+++<<<<<<< HEAD
+ +	br->ip4_querier.addr.src.ip4 = saddr;
+ +
+ +	/* update protected by general multicast_lock by caller */
+ +	rcu_assign_pointer(br->ip4_querier.port, port);
+++=======
++ 	br_multicast_update_querier(brmctx, &brmctx->ip4_querier, port_ifidx,
++ 				    saddr);
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  
+  	return true;
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+++<<<<<<< HEAD
+ +static bool br_ip6_multicast_select_querier(struct net_bridge *br,
+ +					    struct net_bridge_port *port,
+ +					    struct in6_addr *saddr)
+ +{
+ +	if (!timer_pending(&br->ip6_own_query.timer) &&
+ +	    !timer_pending(&br->ip6_other_query.timer))
+ +		goto update;
+ +
+ +	if (ipv6_addr_cmp(saddr, &br->ip6_querier.addr.src.ip6) <= 0)
+++=======
++ static bool br_ip6_multicast_select_querier(struct net_bridge_mcast *brmctx,
++ 					    struct net_bridge_mcast_port *pmctx,
++ 					    struct br_ip *saddr)
++ {
++ 	int port_ifidx = pmctx ? pmctx->port->dev->ifindex : 0;
++ 
++ 	if (!timer_pending(&brmctx->ip6_own_query.timer) &&
++ 	    !timer_pending(&brmctx->ip6_other_query.timer))
++ 		goto update;
++ 
++ 	if (ipv6_addr_cmp(&saddr->src.ip6,
++ 			  &brmctx->ip6_querier.addr.src.ip6) <= 0)
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		goto update;
+  
+  	return false;
+  
+  update:
+++<<<<<<< HEAD
+ +	br->ip6_querier.addr.src.ip6 = *saddr;
+ +
+ +	/* update protected by general multicast_lock by caller */
+ +	rcu_assign_pointer(br->ip6_querier.port, port);
+++=======
++ 	br_multicast_update_querier(brmctx, &brmctx->ip6_querier, port_ifidx,
++ 				    saddr);
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  
+  	return true;
+  }
+@@@ -2203,11 -3115,11 +2299,15 @@@ br_ip4_multicast_query_received(struct 
+  				struct br_ip *saddr,
+  				unsigned long max_delay)
+  {
+++<<<<<<< HEAD
+ +	if (!br_ip4_multicast_select_querier(br, port, saddr->src.ip4))
+++=======
++ 	if (!br_ip4_multicast_select_querier(brmctx, pmctx, saddr))
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		return;
+  
+ -	br_multicast_update_query_timer(brmctx, query, max_delay);
+ -	br_ip4_multicast_mark_router(brmctx, pmctx);
+ +	br_multicast_update_query_timer(br, query, max_delay);
+ +	br_multicast_mark_router(br, port);
+  }
+  
+  #if IS_ENABLED(CONFIG_IPV6)
+@@@ -2218,11 -3130,11 +2318,15 @@@ br_ip6_multicast_query_received(struct 
+  				struct br_ip *saddr,
+  				unsigned long max_delay)
+  {
+++<<<<<<< HEAD
+ +	if (!br_ip6_multicast_select_querier(br, port, &saddr->src.ip6))
+++=======
++ 	if (!br_ip6_multicast_select_querier(brmctx, pmctx, saddr))
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  		return;
+  
+ -	br_multicast_update_query_timer(brmctx, query, max_delay);
+ -	br_ip6_multicast_mark_router(brmctx, pmctx);
+ +	br_multicast_update_query_timer(br, query, max_delay);
+ +	br_multicast_mark_router(br, port);
+  }
+  #endif
+  
+@@@ -2756,13 -3701,16 +2860,19 @@@ static void br_multicast_query_expired(
+  				       struct bridge_mcast_own_query *query,
+  				       struct bridge_mcast_querier *querier)
+  {
+ -	spin_lock(&brmctx->br->multicast_lock);
+ -	if (br_multicast_ctx_vlan_disabled(brmctx))
+ -		goto out;
+ -
+ -	if (query->startup_sent < brmctx->multicast_startup_query_count)
+ +	spin_lock(&br->multicast_lock);
+ +	if (query->startup_sent < br->multicast_startup_query_count)
+  		query->startup_sent++;
+  
+++<<<<<<< HEAD
+ +	RCU_INIT_POINTER(querier->port, NULL);
+ +	br_multicast_send_query(br, NULL, query);
+ +	spin_unlock(&br->multicast_lock);
+++=======
++ 	br_multicast_send_query(brmctx, NULL, query);
++ out:
++ 	spin_unlock(&brmctx->br->multicast_lock);
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  }
+  
+  static void br_ip4_multicast_query_expired(struct timer_list *t)
+@@@ -2794,6 -3746,55 +2904,58 @@@ static void br_multicast_gc_work(struc
+  	br_multicast_gc(&deleted_head);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void br_multicast_ctx_init(struct net_bridge *br,
++ 			   struct net_bridge_vlan *vlan,
++ 			   struct net_bridge_mcast *brmctx)
++ {
++ 	brmctx->br = br;
++ 	brmctx->vlan = vlan;
++ 	brmctx->multicast_router = MDB_RTR_TYPE_TEMP_QUERY;
++ 	brmctx->multicast_last_member_count = 2;
++ 	brmctx->multicast_startup_query_count = 2;
++ 
++ 	brmctx->multicast_last_member_interval = HZ;
++ 	brmctx->multicast_query_response_interval = 10 * HZ;
++ 	brmctx->multicast_startup_query_interval = 125 * HZ / 4;
++ 	brmctx->multicast_query_interval = 125 * HZ;
++ 	brmctx->multicast_querier_interval = 255 * HZ;
++ 	brmctx->multicast_membership_interval = 260 * HZ;
++ 
++ 	brmctx->ip4_other_query.delay_time = 0;
++ 	brmctx->ip4_querier.port_ifidx = 0;
++ 	seqcount_init(&brmctx->ip4_querier.seq);
++ 	brmctx->multicast_igmp_version = 2;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	brmctx->multicast_mld_version = 1;
++ 	brmctx->ip6_other_query.delay_time = 0;
++ 	brmctx->ip6_querier.port_ifidx = 0;
++ 	seqcount_init(&brmctx->ip6_querier.seq);
++ #endif
++ 
++ 	timer_setup(&brmctx->ip4_mc_router_timer,
++ 		    br_ip4_multicast_local_router_expired, 0);
++ 	timer_setup(&brmctx->ip4_other_query.timer,
++ 		    br_ip4_multicast_querier_expired, 0);
++ 	timer_setup(&brmctx->ip4_own_query.timer,
++ 		    br_ip4_multicast_query_expired, 0);
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	timer_setup(&brmctx->ip6_mc_router_timer,
++ 		    br_ip6_multicast_local_router_expired, 0);
++ 	timer_setup(&brmctx->ip6_other_query.timer,
++ 		    br_ip6_multicast_querier_expired, 0);
++ 	timer_setup(&brmctx->ip6_own_query.timer,
++ 		    br_ip6_multicast_query_expired, 0);
++ #endif
++ }
++ 
++ void br_multicast_ctx_deinit(struct net_bridge_mcast *brmctx)
++ {
++ 	__br_multicast_stop(brmctx);
++ }
++ 
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  void br_multicast_init(struct net_bridge *br)
+  {
+  	br->hash_max = BR_MULTICAST_DEFAULT_HASH_MAX;
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,70e2d9a7f105..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -83,7 -81,8 +83,12 @@@ struct bridge_mcast_other_query 
+  /* selected querier */
+  struct bridge_mcast_querier {
+  	struct br_ip addr;
+++<<<<<<< HEAD
+ +	struct net_bridge_port __rcu	*port;
+++=======
++ 	int port_ifidx;
++ 	seqcount_t seq;
+++>>>>>>> 67b746f94ff3 (net: bridge: mcast: make sure querier port/address updates are consistent)
+  };
+  
+  /* IGMP/MLD statistics */
+* Unmerged path net/bridge/br_multicast.c
+* Unmerged path net/bridge/br_private.h
