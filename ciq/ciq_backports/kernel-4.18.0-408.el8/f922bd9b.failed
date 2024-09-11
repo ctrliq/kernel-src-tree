@@ -1,0 +1,263 @@
+KVM: Move MMU notifier's mmu_lock acquisition into common helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit f922bd9bf33bd5a8c6694927f010f32127810fbf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/f922bd9b.failed
+
+Acquire and release mmu_lock in the __kvm_handle_hva_range() helper
+instead of requiring the caller to do the same.  This paves the way for
+future patches to take mmu_lock if and only if an overlapping memslot is
+found, without also having to introduce the on_lock() shenanigans used
+to manipulate the notifier count and sequence.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210402005658.3024832-8-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f922bd9bf33bd5a8c6694927f010f32127810fbf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,e768b862cbd9..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -482,6 -451,141 +482,144 @@@ static void kvm_mmu_notifier_invalidate
+  	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ typedef bool (*hva_handler_t)(struct kvm *kvm, struct kvm_gfn_range *range);
++ 
++ typedef void (*on_lock_fn_t)(struct kvm *kvm, unsigned long start,
++ 			     unsigned long end);
++ 
++ struct kvm_hva_range {
++ 	unsigned long start;
++ 	unsigned long end;
++ 	pte_t pte;
++ 	hva_handler_t handler;
++ 	on_lock_fn_t on_lock;
++ 	bool flush_on_ret;
++ 	bool may_block;
++ };
++ 
++ /*
++  * Use a dedicated stub instead of NULL to indicate that there is no callback
++  * function/handler.  The compiler technically can't guarantee that a real
++  * function will have a non-zero address, and so it will generate code to
++  * check for !NULL, whereas comparing against a stub will be elided at compile
++  * time (unless the compiler is getting long in the tooth, e.g. gcc 4.9).
++  */
++ static void kvm_null_fn(void)
++ {
++ 
++ }
++ #define IS_KVM_NULL_FN(fn) ((fn) == (void *)kvm_null_fn)
++ 
++ static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
++ 						  const struct kvm_hva_range *range)
++ {
++ 	struct kvm_gfn_range gfn_range;
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_memslots *slots;
++ 	bool ret = false;
++ 	int i, idx;
++ 
++ 	/* A null handler is allowed if and only if on_lock() is provided. */
++ 	if (WARN_ON_ONCE(IS_KVM_NULL_FN(range->on_lock) &&
++ 			 IS_KVM_NULL_FN(range->handler)))
++ 		return 0;
++ 
++ 	KVM_MMU_LOCK(kvm);
++ 
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	if (!IS_KVM_NULL_FN(range->on_lock)) {
++ 		range->on_lock(kvm, range->start, range->end);
++ 
++ 		if (IS_KVM_NULL_FN(range->handler))
++ 			goto out_unlock;
++ 	}
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(slot, slots) {
++ 			unsigned long hva_start, hva_end;
++ 
++ 			hva_start = max(range->start, slot->userspace_addr);
++ 			hva_end = min(range->end, slot->userspace_addr +
++ 						  (slot->npages << PAGE_SHIFT));
++ 			if (hva_start >= hva_end)
++ 				continue;
++ 
++ 			/*
++ 			 * To optimize for the likely case where the address
++ 			 * range is covered by zero or one memslots, don't
++ 			 * bother making these conditional (to avoid writes on
++ 			 * the second or later invocation of the handler).
++ 			 */
++ 			gfn_range.pte = range->pte;
++ 			gfn_range.may_block = range->may_block;
++ 
++ 			/*
++ 			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
++ 			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
++ 			 */
++ 			gfn_range.start = hva_to_gfn_memslot(hva_start, slot);
++ 			gfn_range.end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, slot);
++ 			gfn_range.slot = slot;
++ 
++ 			ret |= range->handler(kvm, &gfn_range);
++ 		}
++ 	}
++ 
++ 	if (range->flush_on_ret && (ret || kvm->tlbs_dirty))
++ 		kvm_flush_remote_tlbs(kvm);
++ 
++ out_unlock:
++ 	KVM_MMU_UNLOCK(kvm);
++ 
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 
++ 	/* The notifiers are averse to booleans. :-( */
++ 	return (int)ret;
++ }
++ 
++ static __always_inline int kvm_handle_hva_range(struct mmu_notifier *mn,
++ 						unsigned long start,
++ 						unsigned long end,
++ 						pte_t pte,
++ 						hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= pte,
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= true,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
++ 
++ static __always_inline int kvm_handle_hva_range_no_flush(struct mmu_notifier *mn,
++ 							 unsigned long start,
++ 							 unsigned long end,
++ 							 hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= __pte(0),
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= false,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
+++>>>>>>> f922bd9bf33b (KVM: Move MMU notifier's mmu_lock acquisition into common helper)
+  static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+  					struct mm_struct *mm,
+  					unsigned long address,
+@@@ -499,29 -602,12 +637,35 @@@
+  	 */
+  	WARN_ON_ONCE(!kvm->mmu_notifier_count);
+  
+ -	kvm_handle_hva_range(mn, address, address + 1, pte, kvm_set_spte_gfn);
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +
+ +	KVM_MMU_LOCK(kvm);
+ +
+ +	if (kvm_set_spte_hva(kvm, address, pte))
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+ +static void kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
+ +						    struct mm_struct *mm,
+ +						    unsigned long start,
+ +						    unsigned long end)
+ +{
+ +	struct kvm *kvm = mmu_notifier_to_kvm(mn);
+ +	int need_tlb_flush = 0, idx;
+ +
+ +	trace_kvm_unmap_hva_range(range->start, range->end);
+ +
+ +	idx = srcu_read_lock(&kvm->srcu);
+ +	KVM_MMU_LOCK(kvm);
+++=======
++ static void kvm_inc_notifier_count(struct kvm *kvm, unsigned long start,
++ 				   unsigned long end)
++ {
+++>>>>>>> f922bd9bf33b (KVM: Move MMU notifier's mmu_lock acquisition into common helper)
+  	/*
+  	 * The count increase must become visible at unlock time as no
+  	 * spte can be established without taking the mmu_lock and
+@@@ -546,23 -632,32 +690,48 @@@
+  		kvm->mmu_notifier_range_end =
+  			max(kvm->mmu_notifier_range_end, end);
+  	}
+++<<<<<<< HEAD
+ +	need_tlb_flush = kvm_unmap_hva_range(kvm, start, end, 0);
+ +	/* we've to flush the tlb before the pages can be freed */
+ +	if (need_tlb_flush || kvm->tlbs_dirty)
+ +		kvm_flush_remote_tlbs(kvm);
+ +
+ +	KVM_MMU_UNLOCK(kvm);
+ +	srcu_read_unlock(&kvm->srcu, idx);
+ +}
+ +
+ +static void kvm_mmu_notifier_invalidate_range_end(struct mmu_notifier *mn,
+ +						  struct mm_struct *mm,
+ +						  unsigned long start,
+ +						  unsigned long end)
+++=======
++ }
++ 
++ static int kvm_mmu_notifier_invalidate_range_start(struct mmu_notifier *mn,
++ 					const struct mmu_notifier_range *range)
+  {
+  	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range hva_range = {
++ 		.start		= range->start,
++ 		.end		= range->end,
++ 		.pte		= __pte(0),
++ 		.handler	= kvm_unmap_gfn_range,
++ 		.on_lock	= kvm_inc_notifier_count,
++ 		.flush_on_ret	= true,
++ 		.may_block	= mmu_notifier_range_blockable(range),
++ 	};
+  
+- 	KVM_MMU_LOCK(kvm);
++ 	trace_kvm_unmap_hva_range(range->start, range->end);
++ 
++ 	__kvm_handle_hva_range(kvm, &hva_range);
++ 
++ 	return 0;
++ }
++ 
++ static void kvm_dec_notifier_count(struct kvm *kvm, unsigned long start,
++ 				   unsigned long end)
+++>>>>>>> f922bd9bf33b (KVM: Move MMU notifier's mmu_lock acquisition into common helper)
++ {
+  	/*
+  	 * This sequence increase will notify the kvm page fault that
+  	 * the page that is going to be mapped in the spte could have
+* Unmerged path virt/kvm/kvm_main.c
