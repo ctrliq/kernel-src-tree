@@ -1,0 +1,101 @@
+xprtrdma: Connection becomes unstable after a reconnect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit a31b2f939219dd9bffdf01a45bd91f209f8cc369
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/a31b2f93.failed
+
+This is because xprt_request_get_cong() is allowing more than one
+RPC Call to be transmitted before the first Receive on the new
+connection. The first Receive fills the Receive Queue based on the
+server's credit grant. Before that Receive, there is only a single
+Receive WR posted because the client doesn't know the server's
+credit grant.
+
+Solution is to clear rq_cong on all outstanding rpc_rqsts when the
+the cwnd is reset. This is because an RPC/RDMA credit is good for
+one connection instance only.
+
+Fixes: 75891f502f5f ("SUNRPC: Support for congestion control ... ")
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit a31b2f939219dd9bffdf01a45bd91f209f8cc369)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/verbs.c
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index 078deea63c94,f4b136504e96..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -74,8 -75,11 +74,13 @@@
+   * internal functions
+   */
+  static void rpcrdma_sendctx_put_locked(struct rpcrdma_sendctx *sc);
+++<<<<<<< HEAD
+++=======
++ static void rpcrdma_reqs_reset(struct rpcrdma_xprt *r_xprt);
++ static void rpcrdma_reps_destroy(struct rpcrdma_buffer *buf);
+++>>>>>>> a31b2f939219 (xprtrdma: Connection becomes unstable after a reconnect)
+  static void rpcrdma_mrs_create(struct rpcrdma_xprt *r_xprt);
+  static void rpcrdma_mrs_destroy(struct rpcrdma_buffer *buf);
+ -static void rpcrdma_mr_free(struct rpcrdma_mr *mr);
+  static struct rpcrdma_regbuf *
+  rpcrdma_regbuf_alloc(size_t size, enum dma_data_direction direction,
+  		     gfp_t flags);
+@@@ -1034,10 -1044,29 +1040,35 @@@ out1
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool rpcrdma_rep_create(struct rpcrdma_xprt *r_xprt, bool temp)
+++=======
++ /**
++  * rpcrdma_reqs_reset - Reset all reqs owned by a transport
++  * @r_xprt: controlling transport instance
++  *
++  * ASSUMPTION: the rb_allreqs list is stable for the duration,
++  * and thus can be walked without holding rb_lock. Eg. the
++  * caller is holding the transport send lock to exclude
++  * device removal or disconnection.
++  */
++ static void rpcrdma_reqs_reset(struct rpcrdma_xprt *r_xprt)
++ {
++ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
++ 	struct rpcrdma_req *req;
++ 
++ 	list_for_each_entry(req, &buf->rb_allreqs, rl_all) {
++ 		/* Credits are valid only for one connection */
++ 		req->rl_slot.rq_cong = 0;
++ 	}
++ }
++ 
++ static struct rpcrdma_rep *rpcrdma_rep_create(struct rpcrdma_xprt *r_xprt,
++ 					      bool temp)
+++>>>>>>> a31b2f939219 (xprtrdma: Connection becomes unstable after a reconnect)
+  {
+ +	struct rpcrdma_create_data_internal *cdata = &r_xprt->rx_data;
+ +	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	struct rpcrdma_rep *rep;
+  
+  	rep = kzalloc(sizeof(*rep), GFP_KERNEL);
+diff --git a/net/sunrpc/xprtrdma/transport.c b/net/sunrpc/xprtrdma/transport.c
+index a4356391e7cd..1ffe8b11bf9d 100644
+--- a/net/sunrpc/xprtrdma/transport.c
++++ b/net/sunrpc/xprtrdma/transport.c
+@@ -450,8 +450,11 @@ void xprt_rdma_close(struct rpc_xprt *xprt)
+ 	/* Prepare @xprt for the next connection by reinitializing
+ 	 * its credit grant to one (see RFC 8166, Section 3.3.3).
+ 	 */
++	spin_lock(&xprt->transport_lock);
+ 	r_xprt->rx_buf.rb_credits = 1;
++	xprt->cong = 0;
+ 	xprt->cwnd = RPC_CWNDSHIFT;
++	spin_unlock(&xprt->transport_lock);
+ 
+ out:
+ 	++xprt->connect_cookie;
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
