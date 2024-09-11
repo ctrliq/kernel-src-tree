@@ -1,0 +1,678 @@
+mptcp: send out dedicated ADD_ADDR packet
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Geliang Tang <geliangtang@gmail.com>
+commit 84dfe3677a6f45b3d0dfdd564e55717a1a5e60cc
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/84dfe367.failed
+
+When ADD_ADDR suboption includes an IPv6 address, the size is 28 octets.
+It will not fit when other MPTCP suboptions are included in this packet,
+e.g. DSS. So here we send out an ADD_ADDR dedicated packet to carry only
+ADD_ADDR suboption, no other MPTCP suboptions.
+
+In mptcp_pm_announce_addr, we check whether this is an IPv6 ADD_ADDR.
+If it is, we set the flag MPTCP_ADD_ADDR_IPV6 to true. Then we call
+mptcp_pm_nl_add_addr_send_ack to sent out a new pure ACK packet.
+
+In mptcp_established_options_add_addr, we check whether this is a pure
+ACK packet for ADD_ADDR. If it is, we drop all other MPTCP suboptions
+in this packet, only put ADD_ADDR suboption in it.
+
+	Suggested-by: Paolo Abeni <pabeni@redhat.com>
+	Acked-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Geliang Tang <geliangtang@gmail.com>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 84dfe3677a6f45b3d0dfdd564e55717a1a5e60cc)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/options.c
+#	net/mptcp/pm.c
+#	net/mptcp/pm_netlink.c
+#	net/mptcp/protocol.c
+#	net/mptcp/protocol.h
+diff --cc net/mptcp/options.c
+index cfc2e1d06a18,d7afffcc87c1..000000000000
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@@ -241,7 -242,9 +241,13 @@@ static void mptcp_parse_option(const st
+  
+  		mp_opt->add_addr = 1;
+  		mp_opt->addr_id = *ptr++;
+++<<<<<<< HEAD
+ +		pr_debug("ADD_ADDR: id=%d", mp_opt->addr_id);
+++=======
++ 		pr_debug("ADD_ADDR%s: id=%d, echo=%d",
++ 			 (mp_opt->family == MPTCP_ADDR_IPVERSION_6) ? "6" : "",
++ 			 mp_opt->addr_id, mp_opt->echo);
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  		if (mp_opt->family == MPTCP_ADDR_IPVERSION_4) {
+  			memcpy((u8 *)&mp_opt->addr.s_addr, (u8 *)ptr, 4);
+  			ptr += 4;
+@@@ -579,14 -582,25 +585,24 @@@ static bool mptcp_established_options_a
+  {
+  	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+  	struct mptcp_sock *msk = mptcp_sk(subflow->conn);
++ 	bool drop_other_suboptions = false;
++ 	unsigned int opt_size = *size;
+  	struct mptcp_addr_info saddr;
+ -	bool echo;
+  	int len;
+  
++ 	if (mptcp_pm_should_add_signal_ipv6(msk) &&
++ 	    skb && skb_is_tcp_pure_ack(skb)) {
++ 		pr_debug("drop other suboptions");
++ 		opts->suboptions = 0;
++ 		remaining += opt_size;
++ 		drop_other_suboptions = true;
++ 	}
++ 
+  	if (!mptcp_pm_should_add_signal(msk) ||
+ -	    !(mptcp_pm_add_addr_signal(msk, remaining, &saddr, &echo)))
+ +	    !(mptcp_pm_add_addr_signal(msk, remaining, &saddr)))
+  		return false;
+  
+ -	len = mptcp_add_addr_len(saddr.family, echo);
+ +	len = mptcp_add_addr_len(saddr.family);
+  	if (remaining < len)
+  		return false;
+  
+@@@ -713,10 -773,18 +731,15 @@@ static bool check_fully_established(str
+  		goto fully_established;
+  	}
+  
++ 	if (mp_opt->add_addr) {
++ 		WRITE_ONCE(msk->fully_established, true);
++ 		return true;
++ 	}
++ 
+  	/* If the first established packet does not contain MP_CAPABLE + data
+ -	 * then fallback to TCP. Fallback scenarios requires a reset for
+ -	 * MP_JOIN subflows.
+ +	 * then fallback to TCP
+  	 */
+  	if (!mp_opt->mp_capable) {
+ -		if (subflow->mp_join)
+ -			goto reset;
+  		subflow->mp_capable = 0;
+  		pr_fallback(msk);
+  		__mptcp_do_fallback(msk);
+diff --cc net/mptcp/pm.c
+index a78fc80f9b51,75c5040e8d5d..000000000000
+--- a/net/mptcp/pm.c
++++ b/net/mptcp/pm.c
+@@@ -20,7 -19,14 +20,16 @@@ int mptcp_pm_announce_addr(struct mptcp
+  	pr_debug("msk=%p, local_id=%d", msk, addr->id);
+  
+  	msk->pm.local = *addr;
+++<<<<<<< HEAD
+ +	WRITE_ONCE(msk->pm.add_addr_signal, true);
+++=======
++ 	add_addr |= BIT(MPTCP_ADD_ADDR_SIGNAL);
++ 	if (echo)
++ 		add_addr |= BIT(MPTCP_ADD_ADDR_ECHO);
++ 	if (addr->family == AF_INET6)
++ 		add_addr |= BIT(MPTCP_ADD_ADDR_IPV6);
++ 	WRITE_ONCE(msk->pm.add_addr_signal, add_addr);
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  	return 0;
+  }
+  
+@@@ -139,20 -153,38 +148,51 @@@ void mptcp_pm_add_addr_received(struct 
+  	pr_debug("msk=%p remote_id=%d accept=%d", msk, addr->id,
+  		 READ_ONCE(pm->accept_addr));
+  
+ +	/* avoid acquiring the lock if there is no room for fouther addresses */
+ +	if (!READ_ONCE(pm->accept_addr))
+ +		return;
+ +
+  	spin_lock_bh(&pm->lock);
+  
+++<<<<<<< HEAD
+ +	/* be sure there is something to signal re-checking under PM lock */
+ +	if (READ_ONCE(pm->accept_addr) &&
+ +	    mptcp_pm_schedule_work(msk, MPTCP_PM_ADD_ADDR_RECEIVED))
+++=======
++ 	if (!READ_ONCE(pm->accept_addr)) {
++ 		mptcp_pm_announce_addr(msk, addr, true);
++ 		mptcp_pm_add_addr_send_ack(msk);
++ 	} else if (mptcp_pm_schedule_work(msk, MPTCP_PM_ADD_ADDR_RECEIVED)) {
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  		pm->remote = *addr;
++ 	}
++ 
++ 	spin_unlock_bh(&pm->lock);
++ }
++ 
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_add_addr_send_ack(struct mptcp_sock *msk)
++ {
++ 	if (!mptcp_pm_should_add_signal_ipv6(msk))
++ 		return;
+  
++ 	mptcp_pm_schedule_work(msk, MPTCP_PM_ADD_ADDR_SEND_ACK);
++ }
++ 
++ void mptcp_pm_rm_addr_received(struct mptcp_sock *msk, u8 rm_id)
++ {
++ 	struct mptcp_pm_data *pm = &msk->pm;
++ 
++ 	pr_debug("msk=%p remote_id=%d", msk, rm_id);
++ 
++ 	spin_lock_bh(&pm->lock);
++ 	mptcp_pm_schedule_work(msk, MPTCP_PM_RM_ADDR_RECEIVED);
++ 	pm->rm_id = rm_id;
+  	spin_unlock_bh(&pm->lock);
+  }
+  
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  /* path manager helpers */
+  
+  bool mptcp_pm_add_addr_signal(struct mptcp_sock *msk, unsigned int remaining,
+diff --cc net/mptcp/pm_netlink.c
+index 6f3bf9fdbbbc,03f2c28f11f5..000000000000
+--- a/net/mptcp/pm_netlink.c
++++ b/net/mptcp/pm_netlink.c
+@@@ -179,11 -187,130 +179,133 @@@ static void check_work_pending(struct m
+  		WRITE_ONCE(msk->pm.work_pending, false);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct mptcp_pm_add_entry *
++ lookup_anno_list_by_saddr(struct mptcp_sock *msk,
++ 			  struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 
++ 	list_for_each_entry(entry, &msk->pm.anno_list, list) {
++ 		if (addresses_equal(&entry->addr, addr, false))
++ 			return entry;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void mptcp_pm_add_timer(struct timer_list *timer)
++ {
++ 	struct mptcp_pm_add_entry *entry = from_timer(entry, timer, add_timer);
++ 	struct mptcp_sock *msk = entry->sock;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	if (!msk)
++ 		return;
++ 
++ 	if (inet_sk_state_load(sk) == TCP_CLOSE)
++ 		return;
++ 
++ 	if (!entry->addr.id)
++ 		return;
++ 
++ 	if (mptcp_pm_should_add_signal(msk)) {
++ 		sk_reset_timer(sk, timer, jiffies + TCP_RTO_MAX / 8);
++ 		goto out;
++ 	}
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	if (!mptcp_pm_should_add_signal(msk)) {
++ 		pr_debug("retransmit ADD_ADDR id=%d", entry->addr.id);
++ 		mptcp_pm_announce_addr(msk, &entry->addr, false);
++ 		mptcp_pm_add_addr_send_ack(msk);
++ 		entry->retrans_times++;
++ 	}
++ 
++ 	if (entry->retrans_times < ADD_ADDR_RETRANS_MAX)
++ 		sk_reset_timer(sk, timer,
++ 			       jiffies + mptcp_get_add_addr_timeout(sock_net(sk)));
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ out:
++ 	__sock_put(sk);
++ }
++ 
++ struct mptcp_pm_add_entry *
++ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
++ 		       struct mptcp_addr_info *addr)
++ {
++ 	struct mptcp_pm_add_entry *entry;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	entry = lookup_anno_list_by_saddr(msk, addr);
++ 	if (entry)
++ 		entry->retrans_times = ADD_ADDR_RETRANS_MAX;
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	if (entry)
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 
++ 	return entry;
++ }
++ 
++ static bool mptcp_pm_alloc_anno_list(struct mptcp_sock *msk,
++ 				     struct mptcp_pm_addr_entry *entry)
++ {
++ 	struct mptcp_pm_add_entry *add_entry = NULL;
++ 	struct sock *sk = (struct sock *)msk;
++ 	struct net *net = sock_net(sk);
++ 
++ 	if (lookup_anno_list_by_saddr(msk, &entry->addr))
++ 		return false;
++ 
++ 	add_entry = kmalloc(sizeof(*add_entry), GFP_ATOMIC);
++ 	if (!add_entry)
++ 		return false;
++ 
++ 	list_add(&add_entry->list, &msk->pm.anno_list);
++ 
++ 	add_entry->addr = entry->addr;
++ 	add_entry->sock = msk;
++ 	add_entry->retrans_times = 0;
++ 
++ 	timer_setup(&add_entry->add_timer, mptcp_pm_add_timer, 0);
++ 	sk_reset_timer(sk, &add_entry->add_timer,
++ 		       jiffies + mptcp_get_add_addr_timeout(net));
++ 
++ 	return true;
++ }
++ 
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_add_entry *entry, *tmp;
++ 	struct sock *sk = (struct sock *)msk;
++ 	LIST_HEAD(free_list);
++ 
++ 	pr_debug("msk=%p", msk);
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 	list_splice_init(&msk->pm.anno_list, &free_list);
++ 	spin_unlock_bh(&msk->pm.lock);
++ 
++ 	list_for_each_entry_safe(entry, tmp, &free_list, list) {
++ 		sk_stop_timer_sync(sk, &entry->add_timer);
++ 		kfree(entry);
++ 	}
++ }
++ 
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  static void mptcp_pm_create_subflow_or_signal_addr(struct mptcp_sock *msk)
+  {
+ -	struct mptcp_addr_info remote = { 0 };
+  	struct sock *sk = (struct sock *)msk;
+  	struct mptcp_pm_addr_entry *local;
+ +	struct mptcp_addr_info remote;
+  	struct pm_nl_pernet *pernet;
+  
+  	pernet = net_generic(sock_net((struct sock *)msk), pm_nl_pernet_id);
+@@@ -199,8 -326,11 +321,16 @@@
+  					      msk->pm.add_addr_signaled);
+  
+  		if (local) {
+++<<<<<<< HEAD
+ +			msk->pm.add_addr_signaled++;
+ +			mptcp_pm_announce_addr(msk, &local->addr);
+++=======
++ 			if (mptcp_pm_alloc_anno_list(msk, local)) {
++ 				msk->pm.add_addr_signaled++;
++ 				mptcp_pm_announce_addr(msk, &local->addr, false);
++ 				mptcp_pm_nl_add_addr_send_ack(msk);
++ 			}
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  		} else {
+  			/* pick failed, avoid fourther attempts later */
+  			msk->pm.local_addr_used = msk->pm.add_addr_signal_max;
+@@@ -267,8 -396,106 +397,109 @@@ void mptcp_pm_nl_add_addr_received(stru
+  	local.family = remote.family;
+  
+  	spin_unlock_bh(&msk->pm.lock);
+ -	__mptcp_subflow_connect((struct sock *)msk, &local, &remote);
+ +	__mptcp_subflow_connect((struct sock *)msk, 0, &local, &remote);
+  	spin_lock_bh(&msk->pm.lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	mptcp_pm_announce_addr(msk, &remote, true);
++ 	mptcp_pm_nl_add_addr_send_ack(msk);
++ }
++ 
++ void mptcp_pm_nl_add_addr_send_ack(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	if (!mptcp_pm_should_add_signal_ipv6(msk))
++ 		return;
++ 
++ 	__mptcp_flush_join_list(msk);
++ 	subflow = list_first_entry_or_null(&msk->conn_list, typeof(*subflow), node);
++ 	if (subflow) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 		u8 add_addr;
++ 
++ 		spin_unlock_bh(&msk->pm.lock);
++ 		pr_debug("send ack for add_addr6");
++ 		lock_sock(ssk);
++ 		tcp_send_ack(ssk);
++ 		release_sock(ssk);
++ 		spin_lock_bh(&msk->pm.lock);
++ 
++ 		add_addr = READ_ONCE(msk->pm.add_addr_signal);
++ 		add_addr &= ~BIT(MPTCP_ADD_ADDR_IPV6);
++ 		WRITE_ONCE(msk->pm.add_addr_signal, add_addr);
++ 	}
++ }
++ 
++ void mptcp_pm_nl_rm_addr_received(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow, *tmp;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	pr_debug("address rm_id %d", msk->pm.rm_id);
++ 
++ 	if (!msk->pm.rm_id)
++ 		return;
++ 
++ 	if (list_empty(&msk->conn_list))
++ 		return;
++ 
++ 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 		int how = RCV_SHUTDOWN | SEND_SHUTDOWN;
++ 
++ 		if (msk->pm.rm_id != subflow->remote_id)
++ 			continue;
++ 
++ 		spin_unlock_bh(&msk->pm.lock);
++ 		mptcp_subflow_shutdown(sk, ssk, how);
++ 		__mptcp_close_ssk(sk, ssk, subflow);
++ 		spin_lock_bh(&msk->pm.lock);
++ 
++ 		msk->pm.add_addr_accepted--;
++ 		msk->pm.subflows--;
++ 		WRITE_ONCE(msk->pm.accept_addr, true);
++ 
++ 		__MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RMADDR);
++ 
++ 		break;
++ 	}
++ }
++ 
++ void mptcp_pm_nl_rm_subflow_received(struct mptcp_sock *msk, u8 rm_id)
++ {
++ 	struct mptcp_subflow_context *subflow, *tmp;
++ 	struct sock *sk = (struct sock *)msk;
++ 
++ 	pr_debug("subflow rm_id %d", rm_id);
++ 
++ 	if (!rm_id)
++ 		return;
++ 
++ 	if (list_empty(&msk->conn_list))
++ 		return;
++ 
++ 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 		int how = RCV_SHUTDOWN | SEND_SHUTDOWN;
++ 
++ 		if (rm_id != subflow->local_id)
++ 			continue;
++ 
++ 		spin_unlock_bh(&msk->pm.lock);
++ 		mptcp_subflow_shutdown(sk, ssk, how);
++ 		__mptcp_close_ssk(sk, ssk, subflow);
++ 		spin_lock_bh(&msk->pm.lock);
++ 
++ 		msk->pm.local_addr_used--;
++ 		msk->pm.subflows--;
++ 
++ 		__MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RMSUBFLOW);
++ 
++ 		break;
++ 	}
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  }
+  
+  static bool address_use_port(struct mptcp_pm_addr_entry *entry)
+diff --cc net/mptcp/protocol.c
+index 75ee5f9fd199,8f303de7f500..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -472,10 -686,11 +472,10 @@@ void mptcp_data_ready(struct sock *sk, 
+  		move_skbs_to_msk(msk, ssk);
+  	}
+  wake:
+ -	if (wake)
+ -		sk->sk_data_ready(sk);
+ +	sk->sk_data_ready(sk);
+  }
+  
+- static void __mptcp_flush_join_list(struct mptcp_sock *msk)
++ void __mptcp_flush_join_list(struct mptcp_sock *msk)
+  {
+  	if (likely(list_empty(&msk->join_list)))
+  		return;
+@@@ -1425,6 -1797,70 +1425,73 @@@ static unsigned int mptcp_sync_mss(stru
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void pm_work(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_pm_data *pm = &msk->pm;
++ 
++ 	spin_lock_bh(&msk->pm.lock);
++ 
++ 	pr_debug("msk=%p status=%x", msk, pm->status);
++ 	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_RECEIVED);
++ 		mptcp_pm_nl_add_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_ADD_ADDR_SEND_ACK)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ADD_ADDR_SEND_ACK);
++ 		mptcp_pm_nl_add_addr_send_ack(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_RM_ADDR_RECEIVED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_RM_ADDR_RECEIVED);
++ 		mptcp_pm_nl_rm_addr_received(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_ESTABLISHED);
++ 		mptcp_pm_nl_fully_established(msk);
++ 	}
++ 	if (pm->status & BIT(MPTCP_PM_SUBFLOW_ESTABLISHED)) {
++ 		pm->status &= ~BIT(MPTCP_PM_SUBFLOW_ESTABLISHED);
++ 		mptcp_pm_nl_subflow_established(msk);
++ 	}
++ 
++ 	spin_unlock_bh(&msk->pm.lock);
++ }
++ 
++ static void __mptcp_close_subflow(struct mptcp_sock *msk)
++ {
++ 	struct mptcp_subflow_context *subflow, *tmp;
++ 
++ 	list_for_each_entry_safe(subflow, tmp, &msk->conn_list, node) {
++ 		struct sock *ssk = mptcp_subflow_tcp_sock(subflow);
++ 
++ 		if (inet_sk_state_load(ssk) != TCP_CLOSE)
++ 			continue;
++ 
++ 		__mptcp_close_ssk((struct sock *)msk, ssk, subflow);
++ 	}
++ }
++ 
++ static bool mptcp_check_close_timeout(const struct sock *sk)
++ {
++ 	s32 delta = tcp_jiffies32 - inet_csk(sk)->icsk_mtup.probe_timestamp;
++ 	struct mptcp_subflow_context *subflow;
++ 
++ 	if (delta >= TCP_TIMEWAIT_LEN)
++ 		return true;
++ 
++ 	/* if all subflows are in closed status don't bother with additional
++ 	 * timeout
++ 	 */
++ 	mptcp_for_each_subflow(mptcp_sk(sk), subflow) {
++ 		if (inet_sk_state_load(mptcp_subflow_tcp_sock(subflow)) !=
++ 		    TCP_CLOSE)
++ 			return false;
++ 	}
++ 	return true;
++ }
++ 
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  static void mptcp_worker(struct work_struct *work)
+  {
+  	struct mptcp_sock *msk = container_of(work, struct mptcp_sock, work);
+diff --cc net/mptcp/protocol.h
+index a60ec79c4e54,4d6dd4adaaaf..000000000000
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@@ -157,10 -160,18 +157,24 @@@ struct mptcp_addr_info 
+  
+  enum mptcp_pm_status {
+  	MPTCP_PM_ADD_ADDR_RECEIVED,
+++<<<<<<< HEAD
+++=======
++ 	MPTCP_PM_ADD_ADDR_SEND_ACK,
++ 	MPTCP_PM_RM_ADDR_RECEIVED,
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  	MPTCP_PM_ESTABLISHED,
+  	MPTCP_PM_SUBFLOW_ESTABLISHED,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ enum mptcp_add_addr_status {
++ 	MPTCP_ADD_ADDR_SIGNAL,
++ 	MPTCP_ADD_ADDR_ECHO,
++ 	MPTCP_ADD_ADDR_IPV6,
++ };
++ 
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  struct mptcp_pm_data {
+  	struct mptcp_addr_info local;
+  	struct mptcp_addr_info remote;
+@@@ -402,13 -467,32 +416,30 @@@ bool mptcp_finish_join(struct sock *sk)
+  void mptcp_data_acked(struct sock *sk);
+  void mptcp_subflow_eof(struct sock *sk);
+  bool mptcp_update_rcv_data_fin(struct mptcp_sock *msk, u64 data_fin_seq, bool use_64bit);
+++<<<<<<< HEAD
+++=======
++ void __mptcp_flush_join_list(struct mptcp_sock *msk);
++ static inline bool mptcp_data_fin_enabled(const struct mptcp_sock *msk)
++ {
++ 	return READ_ONCE(msk->snd_data_fin_enable) &&
++ 	       READ_ONCE(msk->write_seq) == READ_ONCE(msk->snd_nxt);
++ }
++ 
++ void mptcp_destroy_common(struct mptcp_sock *msk);
++ 
++ void __init mptcp_token_init(void);
++ static inline void mptcp_token_init_request(struct request_sock *req)
++ {
++ 	mptcp_subflow_rsk(req)->token_node.pprev = NULL;
++ }
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  
+  int mptcp_token_new_request(struct request_sock *req);
+ -void mptcp_token_destroy_request(struct request_sock *req);
+ +void mptcp_token_destroy_request(u32 token);
+  int mptcp_token_new_connect(struct sock *sk);
+ -void mptcp_token_accept(struct mptcp_subflow_request_sock *r,
+ -			struct mptcp_sock *msk);
+ -bool mptcp_token_exists(u32 token);
+ +int mptcp_token_new_accept(u32 token, struct sock *conn);
+  struct mptcp_sock *mptcp_token_get_sock(u32 token);
+ -struct mptcp_sock *mptcp_token_iter_next(const struct net *net, long *s_slot,
+ -					 long *s_num);
+ -void mptcp_token_destroy(struct mptcp_sock *msk);
+ +void mptcp_token_destroy(u32 token);
+  
+  void mptcp_crypto_key_sha(u64 key, u32 *token, u64 *idsn);
+  
+@@@ -426,22 -509,45 +457,50 @@@ void mptcp_pm_subflow_established(struc
+  void mptcp_pm_subflow_closed(struct mptcp_sock *msk, u8 id);
+  void mptcp_pm_add_addr_received(struct mptcp_sock *msk,
+  				const struct mptcp_addr_info *addr);
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_add_addr_send_ack(struct mptcp_sock *msk);
++ void mptcp_pm_rm_addr_received(struct mptcp_sock *msk, u8 rm_id);
++ void mptcp_pm_free_anno_list(struct mptcp_sock *msk);
++ struct mptcp_pm_add_entry *
++ mptcp_pm_del_add_timer(struct mptcp_sock *msk,
++ 		       struct mptcp_addr_info *addr);
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  
+  int mptcp_pm_announce_addr(struct mptcp_sock *msk,
+ -			   const struct mptcp_addr_info *addr,
+ -			   bool echo);
+ +			   const struct mptcp_addr_info *addr);
+  int mptcp_pm_remove_addr(struct mptcp_sock *msk, u8 local_id);
+ -int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 local_id);
+ +int mptcp_pm_remove_subflow(struct mptcp_sock *msk, u8 remote_id);
+  
+  static inline bool mptcp_pm_should_add_signal(struct mptcp_sock *msk)
+  {
+ -	return READ_ONCE(msk->pm.add_addr_signal) & BIT(MPTCP_ADD_ADDR_SIGNAL);
+ +	return READ_ONCE(msk->pm.add_addr_signal);
+  }
+  
+++<<<<<<< HEAD
+ +static inline unsigned int mptcp_add_addr_len(int family)
+++=======
++ static inline bool mptcp_pm_should_add_signal_echo(struct mptcp_sock *msk)
++ {
++ 	return READ_ONCE(msk->pm.add_addr_signal) & BIT(MPTCP_ADD_ADDR_ECHO);
++ }
++ 
++ static inline bool mptcp_pm_should_add_signal_ipv6(struct mptcp_sock *msk)
++ {
++ 	return READ_ONCE(msk->pm.add_addr_signal) & BIT(MPTCP_ADD_ADDR_IPV6);
++ }
++ 
++ static inline bool mptcp_pm_should_rm_signal(struct mptcp_sock *msk)
++ {
++ 	return READ_ONCE(msk->pm.rm_addr_signal);
++ }
++ 
++ static inline unsigned int mptcp_add_addr_len(int family, bool echo)
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  {
+  	if (family == AF_INET)
+ -		return echo ? TCPOLEN_MPTCP_ADD_ADDR_BASE
+ -			    : TCPOLEN_MPTCP_ADD_ADDR;
+ -	return echo ? TCPOLEN_MPTCP_ADD_ADDR6_BASE : TCPOLEN_MPTCP_ADD_ADDR6;
+ +		return TCPOLEN_MPTCP_ADD_ADDR;
+ +	return TCPOLEN_MPTCP_ADD_ADDR6;
+  }
+  
+  bool mptcp_pm_add_addr_signal(struct mptcp_sock *msk, unsigned int remaining,
+@@@ -453,6 -561,9 +512,12 @@@ void mptcp_pm_nl_data_init(struct mptcp
+  void mptcp_pm_nl_fully_established(struct mptcp_sock *msk);
+  void mptcp_pm_nl_subflow_established(struct mptcp_sock *msk);
+  void mptcp_pm_nl_add_addr_received(struct mptcp_sock *msk);
+++<<<<<<< HEAD
+++=======
++ void mptcp_pm_nl_add_addr_send_ack(struct mptcp_sock *msk);
++ void mptcp_pm_nl_rm_addr_received(struct mptcp_sock *msk);
++ void mptcp_pm_nl_rm_subflow_received(struct mptcp_sock *msk, u8 rm_id);
+++>>>>>>> 84dfe3677a6f (mptcp: send out dedicated ADD_ADDR packet)
+  int mptcp_pm_nl_get_local_id(struct mptcp_sock *msk, struct sock_common *skc);
+  
+  static inline struct mptcp_ext *mptcp_get_ext(struct sk_buff *skb)
+* Unmerged path net/mptcp/options.c
+* Unmerged path net/mptcp/pm.c
+* Unmerged path net/mptcp/pm_netlink.c
+* Unmerged path net/mptcp/protocol.c
+* Unmerged path net/mptcp/protocol.h
