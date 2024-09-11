@@ -114,6 +114,7 @@ struct se_session *target_setup_session(struct se_portal_group *,
 		const char *, void *,
 		int (*callback)(struct se_portal_group *,
 				struct se_session *, void *));
+void target_remove_session(struct se_session *);
 
 struct se_session *transport_init_session(enum target_prot_op);
 int transport_alloc_session_tags(struct se_session *, unsigned int,
