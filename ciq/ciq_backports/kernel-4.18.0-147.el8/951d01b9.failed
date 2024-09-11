@@ -1,0 +1,115 @@
+IB/mlx5: Fix how advise_mr() launches async work
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 951d01b96f174ded6180e7e4e14929ef22e7da7e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/951d01b9.failed
+
+Work must hold a kref on the ib_device otherwise the dev pointer can
+become free before the work runs. This can happen because the work is
+being pushed onto the system work queue which is not flushed during driver
+unregister.
+
+Remove the bogus use of 'reg_state':
+ - While in uverbs the reg_state is guaranteed to always be
+   REGISTERED
+ - Testing reg_state with no locking is bogus. Use ib_device_try_get()
+   to get back into a region that prevents unregistration.
+
+For now continue with a flow that is similar to the existing code.
+
+Fixes: 813e90b1aeaa ("IB/mlx5: Add advise_mr() support")
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Moni Shoua <monis@mellanox.com>
+(cherry picked from commit 951d01b96f174ded6180e7e4e14929ef22e7da7e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/odp.c
+diff --cc drivers/infiniband/hw/mlx5/odp.c
+index 4e6f586dbb7c,4ee32964e1dd..000000000000
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@@ -1265,3 -1562,75 +1265,78 @@@ int mlx5_ib_odp_init(void
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct prefetch_mr_work {
++ 	struct work_struct work;
++ 	struct mlx5_ib_dev *dev;
++ 	u32 pf_flags;
++ 	u32 num_sge;
++ 	struct ib_sge sg_list[0];
++ };
++ 
++ static int mlx5_ib_prefetch_sg_list(struct mlx5_ib_dev *dev, u32 pf_flags,
++ 				    struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < num_sge; ++i) {
++ 		struct ib_sge *sg = &sg_list[i];
++ 		int bytes_committed = 0;
++ 		int ret;
++ 
++ 		ret = pagefault_single_data_segment(dev, sg->lkey, sg->addr,
++ 						    sg->length,
++ 						    &bytes_committed, NULL,
++ 						    pf_flags);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 	return 0;
++ }
++ 
++ static void mlx5_ib_prefetch_mr_work(struct work_struct *work)
++ {
++ 	struct prefetch_mr_work *w =
++ 		container_of(work, struct prefetch_mr_work, work);
++ 
++ 	if (ib_device_try_get(&w->dev->ib_dev)) {
++ 		mlx5_ib_prefetch_sg_list(w->dev, w->pf_flags, w->sg_list,
++ 					 w->num_sge);
++ 		ib_device_put(&w->dev->ib_dev);
++ 	}
++ 	put_device(&w->dev->ib_dev.dev);
++ 	kfree(w);
++ }
++ 
++ int mlx5_ib_advise_mr_prefetch(struct ib_pd *pd,
++ 			       enum ib_uverbs_advise_mr_advice advice,
++ 			       u32 flags, struct ib_sge *sg_list, u32 num_sge)
++ {
++ 	struct mlx5_ib_dev *dev = to_mdev(pd->device);
++ 	u32 pf_flags = MLX5_PF_FLAGS_PREFETCH;
++ 	struct prefetch_mr_work *work;
++ 
++ 	if (advice == IB_UVERBS_ADVISE_MR_ADVICE_PREFETCH)
++ 		pf_flags |= MLX5_PF_FLAGS_DOWNGRADE;
++ 
++ 	if (flags & IB_UVERBS_ADVISE_MR_FLAG_FLUSH)
++ 		return mlx5_ib_prefetch_sg_list(dev, pf_flags, sg_list,
++ 						num_sge);
++ 
++ 	work = kvzalloc(struct_size(work, sg_list, num_sge), GFP_KERNEL);
++ 	if (!work)
++ 		return -ENOMEM;
++ 
++ 	memcpy(work->sg_list, sg_list, num_sge * sizeof(struct ib_sge));
++ 
++ 	get_device(&dev->ib_dev.dev);
++ 	work->dev = dev;
++ 	work->pf_flags = pf_flags;
++ 	work->num_sge = num_sge;
++ 
++ 	INIT_WORK(&work->work, mlx5_ib_prefetch_mr_work);
++ 	schedule_work(&work->work);
++ 	return 0;
++ }
+++>>>>>>> 951d01b96f17 (IB/mlx5: Fix how advise_mr() launches async work)
+* Unmerged path drivers/infiniband/hw/mlx5/odp.c
