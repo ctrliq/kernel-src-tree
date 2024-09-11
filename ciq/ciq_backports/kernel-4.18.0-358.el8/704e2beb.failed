@@ -1,0 +1,108 @@
+selftests/bpf: Test ringbuf mmap read-only and read-write restrictions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Andrii Nakryiko <andrii@kernel.org>
+commit 704e2beba23c45eaa056b1c03b5e1fb221e03f80
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/704e2beb.failed
+
+Extend ringbuf selftest to validate read/write and read-only restrictions on
+memory mapping consumer/producer/data pages. Ensure no "escalations" from
+PROT_READ to PROT_WRITE/PROT_EXEC is allowed. And test that mremap() fails to
+expand mmap()'ed area.
+
+	Signed-off-by: Thadeu Lima de Souza Cascardo <cascardo@canonical.com>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+Link: https://lore.kernel.org/bpf/20210514180726.843157-1-andrii@kernel.org
+(cherry picked from commit 704e2beba23c45eaa056b1c03b5e1fb221e03f80)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/bpf/prog_tests/ringbuf.c
+diff --cc tools/testing/selftests/bpf/prog_tests/ringbuf.c
+index fddbc5db5d6a,f9a8ae331963..000000000000
+--- a/tools/testing/selftests/bpf/prog_tests/ringbuf.c
++++ b/tools/testing/selftests/bpf/prog_tests/ringbuf.c
+@@@ -86,12 -86,68 +86,75 @@@ void test_ringbuf(void
+  	const size_t rec_sz = BPF_RINGBUF_HDR_SZ + sizeof(struct sample);
+  	pthread_t thread;
+  	long bg_ret = -1;
+++<<<<<<< HEAD
+ +	int err, cnt;
+++=======
++ 	int err, cnt, rb_fd;
++ 	int page_size = getpagesize();
++ 	void *mmap_ptr, *tmp_ptr;
+++>>>>>>> 704e2beba23c (selftests/bpf: Test ringbuf mmap read-only and read-write restrictions)
+  
+ -	skel = test_ringbuf__open();
+ -	if (CHECK(!skel, "skel_open", "skeleton open failed\n"))
+ +	skel = test_ringbuf__open_and_load();
+ +	if (CHECK(!skel, "skel_open_load", "skeleton open&load failed\n"))
+  		return;
+  
+++<<<<<<< HEAD
+++=======
++ 	err = bpf_map__set_max_entries(skel->maps.ringbuf, page_size);
++ 	if (CHECK(err != 0, "bpf_map__set_max_entries", "bpf_map__set_max_entries failed\n"))
++ 		goto cleanup;
++ 
++ 	err = test_ringbuf__load(skel);
++ 	if (CHECK(err != 0, "skel_load", "skeleton load failed\n"))
++ 		goto cleanup;
++ 
++ 	rb_fd = bpf_map__fd(skel->maps.ringbuf);
++ 	/* good read/write cons_pos */
++ 	mmap_ptr = mmap(NULL, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, rb_fd, 0);
++ 	ASSERT_OK_PTR(mmap_ptr, "rw_cons_pos");
++ 	tmp_ptr = mremap(mmap_ptr, page_size, 2 * page_size, MREMAP_MAYMOVE);
++ 	if (!ASSERT_ERR_PTR(tmp_ptr, "rw_extend"))
++ 		goto cleanup;
++ 	ASSERT_ERR(mprotect(mmap_ptr, page_size, PROT_EXEC), "exec_cons_pos_protect");
++ 	ASSERT_OK(munmap(mmap_ptr, page_size), "unmap_rw");
++ 
++ 	/* bad writeable prod_pos */
++ 	mmap_ptr = mmap(NULL, page_size, PROT_WRITE, MAP_SHARED, rb_fd, page_size);
++ 	err = -errno;
++ 	ASSERT_ERR_PTR(mmap_ptr, "wr_prod_pos");
++ 	ASSERT_EQ(err, -EPERM, "wr_prod_pos_err");
++ 
++ 	/* bad writeable data pages */
++ 	mmap_ptr = mmap(NULL, page_size, PROT_WRITE, MAP_SHARED, rb_fd, 2 * page_size);
++ 	err = -errno;
++ 	ASSERT_ERR_PTR(mmap_ptr, "wr_data_page_one");
++ 	ASSERT_EQ(err, -EPERM, "wr_data_page_one_err");
++ 	mmap_ptr = mmap(NULL, page_size, PROT_WRITE, MAP_SHARED, rb_fd, 3 * page_size);
++ 	ASSERT_ERR_PTR(mmap_ptr, "wr_data_page_two");
++ 	mmap_ptr = mmap(NULL, 2 * page_size, PROT_WRITE, MAP_SHARED, rb_fd, 2 * page_size);
++ 	ASSERT_ERR_PTR(mmap_ptr, "wr_data_page_all");
++ 
++ 	/* good read-only pages */
++ 	mmap_ptr = mmap(NULL, 4 * page_size, PROT_READ, MAP_SHARED, rb_fd, 0);
++ 	if (!ASSERT_OK_PTR(mmap_ptr, "ro_prod_pos"))
++ 		goto cleanup;
++ 
++ 	ASSERT_ERR(mprotect(mmap_ptr, 4 * page_size, PROT_WRITE), "write_protect");
++ 	ASSERT_ERR(mprotect(mmap_ptr, 4 * page_size, PROT_EXEC), "exec_protect");
++ 	ASSERT_ERR_PTR(mremap(mmap_ptr, 0, 4 * page_size, MREMAP_MAYMOVE), "ro_remap");
++ 	ASSERT_OK(munmap(mmap_ptr, 4 * page_size), "unmap_ro");
++ 
++ 	/* good read-only pages with initial offset */
++ 	mmap_ptr = mmap(NULL, page_size, PROT_READ, MAP_SHARED, rb_fd, page_size);
++ 	if (!ASSERT_OK_PTR(mmap_ptr, "ro_prod_pos"))
++ 		goto cleanup;
++ 
++ 	ASSERT_ERR(mprotect(mmap_ptr, page_size, PROT_WRITE), "write_protect");
++ 	ASSERT_ERR(mprotect(mmap_ptr, page_size, PROT_EXEC), "exec_protect");
++ 	ASSERT_ERR_PTR(mremap(mmap_ptr, 0, 3 * page_size, MREMAP_MAYMOVE), "ro_remap");
++ 	ASSERT_OK(munmap(mmap_ptr, page_size), "unmap_ro");
++ 
+++>>>>>>> 704e2beba23c (selftests/bpf: Test ringbuf mmap read-only and read-write restrictions)
+  	/* only trigger BPF program for current process */
+  	skel->bss->pid = getpid();
+  
+* Unmerged path tools/testing/selftests/bpf/prog_tests/ringbuf.c
