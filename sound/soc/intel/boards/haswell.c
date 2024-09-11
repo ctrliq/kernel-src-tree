@@ -122,6 +122,7 @@ static struct snd_soc_dai_link haswell_rt5640_dais[] = {
 	{
 		.name = "System",
 		.stream_name = "System Playback/Capture",
+		.nonatomic = 1,
 		.dynamic = 1,
 		.init = haswell_rtd_init,
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST, SND_SOC_DPCM_TRIGGER_POST},
@@ -132,6 +133,7 @@ static struct snd_soc_dai_link haswell_rt5640_dais[] = {
 	{
 		.name = "Offload0",
 		.stream_name = "Offload0 Playback",
+		.nonatomic = 1,
 		.dynamic = 1,
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST, SND_SOC_DPCM_TRIGGER_POST},
 		.dpcm_playback = 1,
@@ -140,6 +142,7 @@ static struct snd_soc_dai_link haswell_rt5640_dais[] = {
 	{
 		.name = "Offload1",
 		.stream_name = "Offload1 Playback",
+		.nonatomic = 1,
 		.dynamic = 1,
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST, SND_SOC_DPCM_TRIGGER_POST},
 		.dpcm_playback = 1,
@@ -148,6 +151,7 @@ static struct snd_soc_dai_link haswell_rt5640_dais[] = {
 	{
 		.name = "Loopback",
 		.stream_name = "Loopback",
+		.nonatomic = 1,
 		.dynamic = 1,
 		.trigger = {SND_SOC_DPCM_TRIGGER_POST, SND_SOC_DPCM_TRIGGER_POST},
 		.dpcm_capture = 1,
