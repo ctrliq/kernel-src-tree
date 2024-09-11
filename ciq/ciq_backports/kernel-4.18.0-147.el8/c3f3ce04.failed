@@ -1,0 +1,148 @@
+userfaultfd: use RCU to free the task struct when fork fails
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andrea Arcangeli <aarcange@redhat.com>
+commit c3f3ce049f7d97cc7ec9c01cb51d9ec74e0f37c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c3f3ce04.failed
+
+The task structure is freed while get_mem_cgroup_from_mm() holds
+rcu_read_lock() and dereferences mm->owner.
+
+  get_mem_cgroup_from_mm()                failing fork()
+  ----                                    ---
+  task = mm->owner
+                                          mm->owner = NULL;
+                                          free(task)
+  if (task) *task; /* use after free */
+
+The fix consists in freeing the task with RCU also in the fork failure
+case, exactly like it always happens for the regular exit(2) path.  That
+is enough to make the rcu_read_lock hold in get_mem_cgroup_from_mm()
+(left side above) effective to avoid a use after free when dereferencing
+the task structure.
+
+An alternate possible fix would be to defer the delivery of the
+userfaultfd contexts to the monitor until after fork() is guaranteed to
+succeed.  Such a change would require more changes because it would
+create a strict ordering dependency where the uffd methods would need to
+be called beyond the last potentially failing branch in order to be
+safe.  This solution as opposed only adds the dependency to common code
+to set mm->owner to NULL and to free the task struct that was pointed by
+mm->owner with RCU, if fork ends up failing.  The userfaultfd methods
+can still be called anywhere during the fork runtime and the monitor
+will keep discarding orphaned "mm" coming from failed forks in userland.
+
+This race condition couldn't trigger if CONFIG_MEMCG was set =n at build
+time.
+
+[aarcange@redhat.com: improve changelog, reduce #ifdefs per Michal]
+  Link: http://lkml.kernel.org/r/20190429035752.4508-1-aarcange@redhat.com
+Link: http://lkml.kernel.org/r/20190325225636.11635-2-aarcange@redhat.com
+Fixes: 893e26e61d04 ("userfaultfd: non-cooperative: Add fork() event")
+	Signed-off-by: Andrea Arcangeli <aarcange@redhat.com>
+	Tested-by: zhong jiang <zhongjiang@huawei.com>
+	Reported-by: syzbot+cbb52e396df3e565ab02@syzkaller.appspotmail.com
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Cc: Jann Horn <jannh@google.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Mike Rapoport <rppt@linux.vnet.ibm.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Cc: Peter Xu <peterx@redhat.com>
+	Cc: Jason Gunthorpe <jgg@mellanox.com>
+	Cc: "Kirill A . Shutemov" <kirill.shutemov@linux.intel.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: zhong jiang <zhongjiang@huawei.com>
+	Cc: syzbot+cbb52e396df3e565ab02@syzkaller.appspotmail.com
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c3f3ce049f7d97cc7ec9c01cb51d9ec74e0f37c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/fork.c
+diff --cc kernel/fork.c
+index de5d21291bbc,b409e792aadc..000000000000
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@@ -1662,6 -1684,73 +1672,76 @@@ static inline void rcu_copy_process(str
+  #endif /* #ifdef CONFIG_TASKS_RCU */
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int pidfd_release(struct inode *inode, struct file *file)
++ {
++ 	struct pid *pid = file->private_data;
++ 
++ 	file->private_data = NULL;
++ 	put_pid(pid);
++ 	return 0;
++ }
++ 
++ #ifdef CONFIG_PROC_FS
++ static void pidfd_show_fdinfo(struct seq_file *m, struct file *f)
++ {
++ 	struct pid_namespace *ns = proc_pid_ns(file_inode(m->file));
++ 	struct pid *pid = f->private_data;
++ 
++ 	seq_put_decimal_ull(m, "Pid:\t", pid_nr_ns(pid, ns));
++ 	seq_putc(m, '\n');
++ }
++ #endif
++ 
++ const struct file_operations pidfd_fops = {
++ 	.release = pidfd_release,
++ #ifdef CONFIG_PROC_FS
++ 	.show_fdinfo = pidfd_show_fdinfo,
++ #endif
++ };
++ 
++ /**
++  * pidfd_create() - Create a new pid file descriptor.
++  *
++  * @pid:  struct pid that the pidfd will reference
++  *
++  * This creates a new pid file descriptor with the O_CLOEXEC flag set.
++  *
++  * Note, that this function can only be called after the fd table has
++  * been unshared to avoid leaking the pidfd to the new process.
++  *
++  * Return: On success, a cloexec pidfd is returned.
++  *         On error, a negative errno number will be returned.
++  */
++ static int pidfd_create(struct pid *pid)
++ {
++ 	int fd;
++ 
++ 	fd = anon_inode_getfd("[pidfd]", &pidfd_fops, get_pid(pid),
++ 			      O_RDWR | O_CLOEXEC);
++ 	if (fd < 0)
++ 		put_pid(pid);
++ 
++ 	return fd;
++ }
++ 
++ static void __delayed_free_task(struct rcu_head *rhp)
++ {
++ 	struct task_struct *tsk = container_of(rhp, struct task_struct, rcu);
++ 
++ 	free_task(tsk);
++ }
++ 
++ static __always_inline void delayed_free_task(struct task_struct *tsk)
++ {
++ 	if (IS_ENABLED(CONFIG_MEMCG))
++ 		call_rcu(&tsk->rcu, __delayed_free_task);
++ 	else
++ 		free_task(tsk);
++ }
++ 
+++>>>>>>> c3f3ce049f7d (userfaultfd: use RCU to free the task struct when fork fails)
+  /*
+   * This creates a new process as a copy of the old one,
+   * but does not actually start it yet.
+* Unmerged path kernel/fork.c
