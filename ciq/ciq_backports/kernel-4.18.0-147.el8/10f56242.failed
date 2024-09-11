@@ -1,0 +1,136 @@
+IB/mlx5: Fix the locking of SRQ objects in ODP events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Moni Shoua <monis@mellanox.com>
+commit 10f56242e3158f6c17579921ebbba4a0d5188dc2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/10f56242.failed
+
+QP and SRQ objects are stored in different containers so the action to get
+and lock a common resource during ODP event needs to address that.
+
+While here get rid of 'refcount' and 'free' fields in mlx5_core_srq struct
+and use the fields with same semantics in common structure.
+
+Fixes: 032080ab43ac ("IB/mlx5: Lock QP during page fault handling")
+	Signed-off-by: Moni Shoua <monis@mellanox.com>
+	Reviewed-by: Majd Dibbiny <majd@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 10f56242e3158f6c17579921ebbba4a0d5188dc2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/srq.h
+#	drivers/net/ethernet/mellanox/mlx5/core/srq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/srq.c
+index 28c1c0ebd02e,63ac38bb3498..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/srq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/srq.c
+@@@ -672,11 -662,45 +671,49 @@@ int mlx5_core_arm_srq(struct mlx5_core_
+  		return arm_rmp_cmd(dev, srq, lwm);
+  	}
+  }
+ +EXPORT_SYMBOL(mlx5_core_arm_srq);
+  
+ -static int srq_event_notifier(struct notifier_block *nb,
+ -			      unsigned long type, void *data)
+ +void mlx5_init_srq_table(struct mlx5_core_dev *dev)
+  {
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/srq.c
+ +	struct mlx5_srq_table *table = &dev->priv.srq_table;
+++=======
++ 	struct mlx5_srq_table *table;
++ 	struct mlx5_core_srq *srq;
++ 	struct mlx5_eqe *eqe;
++ 	u32 srqn;
++ 
++ 	if (type != MLX5_EVENT_TYPE_SRQ_CATAS_ERROR &&
++ 	    type != MLX5_EVENT_TYPE_SRQ_RQ_LIMIT)
++ 		return NOTIFY_DONE;
++ 
++ 	table = container_of(nb, struct mlx5_srq_table, nb);
++ 
++ 	eqe = data;
++ 	srqn = be32_to_cpu(eqe->data.qp_srq.qp_srq_n) & 0xffffff;
++ 
++ 	spin_lock(&table->lock);
++ 
++ 	srq = radix_tree_lookup(&table->tree, srqn);
++ 	if (srq)
++ 		atomic_inc(&srq->common.refcount);
++ 
++ 	spin_unlock(&table->lock);
++ 
++ 	if (!srq)
++ 		return NOTIFY_OK;
++ 
++ 	srq->event(srq, eqe->type);
++ 
++ 	mlx5_core_res_put(&srq->common);
++ 
++ 	return NOTIFY_OK;
++ }
++ 
++ int mlx5_init_srq_table(struct mlx5_ib_dev *dev)
++ {
++ 	struct mlx5_srq_table *table = &dev->srq_table;
+++>>>>>>> 10f56242e315 (IB/mlx5: Fix the locking of SRQ objects in ODP events):drivers/infiniband/hw/mlx5/srq_cmd.c
+  
+  	memset(table, 0, sizeof(*table));
+  	spin_lock_init(&table->lock);
+* Unmerged path drivers/infiniband/hw/mlx5/srq.h
+diff --git a/drivers/infiniband/hw/mlx5/cq.c b/drivers/infiniband/hw/mlx5/cq.c
+index c631bd057013..f410f783a8e5 100644
+--- a/drivers/infiniband/hw/mlx5/cq.c
++++ b/drivers/infiniband/hw/mlx5/cq.c
+@@ -187,8 +187,8 @@ static void handle_responder(struct ib_wc *wc, struct mlx5_cqe64 *cqe,
+ 			wqe_ctr = be16_to_cpu(cqe->wqe_counter);
+ 			wc->wr_id = srq->wrid[wqe_ctr];
+ 			mlx5_ib_free_srq_wqe(srq, wqe_ctr);
+-			if (msrq && atomic_dec_and_test(&msrq->refcount))
+-				complete(&msrq->free);
++			if (msrq)
++				mlx5_core_res_put(&msrq->common);
+ 		}
+ 	} else {
+ 		wq	  = &qp->rq;
+diff --git a/drivers/infiniband/hw/mlx5/odp.c b/drivers/infiniband/hw/mlx5/odp.c
+index 4e6f586dbb7c..1b918b0b3cd3 100644
+--- a/drivers/infiniband/hw/mlx5/odp.c
++++ b/drivers/infiniband/hw/mlx5/odp.c
+@@ -1019,22 +1019,25 @@ static int mlx5_ib_mr_responder_pfault_handler(
+ static inline struct mlx5_core_rsc_common *odp_get_rsc(struct mlx5_ib_dev *dev,
+ 						       u32 wq_num, int pf_type)
+ {
+-	enum mlx5_res_type res_type;
++	struct mlx5_core_rsc_common *common = NULL;
++	struct mlx5_core_srq *srq;
+ 
+ 	switch (pf_type) {
+ 	case MLX5_WQE_PF_TYPE_RMP:
+-		res_type = MLX5_RES_SRQ;
++		srq = mlx5_cmd_get_srq(dev, wq_num);
++		if (srq)
++			common = &srq->common;
+ 		break;
+ 	case MLX5_WQE_PF_TYPE_REQ_SEND_OR_WRITE:
+ 	case MLX5_WQE_PF_TYPE_RESP:
+ 	case MLX5_WQE_PF_TYPE_REQ_READ_OR_ATOMIC:
+-		res_type = MLX5_RES_QP;
++		common = mlx5_core_res_hold(dev->mdev, wq_num, MLX5_RES_QP);
+ 		break;
+ 	default:
+-		return NULL;
++		break;
+ 	}
+ 
+-	return mlx5_core_res_hold(dev->mdev, wq_num, res_type);
++	return common;
+ }
+ 
+ static inline struct mlx5_ib_qp *res_to_qp(struct mlx5_core_rsc_common *res)
+* Unmerged path drivers/infiniband/hw/mlx5/srq.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/srq.c
