@@ -1,0 +1,202 @@
+net/mlx5e: Fix wrong calculation of header index in HW_GRO
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Khalid Manaa <khalidm@nvidia.com>
+commit b8d91145ed7cfa046cc07bcfb277465b9d45da73
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/b8d91145.failed
+
+The HW doesn't wrap the CQE.shampo.header_index field according to the
+headers buffer size, instead it always increases it until reaching overflow
+of u16 size.
+
+Thus the mlx5e_handle_rx_cqe_mpwrq_shampo handler should mask the
+CQE header_index field to find the actual header index in the headers buffer.
+
+Fixes: f97d5c2a453e ("net/mlx5e: Add handle SHAMPO cqe support")
+	Signed-off-by: Khalid Manaa <khalidm@nvidia.com>
+	Reviewed-by: Tariq Toukan <tariqt@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit b8d91145ed7cfa046cc07bcfb277465b9d45da73)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+index a9ca28689ffb,b789af07829c..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@@ -167,6 -167,15 +167,18 @@@ static inline u16 mlx5e_txqsq_get_next_
+  	return pi;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline u16 mlx5e_shampo_get_cqe_header_index(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe)
++ {
++ 	return be16_to_cpu(cqe->shampo.header_entry_index) & (rq->mpwqe.shampo->hd_per_wq - 1);
++ }
++ 
++ struct mlx5e_shampo_umr {
++ 	u16 len;
++ };
++ 
+++>>>>>>> b8d91145ed7c (net/mlx5e: Fix wrong calculation of header index in HW_GRO)
+  struct mlx5e_icosq_wqe_info {
+  	u8 wqe_type;
+  	u8 num_wqebbs;
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 19d50353de25,3a79ecd38003..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@@ -847,6 -1068,142 +847,145 @@@ static void mlx5e_lro_update_hdr(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void *mlx5e_shampo_get_packet_hd(struct mlx5e_rq *rq, u16 header_index)
++ {
++ 	struct mlx5e_dma_info *last_head = &rq->mpwqe.shampo->info[header_index];
++ 	u16 head_offset = (last_head->addr & (PAGE_SIZE - 1)) + rq->buff.headroom;
++ 
++ 	return page_address(last_head->page) + head_offset;
++ }
++ 
++ static void mlx5e_shampo_update_ipv4_udp_hdr(struct mlx5e_rq *rq, struct iphdr *ipv4)
++ {
++ 	int udp_off = rq->hw_gro_data->fk.control.thoff;
++ 	struct sk_buff *skb = rq->hw_gro_data->skb;
++ 	struct udphdr *uh;
++ 
++ 	uh = (struct udphdr *)(skb->data + udp_off);
++ 	uh->len = htons(skb->len - udp_off);
++ 
++ 	if (uh->check)
++ 		uh->check = ~udp_v4_check(skb->len - udp_off, ipv4->saddr,
++ 					  ipv4->daddr, 0);
++ 
++ 	skb->csum_start = (unsigned char *)uh - skb->head;
++ 	skb->csum_offset = offsetof(struct udphdr, check);
++ 
++ 	skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_L4;
++ }
++ 
++ static void mlx5e_shampo_update_ipv6_udp_hdr(struct mlx5e_rq *rq, struct ipv6hdr *ipv6)
++ {
++ 	int udp_off = rq->hw_gro_data->fk.control.thoff;
++ 	struct sk_buff *skb = rq->hw_gro_data->skb;
++ 	struct udphdr *uh;
++ 
++ 	uh = (struct udphdr *)(skb->data + udp_off);
++ 	uh->len = htons(skb->len - udp_off);
++ 
++ 	if (uh->check)
++ 		uh->check = ~udp_v6_check(skb->len - udp_off, &ipv6->saddr,
++ 					  &ipv6->daddr, 0);
++ 
++ 	skb->csum_start = (unsigned char *)uh - skb->head;
++ 	skb->csum_offset = offsetof(struct udphdr, check);
++ 
++ 	skb_shinfo(skb)->gso_type |= SKB_GSO_UDP_L4;
++ }
++ 
++ static void mlx5e_shampo_update_fin_psh_flags(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe,
++ 					      struct tcphdr *skb_tcp_hd)
++ {
++ 	u16 header_index = mlx5e_shampo_get_cqe_header_index(rq, cqe);
++ 	struct tcphdr *last_tcp_hd;
++ 	void *last_hd_addr;
++ 
++ 	last_hd_addr = mlx5e_shampo_get_packet_hd(rq, header_index);
++ 	last_tcp_hd =  last_hd_addr + ETH_HLEN + rq->hw_gro_data->fk.control.thoff;
++ 	tcp_flag_word(skb_tcp_hd) |= tcp_flag_word(last_tcp_hd) & (TCP_FLAG_FIN | TCP_FLAG_PSH);
++ }
++ 
++ static void mlx5e_shampo_update_ipv4_tcp_hdr(struct mlx5e_rq *rq, struct iphdr *ipv4,
++ 					     struct mlx5_cqe64 *cqe, bool match)
++ {
++ 	int tcp_off = rq->hw_gro_data->fk.control.thoff;
++ 	struct sk_buff *skb = rq->hw_gro_data->skb;
++ 	struct tcphdr *tcp;
++ 
++ 	tcp = (struct tcphdr *)(skb->data + tcp_off);
++ 	if (match)
++ 		mlx5e_shampo_update_fin_psh_flags(rq, cqe, tcp);
++ 
++ 	tcp->check = ~tcp_v4_check(skb->len - tcp_off, ipv4->saddr,
++ 				   ipv4->daddr, 0);
++ 	skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV4;
++ 	if (ntohs(ipv4->id) == rq->hw_gro_data->second_ip_id)
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_FIXEDID;
++ 
++ 	skb->csum_start = (unsigned char *)tcp - skb->head;
++ 	skb->csum_offset = offsetof(struct tcphdr, check);
++ 
++ 	if (tcp->cwr)
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_ECN;
++ }
++ 
++ static void mlx5e_shampo_update_ipv6_tcp_hdr(struct mlx5e_rq *rq, struct ipv6hdr *ipv6,
++ 					     struct mlx5_cqe64 *cqe, bool match)
++ {
++ 	int tcp_off = rq->hw_gro_data->fk.control.thoff;
++ 	struct sk_buff *skb = rq->hw_gro_data->skb;
++ 	struct tcphdr *tcp;
++ 
++ 	tcp = (struct tcphdr *)(skb->data + tcp_off);
++ 	if (match)
++ 		mlx5e_shampo_update_fin_psh_flags(rq, cqe, tcp);
++ 
++ 	tcp->check = ~tcp_v6_check(skb->len - tcp_off, &ipv6->saddr,
++ 				   &ipv6->daddr, 0);
++ 	skb_shinfo(skb)->gso_type |= SKB_GSO_TCPV6;
++ 	skb->csum_start = (unsigned char *)tcp - skb->head;
++ 	skb->csum_offset = offsetof(struct tcphdr, check);
++ 
++ 	if (tcp->cwr)
++ 		skb_shinfo(skb)->gso_type |= SKB_GSO_TCP_ECN;
++ }
++ 
++ static void mlx5e_shampo_update_hdr(struct mlx5e_rq *rq, struct mlx5_cqe64 *cqe, bool match)
++ {
++ 	bool is_ipv4 = (rq->hw_gro_data->fk.basic.n_proto == htons(ETH_P_IP));
++ 	struct sk_buff *skb = rq->hw_gro_data->skb;
++ 
++ 	skb_shinfo(skb)->gso_segs = NAPI_GRO_CB(skb)->count;
++ 	skb->ip_summed = CHECKSUM_PARTIAL;
++ 
++ 	if (is_ipv4) {
++ 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct iphdr);
++ 		struct iphdr *ipv4 = (struct iphdr *)(skb->data + nhoff);
++ 		__be16 newlen = htons(skb->len - nhoff);
++ 
++ 		csum_replace2(&ipv4->check, ipv4->tot_len, newlen);
++ 		ipv4->tot_len = newlen;
++ 
++ 		if (ipv4->protocol == IPPROTO_TCP)
++ 			mlx5e_shampo_update_ipv4_tcp_hdr(rq, ipv4, cqe, match);
++ 		else
++ 			mlx5e_shampo_update_ipv4_udp_hdr(rq, ipv4);
++ 	} else {
++ 		int nhoff = rq->hw_gro_data->fk.control.thoff - sizeof(struct ipv6hdr);
++ 		struct ipv6hdr *ipv6 = (struct ipv6hdr *)(skb->data + nhoff);
++ 
++ 		ipv6->payload_len = htons(skb->len - nhoff - sizeof(*ipv6));
++ 
++ 		if (ipv6->nexthdr == IPPROTO_TCP)
++ 			mlx5e_shampo_update_ipv6_tcp_hdr(rq, ipv6, cqe, match);
++ 		else
++ 			mlx5e_shampo_update_ipv6_udp_hdr(rq, ipv6);
++ 	}
++ }
++ 
+++>>>>>>> b8d91145ed7c (net/mlx5e: Fix wrong calculation of header index in HW_GRO)
+  static inline void mlx5e_skb_set_hash(struct mlx5_cqe64 *cqe,
+  				      struct sk_buff *skb)
+  {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
