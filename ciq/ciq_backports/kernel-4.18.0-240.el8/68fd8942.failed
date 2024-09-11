@@ -1,0 +1,119 @@
+net/smc: clear link during SMC client link down processing
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 68fd8942038f30dbb64a594dc15d9948289de42a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/68fd8942.failed
+
+In a link-down condition we notify the SMC server and expect that the
+server will finally trigger the link clear processing on the client
+side. This could fail when anything along this notification path goes
+wrong. Clear the link as part of SMC client link-down processing to
+prevent dangling links.
+
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+Fixes: 541afa10c126 ("net/smc: add smcr_port_err() and smcr_link_down() processing")
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 68fd8942038f30dbb64a594dc15d9948289de42a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_core.c
+diff --cc net/smc/smc_core.c
+index 399bc3ffb64e,e286b3c8c962..000000000000
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@@ -984,6 -1170,85 +984,88 @@@ void smcr_port_add(struct smc_ib_devic
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* link is down - switch connections to alternate link,
++  * must be called under lgr->llc_conf_mutex lock
++  */
++ static void smcr_link_down(struct smc_link *lnk)
++ {
++ 	struct smc_link_group *lgr = lnk->lgr;
++ 	struct smc_link *to_lnk;
++ 	int del_link_id;
++ 
++ 	if (!lgr || lnk->state == SMC_LNK_UNUSED || list_empty(&lgr->list))
++ 		return;
++ 
++ 	smc_ib_modify_qp_reset(lnk);
++ 	to_lnk = smc_switch_conns(lgr, lnk, true);
++ 	if (!to_lnk) { /* no backup link available */
++ 		smcr_link_clear(lnk, true);
++ 		return;
++ 	}
++ 	smcr_lgr_set_type(lgr, SMC_LGR_SINGLE);
++ 	del_link_id = lnk->link_id;
++ 
++ 	if (lgr->role == SMC_SERV) {
++ 		/* trigger local delete link processing */
++ 		smc_llc_srv_delete_link_local(to_lnk, del_link_id);
++ 	} else {
++ 		if (lgr->llc_flow_lcl.type != SMC_LLC_FLOW_NONE) {
++ 			/* another llc task is ongoing */
++ 			mutex_unlock(&lgr->llc_conf_mutex);
++ 			wait_event_timeout(lgr->llc_flow_waiter,
++ 				(list_empty(&lgr->list) ||
++ 				 lgr->llc_flow_lcl.type == SMC_LLC_FLOW_NONE),
++ 				SMC_LLC_WAIT_TIME);
++ 			mutex_lock(&lgr->llc_conf_mutex);
++ 		}
++ 		if (!list_empty(&lgr->list)) {
++ 			smc_llc_send_delete_link(to_lnk, del_link_id,
++ 						 SMC_LLC_REQ, true,
++ 						 SMC_LLC_DEL_LOST_PATH);
++ 			smcr_link_clear(lnk, true);
++ 		}
++ 		wake_up(&lgr->llc_flow_waiter);	/* wake up next waiter */
++ 	}
++ }
++ 
++ /* must be called under lgr->llc_conf_mutex lock */
++ void smcr_link_down_cond(struct smc_link *lnk)
++ {
++ 	if (smc_link_downing(&lnk->state))
++ 		smcr_link_down(lnk);
++ }
++ 
++ /* will get the lgr->llc_conf_mutex lock */
++ void smcr_link_down_cond_sched(struct smc_link *lnk)
++ {
++ 	if (smc_link_downing(&lnk->state))
++ 		schedule_work(&lnk->link_down_wrk);
++ }
++ 
++ void smcr_port_err(struct smc_ib_device *smcibdev, u8 ibport)
++ {
++ 	struct smc_link_group *lgr, *n;
++ 	int i;
++ 
++ 	list_for_each_entry_safe(lgr, n, &smc_lgr_list.list, list) {
++ 		if (strncmp(smcibdev->pnetid[ibport - 1], lgr->pnet_id,
++ 			    SMC_MAX_PNETID_LEN))
++ 			continue; /* lgr is not affected */
++ 		if (list_empty(&lgr->list))
++ 			continue;
++ 		for (i = 0; i < SMC_LINKS_PER_LGR_MAX; i++) {
++ 			struct smc_link *lnk = &lgr->lnk[i];
++ 
++ 			if (smc_link_usable(lnk) &&
++ 			    lnk->smcibdev == smcibdev && lnk->ibport == ibport)
++ 				smcr_link_down_cond_sched(lnk);
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> 68fd8942038f (net/smc: clear link during SMC client link down processing)
+  static void smc_link_up_work(struct work_struct *work)
+  {
+  	struct smc_ib_up_work *ib_work = container_of(work,
+* Unmerged path net/smc/smc_core.c
