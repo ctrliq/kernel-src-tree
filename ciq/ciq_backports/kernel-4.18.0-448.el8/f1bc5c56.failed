@@ -1,0 +1,168 @@
+xfs: merge xfs_reclaim_inodes_ag into xfs_inode_walk_ag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit f1bc5c5630f90b83b339e8970dcf6d03abba5bd5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f1bc5c56.failed
+
+Merge these two inode walk loops together, since they're pretty similar
+now.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit f1bc5c5630f90b83b339e8970dcf6d03abba5bd5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/xfs_icache.c
+diff --cc fs/xfs/xfs_icache.c
+index a7aa9b27affa,1223921fb01c..000000000000
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@@ -990,96 -984,6 +984,99 @@@ out
+  	xfs_iflags_clear(ip, XFS_IRECLAIM);
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Walk the AGs and reclaim the inodes in them. Even if the filesystem is
+ + * corrupted, we still want to try to reclaim all the inodes. If we don't,
+ + * then a shut down during filesystem unmount reclaim walk leak all the
+ + * unreclaimed inodes.
+ + *
+ + * Returns non-zero if any AGs or inodes were skipped in the reclaim pass
+ + * so that callers that want to block until all dirty inodes are written back
+ + * and reclaimed can sanely loop.
+ + */
+ +static void
+ +xfs_reclaim_inodes_ag(
+ +	struct xfs_mount	*mp,
+ +	int			*nr_to_scan)
+ +{
+ +	struct xfs_perag	*pag;
+ +	xfs_agnumber_t		agno;
+ +
+ +	for_each_perag_tag(mp, agno, pag, XFS_ICI_RECLAIM_TAG) {
+ +		unsigned long	first_index = 0;
+ +		int		done = 0;
+ +		int		nr_found = 0;
+ +
+ +		first_index = READ_ONCE(pag->pag_ici_reclaim_cursor);
+ +		do {
+ +			struct xfs_inode *batch[XFS_LOOKUP_BATCH];
+ +			int	i;
+ +
+ +			rcu_read_lock();
+ +			nr_found = radix_tree_gang_lookup_tag(
+ +					&pag->pag_ici_root,
+ +					(void **)batch, first_index,
+ +					XFS_LOOKUP_BATCH,
+ +					XFS_ICI_RECLAIM_TAG);
+ +			if (!nr_found) {
+ +				done = 1;
+ +				rcu_read_unlock();
+ +				break;
+ +			}
+ +
+ +			/*
+ +			 * Grab the inodes before we drop the lock. if we found
+ +			 * nothing, nr == 0 and the loop will be skipped.
+ +			 */
+ +			for (i = 0; i < nr_found; i++) {
+ +				struct xfs_inode *ip = batch[i];
+ +
+ +				if (done || !xfs_reclaim_inode_grab(ip))
+ +					batch[i] = NULL;
+ +
+ +				/*
+ +				 * Update the index for the next lookup. Catch
+ +				 * overflows into the next AG range which can
+ +				 * occur if we have inodes in the last block of
+ +				 * the AG and we are currently pointing to the
+ +				 * last inode.
+ +				 *
+ +				 * Because we may see inodes that are from the
+ +				 * wrong AG due to RCU freeing and
+ +				 * reallocation, only update the index if it
+ +				 * lies in this AG. It was a race that lead us
+ +				 * to see this inode, so another lookup from
+ +				 * the same index will not find it again.
+ +				 */
+ +				if (XFS_INO_TO_AGNO(mp, ip->i_ino) !=
+ +								pag->pag_agno)
+ +					continue;
+ +				first_index = XFS_INO_TO_AGINO(mp, ip->i_ino + 1);
+ +				if (first_index < XFS_INO_TO_AGINO(mp, ip->i_ino))
+ +					done = 1;
+ +			}
+ +
+ +			/* unlock now we've grabbed the inodes. */
+ +			rcu_read_unlock();
+ +
+ +			for (i = 0; i < nr_found; i++) {
+ +				if (batch[i])
+ +					xfs_reclaim_inode(batch[i], pag);
+ +			}
+ +
+ +			*nr_to_scan -= XFS_LOOKUP_BATCH;
+ +			cond_resched();
+ +		} while (nr_found && !done && *nr_to_scan > 0);
+ +
+ +		if (done)
+ +			first_index = 0;
+ +		WRITE_ONCE(pag->pag_ici_reclaim_cursor, first_index);
+ +	}
+ +}
+ +
+++=======
+++>>>>>>> f1bc5c5630f9 (xfs: merge xfs_reclaim_inodes_ag into xfs_inode_walk_ag)
+  void
+  xfs_reclaim_inodes(
+  	struct xfs_mount	*mp)
+* Unmerged path fs/xfs/xfs_icache.c
+diff --git a/fs/xfs/xfs_icache.h b/fs/xfs/xfs_icache.h
+index 3ec00f1fea86..b6ab1067c52b 100644
+--- a/fs/xfs/xfs_icache.h
++++ b/fs/xfs/xfs_icache.h
+@@ -15,6 +15,7 @@ struct xfs_eofblocks {
+ 	kgid_t		eof_gid;
+ 	prid_t		eof_prid;
+ 	__u64		eof_min_file_size;
++	int		icw_scan_limit;
+ };
+ 
+ /*
+diff --git a/fs/xfs/xfs_trace.h b/fs/xfs/xfs_trace.h
+index 8855d7af32c2..9869b4da41d1 100644
+--- a/fs/xfs/xfs_trace.h
++++ b/fs/xfs/xfs_trace.h
+@@ -3898,6 +3898,7 @@ DECLARE_EVENT_CLASS(xfs_eofblocks_class,
+ 		__field(uint32_t, gid)
+ 		__field(prid_t, prid)
+ 		__field(__u64, min_file_size)
++		__field(int, scan_limit)
+ 		__field(unsigned long, caller_ip)
+ 	),
+ 	TP_fast_assign(
+@@ -3909,15 +3910,17 @@ DECLARE_EVENT_CLASS(xfs_eofblocks_class,
+ 						eofb->eof_gid) : 0;
+ 		__entry->prid = eofb ? eofb->eof_prid : 0;
+ 		__entry->min_file_size = eofb ? eofb->eof_min_file_size : 0;
++		__entry->scan_limit = eofb ? eofb->icw_scan_limit : 0;
+ 		__entry->caller_ip = caller_ip;
+ 	),
+-	TP_printk("dev %d:%d flags 0x%x uid %u gid %u prid %u minsize %llu caller %pS",
++	TP_printk("dev %d:%d flags 0x%x uid %u gid %u prid %u minsize %llu scan_limit %d caller %pS",
+ 		  MAJOR(__entry->dev), MINOR(__entry->dev),
+ 		  __entry->flags,
+ 		  __entry->uid,
+ 		  __entry->gid,
+ 		  __entry->prid,
+ 		  __entry->min_file_size,
++		  __entry->scan_limit,
+ 		  (char *)__entry->caller_ip)
+ );
+ #define DEFINE_EOFBLOCKS_EVENT(name)	\
