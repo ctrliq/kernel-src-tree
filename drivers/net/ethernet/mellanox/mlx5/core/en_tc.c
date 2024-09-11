@@ -2172,10 +2172,9 @@ static bool is_merged_eswitch_dev(struct mlx5e_priv *priv,
 	peer_priv = netdev_priv(peer_netdev);
 
 	return (MLX5_CAP_ESW(priv->mdev, merged_eswitch) &&
-		(priv->netdev->netdev_ops == peer_netdev->netdev_ops) &&
-		same_hw_devs(priv, peer_priv) &&
-		MLX5_VPORT_MANAGER(peer_priv->mdev) &&
-		(peer_priv->mdev->priv.eswitch->mode == SRIOV_OFFLOADS));
+		mlx5e_eswitch_rep(priv->netdev) &&
+		mlx5e_eswitch_rep(peer_netdev) &&
+		same_hw_devs(priv, peer_priv));
 }
 
 static int mlx5e_route_lookup_ipv6(struct mlx5e_priv *priv,
