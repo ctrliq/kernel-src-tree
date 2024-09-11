@@ -1,0 +1,184 @@
+blk-mq: Rename BLK_MQ_F_TAG_SHARED as BLK_MQ_F_TAG_QUEUE_SHARED
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 51db1c37ee166159c5753ce8d64d6bacf113e0f0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/51db1c37.failed
+
+BLK_MQ_F_TAG_SHARED actually means that tags is shared among request
+queues, all of which should belong to LUNs attached to same HBA.
+
+So rename it to make the point explicitly.
+
+[jpg: rebase a few times, add rnbd-clt.c change]
+
+	Suggested-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: John Garry <john.garry@huawei.com>
+	Tested-by: Douglas Gilbert <dgilbert@interlog.com>
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 51db1c37ee166159c5753ce8d64d6bacf113e0f0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-tag.h
+#	block/blk-mq.c
+#	drivers/block/rnbd/rnbd-clt.c
+#	include/linux/blk-mq.h
+diff --cc block/blk-mq-tag.h
+index 2e4ef51cdb32,918e2cee4f43..000000000000
+--- a/block/blk-mq-tag.h
++++ b/block/blk-mq-tag.h
+@@@ -79,15 -71,34 +79,40 @@@ static inline void blk_mq_tag_idle(stru
+  }
+  
+  /*
+ - * For shared tag users, we track the number of currently active users
+ - * and attempt to provide a fair share of the tag depth for each of them.
+ + * This helper should only be used for flush request to share tag
+ + * with the request cloned from, and both the two requests can't be
+ + * in flight at the same time. The caller has to make sure the tag
+ + * can't be freed.
+   */
+ -static inline bool hctx_may_queue(struct blk_mq_hw_ctx *hctx,
+ -				  struct sbitmap_queue *bt)
+ +static inline void blk_mq_tag_set_rq(struct blk_mq_hw_ctx *hctx,
+ +		unsigned int tag, struct request *rq)
+  {
+++<<<<<<< HEAD
+ +	hctx->tags->rqs[tag] = rq;
+++=======
++ 	unsigned int depth, users;
++ 
++ 	if (!hctx || !(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED))
++ 		return true;
++ 	if (!test_bit(BLK_MQ_S_TAG_ACTIVE, &hctx->state))
++ 		return true;
++ 
++ 	/*
++ 	 * Don't try dividing an ant
++ 	 */
++ 	if (bt->sb.depth == 1)
++ 		return true;
++ 
++ 	users = atomic_read(&hctx->tags->active_queues);
++ 	if (!users)
++ 		return true;
++ 
++ 	/*
++ 	 * Allow at least some tags
++ 	 */
++ 	depth = max((bt->sb.depth + users - 1) / users, 4U);
++ 	return atomic_read(&hctx->nr_active) < depth;
+++>>>>>>> 51db1c37ee16 (blk-mq: Rename BLK_MQ_F_TAG_SHARED as BLK_MQ_F_TAG_QUEUE_SHARED)
+  }
+  
+  static inline bool blk_mq_tag_is_reserved(struct blk_mq_tags *tags,
+diff --cc block/blk-mq.c
+index 51b640f2232f,75031fa1709c..000000000000
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@@ -1069,6 -1094,45 +1069,48 @@@ static inline unsigned int queued_to_in
+  	return min(BLK_MQ_MAX_DISPATCH_ORDER - 1, ilog2(queued) + 1);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool __blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct sbitmap_queue *bt = &rq->mq_hctx->tags->bitmap_tags;
++ 	unsigned int tag_offset = rq->mq_hctx->tags->nr_reserved_tags;
++ 	int tag;
++ 
++ 	blk_mq_tag_busy(rq->mq_hctx);
++ 
++ 	if (blk_mq_tag_is_reserved(rq->mq_hctx->sched_tags, rq->internal_tag)) {
++ 		bt = &rq->mq_hctx->tags->breserved_tags;
++ 		tag_offset = 0;
++ 	}
++ 
++ 	if (!hctx_may_queue(rq->mq_hctx, bt))
++ 		return false;
++ 	tag = __sbitmap_queue_get(bt);
++ 	if (tag == BLK_MQ_NO_TAG)
++ 		return false;
++ 
++ 	rq->tag = tag + tag_offset;
++ 	return true;
++ }
++ 
++ static bool blk_mq_get_driver_tag(struct request *rq)
++ {
++ 	struct blk_mq_hw_ctx *hctx = rq->mq_hctx;
++ 
++ 	if (rq->tag == BLK_MQ_NO_TAG && !__blk_mq_get_driver_tag(rq))
++ 		return false;
++ 
++ 	if ((hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED) &&
++ 			!(rq->rq_flags & RQF_MQ_INFLIGHT)) {
++ 		rq->rq_flags |= RQF_MQ_INFLIGHT;
++ 		atomic_inc(&hctx->nr_active);
++ 	}
++ 	hctx->tags->rqs[rq->tag] = rq;
++ 	return true;
++ }
++ 
+++>>>>>>> 51db1c37ee16 (blk-mq: Rename BLK_MQ_F_TAG_SHARED as BLK_MQ_F_TAG_QUEUE_SHARED)
+  static int blk_mq_dispatch_wake(wait_queue_entry_t *wait, unsigned mode,
+  				int flags, void *key)
+  {
+@@@ -1300,6 -1418,12 +1342,15 @@@ bool blk_mq_dispatch_rq_list(struct req
+  	 */
+  	if (!list_empty(list)) {
+  		bool needs_restart;
+++<<<<<<< HEAD
+++=======
++ 		/* For non-shared tags, the RESTART check will suffice */
++ 		bool no_tag = prep == PREP_DISPATCH_NO_TAG &&
++ 			(hctx->flags & BLK_MQ_F_TAG_QUEUE_SHARED);
++ 		bool no_budget_avail = prep == PREP_DISPATCH_NO_BUDGET;
++ 
++ 		blk_mq_release_budgets(q, nr_budgets);
+++>>>>>>> 51db1c37ee16 (blk-mq: Rename BLK_MQ_F_TAG_SHARED as BLK_MQ_F_TAG_QUEUE_SHARED)
+  
+  		/*
+  		 * If we didn't flush the entire list, we could have told
+diff --cc include/linux/blk-mq.h
+index 200eeffcb439,982c4f92b63c..000000000000
+--- a/include/linux/blk-mq.h
++++ b/include/linux/blk-mq.h
+@@@ -286,8 -378,7 +286,12 @@@ struct blk_mq_ops 
+  
+  enum {
+  	BLK_MQ_F_SHOULD_MERGE	= 1 << 0,
+++<<<<<<< HEAD
+ +	BLK_MQ_F_TAG_SHARED	= 1 << 1,
+ +	BLK_MQ_F_SG_MERGE	= 1 << 2,	/* obsolete */
+++=======
++ 	BLK_MQ_F_TAG_QUEUE_SHARED = 1 << 1,
+++>>>>>>> 51db1c37ee16 (blk-mq: Rename BLK_MQ_F_TAG_SHARED as BLK_MQ_F_TAG_QUEUE_SHARED)
+  	/*
+  	 * Set when this device requires underlying blk-mq device for
+  	 * completing IO:
+* Unmerged path drivers/block/rnbd/rnbd-clt.c
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index d1469359e7d4..d1f5813093be 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -248,7 +248,7 @@ static const char *const alloc_policy_name[] = {
+ #define HCTX_FLAG_NAME(name) [ilog2(BLK_MQ_F_##name)] = #name
+ static const char *const hctx_flag_name[] = {
+ 	HCTX_FLAG_NAME(SHOULD_MERGE),
+-	HCTX_FLAG_NAME(TAG_SHARED),
++	HCTX_FLAG_NAME(TAG_QUEUE_SHARED),
+ 	HCTX_FLAG_NAME(BLOCKING),
+ 	HCTX_FLAG_NAME(NO_SCHED),
+ 	HCTX_FLAG_NAME(STACKING),
+* Unmerged path block/blk-mq-tag.h
+* Unmerged path block/blk-mq.c
+* Unmerged path drivers/block/rnbd/rnbd-clt.c
+* Unmerged path include/linux/blk-mq.h
