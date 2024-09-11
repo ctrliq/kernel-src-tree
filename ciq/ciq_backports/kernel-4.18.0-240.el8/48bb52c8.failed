@@ -1,0 +1,270 @@
+devlink: Add auto dump flag to health reporter
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Eran Ben Elisha <eranbe@mellanox.com>
+commit 48bb52c80be0e462328f58ca3a34ecfef3584320
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/48bb52c8.failed
+
+On low memory system, run time dumps can consume too much memory. Add
+administrator ability to disable auto dumps per reporter as part of the
+error flow handle routine.
+
+This attribute is not relevant while executing
+DEVLINK_CMD_HEALTH_REPORTER_DUMP_GET.
+
+By default, auto dump is activated for any reporter that has a dump method,
+as part of the reporter registration to devlink.
+
+	Signed-off-by: Eran Ben Elisha <eranbe@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 48bb52c80be0e462328f58ca3a34ecfef3584320)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/devlink.h
+#	net/core/devlink.c
+diff --cc include/uapi/linux/devlink.h
+index 500c31eab326,e7891d1d2ebd..000000000000
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@@ -424,6 -425,12 +424,15 @@@ enum devlink_attr 
+  	DEVLINK_ATTR_RELOAD_FAILED,			/* u8 0 or 1 */
+  
+  	DEVLINK_ATTR_HEALTH_REPORTER_DUMP_TS_NS,	/* u64 */
+++<<<<<<< HEAD
+++=======
++ 
++ 	DEVLINK_ATTR_NETNS_FD,			/* u32 */
++ 	DEVLINK_ATTR_NETNS_PID,			/* u32 */
++ 	DEVLINK_ATTR_NETNS_ID,			/* u32 */
++ 
++ 	DEVLINK_ATTR_HEALTH_REPORTER_AUTO_DUMP,	/* u8 */
+++>>>>>>> 48bb52c80be0 (devlink: Add auto dump flag to health reporter)
+  	/* add new attributes above here, update the policy in devlink.c */
+  
+  	__DEVLINK_ATTR_MAX,
+diff --cc net/core/devlink.c
+index d02f367eb501,85c7887356f6..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -4712,7 -5155,8 +4713,12 @@@ devlink_health_reporter_create(struct d
+  	reporter->ops = ops;
+  	reporter->devlink = devlink;
+  	reporter->graceful_period = graceful_period;
+++<<<<<<< HEAD
+ +	reporter->auto_recover = auto_recover;
+++=======
++ 	reporter->auto_recover = !!ops->recover;
++ 	reporter->auto_dump = !!ops->dump;
+++>>>>>>> 48bb52c80be0 (devlink: Add auto dump flag to health reporter)
+  	mutex_init(&reporter->dump_lock);
+  	refcount_set(&reporter->refcount, 1);
+  	list_add_tail(&reporter->list, &devlink->reporter_list);
+@@@ -5016,6 -5278,184 +5026,187 @@@ static void devlink_recover_notify(stru
+  }
+  
+  void
+++<<<<<<< HEAD
+++=======
++ devlink_health_reporter_recovery_done(struct devlink_health_reporter *reporter)
++ {
++ 	reporter->recovery_count++;
++ 	reporter->last_recovery_ts = jiffies;
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_reporter_recovery_done);
++ 
++ static int
++ devlink_health_reporter_recover(struct devlink_health_reporter *reporter,
++ 				void *priv_ctx, struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (reporter->health_state == DEVLINK_HEALTH_REPORTER_STATE_HEALTHY)
++ 		return 0;
++ 
++ 	if (!reporter->ops->recover)
++ 		return -EOPNOTSUPP;
++ 
++ 	err = reporter->ops->recover(reporter, priv_ctx, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	devlink_health_reporter_recovery_done(reporter);
++ 	reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_HEALTHY;
++ 	devlink_recover_notify(reporter, DEVLINK_CMD_HEALTH_REPORTER_RECOVER);
++ 
++ 	return 0;
++ }
++ 
++ static void
++ devlink_health_dump_clear(struct devlink_health_reporter *reporter)
++ {
++ 	if (!reporter->dump_fmsg)
++ 		return;
++ 	devlink_fmsg_free(reporter->dump_fmsg);
++ 	reporter->dump_fmsg = NULL;
++ }
++ 
++ static int devlink_health_do_dump(struct devlink_health_reporter *reporter,
++ 				  void *priv_ctx,
++ 				  struct netlink_ext_ack *extack)
++ {
++ 	int err;
++ 
++ 	if (!reporter->ops->dump)
++ 		return 0;
++ 
++ 	if (reporter->dump_fmsg)
++ 		return 0;
++ 
++ 	reporter->dump_fmsg = devlink_fmsg_alloc();
++ 	if (!reporter->dump_fmsg) {
++ 		err = -ENOMEM;
++ 		return err;
++ 	}
++ 
++ 	err = devlink_fmsg_obj_nest_start(reporter->dump_fmsg);
++ 	if (err)
++ 		goto dump_err;
++ 
++ 	err = reporter->ops->dump(reporter, reporter->dump_fmsg,
++ 				  priv_ctx, extack);
++ 	if (err)
++ 		goto dump_err;
++ 
++ 	err = devlink_fmsg_obj_nest_end(reporter->dump_fmsg);
++ 	if (err)
++ 		goto dump_err;
++ 
++ 	reporter->dump_ts = jiffies;
++ 	reporter->dump_real_ts = ktime_get_real_ns();
++ 
++ 	return 0;
++ 
++ dump_err:
++ 	devlink_health_dump_clear(reporter);
++ 	return err;
++ }
++ 
++ int devlink_health_report(struct devlink_health_reporter *reporter,
++ 			  const char *msg, void *priv_ctx)
++ {
++ 	enum devlink_health_reporter_state prev_health_state;
++ 	struct devlink *devlink = reporter->devlink;
++ 
++ 	/* write a log message of the current error */
++ 	WARN_ON(!msg);
++ 	trace_devlink_health_report(devlink, reporter->ops->name, msg);
++ 	reporter->error_count++;
++ 	prev_health_state = reporter->health_state;
++ 	reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
++ 	devlink_recover_notify(reporter, DEVLINK_CMD_HEALTH_REPORTER_RECOVER);
++ 
++ 	/* abort if the previous error wasn't recovered */
++ 	if (reporter->auto_recover &&
++ 	    (prev_health_state != DEVLINK_HEALTH_REPORTER_STATE_HEALTHY ||
++ 	     jiffies - reporter->last_recovery_ts <
++ 	     msecs_to_jiffies(reporter->graceful_period))) {
++ 		trace_devlink_health_recover_aborted(devlink,
++ 						     reporter->ops->name,
++ 						     reporter->health_state,
++ 						     jiffies -
++ 						     reporter->last_recovery_ts);
++ 		return -ECANCELED;
++ 	}
++ 
++ 	reporter->health_state = DEVLINK_HEALTH_REPORTER_STATE_ERROR;
++ 
++ 	if (reporter->auto_dump) {
++ 		mutex_lock(&reporter->dump_lock);
++ 		/* store current dump of current error, for later analysis */
++ 		devlink_health_do_dump(reporter, priv_ctx, NULL);
++ 		mutex_unlock(&reporter->dump_lock);
++ 	}
++ 
++ 	if (reporter->auto_recover)
++ 		return devlink_health_reporter_recover(reporter,
++ 						       priv_ctx, NULL);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL_GPL(devlink_health_report);
++ 
++ static struct devlink_health_reporter *
++ devlink_health_reporter_get_from_attrs(struct devlink *devlink,
++ 				       struct nlattr **attrs)
++ {
++ 	struct devlink_health_reporter *reporter;
++ 	char *reporter_name;
++ 
++ 	if (!attrs[DEVLINK_ATTR_HEALTH_REPORTER_NAME])
++ 		return NULL;
++ 
++ 	reporter_name = nla_data(attrs[DEVLINK_ATTR_HEALTH_REPORTER_NAME]);
++ 	mutex_lock(&devlink->reporters_lock);
++ 	reporter = devlink_health_reporter_find_by_name(devlink, reporter_name);
++ 	if (reporter)
++ 		refcount_inc(&reporter->refcount);
++ 	mutex_unlock(&devlink->reporters_lock);
++ 	return reporter;
++ }
++ 
++ static struct devlink_health_reporter *
++ devlink_health_reporter_get_from_info(struct devlink *devlink,
++ 				      struct genl_info *info)
++ {
++ 	return devlink_health_reporter_get_from_attrs(devlink, info->attrs);
++ }
++ 
++ static struct devlink_health_reporter *
++ devlink_health_reporter_get_from_cb(struct netlink_callback *cb)
++ {
++ 	const struct genl_dumpit_info *info = genl_dumpit_info(cb);
++ 	struct devlink_health_reporter *reporter;
++ 	struct nlattr **attrs = info->attrs;
++ 	struct devlink *devlink;
++ 
++ 	mutex_lock(&devlink_mutex);
++ 	devlink = devlink_get_from_attrs(sock_net(cb->skb->sk), attrs);
++ 	if (IS_ERR(devlink))
++ 		goto unlock;
++ 
++ 	reporter = devlink_health_reporter_get_from_attrs(devlink, attrs);
++ 	mutex_unlock(&devlink_mutex);
++ 	return reporter;
++ unlock:
++ 	mutex_unlock(&devlink_mutex);
++ 	return NULL;
++ }
++ 
++ static void
++ devlink_health_reporter_put(struct devlink_health_reporter *reporter)
++ {
++ 	refcount_dec(&reporter->refcount);
++ }
++ 
++ void
+++>>>>>>> 48bb52c80be0 (devlink: Add auto dump flag to health reporter)
+  devlink_health_reporter_state_update(struct devlink_health_reporter *reporter,
+  				     enum devlink_health_reporter_state state)
+  {
+@@@ -5863,6 -6327,10 +6063,13 @@@ static const struct nla_policy devlink_
+  	[DEVLINK_ATTR_TRAP_NAME] = { .type = NLA_NUL_STRING },
+  	[DEVLINK_ATTR_TRAP_ACTION] = { .type = NLA_U8 },
+  	[DEVLINK_ATTR_TRAP_GROUP_NAME] = { .type = NLA_NUL_STRING },
+++<<<<<<< HEAD
+++=======
++ 	[DEVLINK_ATTR_NETNS_PID] = { .type = NLA_U32 },
++ 	[DEVLINK_ATTR_NETNS_FD] = { .type = NLA_U32 },
++ 	[DEVLINK_ATTR_NETNS_ID] = { .type = NLA_U32 },
++ 	[DEVLINK_ATTR_HEALTH_REPORTER_AUTO_DUMP] = { .type = NLA_U8 },
+++>>>>>>> 48bb52c80be0 (devlink: Add auto dump flag to health reporter)
+  };
+  
+  static const struct genl_ops devlink_nl_ops[] = {
+* Unmerged path include/uapi/linux/devlink.h
+* Unmerged path net/core/devlink.c
