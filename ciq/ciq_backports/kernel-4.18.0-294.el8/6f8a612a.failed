@@ -1,0 +1,445 @@
+mptcp: keep track of advertised windows right edge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 6f8a612a33e426d473f7161d1950dc00a613494b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6f8a612a.failed
+
+Before sending 'x' new bytes also check that the new snd_una would
+be within the permitted receive window.
+
+For every ACK that also contains a DSS ack, check whether its tcp-level
+receive window would advance the current mptcp window right edge and
+update it if so.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+Co-developed-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 6f8a612a33e426d473f7161d1950dc00a613494b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/mptcp/protocol.c
+diff --cc net/mptcp/protocol.c
+index d41791292d73,5a92b9239909..000000000000
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@@ -145,10 -149,135 +151,139 @@@ static bool mptcp_try_coalesce(struct s
+  	return true;
+  }
+  
+ -static bool mptcp_ooo_try_coalesce(struct mptcp_sock *msk, struct sk_buff *to,
+ -				   struct sk_buff *from)
+ +static void __mptcp_move_skb(struct mptcp_sock *msk, struct sock *ssk,
+ +			     struct sk_buff *skb,
+ +			     unsigned int offset, size_t copy_len)
+  {
+++<<<<<<< HEAD
+++=======
++ 	if (MPTCP_SKB_CB(from)->map_seq != MPTCP_SKB_CB(to)->end_seq)
++ 		return false;
++ 
++ 	return mptcp_try_coalesce((struct sock *)msk, to, from);
++ }
++ 
++ /* "inspired" by tcp_data_queue_ofo(), main differences:
++  * - use mptcp seqs
++  * - don't cope with sacks
++  */
++ static void mptcp_data_queue_ofo(struct mptcp_sock *msk, struct sk_buff *skb)
++ {
++ 	struct sock *sk = (struct sock *)msk;
++ 	struct rb_node **p, *parent;
++ 	u64 seq, end_seq, max_seq;
++ 	struct sk_buff *skb1;
++ 	int space;
++ 
++ 	seq = MPTCP_SKB_CB(skb)->map_seq;
++ 	end_seq = MPTCP_SKB_CB(skb)->end_seq;
++ 	space = tcp_space(sk);
++ 	max_seq = space > 0 ? space + msk->ack_seq : msk->ack_seq;
++ 
++ 	pr_debug("msk=%p seq=%llx limit=%llx empty=%d", msk, seq, max_seq,
++ 		 RB_EMPTY_ROOT(&msk->out_of_order_queue));
++ 	if (after64(seq, max_seq)) {
++ 		/* out of window */
++ 		mptcp_drop(sk, skb);
++ 		pr_debug("oow by %ld", (unsigned long)seq - (unsigned long)max_seq);
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_NODSSWINDOW);
++ 		return;
++ 	}
++ 
++ 	p = &msk->out_of_order_queue.rb_node;
++ 	MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOQUEUE);
++ 	if (RB_EMPTY_ROOT(&msk->out_of_order_queue)) {
++ 		rb_link_node(&skb->rbnode, NULL, p);
++ 		rb_insert_color(&skb->rbnode, &msk->out_of_order_queue);
++ 		msk->ooo_last_skb = skb;
++ 		goto end;
++ 	}
++ 
++ 	/* with 2 subflows, adding at end of ooo queue is quite likely
++ 	 * Use of ooo_last_skb avoids the O(Log(N)) rbtree lookup.
++ 	 */
++ 	if (mptcp_ooo_try_coalesce(msk, msk->ooo_last_skb, skb)) {
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOMERGE);
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOQUEUETAIL);
++ 		return;
++ 	}
++ 
++ 	/* Can avoid an rbtree lookup if we are adding skb after ooo_last_skb */
++ 	if (!before64(seq, MPTCP_SKB_CB(msk->ooo_last_skb)->end_seq)) {
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOQUEUETAIL);
++ 		parent = &msk->ooo_last_skb->rbnode;
++ 		p = &parent->rb_right;
++ 		goto insert;
++ 	}
++ 
++ 	/* Find place to insert this segment. Handle overlaps on the way. */
++ 	parent = NULL;
++ 	while (*p) {
++ 		parent = *p;
++ 		skb1 = rb_to_skb(parent);
++ 		if (before64(seq, MPTCP_SKB_CB(skb1)->map_seq)) {
++ 			p = &parent->rb_left;
++ 			continue;
++ 		}
++ 		if (before64(seq, MPTCP_SKB_CB(skb1)->end_seq)) {
++ 			if (!after64(end_seq, MPTCP_SKB_CB(skb1)->end_seq)) {
++ 				/* All the bits are present. Drop. */
++ 				mptcp_drop(sk, skb);
++ 				MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
++ 				return;
++ 			}
++ 			if (after64(seq, MPTCP_SKB_CB(skb1)->map_seq)) {
++ 				/* partial overlap:
++ 				 *     |     skb      |
++ 				 *  |     skb1    |
++ 				 * continue traversing
++ 				 */
++ 			} else {
++ 				/* skb's seq == skb1's seq and skb covers skb1.
++ 				 * Replace skb1 with skb.
++ 				 */
++ 				rb_replace_node(&skb1->rbnode, &skb->rbnode,
++ 						&msk->out_of_order_queue);
++ 				mptcp_drop(sk, skb1);
++ 				MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
++ 				goto merge_right;
++ 			}
++ 		} else if (mptcp_ooo_try_coalesce(msk, skb1, skb)) {
++ 			MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_OFOMERGE);
++ 			return;
++ 		}
++ 		p = &parent->rb_right;
++ 	}
++ 
++ insert:
++ 	/* Insert segment into RB tree. */
++ 	rb_link_node(&skb->rbnode, parent, p);
++ 	rb_insert_color(&skb->rbnode, &msk->out_of_order_queue);
++ 
++ merge_right:
++ 	/* Remove other segments covered by skb. */
++ 	while ((skb1 = skb_rb_next(skb)) != NULL) {
++ 		if (before64(end_seq, MPTCP_SKB_CB(skb1)->end_seq))
++ 			break;
++ 		rb_erase(&skb1->rbnode, &msk->out_of_order_queue);
++ 		mptcp_drop(sk, skb1);
++ 		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_DUPDATA);
++ 	}
++ 	/* If there is no skb after us, we are the last_skb ! */
++ 	if (!skb1)
++ 		msk->ooo_last_skb = skb;
++ 
++ end:
++ 	skb_condense(skb);
++ 	skb_set_owner_r(skb, sk);
++ }
++ 
++ static bool __mptcp_move_skb(struct mptcp_sock *msk, struct sock *ssk,
++ 			     struct sk_buff *skb, unsigned int offset,
++ 			     size_t copy_len)
++ {
++ 	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(ssk);
+++>>>>>>> 6f8a612a33e4 (mptcp: keep track of advertised windows right edge)
+  	struct sock *sk = (struct sock *)msk;
+  	struct sk_buff *tail;
+  
+@@@ -709,56 -944,52 +845,85 @@@ mptcp_carve_data_frag(const struct mptc
+  	return dfrag;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct mptcp_sendmsg_info {
++ 	int mss_now;
++ 	int size_goal;
++ 	u16 limit;
++ 	u16 sent;
++ 	unsigned int flags;
++ };
++ 
++ static int mptcp_check_allowed_size(struct mptcp_sock *msk, u64 data_seq,
++ 				    int avail_size)
++ {
++ 	u64 window_end = mptcp_wnd_end(msk);
++ 
++ 	if (__mptcp_check_fallback(msk))
++ 		return avail_size;
++ 
++ 	if (!before64(data_seq + avail_size, window_end)) {
++ 		u64 allowed_size = window_end - data_seq;
++ 
++ 		return min_t(unsigned int, allowed_size, avail_size);
++ 	}
++ 
++ 	return avail_size;
++ }
++ 
+++>>>>>>> 6f8a612a33e4 (mptcp: keep track of advertised windows right edge)
+  static int mptcp_sendmsg_frag(struct sock *sk, struct sock *ssk,
+ -			      struct mptcp_data_frag *dfrag,
+ -			      struct mptcp_sendmsg_info *info)
+ +			      struct msghdr *msg, struct mptcp_data_frag *dfrag,
+ +			      long *timeo, int *pmss_now,
+ +			      int *ps_goal)
+  {
+ -	u64 data_seq = dfrag->data_seq + info->sent;
+ +	int mss_now, avail_size, size_goal, offset, ret, frag_truesize = 0;
+ +	bool dfrag_collapsed, can_collapse = false;
+  	struct mptcp_sock *msk = mptcp_sk(sk);
++ 	bool zero_window_probe = false;
+  	struct mptcp_ext *mpext = NULL;
+ +	bool retransmission = !!dfrag;
+  	struct sk_buff *skb, *tail;
+ -	bool can_collapse = false;
+ -	int avail_size;
+ -	size_t ret;
+ +	struct page_frag *pfrag;
+ +	struct page *page;
+ +	u64 *write_seq;
+ +	size_t psize;
+ +
+ +	/* use the mptcp page cache so that we can easily move the data
+ +	 * from one substream to another, but do per subflow memory accounting
+ +	 * Note: pfrag is used only !retransmission, but the compiler if
+ +	 * fooled into a warning if we don't init here
+ +	 */
+ +	pfrag = sk_page_frag(sk);
+ +	while ((!retransmission && !mptcp_page_frag_refill(ssk, pfrag)) ||
+ +	       !mptcp_ext_cache_refill(msk)) {
+ +		ret = sk_stream_wait_memory(ssk, timeo);
+ +		if (ret)
+ +			return ret;
+  
+ -	pr_debug("msk=%p ssk=%p sending dfrag at seq=%lld len=%d already sent=%d",
+ -		 msk, ssk, dfrag->data_seq, dfrag->data_len, info->sent);
+ +		/* if sk_stream_wait_memory() sleeps snd_una can change
+ +		 * significantly, refresh the rtx queue
+ +		 */
+ +		mptcp_clean_una(sk);
+ +	}
+ +	if (!retransmission) {
+ +		write_seq = &msk->write_seq;
+ +		page = pfrag->page;
+ +	} else {
+ +		write_seq = &dfrag->data_seq;
+ +		page = dfrag->page;
+ +	}
+  
+ -	/* compute send limit */
+ -	info->mss_now = tcp_send_mss(ssk, &info->size_goal, info->flags);
+ -	avail_size = info->size_goal;
+ +	/* compute copy limit */
+ +	mss_now = tcp_send_mss(ssk, &size_goal, msg->msg_flags);
+ +	*pmss_now = mss_now;
+ +	*ps_goal = size_goal;
+ +	avail_size = size_goal;
+  	skb = tcp_write_queue_tail(ssk);
+  	if (skb) {
+ +		mpext = skb_ext_find(skb, SKB_EXT_MPTCP);
+ +
+  		/* Limit the write to the size available in the
+  		 * current skb, if any, so that we create at most a new skb.
+  		 * Explicitly tells TCP internals to avoid collapsing on later
+@@@ -770,43 -1002,26 +935,59 @@@
+  		if (!can_collapse)
+  			TCP_SKB_CB(skb)->eor = 1;
+  		else
+ -			avail_size = info->size_goal - skb->len;
+ +			avail_size = size_goal - skb->len;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!retransmission) {
+ +		/* reuse tail pfrag, if possible, or carve a new one from the
+ +		 * page allocator
+ +		 */
+ +		dfrag = mptcp_rtx_tail(sk);
+ +		offset = pfrag->offset;
+ +		dfrag_collapsed = mptcp_frag_can_collapse_to(msk, pfrag, dfrag);
+ +		if (!dfrag_collapsed) {
+ +			dfrag = mptcp_carve_data_frag(msk, pfrag, offset);
+ +			offset = dfrag->offset;
+ +			frag_truesize = dfrag->overhead;
+ +		}
+ +		psize = min_t(size_t, pfrag->size - offset, avail_size);
+++=======
++ 	/* Zero window and all data acked? Probe. */
++ 	avail_size = mptcp_check_allowed_size(msk, data_seq, avail_size);
++ 	if (avail_size == 0) {
++ 		if (skb || atomic64_read(&msk->snd_una) != msk->snd_nxt)
++ 			return 0;
++ 		zero_window_probe = true;
++ 		data_seq = atomic64_read(&msk->snd_una) - 1;
++ 		avail_size = 1;
++ 	}
++ 
++ 	if (WARN_ON_ONCE(info->sent > info->limit ||
++ 			 info->limit > dfrag->data_len))
++ 		return 0;
+++>>>>>>> 6f8a612a33e4 (mptcp: keep track of advertised windows right edge)
+ +
+ +		/* Copy to page */
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		psize = copy_page_from_iter(pfrag->page, offset,
+ +					    min_t(size_t, msg_data_left(msg),
+ +						  psize),
+ +					    &msg->msg_iter);
+ +		pr_debug("left=%zu", msg_data_left(msg));
+ +		if (!psize)
+ +			return -EINVAL;
+  
+ -	ret = info->limit - info->sent;
+ -	tail = tcp_build_frag(ssk, avail_size, info->flags, dfrag->page,
+ -			      dfrag->offset + info->sent, &ret);
+ +		if (!sk_wmem_schedule(sk, psize + dfrag->overhead)) {
+ +			iov_iter_revert(&msg->msg_iter, psize);
+ +			return -ENOMEM;
+ +		}
+ +	} else {
+ +		offset = dfrag->offset;
+ +		psize = min_t(size_t, dfrag->data_len, avail_size);
+ +	}
+ +
+ +	tail = tcp_build_frag(ssk, psize, msg->msg_flags, page, offset, &psize);
+  	if (!tail) {
+  		tcp_remove_empty_skb(sk, tcp_write_queue_tail(ssk));
+  		return -ENOMEM;
+@@@ -858,12 -1050,14 +1040,18 @@@
+  		 mpext->data_seq, mpext->subflow_seq, mpext->data_len,
+  		 mpext->dsn64);
+  
++ 	if (zero_window_probe) {
++ 		mptcp_subflow_ctx(ssk)->rel_write_seq += ret;
++ 		mpext->frozen = 1;
++ 		ret = 0;
++ 		tcp_push_pending_frames(ssk);
++ 	}
+  out:
+ +	if (!retransmission)
+ +		pfrag->offset += frag_truesize;
+ +	WRITE_ONCE(*write_seq, *write_seq + ret);
+  	mptcp_subflow_ctx(ssk)->rel_write_seq += ret;
+ +
+  	return ret;
+  }
+  
+@@@ -1462,13 -1904,12 +1650,22 @@@ static void mptcp_worker(struct work_st
+  
+  	lock_sock(ssk);
+  
+++<<<<<<< HEAD
+ +	orig_len = dfrag->data_len;
+ +	orig_offset = dfrag->offset;
+ +	orig_write_seq = dfrag->data_seq;
+ +	while (dfrag->data_len > 0) {
+ +		int ret = mptcp_sendmsg_frag(sk, ssk, &msg, dfrag, &timeo,
+ +					     &mss_now, &size_goal);
+ +		if (ret < 0)
+++=======
++ 	/* limit retransmission to the bytes already sent on some subflows */
++ 	info.sent = 0;
++ 	info.limit = dfrag->already_sent;
++ 	while (info.sent < dfrag->already_sent) {
++ 		ret = mptcp_sendmsg_frag(sk, ssk, dfrag, &info);
++ 		if (ret <= 0)
+++>>>>>>> 6f8a612a33e4 (mptcp: keep track of advertised windows right edge)
+  			break;
+  
+  		MPTCP_INC_STATS(sock_net(sk), MPTCP_MIB_RETRANSSEGS);
+diff --git a/net/mptcp/options.c b/net/mptcp/options.c
+index cfc2e1d06a18..72f417070f9b 100644
+--- a/net/mptcp/options.c
++++ b/net/mptcp/options.c
+@@ -756,11 +756,14 @@ static u64 expand_ack(u64 old_ack, u64 cur_ack, bool use_64bit)
+ 	return cur_ack;
+ }
+ 
+-static void update_una(struct mptcp_sock *msk,
+-		       struct mptcp_options_received *mp_opt)
++static void ack_update_msk(struct mptcp_sock *msk,
++			   const struct sock *ssk,
++			   struct mptcp_options_received *mp_opt)
+ {
+ 	u64 new_snd_una, snd_una, old_snd_una = atomic64_read(&msk->snd_una);
++	u64 new_wnd_end, wnd_end, old_wnd_end = atomic64_read(&msk->wnd_end);
+ 	u64 snd_nxt = READ_ONCE(msk->snd_nxt);
++	struct sock *sk = (struct sock *)msk;
+ 
+ 	/* avoid ack expansion on update conflict, to reduce the risk of
+ 	 * wrongly expanding to a future ack sequence number, which is way
+@@ -772,12 +775,25 @@ static void update_una(struct mptcp_sock *msk,
+ 	if (after64(new_snd_una, snd_nxt))
+ 		new_snd_una = old_snd_una;
+ 
++	new_wnd_end = new_snd_una + tcp_sk(ssk)->snd_wnd;
++
++	while (after64(new_wnd_end, old_wnd_end)) {
++		wnd_end = old_wnd_end;
++		old_wnd_end = atomic64_cmpxchg(&msk->wnd_end, wnd_end,
++					       new_wnd_end);
++		if (old_wnd_end == wnd_end) {
++			if (mptcp_send_head(sk))
++				mptcp_schedule_work(sk);
++			break;
++		}
++	}
++
+ 	while (after64(new_snd_una, old_snd_una)) {
+ 		snd_una = old_snd_una;
+ 		old_snd_una = atomic64_cmpxchg(&msk->snd_una, snd_una,
+ 					       new_snd_una);
+ 		if (old_snd_una == snd_una) {
+-			mptcp_data_acked((struct sock *)msk);
++			mptcp_data_acked(sk);
+ 			break;
+ 		}
+ 	}
+@@ -867,7 +883,7 @@ void mptcp_incoming_options(struct sock *sk, struct sk_buff *skb)
+ 	 * monodirectional flows will stuck
+ 	 */
+ 	if (mp_opt.use_ack)
+-		update_una(msk, &mp_opt);
++		ack_update_msk(msk, sk, &mp_opt);
+ 
+ 	/* Zero-data-length packets are dropped by the caller and not
+ 	 * propagated to the MPTCP layer, so the skb extension does not
+* Unmerged path net/mptcp/protocol.c
+diff --git a/net/mptcp/protocol.h b/net/mptcp/protocol.h
+index a60ec79c4e54..268ca1b54e3e 100644
+--- a/net/mptcp/protocol.h
++++ b/net/mptcp/protocol.h
+@@ -205,6 +205,7 @@ struct mptcp_sock {
+ 	u64		ack_seq;
+ 	u64		rcv_data_fin_seq;
+ 	atomic64_t	snd_una;
++	atomic64_t	wnd_end;
+ 	unsigned long	timer_ival;
+ 	u32		token;
+ 	unsigned long	flags;
