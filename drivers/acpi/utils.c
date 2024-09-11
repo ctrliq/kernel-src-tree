@@ -117,7 +117,6 @@ acpi_extract_package(union acpi_object *package,
 					      " [%c]\n",
 					      i, format_string[i]);
 				return AE_BAD_DATA;
-				break;
 			}
 			break;
 
@@ -142,7 +141,6 @@ acpi_extract_package(union acpi_object *package,
 					      " expecting [%c]\n",
 					      i, format_string[i]);
 				return AE_BAD_DATA;
-				break;
 			}
 			break;
 		case ACPI_TYPE_LOCAL_REFERENCE:
@@ -157,7 +155,6 @@ acpi_extract_package(union acpi_object *package,
 					      " expecting [%c]\n",
 					      i, format_string[i]);
 				return AE_BAD_DATA;
-				break;
 			}
 			break;
 
@@ -168,7 +165,6 @@ acpi_extract_package(union acpi_object *package,
 					  i));
 			/* TBD: handle nested packages... */
 			return AE_SUPPORT;
-			break;
 		}
 	}
 
