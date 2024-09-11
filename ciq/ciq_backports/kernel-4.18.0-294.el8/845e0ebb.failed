@@ -1,0 +1,905 @@
+net: change addr_list_lock back to static key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [net] change addr_list_lock back to static key (Ivan Vecera) [1867961]
+Rebuild_FUZZ: 94.12%
+commit-author Cong Wang <xiyou.wangcong@gmail.com>
+commit 845e0ebb4408d4473cf60d21224a897037e9a77a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/845e0ebb.failed
+
+The dynamic key update for addr_list_lock still causes troubles,
+for example the following race condition still exists:
+
+CPU 0:				CPU 1:
+(RCU read lock)			(RTNL lock)
+dev_mc_seq_show()		netdev_update_lockdep_key()
+				  -> lockdep_unregister_key()
+ -> netif_addr_lock_bh()
+
+because lockdep doesn't provide an API to update it atomically.
+Therefore, we have to move it back to static keys and use subclass
+for nest locking like before.
+
+In commit 1a33e10e4a95 ("net: partially revert dynamic lockdep key
+changes"), I already reverted most parts of commit ab92d68fc22f
+("net: core: add generic lockdep keys").
+
+This patch reverts the rest and also part of commit f3b0a18bb6cb
+("net: remove unnecessary variables and callback"). After this
+patch, addr_list_lock changes back to using static keys and
+subclasses to satisfy lockdep. Thanks to dev->lower_level, we do
+not have to change back to ->ndo_get_lock_subclass().
+
+And hopefully this reduces some syzbot lockdep noises too.
+
+	Reported-by: syzbot+f3a0e80c34b3fc28ac5e@syzkaller.appspotmail.com
+	Cc: Taehee Yoo <ap420073@gmail.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Signed-off-by: Cong Wang <xiyou.wangcong@gmail.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 845e0ebb4408d4473cf60d21224a897037e9a77a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/hamradio/bpqether.c
+#	drivers/net/macsec.c
+#	drivers/net/macvlan.c
+#	drivers/net/wireless/intersil/hostap/hostap_hw.c
+#	include/linux/netdevice.h
+#	net/8021q/vlan_dev.c
+#	net/batman-adv/soft-interface.c
+#	net/core/dev.c
+#	net/dsa/master.c
+#	net/netrom/af_netrom.c
+#	net/rose/af_rose.c
+diff --cc drivers/net/hamradio/bpqether.c
+index 036f912bb8b2,1ad6085994b1..000000000000
+--- a/drivers/net/hamradio/bpqether.c
++++ b/drivers/net/hamradio/bpqether.c
+@@@ -112,6 -107,27 +112,30 @@@ struct bpqdev 
+  
+  static LIST_HEAD(bpq_devices);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * bpqether network devices are paired with ethernet devices below them, so
++  * form a special "super class" of normal ethernet devices; split their locks
++  * off into a separate class since they always nest.
++  */
++ static struct lock_class_key bpq_netdev_xmit_lock_key;
++ static struct lock_class_key bpq_netdev_addr_lock_key;
++ 
++ static void bpq_set_lockdep_class_one(struct net_device *dev,
++ 				      struct netdev_queue *txq,
++ 				      void *_unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock, &bpq_netdev_xmit_lock_key);
++ }
++ 
++ static void bpq_set_lockdep_class(struct net_device *dev)
++ {
++ 	lockdep_set_class(&dev->addr_list_lock, &bpq_netdev_addr_lock_key);
++ 	netdev_for_each_tx_queue(dev, bpq_set_lockdep_class_one, NULL);
++ }
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  /* ------------------------------------------------------------------------ */
+  
+  
+diff --cc drivers/net/macsec.c
+index 708209d5dd26,e56547bfdac9..000000000000
+--- a/drivers/net/macsec.c
++++ b/drivers/net/macsec.c
+@@@ -3261,6 -4051,11 +3263,14 @@@ static int macsec_newlink(struct net *n
+  	if (err < 0)
+  		return err;
+  
+++<<<<<<< HEAD
+++=======
++ 	netdev_lockdep_set_classes(dev);
++ 	lockdep_set_class_and_subclass(&dev->addr_list_lock,
++ 				       &macsec_netdev_addr_lock_key,
++ 				       dev->lower_level);
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  	err = netdev_upper_dev_link(real_dev, dev, extack);
+  	if (err < 0)
+  		goto unregister;
+diff --cc drivers/net/macvlan.c
+index f4843edefca4,6a6cc9f75307..000000000000
+--- a/drivers/net/macvlan.c
++++ b/drivers/net/macvlan.c
+@@@ -891,6 -902,7 +901,10 @@@ static int macvlan_init(struct net_devi
+  	dev->gso_max_size	= lowerdev->gso_max_size;
+  	dev->gso_max_segs	= lowerdev->gso_max_segs;
+  	dev->hard_header_len	= lowerdev->hard_header_len;
+++<<<<<<< HEAD
+++=======
++ 	macvlan_set_lockdep_class(dev);
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  
+  	vlan->pcpu_stats = netdev_alloc_pcpu_stats(struct vlan_pcpu_stats);
+  	if (!vlan->pcpu_stats)
+diff --cc drivers/net/wireless/intersil/hostap/hostap_hw.c
+index 94545ade2bf2,2ab34cf74ecc..000000000000
+--- a/drivers/net/wireless/intersil/hostap/hostap_hw.c
++++ b/drivers/net/wireless/intersil/hostap/hostap_hw.c
+@@@ -3044,6 -3041,30 +3044,33 @@@ static void prism2_clear_set_tim_queue(
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * HostAP uses two layers of net devices, where the inner
++  * layer gets called all the time from the outer layer.
++  * This is a natural nesting, which needs a split lock type.
++  */
++ static struct lock_class_key hostap_netdev_xmit_lock_key;
++ static struct lock_class_key hostap_netdev_addr_lock_key;
++ 
++ static void prism2_set_lockdep_class_one(struct net_device *dev,
++ 					 struct netdev_queue *txq,
++ 					 void *_unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock,
++ 			  &hostap_netdev_xmit_lock_key);
++ }
++ 
++ static void prism2_set_lockdep_class(struct net_device *dev)
++ {
++ 	lockdep_set_class(&dev->addr_list_lock,
++ 			  &hostap_netdev_addr_lock_key);
++ 	netdev_for_each_tx_queue(dev, prism2_set_lockdep_class_one, NULL);
++ }
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  static struct net_device *
+  prism2_init_local_data(struct prism2_helper_functions *funcs, int card_idx,
+  		       struct device *sdev)
+diff --cc include/linux/netdevice.h
+index 4f3ecb3f5361,e2825e27ef89..000000000000
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@@ -1903,13 -1820,9 +1903,19 @@@ struct net_device_extended_rh 
+   *	@phydev:	Physical device may attach itself
+   *			for hardware timestamping
+   *	@sfp_bus:	attached &struct sfp_bus structure.
+++<<<<<<< HEAD
+ + *	@qdisc_tx_busylock_key: lockdep class annotating Qdisc->busylock
+ + *				spinlock
+ + *	@qdisc_running_key:	lockdep class annotating Qdisc->running seqcount
+ + *	@qdisc_xmit_lock_key:	lockdep class annotating
+ + *				netdev_queue->_xmit_lock spinlock
+ + *	@addr_list_lock_key:	lockdep class annotating
+ + *				net_device->addr_list_lock spinlock
+++=======
++  *
++  *	@qdisc_tx_busylock: lockdep class annotating Qdisc->busylock spinlock
++  *	@qdisc_running_key: lockdep class annotating Qdisc->running seqcount
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+   *
+   *	@proto_down:	protocol port state information can be sent to the
+   *			switch driver and used to set the phys state of the
+@@@ -2212,54 -2123,17 +2218,59 @@@ struct net_device 
+  #endif
+  	struct phy_device	*phydev;
+  	struct sfp_bus		*sfp_bus;
+++<<<<<<< HEAD
+ +	RH_KABI_DEPRECATE(struct lock_class_key	*, qdisc_tx_busylock)
+ +	RH_KABI_DEPRECATE(struct lock_class_key	*, qdisc_running_key)
+ +	/* RHEL: The KABI breakage here is not real. We are inserting
+ +	 * 4 fields of type struct lock_class_key but the size of this
+ +	 * structure is zero for non-debug kernel configs because
+ +	 * LOCKDEP is not enabled for them and for debug flavours
+ +	 * KABI is not preserved.
+ +	 */
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_tx_busylock_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_running_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key qdisc_xmit_lock_key)
+ +	RH_KABI_BROKEN_INSERT(struct lock_class_key addr_list_lock_key)
+++=======
++ 	struct lock_class_key	*qdisc_tx_busylock;
++ 	struct lock_class_key	*qdisc_running_key;
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  	bool			proto_down;
+ -	unsigned		wol_enabled:1;
+ -
+ -	struct list_head	net_notifier_list;
+ -
+ -#if IS_ENABLED(CONFIG_MACSEC)
+ -	/* MACsec management functions */
+ -	const struct macsec_ops *macsec_ops;
+ -#endif
+ +	RH_KABI_FILL_HOLE(unsigned	wol_enabled:1)
+ +
+ +	/* 23 bits hole remain and... */
+ +	/* 4 bytes hole remain prior RH_KABI reservations below */
+ +
+ +	RH_KABI_USE(1, struct mpls_dev __rcu   *mpls_ptr)
+ +	RH_KABI_USE(2, 3, struct list_head	net_notifier_list)
+ +	RH_KABI_USE(4, struct xdp_dev_bulk_queue __percpu *xdp_bulkq)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_RESERVE(8)
+ +	RH_KABI_RESERVE(9)
+ +	RH_KABI_RESERVE(10)
+ +	RH_KABI_RESERVE(11)
+ +	RH_KABI_RESERVE(12)
+ +	RH_KABI_RESERVE(13)
+ +	RH_KABI_RESERVE(14)
+ +	RH_KABI_RESERVE(15)
+ +	RH_KABI_RESERVE(16)
+ +	RH_KABI_RESERVE(17)
+ +	RH_KABI_RESERVE(18)
+ +	RH_KABI_RESERVE(19)
+ +	RH_KABI_RESERVE(20)
+ +	RH_KABI_RESERVE(21)
+ +	RH_KABI_RESERVE(22)
+ +	RH_KABI_RESERVE(23)
+ +	RH_KABI_RESERVE(24)
+ +	RH_KABI_RESERVE(25)
+ +	RH_KABI_RESERVE(26)
+ +	RH_KABI_RESERVE(27)
+ +	RH_KABI_RESERVE(28)
+ +	RH_KABI_RESERVE(29)
+ +	RH_KABI_RESERVE(30)
+ +	RH_KABI_AUX_PTR(net_device_extended)
+  };
+  #define to_net_dev(d) container_of(d, struct net_device, dev)
+  
+@@@ -2339,9 -2209,28 +2350,34 @@@ static inline void netdev_for_each_tx_q
+  		f(dev, &dev->_tx[i], arg);
+  }
+  
+++<<<<<<< HEAD
+ +struct netdev_queue *netdev_pick_tx(struct net_device *dev,
+ +				    struct sk_buff *skb,
+ +				    struct net_device *sb_dev);
+++=======
++ #define netdev_lockdep_set_classes(dev)				\
++ {								\
++ 	static struct lock_class_key qdisc_tx_busylock_key;	\
++ 	static struct lock_class_key qdisc_running_key;		\
++ 	static struct lock_class_key qdisc_xmit_lock_key;	\
++ 	static struct lock_class_key dev_addr_list_lock_key;	\
++ 	unsigned int i;						\
++ 								\
++ 	(dev)->qdisc_tx_busylock = &qdisc_tx_busylock_key;	\
++ 	(dev)->qdisc_running_key = &qdisc_running_key;		\
++ 	lockdep_set_class(&(dev)->addr_list_lock,		\
++ 			  &dev_addr_list_lock_key);		\
++ 	for (i = 0; i < (dev)->num_tx_queues; i++)		\
++ 		lockdep_set_class(&(dev)->_tx[i]._xmit_lock,	\
++ 				  &qdisc_xmit_lock_key);	\
++ }
++ 
++ u16 netdev_pick_tx(struct net_device *dev, struct sk_buff *skb,
++ 		     struct net_device *sb_dev);
++ struct netdev_queue *netdev_core_pick_tx(struct net_device *dev,
++ 					 struct sk_buff *skb,
++ 					 struct net_device *sb_dev);
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  
+  /* returns the headroom that the master device needs to take in account
+   * when forwarding to this dev
+diff --cc net/8021q/vlan_dev.c
+index 84928dc428e5,c8d6a07e23c5..000000000000
+--- a/net/8021q/vlan_dev.c
++++ b/net/8021q/vlan_dev.c
+@@@ -491,6 -488,29 +491,32 @@@ static void vlan_dev_set_rx_mode(struc
+  	dev_uc_sync(vlan_dev_priv(vlan_dev)->real_dev, vlan_dev);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * vlan network devices have devices nesting below it, and are a special
++  * "super class" of normal network devices; split their locks off into a
++  * separate class since they always nest.
++  */
++ static struct lock_class_key vlan_netdev_xmit_lock_key;
++ static struct lock_class_key vlan_netdev_addr_lock_key;
++ 
++ static void vlan_dev_set_lockdep_one(struct net_device *dev,
++ 				     struct netdev_queue *txq,
++ 				     void *unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock, &vlan_netdev_xmit_lock_key);
++ }
++ 
++ static void vlan_dev_set_lockdep_class(struct net_device *dev, int subclass)
++ {
++ 	lockdep_set_class_and_subclass(&dev->addr_list_lock,
++ 				       &vlan_netdev_addr_lock_key,
++ 				       subclass);
++ 	netdev_for_each_tx_queue(dev, vlan_dev_set_lockdep_one, NULL);
++ }
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  static const struct header_ops vlan_header_ops = {
+  	.create	 = vlan_dev_hard_header,
+  	.parse	 = eth_header_parse,
+@@@ -578,8 -601,10 +604,15 @@@ static int vlan_dev_init(struct net_dev
+  
+  	SET_NETDEV_DEVTYPE(dev, &vlan_type);
+  
+++<<<<<<< HEAD
+ +	vlan_dev_priv(dev)->vlan_pcpu_stats = netdev_alloc_pcpu_stats(struct vlan_pcpu_stats);
+ +	if (!vlan_dev_priv(dev)->vlan_pcpu_stats)
+++=======
++ 	vlan_dev_set_lockdep_class(dev, dev->lower_level);
++ 
++ 	vlan->vlan_pcpu_stats = netdev_alloc_pcpu_stats(struct vlan_pcpu_stats);
++ 	if (!vlan->vlan_pcpu_stats)
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  		return -ENOMEM;
+  
+  	return 0;
+diff --cc net/batman-adv/soft-interface.c
+index b0323760e099,f1f1c86f3419..000000000000
+--- a/net/batman-adv/soft-interface.c
++++ b/net/batman-adv/soft-interface.c
+@@@ -726,6 -740,36 +726,39 @@@ static int batadv_interface_kill_vid(st
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* batman-adv network devices have devices nesting below it and are a special
++  * "super class" of normal network devices; split their locks off into a
++  * separate class since they always nest.
++  */
++ static struct lock_class_key batadv_netdev_xmit_lock_key;
++ static struct lock_class_key batadv_netdev_addr_lock_key;
++ 
++ /**
++  * batadv_set_lockdep_class_one() - Set lockdep class for a single tx queue
++  * @dev: device which owns the tx queue
++  * @txq: tx queue to modify
++  * @_unused: always NULL
++  */
++ static void batadv_set_lockdep_class_one(struct net_device *dev,
++ 					 struct netdev_queue *txq,
++ 					 void *_unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock, &batadv_netdev_xmit_lock_key);
++ }
++ 
++ /**
++  * batadv_set_lockdep_class() - Set txq and addr_list lockdep class
++  * @dev: network device to modify
++  */
++ static void batadv_set_lockdep_class(struct net_device *dev)
++ {
++ 	lockdep_set_class(&dev->addr_list_lock, &batadv_netdev_addr_lock_key);
++ 	netdev_for_each_tx_queue(dev, batadv_set_lockdep_class_one, NULL);
++ }
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  /**
+   * batadv_softif_init_late() - late stage initialization of soft interface
+   * @dev: registered network device to modify
+diff --cc net/core/dev.c
+index a84b03df897e,6bc2388141f6..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -284,6 -399,89 +284,92 @@@ static RAW_NOTIFIER_HEAD(netdev_chain)
+  DEFINE_PER_CPU_ALIGNED(struct softnet_data, softnet_data);
+  EXPORT_PER_CPU_SYMBOL(softnet_data);
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_LOCKDEP
++ /*
++  * register_netdevice() inits txq->_xmit_lock and sets lockdep class
++  * according to dev->type
++  */
++ static const unsigned short netdev_lock_type[] = {
++ 	 ARPHRD_NETROM, ARPHRD_ETHER, ARPHRD_EETHER, ARPHRD_AX25,
++ 	 ARPHRD_PRONET, ARPHRD_CHAOS, ARPHRD_IEEE802, ARPHRD_ARCNET,
++ 	 ARPHRD_APPLETLK, ARPHRD_DLCI, ARPHRD_ATM, ARPHRD_METRICOM,
++ 	 ARPHRD_IEEE1394, ARPHRD_EUI64, ARPHRD_INFINIBAND, ARPHRD_SLIP,
++ 	 ARPHRD_CSLIP, ARPHRD_SLIP6, ARPHRD_CSLIP6, ARPHRD_RSRVD,
++ 	 ARPHRD_ADAPT, ARPHRD_ROSE, ARPHRD_X25, ARPHRD_HWX25,
++ 	 ARPHRD_PPP, ARPHRD_CISCO, ARPHRD_LAPB, ARPHRD_DDCMP,
++ 	 ARPHRD_RAWHDLC, ARPHRD_TUNNEL, ARPHRD_TUNNEL6, ARPHRD_FRAD,
++ 	 ARPHRD_SKIP, ARPHRD_LOOPBACK, ARPHRD_LOCALTLK, ARPHRD_FDDI,
++ 	 ARPHRD_BIF, ARPHRD_SIT, ARPHRD_IPDDP, ARPHRD_IPGRE,
++ 	 ARPHRD_PIMREG, ARPHRD_HIPPI, ARPHRD_ASH, ARPHRD_ECONET,
++ 	 ARPHRD_IRDA, ARPHRD_FCPP, ARPHRD_FCAL, ARPHRD_FCPL,
++ 	 ARPHRD_FCFABRIC, ARPHRD_IEEE80211, ARPHRD_IEEE80211_PRISM,
++ 	 ARPHRD_IEEE80211_RADIOTAP, ARPHRD_PHONET, ARPHRD_PHONET_PIPE,
++ 	 ARPHRD_IEEE802154, ARPHRD_VOID, ARPHRD_NONE};
++ 
++ static const char *const netdev_lock_name[] = {
++ 	"_xmit_NETROM", "_xmit_ETHER", "_xmit_EETHER", "_xmit_AX25",
++ 	"_xmit_PRONET", "_xmit_CHAOS", "_xmit_IEEE802", "_xmit_ARCNET",
++ 	"_xmit_APPLETLK", "_xmit_DLCI", "_xmit_ATM", "_xmit_METRICOM",
++ 	"_xmit_IEEE1394", "_xmit_EUI64", "_xmit_INFINIBAND", "_xmit_SLIP",
++ 	"_xmit_CSLIP", "_xmit_SLIP6", "_xmit_CSLIP6", "_xmit_RSRVD",
++ 	"_xmit_ADAPT", "_xmit_ROSE", "_xmit_X25", "_xmit_HWX25",
++ 	"_xmit_PPP", "_xmit_CISCO", "_xmit_LAPB", "_xmit_DDCMP",
++ 	"_xmit_RAWHDLC", "_xmit_TUNNEL", "_xmit_TUNNEL6", "_xmit_FRAD",
++ 	"_xmit_SKIP", "_xmit_LOOPBACK", "_xmit_LOCALTLK", "_xmit_FDDI",
++ 	"_xmit_BIF", "_xmit_SIT", "_xmit_IPDDP", "_xmit_IPGRE",
++ 	"_xmit_PIMREG", "_xmit_HIPPI", "_xmit_ASH", "_xmit_ECONET",
++ 	"_xmit_IRDA", "_xmit_FCPP", "_xmit_FCAL", "_xmit_FCPL",
++ 	"_xmit_FCFABRIC", "_xmit_IEEE80211", "_xmit_IEEE80211_PRISM",
++ 	"_xmit_IEEE80211_RADIOTAP", "_xmit_PHONET", "_xmit_PHONET_PIPE",
++ 	"_xmit_IEEE802154", "_xmit_VOID", "_xmit_NONE"};
++ 
++ static struct lock_class_key netdev_xmit_lock_key[ARRAY_SIZE(netdev_lock_type)];
++ static struct lock_class_key netdev_addr_lock_key[ARRAY_SIZE(netdev_lock_type)];
++ 
++ static inline unsigned short netdev_lock_pos(unsigned short dev_type)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(netdev_lock_type); i++)
++ 		if (netdev_lock_type[i] == dev_type)
++ 			return i;
++ 	/* the last key is used by default */
++ 	return ARRAY_SIZE(netdev_lock_type) - 1;
++ }
++ 
++ static inline void netdev_set_xmit_lockdep_class(spinlock_t *lock,
++ 						 unsigned short dev_type)
++ {
++ 	int i;
++ 
++ 	i = netdev_lock_pos(dev_type);
++ 	lockdep_set_class_and_name(lock, &netdev_xmit_lock_key[i],
++ 				   netdev_lock_name[i]);
++ }
++ 
++ static inline void netdev_set_addr_lockdep_class(struct net_device *dev)
++ {
++ 	int i;
++ 
++ 	i = netdev_lock_pos(dev->type);
++ 	lockdep_set_class_and_name(&dev->addr_list_lock,
++ 				   &netdev_addr_lock_key[i],
++ 				   netdev_lock_name[i]);
++ }
++ #else
++ static inline void netdev_set_xmit_lockdep_class(spinlock_t *lock,
++ 						 unsigned short dev_type)
++ {
++ }
++ 
++ static inline void netdev_set_addr_lockdep_class(struct net_device *dev)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  /*******************************************************************************
+   *
+   *		Protocol management and registration routines
+@@@ -8831,31 -9388,6 +8917,34 @@@ void netif_tx_stop_all_queues(struct ne
+  }
+  EXPORT_SYMBOL(netif_tx_stop_all_queues);
+  
+++<<<<<<< HEAD
+ +static void netdev_register_lockdep_key(struct net_device *dev)
+ +{
+ +	lockdep_register_key(&dev->qdisc_tx_busylock_key);
+ +	lockdep_register_key(&dev->qdisc_running_key);
+ +	lockdep_register_key(&dev->qdisc_xmit_lock_key);
+ +	lockdep_register_key(&dev->addr_list_lock_key);
+ +}
+ +
+ +static void netdev_unregister_lockdep_key(struct net_device *dev)
+ +{
+ +	lockdep_unregister_key(&dev->qdisc_tx_busylock_key);
+ +	lockdep_unregister_key(&dev->qdisc_running_key);
+ +	lockdep_unregister_key(&dev->qdisc_xmit_lock_key);
+ +	lockdep_unregister_key(&dev->addr_list_lock_key);
+ +}
+ +
+ +void netdev_update_lockdep_key(struct net_device *dev)
+ +{
+ +	lockdep_unregister_key(&dev->addr_list_lock_key);
+ +	lockdep_register_key(&dev->addr_list_lock_key);
+ +
+ +	lockdep_set_class(&dev->addr_list_lock, &dev->addr_list_lock_key);
+ +}
+ +EXPORT_SYMBOL(netdev_update_lockdep_key);
+ +
+++=======
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  /**
+   *	register_netdevice	- register a network device
+   *	@dev: device to register
+@@@ -8889,8 -9421,12 +8978,8 @@@ int register_netdevice(struct net_devic
+  	BUG_ON(dev->reg_state != NETREG_UNINITIALIZED);
+  	BUG_ON(!net);
+  
+ -	ret = ethtool_check_ops(dev->ethtool_ops);
+ -	if (ret)
+ -		return ret;
+ -
+  	spin_lock_init(&dev->addr_list_lock);
+- 	lockdep_set_class(&dev->addr_list_lock, &dev->addr_list_lock_key);
++ 	netdev_set_addr_lockdep_class(dev);
+  
+  	ret = dev_get_valid_name(net, dev, dev->name);
+  	if (ret < 0)
+@@@ -9400,8 -9945,6 +9489,11 @@@ struct net_device *alloc_netdev_mqs(in
+  
+  	dev_net_set(dev, &init_net);
+  
+++<<<<<<< HEAD
+ +	netdev_register_lockdep_key(dev);
+ +
+++=======
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  	dev->gso_max_size = GSO_MAX_SIZE;
+  	dev->gso_max_segs = GSO_MAX_SEGS;
+  	dev->upper_level = 1;
+@@@ -9489,8 -10032,6 +9581,11 @@@ void free_netdev(struct net_device *dev
+  	free_percpu(dev->xdp_bulkq);
+  	dev->xdp_bulkq = NULL;
+  
+++<<<<<<< HEAD
+ +	netdev_unregister_lockdep_key(dev);
+ +
+++=======
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  	/*  Compatibility with error handling in drivers */
+  	if (dev->reg_state == NETREG_UNINITIALIZED) {
+  		netdev_freemem(dev);
+diff --cc net/dsa/master.c
+index c90ee3227dea,480a61460c23..000000000000
+--- a/net/dsa/master.c
++++ b/net/dsa/master.c
+@@@ -158,8 -260,86 +158,80 @@@ static void dsa_master_ethtool_teardown
+  	cpu_dp->orig_ethtool_ops = NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dsa_master_ndo_setup(struct net_device *dev)
++ {
++ 	struct dsa_port *cpu_dp = dev->dsa_ptr;
++ 	struct dsa_switch *ds = cpu_dp->ds;
++ 	struct net_device_ops *ops;
++ 
++ 	if (dev->netdev_ops->ndo_get_phys_port_name)
++ 		return 0;
++ 
++ 	ops = devm_kzalloc(ds->dev, sizeof(*ops), GFP_KERNEL);
++ 	if (!ops)
++ 		return -ENOMEM;
++ 
++ 	cpu_dp->orig_ndo_ops = dev->netdev_ops;
++ 	if (cpu_dp->orig_ndo_ops)
++ 		memcpy(ops, cpu_dp->orig_ndo_ops, sizeof(*ops));
++ 
++ 	ops->ndo_get_phys_port_name = dsa_master_get_phys_port_name;
++ 	ops->ndo_do_ioctl = dsa_master_ioctl;
++ 
++ 	dev->netdev_ops  = ops;
++ 
++ 	return 0;
++ }
++ 
++ static void dsa_master_ndo_teardown(struct net_device *dev)
++ {
++ 	struct dsa_port *cpu_dp = dev->dsa_ptr;
++ 
++ 	if (cpu_dp->orig_ndo_ops)
++ 		dev->netdev_ops = cpu_dp->orig_ndo_ops;
++ 	cpu_dp->orig_ndo_ops = NULL;
++ }
++ 
++ static ssize_t tagging_show(struct device *d, struct device_attribute *attr,
++ 			    char *buf)
++ {
++ 	struct net_device *dev = to_net_dev(d);
++ 	struct dsa_port *cpu_dp = dev->dsa_ptr;
++ 
++ 	return sprintf(buf, "%s\n",
++ 		       dsa_tag_protocol_to_str(cpu_dp->tag_ops));
++ }
++ static DEVICE_ATTR_RO(tagging);
++ 
++ static struct attribute *dsa_slave_attrs[] = {
++ 	&dev_attr_tagging.attr,
++ 	NULL
++ };
++ 
++ static const struct attribute_group dsa_group = {
++ 	.name	= "dsa",
++ 	.attrs	= dsa_slave_attrs,
++ };
++ 
++ static void dsa_master_reset_mtu(struct net_device *dev)
++ {
++ 	int err;
++ 
++ 	rtnl_lock();
++ 	err = dev_set_mtu(dev, ETH_DATA_LEN);
++ 	if (err)
++ 		netdev_dbg(dev,
++ 			   "Unable to reset MTU to exclude DSA overheads\n");
++ 	rtnl_unlock();
++ }
++ 
++ static struct lock_class_key dsa_master_addr_list_lock_key;
++ 
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  int dsa_master_setup(struct net_device *dev, struct dsa_port *cpu_dp)
+  {
+ -	int ret;
+ -
+ -	rtnl_lock();
+ -	ret = dev_set_mtu(dev, ETH_DATA_LEN + cpu_dp->tag_ops->overhead);
+ -	rtnl_unlock();
+ -	if (ret)
+ -		netdev_warn(dev, "error %d setting MTU to include DSA overhead\n",
+ -			    ret);
+ -
+  	/* If we use a tagging format that doesn't have an ethertype
+  	 * field, make sure that all packets from this point on get
+  	 * sent to the tag format's receive function.
+@@@ -167,8 -347,27 +239,16 @@@
+  	wmb();
+  
+  	dev->dsa_ptr = cpu_dp;
+++<<<<<<< HEAD
+++=======
++ 	lockdep_set_class(&dev->addr_list_lock,
++ 			  &dsa_master_addr_list_lock_key);
++ 	ret = dsa_master_ethtool_setup(dev);
++ 	if (ret)
++ 		return ret;
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+  
+ -	ret = dsa_master_ndo_setup(dev);
+ -	if (ret)
+ -		goto out_err_ethtool_teardown;
+ -
+ -	ret = sysfs_create_group(&dev->dev.kobj, &dsa_group);
+ -	if (ret)
+ -		goto out_err_ndo_teardown;
+ -
+ -	return ret;
+ -
+ -out_err_ndo_teardown:
+ -	dsa_master_ndo_teardown(dev);
+ -out_err_ethtool_teardown:
+ -	dsa_master_ethtool_teardown(dev);
+ -	return ret;
+ +	return dsa_master_ethtool_setup(dev);
+  }
+  
+  void dsa_master_teardown(struct net_device *dev)
+diff --cc net/netrom/af_netrom.c
+index 8c5cfe743eb8,f90ef6934b8f..000000000000
+--- a/net/netrom/af_netrom.c
++++ b/net/netrom/af_netrom.c
+@@@ -67,6 -64,28 +67,31 @@@ static DEFINE_SPINLOCK(nr_list_lock)
+  static const struct proto_ops nr_proto_ops;
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * NETROM network devices are virtual network devices encapsulating NETROM
++  * frames into AX.25 which will be sent through an AX.25 device, so form a
++  * special "super class" of normal net devices; split their locks off into a
++  * separate class since they always nest.
++  */
++ static struct lock_class_key nr_netdev_xmit_lock_key;
++ static struct lock_class_key nr_netdev_addr_lock_key;
++ 
++ static void nr_set_lockdep_one(struct net_device *dev,
++ 			       struct netdev_queue *txq,
++ 			       void *_unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock, &nr_netdev_xmit_lock_key);
++ }
++ 
++ static void nr_set_lockdep_key(struct net_device *dev)
++ {
++ 	lockdep_set_class(&dev->addr_list_lock, &nr_netdev_addr_lock_key);
++ 	netdev_for_each_tx_queue(dev, nr_set_lockdep_one, NULL);
++ }
++ 
++ /*
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+   *	Socket removal during an interrupt is now safe.
+   */
+  static void nr_remove_socket(struct sock *sk)
+diff --cc net/rose/af_rose.c
+index 508dfb60ef02,ce85656ac9c1..000000000000
+--- a/net/rose/af_rose.c
++++ b/net/rose/af_rose.c
+@@@ -68,6 -65,28 +68,31 @@@ static const struct proto_ops rose_prot
+  ax25_address rose_callsign;
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * ROSE network devices are virtual network devices encapsulating ROSE
++  * frames into AX.25 which will be sent through an AX.25 device, so form a
++  * special "super class" of normal net devices; split their locks off into a
++  * separate class since they always nest.
++  */
++ static struct lock_class_key rose_netdev_xmit_lock_key;
++ static struct lock_class_key rose_netdev_addr_lock_key;
++ 
++ static void rose_set_lockdep_one(struct net_device *dev,
++ 				 struct netdev_queue *txq,
++ 				 void *_unused)
++ {
++ 	lockdep_set_class(&txq->_xmit_lock, &rose_netdev_xmit_lock_key);
++ }
++ 
++ static void rose_set_lockdep_key(struct net_device *dev)
++ {
++ 	lockdep_set_class(&dev->addr_list_lock, &rose_netdev_addr_lock_key);
++ 	netdev_for_each_tx_queue(dev, rose_set_lockdep_one, NULL);
++ }
++ 
++ /*
+++>>>>>>> 845e0ebb4408 (net: change addr_list_lock back to static key)
+   *	Convert a ROSE address into text.
+   */
+  char *rose2asc(char *buf, const rose_address *addr)
+diff --git a/drivers/net/bonding/bond_main.c b/drivers/net/bonding/bond_main.c
+index 5e837d952641..9739f7e65486 100644
+--- a/drivers/net/bonding/bond_main.c
++++ b/drivers/net/bonding/bond_main.c
+@@ -3687,8 +3687,6 @@ static int bond_do_ioctl(struct net_device *bond_dev, struct ifreq *ifr, int cmd
+ 	case BOND_RELEASE_OLD:
+ 	case SIOCBONDRELEASE:
+ 		res = bond_release(bond_dev, slave_dev);
+-		if (!res)
+-			netdev_update_lockdep_key(slave_dev);
+ 		break;
+ 	case BOND_SETHWADDR_OLD:
+ 	case SIOCBONDSETHWADDR:
+diff --git a/drivers/net/bonding/bond_options.c b/drivers/net/bonding/bond_options.c
+index 215c10923289..ddb3916d3506 100644
+--- a/drivers/net/bonding/bond_options.c
++++ b/drivers/net/bonding/bond_options.c
+@@ -1398,8 +1398,6 @@ static int bond_option_slaves_set(struct bonding *bond,
+ 	case '-':
+ 		slave_dbg(bond->dev, dev, "Releasing interface\n");
+ 		ret = bond_release(bond->dev, dev);
+-		if (!ret)
+-			netdev_update_lockdep_key(dev);
+ 		break;
+ 
+ 	default:
+* Unmerged path drivers/net/hamradio/bpqether.c
+* Unmerged path drivers/net/macsec.c
+* Unmerged path drivers/net/macvlan.c
+diff --git a/drivers/net/vxlan.c b/drivers/net/vxlan.c
+index 205667d02a99..f72203ad1dfa 100644
+--- a/drivers/net/vxlan.c
++++ b/drivers/net/vxlan.c
+@@ -3933,10 +3933,8 @@ static int vxlan_changelink(struct net_device *dev, struct nlattr *tb[],
+ 		mod_timer(&vxlan->age_timer, jiffies);
+ 
+ 	netdev_adjacent_change_commit(dst->remote_dev, lowerdev, dev);
+-	if (lowerdev && lowerdev != dst->remote_dev) {
++	if (lowerdev && lowerdev != dst->remote_dev)
+ 		dst->remote_dev = lowerdev;
+-		netdev_update_lockdep_key(lowerdev);
+-	}
+ 	vxlan_config_apply(dev, &conf, lowerdev, vxlan->net, true);
+ 	return 0;
+ }
+* Unmerged path drivers/net/wireless/intersil/hostap/hostap_hw.c
+* Unmerged path include/linux/netdevice.h
+* Unmerged path net/8021q/vlan_dev.c
+* Unmerged path net/batman-adv/soft-interface.c
+diff --git a/net/bridge/br_device.c b/net/bridge/br_device.c
+index a515521ffa96..824bf4646291 100644
+--- a/net/bridge/br_device.c
++++ b/net/bridge/br_device.c
+@@ -109,6 +109,13 @@ netdev_tx_t br_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	return NETDEV_TX_OK;
+ }
+ 
++static struct lock_class_key bridge_netdev_addr_lock_key;
++
++static void br_set_lockdep_class(struct net_device *dev)
++{
++	lockdep_set_class(&dev->addr_list_lock, &bridge_netdev_addr_lock_key);
++}
++
+ static int br_dev_init(struct net_device *dev)
+ {
+ 	struct net_bridge *br = netdev_priv(dev);
+@@ -138,6 +145,7 @@ static int br_dev_init(struct net_device *dev)
+ 		br_fdb_hash_fini(br);
+ 	}
+ 
++	br_set_lockdep_class(dev);
+ 	return err;
+ }
+ 
+* Unmerged path net/core/dev.c
+diff --git a/net/core/dev_addr_lists.c b/net/core/dev_addr_lists.c
+index 84c3f0bc7bf9..973c0913840a 100644
+--- a/net/core/dev_addr_lists.c
++++ b/net/core/dev_addr_lists.c
+@@ -544,7 +544,7 @@ int dev_uc_sync(struct net_device *to, struct net_device *from)
+ 	if (to->addr_len != from->addr_len)
+ 		return -EINVAL;
+ 
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	err = __hw_addr_sync(&to->uc, &from->uc, to->addr_len);
+ 	if (!err)
+ 		__dev_set_rx_mode(to);
+@@ -574,7 +574,7 @@ int dev_uc_sync_multiple(struct net_device *to, struct net_device *from)
+ 	if (to->addr_len != from->addr_len)
+ 		return -EINVAL;
+ 
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	err = __hw_addr_sync_multiple(&to->uc, &from->uc, to->addr_len);
+ 	if (!err)
+ 		__dev_set_rx_mode(to);
+@@ -598,7 +598,7 @@ void dev_uc_unsync(struct net_device *to, struct net_device *from)
+ 		return;
+ 
+ 	netif_addr_lock_bh(from);
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	__hw_addr_unsync(&to->uc, &from->uc, to->addr_len);
+ 	__dev_set_rx_mode(to);
+ 	netif_addr_unlock(to);
+@@ -765,7 +765,7 @@ int dev_mc_sync(struct net_device *to, struct net_device *from)
+ 	if (to->addr_len != from->addr_len)
+ 		return -EINVAL;
+ 
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	err = __hw_addr_sync(&to->mc, &from->mc, to->addr_len);
+ 	if (!err)
+ 		__dev_set_rx_mode(to);
+@@ -795,7 +795,7 @@ int dev_mc_sync_multiple(struct net_device *to, struct net_device *from)
+ 	if (to->addr_len != from->addr_len)
+ 		return -EINVAL;
+ 
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	err = __hw_addr_sync_multiple(&to->mc, &from->mc, to->addr_len);
+ 	if (!err)
+ 		__dev_set_rx_mode(to);
+@@ -819,7 +819,7 @@ void dev_mc_unsync(struct net_device *to, struct net_device *from)
+ 		return;
+ 
+ 	netif_addr_lock_bh(from);
+-	netif_addr_lock(to);
++	netif_addr_lock_nested(to);
+ 	__hw_addr_unsync(&to->mc, &from->mc, to->addr_len);
+ 	__dev_set_rx_mode(to);
+ 	netif_addr_unlock(to);
+diff --git a/net/core/rtnetlink.c b/net/core/rtnetlink.c
+index 547c820c186b..160a5c0b4817 100644
+--- a/net/core/rtnetlink.c
++++ b/net/core/rtnetlink.c
+@@ -2413,7 +2413,6 @@ static int do_set_master(struct net_device *dev, int ifindex,
+ 			err = ops->ndo_del_slave(upper_dev, dev);
+ 			if (err)
+ 				return err;
+-			netdev_update_lockdep_key(dev);
+ 		} else {
+ 			return -EOPNOTSUPP;
+ 		}
+* Unmerged path net/dsa/master.c
+* Unmerged path net/netrom/af_netrom.c
+* Unmerged path net/rose/af_rose.c
