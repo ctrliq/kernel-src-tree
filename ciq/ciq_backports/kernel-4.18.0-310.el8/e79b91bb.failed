@@ -1,0 +1,286 @@
+KVM: SVM: use vmsave/vmload for saving/restoring additional host state
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Michael Roth <michael.roth@amd.com>
+commit e79b91bb3c916a52ce823ab60489c717c925c49f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/e79b91bb.failed
+
+Using a guest workload which simply issues 'hlt' in a tight loop to
+generate VMEXITs, it was observed (on a recent EPYC processor) that a
+significant amount of the VMEXIT overhead measured on the host was the
+result of MSR reads/writes in svm_vcpu_load/svm_vcpu_put according to
+perf:
+
+  67.49%--kvm_arch_vcpu_ioctl_run
+          |
+          |--23.13%--vcpu_put
+          |          kvm_arch_vcpu_put
+          |          |
+          |          |--21.31%--native_write_msr
+          |          |
+          |           --1.27%--svm_set_cr4
+          |
+          |--16.11%--vcpu_load
+          |          |
+          |           --15.58%--kvm_arch_vcpu_load
+          |                     |
+          |                     |--13.97%--svm_set_cr4
+          |                     |          |
+          |                     |          |--12.64%--native_read_msr
+
+Most of these MSRs relate to 'syscall'/'sysenter' and segment bases, and
+can be saved/restored using 'vmsave'/'vmload' instructions rather than
+explicit MSR reads/writes. In doing so there is a significant reduction
+in the svm_vcpu_load/svm_vcpu_put overhead measured for the above
+workload:
+
+  50.92%--kvm_arch_vcpu_ioctl_run
+          |
+          |--19.28%--disable_nmi_singlestep
+          |
+          |--13.68%--vcpu_load
+          |          kvm_arch_vcpu_load
+          |          |
+          |          |--9.19%--svm_set_cr4
+          |          |          |
+          |          |           --6.44%--native_read_msr
+          |          |
+          |           --3.55%--native_write_msr
+          |
+          |--6.05%--kvm_inject_nmi
+          |--2.80%--kvm_sev_es_mmio_read
+          |--2.19%--vcpu_put
+          |          |
+          |           --1.25%--kvm_arch_vcpu_put
+          |                     native_write_msr
+
+Quantifying this further, if we look at the raw cycle counts for a
+normal iteration of the above workload (according to 'rdtscp'),
+kvm_arch_vcpu_ioctl_run() takes ~4600 cycles from start to finish with
+the current behavior. Using 'vmsave'/'vmload', this is reduced to
+~2800 cycles, a savings of 39%.
+
+While this approach doesn't seem to manifest in any noticeable
+improvement for more realistic workloads like UnixBench, netperf, and
+kernel builds, likely due to their exit paths generally involving IO
+with comparatively high latencies, it does improve overall overhead
+of KVM_RUN significantly, which may still be noticeable for certain
+situations. It also simplifies some aspects of the code.
+
+With this change, explicit save/restore is no longer needed for the
+following host MSRs, since they are documented[1] as being part of the
+VMCB State Save Area:
+
+  MSR_STAR, MSR_LSTAR, MSR_CSTAR,
+  MSR_SYSCALL_MASK, MSR_KERNEL_GS_BASE,
+  MSR_IA32_SYSENTER_CS,
+  MSR_IA32_SYSENTER_ESP,
+  MSR_IA32_SYSENTER_EIP,
+  MSR_FS_BASE, MSR_GS_BASE
+
+and only the following MSR needs individual handling in
+svm_vcpu_put/svm_vcpu_load:
+
+  MSR_TSC_AUX
+
+We could drop the host_save_user_msrs array/loop and instead handle
+MSR read/write of MSR_TSC_AUX directly, but we leave that for now as
+a potential follow-up.
+
+Since 'vmsave'/'vmload' also handles the LDTR and FS/GS segment
+registers (and associated hidden state)[2], some of the code
+previously used to handle this is no longer needed, so we drop it
+as well.
+
+The first public release of the SVM spec[3] also documents the same
+handling for the host state in question, so we make these changes
+unconditionally.
+
+Also worth noting is that we 'vmsave' to the same page that is
+subsequently used by 'vmrun' to record some host additional state. This
+is okay, since, in accordance with the spec[2], the additional state
+written to the page by 'vmrun' does not overwrite any fields written by
+'vmsave'. This has also been confirmed through testing (for the above
+CPU, at least).
+
+[1] AMD64 Architecture Programmer's Manual, Rev 3.33, Volume 2, Appendix B, Table B-2
+[2] AMD64 Architecture Programmer's Manual, Rev 3.31, Volume 3, Chapter 4, VMSAVE/VMLOAD
+[3] Secure Virtual Machine Architecture Reference Manual, Rev 3.01
+
+	Suggested-by: Tom Lendacky <thomas.lendacky@amd.com>
+	Signed-off-by: Michael Roth <michael.roth@amd.com>
+Message-Id: <20210202190126.2185715-2-michael.roth@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e79b91bb3c916a52ce823ab60489c717c925c49f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+#	arch/x86/kvm/svm/svm_ops.h
+diff --cc arch/x86/kvm/svm/svm.c
+index eca4258a8e0e,fc4c3cc60d69..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -1393,15 -1424,15 +1393,27 @@@ static void svm_vcpu_load(struct kvm_vc
+  		vmcb_mark_all_dirty(svm->vmcb);
+  	}
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_X86_64
+ +	rdmsrl(MSR_GS_BASE, to_svm(vcpu)->host.gs_base);
+ +#endif
+ +	savesegment(fs, svm->host.fs);
+ +	savesegment(gs, svm->host.gs);
+ +	svm->host.ldt = kvm_read_ldt();
+ +
+ +	for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
+ +		rdmsrl(host_save_user_msrs[i], svm->host_user_msrs[i]);
+++=======
++ 	if (sev_es_guest(svm->vcpu.kvm)) {
++ 		sev_es_vcpu_load(svm, cpu);
++ 	} else {
++ 		for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
++ 			rdmsrl(host_save_user_msrs[i].index,
++ 			       svm->host_user_msrs[i]);
++ 
++ 		vmsave(__sme_page_pa(sd->save_area));
++ 	}
+++>>>>>>> e79b91bb3c91 (KVM: SVM: use vmsave/vmload for saving/restoring additional host state)
+  
+  	if (static_cpu_has(X86_FEATURE_TSCRATEMSR)) {
+  		u64 tsc_ratio = vcpu->arch.tsc_scaling_ratio;
+@@@ -1429,18 -1460,13 +1441,28 @@@ static void svm_vcpu_put(struct kvm_vcp
+  	avic_vcpu_put(vcpu);
+  
+  	++vcpu->stat.host_state_reload;
+++<<<<<<< HEAD
+ +	kvm_load_ldt(svm->host.ldt);
+ +#ifdef CONFIG_X86_64
+ +	loadsegment(fs, svm->host.fs);
+ +	wrmsrl(MSR_KERNEL_GS_BASE, current->thread.gsbase);
+ +	load_gs_index(svm->host.gs);
+ +#else
+ +#ifdef CONFIG_X86_32_LAZY_GS
+ +	loadsegment(gs, svm->host.gs);
+ +#endif
+ +#endif
+ +	for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
+ +		wrmsrl(host_save_user_msrs[i], svm->host_user_msrs[i]);
+++=======
++ 	if (sev_es_guest(svm->vcpu.kvm)) {
++ 		sev_es_vcpu_put(svm);
++ 	} else {
++ 		for (i = 0; i < NR_HOST_SAVE_USER_MSRS; i++)
++ 			wrmsrl(host_save_user_msrs[i].index,
++ 			       svm->host_user_msrs[i]);
++ 	}
+++>>>>>>> e79b91bb3c91 (KVM: SVM: use vmsave/vmload for saving/restoring additional host state)
+  }
+  
+  static unsigned long svm_get_rflags(struct kvm_vcpu *vcpu)
+@@@ -3670,9 -3744,60 +3692,46 @@@ static fastpath_t svm_exit_handlers_fas
+  	return EXIT_FASTPATH_NONE;
+  }
+  
+ -static noinstr void svm_vcpu_enter_exit(struct kvm_vcpu *vcpu,
+ -					struct vcpu_svm *svm)
+ -{
+ -	/*
+ -	 * VMENTER enables interrupts (host state), but the kernel state is
+ -	 * interrupts disabled when this is invoked. Also tell RCU about
+ -	 * it. This is the same logic as for exit_to_user_mode().
+ -	 *
+ -	 * This ensures that e.g. latency analysis on the host observes
+ -	 * guest mode as interrupt enabled.
+ -	 *
+ -	 * guest_enter_irqoff() informs context tracking about the
+ -	 * transition to guest mode and if enabled adjusts RCU state
+ -	 * accordingly.
+ -	 */
+ -	instrumentation_begin();
+ -	trace_hardirqs_on_prepare();
+ -	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
+ -	instrumentation_end();
+ +void __svm_vcpu_run(unsigned long vmcb_pa, unsigned long *regs);
+  
+++<<<<<<< HEAD
+ +static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++=======
++ 	guest_enter_irqoff();
++ 	lockdep_hardirqs_on(CALLER_ADDR0);
++ 
++ 	if (sev_es_guest(svm->vcpu.kvm)) {
++ 		__svm_sev_es_vcpu_run(svm->vmcb_pa);
++ 	} else {
++ 		struct svm_cpu_data *sd = per_cpu(svm_data, vcpu->cpu);
++ 
++ 		__svm_vcpu_run(svm->vmcb_pa, (unsigned long *)&svm->vcpu.arch.regs);
++ 
++ 		vmload(__sme_page_pa(sd->save_area));
++ 	}
++ 
++ 	/*
++ 	 * VMEXIT disables interrupts (host state), but tracing and lockdep
++ 	 * have them in state 'on' as recorded before entering guest mode.
++ 	 * Same as enter_from_user_mode().
++ 	 *
++ 	 * guest_exit_irqoff() restores host context and reinstates RCU if
++ 	 * enabled and required.
++ 	 *
++ 	 * This needs to be done before the below as native_read_msr()
++ 	 * contains a tracepoint and x86_spec_ctrl_restore_host() calls
++ 	 * into world and some more.
++ 	 */
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	guest_exit_irqoff();
++ 
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ 
++ static __no_kcsan fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+++>>>>>>> e79b91bb3c91 (KVM: SVM: use vmsave/vmload for saving/restoring additional host state)
+  {
+  	struct vcpu_svm *svm = to_svm(vcpu);
+  
+diff --cc arch/x86/kvm/svm/svm.h
+index de600f536464,2d227ba34368..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -22,18 -23,15 +22,26 @@@
+  
+  #define __sme_page_pa(x) __sme_set(page_to_pfn(x) << PAGE_SHIFT)
+  
+++<<<<<<< HEAD
+ +static const u32 host_save_user_msrs[] = {
+ +#ifdef CONFIG_X86_64
+ +	MSR_STAR, MSR_LSTAR, MSR_CSTAR, MSR_SYSCALL_MASK, MSR_KERNEL_GS_BASE,
+ +	MSR_FS_BASE,
+ +#endif
+ +	MSR_IA32_SYSENTER_CS, MSR_IA32_SYSENTER_ESP, MSR_IA32_SYSENTER_EIP,
+ +	MSR_TSC_AUX,
+++=======
++ static const struct svm_host_save_msrs {
++ 	u32 index;		/* Index of the MSR */
++ 	bool sev_es_restored;	/* True if MSR is restored on SEV-ES VMEXIT */
++ } host_save_user_msrs[] = {
++ 	{ .index = MSR_TSC_AUX,			.sev_es_restored = false },
+++>>>>>>> e79b91bb3c91 (KVM: SVM: use vmsave/vmload for saving/restoring additional host state)
+  };
+ +
+  #define NR_HOST_SAVE_USER_MSRS ARRAY_SIZE(host_save_user_msrs)
+  
+ -#define MAX_DIRECT_ACCESS_MSRS	18
+ +#define MAX_DIRECT_ACCESS_MSRS	15
+  #define MSRPM_OFFSETS	16
+  extern u32 msrpm_offsets[MSRPM_OFFSETS] __read_mostly;
+  extern bool npt_enabled;
+* Unmerged path arch/x86/kvm/svm/svm_ops.h
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
+* Unmerged path arch/x86/kvm/svm/svm_ops.h
