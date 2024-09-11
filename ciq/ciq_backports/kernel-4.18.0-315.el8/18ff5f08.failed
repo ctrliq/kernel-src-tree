@@ -1,0 +1,162 @@
+scsi: smartpqi: Add additional logging for LUN resets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Kevin Barnett <kevin.barnett@microchip.com>
+commit 18ff5f0877be9bf45079691939d2ff7af6e437ae
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/18ff5f08.failed
+
+LUN resets can take longer to complete. Adding in more driver logging helps
+show where the driver is in the reset process.
+
+Add a timeout in pqi_device_wait_for_pending_io() to cap how long the
+driver will wait for outstanding commands.
+
+Link: https://lore.kernel.org/r/161549385119.25025.10366493975709358647.stgit@brunhilda
+	Reviewed-by: Mahesh Rajashekhara <mahesh.rajashekhara@microchip.com>
+	Reviewed-by: Scott Benesh <scott.benesh@microchip.com>
+	Reviewed-by: Mike McGowen <mike.mcgowen@microchip.com>
+	Reviewed-by: Scott Teel <scott.teel@microchip.com>
+	Signed-off-by: Kevin Barnett <kevin.barnett@microchip.com>
+	Signed-off-by: Don Brace <don.brace@microchip.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 18ff5f0877be9bf45079691939d2ff7af6e437ae)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/smartpqi/smartpqi_init.c
+diff --cc drivers/scsi/smartpqi/smartpqi_init.c
+index 248a9a8f9a8a,91616ddafd17..000000000000
+--- a/drivers/scsi/smartpqi/smartpqi_init.c
++++ b/drivers/scsi/smartpqi/smartpqi_init.c
+@@@ -317,40 -324,45 +317,63 @@@ static inline void pqi_ctrl_unblock_req
+  	wake_up_all(&ctrl_info->block_requests_wait);
+  }
+  
+ -static void pqi_wait_if_ctrl_blocked(struct pqi_ctrl_info *ctrl_info)
+ +static unsigned long pqi_wait_if_ctrl_blocked(struct pqi_ctrl_info *ctrl_info,
+ +	unsigned long timeout_msecs)
+  {
+ +	unsigned long remaining_msecs;
+ +
+  	if (!pqi_ctrl_blocked(ctrl_info))
+ -		return;
+ +		return timeout_msecs;
+  
+  	atomic_inc(&ctrl_info->num_blocked_threads);
+ -	wait_event(ctrl_info->block_requests_wait,
+ -		!pqi_ctrl_blocked(ctrl_info));
+ +
+ +	if (timeout_msecs == NO_TIMEOUT) {
+ +		wait_event(ctrl_info->block_requests_wait,
+ +			!pqi_ctrl_blocked(ctrl_info));
+ +		remaining_msecs = timeout_msecs;
+ +	} else {
+ +		unsigned long remaining_jiffies;
+ +
+ +		remaining_jiffies =
+ +			wait_event_timeout(ctrl_info->block_requests_wait,
+ +				!pqi_ctrl_blocked(ctrl_info),
+ +				msecs_to_jiffies(timeout_msecs));
+ +		remaining_msecs = jiffies_to_msecs(remaining_jiffies);
+ +	}
+ +
+  	atomic_dec(&ctrl_info->num_blocked_threads);
+ +
+ +	return remaining_msecs;
+  }
+  
++ #define PQI_QUIESCE_WARNING_TIMEOUT_SECS		10
++ 
+  static inline void pqi_ctrl_wait_until_quiesced(struct pqi_ctrl_info *ctrl_info)
+  {
++ 	unsigned long start_jiffies;
++ 	unsigned long warning_timeout;
++ 	bool displayed_warning;
++ 
++ 	displayed_warning = false;
++ 	start_jiffies = jiffies;
++ 	warning_timeout = (PQI_QUIESCE_WARNING_TIMEOUT_SECS * PQI_HZ) + start_jiffies;
++ 
+  	while (atomic_read(&ctrl_info->num_busy_threads) >
+- 		atomic_read(&ctrl_info->num_blocked_threads))
++ 		atomic_read(&ctrl_info->num_blocked_threads)) {
++ 		if (time_after(jiffies, warning_timeout)) {
++ 			dev_warn(&ctrl_info->pci_dev->dev,
++ 				"waiting %u seconds for driver activity to quiesce\n",
++ 				jiffies_to_msecs(jiffies - start_jiffies) / 1000);
++ 			displayed_warning = true;
++ 			warning_timeout = (PQI_QUIESCE_WARNING_TIMEOUT_SECS * PQI_HZ) + jiffies;
++ 		}
+  		usleep_range(1000, 2000);
++ 	}
++ 
++ 	if (displayed_warning)
++ 		dev_warn(&ctrl_info->pci_dev->dev,
++ 			"driver activity quiesced after waiting for %u seconds\n",
++ 			jiffies_to_msecs(jiffies - start_jiffies) / 1000);
+  }
+  
+  static inline bool pqi_device_offline(struct pqi_scsi_dev *device)
+@@@ -1549,20 -1692,19 +1572,24 @@@ static int pqi_add_device(struct pqi_ct
+  	return rc;
+  }
+  
+- #define PQI_PENDING_IO_TIMEOUT_SECS	20
++ #define PQI_REMOVE_DEVICE_PENDING_IO_TIMEOUT_MSECS	(20 * 1000)
+  
+ -static inline void pqi_remove_device(struct pqi_ctrl_info *ctrl_info, struct pqi_scsi_dev *device)
+ +static inline void pqi_remove_device(struct pqi_ctrl_info *ctrl_info,
+ +	struct pqi_scsi_dev *device)
+  {
+  	int rc;
+  
+  	pqi_device_remove_start(device);
+  
+  	rc = pqi_device_wait_for_pending_io(ctrl_info, device,
+++<<<<<<< HEAD
+ +		PQI_PENDING_IO_TIMEOUT_SECS);
+++=======
++ 		PQI_REMOVE_DEVICE_PENDING_IO_TIMEOUT_MSECS);
+++>>>>>>> 18ff5f0877be (scsi: smartpqi: Add additional logging for LUN resets)
+  	if (rc)
+  		dev_err(&ctrl_info->pci_dev->dev,
+ -			"scsi %d:%d:%d:%d removing device with %d outstanding command(s)\n",
+ +			"scsi %d:%d:%d:%d removing device with %d outstanding commands\n",
+  			ctrl_info->scsi_host->host_no, device->bus,
+  			device->target, device->lun,
+  			atomic_read(&device->scsi_cmds_outstanding));
+@@@ -3007,13 -3197,11 +3038,12 @@@ static int pqi_process_io_intr(struct p
+  		case PQI_RESPONSE_IU_VENDOR_GENERAL:
+  			io_request->status =
+  				get_unaligned_le16(
+ -				&((struct pqi_vendor_general_response *)response)->status);
+ +				&((struct pqi_vendor_general_response *)
+ +					response)->status);
+  			break;
+  		case PQI_RESPONSE_IU_TASK_MANAGEMENT:
+- 			io_request->status =
+- 				pqi_interpret_task_management_response(
+- 					(void *)response);
++ 			io_request->status = pqi_interpret_task_management_response(ctrl_info,
++ 				(void *)response);
+  			break;
+  		case PQI_RESPONSE_IU_AIO_PATH_DISABLED:
+  			pqi_aio_path_disabled(io_request);
+@@@ -5629,11 -5967,9 +5682,10 @@@ static int pqi_lun_reset(struct pqi_ctr
+  		sizeof(request->lun_number));
+  	request->task_management_function = SOP_TASK_MANAGEMENT_LUN_RESET;
+  	if (ctrl_info->tmf_iu_timeout_supported)
+- 		put_unaligned_le16(PQI_LUN_RESET_TIMEOUT_SECS,
+- 					&request->timeout);
++ 		put_unaligned_le16(PQI_LUN_RESET_FIRMWARE_TIMEOUT_SECS, &request->timeout);
+  
+ -	pqi_start_io(ctrl_info, &ctrl_info->queue_groups[PQI_DEFAULT_QUEUE_GROUP], RAID_PATH,
+ +	pqi_start_io(ctrl_info,
+ +		&ctrl_info->queue_groups[PQI_DEFAULT_QUEUE_GROUP], RAID_PATH,
+  		io_request);
+  
+  	rc = pqi_wait_for_lun_reset_completion(ctrl_info, device, &wait);
+* Unmerged path drivers/scsi/smartpqi/smartpqi_init.c
