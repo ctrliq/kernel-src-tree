@@ -1,0 +1,1664 @@
+bpf: Introduce dynamic program extensions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Alexei Starovoitov <ast@kernel.org>
+commit be8704ff07d2374bcc5c675526f95e70c6459683
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/be8704ff.failed
+
+Introduce dynamic program extensions. The users can load additional BPF
+functions and replace global functions in previously loaded BPF programs while
+these programs are executing.
+
+Global functions are verified individually by the verifier based on their types only.
+Hence the global function in the new program which types match older function can
+safely replace that corresponding function.
+
+This new function/program is called 'an extension' of old program. At load time
+the verifier uses (attach_prog_fd, attach_btf_id) pair to identify the function
+to be replaced. The BPF program type is derived from the target program into
+extension program. Technically bpf_verifier_ops is copied from target program.
+The BPF_PROG_TYPE_EXT program type is a placeholder. It has empty verifier_ops.
+The extension program can call the same bpf helper functions as target program.
+Single BPF_PROG_TYPE_EXT type is used to extend XDP, SKB and all other program
+types. The verifier allows only one level of replacement. Meaning that the
+extension program cannot recursively extend an extension. That also means that
+the maximum stack size is increasing from 512 to 1024 bytes and maximum
+function nesting level from 8 to 16. The programs don't always consume that
+much. The stack usage is determined by the number of on-stack variables used by
+the program. The verifier could have enforced 512 limit for combined original
+plus extension program, but it makes for difficult user experience. The main
+use case for extensions is to provide generic mechanism to plug external
+programs into policy program or function call chaining.
+
+BPF trampoline is used to track both fentry/fexit and program extensions
+because both are using the same nop slot at the beginning of every BPF
+function. Attaching fentry/fexit to a function that was replaced is not
+allowed. The opposite is true as well. Replacing a function that currently
+being analyzed with fentry/fexit is not allowed. The executable page allocated
+by BPF trampoline is not used by program extensions. This inefficiency will be
+optimized in future patches.
+
+Function by function verification of global function supports scalars and
+pointer to context only. Hence program extensions are supported for such class
+of global functions only. In the future the verifier will be extended with
+support to pointers to structures, arrays with sizes, etc.
+
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+	Acked-by: Toke Høiland-Jørgensen <toke@redhat.com>
+Link: https://lore.kernel.org/bpf/20200121005348.2769920-2-ast@kernel.org
+(cherry picked from commit be8704ff07d2374bcc5c675526f95e70c6459683)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/linux/bpf_types.h
+#	include/linux/btf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/btf.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/trampoline.c
+#	kernel/bpf/verifier.c
+diff --cc include/linux/bpf.h
+index 602dd6841705,05d16615054c..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -389,13 -413,202 +389,206 @@@ struct bpf_prog_stats 
+  	struct u64_stats_sync syncp;
+  } __aligned(2 * sizeof(u64));
+  
+++<<<<<<< HEAD
+++=======
++ struct btf_func_model {
++ 	u8 ret_size;
++ 	u8 nr_args;
++ 	u8 arg_size[MAX_BPF_FUNC_ARGS];
++ };
++ 
++ /* Restore arguments before returning from trampoline to let original function
++  * continue executing. This flag is used for fentry progs when there are no
++  * fexit progs.
++  */
++ #define BPF_TRAMP_F_RESTORE_REGS	BIT(0)
++ /* Call original function after fentry progs, but before fexit progs.
++  * Makes sense for fentry/fexit, normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_CALL_ORIG		BIT(1)
++ /* Skip current frame and return to parent.  Makes sense for fentry/fexit
++  * programs only. Should not be used with normal calls and indirect calls.
++  */
++ #define BPF_TRAMP_F_SKIP_FRAME		BIT(2)
++ 
++ /* Different use cases for BPF trampoline:
++  * 1. replace nop at the function entry (kprobe equivalent)
++  *    flags = BPF_TRAMP_F_RESTORE_REGS
++  *    fentry = a set of programs to run before returning from trampoline
++  *
++  * 2. replace nop at the function entry (kprobe + kretprobe equivalent)
++  *    flags = BPF_TRAMP_F_CALL_ORIG | BPF_TRAMP_F_SKIP_FRAME
++  *    orig_call = fentry_ip + MCOUNT_INSN_SIZE
++  *    fentry = a set of program to run before calling original function
++  *    fexit = a set of program to run after original function
++  *
++  * 3. replace direct call instruction anywhere in the function body
++  *    or assign a function pointer for indirect call (like tcp_congestion_ops->cong_avoid)
++  *    With flags = 0
++  *      fentry = a set of programs to run before returning from trampoline
++  *    With flags = BPF_TRAMP_F_CALL_ORIG
++  *      orig_call = original callback addr or direct function addr
++  *      fentry = a set of program to run before calling original function
++  *      fexit = a set of program to run after original function
++  */
++ int arch_prepare_bpf_trampoline(void *image, void *image_end,
++ 				const struct btf_func_model *m, u32 flags,
++ 				struct bpf_prog **fentry_progs, int fentry_cnt,
++ 				struct bpf_prog **fexit_progs, int fexit_cnt,
++ 				void *orig_call);
++ /* these two functions are called from generated trampoline */
++ u64 notrace __bpf_prog_enter(void);
++ void notrace __bpf_prog_exit(struct bpf_prog *prog, u64 start);
++ 
++ enum bpf_tramp_prog_type {
++ 	BPF_TRAMP_FENTRY,
++ 	BPF_TRAMP_FEXIT,
++ 	BPF_TRAMP_MAX,
++ 	BPF_TRAMP_REPLACE, /* more than MAX */
++ };
++ 
++ struct bpf_trampoline {
++ 	/* hlist for trampoline_table */
++ 	struct hlist_node hlist;
++ 	/* serializes access to fields of this trampoline */
++ 	struct mutex mutex;
++ 	refcount_t refcnt;
++ 	u64 key;
++ 	struct {
++ 		struct btf_func_model model;
++ 		void *addr;
++ 		bool ftrace_managed;
++ 	} func;
++ 	/* if !NULL this is BPF_PROG_TYPE_EXT program that extends another BPF
++ 	 * program by replacing one of its functions. func.addr is the address
++ 	 * of the function it replaced.
++ 	 */
++ 	struct bpf_prog *extension_prog;
++ 	/* list of BPF programs using this trampoline */
++ 	struct hlist_head progs_hlist[BPF_TRAMP_MAX];
++ 	/* Number of attached programs. A counter per kind. */
++ 	int progs_cnt[BPF_TRAMP_MAX];
++ 	/* Executable image of trampoline */
++ 	void *image;
++ 	u64 selector;
++ };
++ 
++ #define BPF_DISPATCHER_MAX 48 /* Fits in 2048B */
++ 
++ struct bpf_dispatcher_prog {
++ 	struct bpf_prog *prog;
++ 	refcount_t users;
++ };
++ 
++ struct bpf_dispatcher {
++ 	/* dispatcher mutex */
++ 	struct mutex mutex;
++ 	void *func;
++ 	struct bpf_dispatcher_prog progs[BPF_DISPATCHER_MAX];
++ 	int num_progs;
++ 	void *image;
++ 	u32 image_off;
++ };
++ 
++ static __always_inline unsigned int bpf_dispatcher_nopfunc(
++ 	const void *ctx,
++ 	const struct bpf_insn *insnsi,
++ 	unsigned int (*bpf_func)(const void *,
++ 				 const struct bpf_insn *))
++ {
++ 	return bpf_func(ctx, insnsi);
++ }
++ #ifdef CONFIG_BPF_JIT
++ struct bpf_trampoline *bpf_trampoline_lookup(u64 key);
++ int bpf_trampoline_link_prog(struct bpf_prog *prog);
++ int bpf_trampoline_unlink_prog(struct bpf_prog *prog);
++ void bpf_trampoline_put(struct bpf_trampoline *tr);
++ void *bpf_jit_alloc_exec_page(void);
++ #define BPF_DISPATCHER_INIT(name) {			\
++ 	.mutex = __MUTEX_INITIALIZER(name.mutex),	\
++ 	.func = &name##func,				\
++ 	.progs = {},					\
++ 	.num_progs = 0,					\
++ 	.image = NULL,					\
++ 	.image_off = 0					\
++ }
++ 
++ #define DEFINE_BPF_DISPATCHER(name)					\
++ 	noinline unsigned int name##func(				\
++ 		const void *ctx,					\
++ 		const struct bpf_insn *insnsi,				\
++ 		unsigned int (*bpf_func)(const void *,			\
++ 					 const struct bpf_insn *))	\
++ 	{								\
++ 		return bpf_func(ctx, insnsi);				\
++ 	}								\
++ 	EXPORT_SYMBOL(name##func);			\
++ 	struct bpf_dispatcher name = BPF_DISPATCHER_INIT(name);
++ #define DECLARE_BPF_DISPATCHER(name)					\
++ 	unsigned int name##func(					\
++ 		const void *ctx,					\
++ 		const struct bpf_insn *insnsi,				\
++ 		unsigned int (*bpf_func)(const void *,			\
++ 					 const struct bpf_insn *));	\
++ 	extern struct bpf_dispatcher name;
++ #define BPF_DISPATCHER_FUNC(name) name##func
++ #define BPF_DISPATCHER_PTR(name) (&name)
++ void bpf_dispatcher_change_prog(struct bpf_dispatcher *d, struct bpf_prog *from,
++ 				struct bpf_prog *to);
++ #else
++ static inline struct bpf_trampoline *bpf_trampoline_lookup(u64 key)
++ {
++ 	return NULL;
++ }
++ static inline int bpf_trampoline_link_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline int bpf_trampoline_unlink_prog(struct bpf_prog *prog)
++ {
++ 	return -ENOTSUPP;
++ }
++ static inline void bpf_trampoline_put(struct bpf_trampoline *tr) {}
++ #define DEFINE_BPF_DISPATCHER(name)
++ #define DECLARE_BPF_DISPATCHER(name)
++ #define BPF_DISPATCHER_FUNC(name) bpf_dispatcher_nopfunc
++ #define BPF_DISPATCHER_PTR(name) NULL
++ static inline void bpf_dispatcher_change_prog(struct bpf_dispatcher *d,
++ 					      struct bpf_prog *from,
++ 					      struct bpf_prog *to) {}
++ #endif
++ 
++ struct bpf_func_info_aux {
++ 	u16 linkage;
++ 	bool unreliable;
++ };
++ 
++ enum bpf_jit_poke_reason {
++ 	BPF_POKE_REASON_TAIL_CALL,
++ };
++ 
++ /* Descriptor of pokes pointing /into/ the JITed image. */
++ struct bpf_jit_poke_descriptor {
++ 	void *ip;
++ 	union {
++ 		struct {
++ 			struct bpf_map *map;
++ 			u32 key;
++ 		} tail_call;
++ 	};
++ 	bool ip_stable;
++ 	u8 adj_off;
++ 	u16 reason;
++ };
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  struct bpf_prog_aux {
+ -	atomic64_t refcnt;
+ +	atomic_t refcnt;
+  	u32 used_map_cnt;
+  	u32 max_ctx_offset;
+ -	u32 max_pkt_offset;
+ -	u32 max_tp_access;
+ +	/* not protected by KABI, safe to extend in the middle */
+ +	RH_KABI_BROKEN_INSERT(u32 max_pkt_offset)
+ +	RH_KABI_BROKEN_INSERT(u32 max_tp_access)
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+@@@ -788,6 -1099,24 +981,27 @@@ int btf_struct_access(struct bpf_verifi
+  		      const struct btf_type *t, int off, int size,
+  		      enum bpf_access_type atype,
+  		      u32 *next_btf_id);
+++<<<<<<< HEAD
+++=======
++ int btf_resolve_helper_id(struct bpf_verifier_log *log,
++ 			  const struct bpf_func_proto *fn, int);
++ 
++ int btf_distill_func_proto(struct bpf_verifier_log *log,
++ 			   struct btf *btf,
++ 			   const struct btf_type *func_proto,
++ 			   const char *func_name,
++ 			   struct btf_func_model *m);
++ 
++ struct bpf_reg_state;
++ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
++ 			     struct bpf_reg_state *regs);
++ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
++ 			  struct bpf_reg_state *reg);
++ int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
++ 			 struct btf *btf, const struct btf_type *t);
++ 
++ struct bpf_prog *bpf_prog_by_id(u32 id);
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  
+  #else /* !CONFIG_BPF_SYSCALL */
+  static inline struct bpf_prog *bpf_prog_get(u32 ufd)
+diff --cc include/linux/bpf_types.h
+index eec5aeeeaf92,c81d4ece79a4..000000000000
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@@ -2,41 -2,74 +2,52 @@@
+  /* internal file - do not include directly */
+  
+  #ifdef CONFIG_NET
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SOCKET_FILTER, sk_filter,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_CLS, tc_cls_act,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_ACT, tc_cls_act,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp,
+ -	      struct xdp_md, struct xdp_buff)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SOCKET_FILTER, sk_filter)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_CLS, tc_cls_act)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SCHED_ACT, tc_cls_act)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_XDP, xdp)
+  #ifdef CONFIG_CGROUP_BPF
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SKB, cg_skb,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK, cg_sock,
+ -	      struct bpf_sock, struct sock)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK_ADDR, cg_sock_addr,
+ -	      struct bpf_sock_addr, struct bpf_sock_addr_kern)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SKB, cg_skb)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK, cg_sock)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCK_ADDR, cg_sock_addr)
+  #endif
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_IN, lwt_in,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_OUT, lwt_out,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_XMIT, lwt_xmit,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_SEG6LOCAL, lwt_seg6local,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SOCK_OPS, sock_ops,
+ -	      struct bpf_sock_ops, struct bpf_sock_ops_kern)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SK_SKB, sk_skb,
+ -	      struct __sk_buff, struct sk_buff)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_SK_MSG, sk_msg,
+ -	      struct sk_msg_md, struct sk_msg)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_FLOW_DISSECTOR, flow_dissector,
+ -	      struct __sk_buff, struct bpf_flow_dissector)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_IN, lwt_in)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_OUT, lwt_out)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_XMIT, lwt_xmit)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_LWT_SEG6LOCAL, lwt_seg6local)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SOCK_OPS, sock_ops)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SK_SKB, sk_skb)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SK_MSG, sk_msg)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_FLOW_DISSECTOR, flow_dissector)
+  #endif
+  #ifdef CONFIG_BPF_EVENTS
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_KPROBE, kprobe,
+ -	      bpf_user_pt_regs_t, struct pt_regs)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_TRACEPOINT, tracepoint,
+ -	      __u64, u64)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_PERF_EVENT, perf_event,
+ -	      struct bpf_perf_event_data, struct bpf_perf_event_data_kern)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT, raw_tracepoint,
+ -	      struct bpf_raw_tracepoint_args, u64)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, raw_tracepoint_writable,
+ -	      struct bpf_raw_tracepoint_args, u64)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_TRACING, tracing,
+ -	      void *, void *)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_KPROBE, kprobe)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_TRACEPOINT, tracepoint)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_PERF_EVENT, perf_event)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT, raw_tracepoint)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE, raw_tracepoint_writable)
+  #endif
+  #ifdef CONFIG_CGROUP_BPF
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_DEVICE, cg_dev,
+ -	      struct bpf_cgroup_dev_ctx, struct bpf_cgroup_dev_ctx)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SYSCTL, cg_sysctl,
+ -	      struct bpf_sysctl, struct bpf_sysctl_kern)
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCKOPT, cg_sockopt,
+ -	      struct bpf_sockopt, struct bpf_sockopt_kern)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_DEVICE, cg_dev)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SYSCTL, cg_sysctl)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_CGROUP_SOCKOPT, cg_sockopt)
+  #endif
+  #ifdef CONFIG_BPF_LIRC_MODE2
+ -BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2,
+ -	      __u32, u32)
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_LIRC_MODE2, lirc_mode2)
+  #endif
+  #ifdef CONFIG_INET
+++<<<<<<< HEAD
+ +BPF_PROG_TYPE(BPF_PROG_TYPE_SK_REUSEPORT, sk_reuseport)
+++=======
++ BPF_PROG_TYPE(BPF_PROG_TYPE_SK_REUSEPORT, sk_reuseport,
++ 	      struct sk_reuseport_md, struct sk_reuseport_kern)
++ #endif
++ #if defined(CONFIG_BPF_JIT)
++ BPF_PROG_TYPE(BPF_PROG_TYPE_STRUCT_OPS, bpf_struct_ops,
++ 	      void *, void *)
++ BPF_PROG_TYPE(BPF_PROG_TYPE_EXT, bpf_extension,
++ 	      void *, void *)
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  #endif
+  
+  BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+diff --cc include/linux/btf.h
+index 55d43bc856be,5c1ea99b480f..000000000000
+--- a/include/linux/btf.h
++++ b/include/linux/btf.h
+@@@ -52,6 -55,86 +52,89 @@@ bool btf_member_is_reg_int(const struc
+  			   u32 expected_offset, u32 expected_size);
+  int btf_find_spin_lock(const struct btf *btf, const struct btf_type *t);
+  bool btf_type_is_void(const struct btf_type *t);
+++<<<<<<< HEAD
+++=======
++ s32 btf_find_by_name_kind(const struct btf *btf, const char *name, u8 kind);
++ const struct btf_type *btf_type_skip_modifiers(const struct btf *btf,
++ 					       u32 id, u32 *res_id);
++ const struct btf_type *btf_type_resolve_ptr(const struct btf *btf,
++ 					    u32 id, u32 *res_id);
++ const struct btf_type *btf_type_resolve_func_ptr(const struct btf *btf,
++ 						 u32 id, u32 *res_id);
++ const struct btf_type *
++ btf_resolve_size(const struct btf *btf, const struct btf_type *type,
++ 		 u32 *type_size, const struct btf_type **elem_type,
++ 		 u32 *total_nelems);
++ 
++ #define for_each_member(i, struct_type, member)			\
++ 	for (i = 0, member = btf_type_member(struct_type);	\
++ 	     i < btf_type_vlen(struct_type);			\
++ 	     i++, member++)
++ 
++ static inline bool btf_type_is_ptr(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_PTR;
++ }
++ 
++ static inline bool btf_type_is_int(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_INT;
++ }
++ 
++ static inline bool btf_type_is_enum(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_ENUM;
++ }
++ 
++ static inline bool btf_type_is_typedef(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_TYPEDEF;
++ }
++ 
++ static inline bool btf_type_is_func(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_FUNC;
++ }
++ 
++ static inline bool btf_type_is_func_proto(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KIND(t->info) == BTF_KIND_FUNC_PROTO;
++ }
++ 
++ static inline u16 btf_type_vlen(const struct btf_type *t)
++ {
++ 	return BTF_INFO_VLEN(t->info);
++ }
++ 
++ static inline u16 btf_func_linkage(const struct btf_type *t)
++ {
++ 	return BTF_INFO_VLEN(t->info);
++ }
++ 
++ static inline bool btf_type_kflag(const struct btf_type *t)
++ {
++ 	return BTF_INFO_KFLAG(t->info);
++ }
++ 
++ static inline u32 btf_member_bit_offset(const struct btf_type *struct_type,
++ 					const struct btf_member *member)
++ {
++ 	return btf_type_kflag(struct_type) ? BTF_MEMBER_BIT_OFFSET(member->offset)
++ 					   : member->offset;
++ }
++ 
++ static inline u32 btf_member_bitfield_size(const struct btf_type *struct_type,
++ 					   const struct btf_member *member)
++ {
++ 	return btf_type_kflag(struct_type) ? BTF_MEMBER_BITFIELD_SIZE(member->offset)
++ 					   : 0;
++ }
++ 
++ static inline const struct btf_member *btf_type_member(const struct btf_type *t)
++ {
++ 	return (const struct btf_member *)(t + 1);
++ }
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  
+  #ifdef CONFIG_BPF_SYSCALL
+  const struct btf_type *btf_type_by_id(const struct btf *btf, u32 type_id);
+diff --cc include/uapi/linux/bpf.h
+index f26f93a554f1,e81628eb059c..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -175,7 -178,9 +175,13 @@@ enum bpf_prog_type 
+  	BPF_PROG_TYPE_CGROUP_SYSCTL,
+  	BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE,
+  	BPF_PROG_TYPE_CGROUP_SOCKOPT,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_PROG_TYPE_TRACING,
++ 	BPF_PROG_TYPE_STRUCT_OPS,
++ 	BPF_PROG_TYPE_EXT,
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  };
+  
+  enum bpf_attach_type {
+diff --cc kernel/bpf/btf.c
+index fef5ecb3622e,32963b6d5a9c..000000000000
+--- a/kernel/bpf/btf.c
++++ b/kernel/bpf/btf.c
+@@@ -3797,6 -3952,511 +3802,514 @@@ again
+  	return -EINVAL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __btf_resolve_helper_id(struct bpf_verifier_log *log, void *fn,
++ 				   int arg)
++ {
++ 	char fnname[KSYM_SYMBOL_LEN + 4] = "btf_";
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	const char *tname, *sym;
++ 	u32 btf_id, i;
++ 
++ 	if (IS_ERR(btf_vmlinux)) {
++ 		bpf_log(log, "btf_vmlinux is malformed\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	sym = kallsyms_lookup((long)fn, NULL, NULL, NULL, fnname + 4);
++ 	if (!sym) {
++ 		bpf_log(log, "kernel doesn't have kallsyms\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	for (i = 1; i <= btf_vmlinux->nr_types; i++) {
++ 		t = btf_type_by_id(btf_vmlinux, i);
++ 		if (BTF_INFO_KIND(t->info) != BTF_KIND_TYPEDEF)
++ 			continue;
++ 		tname = __btf_name_by_offset(btf_vmlinux, t->name_off);
++ 		if (!strcmp(tname, fnname))
++ 			break;
++ 	}
++ 	if (i > btf_vmlinux->nr_types) {
++ 		bpf_log(log, "helper %s type is not found\n", fnname);
++ 		return -ENOENT;
++ 	}
++ 
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	if (!btf_type_is_ptr(t))
++ 		return -EFAULT;
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	if (!btf_type_is_func_proto(t))
++ 		return -EFAULT;
++ 
++ 	args = (const struct btf_param *)(t + 1);
++ 	if (arg >= btf_type_vlen(t)) {
++ 		bpf_log(log, "bpf helper %s doesn't have %d-th argument\n",
++ 			fnname, arg);
++ 		return -EINVAL;
++ 	}
++ 
++ 	t = btf_type_by_id(btf_vmlinux, args[arg].type);
++ 	if (!btf_type_is_ptr(t) || !t->type) {
++ 		/* anything but the pointer to struct is a helper config bug */
++ 		bpf_log(log, "ARG_PTR_TO_BTF is misconfigured\n");
++ 		return -EFAULT;
++ 	}
++ 	btf_id = t->type;
++ 	t = btf_type_by_id(btf_vmlinux, t->type);
++ 	/* skip modifiers */
++ 	while (btf_type_is_modifier(t)) {
++ 		btf_id = t->type;
++ 		t = btf_type_by_id(btf_vmlinux, t->type);
++ 	}
++ 	if (!btf_type_is_struct(t)) {
++ 		bpf_log(log, "ARG_PTR_TO_BTF is not a struct\n");
++ 		return -EFAULT;
++ 	}
++ 	bpf_log(log, "helper %s arg%d has btf_id %d struct %s\n", fnname + 4,
++ 		arg, btf_id, __btf_name_by_offset(btf_vmlinux, t->name_off));
++ 	return btf_id;
++ }
++ 
++ int btf_resolve_helper_id(struct bpf_verifier_log *log,
++ 			  const struct bpf_func_proto *fn, int arg)
++ {
++ 	int *btf_id = &fn->btf_id[arg];
++ 	int ret;
++ 
++ 	if (fn->arg_type[arg] != ARG_PTR_TO_BTF_ID)
++ 		return -EINVAL;
++ 
++ 	ret = READ_ONCE(*btf_id);
++ 	if (ret)
++ 		return ret;
++ 	/* ok to race the search. The result is the same */
++ 	ret = __btf_resolve_helper_id(log, fn->func, arg);
++ 	if (!ret) {
++ 		/* Function argument cannot be type 'void' */
++ 		bpf_log(log, "BTF resolution bug\n");
++ 		return -EFAULT;
++ 	}
++ 	WRITE_ONCE(*btf_id, ret);
++ 	return ret;
++ }
++ 
++ static int __get_type_size(struct btf *btf, u32 btf_id,
++ 			   const struct btf_type **bad_type)
++ {
++ 	const struct btf_type *t;
++ 
++ 	if (!btf_id)
++ 		/* void */
++ 		return 0;
++ 	t = btf_type_by_id(btf, btf_id);
++ 	while (t && btf_type_is_modifier(t))
++ 		t = btf_type_by_id(btf, t->type);
++ 	if (!t) {
++ 		*bad_type = btf->types[0];
++ 		return -EINVAL;
++ 	}
++ 	if (btf_type_is_ptr(t))
++ 		/* kernel size of pointer. Not BPF's size of pointer*/
++ 		return sizeof(void *);
++ 	if (btf_type_is_int(t) || btf_type_is_enum(t))
++ 		return t->size;
++ 	*bad_type = t;
++ 	return -EINVAL;
++ }
++ 
++ int btf_distill_func_proto(struct bpf_verifier_log *log,
++ 			   struct btf *btf,
++ 			   const struct btf_type *func,
++ 			   const char *tname,
++ 			   struct btf_func_model *m)
++ {
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	u32 i, nargs;
++ 	int ret;
++ 
++ 	if (!func) {
++ 		/* BTF function prototype doesn't match the verifier types.
++ 		 * Fall back to 5 u64 args.
++ 		 */
++ 		for (i = 0; i < 5; i++)
++ 			m->arg_size[i] = 8;
++ 		m->ret_size = 8;
++ 		m->nr_args = 5;
++ 		return 0;
++ 	}
++ 	args = (const struct btf_param *)(func + 1);
++ 	nargs = btf_type_vlen(func);
++ 	if (nargs >= MAX_BPF_FUNC_ARGS) {
++ 		bpf_log(log,
++ 			"The function %s has %d arguments. Too many.\n",
++ 			tname, nargs);
++ 		return -EINVAL;
++ 	}
++ 	ret = __get_type_size(btf, func->type, &t);
++ 	if (ret < 0) {
++ 		bpf_log(log,
++ 			"The function %s return type %s is unsupported.\n",
++ 			tname, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 		return -EINVAL;
++ 	}
++ 	m->ret_size = ret;
++ 
++ 	for (i = 0; i < nargs; i++) {
++ 		ret = __get_type_size(btf, args[i].type, &t);
++ 		if (ret < 0) {
++ 			bpf_log(log,
++ 				"The function %s arg%d type %s is unsupported.\n",
++ 				tname, i, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 			return -EINVAL;
++ 		}
++ 		m->arg_size[i] = ret;
++ 	}
++ 	m->nr_args = nargs;
++ 	return 0;
++ }
++ 
++ /* Compare BTFs of two functions assuming only scalars and pointers to context.
++  * t1 points to BTF_KIND_FUNC in btf1
++  * t2 points to BTF_KIND_FUNC in btf2
++  * Returns:
++  * EINVAL - function prototype mismatch
++  * EFAULT - verifier bug
++  * 0 - 99% match. The last 1% is validated by the verifier.
++  */
++ int btf_check_func_type_match(struct bpf_verifier_log *log,
++ 			      struct btf *btf1, const struct btf_type *t1,
++ 			      struct btf *btf2, const struct btf_type *t2)
++ {
++ 	const struct btf_param *args1, *args2;
++ 	const char *fn1, *fn2, *s1, *s2;
++ 	u32 nargs1, nargs2, i;
++ 
++ 	fn1 = btf_name_by_offset(btf1, t1->name_off);
++ 	fn2 = btf_name_by_offset(btf2, t2->name_off);
++ 
++ 	if (btf_func_linkage(t1) != BTF_FUNC_GLOBAL) {
++ 		bpf_log(log, "%s() is not a global function\n", fn1);
++ 		return -EINVAL;
++ 	}
++ 	if (btf_func_linkage(t2) != BTF_FUNC_GLOBAL) {
++ 		bpf_log(log, "%s() is not a global function\n", fn2);
++ 		return -EINVAL;
++ 	}
++ 
++ 	t1 = btf_type_by_id(btf1, t1->type);
++ 	if (!t1 || !btf_type_is_func_proto(t1))
++ 		return -EFAULT;
++ 	t2 = btf_type_by_id(btf2, t2->type);
++ 	if (!t2 || !btf_type_is_func_proto(t2))
++ 		return -EFAULT;
++ 
++ 	args1 = (const struct btf_param *)(t1 + 1);
++ 	nargs1 = btf_type_vlen(t1);
++ 	args2 = (const struct btf_param *)(t2 + 1);
++ 	nargs2 = btf_type_vlen(t2);
++ 
++ 	if (nargs1 != nargs2) {
++ 		bpf_log(log, "%s() has %d args while %s() has %d args\n",
++ 			fn1, nargs1, fn2, nargs2);
++ 		return -EINVAL;
++ 	}
++ 
++ 	t1 = btf_type_skip_modifiers(btf1, t1->type, NULL);
++ 	t2 = btf_type_skip_modifiers(btf2, t2->type, NULL);
++ 	if (t1->info != t2->info) {
++ 		bpf_log(log,
++ 			"Return type %s of %s() doesn't match type %s of %s()\n",
++ 			btf_type_str(t1), fn1,
++ 			btf_type_str(t2), fn2);
++ 		return -EINVAL;
++ 	}
++ 
++ 	for (i = 0; i < nargs1; i++) {
++ 		t1 = btf_type_skip_modifiers(btf1, args1[i].type, NULL);
++ 		t2 = btf_type_skip_modifiers(btf2, args2[i].type, NULL);
++ 
++ 		if (t1->info != t2->info) {
++ 			bpf_log(log, "arg%d in %s() is %s while %s() has %s\n",
++ 				i, fn1, btf_type_str(t1),
++ 				fn2, btf_type_str(t2));
++ 			return -EINVAL;
++ 		}
++ 		if (btf_type_has_size(t1) && t1->size != t2->size) {
++ 			bpf_log(log,
++ 				"arg%d in %s() has size %d while %s() has %d\n",
++ 				i, fn1, t1->size,
++ 				fn2, t2->size);
++ 			return -EINVAL;
++ 		}
++ 
++ 		/* global functions are validated with scalars and pointers
++ 		 * to context only. And only global functions can be replaced.
++ 		 * Hence type check only those types.
++ 		 */
++ 		if (btf_type_is_int(t1) || btf_type_is_enum(t1))
++ 			continue;
++ 		if (!btf_type_is_ptr(t1)) {
++ 			bpf_log(log,
++ 				"arg%d in %s() has unrecognized type\n",
++ 				i, fn1);
++ 			return -EINVAL;
++ 		}
++ 		t1 = btf_type_skip_modifiers(btf1, t1->type, NULL);
++ 		t2 = btf_type_skip_modifiers(btf2, t2->type, NULL);
++ 		if (!btf_type_is_struct(t1)) {
++ 			bpf_log(log,
++ 				"arg%d in %s() is not a pointer to context\n",
++ 				i, fn1);
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_struct(t2)) {
++ 			bpf_log(log,
++ 				"arg%d in %s() is not a pointer to context\n",
++ 				i, fn2);
++ 			return -EINVAL;
++ 		}
++ 		/* This is an optional check to make program writing easier.
++ 		 * Compare names of structs and report an error to the user.
++ 		 * btf_prepare_func_args() already checked that t2 struct
++ 		 * is a context type. btf_prepare_func_args() will check
++ 		 * later that t1 struct is a context type as well.
++ 		 */
++ 		s1 = btf_name_by_offset(btf1, t1->name_off);
++ 		s2 = btf_name_by_offset(btf2, t2->name_off);
++ 		if (strcmp(s1, s2)) {
++ 			bpf_log(log,
++ 				"arg%d %s(struct %s *) doesn't match %s(struct %s *)\n",
++ 				i, fn1, s1, fn2, s2);
++ 			return -EINVAL;
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ /* Compare BTFs of given program with BTF of target program */
++ int btf_check_type_match(struct bpf_verifier_env *env, struct bpf_prog *prog,
++ 			 struct btf *btf2, const struct btf_type *t2)
++ {
++ 	struct btf *btf1 = prog->aux->btf;
++ 	const struct btf_type *t1;
++ 	u32 btf_id = 0;
++ 
++ 	if (!prog->aux->func_info) {
++ 		bpf_log(&env->log, "Program extension requires BTF\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	btf_id = prog->aux->func_info[0].type_id;
++ 	if (!btf_id)
++ 		return -EFAULT;
++ 
++ 	t1 = btf_type_by_id(btf1, btf_id);
++ 	if (!t1 || !btf_type_is_func(t1))
++ 		return -EFAULT;
++ 
++ 	return btf_check_func_type_match(&env->log, btf1, t1, btf2, t2);
++ }
++ 
++ /* Compare BTF of a function with given bpf_reg_state.
++  * Returns:
++  * EFAULT - there is a verifier bug. Abort verification.
++  * EINVAL - there is a type mismatch or BTF is not available.
++  * 0 - BTF matches with what bpf_reg_state expects.
++  * Only PTR_TO_CTX and SCALAR_VALUE states are recognized.
++  */
++ int btf_check_func_arg_match(struct bpf_verifier_env *env, int subprog,
++ 			     struct bpf_reg_state *reg)
++ {
++ 	struct bpf_verifier_log *log = &env->log;
++ 	struct bpf_prog *prog = env->prog;
++ 	struct btf *btf = prog->aux->btf;
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	u32 i, nargs, btf_id;
++ 	const char *tname;
++ 
++ 	if (!prog->aux->func_info)
++ 		return -EINVAL;
++ 
++ 	btf_id = prog->aux->func_info[subprog].type_id;
++ 	if (!btf_id)
++ 		return -EFAULT;
++ 
++ 	if (prog->aux->func_info_aux[subprog].unreliable)
++ 		return -EINVAL;
++ 
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t || !btf_type_is_func(t)) {
++ 		/* These checks were already done by the verifier while loading
++ 		 * struct bpf_func_info
++ 		 */
++ 		bpf_log(log, "BTF of func#%d doesn't point to KIND_FUNC\n",
++ 			subprog);
++ 		return -EFAULT;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 
++ 	t = btf_type_by_id(btf, t->type);
++ 	if (!t || !btf_type_is_func_proto(t)) {
++ 		bpf_log(log, "Invalid BTF of func %s\n", tname);
++ 		return -EFAULT;
++ 	}
++ 	args = (const struct btf_param *)(t + 1);
++ 	nargs = btf_type_vlen(t);
++ 	if (nargs > 5) {
++ 		bpf_log(log, "Function %s has %d > 5 args\n", tname, nargs);
++ 		goto out;
++ 	}
++ 	/* check that BTF function arguments match actual types that the
++ 	 * verifier sees.
++ 	 */
++ 	for (i = 0; i < nargs; i++) {
++ 		t = btf_type_by_id(btf, args[i].type);
++ 		while (btf_type_is_modifier(t))
++ 			t = btf_type_by_id(btf, t->type);
++ 		if (btf_type_is_int(t) || btf_type_is_enum(t)) {
++ 			if (reg[i + 1].type == SCALAR_VALUE)
++ 				continue;
++ 			bpf_log(log, "R%d is not a scalar\n", i + 1);
++ 			goto out;
++ 		}
++ 		if (btf_type_is_ptr(t)) {
++ 			if (reg[i + 1].type == SCALAR_VALUE) {
++ 				bpf_log(log, "R%d is not a pointer\n", i + 1);
++ 				goto out;
++ 			}
++ 			/* If function expects ctx type in BTF check that caller
++ 			 * is passing PTR_TO_CTX.
++ 			 */
++ 			if (btf_get_prog_ctx_type(log, btf, t, prog->type, i)) {
++ 				if (reg[i + 1].type != PTR_TO_CTX) {
++ 					bpf_log(log,
++ 						"arg#%d expected pointer to ctx, but got %s\n",
++ 						i, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 					goto out;
++ 				}
++ 				if (check_ctx_reg(env, &reg[i + 1], i + 1))
++ 					goto out;
++ 				continue;
++ 			}
++ 		}
++ 		bpf_log(log, "Unrecognized arg#%d type %s\n",
++ 			i, btf_kind_str[BTF_INFO_KIND(t->info)]);
++ 		goto out;
++ 	}
++ 	return 0;
++ out:
++ 	/* Compiler optimizations can remove arguments from static functions
++ 	 * or mismatched type can be passed into a global function.
++ 	 * In such cases mark the function as unreliable from BTF point of view.
++ 	 */
++ 	prog->aux->func_info_aux[subprog].unreliable = true;
++ 	return -EINVAL;
++ }
++ 
++ /* Convert BTF of a function into bpf_reg_state if possible
++  * Returns:
++  * EFAULT - there is a verifier bug. Abort verification.
++  * EINVAL - cannot convert BTF.
++  * 0 - Successfully converted BTF into bpf_reg_state
++  * (either PTR_TO_CTX or SCALAR_VALUE).
++  */
++ int btf_prepare_func_args(struct bpf_verifier_env *env, int subprog,
++ 			  struct bpf_reg_state *reg)
++ {
++ 	struct bpf_verifier_log *log = &env->log;
++ 	struct bpf_prog *prog = env->prog;
++ 	enum bpf_prog_type prog_type = prog->type;
++ 	struct btf *btf = prog->aux->btf;
++ 	const struct btf_param *args;
++ 	const struct btf_type *t;
++ 	u32 i, nargs, btf_id;
++ 	const char *tname;
++ 
++ 	if (!prog->aux->func_info ||
++ 	    prog->aux->func_info_aux[subprog].linkage != BTF_FUNC_GLOBAL) {
++ 		bpf_log(log, "Verifier bug\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	btf_id = prog->aux->func_info[subprog].type_id;
++ 	if (!btf_id) {
++ 		bpf_log(log, "Global functions need valid BTF\n");
++ 		return -EFAULT;
++ 	}
++ 
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t || !btf_type_is_func(t)) {
++ 		/* These checks were already done by the verifier while loading
++ 		 * struct bpf_func_info
++ 		 */
++ 		bpf_log(log, "BTF of func#%d doesn't point to KIND_FUNC\n",
++ 			subprog);
++ 		return -EFAULT;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 
++ 	if (log->level & BPF_LOG_LEVEL)
++ 		bpf_log(log, "Validating %s() func#%d...\n",
++ 			tname, subprog);
++ 
++ 	if (prog->aux->func_info_aux[subprog].unreliable) {
++ 		bpf_log(log, "Verifier bug in function %s()\n", tname);
++ 		return -EFAULT;
++ 	}
++ 	if (prog_type == BPF_PROG_TYPE_EXT)
++ 		prog_type = prog->aux->linked_prog->type;
++ 
++ 	t = btf_type_by_id(btf, t->type);
++ 	if (!t || !btf_type_is_func_proto(t)) {
++ 		bpf_log(log, "Invalid type of function %s()\n", tname);
++ 		return -EFAULT;
++ 	}
++ 	args = (const struct btf_param *)(t + 1);
++ 	nargs = btf_type_vlen(t);
++ 	if (nargs > 5) {
++ 		bpf_log(log, "Global function %s() with %d > 5 args. Buggy compiler.\n",
++ 			tname, nargs);
++ 		return -EINVAL;
++ 	}
++ 	/* check that function returns int */
++ 	t = btf_type_by_id(btf, t->type);
++ 	while (btf_type_is_modifier(t))
++ 		t = btf_type_by_id(btf, t->type);
++ 	if (!btf_type_is_int(t) && !btf_type_is_enum(t)) {
++ 		bpf_log(log,
++ 			"Global function %s() doesn't return scalar. Only those are supported.\n",
++ 			tname);
++ 		return -EINVAL;
++ 	}
++ 	/* Convert BTF function arguments into verifier types.
++ 	 * Only PTR_TO_CTX and SCALAR are supported atm.
++ 	 */
++ 	for (i = 0; i < nargs; i++) {
++ 		t = btf_type_by_id(btf, args[i].type);
++ 		while (btf_type_is_modifier(t))
++ 			t = btf_type_by_id(btf, t->type);
++ 		if (btf_type_is_int(t) || btf_type_is_enum(t)) {
++ 			reg[i + 1].type = SCALAR_VALUE;
++ 			continue;
++ 		}
++ 		if (btf_type_is_ptr(t) &&
++ 		    btf_get_prog_ctx_type(log, btf, t, prog_type, i)) {
++ 			reg[i + 1].type = PTR_TO_CTX;
++ 			continue;
++ 		}
++ 		bpf_log(log, "Arg#%d type %s in %s() is not supported yet.\n",
++ 			i, btf_kind_str[BTF_INFO_KIND(t->info)], tname);
++ 		return -EINVAL;
++ 	}
++ 	return 0;
++ }
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  void btf_type_seq_show(const struct btf *btf, u32 type_id, void *obj,
+  		       struct seq_file *m)
+  {
+diff --cc kernel/bpf/syscall.c
+index 4aa6a47aa4b8,a91ad518c050..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -1632,20 -1921,28 +1632,37 @@@ static void bpf_prog_load_fixup_attach_
+  }
+  
+  static int
+ -bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ -			   enum bpf_attach_type expected_attach_type,
+ -			   u32 btf_id, u32 prog_fd)
+ +bpf_prog_load_check_attach_type(enum bpf_prog_type prog_type,
+ +				enum bpf_attach_type expected_attach_type)
+  {
+ -	if (btf_id) {
+ +	switch (prog_type) {
+ +	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+  		if (btf_id > BTF_MAX_TYPE)
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		break;
+ +	default:
+ +		if (btf_id)
+++=======
++ 
++ 		switch (prog_type) {
++ 		case BPF_PROG_TYPE_TRACING:
++ 		case BPF_PROG_TYPE_STRUCT_OPS:
++ 		case BPF_PROG_TYPE_EXT:
++ 			break;
++ 		default:
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  			return -EINVAL;
+ -		}
+ +		break;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	if (prog_fd && prog_type != BPF_PROG_TYPE_TRACING &&
++ 	    prog_type != BPF_PROG_TYPE_EXT)
++ 		return -EINVAL;
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  	switch (prog_type) {
+  	case BPF_PROG_TYPE_CGROUP_SOCK:
+  		switch (expected_attach_type) {
+@@@ -1855,6 -2169,50 +1876,53 @@@ static int bpf_obj_get(const union bpf_
+  				attr->file_flags);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bpf_tracing_prog_release(struct inode *inode, struct file *filp)
++ {
++ 	struct bpf_prog *prog = filp->private_data;
++ 
++ 	WARN_ON_ONCE(bpf_trampoline_unlink_prog(prog));
++ 	bpf_prog_put(prog);
++ 	return 0;
++ }
++ 
++ static const struct file_operations bpf_tracing_prog_fops = {
++ 	.release	= bpf_tracing_prog_release,
++ 	.read		= bpf_dummy_read,
++ 	.write		= bpf_dummy_write,
++ };
++ 
++ static int bpf_tracing_prog_attach(struct bpf_prog *prog)
++ {
++ 	int tr_fd, err;
++ 
++ 	if (prog->expected_attach_type != BPF_TRACE_FENTRY &&
++ 	    prog->expected_attach_type != BPF_TRACE_FEXIT &&
++ 	    prog->type != BPF_PROG_TYPE_EXT) {
++ 		err = -EINVAL;
++ 		goto out_put_prog;
++ 	}
++ 
++ 	err = bpf_trampoline_link_prog(prog);
++ 	if (err)
++ 		goto out_put_prog;
++ 
++ 	tr_fd = anon_inode_getfd("bpf-tracing-prog", &bpf_tracing_prog_fops,
++ 				 prog, O_CLOEXEC);
++ 	if (tr_fd < 0) {
++ 		WARN_ON_ONCE(bpf_trampoline_unlink_prog(prog));
++ 		err = tr_fd;
++ 		goto out_put_prog;
++ 	}
++ 	return tr_fd;
++ 
++ out_put_prog:
++ 	bpf_prog_put(prog);
++ 	return err;
++ }
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  struct bpf_raw_tracepoint {
+  	struct bpf_raw_event_map *btp;
+  	struct bpf_prog *prog;
+@@@ -1886,19 -2244,54 +1954,57 @@@ static int bpf_raw_tracepoint_open(cons
+  	struct bpf_raw_tracepoint *raw_tp;
+  	struct bpf_raw_event_map *btp;
+  	struct bpf_prog *prog;
+ -	const char *tp_name;
+ -	char buf[128];
+ +	char tp_name[128];
+  	int tp_fd, err;
+  
+ -	if (CHECK_ATTR(BPF_RAW_TRACEPOINT_OPEN))
+ -		return -EINVAL;
+ +	rh_mark_used_feature("eBPF/rawtrace");
+  
+++<<<<<<< HEAD
+ +	if (strncpy_from_user(tp_name, u64_to_user_ptr(attr->raw_tracepoint.name),
+ +			      sizeof(tp_name) - 1) < 0)
+ +		return -EFAULT;
+ +	tp_name[sizeof(tp_name) - 1] = 0;
+++=======
++ 	prog = bpf_prog_get(attr->raw_tracepoint.prog_fd);
++ 	if (IS_ERR(prog))
++ 		return PTR_ERR(prog);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT &&
++ 	    prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_EXT &&
++ 	    prog->type != BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE) {
++ 		err = -EINVAL;
++ 		goto out_put_prog;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_TRACING ||
++ 	    prog->type == BPF_PROG_TYPE_EXT) {
++ 		if (attr->raw_tracepoint.name) {
++ 			/* The attach point for this category of programs
++ 			 * should be specified via btf_id during program load.
++ 			 */
++ 			err = -EINVAL;
++ 			goto out_put_prog;
++ 		}
++ 		if (prog->expected_attach_type == BPF_TRACE_RAW_TP)
++ 			tp_name = prog->aux->attach_func_name;
++ 		else
++ 			return bpf_tracing_prog_attach(prog);
++ 	} else {
++ 		if (strncpy_from_user(buf,
++ 				      u64_to_user_ptr(attr->raw_tracepoint.name),
++ 				      sizeof(buf) - 1) < 0) {
++ 			err = -EFAULT;
++ 			goto out_put_prog;
++ 		}
++ 		buf[sizeof(buf) - 1] = 0;
++ 		tp_name = buf;
++ 	}
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  
+  	btp = bpf_get_raw_tracepoint(tp_name);
+ -	if (!btp) {
+ -		err = -ENOENT;
+ -		goto out_put_prog;
+ -	}
+ +	if (!btp)
+ +		return -ENOENT;
+  
+  	raw_tp = kzalloc(sizeof(*raw_tp), GFP_USER);
+  	if (!raw_tp) {
+diff --cc kernel/bpf/verifier.c
+index a2c1dcade9ad,9fe94f64f0ec..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -9504,11 -9505,164 +9504,168 @@@ static void free_states(struct bpf_veri
+  			kfree(sl);
+  			sl = sln;
+  		}
+ -		env->explored_states[i] = NULL;
+  	}
+ +
+ +	kvfree(env->explored_states);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* The verifier is using insn_aux_data[] to store temporary data during
++  * verification and to store information for passes that run after the
++  * verification like dead code sanitization. do_check_common() for subprogram N
++  * may analyze many other subprograms. sanitize_insn_aux_data() clears all
++  * temporary data after do_check_common() finds that subprogram N cannot be
++  * verified independently. pass_cnt counts the number of times
++  * do_check_common() was run and insn->aux->seen tells the pass number
++  * insn_aux_data was touched. These variables are compared to clear temporary
++  * data from failed pass. For testing and experiments do_check_common() can be
++  * run multiple times even when prior attempt to verify is unsuccessful.
++  */
++ static void sanitize_insn_aux_data(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_insn *insn = env->prog->insnsi;
++ 	struct bpf_insn_aux_data *aux;
++ 	int i, class;
++ 
++ 	for (i = 0; i < env->prog->len; i++) {
++ 		class = BPF_CLASS(insn[i].code);
++ 		if (class != BPF_LDX && class != BPF_STX)
++ 			continue;
++ 		aux = &env->insn_aux_data[i];
++ 		if (aux->seen != env->pass_cnt)
++ 			continue;
++ 		memset(aux, 0, offsetof(typeof(*aux), orig_idx));
++ 	}
++ }
++ 
++ static int do_check_common(struct bpf_verifier_env *env, int subprog)
++ {
++ 	struct bpf_verifier_state *state;
++ 	struct bpf_reg_state *regs;
++ 	int ret, i;
++ 
++ 	env->prev_linfo = NULL;
++ 	env->pass_cnt++;
++ 
++ 	state = kzalloc(sizeof(struct bpf_verifier_state), GFP_KERNEL);
++ 	if (!state)
++ 		return -ENOMEM;
++ 	state->curframe = 0;
++ 	state->speculative = false;
++ 	state->branches = 1;
++ 	state->frame[0] = kzalloc(sizeof(struct bpf_func_state), GFP_KERNEL);
++ 	if (!state->frame[0]) {
++ 		kfree(state);
++ 		return -ENOMEM;
++ 	}
++ 	env->cur_state = state;
++ 	init_func_state(env, state->frame[0],
++ 			BPF_MAIN_FUNC /* callsite */,
++ 			0 /* frameno */,
++ 			subprog);
++ 
++ 	regs = state->frame[state->curframe]->regs;
++ 	if (subprog || env->prog->type == BPF_PROG_TYPE_EXT) {
++ 		ret = btf_prepare_func_args(env, subprog, regs);
++ 		if (ret)
++ 			goto out;
++ 		for (i = BPF_REG_1; i <= BPF_REG_5; i++) {
++ 			if (regs[i].type == PTR_TO_CTX)
++ 				mark_reg_known_zero(env, regs, i);
++ 			else if (regs[i].type == SCALAR_VALUE)
++ 				mark_reg_unknown(env, regs, i);
++ 		}
++ 	} else {
++ 		/* 1st arg to a function */
++ 		regs[BPF_REG_1].type = PTR_TO_CTX;
++ 		mark_reg_known_zero(env, regs, BPF_REG_1);
++ 		ret = btf_check_func_arg_match(env, subprog, regs);
++ 		if (ret == -EFAULT)
++ 			/* unlikely verifier bug. abort.
++ 			 * ret == 0 and ret < 0 are sadly acceptable for
++ 			 * main() function due to backward compatibility.
++ 			 * Like socket filter program may be written as:
++ 			 * int bpf_prog(struct pt_regs *ctx)
++ 			 * and never dereference that ctx in the program.
++ 			 * 'struct pt_regs' is a type mismatch for socket
++ 			 * filter that should be using 'struct __sk_buff'.
++ 			 */
++ 			goto out;
++ 	}
++ 
++ 	ret = do_check(env);
++ out:
++ 	/* check for NULL is necessary, since cur_state can be freed inside
++ 	 * do_check() under memory pressure.
++ 	 */
++ 	if (env->cur_state) {
++ 		free_verifier_state(env->cur_state, true);
++ 		env->cur_state = NULL;
++ 	}
++ 	while (!pop_stack(env, NULL, NULL));
++ 	free_states(env);
++ 	if (ret)
++ 		/* clean aux data in case subprog was rejected */
++ 		sanitize_insn_aux_data(env);
++ 	return ret;
++ }
++ 
++ /* Verify all global functions in a BPF program one by one based on their BTF.
++  * All global functions must pass verification. Otherwise the whole program is rejected.
++  * Consider:
++  * int bar(int);
++  * int foo(int f)
++  * {
++  *    return bar(f);
++  * }
++  * int bar(int b)
++  * {
++  *    ...
++  * }
++  * foo() will be verified first for R1=any_scalar_value. During verification it
++  * will be assumed that bar() already verified successfully and call to bar()
++  * from foo() will be checked for type match only. Later bar() will be verified
++  * independently to check that it's safe for R1=any_scalar_value.
++  */
++ static int do_check_subprogs(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog_aux *aux = env->prog->aux;
++ 	int i, ret;
++ 
++ 	if (!aux->func_info)
++ 		return 0;
++ 
++ 	for (i = 1; i < env->subprog_cnt; i++) {
++ 		if (aux->func_info_aux[i].linkage != BTF_FUNC_GLOBAL)
++ 			continue;
++ 		env->insn_idx = env->subprog_info[i].start;
++ 		WARN_ON_ONCE(env->insn_idx == 0);
++ 		ret = do_check_common(env, i);
++ 		if (ret) {
++ 			return ret;
++ 		} else if (env->log.level & BPF_LOG_LEVEL) {
++ 			verbose(env,
++ 				"Func#%d is safe for any args that match its prototype\n",
++ 				i);
++ 		}
++ 	}
++ 	return 0;
++ }
++ 
++ static int do_check_main(struct bpf_verifier_env *env)
++ {
++ 	int ret;
++ 
++ 	env->insn_idx = 0;
++ 	ret = do_check_common(env, 0);
++ 	if (!ret)
++ 		env->prog->aux->stack_depth = env->subprog_info[0].stack_depth;
++ 	return ret;
++ }
++ 
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  static void print_verification_stats(struct bpf_verifier_env *env)
+  {
+  	int i;
+@@@ -9533,6 -9687,264 +9690,267 @@@
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
++ {
++ 	const struct btf_type *t, *func_proto;
++ 	const struct bpf_struct_ops *st_ops;
++ 	const struct btf_member *member;
++ 	struct bpf_prog *prog = env->prog;
++ 	u32 btf_id, member_idx;
++ 	const char *mname;
++ 
++ 	btf_id = prog->aux->attach_btf_id;
++ 	st_ops = bpf_struct_ops_find(btf_id);
++ 	if (!st_ops) {
++ 		verbose(env, "attach_btf_id %u is not a supported struct\n",
++ 			btf_id);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	t = st_ops->type;
++ 	member_idx = prog->expected_attach_type;
++ 	if (member_idx >= btf_type_vlen(t)) {
++ 		verbose(env, "attach to invalid member idx %u of struct %s\n",
++ 			member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	member = &btf_type_member(t)[member_idx];
++ 	mname = btf_name_by_offset(btf_vmlinux, member->name_off);
++ 	func_proto = btf_type_resolve_func_ptr(btf_vmlinux, member->type,
++ 					       NULL);
++ 	if (!func_proto) {
++ 		verbose(env, "attach to invalid member %s(@idx %u) of struct %s\n",
++ 			mname, member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (st_ops->check_member) {
++ 		int err = st_ops->check_member(t, member);
++ 
++ 		if (err) {
++ 			verbose(env, "attach to unsupported member %s of struct %s\n",
++ 				mname, st_ops->name);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	prog->aux->attach_func_proto = func_proto;
++ 	prog->aux->attach_func_name = mname;
++ 	env->ops = st_ops->verifier_ops;
++ 
++ 	return 0;
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	int ret = 0, subprog = -1, i;
++ 	struct bpf_trampoline *tr;
++ 	const struct btf_type *t;
++ 	bool conservative = true;
++ 	const char *tname;
++ 	struct btf *btf;
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING && !prog_extension)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	btf = bpf_prog_get_target_btf(prog);
++ 	if (!btf) {
++ 		verbose(env,
++ 			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	if (tgt_prog) {
++ 		struct bpf_prog_aux *aux = tgt_prog->aux;
++ 
++ 		for (i = 0; i < aux->func_info_cnt; i++)
++ 			if (aux->func_info[i].type_id == btf_id) {
++ 				subprog = i;
++ 				break;
++ 			}
++ 		if (subprog == -1) {
++ 			verbose(env, "Subprog %s doesn't exist\n", tname);
++ 			return -EINVAL;
++ 		}
++ 		conservative = aux->func_info_aux[subprog].unreliable;
++ 		if (prog_extension) {
++ 			if (conservative) {
++ 				verbose(env,
++ 					"Cannot replace static functions\n");
++ 				return -EINVAL;
++ 			}
++ 			if (!prog->jit_requested) {
++ 				verbose(env,
++ 					"Extension programs should be JITed\n");
++ 				return -EINVAL;
++ 			}
++ 			env->ops = bpf_verifier_ops[tgt_prog->type];
++ 		}
++ 		if (!tgt_prog->jited) {
++ 			verbose(env, "Can attach to only JITed progs\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == prog->type) {
++ 			/* Cannot fentry/fexit another fentry/fexit program.
++ 			 * Cannot attach program extension to another extension.
++ 			 * It's ok to attach fentry/fexit to extension program.
++ 			 */
++ 			verbose(env, "Cannot recursively attach\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == BPF_PROG_TYPE_TRACING &&
++ 		    prog_extension &&
++ 		    (tgt_prog->expected_attach_type == BPF_TRACE_FENTRY ||
++ 		     tgt_prog->expected_attach_type == BPF_TRACE_FEXIT)) {
++ 			/* Program extensions can extend all program types
++ 			 * except fentry/fexit. The reason is the following.
++ 			 * The fentry/fexit programs are used for performance
++ 			 * analysis, stats and can be attached to any program
++ 			 * type except themselves. When extension program is
++ 			 * replacing XDP function it is necessary to allow
++ 			 * performance analysis of all functions. Both original
++ 			 * XDP program and its program extension. Hence
++ 			 * attaching fentry/fexit to BPF_PROG_TYPE_EXT is
++ 			 * allowed. If extending of fentry/fexit was allowed it
++ 			 * would be possible to create long call chain
++ 			 * fentry->extension->fentry->extension beyond
++ 			 * reasonable stack size. Hence extending fentry is not
++ 			 * allowed.
++ 			 */
++ 			verbose(env, "Cannot extend fentry/fexit\n");
++ 			return -EINVAL;
++ 		}
++ 		key = ((u64)aux->id) << 32 | btf_id;
++ 	} else {
++ 		if (prog_extension) {
++ 			verbose(env, "Cannot replace kernel functions\n");
++ 			return -EINVAL;
++ 		}
++ 		key = btf_id;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (tgt_prog) {
++ 			verbose(env,
++ 				"Only FENTRY/FEXIT progs are attachable to another BPF prog\n");
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	default:
++ 		if (!prog_extension)
++ 			return -EINVAL;
++ 		/* fallthrough */
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		if (!btf_type_is_func(t)) {
++ 			verbose(env, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (prog_extension &&
++ 		    btf_check_type_match(env, prog, btf, t))
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		tr = bpf_trampoline_lookup(key);
++ 		if (!tr)
++ 			return -ENOMEM;
++ 		prog->aux->attach_func_name = tname;
++ 		/* t is either vmlinux type or another program's type */
++ 		prog->aux->attach_func_proto = t;
++ 		mutex_lock(&tr->mutex);
++ 		if (tr->func.addr) {
++ 			prog->aux->trampoline = tr;
++ 			goto out;
++ 		}
++ 		if (tgt_prog && conservative) {
++ 			prog->aux->attach_func_proto = NULL;
++ 			t = NULL;
++ 		}
++ 		ret = btf_distill_func_proto(&env->log, btf, t,
++ 					     tname, &tr->func.model);
++ 		if (ret < 0)
++ 			goto out;
++ 		if (tgt_prog) {
++ 			if (subprog == 0)
++ 				addr = (long) tgt_prog->bpf_func;
++ 			else
++ 				addr = (long) tgt_prog->aux->func[subprog]->bpf_func;
++ 		} else {
++ 			addr = kallsyms_lookup_name(tname);
++ 			if (!addr) {
++ 				verbose(env,
++ 					"The address of function %s cannot be found\n",
++ 					tname);
++ 				ret = -ENOENT;
++ 				goto out;
++ 			}
++ 		}
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
++ 	}
++ }
++ 
+++>>>>>>> be8704ff07d2 (bpf: Introduce dynamic program extensions)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+* Unmerged path kernel/bpf/trampoline.c
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/linux/bpf_types.h
+* Unmerged path include/linux/btf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/btf.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/trampoline.c
+* Unmerged path kernel/bpf/verifier.c
