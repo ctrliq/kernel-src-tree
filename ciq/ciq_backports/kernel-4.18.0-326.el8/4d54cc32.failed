@@ -1,0 +1,155 @@
+mptcp: avoid lock_fast usage in accept path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 4d54cc32112d8d8b0667559c9309f1a6f764f70b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/4d54cc32.failed
+
+Once event support is added this may need to allocate memory while msk
+lock is held with softirqs disabled.
+
+Not using lock_fast also allows to do the allocation with GFP_KERNEL.
+
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 4d54cc32112d8d8b0667559c9309f1a6f764f70b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netlink/genetlink.c
+diff --cc net/netlink/genetlink.c
+index e42ae71c2406,2d6fdf40df66..000000000000
+--- a/net/netlink/genetlink.c
++++ b/net/netlink/genetlink.c
+@@@ -1362,49 -1362,33 +1362,79 @@@ static struct genl_family genl_ctrl __r
+  
+  static int genl_bind(struct net *net, int group)
+  {
+++<<<<<<< HEAD
+ +	struct genl_family *f;
+ +	int err = -ENOENT;
+ +	unsigned int id;
+ +
+ +	down_read(&cb_lock);
+ +
+ +	idr_for_each_entry(&genl_fam_idr, f, id) {
+ +		if (group >= f->mcgrp_offset &&
+ +		    group < f->mcgrp_offset + f->n_mcgrps) {
+ +			int fam_grp = group - f->mcgrp_offset;
+ +
+ +			if (!f->netnsok && net != &init_net)
+ +				err = -ENOENT;
+ +			else if (f->mcast_bind)
+ +				err = f->mcast_bind(net, fam_grp);
+ +			else
+ +				err = 0;
+ +			break;
+ +		}
+ +	}
+ +	up_read(&cb_lock);
+ +
+ +	return err;
+ +}
+ +
+ +static void genl_unbind(struct net *net, int group)
+ +{
+ +	struct genl_family *f;
+ +	unsigned int id;
+ +
+ +	down_read(&cb_lock);
+ +
+ +	idr_for_each_entry(&genl_fam_idr, f, id) {
+ +		if (group >= f->mcgrp_offset &&
+ +		    group < f->mcgrp_offset + f->n_mcgrps) {
+ +			int fam_grp = group - f->mcgrp_offset;
+ +
+ +			if (f->mcast_unbind)
+ +				f->mcast_unbind(net, fam_grp);
+ +			break;
+ +		}
+ +	}
+ +	up_read(&cb_lock);
+++=======
++ 	const struct genl_family *family;
++ 	unsigned int id;
++ 	int ret = 0;
++ 
++ 	genl_lock_all();
++ 
++ 	idr_for_each_entry(&genl_fam_idr, family, id) {
++ 		const struct genl_multicast_group *grp;
++ 		int i;
++ 
++ 		if (family->n_mcgrps == 0)
++ 			continue;
++ 
++ 		i = group - family->mcgrp_offset;
++ 		if (i < 0 || i >= family->n_mcgrps)
++ 			continue;
++ 
++ 		grp = &family->mcgrps[i];
++ 		if ((grp->flags & GENL_UNS_ADMIN_PERM) &&
++ 		    !ns_capable(net->user_ns, CAP_NET_ADMIN))
++ 			ret = -EPERM;
++ 
++ 		break;
++ 	}
++ 
++ 	genl_unlock_all();
++ 	return ret;
+++>>>>>>> 4d54cc32112d (mptcp: avoid lock_fast usage in accept path)
+  }
+  
+  static int __net_init genl_pernet_init(struct net *net)
+@@@ -1413,7 -1397,6 +1443,10 @@@
+  		.input		= genl_rcv,
+  		.flags		= NL_CFG_F_NONROOT_RECV,
+  		.bind		= genl_bind,
+++<<<<<<< HEAD
+ +		.unbind		= genl_unbind,
+++=======
+++>>>>>>> 4d54cc32112d (mptcp: avoid lock_fast usage in accept path)
+  	};
+  
+  	/* we'll bump the group number right afterwards */
+diff --git a/include/net/genetlink.h b/include/net/genetlink.h
+index 654987d273db..2921daba9d96 100644
+--- a/include/net/genetlink.h
++++ b/include/net/genetlink.h
+@@ -16,6 +16,7 @@
+  */
+ struct genl_multicast_group {
+ 	char			name[GENL_NAMSIZ];
++	u8			flags;
+ };
+ 
+ struct genl_ops;
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index 7225d57f4a70..9e36fdf173d3 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -3276,9 +3276,8 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 		struct mptcp_sock *msk = mptcp_sk(newsock->sk);
+ 		struct mptcp_subflow_context *subflow;
+ 		struct sock *newsk = newsock->sk;
+-		bool slowpath;
+ 
+-		slowpath = lock_sock_fast(newsk);
++		lock_sock(newsk);
+ 
+ 		/* PM/worker can now acquire the first subflow socket
+ 		 * lock without racing with listener queue cleanup,
+@@ -3304,7 +3303,7 @@ static int mptcp_stream_accept(struct socket *sock, struct socket *newsock,
+ 			if (!ssk->sk_socket)
+ 				mptcp_sock_graft(ssk, newsock);
+ 		}
+-		unlock_sock_fast(newsk, slowpath);
++		release_sock(newsk);
+ 	}
+ 
+ 	if (inet_csk_listen_poll(ssock->sk))
+* Unmerged path net/netlink/genetlink.c
