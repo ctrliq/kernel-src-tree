@@ -1,0 +1,135 @@
+arm64: cpufeature: Add CPU capability for AArch32 EL1 support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [arm64] cpufeature: Add CPU capability for AArch32 EL1 support (Andrew Jones) [1842468]
+Rebuild_FUZZ: 93.91%
+commit-author Will Deacon <will@kernel.org>
+commit 540f76d12c662d3da2ebdf0086ee289123fcd120
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/540f76d1.failed
+
+Although we emit a "SANITY CHECK" warning and taint the kernel if we
+detect a CPU mismatch for AArch32 support at EL1, we still online the
+CPU with disastrous consequences for any running 32-bit VMs.
+
+Introduce a capability for AArch32 support at EL1 so that late onlining
+of incompatible CPUs is forbidden.
+
+	Tested-by: Sai Prakash Ranjan <saiprakash.ranjan@codeaurora.org>
+	Reviewed-by: Suzuki K Poulose <suzuki.poulose@arm.com>
+	Acked-by: Marc Zyngier <maz@kernel.org>
+Link: https://lore.kernel.org/r/20200421142922.18950-4-will@kernel.org
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 540f76d12c662d3da2ebdf0086ee289123fcd120)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/cpucaps.h
+diff --cc arch/arm64/include/asm/cpucaps.h
+index 5ca3d91a67b5,c54c674e6c21..000000000000
+--- a/arch/arm64/include/asm/cpucaps.h
++++ b/arch/arm64/include/asm/cpucaps.h
+@@@ -60,11 -49,20 +60,26 @@@
+  #define ARM64_HAS_ADDRESS_AUTH_IMP_DEF		39
+  #define ARM64_HAS_GENERIC_AUTH_ARCH		40
+  #define ARM64_HAS_GENERIC_AUTH_IMP_DEF		41
+ -#define ARM64_HAS_IRQ_PRIO_MASKING		42
+ -#define ARM64_HAS_DCPODP			43
+ +#define ARM64_WORKAROUND_CAVIUM_TX2_219_TVM	42
+ +#define ARM64_WORKAROUND_CAVIUM_TX2_219_PRFM	43
+  #define ARM64_WORKAROUND_1463225		44
+++<<<<<<< HEAD
+ +#define ARM64_WORKAROUND_1542419		45
+ +
+ +#define ARM64_NCAPS				46
+++=======
++ #define ARM64_WORKAROUND_CAVIUM_TX2_219_TVM	45
++ #define ARM64_WORKAROUND_CAVIUM_TX2_219_PRFM	46
++ #define ARM64_WORKAROUND_1542419		47
++ #define ARM64_WORKAROUND_SPECULATIVE_AT_NVHE	48
++ #define ARM64_HAS_E0PD				49
++ #define ARM64_HAS_RNG				50
++ #define ARM64_HAS_AMU_EXTN			51
++ #define ARM64_HAS_ADDRESS_AUTH			52
++ #define ARM64_HAS_GENERIC_AUTH			53
++ #define ARM64_HAS_32BIT_EL1			54
++ 
++ #define ARM64_NCAPS				55
+++>>>>>>> 540f76d12c66 (arm64: cpufeature: Add CPU capability for AArch32 EL1 support)
+  
+  #endif /* __ASM_CPUCAPS_H */
+* Unmerged path arch/arm64/include/asm/cpucaps.h
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index 29fa94608f98..b515718697fb 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -624,6 +624,7 @@
+ #define ID_AA64PFR0_ASIMD_NI		0xf
+ #define ID_AA64PFR0_ASIMD_SUPPORTED	0x0
+ #define ID_AA64PFR0_EL1_64BIT_ONLY	0x1
++#define ID_AA64PFR0_EL1_32BIT_64BIT	0x2
+ #define ID_AA64PFR0_EL0_64BIT_ONLY	0x1
+ #define ID_AA64PFR0_EL0_32BIT_64BIT	0x2
+ 
+diff --git a/arch/arm64/kernel/cpufeature.c b/arch/arm64/kernel/cpufeature.c
+index a1f04d917ce1..ed2144d11b54 100644
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@ -1332,6 +1332,18 @@ static const struct arm64_cpu_capabilities arm64_features[] = {
+ 		.field_pos = ID_AA64PFR0_EL0_SHIFT,
+ 		.min_field_value = ID_AA64PFR0_EL0_32BIT_64BIT,
+ 	},
++#ifdef CONFIG_KVM
++	{
++		.desc = "32-bit EL1 Support",
++		.capability = ARM64_HAS_32BIT_EL1,
++		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
++		.matches = has_cpuid_feature,
++		.sys_reg = SYS_ID_AA64PFR0_EL1,
++		.sign = FTR_UNSIGNED,
++		.field_pos = ID_AA64PFR0_EL1_SHIFT,
++		.min_field_value = ID_AA64PFR0_EL1_32BIT_64BIT,
++	},
++#endif
+ 	{
+ 		.desc = "Kernel page table isolation (KPTI)",
+ 		.capability = ARM64_UNMAP_KERNEL_AT_EL0,
+diff --git a/arch/arm64/kvm/reset.c b/arch/arm64/kvm/reset.c
+index 52263c52cddb..90b4d17217e2 100644
+--- a/arch/arm64/kvm/reset.c
++++ b/arch/arm64/kvm/reset.c
+@@ -57,14 +57,6 @@ static const struct kvm_regs default_regs_reset32 = {
+ 			PSR_AA32_I_BIT | PSR_AA32_F_BIT),
+ };
+ 
+-static bool cpu_has_32bit_el1(void)
+-{
+-	u64 pfr0;
+-
+-	pfr0 = read_sanitised_ftr_reg(SYS_ID_AA64PFR0_EL1);
+-	return !!(pfr0 & 0x20);
+-}
+-
+ /**
+  * kvm_arch_vm_ioctl_check_extension
+  *
+@@ -77,7 +69,7 @@ int kvm_arch_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 
+ 	switch (ext) {
+ 	case KVM_CAP_ARM_EL1_32BIT:
+-		r = cpu_has_32bit_el1();
++		r = cpus_have_const_cap(ARM64_HAS_32BIT_EL1);
+ 		break;
+ 	case KVM_CAP_GUEST_DEBUG_HW_BPS:
+ 		r = get_num_brps();
+@@ -294,7 +286,7 @@ int kvm_reset_vcpu(struct kvm_vcpu *vcpu)
+ 	switch (vcpu->arch.target) {
+ 	default:
+ 		if (test_bit(KVM_ARM_VCPU_EL1_32BIT, vcpu->arch.features)) {
+-			if (!cpu_has_32bit_el1())
++			if (!cpus_have_const_cap(ARM64_HAS_32BIT_EL1))
+ 				goto out;
+ 			cpu_reset = &default_regs_reset32;
+ 		} else {
