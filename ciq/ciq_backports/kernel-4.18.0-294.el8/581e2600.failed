@@ -1,0 +1,544 @@
+block: move block layer internals out of include/linux/genhd.h
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 581e26004a09c50e5017caadc850ea17e374a5ee
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/581e2600.failed
+
+None of this needs to be exposed to drivers.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 581e26004a09c50e5017caadc850ea17e374a5ee)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk.h
+#	block/partition-generic.c
+#	include/linux/genhd.h
+diff --cc block/blk.h
+index 5c44b4751a29,ac20f972842e..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -342,10 -374,111 +351,118 @@@ void blk_queue_free_zone_bitmaps(struc
+  static inline void blk_queue_free_zone_bitmaps(struct request_queue *q) {}
+  #endif
+  
+++<<<<<<< HEAD
+ +/* internal helper for accessing request_aux  */
+ +static inline struct request_aux *rq_aux(const struct request *rq)
+ +{
+ +	return (struct request_aux *)((void *)rq - sizeof(struct request_aux));
+++=======
++ void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
++ 			int rw);
++ void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
++ struct hd_struct *disk_map_sector_rcu(struct gendisk *disk, sector_t sector);
++ 
++ int blk_alloc_devt(struct hd_struct *part, dev_t *devt);
++ void blk_free_devt(dev_t devt);
++ void blk_invalidate_devt(dev_t devt);
++ char *disk_name(struct gendisk *hd, int partno, char *buf);
++ #define ADDPART_FLAG_NONE	0
++ #define ADDPART_FLAG_RAID	1
++ #define ADDPART_FLAG_WHOLEDISK	2
++ struct hd_struct *__must_check add_partition(struct gendisk *disk, int partno,
++ 		sector_t start, sector_t len, int flags,
++ 		struct partition_meta_info *info);
++ void __delete_partition(struct percpu_ref *ref);
++ void delete_partition(struct gendisk *disk, int partno);
++ int disk_expand_part_tbl(struct gendisk *disk, int target);
++ 
++ static inline int hd_ref_init(struct hd_struct *part)
++ {
++ 	if (percpu_ref_init(&part->ref, __delete_partition, 0,
++ 				GFP_KERNEL))
++ 		return -ENOMEM;
++ 	return 0;
++ }
++ 
++ static inline void hd_struct_get(struct hd_struct *part)
++ {
++ 	percpu_ref_get(&part->ref);
++ }
++ 
++ static inline int hd_struct_try_get(struct hd_struct *part)
++ {
++ 	return percpu_ref_tryget_live(&part->ref);
++ }
++ 
++ static inline void hd_struct_put(struct hd_struct *part)
++ {
++ 	percpu_ref_put(&part->ref);
++ }
++ 
++ static inline void hd_struct_kill(struct hd_struct *part)
++ {
++ 	percpu_ref_kill(&part->ref);
++ }
++ 
++ static inline void hd_free_part(struct hd_struct *part)
++ {
++ 	free_part_stats(part);
++ 	kfree(part->info);
++ 	percpu_ref_exit(&part->ref);
++ }
++ 
++ /*
++  * Any access of part->nr_sects which is not protected by partition
++  * bd_mutex or gendisk bdev bd_mutex, should be done using this
++  * accessor function.
++  *
++  * Code written along the lines of i_size_read() and i_size_write().
++  * CONFIG_PREEMPTION case optimizes the case of UP kernel with preemption
++  * on.
++  */
++ static inline sector_t part_nr_sects_read(struct hd_struct *part)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	sector_t nr_sects;
++ 	unsigned seq;
++ 	do {
++ 		seq = read_seqcount_begin(&part->nr_sects_seq);
++ 		nr_sects = part->nr_sects;
++ 	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
++ 	return nr_sects;
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	sector_t nr_sects;
++ 
++ 	preempt_disable();
++ 	nr_sects = part->nr_sects;
++ 	preempt_enable();
++ 	return nr_sects;
++ #else
++ 	return part->nr_sects;
++ #endif
++ }
++ 
++ /*
++  * Should be called with mutex lock held (typically bd_mutex) of partition
++  * to provide mutual exlusion among writers otherwise seqcount might be
++  * left in wrong state leaving the readers spinning infinitely.
++  */
++ static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
++ {
++ #if BITS_PER_LONG==32 && defined(CONFIG_SMP)
++ 	write_seqcount_begin(&part->nr_sects_seq);
++ 	part->nr_sects = size;
++ 	write_seqcount_end(&part->nr_sects_seq);
++ #elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPTION)
++ 	preempt_disable();
++ 	part->nr_sects = size;
++ 	preempt_enable();
++ #else
++ 	part->nr_sects = size;
++ #endif
+++>>>>>>> 581e26004a09 (block: move block layer internals out of include/linux/genhd.h)
+  }
+  
+  #endif /* BLK_INTERNAL_H */
+diff --cc block/partition-generic.c
+index 9b9e90161fdf,b79c4513629b..000000000000
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@@ -1,61 -1,176 +1,66 @@@
+  // SPDX-License-Identifier: GPL-2.0
+  /*
+ - * Copyright (C) 1991-1998  Linus Torvalds
+ - * Re-organised Feb 1998 Russell King
+ + *  Code extracted from drivers/block/genhd.c
+ + *  Copyright (C) 1991-1998  Linus Torvalds
+ + *  Re-organised Feb 1998 Russell King
+ + *
+ + *  We now have independent partition support from the
+ + *  block drivers, which allows all the partition code to
+ + *  be grouped in one location, and it to be mostly self
+ + *  contained.
+   */
+ +
+ +#include <linux/init.h>
+ +#include <linux/module.h>
+  #include <linux/fs.h>
+  #include <linux/slab.h>
+ +#include <linux/kmod.h>
+  #include <linux/ctype.h>
+  #include <linux/genhd.h>
+ -#include <linux/vmalloc.h>
+  #include <linux/blktrace_api.h>
+++<<<<<<< HEAD:block/partition-generic.c
+++=======
++ #include <linux/raid/detect.h>
++ #include "check.h"
+++>>>>>>> 581e26004a09 (block: move block layer internals out of include/linux/genhd.h):block/partitions/core.c
+  
+ -static int (*check_part[])(struct parsed_partitions *) = {
+ -	/*
+ -	 * Probe partition formats with tables at disk address 0
+ -	 * that also have an ADFS boot block at 0xdc0.
+ -	 */
+ -#ifdef CONFIG_ACORN_PARTITION_ICS
+ -	adfspart_check_ICS,
+ -#endif
+ -#ifdef CONFIG_ACORN_PARTITION_POWERTEC
+ -	adfspart_check_POWERTEC,
+ -#endif
+ -#ifdef CONFIG_ACORN_PARTITION_EESOX
+ -	adfspart_check_EESOX,
+ -#endif
+ -
+ -	/*
+ -	 * Now move on to formats that only have partition info at
+ -	 * disk address 0xdc0.  Since these may also have stale
+ -	 * PC/BIOS partition tables, they need to come before
+ -	 * the msdos entry.
+ -	 */
+ -#ifdef CONFIG_ACORN_PARTITION_CUMANA
+ -	adfspart_check_CUMANA,
+ -#endif
+ -#ifdef CONFIG_ACORN_PARTITION_ADFS
+ -	adfspart_check_ADFS,
+ -#endif
+ +#include "partitions/check.h"
+  
+ -#ifdef CONFIG_CMDLINE_PARTITION
+ -	cmdline_partition,
+ -#endif
+ -#ifdef CONFIG_EFI_PARTITION
+ -	efi_partition,		/* this must come before msdos */
+ -#endif
+ -#ifdef CONFIG_SGI_PARTITION
+ -	sgi_partition,
+ -#endif
+ -#ifdef CONFIG_LDM_PARTITION
+ -	ldm_partition,		/* this must come before msdos */
+ -#endif
+ -#ifdef CONFIG_MSDOS_PARTITION
+ -	msdos_partition,
+ -#endif
+ -#ifdef CONFIG_OSF_PARTITION
+ -	osf_partition,
+ -#endif
+ -#ifdef CONFIG_SUN_PARTITION
+ -	sun_partition,
+ -#endif
+ -#ifdef CONFIG_AMIGA_PARTITION
+ -	amiga_partition,
+ -#endif
+ -#ifdef CONFIG_ATARI_PARTITION
+ -	atari_partition,
+ -#endif
+ -#ifdef CONFIG_MAC_PARTITION
+ -	mac_partition,
+ -#endif
+ -#ifdef CONFIG_ULTRIX_PARTITION
+ -	ultrix_partition,
+ -#endif
+ -#ifdef CONFIG_IBM_PARTITION
+ -	ibm_partition,
+ +#ifdef CONFIG_BLK_DEV_MD
+ +extern void md_autodetect_dev(dev_t dev);
+  #endif
+ -#ifdef CONFIG_KARMA_PARTITION
+ -	karma_partition,
+ -#endif
+ -#ifdef CONFIG_SYSV68_PARTITION
+ -	sysv68_partition,
+ -#endif
+ -	NULL
+ -};
+ + 
+ +/*
+ + * disk_name() is used by partition check code and the genhd driver.
+ + * It formats the devicename of the indicated disk into
+ + * the supplied buffer (of size at least 32), and returns
+ + * a pointer to that same buffer (for convenience).
+ + */
+  
+ -static struct parsed_partitions *allocate_partitions(struct gendisk *hd)
+ +char *disk_name(struct gendisk *hd, int partno, char *buf)
+  {
+ -	struct parsed_partitions *state;
+ -	int nr;
+ -
+ -	state = kzalloc(sizeof(*state), GFP_KERNEL);
+ -	if (!state)
+ -		return NULL;
+ -
+ -	nr = disk_max_parts(hd);
+ -	state->parts = vzalloc(array_size(nr, sizeof(state->parts[0])));
+ -	if (!state->parts) {
+ -		kfree(state);
+ -		return NULL;
+ -	}
+ -
+ -	state->limit = nr;
+ +	if (!partno)
+ +		snprintf(buf, BDEVNAME_SIZE, "%s", hd->disk_name);
+ +	else if (isdigit(hd->disk_name[strlen(hd->disk_name)-1]))
+ +		snprintf(buf, BDEVNAME_SIZE, "%sp%d", hd->disk_name, partno);
+ +	else
+ +		snprintf(buf, BDEVNAME_SIZE, "%s%d", hd->disk_name, partno);
+  
+ -	return state;
+ +	return buf;
+  }
+  
+ -static void free_partitions(struct parsed_partitions *state)
+ +const char *bdevname(struct block_device *bdev, char *buf)
+  {
+ -	vfree(state->parts);
+ -	kfree(state);
+ +	return disk_name(bdev->bd_disk, bdev->bd_part->partno, buf);
+  }
+  
+ -static struct parsed_partitions *check_partition(struct gendisk *hd,
+ -		struct block_device *bdev)
+ -{
+ -	struct parsed_partitions *state;
+ -	int i, res, err;
+ -
+ -	state = allocate_partitions(hd);
+ -	if (!state)
+ -		return NULL;
+ -	state->pp_buf = (char *)__get_free_page(GFP_KERNEL);
+ -	if (!state->pp_buf) {
+ -		free_partitions(state);
+ -		return NULL;
+ -	}
+ -	state->pp_buf[0] = '\0';
+ -
+ -	state->bdev = bdev;
+ -	disk_name(hd, 0, state->name);
+ -	snprintf(state->pp_buf, PAGE_SIZE, " %s:", state->name);
+ -	if (isdigit(state->name[strlen(state->name)-1]))
+ -		sprintf(state->name, "p");
+ -
+ -	i = res = err = 0;
+ -	while (!res && check_part[i]) {
+ -		memset(state->parts, 0, state->limit * sizeof(state->parts[0]));
+ -		res = check_part[i++](state);
+ -		if (res < 0) {
+ -			/*
+ -			 * We have hit an I/O error which we don't report now.
+ -			 * But record it, and let the others do their job.
+ -			 */
+ -			err = res;
+ -			res = 0;
+ -		}
+ -
+ -	}
+ -	if (res > 0) {
+ -		printk(KERN_INFO "%s", state->pp_buf);
+ -
+ -		free_page((unsigned long)state->pp_buf);
+ -		return state;
+ -	}
+ -	if (state->access_beyond_eod)
+ -		err = -ENOSPC;
+ -	/*
+ -	 * The partition is unrecognized. So report I/O errors if there were any
+ -	 */
+ -	if (err)
+ -		res = err;
+ -	if (res) {
+ -		strlcat(state->pp_buf,
+ -			" unable to read partition table\n", PAGE_SIZE);
+ -		printk(KERN_INFO "%s", state->pp_buf);
+ -	}
+ +EXPORT_SYMBOL(bdevname);
+  
+ -	free_page((unsigned long)state->pp_buf);
+ -	free_partitions(state);
+ -	return ERR_PTR(res);
+ +const char *bio_devname(struct bio *bio, char *buf)
+ +{
+ +	return disk_name(bio->bi_disk, bio->bi_partno, buf);
+  }
+ +EXPORT_SYMBOL(bio_devname);
+  
+  static ssize_t part_partition_show(struct device *dev,
+  				   struct device_attribute *attr, char *buf)
+diff --cc include/linux/genhd.h
+index 17a430524bd8,14354a6e89c2..000000000000
+--- a/include/linux/genhd.h
++++ b/include/linux/genhd.h
+@@@ -289,10 -298,6 +289,13 @@@ extern void disk_part_iter_init(struct 
+  extern struct hd_struct *disk_part_iter_next(struct disk_part_iter *piter);
+  extern void disk_part_iter_exit(struct disk_part_iter *piter);
+  
+++<<<<<<< HEAD
+ +extern struct hd_struct *disk_map_sector_rcu(struct gendisk *disk,
+ +					     sector_t sector);
+ +bool disk_has_partitions(struct gendisk *disk);
+ +
+++=======
+++>>>>>>> 581e26004a09 (block: move block layer internals out of include/linux/genhd.h)
+  /*
+   * Macros to operate on percpu disk statistics:
+   *
+@@@ -404,26 -406,6 +407,29 @@@ static inline void free_part_stats(stru
+  #define part_stat_local_read_cpu(gendiskp, field, cpu)			\
+  	local_read(&(part_stat_get_cpu(gendiskp, field, cpu)))
+  
+++<<<<<<< HEAD
+ +void part_dec_in_flight(struct request_queue *q, struct hd_struct *part,
+ +			int rw);
+ +void part_inc_in_flight(struct request_queue *q, struct hd_struct *part,
+ +			int rw);
+ +
+ +static inline struct partition_meta_info *alloc_part_info(struct gendisk *disk)
+ +{
+ +	if (disk)
+ +		return kzalloc_node(sizeof(struct partition_meta_info),
+ +				    GFP_KERNEL, disk->node_id);
+ +	return kzalloc(sizeof(struct partition_meta_info), GFP_KERNEL);
+ +}
+ +
+ +static inline void free_part_info(struct hd_struct *part)
+ +{
+ +	kfree(part->info);
+ +}
+ +
+ +void update_io_ticks(struct hd_struct *part, unsigned long now, bool end);
+ +
+++=======
+++>>>>>>> 581e26004a09 (block: move block layer internals out of include/linux/genhd.h)
+  /* block/genhd.c */
+  extern void device_add_disk(struct device *parent, struct gendisk *disk,
+  			    const struct attribute_group **groups);
+@@@ -539,100 -491,6 +529,103 @@@ extern ssize_t part_fail_store(struct d
+  
+  #define alloc_disk(minors) alloc_disk_node(minors, NUMA_NO_NODE)
+  
+++<<<<<<< HEAD
+ +static inline int hd_ref_init(struct hd_struct *part)
+ +{
+ +	if (percpu_ref_init(&part->ref, __delete_partition, 0,
+ +				GFP_KERNEL))
+ +		return -ENOMEM;
+ +	return 0;
+ +}
+ +
+ +static inline void hd_struct_get(struct hd_struct *part)
+ +{
+ +	percpu_ref_get(&part->ref);
+ +}
+ +
+ +static inline int hd_struct_try_get(struct hd_struct *part)
+ +{
+ +	return percpu_ref_tryget_live(&part->ref);
+ +}
+ +
+ +static inline void hd_struct_put(struct hd_struct *part)
+ +{
+ +	percpu_ref_put(&part->ref);
+ +}
+ +
+ +static inline void hd_struct_kill(struct hd_struct *part)
+ +{
+ +	percpu_ref_kill(&part->ref);
+ +}
+ +
+ +static inline void hd_free_part(struct hd_struct *part)
+ +{
+ +	free_part_stats(part);
+ +	free_part_info(part);
+ +	percpu_ref_exit(&part->ref);
+ +}
+ +
+ +/*
+ + * Any access of part->nr_sects which is not protected by partition
+ + * bd_mutex or gendisk bdev bd_mutex, should be done using this
+ + * accessor function.
+ + *
+ + * Code written along the lines of i_size_read() and i_size_write().
+ + * CONFIG_PREEMPT case optimizes the case of UP kernel with preemption
+ + * on.
+ + */
+ +static inline sector_t part_nr_sects_read(struct hd_struct *part)
+ +{
+ +#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+ +	sector_t nr_sects;
+ +	unsigned seq;
+ +	do {
+ +		seq = read_seqcount_begin(&part->nr_sects_seq);
+ +		nr_sects = part->nr_sects;
+ +	} while (read_seqcount_retry(&part->nr_sects_seq, seq));
+ +	return nr_sects;
+ +#elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPT)
+ +	sector_t nr_sects;
+ +
+ +	preempt_disable();
+ +	nr_sects = part->nr_sects;
+ +	preempt_enable();
+ +	return nr_sects;
+ +#else
+ +	return part->nr_sects;
+ +#endif
+ +}
+ +
+ +/*
+ + * Should be called with mutex lock held (typically bd_mutex) of partition
+ + * to provide mutual exlusion among writers otherwise seqcount might be
+ + * left in wrong state leaving the readers spinning infinitely.
+ + */
+ +static inline void part_nr_sects_write(struct hd_struct *part, sector_t size)
+ +{
+ +#if BITS_PER_LONG==32 && defined(CONFIG_SMP)
+ +	write_seqcount_begin(&part->nr_sects_seq);
+ +	part->nr_sects = size;
+ +	write_seqcount_end(&part->nr_sects_seq);
+ +#elif BITS_PER_LONG==32 && defined(CONFIG_PREEMPT)
+ +	preempt_disable();
+ +	part->nr_sects = size;
+ +	preempt_enable();
+ +#else
+ +	part->nr_sects = size;
+ +#endif
+ +}
+ +
+ +#if defined(CONFIG_BLK_DEV_INTEGRITY)
+ +extern void blk_integrity_add(struct gendisk *);
+ +extern void blk_integrity_del(struct gendisk *);
+ +#else	/* CONFIG_BLK_DEV_INTEGRITY */
+ +static inline void blk_integrity_add(struct gendisk *disk) { }
+ +static inline void blk_integrity_del(struct gendisk *disk) { }
+ +#endif	/* CONFIG_BLK_DEV_INTEGRITY */
+ +
+++=======
+++>>>>>>> 581e26004a09 (block: move block layer internals out of include/linux/genhd.h)
+  #else /* CONFIG_BLOCK */
+  
+  static inline void printk_all_partitions(void) { }
+* Unmerged path block/blk.h
+diff --git a/block/ioctl.c b/block/ioctl.c
+index f8f8a81c640e..1c09052cfa22 100644
+--- a/block/ioctl.c
++++ b/block/ioctl.c
+@@ -9,6 +9,7 @@
+ #include <linux/blktrace_api.h>
+ #include <linux/pr.h>
+ #include <linux/uaccess.h>
++#include "blk.h"
+ 
+ static int blkpg_ioctl(struct block_device *bdev, struct blkpg_ioctl_arg __user *arg)
+ {
+* Unmerged path block/partition-generic.c
+diff --git a/block/partitions/check.h b/block/partitions/check.h
+index 19852b494e93..43559210cb27 100644
+--- a/block/partitions/check.h
++++ b/block/partitions/check.h
+@@ -2,6 +2,7 @@
+ #include <linux/pagemap.h>
+ #include <linux/blkdev.h>
+ #include <linux/genhd.h>
++#include "../blk.h"
+ 
+ /*
+  * add_gd_partition adds a partitions details to the devices partition
+* Unmerged path include/linux/genhd.h
