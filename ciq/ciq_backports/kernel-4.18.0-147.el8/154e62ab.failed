@@ -1,0 +1,128 @@
+net/mlx5e: Properly initialize flow attributes for slow path eswitch rule deletion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Or Gerlitz <ogerlitz@mellanox.com>
+commit 154e62abe9cd07c9b71735d8456a03a7c5251280
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/154e62ab.failed
+
+When a neighbour is resolved, we delete the goto slow path rule from HW.
+
+The eswitch flow attributes where not properly initialized on that case,
+hence we mess up the eswitch refcounts for chain zero (the default one).
+
+Fix that along with making sure to use semicolons and not commas on that code;
+
+Fixes: 5dbe906ff1d5 ('net/mlx5e: Use a slow path rule instead if vxlan neighbour isn't available')
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Reviewed-by: Paul Blakey <paulb@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 154e62abe9cd07c9b71735d8456a03a7c5251280)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+index bd15011e5202,3b732c02b5e1..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
+@@@ -816,17 -821,90 +816,90 @@@ static int mlx5e_attach_encap(struct ml
+  			      struct ip_tunnel_info *tun_info,
+  			      struct net_device *mirred_dev,
+  			      struct net_device **encap_dev,
+ -			      struct mlx5e_tc_flow *flow,
+ -			      struct netlink_ext_ack *extack);
+ +			      struct mlx5e_tc_flow *flow);
+  
+  static struct mlx5_flow_handle *
+++<<<<<<< HEAD
+++=======
++ mlx5e_tc_offload_fdb_rules(struct mlx5_eswitch *esw,
++ 			   struct mlx5e_tc_flow *flow,
++ 			   struct mlx5_flow_spec *spec,
++ 			   struct mlx5_esw_flow_attr *attr)
++ {
++ 	struct mlx5_flow_handle *rule;
++ 
++ 	rule = mlx5_eswitch_add_offloaded_rule(esw, spec, attr);
++ 	if (IS_ERR(rule))
++ 		return rule;
++ 
++ 	if (attr->mirror_count) {
++ 		flow->rule[1] = mlx5_eswitch_add_fwd_rule(esw, spec, attr);
++ 		if (IS_ERR(flow->rule[1])) {
++ 			mlx5_eswitch_del_offloaded_rule(esw, rule, attr);
++ 			return flow->rule[1];
++ 		}
++ 	}
++ 
++ 	flow->flags |= MLX5E_TC_FLOW_OFFLOADED;
++ 	return rule;
++ }
++ 
++ static void
++ mlx5e_tc_unoffload_fdb_rules(struct mlx5_eswitch *esw,
++ 			     struct mlx5e_tc_flow *flow,
++ 			   struct mlx5_esw_flow_attr *attr)
++ {
++ 	flow->flags &= ~MLX5E_TC_FLOW_OFFLOADED;
++ 
++ 	if (attr->mirror_count)
++ 		mlx5_eswitch_del_fwd_rule(esw, flow->rule[1], attr);
++ 
++ 	mlx5_eswitch_del_offloaded_rule(esw, flow->rule[0], attr);
++ }
++ 
++ static struct mlx5_flow_handle *
++ mlx5e_tc_offload_to_slow_path(struct mlx5_eswitch *esw,
++ 			      struct mlx5e_tc_flow *flow,
++ 			      struct mlx5_flow_spec *spec,
++ 			      struct mlx5_esw_flow_attr *slow_attr)
++ {
++ 	struct mlx5_flow_handle *rule;
++ 
++ 	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
++ 	slow_attr->action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	slow_attr->mirror_count = 0;
++ 	slow_attr->dest_chain = FDB_SLOW_PATH_CHAIN;
++ 
++ 	rule = mlx5e_tc_offload_fdb_rules(esw, flow, spec, slow_attr);
++ 	if (!IS_ERR(rule))
++ 		flow->flags |= MLX5E_TC_FLOW_SLOW;
++ 
++ 	return rule;
++ }
++ 
++ static void
++ mlx5e_tc_unoffload_from_slow_path(struct mlx5_eswitch *esw,
++ 				  struct mlx5e_tc_flow *flow,
++ 				  struct mlx5_esw_flow_attr *slow_attr)
++ {
++ 	memcpy(slow_attr, flow->esw_attr, sizeof(*slow_attr));
++ 	slow_attr->action = MLX5_FLOW_CONTEXT_ACTION_FWD_DEST;
++ 	slow_attr->mirror_count = 0;
++ 	slow_attr->dest_chain = FDB_SLOW_PATH_CHAIN;
++ 	mlx5e_tc_unoffload_fdb_rules(esw, flow, slow_attr);
++ 	flow->flags &= ~MLX5E_TC_FLOW_SLOW;
++ }
++ 
++ static int
+++>>>>>>> 154e62abe9cd (net/mlx5e: Properly initialize flow attributes for slow path eswitch rule deletion)
+  mlx5e_tc_add_fdb_flow(struct mlx5e_priv *priv,
+  		      struct mlx5e_tc_flow_parse_attr *parse_attr,
+ -		      struct mlx5e_tc_flow *flow,
+ -		      struct netlink_ext_ack *extack)
+ +		      struct mlx5e_tc_flow *flow)
+  {
+  	struct mlx5_eswitch *esw = priv->mdev->priv.eswitch;
+ -	u32 max_chain = mlx5_eswitch_get_chain_range(esw);
+  	struct mlx5_esw_flow_attr *attr = flow->esw_attr;
+ -	u16 max_prio = mlx5_eswitch_get_prio_range(esw);
+  	struct net_device *out_dev, *encap_dev = NULL;
+ +	struct mlx5_flow_handle *rule = NULL;
+  	struct mlx5_fc *counter = NULL;
+  	struct mlx5e_rep_priv *rpriv;
+  	struct mlx5e_priv *out_priv;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tc.c
