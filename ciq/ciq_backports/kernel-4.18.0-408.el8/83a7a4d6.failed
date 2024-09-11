@@ -1,0 +1,234 @@
+arm64: perf: Enable PMU counter userspace access for perf event
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Rob Herring <robh@kernel.org>
+commit 83a7a4d643d33a8b74a42229346b7ed7139fcef9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/83a7a4d6.failed
+
+Arm PMUs can support direct userspace access of counters which allows for
+low overhead (i.e. no syscall) self-monitoring of tasks. The same feature
+exists on x86 called 'rdpmc'. Unlike x86, userspace access will only be
+enabled for thread bound events. This could be extended if needed, but
+simplifies the implementation and reduces the chances for any
+information leaks (which the x86 implementation suffers from).
+
+PMU EL0 access will be enabled when an event with userspace access is
+part of the thread's context. This includes when the event is not
+scheduled on the PMU. There's some additional overhead clearing
+dirty counters when access is enabled in order to prevent leaking
+disabled counter data from other tasks.
+
+Unlike x86, enabling of userspace access must be requested with a new
+attr bit: config1:1. If the user requests userspace access with 64-bit
+counters, then the event open will fail if the h/w doesn't support
+64-bit counters. Chaining is not supported with userspace access. The
+modes for config1 are as follows:
+
+config1 = 0 : user access disabled and always 32-bit
+config1 = 1 : user access disabled and always 64-bit (using chaining if needed)
+config1 = 2 : user access enabled and always 32-bit
+config1 = 3 : user access enabled and always 64-bit
+
+Based on work by Raphael Gault <raphael.gault@arm.com>, but has been
+completely re-written.
+
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Ingo Molnar <mingo@redhat.com>
+	Cc: Arnaldo Carvalho de Melo <acme@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Jiri Olsa <jolsa@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: linux-perf-users@vger.kernel.org
+	Signed-off-by: Rob Herring <robh@kernel.org>
+Link: https://lore.kernel.org/r/20211208201124.310740-5-robh@kernel.org
+[will: Made armv8pmu_proc_user_access_handler() static]
+	Signed-off-by: Will Deacon <will@kernel.org>
+(cherry picked from commit 83a7a4d643d33a8b74a42229346b7ed7139fcef9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/perf_event.c
+diff --cc arch/arm64/kernel/perf_event.c
+index 7b0baffd784b,81cc9f0e718a..000000000000
+--- a/arch/arm64/kernel/perf_event.c
++++ b/arch/arm64/kernel/perf_event.c
+@@@ -271,7 -285,10 +271,8 @@@ static struct attribute_group armv8_pmu
+  
+  PMU_FORMAT_ATTR(event, "config:0-15");
+  PMU_FORMAT_ATTR(long, "config1:0");
++ PMU_FORMAT_ATTR(rdpmc, "config1:1");
+  
+ -static int sysctl_perf_user_access __read_mostly;
+ -
+  static inline bool armv8pmu_event_is_64bit(struct perf_event *event)
+  {
+  	return event->attr.config1 & 0x1;
+@@@ -293,9 -371,7 +300,13 @@@ static struct attribute_group armv8_pmu
+   */
+  #define	ARMV8_IDX_CYCLE_COUNTER	0
+  #define	ARMV8_IDX_COUNTER0	1
+++<<<<<<< HEAD
+ +#define	ARMV8_IDX_COUNTER_LAST(cpu_pmu) \
+ +	(ARMV8_IDX_CYCLE_COUNTER + cpu_pmu->num_events - 1)
+ +
+++=======
++ #define	ARMV8_IDX_CYCLE_COUNTER_USER	32
+++>>>>>>> 83a7a4d643d3 (arm64: perf: Enable PMU counter userspace access for perf event)
+  
+  /*
+   * We unconditionally enable ARMv8.5-PMU long event counter support
+@@@ -590,12 -731,30 +605,34 @@@ static inline u32 armv8pmu_getreset_fla
+  	return value;
+  }
+  
++ static void armv8pmu_disable_user_access(void)
++ {
++ 	write_sysreg(0, pmuserenr_el0);
++ }
++ 
++ static void armv8pmu_enable_user_access(struct arm_pmu *cpu_pmu)
++ {
++ 	int i;
++ 	struct pmu_hw_events *cpuc = this_cpu_ptr(cpu_pmu->hw_events);
++ 
++ 	/* Clear any unused counters to avoid leaking their contents */
++ 	for_each_clear_bit(i, cpuc->used_mask, cpu_pmu->num_events) {
++ 		if (i == ARMV8_IDX_CYCLE_COUNTER)
++ 			write_sysreg(0, pmccntr_el0);
++ 		else
++ 			armv8pmu_write_evcntr(i, 0);
++ 	}
++ 
++ 	write_sysreg(0, pmuserenr_el0);
++ 	write_sysreg(ARMV8_PMU_USERENR_ER | ARMV8_PMU_USERENR_CR, pmuserenr_el0);
++ }
++ 
+  static void armv8pmu_enable_event(struct perf_event *event)
+  {
+ +	unsigned long flags;
+ +	struct arm_pmu *cpu_pmu = to_arm_pmu(event->pmu);
+ +	struct pmu_hw_events *events = this_cpu_ptr(cpu_pmu->hw_events);
+ +
+  	/*
+  	 * Enable counter and interrupt, and set the counter to count
+  	 * the event that we're interested in.
+@@@ -651,13 -796,16 +688,24 @@@ static void armv8pmu_disable_event(stru
+  
+  static void armv8pmu_start(struct arm_pmu *cpu_pmu)
+  {
+++<<<<<<< HEAD
+ +	unsigned long flags;
+ +	struct pmu_hw_events *events = this_cpu_ptr(cpu_pmu->hw_events);
+ +
+ +	raw_spin_lock_irqsave(&events->pmu_lock, flags);
+++=======
++ 	struct perf_event_context *task_ctx =
++ 		this_cpu_ptr(cpu_pmu->pmu.pmu_cpu_context)->task_ctx;
++ 
++ 	if (sysctl_perf_user_access && task_ctx && task_ctx->nr_user)
++ 		armv8pmu_enable_user_access(cpu_pmu);
++ 	else
++ 		armv8pmu_disable_user_access();
++ 
+++>>>>>>> 83a7a4d643d3 (arm64: perf: Enable PMU counter userspace access for perf event)
+  	/* Enable all counters */
+  	armv8pmu_pmcr_write(armv8pmu_pmcr_read() | ARMV8_PMU_PMCR_E);
+ +	raw_spin_unlock_irqrestore(&events->pmu_lock, flags);
+  }
+  
+  static void armv8pmu_stop(struct arm_pmu *cpu_pmu)
+@@@ -1002,7 -1185,40 +1088,44 @@@ static int armv8pmu_probe_pmu(struct ar
+  	return probe.present ? 0 : -ENODEV;
+  }
+  
+++<<<<<<< HEAD
+ +static int armv8_pmu_init(struct arm_pmu *cpu_pmu)
+++=======
++ static void armv8pmu_disable_user_access_ipi(void *unused)
++ {
++ 	armv8pmu_disable_user_access();
++ }
++ 
++ static int armv8pmu_proc_user_access_handler(struct ctl_table *table, int write,
++ 		void *buffer, size_t *lenp, loff_t *ppos)
++ {
++ 	int ret = proc_dointvec_minmax(table, write, buffer, lenp, ppos);
++ 	if (ret || !write || sysctl_perf_user_access)
++ 		return ret;
++ 
++ 	on_each_cpu(armv8pmu_disable_user_access_ipi, NULL, 1);
++ 	return 0;
++ }
++ 
++ static struct ctl_table armv8_pmu_sysctl_table[] = {
++ 	{
++ 		.procname       = "perf_user_access",
++ 		.data		= &sysctl_perf_user_access,
++ 		.maxlen		= sizeof(unsigned int),
++ 		.mode           = 0644,
++ 		.proc_handler	= armv8pmu_proc_user_access_handler,
++ 		.extra1		= SYSCTL_ZERO,
++ 		.extra2		= SYSCTL_ONE,
++ 	},
++ 	{ }
++ };
++ 
++ static int armv8_pmu_init(struct arm_pmu *cpu_pmu, char *name,
++ 			  int (*map_event)(struct perf_event *event),
++ 			  const struct attribute_group *events,
++ 			  const struct attribute_group *format,
++ 			  const struct attribute_group *caps)
+++>>>>>>> 83a7a4d643d3 (arm64: perf: Enable PMU counter userspace access for perf event)
+  {
+  	int ret = armv8pmu_probe_pmu(cpu_pmu);
+  	if (ret)
+@@@ -1021,6 -1237,19 +1144,22 @@@
+  	cpu_pmu->set_event_filter	= armv8pmu_set_event_filter;
+  	cpu_pmu->filter_match		= armv8pmu_filter_match;
+  
+++<<<<<<< HEAD
+++=======
++ 	cpu_pmu->pmu.event_idx		= armv8pmu_user_event_idx;
++ 
++ 	cpu_pmu->name			= name;
++ 	cpu_pmu->map_event		= map_event;
++ 	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_EVENTS] = events ?
++ 			events : &armv8_pmuv3_events_attr_group;
++ 	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_FORMATS] = format ?
++ 			format : &armv8_pmuv3_format_attr_group;
++ 	cpu_pmu->attr_groups[ARMPMU_ATTR_GROUP_CAPS] = caps ?
++ 			caps : &armv8_pmuv3_caps_attr_group;
++ 
++ 	register_sysctl("kernel", armv8_pmu_sysctl_table);
++ 
+++>>>>>>> 83a7a4d643d3 (arm64: perf: Enable PMU counter userspace access for perf event)
+  	return 0;
+  }
+  
+@@@ -1195,6 -1414,15 +1334,18 @@@ void arch_perf_update_userpage(struct p
+  
+  	userpg->cap_user_time = 0;
+  	userpg->cap_user_time_zero = 0;
+++<<<<<<< HEAD
+++=======
++ 	userpg->cap_user_time_short = 0;
++ 	userpg->cap_user_rdpmc = armv8pmu_event_has_user_read(event);
++ 
++ 	if (userpg->cap_user_rdpmc) {
++ 		if (event->hw.flags & ARMPMU_EVT_64BIT)
++ 			userpg->pmc_width = 64;
++ 		else
++ 			userpg->pmc_width = 32;
++ 	}
+++>>>>>>> 83a7a4d643d3 (arm64: perf: Enable PMU counter userspace access for perf event)
+  
+  	do {
+  		rd = sched_clock_read_begin(&seq);
+* Unmerged path arch/arm64/kernel/perf_event.c
