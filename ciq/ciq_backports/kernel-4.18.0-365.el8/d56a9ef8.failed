@@ -1,0 +1,158 @@
+kasan, arm64: unpoison stack only with CONFIG_KASAN_STACK
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit d56a9ef84bd0e1e8fba7a837ab12a4ec8476579f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/d56a9ef8.failed
+
+There's a config option CONFIG_KASAN_STACK that has to be enabled for
+KASAN to use stack instrumentation and perform validity checks for
+stack variables.
+
+There's no need to unpoison stack when CONFIG_KASAN_STACK is not enabled.
+Only call kasan_unpoison_task_stack[_below]() when CONFIG_KASAN_STACK is
+enabled.
+
+Note, that CONFIG_KASAN_STACK is an option that is currently always
+defined when CONFIG_KASAN is enabled, and therefore has to be tested
+with #if instead of #ifdef.
+
+Link: https://lkml.kernel.org/r/d09dd3f8abb388da397fd11598c5edeaa83fe559.1606162397.git.andreyknvl@google.com
+Link: https://linux-review.googlesource.com/id/If8a891e9fe01ea543e00b576852685afec0887e3
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Acked-by: Catalin Marinas <catalin.marinas@arm.com>
+	Reviewed-by: Dmitry Vyukov <dvyukov@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit d56a9ef84bd0e1e8fba7a837ab12a4ec8476579f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+diff --cc include/linux/kasan.h
+index f00d17cf6822,e638255ce906..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -35,10 -58,25 +35,8 @@@ extern void kasan_enable_current(void)
+  /* Disable reporting bugs for current task */
+  extern void kasan_disable_current(void);
+  
+ -#else /* CONFIG_KASAN_GENERIC || CONFIG_KASAN_SW_TAGS */
+ -
+ -static inline int kasan_add_zero_shadow(void *start, unsigned long size)
+ -{
+ -	return 0;
+ -}
+ -static inline void kasan_remove_zero_shadow(void *start,
+ -					unsigned long size)
+ -{}
+ -
+ -static inline void kasan_enable_current(void) {}
+ -static inline void kasan_disable_current(void) {}
+ -
+ -#endif /* CONFIG_KASAN_GENERIC || CONFIG_KASAN_SW_TAGS */
+ -
+ -#ifdef CONFIG_KASAN
+ -
+ -void kasan_unpoison_range(const void *address, size_t size);
+ +void kasan_unpoison_shadow(const void *address, size_t size);
+  
+- void kasan_unpoison_task_stack(struct task_struct *task);
+- 
+  void kasan_alloc_pages(struct page *page, unsigned int order);
+  void kasan_free_pages(struct page *page, unsigned int order);
+  
+@@@ -97,13 -119,8 +95,16 @@@ void kasan_restore_multi_shot(bool enab
+  
+  #else /* CONFIG_KASAN */
+  
+ -static inline void kasan_unpoison_range(const void *address, size_t size) {}
+ +static inline void kasan_unpoison_shadow(const void *address, size_t size) {}
+  
+++<<<<<<< HEAD
+ +static inline void kasan_unpoison_task_stack(struct task_struct *task) {}
+ +
+ +static inline void kasan_enable_current(void) {}
+ +static inline void kasan_disable_current(void) {}
+ +
+++=======
+++>>>>>>> d56a9ef84bd0 (kasan, arm64: unpoison stack only with CONFIG_KASAN_STACK)
+  static inline void kasan_alloc_pages(struct page *page, unsigned int order) {}
+  static inline void kasan_free_pages(struct page *page, unsigned int order) {}
+  
+@@@ -166,10 -172,14 +167,16 @@@ static inline size_t kasan_metadata_siz
+  
+  #endif /* CONFIG_KASAN */
+  
++ #if defined(CONFIG_KASAN) && CONFIG_KASAN_STACK
++ void kasan_unpoison_task_stack(struct task_struct *task);
++ #else
++ static inline void kasan_unpoison_task_stack(struct task_struct *task) {}
++ #endif
++ 
+  #ifdef CONFIG_KASAN_GENERIC
+  
+ +#define KASAN_SHADOW_INIT 0
+ +
+  void kasan_cache_shrink(struct kmem_cache *cache);
+  void kasan_cache_shutdown(struct kmem_cache *cache);
+  void kasan_record_aux_stack(void *ptr);
+diff --git a/arch/arm64/kernel/sleep.S b/arch/arm64/kernel/sleep.S
+index 3e53ffa07994..1a14458ff971 100644
+--- a/arch/arm64/kernel/sleep.S
++++ b/arch/arm64/kernel/sleep.S
+@@ -132,7 +132,7 @@ ENTRY(_cpu_resume)
+ 	 */
+ 	bl	cpu_do_resume
+ 
+-#ifdef CONFIG_KASAN
++#if defined(CONFIG_KASAN) && CONFIG_KASAN_STACK
+ 	mov	x0, sp
+ 	bl	kasan_unpoison_task_stack_below
+ #endif
+diff --git a/arch/x86/kernel/acpi/wakeup_64.S b/arch/x86/kernel/acpi/wakeup_64.S
+index cc758cae111e..908e9a6c0683 100644
+--- a/arch/x86/kernel/acpi/wakeup_64.S
++++ b/arch/x86/kernel/acpi/wakeup_64.S
+@@ -109,7 +109,7 @@ SYM_FUNC_START(do_suspend_lowlevel)
+ 	movq	pt_regs_r14(%rax), %r14
+ 	movq	pt_regs_r15(%rax), %r15
+ 
+-#ifdef CONFIG_KASAN
++#if defined(CONFIG_KASAN) && CONFIG_KASAN_STACK
+ 	/*
+ 	 * The suspend path may have poisoned some areas deeper in the stack,
+ 	 * which we now need to unpoison.
+* Unmerged path include/linux/kasan.h
+diff --git a/mm/kasan/common.c b/mm/kasan/common.c
+index e989322c0f3f..02d19afa2001 100644
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@ -172,6 +172,7 @@ void kasan_unpoison_shadow(const void *address, size_t size)
+ 	}
+ }
+ 
++#if CONFIG_KASAN_STACK
+ static void __kasan_unpoison_stack(struct task_struct *task, const void *sp)
+ {
+ 	void *base = task_stack_page(task);
+@@ -198,6 +199,7 @@ asmlinkage void kasan_unpoison_task_stack_below(const void *watermark)
+ 
+ 	kasan_unpoison_shadow(base, watermark - base);
+ }
++#endif /* CONFIG_KASAN_STACK */
+ 
+ void kasan_alloc_pages(struct page *page, unsigned int order)
+ {
