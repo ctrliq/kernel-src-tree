@@ -22,7 +22,7 @@
 #define PHY_ID_AQR107	0x03a1b4e0
 #define PHY_ID_AQR405	0x03a1b4b0
 
-static int aquantia_config_aneg(struct phy_device *phydev)
+static int aqr_config_aneg(struct phy_device *phydev)
 {
 	linkmode_copy(phydev->supported, phy_10gbit_features);
 	linkmode_copy(phydev->advertising, phydev->supported);
@@ -30,7 +30,7 @@ static int aquantia_config_aneg(struct phy_device *phydev)
 	return 0;
 }
 
-static int aquantia_config_intr(struct phy_device *phydev)
+static int aqr_config_intr(struct phy_device *phydev)
 {
 	int err;
 
@@ -59,7 +59,7 @@ static int aquantia_config_intr(struct phy_device *phydev)
 	return err;
 }
 
-static int aquantia_ack_interrupt(struct phy_device *phydev)
+static int aqr_ack_interrupt(struct phy_device *phydev)
 {
 	int reg;
 
@@ -67,7 +67,7 @@ static int aquantia_ack_interrupt(struct phy_device *phydev)
 	return (reg < 0) ? reg : 0;
 }
 
-static int aquantia_read_status(struct phy_device *phydev)
+static int aqr_read_status(struct phy_device *phydev)
 {
 	int reg;
 
@@ -102,7 +102,7 @@ static int aquantia_read_status(struct phy_device *phydev)
 	return 0;
 }
 
-static struct phy_driver aquantia_driver[] = {
+static struct phy_driver aqr_driver[] = {
 {
 	.phy_id		= PHY_ID_AQ1202,
 	.phy_id_mask	= 0xfffffff0,
@@ -110,10 +110,10 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 {
 	.phy_id		= PHY_ID_AQ2104,
@@ -122,10 +122,10 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 {
 	.phy_id		= PHY_ID_AQR105,
@@ -134,10 +134,10 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 {
 	.phy_id		= PHY_ID_AQR106,
@@ -146,10 +146,10 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 {
 	.phy_id		= PHY_ID_AQR107,
@@ -158,10 +158,10 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 {
 	.phy_id		= PHY_ID_AQR405,
@@ -170,16 +170,16 @@ static struct phy_driver aquantia_driver[] = {
 	.features	= PHY_10GBIT_FULL_FEATURES,
 	.flags		= PHY_HAS_INTERRUPT,
 	.aneg_done	= genphy_c45_aneg_done,
-	.config_aneg    = aquantia_config_aneg,
-	.config_intr	= aquantia_config_intr,
-	.ack_interrupt	= aquantia_ack_interrupt,
-	.read_status	= aquantia_read_status,
+	.config_aneg    = aqr_config_aneg,
+	.config_intr	= aqr_config_intr,
+	.ack_interrupt	= aqr_ack_interrupt,
+	.read_status	= aqr_read_status,
 },
 };
 
-module_phy_driver(aquantia_driver);
+module_phy_driver(aqr_driver);
 
-static struct mdio_device_id __maybe_unused aquantia_tbl[] = {
+static struct mdio_device_id __maybe_unused aqr_tbl[] = {
 	{ PHY_ID_AQ1202, 0xfffffff0 },
 	{ PHY_ID_AQ2104, 0xfffffff0 },
 	{ PHY_ID_AQR105, 0xfffffff0 },
@@ -189,7 +189,7 @@ static struct mdio_device_id __maybe_unused aquantia_tbl[] = {
 	{ }
 };
 
-MODULE_DEVICE_TABLE(mdio, aquantia_tbl);
+MODULE_DEVICE_TABLE(mdio, aqr_tbl);
 
 MODULE_DESCRIPTION("Aquantia PHY driver");
 MODULE_AUTHOR("Shaohui Xie <Shaohui.Xie@freescale.com>");
