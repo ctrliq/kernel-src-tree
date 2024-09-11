@@ -1,0 +1,167 @@
+kasan: clean up setting free info in kasan_slab_free
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit df54b383124cf3e09f66644ee8a2eb977e8c7f26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/df54b383.failed
+
+Put kasan_stack_collection_enabled() check and kasan_set_free_info() calls
+next to each other.
+
+The way this was previously implemented was a minor optimization that
+relied of the the fact that kasan_stack_collection_enabled() is always
+true for generic KASAN.  The confusion that this brings outweights saving
+a few instructions.
+
+Link: https://lkml.kernel.org/r/f838e249be5ab5810bf54a36ef5072cfd80e2da7.1612546384.git.andreyknvl@google.com
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Peter Collingbourne <pcc@google.com>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit df54b383124cf3e09f66644ee8a2eb977e8c7f26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,48d51daeda95..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -431,112 -348,23 +431,117 @@@ static bool __kasan_slab_free(struct km
+  		return true;
+  	}
+  
+ -	kasan_poison(object, cache->object_size, KASAN_KMALLOC_FREE);
+ +	rounded_up_size = round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE);
+ +	kasan_poison_shadow(object, rounded_up_size, KASAN_KMALLOC_FREE);
+  
+++<<<<<<< HEAD
+ +	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine) ||
+ +			unlikely(!(cache->flags & SLAB_KASAN)))
+++=======
++ 	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine))
+++>>>>>>> df54b383124c (kasan: clean up setting free info in kasan_slab_free)
+  		return false;
+  
+- 	kasan_set_free_info(cache, object, tag);
++ 	if (kasan_stack_collection_enabled())
++ 		kasan_set_free_info(cache, object, tag);
+  
+ -	return kasan_quarantine_put(cache, object);
+ +	quarantine_put(cache, object);
+ +
+ +	return IS_ENABLED(CONFIG_KASAN_GENERIC);
+  }
+  
+ -bool __kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ +bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+  {
+ -	return ____kasan_slab_free(cache, object, ip, true);
+ +	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+ -void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
+ +static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags, bool keep_tag)
+ +{
+ +	unsigned long redzone_start;
+ +	unsigned long redzone_end;
+ +	u8 tag = 0xff;
+ +
+ +	if (gfpflags_allow_blocking(flags))
+ +		quarantine_reduce();
+ +
+ +	if (unlikely(object == NULL))
+ +		return NULL;
+ +
+ +	redzone_start = round_up((unsigned long)(object + size),
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = round_up((unsigned long)object + cache->object_size,
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		tag = assign_tag(cache, object, false, keep_tag);
+ +
+ +	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
+ +	kasan_unpoison_shadow(set_tag(object, tag), size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_KMALLOC_REDZONE);
+ +
+ +	if (cache->flags & SLAB_KASAN)
+ +		kasan_set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+ +
+ +	return set_tag(object, tag);
+ +}
+ +
+ +void * __must_check kasan_slab_alloc(struct kmem_cache *cache, void *object,
+ +					gfp_t flags)
+ +{
+ +	return __kasan_kmalloc(cache, object, cache->object_size, flags, false);
+ +}
+ +
+ +void * __must_check kasan_kmalloc(struct kmem_cache *cache, const void *object,
+ +				size_t size, gfp_t flags)
+ +{
+ +	return __kasan_kmalloc(cache, object, size, flags, true);
+ +}
+ +EXPORT_SYMBOL(kasan_kmalloc);
+ +
+ +void * __must_check kasan_kmalloc_large(const void *ptr, size_t size,
+ +						gfp_t flags)
+ +{
+ +	struct page *page;
+ +	unsigned long redzone_start;
+ +	unsigned long redzone_end;
+ +
+ +	if (gfpflags_allow_blocking(flags))
+ +		quarantine_reduce();
+ +
+ +	if (unlikely(ptr == NULL))
+ +		return NULL;
+ +
+ +	page = virt_to_page(ptr);
+ +	redzone_start = round_up((unsigned long)(ptr + size),
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +	redzone_end = (unsigned long)ptr + page_size(page);
+ +
+ +	kasan_unpoison_shadow(ptr, size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_PAGE_REDZONE);
+ +
+ +	return (void *)ptr;
+ +}
+ +
+ +void * __must_check kasan_krealloc(const void *object, size_t size, gfp_t flags)
+ +{
+ +	struct page *page;
+ +
+ +	if (unlikely(object == ZERO_SIZE_PTR))
+ +		return (void *)object;
+ +
+ +	page = virt_to_head_page(object);
+ +
+ +	if (unlikely(!PageSlab(page)))
+ +		return kasan_kmalloc_large(object, size, flags);
+ +	else
+ +		return __kasan_kmalloc(page->slab_cache, object, size,
+ +						flags, true);
+ +}
+ +
+ +void kasan_poison_kfree(void *ptr, unsigned long ip)
+  {
+  	struct page *page;
+  
+* Unmerged path mm/kasan/common.c
