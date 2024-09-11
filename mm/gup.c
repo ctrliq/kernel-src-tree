@@ -1618,8 +1618,11 @@ check_again:
 		/*
 		 * drop the above get_user_pages reference.
 		 */
-		for (i = 0; i < nr_pages; i++)
-			put_page(pages[i]);
+		if (gup_flags & FOLL_PIN)
+			unpin_user_pages(pages, nr_pages);
+		else
+			for (i = 0; i < nr_pages; i++)
+				put_page(pages[i]);
 
 		if (migrate_pages(&cma_page_list, new_non_cma_page,
 				  NULL, 0, MIGRATE_SYNC, MR_CONTIG_RANGE)) {
@@ -1702,8 +1705,11 @@ static long __gup_longterm_locked(struct task_struct *tsk,
 			goto out;
 
 		if (check_dax_vmas(vmas_tmp, rc)) {
-			for (i = 0; i < rc; i++)
-				put_page(pages[i]);
+			if (gup_flags & FOLL_PIN)
+				unpin_user_pages(pages, rc);
+			else
+				for (i = 0; i < rc; i++)
+					put_page(pages[i]);
 			rc = -EOPNOTSUPP;
 			goto out;
 		}
