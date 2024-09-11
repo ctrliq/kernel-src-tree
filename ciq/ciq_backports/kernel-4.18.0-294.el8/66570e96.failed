@@ -1,0 +1,289 @@
+kvm: x86: only provide PV features if enabled in guest's CPUID
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Oliver Upton <oupton@google.com>
+commit 66570e966dd9cb4fd57811d0056c6472a14a2c41
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/66570e96.failed
+
+KVM unconditionally provides PV features to the guest, regardless of the
+configured CPUID. An unwitting guest that doesn't check
+KVM_CPUID_FEATURES before use could access paravirt features that
+userspace did not intend to provide. Fix this by checking the guest's
+CPUID before performing any paravirtual operations.
+
+Introduce a capability, KVM_CAP_ENFORCE_PV_FEATURE_CPUID, to gate the
+aforementioned enforcement. Migrating a VM from a host w/o this patch to
+a host with this patch could silently change the ABI exposed to the
+guest, warranting that we default to the old behavior and opt-in for
+the new one.
+
+	Reviewed-by: Jim Mattson <jmattson@google.com>
+	Reviewed-by: Peter Shier <pshier@google.com>
+	Signed-off-by: Oliver Upton <oupton@google.com>
+Change-Id: I202a0926f65035b872bfe8ad15307c026de59a98
+Message-Id: <20200818152429.1923996-4-oupton@google.com>
+	Reviewed-by: Wanpeng Li <wanpengli@tencent.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 66570e966dd9cb4fd57811d0056c6472a14a2c41)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/virt/kvm/api.rst
+#	arch/x86/kvm/x86.c
+#	include/uapi/linux/kvm.h
+diff --cc Documentation/virt/kvm/api.rst
+index 235a1db41e51,76317221d29f..000000000000
+--- a/Documentation/virt/kvm/api.rst
++++ b/Documentation/virt/kvm/api.rst
+@@@ -6156,3 -6322,72 +6156,75 @@@ KVM can therefore start protected VMs
+  This capability governs the KVM_S390_PV_COMMAND ioctl and the
+  KVM_MP_STATE_LOAD MP_STATE. KVM_SET_MP_STATE can fail for protected
+  guests when the state change is invalid.
+++<<<<<<< HEAD
+++=======
++ 
++ 8.24 KVM_CAP_STEAL_TIME
++ -----------------------
++ 
++ :Architectures: arm64, x86
++ 
++ This capability indicates that KVM supports steal time accounting.
++ When steal time accounting is supported it may be enabled with
++ architecture-specific interfaces.  This capability and the architecture-
++ specific interfaces must be consistent, i.e. if one says the feature
++ is supported, than the other should as well and vice versa.  For arm64
++ see Documentation/virt/kvm/devices/vcpu.rst "KVM_ARM_VCPU_PVTIME_CTRL".
++ For x86 see Documentation/virt/kvm/msr.rst "MSR_KVM_STEAL_TIME".
++ 
++ 8.25 KVM_CAP_S390_DIAG318
++ -------------------------
++ 
++ :Architectures: s390
++ 
++ This capability enables a guest to set information about its control program
++ (i.e. guest kernel type and version). The information is helpful during
++ system/firmware service events, providing additional data about the guest
++ environments running on the machine.
++ 
++ The information is associated with the DIAGNOSE 0x318 instruction, which sets
++ an 8-byte value consisting of a one-byte Control Program Name Code (CPNC) and
++ a 7-byte Control Program Version Code (CPVC). The CPNC determines what
++ environment the control program is running in (e.g. Linux, z/VM...), and the
++ CPVC is used for information specific to OS (e.g. Linux version, Linux
++ distribution...)
++ 
++ If this capability is available, then the CPNC and CPVC can be synchronized
++ between KVM and userspace via the sync regs mechanism (KVM_SYNC_DIAG318).
++ 
++ 8.26 KVM_CAP_X86_USER_SPACE_MSR
++ -------------------------------
++ 
++ :Architectures: x86
++ 
++ This capability indicates that KVM supports deflection of MSR reads and
++ writes to user space. It can be enabled on a VM level. If enabled, MSR
++ accesses that would usually trigger a #GP by KVM into the guest will
++ instead get bounced to user space through the KVM_EXIT_X86_RDMSR and
++ KVM_EXIT_X86_WRMSR exit notifications.
++ 
++ 8.25 KVM_X86_SET_MSR_FILTER
++ ---------------------------
++ 
++ :Architectures: x86
++ 
++ This capability indicates that KVM supports that accesses to user defined MSRs
++ may be rejected. With this capability exposed, KVM exports new VM ioctl
++ KVM_X86_SET_MSR_FILTER which user space can call to specify bitmaps of MSR
++ ranges that KVM should reject access to.
++ 
++ In combination with KVM_CAP_X86_USER_SPACE_MSR, this allows user space to
++ trap and emulate MSRs that are outside of the scope of KVM as well as
++ limit the attack surface on KVM's MSR emulation code.
++ 
++ 
++ 8.26 KVM_CAP_ENFORCE_PV_CPUID
++ -----------------------------
++ 
++ Architectures: x86
++ 
++ When enabled, KVM will disable paravirtual features provided to the
++ guest according to the bits in the KVM_CPUID_FEATURES CPUID leaf
++ (0x40000001). Otherwise, a guest may use the paravirtual features
++ regardless of what has actually been exposed through the CPUID leaf.
+++>>>>>>> 66570e966dd9 (kvm: x86: only provide PV features if enabled in guest's CPUID)
+diff --cc arch/x86/kvm/x86.c
+index 6a28fd7d7b65,ca940de53e18..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -2745,13 -2873,24 +2745,26 @@@ static int kvm_pv_enable_async_pf(struc
+  {
+  	gpa_t gpa = data & ~0x3f;
+  
+ -	/* Bits 4:5 are reserved, Should be zero */
+ -	if (data & 0x30)
+ +	/* Bits 3:5 are reserved, Should be zero */
+ +	if (data & 0x38)
+  		return 1;
+  
+++<<<<<<< HEAD
+ +	vcpu->arch.apf.msr_val = data;
+++=======
++ 	if (!guest_pv_has(vcpu, KVM_FEATURE_ASYNC_PF_VMEXIT) &&
++ 	    (data & KVM_ASYNC_PF_DELIVERY_AS_PF_VMEXIT))
++ 		return 1;
++ 
++ 	if (!guest_pv_has(vcpu, KVM_FEATURE_ASYNC_PF_INT) &&
++ 	    (data & KVM_ASYNC_PF_DELIVERY_AS_INT))
++ 		return 1;
++ 
++ 	if (!lapic_in_kernel(vcpu))
++ 		return data ? 1 : 0;
+++>>>>>>> 66570e966dd9 (kvm: x86: only provide PV features if enabled in guest's CPUID)
+  
+ -	vcpu->arch.apf.msr_en_val = data;
+ -
+ -	if (!kvm_pv_async_pf_enabled(vcpu)) {
+ +	if (!(data & KVM_ASYNC_PF_ENABLED)) {
+  		kvm_clear_async_pf_completion_queue(vcpu);
+  		kvm_async_pf_hash_reset(vcpu);
+  		return 0;
+@@@ -2976,7 -3158,24 +3008,27 @@@ int kvm_set_msr_common(struct kvm_vcpu 
+  		if (kvm_pv_enable_async_pf(vcpu, data))
+  			return 1;
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case MSR_KVM_ASYNC_PF_INT:
++ 		if (!guest_pv_has(vcpu, KVM_FEATURE_ASYNC_PF_INT))
++ 			return 1;
++ 
++ 		if (kvm_pv_enable_async_pf_int(vcpu, data))
++ 			return 1;
++ 		break;
++ 	case MSR_KVM_ASYNC_PF_ACK:
++ 		if (!guest_pv_has(vcpu, KVM_FEATURE_ASYNC_PF))
++ 			return 1;
++ 		if (data & 0x1) {
++ 			vcpu->arch.apf.pageready_pending = false;
++ 			kvm_check_async_pf_completion(vcpu);
++ 		}
++ 		break;
+++>>>>>>> 66570e966dd9 (kvm: x86: only provide PV features if enabled in guest's CPUID)
+  	case MSR_KVM_STEAL_TIME:
++ 		if (!guest_pv_has(vcpu, KVM_FEATURE_STEAL_TIME))
++ 			return 1;
+  
+  		if (unlikely(!sched_info_on()))
+  			return 1;
+@@@ -3482,6 -3695,10 +3540,13 @@@ int kvm_vm_ioctl_check_extension(struc
+  	case KVM_CAP_MSR_PLATFORM_INFO:
+  	case KVM_CAP_EXCEPTION_PAYLOAD:
+  	case KVM_CAP_SET_GUEST_DEBUG:
+++<<<<<<< HEAD
+++=======
++ 	case KVM_CAP_LAST_CPU:
++ 	case KVM_CAP_X86_USER_SPACE_MSR:
++ 	case KVM_CAP_X86_MSR_FILTER:
++ 	case KVM_CAP_ENFORCE_PV_FEATURE_CPUID:
+++>>>>>>> 66570e966dd9 (kvm: x86: only provide PV features if enabled in guest's CPUID)
+  		r = 1;
+  		break;
+  	case KVM_CAP_SYNC_REGS:
+diff --cc include/uapi/linux/kvm.h
+index f2c3051a98e4,ca41220b40b8..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1030,6 -1045,14 +1030,17 @@@ struct kvm_ppc_resize_hpt 
+  #define KVM_CAP_S390_PROTECTED 180
+  #define KVM_CAP_PPC_SECURE_GUEST 181
+  #define KVM_CAP_HALT_POLL 182
+++<<<<<<< HEAD
+++=======
++ #define KVM_CAP_ASYNC_PF_INT 183
++ #define KVM_CAP_LAST_CPU 184
++ #define KVM_CAP_SMALLER_MAXPHYADDR 185
++ #define KVM_CAP_S390_DIAG318 186
++ #define KVM_CAP_STEAL_TIME 187
++ #define KVM_CAP_X86_USER_SPACE_MSR 188
++ #define KVM_CAP_X86_MSR_FILTER 189
++ #define KVM_CAP_ENFORCE_PV_FEATURE_CPUID 190
+++>>>>>>> 66570e966dd9 (kvm: x86: only provide PV features if enabled in guest's CPUID)
+  
+  #ifdef KVM_CAP_IRQ_ROUTING
+  
+* Unmerged path Documentation/virt/kvm/api.rst
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index d657bab8afd1..d2937baf5893 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -797,6 +797,21 @@ struct kvm_vcpu_arch {
+ 
+ 	/* AMD MSRC001_0015 Hardware Configuration */
+ 	u64 msr_hwcr;
++
++	/* pv related cpuid info */
++	struct {
++		/*
++		 * value of the eax register in the KVM_CPUID_FEATURES CPUID
++		 * leaf.
++		 */
++		u32 features;
++
++		/*
++		 * indicates whether pv emulation should be disabled if features
++		 * are not present in the guest's cpuid
++		 */
++		bool enforce;
++	} pv_cpuid;
+ };
+ 
+ struct kvm_lpage_info {
+diff --git a/arch/x86/kvm/cpuid.c b/arch/x86/kvm/cpuid.c
+index 2738b2a9ad9b..822e67cd9ea9 100644
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@ -107,6 +107,13 @@ void kvm_update_cpuid_runtime(struct kvm_vcpu *vcpu)
+ 		(best->eax & (1 << KVM_FEATURE_PV_UNHALT)))
+ 		best->eax &= ~(1 << KVM_FEATURE_PV_UNHALT);
+ 
++	/*
++	 * save the feature bitmap to avoid cpuid lookup for every PV
++	 * operation
++	 */
++	if (best)
++		vcpu->arch.pv_cpuid.features = best->eax;
++
+ 	if (!kvm_check_has_quirk(vcpu->kvm, KVM_X86_QUIRK_MISC_ENABLE_NO_MWAIT)) {
+ 		best = kvm_find_cpuid_entry(vcpu, 0x1, 0);
+ 		if (best)
+diff --git a/arch/x86/kvm/cpuid.h b/arch/x86/kvm/cpuid.h
+index 3eed1e949444..a740f6451108 100644
+--- a/arch/x86/kvm/cpuid.h
++++ b/arch/x86/kvm/cpuid.h
+@@ -5,6 +5,7 @@
+ #include "x86.h"
+ #include <asm/cpu.h>
+ #include <asm/processor.h>
++#include <uapi/asm/kvm_para.h>
+ 
+ extern u32 kvm_cpu_caps[NCAPINTS] __read_mostly;
+ void kvm_set_cpu_caps(void);
+@@ -306,4 +307,13 @@ static inline bool page_address_valid(struct kvm_vcpu *vcpu, gpa_t gpa)
+ 	return PAGE_ALIGNED(gpa) && !(gpa >> cpuid_maxphyaddr(vcpu));
+ }
+ 
++static __always_inline bool guest_pv_has(struct kvm_vcpu *vcpu,
++					 unsigned int kvm_feature)
++{
++	if (!vcpu->arch.pv_cpuid.enforce)
++		return true;
++
++	return vcpu->arch.pv_cpuid.features & (1u << kvm_feature);
++}
++
+ #endif
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path include/uapi/linux/kvm.h
