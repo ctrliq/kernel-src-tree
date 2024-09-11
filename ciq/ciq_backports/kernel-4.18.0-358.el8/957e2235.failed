@@ -1,0 +1,610 @@
+net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vladimir Oltean <vladimir.oltean@nxp.com>
+commit 957e2235e5264c97cd6be8e2e17f2e11b41f2239
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/957e2235.failed
+
+With the introduction of explicit offloading API in switchdev in commit
+2f5dc00f7a3e ("net: bridge: switchdev: let drivers inform which bridge
+ports are offloaded"), we started having Ethernet switch drivers calling
+directly into a function exported by net/bridge/br_switchdev.c, which is
+a function exported by the bridge driver.
+
+This means that drivers that did not have an explicit dependency on the
+bridge before, like cpsw and am65-cpsw, now do - otherwise it is not
+possible to call a symbol exported by a driver that can be built as
+module unless you are a module too.
+
+There was an attempt to solve the dependency issue in the form of commit
+b0e81817629a ("net: build all switchdev drivers as modules when the
+bridge is a module"). Grygorii Strashko, however, says about it:
+
+| In my opinion, the problem is a bit bigger here than just fixing the
+| build :(
+|
+| In case, of ^cpsw the switchdev mode is kinda optional and in many
+| cases (especially for testing purposes, NFS) the multi-mac mode is
+| still preferable mode.
+|
+| There were no such tight dependency between switchdev drivers and
+| bridge core before and switchdev serviced as independent, notification
+| based layer between them, so ^cpsw still can be "Y" and bridge can be
+| "M". Now for mostly every kernel build configuration the CONFIG_BRIDGE
+| will need to be set as "Y", or we will have to update drivers to
+| support build with BRIDGE=n and maintain separate builds for
+| networking vs non-networking testing.  But is this enough?  Wouldn't
+| it cause 'chain reaction' required to add more and more "Y" options
+| (like CONFIG_VLAN_8021Q)?
+|
+| PS. Just to be sure we on the same page - ARM builds will be forced
+| (with this patch) to have CONFIG_TI_CPSW_SWITCHDEV=m and so all our
+| automation testing will just fail with omap2plus_defconfig.
+
+In the light of this, it would be desirable for some configurations to
+avoid dependencies between switchdev drivers and the bridge, and have
+the switchdev mode as completely optional within the driver.
+
+Arnd Bergmann also tried to write a patch which better expressed the
+build time dependency for Ethernet switch drivers where the switchdev
+support is optional, like cpsw/am65-cpsw, and this made the drivers
+follow the bridge (compile as module if the bridge is a module) only if
+the optional switchdev support in the driver was enabled in the first
+place:
+https://patchwork.kernel.org/project/netdevbpf/patch/20210802144813.1152762-1-arnd@kernel.org/
+
+but this still did not solve the fact that cpsw and am65-cpsw now must
+be built as modules when the bridge is a module - it just expressed
+correctly that optional dependency. But the new behavior is an apparent
+regression from Grygorii's perspective.
+
+So to support the use case where the Ethernet driver is built-in,
+NET_SWITCHDEV (a bool option) is enabled, and the bridge is a module, we
+need a framework that can handle the possible absence of the bridge from
+the running system, i.e. runtime bloatware as opposed to build-time
+bloatware.
+
+Luckily we already have this framework, since switchdev has been using
+it extensively. Events from the bridge side are transmitted to the
+driver side using notifier chains - this was originally done so that
+unrelated drivers could snoop for events emitted by the bridge towards
+ports that are implemented by other drivers (think of a switch driver
+with LAG offload that listens for switchdev events on a bonding/team
+interface that it offloads).
+
+There are also events which are transmitted from the driver side to the
+bridge side, which again are modeled using notifiers.
+SWITCHDEV_FDB_ADD_TO_BRIDGE is an example of this, and deals with
+notifying the bridge that a MAC address has been dynamically learned.
+So there is a precedent we can use for modeling the new framework.
+
+The difference compared to SWITCHDEV_FDB_ADD_TO_BRIDGE is that the work
+that the bridge needs to do when a port becomes offloaded is blocking in
+its nature: replay VLANs, MDBs etc. The calling context is indeed
+blocking (we are under rtnl_mutex), but the existing switchdev
+notification chain that the bridge is subscribed to is only the atomic
+one. So we need to subscribe the bridge to the blocking switchdev
+notification chain too.
+
+This patch:
+- keeps the driver-side perception of the switchdev_bridge_port_{,un}offload
+  unchanged
+- moves the implementation of switchdev_bridge_port_{,un}offload from
+  the bridge module into the switchdev module.
+- makes everybody that is subscribed to the switchdev blocking notifier
+  chain "hear" offload & unoffload events
+- makes the bridge driver subscribe and handle those events
+- moves the bridge driver's handling of those events into 2 new
+  functions called br_switchdev_port_{,un}offload. These functions
+  contain in fact the core of the logic that was previously in
+  switchdev_bridge_port_{,un}offload, just that now we go through an
+  extra indirection layer to reach them.
+
+Unlike all the other switchdev notification structures, the structure
+used to carry the bridge port information, struct
+switchdev_notifier_brport_info, does not contain a "bool handled".
+This is because in the current usage pattern, we always know that a
+switchdev bridge port offloading event will be handled by the bridge,
+because the switchdev_bridge_port_offload() call was initiated by a
+NETDEV_CHANGEUPPER event in the first place, where info->upper_dev is a
+bridge. So if the bridge wasn't loaded, then the CHANGEUPPER event
+couldn't have happened.
+
+	Signed-off-by: Vladimir Oltean <vladimir.oltean@nxp.com>
+	Tested-by: Grygorii Strashko <grygorii.strashko@ti.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 957e2235e5264c97cd6be8e2e17f2e11b41f2239)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/ti/am65-cpsw-nuss.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	include/linux/if_bridge.h
+#	include/net/switchdev.h
+#	net/bridge/br.c
+#	net/bridge/br_private.h
+#	net/bridge/br_switchdev.c
+diff --cc include/linux/if_bridge.h
+index f87c7c990fb6,509e18c7e740..000000000000
+--- a/include/linux/if_bridge.h
++++ b/include/linux/if_bridge.h
+@@@ -191,13 -188,6 +191,16 @@@ static inline clock_t br_get_ageing_tim
+  {
+  	return 0;
+  }
+ +
+++<<<<<<< HEAD
+ +static inline int br_fdb_replay(struct net_device *br_dev,
+ +				struct net_device *dev,
+ +				struct notifier_block *nb)
+ +{
+ +	return -EOPNOTSUPP;
+ +}
+  #endif
+  
+++=======
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+  #endif
+diff --cc include/net/switchdev.h
+index 46438f22e4e1,60d806b6a5ae..000000000000
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@@ -101,36 -96,96 +101,45 @@@ struct switchdev_obj_port_mdb 
+  #define SWITCHDEV_OBJ_PORT_MDB(OBJ) \
+  	container_of((OBJ), struct switchdev_obj_port_mdb, obj)
+  
+ +typedef int switchdev_obj_dump_cb_t(struct switchdev_obj *obj);
+  
+ -/* SWITCHDEV_OBJ_ID_MRP */
+ -struct switchdev_obj_mrp {
+ -	struct switchdev_obj obj;
+ -	struct net_device *p_port;
+ -	struct net_device *s_port;
+ -	u32 ring_id;
+ -	u16 prio;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_mrp, obj)
+ -
+ -/* SWITCHDEV_OBJ_ID_RING_TEST_MRP */
+ -struct switchdev_obj_ring_test_mrp {
+ -	struct switchdev_obj obj;
+ -	/* The value is in us and a value of 0 represents to stop */
+ -	u32 interval;
+ -	u8 max_miss;
+ -	u32 ring_id;
+ -	u32 period;
+ -	bool monitor;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_RING_TEST_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_ring_test_mrp, obj)
+ -
+ -/* SWICHDEV_OBJ_ID_RING_ROLE_MRP */
+ -struct switchdev_obj_ring_role_mrp {
+ -	struct switchdev_obj obj;
+ -	u8 ring_role;
+ -	u32 ring_id;
+ -	u8 sw_backup;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_RING_ROLE_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_ring_role_mrp, obj)
+ -
+ -struct switchdev_obj_ring_state_mrp {
+ -	struct switchdev_obj obj;
+ -	u8 ring_state;
+ -	u32 ring_id;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_RING_STATE_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_ring_state_mrp, obj)
+ -
+ -/* SWITCHDEV_OBJ_ID_IN_TEST_MRP */
+ -struct switchdev_obj_in_test_mrp {
+ -	struct switchdev_obj obj;
+ -	/* The value is in us and a value of 0 represents to stop */
+ -	u32 interval;
+ -	u32 in_id;
+ -	u32 period;
+ -	u8 max_miss;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_IN_TEST_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_in_test_mrp, obj)
+ -
+ -/* SWICHDEV_OBJ_ID_IN_ROLE_MRP */
+ -struct switchdev_obj_in_role_mrp {
+ -	struct switchdev_obj obj;
+ -	struct net_device *i_port;
+ -	u32 ring_id;
+ -	u16 in_id;
+ -	u8 in_role;
+ -	u8 sw_backup;
+++<<<<<<< HEAD
+ +struct switchdev_ops_extended_rh {
+  };
+  
+ -#define SWITCHDEV_OBJ_IN_ROLE_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_in_role_mrp, obj)
+ -
+ -struct switchdev_obj_in_state_mrp {
+ -	struct switchdev_obj obj;
+ -	u32 in_id;
+ -	u8 in_state;
+ -};
+ -
+ -#define SWITCHDEV_OBJ_IN_STATE_MRP(OBJ) \
+ -	container_of((OBJ), struct switchdev_obj_in_state_mrp, obj)
+ -
+ -typedef int switchdev_obj_dump_cb_t(struct switchdev_obj *obj);
+ -
+ +/**
+ + * struct switchdev_ops - switchdev operations
+ + *
+ + * @switchdev_port_attr_set: Set a port attribute (see switchdev_attr).
+ + */
+ +struct RH_KABI_RENAME(switchdev_ops, rh_deprecated_switchdev_ops) {
+ +	RH_KABI_DEPRECATE_FN(int, switchdev_port_attr_get, struct net_device *dev,
+ +					   struct switchdev_attr *attr)
+ +	RH_KABI_DEPRECATE_FN(int, switchdev_port_attr_set, struct net_device *dev,
+ +					   const struct switchdev_attr *attr,
+ +					   struct switchdev_trans *trans)
+ +	RH_KABI_DEPRECATE_FN(int, switchdev_port_obj_add, struct net_device *dev,
+ +					  const struct switchdev_obj *obj,
+ +					  struct switchdev_trans *trans)
+ +	RH_KABI_DEPRECATE_FN(int, switchdev_port_obj_del, struct net_device *dev,
+ +					  const struct switchdev_obj *obj)
+ +
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+ +	RH_KABI_RESERVE(5)
+ +	RH_KABI_RESERVE(6)
+ +	RH_KABI_RESERVE(7)
+ +	RH_KABI_AUX_EMBED(switchdev_ops_extended)
+++=======
++ struct switchdev_brport {
++ 	struct net_device *dev;
++ 	const void *ctx;
++ 	struct notifier_block *atomic_nb;
++ 	struct notifier_block *blocking_nb;
++ 	bool tx_fwd_offload;
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+  };
+  
+  enum switchdev_notifier_type {
+@@@ -192,11 -254,29 +209,22 @@@ switchdev_notifier_info_to_extack(cons
+  	return info->extack;
+  }
+  
+ -static inline bool
+ -switchdev_fdb_is_dynamically_learned(const struct switchdev_notifier_fdb_info *fdb_info)
+ -{
+ -	return !fdb_info->added_by_user && !fdb_info->is_local;
+ -}
+ -
+  #ifdef CONFIG_NET_SWITCHDEV
+  
++ int switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 				  struct net_device *dev, const void *ctx,
++ 				  struct notifier_block *atomic_nb,
++ 				  struct notifier_block *blocking_nb,
++ 				  bool tx_fwd_offload,
++ 				  struct netlink_ext_ack *extack);
++ void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				     const void *ctx,
++ 				     struct notifier_block *atomic_nb,
++ 				     struct notifier_block *blocking_nb);
++ 
+  void switchdev_deferred_process(void);
+  int switchdev_port_attr_set(struct net_device *dev,
+ -			    const struct switchdev_attr *attr,
+ -			    struct netlink_ext_ack *extack);
+ +			    const struct switchdev_attr *attr);
+  int switchdev_port_obj_add(struct net_device *dev,
+  			   const struct switchdev_obj *obj,
+  			   struct netlink_ext_ack *extack);
+@@@ -259,11 -338,30 +287,30 @@@ int switchdev_handle_port_obj_del(struc
+  int switchdev_handle_port_attr_set(struct net_device *dev,
+  			struct switchdev_notifier_port_attr_info *port_attr_info,
+  			bool (*check_cb)(const struct net_device *dev),
+ -			int (*set_cb)(struct net_device *dev, const void *ctx,
+ +			int (*set_cb)(struct net_device *dev,
+  				      const struct switchdev_attr *attr,
+ -				      struct netlink_ext_ack *extack));
+ +				      struct switchdev_trans *trans));
+  #else
+  
++ static inline int
++ switchdev_bridge_port_offload(struct net_device *brport_dev,
++ 			      struct net_device *dev, const void *ctx,
++ 			      struct notifier_block *atomic_nb,
++ 			      struct notifier_block *blocking_nb,
++ 			      bool tx_fwd_offload,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline void
++ switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++ 				const void *ctx,
++ 				struct notifier_block *atomic_nb,
++ 				struct notifier_block *blocking_nb)
++ {
++ }
++ 
+  static inline void switchdev_deferred_process(void)
+  {
+  }
+diff --cc net/bridge/br.c
+index 77c8f6ec5329,d3a32c6813e0..000000000000
+--- a/net/bridge/br.c
++++ b/net/bridge/br.c
+@@@ -351,7 -401,11 +393,15 @@@ static int __init br_init(void
+  	if (err)
+  		goto err_out5;
+  
+++<<<<<<< HEAD
+ +	brioctl_set(br_ioctl_deviceless_stub);
+++=======
++ 	err = br_netlink_init();
++ 	if (err)
++ 		goto err_out6;
++ 
++ 	brioctl_set(br_ioctl_stub);
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+  
+  #if IS_ENABLED(CONFIG_ATM_LANE)
+  	br_fdb_test_addr_hook = br_fdb_test_addr;
+diff --cc net/bridge/br_private.h
+index 30e07225bc94,10d43bf4bb80..000000000000
+--- a/net/bridge/br_private.h
++++ b/net/bridge/br_private.h
+@@@ -1465,6 -1880,25 +1465,28 @@@ static inline void br_sysfs_delbr(struc
+  
+  /* br_switchdev.c */
+  #ifdef CONFIG_NET_SWITCHDEV
+++<<<<<<< HEAD
+++=======
++ int br_switchdev_port_offload(struct net_bridge_port *p,
++ 			      struct net_device *dev, const void *ctx,
++ 			      struct notifier_block *atomic_nb,
++ 			      struct notifier_block *blocking_nb,
++ 			      bool tx_fwd_offload,
++ 			      struct netlink_ext_ack *extack);
++ 
++ void br_switchdev_port_unoffload(struct net_bridge_port *p, const void *ctx,
++ 				 struct notifier_block *atomic_nb,
++ 				 struct notifier_block *blocking_nb);
++ 
++ bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb);
++ 
++ void br_switchdev_frame_set_offload_fwd_mark(struct sk_buff *skb);
++ 
++ void nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++ 					     struct sk_buff *skb);
++ void nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++ 					      struct sk_buff *skb);
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+  void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+  			      struct sk_buff *skb);
+  bool nbp_switchdev_allowed_egress(const struct net_bridge_port *p,
+@@@ -1487,6 -1919,45 +1509,48 @@@ static inline void br_switchdev_frame_u
+  	skb->offload_fwd_mark = 0;
+  }
+  #else
+++<<<<<<< HEAD
+++=======
++ static inline int
++ br_switchdev_port_offload(struct net_bridge_port *p,
++ 			  struct net_device *dev, const void *ctx,
++ 			  struct notifier_block *atomic_nb,
++ 			  struct notifier_block *blocking_nb,
++ 			  bool tx_fwd_offload,
++ 			  struct netlink_ext_ack *extack)
++ {
++ 	return -EOPNOTSUPP;
++ }
++ 
++ static inline void
++ br_switchdev_port_unoffload(struct net_bridge_port *p, const void *ctx,
++ 			    struct notifier_block *atomic_nb,
++ 			    struct notifier_block *blocking_nb)
++ {
++ }
++ 
++ static inline bool br_switchdev_frame_uses_tx_fwd_offload(struct sk_buff *skb)
++ {
++ 	return false;
++ }
++ 
++ static inline void br_switchdev_frame_set_offload_fwd_mark(struct sk_buff *skb)
++ {
++ }
++ 
++ static inline void
++ nbp_switchdev_frame_mark_tx_fwd_offload(const struct net_bridge_port *p,
++ 					struct sk_buff *skb)
++ {
++ }
++ 
++ static inline void
++ nbp_switchdev_frame_mark_tx_fwd_to_hwdom(const struct net_bridge_port *p,
++ 					 struct sk_buff *skb)
++ {
++ }
++ 
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+  static inline void nbp_switchdev_frame_mark(const struct net_bridge_port *p,
+  					    struct sk_buff *skb)
+  {
+diff --cc net/bridge/br_switchdev.c
+index be7535fa5f0e,6bf518d78f02..000000000000
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@@ -185,4 -263,90 +185,88 @@@ void nbp_switchdev_del(struct net_bridg
+  
+  	if (p->hwdom)
+  		nbp_switchdev_hwdom_put(p);
+ -
+ -	if (p->flags & BR_TX_FWD_OFFLOAD) {
+ -		p->flags &= ~BR_TX_FWD_OFFLOAD;
+ -		static_branch_dec(&br_switchdev_tx_fwd_offload);
+ -	}
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ static int nbp_switchdev_sync_objs(struct net_bridge_port *p, const void *ctx,
++ 				   struct notifier_block *atomic_nb,
++ 				   struct notifier_block *blocking_nb,
++ 				   struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 	int err;
++ 
++ 	err = br_vlan_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = br_mdb_replay(br_dev, dev, ctx, true, blocking_nb, extack);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	err = br_fdb_replay(br_dev, ctx, true, atomic_nb);
++ 	if (err && err != -EOPNOTSUPP)
++ 		return err;
++ 
++ 	return 0;
++ }
++ 
++ static void nbp_switchdev_unsync_objs(struct net_bridge_port *p,
++ 				      const void *ctx,
++ 				      struct notifier_block *atomic_nb,
++ 				      struct notifier_block *blocking_nb)
++ {
++ 	struct net_device *br_dev = p->br->dev;
++ 	struct net_device *dev = p->dev;
++ 
++ 	br_vlan_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	br_mdb_replay(br_dev, dev, ctx, false, blocking_nb, NULL);
++ 
++ 	br_fdb_replay(br_dev, ctx, false, atomic_nb);
++ }
++ 
++ /* Let the bridge know that this port is offloaded, so that it can assign a
++  * switchdev hardware domain to it.
++  */
++ int br_switchdev_port_offload(struct net_bridge_port *p,
++ 			      struct net_device *dev, const void *ctx,
++ 			      struct notifier_block *atomic_nb,
++ 			      struct notifier_block *blocking_nb,
++ 			      bool tx_fwd_offload,
++ 			      struct netlink_ext_ack *extack)
++ {
++ 	struct netdev_phys_item_id ppid;
++ 	int err;
++ 
++ 	err = dev_get_port_parent_id(dev, &ppid, false);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nbp_switchdev_add(p, ppid, tx_fwd_offload, extack);
++ 	if (err)
++ 		return err;
++ 
++ 	err = nbp_switchdev_sync_objs(p, ctx, atomic_nb, blocking_nb, extack);
++ 	if (err)
++ 		goto out_switchdev_del;
++ 
++ 	return 0;
++ 
++ out_switchdev_del:
++ 	nbp_switchdev_del(p);
++ 
++ 	return err;
++ }
++ 
++ void br_switchdev_port_unoffload(struct net_bridge_port *p, const void *ctx,
++ 				 struct notifier_block *atomic_nb,
++ 				 struct notifier_block *blocking_nb)
++ {
++ 	nbp_switchdev_unsync_objs(p, ctx, atomic_nb, blocking_nb);
++ 
++ 	nbp_switchdev_del(p);
++ }
+++>>>>>>> 957e2235e526 (net: make switchdev_bridge_port_{,unoffload} loosely coupled with the bridge)
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path include/linux/if_bridge.h
+* Unmerged path include/net/switchdev.h
+* Unmerged path net/bridge/br.c
+* Unmerged path net/bridge/br_private.h
+* Unmerged path net/bridge/br_switchdev.c
+diff --git a/net/switchdev/switchdev.c b/net/switchdev/switchdev.c
+index 5854b8cbac3b..63acb2dd00cc 100644
+--- a/net/switchdev/switchdev.c
++++ b/net/switchdev/switchdev.c
+@@ -876,3 +876,51 @@ int switchdev_handle_port_attr_set(struct net_device *dev,
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(switchdev_handle_port_attr_set);
++
++int switchdev_bridge_port_offload(struct net_device *brport_dev,
++				  struct net_device *dev, const void *ctx,
++				  struct notifier_block *atomic_nb,
++				  struct notifier_block *blocking_nb,
++				  bool tx_fwd_offload,
++				  struct netlink_ext_ack *extack)
++{
++	struct switchdev_notifier_brport_info brport_info = {
++		.brport = {
++			.dev = dev,
++			.ctx = ctx,
++			.atomic_nb = atomic_nb,
++			.blocking_nb = blocking_nb,
++			.tx_fwd_offload = tx_fwd_offload,
++		},
++	};
++	int err;
++
++	ASSERT_RTNL();
++
++	err = call_switchdev_blocking_notifiers(SWITCHDEV_BRPORT_OFFLOADED,
++						brport_dev, &brport_info.info,
++						extack);
++	return notifier_to_errno(err);
++}
++EXPORT_SYMBOL_GPL(switchdev_bridge_port_offload);
++
++void switchdev_bridge_port_unoffload(struct net_device *brport_dev,
++				     const void *ctx,
++				     struct notifier_block *atomic_nb,
++				     struct notifier_block *blocking_nb)
++{
++	struct switchdev_notifier_brport_info brport_info = {
++		.brport = {
++			.ctx = ctx,
++			.atomic_nb = atomic_nb,
++			.blocking_nb = blocking_nb,
++		},
++	};
++
++	ASSERT_RTNL();
++
++	call_switchdev_blocking_notifiers(SWITCHDEV_BRPORT_UNOFFLOADED,
++					  brport_dev, &brport_info.info,
++					  NULL);
++}
++EXPORT_SYMBOL_GPL(switchdev_bridge_port_unoffload);
