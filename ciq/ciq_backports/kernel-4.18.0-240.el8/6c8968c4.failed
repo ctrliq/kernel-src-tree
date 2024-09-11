@@ -1,0 +1,190 @@
+net/smc: use worker to process incoming llc messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 6c8968c421e0e6bea8a78ee4fdd043d850cd5b26
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6c8968c4.failed
+
+Incoming llc messages are processed in irq tasklet context, and
+a worker is used to send outgoing messages. The worker is needed
+because getting a send buffer could result in a wait for a free buffer.
+
+To make sure all incoming llc messages are processed in a serialized way
+introduce an event queue and create a new queue entry for each message
+which is queued to this event queue. A new worker processes the event
+queue entries in order.
+And remove the use of a separate worker to send outgoing llc messages
+because the messages are processed in worker context already.
+With this event queue the serialized llc_wq work queue is obsolete,
+remove it.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 6c8968c421e0e6bea8a78ee4fdd043d850cd5b26)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_llc.c
+index 4119cdb6b6bf,be74876a36ae..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -372,30 -369,13 +369,19 @@@ static int smc_llc_send_message(struct 
+  	struct smc_wr_buf *wr_buf;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (llcwrk->link->state == SMC_LNK_INACTIVE)
+ +		goto out;
+ +	rc = smc_llc_add_pending_send(llcwrk->link, &wr_buf, &pend);
+++=======
++ 	if (!smc_link_usable(link))
++ 		return -ENOLINK;
++ 	rc = smc_llc_add_pending_send(link, &wr_buf, &pend);
+++>>>>>>> 6c8968c421e0 (net/smc: use worker to process incoming llc messages)
+  	if (rc)
+- 		goto out;
+- 	memcpy(wr_buf, &llcwrk->llcbuf, llcwrk->llclen);
+- 	smc_wr_tx_send(llcwrk->link, pend);
+- out:
+- 	kfree(llcwrk);
+- }
+- 
+- /* copy llcbuf and schedule an llc send on link */
+- static int smc_llc_send_message(struct smc_link *link, void *llcbuf, int llclen)
+- {
+- 	struct smc_llc_send_work *wrk = kmalloc(sizeof(*wrk), GFP_ATOMIC);
+- 
+- 	if (!wrk)
+- 		return -ENOMEM;
+- 	INIT_WORK(&wrk->work, smc_llc_send_message_work);
+- 	wrk->link = link;
+- 	wrk->llclen = llclen;
+- 	memcpy(&wrk->llcbuf, llcbuf, llclen);
+- 	queue_work(link->llc_wq, &wrk->work);
+- 	return 0;
++ 		return rc;
++ 	memcpy(wr_buf, llcbuf, sizeof(union smc_llc_msg));
++ 	return smc_wr_tx_send(link, pend);
+  }
+  
+  /********************************* receive ***********************************/
+@@@ -553,17 -533,26 +539,35 @@@ static void smc_llc_rx_delete_rkey(stru
+  	}
+  }
+  
+- static void smc_llc_rx_handler(struct ib_wc *wc, void *buf)
++ /* flush the llc event queue */
++ void smc_llc_event_flush(struct smc_link_group *lgr)
+  {
+- 	struct smc_link *link = (struct smc_link *)wc->qp->qp_context;
+- 	union smc_llc_msg *llc = buf;
++ 	struct smc_llc_qentry *qentry, *q;
+  
++ 	spin_lock_bh(&lgr->llc_event_q_lock);
++ 	list_for_each_entry_safe(qentry, q, &lgr->llc_event_q, list) {
++ 		list_del_init(&qentry->list);
++ 		kfree(qentry);
++ 	}
++ 	spin_unlock_bh(&lgr->llc_event_q_lock);
++ }
++ 
++ static void smc_llc_event_handler(struct smc_llc_qentry *qentry)
++ {
++ 	union smc_llc_msg *llc = &qentry->msg;
++ 	struct smc_link *link = qentry->link;
++ 
+++<<<<<<< HEAD
+ +	if (wc->byte_len < sizeof(*llc))
+ +		return; /* short message */
+ +	if (llc->raw.hdr.length != sizeof(*llc))
+ +		return; /* invalid message */
+ +	if (link->state == SMC_LNK_INACTIVE)
+ +		return; /* link not active, drop msg */
+++=======
++ 	if (!smc_link_usable(link))
++ 		goto out;
+++>>>>>>> 6c8968c421e0 (net/smc: use worker to process incoming llc messages)
+  
+  	switch (llc->raw.hdr.common.type) {
+  	case SMC_LLC_TEST_LINK:
+@@@ -674,8 -695,10 +721,15 @@@ void smc_llc_link_inactive(struct smc_l
+  /* called in worker context */
+  void smc_llc_link_clear(struct smc_link *link)
+  {
+++<<<<<<< HEAD
+ +	flush_workqueue(link->llc_wq);
+ +	destroy_workqueue(link->llc_wq);
+++=======
++ 	complete(&link->llc_testlink_resp);
++ 	cancel_delayed_work_sync(&link->llc_testlink_wrk);
++ 	smc_wr_wakeup_reg_wait(link);
++ 	smc_wr_wakeup_tx_wait(link);
+++>>>>>>> 6c8968c421e0 (net/smc: use worker to process incoming llc messages)
+  }
+  
+  /* register a new rtoken at the remote peer */
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index 9e33952db1df..37ba3607948c 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -409,7 +409,8 @@ static int smc_lgr_create(struct smc_sock *smc, struct smc_init_info *ini)
+ 		lgr->role = smc->listen_smc ? SMC_SERV : SMC_CLNT;
+ 		memcpy(lgr->peer_systemid, ini->ib_lcl->id_for_peer,
+ 		       SMC_SYSTEMID_LEN);
+-
++		INIT_LIST_HEAD(&lgr->llc_event_q);
++		spin_lock_init(&lgr->llc_event_q_lock);
+ 		link_idx = SMC_SINGLE_LINK;
+ 		lnk = &lgr->lnk[link_idx];
+ 		rc = smcr_link_init(lgr, lnk, link_idx, ini);
+@@ -606,6 +607,7 @@ static void smc_lgr_free(struct smc_link_group *lgr)
+ 				continue;
+ 			smcr_link_clear(&lgr->lnk[i]);
+ 		}
++		smc_llc_event_flush(lgr);
+ 		if (!atomic_dec_return(&lgr_cnt))
+ 			wake_up(&lgrs_deleted);
+ 	}
+diff --git a/net/smc/smc_core.h b/net/smc/smc_core.h
+index d8e041838cfe..04d876bc352e 100644
+--- a/net/smc/smc_core.h
++++ b/net/smc/smc_core.h
+@@ -119,7 +119,6 @@ struct smc_link {
+ 	struct smc_link_group	*lgr;		/* parent link group */
+ 
+ 	enum smc_link_state	state;		/* state of link */
+-	struct workqueue_struct *llc_wq;	/* single thread work queue */
+ 	struct completion	llc_confirm;	/* wait for rx of conf link */
+ 	struct completion	llc_confirm_resp; /* wait 4 rx of cnf lnk rsp */
+ 	int			llc_confirm_rc; /* rc from confirm link msg */
+@@ -232,6 +231,12 @@ struct smc_link_group {
+ 			DECLARE_BITMAP(rtokens_used_mask, SMC_RMBS_PER_LGR_MAX);
+ 						/* used rtoken elements */
+ 			u8			next_link_id;
++			struct list_head	llc_event_q;
++						/* queue for llc events */
++			spinlock_t		llc_event_q_lock;
++						/* protects llc_event_q */
++			struct work_struct	llc_event_work;
++						/* llc event worker */
+ 		};
+ 		struct { /* SMC-D */
+ 			u64			peer_gid;
+* Unmerged path net/smc/smc_llc.c
+diff --git a/net/smc/smc_llc.h b/net/smc/smc_llc.h
+index 461c0c3ef76e..069117c7b95b 100644
+--- a/net/smc/smc_llc.h
++++ b/net/smc/smc_llc.h
+@@ -51,6 +51,7 @@ int smc_llc_do_confirm_rkey(struct smc_link *link,
+ 			    struct smc_buf_desc *rmb_desc);
+ int smc_llc_do_delete_rkey(struct smc_link *link,
+ 			   struct smc_buf_desc *rmb_desc);
++void smc_llc_event_flush(struct smc_link_group *lgr);
+ int smc_llc_init(void) __init;
+ 
+ #endif /* SMC_LLC_H */
