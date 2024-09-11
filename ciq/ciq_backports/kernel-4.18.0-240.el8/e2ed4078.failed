@@ -1,0 +1,112 @@
+kvm: i8254: Deactivate APICv when using in-kernel PIT re-injection mode.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [x86] kvm: i8254: Deactivate APICv when using in-kernel PIT re-injection mode (Vitaly Kuznetsov) [1813987]
+Rebuild_FUZZ: 99.30%
+commit-author Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+commit e2ed4078a6ef3ddf4063329298852e24c36d46c8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e2ed4078.failed
+
+AMD SVM AVIC accelerates EOI write and does not trap. This causes
+in-kernel PIT re-injection mode to fail since it relies on irq-ack
+notifier mechanism. So, APICv is activated only when in-kernel PIT
+is in discard mode e.g. w/ qemu option:
+
+  -global kvm-pit.lost_tick_policy=discard
+
+Also, introduce APICV_INHIBIT_REASON_PIT_REINJ bit to be used for this
+reason.
+
+	Suggested-by: Paolo Bonzini <pbonzini@redhat.com>
+	Signed-off-by: Suravee Suthikulpanit <suravee.suthikulpanit@amd.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit e2ed4078a6ef3ddf4063329298852e24c36d46c8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/svm.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 5bd73b4f5d32,4dffbc10d3f8..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -876,6 -875,12 +876,15 @@@ enum kvm_irqchip_mode 
+  	KVM_IRQCHIP_SPLIT,        /* created with KVM_CAP_SPLIT_IRQCHIP */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define APICV_INHIBIT_REASON_DISABLE    0
++ #define APICV_INHIBIT_REASON_HYPERV     1
++ #define APICV_INHIBIT_REASON_NESTED     2
++ #define APICV_INHIBIT_REASON_IRQWIN     3
++ #define APICV_INHIBIT_REASON_PIT_REINJ  4
++ 
+++>>>>>>> e2ed4078a6ef (kvm: i8254: Deactivate APICv when using in-kernel PIT re-injection mode.)
+  struct kvm_arch {
+  	unsigned long n_used_mmu_pages;
+  	unsigned long n_requested_mmu_pages;
+diff --cc arch/x86/kvm/svm.c
+index 0b5d8983224a,0b05967aa455..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -7361,6 -7354,22 +7367,25 @@@ static bool svm_apic_init_signal_blocke
+  		   (svm->vmcb->control.intercept & (1ULL << INTERCEPT_INIT));
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool svm_check_apicv_inhibit_reasons(ulong bit)
++ {
++ 	ulong supported = BIT(APICV_INHIBIT_REASON_DISABLE) |
++ 			  BIT(APICV_INHIBIT_REASON_HYPERV) |
++ 			  BIT(APICV_INHIBIT_REASON_NESTED) |
++ 			  BIT(APICV_INHIBIT_REASON_IRQWIN) |
++ 			  BIT(APICV_INHIBIT_REASON_PIT_REINJ);
++ 
++ 	return supported & BIT(bit);
++ }
++ 
++ static void svm_pre_update_apicv_exec_ctrl(struct kvm *kvm, bool activate)
++ {
++ 	avic_update_access_page(kvm, activate);
++ }
++ 
+++>>>>>>> e2ed4078a6ef (kvm: i8254: Deactivate APICv when using in-kernel PIT re-injection mode.)
+  static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+  	.cpu_has_kvm_support = has_svm,
+  	.disabled_by_bios = is_disabled,
+* Unmerged path arch/x86/include/asm/kvm_host.h
+diff --git a/arch/x86/kvm/i8254.c b/arch/x86/kvm/i8254.c
+index 4a6dc54cc12b..b24c606ac04b 100644
+--- a/arch/x86/kvm/i8254.c
++++ b/arch/x86/kvm/i8254.c
+@@ -295,12 +295,24 @@ void kvm_pit_set_reinject(struct kvm_pit *pit, bool reinject)
+ 	if (atomic_read(&ps->reinject) == reinject)
+ 		return;
+ 
++	/*
++	 * AMD SVM AVIC accelerates EOI write and does not trap.
++	 * This cause in-kernel PIT re-inject mode to fail
++	 * since it checks ps->irq_ack before kvm_set_irq()
++	 * and relies on the ack notifier to timely queue
++	 * the pt->worker work iterm and reinject the missed tick.
++	 * So, deactivate APICv when PIT is in reinject mode.
++	 */
+ 	if (reinject) {
++		kvm_request_apicv_update(kvm, false,
++					 APICV_INHIBIT_REASON_PIT_REINJ);
+ 		/* The initial state is preserved while ps->reinject == 0. */
+ 		kvm_pit_reset_reinject(pit);
+ 		kvm_register_irq_ack_notifier(kvm, &ps->irq_ack_notifier);
+ 		kvm_register_irq_mask_notifier(kvm, 0, &pit->mask_notifier);
+ 	} else {
++		kvm_request_apicv_update(kvm, true,
++					 APICV_INHIBIT_REASON_PIT_REINJ);
+ 		kvm_unregister_irq_ack_notifier(kvm, &ps->irq_ack_notifier);
+ 		kvm_unregister_irq_mask_notifier(kvm, 0, &pit->mask_notifier);
+ 	}
+* Unmerged path arch/x86/kvm/svm.c
