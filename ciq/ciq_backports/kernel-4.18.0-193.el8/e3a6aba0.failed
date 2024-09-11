@@ -1,0 +1,275 @@
+nfp: flower: add GRE decap classification support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit e3a6aba081f45882069af28d73157e01c22d8092
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/e3a6aba0.failed
+
+Extend the existing tunnel matching support to include GRE decap
+classification. Specifically matching existing tunnel fields for
+NVGRE (GRE with protocol field set to TEB).
+
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Reviewed-by: Jakub Kicinski <jakub.kicinski@netronome.com>
+	Reviewed-by: John Hurley <john.hurley@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit e3a6aba081f45882069af28d73157e01c22d8092)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 9878f76b520f,6dbe947269c3..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -237,55 -287,48 +236,88 @@@ nfp_flower_calculate_key_layers(struct 
+  		if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_OPTS))
+  			flow_rule_match_enc_opts(rule, &enc_op);
+  
+ +		switch (enc_ports.key->dst) {
+ +		case htons(NFP_FL_VXLAN_PORT):
+ +			*tun_type = NFP_FL_TUNNEL_VXLAN;
+ +			key_layer |= NFP_FLOWER_LAYER_VXLAN;
+ +			key_size += sizeof(struct nfp_flower_ipv4_udp_tun);
+ +
+++<<<<<<< HEAD
+ +			if (enc_op.key) {
+ +				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: encap options not supported on vxlan tunnels");
+ +				return -EOPNOTSUPP;
+ +			}
+ +			break;
+ +		case htons(GENEVE_UDP_PORT):
+ +			if (!(priv->flower_ext_feats & NFP_FL_FEATS_GENEVE)) {
+ +				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: loaded firmware does not support geneve offload");
+ +				return -EOPNOTSUPP;
+ +			}
+ +			*tun_type = NFP_FL_TUNNEL_GENEVE;
+ +			key_layer |= NFP_FLOWER_LAYER_EXT_META;
+ +			key_size += sizeof(struct nfp_flower_ext_meta);
+ +			key_layer_two |= NFP_FLOWER_LAYER2_GENEVE;
+ +			key_size += sizeof(struct nfp_flower_ipv4_udp_tun);
+  
+ +			if (!enc_op.key)
+ +				break;
+ +			if (!(priv->flower_ext_feats &
+ +			      NFP_FL_FEATS_GENEVE_OPT)) {
+ +				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: loaded firmware does not support geneve option offload");
+ +				return -EOPNOTSUPP;
+ +			}
+ +			err = nfp_flower_calc_opt_layer(&enc_op, &key_layer_two,
+ +							&key_size, extack);
+ +			if (err)
+ +				return err;
+ +			break;
+ +		default:
+ +			NL_SET_ERR_MSG_MOD(extack, "unsupported offload: tunnel type unknown");
+ +			return -EOPNOTSUPP;
+ +		}
+++=======
++ 		if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_PORTS)) {
++ 			/* check if GRE, which has no enc_ports */
++ 			if (netif_is_gretap(netdev)) {
++ 				*tun_type = NFP_FL_TUNNEL_GRE;
++ 				key_layer |= NFP_FLOWER_LAYER_EXT_META;
++ 				key_size += sizeof(struct nfp_flower_ext_meta);
++ 				key_layer_two |= NFP_FLOWER_LAYER2_GRE;
++ 				key_size +=
++ 					sizeof(struct nfp_flower_ipv4_gre_tun);
+++>>>>>>> e3a6aba081f4 (nfp: flower: add GRE decap classification support)
++ 
++ 				if (enc_op.key) {
++ 					NL_SET_ERR_MSG_MOD(extack, "unsupported offload: encap options not supported on GRE tunnels");
++ 					return -EOPNOTSUPP;
++ 				}
++ 			} else {
++ 				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: an exact match on L4 destination port is required for non-GRE tunnels");
++ 				return -EOPNOTSUPP;
++ 			}
++ 		} else {
++ 			flow_rule_match_enc_ports(rule, &enc_ports);
++ 			if (enc_ports.mask->dst != cpu_to_be16(~0)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: only an exact match L4 destination port is supported");
++ 				return -EOPNOTSUPP;
++ 			}
+  
+- 		/* Ensure the ingress netdev matches the expected tun type. */
+- 		if (!nfp_fl_netdev_is_tunnel_type(netdev, *tun_type)) {
+- 			NL_SET_ERR_MSG_MOD(extack, "unsupported offload: ingress netdev does not match the expected tunnel type");
+- 			return -EOPNOTSUPP;
++ 			err = nfp_flower_calc_udp_tun_layer(enc_ports.key,
++ 							    enc_op.key,
++ 							    &key_layer_two,
++ 							    &key_layer,
++ 							    &key_size, priv,
++ 							    tun_type, extack);
++ 			if (err)
++ 				return err;
++ 
++ 			/* Ensure the ingress netdev matches the expected
++ 			 * tun type.
++ 			 */
++ 			if (!nfp_fl_netdev_is_tunnel_type(netdev, *tun_type)) {
++ 				NL_SET_ERR_MSG_MOD(extack, "unsupported offload: ingress netdev does not match the expected tunnel type");
++ 				return -EOPNOTSUPP;
++ 			}
+  		}
+  	}
+  
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 0bdc7637c7d2..c08e71fe2234 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -8,6 +8,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/types.h>
+ #include <net/geneve.h>
++#include <net/gre.h>
+ #include <net/vxlan.h>
+ 
+ #include "../nfp_app.h"
+@@ -22,6 +23,7 @@
+ #define NFP_FLOWER_LAYER_CT		BIT(6)
+ #define NFP_FLOWER_LAYER_VXLAN		BIT(7)
+ 
++#define NFP_FLOWER_LAYER2_GRE		BIT(0)
+ #define NFP_FLOWER_LAYER2_GENEVE	BIT(5)
+ #define NFP_FLOWER_LAYER2_GENEVE_OP	BIT(6)
+ 
+@@ -37,6 +39,9 @@
+ #define NFP_FL_IP_FRAG_FIRST		BIT(7)
+ #define NFP_FL_IP_FRAGMENTED		BIT(6)
+ 
++/* GRE Tunnel flags */
++#define NFP_FL_GRE_FLAG_KEY		BIT(2)
++
+ /* Compressed HW representation of TCP Flags */
+ #define NFP_FL_TCP_FLAG_URG		BIT(4)
+ #define NFP_FL_TCP_FLAG_PSH		BIT(3)
+@@ -107,6 +112,7 @@
+ 
+ enum nfp_flower_tun_type {
+ 	NFP_FL_TUNNEL_NONE =	0,
++	NFP_FL_TUNNEL_GRE =	1,
+ 	NFP_FL_TUNNEL_VXLAN =	2,
+ 	NFP_FL_TUNNEL_GENEVE =	4,
+ };
+@@ -388,6 +394,35 @@ struct nfp_flower_ipv4_udp_tun {
+ 	__be32 tun_id;
+ };
+ 
++/* Flow Frame GRE TUNNEL --> Tunnel details (6W/24B)
++ * -----------------------------------------------------------------
++ *    3                   2                   1
++ *  1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0 9 8 7 6 5 4 3 2 1 0
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                         ipv4_addr_src                         |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                         ipv4_addr_dst                         |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |           tun_flags           |       tos     |       ttl     |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |            Reserved           |           Ethertype           |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                              Key                              |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ * |                           Reserved                            |
++ * +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
++ */
++
++struct nfp_flower_ipv4_gre_tun {
++	struct nfp_flower_tun_ipv4 ipv4;
++	__be16 tun_flags;
++	struct nfp_flower_tun_ip_ext ip_ext;
++	__be16 reserved1;
++	__be16 ethertype;
++	__be32 tun_key;
++	__be32 reserved2;
++};
++
+ struct nfp_flower_geneve_options {
+ 	u8 data[NFP_FL_MAX_GENEVE_OPT_KEY];
+ };
+@@ -535,6 +570,8 @@ nfp_fl_netdev_is_tunnel_type(struct net_device *netdev,
+ {
+ 	if (netif_is_vxlan(netdev))
+ 		return tun_type == NFP_FL_TUNNEL_VXLAN;
++	if (netif_is_gretap(netdev))
++		return tun_type == NFP_FL_TUNNEL_GRE;
+ 	if (netif_is_geneve(netdev))
+ 		return tun_type == NFP_FL_TUNNEL_GENEVE;
+ 
+@@ -551,6 +588,8 @@ static inline bool nfp_fl_is_netdev_to_offload(struct net_device *netdev)
+ 		return true;
+ 	if (netif_is_geneve(netdev))
+ 		return true;
++	if (netif_is_gretap(netdev))
++		return true;
+ 
+ 	return false;
+ }
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/match.c b/drivers/net/ethernet/netronome/nfp/flower/match.c
+index 9181611087c2..c1690de19172 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/match.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/match.c
+@@ -316,6 +316,35 @@ nfp_flower_compile_tun_ip_ext(struct nfp_flower_tun_ip_ext *ext,
+ 	}
+ }
+ 
++static void
++nfp_flower_compile_ipv4_gre_tun(struct nfp_flower_ipv4_gre_tun *ext,
++				struct nfp_flower_ipv4_gre_tun *msk,
++				struct tc_cls_flower_offload *flow)
++{
++	struct flow_rule *rule = tc_cls_flower_offload_flow_rule(flow);
++
++	memset(ext, 0, sizeof(struct nfp_flower_ipv4_gre_tun));
++	memset(msk, 0, sizeof(struct nfp_flower_ipv4_gre_tun));
++
++	/* NVGRE is the only supported GRE tunnel type */
++	ext->ethertype = cpu_to_be16(ETH_P_TEB);
++	msk->ethertype = cpu_to_be16(~0);
++
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_ENC_KEYID)) {
++		struct flow_match_enc_keyid match;
++
++		flow_rule_match_enc_keyid(rule, &match);
++		ext->tun_key = match.key->keyid;
++		msk->tun_key = match.mask->keyid;
++
++		ext->tun_flags = cpu_to_be16(NFP_FL_GRE_FLAG_KEY);
++		msk->tun_flags = cpu_to_be16(NFP_FL_GRE_FLAG_KEY);
++	}
++
++	nfp_flower_compile_tun_ipv4_addrs(&ext->ipv4, &msk->ipv4, flow);
++	nfp_flower_compile_tun_ip_ext(&ext->ip_ext, &msk->ip_ext, flow);
++}
++
+ static void
+ nfp_flower_compile_ipv4_udp_tun(struct nfp_flower_ipv4_udp_tun *ext,
+ 				struct nfp_flower_ipv4_udp_tun *msk,
+@@ -425,6 +454,21 @@ int nfp_flower_compile_flow_match(struct nfp_app *app,
+ 		msk += sizeof(struct nfp_flower_ipv6);
+ 	}
+ 
++	if (key_ls->key_layer_two & NFP_FLOWER_LAYER2_GRE) {
++		__be32 tun_dst;
++
++		nfp_flower_compile_ipv4_gre_tun((void *)ext, (void *)msk, flow);
++		tun_dst = ((struct nfp_flower_ipv4_gre_tun *)ext)->ipv4.dst;
++		ext += sizeof(struct nfp_flower_ipv4_gre_tun);
++		msk += sizeof(struct nfp_flower_ipv4_gre_tun);
++
++		/* Store the tunnel destination in the rule data.
++		 * This must be present and be an exact match.
++		 */
++		nfp_flow->nfp_tun_ipv4_addr = tun_dst;
++		nfp_tunnel_add_ipv4_off(app, tun_dst);
++	}
++
+ 	if (key_ls->key_layer & NFP_FLOWER_LAYER_VXLAN ||
+ 	    key_ls->key_layer_two & NFP_FLOWER_LAYER2_GENEVE) {
+ 		__be32 tun_dst;
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
