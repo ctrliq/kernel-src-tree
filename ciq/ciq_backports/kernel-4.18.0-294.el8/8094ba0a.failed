@@ -1,0 +1,222 @@
+RDMA/cma: Provide ECE reject reason
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Leon Romanovsky <leon@kernel.org>
+commit 8094ba0ace7f6cd1e31ea8b151fba3594cadfa9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8094ba0a.failed
+
+IBTA declares "vendor option not supported" reject reason in REJ messages
+if passive side doesn't want to accept proposed ECE options.
+
+Due to the fact that ECE is managed by userspace, there is a need to let
+users to provide such rejected reason.
+
+Link: https://lore.kernel.org/r/20200526103304.196371-7-leon@kernel.org
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 8094ba0ace7f6cd1e31ea8b151fba3594cadfa9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/rtrs/rtrs-srv.c
+#	net/rds/ib_cm.c
+diff --cc net/rds/ib_cm.c
+index f1684ae6abfd,0fec4171564e..000000000000
+--- a/net/rds/ib_cm.c
++++ b/net/rds/ib_cm.c
+@@@ -35,6 -36,8 +35,11 @@@
+  #include <linux/slab.h>
+  #include <linux/vmalloc.h>
+  #include <linux/ratelimit.h>
+++<<<<<<< HEAD
+++=======
++ #include <net/addrconf.h>
++ #include <rdma/ib_cm.h>
+++>>>>>>> 8094ba0ace7f (RDMA/cma: Provide ECE reject reason)
+  
+  #include "rds_single_path.h"
+  #include "rds.h"
+@@@ -713,7 -928,8 +718,12 @@@ out
+  	if (conn)
+  		mutex_unlock(&conn->c_cm_lock);
+  	if (err)
+++<<<<<<< HEAD
+ +		rdma_reject(cm_id, NULL, 0);
+++=======
++ 		rdma_reject(cm_id, &err, sizeof(int),
++ 			    IB_CM_REJ_CONSUMER_DEFINED);
+++>>>>>>> 8094ba0ace7f (RDMA/cma: Provide ECE reject reason)
+  	return destroy;
+  }
+  
+* Unmerged path drivers/infiniband/ulp/rtrs/rtrs-srv.c
+diff --git a/drivers/infiniband/core/cma.c b/drivers/infiniband/core/cma.c
+index 7632f7869672..bc96827d0a78 100644
+--- a/drivers/infiniband/core/cma.c
++++ b/drivers/infiniband/core/cma.c
+@@ -4190,7 +4190,7 @@ int __rdma_accept(struct rdma_cm_id *id, struct rdma_conn_param *conn_param,
+ 	return 0;
+ reject:
+ 	cma_modify_qp_err(id_priv);
+-	rdma_reject(id, NULL, 0);
++	rdma_reject(id, NULL, 0, IB_CM_REJ_CONSUMER_DEFINED);
+ 	return ret;
+ }
+ EXPORT_SYMBOL(__rdma_accept);
+@@ -4230,7 +4230,7 @@ int rdma_notify(struct rdma_cm_id *id, enum ib_event_type event)
+ EXPORT_SYMBOL(rdma_notify);
+ 
+ int rdma_reject(struct rdma_cm_id *id, const void *private_data,
+-		u8 private_data_len)
++		u8 private_data_len, u8 reason)
+ {
+ 	struct rdma_id_private *id_priv;
+ 	int ret;
+@@ -4245,9 +4245,8 @@ int rdma_reject(struct rdma_cm_id *id, const void *private_data,
+ 						private_data, private_data_len);
+ 		} else {
+ 			trace_cm_send_rej(id_priv);
+-			ret = ib_send_cm_rej(id_priv->cm_id.ib,
+-					     IB_CM_REJ_CONSUMER_DEFINED, NULL,
+-					     0, private_data, private_data_len);
++			ret = ib_send_cm_rej(id_priv->cm_id.ib, reason, NULL, 0,
++					     private_data, private_data_len);
+ 		}
+ 	} else if (rdma_cap_iw_cm(id->device, id->port_num)) {
+ 		ret = iw_cm_reject(id_priv->cm_id.iw,
+diff --git a/drivers/infiniband/core/ucma.c b/drivers/infiniband/core/ucma.c
+index 2fb83a934543..66f93ee15759 100644
+--- a/drivers/infiniband/core/ucma.c
++++ b/drivers/infiniband/core/ucma.c
+@@ -52,6 +52,7 @@
+ #include <rdma/rdma_cm_ib.h>
+ #include <rdma/ib_addr.h>
+ #include <rdma/ib.h>
++#include <rdma/ib_cm.h>
+ #include <rdma/rdma_netlink.h>
+ #include "core_priv.h"
+ 
+@@ -1181,12 +1182,24 @@ static ssize_t ucma_reject(struct ucma_file *file, const char __user *inbuf,
+ 	if (copy_from_user(&cmd, inbuf, sizeof(cmd)))
+ 		return -EFAULT;
+ 
++	if (!cmd.reason)
++		cmd.reason = IB_CM_REJ_CONSUMER_DEFINED;
++
++	switch (cmd.reason) {
++	case IB_CM_REJ_CONSUMER_DEFINED:
++	case IB_CM_REJ_VENDOR_OPTION_NOT_SUPPORTED:
++		break;
++	default:
++		return -EINVAL;
++	}
++
+ 	ctx = ucma_get_ctx_dev(file, cmd.id);
+ 	if (IS_ERR(ctx))
+ 		return PTR_ERR(ctx);
+ 
+ 	mutex_lock(&ctx->mutex);
+-	ret = rdma_reject(ctx->cm_id, cmd.private_data, cmd.private_data_len);
++	ret = rdma_reject(ctx->cm_id, cmd.private_data, cmd.private_data_len,
++			  cmd.reason);
+ 	mutex_unlock(&ctx->mutex);
+ 	ucma_put_ctx(ctx);
+ 	return ret;
+diff --git a/drivers/infiniband/ulp/isert/ib_isert.c b/drivers/infiniband/ulp/isert/ib_isert.c
+index a1a035270cab..b7df38ee8ae0 100644
+--- a/drivers/infiniband/ulp/isert/ib_isert.c
++++ b/drivers/infiniband/ulp/isert/ib_isert.c
+@@ -15,6 +15,7 @@
+ #include <linux/in.h>
+ #include <linux/in6.h>
+ #include <rdma/ib_verbs.h>
++#include <rdma/ib_cm.h>
+ #include <rdma/rdma_cm.h>
+ #include <target/target_core_base.h>
+ #include <target/target_core_fabric.h>
+@@ -502,7 +503,7 @@ isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+ 	if (!np->enabled) {
+ 		spin_unlock_bh(&np->np_thread_lock);
+ 		isert_dbg("iscsi_np is not enabled, reject connect request\n");
+-		return rdma_reject(cma_id, NULL, 0);
++		return rdma_reject(cma_id, NULL, 0, IB_CM_REJ_CONSUMER_DEFINED);
+ 	}
+ 	spin_unlock_bh(&np->np_thread_lock);
+ 
+@@ -553,7 +554,7 @@ isert_connect_request(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+ 	isert_free_login_buf(isert_conn);
+ out:
+ 	kfree(isert_conn);
+-	rdma_reject(cma_id, NULL, 0);
++	rdma_reject(cma_id, NULL, 0, IB_CM_REJ_CONSUMER_DEFINED);
+ 	return ret;
+ }
+ 
+* Unmerged path drivers/infiniband/ulp/rtrs/rtrs-srv.c
+diff --git a/drivers/infiniband/ulp/srpt/ib_srpt.c b/drivers/infiniband/ulp/srpt/ib_srpt.c
+index 73338f456cb9..bc9ee1b17e3c 100644
+--- a/drivers/infiniband/ulp/srpt/ib_srpt.c
++++ b/drivers/infiniband/ulp/srpt/ib_srpt.c
+@@ -2497,7 +2497,8 @@ static int srpt_cm_req_recv(struct srpt_device *const sdev,
+ 				   SRP_BUF_FORMAT_INDIRECT);
+ 
+ 	if (rdma_cm_id)
+-		rdma_reject(rdma_cm_id, rej, sizeof(*rej));
++		rdma_reject(rdma_cm_id, rej, sizeof(*rej),
++			    IB_CM_REJ_CONSUMER_DEFINED);
+ 	else
+ 		ib_send_cm_rej(ib_cm_id, IB_CM_REJ_CONSUMER_DEFINED, NULL, 0,
+ 			       rej, sizeof(*rej));
+diff --git a/drivers/nvme/target/rdma.c b/drivers/nvme/target/rdma.c
+index 16359fae3927..e7016a5896ca 100644
+--- a/drivers/nvme/target/rdma.c
++++ b/drivers/nvme/target/rdma.c
+@@ -28,6 +28,7 @@
+ #include <rdma/ib_verbs.h>
+ #include <rdma/rdma_cm.h>
+ #include <rdma/rw.h>
++#include <rdma/ib_cm.h>
+ 
+ #include <linux/nvme-rdma.h>
+ #include "nvmet.h"
+@@ -1322,7 +1323,8 @@ static int nvmet_rdma_cm_reject(struct rdma_cm_id *cm_id,
+ 	rej.recfmt = cpu_to_le16(NVME_RDMA_CM_FMT_1_0);
+ 	rej.sts = cpu_to_le16(status);
+ 
+-	return rdma_reject(cm_id, (void *)&rej, sizeof(rej));
++	return rdma_reject(cm_id, (void *)&rej, sizeof(rej),
++			   IB_CM_REJ_CONSUMER_DEFINED);
+ }
+ 
+ static struct nvmet_rdma_queue *
+diff --git a/include/rdma/rdma_cm.h b/include/rdma/rdma_cm.h
+index 7ac91677660f..939d7abe026f 100644
+--- a/include/rdma/rdma_cm.h
++++ b/include/rdma/rdma_cm.h
+@@ -320,7 +320,7 @@ int rdma_notify(struct rdma_cm_id *id, enum ib_event_type event);
+  * rdma_reject - Called to reject a connection request or response.
+  */
+ int rdma_reject(struct rdma_cm_id *id, const void *private_data,
+-		u8 private_data_len);
++		u8 private_data_len, u8 reason);
+ 
+ /**
+  * rdma_disconnect - This function disconnects the associated QP and
+diff --git a/include/uapi/rdma/rdma_user_cm.h b/include/uapi/rdma/rdma_user_cm.h
+index 6b883dde7064..ed5a514305c1 100644
+--- a/include/uapi/rdma/rdma_user_cm.h
++++ b/include/uapi/rdma/rdma_user_cm.h
+@@ -238,7 +238,8 @@ struct rdma_ucm_accept {
+ struct rdma_ucm_reject {
+ 	__u32 id;
+ 	__u8  private_data_len;
+-	__u8  reserved[3];
++	__u8  reason;
++	__u8  reserved[2];
+ 	__u8  private_data[RDMA_MAX_PRIVATE_DATA];
+ };
+ 
+* Unmerged path net/rds/ib_cm.c
