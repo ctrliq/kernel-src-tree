@@ -445,7 +445,7 @@ END(spurious_entries_start)
 	 */
 
 	movq	\old_rsp, PER_CPU_VAR(irq_stack_union + IRQ_STACK_SIZE - 8)
-	movq	PER_CPU_VAR(irq_stack_ptr), %rsp
+	movq	PER_CPU_VAR(hardirq_stack_ptr), %rsp
 
 #ifdef CONFIG_DEBUG_ENTRY
 	/*
