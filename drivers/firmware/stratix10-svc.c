@@ -257,7 +257,7 @@ static void svc_thread_cmd_config_status(struct stratix10_svc_controller *ctrl,
 		 */
 		msleep(1000);
 		count_in_sec--;
-	};
+	}
 
 	if (res.a0 == INTEL_SIP_SMC_STATUS_OK && count_in_sec)
 		cb_data->status = BIT(SVC_STATUS_RECONFIG_COMPLETED);
@@ -465,7 +465,7 @@ static int svc_normal_to_secure_thread(void *data)
 			break;
 
 		}
-	};
+	}
 
 	kfree(cbdata);
 	kfree(pdata);
