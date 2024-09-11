@@ -42,7 +42,7 @@ static void destroy_cq(struct c4iw_rdev *rdev, struct t4_cq *cq,
 	struct fw_ri_res *res;
 	int wr_len;
 
-	wr_len = sizeof *res_wr + sizeof *res;
+	wr_len = sizeof(*res_wr) + sizeof(*res);
 	set_wr_txq(skb, CPL_PRIORITY_CONTROL, 0);
 
 	res_wr = __skb_put_zero(skb, wr_len);
@@ -114,7 +114,7 @@ static int create_cq(struct c4iw_rdev *rdev, struct t4_cq *cq,
 	}
 
 	/* build fw_ri_res_wr */
-	wr_len = sizeof *res_wr + sizeof *res;
+	wr_len = sizeof(*res_wr) + sizeof(*res);
 
 	skb = alloc_skb(wr_len, GFP_KERNEL);
 	if (!skb) {
@@ -1088,10 +1088,10 @@ int c4iw_create_cq(struct ib_cq *ibcq, const struct ib_cq_init_attr *attr,
 
 	if (ucontext) {
 		ret = -ENOMEM;
-		mm = kmalloc(sizeof *mm, GFP_KERNEL);
+		mm = kmalloc(sizeof(*mm), GFP_KERNEL);
 		if (!mm)
 			goto err_remove_handle;
-		mm2 = kmalloc(sizeof *mm2, GFP_KERNEL);
+		mm2 = kmalloc(sizeof(*mm2), GFP_KERNEL);
 		if (!mm2)
 			goto err_free_mm;
 
