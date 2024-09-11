@@ -1,0 +1,245 @@
+scsi: qla2xxx: Address a set of sparse warnings
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Shyam Sundar <ssundar@marvell.com>
+commit 58101f1504ad9b36e34533ec1fb01a8de80aa6d6
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/58101f15.failed
+
+Fix the following sparse warnings:
+
+drivers/scsi/qla2xxx/qla_isr.c:881:23: warning: restricted __le16 degrades to integer
+drivers/scsi/qla2xxx/qla_isr.c:881:23: warning: cast to restricted __le16
+
+Link: https://lore.kernel.org/r/20200715043358.21668-1-njavali@marvell.com
+	Signed-off-by: Shyam Sundar <ssundar@marvell.com>
+	Signed-off-by: Nilesh Javali <njavali@marvell.com>
+	Signed-off-by: Martin K. Petersen <martin.petersen@oracle.com>
+(cherry picked from commit 58101f1504ad9b36e34533ec1fb01a8de80aa6d6)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/scsi/qla2xxx/qla_fw.h
+#	drivers/scsi/qla2xxx/qla_isr.c
+diff --cc drivers/scsi/qla2xxx/qla_fw.h
+index 34bbd2edc2fc,bba1b77fba7e..000000000000
+--- a/drivers/scsi/qla2xxx/qla_fw.h
++++ b/drivers/scsi/qla2xxx/qla_fw.h
+@@@ -604,17 -604,17 +604,22 @@@ struct sts_entry_24xx 
+  
+  	uint32_t handle;		/* System handle. */
+  
+ -	__le16	comp_status;		/* Completion status. */
+ -	__le16	ox_id;			/* OX_ID used by the firmware. */
+ +	uint16_t comp_status;		/* Completion status. */
+ +	uint16_t ox_id;			/* OX_ID used by the firmware. */
+  
+ -	__le32	residual_len;		/* FW calc residual transfer length. */
+ +	uint32_t residual_len;		/* FW calc residual transfer length. */
+  
+  	union {
+++<<<<<<< HEAD
+ +		uint16_t reserved_1;
+ +		uint16_t nvme_rsp_pyld_len;
+++=======
++ 		__le16 reserved_1;
++ 		__le16	nvme_rsp_pyld_len;
+++>>>>>>> 58101f1504ad (scsi: qla2xxx: Address a set of sparse warnings)
+  	};
+  
+ -	__le16	state_flags;		/* State flags. */
+ +	uint16_t state_flags;		/* State flags. */
+  #define SF_TRANSFERRED_DATA	BIT_11
+  #define SF_NVME_ERSP            BIT_6
+  #define SF_FCP_RSP_DMA		BIT_0
+diff --cc drivers/scsi/qla2xxx/qla_isr.c
+index bada8ca1cc29,27bcd346af7c..000000000000
+--- a/drivers/scsi/qla2xxx/qla_isr.c
++++ b/drivers/scsi/qla2xxx/qla_isr.c
+@@@ -652,6 -790,179 +652,182 @@@ qla27xx_handle_8200_aen(scsi_qla_host_
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct purex_item *
++ qla24xx_alloc_purex_item(scsi_qla_host_t *vha, uint16_t size)
++ {
++ 	struct purex_item *item = NULL;
++ 	uint8_t item_hdr_size = sizeof(*item);
++ 
++ 	if (size > QLA_DEFAULT_PAYLOAD_SIZE) {
++ 		item = kzalloc(item_hdr_size +
++ 		    (size - QLA_DEFAULT_PAYLOAD_SIZE), GFP_ATOMIC);
++ 	} else {
++ 		if (atomic_inc_return(&vha->default_item.in_use) == 1) {
++ 			item = &vha->default_item;
++ 			goto initialize_purex_header;
++ 		} else {
++ 			item = kzalloc(item_hdr_size, GFP_ATOMIC);
++ 		}
++ 	}
++ 	if (!item) {
++ 		ql_log(ql_log_warn, vha, 0x5092,
++ 		       ">> Failed allocate purex list item.\n");
++ 
++ 		return NULL;
++ 	}
++ 
++ initialize_purex_header:
++ 	item->vha = vha;
++ 	item->size = size;
++ 	return item;
++ }
++ 
++ static void
++ qla24xx_queue_purex_item(scsi_qla_host_t *vha, struct purex_item *pkt,
++ 			 void (*process_item)(struct scsi_qla_host *vha,
++ 					      struct purex_item *pkt))
++ {
++ 	struct purex_list *list = &vha->purex_list;
++ 	ulong flags;
++ 
++ 	pkt->process_item = process_item;
++ 
++ 	spin_lock_irqsave(&list->lock, flags);
++ 	list_add_tail(&pkt->list, &list->head);
++ 	spin_unlock_irqrestore(&list->lock, flags);
++ 
++ 	set_bit(PROCESS_PUREX_IOCB, &vha->dpc_flags);
++ }
++ 
++ /**
++  * qla24xx_copy_std_pkt() - Copy over purex ELS which is
++  * contained in a single IOCB.
++  * purex packet.
++  * @vha: SCSI driver HA context
++  * @pkt: ELS packet
++  */
++ static struct purex_item
++ *qla24xx_copy_std_pkt(struct scsi_qla_host *vha, void *pkt)
++ {
++ 	struct purex_item *item;
++ 
++ 	item = qla24xx_alloc_purex_item(vha,
++ 					QLA_DEFAULT_PAYLOAD_SIZE);
++ 	if (!item)
++ 		return item;
++ 
++ 	memcpy(&item->iocb, pkt, sizeof(item->iocb));
++ 	return item;
++ }
++ 
++ /**
++  * qla27xx_copy_fpin_pkt() - Copy over fpin packets that can
++  * span over multiple IOCBs.
++  * @vha: SCSI driver HA context
++  * @pkt: ELS packet
++  * @rsp: Response queue
++  */
++ static struct purex_item *
++ qla27xx_copy_fpin_pkt(struct scsi_qla_host *vha, void **pkt,
++ 		      struct rsp_que **rsp)
++ {
++ 	struct purex_entry_24xx *purex = *pkt;
++ 	struct rsp_que *rsp_q = *rsp;
++ 	sts_cont_entry_t *new_pkt;
++ 	uint16_t no_bytes = 0, total_bytes = 0, pending_bytes = 0;
++ 	uint16_t buffer_copy_offset = 0;
++ 	uint16_t entry_count, entry_count_remaining;
++ 	struct purex_item *item;
++ 	void *fpin_pkt = NULL;
++ 
++ 	total_bytes = (le16_to_cpu(purex->frame_size) & 0x0FFF)
++ 	    - PURX_ELS_HEADER_SIZE;
++ 	pending_bytes = total_bytes;
++ 	entry_count = entry_count_remaining = purex->entry_count;
++ 	no_bytes = (pending_bytes > sizeof(purex->els_frame_payload))  ?
++ 		   sizeof(purex->els_frame_payload) : pending_bytes;
++ 	ql_log(ql_log_info, vha, 0x509a,
++ 	       "FPIN ELS, frame_size 0x%x, entry count %d\n",
++ 	       total_bytes, entry_count);
++ 
++ 	item = qla24xx_alloc_purex_item(vha, total_bytes);
++ 	if (!item)
++ 		return item;
++ 
++ 	fpin_pkt = &item->iocb;
++ 
++ 	memcpy(fpin_pkt, &purex->els_frame_payload[0], no_bytes);
++ 	buffer_copy_offset += no_bytes;
++ 	pending_bytes -= no_bytes;
++ 	--entry_count_remaining;
++ 
++ 	((response_t *)purex)->signature = RESPONSE_PROCESSED;
++ 	wmb();
++ 
++ 	do {
++ 		while ((total_bytes > 0) && (entry_count_remaining > 0)) {
++ 			if (rsp_q->ring_ptr->signature == RESPONSE_PROCESSED) {
++ 				ql_dbg(ql_dbg_async, vha, 0x5084,
++ 				       "Ran out of IOCBs, partial data 0x%x\n",
++ 				       buffer_copy_offset);
++ 				cpu_relax();
++ 				continue;
++ 			}
++ 
++ 			new_pkt = (sts_cont_entry_t *)rsp_q->ring_ptr;
++ 			*pkt = new_pkt;
++ 
++ 			if (new_pkt->entry_type != STATUS_CONT_TYPE) {
++ 				ql_log(ql_log_warn, vha, 0x507a,
++ 				       "Unexpected IOCB type, partial data 0x%x\n",
++ 				       buffer_copy_offset);
++ 				break;
++ 			}
++ 
++ 			rsp_q->ring_index++;
++ 			if (rsp_q->ring_index == rsp_q->length) {
++ 				rsp_q->ring_index = 0;
++ 				rsp_q->ring_ptr = rsp_q->ring;
++ 			} else {
++ 				rsp_q->ring_ptr++;
++ 			}
++ 			no_bytes = (pending_bytes > sizeof(new_pkt->data)) ?
++ 			    sizeof(new_pkt->data) : pending_bytes;
++ 			if ((buffer_copy_offset + no_bytes) <= total_bytes) {
++ 				memcpy(((uint8_t *)fpin_pkt +
++ 				    buffer_copy_offset), new_pkt->data,
++ 				    no_bytes);
++ 				buffer_copy_offset += no_bytes;
++ 				pending_bytes -= no_bytes;
++ 				--entry_count_remaining;
++ 			} else {
++ 				ql_log(ql_log_warn, vha, 0x5044,
++ 				       "Attempt to copy more that we got, optimizing..%x\n",
++ 				       buffer_copy_offset);
++ 				memcpy(((uint8_t *)fpin_pkt +
++ 				    buffer_copy_offset), new_pkt->data,
++ 				    total_bytes - buffer_copy_offset);
++ 			}
++ 
++ 			((response_t *)new_pkt)->signature = RESPONSE_PROCESSED;
++ 			wmb();
++ 		}
++ 
++ 		if (pending_bytes != 0 || entry_count_remaining != 0) {
++ 			ql_log(ql_log_fatal, vha, 0x508b,
++ 			       "Dropping partial FPIN, underrun bytes = 0x%x, entry cnts 0x%x\n",
++ 			       total_bytes, entry_count_remaining);
++ 			qla24xx_free_purex_item(item);
++ 			return NULL;
++ 		}
++ 	} while (entry_count_remaining > 0);
++ 	host_to_fcp_swap((uint8_t *)&item->iocb, total_bytes);
++ 	return item;
++ }
++ 
+++>>>>>>> 58101f1504ad (scsi: qla2xxx: Address a set of sparse warnings)
+  /**
+   * qla2x00_async_event() - Process aynchronous events.
+   * @vha: SCSI driver HA context
+* Unmerged path drivers/scsi/qla2xxx/qla_fw.h
+* Unmerged path drivers/scsi/qla2xxx/qla_isr.c
