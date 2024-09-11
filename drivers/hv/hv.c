@@ -26,7 +26,6 @@
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/hyperv.h>
-#include <linux/version.h>
 #include <linux/random.h>
 #include <linux/clockchips.h>
 #include <linux/interrupt.h>
