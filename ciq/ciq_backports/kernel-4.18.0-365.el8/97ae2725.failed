@@ -1,0 +1,170 @@
+md/raid5: avoid device_lock in read_one_chunk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Gal Ofri <gal.ofri@storing.io>
+commit 97ae27252f4962d0fcc38ee1d9f913d817a2024e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/97ae2725.failed
+
+There is a lock contention on device_lock in read_one_chunk().
+device_lock is taken to sync conf->active_aligned_reads and
+conf->quiesce.
+read_one_chunk() takes the lock, then waits for quiesce=0 (resumed)
+before incrementing active_aligned_reads.
+raid5_quiesce() takes the lock, sets quiesce=2 (in-progress), then waits
+for active_aligned_reads to be zero before setting quiesce=1
+(suspended).
+
+Introduce a fast (lockless) path in read_one_chunk(): activate aligned
+read without taking device_lock.  In case quiesce starts while
+activating the aligned-read in fast path, deactivate it and revert to
+old behavior (take device_lock and wait for quiesce to finish).
+
+Add smp store/load in raid5_quiesce()/read_one_chunk() respectively to
+gaurantee that read_one_chunk() does not miss an ongoing quiesce.
+
+My setups:
+1. 8 local nvme drives (each up to 250k iops).
+2. 8 ram disks (brd).
+
+Each setup with raid6 (6+2), 1024 io threads on a 96 cpu-cores (48 per
+socket) system. Record both iops and cpu spent on this contention with
+rand-read-4k. Record bw with sequential-read-128k.  Note: in most cases
+cpu is still busy but due to "new" bottlenecks.
+
+nvme:
+              | iops           | cpu  | bw
+-----------------------------------------------
+without patch | 1.6M           | ~50% | 5.5GB/s
+with patch    | 2M (throttled) | 0%   | 16GB/s (throttled)
+
+ram (brd):
+              | iops           | cpu  | bw
+-----------------------------------------------
+without patch | 2M             | ~80% | 24GB/s
+with patch    | 4M             | 0%   | 55GB/s
+
+CC: Song Liu <song@kernel.org>
+CC: Neil Brown <neilb@suse.de>
+	Reviewed-by: NeilBrown <neilb@suse.de>
+	Signed-off-by: Gal Ofri <gal.ofri@storing.io>
+	Signed-off-by: Song Liu <song@kernel.org>
+(cherry picked from commit 97ae27252f4962d0fcc38ee1d9f913d817a2024e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/raid5.c
+diff --cc drivers/md/raid5.c
+index 08041f68d898,e248532bb70a..000000000000
+--- a/drivers/md/raid5.c
++++ b/drivers/md/raid5.c
+@@@ -5423,10 -5398,12 +5423,17 @@@ static void raid5_align_endio(struct bi
+  static int raid5_read_one_chunk(struct mddev *mddev, struct bio *raid_bio)
+  {
+  	struct r5conf *conf = mddev->private;
+ -	struct bio *align_bio;
+ +	int dd_idx;
+ +	struct bio* align_bi;
+  	struct md_rdev *rdev;
+++<<<<<<< HEAD
+ +	sector_t end_sector;
+++=======
++ 	sector_t sector, end_sector, first_bad;
++ 	int bad_sectors, dd_idx;
++ 	struct md_io_acct *md_io_acct;
++ 	bool did_inc;
+++>>>>>>> 97ae27252f49 (md/raid5: avoid device_lock in read_one_chunk())
+  
+  	if (!in_chunk_boundary(mddev, raid_bio)) {
+  		pr_debug("%s: non aligned\n", __func__);
+@@@ -5470,45 -5440,49 +5477,66 @@@
+  		return 0;
+  	}
+  
+ -	align_bio = bio_clone_fast(raid_bio, GFP_NOIO, &mddev->io_acct_set);
+ -	md_io_acct = container_of(align_bio, struct md_io_acct, bio_clone);
+ -	raid_bio->bi_next = (void *)rdev;
+ -	if (blk_queue_io_stat(raid_bio->bi_bdev->bd_disk->queue))
+ -		md_io_acct->start_time = bio_start_io_acct(raid_bio);
+ -	md_io_acct->orig_bio = raid_bio;
+ -
+ -	bio_set_dev(align_bio, rdev->bdev);
+ -	align_bio->bi_end_io = raid5_align_endio;
+ -	align_bio->bi_private = md_io_acct;
+ -	align_bio->bi_iter.bi_sector = sector;
+ +	if (rdev) {
+ +		sector_t first_bad;
+ +		int bad_sectors;
+  
+ -	/* No reshape active, so we can trust rdev->data_offset */
+ -	align_bio->bi_iter.bi_sector += rdev->data_offset;
+ +		atomic_inc(&rdev->nr_pending);
+ +		rcu_read_unlock();
+ +		raid_bio->bi_next = (void*)rdev;
+ +		bio_set_dev(align_bi, rdev->bdev);
+ +		bio_clear_flag(align_bi, BIO_SEG_VALID);
+ +
+ +		if (is_badblock(rdev, align_bi->bi_iter.bi_sector,
+ +				bio_sectors(align_bi),
+ +				&first_bad, &bad_sectors)) {
+ +			bio_put(align_bi);
+ +			rdev_dec_pending(rdev, mddev);
+ +			return 0;
+ +		}
+  
+++<<<<<<< HEAD
+ +		/* No reshape active, so we can trust rdev->data_offset */
+ +		align_bi->bi_iter.bi_sector += rdev->data_offset;
+++=======
++ 	did_inc = false;
++ 	if (conf->quiesce == 0) {
++ 		atomic_inc(&conf->active_aligned_reads);
++ 		did_inc = true;
++ 	}
++ 	/* need a memory barrier to detect the race with raid5_quiesce() */
++ 	if (!did_inc || smp_load_acquire(&conf->quiesce) != 0) {
++ 		/* quiesce is in progress, so we need to undo io activation and wait
++ 		 * for it to finish
++ 		 */
++ 		if (did_inc && atomic_dec_and_test(&conf->active_aligned_reads))
++ 			wake_up(&conf->wait_for_quiescent);
++ 		spin_lock_irq(&conf->device_lock);
++ 		wait_event_lock_irq(conf->wait_for_quiescent, conf->quiesce == 0,
++ 				    conf->device_lock);
++ 		atomic_inc(&conf->active_aligned_reads);
++ 		spin_unlock_irq(&conf->device_lock);
++ 	}
+++>>>>>>> 97ae27252f49 (md/raid5: avoid device_lock in read_one_chunk())
+  
+ -	if (mddev->gendisk)
+ -		trace_block_bio_remap(align_bio, disk_devt(mddev->gendisk),
+ -				      raid_bio->bi_iter.bi_sector);
+ -	submit_bio_noacct(align_bio);
+ -	return 1;
+ +		spin_lock_irq(&conf->device_lock);
+ +		wait_event_lock_irq(conf->wait_for_quiescent,
+ +				    conf->quiesce == 0,
+ +				    conf->device_lock);
+ +		atomic_inc(&conf->active_aligned_reads);
+ +		spin_unlock_irq(&conf->device_lock);
+  
+ -out_rcu_unlock:
+ -	rcu_read_unlock();
+ -	return 0;
+ +		if (mddev->gendisk)
+ +			trace_block_bio_remap(align_bi->bi_disk->queue,
+ +					      align_bi, disk_devt(mddev->gendisk),
+ +					      raid_bio->bi_iter.bi_sector);
+ +		generic_make_request(align_bi);
+ +		return 1;
+ +	} else {
+ +		rcu_read_unlock();
+ +		bio_put(align_bi);
+ +		return 0;
+ +	}
+  }
+  
+  static struct bio *chunk_aligned_read(struct mddev *mddev, struct bio *raid_bio)
+* Unmerged path drivers/md/raid5.c
