@@ -1,0 +1,149 @@
+netfilter: conntrack: Pass value of ctinfo to __nf_conntrack_update
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Nathan Chancellor <natechancellor@gmail.com>
+commit 46c1e0621a72e0469ec4edfdb6ed4d387ec34f8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/46c1e062.failed
+
+Clang warns:
+
+net/netfilter/nf_conntrack_core.c:2068:21: warning: variable 'ctinfo' is
+uninitialized when used here [-Wuninitialized]
+        nf_ct_set(skb, ct, ctinfo);
+                           ^~~~~~
+net/netfilter/nf_conntrack_core.c:2024:2: note: variable 'ctinfo' is
+declared here
+        enum ip_conntrack_info ctinfo;
+        ^
+1 warning generated.
+
+nf_conntrack_update was split up into nf_conntrack_update and
+__nf_conntrack_update, where the assignment of ctinfo is in
+nf_conntrack_update but it is used in __nf_conntrack_update.
+
+Pass the value of ctinfo from nf_conntrack_update to
+__nf_conntrack_update so that uninitialized memory is not used
+and everything works properly.
+
+Fixes: ee04805ff54a ("netfilter: conntrack: make conntrack userspace helpers work again")
+Link: https://github.com/ClangBuiltLinux/linux/issues/1039
+	Signed-off-by: Nathan Chancellor <natechancellor@gmail.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 46c1e0621a72e0469ec4edfdb6ed4d387ec34f8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index 680e0b0d92a5,e3b054a2f796..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -1725,16 -2016,15 +1725,21 @@@ static void nf_conntrack_attach(struct 
+  	nf_conntrack_get(skb_nfct(nskb));
+  }
+  
+++<<<<<<< HEAD
+ +static int nf_conntrack_update(struct net *net, struct sk_buff *skb)
+++=======
++ static int __nf_conntrack_update(struct net *net, struct sk_buff *skb,
++ 				 struct nf_conn *ct,
++ 				 enum ip_conntrack_info ctinfo)
+++>>>>>>> 46c1e0621a72 (netfilter: conntrack: Pass value of ctinfo to __nf_conntrack_update)
+  {
+ +	const struct nf_conntrack_l3proto *l3proto;
+ +	const struct nf_conntrack_l4proto *l4proto;
+  	struct nf_conntrack_tuple_hash *h;
+  	struct nf_conntrack_tuple tuple;
+- 	enum ip_conntrack_info ctinfo;
+  	struct nf_nat_hook *nat_hook;
+ -	unsigned int status;
+ -	int dataoff;
+ +	unsigned int dataoff, status;
+ +	struct nf_conn *ct;
+  	u16 l3num;
+  	u8 l4num;
+  
+@@@ -1801,6 -2084,76 +1806,79 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This packet is coming from userspace via nf_queue, complete the packet
++  * processing after the helper invocation in nf_confirm().
++  */
++ static int nf_confirm_cthelper(struct sk_buff *skb, struct nf_conn *ct,
++ 			       enum ip_conntrack_info ctinfo)
++ {
++ 	const struct nf_conntrack_helper *helper;
++ 	const struct nf_conn_help *help;
++ 	unsigned int protoff;
++ 
++ 	help = nfct_help(ct);
++ 	if (!help)
++ 		return 0;
++ 
++ 	helper = rcu_dereference(help->helper);
++ 	if (!(helper->flags & NF_CT_HELPER_F_USERSPACE))
++ 		return 0;
++ 
++ 	switch (nf_ct_l3num(ct)) {
++ 	case NFPROTO_IPV4:
++ 		protoff = skb_network_offset(skb) + ip_hdrlen(skb);
++ 		break;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case NFPROTO_IPV6: {
++ 		__be16 frag_off;
++ 		u8 pnum;
++ 
++ 		pnum = ipv6_hdr(skb)->nexthdr;
++ 		protoff = ipv6_skip_exthdr(skb, sizeof(struct ipv6hdr), &pnum,
++ 					   &frag_off);
++ 		if (protoff < 0 || (frag_off & htons(~0x7)) != 0)
++ 			return 0;
++ 		break;
++ 	}
++ #endif
++ 	default:
++ 		return 0;
++ 	}
++ 
++ 	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status) &&
++ 	    !nf_is_loopback_packet(skb)) {
++ 		if (!nf_ct_seq_adjust(skb, ct, ctinfo, protoff)) {
++ 			NF_CT_STAT_INC_ATOMIC(nf_ct_net(ct), drop);
++ 			return -1;
++ 		}
++ 	}
++ 
++ 	/* We've seen it coming out the other side: confirm it */
++ 	return nf_conntrack_confirm(skb) == NF_DROP ? - 1 : 0;
++ }
++ 
++ static int nf_conntrack_update(struct net *net, struct sk_buff *skb)
++ {
++ 	enum ip_conntrack_info ctinfo;
++ 	struct nf_conn *ct;
++ 	int err;
++ 
++ 	ct = nf_ct_get(skb, &ctinfo);
++ 	if (!ct)
++ 		return 0;
++ 
++ 	if (!nf_ct_is_confirmed(ct)) {
++ 		err = __nf_conntrack_update(net, skb, ct, ctinfo);
++ 		if (err < 0)
++ 			return err;
++ 	}
++ 
++ 	return nf_confirm_cthelper(skb, ct, ctinfo);
++ }
++ 
+++>>>>>>> 46c1e0621a72 (netfilter: conntrack: Pass value of ctinfo to __nf_conntrack_update)
+  static bool nf_conntrack_get_tuple_skb(struct nf_conntrack_tuple *dst_tuple,
+  				       const struct sk_buff *skb)
+  {
+* Unmerged path net/netfilter/nf_conntrack_core.c
