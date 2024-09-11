@@ -1,0 +1,380 @@
+iommu: use the __iommu_attach_device() directly for deferred attach
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Lianbo Jiang <lijiang@redhat.com>
+commit 3ab657291638ea267654c3e4798161b2cee6ae01
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3ab65729.failed
+
+Currently, because domain attach allows to be deferred from iommu
+driver to device driver, and when iommu initializes, the devices
+on the bus will be scanned and the default groups will be allocated.
+
+Due to the above changes, some devices could be added to the same
+group as below:
+
+[    3.859417] pci 0000:01:00.0: Adding to iommu group 16
+[    3.864572] pci 0000:01:00.1: Adding to iommu group 16
+[    3.869738] pci 0000:02:00.0: Adding to iommu group 17
+[    3.874892] pci 0000:02:00.1: Adding to iommu group 17
+
+But when attaching these devices, it doesn't allow that a group has
+more than one device, otherwise it will return an error. This conflicts
+with the deferred attaching. Unfortunately, it has two devices in the
+same group for my side, for example:
+
+[    9.627014] iommu_group_device_count(): device name[0]:0000:01:00.0
+[    9.633545] iommu_group_device_count(): device name[1]:0000:01:00.1
+...
+[   10.255609] iommu_group_device_count(): device name[0]:0000:02:00.0
+[   10.262144] iommu_group_device_count(): device name[1]:0000:02:00.1
+
+Finally, which caused the failure of tg3 driver when tg3 driver calls
+the dma_alloc_coherent() to allocate coherent memory in the tg3_test_dma().
+
+[    9.660310] tg3 0000:01:00.0: DMA engine test failed, aborting
+[    9.754085] tg3: probe of 0000:01:00.0 failed with error -12
+[    9.997512] tg3 0000:01:00.1: DMA engine test failed, aborting
+[   10.043053] tg3: probe of 0000:01:00.1 failed with error -12
+[   10.288905] tg3 0000:02:00.0: DMA engine test failed, aborting
+[   10.334070] tg3: probe of 0000:02:00.0 failed with error -12
+[   10.578303] tg3 0000:02:00.1: DMA engine test failed, aborting
+[   10.622629] tg3: probe of 0000:02:00.1 failed with error -12
+
+In addition, the similar situations also occur in other drivers such
+as the bnxt_en driver. That can be reproduced easily in kdump kernel
+when SME is active.
+
+Let's move the handling currently in iommu_dma_deferred_attach() into
+the iommu core code so that it can call the __iommu_attach_device()
+directly instead of the iommu_attach_device(). The external interface
+iommu_attach_device() is not suitable for handling this situation.
+
+	Signed-off-by: Lianbo Jiang <lijiang@redhat.com>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+Link: https://lore.kernel.org/r/20210126115337.20068-3-lijiang@redhat.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 3ab657291638ea267654c3e4798161b2cee6ae01)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+#	drivers/iommu/iommu.c
+diff --cc drivers/iommu/dma-iommu.c
+index b4d011969bbf,f659395e7959..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -364,21 -380,6 +364,24 @@@ static int iommu_dma_init_domain(struc
+  	return iova_reserve_iommu_regions(dev, domain);
+  }
+  
+++<<<<<<< HEAD
+ +static int iommu_dma_deferred_attach(struct device *dev,
+ +		struct iommu_domain *domain)
+ +{
+ +	const struct iommu_ops *ops = domain->ops;
+ +
+ +	if (!is_kdump_kernel())
+ +		return 0;
+ +
+ +	if (unlikely(ops->is_attach_deferred &&
+ +			ops->is_attach_deferred(domain, dev)))
+ +		return iommu_attach_device(domain, dev);
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 3ab657291638 (iommu: use the __iommu_attach_device() directly for deferred attach)
+  /**
+   * dma_info_to_prot - Translate DMA API directions and attributes to IOMMU API
+   *                    page flags.
+@@@ -495,7 -522,8 +498,12 @@@ static dma_addr_t __iommu_dma_map(struc
+  	size_t iova_off = iova_offset(iovad, phys);
+  	dma_addr_t iova;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(iommu_dma_deferred_attach(dev, domain)))
+++=======
++ 	if (static_branch_unlikely(&iommu_deferred_attach_enabled) &&
++ 	    iommu_deferred_attach(dev, domain))
+++>>>>>>> 3ab657291638 (iommu: use the __iommu_attach_device() directly for deferred attach)
+  		return DMA_MAPPING_ERROR;
+  
+  	size = iova_align(iovad, size + iova_off);
+@@@ -607,7 -681,8 +615,12 @@@ static void *iommu_dma_alloc_remap(stru
+  
+  	*dma_handle = DMA_MAPPING_ERROR;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(iommu_dma_deferred_attach(dev, domain)))
+++=======
++ 	if (static_branch_unlikely(&iommu_deferred_attach_enabled) &&
++ 	    iommu_deferred_attach(dev, domain))
+++>>>>>>> 3ab657291638 (iommu: use the __iommu_attach_device() directly for deferred attach)
+  		return NULL;
+  
+  	min_size = alloc_sizes & -alloc_sizes;
+@@@ -852,7 -965,8 +865,12 @@@ static int iommu_dma_map_sg(struct devi
+  	unsigned long mask = dma_get_seg_boundary(dev);
+  	int i;
+  
+++<<<<<<< HEAD
+ +	if (unlikely(iommu_dma_deferred_attach(dev, domain)))
+++=======
++ 	if (static_branch_unlikely(&iommu_deferred_attach_enabled) &&
++ 	    iommu_deferred_attach(dev, domain))
+++>>>>>>> 3ab657291638 (iommu: use the __iommu_attach_device() directly for deferred attach)
+  		return 0;
+  
+  	if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC))
+diff --cc drivers/iommu/iommu.c
+index 76e972a6918d,fd76e2f579fe..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -1960,6 -1980,226 +1960,229 @@@ out_unlock
+  }
+  EXPORT_SYMBOL_GPL(iommu_attach_device);
+  
+++<<<<<<< HEAD
+++=======
++ int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain)
++ {
++ 	const struct iommu_ops *ops = domain->ops;
++ 
++ 	if (ops->is_attach_deferred && ops->is_attach_deferred(domain, dev))
++ 		return __iommu_attach_device(domain, dev);
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Check flags and other user provided data for valid combinations. We also
++  * make sure no reserved fields or unused flags are set. This is to ensure
++  * not breaking userspace in the future when these fields or flags are used.
++  */
++ static int iommu_check_cache_invl_data(struct iommu_cache_invalidate_info *info)
++ {
++ 	u32 mask;
++ 	int i;
++ 
++ 	if (info->version != IOMMU_CACHE_INVALIDATE_INFO_VERSION_1)
++ 		return -EINVAL;
++ 
++ 	mask = (1 << IOMMU_CACHE_INV_TYPE_NR) - 1;
++ 	if (info->cache & ~mask)
++ 		return -EINVAL;
++ 
++ 	if (info->granularity >= IOMMU_INV_GRANU_NR)
++ 		return -EINVAL;
++ 
++ 	switch (info->granularity) {
++ 	case IOMMU_INV_GRANU_ADDR:
++ 		if (info->cache & IOMMU_CACHE_INV_TYPE_PASID)
++ 			return -EINVAL;
++ 
++ 		mask = IOMMU_INV_ADDR_FLAGS_PASID |
++ 			IOMMU_INV_ADDR_FLAGS_ARCHID |
++ 			IOMMU_INV_ADDR_FLAGS_LEAF;
++ 
++ 		if (info->granu.addr_info.flags & ~mask)
++ 			return -EINVAL;
++ 		break;
++ 	case IOMMU_INV_GRANU_PASID:
++ 		mask = IOMMU_INV_PASID_FLAGS_PASID |
++ 			IOMMU_INV_PASID_FLAGS_ARCHID;
++ 		if (info->granu.pasid_info.flags & ~mask)
++ 			return -EINVAL;
++ 
++ 		break;
++ 	case IOMMU_INV_GRANU_DOMAIN:
++ 		if (info->cache & IOMMU_CACHE_INV_TYPE_DEV_IOTLB)
++ 			return -EINVAL;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* Check reserved padding fields */
++ 	for (i = 0; i < sizeof(info->padding); i++) {
++ 		if (info->padding[i])
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int iommu_uapi_cache_invalidate(struct iommu_domain *domain, struct device *dev,
++ 				void __user *uinfo)
++ {
++ 	struct iommu_cache_invalidate_info inv_info = { 0 };
++ 	u32 minsz;
++ 	int ret;
++ 
++ 	if (unlikely(!domain->ops->cache_invalidate))
++ 		return -ENODEV;
++ 
++ 	/*
++ 	 * No new spaces can be added before the variable sized union, the
++ 	 * minimum size is the offset to the union.
++ 	 */
++ 	minsz = offsetof(struct iommu_cache_invalidate_info, granu);
++ 
++ 	/* Copy minsz from user to get flags and argsz */
++ 	if (copy_from_user(&inv_info, uinfo, minsz))
++ 		return -EFAULT;
++ 
++ 	/* Fields before the variable size union are mandatory */
++ 	if (inv_info.argsz < minsz)
++ 		return -EINVAL;
++ 
++ 	/* PASID and address granu require additional info beyond minsz */
++ 	if (inv_info.granularity == IOMMU_INV_GRANU_PASID &&
++ 	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.pasid_info))
++ 		return -EINVAL;
++ 
++ 	if (inv_info.granularity == IOMMU_INV_GRANU_ADDR &&
++ 	    inv_info.argsz < offsetofend(struct iommu_cache_invalidate_info, granu.addr_info))
++ 		return -EINVAL;
++ 
++ 	/*
++ 	 * User might be using a newer UAPI header which has a larger data
++ 	 * size, we shall support the existing flags within the current
++ 	 * size. Copy the remaining user data _after_ minsz but not more
++ 	 * than the current kernel supported size.
++ 	 */
++ 	if (copy_from_user((void *)&inv_info + minsz, uinfo + minsz,
++ 			   min_t(u32, inv_info.argsz, sizeof(inv_info)) - minsz))
++ 		return -EFAULT;
++ 
++ 	/* Now the argsz is validated, check the content */
++ 	ret = iommu_check_cache_invl_data(&inv_info);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return domain->ops->cache_invalidate(domain, dev, &inv_info);
++ }
++ EXPORT_SYMBOL_GPL(iommu_uapi_cache_invalidate);
++ 
++ static int iommu_check_bind_data(struct iommu_gpasid_bind_data *data)
++ {
++ 	u64 mask;
++ 	int i;
++ 
++ 	if (data->version != IOMMU_GPASID_BIND_VERSION_1)
++ 		return -EINVAL;
++ 
++ 	/* Check the range of supported formats */
++ 	if (data->format >= IOMMU_PASID_FORMAT_LAST)
++ 		return -EINVAL;
++ 
++ 	/* Check all flags */
++ 	mask = IOMMU_SVA_GPASID_VAL;
++ 	if (data->flags & ~mask)
++ 		return -EINVAL;
++ 
++ 	/* Check reserved padding fields */
++ 	for (i = 0; i < sizeof(data->padding); i++) {
++ 		if (data->padding[i])
++ 			return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int iommu_sva_prepare_bind_data(void __user *udata,
++ 				       struct iommu_gpasid_bind_data *data)
++ {
++ 	u32 minsz;
++ 
++ 	/*
++ 	 * No new spaces can be added before the variable sized union, the
++ 	 * minimum size is the offset to the union.
++ 	 */
++ 	minsz = offsetof(struct iommu_gpasid_bind_data, vendor);
++ 
++ 	/* Copy minsz from user to get flags and argsz */
++ 	if (copy_from_user(data, udata, minsz))
++ 		return -EFAULT;
++ 
++ 	/* Fields before the variable size union are mandatory */
++ 	if (data->argsz < minsz)
++ 		return -EINVAL;
++ 	/*
++ 	 * User might be using a newer UAPI header, we shall let IOMMU vendor
++ 	 * driver decide on what size it needs. Since the guest PASID bind data
++ 	 * can be vendor specific, larger argsz could be the result of extension
++ 	 * for one vendor but it should not affect another vendor.
++ 	 * Copy the remaining user data _after_ minsz
++ 	 */
++ 	if (copy_from_user((void *)data + minsz, udata + minsz,
++ 			   min_t(u32, data->argsz, sizeof(*data)) - minsz))
++ 		return -EFAULT;
++ 
++ 	return iommu_check_bind_data(data);
++ }
++ 
++ int iommu_uapi_sva_bind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 			       void __user *udata)
++ {
++ 	struct iommu_gpasid_bind_data data = { 0 };
++ 	int ret;
++ 
++ 	if (unlikely(!domain->ops->sva_bind_gpasid))
++ 		return -ENODEV;
++ 
++ 	ret = iommu_sva_prepare_bind_data(udata, &data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return domain->ops->sva_bind_gpasid(domain, dev, &data);
++ }
++ EXPORT_SYMBOL_GPL(iommu_uapi_sva_bind_gpasid);
++ 
++ int iommu_sva_unbind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 			     ioasid_t pasid)
++ {
++ 	if (unlikely(!domain->ops->sva_unbind_gpasid))
++ 		return -ENODEV;
++ 
++ 	return domain->ops->sva_unbind_gpasid(dev, pasid);
++ }
++ EXPORT_SYMBOL_GPL(iommu_sva_unbind_gpasid);
++ 
++ int iommu_uapi_sva_unbind_gpasid(struct iommu_domain *domain, struct device *dev,
++ 				 void __user *udata)
++ {
++ 	struct iommu_gpasid_bind_data data = { 0 };
++ 	int ret;
++ 
++ 	if (unlikely(!domain->ops->sva_bind_gpasid))
++ 		return -ENODEV;
++ 
++ 	ret = iommu_sva_prepare_bind_data(udata, &data);
++ 	if (ret)
++ 		return ret;
++ 
++ 	return iommu_sva_unbind_gpasid(domain, dev, data.hpasid);
++ }
++ EXPORT_SYMBOL_GPL(iommu_uapi_sva_unbind_gpasid);
++ 
+++>>>>>>> 3ab657291638 (iommu: use the __iommu_attach_device() directly for deferred attach)
+  static void __iommu_detach_device(struct iommu_domain *domain,
+  				  struct device *dev)
+  {
+* Unmerged path drivers/iommu/dma-iommu.c
+* Unmerged path drivers/iommu/iommu.c
+diff --git a/include/linux/iommu.h b/include/linux/iommu.h
+index 73a924c4c3bd..823b008a82db 100644
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@ -393,6 +393,7 @@ int  iommu_device_sysfs_add(struct iommu_device *iommu,
+ void iommu_device_sysfs_remove(struct iommu_device *iommu);
+ int  iommu_device_link(struct iommu_device   *iommu, struct device *link);
+ void iommu_device_unlink(struct iommu_device *iommu, struct device *link);
++int iommu_deferred_attach(struct device *dev, struct iommu_domain *domain);
+ 
+ static inline void __iommu_device_set_ops(struct iommu_device *iommu,
+ 					  const struct iommu_ops *ops)
