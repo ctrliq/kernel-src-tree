@@ -1,0 +1,136 @@
+xfs: rename the blockgc workqueue
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Darrick J. Wong <djwong@kernel.org>
+commit 3fef46fc43ca12a0006d6683c8ac114628ad53a1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/3fef46fc.failed
+
+Since we're about to start using the blockgc workqueue to dispose of
+inactivated inodes, strip the "block" prefix from the name; now it's
+merely the general garbage collection (gc) workqueue.
+
+	Signed-off-by: Darrick J. Wong <djwong@kernel.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 3fef46fc43ca12a0006d6683c8ac114628ad53a1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/xfs.txt
+diff --cc Documentation/filesystems/xfs.txt
+index 20c6aa2c7752,8de008c0c5ad..000000000000
+--- a/Documentation/filesystems/xfs.txt
++++ b/Documentation/filesystems/xfs.txt
+@@@ -468,3 -499,45 +468,48 @@@ the class and error context. For exampl
+  "metadata/ENODEV" are "0" rather than "-1" so that this error handler defaults
+  to "fail immediately" behaviour. This is done because ENODEV is a fatal,
+  unrecoverable error no matter how many times the metadata IO is retried.
+++<<<<<<< HEAD:Documentation/filesystems/xfs.txt
+++=======
++ 
++ Workqueue Concurrency
++ =====================
++ 
++ XFS uses kernel workqueues to parallelize metadata update processes.  This
++ enables it to take advantage of storage hardware that can service many IO
++ operations simultaneously.  This interface exposes internal implementation
++ details of XFS, and as such is explicitly not part of any userspace API/ABI
++ guarantee the kernel may give userspace.  These are undocumented features of
++ the generic workqueue implementation XFS uses for concurrency, and they are
++ provided here purely for diagnostic and tuning purposes and may change at any
++ time in the future.
++ 
++ The control knobs for a filesystem's workqueues are organized by task at hand
++ and the short name of the data device.  They all can be found in:
++ 
++   /sys/bus/workqueue/devices/${task}!${device}
++ 
++ ================  ===========
++   Task            Description
++ ================  ===========
++   xfs_iwalk-$pid  Inode scans of the entire filesystem. Currently limited to
++                   mount time quotacheck.
++   xfs-gc          Background garbage collection of disk space that have been
++                   speculatively allocated beyond EOF or for staging copy on
++                   write operations.
++ ================  ===========
++ 
++ For example, the knobs for the quotacheck workqueue for /dev/nvme0n1 would be
++ found in /sys/bus/workqueue/devices/xfs_iwalk-1111!nvme0n1/.
++ 
++ The interesting knobs for XFS workqueues are as follows:
++ 
++ ============     ===========
++   Knob           Description
++ ============     ===========
++   max_active     Maximum number of background threads that can be started to
++                  run the work.
++   cpumask        CPUs upon which the threads are allowed to run.
++   nice           Relative priority of scheduling the threads.  These are the
++                  same nice levels that can be applied to userspace processes.
++ ============     ===========
+++>>>>>>> 3fef46fc43ca (xfs: rename the blockgc workqueue):Documentation/admin-guide/xfs.rst
+* Unmerged path Documentation/filesystems/xfs.txt
+diff --git a/fs/xfs/xfs_icache.c b/fs/xfs/xfs_icache.c
+index f922fd9a454b..b3db40835069 100644
+--- a/fs/xfs/xfs_icache.c
++++ b/fs/xfs/xfs_icache.c
+@@ -1335,7 +1335,7 @@ xfs_blockgc_queue(
+ {
+ 	rcu_read_lock();
+ 	if (radix_tree_tagged(&pag->pag_ici_root, XFS_ICI_BLOCKGC_TAG))
+-		queue_delayed_work(pag->pag_mount->m_blockgc_workqueue,
++		queue_delayed_work(pag->pag_mount->m_gc_workqueue,
+ 				   &pag->pag_blockgc_work,
+ 				   msecs_to_jiffies(xfs_blockgc_secs * 1000));
+ 	rcu_read_unlock();
+diff --git a/fs/xfs/xfs_mount.h b/fs/xfs/xfs_mount.h
+index b587b392c7b5..bc4e74adb74a 100644
+--- a/fs/xfs/xfs_mount.h
++++ b/fs/xfs/xfs_mount.h
+@@ -100,7 +100,7 @@ typedef struct xfs_mount {
+ 	struct workqueue_struct	*m_unwritten_workqueue;
+ 	struct workqueue_struct	*m_cil_workqueue;
+ 	struct workqueue_struct	*m_reclaim_workqueue;
+-	struct workqueue_struct *m_blockgc_workqueue;
++	struct workqueue_struct *m_gc_workqueue;
+ 	struct workqueue_struct	*m_sync_workqueue;
+ 
+ 	int			m_bsize;	/* fs logical block size */
+diff --git a/fs/xfs/xfs_super.c b/fs/xfs/xfs_super.c
+index cb55e77ebc47..29c06a324442 100644
+--- a/fs/xfs/xfs_super.c
++++ b/fs/xfs/xfs_super.c
+@@ -520,10 +520,10 @@ xfs_init_mount_workqueues(
+ 	if (!mp->m_reclaim_workqueue)
+ 		goto out_destroy_cil;
+ 
+-	mp->m_blockgc_workqueue = alloc_workqueue("xfs-blockgc/%s",
++	mp->m_gc_workqueue = alloc_workqueue("xfs-gc/%s",
+ 			WQ_SYSFS | WQ_UNBOUND | WQ_FREEZABLE | WQ_MEM_RECLAIM,
+ 			0, mp->m_super->s_id);
+-	if (!mp->m_blockgc_workqueue)
++	if (!mp->m_gc_workqueue)
+ 		goto out_destroy_reclaim;
+ 
+ 	mp->m_sync_workqueue = alloc_workqueue("xfs-sync/%s",
+@@ -534,7 +534,7 @@ xfs_init_mount_workqueues(
+ 	return 0;
+ 
+ out_destroy_eofb:
+-	destroy_workqueue(mp->m_blockgc_workqueue);
++	destroy_workqueue(mp->m_gc_workqueue);
+ out_destroy_reclaim:
+ 	destroy_workqueue(mp->m_reclaim_workqueue);
+ out_destroy_cil:
+@@ -552,7 +552,7 @@ xfs_destroy_mount_workqueues(
+ 	struct xfs_mount	*mp)
+ {
+ 	destroy_workqueue(mp->m_sync_workqueue);
+-	destroy_workqueue(mp->m_blockgc_workqueue);
++	destroy_workqueue(mp->m_gc_workqueue);
+ 	destroy_workqueue(mp->m_reclaim_workqueue);
+ 	destroy_workqueue(mp->m_cil_workqueue);
+ 	destroy_workqueue(mp->m_unwritten_workqueue);
