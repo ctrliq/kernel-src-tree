@@ -1,0 +1,252 @@
+Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping"
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit af6b61d7ef58099c82d854395a0e002be6bd036c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/af6b61d7.failed
+
+This reverts commit 009a82f6437490c262584d65a14094a818bcb747.
+
+The ability to optimise here relies on compiler being able to optimise
+away tail calls to avoid stack overflows. Unfortunately, we are seeing
+reports of problems, so let's just revert.
+
+	Reported-by: Daniel Mack <daniel@zonque.org>
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit af6b61d7ef58099c82d854395a0e002be6bd036c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/clnt.c
+diff --cc net/sunrpc/clnt.c
+index 2b272ab9272e,1d0395ef62c9..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1750,21 -1764,73 +1750,52 @@@ rpc_xdr_encode(struct rpc_task *task
+  		     req->rq_rbuffer,
+  		     req->rq_rcvsize);
+  
+ -	req->rq_snd_buf.head[0].iov_len = 0;
+ -	xdr_init_encode(&xdr, &req->rq_snd_buf,
+ -			req->rq_snd_buf.head[0].iov_base, req);
+ -	if (rpc_encode_header(task, &xdr))
+ +	p = rpc_encode_header(task);
+ +	if (p == NULL) {
+ +		printk(KERN_INFO "RPC: couldn't encode RPC header, exit EIO\n");
+ +		rpc_exit(task, -EIO);
+  		return;
+ +	}
+  
+ -	task->tk_status = rpcauth_wrap_req(task, &xdr);
+ -}
+ -
+ -/*
+ - * 3.	Encode arguments of an RPC call
+ - */
+ -static void
+ -call_encode(struct rpc_task *task)
+ -{
+ -	if (!rpc_task_need_encode(task))
+ -		goto out;
+ -	dprint_status(task);
+ -	/* Encode here so that rpcsec_gss can use correct sequence number. */
+ -	rpc_xdr_encode(task);
+ -	/* Did the encode result in an error condition? */
+ -	if (task->tk_status != 0) {
+ -		/* Was the error nonfatal? */
+ -		switch (task->tk_status) {
+ -		case -EAGAIN:
+ -		case -ENOMEM:
+ -			rpc_delay(task, HZ >> 4);
+ -			break;
+ -		case -EKEYEXPIRED:
+ -			task->tk_action = call_refresh;
+ -			break;
+ -		default:
+ -			rpc_exit(task, task->tk_status);
+ -		}
+++<<<<<<< HEAD
+ +	encode = task->tk_msg.rpc_proc->p_encode;
+ +	if (encode == NULL)
+  		return;
+ -	} else {
+ -		xprt_request_prepare(task->tk_rqstp);
+ -	}
+  
+ +	task->tk_status = rpcauth_wrap_req(task, encode, req, p,
+ +			task->tk_msg.rpc_argp);
+ +	if (task->tk_status == 0)
+ +		set_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+++=======
++ 	/* Add task to reply queue before transmission to avoid races */
++ 	if (rpc_reply_expected(task))
++ 		xprt_request_enqueue_receive(task);
++ 	xprt_request_enqueue_transmit(task);
++ out:
++ 	task->tk_action = call_transmit;
++ 	/* Check that the connection is OK */
++ 	if (!xprt_bound(task->tk_xprt))
++ 		task->tk_action = call_bind;
++ 	else if (!xprt_connected(task->tk_xprt))
++ 		task->tk_action = call_connect;
++ }
++ 
++ /*
++  * Helpers to check if the task was already transmitted, and
++  * to take action when that is the case.
++  */
++ static bool
++ rpc_task_transmitted(struct rpc_task *task)
++ {
++ 	return !test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
++ }
++ 
++ static void
++ rpc_task_handle_transmitted(struct rpc_task *task)
++ {
++ 	xprt_end_transmit(task);
++ 	task->tk_action = call_transmit_status;
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  }
+  
+  /*
+@@@ -1775,14 -1841,24 +1806,27 @@@ call_bind(struct rpc_task *task
+  {
+  	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rpc_task_transmitted(task)) {
++ 		rpc_task_handle_transmitted(task);
++ 		return;
++ 	}
++ 
++ 	if (xprt_bound(xprt)) {
++ 		task->tk_action = call_connect;
++ 		return;
++ 	}
++ 
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  	dprint_status(task);
+  
+ -	task->tk_action = call_bind_status;
+ -	if (!xprt_prepare_transmit(task))
+ -		return;
+ -
+ -	task->tk_timeout = xprt->bind_timeout;
+ -	xprt->ops->rpcbind(task);
+ +	task->tk_action = call_connect;
+ +	if (!xprt_bound(xprt)) {
+ +		task->tk_action = call_bind_status;
+ +		task->tk_timeout = xprt->bind_timeout;
+ +		xprt->ops->rpcbind(task);
+ +	}
+  }
+  
+  /*
+@@@ -1871,6 -1955,16 +1915,19 @@@ call_connect(struct rpc_task *task
+  {
+  	struct rpc_xprt *xprt = task->tk_rqstp->rq_xprt;
+  
+++<<<<<<< HEAD
+++=======
++ 	if (rpc_task_transmitted(task)) {
++ 		rpc_task_handle_transmitted(task);
++ 		return;
++ 	}
++ 
++ 	if (xprt_connected(xprt)) {
++ 		task->tk_action = call_transmit;
++ 		return;
++ 	}
++ 
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  	dprintk("RPC: %5u call_connect xprt %p %s connected\n",
+  			task->tk_pid, xprt,
+  			(xprt_connected(xprt) ? "is" : "is not"));
+@@@ -1958,35 -2055,17 +2015,39 @@@ call_transmit(struct rpc_task *task
+  	dprint_status(task);
+  
+  	task->tk_action = call_transmit_status;
+ -	if (!xprt_prepare_transmit(task))
+ -		return;
+ -	task->tk_status = 0;
+ -	if (test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate)) {
+ -		if (!xprt_connected(task->tk_xprt)) {
+ -			task->tk_status = -ENOTCONN;
+ +	/* Encode here so that rpcsec_gss can use correct sequence number. */
+ +	if (rpc_task_need_encode(task)) {
+ +		rpc_xdr_encode(task);
+ +		/* Did the encode result in an error condition? */
+ +		if (task->tk_status != 0) {
+ +			/* Was the error nonfatal? */
+ +			if (task->tk_status == -EAGAIN)
+ +				rpc_delay(task, HZ >> 4);
+ +			else
+ +				rpc_exit(task, task->tk_status);
+  			return;
+  		}
+ -		xprt_transmit(task);
+  	}
+++<<<<<<< HEAD
+ +	if (!xprt_prepare_transmit(task))
+ +		return;
+ +	xprt_transmit(task);
+ +	if (task->tk_status < 0)
+ +		return;
+ +	if (is_retrans)
+ +		task->tk_client->cl_stats->rpcretrans++;
+ +	/*
+ +	 * On success, ensure that we call xprt_end_transmit() before sleeping
+ +	 * in order to allow access to the socket to other RPC requests.
+ +	 */
+ +	call_transmit_status(task);
+ +	if (rpc_reply_expected(task))
+ +		return;
+ +	task->tk_action = rpc_exit_task;
+ +	rpc_wake_up_queued_task(&task->tk_rqstp->rq_xprt->pending, task);
+++=======
++ 	xprt_end_transmit(task);
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  }
+  
+  /*
+@@@ -2001,8 -2080,9 +2062,14 @@@ call_transmit_status(struct rpc_task *t
+  	 * Common case: success.  Force the compiler to put this
+  	 * test first.
+  	 */
+++<<<<<<< HEAD
+ +	if (task->tk_status == 0) {
+ +		xprt_end_transmit(task);
+++=======
++ 	if (rpc_task_transmitted(task)) {
++ 		if (task->tk_status == 0)
++ 			xprt_request_wait_receive(task);
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  		return;
+  	}
+  
+@@@ -2055,6 -2134,17 +2122,19 @@@
+  }
+  
+  #if defined(CONFIG_SUNRPC_BACKCHANNEL)
+++<<<<<<< HEAD
+++=======
++ static void call_bc_transmit(struct rpc_task *task);
++ static void call_bc_transmit_status(struct rpc_task *task);
++ 
++ static void
++ call_bc_encode(struct rpc_task *task)
++ {
++ 	xprt_request_enqueue_transmit(task);
++ 	task->tk_action = call_bc_transmit;
++ }
++ 
+++>>>>>>> af6b61d7ef58 (Revert "SUNRPC: Micro-optimise when the task is known not to be sleeping")
+  /*
+   * 5b.	Send the backchannel RPC reply.  On error, drop the reply.  In
+   * addition, disconnect on connectivity errors.
+* Unmerged path net/sunrpc/clnt.c
