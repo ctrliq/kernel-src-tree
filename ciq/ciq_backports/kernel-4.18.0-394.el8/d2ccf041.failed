@@ -1,0 +1,227 @@
+RDMA/rxe: Remove key'ed object support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit d2ccf0411d253433409278cd517a091a5b7b613e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/d2ccf041.failed
+
+Now that rxe_mcast.c has it's own red-black tree support there is no
+longer any requirement for key'ed objects in rxe pools. This patch removes
+the key APIs and related code.
+
+Link: https://lore.kernel.org/r/20220208211644.123457-7-rpearsonhpe@gmail.com
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit d2ccf0411d253433409278cd517a091a5b7b613e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+#	drivers/infiniband/sw/rxe/rxe_pool.h
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index e7b233608b61,940c8eeab8fd..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -157,11 -145,6 +155,14 @@@ int rxe_pool_init
+  			goto out;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (rxe_type_info[type].flags & RXE_POOL_KEY) {
+ +		pool->key.key_offset = rxe_type_info[type].key_offset;
+ +		pool->key.key_size = rxe_type_info[type].key_size;
+ +	}
+ +
+++=======
+++>>>>>>> d2ccf0411d25 (RDMA/rxe: Remove key'ed object support)
+  out:
+  	return err;
+  }
+@@@ -217,79 -201,7 +218,83 @@@ static int rxe_insert_index(struct rxe_
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int rxe_insert_key(struct rxe_pool *pool, struct rxe_pool_entry *new)
+ +{
+ +	struct rb_node **link = &pool->key.tree.rb_node;
+ +	struct rb_node *parent = NULL;
+ +	struct rxe_pool_entry *elem;
+ +	int cmp;
+ +
+ +	while (*link) {
+ +		parent = *link;
+ +		elem = rb_entry(parent, struct rxe_pool_entry, key_node);
+ +
+ +		cmp = memcmp((u8 *)elem + pool->key.key_offset,
+ +			     (u8 *)new + pool->key.key_offset, pool->key.key_size);
+ +
+ +		if (cmp == 0) {
+ +			pr_warn("key already exists!\n");
+ +			return -EINVAL;
+ +		}
+ +
+ +		if (cmp > 0)
+ +			link = &(*link)->rb_left;
+ +		else
+ +			link = &(*link)->rb_right;
+ +	}
+ +
+ +	rb_link_node(&new->key_node, parent, link);
+ +	rb_insert_color(&new->key_node, &pool->key.tree);
+ +
+ +	return 0;
+ +}
+ +
+ +int __rxe_add_key_locked(struct rxe_pool_entry *elem, void *key)
+ +{
+ +	struct rxe_pool *pool = elem->pool;
+ +	int err;
+ +
+ +	memcpy((u8 *)elem + pool->key.key_offset, key, pool->key.key_size);
+ +	err = rxe_insert_key(pool, elem);
+ +
+ +	return err;
+ +}
+ +
+ +int __rxe_add_key(struct rxe_pool_entry *elem, void *key)
+ +{
+ +	struct rxe_pool *pool = elem->pool;
+ +	unsigned long flags;
+ +	int err;
+ +
+ +	write_lock_irqsave(&pool->pool_lock, flags);
+ +	err = __rxe_add_key_locked(elem, key);
+ +	write_unlock_irqrestore(&pool->pool_lock, flags);
+ +
+ +	return err;
+ +}
+ +
+ +void __rxe_drop_key_locked(struct rxe_pool_entry *elem)
+ +{
+ +	struct rxe_pool *pool = elem->pool;
+ +
+ +	rb_erase(&elem->key_node, &pool->key.tree);
+ +}
+ +
+ +void __rxe_drop_key(struct rxe_pool_entry *elem)
+ +{
+ +	struct rxe_pool *pool = elem->pool;
+ +	unsigned long flags;
+ +
+ +	write_lock_irqsave(&pool->pool_lock, flags);
+ +	__rxe_drop_key_locked(elem);
+ +	write_unlock_irqrestore(&pool->pool_lock, flags);
+ +}
+ +
+ +int __rxe_add_index_locked(struct rxe_pool_entry *elem)
+++=======
++ int __rxe_add_index_locked(struct rxe_pool_elem *elem)
+++>>>>>>> d2ccf0411d25 (RDMA/rxe: Remove key'ed object support)
+  {
+  	struct rxe_pool *pool = elem->pool;
+  	int err;
+@@@ -456,49 -367,3 +461,52 @@@ void *rxe_pool_get_index(struct rxe_poo
+  
+  	return obj;
+  }
+++<<<<<<< HEAD
+ +
+ +void *rxe_pool_get_key_locked(struct rxe_pool *pool, void *key)
+ +{
+ +	const struct rxe_type_info *info = &rxe_type_info[pool->type];
+ +	struct rb_node *node;
+ +	struct rxe_pool_entry *elem;
+ +	u8 *obj;
+ +	int cmp;
+ +
+ +	node = pool->key.tree.rb_node;
+ +
+ +	while (node) {
+ +		elem = rb_entry(node, struct rxe_pool_entry, key_node);
+ +
+ +		cmp = memcmp((u8 *)elem + pool->key.key_offset,
+ +			     key, pool->key.key_size);
+ +
+ +		if (cmp > 0)
+ +			node = node->rb_left;
+ +		else if (cmp < 0)
+ +			node = node->rb_right;
+ +		else
+ +			break;
+ +	}
+ +
+ +	if (node) {
+ +		kref_get(&elem->ref_cnt);
+ +		obj = (u8 *)elem - info->elem_offset;
+ +	} else {
+ +		obj = NULL;
+ +	}
+ +
+ +	return obj;
+ +}
+ +
+ +void *rxe_pool_get_key(struct rxe_pool *pool, void *key)
+ +{
+ +	u8 *obj;
+ +	unsigned long flags;
+ +
+ +	read_lock_irqsave(&pool->pool_lock, flags);
+ +	obj = rxe_pool_get_key_locked(pool, key);
+ +	read_unlock_irqrestore(&pool->pool_lock, flags);
+ +
+ +	return obj;
+ +}
+++=======
+++>>>>>>> d2ccf0411d25 (RDMA/rxe: Remove key'ed object support)
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.h
+index 837585fdbc34,2db9d9872cd1..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@@ -104,34 -93,14 +93,37 @@@ int __rxe_add_index(struct rxe_pool_ent
+  /* drop an index and remove object from rb tree
+   * holding and not holding the pool_lock
+   */
+ -void __rxe_drop_index_locked(struct rxe_pool_elem *elem);
+ +void __rxe_drop_index_locked(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_index_locked(obj) __rxe_drop_index_locked(&(obj)->pelem)
+  
+ -#define rxe_drop_index_locked(obj) __rxe_drop_index_locked(&(obj)->elem)
+ +void __rxe_drop_index(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_index(obj) __rxe_drop_index(&(obj)->pelem)
+ +
+++<<<<<<< HEAD
+ +/* assign a key to a keyed object and insert object into
+ + * pool's rb tree holding and not holding pool_lock
+ + */
+ +int __rxe_add_key_locked(struct rxe_pool_entry *elem, void *key);
+  
+ -void __rxe_drop_index(struct rxe_pool_elem *elem);
+ +#define rxe_add_key_locked(obj, key) __rxe_add_key_locked(&(obj)->pelem, key)
+  
+ -#define rxe_drop_index(obj) __rxe_drop_index(&(obj)->elem)
+ +int __rxe_add_key(struct rxe_pool_entry *elem, void *key);
+  
+ +#define rxe_add_key(obj, key) __rxe_add_key(&(obj)->pelem, key)
+ +
+ +/* remove elem from rb tree holding and not holding the pool_lock */
+ +void __rxe_drop_key_locked(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_key_locked(obj) __rxe_drop_key_locked(&(obj)->pelem)
+ +
+ +void __rxe_drop_key(struct rxe_pool_entry *elem);
+ +
+ +#define rxe_drop_key(obj) __rxe_drop_key(&(obj)->pelem)
+ +
+++=======
+++>>>>>>> d2ccf0411d25 (RDMA/rxe: Remove key'ed object support)
+  /* lookup an indexed object from index holding and not holding the pool_lock.
+   * takes a reference on object
+   */
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.h
