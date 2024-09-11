@@ -1,0 +1,208 @@
+KVM: Take mmu_lock when handling MMU notifier iff the hva hits a memslot
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 8931a454aea03bab21b3b8fcdc94f674eebd1c5d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8931a454.failed
+
+Defer acquiring mmu_lock in the MMU notifier paths until a "hit" has been
+detected in the memslots, i.e. don't take the lock for notifications that
+don't affect the guest.
+
+For small VMs, spurious locking is a minor annoyance.  And for "volatile"
+setups where the majority of notifications _are_ relevant, this barely
+qualifies as an optimization.
+
+But, for large VMs (hundreds of threads) with static setups, e.g. no
+page migration, no swapping, etc..., the vast majority of MMU notifier
+callbacks will be unrelated to the guest, e.g. will often be in response
+to the userspace VMM adjusting its own virtual address space.  In such
+large VMs, acquiring mmu_lock can be painful as it blocks vCPUs from
+handling page faults.  In some scenarios it can even be "fatal" in the
+sense that it causes unacceptable brownouts, e.g. when rebuilding huge
+pages after live migration, a significant percentage of vCPUs will be
+attempting to handle page faults.
+
+x86's TDP MMU implementation is especially susceptible to spurious
+locking due it taking mmu_lock for read when handling page faults.
+Because rwlock is fair, a single writer will stall future readers, while
+the writer is itself stalled waiting for in-progress readers to complete.
+This is exacerbated by the MMU notifiers often firing multiple times in
+quick succession, e.g. moving a page will (always?) invoke three separate
+notifiers: .invalidate_range_start(), invalidate_range_end(), and
+.change_pte().  Unnecessarily taking mmu_lock each time means even a
+single spurious sequence can be problematic.
+
+Note, this optimizes only the unpaired callbacks.  Optimizing the
+.invalidate_range_{start,end}() pairs is more complex and will be done in
+a future patch.
+
+	Suggested-by: Ben Gardon <bgardon@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+Message-Id: <20210402005658.3024832-9-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8931a454aea03bab21b3b8fcdc94f674eebd1c5d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	virt/kvm/kvm_main.c
+diff --cc virt/kvm/kvm_main.c
+index 6f04c4e5e88c,529cff1050d7..000000000000
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@@ -482,6 -451,148 +482,151 @@@ static void kvm_mmu_notifier_invalidate
+  	srcu_read_unlock(&kvm->srcu, idx);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ typedef bool (*hva_handler_t)(struct kvm *kvm, struct kvm_gfn_range *range);
++ 
++ typedef void (*on_lock_fn_t)(struct kvm *kvm, unsigned long start,
++ 			     unsigned long end);
++ 
++ struct kvm_hva_range {
++ 	unsigned long start;
++ 	unsigned long end;
++ 	pte_t pte;
++ 	hva_handler_t handler;
++ 	on_lock_fn_t on_lock;
++ 	bool flush_on_ret;
++ 	bool may_block;
++ };
++ 
++ /*
++  * Use a dedicated stub instead of NULL to indicate that there is no callback
++  * function/handler.  The compiler technically can't guarantee that a real
++  * function will have a non-zero address, and so it will generate code to
++  * check for !NULL, whereas comparing against a stub will be elided at compile
++  * time (unless the compiler is getting long in the tooth, e.g. gcc 4.9).
++  */
++ static void kvm_null_fn(void)
++ {
++ 
++ }
++ #define IS_KVM_NULL_FN(fn) ((fn) == (void *)kvm_null_fn)
++ 
++ static __always_inline int __kvm_handle_hva_range(struct kvm *kvm,
++ 						  const struct kvm_hva_range *range)
++ {
++ 	bool ret = false, locked = false;
++ 	struct kvm_gfn_range gfn_range;
++ 	struct kvm_memory_slot *slot;
++ 	struct kvm_memslots *slots;
++ 	int i, idx;
++ 
++ 	/* A null handler is allowed if and only if on_lock() is provided. */
++ 	if (WARN_ON_ONCE(IS_KVM_NULL_FN(range->on_lock) &&
++ 			 IS_KVM_NULL_FN(range->handler)))
++ 		return 0;
++ 
++ 	idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	/* The on_lock() path does not yet support lock elision. */
++ 	if (!IS_KVM_NULL_FN(range->on_lock)) {
++ 		locked = true;
++ 		KVM_MMU_LOCK(kvm);
++ 
++ 		range->on_lock(kvm, range->start, range->end);
++ 
++ 		if (IS_KVM_NULL_FN(range->handler))
++ 			goto out_unlock;
++ 	}
++ 
++ 	for (i = 0; i < KVM_ADDRESS_SPACE_NUM; i++) {
++ 		slots = __kvm_memslots(kvm, i);
++ 		kvm_for_each_memslot(slot, slots) {
++ 			unsigned long hva_start, hva_end;
++ 
++ 			hva_start = max(range->start, slot->userspace_addr);
++ 			hva_end = min(range->end, slot->userspace_addr +
++ 						  (slot->npages << PAGE_SHIFT));
++ 			if (hva_start >= hva_end)
++ 				continue;
++ 
++ 			/*
++ 			 * To optimize for the likely case where the address
++ 			 * range is covered by zero or one memslots, don't
++ 			 * bother making these conditional (to avoid writes on
++ 			 * the second or later invocation of the handler).
++ 			 */
++ 			gfn_range.pte = range->pte;
++ 			gfn_range.may_block = range->may_block;
++ 
++ 			/*
++ 			 * {gfn(page) | page intersects with [hva_start, hva_end)} =
++ 			 * {gfn_start, gfn_start+1, ..., gfn_end-1}.
++ 			 */
++ 			gfn_range.start = hva_to_gfn_memslot(hva_start, slot);
++ 			gfn_range.end = hva_to_gfn_memslot(hva_end + PAGE_SIZE - 1, slot);
++ 			gfn_range.slot = slot;
++ 
++ 			if (!locked) {
++ 				locked = true;
++ 				KVM_MMU_LOCK(kvm);
++ 			}
++ 			ret |= range->handler(kvm, &gfn_range);
++ 		}
++ 	}
++ 
++ 	if (range->flush_on_ret && (ret || kvm->tlbs_dirty))
++ 		kvm_flush_remote_tlbs(kvm);
++ 
++ out_unlock:
++ 	if (locked)
++ 		KVM_MMU_UNLOCK(kvm);
++ 
++ 	srcu_read_unlock(&kvm->srcu, idx);
++ 
++ 	/* The notifiers are averse to booleans. :-( */
++ 	return (int)ret;
++ }
++ 
++ static __always_inline int kvm_handle_hva_range(struct mmu_notifier *mn,
++ 						unsigned long start,
++ 						unsigned long end,
++ 						pte_t pte,
++ 						hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= pte,
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= true,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
++ 
++ static __always_inline int kvm_handle_hva_range_no_flush(struct mmu_notifier *mn,
++ 							 unsigned long start,
++ 							 unsigned long end,
++ 							 hva_handler_t handler)
++ {
++ 	struct kvm *kvm = mmu_notifier_to_kvm(mn);
++ 	const struct kvm_hva_range range = {
++ 		.start		= start,
++ 		.end		= end,
++ 		.pte		= __pte(0),
++ 		.handler	= handler,
++ 		.on_lock	= (void *)kvm_null_fn,
++ 		.flush_on_ret	= false,
++ 		.may_block	= false,
++ 	};
++ 
++ 	return __kvm_handle_hva_range(kvm, &range);
++ }
+++>>>>>>> 8931a454aea0 (KVM: Take mmu_lock when handling MMU notifier iff the hva hits a memslot)
+  static void kvm_mmu_notifier_change_pte(struct mmu_notifier *mn,
+  					struct mm_struct *mm,
+  					unsigned long address,
+* Unmerged path virt/kvm/kvm_main.c
