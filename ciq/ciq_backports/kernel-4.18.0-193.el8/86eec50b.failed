@@ -1,0 +1,172 @@
+net/mlx5: Support querying max VFs from device
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: Support querying max VFs from device (Alaa Hleihel) [1724336]
+Rebuild_FUZZ: 95.45%
+commit-author Bodong Wang <bodong@mellanox.com>
+commit 86eec50beaf3a45f6432d491072fa5c54284dbca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/86eec50b.failed
+
+For ECPF with eswitch manager privilege, query the host max VF count
+by querying the device using query_functions command.
+
+With this enhancement:
+1. flow steering entries are created only for valid vports based on
+   the max VF count of the PF.
+2. Driver only queries cap of valid vport.
+
+Eswitch requires the max VFs when doing initialization, so do sr-iov
+init before eswitch init.
+
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 86eec50beaf3a45f6432d491072fa5c54284dbca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/main.c
+#	include/linux/mlx5/driver.h
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/main.c
+index ea5e5990b832,720f65bfe6a9..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@@ -892,22 -844,22 +892,40 @@@ static int mlx5_init_once(struct mlx5_c
+  		goto err_rl_cleanup;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = mlx5_eswitch_init(dev);
+ +	if (err) {
+ +		dev_err(&pdev->dev, "Failed to init eswitch %d\n", err);
+ +		goto err_mpfs_cleanup;
+ +	}
+ +
+ +	err = mlx5_sriov_init(dev);
+ +	if (err) {
+ +		dev_err(&pdev->dev, "Failed to init sriov %d\n", err);
+ +		goto err_eswitch_cleanup;
+++=======
++ 	err = mlx5_sriov_init(dev);
++ 	if (err) {
++ 		mlx5_core_err(dev, "Failed to init sriov %d\n", err);
++ 		goto err_mpfs_cleanup;
++ 	}
++ 
++ 	err = mlx5_eswitch_init(dev);
++ 	if (err) {
++ 		mlx5_core_err(dev, "Failed to init eswitch %d\n", err);
++ 		goto err_sriov_cleanup;
+++>>>>>>> 86eec50beaf3 (net/mlx5: Support querying max VFs from device)
+  	}
+  
+  	err = mlx5_fpga_init(dev);
+  	if (err) {
+++<<<<<<< HEAD
+ +		dev_err(&pdev->dev, "Failed to init fpga device %d\n", err);
+ +		goto err_sriov_cleanup;
+++=======
++ 		mlx5_core_err(dev, "Failed to init fpga device %d\n", err);
++ 		goto err_eswitch_cleanup;
+++>>>>>>> 86eec50beaf3 (net/mlx5: Support querying max VFs from device)
+  	}
+  
+  	dev->tracer = mlx5_fw_tracer_create(dev);
+@@@ -942,11 -893,10 +960,11 @@@ static void mlx5_cleanup_once(struct ml
+  {
+  	mlx5_fw_tracer_destroy(dev->tracer);
+  	mlx5_fpga_cleanup(dev);
+- 	mlx5_sriov_cleanup(dev);
+  	mlx5_eswitch_cleanup(dev->priv.eswitch);
++ 	mlx5_sriov_cleanup(dev);
+  	mlx5_mpfs_cleanup(dev);
+  	mlx5_cleanup_rl_table(dev);
+ +	mlx5_geneve_destroy(dev->geneve);
+  	mlx5_vxlan_destroy(dev->vxlan);
+  	mlx5_cleanup_clock(dev);
+  	mlx5_cleanup_reserved_gids(dev);
+diff --cc include/linux/mlx5/driver.h
+index 655e39273378,64155fe201ee..000000000000
+--- a/include/linux/mlx5/driver.h
++++ b/include/linux/mlx5/driver.h
+@@@ -1094,13 -1099,14 +1095,18 @@@ static inline bool mlx5_core_is_ecpf_es
+  	return dev->caps.embedded_cpu && MLX5_CAP_GEN(dev, eswitch_manager);
+  }
+  
+++<<<<<<< HEAD
+ +#define MLX5_HOST_PF_MAX_VFS	(127u)
+++=======
++ static inline bool mlx5_ecpf_vport_exists(struct mlx5_core_dev *dev)
++ {
++ 	return mlx5_core_is_pf(dev) && MLX5_CAP_ESW(dev, ecpf_vport_exists);
++ }
++ 
+++>>>>>>> 86eec50beaf3 (net/mlx5: Support querying max VFs from device)
+  static inline u16 mlx5_core_max_vfs(struct mlx5_core_dev *dev)
+  {
+- 	if (mlx5_core_is_ecpf_esw_manager(dev))
+- 		return MLX5_HOST_PF_MAX_VFS;
+- 	else
+- 		return pci_sriov_get_totalvfs(dev->pdev);
++ 	return dev->priv.sriov.max_vfs;
+  }
+  
+  static inline int mlx5_get_gid_table_len(u16 param)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+index a249b3c3843d..2eecb831c499 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sriov.c
+@@ -208,6 +208,27 @@ void mlx5_sriov_detach(struct mlx5_core_dev *dev)
+ 	mlx5_device_disable_sriov(dev);
+ }
+ 
++static u16 mlx5_get_max_vfs(struct mlx5_core_dev *dev)
++{
++	u32 out[MLX5_ST_SZ_DW(query_esw_functions_out)] = {};
++	u16 host_total_vfs;
++	int err;
++
++	if (mlx5_core_is_ecpf_esw_manager(dev)) {
++		err = mlx5_esw_query_functions(dev, out, sizeof(out));
++		host_total_vfs = MLX5_GET(query_esw_functions_out, out,
++					  host_params_context.host_total_vfs);
++
++		/* Old FW doesn't support getting total_vfs from esw func
++		 * but supports getting it from pci_sriov.
++		 */
++		if (!err && host_total_vfs)
++			return host_total_vfs;
++	}
++
++	return pci_sriov_get_totalvfs(dev->pdev);
++}
++
+ int mlx5_sriov_init(struct mlx5_core_dev *dev)
+ {
+ 	struct mlx5_core_sriov *sriov = &dev->priv.sriov;
+@@ -218,6 +239,7 @@ int mlx5_sriov_init(struct mlx5_core_dev *dev)
+ 		return 0;
+ 
+ 	total_vfs = pci_sriov_get_totalvfs(pdev);
++	sriov->max_vfs = mlx5_get_max_vfs(dev);
+ 	sriov->num_vfs = pci_num_vf(pdev);
+ 	sriov->vfs_ctx = kcalloc(total_vfs, sizeof(*sriov->vfs_ctx), GFP_KERNEL);
+ 	if (!sriov->vfs_ctx)
+* Unmerged path include/linux/mlx5/driver.h
+diff --git a/include/linux/mlx5/mlx5_ifc.h b/include/linux/mlx5/mlx5_ifc.h
+index 4c1b5622ece1..8426d8ee37a0 100644
+--- a/include/linux/mlx5/mlx5_ifc.h
++++ b/include/linux/mlx5/mlx5_ifc.h
+@@ -9708,7 +9708,7 @@ struct mlx5_ifc_host_params_context_bits {
+ 	u8         reserved_at_8[0x8];
+ 	u8         host_num_of_vfs[0x10];
+ 
+-	u8         reserved_at_20[0x10];
++	u8         host_total_vfs[0x10];
+ 	u8         host_pci_bus[0x10];
+ 
+ 	u8         reserved_at_40[0x10];
