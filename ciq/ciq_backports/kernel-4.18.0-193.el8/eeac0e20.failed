@@ -1,0 +1,290 @@
+s390/qeth: collect accurate TX statistics
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit eeac0e20a173dd9407e7092b3ddb45917249d68d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/eeac0e20.failed
+
+This consolidates the SW statistics code, and improves it to
+(1) account for the header overhead of each segment on a TSO skb,
+(2) count dangling packets as in-error (during eg. shutdown), and
+(3) only count offloads when the skb was successfully transmitted.
+
+We also count each segment of an TSO skb as one packet - except for
+tx_dropped, to be consistent with dev->tx_dropped.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit eeac0e20a173dd9407e7092b3ddb45917249d68d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_l2_main.c
+#	drivers/s390/net/qeth_l3_main.c
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,d7a15a88bdba..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -70,16 -71,9 +70,16 @@@ static void qeth_free_qdio_queues(struc
+  static void qeth_notify_skbs(struct qeth_qdio_out_q *queue,
+  		struct qeth_qdio_out_buffer *buf,
+  		enum iucv_tx_notify notification);
+- static void qeth_release_skbs(struct qeth_qdio_out_buffer *buf);
++ static void qeth_tx_complete_buf(struct qeth_qdio_out_buffer *buf, bool error);
+  static int qeth_init_qdio_out_buf(struct qeth_qdio_out_q *, int);
+  
+ +int qeth_card_hw_is_reachable(struct qeth_card *card)
+ +{
+ +	return (card->state == CARD_STATE_SOFTSETUP) ||
+ +		(card->state == CARD_STATE_UP);
+ +}
+ +EXPORT_SYMBOL_GPL(qeth_card_hw_is_reachable);
+ +
+  static void qeth_close_dev_handler(struct work_struct *work)
+  {
+  	struct qeth_card *card;
+@@@ -1208,9 -1129,9 +1237,9 @@@ static void qeth_clear_output_buffer(st
+  	if (buf->buffer->element[0].sflags & SBAL_SFLAGS0_PCI_REQ)
+  		atomic_dec(&queue->set_pci_flags_count);
+  
+- 	qeth_release_skbs(buf);
++ 	qeth_tx_complete_buf(buf, error);
+  
+ -	for (i = 0; i < queue->max_elements; ++i) {
+ +	for (i = 0; i < QETH_MAX_BUFFER_ELEMENTS(queue->card); ++i) {
+  		if (buf->buffer->element[i].addr && buf->is_header[i])
+  			kmem_cache_free(qeth_core_header_cache,
+  				buf->buffer->element[i].addr);
+@@@ -3410,7 -3269,6 +3439,10 @@@ static void qeth_flush_buffers(struct q
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	netif_trans_update(queue->card->dev);
+++=======
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  	qdio_flags = QDIO_FLAG_SYNC_OUTPUT;
+  	if (atomic_read(&queue->set_pci_flags_count))
+  		qdio_flags |= QDIO_FLAG_PCI_OUT;
+@@@ -3418,7 -3275,6 +3450,10 @@@
+  	rc = do_QDIO(CARD_DDEV(queue->card), qdio_flags,
+  		     queue->queue_no, index, count);
+  	if (rc) {
+++<<<<<<< HEAD
+ +		queue->card->stats.tx_errors += count;
+++=======
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  		/* ignore temporary SIGA errors without busy condition */
+  		if (rc == -ENOBUFS)
+  			return;
+@@@ -4117,23 -4007,9 +4150,29 @@@ int qeth_xmit(struct qeth_card *card, s
+  					 hd_len, elements);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!rc) {
+ +		if (card->options.performance_stats) {
+ +			card->perf_stats.buf_elements_sent += elements;
+ +			if (is_sg)
+ +				card->perf_stats.sg_skbs_sent++;
+ +			if (is_tso) {
+ +				card->perf_stats.large_send_bytes += frame_len;
+ +				card->perf_stats.large_send_cnt++;
+ +			}
+ +		}
+ +	} else {
+ +		if (!push_len)
+ +			kmem_cache_free(qeth_core_header_cache, hdr);
+ +		if (rc == -EBUSY)
+ +			/* roll back to ETH header */
+ +			skb_pull(skb, push_len);
+ +	}
+++=======
++ 	if (rc && !push_len)
++ 		kmem_cache_free(qeth_core_header_cache, hdr);
++ 
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  	return rc;
+  }
+  EXPORT_SYMBOL_GPL(qeth_xmit);
+diff --cc drivers/s390/net/qeth_l2_main.c
+index 26cbbcb6463c,b8799cd3e7aa..000000000000
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@@ -186,11 -175,8 +186,14 @@@ static void qeth_l2_fill_header(struct 
+  		hdr->hdr.l2.id = QETH_HEADER_TYPE_L2_TSO;
+  	} else {
+  		hdr->hdr.l2.id = QETH_HEADER_TYPE_LAYER2;
+- 		if (skb->ip_summed == CHECKSUM_PARTIAL) {
++ 		if (skb->ip_summed == CHECKSUM_PARTIAL)
+  			qeth_tx_csum(skb, &hdr->hdr.l2.flags[1], ipv);
+++<<<<<<< HEAD
+ +			if (card->options.performance_stats)
+ +				card->perf_stats.tx_csum++;
+ +		}
+++=======
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  	}
+  
+  	/* set byte byte 3 to casting flags */
+@@@ -601,39 -584,27 +604,51 @@@ static netdev_tx_t qeth_l2_hard_start_x
+  					   struct net_device *dev)
+  {
+  	struct qeth_card *card = dev->ml_priv;
+ -	u16 txq = skb_get_queue_mapping(skb);
+ +	int cast_type = qeth_l2_get_cast_type(card, skb);
+ +	int ipv = qeth_get_ip_version(skb);
+  	struct qeth_qdio_out_q *queue;
+- 	int tx_bytes = skb->len;
+  	int rc;
+  
+++<<<<<<< HEAD
+ +	if (card->state != CARD_STATE_UP) {
+ +		card->stats.tx_carrier_errors++;
+ +		goto tx_drop;
+ +	}
+ +
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+++=======
++ 	if (!skb_is_gso(skb))
++ 		qdisc_skb_cb(skb)->pkt_len = skb->len;
++ 	if (IS_IQD(card))
++ 		txq = qeth_iqd_translate_txq(dev, txq);
++ 	queue = card->qdio.out_qs[txq];
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  
+  	if (IS_OSN(card))
+  		rc = qeth_l2_xmit_osn(card, skb, queue);
+  	else
+ -		rc = qeth_xmit(card, skb, queue, qeth_get_ip_version(skb),
+ +		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+  			       qeth_l2_fill_header);
+  
+++<<<<<<< HEAD
+ +	if (!rc) {
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+ +		return NETDEV_TX_OK;
+ +	} else if (rc == -EBUSY) {
+ +		return NETDEV_TX_BUSY;
+ +	} /* else fall through */
+++=======
++ 	if (!rc)
++ 		return NETDEV_TX_OK;
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +tx_drop:
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+ +	netif_wake_queue(dev);
+  	return NETDEV_TX_OK;
+  }
+  
+diff --cc drivers/s390/net/qeth_l3_main.c
+index 0e3a2d122884,d7bfc7a0e4c0..000000000000
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@@ -1958,8 -1957,6 +1958,11 @@@ static void qeth_l3_fill_header(struct 
+  			/* some HW requires combined L3+L4 csum offload: */
+  			if (ipv == 4)
+  				hdr->hdr.l3.ext_flags |= QETH_HDR_EXT_CSUM_HDR_REQ;
+++<<<<<<< HEAD
+ +			if (card->options.performance_stats)
+ +				card->perf_stats.tx_csum++;
+++=======
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  		}
+  	}
+  
+@@@ -2048,52 -2039,42 +2051,58 @@@ static int qeth_l3_xmit(struct qeth_car
+  static netdev_tx_t qeth_l3_hard_start_xmit(struct sk_buff *skb,
+  					   struct net_device *dev)
+  {
+ +	int cast_type = qeth_l3_get_cast_type(skb);
+  	struct qeth_card *card = dev->ml_priv;
+ -	u16 txq = skb_get_queue_mapping(skb);
+  	int ipv = qeth_get_ip_version(skb);
+  	struct qeth_qdio_out_q *queue;
+- 	int tx_bytes = skb->len;
+  	int rc;
+  
++ 	if (!skb_is_gso(skb))
++ 		qdisc_skb_cb(skb)->pkt_len = skb->len;
+  	if (IS_IQD(card)) {
+ -		queue = card->qdio.out_qs[qeth_iqd_translate_txq(dev, txq)];
+ -
+  		if (card->options.sniffer)
+  			goto tx_drop;
+  		if ((card->options.cq != QETH_CQ_ENABLED && !ipv) ||
+  		    (card->options.cq == QETH_CQ_ENABLED &&
+  		     skb->protocol != htons(ETH_P_AF_IUCV)))
+  			goto tx_drop;
+ -	} else {
+ -		queue = card->qdio.out_qs[txq];
+  	}
+  
+ -	if (!(dev->flags & IFF_BROADCAST) &&
+ -	    qeth_l3_get_cast_type(skb) == RTN_BROADCAST)
+ +	if (card->state != CARD_STATE_UP) {
+ +		card->stats.tx_carrier_errors++;
+  		goto tx_drop;
+ +	}
+ +
+ +	if (cast_type == RTN_BROADCAST && !card->info.broadcast_capable)
+ +		goto tx_drop;
+ +
+ +	queue = qeth_get_tx_queue(card, skb, ipv, cast_type);
+ +	netif_stop_queue(dev);
+  
+  	if (ipv == 4 || IS_IQD(card))
+ -		rc = qeth_l3_xmit(card, skb, queue, ipv);
+ +		rc = qeth_l3_xmit(card, skb, queue, ipv, cast_type);
+  	else
+ -		rc = qeth_xmit(card, skb, queue, ipv, qeth_l3_fill_header);
+ +		rc = qeth_xmit(card, skb, queue, ipv, cast_type,
+ +			       qeth_l3_fill_header);
+  
+++<<<<<<< HEAD
+ +	if (!rc) {
+ +		card->stats.tx_packets++;
+ +		card->stats.tx_bytes += tx_bytes;
+ +		netif_wake_queue(dev);
+ +		return NETDEV_TX_OK;
+ +	} else if (rc == -EBUSY) {
+ +		return NETDEV_TX_BUSY;
+ +	} /* else fall through */
+++=======
++ 	if (!rc)
++ 		return NETDEV_TX_OK;
+++>>>>>>> eeac0e20a173 (s390/qeth: collect accurate TX statistics)
+  
+  tx_drop:
+ -	QETH_TXQ_STAT_INC(queue, tx_dropped);
+ +	card->stats.tx_dropped++;
+  	kfree_skb(skb);
+ +	netif_wake_queue(dev);
+  	return NETDEV_TX_OK;
+  }
+  
+diff --git a/drivers/s390/net/qeth_core.h b/drivers/s390/net/qeth_core.h
+index dcbcb3b4d38f..38721a408765 100644
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@ -28,6 +28,7 @@
+ #include <net/ipv6.h>
+ #include <net/if_inet6.h>
+ #include <net/addrconf.h>
++#include <net/sch_generic.h>
+ #include <net/tcp.h>
+ 
+ #include <asm/debug.h>
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_l2_main.c
+* Unmerged path drivers/s390/net/qeth_l3_main.c
