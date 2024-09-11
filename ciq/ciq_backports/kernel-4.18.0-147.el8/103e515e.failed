@@ -1,0 +1,197 @@
+nvme: add a numa_node field to struct nvme_ctrl
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Hannes Reinecke <hare@suse.com>
+commit 103e515efa89be33d04e45aae82de136f0c49865
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/103e515e.failed
+
+Instead of directly poking into the struct device add a new numa_node
+field to struct nvme_ctrl.  This allows fabrics drivers where ctrl->dev
+is a virtual device to support NUMA affinity as well.
+
+Also expose the field as a sysfs attribute, and populate it for the
+RDMA and FC transports.
+
+	Signed-off-by: Hannes Reinecke <hare@suse.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 103e515efa89be33d04e45aae82de136f0c49865)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/multipath.c
+diff --cc drivers/nvme/host/multipath.c
+index 1b128a2a399e,183ec17ba067..000000000000
+--- a/drivers/nvme/host/multipath.c
++++ b/drivers/nvme/host/multipath.c
+@@@ -68,14 -108,56 +68,38 @@@ void nvme_kick_requeue_lists(struct nvm
+  	up_read(&ctrl->namespaces_rwsem);
+  }
+  
+ -static const char *nvme_ana_state_names[] = {
+ -	[0]				= "invalid state",
+ -	[NVME_ANA_OPTIMIZED]		= "optimized",
+ -	[NVME_ANA_NONOPTIMIZED]		= "non-optimized",
+ -	[NVME_ANA_INACCESSIBLE]		= "inaccessible",
+ -	[NVME_ANA_PERSISTENT_LOSS]	= "persistent-loss",
+ -	[NVME_ANA_CHANGE]		= "change",
+ -};
+ -
+ -void nvme_mpath_clear_current_path(struct nvme_ns *ns)
+ +static struct nvme_ns *__nvme_find_path(struct nvme_ns_head *head)
+  {
+ -	struct nvme_ns_head *head = ns->head;
+ -	int node;
+ -
+ -	if (!head)
+ -		return;
+ -
+ -	for_each_node(node) {
+ -		if (ns == rcu_access_pointer(head->current_path[node]))
+ -			rcu_assign_pointer(head->current_path[node], NULL);
+ -	}
+ -}
+ -
+ -static struct nvme_ns *__nvme_find_path(struct nvme_ns_head *head, int node)
+ -{
+ -	int found_distance = INT_MAX, fallback_distance = INT_MAX, distance;
+ -	struct nvme_ns *found = NULL, *fallback = NULL, *ns;
+ +	struct nvme_ns *ns;
+  
+  	list_for_each_entry_rcu(ns, &head->list, siblings) {
+++<<<<<<< HEAD
+ +		if (ns->ctrl->state == NVME_CTRL_LIVE) {
+ +			rcu_assign_pointer(head->current_path, ns);
+ +			return ns;
+++=======
++ 		if (ns->ctrl->state != NVME_CTRL_LIVE ||
++ 		    test_bit(NVME_NS_ANA_PENDING, &ns->flags))
++ 			continue;
++ 
++ 		distance = node_distance(node, ns->ctrl->numa_node);
++ 
++ 		switch (ns->ana_state) {
++ 		case NVME_ANA_OPTIMIZED:
++ 			if (distance < found_distance) {
++ 				found_distance = distance;
++ 				found = ns;
++ 			}
++ 			break;
++ 		case NVME_ANA_NONOPTIMIZED:
++ 			if (distance < fallback_distance) {
++ 				fallback_distance = distance;
++ 				fallback = ns;
++ 			}
++ 			break;
++ 		default:
++ 			break;
+++>>>>>>> 103e515efa89 (nvme: add a numa_node field to struct nvme_ctrl)
+  		}
+  	}
+  
+diff --git a/drivers/nvme/host/core.c b/drivers/nvme/host/core.c
+index 4726c694b7b8..b067cb93d4ca 100644
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@ -2754,6 +2754,7 @@ static ssize_t  field##_show(struct device *dev,				\
+ static DEVICE_ATTR(field, S_IRUGO, field##_show, NULL);
+ 
+ nvme_show_int_function(cntlid);
++nvme_show_int_function(numa_node);
+ 
+ static ssize_t nvme_sysfs_delete(struct device *dev,
+ 				struct device_attribute *attr, const char *buf,
+@@ -2833,6 +2834,7 @@ static struct attribute *nvme_dev_attrs[] = {
+ 	&dev_attr_subsysnqn.attr,
+ 	&dev_attr_address.attr,
+ 	&dev_attr_state.attr,
++	&dev_attr_numa_node.attr,
+ 	NULL
+ };
+ 
+@@ -3038,7 +3040,7 @@ static void nvme_alloc_ns(struct nvme_ctrl *ctrl, unsigned nsid)
+ 	struct gendisk *disk;
+ 	struct nvme_id_ns *id;
+ 	char disk_name[DISK_NAME_LEN];
+-	int node = dev_to_node(ctrl->dev), flags = GENHD_FL_EXT_DEVT;
++	int node = ctrl->numa_node, flags = GENHD_FL_EXT_DEVT;
+ 
+ 	ns = kzalloc_node(sizeof(*ns), GFP_KERNEL, node);
+ 	if (!ns)
+diff --git a/drivers/nvme/host/fc.c b/drivers/nvme/host/fc.c
+index e3c6c1d895d9..b35d15da1380 100644
+--- a/drivers/nvme/host/fc.c
++++ b/drivers/nvme/host/fc.c
+@@ -2424,7 +2424,7 @@ nvme_fc_create_io_queues(struct nvme_fc_ctrl *ctrl)
+ 	ctrl->tag_set.ops = &nvme_fc_mq_ops;
+ 	ctrl->tag_set.queue_depth = ctrl->ctrl.opts->queue_size;
+ 	ctrl->tag_set.reserved_tags = 1; /* fabric connect */
+-	ctrl->tag_set.numa_node = NUMA_NO_NODE;
++	ctrl->tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->tag_set.flags = BLK_MQ_F_SHOULD_MERGE;
+ 	ctrl->tag_set.cmd_size =
+ 		struct_size((struct nvme_fcp_op_w_sgl *)NULL, priv,
+@@ -3029,6 +3029,7 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 
+ 	ctrl->ctrl.opts = opts;
+ 	ctrl->ctrl.nr_reconnects = 0;
++	ctrl->ctrl.numa_node = dev_to_node(lport->dev);
+ 	INIT_LIST_HEAD(&ctrl->ctrl_list);
+ 	ctrl->lport = lport;
+ 	ctrl->rport = rport;
+@@ -3069,7 +3070,7 @@ nvme_fc_init_ctrl(struct device *dev, struct nvmf_ctrl_options *opts,
+ 	ctrl->admin_tag_set.ops = &nvme_fc_admin_mq_ops;
+ 	ctrl->admin_tag_set.queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+ 	ctrl->admin_tag_set.reserved_tags = 2; /* fabric connect + Keep-Alive */
+-	ctrl->admin_tag_set.numa_node = NUMA_NO_NODE;
++	ctrl->admin_tag_set.numa_node = ctrl->ctrl.numa_node;
+ 	ctrl->admin_tag_set.cmd_size =
+ 		struct_size((struct nvme_fcp_op_w_sgl *)NULL, priv,
+ 			    ctrl->lport->ops->fcprqst_priv_sz);
+* Unmerged path drivers/nvme/host/multipath.c
+diff --git a/drivers/nvme/host/nvme.h b/drivers/nvme/host/nvme.h
+index 43c5bb60abbc..35e7ec2cd7f1 100644
+--- a/drivers/nvme/host/nvme.h
++++ b/drivers/nvme/host/nvme.h
+@@ -147,6 +147,7 @@ struct nvme_ctrl {
+ 	struct request_queue *connect_q;
+ 	struct device *dev;
+ 	int instance;
++	int numa_node;
+ 	struct blk_mq_tag_set *tagset;
+ 	struct blk_mq_tag_set *admin_tagset;
+ 	struct list_head namespaces;
+diff --git a/drivers/nvme/host/rdma.c b/drivers/nvme/host/rdma.c
+index 4efc59f726f4..28d10457ac2c 100644
+--- a/drivers/nvme/host/rdma.c
++++ b/drivers/nvme/host/rdma.c
+@@ -687,7 +687,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		set->ops = &nvme_rdma_admin_mq_ops;
+ 		set->queue_depth = NVME_AQ_MQ_TAG_DEPTH;
+ 		set->reserved_tags = 2; /* connect + keep-alive */
+-		set->numa_node = NUMA_NO_NODE;
++		set->numa_node = nctrl->numa_node;
+ 		set->cmd_size = sizeof(struct nvme_rdma_request) +
+ 			SG_CHUNK_SIZE * sizeof(struct scatterlist);
+ 		set->driver_data = ctrl;
+@@ -700,7 +700,7 @@ static struct blk_mq_tag_set *nvme_rdma_alloc_tagset(struct nvme_ctrl *nctrl,
+ 		set->ops = &nvme_rdma_mq_ops;
+ 		set->queue_depth = nctrl->sqsize + 1;
+ 		set->reserved_tags = 1; /* fabric connect */
+-		set->numa_node = NUMA_NO_NODE;
++		set->numa_node = nctrl->numa_node;
+ 		set->flags = BLK_MQ_F_SHOULD_MERGE;
+ 		set->cmd_size = sizeof(struct nvme_rdma_request) +
+ 			SG_CHUNK_SIZE * sizeof(struct scatterlist);
+@@ -756,6 +756,7 @@ static int nvme_rdma_configure_admin_queue(struct nvme_rdma_ctrl *ctrl,
+ 		return error;
+ 
+ 	ctrl->device = ctrl->queues[0].device;
++	ctrl->ctrl.numa_node = dev_to_node(ctrl->device->dev->dma_device);
+ 
+ 	ctrl->max_fr_pages = nvme_rdma_get_max_fr_pages(ctrl->device->dev);
+ 
