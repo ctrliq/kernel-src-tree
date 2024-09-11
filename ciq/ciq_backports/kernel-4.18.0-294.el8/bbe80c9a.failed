@@ -1,0 +1,209 @@
+usb: typec: altmode: Remove the notification chain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Heikki Krogerus <heikki.krogerus@linux.intel.com>
+commit bbe80c9a89b868e98ef0710cb03ee68dd78a4d8d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bbe80c9a.failed
+
+Using the generic notification chain is not reasonable with
+the alternate modes because it would require dependencies
+between the drivers of the components that need the
+notifications, and the typec drivers.
+
+There are no users for the alternate mode notifications, so
+removing the chain and the API for it completely.
+
+	Signed-off-by: Heikki Krogerus <heikki.krogerus@linux.intel.com>
+Link: https://lore.kernel.org/r/20200211112531.86510-6-heikki.krogerus@linux.intel.com
+	Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+(cherry picked from commit bbe80c9a89b868e98ef0710cb03ee68dd78a4d8d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/typec/bus.c
+#	drivers/usb/typec/class.c
+diff --cc drivers/usb/typec/bus.c
+index e78c8a68c745,c823122f9cb7..000000000000
+--- a/drivers/usb/typec/bus.c
++++ b/drivers/usb/typec/bus.c
+@@@ -22,14 -33,7 +22,17 @@@ static int typec_altmode_set_state(stru
+  
+  	port_altmode = is_port ? to_altmode(adev) : to_altmode(adev)->partner;
+  
+++<<<<<<< HEAD
+ +	ret = typec_altmode_set_mux(port_altmode, state);
+ +	if (ret)
+ +		return ret;
+ +
+ +	blocking_notifier_call_chain(&port_altmode->nh, state, NULL);
+ +
+ +	return 0;
+++=======
++ 	return typec_altmode_set_mux(port_altmode, conf, data);
+++>>>>>>> bbe80c9a89b8 (usb: typec: altmode: Remove the notification chain)
+  }
+  
+  /* -------------------------------------------------------------------------- */
+diff --cc drivers/usb/typec/class.c
+index 6950a47b63c6,12be5bb6d32c..000000000000
+--- a/drivers/usb/typec/class.c
++++ b/drivers/usb/typec/class.c
+@@@ -206,75 -206,6 +206,78 @@@ static void typec_altmode_put_partner(s
+  	put_device(&adev->dev);
+  }
+  
+++<<<<<<< HEAD
+ +static int typec_port_fwnode_match(struct device *dev, const void *fwnode)
+ +{
+ +	return dev_fwnode(dev) == fwnode;
+ +}
+ +
+ +static void *typec_port_match(struct device_connection *con, int ep, void *data)
+ +{
+ +	struct device *dev;
+ +
+ +	/*
+ +	 * FIXME: Check does the fwnode supports the requested SVID. If it does
+ +	 * we need to return ERR_PTR(-PROBE_DEFER) when there is no device.
+ +	 */
+ +	if (con->fwnode)
+ +		return class_find_device(typec_class, NULL, con->fwnode,
+ +					 typec_port_fwnode_match);
+ +
+ +	dev = class_find_device_by_name(typec_class, con->endpoint[ep]);
+ +
+ +	return dev ? dev : ERR_PTR(-EPROBE_DEFER);
+ +}
+ +
+ +struct typec_altmode *
+ +typec_altmode_register_notifier(struct device *dev, u16 svid, u8 mode,
+ +				struct notifier_block *nb)
+ +{
+ +	struct typec_device_id id = { svid, mode, };
+ +	struct device *altmode_dev;
+ +	struct device *port_dev;
+ +	struct altmode *altmode;
+ +	int ret;
+ +
+ +	/* Find the port linked to the caller */
+ +	port_dev = device_connection_find_match(dev, NULL, NULL,
+ +						typec_port_match);
+ +	if (IS_ERR_OR_NULL(port_dev))
+ +		return port_dev ? ERR_CAST(port_dev) : ERR_PTR(-ENODEV);
+ +
+ +	/* Find the altmode with matching svid */
+ +	altmode_dev = device_find_child(port_dev, &id, altmode_match);
+ +
+ +	put_device(port_dev);
+ +
+ +	if (!altmode_dev)
+ +		return ERR_PTR(-ENODEV);
+ +
+ +	altmode = to_altmode(to_typec_altmode(altmode_dev));
+ +
+ +	/* Register notifier */
+ +	ret = blocking_notifier_chain_register(&altmode->nh, nb);
+ +	if (ret) {
+ +		put_device(altmode_dev);
+ +		return ERR_PTR(ret);
+ +	}
+ +
+ +	return &altmode->adev;
+ +}
+ +EXPORT_SYMBOL_GPL(typec_altmode_register_notifier);
+ +
+ +void typec_altmode_unregister_notifier(struct typec_altmode *adev,
+ +				       struct notifier_block *nb)
+ +{
+ +	struct altmode *altmode = to_altmode(adev);
+ +
+ +	blocking_notifier_chain_unregister(&altmode->nh, nb);
+ +	put_device(&adev->dev);
+ +}
+ +EXPORT_SYMBOL_GPL(typec_altmode_unregister_notifier);
+ +
+++=======
+++>>>>>>> bbe80c9a89b8 (usb: typec: altmode: Remove the notification chain)
+  /**
+   * typec_altmode_update_active - Report Enter/Exit mode
+   * @adev: Handle to the alternate mode
+diff --git a/Documentation/driver-api/usb/typec_bus.rst b/Documentation/driver-api/usb/typec_bus.rst
+index f47a69bff498..03dfa9c018b7 100644
+--- a/Documentation/driver-api/usb/typec_bus.rst
++++ b/Documentation/driver-api/usb/typec_bus.rst
+@@ -53,9 +53,7 @@ in need to reconfigure the pins on the connector, the alternate mode driver
+ needs to notify the bus using :c:func:`typec_altmode_notify()`. The driver
+ passes the negotiated SVID specific pin configuration value to the function as
+ parameter. The bus driver will then configure the mux behind the connector using
+-that value as the state value for the mux, and also call blocking notification
+-chain to notify the external drivers about the state of the connector that need
+-to know it.
++that value as the state value for the mux.
+ 
+ NOTE: The SVID specific pin configuration values must always start from
+ ``TYPEC_STATE_MODAL``. USB Type-C specification defines two default states for
+@@ -80,19 +78,6 @@ Helper macro ``TYPEC_MODAL_STATE()`` can also be used::
+ #define ALTMODEX_CONF_A = TYPEC_MODAL_STATE(0);
+ #define ALTMODEX_CONF_B = TYPEC_MODAL_STATE(1);
+ 
+-Notification chain
+-~~~~~~~~~~~~~~~~~~
+-
+-The drivers for the components that the alternate modes are designed for need to
+-get details regarding the results of the negotiation with the partner, and the
+-pin configuration of the connector. In case of DisplayPort alternate mode for
+-example, the GPU drivers will need to know those details. In case of
+-Thunderbolt alternate mode, the thunderbolt drivers will need to know them, and
+-so on.
+-
+-The notification chain is designed for this purpose. The drivers can register
+-notifiers with :c:func:`typec_altmode_register_notifier()`.
+-
+ Cable plug alternate modes
+ ~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+@@ -129,8 +114,3 @@ Cable Plug operations
+ 
+ .. kernel-doc:: drivers/usb/typec/bus.c
+    :functions: typec_altmode_get_plug typec_altmode_put_plug
+-
+-Notifications
+-~~~~~~~~~~~~~
+-.. kernel-doc:: drivers/usb/typec/class.c
+-   :functions: typec_altmode_register_notifier typec_altmode_unregister_notifier
+* Unmerged path drivers/usb/typec/bus.c
+diff --git a/drivers/usb/typec/bus.h b/drivers/usb/typec/bus.h
+index db40e61d8b72..9962e91e8a1a 100644
+--- a/drivers/usb/typec/bus.h
++++ b/drivers/usb/typec/bus.h
+@@ -22,8 +22,6 @@ struct altmode {
+ 
+ 	struct altmode			*partner;
+ 	struct altmode			*plug[2];
+-
+-	struct blocking_notifier_head	nh;
+ };
+ 
+ #define to_altmode(d) container_of(d, struct altmode, adev)
+* Unmerged path drivers/usb/typec/class.c
+diff --git a/include/linux/usb/typec_altmode.h b/include/linux/usb/typec_altmode.h
+index 923ff3af0628..d834e236c6df 100644
+--- a/include/linux/usb/typec_altmode.h
++++ b/include/linux/usb/typec_altmode.h
+@@ -126,13 +126,6 @@ void typec_altmode_put_plug(struct typec_altmode *plug);
+ struct typec_altmode *typec_match_altmode(struct typec_altmode **altmodes,
+ 					  size_t n, u16 svid, u8 mode);
+ 
+-struct typec_altmode *
+-typec_altmode_register_notifier(struct device *dev, u16 svid, u8 mode,
+-				struct notifier_block *nb);
+-
+-void typec_altmode_unregister_notifier(struct typec_altmode *adev,
+-				       struct notifier_block *nb);
+-
+ /**
+  * typec_altmode_get_orientation - Get cable plug orientation
+  * altmode: Handle to the alternate mode
