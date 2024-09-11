@@ -1,0 +1,66 @@
+tipc: fix retransmission on unicast links
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+commit a34f829164f3c70d7f53bb532ddcc39fa890b722
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a34f8291.failed
+
+A scenario has been observed where a 'bc_init' message for a link is not
+retransmitted if it fails to be received by the peer. This leads to the
+peer never establishing the link fully and it discarding all other data
+received on the link. In this scenario the message is lost in transit to
+the peer.
+
+The issue is traced to the 'nxt_retr' field of the skb not being
+initialised for links that aren't a bc_sndlink. This leads to the
+comparison in tipc_link_advance_transmq() that gates whether to attempt
+retransmission of a message performing in an undesirable way.
+Depending on the relative value of 'jiffies', this comparison:
+    time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr)
+may return true or false given that 'nxt_retr' remains at the
+uninitialised value of 0 for non bc_sndlinks.
+
+This is most noticeable shortly after boot when jiffies is initialised
+to a high value (to flush out rollover bugs) and we compare a jiffies of,
+say, 4294940189 to zero. In that case time_before returns 'true' leading
+to the skb not being retransmitted.
+
+The fix is to ensure that all skbs have a valid 'nxt_retr' time set for
+them and this is achieved by refactoring the setting of this value into
+a central function.
+With this fix, transmission losses of 'bc_init' messages do not stall
+the link establishment forever because the 'bc_init' message is
+retransmitted and the link eventually establishes correctly.
+
+Fixes: 382f598fb66b ("tipc: reduce duplicate packets for unicast traffic")
+	Acked-by: Jon Maloy <jmaloy@redhat.com>
+	Signed-off-by: Hamish Martin <hamish.martin@alliedtelesis.co.nz>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a34f829164f3c70d7f53bb532ddcc39fa890b722)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tipc/link.c
+diff --cc net/tipc/link.c
+index 91be69d1779e,263d950e70e9..000000000000
+--- a/net/tipc/link.c
++++ b/net/tipc/link.c
+@@@ -1429,9 -1595,8 +1440,14 @@@ next_gap_ack
+  			/* retransmit skb if unrestricted*/
+  			if (time_before(jiffies, TIPC_SKB_CB(skb)->nxt_retr))
+  				continue;
+++<<<<<<< HEAD
+ +			TIPC_SKB_CB(skb)->nxt_retr = TIPC_UC_RETR_TIME;
+ +			_skb = __pskb_copy(skb, LL_MAX_HEADER + MIN_H_SIZE,
+ +					   GFP_ATOMIC);
+++=======
++ 			tipc_link_set_skb_retransmit_time(skb, l);
++ 			_skb = pskb_copy(skb, GFP_ATOMIC);
+++>>>>>>> a34f829164f3 (tipc: fix retransmission on unicast links)
+  			if (!_skb)
+  				continue;
+  			hdr = buf_msg(_skb);
+* Unmerged path net/tipc/link.c
