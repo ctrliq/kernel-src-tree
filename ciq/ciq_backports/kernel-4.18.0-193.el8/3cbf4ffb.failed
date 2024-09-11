@@ -1,0 +1,221 @@
+net: plumb network namespace into __skb_flow_dissect
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] plumb network namespace into __skb_flow_dissect (Jiri Benc) [1749814]
+Rebuild_FUZZ: 94.95%
+commit-author Stanislav Fomichev <sdf@google.com>
+commit 3cbf4ffba5eeec60f82868a5facc1962d8a44d00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/3cbf4ffb.failed
+
+This new argument will be used in the next patches for the
+eth_get_headlen use case. eth_get_headlen calls flow dissector
+with only data (without skb) so there is currently no way to
+pull attached BPF flow dissector program. With this new argument,
+we can amend the callers to explicitly pass network namespace
+so we can use attached BPF program.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 3cbf4ffba5eeec60f82868a5facc1962d8a44d00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/skbuff.h
+#	net/core/flow_dissector.c
+diff --cc include/linux/skbuff.h
+index 9f40de2e11fc,b466fbface2e..000000000000
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@@ -1266,7 -1275,17 +1266,21 @@@ static inline int skb_flow_dissector_bp
+  }
+  #endif
+  
+++<<<<<<< HEAD
+ +bool __skb_flow_dissect(const struct sk_buff *skb,
+++=======
++ struct bpf_flow_dissector;
++ bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
++ 		      __be16 proto, int nhoff, int hlen);
++ 
++ struct bpf_flow_keys;
++ bool __skb_flow_bpf_dissect(struct bpf_prog *prog,
++ 			    const struct sk_buff *skb,
++ 			    struct flow_dissector *flow_dissector,
++ 			    struct bpf_flow_keys *flow_keys);
++ bool __skb_flow_dissect(const struct net *net,
++ 			const struct sk_buff *skb,
+++>>>>>>> 3cbf4ffba5ee (net: plumb network namespace into __skb_flow_dissect)
+  			struct flow_dissector *flow_dissector,
+  			void *target_container,
+  			void *data, __be16 proto, int nhoff, int hlen,
+@@@ -2485,10 -2494,9 +2500,11 @@@ static inline void skb_probe_transport_
+  	if (skb_transport_header_was_set(skb))
+  		return;
+  
+- 	if (skb_flow_dissect_flow_keys_basic(skb, &keys, NULL, 0, 0, 0, 0))
++ 	if (skb_flow_dissect_flow_keys_basic(NULL, skb, &keys,
++ 					     NULL, 0, 0, 0, 0))
+  		skb_set_transport_header(skb, keys.control.thoff);
+ +	else if (offset_hint >= 0)
+ +		skb_set_transport_header(skb, offset_hint);
+  }
+  
+  static inline void skb_mac_header_rebuild(struct sk_buff *skb)
+diff --cc net/core/flow_dissector.c
+index 2a5c7afc694d,f32c7e737fc6..000000000000
+--- a/net/core/flow_dissector.c
++++ b/net/core/flow_dissector.c
+@@@ -782,8 -683,46 +782,9 @@@ static void __skb_flow_bpf_to_target(co
+  	}
+  }
+  
+ -bool __skb_flow_bpf_dissect(struct bpf_prog *prog,
+ -			    const struct sk_buff *skb,
+ -			    struct flow_dissector *flow_dissector,
+ -			    struct bpf_flow_keys *flow_keys)
+ -{
+ -	struct bpf_flow_dissector ctx = {
+ -		.flow_keys = flow_keys,
+ -		.skb = skb,
+ -		.data = skb->data,
+ -		.data_end = skb->data + skb_headlen(skb),
+ -	};
+ -
+ -	return bpf_flow_dissect(prog, &ctx, skb->protocol,
+ -				skb_network_offset(skb), skb_headlen(skb));
+ -}
+ -
+ -bool bpf_flow_dissect(struct bpf_prog *prog, struct bpf_flow_dissector *ctx,
+ -		      __be16 proto, int nhoff, int hlen)
+ -{
+ -	struct bpf_flow_keys *flow_keys = ctx->flow_keys;
+ -	u32 result;
+ -
+ -	/* Pass parameters to the BPF program */
+ -	memset(flow_keys, 0, sizeof(*flow_keys));
+ -	flow_keys->n_proto = proto;
+ -	flow_keys->nhoff = nhoff;
+ -	flow_keys->thoff = flow_keys->nhoff;
+ -
+ -	result = BPF_PROG_RUN(prog, ctx);
+ -
+ -	flow_keys->nhoff = clamp_t(u16, flow_keys->nhoff, nhoff, hlen);
+ -	flow_keys->thoff = clamp_t(u16, flow_keys->thoff,
+ -				   flow_keys->nhoff, hlen);
+ -
+ -	return result == BPF_OK;
+ -}
+ -
+  /**
+   * __skb_flow_dissect - extract the flow_keys struct and return it
++  * @net: associated network namespace, derived from @skb if NULL
+   * @skb: sk_buff to extract the flow from, can be NULL if the rest are specified
+   * @flow_dissector: list of keys to dissect
+   * @target_container: target structure to put dissected values into
+@@@ -855,55 -794,34 +857,84 @@@ bool __skb_flow_dissect(const struct ne
+  					      FLOW_DISSECTOR_KEY_BASIC,
+  					      target_container);
+  
+ +	rcu_read_lock();
+  	if (skb) {
+++<<<<<<< HEAD
+ +		if (skb->dev)
+ +			attached = rcu_dereference(dev_net(skb->dev)->flow_dissector_prog);
+ +		else if (skb->sk)
+ +			attached = rcu_dereference(sock_net(skb->sk)->flow_dissector_prog);
+ +		else
+ +			WARN_ON_ONCE(1);
+++=======
++ 		struct bpf_flow_keys flow_keys;
++ 		struct bpf_prog *attached = NULL;
++ 
++ 		rcu_read_lock();
++ 		if (!net) {
++ 			if (skb->dev)
++ 				net = dev_net(skb->dev);
++ 			else if (skb->sk)
++ 				net = sock_net(skb->sk);
++ 			else
++ 				WARN_ON_ONCE(1);
++ 		}
++ 
++ 		if (net)
++ 			attached = rcu_dereference(net->flow_dissector_prog);
++ 
++ 		if (attached) {
++ 			ret = __skb_flow_bpf_dissect(attached, skb,
++ 						     flow_dissector,
++ 						     &flow_keys);
++ 			__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
++ 						 target_container);
++ 			rcu_read_unlock();
++ 			return ret;
++ 		}
++ 		rcu_read_unlock();
+++>>>>>>> 3cbf4ffba5ee (net: plumb network namespace into __skb_flow_dissect)
+ +	}
+ +	if (attached) {
+ +		/* Note that even though the const qualifier is discarded
+ +		 * throughout the execution of the BPF program, all changes(the
+ +		 * control block) are reverted after the BPF program returns.
+ +		 * Therefore, __skb_flow_dissect does not alter the skb.
+ +		 */
+ +		struct bpf_flow_keys flow_keys = {};
+ +		struct bpf_skb_data_end cb_saved;
+ +		struct bpf_skb_data_end *cb;
+ +		u32 result;
+ +
+ +		cb = (struct bpf_skb_data_end *)skb->cb;
+ +
+ +		/* Save Control Block */
+ +		memcpy(&cb_saved, cb, sizeof(cb_saved));
+ +		memset(cb, 0, sizeof(cb_saved));
+ +
+ +		/* Pass parameters to the BPF program */
+ +		cb->qdisc_cb.flow_keys = &flow_keys;
+ +		flow_keys.nhoff = nhoff;
+ +		flow_keys.thoff = nhoff;
+ +
+ +		bpf_compute_data_pointers((struct sk_buff *)skb);
+ +		preempt_disable();
+ +		result = BPF_PROG_RUN(attached, skb);
+ +		preempt_enable();
+ +
+ +		/* Restore state */
+ +		memcpy(cb, &cb_saved, sizeof(cb_saved));
+ +
+ +		flow_keys.nhoff = clamp_t(u16, flow_keys.nhoff, 0, skb->len);
+ +		flow_keys.thoff = clamp_t(u16, flow_keys.thoff,
+ +					  flow_keys.nhoff, skb->len);
+ +
+ +		__skb_flow_bpf_to_target(&flow_keys, flow_dissector,
+ +					 target_container);
+ +		rcu_read_unlock();
+ +		return result == BPF_OK;
+  	}
+ +	rcu_read_unlock();
+  
+  	if (dissector_uses_key(flow_dissector,
+  			       FLOW_DISSECTOR_KEY_ETH_ADDRS)) {
+* Unmerged path include/linux/skbuff.h
+* Unmerged path net/core/flow_dissector.c
+diff --git a/net/ethernet/eth.c b/net/ethernet/eth.c
+index ee28440f57c5..39522dbc70e2 100644
+--- a/net/ethernet/eth.c
++++ b/net/ethernet/eth.c
+@@ -135,8 +135,9 @@ u32 eth_get_headlen(void *data, unsigned int len)
+ 		return len;
+ 
+ 	/* parse any remaining L2/L3 headers, check for L4 */
+-	if (!skb_flow_dissect_flow_keys_basic(NULL, &keys, data, eth->h_proto,
+-					      sizeof(*eth), len, flags))
++	if (!skb_flow_dissect_flow_keys_basic(NULL, NULL, &keys, data,
++					      eth->h_proto, sizeof(*eth),
++					      len, flags))
+ 		return max_t(u32, keys.control.thoff, sizeof(*eth));
+ 
+ 	/* parse for any L4 headers */
