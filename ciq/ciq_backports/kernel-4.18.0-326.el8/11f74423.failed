@@ -1,0 +1,150 @@
+xfs: support inode btree blockcounts in online repair
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Darrick J. Wong <darrick.wong@oracle.com>
+commit 11f744234f052922db4ed77dad35862b3d3164cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/11f74423.failed
+
+Add the necessary bits to the online repair code to support logging the
+inode btree counters when rebuilding the btrees, and to support fixing
+the counters when rebuilding the AGI.
+
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+(cherry picked from commit 11f744234f052922db4ed77dad35862b3d3164cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_ialloc_btree.c
+diff --cc fs/xfs/libxfs/xfs_ialloc_btree.c
+index 6a9431e8343e,cc919a2ee870..000000000000
+--- a/fs/xfs/libxfs/xfs_ialloc_btree.c
++++ b/fs/xfs/libxfs/xfs_ialloc_btree.c
+@@@ -460,6 -453,81 +460,84 @@@ xfs_inobt_init_cursor
+  	return cur;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* Create an inode btree cursor. */
++ struct xfs_btree_cur *
++ xfs_inobt_init_cursor(
++ 	struct xfs_mount	*mp,
++ 	struct xfs_trans	*tp,
++ 	struct xfs_buf		*agbp,
++ 	xfs_agnumber_t		agno,
++ 	xfs_btnum_t		btnum)
++ {
++ 	struct xfs_btree_cur	*cur;
++ 	struct xfs_agi		*agi = agbp->b_addr;
++ 
++ 	cur = xfs_inobt_init_common(mp, tp, agno, btnum);
++ 	if (btnum == XFS_BTNUM_INO)
++ 		cur->bc_nlevels = be32_to_cpu(agi->agi_level);
++ 	else
++ 		cur->bc_nlevels = be32_to_cpu(agi->agi_free_level);
++ 	cur->bc_ag.agbp = agbp;
++ 	return cur;
++ }
++ 
++ /* Create an inode btree cursor with a fake root for staging. */
++ struct xfs_btree_cur *
++ xfs_inobt_stage_cursor(
++ 	struct xfs_mount	*mp,
++ 	struct xbtree_afakeroot	*afake,
++ 	xfs_agnumber_t		agno,
++ 	xfs_btnum_t		btnum)
++ {
++ 	struct xfs_btree_cur	*cur;
++ 
++ 	cur = xfs_inobt_init_common(mp, NULL, agno, btnum);
++ 	xfs_btree_stage_afakeroot(cur, afake);
++ 	return cur;
++ }
++ 
++ /*
++  * Install a new inobt btree root.  Caller is responsible for invalidating
++  * and freeing the old btree blocks.
++  */
++ void
++ xfs_inobt_commit_staged_btree(
++ 	struct xfs_btree_cur	*cur,
++ 	struct xfs_trans	*tp,
++ 	struct xfs_buf		*agbp)
++ {
++ 	struct xfs_agi		*agi = agbp->b_addr;
++ 	struct xbtree_afakeroot	*afake = cur->bc_ag.afake;
++ 	int			fields;
++ 
++ 	ASSERT(cur->bc_flags & XFS_BTREE_STAGING);
++ 
++ 	if (cur->bc_btnum == XFS_BTNUM_INO) {
++ 		fields = XFS_AGI_ROOT | XFS_AGI_LEVEL;
++ 		agi->agi_root = cpu_to_be32(afake->af_root);
++ 		agi->agi_level = cpu_to_be32(afake->af_levels);
++ 		if (xfs_sb_version_hasinobtcounts(&cur->bc_mp->m_sb)) {
++ 			agi->agi_iblocks = cpu_to_be32(afake->af_blocks);
++ 			fields |= XFS_AGI_IBLOCKS;
++ 		}
++ 		xfs_ialloc_log_agi(tp, agbp, fields);
++ 		xfs_btree_commit_afakeroot(cur, tp, agbp, &xfs_inobt_ops);
++ 	} else {
++ 		fields = XFS_AGI_FREE_ROOT | XFS_AGI_FREE_LEVEL;
++ 		agi->agi_free_root = cpu_to_be32(afake->af_root);
++ 		agi->agi_free_level = cpu_to_be32(afake->af_levels);
++ 		if (xfs_sb_version_hasinobtcounts(&cur->bc_mp->m_sb)) {
++ 			agi->agi_fblocks = cpu_to_be32(afake->af_blocks);
++ 			fields |= XFS_AGI_IBLOCKS;
++ 		}
++ 		xfs_ialloc_log_agi(tp, agbp, fields);
++ 		xfs_btree_commit_afakeroot(cur, tp, agbp, &xfs_finobt_ops);
++ 	}
++ }
++ 
+++>>>>>>> 11f744234f05 (xfs: support inode btree blockcounts in online repair)
+  /*
+   * Calculate number of records in an inobt btree block.
+   */
+* Unmerged path fs/xfs/libxfs/xfs_ialloc_btree.c
+diff --git a/fs/xfs/scrub/agheader_repair.c b/fs/xfs/scrub/agheader_repair.c
+index af941f18924c..f5e2aa0984cf 100644
+--- a/fs/xfs/scrub/agheader_repair.c
++++ b/fs/xfs/scrub/agheader_repair.c
+@@ -810,10 +810,34 @@ xrep_agi_calc_from_btrees(
+ 	error = xfs_ialloc_count_inodes(cur, &count, &freecount);
+ 	if (error)
+ 		goto err;
++	if (xfs_sb_version_hasinobtcounts(&mp->m_sb)) {
++		xfs_agblock_t	blocks;
++
++		error = xfs_btree_count_blocks(cur, &blocks);
++		if (error)
++			goto err;
++		agi->agi_iblocks = cpu_to_be32(blocks);
++	}
+ 	xfs_btree_del_cursor(cur, error);
+ 
+ 	agi->agi_count = cpu_to_be32(count);
+ 	agi->agi_freecount = cpu_to_be32(freecount);
++
++	if (xfs_sb_version_hasfinobt(&mp->m_sb) &&
++	    xfs_sb_version_hasinobtcounts(&mp->m_sb)) {
++		xfs_agblock_t	blocks;
++
++		cur = xfs_inobt_init_cursor(mp, sc->tp, agi_bp, sc->sa.agno,
++				XFS_BTNUM_FINO);
++		if (error)
++			goto err;
++		error = xfs_btree_count_blocks(cur, &blocks);
++		if (error)
++			goto err;
++		xfs_btree_del_cursor(cur, error);
++		agi->agi_fblocks = cpu_to_be32(blocks);
++	}
++
+ 	return 0;
+ err:
+ 	xfs_btree_del_cursor(cur, error);
