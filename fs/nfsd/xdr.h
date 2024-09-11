@@ -103,6 +103,7 @@ struct nfsd_readres {
 	struct svc_fh		fh;
 	unsigned long		count;
 	struct kstat		stat;
+	struct page		**pages;
 };
 
 struct nfsd_readdirres {
