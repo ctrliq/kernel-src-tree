@@ -1,0 +1,91 @@
+mm, slub: do initial checks in ___slab_alloc() with irqs enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Vlastimil Babka <vbabka@suse.cz>
+commit 0b303fb402862dcb7948eeeed2439bd8c99948b5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0b303fb4.failed
+
+As another step of shortening irq disabled sections in ___slab_alloc(), delay
+disabling irqs until we pass the initial checks if there is a cached percpu
+slab and it's suitable for our allocation.
+
+Now we have to recheck c->page after actually disabling irqs as an allocation
+in irq handler might have replaced it.
+
+Because we call pfmemalloc_match() as one of the checks, we might hit
+VM_BUG_ON_PAGE(!PageSlab(page)) in PageSlabPfmemalloc in case we get
+interrupted and the page is freed. Thus introduce a pfmemalloc_match_unsafe()
+variant that lacks the PageSlab check.
+
+	Signed-off-by: Vlastimil Babka <vbabka@suse.cz>
+	Acked-by: Mel Gorman <mgorman@techsingularity.net>
+(cherry picked from commit 0b303fb402862dcb7948eeeed2439bd8c99948b5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slub.c
+diff --cc mm/slub.c
+index 18ea2f53cb90,6295695d8515..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -2617,7 -2694,10 +2630,13 @@@ static void *___slab_alloc(struct kmem_
+  
+  	stat(s, ALLOC_SLOWPATH);
+  
+++<<<<<<< HEAD
+ +	page = c->page;
+++=======
++ reread_page:
++ 
++ 	page = READ_ONCE(c->page);
+++>>>>>>> 0b303fb40286 (mm, slub: do initial checks in ___slab_alloc() with irqs enabled)
+  	if (!page) {
+  		/*
+  		 * if the node is not online or has no normal memory, just
+@@@ -2679,10 -2769,22 +2708,21 @@@ load_freelist
+  	VM_BUG_ON(!c->page->frozen);
+  	c->freelist = get_freepointer(s, freelist);
+  	c->tid = next_tid(c->tid);
+ -	local_irq_restore(flags);
+  	return freelist;
+  
++ deactivate_slab:
++ 
++ 	local_irq_save(flags);
++ 	if (page != c->page) {
++ 		local_irq_restore(flags);
++ 		goto reread_page;
++ 	}
++ 	deactivate_slab(s, page, c->freelist, c);
++ 
+  new_slab:
+  
++ 	lockdep_assert_irqs_disabled();
++ 
+  	if (slub_percpu_partial(c)) {
+  		page = c->page = slub_percpu_partial(c);
+  		slub_set_percpu_partial(c, page);
+diff --git a/include/linux/page-flags.h b/include/linux/page-flags.h
+index b52d448367b5..49dadc688373 100644
+--- a/include/linux/page-flags.h
++++ b/include/linux/page-flags.h
+@@ -777,6 +777,15 @@ static inline int PageSlabPfmemalloc(struct page *page)
+ 	return PageActive(page);
+ }
+ 
++/*
++ * A version of PageSlabPfmemalloc() for opportunistic checks where the page
++ * might have been freed under us and not be a PageSlab anymore.
++ */
++static inline int __PageSlabPfmemalloc(struct page *page)
++{
++	return PageActive(page);
++}
++
+ static inline void SetPageSlabPfmemalloc(struct page *page)
+ {
+ 	VM_BUG_ON_PAGE(!PageSlab(page), page);
+* Unmerged path mm/slub.c
