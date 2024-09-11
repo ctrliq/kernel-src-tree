@@ -9366,7 +9366,7 @@ static int libbpf_find_prog_btf_id(const char *name, __u32 attach_prog_fd)
 	struct bpf_prog_info_linear *info_linear;
 	struct bpf_prog_info *info;
 	struct btf *btf = NULL;
-	int err = -EINVAL;
+	int err;
 
 	info_linear = bpf_program__get_prog_info_linear(attach_prog_fd, 0);
 	if (IS_ERR_OR_NULL(info_linear)) {
@@ -9374,6 +9374,8 @@ static int libbpf_find_prog_btf_id(const char *name, __u32 attach_prog_fd)
 			attach_prog_fd);
 		return -EINVAL;
 	}
+
+	err = -EINVAL;
 	info = &info_linear->info;
 	if (!info->btf_id) {
 		pr_warn("The target program doesn't have BTF\n");
