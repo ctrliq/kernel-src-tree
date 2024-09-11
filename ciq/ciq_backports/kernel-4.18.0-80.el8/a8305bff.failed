@@ -1,0 +1,509 @@
+net: Add and use skb_mark_not_on_list().
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [net] Add and use skb_mark_not_on_list(). (Ivan Vecera) [1638022]
+Rebuild_FUZZ: 93.33%
+commit-author David S. Miller <davem@davemloft.net>
+commit a8305bff685252e80b7c60f4f5e7dd2e63e38218
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/a8305bff.failed
+
+An SKB is not on a list if skb->next is NULL.
+
+Codify this convention into a helper function and use it
+where we are dequeueing an SKB and need to mark it as such.
+
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a8305bff685252e80b7c60f4f5e7dd2e63e38218)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/dev.c
+#	net/ipv4/ip_fragment.c
+#	net/ipv4/ip_input.c
+diff --cc net/core/dev.c
+index 06489a7361c6,f76dd7e14dd6..000000000000
+--- a/net/core/dev.c
++++ b/net/core/dev.c
+@@@ -4896,7 -5286,26 +4896,30 @@@ out
+  	return netif_receive_skb_internal(skb);
+  }
+  
+++<<<<<<< HEAD
+ +/* napi->gro_list contains packets ordered by age.
+++=======
++ static void __napi_gro_flush_chain(struct napi_struct *napi, u32 index,
++ 				   bool flush_old)
++ {
++ 	struct list_head *head = &napi->gro_hash[index].list;
++ 	struct sk_buff *skb, *p;
++ 
++ 	list_for_each_entry_safe_reverse(skb, p, head, list) {
++ 		if (flush_old && NAPI_GRO_CB(skb)->age == jiffies)
++ 			return;
++ 		list_del(&skb->list);
++ 		skb_mark_not_on_list(skb);
++ 		napi_gro_complete(skb);
++ 		napi->gro_hash[index].count--;
++ 	}
++ 
++ 	if (!napi->gro_hash[index].count)
++ 		__clear_bit(index, &napi->gro_bitmask);
++ }
++ 
++ /* napi->gro_hash[].list contains packets ordered by age.
+++>>>>>>> a8305bff6852 (net: Add and use skb_mark_not_on_list().)
+   * youngest packets at the head of it.
+   * Complete skbs in reverse order to reduce latencies.
+   */
+@@@ -5060,12 -5481,10 +5083,19 @@@ static enum gro_result dev_gro_receive(
+  	ret = NAPI_GRO_CB(skb)->free ? GRO_MERGED_FREE : GRO_MERGED;
+  
+  	if (pp) {
+++<<<<<<< HEAD
+ +		struct sk_buff *nskb = *pp;
+ +
+ +		*pp = nskb->next;
+ +		nskb->next = NULL;
+ +		napi_gro_complete(nskb);
+ +		napi->gro_count--;
+++=======
++ 		list_del(&pp->list);
++ 		skb_mark_not_on_list(pp);
++ 		napi_gro_complete(pp);
++ 		napi->gro_hash[hash].count--;
+++>>>>>>> a8305bff6852 (net: Add and use skb_mark_not_on_list().)
+  	}
+  
+  	if (same_flow)
+diff --cc net/ipv4/ip_fragment.c
+index dbd518f59d6a,cab3e4a5124b..000000000000
+--- a/net/ipv4/ip_fragment.c
++++ b/net/ipv4/ip_fragment.c
+@@@ -575,7 -622,9 +575,13 @@@ static int ip_frag_reasm(struct ipq *qp
+  	}
+  	sub_frag_mem_limit(qp->q.net, head->truesize);
+  
+++<<<<<<< HEAD
+ +	head->next = NULL;
+++=======
++ 	*nextp = NULL;
++ 	skb_mark_not_on_list(head);
++ 	head->prev = NULL;
+++>>>>>>> a8305bff6852 (net: Add and use skb_mark_not_on_list().)
+  	head->dev = dev;
+  	head->tstamp = qp->q.stamp;
+  	IPCB(head)->frag_max_size = max(qp->max_df_size, qp->q.max_size);
+diff --cc net/ipv4/ip_input.c
+index 7582713dd18f,eba7f3883230..000000000000
+--- a/net/ipv4/ip_input.c
++++ b/net/ipv4/ip_input.c
+@@@ -500,5 -507,113 +500,117 @@@ inhdr_error
+  drop:
+  	kfree_skb(skb);
+  out:
+++<<<<<<< HEAD
+ +	return NET_RX_DROP;
+++=======
++ 	return NULL;
++ }
++ 
++ /*
++  * IP receive entry point
++  */
++ int ip_rcv(struct sk_buff *skb, struct net_device *dev, struct packet_type *pt,
++ 	   struct net_device *orig_dev)
++ {
++ 	struct net *net = dev_net(dev);
++ 
++ 	skb = ip_rcv_core(skb, net);
++ 	if (skb == NULL)
++ 		return NET_RX_DROP;
++ 	return NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING,
++ 		       net, NULL, skb, dev, NULL,
++ 		       ip_rcv_finish);
++ }
++ 
++ static void ip_sublist_rcv_finish(struct list_head *head)
++ {
++ 	struct sk_buff *skb, *next;
++ 
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		list_del(&skb->list);
++ 		/* Handle ip{6}_forward case, as sch_direct_xmit have
++ 		 * another kind of SKB-list usage (see validate_xmit_skb_list)
++ 		 */
++ 		skb_mark_not_on_list(skb);
++ 		dst_input(skb);
++ 	}
++ }
++ 
++ static void ip_list_rcv_finish(struct net *net, struct sock *sk,
++ 			       struct list_head *head)
++ {
++ 	struct dst_entry *curr_dst = NULL;
++ 	struct sk_buff *skb, *next;
++ 	struct list_head sublist;
++ 
++ 	INIT_LIST_HEAD(&sublist);
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		struct dst_entry *dst;
++ 
++ 		list_del(&skb->list);
++ 		/* if ingress device is enslaved to an L3 master device pass the
++ 		 * skb to its handler for processing
++ 		 */
++ 		skb = l3mdev_ip_rcv(skb);
++ 		if (!skb)
++ 			continue;
++ 		if (ip_rcv_finish_core(net, sk, skb) == NET_RX_DROP)
++ 			continue;
++ 
++ 		dst = skb_dst(skb);
++ 		if (curr_dst != dst) {
++ 			/* dispatch old sublist */
++ 			if (!list_empty(&sublist))
++ 				ip_sublist_rcv_finish(&sublist);
++ 			/* start new sublist */
++ 			INIT_LIST_HEAD(&sublist);
++ 			curr_dst = dst;
++ 		}
++ 		list_add_tail(&skb->list, &sublist);
++ 	}
++ 	/* dispatch final sublist */
++ 	ip_sublist_rcv_finish(&sublist);
++ }
++ 
++ static void ip_sublist_rcv(struct list_head *head, struct net_device *dev,
++ 			   struct net *net)
++ {
++ 	NF_HOOK_LIST(NFPROTO_IPV4, NF_INET_PRE_ROUTING, net, NULL,
++ 		     head, dev, NULL, ip_rcv_finish);
++ 	ip_list_rcv_finish(net, NULL, head);
++ }
++ 
++ /* Receive a list of IP packets */
++ void ip_list_rcv(struct list_head *head, struct packet_type *pt,
++ 		 struct net_device *orig_dev)
++ {
++ 	struct net_device *curr_dev = NULL;
++ 	struct net *curr_net = NULL;
++ 	struct sk_buff *skb, *next;
++ 	struct list_head sublist;
++ 
++ 	INIT_LIST_HEAD(&sublist);
++ 	list_for_each_entry_safe(skb, next, head, list) {
++ 		struct net_device *dev = skb->dev;
++ 		struct net *net = dev_net(dev);
++ 
++ 		list_del(&skb->list);
++ 		skb = ip_rcv_core(skb, net);
++ 		if (skb == NULL)
++ 			continue;
++ 
++ 		if (curr_dev != dev || curr_net != net) {
++ 			/* dispatch old sublist */
++ 			if (!list_empty(&sublist))
++ 				ip_sublist_rcv(&sublist, curr_dev, curr_net);
++ 			/* start new sublist */
++ 			INIT_LIST_HEAD(&sublist);
++ 			curr_dev = dev;
++ 			curr_net = net;
++ 		}
++ 		list_add_tail(&skb->list, &sublist);
++ 	}
++ 	/* dispatch final sublist */
++ 	ip_sublist_rcv(&sublist, curr_dev, curr_net);
+++>>>>>>> a8305bff6852 (net: Add and use skb_mark_not_on_list().)
+  }
+diff --git a/include/linux/skbuff.h b/include/linux/skbuff.h
+index e533b51fccfe..c93b63688eb5 100644
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -1330,6 +1330,11 @@ static inline void skb_zcopy_abort(struct sk_buff *skb)
+ 	}
+ }
+ 
++static inline void skb_mark_not_on_list(struct sk_buff *skb)
++{
++	skb->next = NULL;
++}
++
+ /**
+  *	skb_queue_empty - check if a queue is empty
+  *	@list: queue head
+* Unmerged path net/core/dev.c
+diff --git a/net/core/sock.c b/net/core/sock.c
+index 659466603321..0dd7a74b0604 100644
+--- a/net/core/sock.c
++++ b/net/core/sock.c
+@@ -2377,7 +2377,7 @@ static void __release_sock(struct sock *sk)
+ 			next = skb->next;
+ 			prefetch(next);
+ 			WARN_ON_ONCE(skb_dst_is_noref(skb));
+-			skb->next = NULL;
++			skb_mark_not_on_list(skb);
+ 			sk_backlog_rcv(sk, skb);
+ 
+ 			cond_resched();
+diff --git a/net/ieee802154/6lowpan/reassembly.c b/net/ieee802154/6lowpan/reassembly.c
+index e4b6aa4fa273..534ac7f0a8c0 100644
+--- a/net/ieee802154/6lowpan/reassembly.c
++++ b/net/ieee802154/6lowpan/reassembly.c
+@@ -265,7 +265,7 @@ static int lowpan_frag_reasm(struct lowpan_frag_queue *fq, struct sk_buff *prev,
+ 	}
+ 	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ 
+-	head->next = NULL;
++	skb_mark_not_on_list(head);
+ 	head->dev = ldev;
+ 	head->tstamp = fq->q.stamp;
+ 
+* Unmerged path net/ipv4/ip_fragment.c
+* Unmerged path net/ipv4/ip_input.c
+diff --git a/net/ipv4/ip_output.c b/net/ipv4/ip_output.c
+index d1869b78fdc6..1f35bd7787d4 100644
+--- a/net/ipv4/ip_output.c
++++ b/net/ipv4/ip_output.c
+@@ -278,7 +278,7 @@ static int ip_finish_output_gso(struct net *net, struct sock *sk,
+ 		struct sk_buff *nskb = segs->next;
+ 		int err;
+ 
+-		segs->next = NULL;
++		skb_mark_not_on_list(segs);
+ 		err = ip_fragment(net, sk, segs, mtu, ip_finish_output2);
+ 
+ 		if (err && ret == 0)
+@@ -683,7 +683,7 @@ int ip_do_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 
+ 			skb = frag;
+ 			frag = skb->next;
+-			skb->next = NULL;
++			skb_mark_not_on_list(skb);
+ 		}
+ 
+ 		if (err == 0) {
+diff --git a/net/ipv6/ip6_output.c b/net/ipv6/ip6_output.c
+index dc1991aa61f3..8d5ad45f3eb3 100644
+--- a/net/ipv6/ip6_output.c
++++ b/net/ipv6/ip6_output.c
+@@ -727,7 +727,7 @@ int ip6_fragment(struct net *net, struct sock *sk, struct sk_buff *skb,
+ 
+ 			skb = frag;
+ 			frag = skb->next;
+-			skb->next = NULL;
++			skb_mark_not_on_list(skb);
+ 		}
+ 
+ 		kfree(tmp_hdr);
+diff --git a/net/ipv6/netfilter/nf_conntrack_reasm.c b/net/ipv6/netfilter/nf_conntrack_reasm.c
+index 3715586b5b27..8a49039c78eb 100644
+--- a/net/ipv6/netfilter/nf_conntrack_reasm.c
++++ b/net/ipv6/netfilter/nf_conntrack_reasm.c
+@@ -450,7 +450,7 @@ nf_ct_frag6_reasm(struct frag_queue *fq, struct sk_buff *prev,  struct net_devic
+ 	sub_frag_mem_limit(fq->q.net, head->truesize);
+ 
+ 	head->ignore_df = 1;
+-	head->next = NULL;
++	skb_mark_not_on_list(head);
+ 	head->dev = dev;
+ 	head->tstamp = fq->q.stamp;
+ 	ipv6_hdr(head)->payload_len = htons(payload_len);
+diff --git a/net/ipv6/reassembly.c b/net/ipv6/reassembly.c
+index 474bc6a00cd3..4cd285387e22 100644
+--- a/net/ipv6/reassembly.c
++++ b/net/ipv6/reassembly.c
+@@ -443,7 +443,7 @@ static int ip6_frag_reasm(struct frag_queue *fq, struct sk_buff *prev,
+ 	}
+ 	sub_frag_mem_limit(fq->q.net, sum_truesize);
+ 
+-	head->next = NULL;
++	skb_mark_not_on_list(head);
+ 	head->dev = dev;
+ 	head->tstamp = fq->q.stamp;
+ 	ipv6_hdr(head)->payload_len = htons(payload_len);
+diff --git a/net/netfilter/nfnetlink_queue.c b/net/netfilter/nfnetlink_queue.c
+index ea4ba551abb2..5207eb8a5864 100644
+--- a/net/netfilter/nfnetlink_queue.c
++++ b/net/netfilter/nfnetlink_queue.c
+@@ -764,7 +764,7 @@ __nfqnl_enqueue_packet_gso(struct net *net, struct nfqnl_instance *queue,
+ 		return ret;
+ 	}
+ 
+-	skb->next = NULL;
++	skb_mark_not_on_list(skb);
+ 
+ 	entry_seg = nf_queue_entry_dup(entry);
+ 	if (entry_seg) {
+diff --git a/net/rxrpc/input.c b/net/rxrpc/input.c
+index 608d078a4981..96292c34143b 100644
+--- a/net/rxrpc/input.c
++++ b/net/rxrpc/input.c
+@@ -259,7 +259,7 @@ static void rxrpc_rotate_tx_window(struct rxrpc_call *call, rxrpc_seq_t to,
+ 	while (list) {
+ 		skb = list;
+ 		list = skb->next;
+-		skb->next = NULL;
++		skb_mark_not_on_list(skb);
+ 		rxrpc_free_skb(skb, rxrpc_skb_tx_freed);
+ 	}
+ }
+diff --git a/net/sched/sch_cake.c b/net/sched/sch_cake.c
+index 35fc7252187c..1074d4791223 100644
+--- a/net/sched/sch_cake.c
++++ b/net/sched/sch_cake.c
+@@ -800,7 +800,7 @@ static struct sk_buff *dequeue_head(struct cake_flow *flow)
+ 
+ 	if (skb) {
+ 		flow->head = skb->next;
+-		skb->next = NULL;
++		skb_mark_not_on_list(skb);
+ 	}
+ 
+ 	return skb;
+@@ -1240,7 +1240,7 @@ static struct sk_buff *cake_ack_filter(struct cake_sched_data *q,
+ 	else
+ 		flow->head = elig_ack->next;
+ 
+-	elig_ack->next = NULL;
++	skb_mark_not_on_list(elig_ack);
+ 
+ 	return elig_ack;
+ }
+@@ -1661,7 +1661,7 @@ static s32 cake_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 
+ 		while (segs) {
+ 			nskb = segs->next;
+-			segs->next = NULL;
++			skb_mark_not_on_list(segs);
+ 			qdisc_skb_cb(segs)->pkt_len = segs->len;
+ 			cobalt_set_enqueue_time(segs, now);
+ 			get_cobalt_cb(segs)->adjusted_len = cake_overhead(q,
+diff --git a/net/sched/sch_fq.c b/net/sched/sch_fq.c
+index 4808713c73b9..b27ba36a269c 100644
+--- a/net/sched/sch_fq.c
++++ b/net/sched/sch_fq.c
+@@ -319,7 +319,7 @@ static struct sk_buff *fq_dequeue_head(struct Qdisc *sch, struct fq_flow *flow)
+ 
+ 	if (skb) {
+ 		flow->head = skb->next;
+-		skb->next = NULL;
++		skb_mark_not_on_list(skb);
+ 		flow->qlen--;
+ 		qdisc_qstats_backlog_dec(sch, skb);
+ 		sch->q.qlen--;
+diff --git a/net/sched/sch_fq_codel.c b/net/sched/sch_fq_codel.c
+index 6c0a9d5dbf94..cd04d40c30b6 100644
+--- a/net/sched/sch_fq_codel.c
++++ b/net/sched/sch_fq_codel.c
+@@ -124,7 +124,7 @@ static inline struct sk_buff *dequeue_head(struct fq_codel_flow *flow)
+ 	struct sk_buff *skb = flow->head;
+ 
+ 	flow->head = skb->next;
+-	skb->next = NULL;
++	skb_mark_not_on_list(skb);
+ 	return skb;
+ }
+ 
+diff --git a/net/sched/sch_generic.c b/net/sched/sch_generic.c
+index 69078c82963e..a64132a5db36 100644
+--- a/net/sched/sch_generic.c
++++ b/net/sched/sch_generic.c
+@@ -184,7 +184,7 @@ static void try_bulk_dequeue_skb(struct Qdisc *q,
+ 		skb = nskb;
+ 		(*packets)++; /* GSO counts as one pkt */
+ 	}
+-	skb->next = NULL;
++	skb_mark_not_on_list(skb);
+ }
+ 
+ /* This variant of try_bulk_dequeue_skb() makes sure
+@@ -210,7 +210,7 @@ static void try_bulk_dequeue_skb_slow(struct Qdisc *q,
+ 		skb = nskb;
+ 	} while (++cnt < 8);
+ 	(*packets) += cnt;
+-	skb->next = NULL;
++	skb_mark_not_on_list(skb);
+ }
+ 
+ /* Note that dequeue_skb can possibly return a SKB list (via skb->next).
+diff --git a/net/sched/sch_hhf.c b/net/sched/sch_hhf.c
+index c3a8388dcdf6..9d6a47697406 100644
+--- a/net/sched/sch_hhf.c
++++ b/net/sched/sch_hhf.c
+@@ -330,7 +330,7 @@ static struct sk_buff *dequeue_head(struct wdrr_bucket *bucket)
+ 	struct sk_buff *skb = bucket->head;
+ 
+ 	bucket->head = skb->next;
+-	skb->next = NULL;
++	skb_mark_not_on_list(skb);
+ 	return skb;
+ }
+ 
+diff --git a/net/sched/sch_netem.c b/net/sched/sch_netem.c
+index b9541ce4d672..506e1960ed7f 100644
+--- a/net/sched/sch_netem.c
++++ b/net/sched/sch_netem.c
+@@ -568,7 +568,7 @@ static int netem_enqueue(struct sk_buff *skb, struct Qdisc *sch,
+ 	if (segs) {
+ 		while (segs) {
+ 			skb2 = segs->next;
+-			segs->next = NULL;
++			skb_mark_not_on_list(segs);
+ 			qdisc_skb_cb(segs)->pkt_len = segs->len;
+ 			last_len = segs->len;
+ 			rc = qdisc_enqueue(segs, sch, to_free);
+diff --git a/net/sched/sch_tbf.c b/net/sched/sch_tbf.c
+index 6f74a426f159..a4530e85bd02 100644
+--- a/net/sched/sch_tbf.c
++++ b/net/sched/sch_tbf.c
+@@ -162,7 +162,7 @@ static int tbf_segment(struct sk_buff *skb, struct Qdisc *sch,
+ 	nb = 0;
+ 	while (segs) {
+ 		nskb = segs->next;
+-		segs->next = NULL;
++		skb_mark_not_on_list(segs);
+ 		qdisc_skb_cb(segs)->pkt_len = segs->len;
+ 		len += segs->len;
+ 		ret = qdisc_enqueue(segs, q->qdisc, to_free);
+diff --git a/net/tipc/bearer.c b/net/tipc/bearer.c
+index 8dd419220973..b99f1e3c2bd1 100644
+--- a/net/tipc/bearer.c
++++ b/net/tipc/bearer.c
+@@ -577,7 +577,7 @@ static int tipc_l2_rcv_msg(struct sk_buff *skb, struct net_device *dev,
+ 		rcu_dereference_rtnl(orig_dev->tipc_ptr);
+ 	if (likely(b && test_bit(0, &b->up) &&
+ 		   (skb->pkt_type <= PACKET_MULTICAST))) {
+-		skb->next = NULL;
++		skb_mark_not_on_list(skb);
+ 		tipc_rcv(dev_net(b->pt.dev), skb, b);
+ 		rcu_read_unlock();
+ 		return NET_RX_SUCCESS;
+diff --git a/net/xfrm/xfrm_device.c b/net/xfrm/xfrm_device.c
+index 175941e15a6e..55cb7ebf5d40 100644
+--- a/net/xfrm/xfrm_device.c
++++ b/net/xfrm/xfrm_device.c
+@@ -99,7 +99,7 @@ struct sk_buff *validate_xmit_xfrm(struct sk_buff *skb, netdev_features_t featur
+ 
+ 	do {
+ 		struct sk_buff *nskb = skb2->next;
+-		skb2->next = NULL;
++		skb_mark_not_on_list(skb2);
+ 
+ 		xo = xfrm_offload(skb2);
+ 		xo->flags |= XFRM_DEV_RESUME;
+diff --git a/net/xfrm/xfrm_output.c b/net/xfrm/xfrm_output.c
+index 89b178a78dc7..a5f7c4d6d590 100644
+--- a/net/xfrm/xfrm_output.c
++++ b/net/xfrm/xfrm_output.c
+@@ -190,7 +190,7 @@ static int xfrm_output_gso(struct net *net, struct sock *sk, struct sk_buff *skb
+ 		struct sk_buff *nskb = segs->next;
+ 		int err;
+ 
+-		segs->next = NULL;
++		skb_mark_not_on_list(segs);
+ 		err = xfrm_output2(net, sk, segs);
+ 
+ 		if (unlikely(err)) {
