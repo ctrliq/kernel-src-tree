@@ -1,0 +1,300 @@
+sched: Prevent balance_push() on remote runqueues
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 868ad33bfa3bf39960982682ad3a0f8ebda1656e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/868ad33b.failed
+
+sched_setscheduler() and rt_mutex_setprio() invoke the run-queue balance
+callback after changing priorities or the scheduling class of a task. The
+run-queue for which the callback is invoked can be local or remote.
+
+That's not a problem for the regular rq::push_work which is serialized with
+a busy flag in the run-queue struct, but for the balance_push() work which
+is only valid to be invoked on the outgoing CPU that's wrong. It not only
+triggers the debug warning, but also leaves the per CPU variable push_work
+unprotected, which can result in double enqueues on the stop machine list.
+
+Remove the warning and validate that the function is invoked on the
+outgoing CPU.
+
+Fixes: ae7927023243 ("sched: Optimize finish_lock_switch()")
+	Reported-by: Sebastian Siewior <bigeasy@linutronix.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/87zgt1hdw7.ffs@tglx
+(cherry picked from commit 868ad33bfa3bf39960982682ad3a0f8ebda1656e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 7d10e0df3c83,b21a1857b75a..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -6069,119 -8485,144 +6069,162 @@@ void idle_task_exit(void
+  	/* finish_cpu(), as ran on the BP, will clean up the active_mm state */
+  }
+  
+ -static int __balance_push_cpu_stop(void *arg)
+ +/*
+ + * Since this CPU is going 'away' for a while, fold any nr_active delta
+ + * we might have. Assumes we're called after migrate_tasks() so that the
+ + * nr_active count is stable. We need to take the teardown thread which
+ + * is calling this into account, so we hand in adjust = 1 to the load
+ + * calculation.
+ + *
+ + * Also see the comment "Global load-average calculations".
+ + */
+ +static void calc_load_migrate(struct rq *rq)
+  {
+ -	struct task_struct *p = arg;
+ -	struct rq *rq = this_rq();
+ -	struct rq_flags rf;
+ -	int cpu;
+ +	long delta = calc_load_fold_active(rq, 1);
+ +	if (delta)
+ +		atomic_long_add(delta, &calc_load_tasks);
+ +}
+  
+ -	raw_spin_lock_irq(&p->pi_lock);
+ -	rq_lock(rq, &rf);
+ +static struct task_struct *__pick_migrate_task(struct rq *rq)
+ +{
+ +	const struct sched_class *class;
+ +	struct task_struct *next;
+  
+ +	for_each_class(class) {
+ +		next = class->pick_next_task(rq);
+ +		if (next) {
+ +			next->sched_class->put_prev_task(rq, next);
+ +			return next;
+ +		}
+ +	}
+ +
+ +	/* The idle class should always have a runnable task */
+ +	BUG();
+ +}
+ +
+ +/*
+ + * Migrate all tasks from the rq, sleeping tasks will be migrated by
+ + * try_to_wake_up()->select_task_rq().
+ + *
+ + * Called with rq->lock held even though we'er in stop_machine() and
+ + * there's no concurrency possible, we hold the required locks anyway
+ + * because of lock validation efforts.
+ + */
+ +static void migrate_tasks(struct rq *dead_rq, struct rq_flags *rf)
+ +{
+ +	struct rq *rq = dead_rq;
+ +	struct task_struct *next, *stop = rq->stop;
+ +	struct rq_flags orf = *rf;
+ +	int dest_cpu;
+ +
+ +	/*
+ +	 * Fudge the rq selection such that the below task selection loop
+ +	 * doesn't get stuck on the currently eligible stop task.
+ +	 *
+ +	 * We're currently inside stop_machine() and the rq is either stuck
+ +	 * in the stop_machine_cpu_stop() loop, or we're executing this code,
+ +	 * either way we should never end up calling schedule() until we're
+ +	 * done here.
+ +	 */
+ +	rq->stop = NULL;
+ +
+ +	/*
+ +	 * put_prev_task() and pick_next_task() sched
+ +	 * class method both need to have an up-to-date
+ +	 * value of rq->clock[_task]
+ +	 */
+  	update_rq_clock(rq);
+  
+ -	if (task_rq(p) == rq && task_on_rq_queued(p)) {
+ -		cpu = select_fallback_rq(rq->cpu, p);
+ -		rq = __migrate_task(rq, &rf, p, cpu);
+ -	}
+ +	for (;;) {
+ +		/*
+ +		 * There's this thread running, bail when that's the only
+ +		 * remaining thread:
+ +		 */
+ +		if (rq->nr_running == 1)
+ +			break;
+  
+++<<<<<<< HEAD
+ +		next = __pick_migrate_task(rq);
+++=======
++ 	rq_unlock(rq, &rf);
++ 	raw_spin_unlock_irq(&p->pi_lock);
++ 
++ 	put_task_struct(p);
++ 
++ 	return 0;
++ }
++ 
++ static DEFINE_PER_CPU(struct cpu_stop_work, push_work);
++ 
++ /*
++  * Ensure we only run per-cpu kthreads once the CPU goes !active.
++  *
++  * This is enabled below SCHED_AP_ACTIVE; when !cpu_active(), but only
++  * effective when the hotplug motion is down.
++  */
++ static void balance_push(struct rq *rq)
++ {
++ 	struct task_struct *push_task = rq->curr;
++ 
++ 	lockdep_assert_rq_held(rq);
++ 
++ 	/*
++ 	 * Ensure the thing is persistent until balance_push_set(.on = false);
++ 	 */
++ 	rq->balance_callback = &balance_push_callback;
++ 
++ 	/*
+ -	 * Only active while going offline and when invoked on the outgoing
+ -	 * CPU.
+ -	 */
+ -	if (!cpu_dying(rq->cpu) || rq != this_rq())
+ -		return;
+ -
+ -	/*
+ -	 * Both the cpu-hotplug and stop task are in this case and are
+ -	 * required to complete the hotplug process.
+ -	 */
+ -	if (kthread_is_per_cpu(push_task) ||
+ -	    is_migration_disabled(push_task)) {
+ -
+ -		/*
+ -		 * If this is the idle task on the outgoing CPU try to wake
+ -		 * up the hotplug control thread which might wait for the
+ -		 * last task to vanish. The rcuwait_active() check is
+ -		 * accurate here because the waiter is pinned on this CPU
+ -		 * and can't obviously be running in parallel.
+ -		 *
+ -		 * On RT kernels this also has to check whether there are
+ -		 * pinned and scheduled out tasks on the runqueue. They
+ -		 * need to leave the migrate disabled section first.
+ -		 */
+ -		if (!rq->nr_running && !rq_has_pinned_tasks(rq) &&
+ -		    rcuwait_active(&rq->hotplug_wait)) {
+ -			raw_spin_rq_unlock(rq);
+ -			rcuwait_wake_up(&rq->hotplug_wait);
+ -			raw_spin_rq_lock(rq);
+ -		}
+ -		return;
+ -	}
+ -
+ -	get_task_struct(push_task);
+ -	/*
+ -	 * Temporarily drop rq->lock such that we can wake-up the stop task.
+ -	 * Both preemption and IRQs are still disabled.
+ -	 */
+ -	raw_spin_rq_unlock(rq);
+ -	stop_one_cpu_nowait(rq->cpu, __balance_push_cpu_stop, push_task,
+ -			    this_cpu_ptr(&push_work));
+ -	/*
+ -	 * At this point need_resched() is true and we'll take the loop in
+ -	 * schedule(). The next pick is obviously going to be the stop task
+ -	 * which kthread_is_per_cpu() and will push this task away.
+ -	 */
+ -	raw_spin_rq_lock(rq);
+ -}
+ -
+ -static void balance_push_set(int cpu, bool on)
+ -{
+ -	struct rq *rq = cpu_rq(cpu);
+ -	struct rq_flags rf;
+ -
+ -	rq_lock_irqsave(rq, &rf);
+ -	if (on) {
+ -		WARN_ON_ONCE(rq->balance_callback);
+ -		rq->balance_callback = &balance_push_callback;
+ -	} else if (rq->balance_callback == &balance_push_callback) {
+ -		rq->balance_callback = NULL;
+ -	}
+ -	rq_unlock_irqrestore(rq, &rf);
+ -}
+ -
+ -/*
+ - * Invoked from a CPUs hotplug control thread after the CPU has been marked
+ - * inactive. All tasks which are not per CPU kernel threads are either
+ - * pushed off this CPU now via balance_push() or placed on a different CPU
+ - * during wakeup. Wait until the CPU is quiescent.
+ - */
+ -static void balance_hotplug_wait(void)
+ -{
+ -	struct rq *rq = this_rq();
+++	 * Only active while going offline and when invoked on the outgoing
+++	 * CPU.
+++	 */
+++	if (!cpu_dying(rq->cpu) || rq != this_rq())
+++		return;
++ 
+ -	rcuwait_wait_event(&rq->hotplug_wait,
+ -			   rq->nr_running == 1 && !rq_has_pinned_tasks(rq),
+ -			   TASK_UNINTERRUPTIBLE);
+ -}
+++	/*
+++	 * Both the cpu-hotplug and stop task are in this case and are
+++	 * required to complete the hotplug process.
+++	 */
+++	if (kthread_is_per_cpu(push_task) ||
+++	    is_migration_disabled(push_task)) {
+++>>>>>>> 868ad33bfa3b (sched: Prevent balance_push() on remote runqueues)
+  
+ -#else
+ +		/*
+ +		 * Rules for changing task_struct::cpus_mask are holding
+ +		 * both pi_lock and rq->lock, such that holding either
+ +		 * stabilizes the mask.
+ +		 *
+ +		 * Drop rq->lock is not quite as disastrous as it usually is
+ +		 * because !cpu_active at this point, which means load-balance
+ +		 * will not interfere. Also, stop-machine.
+ +		 */
+ +		rq_unlock(rq, rf);
+ +		raw_spin_lock(&next->pi_lock);
+ +		rq_relock(rq, rf);
+  
+ -static inline void balance_push(struct rq *rq)
+ -{
+ -}
+ +		/*
+ +		 * Since we're inside stop-machine, _nothing_ should have
+ +		 * changed the task, WARN if weird stuff happened, because in
+ +		 * that case the above rq->lock drop is a fail too.
+ +		 */
+ +		if (WARN_ON(task_rq(next) != rq || !task_on_rq_queued(next))) {
+ +			raw_spin_unlock(&next->pi_lock);
+ +			continue;
+ +		}
+  
+ -static inline void balance_push_set(int cpu, bool on)
+ -{
+ -}
+ +		/* Find suitable destination for @next, with force if needed. */
+ +		dest_cpu = select_fallback_rq(dead_rq->cpu, next);
+ +		rq = __migrate_task(rq, rf, next, dest_cpu);
+ +		if (rq != dead_rq) {
+ +			rq_unlock(rq, rf);
+ +			rq = dead_rq;
+ +			*rf = orf;
+ +			rq_relock(rq, rf);
+ +		}
+ +		raw_spin_unlock(&next->pi_lock);
+ +	}
+  
+ -static inline void balance_hotplug_wait(void)
+ -{
+ +	rq->stop = stop;
+  }
+ -
+  #endif /* CONFIG_HOTPLUG_CPU */
+  
+  void set_rq_online(struct rq *rq)
+* Unmerged path kernel/sched/core.c
