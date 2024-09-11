@@ -1507,6 +1507,7 @@ static void __stop_tx_rs485(struct uart_8250_port *p)
 				   p->port.rs485.delay_rts_after_send);
 	} else {
 		__do_stop_tx_rs485(p);
+		em485->active_timer = NULL;
 	}
 }
 
@@ -1533,8 +1534,6 @@ static inline void __stop_tx(struct uart_8250_port *p)
 		 */
 		if ((lsr & BOTH_EMPTY) != BOTH_EMPTY)
 			return;
-
-		em485->active_timer = NULL;
 
 		__stop_tx_rs485(p);
 	}
