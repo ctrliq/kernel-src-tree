@@ -1,0 +1,214 @@
+x86/fpu/regset: Move fpu__read_begin() into regset
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 5a32fac8dbe8adc08c10e2c8770c95aebfc627cd
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/5a32fac8.failed
+
+The function can only be used from the regset get() callbacks safely. So
+there is no reason to have it globally exposed.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+	Reviewed-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20210623121453.234942936@linutronix.de
+(cherry picked from commit 5a32fac8dbe8adc08c10e2c8770c95aebfc627cd)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/fpu/regset.c
+diff --cc arch/x86/kernel/fpu/regset.c
+index 7bcf779c46cb,937adf702b37..000000000000
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@@ -28,20 -28,39 +28,40 @@@ int regset_xregset_fpregs_active(struc
+  		return 0;
+  }
+  
++ /*
++  * The regset get() functions are invoked from:
++  *
++  *   - coredump to dump the current task's fpstate. If the current task
++  *     owns the FPU then the memory state has to be synchronized and the
++  *     FPU register state preserved. Otherwise fpstate is already in sync.
++  *
++  *   - ptrace to dump fpstate of a stopped task, in which case the registers
++  *     have already been saved to fpstate on context switch.
++  */
++ static void sync_fpstate(struct fpu *fpu)
++ {
++ 	if (fpu == &current->thread.fpu)
++ 		fpu__save(fpu);
++ }
++ 
+  int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ -		struct membuf to)
+ +		unsigned int pos, unsigned int count,
+ +		void *kbuf, void __user *ubuf)
+  {
+  	struct fpu *fpu = &target->thread.fpu;
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_FXSR))
+ +	if (!boot_cpu_has(X86_FEATURE_FXSR))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	fpu__prepare_read(fpu);
+ +	fpstate_sanitize_xstate(fpu);
+++=======
++ 	sync_fpstate(fpu);
+++>>>>>>> 5a32fac8dbe8 (x86/fpu/regset: Move fpu__read_begin() into regset)
+  
+ -	if (!use_xsave()) {
+ -		return membuf_write(&to, &fpu->state.fxsave,
+ -				    sizeof(fpu->state.fxsave));
+ -	}
+ -
+ -	copy_xstate_to_uabi_buf(to, &fpu->state.xsave, XSTATE_COPY_FX);
+ -	return 0;
+ +	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+ +				   &fpu->state.fxsave, 0, -1);
+  }
+  
+  int xfpregs_set(struct task_struct *target, const struct user_regset *regset,
+@@@ -86,40 -105,17 +106,44 @@@
+  }
+  
+  int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ -		struct membuf to)
+ +		unsigned int pos, unsigned int count,
+ +		void *kbuf, void __user *ubuf)
+  {
+  	struct fpu *fpu = &target->thread.fpu;
+ +	struct xregs_state *xsave;
+ +	int ret;
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_XSAVE))
+ +	if (!boot_cpu_has(X86_FEATURE_XSAVE))
+  		return -ENODEV;
+  
+++<<<<<<< HEAD
+ +	xsave = &fpu->state.xsave;
+ +
+ +	fpu__prepare_read(fpu);
+++=======
++ 	sync_fpstate(fpu);
+++>>>>>>> 5a32fac8dbe8 (x86/fpu/regset: Move fpu__read_begin() into regset)
+  
+ -	copy_xstate_to_uabi_buf(to, &fpu->state.xsave, XSTATE_COPY_XSAVE);
+ -	return 0;
+ +	if (using_compacted_format()) {
+ +		if (kbuf)
+ +			ret = copy_xstate_to_kernel(kbuf, xsave, pos, count);
+ +		else
+ +			ret = copy_xstate_to_user(ubuf, xsave, pos, count);
+ +	} else {
+ +		fpstate_sanitize_xstate(fpu);
+ +		/*
+ +		 * Copy the 48 bytes defined by the software into the xsave
+ +		 * area in the thread struct, so that we can copy the whole
+ +		 * area to user using one user_regset_copyout().
+ +		 */
+ +		memcpy(&xsave->i387.sw_reserved, xstate_fx_sw_bytes, sizeof(xstate_fx_sw_bytes));
+ +
+ +		/*
+ +		 * Copy the xstate memory layout.
+ +		 */
+ +		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf, xsave, 0, -1);
+ +	}
+ +	return ret;
+  }
+  
+  int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+@@@ -300,27 -301,30 +324,27 @@@ int fpregs_get(struct task_struct *targ
+  {
+  	struct fpu *fpu = &target->thread.fpu;
+  	struct user_i387_ia32_struct env;
+ -	struct fxregs_state fxsave, *fx;
+  
+- 	fpu__prepare_read(fpu);
++ 	sync_fpstate(fpu);
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_FPU))
+ -		return fpregs_soft_get(target, regset, to);
+ +	if (!boot_cpu_has(X86_FEATURE_FPU))
+ +		return fpregs_soft_get(target, regset, pos, count, kbuf, ubuf);
+  
+ -	if (!cpu_feature_enabled(X86_FEATURE_FXSR)) {
+ -		return membuf_write(&to, &fpu->state.fsave,
+ -				    sizeof(struct fregs_state));
+ -	}
+ +	if (!boot_cpu_has(X86_FEATURE_FXSR))
+ +		return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+ +					   &fpu->state.fsave, 0,
+ +					   -1);
+  
+ -	if (use_xsave()) {
+ -		struct membuf mb = { .p = &fxsave, .left = sizeof(fxsave) };
+ +	fpstate_sanitize_xstate(fpu);
+  
+ -		/* Handle init state optimized xstate correctly */
+ -		copy_xstate_to_uabi_buf(mb, &fpu->state.xsave, XSTATE_COPY_FP);
+ -		fx = &fxsave;
+ -	} else {
+ -		fx = &fpu->state.fxsave;
+ +	if (kbuf && pos == 0 && count == sizeof(env)) {
+ +		convert_from_fxsr(kbuf, target);
+ +		return 0;
+  	}
+  
+ -	__convert_from_fxsr(&env, target, fx);
+ -	return membuf_write(&to, &env, sizeof(env));
+ +	convert_from_fxsr(&env, target);
+ +
+ +	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, &env, 0, -1);
+  }
+  
+  int fpregs_set(struct task_struct *target, const struct user_regset *regset,
+diff --git a/arch/x86/include/asm/fpu/internal.h b/arch/x86/include/asm/fpu/internal.h
+index 1bc560a23553..c32102d55a38 100644
+--- a/arch/x86/include/asm/fpu/internal.h
++++ b/arch/x86/include/asm/fpu/internal.h
+@@ -26,7 +26,6 @@
+ /*
+  * High level FPU state handling functions:
+  */
+-extern void fpu__prepare_read(struct fpu *fpu);
+ extern void fpu__prepare_write(struct fpu *fpu);
+ extern void fpu__save(struct fpu *fpu);
+ extern int  fpu__restore_sig(void __user *buf, int ia32_frame);
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 780a11e1b5d6..b7aec55cd790 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -273,26 +273,6 @@ static void fpu__initialize(struct fpu *fpu)
+ 	trace_x86_fpu_init_state(fpu);
+ }
+ 
+-/*
+- * This function must be called before we read a task's fpstate.
+- *
+- * There's two cases where this gets called:
+- *
+- * - for the current task (when coredumping), in which case we have
+- *   to save the latest FPU registers into the fpstate,
+- *
+- * - or it's called for stopped tasks (ptrace), in which case the
+- *   registers were already saved by the context-switch code when
+- *   the task scheduled out.
+- *
+- * If the task has used the FPU before then save it.
+- */
+-void fpu__prepare_read(struct fpu *fpu)
+-{
+-	if (fpu == &current->thread.fpu)
+-		fpu__save(fpu);
+-}
+-
+ /*
+  * This function must be called before we write a task's fpstate.
+  *
+* Unmerged path arch/x86/kernel/fpu/regset.c
