@@ -1,0 +1,302 @@
+mm: memcontrol: account kernel stack per node
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Shakeel Butt <shakeelb@google.com>
+commit 991e7673859ed41e7ba83c8c4e57afe8cfebe314
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/991e7673.failed
+
+Currently the kernel stack is being accounted per-zone.  There is no need
+to do that.  In addition due to being per-zone, memcg has to keep a
+separate MEMCG_KERNEL_STACK_KB.  Make the stat per-node and deprecate
+MEMCG_KERNEL_STACK_KB as memcg_stat_item is an extension of
+node_stat_item.  In addition localize the kernel stack stats updates to
+account_kernel_stack().
+
+	Signed-off-by: Shakeel Butt <shakeelb@google.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Roman Gushchin <guro@fb.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+Link: http://lkml.kernel.org/r/20200630161539.1759185-1-shakeelb@google.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 991e7673859ed41e7ba83c8c4e57afe8cfebe314)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/base/node.c
+#	fs/proc/meminfo.c
+#	include/linux/memcontrol.h
+#	include/linux/mmzone.h
+#	kernel/scs.c
+#	mm/page_alloc.c
+#	mm/vmstat.c
+diff --cc drivers/base/node.c
+index 8633d5d90a7d,508b80f6329b..000000000000
+--- a/drivers/base/node.c
++++ b/drivers/base/node.c
+@@@ -436,7 -440,10 +436,14 @@@ static ssize_t node_read_meminfo(struc
+  		       nid, K(node_page_state(pgdat, NR_FILE_MAPPED)),
+  		       nid, K(node_page_state(pgdat, NR_ANON_MAPPED)),
+  		       nid, K(i.sharedram),
+++<<<<<<< HEAD
+ +		       nid, sum_zone_node_page_state(nid, NR_KERNEL_STACK_KB),
+++=======
++ 		       nid, node_page_state(pgdat, NR_KERNEL_STACK_KB),
++ #ifdef CONFIG_SHADOW_CALL_STACK
++ 		       nid, node_page_state(pgdat, NR_KERNEL_SCS_KB),
++ #endif
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  		       nid, K(sum_zone_node_page_state(nid, NR_PAGETABLE)),
+  		       nid, 0UL,
+  		       nid, K(sum_zone_node_page_state(nid, NR_BOUNCE)),
+diff --cc fs/proc/meminfo.c
+index 89a6b114397f,2a4c58f70fb9..000000000000
+--- a/fs/proc/meminfo.c
++++ b/fs/proc/meminfo.c
+@@@ -103,12 -101,13 +103,20 @@@ static int meminfo_proc_show(struct seq
+  	show_val_kb(m, "SReclaimable:   ", sreclaimable);
+  	show_val_kb(m, "SUnreclaim:     ", sunreclaim);
+  	seq_printf(m, "KernelStack:    %8lu kB\n",
+++<<<<<<< HEAD
+ +		   global_zone_page_state(NR_KERNEL_STACK_KB));
+++=======
++ 		   global_node_page_state(NR_KERNEL_STACK_KB));
++ #ifdef CONFIG_SHADOW_CALL_STACK
++ 	seq_printf(m, "ShadowCallStack:%8lu kB\n",
++ 		   global_node_page_state(NR_KERNEL_SCS_KB));
++ #endif
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  	show_val_kb(m, "PageTables:     ",
+  		    global_zone_page_state(NR_PAGETABLE));
+ +#ifdef CONFIG_QUICKLIST
+ +	show_val_kb(m, "Quicklists:     ", quicklist_total_size());
+ +#endif
+  
+  	show_val_kb(m, "NFS_Unstable:   ", 0);
+  	show_val_kb(m, "Bounce:         ",
+diff --cc include/linux/memcontrol.h
+index f16582585aa2,624400c27eba..000000000000
+--- a/include/linux/memcontrol.h
++++ b/include/linux/memcontrol.h
+@@@ -41,13 -32,6 +41,16 @@@ struct kmem_cache
+  enum memcg_stat_item {
+  	MEMCG_SWAP = NR_VM_NODE_STAT_ITEMS,
+  	MEMCG_SOCK,
+++<<<<<<< HEAD
+ +	MEMCG_PERCPU_B,
+ +	/* XXX: why are these zone and not node counters? */
+ +	MEMCG_KERNEL_STACK_KB,
+ +#ifdef __GENKSYMS__
+ +	_RH_KABI_MEMCG_STAT_RESERVED1,
+ +	_RH_KABI_MEMCG_STAT_RESERVED2,
+ +#endif
+++=======
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  	MEMCG_NR_STAT,
+  };
+  
+diff --cc include/linux/mmzone.h
+index ae118ed2cb9b,a3bd54139a30..000000000000
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@@ -157,7 -155,6 +157,10 @@@ enum zone_stat_item 
+  	NR_ZONE_WRITE_PENDING,	/* Count of dirty, writeback and unstable pages */
+  	NR_MLOCK,		/* mlock()ed pages found and moved off LRU */
+  	NR_PAGETABLE,		/* used for pagetables */
+++<<<<<<< HEAD
+ +	NR_KERNEL_STACK_KB,	/* measured in KiB */
+++=======
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  	/* Second 128 byte cacheline */
+  	NR_BOUNCE,
+  #if IS_ENABLED(CONFIG_ZSMALLOC)
+@@@ -206,9 -196,13 +209,19 @@@ enum node_stat_item 
+  	NR_VMSCAN_IMMEDIATE,	/* Prioritise for reclaim when writeback ends */
+  	NR_DIRTIED,		/* page dirtyings since bootup */
+  	NR_WRITTEN,		/* page writings since bootup */
+++<<<<<<< HEAD
+ +	RH_KABI_RENAME(NR_INDIRECTLY_RECLAIMABLE_BYTES,
+ +		       NR_KERNEL_MISC_RECLAIMABLE),
+ +				/* reclaimable non-slab kernel pages */
+++=======
++ 	NR_KERNEL_MISC_RECLAIMABLE,	/* reclaimable non-slab kernel pages */
++ 	NR_FOLL_PIN_ACQUIRED,	/* via: pin_user_page(), gup flag: FOLL_PIN */
++ 	NR_FOLL_PIN_RELEASED,	/* pages returned via unpin_user_page() */
++ 	NR_KERNEL_STACK_KB,	/* measured in KiB */
++ #if IS_ENABLED(CONFIG_SHADOW_CALL_STACK)
++ 	NR_KERNEL_SCS_KB,	/* measured in KiB */
++ #endif
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  	NR_VM_NODE_STAT_ITEMS
+  };
+  
+diff --cc mm/page_alloc.c
+index 65c092920ff8,8d5d8526c2f3..000000000000
+--- a/mm/page_alloc.c
++++ b/mm/page_alloc.c
+@@@ -5441,7 -5456,6 +5449,10 @@@ void show_free_areas(unsigned int filte
+  			" present:%lukB"
+  			" managed:%lukB"
+  			" mlocked:%lukB"
+++<<<<<<< HEAD
+ +			" kernel_stack:%lukB"
+++=======
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  			" pagetables:%lukB"
+  			" bounce:%lukB"
+  			" free_pcp:%lukB"
+@@@ -5462,7 -5477,6 +5473,10 @@@
+  			K(zone->present_pages),
+  			K(zone_managed_pages(zone)),
+  			K(zone_page_state(zone, NR_MLOCK)),
+++<<<<<<< HEAD
+ +			zone_page_state(zone, NR_KERNEL_STACK_KB),
+++=======
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  			K(zone_page_state(zone, NR_PAGETABLE)),
+  			K(zone_page_state(zone, NR_BOUNCE)),
+  			K(free_pcp),
+diff --cc mm/vmstat.c
+index d9662e48d82b,2b866cbab11d..000000000000
+--- a/mm/vmstat.c
++++ b/mm/vmstat.c
+@@@ -1157,7 -1140,6 +1157,10 @@@ const char * const vmstat_text[] = 
+  	"nr_zone_write_pending",
+  	"nr_mlock",
+  	"nr_page_table_pages",
+++<<<<<<< HEAD
+ +	"nr_kernel_stack",
+++=======
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  	"nr_bounce",
+  #if IS_ENABLED(CONFIG_ZSMALLOC)
+  	"nr_zspages",
+@@@ -1209,6 -1188,12 +1212,15 @@@
+  	"nr_dirtied",
+  	"nr_written",
+  	"nr_kernel_misc_reclaimable",
+++<<<<<<< HEAD
+++=======
++ 	"nr_foll_pin_acquired",
++ 	"nr_foll_pin_released",
++ 	"nr_kernel_stack",
++ #if IS_ENABLED(CONFIG_SHADOW_CALL_STACK)
++ 	"nr_shadow_call_stack",
++ #endif
+++>>>>>>> 991e7673859e (mm: memcontrol: account kernel stack per node)
+  
+  	/* enum writeback_stat_item counters */
+  	"nr_dirty_threshold",
+* Unmerged path kernel/scs.c
+* Unmerged path drivers/base/node.c
+* Unmerged path fs/proc/meminfo.c
+* Unmerged path include/linux/memcontrol.h
+* Unmerged path include/linux/mmzone.h
+diff --git a/kernel/fork.c b/kernel/fork.c
+index 9a2ad5adca15..b6125522c06a 100644
+--- a/kernel/fork.c
++++ b/kernel/fork.c
+@@ -267,13 +267,8 @@ static inline void free_thread_stack(struct task_struct *tsk)
+ 	if (vm) {
+ 		int i;
+ 
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+-			mod_memcg_page_state(vm->pages[i],
+-					     MEMCG_KERNEL_STACK_KB,
+-					     -(int)(PAGE_SIZE / 1024));
+-
++		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++)
+ 			memcg_kmem_uncharge_page(vm->pages[i], 0);
+-		}
+ 
+ 		for (i = 0; i < NR_CACHED_STACKS; i++) {
+ 			if (this_cpu_cmpxchg(cached_stacks[i],
+@@ -365,31 +360,14 @@ static void account_kernel_stack(struct task_struct *tsk, int account)
+ 	void *stack = task_stack_page(tsk);
+ 	struct vm_struct *vm = task_stack_vm_area(tsk);
+ 
+-	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
+-
+-	if (vm) {
+-		int i;
+-
+-		BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
+ 
+-		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+-			mod_zone_page_state(page_zone(vm->pages[i]),
+-					    NR_KERNEL_STACK_KB,
+-					    PAGE_SIZE / 1024 * account);
+-		}
+-	} else {
+-		/*
+-		 * All stack pages are in the same zone and belong to the
+-		 * same memcg.
+-		 */
+-		struct page *first_page = virt_to_page(stack);
+-
+-		mod_zone_page_state(page_zone(first_page), NR_KERNEL_STACK_KB,
+-				    THREAD_SIZE / 1024 * account);
+-
+-		mod_memcg_obj_state(stack, MEMCG_KERNEL_STACK_KB,
+-				    account * (THREAD_SIZE / 1024));
+-	}
++	/* All stack pages are in the same node. */
++	if (vm)
++		mod_lruvec_page_state(vm->pages[0], NR_KERNEL_STACK_KB,
++				      account * (THREAD_SIZE / 1024));
++	else
++		mod_lruvec_slab_state(stack, NR_KERNEL_STACK_KB,
++				      account * (THREAD_SIZE / 1024));
+ }
+ 
+ static int memcg_charge_kernel_stack(struct task_struct *tsk)
+@@ -398,24 +376,23 @@ static int memcg_charge_kernel_stack(struct task_struct *tsk)
+ 	struct vm_struct *vm = task_stack_vm_area(tsk);
+ 	int ret;
+ 
++	BUILD_BUG_ON(IS_ENABLED(CONFIG_VMAP_STACK) && PAGE_SIZE % 1024 != 0);
++
+ 	if (vm) {
+ 		int i;
+ 
++		BUG_ON(vm->nr_pages != THREAD_SIZE / PAGE_SIZE);
++
+ 		for (i = 0; i < THREAD_SIZE / PAGE_SIZE; i++) {
+ 			/*
+ 			 * If memcg_kmem_charge_page() fails, page->mem_cgroup
+-			 * pointer is NULL, and both memcg_kmem_uncharge_page()
+-			 * and mod_memcg_page_state() in free_thread_stack()
+-			 * will ignore this page. So it's safe.
++			 * pointer is NULL, and memcg_kmem_uncharge_page() in
++			 * free_thread_stack() will ignore this page.
+ 			 */
+ 			ret = memcg_kmem_charge_page(vm->pages[i], GFP_KERNEL,
+ 						     0);
+ 			if (ret)
+ 				return ret;
+-
+-			mod_memcg_page_state(vm->pages[i],
+-					     MEMCG_KERNEL_STACK_KB,
+-					     PAGE_SIZE / 1024);
+ 		}
+ 	}
+ #endif
+* Unmerged path kernel/scs.c
+diff --git a/mm/memcontrol.c b/mm/memcontrol.c
+index e0c5e437cb00..7840fdef7e98 100644
+--- a/mm/memcontrol.c
++++ b/mm/memcontrol.c
+@@ -1500,7 +1500,7 @@ static char *memory_stat_format(struct mem_cgroup *memcg)
+ 		       (u64)memcg_page_state(memcg, NR_FILE_PAGES) *
+ 		       PAGE_SIZE);
+ 	seq_buf_printf(&s, "kernel_stack %llu\n",
+-		       (u64)memcg_page_state(memcg, MEMCG_KERNEL_STACK_KB) *
++		       (u64)memcg_page_state(memcg, NR_KERNEL_STACK_KB) *
+ 		       1024);
+ 	seq_buf_printf(&s, "slab %llu\n",
+ 		       (u64)(memcg_page_state(memcg, NR_SLAB_RECLAIMABLE_B) +
+* Unmerged path mm/page_alloc.c
+* Unmerged path mm/vmstat.c
