@@ -1,0 +1,323 @@
+RDMA/rxe: Revert changes from irqsave to bh locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit a099b08599e6ae6b8e9faccee83760dab622c11e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/a099b085.failed
+
+A previous patch replaced all irqsave locks in rxe with bh locks.  This
+ran into problems because rdmacm has a bad habit of calling rdma verbs
+APIs while disabling irqs. This is not allowed during spin_unlock_bh()
+causing programs that use rdmacm to fail.  This patch reverts the changes
+to locks that had this problem or got dragged into the same mess. After
+this patch blktests/check -q srp now runs correctly.
+
+Link: https://lore.kernel.org/r/20220215194448.44369-1-rpearsonhpe@gmail.com
+Fixes: 21adfa7a3c4e ("RDMA/rxe: Replace irqsave locks with bh locks")
+	Reported-by: Guoqing Jiang <guoqing.jiang@linux.dev>
+	Reported-by: Bart Van Assche <bvanassche@acm.org>
+	Signed-off-by: Bob Pearson <rpearsonhpe@gmail.com>
+	Tested-by: Bart Van Assche <bvanassche@acm.org>
+	Acked-by: Zhu Yanjun <zyjzyj2000@gmail.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit a099b08599e6ae6b8e9faccee83760dab622c11e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_cq.c
+#	drivers/infiniband/sw/rxe/rxe_mcast.c
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+#	drivers/infiniband/sw/rxe/rxe_queue.c
+diff --cc drivers/infiniband/sw/rxe/rxe_cq.c
+index 6087575d7f46,642b52539ac3..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_cq.c
++++ b/drivers/infiniband/sw/rxe/rxe_cq.c
+@@@ -43,9 -39,9 +43,13 @@@ err1
+  	return -EINVAL;
+  }
+  
+ -static void rxe_send_complete(struct tasklet_struct *t)
+ +static void rxe_send_complete(unsigned long data)
+  {
+++<<<<<<< HEAD
+ +	struct rxe_cq *cq = (struct rxe_cq *)data;
+++=======
++ 	struct rxe_cq *cq = from_tasklet(cq, t, comp_task);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  	unsigned long flags;
+  
+  	spin_lock_irqsave(&cq->cq_lock, flags);
+@@@ -110,17 -106,13 +114,21 @@@ int rxe_cq_resize_queue(struct rxe_cq *
+  int rxe_cq_post(struct rxe_cq *cq, struct rxe_cqe *cqe, int solicited)
+  {
+  	struct ib_event ev;
+ +	unsigned long flags;
+  	int full;
+  	void *addr;
++ 	unsigned long flags;
+  
+  	spin_lock_irqsave(&cq->cq_lock, flags);
+++<<<<<<< HEAD
+ +
+ +	if (cq->is_user)
+ +		full = queue_full(cq->queue, QUEUE_TYPE_TO_USER);
+ +	else
+ +		full = queue_full(cq->queue, QUEUE_TYPE_KERNEL);
+++=======
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+ -	full = queue_full(cq->queue, QUEUE_TYPE_TO_CLIENT);
+  	if (unlikely(full)) {
+  		spin_unlock_irqrestore(&cq->cq_lock, flags);
+  		if (cq->ibcq.event_handler) {
+diff --cc drivers/infiniband/sw/rxe/rxe_mcast.c
+index 5f1c72c1473c,2878a56d9994..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_mcast.c
++++ b/drivers/infiniband/sw/rxe/rxe_mcast.c
+@@@ -82,15 -82,15 +82,23 @@@ done
+  	return 0;
+  }
+  
+ -static int rxe_mcast_add_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ -			   struct rxe_mcg *grp)
+ +int rxe_mcast_add_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			   struct rxe_mc_grp *grp)
+  {
+  	int err;
+++<<<<<<< HEAD
+ +	struct rxe_mc_elem *elem;
+ +
+ +	/* check to see of the qp is already a member of the group */
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+++=======
++ 	struct rxe_mca *elem;
++ 	unsigned long flags;
++ 
++ 	/* check to see of the qp is already a member of the group */
++ 	spin_lock_irqsave(&grp->mcg_lock, flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  	list_for_each_entry(elem, &grp->qp_list, qp_list) {
+  		if (elem->qp == qp) {
+  			err = 0;
+@@@ -121,32 -120,30 +129,50 @@@
+  
+  	err = 0;
+  out:
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&grp->mcg_lock);
+ +	spin_unlock_bh(&qp->grp_lock);
+++=======
++ 	spin_unlock_irqrestore(&grp->mcg_lock, flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  	return err;
+  }
+  
+ -static int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ -				   union ib_gid *mgid)
+ +int rxe_mcast_drop_grp_elem(struct rxe_dev *rxe, struct rxe_qp *qp,
+ +			    union ib_gid *mgid)
+  {
+++<<<<<<< HEAD
+ +	struct rxe_mc_grp *grp;
+ +	struct rxe_mc_elem *elem, *tmp;
+++=======
++ 	struct rxe_mcg *grp;
++ 	struct rxe_mca *elem, *tmp;
++ 	unsigned long flags;
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	grp = rxe_pool_get_key(&rxe->mc_grp_pool, mgid);
+  	if (!grp)
+  		goto err1;
+  
+++<<<<<<< HEAD
+ +	spin_lock_bh(&qp->grp_lock);
+ +	spin_lock_bh(&grp->mcg_lock);
+++=======
++ 	spin_lock_irqsave(&grp->mcg_lock, flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	list_for_each_entry_safe(elem, tmp, &grp->qp_list, qp_list) {
+  		if (elem->qp == qp) {
+  			list_del(&elem->qp_list);
+ +			list_del(&elem->grp_list);
+  			grp->num_qp--;
+ -			atomic_dec(&qp->mcg_num);
+  
+++<<<<<<< HEAD
+ +			spin_unlock_bh(&grp->mcg_lock);
+ +			spin_unlock_bh(&qp->grp_lock);
+++=======
++ 			spin_unlock_irqrestore(&grp->mcg_lock, flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  			rxe_drop_ref(elem);
+  			rxe_drop_ref(grp);	/* ref held by QP */
+  			rxe_drop_ref(grp);	/* ref from get_key */
+@@@ -154,8 -151,7 +180,12 @@@
+  		}
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock_bh(&grp->mcg_lock);
+ +	spin_unlock_bh(&qp->grp_lock);
+++=======
++ 	spin_unlock_irqrestore(&grp->mcg_lock, flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  	rxe_drop_ref(grp);			/* ref from get_key */
+  err1:
+  	return -EINVAL;
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index e7b233608b61,a11dab13c192..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -447,8 -444,8 +447,13 @@@ void *rxe_pool_get_index_locked(struct 
+  
+  void *rxe_pool_get_index(struct rxe_pool *pool, u32 index)
+  {
+++<<<<<<< HEAD
+ +	u8 *obj;
+ +	unsigned long flags;
+++=======
++ 	unsigned long flags;
++ 	void *obj;
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	read_lock_irqsave(&pool->pool_lock, flags);
+  	obj = rxe_pool_get_index_locked(pool, index);
+@@@ -493,8 -489,8 +498,13 @@@ void *rxe_pool_get_key_locked(struct rx
+  
+  void *rxe_pool_get_key(struct rxe_pool *pool, void *key)
+  {
+++<<<<<<< HEAD
+ +	u8 *obj;
+ +	unsigned long flags;
+++=======
++ 	unsigned long flags;
++ 	void *obj;
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	read_lock_irqsave(&pool->pool_lock, flags);
+  	obj = rxe_pool_get_key_locked(pool, key);
+diff --cc drivers/infiniband/sw/rxe/rxe_queue.c
+index 72d95398e604,dbd4971039c0..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_queue.c
++++ b/drivers/infiniband/sw/rxe/rxe_queue.c
+@@@ -135,7 -151,8 +135,12 @@@ int rxe_queue_resize(struct rxe_queue *
+  	struct rxe_queue *new_q;
+  	unsigned int num_elem = *num_elem_p;
+  	int err;
+++<<<<<<< HEAD
+ +	unsigned long flags = 0, flags1;
+++=======
++ 	unsigned long producer_flags;
++ 	unsigned long consumer_flags;
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	new_q = rxe_queue_init(q->rxe, &num_elem, elem_size, q->type);
+  	if (!new_q)
+@@@ -149,17 -166,17 +154,30 @@@
+  		goto err1;
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_lock_irqsave(consumer_lock, flags1);
+ +
+ +	if (producer_lock) {
+ +		spin_lock_irqsave(producer_lock, flags);
+ +		err = resize_finish(q, new_q, num_elem);
+ +		spin_unlock_irqrestore(producer_lock, flags);
+++=======
++ 	spin_lock_irqsave(consumer_lock, consumer_flags);
++ 
++ 	if (producer_lock) {
++ 		spin_lock_irqsave(producer_lock, producer_flags);
++ 		err = resize_finish(q, new_q, num_elem);
++ 		spin_unlock_irqrestore(producer_lock, producer_flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  	} else {
+  		err = resize_finish(q, new_q, num_elem);
+  	}
+  
+++<<<<<<< HEAD
+ +	spin_unlock_irqrestore(consumer_lock, flags1);
+++=======
++ 	spin_unlock_irqrestore(consumer_lock, consumer_flags);
+++>>>>>>> a099b08599e6 (RDMA/rxe: Revert changes from irqsave to bh locks)
+  
+  	rxe_queue_cleanup(new_q);	/* new/old dep on err */
+  	if (err)
+* Unmerged path drivers/infiniband/sw/rxe/rxe_cq.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_mcast.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+* Unmerged path drivers/infiniband/sw/rxe/rxe_queue.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_resp.c b/drivers/infiniband/sw/rxe/rxe_resp.c
+index 11f1708b8c9d..fdfcf3115f3b 100644
+--- a/drivers/infiniband/sw/rxe/rxe_resp.c
++++ b/drivers/infiniband/sw/rxe/rxe_resp.c
+@@ -297,24 +297,25 @@ static enum resp_states get_srq_wqe(struct rxe_qp *qp)
+ 	struct ib_event ev;
+ 	unsigned int count;
+ 	size_t size;
++	unsigned long flags;
+ 
+ 	if (srq->error)
+ 		return RESPST_ERR_RNR;
+ 
+-	spin_lock_bh(&srq->rq.consumer_lock);
++	spin_lock_irqsave(&srq->rq.consumer_lock, flags);
+ 
+ 	if (qp->is_user)
+ 		wqe = queue_head(q, QUEUE_TYPE_FROM_USER);
+ 	else
+ 		wqe = queue_head(q, QUEUE_TYPE_KERNEL);
+ 	if (!wqe) {
+-		spin_unlock_bh(&srq->rq.consumer_lock);
++		spin_unlock_irqrestore(&srq->rq.consumer_lock, flags);
+ 		return RESPST_ERR_RNR;
+ 	}
+ 
+ 	/* don't trust user space data */
+ 	if (unlikely(wqe->dma.num_sge > srq->rq.max_sge)) {
+-		spin_unlock_bh(&srq->rq.consumer_lock);
++		spin_unlock_irqrestore(&srq->rq.consumer_lock, flags);
+ 		pr_warn("%s: invalid num_sge in SRQ entry\n", __func__);
+ 		return RESPST_ERR_MALFORMED_WQE;
+ 	}
+@@ -335,11 +336,11 @@ static enum resp_states get_srq_wqe(struct rxe_qp *qp)
+ 		goto event;
+ 	}
+ 
+-	spin_unlock_bh(&srq->rq.consumer_lock);
++	spin_unlock_irqrestore(&srq->rq.consumer_lock, flags);
+ 	return RESPST_CHK_LENGTH;
+ 
+ event:
+-	spin_unlock_bh(&srq->rq.consumer_lock);
++	spin_unlock_irqrestore(&srq->rq.consumer_lock, flags);
+ 	ev.device = qp->ibqp.device;
+ 	ev.element.srq = qp->ibqp.srq;
+ 	ev.event = IB_EVENT_SRQ_LIMIT_REACHED;
+diff --git a/drivers/infiniband/sw/rxe/rxe_verbs.c b/drivers/infiniband/sw/rxe/rxe_verbs.c
+index e2250e9584ce..4af6962588a7 100644
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@ -396,6 +396,7 @@ static int rxe_post_srq_recv(struct ib_srq *ibsrq, const struct ib_recv_wr *wr,
+ 	int err = 0;
+ 	unsigned long flags;
+ 	struct rxe_srq *srq = to_rsrq(ibsrq);
++	unsigned long flags;
+ 
+ 	spin_lock_irqsave(&srq->rq.producer_lock, flags);
+ 
+@@ -915,6 +916,7 @@ static int rxe_req_notify_cq(struct ib_cq *ibcq, enum ib_cq_notify_flags flags)
+ 	unsigned long irq_flags;
+ 	int ret = 0;
+ 	int empty;
++	unsigned long irq_flags;
+ 
+ 	spin_lock_irqsave(&cq->cq_lock, irq_flags);
+ 	if (cq->notify != IB_CQ_NEXT_COMP)
