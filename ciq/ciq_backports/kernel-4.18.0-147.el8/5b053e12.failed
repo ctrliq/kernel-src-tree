@@ -1,0 +1,139 @@
+net: tls: Set async_capable for tls zerocopy only if we see EINPROGRESS
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: Set async_capable for tls zerocopy only if we see EINPROGRESS (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 96.35%
+commit-author Dave Watson <davejwatson@fb.com>
+commit 5b053e121ffdec851dc3a7046e9bece287a3c5b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5b053e12.failed
+
+Currently we don't zerocopy if the crypto framework async bit is set.
+However some crypto algorithms (such as x86 AESNI) support async,
+but in the context of sendmsg, will never run asynchronously.  Instead,
+check for actual EINPROGRESS return code before assuming algorithm is
+async.
+
+	Signed-off-by: Dave Watson <davejwatson@fb.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5b053e121ffdec851dc3a7046e9bece287a3c5b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_sw.c
+diff --cc net/tls/tls_sw.c
+index 3f443983a6b3,8051a9164139..000000000000
+--- a/net/tls/tls_sw.c
++++ b/net/tls/tls_sw.c
+@@@ -566,27 -654,79 +566,38 @@@ static int tls_push_record(struct sock 
+  	rec->tx_flags = flags;
+  	req = &rec->aead_req;
+  
+ -	i = msg_pl->sg.end;
+ -	sk_msg_iter_var_prev(i);
+ -
+ -	rec->content_type = record_type;
+ -	if (tls_ctx->crypto_send.info.version == TLS_1_3_VERSION) {
+ -		/* Add content type to end of message.  No padding added */
+ -		sg_set_buf(&rec->sg_content_type, &rec->content_type, 1);
+ -		sg_mark_end(&rec->sg_content_type);
+ -		sg_chain(msg_pl->sg.data, msg_pl->sg.end + 1,
+ -			 &rec->sg_content_type);
+ -	} else {
+ -		sg_mark_end(sk_msg_elem(msg_pl, i));
+ -	}
+ -
+ -	i = msg_pl->sg.start;
+ -	sg_chain(rec->sg_aead_in, 2, rec->inplace_crypto ?
+ -		 &msg_en->sg.data[i] : &msg_pl->sg.data[i]);
+ -
+ -	i = msg_en->sg.end;
+ -	sk_msg_iter_var_prev(i);
+ -	sg_mark_end(sk_msg_elem(msg_en, i));
+ +	sg_mark_end(rec->sg_plaintext_data + rec->sg_plaintext_num_elem);
+ +	sg_mark_end(rec->sg_encrypted_data + rec->sg_encrypted_num_elem);
+  
+ -	i = msg_en->sg.start;
+ -	sg_chain(rec->sg_aead_out, 2, &msg_en->sg.data[i]);
+ -
+ -	tls_make_aad(rec->aad_space, msg_pl->sg.size + tls_ctx->tx.tail_size,
+ +	tls_make_aad(rec->aad_space, rec->sg_plaintext_size,
+  		     tls_ctx->tx.rec_seq, tls_ctx->tx.rec_seq_size,
+ -		     record_type,
+ -		     tls_ctx->crypto_send.info.version);
+ +		     record_type);
+  
+  	tls_fill_prepend(tls_ctx,
+ -			 page_address(sg_page(&msg_en->sg.data[i])) +
+ -			 msg_en->sg.data[i].offset,
+ -			 msg_pl->sg.size + tls_ctx->tx.tail_size,
+ -			 record_type,
+ -			 tls_ctx->crypto_send.info.version);
+ +			 page_address(sg_page(&rec->sg_encrypted_data[1])) +
+ +			 rec->sg_encrypted_data[1].offset,
+ +			 rec->sg_plaintext_size, record_type);
+ +
+ +	tls_ctx->pending_open_record_frags = 0;
+  
+ -	tls_ctx->pending_open_record_frags = false;
+ +	rc = tls_do_encryption(sk, tls_ctx, ctx, req, rec->sg_plaintext_size);
+ +	if (rc == -EINPROGRESS)
+ +		return -EINPROGRESS;
+  
+ -	rc = tls_do_encryption(sk, tls_ctx, ctx, req,
+ -			       msg_pl->sg.size + tls_ctx->tx.tail_size, i);
+  	if (rc < 0) {
+++<<<<<<< HEAD
+ +		tls_err_abort(sk, EBADMSG);
+++=======
++ 		if (rc != -EINPROGRESS) {
++ 			tls_err_abort(sk, EBADMSG);
++ 			if (split) {
++ 				tls_ctx->pending_open_record_frags = true;
++ 				tls_merge_open_record(sk, rec, tmp, orig_end);
++ 			}
++ 		}
++ 		ctx->async_capable = 1;
+++>>>>>>> 5b053e121ffd (net: tls: Set async_capable for tls zerocopy only if we see EINPROGRESS)
+  		return rc;
+ -	} else if (split) {
+ -		msg_pl = &tmp->msg_plaintext;
+ -		msg_en = &tmp->msg_encrypted;
+ -		sk_msg_trim(sk, msg_en, msg_pl->sg.size +
+ -			    tls_ctx->tx.overhead_size);
+ -		tls_ctx->pending_open_record_frags = true;
+ -		ctx->open_rec = tmp;
+  	}
+  
+  	return tls_tx_records(sk, flags);
+@@@ -729,12 -860,12 +740,11 @@@ int tls_sw_sendmsg(struct sock *sk, str
+  	long timeo = sock_sndtimeo(sk, msg->msg_flags & MSG_DONTWAIT);
+  	struct tls_context *tls_ctx = tls_get_ctx(sk);
+  	struct tls_sw_context_tx *ctx = tls_sw_ctx_tx(tls_ctx);
+- 	struct crypto_tfm *tfm = crypto_aead_tfm(ctx->aead_send);
+- 	bool async_capable = tfm->__crt_alg->cra_flags & CRYPTO_ALG_ASYNC;
++ 	bool async_capable = ctx->async_capable;
+  	unsigned char record_type = TLS_RECORD_TYPE_DATA;
+ -	bool is_kvec = iov_iter_is_kvec(&msg->msg_iter);
+ +	bool is_kvec = msg->msg_iter.type & ITER_KVEC;
+  	bool eor = !(msg->msg_flags & MSG_MORE);
+  	size_t try_to_copy, copied = 0;
+ -	struct sk_msg *msg_pl, *msg_en;
+  	struct tls_rec *rec;
+  	int required_size;
+  	int num_async = 0;
+diff --git a/include/net/tls.h b/include/net/tls.h
+index d1f6db15d1de..790ca7db10d1 100644
+--- a/include/net/tls.h
++++ b/include/net/tls.h
+@@ -133,6 +133,7 @@ struct tls_sw_context_tx {
+ 	struct list_head tx_list;
+ 	atomic_t encrypt_pending;
+ 	int async_notify;
++	int async_capable;
+ 
+ #define BIT_TX_SCHEDULED	0
+ 	unsigned long tx_bitmask;
+* Unmerged path net/tls/tls_sw.c
