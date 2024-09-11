@@ -150,7 +150,6 @@ extern u32 __kvm_get_mdcr_el2(void);
 .macro get_vcpu_ptr vcpu, ctxt
 	get_host_ctxt \ctxt, \vcpu
 	ldr	\vcpu, [\ctxt, #HOST_CONTEXT_VCPU]
-	kern_hyp_va	\vcpu
 .endm
 
 #endif
