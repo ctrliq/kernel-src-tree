@@ -20,11 +20,6 @@
 	((sizeof(struct gfs2_log_descriptor) + (2 * sizeof(__be64) - 1)) & \
 	 ~(2 * sizeof(__be64) - 1))
 
-extern const struct gfs2_log_operations gfs2_glock_lops;
-extern const struct gfs2_log_operations gfs2_buf_lops;
-extern const struct gfs2_log_operations gfs2_revoke_lops;
-extern const struct gfs2_log_operations gfs2_databuf_lops;
-
 extern const struct gfs2_log_operations *gfs2_log_ops[];
 extern void gfs2_log_incr_head(struct gfs2_sbd *sdp);
 extern u64 gfs2_log_bmap(struct gfs2_jdesc *jd, unsigned int lbn);
