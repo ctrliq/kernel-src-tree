@@ -4803,6 +4803,8 @@ qla2x00_free_fcport(fc_port_t *fcport)
 
 		fcport->ct_desc.ct_sns = NULL;
 	}
+	list_del(&fcport->list);
+	qla2x00_clear_loop_id(fcport);
 	kfree(fcport);
 }
 
