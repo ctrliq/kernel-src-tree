@@ -1,0 +1,168 @@
+iommu/vt-d: Remove static identity map code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] vt-d: Remove static identity map code (Jerry Snitselaar) [1742234]
+Rebuild_FUZZ: 92.50%
+commit-author Lu Baolu <baolu.lu@linux.intel.com>
+commit df4f3c603aeb6dd40b74b93bf2db6d9c3213d4e1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/df4f3c60.failed
+
+The code to prepare the static identity map for various reserved
+memory ranges in intel_iommu_init() is duplicated with the default
+domain mechanism now. Remove it to avoid duplication.
+
+	Signed-off-by: James Sewart <jamessewart@arista.com>
+	Signed-off-by: Lu Baolu <baolu.lu@linux.intel.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit df4f3c603aeb6dd40b74b93bf2db6d9c3213d4e1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/intel-iommu.c
+diff --cc drivers/iommu/intel-iommu.c
+index df7ae148ab9d,d9d7d669de81..000000000000
+--- a/drivers/iommu/intel-iommu.c
++++ b/drivers/iommu/intel-iommu.c
+@@@ -2978,68 -2975,6 +2953,71 @@@ static int device_def_domain_type(struc
+  			IOMMU_DOMAIN_IDENTITY : 0;
+  }
+  
+++<<<<<<< HEAD
+ +static inline int iommu_should_identity_map(struct device *dev)
+ +{
+ +	return device_def_domain_type(dev) == IOMMU_DOMAIN_IDENTITY;
+ +}
+ +
+ +static int __init dev_prepare_static_identity_mapping(struct device *dev, int hw)
+ +{
+ +	int ret;
+ +
+ +	if (!iommu_should_identity_map(dev))
+ +		return 0;
+ +
+ +	ret = domain_add_dev_info(si_domain, dev);
+ +	if (!ret)
+ +		pr_info("%s identity mapping for device %s\n",
+ +			hw ? "Hardware" : "Software", dev_name(dev));
+ +	else if (ret == -ENODEV)
+ +		/* device not associated with an iommu */
+ +		ret = 0;
+ +
+ +	return ret;
+ +}
+ +
+ +
+ +static int __init iommu_prepare_static_identity_mapping(int hw)
+ +{
+ +	struct pci_dev *pdev = NULL;
+ +	struct dmar_drhd_unit *drhd;
+ +	struct intel_iommu *iommu;
+ +	struct device *dev;
+ +	int i;
+ +	int ret = 0;
+ +
+ +	for_each_pci_dev(pdev) {
+ +		ret = dev_prepare_static_identity_mapping(&pdev->dev, hw);
+ +		if (ret)
+ +			return ret;
+ +	}
+ +
+ +	for_each_active_iommu(iommu, drhd)
+ +		for_each_active_dev_scope(drhd->devices, drhd->devices_cnt, i, dev) {
+ +			struct acpi_device_physical_node *pn;
+ +			struct acpi_device *adev;
+ +
+ +			if (dev->bus != &acpi_bus_type)
+ +				continue;
+ +
+ +			adev= to_acpi_device(dev);
+ +			mutex_lock(&adev->physical_node_lock);
+ +			list_for_each_entry(pn, &adev->physical_node_list, node) {
+ +				ret = dev_prepare_static_identity_mapping(pn->dev, hw);
+ +				if (ret)
+ +					break;
+ +			}
+ +			mutex_unlock(&adev->physical_node_lock);
+ +			if (ret)
+ +				return ret;
+ +		}
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> df4f3c603aeb (iommu/vt-d: Remove static identity map code)
+  static void intel_iommu_init_qi(struct intel_iommu *iommu)
+  {
+  	/*
+@@@ -3395,63 -3326,10 +3369,12 @@@ static int __init init_dmars(void
+  
+  	check_tylersburg_isoch();
+  
+ -	ret = si_domain_init(hw_pass_through);
+ -	if (ret)
+ -		goto free_iommu;
+ +	if (iommu_identity_mapping) {
+ +		ret = si_domain_init(hw_pass_through);
+ +		if (ret)
+ +			goto free_iommu;
+ +	}
+  
+- 
+- 	/*
+- 	 * If we copied translations from a previous kernel in the kdump
+- 	 * case, we can not assign the devices to domains now, as that
+- 	 * would eliminate the old mappings. So skip this part and defer
+- 	 * the assignment to device driver initialization time.
+- 	 */
+- 	if (copied_tables)
+- 		goto domains_done;
+- 
+- 	/*
+- 	 * If pass through is not set or not enabled, setup context entries for
+- 	 * identity mappings for rmrr, gfx, and isa and may fall back to static
+- 	 * identity mapping if iommu_identity_mapping is set.
+- 	 */
+- 	if (iommu_identity_mapping) {
+- 		ret = iommu_prepare_static_identity_mapping(hw_pass_through);
+- 		if (ret) {
+- 			pr_crit("Failed to setup IOMMU pass-through\n");
+- 			goto free_iommu;
+- 		}
+- 	}
+- 	/*
+- 	 * For each rmrr
+- 	 *   for each dev attached to rmrr
+- 	 *   do
+- 	 *     locate drhd for dev, alloc domain for dev
+- 	 *     allocate free domain
+- 	 *     allocate page table entries for rmrr
+- 	 *     if context not allocated for bus
+- 	 *           allocate and init context
+- 	 *           set present in root table for this bus
+- 	 *     init context with domain, translation etc
+- 	 *    endfor
+- 	 * endfor
+- 	 */
+- 	pr_info("Setting RMRR:\n");
+- 	for_each_rmrr_units(rmrr) {
+- 		/* some BIOS lists non-exist devices in DMAR table. */
+- 		for_each_active_dev_scope(rmrr->devices, rmrr->devices_cnt,
+- 					  i, dev) {
+- 			ret = iommu_prepare_rmrr_dev(rmrr, dev);
+- 			if (ret)
+- 				pr_err("Mapping reserved region failed\n");
+- 		}
+- 	}
+- 
+- 	iommu_prepare_isa();
+- 
+- domains_done:
+- 
+  	/*
+  	 * for each drhd
+  	 *   enable fault log
+* Unmerged path drivers/iommu/intel-iommu.c
