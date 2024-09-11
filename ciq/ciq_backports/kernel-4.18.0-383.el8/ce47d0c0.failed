@@ -1,0 +1,146 @@
+x86/sev: Allow #VC exceptions on the VC2 stack
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Joerg Roedel <jroedel@suse.de>
+commit ce47d0c00ff5621ae5825c9d81722b23b0df395e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/ce47d0c0.failed
+
+When code running on the VC2 stack causes a nested VC exception, the
+handler will not handle it as expected but goes again into the error
+path.
+
+The result is that the panic() call happening when the VC exception
+was raised in an invalid context is called recursively. Fix this by
+checking the interrupted stack too and only call panic if it is not
+the VC2 stack.
+
+ [ bp: Fixup comment. ]
+
+Fixes: 0786138c78e79 ("x86/sev-es: Add a Runtime #VC Exception Handler")
+	Reported-by: Xinyang Ge <xing@microsoft.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211021080833.30875-3-joro@8bytes.org
+(cherry picked from commit ce47d0c00ff5621ae5825c9d81722b23b0df395e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/sev.c
+diff --cc arch/x86/kernel/sev.c
+index 337dc4394c94,2de1f3604b7e..000000000000
+--- a/arch/x86/kernel/sev.c
++++ b/arch/x86/kernel/sev.c
+@@@ -1240,22 -1324,23 +1240,39 @@@ static __always_inline bool is_vc2_stac
+  	return (sp >= __this_cpu_ist_bottom_va(VC2) && sp < __this_cpu_ist_top_va(VC2));
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * Main #VC exception handler. It is called when the entry code was able to
+ + * switch off the IST to a safe kernel stack.
+ + *
+ + * With the current implementation it is always possible to switch to a safe
+ + * stack because #VC exceptions only happen at known places, like intercepted
+ + * instructions or accesses to MMIO areas/IO ports. They can also happen with
+ + * code instrumentation when the hypervisor intercepts #DB, but the critical
+ + * paths are forbidden to be instrumented, so #DB exceptions currently also
+ + * only happen in safe places.
+ + */
+ +__visible noinstr void safe_stack_exc_vmm_communication(struct pt_regs *regs, long error_code)
+++=======
++ static __always_inline bool vc_from_invalid_context(struct pt_regs *regs)
++ {
++ 	unsigned long sp, prev_sp;
++ 
++ 	sp      = (unsigned long)regs;
++ 	prev_sp = regs->sp;
++ 
++ 	/*
++ 	 * If the code was already executing on the VC2 stack when the #VC
++ 	 * happened, let it proceed to the normal handling routine. This way the
++ 	 * code executing on the VC2 stack can cause #VC exceptions to get handled.
++ 	 */
++ 	return is_vc2_stack(sp) && !is_vc2_stack(prev_sp);
++ }
++ 
++ static bool vc_raw_handle_exception(struct pt_regs *regs, unsigned long error_code)
+++>>>>>>> ce47d0c00ff5 (x86/sev: Allow #VC exceptions on the VC2 stack)
+  {
+ +	struct sev_es_runtime_data *data = this_cpu_read(runtime_data);
+  	struct ghcb_state state;
+  	struct es_em_ctxt ctxt;
+  	enum es_result result;
+@@@ -1331,23 -1392,52 +1348,56 @@@
+  		BUG();
+  	}
+  
+ -	return ret;
+ -}
+ +out:
+ +	instrumentation_end();
+  
+ -static __always_inline bool vc_is_db(unsigned long error_code)
+ -{
+ -	return error_code == SVM_EXIT_EXCP_BASE + X86_TRAP_DB;
+ -}
+ +	return;
+  
+ -/*
+ - * Runtime #VC exception handler when raised from kernel mode. Runs in NMI mode
+ - * and will panic when an error happens.
+ - */
+ -DEFINE_IDTENTRY_VC_KERNEL(exc_vmm_communication)
+ -{
+ -	irqentry_state_t irq_state;
+ +fail:
+ +	if (user_mode(regs)) {
+ +		/*
+ +		 * Do not kill the machine if user-space triggered the
+ +		 * exception. Send SIGBUS instead and let user-space deal with
+ +		 * it.
+ +		 */
+ +		force_sig_fault(SIGBUS, BUS_OBJERR, (void __user *)0, current);
+ +	} else {
+ +		pr_emerg("PANIC: Unhandled #VC exception in kernel space (result=%d)\n",
+ +			 result);
+  
+++<<<<<<< HEAD
+++=======
++ 	/*
++ 	 * With the current implementation it is always possible to switch to a
++ 	 * safe stack because #VC exceptions only happen at known places, like
++ 	 * intercepted instructions or accesses to MMIO areas/IO ports. They can
++ 	 * also happen with code instrumentation when the hypervisor intercepts
++ 	 * #DB, but the critical paths are forbidden to be instrumented, so #DB
++ 	 * exceptions currently also only happen in safe places.
++ 	 *
++ 	 * But keep this here in case the noinstr annotations are violated due
++ 	 * to bug elsewhere.
++ 	 */
++ 	if (unlikely(vc_from_invalid_context(regs))) {
++ 		instrumentation_begin();
++ 		panic("Can't handle #VC exception from unsupported context\n");
++ 		instrumentation_end();
++ 	}
++ 
++ 	/*
++ 	 * Handle #DB before calling into !noinstr code to avoid recursive #DB.
++ 	 */
++ 	if (vc_is_db(error_code)) {
++ 		exc_debug(regs);
++ 		return;
++ 	}
++ 
++ 	irq_state = irqentry_nmi_enter(regs);
++ 
++ 	instrumentation_begin();
++ 
++ 	if (!vc_raw_handle_exception(regs, error_code)) {
+++>>>>>>> ce47d0c00ff5 (x86/sev: Allow #VC exceptions on the VC2 stack)
+  		/* Show some debug info */
+  		show_regs(regs);
+  
+* Unmerged path arch/x86/kernel/sev.c
