@@ -1,0 +1,240 @@
+ionic: optimize fastpath struct usage
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Shannon Nelson <snelson@pensando.io>
+commit f37bc3462e80d2dac9f0b2868720782a94dfb523
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/f37bc346.failed
+
+Clean up a couple of struct uses to make for better fast path
+access.
+
+	Signed-off-by: Shannon Nelson <snelson@pensando.io>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f37bc3462e80d2dac9f0b2868720782a94dfb523)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+diff --cc drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+index 8369e1e143a1,c472c14b3a80..000000000000
+--- a/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_txrx.c
+@@@ -1120,19 -1118,16 +1118,24 @@@ static int ionic_tx(struct ionic_queue 
+  
+  static int ionic_tx_descs_needed(struct ionic_queue *q, struct sk_buff *skb)
+  {
+- 	int sg_elems = q->lif->qtype_info[IONIC_QTYPE_TXQ].max_sg_elems;
+  	struct ionic_tx_stats *stats = q_to_tx_stats(q);
+ +	int ndescs;
+  	int err;
+  
+ -	/* If TSO, need roundup(skb->len/mss) descs */
+ +	/* Each desc is mss long max, so a descriptor for each gso_seg */
+  	if (skb_is_gso(skb))
+ -		return (skb->len / skb_shinfo(skb)->gso_size) + 1;
+ +		ndescs = skb_shinfo(skb)->gso_segs;
+ +	else
+ +		ndescs = 1;
+  
+++<<<<<<< HEAD
+ +	if (skb_shinfo(skb)->nr_frags <= sg_elems)
+ +		return ndescs;
+++=======
++ 	/* If non-TSO, just need 1 desc and nr_frags sg elems */
++ 	if (skb_shinfo(skb)->nr_frags <= q->max_sg_elems)
++ 		return 1;
+++>>>>>>> f37bc3462e80 (ionic: optimize fastpath struct usage)
+  
+  	/* Too many frags, so linearize */
+  	err = skb_linearize(skb);
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_dev.c b/drivers/net/ethernet/pensando/ionic/ionic_dev.c
+index fb2b5bf179d7..b951bf5bbdc4 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.c
+@@ -585,9 +585,9 @@ void ionic_q_sg_map(struct ionic_queue *q, void *base, dma_addr_t base_pa)
+ void ionic_q_post(struct ionic_queue *q, bool ring_doorbell, ionic_desc_cb cb,
+ 		  void *cb_arg)
+ {
+-	struct device *dev = q->lif->ionic->dev;
+ 	struct ionic_desc_info *desc_info;
+ 	struct ionic_lif *lif = q->lif;
++	struct device *dev = q->dev;
+ 
+ 	desc_info = &q->info[q->head_idx];
+ 	desc_info->cb = cb;
+@@ -629,7 +629,7 @@ void ionic_q_service(struct ionic_queue *q, struct ionic_cq_info *cq_info,
+ 
+ 	/* stop index must be for a descriptor that is not yet completed */
+ 	if (unlikely(!ionic_q_is_posted(q, stop_index)))
+-		dev_err(q->lif->ionic->dev,
++		dev_err(q->dev,
+ 			"ionic stop is not posted %s stop %u tail %u head %u\n",
+ 			q->name, stop_index, q->tail_idx, q->head_idx);
+ 
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_dev.h b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+index 0f877c86eba6..339824cfd618 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_dev.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_dev.h
+@@ -205,10 +205,12 @@ struct ionic_queue {
+ 	struct device *dev;
+ 	struct ionic_lif *lif;
+ 	struct ionic_desc_info *info;
++	u64 dbval;
+ 	u16 head_idx;
+ 	u16 tail_idx;
+ 	unsigned int index;
+ 	unsigned int num_descs;
++	unsigned int max_sg_elems;
+ 	u64 dbell_count;
+ 	u64 stop;
+ 	u64 wake;
+@@ -217,7 +219,6 @@ struct ionic_queue {
+ 	unsigned int type;
+ 	unsigned int hw_index;
+ 	unsigned int hw_type;
+-	u64 dbval;
+ 	union {
+ 		void *base;
+ 		struct ionic_txq_desc *txq;
+@@ -235,7 +236,7 @@ struct ionic_queue {
+ 	unsigned int sg_desc_size;
+ 	unsigned int pid;
+ 	char name[IONIC_QUEUE_NAME_MAX_SZ];
+-};
++} ____cacheline_aligned_in_smp;
+ 
+ #define IONIC_INTR_INDEX_NOT_ASSIGNED	-1
+ #define IONIC_INTR_NAME_MAX_SZ		32
+@@ -262,7 +263,7 @@ struct ionic_cq {
+ 	u64 compl_count;
+ 	void *base;
+ 	dma_addr_t base_pa;
+-};
++} ____cacheline_aligned_in_smp;
+ 
+ struct ionic;
+ 
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_lif.c b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+index be15aa46b7e4..8cbf8161f102 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.c
+@@ -494,6 +494,7 @@ static int ionic_qcq_alloc(struct ionic_lif *lif, unsigned int type,
+ 		goto err_out;
+ 	}
+ 
++	new->q.dev = dev;
+ 	new->flags = flags;
+ 
+ 	new->q.info = devm_kcalloc(dev, num_descs, sizeof(*new->q.info),
+@@ -505,6 +506,7 @@ static int ionic_qcq_alloc(struct ionic_lif *lif, unsigned int type,
+ 	}
+ 
+ 	new->q.type = type;
++	new->q.max_sg_elems = lif->qtype_info[type].max_sg_elems;
+ 
+ 	err = ionic_q_init(lif, idev, &new->q, index, name, num_descs,
+ 			   desc_size, sg_desc_size, pid);
+@@ -2449,7 +2451,6 @@ int ionic_lif_alloc(struct ionic *ionic)
+ 	lif->index = 0;
+ 	lif->ntxq_descs = IONIC_DEF_TXRX_DESC;
+ 	lif->nrxq_descs = IONIC_DEF_TXRX_DESC;
+-	lif->tx_budget = IONIC_TX_BUDGET_DEFAULT;
+ 
+ 	/* Convert the default coalesce value to actual hw resolution */
+ 	lif->rx_coalesce_usecs = IONIC_ITR_COAL_USEC_DEFAULT;
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_lif.h b/drivers/net/ethernet/pensando/ionic/ionic_lif.h
+index 9bed42719ae5..7f44e59fdfb9 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_lif.h
++++ b/drivers/net/ethernet/pensando/ionic/ionic_lif.h
+@@ -159,16 +159,11 @@ struct ionic_qtype_info {
+ 
+ #define IONIC_LIF_NAME_MAX_SZ		32
+ struct ionic_lif {
+-	char name[IONIC_LIF_NAME_MAX_SZ];
+-	struct list_head list;
+ 	struct net_device *netdev;
+ 	DECLARE_BITMAP(state, IONIC_LIF_F_STATE_SIZE);
+ 	struct ionic *ionic;
+-	bool registered;
+ 	unsigned int index;
+ 	unsigned int hw_index;
+-	unsigned int kern_pid;
+-	u64 __iomem *kern_dbpage;
+ 	struct mutex queue_lock;	/* lock for queue structures */
+ 	spinlock_t adminq_lock;		/* lock for AdminQ operations */
+ 	struct ionic_qcq *adminqcq;
+@@ -177,20 +172,25 @@ struct ionic_lif {
+ 	struct ionic_tx_stats *txqstats;
+ 	struct ionic_qcq **rxqcqs;
+ 	struct ionic_rx_stats *rxqstats;
++	struct ionic_deferred deferred;
++	struct work_struct tx_timeout_work;
+ 	u64 last_eid;
++	unsigned int kern_pid;
++	u64 __iomem *kern_dbpage;
+ 	unsigned int neqs;
+ 	unsigned int nxqs;
+ 	unsigned int ntxq_descs;
+ 	unsigned int nrxq_descs;
+ 	u32 rx_copybreak;
+-	u32 tx_budget;
+ 	unsigned int rx_mode;
+ 	u64 hw_features;
++	bool registered;
+ 	bool mc_overflow;
+-	unsigned int nmcast;
+ 	bool uc_overflow;
+ 	u16 lif_type;
++	unsigned int nmcast;
+ 	unsigned int nucast;
++	char name[IONIC_LIF_NAME_MAX_SZ];
+ 
+ 	union ionic_lif_identity *identity;
+ 	struct ionic_lif_info *info;
+@@ -205,16 +205,14 @@ struct ionic_lif {
+ 	u32 rss_ind_tbl_sz;
+ 
+ 	struct ionic_rx_filters rx_filters;
+-	struct ionic_deferred deferred;
+-	unsigned long *dbid_inuse;
+-	unsigned int dbid_count;
+-	struct dentry *dentry;
+ 	u32 rx_coalesce_usecs;		/* what the user asked for */
+ 	u32 rx_coalesce_hw;		/* what the hw is using */
+ 	u32 tx_coalesce_usecs;		/* what the user asked for */
+ 	u32 tx_coalesce_hw;		/* what the hw is using */
++	unsigned long *dbid_inuse;
++	unsigned int dbid_count;
+ 
+-	struct work_struct tx_timeout_work;
++	struct dentry *dentry;
+ };
+ 
+ struct ionic_queue_params {
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_main.c b/drivers/net/ethernet/pensando/ionic/ionic_main.c
+index fbc57de6683e..14ece909a451 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_main.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_main.c
+@@ -234,17 +234,15 @@ static void ionic_adminq_cb(struct ionic_queue *q,
+ {
+ 	struct ionic_admin_ctx *ctx = cb_arg;
+ 	struct ionic_admin_comp *comp;
+-	struct device *dev;
+ 
+ 	if (!ctx)
+ 		return;
+ 
+ 	comp = cq_info->cq_desc;
+-	dev = &q->lif->netdev->dev;
+ 
+ 	memcpy(&ctx->comp, comp, sizeof(*comp));
+ 
+-	dev_dbg(dev, "comp admin queue command:\n");
++	dev_dbg(q->dev, "comp admin queue command:\n");
+ 	dynamic_hex_dump("comp ", DUMP_PREFIX_OFFSET, 16, 1,
+ 			 &ctx->comp, sizeof(ctx->comp), true);
+ 
+* Unmerged path drivers/net/ethernet/pensando/ionic/ionic_txrx.c
