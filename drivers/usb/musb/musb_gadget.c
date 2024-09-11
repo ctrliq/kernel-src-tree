@@ -1316,7 +1316,7 @@ done:
 }
 
 /*
- * Set or clear the halt bit of an endpoint. A halted enpoint won't tx/rx any
+ * Set or clear the halt bit of an endpoint. A halted endpoint won't tx/rx any
  * data but will queue requests.
  *
  * exported to ep0 code
