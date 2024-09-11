@@ -1,0 +1,144 @@
+iommu: Factor iommu_iotlb_gather_is_disjoint() out
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Nadav Amit <namit@vmware.com>
+commit febb82c208e481eee057c70fa3176bb48712a111
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/febb82c2.failed
+
+Refactor iommu_iotlb_gather_add_page() and factor out the logic that
+detects whether IOTLB gather range and a new range are disjoint. To be
+used by the next patch that implements different gathering logic for
+AMD.
+
+Note that updating gather->pgsize unconditionally does not affect
+correctness as the function had (and has) an invariant, in which
+gather->pgsize always represents the flushing granularity of its range.
+Arguably, “size" should never be zero, but lets assume for the matter of
+discussion that it might.
+
+If "size" equals to "gather->pgsize", then the assignment in question
+has no impact.
+
+Otherwise, if "size" is non-zero, then iommu_iotlb_sync() would
+initialize the size and range (see iommu_iotlb_gather_init()), and the
+invariant is kept.
+
+Otherwise, "size" is zero, and "gather" already holds a range, so
+gather->pgsize is non-zero and (gather->pgsize && gather->pgsize !=
+size) is true. Therefore, again, iommu_iotlb_sync() would be called and
+initialize the size.
+
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Jiajun Cao <caojiajun@vmware.com>
+	Cc: Lu Baolu <baolu.lu@linux.intel.com>
+	Cc: iommu@lists.linux-foundation.org
+	Cc: linux-kernel@vger.kernel.org>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Will Deacon <will@kernel.org>
+	Signed-off-by: Nadav Amit <namit@vmware.com>
+Link: https://lore.kernel.org/r/20210723093209.714328-5-namit@vmware.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit febb82c208e481eee057c70fa3176bb48712a111)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/iommu.h
+diff --cc include/linux/iommu.h
+index 486407c90575,979a5ceeea55..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -582,6 -497,60 +582,63 @@@ static inline void iommu_iotlb_sync(str
+  	iommu_iotlb_gather_init(iotlb_gather);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * iommu_iotlb_gather_is_disjoint - Checks whether a new range is disjoint
++  *
++  * @gather: TLB gather data
++  * @iova: start of page to invalidate
++  * @size: size of page to invalidate
++  *
++  * Helper for IOMMU drivers to check whether a new range and the gathered range
++  * are disjoint. For many IOMMUs, flushing the IOMMU in this case is better
++  * than merging the two, which might lead to unnecessary invalidations.
++  */
++ static inline
++ bool iommu_iotlb_gather_is_disjoint(struct iommu_iotlb_gather *gather,
++ 				    unsigned long iova, size_t size)
++ {
++ 	unsigned long start = iova, end = start + size - 1;
++ 
++ 	return gather->end != 0 &&
++ 		(end + 1 < gather->start || start > gather->end + 1);
++ }
++ 
++ 
++ /**
++  * iommu_iotlb_gather_add_range - Gather for address-based TLB invalidation
++  * @gather: TLB gather data
++  * @iova: start of page to invalidate
++  * @size: size of page to invalidate
++  *
++  * Helper for IOMMU drivers to build arbitrarily-sized invalidation commands
++  * where only the address range matters, and simply minimising intermediate
++  * syncs is preferred.
++  */
++ static inline void iommu_iotlb_gather_add_range(struct iommu_iotlb_gather *gather,
++ 						unsigned long iova, size_t size)
++ {
++ 	unsigned long end = iova + size - 1;
++ 
++ 	if (gather->start > iova)
++ 		gather->start = iova;
++ 	if (gather->end < end)
++ 		gather->end = end;
++ }
++ 
++ /**
++  * iommu_iotlb_gather_add_page - Gather for page-based TLB invalidation
++  * @domain: IOMMU domain to be invalidated
++  * @gather: TLB gather data
++  * @iova: start of page to invalidate
++  * @size: size of page to invalidate
++  *
++  * Helper for IOMMU drivers to build invalidation commands based on individual
++  * pages, or with page size/table level hints which cannot be gathered if they
++  * differ.
++  */
+++>>>>>>> febb82c208e4 (iommu: Factor iommu_iotlb_gather_is_disjoint() out)
+  static inline void iommu_iotlb_gather_add_page(struct iommu_domain *domain,
+  					       struct iommu_iotlb_gather *gather,
+  					       unsigned long iova, size_t size)
+@@@ -593,18 -560,12 +648,20 @@@
+  	 * a different granularity, then sync the TLB so that the gather
+  	 * structure can be rewritten.
+  	 */
+- 	if (gather->pgsize != size ||
+- 	    end + 1 < gather->start || start > gather->end + 1) {
+- 		if (gather->pgsize)
+- 			iommu_iotlb_sync(domain, gather);
+- 		gather->pgsize = size;
+- 	}
++ 	if ((gather->pgsize && gather->pgsize != size) ||
++ 	    iommu_iotlb_gather_is_disjoint(gather, iova, size))
++ 		iommu_iotlb_sync(domain, gather);
+  
+++<<<<<<< HEAD
+ +	if (gather->end < end)
+ +		gather->end = end;
+ +
+ +	if (gather->start > start)
+ +		gather->start = start;
+++=======
++ 	gather->pgsize = size;
++ 	iommu_iotlb_gather_add_range(gather, iova, size);
+++>>>>>>> febb82c208e4 (iommu: Factor iommu_iotlb_gather_is_disjoint() out)
+  }
+  
+  /* PCI device grouping function */
+* Unmerged path include/linux/iommu.h
