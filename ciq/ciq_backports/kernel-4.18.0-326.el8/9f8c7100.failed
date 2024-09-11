@@ -1,0 +1,196 @@
+net/mlx5: E-Switch, Prepare to return total vports from eswitch struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Parav Pandit <parav@nvidia.com>
+commit 9f8c7100c8f9879b7e972205cd1f33f0bc1cc8cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/9f8c7100.failed
+
+Total vports are already stored during eswitch initialization. Instead
+of calculating everytime, read directly from eswitch.
+
+Additionally, host PF's SF vport information is available using
+QUERY_HCA_CAP command. It is not available through HCA_CAP of the
+eswitch manager PF.
+Hence, this patch prepares the return total eswitch vport count from the
+existing eswitch struct.
+
+This further helps to keep eswitch port counting macros and logic within
+eswitch.
+
+	Signed-off-by: Parav Pandit <parav@nvidia.com>
+	Reviewed-by: Roi Dayan <roid@nvidia.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 9f8c7100c8f9879b7e972205cd1f33f0bc1cc8cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+index 6f56131481bc,f0974aa94574..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+@@@ -2520,4 -2105,119 +2520,118 @@@ bool mlx5_esw_multipath_prereq(struct m
+  		dev1->priv.eswitch->mode == MLX5_ESWITCH_OFFLOADS);
+  }
+  
+ -int mlx5_esw_event_notifier_register(struct mlx5_eswitch *esw, struct notifier_block *nb)
+ -{
+ -	return blocking_notifier_chain_register(&esw->n_head, nb);
+ -}
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5_esw_event_notifier_unregister(struct mlx5_eswitch *esw, struct notifier_block *nb)
++ {
++ 	blocking_notifier_chain_unregister(&esw->n_head, nb);
++ }
++ 
++ /**
++  * mlx5_esw_hold() - Try to take a read lock on esw mode lock.
++  * @mdev: mlx5 core device.
++  *
++  * Should be called by esw resources callers.
++  *
++  * Return: true on success or false.
++  */
++ bool mlx5_esw_hold(struct mlx5_core_dev *mdev)
++ {
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	/* e.g. VF doesn't have eswitch so nothing to do */
++ 	if (!mlx5_esw_allowed(esw))
++ 		return true;
++ 
++ 	if (down_read_trylock(&esw->mode_lock) != 0)
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ /**
++  * mlx5_esw_release() - Release a read lock on esw mode lock.
++  * @mdev: mlx5 core device.
++  */
++ void mlx5_esw_release(struct mlx5_core_dev *mdev)
++ {
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	if (mlx5_esw_allowed(esw))
++ 		up_read(&esw->mode_lock);
++ }
++ 
++ /**
++  * mlx5_esw_get() - Increase esw user count.
++  * @mdev: mlx5 core device.
++  */
++ void mlx5_esw_get(struct mlx5_core_dev *mdev)
++ {
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	if (mlx5_esw_allowed(esw))
++ 		atomic64_inc(&esw->user_count);
++ }
++ 
++ /**
++  * mlx5_esw_put() - Decrease esw user count.
++  * @mdev: mlx5 core device.
++  */
++ void mlx5_esw_put(struct mlx5_core_dev *mdev)
++ {
++ 	struct mlx5_eswitch *esw = mdev->priv.eswitch;
++ 
++ 	if (mlx5_esw_allowed(esw))
++ 		atomic64_dec_if_positive(&esw->user_count);
++ }
++ 
++ /**
++  * mlx5_esw_try_lock() - Take a write lock on esw mode lock.
++  * @esw: eswitch device.
++  *
++  * Should be called by esw mode change routine.
++  *
++  * Return:
++  * * 0       - esw mode if successfully locked and refcount is 0.
++  * * -EBUSY  - refcount is not 0.
++  * * -EINVAL - In the middle of switching mode or lock is already held.
++  */
++ int mlx5_esw_try_lock(struct mlx5_eswitch *esw)
++ {
++ 	if (down_write_trylock(&esw->mode_lock) == 0)
++ 		return -EINVAL;
++ 
++ 	if (atomic64_read(&esw->user_count) > 0) {
++ 		up_write(&esw->mode_lock);
++ 		return -EBUSY;
++ 	}
++ 
++ 	return esw->mode;
++ }
++ 
++ /**
++  * mlx5_esw_unlock() - Release write lock on esw mode lock
++  * @esw: eswitch device.
++  */
++ void mlx5_esw_unlock(struct mlx5_eswitch *esw)
++ {
++ 	up_write(&esw->mode_lock);
++ }
++ 
++ /**
++  * mlx5_eswitch_get_total_vports - Get total vports of the eswitch
++  *
++  * @dev: Pointer to core device
++  *
++  * mlx5_eswitch_get_total_vports returns total number of eswitch vports.
++  */
++ u16 mlx5_eswitch_get_total_vports(const struct mlx5_core_dev *dev)
++ {
++ 	struct mlx5_eswitch *esw;
++ 
++ 	esw = dev->priv.eswitch;
++ 	return mlx5_esw_allowed(esw) ? esw->total_vports : 0;
++ }
++ EXPORT_SYMBOL_GPL(mlx5_eswitch_get_total_vports);
+++>>>>>>> 9f8c7100c8f9 (net/mlx5: E-Switch, Prepare to return total vports from eswitch struct)
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+index f8d344738e70..b27125e69370 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch.h
+@@ -521,6 +521,14 @@ static inline u16 mlx5_eswitch_first_host_vport_num(struct mlx5_core_dev *dev)
+ 		MLX5_VPORT_PF : MLX5_VPORT_FIRST_VF;
+ }
+ 
++#define MLX5_VPORT_PF_PLACEHOLDER		(1u)
++#define MLX5_VPORT_UPLINK_PLACEHOLDER		(1u)
++#define MLX5_VPORT_ECPF_PLACEHOLDER(mdev)	(mlx5_ecpf_vport_exists(mdev))
++
++#define MLX5_SPECIAL_VPORTS(mdev) (MLX5_VPORT_PF_PLACEHOLDER +		\
++				   MLX5_VPORT_UPLINK_PLACEHOLDER +	\
++				   MLX5_VPORT_ECPF_PLACEHOLDER(mdev))
++
+ static inline int mlx5_esw_sf_start_idx(const struct mlx5_eswitch *esw)
+ {
+ 	/* PF and VF vports indices start from 0 to max_vfs */
+diff --git a/include/linux/mlx5/vport.h b/include/linux/mlx5/vport.h
+index 4db87bcfce7b..aad53cb72f17 100644
+--- a/include/linux/mlx5/vport.h
++++ b/include/linux/mlx5/vport.h
+@@ -36,14 +36,6 @@
+ #include <linux/mlx5/driver.h>
+ #include <linux/mlx5/device.h>
+ 
+-#define MLX5_VPORT_PF_PLACEHOLDER		(1u)
+-#define MLX5_VPORT_UPLINK_PLACEHOLDER		(1u)
+-#define MLX5_VPORT_ECPF_PLACEHOLDER(mdev)	(mlx5_ecpf_vport_exists(mdev))
+-
+-#define MLX5_SPECIAL_VPORTS(mdev) (MLX5_VPORT_PF_PLACEHOLDER +		\
+-				   MLX5_VPORT_UPLINK_PLACEHOLDER +	\
+-				   MLX5_VPORT_ECPF_PLACEHOLDER(mdev))
+-
+ #define MLX5_VPORT_MANAGER(mdev)					\
+ 	(MLX5_CAP_GEN(mdev, vport_group_manager) &&			\
+ 	 (MLX5_CAP_GEN(mdev, port_type) == MLX5_CAP_PORT_TYPE_ETH) &&	\
