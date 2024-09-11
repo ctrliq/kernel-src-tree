@@ -1,0 +1,114 @@
+arm64: Do not pass tagged addresses to __is_lm_address()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Catalin Marinas <catalin.marinas@arm.com>
+commit 91cb2c8b072e00632adf463b78b44f123d46a0fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/91cb2c8b.failed
+
+Commit 519ea6f1c82f ("arm64: Fix kernel address detection of
+__is_lm_address()") fixed the incorrect validation of addresses below
+PAGE_OFFSET. However, it no longer allowed tagged addresses to be passed
+to virt_addr_valid().
+
+Fix this by explicitly resetting the pointer tag prior to invoking
+__is_lm_address(). This is consistent with the __lm_to_phys() macro.
+
+Fixes: 519ea6f1c82f ("arm64: Fix kernel address detection of __is_lm_address()")
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+	Acked-by: Ard Biesheuvel <ardb@kernel.org>
+	Cc: <stable@vger.kernel.org> # 5.4.x
+	Cc: Will Deacon <will@kernel.org>
+	Cc: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Mark Rutland <mark.rutland@arm.com>
+Link: https://lore.kernel.org/r/20210201190634.22942-2-catalin.marinas@arm.com
+(cherry picked from commit 91cb2c8b072e00632adf463b78b44f123d46a0fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/memory.h
+diff --cc arch/arm64/include/asm/memory.h
+index 630eaf618e50,3c1aaa522cbd..000000000000
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@@ -336,30 -314,41 +336,57 @@@ static inline void *phys_to_virt(phys_a
+   */
+  #define ARCH_PFN_OFFSET		((unsigned long)PHYS_PFN_OFFSET)
+  
+ -#if !defined(CONFIG_SPARSEMEM_VMEMMAP) || defined(CONFIG_DEBUG_VIRTUAL)
+ -#define virt_to_page(x)		pfn_to_page(virt_to_pfn(x))
+ +#ifndef CONFIG_SPARSEMEM_VMEMMAP
+ +#define virt_to_page(kaddr)	pfn_to_page(__pa(kaddr) >> PAGE_SHIFT)
+  #else
+ -#define page_to_virt(x)	({						\
+ -	__typeof__(x) __page = x;					\
+ -	u64 __idx = ((u64)__page - VMEMMAP_START) / sizeof(struct page);\
+ -	u64 __addr = PAGE_OFFSET + (__idx * PAGE_SIZE);			\
+ -	(void *)__tag_set((const void *)__addr, page_kasan_tag(__page));\
+ +#define __virt_to_pgoff(kaddr)	(((u64)(kaddr) - PAGE_OFFSET) / PAGE_SIZE * sizeof(struct page))
+ +#define __page_to_voff(kaddr)	(((u64)(kaddr) - VMEMMAP_START) * PAGE_SIZE / sizeof(struct page))
+ +
+ +#define page_to_virt(page)	({					\
+ +	unsigned long __addr =						\
+ +		((__page_to_voff(page)) + PAGE_OFFSET);			\
+ +	const void *__addr_tag =					\
+ +		__tag_set((void *)__addr, page_kasan_tag(page));	\
+ +	((void *)__addr_tag);						\
+  })
+  
+++<<<<<<< HEAD
+ +#define virt_to_page(vaddr)	\
+ +	((struct page *)((__virt_to_pgoff(__tag_reset(vaddr))) + VMEMMAP_START))
+++=======
++ #define virt_to_page(x)	({						\
++ 	u64 __idx = (__tag_reset((u64)x) - PAGE_OFFSET) / PAGE_SIZE;	\
++ 	u64 __addr = VMEMMAP_START + (__idx * sizeof(struct page));	\
++ 	(struct page *)__addr;						\
++ })
++ #endif /* !CONFIG_SPARSEMEM_VMEMMAP || CONFIG_DEBUG_VIRTUAL */
++ 
++ #define virt_addr_valid(addr)	({					\
++ 	__typeof__(addr) __addr = __tag_reset(addr);			\
++ 	__is_lm_address(__addr) && pfn_valid(virt_to_pfn(__addr));	\
++ })
++ 
++ void dump_mem_limit(void);
++ #endif /* !ASSEMBLY */
++ 
++ /*
++  * Given that the GIC architecture permits ITS implementations that can only be
++  * configured with a LPI table address once, GICv3 systems with many CPUs may
++  * end up reserving a lot of different regions after a kexec for their LPI
++  * tables (one per CPU), as we are forced to reuse the same memory after kexec
++  * (and thus reserve it persistently with EFI beforehand)
++  */
++ #if defined(CONFIG_EFI) && defined(CONFIG_ARM_GIC_V3_ITS)
++ # define INIT_MEMBLOCK_RESERVED_REGIONS	(INIT_MEMBLOCK_REGIONS + NR_CPUS + 1)
+++>>>>>>> 91cb2c8b072e (arm64: Do not pass tagged addresses to __is_lm_address())
+  #endif
+ +#endif
+ +
+ +#define _virt_addr_is_linear(kaddr)	\
+ +	(__tag_reset((u64)(kaddr)) >= PAGE_OFFSET)
+ +
+ +#define virt_addr_valid(kaddr)		\
+ +	(_virt_addr_is_linear(kaddr) && pfn_valid(virt_to_pfn(kaddr)))
+  
+  #include <asm-generic/memory_model.h>
+  
+* Unmerged path arch/arm64/include/asm/memory.h
+diff --git a/arch/arm64/mm/physaddr.c b/arch/arm64/mm/physaddr.c
+index 67a9ba9eaa96..cde44c13dda1 100644
+--- a/arch/arm64/mm/physaddr.c
++++ b/arch/arm64/mm/physaddr.c
+@@ -9,7 +9,7 @@
+ 
+ phys_addr_t __virt_to_phys(unsigned long x)
+ {
+-	WARN(!__is_lm_address(x),
++	WARN(!__is_lm_address(__tag_reset(x)),
+ 	     "virt_to_phys used for non-linear address: %pK (%pS)\n",
+ 	      (void *)x,
+ 	      (void *)x);
