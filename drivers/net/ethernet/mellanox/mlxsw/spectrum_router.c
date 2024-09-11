@@ -4387,6 +4387,19 @@ mlxsw_sp_fib4_entry_type_set(struct mlxsw_sp *mlxsw_sp,
 	}
 }
 
+static void
+mlxsw_sp_fib4_entry_type_unset(struct mlxsw_sp *mlxsw_sp,
+			       struct mlxsw_sp_fib_entry *fib_entry)
+{
+	switch (fib_entry->type) {
+	case MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP:
+		mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, fib_entry);
+		break;
+	default:
+		break;
+	}
+}
+
 static struct mlxsw_sp_fib4_entry *
 mlxsw_sp_fib4_entry_create(struct mlxsw_sp *mlxsw_sp,
 			   struct mlxsw_sp_fib_node *fib_node,
@@ -4419,6 +4432,7 @@ mlxsw_sp_fib4_entry_create(struct mlxsw_sp *mlxsw_sp,
 	return fib4_entry;
 
 err_nexthop4_group_get:
+	mlxsw_sp_fib4_entry_type_unset(mlxsw_sp, fib_entry);
 err_fib4_entry_type_set:
 	kfree(fib4_entry);
 	return ERR_PTR(err);
@@ -4428,6 +4442,7 @@ static void mlxsw_sp_fib4_entry_destroy(struct mlxsw_sp *mlxsw_sp,
 					struct mlxsw_sp_fib4_entry *fib4_entry)
 {
 	mlxsw_sp_nexthop4_group_put(mlxsw_sp, &fib4_entry->common);
+	mlxsw_sp_fib4_entry_type_unset(mlxsw_sp, &fib4_entry->common);
 	kfree(fib4_entry);
 }
 
@@ -4730,9 +4745,6 @@ mlxsw_sp_fib4_node_entry_unlink(struct mlxsw_sp *mlxsw_sp,
 {
 	mlxsw_sp_fib_node_entry_del(mlxsw_sp, &fib4_entry->common);
 	list_del(&fib4_entry->common.list);
-
-	if (fib4_entry->common.type == MLXSW_SP_FIB_ENTRY_TYPE_IPIP_DECAP)
-		mlxsw_sp_fib_entry_decap_fini(mlxsw_sp, &fib4_entry->common);
 }
 
 static void mlxsw_sp_fib4_entry_replace(struct mlxsw_sp *mlxsw_sp,
