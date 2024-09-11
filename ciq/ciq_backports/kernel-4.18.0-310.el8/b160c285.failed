@@ -1,0 +1,69 @@
+tcp: do not mess with cloned skbs in tcp_add_backlog()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit b160c28548bc0a87cbd16d5af6d3edcfd70b8c9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b160c285.failed
+
+Heiner Kallweit reported that some skbs were sent with
+the following invalid GSO properties :
+- gso_size > 0
+- gso_type == 0
+
+This was triggerring a WARN_ON_ONCE() in rtl8169_tso_csum_v2.
+
+Juerg Haefliger was able to reproduce a similar issue using
+a lan78xx NIC and a workload mixing TCP incoming traffic
+and forwarded packets.
+
+The problem is that tcp_add_backlog() is writing
+over gso_segs and gso_size even if the incoming packet will not
+be coalesced to the backlog tail packet.
+
+While skb_try_coalesce() would bail out if tail packet is cloned,
+this overwriting would lead to corruptions of other packets
+cooked by lan78xx, sharing a common super-packet.
+
+The strategy used by lan78xx is to use a big skb, and split
+it into all received packets using skb_clone() to avoid copies.
+The drawback of this strategy is that all the small skb share a common
+struct skb_shared_info.
+
+This patch rewrites TCP gso_size/gso_segs handling to only
+happen on the tail skb, since skb_try_coalesce() made sure
+it was not cloned.
+
+Fixes: 4f693b55c3d2 ("tcp: implement coalescing on backlog queue")
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+Bisected-by: Juerg Haefliger <juergh@canonical.com>
+	Tested-by: Juerg Haefliger <juergh@canonical.com>
+	Reported-by: Heiner Kallweit <hkallweit1@gmail.com>
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=209423
+Link: https://lore.kernel.org/r/20210119164900.766957-1-eric.dumazet@gmail.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit b160c28548bc0a87cbd16d5af6d3edcfd70b8c9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_ipv4.c
+diff --cc net/ipv4/tcp_ipv4.c
+index 88956a7206d2,4e82745d336f..000000000000
+--- a/net/ipv4/tcp_ipv4.c
++++ b/net/ipv4/tcp_ipv4.c
+@@@ -1666,7 -1759,8 +1666,12 @@@ int tcp_v4_early_demux(struct sk_buff *
+  
+  bool tcp_add_backlog(struct sock *sk, struct sk_buff *skb)
+  {
+++<<<<<<< HEAD
+ +	u32 limit = sk->sk_rcvbuf + sk->sk_sndbuf;
+++=======
++ 	u32 limit = READ_ONCE(sk->sk_rcvbuf) + READ_ONCE(sk->sk_sndbuf);
++ 	u32 tail_gso_size, tail_gso_segs;
+++>>>>>>> b160c28548bc (tcp: do not mess with cloned skbs in tcp_add_backlog())
+  	struct skb_shared_info *shinfo;
+  	const struct tcphdr *th;
+  	struct tcphdr *thtail;
+* Unmerged path net/ipv4/tcp_ipv4.c
