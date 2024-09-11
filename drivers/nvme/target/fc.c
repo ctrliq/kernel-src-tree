@@ -1144,11 +1144,12 @@ nvmet_fc_alloc_target_assoc(struct nvmet_fc_tgtport *tgtport, void *hosthandle)
 
 		spin_lock_irqsave(&tgtport->lock, flags);
 		needrandom = false;
-		list_for_each_entry(tmpassoc, &tgtport->assoc_list, a_list)
+		list_for_each_entry(tmpassoc, &tgtport->assoc_list, a_list) {
 			if (ran == tmpassoc->association_id) {
 				needrandom = true;
 				break;
 			}
+		}
 		if (!needrandom) {
 			assoc->association_id = ran;
 			list_add_tail(&assoc->a_list, &tgtport->assoc_list);
@@ -1856,7 +1857,7 @@ nvmet_fc_ls_disconnect(struct nvmet_fc_tgtport *tgtport,
 						&iod->rqstbuf->rq_dis_assoc;
 	struct fcnvme_ls_disconnect_assoc_acc *acc =
 						&iod->rspbuf->rsp_dis_assoc;
-	struct nvmet_fc_tgt_assoc *assoc;
+	struct nvmet_fc_tgt_assoc *assoc = NULL;
 	struct nvmet_fc_ls_iod *oldls = NULL;
 	unsigned long flags;
 	int ret = 0;
@@ -1873,7 +1874,7 @@ nvmet_fc_ls_disconnect(struct nvmet_fc_tgtport *tgtport,
 			ret = VERR_NO_ASSOC;
 	}
 
-	if (ret) {
+	if (ret || !assoc) {
 		dev_err(tgtport->dev,
 			"Disconnect LS failed: %s\n",
 			validation_errors[ret]);
