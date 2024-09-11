@@ -1,0 +1,128 @@
+KVM: nVMX: Open a window for pending nested VMX preemption timer
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit d2060bd42e4482b15c35f961a294ee57f369027d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d2060bd4.failed
+
+Add a kvm_x86_ops hook to detect a nested pending "hypervisor timer" and
+use it to effectively open a window for servicing the expired timer.
+Like pending SMIs on VMX, opening a window simply means requesting an
+immediate exit.
+
+This fixes a bug where an expired VMX preemption timer (for L2) will be
+delayed and/or lost if a pending exception is injected into L2.  The
+pending exception is rightly prioritized by vmx_check_nested_events()
+and injected into L2, with the preemption timer left pending.  Because
+no window opened, L2 is free to run uninterrupted.
+
+Fixes: f4124500c2c13 ("KVM: nVMX: Fully emulate preemption timer")
+	Reported-by: Jim Mattson <jmattson@google.com>
+	Cc: Oliver Upton <oupton@google.com>
+	Cc: Peter Shier <pshier@google.com>
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200423022550.15113-3-sean.j.christopherson@intel.com>
+[Check it in kvm_vcpu_has_events too, to ensure that the preemption
+ timer is serviced promptly even if the vCPU is halted and L1 is not
+ intercepting HLT. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d2060bd42e4482b15c35f961a294ee57f369027d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/vmx/nested.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_host.h
+index 8e755c9a81df,e6671c61fd65..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -1270,6 -1254,31 +1270,34 @@@ struct kvm_x86_ops 
+  	int (*enable_direct_tlbflush)(struct kvm_vcpu *vcpu);
+  };
+  
+++<<<<<<< HEAD
+++=======
++ struct kvm_x86_nested_ops {
++ 	int (*check_events)(struct kvm_vcpu *vcpu);
++ 	bool (*hv_timer_pending)(struct kvm_vcpu *vcpu);
++ 	int (*get_state)(struct kvm_vcpu *vcpu,
++ 			 struct kvm_nested_state __user *user_kvm_nested_state,
++ 			 unsigned user_data_size);
++ 	int (*set_state)(struct kvm_vcpu *vcpu,
++ 			 struct kvm_nested_state __user *user_kvm_nested_state,
++ 			 struct kvm_nested_state *kvm_state);
++ 	bool (*get_vmcs12_pages)(struct kvm_vcpu *vcpu);
++ 
++ 	int (*enable_evmcs)(struct kvm_vcpu *vcpu,
++ 			    uint16_t *vmcs_version);
++ 	uint16_t (*get_evmcs_version)(struct kvm_vcpu *vcpu);
++ };
++ 
++ struct kvm_x86_init_ops {
++ 	int (*cpu_has_kvm_support)(void);
++ 	int (*disabled_by_bios)(void);
++ 	int (*check_processor_compatibility)(void);
++ 	int (*hardware_setup)(void);
++ 
++ 	struct kvm_x86_ops *runtime_ops;
++ };
++ 
+++>>>>>>> d2060bd42e44 (KVM: nVMX: Open a window for pending nested VMX preemption timer)
+  struct kvm_arch_async_pf {
+  	u32 token;
+  	gfn_t gfn;
+diff --cc arch/x86/kvm/vmx/nested.c
+index f7a7ba1fd720,51220a14a633..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -6342,3 -6450,13 +6347,16 @@@ __init int nested_vmx_hardware_setup(in
+  
+  	return 0;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ struct kvm_x86_nested_ops vmx_nested_ops = {
++ 	.check_events = vmx_check_nested_events,
++ 	.hv_timer_pending = nested_vmx_preemption_timer_pending,
++ 	.get_state = vmx_get_nested_state,
++ 	.set_state = vmx_set_nested_state,
++ 	.get_vmcs12_pages = nested_get_vmcs12_pages,
++ 	.enable_evmcs = nested_enable_evmcs,
++ 	.get_evmcs_version = nested_get_evmcs_version,
++ };
+++>>>>>>> d2060bd42e44 (KVM: nVMX: Open a window for pending nested VMX preemption timer)
+diff --cc arch/x86/kvm/x86.c
+index 2a5f5d2bc771,e874182d113c..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -8208,12 -8349,16 +8208,20 @@@ static int vcpu_enter_guest(struct kvm_
+  			 *    SMI.
+  			 */
+  			if (vcpu->arch.smi_pending && !is_smm(vcpu))
+ -				if (!kvm_x86_ops.enable_smi_window(vcpu))
+ +				if (!kvm_x86_ops->enable_smi_window(vcpu))
+  					req_immediate_exit = true;
+  			if (vcpu->arch.nmi_pending)
+ -				kvm_x86_ops.enable_nmi_window(vcpu);
+ +				kvm_x86_ops->enable_nmi_window(vcpu);
+  			if (kvm_cpu_has_injectable_intr(vcpu) || req_int_win)
+++<<<<<<< HEAD
+ +				kvm_x86_ops->enable_irq_window(vcpu);
+++=======
++ 				kvm_x86_ops.enable_irq_window(vcpu);
++ 			if (is_guest_mode(vcpu) &&
++ 			    kvm_x86_ops.nested_ops->hv_timer_pending &&
++ 			    kvm_x86_ops.nested_ops->hv_timer_pending(vcpu))
++ 				req_immediate_exit = true;
+++>>>>>>> d2060bd42e44 (KVM: nVMX: Open a window for pending nested VMX preemption timer)
+  			WARN_ON(vcpu->arch.exception.pending);
+  		}
+  
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/vmx/nested.c
+* Unmerged path arch/x86/kvm/x86.c
