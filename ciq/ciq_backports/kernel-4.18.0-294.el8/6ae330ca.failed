@@ -1,0 +1,295 @@
+virtiofs: serialize truncate/punch_hole and dax fault path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 6ae330cad6ef22ab8347ea9e0707dc56a7c7363f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6ae330ca.failed
+
+Currently in fuse we don't seem have any lock which can serialize fault
+path with truncate/punch_hole path. With dax support I need one for
+following reasons.
+
+1. Dax requirement
+
+  DAX fault code relies on inode size being stable for the duration of
+  fault and want to serialize with truncate/punch_hole and they explicitly
+  mention it.
+
+  static vm_fault_t dax_iomap_pmd_fault(struct vm_fault *vmf, pfn_t *pfnp,
+                               const struct iomap_ops *ops)
+        /*
+         * Check whether offset isn't beyond end of file now. Caller is
+         * supposed to hold locks serializing us with truncate / punch hole so
+         * this is a reliable test.
+         */
+        max_pgoff = DIV_ROUND_UP(i_size_read(inode), PAGE_SIZE);
+
+2. Make sure there are no users of pages being truncated/punch_hole
+
+  get_user_pages() might take references to page and then do some DMA
+  to said pages. Filesystem might truncate those pages without knowing
+  that a DMA is in progress or some I/O is in progress. So use
+  dax_layout_busy_page() to make sure there are no such references
+  and I/O is not in progress on said pages before moving ahead with
+  truncation.
+
+3. Limitation of kvm page fault error reporting
+
+  If we are truncating file on host first and then removing mappings in
+  guest lateter (truncate page cache etc), then this could lead to a
+  problem with KVM. Say a mapping is in place in guest and truncation
+  happens on host. Now if guest accesses that mapping, then host will
+  take a fault and kvm will either exit to qemu or spin infinitely.
+
+  IOW, before we do truncation on host, we need to make sure that guest
+  inode does not have any mapping in that region or whole file.
+
+4. virtiofs memory range reclaim
+
+ Soon I will introduce the notion of being able to reclaim dax memory
+ ranges from a fuse dax inode. There also I need to make sure that
+ no I/O or fault is going on in the reclaimed range and nobody is using
+ it so that range can be reclaimed without issues.
+
+Currently if we take inode lock, that serializes read/write. But it does
+not do anything for faults. So I add another semaphore fuse_inode->i_mmap_sem
+for this purpose.  It can be used to serialize with faults.
+
+As of now, I am adding taking this semaphore only in dax fault path and
+not regular fault path because existing code does not have one. May
+be existing code can benefit from it as well to take care of some
+races, but that we can fix later if need be. For now, I am just focussing
+only on DAX path which is new path.
+
+Also added logic to take fuse_inode->i_mmap_sem in
+truncate/punch_hole/open(O_TRUNC) path to make sure file truncation and
+fuse dax fault are mutually exlusive and avoid all the above problems.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Cc: Dave Chinner <david@fromorbit.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 6ae330cad6ef22ab8347ea9e0707dc56a7c7363f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/dax.c
+#	fs/fuse/fuse_i.h
+diff --cc fs/fuse/fuse_i.h
+index 50415774dba0,32c935f1e1b0..000000000000
+--- a/fs/fuse/fuse_i.h
++++ b/fs/fuse/fuse_i.h
+@@@ -148,6 -148,20 +148,23 @@@ struct fuse_inode 
+  
+  	/** Lock to protect write related fields */
+  	spinlock_t lock;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/**
++ 	 * Can't take inode lock in fault path (leads to circular dependency).
++ 	 * Introduce another semaphore which can be taken in fault path and
++ 	 * then other filesystem paths can take this to block faults.
++ 	 */
++ 	struct rw_semaphore i_mmap_sem;
++ 
++ #ifdef CONFIG_FUSE_DAX
++ 	/*
++ 	 * Dax specific inode data
++ 	 */
++ 	struct fuse_inode_dax *dax;
++ #endif
+++>>>>>>> 6ae330cad6ef (virtiofs: serialize truncate/punch_hole and dax fault path)
+  };
+  
+  /** FUSE inode state bits */
+@@@ -1092,4 -1116,19 +1109,22 @@@ unsigned int fuse_len_args(unsigned in
+  u64 fuse_get_unique(struct fuse_iqueue *fiq);
+  void fuse_free_conn(struct fuse_conn *fc);
+  
+++<<<<<<< HEAD
+++=======
++ /* dax.c */
++ 
++ #define FUSE_IS_DAX(inode) (IS_ENABLED(CONFIG_FUSE_DAX) && IS_DAX(inode))
++ 
++ ssize_t fuse_dax_read_iter(struct kiocb *iocb, struct iov_iter *to);
++ ssize_t fuse_dax_write_iter(struct kiocb *iocb, struct iov_iter *from);
++ int fuse_dax_mmap(struct file *file, struct vm_area_struct *vma);
++ int fuse_dax_break_layouts(struct inode *inode, u64 dmap_start, u64 dmap_end);
++ int fuse_dax_conn_alloc(struct fuse_conn *fc, struct dax_device *dax_dev);
++ void fuse_dax_conn_free(struct fuse_conn *fc);
++ bool fuse_dax_inode_alloc(struct super_block *sb, struct fuse_inode *fi);
++ void fuse_dax_inode_init(struct inode *inode);
++ void fuse_dax_inode_cleanup(struct inode *inode);
++ bool fuse_dax_check_alignment(struct fuse_conn *fc, unsigned int map_alignment);
++ 
+++>>>>>>> 6ae330cad6ef (virtiofs: serialize truncate/punch_hole and dax fault path)
+  #endif /* _FS_FUSE_I_H */
+* Unmerged path fs/fuse/dax.c
+* Unmerged path fs/fuse/dax.c
+diff --git a/fs/fuse/dir.c b/fs/fuse/dir.c
+index 289872b15779..0c3db5ad77c6 100644
+--- a/fs/fuse/dir.c
++++ b/fs/fuse/dir.c
+@@ -1494,6 +1494,7 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 	loff_t oldsize;
+ 	int err;
+ 	bool trust_local_cmtime = is_wb && S_ISREG(inode->i_mode);
++	bool fault_blocked = false;
+ 
+ 	if (!fc->default_permissions)
+ 		attr->ia_valid |= ATTR_FORCE;
+@@ -1502,6 +1503,22 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 	if (err)
+ 		return err;
+ 
++	if (attr->ia_valid & ATTR_SIZE) {
++		if (WARN_ON(!S_ISREG(inode->i_mode)))
++			return -EIO;
++		is_truncate = true;
++	}
++
++	if (FUSE_IS_DAX(inode) && is_truncate) {
++		down_write(&fi->i_mmap_sem);
++		fault_blocked = true;
++		err = fuse_dax_break_layouts(inode, 0, 0);
++		if (err) {
++			up_write(&fi->i_mmap_sem);
++			return err;
++		}
++	}
++
+ 	if (attr->ia_valid & ATTR_OPEN) {
+ 		/* This is coming from open(..., ... | O_TRUNC); */
+ 		WARN_ON(!(attr->ia_valid & ATTR_SIZE));
+@@ -1514,17 +1531,11 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 			 */
+ 			i_size_write(inode, 0);
+ 			truncate_pagecache(inode, 0);
+-			return 0;
++			goto out;
+ 		}
+ 		file = NULL;
+ 	}
+ 
+-	if (attr->ia_valid & ATTR_SIZE) {
+-		if (WARN_ON(!S_ISREG(inode->i_mode)))
+-			return -EIO;
+-		is_truncate = true;
+-	}
+-
+ 	/* Flush dirty data/metadata before non-truncate SETATTR */
+ 	if (is_wb && S_ISREG(inode->i_mode) &&
+ 	    attr->ia_valid &
+@@ -1607,6 +1618,10 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 	}
+ 
+ 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
++out:
++	if (fault_blocked)
++		up_write(&fi->i_mmap_sem);
++
+ 	return 0;
+ 
+ error:
+@@ -1614,6 +1629,9 @@ int fuse_do_setattr(struct dentry *dentry, struct iattr *attr,
+ 		fuse_release_nowrite(inode);
+ 
+ 	clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
++
++	if (fault_blocked)
++		up_write(&fi->i_mmap_sem);
+ 	return err;
+ }
+ 
+diff --git a/fs/fuse/file.c b/fs/fuse/file.c
+index e64ca703e652..fc1708b4695f 100644
+--- a/fs/fuse/file.c
++++ b/fs/fuse/file.c
+@@ -218,22 +218,34 @@ int fuse_open_common(struct inode *inode, struct file *file, bool isdir)
+ 	bool is_wb_truncate = (file->f_flags & O_TRUNC) &&
+ 			  fc->atomic_o_trunc &&
+ 			  fc->writeback_cache;
++	bool dax_truncate = (file->f_flags & O_TRUNC) &&
++			  fc->atomic_o_trunc && FUSE_IS_DAX(inode);
+ 
+ 	err = generic_file_open(inode, file);
+ 	if (err)
+ 		return err;
+ 
+-	if (is_wb_truncate) {
++	if (is_wb_truncate || dax_truncate) {
+ 		inode_lock(inode);
+ 		fuse_set_nowrite(inode);
+ 	}
+ 
+-	err = fuse_do_open(fc, get_node_id(inode), file, isdir);
++	if (dax_truncate) {
++		down_write(&get_fuse_inode(inode)->i_mmap_sem);
++		err = fuse_dax_break_layouts(inode, 0, 0);
++		if (err)
++			goto out;
++	}
+ 
++	err = fuse_do_open(fc, get_node_id(inode), file, isdir);
+ 	if (!err)
+ 		fuse_finish_open(inode, file);
+ 
+-	if (is_wb_truncate) {
++out:
++	if (dax_truncate)
++		up_write(&get_fuse_inode(inode)->i_mmap_sem);
++
++	if (is_wb_truncate | dax_truncate) {
+ 		fuse_release_nowrite(inode);
+ 		inode_unlock(inode);
+ 	}
+@@ -3190,6 +3202,8 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 	bool lock_inode = !(mode & FALLOC_FL_KEEP_SIZE) ||
+ 			   (mode & FALLOC_FL_PUNCH_HOLE);
+ 
++	bool block_faults = FUSE_IS_DAX(inode) && lock_inode;
++
+ 	if (mode & ~(FALLOC_FL_KEEP_SIZE | FALLOC_FL_PUNCH_HOLE))
+ 		return -EOPNOTSUPP;
+ 
+@@ -3198,6 +3212,13 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 
+ 	if (lock_inode) {
+ 		inode_lock(inode);
++		if (block_faults) {
++			down_write(&fi->i_mmap_sem);
++			err = fuse_dax_break_layouts(inode, 0, 0);
++			if (err)
++				goto out;
++		}
++
+ 		if (mode & FALLOC_FL_PUNCH_HOLE) {
+ 			loff_t endbyte = offset + length - 1;
+ 
+@@ -3247,6 +3268,9 @@ static long fuse_file_fallocate(struct file *file, int mode, loff_t offset,
+ 	if (!(mode & FALLOC_FL_KEEP_SIZE))
+ 		clear_bit(FUSE_I_SIZE_UNSTABLE, &fi->state);
+ 
++	if (block_faults)
++		up_write(&fi->i_mmap_sem);
++
+ 	if (lock_inode)
+ 		inode_unlock(inode);
+ 
+* Unmerged path fs/fuse/fuse_i.h
+diff --git a/fs/fuse/inode.c b/fs/fuse/inode.c
+index 10b75246113a..3f430499f51d 100644
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@ -80,6 +80,7 @@ static struct inode *fuse_alloc_inode(struct super_block *sb)
+ 	fi->orig_ino = 0;
+ 	fi->state = 0;
+ 	mutex_init(&fi->mutex);
++	init_rwsem(&fi->i_mmap_sem);
+ 	spin_lock_init(&fi->lock);
+ 	fi->forget = fuse_alloc_forget();
+ 	if (!fi->forget) {
