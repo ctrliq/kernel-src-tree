@@ -1,0 +1,138 @@
+x86/boot/compressed/64: Setup a GHCB-based VC Exception handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] boot/compressed/64: Setup a GHCB-based VC Exception handler (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 96.72%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 597cfe48212a3f110ab0f918bf59791f453e65b7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/597cfe48.failed
+
+Install an exception handler for #VC exception that uses a GHCB. Also
+add the infrastructure for handling different exit-codes by decoding
+the instruction that caused the exception and error handling.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20200907131613.12703-24-joro@8bytes.org
+(cherry picked from commit 597cfe48212a3f110ab0f918bf59791f453e65b7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig
+#	arch/x86/boot/compressed/idt_64.c
+#	arch/x86/boot/compressed/idt_handlers_64.S
+#	arch/x86/boot/compressed/misc.h
+#	arch/x86/boot/compressed/sev-es.c
+#	arch/x86/include/asm/sev-es.h
+#	arch/x86/kernel/sev-es-shared.c
+diff --cc arch/x86/Kconfig
+index 3fc0a4c91af5,8289dd44efbd..000000000000
+--- a/arch/x86/Kconfig
++++ b/arch/x86/Kconfig
+@@@ -1514,9 -1517,12 +1514,14 @@@ config X86_CPA_STATISTIC
+  config AMD_MEM_ENCRYPT
+  	bool "AMD Secure Memory Encryption (SME) support"
+  	depends on X86_64 && CPU_SUP_AMD
+ -	select DMA_COHERENT_POOL
+  	select DYNAMIC_PHYSICAL_MASK
+ -	select ARCH_USE_MEMREMAP_PROT
+  	select ARCH_HAS_FORCE_DMA_UNENCRYPTED
+++<<<<<<< HEAD
+ +	---help---
+++=======
++ 	select INSTRUCTION_DECODER
++ 	help
+++>>>>>>> 597cfe48212a (x86/boot/compressed/64: Setup a GHCB-based VC Exception handler)
+  	  Say yes to enable support for the encryption of system memory.
+  	  This requires an AMD processor that supports Secure Memory
+  	  Encryption (SME).
+diff --cc arch/x86/boot/compressed/misc.h
+index d55a1ca4f95b,9995c70ca813..000000000000
+--- a/arch/x86/boot/compressed/misc.h
++++ b/arch/x86/boot/compressed/misc.h
+@@@ -133,4 -135,21 +139,24 @@@ int count_immovable_mem_regions(void)
+  static inline int count_immovable_mem_regions(void) { return 0; }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ /* ident_map_64.c */
++ #ifdef CONFIG_X86_5LEVEL
++ extern unsigned int __pgtable_l5_enabled, pgdir_shift, ptrs_per_p4d;
++ #endif
++ 
++ /* Used by PAGE_KERN* macros: */
++ extern pteval_t __default_kernel_pte_mask;
++ 
++ /* idt_64.c */
++ extern gate_desc boot_idt[BOOT_IDT_ENTRIES];
++ extern struct desc_ptr boot_idt_desc;
++ 
++ /* IDT Entry Points */
++ void boot_page_fault(void);
++ void boot_stage1_vc(void);
++ void boot_stage2_vc(void);
++ 
+++>>>>>>> 597cfe48212a (x86/boot/compressed/64: Setup a GHCB-based VC Exception handler)
+  #endif /* BOOT_COMPRESSED_MISC_H */
+* Unmerged path arch/x86/boot/compressed/idt_64.c
+* Unmerged path arch/x86/boot/compressed/idt_handlers_64.S
+* Unmerged path arch/x86/boot/compressed/sev-es.c
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/kernel/sev-es-shared.c
+* Unmerged path arch/x86/Kconfig
+diff --git a/arch/x86/boot/compressed/Makefile b/arch/x86/boot/compressed/Makefile
+index 0ae4decaece3..04c3eb11190f 100644
+--- a/arch/x86/boot/compressed/Makefile
++++ b/arch/x86/boot/compressed/Makefile
+@@ -38,6 +38,11 @@ KBUILD_CFLAGS += $(call cc-option,-fno-stack-protector)
+ KBUILD_CFLAGS += $(call cc-disable-warning, address-of-packed-member)
+ KBUILD_CFLAGS += $(call cc-disable-warning, gnu)
+ 
++# sev-es.c indirectly inludes inat-table.h which is generated during
++# compilation and stored in $(objtree). Add the directory to the includes so
++# that the compiler finds it even with out-of-tree builds (make O=/some/path).
++CFLAGS_sev-es.o += -I$(objtree)/arch/x86/lib/
++
+ KBUILD_AFLAGS  := $(KBUILD_CFLAGS) -D__ASSEMBLY__
+ GCOV_PROFILE := n
+ UBSAN_SANITIZE :=n
+* Unmerged path arch/x86/boot/compressed/idt_64.c
+* Unmerged path arch/x86/boot/compressed/idt_handlers_64.S
+diff --git a/arch/x86/boot/compressed/misc.c b/arch/x86/boot/compressed/misc.c
+index 37b2fdc724d6..246873efe6af 100644
+--- a/arch/x86/boot/compressed/misc.c
++++ b/arch/x86/boot/compressed/misc.c
+@@ -440,6 +440,13 @@ asmlinkage __visible void *extract_kernel(void *rmode, memptr heap,
+ 	parse_elf(output);
+ 	handle_relocations(output, output_len, virt_addr);
+ 	debug_putstr("done.\nBooting the kernel.\n");
++
++	/*
++	 * Flush GHCB from cache and map it encrypted again when running as
++	 * SEV-ES guest.
++	 */
++	sev_es_shutdown_ghcb();
++
+ 	return output;
+ }
+ 
+* Unmerged path arch/x86/boot/compressed/misc.h
+* Unmerged path arch/x86/boot/compressed/sev-es.c
+* Unmerged path arch/x86/include/asm/sev-es.h
+diff --git a/arch/x86/include/uapi/asm/svm.h b/arch/x86/include/uapi/asm/svm.h
+index 522d42dfc28c..4bd872f0f0fa 100644
+--- a/arch/x86/include/uapi/asm/svm.h
++++ b/arch/x86/include/uapi/asm/svm.h
+@@ -29,6 +29,7 @@
+ #define SVM_EXIT_WRITE_DR6     0x036
+ #define SVM_EXIT_WRITE_DR7     0x037
+ #define SVM_EXIT_EXCP_BASE     0x040
++#define SVM_EXIT_LAST_EXCP     0x05f
+ #define SVM_EXIT_INTR          0x060
+ #define SVM_EXIT_NMI           0x061
+ #define SVM_EXIT_SMI           0x062
+* Unmerged path arch/x86/kernel/sev-es-shared.c
