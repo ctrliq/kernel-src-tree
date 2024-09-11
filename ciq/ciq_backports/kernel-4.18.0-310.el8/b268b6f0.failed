@@ -1,0 +1,422 @@
+KVM: selftests: Implement perf_test_util more conventionally
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Andrew Jones <drjones@redhat.com>
+commit b268b6f0bd36322358accb15c45683a9e1220231
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/b268b6f0.failed
+
+It's not conventional C to put non-inline functions in header
+files. Create a source file for the functions instead. Also
+reduce the amount of globals and rename the functions to
+something less generic.
+
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+	Reviewed-by: Peter Xu <peterx@redhat.com>
+	Signed-off-by: Andrew Jones <drjones@redhat.com>
+Message-Id: <20201218141734.54359-4-drjones@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit b268b6f0bd36322358accb15c45683a9e1220231)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/Makefile
+#	tools/testing/selftests/kvm/dirty_log_perf_test.c
+#	tools/testing/selftests/kvm/include/perf_test_util.h
+diff --cc tools/testing/selftests/kvm/Makefile
+index 5fd70f1dff50,fe41c6a0fa67..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -33,7 -33,7 +33,11 @@@ ifeq ($(ARCH),s390
+  	UNAME_M := s390x
+  endif
+  
+++<<<<<<< HEAD
+ +LIBKVM = lib/assert.c lib/elf.c lib/io.c lib/kvm_util.c lib/sparsebit.c lib/test_util.c
+++=======
++ LIBKVM = lib/assert.c lib/elf.c lib/io.c lib/kvm_util.c lib/sparsebit.c lib/test_util.c lib/guest_modes.c lib/perf_test_util.c
+++>>>>>>> b268b6f0bd36 (KVM: selftests: Implement perf_test_util more conventionally)
+  LIBKVM_x86_64 = lib/x86_64/processor.c lib/x86_64/vmx.c lib/x86_64/svm.c lib/x86_64/ucall.c lib/x86_64/handlers.S
+  LIBKVM_aarch64 = lib/aarch64/processor.c lib/aarch64/ucall.c
+  LIBKVM_s390x = lib/s390x/processor.c lib/s390x/ucall.c lib/s390x/diag318_test_handler.c
+diff --cc tools/testing/selftests/kvm/include/perf_test_util.h
+index e9e0ac1876cf,b1188823c31b..000000000000
+--- a/tools/testing/selftests/kvm/include/perf_test_util.h
++++ b/tools/testing/selftests/kvm/include/perf_test_util.h
+@@@ -9,14 -9,6 +9,17 @@@
+  #define SELFTEST_KVM_PERF_TEST_UTIL_H
+  
+  #include "kvm_util.h"
+++<<<<<<< HEAD
+ +#include "processor.h"
+ +
+ +#define MAX_VCPUS 512
+ +
+ +#define PAGE_SHIFT_4K  12
+ +#define PTES_PER_4K_PT 512
+ +
+ +#define TEST_MEM_SLOT_INDEX		1
+++=======
+++>>>>>>> b268b6f0bd36 (KVM: selftests: Implement perf_test_util more conventionally)
+  
+  /* Default guest test virtual memory offset */
+  #define DEFAULT_GUEST_TEST_MEM		0xc0000000
+@@@ -54,139 -31,21 +42,142 @@@ struct perf_test_args 
+  	uint64_t guest_page_size;
+  	int wr_fract;
+  
+- 	struct vcpu_args vcpu_args[MAX_VCPUS];
++ 	struct perf_test_vcpu_args vcpu_args[KVM_MAX_VCPUS];
+  };
+  
+- static struct perf_test_args perf_test_args;
++ extern struct perf_test_args perf_test_args;
+  
+  /*
+-  * Continuously write to the first 8 bytes of each page in the
+-  * specified region.
++  * Guest physical memory offset of the testing memory slot.
++  * This will be set to the topmost valid physical address minus
++  * the test memory size.
+   */
+- static void guest_code(uint32_t vcpu_id)
+- {
+- 	struct vcpu_args *vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
+- 	uint64_t gva;
+- 	uint64_t pages;
+- 	int i;
++ extern uint64_t guest_test_phys_mem;
+  
+++<<<<<<< HEAD
+ +	/* Make sure vCPU args data structure is not corrupt. */
+ +	GUEST_ASSERT(vcpu_args->vcpu_id == vcpu_id);
+ +
+ +	gva = vcpu_args->gva;
+ +	pages = vcpu_args->pages;
+ +
+ +	for (i = 0; i < pages; i++) {
+ +		uint64_t addr = gva + (i * perf_test_args.guest_page_size);
+ +
+ +		if (i % perf_test_args.wr_fract == 0)
+ +			*(uint64_t *)addr = 0x0123456789ABCDEF;
+ +		else
+ +			READ_ONCE(*(uint64_t *)addr);
+ +	}
+ +
+ +	GUEST_SYNC(1);
+ +}
+ +
+ +static struct kvm_vm *create_vm(enum vm_guest_mode mode, int vcpus,
+ +				uint64_t vcpu_memory_bytes)
+ +{
+ +	struct kvm_vm *vm;
+ +	uint64_t pages = DEFAULT_GUEST_PHY_PAGES;
+ +	uint64_t guest_num_pages;
+ +
+ +	/* Account for a few pages per-vCPU for stacks */
+ +	pages += DEFAULT_STACK_PGS * vcpus;
+ +
+ +	/*
+ +	 * Reserve twice the ammount of memory needed to map the test region and
+ +	 * the page table / stacks region, at 4k, for page tables. Do the
+ +	 * calculation with 4K page size: the smallest of all archs. (e.g., 64K
+ +	 * page size guest will need even less memory for page tables).
+ +	 */
+ +	pages += (2 * pages) / PTES_PER_4K_PT;
+ +	pages += ((2 * vcpus * vcpu_memory_bytes) >> PAGE_SHIFT_4K) /
+ +		 PTES_PER_4K_PT;
+ +	pages = vm_adjust_num_guest_pages(mode, pages);
+ +
+ +	pr_info("Testing guest mode: %s\n", vm_guest_mode_string(mode));
+ +
+ +	vm = vm_create(mode, pages, O_RDWR);
+ +	kvm_vm_elf_load(vm, program_invocation_name, 0, 0);
+ +#ifdef __x86_64__
+ +	vm_create_irqchip(vm);
+ +#endif
+ +
+ +	perf_test_args.vm = vm;
+ +	perf_test_args.guest_page_size = vm_get_page_size(vm);
+ +	perf_test_args.host_page_size = getpagesize();
+ +
+ +	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.guest_page_size == 0,
+ +		    "Guest memory size is not guest page size aligned.");
+ +
+ +	guest_num_pages = (vcpus * vcpu_memory_bytes) /
+ +			  perf_test_args.guest_page_size;
+ +	guest_num_pages = vm_adjust_num_guest_pages(mode, guest_num_pages);
+ +
+ +	/*
+ +	 * If there should be more memory in the guest test region than there
+ +	 * can be pages in the guest, it will definitely cause problems.
+ +	 */
+ +	TEST_ASSERT(guest_num_pages < vm_get_max_gfn(vm),
+ +		    "Requested more guest memory than address space allows.\n"
+ +		    "    guest pages: %lx max gfn: %x vcpus: %d wss: %lx]\n",
+ +		    guest_num_pages, vm_get_max_gfn(vm), vcpus,
+ +		    vcpu_memory_bytes);
+ +
+ +	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.host_page_size == 0,
+ +		    "Guest memory size is not host page size aligned.");
+ +
+ +	guest_test_phys_mem = (vm_get_max_gfn(vm) - guest_num_pages) *
+ +			      perf_test_args.guest_page_size;
+ +	guest_test_phys_mem &= ~(perf_test_args.host_page_size - 1);
+ +
+ +#ifdef __s390x__
+ +	/* Align to 1M (segment size) */
+ +	guest_test_phys_mem &= ~((1 << 20) - 1);
+ +#endif
+ +
+ +	pr_info("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
+ +
+ +	/* Add an extra memory slot for testing */
+ +	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
+ +				    guest_test_phys_mem,
+ +				    TEST_MEM_SLOT_INDEX,
+ +				    guest_num_pages, 0);
+ +
+ +	/* Do mapping for the demand paging memory slot */
+ +	virt_map(vm, guest_test_virt_mem, guest_test_phys_mem, guest_num_pages, 0);
+ +
+ +	ucall_init(vm, NULL);
+ +
+ +	return vm;
+ +}
+ +
+ +static void add_vcpus(struct kvm_vm *vm, int vcpus, uint64_t vcpu_memory_bytes)
+ +{
+ +	vm_paddr_t vcpu_gpa;
+ +	struct vcpu_args *vcpu_args;
+ +	int vcpu_id;
+ +
+ +	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
+ +		vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
+ +
+ +		vm_vcpu_add_default(vm, vcpu_id, guest_code);
+ +
+ +		vcpu_args->vcpu_id = vcpu_id;
+ +		vcpu_args->gva = guest_test_virt_mem +
+ +				 (vcpu_id * vcpu_memory_bytes);
+ +		vcpu_args->pages = vcpu_memory_bytes /
+ +				   perf_test_args.guest_page_size;
+ +
+ +		vcpu_gpa = guest_test_phys_mem + (vcpu_id * vcpu_memory_bytes);
+ +		pr_debug("Added VCPU %d with test mem gpa [%lx, %lx)\n",
+ +			 vcpu_id, vcpu_gpa, vcpu_gpa + vcpu_memory_bytes);
+ +	}
+ +}
+++=======
++ struct kvm_vm *perf_test_create_vm(enum vm_guest_mode mode, int vcpus,
++ 				uint64_t vcpu_memory_bytes);
++ void perf_test_destroy_vm(struct kvm_vm *vm);
++ void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus, uint64_t vcpu_memory_bytes);
+++>>>>>>> b268b6f0bd36 (KVM: selftests: Implement perf_test_util more conventionally)
+  
+  #endif /* SELFTEST_KVM_PERF_TEST_UTIL_H */
+* Unmerged path tools/testing/selftests/kvm/dirty_log_perf_test.c
+* Unmerged path tools/testing/selftests/kvm/Makefile
+diff --git a/tools/testing/selftests/kvm/demand_paging_test.c b/tools/testing/selftests/kvm/demand_paging_test.c
+index 3d96a7bfaff3..e1f8baccc013 100644
+--- a/tools/testing/selftests/kvm/demand_paging_test.c
++++ b/tools/testing/selftests/kvm/demand_paging_test.c
+@@ -39,12 +39,14 @@
+ #define PER_VCPU_DEBUG(...) _no_printf(__VA_ARGS__)
+ #endif
+ 
++static int nr_vcpus = 1;
++static uint64_t guest_percpu_mem_size = DEFAULT_PER_VCPU_MEM_SIZE;
+ static char *guest_data_prototype;
+ 
+ static void *vcpu_worker(void *data)
+ {
+ 	int ret;
+-	struct vcpu_args *vcpu_args = (struct vcpu_args *)data;
++	struct perf_test_vcpu_args *vcpu_args = (struct perf_test_vcpu_args *)data;
+ 	int vcpu_id = vcpu_args->vcpu_id;
+ 	struct kvm_vm *vm = perf_test_args.vm;
+ 	struct kvm_run *run;
+@@ -261,7 +263,7 @@ static void run_test(enum vm_guest_mode mode, bool use_uffd,
+ 	int vcpu_id;
+ 	int r;
+ 
+-	vm = create_vm(mode, nr_vcpus, guest_percpu_mem_size);
++	vm = perf_test_create_vm(mode, nr_vcpus, guest_percpu_mem_size);
+ 
+ 	perf_test_args.wr_fract = 1;
+ 
+@@ -273,7 +275,7 @@ static void run_test(enum vm_guest_mode mode, bool use_uffd,
+ 	vcpu_threads = malloc(nr_vcpus * sizeof(*vcpu_threads));
+ 	TEST_ASSERT(vcpu_threads, "Memory allocation failed");
+ 
+-	add_vcpus(vm, nr_vcpus, guest_percpu_mem_size);
++	perf_test_setup_vcpus(vm, nr_vcpus, guest_percpu_mem_size);
+ 
+ 	if (use_uffd) {
+ 		uffd_handler_threads =
+@@ -357,8 +359,7 @@ static void run_test(enum vm_guest_mode mode, bool use_uffd,
+ 		perf_test_args.vcpu_args[0].pages * nr_vcpus /
+ 		((double)ts_diff.tv_sec + (double)ts_diff.tv_nsec / 100000000.0));
+ 
+-	ucall_uninit(vm);
+-	kvm_vm_free(vm);
++	perf_test_destroy_vm(vm);
+ 
+ 	free(guest_data_prototype);
+ 	free(vcpu_threads);
+* Unmerged path tools/testing/selftests/kvm/dirty_log_perf_test.c
+diff --git a/tools/testing/selftests/kvm/include/kvm_util.h b/tools/testing/selftests/kvm/include/kvm_util.h
+index dfa9d369e8fc..f0b1b6f11aca 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -16,6 +16,7 @@
+ 
+ #include "sparsebit.h"
+ 
++#define KVM_MAX_VCPUS 512
+ 
+ /*
+  * Callers of kvm_util only have an incomplete/opaque description of the
+* Unmerged path tools/testing/selftests/kvm/include/perf_test_util.h
+diff --git a/tools/testing/selftests/kvm/lib/perf_test_util.c b/tools/testing/selftests/kvm/lib/perf_test_util.c
+new file mode 100644
+index 000000000000..9be1944c2d1c
+--- /dev/null
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@ -0,0 +1,134 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright (C) 2020, Google LLC.
++ */
++
++#include "kvm_util.h"
++#include "perf_test_util.h"
++#include "processor.h"
++
++struct perf_test_args perf_test_args;
++
++uint64_t guest_test_phys_mem;
++
++/*
++ * Guest virtual memory offset of the testing memory slot.
++ * Must not conflict with identity mapped test code.
++ */
++static uint64_t guest_test_virt_mem = DEFAULT_GUEST_TEST_MEM;
++
++/*
++ * Continuously write to the first 8 bytes of each page in the
++ * specified region.
++ */
++static void guest_code(uint32_t vcpu_id)
++{
++	struct perf_test_vcpu_args *vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
++	uint64_t gva;
++	uint64_t pages;
++	int i;
++
++	/* Make sure vCPU args data structure is not corrupt. */
++	GUEST_ASSERT(vcpu_args->vcpu_id == vcpu_id);
++
++	gva = vcpu_args->gva;
++	pages = vcpu_args->pages;
++
++	while (true) {
++		for (i = 0; i < pages; i++) {
++			uint64_t addr = gva + (i * perf_test_args.guest_page_size);
++
++			if (i % perf_test_args.wr_fract == 0)
++				*(uint64_t *)addr = 0x0123456789ABCDEF;
++			else
++				READ_ONCE(*(uint64_t *)addr);
++		}
++
++		GUEST_SYNC(1);
++	}
++}
++
++struct kvm_vm *perf_test_create_vm(enum vm_guest_mode mode, int vcpus,
++				   uint64_t vcpu_memory_bytes)
++{
++	struct kvm_vm *vm;
++	uint64_t guest_num_pages;
++
++	pr_info("Testing guest mode: %s\n", vm_guest_mode_string(mode));
++
++	perf_test_args.host_page_size = getpagesize();
++	perf_test_args.guest_page_size = vm_guest_mode_params[mode].page_size;
++
++	guest_num_pages = vm_adjust_num_guest_pages(mode,
++				(vcpus * vcpu_memory_bytes) / perf_test_args.guest_page_size);
++
++	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.host_page_size == 0,
++		    "Guest memory size is not host page size aligned.");
++	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.guest_page_size == 0,
++		    "Guest memory size is not guest page size aligned.");
++
++	vm = vm_create_with_vcpus(mode, vcpus,
++				  (vcpus * vcpu_memory_bytes) / perf_test_args.guest_page_size,
++				  0, guest_code, NULL);
++
++	perf_test_args.vm = vm;
++
++	/*
++	 * If there should be more memory in the guest test region than there
++	 * can be pages in the guest, it will definitely cause problems.
++	 */
++	TEST_ASSERT(guest_num_pages < vm_get_max_gfn(vm),
++		    "Requested more guest memory than address space allows.\n"
++		    "    guest pages: %lx max gfn: %x vcpus: %d wss: %lx]\n",
++		    guest_num_pages, vm_get_max_gfn(vm), vcpus,
++		    vcpu_memory_bytes);
++
++	guest_test_phys_mem = (vm_get_max_gfn(vm) - guest_num_pages) *
++			      perf_test_args.guest_page_size;
++	guest_test_phys_mem &= ~(perf_test_args.host_page_size - 1);
++#ifdef __s390x__
++	/* Align to 1M (segment size) */
++	guest_test_phys_mem &= ~((1 << 20) - 1);
++#endif
++	pr_info("guest physical test memory offset: 0x%lx\n", guest_test_phys_mem);
++
++	/* Add an extra memory slot for testing */
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
++				    guest_test_phys_mem,
++				    PERF_TEST_MEM_SLOT_INDEX,
++				    guest_num_pages, 0);
++
++	/* Do mapping for the demand paging memory slot */
++	virt_map(vm, guest_test_virt_mem, guest_test_phys_mem, guest_num_pages, 0);
++
++	ucall_init(vm, NULL);
++
++	return vm;
++}
++
++void perf_test_destroy_vm(struct kvm_vm *vm)
++{
++	ucall_uninit(vm);
++	kvm_vm_free(vm);
++}
++
++void perf_test_setup_vcpus(struct kvm_vm *vm, int vcpus, uint64_t vcpu_memory_bytes)
++{
++	vm_paddr_t vcpu_gpa;
++	struct perf_test_vcpu_args *vcpu_args;
++	int vcpu_id;
++
++	for (vcpu_id = 0; vcpu_id < vcpus; vcpu_id++) {
++		vcpu_args = &perf_test_args.vcpu_args[vcpu_id];
++
++		vcpu_args->vcpu_id = vcpu_id;
++		vcpu_args->gva = guest_test_virt_mem +
++				 (vcpu_id * vcpu_memory_bytes);
++		vcpu_args->pages = vcpu_memory_bytes /
++				   perf_test_args.guest_page_size;
++
++		vcpu_gpa = guest_test_phys_mem + (vcpu_id * vcpu_memory_bytes);
++		pr_debug("Added VCPU %d with test mem gpa [%lx, %lx)\n",
++			 vcpu_id, vcpu_gpa, vcpu_gpa + vcpu_memory_bytes);
++	}
++}
