@@ -1,0 +1,530 @@
+sched/core: Provide a scheduling point for RT locks
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 6991436c2b5d91d5358d9914ae2df22b9a1d1dc9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/6991436c.failed
+
+RT enabled kernels substitute spin/rwlocks with 'sleeping' variants based
+on rtmutexes. Blocking on such a lock is similar to preemption versus:
+
+ - I/O scheduling and worker handling, because these functions might block
+   on another substituted lock, or come from a lock contention within these
+   functions.
+
+ - RCU considers this like a preemption, because the task might be in a read
+   side critical section.
+
+Add a separate scheduling point for this, and hand a new scheduling mode
+argument to __schedule() which allows, along with separate mode masks, to
+handle this gracefully from within the scheduler, without proliferating that
+to other subsystems like RCU.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20210815211302.372319055@linutronix.de
+(cherry picked from commit 6991436c2b5d91d5358d9914ae2df22b9a1d1dc9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/sched/core.c
+diff --cc kernel/sched/core.c
+index 9945a9321de5,c89c1d45dd0b..000000000000
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@@ -3720,6 -5370,473 +3720,476 @@@ restart
+  	BUG();
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_SCHED_CORE
++ static inline bool is_task_rq_idle(struct task_struct *t)
++ {
++ 	return (task_rq(t)->idle == t);
++ }
++ 
++ static inline bool cookie_equals(struct task_struct *a, unsigned long cookie)
++ {
++ 	return is_task_rq_idle(a) || (a->core_cookie == cookie);
++ }
++ 
++ static inline bool cookie_match(struct task_struct *a, struct task_struct *b)
++ {
++ 	if (is_task_rq_idle(a) || is_task_rq_idle(b))
++ 		return true;
++ 
++ 	return a->core_cookie == b->core_cookie;
++ }
++ 
++ // XXX fairness/fwd progress conditions
++ /*
++  * Returns
++  * - NULL if there is no runnable task for this class.
++  * - the highest priority task for this runqueue if it matches
++  *   rq->core->core_cookie or its priority is greater than max.
++  * - Else returns idle_task.
++  */
++ static struct task_struct *
++ pick_task(struct rq *rq, const struct sched_class *class, struct task_struct *max, bool in_fi)
++ {
++ 	struct task_struct *class_pick, *cookie_pick;
++ 	unsigned long cookie = rq->core->core_cookie;
++ 
++ 	class_pick = class->pick_task(rq);
++ 	if (!class_pick)
++ 		return NULL;
++ 
++ 	if (!cookie) {
++ 		/*
++ 		 * If class_pick is tagged, return it only if it has
++ 		 * higher priority than max.
++ 		 */
++ 		if (max && class_pick->core_cookie &&
++ 		    prio_less(class_pick, max, in_fi))
++ 			return idle_sched_class.pick_task(rq);
++ 
++ 		return class_pick;
++ 	}
++ 
++ 	/*
++ 	 * If class_pick is idle or matches cookie, return early.
++ 	 */
++ 	if (cookie_equals(class_pick, cookie))
++ 		return class_pick;
++ 
++ 	cookie_pick = sched_core_find(rq, cookie);
++ 
++ 	/*
++ 	 * If class > max && class > cookie, it is the highest priority task on
++ 	 * the core (so far) and it must be selected, otherwise we must go with
++ 	 * the cookie pick in order to satisfy the constraint.
++ 	 */
++ 	if (prio_less(cookie_pick, class_pick, in_fi) &&
++ 	    (!max || prio_less(max, class_pick, in_fi)))
++ 		return class_pick;
++ 
++ 	return cookie_pick;
++ }
++ 
++ extern void task_vruntime_update(struct rq *rq, struct task_struct *p, bool in_fi);
++ 
++ static struct task_struct *
++ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
++ {
++ 	struct task_struct *next, *max = NULL;
++ 	const struct sched_class *class;
++ 	const struct cpumask *smt_mask;
++ 	bool fi_before = false;
++ 	int i, j, cpu, occ = 0;
++ 	bool need_sync;
++ 
++ 	if (!sched_core_enabled(rq))
++ 		return __pick_next_task(rq, prev, rf);
++ 
++ 	cpu = cpu_of(rq);
++ 
++ 	/* Stopper task is switching into idle, no need core-wide selection. */
++ 	if (cpu_is_offline(cpu)) {
++ 		/*
++ 		 * Reset core_pick so that we don't enter the fastpath when
++ 		 * coming online. core_pick would already be migrated to
++ 		 * another cpu during offline.
++ 		 */
++ 		rq->core_pick = NULL;
++ 		return __pick_next_task(rq, prev, rf);
++ 	}
++ 
++ 	/*
++ 	 * If there were no {en,de}queues since we picked (IOW, the task
++ 	 * pointers are all still valid), and we haven't scheduled the last
++ 	 * pick yet, do so now.
++ 	 *
++ 	 * rq->core_pick can be NULL if no selection was made for a CPU because
++ 	 * it was either offline or went offline during a sibling's core-wide
++ 	 * selection. In this case, do a core-wide selection.
++ 	 */
++ 	if (rq->core->core_pick_seq == rq->core->core_task_seq &&
++ 	    rq->core->core_pick_seq != rq->core_sched_seq &&
++ 	    rq->core_pick) {
++ 		WRITE_ONCE(rq->core_sched_seq, rq->core->core_pick_seq);
++ 
++ 		next = rq->core_pick;
++ 		if (next != prev) {
++ 			put_prev_task(rq, prev);
++ 			set_next_task(rq, next);
++ 		}
++ 
++ 		rq->core_pick = NULL;
++ 		return next;
++ 	}
++ 
++ 	put_prev_task_balance(rq, prev, rf);
++ 
++ 	smt_mask = cpu_smt_mask(cpu);
++ 	need_sync = !!rq->core->core_cookie;
++ 
++ 	/* reset state */
++ 	rq->core->core_cookie = 0UL;
++ 	if (rq->core->core_forceidle) {
++ 		need_sync = true;
++ 		fi_before = true;
++ 		rq->core->core_forceidle = false;
++ 	}
++ 
++ 	/*
++ 	 * core->core_task_seq, core->core_pick_seq, rq->core_sched_seq
++ 	 *
++ 	 * @task_seq guards the task state ({en,de}queues)
++ 	 * @pick_seq is the @task_seq we did a selection on
++ 	 * @sched_seq is the @pick_seq we scheduled
++ 	 *
++ 	 * However, preemptions can cause multiple picks on the same task set.
++ 	 * 'Fix' this by also increasing @task_seq for every pick.
++ 	 */
++ 	rq->core->core_task_seq++;
++ 
++ 	/*
++ 	 * Optimize for common case where this CPU has no cookies
++ 	 * and there are no cookied tasks running on siblings.
++ 	 */
++ 	if (!need_sync) {
++ 		for_each_class(class) {
++ 			next = class->pick_task(rq);
++ 			if (next)
++ 				break;
++ 		}
++ 
++ 		if (!next->core_cookie) {
++ 			rq->core_pick = NULL;
++ 			/*
++ 			 * For robustness, update the min_vruntime_fi for
++ 			 * unconstrained picks as well.
++ 			 */
++ 			WARN_ON_ONCE(fi_before);
++ 			task_vruntime_update(rq, next, false);
++ 			goto done;
++ 		}
++ 	}
++ 
++ 	for_each_cpu(i, smt_mask) {
++ 		struct rq *rq_i = cpu_rq(i);
++ 
++ 		rq_i->core_pick = NULL;
++ 
++ 		if (i != cpu)
++ 			update_rq_clock(rq_i);
++ 	}
++ 
++ 	/*
++ 	 * Try and select tasks for each sibling in descending sched_class
++ 	 * order.
++ 	 */
++ 	for_each_class(class) {
++ again:
++ 		for_each_cpu_wrap(i, smt_mask, cpu) {
++ 			struct rq *rq_i = cpu_rq(i);
++ 			struct task_struct *p;
++ 
++ 			if (rq_i->core_pick)
++ 				continue;
++ 
++ 			/*
++ 			 * If this sibling doesn't yet have a suitable task to
++ 			 * run; ask for the most eligible task, given the
++ 			 * highest priority task already selected for this
++ 			 * core.
++ 			 */
++ 			p = pick_task(rq_i, class, max, fi_before);
++ 			if (!p)
++ 				continue;
++ 
++ 			if (!is_task_rq_idle(p))
++ 				occ++;
++ 
++ 			rq_i->core_pick = p;
++ 			if (rq_i->idle == p && rq_i->nr_running) {
++ 				rq->core->core_forceidle = true;
++ 				if (!fi_before)
++ 					rq->core->core_forceidle_seq++;
++ 			}
++ 
++ 			/*
++ 			 * If this new candidate is of higher priority than the
++ 			 * previous; and they're incompatible; we need to wipe
++ 			 * the slate and start over. pick_task makes sure that
++ 			 * p's priority is more than max if it doesn't match
++ 			 * max's cookie.
++ 			 *
++ 			 * NOTE: this is a linear max-filter and is thus bounded
++ 			 * in execution time.
++ 			 */
++ 			if (!max || !cookie_match(max, p)) {
++ 				struct task_struct *old_max = max;
++ 
++ 				rq->core->core_cookie = p->core_cookie;
++ 				max = p;
++ 
++ 				if (old_max) {
++ 					rq->core->core_forceidle = false;
++ 					for_each_cpu(j, smt_mask) {
++ 						if (j == i)
++ 							continue;
++ 
++ 						cpu_rq(j)->core_pick = NULL;
++ 					}
++ 					occ = 1;
++ 					goto again;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	rq->core->core_pick_seq = rq->core->core_task_seq;
++ 	next = rq->core_pick;
++ 	rq->core_sched_seq = rq->core->core_pick_seq;
++ 
++ 	/* Something should have been selected for current CPU */
++ 	WARN_ON_ONCE(!next);
++ 
++ 	/*
++ 	 * Reschedule siblings
++ 	 *
++ 	 * NOTE: L1TF -- at this point we're no longer running the old task and
++ 	 * sending an IPI (below) ensures the sibling will no longer be running
++ 	 * their task. This ensures there is no inter-sibling overlap between
++ 	 * non-matching user state.
++ 	 */
++ 	for_each_cpu(i, smt_mask) {
++ 		struct rq *rq_i = cpu_rq(i);
++ 
++ 		/*
++ 		 * An online sibling might have gone offline before a task
++ 		 * could be picked for it, or it might be offline but later
++ 		 * happen to come online, but its too late and nothing was
++ 		 * picked for it.  That's Ok - it will pick tasks for itself,
++ 		 * so ignore it.
++ 		 */
++ 		if (!rq_i->core_pick)
++ 			continue;
++ 
++ 		/*
++ 		 * Update for new !FI->FI transitions, or if continuing to be in !FI:
++ 		 * fi_before     fi      update?
++ 		 *  0            0       1
++ 		 *  0            1       1
++ 		 *  1            0       1
++ 		 *  1            1       0
++ 		 */
++ 		if (!(fi_before && rq->core->core_forceidle))
++ 			task_vruntime_update(rq_i, rq_i->core_pick, rq->core->core_forceidle);
++ 
++ 		rq_i->core_pick->core_occupation = occ;
++ 
++ 		if (i == cpu) {
++ 			rq_i->core_pick = NULL;
++ 			continue;
++ 		}
++ 
++ 		/* Did we break L1TF mitigation requirements? */
++ 		WARN_ON_ONCE(!cookie_match(next, rq_i->core_pick));
++ 
++ 		if (rq_i->curr == rq_i->core_pick) {
++ 			rq_i->core_pick = NULL;
++ 			continue;
++ 		}
++ 
++ 		resched_curr(rq_i);
++ 	}
++ 
++ done:
++ 	set_next_task(rq, next);
++ 	return next;
++ }
++ 
++ static bool try_steal_cookie(int this, int that)
++ {
++ 	struct rq *dst = cpu_rq(this), *src = cpu_rq(that);
++ 	struct task_struct *p;
++ 	unsigned long cookie;
++ 	bool success = false;
++ 
++ 	local_irq_disable();
++ 	double_rq_lock(dst, src);
++ 
++ 	cookie = dst->core->core_cookie;
++ 	if (!cookie)
++ 		goto unlock;
++ 
++ 	if (dst->curr != dst->idle)
++ 		goto unlock;
++ 
++ 	p = sched_core_find(src, cookie);
++ 	if (p == src->idle)
++ 		goto unlock;
++ 
++ 	do {
++ 		if (p == src->core_pick || p == src->curr)
++ 			goto next;
++ 
++ 		if (!cpumask_test_cpu(this, &p->cpus_mask))
++ 			goto next;
++ 
++ 		if (p->core_occupation > dst->idle->core_occupation)
++ 			goto next;
++ 
++ 		p->on_rq = TASK_ON_RQ_MIGRATING;
++ 		deactivate_task(src, p, 0);
++ 		set_task_cpu(p, this);
++ 		activate_task(dst, p, 0);
++ 		p->on_rq = TASK_ON_RQ_QUEUED;
++ 
++ 		resched_curr(dst);
++ 
++ 		success = true;
++ 		break;
++ 
++ next:
++ 		p = sched_core_next(p, cookie);
++ 	} while (p);
++ 
++ unlock:
++ 	double_rq_unlock(dst, src);
++ 	local_irq_enable();
++ 
++ 	return success;
++ }
++ 
++ static bool steal_cookie_task(int cpu, struct sched_domain *sd)
++ {
++ 	int i;
++ 
++ 	for_each_cpu_wrap(i, sched_domain_span(sd), cpu) {
++ 		if (i == cpu)
++ 			continue;
++ 
++ 		if (need_resched())
++ 			break;
++ 
++ 		if (try_steal_cookie(cpu, i))
++ 			return true;
++ 	}
++ 
++ 	return false;
++ }
++ 
++ static void sched_core_balance(struct rq *rq)
++ {
++ 	struct sched_domain *sd;
++ 	int cpu = cpu_of(rq);
++ 
++ 	preempt_disable();
++ 	rcu_read_lock();
++ 	raw_spin_rq_unlock_irq(rq);
++ 	for_each_domain(cpu, sd) {
++ 		if (need_resched())
++ 			break;
++ 
++ 		if (steal_cookie_task(cpu, sd))
++ 			break;
++ 	}
++ 	raw_spin_rq_lock_irq(rq);
++ 	rcu_read_unlock();
++ 	preempt_enable();
++ }
++ 
++ static DEFINE_PER_CPU(struct callback_head, core_balance_head);
++ 
++ void queue_core_balance(struct rq *rq)
++ {
++ 	if (!sched_core_enabled(rq))
++ 		return;
++ 
++ 	if (!rq->core->core_cookie)
++ 		return;
++ 
++ 	if (!rq->nr_running) /* not forced idle */
++ 		return;
++ 
++ 	queue_balance_callback(rq, &per_cpu(core_balance_head, rq->cpu), sched_core_balance);
++ }
++ 
++ static inline void sched_core_cpu_starting(unsigned int cpu)
++ {
++ 	const struct cpumask *smt_mask = cpu_smt_mask(cpu);
++ 	struct rq *rq, *core_rq = NULL;
++ 	int i;
++ 
++ 	core_rq = cpu_rq(cpu)->core;
++ 
++ 	if (!core_rq) {
++ 		for_each_cpu(i, smt_mask) {
++ 			rq = cpu_rq(i);
++ 			if (rq->core && rq->core == rq)
++ 				core_rq = rq;
++ 		}
++ 
++ 		if (!core_rq)
++ 			core_rq = cpu_rq(cpu);
++ 
++ 		for_each_cpu(i, smt_mask) {
++ 			rq = cpu_rq(i);
++ 
++ 			WARN_ON_ONCE(rq->core && rq->core != core_rq);
++ 			rq->core = core_rq;
++ 		}
++ 	}
++ }
++ #else /* !CONFIG_SCHED_CORE */
++ 
++ static inline void sched_core_cpu_starting(unsigned int cpu) {}
++ 
++ static struct task_struct *
++ pick_next_task(struct rq *rq, struct task_struct *prev, struct rq_flags *rf)
++ {
++ 	return __pick_next_task(rq, prev, rf);
++ }
++ 
++ #endif /* CONFIG_SCHED_CORE */
++ 
++ /*
++  * Constants for the sched_mode argument of __schedule().
++  *
++  * The mode argument allows RT enabled kernels to differentiate a
++  * preemption from blocking on an 'sleeping' spin/rwlock. Note that
++  * SM_MASK_PREEMPT for !RT has all bits set, which allows the compiler to
++  * optimize the AND operation out and just check for zero.
++  */
++ #define SM_NONE			0x0
++ #define SM_PREEMPT		0x1
++ #define SM_RTLOCK_WAIT		0x2
++ 
++ #ifndef CONFIG_PREEMPT_RT
++ # define SM_MASK_PREEMPT	(~0U)
++ #else
++ # define SM_MASK_PREEMPT	SM_PREEMPT
++ #endif
++ 
+++>>>>>>> 6991436c2b5d (sched/core: Provide a scheduling point for RT locks)
+  /*
+   * __schedule() is the main scheduler function.
+   *
+diff --git a/include/linux/sched.h b/include/linux/sched.h
+index a7fd30871ea0..b5832800392c 100644
+--- a/include/linux/sched.h
++++ b/include/linux/sched.h
+@@ -228,6 +228,9 @@ extern long schedule_timeout_idle(long timeout);
+ asmlinkage void schedule(void);
+ extern void schedule_preempt_disabled(void);
+ asmlinkage void preempt_schedule_irq(void);
++#ifdef CONFIG_PREEMPT_RT
++ extern void schedule_rtlock(void);
++#endif
+ 
+ extern int __must_check io_schedule_prepare(void);
+ extern void io_schedule_finish(int token);
+* Unmerged path kernel/sched/core.c
