@@ -1,0 +1,190 @@
+KVM: x86/mmu: Zap roots in two passes to avoid inducing RCU stalls
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Sean Christopherson <seanjc@google.com>
+commit 1b6043e8e58468a7c3f2a2469b8834efe8bf5b0a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1b6043e8.failed
+
+When zapping a TDP MMU root, perform the zap in two passes to avoid
+zapping an entire top-level SPTE while holding RCU, which can induce RCU
+stalls.  In the first pass, zap SPTEs at PG_LEVEL_1G, and then
+zap top-level entries in the second pass.
+
+With 4-level paging, zapping a PGD that is fully populated with 4kb leaf
+SPTEs take up to ~7 or so seconds (time varies based on kernel config,
+number of (v)CPUs, etc...).  With 5-level paging, that time can balloon
+well into hundreds of seconds.
+
+Before remote TLB flushes were omitted, the problem was even worse as
+waiting for all active vCPUs to respond to the IPI introduced significant
+overhead for VMs with large numbers of vCPUs.
+
+By zapping 1gb SPTEs (both shadow pages and hugepages) in the first pass,
+the amount of work that is done without dropping RCU protection is
+strictly bounded, with the worst case latency for a single operation
+being less than 100ms.
+
+Zapping at 1gb in the first pass is not arbitrary.  First and foremost,
+KVM relies on being able to zap 1gb shadow pages in a single shot when
+when repacing a shadow page with a hugepage.  Zapping a 1gb shadow page
+that is fully populated with 4kb dirty SPTEs also triggers the worst case
+latency due writing back the struct page accessed/dirty bits for each 4kb
+page, i.e. the two-pass approach is guaranteed to work so long as KVM can
+cleany zap a 1gb shadow page.
+
+  rcu: INFO: rcu_sched self-detected stall on CPU
+  rcu:     52-....: (20999 ticks this GP) idle=7be/1/0x4000000000000000
+                                          softirq=15759/15759 fqs=5058
+   (t=21016 jiffies g=66453 q=238577)
+  NMI backtrace for cpu 52
+  Call Trace:
+   ...
+   mark_page_accessed+0x266/0x2f0
+   kvm_set_pfn_accessed+0x31/0x40
+   handle_removed_tdp_mmu_page+0x259/0x2e0
+   __handle_changed_spte+0x223/0x2c0
+   handle_removed_tdp_mmu_page+0x1c1/0x2e0
+   __handle_changed_spte+0x223/0x2c0
+   handle_removed_tdp_mmu_page+0x1c1/0x2e0
+   __handle_changed_spte+0x223/0x2c0
+   zap_gfn_range+0x141/0x3b0
+   kvm_tdp_mmu_zap_invalidated_roots+0xc8/0x130
+   kvm_mmu_zap_all_fast+0x121/0x190
+   kvm_mmu_invalidate_zap_pages_in_memslot+0xe/0x10
+   kvm_page_track_flush_slot+0x5c/0x80
+   kvm_arch_flush_shadow_memslot+0xe/0x10
+   kvm_set_memslot+0x172/0x4e0
+   __kvm_set_memory_region+0x337/0x590
+   kvm_vm_ioctl+0x49c/0xf80
+
+	Reported-by: David Matlack <dmatlack@google.com>
+	Cc: Ben Gardon <bgardon@google.com>
+	Cc: Mingwei Zhang <mizhang@google.com>
+	Signed-off-by: Sean Christopherson <seanjc@google.com>
+	Reviewed-by: Ben Gardon <bgardon@google.com>
+Message-Id: <20220226001546.360188-22-seanjc@google.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 1b6043e8e58468a7c3f2a2469b8834efe8bf5b0a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/mmu/tdp_mmu.c
+diff --cc arch/x86/kvm/mmu/tdp_mmu.c
+index 97bb57fe39ca,8e31627bca59..000000000000
+--- a/arch/x86/kvm/mmu/tdp_mmu.c
++++ b/arch/x86/kvm/mmu/tdp_mmu.c
+@@@ -700,11 -812,103 +700,107 @@@ static inline bool __must_check tdp_mmu
+  	return iter->yielded;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline gfn_t tdp_mmu_max_gfn_host(void)
++ {
++ 	/*
++ 	 * Bound TDP MMU walks at host.MAXPHYADDR, guest accesses beyond that
++ 	 * will hit a #PF(RSVD) and never hit an EPT Violation/Misconfig / #NPF,
++ 	 * and so KVM will never install a SPTE for such addresses.
++ 	 */
++ 	return 1ULL << (shadow_phys_bits - PAGE_SHIFT);
++ }
++ 
++ static void __tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
++ 			       bool shared, int zap_level)
++ {
++ 	struct tdp_iter iter;
++ 
++ 	gfn_t end = tdp_mmu_max_gfn_host();
++ 	gfn_t start = 0;
++ 
++ 	for_each_tdp_pte_min_level(iter, root, zap_level, start, end) {
++ retry:
++ 		if (tdp_mmu_iter_cond_resched(kvm, &iter, false, shared))
++ 			continue;
++ 
++ 		if (!is_shadow_present_pte(iter.old_spte))
++ 			continue;
++ 
++ 		if (iter.level > zap_level)
++ 			continue;
++ 
++ 		if (!shared)
++ 			tdp_mmu_set_spte(kvm, &iter, 0);
++ 		else if (tdp_mmu_set_spte_atomic(kvm, &iter, 0))
++ 			goto retry;
++ 	}
++ }
++ 
++ static void tdp_mmu_zap_root(struct kvm *kvm, struct kvm_mmu_page *root,
++ 			     bool shared)
++ {
++ 
++ 	/*
++ 	 * The root must have an elevated refcount so that it's reachable via
++ 	 * mmu_notifier callbacks, which allows this path to yield and drop
++ 	 * mmu_lock.  When handling an unmap/release mmu_notifier command, KVM
++ 	 * must drop all references to relevant pages prior to completing the
++ 	 * callback.  Dropping mmu_lock with an unreachable root would result
++ 	 * in zapping SPTEs after a relevant mmu_notifier callback completes
++ 	 * and lead to use-after-free as zapping a SPTE triggers "writeback" of
++ 	 * dirty accessed bits to the SPTE's associated struct page.
++ 	 */
++ 	WARN_ON_ONCE(!refcount_read(&root->tdp_mmu_root_count));
++ 
++ 	kvm_lockdep_assert_mmu_lock_held(kvm, shared);
++ 
++ 	rcu_read_lock();
++ 
++ 	/*
++ 	 * To avoid RCU stalls due to recursively removing huge swaths of SPs,
++ 	 * split the zap into two passes.  On the first pass, zap at the 1gb
++ 	 * level, and then zap top-level SPs on the second pass.  "1gb" is not
++ 	 * arbitrary, as KVM must be able to zap a 1gb shadow page without
++ 	 * inducing a stall to allow in-place replacement with a 1gb hugepage.
++ 	 *
++ 	 * Because zapping a SP recurses on its children, stepping down to
++ 	 * PG_LEVEL_4K in the iterator itself is unnecessary.
++ 	 */
++ 	__tdp_mmu_zap_root(kvm, root, shared, PG_LEVEL_1G);
++ 	__tdp_mmu_zap_root(kvm, root, shared, root->role.level);
++ 
++ 	rcu_read_unlock();
++ }
++ 
++ bool kvm_tdp_mmu_zap_sp(struct kvm *kvm, struct kvm_mmu_page *sp)
++ {
++ 	u64 old_spte;
++ 
++ 	/*
++ 	 * This helper intentionally doesn't allow zapping a root shadow page,
++ 	 * which doesn't have a parent page table and thus no associated entry.
++ 	 */
++ 	if (WARN_ON_ONCE(!sp->ptep))
++ 		return false;
++ 
++ 	old_spte = kvm_tdp_mmu_read_spte(sp->ptep);
++ 	if (WARN_ON_ONCE(!is_shadow_present_pte(old_spte)))
++ 		return false;
++ 
++ 	__tdp_mmu_set_spte(kvm, kvm_mmu_page_as_id(sp), sp->ptep, old_spte, 0,
++ 			   sp->gfn, sp->role.level + 1, true, true);
++ 
++ 	return true;
++ }
++ 
+++>>>>>>> 1b6043e8e584 (KVM: x86/mmu: Zap roots in two passes to avoid inducing RCU stalls)
+  /*
+ - * Zap leafs SPTEs for the range of gfns, [start, end). Returns true if SPTEs
+ - * have been cleared and a TLB flush is needed before releasing the MMU lock.
+ - *
+ + * Tears down the mappings for the range of gfns, [start, end), and frees the
+ + * non-root pages mapping GFNs strictly within that range. Returns true if
+ + * SPTEs have been cleared and a TLB flush is needed before releasing the
+ + * MMU lock.
+   * If can_yield is true, will release the MMU lock and reschedule if the
+   * scheduler needs the CPU or there is contention on the MMU lock. If this
+   * function cannot yield, it will not release the MMU lock or reschedule and
+* Unmerged path arch/x86/kvm/mmu/tdp_mmu.c
