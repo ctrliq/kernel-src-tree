@@ -1,0 +1,228 @@
+KVM: PPC: Book3S HV: Don't access HFSCR, LPIDR or LPCR when running nested
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Paul Mackerras <paulus@ozlabs.org>
+commit f3c99f97a3cda284418af6e242e06b351b83f647
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/f3c99f97.failed
+
+When running as a nested hypervisor, this avoids reading hypervisor
+privileged registers (specifically HFSCR, LPIDR and LPCR) at startup;
+instead reasonable default values are used.  This also avoids writing
+LPIDR in the single-vcpu entry/exit path.
+
+Also, this removes the check for CPU_FTR_HVMODE in kvmppc_mmu_hv_init()
+since its only caller already checks this.
+
+	Reviewed-by: David Gibson <david@gibson.dropbear.id.au>
+	Signed-off-by: Paul Mackerras <paulus@ozlabs.org>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit f3c99f97a3cda284418af6e242e06b351b83f647)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/kvm/book3s_hv.c
+diff --cc arch/powerpc/kvm/book3s_hv.c
+index de29c24e5f3d,c90deb5a5219..000000000000
+--- a/arch/powerpc/kvm/book3s_hv.c
++++ b/arch/powerpc/kvm/book3s_hv.c
+@@@ -3425,6 -3911,171 +3428,174 @@@ static int kvmppc_run_vcpu(struct kvm_r
+  	return vcpu->arch.ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ int kvmhv_run_single_vcpu(struct kvm_run *kvm_run,
++ 			  struct kvm_vcpu *vcpu, u64 time_limit,
++ 			  unsigned long lpcr)
++ {
++ 	int trap, r, pcpu;
++ 	int srcu_idx;
++ 	struct kvmppc_vcore *vc;
++ 	struct kvm *kvm = vcpu->kvm;
++ 	struct kvm_nested_guest *nested = vcpu->arch.nested;
++ 
++ 	trace_kvmppc_run_vcpu_enter(vcpu);
++ 
++ 	kvm_run->exit_reason = 0;
++ 	vcpu->arch.ret = RESUME_GUEST;
++ 	vcpu->arch.trap = 0;
++ 
++ 	vc = vcpu->arch.vcore;
++ 	vcpu->arch.ceded = 0;
++ 	vcpu->arch.run_task = current;
++ 	vcpu->arch.kvm_run = kvm_run;
++ 	vcpu->arch.stolen_logged = vcore_stolen_time(vc, mftb());
++ 	vcpu->arch.state = KVMPPC_VCPU_RUNNABLE;
++ 	vcpu->arch.busy_preempt = TB_NIL;
++ 	vcpu->arch.last_inst = KVM_INST_FETCH_FAILED;
++ 	vc->runnable_threads[0] = vcpu;
++ 	vc->n_runnable = 1;
++ 	vc->runner = vcpu;
++ 
++ 	/* See if the MMU is ready to go */
++ 	if (!kvm->arch.mmu_ready)
++ 		kvmhv_setup_mmu(vcpu);
++ 
++ 	if (need_resched())
++ 		cond_resched();
++ 
++ 	kvmppc_update_vpas(vcpu);
++ 
++ 	init_vcore_to_run(vc);
++ 	vc->preempt_tb = TB_NIL;
++ 
++ 	preempt_disable();
++ 	pcpu = smp_processor_id();
++ 	vc->pcpu = pcpu;
++ 	kvmppc_prepare_radix_vcpu(vcpu, pcpu);
++ 
++ 	local_irq_disable();
++ 	hard_irq_disable();
++ 	if (signal_pending(current))
++ 		goto sigpend;
++ 	if (lazy_irq_pending() || need_resched() || !kvm->arch.mmu_ready)
++ 		goto out;
++ 
++ 	if (!nested) {
++ 		kvmppc_core_prepare_to_enter(vcpu);
++ 		if (vcpu->arch.doorbell_request) {
++ 			vc->dpdes = 1;
++ 			smp_wmb();
++ 			vcpu->arch.doorbell_request = 0;
++ 		}
++ 		if (test_bit(BOOK3S_IRQPRIO_EXTERNAL,
++ 			     &vcpu->arch.pending_exceptions))
++ 			lpcr |= LPCR_MER;
++ 	} else if (vcpu->arch.pending_exceptions ||
++ 		   vcpu->arch.doorbell_request ||
++ 		   xive_interrupt_pending(vcpu)) {
++ 		vcpu->arch.ret = RESUME_HOST;
++ 		goto out;
++ 	}
++ 
++ 	kvmppc_clear_host_core(pcpu);
++ 
++ 	local_paca->kvm_hstate.tid = 0;
++ 	local_paca->kvm_hstate.napping = 0;
++ 	local_paca->kvm_hstate.kvm_split_mode = NULL;
++ 	kvmppc_start_thread(vcpu, vc);
++ 	kvmppc_create_dtl_entry(vcpu, vc);
++ 	trace_kvm_guest_enter(vcpu);
++ 
++ 	vc->vcore_state = VCORE_RUNNING;
++ 	trace_kvmppc_run_core(vc, 0);
++ 
++ 	if (cpu_has_feature(CPU_FTR_HVMODE))
++ 		kvmppc_radix_check_need_tlb_flush(kvm, pcpu, nested);
++ 
++ 	trace_hardirqs_on();
++ 	guest_enter_irqoff();
++ 
++ 	srcu_idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	this_cpu_disable_ftrace();
++ 
++ 	trap = kvmhv_p9_guest_entry(vcpu, time_limit, lpcr);
++ 	vcpu->arch.trap = trap;
++ 
++ 	this_cpu_enable_ftrace();
++ 
++ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
++ 
++ 	if (cpu_has_feature(CPU_FTR_HVMODE)) {
++ 		mtspr(SPRN_LPID, kvm->arch.host_lpid);
++ 		isync();
++ 	}
++ 
++ 	trace_hardirqs_off();
++ 	set_irq_happened(trap);
++ 
++ 	kvmppc_set_host_core(pcpu);
++ 
++ 	local_irq_enable();
++ 	guest_exit();
++ 
++ 	cpumask_clear_cpu(pcpu, &kvm->arch.cpu_in_guest);
++ 
++ 	preempt_enable();
++ 
++ 	/* cancel pending decrementer exception if DEC is now positive */
++ 	if (get_tb() < vcpu->arch.dec_expires && kvmppc_core_pending_dec(vcpu))
++ 		kvmppc_core_dequeue_dec(vcpu);
++ 
++ 	trace_kvm_guest_exit(vcpu);
++ 	r = RESUME_GUEST;
++ 	if (trap) {
++ 		if (!nested)
++ 			r = kvmppc_handle_exit_hv(kvm_run, vcpu, current);
++ 		else
++ 			r = kvmppc_handle_nested_exit(vcpu);
++ 	}
++ 	vcpu->arch.ret = r;
++ 
++ 	if (is_kvmppc_resume_guest(r) && vcpu->arch.ceded &&
++ 	    !kvmppc_vcpu_woken(vcpu)) {
++ 		kvmppc_set_timer(vcpu);
++ 		while (vcpu->arch.ceded && !kvmppc_vcpu_woken(vcpu)) {
++ 			if (signal_pending(current)) {
++ 				vcpu->stat.signal_exits++;
++ 				kvm_run->exit_reason = KVM_EXIT_INTR;
++ 				vcpu->arch.ret = -EINTR;
++ 				break;
++ 			}
++ 			spin_lock(&vc->lock);
++ 			kvmppc_vcore_blocked(vc);
++ 			spin_unlock(&vc->lock);
++ 		}
++ 	}
++ 	vcpu->arch.ceded = 0;
++ 
++ 	vc->vcore_state = VCORE_INACTIVE;
++ 	trace_kvmppc_run_core(vc, 1);
++ 
++  done:
++ 	kvmppc_remove_runnable(vc, vcpu);
++ 	trace_kvmppc_run_vcpu_exit(vcpu, kvm_run);
++ 
++ 	return vcpu->arch.ret;
++ 
++  sigpend:
++ 	vcpu->stat.signal_exits++;
++ 	kvm_run->exit_reason = KVM_EXIT_INTR;
++ 	vcpu->arch.ret = -EINTR;
++  out:
++ 	local_irq_enable();
++ 	preempt_enable();
++ 	goto done;
++ }
++ 
+++>>>>>>> f3c99f97a3cd (KVM: PPC: Book3S HV: Don't access HFSCR, LPIDR or LPCR when running nested)
+  static int kvmppc_vcpu_run_hv(struct kvm_run *run, struct kvm_vcpu *vcpu)
+  {
+  	int r;
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_hv.c b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+index 4c08f42f6406..262e5b9abab4 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_hv.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_hv.c
+@@ -269,14 +269,13 @@ int kvmppc_mmu_hv_init(void)
+ {
+ 	unsigned long host_lpid, rsvd_lpid;
+ 
+-	if (!cpu_has_feature(CPU_FTR_HVMODE))
+-		return -EINVAL;
+-
+ 	if (!mmu_has_feature(MMU_FTR_LOCKLESS_TLBIE))
+ 		return -EINVAL;
+ 
+ 	/* POWER7 has 10-bit LPIDs (12-bit in POWER8) */
+-	host_lpid = mfspr(SPRN_LPID);
++	host_lpid = 0;
++	if (cpu_has_feature(CPU_FTR_HVMODE))
++		host_lpid = mfspr(SPRN_LPID);
+ 	rsvd_lpid = LPID_RSVD;
+ 
+ 	kvmppc_init_lpid(rsvd_lpid + 1);
+* Unmerged path arch/powerpc/kvm/book3s_hv.c
