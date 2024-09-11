@@ -1,0 +1,480 @@
+intel: Remove rcu_read_lock() around XDP program invocation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit 49589b23d5a92dff4a7cb705608dff7dd13ef709
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/49589b23.failed
+
+The Intel drivers all have rcu_read_lock()/rcu_read_unlock() pairs around
+XDP program invocations. However, the actual lifetime of the objects
+referred by the XDP program invocation is longer, all the way through to
+the call to xdp_do_flush(), making the scope of the rcu_read_lock() too
+small. This turns out to be harmless because it all happens in a single
+NAPI poll cycle (and thus under local_bh_disable()), but it makes the
+rcu_read_lock() misleading.
+
+Rather than extend the scope of the rcu_read_lock(), just get rid of it
+entirely. With the addition of RCU annotations to the XDP_REDIRECT map
+types that take bh execution into account, lockdep even understands this to
+be safe, so there's really no reason to keep it around.
+
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Tested-by: Jesper Dangaard Brouer <brouer@redhat.com> # i40e
+	Cc: Jesse Brandeburg <jesse.brandeburg@intel.com>
+	Cc: Tony Nguyen <anthony.l.nguyen@intel.com>
+	Cc: intel-wired-lan@lists.osuosl.org
+Link: https://lore.kernel.org/bpf/20210624160609.292325-12-toke@redhat.com
+(cherry picked from commit 49589b23d5a92dff4a7cb705608dff7dd13ef709)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc_main.c
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 261f28037c1a,95323095094d..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -1885,6 -2051,251 +1885,254 @@@ static void igc_alloc_rx_buffers(struc
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool igc_alloc_rx_buffers_zc(struct igc_ring *ring, u16 count)
++ {
++ 	union igc_adv_rx_desc *desc;
++ 	u16 i = ring->next_to_use;
++ 	struct igc_rx_buffer *bi;
++ 	dma_addr_t dma;
++ 	bool ok = true;
++ 
++ 	if (!count)
++ 		return ok;
++ 
++ 	desc = IGC_RX_DESC(ring, i);
++ 	bi = &ring->rx_buffer_info[i];
++ 	i -= ring->count;
++ 
++ 	do {
++ 		bi->xdp = xsk_buff_alloc(ring->xsk_pool);
++ 		if (!bi->xdp) {
++ 			ok = false;
++ 			break;
++ 		}
++ 
++ 		dma = xsk_buff_xdp_get_dma(bi->xdp);
++ 		desc->read.pkt_addr = cpu_to_le64(dma);
++ 
++ 		desc++;
++ 		bi++;
++ 		i++;
++ 		if (unlikely(!i)) {
++ 			desc = IGC_RX_DESC(ring, 0);
++ 			bi = ring->rx_buffer_info;
++ 			i -= ring->count;
++ 		}
++ 
++ 		/* Clear the length for the next_to_use descriptor. */
++ 		desc->wb.upper.length = 0;
++ 
++ 		count--;
++ 	} while (count);
++ 
++ 	i += ring->count;
++ 
++ 	if (ring->next_to_use != i) {
++ 		ring->next_to_use = i;
++ 
++ 		/* Force memory writes to complete before letting h/w
++ 		 * know there are new descriptors to fetch.  (Only
++ 		 * applicable for weak-ordered memory model archs,
++ 		 * such as IA-64).
++ 		 */
++ 		wmb();
++ 		writel(i, ring->tail);
++ 	}
++ 
++ 	return ok;
++ }
++ 
++ static int igc_xdp_init_tx_buffer(struct igc_tx_buffer *buffer,
++ 				  struct xdp_frame *xdpf,
++ 				  struct igc_ring *ring)
++ {
++ 	dma_addr_t dma;
++ 
++ 	dma = dma_map_single(ring->dev, xdpf->data, xdpf->len, DMA_TO_DEVICE);
++ 	if (dma_mapping_error(ring->dev, dma)) {
++ 		netdev_err_once(ring->netdev, "Failed to map DMA for TX\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	buffer->type = IGC_TX_BUFFER_TYPE_XDP;
++ 	buffer->xdpf = xdpf;
++ 	buffer->protocol = 0;
++ 	buffer->bytecount = xdpf->len;
++ 	buffer->gso_segs = 1;
++ 	buffer->time_stamp = jiffies;
++ 	dma_unmap_len_set(buffer, len, xdpf->len);
++ 	dma_unmap_addr_set(buffer, dma, dma);
++ 	return 0;
++ }
++ 
++ /* This function requires __netif_tx_lock is held by the caller. */
++ static int igc_xdp_init_tx_descriptor(struct igc_ring *ring,
++ 				      struct xdp_frame *xdpf)
++ {
++ 	struct igc_tx_buffer *buffer;
++ 	union igc_adv_tx_desc *desc;
++ 	u32 cmd_type, olinfo_status;
++ 	int err;
++ 
++ 	if (!igc_desc_unused(ring))
++ 		return -EBUSY;
++ 
++ 	buffer = &ring->tx_buffer_info[ring->next_to_use];
++ 	err = igc_xdp_init_tx_buffer(buffer, xdpf, ring);
++ 	if (err)
++ 		return err;
++ 
++ 	cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
++ 		   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
++ 		   buffer->bytecount;
++ 	olinfo_status = buffer->bytecount << IGC_ADVTXD_PAYLEN_SHIFT;
++ 
++ 	desc = IGC_TX_DESC(ring, ring->next_to_use);
++ 	desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 	desc->read.olinfo_status = cpu_to_le32(olinfo_status);
++ 	desc->read.buffer_addr = cpu_to_le64(dma_unmap_addr(buffer, dma));
++ 
++ 	netdev_tx_sent_queue(txring_txq(ring), buffer->bytecount);
++ 
++ 	buffer->next_to_watch = desc;
++ 
++ 	ring->next_to_use++;
++ 	if (ring->next_to_use == ring->count)
++ 		ring->next_to_use = 0;
++ 
++ 	return 0;
++ }
++ 
++ static struct igc_ring *igc_xdp_get_tx_ring(struct igc_adapter *adapter,
++ 					    int cpu)
++ {
++ 	int index = cpu;
++ 
++ 	if (unlikely(index < 0))
++ 		index = 0;
++ 
++ 	while (index >= adapter->num_tx_queues)
++ 		index -= adapter->num_tx_queues;
++ 
++ 	return adapter->tx_ring[index];
++ }
++ 
++ static int igc_xdp_xmit_back(struct igc_adapter *adapter, struct xdp_buff *xdp)
++ {
++ 	struct xdp_frame *xdpf = xdp_convert_buff_to_frame(xdp);
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	struct igc_ring *ring;
++ 	int res;
++ 
++ 	if (unlikely(!xdpf))
++ 		return -EFAULT;
++ 
++ 	ring = igc_xdp_get_tx_ring(adapter, cpu);
++ 	nq = txring_txq(ring);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	res = igc_xdp_init_tx_descriptor(ring, xdpf);
++ 	__netif_tx_unlock(nq);
++ 	return res;
++ }
++ 
++ /* This function assumes rcu_read_lock() is held by the caller. */
++ static int __igc_xdp_run_prog(struct igc_adapter *adapter,
++ 			      struct bpf_prog *prog,
++ 			      struct xdp_buff *xdp)
++ {
++ 	u32 act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		return IGC_XDP_PASS;
++ 	case XDP_TX:
++ 		if (igc_xdp_xmit_back(adapter, xdp) < 0)
++ 			goto out_failure;
++ 		return IGC_XDP_TX;
++ 	case XDP_REDIRECT:
++ 		if (xdp_do_redirect(adapter->netdev, xdp, prog) < 0)
++ 			goto out_failure;
++ 		return IGC_XDP_REDIRECT;
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ out_failure:
++ 		trace_xdp_exception(adapter->netdev, prog, act);
++ 		fallthrough;
++ 	case XDP_DROP:
++ 		return IGC_XDP_CONSUMED;
++ 	}
++ }
++ 
++ static struct sk_buff *igc_xdp_run_prog(struct igc_adapter *adapter,
++ 					struct xdp_buff *xdp)
++ {
++ 	struct bpf_prog *prog;
++ 	int res;
++ 
++ 	prog = READ_ONCE(adapter->xdp_prog);
++ 	if (!prog) {
++ 		res = IGC_XDP_PASS;
++ 		goto out;
++ 	}
++ 
++ 	res = __igc_xdp_run_prog(adapter, prog, xdp);
++ 
++ out:
++ 	return ERR_PTR(-res);
++ }
++ 
++ /* This function assumes __netif_tx_lock is held by the caller. */
++ static void igc_flush_tx_descriptors(struct igc_ring *ring)
++ {
++ 	/* Once tail pointer is updated, hardware can fetch the descriptors
++ 	 * any time so we issue a write membar here to ensure all memory
++ 	 * writes are complete before the tail pointer is updated.
++ 	 */
++ 	wmb();
++ 	writel(ring->next_to_use, ring->tail);
++ }
++ 
++ static void igc_finalize_xdp(struct igc_adapter *adapter, int status)
++ {
++ 	int cpu = smp_processor_id();
++ 	struct netdev_queue *nq;
++ 	struct igc_ring *ring;
++ 
++ 	if (status & IGC_XDP_TX) {
++ 		ring = igc_xdp_get_tx_ring(adapter, cpu);
++ 		nq = txring_txq(ring);
++ 
++ 		__netif_tx_lock(nq, cpu);
++ 		igc_flush_tx_descriptors(ring);
++ 		__netif_tx_unlock(nq);
++ 	}
++ 
++ 	if (status & IGC_XDP_REDIRECT)
++ 		xdp_do_flush();
++ }
++ 
++ static void igc_update_rx_stats(struct igc_q_vector *q_vector,
++ 				unsigned int packets, unsigned int bytes)
++ {
++ 	struct igc_ring *ring = q_vector->rx.ring;
++ 
++ 	u64_stats_update_begin(&ring->rx_syncp);
++ 	ring->rx_stats.packets += packets;
++ 	ring->rx_stats.bytes += bytes;
++ 	u64_stats_update_end(&ring->rx_syncp);
++ 
++ 	q_vector->rx.total_packets += packets;
++ 	q_vector->rx.total_bytes += bytes;
++ }
++ 
+++>>>>>>> 49589b23d5a9 (intel: Remove rcu_read_lock() around XDP program invocation)
+  static int igc_clean_rx_irq(struct igc_q_vector *q_vector, const int budget)
+  {
+  	unsigned int total_bytes = 0, total_packets = 0;
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.c b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index c358d9049881..7d8d4fc82e8b 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -2298,7 +2298,6 @@ static int i40e_run_xdp(struct i40e_ring *rx_ring, struct xdp_buff *xdp)
+ 	struct bpf_prog *xdp_prog;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 
+ 	if (!xdp_prog)
+@@ -2334,7 +2333,6 @@ static int i40e_run_xdp(struct i40e_ring *rx_ring, struct xdp_buff *xdp)
+ 		break;
+ 	}
+ xdp_out:
+-	rcu_read_unlock();
+ 	return result;
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_xsk.c b/drivers/net/ethernet/intel/i40e/i40e_xsk.c
+index 5b39c457bd77..48b8b2f53fae 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_xsk.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_xsk.c
+@@ -153,7 +153,6 @@ static int i40e_run_xdp_zc(struct i40e_ring *rx_ring, struct xdp_buff *xdp)
+ 	struct bpf_prog *xdp_prog;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	/* NB! xdp_prog will always be !NULL, due to the fact that
+ 	 * this path is enabled by setting an XDP program.
+ 	 */
+@@ -164,7 +163,6 @@ static int i40e_run_xdp_zc(struct i40e_ring *rx_ring, struct xdp_buff *xdp)
+ 		err = xdp_do_redirect(rx_ring->netdev, xdp, xdp_prog);
+ 		if (err)
+ 			goto out_failure;
+-		rcu_read_unlock();
+ 		return I40E_XDP_REDIR;
+ 	}
+ 
+@@ -188,7 +186,6 @@ static int i40e_run_xdp_zc(struct i40e_ring *rx_ring, struct xdp_buff *xdp)
+ 		result = I40E_XDP_CONSUMED;
+ 		break;
+ 	}
+-	rcu_read_unlock();
+ 	return result;
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index 27e051d04493..cca63477894c 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -1147,15 +1147,11 @@ int ice_clean_rx_irq(struct ice_ring *rx_ring, int budget)
+ 		xdp.frame_sz = ice_rx_frame_truesize(rx_ring, size);
+ #endif
+ 
+-		rcu_read_lock();
+ 		xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+-		if (!xdp_prog) {
+-			rcu_read_unlock();
++		if (!xdp_prog)
+ 			goto construct_skb;
+-		}
+ 
+ 		xdp_res = ice_run_xdp(rx_ring, &xdp, xdp_prog);
+-		rcu_read_unlock();
+ 		if (!xdp_res)
+ 			goto construct_skb;
+ 		if (xdp_res & (ICE_XDP_TX | ICE_XDP_REDIR)) {
+diff --git a/drivers/net/ethernet/intel/ice/ice_xsk.c b/drivers/net/ethernet/intel/ice/ice_xsk.c
+index f1d4240e57df..4ffbd85f15f0 100644
+--- a/drivers/net/ethernet/intel/ice/ice_xsk.c
++++ b/drivers/net/ethernet/intel/ice/ice_xsk.c
+@@ -469,7 +469,6 @@ ice_run_xdp_zc(struct ice_ring *rx_ring, struct xdp_buff *xdp)
+ 	struct ice_ring *xdp_ring;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	/* ZC patch is enabled only when XDP program is set,
+ 	 * so here it can not be NULL
+ 	 */
+@@ -481,7 +480,6 @@ ice_run_xdp_zc(struct ice_ring *rx_ring, struct xdp_buff *xdp)
+ 		err = xdp_do_redirect(rx_ring->netdev, xdp, xdp_prog);
+ 		if (err)
+ 			goto out_failure;
+-		rcu_read_unlock();
+ 		return ICE_XDP_REDIR;
+ 	}
+ 
+@@ -506,7 +504,6 @@ ice_run_xdp_zc(struct ice_ring *rx_ring, struct xdp_buff *xdp)
+ 		break;
+ 	}
+ 
+-	rcu_read_unlock();
+ 	return result;
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index f7badd8c36f4..a805cc8100db 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -8390,7 +8390,6 @@ static struct sk_buff *igb_run_xdp(struct igb_adapter *adapter,
+ 	struct bpf_prog *xdp_prog;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 
+ 	if (!xdp_prog)
+@@ -8423,7 +8422,6 @@ static struct sk_buff *igb_run_xdp(struct igb_adapter *adapter,
+ 		break;
+ 	}
+ xdp_out:
+-	rcu_read_unlock();
+ 	return ERR_PTR(-result);
+ }
+ 
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 55ad3851213a..366bc9daddde 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -2193,7 +2193,6 @@ static struct sk_buff *ixgbe_run_xdp(struct ixgbe_adapter *adapter,
+ 	struct xdp_frame *xdpf;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 
+ 	if (!xdp_prog)
+@@ -2231,7 +2230,6 @@ static struct sk_buff *ixgbe_run_xdp(struct ixgbe_adapter *adapter,
+ 		break;
+ 	}
+ xdp_out:
+-	rcu_read_unlock();
+ 	return ERR_PTR(-result);
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+index f72d2978263b..96dd1a4f956a 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_xsk.c
+@@ -100,7 +100,6 @@ static int ixgbe_run_xdp_zc(struct ixgbe_adapter *adapter,
+ 	struct xdp_frame *xdpf;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 	act = bpf_prog_run_xdp(xdp_prog, xdp);
+ 
+@@ -108,7 +107,6 @@ static int ixgbe_run_xdp_zc(struct ixgbe_adapter *adapter,
+ 		err = xdp_do_redirect(rx_ring->netdev, xdp, xdp_prog);
+ 		if (err)
+ 			goto out_failure;
+-		rcu_read_unlock();
+ 		return IXGBE_XDP_REDIR;
+ 	}
+ 
+@@ -134,7 +132,6 @@ static int ixgbe_run_xdp_zc(struct ixgbe_adapter *adapter,
+ 		result = IXGBE_XDP_CONSUMED;
+ 		break;
+ 	}
+-	rcu_read_unlock();
+ 	return result;
+ }
+ 
+diff --git a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+index 58207ffbbe6c..570be2e35100 100644
+--- a/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
++++ b/drivers/net/ethernet/intel/ixgbevf/ixgbevf_main.c
+@@ -1056,7 +1056,6 @@ static struct sk_buff *ixgbevf_run_xdp(struct ixgbevf_adapter *adapter,
+ 	struct bpf_prog *xdp_prog;
+ 	u32 act;
+ 
+-	rcu_read_lock();
+ 	xdp_prog = READ_ONCE(rx_ring->xdp_prog);
+ 
+ 	if (!xdp_prog)
+@@ -1084,7 +1083,6 @@ static struct sk_buff *ixgbevf_run_xdp(struct ixgbevf_adapter *adapter,
+ 		break;
+ 	}
+ xdp_out:
+-	rcu_read_unlock();
+ 	return ERR_PTR(-result);
+ }
+ 
