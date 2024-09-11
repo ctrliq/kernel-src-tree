@@ -1364,12 +1364,6 @@ static const struct attribute_group pci_dev_reset_attr_group = {
 	.is_visible = pci_dev_reset_attr_is_visible,
 };
 
-
-static void pci_create_capabilities_sysfs(struct pci_dev *dev)
-{
-	pcie_vpd_create_sysfs_dev_files(dev);
-}
-
 int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
 {
 	int retval;
@@ -1381,16 +1375,9 @@ int __must_check pci_create_sysfs_dev_files(struct pci_dev *pdev)
 	if (retval)
 		return retval;
 
-	/* add sysfs entries for various capabilities */
-	pci_create_capabilities_sysfs(pdev);
 	pci_create_firmware_label_files(pdev);
 
 	return 0;
-}
-
-static void pci_remove_capabilities_sysfs(struct pci_dev *dev)
-{
-	pcie_vpd_remove_sysfs_dev_files(dev);
 }
 
 /**
@@ -1404,7 +1391,6 @@ void pci_remove_sysfs_dev_files(struct pci_dev *pdev)
 	if (!sysfs_initialized)
 		return;
 
-	pci_remove_capabilities_sysfs(pdev);
 	pci_remove_resource_files(pdev);
 	pci_remove_firmware_label_files(pdev);
 }
@@ -1496,6 +1482,7 @@ const struct attribute_group *pci_dev_groups[] = {
 	&pci_dev_config_attr_group,
 	&pci_dev_rom_attr_group,
 	&pci_dev_reset_attr_group,
+	&pci_dev_vpd_attr_group,
 	NULL,
 };
 
