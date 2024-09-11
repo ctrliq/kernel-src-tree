@@ -1,0 +1,197 @@
+RDMA/rxe: Add unlocked versions of pool APIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Bob Pearson <rpearsonhpe@gmail.com>
+commit 3853c35e243d56238159e8365b6aca410bdd4576
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/3853c35e.failed
+
+The existing pool APIs use the rw_lock pool_lock to protect critical
+sections that change the pool state. This does not correctly implement a
+typical sequence like the following
+
+        elem = <lookup key in pool>
+
+        if found use elem else
+
+        elem = <alloc new elem in pool>
+
+        <add key to elem>
+
+Which is racy if multiple threads are attempting to perform this at the
+same time. We want the second thread to use the elem created by the first
+thread not create two equivalent elems.
+
+This patch adds new APIs that are the same as existing APIs but do not
+take the pool_lock. A caller can then take the lock and perform a sequence
+of pool operations and then release the lock.
+
+Link: https://lore.kernel.org/r/20201216231550.27224-7-rpearson@hpe.com
+	Signed-off-by: Bob Pearson <rpearson@hpe.com>
+	Signed-off-by: Jason Gunthorpe <jgg@nvidia.com>
+(cherry picked from commit 3853c35e243d56238159e8365b6aca410bdd4576)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rxe/rxe_pool.c
+diff --cc drivers/infiniband/sw/rxe/rxe_pool.c
+index 3727f20dbe87,d26730eec720..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_pool.c
++++ b/drivers/infiniband/sw/rxe/rxe_pool.c
+@@@ -365,10 -337,11 +393,14 @@@ void __rxe_drop_index(struct rxe_pool_e
+  	write_unlock_irqrestore(&pool->pool_lock, flags);
+  }
+  
+- void *rxe_alloc(struct rxe_pool *pool)
++ void *rxe_alloc_nl(struct rxe_pool *pool)
+  {
+ -	struct rxe_type_info *info = &rxe_type_info[pool->type];
+  	struct rxe_pool_entry *elem;
+++<<<<<<< HEAD
+ +	unsigned long flags;
+++=======
++ 	u8 *obj;
+++>>>>>>> 3853c35e243d (RDMA/rxe: Add unlocked versions of pool APIs)
+  
+  	might_sleep_if(!(pool->flags & RXE_POOL_ATOMIC));
+  
+@@@ -482,17 -475,16 +521,14 @@@ void *rxe_pool_get_index(struct rxe_poo
+  
+  out:
+  	read_unlock_irqrestore(&pool->pool_lock, flags);
+ -	return obj;
+ +	return node ? elem : NULL;
+  }
+  
+- void *rxe_pool_get_key(struct rxe_pool *pool, void *key)
++ void *rxe_pool_get_key_nl(struct rxe_pool *pool, void *key)
+  {
+ -	struct rxe_type_info *info = &rxe_type_info[pool->type];
+ -	struct rb_node *node;
+ -	struct rxe_pool_entry *elem;
+ -	u8 *obj = NULL;
+ +	struct rb_node *node = NULL;
+ +	struct rxe_pool_entry *elem = NULL;
+  	int cmp;
+- 	unsigned long flags;
+- 
+- 	read_lock_irqsave(&pool->pool_lock, flags);
+  
+  	if (pool->state != RXE_POOL_STATE_VALID)
+  		goto out;
+@@@ -513,10 -505,25 +549,26 @@@
+  			break;
+  	}
+  
+ -	if (node) {
+ +	if (node)
+  		kref_get(&elem->ref_cnt);
+ -		obj = (u8 *)elem - info->elem_offset;
+ -	} else {
+ -		obj = NULL;
+ -	}
+  
+  out:
+++<<<<<<< HEAD
+ +	read_unlock_irqrestore(&pool->pool_lock, flags);
+ +	return node ? elem : NULL;
+++=======
++ 	return obj;
++ }
++ 
++ void *rxe_pool_get_key(struct rxe_pool *pool, void *key)
++ {
++ 	u8 *obj = NULL;
++ 	unsigned long flags;
++ 
++ 	read_lock_irqsave(&pool->pool_lock, flags);
++ 	obj = rxe_pool_get_key_nl(pool, key);
++ 	read_unlock_irqrestore(&pool->pool_lock, flags);
++ 
++ 	return obj;
+++>>>>>>> 3853c35e243d (RDMA/rxe: Add unlocked versions of pool APIs)
+  }
+* Unmerged path drivers/infiniband/sw/rxe/rxe_pool.c
+diff --git a/drivers/infiniband/sw/rxe/rxe_pool.h b/drivers/infiniband/sw/rxe/rxe_pool.h
+index e1a24bca99de..1058de3f14ea 100644
+--- a/drivers/infiniband/sw/rxe/rxe_pool.h
++++ b/drivers/infiniband/sw/rxe/rxe_pool.h
+@@ -116,41 +116,70 @@ void rxe_pool_cleanup(struct rxe_pool *pool);
+ /* allocate an object from pool */
+ void *rxe_alloc(struct rxe_pool *pool);
+ 
++/* allocate an object from pool - no lock */
++void *rxe_alloc_nl(struct rxe_pool *pool);
++
+ /* connect already allocated object to pool */
+ int __rxe_add_to_pool(struct rxe_pool *pool, struct rxe_pool_entry *elem);
+ 
+ #define rxe_add_to_pool(pool, obj) __rxe_add_to_pool(pool, &(obj)->pelem)
+ 
+ /* assign an index to an indexed object and insert object into
+- *  pool's rb tree
++ *  pool's rb tree with and without holding the pool_lock
+  */
+ void __rxe_add_index(struct rxe_pool_entry *elem);
+ 
+ #define rxe_add_index(obj) __rxe_add_index(&(obj)->pelem)
+ 
+-/* drop an index and remove object from rb tree */
++void __rxe_add_index_nl(struct rxe_pool_entry *elem);
++
++#define rxe_add_index_nl(obj) __rxe_add_index_nl(&(obj)->pelem)
++
++/* drop an index and remove object from rb tree
++ * with and without holding the pool_lock
++ */
+ void __rxe_drop_index(struct rxe_pool_entry *elem);
+ 
+ #define rxe_drop_index(obj) __rxe_drop_index(&(obj)->pelem)
+ 
++void __rxe_drop_index_nl(struct rxe_pool_entry *elem);
++
++#define rxe_drop_index_nl(obj) __rxe_drop_index_nl(&(obj)->pelem)
++
+ /* assign a key to a keyed object and insert object into
+- *  pool's rb tree
++ * pool's rb tree with and without holding pool_lock
+  */
+ void __rxe_add_key(struct rxe_pool_entry *elem, void *key);
+ 
+ #define rxe_add_key(obj, key) __rxe_add_key(&(obj)->pelem, key)
+ 
+-/* remove elem from rb tree */
++void __rxe_add_key_nl(struct rxe_pool_entry *elem, void *key);
++
++#define rxe_add_key_nl(obj, key) __rxe_add_key_nl(&(obj)->pelem, key)
++
++/* remove elem from rb tree with and without holding pool_lock */
+ void __rxe_drop_key(struct rxe_pool_entry *elem);
+ 
+ #define rxe_drop_key(obj) __rxe_drop_key(&(obj)->pelem)
+ 
+-/* lookup an indexed object from index. takes a reference on object */
++void __rxe_drop_key_nl(struct rxe_pool_entry *elem);
++
++#define rxe_drop_key_nl(obj) __rxe_drop_key_nl(&(obj)->pelem)
++
++/* lookup an indexed object from index with and without holding pool_lock.
++ * takes a reference on object
++ */
+ void *rxe_pool_get_index(struct rxe_pool *pool, u32 index);
+ 
+-/* lookup keyed object from key. takes a reference on the object */
++void *rxe_pool_get_index_nl(struct rxe_pool *pool, u32 index);
++
++/* lookup keyed object from key with and without holding pool_lock.
++ * takes a reference on the objecti
++ */
+ void *rxe_pool_get_key(struct rxe_pool *pool, void *key);
+ 
++void *rxe_pool_get_key_nl(struct rxe_pool *pool, void *key);
++
+ /* cleanup an object when all references are dropped */
+ void rxe_elem_release(struct kref *kref);
+ 
