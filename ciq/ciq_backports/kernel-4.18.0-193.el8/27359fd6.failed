@@ -1,0 +1,263 @@
+dax: Fix unlock mismatch with updated API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 27359fd6e5f3c5db8fe544b63238b6170e8806d8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/27359fd6.failed
+
+Internal to dax_unlock_mapping_entry(), dax_unlock_entry() is used to
+store a replacement entry in the Xarray at the given xas-index with the
+DAX_LOCKED bit clear. When called, dax_unlock_entry() expects the unlocked
+value of the entry relative to the current Xarray state to be specified.
+
+In most contexts dax_unlock_entry() is operating in the same scope as
+the matched dax_lock_entry(). However, in the dax_unlock_mapping_entry()
+case the implementation needs to recall the original entry. In the case
+where the original entry is a 'pmd' entry it is possible that the pfn
+performed to do the lookup is misaligned to the value retrieved in the
+Xarray.
+
+Change the api to return the unlock cookie from dax_lock_page() and pass
+it to dax_unlock_page(). This fixes a bug where dax_unlock_page() was
+assuming that the page was PMD-aligned if the entry was a PMD entry with
+signatures like:
+
+ WARNING: CPU: 38 PID: 1396 at fs/dax.c:340 dax_insert_entry+0x2b2/0x2d0
+ RIP: 0010:dax_insert_entry+0x2b2/0x2d0
+ [..]
+ Call Trace:
+  dax_iomap_pte_fault.isra.41+0x791/0xde0
+  ext4_dax_huge_fault+0x16f/0x1f0
+  ? up_read+0x1c/0xa0
+  __do_fault+0x1f/0x160
+  __handle_mm_fault+0x1033/0x1490
+  handle_mm_fault+0x18b/0x3d0
+
+Link: https://lkml.kernel.org/r/20181130154902.GL10377@bombadil.infradead.org
+Fixes: 9f32d221301c ("dax: Convert dax_lock_mapping_entry to XArray")
+	Reported-by: Dan Williams <dan.j.williams@intel.com>
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+	Tested-by: Dan Williams <dan.j.williams@intel.com>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 27359fd6e5f3c5db8fe544b63238b6170e8806d8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index b89ab8b5e700,48132eca3761..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -489,32 -374,26 +489,52 @@@ static struct page *dax_busy_page(void 
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +static bool entry_wait_revalidate(void)
+ +{
+ +	rcu_read_unlock();
+ +	schedule();
+ +	rcu_read_lock();
+ +
+ +	/*
+ +	 * Tell __get_unlocked_mapping_entry() to take a break, we need
+ +	 * to revalidate page->mapping after dropping locks
+ +	 */
+ +	return true;
+ +}
+ +
+ +bool dax_lock_mapping_entry(struct page *page)
+ +{
+ +	pgoff_t index;
+ +	struct inode *inode;
+ +	bool did_lock = false;
+ +	void *entry = NULL, **slot;
+ +	struct address_space *mapping;
+++=======
++ /*
++  * dax_lock_mapping_entry - Lock the DAX entry corresponding to a page
++  * @page: The page whose entry we want to lock
++  *
++  * Context: Process context.
++  * Return: A cookie to pass to dax_unlock_page() or 0 if the entry could
++  * not be locked.
++  */
++ dax_entry_t dax_lock_page(struct page *page)
++ {
++ 	XA_STATE(xas, NULL, 0);
++ 	void *entry;
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  
+ -	/* Ensure page->mapping isn't freed while we look at it */
+  	rcu_read_lock();
+  	for (;;) {
+ -		struct address_space *mapping = READ_ONCE(page->mapping);
+ +		mapping = READ_ONCE(page->mapping);
+  
+++<<<<<<< HEAD
+ +		if (!dax_mapping(mapping))
+++=======
++ 		entry = NULL;
++ 		if (!mapping || !dax_mapping(mapping))
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  			break;
+  
+  		/*
+@@@ -524,48 -403,41 +544,65 @@@
+  		 * otherwise we would not have a valid pfn_to_page()
+  		 * translation.
+  		 */
+++<<<<<<< HEAD
+ +		inode = mapping->host;
+ +		if (S_ISCHR(inode->i_mode)) {
+ +			did_lock = true;
+++=======
++ 		entry = (void *)~0UL;
++ 		if (S_ISCHR(mapping->host->i_mode))
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  			break;
+ +		}
+  
+ -		xas.xa = &mapping->i_pages;
+ -		xas_lock_irq(&xas);
+ +		xa_lock_irq(&mapping->i_pages);
+  		if (mapping != page->mapping) {
+ -			xas_unlock_irq(&xas);
+ +			xa_unlock_irq(&mapping->i_pages);
+  			continue;
+  		}
+ -		xas_set(&xas, page->index);
+ -		entry = xas_load(&xas);
+ -		if (dax_is_locked(entry)) {
+ -			rcu_read_unlock();
+ -			wait_entry_unlocked(&xas, entry);
+ -			rcu_read_lock();
+ +		index = page->index;
+ +
+ +		entry = __get_unlocked_mapping_entry(mapping, index, &slot,
+ +				entry_wait_revalidate);
+ +		if (!entry) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			break;
+ +		} else if (IS_ERR(entry)) {
+ +			xa_unlock_irq(&mapping->i_pages);
+ +			WARN_ON_ONCE(PTR_ERR(entry) != -EAGAIN);
+  			continue;
+  		}
+ -		dax_lock_entry(&xas, entry);
+ -		xas_unlock_irq(&xas);
+ +		lock_slot(mapping, slot);
+ +		did_lock = true;
+ +		xa_unlock_irq(&mapping->i_pages);
+  		break;
+  	}
+  	rcu_read_unlock();
+++<<<<<<< HEAD
+ +
+ +	return did_lock;
+++=======
++ 	return (dax_entry_t)entry;
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  }
+  
+- void dax_unlock_mapping_entry(struct page *page)
++ void dax_unlock_page(struct page *page, dax_entry_t cookie)
+  {
+  	struct address_space *mapping = page->mapping;
+++<<<<<<< HEAD
+ +	struct inode *inode = mapping->host;
+++=======
++ 	XA_STATE(xas, &mapping->i_pages, page->index);
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  
+ -	if (S_ISCHR(mapping->host->i_mode))
+ +	if (S_ISCHR(inode->i_mode))
+  		return;
+  
+++<<<<<<< HEAD
+ +	unlock_mapping_entry(mapping, page->index);
+++=======
++ 	dax_unlock_entry(&xas, (void *)cookie);
+++>>>>>>> 27359fd6e5f3 (dax: Fix unlock mismatch with updated API)
+  }
+  
+  /*
+* Unmerged path fs/dax.c
+diff --git a/include/linux/dax.h b/include/linux/dax.h
+index df9663765322..becaea5f4488 100644
+--- a/include/linux/dax.h
++++ b/include/linux/dax.h
+@@ -7,6 +7,8 @@
+ #include <linux/radix-tree.h>
+ #include <asm/pgtable.h>
+ 
++typedef unsigned long dax_entry_t;
++
+ struct iomap_ops;
+ struct dax_device;
+ struct dax_operations {
+@@ -105,8 +107,8 @@ int dax_writeback_mapping_range(struct address_space *mapping,
+ 		struct block_device *bdev, struct writeback_control *wbc);
+ 
+ struct page *dax_layout_busy_page(struct address_space *mapping);
+-bool dax_lock_mapping_entry(struct page *page);
+-void dax_unlock_mapping_entry(struct page *page);
++dax_entry_t dax_lock_page(struct page *page);
++void dax_unlock_page(struct page *page, dax_entry_t cookie);
+ #else
+ static inline bool bdev_dax_supported(struct block_device *bdev,
+ 		int blocksize)
+@@ -146,14 +148,14 @@ static inline int dax_writeback_mapping_range(struct address_space *mapping,
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static inline bool dax_lock_mapping_entry(struct page *page)
++static inline dax_entry_t dax_lock_page(struct page *page)
+ {
+ 	if (IS_DAX(page->mapping->host))
+-		return true;
+-	return false;
++		return ~0UL;
++	return 0;
+ }
+ 
+-static inline void dax_unlock_mapping_entry(struct page *page)
++static inline void dax_unlock_page(struct page *page, dax_entry_t cookie)
+ {
+ }
+ #endif
+diff --git a/mm/memory-failure.c b/mm/memory-failure.c
+index f5ec8e5dc464..45a709bf6770 100644
+--- a/mm/memory-failure.c
++++ b/mm/memory-failure.c
+@@ -1161,6 +1161,7 @@ static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
+ 	LIST_HEAD(tokill);
+ 	int rc = -EBUSY;
+ 	loff_t start;
++	dax_entry_t cookie;
+ 
+ 	/*
+ 	 * Prevent the inode from being freed while we are interrogating
+@@ -1169,7 +1170,8 @@ static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
+ 	 * also prevents changes to the mapping of this pfn until
+ 	 * poison signaling is complete.
+ 	 */
+-	if (!dax_lock_mapping_entry(page))
++	cookie = dax_lock_page(page);
++	if (!cookie)
+ 		goto out;
+ 
+ 	if (hwpoison_filter(page)) {
+@@ -1220,7 +1222,7 @@ static int memory_failure_dev_pagemap(unsigned long pfn, int flags,
+ 	kill_procs(&tokill, flags & MF_MUST_KILL, !unmap_success, pfn, flags);
+ 	rc = 0;
+ unlock:
+-	dax_unlock_mapping_entry(page);
++	dax_unlock_page(page, cookie);
+ out:
+ 	/* drop pgmap ref acquired in caller */
+ 	put_dev_pagemap(pgmap);
