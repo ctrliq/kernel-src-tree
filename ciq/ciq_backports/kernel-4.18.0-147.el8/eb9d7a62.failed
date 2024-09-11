@@ -1,0 +1,368 @@
+powerpc/mm_iommu: Fix potential deadlock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [powerpc] mm_iommu: Fix potential deadlock (David Gibson) [1629531]
+Rebuild_FUZZ: 88.89%
+commit-author Alexey Kardashevskiy <aik@ozlabs.ru>
+commit eb9d7a62c38628ab0ba6e59d22d7cb7930e415d1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/eb9d7a62.failed
+
+Currently mm_iommu_do_alloc() is called in 2 cases:
+- VFIO_IOMMU_SPAPR_REGISTER_MEMORY ioctl() for normal memory:
+	this locks &mem_list_mutex and then locks mm::mmap_sem
+	several times when adjusting locked_vm or pinning pages;
+- vfio_pci_nvgpu_regops::mmap() for GPU memory:
+	this is called with mm::mmap_sem held already and it locks
+	&mem_list_mutex.
+
+So one can craft a userspace program to do special ioctl and mmap in
+2 threads concurrently and cause a deadlock which lockdep warns about
+(below).
+
+We did not hit this yet because QEMU constructs the machine in a single
+thread.
+
+This moves the overlap check next to where the new entry is added and
+reduces the amount of time spent with &mem_list_mutex held.
+
+This moves locked_vm adjustment from under &mem_list_mutex.
+
+This relies on mm_iommu_adjust_locked_vm() doing nothing when entries==0.
+
+This is one of the lockdep warnings:
+
+======================================================
+WARNING: possible circular locking dependency detected
+5.1.0-rc2-le_nv2_aikATfstn1-p1 #363 Not tainted
+------------------------------------------------------
+qemu-system-ppc/8038 is trying to acquire lock:
+000000002ec6c453 (mem_list_mutex){+.+.}, at: mm_iommu_do_alloc+0x70/0x490
+
+but task is already holding lock:
+00000000fd7da97f (&mm->mmap_sem){++++}, at: vm_mmap_pgoff+0xf0/0x160
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&mm->mmap_sem){++++}:
+       lock_acquire+0xf8/0x260
+       down_write+0x44/0xa0
+       mm_iommu_adjust_locked_vm.part.1+0x4c/0x190
+       mm_iommu_do_alloc+0x310/0x490
+       tce_iommu_ioctl.part.9+0xb84/0x1150 [vfio_iommu_spapr_tce]
+       vfio_fops_unl_ioctl+0x94/0x430 [vfio]
+       do_vfs_ioctl+0xe4/0x930
+       ksys_ioctl+0xc4/0x110
+       sys_ioctl+0x28/0x80
+       system_call+0x5c/0x70
+
+-> #0 (mem_list_mutex){+.+.}:
+       __lock_acquire+0x1484/0x1900
+       lock_acquire+0xf8/0x260
+       __mutex_lock+0x88/0xa70
+       mm_iommu_do_alloc+0x70/0x490
+       vfio_pci_nvgpu_mmap+0xc0/0x130 [vfio_pci]
+       vfio_pci_mmap+0x198/0x2a0 [vfio_pci]
+       vfio_device_fops_mmap+0x44/0x70 [vfio]
+       mmap_region+0x5d4/0x770
+       do_mmap+0x42c/0x650
+       vm_mmap_pgoff+0x124/0x160
+       ksys_mmap_pgoff+0xdc/0x2f0
+       sys_mmap+0x40/0x80
+       system_call+0x5c/0x70
+
+other info that might help us debug this:
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&mm->mmap_sem);
+                               lock(mem_list_mutex);
+                               lock(&mm->mmap_sem);
+  lock(mem_list_mutex);
+
+ *** DEADLOCK ***
+
+1 lock held by qemu-system-ppc/8038:
+ #0: 00000000fd7da97f (&mm->mmap_sem){++++}, at: vm_mmap_pgoff+0xf0/0x160
+
+Fixes: c10c21efa4bc ("powerpc/vfio/iommu/kvm: Do not pin device memory", 2018-12-19)
+	Signed-off-by: Alexey Kardashevskiy <aik@ozlabs.ru>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit eb9d7a62c38628ab0ba6e59d22d7cb7930e415d1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/mm/mmu_context_iommu.c
+diff --cc arch/powerpc/mm/mmu_context_iommu.c
+index ce8cc69f7901,9d9be850f8c2..000000000000
+--- a/arch/powerpc/mm/mmu_context_iommu.c
++++ b/arch/powerpc/mm/mmu_context_iommu.c
+@@@ -78,83 -91,21 +78,95 @@@ bool mm_iommu_preregistered(struct mm_s
+  }
+  EXPORT_SYMBOL_GPL(mm_iommu_preregistered);
+  
+ -static long mm_iommu_do_alloc(struct mm_struct *mm, unsigned long ua,
+ -			      unsigned long entries, unsigned long dev_hpa,
+ -			      struct mm_iommu_table_group_mem_t **pmem)
+ +/*
+ + * Taken from alloc_migrate_target with changes to remove CMA allocations
+ + */
+ +struct page *new_iommu_non_cma_page(struct page *page, unsigned long private)
+ +{
+ +	gfp_t gfp_mask = GFP_USER;
+ +	struct page *new_page;
+ +
+ +	if (PageCompound(page))
+ +		return NULL;
+ +
+ +	if (PageHighMem(page))
+ +		gfp_mask |= __GFP_HIGHMEM;
+ +
+ +	/*
+ +	 * We don't want the allocation to force an OOM if possibe
+ +	 */
+ +	new_page = alloc_page(gfp_mask | __GFP_NORETRY | __GFP_NOWARN);
+ +	return new_page;
+ +}
+ +
+ +static int mm_iommu_move_page_from_cma(struct page *page)
+ +{
+ +	int ret = 0;
+ +	LIST_HEAD(cma_migrate_pages);
+ +
+ +	/* Ignore huge pages for now */
+ +	if (PageCompound(page))
+ +		return -EBUSY;
+ +
+ +	lru_add_drain();
+ +	ret = isolate_lru_page(page);
+ +	if (ret)
+ +		return ret;
+ +
+ +	list_add(&page->lru, &cma_migrate_pages);
+ +	put_page(page); /* Drop the gup reference */
+ +
+ +	ret = migrate_pages(&cma_migrate_pages, new_iommu_non_cma_page,
+ +				NULL, 0, MIGRATE_SYNC, MR_CONTIG_RANGE);
+ +	if (ret) {
+ +		if (!list_empty(&cma_migrate_pages))
+ +			putback_movable_pages(&cma_migrate_pages);
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ +		struct mm_iommu_table_group_mem_t **pmem)
+  {
+++<<<<<<< HEAD
+ +	struct mm_iommu_table_group_mem_t *mem;
+ +	long i, j, ret = 0, locked_entries = 0;
+++=======
++ 	struct mm_iommu_table_group_mem_t *mem, *mem2;
++ 	long i, ret, locked_entries = 0, pinned = 0;
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  	unsigned int pageshift;
+ +	unsigned long flags;
+ +	unsigned long cur_ua;
+ +	struct page *page = NULL;
+ +
+++<<<<<<< HEAD
+ +	mutex_lock(&mem_list_mutex);
+ +
+ +	list_for_each_entry_rcu(mem, &mm->context.iommu_group_mem_list,
+ +			next) {
+ +		/* Overlap? */
+ +		if ((mem->ua < (ua + (entries << PAGE_SHIFT))) &&
+ +				(ua < (mem->ua +
+ +				       (mem->entries << PAGE_SHIFT)))) {
+ +			ret = -EINVAL;
+ +			goto unlock_exit;
+ +		}
+  
+ +	}
+ +
+ +	ret = mm_iommu_adjust_locked_vm(mm, entries, true);
+ +	if (ret)
+ +		goto unlock_exit;
+++=======
++ 	if (dev_hpa == MM_IOMMU_TABLE_INVALID_HPA) {
++ 		ret = mm_iommu_adjust_locked_vm(mm, entries, true);
++ 		if (ret)
++ 			return ret;
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  
+ -		locked_entries = entries;
+ -	}
+ +	locked_entries = entries;
+  
+  	mem = kzalloc(sizeof(*mem), GFP_KERNEL);
+  	if (!mem) {
+@@@ -175,61 -133,37 +187,78 @@@
+  		goto unlock_exit;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ 	down_read(&mm->mmap_sem);
++ 	ret = get_user_pages_longterm(ua, entries, FOLL_WRITE, mem->hpages, NULL);
++ 	up_read(&mm->mmap_sem);
++ 	pinned = ret > 0 ? ret : 0;
++ 	if (ret != entries) {
++ 		ret = -EFAULT;
++ 		goto free_exit;
++ 	}
++ 
++ 	pageshift = PAGE_SHIFT;
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  	for (i = 0; i < entries; ++i) {
+ -		struct page *page = mem->hpages[i];
+ -
+ +		cur_ua = ua + (i << PAGE_SHIFT);
+ +		if (1 != get_user_pages_fast(cur_ua,
+ +					1/* pages */, 1/* iswrite */, &page)) {
+ +			ret = -EFAULT;
+ +			for (j = 0; j < i; ++j)
+ +				put_page(pfn_to_page(mem->hpas[j] >>
+ +						PAGE_SHIFT));
+ +			vfree(mem->hpas);
+ +			kfree(mem);
+ +			goto unlock_exit;
+ +		}
+  		/*
+ -		 * Allow to use larger than 64k IOMMU pages. Only do that
+ -		 * if we are backed by hugetlb.
+ +		 * If we get a page from the CMA zone, since we are going to
+ +		 * be pinning these entries, we might as well move them out
+ +		 * of the CMA zone if possible. NOTE: faulting in + migration
+ +		 * can be expensive. Batching can be considered later
+  		 */
+ -		if ((mem->pageshift > PAGE_SHIFT) && PageHuge(page)) {
+ +		if (is_migrate_cma_page(page)) {
+ +			if (mm_iommu_move_page_from_cma(page))
+ +				goto populate;
+ +			if (1 != get_user_pages_fast(cur_ua,
+ +						1/* pages */, 1/* iswrite */,
+ +						&page)) {
+ +				ret = -EFAULT;
+ +				for (j = 0; j < i; ++j)
+ +					put_page(pfn_to_page(mem->hpas[j] >>
+ +								PAGE_SHIFT));
+ +				vfree(mem->hpas);
+ +				kfree(mem);
+ +				goto unlock_exit;
+ +			}
+ +		}
+ +populate:
+ +		pageshift = PAGE_SHIFT;
+ +		if (mem->pageshift > PAGE_SHIFT && PageCompound(page)) {
+ +			pte_t *pte;
+  			struct page *head = compound_head(page);
+ -
+ -			pageshift = compound_order(head) + PAGE_SHIFT;
+ +			unsigned int compshift = compound_order(head);
+ +			unsigned int pteshift;
+ +
+ +			local_irq_save(flags); /* disables as well */
+ +			pte = find_linux_pte(mm->pgd, cur_ua, NULL, &pteshift);
+ +
+ +			/* Double check it is still the same pinned page */
+ +			if (pte && pte_page(*pte) == head &&
+ +			    pteshift == compshift + PAGE_SHIFT)
+ +				pageshift = max_t(unsigned int, pteshift,
+ +						PAGE_SHIFT);
+ +			local_irq_restore(flags);
+  		}
+  		mem->pageshift = min(mem->pageshift, pageshift);
+ -		/*
+ -		 * We don't need struct page reference any more, switch
+ -		 * to physical address.
+ -		 */
+  		mem->hpas[i] = page_to_pfn(page) << PAGE_SHIFT;
+  	}
+  
+++<<<<<<< HEAD
+++=======
++ good_exit:
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  	atomic64_set(&mem->mapped, 1);
+  	mem->used = 1;
+  	mem->ua = ua;
+@@@ -244,10 -186,40 +281,25 @@@
+  
+  	mutex_unlock(&mem_list_mutex);
+  
++ 	*pmem = mem;
++ 
++ 	return 0;
++ 
++ free_exit:
++ 	/* free the reference taken */
++ 	for (i = 0; i < pinned; i++)
++ 		put_page(mem->hpages[i]);
++ 
++ 	vfree(mem->hpas);
++ 	kfree(mem);
++ 
++ unlock_exit:
++ 	mm_iommu_adjust_locked_vm(mm, locked_entries, false);
++ 
+  	return ret;
+  }
+ -
+ -long mm_iommu_new(struct mm_struct *mm, unsigned long ua, unsigned long entries,
+ -		struct mm_iommu_table_group_mem_t **pmem)
+ -{
+ -	return mm_iommu_do_alloc(mm, ua, entries, MM_IOMMU_TABLE_INVALID_HPA,
+ -			pmem);
+ -}
+  EXPORT_SYMBOL_GPL(mm_iommu_new);
+  
+ -long mm_iommu_newdev(struct mm_struct *mm, unsigned long ua,
+ -		unsigned long entries, unsigned long dev_hpa,
+ -		struct mm_iommu_table_group_mem_t **pmem)
+ -{
+ -	return mm_iommu_do_alloc(mm, ua, entries, dev_hpa, pmem);
+ -}
+ -EXPORT_SYMBOL_GPL(mm_iommu_newdev);
+ -
+  static void mm_iommu_unpin(struct mm_iommu_table_group_mem_t *mem)
+  {
+  	long i;
+@@@ -294,6 -269,7 +346,10 @@@ static void mm_iommu_release(struct mm_
+  long mm_iommu_put(struct mm_struct *mm, struct mm_iommu_table_group_mem_t *mem)
+  {
+  	long ret = 0;
+++<<<<<<< HEAD
+++=======
++ 	unsigned long unlock_entries = 0;
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  
+  	mutex_lock(&mem_list_mutex);
+  
+@@@ -314,10 -290,11 +370,18 @@@
+  		goto unlock_exit;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* @mapped became 0 so now mappings are disabled, release the region */
+ +	mm_iommu_release(mem);
+ +
+ +	mm_iommu_adjust_locked_vm(mm, mem->entries, false);
+++=======
++ 	if (mem->dev_hpa == MM_IOMMU_TABLE_INVALID_HPA)
++ 		unlock_entries = mem->entries;
++ 
++ 	/* @mapped became 0 so now mappings are disabled, release the region */
++ 	mm_iommu_release(mem);
+++>>>>>>> eb9d7a62c386 (powerpc/mm_iommu: Fix potential deadlock)
+  
+  unlock_exit:
+  	mutex_unlock(&mem_list_mutex);
+* Unmerged path arch/powerpc/mm/mmu_context_iommu.c
