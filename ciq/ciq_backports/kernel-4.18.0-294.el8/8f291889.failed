@@ -1,0 +1,175 @@
+new helpers: vfs_create_mount(), fc_mount()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 8f2918898eb5fe25845dde7f4a77bda0e2966e05
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8f291889.failed
+
+Create a new helper, vfs_create_mount(), that creates a detached vfsmount
+object from an fs_context that has a superblock attached to it.
+
+Almost all uses will be paired with immediately preceding vfs_get_tree();
+add a helper for such combination.
+
+Switch vfs_kern_mount() to use this.
+
+NOTE: mild behaviour change; passing NULL as 'device name' to
+something like procfs will change /proc/*/mountstats - "device none"
+instead on "no device".  That is consistent with /proc/mounts et.al.
+
+[do'h - EXPORT_SYMBOL_GPL slipped in by mistake; removed]
+[AV -- remove confused comment from vfs_create_mount()]
+[AV -- removed the second argument]
+
+	Reviewed-by: David Howells <dhowells@redhat.com>
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 8f2918898eb5fe25845dde7f4a77bda0e2966e05)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/namespace.c
+diff --cc fs/namespace.c
+index 7910046ac0d6,156771f5745a..000000000000
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@@ -939,37 -941,82 +939,115 @@@ static struct mount *skip_mnt_tree(stru
+  	return p;
+  }
+  
+++<<<<<<< HEAD
+ +struct vfsmount *
+ +vfs_kern_mount(struct file_system_type *type, int flags, const char *name, void *data)
+ +{
+ +	struct mount *mnt;
+ +	struct dentry *root;
+++=======
++ /**
++  * vfs_create_mount - Create a mount for a configured superblock
++  * @fc: The configuration context with the superblock attached
++  *
++  * Create a mount to an already configured superblock.  If necessary, the
++  * caller should invoke vfs_get_tree() before calling this.
++  *
++  * Note that this does not attach the mount to anything.
++  */
++ struct vfsmount *vfs_create_mount(struct fs_context *fc)
++ {
++ 	struct mount *mnt;
++ 
++ 	if (!fc->root)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	mnt = alloc_vfsmnt(fc->source ?: "none");
++ 	if (!mnt)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	if (fc->sb_flags & SB_KERNMOUNT)
++ 		mnt->mnt.mnt_flags = MNT_INTERNAL;
++ 
++ 	atomic_inc(&fc->root->d_sb->s_active);
++ 	mnt->mnt.mnt_sb		= fc->root->d_sb;
++ 	mnt->mnt.mnt_root	= dget(fc->root);
++ 	mnt->mnt_mountpoint	= mnt->mnt.mnt_root;
++ 	mnt->mnt_parent		= mnt;
++ 
++ 	lock_mount_hash();
++ 	list_add_tail(&mnt->mnt_instance, &mnt->mnt.mnt_sb->s_mounts);
++ 	unlock_mount_hash();
++ 	return &mnt->mnt;
++ }
++ EXPORT_SYMBOL(vfs_create_mount);
++ 
++ struct vfsmount *fc_mount(struct fs_context *fc)
++ {
++ 	int err = vfs_get_tree(fc);
++ 	if (!err) {
++ 		up_write(&fc->root->d_sb->s_umount);
++ 		return vfs_create_mount(fc);
++ 	}
++ 	return ERR_PTR(err);
++ }
++ EXPORT_SYMBOL(fc_mount);
++ 
++ struct vfsmount *vfs_kern_mount(struct file_system_type *type,
++ 				int flags, const char *name,
++ 				void *data)
++ {
++ 	struct fs_context *fc;
++ 	struct vfsmount *mnt;
++ 	int ret = 0;
+++>>>>>>> 8f2918898eb5 (new helpers: vfs_create_mount(), fc_mount())
+  
+  	if (!type)
+  		return ERR_PTR(-ENODEV);
+  
+++<<<<<<< HEAD
+ +	mnt = alloc_vfsmnt(name);
+ +	if (!mnt)
+ +		return ERR_PTR(-ENOMEM);
+ +
+ +	if (flags & SB_KERNMOUNT)
+ +		mnt->mnt.mnt_flags = MNT_INTERNAL;
+ +
+ +	root = mount_fs(type, flags, name, data);
+ +	if (IS_ERR(root)) {
+ +		mnt_free_id(mnt);
+ +		free_vfsmnt(mnt);
+ +		return ERR_CAST(root);
+ +	}
+ +
+ +	mnt->mnt.mnt_root = root;
+ +	mnt->mnt.mnt_sb = root->d_sb;
+ +	mnt->mnt_mountpoint = mnt->mnt.mnt_root;
+ +	mnt->mnt_parent = mnt;
+ +	lock_mount_hash();
+ +	list_add_tail(&mnt->mnt_instance, &root->d_sb->s_mounts);
+ +	unlock_mount_hash();
+ +	return &mnt->mnt;
+++=======
++ 	fc = fs_context_for_mount(type, flags);
++ 	if (IS_ERR(fc))
++ 		return ERR_CAST(fc);
++ 
++ 	if (name) {
++ 		fc->source = kstrdup(name, GFP_KERNEL);
++ 		if (!fc->source)
++ 			ret = -ENOMEM;
++ 	}
++ 	if (!ret)
++ 		ret = parse_monolithic_mount_data(fc, data);
++ 	if (!ret)
++ 		mnt = fc_mount(fc);
++ 	else
++ 		mnt = ERR_PTR(ret);
++ 
++ 	put_fs_context(fc);
++ 	return mnt;
+++>>>>>>> 8f2918898eb5 (new helpers: vfs_create_mount(), fc_mount())
+  }
+  EXPORT_SYMBOL_GPL(vfs_kern_mount);
+  
+* Unmerged path fs/namespace.c
+diff --git a/include/linux/mount.h b/include/linux/mount.h
+index 037eed52164b..9197ddbf35fb 100644
+--- a/include/linux/mount.h
++++ b/include/linux/mount.h
+@@ -21,6 +21,7 @@ struct super_block;
+ struct vfsmount;
+ struct dentry;
+ struct mnt_namespace;
++struct fs_context;
+ 
+ #define MNT_NOSUID	0x01
+ #define MNT_NODEV	0x02
+@@ -88,6 +89,8 @@ struct path;
+ extern struct vfsmount *clone_private_mount(const struct path *path);
+ 
+ struct file_system_type;
++extern struct vfsmount *fc_mount(struct fs_context *fc);
++extern struct vfsmount *vfs_create_mount(struct fs_context *fc);
+ extern struct vfsmount *vfs_kern_mount(struct file_system_type *type,
+ 				      int flags, const char *name,
+ 				      void *data);
