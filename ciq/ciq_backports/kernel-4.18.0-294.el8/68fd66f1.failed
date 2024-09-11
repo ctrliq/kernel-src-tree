@@ -1,0 +1,293 @@
+KVM: x86: extend struct kvm_vcpu_pv_apf_data with token info
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vitaly Kuznetsov <vkuznets@redhat.com>
+commit 68fd66f100d196d35ab3008d4c69af3a0d7e7200
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/68fd66f1.failed
+
+Currently, APF mechanism relies on the #PF abuse where the token is being
+passed through CR2. If we switch to using interrupts to deliver page-ready
+notifications we need a different way to pass the data. Extent the existing
+'struct kvm_vcpu_pv_apf_data' with token information for page-ready
+notifications.
+
+While on it, rename 'reason' to 'flags'. This doesn't change the semantics
+as we only have reasons '1' and '2' and these can be treated as bit flags
+but KVM_PV_REASON_PAGE_READY is going away with interrupt based delivery
+making 'reason' name misleading.
+
+The newly introduced apf_put_user_ready() temporary puts both flags and
+token information, this will be changed to put token only when we switch
+to interrupt based notifications.
+
+	Signed-off-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+Message-Id: <20200525144125.143875-3-vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 68fd66f100d196d35ab3008d4c69af3a0d7e7200)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_para.h
+#	arch/x86/kernel/kvm.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/include/asm/kvm_para.h
+index 5ed3cf1c3934,57fd1966c4ea..000000000000
+--- a/arch/x86/include/asm/kvm_para.h
++++ b/arch/x86/include/asm/kvm_para.h
+@@@ -88,11 -88,21 +88,27 @@@ static inline long kvm_hypercall4(unsig
+  bool kvm_para_available(void);
+  unsigned int kvm_arch_para_features(void);
+  unsigned int kvm_arch_para_hints(void);
+ -void kvm_async_pf_task_wait_schedule(u32 token);
+ +void kvm_async_pf_task_wait(u32 token, int interrupt_kernel);
+  void kvm_async_pf_task_wake(u32 token);
+++<<<<<<< HEAD
+ +u32 kvm_read_and_reset_pf_reason(void);
+ +extern void kvm_disable_steal_time(void);
+ +void do_async_page_fault(struct pt_regs *regs, unsigned long error_code);
+++=======
++ u32 kvm_read_and_reset_apf_flags(void);
++ void kvm_disable_steal_time(void);
++ bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token);
++ 
++ DECLARE_STATIC_KEY_FALSE(kvm_async_pf_enabled);
++ 
++ static __always_inline bool kvm_handle_async_pf(struct pt_regs *regs, u32 token)
++ {
++ 	if (static_branch_unlikely(&kvm_async_pf_enabled))
++ 		return __kvm_handle_async_pf(regs, token);
++ 	else
++ 		return false;
++ }
+++>>>>>>> 68fd66f100d1 (KVM: x86: extend struct kvm_vcpu_pv_apf_data with token info)
+  
+  #ifdef CONFIG_PARAVIRT_SPINLOCKS
+  void __init kvm_spinlock_init(void);
+diff --cc arch/x86/kernel/kvm.c
+index 34ea59cb4c95,d6f22a3a1f7d..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -241,43 -218,53 +241,47 @@@ again
+  }
+  EXPORT_SYMBOL_GPL(kvm_async_pf_task_wake);
+  
+- u32 kvm_read_and_reset_pf_reason(void)
++ u32 kvm_read_and_reset_apf_flags(void)
+  {
+- 	u32 reason = 0;
++ 	u32 flags = 0;
+  
+  	if (__this_cpu_read(apf_reason.enabled)) {
+- 		reason = __this_cpu_read(apf_reason.reason);
+- 		__this_cpu_write(apf_reason.reason, 0);
++ 		flags = __this_cpu_read(apf_reason.flags);
++ 		__this_cpu_write(apf_reason.flags, 0);
+  	}
+  
+- 	return reason;
++ 	return flags;
+  }
+- EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
+- NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
++ EXPORT_SYMBOL_GPL(kvm_read_and_reset_apf_flags);
++ NOKPROBE_SYMBOL(kvm_read_and_reset_apf_flags);
+  
+ -bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ +dotraplinkage void
+ +do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+++<<<<<<< HEAD
+ +	enum ctx_state prev_state;
+++=======
++ 	u32 reason = kvm_read_and_reset_apf_flags();
+++>>>>>>> 68fd66f100d1 (KVM: x86: extend struct kvm_vcpu_pv_apf_data with token info)
+  
+ -	switch (reason) {
+ +	switch (kvm_read_and_reset_pf_reason()) {
+ +	default:
+ +		do_page_fault(regs, error_code);
+ +		break;
+  	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ -	case KVM_PV_REASON_PAGE_READY:
+ +		/* page is swapped out by the host. */
+ +		prev_state = exception_enter();
+ +		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
+ +		exception_exit(prev_state);
+  		break;
+ -	default:
+ -		return false;
+ -	}
+ -
+ -	/*
+ -	 * If the host managed to inject an async #PF into an interrupt
+ -	 * disabled region, then die hard as this is not going to end well
+ -	 * and the host side is seriously broken.
+ -	 */
+ -	if (unlikely(!(regs->flags & X86_EFLAGS_IF)))
+ -		panic("Host injected async #PF in interrupt disabled region\n");
+ -
+ -	if (reason == KVM_PV_REASON_PAGE_NOT_PRESENT) {
+ -		if (unlikely(!(user_mode(regs))))
+ -			panic("Host injected async #PF in kernel mode\n");
+ -		/* Page is swapped out by the host. */
+ -		kvm_async_pf_task_wait_schedule(token);
+ -	} else {
+ +	case KVM_PV_REASON_PAGE_READY:
+  		rcu_irq_enter();
+ -		kvm_async_pf_task_wake(token);
+ +		kvm_async_pf_task_wake((u32)read_cr2());
+  		rcu_irq_exit();
+ +		break;
+  	}
+ -	return true;
+  }
+ -NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+ +NOKPROBE_SYMBOL(do_async_page_fault);
+  
+  static void __init paravirt_ops_setup(void)
+  {
+diff --cc arch/x86/kvm/x86.c
+index acc910a907d8,84aa3c1519ed..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -10471,9 -10507,8 +10480,14 @@@ void kvm_arch_async_page_present(struc
+  		kvm_del_async_pf_gfn(vcpu, work->arch.gfn);
+  	trace_kvm_async_pf_ready(work->arch.token, work->cr2_or_gpa);
+  
+++<<<<<<< HEAD
+ +	if ((work->wakeup_all || work->notpresent_injected) &&
+ +	    vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED &&
+ +	    !apf_put_user(vcpu, KVM_PV_REASON_PAGE_READY)) {
+++=======
++ 	if (vcpu->arch.apf.msr_val & KVM_ASYNC_PF_ENABLED &&
++ 	    !apf_put_user_ready(vcpu, work->arch.token)) {
+++>>>>>>> 68fd66f100d1 (KVM: x86: extend struct kvm_vcpu_pv_apf_data with token info)
+  			fault.vector = PF_VECTOR;
+  			fault.error_code_valid = true;
+  			fault.error_code = 0;
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 5e5db7bc5e26..f69ff7324d3a 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -773,7 +773,7 @@ struct kvm_vcpu_arch {
+ 		u64 msr_val;
+ 		u32 id;
+ 		bool send_user_only;
+-		u32 host_apf_reason;
++		u32 host_apf_flags;
+ 		unsigned long nested_apf_token;
+ 		bool delivery_as_pf_vmexit;
+ 	} apf;
+* Unmerged path arch/x86/include/asm/kvm_para.h
+diff --git a/arch/x86/include/uapi/asm/kvm_para.h b/arch/x86/include/uapi/asm/kvm_para.h
+index 2a8e0b6b9805..d1cd5c0f431a 100644
+--- a/arch/x86/include/uapi/asm/kvm_para.h
++++ b/arch/x86/include/uapi/asm/kvm_para.h
+@@ -112,8 +112,9 @@ struct kvm_mmu_op_release_pt {
+ #define KVM_PV_REASON_PAGE_READY 2
+ 
+ struct kvm_vcpu_pv_apf_data {
+-	__u32 reason;
+-	__u8 pad[60];
++	__u32 flags;
++	__u32 token; /* Used for page ready notification only */
++	__u8 pad[56];
+ 	__u32 enabled;
+ };
+ 
+* Unmerged path arch/x86/kernel/kvm.c
+diff --git a/arch/x86/kvm/mmu/mmu.c b/arch/x86/kvm/mmu/mmu.c
+index 7ea1e3fb17e3..1683870a00bf 100644
+--- a/arch/x86/kvm/mmu/mmu.c
++++ b/arch/x86/kvm/mmu/mmu.c
+@@ -4164,7 +4164,7 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
+ #endif
+ 
+ 	vcpu->arch.l1tf_flush_l1d = true;
+-	switch (vcpu->arch.apf.host_apf_reason) {
++	switch (vcpu->arch.apf.host_apf_flags) {
+ 	default:
+ 		trace_kvm_page_fault(fault_address, error_code);
+ 
+@@ -4174,13 +4174,13 @@ int kvm_handle_page_fault(struct kvm_vcpu *vcpu, u64 error_code,
+ 				insn_len);
+ 		break;
+ 	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+-		vcpu->arch.apf.host_apf_reason = 0;
++		vcpu->arch.apf.host_apf_flags = 0;
+ 		local_irq_disable();
+ 		kvm_async_pf_task_wait(fault_address, 0);
+ 		local_irq_enable();
+ 		break;
+ 	case KVM_PV_REASON_PAGE_READY:
+-		vcpu->arch.apf.host_apf_reason = 0;
++		vcpu->arch.apf.host_apf_flags = 0;
+ 		local_irq_disable();
+ 		kvm_async_pf_task_wake(fault_address);
+ 		local_irq_enable();
+diff --git a/arch/x86/kvm/svm/nested.c b/arch/x86/kvm/svm/nested.c
+index b8f8200596ed..8b10b50ef88f 100644
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@ -965,7 +965,7 @@ int nested_svm_exit_special(struct vcpu_svm *svm)
+ 		if (get_host_vmcb(svm)->control.intercept_exceptions & excp_bits)
+ 			return NESTED_EXIT_HOST;
+ 		else if (exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR &&
+-			 svm->vcpu.arch.apf.host_apf_reason)
++			 svm->vcpu.arch.apf.host_apf_flags)
+ 			/* Trap async PF even if not shadowing */
+ 			return NESTED_EXIT_HOST;
+ 		break;
+diff --git a/arch/x86/kvm/svm/svm.c b/arch/x86/kvm/svm/svm.c
+index 3ea87e4bff90..d3737d9be3b3 100644
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@ -3480,7 +3480,8 @@ static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
+ 
+ 	/* if exit due to PF check for async PF */
+ 	if (svm->vmcb->control.exit_code == SVM_EXIT_EXCP_BASE + PF_VECTOR)
+-		svm->vcpu.arch.apf.host_apf_reason = kvm_read_and_reset_pf_reason();
++		svm->vcpu.arch.apf.host_apf_flags =
++			kvm_read_and_reset_apf_flags();
+ 
+ 	if (npt_enabled) {
+ 		vcpu->arch.regs_avail &= ~(1 << VCPU_EXREG_PDPTR);
+diff --git a/arch/x86/kvm/vmx/nested.c b/arch/x86/kvm/vmx/nested.c
+index bec7585f2610..cd8a7c9bbafc 100644
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@ -5678,7 +5678,7 @@ static bool nested_vmx_l0_wants_exit(struct kvm_vcpu *vcpu, u32 exit_reason)
+ 		if (is_nmi(intr_info))
+ 			return true;
+ 		else if (is_page_fault(intr_info))
+-			return vcpu->arch.apf.host_apf_reason || !enable_ept;
++			return vcpu->arch.apf.host_apf_flags || !enable_ept;
+ 		else if (is_debug(intr_info) &&
+ 			 vcpu->guest_debug &
+ 			 (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 355490ade561..f2451be5ae9f 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -4790,7 +4790,7 @@ static int handle_exception_nmi(struct kvm_vcpu *vcpu)
+ 	if (is_page_fault(intr_info)) {
+ 		cr2 = vmx_get_exit_qual(vcpu);
+ 		/* EPT won't cause page fault directly */
+-		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_reason && enable_ept);
++		WARN_ON_ONCE(!vcpu->arch.apf.host_apf_flags && enable_ept);
+ 		return kvm_handle_page_fault(vcpu, error_code, cr2, NULL, 0);
+ 	}
+ 
+@@ -6385,7 +6385,7 @@ static void handle_exception_nmi_irqoff(struct vcpu_vmx *vmx)
+ 
+ 	/* if exit due to PF check for async PF */
+ 	if (is_page_fault(intr_info)) {
+-		vmx->vcpu.arch.apf.host_apf_reason = kvm_read_and_reset_pf_reason();
++		vmx->vcpu.arch.apf.host_apf_flags = kvm_read_and_reset_apf_flags();
+ 	/* Handle machine checks before interrupts are enabled */
+ 	} else if (is_machine_check(intr_info)) {
+ 		kvm_machine_check();
+* Unmerged path arch/x86/kvm/x86.c
