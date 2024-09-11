@@ -1,0 +1,173 @@
+perf/smmuv3: Enable HiSilicon Erratum 162001800 quirk
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+commit 24062fe85860debfdae0eeaa495f27c9971ec163
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/24062fe8.failed
+
+HiSilicon erratum 162001800 describes the limitation of
+SMMUv3 PMCG implementation on HiSilicon Hip08 platforms.
+
+On these platforms, the PMCG event counter registers
+(SMMU_PMCG_EVCNTRn) are read only and as a result it
+is not possible to set the initial counter period value
+on event monitor start.
+
+To work around this, the current value of the counter
+is read and used for delta calculations. OEM information
+from ACPI header is used to identify the affected hardware
+platforms.
+
+	Signed-off-by: Shameer Kolothum <shameerali.kolothum.thodi@huawei.com>
+	Reviewed-by: Hanjun Guo <hanjun.guo@linaro.org>
+	Reviewed-by: Robin Murphy <robin.murphy@arm.com>
+	Acked-by: Lorenzo Pieralisi <lorenzo.pieralisi@arm.com>
+[will: update silicon-errata.txt and add reason string to acpi match]
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+(cherry picked from commit 24062fe85860debfdae0eeaa495f27c9971ec163)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/arm64/silicon-errata.txt
+* Unmerged path Documentation/arm64/silicon-errata.txt
+* Unmerged path Documentation/arm64/silicon-errata.txt
+diff --git a/drivers/acpi/arm64/iort.c b/drivers/acpi/arm64/iort.c
+index c928060f50f7..a014a6610059 100644
+--- a/drivers/acpi/arm64/iort.c
++++ b/drivers/acpi/arm64/iort.c
+@@ -1472,9 +1472,23 @@ static void __init arm_smmu_v3_pmcg_init_resources(struct resource *res,
+ 				       ACPI_EDGE_SENSITIVE, &res[2]);
+ }
+ 
++static struct acpi_platform_list pmcg_plat_info[] __initdata = {
++	/* HiSilicon Hip08 Platform */
++	{"HISI  ", "HIP08   ", 0, ACPI_SIG_IORT, greater_than_or_equal,
++	 "Erratum #162001800", IORT_SMMU_V3_PMCG_HISI_HIP08},
++	{ }
++};
++
+ static int __init arm_smmu_v3_pmcg_add_platdata(struct platform_device *pdev)
+ {
+-	u32 model = IORT_SMMU_V3_PMCG_GENERIC;
++	u32 model;
++	int idx;
++
++	idx = acpi_match_platform_list(pmcg_plat_info);
++	if (idx >= 0)
++		model = pmcg_plat_info[idx].data;
++	else
++		model = IORT_SMMU_V3_PMCG_GENERIC;
+ 
+ 	return platform_device_add_data(pdev, &model, sizeof(model));
+ }
+diff --git a/drivers/perf/arm_smmuv3_pmu.c b/drivers/perf/arm_smmuv3_pmu.c
+index a4f4b488a2de..da71c741cb46 100644
+--- a/drivers/perf/arm_smmuv3_pmu.c
++++ b/drivers/perf/arm_smmuv3_pmu.c
+@@ -35,6 +35,7 @@
+  */
+ 
+ #include <linux/acpi.h>
++#include <linux/acpi_iort.h>
+ #include <linux/bitfield.h>
+ #include <linux/bitops.h>
+ #include <linux/cpuhotplug.h>
+@@ -93,6 +94,8 @@
+ 
+ #define SMMU_PMCG_PA_SHIFT              12
+ 
++#define SMMU_PMCG_EVCNTR_RDONLY         BIT(0)
++
+ static int cpuhp_state_num;
+ 
+ struct smmu_pmu {
+@@ -108,6 +111,7 @@ struct smmu_pmu {
+ 	void __iomem *reg_base;
+ 	void __iomem *reloc_base;
+ 	u64 counter_mask;
++	u32 options;
+ 	bool global_filter;
+ 	u32 global_filter_span;
+ 	u32 global_filter_sid;
+@@ -222,15 +226,27 @@ static void smmu_pmu_set_period(struct smmu_pmu *smmu_pmu,
+ 	u32 idx = hwc->idx;
+ 	u64 new;
+ 
+-	/*
+-	 * We limit the max period to half the max counter value of the counter
+-	 * size, so that even in the case of extreme interrupt latency the
+-	 * counter will (hopefully) not wrap past its initial value.
+-	 */
+-	new = smmu_pmu->counter_mask >> 1;
++	if (smmu_pmu->options & SMMU_PMCG_EVCNTR_RDONLY) {
++		/*
++		 * On platforms that require this quirk, if the counter starts
++		 * at < half_counter value and wraps, the current logic of
++		 * handling the overflow may not work. It is expected that,
++		 * those platforms will have full 64 counter bits implemented
++		 * so that such a possibility is remote(eg: HiSilicon HIP08).
++		 */
++		new = smmu_pmu_counter_get_value(smmu_pmu, idx);
++	} else {
++		/*
++		 * We limit the max period to half the max counter value
++		 * of the counter size, so that even in the case of extreme
++		 * interrupt latency the counter will (hopefully) not wrap
++		 * past its initial value.
++		 */
++		new = smmu_pmu->counter_mask >> 1;
++		smmu_pmu_counter_set_value(smmu_pmu, idx, new);
++	}
+ 
+ 	local64_set(&hwc->prev_count, new);
+-	smmu_pmu_counter_set_value(smmu_pmu, idx, new);
+ }
+ 
+ static void smmu_pmu_set_event_filter(struct perf_event *event,
+@@ -665,6 +681,22 @@ static void smmu_pmu_reset(struct smmu_pmu *smmu_pmu)
+ 		       smmu_pmu->reloc_base + SMMU_PMCG_OVSCLR0);
+ }
+ 
++static void smmu_pmu_get_acpi_options(struct smmu_pmu *smmu_pmu)
++{
++	u32 model;
++
++	model = *(u32 *)dev_get_platdata(smmu_pmu->dev);
++
++	switch (model) {
++	case IORT_SMMU_V3_PMCG_HISI_HIP08:
++		/* HiSilicon Erratum 162001800 */
++		smmu_pmu->options |= SMMU_PMCG_EVCNTR_RDONLY;
++		break;
++	}
++
++	dev_notice(smmu_pmu->dev, "option mask 0x%x\n", smmu_pmu->options);
++}
++
+ static int smmu_pmu_probe(struct platform_device *pdev)
+ {
+ 	struct smmu_pmu *smmu_pmu;
+@@ -744,6 +776,8 @@ static int smmu_pmu_probe(struct platform_device *pdev)
+ 		return -EINVAL;
+ 	}
+ 
++	smmu_pmu_get_acpi_options(smmu_pmu);
++
+ 	/* Pick one CPU to be the preferred one to use */
+ 	smmu_pmu->on_cpu = raw_smp_processor_id();
+ 	WARN_ON(irq_set_affinity_hint(smmu_pmu->irq,
+diff --git a/include/linux/acpi_iort.h b/include/linux/acpi_iort.h
+index 676bfe43f545..98e1a817c6f3 100644
+--- a/include/linux/acpi_iort.h
++++ b/include/linux/acpi_iort.h
+@@ -32,6 +32,7 @@
+  * do with hardware or with IORT specification.
+  */
+ #define IORT_SMMU_V3_PMCG_GENERIC        0x00000000 /* Generic SMMUv3 PMCG */
++#define IORT_SMMU_V3_PMCG_HISI_HIP08     0x00000001 /* HiSilicon HIP08 PMCG */
+ 
+ int iort_register_domain_token(int trans_id, phys_addr_t base,
+ 			       struct fwnode_handle *fw_node);
