@@ -1,0 +1,980 @@
+RDMA: Move driver_id into struct ib_device_ops
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit b9560a419bfd498279333387817adcf5faef2825
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b9560a41.failed
+
+No reason for every driver to emit code to set this, just make it part of
+the driver's existing static const ops structure.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b9560a419bfd498279333387817adcf5faef2825)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/device.c
+#	drivers/infiniband/hw/hns/hns_roce_main.c
+#	drivers/infiniband/sw/rxe/rxe_verbs.c
+diff --cc drivers/infiniband/core/device.c
+index ec96a7b1c811,538d01f27bf8..000000000000
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@@ -189,6 -357,54 +189,57 @@@ static struct ib_device *__ib_device_ge
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ib_device_get_by_name - Find an IB device by name
++  * @name: The name to look for
++  * @driver_id: The driver ID that must match (RDMA_DRIVER_UNKNOWN matches all)
++  *
++  * Find and hold an ib_device by its name. The caller must call
++  * ib_device_put() on the returned pointer.
++  */
++ struct ib_device *ib_device_get_by_name(const char *name,
++ 					enum rdma_driver_id driver_id)
++ {
++ 	struct ib_device *device;
++ 
++ 	down_read(&devices_rwsem);
++ 	device = __ib_device_get_by_name(name);
++ 	if (device && driver_id != RDMA_DRIVER_UNKNOWN &&
++ 	    device->ops.driver_id != driver_id)
++ 		device = NULL;
++ 
++ 	if (device) {
++ 		if (!ib_device_try_get(device))
++ 			device = NULL;
++ 	}
++ 	up_read(&devices_rwsem);
++ 	return device;
++ }
++ EXPORT_SYMBOL(ib_device_get_by_name);
++ 
++ static int rename_compat_devs(struct ib_device *device)
++ {
++ 	struct ib_core_device *cdev;
++ 	unsigned long index;
++ 	int ret = 0;
++ 
++ 	mutex_lock(&device->compat_devs_mutex);
++ 	xa_for_each (&device->compat_devs, index, cdev) {
++ 		ret = device_rename(&cdev->dev, dev_name(&device->dev));
++ 		if (ret) {
++ 			dev_warn(&cdev->dev,
++ 				 "Fail to rename compatdev to new name %s\n",
++ 				 dev_name(&device->dev));
++ 			break;
++ 		}
++ 	}
++ 	mutex_unlock(&device->compat_devs_mutex);
++ 	return ret;
++ }
++ 
+++>>>>>>> b9560a419bfd (RDMA: Move driver_id into struct ib_device_ops)
+  int ib_device_rename(struct ib_device *ibdev, const char *name)
+  {
+  	int ret;
+@@@ -700,6 -1411,217 +751,220 @@@ void ib_unregister_device(struct ib_dev
+  }
+  EXPORT_SYMBOL(ib_unregister_device);
+  
+++<<<<<<< HEAD
+++=======
++ /**
++  * ib_unregister_device_and_put - Unregister a device while holding a 'get'
++  * device: The device to unregister
++  *
++  * This is the same as ib_unregister_device(), except it includes an internal
++  * ib_device_put() that should match a 'get' obtained by the caller.
++  *
++  * It is safe to call this routine concurrently from multiple threads while
++  * holding the 'get'. When the function returns the device is fully
++  * unregistered.
++  *
++  * Drivers using this flow MUST use the driver_unregister callback to clean up
++  * their resources associated with the device and dealloc it.
++  */
++ void ib_unregister_device_and_put(struct ib_device *ib_dev)
++ {
++ 	WARN_ON(!ib_dev->ops.dealloc_driver);
++ 	get_device(&ib_dev->dev);
++ 	ib_device_put(ib_dev);
++ 	__ib_unregister_device(ib_dev);
++ 	put_device(&ib_dev->dev);
++ }
++ EXPORT_SYMBOL(ib_unregister_device_and_put);
++ 
++ /**
++  * ib_unregister_driver - Unregister all IB devices for a driver
++  * @driver_id: The driver to unregister
++  *
++  * This implements a fence for device unregistration. It only returns once all
++  * devices associated with the driver_id have fully completed their
++  * unregistration and returned from ib_unregister_device*().
++  *
++  * If device's are not yet unregistered it goes ahead and starts unregistering
++  * them.
++  *
++  * This does not block creation of new devices with the given driver_id, that
++  * is the responsibility of the caller.
++  */
++ void ib_unregister_driver(enum rdma_driver_id driver_id)
++ {
++ 	struct ib_device *ib_dev;
++ 	unsigned long index;
++ 
++ 	down_read(&devices_rwsem);
++ 	xa_for_each (&devices, index, ib_dev) {
++ 		if (ib_dev->ops.driver_id != driver_id)
++ 			continue;
++ 
++ 		get_device(&ib_dev->dev);
++ 		up_read(&devices_rwsem);
++ 
++ 		WARN_ON(!ib_dev->ops.dealloc_driver);
++ 		__ib_unregister_device(ib_dev);
++ 
++ 		put_device(&ib_dev->dev);
++ 		down_read(&devices_rwsem);
++ 	}
++ 	up_read(&devices_rwsem);
++ }
++ EXPORT_SYMBOL(ib_unregister_driver);
++ 
++ static void ib_unregister_work(struct work_struct *work)
++ {
++ 	struct ib_device *ib_dev =
++ 		container_of(work, struct ib_device, unregistration_work);
++ 
++ 	__ib_unregister_device(ib_dev);
++ 	put_device(&ib_dev->dev);
++ }
++ 
++ /**
++  * ib_unregister_device_queued - Unregister a device using a work queue
++  * device: The device to unregister
++  *
++  * This schedules an asynchronous unregistration using a WQ for the device. A
++  * driver should use this to avoid holding locks while doing unregistration,
++  * such as holding the RTNL lock.
++  *
++  * Drivers using this API must use ib_unregister_driver before module unload
++  * to ensure that all scheduled unregistrations have completed.
++  */
++ void ib_unregister_device_queued(struct ib_device *ib_dev)
++ {
++ 	WARN_ON(!refcount_read(&ib_dev->refcount));
++ 	WARN_ON(!ib_dev->ops.dealloc_driver);
++ 	get_device(&ib_dev->dev);
++ 	if (!queue_work(system_unbound_wq, &ib_dev->unregistration_work))
++ 		put_device(&ib_dev->dev);
++ }
++ EXPORT_SYMBOL(ib_unregister_device_queued);
++ 
++ /*
++  * The caller must pass in a device that has the kref held and the refcount
++  * released. If the device is in cur_net and still registered then it is moved
++  * into net.
++  */
++ static int rdma_dev_change_netns(struct ib_device *device, struct net *cur_net,
++ 				 struct net *net)
++ {
++ 	int ret2 = -EINVAL;
++ 	int ret;
++ 
++ 	mutex_lock(&device->unregistration_lock);
++ 
++ 	/*
++ 	 * If a device not under ib_device_get() or if the unregistration_lock
++ 	 * is not held, the namespace can be changed, or it can be unregistered.
++ 	 * Check again under the lock.
++ 	 */
++ 	if (refcount_read(&device->refcount) == 0 ||
++ 	    !net_eq(cur_net, read_pnet(&device->coredev.rdma_net))) {
++ 		ret = -ENODEV;
++ 		goto out;
++ 	}
++ 
++ 	kobject_uevent(&device->dev.kobj, KOBJ_REMOVE);
++ 	disable_device(device);
++ 
++ 	/*
++ 	 * At this point no one can be using the device, so it is safe to
++ 	 * change the namespace.
++ 	 */
++ 	write_pnet(&device->coredev.rdma_net, net);
++ 
++ 	down_read(&devices_rwsem);
++ 	/*
++ 	 * Currently rdma devices are system wide unique. So the device name
++ 	 * is guaranteed free in the new namespace. Publish the new namespace
++ 	 * at the sysfs level.
++ 	 */
++ 	ret = device_rename(&device->dev, dev_name(&device->dev));
++ 	up_read(&devices_rwsem);
++ 	if (ret) {
++ 		dev_warn(&device->dev,
++ 			 "%s: Couldn't rename device after namespace change\n",
++ 			 __func__);
++ 		/* Try and put things back and re-enable the device */
++ 		write_pnet(&device->coredev.rdma_net, cur_net);
++ 	}
++ 
++ 	ret2 = enable_device_and_get(device);
++ 	if (ret2) {
++ 		/*
++ 		 * This shouldn't really happen, but if it does, let the user
++ 		 * retry at later point. So don't disable the device.
++ 		 */
++ 		dev_warn(&device->dev,
++ 			 "%s: Couldn't re-enable device after namespace change\n",
++ 			 __func__);
++ 	}
++ 	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
++ 
++ 	ib_device_put(device);
++ out:
++ 	mutex_unlock(&device->unregistration_lock);
++ 	if (ret)
++ 		return ret;
++ 	return ret2;
++ }
++ 
++ int ib_device_set_netns_put(struct sk_buff *skb,
++ 			    struct ib_device *dev, u32 ns_fd)
++ {
++ 	struct net *net;
++ 	int ret;
++ 
++ 	net = get_net_ns_by_fd(ns_fd);
++ 	if (IS_ERR(net)) {
++ 		ret = PTR_ERR(net);
++ 		goto net_err;
++ 	}
++ 
++ 	if (!netlink_ns_capable(skb, net->user_ns, CAP_NET_ADMIN)) {
++ 		ret = -EPERM;
++ 		goto ns_err;
++ 	}
++ 
++ 	/*
++ 	 * Currently supported only for those providers which support
++ 	 * disassociation and don't do port specific sysfs init. Once a
++ 	 * port_cleanup infrastructure is implemented, this limitation will be
++ 	 * removed.
++ 	 */
++ 	if (!dev->ops.disassociate_ucontext || dev->ops.init_port ||
++ 	    ib_devices_shared_netns) {
++ 		ret = -EOPNOTSUPP;
++ 		goto ns_err;
++ 	}
++ 
++ 	get_device(&dev->dev);
++ 	ib_device_put(dev);
++ 	ret = rdma_dev_change_netns(dev, current->nsproxy->net_ns, net);
++ 	put_device(&dev->dev);
++ 
++ 	put_net(net);
++ 	return ret;
++ 
++ ns_err:
++ 	put_net(net);
++ net_err:
++ 	ib_device_put(dev);
++ 	return ret;
++ }
++ 
++ static struct pernet_operations rdma_dev_net_ops = {
++ 	.init = rdma_dev_init_net,
++ 	.exit = rdma_dev_exit_net,
++ 	.id = &rdma_dev_net_id,
++ 	.size = sizeof(struct rdma_dev_net),
++ };
++ 
+++>>>>>>> b9560a419bfd (RDMA: Move driver_id into struct ib_device_ops)
+  static int assign_client_id(struct ib_client *client)
+  {
+  	int ret;
+@@@ -976,6 -1846,185 +1241,188 @@@ int ib_query_port(struct ib_device *dev
+  }
+  EXPORT_SYMBOL(ib_query_port);
+  
+++<<<<<<< HEAD
+++=======
++ static void add_ndev_hash(struct ib_port_data *pdata)
++ {
++ 	unsigned long flags;
++ 
++ 	might_sleep();
++ 
++ 	spin_lock_irqsave(&ndev_hash_lock, flags);
++ 	if (hash_hashed(&pdata->ndev_hash_link)) {
++ 		hash_del_rcu(&pdata->ndev_hash_link);
++ 		spin_unlock_irqrestore(&ndev_hash_lock, flags);
++ 		/*
++ 		 * We cannot do hash_add_rcu after a hash_del_rcu until the
++ 		 * grace period
++ 		 */
++ 		synchronize_rcu();
++ 		spin_lock_irqsave(&ndev_hash_lock, flags);
++ 	}
++ 	if (pdata->netdev)
++ 		hash_add_rcu(ndev_hash, &pdata->ndev_hash_link,
++ 			     (uintptr_t)pdata->netdev);
++ 	spin_unlock_irqrestore(&ndev_hash_lock, flags);
++ }
++ 
++ /**
++  * ib_device_set_netdev - Associate the ib_dev with an underlying net_device
++  * @ib_dev: Device to modify
++  * @ndev: net_device to affiliate, may be NULL
++  * @port: IB port the net_device is connected to
++  *
++  * Drivers should use this to link the ib_device to a netdev so the netdev
++  * shows up in interfaces like ib_enum_roce_netdev. Only one netdev may be
++  * affiliated with any port.
++  *
++  * The caller must ensure that the given ndev is not unregistered or
++  * unregistering, and that either the ib_device is unregistered or
++  * ib_device_set_netdev() is called with NULL when the ndev sends a
++  * NETDEV_UNREGISTER event.
++  */
++ int ib_device_set_netdev(struct ib_device *ib_dev, struct net_device *ndev,
++ 			 unsigned int port)
++ {
++ 	struct net_device *old_ndev;
++ 	struct ib_port_data *pdata;
++ 	unsigned long flags;
++ 	int ret;
++ 
++ 	/*
++ 	 * Drivers wish to call this before ib_register_driver, so we have to
++ 	 * setup the port data early.
++ 	 */
++ 	ret = alloc_port_data(ib_dev);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (!rdma_is_port_valid(ib_dev, port))
++ 		return -EINVAL;
++ 
++ 	pdata = &ib_dev->port_data[port];
++ 	spin_lock_irqsave(&pdata->netdev_lock, flags);
++ 	old_ndev = rcu_dereference_protected(
++ 		pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 	if (old_ndev == ndev) {
++ 		spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 		return 0;
++ 	}
++ 
++ 	if (ndev)
++ 		dev_hold(ndev);
++ 	rcu_assign_pointer(pdata->netdev, ndev);
++ 	spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 
++ 	add_ndev_hash(pdata);
++ 	if (old_ndev)
++ 		dev_put(old_ndev);
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(ib_device_set_netdev);
++ 
++ static void free_netdevs(struct ib_device *ib_dev)
++ {
++ 	unsigned long flags;
++ 	unsigned int port;
++ 
++ 	rdma_for_each_port (ib_dev, port) {
++ 		struct ib_port_data *pdata = &ib_dev->port_data[port];
++ 		struct net_device *ndev;
++ 
++ 		spin_lock_irqsave(&pdata->netdev_lock, flags);
++ 		ndev = rcu_dereference_protected(
++ 			pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 		if (ndev) {
++ 			spin_lock(&ndev_hash_lock);
++ 			hash_del_rcu(&pdata->ndev_hash_link);
++ 			spin_unlock(&ndev_hash_lock);
++ 
++ 			/*
++ 			 * If this is the last dev_put there is still a
++ 			 * synchronize_rcu before the netdev is kfreed, so we
++ 			 * can continue to rely on unlocked pointer
++ 			 * comparisons after the put
++ 			 */
++ 			rcu_assign_pointer(pdata->netdev, NULL);
++ 			dev_put(ndev);
++ 		}
++ 		spin_unlock_irqrestore(&pdata->netdev_lock, flags);
++ 	}
++ }
++ 
++ struct net_device *ib_device_get_netdev(struct ib_device *ib_dev,
++ 					unsigned int port)
++ {
++ 	struct ib_port_data *pdata;
++ 	struct net_device *res;
++ 
++ 	if (!rdma_is_port_valid(ib_dev, port))
++ 		return NULL;
++ 
++ 	pdata = &ib_dev->port_data[port];
++ 
++ 	/*
++ 	 * New drivers should use ib_device_set_netdev() not the legacy
++ 	 * get_netdev().
++ 	 */
++ 	if (ib_dev->ops.get_netdev)
++ 		res = ib_dev->ops.get_netdev(ib_dev, port);
++ 	else {
++ 		spin_lock(&pdata->netdev_lock);
++ 		res = rcu_dereference_protected(
++ 			pdata->netdev, lockdep_is_held(&pdata->netdev_lock));
++ 		if (res)
++ 			dev_hold(res);
++ 		spin_unlock(&pdata->netdev_lock);
++ 	}
++ 
++ 	/*
++ 	 * If we are starting to unregister expedite things by preventing
++ 	 * propagation of an unregistering netdev.
++ 	 */
++ 	if (res && res->reg_state != NETREG_REGISTERED) {
++ 		dev_put(res);
++ 		return NULL;
++ 	}
++ 
++ 	return res;
++ }
++ 
++ /**
++  * ib_device_get_by_netdev - Find an IB device associated with a netdev
++  * @ndev: netdev to locate
++  * @driver_id: The driver ID that must match (RDMA_DRIVER_UNKNOWN matches all)
++  *
++  * Find and hold an ib_device that is associated with a netdev via
++  * ib_device_set_netdev(). The caller must call ib_device_put() on the
++  * returned pointer.
++  */
++ struct ib_device *ib_device_get_by_netdev(struct net_device *ndev,
++ 					  enum rdma_driver_id driver_id)
++ {
++ 	struct ib_device *res = NULL;
++ 	struct ib_port_data *cur;
++ 
++ 	rcu_read_lock();
++ 	hash_for_each_possible_rcu (ndev_hash, cur, ndev_hash_link,
++ 				    (uintptr_t)ndev) {
++ 		if (rcu_access_pointer(cur->netdev) == ndev &&
++ 		    (driver_id == RDMA_DRIVER_UNKNOWN ||
++ 		     cur->ib_dev->ops.driver_id == driver_id) &&
++ 		    ib_device_try_get(cur->ib_dev)) {
++ 			res = cur->ib_dev;
++ 			break;
++ 		}
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return res;
++ }
++ EXPORT_SYMBOL(ib_device_get_by_netdev);
++ 
+++>>>>>>> b9560a419bfd (RDMA: Move driver_id into struct ib_device_ops)
+  /**
+   * ib_enum_roce_netdev - enumerate all RoCE ports
+   * @ib_dev : IB device we want to query
+diff --cc drivers/infiniband/hw/hns/hns_roce_main.c
+index e6509f248a6a,dd408f8afe72..000000000000
+--- a/drivers/infiniband/hw/hns/hns_roce_main.c
++++ b/drivers/infiniband/hw/hns/hns_roce_main.c
+@@@ -556,8 -514,30 +558,35 @@@ static int hns_roce_register_device(str
+  		ib_set_device_ops(ib_dev, &hns_roce_dev_mr_ops);
+  	}
+  
+++<<<<<<< HEAD
+ +	/* OTHERS */
+ +	ib_dev->driver_id = RDMA_DRIVER_HNS;
+++=======
++ 	/* MW */
++ 	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_MW) {
++ 		ib_dev->uverbs_cmd_mask |=
++ 					(1ULL << IB_USER_VERBS_CMD_ALLOC_MW) |
++ 					(1ULL << IB_USER_VERBS_CMD_DEALLOC_MW);
++ 		ib_set_device_ops(ib_dev, &hns_roce_dev_mw_ops);
++ 	}
++ 
++ 	/* FRMR */
++ 	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_FRMR)
++ 		ib_set_device_ops(ib_dev, &hns_roce_dev_frmr_ops);
++ 
++ 	/* SRQ */
++ 	if (hr_dev->caps.flags & HNS_ROCE_CAP_FLAG_SRQ) {
++ 		ib_dev->uverbs_cmd_mask |=
++ 				(1ULL << IB_USER_VERBS_CMD_CREATE_SRQ) |
++ 				(1ULL << IB_USER_VERBS_CMD_MODIFY_SRQ) |
++ 				(1ULL << IB_USER_VERBS_CMD_QUERY_SRQ) |
++ 				(1ULL << IB_USER_VERBS_CMD_DESTROY_SRQ) |
++ 				(1ULL << IB_USER_VERBS_CMD_POST_SRQ_RECV);
++ 		ib_set_device_ops(ib_dev, &hns_roce_dev_srq_ops);
++ 		ib_set_device_ops(ib_dev, hr_dev->hw->hns_roce_dev_srq_ops);
++ 	}
++ 
+++>>>>>>> b9560a419bfd (RDMA: Move driver_id into struct ib_device_ops)
+  	ib_set_device_ops(ib_dev, hr_dev->hw->hns_roce_dev_ops);
+  	ib_set_device_ops(ib_dev, &hns_roce_dev_ops);
+  	for (i = 0; i < hr_dev->caps.num_ports; i++) {
+diff --cc drivers/infiniband/sw/rxe/rxe_verbs.c
+index f3188f269481,3d3130dc6380..000000000000
+--- a/drivers/infiniband/sw/rxe/rxe_verbs.c
++++ b/drivers/infiniband/sw/rxe/rxe_verbs.c
+@@@ -1126,7 -1101,18 +1126,9 @@@ static const struct attribute_group rxe
+  	.attrs = rxe_dev_attributes,
+  };
+  
+ -static int rxe_enable_driver(struct ib_device *ib_dev)
+ -{
+ -	struct rxe_dev *rxe = container_of(ib_dev, struct rxe_dev, ib_dev);
+ -
+ -	rxe_set_port_state(rxe);
+ -	dev_info(&rxe->ib_dev.dev, "added %s\n", netdev_name(rxe->ndev));
+ -	return 0;
+ -}
+ -
+  static const struct ib_device_ops rxe_dev_ops = {
++ 	.driver_id = RDMA_DRIVER_RXE,
++ 
+  	.alloc_hw_stats = rxe_ib_alloc_hw_stats,
+  	.alloc_mr = rxe_alloc_mr,
+  	.alloc_pd = rxe_alloc_pd,
+@@@ -1239,24 -1232,13 +1241,29 @@@ int rxe_register_device(struct rxe_dev 
+  	rxe->tfm = tfm;
+  
+  	rdma_set_device_sysfs_group(dev, &rxe_attr_group);
+++<<<<<<< HEAD
+ +	dev->driver_id = RDMA_DRIVER_RXE;
+ +	err = ib_register_device(dev, "rxe%d");
+ +	if (err) {
+++=======
++ 	err = ib_register_device(dev, ibdev_name);
++ 	if (err)
+++>>>>>>> b9560a419bfd (RDMA: Move driver_id into struct ib_device_ops)
+  		pr_warn("%s failed with error %d\n", __func__, err);
+ +		goto err1;
+ +	}
+ +
+ +	return 0;
+ +
+ +err1:
+ +	crypto_free_shash(rxe->tfm);
+  
+ -	/*
+ -	 * Note that rxe may be invalid at this point if another thread
+ -	 * unregistered it.
+ -	 */
+  	return err;
+  }
+ +
+ +void rxe_unregister_device(struct rxe_dev *rxe)
+ +{
+ +	struct ib_device *dev = &rxe->ib_dev;
+ +
+ +	ib_unregister_device(dev);
+ +}
+* Unmerged path drivers/infiniband/core/device.c
+diff --git a/drivers/infiniband/core/uverbs_uapi.c b/drivers/infiniband/core/uverbs_uapi.c
+index ccc4be0a6566..00c547887132 100644
+--- a/drivers/infiniband/core/uverbs_uapi.c
++++ b/drivers/infiniband/core/uverbs_uapi.c
+@@ -647,7 +647,7 @@ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	INIT_RADIX_TREE(&uapi->radix, GFP_KERNEL);
+-	uapi->driver_id = ibdev->driver_id;
++	uapi->driver_id = ibdev->ops.driver_id;
+ 
+ 	rc = uapi_merge_def(uapi, ibdev, uverbs_core_api, false);
+ 	if (rc)
+diff --git a/drivers/infiniband/hw/bnxt_re/main.c b/drivers/infiniband/hw/bnxt_re/main.c
+index 1f64cd1c51a2..dfa783e13691 100644
+--- a/drivers/infiniband/hw/bnxt_re/main.c
++++ b/drivers/infiniband/hw/bnxt_re/main.c
+@@ -596,6 +596,8 @@ static void bnxt_re_unregister_ib(struct bnxt_re_dev *rdev)
+ }
+ 
+ static const struct ib_device_ops bnxt_re_dev_ops = {
++	.driver_id = RDMA_DRIVER_BNXT_RE,
++
+ 	.add_gid = bnxt_re_add_gid,
+ 	.alloc_hw_stats = bnxt_re_ib_alloc_hw_stats,
+ 	.alloc_mr = bnxt_re_alloc_mr,
+@@ -687,7 +689,6 @@ static int bnxt_re_register_ib(struct bnxt_re_dev *rdev)
+ 
+ 
+ 	rdma_set_device_sysfs_group(ibdev, &bnxt_re_dev_attr_group);
+-	ibdev->driver_id = RDMA_DRIVER_BNXT_RE;
+ 	ib_set_device_ops(ibdev, &bnxt_re_dev_ops);
+ 	ret = ib_device_set_netdev(&rdev->ibdev, rdev->netdev, 1);
+ 	if (ret)
+diff --git a/drivers/infiniband/hw/cxgb3/iwch_provider.c b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+index b9bb151437dc..ad3d3fbfd875 100644
+--- a/drivers/infiniband/hw/cxgb3/iwch_provider.c
++++ b/drivers/infiniband/hw/cxgb3/iwch_provider.c
+@@ -1320,6 +1320,8 @@ static void get_dev_fw_ver_str(struct ib_device *ibdev, char *str)
+ }
+ 
+ static const struct ib_device_ops iwch_dev_ops = {
++	.driver_id = RDMA_DRIVER_CXGB3,
++
+ 	.alloc_hw_stats	= iwch_alloc_stats,
+ 	.alloc_mr = iwch_alloc_mr,
+ 	.alloc_mw = iwch_alloc_mw,
+@@ -1408,7 +1410,6 @@ int iwch_register_device(struct iwch_dev *dev)
+ 	memcpy(dev->ibdev.iwcm->ifname, dev->rdev.t3cdev_p->lldev->name,
+ 	       sizeof(dev->ibdev.iwcm->ifname));
+ 
+-	dev->ibdev.driver_id = RDMA_DRIVER_CXGB3;
+ 	rdma_set_device_sysfs_group(&dev->ibdev, &iwch_attr_group);
+ 	ib_set_device_ops(&dev->ibdev, &iwch_dev_ops);
+ 	ret = ib_register_device(&dev->ibdev, "cxgb3_%d");
+diff --git a/drivers/infiniband/hw/cxgb4/provider.c b/drivers/infiniband/hw/cxgb4/provider.c
+index e03b14a450bc..a908d4b7494c 100644
+--- a/drivers/infiniband/hw/cxgb4/provider.c
++++ b/drivers/infiniband/hw/cxgb4/provider.c
+@@ -506,6 +506,8 @@ static int fill_res_entry(struct sk_buff *msg, struct rdma_restrack_entry *res)
+ }
+ 
+ static const struct ib_device_ops c4iw_dev_ops = {
++	.driver_id = RDMA_DRIVER_CXGB4,
++
+ 	.alloc_hw_stats = c4iw_alloc_stats,
+ 	.alloc_mr = c4iw_alloc_mr,
+ 	.alloc_mw = c4iw_alloc_mw,
+@@ -618,7 +620,6 @@ void c4iw_register_device(struct work_struct *work)
+ 	       sizeof(dev->ibdev.iwcm->ifname));
+ 
+ 	rdma_set_device_sysfs_group(&dev->ibdev, &c4iw_attr_group);
+-	dev->ibdev.driver_id = RDMA_DRIVER_CXGB4;
+ 	ib_set_device_ops(&dev->ibdev, &c4iw_dev_ops);
+ 	ret = set_netdevs(&dev->ibdev, &dev->rdev);
+ 	if (ret)
+diff --git a/drivers/infiniband/hw/efa/efa_main.c b/drivers/infiniband/hw/efa/efa_main.c
+index 44152ed1ee86..92b570dcecd8 100644
+--- a/drivers/infiniband/hw/efa/efa_main.c
++++ b/drivers/infiniband/hw/efa/efa_main.c
+@@ -197,6 +197,8 @@ static void efa_stats_init(struct efa_dev *dev)
+ }
+ 
+ static const struct ib_device_ops efa_dev_ops = {
++	.driver_id = RDMA_DRIVER_EFA,
++
+ 	.alloc_pd = efa_alloc_pd,
+ 	.alloc_ucontext = efa_alloc_ucontext,
+ 	.create_ah = efa_create_ah,
+@@ -287,7 +289,6 @@ static int efa_ib_device_add(struct efa_dev *dev)
+ 	dev->ibdev.uverbs_ex_cmd_mask =
+ 		(1ull << IB_USER_VERBS_EX_CMD_QUERY_DEVICE);
+ 
+-	dev->ibdev.driver_id = RDMA_DRIVER_EFA;
+ 	ib_set_device_ops(&dev->ibdev, &efa_dev_ops);
+ 
+ 	err = ib_register_device(&dev->ibdev, "efa_%d");
+diff --git a/drivers/infiniband/hw/hfi1/verbs.c b/drivers/infiniband/hw/hfi1/verbs.c
+index e52467f6adab..1deadddc2682 100644
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@ -1778,6 +1778,8 @@ static int get_hw_stats(struct ib_device *ibdev, struct rdma_hw_stats *stats,
+ }
+ 
+ static const struct ib_device_ops hfi1_dev_ops = {
++	.driver_id = RDMA_DRIVER_HFI1,
++
+ 	.alloc_hw_stats = alloc_hw_stats,
+ 	.alloc_rdma_netdev = hfi1_vnic_alloc_rn,
+ 	.get_dev_fw_str = hfi1_get_dev_fw_str,
+@@ -1922,7 +1924,7 @@ int hfi1_register_ib_device(struct hfi1_devdata *dd)
+ 	rdma_set_device_sysfs_group(&dd->verbs_dev.rdi.ibdev,
+ 				    &ib_hfi1_attr_group);
+ 
+-	ret = rvt_register_device(&dd->verbs_dev.rdi, RDMA_DRIVER_HFI1);
++	ret = rvt_register_device(&dd->verbs_dev.rdi);
+ 	if (ret)
+ 		goto err_verbs_txreq;
+ 
+* Unmerged path drivers/infiniband/hw/hns/hns_roce_main.c
+diff --git a/drivers/infiniband/hw/i40iw/i40iw_verbs.c b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+index c58fa19da4cf..42af636708b5 100644
+--- a/drivers/infiniband/hw/i40iw/i40iw_verbs.c
++++ b/drivers/infiniband/hw/i40iw/i40iw_verbs.c
+@@ -2685,6 +2685,8 @@ static int i40iw_query_pkey(struct ib_device *ibdev,
+ }
+ 
+ static const struct ib_device_ops i40iw_dev_ops = {
++	.driver_id = RDMA_DRIVER_I40IW,
++
+ 	.alloc_hw_stats = i40iw_alloc_hw_stats,
+ 	.alloc_mr = i40iw_alloc_mr,
+ 	.alloc_pd = i40iw_alloc_pd,
+@@ -2831,7 +2833,6 @@ int i40iw_register_rdma_device(struct i40iw_device *iwdev)
+ 		return -ENOMEM;
+ 	iwibdev = iwdev->iwibdev;
+ 	rdma_set_device_sysfs_group(&iwibdev->ibdev, &i40iw_attr_group);
+-	iwibdev->ibdev.driver_id = RDMA_DRIVER_I40IW;
+ 	ret = ib_register_device(&iwibdev->ibdev, "i40iw%d");
+ 	if (ret)
+ 		goto error;
+diff --git a/drivers/infiniband/hw/mlx4/main.c b/drivers/infiniband/hw/mlx4/main.c
+index d66002a31000..38af2319234a 100644
+--- a/drivers/infiniband/hw/mlx4/main.c
++++ b/drivers/infiniband/hw/mlx4/main.c
+@@ -2531,6 +2531,8 @@ static void get_fw_ver_str(struct ib_device *device, char *str)
+ }
+ 
+ static const struct ib_device_ops mlx4_ib_dev_ops = {
++	.driver_id = RDMA_DRIVER_MLX4,
++
+ 	.add_gid = mlx4_ib_add_gid,
+ 	.alloc_mr = mlx4_ib_alloc_mr,
+ 	.alloc_pd = mlx4_ib_alloc_pd,
+@@ -2856,7 +2858,6 @@ static void *mlx4_ib_add(struct mlx4_dev *dev)
+ 		goto err_steer_free_bitmap;
+ 
+ 	rdma_set_device_sysfs_group(&ibdev->ib_dev, &mlx4_attr_group);
+-	ibdev->ib_dev.driver_id = RDMA_DRIVER_MLX4;
+ 	if (ib_register_device(&ibdev->ib_dev, "mlx4_%d"))
+ 		goto err_diag_counters;
+ 
+diff --git a/drivers/infiniband/hw/mlx5/main.c b/drivers/infiniband/hw/mlx5/main.c
+index 9937619aa9d5..4c0aaee5321a 100644
+--- a/drivers/infiniband/hw/mlx5/main.c
++++ b/drivers/infiniband/hw/mlx5/main.c
+@@ -5926,6 +5926,8 @@ static void mlx5_ib_stage_flow_db_cleanup(struct mlx5_ib_dev *dev)
+ }
+ 
+ static const struct ib_device_ops mlx5_ib_dev_ops = {
++	.driver_id = RDMA_DRIVER_MLX5,
++
+ 	.add_gid = mlx5_ib_add_gid,
+ 	.alloc_mr = mlx5_ib_alloc_mr,
+ 	.alloc_pd = mlx5_ib_alloc_pd,
+@@ -6085,7 +6087,6 @@ int mlx5_ib_stage_caps_init(struct mlx5_ib_dev *dev)
+ 	if (mlx5_accel_ipsec_device_caps(dev->mdev) &
+ 	    MLX5_ACCEL_IPSEC_CAP_DEVICE)
+ 		ib_set_device_ops(&dev->ib_dev, &mlx5_ib_dev_flow_ipsec_ops);
+-	dev->ib_dev.driver_id = RDMA_DRIVER_MLX5;
+ 	ib_set_device_ops(&dev->ib_dev, &mlx5_ib_dev_ops);
+ 
+ 	if (IS_ENABLED(CONFIG_INFINIBAND_USER_ACCESS))
+diff --git a/drivers/infiniband/hw/mthca/mthca_provider.c b/drivers/infiniband/hw/mthca/mthca_provider.c
+index ae6b236e4756..902afa5eb363 100644
+--- a/drivers/infiniband/hw/mthca/mthca_provider.c
++++ b/drivers/infiniband/hw/mthca/mthca_provider.c
+@@ -1194,6 +1194,8 @@ static void get_dev_fw_str(struct ib_device *device, char *str)
+ }
+ 
+ static const struct ib_device_ops mthca_dev_ops = {
++	.driver_id = RDMA_DRIVER_MTHCA,
++
+ 	.alloc_pd = mthca_alloc_pd,
+ 	.alloc_ucontext = mthca_alloc_ucontext,
+ 	.attach_mcast = mthca_multicast_attach,
+@@ -1336,7 +1338,6 @@ int mthca_register_device(struct mthca_dev *dev)
+ 	mutex_init(&dev->cap_mask_mutex);
+ 
+ 	rdma_set_device_sysfs_group(&dev->ib_dev, &mthca_attr_group);
+-	dev->ib_dev.driver_id = RDMA_DRIVER_MTHCA;
+ 	ret = ib_register_device(&dev->ib_dev, "mthca%d");
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/infiniband/hw/nes/nes_verbs.c b/drivers/infiniband/hw/nes/nes_verbs.c
+index cece4f7f433e..e358b78b18f2 100644
+--- a/drivers/infiniband/hw/nes/nes_verbs.c
++++ b/drivers/infiniband/hw/nes/nes_verbs.c
+@@ -3576,6 +3576,8 @@ static void get_dev_fw_str(struct ib_device *dev, char *str)
+ }
+ 
+ static const struct ib_device_ops nes_dev_ops = {
++	.driver_id = RDMA_DRIVER_NES,
++
+ 	.alloc_mr = nes_alloc_mr,
+ 	.alloc_mw = nes_alloc_mw,
+ 	.alloc_pd = nes_alloc_pd,
+@@ -3745,7 +3747,6 @@ int nes_register_ofa_device(struct nes_ib_device *nesibdev)
+ 	int ret;
+ 
+ 	rdma_set_device_sysfs_group(&nesvnic->nesibdev->ibdev, &nes_attr_group);
+-	nesvnic->nesibdev->ibdev.driver_id = RDMA_DRIVER_NES;
+ 	ret = ib_register_device(&nesvnic->nesibdev->ibdev, "nes%d");
+ 	if (ret) {
+ 		return ret;
+diff --git a/drivers/infiniband/hw/ocrdma/ocrdma_main.c b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+index f315478642e2..661eaeb92540 100644
+--- a/drivers/infiniband/hw/ocrdma/ocrdma_main.c
++++ b/drivers/infiniband/hw/ocrdma/ocrdma_main.c
+@@ -144,6 +144,8 @@ static const struct attribute_group ocrdma_attr_group = {
+ };
+ 
+ static const struct ib_device_ops ocrdma_dev_ops = {
++	.driver_id = RDMA_DRIVER_OCRDMA,
++
+ 	.alloc_mr = ocrdma_alloc_mr,
+ 	.alloc_pd = ocrdma_alloc_pd,
+ 	.alloc_ucontext = ocrdma_alloc_ucontext,
+@@ -243,7 +245,6 @@ static int ocrdma_register_device(struct ocrdma_dev *dev)
+ 		ib_set_device_ops(&dev->ibdev, &ocrdma_dev_srq_ops);
+ 	}
+ 	rdma_set_device_sysfs_group(&dev->ibdev, &ocrdma_attr_group);
+-	dev->ibdev.driver_id = RDMA_DRIVER_OCRDMA;
+ 	ret = ib_device_set_netdev(&dev->ibdev, dev->nic_info.netdev, 1);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/infiniband/hw/qedr/main.c b/drivers/infiniband/hw/qedr/main.c
+index 65953b3f1f4f..efdaa064c0f8 100644
+--- a/drivers/infiniband/hw/qedr/main.c
++++ b/drivers/infiniband/hw/qedr/main.c
+@@ -188,6 +188,8 @@ static void qedr_roce_register_device(struct qedr_dev *dev)
+ }
+ 
+ static const struct ib_device_ops qedr_dev_ops = {
++	.driver_id = RDMA_DRIVER_QEDR,
++
+ 	.alloc_mr = qedr_alloc_mr,
+ 	.alloc_pd = qedr_alloc_pd,
+ 	.alloc_ucontext = qedr_alloc_ucontext,
+@@ -274,7 +276,6 @@ static int qedr_register_device(struct qedr_dev *dev)
+ 	rdma_set_device_sysfs_group(&dev->ibdev, &qedr_attr_group);
+ 	ib_set_device_ops(&dev->ibdev, &qedr_dev_ops);
+ 
+-	dev->ibdev.driver_id = RDMA_DRIVER_QEDR;
+ 	rc = ib_device_set_netdev(&dev->ibdev, dev->ndev, 1);
+ 	if (rc)
+ 		return rc;
+diff --git a/drivers/infiniband/hw/qib/qib_verbs.c b/drivers/infiniband/hw/qib/qib_verbs.c
+index 5ff32d32c61c..bbc331d7f49b 100644
+--- a/drivers/infiniband/hw/qib/qib_verbs.c
++++ b/drivers/infiniband/hw/qib/qib_verbs.c
+@@ -1482,6 +1482,8 @@ static void qib_fill_device_attr(struct qib_devdata *dd)
+ }
+ 
+ static const struct ib_device_ops qib_dev_ops = {
++	.driver_id = RDMA_DRIVER_QIB,
++
+ 	.init_port = qib_create_port_files,
+ 	.modify_device = qib_modify_device,
+ 	.process_mad = qib_process_mad,
+@@ -1616,7 +1618,7 @@ int qib_register_ib_device(struct qib_devdata *dd)
+ 	rdma_set_device_sysfs_group(&dd->verbs_dev.rdi.ibdev, &qib_attr_group);
+ 
+ 	ib_set_device_ops(ibdev, &qib_dev_ops);
+-	ret = rvt_register_device(&dd->verbs_dev.rdi, RDMA_DRIVER_QIB);
++	ret = rvt_register_device(&dd->verbs_dev.rdi);
+ 	if (ret)
+ 		goto err_tx;
+ 
+diff --git a/drivers/infiniband/hw/usnic/usnic_ib_main.c b/drivers/infiniband/hw/usnic/usnic_ib_main.c
+index 6b56f4f2222a..7cb98d2794df 100644
+--- a/drivers/infiniband/hw/usnic/usnic_ib_main.c
++++ b/drivers/infiniband/hw/usnic/usnic_ib_main.c
+@@ -316,6 +316,8 @@ static void usnic_get_dev_fw_str(struct ib_device *device, char *str)
+ }
+ 
+ static const struct ib_device_ops usnic_dev_ops = {
++	.driver_id = RDMA_DRIVER_USNIC,
++
+ 	.alloc_pd = usnic_ib_alloc_pd,
+ 	.alloc_ucontext = usnic_ib_alloc_ucontext,
+ 	.create_ah = usnic_ib_create_ah,
+@@ -405,7 +407,6 @@ static void *usnic_ib_device_add(struct pci_dev *dev)
+ 
+ 	ib_set_device_ops(&us_ibdev->ib_dev, &usnic_dev_ops);
+ 
+-	us_ibdev->ib_dev.driver_id = RDMA_DRIVER_USNIC;
+ 	rdma_set_device_sysfs_group(&us_ibdev->ib_dev, &usnic_attr_group);
+ 
+ 	if (ib_register_device(&us_ibdev->ib_dev, "usnic_%d"))
+diff --git a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+index 02c7ba35823c..f2ef13bbf794 100644
+--- a/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
++++ b/drivers/infiniband/hw/vmw_pvrdma/pvrdma_main.c
+@@ -144,6 +144,8 @@ static int pvrdma_port_immutable(struct ib_device *ibdev, u8 port_num,
+ }
+ 
+ static const struct ib_device_ops pvrdma_dev_ops = {
++	.driver_id = RDMA_DRIVER_VMW_PVRDMA,
++
+ 	.add_gid = pvrdma_add_gid,
+ 	.alloc_mr = pvrdma_alloc_mr,
+ 	.alloc_pd = pvrdma_alloc_pd,
+@@ -255,7 +257,6 @@ static int pvrdma_register_device(struct pvrdma_dev *dev)
+ 		if (!dev->srq_tbl)
+ 			goto err_qp_free;
+ 	}
+-	dev->ib_dev.driver_id = RDMA_DRIVER_VMW_PVRDMA;
+ 	ret = ib_device_set_netdev(&dev->ib_dev, dev->netdev, 1);
+ 	if (ret)
+ 		return ret;
+diff --git a/drivers/infiniband/sw/rdmavt/vt.c b/drivers/infiniband/sw/rdmavt/vt.c
+index b3f0c5578925..8f260edccd26 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.c
++++ b/drivers/infiniband/sw/rdmavt/vt.c
+@@ -536,7 +536,7 @@ static noinline int check_support(struct rvt_dev_info *rdi, int verb)
+  *
+  * Return: 0 on success otherwise an errno.
+  */
+-int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
++int rvt_register_device(struct rvt_dev_info *rdi)
+ {
+ 	int ret = 0, i;
+ 
+@@ -642,7 +642,6 @@ int rvt_register_device(struct rvt_dev_info *rdi, u32 driver_id)
+ 	if (!rdi->ibdev.num_comp_vectors)
+ 		rdi->ibdev.num_comp_vectors = 1;
+ 
+-	rdi->ibdev.driver_id = driver_id;
+ 	/* We are now good to announce we exist */
+ 	ret = ib_register_device(&rdi->ibdev, dev_name(&rdi->ibdev.dev));
+ 	if (ret) {
+* Unmerged path drivers/infiniband/sw/rxe/rxe_verbs.c
+diff --git a/include/rdma/ib_verbs.h b/include/rdma/ib_verbs.h
+index 714b9b5e3733..e72a836ab046 100644
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@ -2290,6 +2290,8 @@ struct uverbs_attr_bundle;
+  * need to define the supported operations, otherwise they will be set to null.
+  */
+ struct ib_device_ops {
++	enum rdma_driver_id driver_id;
++
+ 	int (*post_send)(struct ib_qp *qp, const struct ib_send_wr *send_wr,
+ 			 const struct ib_send_wr **bad_send_wr);
+ 	int (*post_recv)(struct ib_qp *qp, const struct ib_recv_wr *recv_wr,
+@@ -2600,7 +2602,6 @@ struct ib_device {
+ 	struct rdma_restrack_root     res;
+ 
+ 	const struct uapi_definition   *driver_def;
+-	enum rdma_driver_id		driver_id;
+ 
+ 	/*
+ 	 * Positive refcount indicates that the device is currently
+diff --git a/include/rdma/rdma_vt.h b/include/rdma/rdma_vt.h
+index 87d66c9630d7..1aa4f35b07b3 100644
+--- a/include/rdma/rdma_vt.h
++++ b/include/rdma/rdma_vt.h
+@@ -596,7 +596,7 @@ static inline void rvt_mod_retry_timer(struct rvt_qp *qp)
+ 
+ struct rvt_dev_info *rvt_alloc_device(size_t size, int nports);
+ void rvt_dealloc_device(struct rvt_dev_info *rdi);
+-int rvt_register_device(struct rvt_dev_info *rvd, u32 driver_id);
++int rvt_register_device(struct rvt_dev_info *rvd);
+ void rvt_unregister_device(struct rvt_dev_info *rvd);
+ int rvt_check_ah(struct ib_device *ibdev, struct rdma_ah_attr *ah_attr);
+ int rvt_init_port(struct rvt_dev_info *rdi, struct rvt_ibport *port,
