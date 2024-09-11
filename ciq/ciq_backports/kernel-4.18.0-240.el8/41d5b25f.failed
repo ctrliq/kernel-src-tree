@@ -1,0 +1,266 @@
+Bluetooth: hci_qca: add PM support
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Claire Chang <tientzu@chromium.org>
+commit 41d5b25fed0a010cedbdd25e56fdb92d59c233fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/41d5b25f.failed
+
+Add PM suspend/resume callbacks for hci_qca driver.
+
+BT host will make sure both Rx and Tx go into sleep state in
+qca_suspend. Without this, Tx may still remain in awake state, which
+prevents BTSOC from entering deep sleep. For example, BlueZ will send
+Set Event Mask to device when suspending and this will wake the device
+Rx up. However, the Tx idle timeout on the host side is 2000 ms. If the
+host is suspended before its Tx idle times out, it won't send
+HCI_IBS_SLEEP_IND to the device and the device Rx will remain awake.
+
+We implement this by canceling relevant work in workqueue, sending
+HCI_IBS_SLEEP_IND to the device and then waiting HCI_IBS_SLEEP_IND sent
+by the device.
+
+In order to prevent the device from being awaken again after qca_suspend
+is called, we introduce QCA_SUSPEND flag. QCA_SUSPEND is set in the
+beginning of qca_suspend to indicate system is suspending and that we'd
+like to ignore any further wake events.
+
+With QCA_SUSPEND and spinlock, we can avoid race condition, e.g. if
+qca_enqueue acquires qca->hci_ibs_lock before qca_suspend calls
+cancel_work_sync and then qca_enqueue adds a new qca->ws_awake_device
+work after the previous one is cancelled.
+
+If BTSOC wants to wake the whole system up after qca_suspend is called,
+it will keep sending HCI_IBS_WAKE_IND and uart driver will take care of
+waking the system. For example, uart driver will reconfigure its Rx pin
+to a normal GPIO pin and enable irq wake on that pin when suspending.
+Once host detects Rx falling, the system will begin resuming. Then, the
+BT host clears QCA_SUSPEND flag in qca_resume and begins dealing with
+normal HCI packets. By doing so, only a few HCI_IBS_WAKE_IND packets are
+lost and there is no data packet loss.
+
+	Signed-off-by: Claire Chang <tientzu@chromium.org>
+	Reviewed-by: Balakrishna Godavarthi <bgodavar@codeaurora.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 41d5b25fed0a010cedbdd25e56fdb92d59c233fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/bluetooth/hci_qca.c
+diff --cc drivers/bluetooth/hci_qca.c
+index c7723b08787d,c2062087b46b..000000000000
+--- a/drivers/bluetooth/hci_qca.c
++++ b/drivers/bluetooth/hci_qca.c
+@@@ -48,16 -42,23 +48,34 @@@
+  #define HCI_IBS_WAKE_ACK	0xFC
+  #define HCI_MAX_IBS_SIZE	10
+  
+ +/* Controller states */
+ +#define STATE_IN_BAND_SLEEP_ENABLED	1
+ +
+  #define IBS_WAKE_RETRANS_TIMEOUT_MS	100
+++<<<<<<< HEAD
+ +#define IBS_TX_IDLE_TIMEOUT_MS		2000
+ +#define BAUDRATE_SETTLE_TIMEOUT_MS	300
+++=======
++ #define IBS_BTSOC_TX_IDLE_TIMEOUT_MS	40
++ #define IBS_HOST_TX_IDLE_TIMEOUT_MS	2000
++ #define CMD_TRANS_TIMEOUT_MS		100
+++>>>>>>> 41d5b25fed0a (Bluetooth: hci_qca: add PM support)
+  
+  /* susclk rate */
+  #define SUSCLK_RATE_32KHZ	32768
+  
+++<<<<<<< HEAD
+++=======
++ /* Controller debug log header */
++ #define QCA_DEBUG_HANDLE	0x2EDC
++ 
++ enum qca_flags {
++ 	QCA_IBS_ENABLED,
++ 	QCA_DROP_VENDOR_EVENT,
++ 	QCA_SUSPENDING,
++ };
++ 
+++>>>>>>> 41d5b25fed0a (Bluetooth: hci_qca: add PM support)
+  /* HCI_IBS transmit side sleep protocol states */
+  enum tx_ibs_states {
+  	HCI_IBS_TX_ASLEEP,
+@@@ -100,6 -101,8 +118,11 @@@ struct qca_data 
+  	struct work_struct ws_rx_vote_off;
+  	struct work_struct ws_tx_vote_off;
+  	unsigned long flags;
+++<<<<<<< HEAD
+++=======
++ 	struct completion drop_ev_comp;
++ 	wait_queue_head_t suspend_wait_q;
+++>>>>>>> 41d5b25fed0a (Bluetooth: hci_qca: add PM support)
+  
+  	/* For debugging purpose */
+  	u64 ibs_sent_wacks;
+@@@ -429,7 -505,10 +458,9 @@@ static int qca_open(struct hci_uart *hu
+  	INIT_WORK(&qca->ws_rx_vote_off, qca_wq_serial_rx_clock_vote_off);
+  	INIT_WORK(&qca->ws_tx_vote_off, qca_wq_serial_tx_clock_vote_off);
+  
++ 	init_waitqueue_head(&qca->suspend_wait_q);
++ 
+  	qca->hu = hu;
+ -	init_completion(&qca->drop_ev_comp);
+  
+  	/* Assume we start with both sides asleep -- extra wakes OK */
+  	qca->tx_ibs_state = HCI_IBS_TX_ASLEEP;
+@@@ -443,15 -543,8 +474,15 @@@
+  	qca->wake_retrans = IBS_WAKE_RETRANS_TIMEOUT_MS;
+  
+  	timer_setup(&qca->tx_idle_timer, hci_ibs_tx_idle_timeout, 0);
+- 	qca->tx_idle_delay = IBS_TX_IDLE_TIMEOUT_MS;
++ 	qca->tx_idle_delay = IBS_HOST_TX_IDLE_TIMEOUT_MS;
+  
+ +	if (hu->serdev) {
+ +		serdev_device_open(hu->serdev);
+ +
+ +		qcadev = serdev_device_get_drvdata(hu->serdev);
+ +		gpiod_set_value_cansleep(qcadev->bt_en, 1);
+ +	}
+ +
+  	BT_DBG("HCI_UART_QCA open, tx_idle_delay=%u, wake_retrans=%u",
+  	       qca->tx_idle_delay, qca->wake_retrans);
+  
+@@@ -692,11 -801,16 +737,17 @@@ static int qca_enqueue(struct hci_uart 
+  	/* Prepend skb with frame type */
+  	memcpy(skb_push(skb, 1), &hci_skb_pkt_type(skb), 1);
+  
+ -	spin_lock_irqsave(&qca->hci_ibs_lock, flags);
+ -
+  	/* Don't go to sleep in middle of patch download or
+  	 * Out-Of-Band(GPIOs control) sleep is selected.
++ 	 * Don't wake the device up when suspending.
+  	 */
+++<<<<<<< HEAD
+ +	if (!test_bit(STATE_IN_BAND_SLEEP_ENABLED, &qca->flags)) {
+++=======
++ 	if (!test_bit(QCA_IBS_ENABLED, &qca->flags) ||
++ 	    test_bit(QCA_SUSPENDING, &qca->flags)) {
+++>>>>>>> 41d5b25fed0a (Bluetooth: hci_qca: add PM support)
+  		skb_queue_tail(&qca->txq, skb);
+ -		spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
+  		return 0;
+  	}
+  
+@@@ -1032,13 -1558,111 +1083,106 @@@ static void qca_serdev_remove(struct se
+  {
+  	struct qca_serdev *qcadev = serdev_device_get_drvdata(serdev);
+  
+ -	if (qca_is_wcn399x(qcadev->btsoc_type))
+ -		qca_power_shutdown(&qcadev->serdev_hu);
+ -	else
+ -		clk_disable_unprepare(qcadev->susclk);
+ -
+  	hci_uart_unregister_device(&qcadev->serdev_hu);
+ +
+ +	clk_disable_unprepare(qcadev->susclk);
+  }
+  
++ static int __maybe_unused qca_suspend(struct device *dev)
++ {
++ 	struct hci_dev *hdev = container_of(dev, struct hci_dev, dev);
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 	unsigned long flags;
++ 	int ret = 0;
++ 	u8 cmd;
++ 
++ 	set_bit(QCA_SUSPENDING, &qca->flags);
++ 
++ 	/* Device is downloading patch or doesn't support in-band sleep. */
++ 	if (!test_bit(QCA_IBS_ENABLED, &qca->flags))
++ 		return 0;
++ 
++ 	cancel_work_sync(&qca->ws_awake_device);
++ 	cancel_work_sync(&qca->ws_awake_rx);
++ 
++ 	spin_lock_irqsave_nested(&qca->hci_ibs_lock,
++ 				 flags, SINGLE_DEPTH_NESTING);
++ 
++ 	switch (qca->tx_ibs_state) {
++ 	case HCI_IBS_TX_WAKING:
++ 		del_timer(&qca->wake_retrans_timer);
++ 		/* Fall through */
++ 	case HCI_IBS_TX_AWAKE:
++ 		del_timer(&qca->tx_idle_timer);
++ 
++ 		serdev_device_write_flush(hu->serdev);
++ 		cmd = HCI_IBS_SLEEP_IND;
++ 		ret = serdev_device_write_buf(hu->serdev, &cmd, sizeof(cmd));
++ 
++ 		if (ret < 0) {
++ 			BT_ERR("Failed to send SLEEP to device");
++ 			break;
++ 		}
++ 
++ 		qca->tx_ibs_state = HCI_IBS_TX_ASLEEP;
++ 		qca->ibs_sent_slps++;
++ 
++ 		qca_wq_serial_tx_clock_vote_off(&qca->ws_tx_vote_off);
++ 		break;
++ 
++ 	case HCI_IBS_TX_ASLEEP:
++ 		break;
++ 
++ 	default:
++ 		BT_ERR("Spurious tx state %d", qca->tx_ibs_state);
++ 		ret = -EINVAL;
++ 		break;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&qca->hci_ibs_lock, flags);
++ 
++ 	if (ret < 0)
++ 		goto error;
++ 
++ 	serdev_device_wait_until_sent(hu->serdev,
++ 				      msecs_to_jiffies(CMD_TRANS_TIMEOUT_MS));
++ 
++ 	/* Wait for HCI_IBS_SLEEP_IND sent by device to indicate its Tx is going
++ 	 * to sleep, so that the packet does not wake the system later.
++ 	 */
++ 
++ 	ret = wait_event_interruptible_timeout(qca->suspend_wait_q,
++ 			qca->rx_ibs_state == HCI_IBS_RX_ASLEEP,
++ 			msecs_to_jiffies(IBS_BTSOC_TX_IDLE_TIMEOUT_MS));
++ 
++ 	if (ret > 0)
++ 		return 0;
++ 
++ 	if (ret == 0)
++ 		ret = -ETIMEDOUT;
++ 
++ error:
++ 	clear_bit(QCA_SUSPENDING, &qca->flags);
++ 
++ 	return ret;
++ }
++ 
++ static int __maybe_unused qca_resume(struct device *dev)
++ {
++ 	struct hci_dev *hdev = container_of(dev, struct hci_dev, dev);
++ 	struct hci_uart *hu = hci_get_drvdata(hdev);
++ 	struct qca_data *qca = hu->priv;
++ 
++ 	clear_bit(QCA_SUSPENDING, &qca->flags);
++ 
++ 	return 0;
++ }
++ 
++ static SIMPLE_DEV_PM_OPS(qca_pm_ops, qca_suspend, qca_resume);
++ 
+  static const struct of_device_id qca_bluetooth_of_match[] = {
+  	{ .compatible = "qcom,qca6174-bt" },
+ -	{ .compatible = "qcom,wcn3990-bt", .data = &qca_soc_data_wcn3990},
+ -	{ .compatible = "qcom,wcn3998-bt", .data = &qca_soc_data_wcn3998},
+  	{ /* sentinel */ }
+  };
+  MODULE_DEVICE_TABLE(of, qca_bluetooth_of_match);
+* Unmerged path drivers/bluetooth/hci_qca.c
