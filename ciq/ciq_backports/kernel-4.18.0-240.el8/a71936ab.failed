@@ -1,0 +1,180 @@
+kvm: x86: Cleanup vcpu->arch.guest_xstate_size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Xiaoyao Li <xiaoyao.li@intel.com>
+commit a71936ab46f1da1539d97a98dfb2f94ee383d687
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/a71936ab.failed
+
+vcpu->arch.guest_xstate_size lost its only user since commit df1daba7d1cb
+("KVM: x86: support XSAVES usage in the host"), so clean it up.
+
+	Signed-off-by: Xiaoyao Li <xiaoyao.li@intel.com>
+Message-Id: <20200429154312.1411-1-xiaoyao.li@intel.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit a71936ab46f1da1539d97a98dfb2f94ee383d687)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/cpuid.c
+index 6821e9af6e76,cd708b0b460a..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -107,13 -86,10 +107,17 @@@ int kvm_update_cpuid(struct kvm_vcpu *v
+  	best = kvm_find_cpuid_entry(vcpu, 0xD, 0);
+  	if (!best) {
+  		vcpu->arch.guest_supported_xcr0 = 0;
+- 		vcpu->arch.guest_xstate_size = XSAVE_HDR_SIZE + XSAVE_HDR_OFFSET;
+  	} else {
+  		vcpu->arch.guest_supported_xcr0 =
+++<<<<<<< HEAD
+ +			(best->eax | ((u64)best->edx << 32)) &
+ +			kvm_supported_xcr0();
+ +		vcpu->arch.guest_xstate_size = best->ebx =
+ +			xstate_required_size(vcpu->arch.xcr0, false);
+++=======
++ 			(best->eax | ((u64)best->edx << 32)) & supported_xcr0;
++ 		best->ebx = xstate_required_size(vcpu->arch.xcr0, false);
+++>>>>>>> a71936ab46f1 (kvm: x86: Cleanup vcpu->arch.guest_xstate_size)
+  	}
+  
+  	best = kvm_find_cpuid_entry(vcpu, 0xD, 1);
+diff --cc arch/x86/kvm/x86.c
+index 12e08a32ea3b,6b958d6c9427..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -9186,36 -9318,91 +9186,102 @@@ static void fx_init(struct kvm_vcpu *vc
+  	vcpu->arch.cr0 |= X86_CR0_ET;
+  }
+  
+ -int kvm_arch_vcpu_precreate(struct kvm *kvm, unsigned int id)
+ +void kvm_arch_vcpu_free(struct kvm_vcpu *vcpu)
+  {
+ -	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+ -		pr_warn_once("kvm: SMP vm created on host with unstable TSC; "
+ -			     "guest TSC will not be reliable\n");
+ +	void *wbinvd_dirty_mask = vcpu->arch.wbinvd_dirty_mask;
+ +	struct gfn_to_pfn_cache *cache = &vcpu->arch.st.cache;
+  
+ -	return 0;
+ +	kvm_release_pfn(cache->pfn, cache->dirty, cache);
+ +
+ +	kvmclock_reset(vcpu);
+ +
+ +	kvm_x86_ops->vcpu_free(vcpu);
+ +	free_cpumask_var(wbinvd_dirty_mask);
+  }
+  
+ -int kvm_arch_vcpu_create(struct kvm_vcpu *vcpu)
+ +struct kvm_vcpu *kvm_arch_vcpu_create(struct kvm *kvm,
+ +						unsigned int id)
+  {
+ -	struct page *page;
+ -	int r;
+ +	struct kvm_vcpu *vcpu;
+  
+ -	if (!irqchip_in_kernel(vcpu->kvm) || kvm_vcpu_is_reset_bsp(vcpu))
+ -		vcpu->arch.mp_state = KVM_MP_STATE_RUNNABLE;
+ -	else
+ -		vcpu->arch.mp_state = KVM_MP_STATE_UNINITIALIZED;
+ +	if (kvm_check_tsc_unstable() && atomic_read(&kvm->online_vcpus) != 0)
+ +		printk_once(KERN_WARNING
+ +		"kvm: SMP vm created on host with unstable TSC; "
+ +		"guest TSC will not be reliable\n");
+  
+ -	kvm_set_tsc_khz(vcpu, max_tsc_khz);
+ +	vcpu = kvm_x86_ops->vcpu_create(kvm, id);
+  
+++<<<<<<< HEAD
+ +	return vcpu;
+ +}
+++=======
++ 	r = kvm_mmu_create(vcpu);
++ 	if (r < 0)
++ 		return r;
++ 
++ 	if (irqchip_in_kernel(vcpu->kvm)) {
++ 		r = kvm_create_lapic(vcpu, lapic_timer_advance_ns);
++ 		if (r < 0)
++ 			goto fail_mmu_destroy;
++ 		if (kvm_apicv_activated(vcpu->kvm))
++ 			vcpu->arch.apicv_active = true;
++ 	} else
++ 		static_key_slow_inc(&kvm_no_apic_vcpu);
++ 
++ 	r = -ENOMEM;
++ 
++ 	page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++ 	if (!page)
++ 		goto fail_free_lapic;
++ 	vcpu->arch.pio_data = page_address(page);
++ 
++ 	vcpu->arch.mce_banks = kzalloc(KVM_MAX_MCE_BANKS * sizeof(u64) * 4,
++ 				       GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.mce_banks)
++ 		goto fail_free_pio_data;
++ 	vcpu->arch.mcg_cap = KVM_MAX_MCE_BANKS;
++ 
++ 	if (!zalloc_cpumask_var(&vcpu->arch.wbinvd_dirty_mask,
++ 				GFP_KERNEL_ACCOUNT))
++ 		goto fail_free_mce_banks;
++ 
++ 	if (!alloc_emulate_ctxt(vcpu))
++ 		goto free_wbinvd_dirty_mask;
++ 
++ 	vcpu->arch.user_fpu = kmem_cache_zalloc(x86_fpu_cache,
++ 						GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.user_fpu) {
++ 		pr_err("kvm: failed to allocate userspace's fpu\n");
++ 		goto free_emulate_ctxt;
++ 	}
++ 
++ 	vcpu->arch.guest_fpu = kmem_cache_zalloc(x86_fpu_cache,
++ 						 GFP_KERNEL_ACCOUNT);
++ 	if (!vcpu->arch.guest_fpu) {
++ 		pr_err("kvm: failed to allocate vcpu's fpu\n");
++ 		goto free_user_fpu;
++ 	}
++ 	fx_init(vcpu);
++ 
++ 	vcpu->arch.maxphyaddr = cpuid_query_maxphyaddr(vcpu);
++ 
++ 	vcpu->arch.pat = MSR_IA32_CR_PAT_DEFAULT;
++ 
++ 	kvm_async_pf_hash_reset(vcpu);
++ 	kvm_pmu_init(vcpu);
++ 
++ 	vcpu->arch.pending_external_vector = -1;
++ 	vcpu->arch.preempted_in_kernel = false;
++ 
++ 	kvm_hv_vcpu_init(vcpu);
++ 
++ 	r = kvm_x86_ops.vcpu_create(vcpu);
++ 	if (r)
++ 		goto free_guest_fpu;
+++>>>>>>> a71936ab46f1 (kvm: x86: Cleanup vcpu->arch.guest_xstate_size)
+  
+ +int kvm_arch_vcpu_setup(struct kvm_vcpu *vcpu)
+ +{
+  	vcpu->arch.arch_capabilities = kvm_get_arch_capabilities();
+  	vcpu->arch.msr_platform_info = MSR_PLATFORM_INFO_CPUID_FAULT;
+  	kvm_vcpu_mtrr_init(vcpu);
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 8e755c9a81df..6dd05f11a4fa 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -652,7 +652,6 @@ struct kvm_vcpu_arch {
+ 
+ 	u64 xcr0;
+ 	u64 guest_supported_xcr0;
+-	u32 guest_xstate_size;
+ 
+ 	struct kvm_pio_request pio;
+ 	void *pio_data;
+* Unmerged path arch/x86/kvm/cpuid.c
+* Unmerged path arch/x86/kvm/x86.c
