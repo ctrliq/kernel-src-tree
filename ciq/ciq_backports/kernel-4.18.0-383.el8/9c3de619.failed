@@ -1,0 +1,131 @@
+libbpf: Use dynamically allocated buffer when receiving netlink messages
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-383.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit 9c3de619e13ee6693ec5ac74f50b7aa89056a70e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-383.el8/9c3de619.failed
+
+When receiving netlink messages, libbpf was using a statically allocated
+stack buffer of 4k bytes. This happened to work fine on systems with a 4k
+page size, but on systems with larger page sizes it can lead to truncated
+messages. The user-visible impact of this was that libbpf would insist no
+XDP program was attached to some interfaces because that bit of the netlink
+message got chopped off.
+
+Fix this by switching to a dynamically allocated buffer; we borrow the
+approach from iproute2 of using recvmsg() with MSG_PEEK|MSG_TRUNC to get
+the actual size of the pending message before receiving it, adjusting the
+buffer as necessary. While we're at it, also add retries on interrupted
+system calls around the recvmsg() call.
+
+v2:
+  - Move peek logic to libbpf_netlink_recv(), don't double free on ENOMEM.
+
+Fixes: 8bbb77b7c7a2 ("libbpf: Add various netlink helpers")
+	Reported-by: Zhiqian Guan <zhguan@redhat.com>
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Andrii Nakryiko <andrii@kernel.org>
+	Acked-by: Kumar Kartikeya Dwivedi <memxor@gmail.com>
+Link: https://lore.kernel.org/bpf/20220211234819.612288-1-toke@redhat.com
+(cherry picked from commit 9c3de619e13ee6693ec5ac74f50b7aa89056a70e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/netlink.c
+diff --cc tools/lib/bpf/netlink.c
+index 4676dcf5eae8,a598061f6fea..000000000000
+--- a/tools/lib/bpf/netlink.c
++++ b/tools/lib/bpf/netlink.c
+@@@ -73,21 -76,79 +73,84 @@@ cleanup
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int bpf_netlink_recv(int sock, __u32 nl_pid, int seq,
+ +			    __dump_nlmsg_t _fn, libbpf_dump_nlmsg_t fn,
+ +			    void *cookie)
+++=======
++ static void libbpf_netlink_close(int sock)
+  {
++ 	close(sock);
++ }
++ 
++ enum {
++ 	NL_CONT,
++ 	NL_NEXT,
++ 	NL_DONE,
++ };
++ 
++ static int netlink_recvmsg(int sock, struct msghdr *mhdr, int flags)
++ {
++ 	int len;
++ 
++ 	do {
++ 		len = recvmsg(sock, mhdr, flags);
++ 	} while (len < 0 && (errno == EINTR || errno == EAGAIN));
++ 
++ 	if (len < 0)
++ 		return -errno;
++ 	return len;
++ }
++ 
++ static int alloc_iov(struct iovec *iov, int len)
++ {
++ 	void *nbuf;
++ 
++ 	nbuf = realloc(iov->iov_base, len);
++ 	if (!nbuf)
++ 		return -ENOMEM;
++ 
++ 	iov->iov_base = nbuf;
++ 	iov->iov_len = len;
++ 	return 0;
++ }
++ 
++ static int libbpf_netlink_recv(int sock, __u32 nl_pid, int seq,
++ 			       __dump_nlmsg_t _fn, libbpf_dump_nlmsg_t fn,
++ 			       void *cookie)
+++>>>>>>> 9c3de619e13e (libbpf: Use dynamically allocated buffer when receiving netlink messages)
++ {
++ 	struct iovec iov = {};
++ 	struct msghdr mhdr = {
++ 		.msg_iov = &iov,
++ 		.msg_iovlen = 1,
++ 	};
+  	bool multipart = true;
+  	struct nlmsgerr *err;
+  	struct nlmsghdr *nh;
+- 	char buf[4096];
+  	int len, ret;
+  
++ 	ret = alloc_iov(&iov, 4096);
++ 	if (ret)
++ 		goto done;
++ 
+  	while (multipart) {
+ -start:
+  		multipart = false;
+- 		len = recv(sock, buf, sizeof(buf), 0);
++ 		len = netlink_recvmsg(sock, &mhdr, MSG_PEEK | MSG_TRUNC);
++ 		if (len < 0) {
++ 			ret = len;
++ 			goto done;
++ 		}
++ 
++ 		if (len > iov.iov_len) {
++ 			ret = alloc_iov(&iov, len);
++ 			if (ret)
++ 				goto done;
++ 		}
++ 
++ 		len = netlink_recvmsg(sock, &mhdr, 0);
+  		if (len < 0) {
+- 			ret = -errno;
++ 			ret = len;
+  			goto done;
+  		}
+  
+* Unmerged path tools/lib/bpf/netlink.c
