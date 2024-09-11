@@ -1,0 +1,529 @@
+iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit 4fc52b81e87be583efb834df5b58245cb9ddd3e7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/4fc52b81.failed
+
+Use an explicit set_pgtable_quirks method instead that just passes
+the actual quirk bitmask instead.
+
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Acked-by: Will Deacon <will@kernel.org>
+	Acked-by: Li Yang <leoyang.li@nxp.com>
+Link: https://lore.kernel.org/r/20210401155256.298656-20-hch@lst.de
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 4fc52b81e87be583efb834df5b58245cb9ddd3e7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/msm/adreno/adreno_gpu.c
+#	drivers/iommu/arm/arm-smmu/arm-smmu.c
+#	drivers/iommu/iommu.c
+#	include/linux/iommu.h
+diff --cc drivers/gpu/drm/msm/adreno/adreno_gpu.c
+index 17d0506d058c,4a0b14dad93e..000000000000
+--- a/drivers/gpu/drm/msm/adreno/adreno_gpu.c
++++ b/drivers/gpu/drm/msm/adreno/adreno_gpu.c
+@@@ -22,6 -19,214 +22,216 @@@
+  #include "msm_gem.h"
+  #include "msm_mmu.h"
+  
+++<<<<<<< HEAD
+++=======
++ static bool zap_available = true;
++ 
++ static int zap_shader_load_mdt(struct msm_gpu *gpu, const char *fwname,
++ 		u32 pasid)
++ {
++ 	struct device *dev = &gpu->pdev->dev;
++ 	const struct firmware *fw;
++ 	const char *signed_fwname = NULL;
++ 	struct device_node *np, *mem_np;
++ 	struct resource r;
++ 	phys_addr_t mem_phys;
++ 	ssize_t mem_size;
++ 	void *mem_region = NULL;
++ 	int ret;
++ 
++ 	if (!IS_ENABLED(CONFIG_ARCH_QCOM)) {
++ 		zap_available = false;
++ 		return -EINVAL;
++ 	}
++ 
++ 	np = of_get_child_by_name(dev->of_node, "zap-shader");
++ 	if (!np) {
++ 		zap_available = false;
++ 		return -ENODEV;
++ 	}
++ 
++ 	mem_np = of_parse_phandle(np, "memory-region", 0);
++ 	of_node_put(np);
++ 	if (!mem_np) {
++ 		zap_available = false;
++ 		return -EINVAL;
++ 	}
++ 
++ 	ret = of_address_to_resource(mem_np, 0, &r);
++ 	of_node_put(mem_np);
++ 	if (ret)
++ 		return ret;
++ 
++ 	mem_phys = r.start;
++ 
++ 	/*
++ 	 * Check for a firmware-name property.  This is the new scheme
++ 	 * to handle firmware that may be signed with device specific
++ 	 * keys, allowing us to have a different zap fw path for different
++ 	 * devices.
++ 	 *
++ 	 * If the firmware-name property is found, we bypass the
++ 	 * adreno_request_fw() mechanism, because we don't need to handle
++ 	 * the /lib/firmware/qcom/... vs /lib/firmware/... case.
++ 	 *
++ 	 * If the firmware-name property is not found, for backwards
++ 	 * compatibility we fall back to the fwname from the gpulist
++ 	 * table.
++ 	 */
++ 	of_property_read_string_index(np, "firmware-name", 0, &signed_fwname);
++ 	if (signed_fwname) {
++ 		fwname = signed_fwname;
++ 		ret = request_firmware_direct(&fw, fwname, gpu->dev->dev);
++ 		if (ret)
++ 			fw = ERR_PTR(ret);
++ 	} else if (fwname) {
++ 		/* Request the MDT file from the default location: */
++ 		fw = adreno_request_fw(to_adreno_gpu(gpu), fwname);
++ 	} else {
++ 		/*
++ 		 * For new targets, we require the firmware-name property,
++ 		 * if a zap-shader is required, rather than falling back
++ 		 * to a firmware name specified in gpulist.
++ 		 *
++ 		 * Because the firmware is signed with a (potentially)
++ 		 * device specific key, having the name come from gpulist
++ 		 * was a bad idea, and is only provided for backwards
++ 		 * compatibility for older targets.
++ 		 */
++ 		return -ENODEV;
++ 	}
++ 
++ 	if (IS_ERR(fw)) {
++ 		DRM_DEV_ERROR(dev, "Unable to load %s\n", fwname);
++ 		return PTR_ERR(fw);
++ 	}
++ 
++ 	/* Figure out how much memory we need */
++ 	mem_size = qcom_mdt_get_size(fw);
++ 	if (mem_size < 0) {
++ 		ret = mem_size;
++ 		goto out;
++ 	}
++ 
++ 	if (mem_size > resource_size(&r)) {
++ 		DRM_DEV_ERROR(dev,
++ 			"memory region is too small to load the MDT\n");
++ 		ret = -E2BIG;
++ 		goto out;
++ 	}
++ 
++ 	/* Allocate memory for the firmware image */
++ 	mem_region = memremap(mem_phys, mem_size,  MEMREMAP_WC);
++ 	if (!mem_region) {
++ 		ret = -ENOMEM;
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * Load the rest of the MDT
++ 	 *
++ 	 * Note that we could be dealing with two different paths, since
++ 	 * with upstream linux-firmware it would be in a qcom/ subdir..
++ 	 * adreno_request_fw() handles this, but qcom_mdt_load() does
++ 	 * not.  But since we've already gotten through adreno_request_fw()
++ 	 * we know which of the two cases it is:
++ 	 */
++ 	if (signed_fwname || (to_adreno_gpu(gpu)->fwloc == FW_LOCATION_LEGACY)) {
++ 		ret = qcom_mdt_load(dev, fw, fwname, pasid,
++ 				mem_region, mem_phys, mem_size, NULL);
++ 	} else {
++ 		char *newname;
++ 
++ 		newname = kasprintf(GFP_KERNEL, "qcom/%s", fwname);
++ 
++ 		ret = qcom_mdt_load(dev, fw, newname, pasid,
++ 				mem_region, mem_phys, mem_size, NULL);
++ 		kfree(newname);
++ 	}
++ 	if (ret)
++ 		goto out;
++ 
++ 	/* Send the image to the secure world */
++ 	ret = qcom_scm_pas_auth_and_reset(pasid);
++ 
++ 	/*
++ 	 * If the scm call returns -EOPNOTSUPP we assume that this target
++ 	 * doesn't need/support the zap shader so quietly fail
++ 	 */
++ 	if (ret == -EOPNOTSUPP)
++ 		zap_available = false;
++ 	else if (ret)
++ 		DRM_DEV_ERROR(dev, "Unable to authorize the image\n");
++ 
++ out:
++ 	if (mem_region)
++ 		memunmap(mem_region);
++ 
++ 	release_firmware(fw);
++ 
++ 	return ret;
++ }
++ 
++ int adreno_zap_shader_load(struct msm_gpu *gpu, u32 pasid)
++ {
++ 	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
++ 	struct platform_device *pdev = gpu->pdev;
++ 
++ 	/* Short cut if we determine the zap shader isn't available/needed */
++ 	if (!zap_available)
++ 		return -ENODEV;
++ 
++ 	/* We need SCM to be able to load the firmware */
++ 	if (!qcom_scm_is_available()) {
++ 		DRM_DEV_ERROR(&pdev->dev, "SCM is not available\n");
++ 		return -EPROBE_DEFER;
++ 	}
++ 
++ 	return zap_shader_load_mdt(gpu, adreno_gpu->info->zapfw, pasid);
++ }
++ 
++ void adreno_set_llc_attributes(struct iommu_domain *iommu)
++ {
++ 	iommu_set_pgtable_quirks(iommu, IO_PGTABLE_QUIRK_ARM_OUTER_WBWA);
++ }
++ 
++ struct msm_gem_address_space *
++ adreno_iommu_create_address_space(struct msm_gpu *gpu,
++ 		struct platform_device *pdev)
++ {
++ 	struct iommu_domain *iommu;
++ 	struct msm_mmu *mmu;
++ 	struct msm_gem_address_space *aspace;
++ 	u64 start, size;
++ 
++ 	iommu = iommu_domain_alloc(&platform_bus_type);
++ 	if (!iommu)
++ 		return NULL;
++ 
++ 	mmu = msm_iommu_new(&pdev->dev, iommu);
++ 	if (IS_ERR(mmu)) {
++ 		iommu_domain_free(iommu);
++ 		return ERR_CAST(mmu);
++ 	}
++ 
++ 	/*
++ 	 * Use the aperture start or SZ_16M, whichever is greater. This will
++ 	 * ensure that we align with the allocated pagetable range while still
++ 	 * allowing room in the lower 32 bits for GMEM and whatnot
++ 	 */
++ 	start = max_t(u64, SZ_16M, iommu->geometry.aperture_start);
++ 	size = iommu->geometry.aperture_end - start + 1;
++ 
++ 	aspace = msm_gem_address_space_create(mmu, "gpu",
++ 		start & GENMASK_ULL(48, 0), size);
++ 
++ 	if (IS_ERR(aspace) && !IS_ERR(mmu))
++ 		mmu->funcs->destroy(mmu);
++ 
++ 	return aspace;
++ }
++ 
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  int adreno_get_param(struct msm_gpu *gpu, uint32_t param, uint64_t *value)
+  {
+  	struct adreno_gpu *adreno_gpu = to_adreno_gpu(gpu);
+diff --cc drivers/iommu/arm/arm-smmu/arm-smmu.c
+index 3c3c49fd26d8,3c6adcdb201b..000000000000
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.c
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.c
+@@@ -1480,98 -1484,34 +1480,126 @@@ static struct iommu_group *arm_smmu_dev
+  	return group;
+  }
+  
+++<<<<<<< HEAD
+ +static int arm_smmu_domain_get_attr(struct iommu_domain *domain,
+ +				    enum iommu_attr attr, void *data)
+ +{
+ +	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+ +
+ +	switch(domain->type) {
+ +	case IOMMU_DOMAIN_UNMANAGED:
+ +		switch (attr) {
+ +		case DOMAIN_ATTR_NESTING:
+ +			*(int *)data = (smmu_domain->stage == ARM_SMMU_DOMAIN_NESTED);
+ +			return 0;
+ +		case DOMAIN_ATTR_IO_PGTABLE_CFG: {
+ +			struct io_pgtable_domain_attr *pgtbl_cfg = data;
+ +			*pgtbl_cfg = smmu_domain->pgtbl_cfg;
+ +
+ +			return 0;
+ +		}
+ +		default:
+ +			return -ENODEV;
+ +		}
+ +		break;
+ +	case IOMMU_DOMAIN_DMA:
+ +		switch (attr) {
+ +		case DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE: {
+ +			bool non_strict = smmu_domain->pgtbl_cfg.quirks &
+ +					  IO_PGTABLE_QUIRK_NON_STRICT;
+ +			*(int *)data = non_strict;
+ +			return 0;
+ +		}
+ +		default:
+ +			return -ENODEV;
+ +		}
+ +		break;
+ +	default:
+ +		return -EINVAL;
+ +	}
+ +}
+ +
+ +static int arm_smmu_domain_set_attr(struct iommu_domain *domain,
+ +				    enum iommu_attr attr, void *data)
+++=======
++ static int arm_smmu_enable_nesting(struct iommu_domain *domain)
+  {
++ 	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
+  	int ret = 0;
++ 
++ 	mutex_lock(&smmu_domain->init_mutex);
++ 	if (smmu_domain->smmu)
++ 		ret = -EPERM;
++ 	else
++ 		smmu_domain->stage = ARM_SMMU_DOMAIN_NESTED;
++ 	mutex_unlock(&smmu_domain->init_mutex);
++ 
++ 	return ret;
++ }
++ 
++ static int arm_smmu_set_pgtable_quirks(struct iommu_domain *domain,
++ 		unsigned long quirks)
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
++ {
+  	struct arm_smmu_domain *smmu_domain = to_smmu_domain(domain);
++ 	int ret = 0;
+  
+  	mutex_lock(&smmu_domain->init_mutex);
+++<<<<<<< HEAD
+ +
+ +	switch(domain->type) {
+ +	case IOMMU_DOMAIN_UNMANAGED:
+ +		switch (attr) {
+ +		case DOMAIN_ATTR_NESTING:
+ +			if (smmu_domain->smmu) {
+ +				ret = -EPERM;
+ +				goto out_unlock;
+ +			}
+ +
+ +			if (*(int *)data)
+ +				smmu_domain->stage = ARM_SMMU_DOMAIN_NESTED;
+ +			else
+ +				smmu_domain->stage = ARM_SMMU_DOMAIN_S1;
+ +			break;
+ +		case DOMAIN_ATTR_IO_PGTABLE_CFG: {
+ +			struct io_pgtable_domain_attr *pgtbl_cfg = data;
+ +
+ +			if (smmu_domain->smmu) {
+ +				ret = -EPERM;
+ +				goto out_unlock;
+ +			}
+ +
+ +			smmu_domain->pgtbl_cfg = *pgtbl_cfg;
+ +			break;
+ +		}
+ +		default:
+ +			ret = -ENODEV;
+ +		}
+ +		break;
+ +	case IOMMU_DOMAIN_DMA:
+ +		switch (attr) {
+ +		case DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE:
+ +			if (*(int *)data)
+ +				smmu_domain->pgtbl_cfg.quirks |= IO_PGTABLE_QUIRK_NON_STRICT;
+ +			else
+ +				smmu_domain->pgtbl_cfg.quirks &= ~IO_PGTABLE_QUIRK_NON_STRICT;
+ +			break;
+ +		default:
+ +			ret = -ENODEV;
+ +		}
+ +		break;
+ +	default:
+ +		ret = -EINVAL;
+ +	}
+ +out_unlock:
+++=======
++ 	if (smmu_domain->smmu)
++ 		ret = -EPERM;
++ 	else
++ 		smmu_domain->pgtbl_quirks = quirks;
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  	mutex_unlock(&smmu_domain->init_mutex);
++ 
+  	return ret;
+  }
+  
+@@@ -1630,8 -1570,8 +1658,13 @@@ static struct iommu_ops arm_smmu_ops = 
+  	.probe_device		= arm_smmu_probe_device,
+  	.release_device		= arm_smmu_release_device,
+  	.device_group		= arm_smmu_device_group,
+++<<<<<<< HEAD
+ +	.domain_get_attr	= arm_smmu_domain_get_attr,
+ +	.domain_set_attr	= arm_smmu_domain_set_attr,
+++=======
++ 	.enable_nesting		= arm_smmu_enable_nesting,
++ 	.set_pgtable_quirks	= arm_smmu_set_pgtable_quirks,
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  	.of_xlate		= arm_smmu_of_xlate,
+  	.get_resv_regions	= arm_smmu_get_resv_regions,
+  	.put_resv_regions	= generic_iommu_put_resv_regions,
+diff --cc drivers/iommu/iommu.c
+index 3393cee7f54d,7ea5135b1431..000000000000
+--- a/drivers/iommu/iommu.c
++++ b/drivers/iommu/iommu.c
+@@@ -2720,6 -2691,27 +2720,30 @@@ int iommu_domain_set_attr(struct iommu_
+  }
+  EXPORT_SYMBOL_GPL(iommu_domain_set_attr);
+  
+++<<<<<<< HEAD
+++=======
++ int iommu_enable_nesting(struct iommu_domain *domain)
++ {
++ 	if (domain->type != IOMMU_DOMAIN_UNMANAGED)
++ 		return -EINVAL;
++ 	if (!domain->ops->enable_nesting)
++ 		return -EINVAL;
++ 	return domain->ops->enable_nesting(domain);
++ }
++ EXPORT_SYMBOL_GPL(iommu_enable_nesting);
++ 
++ int iommu_set_pgtable_quirks(struct iommu_domain *domain,
++ 		unsigned long quirk)
++ {
++ 	if (domain->type != IOMMU_DOMAIN_UNMANAGED)
++ 		return -EINVAL;
++ 	if (!domain->ops->set_pgtable_quirks)
++ 		return -EINVAL;
++ 	return domain->ops->set_pgtable_quirks(domain, quirk);
++ }
++ EXPORT_SYMBOL_GPL(iommu_set_pgtable_quirks);
++ 
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  void iommu_get_resv_regions(struct device *dev, struct list_head *list)
+  {
+  	const struct iommu_ops *ops = dev->bus->iommu_ops;
+diff --cc include/linux/iommu.h
+index 486407c90575,fbac49fe0880..000000000000
+--- a/include/linux/iommu.h
++++ b/include/linux/iommu.h
+@@@ -123,17 -107,6 +123,20 @@@ enum iommu_cap 
+   */
+  
+  enum iommu_attr {
+++<<<<<<< HEAD
+ +	DOMAIN_ATTR_GEOMETRY,
+ +	DOMAIN_ATTR_PAGING,
+ +	DOMAIN_ATTR_WINDOWS,
+ +	DOMAIN_ATTR_FSL_PAMU_STASH,
+ +	DOMAIN_ATTR_FSL_PAMU_ENABLE,
+ +	DOMAIN_ATTR_FSL_PAMUV1,
+ +	DOMAIN_ATTR_NESTING,	/* two stages of translation */
+ +	DOMAIN_ATTR_DMA_USE_FLUSH_QUEUE,
+ +#ifndef __GENKSYMS__
+ +	DOMAIN_ATTR_IO_PGTABLE_CFG,
+ +#endif
+++=======
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  	DOMAIN_ATTR_MAX,
+  };
+  
+@@@ -236,6 -207,8 +239,11 @@@ struct iommu_iotlb_gather 
+   * @device_group: find iommu group for a particular device
+   * @domain_get_attr: Query domain attributes
+   * @domain_set_attr: Change domain attributes
+++<<<<<<< HEAD
+++=======
++  * @enable_nesting: Enable nesting
++  * @set_pgtable_quirks: Set io page table quirks (IO_PGTABLE_QUIRK_*)
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+   * @get_resv_regions: Request list of reserved regions for a device
+   * @put_resv_regions: Free list of reserved regions for a device
+   * @apply_resv_region: Temporary helper call-back for iova reserved ranges
+@@@ -297,6 -261,9 +305,12 @@@ struct iommu_ops 
+  			       enum iommu_attr attr, void *data);
+  	int (*domain_set_attr)(struct iommu_domain *domain,
+  			       enum iommu_attr attr, void *data);
+++<<<<<<< HEAD
+++=======
++ 	int (*enable_nesting)(struct iommu_domain *domain);
++ 	int (*set_pgtable_quirks)(struct iommu_domain *domain,
++ 				  unsigned long quirks);
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  
+  	/* Request/Free a list of reserved regions for a device */
+  	void (*get_resv_regions)(struct device *dev, struct list_head *list);
+@@@ -558,11 -513,12 +572,17 @@@ extern int iommu_domain_get_attr(struc
+  				 void *data);
+  extern int iommu_domain_set_attr(struct iommu_domain *domain, enum iommu_attr,
+  				 void *data);
+++<<<<<<< HEAD
+++=======
++ int iommu_enable_nesting(struct iommu_domain *domain);
++ int iommu_set_pgtable_quirks(struct iommu_domain *domain,
++ 		unsigned long quirks);
+++>>>>>>> 4fc52b81e87b (iommu: remove DOMAIN_ATTR_IO_PGTABLE_CFG)
+  
+ -void iommu_set_dma_strict(bool val);
+ -bool iommu_get_dma_strict(struct iommu_domain *domain);
+ +/* Window handling function prototypes */
+ +extern int iommu_domain_window_enable(struct iommu_domain *domain, u32 wnd_nr,
+ +				      phys_addr_t offset, u64 size,
+ +				      int prot);
+  
+  extern int report_iommu_fault(struct iommu_domain *domain, struct device *dev,
+  			      unsigned long iova, int flags);
+* Unmerged path drivers/gpu/drm/msm/adreno/adreno_gpu.c
+* Unmerged path drivers/iommu/arm/arm-smmu/arm-smmu.c
+diff --git a/drivers/iommu/arm/arm-smmu/arm-smmu.h b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+index a05d9fdbe2ff..3358ee7f6ec5 100644
+--- a/drivers/iommu/arm/arm-smmu/arm-smmu.h
++++ b/drivers/iommu/arm/arm-smmu/arm-smmu.h
+@@ -375,7 +375,7 @@ enum arm_smmu_domain_stage {
+ struct arm_smmu_domain {
+ 	struct arm_smmu_device		*smmu;
+ 	struct io_pgtable_ops		*pgtbl_ops;
+-	struct io_pgtable_domain_attr	pgtbl_cfg;
++	unsigned long			pgtbl_quirks;
+ 	const struct iommu_flush_ops	*flush_ops;
+ 	struct arm_smmu_cfg		cfg;
+ 	enum arm_smmu_domain_stage	stage;
+* Unmerged path drivers/iommu/iommu.c
+diff --git a/include/linux/io-pgtable.h b/include/linux/io-pgtable.h
+index 2c9a1ae044af..5756ebef285b 100644
+--- a/include/linux/io-pgtable.h
++++ b/include/linux/io-pgtable.h
+@@ -205,10 +205,6 @@ struct io_pgtable {
+ 
+ #define io_pgtable_ops_to_pgtable(x) container_of((x), struct io_pgtable, ops)
+ 
+-struct io_pgtable_domain_attr {
+-	unsigned long quirks;
+-};
+-
+ static inline void io_pgtable_tlb_flush_all(struct io_pgtable *iop)
+ {
+ 	if (iop->cfg.tlb && iop->cfg.tlb->tlb_flush_all)
+* Unmerged path include/linux/iommu.h
