@@ -1,0 +1,108 @@
+ext4: find old entry again if failed to rename whiteout
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author zhangyi (F) <yi.zhang@huawei.com>
+commit b7ff91fd030dc9d72ed91b1aab36e445a003af4f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/b7ff91fd.failed
+
+If we failed to add new entry on rename whiteout, we cannot reset the
+old->de entry directly, because the old->de could have moved from under
+us during make indexed dir. So find the old entry again before reset is
+needed, otherwise it may corrupt the filesystem as below.
+
+  /dev/sda: Entry '00000001' in ??? (12) has deleted/unused inode 15. CLEARED.
+  /dev/sda: Unattached inode 75
+  /dev/sda: UNEXPECTED INCONSISTENCY; RUN fsck MANUALLY.
+
+Fixes: 6b4b8e6b4ad ("ext4: fix bug for rename with RENAME_WHITEOUT")
+	Cc: stable@vger.kernel.org
+	Signed-off-by: zhangyi (F) <yi.zhang@huawei.com>
+Link: https://lore.kernel.org/r/20210303131703.330415-1-yi.zhang@huawei.com
+	Signed-off-by: Theodore Ts'o <tytso@mit.edu>
+(cherry picked from commit b7ff91fd030dc9d72ed91b1aab36e445a003af4f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ext4/namei.c
+diff --cc fs/ext4/namei.c
+index 0088801ee734,4aae59d55288..000000000000
+--- a/fs/ext4/namei.c
++++ b/fs/ext4/namei.c
+@@@ -3380,22 -3601,43 +3380,47 @@@ static int ext4_setent(handle_t *handle
+  	inode_inc_iversion(ent->dir);
+  	ent->dir->i_ctime = ent->dir->i_mtime =
+  		current_time(ent->dir);
+ -	retval = ext4_mark_inode_dirty(handle, ent->dir);
+ +	ext4_mark_inode_dirty(handle, ent->dir);
+  	BUFFER_TRACE(ent->bh, "call ext4_handle_dirty_metadata");
+  	if (!ent->inlined) {
+ -		retval2 = ext4_handle_dirty_dirblock(handle, ent->dir, ent->bh);
+ -		if (unlikely(retval2)) {
+ -			ext4_std_error(ent->dir->i_sb, retval2);
+ -			return retval2;
+ +		retval = ext4_handle_dirty_dirent_node(handle,
+ +						       ent->dir, ent->bh);
+ +		if (unlikely(retval)) {
+ +			ext4_std_error(ent->dir->i_sb, retval);
+ +			return retval;
+  		}
+  	}
+ -	return retval;
+ +	brelse(ent->bh);
+ +	ent->bh = NULL;
+ +
+ +	return 0;
+  }
+  
++ static void ext4_resetent(handle_t *handle, struct ext4_renament *ent,
++ 			  unsigned ino, unsigned file_type)
++ {
++ 	struct ext4_renament old = *ent;
++ 	int retval = 0;
++ 
++ 	/*
++ 	 * old->de could have moved from under us during make indexed dir,
++ 	 * so the old->de may no longer valid and need to find it again
++ 	 * before reset old inode info.
++ 	 */
++ 	old.bh = ext4_find_entry(old.dir, &old.dentry->d_name, &old.de, NULL);
++ 	if (IS_ERR(old.bh))
++ 		retval = PTR_ERR(old.bh);
++ 	if (!old.bh)
++ 		retval = -ENOENT;
++ 	if (retval) {
++ 		ext4_std_error(old.dir->i_sb, retval);
++ 		return;
++ 	}
++ 
++ 	ext4_setent(handle, &old, ino, file_type);
++ 	brelse(old.bh);
++ }
++ 
+  static int ext4_find_delete_entry(handle_t *handle, struct inode *dir,
+  				  const struct qstr *d_name)
+  {
+@@@ -3690,6 -3960,16 +3715,19 @@@ static int ext4_rename(struct inode *ol
+  	retval = 0;
+  
+  end_rename:
+++<<<<<<< HEAD
+++=======
++ 	if (whiteout) {
++ 		if (retval) {
++ 			ext4_resetent(handle, &old,
++ 				      old.inode->i_ino, old_file_type);
++ 			drop_nlink(whiteout);
++ 		}
++ 		unlock_new_inode(whiteout);
++ 		iput(whiteout);
++ 
++ 	}
+++>>>>>>> b7ff91fd030d (ext4: find old entry again if failed to rename whiteout)
+  	brelse(old.dir_bh);
+  	brelse(old.bh);
+  	brelse(new.bh);
+* Unmerged path fs/ext4/namei.c
