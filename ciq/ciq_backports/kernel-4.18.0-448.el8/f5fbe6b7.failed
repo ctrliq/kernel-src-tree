@@ -1,0 +1,176 @@
+writeback, cgroup: support switching multiple inodes at once
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit f5fbe6b7ad6ef1fbdf8074a6ca9fdab739bf86d4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/f5fbe6b7.failed
+
+Currently only a single inode can be switched to another writeback
+structure at once.  That means to switch an inode a separate
+inode_switch_wbs_context structure must be allocated, and a separate rcu
+callback and work must be scheduled.
+
+It's fine for the existing ad-hoc switching, which is not happening that
+often, but sub-optimal for massive switching required in order to release
+a writeback structure.  To prepare for it, let's add a support for
+switching multiple inodes at once.
+
+Instead of containing a single inode pointer, inode_switch_wbs_context
+will contain a NULL-terminated array of inode pointers.
+inode_do_switch_wbs() will be called for each inode.
+
+To optimize the locking bdi->wb_switch_rwsem, old_wb's and new_wb's
+list_locks will be acquired and released only once altogether for all
+inodes.  wb_wakeup() will be also be called only once.  Instead of calling
+wb_put(old_wb) after each successful switch, wb_put_many() is introduced
+and used.
+
+Link: https://lkml.kernel.org/r/20210608230225.2078447-8-guro@fb.com
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Tejun Heo <tj@kernel.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Acked-by: Dennis Zhou <dennis@kernel.org>
+	Cc: Alexander Viro <viro@zeniv.linux.org.uk>
+	Cc: Dave Chinner <dchinner@redhat.com>
+	Cc: Jan Kara <jack@suse.com>
+	Cc: Jens Axboe <axboe@kernel.dk>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f5fbe6b7ad6ef1fbdf8074a6ca9fdab739bf86d4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fs-writeback.c
+diff --cc fs/fs-writeback.c
+index 56770ec54b07,737ac27adb77..000000000000
+--- a/fs/fs-writeback.c
++++ b/fs/fs-writeback.c
+@@@ -347,42 -356,18 +355,44 @@@ static void bdi_down_write_wb_switch_rw
+  
+  static void bdi_up_write_wb_switch_rwsem(struct backing_dev_info *bdi)
+  {
+ -	up_write(&bdi->wb_switch_rwsem);
+ +	up_write(bdi->wb_switch_rwsem);
+  }
+  
+- static void inode_do_switch_wbs(struct inode *inode,
++ static bool inode_do_switch_wbs(struct inode *inode,
++ 				struct bdi_writeback *old_wb,
+  				struct bdi_writeback *new_wb)
+  {
+- 	struct backing_dev_info *bdi = inode_to_bdi(inode);
+  	struct address_space *mapping = inode->i_mapping;
+- 	struct bdi_writeback *old_wb = inode->i_wb;
+  	XA_STATE(xas, &mapping->i_pages, 0);
+  	struct page *page;
+  	bool switched = false;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * If @inode switches cgwb membership while sync_inodes_sb() is
+ +	 * being issued, sync_inodes_sb() might miss it.  Synchronize.
+ +	 */
+ +	down_read(bdi->wb_switch_rwsem);
+ +
+ +	/*
+ +	 * By the time control reaches here, RCU grace period has passed
+ +	 * since I_WB_SWITCH assertion and all wb stat update transactions
+ +	 * between unlocked_inode_to_wb_begin/end() are guaranteed to be
+ +	 * synchronizing against the i_pages lock.
+ +	 *
+ +	 * Grabbing old_wb->list_lock, inode->i_lock and the i_pages lock
+ +	 * gives us exclusion against all wb related operations on @inode
+ +	 * including IO list manipulations and stat updates.
+ +	 */
+ +	if (old_wb < new_wb) {
+ +		spin_lock(&old_wb->list_lock);
+ +		spin_lock_nested(&new_wb->list_lock, SINGLE_DEPTH_NESTING);
+ +	} else {
+ +		spin_lock(&new_wb->list_lock);
+ +		spin_lock_nested(&old_wb->list_lock, SINGLE_DEPTH_NESTING);
+ +	}
+++=======
+++>>>>>>> f5fbe6b7ad6e (writeback, cgroup: support switching multiple inodes at once)
+  	spin_lock(&inode->i_lock);
+  	xa_lock_irq(&mapping->i_pages);
+  
+@@@ -462,15 -442,8 +472,17 @@@ skip_switch
+  
+  	xa_unlock_irq(&mapping->i_pages);
+  	spin_unlock(&inode->i_lock);
+- 	spin_unlock(&new_wb->list_lock);
+- 	spin_unlock(&old_wb->list_lock);
+  
+++<<<<<<< HEAD
+ +	up_read(bdi->wb_switch_rwsem);
+ +
+ +	if (switched) {
+ +		wb_wakeup(new_wb);
+ +		wb_put(old_wb);
+ +	}
+++=======
++ 	return switched;
+++>>>>>>> f5fbe6b7ad6e (writeback, cgroup: support switching multiple inodes at once)
+  }
+  
+  static void inode_switch_wbs_work_fn(struct work_struct *work)
+@@@ -534,10 -552,8 +591,10 @@@ static void inode_switch_wbs(struct ino
+  	__iget(inode);
+  	spin_unlock(&inode->i_lock);
+  
+- 	isw->inode = inode;
++ 	isw->inodes[0] = inode;
+  
+ +	atomic_inc(&isw_nr_in_flight);
+ +
+  	/*
+  	 * In addition to synchronizing among switchers, I_WB_SWITCH tells
+  	 * the RCU protected stat update paths to grab the i_page
+* Unmerged path fs/fs-writeback.c
+diff --git a/include/linux/backing-dev-defs.h b/include/linux/backing-dev-defs.h
+index 6cd2738b9494..5233b0b49ab4 100644
+--- a/include/linux/backing-dev-defs.h
++++ b/include/linux/backing-dev-defs.h
+@@ -296,8 +296,9 @@ static inline void wb_get(struct bdi_writeback *wb)
+ /**
+  * wb_put - decrement a wb's refcount
+  * @wb: bdi_writeback to put
++ * @nr: number of references to put
+  */
+-static inline void wb_put(struct bdi_writeback *wb)
++static inline void wb_put_many(struct bdi_writeback *wb, unsigned long nr)
+ {
+ 	if (WARN_ON_ONCE(!wb->bdi)) {
+ 		/*
+@@ -308,7 +309,16 @@ static inline void wb_put(struct bdi_writeback *wb)
+ 	}
+ 
+ 	if (wb != &wb->bdi->wb)
+-		percpu_ref_put(&wb->refcnt);
++		percpu_ref_put_many(&wb->refcnt, nr);
++}
++
++/**
++ * wb_put - decrement a wb's refcount
++ * @wb: bdi_writeback to put
++ */
++static inline void wb_put(struct bdi_writeback *wb)
++{
++	wb_put_many(wb, 1);
+ }
+ 
+ /**
+@@ -337,6 +347,10 @@ static inline void wb_put(struct bdi_writeback *wb)
+ {
+ }
+ 
++static inline void wb_put_many(struct bdi_writeback *wb, unsigned long nr)
++{
++}
++
+ static inline bool wb_dying(struct bdi_writeback *wb)
+ {
+ 	return false;
