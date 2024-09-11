@@ -1,0 +1,154 @@
+net/mlx5: E-Switch, Add state to eswitch vport representors
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] mlx5: E-Switch, Add state to eswitch vport representors (Alaa Hleihel) [1724333]
+Rebuild_FUZZ: 96.49%
+commit-author Bodong Wang <bodong@mellanox.com>
+commit f121e0ea9586b2c937bf1ff9a0b682dc6424ce1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f121e0ea.failed
+
+Currently the eswitch vport reps have a valid indicator, which is
+set on register and unset on unregister. However, a rep can be loaded
+or not loaded when doing unregister, current driver checks if the
+vport of that rep is enabled as a flag to imply the rep is loaded.
+However, for ECPF, this is not valid as the host PF will enable the
+vports for its VFs instead.
+
+Add three states: {unregistered, registered, loaded}, with the
+following state changes across different operations:
+
+	create: (none)       -> unregistered
+	reg:    unregistered -> registered
+	load:   registered   -> loaded
+	unload: loaded       -> registered
+	unreg:  registered   -> unregistered
+
+Note that the state shall only be updated inside eswitch driver rather
+than individual drivers such as ETH or IB.
+
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Signed-off-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Suggested-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Or Gerlitz <ogerlitz@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit f121e0ea9586b2c937bf1ff9a0b682dc6424ce1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+index a13e7b20a794,c6c9dad69ba8..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+@@@ -1226,18 -1268,29 +1226,34 @@@ int esw_offloads_init_reps(struct mlx5_
+  	offloads = &esw->offloads;
+  	mlx5_query_nic_vport_mac_address(dev, 0, hw_id);
+  
+ -	mlx5_esw_for_all_reps(esw, vport, rep) {
+ +	for (vport = 0; vport < total_vfs; vport++) {
+ +		rep = &offloads->vport_reps[vport];
+ +
+  		rep->vport = vport;
+  		ether_addr_copy(rep->hw_id, hw_id);
++ 
++ 		for (rep_type = 0; rep_type < NUM_REP_TYPES; rep_type++)
++ 			rep->rep_if[rep_type].state = REP_UNREGISTERED;
+  	}
+  
+ -	offloads->vport_reps[0].vport = MLX5_VPORT_UPLINK;
+ +	offloads->vport_reps[0].vport = FDB_UPLINK_VPORT;
+  
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void __esw_offloads_unload_rep(struct mlx5_eswitch *esw,
++ 				      struct mlx5_eswitch_rep *rep, u8 rep_type)
++ {
++ 	if (rep->rep_if[rep_type].state != REP_LOADED)
++ 		return;
++ 
++ 	rep->rep_if[rep_type].unload(rep);
++ 	rep->rep_if[rep_type].state = REP_REGISTERED;
++ }
++ 
+++>>>>>>> f121e0ea9586 (net/mlx5: E-Switch, Add state to eswitch vport representors)
+  static void esw_offloads_unload_reps_type(struct mlx5_eswitch *esw, int nvports,
+  					  u8 rep_type)
+  {
+@@@ -1261,6 -1312,23 +1277,26 @@@ static void esw_offloads_unload_reps(st
+  		esw_offloads_unload_reps_type(esw, nvports, rep_type);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int __esw_offloads_load_rep(struct mlx5_eswitch *esw,
++ 				   struct mlx5_eswitch_rep *rep, u8 rep_type)
++ {
++ 	int err = 0;
++ 
++ 	if (rep->rep_if[rep_type].state != REP_REGISTERED)
++ 		return 0;
++ 
++ 	err = rep->rep_if[rep_type].load(esw->dev, rep);
++ 	if (err)
++ 		return err;
++ 
++ 	rep->rep_if[rep_type].state = REP_LOADED;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> f121e0ea9586 (net/mlx5: E-Switch, Add state to eswitch vport representors)
+  static int esw_offloads_load_reps_type(struct mlx5_eswitch *esw, int nvports,
+  				       u8 rep_type)
+  {
+@@@ -1831,15 -1905,11 +1868,15 @@@ void *mlx5_eswitch_get_proto_dev(struc
+  				 int vport,
+  				 u8 rep_type)
+  {
+ +	struct mlx5_esw_offload *offloads = &esw->offloads;
+  	struct mlx5_eswitch_rep *rep;
+  
+ -	rep = mlx5_eswitch_get_rep(esw, vport);
+ +	if (vport == FDB_UPLINK_VPORT)
+ +		vport = UPLINK_REP_INDEX;
+ +
+ +	rep = &offloads->vport_reps[vport];
+  
+- 	if (rep->rep_if[rep_type].valid &&
++ 	if (rep->rep_if[rep_type].state == REP_LOADED &&
+  	    rep->rep_if[rep_type].get_proto_dev)
+  		return rep->rep_if[rep_type].get_proto_dev(rep);
+  	return NULL;
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eswitch_offloads.c
+diff --git a/include/linux/mlx5/eswitch.h b/include/linux/mlx5/eswitch.h
+index fab5121ffb8f..e3dbc1bc0917 100644
+--- a/include/linux/mlx5/eswitch.h
++++ b/include/linux/mlx5/eswitch.h
+@@ -22,6 +22,12 @@ enum {
+ 	NUM_REP_TYPES,
+ };
+ 
++enum {
++	REP_UNREGISTERED,
++	REP_REGISTERED,
++	REP_LOADED,
++};
++
+ struct mlx5_eswitch_rep;
+ struct mlx5_eswitch_rep_if {
+ 	int		       (*load)(struct mlx5_core_dev *dev,
+@@ -29,7 +35,7 @@ struct mlx5_eswitch_rep_if {
+ 	void		       (*unload)(struct mlx5_eswitch_rep *rep);
+ 	void		       *(*get_proto_dev)(struct mlx5_eswitch_rep *rep);
+ 	void			*priv;
+-	bool		       valid;
++	u8			state;
+ };
+ 
+ struct mlx5_eswitch_rep {
