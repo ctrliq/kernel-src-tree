@@ -1,0 +1,398 @@
+ftrace: Add modify_ftrace_direct()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Steven Rostedt (VMware) <rostedt@goodmis.org>
+commit 0567d6809182df53da03636fad36c507c5cf07a5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/0567d680.failed
+
+Add a new function modify_ftrace_direct() that will allow a user to update
+an existing direct caller to a new trampoline, without missing hits due to
+unregistering one and then adding another.
+
+Link: https://lore.kernel.org/r/20191109022907.6zzo6orhxpt5n2sv@ast-mbp.dhcp.thefacebook.com
+
+	Suggested-by: Alexei Starovoitov <alexei.starovoitov@gmail.com>
+	Signed-off-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+(cherry picked from commit 0567d6809182df53da03636fad36c507c5cf07a5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ftrace.h
+#	kernel/trace/ftrace.c
+diff --cc include/linux/ftrace.h
+index a0bdf45611c0,73eb2e93593f..000000000000
+--- a/include/linux/ftrace.h
++++ b/include/linux/ftrace.h
+@@@ -243,6 -246,51 +243,54 @@@ static inline void ftrace_free_init_mem
+  static inline void ftrace_free_mem(struct module *mod, void *start, void *end) { }
+  #endif /* CONFIG_FUNCTION_TRACER */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
++ extern int ftrace_direct_func_count;
++ int register_ftrace_direct(unsigned long ip, unsigned long addr);
++ int unregister_ftrace_direct(unsigned long ip, unsigned long addr);
++ int modify_ftrace_direct(unsigned long ip, unsigned long old_addr, unsigned long new_addr);
++ struct ftrace_direct_func *ftrace_find_direct_func(unsigned long addr);
++ #else
++ # define ftrace_direct_func_count 0
++ static inline int register_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	return -ENODEV;
++ }
++ static inline int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	return -ENODEV;
++ }
++ static inline int modify_ftrace_direct(unsigned long ip,
++ 				       unsigned long old_addr, unsigned long new_addr)
++ {
++ 	return -ENODEV;
++ }
++ static inline struct ftrace_direct_func *ftrace_find_direct_func(unsigned long addr)
++ {
++ 	return NULL;
++ }
++ #endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
++ 
++ #ifndef CONFIG_HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
++ /*
++  * This must be implemented by the architecture.
++  * It is the way the ftrace direct_ops helper, when called
++  * via ftrace (because there's other callbacks besides the
++  * direct call), can inform the architecture's trampoline that this
++  * routine has a direct caller, and what the caller is.
++  *
++  * For example, in x86, it returns the direct caller
++  * callback function via the regs->orig_ax parameter.
++  * Then in the ftrace trampoline, if this is set, it makes
++  * the return from the trampoline jump to the direct caller
++  * instead of going back to the function it just traced.
++  */
++ static inline void arch_ftrace_set_direct_caller(struct pt_regs *regs,
++ 						 unsigned long addr) { }
++ #endif /* CONFIG_HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
++ 
+++>>>>>>> 0567d6809182 (ftrace: Add modify_ftrace_direct())
+  #ifdef CONFIG_STACK_TRACER
+  
+  extern int stack_tracer_enabled;
+diff --cc kernel/trace/ftrace.c
+index 3bd9dedf1818,834f3556ea1e..000000000000
+--- a/kernel/trace/ftrace.c
++++ b/kernel/trace/ftrace.c
+@@@ -4804,9 -4942,304 +4804,307 @@@ static in
+  ftrace_set_addr(struct ftrace_ops *ops, unsigned long ip, int remove,
+  		int reset, int enable)
+  {
+ -	return ftrace_set_hash(ops, NULL, 0, ip, remove, reset, enable);
+ +	return ftrace_set_hash(ops, 0, 0, ip, remove, reset, enable);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
++ 
++ struct ftrace_direct_func {
++ 	struct list_head	next;
++ 	unsigned long		addr;
++ 	int			count;
++ };
++ 
++ static LIST_HEAD(ftrace_direct_funcs);
++ 
++ /**
++  * ftrace_find_direct_func - test an address if it is a registered direct caller
++  * @addr: The address of a registered direct caller
++  *
++  * This searches to see if a ftrace direct caller has been registered
++  * at a specific address, and if so, it returns a descriptor for it.
++  *
++  * This can be used by architecture code to see if an address is
++  * a direct caller (trampoline) attached to a fentry/mcount location.
++  * This is useful for the function_graph tracer, as it may need to
++  * do adjustments if it traced a location that also has a direct
++  * trampoline attached to it.
++  */
++ struct ftrace_direct_func *ftrace_find_direct_func(unsigned long addr)
++ {
++ 	struct ftrace_direct_func *entry;
++ 	bool found = false;
++ 
++ 	/* May be called by fgraph trampoline (protected by rcu tasks) */
++ 	list_for_each_entry_rcu(entry, &ftrace_direct_funcs, next) {
++ 		if (entry->addr == addr) {
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 	if (found)
++ 		return entry;
++ 
++ 	return NULL;
++ }
++ 
++ /**
++  * register_ftrace_direct - Call a custom trampoline directly
++  * @ip: The address of the nop at the beginning of a function
++  * @addr: The address of the trampoline to call at @ip
++  *
++  * This is used to connect a direct call from the nop location (@ip)
++  * at the start of ftrace traced functions. The location that it calls
++  * (@addr) must be able to handle a direct call, and save the parameters
++  * of the function being traced, and restore them (or inject new ones
++  * if needed), before returning.
++  *
++  * Returns:
++  *  0 on success
++  *  -EBUSY - Another direct function is already attached (there can be only one)
++  *  -ENODEV - @ip does not point to a ftrace nop location (or not supported)
++  *  -ENOMEM - There was an allocation failure.
++  */
++ int register_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	struct ftrace_direct_func *direct;
++ 	struct ftrace_func_entry *entry;
++ 	struct ftrace_hash *free_hash = NULL;
++ 	struct dyn_ftrace *rec;
++ 	int ret = -EBUSY;
++ 
++ 	mutex_lock(&direct_mutex);
++ 
++ 	/* See if there's a direct function at @ip already */
++ 	if (find_rec_direct(ip))
++ 		goto out_unlock;
++ 
++ 	ret = -ENODEV;
++ 	rec = lookup_rec(ip, ip);
++ 	if (!rec)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * Check if the rec says it has a direct call but we didn't
++ 	 * find one earlier?
++ 	 */
++ 	if (WARN_ON(rec->flags & FTRACE_FL_DIRECT))
++ 		goto out_unlock;
++ 
++ 	/* Make sure the ip points to the exact record */
++ 	ip = rec->ip;
++ 
++ 	ret = -ENOMEM;
++ 	if (ftrace_hash_empty(direct_functions) ||
++ 	    direct_functions->count > 2 * (1 << direct_functions->size_bits)) {
++ 		struct ftrace_hash *new_hash;
++ 		int size = ftrace_hash_empty(direct_functions) ? 0 :
++ 			direct_functions->count + 1;
++ 
++ 		if (size < 32)
++ 			size = 32;
++ 
++ 		new_hash = dup_hash(direct_functions, size);
++ 		if (!new_hash)
++ 			goto out_unlock;
++ 
++ 		free_hash = direct_functions;
++ 		direct_functions = new_hash;
++ 	}
++ 
++ 	entry = kmalloc(sizeof(*entry), GFP_KERNEL);
++ 	if (!entry)
++ 		goto out_unlock;
++ 
++ 	direct = ftrace_find_direct_func(addr);
++ 	if (!direct) {
++ 		direct = kmalloc(sizeof(*direct), GFP_KERNEL);
++ 		if (!direct) {
++ 			kfree(entry);
++ 			goto out_unlock;
++ 		}
++ 		direct->addr = addr;
++ 		direct->count = 0;
++ 		list_add_rcu(&direct->next, &ftrace_direct_funcs);
++ 		ftrace_direct_func_count++;
++ 	}
++ 
++ 	entry->ip = ip;
++ 	entry->direct = addr;
++ 	__add_hash_entry(direct_functions, entry);
++ 
++ 	ret = ftrace_set_filter_ip(&direct_ops, ip, 0, 0);
++ 	if (ret)
++ 		remove_hash_entry(direct_functions, entry);
++ 
++ 	if (!ret && !(direct_ops.flags & FTRACE_OPS_FL_ENABLED)) {
++ 		ret = register_ftrace_function(&direct_ops);
++ 		if (ret)
++ 			ftrace_set_filter_ip(&direct_ops, ip, 1, 0);
++ 	}
++ 
++ 	if (ret) {
++ 		kfree(entry);
++ 		if (!direct->count) {
++ 			list_del_rcu(&direct->next);
++ 			synchronize_rcu_tasks();
++ 			kfree(direct);
++ 			if (free_hash)
++ 				free_ftrace_hash(free_hash);
++ 			free_hash = NULL;
++ 			ftrace_direct_func_count--;
++ 		}
++ 	} else {
++ 		if (!direct->count)
++ 			direct->count++;
++ 	}
++  out_unlock:
++ 	mutex_unlock(&direct_mutex);
++ 
++ 	if (free_hash) {
++ 		synchronize_rcu_tasks();
++ 		free_ftrace_hash(free_hash);
++ 	}
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(register_ftrace_direct);
++ 
++ int unregister_ftrace_direct(unsigned long ip, unsigned long addr)
++ {
++ 	struct ftrace_func_entry *entry;
++ 	struct ftrace_direct_func *direct;
++ 	struct dyn_ftrace *rec;
++ 	int ret = -ENODEV;
++ 
++ 	mutex_lock(&direct_mutex);
++ 
++ 	entry = __ftrace_lookup_ip(direct_functions, ip);
++ 	if (!entry) {
++ 		/* OK if it is off by a little */
++ 		rec = lookup_rec(ip, ip);
++ 		if (!rec || rec->ip == ip)
++ 			goto out_unlock;
++ 
++ 		entry = __ftrace_lookup_ip(direct_functions, rec->ip);
++ 		if (!entry) {
++ 			WARN_ON(rec->flags & FTRACE_FL_DIRECT);
++ 			goto out_unlock;
++ 		}
++ 
++ 		WARN_ON(!(rec->flags & FTRACE_FL_DIRECT));
++ 	}
++ 
++ 	if (direct_functions->count == 1)
++ 		unregister_ftrace_function(&direct_ops);
++ 
++ 	ret = ftrace_set_filter_ip(&direct_ops, ip, 1, 0);
++ 
++ 	WARN_ON(ret);
++ 
++ 	remove_hash_entry(direct_functions, entry);
++ 
++ 	direct = ftrace_find_direct_func(addr);
++ 	if (!WARN_ON(!direct)) {
++ 		/* This is the good path (see the ! before WARN) */
++ 		direct->count--;
++ 		WARN_ON(direct->count < 0);
++ 		if (!direct->count) {
++ 			list_del_rcu(&direct->next);
++ 			synchronize_rcu_tasks();
++ 			kfree(direct);
++ 			ftrace_direct_func_count--;
++ 		}
++ 	}
++  out_unlock:
++ 	mutex_unlock(&direct_mutex);
++ 
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(unregister_ftrace_direct);
++ 
++ static struct ftrace_ops stub_ops = {
++ 	.func		= ftrace_stub,
++ };
++ 
++ /**
++  * modify_ftrace_direct - Modify an existing direct call to call something else
++  * @ip: The instruction pointer to modify
++  * @old_addr: The address that the current @ip calls directly
++  * @new_addr: The address that the @ip should call
++  *
++  * This modifies a ftrace direct caller at an instruction pointer without
++  * having to disable it first. The direct call will switch over to the
++  * @new_addr without missing anything.
++  *
++  * Returns: zero on success. Non zero on error, which includes:
++  *  -ENODEV : the @ip given has no direct caller attached
++  *  -EINVAL : the @old_addr does not match the current direct caller
++  */
++ int modify_ftrace_direct(unsigned long ip,
++ 			 unsigned long old_addr, unsigned long new_addr)
++ {
++ 	struct ftrace_func_entry *entry;
++ 	struct dyn_ftrace *rec;
++ 	int ret = -ENODEV;
++ 
++ 	mutex_lock(&direct_mutex);
++ 	entry = __ftrace_lookup_ip(direct_functions, ip);
++ 	if (!entry) {
++ 		/* OK if it is off by a little */
++ 		rec = lookup_rec(ip, ip);
++ 		if (!rec || rec->ip == ip)
++ 			goto out_unlock;
++ 
++ 		entry = __ftrace_lookup_ip(direct_functions, rec->ip);
++ 		if (!entry)
++ 			goto out_unlock;
++ 
++ 		ip = rec->ip;
++ 		WARN_ON(!(rec->flags & FTRACE_FL_DIRECT));
++ 	}
++ 
++ 	ret = -EINVAL;
++ 	if (entry->direct != old_addr)
++ 		goto out_unlock;
++ 
++ 	/*
++ 	 * By setting a stub function at the same address, we force
++ 	 * the code to call the iterator and the direct_ops helper.
++ 	 * This means that @ip does not call the direct call, and
++ 	 * we can simply modify it.
++ 	 */
++ 	ret = ftrace_set_filter_ip(&stub_ops, ip, 0, 0);
++ 	if (ret)
++ 		goto out_unlock;
++ 
++ 	ret = register_ftrace_function(&stub_ops);
++ 	if (ret) {
++ 		ftrace_set_filter_ip(&stub_ops, ip, 1, 0);
++ 		goto out_unlock;
++ 	}
++ 
++ 	entry->direct = new_addr;
++ 
++ 	/*
++ 	 * By removing the stub, we put back the direct call, calling
++ 	 * the @new_addr.
++ 	 */
++ 	unregister_ftrace_function(&stub_ops);
++ 	ftrace_set_filter_ip(&stub_ops, ip, 1, 0);
++ 
++ 	ret = 0;
++ 
++  out_unlock:
++ 	mutex_unlock(&direct_mutex);
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(modify_ftrace_direct);
++ #endif /* CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS */
++ 
+++>>>>>>> 0567d6809182 (ftrace: Add modify_ftrace_direct())
+  /**
+   * ftrace_set_filter_ip - set a function to filter on in ftrace by address
+   * @ops - the ops to set the filter with
+* Unmerged path include/linux/ftrace.h
+* Unmerged path kernel/trace/ftrace.c
