@@ -1,0 +1,340 @@
+arm64: ssbd: Add support for PSTATE.SSBS rather than trapping to EL3
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Will Deacon <will.deacon@arm.com>
+commit 8f04e8e6e29c93421a95b61cad62e3918425eac7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/8f04e8e6.failed
+
+On CPUs with support for PSTATE.SSBS, the kernel can toggle the SSBD
+state without needing to call into firmware.
+
+This patch hooks into the existing SSBD infrastructure so that SSBS is
+used on CPUs that support it, but it's all made horribly complicated by
+the very real possibility of big/little systems that don't uniformly
+provide the new capability.
+
+	Signed-off-by: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 8f04e8e6e29c93421a95b61cad62e3918425eac7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/cpufeature.c
+diff --cc arch/arm64/kernel/cpufeature.c
+index cbb9accafe8b,9aa18a0df0d7..000000000000
+--- a/arch/arm64/kernel/cpufeature.c
++++ b/arch/arm64/kernel/cpufeature.c
+@@@ -1043,6 -1031,56 +1043,59 @@@ static void cpu_copy_el2regs(const stru
+  }
+  #endif
+  
+++<<<<<<< HEAD
+++=======
++ static void cpu_has_fwb(const struct arm64_cpu_capabilities *__unused)
++ {
++ 	u64 val = read_sysreg_s(SYS_CLIDR_EL1);
++ 
++ 	/* Check that CLIDR_EL1.LOU{U,IS} are both 0 */
++ 	WARN_ON(val & (7 << 27 | 7 << 21));
++ }
++ 
++ #ifdef CONFIG_ARM64_SSBD
++ static int ssbs_emulation_handler(struct pt_regs *regs, u32 instr)
++ {
++ 	if (user_mode(regs))
++ 		return 1;
++ 
++ 	if (instr & BIT(CRm_shift))
++ 		regs->pstate |= PSR_SSBS_BIT;
++ 	else
++ 		regs->pstate &= ~PSR_SSBS_BIT;
++ 
++ 	arm64_skip_faulting_instruction(regs, 4);
++ 	return 0;
++ }
++ 
++ static struct undef_hook ssbs_emulation_hook = {
++ 	.instr_mask	= ~(1U << CRm_shift),
++ 	.instr_val	= 0xd500001f | REG_PSTATE_SSBS_IMM,
++ 	.fn		= ssbs_emulation_handler,
++ };
++ 
++ static void cpu_enable_ssbs(const struct arm64_cpu_capabilities *__unused)
++ {
++ 	static bool undef_hook_registered = false;
++ 	static DEFINE_SPINLOCK(hook_lock);
++ 
++ 	spin_lock(&hook_lock);
++ 	if (!undef_hook_registered) {
++ 		register_undef_hook(&ssbs_emulation_hook);
++ 		undef_hook_registered = true;
++ 	}
++ 	spin_unlock(&hook_lock);
++ 
++ 	if (arm64_get_ssbd_state() == ARM64_SSBD_FORCE_DISABLE) {
++ 		sysreg_clear_set(sctlr_el1, 0, SCTLR_ELx_DSSBS);
++ 		arm64_set_ssbd_mitigation(false);
++ 	} else {
++ 		arm64_set_ssbd_mitigation(true);
++ 	}
++ }
++ #endif /* CONFIG_ARM64_SSBD */
++ 
+++>>>>>>> 8f04e8e6e29c (arm64: ssbd: Add support for PSTATE.SSBS rather than trapping to EL3)
+  static const struct arm64_cpu_capabilities arm64_features[] = {
+  	{
+  		.desc = "GIC system register CPU interface",
+@@@ -1219,27 -1268,26 +1272,33 @@@
+  		.cpu_enable = cpu_enable_hw_dbm,
+  	},
+  #endif
++ #ifdef CONFIG_ARM64_SSBD
+  	{
+ -		.desc = "CRC32 instructions",
+ -		.capability = ARM64_HAS_CRC32,
+ +		.desc = "Speculation barrier (SB)",
+ +		.capability = ARM64_HAS_SB,
+  		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+  		.matches = has_cpuid_feature,
+ -		.sys_reg = SYS_ID_AA64ISAR0_EL1,
+ -		.field_pos = ID_AA64ISAR0_CRC32_SHIFT,
+ +		.sys_reg = SYS_ID_AA64ISAR1_EL1,
+ +		.field_pos = ID_AA64ISAR1_SB_SHIFT,
+ +		.sign = FTR_UNSIGNED,
+  		.min_field_value = 1,
+  	},
+ +#ifdef CONFIG_ARM64_CNP
+  	{
+ -		.desc = "Speculative Store Bypassing Safe (SSBS)",
+ -		.capability = ARM64_SSBS,
+ -		.type = ARM64_CPUCAP_WEAK_LOCAL_CPU_FEATURE,
+ -		.matches = has_cpuid_feature,
+ -		.sys_reg = SYS_ID_AA64PFR1_EL1,
+ -		.field_pos = ID_AA64PFR1_SSBS_SHIFT,
+ +		.desc = "Common not Private translations",
+ +		.capability = ARM64_HAS_CNP,
+ +		.type = ARM64_CPUCAP_SYSTEM_FEATURE,
+ +		.matches = has_useable_cnp,
+ +		.sys_reg = SYS_ID_AA64MMFR2_EL1,
+  		.sign = FTR_UNSIGNED,
+++<<<<<<< HEAD
+ +		.field_pos = ID_AA64MMFR2_CNP_SHIFT,
+ +		.min_field_value = 1,
+ +		.cpu_enable = cpu_enable_cnp,
+++=======
++ 		.min_field_value = ID_AA64PFR1_SSBS_PSTATE_ONLY,
++ 		.cpu_enable = cpu_enable_ssbs,
+++>>>>>>> 8f04e8e6e29c (arm64: ssbd: Add support for PSTATE.SSBS rather than trapping to EL3)
+  	},
+  #endif
+  	{},
+diff --git a/arch/arm64/include/asm/processor.h b/arch/arm64/include/asm/processor.h
+index 96043739a8c6..80d0ee02d1f0 100644
+--- a/arch/arm64/include/asm/processor.h
++++ b/arch/arm64/include/asm/processor.h
+@@ -195,6 +195,10 @@ static inline void start_thread(struct pt_regs *regs, unsigned long pc,
+ {
+ 	start_thread_common(regs, pc);
+ 	regs->pstate = PSR_MODE_EL0t;
++
++	if (arm64_get_ssbd_state() != ARM64_SSBD_FORCE_ENABLE)
++		regs->pstate |= PSR_SSBS_BIT;
++
+ 	regs->sp = sp;
+ }
+ 
+@@ -211,6 +215,9 @@ static inline void compat_start_thread(struct pt_regs *regs, unsigned long pc,
+ 	regs->pstate |= COMPAT_PSR_E_BIT;
+ #endif
+ 
++	if (arm64_get_ssbd_state() != ARM64_SSBD_FORCE_ENABLE)
++		regs->pstate |= PSR_AA32_SSBS_BIT;
++
+ 	regs->compat_sp = sp;
+ }
+ #endif
+diff --git a/arch/arm64/include/asm/ptrace.h b/arch/arm64/include/asm/ptrace.h
+index 9e5a3efba3c0..1bf71d03ae4c 100644
+--- a/arch/arm64/include/asm/ptrace.h
++++ b/arch/arm64/include/asm/ptrace.h
+@@ -53,6 +53,7 @@
+ #define PSR_AA32_I_BIT		0x00000080
+ #define PSR_AA32_A_BIT		0x00000100
+ #define PSR_AA32_E_BIT		0x00000200
++#define PSR_AA32_SSBS_BIT	0x00800000
+ #define PSR_AA32_DIT_BIT	0x01000000
+ #define PSR_AA32_Q_BIT		0x08000000
+ #define PSR_AA32_V_BIT		0x10000000
+diff --git a/arch/arm64/include/asm/sysreg.h b/arch/arm64/include/asm/sysreg.h
+index 9e38d54b6b00..12f55fc8a3c9 100644
+--- a/arch/arm64/include/asm/sysreg.h
++++ b/arch/arm64/include/asm/sysreg.h
+@@ -86,11 +86,14 @@
+ 
+ #define REG_PSTATE_PAN_IMM		sys_reg(0, 0, 4, 0, 4)
+ #define REG_PSTATE_UAO_IMM		sys_reg(0, 0, 4, 0, 3)
++#define REG_PSTATE_SSBS_IMM		sys_reg(0, 3, 4, 0, 1)
+ 
+ #define SET_PSTATE_PAN(x) __emit_inst(0xd5000000 | REG_PSTATE_PAN_IMM |	\
+ 				      (!!x)<<8 | 0x1f)
+ #define SET_PSTATE_UAO(x) __emit_inst(0xd5000000 | REG_PSTATE_UAO_IMM |	\
+ 				      (!!x)<<8 | 0x1f)
++#define SET_PSTATE_SSBS(x) __emit_inst(0xd5000000 | REG_PSTATE_SSBS_IMM | \
++				       (!!x)<<8 | 0x1f)
+ 
+ #define __SYS_BARRIER_INSN(CRm, op2, Rt) \
+ 	__emit_inst(0xd5000000 | sys_insn(0, 3, 3, (CRm), (op2)) | ((Rt) & 0x1f))
+diff --git a/arch/arm64/include/uapi/asm/ptrace.h b/arch/arm64/include/uapi/asm/ptrace.h
+index 81547c3a95a3..cff79c5d848a 100644
+--- a/arch/arm64/include/uapi/asm/ptrace.h
++++ b/arch/arm64/include/uapi/asm/ptrace.h
+@@ -46,6 +46,7 @@
+ #define PSR_I_BIT	0x00000080
+ #define PSR_A_BIT	0x00000100
+ #define PSR_D_BIT	0x00000200
++#define PSR_SSBS_BIT	0x00001000
+ #define PSR_PAN_BIT	0x00400000
+ #define PSR_UAO_BIT	0x00800000
+ #define PSR_V_BIT	0x10000000
+diff --git a/arch/arm64/kernel/cpu_errata.c b/arch/arm64/kernel/cpu_errata.c
+index 5d1fa928ea4b..777adac43e55 100644
+--- a/arch/arm64/kernel/cpu_errata.c
++++ b/arch/arm64/kernel/cpu_errata.c
+@@ -309,6 +309,14 @@ void __init arm64_enable_wa2_handling(struct alt_instr *alt,
+ 
+ void arm64_set_ssbd_mitigation(bool state)
+ {
++	if (this_cpu_has_cap(ARM64_SSBS)) {
++		if (state)
++			asm volatile(SET_PSTATE_SSBS(0));
++		else
++			asm volatile(SET_PSTATE_SSBS(1));
++		return;
++	}
++
+ 	switch (psci_ops.conduit) {
+ 	case PSCI_CONDUIT_HVC:
+ 		arm_smccc_1_1_hvc(ARM_SMCCC_ARCH_WORKAROUND_2, state, NULL);
+@@ -333,6 +341,11 @@ static bool has_ssbd_mitigation(const struct arm64_cpu_capabilities *entry,
+ 
+ 	WARN_ON(scope != SCOPE_LOCAL_CPU || preemptible());
+ 
++	if (this_cpu_has_cap(ARM64_SSBS)) {
++		required = false;
++		goto out_printmsg;
++	}
++
+ 	if (psci_ops.smccc_version == SMCCC_VERSION_1_0) {
+ 		ssbd_state = ARM64_SSBD_UNKNOWN;
+ 		return false;
+@@ -381,7 +394,6 @@ static bool has_ssbd_mitigation(const struct arm64_cpu_capabilities *entry,
+ 
+ 	switch (ssbd_state) {
+ 	case ARM64_SSBD_FORCE_DISABLE:
+-		pr_info_once("%s disabled from command-line\n", entry->desc);
+ 		arm64_set_ssbd_mitigation(false);
+ 		required = false;
+ 		break;
+@@ -394,7 +406,6 @@ static bool has_ssbd_mitigation(const struct arm64_cpu_capabilities *entry,
+ 		break;
+ 
+ 	case ARM64_SSBD_FORCE_ENABLE:
+-		pr_info_once("%s forced from command-line\n", entry->desc);
+ 		arm64_set_ssbd_mitigation(true);
+ 		required = true;
+ 		break;
+@@ -404,6 +415,17 @@ static bool has_ssbd_mitigation(const struct arm64_cpu_capabilities *entry,
+ 		break;
+ 	}
+ 
++out_printmsg:
++	switch (ssbd_state) {
++	case ARM64_SSBD_FORCE_DISABLE:
++		pr_info_once("%s disabled from command-line\n", entry->desc);
++		break;
++
++	case ARM64_SSBD_FORCE_ENABLE:
++		pr_info_once("%s forced from command-line\n", entry->desc);
++		break;
++	}
++
+ 	return required;
+ }
+ #endif	/* CONFIG_ARM64_SSBD */
+* Unmerged path arch/arm64/kernel/cpufeature.c
+diff --git a/arch/arm64/kernel/process.c b/arch/arm64/kernel/process.c
+index e10bc363f533..27e2751af313 100644
+--- a/arch/arm64/kernel/process.c
++++ b/arch/arm64/kernel/process.c
+@@ -358,6 +358,10 @@ int copy_thread(unsigned long clone_flags, unsigned long stack_start,
+ 		if (IS_ENABLED(CONFIG_ARM64_UAO) &&
+ 		    cpus_have_const_cap(ARM64_HAS_UAO))
+ 			childregs->pstate |= PSR_UAO_BIT;
++
++		if (arm64_get_ssbd_state() == ARM64_SSBD_FORCE_DISABLE)
++			childregs->pstate |= PSR_SSBS_BIT;
++
+ 		p->thread.cpu_context.x19 = stack_start;
+ 		p->thread.cpu_context.x20 = stk_sz;
+ 	}
+diff --git a/arch/arm64/kernel/ssbd.c b/arch/arm64/kernel/ssbd.c
+index 07b12c034ec2..885f13e58708 100644
+--- a/arch/arm64/kernel/ssbd.c
++++ b/arch/arm64/kernel/ssbd.c
+@@ -3,12 +3,30 @@
+  * Copyright (C) 2018 ARM Ltd, All Rights Reserved.
+  */
+ 
++#include <linux/compat.h>
+ #include <linux/errno.h>
+ #include <linux/sched.h>
++#include <linux/sched/task_stack.h>
+ #include <linux/thread_info.h>
+ 
+ #include <asm/cpufeature.h>
+ 
++static void ssbd_ssbs_enable(struct task_struct *task)
++{
++	u64 val = is_compat_thread(task_thread_info(task)) ?
++		  PSR_AA32_SSBS_BIT : PSR_SSBS_BIT;
++
++	task_pt_regs(task)->pstate |= val;
++}
++
++static void ssbd_ssbs_disable(struct task_struct *task)
++{
++	u64 val = is_compat_thread(task_thread_info(task)) ?
++		  PSR_AA32_SSBS_BIT : PSR_SSBS_BIT;
++
++	task_pt_regs(task)->pstate &= ~val;
++}
++
+ /*
+  * prctl interface for SSBD
+  */
+@@ -44,12 +62,14 @@ static int ssbd_prctl_set(struct task_struct *task, unsigned long ctrl)
+ 			return -EPERM;
+ 		task_clear_spec_ssb_disable(task);
+ 		clear_tsk_thread_flag(task, TIF_SSBD);
++		ssbd_ssbs_enable(task);
+ 		break;
+ 	case PR_SPEC_DISABLE:
+ 		if (state == ARM64_SSBD_FORCE_DISABLE)
+ 			return -EPERM;
+ 		task_set_spec_ssb_disable(task);
+ 		set_tsk_thread_flag(task, TIF_SSBD);
++		ssbd_ssbs_disable(task);
+ 		break;
+ 	case PR_SPEC_FORCE_DISABLE:
+ 		if (state == ARM64_SSBD_FORCE_DISABLE)
+@@ -57,6 +77,7 @@ static int ssbd_prctl_set(struct task_struct *task, unsigned long ctrl)
+ 		task_set_spec_ssb_disable(task);
+ 		task_set_spec_ssb_force_disable(task);
+ 		set_tsk_thread_flag(task, TIF_SSBD);
++		ssbd_ssbs_disable(task);
+ 		break;
+ 	default:
+ 		return -ERANGE;
