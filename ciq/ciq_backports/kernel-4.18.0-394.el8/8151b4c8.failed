@@ -1,0 +1,146 @@
+mm: add readahead address space operation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 8151b4c8bee43cea7a28cb0300123df90880e60c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8151b4c8.failed
+
+This replaces ->readpages with a saner interface:
+ - Return void instead of an ignored error code.
+ - Page cache is already populated with locked pages when ->readahead
+   is called.
+ - New arguments can be passed to the implementation without changing
+   all the filesystems that use a common helper function like
+   mpage_readahead().
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: John Hubbard <jhubbard@nvidia.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: William Kucharski <william.kucharski@oracle.com>
+	Cc: Chao Yu <yuchao0@huawei.com>
+	Cc: Cong Wang <xiyou.wangcong@gmail.com>
+	Cc: Darrick J. Wong <darrick.wong@oracle.com>
+	Cc: Dave Chinner <dchinner@redhat.com>
+	Cc: Eric Biggers <ebiggers@google.com>
+	Cc: Gao Xiang <gaoxiang25@huawei.com>
+	Cc: Jaegeuk Kim <jaegeuk@kernel.org>
+	Cc: Joseph Qi <joseph.qi@linux.alibaba.com>
+	Cc: Junxiao Bi <junxiao.bi@oracle.com>
+	Cc: Michal Hocko <mhocko@suse.com>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Cc: Johannes Thumshirn <johannes.thumshirn@wdc.com>
+	Cc: Miklos Szeredi <mszeredi@redhat.com>
+Link: http://lkml.kernel.org/r/20200414150233.24495-12-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 8151b4c8bee43cea7a28cb0300123df90880e60c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	Documentation/filesystems/Locking
+#	Documentation/filesystems/vfs.rst
+diff --cc Documentation/filesystems/Locking
+index 171f5b56ef6c,0af2e0e11461..000000000000
+--- a/Documentation/filesystems/Locking
++++ b/Documentation/filesystems/Locking
+@@@ -221,9 -272,10 +222,16 @@@ writepage:		yes, unlocks (see below
+  readpage:		yes, unlocks
+  writepages:
+  set_page_dirty		no
+++<<<<<<< HEAD:Documentation/filesystems/Locking
+ +readpages:
+ +write_begin:		locks the page		exclusive
+ +write_end:		yes, unlocks		exclusive
+++=======
++ readahead:		yes, unlocks
++ readpages:		no
++ write_begin:		locks the page		 exclusive
++ write_end:		yes, unlocks		 exclusive
+++>>>>>>> 8151b4c8bee4 (mm: add readahead address space operation):Documentation/filesystems/locking.rst
+  bmap:
+  invalidatepage:		yes
+  releasepage:		yes
+@@@ -237,17 -289,20 +245,23 @@@ is_partially_uptodate:	ye
+  error_remove_page:	yes
+  swap_activate:		no
+  swap_deactivate:	no
+ -======================	======================== =========
+  
+ -->write_begin(), ->write_end() and ->readpage() may be called from
+ +	->write_begin(), ->write_end() and ->readpage() may be called from
+  the request handler (/dev/loop).
+  
+ -->readpage() unlocks the page, either synchronously or via I/O
+ +	->readpage() unlocks the page, either synchronously or via I/O
+  completion.
+  
+++<<<<<<< HEAD:Documentation/filesystems/Locking
+ +	->readpages() populates the pagecache with the passed pages and starts
+++=======
++ ->readahead() unlocks the pages that I/O is attempted on like ->readpage().
++ 
++ ->readpages() populates the pagecache with the passed pages and starts
+++>>>>>>> 8151b4c8bee4 (mm: add readahead address space operation):Documentation/filesystems/locking.rst
+  I/O against them.  They come unlocked upon I/O completion.
+  
+ -->writepage() is used for two purposes: for "memory cleansing" and for
+ +	->writepage() is used for two purposes: for "memory cleansing" and for
+  "sync".  These are quite different operations and the behaviour may differ
+  depending upon the mode.
+  
+* Unmerged path Documentation/filesystems/vfs.rst
+* Unmerged path Documentation/filesystems/Locking
+* Unmerged path Documentation/filesystems/vfs.rst
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 6409ec6dd5c0..eb5314f10614 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -291,6 +291,7 @@ enum positive_aop_returns {
+ struct page;
+ struct address_space;
+ struct writeback_control;
++struct readahead_control;
+ 
+ /*
+  * Write life time hint values.
+@@ -368,6 +369,7 @@ struct address_space_operations {
+ 	 */
+ 	int (*readpages)(struct file *filp, struct address_space *mapping,
+ 			struct list_head *pages, unsigned nr_pages);
++	void (*readahead)(struct readahead_control *);
+ 
+ 	int (*write_begin)(struct file *, struct address_space *mapping,
+ 				loff_t pos, unsigned len, unsigned flags,
+diff --git a/mm/readahead.c b/mm/readahead.c
+index 0bb4e0066d79..42f135fe9cfb 100644
+--- a/mm/readahead.c
++++ b/mm/readahead.c
+@@ -124,7 +124,14 @@ static void read_pages(struct readahead_control *rac, struct list_head *pages,
+ 
+ 	blk_start_plug(&plug);
+ 
+-	if (aops->readpages) {
++	if (aops->readahead) {
++		aops->readahead(rac);
++		/* Clean up the remaining pages */
++		while ((page = readahead_page(rac))) {
++			unlock_page(page);
++			put_page(page);
++		}
++	} else if (aops->readpages) {
+ 		aops->readpages(rac->file, rac->mapping, pages,
+ 				readahead_count(rac));
+ 		/* Clean up the remaining pages */
+@@ -232,7 +239,8 @@ void force_page_cache_readahead(struct address_space *mapping,
+ 	struct file_ra_state *ra = &filp->f_ra;
+ 	unsigned long max_pages;
+ 
+-	if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages))
++	if (unlikely(!mapping->a_ops->readpage && !mapping->a_ops->readpages &&
++			!mapping->a_ops->readahead))
+ 		return;
+ 
+ 	/*
