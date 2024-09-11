@@ -1,0 +1,629 @@
+kasan: sanitize objects when metadata doesn't fit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andrey Konovalov <andreyknvl@google.com>
+commit 97593cad003c668e2532cb2939a24a031f8de52d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/97593cad.failed
+
+KASAN marks caches that are sanitized with the SLAB_KASAN cache flag.
+Currently if the metadata that is appended after the object (stores e.g.
+stack trace ids) doesn't fit into KMALLOC_MAX_SIZE (can only happen with
+SLAB, see the comment in the patch), KASAN turns off sanitization
+completely.
+
+With this change sanitization of the object data is always enabled.
+However the metadata is only stored when it fits.  Instead of checking for
+SLAB_KASAN flag accross the code to find out whether the metadata is
+there, use cache->kasan_info.alloc/free_meta_offset.  As 0 can be a valid
+value for free_meta_offset, introduce KASAN_NO_FREE_META as an indicator
+that the free metadata is missing.
+
+Without this change all sanitized KASAN objects would be put into
+quarantine with generic KASAN.  With this change, only the objects that
+have metadata (i.e.  when it fits) are put into quarantine, the rest is
+freed right away.
+
+Along the way rework __kasan_cache_create() and add claryfying comments.
+
+Link: https://lkml.kernel.org/r/aee34b87a5e4afe586c2ac6a0b32db8dc4dcc2dc.1606162397.git.andreyknvl@google.com
+Link: https://linux-review.googlesource.com/id/Icd947e2bea054cb5cfbdc6cf6652227d97032dcb
+Co-developed-by: Vincenzo Frascino <Vincenzo.Frascino@arm.com>
+	Signed-off-by: Vincenzo Frascino <Vincenzo.Frascino@arm.com>
+	Signed-off-by: Andrey Konovalov <andreyknvl@google.com>
+	Reviewed-by: Marco Elver <elver@google.com>
+	Tested-by: Vincenzo Frascino <vincenzo.frascino@arm.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Branislav Rankov <Branislav.Rankov@arm.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Evgenii Stepanov <eugenis@google.com>
+	Cc: Kevin Brodsky <kevin.brodsky@arm.com>
+	Cc: Vasily Gorbik <gor@linux.ibm.com>
+	Cc: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 97593cad003c668e2532cb2939a24a031f8de52d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/kasan/common.c
+#	mm/kasan/generic.c
+#	mm/kasan/hw_tags.c
+#	mm/kasan/kasan.h
+#	mm/kasan/report.c
+#	mm/kasan/tags.c
+diff --cc mm/kasan/common.c
+index 0d0cb20ec1a4,0cd583d2fe1c..000000000000
+--- a/mm/kasan/common.c
++++ b/mm/kasan/common.c
+@@@ -227,9 -114,6 +227,12 @@@ void kasan_free_pages(struct page *page
+   */
+  static inline unsigned int optimal_redzone(unsigned int object_size)
+  {
+++<<<<<<< HEAD
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		return 0;
+ +
+++=======
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  	return
+  		object_size <= 64        - 16   ? 16 :
+  		object_size <= 128       - 32   ? 32 :
+@@@ -240,69 -124,112 +243,125 @@@
+  		object_size <= (1 << 16) - 1024 ? 1024 : 2048;
+  }
+  
+ -void __kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
+ -			  slab_flags_t *flags)
+ +void kasan_cache_create(struct kmem_cache *cache, unsigned int *size,
+ +			slab_flags_t *flags)
+  {
+- 	unsigned int orig_size = *size;
+- 	unsigned int redzone_size;
+- 	int redzone_adjust;
++ 	unsigned int ok_size;
++ 	unsigned int optimal_size;
+  
+++<<<<<<< HEAD
+ +	/* Add alloc meta. */
+- 	cache->kasan_info.alloc_meta_offset = *size;
+- 	*size += sizeof(struct kasan_alloc_meta);
+++=======
++ 	/*
++ 	 * SLAB_KASAN is used to mark caches as ones that are sanitized by
++ 	 * KASAN. Currently this flag is used in two places:
++ 	 * 1. In slab_ksize() when calculating the size of the accessible
++ 	 *    memory within the object.
++ 	 * 2. In slab_common.c to prevent merging of sanitized caches.
++ 	 */
++ 	*flags |= SLAB_KASAN;
+  
+- 	/* Add free meta. */
+- 	if (IS_ENABLED(CONFIG_KASAN_GENERIC) &&
+- 	    (cache->flags & SLAB_TYPESAFE_BY_RCU || cache->ctor ||
+- 	     cache->object_size < sizeof(struct kasan_free_meta))) {
+- 		cache->kasan_info.free_meta_offset = *size;
+- 		*size += sizeof(struct kasan_free_meta);
+- 	}
++ 	if (!kasan_stack_collection_enabled())
++ 		return;
+  
+- 	redzone_size = optimal_redzone(cache->object_size);
+- 	redzone_adjust = redzone_size -	(*size - cache->object_size);
+- 	if (redzone_adjust > 0)
+- 		*size += redzone_adjust;
++ 	ok_size = *size;
+  
+- 	*size = min_t(unsigned int, KMALLOC_MAX_SIZE,
+- 			max(*size, cache->object_size + redzone_size));
++ 	/* Add alloc meta into redzone. */
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
++ 	cache->kasan_info.alloc_meta_offset = *size;
++ 	*size += sizeof(struct kasan_alloc_meta);
+  
+  	/*
+- 	 * If the metadata doesn't fit, don't enable KASAN at all.
++ 	 * If alloc meta doesn't fit, don't add it.
++ 	 * This can only happen with SLAB, as it has KMALLOC_MAX_SIZE equal
++ 	 * to KMALLOC_MAX_CACHE_SIZE and doesn't fall back to page_alloc for
++ 	 * larger sizes.
+  	 */
+- 	if (*size <= cache->kasan_info.alloc_meta_offset ||
+- 			*size <= cache->kasan_info.free_meta_offset) {
++ 	if (*size > KMALLOC_MAX_SIZE) {
+  		cache->kasan_info.alloc_meta_offset = 0;
+- 		cache->kasan_info.free_meta_offset = 0;
+- 		*size = orig_size;
++ 		*size = ok_size;
++ 		/* Continue, since free meta might still fit. */
++ 	}
++ 
++ 	/* Only the generic mode uses free meta or flexible redzones. */
++ 	if (!IS_ENABLED(CONFIG_KASAN_GENERIC)) {
++ 		cache->kasan_info.free_meta_offset = KASAN_NO_FREE_META;
+  		return;
+  	}
+  
+- 	*flags |= SLAB_KASAN;
++ 	/*
++ 	 * Add free meta into redzone when it's not possible to store
++ 	 * it in the object. This is the case when:
++ 	 * 1. Object is SLAB_TYPESAFE_BY_RCU, which means that it can
++ 	 *    be touched after it was freed, or
++ 	 * 2. Object has a constructor, which means it's expected to
++ 	 *    retain its content until the next allocation, or
++ 	 * 3. Object is too small.
++ 	 * Otherwise cache->kasan_info.free_meta_offset = 0 is implied.
++ 	 */
++ 	if ((cache->flags & SLAB_TYPESAFE_BY_RCU) || cache->ctor ||
++ 	    cache->object_size < sizeof(struct kasan_free_meta)) {
++ 		ok_size = *size;
++ 
++ 		cache->kasan_info.free_meta_offset = *size;
++ 		*size += sizeof(struct kasan_free_meta);
++ 
++ 		/* If free meta doesn't fit, don't add it. */
++ 		if (*size > KMALLOC_MAX_SIZE) {
++ 			cache->kasan_info.free_meta_offset = KASAN_NO_FREE_META;
++ 			*size = ok_size;
++ 		}
++ 	}
++ 
++ 	/* Calculate size with optimal redzone. */
++ 	optimal_size = cache->object_size + optimal_redzone(cache->object_size);
++ 	/* Limit it with KMALLOC_MAX_SIZE (relevant for SLAB only). */
++ 	if (optimal_size > KMALLOC_MAX_SIZE)
++ 		optimal_size = KMALLOC_MAX_SIZE;
++ 	/* Use optimal size if the size with added metas is not large enough. */
++ 	if (*size < optimal_size)
++ 		*size = optimal_size;
+  }
+  
+ -size_t __kasan_metadata_size(struct kmem_cache *cache)
+ +size_t kasan_metadata_size(struct kmem_cache *cache)
+  {
+ -	if (!kasan_stack_collection_enabled())
+ -		return 0;
+  	return (cache->kasan_info.alloc_meta_offset ?
+  		sizeof(struct kasan_alloc_meta) : 0) +
+  		(cache->kasan_info.free_meta_offset ?
+  		sizeof(struct kasan_free_meta) : 0);
+  }
+  
+ -struct kasan_alloc_meta *kasan_get_alloc_meta(struct kmem_cache *cache,
+ -					      const void *object)
+ +struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+ +					const void *object)
+ +{
+++<<<<<<< HEAD
+ +	return (void *)object + cache->kasan_info.alloc_meta_offset;
+ +}
+ +
+ +struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
+ +				      const void *object)
+  {
+ +	BUILD_BUG_ON(sizeof(struct kasan_free_meta) > 32);
+ +	return (void *)object + cache->kasan_info.free_meta_offset;
+++=======
++ 	if (!cache->kasan_info.alloc_meta_offset)
++ 		return NULL;
++ 	return kasan_reset_tag(object) + cache->kasan_info.alloc_meta_offset;
++ }
++ 
++ #ifdef CONFIG_KASAN_GENERIC
++ struct kasan_free_meta *kasan_get_free_meta(struct kmem_cache *cache,
++ 					    const void *object)
++ {
++ 	BUILD_BUG_ON(sizeof(struct kasan_free_meta) > 32);
++ 	if (cache->kasan_info.free_meta_offset == KASAN_NO_FREE_META)
++ 		return NULL;
++ 	return kasan_reset_tag(object) + cache->kasan_info.free_meta_offset;
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  }
++ #endif
+  
+ -void __kasan_poison_slab(struct page *page)
+ +void kasan_poison_slab(struct page *page)
+  {
+  	unsigned long i;
+  
+@@@ -370,20 -298,19 +429,28 @@@ static u8 assign_tag(struct kmem_cache 
+  #endif
+  }
+  
+ -void * __must_check __kasan_init_slab_obj(struct kmem_cache *cache,
+ +void * __must_check kasan_init_slab_obj(struct kmem_cache *cache,
+  						const void *object)
+  {
+ -	struct kasan_alloc_meta *alloc_meta;
+ +	struct kasan_alloc_meta *alloc_info;
+  
+++<<<<<<< HEAD
+ +	if (!(cache->flags & SLAB_KASAN))
+ +		return (void *)object;
+ +
+ +	alloc_info = get_alloc_info(cache, object);
+ +	__memset(alloc_info, 0, sizeof(*alloc_info));
+++=======
++ 	if (kasan_stack_collection_enabled()) {
++ 		alloc_meta = kasan_get_alloc_meta(cache, object);
++ 		if (alloc_meta)
++ 			__memset(alloc_meta, 0, sizeof(*alloc_meta));
++ 	}
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  
+ -	/* Tag is ignored in set_tag() without CONFIG_KASAN_SW/HW_TAGS */
+ -	object = set_tag(object, assign_tag(cache, object, true, false));
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		object = set_tag(object,
+ +				assign_tag(cache, object, true, false));
+  
+  	return (void *)object;
+  }
+@@@ -431,26 -340,57 +498,59 @@@ static bool __kasan_slab_free(struct km
+  		return true;
+  	}
+  
+ -	poison_range(object, cache->object_size, KASAN_KMALLOC_FREE);
+ -
+ -	if (!kasan_stack_collection_enabled())
+ -		return false;
+ +	rounded_up_size = round_up(cache->object_size, KASAN_SHADOW_SCALE_SIZE);
+ +	kasan_poison_shadow(object, rounded_up_size, KASAN_KMALLOC_FREE);
+  
+- 	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine) ||
+- 			unlikely(!(cache->flags & SLAB_KASAN)))
++ 	if ((IS_ENABLED(CONFIG_KASAN_GENERIC) && !quarantine))
+  		return false;
+  
+  	kasan_set_free_info(cache, object, tag);
+  
+- 	quarantine_put(cache, object);
+- 
+- 	return IS_ENABLED(CONFIG_KASAN_GENERIC);
++ 	return quarantine_put(cache, object);
+  }
+  
+ -bool __kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+ +bool kasan_slab_free(struct kmem_cache *cache, void *object, unsigned long ip)
+  {
+ -	return ____kasan_slab_free(cache, object, ip, true);
+ +	return __kasan_slab_free(cache, object, ip, true);
+  }
+  
+++<<<<<<< HEAD
+ +static void *__kasan_kmalloc(struct kmem_cache *cache, const void *object,
+++=======
++ void __kasan_slab_free_mempool(void *ptr, unsigned long ip)
++ {
++ 	struct page *page;
++ 
++ 	page = virt_to_head_page(ptr);
++ 
++ 	/*
++ 	 * Even though this function is only called for kmem_cache_alloc and
++ 	 * kmalloc backed mempool allocations, those allocations can still be
++ 	 * !PageSlab() when the size provided to kmalloc is larger than
++ 	 * KMALLOC_MAX_SIZE, and kmalloc falls back onto page_alloc.
++ 	 */
++ 	if (unlikely(!PageSlab(page))) {
++ 		if (ptr != page_address(page)) {
++ 			kasan_report_invalid_free(ptr, ip);
++ 			return;
++ 		}
++ 		poison_range(ptr, page_size(page), KASAN_FREE_PAGE);
++ 	} else {
++ 		____kasan_slab_free(page->slab_cache, ptr, ip, false);
++ 	}
++ }
++ 
++ static void set_alloc_info(struct kmem_cache *cache, void *object, gfp_t flags)
++ {
++ 	struct kasan_alloc_meta *alloc_meta;
++ 
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (alloc_meta)
++ 		kasan_set_track(&alloc_meta->alloc_track, flags);
++ }
++ 
++ static void *____kasan_kmalloc(struct kmem_cache *cache, const void *object,
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  				size_t size, gfp_t flags, bool keep_tag)
+  {
+  	unsigned long redzone_start;
+@@@ -464,20 -404,18 +564,25 @@@
+  		return NULL;
+  
+  	redzone_start = round_up((unsigned long)(object + size),
+ -				KASAN_GRANULE_SIZE);
+ +				KASAN_SHADOW_SCALE_SIZE);
+  	redzone_end = round_up((unsigned long)object + cache->object_size,
+ -				KASAN_GRANULE_SIZE);
+ -	tag = assign_tag(cache, object, false, keep_tag);
+ +				KASAN_SHADOW_SCALE_SIZE);
+ +
+ +	if (IS_ENABLED(CONFIG_KASAN_SW_TAGS))
+ +		tag = assign_tag(cache, object, false, keep_tag);
+  
+ -	/* Tag is ignored in set_tag without CONFIG_KASAN_SW/HW_TAGS */
+ -	unpoison_range(set_tag(object, tag), size);
+ -	poison_range((void *)redzone_start, redzone_end - redzone_start,
+ -		     KASAN_KMALLOC_REDZONE);
+++<<<<<<< HEAD
+ +	/* Tag is ignored in set_tag without CONFIG_KASAN_SW_TAGS */
+ +	kasan_unpoison_shadow(set_tag(object, tag), size);
+ +	kasan_poison_shadow((void *)redzone_start, redzone_end - redzone_start,
+ +		KASAN_KMALLOC_REDZONE);
+  
+ +	if (cache->flags & SLAB_KASAN)
+ +		kasan_set_track(&get_alloc_info(cache, object)->alloc_track, flags);
+++=======
++ 	if (kasan_stack_collection_enabled())
++ 		set_alloc_info(cache, (void *)object, flags);
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  
+  	return set_tag(object, tag);
+  }
+diff --cc mm/kasan/generic.c
+index d341859a1b95,1dd5a0f99372..000000000000
+--- a/mm/kasan/generic.c
++++ b/mm/kasan/generic.c
+@@@ -343,12 -347,12 +343,17 @@@ void kasan_set_free_info(struct kmem_ca
+  {
+  	struct kasan_free_meta *free_meta;
+  
+++<<<<<<< HEAD
+ +	free_meta = get_free_info(cache, object);
+ +	kasan_set_track(&free_meta->free_track, GFP_NOWAIT);
+++=======
++ 	free_meta = kasan_get_free_meta(cache, object);
++ 	if (!free_meta)
++ 		return;
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  
+- 	/*
+- 	 *  the object was freed and has free track set
+- 	 */
++ 	kasan_set_track(&free_meta->free_track, GFP_NOWAIT);
++ 	/* The object was freed and has free track set. */
+  	*(u8 *)kasan_mem_to_shadow(object) = KASAN_KMALLOC_FREETRACK;
+  }
+  
+@@@ -357,5 -361,6 +362,10 @@@ struct kasan_track *kasan_get_free_trac
+  {
+  	if (*(u8 *)kasan_mem_to_shadow(object) != KASAN_KMALLOC_FREETRACK)
+  		return NULL;
+++<<<<<<< HEAD
+ +	return &get_free_info(cache, object)->free_track;
+++=======
++ 	/* Free meta must be present with KASAN_KMALLOC_FREETRACK. */
++ 	return &kasan_get_free_meta(cache, object)->free_track;
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  }
+diff --cc mm/kasan/kasan.h
+index 2db4c5c1b473,cc4d9e1d49b1..000000000000
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@@ -134,10 -174,14 +143,21 @@@ struct kasan_free_meta 
+  #endif
+  };
+  
+++<<<<<<< HEAD
+ +struct kasan_alloc_meta *get_alloc_info(struct kmem_cache *cache,
+ +					const void *object);
+ +struct kasan_free_meta *get_free_info(struct kmem_cache *cache,
+ +					const void *object);
+++=======
++ struct kasan_alloc_meta *kasan_get_alloc_meta(struct kmem_cache *cache,
++ 						const void *object);
++ #ifdef CONFIG_KASAN_GENERIC
++ struct kasan_free_meta *kasan_get_free_meta(struct kmem_cache *cache,
++ 						const void *object);
++ #endif
++ 
++ #if defined(CONFIG_KASAN_GENERIC) || defined(CONFIG_KASAN_SW_TAGS)
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  
+  static inline const void *kasan_shadow_to_mem(const void *shadow_addr)
+  {
+diff --cc mm/kasan/report.c
+index a0772fe304d1,c0fb21797550..000000000000
+--- a/mm/kasan/report.c
++++ b/mm/kasan/report.c
+@@@ -159,36 -165,45 +159,64 @@@ static void describe_object_addr(struc
+  		(void *)(object_addr + cache->object_size));
+  }
+  
+ -static void describe_object_stacks(struct kmem_cache *cache, void *object,
+ -					const void *addr, u8 tag)
+ +static void describe_object(struct kmem_cache *cache, void *object,
+ +				const void *addr, u8 tag)
+  {
+++<<<<<<< HEAD
+ +	struct kasan_alloc_meta *alloc_info = get_alloc_info(cache, object);
+ +
+ +	if (cache->flags & SLAB_KASAN) {
+ +		struct kasan_track *free_track;
+ +
+ +		print_track(&alloc_info->alloc_track, "Allocated");
+++=======
++ 	struct kasan_alloc_meta *alloc_meta;
++ 	struct kasan_track *free_track;
++ 
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (alloc_meta) {
++ 		print_track(&alloc_meta->alloc_track, "Allocated");
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  		pr_err("\n");
+- 		free_track = kasan_get_free_track(cache, object, tag);
+- 		if (free_track) {
+- 			print_track(free_track, "Freed");
+- 			pr_err("\n");
+- 		}
++ 	}
++ 
++ 	free_track = kasan_get_free_track(cache, object, tag);
++ 	if (free_track) {
++ 		print_track(free_track, "Freed");
++ 		pr_err("\n");
++ 	}
+  
+  #ifdef CONFIG_KASAN_GENERIC
+++<<<<<<< HEAD
+ +		if (alloc_info->aux_stack[0]) {
+ +			pr_err("Last potentially related work creation:\n");
+ +			print_stack(alloc_info->aux_stack[0]);
+ +			pr_err("\n");
+ +		}
+ +		if (alloc_info->aux_stack[1]) {
+ +			pr_err("Second to last potentially related work creation:\n");
+ +			print_stack(alloc_info->aux_stack[1]);
+ +			pr_err("\n");
+ +		}
+ +#endif
+ +	}
+++=======
++ 	if (!alloc_meta)
++ 		return;
++ 	if (alloc_meta->aux_stack[0]) {
++ 		pr_err("Last potentially related work creation:\n");
++ 		print_stack(alloc_meta->aux_stack[0]);
++ 		pr_err("\n");
++ 	}
++ 	if (alloc_meta->aux_stack[1]) {
++ 		pr_err("Second to last potentially related work creation:\n");
++ 		print_stack(alloc_meta->aux_stack[1]);
++ 		pr_err("\n");
++ 	}
++ #endif
++ }
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit)
+  
+ -static void describe_object(struct kmem_cache *cache, void *object,
+ -				const void *addr, u8 tag)
+ -{
+ -	if (kasan_stack_collection_enabled())
+ -		describe_object_stacks(cache, object, addr, tag);
+  	describe_object_addr(cache, object, addr);
+  }
+  
+diff --cc mm/kasan/tags.c
+index 5c8b08a25715,5dcd830805b2..000000000000
+--- a/mm/kasan/tags.c
++++ b/mm/kasan/tags.c
+@@@ -163,7 -169,9 +163,13 @@@ void kasan_set_free_info(struct kmem_ca
+  	struct kasan_alloc_meta *alloc_meta;
+  	u8 idx = 0;
+  
+++<<<<<<< HEAD:mm/kasan/tags.c
+ +	alloc_meta = get_alloc_info(cache, object);
+++=======
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (!alloc_meta)
++ 		return;
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit):mm/kasan/sw_tags.c
+  
+  #ifdef CONFIG_KASAN_SW_TAGS_IDENTIFY
+  	idx = alloc_meta->free_track_idx;
+@@@ -180,7 -188,9 +186,13 @@@ struct kasan_track *kasan_get_free_trac
+  	struct kasan_alloc_meta *alloc_meta;
+  	int i = 0;
+  
+++<<<<<<< HEAD:mm/kasan/tags.c
+ +	alloc_meta = get_alloc_info(cache, object);
+++=======
++ 	alloc_meta = kasan_get_alloc_meta(cache, object);
++ 	if (!alloc_meta)
++ 		return NULL;
+++>>>>>>> 97593cad003c (kasan: sanitize objects when metadata doesn't fit):mm/kasan/sw_tags.c
+  
+  #ifdef CONFIG_KASAN_SW_TAGS_IDENTIFY
+  	for (i = 0; i < KASAN_NR_FREE_STACKS; i++) {
+* Unmerged path mm/kasan/hw_tags.c
+* Unmerged path mm/kasan/common.c
+* Unmerged path mm/kasan/generic.c
+* Unmerged path mm/kasan/hw_tags.c
+* Unmerged path mm/kasan/kasan.h
+diff --git a/mm/kasan/quarantine.c b/mm/kasan/quarantine.c
+index 88fab9ff2d6e..3151dfe8f015 100644
+--- a/mm/kasan/quarantine.c
++++ b/mm/kasan/quarantine.c
+@@ -137,7 +137,12 @@ static void qlink_free(struct qlist_node *qlink, struct kmem_cache *cache)
+ 	if (IS_ENABLED(CONFIG_SLAB))
+ 		local_irq_save(flags);
+ 
++	/*
++	 * As the object now gets freed from the quaratine, assume that its
++	 * free track is no longer valid.
++	 */
+ 	*(u8 *)kasan_mem_to_shadow(object) = KASAN_KMALLOC_FREE;
++
+ 	___cache_free(cache, object, _THIS_IP_);
+ 
+ 	if (IS_ENABLED(CONFIG_SLAB))
+@@ -163,13 +168,20 @@ static void qlist_free_all(struct qlist_head *q, struct kmem_cache *cache)
+ 	qlist_init(q);
+ }
+ 
+-void quarantine_put(struct kmem_cache *cache, void *object)
++bool quarantine_put(struct kmem_cache *cache, void *object)
+ {
+ 	unsigned long flags;
+ 	struct qlist_head *q;
+ 	struct qlist_head temp = QLIST_INIT;
+ 	struct kasan_free_meta *info = get_free_info(cache, object);
+ 
++	/*
++	 * If there's no metadata for this object, don't put it into
++	 * quarantine.
++	 */
++	if (!meta)
++		return false;
++
+ 	/*
+ 	 * Note: irq must be disabled until after we move the batch to the
+ 	 * global quarantine. Otherwise quarantine_remove_cache() can miss
+@@ -183,7 +195,7 @@ void quarantine_put(struct kmem_cache *cache, void *object)
+ 	q = this_cpu_ptr(&cpu_quarantine);
+ 	if (q->offline) {
+ 		local_irq_restore(flags);
+-		return;
++		return false;
+ 	}
+ 	qlist_put(q, &info->quarantine_link, cache->size);
+ 	if (unlikely(q->bytes > QUARANTINE_PERCPU_SIZE)) {
+@@ -206,6 +218,8 @@ void quarantine_put(struct kmem_cache *cache, void *object)
+ 	}
+ 
+ 	local_irq_restore(flags);
++
++	return true;
+ }
+ 
+ void quarantine_reduce(void)
+* Unmerged path mm/kasan/report.c
+* Unmerged path mm/kasan/tags.c
+diff --git a/mm/kasan/tags_report.c b/mm/kasan/tags_report.c
+index 5f183501b871..4a96dbe03c6c 100644
+--- a/mm/kasan/tags_report.c
++++ b/mm/kasan/tags_report.c
+@@ -48,9 +48,12 @@ const char *get_bug_type(struct kasan_access_info *info)
+ 		object = nearest_obj(cache, page, (void *)addr);
+ 		alloc_meta = get_alloc_info(cache, object);
+ 
+-		for (i = 0; i < KASAN_NR_FREE_STACKS; i++)
+-			if (alloc_meta->free_pointer_tag[i] == tag)
+-				return "use-after-free";
++		if (alloc_meta) {
++			for (i = 0; i < KASAN_NR_FREE_STACKS; i++) {
++				if (alloc_meta->free_pointer_tag[i] == tag)
++					return "use-after-free";
++			}
++		}
+ 		return "out-of-bounds";
+ 	}
+ 
