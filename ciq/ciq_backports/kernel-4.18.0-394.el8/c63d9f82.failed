@@ -1,0 +1,150 @@
+arm64: head.S: Convert to modern annotations for assembly functions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Mark Brown <broonie@kernel.org>
+commit c63d9f82db94399022a193cdfd57dbafa2a871cb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/c63d9f82.failed
+
+In an effort to clarify and simplify the annotation of assembly functions
+in the kernel new macros have been introduced. These replace ENTRY and
+ENDPROC and also add a new annotation for static functions which previously
+had no ENTRY equivalent. Update the annotations in the core kernel code to
+the new macros.
+
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit c63d9f82db94399022a193cdfd57dbafa2a871cb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kernel/head.S
+diff --cc arch/arm64/kernel/head.S
+index e3713313312f,716c946c98e9..000000000000
+--- a/arch/arm64/kernel/head.S
++++ b/arch/arm64/kernel/head.S
+@@@ -412,7 -403,8 +412,12 @@@ SYM_FUNC_START_LOCAL(__create_page_tabl
+  	bl	__inval_dcache_area
+  
+  	ret	x28
+++<<<<<<< HEAD
+ +ENDPROC(__create_page_tables)
+++=======
++ SYM_FUNC_END(__create_page_tables)
++ 	.ltorg
+++>>>>>>> c63d9f82db94 (arm64: head.S: Convert to modern annotations for assembly functions)
+  
+  /*
+   * The following fragment of code is executed with the MMU enabled.
+@@@ -852,18 -844,97 +857,102 @@@ SYM_FUNC_START_LOCAL(__relocate_kernel
+  
+  0:	cmp	x9, x10
+  	b.hs	1f
+ -	ldp	x12, x13, [x9], #24
+ -	ldr	x14, [x9, #-8]
+ -	cmp	w13, #R_AARCH64_RELATIVE
+ +	ldp	x11, x12, [x9], #24
+ +	ldr	x13, [x9, #-8]
+ +	cmp	w12, #R_AARCH64_RELATIVE
+  	b.ne	0b
+ -	add	x14, x14, x23			// relocate
+ -	str	x14, [x12, x23]
+ +	add	x13, x13, x23			// relocate
+ +	str	x13, [x11, x23]
+  	b	0b
+++<<<<<<< HEAD
+ +1:	ret
+ +ENDPROC(__relocate_kernel)
+++=======
++ 
++ 1:
++ #ifdef CONFIG_RELR
++ 	/*
++ 	 * Apply RELR relocations.
++ 	 *
++ 	 * RELR is a compressed format for storing relative relocations. The
++ 	 * encoded sequence of entries looks like:
++ 	 * [ AAAAAAAA BBBBBBB1 BBBBBBB1 ... AAAAAAAA BBBBBB1 ... ]
++ 	 *
++ 	 * i.e. start with an address, followed by any number of bitmaps. The
++ 	 * address entry encodes 1 relocation. The subsequent bitmap entries
++ 	 * encode up to 63 relocations each, at subsequent offsets following
++ 	 * the last address entry.
++ 	 *
++ 	 * The bitmap entries must have 1 in the least significant bit. The
++ 	 * assumption here is that an address cannot have 1 in lsb. Odd
++ 	 * addresses are not supported. Any odd addresses are stored in the RELA
++ 	 * section, which is handled above.
++ 	 *
++ 	 * Excluding the least significant bit in the bitmap, each non-zero
++ 	 * bit in the bitmap represents a relocation to be applied to
++ 	 * a corresponding machine word that follows the base address
++ 	 * word. The second least significant bit represents the machine
++ 	 * word immediately following the initial address, and each bit
++ 	 * that follows represents the next word, in linear order. As such,
++ 	 * a single bitmap can encode up to 63 relocations in a 64-bit object.
++ 	 *
++ 	 * In this implementation we store the address of the next RELR table
++ 	 * entry in x9, the address being relocated by the current address or
++ 	 * bitmap entry in x13 and the address being relocated by the current
++ 	 * bit in x14.
++ 	 *
++ 	 * Because addends are stored in place in the binary, RELR relocations
++ 	 * cannot be applied idempotently. We use x24 to keep track of the
++ 	 * currently applied displacement so that we can correctly relocate if
++ 	 * __relocate_kernel is called twice with non-zero displacements (i.e.
++ 	 * if there is both a physical misalignment and a KASLR displacement).
++ 	 */
++ 	ldr	w9, =__relr_offset		// offset to reloc table
++ 	ldr	w10, =__relr_size		// size of reloc table
++ 	add	x9, x9, x11			// __va(.relr)
++ 	add	x10, x9, x10			// __va(.relr) + sizeof(.relr)
++ 
++ 	sub	x15, x23, x24			// delta from previous offset
++ 	cbz	x15, 7f				// nothing to do if unchanged
++ 	mov	x24, x23			// save new offset
++ 
++ 2:	cmp	x9, x10
++ 	b.hs	7f
++ 	ldr	x11, [x9], #8
++ 	tbnz	x11, #0, 3f			// branch to handle bitmaps
++ 	add	x13, x11, x23
++ 	ldr	x12, [x13]			// relocate address entry
++ 	add	x12, x12, x15
++ 	str	x12, [x13], #8			// adjust to start of bitmap
++ 	b	2b
++ 
++ 3:	mov	x14, x13
++ 4:	lsr	x11, x11, #1
++ 	cbz	x11, 6f
++ 	tbz	x11, #0, 5f			// skip bit if not set
++ 	ldr	x12, [x14]			// relocate bit
++ 	add	x12, x12, x15
++ 	str	x12, [x14]
++ 
++ 5:	add	x14, x14, #8			// move to next bit's address
++ 	b	4b
++ 
++ 6:	/*
++ 	 * Move to the next bitmap's address. 8 is the word size, and 63 is the
++ 	 * number of significant bits in a bitmap entry.
++ 	 */
++ 	add	x13, x13, #(8 * 63)
++ 	b	2b
++ 
++ 7:
++ #endif
++ 	ret
++ 
++ SYM_FUNC_END(__relocate_kernel)
+++>>>>>>> c63d9f82db94 (arm64: head.S: Convert to modern annotations for assembly functions)
+  #endif
+  
+- __primary_switch:
++ SYM_FUNC_START_LOCAL(__primary_switch)
+  #ifdef CONFIG_RANDOMIZE_BASE
+  	mov	x19, x0				// preserve new SCTLR_EL1 value
+  	mrs	x20, sctlr_el1			// preserve old SCTLR_EL1 value
+* Unmerged path arch/arm64/kernel/head.S
