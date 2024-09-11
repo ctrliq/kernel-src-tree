@@ -57,6 +57,11 @@ int mlxsw_sp1_ptp_hwtstamp_set(struct mlxsw_sp_port *mlxsw_sp_port,
 int mlxsw_sp1_ptp_get_ts_info(struct mlxsw_sp *mlxsw_sp,
 			      struct ethtool_ts_info *info);
 
+int mlxsw_sp1_get_stats_count(void);
+void mlxsw_sp1_get_stats_strings(u8 **p);
+void mlxsw_sp1_get_stats(struct mlxsw_sp_port *mlxsw_sp_port,
+			 u64 *data, int data_index);
+
 #else
 
 static inline struct mlxsw_sp_ptp_clock *
@@ -119,6 +124,19 @@ static inline int mlxsw_sp1_ptp_get_ts_info(struct mlxsw_sp *mlxsw_sp,
 	return mlxsw_sp_ptp_get_ts_info_noptp(info);
 }
 
+static inline int mlxsw_sp1_get_stats_count(void)
+{
+	return 0;
+}
+
+static inline void mlxsw_sp1_get_stats_strings(u8 **p)
+{
+}
+
+static inline void mlxsw_sp1_get_stats(struct mlxsw_sp_port *mlxsw_sp_port,
+				       u64 *data, int data_index)
+{
+}
 #endif
 
 static inline struct mlxsw_sp_ptp_clock *
@@ -171,6 +189,20 @@ static inline int mlxsw_sp2_ptp_get_ts_info(struct mlxsw_sp *mlxsw_sp,
 					    struct ethtool_ts_info *info)
 {
 	return mlxsw_sp_ptp_get_ts_info_noptp(info);
+}
+
+static inline int mlxsw_sp2_get_stats_count(void)
+{
+	return 0;
+}
+
+static inline void mlxsw_sp2_get_stats_strings(u8 **p)
+{
+}
+
+static inline void mlxsw_sp2_get_stats(struct mlxsw_sp_port *mlxsw_sp_port,
+				       u64 *data, int data_index)
+{
 }
 
 #endif

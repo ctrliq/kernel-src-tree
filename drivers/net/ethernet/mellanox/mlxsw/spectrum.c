@@ -173,6 +173,10 @@ struct mlxsw_sp_ptp_ops {
 			    struct hwtstamp_config *config);
 	int (*get_ts_info)(struct mlxsw_sp *mlxsw_sp,
 			   struct ethtool_ts_info *info);
+	int (*get_stats_count)(void);
+	void (*get_stats_strings)(u8 **p);
+	void (*get_stats)(struct mlxsw_sp_port *mlxsw_sp_port,
+			  u64 *data, int data_index);
 };
 
 static int mlxsw_sp_component_query(struct mlxfw_dev *mlxfw_dev,
@@ -2298,6 +2302,7 @@ static void mlxsw_sp_port_get_tc_strings(u8 **p, int tc)
 static void mlxsw_sp_port_get_strings(struct net_device *dev,
 				      u32 stringset, u8 *data)
 {
+	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
 	u8 *p = data;
 	int i;
 
@@ -2339,6 +2344,7 @@ static void mlxsw_sp_port_get_strings(struct net_device *dev,
 		for (i = 0; i < TC_MAX_QUEUE; i++)
 			mlxsw_sp_port_get_tc_strings(&p, i);
 
+		mlxsw_sp_port->mlxsw_sp->ptp_ops->get_stats_strings(&p);
 		break;
 	}
 }
@@ -2433,6 +2439,7 @@ static void __mlxsw_sp_port_get_stats(struct net_device *dev,
 static void mlxsw_sp_port_get_stats(struct net_device *dev,
 				    struct ethtool_stats *stats, u64 *data)
 {
+	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
 	int i, data_index = 0;
 
 	/* IEEE 802.3 Counters */
@@ -2473,13 +2480,21 @@ static void mlxsw_sp_port_get_stats(struct net_device *dev,
 					  data, data_index);
 		data_index += MLXSW_SP_PORT_HW_TC_STATS_LEN;
 	}
+
+	/* PTP counters */
+	mlxsw_sp_port->mlxsw_sp->ptp_ops->get_stats(mlxsw_sp_port,
+						    data, data_index);
+	data_index += mlxsw_sp_port->mlxsw_sp->ptp_ops->get_stats_count();
 }
 
 static int mlxsw_sp_port_get_sset_count(struct net_device *dev, int sset)
 {
+	struct mlxsw_sp_port *mlxsw_sp_port = netdev_priv(dev);
+
 	switch (sset) {
 	case ETH_SS_STATS:
-		return MLXSW_SP_PORT_ETHTOOL_STATS_LEN;
+		return MLXSW_SP_PORT_ETHTOOL_STATS_LEN +
+		       mlxsw_sp_port->mlxsw_sp->ptp_ops->get_stats_count();
 	default:
 		return -EOPNOTSUPP;
 	}
@@ -4607,6 +4622,9 @@ static const struct mlxsw_sp_ptp_ops mlxsw_sp1_ptp_ops = {
 	.hwtstamp_get	= mlxsw_sp1_ptp_hwtstamp_get,
 	.hwtstamp_set	= mlxsw_sp1_ptp_hwtstamp_set,
 	.get_ts_info	= mlxsw_sp1_ptp_get_ts_info,
+	.get_stats_count = mlxsw_sp1_get_stats_count,
+	.get_stats_strings = mlxsw_sp1_get_stats_strings,
+	.get_stats	= mlxsw_sp1_get_stats,
 };
 
 static const struct mlxsw_sp_ptp_ops mlxsw_sp2_ptp_ops = {
@@ -4619,6 +4637,9 @@ static const struct mlxsw_sp_ptp_ops mlxsw_sp2_ptp_ops = {
 	.hwtstamp_get	= mlxsw_sp2_ptp_hwtstamp_get,
 	.hwtstamp_set	= mlxsw_sp2_ptp_hwtstamp_set,
 	.get_ts_info	= mlxsw_sp2_ptp_get_ts_info,
+	.get_stats_count = mlxsw_sp2_get_stats_count,
+	.get_stats_strings = mlxsw_sp2_get_stats_strings,
+	.get_stats	= mlxsw_sp2_get_stats,
 };
 
 static int mlxsw_sp_netdevice_event(struct notifier_block *unused,
