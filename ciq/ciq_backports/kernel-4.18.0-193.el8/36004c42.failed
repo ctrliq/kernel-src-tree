@@ -1,0 +1,112 @@
+ASoC: Intel: Skylake: large_config_get overhaul
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [sound] ALSA: ASoC: Intel: Skylake: large_config_get overhaul (Jaroslav Kysela) [1738610]
+Rebuild_FUZZ: 94.00%
+commit-author Cezary Rojewski <cezary.rojewski@intel.com>
+commit 36004c42c761a6d95b867a4fbb9a955034e53351
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/36004c42.failed
+
+LARGE_CONFIG_GET is mainly used to retrieve requested module parameters
+but it may also carry TX payload with them. Update its implementation to
+account for both TX and RX data.
+First reply.header carries total payload size within data_off_sizefield.
+Make use of reply.header to realloc returned buffer with correct size.
+
+Failure of IPC request is permissive - error-payload may be returned, an
+informative data why GET for given param failed - and thus function
+should not collapse before entire processing is finished. Caller is
+responsible for checking returned payload and bytes parameters.
+
+	Signed-off-by: Cezary Rojewski <cezary.rojewski@intel.com>
+Link: https://lore.kernel.org/r/20190808181549.12521-3-cezary.rojewski@intel.com
+	Reviewed-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 36004c42c761a6d95b867a4fbb9a955034e53351)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/intel/skylake/skl-messages.c
+diff --cc sound/soc/intel/skylake/skl-messages.c
+index 7a9f212503ec,84f0e6f58eb5..000000000000
+--- a/sound/soc/intel/skylake/skl-messages.c
++++ b/sound/soc/intel/skylake/skl-messages.c
+@@@ -1399,5 -1386,5 +1400,9 @@@ int skl_get_module_params(struct skl_ss
+  	msg.param_data_size = size;
+  	msg.large_param_id = param_id;
+  
+++<<<<<<< HEAD
+ +	return skl_ipc_get_large_config(&ctx->ipc, &msg, params);
+++=======
++ 	return skl_ipc_get_large_config(&skl->ipc, &msg, &params, &bytes);
+++>>>>>>> 36004c42c761 (ASoC: Intel: Skylake: large_config_get overhaul)
+  }
+* Unmerged path sound/soc/intel/skylake/skl-messages.c
+diff --git a/sound/soc/intel/skylake/skl-sst-ipc.c b/sound/soc/intel/skylake/skl-sst-ipc.c
+index 19197f7d06cd..80d53b1d5597 100644
+--- a/sound/soc/intel/skylake/skl-sst-ipc.c
++++ b/sound/soc/intel/skylake/skl-sst-ipc.c
+@@ -969,12 +969,18 @@ int skl_ipc_set_large_config(struct sst_generic_ipc *ipc,
+ EXPORT_SYMBOL_GPL(skl_ipc_set_large_config);
+ 
+ int skl_ipc_get_large_config(struct sst_generic_ipc *ipc,
+-		struct skl_ipc_large_config_msg *msg, u32 *param)
++		struct skl_ipc_large_config_msg *msg,
++		u32 **payload, size_t *bytes)
+ {
+ 	struct skl_ipc_header header = {0};
+-	struct sst_ipc_message request = {0}, reply = {0};
++	struct sst_ipc_message request, reply = {0};
++	unsigned int *buf;
+ 	int ret;
+ 
++	reply.data = kzalloc(SKL_ADSP_W1_SZ, GFP_KERNEL);
++	if (!reply.data)
++		return -ENOMEM;
++
+ 	header.primary = IPC_MSG_TARGET(IPC_MOD_MSG);
+ 	header.primary |= IPC_MSG_DIR(IPC_MSG_REQUEST);
+ 	header.primary |= IPC_GLB_TYPE(IPC_MOD_LARGE_CONFIG_GET);
+@@ -986,13 +992,22 @@ int skl_ipc_get_large_config(struct sst_generic_ipc *ipc,
+ 	header.extension |= IPC_FINAL_BLOCK(1);
+ 	header.extension |= IPC_INITIAL_BLOCK(1);
+ 
+-	request.header = *(u64 *)(&header);
+-	reply.data = param;
+-	reply.size = msg->param_data_size;
++	request.header = *(u64 *)&header;
++	request.data = *payload;
++	request.size = *bytes;
++	reply.size = SKL_ADSP_W1_SZ;
++
+ 	ret = sst_ipc_tx_message_wait(ipc, request, &reply);
+ 	if (ret < 0)
+ 		dev_err(ipc->dev, "ipc: get large config fail, err: %d\n", ret);
+ 
++	reply.size = (reply.header >> 32) & IPC_DATA_OFFSET_SZ_MASK;
++	buf = krealloc(reply.data, reply.size, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++	*payload = buf;
++	*bytes = reply.size;
++
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(skl_ipc_get_large_config);
+diff --git a/sound/soc/intel/skylake/skl-sst-ipc.h b/sound/soc/intel/skylake/skl-sst-ipc.h
+index 9c31a48e99dd..de05201aec43 100644
+--- a/sound/soc/intel/skylake/skl-sst-ipc.h
++++ b/sound/soc/intel/skylake/skl-sst-ipc.h
+@@ -187,7 +187,8 @@ int skl_ipc_set_large_config(struct sst_generic_ipc *ipc,
+ 		struct skl_ipc_large_config_msg *msg, u32 *param);
+ 
+ int skl_ipc_get_large_config(struct sst_generic_ipc *ipc,
+-		struct skl_ipc_large_config_msg *msg, u32 *param);
++		struct skl_ipc_large_config_msg *msg,
++		u32 **payload, size_t *bytes);
+ 
+ int skl_sst_ipc_load_library(struct sst_generic_ipc *ipc,
+ 			u8 dma_id, u8 table_id, bool wait);
