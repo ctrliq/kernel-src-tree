@@ -1,0 +1,197 @@
+af_unix: Return errno instead of NULL in unix_create1().
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+commit f4bd73b5a950866f6c6fc98a7b684d307c5d586a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f4bd73b5.failed
+
+unix_create1() returns NULL on error, and the callers assume that it never
+fails for reasons other than out of memory.  So, the callers always return
+-ENOMEM when unix_create1() fails.
+
+However, it also returns NULL when the number of af_unix sockets exceeds
+twice the limit controlled by sysctl: fs.file-max.  In this case, the
+callers should return -ENFILE like alloc_empty_file().
+
+This patch changes unix_create1() to return the correct error value instead
+of NULL on error.
+
+Out of curiosity, the assumption has been wrong since 1999 due to this
+change introduced in 2.2.4 [0].
+
+  diff -u --recursive --new-file v2.2.3/linux/net/unix/af_unix.c linux/net/unix/af_unix.c
+  --- v2.2.3/linux/net/unix/af_unix.c	Tue Jan 19 11:32:53 1999
+  +++ linux/net/unix/af_unix.c	Sun Mar 21 07:22:00 1999
+  @@ -388,6 +413,9 @@
+   {
+   	struct sock *sk;
+
+  +	if (atomic_read(&unix_nr_socks) >= 2*max_files)
+  +		return NULL;
+  +
+   	MOD_INC_USE_COUNT;
+   	sk = sk_alloc(PF_UNIX, GFP_KERNEL, 1);
+   	if (!sk) {
+
+[0]: https://cdn.kernel.org/pub/linux/kernel/v2.2/patch-2.2.4.gz
+
+Fixes: 1da177e4c3f4 ("Linux-2.6.12-rc2")
+	Signed-off-by: Kuniyuki Iwashima <kuniyu@amazon.co.jp>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit f4bd73b5a950866f6c6fc98a7b684d307c5d586a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/unix/af_unix.c
+diff --cc net/unix/af_unix.c
+index b5680a4ac54a,f505b89bda6a..000000000000
+--- a/net/unix/af_unix.c
++++ b/net/unix/af_unix.c
+@@@ -746,26 -788,65 +746,41 @@@ static const struct proto_ops unix_seqp
+  	.mmap =		sock_no_mmap,
+  	.sendpage =	sock_no_sendpage,
+  	.set_peek_off =	unix_set_peek_off,
+ -	.show_fdinfo =	unix_show_fdinfo,
+  };
+  
+ -static void unix_close(struct sock *sk, long timeout)
+ -{
+ -	/* Nothing to do here, unix socket does not need a ->close().
+ -	 * This is merely for sockmap.
+ -	 */
+ -}
+ -
+ -static void unix_unhash(struct sock *sk)
+ -{
+ -	/* Nothing to do here, unix socket does not need a ->unhash().
+ -	 * This is merely for sockmap.
+ -	 */
+ -}
+ -
+ -struct proto unix_dgram_proto = {
+ -	.name			= "UNIX-DGRAM",
+ -	.owner			= THIS_MODULE,
+ -	.obj_size		= sizeof(struct unix_sock),
+ -	.close			= unix_close,
+ -#ifdef CONFIG_BPF_SYSCALL
+ -	.psock_update_sk_prot	= unix_dgram_bpf_update_proto,
+ -#endif
+ -};
+ -
+ -struct proto unix_stream_proto = {
+ -	.name			= "UNIX-STREAM",
+ +static struct proto unix_proto = {
+ +	.name			= "UNIX",
+  	.owner			= THIS_MODULE,
+  	.obj_size		= sizeof(struct unix_sock),
+ -	.close			= unix_close,
+ -	.unhash			= unix_unhash,
+ -#ifdef CONFIG_BPF_SYSCALL
+ -	.psock_update_sk_prot	= unix_stream_bpf_update_proto,
+ -#endif
+  };
+  
+ -static struct sock *unix_create1(struct net *net, struct socket *sock, int kern, int type)
+ +static struct sock *unix_create1(struct net *net, struct socket *sock, int kern)
+  {
+- 	struct sock *sk = NULL;
+  	struct unix_sock *u;
++ 	struct sock *sk;
++ 	int err;
+  
+  	atomic_long_inc(&unix_nr_socks);
+- 	if (atomic_long_read(&unix_nr_socks) > 2 * get_max_files())
+- 		goto out;
++ 	if (atomic_long_read(&unix_nr_socks) > 2 * get_max_files()) {
++ 		err = -ENFILE;
++ 		goto err;
++ 	}
+  
+++<<<<<<< HEAD
+ +	sk = sk_alloc(net, PF_UNIX, GFP_KERNEL, &unix_proto, kern);
+ +	if (!sk)
+ +		goto out;
+++=======
++ 	if (type == SOCK_STREAM)
++ 		sk = sk_alloc(net, PF_UNIX, GFP_KERNEL, &unix_stream_proto, kern);
++ 	else /*dgram and  seqpacket */
++ 		sk = sk_alloc(net, PF_UNIX, GFP_KERNEL, &unix_dgram_proto, kern);
++ 
++ 	if (!sk) {
++ 		err = -ENOMEM;
++ 		goto err;
++ 	}
+++>>>>>>> f4bd73b5a950 (af_unix: Return errno instead of NULL in unix_create1().)
+  
+  	sock_init_data(sock, sk);
+  
+@@@ -783,16 -864,18 +798,17 @@@
+  	mutex_init(&u->bindlock); /* single task binding lock */
+  	init_waitqueue_head(&u->peer_wait);
+  	init_waitqueue_func_entry(&u->peer_wake, unix_dgram_peer_wake_relay);
+ -	memset(&u->scm_stat, 0, sizeof(struct scm_stat));
+  	unix_insert_socket(unix_sockets_unbound(sk), sk);
+- out:
+- 	if (sk == NULL)
+- 		atomic_long_dec(&unix_nr_socks);
+- 	else {
+- 		local_bh_disable();
+- 		sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
+- 		local_bh_enable();
+- 	}
++ 
++ 	local_bh_disable();
++ 	sock_prot_inuse_add(sock_net(sk), sk->sk_prot, 1);
++ 	local_bh_enable();
++ 
+  	return sk;
++ 
++ err:
++ 	atomic_long_dec(&unix_nr_socks);
++ 	return ERR_PTR(err);
+  }
+  
+  static int unix_create(struct net *net, struct socket *sock, int protocol,
+@@@ -824,7 -909,11 +842,15 @@@
+  		return -ESOCKTNOSUPPORT;
+  	}
+  
+++<<<<<<< HEAD
+ +	return unix_create1(net, sock, kern) ? 0 : -ENOMEM;
+++=======
++ 	sk = unix_create1(net, sock, kern, sock->type);
++ 	if (IS_ERR(sk))
++ 		return PTR_ERR(sk);
++ 
++ 	return 0;
+++>>>>>>> f4bd73b5a950 (af_unix: Return errno instead of NULL in unix_create1().)
+  }
+  
+  static int unix_release(struct socket *sock)
+@@@ -1233,12 -1326,15 +1259,20 @@@ static int unix_stream_connect(struct s
+  	   we will have to recheck all again in any case.
+  	 */
+  
+- 	err = -ENOMEM;
+- 
+  	/* create new sock for complete connection */
+++<<<<<<< HEAD
+ +	newsk = unix_create1(sock_net(sk), NULL, 0);
+ +	if (newsk == NULL)
+++=======
++ 	newsk = unix_create1(sock_net(sk), NULL, 0, sock->type);
++ 	if (IS_ERR(newsk)) {
++ 		err = PTR_ERR(newsk);
++ 		newsk = NULL;
+++>>>>>>> f4bd73b5a950 (af_unix: Return errno instead of NULL in unix_create1().)
+  		goto out;
++ 	}
++ 
++ 	err = -ENOMEM;
+  
+  	/* Allocate skb for sending to listening sock */
+  	skb = sock_wmalloc(newsk, 1, 0, GFP_KERNEL);
+* Unmerged path net/unix/af_unix.c
