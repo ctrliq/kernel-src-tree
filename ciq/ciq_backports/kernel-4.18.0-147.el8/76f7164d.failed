@@ -1,0 +1,123 @@
+net/tls: free ctx in sock destruct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+Rebuild_CHGLOG: - [net] tls: free ctx in sock destruct (Sabrina Dubroca) [1711821]
+Rebuild_FUZZ: 93.75%
+commit-author Atul Gupta <atul.gupta@chelsio.com>
+commit 76f7164d02d4c596b396fc2e868276d1db3c5e1e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/76f7164d.failed
+
+free tls context in sock destruct. close may not be the last
+call to free sock but force releasing the ctx in close
+will result in GPF when ctx referred again in tcp_done
+
+[  515.330477] general protection fault: 0000 [#1] SMP PTI
+[  515.330539] CPU: 5 PID: 0 Comm: swapper/5 Not tainted 4.20.0-rc7+ #10
+[  515.330657] Hardware name: Supermicro X8ST3/X8ST3, BIOS 2.0b
+11/07/2013
+[  515.330844] RIP: 0010:tls_hw_unhash+0xbf/0xd0
+[
+[  515.332220] CS:  0010 DS: 0000 ES: 0000 CR0: 0000000080050033
+[  515.332340] CR2: 00007fab32c55000 CR3: 000000009261e000 CR4:
+00000000000006e0
+[  515.332519] Call Trace:
+[  515.332632]  <IRQ>
+[  515.332793]  tcp_set_state+0x5a/0x190
+[  515.332907]  ? tcp_update_metrics+0xe3/0x350
+[  515.333023]  tcp_done+0x31/0xd0
+[  515.333130]  tcp_rcv_state_process+0xc27/0x111a
+[  515.333242]  ? __lock_is_held+0x4f/0x90
+[  515.333350]  ? tcp_v4_do_rcv+0xaf/0x1e0
+[  515.333456]  tcp_v4_do_rcv+0xaf/0x1e0
+
+	Signed-off-by: Atul Gupta <atul.gupta@chelsio.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 76f7164d02d4c596b396fc2e868276d1db3c5e1e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/tls/tls_main.c
+diff --cc net/tls/tls_main.c
+index a3694e64e12d,d36d095cbcf0..000000000000
+--- a/net/tls/tls_main.c
++++ b/net/tls/tls_main.c
+@@@ -546,6 -555,43 +548,46 @@@ static struct tls_context *create_ctx(s
+  	return ctx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void tls_build_proto(struct sock *sk)
++ {
++ 	int ip_ver = sk->sk_family == AF_INET6 ? TLSV6 : TLSV4;
++ 
++ 	/* Build IPv6 TLS whenever the address of tcpv6 _prot changes */
++ 	if (ip_ver == TLSV6 &&
++ 	    unlikely(sk->sk_prot != smp_load_acquire(&saved_tcpv6_prot))) {
++ 		mutex_lock(&tcpv6_prot_mutex);
++ 		if (likely(sk->sk_prot != saved_tcpv6_prot)) {
++ 			build_protos(tls_prots[TLSV6], sk->sk_prot);
++ 			smp_store_release(&saved_tcpv6_prot, sk->sk_prot);
++ 		}
++ 		mutex_unlock(&tcpv6_prot_mutex);
++ 	}
++ 
++ 	if (ip_ver == TLSV4 &&
++ 	    unlikely(sk->sk_prot != smp_load_acquire(&saved_tcpv4_prot))) {
++ 		mutex_lock(&tcpv4_prot_mutex);
++ 		if (likely(sk->sk_prot != saved_tcpv4_prot)) {
++ 			build_protos(tls_prots[TLSV4], sk->sk_prot);
++ 			smp_store_release(&saved_tcpv4_prot, sk->sk_prot);
++ 		}
++ 		mutex_unlock(&tcpv4_prot_mutex);
++ 	}
++ }
++ 
++ static void tls_hw_sk_destruct(struct sock *sk)
++ {
++ 	struct tls_context *ctx = tls_get_ctx(sk);
++ 	struct inet_connection_sock *icsk = inet_csk(sk);
++ 
++ 	ctx->sk_destruct(sk);
++ 	/* Free ctx */
++ 	kfree(ctx);
++ 	icsk->icsk_ulp_data = NULL;
++ }
++ 
+++>>>>>>> 76f7164d02d4 (net/tls: free ctx in sock destruct)
+  static int tls_hw_prot(struct sock *sk)
+  {
+  	struct tls_context *ctx;
+diff --git a/drivers/crypto/chelsio/chtls/chtls_cm.c b/drivers/crypto/chelsio/chtls/chtls_cm.c
+index 629a1b3c519d..5300d810ecb6 100644
+--- a/drivers/crypto/chelsio/chtls/chtls_cm.c
++++ b/drivers/crypto/chelsio/chtls/chtls_cm.c
+@@ -23,6 +23,7 @@
+ #include <linux/if_vlan.h>
+ #include <net/tcp.h>
+ #include <net/dst.h>
++#include <net/tls.h>
+ 
+ #include "chtls.h"
+ #include "chtls_cm.h"
+@@ -1017,6 +1018,7 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
+ 	const struct tcphdr *tcph;
+ 	struct inet_sock *newinet;
+ 	const struct iphdr *iph;
++	struct tls_context *ctx;
+ 	struct net_device *ndev;
+ 	struct chtls_sock *csk;
+ 	struct dst_entry *dst;
+@@ -1066,6 +1068,8 @@ static struct sock *chtls_recv_sock(struct sock *lsk,
+ 
+ 	oreq->ts_recent = PASS_OPEN_TID_G(ntohl(req->tos_stid));
+ 	sk_setup_caps(newsk, dst);
++	ctx = tls_get_ctx(lsk);
++	newsk->sk_destruct = ctx->sk_destruct;
+ 	csk->sk = newsk;
+ 	csk->passive_reap_next = oreq;
+ 	csk->tx_chan = cxgb4_port_chan(ndev);
+* Unmerged path net/tls/tls_main.c
