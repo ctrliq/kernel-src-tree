@@ -1,0 +1,324 @@
+net: stmmac: make tc_flow_parsers static
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Ben Dooks (Codethink) <ben.dooks@codethink.co.uk>
+commit bad28d889caea00bc9415c59fa6a433a72eeaf5e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bad28d88.failed
+
+The tc_flow_parsers is not used outside of the driver, so
+make it static to avoid the following sparse warning:
+
+drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c:516:3: warning: symbol 'tc_flow_parsers' was not declared. Should it be static?
+
+	Signed-off-by: Ben Dooks <ben.dooks@codethink.co.uk>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit bad28d889caea00bc9415c59fa6a433a72eeaf5e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+index 9f686caafe62,f9a9a9d82233..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
+@@@ -289,6 -306,293 +289,296 @@@ static int tc_init(struct stmmac_priv *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int tc_setup_cbs(struct stmmac_priv *priv,
++ 			struct tc_cbs_qopt_offload *qopt)
++ {
++ 	u32 tx_queues_count = priv->plat->tx_queues_to_use;
++ 	u32 queue = qopt->queue;
++ 	u32 ptr, speed_div;
++ 	u32 mode_to_use;
++ 	u64 value;
++ 	int ret;
++ 
++ 	/* Queue 0 is not AVB capable */
++ 	if (queue <= 0 || queue >= tx_queues_count)
++ 		return -EINVAL;
++ 	if (!priv->dma_cap.av)
++ 		return -EOPNOTSUPP;
++ 	if (priv->speed != SPEED_100 && priv->speed != SPEED_1000)
++ 		return -EOPNOTSUPP;
++ 
++ 	mode_to_use = priv->plat->tx_queues_cfg[queue].mode_to_use;
++ 	if (mode_to_use == MTL_QUEUE_DCB && qopt->enable) {
++ 		ret = stmmac_dma_qmode(priv, priv->ioaddr, queue, MTL_QUEUE_AVB);
++ 		if (ret)
++ 			return ret;
++ 
++ 		priv->plat->tx_queues_cfg[queue].mode_to_use = MTL_QUEUE_AVB;
++ 	} else if (!qopt->enable) {
++ 		return stmmac_dma_qmode(priv, priv->ioaddr, queue, MTL_QUEUE_DCB);
++ 	}
++ 
++ 	/* Port Transmit Rate and Speed Divider */
++ 	ptr = (priv->speed == SPEED_100) ? 4 : 8;
++ 	speed_div = (priv->speed == SPEED_100) ? 100000 : 1000000;
++ 
++ 	/* Final adjustments for HW */
++ 	value = div_s64(qopt->idleslope * 1024ll * ptr, speed_div);
++ 	priv->plat->tx_queues_cfg[queue].idle_slope = value & GENMASK(31, 0);
++ 
++ 	value = div_s64(-qopt->sendslope * 1024ll * ptr, speed_div);
++ 	priv->plat->tx_queues_cfg[queue].send_slope = value & GENMASK(31, 0);
++ 
++ 	value = qopt->hicredit * 1024ll * 8;
++ 	priv->plat->tx_queues_cfg[queue].high_credit = value & GENMASK(31, 0);
++ 
++ 	value = qopt->locredit * 1024ll * 8;
++ 	priv->plat->tx_queues_cfg[queue].low_credit = value & GENMASK(31, 0);
++ 
++ 	ret = stmmac_config_cbs(priv, priv->hw,
++ 				priv->plat->tx_queues_cfg[queue].send_slope,
++ 				priv->plat->tx_queues_cfg[queue].idle_slope,
++ 				priv->plat->tx_queues_cfg[queue].high_credit,
++ 				priv->plat->tx_queues_cfg[queue].low_credit,
++ 				queue);
++ 	if (ret)
++ 		return ret;
++ 
++ 	dev_info(priv->device, "CBS queue %d: send %d, idle %d, hi %d, lo %d\n",
++ 			queue, qopt->sendslope, qopt->idleslope,
++ 			qopt->hicredit, qopt->locredit);
++ 	return 0;
++ }
++ 
++ static int tc_parse_flow_actions(struct stmmac_priv *priv,
++ 				 struct flow_action *action,
++ 				 struct stmmac_flow_entry *entry)
++ {
++ 	struct flow_action_entry *act;
++ 	int i;
++ 
++ 	if (!flow_action_has_entries(action))
++ 		return -EINVAL;
++ 
++ 	flow_action_for_each(i, act, action) {
++ 		switch (act->id) {
++ 		case FLOW_ACTION_DROP:
++ 			entry->action |= STMMAC_FLOW_ACTION_DROP;
++ 			return 0;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
++ 	/* Nothing to do, maybe inverse filter ? */
++ 	return 0;
++ }
++ 
++ static int tc_add_basic_flow(struct stmmac_priv *priv,
++ 			     struct flow_cls_offload *cls,
++ 			     struct stmmac_flow_entry *entry)
++ {
++ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++ 	struct flow_dissector *dissector = rule->match.dissector;
++ 	struct flow_match_basic match;
++ 
++ 	/* Nothing to do here */
++ 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_BASIC))
++ 		return -EINVAL;
++ 
++ 	flow_rule_match_basic(rule, &match);
++ 	entry->ip_proto = match.key->ip_proto;
++ 	return 0;
++ }
++ 
++ static int tc_add_ip4_flow(struct stmmac_priv *priv,
++ 			   struct flow_cls_offload *cls,
++ 			   struct stmmac_flow_entry *entry)
++ {
++ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++ 	struct flow_dissector *dissector = rule->match.dissector;
++ 	bool inv = entry->action & STMMAC_FLOW_ACTION_DROP;
++ 	struct flow_match_ipv4_addrs match;
++ 	u32 hw_match;
++ 	int ret;
++ 
++ 	/* Nothing to do here */
++ 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_IPV4_ADDRS))
++ 		return -EINVAL;
++ 
++ 	flow_rule_match_ipv4_addrs(rule, &match);
++ 	hw_match = ntohl(match.key->src) & ntohl(match.mask->src);
++ 	if (hw_match) {
++ 		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
++ 					      false, true, inv, hw_match);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	hw_match = ntohl(match.key->dst) & ntohl(match.mask->dst);
++ 	if (hw_match) {
++ 		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, true,
++ 					      false, false, inv, hw_match);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int tc_add_ports_flow(struct stmmac_priv *priv,
++ 			     struct flow_cls_offload *cls,
++ 			     struct stmmac_flow_entry *entry)
++ {
++ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++ 	struct flow_dissector *dissector = rule->match.dissector;
++ 	bool inv = entry->action & STMMAC_FLOW_ACTION_DROP;
++ 	struct flow_match_ports match;
++ 	u32 hw_match;
++ 	bool is_udp;
++ 	int ret;
++ 
++ 	/* Nothing to do here */
++ 	if (!dissector_uses_key(dissector, FLOW_DISSECTOR_KEY_PORTS))
++ 		return -EINVAL;
++ 
++ 	switch (entry->ip_proto) {
++ 	case IPPROTO_TCP:
++ 		is_udp = false;
++ 		break;
++ 	case IPPROTO_UDP:
++ 		is_udp = true;
++ 		break;
++ 	default:
++ 		return -EINVAL;
++ 	}
++ 
++ 	flow_rule_match_ports(rule, &match);
++ 
++ 	hw_match = ntohs(match.key->src) & ntohs(match.mask->src);
++ 	if (hw_match) {
++ 		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
++ 					      is_udp, true, inv, hw_match);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	hw_match = ntohs(match.key->dst) & ntohs(match.mask->dst);
++ 	if (hw_match) {
++ 		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, true,
++ 					      is_udp, false, inv, hw_match);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	entry->is_l4 = true;
++ 	return 0;
++ }
++ 
++ static struct stmmac_flow_entry *tc_find_flow(struct stmmac_priv *priv,
++ 					      struct flow_cls_offload *cls,
++ 					      bool get_free)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < priv->flow_entries_max; i++) {
++ 		struct stmmac_flow_entry *entry = &priv->flow_entries[i];
++ 
++ 		if (entry->cookie == cls->cookie)
++ 			return entry;
++ 		if (get_free && (entry->in_use == false))
++ 			return entry;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static struct {
++ 	int (*fn)(struct stmmac_priv *priv, struct flow_cls_offload *cls,
++ 		  struct stmmac_flow_entry *entry);
++ } tc_flow_parsers[] = {
++ 	{ .fn = tc_add_basic_flow },
++ 	{ .fn = tc_add_ip4_flow },
++ 	{ .fn = tc_add_ports_flow },
++ };
++ 
++ static int tc_add_flow(struct stmmac_priv *priv,
++ 		       struct flow_cls_offload *cls)
++ {
++ 	struct stmmac_flow_entry *entry = tc_find_flow(priv, cls, false);
++ 	struct flow_rule *rule = flow_cls_offload_flow_rule(cls);
++ 	int i, ret;
++ 
++ 	if (!entry) {
++ 		entry = tc_find_flow(priv, cls, true);
++ 		if (!entry)
++ 			return -ENOENT;
++ 	}
++ 
++ 	ret = tc_parse_flow_actions(priv, &rule->action, entry);
++ 	if (ret)
++ 		return ret;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(tc_flow_parsers); i++) {
++ 		ret = tc_flow_parsers[i].fn(priv, cls, entry);
++ 		if (!ret) {
++ 			entry->in_use = true;
++ 			continue;
++ 		}
++ 	}
++ 
++ 	if (!entry->in_use)
++ 		return -EINVAL;
++ 
++ 	entry->cookie = cls->cookie;
++ 	return 0;
++ }
++ 
++ static int tc_del_flow(struct stmmac_priv *priv,
++ 		       struct flow_cls_offload *cls)
++ {
++ 	struct stmmac_flow_entry *entry = tc_find_flow(priv, cls, false);
++ 	int ret;
++ 
++ 	if (!entry || !entry->in_use)
++ 		return -ENOENT;
++ 
++ 	if (entry->is_l4) {
++ 		ret = stmmac_config_l4_filter(priv, priv->hw, entry->idx, false,
++ 					      false, false, false, 0);
++ 	} else {
++ 		ret = stmmac_config_l3_filter(priv, priv->hw, entry->idx, false,
++ 					      false, false, false, 0);
++ 	}
++ 
++ 	entry->in_use = false;
++ 	entry->cookie = 0;
++ 	entry->is_l4 = false;
++ 	return ret;
++ }
++ 
++ static int tc_setup_cls(struct stmmac_priv *priv,
++ 			struct flow_cls_offload *cls)
++ {
++ 	int ret = 0;
++ 
++ 	switch (cls->command) {
++ 	case FLOW_CLS_REPLACE:
++ 		ret = tc_add_flow(priv, cls);
++ 		break;
++ 	case FLOW_CLS_DESTROY:
++ 		ret = tc_del_flow(priv, cls);
++ 		break;
++ 	default:
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> bad28d889cae (net: stmmac: make tc_flow_parsers static)
+  const struct stmmac_tc_ops dwmac510_tc_ops = {
+  	.init = tc_init,
+  	.setup_cls_u32 = tc_setup_cls_u32,
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/stmmac_tc.c
