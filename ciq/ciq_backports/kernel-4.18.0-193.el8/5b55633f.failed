@@ -1,0 +1,367 @@
+s390/qeth: guard against runt packets
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [s390] qeth: guard against runt packets (Philipp Rudo) [1781085]
+Rebuild_FUZZ: 92.75%
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit 5b55633f20ee1bb253dc7d915ec2fd35fd865d5a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5b55633f.failed
+
+Depending on a packet's type, the RX path needs to access fields in the
+packet headers and thus requires a minimum packet length.
+Enforce this length when building the skb.
+
+On the other hand a single runt packet is no reason to drop the whole
+RX buffer. So just skip it, and continue processing on the next packet.
+
+Fixes: 4a71df50047f ("qeth: new qeth device driver")
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5b55633f20ee1bb253dc7d915ec2fd35fd865d5a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+#	drivers/s390/net/qeth_ethtool.c
+diff --cc drivers/s390/net/qeth_core.h
+index dcbcb3b4d38f,7cdebd2e329f..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -461,6 -465,57 +461,60 @@@ enum qeth_out_q_states 
+         QETH_OUT_Q_LOCKED_FLUSH,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define QETH_CARD_STAT_ADD(_c, _stat, _val)	((_c)->stats._stat += (_val))
++ #define QETH_CARD_STAT_INC(_c, _stat)		QETH_CARD_STAT_ADD(_c, _stat, 1)
++ 
++ #define QETH_TXQ_STAT_ADD(_q, _stat, _val)	((_q)->stats._stat += (_val))
++ #define QETH_TXQ_STAT_INC(_q, _stat)		QETH_TXQ_STAT_ADD(_q, _stat, 1)
++ 
++ struct qeth_card_stats {
++ 	u64 rx_bufs;
++ 	u64 rx_skb_csum;
++ 	u64 rx_sg_skbs;
++ 	u64 rx_sg_frags;
++ 	u64 rx_sg_alloc_page;
++ 
++ 	u64 rx_dropped_nomem;
++ 	u64 rx_dropped_notsupp;
++ 	u64 rx_dropped_runt;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 rx_packets;
++ 	u64 rx_bytes;
++ 	u64 rx_multicast;
++ 	u64 rx_length_errors;
++ 	u64 rx_frame_errors;
++ 	u64 rx_fifo_errors;
++ };
++ 
++ struct qeth_out_q_stats {
++ 	u64 bufs;
++ 	u64 bufs_pack;
++ 	u64 buf_elements;
++ 	u64 skbs_pack;
++ 	u64 skbs_sg;
++ 	u64 skbs_csum;
++ 	u64 skbs_tso;
++ 	u64 skbs_linearized;
++ 	u64 skbs_linearized_fail;
++ 	u64 tso_bytes;
++ 	u64 packing_mode_switch;
++ 	u64 stopped;
++ 	u64 completion_yield;
++ 	u64 completion_timer;
++ 
++ 	/* rtnl_link_stats64 */
++ 	u64 tx_packets;
++ 	u64 tx_bytes;
++ 	u64 tx_errors;
++ 	u64 tx_dropped;
++ };
++ 
++ #define QETH_TX_TIMER_USECS		500
++ 
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  struct qeth_qdio_out_q {
+  	struct qdio_buffer *qdio_bufs[QDIO_MAX_BUFFERS_PER_Q];
+  	struct qeth_qdio_out_buffer *bufs[QDIO_MAX_BUFFERS_PER_Q];
+diff --cc drivers/s390/net/qeth_core_main.c
+index a0c5702815af,7285484212de..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -5168,7 -5063,9 +5168,12 @@@ struct sk_buff *qeth_core_get_next_skb(
+  {
+  	struct qdio_buffer_element *element = *__element;
+  	struct qdio_buffer *buffer = qethbuffer->buffer;
++ 	unsigned int headroom, linear_len;
+  	int offset = *__offset;
+++<<<<<<< HEAD
+++=======
++ 	bool use_rx_sg = false;
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  	struct sk_buff *skb;
+  	int skb_len = 0;
+  	void *data_ptr;
+@@@ -5189,27 -5087,57 +5196,61 @@@
+  	switch ((*hdr)->hdr.l2.id) {
+  	case QETH_HEADER_TYPE_LAYER2:
+  		skb_len = (*hdr)->hdr.l2.pkt_length;
+++<<<<<<< HEAD
+++		break;
+++	case QETH_HEADER_TYPE_LAYER3:
+++		skb_len = (*hdr)->hdr.l3.length;
+++=======
++ 		linear_len = ETH_HLEN;
++ 		headroom = 0;
+  		break;
+  	case QETH_HEADER_TYPE_LAYER3:
+  		skb_len = (*hdr)->hdr.l3.length;
++ 		if (!IS_LAYER3(card)) {
++ 			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
++ 			goto walk_packet;
++ 		}
++ 
++ 		if ((*hdr)->hdr.l3.flags & QETH_HDR_PASSTHRU) {
++ 			linear_len = ETH_HLEN;
++ 			headroom = 0;
++ 			break;
++ 		}
++ 
++ 		if ((*hdr)->hdr.l3.flags & QETH_HDR_IPV6)
++ 			linear_len = sizeof(struct ipv6hdr);
++ 		else
++ 			linear_len = sizeof(struct iphdr);
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  		headroom = ETH_HLEN;
+  		break;
+  	case QETH_HEADER_TYPE_OSN:
+  		skb_len = (*hdr)->hdr.osn.pdu_length;
+++<<<<<<< HEAD
+++=======
++ 		if (!IS_OSN(card)) {
++ 			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
++ 			goto walk_packet;
++ 		}
++ 
++ 		linear_len = skb_len;
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  		headroom = sizeof(struct qeth_hdr);
+  		break;
+  	default:
+ -		if ((*hdr)->hdr.l2.id & QETH_HEADER_MASK_INVAL)
+ -			QETH_CARD_STAT_INC(card, rx_frame_errors);
+ -		else
+ -			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
+ -
+ -		/* Can't determine packet length, drop the whole buffer. */
+ -		return NULL;
+ +		break;
+  	}
+  
+- 	if (!skb_len)
+- 		return NULL;
++ 	if (skb_len < linear_len) {
++ 		QETH_CARD_STAT_INC(card, rx_dropped_runt);
++ 		goto walk_packet;
++ 	}
+  
+ -	use_rx_sg = (card->options.cq == QETH_CQ_ENABLED) ||
+ -		    ((skb_len >= card->options.rx_sg_cb) &&
+ -		     !atomic_read(&card->force_alloc_skb) &&
+ -		     !IS_OSN(card));
+ +	if (((skb_len >= card->options.rx_sg_cb) &&
+ +	     !IS_OSN(card) &&
+ +	     (!atomic_read(&card->force_alloc_skb))) ||
+ +	    (card->options.cq == QETH_CQ_ENABLED))
+ +		use_rx_sg = 1;
+  
+  	if (use_rx_sg && qethbuffer->rx_skb) {
+  		/* QETH_CQ_ENABLED only: */
+@@@ -6215,6 -6268,47 +6256,50 @@@ netdev_features_t qeth_features_check(s
+  }
+  EXPORT_SYMBOL_GPL(qeth_features_check);
+  
+++<<<<<<< HEAD
+++=======
++ void qeth_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
++ {
++ 	struct qeth_card *card = dev->ml_priv;
++ 	struct qeth_qdio_out_q *queue;
++ 	unsigned int i;
++ 
++ 	QETH_CARD_TEXT(card, 5, "getstat");
++ 
++ 	stats->rx_packets = card->stats.rx_packets;
++ 	stats->rx_bytes = card->stats.rx_bytes;
++ 	stats->rx_errors = card->stats.rx_length_errors +
++ 			   card->stats.rx_frame_errors +
++ 			   card->stats.rx_fifo_errors;
++ 	stats->rx_dropped = card->stats.rx_dropped_nomem +
++ 			    card->stats.rx_dropped_notsupp +
++ 			    card->stats.rx_dropped_runt;
++ 	stats->multicast = card->stats.rx_multicast;
++ 	stats->rx_length_errors = card->stats.rx_length_errors;
++ 	stats->rx_frame_errors = card->stats.rx_frame_errors;
++ 	stats->rx_fifo_errors = card->stats.rx_fifo_errors;
++ 
++ 	for (i = 0; i < card->qdio.no_out_queues; i++) {
++ 		queue = card->qdio.out_qs[i];
++ 
++ 		stats->tx_packets += queue->stats.tx_packets;
++ 		stats->tx_bytes += queue->stats.tx_bytes;
++ 		stats->tx_errors += queue->stats.tx_errors;
++ 		stats->tx_dropped += queue->stats.tx_dropped;
++ 	}
++ }
++ EXPORT_SYMBOL_GPL(qeth_get_stats64);
++ 
++ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
++ 			  u8 cast_type, struct net_device *sb_dev)
++ {
++ 	if (cast_type != RTN_UNICAST)
++ 		return QETH_IQD_MCAST_TXQ;
++ 	return QETH_IQD_MIN_UCAST_TXQ;
++ }
++ EXPORT_SYMBOL_GPL(qeth_iqd_select_queue);
++ 
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  int qeth_open(struct net_device *dev)
+  {
+  	struct qeth_card *card = dev->ml_priv;
+diff --cc drivers/s390/net/qeth_ethtool.c
+index 31474f66f6bf,ab59bc975719..000000000000
+--- a/drivers/s390/net/qeth_ethtool.c
++++ b/drivers/s390/net/qeth_ethtool.c
+@@@ -9,43 -9,88 +9,104 @@@
+  #include <linux/ethtool.h>
+  #include "qeth_core.h"
+  
+ -
+ -#define QETH_TXQ_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_out_q_stats, _stat) \
+ -}
+ -
+ -#define QETH_CARD_STAT(_name, _stat) { \
+ -	.name = _name, \
+ -	.offset = offsetof(struct qeth_card_stats, _stat) \
+ -}
+ -
+ -struct qeth_stats {
+ -	char name[ETH_GSTRING_LEN];
+ -	unsigned int offset;
+ +static struct {
+ +	const char str[ETH_GSTRING_LEN];
+ +} qeth_ethtool_stats_keys[] = {
+ +/*  0 */{"rx skbs"},
+ +	{"rx buffers"},
+ +	{"tx skbs"},
+ +	{"tx buffers"},
+ +	{"tx skbs no packing"},
+ +	{"tx buffers no packing"},
+ +	{"tx skbs packing"},
+ +	{"tx buffers packing"},
+ +	{"tx sg skbs"},
+ +	{"tx buffer elements"},
+ +/* 10 */{"rx sg skbs"},
+ +	{"rx sg frags"},
+ +	{"rx sg page allocs"},
+ +	{"tx large kbytes"},
+ +	{"tx large count"},
+ +	{"tx pk state ch n->p"},
+ +	{"tx pk state ch p->n"},
+ +	{"tx pk watermark low"},
+ +	{"tx pk watermark high"},
+ +	{"queue 0 buffer usage"},
+ +/* 20 */{"queue 1 buffer usage"},
+ +	{"queue 2 buffer usage"},
+ +	{"queue 3 buffer usage"},
+ +	{"tx csum"},
+ +	{"tx lin"},
+ +	{"tx linfail"},
+ +	{"rx csum"}
+  };
+  
+++<<<<<<< HEAD
+++=======
++ static const struct qeth_stats txq_stats[] = {
++ 	QETH_TXQ_STAT("IO buffers", bufs),
++ 	QETH_TXQ_STAT("IO buffer elements", buf_elements),
++ 	QETH_TXQ_STAT("packed IO buffers", bufs_pack),
++ 	QETH_TXQ_STAT("skbs", tx_packets),
++ 	QETH_TXQ_STAT("packed skbs", skbs_pack),
++ 	QETH_TXQ_STAT("SG skbs", skbs_sg),
++ 	QETH_TXQ_STAT("HW csum skbs", skbs_csum),
++ 	QETH_TXQ_STAT("TSO skbs", skbs_tso),
++ 	QETH_TXQ_STAT("linearized skbs", skbs_linearized),
++ 	QETH_TXQ_STAT("linearized+error skbs", skbs_linearized_fail),
++ 	QETH_TXQ_STAT("TSO bytes", tso_bytes),
++ 	QETH_TXQ_STAT("Packing mode switches", packing_mode_switch),
++ 	QETH_TXQ_STAT("Queue stopped", stopped),
++ 	QETH_TXQ_STAT("Completion yield", completion_yield),
++ 	QETH_TXQ_STAT("Completion timer", completion_timer),
++ };
++ 
++ static const struct qeth_stats card_stats[] = {
++ 	QETH_CARD_STAT("rx0 IO buffers", rx_bufs),
++ 	QETH_CARD_STAT("rx0 HW csum skbs", rx_skb_csum),
++ 	QETH_CARD_STAT("rx0 SG skbs", rx_sg_skbs),
++ 	QETH_CARD_STAT("rx0 SG page frags", rx_sg_frags),
++ 	QETH_CARD_STAT("rx0 SG page allocs", rx_sg_alloc_page),
++ 	QETH_CARD_STAT("rx0 dropped, no memory", rx_dropped_nomem),
++ 	QETH_CARD_STAT("rx0 dropped, bad format", rx_dropped_notsupp),
++ 	QETH_CARD_STAT("rx0 dropped, runt", rx_dropped_runt),
++ };
++ 
++ #define TXQ_STATS_LEN	ARRAY_SIZE(txq_stats)
++ #define CARD_STATS_LEN	ARRAY_SIZE(card_stats)
++ 
++ static void qeth_add_stat_data(u64 **dst, void *src,
++ 			       const struct qeth_stats stats[],
++ 			       unsigned int size)
++ {
++ 	unsigned int i;
++ 	char *stat;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		stat = (char *)src + stats[i].offset;
++ 		**dst = *(u64 *)stat;
++ 		(*dst)++;
++ 	}
++ }
++ 
++ static void qeth_add_stat_strings(u8 **data, const char *prefix,
++ 				  const struct qeth_stats stats[],
++ 				  unsigned int size)
++ {
++ 	unsigned int i;
++ 
++ 	for (i = 0; i < size; i++) {
++ 		snprintf(*data, ETH_GSTRING_LEN, "%s%s", prefix, stats[i].name);
++ 		*data += ETH_GSTRING_LEN;
++ 	}
++ }
++ 
+++>>>>>>> 5b55633f20ee (s390/qeth: guard against runt packets)
+  static int qeth_get_sset_count(struct net_device *dev, int stringset)
+  {
+ -	struct qeth_card *card = dev->ml_priv;
+ -
+  	switch (stringset) {
+  	case ETH_SS_STATS:
+ -		return CARD_STATS_LEN +
+ -		       card->qdio.no_out_queues * TXQ_STATS_LEN;
+ +		return (sizeof(qeth_ethtool_stats_keys) / ETH_GSTRING_LEN);
+  	default:
+  		return -EINVAL;
+  	}
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+* Unmerged path drivers/s390/net/qeth_ethtool.c
