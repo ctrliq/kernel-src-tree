@@ -1,0 +1,219 @@
+devlink: Fix reload stats structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Moshe Shemesh <moshe@mellanox.com>
+commit 5204bb683c1633e550c2124ccc2358dd645a80db
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/5204bb68.failed
+
+Fix reload stats structure exposed to the user. Change stats structure
+hierarchy to have the reload action as a parent of the stat entry and
+then stat entry includes value per limit. This will also help to avoid
+string concatenation on iproute2 output.
+
+Reload stats structure before this fix:
+"stats": {
+    "reload": {
+        "driver_reinit": 2,
+        "fw_activate": 1,
+        "fw_activate_no_reset": 0
+     }
+}
+
+After this fix:
+"stats": {
+    "reload": {
+        "driver_reinit": {
+            "unspecified": 2
+        },
+        "fw_activate": {
+            "unspecified": 1,
+            "no_reset": 0
+        }
+}
+
+Fixes: a254c264267e ("devlink: Add reload stats")
+	Signed-off-by: Moshe Shemesh <moshe@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+Link: https://lore.kernel.org/r/1606109785-25197-1-git-send-email-moshe@mellanox.com
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 5204bb683c1633e550c2124ccc2358dd645a80db)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/devlink.h
+#	net/core/devlink.c
+diff --cc include/uapi/linux/devlink.h
+index f2172c34975d,5203f54a2be1..000000000000
+--- a/include/uapi/linux/devlink.h
++++ b/include/uapi/linux/devlink.h
+@@@ -462,11 -510,24 +462,28 @@@ enum devlink_attr 
+  	DEVLINK_ATTR_PORT_LANES,			/* u32 */
+  	DEVLINK_ATTR_PORT_SPLITTABLE,			/* u8 */
+  
+ -	DEVLINK_ATTR_PORT_EXTERNAL,		/* u8 */
+ -	DEVLINK_ATTR_PORT_CONTROLLER_NUMBER,	/* u32 */
+ +	/* Not supported in RHEL, i adding reserved fields due to keep UAPI */
+ +	__RH_RESERVED_DEVLINK_ATTR_PORT_EXTERNAL,		/* u8 */
+ +	__RH_RESERVED_DEVLINK_ATTR_PORT_CONTROLLER_NUMBER,	/* u32 */
+  
+  	DEVLINK_ATTR_FLASH_UPDATE_STATUS_TIMEOUT,	/* u64 */
+++<<<<<<< HEAD
+++=======
++ 	DEVLINK_ATTR_FLASH_UPDATE_OVERWRITE_MASK,	/* bitfield32 */
++ 
++ 	DEVLINK_ATTR_RELOAD_ACTION,		/* u8 */
++ 	DEVLINK_ATTR_RELOAD_ACTIONS_PERFORMED,	/* bitfield32 */
++ 	DEVLINK_ATTR_RELOAD_LIMITS,		/* bitfield32 */
++ 
++ 	DEVLINK_ATTR_DEV_STATS,			/* nested */
++ 	DEVLINK_ATTR_RELOAD_STATS,		/* nested */
++ 	DEVLINK_ATTR_RELOAD_STATS_ENTRY,	/* nested */
++ 	DEVLINK_ATTR_RELOAD_STATS_LIMIT,	/* u8 */
++ 	DEVLINK_ATTR_RELOAD_STATS_VALUE,	/* u32 */
++ 	DEVLINK_ATTR_REMOTE_RELOAD_STATS,	/* nested */
++ 	DEVLINK_ATTR_RELOAD_ACTION_INFO,        /* nested */
++ 	DEVLINK_ATTR_RELOAD_ACTION_STATS,       /* nested */
+++>>>>>>> 5204bb683c16 (devlink: Fix reload stats structure)
+  
+  	/* add new attributes above here, update the policy in devlink.c */
+  
+diff --cc net/core/devlink.c
+index f205b9e289c8,c91e15b7a2bd..000000000000
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@@ -466,6 -479,127 +466,130 @@@ static int devlink_nl_put_handle(struc
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct devlink_reload_combination {
++ 	enum devlink_reload_action action;
++ 	enum devlink_reload_limit limit;
++ };
++ 
++ static const struct devlink_reload_combination devlink_reload_invalid_combinations[] = {
++ 	{
++ 		/* can't reinitialize driver with no down time */
++ 		.action = DEVLINK_RELOAD_ACTION_DRIVER_REINIT,
++ 		.limit = DEVLINK_RELOAD_LIMIT_NO_RESET,
++ 	},
++ };
++ 
++ static bool
++ devlink_reload_combination_is_invalid(enum devlink_reload_action action,
++ 				      enum devlink_reload_limit limit)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < ARRAY_SIZE(devlink_reload_invalid_combinations); i++)
++ 		if (devlink_reload_invalid_combinations[i].action == action &&
++ 		    devlink_reload_invalid_combinations[i].limit == limit)
++ 			return true;
++ 	return false;
++ }
++ 
++ static bool
++ devlink_reload_action_is_supported(struct devlink *devlink, enum devlink_reload_action action)
++ {
++ 	return test_bit(action, &devlink->ops->reload_actions);
++ }
++ 
++ static bool
++ devlink_reload_limit_is_supported(struct devlink *devlink, enum devlink_reload_limit limit)
++ {
++ 	return test_bit(limit, &devlink->ops->reload_limits);
++ }
++ 
++ static int devlink_reload_stat_put(struct sk_buff *msg,
++ 				   enum devlink_reload_limit limit, u32 value)
++ {
++ 	struct nlattr *reload_stats_entry;
++ 
++ 	reload_stats_entry = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_STATS_ENTRY);
++ 	if (!reload_stats_entry)
++ 		return -EMSGSIZE;
++ 
++ 	if (nla_put_u8(msg, DEVLINK_ATTR_RELOAD_STATS_LIMIT, limit) ||
++ 	    nla_put_u32(msg, DEVLINK_ATTR_RELOAD_STATS_VALUE, value))
++ 		goto nla_put_failure;
++ 	nla_nest_end(msg, reload_stats_entry);
++ 	return 0;
++ 
++ nla_put_failure:
++ 	nla_nest_cancel(msg, reload_stats_entry);
++ 	return -EMSGSIZE;
++ }
++ 
++ static int devlink_reload_stats_put(struct sk_buff *msg, struct devlink *devlink, bool is_remote)
++ {
++ 	struct nlattr *reload_stats_attr, *act_info, *act_stats;
++ 	int i, j, stat_idx;
++ 	u32 value;
++ 
++ 	if (!is_remote)
++ 		reload_stats_attr = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_STATS);
++ 	else
++ 		reload_stats_attr = nla_nest_start(msg, DEVLINK_ATTR_REMOTE_RELOAD_STATS);
++ 
++ 	if (!reload_stats_attr)
++ 		return -EMSGSIZE;
++ 
++ 	for (i = 0; i <= DEVLINK_RELOAD_ACTION_MAX; i++) {
++ 		if ((!is_remote &&
++ 		     !devlink_reload_action_is_supported(devlink, i)) ||
++ 		    i == DEVLINK_RELOAD_ACTION_UNSPEC)
++ 			continue;
++ 		act_info = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_ACTION_INFO);
++ 		if (!act_info)
++ 			goto nla_put_failure;
++ 
++ 		if (nla_put_u8(msg, DEVLINK_ATTR_RELOAD_ACTION, i))
++ 			goto action_info_nest_cancel;
++ 		act_stats = nla_nest_start(msg, DEVLINK_ATTR_RELOAD_ACTION_STATS);
++ 		if (!act_stats)
++ 			goto action_info_nest_cancel;
++ 
++ 		for (j = 0; j <= DEVLINK_RELOAD_LIMIT_MAX; j++) {
++ 			/* Remote stats are shown even if not locally supported.
++ 			 * Stats of actions with unspecified limit are shown
++ 			 * though drivers don't need to register unspecified
++ 			 * limit.
++ 			 */
++ 			if ((!is_remote && j != DEVLINK_RELOAD_LIMIT_UNSPEC &&
++ 			     !devlink_reload_limit_is_supported(devlink, j)) ||
++ 			    devlink_reload_combination_is_invalid(i, j))
++ 				continue;
++ 
++ 			stat_idx = j * __DEVLINK_RELOAD_ACTION_MAX + i;
++ 			if (!is_remote)
++ 				value = devlink->stats.reload_stats[stat_idx];
++ 			else
++ 				value = devlink->stats.remote_reload_stats[stat_idx];
++ 			if (devlink_reload_stat_put(msg, j, value))
++ 				goto action_stats_nest_cancel;
++ 		}
++ 		nla_nest_end(msg, act_stats);
++ 		nla_nest_end(msg, act_info);
++ 	}
++ 	nla_nest_end(msg, reload_stats_attr);
++ 	return 0;
++ 
++ action_stats_nest_cancel:
++ 	nla_nest_cancel(msg, act_stats);
++ action_info_nest_cancel:
++ 	nla_nest_cancel(msg, act_info);
++ nla_put_failure:
++ 	nla_nest_cancel(msg, reload_stats_attr);
++ 	return -EMSGSIZE;
++ }
++ 
+++>>>>>>> 5204bb683c16 (devlink: Fix reload stats structure)
+  static int devlink_nl_fill(struct sk_buff *msg, struct devlink *devlink,
+  			   enum devlink_command cmd, u32 portid,
+  			   u32 seq, int flags)
+* Unmerged path include/uapi/linux/devlink.h
+* Unmerged path net/core/devlink.c
