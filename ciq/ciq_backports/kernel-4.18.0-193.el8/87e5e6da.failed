@@ -1,0 +1,299 @@
+uio: make import_iovec()/compat_import_iovec() return bytes on success
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit 87e5e6dab6c2a21fab2620f37786276d202e2ce0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/87e5e6da.failed
+
+Currently these functions return < 0 on error, and 0 for success.
+Change that so that we return < 0 on error, but number of bytes
+for success.
+
+Some callers already treat the return value that way, others need a
+slight tweak.
+
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 87e5e6dab6c2a21fab2620f37786276d202e2ce0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/aio.c
+diff --cc fs/aio.c
+index 38f8d514060c,41824c710b36..000000000000
+--- a/fs/aio.c
++++ b/fs/aio.c
+@@@ -1430,14 -1477,11 +1430,20 @@@ static int aio_prep_rw(struct kiocb *re
+  
+  	req->ki_flags &= ~IOCB_HIPRI; /* no one is going to poll for this I/O */
+  	return 0;
+ +
+ +out_fput:
+ +	fput(req->ki_filp);
+ +	return ret;
+  }
+  
+++<<<<<<< HEAD
+ +static int aio_setup_rw(int rw, struct iocb *iocb, struct iovec **iovec,
+ +		bool vectored, bool compat, struct iov_iter *iter)
+++=======
++ static ssize_t aio_setup_rw(int rw, const struct iocb *iocb,
++ 		struct iovec **iovec, bool vectored, bool compat,
++ 		struct iov_iter *iter)
+++>>>>>>> 87e5e6dab6c2 (uio: make import_iovec()/compat_import_iovec() return bytes on success)
+  {
+  	void __user *buf = (void __user *)(uintptr_t)iocb->aio_buf;
+  	size_t len = iocb->aio_nbytes;
+@@@ -1487,17 -1531,15 +1493,22 @@@ static ssize_t aio_read(struct kiocb *r
+  	if (ret)
+  		return ret;
+  	file = req->ki_filp;
+ +
+ +	ret = -EBADF;
+  	if (unlikely(!(file->f_mode & FMODE_READ)))
+ -		return -EBADF;
+ +		goto out_fput;
+  	ret = -EINVAL;
+  	if (unlikely(!file->f_op->read_iter))
+ -		return -EINVAL;
+ +		goto out_fput;
+  
+  	ret = aio_setup_rw(READ, iocb, &iovec, vectored, compat, &iter);
+++<<<<<<< HEAD
+ +	if (ret)
+ +		goto out_fput;
+++=======
++ 	if (ret < 0)
++ 		return ret;
+++>>>>>>> 87e5e6dab6c2 (uio: make import_iovec()/compat_import_iovec() return bytes on success)
+  	ret = rw_verify_area(READ, file, &req->ki_pos, iov_iter_count(&iter));
+  	if (!ret)
+  		aio_rw_done(req, call_read_iter(file, req, &iter));
+@@@ -1521,16 -1560,14 +1532,21 @@@ static ssize_t aio_write(struct kiocb *
+  		return ret;
+  	file = req->ki_filp;
+  
+ +	ret = -EBADF;
+  	if (unlikely(!(file->f_mode & FMODE_WRITE)))
+ -		return -EBADF;
+ +		goto out_fput;
+ +	ret = -EINVAL;
+  	if (unlikely(!file->f_op->write_iter))
+ -		return -EINVAL;
+ +		goto out_fput;
+  
+  	ret = aio_setup_rw(WRITE, iocb, &iovec, vectored, compat, &iter);
+++<<<<<<< HEAD
+ +	if (ret)
+ +		goto out_fput;
+++=======
++ 	if (ret < 0)
++ 		return ret;
+++>>>>>>> 87e5e6dab6c2 (uio: make import_iovec()/compat_import_iovec() return bytes on success)
+  	ret = rw_verify_area(WRITE, file, &req->ki_pos, iov_iter_count(&iter));
+  	if (!ret) {
+  		/*
+* Unmerged path fs/aio.c
+diff --git a/fs/io_uring.c b/fs/io_uring.c
+index 8da4e80415da..888c41e5d5b5 100644
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@ -1000,9 +1000,9 @@ static int io_import_fixed(struct io_ring_ctx *ctx, int rw,
+ 	return 0;
+ }
+ 
+-static int io_import_iovec(struct io_ring_ctx *ctx, int rw,
+-			   const struct sqe_submit *s, struct iovec **iovec,
+-			   struct iov_iter *iter)
++static ssize_t io_import_iovec(struct io_ring_ctx *ctx, int rw,
++			       const struct sqe_submit *s, struct iovec **iovec,
++			       struct iov_iter *iter)
+ {
+ 	const struct io_uring_sqe *sqe = s->sqe;
+ 	void __user *buf = u64_to_user_ptr(READ_ONCE(sqe->addr));
+@@ -1020,7 +1020,7 @@ static int io_import_iovec(struct io_ring_ctx *ctx, int rw,
+ 	opcode = READ_ONCE(sqe->opcode);
+ 	if (opcode == IORING_OP_READ_FIXED ||
+ 	    opcode == IORING_OP_WRITE_FIXED) {
+-		int ret = io_import_fixed(ctx, rw, sqe, iter);
++		ssize_t ret = io_import_fixed(ctx, rw, sqe, iter);
+ 		*iovec = NULL;
+ 		return ret;
+ 	}
+@@ -1086,7 +1086,7 @@ static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+ 	struct iov_iter iter;
+ 	struct file *file;
+ 	size_t iov_count;
+-	int ret;
++	ssize_t ret;
+ 
+ 	ret = io_prep_rw(req, s, force_nonblock);
+ 	if (ret)
+@@ -1099,7 +1099,7 @@ static int io_read(struct io_kiocb *req, const struct sqe_submit *s,
+ 		return -EINVAL;
+ 
+ 	ret = io_import_iovec(req->ctx, READ, s, &iovec, &iter);
+-	if (ret)
++	if (ret < 0)
+ 		return ret;
+ 
+ 	iov_count = iov_iter_count(&iter);
+@@ -1133,7 +1133,7 @@ static int io_write(struct io_kiocb *req, const struct sqe_submit *s,
+ 	struct iov_iter iter;
+ 	struct file *file;
+ 	size_t iov_count;
+-	int ret;
++	ssize_t ret;
+ 
+ 	ret = io_prep_rw(req, s, force_nonblock);
+ 	if (ret)
+@@ -1146,7 +1146,7 @@ static int io_write(struct io_kiocb *req, const struct sqe_submit *s,
+ 		return -EINVAL;
+ 
+ 	ret = io_import_iovec(req->ctx, WRITE, s, &iovec, &iter);
+-	if (ret)
++	if (ret < 0)
+ 		return ret;
+ 
+ 	iov_count = iov_iter_count(&iter);
+diff --git a/fs/splice.c b/fs/splice.c
+index 558eeb9ace87..c0ab923a4bc3 100644
+--- a/fs/splice.c
++++ b/fs/splice.c
+@@ -1351,7 +1351,7 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
+ 	struct iov_iter iter;
+-	long error;
++	ssize_t error;
+ 	struct fd f;
+ 	int type;
+ 
+@@ -1362,7 +1362,7 @@ SYSCALL_DEFINE4(vmsplice, int, fd, const struct iovec __user *, uiov,
+ 
+ 	error = import_iovec(type, uiov, nr_segs,
+ 			     ARRAY_SIZE(iovstack), &iov, &iter);
+-	if (!error) {
++	if (error >= 0) {
+ 		error = do_vmsplice(f.file, &iter, flags);
+ 		kfree(iov);
+ 	}
+@@ -1377,7 +1377,7 @@ COMPAT_SYSCALL_DEFINE4(vmsplice, int, fd, const struct compat_iovec __user *, io
+ 	struct iovec iovstack[UIO_FASTIOV];
+ 	struct iovec *iov = iovstack;
+ 	struct iov_iter iter;
+-	long error;
++	ssize_t error;
+ 	struct fd f;
+ 	int type;
+ 
+@@ -1388,7 +1388,7 @@ COMPAT_SYSCALL_DEFINE4(vmsplice, int, fd, const struct compat_iovec __user *, io
+ 
+ 	error = compat_import_iovec(type, iov32, nr_segs,
+ 			     ARRAY_SIZE(iovstack), &iov, &iter);
+-	if (!error) {
++	if (error >= 0) {
+ 		error = do_vmsplice(f.file, &iter, flags);
+ 		kfree(iov);
+ 	}
+diff --git a/include/linux/uio.h b/include/linux/uio.h
+index bc2b9f6f90bf..a5925bfb9ee4 100644
+--- a/include/linux/uio.h
++++ b/include/linux/uio.h
+@@ -250,13 +250,13 @@ bool csum_and_copy_from_iter_full(void *addr, size_t bytes, __wsum *csum, struct
+ size_t hash_and_copy_to_iter(const void *addr, size_t bytes, void *hashp,
+ 		struct iov_iter *i);
+ 
+-int import_iovec(int type, const struct iovec __user * uvector,
++ssize_t import_iovec(int type, const struct iovec __user * uvector,
+ 		 unsigned nr_segs, unsigned fast_segs,
+ 		 struct iovec **iov, struct iov_iter *i);
+ 
+ #ifdef CONFIG_COMPAT
+ struct compat_iovec;
+-int compat_import_iovec(int type, const struct compat_iovec __user * uvector,
++ssize_t compat_import_iovec(int type, const struct compat_iovec __user * uvector,
+ 		 unsigned nr_segs, unsigned fast_segs,
+ 		 struct iovec **iov, struct iov_iter *i);
+ #endif
+diff --git a/lib/iov_iter.c b/lib/iov_iter.c
+index b7db915a24cc..f730ed378adf 100644
+--- a/lib/iov_iter.c
++++ b/lib/iov_iter.c
+@@ -1538,9 +1538,9 @@ EXPORT_SYMBOL(dup_iter);
+  * on-stack array was used or not (and regardless of whether this function
+  * returns an error or not).
+  *
+- * Return: 0 on success or negative error code on error.
++ * Return: Negative error code on error, bytes imported on success
+  */
+-int import_iovec(int type, const struct iovec __user * uvector,
++ssize_t import_iovec(int type, const struct iovec __user * uvector,
+ 		 unsigned nr_segs, unsigned fast_segs,
+ 		 struct iovec **iov, struct iov_iter *i)
+ {
+@@ -1556,16 +1556,17 @@ int import_iovec(int type, const struct iovec __user * uvector,
+ 	}
+ 	iov_iter_init(i, type, p, nr_segs, n);
+ 	*iov = p == *iov ? NULL : p;
+-	return 0;
++	return n;
+ }
+ EXPORT_SYMBOL(import_iovec);
+ 
+ #ifdef CONFIG_COMPAT
+ #include <linux/compat.h>
+ 
+-int compat_import_iovec(int type, const struct compat_iovec __user * uvector,
+-		 unsigned nr_segs, unsigned fast_segs,
+-		 struct iovec **iov, struct iov_iter *i)
++ssize_t compat_import_iovec(int type,
++		const struct compat_iovec __user * uvector,
++		unsigned nr_segs, unsigned fast_segs,
++		struct iovec **iov, struct iov_iter *i)
+ {
+ 	ssize_t n;
+ 	struct iovec *p;
+@@ -1579,7 +1580,7 @@ int compat_import_iovec(int type, const struct compat_iovec __user * uvector,
+ 	}
+ 	iov_iter_init(i, type, p, nr_segs, n);
+ 	*iov = p == *iov ? NULL : p;
+-	return 0;
++	return n;
+ }
+ #endif
+ 
+diff --git a/net/compat.c b/net/compat.c
+index 34e104add352..f44825efe279 100644
+--- a/net/compat.c
++++ b/net/compat.c
+@@ -79,9 +79,10 @@ int get_compat_msghdr(struct msghdr *kmsg,
+ 
+ 	kmsg->msg_iocb = NULL;
+ 
+-	return compat_import_iovec(save_addr ? READ : WRITE,
++	err = compat_import_iovec(save_addr ? READ : WRITE,
+ 				   compat_ptr(msg.msg_iov), msg.msg_iovlen,
+ 				   UIO_FASTIOV, iov, &kmsg->msg_iter);
++	return err < 0 ? err : 0;
+ }
+ 
+ /* Bleech... */
+diff --git a/net/socket.c b/net/socket.c
+index 90bc1424631d..07e24de0d246 100644
+--- a/net/socket.c
++++ b/net/socket.c
+@@ -2161,9 +2161,10 @@ static int copy_msghdr_from_user(struct msghdr *kmsg,
+ 
+ 	kmsg->msg_iocb = NULL;
+ 
+-	return import_iovec(save_addr ? READ : WRITE,
++	err = import_iovec(save_addr ? READ : WRITE,
+ 			    msg.msg_iov, msg.msg_iovlen,
+ 			    UIO_FASTIOV, iov, &kmsg->msg_iter);
++	return err < 0 ? err : 0;
+ }
+ 
+ static int ___sys_sendmsg(struct socket *sock, struct user_msghdr __user *msg,
