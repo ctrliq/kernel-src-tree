@@ -1,0 +1,236 @@
+KVM: Move wiping of the kvm->vcpus array to common code
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 27592ae8dbe41033261b6fdf27d78998aabd2665
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/27592ae8.failed
+
+All architectures have similar loops iterating over the vcpus,
+freeing one vcpu at a time, and eventually wiping the reference
+off the vcpus array. They are also inconsistently taking
+the kvm->lock mutex when wiping the references from the array.
+
+Make this code common, which will simplify further changes.
+The locking is dropped altogether, as this should only be called
+when there is no further references on the kvm structure.
+
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+Message-Id: <20211116160403.4074052-2-maz@kernel.org>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 27592ae8dbe41033261b6fdf27d78998aabd2665)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/kvm/arm.c
+#	arch/riscv/kvm/vm.c
+diff --cc arch/arm64/kvm/arm.c
+index c717141ce25d,362b10cb992c..000000000000
+--- a/arch/arm64/kvm/arm.c
++++ b/arch/arm64/kvm/arm.c
+@@@ -168,20 -175,11 +168,28 @@@ vm_fault_t kvm_arch_vcpu_fault(struct k
+   */
+  void kvm_arch_destroy_vm(struct kvm *kvm)
+  {
+++<<<<<<< HEAD
+ +	int i;
+ +
+ +	kvm_vgic_destroy(kvm);
+ +
+ +	free_percpu(kvm->arch.last_vcpu_ran);
+ +	kvm->arch.last_vcpu_ran = NULL;
+ +
+ +	for (i = 0; i < KVM_MAX_VCPUS; ++i) {
+ +		if (kvm->vcpus[i]) {
+ +			kvm_vcpu_destroy(kvm->vcpus[i]);
+ +			kvm->vcpus[i] = NULL;
+ +		}
+ +	}
+ +	atomic_set(&kvm->online_vcpus, 0);
+++=======
++ 	bitmap_free(kvm->arch.pmu_filter);
++ 
++ 	kvm_vgic_destroy(kvm);
++ 
++ 	kvm_destroy_vcpus(kvm);
+++>>>>>>> 27592ae8dbe4 (KVM: Move wiping of the kvm->vcpus array to common code)
+  }
+  
+  int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+* Unmerged path arch/riscv/kvm/vm.c
+* Unmerged path arch/arm64/kvm/arm.c
+diff --git a/arch/mips/kvm/mips.c b/arch/mips/kvm/mips.c
+index 33056cb2d37e..40d56afaf527 100644
+--- a/arch/mips/kvm/mips.c
++++ b/arch/mips/kvm/mips.c
+@@ -204,25 +204,6 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 	return 0;
+ }
+ 
+-void kvm_mips_free_vcpus(struct kvm *kvm)
+-{
+-	unsigned int i;
+-	struct kvm_vcpu *vcpu;
+-
+-	kvm_for_each_vcpu(i, vcpu, kvm) {
+-		kvm_vcpu_destroy(vcpu);
+-	}
+-
+-	mutex_lock(&kvm->lock);
+-
+-	for (i = 0; i < atomic_read(&kvm->online_vcpus); i++)
+-		kvm->vcpus[i] = NULL;
+-
+-	atomic_set(&kvm->online_vcpus, 0);
+-
+-	mutex_unlock(&kvm->lock);
+-}
+-
+ static void kvm_mips_free_gpa_pt(struct kvm *kvm)
+ {
+ 	/* It should always be safe to remove after flushing the whole range */
+@@ -232,7 +213,7 @@ static void kvm_mips_free_gpa_pt(struct kvm *kvm)
+ 
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+-	kvm_mips_free_vcpus(kvm);
++	kvm_destroy_vcpus(kvm);
+ 	kvm_mips_free_gpa_pt(kvm);
+ }
+ 
+diff --git a/arch/powerpc/kvm/powerpc.c b/arch/powerpc/kvm/powerpc.c
+index 98100c4b560f..0bfc40fc00e5 100644
+--- a/arch/powerpc/kvm/powerpc.c
++++ b/arch/powerpc/kvm/powerpc.c
+@@ -476,9 +476,6 @@ int kvm_arch_init_vm(struct kvm *kvm, unsigned long type)
+ 
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+-	unsigned int i;
+-	struct kvm_vcpu *vcpu;
+-
+ #ifdef CONFIG_KVM_XICS
+ 	/*
+ 	 * We call kick_all_cpus_sync() to ensure that all
+@@ -489,14 +486,9 @@ void kvm_arch_destroy_vm(struct kvm *kvm)
+ 		kick_all_cpus_sync();
+ #endif
+ 
+-	kvm_for_each_vcpu(i, vcpu, kvm)
+-		kvm_vcpu_destroy(vcpu);
++	kvm_destroy_vcpus(kvm);
+ 
+ 	mutex_lock(&kvm->lock);
+-	for (i = 0; i < atomic_read(&kvm->online_vcpus); i++)
+-		kvm->vcpus[i] = NULL;
+-
+-	atomic_set(&kvm->online_vcpus, 0);
+ 
+ 	kvmppc_core_destroy_vm(kvm);
+ 
+* Unmerged path arch/riscv/kvm/vm.c
+diff --git a/arch/s390/kvm/kvm-s390.c b/arch/s390/kvm/kvm-s390.c
+index d74a232fd87a..2b8eff471f65 100644
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@ -2766,27 +2766,11 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
+ 	free_page((unsigned long)(vcpu->arch.sie_block));
+ }
+ 
+-static void kvm_free_vcpus(struct kvm *kvm)
+-{
+-	unsigned int i;
+-	struct kvm_vcpu *vcpu;
+-
+-	kvm_for_each_vcpu(i, vcpu, kvm)
+-		kvm_vcpu_destroy(vcpu);
+-
+-	mutex_lock(&kvm->lock);
+-	for (i = 0; i < atomic_read(&kvm->online_vcpus); i++)
+-		kvm->vcpus[i] = NULL;
+-
+-	atomic_set(&kvm->online_vcpus, 0);
+-	mutex_unlock(&kvm->lock);
+-}
+-
+ void kvm_arch_destroy_vm(struct kvm *kvm)
+ {
+ 	u16 rc, rrc;
+ 
+-	kvm_free_vcpus(kvm);
++	kvm_destroy_vcpus(kvm);
+ 	sca_dispose(kvm);
+ 	kvm_s390_gisa_destroy(kvm);
+ 	/*
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index 91e139cea33b..9ab73d2c8a5c 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -11570,15 +11570,8 @@ static void kvm_free_vcpus(struct kvm *kvm)
+ 		kvm_clear_async_pf_completion_queue(vcpu);
+ 		kvm_unload_vcpu_mmu(vcpu);
+ 	}
+-	kvm_for_each_vcpu(i, vcpu, kvm)
+-		kvm_vcpu_destroy(vcpu);
+-
+-	mutex_lock(&kvm->lock);
+-	for (i = 0; i < atomic_read(&kvm->online_vcpus); i++)
+-		kvm->vcpus[i] = NULL;
+ 
+-	atomic_set(&kvm->online_vcpus, 0);
+-	mutex_unlock(&kvm->lock);
++	kvm_destroy_vcpus(kvm);
+ }
+ 
+ void kvm_arch_sync_events(struct kvm *kvm)
+diff --git a/include/linux/kvm_host.h b/include/linux/kvm_host.h
+index 470cdd19398b..d5db6871a520 100644
+--- a/include/linux/kvm_host.h
++++ b/include/linux/kvm_host.h
+@@ -681,7 +681,7 @@ static inline struct kvm_vcpu *kvm_get_vcpu_by_id(struct kvm *kvm, int id)
+ 		if (WARN_ON_ONCE(!memslot->npages)) {			\
+ 		} else
+ 
+-void kvm_vcpu_destroy(struct kvm_vcpu *vcpu);
++void kvm_destroy_vcpus(struct kvm *kvm);
+ 
+ void vcpu_load(struct kvm_vcpu *vcpu);
+ void vcpu_put(struct kvm_vcpu *vcpu);
+diff --git a/virt/kvm/kvm_main.c b/virt/kvm/kvm_main.c
+index 13b1084d09e4..9dd5befec040 100644
+--- a/virt/kvm/kvm_main.c
++++ b/virt/kvm/kvm_main.c
+@@ -455,7 +455,7 @@ static void kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
+ 	vcpu->last_used_slot = 0;
+ }
+ 
+-void kvm_vcpu_destroy(struct kvm_vcpu *vcpu)
++static void kvm_vcpu_destroy(struct kvm_vcpu *vcpu)
+ {
+ 	kvm_dirty_ring_free(&vcpu->dirty_ring);
+ 	kvm_arch_vcpu_destroy(vcpu);
+@@ -470,7 +470,20 @@ void kvm_vcpu_destroy(struct kvm_vcpu *vcpu)
+ 	free_page((unsigned long)vcpu->run);
+ 	kmem_cache_free(kvm_vcpu_cache, vcpu);
+ }
+-EXPORT_SYMBOL_GPL(kvm_vcpu_destroy);
++
++void kvm_destroy_vcpus(struct kvm *kvm)
++{
++	unsigned int i;
++	struct kvm_vcpu *vcpu;
++
++	kvm_for_each_vcpu(i, vcpu, kvm) {
++		kvm_vcpu_destroy(vcpu);
++		kvm->vcpus[i] = NULL;
++	}
++
++	atomic_set(&kvm->online_vcpus, 0);
++}
++EXPORT_SYMBOL_GPL(kvm_destroy_vcpus);
+ 
+ #if defined(CONFIG_MMU_NOTIFIER) && defined(KVM_ARCH_WANT_MMU_NOTIFIER)
+ static inline struct kvm *mmu_notifier_to_kvm(struct mmu_notifier *mn)
