@@ -1,0 +1,166 @@
+mt76: mt7921: fix inappropriate WoW setup with the missing ARP informaiton
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Sean Wang <sean.wang@mediatek.com>
+commit 9c9d83213424679b087267600d53a35acfa0201f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9c9d8321.failed
+
+Fix the Wake-on-WoWLAN failure should rely on ARP Information is being
+updated in time to the firmware.
+
+Fixes: ffa1bf97425b ("mt76: mt7921: introduce PM support")
+	Signed-off-by: Sean Wang <sean.wang@mediatek.com>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 9c9d83213424679b087267600d53a35acfa0201f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/main.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/main.c
+index f61698791235,32b1cd0bca1f..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/main.c
+@@@ -568,7 -623,13 +568,17 @@@ static void mt7921_bss_info_changed(str
+  	if (changed & BSS_CHANGED_PS)
+  		mt7921_mcu_uni_bss_ps(dev, vif);
+  
+++<<<<<<< HEAD
+ +	mutex_unlock(&dev->mt76.mutex);
+++=======
++ 	if (changed & BSS_CHANGED_ASSOC)
++ 		mt7921_bss_bcnft_apply(dev, vif, info->assoc);
++ 
++ 	if (changed & BSS_CHANGED_ARP_FILTER)
++ 		mt7921_mcu_update_arp_filter(hw, vif, info);
++ 
++ 	mt7921_mutex_release(dev);
+++>>>>>>> 9c9d83213424 (mt76: mt7921: fix inappropriate WoW setup with the missing ARP informaiton)
+  }
+  
+  int mt7921_mac_sta_add(struct mt76_dev *mdev, struct ieee80211_vif *vif,
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+index a931e8406c2a,353877f1c762..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+@@@ -2887,43 -1326,46 +2887,88 @@@ mt7921_mcu_key_iter(struct ieee80211_h
+  	}
+  }
+  
+++<<<<<<< HEAD
+ +int mt7921_mcu_update_gtk_rekey(struct ieee80211_hw *hw,
+ +				struct ieee80211_vif *vif,
+ +				struct cfg80211_gtk_rekey_data *key)
+ +{
+ +	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
+ +	struct mt7921_dev *dev = mt7921_hw_dev(hw);
+ +	struct mt7921_gtk_rekey_tlv *gtk_tlv;
+ +	struct sk_buff *skb;
+ +	struct {
+ +		u8 bss_idx;
+ +		u8 pad[3];
+ +	} __packed hdr = {
+ +		.bss_idx = mvif->mt76.idx,
+ +	};
+ +
+ +	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
+ +				 sizeof(hdr) + sizeof(*gtk_tlv));
+ +	if (!skb)
+ +		return -ENOMEM;
+ +
+ +	skb_put_data(skb, &hdr, sizeof(hdr));
+ +	gtk_tlv = (struct mt7921_gtk_rekey_tlv *)skb_put(skb,
+ +							 sizeof(*gtk_tlv));
+ +	gtk_tlv->tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_GTK_REKEY);
+ +	gtk_tlv->len = cpu_to_le16(sizeof(*gtk_tlv));
+ +	gtk_tlv->rekey_mode = 2;
+ +	gtk_tlv->option = 1;
+ +
+ +	rcu_read_lock();
+ +	ieee80211_iter_keys_rcu(hw, vif, mt7921_mcu_key_iter, gtk_tlv);
+ +	rcu_read_unlock();
+ +
+ +	memcpy(gtk_tlv->kek, key->kek, NL80211_KEK_LEN);
+ +	memcpy(gtk_tlv->kck, key->kck, NL80211_KCK_LEN);
+ +	memcpy(gtk_tlv->replay_ctr, key->replay_ctr, NL80211_REPLAY_CTR_LEN);
+++=======
++ int mt7921_mcu_update_arp_filter(struct ieee80211_hw *hw,
++ 				 struct ieee80211_vif *vif,
++ 				 struct ieee80211_bss_conf *info)
++ {
++ 	struct mt7921_vif *mvif = (struct mt7921_vif *)vif->drv_priv;
++ 	struct mt7921_dev *dev = mt7921_hw_dev(hw);
++ 	struct sk_buff *skb;
++ 	int i, len = min_t(int, info->arp_addr_cnt,
++ 			   IEEE80211_BSS_ARP_ADDR_LIST_LEN);
++ 	struct {
++ 		struct {
++ 			u8 bss_idx;
++ 			u8 pad[3];
++ 		} __packed hdr;
++ 		struct mt76_connac_arpns_tlv arp;
++ 	} req_hdr = {
++ 		.hdr = {
++ 			.bss_idx = mvif->mt76.idx,
++ 		},
++ 		.arp = {
++ 			.tag = cpu_to_le16(UNI_OFFLOAD_OFFLOAD_ARP),
++ 			.len = cpu_to_le16(sizeof(struct mt76_connac_arpns_tlv)),
++ 			.ips_num = len,
++ 			.mode = 2,  /* update */
++ 			.option = 1,
++ 		},
++ 	};
++ 
++ 	skb = mt76_mcu_msg_alloc(&dev->mt76, NULL,
++ 				 sizeof(req_hdr) + len * sizeof(__be32));
++ 	if (!skb)
++ 		return -ENOMEM;
++ 
++ 	skb_put_data(skb, &req_hdr, sizeof(req_hdr));
++ 	for (i = 0; i < len; i++) {
++ 		u8 *addr = (u8 *)skb_put(skb, sizeof(__be32));
++ 
++ 		memcpy(addr, &info->arp_addr_list[i], sizeof(__be32));
++ 	}
+++>>>>>>> 9c9d83213424 (mt76: mt7921: fix inappropriate WoW setup with the missing ARP informaiton)
+  
+  	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_UNI_CMD_OFFLOAD,
+  				     true);
+  }
+++<<<<<<< HEAD
+ +#endif /* CONFIG_PM */
+++=======
+++>>>>>>> 9c9d83213424 (mt76: mt7921: fix inappropriate WoW setup with the missing ARP informaiton)
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+index 2a7af97420c3,ebe51017dd55..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+@@@ -370,4 -338,17 +370,20 @@@ int mt7921_mcu_update_gtk_rekey(struct 
+  int mt7921_mcu_update_arp_filter(struct ieee80211_hw *hw,
+  				 struct ieee80211_vif *vif,
+  				 struct ieee80211_bss_conf *info);
+++<<<<<<< HEAD
+++=======
++ int mt7921_mcu_drv_pmctrl(struct mt7921_dev *dev);
++ int mt7921_mcu_fw_pmctrl(struct mt7921_dev *dev);
++ void mt7921_pm_wake_work(struct work_struct *work);
++ void mt7921_pm_power_save_work(struct work_struct *work);
++ bool mt7921_wait_for_mcu_init(struct mt7921_dev *dev);
++ int mt7921_mac_set_beacon_filter(struct mt7921_phy *phy,
++ 				 struct ieee80211_vif *vif,
++ 				 bool enable);
++ void mt7921_pm_interface_iter(void *priv, u8 *mac, struct ieee80211_vif *vif);
++ void mt7921_coredump_work(struct work_struct *work);
++ int mt7921_mcu_update_arp_filter(struct ieee80211_hw *hw,
++ 				 struct ieee80211_vif *vif,
++ 				 struct ieee80211_bss_conf *info);
+++>>>>>>> 9c9d83213424 (mt76: mt7921: fix inappropriate WoW setup with the missing ARP informaiton)
+  #endif
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/main.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mcu.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
