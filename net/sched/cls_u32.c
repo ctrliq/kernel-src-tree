@@ -957,8 +957,7 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
 		if (!new)
 			return -ENOMEM;
 
-		err = u32_set_parms(net, tp, base,
-				    rtnl_dereference(n->ht_up)->tp_c, new, tb,
+		err = u32_set_parms(net, tp, base, tp_c, new, tb,
 				    tca[TCA_RATE], ovr, extack);
 
 		if (err) {
@@ -1125,7 +1124,7 @@ static int u32_change(struct net *net, struct sk_buff *in_skb,
 	}
 #endif
 
-	err = u32_set_parms(net, tp, base, ht->tp_c, n, tb, tca[TCA_RATE], ovr,
+	err = u32_set_parms(net, tp, base, tp_c, n, tb, tca[TCA_RATE], ovr,
 			    extack);
 	if (err == 0) {
 		struct tc_u_knode __rcu **ins;
