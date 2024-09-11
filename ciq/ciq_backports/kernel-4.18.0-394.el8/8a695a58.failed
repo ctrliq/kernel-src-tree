@@ -1,0 +1,152 @@
+arm64: Kconfig: Remove ARCH_HAS_HOLES_MEMORYMODEL
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author James Morse <james.morse@arm.com>
+commit 8a695a5873339c2e7c746ee51e3774fedd07d0a9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/8a695a58.failed
+
+include/linux/mmzone.h describes ARCH_HAS_HOLES_MEMORYMODEL as
+relevant when parts the memmap have been free()d. This would
+happen on systems where memory is smaller than a sparsemem-section,
+and the extra struct pages are expensive. pfn_valid() on these
+systems returns true for the whole sparsemem-section, so an extra
+memmap_valid_within() check is needed.
+
+On arm64 we have nomap memory, so always provide pfn_valid() to test
+for nomap pages. This means ARCH_HAS_HOLES_MEMORYMODEL's extra checks
+are already rolled up into pfn_valid().
+
+Remove it.
+
+	Acked-by: Will Deacon <will.deacon@arm.com>
+	Signed-off-by: James Morse <james.morse@arm.com>
+	Signed-off-by: Catalin Marinas <catalin.marinas@arm.com>
+(cherry picked from commit 8a695a5873339c2e7c746ee51e3774fedd07d0a9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/Kconfig
+#	arch/arm64/mm/init.c
+diff --cc arch/arm64/Kconfig
+index 60bcc7d93948,da5e6f085561..000000000000
+--- a/arch/arm64/Kconfig
++++ b/arch/arm64/Kconfig
+@@@ -998,11 -766,10 +998,16 @@@ config NEED_PER_CPU_EMBED_FIRST_CHUN
+  config HOLES_IN_ZONE
+  	def_bool y
+  
+ +source kernel/Kconfig.preempt
+  source kernel/Kconfig.hz
+  
+++<<<<<<< HEAD
+ +config ARCH_HAS_HOLES_MEMORYMODEL
+ +	def_bool y if SPARSEMEM
+++=======
++ config ARCH_SUPPORTS_DEBUG_PAGEALLOC
++ 	def_bool y
+++>>>>>>> 8a695a587333 (arm64: Kconfig: Remove ARCH_HAS_HOLES_MEMORYMODEL)
+  
+  config ARCH_SPARSEMEM_ENABLE
+  	def_bool y
+@@@ -1014,8 -781,11 +1019,8 @@@ config ARCH_SPARSEMEM_DEFAUL
+  config ARCH_SELECT_MEMORY_MODEL
+  	def_bool ARCH_SPARSEMEM_ENABLE
+  
+ -config ARCH_FLATMEM_ENABLE
+ -	def_bool !NUMA
+ -
+  config HAVE_ARCH_PFN_VALID
+- 	def_bool ARCH_HAS_HOLES_MEMORYMODEL || !SPARSEMEM
++ 	def_bool y
+  
+  config HW_PERF_EVENTS
+  	def_bool y
+diff --cc arch/arm64/mm/init.c
+index 356355b85d3a,3cf87341859f..000000000000
+--- a/arch/arm64/mm/init.c
++++ b/arch/arm64/mm/init.c
+@@@ -232,15 -233,57 +232,62 @@@ static void __init zone_sizes_init(unsi
+  {
+  	unsigned long max_zone_pfns[MAX_NR_ZONES]  = {0};
+  
+ -	if (IS_ENABLED(CONFIG_ZONE_DMA32))
+ -		max_zone_pfns[ZONE_DMA32] = PFN_DOWN(max_zone_dma_phys());
+ +#ifdef CONFIG_ZONE_DMA32
+ +	max_zone_pfns[ZONE_DMA32] = PFN_DOWN(arm64_dma32_phys_limit);
+ +#endif
+  	max_zone_pfns[ZONE_NORMAL] = max;
+  
+ -	free_area_init_nodes(max_zone_pfns);
+ +	free_area_init(max_zone_pfns);
+  }
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_HAVE_ARCH_PFN_VALID
+++=======
++ #else
++ 
++ static void __init zone_sizes_init(unsigned long min, unsigned long max)
++ {
++ 	struct memblock_region *reg;
++ 	unsigned long zone_size[MAX_NR_ZONES], zhole_size[MAX_NR_ZONES];
++ 	unsigned long max_dma = min;
++ 
++ 	memset(zone_size, 0, sizeof(zone_size));
++ 
++ 	/* 4GB maximum for 32-bit only capable devices */
++ #ifdef CONFIG_ZONE_DMA32
++ 	max_dma = PFN_DOWN(arm64_dma_phys_limit);
++ 	zone_size[ZONE_DMA32] = max_dma - min;
++ #endif
++ 	zone_size[ZONE_NORMAL] = max - max_dma;
++ 
++ 	memcpy(zhole_size, zone_size, sizeof(zhole_size));
++ 
++ 	for_each_memblock(memory, reg) {
++ 		unsigned long start = memblock_region_memory_base_pfn(reg);
++ 		unsigned long end = memblock_region_memory_end_pfn(reg);
++ 
++ 		if (start >= max)
++ 			continue;
++ 
++ #ifdef CONFIG_ZONE_DMA32
++ 		if (start < max_dma) {
++ 			unsigned long dma_end = min(end, max_dma);
++ 			zhole_size[ZONE_DMA32] -= dma_end - start;
++ 		}
++ #endif
++ 		if (end > max_dma) {
++ 			unsigned long normal_end = min(end, max);
++ 			unsigned long normal_start = max(start, max_dma);
++ 			zhole_size[ZONE_NORMAL] -= normal_end - normal_start;
++ 		}
++ 	}
++ 
++ 	free_area_init_node(0, zone_size, min, zhole_size);
++ }
++ 
++ #endif /* CONFIG_NUMA */
++ 
+++>>>>>>> 8a695a587333 (arm64: Kconfig: Remove ARCH_HAS_HOLES_MEMORYMODEL)
+  int pfn_valid(unsigned long pfn)
+  {
+  	phys_addr_t addr = pfn << PAGE_SHIFT;
+* Unmerged path arch/arm64/Kconfig
+diff --git a/arch/arm64/include/asm/page.h b/arch/arm64/include/asm/page.h
+index 60d02c81a3a2..c88a3cb117a1 100644
+--- a/arch/arm64/include/asm/page.h
++++ b/arch/arm64/include/asm/page.h
+@@ -37,9 +37,7 @@ extern void clear_page(void *to);
+ 
+ typedef struct page *pgtable_t;
+ 
+-#ifdef CONFIG_HAVE_ARCH_PFN_VALID
+ extern int pfn_valid(unsigned long);
+-#endif
+ 
+ #include <asm/memory.h>
+ 
+* Unmerged path arch/arm64/mm/init.c
