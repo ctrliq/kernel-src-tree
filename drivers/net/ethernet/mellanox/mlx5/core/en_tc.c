@@ -2613,7 +2613,8 @@ static bool is_action_keys_supported(const struct flow_action_entry *act)
 	return false;
 }
 
-static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
+static bool modify_header_match_supported(struct mlx5e_priv *priv,
+					  struct mlx5_flow_spec *spec,
 					  struct flow_action *flow_action,
 					  u32 actions,
 					  struct netlink_ext_ack *extack)
@@ -2649,7 +2650,8 @@ static bool modify_header_match_supported(struct mlx5_flow_spec *spec,
 	    ip_proto != IPPROTO_UDP && ip_proto != IPPROTO_ICMP) {
 		NL_SET_ERR_MSG_MOD(extack,
 				   "can't offload re-write of non TCP/UDP");
-		pr_info("can't offload re-write of ip proto %d\n", ip_proto);
+		netdev_info(priv->netdev, "can't offload re-write of ip proto %d\n",
+			    ip_proto);
 		return false;
 	}
 
@@ -2687,7 +2689,7 @@ static bool actions_match_supported(struct mlx5e_priv *priv,
 	}
 
 	if (actions & MLX5_FLOW_CONTEXT_ACTION_MOD_HDR)
-		return modify_header_match_supported(&parse_attr->spec,
+		return modify_header_match_supported(priv, &parse_attr->spec,
 						     flow_action, actions,
 						     extack);
 
