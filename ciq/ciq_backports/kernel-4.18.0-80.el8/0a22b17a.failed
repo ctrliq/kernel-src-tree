@@ -1,0 +1,126 @@
+nfp: flower: add geneve option match offload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+commit 0a22b17a6b1ddb161fae7452faa892ba4d77ebe9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/0a22b17a.failed
+
+Introduce a new layer for matching on geneve options. This allows
+offloading filters configured to match geneve with options.
+
+	Signed-off-by: Pieter Jansen van Vuuren <pieter.jansenvanvuuren@netronome.com>
+	Signed-off-by: Simon Horman <simon.horman@netronome.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 0a22b17a6b1ddb161fae7452faa892ba4d77ebe9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/netronome/nfp/flower/offload.c
+diff --cc drivers/net/ethernet/netronome/nfp/flower/offload.c
+index 1616921f5a99,2edab01c3beb..000000000000
+--- a/drivers/net/ethernet/netronome/nfp/flower/offload.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/offload.c
+@@@ -66,6 -66,8 +66,11 @@@
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS) | \
+++<<<<<<< HEAD
+++=======
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_OPTS) | \
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_IP) | \
+++>>>>>>> 0a22b17a6b1d (nfp: flower: add geneve option match offload)
+  	 BIT(FLOW_DISSECTOR_KEY_MPLS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_IP))
+  
+@@@ -74,7 -76,9 +79,13 @@@
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_KEYID) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV4_ADDRS) | \
+  	 BIT(FLOW_DISSECTOR_KEY_ENC_IPV6_ADDRS) | \
+++<<<<<<< HEAD
+ +	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS))
+++=======
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_OPTS) | \
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_PORTS) | \
++ 	 BIT(FLOW_DISSECTOR_KEY_ENC_IP))
+++>>>>>>> 0a22b17a6b1d (nfp: flower: add geneve option match offload)
+  
+  #define NFP_FLOWER_WHITELIST_TUN_DISSECTOR_R \
+  	(BIT(FLOW_DISSECTOR_KEY_ENC_CONTROL) | \
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+index 32551df27c9d..18aa1a7bdeb0 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
++++ b/drivers/net/ethernet/netronome/nfp/flower/cmsg.h
+@@ -52,6 +52,7 @@
+ #define NFP_FLOWER_LAYER_VXLAN		BIT(7)
+ 
+ #define NFP_FLOWER_LAYER2_GENEVE	BIT(5)
++#define NFP_FLOWER_LAYER2_GENEVE_OP	BIT(6)
+ 
+ #define NFP_FLOWER_MASK_VLAN_PRIO	GENMASK(15, 13)
+ #define NFP_FLOWER_MASK_VLAN_CFI	BIT(12)
+@@ -85,6 +86,7 @@
+ /* Maximum allowed geneve options */
+ #define NFP_FL_MAX_GENEVE_OPT_ACT	32
+ #define NFP_FL_MAX_GENEVE_OPT_CNT	64
++#define NFP_FL_MAX_GENEVE_OPT_KEY	32
+ 
+ /* Action opcodes */
+ #define NFP_FL_ACTION_OPCODE_OUTPUT		0
+@@ -402,6 +404,10 @@ struct nfp_flower_ipv4_udp_tun {
+ 	__be32 tun_id;
+ };
+ 
++struct nfp_flower_geneve_options {
++	u8 data[NFP_FL_MAX_GENEVE_OPT_KEY];
++};
++
+ #define NFP_FL_TUN_VNI_OFFSET 8
+ 
+ /* The base header for a control message packet.
+diff --git a/drivers/net/ethernet/netronome/nfp/flower/match.c b/drivers/net/ethernet/netronome/nfp/flower/match.c
+index 84f7a5dbea9d..414ad241d287 100644
+--- a/drivers/net/ethernet/netronome/nfp/flower/match.c
++++ b/drivers/net/ethernet/netronome/nfp/flower/match.c
+@@ -262,6 +262,21 @@ nfp_flower_compile_ipv6(struct nfp_flower_ipv6 *frame,
+ 	nfp_flower_compile_ip_ext(&frame->ip_ext, flow, mask_version);
+ }
+ 
++static int
++nfp_flower_compile_geneve_opt(void *key_buf, struct tc_cls_flower_offload *flow,
++			      bool mask_version)
++{
++	struct fl_flow_key *target = mask_version ? flow->mask : flow->key;
++	struct flow_dissector_key_enc_opts *opts;
++
++	opts = skb_flow_dissector_target(flow->dissector,
++					 FLOW_DISSECTOR_KEY_ENC_OPTS,
++					 target);
++	memcpy(key_buf, opts->data, opts->len);
++
++	return 0;
++}
++
+ static void
+ nfp_flower_compile_ipv4_udp_tun(struct nfp_flower_ipv4_udp_tun *frame,
+ 				struct tc_cls_flower_offload *flow,
+@@ -415,6 +430,16 @@ int nfp_flower_compile_flow_match(struct tc_cls_flower_offload *flow,
+ 			nfp_flow->nfp_tun_ipv4_addr = tun_dst;
+ 			nfp_tunnel_add_ipv4_off(netdev_repr->app, tun_dst);
+ 		}
++
++		if (key_ls->key_layer_two & NFP_FLOWER_LAYER2_GENEVE_OP) {
++			err = nfp_flower_compile_geneve_opt(ext, flow, false);
++			if (err)
++				return err;
++
++			err = nfp_flower_compile_geneve_opt(msk, flow, true);
++			if (err)
++				return err;
++		}
+ 	}
+ 
+ 	return 0;
+* Unmerged path drivers/net/ethernet/netronome/nfp/flower/offload.c
