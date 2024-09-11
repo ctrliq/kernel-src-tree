@@ -1,0 +1,202 @@
+bpf: Introduce bpf_skb_ancestor_cgroup_id helper
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Andrey Ignatov <rdna@fb.com>
+commit 7723628101aaeb1d723786747529b4ea65c5b5c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/77236281.failed
+
+== Problem description ==
+
+It's useful to be able to identify cgroup associated with skb in TC so
+that a policy can be applied to this skb, and existing bpf_skb_cgroup_id
+helper can help with this.
+
+Though in real life cgroup hierarchy and hierarchy to apply a policy to
+don't map 1:1.
+
+It's often the case that there is a container and corresponding cgroup,
+but there are many more sub-cgroups inside container, e.g. because it's
+delegated to containerized application to control resources for its
+subsystems, or to separate application inside container from infra that
+belongs to containerization system (e.g. sshd).
+
+At the same time it may be useful to apply a policy to container as a
+whole.
+
+If multiple containers like this are run on a host (what is often the
+case) and many of them have sub-cgroups, it may not be possible to apply
+per-container policy in TC with existing helpers such as
+bpf_skb_under_cgroup or bpf_skb_cgroup_id:
+
+* bpf_skb_cgroup_id will return id of immediate cgroup associated with
+  skb, i.e. if it's a sub-cgroup inside container, it can't be used to
+  identify container's cgroup;
+
+* bpf_skb_under_cgroup can work only with one cgroup and doesn't scale,
+  i.e. if there are N containers on a host and a policy has to be
+  applied to M of them (0 <= M <= N), it'd require M calls to
+  bpf_skb_under_cgroup, and, if M changes, it'd require to rebuild &
+  load new BPF program.
+
+== Solution ==
+
+The patch introduces new helper bpf_skb_ancestor_cgroup_id that can be
+used to get id of cgroup v2 that is an ancestor of cgroup associated
+with skb at specified level of cgroup hierarchy.
+
+That way admin can place all containers on one level of cgroup hierarchy
+(what is a good practice in general and already used in many
+configurations) and identify specific cgroup on this level no matter
+what sub-cgroup skb is associated with.
+
+E.g. if there is a cgroup hierarchy:
+  root/
+  root/container1/
+  root/container1/app11/
+  root/container1/app11/sub-app-a/
+  root/container1/app12/
+  root/container2/
+  root/container2/app21/
+  root/container2/app22/
+  root/container2/app22/sub-app-b/
+
+, then having skb associated with root/container1/app11/sub-app-a/ it's
+possible to get ancestor at level 1, what is container1 and apply policy
+for this container, or apply another policy if it's container2.
+
+Policies can be kept e.g. in a hash map where key is a container cgroup
+id and value is an action.
+
+Levels where container cgroups are created are usually known in advance
+whether cgroup hierarchy inside container may be hard to predict
+especially in case when its creation is delegated to containerized
+application.
+
+== Implementation details ==
+
+The helper gets ancestor by walking parents up to specified level.
+
+Another option would be to get different kind of "id" from
+cgroup->ancestor_ids[level] and use it with idr_find() to get struct
+cgroup for ancestor. But that would require radix lookup what doesn't
+seem to be better (at least it's not obviously better).
+
+Format of return value of the new helper is same as that of
+bpf_skb_cgroup_id.
+
+	Signed-off-by: Andrey Ignatov <rdna@fb.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+(cherry picked from commit 7723628101aaeb1d723786747529b4ea65c5b5c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index 4bb4aa8c40e5,66917a4eba27..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -2200,7 -2224,9 +2218,13 @@@ union bpf_attr 
+  	FN(rc_keydown),			\
+  	FN(skb_cgroup_id),		\
+  	FN(get_current_cgroup_id),	\
+++<<<<<<< HEAD
+ +	FN(get_local_storage),
+++=======
++ 	FN(get_local_storage),		\
++ 	FN(sk_select_reuseport),	\
++ 	FN(skb_ancestor_cgroup_id),
+++>>>>>>> 7723628101aa (bpf: Introduce bpf_skb_ancestor_cgroup_id helper)
+  
+  /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+   * function eBPF program intends to call
+diff --git a/include/linux/cgroup.h b/include/linux/cgroup.h
+index 0c4d56acfdca..b8bcbdeb2eac 100644
+--- a/include/linux/cgroup.h
++++ b/include/linux/cgroup.h
+@@ -555,6 +555,36 @@ static inline bool cgroup_is_descendant(struct cgroup *cgrp,
+ 	return cgrp->ancestor_ids[ancestor->level] == ancestor->id;
+ }
+ 
++/**
++ * cgroup_ancestor - find ancestor of cgroup
++ * @cgrp: cgroup to find ancestor of
++ * @ancestor_level: level of ancestor to find starting from root
++ *
++ * Find ancestor of cgroup at specified level starting from root if it exists
++ * and return pointer to it. Return NULL if @cgrp doesn't have ancestor at
++ * @ancestor_level.
++ *
++ * This function is safe to call as long as @cgrp is accessible.
++ */
++static inline struct cgroup *cgroup_ancestor(struct cgroup *cgrp,
++					     int ancestor_level)
++{
++	struct cgroup *ptr;
++
++	if (cgrp->level < ancestor_level)
++		return NULL;
++
++	for (ptr = cgrp;
++	     ptr && ptr->level > ancestor_level;
++	     ptr = cgroup_parent(ptr))
++		;
++
++	if (ptr && ptr->level == ancestor_level)
++		return ptr;
++
++	return NULL;
++}
++
+ /**
+  * task_under_cgroup_hierarchy - test task's membership of cgroup ancestry
+  * @task: the task to be tested
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 9215221d9011..3db4ec9fe641 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -3765,6 +3765,32 @@ static const struct bpf_func_proto bpf_skb_cgroup_id_proto = {
+ 	.ret_type       = RET_INTEGER,
+ 	.arg1_type      = ARG_PTR_TO_CTX,
+ };
++
++BPF_CALL_2(bpf_skb_ancestor_cgroup_id, const struct sk_buff *, skb, int,
++	   ancestor_level)
++{
++	struct sock *sk = skb_to_full_sk(skb);
++	struct cgroup *ancestor;
++	struct cgroup *cgrp;
++
++	if (!sk || !sk_fullsock(sk))
++		return 0;
++
++	cgrp = sock_cgroup_ptr(&sk->sk_cgrp_data);
++	ancestor = cgroup_ancestor(cgrp, ancestor_level);
++	if (!ancestor)
++		return 0;
++
++	return ancestor->kn->id.id;
++}
++
++static const struct bpf_func_proto bpf_skb_ancestor_cgroup_id_proto = {
++	.func           = bpf_skb_ancestor_cgroup_id,
++	.gpl_only       = false,
++	.ret_type       = RET_INTEGER,
++	.arg1_type      = ARG_PTR_TO_CTX,
++	.arg2_type      = ARG_ANYTHING,
++};
+ #endif
+ 
+ static unsigned long bpf_xdp_copy(void *dst_buff, const void *src_buff,
+@@ -4939,6 +4965,8 @@ tc_cls_act_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
+ #ifdef CONFIG_SOCK_CGROUP_DATA
+ 	case BPF_FUNC_skb_cgroup_id:
+ 		return &bpf_skb_cgroup_id_proto;
++	case BPF_FUNC_skb_ancestor_cgroup_id:
++		return &bpf_skb_ancestor_cgroup_id_proto;
+ #endif
+ 	default:
+ 		return bpf_base_func_proto(func_id);
