@@ -205,7 +205,6 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 	struct mm_struct *mm;
 	unsigned long npages;
 	int ret;
-	unsigned long dma_attrs = 0;
 	struct scatterlist *sg;
 	unsigned int gup_flags = FOLL_WRITE;
 
@@ -216,9 +215,6 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 			  ->context;
 	if (!context)
 		return ERR_PTR(-EIO);
-
-	if (dmasync)
-		dma_attrs |= DMA_ATTR_WRITE_BARRIER;
 
 	/*
 	 * If the combination of the addr and size requested for this memory
@@ -317,11 +313,10 @@ struct ib_umem *ib_umem_get(struct ib_udata *udata, unsigned long addr,
 
 	sg_mark_end(sg);
 
-	umem->nmap = ib_dma_map_sg_attrs(context->device,
+	umem->nmap = ib_dma_map_sg(context->device,
 				  umem->sg_head.sgl,
 				  umem->sg_nents,
-				  DMA_BIDIRECTIONAL,
-				  dma_attrs);
+				  DMA_BIDIRECTIONAL);
 
 	if (!umem->nmap) {
 		ret = -ENOMEM;
