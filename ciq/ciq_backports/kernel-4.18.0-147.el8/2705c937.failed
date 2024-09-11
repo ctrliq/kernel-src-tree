@@ -1,0 +1,213 @@
+block: kill QUEUE_FLAG_NO_SG_MERGE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Ming Lei <ming.lei@redhat.com>
+commit 2705c93742e91730d335838025d75d8043861174
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/2705c937.failed
+
+Since bdced438acd83ad83a6c ("block: setup bi_phys_segments after splitting"),
+physical segment number is mainly figured out in blk_queue_split() for
+fast path, and the flag of BIO_SEG_VALID is set there too.
+
+Now only blk_recount_segments() and blk_recalc_rq_segments() use this
+flag.
+
+Basically blk_recount_segments() is bypassed in fast path given BIO_SEG_VALID
+is set in blk_queue_split().
+
+For another user of blk_recalc_rq_segments():
+
+- run in partial completion branch of blk_update_request, which is an unusual case
+
+- run in blk_cloned_rq_check_limits(), still not a big problem if the flag is killed
+since dm-rq is the only user.
+
+Multi-page bvec is enabled now, not doing S/G merging is rather pointless with the
+current setup of the I/O path, as it isn't going to save you a significant amount
+of cycles.
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Omar Sandoval <osandov@fb.com>
+	Signed-off-by: Ming Lei <ming.lei@redhat.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 2705c93742e91730d335838025d75d8043861174)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-merge.c
+#	include/linux/blkdev.h
+diff --cc block/blk-merge.c
+index 891d7bccde5b,bed065904677..000000000000
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@@ -291,12 -358,12 +291,11 @@@ void blk_queue_split(struct request_que
+  EXPORT_SYMBOL(blk_queue_split);
+  
+  static unsigned int __blk_recalc_rq_segments(struct request_queue *q,
+- 					     struct bio *bio,
+- 					     bool no_sg_merge)
++ 					     struct bio *bio)
+  {
+  	struct bio_vec bv, bvprv = { NULL };
+ -	int prev = 0;
+ +	int cluster, prev = 0;
+  	unsigned int seg_size, nr_phys_segs;
+ -	unsigned front_seg_size = bio->bi_seg_front_size;
+  	struct bio *fbio, *bbio;
+  	struct bvec_iter iter;
+  
+@@@ -317,15 -383,8 +316,20 @@@
+  	seg_size = 0;
+  	nr_phys_segs = 0;
+  	for_each_bio(bio) {
+++<<<<<<< HEAD
+ +		bio_for_each_segment(bv, bio, iter) {
+ +			/*
+ +			 * If SG merging is disabled, each bio vector is
+ +			 * a segment
+ +			 */
+ +			if (no_sg_merge)
+ +				goto new_segment;
+ +
+ +			if (prev && cluster) {
+++=======
++ 		bio_for_each_bvec(bv, bio, iter) {
++ 			if (prev) {
+++>>>>>>> 2705c93742e9 (block: kill QUEUE_FLAG_NO_SG_MERGE)
+  				if (seg_size + bv.bv_len
+  				    > queue_max_segment_size(q))
+  					goto new_segment;
+diff --cc include/linux/blkdev.h
+index e4cfc3fbcfc4,faed9d9eb84c..000000000000
+--- a/include/linux/blkdev.h
++++ b/include/linux/blkdev.h
+@@@ -583,38 -572,32 +583,67 @@@ struct request_queue 
+  	u64			write_hints[BLK_MAX_WRITE_HINTS];
+  };
+  
+++<<<<<<< HEAD
+ +#define QUEUE_FLAG_STOPPED	1	/* queue is stopped */
+ +#define QUEUE_FLAG_DYING	2	/* queue being torn down */
+ +#define QUEUE_FLAG_BIDI		4	/* queue supports bidi requests */
+ +#define QUEUE_FLAG_NOMERGES     5	/* disable merge attempts */
+ +#define QUEUE_FLAG_SAME_COMP	6	/* complete on same CPU-group */
+ +#define QUEUE_FLAG_FAIL_IO	7	/* fake timeout */
+ +#define QUEUE_FLAG_UNPRIV_SGIO  8	/* SG_IO free for unprivileged users */
+ +#define QUEUE_FLAG_NONROT	9	/* non-rotational device (SSD) */
+ +#define QUEUE_FLAG_VIRT        QUEUE_FLAG_NONROT /* paravirt device */
+ +#define QUEUE_FLAG_IO_STAT     10	/* do IO stats */
+ +#define QUEUE_FLAG_DISCARD     11	/* supports DISCARD */
+ +#define QUEUE_FLAG_NOXMERGES   12	/* No extended merges */
+ +#define QUEUE_FLAG_ADD_RANDOM  13	/* Contributes to random pool */
+ +#define QUEUE_FLAG_SECERASE    14	/* supports secure erase */
+ +#define QUEUE_FLAG_SAME_FORCE  15	/* force complete on same CPU */
+ +#define QUEUE_FLAG_DEAD        16	/* queue tear-down finished */
+ +#define QUEUE_FLAG_INIT_DONE   17	/* queue is initialized */
+ +#define QUEUE_FLAG_NO_SG_MERGE 18	/* don't attempt to merge SG segments*/
+ +#define QUEUE_FLAG_POLL	       19	/* IO polling enabled if set */
+ +#define QUEUE_FLAG_WC	       20	/* Write back caching */
+ +#define QUEUE_FLAG_FUA	       21	/* device supports FUA writes */
+ +#define QUEUE_FLAG_DAX         23	/* device supports DAX */
+ +#define QUEUE_FLAG_STATS       24	/* track rq completion times */
+ +#define QUEUE_FLAG_POLL_STATS  25	/* collecting stats for hybrid polling */
+ +#define QUEUE_FLAG_REGISTERED  26	/* queue has been registered to a disk */
+ +#define QUEUE_FLAG_SCSI_PASSTHROUGH 27	/* queue supports SCSI commands */
+ +#define QUEUE_FLAG_QUIESCED    28	/* queue has been quiesced */
+ +#define QUEUE_FLAG_PCI_P2PDMA  29	/* device supports PCI p2p requests */
+ +
+ +#define QUEUE_FLAG_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+ +				 (1 << QUEUE_FLAG_SAME_COMP)	|	\
+ +				 (1 << QUEUE_FLAG_ADD_RANDOM))
+++=======
++ #define QUEUE_FLAG_STOPPED	0	/* queue is stopped */
++ #define QUEUE_FLAG_DYING	1	/* queue being torn down */
++ #define QUEUE_FLAG_BIDI		2	/* queue supports bidi requests */
++ #define QUEUE_FLAG_NOMERGES     3	/* disable merge attempts */
++ #define QUEUE_FLAG_SAME_COMP	4	/* complete on same CPU-group */
++ #define QUEUE_FLAG_FAIL_IO	5	/* fake timeout */
++ #define QUEUE_FLAG_NONROT	6	/* non-rotational device (SSD) */
++ #define QUEUE_FLAG_VIRT		QUEUE_FLAG_NONROT /* paravirt device */
++ #define QUEUE_FLAG_IO_STAT	7	/* do disk/partitions IO accounting */
++ #define QUEUE_FLAG_DISCARD	8	/* supports DISCARD */
++ #define QUEUE_FLAG_NOXMERGES	9	/* No extended merges */
++ #define QUEUE_FLAG_ADD_RANDOM	10	/* Contributes to random pool */
++ #define QUEUE_FLAG_SECERASE	11	/* supports secure erase */
++ #define QUEUE_FLAG_SAME_FORCE	12	/* force complete on same CPU */
++ #define QUEUE_FLAG_DEAD		13	/* queue tear-down finished */
++ #define QUEUE_FLAG_INIT_DONE	14	/* queue is initialized */
++ #define QUEUE_FLAG_POLL		16	/* IO polling enabled if set */
++ #define QUEUE_FLAG_WC		17	/* Write back caching */
++ #define QUEUE_FLAG_FUA		18	/* device supports FUA writes */
++ #define QUEUE_FLAG_DAX		19	/* device supports DAX */
++ #define QUEUE_FLAG_STATS	20	/* track IO start and completion times */
++ #define QUEUE_FLAG_POLL_STATS	21	/* collecting stats for hybrid polling */
++ #define QUEUE_FLAG_REGISTERED	22	/* queue has been registered to a disk */
++ #define QUEUE_FLAG_SCSI_PASSTHROUGH 23	/* queue supports SCSI commands */
++ #define QUEUE_FLAG_QUIESCED	24	/* queue has been quiesced */
++ #define QUEUE_FLAG_PCI_P2PDMA	25	/* device supports PCI p2p requests */
+++>>>>>>> 2705c93742e9 (block: kill QUEUE_FLAG_NO_SG_MERGE)
+  
+  #define QUEUE_FLAG_MQ_DEFAULT	((1 << QUEUE_FLAG_IO_STAT) |		\
+  				 (1 << QUEUE_FLAG_SAME_COMP))
+* Unmerged path block/blk-merge.c
+diff --git a/block/blk-mq-debugfs.c b/block/blk-mq-debugfs.c
+index a1b945fc9378..fe0228939883 100644
+--- a/block/blk-mq-debugfs.c
++++ b/block/blk-mq-debugfs.c
+@@ -127,7 +127,6 @@ static const char *const blk_queue_flag_name[] = {
+ 	QUEUE_FLAG_NAME(SAME_FORCE),
+ 	QUEUE_FLAG_NAME(DEAD),
+ 	QUEUE_FLAG_NAME(INIT_DONE),
+-	QUEUE_FLAG_NAME(NO_SG_MERGE),
+ 	QUEUE_FLAG_NAME(POLL),
+ 	QUEUE_FLAG_NAME(WC),
+ 	QUEUE_FLAG_NAME(FUA),
+diff --git a/block/blk-mq.c b/block/blk-mq.c
+index 6eaec7025d6a..b7799daa4e4e 100644
+--- a/block/blk-mq.c
++++ b/block/blk-mq.c
+@@ -2872,9 +2872,6 @@ struct request_queue *blk_mq_init_allocated_queue(struct blk_mq_tag_set *set,
+ 	    set->map[HCTX_TYPE_POLL].nr_queues)
+ 		blk_queue_flag_set(QUEUE_FLAG_POLL, q);
+ 
+-	if (!(set->flags & BLK_MQ_F_SG_MERGE))
+-		blk_queue_flag_set(QUEUE_FLAG_NO_SG_MERGE, q);
+-
+ 	q->sg_reserved_size = INT_MAX;
+ 
+ 	INIT_DELAYED_WORK(&q->requeue_work, blk_mq_requeue_work);
+diff --git a/drivers/md/dm-table.c b/drivers/md/dm-table.c
+index 130e10945cfc..495fa3fc1345 100644
+--- a/drivers/md/dm-table.c
++++ b/drivers/md/dm-table.c
+@@ -1703,14 +1703,6 @@ static int device_is_not_random(struct dm_target *ti, struct dm_dev *dev,
+ 	return q && !blk_queue_add_random(q);
+ }
+ 
+-static int queue_supports_sg_merge(struct dm_target *ti, struct dm_dev *dev,
+-				   sector_t start, sector_t len, void *data)
+-{
+-	struct request_queue *q = bdev_get_queue(dev->bdev);
+-
+-	return q && !test_bit(QUEUE_FLAG_NO_SG_MERGE, &q->queue_flags);
+-}
+-
+ static bool dm_table_all_devices_attribute(struct dm_table *t,
+ 					   iterate_devices_callout_fn func)
+ {
+@@ -1907,11 +1899,6 @@ void dm_table_set_restrictions(struct dm_table *t, struct request_queue *q,
+ 	if (!dm_table_supports_write_zeroes(t))
+ 		q->limits.max_write_zeroes_sectors = 0;
+ 
+-	if (dm_table_all_devices_attribute(t, queue_supports_sg_merge))
+-		blk_queue_flag_clear(QUEUE_FLAG_NO_SG_MERGE, q);
+-	else
+-		blk_queue_flag_set(QUEUE_FLAG_NO_SG_MERGE, q);
+-
+ 	dm_table_verify_integrity(t);
+ 
+ 	/*
+* Unmerged path include/linux/blkdev.h
