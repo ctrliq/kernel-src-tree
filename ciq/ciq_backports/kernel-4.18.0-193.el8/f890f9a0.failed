@@ -1,0 +1,298 @@
+ALSA: firewire-lib: replace pointer callback to flush isoc contexts in AMDTP domain
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Takashi Sakamoto <o-takashi@sakamocchi.jp>
+commit f890f9a04b361b2209c38e3317e6290a98e6ff6e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/f890f9a0.failed
+
+An isoc context for AMDTP stream is flushed to queue packet
+by a call of pcm.pointer. This commit extends this for AMDTP
+domain.
+
+	Signed-off-by: Takashi Sakamoto <o-takashi@sakamocchi.jp>
+Link: https://lore.kernel.org/r/20191018061911.24909-3-o-takashi@sakamocchi.jp
+	Signed-off-by: Takashi Iwai <tiwai@suse.de>
+(cherry picked from commit f890f9a04b361b2209c38e3317e6290a98e6ff6e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/firewire/amdtp-stream.h
+diff --cc sound/firewire/amdtp-stream.h
+index 7032772c4f90,ba0bbeddfdcb..000000000000
+--- a/sound/firewire/amdtp-stream.h
++++ b/sound/firewire/amdtp-stream.h
+@@@ -270,4 -285,22 +269,25 @@@ struct amdtp_domain 
+  int amdtp_domain_init(struct amdtp_domain *d);
+  void amdtp_domain_destroy(struct amdtp_domain *d);
+  
+++<<<<<<< HEAD
+++=======
++ int amdtp_domain_add_stream(struct amdtp_domain *d, struct amdtp_stream *s,
++ 			    int channel, int speed);
++ 
++ int amdtp_domain_start(struct amdtp_domain *d);
++ void amdtp_domain_stop(struct amdtp_domain *d);
++ 
++ static inline int amdtp_domain_set_events_per_period(struct amdtp_domain *d,
++ 						unsigned int events_per_period,
++ 						unsigned int events_per_buffer)
++ {
++ 	d->events_per_period = events_per_period;
++ 	d->events_per_buffer = events_per_buffer;
++ 
++ 	return 0;
++ }
++ 
++ unsigned long amdtp_domain_stream_pcm_pointer(struct amdtp_domain *d,
++ 					      struct amdtp_stream *s);
+++>>>>>>> f890f9a04b36 (ALSA: firewire-lib: replace pointer callback to flush isoc contexts in AMDTP domain)
+  #endif
+diff --git a/sound/firewire/amdtp-stream.c b/sound/firewire/amdtp-stream.c
+index 6e1b83a082a2..48c097588051 100644
+--- a/sound/firewire/amdtp-stream.c
++++ b/sound/firewire/amdtp-stream.c
+@@ -999,35 +999,44 @@ static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
+ }
+ 
+ /**
+- * amdtp_stream_pcm_pointer - get the PCM buffer position
++ * amdtp_domain_stream_pcm_pointer - get the PCM buffer position
++ * @d: the AMDTP domain.
+  * @s: the AMDTP stream that transports the PCM data
+  *
+  * Returns the current buffer position, in frames.
+  */
+-unsigned long amdtp_stream_pcm_pointer(struct amdtp_stream *s)
++unsigned long amdtp_domain_stream_pcm_pointer(struct amdtp_domain *d,
++					      struct amdtp_stream *s)
+ {
+-	/*
+-	 * This function is called in software IRQ context of period_tasklet or
+-	 * process context.
+-	 *
+-	 * When the software IRQ context was scheduled by software IRQ context
+-	 * of IR/IT contexts, queued packets were already handled. Therefore,
+-	 * no need to flush the queue in buffer anymore.
+-	 *
+-	 * When the process context reach here, some packets will be already
+-	 * queued in the buffer. These packets should be handled immediately
+-	 * to keep better granularity of PCM pointer.
+-	 *
+-	 * Later, the process context will sometimes schedules software IRQ
+-	 * context of the period_tasklet. Then, no need to flush the queue by
+-	 * the same reason as described for IR/IT contexts.
+-	 */
+-	if (!in_interrupt() && amdtp_stream_running(s))
+-		fw_iso_context_flush_completions(s->context);
++	struct amdtp_stream *irq_target = d->irq_target;
++
++	if (irq_target && amdtp_stream_running(irq_target)) {
++		// This function is called in software IRQ context of
++		// period_tasklet or process context.
++		//
++		// When the software IRQ context was scheduled by software IRQ
++		// context of IT contexts, queued packets were already handled.
++		// Therefore, no need to flush the queue in buffer furthermore.
++		//
++		// When the process context reach here, some packets will be
++		// already queued in the buffer. These packets should be handled
++		// immediately to keep better granularity of PCM pointer.
++		//
++		// Later, the process context will sometimes schedules software
++		// IRQ context of the period_tasklet. Then, no need to flush the
++		// queue by the same reason as described in the above
++		if (!in_interrupt()) {
++			// Queued packet should be processed without any kernel
++			// preemption to keep latency against bus cycle.
++			preempt_disable();
++			fw_iso_context_flush_completions(irq_target->context);
++			preempt_enable();
++		}
++	}
+ 
+ 	return READ_ONCE(s->pcm_buffer_pointer);
+ }
+-EXPORT_SYMBOL(amdtp_stream_pcm_pointer);
++EXPORT_SYMBOL_GPL(amdtp_domain_stream_pcm_pointer);
+ 
+ /**
+  * amdtp_stream_pcm_ack - acknowledge queued PCM frames
+* Unmerged path sound/firewire/amdtp-stream.h
+diff --git a/sound/firewire/bebob/bebob_pcm.c b/sound/firewire/bebob/bebob_pcm.c
+index 516c9874f4a1..8c50f8bcc94d 100644
+--- a/sound/firewire/bebob/bebob_pcm.c
++++ b/sound/firewire/bebob/bebob_pcm.c
+@@ -303,17 +303,19 @@ pcm_playback_trigger(struct snd_pcm_substream *substream, int cmd)
+ 	return 0;
+ }
+ 
+-static snd_pcm_uframes_t
+-pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
++static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_bebob *bebob = sbstrm->private_data;
+-	return amdtp_stream_pcm_pointer(&bebob->tx_stream);
++
++	return amdtp_domain_stream_pcm_pointer(&bebob->domain,
++					       &bebob->tx_stream);
+ }
+-static snd_pcm_uframes_t
+-pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
++static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_bebob *bebob = sbstrm->private_data;
+-	return amdtp_stream_pcm_pointer(&bebob->rx_stream);
++
++	return amdtp_domain_stream_pcm_pointer(&bebob->domain,
++					       &bebob->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/dice/dice-pcm.c b/sound/firewire/dice/dice-pcm.c
+index 813c9ffbeced..cc0a2a161dee 100644
+--- a/sound/firewire/dice/dice-pcm.c
++++ b/sound/firewire/dice/dice-pcm.c
+@@ -365,14 +365,14 @@ static snd_pcm_uframes_t capture_pointer(struct snd_pcm_substream *substream)
+ 	struct snd_dice *dice = substream->private_data;
+ 	struct amdtp_stream *stream = &dice->tx_stream[substream->pcm->device];
+ 
+-	return amdtp_stream_pcm_pointer(stream);
++	return amdtp_domain_stream_pcm_pointer(&dice->domain, stream);
+ }
+ static snd_pcm_uframes_t playback_pointer(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_dice *dice = substream->private_data;
+ 	struct amdtp_stream *stream = &dice->rx_stream[substream->pcm->device];
+ 
+-	return amdtp_stream_pcm_pointer(stream);
++	return amdtp_domain_stream_pcm_pointer(&dice->domain, stream);
+ }
+ 
+ static int capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/digi00x/digi00x-pcm.c b/sound/firewire/digi00x/digi00x-pcm.c
+index 8dbfb3ff17f6..b5dd35c01bf6 100644
+--- a/sound/firewire/digi00x/digi00x-pcm.c
++++ b/sound/firewire/digi00x/digi00x-pcm.c
+@@ -291,14 +291,14 @@ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_dg00x *dg00x = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&dg00x->tx_stream);
++	return amdtp_domain_stream_pcm_pointer(&dg00x->domain, &dg00x->tx_stream);
+ }
+ 
+ static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_dg00x *dg00x = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&dg00x->rx_stream);
++	return amdtp_domain_stream_pcm_pointer(&dg00x->domain, &dg00x->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/fireface/ff-pcm.c b/sound/firewire/fireface/ff-pcm.c
+index 415bc9ccd1c7..864bb762655b 100644
+--- a/sound/firewire/fireface/ff-pcm.c
++++ b/sound/firewire/fireface/ff-pcm.c
+@@ -330,14 +330,14 @@ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_ff *ff = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&ff->tx_stream);
++	return amdtp_domain_stream_pcm_pointer(&ff->domain, &ff->tx_stream);
+ }
+ 
+ static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_ff *ff = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&ff->rx_stream);
++	return amdtp_domain_stream_pcm_pointer(&ff->domain, &ff->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/fireworks/fireworks_pcm.c b/sound/firewire/fireworks/fireworks_pcm.c
+index 314d1f8b8344..1485a851a667 100644
+--- a/sound/firewire/fireworks/fireworks_pcm.c
++++ b/sound/firewire/fireworks/fireworks_pcm.c
+@@ -338,12 +338,14 @@ static int pcm_playback_trigger(struct snd_pcm_substream *substream, int cmd)
+ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_efw *efw = sbstrm->private_data;
+-	return amdtp_stream_pcm_pointer(&efw->tx_stream);
++
++	return amdtp_domain_stream_pcm_pointer(&efw->domain, &efw->tx_stream);
+ }
+ static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_efw *efw = sbstrm->private_data;
+-	return amdtp_stream_pcm_pointer(&efw->rx_stream);
++
++	return amdtp_domain_stream_pcm_pointer(&efw->domain, &efw->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/motu/motu-pcm.c b/sound/firewire/motu/motu-pcm.c
+index 7bbf8b86a33d..22202776ed14 100644
+--- a/sound/firewire/motu/motu-pcm.c
++++ b/sound/firewire/motu/motu-pcm.c
+@@ -310,13 +310,13 @@ static snd_pcm_uframes_t capture_pointer(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_motu *motu = substream->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&motu->tx_stream);
++	return amdtp_domain_stream_pcm_pointer(&motu->domain, &motu->tx_stream);
+ }
+ static snd_pcm_uframes_t playback_pointer(struct snd_pcm_substream *substream)
+ {
+ 	struct snd_motu *motu = substream->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&motu->rx_stream);
++	return amdtp_domain_stream_pcm_pointer(&motu->domain, &motu->rx_stream);
+ }
+ 
+ static int capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/oxfw/oxfw-pcm.c b/sound/firewire/oxfw/oxfw-pcm.c
+index f3e25898d270..b971deb9a4dd 100644
+--- a/sound/firewire/oxfw/oxfw-pcm.c
++++ b/sound/firewire/oxfw/oxfw-pcm.c
+@@ -380,13 +380,13 @@ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstm)
+ {
+ 	struct snd_oxfw *oxfw = sbstm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&oxfw->tx_stream);
++	return amdtp_domain_stream_pcm_pointer(&oxfw->domain, &oxfw->tx_stream);
+ }
+ static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstm)
+ {
+ 	struct snd_oxfw *oxfw = sbstm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&oxfw->rx_stream);
++	return amdtp_domain_stream_pcm_pointer(&oxfw->domain, &oxfw->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
+diff --git a/sound/firewire/tascam/tascam-pcm.c b/sound/firewire/tascam/tascam-pcm.c
+index 6cd3a420fbdf..932d07fabe17 100644
+--- a/sound/firewire/tascam/tascam-pcm.c
++++ b/sound/firewire/tascam/tascam-pcm.c
+@@ -220,14 +220,14 @@ static snd_pcm_uframes_t pcm_capture_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_tscm *tscm = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&tscm->tx_stream);
++	return amdtp_domain_stream_pcm_pointer(&tscm->domain, &tscm->tx_stream);
+ }
+ 
+ static snd_pcm_uframes_t pcm_playback_pointer(struct snd_pcm_substream *sbstrm)
+ {
+ 	struct snd_tscm *tscm = sbstrm->private_data;
+ 
+-	return amdtp_stream_pcm_pointer(&tscm->rx_stream);
++	return amdtp_domain_stream_pcm_pointer(&tscm->domain, &tscm->rx_stream);
+ }
+ 
+ static int pcm_capture_ack(struct snd_pcm_substream *substream)
