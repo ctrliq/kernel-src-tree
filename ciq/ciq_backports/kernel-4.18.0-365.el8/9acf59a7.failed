@@ -1,0 +1,470 @@
+igc: Enable TX via AF_XDP zero-copy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Andre Guedes <andre.guedes@intel.com>
+commit 9acf59a752d4c686739117d3b3129e60af1ba5c1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/9acf59a7.failed
+
+Add support for transmitting packets via AF_XDP zero-copy mechanism.
+
+The packet transmission itself is implemented by igc_xdp_xmit_zc() which
+is called from igc_clean_tx_irq() when the ring has AF_XDP zero-copy
+enabled. Likewise i40e and ice drivers, the transmission budget used is
+the number of descriptors available on the ring.
+
+A new tx buffer type is introduced to 'enum igc_tx_buffer_type' to
+indicate the tx buffer uses memory from xsk pool so it can be properly
+cleaned after transmission or when the ring is cleaned.
+
+The I225 controller has only 4 Tx hardware queues so the main difference
+between igc and other Intel drivers that support AF_XDP zero-copy is
+that there is no tx ring dedicated exclusively to XDP. Instead, tx
+rings are shared between the network stack and XDP, and netdev queue
+lock is used to ensure mutual exclusion. This is the same approach
+implemented to support XDP_TX and XDP_REDIRECT actions.
+
+	Signed-off-by: Andre Guedes <andre.guedes@intel.com>
+	Signed-off-by: Vedang Patel <vedang.patel@intel.com>
+	Signed-off-by: Jithu Joseph <jithu.joseph@intel.com>
+	Reviewed-by: Maciej Fijalkowski <maciej.fijalkowski@intel.com>
+	Tested-by: Dvora Fuxbrumer <dvorax.fuxbrumer@linux.intel.com>
+	Signed-off-by: Tony Nguyen <anthony.l.nguyen@intel.com>
+(cherry picked from commit 9acf59a752d4c686739117d3b3129e60af1ba5c1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/intel/igc/igc.h
+#	drivers/net/ethernet/intel/igc/igc_main.c
+#	drivers/net/ethernet/intel/igc/igc_xdp.c
+diff --cc drivers/net/ethernet/intel/igc/igc.h
+index b00cd8696b6d,b6d3277c6f52..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc.h
++++ b/drivers/net/ethernet/intel/igc/igc.h
+@@@ -238,6 -256,11 +238,14 @@@ bool igc_has_link(struct igc_adapter *a
+  void igc_reset(struct igc_adapter *adapter);
+  int igc_set_spd_dplx(struct igc_adapter *adapter, u32 spd, u8 dplx);
+  void igc_update_stats(struct igc_adapter *adapter);
+++<<<<<<< HEAD
+++=======
++ void igc_disable_rx_ring(struct igc_ring *ring);
++ void igc_enable_rx_ring(struct igc_ring *ring);
++ void igc_disable_tx_ring(struct igc_ring *ring);
++ void igc_enable_tx_ring(struct igc_ring *ring);
++ int igc_xsk_wakeup(struct net_device *dev, u32 queue_id, u32 flags);
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  
+  /* igc_dump declarations */
+  void igc_rings_dump(struct igc_adapter *adapter);
+@@@ -389,6 -412,12 +397,15 @@@ enum igc_boards 
+  #define TXD_USE_COUNT(S)	DIV_ROUND_UP((S), IGC_MAX_DATA_PER_TXD)
+  #define DESC_NEEDED	(MAX_SKB_FRAGS + 4)
+  
+++<<<<<<< HEAD
+++=======
++ enum igc_tx_buffer_type {
++ 	IGC_TX_BUFFER_TYPE_SKB,
++ 	IGC_TX_BUFFER_TYPE_XDP,
++ 	IGC_TX_BUFFER_TYPE_XSK,
++ };
++ 
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  /* wrapper around a pointer to a socket buffer,
+   * so a DMA handle can be stored along with the buffer
+   */
+diff --cc drivers/net/ethernet/intel/igc/igc_main.c
+index 992dd6933ec4,ea998d2defa4..000000000000
+--- a/drivers/net/ethernet/intel/igc/igc_main.c
++++ b/drivers/net/ethernet/intel/igc/igc_main.c
+@@@ -186,10 -192,22 +187,27 @@@ static void igc_clean_tx_ring(struct ig
+  	while (i != tx_ring->next_to_use) {
+  		union igc_adv_tx_desc *eop_desc, *tx_desc;
+  
+++<<<<<<< HEAD
+ +		/* Free all the Tx ring sk_buffs */
+ +		dev_kfree_skb_any(tx_buffer->skb);
+- 
+- 		igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
+++=======
++ 		switch (tx_buffer->type) {
++ 		case IGC_TX_BUFFER_TYPE_XSK:
++ 			xsk_frames++;
++ 			break;
++ 		case IGC_TX_BUFFER_TYPE_XDP:
++ 			xdp_return_frame(tx_buffer->xdpf);
++ 			igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
++ 			break;
++ 		case IGC_TX_BUFFER_TYPE_SKB:
++ 			dev_kfree_skb_any(tx_buffer->skb);
++ 			igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
++ 			break;
++ 		default:
++ 			netdev_warn_once(tx_ring->netdev, "Unknown Tx buffer type\n");
++ 			break;
++ 		}
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  
+  		/* check for eop_desc to determine the end of the packet */
+  		eop_desc = tx_buffer->next_to_watch;
+@@@ -1981,6 -2362,221 +2004,224 @@@ static int igc_clean_rx_irq(struct igc_
+  	return total_packets;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct sk_buff *igc_construct_skb_zc(struct igc_ring *ring,
++ 					    struct xdp_buff *xdp)
++ {
++ 	unsigned int metasize = xdp->data - xdp->data_meta;
++ 	unsigned int datasize = xdp->data_end - xdp->data;
++ 	unsigned int totalsize = metasize + datasize;
++ 	struct sk_buff *skb;
++ 
++ 	skb = __napi_alloc_skb(&ring->q_vector->napi,
++ 			       xdp->data_end - xdp->data_hard_start,
++ 			       GFP_ATOMIC | __GFP_NOWARN);
++ 	if (unlikely(!skb))
++ 		return NULL;
++ 
++ 	skb_reserve(skb, xdp->data_meta - xdp->data_hard_start);
++ 	memcpy(__skb_put(skb, totalsize), xdp->data_meta, totalsize);
++ 	if (metasize)
++ 		skb_metadata_set(skb, metasize);
++ 
++ 	return skb;
++ }
++ 
++ static void igc_dispatch_skb_zc(struct igc_q_vector *q_vector,
++ 				union igc_adv_rx_desc *desc,
++ 				struct xdp_buff *xdp,
++ 				ktime_t timestamp)
++ {
++ 	struct igc_ring *ring = q_vector->rx.ring;
++ 	struct sk_buff *skb;
++ 
++ 	skb = igc_construct_skb_zc(ring, xdp);
++ 	if (!skb) {
++ 		ring->rx_stats.alloc_failed++;
++ 		return;
++ 	}
++ 
++ 	if (timestamp)
++ 		skb_hwtstamps(skb)->hwtstamp = timestamp;
++ 
++ 	if (igc_cleanup_headers(ring, desc, skb))
++ 		return;
++ 
++ 	igc_process_skb_fields(ring, desc, skb);
++ 	napi_gro_receive(&q_vector->napi, skb);
++ }
++ 
++ static int igc_clean_rx_irq_zc(struct igc_q_vector *q_vector, const int budget)
++ {
++ 	struct igc_adapter *adapter = q_vector->adapter;
++ 	struct igc_ring *ring = q_vector->rx.ring;
++ 	u16 cleaned_count = igc_desc_unused(ring);
++ 	int total_bytes = 0, total_packets = 0;
++ 	u16 ntc = ring->next_to_clean;
++ 	struct bpf_prog *prog;
++ 	bool failure = false;
++ 	int xdp_status = 0;
++ 
++ 	rcu_read_lock();
++ 
++ 	prog = READ_ONCE(adapter->xdp_prog);
++ 
++ 	while (likely(total_packets < budget)) {
++ 		union igc_adv_rx_desc *desc;
++ 		struct igc_rx_buffer *bi;
++ 		ktime_t timestamp = 0;
++ 		unsigned int size;
++ 		int res;
++ 
++ 		desc = IGC_RX_DESC(ring, ntc);
++ 		size = le16_to_cpu(desc->wb.upper.length);
++ 		if (!size)
++ 			break;
++ 
++ 		/* This memory barrier is needed to keep us from reading
++ 		 * any other fields out of the rx_desc until we know the
++ 		 * descriptor has been written back
++ 		 */
++ 		dma_rmb();
++ 
++ 		bi = &ring->rx_buffer_info[ntc];
++ 
++ 		if (igc_test_staterr(desc, IGC_RXDADV_STAT_TSIP)) {
++ 			timestamp = igc_ptp_rx_pktstamp(q_vector->adapter,
++ 							bi->xdp->data);
++ 
++ 			bi->xdp->data += IGC_TS_HDR_LEN;
++ 
++ 			/* HW timestamp has been copied into local variable. Metadata
++ 			 * length when XDP program is called should be 0.
++ 			 */
++ 			bi->xdp->data_meta += IGC_TS_HDR_LEN;
++ 			size -= IGC_TS_HDR_LEN;
++ 		}
++ 
++ 		bi->xdp->data_end = bi->xdp->data + size;
++ 		xsk_buff_dma_sync_for_cpu(bi->xdp, ring->xsk_pool);
++ 
++ 		res = __igc_xdp_run_prog(adapter, prog, bi->xdp);
++ 		switch (res) {
++ 		case IGC_XDP_PASS:
++ 			igc_dispatch_skb_zc(q_vector, desc, bi->xdp, timestamp);
++ 			fallthrough;
++ 		case IGC_XDP_CONSUMED:
++ 			xsk_buff_free(bi->xdp);
++ 			break;
++ 		case IGC_XDP_TX:
++ 		case IGC_XDP_REDIRECT:
++ 			xdp_status |= res;
++ 			break;
++ 		}
++ 
++ 		bi->xdp = NULL;
++ 		total_bytes += size;
++ 		total_packets++;
++ 		cleaned_count++;
++ 		ntc++;
++ 		if (ntc == ring->count)
++ 			ntc = 0;
++ 	}
++ 
++ 	ring->next_to_clean = ntc;
++ 	rcu_read_unlock();
++ 
++ 	if (cleaned_count >= IGC_RX_BUFFER_WRITE)
++ 		failure = !igc_alloc_rx_buffers_zc(ring, cleaned_count);
++ 
++ 	if (xdp_status)
++ 		igc_finalize_xdp(adapter, xdp_status);
++ 
++ 	igc_update_rx_stats(q_vector, total_packets, total_bytes);
++ 
++ 	if (xsk_uses_need_wakeup(ring->xsk_pool)) {
++ 		if (failure || ring->next_to_clean == ring->next_to_use)
++ 			xsk_set_rx_need_wakeup(ring->xsk_pool);
++ 		else
++ 			xsk_clear_rx_need_wakeup(ring->xsk_pool);
++ 		return total_packets;
++ 	}
++ 
++ 	return failure ? budget : total_packets;
++ }
++ 
++ static void igc_update_tx_stats(struct igc_q_vector *q_vector,
++ 				unsigned int packets, unsigned int bytes)
++ {
++ 	struct igc_ring *ring = q_vector->tx.ring;
++ 
++ 	u64_stats_update_begin(&ring->tx_syncp);
++ 	ring->tx_stats.bytes += bytes;
++ 	ring->tx_stats.packets += packets;
++ 	u64_stats_update_end(&ring->tx_syncp);
++ 
++ 	q_vector->tx.total_bytes += bytes;
++ 	q_vector->tx.total_packets += packets;
++ }
++ 
++ static void igc_xdp_xmit_zc(struct igc_ring *ring)
++ {
++ 	struct xsk_buff_pool *pool = ring->xsk_pool;
++ 	struct netdev_queue *nq = txring_txq(ring);
++ 	union igc_adv_tx_desc *tx_desc = NULL;
++ 	int cpu = smp_processor_id();
++ 	u16 ntu = ring->next_to_use;
++ 	struct xdp_desc xdp_desc;
++ 	u16 budget;
++ 
++ 	if (!netif_carrier_ok(ring->netdev))
++ 		return;
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 
++ 	budget = igc_desc_unused(ring);
++ 
++ 	while (xsk_tx_peek_desc(pool, &xdp_desc) && budget--) {
++ 		u32 cmd_type, olinfo_status;
++ 		struct igc_tx_buffer *bi;
++ 		dma_addr_t dma;
++ 
++ 		cmd_type = IGC_ADVTXD_DTYP_DATA | IGC_ADVTXD_DCMD_DEXT |
++ 			   IGC_ADVTXD_DCMD_IFCS | IGC_TXD_DCMD |
++ 			   xdp_desc.len;
++ 		olinfo_status = xdp_desc.len << IGC_ADVTXD_PAYLEN_SHIFT;
++ 
++ 		dma = xsk_buff_raw_get_dma(pool, xdp_desc.addr);
++ 		xsk_buff_raw_dma_sync_for_device(pool, dma, xdp_desc.len);
++ 
++ 		tx_desc = IGC_TX_DESC(ring, ntu);
++ 		tx_desc->read.cmd_type_len = cpu_to_le32(cmd_type);
++ 		tx_desc->read.olinfo_status = cpu_to_le32(olinfo_status);
++ 		tx_desc->read.buffer_addr = cpu_to_le64(dma);
++ 
++ 		bi = &ring->tx_buffer_info[ntu];
++ 		bi->type = IGC_TX_BUFFER_TYPE_XSK;
++ 		bi->protocol = 0;
++ 		bi->bytecount = xdp_desc.len;
++ 		bi->gso_segs = 1;
++ 		bi->time_stamp = jiffies;
++ 		bi->next_to_watch = tx_desc;
++ 
++ 		netdev_tx_sent_queue(txring_txq(ring), xdp_desc.len);
++ 
++ 		ntu++;
++ 		if (ntu == ring->count)
++ 			ntu = 0;
++ 	}
++ 
++ 	ring->next_to_use = ntu;
++ 	if (tx_desc) {
++ 		igc_flush_tx_descriptors(ring);
++ 		xsk_tx_release(pool);
++ 	}
++ 
++ 	__netif_tx_unlock(nq);
++ }
++ 
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  /**
+   * igc_clean_tx_irq - Reclaim resources after transmit completes
+   * @q_vector: pointer to q_vector containing needed info
+@@@ -2026,10 -2623,22 +2268,27 @@@ static bool igc_clean_tx_irq(struct igc
+  		total_bytes += tx_buffer->bytecount;
+  		total_packets += tx_buffer->gso_segs;
+  
+++<<<<<<< HEAD
+ +		/* free the skb */
+ +		napi_consume_skb(tx_buffer->skb, napi_budget);
+- 
+- 		igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
+++=======
++ 		switch (tx_buffer->type) {
++ 		case IGC_TX_BUFFER_TYPE_XSK:
++ 			xsk_frames++;
++ 			break;
++ 		case IGC_TX_BUFFER_TYPE_XDP:
++ 			xdp_return_frame(tx_buffer->xdpf);
++ 			igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
++ 			break;
++ 		case IGC_TX_BUFFER_TYPE_SKB:
++ 			napi_consume_skb(tx_buffer->skb, napi_budget);
++ 			igc_unmap_tx_buffer(tx_ring->dev, tx_buffer);
++ 			break;
++ 		default:
++ 			netdev_warn_once(tx_ring->netdev, "Unknown Tx buffer type\n");
++ 			break;
++ 		}
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  
+  		/* clear last DMA location and unmap remaining buffers */
+  		while (tx_desc != eop_desc) {
+@@@ -2069,13 -2678,17 +2328,21 @@@
+  
+  	i += tx_ring->count;
+  	tx_ring->next_to_clean = i;
+ -
+ -	igc_update_tx_stats(q_vector, total_packets, total_bytes);
+ +	u64_stats_update_begin(&tx_ring->tx_syncp);
+ +	tx_ring->tx_stats.bytes += total_bytes;
+ +	tx_ring->tx_stats.packets += total_packets;
+ +	u64_stats_update_end(&tx_ring->tx_syncp);
+ +	q_vector->tx.total_bytes += total_bytes;
+ +	q_vector->tx.total_packets += total_packets;
+  
++ 	if (tx_ring->xsk_pool) {
++ 		if (xsk_frames)
++ 			xsk_tx_completed(tx_ring->xsk_pool, xsk_frames);
++ 		if (xsk_uses_need_wakeup(tx_ring->xsk_pool))
++ 			xsk_set_tx_need_wakeup(tx_ring->xsk_pool);
++ 		igc_xdp_xmit_zc(tx_ring);
++ 	}
++ 
+  	if (test_bit(IGC_RING_FLAG_TX_DETECT_HANG, &tx_ring->flags)) {
+  		struct igc_hw *hw = &adapter->hw;
+  
+@@@ -5608,6 -6386,61 +5875,64 @@@ struct net_device *igc_get_hw_dev(struc
+  	return adapter->netdev;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void igc_disable_rx_ring_hw(struct igc_ring *ring)
++ {
++ 	struct igc_hw *hw = &ring->q_vector->adapter->hw;
++ 	u8 idx = ring->reg_idx;
++ 	u32 rxdctl;
++ 
++ 	rxdctl = rd32(IGC_RXDCTL(idx));
++ 	rxdctl &= ~IGC_RXDCTL_QUEUE_ENABLE;
++ 	rxdctl |= IGC_RXDCTL_SWFLUSH;
++ 	wr32(IGC_RXDCTL(idx), rxdctl);
++ }
++ 
++ void igc_disable_rx_ring(struct igc_ring *ring)
++ {
++ 	igc_disable_rx_ring_hw(ring);
++ 	igc_clean_rx_ring(ring);
++ }
++ 
++ void igc_enable_rx_ring(struct igc_ring *ring)
++ {
++ 	struct igc_adapter *adapter = ring->q_vector->adapter;
++ 
++ 	igc_configure_rx_ring(adapter, ring);
++ 
++ 	if (ring->xsk_pool)
++ 		igc_alloc_rx_buffers_zc(ring, igc_desc_unused(ring));
++ 	else
++ 		igc_alloc_rx_buffers(ring, igc_desc_unused(ring));
++ }
++ 
++ static void igc_disable_tx_ring_hw(struct igc_ring *ring)
++ {
++ 	struct igc_hw *hw = &ring->q_vector->adapter->hw;
++ 	u8 idx = ring->reg_idx;
++ 	u32 txdctl;
++ 
++ 	txdctl = rd32(IGC_TXDCTL(idx));
++ 	txdctl &= ~IGC_TXDCTL_QUEUE_ENABLE;
++ 	txdctl |= IGC_TXDCTL_SWFLUSH;
++ 	wr32(IGC_TXDCTL(idx), txdctl);
++ }
++ 
++ void igc_disable_tx_ring(struct igc_ring *ring)
++ {
++ 	igc_disable_tx_ring_hw(ring);
++ 	igc_clean_tx_ring(ring);
++ }
++ 
++ void igc_enable_tx_ring(struct igc_ring *ring)
++ {
++ 	struct igc_adapter *adapter = ring->q_vector->adapter;
++ 
++ 	igc_configure_tx_ring(adapter, ring);
++ }
++ 
+++>>>>>>> 9acf59a752d4 (igc: Enable TX via AF_XDP zero-copy)
+  /**
+   * igc_init_module - Driver Registration Routine
+   *
+* Unmerged path drivers/net/ethernet/intel/igc/igc_xdp.c
+* Unmerged path drivers/net/ethernet/intel/igc/igc.h
+diff --git a/drivers/net/ethernet/intel/igc/igc_base.h b/drivers/net/ethernet/intel/igc/igc_base.h
+index ea627ce52525..c708f6b83c62 100644
+--- a/drivers/net/ethernet/intel/igc/igc_base.h
++++ b/drivers/net/ethernet/intel/igc/igc_base.h
+@@ -78,6 +78,7 @@ union igc_adv_rx_desc {
+ 
+ /* Additional Transmit Descriptor Control definitions */
+ #define IGC_TXDCTL_QUEUE_ENABLE	0x02000000 /* Ena specific Tx Queue */
++#define IGC_TXDCTL_SWFLUSH	0x04000000 /* Transmit Software Flush */
+ 
+ /* Additional Receive Descriptor Control definitions */
+ #define IGC_RXDCTL_QUEUE_ENABLE	0x02000000 /* Ena specific Rx Queue */
+* Unmerged path drivers/net/ethernet/intel/igc/igc_main.c
+* Unmerged path drivers/net/ethernet/intel/igc/igc_xdp.c
