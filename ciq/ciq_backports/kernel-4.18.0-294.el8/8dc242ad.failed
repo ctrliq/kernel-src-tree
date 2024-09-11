@@ -1,0 +1,140 @@
+tcp: refine tcp_pacing_delay() for very low pacing rates
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit 8dc242ad661c2694a582541c2264ffc0e7c4d27d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8dc242ad.failed
+
+With the addition of horizon feature to sch_fq, we noticed some
+suboptimal behavior of extremely low pacing rate TCP flows, especially
+when TCP is not aware of a drop happening in lower stacks.
+
+Back in commit 3f80e08f40cd ("tcp: add tcp_reset_xmit_timer() helper"),
+tcp_pacing_delay() was added to estimate an extra delay to add to standard
+rto timers.
+
+This patch removes the skb argument from this helper and
+tcp_reset_xmit_timer() because it makes more sense to simply
+consider the time at which next packet is allowed to be sent,
+instead of the time of whatever packet has been sent.
+
+This avoids arming RTO timer too soon and removes
+spurious horizon drops.
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8dc242ad661c2694a582541c2264ffc0e7c4d27d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index d8232826800c,32c9db902f18..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -3870,23 -3897,15 +3868,27 @@@ void tcp_send_probe0(struct sock *sk
+  	if (err <= 0) {
+  		if (icsk->icsk_backoff < net->ipv4.sysctl_tcp_retries2)
+  			icsk->icsk_backoff++;
+ -		timeout = tcp_probe0_when(sk, TCP_RTO_MAX);
+ +		icsk->icsk_probes_out++;
+ +		probe_max = TCP_RTO_MAX;
+  	} else {
+  		/* If packet was not sent due to local congestion,
+ -		 * Let senders fight for local resources conservatively.
+ +		 * do not backoff and do not remember icsk_probes_out.
+ +		 * Let local senders to fight for local resources.
+ +		 *
+ +		 * Use accumulated backoff yet.
+  		 */
+ -		timeout = TCP_RESOURCE_PROBE_INTERVAL;
+ -	}
+ +		if (!icsk->icsk_probes_out)
+ +			icsk->icsk_probes_out = 1;
+ +		probe_max = TCP_RESOURCE_PROBE_INTERVAL;
+ +	}
+++<<<<<<< HEAD
+ +	tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+ +			     tcp_probe0_when(sk, probe_max),
+ +			     TCP_RTO_MAX,
+ +			     NULL);
+++=======
++ 	tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0, timeout, TCP_RTO_MAX);
+++>>>>>>> 8dc242ad661c (tcp: refine tcp_pacing_delay() for very low pacing rates)
+  }
+  
+  int tcp_rtx_synack(const struct sock *sk, struct request_sock *req)
+diff --git a/include/net/tcp.h b/include/net/tcp.h
+index 74365cacb0e4..1a274ea08cd9 100644
+--- a/include/net/tcp.h
++++ b/include/net/tcp.h
+@@ -1274,26 +1274,22 @@ static inline bool tcp_needs_internal_pacing(const struct sock *sk)
+ 	return smp_load_acquire(&sk->sk_pacing_status) == SK_PACING_NEEDED;
+ }
+ 
+-/* Return in jiffies the delay before one skb is sent.
+- * If @skb is NULL, we look at EDT for next packet being sent on the socket.
++/* Estimates in how many jiffies next packet for this flow can be sent.
++ * Scheduling a retransmit timer too early would be silly.
+  */
+-static inline unsigned long tcp_pacing_delay(const struct sock *sk,
+-					     const struct sk_buff *skb)
++static inline unsigned long tcp_pacing_delay(const struct sock *sk)
+ {
+-	s64 pacing_delay = skb ? skb->tstamp : tcp_sk(sk)->tcp_wstamp_ns;
++	s64 delay = tcp_sk(sk)->tcp_wstamp_ns - tcp_sk(sk)->tcp_clock_cache;
+ 
+-	pacing_delay -= tcp_sk(sk)->tcp_clock_cache;
+-
+-	return pacing_delay > 0 ? nsecs_to_jiffies(pacing_delay) : 0;
++	return delay > 0 ? nsecs_to_jiffies(delay) : 0;
+ }
+ 
+ static inline void tcp_reset_xmit_timer(struct sock *sk,
+ 					const int what,
+ 					unsigned long when,
+-					const unsigned long max_when,
+-					const struct sk_buff *skb)
++					const unsigned long max_when)
+ {
+-	inet_csk_reset_xmit_timer(sk, what, when + tcp_pacing_delay(sk, skb),
++	inet_csk_reset_xmit_timer(sk, what, when + tcp_pacing_delay(sk),
+ 				  max_when);
+ }
+ 
+@@ -1321,8 +1317,7 @@ static inline void tcp_check_probe_timer(struct sock *sk)
+ {
+ 	if (!tcp_sk(sk)->packets_out && !inet_csk(sk)->icsk_pending)
+ 		tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-				     tcp_probe0_base(sk), TCP_RTO_MAX,
+-				     NULL);
++				     tcp_probe0_base(sk), TCP_RTO_MAX);
+ }
+ 
+ static inline void tcp_init_wl(struct tcp_sock *tp, u32 seq)
+diff --git a/net/ipv4/tcp_input.c b/net/ipv4/tcp_input.c
+index 171d83de06cc..ccfb05650cb1 100644
+--- a/net/ipv4/tcp_input.c
++++ b/net/ipv4/tcp_input.c
+@@ -3027,7 +3027,7 @@ void tcp_rearm_rto(struct sock *sk)
+ 			rto = usecs_to_jiffies(max_t(int, delta_us, 1));
+ 		}
+ 		tcp_reset_xmit_timer(sk, ICSK_TIME_RETRANS, rto,
+-				     TCP_RTO_MAX, tcp_rtx_queue_head(sk));
++				     TCP_RTO_MAX);
+ 	}
+ }
+ 
+@@ -3304,7 +3304,7 @@ static void tcp_ack_probe(struct sock *sk)
+ 		unsigned long when = tcp_probe0_when(sk, TCP_RTO_MAX);
+ 
+ 		tcp_reset_xmit_timer(sk, ICSK_TIME_PROBE0,
+-				     when, TCP_RTO_MAX, NULL);
++				     when, TCP_RTO_MAX);
+ 	}
+ }
+ 
+* Unmerged path net/ipv4/tcp_output.c
