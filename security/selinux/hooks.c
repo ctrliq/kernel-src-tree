@@ -7227,9 +7227,9 @@ static __init int selinux_init(void)
 	memset(&selinux_state, 0, sizeof(selinux_state));
 	enforcing_set(&selinux_state, selinux_enforcing_boot);
 	selinux_state.checkreqprot = selinux_checkreqprot_boot;
-	selinux_ss_init(&selinux_state.ss);
 	selinux_avc_init(&selinux_state.avc);
 	mutex_init(&selinux_state.status_lock);
+	mutex_init(&selinux_state.policy_mutex);
 
 	/* Set the security state for the initial task. */
 	cred_init_security();

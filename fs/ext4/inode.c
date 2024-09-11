@@ -511,9 +511,8 @@ int ext4_map_blocks(handle_t *handle, struct inode *inode,
 #endif
 
 	map->m_flags = 0;
-	ext_debug("ext4_map_blocks(): inode %lu, flag %d, max_blocks %u,"
-		  "logical block %lu\n", inode->i_ino, flags, map->m_len,
-		  (unsigned long) map->m_lblk);
+	ext_debug(inode, "flag 0x%x, max_blocks %u, logical block %lu\n",
+		  flags, map->m_len, (unsigned long) map->m_lblk);
 
 	/*
 	 * ext4_map_blocks returns an int, and m_len is an unsigned int
@@ -744,6 +743,9 @@ out_sem:
 				return ret;
 		}
 	}
+
+	if (retval < 0)
+		ext_debug(inode, "failed with err %d\n", retval);
 	return retval;
 }
 
@@ -1860,8 +1862,7 @@ static int ext4_da_map_blocks(struct inode *inode, sector_t iblock,
 		invalid_block = ~0;
 
 	map->m_flags = 0;
-	ext_debug("ext4_da_map_blocks(): inode %lu, max_blocks %u,"
-		  "logical block %lu\n", inode->i_ino, map->m_len,
+	ext_debug(inode, "max_blocks %u, logical block %lu\n", map->m_len,
 		  (unsigned long) map->m_lblk);
 
 	/* Lookup extent status tree firstly */
@@ -2006,28 +2007,16 @@ int ext4_da_get_block_prep(struct inode *inode, sector_t iblock,
 	return 0;
 }
 
-static int bget_one(handle_t *handle, struct buffer_head *bh)
-{
-	get_bh(bh);
-	return 0;
-}
-
-static int bput_one(handle_t *handle, struct buffer_head *bh)
-{
-	put_bh(bh);
-	return 0;
-}
-
 static int __ext4_journalled_writepage(struct page *page,
 				       unsigned int len)
 {
 	struct address_space *mapping = page->mapping;
 	struct inode *inode = mapping->host;
-	struct buffer_head *page_bufs = NULL;
 	handle_t *handle = NULL;
 	int ret = 0, err = 0;
 	int inline_data = ext4_has_inline_data(inode);
 	struct buffer_head *inode_bh = NULL;
+	loff_t size;
 
 	ClearPageChecked(page);
 
@@ -2037,14 +2026,6 @@ static int __ext4_journalled_writepage(struct page *page,
 		inode_bh = ext4_journalled_write_inline_data(inode, len, page);
 		if (inode_bh == NULL)
 			goto out;
-	} else {
-		page_bufs = page_buffers(page);
-		if (!page_bufs) {
-			BUG();
-			goto out;
-		}
-		ext4_walk_page_buffers(handle, page_bufs, 0, len,
-				       NULL, bget_one);
 	}
 	/*
 	 * We need to release the page lock before we start the
@@ -2065,7 +2046,8 @@ static int __ext4_journalled_writepage(struct page *page,
 
 	lock_page(page);
 	put_page(page);
-	if (page->mapping != mapping) {
+	size = i_size_read(inode);
+	if (page->mapping != mapping || page_offset(page) > size) {
 		/* The page got truncated from under us */
 		ext4_journal_stop(handle);
 		ret = 0;
@@ -2075,6 +2057,13 @@ static int __ext4_journalled_writepage(struct page *page,
 	if (inline_data) {
 		ret = ext4_mark_inode_dirty(handle, inode);
 	} else {
+		struct buffer_head *page_bufs = page_buffers(page);
+
+		if (page->index == size >> PAGE_SHIFT)
+			len = size & ~PAGE_MASK;
+		else
+			len = PAGE_SIZE;
+
 		ret = ext4_walk_page_buffers(handle, page_bufs, 0, len, NULL,
 					     do_journal_get_write_access);
 
@@ -2092,9 +2081,6 @@ static int __ext4_journalled_writepage(struct page *page,
 out:
 	unlock_page(page);
 out_no_pagelock:
-	if (!inline_data && page_bufs)
-		ext4_walk_page_buffers(NULL, page_bufs, 0, len,
-				       NULL, bput_one);
 	brelse(inode_bh);
 	return ret;
 }
@@ -3662,7 +3648,7 @@ static int ext4_end_io_dio(struct kiocb *iocb, loff_t offset,
 	if (!io_end)
 		return 0;
 
-	ext_debug("ext4_end_io_dio(): io_end 0x%p "
+	ext_debug(io_end->inode, "ext4_end_io_dio(): io_end 0x%p "
 		  "for inode %lu, iocb 0x%p, offset %llu, size %zd\n",
 		  io_end, io_end->inode->i_ino, iocb, offset, size);
 
@@ -4292,8 +4278,9 @@ int ext4_break_layouts(struct inode *inode)
  * Returns: 0 on success or negative on failure
  */
 
-int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length)
+int ext4_punch_hole(struct file *file, loff_t offset, loff_t length)
 {
+	struct inode *inode = file_inode(file);
 	struct super_block *sb = inode->i_sb;
 	ext4_lblk_t first_block, stop_block;
 	struct address_space *mapping = inode->i_mapping;
@@ -4363,6 +4350,10 @@ int ext4_punch_hole(struct inode *inode, loff_t offset, loff_t length)
 
 	/* Wait all existing dio workers, newcomers will block on i_mutex */
 	inode_dio_wait(inode);
+
+	ret = file_modified(file);
+	if (ret)
+		goto out_mutex;
 
 	/*
 	 * Prevent page faults from reinstantiating pages we have released from

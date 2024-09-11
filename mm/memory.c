@@ -1749,19 +1749,16 @@ int vm_map_pages_zero(struct vm_area_struct *vma, struct page **pages,
 }
 EXPORT_SYMBOL(vm_map_pages_zero);
 
-static int insert_pfn(struct vm_area_struct *vma, unsigned long addr,
+static vm_fault_t insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 			pfn_t pfn, pgprot_t prot, bool mkwrite)
 {
 	struct mm_struct *mm = vma->vm_mm;
-	int retval;
 	pte_t *pte, entry;
 	spinlock_t *ptl;
 
-	retval = -ENOMEM;
 	pte = get_locked_pte(mm, addr, &ptl);
 	if (!pte)
-		goto out;
-	retval = -EBUSY;
+		return VM_FAULT_OOM;
 	if (!pte_none(*pte)) {
 		if (mkwrite) {
 			/*
@@ -1800,11 +1797,9 @@ static int insert_pfn(struct vm_area_struct *vma, unsigned long addr,
 	set_pte_at(mm, addr, pte, entry);
 	update_mmu_cache(vma, addr, pte); /* XXX: why not for insert_page? */
 
-	retval = 0;
 out_unlock:
 	pte_unmap_unlock(pte, ptl);
-out:
-	return retval;
+	return VM_FAULT_NOPAGE;
 }
 
 /**
@@ -1831,8 +1826,6 @@ out:
 vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
 			unsigned long pfn, pgprot_t pgprot)
 {
-	int err;
-
 	/*
 	 * Technically, architectures with pte_special can avoid all these
 	 * restrictions (same for remap_pfn_range).  However we would like
@@ -1853,15 +1846,8 @@ vm_fault_t vmf_insert_pfn_prot(struct vm_area_struct *vma, unsigned long addr,
 
 	track_pfn_insert(vma, &pgprot, __pfn_to_pfn_t(pfn, PFN_DEV));
 
-	err = insert_pfn(vma, addr, __pfn_to_pfn_t(pfn, PFN_DEV), pgprot,
+	return insert_pfn(vma, addr, __pfn_to_pfn_t(pfn, PFN_DEV), pgprot,
 			false);
-
-	if (err == -ENOMEM)
-		return VM_FAULT_OOM;
-	if (err < 0 && err != -EBUSY)
-		return VM_FAULT_SIGBUS;
-
-	return VM_FAULT_NOPAGE;
 }
 EXPORT_SYMBOL(vmf_insert_pfn_prot);
 
@@ -1941,7 +1927,7 @@ static vm_fault_t __vm_insert_mixed(struct vm_area_struct *vma,
 		page = pfn_to_page(pfn_t_to_pfn(pfn));
 		err = insert_page(vma, addr, page, pgprot);
 	} else {
-		err = insert_pfn(vma, addr, pfn, pgprot, mkwrite);
+		return insert_pfn(vma, addr, pfn, pgprot, mkwrite);
 	}
 
 	if (err == -ENOMEM)

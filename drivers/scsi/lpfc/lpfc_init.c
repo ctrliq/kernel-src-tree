@@ -341,7 +341,6 @@ lpfc_dump_wakeup_param_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 
 /**
  * lpfc_update_vport_wwn - Updates the fc_nodename, fc_portname,
- *	cfg_soft_wwnn, cfg_soft_wwpn
  * @vport: pointer to lpfc vport data structure.
  *
  *
@@ -351,22 +350,13 @@ lpfc_dump_wakeup_param_cmpl(struct lpfc_hba *phba, LPFC_MBOXQ_t *pmboxq)
 void
 lpfc_update_vport_wwn(struct lpfc_vport *vport)
 {
-	uint8_t vvvl = vport->fc_sparam.cmn.valid_vendor_ver_level;
-	u32 *fawwpn_key = (u32 *)&vport->fc_sparam.un.vendorVersion[0];
-
-	/* If the soft name exists then update it using the service params */
-	if (vport->phba->cfg_soft_wwnn)
-		u64_to_wwn(vport->phba->cfg_soft_wwnn,
-			   vport->fc_sparam.nodeName.u.wwn);
-	if (vport->phba->cfg_soft_wwpn)
-		u64_to_wwn(vport->phba->cfg_soft_wwpn,
-			   vport->fc_sparam.portName.u.wwn);
+	struct lpfc_hba *phba = vport->phba;
 
 	/*
 	 * If the name is empty or there exists a soft name
 	 * then copy the service params name, otherwise use the fc name
 	 */
-	if (vport->fc_nodename.u.wwn[0] == 0 || vport->phba->cfg_soft_wwnn)
+	if (vport->fc_nodename.u.wwn[0] == 0)
 		memcpy(&vport->fc_nodename, &vport->fc_sparam.nodeName,
 			sizeof(struct lpfc_name));
 	else
@@ -379,22 +369,32 @@ lpfc_update_vport_wwn(struct lpfc_vport *vport)
 	 */
 	if (vport->fc_portname.u.wwn[0] != 0 &&
 		memcmp(&vport->fc_portname, &vport->fc_sparam.portName,
-			sizeof(struct lpfc_name)))
+		       sizeof(struct lpfc_name))) {
 		vport->vport_flag |= FAWWPN_PARAM_CHG;
 
-	if (vport->fc_portname.u.wwn[0] == 0 ||
-	    vport->phba->cfg_soft_wwpn ||
-	    (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR) ||
-	    vport->vport_flag & FAWWPN_SET) {
-		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
-			sizeof(struct lpfc_name));
-		vport->vport_flag &= ~FAWWPN_SET;
-		if (vvvl == 1 && cpu_to_be32(*fawwpn_key) == FAPWWN_KEY_VENDOR)
-			vport->vport_flag |= FAWWPN_SET;
+		if (phba->sli_rev == LPFC_SLI_REV4 &&
+		    vport->port_type == LPFC_PHYSICAL_PORT &&
+		    phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_FABRIC) {
+			lpfc_printf_log(phba, KERN_INFO,
+					LOG_SLI | LOG_DISCOVERY | LOG_ELS,
+					"2701 FA-PWWN change WWPN from %llx to "
+					"%llx: vflag x%x fawwpn_flag x%x\n",
+					wwn_to_u64(vport->fc_portname.u.wwn),
+					wwn_to_u64
+					   (vport->fc_sparam.portName.u.wwn),
+					vport->vport_flag,
+					phba->sli4_hba.fawwpn_flag);
+			memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
+			       sizeof(struct lpfc_name));
+		}
 	}
+
+	if (vport->fc_portname.u.wwn[0] == 0)
+		memcpy(&vport->fc_portname, &vport->fc_sparam.portName,
+		       sizeof(struct lpfc_name));
 	else
 		memcpy(&vport->fc_sparam.portName, &vport->fc_portname,
-			sizeof(struct lpfc_name));
+		       sizeof(struct lpfc_name));
 }
 
 /**
@@ -6411,12 +6411,15 @@ lpfc_sli4_async_sli_evt(struct lpfc_hba *phba, struct lpfc_acqe_sli *acqe_sli)
 	case LPFC_SLI_EVENT_TYPE_MISCONF_FAWWN:
 		/* Misconfigured WWN. Reports that the SLI Port is configured
 		 * to use FA-WWN, but the attached device doesn’t support it.
-		 * No driver action is required.
 		 * Event Data1 - N.A, Event Data2 - N.A
+		 * This event only happens on the physical port.
 		 */
-		lpfc_log_msg(phba, KERN_WARNING, LOG_SLI,
-			     "2699 Misconfigured FA-WWN - Attached device does "
-			     "not support FA-WWN\n");
+		lpfc_log_msg(phba, KERN_WARNING, LOG_SLI | LOG_DISCOVERY,
+			     "2699 Misconfigured FA-PWWN - Attached device "
+			     "does not support FA-PWWN\n");
+		phba->sli4_hba.fawwpn_flag &= ~LPFC_FAWWPN_FABRIC;
+		memset(phba->pport->fc_portname.u.wwn, 0,
+		       sizeof(struct lpfc_name));
 		break;
 	case LPFC_SLI_EVENT_TYPE_EEPROM_FAILURE:
 		/* EEPROM failure. No driver action is required */
@@ -7866,6 +7869,18 @@ lpfc_sli4_driver_resource_setup(struct lpfc_hba *phba)
 	rc = lpfc_sli4_read_config(phba);
 	if (unlikely(rc))
 		goto out_free_bsmbx;
+
+	if (phba->sli4_hba.fawwpn_flag & LPFC_FAWWPN_CONFIG) {
+		/* Right now the link is down, if FA-PWWN is configured the
+		 * firmware will try FLOGI before the driver gets a link up.
+		 * If it fails, the driver should get a MISCONFIGURED async
+		 * event which will clear this flag. The only notification
+		 * the driver gets is if it fails, if it succeeds there is no
+		 * notification given. Assume success.
+		 */
+		phba->sli4_hba.fawwpn_flag |= LPFC_FAWWPN_FABRIC;
+	}
+
 	rc = lpfc_mem_alloc_active_rrq_pool_s4(phba);
 	if (unlikely(rc))
 		goto out_free_bsmbx;
@@ -9674,7 +9689,7 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 	struct lpfc_rsrc_desc_fcfcoe *desc;
 	char *pdesc_0;
 	uint16_t forced_link_speed;
-	uint32_t if_type, qmin;
+	uint32_t if_type, qmin, fawwpn;
 	int length, i, rc = 0, rc2;
 
 	pmb = (LPFC_MBOXQ_t *) mempool_alloc(phba->mbox_mem_pool, GFP_KERNEL);
@@ -9716,10 +9731,23 @@ lpfc_sli4_read_config(struct lpfc_hba *phba)
 			phba->sli4_hba.bbscn_params.word0 = rd_config->word8;
 		}
 
+		fawwpn = bf_get(lpfc_mbx_rd_conf_fawwpn, rd_config);
+
+		if (fawwpn) {
+			lpfc_printf_log(phba, KERN_INFO,
+					LOG_INIT | LOG_DISCOVERY,
+					"2702 READ_CONFIG: FA-PWWN is "
+					"configured on\n");
+			phba->sli4_hba.fawwpn_flag |= LPFC_FAWWPN_CONFIG;
+		} else {
+			phba->sli4_hba.fawwpn_flag = 0;
+		}
+
 		phba->sli4_hba.conf_trunk =
 			bf_get(lpfc_mbx_rd_conf_trunk, rd_config);
 		phba->sli4_hba.extents_in_use =
 			bf_get(lpfc_mbx_rd_conf_extnts_inuse, rd_config);
+
 		phba->sli4_hba.max_cfg_param.max_xri =
 			bf_get(lpfc_mbx_rd_conf_xri_count, rd_config);
 		/* Reduce resource usage in kdump environment */

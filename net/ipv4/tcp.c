@@ -2664,8 +2664,7 @@ int tcp_disconnect(struct sock *sk, int flags)
 	icsk->icsk_ack.rcv_mss = TCP_MIN_MSS;
 	memset(&tp->rx_opt, 0, sizeof(tp->rx_opt));
 	__sk_dst_reset(sk);
-	dst_release(sk->sk_rx_dst);
-	sk->sk_rx_dst = NULL;
+	dst_release(xchg((__force struct dst_entry **)&sk->sk_rx_dst, NULL));
 	tcp_saved_syn_free(tp);
 	tp->compressed_ack = 0;
 	tp->segs_in = 0;
@@ -3396,6 +3395,7 @@ static size_t tcp_opt_stats_get_size(void)
 		nla_total_size(sizeof(u32)) + /* TCP_NLA_DSACK_DUPS */
 		nla_total_size(sizeof(u32)) + /* TCP_NLA_REORD_SEEN */
 		nla_total_size(sizeof(u32)) + /* TCP_NLA_SRTT */
+		nla_total_size(sizeof(u16)) + /* TCP_NLA_TIMEOUT_REHASH */
 		0;
 }
 
@@ -3450,6 +3450,7 @@ struct sk_buff *tcp_get_timestamping_opt_stats(const struct sock *sk)
 	nla_put_u32(stats, TCP_NLA_DSACK_DUPS, tp->dsack_dups);
 	nla_put_u32(stats, TCP_NLA_REORD_SEEN, tp->reord_seen);
 	nla_put_u32(stats, TCP_NLA_SRTT, tp->srtt_us >> 3);
+	nla_put_u16(stats, TCP_NLA_TIMEOUT_REHASH, tp->timeout_rehash);
 
 	return stats;
 }

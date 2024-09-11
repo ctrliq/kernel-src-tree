@@ -13,6 +13,7 @@
 #include <linux/dcache.h>
 #include <linux/magic.h>
 #include <linux/types.h>
+#include <linux/rcupdate.h>
 #include <linux/refcount.h>
 #include <linux/workqueue.h>
 #include "flask.h"
@@ -100,7 +101,6 @@ extern const char *selinux_policycap_names[__POLICYDB_CAPABILITY_MAX];
 #define POLICYDB_BOUNDS_MAXDEPTH	4
 
 struct selinux_avc;
-struct selinux_ss;
 struct selinux_policy;
 
 struct selinux_state {
@@ -118,10 +118,10 @@ struct selinux_state {
 	struct mutex status_lock;
 
 	struct selinux_avc *avc;
-	struct selinux_ss *ss;
+	struct selinux_policy __rcu *policy;
+	struct mutex policy_mutex;
 } __randomize_layout;
 
-void selinux_ss_init(struct selinux_ss **ss);
 void selinux_avc_init(struct selinux_avc **avc);
 
 extern struct selinux_state selinux_state;
@@ -218,17 +218,23 @@ static inline bool selinux_policycap_nnp_nosuid_transition(void)
 	return READ_ONCE(state->policycap[POLICYDB_CAPABILITY_NNP_NOSUID_TRANSITION]);
 }
 
+struct selinux_policy_convert_data;
+
+struct selinux_load_state {
+	struct selinux_policy *policy;
+	struct selinux_policy_convert_data *convert_data;
+};
+
 int security_mls_enabled(struct selinux_state *state);
 int security_load_policy(struct selinux_state *state,
-			void *data, size_t len,
-			struct selinux_policy **newpolicyp);
+			 void *data, size_t len,
+			 struct selinux_load_state *load_state);
 void selinux_policy_commit(struct selinux_state *state,
-			struct selinux_policy *newpolicy);
+			   struct selinux_load_state *load_state);
 void selinux_policy_cancel(struct selinux_state *state,
-			struct selinux_policy *policy);
+			   struct selinux_load_state *load_state);
 int security_read_policy(struct selinux_state *state,
 			 void **data, size_t *len);
-size_t security_policydb_len(struct selinux_state *state);
 
 int security_policycap_supported(struct selinux_state *state,
 				 unsigned int req_cap);

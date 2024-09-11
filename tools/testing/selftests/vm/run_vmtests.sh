@@ -58,6 +58,14 @@ else
 	exit 1
 fi
 
+#filter 64bit architectures
+ARCH64STR="arm64 ia64 mips64 parisc64 ppc64 ppc64le riscv64 s390x sh64 sparc64 x86_64"
+if [ -z $ARCH ]; then
+  ARCH=`uname -m 2>/dev/null | sed -e 's/aarch64.*/arm64/'`
+fi
+VADDR64=0
+echo "$ARCH64STR" | grep $ARCH && VADDR64=1
+
 mkdir $mnt
 mount -t hugetlbfs none $mnt
 
@@ -104,10 +112,10 @@ echo "NOTE: The above hugetlb tests provide minimal coverage.  Use"
 echo "      https://github.com/libhugetlbfs/libhugetlbfs.git for"
 echo "      hugetlb regression testing."
 
-echo "--------------------------------------------"
-echo "running 'gup_benchmark -U' (normal/slow gup)"
-echo "--------------------------------------------"
-./gup_benchmark -U
+echo "------------------------------------------------------"
+echo "running: gup_test -u # get_user_pages_fast() benchmark"
+echo "------------------------------------------------------"
+./gup_test -u
 if [ $? -ne 0 ]; then
 	echo "[FAIL]"
 	exitcode=1
@@ -115,10 +123,33 @@ else
 	echo "[PASS]"
 fi
 
-echo "------------------------------------------"
-echo "running gup_benchmark -b (pin_user_pages)"
-echo "------------------------------------------"
-./gup_benchmark -b
+echo "------------------------------------------------------"
+echo "running: gup_test -a # pin_user_pages_fast() benchmark"
+echo "------------------------------------------------------"
+./gup_test -a
+if [ $? -ne 0 ]; then
+	echo "[FAIL]"
+	exitcode=1
+else
+	echo "[PASS]"
+fi
+
+echo "------------------------------------------------------------"
+echo "# Dump pages 0, 19, and 4096, using pin_user_pages:"
+echo "running: gup_test -ct -F 0x1 0 19 0x1000 # dump_page() test"
+echo "------------------------------------------------------------"
+./gup_test -ct -F 0x1 0 19 0x1000
+if [ $? -ne 0 ]; then
+	echo "[FAIL]"
+	exitcode=1
+else
+	echo "[PASS]"
+fi
+
+echo "---------------------------"
+echo "running map_fixed_noreplace"
+echo "---------------------------"
+./map_fixed_noreplace
 if [ $? -ne 0 ]; then
 	echo "[FAIL]"
 	exitcode=1
@@ -200,6 +231,17 @@ else
 	echo "[PASS]"
 fi
 
+echo "-------------------------"
+echo "running mlock-random-test"
+echo "-------------------------"
+./mlock-random-test
+if [ $? -ne 0 ]; then
+	echo "[FAIL]"
+	exitcode=1
+else
+	echo "[PASS]"
+fi
+
 echo "--------------------"
 echo "running mlock2-tests"
 echo "--------------------"
@@ -211,6 +253,18 @@ else
 	echo "[PASS]"
 fi
 
+echo "-----------------"
+echo "running thuge-gen"
+echo "-----------------"
+./thuge-gen
+if [ $? -ne 0 ]; then
+	echo "[FAIL]"
+	exitcode=1
+else
+	echo "[PASS]"
+fi
+
+if [ $VADDR64 -ne 0 ]; then
 echo "-----------------------------"
 echo "running virtual_address_range"
 echo "-----------------------------"
@@ -232,6 +286,7 @@ if [ $? -ne 0 ]; then
 else
     echo "[PASS]"
 fi
+fi # VADDR64
 
 echo "------------------------------------"
 echo "running vmalloc stability smoke test"
@@ -244,6 +299,22 @@ if [ $ret_val -eq 0 ]; then
 elif [ $ret_val -eq $ksft_skip ]; then
 	 echo "[SKIP]"
 	 exitcode=$ksft_skip
+else
+	echo "[FAIL]"
+	exitcode=1
+fi
+
+echo "------------------------------------"
+echo "running HMM smoke test"
+echo "------------------------------------"
+./test_hmm.sh smoke
+ret_val=$?
+
+if [ $ret_val -eq 0 ]; then
+	echo "[PASS]"
+elif [ $ret_val -eq $ksft_skip ]; then
+	echo "[SKIP]"
+	exitcode=$ksft_skip
 else
 	echo "[FAIL]"
 	exitcode=1

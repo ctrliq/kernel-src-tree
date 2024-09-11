@@ -357,8 +357,8 @@ static int qeth_cq_init(struct qeth_card *card)
 		qdio_reset_buffers(card->qdio.c_q->qdio_bufs,
 				   QDIO_MAX_BUFFERS_PER_Q);
 		card->qdio.c_q->next_buf_to_init = 127;
-		rc = do_QDIO(CARD_DDEV(card), QDIO_FLAG_SYNC_INPUT, 1, 0, 127,
-			     NULL);
+
+		rc = qdio_add_bufs_to_input_queue(CARD_DDEV(card), 1, 0, 127);
 		if (rc) {
 			QETH_CARD_TEXT_(card, 2, "1err%d", rc);
 			goto out;
@@ -2429,7 +2429,7 @@ static u8 qeth_mpc_select_prot_type(struct qeth_card *card)
 {
 	if (IS_OSN(card))
 		return QETH_PROT_OSN2;
-	return IS_LAYER2(card) ? QETH_PROT_LAYER2 : QETH_PROT_TCPIP;
+	return IS_LAYER2(card) ? QETH_MPC_PROT_L2 : QETH_MPC_PROT_L3;
 }
 
 static int qeth_ulp_enable(struct qeth_card *card)
@@ -2936,8 +2936,7 @@ static int qeth_init_qdio_queues(struct qeth_card *card)
 	}
 
 	card->qdio.in_q->next_buf_to_init = QDIO_BUFNR(rx_bufs);
-	rc = do_QDIO(CARD_DDEV(card), QDIO_FLAG_SYNC_INPUT, 0, 0, rx_bufs,
-		     NULL);
+	rc = qdio_add_bufs_to_input_queue(CARD_DDEV(card), 0, 0, rx_bufs);
 	if (rc) {
 		QETH_CARD_TEXT_(card, 2, "1err%d", rc);
 		return rc;
@@ -3428,8 +3427,9 @@ static unsigned int qeth_rx_refill_queue(struct qeth_card *card,
 			return 0;
 		}
 
-		rc = do_QDIO(CARD_DDEV(card), QDIO_FLAG_SYNC_INPUT, 0,
-			     queue->next_buf_to_init, count, NULL);
+		rc = qdio_add_bufs_to_input_queue(CARD_DDEV(card), 0,
+						  queue->next_buf_to_init,
+						  count);
 		if (rc) {
 			QETH_CARD_TEXT(card, 2, "qinberr");
 		}
@@ -3601,8 +3601,8 @@ static void qeth_flush_buffers(struct qeth_qdio_out_q *queue, int index,
 	}
 
 	QETH_TXQ_STAT_INC(queue, doorbell);
-	rc = do_QDIO(CARD_DDEV(card), QDIO_FLAG_SYNC_OUTPUT, queue->queue_no,
-		     index, count, aob);
+	rc = qdio_add_bufs_to_output_queue(CARD_DDEV(card), queue->queue_no,
+					   index, count, aob);
 
 	switch (rc) {
 	case 0:
@@ -3749,8 +3749,8 @@ static void qeth_qdio_cq_handler(struct qeth_card *card, unsigned int qdio_err,
 		}
 		qeth_scrub_qdio_buffer(buffer, QDIO_MAX_ELEMENTS_PER_BUFFER);
 	}
-	rc = do_QDIO(CARD_DDEV(card), QDIO_FLAG_SYNC_INPUT, queue,
-		     cq->next_buf_to_init, count, NULL);
+	rc = qdio_add_bufs_to_input_queue(CARD_DDEV(card), queue,
+					  cq->next_buf_to_init, count);
 	if (rc) {
 		dev_warn(&card->gdev->dev,
 			"QDIO reported an error, rc=%i\n", rc);
@@ -3789,7 +3789,7 @@ static void qeth_qdio_output_handler(struct ccw_device *ccwdev,
 /*
  * Note: Function assumes that we have 4 outbound queues.
  */
-int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb)
+static int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb)
 {
 	struct vlan_ethhdr *veth = vlan_eth_hdr(skb);
 	u8 tos;
@@ -3834,7 +3834,6 @@ int qeth_get_priority_queue(struct qeth_card *card, struct sk_buff *skb)
 	}
 	return card->qdio.default_out_queue;
 }
-EXPORT_SYMBOL_GPL(qeth_get_priority_queue);
 
 /**
  * qeth_get_elements_for_frags() -	find number of SBALEs for skb frags.
@@ -5600,10 +5599,10 @@ static void qeth_l3_rebuild_skb(struct qeth_card *card, struct sk_buff *skb,
 #endif
 
 static void qeth_receive_skb(struct qeth_card *card, struct sk_buff *skb,
-			     struct qeth_hdr *hdr, bool uses_frags)
+			     struct qeth_hdr *hdr,
+			     bool uses_frags, bool is_cso)
 {
 	struct napi_struct *napi = &card->napi;
-	bool is_cso;
 
 	switch (hdr->hdr.l2.id) {
 	case QETH_HEADER_TYPE_OSN:
@@ -5616,12 +5615,8 @@ static void qeth_receive_skb(struct qeth_card *card, struct sk_buff *skb,
 		return;
 #if IS_ENABLED(CONFIG_QETH_L3)
 	case QETH_HEADER_TYPE_LAYER3:
-		qeth_l3_rebuild_skb(card, skb, hdr);
-		is_cso = hdr->hdr.l3.ext_flags & QETH_HDR_EXT_CSUM_TRANSP_REQ;
-		break;
 #endif
 	case QETH_HEADER_TYPE_LAYER2:
-		is_cso = hdr->hdr.l2.flags[1] & QETH_HDR_EXT_CSUM_TRANSP_REQ;
 		break;
 	default:
 		/* never happens */
@@ -5687,6 +5682,7 @@ static int qeth_extract_skb(struct qeth_card *card,
 	struct qeth_hdr *hdr;
 	struct sk_buff *skb;
 	int skb_len = 0;
+	bool is_cso;
 
 	element = &buffer->element[*element_no];
 
@@ -5706,11 +5702,15 @@ next_packet:
 	switch (hdr->hdr.l2.id) {
 	case QETH_HEADER_TYPE_LAYER2:
 		skb_len = hdr->hdr.l2.pkt_length;
+		is_cso = hdr->hdr.l2.flags[1] & QETH_HDR_EXT_CSUM_TRANSP_REQ;
+
 		linear_len = ETH_HLEN;
 		headroom = 0;
 		break;
 	case QETH_HEADER_TYPE_LAYER3:
 		skb_len = hdr->hdr.l3.length;
+		is_cso = hdr->hdr.l3.ext_flags & QETH_HDR_EXT_CSUM_TRANSP_REQ;
+
 		if (!IS_LAYER3(card)) {
 			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
 			goto walk_packet;
@@ -5730,6 +5730,7 @@ next_packet:
 		break;
 	case QETH_HEADER_TYPE_OSN:
 		skb_len = hdr->hdr.osn.pdu_length;
+		is_cso = false;
 		if (!IS_OSN(card)) {
 			QETH_CARD_STAT_INC(card, rx_dropped_notsupp);
 			goto walk_packet;
@@ -5848,7 +5849,12 @@ walk_packet:
 	*element_no = element - &buffer->element[0];
 	*__offset = offset;
 
-	qeth_receive_skb(card, skb, hdr, uses_frags);
+#if IS_ENABLED(CONFIG_QETH_L3)
+	if (hdr->hdr.l2.id == QETH_HEADER_TYPE_LAYER3)
+		qeth_l3_rebuild_skb(card, skb, hdr);
+#endif
+
+	qeth_receive_skb(card, skb, hdr, uses_frags, is_cso);
 	return 0;
 }
 
@@ -5884,10 +5890,10 @@ static unsigned int qeth_rx_poll(struct qeth_card *card, int budget)
 		/* Fetch completed RX buffers: */
 		if (!card->rx.b_count) {
 			card->rx.qdio_err = 0;
-			card->rx.b_count = qdio_inspect_queue(CARD_DDEV(card),
-							      0, true,
-							      &card->rx.b_index,
-							      &card->rx.qdio_err);
+			card->rx.b_count =
+				qdio_inspect_input_queue(CARD_DDEV(card), 0,
+							 &card->rx.b_index,
+							 &card->rx.qdio_err);
 			if (card->rx.b_count <= 0) {
 				card->rx.b_count = 0;
 				break;
@@ -5934,8 +5940,8 @@ static void qeth_cq_poll(struct qeth_card *card)
 		unsigned int start, error;
 		int completed;
 
-		completed = qdio_inspect_queue(CARD_DDEV(card), 1, true, &start,
-					       &error);
+		completed = qdio_inspect_input_queue(CARD_DDEV(card), 1, &start,
+						     &error);
 		if (completed <= 0)
 			return;
 
@@ -6072,8 +6078,8 @@ static int qeth_tx_poll(struct napi_struct *napi, int budget)
 			return 0;
 		}
 
-		completed = qdio_inspect_queue(CARD_DDEV(card), queue_no, false,
-					       &start, &error);
+		completed = qdio_inspect_output_queue(CARD_DDEV(card), queue_no,
+						      &start, &error);
 		if (completed <= 0) {
 			/* Ensure we see TX completion for pending work: */
 			if (napi_complete_done(napi, 0) &&
@@ -6313,13 +6319,8 @@ void qeth_remove_discipline(struct qeth_card *card)
 	card->discipline = NULL;
 }
 
-const struct device_type qeth_generic_devtype = {
+static const struct device_type qeth_generic_devtype = {
 	.name = "qeth_generic",
-};
-EXPORT_SYMBOL_GPL(qeth_generic_devtype);
-
-static const struct device_type qeth_osn_devtype = {
-	.name = "qeth_osn",
 };
 
 #define DBF_NAME_LEN	20
@@ -6522,8 +6523,6 @@ static int qeth_core_probe_device(struct ccwgroup_device *gdev)
 		if (rc)
 			goto err_setup_disc;
 
-		gdev->dev.type = IS_OSN(card) ? &qeth_osn_devtype :
-						card->discipline->devtype;
 		break;
 	}
 
@@ -7188,6 +7187,19 @@ u16 qeth_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
 	return (txq == QETH_IQD_MCAST_TXQ) ? QETH_IQD_MIN_UCAST_TXQ : txq;
 }
 EXPORT_SYMBOL_GPL(qeth_iqd_select_queue);
+
+u16 qeth_osa_select_queue(struct net_device *dev, struct sk_buff *skb,
+			  struct net_device *sb_dev,
+			  select_queue_fallback_t fallback)
+{
+	struct qeth_card *card = dev->ml_priv;
+
+	if (qeth_uses_tx_prio_queueing(card))
+		return qeth_get_priority_queue(card, skb);
+
+	return fallback(dev, skb, sb_dev);
+}
+EXPORT_SYMBOL_GPL(qeth_osa_select_queue);
 
 int qeth_open(struct net_device *dev)
 {

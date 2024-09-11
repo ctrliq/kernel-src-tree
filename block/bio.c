@@ -642,73 +642,82 @@ inline int bio_phys_segments(struct request_queue *q, struct bio *bio)
 }
 EXPORT_SYMBOL(bio_phys_segments);
 
-/**
- * 	__bio_clone_fast - clone a bio that shares the original bio's biovec
- * 	@bio: destination bio
- * 	@bio_src: bio to clone
- *
- *	Clone a &bio. Caller will own the returned bio, but not
- *	the actual data it points to. Reference count of returned
- * 	bio will be one.
- *
- * 	Caller must ensure that @bio_src is not freed before @bio.
- */
-void __bio_clone_fast(struct bio *bio, struct bio *bio_src)
+static int __bio_clone(struct bio *bio, struct bio *bio_src, gfp_t gfp)
 {
-	WARN_ON_ONCE(bio->bi_pool && bio->bi_max_vecs);
-
-	/*
-	 * most users will be overriding ->bi_disk with a new target,
-	 * so we don't set nor calculate new physical/hw segment counts here
-	 */
-	bio->bi_disk = bio_src->bi_disk;
-	bio->bi_partno = bio_src->bi_partno;
 	bio_set_flag(bio, BIO_CLONED);
 	if (bio_flagged(bio_src, BIO_THROTTLED))
 		bio_set_flag(bio, BIO_THROTTLED);
-	bio->bi_opf = bio_src->bi_opf;
 	bio->bi_ioprio = bio_src->bi_ioprio;
 	bio->bi_write_hint = bio_src->bi_write_hint;
 	bio->bi_iter = bio_src->bi_iter;
-	bio->bi_io_vec = bio_src->bi_io_vec;
 
 	bio_clone_blkg_association(bio, bio_src);
 	blkcg_bio_issue_init(bio);
+
+	if (bio_integrity(bio_src) &&
+	    bio_integrity_clone(bio, bio_src, gfp) < 0)
+		return -ENOMEM;
+	return 0;
 }
-EXPORT_SYMBOL(__bio_clone_fast);
 
 /**
- *	bio_clone_fast - clone a bio that shares the original bio's biovec
- *	@bio: bio to clone
- *	@gfp_mask: allocation priority
- *	@bs: bio_set to allocate from
+ * bio_clone_fast - clone a bio that shares the original bio's biovec
+ * @bio_src: bio to clone from
+ * @gfp: allocation priority
+ * @bs: bio_set to allocate from
  *
- * 	Like __bio_clone_fast, only also allocates the returned bio
+ * Allocate a new bio that is a clone of @bio_src. The caller owns the returned
+ * bio, but not the actual data it points to.
+ *
+ * The caller must ensure that the return bio is not freed before @bio_src.
  */
-struct bio *bio_clone_fast(struct bio *bio, gfp_t gfp_mask, struct bio_set *bs)
+struct bio *bio_clone_fast(struct bio *bio_src, gfp_t gfp, struct bio_set *bs)
 {
-	struct bio *b;
+	struct bio *bio;
 
-	b = bio_alloc_bioset(gfp_mask, 0, bs);
-	if (!b)
+	bio = bio_alloc_bioset(gfp, 0, bs);
+	if (!bio)
 		return NULL;
 
-	__bio_clone_fast(b, bio);
-
-	if (bio_integrity(bio)) {
-		int ret;
-
-		ret = bio_integrity_clone(b, bio, gfp_mask);
-
-		if (ret < 0) {
-			bio_put(b);
-			return NULL;
-		}
+	if (__bio_clone(bio, bio_src, gfp) < 0) {
+		bio_put(bio);
+		return NULL;
 	}
+	bio->bi_disk = bio_src->bi_disk;
+	bio->bi_partno = bio_src->bi_partno;
+	bio->bi_opf = bio_src->bi_opf;
+	bio->bi_io_vec = bio_src->bi_io_vec;
 
-	return b;
+	return bio;
 }
 EXPORT_SYMBOL(bio_clone_fast);
+
+/**
+ * __bio_clone_fast - clone a bio that shares the original bio's biovec
+ * @bio: bio to clone into
+ * @bio_src: bio to clone from
+ * @gfp: allocation priority
+ *
+ * Initialize a new bio in caller provided memory that is a clone of @bio_src.
+ * The caller owns the returned bio, but not the actual data it points to.
+ *
+ * The caller must ensure that @bio_src is not freed before @bio.
+ */
+int __bio_clone_fast(struct bio *bio, struct bio *bio_src, gfp_t gfp)
+{
+	int ret;
+
+	bio_init(bio, bio_src->bi_io_vec, 0);
+	bio->bi_opf = bio_src->bi_opf;
+	bio->bi_partno = bio_src->bi_partno;
+	bio->bi_disk = bio_src->bi_disk;
+
+	ret = __bio_clone(bio, bio_src, gfp);
+	if (ret)
+		bio_uninit(bio);
+	return ret;
+}
+EXPORT_SYMBOL(__bio_clone_fast);
 
 const char *bio_devname(struct bio *bio, char *buf)
 {
@@ -1755,7 +1764,7 @@ struct bio *bio_copy_kern(struct request_queue *q, void *data, unsigned int len,
 		if (bytes > len)
 			bytes = len;
 
-		page = alloc_page(q->bounce_gfp | gfp_mask);
+		page = alloc_page(q->bounce_gfp | __GFP_ZERO | gfp_mask);
 		if (!page)
 			goto cleanup;
 
@@ -2189,24 +2198,6 @@ bad:
 	return -ENOMEM;
 }
 EXPORT_SYMBOL(bioset_init);
-
-/*
- * Initialize and setup a new bio_set, based on the settings from
- * another bio_set.
- */
-int bioset_init_from_src(struct bio_set *bs, struct bio_set *src)
-{
-	int flags;
-
-	flags = 0;
-	if (src->bvec_pool.min_nr)
-		flags |= BIOSET_NEED_BVECS;
-	if (src->rescue_workqueue)
-		flags |= BIOSET_NEED_RESCUER;
-
-	return bioset_init(bs, src->bio_pool.min_nr, src->front_pad, flags);
-}
-EXPORT_SYMBOL(bioset_init_from_src);
 
 #ifdef CONFIG_BLK_CGROUP
 /**

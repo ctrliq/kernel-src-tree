@@ -157,6 +157,8 @@ enum idxd_device_reset_type {
 #define IDXD_INTC_CMD			0x02
 #define IDXD_INTC_OCCUPY			0x04
 #define IDXD_INTC_PERFMON_OVFL		0x08
+#define IDXD_INTC_HALT_STATE		0x10
+#define IDXD_INTC_INT_HANDLE_REVOKED	0x80000000
 
 #define IDXD_CMD_OFFSET			0xa0
 union idxd_command_reg {
@@ -351,6 +353,7 @@ union wqcfg {
 } __packed;
 
 #define WQCFG_PASID_IDX                2
+#define WQCFG_PRIVL_IDX		2
 #define WQCFG_OCCUP_IDX		6
 
 #define WQCFG_OCCUP_MASK	0xffff

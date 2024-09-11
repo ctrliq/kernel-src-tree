@@ -36,7 +36,7 @@ static DEFINE_PER_CPU_SHARED_ALIGNED(struct call_function_data, cfd_data);
 
 static DEFINE_PER_CPU_SHARED_ALIGNED(struct llist_head, call_single_queue);
 
-static void flush_smp_call_function_queue(bool warn_cpu_offline);
+static void __flush_smp_call_function_queue(bool warn_cpu_offline);
 
 int smpcfd_prepare_cpu(unsigned int cpu)
 {
@@ -81,7 +81,7 @@ int smpcfd_dying_cpu(unsigned int cpu)
 	 * ensure that the outgoing CPU doesn't go offline with work
 	 * still pending.
 	 */
-	flush_smp_call_function_queue(false);
+	__flush_smp_call_function_queue(false);
 	irq_work_run();
 	return 0;
 }
@@ -191,11 +191,11 @@ static int generic_exec_single(int cpu, call_single_data_t *csd)
  */
 void generic_smp_call_function_single_interrupt(void)
 {
-	flush_smp_call_function_queue(true);
+	__flush_smp_call_function_queue(true);
 }
 
 /**
- * flush_smp_call_function_queue - Flush pending smp-call-function callbacks
+ * __flush_smp_call_function_queue - Flush pending smp-call-function callbacks
  *
  * @warn_cpu_offline: If set to 'true', warn if callbacks were queued on an
  *		      offline CPU. Skip this check if set to 'false'.
@@ -208,7 +208,7 @@ void generic_smp_call_function_single_interrupt(void)
  * Loop through the call_single_queue and run all the queued callbacks.
  * Must be called with interrupts disabled.
  */
-static void flush_smp_call_function_queue(bool warn_cpu_offline)
+static void __flush_smp_call_function_queue(bool warn_cpu_offline)
 {
 	call_single_data_t *csd, *csd_next;
 	struct llist_node *entry, *prev;
@@ -314,17 +314,33 @@ static void flush_smp_call_function_queue(bool warn_cpu_offline)
 		sched_ttwu_pending(entry);
 }
 
-void flush_smp_call_function_from_idle(void)
+
+/**
+ * flush_smp_call_function_queue - Flush pending smp-call-function callbacks
+ *				   from task context (idle, migration thread)
+ *
+ * When TIF_POLLING_NRFLAG is supported and a CPU is in idle and has it
+ * set, then remote CPUs can avoid sending IPIs and wake the idle CPU by
+ * setting TIF_NEED_RESCHED. The idle task on the woken up CPU has to
+ * handle queued SMP function calls before scheduling.
+ *
+ * The migration thread has to ensure that an eventually pending wakeup has
+ * been handled before it migrates a task.
+ */
+void flush_smp_call_function_queue(void)
 {
+	unsigned int was_pending;
 	unsigned long flags;
 
 	if (llist_empty(this_cpu_ptr(&call_single_queue)))
 		return;
 
 	local_irq_save(flags);
-	flush_smp_call_function_queue(true);
+	/* Get the already pending soft interrupts for RT enabled kernels */
+	was_pending = local_softirq_pending();
+	__flush_smp_call_function_queue(true);
 	if (local_softirq_pending())
-		do_softirq();
+		do_softirq_post_smp_call_flush(was_pending);
 
 	local_irq_restore(flags);
 }

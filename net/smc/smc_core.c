@@ -33,6 +33,7 @@
 #include "smc_ism.h"
 #include "smc_netlink.h"
 #include "smc_stats.h"
+#include "smc_tracepoint.h"
 
 #define SMC_LGR_NUM_INCR		256
 #define SMC_LGR_FREE_DELAY_SERV		(600 * HZ)
@@ -348,7 +349,7 @@ static int smc_nl_fill_lgr(struct smc_link_group *lgr,
 	if (nla_put_u8(skb, SMC_NLA_LGR_R_VLAN_ID, lgr->vlan_id))
 		goto errattr;
 	if (nla_put_u64_64bit(skb, SMC_NLA_LGR_R_NET_COOKIE,
-			      lgr->net->net_cookie, SMC_NLA_LGR_R_PAD))
+			      atomic64_read(&lgr->net->net_cookie), SMC_NLA_LGR_R_PAD))
 		goto errattr;
 	memcpy(smc_target, lgr->pnet_id, SMC_MAX_PNETID_LEN);
 	smc_target[SMC_MAX_PNETID_LEN] = 0;
@@ -767,7 +768,9 @@ int smcr_link_init(struct smc_link_group *lgr, struct smc_link *lnk,
 	lnk->psn_initial = rndvec[0] + (rndvec[1] << 8) +
 		(rndvec[2] << 16);
 	rc = smc_ib_determine_gid(lnk->smcibdev, lnk->ibport,
-				  ini->vlan_id, lnk->gid, &lnk->sgid_index);
+				  ini->vlan_id, lnk->gid, &lnk->sgid_index,
+				  lgr->smc_version == SMC_V2 ?
+						  &ini->smcrv2 : NULL);
 	if (rc)
 		goto out;
 	rc = smc_llc_link_init(lnk);
@@ -1595,9 +1598,9 @@ void smcr_lgr_set_type(struct smc_link_group *lgr, enum smc_lgr_type new_type)
 		lgr_type = "ASYMMETRIC_LOCAL";
 		break;
 	}
-	pr_warn_ratelimited("smc: SMC-R lg %*phN net %llu state changed: "
+	pr_warn_ratelimited("smc: SMC-R lg %*phN net %ld state changed: "
 			    "%s, pnetid %.16s\n", SMC_LGR_ID_SIZE, &lgr->id,
-			    lgr->net->net_cookie, lgr_type, lgr->pnet_id);
+			    atomic64_read(&lgr->net->net_cookie), lgr_type, lgr->pnet_id);
 }
 
 /* set new lgr type and tag a link as asymmetric */
@@ -1689,15 +1692,19 @@ static void smcr_link_down(struct smc_link *lnk)
 /* must be called under lgr->llc_conf_mutex lock */
 void smcr_link_down_cond(struct smc_link *lnk)
 {
-	if (smc_link_downing(&lnk->state))
+	if (smc_link_downing(&lnk->state)) {
+		trace_smcr_link_down(lnk, __builtin_return_address(0));
 		smcr_link_down(lnk);
+	}
 }
 
 /* will get the lgr->llc_conf_mutex lock */
 void smcr_link_down_cond_sched(struct smc_link *lnk)
 {
-	if (smc_link_downing(&lnk->state))
+	if (smc_link_downing(&lnk->state)) {
+		trace_smcr_link_down(lnk, __builtin_return_address(0));
 		schedule_work(&lnk->link_down_wrk);
+	}
 }
 
 void smcr_port_err(struct smc_ib_device *smcibdev, u8 ibport)

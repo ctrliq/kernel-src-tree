@@ -331,15 +331,10 @@ struct qdio_initialize {
 	qdio_handler_t *input_handler;
 	qdio_handler_t *output_handler;
 	void (*irq_poll)(struct ccw_device *cdev, unsigned long data);
-	unsigned int scan_threshold;
 	unsigned long int_parm;
 	struct qdio_buffer ***input_sbal_addr_array;
 	struct qdio_buffer ***output_sbal_addr_array;
 };
-
-#define QDIO_FLAG_SYNC_INPUT		0x01
-#define QDIO_FLAG_SYNC_OUTPUT		0x02
-#define QDIO_FLAG_PCI_OUT		0x10
 
 int qdio_alloc_buffers(struct qdio_buffer **buf, unsigned int count);
 void qdio_free_buffers(struct qdio_buffer **buf, unsigned int count);
@@ -350,14 +345,18 @@ extern int qdio_allocate(struct ccw_device *cdev, unsigned int no_input_qs,
 extern int qdio_establish(struct ccw_device *cdev,
 			  struct qdio_initialize *init_data);
 extern int qdio_activate(struct ccw_device *);
-extern int do_QDIO(struct ccw_device *cdev, unsigned int callflags, int q_nr,
-		   unsigned int bufnr, unsigned int count, struct qaob *aob);
 extern int qdio_start_irq(struct ccw_device *cdev);
 extern int qdio_stop_irq(struct ccw_device *cdev);
-extern int qdio_get_next_buffers(struct ccw_device *, int, int *, int *);
-extern int qdio_inspect_queue(struct ccw_device *cdev, unsigned int nr,
-			      bool is_input, unsigned int *bufnr,
-			      unsigned int *error);
+extern int qdio_inspect_input_queue(struct ccw_device *cdev, unsigned int nr,
+				    unsigned int *bufnr, unsigned int *error);
+extern int qdio_inspect_output_queue(struct ccw_device *cdev, unsigned int nr,
+				     unsigned int *bufnr, unsigned int *error);
+extern int qdio_add_bufs_to_input_queue(struct ccw_device *cdev,
+					unsigned int q_nr, unsigned int bufnr,
+					unsigned int count);
+extern int qdio_add_bufs_to_output_queue(struct ccw_device *cdev,
+					 unsigned int q_nr, unsigned int bufnr,
+					 unsigned int count, struct qaob *aob);
 extern int qdio_shutdown(struct ccw_device *, int);
 extern int qdio_free(struct ccw_device *);
 extern int qdio_get_ssqd_desc(struct ccw_device *, struct qdio_ssqd_desc *);

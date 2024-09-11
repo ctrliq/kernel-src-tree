@@ -986,7 +986,8 @@ lpfc_cmpl_ct_cmd_gid_ft(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				 "0226 NS query failed due to link event: "
 				 "ulp_status x%x ulp_word4 x%x fc_flag x%x "
 				 "port_state x%x gidft_inp x%x\n",
-				 ulp_status, ulp_word4, vport->fc_flag,
+				 irsp->ulpStatus, irsp->un.ulpWord[4],
+				 vport->fc_flag,
 				 vport->port_state, vport->gidft_inp);
 		if (vport->fc_flag & FC_RSCN_MODE)
 			lpfc_els_flush_rscn(vport);
@@ -1209,7 +1210,8 @@ lpfc_cmpl_ct_cmd_gid_pt(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				 "4166 NS query failed due to link event: "
 				 "ulp_status x%x ulp_word4 x%x fc_flag x%x "
 				 "port_state x%x gidft_inp x%x\n",
-				 ulp_status, ulp_word4, vport->fc_flag,
+				 irsp->ulpStatus, irsp->un.ulpWord[4],
+				 vport->fc_flag,
 				 vport->port_state, vport->gidft_inp);
 		if (vport->fc_flag & FC_RSCN_MODE)
 			lpfc_els_flush_rscn(vport);

@@ -388,6 +388,8 @@ enum {
 
 #define WFPM_LMAC1_PD_NOTIFICATION      0xa0338c
 #define WFPM_ARC1_PD_NOTIFICATION       0xa03044
+#define HPM_SECONDARY_DEVICE_STATE      0xa03404
+
 
 /* For UMAG_GEN_HW_STATUS reg check */
 enum {
@@ -455,6 +457,13 @@ enum {
 #define UREG_DOORBELL_TO_ISR6_SUSPEND	BIT(18)
 #define UREG_DOORBELL_TO_ISR6_RESUME	BIT(19)
 #define UREG_DOORBELL_TO_ISR6_PNVM	BIT(20)
+
+/*
+ * From BZ family driver triggers this bit for suspend and resume
+ * The driver should update CSR_IPC_SLEEP_CONTROL before triggering
+ * this interrupt with suspend/resume value
+ */
+#define UREG_DOORBELL_TO_ISR6_SLEEP_CTRL	BIT(31)
 
 #define CNVI_MBOX_C			0xA3400C
 

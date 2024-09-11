@@ -1257,17 +1257,6 @@ struct cfg80211_unsol_bcast_probe_resp {
 };
 
 /**
- * enum cfg80211_ap_settings_flags - AP settings flags
- *
- * Used by cfg80211_ap_settings
- *
- * @AP_SETTINGS_EXTERNAL_AUTH_SUPPORT: AP supports external authentication
- */
-enum cfg80211_ap_settings_flags {
-	AP_SETTINGS_EXTERNAL_AUTH_SUPPORT = BIT(0),
-};
-
-/**
  * struct cfg80211_ap_settings - AP configuration
  *
  * Used to configure an AP interface.
@@ -1497,6 +1486,8 @@ struct sta_txpwr {
  * @airtime_weight: airtime scheduler weight for this station
  * @txpwr: transmit power for an associated station
  * @he_6ghz_capa: HE 6 GHz Band capabilities of station
+ * @eht_capa: EHT capabilities of station
+ * @eht_capa_len: the length of the EHT capabilities
  */
 struct station_parameters {
 	const u8 *supported_rates;
@@ -1530,6 +1521,8 @@ struct station_parameters {
 	u16 airtime_weight;
 	struct sta_txpwr txpwr;
 	const struct ieee80211_he_6ghz_capa *he_6ghz_capa;
+	const struct ieee80211_eht_cap_elem *eht_capa;
+	u8 eht_capa_len;
 };
 
 /**
@@ -4153,14 +4146,14 @@ struct mgmt_frame_regs {
  *	those to decrypt (Re)Association Request and encrypt (Re)Association
  *	Response frame.
  *
- * @set_radar_offchan: Configure dedicated offchannel chain available for
+ * @set_radar_background: Configure dedicated offchannel chain available for
  *	radar/CAC detection on some hw. This chain can't be used to transmit
  *	or receive frames and it is bounded to a running wdev.
- *	Offchannel radar/CAC detection allows to avoid the CAC downtime
+ *	Background radar/CAC detection allows to avoid the CAC downtime
  *	switching to a different channel during CAC detection on the selected
  *	radar channel.
  *	The caller is expected to set chandef pointer to NULL in order to
- *	disable offchannel CAC/radar detection.
+ *	disable background CAC/radar detection.
  */
 struct cfg80211_ops {
 	int	(*suspend)(struct wiphy *wiphy, struct cfg80211_wowlan *wow);
@@ -4493,8 +4486,8 @@ struct cfg80211_ops {
 				struct cfg80211_color_change_settings *params);
 	int     (*set_fils_aad)(struct wiphy *wiphy, struct net_device *dev,
 				struct cfg80211_fils_aad *fils_aad);
-	int	(*set_radar_offchan)(struct wiphy *wiphy,
-				     struct cfg80211_chan_def *chandef);
+	int	(*set_radar_background)(struct wiphy *wiphy,
+					struct cfg80211_chan_def *chandef);
 };
 
 /*
@@ -7708,9 +7701,9 @@ cfg80211_radar_event(struct wiphy *wiphy,
 }
 
 static inline void
-cfg80211_offchan_radar_event(struct wiphy *wiphy,
-			     struct cfg80211_chan_def *chandef,
-			     gfp_t gfp)
+cfg80211_background_radar_event(struct wiphy *wiphy,
+				struct cfg80211_chan_def *chandef,
+				gfp_t gfp)
 {
 	__cfg80211_radar_event(wiphy, chandef, true, gfp);
 }
@@ -7745,13 +7738,13 @@ void cfg80211_cac_event(struct net_device *netdev,
 			enum nl80211_radar_event event, gfp_t gfp);
 
 /**
- * cfg80211_offchan_cac_abort - Channel Availability Check offchan abort event
+ * cfg80211_background_cac_abort - Channel Availability Check offchan abort event
  * @wiphy: the wiphy
  *
  * This function is called by the driver when a Channel Availability Check
  * (CAC) is aborted by a offchannel dedicated chain.
  */
-void cfg80211_offchan_cac_abort(struct wiphy *wiphy);
+void cfg80211_background_cac_abort(struct wiphy *wiphy);
 
 /**
  * cfg80211_gtk_rekey_notify - notify userspace about driver rekeying

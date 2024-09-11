@@ -3656,7 +3656,6 @@ lpfc_sli_process_sol_iocb(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 			  struct lpfc_iocbq *saveq)
 {
 	struct lpfc_iocbq *cmdiocbp;
-	int rc = 1;
 	unsigned long iflag;
 
 	cmdiocbp = lpfc_sli_iocbq_lookup(phba, pring, saveq);
@@ -3781,7 +3780,7 @@ lpfc_sli_process_sol_iocb(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		}
 	}
 
-	return rc;
+	return 1;
 }
 
 /**
@@ -5199,6 +5198,7 @@ lpfc_sli_brdrestart_s4(struct lpfc_hba *phba)
 	phba->pport->stopped = 0;
 	phba->link_state = LPFC_INIT_START;
 	phba->hba_flag = 0;
+	phba->sli4_hba.fawwpn_flag = 0;
 	spin_unlock_irq(&phba->hbalock);
 
 	memset(&psli->lnk_stat_offsets, 0, sizeof(psli->lnk_stat_offsets));
@@ -10438,13 +10438,32 @@ lpfc_sli4_iocb2wqe(struct lpfc_hba *phba, struct lpfc_iocbq *iocbq,
 		bf_set(wqe_ct, &wqe->els_req.wqe_com, ct);
 		bf_set(wqe_pu, &wqe->els_req.wqe_com, 0);
 		/* CCP CCPE PV PRI in word10 were set in the memcpy */
-		if (command_type == ELS_COMMAND_FIP)
-			els_id = ((iocbq->iocb_flag & LPFC_FIP_ELS_ID_MASK)
-					>> LPFC_FIP_ELS_ID_SHIFT);
 		pcmd = (uint32_t *) (((struct lpfc_dmabuf *)
 					iocbq->context2)->virt);
 		if_type = bf_get(lpfc_sli_intf_if_type,
 					&phba->sli4_hba.sli_intf);
+		/* Word 11 - ELS_ID */
+		switch (*pcmd) {
+		case ELS_CMD_PLOGI:
+			els_id = LPFC_ELS_ID_PLOGI;
+			break;
+		case ELS_CMD_FLOGI:
+			els_id = LPFC_ELS_ID_FLOGI;
+			break;
+		case ELS_CMD_LOGO:
+			els_id = LPFC_ELS_ID_LOGO;
+			break;
+		case ELS_CMD_FDISC:
+			if (!iocbq->vport->fc_myDID) {
+				els_id = LPFC_ELS_ID_FDISC;
+				break;
+			}
+			fallthrough;
+		default:
+			els_id = LPFC_ELS_ID_DEFAULT;
+			break;
+		}
+
 		if (if_type >= LPFC_SLI_INTF_IF_TYPE_2) {
 			if (pcmd && (*pcmd == ELS_CMD_FLOGI ||
 				*pcmd == ELS_CMD_SCR ||
@@ -12309,6 +12328,26 @@ lpfc_ignore_els_cmpl(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 {
 	struct lpfc_nodelist *ndlp = NULL;
 	IOCB_t *irsp = &rspiocb->iocb;
+	LPFC_MBOXQ_t *mbox;
+	struct lpfc_dmabuf *mp;
+
+	if (phba->sli_rev < LPFC_SLI_REV4) {
+
+		/* It is possible a PLOGI_RJT for NPIV ports to get aborted.
+		 * The MBX_REG_LOGIN64 mbox command is freed back to the
+		 * mbox_mem_pool here.
+		 */
+		if (cmdiocb->context_un.mbox) {
+			mbox = cmdiocb->context_un.mbox;
+			mp = (struct lpfc_dmabuf *)mbox->ctx_buf;
+			if (mp) {
+				lpfc_mbuf_free(phba, mp->virt, mp->phys);
+				kfree(mp);
+			}
+			mempool_free(mbox, phba->mbox_mem_pool);
+			cmdiocb->context_un.mbox = NULL;
+		}
+	}
 
 	/* ELS cmd tag <ulpIoTag> completes */
 	lpfc_printf_log(phba, KERN_INFO, LOG_ELS,

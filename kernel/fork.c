@@ -94,6 +94,7 @@
 #include <linux/thread_info.h>
 #include <linux/scs.h>
 #include <linux/kasan.h>
+#include <linux/sched/mm.h>
 
 #include <asm/pgtable.h>
 #include <asm/pgalloc.h>
@@ -1043,6 +1044,7 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 	mm_init_cpumask(mm);
 	mm_init_aio(mm);
 	mm_init_owner(mm, p);
+	mm_pasid_init(mm);
 	RCU_INIT_POINTER(mm->exe_file, NULL);
 	mmu_notifier_subscriptions_init(mm);
 	init_tlb_flush_pending(mm);
@@ -1113,6 +1115,7 @@ static inline void __mmput(struct mm_struct *mm)
 	}
 	if (mm->binfmt)
 		module_put(mm->binfmt->module);
+	mm_pasid_drop(mm);
 	mmdrop(mm);
 }
 

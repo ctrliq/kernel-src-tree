@@ -25,6 +25,7 @@
 #include <linux/pagemap.h>
 #include <linux/swap.h>
 #include <linux/rwsem.h>
+#include <linux/cc_platform.h>
 
 #include <asm/apic.h>
 #include <asm/perf_event.h>
@@ -63,10 +64,6 @@ MODULE_DEVICE_TABLE(x86cpu, svm_cpu_id);
 
 #define DEBUGCTL_RESERVED_BITS (~(0x3fULL))
 
-#define TSC_RATIO_RSVD          0xffffff0000000000ULL
-#define TSC_RATIO_MIN		0x0000000000000001ULL
-#define TSC_RATIO_MAX		0x000000ffffffffffULL
-
 static bool erratum_383_found __read_mostly;
 
 u32 msrpm_offsets[MSRPM_OFFSETS] __read_mostly;
@@ -78,7 +75,6 @@ u32 msrpm_offsets[MSRPM_OFFSETS] __read_mostly;
 static uint64_t osvw_len = 4, osvw_status;
 
 static DEFINE_PER_CPU(u64, current_tsc_ratio);
-#define TSC_RATIO_DEFAULT	0x0100000000ULL
 
 static const struct svm_direct_access_msrs {
 	u32 index;   /* Index of the MSR */
@@ -459,7 +455,7 @@ static int has_svm(void)
 		return 0;
 	}
 
-	if (sev_active()) {
+	if (cc_platform_has(CC_ATTR_GUEST_MEM_ENCRYPT)) {
 		pr_info("KVM is unsupported when running as an SEV guest\n");
 		return 0;
 	}
@@ -471,7 +467,7 @@ static void svm_hardware_disable(void)
 {
 	/* Make sure we clean up behind us */
 	if (tsc_scaling)
-		wrmsrl(MSR_AMD64_TSC_RATIO, TSC_RATIO_DEFAULT);
+		wrmsrl(MSR_AMD64_TSC_RATIO, SVM_TSC_RATIO_DEFAULT);
 
 	cpu_svm_disable();
 
@@ -517,8 +513,8 @@ static int svm_hardware_enable(void)
 		 * Set the default value, even if we don't use TSC scaling
 		 * to avoid having stale value in the msr
 		 */
-		wrmsrl(MSR_AMD64_TSC_RATIO, TSC_RATIO_DEFAULT);
-		__this_cpu_write(current_tsc_ratio, TSC_RATIO_DEFAULT);
+		wrmsrl(MSR_AMD64_TSC_RATIO, SVM_TSC_RATIO_DEFAULT);
+		__this_cpu_write(current_tsc_ratio, SVM_TSC_RATIO_DEFAULT);
 	}
 
 
@@ -1204,12 +1200,6 @@ static int svm_vcpu_create(struct kvm_vcpu *vcpu)
 	if (err)
 		goto error_free_vmsa_page;
 
-	/* We initialize this flag to true to make sure that the is_running
-	 * bit would be set the first time the vcpu is loaded.
-	 */
-	if (irqchip_in_kernel(vcpu->kvm) && kvm_apicv_activated(vcpu->kvm))
-		svm->avic_is_running = true;
-
 	svm->msrpm = svm_vcpu_alloc_msrpm();
 	if (!svm->msrpm) {
 		err = -ENOMEM;
@@ -1315,13 +1305,13 @@ static void svm_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
 		indirect_branch_prediction_barrier();
 	}
 	if (kvm_vcpu_apicv_active(vcpu))
-		avic_vcpu_load(vcpu, cpu);
+		__avic_vcpu_load(vcpu, cpu);
 }
 
 static void svm_vcpu_put(struct kvm_vcpu *vcpu)
 {
 	if (kvm_vcpu_apicv_active(vcpu))
-		avic_vcpu_put(vcpu);
+		__avic_vcpu_put(vcpu);
 
 	svm_prepare_host_switch(vcpu);
 
@@ -1572,7 +1562,7 @@ static void svm_set_gdt(struct kvm_vcpu *vcpu, struct desc_ptr *dt)
 	vmcb_mark_dirty(svm->vmcb, VMCB_DT);
 }
 
-static void svm_post_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
+static void sev_post_set_cr3(struct kvm_vcpu *vcpu, unsigned long cr3)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 
@@ -2720,7 +2710,7 @@ static int svm_set_msr(struct kvm_vcpu *vcpu, struct msr_data *msr)
 			break;
 		}
 
-		if (data & TSC_RATIO_RSVD)
+		if (data & SVM_TSC_RATIO_RSVD)
 			return 1;
 
 		svm->tsc_ratio_msr = data;
@@ -2915,7 +2905,7 @@ static int interrupt_window_interception(struct kvm_vcpu *vcpu)
 	 * In this case AVIC was temporarily disabled for
 	 * requesting the IRQ window and we have to re-enable it.
 	 */
-	kvm_request_apicv_update(vcpu->kvm, true, APICV_INHIBIT_REASON_IRQWIN);
+	kvm_clear_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
 
 	++vcpu->stat.irq_window_exits;
 	return 1;
@@ -3323,19 +3313,53 @@ static void svm_inject_irq(struct kvm_vcpu *vcpu)
 		SVM_EVTINJ_VALID | SVM_EVTINJ_TYPE_INTR;
 }
 
-static void svm_deliver_interrupt(struct kvm_lapic *apic, int delivery_mode,
-				  int trig_mode, int vector)
+void svm_complete_interrupt_delivery(struct kvm_vcpu *vcpu, int delivery_mode,
+				     int trig_mode, int vector)
 {
-	struct kvm_vcpu *vcpu = apic->vcpu;
+	/*
+	 * vcpu->arch.apicv_active must be read after vcpu->mode.
+	 * Pairs with smp_store_release in vcpu_enter_guest.
+	 */
+	bool in_guest_mode = (smp_load_acquire(&vcpu->mode) == IN_GUEST_MODE);
 
-	kvm_lapic_set_irr(vector, apic);
-	if (svm_deliver_avic_intr(vcpu, vector)) {
+	if (!READ_ONCE(vcpu->arch.apicv_active)) {
+		/* Process the interrupt via inject_pending_event */
 		kvm_make_request(KVM_REQ_EVENT, vcpu);
 		kvm_vcpu_kick(vcpu);
-	} else {
-		trace_kvm_apicv_accept_irq(vcpu->vcpu_id, delivery_mode,
-					   trig_mode, vector);
+		return;
 	}
+
+	trace_kvm_apicv_accept_irq(vcpu->vcpu_id, delivery_mode, trig_mode, vector);
+	if (in_guest_mode) {
+		/*
+		 * Signal the doorbell to tell hardware to inject the IRQ.  If
+		 * the vCPU exits the guest before the doorbell chimes, hardware
+		 * will automatically process AVIC interrupts at the next VMRUN.
+		 */
+		avic_ring_doorbell(vcpu);
+	} else {
+		/*
+		 * Wake the vCPU if it was blocking.  KVM will then detect the
+		 * pending IRQ when checking if the vCPU has a wake event.
+		 */
+		kvm_vcpu_wake_up(vcpu);
+	}
+}
+
+static void svm_deliver_interrupt(struct kvm_lapic *apic,  int delivery_mode,
+				  int trig_mode, int vector)
+{
+	kvm_lapic_set_irr(vector, apic);
+
+	/*
+	 * Pairs with the smp_mb_*() after setting vcpu->guest_mode in
+	 * vcpu_enter_guest() to ensure the write to the vIRR is ordered before
+	 * the read of guest_mode.  This guarantees that either VMRUN will see
+	 * and process the new vIRR entry, or that svm_complete_interrupt_delivery
+	 * will signal the doorbell if the CPU has already entered the guest.
+	 */
+	smp_mb__after_atomic();
+	svm_complete_interrupt_delivery(apic->vcpu, delivery_mode, trig_mode, vector);
 }
 
 static void svm_update_cr8_intercept(struct kvm_vcpu *vcpu, int tpr, int irr)
@@ -3479,7 +3503,7 @@ static void svm_enable_irq_window(struct kvm_vcpu *vcpu)
 		 * via AVIC. In such case, we need to temporarily disable AVIC,
 		 * and fallback to injecting IRQ via V_IRQ.
 		 */
-		kvm_request_apicv_update(vcpu->kvm, false, APICV_INHIBIT_REASON_IRQWIN);
+		kvm_set_apicv_inhibit(vcpu->kvm, APICV_INHIBIT_REASON_IRQWIN);
 		svm_set_vintr(svm);
 	}
 }
@@ -3788,7 +3812,7 @@ static fastpath_t svm_vcpu_run(struct kvm_vcpu *vcpu)
 	vcpu->arch.regs_dirty = 0;
 
 	if (unlikely(svm->vmcb->control.exit_code == SVM_EXIT_NMI))
-		kvm_before_interrupt(vcpu);
+		kvm_before_interrupt(vcpu, KVM_HANDLING_NMI);
 
 	kvm_load_host_xsave_state(vcpu);
 	stgi();
@@ -3890,11 +3914,6 @@ static int __init svm_check_processor_compat(void)
 	return 0;
 }
 
-static bool svm_cpu_has_accelerated_tpr(void)
-{
-	return false;
-}
-
 /*
  * The kvm parameter can be NULL (module initialization, or invocation before
  * VM creation). Be sure to check the kvm parameter before using it.
@@ -3926,6 +3945,7 @@ static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
 {
 	struct vcpu_svm *svm = to_svm(vcpu);
 	struct kvm_cpuid_entry2 *best;
+	struct kvm *kvm = vcpu->kvm;
 
 	vcpu->arch.xsaves_enabled = guest_cpuid_has(vcpu, X86_FEATURE_XSAVE) &&
 				    boot_cpu_has(X86_FEATURE_XSAVE) &&
@@ -3952,16 +3972,14 @@ static void svm_vcpu_after_set_cpuid(struct kvm_vcpu *vcpu)
 		 * is exposed to the guest, disable AVIC.
 		 */
 		if (guest_cpuid_has(vcpu, X86_FEATURE_X2APIC))
-			kvm_request_apicv_update(vcpu->kvm, false,
-						 APICV_INHIBIT_REASON_X2APIC);
+			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_X2APIC);
 
 		/*
 		 * Currently, AVIC does not work with nested virtualization.
 		 * So, we disable AVIC when cpuid for SVM is set in the L1 guest.
 		 */
 		if (nested && guest_cpuid_has(vcpu, X86_FEATURE_SVM))
-			kvm_request_apicv_update(vcpu->kvm, false,
-						 APICV_INHIBIT_REASON_NESTED);
+			kvm_set_apicv_inhibit(kvm, APICV_INHIBIT_REASON_NESTED);
 	}
 	init_vmcb_after_set_cpuid(vcpu);
 }
@@ -4326,6 +4344,7 @@ static bool svm_can_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
 {
 	bool smep, smap, is_user;
 	unsigned long cr4;
+	u64 error_code;
 
 	/* Emulation is always possible when KVM has access to all guest state. */
 	if (!sev_guest(vcpu->kvm))
@@ -4344,47 +4363,77 @@ static bool svm_can_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
 		return false;
 
 	/*
+	 * Emulation is possible if the instruction is already decoded, e.g.
+	 * when completing I/O after returning from userspace.
+	 */
+	if (emul_type & EMULTYPE_NO_DECODE)
+		return true;
+
+	/*
+	 * Emulation is possible for SEV guests if and only if a prefilled
+	 * buffer containing the bytes of the intercepted instruction is
+	 * available. SEV guest memory is encrypted with a guest specific key
+	 * and cannot be decrypted by KVM, i.e. KVM would read cyphertext and
+	 * decode garbage.
+	 *
+	 * Inject #UD if KVM reached this point without an instruction buffer.
+	 * In practice, this path should never be hit by a well-behaved guest,
+	 * e.g. KVM doesn't intercept #UD or #GP for SEV guests, but this path
+	 * is still theoretically reachable, e.g. via unaccelerated fault-like
+	 * AVIC access, and needs to be handled by KVM to avoid putting the
+	 * guest into an infinite loop.   Injecting #UD is somewhat arbitrary,
+	 * but its the least awful option given lack of insight into the guest.
+	 */
+	if (unlikely(!insn)) {
+		kvm_queue_exception(vcpu, UD_VECTOR);
+		return false;
+	}
+
+	/*
+	 * Emulate for SEV guests if the insn buffer is not empty.  The buffer
+	 * will be empty if the DecodeAssist microcode cannot fetch bytes for
+	 * the faulting instruction because the code fetch itself faulted, e.g.
+	 * the guest attempted to fetch from emulated MMIO or a guest page
+	 * table used to translate CS:RIP resides in emulated MMIO.
+	 */
+	if (likely(insn_len))
+		return true;
+
+	/*
 	 * Detect and workaround Errata 1096 Fam_17h_00_0Fh.
 	 *
 	 * Errata:
-	 * When CPU raise #NPF on guest data access and vCPU CR4.SMAP=1, it is
-	 * possible that CPU microcode implementing DecodeAssist will fail
-	 * to read bytes of instruction which caused #NPF. In this case,
-	 * GuestIntrBytes field of the VMCB on a VMEXIT will incorrectly
-	 * return 0 instead of the correct guest instruction bytes.
+	 * When CPU raises #NPF on guest data access and vCPU CR4.SMAP=1, it is
+	 * possible that CPU microcode implementing DecodeAssist will fail to
+	 * read guest memory at CS:RIP and vmcb.GuestIntrBytes will incorrectly
+	 * be '0'.  This happens because microcode reads CS:RIP using a _data_
+	 * loap uop with CPL=0 privileges.  If the load hits a SMAP #PF, ucode
+	 * gives up and does not fill the instruction bytes buffer.
 	 *
-	 * This happens because CPU microcode reading instruction bytes
-	 * uses a special opcode which attempts to read data using CPL=0
-	 * priviledges. The microcode reads CS:RIP and if it hits a SMAP
-	 * fault, it gives up and returns no instruction bytes.
+	 * As above, KVM reaches this point iff the VM is an SEV guest, the CPU
+	 * supports DecodeAssist, a #NPF was raised, KVM's page fault handler
+	 * triggered emulation (e.g. for MMIO), and the CPU returned 0 in the
+	 * GuestIntrBytes field of the VMCB.
 	 *
-	 * Detection:
-	 * We reach here in case CPU supports DecodeAssist, raised #NPF and
-	 * returned 0 in GuestIntrBytes field of the VMCB.
-	 * First, errata can only be triggered in case vCPU CR4.SMAP=1.
-	 * Second, if vCPU CR4.SMEP=1, errata could only be triggered
-	 * in case vCPU CPL==3 (Because otherwise guest would have triggered
-	 * a SMEP fault instead of #NPF).
-	 * Otherwise, vCPU CR4.SMEP=0, errata could be triggered by any vCPU CPL.
-	 * As most guests enable SMAP if they have also enabled SMEP, use above
-	 * logic in order to attempt minimize false-positive of detecting errata
-	 * while still preserving all cases semantic correctness.
+	 * This does _not_ mean that the erratum has been encountered, as the
+	 * DecodeAssist will also fail if the load for CS:RIP hits a legitimate
+	 * #PF, e.g. if the guest attempt to execute from emulated MMIO and
+	 * encountered a reserved/not-present #PF.
 	 *
-	 * Workaround:
-	 * To determine what instruction the guest was executing, the hypervisor
-	 * will have to decode the instruction at the instruction pointer.
+	 * To hit the erratum, the following conditions must be true:
+	 *    1. CR4.SMAP=1 (obviously).
+	 *    2. CR4.SMEP=0 || CPL=3.  If SMEP=1 and CPL<3, the erratum cannot
+	 *       have been hit as the guest would have encountered a SMEP
+	 *       violation #PF, not a #NPF.
+	 *    3. The #NPF is not due to a code fetch, in which case failure to
+	 *       retrieve the instruction bytes is legitimate (see abvoe).
 	 *
-	 * In non SEV guest, hypervisor will be able to read the guest
-	 * memory to decode the instruction pointer when insn_len is zero
-	 * so we return true to indicate that decoding is possible.
-	 *
-	 * But in the SEV guest, the guest memory is encrypted with the
-	 * guest specific key and hypervisor will not be able to decode the
-	 * instruction pointer so we will not able to workaround it. Lets
-	 * print the error and request to kill the guest.
+	 * In addition, don't apply the erratum workaround if the #NPF occurred
+	 * while translating guest page tables (see below).
 	 */
-	if (likely(!insn || insn_len))
-		return true;
+	error_code = to_svm(vcpu)->vmcb->control.exit_info_1;
+	if (error_code & (PFERR_GUEST_PAGE_MASK | PFERR_FETCH_MASK))
+		goto resume_guest;
 
 	cr4 = kvm_read_cr4(vcpu);
 	smep = cr4 & X86_CR4_SMEP;
@@ -4409,6 +4458,21 @@ static bool svm_can_emulate_instruction(struct kvm_vcpu *vcpu, int emul_type,
 			kvm_make_request(KVM_REQ_TRIPLE_FAULT, vcpu);
 	}
 
+resume_guest:
+	/*
+	 * If the erratum was not hit, simply resume the guest and let it fault
+	 * again.  While awful, e.g. the vCPU may get stuck in an infinite loop
+	 * if the fault is at CPL=0, it's the lesser of all evils.  Exiting to
+	 * userspace will kill the guest, and letting the emulator read garbage
+	 * will yield random behavior and potentially corrupt the guest.
+	 *
+	 * Simply resuming the guest is technically not a violation of the SEV
+	 * architecture.  AMD's APM states that all code fetches and page table
+	 * accesses for SEV guest are encrypted, regardless of the C-Bit.  The
+	 * APM also states that encrypted accesses to MMIO are "ignored", but
+	 * doesn't explicitly define "ignored", i.e. doing nothing and letting
+	 * the guest spin is technically "ignoring" the access.
+	 */
 	return false;
 }
 
@@ -4461,7 +4525,6 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.hardware_unsetup = svm_hardware_unsetup,
 	.hardware_enable = svm_hardware_enable,
 	.hardware_disable = svm_hardware_disable,
-	.cpu_has_accelerated_tpr = svm_cpu_has_accelerated_tpr,
 	.has_emulated_msr = svm_has_emulated_msr,
 
 	.vcpu_create = svm_vcpu_create,
@@ -4475,8 +4538,8 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.prepare_switch_to_guest = svm_prepare_switch_to_guest,
 	.vcpu_load = svm_vcpu_load,
 	.vcpu_put = svm_vcpu_put,
-	.vcpu_blocking = svm_vcpu_blocking,
-	.vcpu_unblocking = svm_vcpu_unblocking,
+	.vcpu_blocking = avic_vcpu_blocking,
+	.vcpu_unblocking = avic_vcpu_unblocking,
 
 	.update_exception_bitmap = svm_update_exception_bitmap,
 	.get_msr_feature = svm_get_msr_feature,
@@ -4488,7 +4551,7 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.get_cpl = svm_get_cpl,
 	.get_cs_db_l_bits = svm_get_cs_db_l_bits,
 	.set_cr0 = svm_set_cr0,
-	.post_set_cr3 = svm_post_set_cr3,
+	.post_set_cr3 = sev_post_set_cr3,
 	.is_valid_cr4 = svm_is_valid_cr4,
 	.set_cr4 = svm_set_cr4,
 	.set_efer = svm_set_efer,
@@ -4527,13 +4590,9 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.enable_nmi_window = svm_enable_nmi_window,
 	.enable_irq_window = svm_enable_irq_window,
 	.update_cr8_intercept = svm_update_cr8_intercept,
-	.set_virtual_apic_mode = svm_set_virtual_apic_mode,
-	.refresh_apicv_exec_ctrl = svm_refresh_apicv_exec_ctrl,
-	.check_apicv_inhibit_reasons = svm_check_apicv_inhibit_reasons,
-	.load_eoi_exitmap = svm_load_eoi_exitmap,
-	.hwapic_irr_update = svm_hwapic_irr_update,
-	.hwapic_isr_update = svm_hwapic_isr_update,
-	.apicv_post_state_restore = avic_post_state_restore,
+	.refresh_apicv_exec_ctrl = avic_refresh_apicv_exec_ctrl,
+	.check_apicv_inhibit_reasons = avic_check_apicv_inhibit_reasons,
+	.apicv_post_state_restore = avic_apicv_post_state_restore,
 
 	.set_tss_addr = svm_set_tss_addr,
 	.set_identity_map_addr = svm_set_identity_map_addr,
@@ -4563,8 +4622,8 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.nested_ops = &svm_nested_ops,
 
 	.deliver_interrupt = svm_deliver_interrupt,
-	.dy_apicv_has_pending_interrupt = svm_dy_apicv_has_pending_interrupt,
-	.pi_update_irte = svm_update_pi_irte,
+	.dy_apicv_has_pending_interrupt = avic_dy_apicv_has_pending_interrupt,
+	.pi_update_irte = avic_pi_update_irte,
 	.setup_mce = svm_setup_mce,
 
 	.smi_allowed = svm_smi_allowed,
@@ -4572,11 +4631,13 @@ static struct kvm_x86_ops svm_x86_ops __initdata = {
 	.leave_smm = svm_leave_smm,
 	.enable_smi_window = svm_enable_smi_window,
 
-	.mem_enc_op = svm_mem_enc_op,
-	.mem_enc_reg_region = svm_register_enc_region,
-	.mem_enc_unreg_region = svm_unregister_enc_region,
+	.mem_enc_ioctl = sev_mem_enc_ioctl,
+	.mem_enc_register_region = sev_mem_enc_register_region,
+	.mem_enc_unregister_region = sev_mem_enc_unregister_region,
+	.guest_memory_reclaimed = sev_guest_memory_reclaimed,
 
-	.vm_copy_enc_context_from = svm_vm_copy_asid_from,
+	.vm_copy_enc_context_from = sev_vm_copy_enc_context_from,
+	.vm_move_enc_context_from = sev_vm_move_enc_context_from,
 
 	.can_emulate_instruction = svm_can_emulate_instruction,
 
@@ -4706,10 +4767,10 @@ static __init int svm_hardware_setup(void)
 		} else {
 			pr_info("TSC scaling supported\n");
 			kvm_has_tsc_control = true;
-			kvm_max_tsc_scaling_ratio = TSC_RATIO_MAX;
-			kvm_tsc_scaling_ratio_frac_bits = 32;
 		}
 	}
+	kvm_max_tsc_scaling_ratio = SVM_TSC_RATIO_MAX;
+	kvm_tsc_scaling_ratio_frac_bits = 32;
 
 	tsc_aux_uret_slot = kvm_add_user_return_msr(MSR_TSC_AUX);
 
@@ -4766,6 +4827,9 @@ static __init int svm_hardware_setup(void)
 		pr_info("AVIC enabled\n");
 
 		amd_iommu_register_ga_log_notifier(&avic_ga_log_notifier);
+	} else {
+		svm_x86_ops.vcpu_blocking = NULL;
+		svm_x86_ops.vcpu_unblocking = NULL;
 	}
 
 	if (vls) {

@@ -739,9 +739,8 @@ struct lpfc_vport {
 	struct list_head rcv_buffer_list;
 	unsigned long rcv_buffer_time_stamp;
 	uint32_t vport_flag;
-#define STATIC_VPORT	1
-#define FAWWPN_SET	2
-#define FAWWPN_PARAM_CHG	4
+#define STATIC_VPORT		0x1
+#define FAWWPN_PARAM_CHG	0x2
 
 	uint16_t fdmi_num_disc;
 	uint32_t fdmi_hba_mask;
@@ -1141,8 +1140,6 @@ struct lpfc_hba {
 	uint32_t cfg_nvme_seg_cnt;
 	uint32_t cfg_scsi_seg_cnt;
 	uint32_t cfg_sg_dma_buf_size;
-	uint64_t cfg_soft_wwnn;
-	uint64_t cfg_soft_wwpn;
 	uint32_t cfg_hba_queue_depth;
 	uint32_t cfg_enable_hba_reset;
 	uint32_t cfg_enable_hba_heartbeat;
@@ -1274,7 +1271,6 @@ struct lpfc_hba {
 #define VPD_PORT            0x8         /* valid vpd port data */
 #define VPD_MASK            0xf         /* mask for any vpd data */
 
-	uint8_t soft_wwn_enable;
 
 	struct timer_list fcp_poll_timer;
 	struct timer_list eratt_poll;

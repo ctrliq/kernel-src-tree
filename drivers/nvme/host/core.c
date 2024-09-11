@@ -128,26 +128,6 @@ static void nvme_update_bdev_size(struct gendisk *disk)
 	}
 }
 
-/*
- * Prepare a queue for teardown.
- *
- * This must forcibly unquiesce queues to avoid blocking dispatch, and only set
- * the capacity to 0 after that to avoid blocking dispatchers that may be
- * holding bd_butex.  This will end buffered writers dirtying pages that can't
- * be synced.
- */
-static void nvme_set_queue_dying(struct nvme_ns *ns)
-{
-	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
-		return;
-
-	blk_set_queue_dying(ns->queue);
-	blk_mq_unquiesce_queue(ns->queue);
-
-	set_capacity(ns->disk, 0);
-	nvme_update_bdev_size(ns->disk);
-}
-
 void nvme_queue_scan(struct nvme_ctrl *ctrl)
 {
 	/*
@@ -331,6 +311,37 @@ static void nvme_retry_req(struct request *req)
 	blk_mq_delay_kick_requeue_list(req->q, delay);
 }
 
+static void nvme_log_error(struct request *req)
+{
+	struct nvme_ns *ns = req->q->queuedata;
+	struct nvme_request *nr = nvme_req(req);
+
+	if (ns) {
+		pr_err_ratelimited("%s: %s(0x%x) @ LBA %llu, %llu blocks, %s (sct 0x%x / sc 0x%x) %s%s\n",
+		       ns->disk ? ns->disk->disk_name : "?",
+		       nvme_get_opcode_str(nr->cmd->common.opcode),
+		       nr->cmd->common.opcode,
+		       (unsigned long long)nvme_sect_to_lba(ns, blk_rq_pos(req)),
+		       (unsigned long long)blk_rq_bytes(req) >> ns->lba_shift,
+		       nvme_get_error_status_str(nr->status),
+		       nr->status >> 8 & 7,	/* Status Code Type */
+		       nr->status & 0xff,	/* Status Code */
+		       nr->status & NVME_SC_MORE ? "MORE " : "",
+		       nr->status & NVME_SC_DNR  ? "DNR "  : "");
+		return;
+	}
+
+	pr_err_ratelimited("%s: %s(0x%x), %s (sct 0x%x / sc 0x%x) %s%s\n",
+			   dev_name(nr->ctrl->device),
+			   nvme_get_admin_opcode_str(nr->cmd->common.opcode),
+			   nr->cmd->common.opcode,
+			   nvme_get_error_status_str(nr->status),
+			   nr->status >> 8 & 7,	/* Status Code Type */
+			   nr->status & 0xff,	/* Status Code */
+			   nr->status & NVME_SC_MORE ? "MORE " : "",
+			   nr->status & NVME_SC_DNR  ? "DNR "  : "");
+}
+
 enum nvme_disposition {
 	COMPLETE,
 	RETRY,
@@ -368,6 +379,10 @@ static inline enum nvme_disposition nvme_decide_disposition(struct request *req)
 
 static inline void __nvme_end_req(struct request *req, blk_status_t status)
 {
+
+	if (unlikely(status && !(req->rq_flags & RQF_QUIET)))
+		nvme_log_error(req);
+
 	if (IS_ENABLED(CONFIG_BLK_DEV_ZONED) &&
 		req_op(req) == REQ_OP_ZONE_APPEND) {
 		req->__sector = nvme_lba_to_sect(req->q->queuedata,
@@ -1138,6 +1153,7 @@ int __nvme_submit_sync_cmd(struct request_queue *q, struct nvme_command *cmd,
 			goto out;
 	}
 
+	req->rq_flags |= RQF_QUIET;
 	ret = nvme_execute_rq(NULL, req, at_head);
 	if (result && ret >= 0)
 		*result = nvme_req(req)->result;
@@ -1972,6 +1988,7 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
 			goto out_unfreeze;
 	}
 
+	set_bit(NVME_NS_READY, &ns->flags);
 	blk_mq_unfreeze_queue(ns->disk->queue);
 
 	if (blk_queue_is_zoned(ns->queue)) {
@@ -1983,6 +2000,7 @@ static int nvme_update_ns_info(struct nvme_ns *ns, struct nvme_id_ns *id)
 	if (nvme_ns_head_multipath(ns->head)) {
 		blk_mq_freeze_queue(ns->head->disk->queue);
 		nvme_update_disk_info(ns->head->disk, ns, id);
+		nvme_mpath_revalidate_paths(ns);
 		blk_queue_stack_limits(ns->head->disk->queue, ns->queue);
 		blk_queue_update_readahead(ns->head->disk->queue);
 		blk_mq_unfreeze_queue(ns->head->disk->queue);
@@ -3949,6 +3967,7 @@ static void nvme_ns_remove(struct nvme_ns *ns)
 	if (test_and_set_bit(NVME_NS_REMOVING, &ns->flags))
 		return;
 
+	clear_bit(NVME_NS_READY, &ns->flags);
 	set_capacity(ns->disk, 0);
 	nvme_fault_inject_fini(&ns->fault_inject);
 
@@ -4586,6 +4605,38 @@ out:
 }
 EXPORT_SYMBOL_GPL(nvme_init_ctrl);
 
+static void nvme_start_ns_queue(struct nvme_ns *ns)
+{
+	if (test_and_clear_bit(NVME_NS_STOPPED, &ns->flags))
+		blk_mq_unquiesce_queue(ns->queue);
+}
+
+static void nvme_stop_ns_queue(struct nvme_ns *ns)
+{
+	if (!test_and_set_bit(NVME_NS_STOPPED, &ns->flags))
+		blk_mq_quiesce_queue(ns->queue);
+}
+
+/*
+ * Prepare a queue for teardown.
+ *
+ * This must forcibly unquiesce queues to avoid blocking dispatch, and only set
+ * the capacity to 0 after that to avoid blocking dispatchers that may be
+ * holding bd_butex.  This will end buffered writers dirtying pages that can't
+ * be synced.
+ */
+static void nvme_set_queue_dying(struct nvme_ns *ns)
+{
+	if (test_and_set_bit(NVME_NS_DEAD, &ns->flags))
+		return;
+
+	blk_set_queue_dying(ns->queue);
+	nvme_start_ns_queue(ns);
+
+	set_capacity(ns->disk, 0);
+	nvme_update_bdev_size(ns->disk);
+}
+
 /**
  * nvme_kill_queues(): Ends all namespace queues
  * @ctrl: the dead controller that needs to end
@@ -4664,7 +4715,7 @@ void nvme_stop_queues(struct nvme_ctrl *ctrl)
 
 	down_read(&ctrl->namespaces_rwsem);
 	list_for_each_entry(ns, &ctrl->namespaces, list)
-		blk_mq_quiesce_queue(ns->queue);
+		nvme_stop_ns_queue(ns);
 	up_read(&ctrl->namespaces_rwsem);
 }
 EXPORT_SYMBOL_GPL(nvme_stop_queues);
@@ -4675,20 +4726,22 @@ void nvme_start_queues(struct nvme_ctrl *ctrl)
 
 	down_read(&ctrl->namespaces_rwsem);
 	list_for_each_entry(ns, &ctrl->namespaces, list)
-		blk_mq_unquiesce_queue(ns->queue);
+		nvme_start_ns_queue(ns);
 	up_read(&ctrl->namespaces_rwsem);
 }
 EXPORT_SYMBOL_GPL(nvme_start_queues);
 
 void nvme_stop_admin_queue(struct nvme_ctrl *ctrl)
 {
-	blk_mq_quiesce_queue(ctrl->admin_q);
+	if (!test_and_set_bit(NVME_CTRL_ADMIN_Q_STOPPED, &ctrl->flags))
+		blk_mq_quiesce_queue(ctrl->admin_q);
 }
 EXPORT_SYMBOL_GPL(nvme_stop_admin_queue);
 
 void nvme_start_admin_queue(struct nvme_ctrl *ctrl)
 {
-	blk_mq_unquiesce_queue(ctrl->admin_q);
+	if (test_and_clear_bit(NVME_CTRL_ADMIN_Q_STOPPED, &ctrl->flags))
+		blk_mq_unquiesce_queue(ctrl->admin_q);
 }
 EXPORT_SYMBOL_GPL(nvme_start_admin_queue);
 

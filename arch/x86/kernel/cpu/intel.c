@@ -26,6 +26,7 @@
 #include <asm/resctrl.h>
 #include <asm/kdebug.h>
 #include <asm/numa.h>
+#include <asm/thermal.h>
 
 #ifdef CONFIG_X86_64
 #include <linux/topology.h>
@@ -791,6 +792,8 @@ static void init_intel(struct cpuinfo_x86 *c)
 
 	split_lock_init();
 	bus_lock_init();
+
+	intel_init_thermal(c);
 }
 
 #ifdef CONFIG_X86_32
@@ -1127,6 +1130,12 @@ static void __init sld_state_setup(void)
 			}
 		}
 	}
+
+	if (state == sld_ratelimit) {
+		pr_info("#DB: system wide bus lock rate limit is not implemented in RHEL8.  Defaulting to warn.\n");
+		state = sld_warn;
+	}
+
 	sld_state = state;
 }
 

@@ -388,7 +388,9 @@ static struct platform_device *lpss_clk_dev;
 
 static inline void lpt_register_clock_device(void)
 {
-	lpss_clk_dev = platform_device_register_simple("clk-lpt", -1, NULL, 0);
+	lpss_clk_dev = platform_device_register_simple("clk-lpss-atom",
+						       PLATFORM_DEVID_NONE,
+						       NULL, 0);
 }
 
 static int register_device_clock(struct acpi_device *adev,
@@ -1341,7 +1343,7 @@ void __init acpi_lpss_init(void)
 	const struct x86_cpu_id *id;
 	int ret;
 
-	ret = lpt_clk_init();
+	ret = lpss_atom_clk_init();
 	if (ret)
 		return;
 

@@ -576,7 +576,9 @@ struct zone {
 
 #ifdef CONFIG_MEMORY_HOTPLUG
 	/* see spanned/present_pages for more description */
+#ifndef __aarch64__
 	seqlock_t		span_seqlock;
+#endif
 #endif
 
 	int initialized;
@@ -590,6 +592,12 @@ struct zone {
 	 */
 	RH_KABI_FILL_HOLE(int pageset_high)
 	RH_KABI_FILL_HOLE(int pageset_batch)
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+#ifdef __aarch64__
+	RH_KABI_FILL_HOLE(seqlock_t span_seqlock)
+#endif
+#endif
 
 	/* Write-intensive fields used from the page allocator */
 	ZONE_PADDING(_pad1_)
@@ -805,7 +813,9 @@ typedef struct pglist_data {
 	 *
 	 * Nests above zone->lock and zone->span_seqlock
 	 */
+#ifndef __aarch64__
 	spinlock_t node_size_lock;
+#endif
 #endif
 	unsigned long node_start_pfn;
 	unsigned long node_present_pages; /* total number of physical pages */
@@ -850,6 +860,12 @@ typedef struct pglist_data {
 	unsigned long		min_unmapped_pages;
 	unsigned long		min_slab_pages;
 #endif /* CONFIG_NUMA */
+
+#ifdef CONFIG_MEMORY_HOTPLUG
+#ifdef __aarch64__
+        RH_KABI_FILL_HOLE(spinlock_t node_size_lock)
+#endif
+#endif
 
 	/* Write-intensive fields used by page reclaim */
 	ZONE_PADDING(_pad1_)

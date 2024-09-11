@@ -562,20 +562,12 @@ static netdev_tx_t qeth_l2_hard_start_xmit(struct sk_buff *skb,
 	return NETDEV_TX_OK;
 }
 
-static u16 qeth_l2_select_queue(struct net_device *dev, struct sk_buff *skb,
-				struct net_device *sb_dev,
-				select_queue_fallback_t fallback)
+static u16 qeth_l2_iqd_select_queue(struct net_device *dev, struct sk_buff *skb,
+				    struct net_device *sb_dev,
+				    select_queue_fallback_t fallback)
 {
-	struct qeth_card *card = dev->ml_priv;
-
-	if (IS_IQD(card))
-		return qeth_iqd_select_queue(dev, skb,
-					     qeth_get_ether_cast_type(skb),
-					     sb_dev, fallback);
-	if (qeth_uses_tx_prio_queueing(card))
-		return qeth_get_priority_queue(card, skb);
-
-	return fallback(dev, skb, sb_dev);
+	return qeth_iqd_select_queue(dev, skb, qeth_get_ether_cast_type(skb),
+				     sb_dev, fallback);
 }
 
 static void qeth_l2_set_rx_mode(struct net_device *dev)
@@ -770,7 +762,8 @@ struct qeth_l2_br2dev_event_work {
 	unsigned char addr[ETH_ALEN];
 };
 
-static const struct net_device_ops qeth_l2_netdev_ops;
+static const struct net_device_ops qeth_l2_iqd_netdev_ops;
+static const struct net_device_ops qeth_l2_osa_netdev_ops;
 
 static bool qeth_l2_must_learn(struct net_device *netdev,
 			       struct net_device *dstdev)
@@ -782,7 +775,8 @@ static bool qeth_l2_must_learn(struct net_device *netdev,
 		(priv->brport_features & BR_LEARNING_SYNC) &&
 		!(br_port_flag_is_set(netdev, BR_ISOLATED) &&
 		  br_port_flag_is_set(dstdev, BR_ISOLATED)) &&
-		netdev->netdev_ops == &qeth_l2_netdev_ops);
+		(netdev->netdev_ops == &qeth_l2_iqd_netdev_ops ||
+		 netdev->netdev_ops == &qeth_l2_osa_netdev_ops));
 }
 
 /**
@@ -1095,13 +1089,33 @@ static int qeth_l2_bridge_setlink(struct net_device *dev, struct nlmsghdr *nlh,
 	return rc;
 }
 
-static const struct net_device_ops qeth_l2_netdev_ops = {
+static const struct net_device_ops qeth_l2_iqd_netdev_ops = {
 	.ndo_open		= qeth_open,
 	.ndo_stop		= qeth_stop,
 	.ndo_get_stats64	= qeth_get_stats64,
 	.ndo_start_xmit		= qeth_l2_hard_start_xmit,
 	.ndo_features_check	= qeth_features_check,
-	.ndo_select_queue	= qeth_l2_select_queue,
+	.ndo_select_queue	= qeth_l2_iqd_select_queue,
+	.ndo_validate_addr	= qeth_l2_validate_addr,
+	.ndo_set_rx_mode	= qeth_l2_set_rx_mode,
+	.ndo_do_ioctl		= qeth_do_ioctl,
+	.ndo_set_mac_address	= qeth_l2_set_mac_address,
+	.ndo_vlan_rx_add_vid	= qeth_l2_vlan_rx_add_vid,
+	.ndo_vlan_rx_kill_vid	= qeth_l2_vlan_rx_kill_vid,
+	.ndo_tx_timeout		= qeth_tx_timeout,
+	.ndo_fix_features	= qeth_fix_features,
+	.ndo_set_features	= qeth_set_features,
+	.ndo_bridge_getlink	= qeth_l2_bridge_getlink,
+	.ndo_bridge_setlink	= qeth_l2_bridge_setlink,
+};
+
+static const struct net_device_ops qeth_l2_osa_netdev_ops = {
+	.ndo_open		= qeth_open,
+	.ndo_stop		= qeth_stop,
+	.ndo_get_stats64	= qeth_get_stats64,
+	.ndo_start_xmit		= qeth_l2_hard_start_xmit,
+	.ndo_features_check	= qeth_features_check,
+	.ndo_select_queue	= qeth_osa_select_queue,
 	.ndo_validate_addr	= qeth_l2_validate_addr,
 	.ndo_set_rx_mode	= qeth_l2_set_rx_mode,
 	.ndo_do_ioctl		= qeth_do_ioctl,
@@ -1130,8 +1144,9 @@ static int qeth_l2_setup_netdev(struct qeth_card *card)
 		goto add_napi;
 	}
 
+	card->dev->netdev_ops = IS_IQD(card) ? &qeth_l2_iqd_netdev_ops :
+					       &qeth_l2_osa_netdev_ops;
 	card->dev->needed_headroom = sizeof(struct qeth_hdr);
-	card->dev->netdev_ops = &qeth_l2_netdev_ops;
 	card->dev->priv_flags |= IFF_UNICAST_FLT;
 
 	if (IS_OSM(card)) {
@@ -2408,21 +2423,26 @@ static const struct device_type qeth_l2_devtype = {
 	.groups = qeth_l2_attr_groups,
 };
 
+static const struct device_type qeth_osn_devtype = {
+	.name = "qeth_osn",
+};
+
+
 static int qeth_l2_probe_device(struct ccwgroup_device *gdev)
 {
 	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
 	int rc;
 
-	if (IS_OSN(card))
-		dev_notice(&gdev->dev, "OSN support will be dropped in 2021\n");
-
 	qeth_l2_vnicc_set_defaults(card);
 	mutex_init(&card->sbp_lock);
 
-	if (gdev->dev.type == &qeth_generic_devtype) {
+	if (gdev->dev.type) {
 		rc = device_add_groups(&gdev->dev, qeth_l2_attr_groups);
 		if (rc)
 			return rc;
+	} else {
+		gdev->dev.type = IS_OSN(card) ? &qeth_osn_devtype :
+						&qeth_l2_devtype;
 	}
 
 	INIT_WORK(&card->rx_mode_work, qeth_l2_rx_mode_work);
@@ -2434,8 +2454,9 @@ static void qeth_l2_remove_device(struct ccwgroup_device *gdev)
 	struct qeth_card *card = dev_get_drvdata(&gdev->dev);
 	struct qeth_priv *priv;
 
-	if (gdev->dev.type == &qeth_generic_devtype)
+	if (gdev->dev.type != &qeth_l2_devtype)
 		device_remove_groups(&gdev->dev, qeth_l2_attr_groups);
+
 	qeth_set_allowed_threads(card, 0, 1);
 	wait_event(card->wait_q, qeth_threads_running(card, 0xffffffff) == 0);
 
@@ -2562,7 +2583,6 @@ static int qeth_l2_control_event(struct qeth_card *card,
 }
 
 const struct qeth_discipline qeth_l2_discipline = {
-	.devtype = &qeth_l2_devtype,
 	.setup = qeth_l2_probe_device,
 	.remove = qeth_l2_remove_device,
 	.set_online = qeth_l2_set_online,

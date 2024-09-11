@@ -805,7 +805,7 @@ static void accounted_complete(struct cache *cache, struct bio *bio)
 static void accounted_request(struct cache *cache, struct bio *bio)
 {
 	accounted_begin(cache, bio);
-	generic_make_request(bio);
+	dm_submit_bio_remap(bio, NULL);
 }
 
 static void issue_op(struct bio *bio, void *context)
@@ -1710,7 +1710,7 @@ static bool process_bio(struct cache *cache, struct bio *bio)
 	bool commit_needed;
 
 	if (map_bio(cache, bio, get_bio_block(cache, bio), &commit_needed) == DM_MAPIO_REMAPPED)
-		generic_make_request(bio);
+		dm_submit_bio_remap(bio, NULL);
 
 	return commit_needed;
 }
@@ -1776,7 +1776,7 @@ static bool process_discard_bio(struct cache *cache, struct bio *bio)
 
 	if (cache->features.discard_passdown) {
 		remap_to_origin(cache, bio);
-		generic_make_request(bio);
+		dm_submit_bio_remap(bio, NULL);
 	} else
 		bio_endio(bio);
 
@@ -2373,6 +2373,7 @@ static int cache_create(struct cache_args *ca, struct cache **result)
 
 	cache->ti = ca->ti;
 	ti->private = cache;
+	ti->accounts_remapped_io = true;
 	ti->num_flush_bios = 2;
 	ti->flush_supported = true;
 

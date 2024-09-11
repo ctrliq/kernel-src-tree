@@ -486,6 +486,15 @@ struct rx_tpa_end_cmp_ext {
 	  ASYNC_EVENT_CMPL_RESET_NOTIFY_EVENT_DATA1_REASON_CODE_MASK) ==\
 	 ASYNC_EVENT_CMPL_RESET_NOTIFY_EVENT_DATA1_REASON_CODE_FW_EXCEPTION_FATAL)
 
+#define EVENT_DATA1_RESET_NOTIFY_FW_ACTIVATION(data1)			\
+	(((data1) &							\
+	  ASYNC_EVENT_CMPL_RESET_NOTIFY_EVENT_DATA1_REASON_CODE_MASK) ==\
+	ASYNC_EVENT_CMPL_RESET_NOTIFY_EVENT_DATA1_REASON_CODE_FW_ACTIVATION)
+
+#define EVENT_DATA2_RESET_NOTIFY_FW_STATUS_CODE(data2)			\
+	((data2) &							\
+	ASYNC_EVENT_CMPL_RESET_NOTIFY_EVENT_DATA2_FW_STATUS_CODE_MASK)
+
 #define EVENT_DATA1_RECOVERY_MASTER_FUNC(data1)				\
 	!!((data1) &							\
 	   ASYNC_EVENT_CMPL_ERROR_RECOVERY_EVENT_DATA1_FLAGS_MASTER_FUNC)
@@ -1519,6 +1528,21 @@ struct bnxt_ctx_mem_info {
 	struct bnxt_mem_init	mem_init[BNXT_CTX_MEM_INIT_MAX];
 };
 
+enum bnxt_health_severity {
+	SEVERITY_NORMAL = 0,
+	SEVERITY_WARNING,
+	SEVERITY_RECOVERABLE,
+	SEVERITY_FATAL,
+};
+
+enum bnxt_health_remedy {
+	REMEDY_DEVLINK_RECOVER,
+	REMEDY_POWER_CYCLE_DEVICE,
+	REMEDY_POWER_CYCLE_HOST,
+	REMEDY_FW_UPDATE,
+	REMEDY_HW_REPLACE,
+};
+
 struct bnxt_fw_health {
 	u32 flags;
 	u32 polling_dsecs;
@@ -1537,8 +1561,8 @@ struct bnxt_fw_health {
 	u32 last_fw_reset_cnt;
 	u8 enabled:1;
 	u8 primary:1;
-	u8 fatal:1;
 	u8 status_reliable:1;
+	u8 resets_reliable:1;
 	u8 tmr_multiplier;
 	u8 tmr_counter;
 	u8 fw_reset_seq_cnt;
@@ -1548,12 +1572,15 @@ struct bnxt_fw_health {
 	u32 echo_req_data1;
 	u32 echo_req_data2;
 	struct devlink_health_reporter	*fw_reporter;
-	struct devlink_health_reporter *fw_reset_reporter;
-	struct devlink_health_reporter *fw_fatal_reporter;
-};
-
-struct bnxt_fw_reporter_ctx {
-	unsigned long sp_event;
+	/* Protects severity and remedy */
+	struct mutex lock;
+	enum bnxt_health_severity severity;
+	enum bnxt_health_remedy remedy;
+	u32 arrests;
+	u32 discoveries;
+	u32 survivals;
+	u32 fatalities;
+	u32 diagnoses;
 };
 
 #define BNXT_FW_HEALTH_REG_TYPE_MASK	3
@@ -1893,6 +1920,12 @@ struct bnxt {
 #define BNXT_STATE_DRV_REGISTERED	7
 #define BNXT_STATE_PCI_CHANNEL_IO_FROZEN	8
 #define BNXT_STATE_NAPI_DISABLED	9
+#define BNXT_STATE_L2_FILTER_RETRY	10
+#define BNXT_STATE_FW_ACTIVATE		11
+#define BNXT_STATE_RECOVER		12
+#define BNXT_STATE_FW_NON_FATAL_COND	13
+#define BNXT_STATE_FW_ACTIVATE_RESET	14
+#define BNXT_STATE_HALF_OPEN		15	/* For offline ethtool tests */
 
 #define BNXT_NO_FW_ACCESS(bp)					\
 	(test_bit(BNXT_STATE_FW_FATAL_COND, &(bp)->state) ||	\
@@ -1929,10 +1962,13 @@ struct bnxt {
 	#define BNXT_FW_CAP_EXT_STATS_SUPPORTED		0x00040000
 	#define BNXT_FW_CAP_ERR_RECOVER_RELOAD		0x00100000
 	#define BNXT_FW_CAP_HOT_RESET			0x00200000
+	#define BNXT_FW_CAP_PTP_RTC			0x00400000
 	#define BNXT_FW_CAP_VLAN_RX_STRIP		0x01000000
 	#define BNXT_FW_CAP_VLAN_TX_INSERT		0x02000000
 	#define BNXT_FW_CAP_EXT_HW_STATS_SUPPORTED	0x04000000
+	#define BNXT_FW_CAP_LIVEPATCH			0x08000000
 	#define BNXT_FW_CAP_PTP_PPS			0x10000000
+	#define BNXT_FW_CAP_HOT_RESET_IF		0x20000000
 	#define BNXT_FW_CAP_RING_MONITOR		0x40000000
 	#define BNXT_FW_CAP_DBG_QCAPS			0x80000000
 
@@ -2290,6 +2326,7 @@ void bnxt_fw_reset(struct bnxt *bp);
 int bnxt_check_rings(struct bnxt *bp, int tx, int rx, bool sh, int tcs,
 		     int tx_xdp);
 int bnxt_fw_init_one(struct bnxt *bp);
+bool bnxt_hwrm_reset_permitted(struct bnxt *bp);
 int bnxt_setup_mq_tc(struct net_device *dev, u8 tc);
 int bnxt_get_max_rings(struct bnxt *, int *, int *, bool);
 int bnxt_restore_pf_fw_resources(struct bnxt *bp);

@@ -302,31 +302,16 @@ void avtab_destroy(struct avtab *h)
 
 void avtab_init(struct avtab *h)
 {
-	kvfree(h->htable);
 	h->htable = NULL;
 	h->nel = 0;
 	h->nslot = 0;
 	h->mask = 0;
 }
 
-int avtab_alloc(struct avtab *h, u32 nrules)
+static int avtab_alloc_common(struct avtab *h, u32 nslot)
 {
-	u32 shift = 0;
-	u32 work = nrules;
-	u32 nslot;
-
-	if (nrules == 0)
-		goto avtab_alloc_out;
-
-	while (work) {
-		work  = work >> 1;
-		shift++;
-	}
-	if (shift > 2)
-		shift = shift - 2;
-	nslot = 1 << shift;
-	if (nslot > MAX_AVTAB_HASH_BUCKETS)
-		nslot = MAX_AVTAB_HASH_BUCKETS;
+	if (!nslot)
+		return 0;
 
 	h->htable = kvcalloc(nslot, sizeof(void *), GFP_KERNEL);
 	if (!h->htable)
@@ -334,11 +319,37 @@ int avtab_alloc(struct avtab *h, u32 nrules)
 
 	h->nslot = nslot;
 	h->mask = nslot - 1;
-
-avtab_alloc_out:
-	pr_debug("SELinux: %d avtab hash slots, %d rules.\n",
-	       h->nslot, nrules);
 	return 0;
+}
+
+int avtab_alloc(struct avtab *h, u32 nrules)
+{
+	int rc;
+	u32 nslot = 0;
+
+	if (nrules != 0) {
+		u32 shift = 1;
+		u32 work = nrules >> 3;
+		while (work) {
+			work >>= 1;
+			shift++;
+		}
+		nslot = 1 << shift;
+		if (nslot > MAX_AVTAB_HASH_BUCKETS)
+			nslot = MAX_AVTAB_HASH_BUCKETS;
+
+		rc = avtab_alloc_common(h, nslot);
+		if (rc)
+			return rc;
+	}
+
+	pr_debug("SELinux: %d avtab hash slots, %d rules.\n", nslot, nrules);
+	return 0;
+}
+
+int avtab_alloc_dup(struct avtab *new, const struct avtab *orig)
+{
+	return avtab_alloc_common(new, orig->nslot);
 }
 
 void avtab_hash_eval(struct avtab *h, char *tag)

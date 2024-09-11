@@ -181,3 +181,6 @@ extern void fw_devlink_drivers_done(void);
 
 /* device pm support */
 void device_pm_move_to_tail(struct device *dev);
+
+void software_node_notify(struct device *dev);
+void software_node_notify_remove(struct device *dev);

@@ -161,7 +161,7 @@ enum cpuhp_state {
 	CPUHP_AP_PERF_X86_RAPL_ONLINE,
 	CPUHP_AP_PERF_X86_CQM_ONLINE,
 	CPUHP_AP_PERF_X86_CSTATE_ONLINE,
-	CPUHP_AP_PERF_X86_IDXD_ONLINE,
+	/* kABI: CPUHP_AP_PERF_X86_IDXD_ONLINE, */
 	CPUHP_AP_PERF_S390_CF_ONLINE,
 	/* kABI: CPUHP_AP_PERF_S390_CFD_ONLINE, */
 	CPUHP_AP_PERF_S390_SF_ONLINE,
@@ -217,6 +217,9 @@ enum cpuhp_state {
 		CPUHP_AP_PERF_ARM_HISI_L3_ONLINE
 
 #define CPUHP_IOMMU_IOVA_DEAD CPUHP_IOMMU_INTEL_DEAD
+
+#define CPUHP_AP_PERF_X86_IDXD_ONLINE \
+	        CPUHP_AP_PERF_ARM_L2X0_ONLINE
 
 int __cpuhp_setup_state(enum cpuhp_state state,	const char *name, bool invoke,
 			int (*startup)(unsigned int cpu),

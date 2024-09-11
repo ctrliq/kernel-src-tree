@@ -154,6 +154,7 @@ struct nfs_server {
 #define NFS_MOUNT_LOCAL_FCNTL		0x200000
 #define NFS_MOUNT_SOFTERR		0x400000
 #define NFS_MOUNT_SOFTREVAL		0x800000
+#define NFS_MOUNT_TRUNK_DISCOVERY	0x04000000
 
 	unsigned int		caps;		/* server capabilities */
 	unsigned int		rsize;		/* read size */
@@ -284,5 +285,6 @@ struct nfs_server {
 #define NFS_CAP_OFFLOAD_CANCEL	(1U << 25)
 #define NFS_CAP_LAYOUTERROR	(1U << 26)
 #define NFS_CAP_XATTR		(1U << 28)
+#define NFS_CAP_FS_LOCATIONS	(1U << 30)
 
 #endif

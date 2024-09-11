@@ -186,9 +186,9 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, uint8_t expectRsp,
 	 * in FIP mode send FLOGI, FDISC and LOGO as FIP frames.
 	 */
 	if ((did == Fabric_DID) &&
-		(phba->hba_flag & HBA_FIP_SUPPORT) &&
 		((elscmd == ELS_CMD_FLOGI) ||
 		 (elscmd == ELS_CMD_FDISC) ||
+		 (elscmd == ELS_CMD_PLOGI) ||
 		 (elscmd == ELS_CMD_LOGO)))
 		switch (elscmd) {
 		case ELS_CMD_FLOGI:
@@ -206,6 +206,10 @@ lpfc_prep_els_iocb(struct lpfc_vport *vport, uint8_t expectRsp,
 			((LPFC_ELS_ID_LOGO << LPFC_FIP_ELS_ID_SHIFT)
 					& LPFC_FIP_ELS_ID_MASK);
 		break;
+		case ELS_CMD_PLOGI:
+		elsiocb->iocb_flag |=
+			((LPFC_ELS_ID_PLOGI << LPFC_FIP_ELS_ID_SHIFT)
+					& LPFC_FIP_ELS_ID_MASK);
 		}
 	else
 		elsiocb->iocb_flag &= ~LPFC_FIP_ELS_ID_MASK;
@@ -903,10 +907,12 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		if (rc)
 			vport->fc_myDID = PT2PT_LocalID;
 
-		/* Decrement ndlp reference count indicating that ndlp can be
-		 * safely released when other references to it are done.
+		/* If not registered with a transport, decrement ndlp reference
+		 * count indicating that ndlp can be safely released when other
+		 * references are removed.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)))
+			lpfc_nlp_put(ndlp);
 
 		ndlp = lpfc_findnode_did(vport, PT2PT_RemoteID);
 		if (!ndlp) {
@@ -943,11 +949,12 @@ lpfc_cmpl_els_flogi_nport(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 			goto fail;
 		}
 	} else {
-		/* This side will wait for the PLOGI, decrement ndlp reference
-		 * count indicating that ndlp can be released when other
-		 * references to it are done.
+		/* This side will wait for the PLOGI. If not registered with
+		 * a transport, decrement node reference count indicating that
+		 * ndlp can be released when other references are removed.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)))
+			lpfc_nlp_put(ndlp);
 
 		/* Start discovery - this should just do CLEAR_LA */
 		lpfc_disc_start(vport);
@@ -999,7 +1006,8 @@ lpfc_cmpl_els_flogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		/* One additional decrement on node reference count to
 		 * trigger the release of the node
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & SCSI_XPT_REGD))
+			lpfc_nlp_put(ndlp);
 		goto out;
 	}
 
@@ -1393,6 +1401,11 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	/* Check for a deferred FLOGI ACC condition */
 	if (phba->defer_flogi_acc_flag) {
+		/* lookup ndlp for received FLOGI */
+		ndlp = lpfc_findnode_did(vport, 0);
+		if (!ndlp)
+			return 0;
+
 		did = vport->fc_myDID;
 		vport->fc_myDID = Fabric_DID;
 
@@ -1415,6 +1428,11 @@ lpfc_issue_els_flogi(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		phba->defer_flogi_acc_flag = false;
 
 		vport->fc_myDID = did;
+
+		/* Decrement ndlp reference count to indicate the node can be
+		 * released when other references are removed.
+		 */
+		lpfc_nlp_put(ndlp);
 	}
 
 	return 0;
@@ -1519,10 +1537,13 @@ lpfc_initial_flogi(struct lpfc_vport *vport)
 	/* Reset the Fabric flag, topology change may have happened */
 	vport->fc_flag &= ~FC_FABRIC;
 	if (lpfc_issue_els_flogi(vport, ndlp, 0)) {
-		/* This decrement of reference count to node shall kick off
-		 * the release of the node.
+		/* A node reference should be retained while registered with a
+		 * transport or dev-loss-evt work is pending.
+		 * Otherwise, decrement node reference to trigger release.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
+		    !(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
+			lpfc_nlp_put(ndlp);
 		return 0;
 	}
 	return 1;
@@ -1565,10 +1586,13 @@ lpfc_initial_fdisc(struct lpfc_vport *vport)
 	}
 
 	if (lpfc_issue_els_fdisc(vport, ndlp, 0)) {
-		/* decrement node reference count to trigger the release of
-		 * the node.
+		/* A node reference should be retained while registered with a
+		 * transport or dev-loss-evt work is pending.
+		 * Otherwise, decrement node reference to trigger release.
 		 */
-		lpfc_nlp_put(ndlp);
+		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
+		    !(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
+			lpfc_nlp_put(ndlp);
 		return 0;
 	}
 	return 1;
@@ -1969,6 +1993,7 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_dmabuf *prsp;
 	int disc;
 	struct serv_parm *sp = NULL;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
 	cmdiocb->context_un.rsp_iocb = rspiocb;
@@ -2049,19 +2074,21 @@ lpfc_cmpl_els_plogi(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 			spin_unlock_irq(&ndlp->lock);
 			goto out;
 		}
-		spin_unlock_irq(&ndlp->lock);
 
 		/* No PLOGI collision and the node is not registered with the
 		 * scsi or nvme transport. It is no longer an active node. Just
 		 * start the device remove process.
 		 */
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
-			spin_lock_irq(&ndlp->lock);
 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else {
 		/* Good status, call state machine */
 		prsp = list_entry(((struct lpfc_dmabuf *)
@@ -2271,6 +2298,7 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	struct lpfc_nodelist *ndlp;
 	char *mode;
 	u32 loglevel;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
 	cmdiocb->context_un.rsp_iocb = rspiocb;
@@ -2344,14 +2372,18 @@ lpfc_cmpl_els_prli(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * it is no longer an active node.  Otherwise devloss
 		 * handles the final cleanup.
 		 */
+		spin_lock_irq(&ndlp->lock);
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD)) &&
 		    !ndlp->fc4_prli_sent) {
-			spin_lock_irq(&ndlp->lock);
 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else {
 		/* Good status, call state machine.  However, if another
 		 * PRLI is outstanding, don't call the state machine
@@ -2529,16 +2561,6 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 
 	phba->fc_stat.elsXmitPRLI++;
 	elsiocb->iocb_cmpl = lpfc_cmpl_els_prli;
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag |= NLP_PRLI_SND;
-
-	/* The vport counters are used for lpfc_scan_finished, but
-	 * the ndlp is used to track outstanding PRLIs for different
-	 * FC4 types.
-	 */
-	vport->fc_prli_sent++;
-	ndlp->fc4_prli_sent++;
-	spin_unlock_irq(&ndlp->lock);
 
 	lpfc_debugfs_disc_trc(vport, LPFC_DISC_TRC_ELS_CMD,
 			      "Issue PRLI:  did:x%x refcnt %d",
@@ -2546,16 +2568,25 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 	elsiocb->context1 = lpfc_nlp_get(ndlp);
 	if (!elsiocb->context1) {
 		lpfc_els_free_iocb(phba, elsiocb);
-		goto err;
+		return 1;
 	}
 
 	rc = lpfc_sli_issue_iocb(phba, LPFC_ELS_RING, elsiocb, 0);
 	if (rc == IOCB_ERROR) {
 		lpfc_els_free_iocb(phba, elsiocb);
 		lpfc_nlp_put(ndlp);
-		goto err;
+		return 1;
 	}
 
+	/* The vport counters are used for lpfc_scan_finished, but
+	 * the ndlp is used to track outstanding PRLIs for different
+	 * FC4 types.
+	 */
+	spin_lock_irq(&ndlp->lock);
+	ndlp->nlp_flag |= NLP_PRLI_SND;
+	vport->fc_prli_sent++;
+	ndlp->fc4_prli_sent++;
+	spin_unlock_irq(&ndlp->lock);
 
 	/* The driver supports 2 FC4 types.  Make sure
 	 * a PRLI is issued for all types before exiting.
@@ -2565,12 +2596,6 @@ lpfc_issue_els_prli(struct lpfc_vport *vport, struct lpfc_nodelist *ndlp,
 		goto send_next_prli;
 	else
 		return 0;
-
-err:
-	spin_lock_irq(&ndlp->lock);
-	ndlp->nlp_flag &= ~NLP_PRLI_SND;
-	spin_unlock_irq(&ndlp->lock);
-	return 1;
 }
 
 /**
@@ -2722,6 +2747,7 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 	IOCB_t *irsp;
 	struct lpfc_nodelist *ndlp;
 	int  disc;
+	bool release_node = false;
 
 	/* we pass cmdiocb to state machine which needs rspiocb as well */
 	cmdiocb->context_un.rsp_iocb = rspiocb;
@@ -2780,13 +2806,17 @@ lpfc_cmpl_els_adisc(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 		 * transport, it is no longer an active node. Otherwise
 		 * devloss handles the final cleanup.
 		 */
+		spin_lock_irq(&ndlp->lock);
 		if (!(ndlp->fc4_xpt_flags & (SCSI_XPT_REGD | NVME_XPT_REGD))) {
-			spin_lock_irq(&ndlp->lock);
 			ndlp->nlp_flag &= ~NLP_NPR_2B_DISC;
-			spin_unlock_irq(&ndlp->lock);
+			if (!(ndlp->nlp_flag & NLP_IN_DEV_LOSS))
+				release_node = true;
+		}
+		spin_unlock_irq(&ndlp->lock);
+
+		if (release_node)
 			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
 						NLP_EVT_DEVICE_RM);
-		}
 	} else
 		/* Good status, call state machine */
 		lpfc_disc_state_machine(vport, ndlp, cmdiocb,
@@ -2943,8 +2973,10 @@ lpfc_cmpl_els_logo(struct lpfc_hba *phba, struct lpfc_iocbq *cmdiocb,
 				 "2756 LOGO failure, No Retry DID:%06X Status:x%x/x%x\n",
 				 ndlp->nlp_DID, irsp->ulpStatus,
 				 irsp->un.ulpWord[4]);
-		/* Do not call DSM for lpfc_els_abort'ed ELS cmds */
+		/* Call NLP_EVT_DEVICE_RM if link is down or LOGO is aborted */
 		if (lpfc_error_lost_link(irsp)) {
+			lpfc_disc_state_machine(vport, ndlp, cmdiocb,
+						NLP_EVT_DEVICE_RM);
 			skip_recovery = 1;
 			goto out;
 		}
@@ -9925,6 +9957,9 @@ lpfc_els_unsol_buffer(struct lpfc_hba *phba, struct lpfc_sli_ring *pring,
 		}
 
 		lpfc_els_rcv_flogi(vport, elsiocb, ndlp);
+		/* retain node if our response is deferred */
+		if (phba->defer_flogi_acc_flag)
+			break;
 		if (newnode)
 			lpfc_disc_state_machine(vport, ndlp, NULL,
 					NLP_EVT_DEVICE_RM);
