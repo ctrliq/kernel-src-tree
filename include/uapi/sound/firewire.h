@@ -139,7 +139,10 @@ struct snd_firewire_tascam_state {
 // message differs between 23 and 51 quadlets. For the case, the number of mixer bus can be extended
 // up to 12.
 
-#define SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_COUNT	40
+#define SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_INPUT_COUNT	24
+#define SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_OUTPUT_COUNT	24
+#define SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_COUNT \
+	(SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_INPUT_COUNT + SNDRV_FIREWIRE_MOTU_REGISTER_DSP_METER_OUTPUT_COUNT)
 
 /**
  * struct snd_firewire_motu_register_dsp_meter - the container for meter information in DSP
