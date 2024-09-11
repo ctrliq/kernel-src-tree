@@ -1,0 +1,368 @@
+IB/{hfi1, qib, rdmavt}: Put qp in error state when cq is full
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Kamenee Arumugam <kamenee.arumugam@intel.com>
+commit 5136bfea7e79b333af77594fac5bc70282a95313
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5136bfea.failed
+
+When a completion queue is full, the associated queue pairs are not put
+into the error state. According to the IBTA specification, this is a
+violation.
+
+Quote from IBTA spec:
+C9-218: A Requester Class F error occurs when the CQ is inaccessible or
+full and an attempt is made to complete a WQE.  The Affected QP shall be
+moved to the error state and affiliated asynchronous errors generated as
+described in 11.6.3.1 Affiliated Asynchronous Events on page 678. The
+current WQE and any subsequent WQEs are left in an unknown state.
+
+C11-37: The CI shall generate a CQ Error when a CQ overrun is
+detected. This condition will result in an Affiliated Asynchronous Error
+for any associated Work Queues when they attempt to use that
+CQ. Completions can no longer be added to the CQ. It is not guaranteed
+that completions present in the CQ at the time the error occurred can be
+retrieved. Possible causes include a CQ overrun or a CQ protection error.
+
+Put the qp in error state when cq is full. Implement a state called full
+to continue to put other associated QPs in error state.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Reviewed-by: Michael J. Ruhl <michael.j.ruhl@intel.com>
+	Signed-off-by: Kamenee Arumugam <kamenee.arumugam@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 5136bfea7e79b333af77594fac5bc70282a95313)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/sw/rdmavt/cq.c
+diff --cc drivers/infiniband/sw/rdmavt/cq.c
+index 4f1544ad4aff,fac87b13329d..000000000000
+--- a/drivers/infiniband/sw/rdmavt/cq.c
++++ b/drivers/infiniband/sw/rdmavt/cq.c
+@@@ -60,10 -60,16 +60,13 @@@ static struct workqueue_struct *comp_ve
+   * @solicited: true if @entry is solicited
+   *
+   * This may be called with qp->s_lock held.
++  *
++  * Return: return true on success, else return
++  * false if cq is full.
+   */
+- void rvt_cq_enter(struct rvt_cq *cq, struct ib_wc *entry, bool solicited)
++ bool rvt_cq_enter(struct rvt_cq *cq, struct ib_wc *entry, bool solicited)
+  {
+ -	struct ib_uverbs_wc *uqueue = NULL;
+ -	struct ib_wc *kqueue = NULL;
+ -	struct rvt_cq_wc *u_wc = NULL;
+ -	struct rvt_k_cq_wc *k_wc = NULL;
+ +	struct rvt_cq_wc *wc;
+  	unsigned long flags;
+  	u32 head;
+  	u32 next;
+@@@ -83,7 -100,12 +86,16 @@@
+  		next = head + 1;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (unlikely(next == wc->tail)) {
+++=======
++ 	if (unlikely(next == tail || cq->cq_full)) {
++ 		struct rvt_dev_info *rdi = cq->rdi;
++ 
++ 		if (!cq->cq_full)
++ 			rvt_pr_err_ratelimited(rdi, "CQ is full!\n");
++ 		cq->cq_full = true;
+++>>>>>>> 5136bfea7e79 (IB/{hfi1, qib, rdmavt}: Put qp in error state when cq is full)
+  		spin_unlock_irqrestore(&cq->lock, flags);
+  		if (cq->ibcq.event_handler) {
+  			struct ib_event ev;
+@@@ -93,30 -115,30 +105,30 @@@
+  			ev.event = IB_EVENT_CQ_ERR;
+  			cq->ibcq.event_handler(&ev, cq->ibcq.cq_context);
+  		}
+- 		return;
++ 		return false;
+  	}
+  	trace_rvt_cq_enter(cq, entry, head);
+ -	if (uqueue) {
+ -		uqueue[head].wr_id = entry->wr_id;
+ -		uqueue[head].status = entry->status;
+ -		uqueue[head].opcode = entry->opcode;
+ -		uqueue[head].vendor_err = entry->vendor_err;
+ -		uqueue[head].byte_len = entry->byte_len;
+ -		uqueue[head].ex.imm_data = entry->ex.imm_data;
+ -		uqueue[head].qp_num = entry->qp->qp_num;
+ -		uqueue[head].src_qp = entry->src_qp;
+ -		uqueue[head].wc_flags = entry->wc_flags;
+ -		uqueue[head].pkey_index = entry->pkey_index;
+ -		uqueue[head].slid = ib_lid_cpu16(entry->slid);
+ -		uqueue[head].sl = entry->sl;
+ -		uqueue[head].dlid_path_bits = entry->dlid_path_bits;
+ -		uqueue[head].port_num = entry->port_num;
+ +	if (cq->ip) {
+ +		wc->uqueue[head].wr_id = entry->wr_id;
+ +		wc->uqueue[head].status = entry->status;
+ +		wc->uqueue[head].opcode = entry->opcode;
+ +		wc->uqueue[head].vendor_err = entry->vendor_err;
+ +		wc->uqueue[head].byte_len = entry->byte_len;
+ +		wc->uqueue[head].ex.imm_data = entry->ex.imm_data;
+ +		wc->uqueue[head].qp_num = entry->qp->qp_num;
+ +		wc->uqueue[head].src_qp = entry->src_qp;
+ +		wc->uqueue[head].wc_flags = entry->wc_flags;
+ +		wc->uqueue[head].pkey_index = entry->pkey_index;
+ +		wc->uqueue[head].slid = ib_lid_cpu16(entry->slid);
+ +		wc->uqueue[head].sl = entry->sl;
+ +		wc->uqueue[head].dlid_path_bits = entry->dlid_path_bits;
+ +		wc->uqueue[head].port_num = entry->port_num;
+  		/* Make sure entry is written before the head index. */
+ -		RDMA_WRITE_UAPI_ATOMIC(u_wc->head, next);
+ +		smp_wmb();
+  	} else {
+ -		kqueue[head] = *entry;
+ -		k_wc->head = next;
+ +		wc->kqueue[head] = *entry;
+  	}
+ +	wc->head = next;
+  
+  	if (cq->notify == IB_CQ_NEXT_COMP ||
+  	    (cq->notify == IB_CQ_SOLICITED &&
+diff --git a/drivers/infiniband/hw/hfi1/rc.c b/drivers/infiniband/hw/hfi1/rc.c
+index 235bdbc706ac..0477c14633ab 100644
+--- a/drivers/infiniband/hw/hfi1/rc.c
++++ b/drivers/infiniband/hw/hfi1/rc.c
+@@ -3008,8 +3008,7 @@ void hfi1_rc_rcv(struct hfi1_packet *packet)
+ 		wc.dlid_path_bits = 0;
+ 		wc.port_num = 0;
+ 		/* Signal completion event if the solicited bit is set. */
+-		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-			     ib_bth_is_solicited(ohdr));
++		rvt_recv_cq(qp, &wc, ib_bth_is_solicited(ohdr));
+ 		break;
+ 
+ 	case OP(RDMA_WRITE_ONLY):
+diff --git a/drivers/infiniband/hw/hfi1/uc.c b/drivers/infiniband/hw/hfi1/uc.c
+index 4ed4fcfabd6c..0c77f18120ed 100644
+--- a/drivers/infiniband/hw/hfi1/uc.c
++++ b/drivers/infiniband/hw/hfi1/uc.c
+@@ -476,8 +476,7 @@ void hfi1_uc_rcv(struct hfi1_packet *packet)
+ 		wc.dlid_path_bits = 0;
+ 		wc.port_num = 0;
+ 		/* Signal completion event if the solicited bit is set. */
+-		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-			     ib_bth_is_solicited(ohdr));
++		rvt_recv_cq(qp, &wc, ib_bth_is_solicited(ohdr));
+ 		break;
+ 
+ 	case OP(RDMA_WRITE_FIRST):
+diff --git a/drivers/infiniband/hw/hfi1/ud.c b/drivers/infiniband/hw/hfi1/ud.c
+index 4cb0fce5c096..e16d499cfd1e 100644
+--- a/drivers/infiniband/hw/hfi1/ud.c
++++ b/drivers/infiniband/hw/hfi1/ud.c
+@@ -255,8 +255,7 @@ static void ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	wc.dlid_path_bits = rdma_ah_get_dlid(ah_attr) & ((1 << ppd->lmc) - 1);
+ 	wc.port_num = qp->port_num;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-		     swqe->wr.send_flags & IB_SEND_SOLICITED);
++	rvt_recv_cq(qp, &wc, swqe->wr.send_flags & IB_SEND_SOLICITED);
+ 	ibp->rvp.n_loop_pkts++;
+ bail_unlock:
+ 	spin_unlock_irqrestore(&qp->r_lock, flags);
+@@ -1061,7 +1060,7 @@ void hfi1_ud_rcv(struct hfi1_packet *packet)
+ 		dlid & ((1 << ppd_from_ibp(ibp)->lmc) - 1);
+ 	wc.port_num = qp->port_num;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc, solicited);
++	rvt_recv_cq(qp, &wc, solicited);
+ 	return;
+ 
+ drop:
+diff --git a/drivers/infiniband/hw/qib/qib_rc.c b/drivers/infiniband/hw/qib/qib_rc.c
+index 8d9a94d6f685..1d5e2d4ee257 100644
+--- a/drivers/infiniband/hw/qib/qib_rc.c
++++ b/drivers/infiniband/hw/qib/qib_rc.c
+@@ -1891,8 +1891,7 @@ void qib_rc_rcv(struct qib_ctxtdata *rcd, struct ib_header *hdr,
+ 		wc.dlid_path_bits = 0;
+ 		wc.port_num = 0;
+ 		/* Signal completion event if the solicited bit is set. */
+-		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-			     ib_bth_is_solicited(ohdr));
++		rvt_recv_cq(qp, &wc, ib_bth_is_solicited(ohdr));
+ 		break;
+ 
+ 	case OP(RDMA_WRITE_FIRST):
+diff --git a/drivers/infiniband/hw/qib/qib_uc.c b/drivers/infiniband/hw/qib/qib_uc.c
+index 30c70ad0f4bf..e17b91e2c22a 100644
+--- a/drivers/infiniband/hw/qib/qib_uc.c
++++ b/drivers/infiniband/hw/qib/qib_uc.c
+@@ -400,8 +400,7 @@ void qib_uc_rcv(struct qib_ibport *ibp, struct ib_header *hdr,
+ 		wc.dlid_path_bits = 0;
+ 		wc.port_num = 0;
+ 		/* Signal completion event if the solicited bit is set. */
+-		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-			     ib_bth_is_solicited(ohdr));
++		rvt_recv_cq(qp, &wc, ib_bth_is_solicited(ohdr));
+ 		break;
+ 
+ 	case OP(RDMA_WRITE_FIRST):
+diff --git a/drivers/infiniband/hw/qib/qib_ud.c b/drivers/infiniband/hw/qib/qib_ud.c
+index 5cdedba2d164..32ad0b635fc6 100644
+--- a/drivers/infiniband/hw/qib/qib_ud.c
++++ b/drivers/infiniband/hw/qib/qib_ud.c
+@@ -210,8 +210,7 @@ static void qib_ud_loopback(struct rvt_qp *sqp, struct rvt_swqe *swqe)
+ 	wc.dlid_path_bits = rdma_ah_get_dlid(ah_attr) & ((1 << ppd->lmc) - 1);
+ 	wc.port_num = qp->port_num;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-		     swqe->wr.send_flags & IB_SEND_SOLICITED);
++	rvt_recv_cq(qp, &wc, swqe->wr.send_flags & IB_SEND_SOLICITED);
+ 	ibp->rvp.n_loop_pkts++;
+ bail_unlock:
+ 	spin_unlock_irqrestore(&qp->r_lock, flags);
+@@ -573,8 +572,7 @@ void qib_ud_rcv(struct qib_ibport *ibp, struct ib_header *hdr,
+ 		dlid & ((1 << ppd_from_ibp(ibp)->lmc) - 1);
+ 	wc.port_num = qp->port_num;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-		     ib_bth_is_solicited(ohdr));
++	rvt_recv_cq(qp, &wc, ib_bth_is_solicited(ohdr));
+ 	return;
+ 
+ drop:
+* Unmerged path drivers/infiniband/sw/rdmavt/cq.c
+diff --git a/drivers/infiniband/sw/rdmavt/qp.c b/drivers/infiniband/sw/rdmavt/qp.c
+index 3db1c30a9837..f8ef11056de5 100644
+--- a/drivers/infiniband/sw/rdmavt/qp.c
++++ b/drivers/infiniband/sw/rdmavt/qp.c
+@@ -3006,8 +3006,7 @@ void rvt_ruc_loopback(struct rvt_qp *sqp)
+ 	wc.sl = rdma_ah_get_sl(&qp->remote_ah_attr);
+ 	wc.port_num = 1;
+ 	/* Signal completion event if the solicited bit is set. */
+-	rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.recv_cq), &wc,
+-		     wqe->wr.send_flags & IB_SEND_SOLICITED);
++	rvt_recv_cq(qp, &wc, wqe->wr.send_flags & IB_SEND_SOLICITED);
+ 
+ send_comp:
+ 	spin_unlock_irqrestore(&qp->r_lock, flags);
+diff --git a/drivers/infiniband/sw/rdmavt/vt.h b/drivers/infiniband/sw/rdmavt/vt.h
+index 0675ea6c3872..d19ff817c2c7 100644
+--- a/drivers/infiniband/sw/rdmavt/vt.h
++++ b/drivers/infiniband/sw/rdmavt/vt.h
+@@ -78,6 +78,12 @@
+ 		     fmt, \
+ 		     ##__VA_ARGS__)
+ 
++#define rvt_pr_err_ratelimited(rdi, fmt, ...) \
++	__rvt_pr_err_ratelimited((rdi)->driver_f.get_pci_dev(rdi), \
++				 rvt_get_ibdev_name(rdi), \
++				 fmt, \
++				 ##__VA_ARGS__)
++
+ #define __rvt_pr_info(pdev, name, fmt, ...) \
+ 	dev_info(&pdev->dev, "%s: " fmt, name, ##__VA_ARGS__)
+ 
+@@ -87,6 +93,9 @@
+ #define __rvt_pr_err(pdev, name, fmt, ...) \
+ 	dev_err(&pdev->dev, "%s: " fmt, name, ##__VA_ARGS__)
+ 
++#define __rvt_pr_err_ratelimited(pdev, name, fmt, ...) \
++	dev_err_ratelimited(&(pdev)->dev, "%s: " fmt, name, ##__VA_ARGS__)
++
+ static inline int ibport_num_to_idx(struct ib_device *ibdev, u8 port_num)
+ {
+ 	struct rvt_dev_info *rdi = ib_to_rvt(ibdev);
+diff --git a/include/rdma/rdmavt_cq.h b/include/rdma/rdmavt_cq.h
+index 75dc65c0bfb8..e4df2bc1d4e4 100644
+--- a/include/rdma/rdmavt_cq.h
++++ b/include/rdma/rdmavt_cq.h
+@@ -84,6 +84,7 @@ struct rvt_cq {
+ 	spinlock_t lock; /* protect changes in this struct */
+ 	u8 notify;
+ 	u8 triggered;
++	u8 cq_full;
+ 	int comp_vector_cpu;
+ 	struct rvt_dev_info *rdi;
+ 	struct rvt_cq_wc *queue;
+@@ -95,6 +96,6 @@ static inline struct rvt_cq *ibcq_to_rvtcq(struct ib_cq *ibcq)
+ 	return container_of(ibcq, struct rvt_cq, ibcq);
+ }
+ 
+-void rvt_cq_enter(struct rvt_cq *cq, struct ib_wc *entry, bool solicited);
++bool rvt_cq_enter(struct rvt_cq *cq, struct ib_wc *entry, bool solicited);
+ 
+ #endif          /* DEF_RDMAVT_INCCQH */
+diff --git a/include/rdma/rdmavt_qp.h b/include/rdma/rdmavt_qp.h
+index 84d0f36afc2f..e0656aa1b5cd 100644
+--- a/include/rdma/rdmavt_qp.h
++++ b/include/rdma/rdmavt_qp.h
+@@ -716,6 +716,48 @@ rvt_qp_swqe_incr(struct rvt_qp *qp, u32 val)
+ 	return val;
+ }
+ 
++int rvt_error_qp(struct rvt_qp *qp, enum ib_wc_status err);
++
++/**
++ * rvt_recv_cq - add a new entry to completion queue
++ *			by receive queue
++ * @qp: receive queue
++ * @wc: work completion entry to add
++ * @solicited: true if @entry is solicited
++ *
++ * This is wrapper function for rvt_enter_cq function call by
++ * receive queue. If rvt_cq_enter return false, it means cq is
++ * full and the qp is put into error state.
++ */
++static inline void rvt_recv_cq(struct rvt_qp *qp, struct ib_wc *wc,
++			       bool solicited)
++{
++	struct rvt_cq *cq = ibcq_to_rvtcq(qp->ibqp.recv_cq);
++
++	if (unlikely(!rvt_cq_enter(cq, wc, solicited)))
++		rvt_error_qp(qp, IB_WC_LOC_QP_OP_ERR);
++}
++
++/**
++ * rvt_send_cq - add a new entry to completion queue
++ *                        by send queue
++ * @qp: send queue
++ * @wc: work completion entry to add
++ * @solicited: true if @entry is solicited
++ *
++ * This is wrapper function for rvt_enter_cq function call by
++ * send queue. If rvt_cq_enter return false, it means cq is
++ * full and the qp is put into error state.
++ */
++static inline void rvt_send_cq(struct rvt_qp *qp, struct ib_wc *wc,
++			       bool solicited)
++{
++	struct rvt_cq *cq = ibcq_to_rvtcq(qp->ibqp.send_cq);
++
++	if (unlikely(!rvt_cq_enter(cq, wc, solicited)))
++		rvt_error_qp(qp, IB_WC_LOC_QP_OP_ERR);
++}
++
+ /**
+  * rvt_qp_complete_swqe - insert send completion
+  * @qp - the qp
+@@ -766,9 +808,7 @@ rvt_qp_complete_swqe(struct rvt_qp *qp,
+ 			.qp = &qp->ibqp,
+ 			.byte_len = byte_len,
+ 		};
+-
+-		rvt_cq_enter(ibcq_to_rvtcq(qp->ibqp.send_cq), &w,
+-			     status != IB_WC_SUCCESS);
++		rvt_send_cq(qp, &w, status != IB_WC_SUCCESS);
+ 	}
+ 	return last;
+ }
+@@ -778,7 +818,6 @@ extern const int  ib_rvt_state_ops[];
+ struct rvt_dev_info;
+ int rvt_get_rwqe(struct rvt_qp *qp, bool wr_id_only);
+ void rvt_comm_est(struct rvt_qp *qp);
+-int rvt_error_qp(struct rvt_qp *qp, enum ib_wc_status err);
+ void rvt_rc_error(struct rvt_qp *qp, enum ib_wc_status err);
+ unsigned long rvt_rnr_tbl_to_usec(u32 index);
+ enum hrtimer_restart rvt_rc_rnr_retry(struct hrtimer *t);
