@@ -1,0 +1,206 @@
+mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Dan Williams <dan.j.williams@intel.com>
+commit fce86ff5802bac3a7b19db171aa1949ef9caac31
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fce86ff5.failed
+
+Starting with c6f3c5ee40c1 ("mm/huge_memory.c: fix modifying of page
+protection by insert_pfn_pmd()") vmf_insert_pfn_pmd() internally calls
+pmdp_set_access_flags().  That helper enforces a pmd aligned @address
+argument via VM_BUG_ON() assertion.
+
+Update the implementation to take a 'struct vm_fault' argument directly
+and apply the address alignment fixup internally to fix crash signatures
+like:
+
+    kernel BUG at arch/x86/mm/pgtable.c:515!
+    invalid opcode: 0000 [#1] SMP NOPTI
+    CPU: 51 PID: 43713 Comm: java Tainted: G           OE     4.19.35 #1
+    [..]
+    RIP: 0010:pmdp_set_access_flags+0x48/0x50
+    [..]
+    Call Trace:
+     vmf_insert_pfn_pmd+0x198/0x350
+     dax_iomap_fault+0xe82/0x1190
+     ext4_dax_huge_fault+0x103/0x1f0
+     ? __switch_to_asm+0x40/0x70
+     __handle_mm_fault+0x3f6/0x1370
+     ? __switch_to_asm+0x34/0x70
+     ? __switch_to_asm+0x40/0x70
+     handle_mm_fault+0xda/0x200
+     __do_page_fault+0x249/0x4f0
+     do_page_fault+0x32/0x110
+     ? page_fault+0x8/0x30
+     page_fault+0x1e/0x30
+
+Link: http://lkml.kernel.org/r/155741946350.372037.11148198430068238140.stgit@dwillia2-desk3.amr.corp.intel.com
+Fixes: c6f3c5ee40c1 ("mm/huge_memory.c: fix modifying of page protection by insert_pfn_pmd()")
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+	Reported-by: Piotr Balcer <piotr.balcer@intel.com>
+	Tested-by: Yan Ma <yan.ma@intel.com>
+	Tested-by: Pankaj Gupta <pagupta@redhat.com>
+	Reviewed-by: Matthew Wilcox <willy@infradead.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Reviewed-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Cc: Chandan Rajendra <chandan@linux.ibm.com>
+	Cc: Souptick Joarder <jrdr.linux@gmail.com>
+	Cc: <stable@vger.kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit fce86ff5802bac3a7b19db171aa1949ef9caac31)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dax/device.c
+#	fs/dax.c
+#	include/linux/huge_mm.h
+#	mm/huge_memory.c
+diff --cc drivers/dax/device.c
+index 0a2acd7993f0,996d68ff992a..000000000000
+--- a/drivers/dax/device.c
++++ b/drivers/dax/device.c
+@@@ -331,10 -182,9 +331,14 @@@ static int __dev_dax_pmd_fault(struct d
+  		return VM_FAULT_SIGBUS;
+  	}
+  
+ -	*pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
+ +	pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
+  
+++<<<<<<< HEAD
+ +	return vmf_insert_pfn_pmd(vmf->vma, vmf->address, vmf->pmd, pfn,
+ +			vmf->flags & FAULT_FLAG_WRITE);
+++=======
++ 	return vmf_insert_pfn_pmd(vmf, *pfn, vmf->flags & FAULT_FLAG_WRITE);
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  }
+  
+  #ifdef CONFIG_HAVE_ARCH_TRANSPARENT_HUGEPAGE_PUD
+@@@ -382,13 -232,13 +386,17 @@@ static int __dev_dax_pud_fault(struct d
+  		return VM_FAULT_SIGBUS;
+  	}
+  
+ -	*pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
+ +	pfn = phys_to_pfn_t(phys, dax_region->pfn_flags);
+  
+++<<<<<<< HEAD
+ +	return vmf_insert_pfn_pud(vmf->vma, vmf->address, vmf->pud, pfn,
+ +			vmf->flags & FAULT_FLAG_WRITE);
+++=======
++ 	return vmf_insert_pfn_pud(vmf, *pfn, vmf->flags & FAULT_FLAG_WRITE);
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  }
+  #else
+ -static vm_fault_t __dev_dax_pud_fault(struct dev_dax *dev_dax,
+ -				struct vm_fault *vmf, pfn_t *pfn)
+ +static int __dev_dax_pud_fault(struct dev_dax *dev_dax, struct vm_fault *vmf)
+  {
+  	return VM_FAULT_FALLBACK;
+  }
+diff --cc fs/dax.c
+index 55fa1d998011,83009875308c..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -1662,23 -1678,18 +1661,28 @@@ static vm_fault_t dax_insert_pfn_mkwrit
+  						      VM_FAULT_NOPAGE);
+  		return VM_FAULT_NOPAGE;
+  	}
+ -	xas_set_mark(&xas, PAGECACHE_TAG_DIRTY);
+ -	dax_lock_entry(&xas, entry);
+ -	xas_unlock_irq(&xas);
+ -	if (order == 0)
+ +	radix_tree_tag_set(&mapping->i_pages, index, PAGECACHE_TAG_DIRTY);
+ +	entry = lock_slot(mapping, slot);
+ +	xa_unlock_irq(&mapping->i_pages);
+ +	switch (pe_size) {
+ +	case PE_SIZE_PTE:
+  		ret = vmf_insert_mixed_mkwrite(vmf->vma, vmf->address, pfn);
+ +		break;
+  #ifdef CONFIG_FS_DAX_PMD
+++<<<<<<< HEAD
+ +	case PE_SIZE_PMD:
+ +		ret = vmf_insert_pfn_pmd(vmf->vma, vmf->address, vmf->pmd,
+ +			pfn, true);
+ +		break;
+++=======
++ 	else if (order == PMD_ORDER)
++ 		ret = vmf_insert_pfn_pmd(vmf, pfn, FAULT_FLAG_WRITE);
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  #endif
+ -	else
+ +	default:
+  		ret = VM_FAULT_FALLBACK;
+ -	dax_unlock_entry(&xas, entry);
+ +	}
+ +	put_locked_mapping_entry(mapping, index);
+  	trace_dax_insert_pfn_mkwrite(mapping->host, vmf, ret);
+  	return ret;
+  }
+diff --cc include/linux/huge_mm.h
+index cd8ed4940b1f,7cd5c150c21d..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -46,10 -47,8 +46,15 @@@ extern bool move_huge_pmd(struct vm_are
+  extern int change_huge_pmd(struct vm_area_struct *vma, pmd_t *pmd,
+  			unsigned long addr, pgprot_t newprot,
+  			int prot_numa);
+++<<<<<<< HEAD
+ +int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+ +			pmd_t *pmd, pfn_t pfn, bool write);
+ +int vmf_insert_pfn_pud(struct vm_area_struct *vma, unsigned long addr,
+ +			pud_t *pud, pfn_t pfn, bool write);
+++=======
++ vm_fault_t vmf_insert_pfn_pmd(struct vm_fault *vmf, pfn_t pfn, bool write);
++ vm_fault_t vmf_insert_pfn_pud(struct vm_fault *vmf, pfn_t pfn, bool write);
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  enum transparent_hugepage_flag {
+  	TRANSPARENT_HUGEPAGE_FLAG,
+  	TRANSPARENT_HUGEPAGE_REQ_MADV_FLAG,
+diff --cc mm/huge_memory.c
+index 1c0e4ee99d7c,c314a362c167..000000000000
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@@ -772,11 -793,13 +772,18 @@@ out_unlock
+  		pte_free(mm, pgtable);
+  }
+  
+++<<<<<<< HEAD
+ +int vmf_insert_pfn_pmd(struct vm_area_struct *vma, unsigned long addr,
+ +			pmd_t *pmd, pfn_t pfn, bool write)
+++=======
++ vm_fault_t vmf_insert_pfn_pmd(struct vm_fault *vmf, pfn_t pfn, bool write)
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  {
++ 	unsigned long addr = vmf->address & PMD_MASK;
++ 	struct vm_area_struct *vma = vmf->vma;
+  	pgprot_t pgprot = vma->vm_page_prot;
+  	pgtable_t pgtable = NULL;
++ 
+  	/*
+  	 * If we had pmd_special, we could avoid all these restrictions,
+  	 * but we need to be consistent with PTEs and architectures that
+@@@ -848,10 -871,12 +855,17 @@@ out_unlock
+  	spin_unlock(ptl);
+  }
+  
+++<<<<<<< HEAD
+ +int vmf_insert_pfn_pud(struct vm_area_struct *vma, unsigned long addr,
+ +			pud_t *pud, pfn_t pfn, bool write)
+++=======
++ vm_fault_t vmf_insert_pfn_pud(struct vm_fault *vmf, pfn_t pfn, bool write)
+++>>>>>>> fce86ff5802b (mm/huge_memory: fix vmf_insert_pfn_{pmd, pud}() crash, handle unaligned addresses)
+  {
++ 	unsigned long addr = vmf->address & PUD_MASK;
++ 	struct vm_area_struct *vma = vmf->vma;
+  	pgprot_t pgprot = vma->vm_page_prot;
++ 
+  	/*
+  	 * If we had pud_special, we could avoid all these restrictions,
+  	 * but we need to be consistent with PTEs and architectures that
+* Unmerged path drivers/dax/device.c
+* Unmerged path fs/dax.c
+* Unmerged path include/linux/huge_mm.h
+* Unmerged path mm/huge_memory.c
