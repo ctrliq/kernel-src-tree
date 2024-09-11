@@ -12,6 +12,7 @@
 
 struct st_clk_data {
 	void __iomem *base;
+	u32 is_rv;
 };
 
 #endif /* __CLK_ST_H */
