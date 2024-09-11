@@ -1,0 +1,582 @@
+KVM: x86/xen: intercept xen hypercalls if enabled
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Joao Martins <joao.m.martins@oracle.com>
+commit 23200b7a30de315d0e9a40663c905869d29d833c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/23200b7a.failed
+
+Add a new exit reason for emulator to handle Xen hypercalls.
+
+Since this means KVM owns the ABI, dispense with the facility for the
+VMM to provide its own copy of the hypercall pages; just fill them in
+directly using VMCALL/VMMCALL as we do for the Hyper-V hypercall page.
+
+This behaviour is enabled by a new INTERCEPT_HCALL flag in the
+KVM_XEN_HVM_CONFIG ioctl structure, and advertised by the same flag
+being returned from the KVM_CAP_XEN_HVM check.
+
+Rename xen_hvm_config() to kvm_xen_write_hypercall_page() and move it
+to the nascent xen.c while we're at it, and add a test case.
+
+	Signed-off-by: Joao Martins <joao.m.martins@oracle.com>
+	Signed-off-by: David Woodhouse <dwmw@amazon.co.uk>
+(cherry picked from commit 23200b7a30de315d0e9a40663c905869d29d833c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/kvm.h
+#	tools/testing/selftests/kvm/Makefile
+#	tools/testing/selftests/kvm/lib/kvm_util.c
+diff --cc include/uapi/linux/kvm.h
+index a9fa79abd23a,c87defe5db4f..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -250,6 -264,10 +264,13 @@@ struct kvm_xen_exit 
+  #define KVM_EXIT_ARM_NISV         28
+  #define KVM_EXIT_X86_RDMSR        29
+  #define KVM_EXIT_X86_WRMSR        30
+++<<<<<<< HEAD
+++=======
++ #define KVM_EXIT_DIRTY_RING_FULL  31
++ #define KVM_EXIT_AP_RESET_HOLD    32
++ #define KVM_EXIT_X86_BUS_LOCK     33
++ #define KVM_EXIT_XEN              34
+++>>>>>>> 23200b7a30de (KVM: x86/xen: intercept xen hypercalls if enabled)
+  
+  /* For KVM_EXIT_INTERNAL_ERROR */
+  /* Emulate instruction failed. */
+diff --cc tools/testing/selftests/kvm/Makefile
+index 0f73faa651c0,be9613dd6d9b..000000000000
+--- a/tools/testing/selftests/kvm/Makefile
++++ b/tools/testing/selftests/kvm/Makefile
+@@@ -60,10 -61,13 +60,15 @@@ TEST_GEN_PROGS_x86_64 += x86_64/xapic_i
+  TEST_GEN_PROGS_x86_64 += x86_64/xss_msr_test
+  TEST_GEN_PROGS_x86_64 += x86_64/debug_regs
+  TEST_GEN_PROGS_x86_64 += x86_64/tsc_msrs_test
+++<<<<<<< HEAD
+ +TEST_GEN_PROGS_x86_64 += x86_64/user_msr_test
+++=======
++ TEST_GEN_PROGS_x86_64 += x86_64/vmx_pmu_msrs_test
++ TEST_GEN_PROGS_x86_64 += x86_64/xen_vmcall_test
+++>>>>>>> 23200b7a30de (KVM: x86/xen: intercept xen hypercalls if enabled)
+  TEST_GEN_PROGS_x86_64 += demand_paging_test
+  TEST_GEN_PROGS_x86_64 += dirty_log_test
+ -TEST_GEN_PROGS_x86_64 += dirty_log_perf_test
+  TEST_GEN_PROGS_x86_64 += kvm_create_max_vcpus
+ -TEST_GEN_PROGS_x86_64 += memslot_modification_stress_test
+  TEST_GEN_PROGS_x86_64 += set_memory_region_test
+  TEST_GEN_PROGS_x86_64 += steal_time
+  
+diff --cc tools/testing/selftests/kvm/lib/kvm_util.c
+index b2c426adb87f,d787cb802b4a..000000000000
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@@ -1806,6 -1799,9 +1806,12 @@@ static struct exit_reason 
+  	{KVM_EXIT_OSI, "OSI"},
+  	{KVM_EXIT_PAPR_HCALL, "PAPR_HCALL"},
+  	{KVM_EXIT_DIRTY_RING_FULL, "DIRTY_RING_FULL"},
+++<<<<<<< HEAD
+++=======
++ 	{KVM_EXIT_X86_RDMSR, "RDMSR"},
++ 	{KVM_EXIT_X86_WRMSR, "WRMSR"},
++ 	{KVM_EXIT_XEN, "XEN"},
+++>>>>>>> 23200b7a30de (KVM: x86/xen: intercept xen hypercalls if enabled)
+  #ifdef KVM_EXIT_MEMORY_NOT_PRESENT
+  	{KVM_EXIT_MEMORY_NOT_PRESENT, "MEMORY_NOT_PRESENT"},
+  #endif
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index cfdcc4e9299e..c1aedd9737c3 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -531,6 +531,11 @@ struct kvm_vcpu_hv {
+ 	cpumask_t tlb_flush;
+ };
+ 
++/* Xen HVM per vcpu emulation context */
++struct kvm_vcpu_xen {
++	u64 hypercall_rip;
++};
++
+ struct kvm_vcpu_arch {
+ 	/*
+ 	 * rip and regs accesses must go through
+@@ -728,6 +733,7 @@ struct kvm_vcpu_arch {
+ 	unsigned long singlestep_rip;
+ 
+ 	struct kvm_vcpu_hv hyperv;
++	struct kvm_vcpu_xen xen;
+ 
+ 	cpumask_var_t wbinvd_dirty_mask;
+ 
+diff --git a/arch/x86/kvm/Makefile b/arch/x86/kvm/Makefile
+index b804444e16d4..8bee4afc1fec 100644
+--- a/arch/x86/kvm/Makefile
++++ b/arch/x86/kvm/Makefile
+@@ -13,7 +13,7 @@ kvm-y			+= $(KVM)/kvm_main.o $(KVM)/coalesced_mmio.o \
+ 				$(KVM)/eventfd.o $(KVM)/irqchip.o $(KVM)/vfio.o
+ kvm-$(CONFIG_KVM_ASYNC_PF)	+= $(KVM)/async_pf.o
+ 
+-kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o \
++kvm-y			+= x86.o emulate.o i8259.o irq.o lapic.o xen.o \
+ 			   i8254.o ioapic.o irq_comm.o cpuid.o pmu.o mtrr.o \
+ 			   hyperv.o debugfs.o mmu/mmu.o mmu/page_track.o \
+ 			   mmu/spte.o mmu/tdp_iter.o mmu/tdp_mmu.o
+diff --git a/arch/x86/kvm/trace.h b/arch/x86/kvm/trace.h
+index aef960f90f26..d28ecb37b62c 100644
+--- a/arch/x86/kvm/trace.h
++++ b/arch/x86/kvm/trace.h
+@@ -92,6 +92,42 @@ TRACE_EVENT(kvm_hv_hypercall,
+ 		  __entry->outgpa)
+ );
+ 
++/*
++ * Tracepoint for Xen hypercall.
++ */
++TRACE_EVENT(kvm_xen_hypercall,
++	TP_PROTO(unsigned long nr, unsigned long a0, unsigned long a1,
++		 unsigned long a2, unsigned long a3, unsigned long a4,
++		 unsigned long a5),
++	    TP_ARGS(nr, a0, a1, a2, a3, a4, a5),
++
++	TP_STRUCT__entry(
++		__field(unsigned long, nr)
++		__field(unsigned long, a0)
++		__field(unsigned long, a1)
++		__field(unsigned long, a2)
++		__field(unsigned long, a3)
++		__field(unsigned long, a4)
++		__field(unsigned long, a5)
++	),
++
++	TP_fast_assign(
++		__entry->nr = nr;
++		__entry->a0 = a0;
++		__entry->a1 = a1;
++		__entry->a2 = a2;
++		__entry->a3 = a3;
++		__entry->a4 = a4;
++		__entry->a4 = a5;
++	),
++
++	TP_printk("nr 0x%lx a0 0x%lx a1 0x%lx a2 0x%lx a3 0x%lx a4 0x%lx a5 %lx",
++		  __entry->nr, __entry->a0, __entry->a1,  __entry->a2,
++		  __entry->a3, __entry->a4, __entry->a5)
++);
++
++
++
+ /*
+  * Tracepoint for PIO.
+  */
+diff --git a/arch/x86/kvm/x86.c b/arch/x86/kvm/x86.c
+index d4accaf52758..4925f3447bd8 100644
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@ -29,6 +29,7 @@
+ #include "pmu.h"
+ #include "hyperv.h"
+ #include "lapic.h"
++#include "xen.h"
+ 
+ #include <linux/clocksource.h>
+ #include <linux/interrupt.h>
+@@ -2868,34 +2869,6 @@ static int set_msr_mce(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	return 0;
+ }
+ 
+-static int xen_hvm_config(struct kvm_vcpu *vcpu, u64 data)
+-{
+-	struct kvm *kvm = vcpu->kvm;
+-	int lm = is_long_mode(vcpu);
+-	u64 blob_addr = lm ? kvm->arch.xen_hvm_config.blob_addr_64
+-		: kvm->arch.xen_hvm_config.blob_addr_32;
+-	u8 blob_size = lm ? kvm->arch.xen_hvm_config.blob_size_64
+-		: kvm->arch.xen_hvm_config.blob_size_32;
+-	u32 page_num = data & ~PAGE_MASK;
+-	u64 page_addr = data & PAGE_MASK;
+-	u8 *page;
+-
+-	if (page_num >= blob_size)
+-		return 1;
+-
+-	blob_addr += page_num * PAGE_SIZE;
+-
+-	page = memdup_user((u8 __user *)blob_addr, PAGE_SIZE);
+-	if (IS_ERR(page))
+-		return PTR_ERR(page);
+-
+-	if (kvm_vcpu_write_guest(vcpu, page_addr, page, PAGE_SIZE)) {
+-		kfree(page);
+-		return 1;
+-	}
+-	return 0;
+-}
+-
+ static inline bool kvm_pv_async_pf_enabled(struct kvm_vcpu *vcpu)
+ {
+ 	u64 mask = KVM_ASYNC_PF_ENABLED | KVM_ASYNC_PF_DELIVERY_AS_INT;
+@@ -3030,7 +3003,7 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
+ 	u64 data = msr_info->data;
+ 
+ 	if (msr && msr == vcpu->kvm->arch.xen_hvm_config.msr)
+-		return xen_hvm_config(vcpu, data);
++		return kvm_xen_write_hypercall_page(vcpu, data);
+ 
+ 	switch (msr) {
+ 	case MSR_AMD64_NB_CFG:
+@@ -3738,7 +3711,6 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_PIT2:
+ 	case KVM_CAP_PIT_STATE2:
+ 	case KVM_CAP_SET_IDENTITY_MAP_ADDR:
+-	case KVM_CAP_XEN_HVM:
+ 	case KVM_CAP_VCPU_EVENTS:
+ 	case KVM_CAP_HYPERV:
+ 	case KVM_CAP_HYPERV_VAPIC:
+@@ -3778,6 +3750,10 @@ int kvm_vm_ioctl_check_extension(struct kvm *kvm, long ext)
+ 	case KVM_CAP_ENFORCE_PV_FEATURE_CPUID:
+ 		r = 1;
+ 		break;
++	case KVM_CAP_XEN_HVM:
++		r = KVM_XEN_HVM_CONFIG_HYPERCALL_MSR |
++		    KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL;
++		break;
+ 	case KVM_CAP_SYNC_REGS:
+ 		r = KVM_SYNC_X86_VALID_FIELDS;
+ 		break;
+@@ -5619,7 +5595,15 @@ long kvm_arch_vm_ioctl(struct file *filp,
+ 		if (copy_from_user(&xhc, argp, sizeof(xhc)))
+ 			goto out;
+ 		r = -EINVAL;
+-		if (xhc.flags)
++		if (xhc.flags & ~KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL)
++			goto out;
++		/*
++		 * With hypercall interception the kernel generates its own
++		 * hypercall page so it must not be provided.
++		 */
++		if ((xhc.flags & KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL) &&
++		    (xhc.blob_addr_32 || xhc.blob_addr_64 ||
++		     xhc.blob_size_32 || xhc.blob_size_64))
+ 			goto out;
+ 		memcpy(&kvm->arch.xen_hvm_config, &xhc, sizeof(xhc));
+ 		r = 0;
+@@ -8097,6 +8081,9 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
+ 	unsigned long nr, a0, a1, a2, a3, ret;
+ 	int op_64_bit;
+ 
++	if (kvm_xen_hypercall_enabled(vcpu->kvm))
++		return kvm_xen_hypercall(vcpu);
++
+ 	if (kvm_hv_hypercall_enabled(vcpu->kvm))
+ 		return kvm_hv_hypercall(vcpu);
+ 
+diff --git a/arch/x86/kvm/xen.c b/arch/x86/kvm/xen.c
+new file mode 100644
+index 000000000000..62569ca43857
+--- /dev/null
++++ b/arch/x86/kvm/xen.c
+@@ -0,0 +1,142 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2019 Oracle and/or its affiliates. All rights reserved.
++ * Copyright © 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * KVM Xen emulation
++ */
++
++#include "x86.h"
++#include "xen.h"
++
++#include <linux/kvm_host.h>
++
++#include <trace/events/kvm.h>
++
++#include "trace.h"
++
++int kvm_xen_write_hypercall_page(struct kvm_vcpu *vcpu, u64 data)
++{
++	struct kvm *kvm = vcpu->kvm;
++	u32 page_num = data & ~PAGE_MASK;
++	u64 page_addr = data & PAGE_MASK;
++
++	/*
++	 * If Xen hypercall intercept is enabled, fill the hypercall
++	 * page with VMCALL/VMMCALL instructions since that's what
++	 * we catch. Else the VMM has provided the hypercall pages
++	 * with instructions of its own choosing, so use those.
++	 */
++	if (kvm_xen_hypercall_enabled(kvm)) {
++		u8 instructions[32];
++		int i;
++
++		if (page_num)
++			return 1;
++
++		/* mov imm32, %eax */
++		instructions[0] = 0xb8;
++
++		/* vmcall / vmmcall */
++		kvm_x86_ops.patch_hypercall(vcpu, instructions + 5);
++
++		/* ret */
++		instructions[8] = 0xc3;
++
++		/* int3 to pad */
++		memset(instructions + 9, 0xcc, sizeof(instructions) - 9);
++
++		for (i = 0; i < PAGE_SIZE / sizeof(instructions); i++) {
++			*(u32 *)&instructions[1] = i;
++			if (kvm_vcpu_write_guest(vcpu,
++						 page_addr + (i * sizeof(instructions)),
++						 instructions, sizeof(instructions)))
++				return 1;
++		}
++	} else {
++		int lm = is_long_mode(vcpu);
++		u64 blob_addr = lm ? kvm->arch.xen_hvm_config.blob_addr_64
++				   : kvm->arch.xen_hvm_config.blob_addr_32;
++		u8 blob_size = lm ? kvm->arch.xen_hvm_config.blob_size_64
++				  : kvm->arch.xen_hvm_config.blob_size_32;
++		u8 *page;
++
++		if (page_num >= blob_size)
++			return 1;
++
++		blob_addr += page_num * PAGE_SIZE;
++
++		page = memdup_user((u8 __user *)blob_addr, PAGE_SIZE);
++		if (IS_ERR(page))
++			return PTR_ERR(page);
++
++		if (kvm_vcpu_write_guest(vcpu, page_addr, page, PAGE_SIZE)) {
++			kfree(page);
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static int kvm_xen_hypercall_set_result(struct kvm_vcpu *vcpu, u64 result)
++{
++	kvm_rax_write(vcpu, result);
++	return kvm_skip_emulated_instruction(vcpu);
++}
++
++static int kvm_xen_hypercall_complete_userspace(struct kvm_vcpu *vcpu)
++{
++	struct kvm_run *run = vcpu->run;
++
++	if (unlikely(!kvm_is_linear_rip(vcpu, vcpu->arch.xen.hypercall_rip)))
++		return 1;
++
++	return kvm_xen_hypercall_set_result(vcpu, run->xen.u.hcall.result);
++}
++
++int kvm_xen_hypercall(struct kvm_vcpu *vcpu)
++{
++	bool longmode;
++	u64 input, params[6];
++
++	input = (u64)kvm_register_read(vcpu, VCPU_REGS_RAX);
++
++	longmode = is_64_bit_mode(vcpu);
++	if (!longmode) {
++		params[0] = (u32)kvm_rbx_read(vcpu);
++		params[1] = (u32)kvm_rcx_read(vcpu);
++		params[2] = (u32)kvm_rdx_read(vcpu);
++		params[3] = (u32)kvm_rsi_read(vcpu);
++		params[4] = (u32)kvm_rdi_read(vcpu);
++		params[5] = (u32)kvm_rbp_read(vcpu);
++	}
++#ifdef CONFIG_X86_64
++	else {
++		params[0] = (u64)kvm_rdi_read(vcpu);
++		params[1] = (u64)kvm_rsi_read(vcpu);
++		params[2] = (u64)kvm_rdx_read(vcpu);
++		params[3] = (u64)kvm_r10_read(vcpu);
++		params[4] = (u64)kvm_r8_read(vcpu);
++		params[5] = (u64)kvm_r9_read(vcpu);
++	}
++#endif
++	trace_kvm_xen_hypercall(input, params[0], params[1], params[2],
++				params[3], params[4], params[5]);
++
++	vcpu->run->exit_reason = KVM_EXIT_XEN;
++	vcpu->run->xen.type = KVM_EXIT_XEN_HCALL;
++	vcpu->run->xen.u.hcall.longmode = longmode;
++	vcpu->run->xen.u.hcall.cpl = kvm_x86_ops.get_cpl(vcpu);
++	vcpu->run->xen.u.hcall.input = input;
++	vcpu->run->xen.u.hcall.params[0] = params[0];
++	vcpu->run->xen.u.hcall.params[1] = params[1];
++	vcpu->run->xen.u.hcall.params[2] = params[2];
++	vcpu->run->xen.u.hcall.params[3] = params[3];
++	vcpu->run->xen.u.hcall.params[4] = params[4];
++	vcpu->run->xen.u.hcall.params[5] = params[5];
++	vcpu->arch.xen.hypercall_rip = kvm_get_linear_rip(vcpu);
++	vcpu->arch.complete_userspace_io =
++		kvm_xen_hypercall_complete_userspace;
++
++	return 0;
++}
+diff --git a/arch/x86/kvm/xen.h b/arch/x86/kvm/xen.h
+new file mode 100644
+index 000000000000..276ed59e476b
+--- /dev/null
++++ b/arch/x86/kvm/xen.h
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Copyright © 2019 Oracle and/or its affiliates. All rights reserved.
++ * Copyright © 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
++ *
++ * KVM Xen emulation
++ */
++
++#ifndef __ARCH_X86_KVM_XEN_H__
++#define __ARCH_X86_KVM_XEN_H__
++
++int kvm_xen_hypercall(struct kvm_vcpu *vcpu);
++int kvm_xen_write_hypercall_page(struct kvm_vcpu *vcpu, u64 data);
++
++static inline bool kvm_xen_hypercall_enabled(struct kvm *kvm)
++{
++	return kvm->arch.xen_hvm_config.flags &
++		KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL;
++}
++
++#endif /* __ARCH_X86_KVM_XEN_H__ */
+* Unmerged path include/uapi/linux/kvm.h
+* Unmerged path tools/testing/selftests/kvm/Makefile
+* Unmerged path tools/testing/selftests/kvm/lib/kvm_util.c
+diff --git a/tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c b/tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c
+new file mode 100644
+index 000000000000..234c9da286aa
+--- /dev/null
++++ b/tools/testing/selftests/kvm/x86_64/xen_vmcall_test.c
+@@ -0,0 +1,123 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * xen_vmcall_test
++ *
++ * Copyright © 2020 Amazon.com, Inc. or its affiliates.
++ *
++ * Userspace hypercall testing
++ */
++
++#include "test_util.h"
++#include "kvm_util.h"
++#include "processor.h"
++
++#define VCPU_ID		5
++
++#define HCALL_REGION_GPA	0xc0000000ULL
++#define HCALL_REGION_SLOT	10
++
++static struct kvm_vm *vm;
++
++#define INPUTVALUE 17
++#define ARGVALUE(x) (0xdeadbeef5a5a0000UL + x)
++#define RETVALUE 0xcafef00dfbfbffffUL
++
++#define XEN_HYPERCALL_MSR 0x40000000
++
++static void guest_code(void)
++{
++	unsigned long rax = INPUTVALUE;
++	unsigned long rdi = ARGVALUE(1);
++	unsigned long rsi = ARGVALUE(2);
++	unsigned long rdx = ARGVALUE(3);
++	register unsigned long r10 __asm__("r10") = ARGVALUE(4);
++	register unsigned long r8 __asm__("r8") = ARGVALUE(5);
++	register unsigned long r9 __asm__("r9") = ARGVALUE(6);
++
++	/* First a direct invocation of 'vmcall' */
++	__asm__ __volatile__("vmcall" :
++			     "=a"(rax) :
++			     "a"(rax), "D"(rdi), "S"(rsi), "d"(rdx),
++			     "r"(r10), "r"(r8), "r"(r9));
++	GUEST_ASSERT(rax == RETVALUE);
++
++	/* Now fill in the hypercall page */
++	__asm__ __volatile__("wrmsr" : : "c" (XEN_HYPERCALL_MSR),
++			     "a" (HCALL_REGION_GPA & 0xffffffff),
++			     "d" (HCALL_REGION_GPA >> 32));
++
++	/* And invoke the same hypercall that way */
++	__asm__ __volatile__("call *%1" : "=a"(rax) :
++			     "r"(HCALL_REGION_GPA + INPUTVALUE * 32),
++			     "a"(rax), "D"(rdi), "S"(rsi), "d"(rdx),
++			     "r"(r10), "r"(r8), "r"(r9));
++	GUEST_ASSERT(rax == RETVALUE);
++
++	GUEST_DONE();
++}
++
++int main(int argc, char *argv[])
++{
++	if (!(kvm_check_cap(KVM_CAP_XEN_HVM) &
++	      KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL) ) {
++		print_skip("KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL not available");
++		exit(KSFT_SKIP);
++	}
++
++	vm = vm_create_default(VCPU_ID, 0, (void *) guest_code);
++	vcpu_set_cpuid(vm, VCPU_ID, kvm_get_supported_cpuid());
++
++	struct kvm_xen_hvm_config hvmc = {
++		.flags = KVM_XEN_HVM_CONFIG_INTERCEPT_HCALL,
++		.msr = XEN_HYPERCALL_MSR,
++	};
++	vm_ioctl(vm, KVM_XEN_HVM_CONFIG, &hvmc);
++
++	/* Map a region for the hypercall page */
++	vm_userspace_mem_region_add(vm, VM_MEM_SRC_ANONYMOUS,
++                                    HCALL_REGION_GPA, HCALL_REGION_SLOT,
++				    getpagesize(), 0);
++	virt_map(vm, HCALL_REGION_GPA, HCALL_REGION_GPA, 1, 0);
++
++	for (;;) {
++		volatile struct kvm_run *run = vcpu_state(vm, VCPU_ID);
++		struct ucall uc;
++
++		vcpu_run(vm, VCPU_ID);
++
++		if (run->exit_reason == KVM_EXIT_XEN) {
++			ASSERT_EQ(run->xen.type, KVM_EXIT_XEN_HCALL);
++			ASSERT_EQ(run->xen.u.hcall.cpl, 0);
++			ASSERT_EQ(run->xen.u.hcall.longmode, 1);
++			ASSERT_EQ(run->xen.u.hcall.input, INPUTVALUE);
++			ASSERT_EQ(run->xen.u.hcall.params[0], ARGVALUE(1));
++			ASSERT_EQ(run->xen.u.hcall.params[1], ARGVALUE(2));
++			ASSERT_EQ(run->xen.u.hcall.params[2], ARGVALUE(3));
++			ASSERT_EQ(run->xen.u.hcall.params[3], ARGVALUE(4));
++			ASSERT_EQ(run->xen.u.hcall.params[4], ARGVALUE(5));
++			ASSERT_EQ(run->xen.u.hcall.params[5], ARGVALUE(6));
++			run->xen.u.hcall.result = RETVALUE;
++			continue;
++		}
++
++		TEST_ASSERT(run->exit_reason == KVM_EXIT_IO,
++			    "Got exit_reason other than KVM_EXIT_IO: %u (%s)\n",
++			    run->exit_reason,
++			    exit_reason_str(run->exit_reason));
++
++		switch (get_ucall(vm, VCPU_ID, &uc)) {
++		case UCALL_ABORT:
++			TEST_FAIL("%s", (const char *)uc.args[0]);
++			/* NOT REACHED */
++		case UCALL_SYNC:
++			break;
++		case UCALL_DONE:
++			goto done;
++		default:
++			TEST_FAIL("Unknown ucall 0x%lx.", uc.cmd);
++		}
++	}
++done:
++	kvm_vm_free(vm);
++	return 0;
++}
