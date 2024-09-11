@@ -1,0 +1,212 @@
+drm/amd/display: Change the delay time before enabling FEC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Leo (Hanghong) Ma <hanghong.ma@amd.com>
+commit fa11d3c9425354c4b47e40f34d29c5b0949fe4ce
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/fa11d3c9.failed
+
+[why]
+DP spec requires 1000 symbols delay between the end of link training
+and enabling FEC in the stream. Currently we are using 1 miliseconds
+delay which is not accurate.
+
+[how]
+One lane RBR should have the maximum time for transmitting 1000 LL
+codes which is 6.173 us. So using 7 microseconds delay instead of
+1 miliseconds.
+
+	Signed-off-by: Leo (Hanghong) Ma <hanghong.ma@amd.com>
+	Reviewed-by: Harry Wentland <Harry.Wentland@amd.com>
+	Reviewed-by: Nikola Cornij <Nikola.Cornij@amd.com>
+	Acked-by: Leo Li <sunpeng.li@amd.com>
+	Signed-off-by: Alex Deucher <alexander.deucher@amd.com>
+(cherry picked from commit fa11d3c9425354c4b47e40f34d29c5b0949fe4ce)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+diff --cc drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+index b0661eebeeac,b10019106030..000000000000
+--- a/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
++++ b/drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
+@@@ -2787,3 -3798,173 +2787,176 @@@ void dp_enable_mst_on_sink(struct dc_li
+  
+  	core_link_write_dpcd(link, DP_MSTM_CTRL, &mstmCntl, 1);
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ void dp_set_panel_mode(struct dc_link *link, enum dp_panel_mode panel_mode)
++ {
++ 	union dpcd_edp_config edp_config_set;
++ 	bool panel_mode_edp = false;
++ 
++ 	memset(&edp_config_set, '\0', sizeof(union dpcd_edp_config));
++ 
++ 	if (panel_mode != DP_PANEL_MODE_DEFAULT) {
++ 
++ 		switch (panel_mode) {
++ 		case DP_PANEL_MODE_EDP:
++ 		case DP_PANEL_MODE_SPECIAL:
++ 			panel_mode_edp = true;
++ 			break;
++ 
++ 		default:
++ 				break;
++ 		}
++ 
++ 		/*set edp panel mode in receiver*/
++ 		core_link_read_dpcd(
++ 			link,
++ 			DP_EDP_CONFIGURATION_SET,
++ 			&edp_config_set.raw,
++ 			sizeof(edp_config_set.raw));
++ 
++ 		if (edp_config_set.bits.PANEL_MODE_EDP
++ 			!= panel_mode_edp) {
++ 			enum ddc_result result = DDC_RESULT_UNKNOWN;
++ 
++ 			edp_config_set.bits.PANEL_MODE_EDP =
++ 			panel_mode_edp;
++ 			result = core_link_write_dpcd(
++ 				link,
++ 				DP_EDP_CONFIGURATION_SET,
++ 				&edp_config_set.raw,
++ 				sizeof(edp_config_set.raw));
++ 
++ 			ASSERT(result == DDC_RESULT_SUCESSFULL);
++ 		}
++ 	}
++ 	DC_LOG_DETECTION_DP_CAPS("Link: %d eDP panel mode supported: %d "
++ 		 "eDP panel mode enabled: %d \n",
++ 		 link->link_index,
++ 		 link->dpcd_caps.panel_mode_edp,
++ 		 panel_mode_edp);
++ }
++ 
++ enum dp_panel_mode dp_get_panel_mode(struct dc_link *link)
++ {
++ 	/* We need to explicitly check that connector
++ 	 * is not DP. Some Travis_VGA get reported
++ 	 * by video bios as DP.
++ 	 */
++ 	if (link->connector_signal != SIGNAL_TYPE_DISPLAY_PORT) {
++ 
++ 		switch (link->dpcd_caps.branch_dev_id) {
++ 		case DP_BRANCH_DEVICE_ID_0022B9:
++ 			/* alternate scrambler reset is required for Travis
++ 			 * for the case when external chip does not
++ 			 * provide sink device id, alternate scrambler
++ 			 * scheme will  be overriden later by querying
++ 			 * Encoder features
++ 			 */
++ 			if (strncmp(
++ 				link->dpcd_caps.branch_dev_name,
++ 				DP_VGA_LVDS_CONVERTER_ID_2,
++ 				sizeof(
++ 				link->dpcd_caps.
++ 				branch_dev_name)) == 0) {
++ 					return DP_PANEL_MODE_SPECIAL;
++ 			}
++ 			break;
++ 		case DP_BRANCH_DEVICE_ID_00001A:
++ 			/* alternate scrambler reset is required for Travis
++ 			 * for the case when external chip does not provide
++ 			 * sink device id, alternate scrambler scheme will
++ 			 * be overriden later by querying Encoder feature
++ 			 */
++ 			if (strncmp(link->dpcd_caps.branch_dev_name,
++ 				DP_VGA_LVDS_CONVERTER_ID_3,
++ 				sizeof(
++ 				link->dpcd_caps.
++ 				branch_dev_name)) == 0) {
++ 					return DP_PANEL_MODE_SPECIAL;
++ 			}
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ 
++ 	if (link->dpcd_caps.panel_mode_edp) {
++ 		return DP_PANEL_MODE_EDP;
++ 	}
++ 
++ 	return DP_PANEL_MODE_DEFAULT;
++ }
++ 
++ void dp_set_fec_ready(struct dc_link *link, bool ready)
++ {
++ 	/* FEC has to be "set ready" before the link training.
++ 	 * The policy is to always train with FEC
++ 	 * if the sink supports it and leave it enabled on link.
++ 	 * If FEC is not supported, disable it.
++ 	 */
++ 	struct link_encoder *link_enc = link->link_enc;
++ 	uint8_t fec_config = 0;
++ 
++ 	if (link->dc->debug.disable_fec ||
++ 			IS_FPGA_MAXIMUS_DC(link->ctx->dce_environment))
++ 		return;
++ 
++ 	if (link_enc->funcs->fec_set_ready &&
++ 			link->dpcd_caps.fec_cap.bits.FEC_CAPABLE) {
++ 		if (ready) {
++ 			fec_config = 1;
++ 			if (core_link_write_dpcd(link,
++ 					DP_FEC_CONFIGURATION,
++ 					&fec_config,
++ 					sizeof(fec_config)) == DC_OK) {
++ 				link_enc->funcs->fec_set_ready(link_enc, true);
++ 				link->fec_state = dc_link_fec_ready;
++ 			} else {
++ 				link->link_enc->funcs->fec_set_ready(link->link_enc, false);
++ 				link->fec_state = dc_link_fec_not_ready;
++ 				dm_error("dpcd write failed to set fec_ready");
++ 			}
++ 		} else if (link->fec_state == dc_link_fec_ready) {
++ 			fec_config = 0;
++ 			core_link_write_dpcd(link,
++ 					DP_FEC_CONFIGURATION,
++ 					&fec_config,
++ 					sizeof(fec_config));
++ 			link->link_enc->funcs->fec_set_ready(
++ 					link->link_enc, false);
++ 			link->fec_state = dc_link_fec_not_ready;
++ 		}
++ 	}
++ }
++ 
++ void dp_set_fec_enable(struct dc_link *link, bool enable)
++ {
++ 	struct link_encoder *link_enc = link->link_enc;
++ 
++ 	if (link->dc->debug.disable_fec ||
++ 			IS_FPGA_MAXIMUS_DC(link->ctx->dce_environment))
++ 		return;
++ 
++ 	if (link_enc->funcs->fec_set_enable &&
++ 			link->dpcd_caps.fec_cap.bits.FEC_CAPABLE) {
++ 		if (link->fec_state == dc_link_fec_ready && enable) {
++ 			/* Accord to DP spec, FEC enable sequence can first
++ 			 * be transmitted anytime after 1000 LL codes have
++ 			 * been transmitted on the link after link training
++ 			 * completion. Using 1 lane RBR should have the maximum
++ 			 * time for transmitting 1000 LL codes which is 6.173 us.
++ 			 * So use 7 microseconds delay instead.
++ 			 */
++ 			udelay(7);
++ 			link_enc->funcs->fec_set_enable(link_enc, true);
++ 			link->fec_state = dc_link_fec_enabled;
++ 		} else if (link->fec_state == dc_link_fec_enabled && !enable) {
++ 			link_enc->funcs->fec_set_enable(link_enc, false);
++ 			link->fec_state = dc_link_fec_ready;
++ 		}
++ 	}
++ }
++ 
+++>>>>>>> fa11d3c94253 (drm/amd/display: Change the delay time before enabling FEC)
+* Unmerged path drivers/gpu/drm/amd/display/dc/core/dc_link_dp.c
