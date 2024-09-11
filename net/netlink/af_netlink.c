@@ -1714,7 +1714,7 @@ static int netlink_setsockopt(struct socket *sock, int level, int optname,
 			nlk->flags &= ~NETLINK_F_EXT_ACK;
 		err = 0;
 		break;
-	case NETLINK_DUMP_STRICT_CHK:
+	case NETLINK_GET_STRICT_CHK:
 		if (val)
 			nlk->flags |= NETLINK_F_STRICT_CHK;
 		else
@@ -1814,7 +1814,7 @@ static int netlink_getsockopt(struct socket *sock, int level, int optname,
 			return -EFAULT;
 		err = 0;
 		break;
-	case NETLINK_DUMP_STRICT_CHK:
+	case NETLINK_GET_STRICT_CHK:
 		if (len < sizeof(int))
 			return -EINVAL;
 		len = sizeof(int);
