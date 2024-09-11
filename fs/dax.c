@@ -769,7 +769,7 @@ static void dax_mapping_entry_mkclean(struct address_space *mapping,
 		address = pgoff_address(index, vma);
 
 		/*
-		 * Note because we provide start/end to follow_pte_pmd it will
+		 * Note because we provide range to follow_pte_pmd it will
 		 * call mmu_notifier_invalidate_range_start() on our behalf
 		 * before taking any lock.
 		 */
