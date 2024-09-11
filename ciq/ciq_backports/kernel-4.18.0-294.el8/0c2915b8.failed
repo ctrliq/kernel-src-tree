@@ -1,0 +1,120 @@
+dm: fix missing imposition of queue_limits from dm_wq_work() thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 0c2915b8c6db108b1dfb240391cc5a175f97f15b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0c2915b8.failed
+
+If a DM device was suspended when bios were issued to it, those bios
+would be deferred using queue_io(). Once the DM device was resumed
+dm_process_bio() could be called by dm_wq_work() for original bio that
+still needs splitting. dm_process_bio()'s check for current->bio_list
+(meaning call chain is within ->submit_bio) as a prerequisite for
+calling blk_queue_split() for "abnormal IO" would result in
+dm_process_bio() never imposing corresponding queue_limits
+(e.g. discard_granularity, discard_max_bytes, etc).
+
+Fix this by always having dm_wq_work() resubmit deferred bios using
+submit_bio_noacct().
+
+Side-effect is blk_queue_split() is always called for "abnormal IO" from
+->submit_bio, be it from application thread or dm_wq_work() workqueue,
+so proper bio splitting and depth-first bio submission is performed.
+For sake of clarity, remove current->bio_list check before call to
+blk_queue_split().
+
+Also, remove dm_wq_work()'s use of dm_{get,put}_live_table() -- no
+longer needed since IO will be reissued in terms of ->submit_bio.
+And rename bio variable from 'c' to 'bio'.
+
+Fixes: cf9c37865557 ("dm: fix comment in dm_process_bio()")
+	Reported-by: Jeffle Xu <jefflexu@linux.alibaba.com>
+	Reviewed-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 0c2915b8c6db108b1dfb240391cc5a175f97f15b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index 65fa96ff67f7,80266b94b002..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1711,35 -1675,21 +1711,43 @@@ static blk_qc_t dm_process_bio(struct m
+  		return ret;
+  	}
+  
+ +	if (!ti) {
+ +		ti = dm_table_find_target(map, bio->bi_iter.bi_sector);
+ +		if (unlikely(!ti)) {
+ +			bio_io_error(bio);
+ +			return ret;
+ +		}
+ +	}
+ +
+  	/*
+++<<<<<<< HEAD
+ +	 * If in ->make_request_fn we need to use blk_queue_split(), otherwise
+ +	 * queue_limits for abnormal requests (e.g. discard, writesame, etc)
+ +	 * won't be imposed.
+ +	 */
+ +	if (current->bio_list) {
+ +		if (is_abnormal_io(bio))
+ +			blk_queue_split(md->queue, &bio);
+ +		else
+ +			dm_queue_split(md, ti, &bio);
+ +	}
+++=======
++ 	 * Use blk_queue_split() for abnormal IO (e.g. discard, writesame, etc)
++ 	 * otherwise associated queue_limits won't be imposed.
++ 	 */
++ 	if (is_abnormal_io(bio))
++ 		blk_queue_split(&bio);
+++>>>>>>> 0c2915b8c6db (dm: fix missing imposition of queue_limits from dm_wq_work() thread)
+  
+  	if (dm_get_md_type(md) == DM_TYPE_NVME_BIO_BASED)
+ -		return __process_bio(md, map, bio);
+ -	return __split_and_process_bio(md, map, bio);
+ +		return __process_bio(md, map, bio, ti);
+ +	else
+ +		return __split_and_process_bio(md, map, bio);
+  }
+  
+ -static blk_qc_t dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+  	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+@@@ -2469,19 -2382,14 +2472,21 @@@ static void dm_wq_work(struct work_stru
+  
+  	while (!test_bit(DMF_BLOCK_IO_FOR_SUSPEND, &md->flags)) {
+  		spin_lock_irq(&md->deferred_lock);
+- 		c = bio_list_pop(&md->deferred);
++ 		bio = bio_list_pop(&md->deferred);
+  		spin_unlock_irq(&md->deferred_lock);
+  
+- 		if (!c)
++ 		if (!bio)
+  			break;
+  
+++<<<<<<< HEAD
+ +		if (dm_request_based(md))
+ +			(void) generic_make_request(c);
+ +		else
+ +			(void) dm_process_bio(md, map, c);
+++=======
++ 		submit_bio_noacct(bio);
+++>>>>>>> 0c2915b8c6db (dm: fix missing imposition of queue_limits from dm_wq_work() thread)
+  	}
+- 
+- 	dm_put_live_table(md, srcu_idx);
+  }
+  
+  static void dm_queue_flush(struct mapped_device *md)
+* Unmerged path drivers/md/dm.c
