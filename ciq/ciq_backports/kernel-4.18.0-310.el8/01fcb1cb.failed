@@ -1,0 +1,141 @@
+vhost: allow device that does not depend on vhost worker
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jason Wang <jasowang@redhat.com>
+commit 01fcb1cbc88effb3493c6197efc96b69b9f4823a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/01fcb1cb.failed
+
+vDPA device currently relays the eventfd via vhost worker. This is
+inefficient due the latency of wakeup and scheduling, so this patch
+tries to introduce a use_worker attribute for the vhost device. When
+use_worker is not set with vhost_dev_init(), vhost won't try to
+allocate a worker thread and the vhost_poll will be processed directly
+in the wakeup function.
+
+This help for vDPA since it reduces the latency caused by vhost worker.
+
+In my testing, it saves 0.2 ms in pings between VMs on a mutual host.
+
+	Signed-off-by: Zhu Lingshan <lingshan.zhu@intel.com>
+	Signed-off-by: Jason Wang <jasowang@redhat.com>
+Link: https://lore.kernel.org/r/20200529080303.15449-2-jasowang@redhat.com
+	Signed-off-by: Michael S. Tsirkin <mst@redhat.com>
+(cherry picked from commit 01fcb1cbc88effb3493c6197efc96b69b9f4823a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/vhost/vhost.c
+#	drivers/vhost/vhost.h
+diff --cc drivers/vhost/vhost.c
+index 0ae40f9fd189,80da9d9662f2..000000000000
+--- a/drivers/vhost/vhost.c
++++ b/drivers/vhost/vhost.c
+@@@ -543,18 -555,22 +550,29 @@@ long vhost_dev_set_owner(struct vhost_d
+  
+  	/* No owner, become one */
+  	dev->mm = get_task_mm(current);
+++<<<<<<< HEAD
+ +	worker = kthread_create(vhost_worker, dev, "vhost-%d", current->pid);
+ +	if (IS_ERR(worker)) {
+ +		err = PTR_ERR(worker);
+ +		goto err_worker;
+- 	}
+++=======
++ 	dev->kcov_handle = kcov_common_handle();
++ 	if (dev->use_worker) {
++ 		worker = kthread_create(vhost_worker, dev,
++ 					"vhost-%d", current->pid);
++ 		if (IS_ERR(worker)) {
++ 			err = PTR_ERR(worker);
++ 			goto err_worker;
++ 		}
+  
+- 	dev->worker = worker;
+- 	wake_up_process(worker);	/* avoid contributing to loadavg */
++ 		dev->worker = worker;
++ 		wake_up_process(worker); /* avoid contributing to loadavg */
+  
+- 	err = vhost_attach_cgroups(dev);
+- 	if (err)
+- 		goto err_cgroup;
++ 		err = vhost_attach_cgroups(dev);
++ 		if (err)
++ 			goto err_cgroup;
+++>>>>>>> 01fcb1cbc88e (vhost: allow device that does not depend on vhost worker)
++ 	}
+  
+  	err = vhost_dev_alloc_iovecs(dev);
+  	if (err)
+diff --cc drivers/vhost/vhost.h
+index 782e5501e4c7,c8e96a095d3b..000000000000
+--- a/drivers/vhost/vhost.h
++++ b/drivers/vhost/vhost.h
+@@@ -153,6 -153,8 +153,11 @@@ struct vhost_dev 
+  	int iov_limit;
+  	int weight;
+  	int byte_weight;
+++<<<<<<< HEAD
+++=======
++ 	u64 kcov_handle;
++ 	bool use_worker;
+++>>>>>>> 01fcb1cbc88e (vhost: allow device that does not depend on vhost worker)
+  	int (*msg_handler)(struct vhost_dev *dev,
+  			   struct vhost_iotlb_msg *msg);
+  };
+diff --git a/drivers/vhost/net.c b/drivers/vhost/net.c
+index 86bdf495eb46..5a6c339540bc 100644
+--- a/drivers/vhost/net.c
++++ b/drivers/vhost/net.c
+@@ -1326,7 +1326,7 @@ static int vhost_net_open(struct inode *inode, struct file *f)
+ 	}
+ 	vhost_dev_init(dev, vqs, VHOST_NET_VQ_MAX,
+ 		       UIO_MAXIOV + VHOST_NET_BATCH,
+-		       VHOST_NET_PKT_WEIGHT, VHOST_NET_WEIGHT,
++		       VHOST_NET_PKT_WEIGHT, VHOST_NET_WEIGHT, true,
+ 		       NULL);
+ 
+ 	vhost_poll_init(n->poll + VHOST_NET_VQ_TX, handle_tx_net, EPOLLOUT, dev);
+diff --git a/drivers/vhost/scsi.c b/drivers/vhost/scsi.c
+index c29ff782072e..227271ef91e4 100644
+--- a/drivers/vhost/scsi.c
++++ b/drivers/vhost/scsi.c
+@@ -1393,7 +1393,7 @@ static int vhost_scsi_open(struct inode *inode, struct file *f)
+ 		vs->vqs[i].vq.handle_kick = vhost_scsi_handle_kick;
+ 	}
+ 	vhost_dev_init(&vs->dev, vqs, VHOST_SCSI_MAX_VQ, UIO_MAXIOV,
+-		       VHOST_SCSI_WEIGHT, 0, NULL);
++		       VHOST_SCSI_WEIGHT, 0, true, NULL);
+ 
+ 	vhost_scsi_init_inflight(vs, NULL);
+ 
+diff --git a/drivers/vhost/vdpa.c b/drivers/vhost/vdpa.c
+index 14ae8b236100..6240bc20bbad 100644
+--- a/drivers/vhost/vdpa.c
++++ b/drivers/vhost/vdpa.c
+@@ -694,7 +694,7 @@ static int vhost_vdpa_open(struct inode *inode, struct file *filep)
+ 		vqs[i] = &v->vqs[i];
+ 		vqs[i]->handle_kick = handle_vq_kick;
+ 	}
+-	vhost_dev_init(dev, vqs, nvqs, 0, 0, 0,
++	vhost_dev_init(dev, vqs, nvqs, 0, 0, 0, false,
+ 		       vhost_vdpa_process_iotlb_msg);
+ 
+ 	dev->iotlb = vhost_iotlb_alloc(0, 0);
+* Unmerged path drivers/vhost/vhost.c
+* Unmerged path drivers/vhost/vhost.h
+diff --git a/drivers/vhost/vsock.c b/drivers/vhost/vsock.c
+index 1def7d28d05d..a4f2a53c14aa 100644
+--- a/drivers/vhost/vsock.c
++++ b/drivers/vhost/vsock.c
+@@ -632,7 +632,7 @@ static int vhost_vsock_dev_open(struct inode *inode, struct file *file)
+ 
+ 	vhost_dev_init(&vsock->dev, vqs, ARRAY_SIZE(vsock->vqs),
+ 		       UIO_MAXIOV, VHOST_VSOCK_PKT_WEIGHT,
+-		       VHOST_VSOCK_WEIGHT, NULL);
++		       VHOST_VSOCK_WEIGHT, true, NULL);
+ 
+ 	file->private_data = vsock;
+ 	spin_lock_init(&vsock->send_pkt_list_lock);
