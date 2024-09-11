@@ -1,0 +1,139 @@
+drm/i915/cmdparser: Fix jump whitelist clearing
+
+jira LE-1907
+cve CVE-2019-0155
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Ben Hutchings <ben@decadent.org.uk>
+commit ea0b163b13ffc52818c079adb00d55e227a6da6f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ea0b163b.failed
+
+When a jump_whitelist bitmap is reused, it needs to be cleared.
+Currently this is done with memset() and the size calculation assumes
+bitmaps are made of 32-bit words, not longs.  So on 64-bit
+architectures, only the first half of the bitmap is cleared.
+
+If some whitelist bits are carried over between successive batches
+submitted on the same context, this will presumably allow embedding
+the rogue instructions that we're trying to reject.
+
+Use bitmap_zero() instead, which gets the calculation right.
+
+Fixes: f8c08d8faee5 ("drm/i915/cmdparser: Add support for backward jumps")
+	Signed-off-by: Ben Hutchings <ben@decadent.org.uk>
+	Signed-off-by: Jon Bloomfield <jon.bloomfield@intel.com>
+(cherry picked from commit ea0b163b13ffc52818c079adb00d55e227a6da6f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/i915_cmd_parser.c
+diff --cc drivers/gpu/drm/i915/i915_cmd_parser.c
+index 31629df52183,f24096e27bef..000000000000
+--- a/drivers/gpu/drm/i915/i915_cmd_parser.c
++++ b/drivers/gpu/drm/i915/i915_cmd_parser.c
+@@@ -1197,6 -1306,100 +1197,103 @@@ static bool check_cmd(const struct inte
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_bbstart(const struct i915_gem_context *ctx,
++ 			 u32 *cmd, u32 offset, u32 length,
++ 			 u32 batch_len,
++ 			 u64 batch_start,
++ 			 u64 shadow_batch_start)
++ {
++ 	u64 jump_offset, jump_target;
++ 	u32 target_cmd_offset, target_cmd_index;
++ 
++ 	/* For igt compatibility on older platforms */
++ 	if (CMDPARSER_USES_GGTT(ctx->i915)) {
++ 		DRM_DEBUG("CMD: Rejecting BB_START for ggtt based submission\n");
++ 		return -EACCES;
++ 	}
++ 
++ 	if (length != 3) {
++ 		DRM_DEBUG("CMD: Recursive BB_START with bad length(%u)\n",
++ 			  length);
++ 		return -EINVAL;
++ 	}
++ 
++ 	jump_target = *(u64*)(cmd+1);
++ 	jump_offset = jump_target - batch_start;
++ 
++ 	/*
++ 	 * Any underflow of jump_target is guaranteed to be outside the range
++ 	 * of a u32, so >= test catches both too large and too small
++ 	 */
++ 	if (jump_offset >= batch_len) {
++ 		DRM_DEBUG("CMD: BB_START to 0x%llx jumps out of BB\n",
++ 			  jump_target);
++ 		return -EINVAL;
++ 	}
++ 
++ 	/*
++ 	 * This cannot overflow a u32 because we already checked jump_offset
++ 	 * is within the BB, and the batch_len is a u32
++ 	 */
++ 	target_cmd_offset = lower_32_bits(jump_offset);
++ 	target_cmd_index = target_cmd_offset / sizeof(u32);
++ 
++ 	*(u64*)(cmd + 1) = shadow_batch_start + target_cmd_offset;
++ 
++ 	if (target_cmd_index == offset)
++ 		return 0;
++ 
++ 	if (ctx->jump_whitelist_cmds <= target_cmd_index) {
++ 		DRM_DEBUG("CMD: Rejecting BB_START - truncated whitelist array\n");
++ 		return -EINVAL;
++ 	} else if (!test_bit(target_cmd_index, ctx->jump_whitelist)) {
++ 		DRM_DEBUG("CMD: BB_START to 0x%llx not a previously executed cmd\n",
++ 			  jump_target);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static void init_whitelist(struct i915_gem_context *ctx, u32 batch_len)
++ {
++ 	const u32 batch_cmds = DIV_ROUND_UP(batch_len, sizeof(u32));
++ 	const u32 exact_size = BITS_TO_LONGS(batch_cmds);
++ 	u32 next_size = BITS_TO_LONGS(roundup_pow_of_two(batch_cmds));
++ 	unsigned long *next_whitelist;
++ 
++ 	if (CMDPARSER_USES_GGTT(ctx->i915))
++ 		return;
++ 
++ 	if (batch_cmds <= ctx->jump_whitelist_cmds) {
++ 		bitmap_zero(ctx->jump_whitelist, batch_cmds);
++ 		return;
++ 	}
++ 
++ again:
++ 	next_whitelist = kcalloc(next_size, sizeof(long), GFP_KERNEL);
++ 	if (next_whitelist) {
++ 		kfree(ctx->jump_whitelist);
++ 		ctx->jump_whitelist = next_whitelist;
++ 		ctx->jump_whitelist_cmds =
++ 			next_size * BITS_PER_BYTE * sizeof(long);
++ 		return;
++ 	}
++ 
++ 	if (next_size > exact_size) {
++ 		next_size = exact_size;
++ 		goto again;
++ 	}
++ 
++ 	DRM_DEBUG("CMD: Failed to extend whitelist. BB_START may be disallowed\n");
++ 	bitmap_zero(ctx->jump_whitelist, ctx->jump_whitelist_cmds);
++ 
++ 	return;
++ }
++ 
+++>>>>>>> ea0b163b13ff (drm/i915/cmdparser: Fix jump whitelist clearing)
+  #define LENGTH_BIAS 2
+  
+  /**
+* Unmerged path drivers/gpu/drm/i915/i915_cmd_parser.c
