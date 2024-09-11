@@ -848,10 +848,13 @@ static struct compute_test compute_tests[] = {
 static int __init emulate_compute_instr(struct pt_regs *regs,
 					unsigned int instr)
 {
+	extern s32 patch__exec_instr;
 	struct instruction_op op;
 
 	if (!regs || !instr)
 		return -EINVAL;
+
+	regs->nip = patch_site_addr(&patch__exec_instr);
 
 	if (analyse_instr(&op, regs, instr) != 1 ||
 	    GETTYPE(op.type) != COMPUTE) {
