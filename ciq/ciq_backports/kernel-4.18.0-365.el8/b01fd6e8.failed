@@ -1,0 +1,167 @@
+skmsg: Introduce a spinlock to protect ingress_msg
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Cong Wang <cong.wang@bytedance.com>
+commit b01fd6e802b6d0a635176f943315670b679d8d7b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/b01fd6e8.failed
+
+Currently we rely on lock_sock to protect ingress_msg,
+it is too big for this, we can actually just use a spinlock
+to protect this list like protecting other skb queues.
+
+__tcp_bpf_recvmsg() is still special because of peeking,
+it still has to use lock_sock.
+
+	Signed-off-by: Cong Wang <cong.wang@bytedance.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Acked-by: John Fastabend <john.fastabend@gmail.com>
+Link: https://lore.kernel.org/bpf/20210331023237.41094-3-xiyou.wangcong@gmail.com
+(cherry picked from commit b01fd6e802b6d0a635176f943315670b679d8d7b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/core/skmsg.c
+diff --cc net/core/skmsg.c
+index c39c0a361217,305dddc51857..000000000000
+--- a/net/core/skmsg.c
++++ b/net/core/skmsg.c
+@@@ -632,8 -633,15 +633,19 @@@ static void __sk_psock_purge_ingress_ms
+  
+  static void sk_psock_zap_ingress(struct sk_psock *psock)
+  {
+++<<<<<<< HEAD
+ +	__skb_queue_purge(&psock->ingress_skb);
+++=======
++ 	struct sk_buff *skb;
++ 
++ 	while ((skb = skb_dequeue(&psock->ingress_skb)) != NULL) {
++ 		skb_bpf_redirect_clear(skb);
++ 		kfree_skb(skb);
++ 	}
++ 	spin_lock_bh(&psock->ingress_lock);
+++>>>>>>> b01fd6e802b6 (skmsg: Introduce a spinlock to protect ingress_msg)
+  	__sk_psock_purge_ingress_msg(psock);
++ 	spin_unlock_bh(&psock->ingress_lock);
+  }
+  
+  static void sk_psock_link_destroy(struct sk_psock *psock)
+diff --git a/include/linux/skmsg.h b/include/linux/skmsg.h
+index a85cacd89635..7189f883ab26 100644
+--- a/include/linux/skmsg.h
++++ b/include/linux/skmsg.h
+@@ -93,6 +93,7 @@ struct sk_psock {
+ 	struct sk_psock_parser		parser;
+ 	struct sk_buff_head		ingress_skb;
+ 	struct list_head		ingress_msg;
++	spinlock_t			ingress_lock;
+ 	unsigned long			state;
+ 	struct list_head		link;
+ 	spinlock_t			link_lock;
+@@ -287,7 +288,45 @@ static inline struct sk_psock *sk_psock(const struct sock *sk)
+ static inline void sk_psock_queue_msg(struct sk_psock *psock,
+ 				      struct sk_msg *msg)
+ {
++	spin_lock_bh(&psock->ingress_lock);
+ 	list_add_tail(&msg->list, &psock->ingress_msg);
++	spin_unlock_bh(&psock->ingress_lock);
++}
++
++static inline struct sk_msg *sk_psock_dequeue_msg(struct sk_psock *psock)
++{
++	struct sk_msg *msg;
++
++	spin_lock_bh(&psock->ingress_lock);
++	msg = list_first_entry_or_null(&psock->ingress_msg, struct sk_msg, list);
++	if (msg)
++		list_del(&msg->list);
++	spin_unlock_bh(&psock->ingress_lock);
++	return msg;
++}
++
++static inline struct sk_msg *sk_psock_peek_msg(struct sk_psock *psock)
++{
++	struct sk_msg *msg;
++
++	spin_lock_bh(&psock->ingress_lock);
++	msg = list_first_entry_or_null(&psock->ingress_msg, struct sk_msg, list);
++	spin_unlock_bh(&psock->ingress_lock);
++	return msg;
++}
++
++static inline struct sk_msg *sk_psock_next_msg(struct sk_psock *psock,
++					       struct sk_msg *msg)
++{
++	struct sk_msg *ret;
++
++	spin_lock_bh(&psock->ingress_lock);
++	if (list_is_last(&msg->list, &psock->ingress_msg))
++		ret = NULL;
++	else
++		ret = list_next_entry(msg, list);
++	spin_unlock_bh(&psock->ingress_lock);
++	return ret;
+ }
+ 
+ static inline bool sk_psock_queue_empty(const struct sk_psock *psock)
+@@ -295,6 +334,13 @@ static inline bool sk_psock_queue_empty(const struct sk_psock *psock)
+ 	return psock ? list_empty(&psock->ingress_msg) : true;
+ }
+ 
++static inline void kfree_sk_msg(struct sk_msg *msg)
++{
++	if (msg->skb)
++		consume_skb(msg->skb);
++	kfree(msg);
++}
++
+ static inline void sk_psock_report_error(struct sk_psock *psock, int err)
+ {
+ 	struct sock *sk = psock->sk;
+* Unmerged path net/core/skmsg.c
+diff --git a/net/ipv4/tcp_bpf.c b/net/ipv4/tcp_bpf.c
+index bc7d2a586e18..e7366f88f921 100644
+--- a/net/ipv4/tcp_bpf.c
++++ b/net/ipv4/tcp_bpf.c
+@@ -18,9 +18,7 @@ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ 	struct sk_msg *msg_rx;
+ 	int i, copied = 0;
+ 
+-	msg_rx = list_first_entry_or_null(&psock->ingress_msg,
+-					  struct sk_msg, list);
+-
++	msg_rx = sk_psock_peek_msg(psock);
+ 	while (copied != len) {
+ 		struct scatterlist *sge;
+ 
+@@ -68,22 +66,18 @@ int __tcp_bpf_recvmsg(struct sock *sk, struct sk_psock *psock,
+ 		} while (i != msg_rx->sg.end);
+ 
+ 		if (unlikely(peek)) {
+-			if (msg_rx == list_last_entry(&psock->ingress_msg,
+-						      struct sk_msg, list))
++			msg_rx = sk_psock_next_msg(psock, msg_rx);
++			if (!msg_rx)
+ 				break;
+-			msg_rx = list_next_entry(msg_rx, list);
+ 			continue;
+ 		}
+ 
+ 		msg_rx->sg.start = i;
+ 		if (!sge->length && msg_rx->sg.start == msg_rx->sg.end) {
+-			list_del(&msg_rx->list);
+-			if (msg_rx->skb)
+-				consume_skb(msg_rx->skb);
+-			kfree(msg_rx);
++			msg_rx = sk_psock_dequeue_msg(psock);
++			kfree_sk_msg(msg_rx);
+ 		}
+-		msg_rx = list_first_entry_or_null(&psock->ingress_msg,
+-						  struct sk_msg, list);
++		msg_rx = sk_psock_peek_msg(psock);
+ 	}
+ 
+ 	return copied;
