@@ -1,0 +1,263 @@
+padata: add basic support for multithreaded jobs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Daniel Jordan <daniel.m.jordan@oracle.com>
+commit 004ed42638f4428e70ead59d170f3d17ff761a0f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/004ed426.failed
+
+Sometimes the kernel doesn't take full advantage of system memory
+bandwidth, leading to a single CPU spending excessive time in
+initialization paths where the data scales with memory size.
+
+Multithreading naturally addresses this problem.
+
+Extend padata, a framework that handles many parallel yet singlethreaded
+jobs, to also handle multithreaded jobs by adding support for splitting up
+the work evenly, specifying a minimum amount of work that's appropriate
+for one helper thread to do, load balancing between helpers, and
+coordinating them.
+
+This is inspired by work from Pavel Tatashin and Steve Sistare.
+
+	Signed-off-by: Daniel Jordan <daniel.m.jordan@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Tested-by: Josh Triplett <josh@joshtriplett.org>
+	Cc: Alexander Duyck <alexander.h.duyck@linux.intel.com>
+	Cc: Alex Williamson <alex.williamson@redhat.com>
+	Cc: Dan Williams <dan.j.williams@intel.com>
+	Cc: Dave Hansen <dave.hansen@linux.intel.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Herbert Xu <herbert@gondor.apana.org.au>
+	Cc: Jason Gunthorpe <jgg@ziepe.ca>
+	Cc: Jonathan Corbet <corbet@lwn.net>
+	Cc: Kirill Tkhai <ktkhai@virtuozzo.com>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Pavel Machek <pavel@ucw.cz>
+	Cc: Pavel Tatashin <pasha.tatashin@soleen.com>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+	Cc: Randy Dunlap <rdunlap@infradead.org>
+	Cc: Robert Elliott <elliott@hpe.com>
+	Cc: Shile Zhang <shile.zhang@linux.alibaba.com>
+	Cc: Steffen Klassert <steffen.klassert@secunet.com>
+	Cc: Steven Sistare <steven.sistare@oracle.com>
+	Cc: Tejun Heo <tj@kernel.org>
+	Cc: Zi Yan <ziy@nvidia.com>
+Link: http://lkml.kernel.org/r/20200527173608.2885243-5-daniel.m.jordan@oracle.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 004ed42638f4428e70ead59d170f3d17ff761a0f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/padata.h
+#	kernel/padata.c
+diff --cc include/linux/padata.h
+index 441ebdb1c723,7302efff5e65..000000000000
+--- a/include/linux/padata.h
++++ b/include/linux/padata.h
+@@@ -4,18 -5,8 +4,23 @@@
+   * Copyright (C) 2008, 2009 secunet Security Networks AG
+   * Copyright (C) 2008, 2009 Steffen Klassert <steffen.klassert@secunet.com>
+   *
+++<<<<<<< HEAD
+ + * This program is free software; you can redistribute it and/or modify it
+ + * under the terms and conditions of the GNU General Public License,
+ + * version 2, as published by the Free Software Foundation.
+ + *
+ + * This program is distributed in the hope it will be useful, but WITHOUT
+ + * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ + * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+ + * more details.
+ + *
+ + * You should have received a copy of the GNU General Public License along with
+ + * this program; if not, write to the Free Software Foundation, Inc.,
+ + * 51 Franklin St - Fifth Floor, Boston, MA 02110-1301 USA.
+++=======
++  * Copyright (c) 2020 Oracle and/or its affiliates.
++  * Author: Daniel Jordan <daniel.m.jordan@oracle.com>
+++>>>>>>> 004ed42638f4 (padata: add basic support for multithreaded jobs)
+   */
+  
+  #ifndef PADATA_H
+diff --cc kernel/padata.c
+index 7e507ac72e3d,29fc5d87a4cd..000000000000
+--- a/kernel/padata.c
++++ b/kernel/padata.c
+@@@ -32,9 -36,29 +36,33 @@@
+  #include <linux/sysfs.h>
+  #include <linux/rcupdate.h>
+  
+++<<<<<<< HEAD
+ +#define MAX_OBJ_NUM 1000
+++=======
++ #define	PADATA_WORK_ONSTACK	1	/* Work's memory is on stack */
++ 
++ struct padata_work {
++ 	struct work_struct	pw_work;
++ 	struct list_head	pw_list;  /* padata_free_works linkage */
++ 	void			*pw_data;
++ };
++ 
++ static DEFINE_SPINLOCK(padata_works_lock);
++ static struct padata_work *padata_works;
++ static LIST_HEAD(padata_free_works);
+++>>>>>>> 004ed42638f4 (padata: add basic support for multithreaded jobs)
++ 
++ struct padata_mt_job_state {
++ 	spinlock_t		lock;
++ 	struct completion	completion;
++ 	struct padata_mt_job	*job;
++ 	int			nworks;
++ 	int			nworks_fini;
++ 	unsigned long		chunk_size;
++ };
+  
+  static void padata_free_pd(struct parallel_data *pd);
++ static void __init padata_mt_helper(struct work_struct *work);
+  
+  static int padata_index_to_cpu(struct parallel_data *pd, int cpu_index)
+  {
+@@@ -58,30 -82,82 +86,98 @@@ static int padata_cpu_hash(struct paral
+  	return padata_index_to_cpu(pd, cpu_index);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct padata_work *padata_work_alloc(void)
++ {
++ 	struct padata_work *pw;
++ 
++ 	lockdep_assert_held(&padata_works_lock);
++ 
++ 	if (list_empty(&padata_free_works))
++ 		return NULL;	/* No more work items allowed to be queued. */
++ 
++ 	pw = list_first_entry(&padata_free_works, struct padata_work, pw_list);
++ 	list_del(&pw->pw_list);
++ 	return pw;
++ }
++ 
++ static void padata_work_init(struct padata_work *pw, work_func_t work_fn,
++ 			     void *data, int flags)
++ {
++ 	if (flags & PADATA_WORK_ONSTACK)
++ 		INIT_WORK_ONSTACK(&pw->pw_work, work_fn);
++ 	else
++ 		INIT_WORK(&pw->pw_work, work_fn);
++ 	pw->pw_data = data;
++ }
++ 
++ static int __init padata_work_alloc_mt(int nworks, void *data,
++ 				       struct list_head *head)
++ {
++ 	int i;
++ 
++ 	spin_lock(&padata_works_lock);
++ 	/* Start at 1 because the current task participates in the job. */
++ 	for (i = 1; i < nworks; ++i) {
++ 		struct padata_work *pw = padata_work_alloc();
++ 
++ 		if (!pw)
++ 			break;
++ 		padata_work_init(pw, padata_mt_helper, data, 0);
++ 		list_add(&pw->pw_list, head);
++ 	}
++ 	spin_unlock(&padata_works_lock);
++ 
++ 	return i;
++ }
++ 
++ static void padata_work_free(struct padata_work *pw)
++ {
++ 	lockdep_assert_held(&padata_works_lock);
++ 	list_add(&pw->pw_list, &padata_free_works);
++ }
++ 
++ static void __init padata_works_free(struct list_head *works)
++ {
++ 	struct padata_work *cur, *next;
++ 
++ 	if (list_empty(works))
++ 		return;
++ 
++ 	spin_lock(&padata_works_lock);
++ 	list_for_each_entry_safe(cur, next, works, pw_list) {
++ 		list_del(&cur->pw_list);
++ 		padata_work_free(cur);
++ 	}
++ 	spin_unlock(&padata_works_lock);
++ }
++ 
+++>>>>>>> 004ed42638f4 (padata: add basic support for multithreaded jobs)
+  static void padata_parallel_worker(struct work_struct *parallel_work)
+  {
+ -	struct padata_work *pw = container_of(parallel_work, struct padata_work,
+ -					      pw_work);
+ -	struct padata_priv *padata = pw->pw_data;
+ +	struct padata_parallel_queue *pqueue;
+ +	LIST_HEAD(local_list);
+  
+  	local_bh_disable();
+ -	padata->parallel(padata);
+ -	spin_lock(&padata_works_lock);
+ -	padata_work_free(pw);
+ -	spin_unlock(&padata_works_lock);
+ +	pqueue = container_of(parallel_work,
+ +			      struct padata_parallel_queue, work);
+ +
+ +	spin_lock(&pqueue->parallel.lock);
+ +	list_replace_init(&pqueue->parallel.list, &local_list);
+ +	spin_unlock(&pqueue->parallel.lock);
+ +
+ +	while (!list_empty(&local_list)) {
+ +		struct padata_priv *padata;
+ +
+ +		padata = list_entry(local_list.next,
+ +				    struct padata_priv, list);
+ +
+ +		list_del_init(&padata->list);
+ +
+ +		padata->parallel(padata);
+ +	}
+ +
+  	local_bh_enable();
+  }
+  
+@@@ -141,17 -215,21 +237,31 @@@ int padata_do_parallel(struct padata_sh
+  	padata->pd = pd;
+  	padata->cb_cpu = *cb_cpu;
+  
+ -	rcu_read_unlock_bh();
+ +	padata->seq_nr = atomic_inc_return(&pd->seq_nr);
+ +	target_cpu = padata_cpu_hash(pd, padata->seq_nr);
+ +	padata->cpu = target_cpu;
+ +	queue = per_cpu_ptr(pd->pqueue, target_cpu);
+ +
+++<<<<<<< HEAD
+ +	spin_lock(&queue->parallel.lock);
+ +	list_add_tail(&padata->list, &queue->parallel.list);
+ +	spin_unlock(&queue->parallel.lock);
+  
+ +	queue_work(pinst->parallel_wq, &queue->work);
+++=======
++ 	spin_lock(&padata_works_lock);
++ 	padata->seq_nr = ++pd->seq_nr;
++ 	pw = padata_work_alloc();
++ 	spin_unlock(&padata_works_lock);
++ 	if (pw) {
++ 		padata_work_init(pw, padata_parallel_worker, padata, 0);
++ 		queue_work(pinst->parallel_wq, &pw->pw_work);
++ 	} else {
++ 		/* Maximum works limit exceeded, run in the current task. */
++ 		padata->parallel(padata);
++ 	}
+++>>>>>>> 004ed42638f4 (padata: add basic support for multithreaded jobs)
+  
+ -	return 0;
+  out:
+  	rcu_read_unlock_bh();
+  
+* Unmerged path include/linux/padata.h
+* Unmerged path kernel/padata.c
