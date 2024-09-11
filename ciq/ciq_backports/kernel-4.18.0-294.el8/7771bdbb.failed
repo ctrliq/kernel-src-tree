@@ -1,0 +1,276 @@
+kasan: remove use after scope bugs detection.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [lib] kasan: remove use after scope bugs detection (Nico Pache) [1894223]
+Rebuild_FUZZ: 98.88%
+commit-author Andrey Ryabinin <aryabinin@virtuozzo.com>
+commit 7771bdbbfd3d6f204631b6fd9e1bbc30cd15918e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7771bdbb.failed
+
+Use after scope bugs detector seems to be almost entirely useless for
+the linux kernel.  It exists over two years, but I've seen only one
+valid bug so far [1].  And the bug was fixed before it has been
+reported.  There were some other use-after-scope reports, but they were
+false-positives due to different reasons like incompatibility with
+structleak plugin.
+
+This feature significantly increases stack usage, especially with GCC <
+9 version, and causes a 32K stack overflow.  It probably adds
+performance penalty too.
+
+Given all that, let's remove use-after-scope detector entirely.
+
+While preparing this patch I've noticed that we mistakenly enable
+use-after-scope detection for clang compiler regardless of
+CONFIG_KASAN_EXTRA setting.  This is also fixed now.
+
+[1] http://lkml.kernel.org/r/<20171129052106.rhgbjhhis53hkgfn@wfg-t540p.sh.intel.com>
+
+Link: http://lkml.kernel.org/r/20190111185842.13978-1-aryabinin@virtuozzo.com
+	Signed-off-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Acked-by: Will Deacon <will.deacon@arm.com>		[arm64]
+	Cc: Qian Cai <cai@lca.pw>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Catalin Marinas <catalin.marinas@arm.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7771bdbbfd3d6f204631b6fd9e1bbc30cd15918e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/Kconfig.kasan
+#	mm/kasan/generic.c
+#	mm/kasan/generic_report.c
+#	scripts/Makefile.kasan
+#	scripts/gcc-plugins/Kconfig
+diff --cc lib/Kconfig.kasan
+index d0bad1bd9a2b,9950b660e62d..000000000000
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@@ -10,27 -41,42 +10,52 @@@ config KASA
+  	select CONSTRUCTORS
+  	select STACKDEPOT
+  	help
+ -	  Enables generic KASAN mode.
+ -	  Supported in both GCC and Clang. With GCC it requires version 4.9.2
+ -	  or later for basic support and version 5.0 or later for detection of
+ -	  out-of-bounds accesses for stack and global variables and for inline
+ -	  instrumentation mode (CONFIG_KASAN_INLINE). With Clang it requires
+ -	  version 3.7.0 or later and it doesn't support detection of
+ -	  out-of-bounds accesses for global variables yet.
+ -	  This mode consumes about 1/8th of available memory at kernel start
+ -	  and introduces an overhead of ~x1.5 for the rest of the allocations.
+ -	  The performance slowdown is ~x3.
+ +	  Enables kernel address sanitizer - runtime memory debugger,
+ +	  designed to find out-of-bounds accesses and use-after-free bugs.
+ +	  This is strictly a debugging feature and it requires a gcc version
+ +	  of 4.9.2 or later. Detection of out of bounds accesses to stack or
+ +	  global variables requires gcc 5.0 or later.
+ +	  This feature consumes about 1/8 of available memory and brings about
+ +	  ~x3 performance slowdown.
+  	  For better error detection enable CONFIG_STACKTRACE.
+ -	  Currently CONFIG_KASAN_GENERIC doesn't work with CONFIG_DEBUG_SLAB
+ +	  Currently CONFIG_KASAN doesn't work with CONFIG_DEBUG_SLAB
+  	  (the resulting kernel does not boot).
+  
+++<<<<<<< HEAD
+ +config KASAN_EXTRA
+ +	bool "KAsan: extra checks"
+ +	depends on KASAN && DEBUG_KERNEL && !COMPILE_TEST
+ +	help
+ +	  This enables further checks in the kernel address sanitizer, for now
+ +	  it only includes the address-use-after-scope check that can lead
+ +	  to excessive kernel stack usage, frame size warnings and longer
+ +	  compile time.
+ +	  https://gcc.gnu.org/bugzilla/show_bug.cgi?id=81715 has more
+ +
+++=======
++ config KASAN_SW_TAGS
++ 	bool "Software tag-based mode"
++ 	depends on HAVE_ARCH_KASAN_SW_TAGS && CC_HAS_KASAN_SW_TAGS
++ 	depends on (SLUB && SYSFS) || (SLAB && !DEBUG_SLAB)
++ 	select SLUB_DEBUG if SLUB
++ 	select CONSTRUCTORS
++ 	select STACKDEPOT
++ 	help
++ 	  Enables software tag-based KASAN mode.
++ 	  This mode requires Top Byte Ignore support by the CPU and therefore
++ 	  is only supported for arm64.
++ 	  This mode requires Clang version 7.0.0 or later.
++ 	  This mode consumes about 1/16th of available memory at kernel start
++ 	  and introduces an overhead of ~20% for the rest of the allocations.
++ 	  This mode may potentially introduce problems relating to pointer
++ 	  casting and comparison, as it embeds tags into the top byte of each
++ 	  pointer.
++ 	  For better error detection enable CONFIG_STACKTRACE.
++ 	  Currently CONFIG_KASAN_SW_TAGS doesn't work with CONFIG_DEBUG_SLAB
++ 	  (the resulting kernel does not boot).
++ 
++ endchoice
+++>>>>>>> 7771bdbbfd3d (kasan: remove use after scope bugs detection.)
+  
+  choice
+  	prompt "Instrumentation type"
+diff --cc scripts/Makefile.kasan
+index 69552a39951d,6410bd22fe38..000000000000
+--- a/scripts/Makefile.kasan
++++ b/scripts/Makefile.kasan
+@@@ -24,24 -19,33 +24,55 @@@ els
+  			$(call cc-option, -fsanitize=kernel-address \
+  			-mllvm -asan-mapping-offset=$(KASAN_SHADOW_OFFSET)))
+  
+++<<<<<<< HEAD
+ +   ifeq ($(strip $(CFLAGS_KASAN_SHADOW)),)
+ +      CFLAGS_KASAN := $(CFLAGS_KASAN_MINIMAL)
+ +   else
+ +      # Now add all the compiler specific options that are valid standalone
+ +      CFLAGS_KASAN := $(CFLAGS_KASAN_SHADOW) \
+ +	$(call cc-param,asan-globals=1) \
+ +	$(call cc-param,asan-instrumentation-with-call-threshold=$(call_threshold)) \
+ +	$(call cc-param,asan-stack=1) \
+ +	$(call cc-param,asan-use-after-scope=1) \
+ +	$(call cc-param,asan-instrument-allocas=1)
+ +   endif
+ +
+ +endif
+ +
+ +ifdef CONFIG_KASAN_EXTRA
+ +CFLAGS_KASAN += $(call cc-option, -fsanitize-address-use-after-scope)
+ +endif
+ +
+++=======
++ ifeq ($(strip $(CFLAGS_KASAN_SHADOW)),)
++ 	CFLAGS_KASAN := $(CFLAGS_KASAN_MINIMAL)
++ else
++ 	# Now add all the compiler specific options that are valid standalone
++ 	CFLAGS_KASAN := $(CFLAGS_KASAN_SHADOW) \
++ 	 $(call cc-param,asan-globals=1) \
++ 	 $(call cc-param,asan-instrumentation-with-call-threshold=$(call_threshold)) \
++ 	 $(call cc-param,asan-stack=$(CONFIG_KASAN_STACK)) \
++ 	 $(call cc-param,asan-instrument-allocas=1)
++ endif
++ 
++ endif # CONFIG_KASAN_GENERIC
++ 
++ ifdef CONFIG_KASAN_SW_TAGS
++ 
++ ifdef CONFIG_KASAN_INLINE
++     instrumentation_flags := -mllvm -hwasan-mapping-offset=$(KASAN_SHADOW_OFFSET)
++ else
++     instrumentation_flags := -mllvm -hwasan-instrument-with-calls=1
++ endif
++ 
++ CFLAGS_KASAN := -fsanitize=kernel-hwaddress \
++ 		-mllvm -hwasan-instrument-stack=0 \
++ 		$(instrumentation_flags)
++ 
++ endif # CONFIG_KASAN_SW_TAGS
++ 
++ ifdef CONFIG_KASAN
+++>>>>>>> 7771bdbbfd3d (kasan: remove use after scope bugs detection.)
+  CFLAGS_KASAN_NOSANITIZE := -fno-builtin
+ +
+  endif
+* Unmerged path mm/kasan/generic.c
+* Unmerged path mm/kasan/generic_report.c
+* Unmerged path scripts/gcc-plugins/Kconfig
+diff --git a/arch/arm64/include/asm/memory.h b/arch/arm64/include/asm/memory.h
+index df263607ae15..e686f6a8cdd1 100644
+--- a/arch/arm64/include/asm/memory.h
++++ b/arch/arm64/include/asm/memory.h
+@@ -89,11 +89,7 @@
+  */
+ #ifdef CONFIG_KASAN
+ #define KASAN_SHADOW_SIZE	(UL(1) << (VA_BITS - KASAN_SHADOW_SCALE_SHIFT))
+-#ifdef CONFIG_KASAN_EXTRA
+-#define KASAN_THREAD_SHIFT	2
+-#else
+ #define KASAN_THREAD_SHIFT	1
+-#endif /* CONFIG_KASAN_EXTRA */
+ #else
+ #define KASAN_SHADOW_SIZE	(0)
+ #define KASAN_THREAD_SHIFT	0
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index da5a3060bee2..6ab87508ebd0 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -265,7 +265,6 @@ config ENABLE_MUST_CHECK
+ config FRAME_WARN
+ 	int "Warn for stack frames larger than (needs gcc 4.4)"
+ 	range 0 8192
+-	default 3072 if KASAN_EXTRA
+ 	default 2048 if GCC_PLUGIN_LATENT_ENTROPY
+ 	default 1280 if (!64BIT && PARISC)
+ 	default 1024 if (!64BIT && !PARISC)
+* Unmerged path lib/Kconfig.kasan
+diff --git a/lib/test_kasan.c b/lib/test_kasan.c
+index ec657105edbf..d400417d2ef0 100644
+--- a/lib/test_kasan.c
++++ b/lib/test_kasan.c
+@@ -480,29 +480,6 @@ static noinline void __init copy_user_test(void)
+ 	kfree(kmem);
+ }
+ 
+-static noinline void __init use_after_scope_test(void)
+-{
+-	volatile char *volatile p;
+-
+-	pr_info("use-after-scope on int\n");
+-	{
+-		int local = 0;
+-
+-		p = (char *)&local;
+-	}
+-	p[0] = 1;
+-	p[3] = 1;
+-
+-	pr_info("use-after-scope on array\n");
+-	{
+-		char local[1024] = {0};
+-
+-		p = local;
+-	}
+-	p[0] = 1;
+-	p[1023] = 1;
+-}
+-
+ static noinline void __init kasan_alloca_oob_left(void)
+ {
+ 	volatile int i = 10;
+@@ -615,7 +592,6 @@ static int __init kmalloc_tests_init(void)
+ 	kasan_alloca_oob_right();
+ 	ksize_unpoisons_memory();
+ 	copy_user_test();
+-	use_after_scope_test();
+ 	kmem_cache_double_free();
+ 	kmem_cache_invalid_free();
+ 
+* Unmerged path mm/kasan/generic.c
+* Unmerged path mm/kasan/generic_report.c
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index c12dcfde2ebd..950f0a0324fc 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -22,7 +22,6 @@
+ #define KASAN_STACK_MID         0xF2
+ #define KASAN_STACK_RIGHT       0xF3
+ #define KASAN_STACK_PARTIAL     0xF4
+-#define KASAN_USE_AFTER_SCOPE   0xF8
+ 
+ /*
+  * alloca redzone shadow values
+@@ -130,8 +129,6 @@ void __asan_unregister_globals(struct kasan_global *globals, size_t size);
+ void __asan_loadN(unsigned long addr, size_t size);
+ void __asan_storeN(unsigned long addr, size_t size);
+ void __asan_handle_no_return(void);
+-void __asan_poison_stack_memory(const void *addr, size_t size);
+-void __asan_unpoison_stack_memory(const void *addr, size_t size);
+ void __asan_alloca_poison(unsigned long addr, size_t size);
+ void __asan_allocas_unpoison(const void *stack_top, const void *stack_bottom);
+ 
+* Unmerged path scripts/Makefile.kasan
+* Unmerged path scripts/gcc-plugins/Kconfig
