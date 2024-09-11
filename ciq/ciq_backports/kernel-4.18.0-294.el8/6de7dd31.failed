@@ -1,0 +1,140 @@
+KVM: arm64: Don't use has_vhe() for CHOOSE_HYP_SYM()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Marc Zyngier <maz@kernel.org>
+commit 6de7dd31ded078b31a3812a46d8874f871b4e82f
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/6de7dd31.failed
+
+The recently introduced CHOOSE_HYP_SYM() macro picks one symbol
+or another, depending on whether the kernel run as a VHE
+hypervisor or not. For that, it uses the has_vhe() helper, which
+is itself implemented as a final capability.
+
+Unfortunately, __copy_hyp_vect_bpi now indirectly uses CHOOSE_HYP_SYM
+to get the __bp_harden_hyp_vecs symbol, using has_vhe() in the process.
+At this stage, the capability isn't final and things explode:
+
+[    0.000000] ACPI: SRAT not present
+[    0.000000] percpu: Embedded 34 pages/cpu s101264 r8192 d29808 u139264
+[    0.000000] Detected PIPT I-cache on CPU0
+[    0.000000] ------------[ cut here ]------------
+[    0.000000] kernel BUG at arch/arm64/include/asm/cpufeature.h:459!
+[    0.000000] Internal error: Oops - BUG: 0 [#1] PREEMPT SMP
+[    0.000000] Modules linked in:
+[    0.000000] CPU: 0 PID: 0 Comm: swapper Not tainted 5.8.0-rc4-00080-gd630681366e5 #1388
+[    0.000000] pstate: 80000085 (Nzcv daIf -PAN -UAO BTYPE=--)
+[    0.000000] pc : check_branch_predictor+0x3a4/0x408
+[    0.000000] lr : check_branch_predictor+0x2a4/0x408
+[    0.000000] sp : ffff800011693e90
+[    0.000000] x29: ffff800011693e90 x28: ffff8000116a1530
+[    0.000000] x27: ffff8000112c1008 x26: ffff800010ca6ff8
+[    0.000000] x25: ffff8000112c1000 x24: ffff8000116a1320
+[    0.000000] x23: 0000000000000000 x22: ffff8000112c1000
+[    0.000000] x21: ffff800010177120 x20: ffff8000116ae108
+[    0.000000] x19: 0000000000000000 x18: ffff800011965c90
+[    0.000000] x17: 0000000000022000 x16: 0000000000000003
+[    0.000000] x15: 00000000ffffffff x14: ffff8000118c3a38
+[    0.000000] x13: 0000000000000021 x12: 0000000000000022
+[    0.000000] x11: d37a6f4de9bd37a7 x10: 000000000000001d
+[    0.000000] x9 : 0000000000000000 x8 : ffff800011f8dad8
+[    0.000000] x7 : ffff800011965ad0 x6 : 0000000000000003
+[    0.000000] x5 : 0000000000000000 x4 : 0000000000000000
+[    0.000000] x3 : 0000000000000100 x2 : 0000000000000004
+[    0.000000] x1 : ffff8000116ae148 x0 : 0000000000000000
+[    0.000000] Call trace:
+[    0.000000]  check_branch_predictor+0x3a4/0x408
+[    0.000000]  update_cpu_capabilities+0x84/0x138
+[    0.000000]  init_cpu_features+0x2c0/0x2d8
+[    0.000000]  cpuinfo_store_boot_cpu+0x54/0x64
+[    0.000000]  smp_prepare_boot_cpu+0x2c/0x60
+[    0.000000]  start_kernel+0x16c/0x574
+[    0.000000] Code: 17ffffc7 91010281 14000198 17ffffca (d4210000)
+
+This is addressed using a two-fold process:
+- Replace has_vhe() with is_kernel_in_hyp_mode(), which tests
+  whether we are running at EL2.
+- Make CHOOSE_HYP_SYM() return an *undefined* symbol when
+  compiled in the nVHE hypervisor, as we really should never
+  use this helper in the nVHE-specific code.
+
+With this in place, we're back to a bootable kernel again.
+
+Fixes: b877e9849d41 ("KVM: arm64: Build hyp-entry.S separately for VHE/nVHE")
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 6de7dd31ded078b31a3812a46d8874f871b4e82f)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm64/include/asm/kvm_asm.h
+diff --cc arch/arm64/include/asm/kvm_asm.h
+index d8855ef14df1,1a66815ea01b..000000000000
+--- a/arch/arm64/include/asm/kvm_asm.h
++++ b/arch/arm64/include/asm/kvm_asm.h
+@@@ -51,14 -42,56 +51,60 @@@
+  
+  #include <linux/mm.h>
+  
+++<<<<<<< HEAD
+ +/* Translate a kernel address of @sym into its equivalent linear mapping */
+ +#define kvm_ksym_ref(sym)						\
+++=======
++ /*
++  * Translate name of a symbol defined in nVHE hyp to the name seen
++  * by kernel proper. All nVHE symbols are prefixed by the build system
++  * to avoid clashes with the VHE variants.
++  */
++ #define kvm_nvhe_sym(sym)	__kvm_nvhe_##sym
++ 
++ #define DECLARE_KVM_VHE_SYM(sym)	extern char sym[]
++ #define DECLARE_KVM_NVHE_SYM(sym)	extern char kvm_nvhe_sym(sym)[]
++ 
++ /*
++  * Define a pair of symbols sharing the same name but one defined in
++  * VHE and the other in nVHE hyp implementations.
++  */
++ #define DECLARE_KVM_HYP_SYM(sym)		\
++ 	DECLARE_KVM_VHE_SYM(sym);		\
++ 	DECLARE_KVM_NVHE_SYM(sym)
++ 
++ #define CHOOSE_VHE_SYM(sym)	sym
++ #define CHOOSE_NVHE_SYM(sym)	kvm_nvhe_sym(sym)
++ 
++ #ifndef __KVM_NVHE_HYPERVISOR__
++ /*
++  * BIG FAT WARNINGS:
++  *
++  * - Don't be tempted to change the following is_kernel_in_hyp_mode()
++  *   to has_vhe(). has_vhe() is implemented as a *final* capability,
++  *   while this is used early at boot time, when the capabilities are
++  *   not final yet....
++  *
++  * - Don't let the nVHE hypervisor have access to this, as it will
++  *   pick the *wrong* symbol (yes, it runs at EL2...).
++  */
++ #define CHOOSE_HYP_SYM(sym)	(is_kernel_in_hyp_mode() ? CHOOSE_VHE_SYM(sym) \
++ 					   : CHOOSE_NVHE_SYM(sym))
++ #else
++ /* The nVHE hypervisor shouldn't even try to access anything */
++ extern void *__nvhe_undefined_symbol;
++ #define CHOOSE_HYP_SYM(sym)	__nvhe_undefined_symbol
++ #endif
++ 
++ /* Translate a kernel address @ptr into its equivalent linear mapping */
++ #define kvm_ksym_ref(ptr)						\
+++>>>>>>> 6de7dd31ded0 (KVM: arm64: Don't use has_vhe() for CHOOSE_HYP_SYM())
+  	({								\
+ -		void *val = (ptr);					\
+ +		void *val = &sym;					\
+  		if (!is_kernel_in_hyp_mode())				\
+ -			val = lm_alias((ptr));				\
+ +			val = lm_alias(&sym);				\
+  		val;							\
+  	 })
+ -#define kvm_ksym_ref_nvhe(sym)	kvm_ksym_ref(kvm_nvhe_sym(sym))
+  
+  struct kvm;
+  struct kvm_vcpu;
+* Unmerged path arch/arm64/include/asm/kvm_asm.h
