@@ -744,7 +744,7 @@ static int macvlan_set_mac_address(struct net_device *dev, void *p)
 
 	if (vlan->mode == MACVLAN_MODE_PASSTHRU) {
 		macvlan_set_addr_change(vlan->port);
-		return dev_set_mac_address(vlan->lowerdev, addr);
+		return dev_set_mac_address(vlan->lowerdev, addr, NULL);
 	}
 
 	return macvlan_sync_address(dev, addr->sa_data);
@@ -1211,7 +1211,7 @@ static void macvlan_port_destroy(struct net_device *dev)
 
 		sa.sa_family = port->dev->type;
 		memcpy(&sa.sa_data, port->perm_addr, port->dev->addr_len);
-		dev_set_mac_address(port->dev, &sa);
+		dev_set_mac_address(port->dev, &sa, NULL);
 	}
 
 	kfree(port);
