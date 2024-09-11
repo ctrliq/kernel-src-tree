@@ -845,7 +845,7 @@ static void amdtp_stream_first_callback(struct fw_iso_context *context,
  * amdtp_stream_set_parameters() and it must be started before any PCM or MIDI
  * device can be started.
  */
-int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
+static int amdtp_stream_start(struct amdtp_stream *s, int channel, int speed)
 {
 	static const struct {
 		unsigned int data_block;
@@ -978,7 +978,6 @@ err_unlock:
 
 	return err;
 }
-EXPORT_SYMBOL(amdtp_stream_start);
 
 /**
  * amdtp_stream_pcm_pointer - get the PCM buffer position
@@ -1049,7 +1048,7 @@ EXPORT_SYMBOL(amdtp_stream_update);
  * All PCM and MIDI devices of the stream must be stopped before the stream
  * itself can be stopped.
  */
-void amdtp_stream_stop(struct amdtp_stream *s)
+static void amdtp_stream_stop(struct amdtp_stream *s)
 {
 	mutex_lock(&s->mutex);
 
@@ -1069,7 +1068,6 @@ void amdtp_stream_stop(struct amdtp_stream *s)
 
 	mutex_unlock(&s->mutex);
 }
-EXPORT_SYMBOL(amdtp_stream_stop);
 
 /**
  * amdtp_stream_pcm_abort - abort the running PCM device
