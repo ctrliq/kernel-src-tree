@@ -1,0 +1,345 @@
+io_uring: optimise use of ctx->drain_next
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 711be0312df4d350fb5bf1671c132cccae5aaf9a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/711be031.failed
+
+Move setting ctx->drain_next to the only place it could be set, when it
+got linked non-head requests. The same for checking it, it's interesting
+only for a head of a link or a non-linked request.
+
+No functional changes here. This removes some code from the common path
+and also removes REQ_F_DRAIN_LINK flag, as it doesn't need it anymore.
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 711be0312df4d350fb5bf1671c132cccae5aaf9a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 28a601d08266,68843a123000..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -334,9 -503,18 +334,21 @@@ struct io_kiocb 
+  #define REQ_F_IO_DRAIN		16	/* drain existing IO first */
+  #define REQ_F_IO_DRAINED	32	/* drain done */
+  #define REQ_F_LINK		64	/* linked sqes */
+ -#define REQ_F_LINK_TIMEOUT	128	/* has linked timeout */
+ +#define REQ_F_LINK_DONE		128	/* linked sqes done */
+  #define REQ_F_FAIL_LINK		256	/* fail rest of links */
+++<<<<<<< HEAD
+ +#define REQ_F_SHADOW_DRAIN	512	/* link-drain shadow req */
+++=======
++ #define REQ_F_TIMEOUT		1024	/* timeout request */
++ #define REQ_F_ISREG		2048	/* regular file */
++ #define REQ_F_MUST_PUNT		4096	/* must be punted even for NONBLOCK */
++ #define REQ_F_TIMEOUT_NOSEQ	8192	/* no timeout sequence */
++ #define REQ_F_INFLIGHT		16384	/* on inflight list */
++ #define REQ_F_COMP_LOCKED	32768	/* completion under lock */
++ #define REQ_F_HARDLINK		65536	/* doesn't sever on completion < 0 */
++ #define REQ_F_FORCE_ASYNC	131072	/* IOSQE_ASYNC */
++ #define REQ_F_CUR_POS		262144	/* read/write uses file position */
+++>>>>>>> 711be0312df4 (io_uring: optimise use of ctx->drain_next)
+  	u64			user_data;
+  	u32			result;
+  	u32			sequence;
+@@@ -2211,111 -4478,141 +2223,115 @@@ static int __io_queue_sqe(struct io_rin
+  
+  	/* drop submission reference */
+  	io_put_req(req);
+ -}
+ -
+ -static struct io_kiocb *io_prep_linked_timeout(struct io_kiocb *req)
+ -{
+ -	struct io_kiocb *nxt;
+  
+ -	if (!(req->flags & REQ_F_LINK))
+ -		return NULL;
+ -
+ -	nxt = list_first_entry_or_null(&req->link_list, struct io_kiocb,
+ -					link_list);
+ -	if (!nxt || nxt->opcode != IORING_OP_LINK_TIMEOUT)
+ -		return NULL;
+ +	/* and drop final reference, if we failed */
+ +	if (ret) {
+ +		io_cqring_add_event(ctx, req->user_data, ret);
+ +		if (req->flags & REQ_F_LINK)
+ +			req->flags |= REQ_F_FAIL_LINK;
+ +		io_put_req(req);
+ +	}
+  
+ -	req->flags |= REQ_F_LINK_TIMEOUT;
+ -	return nxt;
+ +	return ret;
+  }
+  
+ -static void __io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ +static int io_queue_sqe(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			struct sqe_submit *s, bool force_nonblock)
+  {
+ -	struct io_kiocb *linked_timeout;
+ -	struct io_kiocb *nxt = NULL;
+ -	int ret;
+ -
+ -again:
+ -	linked_timeout = io_prep_linked_timeout(req);
+ -
+ -	ret = io_issue_sqe(req, sqe, &nxt, true);
+ -
+ -	/*
+ -	 * We async punt it if the file wasn't marked NOWAIT, or if the file
+ -	 * doesn't support non-blocking read/write attempts
+ -	 */
+ -	if (ret == -EAGAIN && (!(req->flags & REQ_F_NOWAIT) ||
+ -	    (req->flags & REQ_F_MUST_PUNT))) {
+ -		if (req->work.flags & IO_WQ_WORK_NEEDS_FILES) {
+ -			ret = io_grab_files(req);
+ -			if (ret)
+ -				goto err;
+ -		}
+ -
+ -		/*
+ -		 * Queued up for async execution, worker will release
+ -		 * submit reference when the iocb is actually submitted.
+ -		 */
+ -		io_queue_async_work(req);
+ -		goto done_req;
+ -	}
+ -
+ -err:
+ -	/* drop submission reference */
+ -	io_put_req(req);
+ -
+ -	if (linked_timeout) {
+ -		if (!ret)
+ -			io_queue_linked_timeout(linked_timeout);
+ -		else
+ -			io_put_req(linked_timeout);
+ -	}
+ +	int ret;
+  
+ -	/* and drop final reference, if we failed */
+++<<<<<<< HEAD
+ +	ret = io_req_defer(ctx, req, s->sqe);
+++=======
+++	ret = io_req_defer(req, sqe);
+++>>>>>>> 711be0312df4 (io_uring: optimise use of ctx->drain_next)
+  	if (ret) {
+ -		io_cqring_add_event(req, ret);
+ -		req_set_fail_links(req);
+ -		io_put_req(req);
+ -	}
+ -done_req:
+ -	if (nxt) {
+ -		req = nxt;
+ -		nxt = NULL;
+ -		goto again;
+ +		if (ret != -EIOCBQUEUED) {
+ +			io_free_req(req);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		}
+ +		return 0;
+  	}
+ +
+ +	return __io_queue_sqe(ctx, req, s, force_nonblock);
+  }
+  
+ -static void io_queue_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe)
+ +static int io_queue_link_head(struct io_ring_ctx *ctx, struct io_kiocb *req,
+ +			      struct sqe_submit *s, struct io_kiocb *shadow,
+ +			      bool force_nonblock)
+  {
+  	int ret;
+ +	int need_submit = false;
+  
+ -	ret = io_req_defer(req, sqe);
+ +	if (!shadow)
+ +		return io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	/*
+ +	 * Mark the first IO in link list as DRAIN, let all the following
+ +	 * IOs enter the defer list. all IO needs to be completed before link
+ +	 * list.
+ +	 */
+ +	req->flags |= REQ_F_IO_DRAIN;
+ +	ret = io_req_defer(ctx, req, s->sqe);
+  	if (ret) {
+  		if (ret != -EIOCBQUEUED) {
+ -			io_cqring_add_event(req, ret);
+ -			req_set_fail_links(req);
+ -			io_double_put_req(req);
+ +			io_free_req(req);
+ +			__io_free_req(shadow);
+ +			io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +			return 0;
+  		}
+ -	} else if (req->flags & REQ_F_FORCE_ASYNC) {
+ +	} else {
+  		/*
+ -		 * Never try inline submit of IOSQE_ASYNC is set, go straight
+ -		 * to async execution.
+ +		 * If ret == 0 means that all IOs in front of link io are
+ +		 * running done. let's queue link head.
+  		 */
+ -		req->work.flags |= IO_WQ_WORK_CONCURRENT;
+ -		io_queue_async_work(req);
+ -	} else {
+ -		__io_queue_sqe(req, sqe);
+ +		need_submit = true;
+  	}
+ -}
+  
+ -static inline void io_queue_link_head(struct io_kiocb *req)
+ -{
+ -	if (unlikely(req->flags & REQ_F_FAIL_LINK)) {
+ -		io_cqring_add_event(req, -ECANCELED);
+ -		io_double_put_req(req);
+ -	} else
+ -		io_queue_sqe(req, NULL);
+ +	/* Insert shadow req to defer_list, blocking next IOs */
+ +	spin_lock_irq(&ctx->completion_lock);
+ +	list_add_tail(&shadow->list, &ctx->defer_list);
+ +	spin_unlock_irq(&ctx->completion_lock);
+ +
+ +	if (need_submit)
+ +		return __io_queue_sqe(ctx, req, s, force_nonblock);
+ +
+ +	return 0;
+  }
+  
+ -#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK|	\
+ -				IOSQE_IO_HARDLINK | IOSQE_ASYNC)
+ +#define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK)
+  
+ -static bool io_submit_sqe(struct io_kiocb *req, const struct io_uring_sqe *sqe,
+ -			  struct io_submit_state *state, struct io_kiocb **link)
+ +static void io_submit_sqe(struct io_ring_ctx *ctx, struct sqe_submit *s,
+ +			  struct io_submit_state *state, struct io_kiocb **link,
+ +			  bool force_nonblock)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ -	unsigned int sqe_flags;
+ +	struct io_uring_sqe *sqe_copy;
+ +	struct io_kiocb *req;
+  	int ret;
+  
+ -	sqe_flags = READ_ONCE(sqe->flags);
+ -
+  	/* enforce forwards compatibility on users */
+ -	if (unlikely(sqe_flags & ~SQE_VALID_FLAGS)) {
+ +	if (unlikely(s->sqe->flags & ~SQE_VALID_FLAGS)) {
+  		ret = -EINVAL;
+ -		goto err_req;
+ +		goto err;
+  	}
+ -	if (sqe_flags & IOSQE_ASYNC)
+ -		req->flags |= REQ_F_FORCE_ASYNC;
+  
+ -	ret = io_req_set_file(state, req, sqe);
+ +	req = io_get_req(ctx, state);
+ +	if (unlikely(!req)) {
+ +		ret = -EAGAIN;
+ +		goto err;
+ +	}
+ +
+ +	ret = io_req_set_file(ctx, s, state, req);
+  	if (unlikely(ret)) {
+  err_req:
+ -		io_cqring_add_event(req, ret);
+ -		io_double_put_req(req);
+ -		return false;
+ +		io_free_req(req);
+ +err:
+ +		io_cqring_add_event(ctx, s->sqe->user_data, ret);
+ +		return;
+  	}
+  
+ +	req->user_data = s->sqe->user_data;
+ +
+  	/*
+  	 * If we already have a head request, queue this one for async
+  	 * submittal once the head completes. If we don't have a head but
+@@@ -2324,26 -4621,56 +2340,73 @@@
+  	 * conditions are true (normal request), then just queue it.
+  	 */
+  	if (*link) {
+ -		struct io_kiocb *head = *link;
+ +		struct io_kiocb *prev = *link;
+  
+++<<<<<<< HEAD
+ +		sqe_copy = kmemdup(s->sqe, sizeof(*sqe_copy), GFP_KERNEL);
+ +		if (!sqe_copy) {
+++=======
++ 		if (sqe_flags & IOSQE_IO_DRAIN) {
++ 			head->flags |= REQ_F_IO_DRAIN;
++ 			ctx->drain_next = 1;
++ 		}
++ 
++ 		if (sqe_flags & IOSQE_IO_HARDLINK)
++ 			req->flags |= REQ_F_HARDLINK;
++ 
++ 		if (io_alloc_async_ctx(req)) {
+++>>>>>>> 711be0312df4 (io_uring: optimise use of ctx->drain_next)
+  			ret = -EAGAIN;
+  			goto err_req;
+  		}
+  
+++<<<<<<< HEAD
+ +		s->sqe = sqe_copy;
+ +		memcpy(&req->submit, s, sizeof(*s));
+ +		list_add_tail(&req->list, &prev->link_list);
+ +	} else if (s->sqe->flags & IOSQE_IO_LINK) {
+ +		req->flags |= REQ_F_LINK;
+ +
+ +		memcpy(&req->submit, s, sizeof(*s));
+ +		INIT_LIST_HEAD(&req->link_list);
+ +		*link = req;
+ +	} else {
+ +		io_queue_sqe(ctx, req, s, force_nonblock);
+++=======
++ 		ret = io_req_defer_prep(req, sqe);
++ 		if (ret) {
++ 			/* fail even hard links since we don't submit */
++ 			head->flags |= REQ_F_FAIL_LINK;
++ 			goto err_req;
++ 		}
++ 		trace_io_uring_link(ctx, req, head);
++ 		list_add_tail(&req->link_list, &head->link_list);
++ 
++ 		/* last request of a link, enqueue the link */
++ 		if (!(sqe_flags & (IOSQE_IO_LINK|IOSQE_IO_HARDLINK))) {
++ 			io_queue_link_head(head);
++ 			*link = NULL;
++ 		}
++ 	} else {
++ 		if (unlikely(ctx->drain_next)) {
++ 			req->flags |= REQ_F_IO_DRAIN;
++ 			req->ctx->drain_next = 0;
++ 		}
++ 		if (sqe_flags & (IOSQE_IO_LINK|IOSQE_IO_HARDLINK)) {
++ 			req->flags |= REQ_F_LINK;
++ 			if (sqe_flags & IOSQE_IO_HARDLINK)
++ 				req->flags |= REQ_F_HARDLINK;
++ 
++ 			INIT_LIST_HEAD(&req->link_list);
++ 			ret = io_req_defer_prep(req, sqe);
++ 			if (ret)
++ 				req->flags |= REQ_F_FAIL_LINK;
++ 			*link = req;
++ 		} else {
++ 			io_queue_sqe(req, sqe);
++ 		}
+++>>>>>>> 711be0312df4 (io_uring: optimise use of ctx->drain_next)
+  	}
+ -
+ -	return true;
+  }
+  
+  /*
+* Unmerged path fs/io_uring.c
