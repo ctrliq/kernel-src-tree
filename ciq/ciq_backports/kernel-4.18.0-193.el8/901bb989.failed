@@ -1,0 +1,207 @@
+nl80211: require and validate vendor command policy
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Johannes Berg <johannes.berg@intel.com>
+commit 901bb9891855164fdcfcfdd9c3d25bcc800d3f5b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/901bb989.failed
+
+Require that each vendor command give a policy of its sub-attributes
+in NL80211_ATTR_VENDOR_DATA, and then (stricly) check the contents,
+including the NLA_F_NESTED flag that we couldn't check on the outer
+layer because there we don't know yet.
+
+It is possible to use VENDOR_CMD_RAW_DATA for raw data, but then no
+nested data can be given (NLA_F_NESTED flag must be clear) and the
+data is just passed as is to the command.
+
+	Signed-off-by: Johannes Berg <johannes.berg@intel.com>
+(cherry picked from commit 901bb9891855164fdcfcfdd9c3d25bcc800d3f5b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/netlink.h
+diff --cc include/net/netlink.h
+index 4ce58bc2d023,28ece67f5312..000000000000
+--- a/include/net/netlink.h
++++ b/include/net/netlink.h
+@@@ -1398,12 -1745,31 +1398,35 @@@ static inline void nla_nest_cancel(stru
+   *
+   * Returns 0 on success or a negative error code.
+   */
+ -static inline int __nla_validate_nested(const struct nlattr *start, int maxtype,
+ -					const struct nla_policy *policy,
+ -					unsigned int validate,
+ -					struct netlink_ext_ack *extack)
+ +static inline int nla_validate_nested(const struct nlattr *start, int maxtype,
+ +				      const struct nla_policy *policy,
+ +				      struct netlink_ext_ack *extack)
+  {
+++<<<<<<< HEAD
+ +	return nla_validate(nla_data(start), nla_len(start), maxtype, policy,
+ +			    extack);
+++=======
++ 	return __nla_validate(nla_data(start), nla_len(start), maxtype, policy,
++ 			      validate, extack);
++ }
++ 
++ static inline int
++ nl80211_validate_nested(const struct nlattr *start, int maxtype,
++ 			const struct nla_policy *policy,
++ 			struct netlink_ext_ack *extack)
++ {
++ 	return __nla_validate_nested(start, maxtype, policy,
++ 				     NL_VALIDATE_STRICT, extack);
++ }
++ 
++ static inline int
++ nla_validate_nested_deprecated(const struct nlattr *start, int maxtype,
++ 			       const struct nla_policy *policy,
++ 			       struct netlink_ext_ack *extack)
++ {
++ 	return __nla_validate_nested(start, maxtype, policy,
++ 				     NL_VALIDATE_LIBERAL, extack);
+++>>>>>>> 901bb9891855 (nl80211: require and validate vendor command policy)
+  }
+  
+  /**
+diff --git a/drivers/net/wireless/mac80211_hwsim.c b/drivers/net/wireless/mac80211_hwsim.c
+index fd816c4ca420..6e4bd63e3fa2 100644
+--- a/drivers/net/wireless/mac80211_hwsim.c
++++ b/drivers/net/wireless/mac80211_hwsim.c
+@@ -438,6 +438,8 @@ static struct wiphy_vendor_command mac80211_hwsim_vendor_commands[] = {
+ 			  .subcmd = QCA_NL80211_SUBCMD_TEST },
+ 		.flags = WIPHY_VENDOR_CMD_NEED_NETDEV,
+ 		.doit = mac80211_hwsim_vendor_cmd_test,
++		.policy = hwsim_vendor_test_policy,
++		.maxattr = QCA_WLAN_VENDOR_ATTR_MAX,
+ 	}
+ };
+ 
+diff --git a/include/net/cfg80211.h b/include/net/cfg80211.h
+index f4b191144774..82be129fcec1 100644
+--- a/include/net/cfg80211.h
++++ b/include/net/cfg80211.h
+@@ -4163,6 +4163,8 @@ struct sta_opmode_info {
+ 	u8 rx_nss;
+ };
+ 
++#define VENDOR_CMD_RAW_DATA ((const struct nla_policy *)ERR_PTR(-ENODATA))
++
+ /**
+  * struct wiphy_vendor_command - vendor command definition
+  * @info: vendor command identifying information, as used in nl80211
+@@ -4173,6 +4175,10 @@ struct sta_opmode_info {
+  * @dumpit: dump callback, for transferring bigger/multiple items. The
+  *	@storage points to cb->args[5], ie. is preserved over the multiple
+  *	dumpit calls.
++ * @policy: policy pointer for attributes within %NL80211_ATTR_VENDOR_DATA.
++ *	Set this to %VENDOR_CMD_RAW_DATA if no policy can be given and the
++ *	attribute is just raw data (e.g. a firmware command).
++ * @maxattr: highest attribute number in policy
+  * It's recommended to not have the same sub command with both @doit and
+  * @dumpit, so that userspace can assume certain ones are get and others
+  * are used with dump requests.
+@@ -4185,6 +4191,8 @@ struct wiphy_vendor_command {
+ 	int (*dumpit)(struct wiphy *wiphy, struct wireless_dev *wdev,
+ 		      struct sk_buff *skb, const void *data, int data_len,
+ 		      unsigned long *storage);
++	const struct nla_policy *policy;
++	unsigned int maxattr;
+ };
+ 
+ /**
+* Unmerged path include/net/netlink.h
+diff --git a/net/wireless/core.c b/net/wireless/core.c
+index 0b958e76009a..a599469b8157 100644
+--- a/net/wireless/core.c
++++ b/net/wireless/core.c
+@@ -857,6 +857,19 @@ int wiphy_register(struct wiphy *wiphy)
+ 		return -EINVAL;
+ 	}
+ 
++	for (i = 0; i < rdev->wiphy.n_vendor_commands; i++) {
++		/*
++		 * Validate we have a policy (can be explicitly set to
++		 * VENDOR_CMD_RAW_DATA which is non-NULL) and also that
++		 * we have at least one of doit/dumpit.
++		 */
++		if (WARN_ON(!rdev->wiphy.vendor_commands[i].policy))
++			return -EINVAL;
++		if (WARN_ON(!rdev->wiphy.vendor_commands[i].doit &&
++			    !rdev->wiphy.vendor_commands[i].dumpit))
++			return -EINVAL;
++	}
++
+ #ifdef CONFIG_PM
+ 	if (WARN_ON(rdev->wiphy.wowlan && rdev->wiphy.wowlan->n_patterns &&
+ 		    (!rdev->wiphy.wowlan->pattern_min_len ||
+diff --git a/net/wireless/nl80211.c b/net/wireless/nl80211.c
+index 4e1c052bca2e..9839aecde09f 100644
+--- a/net/wireless/nl80211.c
++++ b/net/wireless/nl80211.c
+@@ -12780,6 +12780,29 @@ static int nl80211_crit_protocol_stop(struct sk_buff *skb,
+ 	return 0;
+ }
+ 
++static int nl80211_vendor_check_policy(const struct wiphy_vendor_command *vcmd,
++				       struct nlattr *attr,
++				       struct netlink_ext_ack *extack)
++{
++	if (vcmd->policy == VENDOR_CMD_RAW_DATA) {
++		if (attr->nla_type & NLA_F_NESTED) {
++			NL_SET_ERR_MSG_ATTR(extack, attr,
++					    "unexpected nested data");
++			return -EINVAL;
++		}
++
++		return 0;
++	}
++
++	if (!(attr->nla_type & NLA_F_NESTED)) {
++		NL_SET_ERR_MSG_ATTR(extack, attr, "expected nested data");
++		return -EINVAL;
++	}
++
++	return nl80211_validate_nested(attr, vcmd->maxattr, vcmd->policy,
++				       extack);
++}
++
+ static int nl80211_vendor_cmd(struct sk_buff *skb, struct genl_info *info)
+ {
+ 	struct cfg80211_registered_device *rdev = info->user_ptr[0];
+@@ -12838,11 +12861,16 @@ static int nl80211_vendor_cmd(struct sk_buff *skb, struct genl_info *info)
+ 		if (info->attrs[NL80211_ATTR_VENDOR_DATA]) {
+ 			data = nla_data(info->attrs[NL80211_ATTR_VENDOR_DATA]);
+ 			len = nla_len(info->attrs[NL80211_ATTR_VENDOR_DATA]);
++
++			err = nl80211_vendor_check_policy(vcmd,
++					info->attrs[NL80211_ATTR_VENDOR_DATA],
++					info->extack);
++			if (err)
++				return err;
+ 		}
+ 
+ 		rdev->cur_cmd_info = info;
+-		err = rdev->wiphy.vendor_commands[i].doit(&rdev->wiphy, wdev,
+-							  data, len);
++		err = vcmd->doit(&rdev->wiphy, wdev, data, len);
+ 		rdev->cur_cmd_info = NULL;
+ 		return err;
+ 	}
+@@ -12929,6 +12957,13 @@ static int nl80211_prepare_vendor_dump(struct sk_buff *skb,
+ 	if (attrbuf[NL80211_ATTR_VENDOR_DATA]) {
+ 		data = nla_data(attrbuf[NL80211_ATTR_VENDOR_DATA]);
+ 		data_len = nla_len(attrbuf[NL80211_ATTR_VENDOR_DATA]);
++
++		err = nl80211_vendor_check_policy(
++				&(*rdev)->wiphy.vendor_commands[vcmd_idx],
++				attrbuf[NL80211_ATTR_VENDOR_DATA],
++				cb->extack);
++		if (err)
++			return err;
+ 	}
+ 
+ 	/* 0 is the first index - add 1 to parse only once */
