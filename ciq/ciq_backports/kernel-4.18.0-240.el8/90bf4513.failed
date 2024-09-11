@@ -1,0 +1,167 @@
+mptcp: add new sock flag to deal with join subflows
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Abeni <pabeni@redhat.com>
+commit 90bf45134d55d626ae2713cac50cda10c6c8b0c2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/90bf4513.failed
+
+MP_JOIN subflows must not land into the accept queue.
+Currently tcp_check_req() calls an mptcp specific helper
+to detect such scenario.
+
+Such helper leverages the subflow context to check for
+MP_JOIN subflows. We need to deal also with MP JOIN
+failures, even when the subflow context is not available
+due allocation failure.
+
+A possible solution would be changing the syn_recv_sock()
+signature to allow returning a more descriptive action/
+error code and deal with that in tcp_check_req().
+
+Since the above need is MPTCP specific, this patch instead
+uses a TCP request socket hole to add a MPTCP specific flag.
+Such flag is used by the MPTCP syn_recv_sock() to tell
+tcp_check_req() how to deal with the request socket.
+
+This change is a no-op for !MPTCP build, and makes the
+MPTCP code simpler. It allows also the next patch to deal
+correctly with MP JOIN failure.
+
+v1 -> v2:
+ - be more conservative on drop_req initialization (Mat)
+
+RFC -> v1:
+ - move the drop_req bit inside tcp_request_sock (Eric)
+
+	Signed-off-by: Paolo Abeni <pabeni@redhat.com>
+	Reviewed-by: Mat Martineau <mathew.j.martineau@linux.intel.com>
+	Reviewed-by: Christoph Paasch <cpaasch@apple.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 90bf45134d55d626ae2713cac50cda10c6c8b0c2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/mptcp.h
+#	net/mptcp/subflow.c
+diff --cc include/net/mptcp.h
+index b648fa20eec8,c4a6ef4ba35b..000000000000
+--- a/include/net/mptcp.h
++++ b/include/net/mptcp.h
+@@@ -66,11 -68,14 +66,20 @@@ static inline bool rsk_is_mptcp(const s
+  	return tcp_rsk(req)->is_mptcp;
+  }
+  
+++<<<<<<< HEAD
+ +void mptcp_parse_option(const struct sk_buff *skb, const unsigned char *ptr,
+ +			int opsize, struct tcp_options_received *opt_rx);
+++=======
++ static inline bool rsk_drop_req(const struct request_sock *req)
++ {
++ 	return tcp_rsk(req)->is_mptcp && tcp_rsk(req)->drop_req;
++ }
++ 
++ void mptcp_space(const struct sock *ssk, int *space, int *full_space);
+++>>>>>>> 90bf45134d55 (mptcp: add new sock flag to deal with join subflows)
+  bool mptcp_syn_options(struct sock *sk, const struct sk_buff *skb,
+  		       unsigned int *size, struct mptcp_out_options *opts);
+ +void mptcp_rcv_synsent(struct sock *sk);
+  bool mptcp_synack_options(const struct request_sock *req, unsigned int *size,
+  			  struct mptcp_out_options *opts);
+  bool mptcp_established_options(struct sock *sk, struct sk_buff *skb,
+@@@ -121,8 -126,7 +130,12 @@@ static inline bool mptcp_skb_can_collap
+  				 skb_ext_find(from, SKB_EXT_MPTCP));
+  }
+  
+++<<<<<<< HEAD
+ +bool mptcp_sk_is_subflow(const struct sock *sk);
+ +
+++=======
++ void mptcp_seq_show(struct seq_file *seq);
+++>>>>>>> 90bf45134d55 (mptcp: add new sock flag to deal with join subflows)
+  #else
+  
+  static inline void mptcp_init(void)
+@@@ -189,11 -198,8 +207,16 @@@ static inline bool mptcp_skb_can_collap
+  	return true;
+  }
+  
+++<<<<<<< HEAD
+ +static inline bool mptcp_sk_is_subflow(const struct sock *sk)
+ +{
+ +	return false;
+ +}
+ +
+++=======
++ static inline void mptcp_space(const struct sock *ssk, int *s, int *fs) { }
++ static inline void mptcp_seq_show(struct seq_file *seq) { }
+++>>>>>>> 90bf45134d55 (mptcp: add new sock flag to deal with join subflows)
+  #endif /* CONFIG_MPTCP */
+  
+  #if IS_ENABLED(CONFIG_MPTCP_IPV6)
+diff --cc net/mptcp/subflow.c
+index c928ab97b1e2,5e03ed8ae899..000000000000
+--- a/net/mptcp/subflow.c
++++ b/net/mptcp/subflow.c
+@@@ -470,6 -512,9 +472,12 @@@ create_child
+  			ctx->conn = (struct sock *)owner;
+  			if (!mptcp_finish_join(child))
+  				goto close_child;
+++<<<<<<< HEAD
+++=======
++ 
++ 			SUBFLOW_REQ_INC_STATS(req, MPTCP_MIB_JOINACKRX);
++ 			tcp_rsk(req)->drop_req = true;
+++>>>>>>> 90bf45134d55 (mptcp: add new sock flag to deal with join subflows)
+  		}
+  	}
+  
+diff --git a/include/linux/tcp.h b/include/linux/tcp.h
+index f8f500b4bc21..34c0b4e88c9e 100644
+--- a/include/linux/tcp.h
++++ b/include/linux/tcp.h
+@@ -180,6 +180,9 @@ struct tcp_request_sock {
+ 	u64				snt_synack; /* first SYNACK sent time */
+ 	bool				tfo_listener;
+ 	bool				is_mptcp;
++#if IS_ENABLED(CONFIG_MPTCP)
++	bool				drop_req;
++#endif
+ 	u32				txhash;
+ 	u32				rcv_isn;
+ 	u32				snt_isn;
+* Unmerged path include/net/mptcp.h
+diff --git a/net/ipv4/tcp_minisocks.c b/net/ipv4/tcp_minisocks.c
+index cfd29d772a91..8c5c81b4f2e2 100644
+--- a/net/ipv4/tcp_minisocks.c
++++ b/net/ipv4/tcp_minisocks.c
+@@ -790,7 +790,7 @@ struct sock *tcp_check_req(struct sock *sk, struct sk_buff *skb,
+ 	if (!child)
+ 		goto listen_overflow;
+ 
+-	if (own_req && sk_is_mptcp(child) && mptcp_sk_is_subflow(child)) {
++	if (own_req && rsk_drop_req(req)) {
+ 		reqsk_queue_removed(&inet_csk(sk)->icsk_accept_queue, req);
+ 		inet_csk_reqsk_queue_drop_and_put(sk, req);
+ 		return child;
+diff --git a/net/mptcp/protocol.c b/net/mptcp/protocol.c
+index ae0053626fa9..7724b185400d 100644
+--- a/net/mptcp/protocol.c
++++ b/net/mptcp/protocol.c
+@@ -1587,13 +1587,6 @@ bool mptcp_finish_join(struct sock *sk)
+ 	return ret;
+ }
+ 
+-bool mptcp_sk_is_subflow(const struct sock *sk)
+-{
+-	struct mptcp_subflow_context *subflow = mptcp_subflow_ctx(sk);
+-
+-	return subflow->mp_join == 1;
+-}
+-
+ static bool mptcp_memory_free(const struct sock *sk, int wake)
+ {
+ 	struct mptcp_sock *msk = mptcp_sk(sk);
+* Unmerged path net/mptcp/subflow.c
