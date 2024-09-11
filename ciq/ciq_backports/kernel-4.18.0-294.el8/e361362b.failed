@@ -1,0 +1,157 @@
+x86/dumpstack/64: Don't evaluate exception stacks before setup
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit e361362b08cab1098b64b0e5fd8c879f086b3f46
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/e361362b.failed
+
+Cyrill reported the following crash:
+
+  BUG: unable to handle page fault for address: 0000000000001ff0
+  #PF: supervisor read access in kernel mode
+  RIP: 0010:get_stack_info+0xb3/0x148
+
+It turns out that if the stack tracer is invoked before the exception stack
+mappings are initialized in_exception_stack() can erroneously classify an
+invalid address as an address inside of an exception stack:
+
+    begin = this_cpu_read(cea_exception_stacks);  <- 0
+    end = begin + sizeof(exception stacks);
+
+i.e. any address between 0 and end will be considered as exception stack
+address and the subsequent code will then try to derefence the resulting
+stack frame at a non mapped address.
+
+ end = begin + (unsigned long)ep->size;
+     ==> end = 0x2000
+
+ regs = (struct pt_regs *)end - 1;
+     ==> regs = 0x2000 - sizeof(struct pt_regs *) = 0x1ff0
+
+ info->next_sp   = (unsigned long *)regs->sp;
+     ==> Crashes due to accessing 0x1ff0
+
+Prevent this by checking the validity of the cea_exception_stack base
+address and bailing out if it is zero.
+
+Fixes: afcd21dad88b ("x86/dumpstack/64: Use cpu_entry_area instead of orig_ist")
+	Reported-by: Cyrill Gorcunov <gorcunov@gmail.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Cyrill Gorcunov <gorcunov@gmail.com>
+	Acked-by: Josh Poimboeuf <jpoimboe@redhat.com>
+	Cc: stable@vger.kernel.org
+Link: https://lkml.kernel.org/r/alpine.DEB.2.21.1910231950590.1852@nanos.tec.linutronix.de
+
+(cherry picked from commit e361362b08cab1098b64b0e5fd8c879f086b3f46)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/dumpstack_64.c
+diff --cc arch/x86/kernel/dumpstack_64.c
+index 35a75d2d7b5a,87b97897a881..000000000000
+--- a/arch/x86/kernel/dumpstack_64.c
++++ b/arch/x86/kernel/dumpstack_64.c
+@@@ -52,31 -50,79 +52,46 @@@ const char *stack_type_name(enum stack_
+  	return NULL;
+  }
+  
+ -/**
+ - * struct estack_pages - Page descriptor for exception stacks
+ - * @offs:	Offset from the start of the exception stack area
+ - * @size:	Size of the exception stack
+ - * @type:	Type to store in the stack_info struct
+ - */
+ -struct estack_pages {
+ -	u32	offs;
+ -	u16	size;
+ -	u16	type;
+ -};
+ -
+ -#define EPAGERANGE(st)							\
+ -	[PFN_DOWN(CEA_ESTACK_OFFS(st)) ...				\
+ -	 PFN_DOWN(CEA_ESTACK_OFFS(st) + CEA_ESTACK_SIZE(st) - 1)] = {	\
+ -		.offs	= CEA_ESTACK_OFFS(st),				\
+ -		.size	= CEA_ESTACK_SIZE(st),				\
+ -		.type	= STACK_TYPE_EXCEPTION + ESTACK_ ##st, }
+ -
+ -/*
+ - * Array of exception stack page descriptors. If the stack is larger than
+ - * PAGE_SIZE, all pages covering a particular stack will have the same
+ - * info. The guard pages including the not mapped DB2 stack are zeroed
+ - * out.
+ - */
+ -static const
+ -struct estack_pages estack_pages[CEA_ESTACK_PAGES] ____cacheline_aligned = {
+ -	EPAGERANGE(DF),
+ -	EPAGERANGE(NMI),
+ -	EPAGERANGE(DB1),
+ -	EPAGERANGE(DB),
+ -	EPAGERANGE(MCE),
+ -};
+ -
+  static bool in_exception_stack(unsigned long *stack, struct stack_info *info)
+  {
+ -	unsigned long begin, end, stk = (unsigned long)stack;
+ -	const struct estack_pages *ep;
+ +	unsigned long *begin, *end;
+  	struct pt_regs *regs;
+ -	unsigned int k;
+ +	unsigned k;
+  
+ -	BUILD_BUG_ON(N_EXCEPTION_STACKS != 6);
+ +	BUILD_BUG_ON(N_EXCEPTION_STACKS != 4);
+  
+++<<<<<<< HEAD
+ +	for (k = 0; k < N_EXCEPTION_STACKS; k++) {
+ +		end   = (unsigned long *)raw_cpu_ptr(&orig_ist)->ist[k];
+ +		begin = end - (exception_stack_sizes[k] / sizeof(long));
+ +		regs  = (struct pt_regs *)end - 1;
+++=======
++ 	begin = (unsigned long)__this_cpu_read(cea_exception_stacks);
++ 	/*
++ 	 * Handle the case where stack trace is collected _before_
++ 	 * cea_exception_stacks had been initialized.
++ 	 */
++ 	if (!begin)
++ 		return false;
++ 
++ 	end = begin + sizeof(struct cea_exception_stacks);
++ 	/* Bail if @stack is outside the exception stack area. */
++ 	if (stk < begin || stk >= end)
++ 		return false;
+++>>>>>>> e361362b08ca (x86/dumpstack/64: Don't evaluate exception stacks before setup)
+  
+ -	/* Calc page offset from start of exception stacks */
+ -	k = (stk - begin) >> PAGE_SHIFT;
+ -	/* Lookup the page descriptor */
+ -	ep = &estack_pages[k];
+ -	/* Guard page? */
+ -	if (!ep->size)
+ -		return false;
+ +		if (stack < begin || stack >= end)
+ +			continue;
+  
+ -	begin += (unsigned long)ep->offs;
+ -	end = begin + (unsigned long)ep->size;
+ -	regs = (struct pt_regs *)end - 1;
+ +		info->type	= STACK_TYPE_EXCEPTION + k;
+ +		info->begin	= begin;
+ +		info->end	= end;
+ +		info->next_sp	= (unsigned long *)regs->sp;
+  
+ -	info->type	= ep->type;
+ -	info->begin	= (unsigned long *)begin;
+ -	info->end	= (unsigned long *)end;
+ -	info->next_sp	= (unsigned long *)regs->sp;
+ -	return true;
+ +		return true;
+ +	}
+ +
+ +	return false;
+  }
+  
+  static bool in_irq_stack(unsigned long *stack, struct stack_info *info)
+* Unmerged path arch/x86/kernel/dumpstack_64.c
