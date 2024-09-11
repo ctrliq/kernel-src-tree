@@ -1,0 +1,102 @@
+kernel/futex: Kill rt_mutex_next_owner()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Davidlohr Bueso <dave@stgolabs.net>
+commit 9a4b99fce659c03699f1cb5003ebe7c57c084d49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9a4b99fc.failed
+
+Update wake_futex_pi() and kill the call altogether. This is possible because:
+
+(i) The case of fixup_owner() in which the pi_mutex was stolen from the
+signaled enqueued top-waiter which fails to trylock and doesn't see a
+current owner of the rtmutex but needs to acknowledge an non-enqueued
+higher priority waiter, which is the other alternative. This used to be
+handled by rt_mutex_next_owner(), which guaranteed fixup_pi_state_owner('newowner')
+never to be nil. Nowadays the logic is handled by an EAGAIN loop, without
+the need of rt_mutex_next_owner(). Specifically:
+
+    c1e2f0eaf015 (futex: Avoid violating the 10th rule of futex)
+    9f5d1c336a10 (futex: Handle transient "ownerless" rtmutex state correctly)
+
+(ii) rt_mutex_next_owner() and rt_mutex_top_waiter() are semantically
+equivalent, as of:
+
+    c28d62cf52d7 (locking/rtmutex: Handle non enqueued waiters gracefully in remove_waiter())
+
+So instead of keeping the call around, just use the good ole rt_mutex_top_waiter().
+No change in semantics.
+
+	Signed-off-by: Davidlohr Bueso <dbueso@suse.de>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+Link: https://lore.kernel.org/r/20210226175029.50335-1-dave@stgolabs.net
+
+(cherry picked from commit 9a4b99fce659c03699f1cb5003ebe7c57c084d49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/futex.c
+diff --cc kernel/futex.c
+index 62cb0ed45515,db8002dbca7a..000000000000
+--- a/kernel/futex.c
++++ b/kernel/futex.c
+@@@ -1506,7 -1493,8 +1506,12 @@@ static void mark_wake_futex(struct wake
+   */
+  static int wake_futex_pi(u32 __user *uaddr, u32 uval, struct futex_pi_state *pi_state)
+  {
+++<<<<<<< HEAD
+ +	u32 uninitialized_var(curval), newval;
+++=======
++ 	u32 curval, newval;
++ 	struct rt_mutex_waiter *top_waiter;
+++>>>>>>> 9a4b99fce659 (kernel/futex: Kill rt_mutex_next_owner())
+  	struct task_struct *new_owner;
+  	bool postunlock = false;
+  	DEFINE_WAKE_Q(wake_q);
+* Unmerged path kernel/futex.c
+diff --git a/kernel/locking/rtmutex.c b/kernel/locking/rtmutex.c
+index b9716eb0e70d..5772c22cc079 100644
+--- a/kernel/locking/rtmutex.c
++++ b/kernel/locking/rtmutex.c
+@@ -1811,26 +1811,6 @@ int rt_mutex_start_proxy_lock(struct rt_mutex *lock,
+ 	return ret;
+ }
+ 
+-/**
+- * rt_mutex_next_owner - return the next owner of the lock
+- *
+- * @lock: the rt lock query
+- *
+- * Returns the next owner of the lock or NULL
+- *
+- * Caller has to serialize against other accessors to the lock
+- * itself.
+- *
+- * Special API call for PI-futex support
+- */
+-struct task_struct *rt_mutex_next_owner(struct rt_mutex *lock)
+-{
+-	if (!rt_mutex_has_waiters(lock))
+-		return NULL;
+-
+-	return rt_mutex_top_waiter(lock)->task;
+-}
+-
+ /**
+  * rt_mutex_wait_proxy_lock() - Wait for lock acquisition
+  * @lock:		the rt_mutex we were woken on
+diff --git a/kernel/locking/rtmutex_common.h b/kernel/locking/rtmutex_common.h
+index ca6fb489007b..a5007f00c1b7 100644
+--- a/kernel/locking/rtmutex_common.h
++++ b/kernel/locking/rtmutex_common.h
+@@ -130,7 +130,6 @@ enum rtmutex_chainwalk {
+ /*
+  * PI-futex support (proxy locking functions, etc.):
+  */
+-extern struct task_struct *rt_mutex_next_owner(struct rt_mutex *lock);
+ extern void rt_mutex_init_proxy_locked(struct rt_mutex *lock,
+ 				       struct task_struct *proxy_owner);
+ extern void rt_mutex_proxy_unlock(struct rt_mutex *lock);
