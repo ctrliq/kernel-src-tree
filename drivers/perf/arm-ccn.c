@@ -227,7 +227,7 @@ static ssize_t arm_ccn_pmu_format_show(struct device *dev,
 	struct dev_ext_attribute *ea = container_of(attr,
 			struct dev_ext_attribute, attr);
 
-	return snprintf(buf, PAGE_SIZE, "%s\n", (char *)ea->var);
+	return sysfs_emit(buf, "%s\n", (char *)ea->var);
 }
 
 #define CCN_FORMAT_ATTR(_name, _config) \
@@ -477,7 +477,7 @@ static ssize_t arm_ccn_pmu_cmp_mask_show(struct device *dev,
 	struct arm_ccn *ccn = pmu_to_arm_ccn(dev_get_drvdata(dev));
 	u64 *mask = arm_ccn_pmu_get_cmp_mask(ccn, attr->attr.name);
 
-	return mask ? snprintf(buf, PAGE_SIZE, "0x%016llx\n", *mask) : -EINVAL;
+	return mask ? sysfs_emit(buf, "0x%016llx\n", *mask) : -EINVAL;
 }
 
 static ssize_t arm_ccn_pmu_cmp_mask_store(struct device *dev,
@@ -1544,6 +1544,7 @@ static struct platform_driver arm_ccn_driver = {
 	.driver = {
 		.name = "arm-ccn",
 		.of_match_table = arm_ccn_match,
+		.suppress_bind_attrs = true,
 	},
 	.probe = arm_ccn_probe,
 	.remove = arm_ccn_remove,

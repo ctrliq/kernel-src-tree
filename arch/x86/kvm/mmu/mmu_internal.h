@@ -38,6 +38,7 @@ struct kvm_mmu_page {
 	struct list_head link;
 	struct hlist_node hash_link;
 
+	bool tdp_mmu_page;
 	bool unsync;
 	u8 mmu_valid_gen;
 	bool lpage_disallowed; /* Can't be replaced by an equiv large page */
@@ -74,7 +75,6 @@ struct kvm_mmu_page {
 	atomic_t write_flooding_count;
 
 #ifdef CONFIG_X86_64
-	bool tdp_mmu_page;
 
 	/* Used for freeing the page asyncronously if it is a TDP MMU page. */
 	struct rcu_head rcu_head;

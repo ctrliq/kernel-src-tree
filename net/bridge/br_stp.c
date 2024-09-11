@@ -1,14 +1,10 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
  *	Spanning tree protocol; generic parts
  *	Linux ethernet bridge
  *
  *	Authors:
  *	Lennert Buytenhek		<buytenh@gnu.org>
- *
- *	This program is free software; you can redistribute it and/or
- *	modify it under the terms of the GNU General Public License
- *	as published by the Free Software Foundation; either version
- *	2 of the License, or (at your option) any later version.
  */
 #include <linux/kernel.h>
 #include <linux/rculist.h>
@@ -47,7 +43,7 @@ void br_set_state(struct net_bridge_port *p, unsigned int state)
 		return;
 
 	p->state = state;
-	err = switchdev_port_attr_set(p->dev, &attr);
+	err = switchdev_port_attr_set(p->dev, &attr, NULL);
 	if (err && err != -EOPNOTSUPP)
 		br_warn(p->br, "error setting offload STP state on port %u(%s)\n",
 				(unsigned int) p->port_no, p->dev->name);
@@ -609,7 +605,7 @@ int __set_ageing_time(struct net_device *dev, unsigned long t)
 	};
 	int err;
 
-	err = switchdev_port_attr_set(dev, &attr);
+	err = switchdev_port_attr_set(dev, &attr, NULL);
 	if (err && err != -EOPNOTSUPP)
 		return err;
 
@@ -619,8 +615,8 @@ int __set_ageing_time(struct net_device *dev, unsigned long t)
 /* Set time interval that dynamic forwarding entries live
  * For pure software bridge, allow values outside the 802.1
  * standard specification for special cases:
- *  0 - entry never ages (all permanant)
- *  1 - entry disappears (no persistance)
+ *  0 - entry never ages (all permanent)
+ *  1 - entry disappears (no persistence)
  *
  * Offloaded switch entries maybe more restrictive
  */
@@ -643,9 +639,9 @@ int br_set_ageing_time(struct net_bridge *br, clock_t ageing_time)
 	return 0;
 }
 
-clock_t br_get_ageing_time(struct net_device *br_dev)
+clock_t br_get_ageing_time(const struct net_device *br_dev)
 {
-	struct net_bridge *br;
+	const struct net_bridge *br;
 
 	if (!netif_is_bridge_master(br_dev))
 		return 0;

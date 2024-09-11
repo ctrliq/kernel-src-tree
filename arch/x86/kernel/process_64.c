@@ -138,7 +138,7 @@ void __show_regs(struct pt_regs *regs, enum show_regs_mode mode)
 		       d3, d6, d7);
 	}
 
-	if (boot_cpu_has(X86_FEATURE_OSPKE))
+	if (cpu_feature_enabled(X86_FEATURE_OSPKE))
 		printk(KERN_DEFAULT "PKRU: %08x\n", read_pkru());
 }
 
@@ -357,21 +357,21 @@ static __always_inline void load_seg_legacy(unsigned short prev_index,
  * lookup in the task's FPU xsave buffer and require to keep that updated
  * in various places.
  */
-static __always_inline void x86_pkru_load(struct thread_struct *prev,
-					  struct thread_struct *next)
+static __always_inline void x86_pkru_load(struct task_struct *prev_ts,
+					  struct task_struct *next_ts)
 {
 	if (!cpu_feature_enabled(X86_FEATURE_OSPKE))
 		return;
 
 	/* Stash the prev task's value: */
-	prev->pkru = rdpkru();
+	prev_ts->task_struct_rh->pkru = rdpkru();
 
 	/*
 	 * PKRU writes are slightly expensive.  Avoid them when not
 	 * strictly necessary:
 	 */
-	if (prev->pkru != next->pkru)
-		wrpkru(next->pkru);
+	if (prev_ts->task_struct_rh->pkru != next_ts->task_struct_rh->pkru)
+		wrpkru(next_ts->task_struct_rh->pkru);
 }
 
 static __always_inline void x86_fsgsbase_load(struct thread_struct *prev,
@@ -624,7 +624,7 @@ __switch_to(struct task_struct *prev_p, struct task_struct *next_p)
 
 	x86_fsgsbase_load(prev, next);
 
-	x86_pkru_load(prev, next);
+	x86_pkru_load(prev_p, next_p);
 
 	/*
 	 * Switch the PDA and FPU contexts.

@@ -741,7 +741,7 @@ static void init_vp_index(struct vmbus_channel *channel)
 	u32 i, ncpu = num_online_cpus();
 	cpumask_var_t available_mask;
 	struct cpumask *alloced_mask;
-	u32 target_cpu;
+	u32 target_cpu = 0;
 	int numa_node;
 
 	if ((vmbus_proto_version == VERSION_WS2008) ||

@@ -382,6 +382,12 @@ int __sk_backlog_rcv(struct sock *sk, struct sk_buff *skb)
 }
 EXPORT_SYMBOL(__sk_backlog_rcv);
 
+void sk_error_report(struct sock *sk)
+{
+	sk->sk_error_report(sk);
+}
+EXPORT_SYMBOL(sk_error_report);
+
 static int sock_get_timeout(long timeo, void *optval)
 {
 	struct __kernel_old_timeval tv;

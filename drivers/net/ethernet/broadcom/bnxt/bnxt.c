@@ -621,7 +621,7 @@ tx_dma_error:
 	tx_buf = &txr->tx_buf_ring[prod];
 	tx_buf->skb = NULL;
 	dma_unmap_single(&pdev->dev, dma_unmap_addr(tx_buf, mapping),
-			 skb_headlen(skb), DMA_TO_DEVICE);
+			 skb_headlen(skb), PCI_DMA_TODEVICE);
 	prod = NEXT_TX(prod);
 
 	/* unmap remaining mapped pages */
@@ -630,7 +630,7 @@ tx_dma_error:
 		tx_buf = &txr->tx_buf_ring[prod];
 		dma_unmap_page(&pdev->dev, dma_unmap_addr(tx_buf, mapping),
 			       skb_frag_size(&skb_shinfo(skb)->frags[i]),
-			       DMA_TO_DEVICE);
+			       PCI_DMA_TODEVICE);
 	}
 
 	dev_kfree_skb_any(skb);
@@ -662,7 +662,7 @@ static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
 		}
 
 		dma_unmap_single(&pdev->dev, dma_unmap_addr(tx_buf, mapping),
-				 skb_headlen(skb), DMA_TO_DEVICE);
+				 skb_headlen(skb), PCI_DMA_TODEVICE);
 		last = tx_buf->nr_frags;
 
 		for (j = 0; j < last; j++) {
@@ -672,7 +672,7 @@ static void bnxt_tx_int(struct bnxt *bp, struct bnxt_napi *bnapi, int nr_pkts)
 				&pdev->dev,
 				dma_unmap_addr(tx_buf, mapping),
 				skb_frag_size(&skb_shinfo(skb)->frags[j]),
-				DMA_TO_DEVICE);
+				PCI_DMA_TODEVICE);
 		}
 
 next_tx_int:
@@ -841,7 +841,7 @@ static inline int bnxt_alloc_rx_page(struct bnxt *bp,
 	}
 
 	mapping = dma_map_page_attrs(&pdev->dev, page, offset,
-				     BNXT_RX_PAGE_SIZE, DMA_FROM_DEVICE,
+				     BNXT_RX_PAGE_SIZE, PCI_DMA_FROMDEVICE,
 				     DMA_ATTR_WEAK_ORDERING);
 	if (dma_mapping_error(&pdev->dev, mapping)) {
 		__free_page(page);
@@ -1081,7 +1081,7 @@ static struct sk_buff *bnxt_rx_pages(struct bnxt *bp,
 		}
 
 		dma_unmap_page_attrs(&pdev->dev, mapping, BNXT_RX_PAGE_SIZE,
-				     DMA_FROM_DEVICE,
+				     PCI_DMA_FROMDEVICE,
 				     DMA_ATTR_WEAK_ORDERING);
 
 		skb->data_len += frag_len;
@@ -2598,7 +2598,7 @@ static void bnxt_free_tx_skbs(struct bnxt *bp)
 				dma_unmap_single(&pdev->dev,
 					dma_unmap_addr(tx_buf, mapping),
 					dma_unmap_len(tx_buf, len),
-					DMA_TO_DEVICE);
+					PCI_DMA_TODEVICE);
 				xdp_return_frame(tx_buf->xdpf);
 				tx_buf->action = 0;
 				tx_buf->xdpf = NULL;
@@ -2623,7 +2623,7 @@ static void bnxt_free_tx_skbs(struct bnxt *bp)
 			dma_unmap_single(&pdev->dev,
 					 dma_unmap_addr(tx_buf, mapping),
 					 skb_headlen(skb),
-					 DMA_TO_DEVICE);
+					 PCI_DMA_TODEVICE);
 
 			last = tx_buf->nr_frags;
 			j += 2;
@@ -2635,7 +2635,7 @@ static void bnxt_free_tx_skbs(struct bnxt *bp)
 				dma_unmap_page(
 					&pdev->dev,
 					dma_unmap_addr(tx_buf, mapping),
-					skb_frag_size(frag), DMA_TO_DEVICE);
+					skb_frag_size(frag), PCI_DMA_TODEVICE);
 			}
 			dev_kfree_skb(skb);
 		}
@@ -2702,7 +2702,7 @@ skip_rx_tpa_free:
 			continue;
 
 		dma_unmap_page_attrs(&pdev->dev, rx_agg_buf->mapping,
-				     BNXT_RX_PAGE_SIZE, DMA_FROM_DEVICE,
+				     BNXT_RX_PAGE_SIZE, PCI_DMA_FROMDEVICE,
 				     DMA_ATTR_WEAK_ORDERING);
 
 		rx_agg_buf->page = NULL;

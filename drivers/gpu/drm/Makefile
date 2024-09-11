@@ -128,4 +128,3 @@ obj-$(CONFIG_DRM_ASPEED_GFX) += aspeed/
 
 # Enable shims for the RHEL DRM backport
 subdir-ccflags-y += -DRH_DRM_BACKPORT
-drm-y += drm_backport.o

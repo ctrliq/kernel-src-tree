@@ -11,16 +11,30 @@
 #define MRP_DOMAIN_UUID_LENGTH		16
 #define MRP_VERSION			1
 #define MRP_FRAME_PRIO			7
+#define MRP_OUI_LENGTH			3
+#define MRP_MANUFACTURE_DATA_LENGTH	2
 
 enum br_mrp_ring_role_type {
 	BR_MRP_RING_ROLE_DISABLED,
 	BR_MRP_RING_ROLE_MRC,
 	BR_MRP_RING_ROLE_MRM,
+	BR_MRP_RING_ROLE_MRA,
+};
+
+enum br_mrp_in_role_type {
+	BR_MRP_IN_ROLE_DISABLED,
+	BR_MRP_IN_ROLE_MIC,
+	BR_MRP_IN_ROLE_MIM,
 };
 
 enum br_mrp_ring_state_type {
 	BR_MRP_RING_STATE_OPEN,
 	BR_MRP_RING_STATE_CLOSED,
+};
+
+enum br_mrp_in_state_type {
+	BR_MRP_IN_STATE_OPEN,
+	BR_MRP_IN_STATE_CLOSED,
 };
 
 enum br_mrp_port_state_type {
@@ -33,6 +47,7 @@ enum br_mrp_port_state_type {
 enum br_mrp_port_role_type {
 	BR_MRP_PORT_ROLE_PRIMARY,
 	BR_MRP_PORT_ROLE_SECONDARY,
+	BR_MRP_PORT_ROLE_INTER,
 };
 
 enum br_mrp_tlv_header_type {
@@ -42,42 +57,18 @@ enum br_mrp_tlv_header_type {
 	BR_MRP_TLV_HEADER_RING_TOPO = 0x3,
 	BR_MRP_TLV_HEADER_RING_LINK_DOWN = 0x4,
 	BR_MRP_TLV_HEADER_RING_LINK_UP = 0x5,
+	BR_MRP_TLV_HEADER_IN_TEST = 0x6,
+	BR_MRP_TLV_HEADER_IN_TOPO = 0x7,
+	BR_MRP_TLV_HEADER_IN_LINK_DOWN = 0x8,
+	BR_MRP_TLV_HEADER_IN_LINK_UP = 0x9,
+	BR_MRP_TLV_HEADER_IN_LINK_STATUS = 0xa,
+	BR_MRP_TLV_HEADER_OPTION = 0x7f,
 };
 
-struct br_mrp_tlv_hdr {
-	__u8 type;
-	__u8 length;
-};
-
-struct br_mrp_end_hdr {
-	struct br_mrp_tlv_hdr hdr;
-};
-
-struct br_mrp_common_hdr {
-	__be16 seq_id;
-	__u8 domain[MRP_DOMAIN_UUID_LENGTH];
-};
-
-struct br_mrp_ring_test_hdr {
-	__be16 prio;
-	__u8 sa[ETH_ALEN];
-	__be16 port_role;
-	__be16 state;
-	__be16 transitions;
-	__be32 timestamp;
-};
-
-struct br_mrp_ring_topo_hdr {
-	__be16 prio;
-	__u8 sa[ETH_ALEN];
-	__be16 interval;
-};
-
-struct br_mrp_ring_link_hdr {
-	__u8 sa[ETH_ALEN];
-	__be16 port_role;
-	__be16 interval;
-	__be16 blocked;
+enum br_mrp_sub_tlv_header_type {
+	BR_MRP_SUB_TLV_HEADER_TEST_MGR_NACK = 0x1,
+	BR_MRP_SUB_TLV_HEADER_TEST_PROPAGATE = 0x2,
+	BR_MRP_SUB_TLV_HEADER_TEST_AUTO_MGR = 0x3,
 };
 
 #endif

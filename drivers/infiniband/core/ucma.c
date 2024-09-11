@@ -1833,7 +1833,7 @@ MODULE_ALIAS_RDMA_CLIENT("rdma_cm");
 static ssize_t abi_version_show(struct device *dev,
 				struct device_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", RDMA_USER_CM_ABI_VERSION);
+	return sysfs_emit(buf, "%d\n", RDMA_USER_CM_ABI_VERSION);
 }
 static DEVICE_ATTR_RO(abi_version);
 

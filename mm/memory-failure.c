@@ -62,6 +62,8 @@
 #include "internal.h"
 #include "ras/ras_event.h"
 
+#include <linux/rh_tasklist_lock.h>
+
 int sysctl_memory_failure_early_kill __read_mostly = 0;
 
 int sysctl_memory_failure_recovery __read_mostly = 1;

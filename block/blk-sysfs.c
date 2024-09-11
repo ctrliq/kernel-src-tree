@@ -60,7 +60,7 @@ static ssize_t queue_var_store64(s64 *var, const char *page)
 
 static ssize_t queue_requests_show(struct request_queue *q, char *page)
 {
-	return queue_var_show(q->nr_requests, (page));
+	return queue_var_show(q->nr_requests, page);
 }
 
 static ssize_t
@@ -286,6 +286,11 @@ queue_store_unpriv_sgio(struct request_queue *q, const char *page, size_t count)
 	else
 		blk_queue_flag_clear(QUEUE_FLAG_UNPRIV_SGIO, q);
 	return ret;
+}
+
+static ssize_t queue_virt_boundary_mask_show(struct request_queue *q, char *page)
+{
+	return queue_var_show(q->limits.virt_boundary_mask, (page));
 }
 
 #define QUEUE_SYSFS_BIT_FNS(name, flag, neg)				\
@@ -779,6 +784,11 @@ static struct queue_sysfs_entry throtl_sample_time_entry = {
 };
 #endif
 
+static struct queue_sysfs_entry queue_virt_boundary_mask_entry = {
+	.attr = {.name = "virt_boundary_mask", .mode = 0444 },
+	.show = queue_virt_boundary_mask_show,
+};
+
 static struct attribute *default_attrs[] = {
 	&queue_requests_entry.attr,
 	&queue_ra_entry.attr,
@@ -820,6 +830,7 @@ static struct attribute *default_attrs[] = {
 #ifdef CONFIG_BLK_DEV_THROTTLING_LOW
 	&throtl_sample_time_entry.attr,
 #endif
+	&queue_virt_boundary_mask_entry.attr,
 	NULL,
 };
 

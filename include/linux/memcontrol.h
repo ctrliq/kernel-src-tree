@@ -88,11 +88,28 @@ enum mem_cgroup_events_target {
 	MEM_CGROUP_NTARGETS,
 };
 
-struct RH_KABI_RENAME(mem_cgroup_stat_cpu, memcg_vmstats_percpu) {
-	long RH_KABI_RENAME(count, stat)[MEMCG_NR_STAT];
-	unsigned long events[NR_VM_EVENT_ITEMS];
-	unsigned long nr_page_events;
-	unsigned long targets[MEM_CGROUP_NTARGETS];
+struct memcg_vmstats_percpu {
+	/* Local (CPU and cgroup) page state & events */
+	long			state[MEMCG_NR_STAT];
+	unsigned long		events[NR_VM_EVENT_ITEMS];
+
+	/* Delta calculation for lockless upward propagation */
+	long			state_prev[MEMCG_NR_STAT];
+	unsigned long		events_prev[NR_VM_EVENT_ITEMS];
+
+	/* Cgroup1: threshold notifications & softlimit tree updates */
+	unsigned long		nr_page_events;
+	unsigned long		targets[MEM_CGROUP_NTARGETS];
+};
+
+struct memcg_vmstats {
+	/* Aggregated (CPU and subtree) page state & events */
+	long			state[MEMCG_NR_STAT];
+	unsigned long		events[NR_VM_EVENT_ITEMS];
+
+	/* Pending child counts during tree propagation */
+	long			state_pending[MEMCG_NR_STAT];
+	unsigned long		events_pending[NR_VM_EVENT_ITEMS];
 };
 
 struct mem_cgroup_reclaim_iter {
@@ -110,12 +127,13 @@ struct batched_lruvec_stat {
 };
 
 /*
- * Bitmap of shrinker::id corresponding to memcg-aware shrinkers,
- * which have elements charged to this memcg.
+ * Bitmap and deferred work of shrinker::id corresponding to memcg-aware
+ * shrinkers, which have elements charged to this memcg.
  */
-struct memcg_shrinker_map {
+struct shrinker_info {
 	struct rcu_head rcu;
-	unsigned long RH_KABI_RENAME(map[0], map[]);
+	atomic_long_t *nr_deferred;
+	unsigned long *map;
 };
 
 /*
@@ -154,7 +172,7 @@ struct mem_cgroup_per_node {
 	 * RHEL8: The mem_cgroup_per_node is dynamically allocated at
 	 * boot time and so is perfectly fine to be extended in size.
 	 */
-	RH_KABI_EXTEND(struct memcg_shrinker_map __rcu	*shrinker_map)
+	RH_KABI_EXTEND(struct shrinker_info __rcu	*shrinker_info)
 };
 
 struct mem_cgroup_threshold {
@@ -260,6 +278,9 @@ struct obj_cgroup {
  *    follows the arrays.
  *  - vm_event_item: NR_VM_EVENT_ITEMS used in vmevents[] of memcg.
  */
+#ifdef __GENKSYMS__
+#include "rh_kabi_memcg.h"
+#else
 struct mem_cgroup {
 	struct cgroup_subsys_state css;
 
@@ -269,13 +290,6 @@ struct mem_cgroup {
 	/* Accounted resources */
 	struct page_counter memory;		/* Both v1 & v2 */
 
-#ifdef __GENKSYMS__
-	struct page_counter swap;
-	struct page_counter memsw;
-	struct page_counter kmem;
-	struct page_counter tcpmem;
-	RH_KABI_DEPRECATE(unsigned long, high)
-#else
 	struct page_counter tcpmem;		/* v1 only */
 	union {
 		struct page_counter swap;	/* v2 only */
@@ -284,7 +298,6 @@ struct mem_cgroup {
 
 	/* Legacy consumer-oriented counters */
 	struct page_counter kmem;		/* v1 only */
-#endif
 
 	/* Range enforcement for interrupt charges */
 	struct work_struct high_work;
@@ -294,17 +307,13 @@ struct mem_cgroup {
 	/* vmpressure notifications */
 	struct vmpressure vmpressure;
 
-	RH_KABI_DEPRECATE(bool, use_hierarchy)
-
-	/* protected by memcg_oom_lock */
-	bool		oom_lock;
-
 	/*
 	 * Should the OOM killer kill all belonging tasks, had it kill one?
 	 */
-	RH_KABI_FILL_HOLE(bool oom_group)
+	bool oom_group;
 
 	/* protected by memcg_oom_lock */
+	bool		oom_lock;
 	int		under_oom;
 
 	int	swappiness;
@@ -313,7 +322,7 @@ struct mem_cgroup {
 
 	/* memory.events and memory.events.local */
 	struct cgroup_file events_file;
-	RH_KABI_BROKEN_INSERT(struct cgroup_file events_local_file)
+	struct cgroup_file events_local_file;
 
 	/* handle for "memory.swap.events" */
 	struct cgroup_file swap_events_file;
@@ -341,25 +350,12 @@ struct mem_cgroup {
 
 	MEMCG_PADDING(_pad1_);
 
-	/*
-	 * set > 0 if pages under this cgroup are moving to other cgroup.
-	 */
-	atomic_t		moving_account;
-	struct task_struct	*move_lock_task;
+	/* memory.stat */
+	struct memcg_vmstats	vmstats;
 
-	/* Subtree VM stats and events (batched updates) */
-	struct RH_KABI_RENAME(mem_cgroup_stat_cpu, memcg_vmstats_percpu)
-		__percpu *RH_KABI_RENAME(stat_cpu, vmstats_percpu);
-
-	/* Legacy local VM stats and events */
-	RH_KABI_FILL_HOLE(struct memcg_vmstats_percpu __percpu *vmstats_local)
-
-	MEMCG_PADDING(_pad2_);
-
-	atomic_long_t		RH_KABI_RENAME(stat, vmstats)[MEMCG_NR_STAT];
-	atomic_long_t		RH_KABI_RENAME(events, vmevents)[NR_VM_EVENT_ITEMS];
+	/* memory.events */
 	atomic_long_t		memory_events[MEMCG_NR_MEMORY_EVENTS];
-	RH_KABI_BROKEN_INSERT(atomic_long_t memory_events_local[MEMCG_NR_MEMORY_EVENTS])
+	atomic_long_t		memory_events_local[MEMCG_NR_MEMORY_EVENTS];
 
 	unsigned long		socket_pressure;
 
@@ -370,20 +366,24 @@ struct mem_cgroup {
 #ifdef CONFIG_MEMCG_KMEM
 	int kmemcg_id;
 	enum memcg_kmem_state kmem_state;
-	RH_KABI_DEPRECATE(struct list_head, kmem_caches)
+	struct obj_cgroup __rcu *objcg;
+	struct list_head objcg_list; /* list of inherited objcgs */
 #endif
-	RH_KABI_REPLACE_SPLIT(int		last_scanned_node;
-			      nodemask_t	scan_nodes;
-			      atomic_t		numainfo_events;
-			      atomic_t		numainfo_updating,
 
-			      struct obj_cgroup __rcu *objcg,
-			      /* list of inherited objcgs */
-			      struct list_head	objcg_list)
+	MEMCG_PADDING(_pad2_);
+
+	/*
+	 * set > 0 if pages under this cgroup are moving to other cgroup.
+	 */
+	atomic_t		moving_account;
+	struct task_struct	*move_lock_task;
+
+	struct memcg_vmstats_percpu __percpu *vmstats_percpu;
+
 #ifdef CONFIG_CGROUP_WRITEBACK
 	struct list_head cgwb_list;
 	struct wb_domain cgwb_domain;
-	RH_KABI_BROKEN_INSERT(struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT])
+	struct memcg_cgwb_frn cgwb_frn[MEMCG_CGWB_FRN_CNT];
 #endif
 
 	/* List of events which userspace want to receive */
@@ -391,12 +391,12 @@ struct mem_cgroup {
 	spinlock_t event_list_lock;
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE
-	RH_KABI_BROKEN_INSERT(struct deferred_split deferred_split_queue)
+	struct deferred_split deferred_split_queue;
 #endif
-	RH_KABI_BROKEN_INSERT(MEMCG_PADDING(_pad3_))
-	struct mem_cgroup_per_node *nodeinfo[0];
-	/* WARNING: nodeinfo must be the last member here */
+
+	struct mem_cgroup_per_node *nodeinfo[];
 };
+#endif /* __GENKSYMS__ */
 
 /*
  * size of first charge trial. "32" comes from vmscan.c's magic value.
@@ -793,22 +793,6 @@ static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page)
 	return mem_cgroup_lruvec(memcg, pgdat);
 }
 
-static inline bool lruvec_holds_page_lru_lock(struct page *page,
-					      struct lruvec *lruvec)
-{
-	pg_data_t *pgdat = page_pgdat(page);
-	const struct mem_cgroup *memcg;
-	struct mem_cgroup_per_node *mz;
-
-	if (mem_cgroup_disabled())
-		return lruvec == &pgdat->__lruvec;
-
-	mz = container_of(lruvec, struct mem_cgroup_per_node, lruvec);
-	memcg = page_memcg(page) ? : root_mem_cgroup;
-
-	return lruvec->pgdat == pgdat && mz->memcg == memcg;
-}
-
 struct mem_cgroup *mem_cgroup_from_task(struct task_struct *p);
 
 struct mem_cgroup *get_mem_cgroup_from_mm(struct mm_struct *mm);
@@ -989,7 +973,7 @@ void mem_cgroup_print_oom_group(struct mem_cgroup *memcg);
 extern bool cgroup_memory_noswap;
 #endif
 
-void lock_page_memcg(struct page *page);
+struct mem_cgroup *lock_page_memcg(struct page *page);
 void unlock_page_memcg(struct page *page);
 
 void __mod_memcg_state(struct mem_cgroup *memcg, int idx, int val);
@@ -1066,10 +1050,6 @@ static inline void mod_memcg_lruvec_state(struct lruvec *lruvec,
 	__mod_memcg_lruvec_state(lruvec, idx, val);
 	local_irq_restore(flags);
 }
-
-unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
-						gfp_t gfp_mask,
-						unsigned long *total_scanned);
 
 void __count_memcg_events(struct mem_cgroup *memcg, enum vm_event_item idx,
 			  unsigned long count);
@@ -1150,6 +1130,10 @@ static inline void memcg_memory_event_mm(struct mm_struct *mm,
 }
 
 void split_page_memcg(struct page *head, unsigned int nr);
+
+unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+						gfp_t gfp_mask,
+						unsigned long *total_scanned);
 
 #else /* CONFIG_MEMCG */
 
@@ -1261,12 +1245,8 @@ static inline struct lruvec *mem_cgroup_page_lruvec(struct page *page)
 	return &pgdat->__lruvec;
 }
 
-static inline bool lruvec_holds_page_lru_lock(struct page *page,
-					      struct lruvec *lruvec)
+static inline void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
 {
-	pg_data_t *pgdat = page_pgdat(page);
-
-	return lruvec == &pgdat->__lruvec;
 }
 
 static inline struct mem_cgroup *parent_mem_cgroup(struct mem_cgroup *memcg)
@@ -1387,8 +1367,9 @@ mem_cgroup_print_oom_meminfo(struct mem_cgroup *memcg)
 {
 }
 
-static inline void lock_page_memcg(struct page *page)
+static inline struct mem_cgroup *lock_page_memcg(struct page *page)
 {
+	return NULL;
 }
 
 static inline void unlock_page_memcg(struct page *page)
@@ -1472,18 +1453,6 @@ static inline void mod_lruvec_kmem_state(void *p, enum node_stat_item idx,
 	mod_node_page_state(page_pgdat(page), idx, val);
 }
 
-static inline
-unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
-					    gfp_t gfp_mask,
-					    unsigned long *total_scanned)
-{
-	return 0;
-}
-
-static inline void split_page_memcg(struct page *head, unsigned int nr)
-{
-}
-
 static inline void count_memcg_events(struct mem_cgroup *memcg,
 				      enum vm_event_item idx,
 				      unsigned long count)
@@ -1506,8 +1475,16 @@ void count_memcg_event_mm(struct mm_struct *mm, enum vm_event_item idx)
 {
 }
 
-static inline void lruvec_memcg_debug(struct lruvec *lruvec, struct page *page)
+static inline void split_page_memcg(struct page *head, unsigned int nr)
 {
+}
+
+static inline
+unsigned long mem_cgroup_soft_limit_reclaim(pg_data_t *pgdat, int order,
+					    gfp_t gfp_mask,
+					    unsigned long *total_scanned)
+{
+	return 0;
 }
 #endif /* CONFIG_MEMCG */
 
@@ -1550,12 +1527,19 @@ static inline void unlock_page_lruvec_irqrestore(struct lruvec *lruvec,
 	spin_unlock_irqrestore(&lruvec->lru_lock, flags);
 }
 
+/* Test requires a stable page->memcg binding, see page_memcg() */
+static inline bool page_matches_lruvec(struct page *page, struct lruvec *lruvec)
+{
+	return lruvec_pgdat(lruvec) == page_pgdat(page) &&
+	       lruvec_memcg(lruvec) == page_memcg(page);
+}
+
 /* Don't lock again iff page's lruvec locked */
 static inline struct lruvec *relock_page_lruvec_irq(struct page *page,
 		struct lruvec *locked_lruvec)
 {
 	if (locked_lruvec) {
-		if (lruvec_holds_page_lru_lock(page, locked_lruvec))
+		if (page_matches_lruvec(page, locked_lruvec))
 			return locked_lruvec;
 
 		unlock_page_lruvec_irq(locked_lruvec);
@@ -1569,7 +1553,7 @@ static inline struct lruvec *relock_page_lruvec_irqsave(struct page *page,
 		struct lruvec *locked_lruvec, unsigned long *flags)
 {
 	if (locked_lruvec) {
-		if (lruvec_holds_page_lru_lock(page, locked_lruvec))
+		if (page_matches_lruvec(page, locked_lruvec))
 			return locked_lruvec;
 
 		unlock_page_lruvec_irqrestore(locked_lruvec, *flags);
@@ -1645,8 +1629,8 @@ static inline bool mem_cgroup_under_socket_pressure(struct mem_cgroup *memcg)
 	return false;
 }
 
-int alloc_shrinker_maps(struct mem_cgroup *memcg);
-void free_shrinker_maps(struct mem_cgroup *memcg);
+int alloc_shrinker_info(struct mem_cgroup *memcg);
+void free_shrinker_info(struct mem_cgroup *memcg);
 void set_shrinker_bit(struct mem_cgroup *memcg, int nid, int shrinker_id);
 void reparent_shrinker_deferred(struct mem_cgroup *memcg);
 #else
@@ -1665,6 +1649,7 @@ static inline void set_shrinker_bit(struct mem_cgroup *memcg,
 #endif
 
 #ifdef CONFIG_MEMCG_KMEM
+bool mem_cgroup_kmem_disabled(void);
 int __memcg_kmem_charge_page(struct page *page, gfp_t gfp, int order);
 void __memcg_kmem_uncharge_page(struct page *page, int order);
 
@@ -1718,6 +1703,10 @@ static inline int memcg_cache_id(struct mem_cgroup *memcg)
 struct mem_cgroup *mem_cgroup_from_obj(void *p);
 
 #else
+static inline bool mem_cgroup_kmem_disabled(void)
+{
+	return true;
+}
 
 static inline int memcg_kmem_charge_page(struct page *page, gfp_t gfp,
 					 int order)

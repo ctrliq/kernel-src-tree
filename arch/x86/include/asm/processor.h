@@ -510,15 +510,6 @@ struct thread_struct {
 	unsigned int		sig_on_uaccess_err:1;
 	unsigned int		uaccess_err:1;	/* uaccess failed */
 
-	/*
-	 * Protection Keys Register for Userspace.  Loaded immediately on
-	 * context switch. Store it in thread_struct to avoid a lookup in
-	 * the tasks's FPU xstate buffer. This value is only valid when a
-	 * task is scheduled out. For 'current' the authoritative source of
-	 * PKRU is the hardware itself.
-	 */
-	u32			pkru;
-
 	/* Floating point and extended processor state */
 	struct fpu		fpu;
 	/*
@@ -910,7 +901,8 @@ static inline uint32_t hypervisor_cpuid_base(const char *sig, uint32_t leaves)
 }
 
 extern unsigned long arch_align_stack(unsigned long sp);
-extern void free_init_pages(char *what, unsigned long begin, unsigned long end);
+void free_init_pages(const char *what, unsigned long begin, unsigned long end);
+extern void free_kernel_image_pages(const char *what, void *begin, void *end);
 
 void default_idle(void);
 #ifdef	CONFIG_XEN

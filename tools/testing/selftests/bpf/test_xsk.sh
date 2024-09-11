@@ -107,7 +107,7 @@ setup_vethPairs() {
 	        echo "setting up ${VETH0}: namespace: ${NS0}"
 	fi
 	ip netns add ${NS1}
-	ip link add ${VETH0} type veth peer name ${VETH1}
+	ip link add ${VETH0} numtxqueues 4 numrxqueues 4 type veth peer name ${VETH1} numtxqueues 4 numrxqueues 4
 	if [ -f /proc/net/if_inet6 ]; then
 		echo 1 > /proc/sys/net/ipv6/conf/${VETH0}/disable_ipv6
 	fi
@@ -118,6 +118,7 @@ setup_vethPairs() {
 	ip netns exec ${NS1} ip link set ${VETH1} mtu ${MTU}
 	ip link set ${VETH0} mtu ${MTU}
 	ip netns exec ${NS1} ip link set ${VETH1} up
+	ip netns exec ${NS1} ip link set dev lo up
 	ip link set ${VETH0} up
 }
 
@@ -152,117 +153,9 @@ test_status $retval "${TEST_NAME}"
 
 statusList=()
 
-### TEST 1
-TEST_NAME="XSK KSELFTEST FRAMEWORK"
+TEST_NAME="XSK KSELFTESTS"
 
-if [[ $verbose -eq 1 ]]; then
-        echo "Switching interfaces [${VETH0}, ${VETH1}] to XDP Generic mode"
-fi
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
-
-retval=$?
-if [ $retval -eq 0 ]; then
-        if [[ $verbose -eq 1 ]]; then
-	        echo "Switching interfaces [${VETH0}, ${VETH1}] to XDP Native mode"
-	fi
-	vethXDPnative ${VETH0} ${VETH1} ${NS1}
-fi
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 2
-TEST_NAME="SKB NOPOLL"
-
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
-
-params=("-S")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 3
-TEST_NAME="SKB POLL"
-
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
-
-params=("-S" "-p")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 4
-TEST_NAME="DRV NOPOLL"
-
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
-
-params=("-N")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 5
-TEST_NAME="DRV POLL"
-
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
-
-params=("-N" "-p")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 6
-TEST_NAME="SKB SOCKET TEARDOWN"
-
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
-
-params=("-S" "-T")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 7
-TEST_NAME="DRV SOCKET TEARDOWN"
-
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
-
-params=("-N" "-T")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 8
-TEST_NAME="SKB BIDIRECTIONAL SOCKETS"
-
-vethXDPgeneric ${VETH0} ${VETH1} ${NS1}
-
-params=("-S" "-B")
-execxdpxceiver params
-
-retval=$?
-test_status $retval "${TEST_NAME}"
-statusList+=($retval)
-
-### TEST 9
-TEST_NAME="DRV BIDIRECTIONAL SOCKETS"
-
-vethXDPnative ${VETH0} ${VETH1} ${NS1}
-
-params=("-N" "-B")
-execxdpxceiver params
+execxdpxceiver
 
 retval=$?
 test_status $retval "${TEST_NAME}"

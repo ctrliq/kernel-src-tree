@@ -64,10 +64,11 @@ efi_status_t handle_kernel_image(efi_system_table_t *sys_table_arg,
 						      sizeof(phys_seed),
 						      (u8 *)&phys_seed);
 			if (status == EFI_NOT_FOUND) {
-				pr_efi(sys_table_arg, "EFI_RNG_PROTOCOL unavailable, no randomness supplied\n");
+				pr_efi(sys_table_arg, "EFI_RNG_PROTOCOL unavailable\n");
+				set_nokaslr(1);
 			} else if (status != EFI_SUCCESS) {
 				pr_efi_err(sys_table_arg, "efi_get_random_bytes() failed\n");
-				return status;
+				set_nokaslr(1);
 			}
 		} else {
 			pr_efi(sys_table_arg, "KASLR disabled on kernel command line\n");
@@ -83,9 +84,14 @@ efi_status_t handle_kernel_image(efi_system_table_t *sys_table_arg,
 	if (preferred_offset < dram_base)
 		preferred_offset += MIN_KIMG_ALIGN;
 
-	if (!IS_ALIGNED((u64)_text, EFI_KIMG_ALIGN))
-		efi_err("FIRMWARE BUG: kernel image not aligned on %ldk boundary\n",
-			EFI_KIMG_ALIGN >> 10);
+	BUILD_BUG_ON(EFI_KIMG_ALIGN != SZ_64K && EFI_KIMG_ALIGN != SZ_64K * 2);
+
+	if (!IS_ALIGNED((u64)_text, EFI_KIMG_ALIGN)) {
+		if (EFI_KIMG_ALIGN == SZ_64K)
+			pr_efi_err(sys_table_arg, "FIRMWARE BUG: kernel image not aligned on 64k boundary\n");
+		else
+			pr_efi_err(sys_table_arg, "FIRMWARE BUG: kernel image not aligned on 128k boundary\n");
+	}
 
 	kernel_size = _edata - _text;
 	kernel_memsize = kernel_size + (_end - _edata);

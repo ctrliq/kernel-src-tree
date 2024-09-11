@@ -32,3 +32,14 @@ obj-$(CONFIG_QUEUED_RWLOCKS) += qrwlock.o
 obj-$(CONFIG_LOCK_TORTURE_TEST) += locktorture.o
 obj-$(CONFIG_WW_MUTEX_SELFTEST) += test-ww_mutex.o
 obj-$(CONFIG_LOCK_EVENT_COUNTS) += lock_events.o
+
+#
+# Generate RHEL8 specific file for __init_rwsem() function to perserve kABI.
+#
+$(src)/rwsem_init.c: $(src)/rwsem.c
+	@(echo "#include <linux/sched/signal.h>";	\
+	  echo "#include <linux/rwsem.h>";		\
+	  echo "#ifndef CONFIG_PREEMPT_RT") >> $(src)/rwsem_init.c
+	@sed -n -e "/^void __init_rwsem(/,/^EXPORT_SYMBOL(__init_rwsem)/p" \
+		-e "/^EXPORT_SYMBOL(__init_rwsem)/q" $(src)/rwsem.c >> $(src)/rwsem_init.c
+	@echo "#endif" >> $(src)/rwsem_init.c

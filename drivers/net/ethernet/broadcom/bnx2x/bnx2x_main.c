@@ -12300,8 +12300,8 @@ static void bnx2x_read_fwinfo(struct bnx2x *bp)
 		goto out_not_found;
 
 	/* vendor specific info */
-	snprintf(str_id, VENDOR_ID_LEN + 1, "%04X", PCI_VENDOR_ID_DELL);
-	if (!strncmp(str_id, &vpd_data[rodi], VENDOR_ID_LEN)) {
+	snprintf(str_id, VENDOR_ID_LEN + 1, "%04x", PCI_VENDOR_ID_DELL);
+	if (!strncasecmp(str_id, &vpd_data[rodi], VENDOR_ID_LEN)) {
 		rodi = pci_vpd_find_ro_info_keyword(vpd_data, vpd_len,
 						    PCI_VPD_RO_KEYWORD_VENDOR0,
 						    &kw_len);

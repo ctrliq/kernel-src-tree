@@ -191,6 +191,7 @@ struct sctp_sock {
 	 * will be inherited by all new associations.
 	 */
 	__u32 hbinterval;
+	__u32 probe_interval;
 
 	__be16 udp_port;
 	__be16 encap_port;
@@ -884,6 +885,7 @@ struct sctp_transport {
 	 * the destination address every heartbeat interval.
 	 */
 	unsigned long hbinterval;
+	unsigned long probe_interval;
 
 	/* SACK delay timeout */
 	unsigned long sackdelay;
@@ -1006,6 +1008,7 @@ struct sctp_transport {
 	} cacc;
 
 	struct {
+		__u32 last_rtx_chunks;
 		__u16 pmtu;
 		__u16 probe_size;
 		__u16 probe_high;
@@ -1046,8 +1049,8 @@ bool sctp_transport_update_pmtu(struct sctp_transport *t, u32 pmtu);
 void sctp_transport_immediate_rtx(struct sctp_transport *);
 void sctp_transport_dst_release(struct sctp_transport *t);
 void sctp_transport_dst_confirm(struct sctp_transport *t);
-void sctp_transport_pl_send(struct sctp_transport *t);
-void sctp_transport_pl_recv(struct sctp_transport *t);
+bool sctp_transport_pl_send(struct sctp_transport *t);
+bool sctp_transport_pl_recv(struct sctp_transport *t);
 
 
 /* This is the structure we use to queue packets as they come into
@@ -1835,6 +1838,7 @@ struct sctp_association {
 	 * will be inherited by all new transports.
 	 */
 	unsigned long hbinterval;
+	unsigned long probe_interval;
 
 	__be16 encap_port;
 

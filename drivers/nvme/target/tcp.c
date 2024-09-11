@@ -16,6 +16,7 @@
 #include <crypto/hash.h>
 
 #include "nvmet.h"
+#include <linux/rh_tasklist_lock.h>
 
 #define NVMET_TCP_DEF_INLINE_DATA_SIZE	(4 * PAGE_SIZE)
 

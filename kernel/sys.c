@@ -77,6 +77,8 @@
 
 #include "uid16.h"
 
+#include <linux/rh_tasklist_lock.h>
+
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
 #endif

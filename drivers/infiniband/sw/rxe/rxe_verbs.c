@@ -26,7 +26,7 @@ static int rxe_query_device(struct ib_device *dev,
 }
 
 static int rxe_query_port(struct ib_device *dev,
-			  u8 port_num, struct ib_port_attr *attr)
+			  u32 port_num, struct ib_port_attr *attr)
 {
 	struct rxe_dev *rxe = to_rdev(dev);
 	struct rxe_port *port;
@@ -54,7 +54,7 @@ static int rxe_query_port(struct ib_device *dev,
 }
 
 static int rxe_query_pkey(struct ib_device *device,
-			  u8 port_num, u16 index, u16 *pkey)
+			  u32 port_num, u16 index, u16 *pkey)
 {
 	if (index > 0)
 		return -EINVAL;
@@ -84,7 +84,7 @@ static int rxe_modify_device(struct ib_device *dev,
 }
 
 static int rxe_modify_port(struct ib_device *dev,
-			   u8 port_num, int mask, struct ib_port_modify *attr)
+			   u32 port_num, int mask, struct ib_port_modify *attr)
 {
 	struct rxe_dev *rxe = to_rdev(dev);
 	struct rxe_port *port;
@@ -101,7 +101,7 @@ static int rxe_modify_port(struct ib_device *dev,
 }
 
 static enum rdma_link_layer rxe_get_link_layer(struct ib_device *dev,
-					       u8 port_num)
+					       u32 port_num)
 {
 	return IB_LINK_LAYER_ETHERNET;
 }
@@ -121,7 +121,7 @@ static void rxe_dealloc_ucontext(struct ib_ucontext *ibuc)
 	rxe_drop_ref(uc);
 }
 
-static int rxe_port_immutable(struct ib_device *dev, u8 port_num,
+static int rxe_port_immutable(struct ib_device *dev, u32 port_num,
 			      struct ib_port_immutable *immutable)
 {
 	int err;
@@ -959,17 +959,6 @@ err2:
 	return ERR_PTR(err);
 }
 
-static int rxe_dereg_mr(struct ib_mr *ibmr, struct ib_udata *udata)
-{
-	struct rxe_mr *mr = to_rmr(ibmr);
-
-	mr->state = RXE_MR_STATE_ZOMBIE;
-	rxe_drop_ref(mr_pd(mr));
-	rxe_drop_index(mr);
-	rxe_drop_ref(mr);
-	return 0;
-}
-
 static struct ib_mr *rxe_alloc_mr(struct ib_pd *ibpd, enum ib_mr_type mr_type,
 				  u32 max_num_sg)
 {
@@ -1076,7 +1065,7 @@ static ssize_t parent_show(struct device *device,
 	struct rxe_dev *rxe =
 		rdma_device_to_drv_device(device, struct rxe_dev, ib_dev);
 
-	return scnprintf(buf, PAGE_SIZE, "%s\n", rxe_parent_name(rxe, 1));
+	return sysfs_emit(buf, "%s\n", rxe_parent_name(rxe, 1));
 }
 
 static DEVICE_ATTR_RO(parent);
@@ -1104,7 +1093,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.driver_id = RDMA_DRIVER_RXE,
 	.uverbs_abi_ver = RXE_UVERBS_ABI_VERSION,
 
-	.alloc_hw_stats = rxe_ib_alloc_hw_stats,
+	.alloc_hw_port_stats = rxe_ib_alloc_hw_port_stats,
 	.alloc_mr = rxe_alloc_mr,
 	.alloc_mw = rxe_alloc_mw,
 	.alloc_pd = rxe_alloc_pd,
@@ -1125,6 +1114,7 @@ static const struct ib_device_ops rxe_dev_ops = {
 	.destroy_qp = rxe_destroy_qp,
 	.destroy_srq = rxe_destroy_srq,
 	.detach_mcast = rxe_detach_mcast,
+	.device_group = &rxe_attr_group,
 	.enable_driver = rxe_enable_driver,
 	.get_dma_mr = rxe_get_dma_mr,
 	.get_hw_stats = rxe_ib_get_hw_stats,
@@ -1191,7 +1181,6 @@ int rxe_register_device(struct rxe_dev *rxe, const char *ibdev_name)
 	}
 	rxe->tfm = tfm;
 
-	rdma_set_device_sysfs_group(dev, &rxe_attr_group);
 	err = ib_register_device(dev, ibdev_name, NULL);
 	if (err)
 		pr_warn("%s failed with error %d\n", __func__, err);

@@ -1286,8 +1286,9 @@ static bool acpi_object_is_system_bus(acpi_handle handle)
 }
 
 static void acpi_set_pnp_ids(acpi_handle handle, struct acpi_device_pnp *pnp,
-				int device_type, struct acpi_device_info *info)
+			     int device_type)
 {
+	struct acpi_device_info *info = NULL;
 	struct acpi_pnp_device_id_list *cid_list;
 	int i;
 
@@ -1298,6 +1299,7 @@ static void acpi_set_pnp_ids(acpi_handle handle, struct acpi_device_pnp *pnp,
 			break;
 		}
 
+		acpi_get_object_info(handle, &info);
 		if (!info) {
 			pr_err(PREFIX "%s: Error reading device info\n",
 					__func__);
@@ -1322,6 +1324,8 @@ static void acpi_set_pnp_ids(acpi_handle handle, struct acpi_device_pnp *pnp,
 							GFP_KERNEL);
 		if (info->valid & ACPI_VALID_CLS)
 			acpi_add_id(pnp, info->class_code.string);
+
+		kfree(info);
 
 		/*
 		 * Some devices don't reliably have _HIDs & _CIDs, so add
@@ -1656,17 +1660,16 @@ static bool acpi_device_enumeration_by_parent(struct acpi_device *device)
 }
 
 void acpi_init_device_object(struct acpi_device *device, acpi_handle handle,
-			     int type, unsigned long long sta,
-			     struct acpi_device_info *info)
+			     int type)
 {
 	INIT_LIST_HEAD(&device->pnp.ids);
 	device->device_type = type;
 	device->handle = handle;
 	device->parent = acpi_bus_get_parent(handle);
 	fwnode_init(&device->fwnode, &acpi_device_fwnode_ops);
-	acpi_set_device_status(device, sta);
+	acpi_set_device_status(device, ACPI_STA_DEFAULT);
 	acpi_device_get_busid(device);
-	acpi_set_pnp_ids(handle, &device->pnp, type, info);
+	acpi_set_pnp_ids(handle, &device->pnp, type);
 	acpi_init_properties(device);
 	acpi_bus_get_flags(device);
 	device->flags.match_driver = false;
@@ -1687,35 +1690,31 @@ void acpi_device_add_finalize(struct acpi_device *device)
 	kobject_uevent(&device->dev.kobj, KOBJ_ADD);
 }
 
+static void acpi_scan_init_status(struct acpi_device *adev)
+{
+	if (acpi_bus_get_status(adev))
+		acpi_set_device_status(adev, 0);
+}
+
 static int acpi_add_single_object(struct acpi_device **child,
-				  acpi_handle handle, int type,
-				  unsigned long long sta)
+				  acpi_handle handle, int type)
 {
 	int result;
 	struct acpi_device *device;
 	struct acpi_buffer buffer = { ACPI_ALLOCATE_BUFFER, NULL };
-	struct acpi_device_info *info = NULL;
-
-	if (handle != ACPI_ROOT_OBJECT && type == ACPI_BUS_TYPE_DEVICE)
-		acpi_get_object_info(handle, &info);
 
 	device = kzalloc(sizeof(struct acpi_device), GFP_KERNEL);
-	if (!device) {
-		printk(KERN_ERR PREFIX "Memory allocation error\n");
-		kfree(info);
+	if (!device)
 		return -ENOMEM;
-	}
 
-	acpi_init_device_object(device, handle, type, sta, info);
-	kfree(info);
+	acpi_init_device_object(device, handle, type);
 	/*
-	 * For ACPI_BUS_TYPE_DEVICE getting the status is delayed till here so
-	 * that we can call acpi_bus_get_status() and use its quirk handling.
-	 * Note this must be done before the get power-/wakeup_dev-flags calls.
+	 * Getting the status is delayed till here so that we can call
+	 * acpi_bus_get_status() and use its quirk handling.  Note that
+	 * this must be done before the get power-/wakeup_dev-flags calls.
 	 */
-	if (type == ACPI_BUS_TYPE_DEVICE)
-		if (acpi_bus_get_status(device) < 0)
-			acpi_set_device_status(device, 0);
+	if (type == ACPI_BUS_TYPE_DEVICE || type == ACPI_BUS_TYPE_PROCESSOR)
+		acpi_scan_init_status(device);
 
 	acpi_bus_get_power_flags(device);
 	acpi_bus_get_wakeup_device_flags(device);
@@ -1919,7 +1918,6 @@ static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 				      struct acpi_device **adev_p)
 {
 	struct acpi_device *device = NULL;
-	unsigned long long sta = ACPI_STA_DEFAULT;
 	acpi_object_type acpi_type;
 	int type;
 
@@ -1947,9 +1945,6 @@ static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 		break;
 
 	case ACPI_TYPE_PROCESSOR:
-		if (ACPI_FAILURE(acpi_bus_get_status_handle(handle, &sta)))
-			return AE_OK;
-
 		type = ACPI_BUS_TYPE_PROCESSOR;
 		break;
 
@@ -1964,7 +1959,7 @@ static acpi_status acpi_bus_check_add(acpi_handle handle, bool check_dep,
 		return AE_OK;
 	}
 
-	acpi_add_single_object(&device, handle, type, sta);
+	acpi_add_single_object(&device, handle, type);
 	if (!device)
 		return AE_CTRL_DEPTH;
 
@@ -2238,8 +2233,7 @@ int acpi_bus_register_early_device(int type)
 	struct acpi_device *device = NULL;
 	int result;
 
-	result = acpi_add_single_object(&device, NULL,
-					type, ACPI_STA_DEFAULT);
+	result = acpi_add_single_object(&device, NULL, type);
 	if (result)
 		return result;
 
@@ -2259,8 +2253,7 @@ static int acpi_bus_scan_fixed(void)
 		struct acpi_device *device = NULL;
 
 		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_POWER_BUTTON,
-						ACPI_STA_DEFAULT);
+						ACPI_BUS_TYPE_POWER_BUTTON);
 		if (result)
 			return result;
 
@@ -2276,8 +2269,7 @@ static int acpi_bus_scan_fixed(void)
 		struct acpi_device *device = NULL;
 
 		result = acpi_add_single_object(&device, NULL,
-						ACPI_BUS_TYPE_SLEEP_BUTTON,
-						ACPI_STA_DEFAULT);
+						ACPI_BUS_TYPE_SLEEP_BUTTON);
 		if (result)
 			return result;
 

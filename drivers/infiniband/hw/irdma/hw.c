@@ -426,9 +426,9 @@ static void irdma_ena_intr(struct irdma_sc_dev *dev, u32 msix_id)
  * irdma_dpc - tasklet for aeq and ceq 0
  * @t: tasklet_struct ptr
  */
-static void irdma_dpc(struct tasklet_struct *t)
+static void irdma_dpc(unsigned long data)
 {
-	struct irdma_pci_f *rf = from_tasklet(rf, t, dpc_tasklet);
+	struct irdma_pci_f *rf = (struct irdma_pci_f *)data;
 
 	if (rf->msix_shared)
 		irdma_process_ceq(rf, rf->ceqlist);
@@ -440,9 +440,9 @@ static void irdma_dpc(struct tasklet_struct *t)
  * irdma_ceq_dpc - dpc handler for CEQ
  * @t: tasklet_struct ptr
  */
-static void irdma_ceq_dpc(struct tasklet_struct *t)
+static void irdma_ceq_dpc(unsigned long data)
 {
-	struct irdma_ceq *iwceq = from_tasklet(iwceq, t, dpc_tasklet);
+	struct irdma_ceq *iwceq = (struct irdma_ceq *)data;
 	struct irdma_pci_f *rf = iwceq->rf;
 
 	irdma_process_ceq(rf, iwceq);
@@ -1089,11 +1089,11 @@ irdma_cfg_ceq_vector(struct irdma_pci_f *rf, struct irdma_ceq *iwceq,
 	int status;
 
 	if (rf->msix_shared && !ceq_id) {
-		tasklet_setup(&rf->dpc_tasklet, irdma_dpc);
+		tasklet_init(&rf->dpc_tasklet, irdma_dpc, (unsigned long)rf);
 		status = request_irq(msix_vec->irq, irdma_irq_handler, 0,
 				     "AEQCEQ", rf);
 	} else {
-		tasklet_setup(&iwceq->dpc_tasklet, irdma_ceq_dpc);
+		tasklet_init(&iwceq->dpc_tasklet, irdma_ceq_dpc, (unsigned long)iwceq);
 
 		status = request_irq(msix_vec->irq, irdma_ceq_handler, 0,
 				     "CEQ", iwceq);
@@ -1125,7 +1125,7 @@ static enum irdma_status_code irdma_cfg_aeq_vector(struct irdma_pci_f *rf)
 	u32 ret = 0;
 
 	if (!rf->msix_shared) {
-		tasklet_setup(&rf->dpc_tasklet, irdma_dpc);
+		tasklet_init(&rf->dpc_tasklet, irdma_dpc, (unsigned long)rf);
 		ret = request_irq(msix_vec->irq, irdma_irq_handler, 0,
 				  "irdma", rf);
 	}

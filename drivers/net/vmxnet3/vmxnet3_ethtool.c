@@ -774,7 +774,7 @@ vmxnet3_get_rss_hash_opts(struct vmxnet3_adapter *adapter,
 	case ESP_V4_FLOW:
 		if (rss_fields & VMXNET3_RSS_FIELDS_ESPIP4)
 			info->data |= RXH_L4_B_0_1 | RXH_L4_B_2_3;
-			/* fallthrough */
+		fallthrough;
 	case SCTP_V4_FLOW:
 	case IPV4_FLOW:
 		info->data |= RXH_IP_SRC | RXH_IP_DST;
@@ -1053,8 +1053,10 @@ vmxnet3_set_rss(struct net_device *netdev, const u32 *p, const u8 *key,
 }
 #endif
 
-static int
-vmxnet3_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
+static int vmxnet3_get_coalesce(struct net_device *netdev,
+				struct ethtool_coalesce *ec,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
 
@@ -1088,8 +1090,10 @@ vmxnet3_get_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
 	return 0;
 }
 
-static int
-vmxnet3_set_coalesce(struct net_device *netdev, struct ethtool_coalesce *ec)
+static int vmxnet3_set_coalesce(struct net_device *netdev,
+				struct ethtool_coalesce *ec,
+				struct kernel_ethtool_coalesce *kernel_coal,
+				struct netlink_ext_ack *extack)
 {
 	struct vmxnet3_adapter *adapter = netdev_priv(netdev);
 	struct Vmxnet3_DriverShared *shared = adapter->shared;

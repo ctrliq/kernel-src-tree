@@ -54,6 +54,8 @@
 #include <asm/ptrace.h>
 #include <asm/irq_regs.h>
 
+#include <linux/rh_tasklist_lock.h>
+
 /* Whether we react on sysrq keys or just ignore them */
 static int __read_mostly sysrq_enabled = CONFIG_MAGIC_SYSRQ_DEFAULT_ENABLE;
 static bool __read_mostly sysrq_always_enabled;

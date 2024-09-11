@@ -13,6 +13,8 @@
 
 #include <asm/msr-index.h>
 
+#include "../kvm_util.h"
+
 #define X86_EFLAGS_FIXED	 (1u << 1)
 
 #define X86_CR4_VME		(1ul << 0)
@@ -52,6 +54,9 @@
 #define CPUID_UMIP		(1ul << 2)
 #define CPUID_PKU		(1ul << 3)
 #define CPUID_LA57		(1ul << 16)
+
+/* CPUID.0x8000_0001.EDX */
+#define CPUID_GBPAGES		(1ul << 26)
 
 /* General Registers in 64-Bit Mode */
 struct gpr64_regs {
@@ -392,6 +397,10 @@ void vcpu_init_descriptor_tables(struct kvm_vm *vm, uint32_t vcpuid);
 void vm_install_exception_handler(struct kvm_vm *vm, int vector,
 			void (*handler)(struct ex_regs *));
 
+uint64_t vm_get_page_table_entry(struct kvm_vm *vm, int vcpuid, uint64_t vaddr);
+void vm_set_page_table_entry(struct kvm_vm *vm, int vcpuid, uint64_t vaddr,
+			     uint64_t pte);
+
 /*
  * set_cpuid() - overwrites a matching cpuid entry with the provided value.
  *		 matches based on ent->function && ent->index. returns true
@@ -407,6 +416,14 @@ uint64_t kvm_hypercall(uint64_t nr, uint64_t a0, uint64_t a1, uint64_t a2,
 struct kvm_cpuid2 *kvm_get_supported_hv_cpuid(void);
 void vcpu_set_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid);
 struct kvm_cpuid2 *vcpu_get_supported_hv_cpuid(struct kvm_vm *vm, uint32_t vcpuid);
+
+enum x86_page_size {
+	X86_PAGE_SIZE_4K = 0,
+	X86_PAGE_SIZE_2M,
+	X86_PAGE_SIZE_1G,
+};
+void __virt_pg_map(struct kvm_vm *vm, uint64_t vaddr, uint64_t paddr,
+		   enum x86_page_size page_size);
 
 /*
  * Basic CPU control in CR0

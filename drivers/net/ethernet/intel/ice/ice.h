@@ -34,6 +34,7 @@
 #include <linux/if_bridge.h>
 #include <linux/ctype.h>
 #include <linux/bpf.h>
+#include <linux/auxiliary_bus.h>
 #include <linux/avf/virtchnl.h>
 #include <linux/cpu_rmap.h>
 #include <linux/dim.h>
@@ -55,12 +56,14 @@
 #include "ice_switch.h"
 #include "ice_common.h"
 #include "ice_sched.h"
+#include "ice_idc_int.h"
 #include "ice_virtchnl_pf.h"
 #include "ice_sriov.h"
 #include "ice_ptp.h"
 #include "ice_fdir.h"
 #include "ice_xsk.h"
 #include "ice_arfs.h"
+#include "ice_lag.h"
 
 #define ICE_BAR0		0
 #define ICE_REQ_DESC_MULTIPLE	32
@@ -79,6 +82,8 @@
 #define ICE_MIN_LAN_OICR_MSIX	1
 #define ICE_MIN_MSIX		(ICE_MIN_LAN_TXRX_MSIX + ICE_MIN_LAN_OICR_MSIX)
 #define ICE_FDIR_MSIX		2
+#define ICE_RDMA_NUM_AEQ_MSIX	4
+#define ICE_MIN_RDMA_MSIX	2
 #define ICE_NO_VSI		0xffff
 #define ICE_VSI_MAP_CONTIG	0
 #define ICE_VSI_MAP_SCATTER	1
@@ -89,8 +94,9 @@
 #define ICE_MAX_LG_RSS_QS	256
 #define ICE_RES_VALID_BIT	0x8000
 #define ICE_RES_MISC_VEC_ID	(ICE_RES_VALID_BIT - 1)
+#define ICE_RES_RDMA_VEC_ID	(ICE_RES_MISC_VEC_ID - 1)
 /* All VF control VSIs share the same IRQ, so assign a unique ID for them */
-#define ICE_RES_VF_CTRL_VEC_ID	(ICE_RES_MISC_VEC_ID - 1)
+#define ICE_RES_VF_CTRL_VEC_ID	(ICE_RES_RDMA_VEC_ID - 1)
 #define ICE_INVAL_Q_INDEX	0xffff
 #define ICE_INVAL_VFID		256
 
@@ -133,13 +139,10 @@
 #define ice_for_each_q_vector(vsi, i) \
 	for ((i) = 0; (i) < (vsi)->num_q_vectors; (i)++)
 
-#define ICE_UCAST_PROMISC_BITS (ICE_PROMISC_UCAST_TX | ICE_PROMISC_MCAST_TX | \
-				ICE_PROMISC_UCAST_RX | ICE_PROMISC_MCAST_RX)
+#define ICE_UCAST_PROMISC_BITS (ICE_PROMISC_UCAST_TX | ICE_PROMISC_UCAST_RX)
 
 #define ICE_UCAST_VLAN_PROMISC_BITS (ICE_PROMISC_UCAST_TX | \
-				     ICE_PROMISC_MCAST_TX | \
 				     ICE_PROMISC_UCAST_RX | \
-				     ICE_PROMISC_MCAST_RX | \
 				     ICE_PROMISC_VLAN_TX  | \
 				     ICE_PROMISC_VLAN_RX)
 
@@ -199,52 +202,54 @@ struct ice_sw {
 };
 
 enum ice_pf_state {
-	__ICE_TESTING,
-	__ICE_DOWN,
-	__ICE_NEEDS_RESTART,
-	__ICE_PREPARED_FOR_RESET,	/* set by driver when prepared */
-	__ICE_RESET_OICR_RECV,		/* set by driver after rcv reset OICR */
-	__ICE_PFR_REQ,			/* set by driver and peers */
-	__ICE_CORER_REQ,		/* set by driver and peers */
-	__ICE_GLOBR_REQ,		/* set by driver and peers */
-	__ICE_CORER_RECV,		/* set by OICR handler */
-	__ICE_GLOBR_RECV,		/* set by OICR handler */
-	__ICE_EMPR_RECV,		/* set by OICR handler */
-	__ICE_SUSPENDED,		/* set on module remove path */
-	__ICE_RESET_FAILED,		/* set by reset/rebuild */
+	ICE_TESTING,
+	ICE_DOWN,
+	ICE_NEEDS_RESTART,
+	ICE_PREPARED_FOR_RESET,	/* set by driver when prepared */
+	ICE_RESET_OICR_RECV,		/* set by driver after rcv reset OICR */
+	ICE_PFR_REQ,		/* set by driver */
+	ICE_CORER_REQ,		/* set by driver */
+	ICE_GLOBR_REQ,		/* set by driver */
+	ICE_CORER_RECV,		/* set by OICR handler */
+	ICE_GLOBR_RECV,		/* set by OICR handler */
+	ICE_EMPR_RECV,		/* set by OICR handler */
+	ICE_SUSPENDED,		/* set on module remove path */
+	ICE_RESET_FAILED,		/* set by reset/rebuild */
 	/* When checking for the PF to be in a nominal operating state, the
 	 * bits that are grouped at the beginning of the list need to be
-	 * checked. Bits occurring before __ICE_STATE_NOMINAL_CHECK_BITS will
+	 * checked. Bits occurring before ICE_STATE_NOMINAL_CHECK_BITS will
 	 * be checked. If you need to add a bit into consideration for nominal
 	 * operating state, it must be added before
-	 * __ICE_STATE_NOMINAL_CHECK_BITS. Do not move this entry's position
+	 * ICE_STATE_NOMINAL_CHECK_BITS. Do not move this entry's position
 	 * without appropriate consideration.
 	 */
-	__ICE_STATE_NOMINAL_CHECK_BITS,
-	__ICE_ADMINQ_EVENT_PENDING,
-	__ICE_MAILBOXQ_EVENT_PENDING,
+	ICE_STATE_NOMINAL_CHECK_BITS,
+	ICE_ADMINQ_EVENT_PENDING,
+	ICE_MAILBOXQ_EVENT_PENDING,
 	ICE_SIDEBANDQ_EVENT_PENDING,
-	__ICE_MDD_EVENT_PENDING,
-	__ICE_VFLR_EVENT_PENDING,
-	__ICE_FLTR_OVERFLOW_PROMISC,
-	__ICE_VF_DIS,
+	ICE_MDD_EVENT_PENDING,
+	ICE_VFLR_EVENT_PENDING,
+	ICE_FLTR_OVERFLOW_PROMISC,
+	ICE_VF_DIS,
 	ICE_VF_DEINIT_IN_PROGRESS,
-	__ICE_CFG_BUSY,
-	__ICE_SERVICE_SCHED,
-	__ICE_SERVICE_DIS,
-	__ICE_FD_FLUSH_REQ,
-	__ICE_OICR_INTR_DIS,		/* Global OICR interrupt disabled */
-	__ICE_MDD_VF_PRINT_PENDING,	/* set when MDD event handle */
-	__ICE_VF_RESETS_DISABLED,	/* disable resets during ice_remove */
-	__ICE_LINK_DEFAULT_OVERRIDE_PENDING,
-	__ICE_PHY_INIT_COMPLETE,
-	__ICE_FD_VF_FLUSH_CTX,		/* set at FD Rx IRQ or timeout */
-	__ICE_STATE_NBITS		/* must be last */
+	ICE_CFG_BUSY,
+	ICE_SERVICE_SCHED,
+	ICE_SERVICE_DIS,
+	ICE_FD_FLUSH_REQ,
+	ICE_OICR_INTR_DIS,		/* Global OICR interrupt disabled */
+	ICE_MDD_VF_PRINT_PENDING,	/* set when MDD event handle */
+	ICE_VF_RESETS_DISABLED,	/* disable resets during ice_remove */
+	ICE_LINK_DEFAULT_OVERRIDE_PENDING,
+	ICE_PHY_INIT_COMPLETE,
+	ICE_FD_VF_FLUSH_CTX,		/* set at FD Rx IRQ or timeout */
+	ICE_STATE_NBITS		/* must be last */
 };
 
 enum ice_vsi_state {
 	ICE_VSI_DOWN,
 	ICE_VSI_NEEDS_RESTART,
+	ICE_VSI_NETDEV_ALLOCD,
+	ICE_VSI_NETDEV_REGISTERED,
 	ICE_VSI_UMAC_FLTR_CHANGED,
 	ICE_VSI_MMAC_FLTR_CHANGED,
 	ICE_VSI_VLAN_FLTR_CHANGED,
@@ -333,6 +338,7 @@ struct ice_vsi {
 	u16 req_rxq;			 /* User requested Rx queues */
 	u16 num_rx_desc;
 	u16 num_tx_desc;
+	u16 qset_handle[ICE_MAX_TRAFFIC_CLASS];
 	struct ice_tc_cfg tc_cfg;
 	struct bpf_prog *xdp_prog;
 	struct ice_ring **xdp_rings;	 /* XDP ring array */
@@ -375,6 +381,7 @@ struct ice_q_vector {
 
 enum ice_pf_flags {
 	ICE_FLAG_FLTR_SYNC,
+	ICE_FLAG_RDMA_ENA,
 	ICE_FLAG_RSS_ENA,
 	ICE_FLAG_SRIOV_ENA,
 	ICE_FLAG_SRIOV_CAPABLE,
@@ -383,6 +390,7 @@ enum ice_pf_flags {
 	ICE_FLAG_FD_ENA,
 	ICE_FLAG_PTP_SUPPORTED,		/* PTP is supported by NVM */
 	ICE_FLAG_PTP,			/* PTP is enabled by software */
+	ICE_FLAG_AUX_ENA,
 	ICE_FLAG_ADV_FEATURES,
 	ICE_FLAG_LINK_DOWN_ON_CLOSE_ENA,
 	ICE_FLAG_TOTAL_PORT_SHUTDOWN_ENA,
@@ -432,7 +440,7 @@ struct ice_pf {
 	/* used to ratelimit the MDD event logging */
 	unsigned long last_printed_mdd_jiffies;
 	DECLARE_BITMAP(malvfs, ICE_MAX_VF_COUNT);
-	DECLARE_BITMAP(state, __ICE_STATE_NBITS);
+	DECLARE_BITMAP(state, ICE_STATE_NBITS);
 	DECLARE_BITMAP(flags, ICE_PF_FLAGS_NBITS);
 	unsigned long *avail_txqs;	/* bitmap to track PF Tx queue usage */
 	unsigned long *avail_rxqs;	/* bitmap to track PF Rx queue usage */
@@ -445,11 +453,15 @@ struct ice_pf {
 	struct mutex tc_mutex;		/* lock to protect TC changes */
 	u32 msg_enable;
 	struct ice_ptp ptp;
+	u16 num_rdma_msix;		/* Total MSIX vectors for RDMA driver */
+	u16 rdma_base_vector;
 
 	/* spinlock to protect the AdminQ wait list */
 	spinlock_t aq_wait_lock;
 	struct hlist_head aq_wait_list;
 	wait_queue_head_t aq_wait_queue;
+
+	wait_queue_head_t reset_wait_queue;
 
 	u32 hw_csum_rx_error;
 	u16 oicr_idx;		/* Other interrupt cause MSIX vector index */
@@ -477,11 +489,14 @@ struct ice_pf {
 	unsigned long tx_timeout_last_recovery;
 	u32 tx_timeout_recovery_level;
 	char int_name[ICE_INT_NAME_STR_LEN];
+	struct auxiliary_device *adev;
+	int aux_idx;
 	u32 sw_int_count;
 
 	__le64 nvm_phy_type_lo; /* NVM PHY type low */
 	__le64 nvm_phy_type_hi; /* NVM PHY type high */
 	struct ice_link_default_override_tlv link_dflt_override;
+	struct ice_lag *lag; /* Link Aggregation information */
 
 #define ICE_INVALID_AGG_NODE_ID		0
 #define ICE_PF_AGG_NODE_ID_START	1
@@ -591,11 +606,31 @@ static inline struct ice_vsi *ice_get_ctrl_vsi(struct ice_pf *pf)
 	return pf->vsi[pf->ctrl_vsi_idx];
 }
 
+/**
+ * ice_set_sriov_cap - enable SRIOV in PF flags
+ * @pf: PF struct
+ */
+static inline void ice_set_sriov_cap(struct ice_pf *pf)
+{
+	if (pf->hw.func_caps.common_cap.sr_iov_1_1)
+		set_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
+}
+
+/**
+ * ice_clear_sriov_cap - disable SRIOV in PF flags
+ * @pf: PF struct
+ */
+static inline void ice_clear_sriov_cap(struct ice_pf *pf)
+{
+	clear_bit(ICE_FLAG_SRIOV_CAPABLE, pf->flags);
+}
+
 #define ICE_FD_STAT_CTR_BLOCK_COUNT	256
 #define ICE_FD_STAT_PF_IDX(base_idx) \
 			((base_idx) * ICE_FD_STAT_CTR_BLOCK_COUNT)
 #define ICE_FD_SB_STAT_IDX(base_idx) ICE_FD_STAT_PF_IDX(base_idx)
 
+bool netif_is_ice(struct net_device *dev);
 int ice_vsi_setup_tx_rings(struct ice_vsi *vsi);
 int ice_vsi_setup_rx_rings(struct ice_vsi *vsi);
 int ice_vsi_open_ctrl(struct ice_vsi *vsi);
@@ -622,6 +657,9 @@ int ice_get_rss_key(struct ice_vsi *vsi, u8 *seed);
 void ice_fill_rss_lut(u8 *lut, u16 rss_table_size, u16 rss_size);
 int ice_schedule_reset(struct ice_pf *pf, enum ice_reset_req reset);
 void ice_print_link_msg(struct ice_vsi *vsi, bool isup);
+int ice_plug_aux_dev(struct ice_pf *pf);
+void ice_unplug_aux_dev(struct ice_pf *pf);
+int ice_init_rdma(struct ice_pf *pf);
 const char *ice_stat_str(enum ice_status stat_err);
 const char *ice_aq_str(enum ice_aq_err aq_err);
 bool ice_is_wol_supported(struct ice_hw *hw);
@@ -646,4 +684,27 @@ int ice_open_internal(struct net_device *netdev);
 int ice_stop(struct net_device *netdev);
 void ice_service_task_schedule(struct ice_pf *pf);
 
+/**
+ * ice_set_rdma_cap - enable RDMA support
+ * @pf: PF struct
+ */
+static inline void ice_set_rdma_cap(struct ice_pf *pf)
+{
+	if (pf->hw.func_caps.common_cap.rdma && pf->num_rdma_msix) {
+		set_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+		set_bit(ICE_FLAG_AUX_ENA, pf->flags);
+		ice_plug_aux_dev(pf);
+	}
+}
+
+/**
+ * ice_clear_rdma_cap - disable RDMA support
+ * @pf: PF struct
+ */
+static inline void ice_clear_rdma_cap(struct ice_pf *pf)
+{
+	ice_unplug_aux_dev(pf);
+	clear_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+	clear_bit(ICE_FLAG_AUX_ENA, pf->flags);
+}
 #endif /* _ICE_H_ */

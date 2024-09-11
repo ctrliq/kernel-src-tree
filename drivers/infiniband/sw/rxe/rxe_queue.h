@@ -83,8 +83,8 @@ static inline int next_index(struct rxe_queue *q, int index)
 
 static inline int queue_empty(struct rxe_queue *q, enum queue_type type)
 {
-	u32 prod;
-	u32 cons;
+	u32 prod = 0;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -108,8 +108,8 @@ static inline int queue_empty(struct rxe_queue *q, enum queue_type type)
 
 static inline int queue_full(struct rxe_queue *q, enum queue_type type)
 {
-	u32 prod;
-	u32 cons;
+	u32 prod = 0;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -134,8 +134,8 @@ static inline int queue_full(struct rxe_queue *q, enum queue_type type)
 static inline unsigned int queue_count(const struct rxe_queue *q,
 					enum queue_type type)
 {
-	u32 prod;
-	u32 cons;
+	u32 prod = 0;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -159,7 +159,7 @@ static inline unsigned int queue_count(const struct rxe_queue *q,
 
 static inline void advance_producer(struct rxe_queue *q, enum queue_type type)
 {
-	u32 prod;
+	u32 prod = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -184,7 +184,7 @@ static inline void advance_producer(struct rxe_queue *q, enum queue_type type)
 
 static inline void advance_consumer(struct rxe_queue *q, enum queue_type type)
 {
-	u32 cons;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -209,7 +209,7 @@ static inline void advance_consumer(struct rxe_queue *q, enum queue_type type)
 
 static inline void *producer_addr(struct rxe_queue *q, enum queue_type type)
 {
-	u32 prod;
+	u32 prod = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -230,7 +230,7 @@ static inline void *producer_addr(struct rxe_queue *q, enum queue_type type)
 
 static inline void *consumer_addr(struct rxe_queue *q, enum queue_type type)
 {
-	u32 cons;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -252,7 +252,7 @@ static inline void *consumer_addr(struct rxe_queue *q, enum queue_type type)
 static inline unsigned int producer_index(struct rxe_queue *q,
 						enum queue_type type)
 {
-	u32 prod;
+	u32 prod = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:
@@ -274,7 +274,7 @@ static inline unsigned int producer_index(struct rxe_queue *q,
 static inline unsigned int consumer_index(struct rxe_queue *q,
 						enum queue_type type)
 {
-	u32 cons;
+	u32 cons = 0;
 
 	switch (type) {
 	case QUEUE_TYPE_FROM_USER:

@@ -17,6 +17,8 @@
 #include <linux/rbtree.h>
 #include <linux/sbitmap.h>
 
+#include <trace/events/block.h>
+
 #include "blk.h"
 #include "blk-mq.h"
 #include "blk-mq-debugfs.h"
@@ -220,6 +222,9 @@ static void dd_request_merged(struct request_queue *q, struct request *req,
 	}
 }
 
+/*
+ * Callback function that is invoked after @next has been merged into @req.
+ */
 static void dd_merged_requests(struct request_queue *q, struct request *req,
 			       struct request *next)
 {
@@ -461,6 +466,8 @@ done:
 }
 
 /*
+ * Called from blk_mq_run_hw_queue() -> __blk_mq_sched_dispatch_requests().
+ *
  * One confusing aspect here is that we get called for a specific
  * hardware queue, but we may return a request that is for a
  * different hardware queue. This is because mq-deadline has shared
@@ -592,6 +599,10 @@ put_eq:
 	return ret;
 }
 
+/*
+ * Try to merge @bio into an existing request. If @bio has been merged into
+ * an existing request, store the pointer to that request into *@rq.
+ */
 static int dd_request_merge(struct request_queue *q, struct request **rq,
 			    struct bio *bio)
 {
@@ -620,6 +631,10 @@ static int dd_request_merge(struct request_queue *q, struct request **rq,
 	return ELEVATOR_NO_MERGE;
 }
 
+/*
+ * Attempt to merge a bio into an existing request. This function is called
+ * before @bio is associated with a request.
+ */
 static bool dd_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
 {
 	struct request_queue *q = hctx->queue;
@@ -650,6 +665,7 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	u8 ioprio_class = IOPRIO_PRIO_CLASS(ioprio);
 	struct dd_per_prio *per_prio;
 	enum dd_prio prio;
+	LIST_HEAD(free);
 
 	lockdep_assert_held(&dd->lock);
 
@@ -661,11 +677,14 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 
 	prio = ioprio_class_to_prio[ioprio_class];
 	dd_count(dd, inserted, prio);
+	rq->elv.priv[0] = (void *)(uintptr_t)1;
 
-	if (blk_mq_sched_try_insert_merge(q, rq))
+	if (blk_mq_sched_try_insert_merge(q, rq, &free)) {
+		blk_mq_free_requests(&free);
 		return;
+	}
 
-	blk_mq_sched_request_inserted(rq);
+	trace_block_rq_insert(rq);
 
 	per_prio = &dd->per_prio[prio];
 	if (at_head) {
@@ -687,6 +706,9 @@ static void dd_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
 	}
 }
 
+/*
+ * Called from blk_mq_sched_insert_request() or blk_mq_sched_insert_requests().
+ */
 static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 			       struct list_head *list, bool at_head)
 {
@@ -704,15 +726,15 @@ static void dd_insert_requests(struct blk_mq_hw_ctx *hctx,
 	spin_unlock(&dd->lock);
 }
 
-/*
- * Nothing to do here. This is defined only to ensure that .finish_request
- * method is called upon request completion.
- */
+/* Callback from inside blk_mq_rq_ctx_init(). */
 static void dd_prepare_request(struct request *rq, struct bio *bio)
 {
+	rq->elv.priv[0] = NULL;
 }
 
 /*
+ * Callback from inside blk_mq_free_request().
+ *
  * For zoned block devices, write unlock the target zone of
  * completed write requests. Do this while holding the zone lock
  * spinlock so that the zone is never unlocked while deadline_fifo_request()
@@ -734,7 +756,14 @@ static void dd_finish_request(struct request *rq)
 	const enum dd_prio prio = ioprio_class_to_prio[ioprio_class];
 	struct dd_per_prio *per_prio = &dd->per_prio[prio];
 
-	dd_count(dd, completed, prio);
+	/*
+	 * The block layer core may call dd_finish_request() without having
+	 * called dd_insert_requests(). Hence only update statistics for
+	 * requests for which dd_insert_requests() has been called. See also
+	 * blk_mq_request_bypass_insert().
+	 */
+	if (rq->elv.priv[0])
+		dd_count(dd, completed, prio);
 
 	if (blk_queue_is_zoned(q)) {
 		unsigned long flags;

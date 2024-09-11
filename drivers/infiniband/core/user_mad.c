@@ -101,7 +101,7 @@ struct ib_umad_port {
 	struct ib_device      *ib_dev;
 	struct ib_umad_device *umad_dev;
 	int                    dev_num;
-	u8                     port_num;
+	u32                     port_num;
 };
 
 struct ib_umad_device {
@@ -700,7 +700,7 @@ static int ib_umad_reg_agent(struct ib_umad_file *file, void __user *arg,
 
 	if (ureq.qpn != 0 && ureq.qpn != 1) {
 		dev_notice(&file->port->dev,
-			   "%s: invalid QPN %d specified\n", __func__,
+			   "%s: invalid QPN %u specified\n", __func__,
 			   ureq.qpn);
 		ret = -EINVAL;
 		goto out;
@@ -800,7 +800,7 @@ static int ib_umad_reg_agent2(struct ib_umad_file *file, void __user *arg)
 	}
 
 	if (ureq.qpn != 0 && ureq.qpn != 1) {
-		dev_notice(&file->port->dev, "%s: invalid QPN %d specified\n",
+		dev_notice(&file->port->dev, "%s: invalid QPN %u specified\n",
 			   __func__, ureq.qpn);
 		ret = -EINVAL;
 		goto out;
@@ -1141,7 +1141,7 @@ static const struct file_operations umad_sm_fops = {
 
 static struct ib_umad_port *get_port(struct ib_device *ibdev,
 				     struct ib_umad_device *umad_dev,
-				     unsigned int port)
+				     u32 port)
 {
 	if (!umad_dev)
 		return ERR_PTR(-EOPNOTSUPP);
@@ -1201,7 +1201,7 @@ static ssize_t ibdev_show(struct device *dev, struct device_attribute *attr,
 	if (!port)
 		return -ENODEV;
 
-	return sprintf(buf, "%s\n", dev_name(&port->ib_dev->dev));
+	return sysfs_emit(buf, "%s\n", dev_name(&port->ib_dev->dev));
 }
 static DEVICE_ATTR_RO(ibdev);
 
@@ -1213,7 +1213,7 @@ static ssize_t port_show(struct device *dev, struct device_attribute *attr,
 	if (!port)
 		return -ENODEV;
 
-	return sprintf(buf, "%d\n", port->port_num);
+	return sysfs_emit(buf, "%d\n", port->port_num);
 }
 static DEVICE_ATTR_RO(port);
 
@@ -1232,7 +1232,7 @@ static char *umad_devnode(struct device *dev, umode_t *mode)
 static ssize_t abi_version_show(struct class *class,
 				struct class_attribute *attr, char *buf)
 {
-	return sprintf(buf, "%d\n", IB_USER_MAD_ABI_VERSION);
+	return sysfs_emit(buf, "%d\n", IB_USER_MAD_ABI_VERSION);
 }
 static CLASS_ATTR_RO(abi_version);
 

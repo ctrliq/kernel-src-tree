@@ -12,12 +12,13 @@
 struct msft_cp_read_supported_features {
 	__u8   sub_opcode;
 } __packed;
+
 struct msft_rp_read_supported_features {
 	__u8   status;
 	__u8   sub_opcode;
 	__le64 features;
 	__u8   evt_prefix_len;
-	__u8   evt_prefix[0];
+	__u8   evt_prefix[];
 } __packed;
 
 struct msft_data {
@@ -62,6 +63,9 @@ static bool read_supported_features(struct hci_dev *hdev,
 
 	msft->evt_prefix_len = rp->evt_prefix_len;
 	msft->features = __le64_to_cpu(rp->features);
+
+	if (msft->features & MSFT_FEATURE_MASK_CURVE_VALIDITY)
+		hdev->msft_curve_validity = true;
 
 	kfree_skb(skb);
 	return true;
@@ -138,4 +142,16 @@ void msft_vendor_evt(struct hci_dev *hdev, struct sk_buff *skb)
 	skb_pull(skb, 1);
 
 	bt_dev_dbg(hdev, "MSFT vendor event %u", event);
+}
+
+__u64 msft_get_features(struct hci_dev *hdev)
+{
+	struct msft_data *msft = hdev->msft_data;
+
+	return  msft ? msft->features : 0;
+}
+
+bool msft_curve_validity(struct hci_dev *hdev)
+{
+	return hdev->msft_curve_validity;
 }

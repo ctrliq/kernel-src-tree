@@ -302,9 +302,19 @@ struct pci_cap_saved_state {
 	struct pci_cap_saved_data	cap;
 };
 
+/* RHEL: We need to hide 'pci_vpd' content from the kABI checker to avoid
+ * checksum changes of affected symbols.
+ */
+#ifndef __GENKSYMS__
+struct pci_vpd {
+	struct mutex	lock;
+	unsigned int	len;
+	u8		cap;
+};
+#endif
+
 struct irq_affinity;
 struct pcie_link_state;
-struct pci_vpd;
 struct pci_sriov;
 struct pci_p2pdma;
 struct rcec_ea;
@@ -468,6 +478,7 @@ struct pci_dev {
 
 	u32		saved_config_space[16]; /* Config space saved at suspend time */
 	struct hlist_head saved_cap_space;
+	RH_KABI_DEPRECATE(struct bin_attribute *, rom_attr)
 	int		rom_attr_enabled;	/* Display of ROM attribute enabled? */
 	struct bin_attribute *res_attr[DEVICE_COUNT_RESOURCE]; /* sysfs file for resources */
 	struct bin_attribute *res_attr_wc[DEVICE_COUNT_RESOURCE]; /* sysfs file for WC mapping of resources */
@@ -483,7 +494,7 @@ struct pci_dev {
 #ifdef CONFIG_PCI_MSI
 	const struct attribute_group **msi_irq_groups;
 #endif
-	struct pci_vpd *vpd;
+	RH_KABI_DEPRECATE(struct pci_vpd *, vpd)
 #ifdef CONFIG_PCI_ATS
 	union {
 		struct pci_sriov	*sriov;		/* PF: SR-IOV info */
@@ -518,17 +529,13 @@ struct pci_dev {
 #endif
 	RH_KABI_USE(5, u16  acs_cap)
 #ifdef CONFIG_PCIEASPM
-	RH_KABI_USE(6, int  l1ss)	/* L1SS Capability pointer */
+	RH_KABI_USE(6, u16  l1ss)	/* L1SS Capability pointer */
 #endif
 #ifdef CONFIG_PCIEPORTBUS
 	RH_KABI_USE(7, struct rcec_ea  *rcec_ea) /* RCEC cached endpoint association */
 	RH_KABI_USE(8, struct pci_dev  *rcec)	 /* Associated RCEC device */
 #endif
-	RH_KABI_RESERVE(9)
-	RH_KABI_RESERVE(10)
-	RH_KABI_RESERVE(11)
-	RH_KABI_RESERVE(12)
-	RH_KABI_RESERVE(13)
+	RH_KABI_USE(9, 10, 11, 12, 13, struct pci_vpd  vpd)
 	RH_KABI_RESERVE(14)
 	RH_KABI_RESERVE(15)
 	RH_KABI_AUX_EMBED(pci_dev_extended)
@@ -905,6 +912,12 @@ struct module;
  *		e.g. drivers/net/e100.c.
  * @sriov_configure: Optional driver callback to allow configuration of
  *		number of VFs to enable via sysfs "sriov_numvfs" file.
+ * @sriov_set_msix_vec_count: PF Driver callback to change number of MSI-X
+ *              vectors on a VF. Triggered via sysfs "sriov_vf_msix_count".
+ *              This will change MSI-X Table Size in the VF Message Control
+ *              registers.
+ * @sriov_get_vf_total_msix: PF driver callback to get the total number of
+ *              MSI-X vectors available for distribution to the VFs.
  * @err_handler: See Documentation/PCI/pci-error-recovery.rst
  * @groups:	Sysfs attribute groups.
  * @driver:	Driver model structure.
@@ -923,8 +936,8 @@ struct pci_driver {
 	void (*shutdown)(struct pci_dev *dev);
 	int  (*sriov_configure)(struct pci_dev *dev, int num_vfs); /* On PF */
 
-	RH_KABI_RESERVE(1)
-	RH_KABI_RESERVE(2)
+	RH_KABI_USE(1, int (*sriov_set_msix_vec_count)(struct pci_dev *vf, int msix_vec_count))
+	RH_KABI_USE(2, u32 (*sriov_get_vf_total_msix)(struct pci_dev *pf))
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 
@@ -1136,8 +1149,8 @@ u8 pci_find_capability(struct pci_dev *dev, int cap);
 u8 pci_find_next_capability(struct pci_dev *dev, u8 pos, int cap);
 u8 pci_find_ht_capability(struct pci_dev *dev, int ht_cap);
 u8 pci_find_next_ht_capability(struct pci_dev *dev, u8 pos, int ht_cap);
-int pci_find_ext_capability(struct pci_dev *dev, int cap);
-int pci_find_next_ext_capability(struct pci_dev *dev, int pos, int cap);
+u16 pci_find_ext_capability(struct pci_dev *dev, int cap);
+u16 pci_find_next_ext_capability(struct pci_dev *dev, u16 pos, int cap);
 struct pci_bus *pci_find_next_bus(const struct pci_bus *from);
 
 u64 pci_get_dsn(struct pci_dev *dev);
@@ -1365,6 +1378,8 @@ void pci_unlock_rescan_remove(void);
 /* Vital Product Data routines */
 ssize_t pci_read_vpd(struct pci_dev *dev, loff_t pos, size_t count, void *buf);
 ssize_t pci_write_vpd(struct pci_dev *dev, loff_t pos, size_t count, const void *buf);
+ssize_t pci_read_vpd_any(struct pci_dev *dev, loff_t pos, size_t count, void *buf);
+ssize_t pci_write_vpd_any(struct pci_dev *dev, loff_t pos, size_t count, const void *buf);
 
 /* Helper functions for low-level code (drivers/pci/setup-[bus,res].c) */
 resource_size_t pcibios_retrieve_fw_addr(struct pci_dev *dev, int idx);

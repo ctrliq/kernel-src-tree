@@ -5,6 +5,7 @@
 #include <linux/spinlock.h>
 #include <linux/export.h>
 
+#define RT_MUTEX_BUILD_MUTEX
 #include "rtmutex.c"
 
 /*
@@ -26,11 +27,17 @@ static __always_inline int __rt_mutex_lock_common(struct rt_mutex *lock,
 
 	might_sleep();
 	mutex_acquire(&lock->dep_map, subclass, 0, _RET_IP_);
-	ret = __rt_mutex_lock(lock, state);
+	ret = __rt_mutex_lock(&lock->rtmutex, state);
 	if (ret)
 		mutex_release(&lock->dep_map, _RET_IP_);
 	return ret;
 }
+
+void rt_mutex_base_init(struct rt_mutex_base *rtb)
+{
+	__rt_mutex_base_init(rtb);
+}
+EXPORT_SYMBOL(rt_mutex_base_init);
 
 #ifdef CONFIG_DEBUG_LOCK_ALLOC
 /**
@@ -93,7 +100,7 @@ int __sched rt_mutex_trylock(struct rt_mutex *lock)
 	if (IS_ENABLED(CONFIG_DEBUG_RT_MUTEXES) && WARN_ON_ONCE(!in_task()))
 		return 0;
 
-	ret = __rt_mutex_trylock(lock);
+	ret = __rt_mutex_trylock(&lock->rtmutex);
 	if (ret)
 		mutex_acquire(&lock->dep_map, 0, 1, _RET_IP_);
 
@@ -109,19 +116,19 @@ EXPORT_SYMBOL_GPL(rt_mutex_trylock);
 void __sched rt_mutex_unlock(struct rt_mutex *lock)
 {
 	mutex_release(&lock->dep_map, _RET_IP_);
-	__rt_mutex_unlock(lock);
+	__rt_mutex_unlock(&lock->rtmutex);
 }
 EXPORT_SYMBOL_GPL(rt_mutex_unlock);
 
 /*
  * Futex variants, must not use fastpath.
  */
-int __sched rt_mutex_futex_trylock(struct rt_mutex *lock)
+int __sched rt_mutex_futex_trylock(struct rt_mutex_base *lock)
 {
 	return rt_mutex_slowtrylock(lock);
 }
 
-int __sched __rt_mutex_futex_trylock(struct rt_mutex *lock)
+int __sched __rt_mutex_futex_trylock(struct rt_mutex_base *lock)
 {
 	return __rt_mutex_slowtrylock(lock);
 }
@@ -131,10 +138,10 @@ int __sched __rt_mutex_futex_trylock(struct rt_mutex *lock)
  * do not use the fast-path, can be simple and will not need to retry.
  *
  * @lock:	The rt_mutex to be unlocked
- * @wake_q:	The wake queue head from which to get the next lock waiter
+ * @wqh:	The wake queue head from which to get the next lock waiter
  */
-bool __sched __rt_mutex_futex_unlock(struct rt_mutex *lock,
-				     struct wake_q_head *wake_q)
+bool __sched __rt_mutex_futex_unlock(struct rt_mutex_base *lock,
+				     struct rt_wake_q_head *wqh)
 {
 	lockdep_assert_held(&lock->wait_lock);
 
@@ -151,23 +158,23 @@ bool __sched __rt_mutex_futex_unlock(struct rt_mutex *lock,
 	 * avoid inversion prior to the wakeup.  preempt_disable()
 	 * therein pairs with rt_mutex_postunlock().
 	 */
-	mark_wakeup_next_waiter(wake_q, lock);
+	mark_wakeup_next_waiter(wqh, lock);
 
 	return true; /* call postunlock() */
 }
 
-void __sched rt_mutex_futex_unlock(struct rt_mutex *lock)
+void __sched rt_mutex_futex_unlock(struct rt_mutex_base *lock)
 {
-	DEFINE_WAKE_Q(wake_q);
+	DEFINE_RT_WAKE_Q(wqh);
 	unsigned long flags;
 	bool postunlock;
 
 	raw_spin_lock_irqsave(&lock->wait_lock, flags);
-	postunlock = __rt_mutex_futex_unlock(lock, &wake_q);
+	postunlock = __rt_mutex_futex_unlock(lock, &wqh);
 	raw_spin_unlock_irqrestore(&lock->wait_lock, flags);
 
 	if (postunlock)
-		rt_mutex_postunlock(&wake_q);
+		rt_mutex_postunlock(&wqh);
 }
 
 /**
@@ -182,12 +189,11 @@ void __sched rt_mutex_futex_unlock(struct rt_mutex *lock)
  * Initializing of a locked rt_mutex is not allowed
  */
 void __sched __rt_mutex_init(struct rt_mutex *lock, const char *name,
-		     struct lock_class_key *key)
+			     struct lock_class_key *key)
 {
 	debug_check_no_locks_freed((void *)lock, sizeof(*lock));
+	__rt_mutex_base_init(&lock->rtmutex);
 	lockdep_init_map_wait(&lock->dep_map, name, key, 0, LD_WAIT_SLEEP);
-
-	__rt_mutex_basic_init(lock);
 }
 EXPORT_SYMBOL_GPL(__rt_mutex_init);
 
@@ -205,10 +211,22 @@ EXPORT_SYMBOL_GPL(__rt_mutex_init);
  * possible at this point because the pi_state which contains the rtmutex
  * is not yet visible to other tasks.
  */
-void __sched rt_mutex_init_proxy_locked(struct rt_mutex *lock,
+void __sched rt_mutex_init_proxy_locked(struct rt_mutex_base *lock,
 					struct task_struct *proxy_owner)
 {
-	__rt_mutex_basic_init(lock);
+	static struct lock_class_key pi_futex_key;
+
+	__rt_mutex_base_init(lock);
+	/*
+	 * On PREEMPT_RT the futex hashbucket spinlock becomes 'sleeping'
+	 * and rtmutex based. That causes a lockdep false positive, because
+	 * some of the futex functions invoke spin_unlock(&hb->lock) with
+	 * the wait_lock of the rtmutex associated to the pi_futex held.
+	 * spin_unlock() in turn takes wait_lock of the rtmutex on which
+	 * the spinlock is based, which makes lockdep notice a lock
+	 * recursion. Give the futex/rtmutex wait_lock a separate key.
+	 */
+	lockdep_set_class(&lock->wait_lock, &pi_futex_key);
 	rt_mutex_set_owner(lock, proxy_owner);
 }
 
@@ -224,7 +242,7 @@ void __sched rt_mutex_init_proxy_locked(struct rt_mutex *lock,
  * possible because it belongs to the pi_state which is about to be freed
  * and it is not longer visible to other tasks.
  */
-void __sched rt_mutex_proxy_unlock(struct rt_mutex *lock)
+void __sched rt_mutex_proxy_unlock(struct rt_mutex_base *lock)
 {
 	debug_rt_mutex_proxy_unlock(lock);
 	rt_mutex_set_owner(lock, NULL);
@@ -249,7 +267,7 @@ void __sched rt_mutex_proxy_unlock(struct rt_mutex *lock)
  *
  * Special API call for PI-futex support.
  */
-int __sched __rt_mutex_start_proxy_lock(struct rt_mutex *lock,
+int __sched __rt_mutex_start_proxy_lock(struct rt_mutex_base *lock,
 					struct rt_mutex_waiter *waiter,
 					struct task_struct *task)
 {
@@ -261,7 +279,7 @@ int __sched __rt_mutex_start_proxy_lock(struct rt_mutex *lock,
 		return 1;
 
 	/* We enforce deadlock detection for futexes */
-	ret = task_blocks_on_rt_mutex(lock, waiter, task,
+	ret = task_blocks_on_rt_mutex(lock, waiter, task, NULL,
 				      RT_MUTEX_FULL_CHAINWALK);
 
 	if (ret && !rt_mutex_owner(lock)) {
@@ -296,7 +314,7 @@ int __sched __rt_mutex_start_proxy_lock(struct rt_mutex *lock,
  *
  * Special API call for PI-futex support.
  */
-int __sched rt_mutex_start_proxy_lock(struct rt_mutex *lock,
+int __sched rt_mutex_start_proxy_lock(struct rt_mutex_base *lock,
 				      struct rt_mutex_waiter *waiter,
 				      struct task_struct *task)
 {
@@ -328,7 +346,7 @@ int __sched rt_mutex_start_proxy_lock(struct rt_mutex *lock,
  *
  * Special API call for PI-futex support
  */
-int __sched rt_mutex_wait_proxy_lock(struct rt_mutex *lock,
+int __sched rt_mutex_wait_proxy_lock(struct rt_mutex_base *lock,
 				     struct hrtimer_sleeper *to,
 				     struct rt_mutex_waiter *waiter)
 {
@@ -337,7 +355,7 @@ int __sched rt_mutex_wait_proxy_lock(struct rt_mutex *lock,
 	raw_spin_lock_irq(&lock->wait_lock);
 	/* sleep on the mutex */
 	set_current_state(TASK_INTERRUPTIBLE);
-	ret = __rt_mutex_slowlock(lock, TASK_INTERRUPTIBLE, to, waiter);
+	ret = rt_mutex_slowlock_block(lock, NULL, TASK_INTERRUPTIBLE, to, waiter);
 	/*
 	 * try_to_take_rt_mutex() sets the waiter bit unconditionally. We might
 	 * have to fix that up.
@@ -368,7 +386,7 @@ int __sched rt_mutex_wait_proxy_lock(struct rt_mutex *lock,
  *
  * Special API call for PI-futex support
  */
-bool __sched rt_mutex_cleanup_proxy_lock(struct rt_mutex *lock,
+bool __sched rt_mutex_cleanup_proxy_lock(struct rt_mutex_base *lock,
 					 struct rt_mutex_waiter *waiter)
 {
 	bool cleanup = false;
@@ -413,7 +431,7 @@ bool __sched rt_mutex_cleanup_proxy_lock(struct rt_mutex *lock,
 void __sched rt_mutex_adjust_pi(struct task_struct *task)
 {
 	struct rt_mutex_waiter *waiter;
-	struct rt_mutex *next_lock;
+	struct rt_mutex_base *next_lock;
 	unsigned long flags;
 
 	raw_spin_lock_irqsave(&task->pi_lock, flags);
@@ -436,12 +454,9 @@ void __sched rt_mutex_adjust_pi(struct task_struct *task)
 /*
  * Performs the wakeup of the top-waiter and re-enables preemption.
  */
-void __sched rt_mutex_postunlock(struct wake_q_head *wake_q)
+void __sched rt_mutex_postunlock(struct rt_wake_q_head *wqh)
 {
-	wake_up_q(wake_q);
-
-	/* Pairs with preempt_disable() in mark_wakeup_next_waiter() */
-	preempt_enable();
+	rt_mutex_wake_up_q(wqh);
 }
 
 #ifdef CONFIG_DEBUG_RT_MUTEXES

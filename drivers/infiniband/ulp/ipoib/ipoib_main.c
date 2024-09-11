@@ -90,7 +90,7 @@ static int ipoib_add_one(struct ib_device *device);
 static void ipoib_remove_one(struct ib_device *device, void *client_data);
 static void ipoib_neigh_reclaim(struct rcu_head *rp);
 static struct net_device *ipoib_get_net_dev_by_params(
-		struct ib_device *dev, u8 port, u16 pkey,
+		struct ib_device *dev, u32 port, u16 pkey,
 		const union ib_gid *gid, const struct sockaddr *addr,
 		void *client_data);
 static int ipoib_set_mac(struct net_device *dev, void *addr);
@@ -316,7 +316,7 @@ static bool ipoib_is_dev_match_addr_rcu(const struct sockaddr *addr,
 	return false;
 }
 
-/**
+/*
  * Find the master net_device on top of the given net_device.
  * @dev: base IPoIB net_device
  *
@@ -361,8 +361,9 @@ static int ipoib_upper_walk(struct net_device *upper,
 }
 
 /**
- * Find a net_device matching the given address, which is an upper device of
- * the given net_device.
+ * ipoib_get_net_dev_match_addr - Find a net_device matching
+ * the given address, which is an upper device of the given net_device.
+ *
  * @addr: IP address to look for.
  * @dev: base IPoIB net_device
  *
@@ -443,7 +444,7 @@ static int ipoib_match_gid_pkey_addr(struct ipoib_dev_priv *priv,
 /* Returns the number of matching net_devs found (between 0 and 2). Also
  * return the matching net_device in the @net_dev parameter, holding a
  * reference to the net_device, if the number of matches >= 1 */
-static int __ipoib_get_net_dev_by_params(struct list_head *dev_list, u8 port,
+static int __ipoib_get_net_dev_by_params(struct list_head *dev_list, u32 port,
 					 u16 pkey_index,
 					 const union ib_gid *gid,
 					 const struct sockaddr *addr,
@@ -468,7 +469,7 @@ static int __ipoib_get_net_dev_by_params(struct list_head *dev_list, u8 port,
 }
 
 static struct net_device *ipoib_get_net_dev_by_params(
-		struct ib_device *dev, u8 port, u16 pkey,
+		struct ib_device *dev, u32 port, u16 pkey,
 		const union ib_gid *gid, const struct sockaddr *addr,
 		void *client_data)
 {
@@ -2155,7 +2156,7 @@ static void ipoib_build_priv(struct net_device *dev)
 	INIT_DELAYED_WORK(&priv->neigh_reap_task, ipoib_reap_neigh);
 }
 
-static struct net_device *ipoib_alloc_netdev(struct ib_device *hca, u8 port,
+static struct net_device *ipoib_alloc_netdev(struct ib_device *hca, u32 port,
 					     const char *name)
 {
 	struct net_device *dev;
@@ -2172,7 +2173,7 @@ static struct net_device *ipoib_alloc_netdev(struct ib_device *hca, u8 port,
 	return dev;
 }
 
-int ipoib_intf_init(struct ib_device *hca, u8 port, const char *name,
+int ipoib_intf_init(struct ib_device *hca, u32 port, const char *name,
 		    struct net_device *dev)
 {
 	struct rdma_netdev *rn = netdev_priv(dev);
@@ -2223,7 +2224,7 @@ out:
 	return rc;
 }
 
-struct net_device *ipoib_intf_alloc(struct ib_device *hca, u8 port,
+struct net_device *ipoib_intf_alloc(struct ib_device *hca, u32 port,
 				    const char *name)
 {
 	struct net_device *dev;
@@ -2274,7 +2275,7 @@ static ssize_t pkey_show(struct device *dev, struct device_attribute *attr,
 	struct net_device *ndev = to_net_dev(dev);
 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
 
-	return sprintf(buf, "0x%04x\n", priv->pkey);
+	return sysfs_emit(buf, "0x%04x\n", priv->pkey);
 }
 static DEVICE_ATTR_RO(pkey);
 
@@ -2284,7 +2285,8 @@ static ssize_t umcast_show(struct device *dev, struct device_attribute *attr,
 	struct net_device *ndev = to_net_dev(dev);
 	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
 
-	return sprintf(buf, "%d\n", test_bit(IPOIB_FLAG_UMCAST, &priv->flags));
+	return sysfs_emit(buf, "%d\n",
+			  test_bit(IPOIB_FLAG_UMCAST, &priv->flags));
 }
 
 void ipoib_set_umcast(struct net_device *ndev, int umcast_val)
@@ -2453,7 +2455,7 @@ static ssize_t dev_id_show(struct device *dev,
 			"\"%s\" wants to know my dev_id. Should it look at dev_port instead? See Documentation/ABI/testing/sysfs-class-net for more info.\n",
 			current->comm);
 
-	return sprintf(buf, "%#x\n", ndev->dev_id);
+	return sysfs_emit(buf, "%#x\n", ndev->dev_id);
 }
 static DEVICE_ATTR_RO(dev_id);
 
@@ -2464,7 +2466,7 @@ static int ipoib_intercept_dev_id_attr(struct net_device *dev)
 }
 
 static struct net_device *ipoib_add_port(const char *format,
-					 struct ib_device *hca, u8 port)
+					 struct ib_device *hca, u32 port)
 {
 	struct rtnl_link_ops *ops = ipoib_get_link_ops();
 	struct rdma_netdev_alloc_params params;

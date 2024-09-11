@@ -84,6 +84,7 @@ struct uart_8250_em485 {
 	struct hrtimer		stop_tx_timer;  /* "rs485 stop tx" timer */
 	struct hrtimer		*active_timer;  /* pointer to active timer */
 	struct uart_8250_port	*port;          /* for hrtimer callbacks */
+	unsigned int		tx_stopped:1;	/* tx is currently stopped */
 };
 
 /*
@@ -134,6 +135,8 @@ struct uart_8250_port {
 	void			(*dl_write)(struct uart_8250_port *, int);
 
 	struct uart_8250_em485 *em485;
+	void			(*rs485_start_tx)(struct uart_8250_port *);
+	void			(*rs485_stop_tx)(struct uart_8250_port *);
 };
 
 static inline struct uart_8250_port *up_to_u8250p(struct uart_port *up)

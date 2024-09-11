@@ -3,7 +3,7 @@
 #define _LINUX_KHUGEPAGED_H
 
 #include <linux/sched/coredump.h> /* MMF_VM_HUGEPAGE */
-#include <linux/shmem_fs.h>
+#include RH_KABI_HIDE_INCLUDE(<linux/shmem_fs.h>)
 
 
 #ifdef CONFIG_TRANSPARENT_HUGEPAGE

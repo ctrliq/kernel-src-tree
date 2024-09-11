@@ -162,7 +162,7 @@ struct request {
 	 */
 	union {
 		struct hlist_node hash;	/* merge hash */
-		struct list_head ipi_list;
+		RH_KABI_REPLACE(struct list_head ipi_list, struct llist_node ipi_list)
 	};
 
 	/*
@@ -489,7 +489,7 @@ struct request_queue {
 #ifdef CONFIG_PM
 	struct device		*dev;
 	RH_KABI_REPLACE(int	rpm_status, enum rpm_status rpm_status)
-	unsigned int		nr_pending;
+	RH_KABI_DEPRECATE(unsigned int,		nr_pending)
 #endif
 
 	/*
@@ -947,6 +947,8 @@ extern void blk_execute_rq(struct request_queue *, struct gendisk *,
 			  struct request *, int);
 extern void blk_execute_rq_nowait(struct request_queue *, struct gendisk *,
 				  struct request *, int, rq_end_io_fn *);
+blk_status_t blk_execute_rq_rh(struct request_queue *, struct gendisk *,
+			  struct request *, int);
 
 /* Helper to convert REQ_OP_XXX to its string format XXX */
 extern const char *blk_op_str(unsigned int op);
@@ -1281,7 +1283,7 @@ static inline bool blk_needs_flush_plug(struct task_struct *tsk)
 
 extern void blk_io_schedule(void);
 
-int blkdev_issue_flush(struct block_device *, gfp_t);
+int blkdev_issue_flush(struct block_device *bdev);
 extern int blkdev_issue_write_same(struct block_device *bdev, sector_t sector,
 		sector_t nr_sects, gfp_t gfp_mask, struct page *page);
 
@@ -1911,7 +1913,7 @@ static inline bool blk_needs_flush_plug(struct task_struct *tsk)
 	return false;
 }
 
-static inline int blkdev_issue_flush(struct block_device *bdev, gfp_t gfp_mask)
+static inline int blkdev_issue_flush(struct block_device *bdev)
 {
 	return 0;
 }

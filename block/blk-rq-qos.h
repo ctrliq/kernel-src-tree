@@ -18,6 +18,7 @@ enum rq_qos_id {
 #else
 	RQ_QOS_LATENCY,
 	RQ_QOS_COST,
+	RQ_QOS_IOPRIO,
 #endif
 };
 

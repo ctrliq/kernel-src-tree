@@ -161,7 +161,6 @@ static int hmac_sha256(u8 *key, u8 ksize, char *plaintext, u8 psize, u8 *output)
 	}
 
 	shash->tfm = tfm;
-	shash->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	ret = crypto_shash_digest(shash, plaintext, psize, output);
 
@@ -304,6 +303,9 @@ void amp_read_loc_assoc_final_data(struct hci_dev *hdev,
 	struct amp_mgr *mgr = hcon->amp_mgr;
 	struct hci_request req;
 	int err;
+
+	if (!mgr)
+		return;
 
 	if (!mgr)
 		return;

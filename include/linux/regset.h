@@ -20,6 +20,52 @@
 struct task_struct;
 struct user_regset;
 
+struct membuf {
+	void *p;
+	size_t left;
+};
+
+static inline int membuf_zero(struct membuf *s, size_t size)
+{
+	if (s->left) {
+		if (size > s->left)
+			size = s->left;
+		memset(s->p, 0, size);
+		s->p += size;
+		s->left -= size;
+	}
+	return s->left;
+}
+
+static inline int membuf_write(struct membuf *s, const void *v, size_t size)
+{
+	if (s->left) {
+		if (size > s->left)
+			size = s->left;
+		memcpy(s->p, v, size);
+		s->p += size;
+		s->left -= size;
+	}
+	return s->left;
+}
+
+/* current s->p must be aligned for v; v must be a scalar */
+#define membuf_store(s, v)				\
+({							\
+	struct membuf *__s = (s);			\
+        if (__s->left) {				\
+		typeof(v) __v = (v);			\
+		size_t __size = sizeof(__v);		\
+		if (unlikely(__size > __s->left)) {	\
+			__size = __s->left;		\
+			memcpy(__s->p, &__v, __size);	\
+		} else {				\
+			*(typeof(__v + 0) *)__s->p = __v;	\
+		}					\
+		__s->p += __size;			\
+		__s->left -= __size;			\
+	}						\
+	__s->left;})
 
 /**
  * user_regset_active_fn - type of @active function in &struct user_regset
@@ -59,6 +105,10 @@ typedef int user_regset_get_fn(struct task_struct *target,
 			       const struct user_regset *regset,
 			       unsigned int pos, unsigned int count,
 			       void *kbuf, void __user *ubuf);
+
+typedef int user_regset_get2_fn(struct task_struct *target,
+			       const struct user_regset *regset,
+			       struct membuf to);
 
 /**
  * user_regset_set_fn - type of @set function in &struct user_regset
@@ -189,6 +239,7 @@ typedef unsigned int user_regset_get_size_fn(struct task_struct *target,
  */
 struct user_regset {
 	user_regset_get_fn		*get;
+	user_regset_get2_fn		*regset_get;
 	user_regset_set_fn		*set;
 	user_regset_active_fn		*active;
 	user_regset_writeback_fn	*writeback;
@@ -356,31 +407,19 @@ static inline int user_regset_copyin_ignore(unsigned int *pos,
 	return 0;
 }
 
-/**
- * copy_regset_to_user - fetch a thread's user_regset data into user memory
- * @target:	thread to be examined
- * @view:	&struct user_regset_view describing user thread machine state
- * @setno:	index in @view->regsets
- * @offset:	offset into the regset data, in bytes
- * @size:	amount of data to copy, in bytes
- * @data:	user-mode pointer to copy into
- */
-static inline int copy_regset_to_user(struct task_struct *target,
-				      const struct user_regset_view *view,
-				      unsigned int setno,
-				      unsigned int offset, unsigned int size,
-				      void __user *data)
-{
-	const struct user_regset *regset = &view->regsets[setno];
+extern int regset_get(struct task_struct *target,
+		      const struct user_regset *regset,
+		      unsigned int size, void *data);
 
-	if (!regset->get)
-		return -EOPNOTSUPP;
+extern int regset_get_alloc(struct task_struct *target,
+			    const struct user_regset *regset,
+			    unsigned int size,
+			    void **data);
 
-	if (!access_ok(data, size))
-		return -EFAULT;
-
-	return regset->get(target, regset, offset, size, NULL, data);
-}
+extern int copy_regset_to_user(struct task_struct *target,
+			       const struct user_regset_view *view,
+			       unsigned int setno, unsigned int offset,
+			       unsigned int size, void __user *data);
 
 /**
  * copy_regset_from_user - store into thread's user_regset data from user memory

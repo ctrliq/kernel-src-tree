@@ -348,22 +348,6 @@ static void nvmet_execute_get_log_page(struct nvmet_req *req)
 	nvmet_req_complete(req, NVME_SC_INVALID_FIELD | NVME_SC_DNR);
 }
 
-static u16 nvmet_set_model_number(struct nvmet_subsys *subsys)
-{
-	u16 status = 0;
-
-	mutex_lock(&subsys->lock);
-	if (!subsys->model_number) {
-		subsys->model_number =
-			kstrdup(NVMET_DEFAULT_CTRL_MODEL, GFP_KERNEL);
-		if (!subsys->model_number)
-			status = NVME_SC_INTERNAL;
-	}
-	mutex_unlock(&subsys->lock);
-
-	return status;
-}
-
 static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 {
 	struct nvmet_ctrl *ctrl = req->sq->ctrl;
@@ -371,22 +355,6 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 	struct nvme_id_ctrl *id;
 	u32 cmd_capsule_size;
 	u16 status = 0;
-
-	if (!subsys->subsys_discovered) {
-		mutex_lock(&subsys->lock);
-		subsys->subsys_discovered = true;
-		mutex_unlock(&subsys->lock);
-	}
-
-	/*
-	 * If there is no model number yet, set it now.  It will then remain
-	 * stable for the life time of the subsystem.
-	 */
-	if (!subsys->model_number) {
-		status = nvmet_set_model_number(subsys);
-		if (status)
-			goto out;
-	}
 
 	id = kzalloc(sizeof(*id), GFP_KERNEL);
 	if (!id) {
@@ -405,6 +373,12 @@ static void nvmet_execute_identify_ctrl(struct nvmet_req *req)
 		       UTS_RELEASE, strlen(UTS_RELEASE), ' ');
 
 	id->rab = 6;
+
+	if (!subsys->subsys_discovered) {
+		mutex_lock(&subsys->lock);
+		subsys->subsys_discovered = true;
+		mutex_unlock(&subsys->lock);
+	}
 
 	/*
 	 * XXX: figure out how we can assign a IEEE OUI, but until then

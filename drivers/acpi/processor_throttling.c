@@ -35,9 +35,6 @@
 
 #define PREFIX "ACPI: "
 
-#define _COMPONENT              ACPI_PROCESSOR_COMPONENT
-ACPI_MODULE_NAME("processor_throttling");
-
 /* ignore_tpc:
  *  0 -> acpi processor driver doesn't ignore _TPC values
  *  1 -> acpi processor driver ignores _TPC values
@@ -209,10 +206,8 @@ err_ret:
  */
 void acpi_processor_throttling_init(void)
 {
-	if (acpi_processor_update_tsd_coord()) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-			"Assume no T-state coordination\n"));
-	}
+	if (acpi_processor_update_tsd_coord())
+		pr_debug("Assume no T-state coordination\n");
 
 	return;
 }
@@ -229,12 +224,13 @@ static int acpi_processor_throttling_notifier(unsigned long event, void *data)
 	cpu = p_tstate->cpu;
 	pr = per_cpu(processors, cpu);
 	if (!pr) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Invalid pr pointer\n"));
+		pr_debug("Invalid pr pointer\n");
 		return 0;
 	}
 	if (!pr->flags.throttling) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Throttling control is "
-				"unsupported on CPU %d\n", cpu));
+		acpi_handle_debug(pr->handle,
+				  "Throttling control unsupported on CPU %d\n",
+				  cpu);
 		return 0;
 	}
 	target_state = p_tstate->target_state;
@@ -258,9 +254,9 @@ static int acpi_processor_throttling_notifier(unsigned long event, void *data)
 			target_state = p_throttling->state_count - 1;
 		}
 		p_tstate->target_state = target_state;
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "PreChange Event:"
-				"target T-state of CPU %d is T%d\n",
-				cpu, target_state));
+		acpi_handle_debug(pr->handle,
+				  "PreChange Event: target T-state of CPU %d is T%d\n",
+				  cpu, target_state);
 		break;
 	case THROTTLING_POSTCHANGE:
 		/*
@@ -268,9 +264,9 @@ static int acpi_processor_throttling_notifier(unsigned long event, void *data)
 		 * T-state flag of acpi_processor_throttling.
 		 */
 		p_throttling->state = target_state;
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "PostChange Event:"
-				"CPU %d is switched to T%d\n",
-				cpu, target_state));
+		acpi_handle_debug(pr->handle,
+				  "PostChange Event: CPU %d is switched to T%d\n",
+				  cpu, target_state);
 		break;
 	default:
 		printk(KERN_WARNING
@@ -297,9 +293,9 @@ static int acpi_processor_get_platform_limit(struct acpi_processor *pr)
 
 	status = acpi_evaluate_integer(pr->handle, "_TPC", NULL, &tpc);
 	if (ACPI_FAILURE(status)) {
-		if (status != AE_NOT_FOUND) {
-			ACPI_EXCEPTION((AE_INFO, status, "Evaluating _TPC"));
-		}
+		if (status != AE_NOT_FOUND)
+			acpi_evaluation_failure_warn(pr->handle, "_TPC", status);
+
 		return -ENODEV;
 	}
 
@@ -430,9 +426,9 @@ static int acpi_processor_get_throttling_control(struct acpi_processor *pr)
 
 	status = acpi_evaluate_object(pr->handle, "_PTC", NULL, &buffer);
 	if (ACPI_FAILURE(status)) {
-		if (status != AE_NOT_FOUND) {
-			ACPI_EXCEPTION((AE_INFO, status, "Evaluating _PTC"));
-		}
+		if (status != AE_NOT_FOUND)
+			acpi_evaluation_failure_warn(pr->handle, "_PTC", status);
+
 		return -ENODEV;
 	}
 
@@ -515,9 +511,9 @@ static int acpi_processor_get_throttling_states(struct acpi_processor *pr)
 
 	status = acpi_evaluate_object(pr->handle, "_TSS", NULL, &buffer);
 	if (ACPI_FAILURE(status)) {
-		if (status != AE_NOT_FOUND) {
-			ACPI_EXCEPTION((AE_INFO, status, "Evaluating _TSS"));
-		}
+		if (status != AE_NOT_FOUND)
+			acpi_evaluation_failure_warn(pr->handle, "_TSS", status);
+
 		return -ENODEV;
 	}
 
@@ -528,8 +524,8 @@ static int acpi_processor_get_throttling_states(struct acpi_processor *pr)
 		goto end;
 	}
 
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Found %d throttling states\n",
-			  tss->package.count));
+	acpi_handle_debug(pr->handle, "Found %d throttling states\n",
+			  tss->package.count);
 
 	pr->throttling.state_count = tss->package.count;
 	pr->throttling.states_tss =
@@ -550,12 +546,13 @@ static int acpi_processor_get_throttling_states(struct acpi_processor *pr)
 		state.length = sizeof(struct acpi_processor_tx_tss);
 		state.pointer = tx;
 
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Extracting state %d\n", i));
+		acpi_handle_debug(pr->handle, "Extracting state %d\n", i);
 
 		status = acpi_extract_package(&(tss->package.elements[i]),
 					      &format, &state);
 		if (ACPI_FAILURE(status)) {
-			ACPI_EXCEPTION((AE_INFO, status, "Invalid _TSS data"));
+			acpi_handle_warn(pr->handle, "Invalid _TSS data: %s\n",
+					 acpi_format_exception(status));
 			result = -EFAULT;
 			kfree(pr->throttling.states_tss);
 			goto end;
@@ -595,9 +592,9 @@ static int acpi_processor_get_tsd(struct acpi_processor *pr)
 
 	status = acpi_evaluate_object(pr->handle, "_TSD", NULL, &buffer);
 	if (ACPI_FAILURE(status)) {
-		if (status != AE_NOT_FOUND) {
-			ACPI_EXCEPTION((AE_INFO, status, "Evaluating _TSD"));
-		}
+		if (status != AE_NOT_FOUND)
+			acpi_evaluation_failure_warn(pr->handle, "_TSD", status);
+
 		return -ENODEV;
 	}
 
@@ -711,9 +708,9 @@ static int acpi_processor_get_throttling_fadt(struct acpi_processor *pr)
 
 	local_irq_enable();
 
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+	acpi_handle_debug(pr->handle,
 			  "Throttling state is T%d (%d%% throttling applied)\n",
-			  state, pr->throttling.states[state].performance));
+			  state, pr->throttling.states[state].performance);
 
 	return 0;
 }
@@ -888,8 +885,8 @@ static int acpi_processor_get_throttling_ptc(struct acpi_processor *pr)
 	if (ret >= 0) {
 		state = acpi_get_throttling_state(pr, value);
 		if (state == -1) {
-			ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-				"Invalid throttling state, reset\n"));
+			acpi_handle_debug(pr->handle,
+					  "Invalid throttling state, reset\n");
 			state = 0;
 			ret = __acpi_processor_set_throttling(pr, state, true,
 							      true);
@@ -934,10 +931,10 @@ static int acpi_processor_get_fadt_info(struct acpi_processor *pr)
 	int i, step;
 
 	if (!pr->throttling.address) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "No throttling register\n"));
+		acpi_handle_debug(pr->handle, "No throttling register\n");
 		return -EINVAL;
 	} else if (!pr->throttling.duty_width) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO, "No throttling states\n"));
+		acpi_handle_debug(pr->handle, "No throttling states\n");
 		return -EINVAL;
 	}
 	/* TBD: Support duty_cycle values that span bit 4. */
@@ -1028,10 +1025,10 @@ static int acpi_processor_set_throttling_fadt(struct acpi_processor *pr,
 
 	local_irq_enable();
 
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+	acpi_handle_debug(pr->handle,
 			  "Throttling state set to T%d (%d%%)\n", state,
 			  (pr->throttling.states[state].performance ? pr->
-			   throttling.states[state].performance / 10 : 0)));
+			   throttling.states[state].performance / 10 : 0));
 
 	return 0;
 }
@@ -1142,8 +1139,8 @@ static int __acpi_processor_set_throttling(struct acpi_processor *pr,
 			 * error message and continue.
 			 */
 			if (!match_pr) {
-				ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-					"Invalid Pointer for CPU %d\n", i));
+				acpi_handle_debug(pr->handle,
+					"Invalid Pointer for CPU %d\n", i);
 				continue;
 			}
 			/*
@@ -1151,9 +1148,8 @@ static int __acpi_processor_set_throttling(struct acpi_processor *pr,
 			 * we will report the error message and continue.
 			 */
 			if (!match_pr->flags.throttling) {
-				ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-					"Throttling Control is unsupported "
-					"on CPU %d\n", i));
+				acpi_handle_debug(pr->handle,
+					"Throttling Control unsupported on CPU %d\n", i);
 				continue;
 			}
 
@@ -1190,11 +1186,11 @@ int acpi_processor_get_throttling_info(struct acpi_processor *pr)
 	int result = 0;
 	struct acpi_processor_throttling *pthrottling;
 
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+	acpi_handle_debug(pr->handle,
 			  "pblk_address[0x%08x] duty_offset[%d] duty_width[%d]\n",
 			  pr->throttling.address,
 			  pr->throttling.duty_offset,
-			  pr->throttling.duty_width));
+			  pr->throttling.duty_width);
 
 	/*
 	 * Evaluate _PTC, _TSS and _TPC
@@ -1234,13 +1230,13 @@ int acpi_processor_get_throttling_info(struct acpi_processor *pr)
 	 * used this part.
 	 */
 	if (errata.piix4.throttle) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
-				  "Throttling not supported on PIIX4 A- or B-step\n"));
+		acpi_handle_debug(pr->handle,
+				  "Throttling not supported on PIIX4 A- or B-step\n");
 		return 0;
 	}
 
-	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Found %d throttling states\n",
-			  pr->throttling.state_count));
+	acpi_handle_debug(pr->handle, "Found %d throttling states\n",
+			  pr->throttling.state_count);
 
 	pr->flags.throttling = 1;
 
@@ -1255,9 +1251,9 @@ int acpi_processor_get_throttling_info(struct acpi_processor *pr)
 		goto end;
 
 	if (pr->throttling.state) {
-		ACPI_DEBUG_PRINT((ACPI_DB_INFO,
+		acpi_handle_debug(pr->handle,
 				  "Disabling throttling (was T%d)\n",
-				  pr->throttling.state));
+				  pr->throttling.state);
 		result = acpi_processor_set_throttling(pr, 0, false);
 		if (result)
 			goto end;

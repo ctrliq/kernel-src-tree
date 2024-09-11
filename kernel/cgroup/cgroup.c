@@ -5788,7 +5788,7 @@ struct cgroup *cgroup_get_from_id(u64 id)
 	struct cgroup *cgrp = NULL;
 
 	mutex_lock(&cgroup_mutex);
-	kn = kernfs_find_and_get_node_by_id(cgrp_dfl_root.kf_root, id);
+	kn = kernfs_get_node_by_id(cgrp_dfl_root.kf_root, id);
 	if (!kn)
 		goto out_unlock;
 

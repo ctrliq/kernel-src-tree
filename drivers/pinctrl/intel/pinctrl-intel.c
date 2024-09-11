@@ -220,7 +220,6 @@ enum {
 };
 
 static int intel_pad_locked(struct intel_pinctrl *pctrl, unsigned int pin)
-
 {
 	struct intel_community *community;
 	const struct intel_padgroup *padgrp;

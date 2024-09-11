@@ -436,7 +436,7 @@ static inline bool i40e_is_channel_macvlan(struct i40e_channel *ch)
 	return !!ch->fwd;
 }
 
-static inline u8 *i40e_channel_mac(struct i40e_channel *ch)
+static inline const u8 *i40e_channel_mac(struct i40e_channel *ch)
 {
 	if (i40e_is_channel_macvlan(ch))
 		return ch->fwd->netdev->dev_addr;
@@ -947,6 +947,8 @@ struct i40e_vsi {
 struct i40e_netdev_priv {
 	struct i40e_vsi *vsi;
 };
+
+extern struct ida i40e_client_ida;
 
 /* struct that defines an interrupt vector */
 struct i40e_q_vector {

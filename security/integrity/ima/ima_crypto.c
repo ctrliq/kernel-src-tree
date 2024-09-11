@@ -341,7 +341,6 @@ static int ima_calc_file_hash_tfm(struct file *file,
 	SHASH_DESC_ON_STACK(shash, tfm);
 
 	shash->tfm = tfm;
-	shash->flags = 0;
 
 	hash->length = crypto_shash_digestsize(tfm);
 
@@ -469,7 +468,6 @@ static int ima_calc_field_array_hash_tfm(struct ima_field_data *field_data,
 	int rc, i;
 
 	shash->tfm = tfm;
-	shash->flags = 0;
 
 	hash->length = crypto_shash_digestsize(tfm);
 
@@ -591,7 +589,6 @@ static int calc_buffer_shash_tfm(const void *buf, loff_t size,
 	int rc;
 
 	shash->tfm = tfm;
-	shash->flags = 0;
 
 	hash->length = crypto_shash_digestsize(tfm);
 
@@ -672,7 +669,6 @@ static int ima_calc_boot_aggregate_tfm(char *digest, u16 alg_id,
 	SHASH_DESC_ON_STACK(shash, tfm);
 
 	shash->tfm = tfm;
-	shash->flags = 0;
 
 	pr_devel("calculating the boot-aggregate based on TPM bank: %04x\n",
 		 d.alg_id);

@@ -23,6 +23,8 @@
 #include <trace/events/power.h>
 #include <linux/cpuset.h>
 
+#include <linux/rh_tasklist_lock.h>
+
 /*
  * Timeout for stopping processes
  */

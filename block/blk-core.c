@@ -54,6 +54,7 @@ EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_remap);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_bio_complete);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_split);
 EXPORT_TRACEPOINT_SYMBOL_GPL(block_unplug);
+EXPORT_TRACEPOINT_SYMBOL_GPL(block_rq_insert);
 
 DEFINE_IDA(blk_queue_ida);
 
@@ -955,8 +956,8 @@ static blk_qc_t do_make_request(struct bio *bio)
 	struct request_queue *q = bio->bi_disk->queue;
 	blk_qc_t ret = BLK_QC_T_NONE;
 
-	if (!q->make_request_fn)
-		return blk_mq_make_request(q, bio);
+	if (queue_is_mq(q))
+		return q->make_request_fn(q, bio);
 	ret = q->make_request_fn(q, bio);
 	blk_queue_exit(q);
 	return ret;
@@ -1065,7 +1066,7 @@ blk_qc_t direct_make_request(struct bio *bio)
 {
 	struct request_queue *q = bio->bi_disk->queue;
 
-	if (WARN_ON_ONCE(q->make_request_fn)) {
+	if (WARN_ON_ONCE(!queue_is_mq(q))) {
 		bio_io_error(bio);
 		return BLK_QC_T_NONE;
 	}
@@ -1073,7 +1074,7 @@ blk_qc_t direct_make_request(struct bio *bio)
 		return BLK_QC_T_NONE;
 	if (unlikely(bio_queue_enter(bio)))
 		return BLK_QC_T_NONE;
-	return blk_mq_make_request(q, bio);
+	return q->make_request_fn(q, bio);
 }
 EXPORT_SYMBOL_GPL(direct_make_request);
 

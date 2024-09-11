@@ -12,13 +12,14 @@
 #include <linux/posix-timers.h>
 #include RH_KABI_HIDE_INCLUDE(<linux/mm_types.h>)
 #include RH_KABI_HIDE_INCLUDE(<asm/ptrace.h>)
+#include <linux/refcount.h>
 
 /*
  * Types defining task->signal and task->sighand and APIs using them:
  */
 
 struct sighand_struct {
-	atomic_t		count;
+	RH_KABI_REPLACE(atomic_t count, refcount_t count)
 	struct k_sigaction	action[_NSIG];
 	spinlock_t		siglock;
 	wait_queue_head_t	signalfd_wqh;
@@ -82,7 +83,7 @@ struct multiprocess_signals {
  * the locking of signal_struct.
  */
 struct signal_struct {
-	refcount_t		sigcnt;
+	RH_KABI_REPLACE(atomic_t sigcnt, refcount_t sigcnt)
 	atomic_t		live;
 	int			nr_threads;
 	struct list_head	thread_head;
@@ -245,6 +246,12 @@ struct signal_struct {
 	RH_KABI_RESERVE(3)
 	RH_KABI_RESERVE(4)
 	RH_KABI_EXTEND(struct posix_cputimers posix_cputimers)
+	RH_KABI_EXTEND(struct rw_semaphore exec_update_lock)
+						/* Held while task_struct is
+						 * being updated during exec,
+						 * and may have inconsistent
+						 * permissions.
+						 */
 } __randomize_layout;
 
 /*
@@ -375,7 +382,7 @@ static inline int fatal_signal_pending(struct task_struct *p)
 	return signal_pending(p) && __fatal_signal_pending(p);
 }
 
-static inline int signal_pending_state(long state, struct task_struct *p)
+static inline int signal_pending_state(unsigned int state, struct task_struct *p)
 {
 	if (!(state & (TASK_INTERRUPTIBLE | TASK_WAKEKILL)))
 		return 0;

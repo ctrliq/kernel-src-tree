@@ -182,7 +182,7 @@ static ssize_t xgene_pmu_format_show(struct device *dev,
 	struct dev_ext_attribute *eattr;
 
 	eattr = container_of(attr, struct dev_ext_attribute, attr);
-	return sprintf(buf, "%s\n", (char *) eattr->var);
+	return sysfs_emit(buf, "%s\n", (char *) eattr->var);
 }
 
 #define XGENE_PMU_FORMAT_ATTR(_name, _config)		\
@@ -290,17 +290,14 @@ static const struct attribute_group mc_pmu_v3_format_attr_group = {
 static ssize_t xgene_pmu_event_show(struct device *dev,
 				    struct device_attribute *attr, char *buf)
 {
-	struct dev_ext_attribute *eattr;
+	struct perf_pmu_events_attr *pmu_attr =
+		container_of(attr, struct perf_pmu_events_attr, attr);
 
-	eattr = container_of(attr, struct dev_ext_attribute, attr);
-	return sprintf(buf, "config=0x%lx\n", (unsigned long) eattr->var);
+	return sysfs_emit(buf, "config=0x%llx\n", pmu_attr->id);
 }
 
 #define XGENE_PMU_EVENT_ATTR(_name, _config)		\
-	(&((struct dev_ext_attribute[]) {		\
-		{ .attr = __ATTR(_name, S_IRUGO, xgene_pmu_event_show, NULL), \
-		  .var = (void *) _config, }		\
-	 })[0].attr.attr)
+	PMU_EVENT_ATTR_ID(_name, xgene_pmu_event_show, _config)
 
 static struct attribute *l3c_pmu_events_attrs[] = {
 	XGENE_PMU_EVENT_ATTR(cycle-count,			0x00),
@@ -1991,6 +1988,7 @@ static struct platform_driver xgene_pmu_driver = {
 		.name		= "xgene-pmu",
 		.of_match_table = xgene_pmu_of_match,
 		.acpi_match_table = ACPI_PTR(xgene_pmu_acpi_match),
+		.suppress_bind_attrs = true,
 	},
 };
 

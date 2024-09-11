@@ -1122,6 +1122,9 @@ static u64 read_id_reg(const struct kvm_vcpu *vcpu,
 	} else if (id == SYS_ID_AA64DFR0_EL1) {
 		u64 cap = 0;
 
+		/* Limit debug to ARMv8.0 */
+		val &= ~(0xfUL << ID_AA64DFR0_DEBUGVER_SHIFT);
+		val |= (0x6UL < ID_AA64DFR0_DEBUGVER_SHIFT);
 		/* Limit guests to PMUv3 for ARMv8.1 */
 		if (kvm_vcpu_has_pmu(vcpu))
 			cap = ID_AA64DFR0_PMUVER_8_1;

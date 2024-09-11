@@ -1510,9 +1510,9 @@ static ssize_t mode_show(struct device *d, struct device_attribute *attr,
 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
 
 	if (test_bit(IPOIB_FLAG_ADMIN_CM, &priv->flags))
-		return sprintf(buf, "connected\n");
+		return sysfs_emit(buf, "connected\n");
 	else
-		return sprintf(buf, "datagram\n");
+		return sysfs_emit(buf, "datagram\n");
 }
 
 static ssize_t mode_store(struct device *d, struct device_attribute *attr,

@@ -169,9 +169,9 @@ static int srp_tmo_get(char *buffer, const struct kernel_param *kp)
 	int tmo = *(int *)kp->arg;
 
 	if (tmo >= 0)
-		return sprintf(buffer, "%d\n", tmo);
+		return sysfs_emit(buffer, "%d\n", tmo);
 	else
-		return sprintf(buffer, "off\n");
+		return sysfs_emit(buffer, "off\n");
 }
 
 static int srp_tmo_set(const char *val, const struct kernel_param *kp)
@@ -2909,7 +2909,7 @@ static ssize_t id_ext_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "0x%016llx\n", be64_to_cpu(target->id_ext));
+	return sysfs_emit(buf, "0x%016llx\n", be64_to_cpu(target->id_ext));
 }
 
 static DEVICE_ATTR_RO(id_ext);
@@ -2919,7 +2919,7 @@ static ssize_t ioc_guid_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "0x%016llx\n", be64_to_cpu(target->ioc_guid));
+	return sysfs_emit(buf, "0x%016llx\n", be64_to_cpu(target->ioc_guid));
 }
 
 static DEVICE_ATTR_RO(ioc_guid);
@@ -2931,8 +2931,8 @@ static ssize_t service_id_show(struct device *dev,
 
 	if (target->using_rdma_cm)
 		return -ENOENT;
-	return sprintf(buf, "0x%016llx\n",
-		       be64_to_cpu(target->ib_cm.service_id));
+	return sysfs_emit(buf, "0x%016llx\n",
+			  be64_to_cpu(target->ib_cm.service_id));
 }
 
 static DEVICE_ATTR_RO(service_id);
@@ -2944,7 +2944,8 @@ static ssize_t pkey_show(struct device *dev, struct device_attribute *attr,
 
 	if (target->using_rdma_cm)
 		return -ENOENT;
-	return sprintf(buf, "0x%04x\n", be16_to_cpu(target->ib_cm.pkey));
+
+	return sysfs_emit(buf, "0x%04x\n", be16_to_cpu(target->ib_cm.pkey));
 }
 
 static DEVICE_ATTR_RO(pkey);
@@ -2954,7 +2955,7 @@ static ssize_t sgid_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%pI6\n", target->sgid.raw);
+	return sysfs_emit(buf, "%pI6\n", target->sgid.raw);
 }
 
 static DEVICE_ATTR_RO(sgid);
@@ -2967,7 +2968,8 @@ static ssize_t dgid_show(struct device *dev, struct device_attribute *attr,
 
 	if (target->using_rdma_cm)
 		return -ENOENT;
-	return sprintf(buf, "%pI6\n", ch->ib_cm.path.dgid.raw);
+
+	return sysfs_emit(buf, "%pI6\n", ch->ib_cm.path.dgid.raw);
 }
 
 static DEVICE_ATTR_RO(dgid);
@@ -2979,7 +2981,8 @@ static ssize_t orig_dgid_show(struct device *dev, struct device_attribute *attr,
 
 	if (target->using_rdma_cm)
 		return -ENOENT;
-	return sprintf(buf, "%pI6\n", target->ib_cm.orig_dgid.raw);
+
+	return sysfs_emit(buf, "%pI6\n", target->ib_cm.orig_dgid.raw);
 }
 
 static DEVICE_ATTR_RO(orig_dgid);
@@ -2995,7 +2998,8 @@ static ssize_t req_lim_show(struct device *dev, struct device_attribute *attr,
 		ch = &target->ch[i];
 		req_lim = min(req_lim, ch->req_lim);
 	}
-	return sprintf(buf, "%d\n", req_lim);
+
+	return sysfs_emit(buf, "%d\n", req_lim);
 }
 
 static DEVICE_ATTR_RO(req_lim);
@@ -3005,7 +3009,7 @@ static ssize_t zero_req_lim_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%d\n", target->zero_req_lim);
+	return sysfs_emit(buf, "%d\n", target->zero_req_lim);
 }
 
 static DEVICE_ATTR_RO(zero_req_lim);
@@ -3015,7 +3019,7 @@ static ssize_t local_ib_port_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%d\n", target->srp_host->port);
+	return sysfs_emit(buf, "%d\n", target->srp_host->port);
 }
 
 static DEVICE_ATTR_RO(local_ib_port);
@@ -3025,8 +3029,8 @@ static ssize_t local_ib_device_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%s\n",
-		       dev_name(&target->srp_host->srp_dev->dev->dev));
+	return sysfs_emit(buf, "%s\n",
+			  dev_name(&target->srp_host->srp_dev->dev->dev));
 }
 
 static DEVICE_ATTR_RO(local_ib_device);
@@ -3036,7 +3040,7 @@ static ssize_t ch_count_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%d\n", target->ch_count);
+	return sysfs_emit(buf, "%d\n", target->ch_count);
 }
 
 static DEVICE_ATTR_RO(ch_count);
@@ -3046,7 +3050,7 @@ static ssize_t comp_vector_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%d\n", target->comp_vector);
+	return sysfs_emit(buf, "%d\n", target->comp_vector);
 }
 
 static DEVICE_ATTR_RO(comp_vector);
@@ -3056,7 +3060,7 @@ static ssize_t tl_retry_count_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%d\n", target->tl_retry_count);
+	return sysfs_emit(buf, "%d\n", target->tl_retry_count);
 }
 
 static DEVICE_ATTR_RO(tl_retry_count);
@@ -3066,7 +3070,7 @@ static ssize_t cmd_sg_entries_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%u\n", target->cmd_sg_cnt);
+	return sysfs_emit(buf, "%u\n", target->cmd_sg_cnt);
 }
 
 static DEVICE_ATTR_RO(cmd_sg_entries);
@@ -3076,7 +3080,7 @@ static ssize_t allow_ext_sg_show(struct device *dev,
 {
 	struct srp_target_port *target = host_to_target(class_to_shost(dev));
 
-	return sprintf(buf, "%s\n", target->allow_ext_sg ? "true" : "false");
+	return sysfs_emit(buf, "%s\n", target->allow_ext_sg ? "true" : "false");
 }
 
 static DEVICE_ATTR_RO(allow_ext_sg);
@@ -3899,7 +3903,7 @@ static ssize_t ibdev_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_host *host = container_of(dev, struct srp_host, dev);
 
-	return sprintf(buf, "%s\n", dev_name(&host->srp_dev->dev->dev));
+	return sysfs_emit(buf, "%s\n", dev_name(&host->srp_dev->dev->dev));
 }
 
 static DEVICE_ATTR_RO(ibdev);
@@ -3909,7 +3913,7 @@ static ssize_t port_show(struct device *dev, struct device_attribute *attr,
 {
 	struct srp_host *host = container_of(dev, struct srp_host, dev);
 
-	return sprintf(buf, "%d\n", host->port);
+	return sysfs_emit(buf, "%d\n", host->port);
 }
 
 static DEVICE_ATTR_RO(port);

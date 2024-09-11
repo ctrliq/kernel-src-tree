@@ -3,7 +3,7 @@
 #define _LINUX_MATH64_H
 
 #include <linux/types.h>
-#include <linux/math.h>
+#include <linux/kernel.h>
 #include <vdso/math64.h>
 #include <asm/div64.h>
 

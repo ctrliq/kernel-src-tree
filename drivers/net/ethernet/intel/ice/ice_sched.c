@@ -596,6 +596,50 @@ ice_alloc_lan_q_ctx(struct ice_hw *hw, u16 vsi_handle, u8 tc, u16 new_numqs)
 }
 
 /**
+ * ice_alloc_rdma_q_ctx - allocate RDMA queue contexts for the given VSI and TC
+ * @hw: pointer to the HW struct
+ * @vsi_handle: VSI handle
+ * @tc: TC number
+ * @new_numqs: number of queues
+ */
+static enum ice_status
+ice_alloc_rdma_q_ctx(struct ice_hw *hw, u16 vsi_handle, u8 tc, u16 new_numqs)
+{
+	struct ice_vsi_ctx *vsi_ctx;
+	struct ice_q_ctx *q_ctx;
+
+	vsi_ctx = ice_get_vsi_ctx(hw, vsi_handle);
+	if (!vsi_ctx)
+		return ICE_ERR_PARAM;
+	/* allocate RDMA queue contexts */
+	if (!vsi_ctx->rdma_q_ctx[tc]) {
+		vsi_ctx->rdma_q_ctx[tc] = devm_kcalloc(ice_hw_to_dev(hw),
+						       new_numqs,
+						       sizeof(*q_ctx),
+						       GFP_KERNEL);
+		if (!vsi_ctx->rdma_q_ctx[tc])
+			return ICE_ERR_NO_MEMORY;
+		vsi_ctx->num_rdma_q_entries[tc] = new_numqs;
+		return 0;
+	}
+	/* num queues are increased, update the queue contexts */
+	if (new_numqs > vsi_ctx->num_rdma_q_entries[tc]) {
+		u16 prev_num = vsi_ctx->num_rdma_q_entries[tc];
+
+		q_ctx = devm_kcalloc(ice_hw_to_dev(hw), new_numqs,
+				     sizeof(*q_ctx), GFP_KERNEL);
+		if (!q_ctx)
+			return ICE_ERR_NO_MEMORY;
+		memcpy(q_ctx, vsi_ctx->rdma_q_ctx[tc],
+		       prev_num * sizeof(*q_ctx));
+		devm_kfree(ice_hw_to_dev(hw), vsi_ctx->rdma_q_ctx[tc]);
+		vsi_ctx->rdma_q_ctx[tc] = q_ctx;
+		vsi_ctx->num_rdma_q_entries[tc] = new_numqs;
+	}
+	return 0;
+}
+
+/**
  * ice_aq_rl_profile - performs a rate limiting task
  * @hw: pointer to the HW struct
  * @opcode: opcode for add, query, or remove profile(s)
@@ -1774,13 +1818,22 @@ ice_sched_update_vsi_child_nodes(struct ice_port_info *pi, u16 vsi_handle,
 	if (!vsi_ctx)
 		return ICE_ERR_PARAM;
 
-	prev_numqs = vsi_ctx->sched.max_lanq[tc];
+	if (owner == ICE_SCHED_NODE_OWNER_LAN)
+		prev_numqs = vsi_ctx->sched.max_lanq[tc];
+	else
+		prev_numqs = vsi_ctx->sched.max_rdmaq[tc];
 	/* num queues are not changed or less than the previous number */
 	if (new_numqs <= prev_numqs)
 		return status;
-	status = ice_alloc_lan_q_ctx(hw, vsi_handle, tc, new_numqs);
-	if (status)
-		return status;
+	if (owner == ICE_SCHED_NODE_OWNER_LAN) {
+		status = ice_alloc_lan_q_ctx(hw, vsi_handle, tc, new_numqs);
+		if (status)
+			return status;
+	} else {
+		status = ice_alloc_rdma_q_ctx(hw, vsi_handle, tc, new_numqs);
+		if (status)
+			return status;
+	}
 
 	if (new_numqs)
 		ice_sched_calc_vsi_child_nodes(hw, new_numqs, new_num_nodes);
@@ -1795,7 +1848,10 @@ ice_sched_update_vsi_child_nodes(struct ice_port_info *pi, u16 vsi_handle,
 					       new_num_nodes, owner);
 	if (status)
 		return status;
-	vsi_ctx->sched.max_lanq[tc] = new_numqs;
+	if (owner == ICE_SCHED_NODE_OWNER_LAN)
+		vsi_ctx->sched.max_lanq[tc] = new_numqs;
+	else
+		vsi_ctx->sched.max_rdmaq[tc] = new_numqs;
 
 	return 0;
 }
@@ -1861,6 +1917,7 @@ ice_sched_cfg_vsi(struct ice_port_info *pi, u16 vsi_handle, u8 tc, u16 maxqs,
 		 * recreate the child nodes all the time in these cases.
 		 */
 		vsi_ctx->sched.max_lanq[tc] = 0;
+		vsi_ctx->sched.max_rdmaq[tc] = 0;
 	}
 
 	/* update the VSI child nodes */
@@ -1990,6 +2047,8 @@ ice_sched_rm_vsi_cfg(struct ice_port_info *pi, u16 vsi_handle, u8 owner)
 		}
 		if (owner == ICE_SCHED_NODE_OWNER_LAN)
 			vsi_ctx->sched.max_lanq[i] = 0;
+		else
+			vsi_ctx->sched.max_rdmaq[i] = 0;
 	}
 	status = 0;
 
@@ -3722,6 +3781,136 @@ ice_cfg_q_bw_dflt_lmt(struct ice_port_info *pi, u16 vsi_handle, u8 tc,
 {
 	return ice_sched_set_q_bw_lmt(pi, vsi_handle, tc, q_handle, rl_type,
 				      ICE_SCHED_DFLT_BW);
+}
+
+/**
+ * ice_sched_get_node_by_id_type - get node from ID type
+ * @pi: port information structure
+ * @id: identifier
+ * @agg_type: type of aggregator
+ * @tc: traffic class
+ *
+ * This function returns node identified by ID of type aggregator, and
+ * based on traffic class (TC). This function needs to be called with
+ * the scheduler lock held.
+ */
+static struct ice_sched_node *
+ice_sched_get_node_by_id_type(struct ice_port_info *pi, u32 id,
+			      enum ice_agg_type agg_type, u8 tc)
+{
+	struct ice_sched_node *node = NULL;
+
+	switch (agg_type) {
+	case ICE_AGG_TYPE_VSI: {
+		struct ice_vsi_ctx *vsi_ctx;
+		u16 vsi_handle = (u16)id;
+
+		if (!ice_is_vsi_valid(pi->hw, vsi_handle))
+			break;
+		/* Get sched_vsi_info */
+		vsi_ctx = ice_get_vsi_ctx(pi->hw, vsi_handle);
+		if (!vsi_ctx)
+			break;
+		node = vsi_ctx->sched.vsi_node[tc];
+		break;
+	}
+
+	case ICE_AGG_TYPE_AGG: {
+		struct ice_sched_node *tc_node;
+
+		tc_node = ice_sched_get_tc_node(pi, tc);
+		if (tc_node)
+			node = ice_sched_get_agg_node(pi, tc_node, id);
+		break;
+	}
+
+	default:
+		break;
+	}
+
+	return node;
+}
+
+/**
+ * ice_sched_set_node_bw_lmt_per_tc - set node BW limit per TC
+ * @pi: port information structure
+ * @id: ID (software VSI handle or AGG ID)
+ * @agg_type: aggregator type (VSI or AGG type node)
+ * @tc: traffic class
+ * @rl_type: min or max
+ * @bw: bandwidth in Kbps
+ *
+ * This function sets BW limit of VSI or Aggregator scheduling node
+ * based on TC information from passed in argument BW.
+ */
+static enum ice_status
+ice_sched_set_node_bw_lmt_per_tc(struct ice_port_info *pi, u32 id,
+				 enum ice_agg_type agg_type, u8 tc,
+				 enum ice_rl_type rl_type, u32 bw)
+{
+	enum ice_status status = ICE_ERR_PARAM;
+	struct ice_sched_node *node;
+
+	if (!pi)
+		return status;
+
+	if (rl_type == ICE_UNKNOWN_BW)
+		return status;
+
+	mutex_lock(&pi->sched_lock);
+	node = ice_sched_get_node_by_id_type(pi, id, agg_type, tc);
+	if (!node) {
+		ice_debug(pi->hw, ICE_DBG_SCHED, "Wrong id, agg type, or tc\n");
+		goto exit_set_node_bw_lmt_per_tc;
+	}
+	if (bw == ICE_SCHED_DFLT_BW)
+		status = ice_sched_set_node_bw_dflt_lmt(pi, node, rl_type);
+	else
+		status = ice_sched_set_node_bw_lmt(pi, node, rl_type, bw);
+
+exit_set_node_bw_lmt_per_tc:
+	mutex_unlock(&pi->sched_lock);
+	return status;
+}
+
+/**
+ * ice_cfg_vsi_bw_lmt_per_tc - configure VSI BW limit per TC
+ * @pi: port information structure
+ * @vsi_handle: software VSI handle
+ * @tc: traffic class
+ * @rl_type: min or max
+ * @bw: bandwidth in Kbps
+ *
+ * This function configures BW limit of VSI scheduling node based on TC
+ * information.
+ */
+enum ice_status
+ice_cfg_vsi_bw_lmt_per_tc(struct ice_port_info *pi, u16 vsi_handle, u8 tc,
+			  enum ice_rl_type rl_type, u32 bw)
+{
+	return ice_sched_set_node_bw_lmt_per_tc(pi, vsi_handle,
+						ICE_AGG_TYPE_VSI,
+						tc, rl_type, bw);
+}
+
+/**
+ * ice_cfg_vsi_bw_dflt_lmt_per_tc - configure default VSI BW limit per TC
+ * @pi: port information structure
+ * @vsi_handle: software VSI handle
+ * @tc: traffic class
+ * @rl_type: min or max
+ *
+ * This function configures default BW limit of VSI scheduling node based on TC
+ * information.
+ */
+enum ice_status
+ice_cfg_vsi_bw_dflt_lmt_per_tc(struct ice_port_info *pi, u16 vsi_handle, u8 tc,
+			       enum ice_rl_type rl_type)
+{
+	return ice_sched_set_node_bw_lmt_per_tc(pi, vsi_handle,
+						ICE_AGG_TYPE_VSI,
+						tc, rl_type,
+						ICE_SCHED_DFLT_BW);
 }
 
 /**

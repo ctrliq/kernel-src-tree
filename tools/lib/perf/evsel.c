@@ -19,10 +19,13 @@
 #include <sys/mman.h>
 #include <asm/bug.h>
 
-void perf_evsel__init(struct perf_evsel *evsel, struct perf_event_attr *attr)
+void perf_evsel__init(struct perf_evsel *evsel, struct perf_event_attr *attr,
+		      int idx)
 {
 	INIT_LIST_HEAD(&evsel->node);
 	evsel->attr = *attr;
+	evsel->idx  = idx;
+	evsel->leader = evsel;
 }
 
 struct perf_evsel *perf_evsel__new(struct perf_event_attr *attr)
@@ -30,7 +33,7 @@ struct perf_evsel *perf_evsel__new(struct perf_event_attr *attr)
 	struct perf_evsel *evsel = zalloc(sizeof(*evsel));
 
 	if (evsel != NULL)
-		perf_evsel__init(evsel, attr);
+		perf_evsel__init(evsel, attr, 0);
 
 	return evsel;
 }

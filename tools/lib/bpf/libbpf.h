@@ -376,20 +376,20 @@ LIBBPF_API int bpf_program__set_struct_ops(struct bpf_program *prog);
 LIBBPF_API int bpf_program__set_extension(struct bpf_program *prog);
 LIBBPF_API int bpf_program__set_sk_lookup(struct bpf_program *prog);
 
-LIBBPF_API enum bpf_prog_type bpf_program__get_type(struct bpf_program *prog);
+LIBBPF_API enum bpf_prog_type bpf_program__get_type(const struct bpf_program *prog);
 LIBBPF_API enum bpf_prog_type
-bpf_program__get_type_v0_0_4(struct bpf_program *prog);
+bpf_program__get_type_v0_0_4(const struct bpf_program *prog);
 LIBBPF_API enum bpf_prog_type
-bpf_program__get_type_v0_0_6(struct bpf_program *prog);
+bpf_program__get_type_v0_0_6(const struct bpf_program *prog);
 LIBBPF_API void bpf_program__set_type(struct bpf_program *prog,
 				      enum bpf_prog_type type);
 
 LIBBPF_API enum bpf_attach_type
-bpf_program__get_expected_attach_type(struct bpf_program *prog);
+bpf_program__get_expected_attach_type(const struct bpf_program *prog);
 LIBBPF_API enum bpf_attach_type
-bpf_program__get_expected_attach_type_v0_0_4(struct bpf_program *prog);
+bpf_program__get_expected_attach_type_v0_0_4(const struct bpf_program *prog);
 LIBBPF_API enum bpf_attach_type
-bpf_program__get_expected_attach_type_v0_0_6(struct bpf_program *prog);
+bpf_program__get_expected_attach_type_v0_0_6(const struct bpf_program *prog);
 LIBBPF_API void
 bpf_program__set_expected_attach_type(struct bpf_program *prog,
 				      enum bpf_attach_type type);
@@ -508,6 +508,7 @@ LIBBPF_API int bpf_map__pin(struct bpf_map *map, const char *path);
 LIBBPF_API int bpf_map__unpin(struct bpf_map *map, const char *path);
 
 LIBBPF_API int bpf_map__set_inner_map_fd(struct bpf_map *map, int fd);
+LIBBPF_API struct bpf_map *bpf_map__inner_map(struct bpf_map *map);
 
 LIBBPF_API long libbpf_get_error(const void *ptr);
 

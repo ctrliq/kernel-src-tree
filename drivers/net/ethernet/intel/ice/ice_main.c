@@ -49,6 +49,8 @@ MODULE_PARM_DESC(debug, "netif level (0=none,...,16=all), hw debug_mask (0x8XXXX
 MODULE_PARM_DESC(debug, "netif level (0=none,...,16=all)");
 #endif /* !CONFIG_DYNAMIC_DEBUG */
 
+static DEFINE_IDA(ice_aux_ida);
+
 static struct workqueue_struct *ice_wq;
 static const struct net_device_ops ice_netdev_safe_mode_ops;
 static const struct net_device_ops ice_netdev_ops;
@@ -57,6 +59,11 @@ static int ice_vsi_open(struct ice_vsi *vsi);
 static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type);
 
 static void ice_vsi_release_all(struct ice_pf *pf);
+
+bool netif_is_ice(struct net_device *dev)
+{
+	return dev && (dev->netdev_ops == &ice_netdev_ops);
+}
 
 /**
  * ice_get_tx_pending - returns number of Tx descriptors not processed
@@ -274,7 +281,7 @@ static int ice_vsi_sync_fltr(struct ice_vsi *vsi)
 	if (!vsi->netdev)
 		return -EINVAL;
 
-	while (test_and_set_bit(__ICE_CFG_BUSY, vsi->state))
+	while (test_and_set_bit(ICE_CFG_BUSY, vsi->state))
 		usleep_range(1000, 2000);
 
 	changed_flags = vsi->current_netdev_flags ^ vsi->netdev->flags;
@@ -324,7 +331,7 @@ static int ice_vsi_sync_fltr(struct ice_vsi *vsi)
 		 * space reserved for promiscuous filters.
 		 */
 		if (hw->adminq.sq_last_status == ICE_AQ_RC_ENOSPC &&
-		    !test_and_set_bit(__ICE_FLTR_OVERFLOW_PROMISC,
+		    !test_and_set_bit(ICE_FLTR_OVERFLOW_PROMISC,
 				      vsi->state)) {
 			promisc_forced_on = true;
 			netdev_warn(netdev, "Reached MAC filter limit, forcing promisc mode on VSI %d\n",
@@ -408,7 +415,7 @@ out:
 	set_bit(ICE_VSI_UMAC_FLTR_CHANGED, vsi->state);
 	set_bit(ICE_VSI_MMAC_FLTR_CHANGED, vsi->state);
 exit:
-	clear_bit(__ICE_CFG_BUSY, vsi->state);
+	clear_bit(ICE_CFG_BUSY, vsi->state);
 	return err;
 }
 
@@ -468,8 +475,10 @@ ice_prepare_for_reset(struct ice_pf *pf)
 	unsigned int i;
 
 	/* already prepared for reset */
-	if (test_bit(__ICE_PREPARED_FOR_RESET, pf->state))
+	if (test_bit(ICE_PREPARED_FOR_RESET, pf->state))
 		return;
+
+	ice_unplug_aux_dev(pf);
 
 	/* Notify VFs of impending reset */
 	if (ice_check_sq_alive(hw, &hw->mailboxq))
@@ -492,7 +501,7 @@ ice_prepare_for_reset(struct ice_pf *pf)
 
 	ice_shutdown_all_ctrlq(hw);
 
-	set_bit(__ICE_PREPARED_FOR_RESET, pf->state);
+	set_bit(ICE_PREPARED_FOR_RESET, pf->state);
 }
 
 /**
@@ -513,12 +522,13 @@ static void ice_do_reset(struct ice_pf *pf, enum ice_reset_req reset_type)
 	/* trigger the reset */
 	if (ice_reset(hw, reset_type)) {
 		dev_err(dev, "reset %d failed\n", reset_type);
-		set_bit(__ICE_RESET_FAILED, pf->state);
-		clear_bit(__ICE_RESET_OICR_RECV, pf->state);
-		clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
-		clear_bit(__ICE_PFR_REQ, pf->state);
-		clear_bit(__ICE_CORER_REQ, pf->state);
-		clear_bit(__ICE_GLOBR_REQ, pf->state);
+		set_bit(ICE_RESET_FAILED, pf->state);
+		clear_bit(ICE_RESET_OICR_RECV, pf->state);
+		clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
+		clear_bit(ICE_PFR_REQ, pf->state);
+		clear_bit(ICE_CORER_REQ, pf->state);
+		clear_bit(ICE_GLOBR_REQ, pf->state);
+		wake_up(&pf->reset_wait_queue);
 		return;
 	}
 
@@ -529,8 +539,9 @@ static void ice_do_reset(struct ice_pf *pf, enum ice_reset_req reset_type)
 	if (reset_type == ICE_RESET_PFR) {
 		pf->pfr_count++;
 		ice_rebuild(pf, reset_type);
-		clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
-		clear_bit(__ICE_PFR_REQ, pf->state);
+		clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
+		clear_bit(ICE_PFR_REQ, pf->state);
+		wake_up(&pf->reset_wait_queue);
 		ice_reset_all_vfs(pf, true);
 	}
 }
@@ -546,20 +557,20 @@ static void ice_reset_subtask(struct ice_pf *pf)
 	/* When a CORER/GLOBR/EMPR is about to happen, the hardware triggers an
 	 * OICR interrupt. The OICR handler (ice_misc_intr) determines what type
 	 * of reset is pending and sets bits in pf->state indicating the reset
-	 * type and __ICE_RESET_OICR_RECV. So, if the latter bit is set
+	 * type and ICE_RESET_OICR_RECV. So, if the latter bit is set
 	 * prepare for pending reset if not already (for PF software-initiated
 	 * global resets the software should already be prepared for it as
-	 * indicated by __ICE_PREPARED_FOR_RESET; for global resets initiated
+	 * indicated by ICE_PREPARED_FOR_RESET; for global resets initiated
 	 * by firmware or software on other PFs, that bit is not set so prepare
 	 * for the reset now), poll for reset done, rebuild and return.
 	 */
-	if (test_bit(__ICE_RESET_OICR_RECV, pf->state)) {
+	if (test_bit(ICE_RESET_OICR_RECV, pf->state)) {
 		/* Perform the largest reset requested */
-		if (test_and_clear_bit(__ICE_CORER_RECV, pf->state))
+		if (test_and_clear_bit(ICE_CORER_RECV, pf->state))
 			reset_type = ICE_RESET_CORER;
-		if (test_and_clear_bit(__ICE_GLOBR_RECV, pf->state))
+		if (test_and_clear_bit(ICE_GLOBR_RECV, pf->state))
 			reset_type = ICE_RESET_GLOBR;
-		if (test_and_clear_bit(__ICE_EMPR_RECV, pf->state))
+		if (test_and_clear_bit(ICE_EMPR_RECV, pf->state))
 			reset_type = ICE_RESET_EMPR;
 		/* return if no valid reset type requested */
 		if (reset_type == ICE_RESET_INVAL)
@@ -568,7 +579,7 @@ static void ice_reset_subtask(struct ice_pf *pf)
 
 		/* make sure we are ready to rebuild */
 		if (ice_check_reset(&pf->hw)) {
-			set_bit(__ICE_RESET_FAILED, pf->state);
+			set_bit(ICE_RESET_FAILED, pf->state);
 		} else {
 			/* done with reset. start rebuild */
 			pf->hw.reset_ongoing = false;
@@ -576,11 +587,12 @@ static void ice_reset_subtask(struct ice_pf *pf)
 			/* clear bit to resume normal operations, but
 			 * ICE_NEEDS_RESTART bit is set in case rebuild failed
 			 */
-			clear_bit(__ICE_RESET_OICR_RECV, pf->state);
-			clear_bit(__ICE_PREPARED_FOR_RESET, pf->state);
-			clear_bit(__ICE_PFR_REQ, pf->state);
-			clear_bit(__ICE_CORER_REQ, pf->state);
-			clear_bit(__ICE_GLOBR_REQ, pf->state);
+			clear_bit(ICE_RESET_OICR_RECV, pf->state);
+			clear_bit(ICE_PREPARED_FOR_RESET, pf->state);
+			clear_bit(ICE_PFR_REQ, pf->state);
+			clear_bit(ICE_CORER_REQ, pf->state);
+			clear_bit(ICE_GLOBR_REQ, pf->state);
+			wake_up(&pf->reset_wait_queue);
 			ice_reset_all_vfs(pf, true);
 		}
 
@@ -588,19 +600,19 @@ static void ice_reset_subtask(struct ice_pf *pf)
 	}
 
 	/* No pending resets to finish processing. Check for new resets */
-	if (test_bit(__ICE_PFR_REQ, pf->state))
+	if (test_bit(ICE_PFR_REQ, pf->state))
 		reset_type = ICE_RESET_PFR;
-	if (test_bit(__ICE_CORER_REQ, pf->state))
+	if (test_bit(ICE_CORER_REQ, pf->state))
 		reset_type = ICE_RESET_CORER;
-	if (test_bit(__ICE_GLOBR_REQ, pf->state))
+	if (test_bit(ICE_GLOBR_REQ, pf->state))
 		reset_type = ICE_RESET_GLOBR;
 	/* If no valid reset type requested just return */
 	if (reset_type == ICE_RESET_INVAL)
 		return;
 
 	/* reset if not already down or busy */
-	if (!test_bit(__ICE_DOWN, pf->state) &&
-	    !test_bit(__ICE_CFG_BUSY, pf->state)) {
+	if (!test_bit(ICE_DOWN, pf->state) &&
+	    !test_bit(ICE_CFG_BUSY, pf->state)) {
 		ice_do_reset(pf, reset_type);
 	}
 }
@@ -991,8 +1003,8 @@ static void ice_watchdog_subtask(struct ice_pf *pf)
 	int i;
 
 	/* if interface is down do nothing */
-	if (test_bit(__ICE_DOWN, pf->state) ||
-	    test_bit(__ICE_CFG_BUSY, pf->state))
+	if (test_bit(ICE_DOWN, pf->state) ||
+	    test_bit(ICE_CFG_BUSY, pf->state))
 		return;
 
 	/* make sure we don't do these things too often */
@@ -1236,7 +1248,7 @@ static int __ice_clean_ctrlq(struct ice_pf *pf, enum ice_ctl_q q_type)
 	u32 oldval, val;
 
 	/* Do not clean control queue if/when PF reset fails */
-	if (test_bit(__ICE_RESET_FAILED, pf->state))
+	if (test_bit(ICE_RESET_FAILED, pf->state))
 		return 0;
 
 	switch (q_type) {
@@ -1380,13 +1392,13 @@ static void ice_clean_adminq_subtask(struct ice_pf *pf)
 {
 	struct ice_hw *hw = &pf->hw;
 
-	if (!test_bit(__ICE_ADMINQ_EVENT_PENDING, pf->state))
+	if (!test_bit(ICE_ADMINQ_EVENT_PENDING, pf->state))
 		return;
 
 	if (__ice_clean_ctrlq(pf, ICE_CTL_Q_ADMIN))
 		return;
 
-	clear_bit(__ICE_ADMINQ_EVENT_PENDING, pf->state);
+	clear_bit(ICE_ADMINQ_EVENT_PENDING, pf->state);
 
 	/* There might be a situation where new messages arrive to a control
 	 * queue between processing the last message and clearing the
@@ -1407,13 +1419,13 @@ static void ice_clean_mailboxq_subtask(struct ice_pf *pf)
 {
 	struct ice_hw *hw = &pf->hw;
 
-	if (!test_bit(__ICE_MAILBOXQ_EVENT_PENDING, pf->state))
+	if (!test_bit(ICE_MAILBOXQ_EVENT_PENDING, pf->state))
 		return;
 
 	if (__ice_clean_ctrlq(pf, ICE_CTL_Q_MAILBOX))
 		return;
 
-	clear_bit(__ICE_MAILBOXQ_EVENT_PENDING, pf->state);
+	clear_bit(ICE_MAILBOXQ_EVENT_PENDING, pf->state);
 
 	if (ice_ctrlq_pending(hw, &hw->mailboxq))
 		__ice_clean_ctrlq(pf, ICE_CTL_Q_MAILBOX);
@@ -1457,9 +1469,9 @@ static void ice_clean_sbq_subtask(struct ice_pf *pf)
  */
 void ice_service_task_schedule(struct ice_pf *pf)
 {
-	if (!test_bit(__ICE_SERVICE_DIS, pf->state) &&
-	    !test_and_set_bit(__ICE_SERVICE_SCHED, pf->state) &&
-	    !test_bit(__ICE_NEEDS_RESTART, pf->state))
+	if (!test_bit(ICE_SERVICE_DIS, pf->state) &&
+	    !test_and_set_bit(ICE_SERVICE_SCHED, pf->state) &&
+	    !test_bit(ICE_NEEDS_RESTART, pf->state))
 		queue_work(ice_wq, &pf->serv_task);
 }
 
@@ -1469,32 +1481,32 @@ void ice_service_task_schedule(struct ice_pf *pf)
  */
 static void ice_service_task_complete(struct ice_pf *pf)
 {
-	WARN_ON(!test_bit(__ICE_SERVICE_SCHED, pf->state));
+	WARN_ON(!test_bit(ICE_SERVICE_SCHED, pf->state));
 
 	/* force memory (pf->state) to sync before next service task */
 	smp_mb__before_atomic();
-	clear_bit(__ICE_SERVICE_SCHED, pf->state);
+	clear_bit(ICE_SERVICE_SCHED, pf->state);
 }
 
 /**
  * ice_service_task_stop - stop service task and cancel works
  * @pf: board private structure
  *
- * Return 0 if the __ICE_SERVICE_DIS bit was not already set,
+ * Return 0 if the ICE_SERVICE_DIS bit was not already set,
  * 1 otherwise.
  */
 static int ice_service_task_stop(struct ice_pf *pf)
 {
 	int ret;
 
-	ret = test_and_set_bit(__ICE_SERVICE_DIS, pf->state);
+	ret = test_and_set_bit(ICE_SERVICE_DIS, pf->state);
 
 	if (pf->serv_tmr.function)
 		del_timer_sync(&pf->serv_tmr);
 	if (pf->serv_task.func)
 		cancel_work_sync(&pf->serv_task);
 
-	clear_bit(__ICE_SERVICE_SCHED, pf->state);
+	clear_bit(ICE_SERVICE_SCHED, pf->state);
 	return ret;
 }
 
@@ -1506,7 +1518,7 @@ static int ice_service_task_stop(struct ice_pf *pf)
  */
 static void ice_service_task_restart(struct ice_pf *pf)
 {
-	clear_bit(__ICE_SERVICE_DIS, pf->state);
+	clear_bit(ICE_SERVICE_DIS, pf->state);
 	ice_service_task_schedule(pf);
 }
 
@@ -1539,7 +1551,7 @@ static void ice_handle_mdd_event(struct ice_pf *pf)
 	unsigned int i;
 	u32 reg;
 
-	if (!test_and_clear_bit(__ICE_MDD_EVENT_PENDING, pf->state)) {
+	if (!test_and_clear_bit(ICE_MDD_EVENT_PENDING, pf->state)) {
 		/* Since the VF MDD event logging is rate limited, check if
 		 * there are pending MDD events.
 		 */
@@ -1631,7 +1643,7 @@ static void ice_handle_mdd_event(struct ice_pf *pf)
 		if (reg & VP_MDET_TX_PQM_VALID_M) {
 			wr32(hw, VP_MDET_TX_PQM(i), 0xFFFF);
 			vf->mdd_tx_events.count++;
-			set_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state);
+			set_bit(ICE_MDD_VF_PRINT_PENDING, pf->state);
 			if (netif_msg_tx_err(pf))
 				dev_info(dev, "Malicious Driver Detection event TX_PQM detected on VF %d\n",
 					 i);
@@ -1641,7 +1653,7 @@ static void ice_handle_mdd_event(struct ice_pf *pf)
 		if (reg & VP_MDET_TX_TCLAN_VALID_M) {
 			wr32(hw, VP_MDET_TX_TCLAN(i), 0xFFFF);
 			vf->mdd_tx_events.count++;
-			set_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state);
+			set_bit(ICE_MDD_VF_PRINT_PENDING, pf->state);
 			if (netif_msg_tx_err(pf))
 				dev_info(dev, "Malicious Driver Detection event TX_TCLAN detected on VF %d\n",
 					 i);
@@ -1651,7 +1663,7 @@ static void ice_handle_mdd_event(struct ice_pf *pf)
 		if (reg & VP_MDET_TX_TDPU_VALID_M) {
 			wr32(hw, VP_MDET_TX_TDPU(i), 0xFFFF);
 			vf->mdd_tx_events.count++;
-			set_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state);
+			set_bit(ICE_MDD_VF_PRINT_PENDING, pf->state);
 			if (netif_msg_tx_err(pf))
 				dev_info(dev, "Malicious Driver Detection event TX_TDPU detected on VF %d\n",
 					 i);
@@ -1661,7 +1673,7 @@ static void ice_handle_mdd_event(struct ice_pf *pf)
 		if (reg & VP_MDET_RX_VALID_M) {
 			wr32(hw, VP_MDET_RX(i), 0xFFFF);
 			vf->mdd_rx_events.count++;
-			set_bit(__ICE_MDD_VF_PRINT_PENDING, pf->state);
+			set_bit(ICE_MDD_VF_PRINT_PENDING, pf->state);
 			if (netif_msg_rx_err(pf))
 				dev_info(dev, "Malicious Driver Detection event RX detected on VF %d\n",
 					 i);
@@ -1826,7 +1838,7 @@ static void ice_init_link_dflt_override(struct ice_port_info *pi)
  * settings using the default override mask from the NVM.
  *
  * The PHY should only be configured with the default override settings the
- * first time media is available. The __ICE_LINK_DEFAULT_OVERRIDE_PENDING state
+ * first time media is available. The ICE_LINK_DEFAULT_OVERRIDE_PENDING state
  * is used to indicate that the user PHY cfg default override is initialized
  * and the PHY has not been configured with the default override settings. The
  * state is set here, and cleared in ice_configure_phy the first time the PHY is
@@ -1858,7 +1870,7 @@ static void ice_init_phy_cfg_dflt_override(struct ice_port_info *pi)
 	cfg->link_fec_opt = ldo->fec_options;
 	phy->curr_user_fec_req = ICE_FEC_AUTO;
 
-	set_bit(__ICE_LINK_DEFAULT_OVERRIDE_PENDING, pf->state);
+	set_bit(ICE_LINK_DEFAULT_OVERRIDE_PENDING, pf->state);
 }
 
 /**
@@ -1930,7 +1942,7 @@ static int ice_init_phy_user_cfg(struct ice_port_info *pi)
 
 out:
 	phy->curr_user_speed_req = ICE_AQ_LINK_SPEED_M;
-	set_bit(__ICE_PHY_INIT_COMPLETE, pf->state);
+	set_bit(ICE_PHY_INIT_COMPLETE, pf->state);
 err_out:
 	kfree(pcaps);
 	return err;
@@ -2014,7 +2026,7 @@ static int ice_configure_phy(struct ice_vsi *vsi)
 	/* Speed - If default override pending, use curr_user_phy_cfg set in
 	 * ice_init_phy_user_cfg_ldo.
 	 */
-	if (test_and_clear_bit(__ICE_LINK_DEFAULT_OVERRIDE_PENDING,
+	if (test_and_clear_bit(ICE_LINK_DEFAULT_OVERRIDE_PENDING,
 			       vsi->back->state)) {
 		cfg->phy_type_low = phy->curr_user_phy_cfg.phy_type_low;
 		cfg->phy_type_high = phy->curr_user_phy_cfg.phy_type_high;
@@ -2095,7 +2107,7 @@ static void ice_check_media_subtask(struct ice_pf *pf)
 	ice_check_module_power(pf, pi->phy.link_info.link_cfg_err);
 
 	if (pi->phy.link_info.link_info & ICE_AQ_MEDIA_AVAILABLE) {
-		if (!test_bit(__ICE_PHY_INIT_COMPLETE, pf->state))
+		if (!test_bit(ICE_PHY_INIT_COMPLETE, pf->state))
 			ice_init_phy_user_cfg(pi);
 
 		/* PHY settings are reset on media insertion, reconfigure
@@ -2131,8 +2143,8 @@ static void ice_service_task(struct work_struct *work)
 
 	/* bail if a reset/recovery cycle is pending or rebuild failed */
 	if (ice_is_reset_in_progress(pf->state) ||
-	    test_bit(__ICE_SUSPENDED, pf->state) ||
-	    test_bit(__ICE_NEEDS_RESTART, pf->state)) {
+	    test_bit(ICE_SUSPENDED, pf->state) ||
+	    test_bit(ICE_NEEDS_RESTART, pf->state)) {
 		ice_service_task_complete(pf);
 		return;
 	}
@@ -2154,7 +2166,8 @@ static void ice_service_task(struct work_struct *work)
 	ice_clean_sbq_subtask(pf);
 	ice_sync_arfs_fltrs(pf);
 	ice_flush_fdir_ctx(pf);
-	/* Clear __ICE_SERVICE_SCHED flag to allow scheduling next event */
+
+	/* Clear ICE_SERVICE_SCHED flag to allow scheduling next event */
 	ice_service_task_complete(pf);
 
 	/* If the tasks have taken longer than one service timer period
@@ -2162,12 +2175,12 @@ static void ice_service_task(struct work_struct *work)
 	 * schedule the service task now.
 	 */
 	if (time_after(jiffies, (start_time + pf->serv_tmr_period)) ||
-	    test_bit(__ICE_MDD_EVENT_PENDING, pf->state) ||
-	    test_bit(__ICE_VFLR_EVENT_PENDING, pf->state) ||
-	    test_bit(__ICE_MAILBOXQ_EVENT_PENDING, pf->state) ||
-	    test_bit(__ICE_FD_VF_FLUSH_CTX, pf->state) ||
+	    test_bit(ICE_MDD_EVENT_PENDING, pf->state) ||
+	    test_bit(ICE_VFLR_EVENT_PENDING, pf->state) ||
+	    test_bit(ICE_MAILBOXQ_EVENT_PENDING, pf->state) ||
+	    test_bit(ICE_FD_VF_FLUSH_CTX, pf->state) ||
 	    test_bit(ICE_SIDEBANDQ_EVENT_PENDING, pf->state) ||
-	    test_bit(__ICE_ADMINQ_EVENT_PENDING, pf->state))
+	    test_bit(ICE_ADMINQ_EVENT_PENDING, pf->state))
 		mod_timer(&pf->serv_tmr, jiffies);
 }
 
@@ -2201,7 +2214,7 @@ int ice_schedule_reset(struct ice_pf *pf, enum ice_reset_req reset)
 	struct device *dev = ice_pf_to_dev(pf);
 
 	/* bail out if earlier reset has failed */
-	if (test_bit(__ICE_RESET_FAILED, pf->state)) {
+	if (test_bit(ICE_RESET_FAILED, pf->state)) {
 		dev_dbg(dev, "earlier reset has failed\n");
 		return -EIO;
 	}
@@ -2211,15 +2224,17 @@ int ice_schedule_reset(struct ice_pf *pf, enum ice_reset_req reset)
 		return -EBUSY;
 	}
 
+	ice_unplug_aux_dev(pf);
+
 	switch (reset) {
 	case ICE_RESET_PFR:
-		set_bit(__ICE_PFR_REQ, pf->state);
+		set_bit(ICE_PFR_REQ, pf->state);
 		break;
 	case ICE_RESET_CORER:
-		set_bit(__ICE_CORER_REQ, pf->state);
+		set_bit(ICE_CORER_REQ, pf->state);
 		break;
 	case ICE_RESET_GLOBR:
-		set_bit(__ICE_GLOBR_REQ, pf->state);
+		set_bit(ICE_GLOBR_REQ, pf->state);
 		break;
 	default:
 		return -EINVAL;
@@ -2714,6 +2729,7 @@ static void ice_ena_misc_vector(struct ice_pf *pf)
 	       PFINT_OICR_PCI_EXCEPTION_M |
 	       PFINT_OICR_VFLR_M |
 	       PFINT_OICR_HMC_ERR_M |
+	       PFINT_OICR_PE_PUSH_M |
 	       PFINT_OICR_PE_CRITERR_M);
 
 	wr32(hw, PFINT_OICR_ENA, val);
@@ -2737,8 +2753,8 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 	u32 oicr, ena_mask;
 
 	dev = ice_pf_to_dev(pf);
-	set_bit(__ICE_ADMINQ_EVENT_PENDING, pf->state);
-	set_bit(__ICE_MAILBOXQ_EVENT_PENDING, pf->state);
+	set_bit(ICE_ADMINQ_EVENT_PENDING, pf->state);
+	set_bit(ICE_MAILBOXQ_EVENT_PENDING, pf->state);
 	set_bit(ICE_SIDEBANDQ_EVENT_PENDING, pf->state);
 
 	oicr = rd32(hw, PFINT_OICR);
@@ -2751,18 +2767,18 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 
 	if (oicr & PFINT_OICR_MAL_DETECT_M) {
 		ena_mask &= ~PFINT_OICR_MAL_DETECT_M;
-		set_bit(__ICE_MDD_EVENT_PENDING, pf->state);
+		set_bit(ICE_MDD_EVENT_PENDING, pf->state);
 	}
 	if (oicr & PFINT_OICR_VFLR_M) {
 		/* disable any further VFLR event notifications */
-		if (test_bit(__ICE_VF_RESETS_DISABLED, pf->state)) {
+		if (test_bit(ICE_VF_RESETS_DISABLED, pf->state)) {
 			u32 reg = rd32(hw, PFINT_OICR_ENA);
 
 			reg &= ~PFINT_OICR_VFLR_M;
 			wr32(hw, PFINT_OICR_ENA, reg);
 		} else {
 			ena_mask &= ~PFINT_OICR_VFLR_M;
-			set_bit(__ICE_VFLR_EVENT_PENDING, pf->state);
+			set_bit(ICE_VFLR_EVENT_PENDING, pf->state);
 		}
 	}
 
@@ -2785,16 +2801,14 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 
 		/* If a reset cycle isn't already in progress, we set a bit in
 		 * pf->state so that the service task can start a reset/rebuild.
-		 * We also make note of which reset happened so that peer
-		 * devices/drivers can be informed.
 		 */
-		if (!test_and_set_bit(__ICE_RESET_OICR_RECV, pf->state)) {
+		if (!test_and_set_bit(ICE_RESET_OICR_RECV, pf->state)) {
 			if (reset == ICE_RESET_CORER)
-				set_bit(__ICE_CORER_RECV, pf->state);
+				set_bit(ICE_CORER_RECV, pf->state);
 			else if (reset == ICE_RESET_GLOBR)
-				set_bit(__ICE_GLOBR_RECV, pf->state);
+				set_bit(ICE_GLOBR_RECV, pf->state);
 			else
-				set_bit(__ICE_EMPR_RECV, pf->state);
+				set_bit(ICE_EMPR_RECV, pf->state);
 
 			/* There are couple of different bits at play here.
 			 * hw->reset_ongoing indicates whether the hardware is
@@ -2802,7 +2816,7 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 			 * is received and set back to false after the driver
 			 * has determined that the hardware is out of reset.
 			 *
-			 * __ICE_RESET_OICR_RECV in pf->state indicates
+			 * ICE_RESET_OICR_RECV in pf->state indicates
 			 * that a post reset rebuild is required before the
 			 * driver is operational again. This is set above.
 			 *
@@ -2830,11 +2844,19 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 		kthread_queue_work(pf->ptp.kworker, &pf->ptp.extts_work);
 	}
 
-	if (oicr & PFINT_OICR_HMC_ERR_M) {
-		ena_mask &= ~PFINT_OICR_HMC_ERR_M;
-		dev_dbg(dev, "HMC Error interrupt - info 0x%x, data 0x%x\n",
-			rd32(hw, PFHMC_ERRORINFO),
-			rd32(hw, PFHMC_ERRORDATA));
+#define ICE_AUX_CRIT_ERR (PFINT_OICR_PE_CRITERR_M | PFINT_OICR_HMC_ERR_M | PFINT_OICR_PE_PUSH_M)
+	if (oicr & ICE_AUX_CRIT_ERR) {
+		struct iidc_event *event;
+
+		ena_mask &= ~ICE_AUX_CRIT_ERR;
+		event = kzalloc(sizeof(*event), GFP_KERNEL);
+		if (event) {
+			set_bit(IIDC_EVENT_CRIT_ERR, event->type);
+			/* report the entire OICR value to AUX driver */
+			event->reg = oicr;
+			ice_send_event_to_aux(pf, event);
+			kfree(event);
+		}
 	}
 
 	/* Report any remaining unexpected interrupts */
@@ -2844,10 +2866,9 @@ static irqreturn_t ice_misc_intr(int __always_unused irq, void *data)
 		/* If a critical error is pending there is no choice but to
 		 * reset the device.
 		 */
-		if (oicr & (PFINT_OICR_PE_CRITERR_M |
-			    PFINT_OICR_PCI_EXCEPTION_M |
+		if (oicr & (PFINT_OICR_PCI_EXCEPTION_M |
 			    PFINT_OICR_ECC_ERR_M)) {
-			set_bit(__ICE_PFR_REQ, pf->state);
+			set_bit(ICE_PFR_REQ, pf->state);
 			ice_service_task_schedule(pf);
 		}
 	}
@@ -3112,6 +3133,7 @@ static int ice_cfg_netdev(struct ice_vsi *vsi)
 	if (!netdev)
 		return -ENOMEM;
 
+	set_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
 	vsi->netdev = netdev;
 	np = netdev_priv(netdev);
 	np->vsi = vsi;
@@ -3324,6 +3346,7 @@ unroll_napi_add:
 	if (vsi) {
 		ice_napi_del(vsi);
 		if (vsi->netdev) {
+			clear_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
 			free_netdev(vsi->netdev);
 			vsi->netdev = NULL;
 		}
@@ -3407,6 +3430,12 @@ static void ice_set_pf_caps(struct ice_pf *pf)
 {
 	struct ice_hw_func_caps *func_caps = &pf->hw.func_caps;
 
+	clear_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+	clear_bit(ICE_FLAG_AUX_ENA, pf->flags);
+	if (func_caps->common_cap.rdma) {
+		set_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+		set_bit(ICE_FLAG_AUX_ENA, pf->flags);
+	}
 	clear_bit(ICE_FLAG_DCB_CAPABLE, pf->flags);
 	if (func_caps->common_cap.dcb)
 		set_bit(ICE_FLAG_DCB_CAPABLE, pf->flags);
@@ -3460,11 +3489,13 @@ static int ice_init_pf(struct ice_pf *pf)
 	spin_lock_init(&pf->aq_wait_lock);
 	init_waitqueue_head(&pf->aq_wait_queue);
 
+	init_waitqueue_head(&pf->reset_wait_queue);
+
 	/* setup service timer and periodic service task */
 	timer_setup(&pf->serv_tmr, ice_service_timer, 0);
 	pf->serv_tmr_period = HZ;
 	INIT_WORK(&pf->serv_task, ice_service_task);
-	clear_bit(__ICE_SERVICE_SCHED, pf->state);
+	clear_bit(ICE_SERVICE_SCHED, pf->state);
 
 	mutex_init(&pf->avail_q_mutex);
 	pf->avail_txqs = bitmap_zalloc(pf->max_pf_txqs, GFP_KERNEL);
@@ -3490,11 +3521,12 @@ static int ice_init_pf(struct ice_pf *pf)
  */
 static int ice_ena_msix_range(struct ice_pf *pf)
 {
-	int v_left, v_actual, v_other, v_budget = 0;
+	int num_cpus, v_left, v_actual, v_other, v_budget = 0;
 	struct device *dev = ice_pf_to_dev(pf);
 	int needed, err, i;
 
 	v_left = pf->hw.func_caps.common_cap.num_msix_vectors;
+	num_cpus = num_online_cpus();
 
 	/* reserve for LAN miscellaneous handler */
 	needed = ICE_MIN_LAN_OICR_MSIX;
@@ -3516,12 +3548,22 @@ static int ice_ena_msix_range(struct ice_pf *pf)
 	v_other = v_budget;
 
 	/* reserve vectors for LAN traffic */
-	needed = min_t(int, num_online_cpus(), v_left);
+	needed = num_cpus;
 	if (v_left < needed)
 		goto no_hw_vecs_left_err;
 	pf->num_lan_msix = needed;
 	v_budget += needed;
 	v_left -= needed;
+
+	/* reserve vectors for RDMA auxiliary driver */
+	if (test_bit(ICE_FLAG_RDMA_ENA, pf->flags)) {
+		needed = num_cpus + ICE_RDMA_NUM_AEQ_MSIX;
+		if (v_left < needed)
+			goto no_hw_vecs_left_err;
+		pf->num_rdma_msix = needed;
+		v_budget += needed;
+		v_left -= needed;
+	}
 
 	pf->msix_entries = devm_kcalloc(dev, v_budget,
 					sizeof(*pf->msix_entries), GFP_KERNEL);
@@ -3552,16 +3594,46 @@ static int ice_ena_msix_range(struct ice_pf *pf)
 			err = -ERANGE;
 			goto msix_err;
 		} else {
-			int v_traffic = v_actual - v_other;
+			int v_remain = v_actual - v_other;
+			int v_rdma = 0, v_min_rdma = 0;
+
+			if (test_bit(ICE_FLAG_RDMA_ENA, pf->flags)) {
+				/* Need at least 1 interrupt in addition to
+				 * AEQ MSIX
+				 */
+				v_rdma = ICE_RDMA_NUM_AEQ_MSIX + 1;
+				v_min_rdma = ICE_MIN_RDMA_MSIX;
+			}
 
 			if (v_actual == ICE_MIN_MSIX ||
-			    v_traffic < ICE_MIN_LAN_TXRX_MSIX)
+			    v_remain < ICE_MIN_LAN_TXRX_MSIX + v_min_rdma) {
+				dev_warn(dev, "Not enough MSI-X vectors to support RDMA.\n");
+				clear_bit(ICE_FLAG_RDMA_ENA, pf->flags);
+
+				pf->num_rdma_msix = 0;
 				pf->num_lan_msix = ICE_MIN_LAN_TXRX_MSIX;
-			else
-				pf->num_lan_msix = v_traffic;
+			} else if ((v_remain < ICE_MIN_LAN_TXRX_MSIX + v_rdma) ||
+				   (v_remain - v_rdma < v_rdma)) {
+				/* Support minimum RDMA and give remaining
+				 * vectors to LAN MSIX
+				 */
+				pf->num_rdma_msix = v_min_rdma;
+				pf->num_lan_msix = v_remain - v_min_rdma;
+			} else {
+				/* Split remaining MSIX with RDMA after
+				 * accounting for AEQ MSIX
+				 */
+				pf->num_rdma_msix = (v_remain - ICE_RDMA_NUM_AEQ_MSIX) / 2 +
+						    ICE_RDMA_NUM_AEQ_MSIX;
+				pf->num_lan_msix = v_remain - pf->num_rdma_msix;
+			}
 
 			dev_notice(dev, "Enabled %d MSI-X vectors for LAN traffic.\n",
 				   pf->num_lan_msix);
+
+			if (test_bit(ICE_FLAG_RDMA_ENA, pf->flags))
+				dev_notice(dev, "Enabled %d MSI-X vectors for RDMA.\n",
+					   pf->num_rdma_msix);
 		}
 	}
 
@@ -3576,6 +3648,7 @@ no_hw_vecs_left_err:
 		needed, v_left);
 	err = -ERANGE;
 exit_err:
+	pf->num_rdma_msix = 0;
 	pf->num_lan_msix = 0;
 	return err;
 }
@@ -3673,7 +3746,7 @@ int ice_vsi_recfg_qs(struct ice_vsi *vsi, int new_rx, int new_tx)
 	if (!new_rx && !new_tx)
 		return -EINVAL;
 
-	while (test_and_set_bit(__ICE_CFG_BUSY, pf->state)) {
+	while (test_and_set_bit(ICE_CFG_BUSY, pf->state)) {
 		timeout--;
 		if (!timeout)
 			return -EBUSY;
@@ -3697,7 +3770,7 @@ int ice_vsi_recfg_qs(struct ice_vsi *vsi, int new_rx, int new_tx)
 	ice_pf_dcb_recfg(pf);
 	ice_vsi_open(vsi);
 done:
-	clear_bit(__ICE_CFG_BUSY, pf->state);
+	clear_bit(ICE_CFG_BUSY, pf->state);
 	return err;
 }
 
@@ -4100,6 +4173,7 @@ static int ice_register_netdev(struct ice_pf *pf)
 	if (err)
 		goto err_register_netdev;
 
+	set_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
 	netif_carrier_off(vsi->netdev);
 	netif_tx_stop_all_queues(vsi->netdev);
 	err = ice_devlink_create_port(vsi);
@@ -4111,9 +4185,11 @@ static int ice_register_netdev(struct ice_pf *pf)
 	return 0;
 err_devlink_create:
 	unregister_netdev(vsi->netdev);
+	clear_bit(ICE_VSI_NETDEV_REGISTERED, vsi->state);
 err_register_netdev:
 	free_netdev(vsi->netdev);
 	vsi->netdev = NULL;
+	clear_bit(ICE_VSI_NETDEV_ALLOCD, vsi->state);
 	return err;
 }
 
@@ -4152,6 +4228,9 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 	if (!pf)
 		return -ENOMEM;
 
+	/* initialize Auxiliary index to invalid value */
+	pf->aux_idx = -1;
+
 	/* set up for high or low DMA */
 	err = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
 	if (err)
@@ -4166,9 +4245,9 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 
 	pf->pdev = pdev;
 	pci_set_drvdata(pdev, pf);
-	set_bit(__ICE_DOWN, pf->state);
+	set_bit(ICE_DOWN, pf->state);
 	/* Disable service task until DOWN bit is cleared */
-	set_bit(__ICE_SERVICE_DIS, pf->state);
+	set_bit(ICE_SERVICE_DIS, pf->state);
 
 	hw = &pf->hw;
 	hw->hw_addr = pcim_iomap_table(pdev)[ICE_BAR0];
@@ -4282,7 +4361,7 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 		goto err_alloc_sw_unroll;
 	}
 
-	clear_bit(__ICE_SERVICE_DIS, pf->state);
+	clear_bit(ICE_SERVICE_DIS, pf->state);
 
 	/* tell the firmware we are up */
 	err = ice_send_version(pf);
@@ -4368,6 +4447,9 @@ ice_probe(struct pci_dev *pdev, const struct pci_device_id __always_unused *ent)
 		ice_cfg_lldp_mib_change(&pf->hw, true);
 	}
 
+	if (ice_init_lag(pf))
+		dev_warn(dev, "Failed to init link aggregation support\n");
+
 	/* print PCI link speed and width */
 	pcie_print_link_status(pf->pdev);
 
@@ -4377,16 +4459,36 @@ probe_done:
 		goto err_netdev_reg;
 
 	/* ready to go, so clear down state bit */
-	clear_bit(__ICE_DOWN, pf->state);
+	clear_bit(ICE_DOWN, pf->state);
+	if (ice_is_aux_ena(pf)) {
+		pf->aux_idx = ida_alloc(&ice_aux_ida, GFP_KERNEL);
+		if (pf->aux_idx < 0) {
+			dev_err(dev, "Failed to allocate device ID for AUX driver\n");
+			err = -ENOMEM;
+			goto err_netdev_reg;
+		}
+
+		err = ice_init_rdma(pf);
+		if (err) {
+			dev_err(dev, "Failed to initialize RDMA: %d\n", err);
+			err = -EIO;
+			goto err_init_aux_unroll;
+		}
+	} else {
+		dev_warn(dev, "RDMA is not supported on this device\n");
+	}
 
 	return 0;
 
+err_init_aux_unroll:
+	pf->adev = NULL;
+	ida_free(&ice_aux_ida, pf->aux_idx);
 err_netdev_reg:
 err_send_version_unroll:
 	ice_vsi_release_all(pf);
 err_alloc_sw_unroll:
-	set_bit(__ICE_SERVICE_DIS, pf->state);
-	set_bit(__ICE_DOWN, pf->state);
+	set_bit(ICE_SERVICE_DIS, pf->state);
+	set_bit(ICE_DOWN, pf->state);
 	devm_kfree(dev, pf->first_sw);
 err_msix_misc_unroll:
 	ice_free_irq_msix_misc(pf);
@@ -4483,16 +4585,20 @@ static void ice_remove(struct pci_dev *pdev)
 	}
 
 	if (test_bit(ICE_FLAG_SRIOV_ENA, pf->flags)) {
-		set_bit(__ICE_VF_RESETS_DISABLED, pf->state);
+		set_bit(ICE_VF_RESETS_DISABLED, pf->state);
 		ice_free_vfs(pf);
 	}
 
-	set_bit(__ICE_DOWN, pf->state);
 	ice_service_task_stop(pf);
 
 	ice_aq_cancel_waiting_tasks(pf);
+	ice_unplug_aux_dev(pf);
+	if (pf->aux_idx >= 0)
+		ida_free(&ice_aux_ida, pf->aux_idx);
+	set_bit(ICE_DOWN, pf->state);
 
 	mutex_destroy(&(&pf->hw)->fdir_fltr_lock);
+	ice_deinit_lag(pf);
 	if (test_bit(ICE_FLAG_PTP_SUPPORTED, pf->flags))
 		ice_ptp_release(pf);
 	if (!ice_is_safe_mode(pf))
@@ -4647,14 +4753,16 @@ static int __maybe_unused ice_suspend(struct device *dev)
 	 */
 	disabled = ice_service_task_stop(pf);
 
+	ice_unplug_aux_dev(pf);
+
 	/* Already suspended?, then there is nothing to do */
-	if (test_and_set_bit(__ICE_SUSPENDED, pf->state)) {
+	if (test_and_set_bit(ICE_SUSPENDED, pf->state)) {
 		if (!disabled)
 			ice_service_task_restart(pf);
 		return 0;
 	}
 
-	if (test_bit(__ICE_DOWN, pf->state) ||
+	if (test_bit(ICE_DOWN, pf->state) ||
 	    ice_is_reset_in_progress(pf->state)) {
 		dev_err(dev, "can't suspend device in reset or already down\n");
 		if (!disabled)
@@ -4726,16 +4834,16 @@ static int __maybe_unused ice_resume(struct device *dev)
 	if (ret)
 		dev_err(dev, "Cannot restore interrupt scheme: %d\n", ret);
 
-	clear_bit(__ICE_DOWN, pf->state);
+	clear_bit(ICE_DOWN, pf->state);
 	/* Now perform PF reset and rebuild */
 	reset_type = ICE_RESET_PFR;
 	/* re-enable service task for reset, but allow reset to schedule it */
-	clear_bit(__ICE_SERVICE_DIS, pf->state);
+	clear_bit(ICE_SERVICE_DIS, pf->state);
 
 	if (ice_schedule_reset(pf, reset_type))
 		dev_err(dev, "Reset during resume failed.\n");
 
-	clear_bit(__ICE_SUSPENDED, pf->state);
+	clear_bit(ICE_SUSPENDED, pf->state);
 	ice_service_task_restart(pf);
 
 	/* Restart the service task */
@@ -4764,11 +4872,11 @@ ice_pci_err_detected(struct pci_dev *pdev, enum pci_channel_state err)
 		return PCI_ERS_RESULT_DISCONNECT;
 	}
 
-	if (!test_bit(__ICE_SUSPENDED, pf->state)) {
+	if (!test_bit(ICE_SUSPENDED, pf->state)) {
 		ice_service_task_stop(pf);
 
-		if (!test_bit(__ICE_PREPARED_FOR_RESET, pf->state)) {
-			set_bit(__ICE_PFR_REQ, pf->state);
+		if (!test_bit(ICE_PREPARED_FOR_RESET, pf->state)) {
+			set_bit(ICE_PFR_REQ, pf->state);
 			ice_prepare_for_reset(pf);
 		}
 	}
@@ -4835,7 +4943,7 @@ static void ice_pci_err_resume(struct pci_dev *pdev)
 		return;
 	}
 
-	if (test_bit(__ICE_SUSPENDED, pf->state)) {
+	if (test_bit(ICE_SUSPENDED, pf->state)) {
 		dev_dbg(&pdev->dev, "%s failed to resume normal operations!\n",
 			__func__);
 		return;
@@ -4856,11 +4964,11 @@ static void ice_pci_err_reset_prepare(struct pci_dev *pdev)
 {
 	struct ice_pf *pf = pci_get_drvdata(pdev);
 
-	if (!test_bit(__ICE_SUSPENDED, pf->state)) {
+	if (!test_bit(ICE_SUSPENDED, pf->state)) {
 		ice_service_task_stop(pf);
 
-		if (!test_bit(__ICE_PREPARED_FOR_RESET, pf->state)) {
-			set_bit(__ICE_PFR_REQ, pf->state);
+		if (!test_bit(ICE_PREPARED_FOR_RESET, pf->state)) {
+			set_bit(ICE_PFR_REQ, pf->state);
 			ice_prepare_for_reset(pf);
 		}
 	}
@@ -5010,7 +5118,7 @@ static int ice_set_mac_address(struct net_device *netdev, void *pi)
 		return 0;
 	}
 
-	if (test_bit(__ICE_DOWN, pf->state) ||
+	if (test_bit(ICE_DOWN, pf->state) ||
 	    ice_is_reset_in_progress(pf->state)) {
 		netdev_err(netdev, "can't set mac %pM. device not ready\n",
 			   mac);
@@ -5554,7 +5662,6 @@ ice_update_vsi_tx_ring_stats(struct ice_vsi *vsi, struct ice_ring **rings,
 static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
 {
 	struct rtnl_link_stats64 *vsi_stats = &vsi->net_stats;
-	struct ice_ring *ring;
 	u64 pkts, bytes;
 	int i;
 
@@ -5578,7 +5685,8 @@ static void ice_update_vsi_ring_stats(struct ice_vsi *vsi)
 
 	/* update Rx rings counters */
 	ice_for_each_rxq(vsi, i) {
-		ring = READ_ONCE(vsi->rx_rings[i]);
+		struct ice_ring *ring = READ_ONCE(vsi->rx_rings[i]);
+
 		ice_fetch_u64_stats_per_ring(ring, &pkts, &bytes);
 		vsi_stats->rx_packets += pkts;
 		vsi_stats->rx_bytes += bytes;
@@ -5605,7 +5713,7 @@ void ice_update_vsi_stats(struct ice_vsi *vsi)
 	struct ice_pf *pf = vsi->back;
 
 	if (test_bit(ICE_VSI_DOWN, vsi->state) ||
-	    test_bit(__ICE_CFG_BUSY, pf->state))
+	    test_bit(ICE_CFG_BUSY, pf->state))
 		return;
 
 	/* get stats as recorded by Tx/Rx rings */
@@ -5860,7 +5968,7 @@ int ice_down(struct ice_vsi *vsi)
 	int i, tx_err, rx_err, link_err = 0;
 
 	/* Caller of this function is expected to set the
-	 * vsi->state __ICE_DOWN bit
+	 * vsi->state ICE_DOWN bit
 	 */
 	if (vsi->netdev) {
 		netif_carrier_off(vsi->netdev);
@@ -6208,7 +6316,7 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 	enum ice_status ret;
 	int err;
 
-	if (test_bit(__ICE_DOWN, pf->state))
+	if (test_bit(ICE_DOWN, pf->state))
 		goto clear_recovery;
 
 	dev_dbg(dev, "rebuilding PF after reset_type=%d\n", reset_type);
@@ -6337,7 +6445,9 @@ static void ice_rebuild(struct ice_pf *pf, enum ice_reset_req reset_type)
 	ice_replay_post(hw);
 
 	/* if we get here, reset flow is successful */
-	clear_bit(__ICE_RESET_FAILED, pf->state);
+	clear_bit(ICE_RESET_FAILED, pf->state);
+
+	ice_plug_aux_dev(pf);
 	return;
 
 err_vsi_rebuild:
@@ -6345,10 +6455,10 @@ err_sched_init_port:
 	ice_sched_cleanup_all(hw);
 err_init_ctrlq:
 	ice_shutdown_all_ctrlq(hw);
-	set_bit(__ICE_RESET_FAILED, pf->state);
+	set_bit(ICE_RESET_FAILED, pf->state);
 clear_recovery:
 	/* set this bit in PF state to control service task scheduling */
-	set_bit(__ICE_NEEDS_RESTART, pf->state);
+	set_bit(ICE_NEEDS_RESTART, pf->state);
 	dev_err(dev, "Rebuild failed, unload and reload driver\n");
 }
 
@@ -6376,7 +6486,9 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
 	struct ice_netdev_priv *np = netdev_priv(netdev);
 	struct ice_vsi *vsi = np->vsi;
 	struct ice_pf *pf = vsi->back;
+	struct iidc_event *event;
 	u8 count = 0;
+	int err = 0;
 
 	if (new_mtu == (int)netdev->mtu) {
 		netdev_warn(netdev, "MTU is already %u\n", netdev->mtu);
@@ -6409,27 +6521,38 @@ static int ice_change_mtu(struct net_device *netdev, int new_mtu)
 		return -EBUSY;
 	}
 
+	event = kzalloc(sizeof(*event), GFP_KERNEL);
+	if (!event)
+		return -ENOMEM;
+
+	set_bit(IIDC_EVENT_BEFORE_MTU_CHANGE, event->type);
+	ice_send_event_to_aux(pf, event);
+	clear_bit(IIDC_EVENT_BEFORE_MTU_CHANGE, event->type);
+
 	netdev->mtu = (unsigned int)new_mtu;
 
 	/* if VSI is up, bring it down and then back up */
 	if (!test_and_set_bit(ICE_VSI_DOWN, vsi->state)) {
-		int err;
-
 		err = ice_down(vsi);
 		if (err) {
 			netdev_err(netdev, "change MTU if_down err %d\n", err);
-			return err;
+			goto event_after;
 		}
 
 		err = ice_up(vsi);
 		if (err) {
 			netdev_err(netdev, "change MTU if_up err %d\n", err);
-			return err;
+			goto event_after;
 		}
 	}
 
 	netdev_dbg(netdev, "changed MTU to %d\n", new_mtu);
-	return 0;
+event_after:
+	set_bit(IIDC_EVENT_AFTER_MTU_CHANGE, event->type);
+	ice_send_event_to_aux(pf, event);
+	kfree(event);
+
+	return err;
 }
 
 /**
@@ -6891,19 +7014,19 @@ static void ice_tx_timeout(struct net_device *netdev, unsigned int txqueue)
 
 	switch (pf->tx_timeout_recovery_level) {
 	case 1:
-		set_bit(__ICE_PFR_REQ, pf->state);
+		set_bit(ICE_PFR_REQ, pf->state);
 		break;
 	case 2:
-		set_bit(__ICE_CORER_REQ, pf->state);
+		set_bit(ICE_CORER_REQ, pf->state);
 		break;
 	case 3:
-		set_bit(__ICE_GLOBR_REQ, pf->state);
+		set_bit(ICE_GLOBR_REQ, pf->state);
 		break;
 	default:
 		netdev_err(netdev, "tx_timeout recovery unsuccessful, device is in unrecoverable state.\n");
-		set_bit(__ICE_DOWN, pf->state);
+		set_bit(ICE_DOWN, pf->state);
 		set_bit(ICE_VSI_NEEDS_RESTART, vsi->state);
-		set_bit(__ICE_SERVICE_DIS, pf->state);
+		set_bit(ICE_SERVICE_DIS, pf->state);
 		break;
 	}
 
@@ -7018,7 +7141,7 @@ int ice_open_internal(struct net_device *netdev)
 	enum ice_status status;
 	int err;
 
-	if (test_bit(__ICE_NEEDS_RESTART, pf->state)) {
+	if (test_bit(ICE_NEEDS_RESTART, pf->state)) {
 		netdev_err(netdev, "driver needs to be unloaded and reloaded\n");
 		return -EIO;
 	}
@@ -7038,7 +7161,7 @@ int ice_open_internal(struct net_device *netdev)
 	/* Set PHY if there is media, otherwise, turn off PHY */
 	if (pi->phy.link_info.link_info & ICE_AQ_MEDIA_AVAILABLE) {
 		clear_bit(ICE_FLAG_NO_MEDIA, pf->flags);
-		if (!test_bit(__ICE_PHY_INIT_COMPLETE, pf->state)) {
+		if (!test_bit(ICE_PHY_INIT_COMPLETE, pf->state)) {
 			err = ice_init_phy_user_cfg(pi);
 			if (err) {
 				netdev_err(netdev, "Failed to initialize PHY settings, error %d\n",
@@ -7176,6 +7299,7 @@ static const struct net_device_ops ice_netdev_ops = {
 	.ndo_set_vf_vlan = ice_set_vf_port_vlan,
 	.ndo_set_vf_link_state = ice_set_vf_link_state,
 	.ndo_get_vf_stats = ice_get_vf_stats,
+	.ndo_set_vf_rate = ice_set_vf_bw,
 	.ndo_vlan_rx_add_vid = ice_vlan_rx_add_vid,
 	.ndo_vlan_rx_kill_vid = ice_vlan_rx_kill_vid,
 	.ndo_set_features = ice_set_features,

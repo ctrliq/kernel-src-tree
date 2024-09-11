@@ -279,7 +279,7 @@ static void qeth_l2_set_pnso_mode(struct qeth_card *card,
 
 static void qeth_l2_dev2br_fdb_flush(struct qeth_card *card)
 {
-	struct switchdev_notifier_fdb_info info;
+	struct switchdev_notifier_fdb_info info = {};
 
 	QETH_CARD_TEXT(card, 2, "fdbflush");
 
@@ -680,7 +680,7 @@ static void qeth_l2_dev2br_fdb_notify(struct qeth_card *card, u8 code,
 				      struct net_if_token *token,
 				      struct mac_addr_lnid *addr_lnid)
 {
-	struct switchdev_notifier_fdb_info info;
+	struct switchdev_notifier_fdb_info info = {};
 	u8 ntfy_mac[ETH_ALEN];
 
 	ether_addr_copy(ntfy_mac, addr_lnid->mac);
@@ -786,13 +786,13 @@ static bool qeth_l2_must_learn(struct net_device *netdev,
 }
 
 /**
- *	qeth_l2_br2dev_worker() - update local MACs
- *	@work: bridge to device FDB update
+ *     qeth_l2_br2dev_worker() - update local MACs
+ *     @work: bridge to device FDB update
  *
- *	Update local MACs of a learning_sync bridgeport so it can receive
- *	messages for a destination port.
- *	In case of an isolated learning_sync port, also update its isolated
- *	siblings.
+ *     Update local MACs of a learning_sync bridgeport so it can receive
+ *     messages for a destination port.
+ *     In case of an isolated learning_sync port, also update its isolated
+ *     siblings.
  */
 static void qeth_l2_br2dev_worker(struct work_struct *work)
 {
@@ -959,7 +959,7 @@ static void qeth_l2_br2dev_get(void)
 		}
 	}
 	QETH_DBF_TEXT_(SETUP, 2, "b2d+%04d",
-		       qeth_l2_switchdev_notify_refcnt.refs.counter);
+			qeth_l2_switchdev_notify_refcnt.refs.counter);
 }
 
 /* Called under rtnl_lock */
@@ -979,7 +979,7 @@ static void qeth_l2_br2dev_put(void)
 		}
 	}
 	QETH_DBF_TEXT_(SETUP, 2, "b2d-%04d",
-		       qeth_l2_switchdev_notify_refcnt.refs.counter);
+			qeth_l2_switchdev_notify_refcnt.refs.counter);
 }
 
 static int qeth_l2_bridge_getlink(struct sk_buff *skb, u32 pid, u32 seq,
@@ -2444,7 +2444,6 @@ static void qeth_l2_remove_device(struct ccwgroup_device *gdev)
 	if (gdev->state == CCWGROUP_ONLINE)
 		qeth_set_offline(card, card->discipline, false);
 
-	cancel_work_sync(&card->close_dev_work);
 	if (card->dev->reg_state == NETREG_REGISTERED) {
 		priv = netdev_priv(card->dev);
 		if (priv->brport_features & BR_LEARNING_SYNC) {
