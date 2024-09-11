@@ -1,0 +1,165 @@
+KVM: x86: Move init-only kvm_x86_ops to separate struct
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit d008dfdb0e7012ddff5bd6c0d2abd3b8ec6e77f5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d008dfdb.failed
+
+Move the kvm_x86_ops functions that are used only within the scope of
+kvm_init() into a separate struct, kvm_x86_init_ops.  In addition to
+identifying the init-only functions without restorting to code comments,
+this also sets the stage for waiting until after ->hardware_setup() to
+set kvm_x86_ops.  Setting kvm_x86_ops after ->hardware_setup() is
+desirable as many of the hooks are not usable until ->hardware_setup()
+completes.
+
+No functional change intended.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200321202603.19355-3-sean.j.christopherson@intel.com>
+	Reviewed-by: Vitaly Kuznetsov <vkuznets@redhat.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit d008dfdb0e7012ddff5bd6c0d2abd3b8ec6e77f5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/x86.c
+diff --cc arch/x86/kvm/x86.c
+index 6c9a4f53f4db,283ef4d919f8..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -9398,9 -9628,15 +9398,19 @@@ void kvm_arch_hardware_disable(void
+  
+  int kvm_arch_hardware_setup(void *opaque)
+  {
++ 	struct kvm_x86_init_ops *ops = opaque;
+  	int r;
+  
+++<<<<<<< HEAD
+ +	r = kvm_x86_ops->hardware_setup();
+++=======
++ 	rdmsrl_safe(MSR_EFER, &host_efer);
++ 
++ 	if (boot_cpu_has(X86_FEATURE_XSAVES))
++ 		rdmsrl(MSR_IA32_XSS, host_xss);
++ 
++ 	r = ops->hardware_setup();
+++>>>>>>> d008dfdb0e70 (KVM: x86: Move init-only kvm_x86_ops to separate struct)
+  	if (r != 0)
+  		return r;
+  
+diff --git a/arch/x86/include/asm/kvm_host.h b/arch/x86/include/asm/kvm_host.h
+index 57bbfbf61b11..c56c667e99c8 100644
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@ -1048,12 +1048,8 @@ static inline u16 kvm_lapic_irq_dest_mode(bool dest_mode_logical)
+ }
+ 
+ struct kvm_x86_ops {
+-	int (*cpu_has_kvm_support)(void);          /* __init */
+-	int (*disabled_by_bios)(void);             /* __init */
+ 	int (*hardware_enable)(void);
+ 	void (*hardware_disable)(void);
+-	int (*check_processor_compatibility)(void);/* __init */
+-	int (*hardware_setup)(void);               /* __init */
+ 	void (*hardware_unsetup)(void);            /* __exit */
+ 	bool (*cpu_has_accelerated_tpr)(void);
+ 	bool (*has_emulated_msr)(int index);
+@@ -1263,6 +1259,15 @@ struct kvm_x86_ops {
+ 	int (*enable_direct_tlbflush)(struct kvm_vcpu *vcpu);
+ };
+ 
++struct kvm_x86_init_ops {
++	int (*cpu_has_kvm_support)(void);
++	int (*disabled_by_bios)(void);
++	int (*check_processor_compatibility)(void);
++	int (*hardware_setup)(void);
++
++	struct kvm_x86_ops *runtime_ops;
++};
++
+ struct kvm_arch_async_pf {
+ 	u32 token;
+ 	gfn_t gfn;
+diff --git a/arch/x86/kvm/svm.c b/arch/x86/kvm/svm.c
+index dd22d2cd361d..ce689cd13320 100644
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@ -7418,11 +7418,7 @@ static bool svm_apic_init_signal_blocked(struct kvm_vcpu *vcpu)
+ }
+ 
+ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+-	.cpu_has_kvm_support = has_svm,
+-	.disabled_by_bios = is_disabled,
+-	.hardware_setup = svm_hardware_setup,
+ 	.hardware_unsetup = svm_hardware_teardown,
+-	.check_processor_compatibility = svm_check_processor_compat,
+ 	.hardware_enable = svm_hardware_enable,
+ 	.hardware_disable = svm_hardware_disable,
+ 	.cpu_has_accelerated_tpr = svm_cpu_has_accelerated_tpr,
+@@ -7557,9 +7553,18 @@ static struct kvm_x86_ops svm_x86_ops __ro_after_init = {
+ 	.apic_init_signal_blocked = svm_apic_init_signal_blocked,
+ };
+ 
++static struct kvm_x86_init_ops svm_init_ops __initdata = {
++	.cpu_has_kvm_support = has_svm,
++	.disabled_by_bios = is_disabled,
++	.hardware_setup = svm_hardware_setup,
++	.check_processor_compatibility = svm_check_processor_compat,
++
++	.runtime_ops = &svm_x86_ops,
++};
++
+ static int __init svm_init(void)
+ {
+-	return kvm_init(&svm_x86_ops, sizeof(struct vcpu_svm),
++	return kvm_init(&svm_init_ops, sizeof(struct vcpu_svm),
+ 			__alignof__(struct vcpu_svm), THIS_MODULE);
+ }
+ 
+diff --git a/arch/x86/kvm/vmx/vmx.c b/arch/x86/kvm/vmx/vmx.c
+index 833b3f7d7961..f37af1526784 100644
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@ -7873,11 +7873,8 @@ static __exit void hardware_unsetup(void)
+ }
+ 
+ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+-	.cpu_has_kvm_support = cpu_has_kvm_support,
+-	.disabled_by_bios = vmx_disabled_by_bios,
+-	.hardware_setup = hardware_setup,
+ 	.hardware_unsetup = hardware_unsetup,
+-	.check_processor_compatibility = vmx_check_processor_compat,
++
+ 	.hardware_enable = hardware_enable,
+ 	.hardware_disable = hardware_disable,
+ 	.cpu_has_accelerated_tpr = report_flexpriority,
+@@ -8025,6 +8022,15 @@ static struct kvm_x86_ops vmx_x86_ops __ro_after_init = {
+ 	.apic_init_signal_blocked = vmx_apic_init_signal_blocked,
+ };
+ 
++static struct kvm_x86_init_ops vmx_init_ops __initdata = {
++	.cpu_has_kvm_support = cpu_has_kvm_support,
++	.disabled_by_bios = vmx_disabled_by_bios,
++	.check_processor_compatibility = vmx_check_processor_compat,
++	.hardware_setup = hardware_setup,
++
++	.runtime_ops = &vmx_x86_ops,
++};
++
+ static void vmx_cleanup_l1d_flush(void)
+ {
+ 	if (vmx_l1d_flush_pages) {
+@@ -8109,7 +8115,7 @@ static int __init vmx_init(void)
+ 	}
+ #endif
+ 
+-	r = kvm_init(&vmx_x86_ops, sizeof(struct vcpu_vmx),
++	r = kvm_init(&vmx_init_ops, sizeof(struct vcpu_vmx),
+ 		     __alignof__(struct vcpu_vmx), THIS_MODULE);
+ 	if (r)
+ 		return r;
+* Unmerged path arch/x86/kvm/x86.c
