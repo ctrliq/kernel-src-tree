@@ -2004,8 +2004,7 @@ static int qca_serdev_probe(struct serdev_device *serdev)
 		err = hci_uart_register_device(&qcadev->serdev_hu, &qca_proto);
 		if (err) {
 			BT_ERR("Rome serdev registration failed");
-			if (qcadev->susclk)
-				clk_disable_unprepare(qcadev->susclk);
+			clk_disable_unprepare(qcadev->susclk);
 			return err;
 		}
 	}
