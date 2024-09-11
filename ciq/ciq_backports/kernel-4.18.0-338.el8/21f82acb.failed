@@ -1,0 +1,272 @@
+ch_ktls/cxgb4: handle partial tag alone SKBs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Rohit Maheshwari <rohitm@chelsio.com>
+commit 21f82acbb8b4e8812521d405479b6fc3790078de
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/21f82acb.failed
+
+If TCP congestion caused a very small packets which only has some
+part fo the TAG, and that too is not till the end. HW can't handle
+such case, so falling back to sw crypto in such cases.
+
+v1->v2:
+- Marked chcr_ktls_sw_fallback() static.
+
+Fixes: dc05f3df8fac ("chcr: Handle first or middle part of record")
+	Signed-off-by: Rohit Maheshwari <rohitm@chelsio.com>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 21f82acbb8b4e8812521d405479b6fc3790078de)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/crypto/chelsio/chcr_ktls.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+#	drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+diff --cc drivers/crypto/chelsio/chcr_ktls.c
+index 074af13f5bc4,b182c940b4a0..000000000000
+--- a/drivers/crypto/chelsio/chcr_ktls.c
++++ b/drivers/crypto/chelsio/chcr_ktls.c
+@@@ -1712,27 -1808,33 +1794,38 @@@ static int chcr_short_record_handler(st
+  
+  	if (remaining_record > 0 &&
+  	    remaining_record < TLS_CIPHER_AES_GCM_128_TAG_SIZE) {
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		int trimmed_len = skb->data_len -
+ +			(TLS_CIPHER_AES_GCM_128_TAG_SIZE - remaining_record);
+ +		struct sk_buff *tmp_skb = NULL;
+ +		/* don't process the pkt if it is only a partial tag */
+ +		if (skb->data_len < TLS_CIPHER_AES_GCM_128_TAG_SIZE)
+ +			goto out;
+++=======
++ 		int trimmed_len = 0;
++ 
++ 		if (tls_end_offset > TLS_CIPHER_AES_GCM_128_TAG_SIZE)
++ 			trimmed_len = data_len -
++ 				      (TLS_CIPHER_AES_GCM_128_TAG_SIZE -
++ 				       remaining_record);
++ 		if (!trimmed_len)
++ 			return FALLBACK;
+++>>>>>>> 21f82acbb8b4 (ch_ktls/cxgb4: handle partial tag alone SKBs):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  
+ -		WARN_ON(trimmed_len > data_len);
+ +		WARN_ON(trimmed_len > skb->data_len);
+  
+ -		data_len = trimmed_len;
+ -		atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_trimmed_pkts);
+ -	}
+ -
+ -	/* check if it is only the header part. */
+ -	if (tls_rec_offset + data_len <= (TLS_HEADER_SIZE + tx_info->iv_size)) {
+ -		if (chcr_ktls_tx_plaintxt(tx_info, skb, tcp_seq, mss,
+ -					  tcp_push_no_fin, q,
+ -					  tx_info->port_id, prior_data,
+ -					  data_len, skb_offset, prior_data_len))
+ +		/* shift to those many bytes */
+ +		tmp_skb = alloc_skb(0, GFP_KERNEL);
+ +		if (unlikely(!tmp_skb))
+  			goto out;
+  
+ -		tx_info->prev_seq = tcp_seq + data_len;
+ -		return 0;
+ +		chcr_ktls_skb_shift(tmp_skb, skb, trimmed_len);
+ +		/* free the last trimmed portion */
+ +		dev_kfree_skb_any(skb);
+ +		skb = tmp_skb;
+ +		atomic64_inc(&tx_info->adap->chcr_stats.ktls_tx_trimmed_pkts);
+  	}
+ -
+ +	data_len = skb->data_len;
+  	/* check if the middle record's start point is 16 byte aligned. CTR
+  	 * needs 16 byte aligned start point to start encryption.
+  	 */
+@@@ -1832,10 -1919,41 +1925,38 @@@ out
+  	return NETDEV_TX_BUSY;
+  }
+  
++ static int chcr_ktls_sw_fallback(struct sk_buff *skb,
++ 				 struct chcr_ktls_info *tx_info,
++ 				 struct sge_eth_txq *q)
++ {
++ 	u32 data_len, skb_offset;
++ 	struct sk_buff *nskb;
++ 	struct tcphdr *th;
++ 
++ 	nskb = tls_encrypt_skb(skb);
++ 
++ 	if (!nskb)
++ 		return 0;
++ 
++ 	th = tcp_hdr(nskb);
++ 	skb_offset =  skb_transport_offset(nskb) + tcp_hdrlen(nskb);
++ 	data_len = nskb->len - skb_offset;
++ 	skb_tx_timestamp(nskb);
++ 
++ 	if (chcr_ktls_tunnel_pkt(tx_info, nskb, q))
++ 		goto out;
++ 
++ 	tx_info->prev_seq = ntohl(th->seq) + data_len;
++ 	atomic64_inc(&tx_info->adap->ch_ktls_stats.ktls_tx_fallback);
++ 	return 0;
++ out:
++ 	dev_kfree_skb_any(nskb);
++ 	return 0;
++ }
+  /* nic tls TX handler */
+ -static int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
+ +int chcr_ktls_xmit(struct sk_buff *skb, struct net_device *dev)
+  {
+ -	u32 tls_end_offset, tcp_seq, skb_data_len, skb_offset;
+ -	struct ch_ktls_port_stats_debug *port_stats;
+  	struct chcr_ktls_ofld_ctx_tx *tx_ctx;
+ -	struct ch_ktls_stats_debug *stats;
+  	struct tcphdr *th = tcp_hdr(skb);
+  	int data_len, qidx, ret = 0, mss;
+  	struct tls_record_info *record;
+@@@ -2000,8 -2119,16 +2121,21 @@@ clear_ref
+  			__skb_frag_unref(&record->frags[i]);
+  		}
+  		/* if any failure, come out from the loop. */
+++<<<<<<< HEAD:drivers/crypto/chelsio/chcr_ktls.c
+ +		if (ret)
+ +			goto out;
+++=======
++ 		if (ret) {
++ 			if (th->fin)
++ 				dev_kfree_skb_any(skb);
++ 
++ 			if (ret == FALLBACK)
++ 				return chcr_ktls_sw_fallback(skb, tx_info, q);
++ 
++ 			return NETDEV_TX_OK;
++ 		}
++ 
+++>>>>>>> 21f82acbb8b4 (ch_ktls/cxgb4: handle partial tag alone SKBs):drivers/net/ethernet/chelsio/inline_crypto/ch_ktls/chcr_ktls.c
+  		/* length should never be less than 0 */
+  		WARN_ON(data_len < 0);
+  
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+index f6cc46ef72b5,17410fe86626..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+@@@ -3492,40 -3561,32 +3492,57 @@@ static int chcr_stats_show(struct seq_f
+  	seq_puts(seq, "\nChelsio KTLS Crypto Accelerator Stats\n");
+  	seq_printf(seq, "Tx TLS offload refcount:          %20u\n",
+  		   refcount_read(&adap->chcr_ktls.ktls_refcount));
+ +	seq_printf(seq, "Tx HW offload contexts added:     %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_ctx));
+ +	seq_printf(seq, "Tx connection created:            %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_open));
+ +	seq_printf(seq, "Tx connection failed:             %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_fail));
+ +	seq_printf(seq, "Tx connection closed:             %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_connection_close));
+ +	seq_printf(seq, "Packets passed for encryption :   %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_encrypted_packets));
+ +	seq_printf(seq, "Bytes passed for encryption :     %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_encrypted_bytes));
+  	seq_printf(seq, "Tx records send:                  %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_send_records));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_send_records));
+  	seq_printf(seq, "Tx partial start of records:      %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_start_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_start_pkts));
+  	seq_printf(seq, "Tx partial middle of records:     %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_middle_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_middle_pkts));
+  	seq_printf(seq, "Tx partial end of record:         %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_end_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_end_pkts));
+  	seq_printf(seq, "Tx complete records:              %20llu\n",
+ -		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_complete_pkts));
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_complete_pkts));
+  	seq_printf(seq, "TX trim pkts :                    %20llu\n",
+++<<<<<<< HEAD
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_trimmed_pkts));
+ +	seq_printf(seq, "Tx out of order packets:          %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_ooo));
+ +	seq_printf(seq, "Tx drop pkts before HW offload:   %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_skip_no_sync_data));
+ +	seq_printf(seq, "Tx drop not synced packets:       %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_drop_no_sync_data));
+ +	seq_printf(seq, "Tx drop bypass req:               %20llu\n",
+ +		   (u64)atomic64_read(&adap->chcr_stats.ktls_tx_drop_bypass_req));
+++=======
++ 		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_trimmed_pkts));
++ 	seq_printf(seq, "TX sw fallback :                  %20llu\n",
++ 		   atomic64_read(&adap->ch_ktls_stats.ktls_tx_fallback));
++ 	while (i < MAX_NPORTS) {
++ 		ktls_port = &adap->ch_ktls_stats.ktls_port[i];
++ 		seq_printf(seq, "Port %d\n", i);
++ 		seq_printf(seq, "Tx connection created:            %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_open));
++ 		seq_printf(seq, "Tx connection failed:             %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_fail));
++ 		seq_printf(seq, "Tx connection closed:             %20llu\n",
++ 			   atomic64_read(&ktls_port->ktls_tx_connection_close));
++ 		i++;
++ 	}
+++>>>>>>> 21f82acbb8b4 (ch_ktls/cxgb4: handle partial tag alone SKBs)
+  #endif
+ +
+  	return 0;
+  }
+  DEFINE_SHOW_ATTRIBUTE(chcr_stats);
+diff --cc drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+index a963fd0b4540,1b49f2fa9b18..000000000000
+--- a/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
++++ b/drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
+@@@ -361,6 -365,33 +361,36 @@@ struct cxgb4_virt_res 
+  	struct cxgb4_range ppod_edram;
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_CHELSIO_TLS_DEVICE)
++ struct ch_ktls_port_stats_debug {
++ 	atomic64_t ktls_tx_connection_open;
++ 	atomic64_t ktls_tx_connection_fail;
++ 	atomic64_t ktls_tx_connection_close;
++ 	atomic64_t ktls_tx_encrypted_packets;
++ 	atomic64_t ktls_tx_encrypted_bytes;
++ 	atomic64_t ktls_tx_ctx;
++ 	atomic64_t ktls_tx_ooo;
++ 	atomic64_t ktls_tx_skip_no_sync_data;
++ 	atomic64_t ktls_tx_drop_no_sync_data;
++ 	atomic64_t ktls_tx_drop_bypass_req;
++ };
++ 
++ struct ch_ktls_stats_debug {
++ 	struct ch_ktls_port_stats_debug ktls_port[MAX_ULD_NPORTS];
++ 	atomic64_t ktls_tx_send_records;
++ 	atomic64_t ktls_tx_end_pkts;
++ 	atomic64_t ktls_tx_start_pkts;
++ 	atomic64_t ktls_tx_middle_pkts;
++ 	atomic64_t ktls_tx_retransmit_pkts;
++ 	atomic64_t ktls_tx_complete_pkts;
++ 	atomic64_t ktls_tx_trimmed_pkts;
++ 	atomic64_t ktls_tx_fallback;
++ };
++ #endif
++ 
+++>>>>>>> 21f82acbb8b4 (ch_ktls/cxgb4: handle partial tag alone SKBs)
+  struct chcr_stats_debug {
+  	atomic_t cipher_rqst;
+  	atomic_t digest_rqst;
+* Unmerged path drivers/crypto/chelsio/chcr_ktls.c
+diff --git a/drivers/crypto/chelsio/chcr_ktls.h b/drivers/crypto/chelsio/chcr_ktls.h
+index 5cbd84b1da05..6b29d9a303a1 100644
+--- a/drivers/crypto/chelsio/chcr_ktls.h
++++ b/drivers/crypto/chelsio/chcr_ktls.h
+@@ -23,6 +23,7 @@
+ 
+ #define CHCR_KTLS_WR_SIZE	(CHCR_PLAIN_TX_DATA_LEN +\
+ 				 sizeof(struct cpl_tx_sec_pdu))
++#define FALLBACK		35
+ 
+ enum chcr_ktls_conn_state {
+ 	KTLS_CONN_CLOSED,
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_debugfs.c
+* Unmerged path drivers/net/ethernet/chelsio/cxgb4/cxgb4_uld.h
