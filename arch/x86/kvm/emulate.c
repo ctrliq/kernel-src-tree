@@ -1092,7 +1092,7 @@ static void emulator_put_fpu(void)
 	fpregs_unlock();
 }
 
-static void read_sse_reg(struct x86_emulate_ctxt *ctxt, sse128_t *data, int reg)
+static void read_sse_reg(sse128_t *data, int reg)
 {
 	emulator_get_fpu();
 	switch (reg) {
@@ -1119,8 +1119,7 @@ static void read_sse_reg(struct x86_emulate_ctxt *ctxt, sse128_t *data, int reg)
 	emulator_put_fpu();
 }
 
-static void write_sse_reg(struct x86_emulate_ctxt *ctxt, sse128_t *data,
-			  int reg)
+static void write_sse_reg(sse128_t *data, int reg)
 {
 	emulator_get_fpu();
 	switch (reg) {
@@ -1147,7 +1146,7 @@ static void write_sse_reg(struct x86_emulate_ctxt *ctxt, sse128_t *data,
 	emulator_put_fpu();
 }
 
-static void read_mmx_reg(struct x86_emulate_ctxt *ctxt, u64 *data, int reg)
+static void read_mmx_reg(u64 *data, int reg)
 {
 	emulator_get_fpu();
 	switch (reg) {
@@ -1164,7 +1163,7 @@ static void read_mmx_reg(struct x86_emulate_ctxt *ctxt, u64 *data, int reg)
 	emulator_put_fpu();
 }
 
-static void write_mmx_reg(struct x86_emulate_ctxt *ctxt, u64 *data, int reg)
+static void write_mmx_reg(u64 *data, int reg)
 {
 	emulator_get_fpu();
 	switch (reg) {
@@ -1236,7 +1235,7 @@ static void decode_register_operand(struct x86_emulate_ctxt *ctxt,
 		op->type = OP_XMM;
 		op->bytes = 16;
 		op->addr.xmm = reg;
-		read_sse_reg(ctxt, &op->vec_val, reg);
+		read_sse_reg(&op->vec_val, reg);
 		return;
 	}
 	if (ctxt->d & Mmx) {
@@ -1287,7 +1286,7 @@ static int decode_modrm(struct x86_emulate_ctxt *ctxt,
 			op->type = OP_XMM;
 			op->bytes = 16;
 			op->addr.xmm = ctxt->modrm_rm;
-			read_sse_reg(ctxt, &op->vec_val, ctxt->modrm_rm);
+			read_sse_reg(&op->vec_val, ctxt->modrm_rm);
 			return rc;
 		}
 		if (ctxt->d & Mmx) {
@@ -1864,10 +1863,10 @@ static int writeback(struct x86_emulate_ctxt *ctxt, struct operand *op)
 				       op->bytes * op->count);
 		break;
 	case OP_XMM:
-		write_sse_reg(ctxt, &op->vec_val, op->addr.xmm);
+		write_sse_reg(&op->vec_val, op->addr.xmm);
 		break;
 	case OP_MM:
-		write_mmx_reg(ctxt, &op->mm_val, op->addr.mm);
+		write_mmx_reg(&op->mm_val, op->addr.mm);
 		break;
 	case OP_NONE:
 		/* no writeback */
@@ -5491,11 +5490,10 @@ static int flush_pending_x87_faults(struct x86_emulate_ctxt *ctxt)
 	return X86EMUL_CONTINUE;
 }
 
-static void fetch_possible_mmx_operand(struct x86_emulate_ctxt *ctxt,
-				       struct operand *op)
+static void fetch_possible_mmx_operand(struct operand *op)
 {
 	if (op->type == OP_MM)
-		read_mmx_reg(ctxt, &op->mm_val, op->addr.mm);
+		read_mmx_reg(&op->mm_val, op->addr.mm);
 }
 
 static int fastop(struct x86_emulate_ctxt *ctxt, void (*fop)(struct fastop *))
@@ -5574,10 +5572,10 @@ int x86_emulate_insn(struct x86_emulate_ctxt *ctxt)
 			 * Now that we know the fpu is exception safe, we can fetch
 			 * operands from it.
 			 */
-			fetch_possible_mmx_operand(ctxt, &ctxt->src);
-			fetch_possible_mmx_operand(ctxt, &ctxt->src2);
+			fetch_possible_mmx_operand(&ctxt->src);
+			fetch_possible_mmx_operand(&ctxt->src2);
 			if (!(ctxt->d & Mov))
-				fetch_possible_mmx_operand(ctxt, &ctxt->dst);
+				fetch_possible_mmx_operand(&ctxt->dst);
 		}
 
 		if (unlikely(emul_flags & X86EMUL_GUEST_MASK) && ctxt->intercept) {
