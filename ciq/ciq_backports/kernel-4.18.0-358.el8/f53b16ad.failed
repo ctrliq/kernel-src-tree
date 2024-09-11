@@ -1,0 +1,161 @@
+selftests: kvm: Add support for customized slot0 memory size
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Zhenzhong Duan <zhenzhong.duan@intel.com>
+commit f53b16ad64408b5376836708f8cf42dbf1cf6098
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f53b16ad.failed
+
+Until commit 39fe2fc96694 ("selftests: kvm: make allocation of extra
+memory take effect", 2021-05-27), parameter extra_mem_pages was used
+only to calculate the page table size for all the memory chunks,
+because real memory allocation happened with calls of
+vm_userspace_mem_region_add() after vm_create_default().
+
+Commit 39fe2fc96694 however changed the meaning of extra_mem_pages to
+the size of memory slot 0.  This makes the memory allocation more
+flexible, but makes it harder to account for the number of
+pages needed for the page tables.  For example, memslot_perf_test
+has a small amount of memory in slot 0 but a lot in other slots,
+and adding that memory twice (both in slot 0 and with later
+calls to vm_userspace_mem_region_add()) causes an error that
+was fixed in commit 000ac4295339 ("selftests: kvm: fix overlapping
+addresses in memslot_perf_test", 2021-05-29)
+
+Since both uses are sensible, add a new parameter slot0_mem_pages
+to vm_create_with_vcpus() and some comments to clarify the meaning of
+slot0_mem_pages and extra_mem_pages.  With this change,
+memslot_perf_test can go back to passing the number of memory
+pages as extra_mem_pages.
+
+	Signed-off-by: Zhenzhong Duan <zhenzhong.duan@intel.com>
+Message-Id: <20210608233816.423958-4-zhenzhong.duan@intel.com>
+[Squashed in a single patch and rewrote the commit message. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit f53b16ad64408b5376836708f8cf42dbf1cf6098)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/testing/selftests/kvm/memslot_perf_test.c
+* Unmerged path tools/testing/selftests/kvm/memslot_perf_test.c
+diff --git a/tools/testing/selftests/kvm/include/kvm_util.h b/tools/testing/selftests/kvm/include/kvm_util.h
+index fcd8e3855111..8bcadfa8cea5 100644
+--- a/tools/testing/selftests/kvm/include/kvm_util.h
++++ b/tools/testing/selftests/kvm/include/kvm_util.h
+@@ -285,10 +285,11 @@ struct kvm_vm *vm_create_default_with_vcpus(uint32_t nr_vcpus, uint64_t extra_me
+ 					    uint32_t num_percpu_pages, void *guest_code,
+ 					    uint32_t vcpuids[]);
+ 
+-/* Like vm_create_default_with_vcpus, but accepts mode as a parameter */
++/* Like vm_create_default_with_vcpus, but accepts mode and slot0 memory as a parameter */
+ struct kvm_vm *vm_create_with_vcpus(enum vm_guest_mode mode, uint32_t nr_vcpus,
+-				    uint64_t extra_mem_pages, uint32_t num_percpu_pages,
+-				    void *guest_code, uint32_t vcpuids[]);
++				    uint64_t slot0_mem_pages, uint64_t extra_mem_pages,
++				    uint32_t num_percpu_pages, void *guest_code,
++				    uint32_t vcpuids[]);
+ 
+ /*
+  * Adds a vCPU with reasonable defaults (e.g. a stack)
+diff --git a/tools/testing/selftests/kvm/kvm_page_table_test.c b/tools/testing/selftests/kvm/kvm_page_table_test.c
+index 1c4753fff19e..82171f17c1d7 100644
+--- a/tools/testing/selftests/kvm/kvm_page_table_test.c
++++ b/tools/testing/selftests/kvm/kvm_page_table_test.c
+@@ -268,7 +268,7 @@ static struct kvm_vm *pre_init_before_test(enum vm_guest_mode mode, void *arg)
+ 
+ 	/* Create a VM with enough guest pages */
+ 	guest_num_pages = test_mem_size / guest_page_size;
+-	vm = vm_create_with_vcpus(mode, nr_vcpus,
++	vm = vm_create_with_vcpus(mode, nr_vcpus, DEFAULT_GUEST_PHY_PAGES,
+ 				  guest_num_pages, 0, guest_code, NULL);
+ 
+ 	/* Align down GPA of the testing memslot */
+diff --git a/tools/testing/selftests/kvm/lib/kvm_util.c b/tools/testing/selftests/kvm/lib/kvm_util.c
+index f62780719176..91f57ee07915 100644
+--- a/tools/testing/selftests/kvm/lib/kvm_util.c
++++ b/tools/testing/selftests/kvm/lib/kvm_util.c
+@@ -308,21 +308,50 @@ struct kvm_vm *vm_create(enum vm_guest_mode mode, uint64_t phy_pages, int perm)
+ 	return vm;
+ }
+ 
++/*
++ * VM Create with customized parameters
++ *
++ * Input Args:
++ *   mode - VM Mode (e.g. VM_MODE_P52V48_4K)
++ *   nr_vcpus - VCPU count
++ *   slot0_mem_pages - Slot0 physical memory size
++ *   extra_mem_pages - Non-slot0 physical memory total size
++ *   num_percpu_pages - Per-cpu physical memory pages
++ *   guest_code - Guest entry point
++ *   vcpuids - VCPU IDs
++ *
++ * Output Args: None
++ *
++ * Return:
++ *   Pointer to opaque structure that describes the created VM.
++ *
++ * Creates a VM with the mode specified by mode (e.g. VM_MODE_P52V48_4K),
++ * with customized slot0 memory size, at least 512 pages currently.
++ * extra_mem_pages is only used to calculate the maximum page table size,
++ * no real memory allocation for non-slot0 memory in this function.
++ */
+ struct kvm_vm *vm_create_with_vcpus(enum vm_guest_mode mode, uint32_t nr_vcpus,
+-				    uint64_t extra_mem_pages, uint32_t num_percpu_pages,
+-				    void *guest_code, uint32_t vcpuids[])
++				    uint64_t slot0_mem_pages, uint64_t extra_mem_pages,
++				    uint32_t num_percpu_pages, void *guest_code,
++				    uint32_t vcpuids[])
+ {
++	uint64_t vcpu_pages, extra_pg_pages, pages;
++	struct kvm_vm *vm;
++	int i;
++
++	/* Force slot0 memory size not small than DEFAULT_GUEST_PHY_PAGES */
++	if (slot0_mem_pages < DEFAULT_GUEST_PHY_PAGES)
++		slot0_mem_pages = DEFAULT_GUEST_PHY_PAGES;
++
+ 	/* The maximum page table size for a memory region will be when the
+ 	 * smallest pages are used. Considering each page contains x page
+ 	 * table descriptors, the total extra size for page tables (for extra
+ 	 * N pages) will be: N/x+N/x^2+N/x^3+... which is definitely smaller
+ 	 * than N/x*2.
+ 	 */
+-	uint64_t vcpu_pages = (DEFAULT_STACK_PGS + num_percpu_pages) * nr_vcpus;
+-	uint64_t extra_pg_pages = (extra_mem_pages + vcpu_pages) / PTES_PER_MIN_PAGE * 2;
+-	uint64_t pages = DEFAULT_GUEST_PHY_PAGES + extra_mem_pages + vcpu_pages + extra_pg_pages;
+-	struct kvm_vm *vm;
+-	int i;
++	vcpu_pages = (DEFAULT_STACK_PGS + num_percpu_pages) * nr_vcpus;
++	extra_pg_pages = (slot0_mem_pages + extra_mem_pages + vcpu_pages) / PTES_PER_MIN_PAGE * 2;
++	pages = slot0_mem_pages + vcpu_pages + extra_pg_pages;
+ 
+ 	TEST_ASSERT(nr_vcpus <= kvm_check_cap(KVM_CAP_MAX_VCPUS),
+ 		    "nr_vcpus = %d too large for host, max-vcpus = %d",
+@@ -354,8 +383,8 @@ struct kvm_vm *vm_create_default_with_vcpus(uint32_t nr_vcpus, uint64_t extra_me
+ 					    uint32_t num_percpu_pages, void *guest_code,
+ 					    uint32_t vcpuids[])
+ {
+-	return vm_create_with_vcpus(VM_MODE_DEFAULT, nr_vcpus, extra_mem_pages,
+-				    num_percpu_pages, guest_code, vcpuids);
++	return vm_create_with_vcpus(VM_MODE_DEFAULT, nr_vcpus, DEFAULT_GUEST_PHY_PAGES,
++				    extra_mem_pages, num_percpu_pages, guest_code, vcpuids);
+ }
+ 
+ struct kvm_vm *vm_create_default(uint32_t vcpuid, uint64_t extra_mem_pages,
+diff --git a/tools/testing/selftests/kvm/lib/perf_test_util.c b/tools/testing/selftests/kvm/lib/perf_test_util.c
+index abf381800a59..7397ca299835 100644
+--- a/tools/testing/selftests/kvm/lib/perf_test_util.c
++++ b/tools/testing/selftests/kvm/lib/perf_test_util.c
+@@ -69,7 +69,7 @@ struct kvm_vm *perf_test_create_vm(enum vm_guest_mode mode, int vcpus,
+ 	TEST_ASSERT(vcpu_memory_bytes % perf_test_args.guest_page_size == 0,
+ 		    "Guest memory size is not guest page size aligned.");
+ 
+-	vm = vm_create_with_vcpus(mode, vcpus,
++	vm = vm_create_with_vcpus(mode, vcpus, DEFAULT_GUEST_PHY_PAGES,
+ 				  (vcpus * vcpu_memory_bytes) / perf_test_args.guest_page_size,
+ 				  0, guest_code, NULL);
+ 
+* Unmerged path tools/testing/selftests/kvm/memslot_perf_test.c
