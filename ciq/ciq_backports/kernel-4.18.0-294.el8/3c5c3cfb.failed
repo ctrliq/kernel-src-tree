@@ -1,0 +1,1539 @@
+kasan: support backing vmalloc space with real shadow memory
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Daniel Axtens <dja@axtens.net>
+commit 3c5c3cfb9ef4da957e3357a2bd36f76ee34c0862
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3c5c3cfb.failed
+
+Patch series "kasan: support backing vmalloc space with real shadow
+memory", v11.
+
+Currently, vmalloc space is backed by the early shadow page.  This means
+that kasan is incompatible with VMAP_STACK.
+
+This series provides a mechanism to back vmalloc space with real,
+dynamically allocated memory.  I have only wired up x86, because that's
+the only currently supported arch I can work with easily, but it's very
+easy to wire up other architectures, and it appears that there is some
+work-in-progress code to do this on arm64 and s390.
+
+This has been discussed before in the context of VMAP_STACK:
+ - https://bugzilla.kernel.org/show_bug.cgi?id=202009
+ - https://lkml.org/lkml/2018/7/22/198
+ - https://lkml.org/lkml/2019/7/19/822
+
+In terms of implementation details:
+
+Most mappings in vmalloc space are small, requiring less than a full
+page of shadow space.  Allocating a full shadow page per mapping would
+therefore be wasteful.  Furthermore, to ensure that different mappings
+use different shadow pages, mappings would have to be aligned to
+KASAN_SHADOW_SCALE_SIZE * PAGE_SIZE.
+
+Instead, share backing space across multiple mappings.  Allocate a
+backing page when a mapping in vmalloc space uses a particular page of
+the shadow region.  This page can be shared by other vmalloc mappings
+later on.
+
+We hook in to the vmap infrastructure to lazily clean up unused shadow
+memory.
+
+Testing with test_vmalloc.sh on an x86 VM with 2 vCPUs shows that:
+
+ - Turning on KASAN, inline instrumentation, without vmalloc, introuduces
+   a 4.1x-4.2x slowdown in vmalloc operations.
+
+ - Turning this on introduces the following slowdowns over KASAN:
+     * ~1.76x slower single-threaded (test_vmalloc.sh performance)
+     * ~2.18x slower when both cpus are performing operations
+       simultaneously (test_vmalloc.sh sequential_test_order=1)
+
+This is unfortunate but given that this is a debug feature only, not the
+end of the world.  The benchmarks are also a stress-test for the vmalloc
+subsystem: they're not indicative of an overall 2x slowdown!
+
+This patch (of 4):
+
+Hook into vmalloc and vmap, and dynamically allocate real shadow memory
+to back the mappings.
+
+Most mappings in vmalloc space are small, requiring less than a full
+page of shadow space.  Allocating a full shadow page per mapping would
+therefore be wasteful.  Furthermore, to ensure that different mappings
+use different shadow pages, mappings would have to be aligned to
+KASAN_SHADOW_SCALE_SIZE * PAGE_SIZE.
+
+Instead, share backing space across multiple mappings.  Allocate a
+backing page when a mapping in vmalloc space uses a particular page of
+the shadow region.  This page can be shared by other vmalloc mappings
+later on.
+
+We hook in to the vmap infrastructure to lazily clean up unused shadow
+memory.
+
+To avoid the difficulties around swapping mappings around, this code
+expects that the part of the shadow region that covers the vmalloc space
+will not be covered by the early shadow page, but will be left unmapped.
+This will require changes in arch-specific code.
+
+This allows KASAN with VMAP_STACK, and may be helpful for architectures
+that do not have a separate module space (e.g.  powerpc64, which I am
+currently working on).  It also allows relaxing the module alignment
+back to PAGE_SIZE.
+
+Testing with test_vmalloc.sh on an x86 VM with 2 vCPUs shows that:
+
+ - Turning on KASAN, inline instrumentation, without vmalloc, introuduces
+   a 4.1x-4.2x slowdown in vmalloc operations.
+
+ - Turning this on introduces the following slowdowns over KASAN:
+     * ~1.76x slower single-threaded (test_vmalloc.sh performance)
+     * ~2.18x slower when both cpus are performing operations
+       simultaneously (test_vmalloc.sh sequential_test_order=3D1)
+
+This is unfortunate but given that this is a debug feature only, not the
+end of the world.
+
+The full benchmark results are:
+
+Performance
+
+                              No KASAN      KASAN original x baseline  KASAN vmalloc x baseline    x KASAN
+
+fix_size_alloc_test             662004            11404956      17.23       19144610      28.92       1.68
+full_fit_alloc_test             710950            12029752      16.92       13184651      18.55       1.10
+long_busy_list_alloc_test      9431875            43990172       4.66       82970178       8.80       1.89
+random_size_alloc_test         5033626            23061762       4.58       47158834       9.37       2.04
+fix_align_alloc_test           1252514            15276910      12.20       31266116      24.96       2.05
+random_size_align_alloc_te     1648501            14578321       8.84       25560052      15.51       1.75
+align_shift_alloc_test             147                 830       5.65           5692      38.72       6.86
+pcpu_alloc_test                  80732              125520       1.55         140864       1.74       1.12
+Total Cycles              119240774314        763211341128       6.40  1390338696894      11.66       1.82
+
+Sequential, 2 cpus
+
+                              No KASAN      KASAN original x baseline  KASAN vmalloc x baseline    x KASAN
+
+fix_size_alloc_test            1423150            14276550      10.03       27733022      19.49       1.94
+full_fit_alloc_test            1754219            14722640       8.39       15030786       8.57       1.02
+long_busy_list_alloc_test     11451858            52154973       4.55      107016027       9.34       2.05
+random_size_alloc_test         5989020            26735276       4.46       68885923      11.50       2.58
+fix_align_alloc_test           2050976            20166900       9.83       50491675      24.62       2.50
+random_size_align_alloc_te     2858229            17971700       6.29       38730225      13.55       2.16
+align_shift_alloc_test             405                6428      15.87          26253      64.82       4.08
+pcpu_alloc_test                 127183              151464       1.19         216263       1.70       1.43
+Total Cycles               54181269392        308723699764       5.70   650772566394      12.01       2.11
+fix_size_alloc_test            1420404            14289308      10.06       27790035      19.56       1.94
+full_fit_alloc_test            1736145            14806234       8.53       15274301       8.80       1.03
+long_busy_list_alloc_test     11404638            52270785       4.58      107550254       9.43       2.06
+random_size_alloc_test         6017006            26650625       4.43       68696127      11.42       2.58
+fix_align_alloc_test           2045504            20280985       9.91       50414862      24.65       2.49
+random_size_align_alloc_te     2845338            17931018       6.30       38510276      13.53       2.15
+align_shift_alloc_test             472                3760       7.97           9656      20.46       2.57
+pcpu_alloc_test                 118643              132732       1.12         146504       1.23       1.10
+Total Cycles               54040011688        309102805492       5.72   651325675652      12.05       2.11
+
+[dja@axtens.net: fixups]
+  Link: http://lkml.kernel.org/r/20191120052719.7201-1-dja@axtens.net
+Link: https://bugzilla.kernel.org/show_bug.cgi?id=3D202009
+Link: http://lkml.kernel.org/r/20191031093909.9228-2-dja@axtens.net
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com> [shadow rework]
+	Signed-off-by: Daniel Axtens <dja@axtens.net>
+Co-developed-by: Mark Rutland <mark.rutland@arm.com>
+	Acked-by: Vasily Gorbik <gor@linux.ibm.com>
+	Reviewed-by: Andrey Ryabinin <aryabinin@virtuozzo.com>
+	Cc: Alexander Potapenko <glider@google.com>
+	Cc: Dmitry Vyukov <dvyukov@google.com>
+	Cc: Christophe Leroy <christophe.leroy@c-s.fr>
+	Cc: Qian Cai <cai@lca.pw>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 3c5c3cfb9ef4da957e3357a2bd36f76ee34c0862)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/kasan.h
+#	lib/Kconfig.kasan
+#	mm/kasan/generic_report.c
+#	mm/vmalloc.c
+diff --cc include/linux/kasan.h
+index 1e5ac58e377c,4f404c565db1..000000000000
+--- a/include/linux/kasan.h
++++ b/include/linux/kasan.h
+@@@ -159,4 -168,61 +169,64 @@@ static inline size_t kasan_metadata_siz
+  
+  #endif /* CONFIG_KASAN */
+  
+++<<<<<<< HEAD
+++=======
++ #ifdef CONFIG_KASAN_GENERIC
++ 
++ #define KASAN_SHADOW_INIT 0
++ 
++ void kasan_cache_shrink(struct kmem_cache *cache);
++ void kasan_cache_shutdown(struct kmem_cache *cache);
++ 
++ #else /* CONFIG_KASAN_GENERIC */
++ 
++ static inline void kasan_cache_shrink(struct kmem_cache *cache) {}
++ static inline void kasan_cache_shutdown(struct kmem_cache *cache) {}
++ 
++ #endif /* CONFIG_KASAN_GENERIC */
++ 
++ #ifdef CONFIG_KASAN_SW_TAGS
++ 
++ #define KASAN_SHADOW_INIT 0xFF
++ 
++ void kasan_init_tags(void);
++ 
++ void *kasan_reset_tag(const void *addr);
++ 
++ void kasan_report(unsigned long addr, size_t size,
++ 		bool is_write, unsigned long ip);
++ 
++ #else /* CONFIG_KASAN_SW_TAGS */
++ 
++ static inline void kasan_init_tags(void) { }
++ 
++ static inline void *kasan_reset_tag(const void *addr)
++ {
++ 	return (void *)addr;
++ }
++ 
++ #endif /* CONFIG_KASAN_SW_TAGS */
++ 
++ #ifdef CONFIG_KASAN_VMALLOC
++ int kasan_populate_vmalloc(unsigned long requested_size,
++ 			   struct vm_struct *area);
++ void kasan_poison_vmalloc(void *start, unsigned long size);
++ void kasan_release_vmalloc(unsigned long start, unsigned long end,
++ 			   unsigned long free_region_start,
++ 			   unsigned long free_region_end);
++ #else
++ static inline int kasan_populate_vmalloc(unsigned long requested_size,
++ 					 struct vm_struct *area)
++ {
++ 	return 0;
++ }
++ 
++ static inline void kasan_poison_vmalloc(void *start, unsigned long size) {}
++ static inline void kasan_release_vmalloc(unsigned long start,
++ 					 unsigned long end,
++ 					 unsigned long free_region_start,
++ 					 unsigned long free_region_end) {}
++ #endif
++ 
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  #endif /* LINUX_KASAN_H */
+diff --cc lib/Kconfig.kasan
+index d0bad1bd9a2b,81f5464ea9e1..000000000000
+--- a/lib/Kconfig.kasan
++++ b/lib/Kconfig.kasan
+@@@ -1,10 -1,45 +1,24 @@@
+  config HAVE_ARCH_KASAN
+  	bool
+  
+++<<<<<<< HEAD
+ +if HAVE_ARCH_KASAN
+++=======
++ config HAVE_ARCH_KASAN_SW_TAGS
++ 	bool
++ 
++ config	HAVE_ARCH_KASAN_VMALLOC
++ 	bool
++ 
++ config CC_HAS_KASAN_GENERIC
++ 	def_bool $(cc-option, -fsanitize=kernel-address)
++ 
++ config CC_HAS_KASAN_SW_TAGS
++ 	def_bool $(cc-option, -fsanitize=kernel-hwaddress)
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  
+  config KASAN
+ -	bool "KASAN: runtime memory debugger"
+ -	depends on (HAVE_ARCH_KASAN && CC_HAS_KASAN_GENERIC) || \
+ -		   (HAVE_ARCH_KASAN_SW_TAGS && CC_HAS_KASAN_SW_TAGS)
+ -	depends on (SLUB && SYSFS) || (SLAB && !DEBUG_SLAB)
+ -	help
+ -	  Enables KASAN (KernelAddressSANitizer) - runtime memory debugger,
+ -	  designed to find out-of-bounds accesses and use-after-free bugs.
+ -	  See Documentation/dev-tools/kasan.rst for details.
+ -
+ -choice
+ -	prompt "KASAN mode"
+ -	depends on KASAN
+ -	default KASAN_GENERIC
+ -	help
+ -	  KASAN has two modes: generic KASAN (similar to userspace ASan,
+ -	  x86_64/arm64/xtensa, enabled with CONFIG_KASAN_GENERIC) and
+ -	  software tag-based KASAN (a version based on software memory
+ -	  tagging, arm64 only, similar to userspace HWASan, enabled with
+ -	  CONFIG_KASAN_SW_TAGS).
+ -	  Both generic and tag-based KASAN are strictly debugging features.
+ -
+ -config KASAN_GENERIC
+ -	bool "Generic mode"
+ -	depends on HAVE_ARCH_KASAN && CC_HAS_KASAN_GENERIC
+ +	bool "KASan: runtime memory debugger"
+  	depends on (SLUB && SYSFS) || (SLAB && !DEBUG_SLAB)
+  	select SLUB_DEBUG if SLUB
+  	select CONSTRUCTORS
+@@@ -66,8 -137,29 +80,32 @@@ config KASAN_S390_4_LEVEL_PAGIN
+  	  to 3TB of RAM with KASan enabled). This options allows to force
+  	  4-level paging instead.
+  
+++<<<<<<< HEAD
+++=======
++ config KASAN_SW_TAGS_IDENTIFY
++ 	bool "Enable memory corruption identification"
++ 	depends on KASAN_SW_TAGS
++ 	help
++ 	  This option enables best-effort identification of bug type
++ 	  (use-after-free or out-of-bounds) at the cost of increased
++ 	  memory consumption.
++ 
++ config KASAN_VMALLOC
++ 	bool "Back mappings in vmalloc space with real shadow memory"
++ 	depends on KASAN && HAVE_ARCH_KASAN_VMALLOC
++ 	help
++ 	  By default, the shadow region for vmalloc space is the read-only
++ 	  zero page. This means that KASAN cannot detect errors involving
++ 	  vmalloc space.
++ 
++ 	  Enabling this option will hook in to vmap/vmalloc and back those
++ 	  mappings with real shadow memory allocated on demand. This allows
++ 	  for KASAN to detect more sorts of errors (and to support vmapped
++ 	  stacks), but at the cost of higher memory usage.
++ 
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  config TEST_KASAN
+ -	tristate "Module for testing KASAN for bug detection"
+ +	tristate "Module for testing kasan for bug detection"
+  	depends on m && KASAN
+  	help
+  	  This is a test module doing various nasty things like
+diff --cc mm/vmalloc.c
+index c82a0db1aefc,4d3b3d60d893..000000000000
+--- a/mm/vmalloc.c
++++ b/mm/vmalloc.c
+@@@ -363,41 -430,636 +363,562 @@@ static struct vmap_area *__find_vmap_ar
+  	return NULL;
+  }
+  
+ -/*
+ - * This function returns back addresses of parent node
+ - * and its left or right link for further processing.
+ - */
+ -static __always_inline struct rb_node **
+ -find_va_links(struct vmap_area *va,
+ -	struct rb_root *root, struct rb_node *from,
+ -	struct rb_node **parent)
+ +static void __insert_vmap_area(struct vmap_area *va)
+  {
+ -	struct vmap_area *tmp_va;
+ -	struct rb_node **link;
+ -
+ -	if (root) {
+ -		link = &root->rb_node;
+ -		if (unlikely(!*link)) {
+ -			*parent = NULL;
+ -			return link;
+ -		}
+ -	} else {
+ -		link = &from;
+ -	}
+ +	struct rb_node **p = &vmap_area_root.rb_node;
+ +	struct rb_node *parent = NULL;
+ +	struct rb_node *tmp;
+  
+ -	/*
+ -	 * Go to the bottom of the tree. When we hit the last point
+ -	 * we end up with parent rb_node and correct direction, i name
+ -	 * it link, where the new va->rb_node will be attached to.
+ -	 */
+ -	do {
+ -		tmp_va = rb_entry(*link, struct vmap_area, rb_node);
+ +	while (*p) {
+ +		struct vmap_area *tmp_va;
+  
+ -		/*
+ -		 * During the traversal we also do some sanity check.
+ -		 * Trigger the BUG() if there are sides(left/right)
+ -		 * or full overlaps.
+ -		 */
+ -		if (va->va_start < tmp_va->va_end &&
+ -				va->va_end <= tmp_va->va_start)
+ -			link = &(*link)->rb_left;
+ -		else if (va->va_end > tmp_va->va_start &&
+ -				va->va_start >= tmp_va->va_end)
+ -			link = &(*link)->rb_right;
+ +		parent = *p;
+ +		tmp_va = rb_entry(parent, struct vmap_area, rb_node);
+ +		if (va->va_start < tmp_va->va_end)
+ +			p = &(*p)->rb_left;
+ +		else if (va->va_end > tmp_va->va_start)
+ +			p = &(*p)->rb_right;
+  		else
+  			BUG();
+ -	} while (*link);
+ -
+ -	*parent = &tmp_va->rb_node;
+ -	return link;
+ -}
+ -
+ -static __always_inline struct list_head *
+ -get_va_next_sibling(struct rb_node *parent, struct rb_node **link)
+ -{
+ -	struct list_head *list;
+ -
+ -	if (unlikely(!parent))
+ -		/*
+ -		 * The red-black tree where we try to find VA neighbors
+ -		 * before merging or inserting is empty, i.e. it means
+ -		 * there is no free vmap space. Normally it does not
+ -		 * happen but we handle this case anyway.
+ -		 */
+ -		return NULL;
+ -
+ -	list = &rb_entry(parent, struct vmap_area, rb_node)->list;
+ -	return (&parent->rb_right == link ? list->next : list);
+ -}
+ -
+ -static __always_inline void
+ -link_va(struct vmap_area *va, struct rb_root *root,
+ -	struct rb_node *parent, struct rb_node **link, struct list_head *head)
+ -{
+ -	/*
+ -	 * VA is still not in the list, but we can
+ -	 * identify its future previous list_head node.
+ -	 */
+ -	if (likely(parent)) {
+ -		head = &rb_entry(parent, struct vmap_area, rb_node)->list;
+ -		if (&parent->rb_right != link)
+ -			head = head->prev;
+  	}
+  
+ -	/* Insert to the rb-tree */
+ -	rb_link_node(&va->rb_node, parent, link);
+ -	if (root == &free_vmap_area_root) {
+ -		/*
+ -		 * Some explanation here. Just perform simple insertion
+ -		 * to the tree. We do not set va->subtree_max_size to
+ -		 * its current size before calling rb_insert_augmented().
+ -		 * It is because of we populate the tree from the bottom
+ -		 * to parent levels when the node _is_ in the tree.
+ -		 *
+ -		 * Therefore we set subtree_max_size to zero after insertion,
+ -		 * to let __augment_tree_propagate_from() puts everything to
+ -		 * the correct order later on.
+ -		 */
+ -		rb_insert_augmented(&va->rb_node,
+ -			root, &free_vmap_area_rb_augment_cb);
+ -		va->subtree_max_size = 0;
+ -	} else {
+ -		rb_insert_color(&va->rb_node, root);
+ -	}
+ +	rb_link_node(&va->rb_node, parent, p);
+ +	rb_insert_color(&va->rb_node, &vmap_area_root);
+  
+ -	/* Address-sort this list */
+ -	list_add(&va->list, head);
+ +	/* address-sort this list */
+ +	tmp = rb_prev(&va->rb_node);
+ +	if (tmp) {
+ +		struct vmap_area *prev;
+ +		prev = rb_entry(tmp, struct vmap_area, rb_node);
+ +		list_add_rcu(&va->list, &prev->list);
+ +	} else
+ +		list_add_rcu(&va->list, &vmap_area_list);
+  }
+  
+ -static __always_inline void
+ -unlink_va(struct vmap_area *va, struct rb_root *root)
+ -{
+ -	if (WARN_ON(RB_EMPTY_NODE(&va->rb_node)))
+ -		return;
+ +static void purge_vmap_area_lazy(void);
+  
+++<<<<<<< HEAD
+ +static BLOCKING_NOTIFIER_HEAD(vmap_notify_list);
+++=======
++ 	if (root == &free_vmap_area_root)
++ 		rb_erase_augmented(&va->rb_node,
++ 			root, &free_vmap_area_rb_augment_cb);
++ 	else
++ 		rb_erase(&va->rb_node, root);
++ 
++ 	list_del(&va->list);
++ 	RB_CLEAR_NODE(&va->rb_node);
++ }
++ 
++ #if DEBUG_AUGMENT_PROPAGATE_CHECK
++ static void
++ augment_tree_propagate_check(struct rb_node *n)
++ {
++ 	struct vmap_area *va;
++ 	struct rb_node *node;
++ 	unsigned long size;
++ 	bool found = false;
++ 
++ 	if (n == NULL)
++ 		return;
++ 
++ 	va = rb_entry(n, struct vmap_area, rb_node);
++ 	size = va->subtree_max_size;
++ 	node = n;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 
++ 		if (get_subtree_max_size(node->rb_left) == size) {
++ 			node = node->rb_left;
++ 		} else {
++ 			if (va_size(va) == size) {
++ 				found = true;
++ 				break;
++ 			}
++ 
++ 			node = node->rb_right;
++ 		}
++ 	}
++ 
++ 	if (!found) {
++ 		va = rb_entry(n, struct vmap_area, rb_node);
++ 		pr_emerg("tree is corrupted: %lu, %lu\n",
++ 			va_size(va), va->subtree_max_size);
++ 	}
++ 
++ 	augment_tree_propagate_check(n->rb_left);
++ 	augment_tree_propagate_check(n->rb_right);
++ }
++ #endif
++ 
++ /*
++  * This function populates subtree_max_size from bottom to upper
++  * levels starting from VA point. The propagation must be done
++  * when VA size is modified by changing its va_start/va_end. Or
++  * in case of newly inserting of VA to the tree.
++  *
++  * It means that __augment_tree_propagate_from() must be called:
++  * - After VA has been inserted to the tree(free path);
++  * - After VA has been shrunk(allocation path);
++  * - After VA has been increased(merging path).
++  *
++  * Please note that, it does not mean that upper parent nodes
++  * and their subtree_max_size are recalculated all the time up
++  * to the root node.
++  *
++  *       4--8
++  *        /\
++  *       /  \
++  *      /    \
++  *    2--2  8--8
++  *
++  * For example if we modify the node 4, shrinking it to 2, then
++  * no any modification is required. If we shrink the node 2 to 1
++  * its subtree_max_size is updated only, and set to 1. If we shrink
++  * the node 8 to 6, then its subtree_max_size is set to 6 and parent
++  * node becomes 4--6.
++  */
++ static __always_inline void
++ augment_tree_propagate_from(struct vmap_area *va)
++ {
++ 	struct rb_node *node = &va->rb_node;
++ 	unsigned long new_va_sub_max_size;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 		new_va_sub_max_size = compute_subtree_max_size(va);
++ 
++ 		/*
++ 		 * If the newly calculated maximum available size of the
++ 		 * subtree is equal to the current one, then it means that
++ 		 * the tree is propagated correctly. So we have to stop at
++ 		 * this point to save cycles.
++ 		 */
++ 		if (va->subtree_max_size == new_va_sub_max_size)
++ 			break;
++ 
++ 		va->subtree_max_size = new_va_sub_max_size;
++ 		node = rb_parent(&va->rb_node);
++ 	}
++ 
++ #if DEBUG_AUGMENT_PROPAGATE_CHECK
++ 	augment_tree_propagate_check(free_vmap_area_root.rb_node);
++ #endif
++ }
++ 
++ static void
++ insert_vmap_area(struct vmap_area *va,
++ 	struct rb_root *root, struct list_head *head)
++ {
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 
++ 	link = find_va_links(va, root, NULL, &parent);
++ 	link_va(va, root, parent, link, head);
++ }
++ 
++ static void
++ insert_vmap_area_augment(struct vmap_area *va,
++ 	struct rb_node *from, struct rb_root *root,
++ 	struct list_head *head)
++ {
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 
++ 	if (from)
++ 		link = find_va_links(va, NULL, from, &parent);
++ 	else
++ 		link = find_va_links(va, root, NULL, &parent);
++ 
++ 	link_va(va, root, parent, link, head);
++ 	augment_tree_propagate_from(va);
++ }
++ 
++ /*
++  * Merge de-allocated chunk of VA memory with previous
++  * and next free blocks. If coalesce is not done a new
++  * free area is inserted. If VA has been merged, it is
++  * freed.
++  */
++ static __always_inline struct vmap_area *
++ merge_or_add_vmap_area(struct vmap_area *va,
++ 	struct rb_root *root, struct list_head *head)
++ {
++ 	struct vmap_area *sibling;
++ 	struct list_head *next;
++ 	struct rb_node **link;
++ 	struct rb_node *parent;
++ 	bool merged = false;
++ 
++ 	/*
++ 	 * Find a place in the tree where VA potentially will be
++ 	 * inserted, unless it is merged with its sibling/siblings.
++ 	 */
++ 	link = find_va_links(va, root, NULL, &parent);
++ 
++ 	/*
++ 	 * Get next node of VA to check if merging can be done.
++ 	 */
++ 	next = get_va_next_sibling(parent, link);
++ 	if (unlikely(next == NULL))
++ 		goto insert;
++ 
++ 	/*
++ 	 * start            end
++ 	 * |                |
++ 	 * |<------VA------>|<-----Next----->|
++ 	 *                  |                |
++ 	 *                  start            end
++ 	 */
++ 	if (next != head) {
++ 		sibling = list_entry(next, struct vmap_area, list);
++ 		if (sibling->va_start == va->va_end) {
++ 			sibling->va_start = va->va_start;
++ 
++ 			/* Check and update the tree if needed. */
++ 			augment_tree_propagate_from(sibling);
++ 
++ 			/* Free vmap_area object. */
++ 			kmem_cache_free(vmap_area_cachep, va);
++ 
++ 			/* Point to the new merged area. */
++ 			va = sibling;
++ 			merged = true;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * start            end
++ 	 * |                |
++ 	 * |<-----Prev----->|<------VA------>|
++ 	 *                  |                |
++ 	 *                  start            end
++ 	 */
++ 	if (next->prev != head) {
++ 		sibling = list_entry(next->prev, struct vmap_area, list);
++ 		if (sibling->va_end == va->va_start) {
++ 			sibling->va_end = va->va_end;
++ 
++ 			/* Check and update the tree if needed. */
++ 			augment_tree_propagate_from(sibling);
++ 
++ 			if (merged)
++ 				unlink_va(va, root);
++ 
++ 			/* Free vmap_area object. */
++ 			kmem_cache_free(vmap_area_cachep, va);
++ 
++ 			/* Point to the new merged area. */
++ 			va = sibling;
++ 			merged = true;
++ 		}
++ 	}
++ 
++ insert:
++ 	if (!merged) {
++ 		link_va(va, root, parent, link, head);
++ 		augment_tree_propagate_from(va);
++ 	}
++ 
++ 	return va;
++ }
++ 
++ static __always_inline bool
++ is_within_this_va(struct vmap_area *va, unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	unsigned long nva_start_addr;
++ 
++ 	if (va->va_start > vstart)
++ 		nva_start_addr = ALIGN(va->va_start, align);
++ 	else
++ 		nva_start_addr = ALIGN(vstart, align);
++ 
++ 	/* Can be overflowed due to big size or alignment. */
++ 	if (nva_start_addr + size < nva_start_addr ||
++ 			nva_start_addr < vstart)
++ 		return false;
++ 
++ 	return (nva_start_addr + size <= va->va_end);
++ }
++ 
++ /*
++  * Find the first free block(lowest start address) in the tree,
++  * that will accomplish the request corresponding to passing
++  * parameters.
++  */
++ static __always_inline struct vmap_area *
++ find_vmap_lowest_match(unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	struct vmap_area *va;
++ 	struct rb_node *node;
++ 	unsigned long length;
++ 
++ 	/* Start from the root. */
++ 	node = free_vmap_area_root.rb_node;
++ 
++ 	/* Adjust the search size for alignment overhead. */
++ 	length = size + align - 1;
++ 
++ 	while (node) {
++ 		va = rb_entry(node, struct vmap_area, rb_node);
++ 
++ 		if (get_subtree_max_size(node->rb_left) >= length &&
++ 				vstart < va->va_start) {
++ 			node = node->rb_left;
++ 		} else {
++ 			if (is_within_this_va(va, size, align, vstart))
++ 				return va;
++ 
++ 			/*
++ 			 * Does not make sense to go deeper towards the right
++ 			 * sub-tree if it does not have a free block that is
++ 			 * equal or bigger to the requested search length.
++ 			 */
++ 			if (get_subtree_max_size(node->rb_right) >= length) {
++ 				node = node->rb_right;
++ 				continue;
++ 			}
++ 
++ 			/*
++ 			 * OK. We roll back and find the first right sub-tree,
++ 			 * that will satisfy the search criteria. It can happen
++ 			 * only once due to "vstart" restriction.
++ 			 */
++ 			while ((node = rb_parent(node))) {
++ 				va = rb_entry(node, struct vmap_area, rb_node);
++ 				if (is_within_this_va(va, size, align, vstart))
++ 					return va;
++ 
++ 				if (get_subtree_max_size(node->rb_right) >= length &&
++ 						vstart <= va->va_start) {
++ 					node = node->rb_right;
++ 					break;
++ 				}
++ 			}
++ 		}
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ #if DEBUG_AUGMENT_LOWEST_MATCH_CHECK
++ #include <linux/random.h>
++ 
++ static struct vmap_area *
++ find_vmap_lowest_linear_match(unsigned long size,
++ 	unsigned long align, unsigned long vstart)
++ {
++ 	struct vmap_area *va;
++ 
++ 	list_for_each_entry(va, &free_vmap_area_list, list) {
++ 		if (!is_within_this_va(va, size, align, vstart))
++ 			continue;
++ 
++ 		return va;
++ 	}
++ 
++ 	return NULL;
++ }
++ 
++ static void
++ find_vmap_lowest_match_check(unsigned long size)
++ {
++ 	struct vmap_area *va_1, *va_2;
++ 	unsigned long vstart;
++ 	unsigned int rnd;
++ 
++ 	get_random_bytes(&rnd, sizeof(rnd));
++ 	vstart = VMALLOC_START + rnd;
++ 
++ 	va_1 = find_vmap_lowest_match(size, 1, vstart);
++ 	va_2 = find_vmap_lowest_linear_match(size, 1, vstart);
++ 
++ 	if (va_1 != va_2)
++ 		pr_emerg("not lowest: t: 0x%p, l: 0x%p, v: 0x%lx\n",
++ 			va_1, va_2, vstart);
++ }
++ #endif
++ 
++ enum fit_type {
++ 	NOTHING_FIT = 0,
++ 	FL_FIT_TYPE = 1,	/* full fit */
++ 	LE_FIT_TYPE = 2,	/* left edge fit */
++ 	RE_FIT_TYPE = 3,	/* right edge fit */
++ 	NE_FIT_TYPE = 4		/* no edge fit */
++ };
++ 
++ static __always_inline enum fit_type
++ classify_va_fit_type(struct vmap_area *va,
++ 	unsigned long nva_start_addr, unsigned long size)
++ {
++ 	enum fit_type type;
++ 
++ 	/* Check if it is within VA. */
++ 	if (nva_start_addr < va->va_start ||
++ 			nva_start_addr + size > va->va_end)
++ 		return NOTHING_FIT;
++ 
++ 	/* Now classify. */
++ 	if (va->va_start == nva_start_addr) {
++ 		if (va->va_end == nva_start_addr + size)
++ 			type = FL_FIT_TYPE;
++ 		else
++ 			type = LE_FIT_TYPE;
++ 	} else if (va->va_end == nva_start_addr + size) {
++ 		type = RE_FIT_TYPE;
++ 	} else {
++ 		type = NE_FIT_TYPE;
++ 	}
++ 
++ 	return type;
++ }
++ 
++ static __always_inline int
++ adjust_va_to_fit_type(struct vmap_area *va,
++ 	unsigned long nva_start_addr, unsigned long size,
++ 	enum fit_type type)
++ {
++ 	struct vmap_area *lva = NULL;
++ 
++ 	if (type == FL_FIT_TYPE) {
++ 		/*
++ 		 * No need to split VA, it fully fits.
++ 		 *
++ 		 * |               |
++ 		 * V      NVA      V
++ 		 * |---------------|
++ 		 */
++ 		unlink_va(va, &free_vmap_area_root);
++ 		kmem_cache_free(vmap_area_cachep, va);
++ 	} else if (type == LE_FIT_TYPE) {
++ 		/*
++ 		 * Split left edge of fit VA.
++ 		 *
++ 		 * |       |
++ 		 * V  NVA  V   R
++ 		 * |-------|-------|
++ 		 */
++ 		va->va_start += size;
++ 	} else if (type == RE_FIT_TYPE) {
++ 		/*
++ 		 * Split right edge of fit VA.
++ 		 *
++ 		 *         |       |
++ 		 *     L   V  NVA  V
++ 		 * |-------|-------|
++ 		 */
++ 		va->va_end = nva_start_addr;
++ 	} else if (type == NE_FIT_TYPE) {
++ 		/*
++ 		 * Split no edge of fit VA.
++ 		 *
++ 		 *     |       |
++ 		 *   L V  NVA  V R
++ 		 * |---|-------|---|
++ 		 */
++ 		lva = __this_cpu_xchg(ne_fit_preload_node, NULL);
++ 		if (unlikely(!lva)) {
++ 			/*
++ 			 * For percpu allocator we do not do any pre-allocation
++ 			 * and leave it as it is. The reason is it most likely
++ 			 * never ends up with NE_FIT_TYPE splitting. In case of
++ 			 * percpu allocations offsets and sizes are aligned to
++ 			 * fixed align request, i.e. RE_FIT_TYPE and FL_FIT_TYPE
++ 			 * are its main fitting cases.
++ 			 *
++ 			 * There are a few exceptions though, as an example it is
++ 			 * a first allocation (early boot up) when we have "one"
++ 			 * big free space that has to be split.
++ 			 *
++ 			 * Also we can hit this path in case of regular "vmap"
++ 			 * allocations, if "this" current CPU was not preloaded.
++ 			 * See the comment in alloc_vmap_area() why. If so, then
++ 			 * GFP_NOWAIT is used instead to get an extra object for
++ 			 * split purpose. That is rare and most time does not
++ 			 * occur.
++ 			 *
++ 			 * What happens if an allocation gets failed. Basically,
++ 			 * an "overflow" path is triggered to purge lazily freed
++ 			 * areas to free some memory, then, the "retry" path is
++ 			 * triggered to repeat one more time. See more details
++ 			 * in alloc_vmap_area() function.
++ 			 */
++ 			lva = kmem_cache_alloc(vmap_area_cachep, GFP_NOWAIT);
++ 			if (!lva)
++ 				return -1;
++ 		}
++ 
++ 		/*
++ 		 * Build the remainder.
++ 		 */
++ 		lva->va_start = va->va_start;
++ 		lva->va_end = nva_start_addr;
++ 
++ 		/*
++ 		 * Shrink this VA to remaining size.
++ 		 */
++ 		va->va_start = nva_start_addr + size;
++ 	} else {
++ 		return -1;
++ 	}
++ 
++ 	if (type != FL_FIT_TYPE) {
++ 		augment_tree_propagate_from(va);
++ 
++ 		if (lva)	/* type == NE_FIT_TYPE */
++ 			insert_vmap_area_augment(lva, &va->rb_node,
++ 				&free_vmap_area_root, &free_vmap_area_list);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Returns a start address of the newly allocated area, if success.
++  * Otherwise a vend is returned that indicates failure.
++  */
++ static __always_inline unsigned long
++ __alloc_vmap_area(unsigned long size, unsigned long align,
++ 	unsigned long vstart, unsigned long vend)
++ {
++ 	unsigned long nva_start_addr;
++ 	struct vmap_area *va;
++ 	enum fit_type type;
++ 	int ret;
++ 
++ 	va = find_vmap_lowest_match(size, align, vstart);
++ 	if (unlikely(!va))
++ 		return vend;
++ 
++ 	if (va->va_start > vstart)
++ 		nva_start_addr = ALIGN(va->va_start, align);
++ 	else
++ 		nva_start_addr = ALIGN(vstart, align);
++ 
++ 	/* Check the "vend" restriction. */
++ 	if (nva_start_addr + size > vend)
++ 		return vend;
++ 
++ 	/* Classify what we have found. */
++ 	type = classify_va_fit_type(va, nva_start_addr, size);
++ 	if (WARN_ON_ONCE(type == NOTHING_FIT))
++ 		return vend;
++ 
++ 	/* Update the free vmap_area. */
++ 	ret = adjust_va_to_fit_type(va, nva_start_addr, size, type);
++ 	if (ret)
++ 		return vend;
++ 
++ #if DEBUG_AUGMENT_LOWEST_MATCH_CHECK
++ 	find_vmap_lowest_match_check(size);
++ #endif
++ 
++ 	return nva_start_addr;
++ }
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  
+  /*
+   * Allocate a region of KVA of the specified size and alignment, within the
+@@@ -594,9 -1190,19 +1115,19 @@@ static void __free_vmap_area(struct vma
+   */
+  static void free_vmap_area(struct vmap_area *va)
+  {
+ -	/*
+ -	 * Remove from the busy tree/list.
+ -	 */
+  	spin_lock(&vmap_area_lock);
+ -	unlink_va(va, &vmap_area_root);
+ +	__free_vmap_area(va);
+  	spin_unlock(&vmap_area_lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	/*
++ 	 * Insert/Merge it back to the free tree/list.
++ 	 */
++ 	spin_lock(&free_vmap_area_lock);
++ 	merge_or_add_vmap_area(va, &free_vmap_area_root, &free_vmap_area_list);
++ 	spin_unlock(&free_vmap_area_lock);
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  }
+  
+  /*
+@@@ -689,11 -1295,24 +1220,28 @@@ static bool __purge_vmap_area_lazy(unsi
+  	flush_tlb_kernel_range(start, end);
+  	resched_threshold = lazy_max_pages() << 1;
+  
+ -	spin_lock(&free_vmap_area_lock);
+ +	spin_lock(&vmap_area_lock);
+  	llist_for_each_entry_safe(va, n_va, valist, purge_list) {
+  		unsigned long nr = (va->va_end - va->va_start) >> PAGE_SHIFT;
++ 		unsigned long orig_start = va->va_start;
++ 		unsigned long orig_end = va->va_end;
+  
+++<<<<<<< HEAD
+ +		__free_vmap_area(va);
+++=======
++ 		/*
++ 		 * Finally insert or merge lazily-freed area. It is
++ 		 * detached and there is no need to "unlink" it from
++ 		 * anything.
++ 		 */
++ 		va = merge_or_add_vmap_area(va, &free_vmap_area_root,
++ 					    &free_vmap_area_list);
++ 
++ 		if (is_vmalloc_or_module_addr((void *)orig_start))
++ 			kasan_release_vmalloc(orig_start, orig_end,
++ 					      va->va_start, va->va_end);
++ 
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  		atomic_long_sub(nr, &vmap_lazy_nr);
+  
+  		if (atomic_long_read(&vmap_lazy_nr) < resched_threshold)
+@@@ -2696,35 -3389,98 +3268,77 @@@ retry
+  		area = (area + nr_vms - 1) % nr_vms;
+  		if (area == term_area)
+  			break;
+ -
+  		start = offsets[area];
+  		end = start + sizes[area];
+ -		va = pvm_find_va_enclose_addr(base + end);
+ +		pvm_find_next_prev(base + end, &next, &prev);
+  	}
+ -
+ +found:
+  	/* we've found a fitting base, insert all va's */
+  	for (area = 0; area < nr_vms; area++) {
+ -		int ret;
+ +		struct vmap_area *va = vas[area];
+  
+ -		start = base + offsets[area];
+ -		size = sizes[area];
+ -
+ -		va = pvm_find_va_enclose_addr(start);
+ -		if (WARN_ON_ONCE(va == NULL))
+ -			/* It is a BUG(), but trigger recovery instead. */
+ -			goto recovery;
+ -
+ -		type = classify_va_fit_type(va, start, size);
+ -		if (WARN_ON_ONCE(type == NOTHING_FIT))
+ -			/* It is a BUG(), but trigger recovery instead. */
+ -			goto recovery;
+ -
+ -		ret = adjust_va_to_fit_type(va, start, size, type);
+ -		if (unlikely(ret))
+ -			goto recovery;
+ -
+ -		/* Allocated area. */
+ -		va = vas[area];
+ -		va->va_start = start;
+ -		va->va_end = start + size;
+ +		va->va_start = base + offsets[area];
+ +		va->va_end = va->va_start + sizes[area];
+ +		__insert_vmap_area(va);
+  	}
+  
+ -	spin_unlock(&free_vmap_area_lock);
+ +	vmap_area_pcpu_hole = base + offsets[last_area];
+  
+ -	/* insert all vm's */
+ -	spin_lock(&vmap_area_lock);
+ -	for (area = 0; area < nr_vms; area++) {
+ -		insert_vmap_area(vas[area], &vmap_area_root, &vmap_area_list);
+ +	spin_unlock(&vmap_area_lock);
+  
+ -		setup_vmalloc_vm_locked(vms[area], vas[area], VM_ALLOC,
+ +	/* insert all vm's */
+ +	for (area = 0; area < nr_vms; area++)
+ +		setup_vmalloc_vm(vms[area], vas[area], VM_ALLOC,
+  				 pcpu_get_vm_areas);
+ -	}
+ -	spin_unlock(&vmap_area_lock);
+  
++ 	/* populate the shadow space outside of the lock */
++ 	for (area = 0; area < nr_vms; area++) {
++ 		/* assume success here */
++ 		kasan_populate_vmalloc(sizes[area], vms[area]);
++ 	}
++ 
+  	kfree(vas);
+  	return vms;
+  
+++<<<<<<< HEAD
+++=======
++ recovery:
++ 	/*
++ 	 * Remove previously allocated areas. There is no
++ 	 * need in removing these areas from the busy tree,
++ 	 * because they are inserted only on the final step
++ 	 * and when pcpu_get_vm_areas() is success.
++ 	 */
++ 	while (area--) {
++ 		merge_or_add_vmap_area(vas[area], &free_vmap_area_root,
++ 				       &free_vmap_area_list);
++ 		vas[area] = NULL;
++ 	}
++ 
++ overflow:
++ 	spin_unlock(&free_vmap_area_lock);
++ 	if (!purged) {
++ 		purge_vmap_area_lazy();
++ 		purged = true;
++ 
++ 		/* Before "retry", check if we recover. */
++ 		for (area = 0; area < nr_vms; area++) {
++ 			if (vas[area])
++ 				continue;
++ 
++ 			vas[area] = kmem_cache_zalloc(
++ 				vmap_area_cachep, GFP_KERNEL);
++ 			if (!vas[area])
++ 				goto err_free;
++ 		}
++ 
++ 		goto retry;
++ 	}
++ 
+++>>>>>>> 3c5c3cfb9ef4 (kasan: support backing vmalloc space with real shadow memory)
+  err_free:
+  	for (area = 0; area < nr_vms; area++) {
+ -		if (vas[area])
+ -			kmem_cache_free(vmap_area_cachep, vas[area]);
+ -
+ +		kfree(vas[area]);
+  		kfree(vms[area]);
+  	}
+  err_free2:
+* Unmerged path mm/kasan/generic_report.c
+diff --git a/Documentation/dev-tools/kasan.rst b/Documentation/dev-tools/kasan.rst
+index b72d07d70239..bdb92c3de7a5 100644
+--- a/Documentation/dev-tools/kasan.rst
++++ b/Documentation/dev-tools/kasan.rst
+@@ -215,3 +215,66 @@ brk handler is used to print bug reports.
+ A potential expansion of this mode is a hardware tag-based mode, which would
+ use hardware memory tagging support instead of compiler instrumentation and
+ manual shadow memory manipulation.
++
++What memory accesses are sanitised by KASAN?
++--------------------------------------------
++
++The kernel maps memory in a number of different parts of the address
++space. This poses something of a problem for KASAN, which requires
++that all addresses accessed by instrumented code have a valid shadow
++region.
++
++The range of kernel virtual addresses is large: there is not enough
++real memory to support a real shadow region for every address that
++could be accessed by the kernel.
++
++By default
++~~~~~~~~~~
++
++By default, architectures only map real memory over the shadow region
++for the linear mapping (and potentially other small areas). For all
++other areas - such as vmalloc and vmemmap space - a single read-only
++page is mapped over the shadow area. This read-only shadow page
++declares all memory accesses as permitted.
++
++This presents a problem for modules: they do not live in the linear
++mapping, but in a dedicated module space. By hooking in to the module
++allocator, KASAN can temporarily map real shadow memory to cover
++them. This allows detection of invalid accesses to module globals, for
++example.
++
++This also creates an incompatibility with ``VMAP_STACK``: if the stack
++lives in vmalloc space, it will be shadowed by the read-only page, and
++the kernel will fault when trying to set up the shadow data for stack
++variables.
++
++CONFIG_KASAN_VMALLOC
++~~~~~~~~~~~~~~~~~~~~
++
++With ``CONFIG_KASAN_VMALLOC``, KASAN can cover vmalloc space at the
++cost of greater memory usage. Currently this is only supported on x86.
++
++This works by hooking into vmalloc and vmap, and dynamically
++allocating real shadow memory to back the mappings.
++
++Most mappings in vmalloc space are small, requiring less than a full
++page of shadow space. Allocating a full shadow page per mapping would
++therefore be wasteful. Furthermore, to ensure that different mappings
++use different shadow pages, mappings would have to be aligned to
++``KASAN_SHADOW_SCALE_SIZE * PAGE_SIZE``.
++
++Instead, we share backing space across multiple mappings. We allocate
++a backing page when a mapping in vmalloc space uses a particular page
++of the shadow region. This page can be shared by other vmalloc
++mappings later on.
++
++We hook in to the vmap infrastructure to lazily clean up unused shadow
++memory.
++
++To avoid the difficulties around swapping mappings around, we expect
++that the part of the shadow region that covers the vmalloc space will
++not be covered by the early shadow page, but will be left
++unmapped. This will require changes in arch-specific code.
++
++This allows ``VMAP_STACK`` support on x86, and can simplify support of
++architectures that do not have a fixed module region.
+* Unmerged path include/linux/kasan.h
+diff --git a/include/linux/moduleloader.h b/include/linux/moduleloader.h
+index 31013c2effd3..86a0ce606f2f 100644
+--- a/include/linux/moduleloader.h
++++ b/include/linux/moduleloader.h
+@@ -86,7 +86,7 @@ void module_arch_cleanup(struct module *mod);
+ /* Any cleanup before freeing mod->module_init */
+ void module_arch_freeing_init(struct module *mod);
+ 
+-#ifdef CONFIG_KASAN
++#if defined(CONFIG_KASAN) && !defined(CONFIG_KASAN_VMALLOC)
+ #include <linux/kasan.h>
+ #define MODULE_ALIGN (PAGE_SIZE << KASAN_SHADOW_SCALE_SHIFT)
+ #else
+diff --git a/include/linux/vmalloc.h b/include/linux/vmalloc.h
+index 54492b1d76f1..579b804d1069 100644
+--- a/include/linux/vmalloc.h
++++ b/include/linux/vmalloc.h
+@@ -22,6 +22,18 @@ struct notifier_block;		/* in notifier.h */
+ #define VM_UNINITIALIZED	0x00000020	/* vm_struct is not fully initialized */
+ #define VM_NO_GUARD		0x00000040      /* don't add guard page */
+ #define VM_KASAN		0x00000080      /* has allocated kasan shadow memory */
++
++/*
++ * VM_KASAN is used slighly differently depending on CONFIG_KASAN_VMALLOC.
++ *
++ * If IS_ENABLED(CONFIG_KASAN_VMALLOC), VM_KASAN is set on a vm_struct after
++ * shadow memory has been mapped. It's used to handle allocation errors so that
++ * we don't try to poision shadow on free if it was never allocated.
++ *
++ * Otherwise, VM_KASAN is set for kasan_module_alloc() allocations and used to
++ * determine which allocations need the module shadow freed.
++ */
++
+ /*
+  * Memory with VM_FLUSH_RESET_PERMS cannot be freed in an interrupt or with
+  * vfree_atomic().
+* Unmerged path lib/Kconfig.kasan
+* Unmerged path mm/kasan/generic_report.c
+diff --git a/mm/kasan/kasan.c b/mm/kasan/kasan.c
+index d79269dd4b58..05fde566e874 100644
+--- a/mm/kasan/kasan.c
++++ b/mm/kasan/kasan.c
+@@ -37,6 +37,8 @@
+ #include <linux/vmalloc.h>
+ #include <linux/bug.h>
+ 
++#include <asm/tlbflush.h>
++
+ #include "kasan.h"
+ #include "../slab.h"
+ 
+@@ -622,6 +624,7 @@ void kasan_kfree_large(void *ptr, unsigned long ip)
+ 	/* The object will be poisoned by page_alloc. */
+ }
+ 
++#ifndef CONFIG_KASAN_VMALLOC
+ int kasan_module_alloc(void *addr, size_t size)
+ {
+ 	void *ret;
+@@ -656,6 +659,7 @@ void kasan_free_shadow(const struct vm_struct *vm)
+ 	if (vm->flags & VM_KASAN)
+ 		vfree(kasan_mem_to_shadow(vm->addr));
+ }
++#endif
+ 
+ static void register_global(struct kasan_global *global)
+ {
+@@ -907,3 +911,232 @@ static int __init kasan_memhotplug_init(void)
+ 
+ core_initcall(kasan_memhotplug_init);
+ #endif
++
++#ifdef CONFIG_KASAN_VMALLOC
++static int kasan_populate_vmalloc_pte(pte_t *ptep, unsigned long addr,
++				      void *unused)
++{
++	unsigned long page;
++	pte_t pte;
++
++	if (likely(!pte_none(*ptep)))
++		return 0;
++
++	page = __get_free_page(GFP_KERNEL);
++	if (!page)
++		return -ENOMEM;
++
++	memset((void *)page, KASAN_VMALLOC_INVALID, PAGE_SIZE);
++	pte = pfn_pte(PFN_DOWN(__pa(page)), PAGE_KERNEL);
++
++	spin_lock(&init_mm.page_table_lock);
++	if (likely(pte_none(*ptep))) {
++		set_pte_at(&init_mm, addr, ptep, pte);
++		page = 0;
++	}
++	spin_unlock(&init_mm.page_table_lock);
++	if (page)
++		free_page(page);
++	return 0;
++}
++
++int kasan_populate_vmalloc(unsigned long requested_size, struct vm_struct *area)
++{
++	unsigned long shadow_start, shadow_end;
++	int ret;
++
++	shadow_start = (unsigned long)kasan_mem_to_shadow(area->addr);
++	shadow_start = ALIGN_DOWN(shadow_start, PAGE_SIZE);
++	shadow_end = (unsigned long)kasan_mem_to_shadow(area->addr +
++							area->size);
++	shadow_end = ALIGN(shadow_end, PAGE_SIZE);
++
++	ret = apply_to_page_range(&init_mm, shadow_start,
++				  shadow_end - shadow_start,
++				  kasan_populate_vmalloc_pte, NULL);
++	if (ret)
++		return ret;
++
++	flush_cache_vmap(shadow_start, shadow_end);
++
++	kasan_unpoison_shadow(area->addr, requested_size);
++
++	area->flags |= VM_KASAN;
++
++	/*
++	 * We need to be careful about inter-cpu effects here. Consider:
++	 *
++	 *   CPU#0				  CPU#1
++	 * WRITE_ONCE(p, vmalloc(100));		while (x = READ_ONCE(p)) ;
++	 *					p[99] = 1;
++	 *
++	 * With compiler instrumentation, that ends up looking like this:
++	 *
++	 *   CPU#0				  CPU#1
++	 * // vmalloc() allocates memory
++	 * // let a = area->addr
++	 * // we reach kasan_populate_vmalloc
++	 * // and call kasan_unpoison_shadow:
++	 * STORE shadow(a), unpoison_val
++	 * ...
++	 * STORE shadow(a+99), unpoison_val	x = LOAD p
++	 * // rest of vmalloc process		<data dependency>
++	 * STORE p, a				LOAD shadow(x+99)
++	 *
++	 * If there is no barrier between the end of unpoisioning the shadow
++	 * and the store of the result to p, the stores could be committed
++	 * in a different order by CPU#0, and CPU#1 could erroneously observe
++	 * poison in the shadow.
++	 *
++	 * We need some sort of barrier between the stores.
++	 *
++	 * In the vmalloc() case, this is provided by a smp_wmb() in
++	 * clear_vm_uninitialized_flag(). In the per-cpu allocator and in
++	 * get_vm_area() and friends, the caller gets shadow allocated but
++	 * doesn't have any pages mapped into the virtual address space that
++	 * has been reserved. Mapping those pages in will involve taking and
++	 * releasing a page-table lock, which will provide the barrier.
++	 */
++
++	return 0;
++}
++
++/*
++ * Poison the shadow for a vmalloc region. Called as part of the
++ * freeing process at the time the region is freed.
++ */
++void kasan_poison_vmalloc(void *start, unsigned long size)
++{
++	size = round_up(size, KASAN_SHADOW_SCALE_SIZE);
++	kasan_poison_shadow(start, size, KASAN_VMALLOC_INVALID);
++}
++
++static int kasan_depopulate_vmalloc_pte(pte_t *ptep, unsigned long addr,
++					void *unused)
++{
++	unsigned long page;
++
++	page = (unsigned long)__va(pte_pfn(*ptep) << PAGE_SHIFT);
++
++	spin_lock(&init_mm.page_table_lock);
++
++	if (likely(!pte_none(*ptep))) {
++		pte_clear(&init_mm, addr, ptep);
++		free_page(page);
++	}
++	spin_unlock(&init_mm.page_table_lock);
++
++	return 0;
++}
++
++/*
++ * Release the backing for the vmalloc region [start, end), which
++ * lies within the free region [free_region_start, free_region_end).
++ *
++ * This can be run lazily, long after the region was freed. It runs
++ * under vmap_area_lock, so it's not safe to interact with the vmalloc/vmap
++ * infrastructure.
++ *
++ * How does this work?
++ * -------------------
++ *
++ * We have a region that is page aligned, labelled as A.
++ * That might not map onto the shadow in a way that is page-aligned:
++ *
++ *                    start                     end
++ *                    v                         v
++ * |????????|????????|AAAAAAAA|AA....AA|AAAAAAAA|????????| < vmalloc
++ *  -------- -------- --------          -------- --------
++ *      |        |       |                 |        |
++ *      |        |       |         /-------/        |
++ *      \-------\|/------/         |/---------------/
++ *              |||                ||
++ *             |??AAAAAA|AAAAAAAA|AA??????|                < shadow
++ *                 (1)      (2)      (3)
++ *
++ * First we align the start upwards and the end downwards, so that the
++ * shadow of the region aligns with shadow page boundaries. In the
++ * example, this gives us the shadow page (2). This is the shadow entirely
++ * covered by this allocation.
++ *
++ * Then we have the tricky bits. We want to know if we can free the
++ * partially covered shadow pages - (1) and (3) in the example. For this,
++ * we are given the start and end of the free region that contains this
++ * allocation. Extending our previous example, we could have:
++ *
++ *  free_region_start                                    free_region_end
++ *  |                 start                     end      |
++ *  v                 v                         v        v
++ * |FFFFFFFF|FFFFFFFF|AAAAAAAA|AA....AA|AAAAAAAA|FFFFFFFF| < vmalloc
++ *  -------- -------- --------          -------- --------
++ *      |        |       |                 |        |
++ *      |        |       |         /-------/        |
++ *      \-------\|/------/         |/---------------/
++ *              |||                ||
++ *             |FFAAAAAA|AAAAAAAA|AAF?????|                < shadow
++ *                 (1)      (2)      (3)
++ *
++ * Once again, we align the start of the free region up, and the end of
++ * the free region down so that the shadow is page aligned. So we can free
++ * page (1) - we know no allocation currently uses anything in that page,
++ * because all of it is in the vmalloc free region. But we cannot free
++ * page (3), because we can't be sure that the rest of it is unused.
++ *
++ * We only consider pages that contain part of the original region for
++ * freeing: we don't try to free other pages from the free region or we'd
++ * end up trying to free huge chunks of virtual address space.
++ *
++ * Concurrency
++ * -----------
++ *
++ * How do we know that we're not freeing a page that is simultaneously
++ * being used for a fresh allocation in kasan_populate_vmalloc(_pte)?
++ *
++ * We _can_ have kasan_release_vmalloc and kasan_populate_vmalloc running
++ * at the same time. While we run under free_vmap_area_lock, the population
++ * code does not.
++ *
++ * free_vmap_area_lock instead operates to ensure that the larger range
++ * [free_region_start, free_region_end) is safe: because __alloc_vmap_area and
++ * the per-cpu region-finding algorithm both run under free_vmap_area_lock,
++ * no space identified as free will become used while we are running. This
++ * means that so long as we are careful with alignment and only free shadow
++ * pages entirely covered by the free region, we will not run in to any
++ * trouble - any simultaneous allocations will be for disjoint regions.
++ */
++void kasan_release_vmalloc(unsigned long start, unsigned long end,
++			   unsigned long free_region_start,
++			   unsigned long free_region_end)
++{
++	void *shadow_start, *shadow_end;
++	unsigned long region_start, region_end;
++
++	region_start = ALIGN(start, PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE);
++	region_end = ALIGN_DOWN(end, PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE);
++
++	free_region_start = ALIGN(free_region_start,
++				  PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE);
++
++	if (start != region_start &&
++	    free_region_start < region_start)
++		region_start -= PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE;
++
++	free_region_end = ALIGN_DOWN(free_region_end,
++				     PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE);
++
++	if (end != region_end &&
++	    free_region_end > region_end)
++		region_end += PAGE_SIZE * KASAN_SHADOW_SCALE_SIZE;
++
++	shadow_start = kasan_mem_to_shadow((void *)region_start);
++	shadow_end = kasan_mem_to_shadow((void *)region_end);
++
++	if (shadow_end > shadow_start) {
++		apply_to_page_range(&init_mm, (unsigned long)shadow_start,
++				    (unsigned long)(shadow_end - shadow_start),
++				    kasan_depopulate_vmalloc_pte, NULL);
++		flush_tlb_kernel_range((unsigned long)shadow_start,
++				       (unsigned long)shadow_end);
++	}
++}
++#endif
+diff --git a/mm/kasan/kasan.h b/mm/kasan/kasan.h
+index c12dcfde2ebd..5675accd01ee 100644
+--- a/mm/kasan/kasan.h
++++ b/mm/kasan/kasan.h
+@@ -13,6 +13,7 @@
+ #define KASAN_KMALLOC_REDZONE   0xFC  /* redzone inside slub object */
+ #define KASAN_KMALLOC_FREE      0xFB  /* object was freed (kmem_cache_free/kfree) */
+ #define KASAN_GLOBAL_REDZONE    0xFA  /* redzone for global variable */
++#define KASAN_VMALLOC_INVALID   0xF9  /* unallocated space in vmapped page */
+ 
+ /*
+  * Stack redzone shadow values
+* Unmerged path mm/vmalloc.c
