@@ -1,0 +1,188 @@
+ACPI: power: Save the last known state of each power resource
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+commit ca84f18798a457e9a92c52882813901e15a3b38b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/ca84f187.failed
+
+Currently, there are two ways to check the state of an ACPI power
+resource and they may not be consistent with each other.  The first
+one is to evaluate the power resource's _STA object and the other one
+is to check its reference counter value.  However, on some systems
+the value returned by _STA may not be consistent with the value of
+the power resource's reference counter (for example, on some systems
+it returns the same value every time for certain power resources).
+
+Moreover, evaluating _STA is unnecessary overhead for a power
+resource for which it has been evaluated already or whose state is
+otherwise known, because either the _ON or the _OFF method has been
+executed for it.
+
+For this reason, save the state of each power resource in its
+struct acpi_power_resource object and use the saved value whenever
+its state needs to be checked, except when its stats is unknown, in
+which case the _STA method is evaluated for it and the value
+returned by that method is saved as the last known state of
+the power resource.
+
+Moreover, drop the power resource _STA method evaluation from
+acpi_add_power_resource(), so as to avoid doing that unnecessarily
+for power resources that will never be used.
+
+	Tested-by: Dave Olsthoorn <dave@bewaar.me>
+	Tested-by: Shujun Wang <wsj20369@163.com>
+	Signed-off-by: Rafael J. Wysocki <rafael.j.wysocki@intel.com>
+(cherry picked from commit ca84f18798a457e9a92c52882813901e15a3b38b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/acpi/power.c
+diff --cc drivers/acpi/power.c
+index 3fdfde3a851a,6aeea7649852..000000000000
+--- a/drivers/acpi/power.c
++++ b/drivers/acpi/power.c
+@@@ -195,17 -183,12 +196,18 @@@ int acpi_extract_power_resources(union 
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +static int acpi_power_get_state(acpi_handle handle, int *state)
+++=======
++ static int __get_state(acpi_handle handle, u8 *state)
+++>>>>>>> ca84f18798a4 (ACPI: power: Save the last known state of each power resource)
+  {
+  	acpi_status status = AE_OK;
+  	unsigned long long sta = 0;
+ -	u8 cur_state;
+ +	char node_name[5];
+ +	struct acpi_buffer buffer = { sizeof(node_name), node_name };
+ +
+  
+- 	if (!handle || !state)
+- 		return -EINVAL;
+- 
+  	status = acpi_evaluate_integer(handle, "_STA", NULL, &sta);
+  	if (ACPI_FAILURE(status))
+  		return -ENODEV;
+@@@ -222,19 -201,32 +224,36 @@@
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+ +static int acpi_power_get_list_state(struct list_head *list, int *state)
+++=======
++ static int acpi_power_get_state(struct acpi_power_resource *resource, u8 *state)
++ {
++ 	if (resource->state == ACPI_POWER_RESOURCE_STATE_UNKNOWN) {
++ 		int ret;
++ 
++ 		ret = __get_state(resource->device.handle, &resource->state);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	*state = resource->state;
++ 	return 0;
++ }
++ 
++ static int acpi_power_get_list_state(struct list_head *list, u8 *state)
+++>>>>>>> ca84f18798a4 (ACPI: power: Save the last known state of each power resource)
+  {
+  	struct acpi_power_resource_entry *entry;
+ -	u8 cur_state = ACPI_POWER_RESOURCE_STATE_OFF;
+ +	int cur_state;
+  
+  	if (!list || !state)
+  		return -EINVAL;
+  
+  	/* The state of the list is 'on' IFF all resources are 'on'. */
+ +	cur_state = 0;
+  	list_for_each_entry(entry, list, node) {
+  		struct acpi_power_resource *resource = entry->resource;
+- 		acpi_handle handle = resource->device.handle;
+  		int result;
+  
+  		mutex_lock(&resource->resource_lock);
+@@@ -372,11 -363,14 +391,15 @@@ static int __acpi_power_on(struct acpi_
+  	acpi_status status = AE_OK;
+  
+  	status = acpi_evaluate_object(resource->device.handle, "_ON", NULL, NULL);
+- 	if (ACPI_FAILURE(status))
++ 	if (ACPI_FAILURE(status)) {
++ 		resource->state = ACPI_POWER_RESOURCE_STATE_UNKNOWN;
+  		return -ENODEV;
++ 	}
++ 
++ 	resource->state = ACPI_POWER_RESOURCE_STATE_ON;
+  
+ -	pr_debug("Power resource [%s] turned on\n", resource->name);
+ +	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Power resource [%s] turned on\n",
+ +			  resource->name));
+  
+  	/*
+  	 * If there are other dependents on this power resource we need to
+@@@ -428,11 -420,15 +451,15 @@@ static int __acpi_power_off(struct acpi
+  
+  	status = acpi_evaluate_object(resource->device.handle, "_OFF",
+  				      NULL, NULL);
+- 	if (ACPI_FAILURE(status))
++ 	if (ACPI_FAILURE(status)) {
++ 		resource->state = ACPI_POWER_RESOURCE_STATE_UNKNOWN;
+  		return -ENODEV;
++ 	}
++ 
++ 	resource->state = ACPI_POWER_RESOURCE_STATE_OFF;
+  
+ -	pr_debug("Power resource [%s] turned off\n", resource->name);
+ -
+ +	ACPI_DEBUG_PRINT((ACPI_DB_INFO, "Power resource [%s] turned off\n",
+ +			  resource->name));
+  	return 0;
+  }
+  
+@@@ -617,9 -609,8 +644,8 @@@ int acpi_power_wakeup_list_init(struct 
+  
+  	list_for_each_entry(entry, list, node) {
+  		struct acpi_power_resource *resource = entry->resource;
+- 		acpi_handle handle = resource->device.handle;
+  		int result;
+ -		u8 state;
+ +		int state;
+  
+  		mutex_lock(&resource->resource_lock);
+  
+@@@ -946,7 -937,7 +972,11 @@@ struct acpi_device *acpi_add_power_reso
+  	union acpi_object acpi_object;
+  	struct acpi_buffer buffer = { sizeof(acpi_object), &acpi_object };
+  	acpi_status status;
+++<<<<<<< HEAD
+ +	int state, result = -ENODEV;
+++=======
++ 	int result;
+++>>>>>>> ca84f18798a4 (ACPI: power: Save the last known state of each power resource)
+  
+  	acpi_bus_get_device(handle, &device);
+  	if (device)
+@@@ -973,13 -964,9 +1003,18 @@@
+  
+  	resource->system_level = acpi_object.power_resource.system_level;
+  	resource->order = acpi_object.power_resource.resource_order;
++ 	resource->state = ACPI_POWER_RESOURCE_STATE_UNKNOWN;
+  
+++<<<<<<< HEAD
+ +	result = acpi_power_get_state(handle, &state);
+ +	if (result)
+ +		goto err;
+ +
+ +	printk(KERN_INFO PREFIX "%s [%s] (%s)\n", acpi_device_name(device),
+ +	       acpi_device_bid(device), state ? "on" : "off");
+++=======
++ 	pr_info("%s [%s]\n", acpi_device_name(device), acpi_device_bid(device));
+++>>>>>>> ca84f18798a4 (ACPI: power: Save the last known state of each power resource)
+  
+  	device->flags.match_driver = true;
+  	result = acpi_device_add(device, acpi_release_power_resource);
+* Unmerged path drivers/acpi/power.c
