@@ -1,0 +1,342 @@
+net: stmmac: Add basic EST support for XGMAC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jose Abreu <Jose.Abreu@synopsys.com>
+commit 8572aec3d0dc43045254fd1bf581fb980bfdbc4b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/8572aec3.failed
+
+Adds the support for EST in XGMAC cores. This feature allows to offload
+scheduling of queues opening time to the IP.
+
+	Signed-off-by: Jose Abreu <Jose.Abreu@synopsys.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 8572aec3d0dc43045254fd1bf581fb980bfdbc4b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
+diff --cc drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
+index a534a159424b,2f6e960947d9..000000000000
+--- a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
+@@@ -1168,6 -1168,248 +1168,251 @@@ static void dwxgmac2_enable_vlan(struc
+  	writel(value, ioaddr + XGMAC_VLAN_INCL);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int dwxgmac2_filter_wait(struct mac_device_info *hw)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 
++ 	if (readl_poll_timeout(ioaddr + XGMAC_L3L4_ADDR_CTRL, value,
++ 			       !(value & XGMAC_XB), 100, 10000))
++ 		return -EBUSY;
++ 	return 0;
++ }
++ 
++ static int dwxgmac2_filter_read(struct mac_device_info *hw, u32 filter_no,
++ 				u8 reg, u32 *data)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 	int ret;
++ 
++ 	ret = dwxgmac2_filter_wait(hw);
++ 	if (ret)
++ 		return ret;
++ 
++ 	value = ((filter_no << XGMAC_IDDR_FNUM) | reg) << XGMAC_IDDR_SHIFT;
++ 	value |= XGMAC_TT | XGMAC_XB;
++ 	writel(value, ioaddr + XGMAC_L3L4_ADDR_CTRL);
++ 
++ 	ret = dwxgmac2_filter_wait(hw);
++ 	if (ret)
++ 		return ret;
++ 
++ 	*data = readl(ioaddr + XGMAC_L3L4_DATA);
++ 	return 0;
++ }
++ 
++ static int dwxgmac2_filter_write(struct mac_device_info *hw, u32 filter_no,
++ 				 u8 reg, u32 data)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 	int ret;
++ 
++ 	ret = dwxgmac2_filter_wait(hw);
++ 	if (ret)
++ 		return ret;
++ 
++ 	writel(data, ioaddr + XGMAC_L3L4_DATA);
++ 
++ 	value = ((filter_no << XGMAC_IDDR_FNUM) | reg) << XGMAC_IDDR_SHIFT;
++ 	value |= XGMAC_XB;
++ 	writel(value, ioaddr + XGMAC_L3L4_ADDR_CTRL);
++ 
++ 	return dwxgmac2_filter_wait(hw);
++ }
++ 
++ static int dwxgmac2_config_l3_filter(struct mac_device_info *hw, u32 filter_no,
++ 				     bool en, bool ipv6, bool sa, bool inv,
++ 				     u32 match)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 	int ret;
++ 
++ 	value = readl(ioaddr + XGMAC_PACKET_FILTER);
++ 	value |= XGMAC_FILTER_IPFE;
++ 	writel(value, ioaddr + XGMAC_PACKET_FILTER);
++ 
++ 	ret = dwxgmac2_filter_read(hw, filter_no, XGMAC_L3L4_CTRL, &value);
++ 	if (ret)
++ 		return ret;
++ 
++ 	/* For IPv6 not both SA/DA filters can be active */
++ 	if (ipv6) {
++ 		value |= XGMAC_L3PEN0;
++ 		value &= ~(XGMAC_L3SAM0 | XGMAC_L3SAIM0);
++ 		value &= ~(XGMAC_L3DAM0 | XGMAC_L3DAIM0);
++ 		if (sa) {
++ 			value |= XGMAC_L3SAM0;
++ 			if (inv)
++ 				value |= XGMAC_L3SAIM0;
++ 		} else {
++ 			value |= XGMAC_L3DAM0;
++ 			if (inv)
++ 				value |= XGMAC_L3DAIM0;
++ 		}
++ 	} else {
++ 		value &= ~XGMAC_L3PEN0;
++ 		if (sa) {
++ 			value |= XGMAC_L3SAM0;
++ 			if (inv)
++ 				value |= XGMAC_L3SAIM0;
++ 		} else {
++ 			value |= XGMAC_L3DAM0;
++ 			if (inv)
++ 				value |= XGMAC_L3DAIM0;
++ 		}
++ 	}
++ 
++ 	ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, value);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (sa) {
++ 		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L3_ADDR0, match);
++ 		if (ret)
++ 			return ret;
++ 	} else {
++ 		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L3_ADDR1, match);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!en)
++ 		return dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, 0);
++ 
++ 	return 0;
++ }
++ 
++ static int dwxgmac2_config_l4_filter(struct mac_device_info *hw, u32 filter_no,
++ 				     bool en, bool udp, bool sa, bool inv,
++ 				     u32 match)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 	int ret;
++ 
++ 	value = readl(ioaddr + XGMAC_PACKET_FILTER);
++ 	value |= XGMAC_FILTER_IPFE;
++ 	writel(value, ioaddr + XGMAC_PACKET_FILTER);
++ 
++ 	ret = dwxgmac2_filter_read(hw, filter_no, XGMAC_L3L4_CTRL, &value);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (udp) {
++ 		value |= XGMAC_L4PEN0;
++ 	} else {
++ 		value &= ~XGMAC_L4PEN0;
++ 	}
++ 
++ 	value &= ~(XGMAC_L4SPM0 | XGMAC_L4SPIM0);
++ 	value &= ~(XGMAC_L4DPM0 | XGMAC_L4DPIM0);
++ 	if (sa) {
++ 		value |= XGMAC_L4SPM0;
++ 		if (inv)
++ 			value |= XGMAC_L4SPIM0;
++ 	} else {
++ 		value |= XGMAC_L4DPM0;
++ 		if (inv)
++ 			value |= XGMAC_L4DPIM0;
++ 	}
++ 
++ 	ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, value);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (sa) {
++ 		value = match & XGMAC_L4SP0;
++ 
++ 		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L4_ADDR, value);
++ 		if (ret)
++ 			return ret;
++ 	} else {
++ 		value = (match << XGMAC_L4DP0_SHIFT) & XGMAC_L4DP0;
++ 
++ 		ret = dwxgmac2_filter_write(hw, filter_no, XGMAC_L4_ADDR, value);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	if (!en)
++ 		return dwxgmac2_filter_write(hw, filter_no, XGMAC_L3L4_CTRL, 0);
++ 
++ 	return 0;
++ }
++ 
++ static void dwxgmac2_set_arp_offload(struct mac_device_info *hw, bool en,
++ 				     u32 addr)
++ {
++ 	void __iomem *ioaddr = hw->pcsr;
++ 	u32 value;
++ 
++ 	writel(addr, ioaddr + XGMAC_ARP_ADDR);
++ 
++ 	value = readl(ioaddr + XGMAC_RX_CONFIG);
++ 	if (en)
++ 		value |= XGMAC_CONFIG_ARPEN;
++ 	else
++ 		value &= ~XGMAC_CONFIG_ARPEN;
++ 	writel(value, ioaddr + XGMAC_RX_CONFIG);
++ }
++ 
++ static int dwxgmac3_est_write(void __iomem *ioaddr, u32 reg, u32 val, bool gcl)
++ {
++ 	u32 ctrl;
++ 
++ 	writel(val, ioaddr + XGMAC_MTL_EST_GCL_DATA);
++ 
++ 	ctrl = (reg << XGMAC_ADDR_SHIFT);
++ 	ctrl |= gcl ? 0 : XGMAC_GCRR;
++ 
++ 	writel(ctrl, ioaddr + XGMAC_MTL_EST_GCL_CONTROL);
++ 
++ 	ctrl |= XGMAC_SRWO;
++ 	writel(ctrl, ioaddr + XGMAC_MTL_EST_GCL_CONTROL);
++ 
++ 	return readl_poll_timeout_atomic(ioaddr + XGMAC_MTL_EST_GCL_CONTROL,
++ 					 ctrl, !(ctrl & XGMAC_SRWO), 100, 5000);
++ }
++ 
++ static int dwxgmac3_est_configure(void __iomem *ioaddr, struct stmmac_est *cfg,
++ 				  unsigned int ptp_rate)
++ {
++ 	int i, ret = 0x0;
++ 	u32 ctrl;
++ 
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_BTR_LOW, cfg->btr[0], false);
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_BTR_HIGH, cfg->btr[1], false);
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_TER, cfg->ter, false);
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_LLR, cfg->gcl_size, false);
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_CTR_LOW, cfg->ctr[0], false);
++ 	ret |= dwxgmac3_est_write(ioaddr, XGMAC_CTR_HIGH, cfg->ctr[1], false);
++ 	if (ret)
++ 		return ret;
++ 
++ 	for (i = 0; i < cfg->gcl_size; i++) {
++ 		ret = dwxgmac3_est_write(ioaddr, i, cfg->gcl[i], true);
++ 		if (ret)
++ 			return ret;
++ 	}
++ 
++ 	ctrl = readl(ioaddr + XGMAC_MTL_EST_CONTROL);
++ 	ctrl &= ~XGMAC_PTOV;
++ 	ctrl |= ((1000000000 / ptp_rate) * 9) << XGMAC_PTOV_SHIFT;
++ 	if (cfg->enable)
++ 		ctrl |= XGMAC_EEST | XGMAC_SSWL;
++ 	else
++ 		ctrl &= ~XGMAC_EEST;
++ 
++ 	writel(ctrl, ioaddr + XGMAC_MTL_EST_CONTROL);
++ 	return 0;
++ }
++ 
+++>>>>>>> 8572aec3d0dc (net: stmmac: Add basic EST support for XGMAC)
+  const struct stmmac_ops dwxgmac210_ops = {
+  	.core_init = dwxgmac2_core_init,
+  	.set_mac = dwxgmac2_set_mac,
+@@@ -1208,6 -1450,10 +1453,13 @@@
+  	.flex_pps_config = dwxgmac2_flex_pps_config,
+  	.sarc_configure = dwxgmac2_sarc_configure,
+  	.enable_vlan = dwxgmac2_enable_vlan,
+++<<<<<<< HEAD
+++=======
++ 	.config_l3_filter = dwxgmac2_config_l3_filter,
++ 	.config_l4_filter = dwxgmac2_config_l4_filter,
++ 	.set_arp_offload = dwxgmac2_set_arp_offload,
++ 	.est_configure = dwxgmac3_est_configure,
+++>>>>>>> 8572aec3d0dc (net: stmmac: Add basic EST support for XGMAC)
+  };
+  
+  int dwxgmac2_setup(struct stmmac_priv *priv)
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h
+index 0c36cd172685..186548109e7b 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h
++++ b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2.h
+@@ -133,6 +133,9 @@
+ #define XGMAC_HWFEAT_TXQCNT		GENMASK(9, 6)
+ #define XGMAC_HWFEAT_RXQCNT		GENMASK(3, 0)
+ #define XGMAC_HW_FEATURE3		0x00000128
++#define XGMAC_HWFEAT_ESTWID		GENMASK(24, 23)
++#define XGMAC_HWFEAT_ESTDEP		GENMASK(22, 20)
++#define XGMAC_HWFEAT_ESTSEL		BIT(19)
+ #define XGMAC_HWFEAT_ASP		GENMASK(15, 14)
+ #define XGMAC_HWFEAT_DVLAN		BIT(13)
+ #define XGMAC_HWFEAT_FRPES		GENMASK(12, 11)
+@@ -206,6 +209,22 @@
+ #define XGMAC_TC_PRTY_MAP1		0x00001044
+ #define XGMAC_PSTC(x)			GENMASK((x) * 8 + 7, (x) * 8)
+ #define XGMAC_PSTC_SHIFT(x)		((x) * 8)
++#define XGMAC_MTL_EST_CONTROL		0x00001050
++#define XGMAC_PTOV			GENMASK(31, 23)
++#define XGMAC_PTOV_SHIFT		23
++#define XGMAC_SSWL			BIT(1)
++#define XGMAC_EEST			BIT(0)
++#define XGMAC_MTL_EST_GCL_CONTROL	0x00001080
++#define XGMAC_BTR_LOW			0x0
++#define XGMAC_BTR_HIGH			0x1
++#define XGMAC_CTR_LOW			0x2
++#define XGMAC_CTR_HIGH			0x3
++#define XGMAC_TER			0x4
++#define XGMAC_LLR			0x5
++#define XGMAC_ADDR_SHIFT		8
++#define XGMAC_GCRR			BIT(2)
++#define XGMAC_SRWO			BIT(0)
++#define XGMAC_MTL_EST_GCL_DATA		0x00001084
+ #define XGMAC_MTL_RXP_CONTROL_STATUS	0x000010a0
+ #define XGMAC_RXPI			BIT(31)
+ #define XGMAC_NPE			GENMASK(23, 16)
+* Unmerged path drivers/net/ethernet/stmicro/stmmac/dwxgmac2_core.c
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_dma.c b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_dma.c
+index 2717ae2429aa..096ff3360108 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_dma.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwxgmac2_dma.c
+@@ -426,6 +426,9 @@ static void dwxgmac2_get_hw_feature(void __iomem *ioaddr,
+ 
+ 	/* MAC HW feature 3 */
+ 	hw_cap = readl(ioaddr + XGMAC_HW_FEATURE3);
++	dma_cap->estwid = (hw_cap & XGMAC_HWFEAT_ESTWID) >> 23;
++	dma_cap->estdep = (hw_cap & XGMAC_HWFEAT_ESTDEP) >> 20;
++	dma_cap->estsel = (hw_cap & XGMAC_HWFEAT_ESTSEL) >> 19;
+ 	dma_cap->asp = (hw_cap & XGMAC_HWFEAT_ASP) >> 14;
+ 	dma_cap->dvlan = (hw_cap & XGMAC_HWFEAT_DVLAN) >> 13;
+ 	dma_cap->frpes = (hw_cap & XGMAC_HWFEAT_FRPES) >> 11;
