@@ -1,0 +1,154 @@
+net: bridge: mst: Notify switchdev drivers of VLAN MSTI migrations
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Tobias Waldekranz <tobias@waldekranz.com>
+commit 6284c723d9b9995cc27ab3c6368a9d95d67111ff
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/6284c723.failed
+
+Whenever a VLAN moves to a new MSTI, send a switchdev notification so
+that switchdevs can track a bridge's VID to MSTI mappings.
+
+	Signed-off-by: Tobias Waldekranz <tobias@waldekranz.com>
+	Acked-by: Nikolay Aleksandrov <razor@blackwall.org>
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+(cherry picked from commit 6284c723d9b9995cc27ab3c6368a9d95d67111ff)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/switchdev.h
+diff --cc include/net/switchdev.h
+index fc7036c5869e,53dfa0f7cf5b..000000000000
+--- a/include/net/switchdev.h
++++ b/include/net/switchdev.h
+@@@ -28,10 -24,12 +28,16 @@@ enum switchdev_attr_id 
+  	SWITCHDEV_ATTR_ID_PORT_MROUTER,
+  	SWITCHDEV_ATTR_ID_BRIDGE_AGEING_TIME,
+  	SWITCHDEV_ATTR_ID_BRIDGE_VLAN_FILTERING,
+ -	SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL,
+ +	RH_KABI_BROKEN_INSERT_ENUM(SWITCHDEV_ATTR_ID_BRIDGE_VLAN_PROTOCOL)
+  	SWITCHDEV_ATTR_ID_BRIDGE_MC_DISABLED,
+  	SWITCHDEV_ATTR_ID_BRIDGE_MROUTER,
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT_ENUM(SWITCHDEV_ATTR_ID_MRP_PORT_ROLE)
+++=======
++ 	SWITCHDEV_ATTR_ID_BRIDGE_MST,
++ 	SWITCHDEV_ATTR_ID_MRP_PORT_ROLE,
++ 	SWITCHDEV_ATTR_ID_VLAN_MSTI,
+++>>>>>>> 6284c723d9b9 (net: bridge: mst: Notify switchdev drivers of VLAN MSTI migrations)
+  };
+  
+  struct switchdev_brport_flags {
+@@@ -69,9 -55,10 +80,13 @@@ struct switchdev_attr 
+  		clock_t ageing_time;			/* BRIDGE_AGEING_TIME */
+  		bool vlan_filtering;			/* BRIDGE_VLAN_FILTERING */
+  		u16 vlan_protocol;			/* BRIDGE_VLAN_PROTOCOL */
+ -		bool mst;				/* BRIDGE_MST */
+  		bool mc_disabled;			/* MC_DISABLED */
+  		u8 mrp_port_role;			/* MRP_PORT_ROLE */
+++<<<<<<< HEAD
+ +		) /* RH_KABI_BROKEN_INSERT_BLOCK */
+++=======
++ 		struct switchdev_vlan_msti vlan_msti;	/* VLAN_MSTI */
+++>>>>>>> 6284c723d9b9 (net: bridge: mst: Notify switchdev drivers of VLAN MSTI migrations)
+  	} u;
+  };
+  
+* Unmerged path include/net/switchdev.h
+diff --git a/net/bridge/br_mst.c b/net/bridge/br_mst.c
+index 5c1831c73fc2..7ed66455665a 100644
+--- a/net/bridge/br_mst.c
++++ b/net/bridge/br_mst.c
+@@ -68,13 +68,26 @@ static void br_mst_vlan_sync_state(struct net_bridge_vlan *pv, u16 msti)
+ 
+ int br_mst_vlan_set_msti(struct net_bridge_vlan *mv, u16 msti)
+ {
++	struct switchdev_attr attr = {
++		.id = SWITCHDEV_ATTR_ID_VLAN_MSTI,
++		.orig_dev = mv->br->dev,
++		.u.vlan_msti = {
++			.vid = mv->vid,
++			.msti = msti,
++		},
++	};
+ 	struct net_bridge_vlan_group *vg;
+ 	struct net_bridge_vlan *pv;
+ 	struct net_bridge_port *p;
++	int err;
+ 
+ 	if (mv->msti == msti)
+ 		return 0;
+ 
++	err = switchdev_port_attr_set(mv->br->dev, &attr, NULL);
++	if (err && err != -EOPNOTSUPP)
++		return err;
++
+ 	mv->msti = msti;
+ 
+ 	list_for_each_entry(p, &mv->br->port_list, list) {
+diff --git a/net/bridge/br_switchdev.c b/net/bridge/br_switchdev.c
+index 6f6a70121a5e..8cc44c367231 100644
+--- a/net/bridge/br_switchdev.c
++++ b/net/bridge/br_switchdev.c
+@@ -331,6 +331,46 @@ br_switchdev_fdb_replay(const struct net_device *br_dev, const void *ctx,
+ 	return err;
+ }
+ 
++static int br_switchdev_vlan_attr_replay(struct net_device *br_dev,
++					 const void *ctx,
++					 struct notifier_block *nb,
++					 struct netlink_ext_ack *extack)
++{
++	struct switchdev_notifier_port_attr_info attr_info = {
++		.info = {
++			.dev = br_dev,
++			.extack = extack,
++			.ctx = ctx,
++		},
++	};
++	struct net_bridge *br = netdev_priv(br_dev);
++	struct net_bridge_vlan_group *vg;
++	struct switchdev_attr attr;
++	struct net_bridge_vlan *v;
++	int err;
++
++	attr_info.attr = &attr;
++	attr.orig_dev = br_dev;
++
++	vg = br_vlan_group(br);
++
++	list_for_each_entry(v, &vg->vlan_list, vlist) {
++		if (v->msti) {
++			attr.id = SWITCHDEV_ATTR_ID_VLAN_MSTI;
++			attr.u.vlan_msti.vid = v->vid;
++			attr.u.vlan_msti.msti = v->msti;
++
++			err = nb->notifier_call(nb, SWITCHDEV_PORT_ATTR_SET,
++						&attr_info);
++			err = notifier_to_errno(err);
++			if (err)
++				return err;
++		}
++	}
++
++	return 0;
++}
++
+ static int
+ br_switchdev_vlan_replay_one(struct notifier_block *nb,
+ 			     struct net_device *dev,
+@@ -425,6 +465,12 @@ static int br_switchdev_vlan_replay(struct net_device *br_dev,
+ 			return err;
+ 	}
+ 
++	if (adding) {
++		err = br_switchdev_vlan_attr_replay(br_dev, ctx, nb, extack);
++		if (err)
++			return err;
++	}
++
+ 	return 0;
+ }
+ 
