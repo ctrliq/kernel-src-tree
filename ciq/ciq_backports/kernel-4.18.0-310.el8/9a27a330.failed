@@ -1,0 +1,267 @@
+ethtool: add standard pause stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Jakub Kicinski <kuba@kernel.org>
+commit 9a27a33027f22a716ce362be48d70ae0eb012ab7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/9a27a330.failed
+
+Currently drivers have to report their pause frames statistics
+via ethtool -S, and there is a wide variety of names used for
+these statistics.
+
+Add the two statistics defined in IEEE 802.3x to the standard
+API. Create a new ethtool request header flag for including
+statistics in the response to GET commands.
+
+Always create the ETHTOOL_A_PAUSE_STATS nest in replies when
+flag is set. Testing if driver declares the op is not a reliable
+way of checking if any stats will actually be included and therefore
+we don't want to give the impression that presence of
+ETHTOOL_A_PAUSE_STATS indicates driver support.
+
+Note that this patch does not include PFC counters, which may fit
+better in dcbnl? But mostly I don't need them/have a setup to test
+them so I haven't looked deeply into exposing them :)
+
+v3:
+ - add a helper for "uninitializing" stats, rather than a cryptic
+   memset() (Andrew)
+
+	Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+	Reviewed-by: Saeed Mahameed <saeedm@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 9a27a33027f22a716ce362be48d70ae0eb012ab7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/ethtool.h
+diff --cc include/linux/ethtool.h
+index d18c5017e8e3,060b20f0b20f..000000000000
+--- a/include/linux/ethtool.h
++++ b/include/linux/ethtool.h
+@@@ -243,7 -241,25 +243,29 @@@ bool ethtool_convert_link_mode_to_legac
+  	 ETHTOOL_COALESCE_PKT_RATE_LOW | ETHTOOL_COALESCE_PKT_RATE_HIGH | \
+  	 ETHTOOL_COALESCE_RATE_SAMPLE_INTERVAL)
+  
+++<<<<<<< HEAD
+ +struct ethtool_ops_extended_rh {
+++=======
++ #define ETHTOOL_STAT_NOT_SET	(~0ULL)
++ 
++ /**
++  * struct ethtool_pause_stats - statistics for IEEE 802.3x pause frames
++  * @tx_pause_frames: transmitted pause frame count. Reported to user space
++  *	as %ETHTOOL_A_PAUSE_STAT_TX_FRAMES.
++  *
++  *	Equivalent to `30.3.4.2 aPAUSEMACCtrlFramesTransmitted`
++  *	from the standard.
++  *
++  * @rx_pause_frames: received pause frame count. Reported to user space
++  *	as %ETHTOOL_A_PAUSE_STAT_RX_FRAMES. Equivalent to:
++  *
++  *	Equivalent to `30.3.4.3 aPAUSEMACCtrlFramesReceived`
++  *	from the standard.
++  */
++ struct ethtool_pause_stats {
++ 	u64 tx_pause_frames;
++ 	u64 rx_pause_frames;
+++>>>>>>> 9a27a33027f2 (ethtool: add standard pause stats)
+  };
+  
+  /**
+diff --git a/Documentation/networking/ethtool-netlink.rst b/Documentation/networking/ethtool-netlink.rst
+index 8e835bbe8918..ec1446f5b7e5 100644
+--- a/Documentation/networking/ethtool-netlink.rst
++++ b/Documentation/networking/ethtool-netlink.rst
+@@ -68,6 +68,7 @@ the flags may not apply to requests. Recognized flags are:
+   =================================  ===================================
+   ``ETHTOOL_FLAG_COMPACT_BITSETS``   use compact format bitsets in reply
+   ``ETHTOOL_FLAG_OMIT_REPLY``        omit optional reply (_SET and _ACT)
++  ``ETHTOOL_FLAG_STATS``             include optional device statistics
+   =================================  ===================================
+ 
+ New request flags should follow the general idea that if the flag is not set,
+@@ -991,8 +992,18 @@ Kernel response contents:
+   ``ETHTOOL_A_PAUSE_AUTONEG``            bool    pause autonegotiation
+   ``ETHTOOL_A_PAUSE_RX``                 bool    receive pause frames
+   ``ETHTOOL_A_PAUSE_TX``                 bool    transmit pause frames
++  ``ETHTOOL_A_PAUSE_STATS``              nested  pause statistics
+   =====================================  ======  ==========================
+ 
++``ETHTOOL_A_PAUSE_STATS`` are reported if ``ETHTOOL_FLAG_STATS`` was set
++in ``ETHTOOL_A_HEADER_FLAGS``.
++It will be empty if driver did not report any statistics. Drivers fill in
++the statistics in the following structure:
++
++.. kernel-doc:: include/linux/ethtool.h
++    :identifiers: ethtool_pause_stats
++
++Each member has a corresponding attribute defined.
+ 
+ PAUSE_SET
+ ============
+* Unmerged path include/linux/ethtool.h
+diff --git a/include/uapi/linux/ethtool_netlink.h b/include/uapi/linux/ethtool_netlink.h
+index 3b69e577c524..aa71c7569352 100644
+--- a/include/uapi/linux/ethtool_netlink.h
++++ b/include/uapi/linux/ethtool_netlink.h
+@@ -92,9 +92,12 @@ enum {
+ #define ETHTOOL_FLAG_COMPACT_BITSETS	(1 << 0)
+ /* provide optional reply for SET or ACT requests */
+ #define ETHTOOL_FLAG_OMIT_REPLY	(1 << 1)
++/* request statistics, if supported by the driver */
++#define ETHTOOL_FLAG_STATS		(1 << 2)
+ 
+ #define ETHTOOL_FLAG_ALL (ETHTOOL_FLAG_COMPACT_BITSETS | \
+-			  ETHTOOL_FLAG_OMIT_REPLY)
++			  ETHTOOL_FLAG_OMIT_REPLY | \
++			  ETHTOOL_FLAG_STATS)
+ 
+ enum {
+ 	ETHTOOL_A_HEADER_UNSPEC,
+@@ -377,12 +380,25 @@ enum {
+ 	ETHTOOL_A_PAUSE_AUTONEG,			/* u8 */
+ 	ETHTOOL_A_PAUSE_RX,				/* u8 */
+ 	ETHTOOL_A_PAUSE_TX,				/* u8 */
++	ETHTOOL_A_PAUSE_STATS,				/* nest - _PAUSE_STAT_* */
+ 
+ 	/* add new constants above here */
+ 	__ETHTOOL_A_PAUSE_CNT,
+ 	ETHTOOL_A_PAUSE_MAX = (__ETHTOOL_A_PAUSE_CNT - 1)
+ };
+ 
++enum {
++	ETHTOOL_A_PAUSE_STAT_UNSPEC,
++	ETHTOOL_A_PAUSE_STAT_PAD,
++
++	ETHTOOL_A_PAUSE_STAT_TX_FRAMES,
++	ETHTOOL_A_PAUSE_STAT_RX_FRAMES,
++
++	/* add new constants above here */
++	__ETHTOOL_A_PAUSE_STAT_CNT,
++	ETHTOOL_A_PAUSE_STAT_MAX = (__ETHTOOL_A_PAUSE_STAT_CNT - 1)
++};
++
+ /* EEE */
+ 
+ enum {
+diff --git a/net/ethtool/pause.c b/net/ethtool/pause.c
+index 7aea35d1e8a5..1980aa7eb2b6 100644
+--- a/net/ethtool/pause.c
++++ b/net/ethtool/pause.c
+@@ -10,6 +10,7 @@ struct pause_req_info {
+ struct pause_reply_data {
+ 	struct ethnl_reply_data		base;
+ 	struct ethtool_pauseparam	pauseparam;
++	struct ethtool_pause_stats	pausestat;
+ };
+ 
+ #define PAUSE_REPDATA(__reply_base) \
+@@ -22,8 +23,15 @@ pause_get_policy[ETHTOOL_A_PAUSE_MAX + 1] = {
+ 	[ETHTOOL_A_PAUSE_AUTONEG]		= { .type = NLA_REJECT },
+ 	[ETHTOOL_A_PAUSE_RX]			= { .type = NLA_REJECT },
+ 	[ETHTOOL_A_PAUSE_TX]			= { .type = NLA_REJECT },
++	[ETHTOOL_A_PAUSE_STATS]			= { .type = NLA_REJECT },
+ };
+ 
++static void ethtool_stats_init(u64 *stats, unsigned int n)
++{
++	while (n--)
++		stats[n] = ETHTOOL_STAT_NOT_SET;
++}
++
+ static int pause_prepare_data(const struct ethnl_req_info *req_base,
+ 			      struct ethnl_reply_data *reply_base,
+ 			      struct genl_info *info)
+@@ -34,10 +42,17 @@ static int pause_prepare_data(const struct ethnl_req_info *req_base,
+ 
+ 	if (!dev->ethtool_ops->get_pauseparam)
+ 		return -EOPNOTSUPP;
++
+ 	ret = ethnl_ops_begin(dev);
+ 	if (ret < 0)
+ 		return ret;
+ 	dev->ethtool_ops->get_pauseparam(dev, &data->pauseparam);
++	if (req_base->flags & ETHTOOL_FLAG_STATS &&
++	    dev->ethtool_ops->get_pause_stats) {
++		ethtool_stats_init((u64 *)&data->pausestat,
++				   sizeof(data->pausestat) / 8);
++		dev->ethtool_ops->get_pause_stats(dev, &data->pausestat);
++	}
+ 	ethnl_ops_complete(dev);
+ 
+ 	return 0;
+@@ -46,9 +61,50 @@ static int pause_prepare_data(const struct ethnl_req_info *req_base,
+ static int pause_reply_size(const struct ethnl_req_info *req_base,
+ 			    const struct ethnl_reply_data *reply_base)
+ {
+-	return nla_total_size(sizeof(u8)) +	/* _PAUSE_AUTONEG */
++	int n = nla_total_size(sizeof(u8)) +	/* _PAUSE_AUTONEG */
+ 		nla_total_size(sizeof(u8)) +	/* _PAUSE_RX */
+ 		nla_total_size(sizeof(u8));	/* _PAUSE_TX */
++
++	if (req_base->flags & ETHTOOL_FLAG_STATS)
++		n += nla_total_size(0) +	/* _PAUSE_STATS */
++			nla_total_size_64bit(sizeof(u64)) *
++				(ETHTOOL_A_PAUSE_STAT_MAX - 2);
++	return n;
++}
++
++static int ethtool_put_stat(struct sk_buff *skb, u64 val, u16 attrtype,
++			    u16 padtype)
++{
++	if (val == ETHTOOL_STAT_NOT_SET)
++		return 0;
++	if (nla_put_u64_64bit(skb, attrtype, val, padtype))
++		return -EMSGSIZE;
++
++	return 0;
++}
++
++static int pause_put_stats(struct sk_buff *skb,
++			   const struct ethtool_pause_stats *pause_stats)
++{
++	const u16 pad = ETHTOOL_A_PAUSE_STAT_PAD;
++	struct nlattr *nest;
++
++	nest = nla_nest_start(skb, ETHTOOL_A_PAUSE_STATS);
++	if (!nest)
++		return -EMSGSIZE;
++
++	if (ethtool_put_stat(skb, pause_stats->tx_pause_frames,
++			     ETHTOOL_A_PAUSE_STAT_TX_FRAMES, pad) ||
++	    ethtool_put_stat(skb, pause_stats->rx_pause_frames,
++			     ETHTOOL_A_PAUSE_STAT_RX_FRAMES, pad))
++		goto err_cancel;
++
++	nla_nest_end(skb, nest);
++	return 0;
++
++err_cancel:
++	nla_nest_cancel(skb, nest);
++	return -EMSGSIZE;
+ }
+ 
+ static int pause_fill_reply(struct sk_buff *skb,
+@@ -63,6 +119,10 @@ static int pause_fill_reply(struct sk_buff *skb,
+ 	    nla_put_u8(skb, ETHTOOL_A_PAUSE_TX, !!pauseparam->tx_pause))
+ 		return -EMSGSIZE;
+ 
++	if (req_base->flags & ETHTOOL_FLAG_STATS &&
++	    pause_put_stats(skb, &data->pausestat))
++		return -EMSGSIZE;
++
+ 	return 0;
+ }
+ 
+@@ -89,6 +149,7 @@ pause_set_policy[ETHTOOL_A_PAUSE_MAX + 1] = {
+ 	[ETHTOOL_A_PAUSE_AUTONEG]		= { .type = NLA_U8 },
+ 	[ETHTOOL_A_PAUSE_RX]			= { .type = NLA_U8 },
+ 	[ETHTOOL_A_PAUSE_TX]			= { .type = NLA_U8 },
++	[ETHTOOL_A_PAUSE_STATS]			= { .type = NLA_REJECT },
+ };
+ 
+ int ethnl_set_pause(struct sk_buff *skb, struct genl_info *info)
