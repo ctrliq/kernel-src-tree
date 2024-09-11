@@ -1,0 +1,165 @@
+devlink: Only pass packet trap group identifier in trap structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit 107f1678941151ccccec67d230a48069aa27527e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/107f1678.failed
+
+Packet trap groups are now explicitly registered by drivers and not
+implicitly registered when the packet traps are registered. Therefore,
+there is no need to encode entire group structure the trap is associated
+with inside the trap structure.
+
+Instead, only pass the group identifier. Refer to it as initial group
+identifier, as future patches will allow user space to move traps
+between groups.
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 107f1678941151ccccec67d230a48069aa27527e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+#	drivers/net/netdevsim/dev.c
+diff --cc drivers/net/netdevsim/dev.c
+index 2865d9b5336b,7bfd0622cef1..000000000000
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@@ -331,11 -381,15 +331,18 @@@ enum 
+  
+  #define NSIM_TRAP_DROP(_id, _group_id)					      \
+  	DEVLINK_TRAP_GENERIC(DROP, DROP, _id,				      \
+- 			     DEVLINK_TRAP_GROUP_GENERIC(_group_id),	      \
++ 			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group_id,	      \
+  			     NSIM_TRAP_METADATA)
+++<<<<<<< HEAD
+++=======
++ #define NSIM_TRAP_DROP_EXT(_id, _group_id, _metadata)			      \
++ 	DEVLINK_TRAP_GENERIC(DROP, DROP, _id,				      \
++ 			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group_id,	      \
++ 			     NSIM_TRAP_METADATA | (_metadata))
+++>>>>>>> 107f16789411 (devlink: Only pass packet trap group identifier in trap structure)
+  #define NSIM_TRAP_EXCEPTION(_id, _group_id)				      \
+  	DEVLINK_TRAP_GENERIC(EXCEPTION, TRAP, _id,			      \
+- 			     DEVLINK_TRAP_GROUP_GENERIC(_group_id),	      \
++ 			     DEVLINK_TRAP_GROUP_GENERIC_ID_##_group_id,	      \
+  			     NSIM_TRAP_METADATA)
+  #define NSIM_TRAP_DRIVER_EXCEPTION(_id, _group_id)			      \
+  	DEVLINK_TRAP_DRIVER(EXCEPTION, TRAP, NSIM_TRAP_ID_##_id,	      \
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+* Unmerged path drivers/net/ethernet/mellanox/mlxsw/spectrum_trap.c
+* Unmerged path drivers/net/netdevsim/dev.c
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index e6a7c522300f..3bc8bcb5d476 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -548,7 +548,7 @@ struct devlink_trap_group {
+  * @generic: Whether the trap is generic or not.
+  * @id: Trap identifier.
+  * @name: Trap name.
+- * @group: Immutable packet trap group attributes.
++ * @init_group_id: Initial group identifier.
+  * @metadata_cap: Metadata types that can be provided by the trap.
+  *
+  * Describes immutable attributes of packet traps that drivers register with
+@@ -560,7 +560,7 @@ struct devlink_trap {
+ 	bool generic;
+ 	u16 id;
+ 	const char *name;
+-	struct devlink_trap_group group;
++	u16 init_group_id;
+ 	u32 metadata_cap;
+ };
+ 
+@@ -617,18 +617,19 @@ enum devlink_trap_group_generic_id {
+ #define DEVLINK_TRAP_GROUP_GENERIC_NAME_BUFFER_DROPS \
+ 	"buffer_drops"
+ 
+-#define DEVLINK_TRAP_GENERIC(_type, _init_action, _id, _group, _metadata_cap) \
++#define DEVLINK_TRAP_GENERIC(_type, _init_action, _id, _group_id,	      \
++			     _metadata_cap)				      \
+ 	{								      \
+ 		.type = DEVLINK_TRAP_TYPE_##_type,			      \
+ 		.init_action = DEVLINK_TRAP_ACTION_##_init_action,	      \
+ 		.generic = true,					      \
+ 		.id = DEVLINK_TRAP_GENERIC_ID_##_id,			      \
+ 		.name = DEVLINK_TRAP_GENERIC_NAME_##_id,		      \
+-		.group = _group,					      \
++		.init_group_id = _group_id,				      \
+ 		.metadata_cap = _metadata_cap,				      \
+ 	}
+ 
+-#define DEVLINK_TRAP_DRIVER(_type, _init_action, _id, _name, _group,	      \
++#define DEVLINK_TRAP_DRIVER(_type, _init_action, _id, _name, _group_id,	      \
+ 			    _metadata_cap)				      \
+ 	{								      \
+ 		.type = DEVLINK_TRAP_TYPE_##_type,			      \
+@@ -636,7 +637,7 @@ enum devlink_trap_group_generic_id {
+ 		.generic = false,					      \
+ 		.id = _id,						      \
+ 		.name = _name,						      \
+-		.group = _group,					      \
++		.init_group_id = _group_id,				      \
+ 		.metadata_cap = _metadata_cap,				      \
+ 	}
+ 
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index d02f367eb501..aa5093af25f5 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -5632,6 +5632,19 @@ devlink_trap_group_item_lookup(struct devlink *devlink, const char *name)
+ 	return NULL;
+ }
+ 
++static struct devlink_trap_group_item *
++devlink_trap_group_item_lookup_by_id(struct devlink *devlink, u16 id)
++{
++	struct devlink_trap_group_item *group_item;
++
++	list_for_each_entry(group_item, &devlink->trap_group_list, list) {
++		if (group_item->group->id == id)
++			return group_item;
++	}
++
++	return NULL;
++}
++
+ static struct devlink_trap_group_item *
+ devlink_trap_group_item_get_from_info(struct devlink *devlink,
+ 				      struct genl_info *info)
+@@ -5770,7 +5783,7 @@ __devlink_trap_group_action_set(struct devlink *devlink,
+ 	int err;
+ 
+ 	list_for_each_entry(trap_item, &devlink->trap_list, list) {
+-		if (strcmp(trap_item->trap->group.name, group_name))
++		if (strcmp(trap_item->group_item->group->name, group_name))
+ 			continue;
+ 		err = __devlink_trap_action_set(devlink, trap_item,
+ 						trap_action, extack);
+@@ -7612,7 +7625,7 @@ static int devlink_trap_driver_verify(const struct devlink_trap *trap)
+ 
+ static int devlink_trap_verify(const struct devlink_trap *trap)
+ {
+-	if (!trap || !trap->name || !trap->group.name)
++	if (!trap || !trap->name)
+ 		return -EINVAL;
+ 
+ 	if (trap->generic)
+@@ -7687,10 +7700,10 @@ static int
+ devlink_trap_item_group_link(struct devlink *devlink,
+ 			     struct devlink_trap_item *trap_item)
+ {
+-	const struct devlink_trap *trap = trap_item->trap;
++	u16 group_id = trap_item->trap->init_group_id;
+ 	struct devlink_trap_group_item *group_item;
+ 
+-	group_item = devlink_trap_group_item_lookup(devlink, trap->group.name);
++	group_item = devlink_trap_group_item_lookup_by_id(devlink, group_id);
+ 	if (WARN_ON_ONCE(!group_item))
+ 		return -EINVAL;
+ 
