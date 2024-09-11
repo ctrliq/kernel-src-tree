@@ -1,0 +1,246 @@
+net/mlx5: FW tracer, events handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Feras Daoud <ferasda@mellanox.com>
+commit c71ad41ccb0c29fce95149b74786574b354c9dda
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/c71ad41c.failed
+
+The tracer has one event, event 0x26, with two subtypes:
+- Subtype 0: Ownership change
+- Subtype 1: Traces available
+
+An ownership change occurs in the following cases:
+1- Owner releases his ownership, in this case, an event will be
+sent to inform others to reattempt acquire ownership.
+2- Ownership was taken by a higher priority tool, in this case
+the owner should understand that it lost ownership, and go through
+tear down flow.
+
+The second subtype indicates that there are traces in the trace buffer,
+in this case, the driver polls the tracer buffer for new traces, parse
+them and prepares the messages for printing.
+
+The HW starts tracing from the first address in the tracer buffer.
+Driver receives an event notifying that new trace block exists.
+HW posts a timestamp event at the last 8B of every 256B block.
+Comparing the timestamp to the last handled timestamp would indicate
+that this is a new trace block. Once the new timestamp is detected,
+the entire block is considered valid.
+
+Block validation and parsing, should be done after copying the current
+block to a different location, in order to avoid block overwritten
+during processing.
+
+	Signed-off-by: Feras Daoud <ferasda@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit c71ad41ccb0c29fce95149b74786574b354c9dda)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c
+#	drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+#	drivers/net/ethernet/mellanox/mlx5/core/eq.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+index a8a856a82c63,3915e91486b2..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+@@@ -29,34 -29,125 +29,134 @@@
+   * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   * SOFTWARE.
+   */
+ -
+ -#ifndef __LIB_TRACER_H__
+ -#define __LIB_TRACER_H__
+ -
+ -#include <linux/mlx5/driver.h>
+ -#include "mlx5_core.h"
+ -
+ -#define STRINGS_DB_SECTIONS_NUM 8
+ -#define STRINGS_DB_READ_SIZE_BYTES 256
+ -#define STRINGS_DB_LEFTOVER_SIZE_BYTES 64
+ -#define TRACER_BUFFER_PAGE_NUM 64
+ -#define TRACER_BUFFER_CHUNK 4096
+ -#define TRACE_BUFFER_SIZE_BYTE (TRACER_BUFFER_PAGE_NUM * TRACER_BUFFER_CHUNK)
+ -
+ +#ifndef __MLX5_EN_XDP_H__
+ +#define __MLX5_EN_XDP_H__
+ +
+ +#include "en.h"
+ +
+ +#define MLX5E_XDP_MAX_MTU ((int)(PAGE_SIZE - \
+ +				 MLX5_SKB_FRAG_SZ(XDP_PACKET_HEADROOM)))
+ +#define MLX5E_XDP_MIN_INLINE (ETH_HLEN + VLAN_HLEN)
+ +#define MLX5E_XDP_TX_DS_COUNT \
+ +	((sizeof(struct mlx5e_tx_wqe) / MLX5_SEND_WQE_DS) + 1 /* SG DS */)
+ +
+ +bool mlx5e_xdp_handle(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+ +		      void *va, u16 *rx_headroom, u32 *len);
+ +bool mlx5e_poll_xdpsq_cq(struct mlx5e_cq *cq);
+ +void mlx5e_free_xdpsq_descs(struct mlx5e_xdpsq *sq);
+ +
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+ +bool mlx5e_xmit_xdp_frame(struct mlx5e_rq *rq, struct mlx5e_dma_info *di,
+ +			  const struct xdp_buff *xdp);
+++=======
++ #define TRACER_BLOCK_SIZE_BYTE 256
++ #define TRACES_PER_BLOCK 32
++ 
++ struct mlx5_fw_tracer {
++ 	struct mlx5_core_dev *dev;
++ 	bool owner;
++ 	u8   trc_ver;
++ 	struct workqueue_struct *work_queue;
++ 	struct work_struct ownership_change_work;
++ 	struct work_struct read_fw_strings_work;
+++>>>>>>> c71ad41ccb0c (net/mlx5: FW tracer, events handling):drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.h
+  
+ -	/* Strings DB */
+ -	struct {
+ -		u8 first_string_trace;
+ -		u8 num_string_trace;
+ -		u32 num_string_db;
+ -		u32 base_address_out[STRINGS_DB_SECTIONS_NUM];
+ -		u32 size_out[STRINGS_DB_SECTIONS_NUM];
+ -		void *buffer[STRINGS_DB_SECTIONS_NUM];
+ -		bool loaded;
+ -	} str_db;
+ +static inline void mlx5e_xmit_xdp_doorbell(struct mlx5e_xdpsq *sq)
+ +{
+ +	struct mlx5_wq_cyc *wq = &sq->wq;
+ +	struct mlx5e_tx_wqe *wqe;
+ +	u16 pi = mlx5_wq_cyc_ctr2ix(wq, sq->pc - 1); /* last pi */
+ +
+++<<<<<<< HEAD:drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+ +	wqe  = mlx5_wq_cyc_get_wqe(wq, pi);
+  
+ +	mlx5e_notify_hw(wq, sq->pc, sq->uar_map, &wqe->ctrl);
+ +}
+++=======
++ 	/* Log Buffer */
++ 	struct {
++ 		u32 pdn;
++ 		void *log_buf;
++ 		dma_addr_t dma;
++ 		u32 size;
++ 		struct mlx5_core_mkey mkey;
++ 		u32 consumer_index;
++ 	} buff;
++ 
++ 	u64 last_timestamp;
++ 	struct work_struct handle_traces_work;
++ };
++ 
++ enum mlx5_fw_tracer_ownership_state {
++ 	MLX5_FW_TRACER_RELEASE_OWNERSHIP,
++ 	MLX5_FW_TRACER_ACQUIRE_OWNERSHIP,
++ };
++ 
++ enum tracer_ctrl_fields_select {
++ 	TRACE_STATUS = 1 << 0,
++ };
++ 
++ enum tracer_event_type {
++ 	TRACER_EVENT_TYPE_STRING,
++ 	TRACER_EVENT_TYPE_TIMESTAMP = 0xFF,
++ 	TRACER_EVENT_TYPE_UNRECOGNIZED,
++ };
++ 
++ enum tracing_mode {
++ 	TRACE_TO_MEMORY = 1 << 0,
++ };
++ 
++ struct tracer_timestamp_event {
++ 	u64        timestamp;
++ 	u8         unreliable;
++ };
++ 
++ struct tracer_string_event {
++ 	u32        timestamp;
++ 	u32        tmsn;
++ 	u32        tdsn;
++ 	u32        string_param;
++ };
++ 
++ struct tracer_event {
++ 	bool      lost_event;
++ 	u32       type;
++ 	u8        event_id;
++ 	union {
++ 		struct tracer_string_event string_event;
++ 		struct tracer_timestamp_event timestamp_event;
++ 	};
++ };
++ 
++ struct mlx5_ifc_tracer_event_bits {
++ 	u8         lost[0x1];
++ 	u8         timestamp[0x7];
++ 	u8         event_id[0x8];
++ 	u8         event_data[0x30];
++ };
++ 
++ struct mlx5_ifc_tracer_string_event_bits {
++ 	u8         lost[0x1];
++ 	u8         timestamp[0x7];
++ 	u8         event_id[0x8];
++ 	u8         tmsn[0xd];
++ 	u8         tdsn[0x3];
++ 	u8         string_param[0x20];
++ };
++ 
++ struct mlx5_ifc_tracer_timestamp_event_bits {
++ 	u8         timestamp7_0[0x8];
++ 	u8         event_id[0x8];
++ 	u8         urts[0x3];
++ 	u8         timestamp52_40[0xd];
++ 	u8         timestamp39_8[0x20];
++ };
++ 
++ struct mlx5_fw_tracer *mlx5_fw_tracer_create(struct mlx5_core_dev *dev);
++ int mlx5_fw_tracer_init(struct mlx5_fw_tracer *tracer);
++ void mlx5_fw_tracer_cleanup(struct mlx5_fw_tracer *tracer);
++ void mlx5_fw_tracer_destroy(struct mlx5_fw_tracer *tracer);
++ void mlx5_fw_tracer_event(struct mlx5_core_dev *dev, struct mlx5_eqe *eqe) { return; }
+++>>>>>>> c71ad41ccb0c (net/mlx5: FW tracer, events handling):drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.h
+  
+  #endif
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/eq.c
+index 0f0d5d68971d,7669b4380779..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/eq.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/eq.c
+@@@ -40,7 -40,7 +40,11 @@@
+  #include "mlx5_core.h"
+  #include "fpga/core.h"
+  #include "eswitch.h"
+++<<<<<<< HEAD
+ +#include "lib/clock.h"
+++=======
++ #include "diag/fw_tracer.h"
+++>>>>>>> c71ad41ccb0c (net/mlx5: FW tracer, events handling)
+  
+  enum {
+  	MLX5_EQE_SIZE		= sizeof(struct mlx5_eqe),
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/diag/fw_tracer.c
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/xdp.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/eq.c
+diff --git a/include/linux/mlx5/device.h b/include/linux/mlx5/device.h
+index 3a6461cdd4b3..6f914f811285 100644
+--- a/include/linux/mlx5/device.h
++++ b/include/linux/mlx5/device.h
+@@ -339,6 +339,13 @@ enum mlx5_event {
+ 
+ 	MLX5_EVENT_TYPE_FPGA_ERROR         = 0x20,
+ 	MLX5_EVENT_TYPE_FPGA_QP_ERROR      = 0x21,
++
++	MLX5_EVENT_TYPE_DEVICE_TRACER      = 0x26,
++};
++
++enum {
++	MLX5_TRACER_SUBTYPE_OWNERSHIP_CHANGE = 0x0,
++	MLX5_TRACER_SUBTYPE_TRACES_AVAILABLE = 0x1,
+ };
+ 
+ enum {
