@@ -1,0 +1,127 @@
+netfilter: conntrack: refetch conntrack after nf_conntrack_update()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pablo Neira Ayuso <pablo@netfilter.org>
+commit d005fbb855d3b5660d62ee5a6bd2d99c13ff8cf3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/d005fbb8.failed
+
+__nf_conntrack_update() might refresh the conntrack object that is
+attached to the skbuff. Otherwise, this triggers UAF.
+
+[  633.200434] ==================================================================
+[  633.200472] BUG: KASAN: use-after-free in nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200478] Read of size 1 at addr ffff888370804c00 by task nfqnl_test/6769
+
+[  633.200487] CPU: 1 PID: 6769 Comm: nfqnl_test Not tainted 5.8.0-rc2+ #388
+[  633.200490] Hardware name: LENOVO 23259H1/23259H1, BIOS G2ET32WW (1.12 ) 05/30/2012
+[  633.200491] Call Trace:
+[  633.200499]  dump_stack+0x7c/0xb0
+[  633.200526]  ? nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200532]  print_address_description.constprop.6+0x1a/0x200
+[  633.200539]  ? _raw_write_lock_irqsave+0xc0/0xc0
+[  633.200568]  ? nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200594]  ? nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200598]  kasan_report.cold.9+0x1f/0x42
+[  633.200604]  ? call_rcu+0x2c0/0x390
+[  633.200633]  ? nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200659]  nf_conntrack_update+0x34e/0x770 [nf_conntrack]
+[  633.200687]  ? nf_conntrack_find_get+0x30/0x30 [nf_conntrack]
+
+Closes: https://bugzilla.netfilter.org/show_bug.cgi?id=1436
+Fixes: ee04805ff54a ("netfilter: conntrack: make conntrack userspace helpers work again")
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit d005fbb855d3b5660d62ee5a6bd2d99c13ff8cf3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_core.c
+diff --cc net/netfilter/nf_conntrack_core.c
+index 680e0b0d92a5,f33d72c5b06e..000000000000
+--- a/net/netfilter/nf_conntrack_core.c
++++ b/net/netfilter/nf_conntrack_core.c
+@@@ -1801,6 -2093,78 +1801,81 @@@ static int nf_conntrack_update(struct n
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* This packet is coming from userspace via nf_queue, complete the packet
++  * processing after the helper invocation in nf_confirm().
++  */
++ static int nf_confirm_cthelper(struct sk_buff *skb, struct nf_conn *ct,
++ 			       enum ip_conntrack_info ctinfo)
++ {
++ 	const struct nf_conntrack_helper *helper;
++ 	const struct nf_conn_help *help;
++ 	int protoff;
++ 
++ 	help = nfct_help(ct);
++ 	if (!help)
++ 		return 0;
++ 
++ 	helper = rcu_dereference(help->helper);
++ 	if (!(helper->flags & NF_CT_HELPER_F_USERSPACE))
++ 		return 0;
++ 
++ 	switch (nf_ct_l3num(ct)) {
++ 	case NFPROTO_IPV4:
++ 		protoff = skb_network_offset(skb) + ip_hdrlen(skb);
++ 		break;
++ #if IS_ENABLED(CONFIG_IPV6)
++ 	case NFPROTO_IPV6: {
++ 		__be16 frag_off;
++ 		u8 pnum;
++ 
++ 		pnum = ipv6_hdr(skb)->nexthdr;
++ 		protoff = ipv6_skip_exthdr(skb, sizeof(struct ipv6hdr), &pnum,
++ 					   &frag_off);
++ 		if (protoff < 0 || (frag_off & htons(~0x7)) != 0)
++ 			return 0;
++ 		break;
++ 	}
++ #endif
++ 	default:
++ 		return 0;
++ 	}
++ 
++ 	if (test_bit(IPS_SEQ_ADJUST_BIT, &ct->status) &&
++ 	    !nf_is_loopback_packet(skb)) {
++ 		if (!nf_ct_seq_adjust(skb, ct, ctinfo, protoff)) {
++ 			NF_CT_STAT_INC_ATOMIC(nf_ct_net(ct), drop);
++ 			return -1;
++ 		}
++ 	}
++ 
++ 	/* We've seen it coming out the other side: confirm it */
++ 	return nf_conntrack_confirm(skb) == NF_DROP ? - 1 : 0;
++ }
++ 
++ static int nf_conntrack_update(struct net *net, struct sk_buff *skb)
++ {
++ 	enum ip_conntrack_info ctinfo;
++ 	struct nf_conn *ct;
++ 	int err;
++ 
++ 	ct = nf_ct_get(skb, &ctinfo);
++ 	if (!ct)
++ 		return 0;
++ 
++ 	if (!nf_ct_is_confirmed(ct)) {
++ 		err = __nf_conntrack_update(net, skb, ct, ctinfo);
++ 		if (err < 0)
++ 			return err;
++ 
++ 		ct = nf_ct_get(skb, &ctinfo);
++ 	}
++ 
++ 	return nf_confirm_cthelper(skb, ct, ctinfo);
++ }
++ 
+++>>>>>>> d005fbb855d3 (netfilter: conntrack: refetch conntrack after nf_conntrack_update())
+  static bool nf_conntrack_get_tuple_skb(struct nf_conntrack_tuple *dst_tuple,
+  				       const struct sk_buff *skb)
+  {
+* Unmerged path net/netfilter/nf_conntrack_core.c
