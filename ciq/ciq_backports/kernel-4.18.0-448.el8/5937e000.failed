@@ -1,0 +1,422 @@
+xfs: Fix multiple fall-through warnings for Clang
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Gustavo A. R. Silva <gustavoars@kernel.org>
+commit 5937e00017f1d1dd4551e723ebfa306671f27843
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/5937e000.failed
+
+In preparation to enable -Wimplicit-fallthrough for Clang, fix
+the following warnings by replacing /* fallthrough */ comments,
+and its variants, with the new pseudo-keyword macro fallthrough:
+
+fs/xfs/libxfs/xfs_attr.c:487:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:500:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:532:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:594:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:607:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:1410:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:1445:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+fs/xfs/libxfs/xfs_attr.c:1473:2: warning: unannotated fall-through between switch labels [-Wimplicit-fallthrough]
+
+Notice that Clang doesn't recognize /* fallthrough */ comments as
+implicit fall-through markings, so in order to globally enable
+-Wimplicit-fallthrough for Clang, these comments need to be
+replaced with fallthrough; in the whole codebase.
+
+Link: https://github.com/KSPP/linux/issues/115
+	Reviewed-by: Kees Cook <keescook@chromium.org>
+	Signed-off-by: Gustavo A. R. Silva <gustavoars@kernel.org>
+(cherry picked from commit 5937e00017f1d1dd4551e723ebfa306671f27843)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index bc11a1b3959d,191d51725988..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -397,20 -479,29 +397,32 @@@ xfs_attr_set_args
+  		 * "remote" value (if it exists).
+  		 */
+  		xfs_attr_restore_rmt_blk(args);
+ -		error = xfs_attr_rmtval_invalidate(args);
+ -		if (error)
+ -			return error;
+  
+++<<<<<<< HEAD
+++=======
++ 		fallthrough;
++ 	case XFS_DAS_RM_LBLK:
++ 		/* Set state in case xfs_attr_rmtval_remove returns -EAGAIN */
++ 		dac->dela_state = XFS_DAS_RM_LBLK;
+++>>>>>>> 5937e00017f1 (xfs: Fix multiple fall-through warnings for Clang)
+  		if (args->rmtblkno) {
+ -			error = __xfs_attr_rmtval_remove(dac);
+ +			error = xfs_attr_rmtval_invalidate(args);
+  			if (error)
+  				return error;
+  
+ -			dac->dela_state = XFS_DAS_RD_LEAF;
+ -			return -EAGAIN;
+ +			error = xfs_attr_rmtval_remove(args);
+ +			if (error)
+ +				return error;
+  		}
+  
+++<<<<<<< HEAD
+++=======
++ 		fallthrough;
++ 	case XFS_DAS_RD_LEAF:
+++>>>>>>> 5937e00017f1 (xfs: Fix multiple fall-through warnings for Clang)
+  		/*
+ -		 * This is the last step for leaf format. Read the block with
+ -		 * the old attr, remove the old attr, check for shortform
+ -		 * conversion and return.
+ +		 * Read in the block containing the "old" attr, then remove the
+ +		 * "old" attr from that block (neat, huh!)
+  		 */
+  		error = xfs_attr3_leaf_read(args->trans, args->dp, args->blkno,
+  					   &bp);
+@@@ -428,84 -516,105 +440,156 @@@
+  			/* bp is gone due to xfs_da_shrink_inode */
+  
+  		return error;
+ +	}
+ +node:
+  
+ -	case XFS_DAS_FOUND_NBLK:
+ -		/*
+ -		 * Find space for remote blocks and fall into the allocation
+ -		 * state.
+ -		 */
+ -		if (args->rmtblkno > 0) {
+ -			error = xfs_attr_rmtval_find_space(dac);
+ -			if (error)
+ -				return error;
+ -		}
+  
+++<<<<<<< HEAD
+ +	do {
+ +		error = xfs_attr_node_addname_find_attr(args, &state);
+++=======
++ 		fallthrough;
++ 	case XFS_DAS_ALLOC_NODE:
++ 		/*
++ 		 * If there was an out-of-line value, allocate the blocks we
++ 		 * identified for its storage and copy the value.  This is done
++ 		 * after we create the attribute so that we don't overflow the
++ 		 * maximum size of a transaction and/or hit a deadlock.
++ 		 */
++ 		dac->dela_state = XFS_DAS_ALLOC_NODE;
++ 		if (args->rmtblkno > 0) {
++ 			if (dac->blkcnt > 0) {
++ 				error = xfs_attr_rmtval_set_blk(dac);
++ 				if (error)
++ 					return error;
++ 				return -EAGAIN;
++ 			}
++ 
++ 			error = xfs_attr_rmtval_set_value(args);
++ 			if (error)
++ 				return error;
++ 		}
++ 
++ 		/*
++ 		 * If this was not a rename, clear the incomplete flag and we're
++ 		 * done.
++ 		 */
++ 		if (!(args->op_flags & XFS_DA_OP_RENAME)) {
++ 			if (args->rmtblkno > 0)
++ 				error = xfs_attr3_leaf_clearflag(args);
++ 			goto out;
++ 		}
++ 
++ 		/*
++ 		 * If this is an atomic rename operation, we must "flip" the
++ 		 * incomplete flags on the "new" and "old" attribute/value pairs
++ 		 * so that one disappears and one appears atomically.  Then we
++ 		 * must remove the "old" attribute/value pair.
++ 		 *
++ 		 * In a separate transaction, set the incomplete flag on the
++ 		 * "old" attr and clear the incomplete flag on the "new" attr.
++ 		 */
++ 		error = xfs_attr3_leaf_flipflags(args);
+++>>>>>>> 5937e00017f1 (xfs: Fix multiple fall-through warnings for Clang)
+  		if (error)
+ -			goto out;
+ -		/*
+ -		 * Commit the flag value change and start the next trans in
+ -		 * series
+ -		 */
+ -		dac->dela_state = XFS_DAS_FLIP_NFLAG;
+ -		return -EAGAIN;
+ +			return error;
+ +		error = xfs_attr_node_addname(args, state);
+ +	} while (error == -EAGAIN);
+ +	if (error)
+ +		return error;
+  
+ -	case XFS_DAS_FLIP_NFLAG:
+ +	/*
+ +	 * Commit the leaf addition or btree split and start the next
+ +	 * trans in the chain.
+ +	 */
+ +	error = xfs_trans_roll_inode(&args->trans, dp);
+ +	if (error)
+ +		goto out;
+ +
+ +	/*
+ +	 * If there was an out-of-line value, allocate the blocks we
+ +	 * identified for its storage and copy the value.  This is done
+ +	 * after we create the attribute so that we don't overflow the
+ +	 * maximum size of a transaction and/or hit a deadlock.
+ +	 */
+ +	if (args->rmtblkno > 0) {
+ +		error = xfs_attr_rmtval_set(args);
+ +		if (error)
+ +			return error;
+ +	}
+ +
+ +	if (!(args->op_flags & XFS_DA_OP_RENAME)) {
+  		/*
+ -		 * Dismantle the "old" attribute/value pair by removing a
+ -		 * "remote" value (if it exists).
+ +		 * Added a "remote" value, just clear the incomplete flag.
+  		 */
+ -		xfs_attr_restore_rmt_blk(args);
+ +		if (args->rmtblkno > 0)
+ +			error = xfs_attr3_leaf_clearflag(args);
+ +		goto out;
+ +	}
+  
+ +	/*
+ +	 * If this is an atomic rename operation, we must "flip" the incomplete
+ +	 * flags on the "new" and "old" attribute/value pairs so that one
+ +	 * disappears and one appears atomically.  Then we must remove the "old"
+ +	 * attribute/value pair.
+ +	 *
+ +	 * In a separate transaction, set the incomplete flag on the "old" attr
+ +	 * and clear the incomplete flag on the "new" attr.
+ +	 */
+ +	error = xfs_attr3_leaf_flipflags(args);
+ +	if (error)
+ +		goto out;
+ +	/*
+ +	 * Commit the flag value change and start the next trans in series
+ +	 */
+ +	error = xfs_trans_roll_inode(&args->trans, args->dp);
+ +	if (error)
+ +		goto out;
+ +
+ +	/*
+ +	 * Dismantle the "old" attribute/value pair by removing a "remote" value
+ +	 * (if it exists).
+ +	 */
+ +	xfs_attr_restore_rmt_blk(args);
+ +
+ +	if (args->rmtblkno) {
+  		error = xfs_attr_rmtval_invalidate(args);
+  		if (error)
+  			return error;
+  
+++<<<<<<< HEAD
+ +		error = xfs_attr_rmtval_remove(args);
+ +		if (error)
+ +			return error;
+++=======
++ 		fallthrough;
++ 	case XFS_DAS_RM_NBLK:
++ 		/* Set state in case xfs_attr_rmtval_remove returns -EAGAIN */
++ 		dac->dela_state = XFS_DAS_RM_NBLK;
++ 		if (args->rmtblkno) {
++ 			error = __xfs_attr_rmtval_remove(dac);
++ 			if (error)
++ 				return error;
++ 
++ 			dac->dela_state = XFS_DAS_CLR_FLAG;
++ 			return -EAGAIN;
++ 		}
++ 
++ 		fallthrough;
++ 	case XFS_DAS_CLR_FLAG:
++ 		/*
++ 		 * The last state for node format. Look up the old attr and
++ 		 * remove it.
++ 		 */
++ 		error = xfs_attr_node_addname_clear_incomplete(dac);
++ 		break;
++ 	default:
++ 		ASSERT(0);
++ 		break;
+++>>>>>>> 5937e00017f1 (xfs: Fix multiple fall-through warnings for Clang)
+  	}
+ +
+ +	error = xfs_attr_node_addname_clear_incomplete(args);
+  out:
+  	return error;
+  }
+@@@ -1258,54 -1380,111 +1342,160 @@@ xfs_attr_node_removename
+  
+  	trace_xfs_attr_node_removename(args);
+  
+++<<<<<<< HEAD
+ +	error = xfs_attr_node_removename_setup(args, &state);
+ +	if (error)
+++=======
++ 	switch (dac->dela_state) {
++ 	case XFS_DAS_UNINIT:
++ 		if (!xfs_inode_hasattr(dp))
++ 			return -ENOATTR;
++ 
++ 		/*
++ 		 * Shortform or leaf formats don't require transaction rolls and
++ 		 * thus state transitions. Call the right helper and return.
++ 		 */
++ 		if (dp->i_afp->if_format == XFS_DINODE_FMT_LOCAL)
++ 			return xfs_attr_sf_removename(args);
++ 
++ 		if (xfs_attr_is_leaf(dp))
++ 			return xfs_attr_leaf_removename(args);
++ 
++ 		/*
++ 		 * Node format may require transaction rolls. Set up the
++ 		 * state context and fall into the state machine.
++ 		 */
++ 		if (!dac->da_state) {
++ 			error = xfs_attr_node_removename_setup(dac);
++ 			if (error)
++ 				return error;
++ 			state = dac->da_state;
++ 		}
++ 
++ 		fallthrough;
++ 	case XFS_DAS_RMTBLK:
++ 		dac->dela_state = XFS_DAS_RMTBLK;
++ 
++ 		/*
++ 		 * If there is an out-of-line value, de-allocate the blocks.
++ 		 * This is done before we remove the attribute so that we don't
++ 		 * overflow the maximum size of a transaction and/or hit a
++ 		 * deadlock.
++ 		 */
++ 		if (args->rmtblkno > 0) {
++ 			/*
++ 			 * May return -EAGAIN. Roll and repeat until all remote
++ 			 * blocks are removed.
++ 			 */
++ 			error = __xfs_attr_rmtval_remove(dac);
++ 			if (error == -EAGAIN)
++ 				return error;
++ 			else if (error)
++ 				goto out;
++ 
++ 			/*
++ 			 * Refill the state structure with buffers (the prior
++ 			 * calls released our buffers) and close out this
++ 			 * transaction before proceeding.
++ 			 */
++ 			ASSERT(args->rmtblkno == 0);
++ 			error = xfs_attr_refillstate(state);
++ 			if (error)
++ 				goto out;
++ 			dac->dela_state = XFS_DAS_RM_NAME;
++ 			dac->flags |= XFS_DAC_DEFER_FINISH;
++ 			return -EAGAIN;
++ 		}
++ 
++ 		fallthrough;
++ 	case XFS_DAS_RM_NAME:
++ 		/*
++ 		 * If we came here fresh from a transaction roll, reattach all
++ 		 * the buffers to the current transaction.
++ 		 */
++ 		if (dac->dela_state == XFS_DAS_RM_NAME) {
++ 			error = xfs_attr_refillstate(state);
++ 			if (error)
++ 				goto out;
++ 		}
++ 
++ 		retval = xfs_attr_node_removename(args, state);
++ 
++ 		/*
++ 		 * Check to see if the tree needs to be collapsed. If so, roll
++ 		 * the transacton and fall into the shrink state.
++ 		 */
++ 		if (retval && (state->path.active > 1)) {
++ 			error = xfs_da3_join(state);
++ 			if (error)
++ 				goto out;
++ 
++ 			dac->flags |= XFS_DAC_DEFER_FINISH;
++ 			dac->dela_state = XFS_DAS_RM_SHRINK;
++ 			return -EAGAIN;
++ 		}
++ 
++ 		fallthrough;
++ 	case XFS_DAS_RM_SHRINK:
++ 		/*
++ 		 * If the result is small enough, push it all into the inode.
++ 		 * This is our final state so it's safe to return a dirty
++ 		 * transaction.
++ 		 */
++ 		if (xfs_attr_is_leaf(dp))
++ 			error = xfs_attr_node_shrink(args, state);
++ 		ASSERT(error != -EAGAIN);
++ 		break;
++ 	default:
++ 		ASSERT(0);
++ 		error = -EINVAL;
+++>>>>>>> 5937e00017f1 (xfs: Fix multiple fall-through warnings for Clang)
+  		goto out;
+ +
+ +	/*
+ +	 * If there is an out-of-line value, de-allocate the blocks.
+ +	 * This is done before we remove the attribute so that we don't
+ +	 * overflow the maximum size of a transaction and/or hit a deadlock.
+ +	 */
+ +	if (args->rmtblkno > 0) {
+ +		error = xfs_attr_rmtval_remove(args);
+ +		if (error)
+ +			goto out;
+ +
+ +		/*
+ +		 * Refill the state structure with buffers, the prior calls
+ +		 * released our buffers.
+ +		 */
+ +		error = xfs_attr_refillstate(state);
+ +		if (error)
+ +			goto out;
+ +	}
+ +	retval = xfs_attr_node_remove_name(args, state);
+ +
+ +	/*
+ +	 * Check to see if the tree needs to be collapsed.
+ +	 */
+ +	if (retval && (state->path.active > 1)) {
+ +		error = xfs_da3_join(state);
+ +		if (error)
+ +			goto out;
+ +		error = xfs_defer_finish(&args->trans);
+ +		if (error)
+ +			goto out;
+ +		/*
+ +		 * Commit the Btree join operation and start a new trans.
+ +		 */
+ +		error = xfs_trans_roll_inode(&args->trans, dp);
+ +		if (error)
+ +			goto out;
+  	}
+ +
+ +	/*
+ +	 * If the result is small enough, push it all into the inode.
+ +	 */
+ +	if (xfs_attr_is_leaf(dp))
+ +		error = xfs_attr_node_shrink(args, state);
+ +
+  out:
+  	if (state)
+  		xfs_da_state_free(state);
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
