@@ -1,0 +1,92 @@
+dm integrity: fix integrity recalculation that is improperly skipped
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 5df96f2b9f58a5d2dc1f30fe7de75e197f2c25f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5df96f2b.failed
+
+Commit adc0daad366b62ca1bce3e2958a40b0b71a8b8b3 ("dm: report suspended
+device during destroy") broke integrity recalculation.
+
+The problem is dm_suspended() returns true not only during suspend,
+but also during resume. So this race condition could occur:
+1. dm_integrity_resume calls queue_work(ic->recalc_wq, &ic->recalc_work)
+2. integrity_recalc (&ic->recalc_work) preempts the current thread
+3. integrity_recalc calls if (unlikely(dm_suspended(ic->ti))) goto unlock_ret;
+4. integrity_recalc exits and no recalculating is done.
+
+To fix this race condition, add a function dm_post_suspending that is
+only true during the postsuspend phase and use it instead of
+dm_suspended().
+
+	Signed-off-by: Mikulas Patocka <mpatocka redhat com>
+Fixes: adc0daad366b ("dm: report suspended device during destroy")
+	Cc: stable vger kernel org # v4.18+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 5df96f2b9f58a5d2dc1f30fe7de75e197f2c25f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm-integrity.c
+#	drivers/md/dm.c
+diff --cc drivers/md/dm-integrity.c
+index abaee5bd45d6,a83a1de1e03f..000000000000
+--- a/drivers/md/dm-integrity.c
++++ b/drivers/md/dm-integrity.c
+@@@ -2087,7 -2420,7 +2087,11 @@@ static void integrity_writer(struct wor
+  	unsigned prev_free_sectors;
+  
+  	/* the following test is not needed, but it tests the replay code */
+++<<<<<<< HEAD
+ +	if (READ_ONCE(ic->suspending) && !ic->meta_dev)
+++=======
++ 	if (unlikely(dm_post_suspending(ic->ti)) && !ic->meta_dev)
+++>>>>>>> 5df96f2b9f58 (dm integrity: fix integrity recalculation that is improperly skipped)
+  		return;
+  
+  	spin_lock_irq(&ic->endio_wait.lock);
+@@@ -2146,7 -2481,7 +2150,11 @@@ static void integrity_recalc(struct wor
+  
+  next_chunk:
+  
+++<<<<<<< HEAD
+ +	if (unlikely(READ_ONCE(ic->suspending)))
+++=======
++ 	if (unlikely(dm_post_suspending(ic->ti)))
+++>>>>>>> 5df96f2b9f58 (dm integrity: fix integrity recalculation that is improperly skipped)
+  		goto unlock_ret;
+  
+  	range.logical_sector = le64_to_cpu(ic->sb->recalc_sector);
+diff --cc drivers/md/dm.c
+index 8f84274dd6d8,5b9de2f71bb0..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -2398,6 -2408,8 +2399,11 @@@ static void __dm_destroy(struct mapped_
+  	map = dm_get_live_table(md, &srcu_idx);
+  	if (!dm_suspended_md(md)) {
+  		dm_table_presuspend_targets(map);
+++<<<<<<< HEAD
+++=======
++ 		set_bit(DMF_SUSPENDED, &md->flags);
++ 		set_bit(DMF_POST_SUSPENDING, &md->flags);
+++>>>>>>> 5df96f2b9f58 (dm integrity: fix integrity recalculation that is improperly skipped)
+  		dm_table_postsuspend_targets(map);
+  	}
+  	/* dm_put_live_table must be before msleep, otherwise deadlock is possible */
+* Unmerged path drivers/md/dm-integrity.c
+* Unmerged path drivers/md/dm.c
+diff --git a/include/linux/device-mapper.h b/include/linux/device-mapper.h
+index c37a9f4ad967..6315b6949309 100644
+--- a/include/linux/device-mapper.h
++++ b/include/linux/device-mapper.h
+@@ -426,6 +426,7 @@ const char *dm_device_name(struct mapped_device *md);
+ int dm_copy_name_and_uuid(struct mapped_device *md, char *name, char *uuid);
+ struct gendisk *dm_disk(struct mapped_device *md);
+ int dm_suspended(struct dm_target *ti);
++int dm_post_suspending(struct dm_target *ti);
+ int dm_noflush_suspending(struct dm_target *ti);
+ void dm_accept_partial_bio(struct bio *bio, unsigned n_sectors);
+ void dm_remap_zone_report(struct dm_target *ti, sector_t start,
