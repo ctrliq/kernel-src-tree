@@ -1,0 +1,131 @@
+KVM: SVM: ensure that EFER.SVME is set when running nested guest or on nested vmexit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-310.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 3c346c0c60ab06a021d1c0884a0ef494bc4ee3a7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-310.el8/3c346c0c.failed
+
+Fixing nested_vmcb_check_save to avoid all TOC/TOU races
+is a bit harder in released kernels, so do the bare minimum
+by avoiding that EFER.SVME is cleared.  This is problematic
+because svm_set_efer frees the data structures for nested
+virtualization if EFER.SVME is cleared.
+
+Also check that EFER.SVME remains set after a nested vmexit;
+clearing it could happen if the bit is zero in the save area
+that is passed to KVM_SET_NESTED_STATE (the save area of the
+nested state corresponds to the nested hypervisor's state
+and is restored on the next nested vmexit).
+
+	Cc: stable@vger.kernel.org
+Fixes: 2fcf4876ada ("KVM: nSVM: implement on demand allocation of the nested state")
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 3c346c0c60ab06a021d1c0884a0ef494bc4ee3a7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/nested.c
+diff --cc arch/x86/kvm/svm/nested.c
+index 2e68b35e628c,c9e7b86350d6..000000000000
+--- a/arch/x86/kvm/svm/nested.c
++++ b/arch/x86/kvm/svm/nested.c
+@@@ -278,7 -227,41 +278,45 @@@ static bool nested_vmcb_valid_sregs(str
+  
+  static bool nested_vmcb_check_save(struct vcpu_svm *svm, struct vmcb *vmcb12)
+  {
+++<<<<<<< HEAD
+ +	if (!nested_vmcb_valid_sregs(svm, &vmcb12->save))
+++=======
++ 	bool vmcb12_lma;
++ 
++ 	/*
++ 	 * FIXME: these should be done after copying the fields,
++ 	 * to avoid TOC/TOU races.  For these save area checks
++ 	 * the possible damage is limited since kvm_set_cr0 and
++ 	 * kvm_set_cr4 handle failure; EFER_SVME is an exception
++ 	 * so it is force-set later in nested_prepare_vmcb_save.
++ 	 */
++ 	if ((vmcb12->save.efer & EFER_SVME) == 0)
++ 		return false;
++ 
++ 	if (((vmcb12->save.cr0 & X86_CR0_CD) == 0) && (vmcb12->save.cr0 & X86_CR0_NW))
++ 		return false;
++ 
++ 	if (!kvm_dr6_valid(vmcb12->save.dr6) || !kvm_dr7_valid(vmcb12->save.dr7))
++ 		return false;
++ 
++ 	vmcb12_lma = (vmcb12->save.efer & EFER_LME) && (vmcb12->save.cr0 & X86_CR0_PG);
++ 
++ 	if (!vmcb12_lma) {
++ 		if (vmcb12->save.cr4 & X86_CR4_PAE) {
++ 			if (vmcb12->save.cr3 & MSR_CR3_LEGACY_PAE_RESERVED_MASK)
++ 				return false;
++ 		} else {
++ 			if (vmcb12->save.cr3 & MSR_CR3_LEGACY_RESERVED_MASK)
++ 				return false;
++ 		}
++ 	} else {
++ 		if (!(vmcb12->save.cr4 & X86_CR4_PAE) ||
++ 		    !(vmcb12->save.cr0 & X86_CR0_PE) ||
++ 		    (vmcb12->save.cr3 & MSR_CR3_LONG_MBZ_MASK))
++ 			return false;
++ 	}
++ 	if (kvm_valid_cr4(&svm->vcpu, vmcb12->save.cr4))
+++>>>>>>> 3c346c0c60ab (KVM: SVM: ensure that EFER.SVME is set when running nested guest or on nested vmexit)
+  		return false;
+  
+  	return true;
+@@@ -403,19 -386,20 +441,31 @@@ static void nested_prepare_vmcb_save(st
+  	svm->vmcb->save.cs = vmcb12->save.cs;
+  	svm->vmcb->save.ss = vmcb12->save.ss;
+  	svm->vmcb->save.ds = vmcb12->save.ds;
+ +	svm->vmcb->save.cpl = vmcb12->save.cpl;
+ +	vmcb_mark_dirty(svm->vmcb, VMCB_SEG);
+ +
+  	svm->vmcb->save.gdtr = vmcb12->save.gdtr;
+  	svm->vmcb->save.idtr = vmcb12->save.idtr;
+++<<<<<<< HEAD
+ +	vmcb_mark_dirty(svm->vmcb, VMCB_DT);
+ +
+ +	kvm_set_rflags(&svm->vcpu, vmcb12->save.rflags | X86_EFLAGS_FIXED);
+ +	svm_set_efer(&svm->vcpu, vmcb12->save.efer);
+++=======
++ 	kvm_set_rflags(&svm->vcpu, vmcb12->save.rflags);
++ 
++ 	/*
++ 	 * Force-set EFER_SVME even though it is checked earlier on the
++ 	 * VMCB12, because the guest can flip the bit between the check
++ 	 * and now.  Clearing EFER_SVME would call svm_free_nested.
++ 	 */
++ 	svm_set_efer(&svm->vcpu, vmcb12->save.efer | EFER_SVME);
++ 
+++>>>>>>> 3c346c0c60ab (KVM: SVM: ensure that EFER.SVME is set when running nested guest or on nested vmexit)
+  	svm_set_cr0(&svm->vcpu, vmcb12->save.cr0);
+  	svm_set_cr4(&svm->vcpu, vmcb12->save.cr4);
+ -	svm->vmcb->save.cr2 = svm->vcpu.arch.cr2 = vmcb12->save.cr2;
+ +
+ +	svm->vcpu.arch.cr2 = vmcb12->save.cr2;
+  	kvm_rax_write(&svm->vcpu, vmcb12->save.rax);
+  	kvm_rsp_write(&svm->vcpu, vmcb12->save.rsp);
+  	kvm_rip_write(&svm->vcpu, vmcb12->save.rip);
+@@@ -1223,12 -1198,12 +1273,14 @@@ static int svm_set_nested_state(struct 
+  	/*
+  	 * Validate host state saved from before VMRUN (see
+  	 * nested_svm_check_permissions).
+ -	 * TODO: validate reserved bits for all saved state.
+  	 */
+ -	if (!(save->cr0 & X86_CR0_PG))
+ +	if (!(save->cr0 & X86_CR0_PG) ||
+ +	    !(save->cr0 & X86_CR0_PE) ||
+ +	    (save->rflags & X86_EFLAGS_VM) ||
+ +	    !nested_vmcb_valid_sregs(svm, save))
+  		goto out_free;
++ 	if (!(save->efer & EFER_SVME))
++ 		goto out_free;
+  
+  	/*
+  	 * All checks done, we can enter guest mode.  L1 control fields
+* Unmerged path arch/x86/kvm/svm/nested.c
