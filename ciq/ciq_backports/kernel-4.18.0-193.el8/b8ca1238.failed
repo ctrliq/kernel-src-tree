@@ -1,0 +1,153 @@
+RDMA/mlx5: Cleanup rep when doing unload
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Bodong Wang <bodong@mellanox.com>
+commit b8ca123860ee556a8d42ab8c5c2afa469817a813
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b8ca1238.failed
+
+When an IB rep is loaded, netdev for the same vport is saved for later
+reference. However, it's not cleaned up when doing unload. For ECPF,
+kernel crashes when driver is referring to the already removed netdev.
+
+Following steps lead to a shown call trace:
+1. Create n VFs from host PF
+2. Distroy the VFs
+3. Run "rdma link" from ARM
+
+Call trace:
+  mlx5_ib_get_netdev+0x9c/0xe8 [mlx5_ib]
+  mlx5_query_port_roce+0x268/0x558 [mlx5_ib]
+  mlx5_ib_rep_query_port+0x14/0x34 [mlx5_ib]
+  ib_query_port+0x9c/0xfc [ib_core]
+  fill_port_info+0x74/0x28c [ib_core]
+  nldev_port_get_doit+0x1a8/0x1e8 [ib_core]
+  rdma_nl_rcv_msg+0x16c/0x1c0 [ib_core]
+  rdma_nl_rcv+0xe8/0x144 [ib_core]
+  netlink_unicast+0x184/0x214
+  netlink_sendmsg+0x288/0x354
+  sock_sendmsg+0x18/0x2c
+  __sys_sendto+0xbc/0x138
+  __arm64_sys_sendto+0x28/0x34
+  el0_svc_common+0xb0/0x100
+  el0_svc_handler+0x6c/0x84
+  el0_svc+0x8/0xc
+
+Cleanup the rep and netdev reference when unloading IB rep.
+
+Fixes: 26628e2d58c9 ("RDMA/mlx5: Move to single device multiport ports in switchdev mode")
+	Signed-off-by: Bodong Wang <bodong@mellanox.com>
+	Reviewed-by: Mark Bloch <markb@mellanox.com>
+	Reviewed-by: Parav Pandit <parav@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit b8ca123860ee556a8d42ab8c5c2afa469817a813)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/mlx5/ib_rep.c
+diff --cc drivers/infiniband/hw/mlx5/ib_rep.c
+index 95ac97af6166,3065c5d0ee96..000000000000
+--- a/drivers/infiniband/hw/mlx5/ib_rep.c
++++ b/drivers/infiniband/hw/mlx5/ib_rep.c
+@@@ -6,53 -6,23 +6,67 @@@
+  #include "ib_rep.h"
+  #include "srq.h"
+  
+ +static const struct mlx5_ib_profile rep_profile = {
+ +	STAGE_CREATE(MLX5_IB_STAGE_INIT,
+ +		     mlx5_ib_stage_init_init,
+ +		     mlx5_ib_stage_init_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_FLOW_DB,
+ +		     mlx5_ib_stage_rep_flow_db_init,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_CAPS,
+ +		     mlx5_ib_stage_caps_init,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_NON_DEFAULT_CB,
+ +		     mlx5_ib_stage_rep_non_default_cb,
+ +		     NULL),
+ +	STAGE_CREATE(MLX5_IB_STAGE_ROCE,
+ +		     mlx5_ib_stage_rep_roce_init,
+ +		     mlx5_ib_stage_rep_roce_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_SRQ,
+ +		     mlx5_init_srq_table,
+ +		     mlx5_cleanup_srq_table),
+ +	STAGE_CREATE(MLX5_IB_STAGE_DEVICE_RESOURCES,
+ +		     mlx5_ib_stage_dev_res_init,
+ +		     mlx5_ib_stage_dev_res_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_COUNTERS,
+ +		     mlx5_ib_stage_counters_init,
+ +		     mlx5_ib_stage_counters_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_BFREG,
+ +		     mlx5_ib_stage_bfrag_init,
+ +		     mlx5_ib_stage_bfrag_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_PRE_IB_REG_UMR,
+ +		     NULL,
+ +		     mlx5_ib_stage_pre_ib_reg_umr_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_IB_REG,
+ +		     mlx5_ib_stage_ib_reg_init,
+ +		     mlx5_ib_stage_ib_reg_cleanup),
+ +	STAGE_CREATE(MLX5_IB_STAGE_POST_IB_REG_UMR,
+ +		     mlx5_ib_stage_post_ib_reg_umr_init,
+ +		     NULL),
+ +};
+ +
+  static int
+ -mlx5_ib_set_vport_rep(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+ +mlx5_ib_nic_rep_load(struct mlx5_core_dev *dev, struct mlx5_eswitch_rep *rep)
+  {
+  	struct mlx5_ib_dev *ibdev;
+++<<<<<<< HEAD
+++=======
++ 	int vport_index;
++ 
++ 	ibdev = mlx5_ib_get_uplink_ibdev(dev->priv.eswitch);
++ 	vport_index = rep->vport_index;
++ 
++ 	ibdev->port[vport_index].rep = rep;
++ 	rep->rep_data[REP_IB].priv = ibdev;
++ 	write_lock(&ibdev->port[vport_index].roce.netdev_lock);
++ 	ibdev->port[vport_index].roce.netdev =
++ 		mlx5_ib_get_rep_netdev(dev->priv.eswitch, rep->vport);
++ 	write_unlock(&ibdev->port[vport_index].roce.netdev_lock);
+++>>>>>>> b8ca123860ee (RDMA/mlx5: Cleanup rep when doing unload)
+  
+ +	ibdev = mlx5_ib_rep_to_dev(rep);
+ +	if (!__mlx5_ib_add(ibdev, ibdev->profile))
+ +		return -EINVAL;
+  	return 0;
+  }
+  
+@@@ -91,15 -69,18 +105,28 @@@ mlx5_ib_vport_rep_load(struct mlx5_core
+  static void
+  mlx5_ib_vport_rep_unload(struct mlx5_eswitch_rep *rep)
+  {
+- 	struct mlx5_ib_dev *dev;
++ 	struct mlx5_ib_dev *dev = mlx5_ib_rep_to_dev(rep);
++ 	struct mlx5_ib_port *port;
+  
+++<<<<<<< HEAD
+ +	if (!rep->rep_if[REP_IB].priv)
+ +		return;
+ +
+ +	dev = mlx5_ib_rep_to_dev(rep);
+ +	__mlx5_ib_remove(dev, dev->profile, MLX5_IB_STAGE_MAX);
+ +	rep->rep_if[REP_IB].priv = NULL;
+ +	ib_dealloc_device(&dev->ib_dev);
+++=======
++ 	port = &dev->port[rep->vport_index];
++ 	write_lock(&port->roce.netdev_lock);
++ 	port->roce.netdev = NULL;
++ 	write_unlock(&port->roce.netdev_lock);
++ 	rep->rep_data[REP_IB].priv = NULL;
++ 	port->rep = NULL;
++ 
++ 	if (rep->vport == MLX5_VPORT_UPLINK)
++ 		__mlx5_ib_remove(dev, dev->profile, MLX5_IB_STAGE_MAX);
+++>>>>>>> b8ca123860ee (RDMA/mlx5: Cleanup rep when doing unload)
+  }
+  
+  static void *mlx5_ib_vport_get_proto_dev(struct mlx5_eswitch_rep *rep)
+* Unmerged path drivers/infiniband/hw/mlx5/ib_rep.c
