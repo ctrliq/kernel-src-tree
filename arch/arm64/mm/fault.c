@@ -62,7 +62,7 @@ static struct fault_info debug_fault_info[];
 
 static inline const struct fault_info *esr_to_fault_info(unsigned int esr)
 {
-	return fault_info + (esr & 63);
+	return fault_info + (esr & ESR_ELx_FSC);
 }
 
 static inline const struct fault_info *esr_to_debug_fault_info(unsigned int esr)
