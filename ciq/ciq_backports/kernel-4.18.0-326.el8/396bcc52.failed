@@ -1,0 +1,324 @@
+mm: remove CONFIG_TRANSPARENT_HUGE_PAGECACHE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Matthew Wilcox (Oracle) <willy@infradead.org>
+commit 396bcc5299c281e9cf1737ad0efcd97be9f83845
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/396bcc52.failed
+
+Commit e496cf3d7821 ("thp: introduce CONFIG_TRANSPARENT_HUGE_PAGECACHE")
+notes that it should be reverted when the PowerPC problem was fixed.  The
+commit fixing the PowerPC problem (953c66c2b22a) did not revert the
+commit; instead setting CONFIG_TRANSPARENT_HUGE_PAGECACHE to the same as
+CONFIG_TRANSPARENT_HUGEPAGE.  Checking with Kirill and Aneesh, this was an
+oversight, so remove the Kconfig symbol and undo the work of commit
+e496cf3d7821.
+
+	Signed-off-by: Matthew Wilcox (Oracle) <willy@infradead.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Aneesh Kumar K.V <aneesh.kumar@linux.vnet.ibm.com>
+	Cc: Christoph Hellwig <hch@lst.de>
+	Cc: Pankaj Gupta <pankaj.gupta.linux@gmail.com>
+Link: http://lkml.kernel.org/r/20200318140253.6141-6-willy@infradead.org
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 396bcc5299c281e9cf1737ad0efcd97be9f83845)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/memory.c
+diff --cc mm/memory.c
+index 2d81ca6d26e3,d527e0ec29c7..000000000000
+--- a/mm/memory.c
++++ b/mm/memory.c
+@@@ -3375,8 -3475,10 +3375,15 @@@ vm_fault_t alloc_set_pte(struct vm_faul
+  	pte_t entry;
+  	vm_fault_t ret;
+  
+++<<<<<<< HEAD
+ +	if (pmd_none(*vmf->pmd) && PageTransCompound(page) &&
+ +			IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE)) {
+++=======
++ 	if (pmd_none(*vmf->pmd) && PageTransCompound(page)) {
++ 		/* THP on COW? */
++ 		VM_BUG_ON_PAGE(memcg, page);
++ 
+++>>>>>>> 396bcc5299c2 (mm: remove CONFIG_TRANSPARENT_HUGE_PAGECACHE)
+  		ret = do_set_pmd(vmf, page);
+  		if (ret != VM_FAULT_FALLBACK)
+  			return ret;
+diff --git a/include/linux/shmem_fs.h b/include/linux/shmem_fs.h
+index d56fefef8905..7a35a6901221 100644
+--- a/include/linux/shmem_fs.h
++++ b/include/linux/shmem_fs.h
+@@ -78,6 +78,7 @@ extern void shmem_truncate_range(struct inode *inode, loff_t start, loff_t end);
+ extern int shmem_unuse(unsigned int type, bool frontswap,
+ 		       unsigned long *fs_pages_to_unuse);
+ 
++extern bool shmem_huge_enabled(struct vm_area_struct *vma);
+ extern unsigned long shmem_swap_usage(struct vm_area_struct *vma);
+ extern unsigned long shmem_partial_swap_usage(struct address_space *mapping,
+ 						pgoff_t start, pgoff_t end);
+@@ -114,15 +115,6 @@ static inline bool shmem_file(struct file *file)
+ extern bool shmem_charge(struct inode *inode, long pages);
+ extern void shmem_uncharge(struct inode *inode, long pages);
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
+-extern bool shmem_huge_enabled(struct vm_area_struct *vma);
+-#else
+-static inline bool shmem_huge_enabled(struct vm_area_struct *vma)
+-{
+-	return false;
+-}
+-#endif
+-
+ #ifdef CONFIG_SHMEM
+ extern int shmem_mcopy_atomic_pte(struct mm_struct *dst_mm, pmd_t *dst_pmd,
+ 				  struct vm_area_struct *dst_vma,
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 45be9c472848..6dc378e580b4 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -431,10 +431,6 @@ config THP_SWAP
+ 
+ 	  For selection by architectures with reasonable THP sizes.
+ 
+-config	TRANSPARENT_HUGE_PAGECACHE
+-	def_bool y
+-	depends on TRANSPARENT_HUGEPAGE
+-
+ #
+ # UP and nommu archs use km based percpu allocator
+ #
+@@ -755,7 +751,7 @@ config GUP_GET_PTE_LOW_HIGH
+ 
+ config READ_ONLY_THP_FOR_FS
+ 	bool "Read-only THP for filesystems (EXPERIMENTAL)"
+-	depends on TRANSPARENT_HUGE_PAGECACHE && SHMEM
++	depends on TRANSPARENT_HUGEPAGE && SHMEM
+ 
+ 	help
+ 	  Allow khugepaged to put read-only file-backed pages in THP.
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 97e3c030e205..c5ae19982fac 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -328,7 +328,7 @@ static struct attribute *hugepage_attr[] = {
+ 	&defrag_attr.attr,
+ 	&use_zero_page_attr.attr,
+ 	&hpage_pmd_size_attr.attr,
+-#if defined(CONFIG_SHMEM) && defined(CONFIG_TRANSPARENT_HUGE_PAGECACHE)
++#ifdef CONFIG_SHMEM
+ 	&shmem_enabled_attr.attr,
+ #endif
+ #ifdef CONFIG_DEBUG_VM
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index 4a149596ca6a..1fa9797d8b36 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -416,8 +416,6 @@ static bool hugepage_vma_check(struct vm_area_struct *vma,
+ 	    (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS) &&
+ 	     vma->vm_file &&
+ 	     (vm_flags & VM_DENYWRITE))) {
+-		if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
+-			return false;
+ 		return IS_ALIGNED((vma->vm_start >> PAGE_SHIFT) - vma->vm_pgoff,
+ 				HPAGE_PMD_NR);
+ 	}
+@@ -1326,7 +1324,7 @@ static void collect_mm_slot(struct mm_slot *mm_slot)
+ 	}
+ }
+ 
+-#if defined(CONFIG_SHMEM) && defined(CONFIG_TRANSPARENT_HUGE_PAGECACHE)
++#ifdef CONFIG_SHMEM
+ /*
+  * Notify khugepaged that given addr of the mm is pte-mapped THP. Then
+  * khugepaged should try to collapse the page table.
+@@ -2017,6 +2015,8 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
+ 		if (khugepaged_scan.address < hstart)
+ 			khugepaged_scan.address = hstart;
+ 		VM_BUG_ON(khugepaged_scan.address & ~HPAGE_PMD_MASK);
++		if (shmem_file(vma->vm_file) && !shmem_huge_enabled(vma))
++			goto skip;
+ 
+ 		while (khugepaged_scan.address < hend) {
+ 			int ret;
+@@ -2028,14 +2028,10 @@ static unsigned int khugepaged_scan_mm_slot(unsigned int pages,
+ 				  khugepaged_scan.address + HPAGE_PMD_SIZE >
+ 				  hend);
+ 			if (IS_ENABLED(CONFIG_SHMEM) && vma->vm_file) {
+-				struct file *file;
++				struct file *file = get_file(vma->vm_file);
+ 				pgoff_t pgoff = linear_page_index(vma,
+ 						khugepaged_scan.address);
+ 
+-				if (shmem_file(vma->vm_file)
+-				    && !shmem_huge_enabled(vma))
+-					goto skip;
+-				file = get_file(vma->vm_file);
+ 				up_read(&mm->mmap_sem);
+ 				ret = 1;
+ 				khugepaged_scan_file(mm, file, pgoff, hpage);
+* Unmerged path mm/memory.c
+diff --git a/mm/rmap.c b/mm/rmap.c
+index 1eaf0612b38c..7734ea7b9a93 100644
+--- a/mm/rmap.c
++++ b/mm/rmap.c
+@@ -932,7 +932,7 @@ static bool page_mkclean_one(struct page *page, struct vm_area_struct *vma,
+ 			set_pte_at(vma->vm_mm, address, pte, entry);
+ 			ret = 1;
+ 		} else {
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 			pmd_t *pmd = pvmw.pmd;
+ 			pmd_t entry;
+ 
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 874ca1383013..976cca24bd81 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -409,7 +409,7 @@ static bool shmem_confirm_swap(struct address_space *mapping,
+ #define SHMEM_HUGE_DENY		(-1)
+ #define SHMEM_HUGE_FORCE	(-2)
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ /* ifdef here to avoid bloating shmem.o when not necessary */
+ 
+ static int shmem_huge __read_mostly;
+@@ -577,7 +577,7 @@ static long shmem_unused_huge_count(struct super_block *sb,
+ 	struct shmem_sb_info *sbinfo = SHMEM_SB(sb);
+ 	return READ_ONCE(sbinfo->shrinklist_len);
+ }
+-#else /* !CONFIG_TRANSPARENT_HUGE_PAGECACHE */
++#else /* !CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ #define shmem_huge SHMEM_HUGE_DENY
+ 
+@@ -586,11 +586,11 @@ static unsigned long shmem_unused_huge_shrink(struct shmem_sb_info *sbinfo,
+ {
+ 	return 0;
+ }
+-#endif /* CONFIG_TRANSPARENT_HUGE_PAGECACHE */
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ static inline bool is_huge_enabled(struct shmem_sb_info *sbinfo)
+ {
+-	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
++	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+ 	    (shmem_huge == SHMEM_HUGE_FORCE || sbinfo->huge) &&
+ 	    shmem_huge != SHMEM_HUGE_DENY)
+ 		return true;
+@@ -1075,7 +1075,7 @@ static int shmem_setattr(struct dentry *dentry, struct iattr *attr)
+ 			 * Part of the huge page can be beyond i_size: subject
+ 			 * to shrink under memory pressure.
+ 			 */
+-			if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE)) {
++			if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE)) {
+ 				spin_lock(&sbinfo->shrinklist_lock);
+ 				/*
+ 				 * _careful to defend against unlocked access to
+@@ -1528,7 +1528,7 @@ static struct page *shmem_alloc_and_acct_page(gfp_t gfp,
+ 	int nr;
+ 	int err = -ENOSPC;
+ 
+-	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
++	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+ 		huge = false;
+ 	nr = huge ? HPAGE_PMD_NR : 1;
+ 
+@@ -2077,7 +2077,7 @@ unsigned long shmem_get_unmapped_area(struct file *file,
+ 	get_area = current->mm->get_unmapped_area;
+ 	addr = get_area(file, uaddr, len, pgoff, flags);
+ 
+-	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE))
++	if (!IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE))
+ 		return addr;
+ 	if (IS_ERR_VALUE(addr))
+ 		return addr;
+@@ -2194,7 +2194,7 @@ static int shmem_mmap(struct file *file, struct vm_area_struct *vma)
+ {
+ 	file_accessed(file);
+ 	vma->vm_ops = &shmem_vm_ops;
+-	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
++	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+ 			((vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK) <
+ 			(vma->vm_end & HPAGE_PMD_MASK)) {
+ 		khugepaged_enter(vma, vma->vm_flags);
+@@ -3415,7 +3415,7 @@ static int shmem_parse_one(struct fs_context *fc, struct fs_parameter *param)
+ 	case Opt_huge:
+ 		ctx->huge = result.uint_32;
+ 		if (ctx->huge != SHMEM_HUGE_NEVER &&
+-		    !(IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
++		    !(IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+ 		      has_transparent_hugepage()))
+ 			goto unsupported_parameter;
+ 		ctx->seen |= SHMEM_SEEN_HUGE;
+@@ -3561,7 +3561,7 @@ static int shmem_show_options(struct seq_file *seq, struct dentry *root)
+ 	if (!gid_eq(sbinfo->gid, GLOBAL_ROOT_GID))
+ 		seq_printf(seq, ",gid=%u",
+ 				from_kgid_munged(&init_user_ns, sbinfo->gid));
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	/* Rightly or wrongly, show huge mount option unmasked by shmem_huge */
+ 	if (sbinfo->huge)
+ 		seq_printf(seq, ",huge=%s", shmem_format_huge(sbinfo->huge));
+@@ -3807,7 +3807,7 @@ static const struct super_operations shmem_ops = {
+ 	.evict_inode	= shmem_evict_inode,
+ 	.drop_inode	= generic_delete_inode,
+ 	.put_super	= shmem_put_super,
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	.nr_cached_objects	= shmem_unused_huge_count,
+ 	.free_cached_objects	= shmem_unused_huge_scan,
+ #endif
+@@ -3869,7 +3869,7 @@ int __init shmem_init(void)
+ 		goto out1;
+ 	}
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ 	if (has_transparent_hugepage() && shmem_huge > SHMEM_HUGE_DENY)
+ 		SHMEM_SB(shm_mnt->mnt_sb)->huge = shmem_huge;
+ 	else
+@@ -3885,7 +3885,7 @@ int __init shmem_init(void)
+ 	return error;
+ }
+ 
+-#if defined(CONFIG_TRANSPARENT_HUGE_PAGECACHE) && defined(CONFIG_SYSFS)
++#if defined(CONFIG_TRANSPARENT_HUGEPAGE) && defined(CONFIG_SYSFS)
+ static ssize_t shmem_enabled_show(struct kobject *kobj,
+ 		struct kobj_attribute *attr, char *buf)
+ {
+@@ -3937,9 +3937,9 @@ static ssize_t shmem_enabled_store(struct kobject *kobj,
+ 
+ struct kobj_attribute shmem_enabled_attr =
+ 	__ATTR(shmem_enabled, 0644, shmem_enabled_show, shmem_enabled_store);
+-#endif /* CONFIG_TRANSPARENT_HUGE_PAGECACHE && CONFIG_SYSFS */
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE && CONFIG_SYSFS */
+ 
+-#ifdef CONFIG_TRANSPARENT_HUGE_PAGECACHE
++#ifdef CONFIG_TRANSPARENT_HUGEPAGE
+ bool shmem_huge_enabled(struct vm_area_struct *vma)
+ {
+ 	struct inode *inode = file_inode(vma->vm_file);
+@@ -3974,7 +3974,7 @@ bool shmem_huge_enabled(struct vm_area_struct *vma)
+ 			return false;
+ 	}
+ }
+-#endif /* CONFIG_TRANSPARENT_HUGE_PAGECACHE */
++#endif /* CONFIG_TRANSPARENT_HUGEPAGE */
+ 
+ #else /* !CONFIG_SHMEM */
+ 
+@@ -4169,7 +4169,7 @@ int shmem_zero_setup(struct vm_area_struct *vma)
+ 	vma->vm_file = file;
+ 	vma->vm_ops = &shmem_vm_ops;
+ 
+-	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGE_PAGECACHE) &&
++	if (IS_ENABLED(CONFIG_TRANSPARENT_HUGEPAGE) &&
+ 			((vma->vm_start + ~HPAGE_PMD_MASK) & HPAGE_PMD_MASK) <
+ 			(vma->vm_end & HPAGE_PMD_MASK)) {
+ 		khugepaged_enter(vma, vma->vm_flags);
