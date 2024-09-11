@@ -1,0 +1,526 @@
+xsk: Create and free buffer pool independently from umem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Magnus Karlsson <magnus.karlsson@intel.com>
+commit 1c1efc2af158869795d3334a12fed2afd9c51539
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/1c1efc2a.failed
+
+Create and free the buffer pool independently from the umem. Move
+these operations that are performed on the buffer pool from the
+umem create and destroy functions to new create and destroy
+functions just for the buffer pool. This so that in later commits
+we can instantiate multiple buffer pools per umem when sharing a
+umem between HW queues and/or devices. We also erradicate the
+back pointer from the umem to the buffer pool as this will not
+work when we introduce the possibility to have multiple buffer
+pools per umem.
+
+	Signed-off-by: Magnus Karlsson <magnus.karlsson@intel.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Björn Töpel <bjorn.topel@intel.com>
+Link: https://lore.kernel.org/bpf/1598603189-32145-4-git-send-email-magnus.karlsson@intel.com
+(cherry picked from commit 1c1efc2af158869795d3334a12fed2afd9c51539)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/xsk_buff_pool.h
+#	net/xdp/xdp_umem.c
+#	net/xdp/xsk_buff_pool.c
+diff --cc include/net/xsk_buff_pool.h
+index 6842990e2712,4025486cc057..000000000000
+--- a/include/net/xsk_buff_pool.h
++++ b/include/net/xsk_buff_pool.h
+@@@ -13,6 -13,8 +13,11 @@@ struct xsk_buff_pool
+  struct xdp_rxq_info;
+  struct xsk_queue;
+  struct xdp_desc;
+++<<<<<<< HEAD
+++=======
++ struct xdp_umem;
++ struct xdp_sock;
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  struct device;
+  struct page;
+  
+@@@ -42,15 -44,19 +47,24 @@@ struct xsk_buff_pool 
+  	u32 frame_len;
+  	bool dma_need_sync;
+  	bool unaligned;
+ -	struct xdp_umem *umem;
+  	void *addrs;
+  	struct device *dev;
++ 	refcount_t users;
++ 	struct work_struct work;
+  	struct xdp_buff_xsk *free_heads[];
+  };
+  
+  /* AF_XDP core. */
+++<<<<<<< HEAD
+ +struct xsk_buff_pool *xp_create(struct page **pages, u32 nr_pages, u32 chunks,
+ +				u32 chunk_size, u32 headroom, u64 size,
+ +				bool unaligned);
+++=======
++ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
++ 						struct xdp_umem *umem);
++ int xp_assign_dev(struct xsk_buff_pool *pool, struct net_device *dev,
++ 		  u16 queue_id, u16 flags);
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  void xp_set_fq(struct xsk_buff_pool *pool, struct xsk_queue *fq);
+  void xp_destroy(struct xsk_buff_pool *pool);
+  void xp_release(struct xdp_buff_xsk *xskb);
+diff --cc net/xdp/xdp_umem.c
+index fb8d9af5bc04,f290345fb6c7..000000000000
+--- a/net/xdp/xdp_umem.c
++++ b/net/xdp/xdp_umem.c
+@@@ -47,138 -47,6 +47,141 @@@ void xdp_del_sk_umem(struct xdp_umem *u
+  	spin_unlock_irqrestore(&umem->xsk_tx_list_lock, flags);
+  }
+  
+++<<<<<<< HEAD
+ +/* The umem is stored both in the _rx struct and the _tx struct as we do
+ + * not know if the device has more tx queues than rx, or the opposite.
+ + * This might also change during run time.
+ + */
+ +static int xdp_reg_umem_at_qid(struct net_device *dev, struct xdp_umem *umem,
+ +			       u16 queue_id)
+ +{
+ +	if (queue_id >= max_t(unsigned int,
+ +			      dev->real_num_rx_queues,
+ +			      dev->real_num_tx_queues))
+ +		return -EINVAL;
+ +
+ +	if (queue_id < dev->real_num_rx_queues)
+ +		dev->_rx[queue_id].umem = umem;
+ +	if (queue_id < dev->real_num_tx_queues)
+ +		dev->_tx[queue_id].umem = umem;
+ +
+ +	return 0;
+ +}
+ +
+ +struct xdp_umem *xdp_get_umem_from_qid(struct net_device *dev,
+ +				       u16 queue_id)
+ +{
+ +	if (queue_id < dev->real_num_rx_queues)
+ +		return dev->_rx[queue_id].umem;
+ +	if (queue_id < dev->real_num_tx_queues)
+ +		return dev->_tx[queue_id].umem;
+ +
+ +	return NULL;
+ +}
+ +EXPORT_SYMBOL(xdp_get_umem_from_qid);
+ +
+ +static void xdp_clear_umem_at_qid(struct net_device *dev, u16 queue_id)
+ +{
+ +	if (queue_id < dev->real_num_rx_queues)
+ +		dev->_rx[queue_id].umem = NULL;
+ +	if (queue_id < dev->real_num_tx_queues)
+ +		dev->_tx[queue_id].umem = NULL;
+ +}
+ +
+ +int xdp_umem_assign_dev(struct xdp_umem *umem, struct net_device *dev,
+ +			u16 queue_id, u16 flags)
+ +{
+ +	bool force_zc, force_copy;
+ +	struct netdev_bpf bpf;
+ +	int err = 0;
+ +
+ +	ASSERT_RTNL();
+ +
+ +	force_zc = flags & XDP_ZEROCOPY;
+ +	force_copy = flags & XDP_COPY;
+ +
+ +	if (force_zc && force_copy)
+ +		return -EINVAL;
+ +
+ +	if (xdp_get_umem_from_qid(dev, queue_id))
+ +		return -EBUSY;
+ +
+ +	err = xdp_reg_umem_at_qid(dev, umem, queue_id);
+ +	if (err)
+ +		return err;
+ +
+ +	umem->dev = dev;
+ +	umem->queue_id = queue_id;
+ +
+ +	if (flags & XDP_USE_NEED_WAKEUP) {
+ +		umem->flags |= XDP_UMEM_USES_NEED_WAKEUP;
+ +		/* Tx needs to be explicitly woken up the first time.
+ +		 * Also for supporting drivers that do not implement this
+ +		 * feature. They will always have to call sendto().
+ +		 */
+ +		xsk_set_tx_need_wakeup(umem);
+ +	}
+ +
+ +	dev_hold(dev);
+ +
+ +	if (force_copy)
+ +		/* For copy-mode, we are done. */
+ +		return 0;
+ +
+ +	if (!dev->netdev_ops->ndo_bpf || !dev->netdev_ops->ndo_xsk_wakeup) {
+ +		err = -EOPNOTSUPP;
+ +		goto err_unreg_umem;
+ +	}
+ +
+ +	bpf.command = XDP_SETUP_XSK_UMEM;
+ +	bpf.xsk.umem = umem;
+ +	bpf.xsk.queue_id = queue_id;
+ +
+ +	err = dev->netdev_ops->ndo_bpf(dev, &bpf);
+ +	if (err)
+ +		goto err_unreg_umem;
+ +
+ +	umem->zc = true;
+ +	return 0;
+ +
+ +err_unreg_umem:
+ +	if (!force_zc)
+ +		err = 0; /* fallback to copy mode */
+ +	if (err)
+ +		xdp_clear_umem_at_qid(dev, queue_id);
+ +	return err;
+ +}
+ +
+ +void xdp_umem_clear_dev(struct xdp_umem *umem)
+ +{
+ +	struct netdev_bpf bpf;
+ +	int err;
+ +
+ +	ASSERT_RTNL();
+ +
+ +	if (!umem->dev)
+ +		return;
+ +
+ +	if (umem->zc) {
+ +		bpf.command = XDP_SETUP_XSK_UMEM;
+ +		bpf.xsk.umem = NULL;
+ +		bpf.xsk.queue_id = umem->queue_id;
+ +
+ +		err = umem->dev->netdev_ops->ndo_bpf(umem->dev, &bpf);
+ +
+ +		if (err)
+ +			WARN(1, "failed to disable umem!\n");
+ +	}
+ +
+ +	xdp_clear_umem_at_qid(umem->dev, umem->queue_id);
+ +
+ +	dev_put(umem->dev);
+ +	umem->dev = NULL;
+ +	umem->zc = false;
+ +}
+ +
+++=======
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  static void xdp_umem_unpin_pages(struct xdp_umem *umem)
+  {
+  	unpin_user_pages_dirty_lock(umem->pgs, umem->npgs, true);
+@@@ -372,16 -246,8 +380,17 @@@ static int xdp_umem_reg(struct xdp_ume
+  	if (err)
+  		goto out_account;
+  
+++<<<<<<< HEAD
+ +	umem->pool = xp_create(umem->pgs, umem->npgs, chunks, chunk_size,
+ +			       headroom, size, unaligned_chunks);
+ +	if (!umem->pool) {
+ +		err = -ENOMEM;
+ +		goto out_pin;
+ +	}
+++=======
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  	return 0;
+  
+- out_pin:
+- 	xdp_umem_unpin_pages(umem);
+  out_account:
+  	xdp_umem_unaccount_pages(umem);
+  	return err;
+diff --cc net/xdp/xsk_buff_pool.c
+index a2044c245215,e58c54d68c3d..000000000000
+--- a/net/xdp/xsk_buff_pool.c
++++ b/net/xdp/xsk_buff_pool.c
+@@@ -29,9 -35,8 +35,14 @@@ void xp_destroy(struct xsk_buff_pool *p
+  	kvfree(pool);
+  }
+  
+++<<<<<<< HEAD
+ +struct xsk_buff_pool *xp_create(struct page **pages, u32 nr_pages, u32 chunks,
+ +				u32 chunk_size, u32 headroom, u64 size,
+ +				bool unaligned)
+++=======
++ struct xsk_buff_pool *xp_create_and_assign_umem(struct xdp_sock *xs,
++ 						struct xdp_umem *umem)
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  {
+  	struct xsk_buff_pool *pool;
+  	struct xdp_buff_xsk *xskb;
+@@@ -46,15 -52,18 +58,29 @@@
+  	if (!pool->heads)
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	pool->chunk_mask = ~((u64)chunk_size - 1);
+ +	pool->addrs_cnt = size;
+ +	pool->heads_cnt = chunks;
+ +	pool->free_heads_cnt = chunks;
+ +	pool->headroom = headroom;
+ +	pool->chunk_size = chunk_size;
+ +	pool->unaligned = unaligned;
+ +	pool->frame_len = chunk_size - headroom - XDP_PACKET_HEADROOM;
+++=======
++ 	pool->chunk_mask = ~((u64)umem->chunk_size - 1);
++ 	pool->addrs_cnt = umem->size;
++ 	pool->heads_cnt = umem->chunks;
++ 	pool->free_heads_cnt = umem->chunks;
++ 	pool->headroom = umem->headroom;
++ 	pool->chunk_size = umem->chunk_size;
++ 	pool->unaligned = umem->flags & XDP_UMEM_UNALIGNED_CHUNK_FLAG;
++ 	pool->frame_len = umem->chunk_size - umem->headroom -
++ 		XDP_PACKET_HEADROOM;
++ 	pool->umem = umem;
+++>>>>>>> 1c1efc2af158 (xsk: Create and free buffer pool independently from umem)
+  	INIT_LIST_HEAD(&pool->free_list);
++ 	refcount_set(&pool->users, 1);
+  
+  	for (i = 0; i < pool->free_heads_cnt; i++) {
+  		xskb = &pool->heads[i];
+diff --git a/include/net/xdp_sock.h b/include/net/xdp_sock.h
+index c9d87cc40c11..842e233728a0 100644
+--- a/include/net/xdp_sock.h
++++ b/include/net/xdp_sock.h
+@@ -20,13 +20,12 @@ struct xdp_buff;
+ struct xdp_umem {
+ 	struct xsk_queue *fq;
+ 	struct xsk_queue *cq;
+-	struct xsk_buff_pool *pool;
+ 	u64 size;
+ 	u32 headroom;
+ 	u32 chunk_size;
++	u32 chunks;
+ 	struct user_struct *user;
+ 	refcount_t users;
+-	struct work_struct work;
+ 	struct page **pgs;
+ 	u32 npgs;
+ 	u16 queue_id;
+* Unmerged path include/net/xsk_buff_pool.h
+* Unmerged path net/xdp/xdp_umem.c
+diff --git a/net/xdp/xdp_umem.h b/net/xdp/xdp_umem.h
+index 32067fe98f65..93e96be6f4de 100644
+--- a/net/xdp/xdp_umem.h
++++ b/net/xdp/xdp_umem.h
+@@ -8,8 +8,8 @@
+ 
+ #include <net/xdp_sock_drv.h>
+ 
+-int xdp_umem_assign_dev(struct xdp_umem *umem, struct net_device *dev,
+-			u16 queue_id, u16 flags);
++void xdp_umem_assign_dev(struct xdp_umem *umem, struct net_device *dev,
++			 u16 queue_id);
+ void xdp_umem_clear_dev(struct xdp_umem *umem);
+ bool xdp_umem_validate_queues(struct xdp_umem *umem);
+ void xdp_get_umem(struct xdp_umem *umem);
+diff --git a/net/xdp/xsk.c b/net/xdp/xsk.c
+index 10c97cce9e3d..06740c2b92b6 100644
+--- a/net/xdp/xsk.c
++++ b/net/xdp/xsk.c
+@@ -101,6 +101,46 @@ bool xsk_umem_uses_need_wakeup(struct xdp_umem *umem)
+ }
+ EXPORT_SYMBOL(xsk_umem_uses_need_wakeup);
+ 
++struct xsk_buff_pool *xsk_get_pool_from_qid(struct net_device *dev,
++					    u16 queue_id)
++{
++	if (queue_id < dev->real_num_rx_queues)
++		return dev->_rx[queue_id].pool;
++	if (queue_id < dev->real_num_tx_queues)
++		return dev->_tx[queue_id].pool;
++
++	return NULL;
++}
++EXPORT_SYMBOL(xsk_get_pool_from_qid);
++
++void xsk_clear_pool_at_qid(struct net_device *dev, u16 queue_id)
++{
++	if (queue_id < dev->real_num_rx_queues)
++		dev->_rx[queue_id].pool = NULL;
++	if (queue_id < dev->real_num_tx_queues)
++		dev->_tx[queue_id].pool = NULL;
++}
++
++/* The buffer pool is stored both in the _rx struct and the _tx struct as we do
++ * not know if the device has more tx queues than rx, or the opposite.
++ * This might also change during run time.
++ */
++int xsk_reg_pool_at_qid(struct net_device *dev, struct xsk_buff_pool *pool,
++			u16 queue_id)
++{
++	if (queue_id >= max_t(unsigned int,
++			      dev->real_num_rx_queues,
++			      dev->real_num_tx_queues))
++		return -EINVAL;
++
++	if (queue_id < dev->real_num_rx_queues)
++		dev->_rx[queue_id].pool = pool;
++	if (queue_id < dev->real_num_tx_queues)
++		dev->_tx[queue_id].pool = pool;
++
++	return 0;
++}
++
+ void xp_release(struct xdp_buff_xsk *xskb)
+ {
+ 	xskb->pool->free_heads[xskb->pool->free_heads_cnt++] = xskb;
+@@ -276,7 +316,7 @@ bool xsk_umem_consume_tx(struct xdp_umem *umem, struct xdp_desc *desc)
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(xs, &umem->xsk_tx_list, list) {
+-		if (!xskq_cons_peek_desc(xs->tx, desc, umem)) {
++		if (!xskq_cons_peek_desc(xs->tx, desc, pool)) {
+ 			xs->tx->queue_empty_descs++;
+ 			continue;
+ 		}
+@@ -344,7 +384,7 @@ static int xsk_generic_xmit(struct sock *sk)
+ 	if (xs->queue_id >= xs->dev->real_num_tx_queues)
+ 		goto out;
+ 
+-	while (xskq_cons_peek_desc(xs->tx, &desc, xs->umem)) {
++	while (xskq_cons_peek_desc(xs->tx, &desc, xs->pool)) {
+ 		char *buffer;
+ 		u64 addr;
+ 		u32 len;
+@@ -671,6 +711,9 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+ 			goto out_unlock;
+ 		}
+ 
++		/* Share the buffer pool with the other socket. */
++		xp_get_pool(umem_xs->pool);
++		xs->pool = umem_xs->pool;
+ 		xdp_get_umem(umem_xs->umem);
+ 		WRITE_ONCE(xs->umem, umem_xs->umem);
+ 		sockfd_put(sock);
+@@ -679,9 +722,21 @@ static int xsk_bind(struct socket *sock, struct sockaddr *addr, int addr_len)
+ 		goto out_unlock;
+ 	} else {
+ 		/* This xsk has its own umem. */
+-		err = xdp_umem_assign_dev(xs->umem, dev, qid, flags);
+-		if (err)
++		xdp_umem_assign_dev(xs->umem, dev, qid);
++		xs->pool = xp_create_and_assign_umem(xs, xs->umem);
++		if (!xs->pool) {
++			err = -ENOMEM;
++			xdp_umem_clear_dev(xs->umem);
++			goto out_unlock;
++		}
++
++		err = xp_assign_dev(xs->pool, dev, qid, flags);
++		if (err) {
++			xp_destroy(xs->pool);
++			xs->pool = NULL;
++			xdp_umem_clear_dev(xs->umem);
+ 			goto out_unlock;
++		}
+ 	}
+ 
+ 	xs->dev = dev;
+@@ -802,7 +857,7 @@ static int xsk_setsockopt(struct socket *sock, int level, int optname,
+ 			&xs->umem->cq;
+ 		err = xsk_init_queue(entries, q, true);
+ 		if (optname == XDP_UMEM_FILL_RING)
+-			xp_set_fq(xs->umem->pool, *q);
++			xp_set_fq(xs->pool, *q);
+ 		mutex_unlock(&xs->mutex);
+ 		return err;
+ 	}
+@@ -1030,7 +1085,8 @@ static int xsk_notifier(struct notifier_block *this,
+ 
+ 				xsk_unbind_dev(xs);
+ 
+-				/* Clear device references in umem. */
++				/* Clear device references. */
++				xp_clear_dev(xs->pool);
+ 				xdp_umem_clear_dev(xs->umem);
+ 			}
+ 			mutex_unlock(&xs->mutex);
+@@ -1075,7 +1131,7 @@ static void xsk_destruct(struct sock *sk)
+ 	if (!sock_flag(sk, SOCK_DEAD))
+ 		return;
+ 
+-	xdp_put_umem(xs->umem);
++	xp_put_pool(xs->pool);
+ 
+ 	sk_refcnt_debug_dec(sk);
+ }
+@@ -1083,8 +1139,8 @@ static void xsk_destruct(struct sock *sk)
+ static int xsk_create(struct net *net, struct socket *sock, int protocol,
+ 		      int kern)
+ {
+-	struct sock *sk;
+ 	struct xdp_sock *xs;
++	struct sock *sk;
+ 
+ 	if (!ns_capable(net->user_ns, CAP_NET_RAW))
+ 		return -EPERM;
+diff --git a/net/xdp/xsk.h b/net/xdp/xsk.h
+index 455ddd480f3d..a00e3e2a9ef1 100644
+--- a/net/xdp/xsk.h
++++ b/net/xdp/xsk.h
+@@ -51,5 +51,8 @@ void xsk_map_try_sock_delete(struct xsk_map *map, struct xdp_sock *xs,
+ 			     struct xdp_sock **map_entry);
+ int xsk_map_inc(struct xsk_map *map);
+ void xsk_map_put(struct xsk_map *map);
++void xsk_clear_pool_at_qid(struct net_device *dev, u16 queue_id);
++int xsk_reg_pool_at_qid(struct net_device *dev, struct xsk_buff_pool *pool,
++			u16 queue_id);
+ 
+ #endif /* XSK_H_ */
+* Unmerged path net/xdp/xsk_buff_pool.c
+diff --git a/net/xdp/xsk_queue.h b/net/xdp/xsk_queue.h
+index bf42cfd74b89..2d883f631c85 100644
+--- a/net/xdp/xsk_queue.h
++++ b/net/xdp/xsk_queue.h
+@@ -166,9 +166,9 @@ static inline bool xp_validate_desc(struct xsk_buff_pool *pool,
+ 
+ static inline bool xskq_cons_is_valid_desc(struct xsk_queue *q,
+ 					   struct xdp_desc *d,
+-					   struct xdp_umem *umem)
++					   struct xsk_buff_pool *pool)
+ {
+-	if (!xp_validate_desc(umem->pool, d)) {
++	if (!xp_validate_desc(pool, d)) {
+ 		q->invalid_descs++;
+ 		return false;
+ 	}
+@@ -177,14 +177,14 @@ static inline bool xskq_cons_is_valid_desc(struct xsk_queue *q,
+ 
+ static inline bool xskq_cons_read_desc(struct xsk_queue *q,
+ 				       struct xdp_desc *desc,
+-				       struct xdp_umem *umem)
++				       struct xsk_buff_pool *pool)
+ {
+ 	while (q->cached_cons != q->cached_prod) {
+ 		struct xdp_rxtx_ring *ring = (struct xdp_rxtx_ring *)q->ring;
+ 		u32 idx = q->cached_cons & q->ring_mask;
+ 
+ 		*desc = ring->desc[idx];
+-		if (xskq_cons_is_valid_desc(q, desc, umem))
++		if (xskq_cons_is_valid_desc(q, desc, pool))
+ 			return true;
+ 
+ 		q->cached_cons++;
+@@ -236,11 +236,11 @@ static inline bool xskq_cons_peek_addr_unchecked(struct xsk_queue *q, u64 *addr)
+ 
+ static inline bool xskq_cons_peek_desc(struct xsk_queue *q,
+ 				       struct xdp_desc *desc,
+-				       struct xdp_umem *umem)
++				       struct xsk_buff_pool *pool)
+ {
+ 	if (q->cached_prod == q->cached_cons)
+ 		xskq_cons_get_entries(q);
+-	return xskq_cons_read_desc(q, desc, umem);
++	return xskq_cons_read_desc(q, desc, pool);
+ }
+ 
+ static inline void xskq_cons_release(struct xsk_queue *q)
