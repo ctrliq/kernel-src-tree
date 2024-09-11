@@ -1,0 +1,200 @@
+IB/uverbs: Refactor related objects to use their own asynchronous event FD
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Yishai Hadas <yishaih@mellanox.com>
+commit 98a8890f73489416a1ea49a644565a244d3f729a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/98a8890f.failed
+
+Refactor related objects to use their own asynchronous event FD.
+The ufile event FD will be the default in case an object won't have its own
+event FD.
+
+Link: https://lore.kernel.org/r/20200519072711.257271-3-leon@kernel.org
+	Signed-off-by: Yishai Hadas <yishaih@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 98a8890f73489416a1ea49a644565a244d3f729a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/uverbs_main.c
+index a801a95c3cfd,47794c85e9af..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -146,10 -146,12 +146,9 @@@ void ib_uverbs_release_ucq(struct ib_uv
+  
+  void ib_uverbs_release_uevent(struct ib_uevent_object *uobj)
+  {
+- 	struct ib_uverbs_async_event_file *async_file =
+- 		READ_ONCE(uobj->uobject.ufile->async_file);
++ 	struct ib_uverbs_async_event_file *async_file = uobj->event_file;
+  	struct ib_uverbs_event *evt, *tmp;
+  
+ -	if (!async_file)
+ -		return;
+ -
+  	spin_lock_irq(&async_file->ev_queue.lock);
+  	list_for_each_entry_safe(evt, tmp, &uobj->event_list, obj_list) {
+  		list_del(&evt->list);
+@@@ -477,12 -483,13 +477,17 @@@ void ib_uverbs_init_async_event_file
+  	ib_uverbs_init_event_queue(&async_file->ev_queue);
+  
+  	/* The first async_event_file becomes the default one for the file. */
+++<<<<<<< HEAD
+ +	lockdep_assert_held(&uverbs_file->ucontext_lock);
+ +	if (!uverbs_file->async_file) {
+++=======
++ 	mutex_lock(&uverbs_file->ucontext_lock);
++ 	if (!uverbs_file->default_async_file) {
+++>>>>>>> 98a8890f7348 (IB/uverbs: Refactor related objects to use their own asynchronous event FD)
+  		/* Pairs with the put in ib_uverbs_release_file */
+  		uverbs_uobject_get(&async_file->uobj);
+- 		smp_store_release(&uverbs_file->async_file, async_file);
++ 		smp_store_release(&uverbs_file->default_async_file, async_file);
+  	}
+ -	mutex_unlock(&uverbs_file->ucontext_lock);
+  
+  	INIT_IB_EVENT_HANDLER(&async_file->event_handler, ib_dev,
+  			      ib_uverbs_event_handler);
+diff --git a/drivers/infiniband/core/uverbs.h b/drivers/infiniband/core/uverbs.h
+index b6f7229cf661..1f6d3008a594 100644
+--- a/drivers/infiniband/core/uverbs.h
++++ b/drivers/infiniband/core/uverbs.h
+@@ -142,7 +142,7 @@ struct ib_uverbs_file {
+ 	 * ucontext_lock held
+ 	 */
+ 	struct ib_ucontext		       *ucontext;
+-	struct ib_uverbs_async_event_file      *async_file;
++	struct ib_uverbs_async_event_file      *default_async_file;
+ 	struct list_head			list;
+ 
+ 	/*
+@@ -180,6 +180,7 @@ struct ib_uverbs_mcast_entry {
+ 
+ struct ib_uevent_object {
+ 	struct ib_uobject	uobject;
++	struct ib_uverbs_async_event_file *event_file;
+ 	/* List member for ib_uverbs_async_event_file list */
+ 	struct list_head	event_list;
+ 	u32			events_reported;
+diff --git a/drivers/infiniband/core/uverbs_cmd.c b/drivers/infiniband/core/uverbs_cmd.c
+index 61414674e506..8c768651c705 100644
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@ -1039,6 +1039,10 @@ static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+ 		goto err_free;
+ 
+ 	obj->uevent.uobject.object = cq;
++	obj->uevent.event_file = READ_ONCE(attrs->ufile->default_async_file);
++	if (obj->uevent.event_file)
++		uverbs_uobject_get(&obj->uevent.event_file->uobj);
++
+ 	memset(&resp, 0, sizeof resp);
+ 	resp.base.cq_handle = obj->uevent.uobject.id;
+ 	resp.base.cqe       = cq->cqe;
+@@ -1055,6 +1059,8 @@ static struct ib_ucq_object *create_cq(struct uverbs_attr_bundle *attrs,
+ 	return obj;
+ 
+ err_cb:
++	if (obj->uevent.event_file)
++		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+ 	ib_destroy_cq_user(cq, uverbs_get_cleared_udata(attrs));
+ 	cq = NULL;
+ err_free:
+@@ -1448,6 +1454,9 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 	}
+ 
+ 	obj->uevent.uobject.object = qp;
++	obj->uevent.event_file = READ_ONCE(attrs->ufile->default_async_file);
++	if (obj->uevent.event_file)
++		uverbs_uobject_get(&obj->uevent.event_file->uobj);
+ 
+ 	memset(&resp, 0, sizeof resp);
+ 	resp.base.qpn             = qp->qp_num;
+@@ -1461,7 +1470,7 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 
+ 	ret = uverbs_response(attrs, &resp, sizeof(resp));
+ 	if (ret)
+-		goto err_cb;
++		goto err_uevent;
+ 
+ 	if (xrcd) {
+ 		obj->uxrcd = container_of(xrcd_uobj, struct ib_uxrcd_object,
+@@ -1486,6 +1495,9 @@ static int create_qp(struct uverbs_attr_bundle *attrs,
+ 
+ 	rdma_alloc_commit_uobject(&obj->uevent.uobject, attrs);
+ 	return 0;
++err_uevent:
++	if (obj->uevent.event_file)
++		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+ err_cb:
+ 	ib_destroy_qp_user(qp, uverbs_get_cleared_udata(attrs));
+ 
+@@ -2963,6 +2975,9 @@ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs)
+ 	atomic_set(&wq->usecnt, 0);
+ 	atomic_inc(&pd->usecnt);
+ 	atomic_inc(&cq->usecnt);
++	obj->uevent.event_file = READ_ONCE(attrs->ufile->default_async_file);
++	if (obj->uevent.event_file)
++		uverbs_uobject_get(&obj->uevent.event_file->uobj);
+ 
+ 	memset(&resp, 0, sizeof(resp));
+ 	resp.wq_handle = obj->uevent.uobject.id;
+@@ -2981,6 +2996,8 @@ static int ib_uverbs_ex_create_wq(struct uverbs_attr_bundle *attrs)
+ 	return 0;
+ 
+ err_copy:
++	if (obj->uevent.event_file)
++		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+ 	ib_destroy_wq(wq, uverbs_get_cleared_udata(attrs));
+ err_put_cq:
+ 	rdma_lookup_put_uobject(&cq->uobject->uevent.uobject,
+@@ -3441,6 +3458,10 @@ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ 	}
+ 
+ 	obj->uevent.uobject.object = srq;
++	obj->uevent.uobject.user_handle = cmd->user_handle;
++	obj->uevent.event_file = READ_ONCE(attrs->ufile->default_async_file);
++	if (obj->uevent.event_file)
++		uverbs_uobject_get(&obj->uevent.event_file->uobj);
+ 
+ 	memset(&resp, 0, sizeof resp);
+ 	resp.srq_handle = obj->uevent.uobject.id;
+@@ -3465,6 +3486,8 @@ static int __uverbs_create_xsrq(struct uverbs_attr_bundle *attrs,
+ 	return 0;
+ 
+ err_copy:
++	if (obj->uevent.event_file)
++		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+ 	ib_destroy_srq_user(srq, uverbs_get_cleared_udata(attrs));
+ err_put_pd:
+ 	uobj_put_obj_read(pd);
+* Unmerged path drivers/infiniband/core/uverbs_main.c
+diff --git a/drivers/infiniband/core/uverbs_std_types_cq.c b/drivers/infiniband/core/uverbs_std_types_cq.c
+index da4110a0eea2..b3bd78338252 100644
+--- a/drivers/infiniband/core/uverbs_std_types_cq.c
++++ b/drivers/infiniband/core/uverbs_std_types_cq.c
+@@ -100,6 +100,10 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
+ 		uverbs_uobject_get(ev_file_uobj);
+ 	}
+ 
++	obj->uevent.event_file = READ_ONCE(attrs->ufile->default_async_file);
++	if (obj->uevent.event_file)
++		uverbs_uobject_get(&obj->uevent.event_file->uobj);
++
+ 	if (attr.comp_vector >= attrs->ufile->device->num_comp_vectors) {
+ 		ret = -EINVAL;
+ 		goto err_event_file;
+@@ -142,6 +146,8 @@ static int UVERBS_HANDLER(UVERBS_METHOD_CQ_CREATE)(
+ err_free:
+ 	kfree(cq);
+ err_event_file:
++	if (obj->uevent.event_file)
++		uverbs_uobject_put(&obj->uevent.event_file->uobj);
+ 	if (ev_file)
+ 		uverbs_uobject_put(ev_file_uobj);
+ 	return ret;
