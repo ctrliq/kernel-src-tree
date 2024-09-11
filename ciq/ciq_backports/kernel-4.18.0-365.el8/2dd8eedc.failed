@@ -1,0 +1,152 @@
+x86/process: Move arch_thread_struct_whitelist() out of line
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 2dd8eedc80b184bb16aad697ae60367c5bf07299
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/2dd8eedc.failed
+
+In preparation for dynamically enabled FPU features move the function
+out of line as the goal is to expose less and not more information.
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+Link: https://lkml.kernel.org/r/20211013145322.869001791@linutronix.de
+(cherry picked from commit 2dd8eedc80b184bb16aad697ae60367c5bf07299)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/processor.h
+#	arch/x86/kernel/fpu/internal.h
+diff --cc arch/x86/include/asm/processor.h
+index 36df2cabb7a7,1bd3e8d05604..000000000000
+--- a/arch/x86/include/asm/processor.h
++++ b/arch/x86/include/asm/processor.h
+@@@ -434,31 -455,14 +434,28 @@@ extern asmlinkage void ignore_sysret(vo
+  void current_save_fsgs(void);
+  #else	/* X86_64 */
+  #ifdef CONFIG_STACKPROTECTOR
+ -DECLARE_PER_CPU(unsigned long, __stack_chk_guard);
+ +/*
+ + * Make sure stack canary segment base is cached-aligned:
+ + *   "For Intel Atom processors, avoid non zero segment base address
+ + *    that is not aligned to cache line boundary at all cost."
+ + * (Optim Ref Manual Assembly/Compiler Coding Rule 15.)
+ + */
+ +struct stack_canary {
+ +	char __pad[20];		/* canary at %gs:20 */
+ +	unsigned long canary;
+ +};
+ +DECLARE_PER_CPU_ALIGNED(struct stack_canary, stack_canary);
+  #endif
+ -DECLARE_PER_CPU(struct irq_stack *, hardirq_stack_ptr);
+ +/* Per CPU softirq stack pointer */
+  DECLARE_PER_CPU(struct irq_stack *, softirq_stack_ptr);
+ -#endif	/* !X86_64 */
+ +#endif	/* X86_64 */
+  
+- extern unsigned int fpu_kernel_xstate_size;
+- extern unsigned int fpu_user_xstate_size;
+- 
+  struct perf_event;
+  
+ +typedef struct {
+ +	unsigned long		seg;
+ +} mm_segment_t;
+ +
+  struct thread_struct {
+  	/* Cached TLS descriptors: */
+  	struct desc_struct	tls_array[GDT_ENTRY_TLS_ENTRIES];
+@@@ -520,40 -534,12 +517,49 @@@
+  	 */
+  };
+  
+++<<<<<<< HEAD
+ +/* Whitelist the FPU state from the task_struct for hardened usercopy. */
+ +static inline void arch_thread_struct_whitelist(unsigned long *offset,
+ +						unsigned long *size)
+ +{
+ +	*offset = offsetof(struct thread_struct, fpu.state);
+ +	*size = fpu_kernel_xstate_size;
+++=======
++ extern void fpu_thread_struct_whitelist(unsigned long *offset, unsigned long *size);
++ 
++ static inline void arch_thread_struct_whitelist(unsigned long *offset,
++ 						unsigned long *size)
++ {
++ 	fpu_thread_struct_whitelist(offset, size);
+++>>>>>>> 2dd8eedc80b1 (x86/process: Move arch_thread_struct_whitelist() out of line)
+ +}
+ +
+ +/*
+ + * Thread-synchronous status.
+ + *
+ + * This is different from the flags in that nobody else
+ + * ever touches our thread-synchronous status, so we don't
+ + * have to worry about atomic accesses.
+ + */
+ +#define TS_COMPAT		0x0002	/* 32bit syscall active (64BIT)*/
+ +
+ +/*
+ + * Set IOPL bits in EFLAGS from given mask
+ + */
+ +static inline void native_set_iopl_mask(unsigned mask)
+ +{
+ +#ifdef CONFIG_X86_32
+ +	unsigned int reg;
+ +
+ +	asm volatile ("pushfl;"
+ +		      "popl %0;"
+ +		      "andl %1, %0;"
+ +		      "orl %2, %0;"
+ +		      "pushl %0;"
+ +		      "popfl"
+ +		      : "=&r" (reg)
+ +		      : "i" (~X86_EFLAGS_IOPL), "r" (mask));
+ +#endif
+  }
+  
+  static inline void
+diff --cc arch/x86/kernel/fpu/internal.h
+index 5ddc09e03c2a,5c4f71ff6ae9..000000000000
+--- a/arch/x86/kernel/fpu/internal.h
++++ b/arch/x86/kernel/fpu/internal.h
+@@@ -2,6 -2,10 +2,13 @@@
+  #ifndef __X86_KERNEL_FPU_INTERNAL_H
+  #define __X86_KERNEL_FPU_INTERNAL_H
+  
+++<<<<<<< HEAD
+++=======
++ extern unsigned int fpu_kernel_xstate_size;
++ extern unsigned int fpu_user_xstate_size;
++ extern struct fpstate init_fpstate;
++ 
+++>>>>>>> 2dd8eedc80b1 (x86/process: Move arch_thread_struct_whitelist() out of line)
+  /* CPU feature check wrappers */
+  static __always_inline __pure bool use_xsave(void)
+  {
+* Unmerged path arch/x86/include/asm/processor.h
+diff --git a/arch/x86/kernel/fpu/core.c b/arch/x86/kernel/fpu/core.c
+index 3f16056105e8..c5d946af9a29 100644
+--- a/arch/x86/kernel/fpu/core.c
++++ b/arch/x86/kernel/fpu/core.c
+@@ -380,6 +380,16 @@ int fpu_clone(struct task_struct *dst)
+ 	return 0;
+ }
+ 
++/*
++ * Whitelist the FPU register state embedded into task_struct for hardened
++ * usercopy.
++ */
++void fpu_thread_struct_whitelist(unsigned long *offset, unsigned long *size)
++{
++	*offset = offsetof(struct thread_struct, fpu.__fpstate.regs);
++	*size = fpu_kernel_xstate_size;
++}
++
+ /*
+  * Drops current FPU state: deactivates the fpregs and
+  * the fpstate. NOTE: it still leaves previous contents
+* Unmerged path arch/x86/kernel/fpu/internal.h
