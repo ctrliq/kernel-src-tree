@@ -2649,6 +2649,14 @@ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
 		struct cifs_credits credits_on_stack;
 		struct cifs_credits *credits = &credits_on_stack;
 
+		if (open_file->invalidHandle) {
+			rc = cifs_reopen_file(open_file, false);
+			if (rc == -EAGAIN)
+				continue;
+			else if (rc)
+				break;
+		}
+
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->wsize,
 						   &wsize, credits);
 		if (rc)
@@ -2750,9 +2758,8 @@ cifs_write_from_iter(loff_t offset, size_t len, struct iov_iter *from,
 
 		if (!rc) {
 			if (wdata->cfile->invalidHandle)
-				rc = cifs_reopen_file(wdata->cfile, false);
-
-			if (!rc)
+				rc = -EAGAIN;
+			else
 				rc = server->ops->async_writev(wdata,
 					cifs_uncached_writedata_release);
 		}
@@ -3354,6 +3361,14 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
 		iov_iter_advance(&direct_iov, offset - ctx->pos);
 
 	do {
+		if (open_file->invalidHandle) {
+			rc = cifs_reopen_file(open_file, true);
+			if (rc == -EAGAIN)
+				continue;
+			else if (rc)
+				break;
+		}
+
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->rsize,
 						   &rsize, credits);
 		if (rc)
@@ -3437,9 +3452,8 @@ cifs_send_async_read(loff_t offset, size_t len, struct cifsFileInfo *open_file,
 
 		if (!rc) {
 			if (rdata->cfile->invalidHandle)
-				rc = cifs_reopen_file(rdata->cfile, true);
-
-			if (!rc)
+				rc = -EAGAIN;
+			else
 				rc = server->ops->async_readv(rdata);
 		}
 
@@ -4126,6 +4140,14 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 		struct cifs_credits credits_on_stack;
 		struct cifs_credits *credits = &credits_on_stack;
 
+		if (open_file->invalidHandle) {
+			rc = cifs_reopen_file(open_file, true);
+			if (rc == -EAGAIN)
+				continue;
+			else if (rc)
+				break;
+		}
+
 		rc = server->ops->wait_mtu_credits(server, cifs_sb->rsize,
 						   &rsize, credits);
 		if (rc)
@@ -4184,9 +4206,8 @@ static int cifs_readpages(struct file *file, struct address_space *mapping,
 
 		if (!rc) {
 			if (rdata->cfile->invalidHandle)
-				rc = cifs_reopen_file(rdata->cfile, true);
-
-			if (!rc)
+				rc = -EAGAIN;
+			else
 				rc = server->ops->async_readv(rdata);
 		}
 
