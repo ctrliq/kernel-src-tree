@@ -1,0 +1,296 @@
+libperf: Adopt perf_mmap__put() function from tools/perf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit 80e53d1148231d7d4fdc4cd89e5393616b33bf82
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/80e53d11.failed
+
+Move perf_mmap__put() from tools/perf to libperf.
+
+Once perf_mmap__put() is moved, we need a way to call application
+related unmap code (AIO and aux related code for eprf), when the map
+goes away.
+
+Add the perf_mmap::unmap callback to do that.
+
+The unmap path from perf is:
+
+  perf_mmap__put                           (libperf)
+    perf_mmap__munmap                      (libperf)
+      map->unmap_cb -> perf_mmap__unmap_cb (perf)
+        mmap__munmap                       (perf)
+
+Committer notes:
+
+Add missing linux/kernel.h to tools/perf/lib/mmap.c to get the BUG_ON
+definition.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lore.kernel.org/lkml/20191007125344.14268-8-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit 80e53d1148231d7d4fdc4cd89e5393616b33bf82)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/lib/include/internal/mmap.h
+#	tools/perf/lib/mmap.c
+#	tools/perf/util/evlist.c
+#	tools/perf/util/mmap.c
+#	tools/perf/util/mmap.h
+diff --cc tools/perf/util/evlist.c
+index 29a998d183ce,4394a5a10ce9..000000000000
+--- a/tools/perf/util/evlist.c
++++ b/tools/perf/util/evlist.c
+@@@ -470,15 -430,15 +470,15 @@@ int perf_evlist__add_pollfd(struct perf
+  static void perf_evlist__munmap_filtered(struct fdarray *fda, int fd,
+  					 void *arg __maybe_unused)
+  {
+ -	struct mmap *map = fda->priv[fd].ptr;
+ +	struct perf_mmap *map = fda->priv[fd].ptr;
+  
+  	if (map)
+- 		perf_mmap__put(map);
++ 		perf_mmap__put(&map->core);
+  }
+  
+ -int evlist__filter_pollfd(struct evlist *evlist, short revents_and_mask)
+ +int perf_evlist__filter_pollfd(struct perf_evlist *evlist, short revents_and_mask)
+  {
+ -	return fdarray__filter(&evlist->core.pollfd, revents_and_mask,
+ +	return fdarray__filter(&evlist->pollfd, revents_and_mask,
+  			       perf_evlist__munmap_filtered, NULL);
+  }
+  
+@@@ -701,31 -600,38 +701,52 @@@ static void perf_evlist__munmap_nofree(
+  	int i;
+  
+  	if (evlist->mmap)
+++<<<<<<< HEAD
+ +		for (i = 0; i < evlist->nr_mmaps; i++)
+ +			perf_mmap__munmap(&evlist->mmap[i]);
+ +
+ +	if (evlist->overwrite_mmap)
+ +		for (i = 0; i < evlist->nr_mmaps; i++)
+ +			perf_mmap__munmap(&evlist->overwrite_mmap[i]);
+++=======
++ 		for (i = 0; i < evlist->core.nr_mmaps; i++)
++ 			perf_mmap__munmap(&evlist->mmap[i].core);
++ 
++ 	if (evlist->overwrite_mmap)
++ 		for (i = 0; i < evlist->core.nr_mmaps; i++)
++ 			perf_mmap__munmap(&evlist->overwrite_mmap[i].core);
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  }
+  
+ -void evlist__munmap(struct evlist *evlist)
+ +void perf_evlist__munmap(struct perf_evlist *evlist)
+  {
+ -	evlist__munmap_nofree(evlist);
+ +	perf_evlist__munmap_nofree(evlist);
+  	zfree(&evlist->mmap);
+  	zfree(&evlist->overwrite_mmap);
+  }
+  
+++<<<<<<< HEAD
+ +static struct perf_mmap *perf_evlist__alloc_mmap(struct perf_evlist *evlist,
+ +						 bool overwrite)
+++=======
++ static void perf_mmap__unmap_cb(struct perf_mmap *map)
++ {
++ 	struct mmap *m = container_of(map, struct mmap, core);
++ 
++ 	mmap__munmap(m);
++ }
++ 
++ static struct mmap *evlist__alloc_mmap(struct evlist *evlist,
++ 				       bool overwrite)
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  {
+  	int i;
+ -	struct mmap *map;
+ +	struct perf_mmap *map;
+  
+ -	evlist->core.nr_mmaps = perf_cpu_map__nr(evlist->core.cpus);
+ -	if (perf_cpu_map__empty(evlist->core.cpus))
+ -		evlist->core.nr_mmaps = perf_thread_map__nr(evlist->core.threads);
+ -	map = zalloc(evlist->core.nr_mmaps * sizeof(struct mmap));
+ +	evlist->nr_mmaps = cpu_map__nr(evlist->cpus);
+ +	if (cpu_map__empty(evlist->cpus))
+ +		evlist->nr_mmaps = thread_map__nr(evlist->threads);
+ +	map = zalloc(evlist->nr_mmaps * sizeof(struct perf_mmap));
+  	if (!map)
+  		return NULL;
+  
+@@@ -741,8 -645,9 +762,12 @@@
+  		 * Each PERF_EVENT_IOC_SET_OUTPUT points to this mmap and
+  		 * thus does perf_mmap__get() on it.
+  		 */
+++<<<<<<< HEAD
+ +		refcount_set(&map[i].refcnt, 0);
+++=======
++ 		perf_mmap__init(&map[i].core, overwrite, perf_mmap__unmap_cb);
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  	}
+ -
+  	return map;
+  }
+  
+@@@ -815,9 -720,9 +840,15 @@@ static int perf_evlist__mmap_per_evsel(
+  		 * other events, so it should not need to be polled anyway.
+  		 * Therefore don't add it for polling.
+  		 */
+++<<<<<<< HEAD
+ +		if (!evsel->system_wide &&
+ +		    __perf_evlist__add_pollfd(evlist, fd, &maps[idx], revent) < 0) {
+ +			perf_mmap__put(&maps[idx]);
+++=======
++ 		if (!evsel->core.system_wide &&
++ 		     perf_evlist__add_pollfd(&evlist->core, fd, &maps[idx], revent) < 0) {
++ 			perf_mmap__put(&maps[idx].core);
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  			return -1;
+  		}
+  
+diff --cc tools/perf/util/mmap.c
+index 850493205040,9f150d50cea5..000000000000
+--- a/tools/perf/util/mmap.c
++++ b/tools/perf/util/mmap.c
+@@@ -101,34 -105,21 +101,43 @@@ union perf_event *perf_mmap__read_event
+  	return event;
+  }
+  
+ -static bool perf_mmap__empty(struct mmap *map)
+ +static bool perf_mmap__empty(struct perf_mmap *map)
+  {
+ -	return perf_mmap__read_head(map) == map->core.prev && !map->auxtrace_mmap.base;
+ +	return perf_mmap__read_head(map) == map->prev && !map->auxtrace_mmap.base;
+  }
+  
+++<<<<<<< HEAD
+ +void perf_mmap__get(struct perf_mmap *map)
+ +{
+ +	refcount_inc(&map->refcnt);
+ +}
+ +
+ +void perf_mmap__put(struct perf_mmap *map)
+++=======
++ void perf_mmap__consume(struct mmap *map)
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+ +{
+ +	BUG_ON(map->base && refcount_read(&map->refcnt) == 0);
+ +
+ +	if (refcount_dec_and_test(&map->refcnt))
+ +		perf_mmap__munmap(map);
+ +}
+ +
+ +void perf_mmap__consume(struct perf_mmap *map)
+  {
+ -	if (!map->core.overwrite) {
+ -		u64 old = map->core.prev;
+ +	if (!map->overwrite) {
+ +		u64 old = map->prev;
+  
+  		perf_mmap__write_tail(map, old);
+  	}
+  
+++<<<<<<< HEAD
+ +	if (refcount_read(&map->refcnt) == 1 && perf_mmap__empty(map))
+ +		perf_mmap__put(map);
+++=======
++ 	if (refcount_read(&map->core.refcnt) == 1 && perf_mmap__empty(map))
++ 		perf_mmap__put(&map->core);
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  }
+  
+  int __weak auxtrace_mmap__mmap(struct auxtrace_mmap *mm __maybe_unused,
+diff --cc tools/perf/util/mmap.h
+index 274ce389cd84,78e3c4436ce8..000000000000
+--- a/tools/perf/util/mmap.h
++++ b/tools/perf/util/mmap.h
+@@@ -77,33 -42,30 +77,37 @@@ struct mmap_params 
+  	struct auxtrace_mmap_params auxtrace_mp;
+  };
+  
+ -int mmap__mmap(struct mmap *map, struct mmap_params *mp, int fd, int cpu);
+ -void mmap__munmap(struct mmap *map);
+ +int perf_mmap__mmap(struct perf_mmap *map, struct mmap_params *mp, int fd, int cpu);
+ +void perf_mmap__munmap(struct perf_mmap *map);
+ +
+++<<<<<<< HEAD
+ +void perf_mmap__get(struct perf_mmap *map);
+ +void perf_mmap__put(struct perf_mmap *map);
+  
+ +void perf_mmap__consume(struct perf_mmap *map);
+++=======
++ void perf_mmap__consume(struct mmap *map);
+++>>>>>>> 80e53d114823 (libperf: Adopt perf_mmap__put() function from tools/perf)
+  
+ -static inline u64 perf_mmap__read_head(struct mmap *mm)
+ +static inline u64 perf_mmap__read_head(struct perf_mmap *mm)
+  {
+ -	return ring_buffer_read_head(mm->core.base);
+ +	return ring_buffer_read_head(mm->base);
+  }
+  
+ -static inline void perf_mmap__write_tail(struct mmap *md, u64 tail)
+ +static inline void perf_mmap__write_tail(struct perf_mmap *md, u64 tail)
+  {
+ -	ring_buffer_write_tail(md->core.base, tail);
+ +	ring_buffer_write_tail(md->base, tail);
+  }
+  
+ -union perf_event *perf_mmap__read_forward(struct mmap *map);
+ +union perf_event *perf_mmap__read_forward(struct perf_mmap *map);
+  
+ -union perf_event *perf_mmap__read_event(struct mmap *map);
+ +union perf_event *perf_mmap__read_event(struct perf_mmap *map);
+  
+ -int perf_mmap__push(struct mmap *md, void *to,
+ -		    int push(struct mmap *map, void *to, void *buf, size_t size));
+ +int perf_mmap__push(struct perf_mmap *md, void *to,
+ +		    int push(struct perf_mmap *map, void *to, void *buf, size_t size));
+  
+ -size_t mmap__mmap_len(struct mmap *map);
+ +size_t perf_mmap__mmap_len(struct perf_mmap *map);
+  
+ -int perf_mmap__read_init(struct mmap *md);
+ -void perf_mmap__read_done(struct mmap *map);
+ +int perf_mmap__read_init(struct perf_mmap *md);
+ +void perf_mmap__read_done(struct perf_mmap *map);
+  #endif /*__PERF_MMAP_H */
+* Unmerged path tools/perf/lib/include/internal/mmap.h
+* Unmerged path tools/perf/lib/mmap.c
+diff --git a/tools/perf/builtin-record.c b/tools/perf/builtin-record.c
+index de0619148499..6c6338d47015 100644
+--- a/tools/perf/builtin-record.c
++++ b/tools/perf/builtin-record.c
+@@ -193,7 +193,7 @@ static int record__aio_complete(struct perf_mmap *md, struct aiocb *cblock)
+ 		 * every aio write request started in record__aio_push() so
+ 		 * decrement it because the request is now complete.
+ 		 */
+-		perf_mmap__put(md);
++		perf_mmap__put(&md->core);
+ 		rc = 1;
+ 	} else {
+ 		/*
+@@ -328,7 +328,7 @@ static int record__aio_push(struct record *rec, struct perf_mmap *map, off_t *of
+ 		 * map->refcount is decremented in record__aio_complete() after
+ 		 * aio write operation finishes successfully.
+ 		 */
+-		perf_mmap__put(map);
++		perf_mmap__put(&map->core);
+ 	}
+ 
+ 	return ret;
+* Unmerged path tools/perf/lib/include/internal/mmap.h
+* Unmerged path tools/perf/lib/mmap.c
+* Unmerged path tools/perf/util/evlist.c
+* Unmerged path tools/perf/util/mmap.c
+* Unmerged path tools/perf/util/mmap.h
