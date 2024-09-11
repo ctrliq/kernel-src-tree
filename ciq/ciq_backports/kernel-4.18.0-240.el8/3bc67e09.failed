@@ -1,0 +1,129 @@
+net/smc: adapt SMC remote CONFIRM_RKEY processing to use the LLC flow
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Karsten Graul <kgraul@linux.ibm.com>
+commit 3bc67e098c3e215f6e09ba3c0e1f569e7ae020d0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3bc67e09.failed
+
+Use the LLC flow framework for the processing of CONFIRM_RKEY messages
+that were received from the peer.
+
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Reviewed-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 3bc67e098c3e215f6e09ba3c0e1f569e7ae020d0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_llc.c
+diff --cc net/smc/smc_llc.c
+index 4119cdb6b6bf,b7b5cc01b78e..000000000000
+--- a/net/smc/smc_llc.c
++++ b/net/smc/smc_llc.c
+@@@ -461,57 -551,54 +462,90 @@@ static void smc_llc_rx_delete_link(stru
+  {
+  	struct smc_link_group *lgr = smc_get_lgr(link);
+  
+ -	smc_lgr_forget(lgr);
+ -	smc_llc_link_deleting(link);
+ -	if (lgr->role == SMC_SERV) {
+ -		/* client asks to delete this link, send request */
+ -		smc_llc_prep_delete_link(llc, link, SMC_LLC_REQ, true);
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (lgr->role == SMC_SERV)
+ +			smc_lgr_schedule_free_work_fast(lgr);
+ +	} else {
+ +		smc_lgr_forget(lgr);
+ +		smc_llc_link_deleting(link);
+ +		if (lgr->role == SMC_SERV) {
+ +			/* client asks to delete this link, send request */
+ +			smc_llc_prep_delete_link(llc, link, SMC_LLC_REQ, true);
+ +		} else {
+ +			/* server requests to delete this link, send response */
+ +			smc_llc_prep_delete_link(llc, link, SMC_LLC_RESP, true);
+ +		}
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+ +		smc_lgr_terminate_sched(lgr);
+ +	}
+ +}
+ +
+ +static void smc_llc_rx_test_link(struct smc_link *link,
+ +				 struct smc_llc_msg_test_link *llc)
+ +{
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		if (link->state == SMC_LNK_ACTIVE)
+ +			complete(&link->llc_testlink_resp);
+  	} else {
+ -		/* server requests to delete this link, send response */
+ -		smc_llc_prep_delete_link(llc, link, SMC_LLC_RESP, true);
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+  	}
+ -	smc_llc_send_message(link, llc);
+ -	smc_lgr_terminate_sched(lgr);
+  }
+  
+- static void smc_llc_rx_confirm_rkey(struct smc_link *link,
+- 				    struct smc_llc_msg_confirm_rkey *llc)
++ /* process a confirm_rkey request from peer, remote flow */
++ static void smc_llc_rmt_conf_rkey(struct smc_link_group *lgr)
+  {
+- 	int rc;
++ 	struct smc_llc_msg_confirm_rkey *llc;
++ 	struct smc_llc_qentry *qentry;
++ 	struct smc_link *link;
++ 	int num_entries;
++ 	int rk_idx;
++ 	int i;
+  
+++<<<<<<< HEAD
+ +	if (llc->hd.flags & SMC_LLC_FLAG_RESP) {
+ +		link->llc_confirm_rkey_rc = llc->hd.flags &
+ +					    SMC_LLC_FLAG_RKEY_NEG;
+ +		complete(&link->llc_confirm_rkey);
+ +	} else {
+ +		rc = smc_rtoken_add(link,
+ +				    llc->rtoken[0].rmb_vaddr,
+ +				    llc->rtoken[0].rmb_key);
+ +
+ +		/* ignore rtokens for other links, we have only one link */
+ +
+ +		llc->hd.flags |= SMC_LLC_FLAG_RESP;
+ +		if (rc < 0)
+ +			llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
+ +		smc_llc_send_message(link, llc, sizeof(*llc));
+ +	}
+++=======
++ 	qentry = lgr->llc_flow_rmt.qentry;
++ 	llc = &qentry->msg.confirm_rkey;
++ 	link = qentry->link;
++ 
++ 	num_entries = llc->rtoken[0].num_rkeys;
++ 	/* first rkey entry is for receiving link */
++ 	rk_idx = smc_rtoken_add(link,
++ 				llc->rtoken[0].rmb_vaddr,
++ 				llc->rtoken[0].rmb_key);
++ 	if (rk_idx < 0)
++ 		goto out_err;
++ 
++ 	for (i = 1; i <= min_t(u8, num_entries, SMC_LLC_RKEYS_PER_MSG - 1); i++)
++ 		smc_rtoken_set2(lgr, rk_idx, llc->rtoken[i].link_id,
++ 				llc->rtoken[i].rmb_vaddr,
++ 				llc->rtoken[i].rmb_key);
++ 	/* max links is 3 so there is no need to support conf_rkey_cont msgs */
++ 	goto out;
++ out_err:
++ 	llc->hd.flags |= SMC_LLC_FLAG_RKEY_NEG;
++ 	llc->hd.flags |= SMC_LLC_FLAG_RKEY_RETRY;
++ out:
++ 	llc->hd.flags |= SMC_LLC_FLAG_RESP;
++ 	smc_llc_send_message(link, &qentry->msg);
++ 	smc_llc_flow_qentry_del(&lgr->llc_flow_rmt);
+++>>>>>>> 3bc67e098c3e (net/smc: adapt SMC remote CONFIRM_RKEY processing to use the LLC flow)
+  }
+  
+  static void smc_llc_rx_confirm_rkey_cont(struct smc_link *link,
+* Unmerged path net/smc/smc_llc.c
