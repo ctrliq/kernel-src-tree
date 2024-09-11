@@ -1,0 +1,87 @@
+RDMA/bnxt_re: Wait for all the CQ events before freeing CQ data structures
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Selvin Xavier <selvin.xavier@broadcom.com>
+commit b1d56fdcb66ebe6604166d71a26744d3cd03fecb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/b1d56fdc.failed
+
+Destroy CQ command to firmware returns the num_cnq_events as a
+response. This indicates the driver about the number of CQ events
+generated for this CQ. Driver should wait for all these events before
+freeing the CQ host structures.  Also, add routine to clean all the
+pending notification for the CQs getting destroyed. This avoids the
+possibility of accessing the CQ data structures after its freed.
+
+Fixes: 1ac5a4047975 ("RDMA/bnxt_re: Add bnxt_re RoCE driver")
+Link: https://lore.kernel.org/r/1584120842-3200-1-git-send-email-selvin.xavier@broadcom.com
+	Signed-off-by: Selvin Xavier <selvin.xavier@broadcom.com>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit b1d56fdcb66ebe6604166d71a26744d3cd03fecb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/bnxt_re/qplib_fp.c
+diff --cc drivers/infiniband/hw/bnxt_re/qplib_fp.c
+index dff535996557,899a5d2c100e..000000000000
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.c
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.c
+@@@ -241,12 -304,12 +306,13 @@@ static void bnxt_qplib_service_nq(unsig
+  	struct bnxt_qplib_cq *cq;
+  	int num_cqne_processed = 0;
+  	int num_srqne_processed = 0;
+ -	int budget = nq->budget;
+  	u32 sw_cons, raw_cons;
+ -	uintptr_t q_handle;
+  	u16 type;
+ +	int budget = nq->budget;
+ +	uintptr_t q_handle;
+ +	bool gen_p5 = bnxt_qplib_is_chip_gen_p5(nq->res->cctx);
+  
++ 	spin_lock_bh(&hwq->lock);
+  	/* Service the NQ until empty */
+  	raw_cons = hwq->cons;
+  	while (budget--) {
+@@@ -272,7 -335,10 +338,14 @@@
+  			q_handle |= (u64)le32_to_cpu(nqcne->cq_handle_high)
+  						     << 32;
+  			cq = (struct bnxt_qplib_cq *)(unsigned long)q_handle;
+++<<<<<<< HEAD
+ +			bnxt_qplib_arm_cq_enable(cq);
+++=======
++ 			if (!cq)
++ 				break;
++ 			bnxt_qplib_armen_db(&cq->dbinfo,
++ 					    DBC_DBC_TYPE_CQ_ARMENA);
+++>>>>>>> b1d56fdcb66e (RDMA/bnxt_re: Wait for all the CQ events before freeing CQ data structures)
+  			spin_lock_bh(&cq->compl_lock);
+  			atomic_set(&cq->arm_state, 0);
+  			if (!nq->cqn_handler(nq, (cq)))
+@@@ -314,10 -383,9 +388,11 @@@
+  	}
+  	if (hwq->cons != raw_cons) {
+  		hwq->cons = raw_cons;
+ -		bnxt_qplib_ring_nq_db(&nq->nq_db.dbinfo, nq->res->cctx, true);
+ +		bnxt_qplib_ring_nq_db_rearm(nq->bar_reg_iomem, hwq->cons,
+ +					    hwq->max_elements, nq->ring_id,
+ +					    gen_p5);
+  	}
++ 	spin_unlock_bh(&hwq->lock);
+  }
+  
+  static irqreturn_t bnxt_qplib_nq_irq(int irq, void *dev_instance)
+* Unmerged path drivers/infiniband/hw/bnxt_re/qplib_fp.c
+diff --git a/drivers/infiniband/hw/bnxt_re/qplib_fp.h b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+index d3f080c18b27..1ac35d5250c5 100644
+--- a/drivers/infiniband/hw/bnxt_re/qplib_fp.h
++++ b/drivers/infiniband/hw/bnxt_re/qplib_fp.h
+@@ -401,6 +401,7 @@ struct bnxt_qplib_cq {
+  * of the same QP while manipulating the flush list.
+  */
+ 	spinlock_t			flush_lock; /* QP flush management */
++	u16				cnq_events;
+ };
+ 
+ #define BNXT_QPLIB_MAX_IRRQE_ENTRY_SIZE	sizeof(struct xrrq_irrq)
