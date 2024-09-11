@@ -1,0 +1,433 @@
+xarray: Extract entries from an XArray
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Matthew Wilcox <willy@infradead.org>
+commit 80a0a1a9a3cde9b23851e8eb7160e2786549306a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/80a0a1a9.failed
+
+The xa_extract function combines the functionality of
+radix_tree_gang_lookup() and radix_tree_gang_lookup_tagged().
+It extracts entries matching the specified filter into a normal array.
+
+	Signed-off-by: Matthew Wilcox <willy@infradead.org>
+(cherry picked from commit 80a0a1a9a3cde9b23851e8eb7160e2786549306a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/xarray.h
+#	lib/xarray.c
+diff --cc include/linux/xarray.h
+index 2dfc8006fe64,82ceed981924..000000000000
+--- a/include/linux/xarray.h
++++ b/include/linux/xarray.h
+@@@ -4,10 -4,400 +4,395 @@@
+  /*
+   * eXtensible Arrays
+   * Copyright (c) 2017 Microsoft Corporation
+ - * Author: Matthew Wilcox <willy@infradead.org>
+ - *
+ - * See Documentation/core-api/xarray.rst for how to use the XArray.
+ + * Author: Matthew Wilcox <mawilcox@microsoft.com>
+   */
+  
+ -#include <linux/bug.h>
+ -#include <linux/compiler.h>
+ -#include <linux/gfp.h>
+ -#include <linux/kconfig.h>
+ -#include <linux/kernel.h>
+ -#include <linux/rcupdate.h>
+  #include <linux/spinlock.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/types.h>
++ 
++ /*
++  * The bottom two bits of the entry determine how the XArray interprets
++  * the contents:
++  *
++  * 00: Pointer entry
++  * 10: Internal entry
++  * x1: Value entry or tagged pointer
++  *
++  * Attempting to store internal entries in the XArray is a bug.
++  *
++  * Most internal entries are pointers to the next node in the tree.
++  * The following internal entries have a special meaning:
++  *
++  * 0-62: Sibling entries
++  * 256: Retry entry
++  *
++  * Errors are also represented as internal entries, but use the negative
++  * space (-4094 to -2).  They're never stored in the slots array; only
++  * returned by the normal API.
++  */
++ 
++ #define BITS_PER_XA_VALUE	(BITS_PER_LONG - 1)
++ 
++ /**
++  * xa_mk_value() - Create an XArray entry from an integer.
++  * @v: Value to store in XArray.
++  *
++  * Context: Any context.
++  * Return: An entry suitable for storing in the XArray.
++  */
++ static inline void *xa_mk_value(unsigned long v)
++ {
++ 	WARN_ON((long)v < 0);
++ 	return (void *)((v << 1) | 1);
++ }
++ 
++ /**
++  * xa_to_value() - Get value stored in an XArray entry.
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: The value stored in the XArray entry.
++  */
++ static inline unsigned long xa_to_value(const void *entry)
++ {
++ 	return (unsigned long)entry >> 1;
++ }
++ 
++ /**
++  * xa_is_value() - Determine if an entry is a value.
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: True if the entry is a value, false if it is a pointer.
++  */
++ static inline bool xa_is_value(const void *entry)
++ {
++ 	return (unsigned long)entry & 1;
++ }
++ 
++ /**
++  * xa_tag_pointer() - Create an XArray entry for a tagged pointer.
++  * @p: Plain pointer.
++  * @tag: Tag value (0, 1 or 3).
++  *
++  * If the user of the XArray prefers, they can tag their pointers instead
++  * of storing value entries.  Three tags are available (0, 1 and 3).
++  * These are distinct from the xa_mark_t as they are not replicated up
++  * through the array and cannot be searched for.
++  *
++  * Context: Any context.
++  * Return: An XArray entry.
++  */
++ static inline void *xa_tag_pointer(void *p, unsigned long tag)
++ {
++ 	return (void *)((unsigned long)p | tag);
++ }
++ 
++ /**
++  * xa_untag_pointer() - Turn an XArray entry into a plain pointer.
++  * @entry: XArray entry.
++  *
++  * If you have stored a tagged pointer in the XArray, call this function
++  * to get the untagged version of the pointer.
++  *
++  * Context: Any context.
++  * Return: A pointer.
++  */
++ static inline void *xa_untag_pointer(void *entry)
++ {
++ 	return (void *)((unsigned long)entry & ~3UL);
++ }
++ 
++ /**
++  * xa_pointer_tag() - Get the tag stored in an XArray entry.
++  * @entry: XArray entry.
++  *
++  * If you have stored a tagged pointer in the XArray, call this function
++  * to get the tag of that pointer.
++  *
++  * Context: Any context.
++  * Return: A tag.
++  */
++ static inline unsigned int xa_pointer_tag(void *entry)
++ {
++ 	return (unsigned long)entry & 3UL;
++ }
++ 
++ /*
++  * xa_mk_internal() - Create an internal entry.
++  * @v: Value to turn into an internal entry.
++  *
++  * Context: Any context.
++  * Return: An XArray internal entry corresponding to this value.
++  */
++ static inline void *xa_mk_internal(unsigned long v)
++ {
++ 	return (void *)((v << 2) | 2);
++ }
++ 
++ /*
++  * xa_to_internal() - Extract the value from an internal entry.
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: The value which was stored in the internal entry.
++  */
++ static inline unsigned long xa_to_internal(const void *entry)
++ {
++ 	return (unsigned long)entry >> 2;
++ }
++ 
++ /*
++  * xa_is_internal() - Is the entry an internal entry?
++  * @entry: XArray entry.
++  *
++  * Context: Any context.
++  * Return: %true if the entry is an internal entry.
++  */
++ static inline bool xa_is_internal(const void *entry)
++ {
++ 	return ((unsigned long)entry & 3) == 2;
++ }
++ 
++ /**
++  * xa_is_err() - Report whether an XArray operation returned an error
++  * @entry: Result from calling an XArray function
++  *
++  * If an XArray operation cannot complete an operation, it will return
++  * a special value indicating an error.  This function tells you
++  * whether an error occurred; xa_err() tells you which error occurred.
++  *
++  * Context: Any context.
++  * Return: %true if the entry indicates an error.
++  */
++ static inline bool xa_is_err(const void *entry)
++ {
++ 	return unlikely(xa_is_internal(entry));
++ }
++ 
++ /**
++  * xa_err() - Turn an XArray result into an errno.
++  * @entry: Result from calling an XArray function.
++  *
++  * If an XArray operation cannot complete an operation, it will return
++  * a special pointer value which encodes an errno.  This function extracts
++  * the errno from the pointer value, or returns 0 if the pointer does not
++  * represent an errno.
++  *
++  * Context: Any context.
++  * Return: A negative errno or 0.
++  */
++ static inline int xa_err(void *entry)
++ {
++ 	/* xa_to_internal() would not do sign extension. */
++ 	if (xa_is_err(entry))
++ 		return (long)entry >> 2;
++ 	return 0;
++ }
++ 
++ typedef unsigned __bitwise xa_mark_t;
++ #define XA_MARK_0		((__force xa_mark_t)0U)
++ #define XA_MARK_1		((__force xa_mark_t)1U)
++ #define XA_MARK_2		((__force xa_mark_t)2U)
++ #define XA_PRESENT		((__force xa_mark_t)8U)
++ #define XA_MARK_MAX		XA_MARK_2
++ 
++ enum xa_lock_type {
++ 	XA_LOCK_IRQ = 1,
++ 	XA_LOCK_BH = 2,
++ };
++ 
++ /*
++  * Values for xa_flags.  The radix tree stores its GFP flags in the xa_flags,
++  * and we remain compatible with that.
++  */
++ #define XA_FLAGS_LOCK_IRQ	((__force gfp_t)XA_LOCK_IRQ)
++ #define XA_FLAGS_LOCK_BH	((__force gfp_t)XA_LOCK_BH)
++ #define XA_FLAGS_MARK(mark)	((__force gfp_t)((1U << __GFP_BITS_SHIFT) << \
++ 						(__force unsigned)(mark)))
++ 
++ /**
++  * struct xarray - The anchor of the XArray.
++  * @xa_lock: Lock that protects the contents of the XArray.
++  *
++  * To use the xarray, define it statically or embed it in your data structure.
++  * It is a very small data structure, so it does not usually make sense to
++  * allocate it separately and keep a pointer to it in your data structure.
++  *
++  * You may use the xa_lock to protect your own data structures as well.
++  */
++ /*
++  * If all of the entries in the array are NULL, @xa_head is a NULL pointer.
++  * If the only non-NULL entry in the array is at index 0, @xa_head is that
++  * entry.  If any other entry in the array is non-NULL, @xa_head points
++  * to an @xa_node.
++  */
++ struct xarray {
++ 	spinlock_t	xa_lock;
++ /* private: The rest of the data structure is not to be used directly. */
++ 	gfp_t		xa_flags;
++ 	void __rcu *	xa_head;
++ };
++ 
++ #define XARRAY_INIT(name, flags) {				\
++ 	.xa_lock = __SPIN_LOCK_UNLOCKED(name.xa_lock),		\
++ 	.xa_flags = flags,					\
++ 	.xa_head = NULL,					\
++ }
++ 
++ /**
++  * DEFINE_XARRAY_FLAGS() - Define an XArray with custom flags.
++  * @name: A string that names your XArray.
++  * @flags: XA_FLAG values.
++  *
++  * This is intended for file scope definitions of XArrays.  It declares
++  * and initialises an empty XArray with the chosen name and flags.  It is
++  * equivalent to calling xa_init_flags() on the array, but it does the
++  * initialisation at compiletime instead of runtime.
++  */
++ #define DEFINE_XARRAY_FLAGS(name, flags)				\
++ 	struct xarray name = XARRAY_INIT(name, flags)
++ 
++ /**
++  * DEFINE_XARRAY() - Define an XArray.
++  * @name: A string that names your XArray.
++  *
++  * This is intended for file scope definitions of XArrays.  It declares
++  * and initialises an empty XArray with the chosen name.  It is equivalent
++  * to calling xa_init() on the array, but it does the initialisation at
++  * compiletime instead of runtime.
++  */
++ #define DEFINE_XARRAY(name) DEFINE_XARRAY_FLAGS(name, 0)
++ 
++ void xa_init_flags(struct xarray *, gfp_t flags);
++ void *xa_load(struct xarray *, unsigned long index);
++ void *xa_store(struct xarray *, unsigned long index, void *entry, gfp_t);
++ void *xa_cmpxchg(struct xarray *, unsigned long index,
++ 			void *old, void *entry, gfp_t);
++ bool xa_get_mark(struct xarray *, unsigned long index, xa_mark_t);
++ void xa_set_mark(struct xarray *, unsigned long index, xa_mark_t);
++ void xa_clear_mark(struct xarray *, unsigned long index, xa_mark_t);
++ void *xa_find(struct xarray *xa, unsigned long *index,
++ 		unsigned long max, xa_mark_t) __attribute__((nonnull(2)));
++ void *xa_find_after(struct xarray *xa, unsigned long *index,
++ 		unsigned long max, xa_mark_t) __attribute__((nonnull(2)));
++ unsigned int xa_extract(struct xarray *, void **dst, unsigned long start,
++ 		unsigned long max, unsigned int n, xa_mark_t);
++ 
++ /**
++  * xa_init() - Initialise an empty XArray.
++  * @xa: XArray.
++  *
++  * An empty XArray is full of NULL entries.
++  *
++  * Context: Any context.
++  */
++ static inline void xa_init(struct xarray *xa)
++ {
++ 	xa_init_flags(xa, 0);
++ }
++ 
++ /**
++  * xa_empty() - Determine if an array has any present entries.
++  * @xa: XArray.
++  *
++  * Context: Any context.
++  * Return: %true if the array contains only NULL pointers.
++  */
++ static inline bool xa_empty(const struct xarray *xa)
++ {
++ 	return xa->xa_head == NULL;
++ }
++ 
++ /**
++  * xa_marked() - Inquire whether any entry in this array has a mark set
++  * @xa: Array
++  * @mark: Mark value
++  *
++  * Context: Any context.
++  * Return: %true if any entry has this mark set.
++  */
++ static inline bool xa_marked(const struct xarray *xa, xa_mark_t mark)
++ {
++ 	return xa->xa_flags & XA_FLAGS_MARK(mark);
++ }
++ 
++ /**
++  * xa_erase() - Erase this entry from the XArray.
++  * @xa: XArray.
++  * @index: Index of entry.
++  *
++  * This function is the equivalent of calling xa_store() with %NULL as
++  * the third argument.  The XArray does not need to allocate memory, so
++  * the user does not need to provide GFP flags.
++  *
++  * Context: Process context.  Takes and releases the xa_lock.
++  * Return: The entry which used to be at this index.
++  */
++ static inline void *xa_erase(struct xarray *xa, unsigned long index)
++ {
++ 	return xa_store(xa, index, NULL, 0);
++ }
++ 
++ /**
++  * xa_insert() - Store this entry in the XArray unless another entry is
++  *			already present.
++  * @xa: XArray.
++  * @index: Index into array.
++  * @entry: New entry.
++  * @gfp: Memory allocation flags.
++  *
++  * If you would rather see the existing entry in the array, use xa_cmpxchg().
++  * This function is for users who don't care what the entry is, only that
++  * one is present.
++  *
++  * Context: Process context.  Takes and releases the xa_lock.
++  *	    May sleep if the @gfp flags permit.
++  * Return: 0 if the store succeeded.  -EEXIST if another entry was present.
++  * -ENOMEM if memory could not be allocated.
++  */
++ static inline int xa_insert(struct xarray *xa, unsigned long index,
++ 		void *entry, gfp_t gfp)
++ {
++ 	void *curr = xa_cmpxchg(xa, index, NULL, entry, gfp);
++ 	if (!curr)
++ 		return 0;
++ 	if (xa_is_err(curr))
++ 		return xa_err(curr);
++ 	return -EEXIST;
++ }
++ 
++ /**
++  * xa_for_each() - Iterate over a portion of an XArray.
++  * @xa: XArray.
++  * @entry: Entry retrieved from array.
++  * @index: Index of @entry.
++  * @max: Maximum index to retrieve from array.
++  * @filter: Selection criterion.
++  *
++  * Initialise @index to the lowest index you want to retrieve from the
++  * array.  During the iteration, @entry will have the value of the entry
++  * stored in @xa at @index.  The iteration will skip all entries in the
++  * array which do not match @filter.  You may modify @index during the
++  * iteration if you want to skip or reprocess indices.  It is safe to modify
++  * the array during the iteration.  At the end of the iteration, @entry will
++  * be set to NULL and @index will have a value less than or equal to max.
++  *
++  * xa_for_each() is O(n.log(n)) while xas_for_each() is O(n).  You have
++  * to handle your own locking with xas_for_each(), and if you have to unlock
++  * after each iteration, it will also end up being O(n.log(n)).  xa_for_each()
++  * will spin if it hits a retry entry; if you intend to see retry entries,
++  * you should use the xas_for_each() iterator instead.  The xas_for_each()
++  * iterator will expand into more inline code than xa_for_each().
++  *
++  * Context: Any context.  Takes and releases the RCU lock.
++  */
++ #define xa_for_each(xa, entry, index, max, filter) \
++ 	for (entry = xa_find(xa, &index, max, filter); entry; \
++ 	     entry = xa_find_after(xa, &index, max, filter))
+++>>>>>>> 80a0a1a9a3cd (xarray: Extract entries from an XArray)
+  
+  #define xa_trylock(xa)		spin_trylock(&(xa)->xa_lock)
+  #define xa_lock(xa)		spin_lock(&(xa)->xa_lock)
+* Unmerged path lib/xarray.c
+* Unmerged path include/linux/xarray.h
+* Unmerged path lib/xarray.c
