@@ -31,6 +31,15 @@ struct prog_test_def {
 	int old_error_cnt;
 };
 
+/* Override C runtime library's usleep() implementation to ensure nanosleep()
+ * is always called. Usleep is frequently used in selftests as a way to
+ * trigger kprobe and tracepoints.
+ */
+int usleep(useconds_t usec)
+{
+	return syscall(__NR_nanosleep, usec * 1000UL);
+}
+
 static bool should_run(struct test_selector *sel, int num, const char *name)
 {
 	if (sel->name && sel->name[0] && !strstr(name, sel->name))
