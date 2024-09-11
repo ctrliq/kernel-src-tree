@@ -1899,7 +1899,7 @@ static struct rdma_id_private *cma_new_conn_id(struct rdma_cm_id *listen_id,
 		rt->path_rec[1] = *ib_event->param.req_rcvd.alternate_path;
 
 	if (net_dev) {
-		rdma_copy_addr(&rt->addr.dev_addr, net_dev, NULL);
+		rdma_copy_src_l2_addr(&rt->addr.dev_addr, net_dev);
 	} else {
 		if (!cma_protocol_roce(listen_id) &&
 		    cma_any_addr(cma_src_addr(id_priv))) {
@@ -1948,7 +1948,7 @@ static struct rdma_id_private *cma_new_udp_id(struct rdma_cm_id *listen_id,
 		goto err;
 
 	if (net_dev) {
-		rdma_copy_addr(&id->route.addr.dev_addr, net_dev, NULL);
+		rdma_copy_src_l2_addr(&id->route.addr.dev_addr, net_dev);
 	} else {
 		if (!cma_any_addr(cma_src_addr(id_priv))) {
 			ret = cma_translate_addr(cma_src_addr(id_priv),
