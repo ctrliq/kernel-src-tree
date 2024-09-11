@@ -1828,6 +1828,7 @@ fetch_mmaped_event(struct perf_session *session,
 struct reader {
 	int	fd;
 	u64	data_size;
+	u64	data_offset;
 };
 
 static int __perf_session__process_events(struct perf_session *session)
@@ -1835,10 +1836,10 @@ static int __perf_session__process_events(struct perf_session *session)
 	struct reader rd = {
 		.fd		= perf_data__fd(session->data),
 		.data_size	= session->header.data_size,
+		.data_offset	= session->header.data_offset,
 	};
 	struct ordered_events *oe = &session->ordered_events;
 	struct perf_tool *tool = session->tool;
-	u64 data_offset = session->header.data_offset;
 	u64 data_size = rd.data_size;
 	u64 head, page_offset, file_offset, file_pos, size;
 	int err, mmap_prot, mmap_flags, map_idx = 0;
@@ -1850,16 +1851,16 @@ static int __perf_session__process_events(struct perf_session *session)
 
 	perf_tool__fill_defaults(tool);
 
-	page_offset = page_size * (data_offset / page_size);
+	page_offset = page_size * (rd.data_offset / page_size);
 	file_offset = page_offset;
-	head = data_offset - page_offset;
+	head = rd.data_offset - page_offset;
 
 	if (data_size == 0)
 		goto out;
 
 	ui_progress__init_size(&prog, data_size, "Processing events...");
 
-	data_size += data_offset;
+	data_size += rd.data_offset;
 
 	mmap_size = MMAP_SIZE;
 	if (mmap_size > data_size) {
