@@ -1,0 +1,1136 @@
+RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit d6f4a21f309dfe10a5693ad236358dd6fcc46f7a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/d6f4a21f.failed
+
+When the ioctl interface for the write commands was introduced it did
+not mark the core response with UVERBS_ATTR_F_VALID_OUTPUT. This causes
+rdma-core in userspace to not mark the buffers as written for valgrind.
+
+Along the same lines it turns out we have always missed marking the driver
+data. Fixing both of these makes valgrind work properly with rdma-core and
+ioctl.
+
+Fixes: 4785860e04bc ("RDMA/uverbs: Implement an ioctl that can call write and write_ex handlers")
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Artemy Kovalyov <artemyko@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit d6f4a21f309dfe10a5693ad236358dd6fcc46f7a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/rdma_core.h
+#	drivers/infiniband/core/uverbs_cmd.c
+#	drivers/infiniband/core/uverbs_ioctl.c
+#	drivers/infiniband/core/uverbs_main.c
+diff --cc drivers/infiniband/core/rdma_core.h
+index a243cc2a59f7,69f8db66925e..000000000000
+--- a/drivers/infiniband/core/rdma_core.h
++++ b/drivers/infiniband/core/rdma_core.h
+@@@ -113,4 -106,119 +113,122 @@@ int uverbs_finalize_object(struct ib_uo
+  			   enum uverbs_obj_access access,
+  			   bool commit);
+  
+++<<<<<<< HEAD
+++=======
++ int uverbs_output_written(const struct uverbs_attr_bundle *bundle, size_t idx);
++ 
++ void setup_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ void release_ufile_idr_uobject(struct ib_uverbs_file *ufile);
++ 
++ /*
++  * This is the runtime description of the uverbs API, used by the syscall
++  * machinery to validate and dispatch calls.
++  */
++ 
++ /*
++  * Depending on ID the slot pointer in the radix tree points at one of these
++  * structs.
++  */
++ 
++ struct uverbs_api_ioctl_method {
++ 	int(__rcu *handler)(struct uverbs_attr_bundle *attrs);
++ 	DECLARE_BITMAP(attr_mandatory, UVERBS_API_ATTR_BKEY_LEN);
++ 	u16 bundle_size;
++ 	u8 use_stack:1;
++ 	u8 driver_method:1;
++ 	u8 disabled:1;
++ 	u8 has_udata:1;
++ 	u8 key_bitmap_len;
++ 	u8 destroy_bkey;
++ };
++ 
++ struct uverbs_api_write_method {
++ 	int (*handler)(struct uverbs_attr_bundle *attrs);
++ 	u8 disabled:1;
++ 	u8 is_ex:1;
++ 	u8 has_udata:1;
++ 	u8 has_resp:1;
++ 	u8 req_size;
++ 	u8 resp_size;
++ };
++ 
++ struct uverbs_api_attr {
++ 	struct uverbs_attr_spec spec;
++ };
++ 
++ struct uverbs_api {
++ 	/* radix tree contains struct uverbs_api_* pointers */
++ 	struct radix_tree_root radix;
++ 	enum rdma_driver_id driver_id;
++ 
++ 	unsigned int num_write;
++ 	unsigned int num_write_ex;
++ 	struct uverbs_api_write_method notsupp_method;
++ 	const struct uverbs_api_write_method **write_methods;
++ 	const struct uverbs_api_write_method **write_ex_methods;
++ };
++ 
++ /*
++  * Get an uverbs_api_object that corresponds to the given object_id.
++  * Note:
++  * -ENOMSG means that any object is allowed to match during lookup.
++  */
++ static inline const struct uverbs_api_object *
++ uapi_get_object(struct uverbs_api *uapi, u16 object_id)
++ {
++ 	const struct uverbs_api_object *res;
++ 
++ 	if (object_id == UVERBS_IDR_ANY_OBJECT)
++ 		return ERR_PTR(-ENOMSG);
++ 
++ 	res = radix_tree_lookup(&uapi->radix, uapi_key_obj(object_id));
++ 	if (!res)
++ 		return ERR_PTR(-ENOENT);
++ 
++ 	return res;
++ }
++ 
++ char *uapi_key_format(char *S, unsigned int key);
++ struct uverbs_api *uverbs_alloc_api(struct ib_device *ibdev);
++ void uverbs_disassociate_api_pre(struct ib_uverbs_device *uverbs_dev);
++ void uverbs_disassociate_api(struct uverbs_api *uapi);
++ void uverbs_destroy_api(struct uverbs_api *uapi);
++ void uapi_compute_bundle_size(struct uverbs_api_ioctl_method *method_elm,
++ 			      unsigned int num_attrs);
++ void uverbs_user_mmap_disassociate(struct ib_uverbs_file *ufile);
++ 
++ extern const struct uapi_definition uverbs_def_obj_counters[];
++ extern const struct uapi_definition uverbs_def_obj_cq[];
++ extern const struct uapi_definition uverbs_def_obj_device[];
++ extern const struct uapi_definition uverbs_def_obj_dm[];
++ extern const struct uapi_definition uverbs_def_obj_flow_action[];
++ extern const struct uapi_definition uverbs_def_obj_intf[];
++ extern const struct uapi_definition uverbs_def_obj_mr[];
++ extern const struct uapi_definition uverbs_def_write_intf[];
++ 
++ static inline const struct uverbs_api_write_method *
++ uapi_get_method(const struct uverbs_api *uapi, u32 command)
++ {
++ 	u32 cmd_idx = command & IB_USER_VERBS_CMD_COMMAND_MASK;
++ 
++ 	if (command & ~(u32)(IB_USER_VERBS_CMD_FLAG_EXTENDED |
++ 			     IB_USER_VERBS_CMD_COMMAND_MASK))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	if (command & IB_USER_VERBS_CMD_FLAG_EXTENDED) {
++ 		if (cmd_idx >= uapi->num_write_ex)
++ 			return ERR_PTR(-EOPNOTSUPP);
++ 		return uapi->write_ex_methods[cmd_idx];
++ 	}
++ 
++ 	if (cmd_idx >= uapi->num_write)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 	return uapi->write_methods[cmd_idx];
++ }
++ 
++ void uverbs_fill_udata(struct uverbs_attr_bundle *bundle,
++ 		       struct ib_udata *udata, unsigned int attr_in,
++ 		       unsigned int attr_out);
++ 
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+  #endif /* RDMA_CORE_H */
+diff --cc drivers/infiniband/core/uverbs_cmd.c
+index 300532a4cde8,3317300ab036..000000000000
+--- a/drivers/infiniband/core/uverbs_cmd.c
++++ b/drivers/infiniband/core/uverbs_cmd.c
+@@@ -47,12 -47,138 +47,142 @@@
+  #include "uverbs.h"
+  #include "core_priv.h"
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Copy a response to userspace. If the provided 'resp' is larger than the
++  * user buffer it is silently truncated. If the user provided a larger buffer
++  * then the trailing portion is zero filled.
++  *
++  * These semantics are intended to support future extension of the output
++  * structures.
++  */
++ static int uverbs_response(struct uverbs_attr_bundle *attrs, const void *resp,
++ 			   size_t resp_len)
++ {
++ 	int ret;
++ 
++ 	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CORE_OUT))
++ 		return uverbs_copy_to_struct_or_zero(
++ 			attrs, UVERBS_ATTR_CORE_OUT, resp, resp_len);
++ 
++ 	if (copy_to_user(attrs->ucore.outbuf, resp,
++ 			 min(attrs->ucore.outlen, resp_len)))
++ 		return -EFAULT;
++ 
++ 	if (resp_len < attrs->ucore.outlen) {
++ 		/*
++ 		 * Zero fill any extra memory that user
++ 		 * space might have provided.
++ 		 */
++ 		ret = clear_user(attrs->ucore.outbuf + resp_len,
++ 				 attrs->ucore.outlen - resp_len);
++ 		if (ret)
++ 			return -EFAULT;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ /*
++  * Copy a request from userspace. If the provided 'req' is larger than the
++  * user buffer then the user buffer is zero extended into the 'req'. If 'req'
++  * is smaller than the user buffer then the uncopied bytes in the user buffer
++  * must be zero.
++  */
++ static int uverbs_request(struct uverbs_attr_bundle *attrs, void *req,
++ 			  size_t req_len)
++ {
++ 	if (copy_from_user(req, attrs->ucore.inbuf,
++ 			   min(attrs->ucore.inlen, req_len)))
++ 		return -EFAULT;
++ 
++ 	if (attrs->ucore.inlen < req_len) {
++ 		memset(req + attrs->ucore.inlen, 0,
++ 		       req_len - attrs->ucore.inlen);
++ 	} else if (attrs->ucore.inlen > req_len) {
++ 		if (!ib_is_buffer_cleared(attrs->ucore.inbuf + req_len,
++ 					  attrs->ucore.inlen - req_len))
++ 			return -EOPNOTSUPP;
++ 	}
++ 	return 0;
++ }
++ 
++ /*
++  * Generate the value for the 'response_length' protocol used by write_ex.
++  * This is the number of bytes the kernel actually wrote. Userspace can use
++  * this to detect what structure members in the response the kernel
++  * understood.
++  */
++ static u32 uverbs_response_length(struct uverbs_attr_bundle *attrs,
++ 				  size_t resp_len)
++ {
++ 	return min_t(size_t, attrs->ucore.outlen, resp_len);
++ }
++ 
++ /*
++  * The iterator version of the request interface is for handlers that need to
++  * step over a flex array at the end of a command header.
++  */
++ struct uverbs_req_iter {
++ 	const void __user *cur;
++ 	const void __user *end;
++ };
++ 
++ static int uverbs_request_start(struct uverbs_attr_bundle *attrs,
++ 				struct uverbs_req_iter *iter,
++ 				void *req,
++ 				size_t req_len)
++ {
++ 	if (attrs->ucore.inlen < req_len)
++ 		return -ENOSPC;
++ 
++ 	if (copy_from_user(req, attrs->ucore.inbuf, req_len))
++ 		return -EFAULT;
++ 
++ 	iter->cur = attrs->ucore.inbuf + req_len;
++ 	iter->end = attrs->ucore.inbuf + attrs->ucore.inlen;
++ 	return 0;
++ }
++ 
++ static int uverbs_request_next(struct uverbs_req_iter *iter, void *val,
++ 			       size_t len)
++ {
++ 	if (iter->cur + len > iter->end)
++ 		return -ENOSPC;
++ 
++ 	if (copy_from_user(val, iter->cur, len))
++ 		return -EFAULT;
++ 
++ 	iter->cur += len;
++ 	return 0;
++ }
++ 
++ static const void __user *uverbs_request_next_ptr(struct uverbs_req_iter *iter,
++ 						  size_t len)
++ {
++ 	const void __user *res = iter->cur;
++ 
++ 	if (iter->cur + len > iter->end)
++ 		return ERR_PTR(-ENOSPC);
++ 	iter->cur += len;
++ 	return res;
++ }
++ 
++ static int uverbs_request_finish(struct uverbs_req_iter *iter)
++ {
++ 	if (!ib_is_buffer_cleared(iter->cur, iter->end - iter->cur))
++ 		return -EOPNOTSUPP;
++ 	return 0;
++ }
++ 
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+  static struct ib_uverbs_completion_event_file *
+ -_ib_uverbs_lookup_comp_file(s32 fd, const struct uverbs_attr_bundle *attrs)
+ +ib_uverbs_lookup_comp_file(int fd, struct ib_ucontext *context)
+  {
+ -	struct ib_uobject *uobj = ufd_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ -					       fd, attrs);
+ +	struct ib_uobject *uobj = uobj_get_read(UVERBS_OBJECT_COMP_CHANNEL,
+ +						fd, context);
+ +	struct ib_uobject_file *uobj_file;
+  
+  	if (IS_ERR(uobj))
+  		return (void *)uobj;
+@@@ -1268,7 -1185,10 +1398,14 @@@ ssize_t ib_uverbs_poll_cq(struct ib_uve
+  		goto out_put;
+  	}
+  
+++<<<<<<< HEAD
+ +	ret = in_len;
+++=======
++ 	if (uverbs_attr_is_valid(attrs, UVERBS_ATTR_CORE_OUT))
++ 		ret = uverbs_output_written(attrs, UVERBS_ATTR_CORE_OUT);
++ 
++ 	ret = 0;
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+  
+  out_put:
+  	uobj_put_obj_read(cq);
+diff --cc drivers/infiniband/core/uverbs_ioctl.c
+index 03065bad8dae,0ca04d224015..000000000000
+--- a/drivers/infiniband/core/uverbs_ioctl.c
++++ b/drivers/infiniband/core/uverbs_ioctl.c
+@@@ -46,35 -144,109 +46,58 @@@ static bool uverbs_is_attr_cleared(cons
+  			   0, uattr->len - len);
+  }
+  
+++<<<<<<< HEAD
+ +static int uverbs_process_attr(struct ib_device *ibdev,
+ +			       struct ib_ucontext *ucontext,
+ +			       const struct ib_uverbs_attr *uattr,
+ +			       u16 attr_id,
+ +			       const struct uverbs_attr_spec_hash *attr_spec_bucket,
+ +			       struct uverbs_attr_bundle_hash *attr_bundle_h,
+ +			       struct ib_uverbs_attr __user *uattr_ptr)
+++=======
++ static int uverbs_set_output(const struct uverbs_attr_bundle *bundle,
++ 			     const struct uverbs_attr *attr)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	u16 flags;
++ 
++ 	flags = pbundle->uattrs[attr->ptr_attr.uattr_idx].flags |
++ 		UVERBS_ATTR_F_VALID_OUTPUT;
++ 	if (put_user(flags,
++ 		     &pbundle->user_attrs[attr->ptr_attr.uattr_idx].flags))
++ 		return -EFAULT;
++ 	return 0;
++ }
++ 
++ static int uverbs_process_idrs_array(struct bundle_priv *pbundle,
++ 				     const struct uverbs_api_attr *attr_uapi,
++ 				     struct uverbs_objs_arr_attr *attr,
++ 				     struct ib_uverbs_attr *uattr,
++ 				     u32 attr_bkey)
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+  {
+ -	const struct uverbs_attr_spec *spec = &attr_uapi->spec;
+ -	size_t array_len;
+ -	u32 *idr_vals;
+ -	int ret = 0;
+ -	size_t i;
+ -
+ -	if (uattr->attr_data.reserved)
+ -		return -EINVAL;
+ -
+ -	if (uattr->len % sizeof(u32))
+ -		return -EINVAL;
+ -
+ -	array_len = uattr->len / sizeof(u32);
+ -	if (array_len < spec->u2.objs_arr.min_len ||
+ -	    array_len > spec->u2.objs_arr.max_len)
+ -		return -EINVAL;
+ -
+ -	attr->uobjects =
+ -		uverbs_alloc(&pbundle->bundle,
+ -			     array_size(array_len, sizeof(*attr->uobjects)));
+ -	if (IS_ERR(attr->uobjects))
+ -		return PTR_ERR(attr->uobjects);
+ -
+ -	/*
+ -	 * Since idr is 4B and *uobjects is >= 4B, we can use attr->uobjects
+ -	 * to store idrs array and avoid additional memory allocation. The
+ -	 * idrs array is offset to the end of the uobjects array so we will be
+ -	 * able to read idr and replace with a pointer.
+ -	 */
+ -	idr_vals = (u32 *)(attr->uobjects + array_len) - array_len;
+ -
+ -	if (uattr->len > sizeof(uattr->data)) {
+ -		ret = copy_from_user(idr_vals, u64_to_user_ptr(uattr->data),
+ -				     uattr->len);
+ -		if (ret)
+ -			return -EFAULT;
+ -	} else {
+ -		memcpy(idr_vals, &uattr->data, uattr->len);
+ -	}
+ -
+ -	for (i = 0; i != array_len; i++) {
+ -		attr->uobjects[i] = uverbs_get_uobject_from_file(
+ -			spec->u2.objs_arr.obj_type, pbundle->bundle.ufile,
+ -			spec->u2.objs_arr.access, idr_vals[i]);
+ -		if (IS_ERR(attr->uobjects[i])) {
+ -			ret = PTR_ERR(attr->uobjects[i]);
+ -			break;
+ -		}
+ -	}
+ -
+ -	attr->len = i;
+ -	__set_bit(attr_bkey, pbundle->spec_finalize);
+ -	return ret;
+ -}
+ -
+ -static int uverbs_free_idrs_array(const struct uverbs_api_attr *attr_uapi,
+ -				  struct uverbs_objs_arr_attr *attr,
+ -				  bool commit)
+ -{
+ -	const struct uverbs_attr_spec *spec = &attr_uapi->spec;
+ -	int current_ret;
+ -	int ret = 0;
+ -	size_t i;
+ +	const struct uverbs_attr_spec *spec;
+ +	const struct uverbs_attr_spec *val_spec;
+ +	struct uverbs_attr *e;
+ +	const struct uverbs_object_spec *object;
+ +	struct uverbs_obj_attr *o_attr;
+ +	struct uverbs_attr *elements = attr_bundle_h->attrs;
+  
+ -	for (i = 0; i != attr->len; i++) {
+ -		current_ret = uverbs_finalize_object(
+ -			attr->uobjects[i], spec->u2.objs_arr.access, commit);
+ -		if (!ret)
+ -			ret = current_ret;
+ +	if (attr_id >= attr_spec_bucket->num_attrs) {
+ +		if (uattr->flags & UVERBS_ATTR_F_MANDATORY)
+ +			return -EINVAL;
+ +		else
+ +			return 0;
+  	}
+  
+ -	return ret;
+ -}
+ +	if (test_bit(attr_id, attr_bundle_h->valid_bitmap))
+ +		return -EINVAL;
+  
+ -static int uverbs_process_attr(struct bundle_priv *pbundle,
+ -			       const struct uverbs_api_attr *attr_uapi,
+ -			       struct ib_uverbs_attr *uattr, u32 attr_bkey)
+ -{
+ -	const struct uverbs_attr_spec *spec = &attr_uapi->spec;
+ -	struct uverbs_attr *e = &pbundle->bundle.attrs[attr_bkey];
+ -	const struct uverbs_attr_spec *val_spec = spec;
+ -	struct uverbs_obj_attr *o_attr;
+ +	spec = &attr_spec_bucket->attrs[attr_id];
+ +	val_spec = spec;
+ +	e = &elements[attr_id];
+ +	e->uattr = uattr_ptr;
+  
+  	switch (spec->type) {
+  	case UVERBS_ATTR_TYPE_ENUM_IN:
+@@@ -183,255 -354,135 +206,268 @@@
+  	return 0;
+  }
+  
+ -/*
+ - * We search the radix tree with the method prefix and now we want to fast
+ - * search the suffix bits to get a particular attribute pointer. It is not
+ - * totally clear to me if this breaks the radix tree encasulation or not, but
+ - * it uses the iter data to determine if the method iter points at the same
+ - * chunk that will store the attribute, if so it just derefs it directly. By
+ - * construction in most kernel configs the method and attrs will all fit in a
+ - * single radix chunk, so in most cases this will have no search. Other cases
+ - * this falls back to a full search.
+ - */
+ -static void __rcu **uapi_get_attr_for_method(struct bundle_priv *pbundle,
+ -					     u32 attr_key)
+ +static int uverbs_finalize_attrs(struct uverbs_attr_bundle *attrs_bundle,
+ +				 struct uverbs_attr_spec_hash *const *spec_hash,
+ +				 size_t num, bool commit)
+  {
+ -	void __rcu **slot;
+ +	unsigned int i;
+ +	int ret = 0;
+  
+ -	if (likely(attr_key < pbundle->radix_slots_len)) {
+ -		void *entry;
+ +	for (i = 0; i < num; i++) {
+ +		struct uverbs_attr_bundle_hash *curr_bundle =
+ +			&attrs_bundle->hash[i];
+ +		const struct uverbs_attr_spec_hash *curr_spec_bucket =
+ +			spec_hash[i];
+ +		unsigned int j;
+  
+ -		slot = pbundle->radix_slots + attr_key;
+ -		entry = rcu_dereference_raw(*slot);
+ -		if (likely(!radix_tree_is_internal_node(entry) && entry))
+ -			return slot;
+ -	}
+ +		if (!curr_spec_bucket)
+ +			continue;
+  
+ -	return radix_tree_lookup_slot(pbundle->radix,
+ -				      pbundle->method_key | attr_key);
+ +		for (j = 0; j < curr_bundle->num_attrs; j++) {
+ +			struct uverbs_attr *attr;
+ +			const struct uverbs_attr_spec *spec;
+ +
+ +			if (!uverbs_attr_is_valid_in_hash(curr_bundle, j))
+ +				continue;
+ +
+ +			attr = &curr_bundle->attrs[j];
+ +			spec = &curr_spec_bucket->attrs[j];
+ +
+ +			if (spec->type == UVERBS_ATTR_TYPE_IDR ||
+ +			    spec->type == UVERBS_ATTR_TYPE_FD) {
+ +				int current_ret;
+ +
+ +				current_ret = uverbs_finalize_object(
+ +					attr->obj_attr.uobject,
+ +					spec->obj.access, commit);
+ +				if (!ret)
+ +					ret = current_ret;
+ +			} else if (spec->type == UVERBS_ATTR_TYPE_PTR_IN &&
+ +				   spec->flags &
+ +					   UVERBS_ATTR_SPEC_F_ALLOC_AND_COPY &&
+ +				   !uverbs_attr_ptr_is_inline(attr)) {
+ +				kvfree(attr->ptr_attr.ptr);
+ +			}
+ +		}
+ +	}
+ +	return ret;
+  }
+  
+ -static int uverbs_set_attr(struct bundle_priv *pbundle,
+ -			   struct ib_uverbs_attr *uattr)
+ +static int uverbs_uattrs_process(struct ib_device *ibdev,
+ +				 struct ib_ucontext *ucontext,
+ +				 const struct ib_uverbs_attr *uattrs,
+ +				 size_t num_uattrs,
+ +				 const struct uverbs_method_spec *method,
+ +				 struct uverbs_attr_bundle *attr_bundle,
+ +				 struct ib_uverbs_attr __user *uattr_ptr)
+  {
+ -	u32 attr_key = uapi_key_attr(uattr->attr_id);
+ -	u32 attr_bkey = uapi_bkey_attr(attr_key);
+ -	const struct uverbs_api_attr *attr;
+ -	void __rcu **slot;
+ -	int ret;
+ +	size_t i;
+ +	int ret = 0;
+ +	int num_given_buckets = 0;
+ +
+ +	for (i = 0; i < num_uattrs; i++) {
+ +		const struct ib_uverbs_attr *uattr = &uattrs[i];
+ +		u16 attr_id = uattr->attr_id;
+ +		struct uverbs_attr_spec_hash *attr_spec_bucket;
+ +
+ +		ret = uverbs_ns_idx(&attr_id, method->num_buckets);
+ +		if (ret < 0 || !method->attr_buckets[ret]) {
+ +			if (uattr->flags & UVERBS_ATTR_F_MANDATORY) {
+ +				uverbs_finalize_attrs(attr_bundle,
+ +						      method->attr_buckets,
+ +						      num_given_buckets,
+ +						      false);
+ +				return ret;
+ +			}
+ +			continue;
+ +		}
+  
+ -	slot = uapi_get_attr_for_method(pbundle, attr_key);
+ -	if (!slot) {
+  		/*
+ -		 * Kernel does not support the attribute but user-space says it
+ -		 * is mandatory
+ +		 * ret is the found ns, so increase num_given_buckets if
+ +		 * necessary.
+  		 */
+ -		if (uattr->flags & UVERBS_ATTR_F_MANDATORY)
+ -			return -EPROTONOSUPPORT;
+ -		return 0;
+ +		if (ret >= num_given_buckets)
+ +			num_given_buckets = ret + 1;
+ +
+ +		attr_spec_bucket = method->attr_buckets[ret];
+ +		ret = uverbs_process_attr(ibdev, ucontext, uattr, attr_id,
+ +					  attr_spec_bucket, &attr_bundle->hash[ret],
+ +					  uattr_ptr++);
+ +		if (ret) {
+ +			uverbs_finalize_attrs(attr_bundle,
+ +					      method->attr_buckets,
+ +					      num_given_buckets,
+ +					      false);
+ +			return ret;
+ +		}
+ +	}
+ +
+ +	return num_given_buckets;
+ +}
+ +
+ +static int uverbs_validate_kernel_mandatory(const struct uverbs_method_spec *method_spec,
+ +					    struct uverbs_attr_bundle *attr_bundle)
+ +{
+ +	unsigned int i;
+ +
+ +	for (i = 0; i < attr_bundle->num_buckets; i++) {
+ +		struct uverbs_attr_spec_hash *attr_spec_bucket =
+ +			method_spec->attr_buckets[i];
+ +
+ +		if (!attr_spec_bucket)
+ +			continue;
+ +
+ +		if (!bitmap_subset(attr_spec_bucket->mandatory_attrs_bitmask,
+ +				   attr_bundle->hash[i].valid_bitmap,
+ +				   attr_spec_bucket->num_attrs))
+ +			return -EINVAL;
+  	}
+ -	attr = rcu_dereference_protected(*slot, true);
+  
+ -	/* Reject duplicate attributes from user-space */
+ -	if (test_bit(attr_bkey, pbundle->bundle.attr_present))
+ +	for (; i < method_spec->num_buckets; i++) {
+ +		struct uverbs_attr_spec_hash *attr_spec_bucket =
+ +			method_spec->attr_buckets[i];
+ +
+ +		if (!bitmap_empty(attr_spec_bucket->mandatory_attrs_bitmask,
+ +				  attr_spec_bucket->num_attrs))
+ +			return -EINVAL;
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int uverbs_handle_method(struct ib_uverbs_attr __user *uattr_ptr,
+ +				const struct ib_uverbs_attr *uattrs,
+ +				size_t num_uattrs,
+ +				struct ib_device *ibdev,
+ +				struct ib_uverbs_file *ufile,
+ +				const struct uverbs_method_spec *method_spec,
+ +				struct uverbs_attr_bundle *attr_bundle)
+ +{
+ +	int ret;
+ +	int finalize_ret;
+ +	int num_given_buckets;
+ +
+ +	num_given_buckets = uverbs_uattrs_process(ibdev, ufile->ucontext, uattrs,
+ +						  num_uattrs, method_spec,
+ +						  attr_bundle, uattr_ptr);
+ +	if (num_given_buckets <= 0)
+  		return -EINVAL;
+  
+ -	ret = uverbs_process_attr(pbundle, attr, uattr, attr_bkey);
+ +	attr_bundle->num_buckets = num_given_buckets;
+ +	ret = uverbs_validate_kernel_mandatory(method_spec, attr_bundle);
+  	if (ret)
+ -		return ret;
+ +		goto cleanup;
+  
+ -	__set_bit(attr_bkey, pbundle->bundle.attr_present);
+ +	ret = method_spec->handler(ibdev, ufile, attr_bundle);
+ +cleanup:
+ +	finalize_ret = uverbs_finalize_attrs(attr_bundle,
+ +					     method_spec->attr_buckets,
+ +					     attr_bundle->num_buckets,
+ +					     !ret);
+  
+ -	return 0;
+ +	return ret ? ret : finalize_ret;
+  }
+  
+ -static int ib_uverbs_run_method(struct bundle_priv *pbundle,
+ -				unsigned int num_attrs)
+ +#define UVERBS_OPTIMIZE_USING_STACK_SZ  256
+ +static long ib_uverbs_cmd_verbs(struct ib_device *ib_dev,
+ +				struct ib_uverbs_file *file,
+ +				struct ib_uverbs_ioctl_hdr *hdr,
+ +				void __user *buf)
+  {
+ -	int (*handler)(struct uverbs_attr_bundle *attrs);
+ -	size_t uattrs_size = array_size(sizeof(*pbundle->uattrs), num_attrs);
+ -	unsigned int destroy_bkey = pbundle->method_elm->destroy_bkey;
+ +	const struct uverbs_object_spec *object_spec;
+ +	const struct uverbs_method_spec *method_spec;
+ +	long err = 0;
+  	unsigned int i;
+ -	int ret;
+ +	struct {
+ +		struct ib_uverbs_attr		*uattrs;
+ +		struct uverbs_attr_bundle	*uverbs_attr_bundle;
+ +	} *ctx = NULL;
+ +	struct uverbs_attr *curr_attr;
+ +	unsigned long *curr_bitmap;
+ +	size_t ctx_size;
+ +	uintptr_t data[UVERBS_OPTIMIZE_USING_STACK_SZ / sizeof(uintptr_t)];
+ +
+ +	if (hdr->driver_id != ib_dev->driver_id)
+ +		return -EINVAL;
+  
+ -	/* See uverbs_disassociate_api() */
+ -	handler = srcu_dereference(
+ -		pbundle->method_elm->handler,
+ -		&pbundle->bundle.ufile->device->disassociate_srcu);
+ -	if (!handler)
+ -		return -EIO;
+ -
+ -	pbundle->uattrs = uverbs_alloc(&pbundle->bundle, uattrs_size);
+ -	if (IS_ERR(pbundle->uattrs))
+ -		return PTR_ERR(pbundle->uattrs);
+ -	if (copy_from_user(pbundle->uattrs, pbundle->user_attrs, uattrs_size))
+ -		return -EFAULT;
+ +	object_spec = uverbs_get_object(ib_dev, hdr->object_id);
+ +	if (!object_spec)
+ +		return -EPROTONOSUPPORT;
+  
+ -	for (i = 0; i != num_attrs; i++) {
+ -		ret = uverbs_set_attr(pbundle, &pbundle->uattrs[i]);
+ -		if (unlikely(ret))
+ -			return ret;
+ -	}
+ +	method_spec = uverbs_get_method(object_spec, hdr->method_id);
+ +	if (!method_spec)
+ +		return -EPROTONOSUPPORT;
+  
+ -	/* User space did not provide all the mandatory attributes */
+ -	if (unlikely(!bitmap_subset(pbundle->method_elm->attr_mandatory,
+ -				    pbundle->bundle.attr_present,
+ -				    pbundle->method_elm->key_bitmap_len)))
+ +	if ((method_spec->flags & UVERBS_ACTION_FLAG_CREATE_ROOT) ^ !file->ucontext)
+  		return -EINVAL;
+  
+ -	if (pbundle->method_elm->has_udata)
+ -		uverbs_fill_udata(&pbundle->bundle,
+ -				  &pbundle->bundle.driver_udata,
+ -				  UVERBS_ATTR_UHW_IN, UVERBS_ATTR_UHW_OUT);
+ +	ctx_size = sizeof(*ctx) +
+ +		   sizeof(struct uverbs_attr_bundle) +
+ +		   sizeof(struct uverbs_attr_bundle_hash) * method_spec->num_buckets +
+ +		   sizeof(*ctx->uattrs) * hdr->num_attrs +
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].attrs) *
+ +		   method_spec->num_child_attrs +
+ +		   sizeof(*ctx->uverbs_attr_bundle->hash[0].valid_bitmap) *
+ +			(method_spec->num_child_attrs / BITS_PER_LONG +
+ +			 method_spec->num_buckets);
+ +
+ +	if (ctx_size <= UVERBS_OPTIMIZE_USING_STACK_SZ)
+ +		ctx = (void *)data;
+ +	if (!ctx)
+ +		ctx = kmalloc(ctx_size, GFP_KERNEL);
+ +	if (!ctx)
+ +		return -ENOMEM;
+ +
+ +	ctx->uverbs_attr_bundle = (void *)ctx + sizeof(*ctx);
+ +	ctx->uattrs = (void *)(ctx->uverbs_attr_bundle + 1) +
+ +			      (sizeof(ctx->uverbs_attr_bundle->hash[0]) *
+ +			       method_spec->num_buckets);
+ +	curr_attr = (void *)(ctx->uattrs + hdr->num_attrs);
+ +	curr_bitmap = (void *)(curr_attr + method_spec->num_child_attrs);
+  
+ -	if (destroy_bkey != UVERBS_API_ATTR_BKEY_LEN) {
+ -		struct uverbs_obj_attr *destroy_attr =
+ -			&pbundle->bundle.attrs[destroy_bkey].obj_attr;
+ +	/*
+ +	 * We just fill the pointers and num_attrs here. The data itself will be
+ +	 * filled at a later stage (uverbs_process_attr)
+ +	 */
+ +	for (i = 0; i < method_spec->num_buckets; i++) {
+ +		unsigned int curr_num_attrs;
+  
+ -		ret = uobj_destroy(destroy_attr->uobject);
+ -		if (ret)
+ -			return ret;
+ -		__clear_bit(destroy_bkey, pbundle->uobj_finalize);
+ +		if (!method_spec->attr_buckets[i])
+ +			continue;
+  
+ -		ret = handler(&pbundle->bundle);
+ -		uobj_put_destroy(destroy_attr->uobject);
+ -	} else {
+ -		ret = handler(&pbundle->bundle);
+ +		curr_num_attrs = method_spec->attr_buckets[i]->num_attrs;
+ +
+ +		ctx->uverbs_attr_bundle->hash[i].attrs = curr_attr;
+ +		curr_attr += curr_num_attrs;
+ +		ctx->uverbs_attr_bundle->hash[i].num_attrs = curr_num_attrs;
+ +		ctx->uverbs_attr_bundle->hash[i].valid_bitmap = curr_bitmap;
+ +		bitmap_zero(curr_bitmap, curr_num_attrs);
+ +		curr_bitmap += BITS_TO_LONGS(curr_num_attrs);
+ +	}
+ +
+ +	err = copy_from_user(ctx->uattrs, buf,
+ +			     sizeof(*ctx->uattrs) * hdr->num_attrs);
+ +	if (err) {
+ +		err = -EFAULT;
+ +		goto out;
+  	}
+  
+ +	err = uverbs_handle_method(buf, ctx->uattrs, hdr->num_attrs, ib_dev,
+ +				   file, method_spec, ctx->uverbs_attr_bundle);
+ +
++ 	/*
++ 	 * Until the drivers are revised to use the bundle directly we have to
++ 	 * assume that the driver wrote to its UHW_OUT and flag userspace
++ 	 * appropriately.
++ 	 */
++ 	if (!ret && pbundle->method_elm->has_udata) {
++ 		const struct uverbs_attr *attr =
++ 			uverbs_attr_get(&pbundle->bundle, UVERBS_ATTR_UHW_OUT);
++ 
++ 		if (!IS_ERR(attr))
++ 			ret = uverbs_set_output(&pbundle->bundle, attr);
++ 	}
++ 
+  	/*
+  	 * EPROTONOSUPPORT is ONLY to be returned if the ioctl framework can
+  	 * not invoke the method because the request is not supported.  No
+@@@ -455,39 -619,182 +491,199 @@@ long ib_uverbs_ioctl(struct file *filp
+  	struct ib_uverbs_ioctl_hdr __user *user_hdr =
+  		(struct ib_uverbs_ioctl_hdr __user *)arg;
+  	struct ib_uverbs_ioctl_hdr hdr;
+ +	struct ib_device *ib_dev;
+  	int srcu_key;
+ -	int err;
+ +	long err;
+  
+ -	if (unlikely(cmd != RDMA_VERBS_IOCTL))
+ -		return -ENOIOCTLCMD;
+ +	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		err = -EIO;
+ +		goto out;
+ +	}
+  
+ -	err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+ -	if (err)
+ -		return -EFAULT;
+ +	if (cmd == RDMA_VERBS_IOCTL) {
+ +		err = copy_from_user(&hdr, user_hdr, sizeof(hdr));
+  
+ -	if (hdr.length > PAGE_SIZE ||
+ -	    hdr.length != struct_size(&hdr, attrs, hdr.num_attrs))
+ -		return -EINVAL;
+ +		if (err || hdr.length > IB_UVERBS_MAX_CMD_SZ ||
+ +		    hdr.length != sizeof(hdr) + hdr.num_attrs * sizeof(struct ib_uverbs_attr)) {
+ +			err = -EINVAL;
+ +			goto out;
+ +		}
+  
+ -	if (hdr.reserved1 || hdr.reserved2)
+ -		return -EPROTONOSUPPORT;
+ +		if (hdr.reserved1 || hdr.reserved2) {
+ +			err = -EPROTONOSUPPORT;
+ +			goto out;
+ +		}
+  
+ -	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+ -	err = ib_uverbs_cmd_verbs(file, &hdr, user_hdr->attrs);
+ +		err = ib_uverbs_cmd_verbs(ib_dev, file, &hdr,
+ +					  (__user void *)arg + sizeof(hdr));
+ +	} else {
+ +		err = -ENOIOCTLCMD;
+ +	}
+ +out:
+  	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
+ +
+  	return err;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int uverbs_get_flags64(u64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	const struct uverbs_attr *attr;
++ 	u64 flags;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	/* Missing attribute means 0 flags */
++ 	if (IS_ERR(attr)) {
++ 		*to = 0;
++ 		return 0;
++ 	}
++ 
++ 	/*
++ 	 * New userspace code should use 8 bytes to pass flags, but we
++ 	 * transparently support old userspaces that were using 4 bytes as
++ 	 * well.
++ 	 */
++ 	if (attr->ptr_attr.len == 8)
++ 		flags = attr->ptr_attr.data;
++ 	else if (attr->ptr_attr.len == 4)
++ 		flags = *(u32 *)&attr->ptr_attr.data;
++ 	else
++ 		return -EINVAL;
++ 
++ 	if (flags & ~allowed_bits)
++ 		return -EINVAL;
++ 
++ 	*to = flags;
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags64);
++ 
++ int uverbs_get_flags32(u32 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		       size_t idx, u64 allowed_bits)
++ {
++ 	u64 flags;
++ 	int ret;
++ 
++ 	ret = uverbs_get_flags64(&flags, attrs_bundle, idx, allowed_bits);
++ 	if (ret)
++ 		return ret;
++ 
++ 	if (flags > U32_MAX)
++ 		return -EINVAL;
++ 	*to = flags;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(uverbs_get_flags32);
++ 
++ /*
++  * Fill a ib_udata struct (core or uhw) using the given attribute IDs.
++  * This is primarily used to convert the UVERBS_ATTR_UHW() into the
++  * ib_udata format used by the drivers.
++  */
++ void uverbs_fill_udata(struct uverbs_attr_bundle *bundle,
++ 		       struct ib_udata *udata, unsigned int attr_in,
++ 		       unsigned int attr_out)
++ {
++ 	struct bundle_priv *pbundle =
++ 		container_of(bundle, struct bundle_priv, bundle);
++ 	const struct uverbs_attr *in =
++ 		uverbs_attr_get(&pbundle->bundle, attr_in);
++ 	const struct uverbs_attr *out =
++ 		uverbs_attr_get(&pbundle->bundle, attr_out);
++ 
++ 	if (!IS_ERR(in)) {
++ 		udata->inlen = in->ptr_attr.len;
++ 		if (uverbs_attr_ptr_is_inline(in))
++ 			udata->inbuf =
++ 				&pbundle->user_attrs[in->ptr_attr.uattr_idx]
++ 					 .data;
++ 		else
++ 			udata->inbuf = u64_to_user_ptr(in->ptr_attr.data);
++ 	} else {
++ 		udata->inbuf = NULL;
++ 		udata->inlen = 0;
++ 	}
++ 
++ 	if (!IS_ERR(out)) {
++ 		udata->outbuf = u64_to_user_ptr(out->ptr_attr.data);
++ 		udata->outlen = out->ptr_attr.len;
++ 	} else {
++ 		udata->outbuf = NULL;
++ 		udata->outlen = 0;
++ 	}
++ }
++ 
++ int uverbs_copy_to(const struct uverbs_attr_bundle *bundle, size_t idx,
++ 		   const void *from, size_t size)
++ {
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 	size_t min_size;
++ 
++ 	if (IS_ERR(attr))
++ 		return PTR_ERR(attr);
++ 
++ 	min_size = min_t(size_t, attr->ptr_attr.len, size);
++ 	if (copy_to_user(u64_to_user_ptr(attr->ptr_attr.data), from, min_size))
++ 		return -EFAULT;
++ 
++ 	return uverbs_set_output(bundle, attr);
++ }
++ EXPORT_SYMBOL(uverbs_copy_to);
++ 
++ 
++ /*
++  * This is only used if the caller has directly used copy_to_use to write the
++  * data.  It signals to user space that the buffer is filled in.
++  */
++ int uverbs_output_written(const struct uverbs_attr_bundle *bundle, size_t idx)
++ {
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 
++ 	if (IS_ERR(attr))
++ 		return PTR_ERR(attr);
++ 
++ 	return uverbs_set_output(bundle, attr);
++ }
++ 
++ int _uverbs_get_const(s64 *to, const struct uverbs_attr_bundle *attrs_bundle,
++ 		      size_t idx, s64 lower_bound, u64 upper_bound,
++ 		      s64  *def_val)
++ {
++ 	const struct uverbs_attr *attr;
++ 
++ 	attr = uverbs_attr_get(attrs_bundle, idx);
++ 	if (IS_ERR(attr)) {
++ 		if ((PTR_ERR(attr) != -ENOENT) || !def_val)
++ 			return PTR_ERR(attr);
++ 
++ 		*to = *def_val;
++ 	} else {
++ 		*to = attr->ptr_attr.data;
++ 	}
++ 
++ 	if (*to < lower_bound || (*to > 0 && (u64)*to > upper_bound))
++ 		return -EINVAL;
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(_uverbs_get_const);
++ 
++ int uverbs_copy_to_struct_or_zero(const struct uverbs_attr_bundle *bundle,
++ 				  size_t idx, const void *from, size_t size)
++ {
++ 	const struct uverbs_attr *attr = uverbs_attr_get(bundle, idx);
++ 
++ 	if (size < attr->ptr_attr.len) {
++ 		if (clear_user(u64_to_user_ptr(attr->ptr_attr.data) + size,
++ 			       attr->ptr_attr.len - size))
++ 			return -EFAULT;
++ 	}
++ 	return uverbs_copy_to(bundle, idx, from, size);
++ }
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+diff --cc drivers/infiniband/core/uverbs_main.c
+index 495189811c27,2890a77339e1..000000000000
+--- a/drivers/infiniband/core/uverbs_main.c
++++ b/drivers/infiniband/core/uverbs_main.c
+@@@ -749,10 -687,90 +749,97 @@@ static ssize_t ib_uverbs_write(struct f
+  		return ret;
+  
+  	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
+++<<<<<<< HEAD
+ +	ib_dev = srcu_dereference(file->device->ib_dev,
+ +				  &file->device->disassociate_srcu);
+ +	if (!ib_dev) {
+ +		ret = -EIO;
+++=======
++ 
++ 	buf += sizeof(hdr);
++ 
++ 	memset(bundle.attr_present, 0, sizeof(bundle.attr_present));
++ 	bundle.ufile = file;
++ 	if (!method_elm->is_ex) {
++ 		size_t in_len = hdr.in_words * 4 - sizeof(hdr);
++ 		size_t out_len = hdr.out_words * 4;
++ 		u64 response = 0;
++ 
++ 		if (method_elm->has_udata) {
++ 			bundle.driver_udata.inlen =
++ 				in_len - method_elm->req_size;
++ 			in_len = method_elm->req_size;
++ 			if (bundle.driver_udata.inlen)
++ 				bundle.driver_udata.inbuf = buf + in_len;
++ 			else
++ 				bundle.driver_udata.inbuf = NULL;
++ 		} else {
++ 			memset(&bundle.driver_udata, 0,
++ 			       sizeof(bundle.driver_udata));
++ 		}
++ 
++ 		if (method_elm->has_resp) {
++ 			/*
++ 			 * The macros check that if has_resp is set
++ 			 * then the command request structure starts
++ 			 * with a '__aligned u64 response' member.
++ 			 */
++ 			ret = get_user(response, (const u64 *)buf);
++ 			if (ret)
++ 				goto out_unlock;
++ 
++ 			if (method_elm->has_udata) {
++ 				bundle.driver_udata.outlen =
++ 					out_len - method_elm->resp_size;
++ 				out_len = method_elm->resp_size;
++ 				if (bundle.driver_udata.outlen)
++ 					bundle.driver_udata.outbuf =
++ 						u64_to_user_ptr(response +
++ 								out_len);
++ 				else
++ 					bundle.driver_udata.outbuf = NULL;
++ 			}
++ 		} else {
++ 			bundle.driver_udata.outlen = 0;
++ 			bundle.driver_udata.outbuf = NULL;
++ 		}
++ 
++ 		ib_uverbs_init_udata_buf_or_null(
++ 			&bundle.ucore, buf, u64_to_user_ptr(response),
++ 			in_len, out_len);
++ 	} else {
++ 		buf += sizeof(ex_hdr);
++ 
++ 		ib_uverbs_init_udata_buf_or_null(&bundle.ucore, buf,
++ 					u64_to_user_ptr(ex_hdr.response),
++ 					hdr.in_words * 8, hdr.out_words * 8);
++ 
++ 		ib_uverbs_init_udata_buf_or_null(
++ 			&bundle.driver_udata, buf + bundle.ucore.inlen,
++ 			u64_to_user_ptr(ex_hdr.response) + bundle.ucore.outlen,
++ 			ex_hdr.provider_in_words * 8,
++ 			ex_hdr.provider_out_words * 8);
++ 
++ 	}
++ 
++ 	ret = method_elm->handler(&bundle);
++ out_unlock:
++ 	srcu_read_unlock(&file->device->disassociate_srcu, srcu_key);
++ 	return (ret) ? : count;
++ }
++ 
++ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
++ {
++ 	struct ib_uverbs_file *file = filp->private_data;
++ 	struct ib_ucontext *ucontext;
++ 	int ret = 0;
++ 	int srcu_key;
++ 
++ 	srcu_key = srcu_read_lock(&file->device->disassociate_srcu);
++ 	ucontext = ib_uverbs_get_ucontext_file(file);
++ 	if (IS_ERR(ucontext)) {
++ 		ret = PTR_ERR(ucontext);
+++>>>>>>> d6f4a21f309d (RDMA/uverbs: Mark ioctl responses with UVERBS_ATTR_F_VALID_OUTPUT)
+  		goto out;
+  	}
+  
+* Unmerged path drivers/infiniband/core/rdma_core.h
+* Unmerged path drivers/infiniband/core/uverbs_cmd.c
+* Unmerged path drivers/infiniband/core/uverbs_ioctl.c
+* Unmerged path drivers/infiniband/core/uverbs_main.c
