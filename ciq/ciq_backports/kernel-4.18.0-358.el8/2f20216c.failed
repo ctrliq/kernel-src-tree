@@ -1,0 +1,249 @@
+Bluetooth: Emit controller suspend and resume events
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+commit 2f20216c1d6fe17c1a224f658be0dc6fab2269c7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/2f20216c.failed
+
+Emit controller suspend and resume events when we are ready for suspend
+and we've resumed from suspend.
+
+The controller suspend event will report whatever suspend state was
+successfully entered. The controller resume event will check the first
+HCI event that was received after we finished preparing for suspend and,
+if it was a connection event, store the address of the peer that caused
+the event. If it was not a connection event, we mark the wake reason as
+an unexpected event.
+
+Here is a sample btmon trace with these events:
+
+@ MGMT Event: Controller Suspended (0x002d) plen 1
+        Suspend state: Page scanning and/or passive scanning (2)
+
+@ MGMT Event: Controller Resumed (0x002e) plen 8
+        Wake reason: Remote wake due to peer device connection (2)
+        LE Address: CD:F3:CD:13:C5:9A (OUI CD-F3-CD)
+
+	Signed-off-by: Abhishek Pandit-Subedi <abhishekpandit@chromium.org>
+	Reviewed-by: Miao-chen Chou <mcchou@chromium.org>
+	Signed-off-by: Marcel Holtmann <marcel@holtmann.org>
+(cherry picked from commit 2f20216c1d6fe17c1a224f658be0dc6fab2269c7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/bluetooth/mgmt.h
+diff --cc include/net/bluetooth/mgmt.h
+index 5b34e2732311,6b55155e05e9..000000000000
+--- a/include/net/bluetooth/mgmt.h
++++ b/include/net/bluetooth/mgmt.h
+@@@ -902,3 -1008,41 +902,44 @@@ struct mgmt_ev_ext_info_changed 
+  struct mgmt_ev_phy_configuration_changed {
+  	__le32	selected_phys;
+  } __packed;
+++<<<<<<< HEAD
+++=======
++ 
++ #define MGMT_EV_EXP_FEATURE_CHANGED	0x0027
++ struct mgmt_ev_exp_feature_changed {
++ 	__u8	uuid[16];
++ 	__le32	flags;
++ } __packed;
++ 
++ #define MGMT_EV_DEVICE_FLAGS_CHANGED		0x002a
++ struct mgmt_ev_device_flags_changed {
++ 	struct mgmt_addr_info addr;
++ 	__le32 supported_flags;
++ 	__le32 current_flags;
++ } __packed;
++ 
++ #define MGMT_EV_ADV_MONITOR_ADDED	0x002b
++ struct mgmt_ev_adv_monitor_added {
++ 	__le16 monitor_handle;
++ }  __packed;
++ 
++ #define MGMT_EV_ADV_MONITOR_REMOVED	0x002c
++ struct mgmt_ev_adv_monitor_removed {
++ 	__le16 monitor_handle;
++ }  __packed;
++ 
++ #define MGMT_EV_CONTROLLER_SUSPEND		0x002d
++ struct mgmt_ev_controller_suspend {
++ 	__u8	suspend_state;
++ } __packed;
++ 
++ #define MGMT_EV_CONTROLLER_RESUME		0x002e
++ struct mgmt_ev_controller_resume {
++ 	__u8	wake_reason;
++ 	struct mgmt_addr_info addr;
++ } __packed;
++ 
++ #define MGMT_WAKE_REASON_NON_BT_WAKE		0x0
++ #define MGMT_WAKE_REASON_UNEXPECTED		0x1
++ #define MGMT_WAKE_REASON_REMOTE_WAKE		0x2
+++>>>>>>> 2f20216c1d6f (Bluetooth: Emit controller suspend and resume events)
+diff --git a/include/net/bluetooth/hci_core.h b/include/net/bluetooth/hci_core.h
+index 87a79e4f1ac5..9498767b796c 100644
+--- a/include/net/bluetooth/hci_core.h
++++ b/include/net/bluetooth/hci_core.h
+@@ -467,6 +467,9 @@ struct hci_dev {
+ 	enum suspended_state	suspend_state;
+ 	bool			scanning_paused;
+ 	bool			suspended;
++	u8			wake_reason;
++	bdaddr_t		wake_addr;
++	u8			wake_addr_type;
+ 
+ 	wait_queue_head_t	suspend_wait_q;
+ 	DECLARE_BITMAP(suspend_tasks, __SUSPEND_NUM_TASKS);
+* Unmerged path include/net/bluetooth/mgmt.h
+diff --git a/net/bluetooth/hci_core.c b/net/bluetooth/hci_core.c
+index 21db1b17916e..944d01b78361 100644
+--- a/net/bluetooth/hci_core.c
++++ b/net/bluetooth/hci_core.c
+@@ -3399,12 +3399,24 @@ static int hci_change_suspend_state(struct hci_dev *hdev,
+ 	return hci_suspend_wait_event(hdev);
+ }
+ 
++static void hci_clear_wake_reason(struct hci_dev *hdev)
++{
++	hci_dev_lock(hdev);
++
++	hdev->wake_reason = 0;
++	bacpy(&hdev->wake_addr, BDADDR_ANY);
++	hdev->wake_addr_type = 0;
++
++	hci_dev_unlock(hdev);
++}
++
+ static int hci_suspend_notifier(struct notifier_block *nb, unsigned long action,
+ 				void *data)
+ {
+ 	struct hci_dev *hdev =
+ 		container_of(nb, struct hci_dev, suspend_notifier);
+ 	int ret = 0;
++	u8 state = BT_RUNNING;
+ 
+ 	/* If powering down, wait for completion. */
+ 	if (mgmt_powering_down(hdev)) {
+@@ -3425,15 +3437,27 @@ static int hci_suspend_notifier(struct notifier_block *nb, unsigned long action,
+ 		 *  - Second, program event filter/whitelist and enable scan
+ 		 */
+ 		ret = hci_change_suspend_state(hdev, BT_SUSPEND_DISCONNECT);
++		if (!ret)
++			state = BT_SUSPEND_DISCONNECT;
+ 
+ 		/* Only configure whitelist if disconnect succeeded and wake
+ 		 * isn't being prevented.
+ 		 */
+-		if (!ret && !(hdev->prevent_wake && hdev->prevent_wake(hdev)))
++		if (!ret && !(hdev->prevent_wake && hdev->prevent_wake(hdev))) {
+ 			ret = hci_change_suspend_state(hdev,
+ 						BT_SUSPEND_CONFIGURE_WAKE);
++			if (!ret)
++				state = BT_SUSPEND_CONFIGURE_WAKE;
++		}
++
++		hci_clear_wake_reason(hdev);
++		mgmt_suspending(hdev, state);
++
+ 	} else if (action == PM_POST_SUSPEND) {
+ 		ret = hci_change_suspend_state(hdev, BT_RUNNING);
++
++		mgmt_resuming(hdev, hdev->wake_reason, &hdev->wake_addr,
++			      hdev->wake_addr_type);
+ 	}
+ 
+ done:
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+index b97ecd647288..f050aa54212e 100644
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -6020,6 +6020,75 @@ static bool hci_get_cmd_complete(struct hci_dev *hdev, u16 opcode,
+ 	return true;
+ }
+ 
++static void hci_store_wake_reason(struct hci_dev *hdev, u8 event,
++				  struct sk_buff *skb)
++{
++	struct hci_ev_le_advertising_info *adv;
++	struct hci_ev_le_direct_adv_info *direct_adv;
++	struct hci_ev_le_ext_adv_report *ext_adv;
++	const struct hci_ev_conn_complete *conn_complete = (void *)skb->data;
++	const struct hci_ev_conn_request *conn_request = (void *)skb->data;
++
++	hci_dev_lock(hdev);
++
++	/* If we are currently suspended and this is the first BT event seen,
++	 * save the wake reason associated with the event.
++	 */
++	if (!hdev->suspended || hdev->wake_reason)
++		goto unlock;
++
++	/* Default to remote wake. Values for wake_reason are documented in the
++	 * Bluez mgmt api docs.
++	 */
++	hdev->wake_reason = MGMT_WAKE_REASON_REMOTE_WAKE;
++
++	/* Once configured for remote wakeup, we should only wake up for
++	 * reconnections. It's useful to see which device is waking us up so
++	 * keep track of the bdaddr of the connection event that woke us up.
++	 */
++	if (event == HCI_EV_CONN_REQUEST) {
++		bacpy(&hdev->wake_addr, &conn_complete->bdaddr);
++		hdev->wake_addr_type = BDADDR_BREDR;
++	} else if (event == HCI_EV_CONN_COMPLETE) {
++		bacpy(&hdev->wake_addr, &conn_request->bdaddr);
++		hdev->wake_addr_type = BDADDR_BREDR;
++	} else if (event == HCI_EV_LE_META) {
++		struct hci_ev_le_meta *le_ev = (void *)skb->data;
++		u8 subevent = le_ev->subevent;
++		u8 *ptr = &skb->data[sizeof(*le_ev)];
++		u8 num_reports = *ptr;
++
++		if ((subevent == HCI_EV_LE_ADVERTISING_REPORT ||
++		     subevent == HCI_EV_LE_DIRECT_ADV_REPORT ||
++		     subevent == HCI_EV_LE_EXT_ADV_REPORT) &&
++		    num_reports) {
++			adv = (void *)(ptr + 1);
++			direct_adv = (void *)(ptr + 1);
++			ext_adv = (void *)(ptr + 1);
++
++			switch (subevent) {
++			case HCI_EV_LE_ADVERTISING_REPORT:
++				bacpy(&hdev->wake_addr, &adv->bdaddr);
++				hdev->wake_addr_type = adv->bdaddr_type;
++				break;
++			case HCI_EV_LE_DIRECT_ADV_REPORT:
++				bacpy(&hdev->wake_addr, &direct_adv->bdaddr);
++				hdev->wake_addr_type = direct_adv->bdaddr_type;
++				break;
++			case HCI_EV_LE_EXT_ADV_REPORT:
++				bacpy(&hdev->wake_addr, &ext_adv->bdaddr);
++				hdev->wake_addr_type = ext_adv->bdaddr_type;
++				break;
++			}
++		}
++	} else {
++		hdev->wake_reason = MGMT_WAKE_REASON_UNEXPECTED;
++	}
++
++unlock:
++	hci_dev_unlock(hdev);
++}
++
+ void hci_event_packet(struct hci_dev *hdev, struct sk_buff *skb)
+ {
+ 	struct hci_event_hdr *hdr = (void *) skb->data;
+@@ -6053,6 +6122,9 @@ void hci_event_packet(struct hci_dev *hdev, struct sk_buff *skb)
+ 
+ 	skb_pull(skb, HCI_EVENT_HDR_SIZE);
+ 
++	/* Store wake reason if we're suspended */
++	hci_store_wake_reason(hdev, event, skb);
++
+ 	switch (event) {
+ 	case HCI_EV_INQUIRY_COMPLETE:
+ 		hci_inquiry_complete_evt(hdev, skb);
