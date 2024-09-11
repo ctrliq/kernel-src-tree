@@ -1,0 +1,247 @@
+x86: Replace ist_enter() with nmi_enter()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] Replace ist_enter() with nmi_enter() (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 93.51%
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 0d00449c7a28a1514595630735df383dec606812
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/0d00449c.failed
+
+A few exceptions (like #DB and #BP) can happen at any location in the code,
+this then means that tracers should treat events from these exceptions as
+NMI-like. The interrupted context could be holding locks with interrupts
+disabled for instance.
+
+Similarly, #MC is an actual NMI-like exception.
+
+All of them use ist_enter() which only concerns itself with RCU, but does
+not do any of the other setup that NMIs need. This means things like:
+
+	printk()
+	  raw_spin_lock_irq(&logbuf_lock);
+	  <#DB/#BP/#MC>
+	     printk()
+	       raw_spin_lock_irq(&logbuf_lock);
+
+are entirely possible (well, not really since printk tries hard to
+play nice, but the concept stands).
+
+So replace ist_enter() with nmi_enter(). Also observe that any nmi_enter()
+caller must be both notrace and NOKPROBE, or in the noinstr text section.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+Link: https://lkml.kernel.org/r/20200505134101.525508608@linutronix.de
+
+
+(cherry picked from commit 0d00449c7a28a1514595630735df383dec606812)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/traps.h
+#	arch/x86/kernel/cpu/mce/core.c
+#	arch/x86/kernel/traps.c
+diff --cc arch/x86/include/asm/traps.h
+index 121452e33fe5,6f6c417e1e46..000000000000
+--- a/arch/x86/include/asm/traps.h
++++ b/arch/x86/include/asm/traps.h
+@@@ -114,10 -113,10 +114,17 @@@ asmlinkage void smp_threshold_interrupt
+  asmlinkage void smp_deferred_error_interrupt(struct pt_regs *regs);
+  #endif
+  
+++<<<<<<< HEAD
+ +extern void ist_enter(struct pt_regs *regs);
+ +extern void ist_exit(struct pt_regs *regs);
+ +extern void ist_begin_non_atomic(struct pt_regs *regs);
+ +extern void ist_end_non_atomic(void);
+++=======
++ void smp_apic_timer_interrupt(struct pt_regs *regs);
++ void smp_spurious_interrupt(struct pt_regs *regs);
++ void smp_error_interrupt(struct pt_regs *regs);
++ asmlinkage void smp_irq_move_cleanup_interrupt(void);
+++>>>>>>> 0d00449c7a28 (x86: Replace ist_enter() with nmi_enter())
+  
+  #ifdef CONFIG_VMAP_STACK
+  void __noreturn handle_stack_overflow(const char *message,
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index df108ae34b27,e9265e2f28c9..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -43,6 -42,8 +43,11 @@@
+  #include <linux/export.h>
+  #include <linux/jump_label.h>
+  #include <linux/set_memory.h>
+++<<<<<<< HEAD
+++=======
++ #include <linux/task_work.h>
++ #include <linux/hardirq.h>
+++>>>>>>> 0d00449c7a28 (x86: Replace ist_enter() with nmi_enter())
+  
+  #include <asm/intel-family.h>
+  #include <asm/processor.h>
+diff --cc arch/x86/kernel/traps.c
+index bceb85be1c08,f7cfb9d0ad02..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -37,10 -37,8 +37,15 @@@
+  #include <linux/mm.h>
+  #include <linux/smp.h>
+  #include <linux/io.h>
+++<<<<<<< HEAD
+ +
+ +#if defined(CONFIG_EDAC)
+ +#include <linux/edac.h>
+ +#endif
+++=======
++ #include <linux/hardirq.h>
++ #include <linux/atomic.h>
+++>>>>>>> 0d00449c7a28 (x86: Replace ist_enter() with nmi_enter())
+  
+  #include <asm/stacktrace.h>
+  #include <asm/processor.h>
+@@@ -87,78 -84,6 +91,81 @@@ static inline void cond_local_irq_disab
+  		local_irq_disable();
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * In IST context, we explicitly disable preemption.  This serves two
+ + * purposes: it makes it much less likely that we would accidentally
+ + * schedule in IST context and it will force a warning if we somehow
+ + * manage to schedule by accident.
+ + */
+ +void ist_enter(struct pt_regs *regs)
+ +{
+ +	if (user_mode(regs)) {
+ +		RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+ +	} else {
+ +		/*
+ +		 * We might have interrupted pretty much anything.  In
+ +		 * fact, if we're a machine check, we can even interrupt
+ +		 * NMI processing.  We don't want in_nmi() to return true,
+ +		 * but we need to notify RCU.
+ +		 */
+ +		rcu_nmi_enter();
+ +	}
+ +
+ +	preempt_disable();
+ +
+ +	/* This code is a bit fragile.  Test it. */
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "ist_enter didn't work");
+ +}
+ +NOKPROBE_SYMBOL(ist_enter);
+ +
+ +void ist_exit(struct pt_regs *regs)
+ +{
+ +	preempt_enable_no_resched();
+ +
+ +	if (!user_mode(regs))
+ +		rcu_nmi_exit();
+ +}
+ +
+ +/**
+ + * ist_begin_non_atomic() - begin a non-atomic section in an IST exception
+ + * @regs:	regs passed to the IST exception handler
+ + *
+ + * IST exception handlers normally cannot schedule.  As a special
+ + * exception, if the exception interrupted userspace code (i.e.
+ + * user_mode(regs) would return true) and the exception was not
+ + * a double fault, it can be safe to schedule.  ist_begin_non_atomic()
+ + * begins a non-atomic section within an ist_enter()/ist_exit() region.
+ + * Callers are responsible for enabling interrupts themselves inside
+ + * the non-atomic section, and callers must call ist_end_non_atomic()
+ + * before ist_exit().
+ + */
+ +void ist_begin_non_atomic(struct pt_regs *regs)
+ +{
+ +	BUG_ON(!user_mode(regs));
+ +
+ +	/*
+ +	 * Sanity check: we need to be on the normal thread stack.  This
+ +	 * will catch asm bugs and any attempt to use ist_preempt_enable
+ +	 * from double_fault.
+ +	 */
+ +	BUG_ON(!on_thread_stack());
+ +
+ +	preempt_enable_no_resched();
+ +}
+ +
+ +/**
+ + * ist_end_non_atomic() - begin a non-atomic section in an IST exception
+ + *
+ + * Ends a non-atomic section started with ist_begin_non_atomic().
+ + */
+ +void ist_end_non_atomic(void)
+ +{
+ +	preempt_disable();
+ +}
+ +
+++=======
+++>>>>>>> 0d00449c7a28 (x86: Replace ist_enter() with nmi_enter())
+  int is_valid_bugaddr(unsigned long addr)
+  {
+  	unsigned short ud;
+* Unmerged path arch/x86/include/asm/traps.h
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+diff --git a/arch/x86/kernel/cpu/mce/p5.c b/arch/x86/kernel/cpu/mce/p5.c
+index 5cddf831720f..92ee53cb1de0 100644
+--- a/arch/x86/kernel/cpu/mce/p5.c
++++ b/arch/x86/kernel/cpu/mce/p5.c
+@@ -7,6 +7,7 @@
+ #include <linux/kernel.h>
+ #include <linux/types.h>
+ #include <linux/smp.h>
++#include <linux/hardirq.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/traps.h>
+@@ -22,7 +23,7 @@ static void pentium_machine_check(struct pt_regs *regs, long error_code)
+ {
+ 	u32 loaddr, hi, lotype;
+ 
+-	ist_enter(regs);
++	nmi_enter();
+ 
+ 	rdmsr(MSR_IA32_P5_MC_ADDR, loaddr, hi);
+ 	rdmsr(MSR_IA32_P5_MC_TYPE, lotype, hi);
+@@ -37,7 +38,7 @@ static void pentium_machine_check(struct pt_regs *regs, long error_code)
+ 
+ 	add_taint(TAINT_MACHINE_CHECK, LOCKDEP_NOW_UNRELIABLE);
+ 
+-	ist_exit(regs);
++	nmi_exit();
+ }
+ 
+ /* Set up machine check reporting for processors with Intel style MCE: */
+diff --git a/arch/x86/kernel/cpu/mce/winchip.c b/arch/x86/kernel/cpu/mce/winchip.c
+index 3b45b270a865..3677b197c468 100644
+--- a/arch/x86/kernel/cpu/mce/winchip.c
++++ b/arch/x86/kernel/cpu/mce/winchip.c
+@@ -6,6 +6,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/kernel.h>
+ #include <linux/types.h>
++#include <linux/hardirq.h>
+ 
+ #include <asm/processor.h>
+ #include <asm/traps.h>
+@@ -16,12 +17,12 @@
+ /* Machine check handler for WinChip C6: */
+ static void winchip_machine_check(struct pt_regs *regs, long error_code)
+ {
+-	ist_enter(regs);
++	nmi_enter();
+ 
+ 	pr_emerg("CPU0: Machine Check Exception.\n");
+ 	add_taint(TAINT_MACHINE_CHECK, LOCKDEP_NOW_UNRELIABLE);
+ 
+-	ist_exit(regs);
++	nmi_exit();
+ }
+ 
+ /* Set up machine check reporting on the Winchip C6 series */
+* Unmerged path arch/x86/kernel/traps.c
