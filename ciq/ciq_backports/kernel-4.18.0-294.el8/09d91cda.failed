@@ -1,0 +1,236 @@
+mm,thp: avoid writes to file with THP in pagecache
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [fs] mm, thp: avoid writes to file with THP in pagecache (Waiman Long) [1877019]
+Rebuild_FUZZ: 99.01%
+commit-author Song Liu <songliubraving@fb.com>
+commit 09d91cda0e8207c1f14ee0d572f61a53dbcdaf85
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/09d91cda.failed
+
+In previous patch, an application could put part of its text section in
+THP via madvise().  These THPs will be protected from writes when the
+application is still running (TXTBSY).  However, after the application
+exits, the file is available for writes.
+
+This patch avoids writes to file THP by dropping page cache for the file
+when the file is open for write.  A new counter nr_thps is added to struct
+address_space.  In do_dentry_open(), if the file is open for write and
+nr_thps is non-zero, we drop page cache for the whole file.
+
+Link: http://lkml.kernel.org/r/20190801184244.3169074-8-songliubraving@fb.com
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Acked-by: Rik van Riel <riel@surriel.com>
+	Acked-by: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Acked-by: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Oleg Nesterov <oleg@redhat.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 09d91cda0e8207c1f14ee0d572f61a53dbcdaf85)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/fs.h
+#	mm/filemap.c
+#	mm/khugepaged.c
+diff --cc include/linux/fs.h
+index f65e87eb75f7,b0c6b0d34d02..000000000000
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@@ -408,28 -423,45 +408,62 @@@ int pagecache_write_end(struct file *, 
+  				loff_t pos, unsigned len, unsigned copied,
+  				struct page *page, void *fsdata);
+  
+++<<<<<<< HEAD
+ +struct address_space {
+ +	struct inode		*host;		/* owner: inode, block_device */
+ +	struct radix_tree_root	i_pages;	/* cached pages */
+ +	atomic_t		i_mmap_writable;/* count VM_SHARED mappings */
+ +	struct rb_root_cached	i_mmap;		/* tree of private and shared mappings */
+ +	struct rw_semaphore	i_mmap_rwsem;	/* protect tree, count, list */
+ +	/* Protected by the i_pages lock */
+ +	unsigned long		nrpages;	/* number of total pages */
+ +	/* number of shadow or DAX exceptional entries */
+++=======
++ /**
++  * struct address_space - Contents of a cacheable, mappable object.
++  * @host: Owner, either the inode or the block_device.
++  * @i_pages: Cached pages.
++  * @gfp_mask: Memory allocation flags to use for allocating pages.
++  * @i_mmap_writable: Number of VM_SHARED mappings.
++  * @nr_thps: Number of THPs in the pagecache (non-shmem only).
++  * @i_mmap: Tree of private and shared mappings.
++  * @i_mmap_rwsem: Protects @i_mmap and @i_mmap_writable.
++  * @nrpages: Number of page entries, protected by the i_pages lock.
++  * @nrexceptional: Shadow or DAX entries, protected by the i_pages lock.
++  * @writeback_index: Writeback starts here.
++  * @a_ops: Methods.
++  * @flags: Error bits and flags (AS_*).
++  * @wb_err: The most recent error which has occurred.
++  * @private_lock: For use by the owner of the address_space.
++  * @private_list: For use by the owner of the address_space.
++  * @private_data: For use by the owner of the address_space.
++  */
++ struct address_space {
++ 	struct inode		*host;
++ 	struct xarray		i_pages;
++ 	gfp_t			gfp_mask;
++ 	atomic_t		i_mmap_writable;
++ #ifdef CONFIG_READ_ONLY_THP_FOR_FS
++ 	/* number of thp, only for non-shmem files */
++ 	atomic_t		nr_thps;
++ #endif
++ 	struct rb_root_cached	i_mmap;
++ 	struct rw_semaphore	i_mmap_rwsem;
++ 	unsigned long		nrpages;
+++>>>>>>> 09d91cda0e82 (mm,thp: avoid writes to file with THP in pagecache)
+  	unsigned long		nrexceptional;
+ -	pgoff_t			writeback_index;
+ -	const struct address_space_operations *a_ops;
+ -	unsigned long		flags;
+ +	pgoff_t			writeback_index;/* writeback starts here */
+ +	const struct address_space_operations *a_ops;	/* methods */
+ +	unsigned long		flags;		/* error bits */
+ +	spinlock_t		private_lock;	/* for use by the address_space */
+ +	gfp_t			gfp_mask;	/* implicit gfp mask for allocations */
+ +	struct list_head	private_list;	/* for use by the address_space */
+ +	void			*private_data;	/* ditto */
+  	errseq_t		wb_err;
+ -	spinlock_t		private_lock;
+ -	struct list_head	private_list;
+ -	void			*private_data;
+ +	RH_KABI_RESERVE(1)
+ +	RH_KABI_RESERVE(2)
+ +	RH_KABI_RESERVE(3)
+ +	RH_KABI_RESERVE(4)
+  } __attribute__((aligned(sizeof(long)))) __randomize_layout;
+  	/*
+  	 * On most architectures that alignment is already the case; but
+diff --cc mm/filemap.c
+index 3bea6c21eec7,1146fcfa3215..000000000000
+--- a/mm/filemap.c
++++ b/mm/filemap.c
+@@@ -203,8 -203,9 +203,14 @@@ static void unaccount_page_cache_page(s
+  		__mod_node_page_state(page_pgdat(page), NR_SHMEM, -nr);
+  		if (PageTransHuge(page))
+  			__dec_node_page_state(page, NR_SHMEM_THPS);
+++<<<<<<< HEAD
+ +	} else {
+ +		VM_BUG_ON_PAGE(PageTransHuge(page), page);
+++=======
++ 	} else if (PageTransHuge(page)) {
++ 		__dec_node_page_state(page, NR_FILE_THPS);
++ 		filemap_nr_thps_dec(mapping);
+++>>>>>>> 09d91cda0e82 (mm,thp: avoid writes to file with THP in pagecache)
+  	}
+  
+  	/*
+diff --cc mm/khugepaged.c
+index 34da5213cf13,e89430ec5267..000000000000
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@@ -1461,40 -1509,35 +1461,49 @@@ out_isolate_failed
+  out_unlock:
+  		unlock_page(page);
+  		put_page(page);
+ -		goto xa_unlocked;
+ +		break;
+  	}
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Handle hole in radix tree at the end of the range.
+ +	 * This code only triggers if there's nothing in radix tree
+ +	 * beyond 'end'.
+ +	 */
+ +	if (result == SCAN_SUCCEED && index < end) {
+ +		int n = end - index;
+++=======
++ 	if (is_shmem)
++ 		__inc_node_page_state(new_page, NR_SHMEM_THPS);
++ 	else {
++ 		__inc_node_page_state(new_page, NR_FILE_THPS);
++ 		filemap_nr_thps_inc(mapping);
++ 	}
+++>>>>>>> 09d91cda0e82 (mm,thp: avoid writes to file with THP in pagecache)
+  
+ -	if (nr_none) {
+ -		struct zone *zone = page_zone(new_page);
+ +		if (!shmem_charge(mapping->host, n)) {
+ +			result = SCAN_FAIL;
+ +			goto tree_locked;
+ +		}
+  
+ -		__mod_node_page_state(zone->zone_pgdat, NR_FILE_PAGES, nr_none);
+ -		if (is_shmem)
+ -			__mod_node_page_state(zone->zone_pgdat,
+ -					      NR_SHMEM, nr_none);
+ +		for (; index < end; index++) {
+ +			radix_tree_insert(&mapping->i_pages, index,
+ +					new_page + (index % HPAGE_PMD_NR));
+ +		}
+ +		nr_none += n;
+  	}
+  
+ -xa_locked:
+ -	xas_unlock_irq(&xas);
+ -xa_unlocked:
+ +tree_locked:
+ +	xa_unlock_irq(&mapping->i_pages);
+ +tree_unlocked:
+  
+  	if (result == SCAN_SUCCEED) {
+ -		struct page *page, *tmp;
+ +		unsigned long flags;
+ +		struct zone *zone = page_zone(new_page);
+  
+  		/*
+ -		 * Replacing old pages with new one has succeeded, now we
+ -		 * need to copy the content and free the old pages.
+ +		 * Replacing old pages with new one has succeed, now we need to
+ +		 * copy the content and free old pages.
+  		 */
+  		index = start;
+  		list_for_each_entry_safe(page, tmp, &pagelist, lru) {
+diff --git a/fs/inode.c b/fs/inode.c
+index ad98bee52a46..3a00cad17906 100644
+--- a/fs/inode.c
++++ b/fs/inode.c
+@@ -183,6 +183,9 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
+ 	mapping->flags = 0;
+ 	mapping->wb_err = 0;
+ 	atomic_set(&mapping->i_mmap_writable, 0);
++#ifdef CONFIG_READ_ONLY_THP_FOR_FS
++	atomic_set(&mapping->nr_thps, 0);
++#endif
+ 	mapping_set_gfp_mask(mapping, GFP_HIGHUSER_MOVABLE);
+ 	mapping->private_data = NULL;
+ 	mapping->writeback_index = 0;
+diff --git a/fs/open.c b/fs/open.c
+index 2b4b976b45b6..cc7266adf22b 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -806,6 +806,14 @@ static int do_dentry_open(struct file *f,
+ 		if (!f->f_mapping->a_ops || !f->f_mapping->a_ops->direct_IO)
+ 			return -EINVAL;
+ 	}
++
++	/*
++	 * XXX: Huge page cache doesn't support writing yet. Drop all page
++	 * cache for this file before processing writes.
++	 */
++	if ((f->f_mode & FMODE_WRITE) && filemap_nr_thps(inode->i_mapping))
++		truncate_pagecache(inode, 0);
++
+ 	return 0;
+ 
+ cleanup_all:
+* Unmerged path include/linux/fs.h
+* Unmerged path mm/filemap.c
+* Unmerged path mm/khugepaged.c
