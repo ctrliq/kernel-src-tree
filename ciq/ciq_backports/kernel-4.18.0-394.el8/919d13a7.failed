@@ -1,0 +1,679 @@
+devlink: Set device as early as possible
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-394.el8
+commit-author Leon Romanovsky <leonro@nvidia.com>
+commit 919d13a7e455c2e7676042d7a5f94c164e859d8a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-394.el8/919d13a7.failed
+
+All kernel devlink implementations call to devlink_alloc() during
+initialization routine for specific device which is used later as
+a parent device for devlink_register().
+
+Such late device assignment causes to the situation which requires us to
+call to device_register() before setting other parameters, but that call
+opens devlink to the world and makes accessible for the netlink users.
+
+Any attempt to move devlink_register() to be the last call generates the
+following error due to access to the devlink->dev pointer.
+
+[    8.758862]  devlink_nl_param_fill+0x2e8/0xe50
+[    8.760305]  devlink_param_notify+0x6d/0x180
+[    8.760435]  __devlink_params_register+0x2f1/0x670
+[    8.760558]  devlink_params_register+0x1e/0x20
+
+The simple change of API to set devlink device in the devlink_alloc()
+instead of devlink_register() fixes all this above and ensures that
+prior to call to devlink_register() everything already set.
+
+	Signed-off-by: Leon Romanovsky <leonro@nvidia.com>
+	Reviewed-by: Jiri Pirko <jiri@nvidia.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 919d13a7e455c2e7676042d7a5f94c164e859d8a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-devlink.c
+#	drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_devlink.c
+#	drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_devlink.c
+#	drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+#	drivers/net/ethernet/huawei/hinic/hinic_devlink.h
+#	drivers/net/ethernet/huawei/hinic/hinic_hw_dev.c
+#	drivers/net/ethernet/huawei/hinic/hinic_main.c
+#	drivers/net/ethernet/intel/ice/ice_devlink.c
+#	drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c
+#	drivers/net/ethernet/marvell/prestera/prestera_devlink.c
+#	drivers/net/ethernet/marvell/prestera/prestera_devlink.h
+#	drivers/net/ethernet/marvell/prestera/prestera_main.c
+#	drivers/net/ethernet/mscc/ocelot_vsc7514.c
+#	drivers/net/ethernet/qlogic/qlge/qlge_main.c
+#	drivers/net/ethernet/ti/am65-cpsw-nuss.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	drivers/ptp/ptp_ocp.c
+#	net/dsa/dsa2.c
+diff --cc drivers/net/ethernet/huawei/hinic/hinic_hw_dev.c
+index 3875f39f43bb,56b6b04e209b..000000000000
+--- a/drivers/net/ethernet/huawei/hinic/hinic_hw_dev.c
++++ b/drivers/net/ethernet/huawei/hinic/hinic_hw_dev.c
+@@@ -732,10 -754,40 +732,44 @@@ static int init_pfhwdev(struct hinic_pf
+  		return err;
+  	}
+  
+++<<<<<<< HEAD
+ +	hinic_register_mgmt_msg_cb(&pfhwdev->pf_to_mgmt, HINIC_MOD_L2NIC,
+ +				   pfhwdev, nic_mgmt_msg_handler);
+++=======
++ 	err = hinic_devlink_register(hwdev->devlink_dev);
++ 	if (err) {
++ 		dev_err(&hwif->pdev->dev, "Failed to register devlink\n");
++ 		hinic_pf_to_mgmt_free(&pfhwdev->pf_to_mgmt);
++ 		return err;
++ 	}
++ 
++ 	err = hinic_func_to_func_init(hwdev);
++ 	if (err) {
++ 		dev_err(&hwif->pdev->dev, "Failed to init mailbox\n");
++ 		hinic_devlink_unregister(hwdev->devlink_dev);
++ 		hinic_pf_to_mgmt_free(&pfhwdev->pf_to_mgmt);
++ 		return err;
++ 	}
++ 
++ 	if (!HINIC_IS_VF(hwif)) {
++ 		hinic_register_mgmt_msg_cb(&pfhwdev->pf_to_mgmt,
++ 					   HINIC_MOD_L2NIC, pfhwdev,
++ 					   nic_mgmt_msg_handler);
++ 		hinic_register_mgmt_msg_cb(&pfhwdev->pf_to_mgmt, HINIC_MOD_COMM,
++ 					   pfhwdev, comm_mgmt_msg_handler);
++ 		hinic_comm_recv_mgmt_self_cmd_reg(pfhwdev,
++ 						  HINIC_COMM_CMD_FAULT_REPORT,
++ 						  pf_fault_event_handler);
++ 		hinic_comm_recv_mgmt_self_cmd_reg
++ 			(pfhwdev, HINIC_COMM_CMD_WATCHDOG_INFO,
++ 			 mgmt_watchdog_timeout_event_handler);
++ 	} else {
++ 		hinic_register_vf_mbox_cb(hwdev, HINIC_MOD_L2NIC,
++ 					  nic_mgmt_msg_handler);
++ 	}
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible)
+  
+  	hinic_set_pf_action(hwif, HINIC_PF_MGMT_ACTIVE);
+ -
+  	return 0;
+  }
+  
+diff --cc drivers/net/ethernet/huawei/hinic/hinic_main.c
+index 756d6aa92389,881d0b247561..000000000000
+--- a/drivers/net/ethernet/huawei/hinic/hinic_main.c
++++ b/drivers/net/ethernet/huawei/hinic/hinic_main.c
+@@@ -919,11 -1180,19 +919,21 @@@ static int nic_dev_init(struct pci_dev 
+  	struct hinic_dev *nic_dev;
+  	struct net_device *netdev;
+  	struct hinic_hwdev *hwdev;
+ -	struct devlink *devlink;
+  	int err, num_qps;
+  
+++<<<<<<< HEAD
+ +	hwdev = hinic_init_hwdev(pdev);
+++=======
++ 	devlink = hinic_devlink_alloc(&pdev->dev);
++ 	if (!devlink) {
++ 		dev_err(&pdev->dev, "Hinic devlink alloc failed\n");
++ 		return -ENOMEM;
++ 	}
++ 
++ 	hwdev = hinic_init_hwdev(pdev, devlink);
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible)
+  	if (IS_ERR(hwdev)) {
+  		dev_err(&pdev->dev, "Failed to initialize HW device\n");
+ -		hinic_devlink_free(devlink);
+  		return PTR_ERR(hwdev);
+  	}
+  
+diff --cc drivers/net/ethernet/intel/ice/ice_devlink.c
+index 3a00133552ec,8c863d64930b..000000000000
+--- a/drivers/net/ethernet/intel/ice/ice_devlink.c
++++ b/drivers/net/ethernet/intel/ice/ice_devlink.c
+@@@ -630,8 -500,15 +630,20 @@@ void ice_devlink_register(struct ice_p
+  {
+  	struct devlink *devlink = priv_to_devlink(pf);
+  	struct device *dev = ice_pf_to_dev(pf);
+++<<<<<<< HEAD
+ +	devlink_register(devlink, dev);
+ +	devlink_reload_enable(devlink);
+++=======
++ 	int err;
++ 
++ 	err = devlink_register(devlink);
++ 	if (err) {
++ 		dev_err(dev, "devlink registration failed: %d\n", err);
++ 		return err;
++ 	}
++ 
++ 	return 0;
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible)
+  }
+  
+  /**
+diff --cc drivers/net/ethernet/qlogic/qlge/qlge_main.c
+index 8758f134eaac,8fcdf89da8aa..000000000000
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_main.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+@@@ -4741,32 -4538,47 +4741,38 @@@ static void ql_timer(struct timer_list 
+  static int qlge_probe(struct pci_dev *pdev,
+  		      const struct pci_device_id *pci_entry)
+  {
+ -	struct qlge_netdev_priv *ndev_priv;
+ -	struct qlge_adapter *qdev = NULL;
+  	struct net_device *ndev = NULL;
+ -	struct devlink *devlink;
+ -	static int cards_found;
+ -	int err;
+ +	struct ql_adapter *qdev = NULL;
+ +	static int cards_found = 0;
+ +	int err = 0;
+  
+++<<<<<<< HEAD:drivers/net/ethernet/qlogic/qlge/qlge_main.c
+ +	ndev = alloc_etherdev_mq(sizeof(struct ql_adapter),
+ +			min(MAX_CPUS, netif_get_num_default_rss_queues()));
+ +	if (!ndev)
+++=======
++ 	devlink = devlink_alloc(&qlge_devlink_ops, sizeof(struct qlge_adapter),
++ 				&pdev->dev);
++ 	if (!devlink)
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible):drivers/staging/qlge/qlge_main.c
+  		return -ENOMEM;
+  
+ -	qdev = devlink_priv(devlink);
+ -
+ -	ndev = alloc_etherdev_mq(sizeof(struct qlge_netdev_priv),
+ -				 min(MAX_CPUS,
+ -				     netif_get_num_default_rss_queues()));
+ -	if (!ndev) {
+ -		err = -ENOMEM;
+ -		goto devlink_free;
+ +	err = ql_init_device(pdev, ndev, cards_found);
+ +	if (err < 0) {
+ +		free_netdev(ndev);
+ +		return err;
+  	}
+  
+ -	ndev_priv = netdev_priv(ndev);
+ -	ndev_priv->qdev = qdev;
+ -	ndev_priv->ndev = ndev;
+ -	qdev->ndev = ndev;
+ -	err = qlge_init_device(pdev, qdev, cards_found);
+ -	if (err < 0)
+ -		goto netdev_free;
+ -
+ +	qdev = netdev_priv(ndev);
+  	SET_NETDEV_DEV(ndev, &pdev->dev);
+  	ndev->hw_features = NETIF_F_SG |
+ -		NETIF_F_IP_CSUM |
+ -		NETIF_F_TSO |
+ -		NETIF_F_TSO_ECN |
+ -		NETIF_F_HW_VLAN_CTAG_TX |
+ -		NETIF_F_HW_VLAN_CTAG_RX |
+ -		NETIF_F_HW_VLAN_CTAG_FILTER |
+ -		NETIF_F_RXCSUM;
+ +			    NETIF_F_IP_CSUM |
+ +			    NETIF_F_TSO |
+ +			    NETIF_F_TSO_ECN |
+ +			    NETIF_F_HW_VLAN_CTAG_TX |
+ +			    NETIF_F_HW_VLAN_CTAG_RX |
+ +			    NETIF_F_HW_VLAN_CTAG_FILTER |
+ +			    NETIF_F_RXCSUM;
+  	ndev->features = ndev->hw_features;
+  	ndev->vlan_features = ndev->hw_features;
+  	/* vlan gets same features (except vlan filter) */
+@@@ -4797,11 -4609,20 +4803,24 @@@
+  	err = register_netdev(ndev);
+  	if (err) {
+  		dev_err(&pdev->dev, "net device registration failed.\n");
+ -		qlge_release_all(pdev);
+ +		ql_release_all(pdev);
+  		pci_disable_device(pdev);
+ -		goto netdev_free;
+ +		free_netdev(ndev);
+ +		return err;
+  	}
+++<<<<<<< HEAD:drivers/net/ethernet/qlogic/qlge/qlge_main.c
+++=======
++ 
++ 	err = devlink_register(devlink);
++ 	if (err)
++ 		goto netdev_free;
++ 
++ 	err = qlge_health_create_reporters(qdev);
++ 
++ 	if (err)
++ 		goto devlink_unregister;
++ 
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible):drivers/staging/qlge/qlge_main.c
+  	/* Start up the timer to trigger EEH if
+  	 * the bus goes dead
+  	 */
+diff --cc net/dsa/dsa2.c
+index 3472b9dc341c,8150e16aaa55..000000000000
+--- a/net/dsa/dsa2.c
++++ b/net/dsa/dsa2.c
+@@@ -358,13 -746,33 +358,18 @@@ static int dsa_switch_setup(struct dsa_
+  	/* Add the switch to devlink before calling setup, so that setup can
+  	 * add dpipe tables
+  	 */
+++<<<<<<< HEAD
+ +	ds->devlink = devlink_alloc(&dsa_devlink_ops, 0);
+++=======
++ 	ds->devlink =
++ 		devlink_alloc(&dsa_devlink_ops, sizeof(*dl_priv), ds->dev);
+++>>>>>>> 919d13a7e455 (devlink: Set device as early as possible)
+  	if (!ds->devlink)
+  		return -ENOMEM;
+ -	dl_priv = devlink_priv(ds->devlink);
+ -	dl_priv->ds = ds;
+  
+- 	err = devlink_register(ds->devlink, ds->dev);
++ 	err = devlink_register(ds->devlink);
+  	if (err)
+ -		goto free_devlink;
+ -
+ -	/* Setup devlink port instances now, so that the switch
+ -	 * setup() can register regions etc, against the ports
+ -	 */
+ -	list_for_each_entry(dp, &ds->dst->ports, list) {
+ -		if (dp->ds == ds) {
+ -			err = dsa_port_devlink_setup(dp);
+ -			if (err)
+ -				goto unregister_devlink_ports;
+ -		}
+ -	}
+ -
+ -	err = dsa_switch_register_notifier(ds);
+ -	if (err)
+ -		goto unregister_devlink_ports;
+ -
+ -	ds->configure_vlan_while_not_filtering = true;
+ +		return err;
+  
+  	err = ds->ops->setup(ds);
+  	if (err < 0)
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-devlink.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_devlink.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_devlink.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.h
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_devlink.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_devlink.h
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_main.c
+* Unmerged path drivers/net/ethernet/mscc/ocelot_vsc7514.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/ptp/ptp_ocp.c
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index d66e30337d44..9576547df4ab 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@ -779,14 +779,17 @@ static void bnxt_dl_params_unregister(struct bnxt *bp)
+ 
+ int bnxt_dl_register(struct bnxt *bp)
+ {
++	const struct devlink_ops *devlink_ops;
+ 	struct devlink_port_attrs attrs = {};
+ 	struct devlink *dl;
+ 	int rc;
+ 
+ 	if (BNXT_PF(bp))
+-		dl = devlink_alloc(&bnxt_dl_ops, sizeof(struct bnxt_dl));
++		devlink_ops = &bnxt_dl_ops;
+ 	else
+-		dl = devlink_alloc(&bnxt_vf_dl_ops, sizeof(struct bnxt_dl));
++		devlink_ops = &bnxt_vf_dl_ops;
++
++	dl = devlink_alloc(devlink_ops, sizeof(struct bnxt_dl), &bp->pdev->dev);
+ 	if (!dl) {
+ 		netdev_warn(bp->dev, "devlink_alloc failed\n");
+ 		return -ENOMEM;
+@@ -799,7 +802,7 @@ int bnxt_dl_register(struct bnxt *bp)
+ 	    bp->hwrm_spec_code > 0x10803)
+ 		bp->eswitch_mode = DEVLINK_ESWITCH_MODE_LEGACY;
+ 
+-	rc = devlink_register(dl, &bp->pdev->dev);
++	rc = devlink_register(dl);
+ 	if (rc) {
+ 		netdev_warn(bp->dev, "devlink_register failed. rc=%d\n", rc);
+ 		goto err_dl_free;
+diff --git a/drivers/net/ethernet/cavium/liquidio/lio_main.c b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+index b2a985da79c9..987e2708fef5 100644
+--- a/drivers/net/ethernet/cavium/liquidio/lio_main.c
++++ b/drivers/net/ethernet/cavium/liquidio/lio_main.c
+@@ -3680,7 +3680,8 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 	}
+ 
+ 	devlink = devlink_alloc(&liquidio_devlink_ops,
+-				sizeof(struct lio_devlink_priv));
++				sizeof(struct lio_devlink_priv),
++				&octeon_dev->pci_dev->dev);
+ 	if (!devlink) {
+ 		dev_err(&octeon_dev->pci_dev->dev, "devlink alloc failed\n");
+ 		goto setup_nic_wait_intr;
+@@ -3689,7 +3690,7 @@ static int setup_nic_devices(struct octeon_device *octeon_dev)
+ 	lio_devlink = devlink_priv(devlink);
+ 	lio_devlink->oct = octeon_dev;
+ 
+-	if (devlink_register(devlink, &octeon_dev->pci_dev->dev)) {
++	if (devlink_register(devlink)) {
+ 		devlink_free(devlink);
+ 		dev_err(&octeon_dev->pci_dev->dev,
+ 			"devlink registration failed\n");
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth-devlink.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3pf/hclge_devlink.c
+* Unmerged path drivers/net/ethernet/hisilicon/hns3/hns3vf/hclgevf_devlink.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_devlink.h
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_hw_dev.c
+* Unmerged path drivers/net/ethernet/huawei/hinic/hinic_main.c
+* Unmerged path drivers/net/ethernet/intel/ice/ice_devlink.c
+* Unmerged path drivers/net/ethernet/marvell/octeontx2/af/rvu_devlink.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_devlink.c
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_devlink.h
+* Unmerged path drivers/net/ethernet/marvell/prestera/prestera_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx4/main.c b/drivers/net/ethernet/mellanox/mlx4/main.c
+index 28ac4693da3c..7267c6c6d2e2 100644
+--- a/drivers/net/ethernet/mellanox/mlx4/main.c
++++ b/drivers/net/ethernet/mellanox/mlx4/main.c
+@@ -4005,7 +4005,7 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 
+ 	printk_once(KERN_INFO "%s", mlx4_version);
+ 
+-	devlink = devlink_alloc(&mlx4_devlink_ops, sizeof(*priv));
++	devlink = devlink_alloc(&mlx4_devlink_ops, sizeof(*priv), &pdev->dev);
+ 	if (!devlink)
+ 		return -ENOMEM;
+ 	priv = devlink_priv(devlink);
+@@ -4024,7 +4024,7 @@ static int mlx4_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	mutex_init(&dev->persist->interface_state_mutex);
+ 	mutex_init(&dev->persist->pci_status_mutex);
+ 
+-	ret = devlink_register(devlink, &pdev->dev);
++	ret = devlink_register(devlink);
+ 	if (ret)
+ 		goto err_persist_free;
+ 	ret = devlink_params_register(devlink, mlx4_devlink_params,
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+index a4a44e0ddcc8..771926343b35 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.c
+@@ -372,9 +372,10 @@ int mlx5_devlink_traps_get_action(struct mlx5_core_dev *dev, int trap_id,
+ 	return 0;
+ }
+ 
+-struct devlink *mlx5_devlink_alloc(void)
++struct devlink *mlx5_devlink_alloc(struct device *dev)
+ {
+-	return devlink_alloc(&mlx5_devlink_ops, sizeof(struct mlx5_core_dev));
++	return devlink_alloc(&mlx5_devlink_ops, sizeof(struct mlx5_core_dev),
++			     dev);
+ }
+ 
+ void mlx5_devlink_free(struct devlink *devlink)
+@@ -651,11 +652,11 @@ static void mlx5_devlink_traps_unregister(struct devlink *devlink)
+ 				       ARRAY_SIZE(mlx5_trap_groups_arr));
+ }
+ 
+-int mlx5_devlink_register(struct devlink *devlink, struct device *dev)
++int mlx5_devlink_register(struct devlink *devlink)
+ {
+ 	int err;
+ 
+-	err = devlink_register(devlink, dev);
++	err = devlink_register(devlink);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/devlink.h b/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
+index 7318d44b774b..30bf4882779b 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/devlink.h
+@@ -31,9 +31,9 @@ int mlx5_devlink_trap_get_num_active(struct mlx5_core_dev *dev);
+ int mlx5_devlink_traps_get_action(struct mlx5_core_dev *dev, int trap_id,
+ 				  enum devlink_trap_action *action);
+ 
+-struct devlink *mlx5_devlink_alloc(void);
++struct devlink *mlx5_devlink_alloc(struct device *dev);
+ void mlx5_devlink_free(struct devlink *devlink);
+-int mlx5_devlink_register(struct devlink *devlink, struct device *dev);
++int mlx5_devlink_register(struct devlink *devlink);
+ void mlx5_devlink_unregister(struct devlink *devlink);
+ 
+ #endif /* __MLX5_DEVLINK_H__ */
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/main.c b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+index 02ae9868da1c..3ca3df75edab 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/main.c
+@@ -1282,7 +1282,7 @@ int mlx5_init_one(struct mlx5_core_dev *dev)
+ 
+ 	set_bit(MLX5_INTERFACE_STATE_UP, &dev->intf_state);
+ 
+-	err = mlx5_devlink_register(priv_to_devlink(dev), dev->device);
++	err = mlx5_devlink_register(priv_to_devlink(dev));
+ 	if (err)
+ 		goto err_devlink_reg;
+ 
+@@ -1463,7 +1463,7 @@ static int probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	struct devlink *devlink;
+ 	int err;
+ 
+-	devlink = mlx5_devlink_alloc();
++	devlink = mlx5_devlink_alloc(&pdev->dev);
+ 	if (!devlink) {
+ 		dev_err(&pdev->dev, "devlink alloc failed\n");
+ 		return -ENOMEM;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/driver.c b/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/driver.c
+index 42c8ee03fe3e..052f48068dc1 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/driver.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/sf/dev/driver.c
+@@ -14,7 +14,7 @@ static int mlx5_sf_dev_probe(struct auxiliary_device *adev, const struct auxilia
+ 	struct devlink *devlink;
+ 	int err;
+ 
+-	devlink = mlx5_devlink_alloc();
++	devlink = mlx5_devlink_alloc(&adev->dev);
+ 	if (!devlink)
+ 		return -ENOMEM;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlxsw/core.c b/drivers/net/ethernet/mellanox/mlxsw/core.c
+index 7e9a7cb31720..87b7f108e442 100644
+--- a/drivers/net/ethernet/mellanox/mlxsw/core.c
++++ b/drivers/net/ethernet/mellanox/mlxsw/core.c
+@@ -1923,7 +1923,8 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 
+ 	if (!reload) {
+ 		alloc_size = sizeof(*mlxsw_core) + mlxsw_driver->priv_size;
+-		devlink = devlink_alloc(&mlxsw_devlink_ops, alloc_size);
++		devlink = devlink_alloc(&mlxsw_devlink_ops, alloc_size,
++					mlxsw_bus_info->dev);
+ 		if (!devlink) {
+ 			err = -ENOMEM;
+ 			goto err_devlink_alloc;
+@@ -1970,7 +1971,7 @@ __mlxsw_core_bus_device_register(const struct mlxsw_bus_info *mlxsw_bus_info,
+ 		goto err_emad_init;
+ 
+ 	if (!reload) {
+-		err = devlink_register(devlink, mlxsw_bus_info->dev);
++		err = devlink_register(devlink);
+ 		if (err)
+ 			goto err_devlink_register;
+ 	}
+* Unmerged path drivers/net/ethernet/mscc/ocelot_vsc7514.c
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_main.c b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+index d0835af1a577..5c258f86028a 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_main.c
+@@ -692,7 +692,7 @@ static int nfp_pci_probe(struct pci_dev *pdev,
+ 		goto err_pci_disable;
+ 	}
+ 
+-	devlink = devlink_alloc(&nfp_devlink_ops, sizeof(*pf));
++	devlink = devlink_alloc(&nfp_devlink_ops, sizeof(*pf), &pdev->dev);
+ 	if (!devlink) {
+ 		err = -ENOMEM;
+ 		goto err_rel_regions;
+diff --git a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+index 921db40047d7..d10a93801344 100644
+--- a/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
++++ b/drivers/net/ethernet/netronome/nfp/nfp_net_main.c
+@@ -701,7 +701,7 @@ int nfp_net_pci_probe(struct nfp_pf *pf)
+ 	if (err)
+ 		goto err_unmap;
+ 
+-	err = devlink_register(devlink, &pf->pdev->dev);
++	err = devlink_register(devlink);
+ 	if (err)
+ 		goto err_app_clean;
+ 
+diff --git a/drivers/net/ethernet/pensando/ionic/ionic_devlink.c b/drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+index 9423673b59c9..cd4f967499ab 100644
+--- a/drivers/net/ethernet/pensando/ionic/ionic_devlink.c
++++ b/drivers/net/ethernet/pensando/ionic/ionic_devlink.c
+@@ -64,7 +64,7 @@ struct ionic *ionic_devlink_alloc(struct device *dev)
+ {
+ 	struct devlink *dl;
+ 
+-	dl = devlink_alloc(&ionic_dl_ops, sizeof(struct ionic));
++	dl = devlink_alloc(&ionic_dl_ops, sizeof(struct ionic), dev);
+ 
+ 	return devlink_priv(dl);
+ }
+@@ -82,7 +82,7 @@ int ionic_devlink_register(struct ionic *ionic)
+ 	struct devlink_port_attrs attrs = {};
+ 	int err;
+ 
+-	err = devlink_register(dl, ionic->dev);
++	err = devlink_register(dl);
+ 	if (err) {
+ 		dev_warn(ionic->dev, "devlink_register failed: %d\n", err);
+ 		return err;
+diff --git a/drivers/net/ethernet/qlogic/qed/qed_devlink.c b/drivers/net/ethernet/qlogic/qed/qed_devlink.c
+index 61349b8adf75..78070682f2df 100644
+--- a/drivers/net/ethernet/qlogic/qed/qed_devlink.c
++++ b/drivers/net/ethernet/qlogic/qed/qed_devlink.c
+@@ -207,14 +207,15 @@ struct devlink *qed_devlink_register(struct qed_dev *cdev)
+ 	struct devlink *dl;
+ 	int rc;
+ 
+-	dl = devlink_alloc(&qed_dl_ops, sizeof(struct qed_devlink));
++	dl = devlink_alloc(&qed_dl_ops, sizeof(struct qed_devlink),
++			   &cdev->pdev->dev);
+ 	if (!dl)
+ 		return ERR_PTR(-ENOMEM);
+ 
+ 	qdevlink = devlink_priv(dl);
+ 	qdevlink->cdev = cdev;
+ 
+-	rc = devlink_register(dl, &cdev->pdev->dev);
++	rc = devlink_register(dl);
+ 	if (rc)
+ 		goto err_free;
+ 
+* Unmerged path drivers/net/ethernet/qlogic/qlge/qlge_main.c
+* Unmerged path drivers/net/ethernet/ti/am65-cpsw-nuss.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+diff --git a/drivers/net/netdevsim/dev.c b/drivers/net/netdevsim/dev.c
+index a3dd545b2aec..013fb53c4a48 100644
+--- a/drivers/net/netdevsim/dev.c
++++ b/drivers/net/netdevsim/dev.c
+@@ -1445,7 +1445,7 @@ int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
+ 	int err;
+ 
+ 	devlink = devlink_alloc_ns(&nsim_dev_devlink_ops, sizeof(*nsim_dev),
+-				   nsim_bus_dev->initial_net);
++				 nsim_bus_dev->initial_net, &nsim_bus_dev->dev);
+ 	if (!devlink)
+ 		return -ENOMEM;
+ 	nsim_dev = devlink_priv(devlink);
+@@ -1466,7 +1466,7 @@ int nsim_dev_probe(struct nsim_bus_dev *nsim_bus_dev)
+ 	if (err)
+ 		goto err_devlink_free;
+ 
+-	err = devlink_register(devlink, &nsim_bus_dev->dev);
++	err = devlink_register(devlink);
+ 	if (err)
+ 		goto err_resources_unregister;
+ 
+* Unmerged path drivers/ptp/ptp_ocp.c
+diff --git a/include/net/devlink.h b/include/net/devlink.h
+index 802531916e69..44fa624762a2 100644
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@ -1564,13 +1564,15 @@ struct net *devlink_net(const struct devlink *devlink);
+  * Drivers that operate on real HW must use devlink_alloc() instead.
+  */
+ struct devlink *devlink_alloc_ns(const struct devlink_ops *ops,
+-				 size_t priv_size, struct net *net);
++				 size_t priv_size, struct net *net,
++				 struct device *dev);
+ static inline struct devlink *devlink_alloc(const struct devlink_ops *ops,
+-					    size_t priv_size)
++					    size_t priv_size,
++					    struct device *dev)
+ {
+-	return devlink_alloc_ns(ops, priv_size, &init_net);
++	return devlink_alloc_ns(ops, priv_size, &init_net, dev);
+ }
+-int devlink_register(struct devlink *devlink, struct device *dev);
++int devlink_register(struct devlink *devlink);
+ void devlink_unregister(struct devlink *devlink);
+ void devlink_reload_enable(struct devlink *devlink);
+ void devlink_reload_disable(struct devlink *devlink);
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index 38c1d0939adb..e8e7232762c4 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -8797,24 +8797,26 @@ static bool devlink_reload_actions_valid(const struct devlink_ops *ops)
+  *	@ops: ops
+  *	@priv_size: size of user private data
+  *	@net: net namespace
++ *	@dev: parent device
+  *
+  *	Allocate new devlink instance resources, including devlink index
+  *	and name.
+  */
+ struct devlink *devlink_alloc_ns(const struct devlink_ops *ops,
+-				 size_t priv_size, struct net *net)
++				 size_t priv_size, struct net *net,
++				 struct device *dev)
+ {
+ 	struct devlink *devlink;
+ 
+-	if (WARN_ON(!ops))
+-		return NULL;
+-
++	WARN_ON(!ops || !dev);
+ 	if (!devlink_reload_actions_valid(ops))
+ 		return NULL;
+ 
+ 	devlink = kzalloc(sizeof(*devlink) + priv_size, GFP_KERNEL);
+ 	if (!devlink)
+ 		return NULL;
++
++	devlink->dev = dev;
+ 	devlink->ops = ops;
+ 	xa_init_flags(&devlink->snapshot_ids, XA_FLAGS_ALLOC);
+ 	write_pnet(&devlink->_net, net);
+@@ -8839,12 +8841,9 @@ EXPORT_SYMBOL_GPL(devlink_alloc_ns);
+  *	devlink_register - Register devlink instance
+  *
+  *	@devlink: devlink
+- *	@dev: parent device
+  */
+-int devlink_register(struct devlink *devlink, struct device *dev)
++int devlink_register(struct devlink *devlink)
+ {
+-	WARN_ON(devlink->dev);
+-	devlink->dev = dev;
+ 	mutex_lock(&devlink_mutex);
+ 	list_add_tail(&devlink->list, &devlink_list);
+ 	devlink_notify(devlink, DEVLINK_CMD_NEW);
+* Unmerged path net/dsa/dsa2.c
