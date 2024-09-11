@@ -371,6 +371,7 @@ struct cont_rec {
  * @scd_base_addr: scheduler sram base address in SRAM
  * @scd_bc_tbls: pointer to the byte count table of the scheduler
  * @kw: keep warm address
+ * @pnvm_dram: DRAM area that contains the PNVM data
  * @pci_dev: basic pci-network driver stuff
  * @hw_base: pci hardware address support
  * @ucode_write_complete: indicates that the ucode has been copied.
@@ -444,6 +445,8 @@ struct iwl_trans_pcie {
 	u32 scd_base_addr;
 	struct iwl_dma_ptr scd_bc_tbls;
 	struct iwl_dma_ptr kw;
+
+	struct iwl_dram_data pnvm_dram;
 
 	struct iwl_txq *txq_memory;
 
