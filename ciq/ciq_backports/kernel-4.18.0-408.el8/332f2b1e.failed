@@ -1,0 +1,173 @@
+dm: return void from __send_empty_flush
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 332f2b1e7360dc118d95bc6f15bcb6830b73a8aa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/332f2b1e.failed
+
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 332f2b1e7360dc118d95bc6f15bcb6830b73a8aa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index e7cb1b8972bd,df7664f3028c..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1469,55 -1390,20 +1469,54 @@@ static void __send_empty_flush(struct c
+  		__send_duplicate_bios(ci, ti, ti->num_flush_bios, NULL);
+  
+  	bio_uninit(ci->bio);
+- 	return 0;
+  }
+  
+ -static void __send_changing_extent_only(struct clone_info *ci, struct dm_target *ti,
+ -					unsigned num_bios)
+ +static int __clone_and_map_data_bio(struct clone_info *ci, struct dm_target *ti,
+ +				    sector_t sector, unsigned *len)
+  {
+ -	unsigned len;
+ +	struct bio *bio = ci->bio;
+ +	struct dm_target_io *tio;
+ +	int r;
+ +
+ +	tio = alloc_tio(ci, ti, 0, GFP_NOIO);
+ +	tio->len_ptr = len;
+ +	r = clone_bio(tio, bio, sector, *len);
+ +	if (r < 0) {
+ +		free_tio(tio);
+ +		return r;
+ +	}
+ +	(void) __map_bio(tio);
+ +
+ +	return 0;
+ +}
+  
+ -	len = min_t(sector_t, ci->sector_count,
+ -		    max_io_len_target_boundary(ti, dm_target_offset(ti, ci->sector)));
+ +static bool is_split_required_for_discard(struct dm_target *ti)
+ +{
+ +	return ti->split_discard_bios;
+ +}
+ +
+ +static int __send_changing_extent_only(struct clone_info *ci, struct dm_target *ti,
+ +				       unsigned num_bios, bool is_split_required)
+ +{
+ +	unsigned len;
+  
+  	/*
+ -	 * dm_accept_partial_bio cannot be used with duplicate bios,
+ -	 * so update clone_info cursor before __send_duplicate_bios().
+ +	 * Even though the device advertised support for this type of
+ +	 * request, that does not mean every target supports it, and
+ +	 * reconfiguration might also have changed that since the
+ +	 * check was performed.
+  	 */
+ +	if (!num_bios)
+ +		return -EOPNOTSUPP;
+ +
+ +	if (!is_split_required)
+ +		len = min_t(sector_t, ci->sector_count,
+ +			    max_io_len_target_boundary(ti, dm_target_offset(ti, ci->sector)));
+ +	else
+ +		len = min_t(sector_t, ci->sector_count, max_io_len(ti, ci->sector));
+ +
+ +	__send_duplicate_bios(ci, ti, num_bios, &len);
+ +
+  	ci->sector += len;
+  	ci->sector_count -= len;
+  
+@@@ -1618,45 -1565,51 +1617,51 @@@ static blk_qc_t __split_and_process_bio
+  	init_clone_info(&ci, md, map, bio);
+  
+  	if (bio->bi_opf & REQ_PREFLUSH) {
+++<<<<<<< HEAD
+ +		error = __send_empty_flush(&ci);
+ +		/* dm_io_dec_pending submits any data associated with flush */
+ +	} else if (op_is_zone_mgmt(bio_op(bio))) {
+ +		ci.bio = bio;
+ +		ci.sector_count = 0;
+ +		error = __split_and_process_non_flush(&ci);
+ +	} else {
+ +		ci.bio = bio;
+ +		ci.sector_count = bio_sectors(bio);
+ +		error = __split_and_process_non_flush(&ci);
+ +		if (ci.sector_count && !error) {
+ +			/*
+ +			 * Remainder must be passed to generic_make_request()
+ +			 * so that it gets handled *after* bios already submitted
+ +			 * have been completely processed.
+ +			 * We take a clone of the original to store in
+ +			 * ci.io->orig_bio to be used by end_io_acct() and
+ +			 * for dec_pending to use for completion handling.
+ +			 */
+ +			struct bio *b = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ +						  GFP_NOIO, &md->queue->bio_split);
+ +			ci.io->orig_bio = b;
+ +
+ +			bio_chain(b, bio);
+ +			trace_block_split(md->queue, b, bio->bi_iter.bi_sector);
+ +			ret = generic_make_request(bio);
+ +		}
+++=======
++ 		__send_empty_flush(&ci);
++ 		/* dm_io_complete submits any data associated with flush */
++ 		goto out;
+++>>>>>>> 332f2b1e7360 (dm: return void from __send_empty_flush)
+  	}
+ +	start_io_acct(ci.io);
+  
+ -	error = __split_and_process_bio(&ci);
+ -	ci.io->map_task = NULL;
+ -	if (error || !ci.sector_count)
+ -		goto out;
+ -
+ -	/*
+ -	 * Remainder must be passed to submit_bio_noacct() so it gets handled
+ -	 * *after* bios already submitted have been completely processed.
+ -	 * We take a clone of the original to store in ci.io->orig_bio to be
+ -	 * used by dm_end_io_acct() and for dm_io_complete() to use for
+ -	 * completion handling.
+ -	 */
+ -	orig_bio = bio_split(bio, bio_sectors(bio) - ci.sector_count,
+ -			     GFP_NOIO, &md->queue->bio_split);
+ -	bio_chain(orig_bio, bio);
+ -	trace_block_split(orig_bio, bio->bi_iter.bi_sector);
+ -	submit_bio_noacct(bio);
+ -out:
+ -	if (!orig_bio)
+ -		orig_bio = bio;
+ -	smp_store_release(&ci.io->orig_bio, orig_bio);
+ -	if (ci.io->start_io_acct)
+ -		dm_start_io_acct(ci.io, NULL);
+ -
+ -	/*
+ -	 * Drop the extra reference count for non-POLLED bio, and hold one
+ -	 * reference for POLLED bio, which will be released in dm_poll_bio
+ -	 *
+ -	 * Add every dm_io instance into the hlist_head which is stored in
+ -	 * bio->bi_private, so that dm_poll_bio can poll them all.
+ -	 */
+ -	if (error || !ci.submit_as_polled)
+ -		dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ -	else
+ -		dm_queue_poll_io(bio, ci.io);
+ +	/* drop the extra reference count */
+ +	dm_io_dec_pending(ci.io, errno_to_blk_status(error));
+ +	return ret;
+  }
+  
+ -static void dm_submit_bio(struct bio *bio)
+ +static blk_qc_t dm_make_request(struct request_queue *q, struct bio *bio)
+  {
+ -	struct mapped_device *md = bio->bi_bdev->bd_disk->private_data;
+ +	struct mapped_device *md = q->queuedata;
+ +	blk_qc_t ret = BLK_QC_T_NONE;
+  	int srcu_idx;
+  	struct dm_table *map;
+  
+* Unmerged path drivers/md/dm.c
