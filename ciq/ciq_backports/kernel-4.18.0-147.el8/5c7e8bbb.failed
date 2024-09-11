@@ -1,0 +1,143 @@
+net/mlx5e: Use monitor counters for update stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Eyal Davidovich <eyald@mellanox.com>
+commit 5c7e8bbb025726f9cb9b2bc050509a94262426f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/5c7e8bbb.failed
+
+- Adding new notifier block (struct mlx5_nb) monitor_counters_nb
+  for handeling MONITOR_COUNTER new event type.
+- Adding work queue element: monitor_counters_work for re-arm and
+  update stats.
+- We re-queue the update stat work, only when working over firmware
+  that doesn't support the monitored counters.
+
+	Signed-off-by: Eyal Davidovich <eyald@mellanox.com>
+	Reviewed-by: Saeed Mahameed <saeedm@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit 5c7e8bbb025726f9cb9b2bc050509a94262426f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index b4f6c14ea722,59745851b5ba..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@@ -49,6 -49,8 +49,11 @@@
+  #include "lib/clock.h"
+  #include "en/port.h"
+  #include "en/xdp.h"
+++<<<<<<< HEAD
+++=======
++ #include "lib/eq.h"
++ #include "en/monitor_stats.h"
+++>>>>>>> 5c7e8bbb0257 (net/mlx5e: Use monitor counters for update stats)
+  
+  struct mlx5e_rq_param {
+  	u32			rqc[MLX5_ST_SZ_DW(rqc)];
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index d2c773481d2f..ba35dc33c071 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -677,6 +677,8 @@ struct mlx5e_priv {
+ 	struct work_struct         set_rx_mode_work;
+ 	struct work_struct         tx_timeout_work;
+ 	struct work_struct         update_stats_work;
++	struct work_struct         monitor_counters_work;
++	struct mlx5_nb             monitor_counters_nb;
+ 
+ 	struct mlx5_core_dev      *mdev;
+ 	struct net_device         *netdev;
+@@ -930,6 +932,7 @@ int mlx5e_create_tises(struct mlx5e_priv *priv);
+ void mlx5e_cleanup_nic_tx(struct mlx5e_priv *priv);
+ int mlx5e_close(struct net_device *netdev);
+ int mlx5e_open(struct net_device *netdev);
++void mlx5e_update_ndo_stats(struct mlx5e_priv *priv);
+ 
+ void mlx5e_queue_update_stats(struct mlx5e_priv *priv);
+ int mlx5e_bits_invert(unsigned long a, int size);
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/monitor_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en/monitor_stats.c
+index 0f010efa1375..2ce420851e77 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/monitor_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/monitor_stats.c
+@@ -3,6 +3,7 @@
+ 
+ #include "en.h"
+ #include "monitor_stats.h"
++#include "lib/eq.h"
+ 
+ /* Driver will set the following watch counters list:
+  * Ppcnt.802_3:
+@@ -45,6 +46,39 @@ void mlx5e_monitor_counter_arm(struct mlx5e_priv *priv)
+ 	mlx5_cmd_exec(priv->mdev, in, sizeof(in), out, sizeof(out));
+ }
+ 
++static void mlx5e_monitor_counters_work(struct work_struct *work)
++{
++	struct mlx5e_priv *priv = container_of(work, struct mlx5e_priv,
++					       monitor_counters_work);
++
++	mutex_lock(&priv->state_lock);
++	mlx5e_update_ndo_stats(priv);
++	mutex_unlock(&priv->state_lock);
++	mlx5e_monitor_counter_arm(priv);
++}
++
++static int mlx5e_monitor_event_handler(struct notifier_block *nb,
++				       unsigned long event, void *eqe)
++{
++	struct mlx5e_priv *priv = mlx5_nb_cof(nb, struct mlx5e_priv,
++					      monitor_counters_nb);
++	queue_work(priv->wq, &priv->monitor_counters_work);
++	return NOTIFY_OK;
++}
++
++void mlx5e_monitor_counter_start(struct mlx5e_priv *priv)
++{
++	MLX5_NB_INIT(&priv->monitor_counters_nb, mlx5e_monitor_event_handler,
++		     MONITOR_COUNTER);
++	mlx5_eq_notifier_register(priv->mdev, &priv->monitor_counters_nb);
++}
++
++static void mlx5e_monitor_counter_stop(struct mlx5e_priv *priv)
++{
++	mlx5_eq_notifier_unregister(priv->mdev, &priv->monitor_counters_nb);
++	cancel_work_sync(&priv->monitor_counters_work);
++}
++
+ static int fill_monitor_counter_ppcnt_set1(int cnt, u32 *in)
+ {
+ 	enum mlx5_monitor_counter_ppcnt ppcnt_cnt;
+@@ -108,12 +142,14 @@ static void mlx5e_set_monitor_counter(struct mlx5e_priv *priv)
+ /* check if mlx5e_monitor_counter_supported before calling this function*/
+ void mlx5e_monitor_counter_init(struct mlx5e_priv *priv)
+ {
++	INIT_WORK(&priv->monitor_counters_work, mlx5e_monitor_counters_work);
++	mlx5e_monitor_counter_start(priv);
+ 	mlx5e_set_monitor_counter(priv);
+ 	mlx5e_monitor_counter_arm(priv);
++	queue_work(priv->wq, &priv->update_stats_work);
+ }
+ 
+-/* check if mlx5e_monitor_counter_supported before calling this function*/
+-void mlx5e_monitor_counter_cleanup(struct mlx5e_priv *priv)
++static void mlx5e_monitor_counter_disable(struct mlx5e_priv *priv)
+ {
+ 	u32  in[MLX5_ST_SZ_DW(set_monitor_counter_in)]  = {};
+ 	u32 out[MLX5_ST_SZ_DW(set_monitor_counter_out)] = {};
+@@ -124,3 +160,10 @@ void mlx5e_monitor_counter_cleanup(struct mlx5e_priv *priv)
+ 
+ 	mlx5_cmd_exec(priv->mdev, in, sizeof(in), out, sizeof(out));
+ }
++
++/* check if mlx5e_monitor_counter_supported before calling this function*/
++void mlx5e_monitor_counter_cleanup(struct mlx5e_priv *priv)
++{
++	mlx5e_monitor_counter_disable(priv);
++	mlx5e_monitor_counter_stop(priv);
++}
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_main.c
