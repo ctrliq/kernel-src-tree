@@ -1,0 +1,128 @@
+bpf: Add BPF_CGROUP_INET_SOCK_RELEASE hook
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Stanislav Fomichev <sdf@google.com>
+commit f5836749c9c04a10decd2742845ad4870965fdef
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/f5836749.failed
+
+Sometimes it's handy to know when the socket gets freed. In
+particular, we'd like to try to use a smarter allocation of
+ports for bpf_bind and explore the possibility of limiting
+the number of SOCK_DGRAM sockets the process can have.
+
+Implement BPF_CGROUP_INET_SOCK_RELEASE hook that triggers on
+inet socket release. It triggers only for userspace sockets
+(not in-kernel ones) and therefore has the same semantics as
+the existing BPF_CGROUP_INET_SOCK_CREATE.
+
+	Signed-off-by: Stanislav Fomichev <sdf@google.com>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/20200706230128.4073544-2-sdf@google.com
+(cherry picked from commit f5836749c9c04a10decd2742845ad4870965fdef)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/bpf.h
+diff --cc include/uapi/linux/bpf.h
+index af3754a78dbd,548a749aebb3..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -222,7 -220,13 +222,17 @@@ enum bpf_attach_type 
+  	BPF_TRACE_FEXIT,
+  	BPF_MODIFY_RETURN,
+  	BPF_LSM_MAC,
+++<<<<<<< HEAD
+ +#endif /* __GENKSYMS__ */
+++=======
++ 	BPF_TRACE_ITER,
++ 	BPF_CGROUP_INET4_GETPEERNAME,
++ 	BPF_CGROUP_INET6_GETPEERNAME,
++ 	BPF_CGROUP_INET4_GETSOCKNAME,
++ 	BPF_CGROUP_INET6_GETSOCKNAME,
++ 	BPF_XDP_DEVMAP,
++ 	BPF_CGROUP_INET_SOCK_RELEASE,
+++>>>>>>> f5836749c9c0 (bpf: Add BPF_CGROUP_INET_SOCK_RELEASE hook)
+  	__MAX_BPF_ATTACH_TYPE
+  };
+  
+diff --git a/include/linux/bpf-cgroup.h b/include/linux/bpf-cgroup.h
+index b7b6e86ffbd8..d397f46a3386 100644
+--- a/include/linux/bpf-cgroup.h
++++ b/include/linux/bpf-cgroup.h
+@@ -243,6 +243,9 @@ int bpf_percpu_cgroup_storage_update(struct bpf_map *map, void *key,
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk)				       \
+ 	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET_SOCK_CREATE)
+ 
++#define BPF_CGROUP_RUN_PROG_INET_SOCK_RELEASE(sk)			       \
++	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET_SOCK_RELEASE)
++
+ #define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk)				       \
+ 	BPF_CGROUP_RUN_SK_PROG(sk, BPF_CGROUP_INET4_POST_BIND)
+ 
+@@ -433,6 +436,7 @@ static inline int bpf_percpu_cgroup_storage_update(struct bpf_map *map,
+ #define BPF_CGROUP_RUN_PROG_INET_INGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_EGRESS(sk,skb) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET_SOCK(sk) ({ 0; })
++#define BPF_CGROUP_RUN_PROG_INET_SOCK_RELEASE(sk) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_BIND(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET6_BIND(sk, uaddr) ({ 0; })
+ #define BPF_CGROUP_RUN_PROG_INET4_POST_BIND(sk) ({ 0; })
+* Unmerged path include/uapi/linux/bpf.h
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 9186e511feb3..b983159117aa 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -1994,6 +1994,7 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ 	case BPF_PROG_TYPE_CGROUP_SOCK:
+ 		switch (expected_attach_type) {
+ 		case BPF_CGROUP_INET_SOCK_CREATE:
++		case BPF_CGROUP_INET_SOCK_RELEASE:
+ 		case BPF_CGROUP_INET4_POST_BIND:
+ 		case BPF_CGROUP_INET6_POST_BIND:
+ 			return 0;
+@@ -2731,6 +2732,7 @@ attach_type_to_prog_type(enum bpf_attach_type attach_type)
+ 		return BPF_PROG_TYPE_CGROUP_SKB;
+ 		break;
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
++	case BPF_CGROUP_INET_SOCK_RELEASE:
+ 	case BPF_CGROUP_INET4_POST_BIND:
+ 	case BPF_CGROUP_INET6_POST_BIND:
+ 		return BPF_PROG_TYPE_CGROUP_SOCK;
+@@ -2879,6 +2881,7 @@ static int bpf_prog_query(const union bpf_attr *attr,
+ 	case BPF_CGROUP_INET_INGRESS:
+ 	case BPF_CGROUP_INET_EGRESS:
+ 	case BPF_CGROUP_INET_SOCK_CREATE:
++	case BPF_CGROUP_INET_SOCK_RELEASE:
+ 	case BPF_CGROUP_INET4_BIND:
+ 	case BPF_CGROUP_INET6_BIND:
+ 	case BPF_CGROUP_INET4_POST_BIND:
+diff --git a/net/core/filter.c b/net/core/filter.c
+index 76aa4a2037db..6de74acbc290 100644
+--- a/net/core/filter.c
++++ b/net/core/filter.c
+@@ -6778,6 +6778,7 @@ static bool __sock_filter_check_attach_type(int off,
+ 	case offsetof(struct bpf_sock, priority):
+ 		switch (attach_type) {
+ 		case BPF_CGROUP_INET_SOCK_CREATE:
++		case BPF_CGROUP_INET_SOCK_RELEASE:
+ 			goto full_access;
+ 		default:
+ 			return false;
+diff --git a/net/ipv4/af_inet.c b/net/ipv4/af_inet.c
+index 763c985aaccd..1c6ee71b202b 100644
+--- a/net/ipv4/af_inet.c
++++ b/net/ipv4/af_inet.c
+@@ -415,6 +415,9 @@ int inet_release(struct socket *sock)
+ 	if (sk) {
+ 		long timeout;
+ 
++		if (!sk->sk_kern_sock)
++			BPF_CGROUP_RUN_PROG_INET_SOCK_RELEASE(sk);
++
+ 		/* Applications forget to leave groups before exiting */
+ 		ip_mc_drop_socket(sk);
+ 
