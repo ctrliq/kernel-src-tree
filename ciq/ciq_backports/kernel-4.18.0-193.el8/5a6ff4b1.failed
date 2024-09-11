@@ -1,0 +1,567 @@
+net: sched: take reference to action dev before calling offloads
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: take reference to action dev before calling offloads (Ivan Vecera) [1739606]
+Rebuild_FUZZ: 95.93%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit 5a6ff4b13d598573fc954f672cd2a267b76a01ec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5a6ff4b1.failed
+
+In order to remove dependency on rtnl lock when calling hardware offload
+API, take reference to action mirred dev when initializing flow_action
+structure in tc_setup_flow_action(). Implement function
+tc_cleanup_flow_action(), use it to release the device after hardware
+offload API is done using it.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 5a6ff4b13d598573fc954f672cd2a267b76a01ec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/pkt_cls.h
+#	net/sched/cls_api.c
+#	net/sched/cls_flower.c
+diff --cc include/net/pkt_cls.h
+index 835bbad70a4b,e553fc80eb23..000000000000
+--- a/include/net/pkt_cls.h
++++ b/include/net/pkt_cls.h
+@@@ -604,33 -502,30 +604,39 @@@ tcf_match_indev(struct sk_buff *skb, in
+  		return false;
+  	return ifindex == skb->skb_iif;
+  }
+ +#endif /* CONFIG_NET_CLS_IND */
+  
+  int tc_setup_flow_action(struct flow_action *flow_action,
+++<<<<<<< HEAD
+ +			 const struct tcf_exts *exts);
+++=======
++ 			 const struct tcf_exts *exts, bool rtnl_held);
++ void tc_cleanup_flow_action(struct flow_action *flow_action);
++ 
+++>>>>>>> 5a6ff4b13d59 (net: sched: take reference to action dev before calling offloads)
+  int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -		     void *type_data, bool err_stop, bool rtnl_held);
+ -int tc_setup_cb_add(struct tcf_block *block, struct tcf_proto *tp,
+ -		    enum tc_setup_type type, void *type_data, bool err_stop,
+ -		    u32 *flags, unsigned int *in_hw_count, bool rtnl_held);
+ -int tc_setup_cb_replace(struct tcf_block *block, struct tcf_proto *tp,
+ -			enum tc_setup_type type, void *type_data, bool err_stop,
+ -			u32 *old_flags, unsigned int *old_in_hw_count,
+ -			u32 *new_flags, unsigned int *new_in_hw_count,
+ -			bool rtnl_held);
+ -int tc_setup_cb_destroy(struct tcf_block *block, struct tcf_proto *tp,
+ -			enum tc_setup_type type, void *type_data, bool err_stop,
+ -			u32 *flags, unsigned int *in_hw_count, bool rtnl_held);
+ -int tc_setup_cb_reoffload(struct tcf_block *block, struct tcf_proto *tp,
+ -			  bool add, flow_setup_cb_t *cb,
+ -			  enum tc_setup_type type, void *type_data,
+ -			  void *cb_priv, u32 *flags, unsigned int *in_hw_count);
+ +		     void *type_data, bool err_stop);
+  unsigned int tcf_exts_num_actions(struct tcf_exts *exts);
+  
+ +enum tc_block_command {
+ +	TC_BLOCK_BIND,
+ +	TC_BLOCK_UNBIND,
+ +};
+ +
+ +struct tc_block_offload {
+ +	enum tc_block_command command;
+ +	enum tcf_block_binder_type binder_type;
+ +	struct tcf_block *block;
+ +	struct netlink_ext_ack *extack;
+ +};
+ +
+ +struct tc_cls_common_offload {
+ +	u32 chain_index;
+ +	__be16 protocol;
+ +	u32 prio;
+ +	struct netlink_ext_ack *extack;
+ +};
+ +
+  struct tc_cls_u32_knode {
+  	struct tcf_exts *exts;
+  	struct tcf_result *res;
+diff --cc net/sched/cls_api.c
+index 081ac3d0fb50,d988737693e4..000000000000
+--- a/net/sched/cls_api.c
++++ b/net/sched/cls_api.c
+@@@ -3266,13 -3072,225 +3266,200 @@@ int tc_setup_cb_call(struct tcf_block *
+  	}
+  	return ok_count;
+  }
+ -
+ -int tc_setup_cb_call(struct tcf_block *block, enum tc_setup_type type,
+ -		     void *type_data, bool err_stop, bool rtnl_held)
+ -{
+ -	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
+ -	int ok_count;
+ -
+ -retry:
+ -	if (take_rtnl)
+ -		rtnl_lock();
+ -	down_read(&block->cb_lock);
+ -	/* Need to obtain rtnl lock if block is bound to devs that require it.
+ -	 * In block bind code cb_lock is obtained while holding rtnl, so we must
+ -	 * obtain the locks in same order here.
+ -	 */
+ -	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
+ -		up_read(&block->cb_lock);
+ -		take_rtnl = true;
+ -		goto retry;
+ -	}
+ -
+ -	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
+ -
+ -	up_read(&block->cb_lock);
+ -	if (take_rtnl)
+ -		rtnl_unlock();
+ -	return ok_count;
+ -}
+  EXPORT_SYMBOL(tc_setup_cb_call);
+  
+++<<<<<<< HEAD
+++=======
++ /* Non-destructive filter add. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offloads counter. On failure,
++  * previously offloaded filter is considered to be intact and offloads counter
++  * is not decremented.
++  */
++ 
++ int tc_setup_cb_add(struct tcf_block *block, struct tcf_proto *tp,
++ 		    enum tc_setup_type type, void *type_data, bool err_stop,
++ 		    u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags,
++ 					  ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_add);
++ 
++ /* Destructive filter replace. If filter that wasn't already in hardware is
++  * successfully offloaded, increment block offload counter. On failure,
++  * previously offloaded filter is considered to be destroyed and offload counter
++  * is decremented.
++  */
++ 
++ int tc_setup_cb_replace(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *old_flags, unsigned int *old_in_hw_count,
++ 			u32 *new_flags, unsigned int *new_in_hw_count,
++ 			bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	/* Make sure all netdevs sharing this block are offload-capable. */
++ 	if (block->nooffloaddevcnt && err_stop) {
++ 		ok_count = -EOPNOTSUPP;
++ 		goto err_unlock;
++ 	}
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, old_in_hw_count, old_flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 	if (ok_count < 0)
++ 		goto err_unlock;
++ 
++ 	if (tp->ops->hw_add)
++ 		tp->ops->hw_add(tp, type_data);
++ 	if (ok_count > 0)
++ 		tc_cls_offload_cnt_update(block, tp, new_in_hw_count,
++ 					  new_flags, ok_count, true);
++ err_unlock:
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_replace);
++ 
++ /* Destroy filter and decrement block offload counter, if filter was previously
++  * offloaded.
++  */
++ 
++ int tc_setup_cb_destroy(struct tcf_block *block, struct tcf_proto *tp,
++ 			enum tc_setup_type type, void *type_data, bool err_stop,
++ 			u32 *flags, unsigned int *in_hw_count, bool rtnl_held)
++ {
++ 	bool take_rtnl = READ_ONCE(block->lockeddevcnt) && !rtnl_held;
++ 	int ok_count;
++ 
++ retry:
++ 	if (take_rtnl)
++ 		rtnl_lock();
++ 	down_read(&block->cb_lock);
++ 	/* Need to obtain rtnl lock if block is bound to devs that require it.
++ 	 * In block bind code cb_lock is obtained while holding rtnl, so we must
++ 	 * obtain the locks in same order here.
++ 	 */
++ 	if (!rtnl_held && !take_rtnl && block->lockeddevcnt) {
++ 		up_read(&block->cb_lock);
++ 		take_rtnl = true;
++ 		goto retry;
++ 	}
++ 
++ 	ok_count = __tc_setup_cb_call(block, type, type_data, err_stop);
++ 
++ 	tc_cls_offload_cnt_reset(block, tp, in_hw_count, flags);
++ 	if (tp->ops->hw_del)
++ 		tp->ops->hw_del(tp, type_data);
++ 
++ 	up_read(&block->cb_lock);
++ 	if (take_rtnl)
++ 		rtnl_unlock();
++ 	return ok_count < 0 ? ok_count : 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_destroy);
++ 
++ int tc_setup_cb_reoffload(struct tcf_block *block, struct tcf_proto *tp,
++ 			  bool add, flow_setup_cb_t *cb,
++ 			  enum tc_setup_type type, void *type_data,
++ 			  void *cb_priv, u32 *flags, unsigned int *in_hw_count)
++ {
++ 	int err = cb(type, type_data, cb_priv);
++ 
++ 	if (err) {
++ 		if (add && tc_skip_sw(*flags))
++ 			return err;
++ 	} else {
++ 		tc_cls_offload_cnt_update(block, tp, in_hw_count, flags, 1,
++ 					  add);
++ 	}
++ 
++ 	return 0;
++ }
++ EXPORT_SYMBOL(tc_setup_cb_reoffload);
++ 
++ void tc_cleanup_flow_action(struct flow_action *flow_action)
++ {
++ 	struct flow_action_entry *entry;
++ 	int i;
++ 
++ 	flow_action_for_each(i, entry, flow_action) {
++ 		switch (entry->id) {
++ 		case FLOW_ACTION_REDIRECT:
++ 		case FLOW_ACTION_MIRRED:
++ 		case FLOW_ACTION_REDIRECT_INGRESS:
++ 		case FLOW_ACTION_MIRRED_INGRESS:
++ 			if (entry->dev)
++ 				dev_put(entry->dev);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 	}
++ }
++ EXPORT_SYMBOL(tc_cleanup_flow_action);
++ 
+++>>>>>>> 5a6ff4b13d59 (net: sched: take reference to action dev before calling offloads)
+  int tc_setup_flow_action(struct flow_action *flow_action,
+ -			 const struct tcf_exts *exts, bool rtnl_held)
+ +			 const struct tcf_exts *exts)
+  {
+  	const struct tc_action *act;
+ -	int i, j, k, err = 0;
+ +	int i, j, k;
+  
+  	if (!exts)
+  		return 0;
+@@@ -3371,9 -3434,15 +3566,19 @@@
+  		if (!is_tcf_pedit(act))
+  			j++;
+  	}
+ -
+ +	return 0;
+  err_out:
+++<<<<<<< HEAD
+ +	return -EOPNOTSUPP;
+++=======
++ 	if (!rtnl_held)
++ 		rtnl_unlock();
++ 
++ 	if (err)
++ 		tc_cleanup_flow_action(flow_action);
++ 
++ 	return err;
+++>>>>>>> 5a6ff4b13d59 (net: sched: take reference to action dev before calling offloads)
+  }
+  EXPORT_SYMBOL(tc_setup_flow_action);
+  
+diff --cc net/sched/cls_flower.c
+index 3eb4f57be10d,2852fe6f50d2..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -418,40 -452,50 +418,46 @@@ static int fl_hw_replace_filter(struct 
+  	cls_flower.rule->match.key = &f->mkey;
+  	cls_flower.classid = f->res.classid;
+  
+ -	err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts,
+ -				   true);
+ +	err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts);
+  	if (err) {
+  		kfree(cls_flower.rule);
+ -		if (skip_sw)
+ +		if (skip_sw) {
+  			NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ -		else
+ -			err = 0;
+ -		goto errout;
+ +			return err;
+ +		}
+ +		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	err = tc_setup_cb_call(block, TC_SETUP_CLSFLOWER, &cls_flower, skip_sw);
+++=======
++ 	err = tc_setup_cb_add(block, tp, TC_SETUP_CLSFLOWER, &cls_flower,
++ 			      skip_sw, &f->flags, &f->in_hw_count, true);
++ 	tc_cleanup_flow_action(&cls_flower.rule->action);
+++>>>>>>> 5a6ff4b13d59 (net: sched: take reference to action dev before calling offloads)
+  	kfree(cls_flower.rule);
+  
+ -	if (err) {
+ -		fl_hw_destroy_filter(tp, f, true, NULL);
+ -		goto errout;
+ -	}
+ -
+ -	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW)) {
+ -		err = -EINVAL;
+ -		goto errout;
+ +	if (err < 0) {
+ +		fl_hw_destroy_filter(tp, f, NULL);
+ +		return err;
+ +	} else if (err > 0) {
+ +		f->in_hw_count = err;
+ +		tcf_block_offload_inc(block, &f->flags);
+  	}
+  
+ -errout:
+ -	if (!rtnl_held)
+ -		rtnl_unlock();
+ +	if (skip_sw && !(f->flags & TCA_CLS_FLAGS_IN_HW))
+ +		return -EINVAL;
+  
+ -	return err;
+ +	return 0;
+  }
+  
+ -static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f,
+ -			       bool rtnl_held)
+ +static void fl_hw_update_stats(struct tcf_proto *tp, struct cls_fl_filter *f)
+  {
+ +	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+ -	struct flow_cls_offload cls_flower = {};
+ -
+ -	if (!rtnl_held)
+ -		rtnl_lock();
+  
+  	tc_cls_common_offload_init(&cls_flower.common, tp, f->flags, NULL);
+ -	cls_flower.command = FLOW_CLS_STATS;
+ +	cls_flower.command = TC_CLSFLOWER_STATS;
+  	cls_flower.cookie = (unsigned long) f;
+  	cls_flower.classid = f->res.classid;
+  
+@@@ -1618,65 -1758,96 +1624,84 @@@ static void fl_walk(struct tcf_proto *t
+  			arg->stop = 1;
+  			break;
+  		}
+ -		__fl_put(f);
+ +		arg->cookie = (unsigned long)f->handle + 1;
+  		arg->count++;
+  	}
+ -	arg->cookie = id;
+ -}
+ -
+ -static struct cls_fl_filter *
+ -fl_get_next_hw_filter(struct tcf_proto *tp, struct cls_fl_filter *f, bool add)
+ -{
+ -	struct cls_fl_head *head = fl_head_dereference(tp);
+ -
+ -	spin_lock(&tp->lock);
+ -	if (list_empty(&head->hw_filters)) {
+ -		spin_unlock(&tp->lock);
+ -		return NULL;
+ -	}
+ -
+ -	if (!f)
+ -		f = list_entry(&head->hw_filters, struct cls_fl_filter,
+ -			       hw_list);
+ -	list_for_each_entry_continue(f, &head->hw_filters, hw_list) {
+ -		if (!(add && f->deleted) && refcount_inc_not_zero(&f->refcnt)) {
+ -			spin_unlock(&tp->lock);
+ -			return f;
+ -		}
+ -	}
+ -
+ -	spin_unlock(&tp->lock);
+ -	return NULL;
+  }
+  
+ -static int fl_reoffload(struct tcf_proto *tp, bool add, flow_setup_cb_t *cb,
+ +static int fl_reoffload(struct tcf_proto *tp, bool add, tc_setup_cb_t *cb,
+  			void *cb_priv, struct netlink_ext_ack *extack)
+  {
+ +	struct cls_fl_head *head = fl_head_dereference(tp);
+ +	struct tc_cls_flower_offload cls_flower = {};
+  	struct tcf_block *block = tp->chain->block;
+ -	struct flow_cls_offload cls_flower = {};
+ -	struct cls_fl_filter *f = NULL;
+ +	struct fl_flow_mask *mask;
+ +	struct cls_fl_filter *f;
+  	int err;
+  
+ -	/* hw_filters list can only be changed by hw offload functions after
+ -	 * obtaining rtnl lock. Make sure it is not changed while reoffload is
+ -	 * iterating it.
+ -	 */
+ -	ASSERT_RTNL();
+ +	list_for_each_entry(mask, &head->masks, list) {
+ +		list_for_each_entry(f, &mask->filters, list) {
+ +			if (tc_skip_hw(f->flags))
+ +				continue;
+ +
+ +			cls_flower.rule =
+ +				flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ +			if (!cls_flower.rule)
+ +				return -ENOMEM;
+ +
+ +			tc_cls_common_offload_init(&cls_flower.common, tp,
+ +						   f->flags, extack);
+ +			cls_flower.command = add ?
+ +				TC_CLSFLOWER_REPLACE : TC_CLSFLOWER_DESTROY;
+ +			cls_flower.cookie = (unsigned long)f;
+ +			cls_flower.rule->match.dissector = &mask->dissector;
+ +			cls_flower.rule->match.mask = &mask->key;
+ +			cls_flower.rule->match.key = &f->mkey;
+ +
+ +			err = tc_setup_flow_action(&cls_flower.rule->action,
+ +						   &f->exts);
+ +			if (err) {
+ +				kfree(cls_flower.rule);
+ +				if (tc_skip_sw(f->flags)) {
+ +					NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ +					return err;
+ +				}
+ +				continue;
+ +			}
+  
+ -	while ((f = fl_get_next_hw_filter(tp, f, add))) {
+ -		cls_flower.rule =
+ -			flow_rule_alloc(tcf_exts_num_actions(&f->exts));
+ -		if (!cls_flower.rule) {
+ -			__fl_put(f);
+ -			return -ENOMEM;
+ -		}
+ +			cls_flower.classid = f->res.classid;
+  
+ -		tc_cls_common_offload_init(&cls_flower.common, tp, f->flags,
+ -					   extack);
+ -		cls_flower.command = add ?
+ -			FLOW_CLS_REPLACE : FLOW_CLS_DESTROY;
+ -		cls_flower.cookie = (unsigned long)f;
+ -		cls_flower.rule->match.dissector = &f->mask->dissector;
+ -		cls_flower.rule->match.mask = &f->mask->key;
+ -		cls_flower.rule->match.key = &f->mkey;
+ -
+ -		err = tc_setup_flow_action(&cls_flower.rule->action, &f->exts,
+ -					   true);
+ -		if (err) {
+ +			err = cb(TC_SETUP_CLSFLOWER, &cls_flower, cb_priv);
+  			kfree(cls_flower.rule);
+ -			if (tc_skip_sw(f->flags)) {
+ -				NL_SET_ERR_MSG_MOD(extack, "Failed to setup flow action");
+ -				__fl_put(f);
+ -				return err;
+ +
+ +			if (err) {
+ +				if (add && tc_skip_sw(f->flags))
+ +					return err;
+ +				continue;
+  			}
+ -			goto next_flow;
+ +
+ +			tc_cls_offload_cnt_update(block, &f->in_hw_count,
+ +						  &f->flags, add);
+  		}
+++<<<<<<< HEAD
+++=======
++ 
++ 		cls_flower.classid = f->res.classid;
++ 
++ 		err = tc_setup_cb_reoffload(block, tp, add, cb,
++ 					    TC_SETUP_CLSFLOWER, &cls_flower,
++ 					    cb_priv, &f->flags,
++ 					    &f->in_hw_count);
++ 		tc_cleanup_flow_action(&cls_flower.rule->action);
++ 		kfree(cls_flower.rule);
++ 
++ 		if (err) {
++ 			__fl_put(f);
++ 			return err;
++ 		}
++ next_flow:
++ 		__fl_put(f);
+++>>>>>>> 5a6ff4b13d59 (net: sched: take reference to action dev before calling offloads)
+  	}
+  
+  	return 0;
+* Unmerged path include/net/pkt_cls.h
+* Unmerged path net/sched/cls_api.c
+* Unmerged path net/sched/cls_flower.c
