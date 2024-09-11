@@ -1,0 +1,356 @@
+x86: switch to ->regset_get()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Al Viro <viro@zeniv.linux.org.uk>
+commit 0557d64d983e3dedead2d4b4e8abc49620d5f5d2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/0557d64d.failed
+
+	All instances of ->get() in arch/x86 switched; that might or might
+not be worth splitting up.  Notes:
+
+	* for xstateregs_get() the amount we want to store is determined at
+the boot time; see init_xstate_size() and update_regset_xstate_info() for
+details.  task->thread.fpu.state.xsave ends with a flexible array member and
+the amount of data in it depends upon the FPU features supported/enabled.
+
+	* fpregs_get() writes slightly less than full ->thread.fpu.state.fsave
+(the last word is not copied); we pass the full size of state.fsave and let
+membuf_write() trim to the amount declared by regset - __regset_get() will
+make sure that the space in buffer is no more than that.
+
+	* copy_xstate_to_user() and its helpers are gone now.
+
+	* fpregs_soft_get() was getting user_regset_copyout() arguments
+wrong.  Since "x86: x86 user_regset math_emu" back in 2008...  I really
+doubt that it's worth splitting out for -stable, though - you need
+a 486SX box for that to trigger...
+
+[Kevin's braino fix for copy_xstate_to_kernel() essentially duplicated here]
+
+	Signed-off-by: Al Viro <viro@zeniv.linux.org.uk>
+(cherry picked from commit 0557d64d983e3dedead2d4b4e8abc49620d5f5d2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/fpu/xstate.h
+#	arch/x86/kernel/fpu/xstate.c
+#	arch/x86/kernel/ptrace.c
+diff --cc arch/x86/include/asm/fpu/xstate.h
+index 6fd67fb1cb12,f691ea1bc086..000000000000
+--- a/arch/x86/include/asm/fpu/xstate.h
++++ b/arch/x86/include/asm/fpu/xstate.h
+@@@ -103,9 -71,8 +103,14 @@@ extern void __init update_regset_xstate
+  void *get_xsave_addr(struct xregs_state *xsave, int xfeature_nr);
+  const void *get_xsave_field_ptr(int xfeature_nr);
+  int using_compacted_format(void);
+++<<<<<<< HEAD
+ +int xfeature_size(int xfeature_nr);
+ +int copy_xstate_to_kernel(void *kbuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+ +int copy_xstate_to_user(void __user *ubuf, struct xregs_state *xsave, unsigned int offset, unsigned int size);
+++=======
++ struct membuf;
++ void copy_xstate_to_kernel(struct membuf to, struct xregs_state *xsave);
+++>>>>>>> 0557d64d983e (x86: switch to ->regset_get())
+  int copy_kernel_to_xstate(struct xregs_state *xsave, const void *kbuf);
+  int copy_user_to_xstate(struct xregs_state *xsave, const void __user *ubuf);
+  void copy_supervisor_to_kernel(struct xregs_state *xsave);
+diff --cc arch/x86/kernel/fpu/xstate.c
+index 9a5033164640,4f8e4287c176..000000000000
+--- a/arch/x86/kernel/fpu/xstate.c
++++ b/arch/x86/kernel/fpu/xstate.c
+@@@ -1102,17 -1048,16 +1085,21 @@@ void copy_xstate_to_kernel(struct membu
+  	header.xfeatures &= xfeatures_mask_user();
+  
+  	if (header.xfeatures & XFEATURE_MASK_FP)
+- 		copy_part(0, off_mxcsr,
+- 			  &xsave->i387, &kbuf, &offset_start, &count);
++ 		copy_part(&to, &last, 0, off_mxcsr, &xsave->i387);
+  	if (header.xfeatures & (XFEATURE_MASK_SSE | XFEATURE_MASK_YMM))
+- 		copy_part(off_mxcsr, MXCSR_AND_FLAGS_SIZE,
+- 			  &xsave->i387.mxcsr, &kbuf, &offset_start, &count);
++ 		copy_part(&to, &last, off_mxcsr,
++ 			  MXCSR_AND_FLAGS_SIZE, &xsave->i387.mxcsr);
+  	if (header.xfeatures & XFEATURE_MASK_FP)
+- 		copy_part(offsetof(struct fxregs_state, st_space), 128,
+- 			  &xsave->i387.st_space, &kbuf, &offset_start, &count);
++ 		copy_part(&to, &last, offsetof(struct fxregs_state, st_space),
++ 			  128, &xsave->i387.st_space);
+  	if (header.xfeatures & XFEATURE_MASK_SSE)
+++<<<<<<< HEAD
+ +		copy_part(xstate_offsets[XFEATURE_SSE], 256,
+ +			  &xsave->i387.xmm_space, &kbuf, &offset_start, &count);
+++=======
++ 		copy_part(&to, &last, xstate_offsets[XFEATURE_SSE],
++ 			  256, &xsave->i387.xmm_space);
+++>>>>>>> 0557d64d983e (x86: switch to ->regset_get())
+  	/*
+  	 * Fill xsave->i387.sw_reserved value for ptrace frame:
+  	 */
+diff --cc arch/x86/kernel/ptrace.c
+index 34efa1d79242,8413cb1285a7..000000000000
+--- a/arch/x86/kernel/ptrace.c
++++ b/arch/x86/kernel/ptrace.c
+@@@ -696,15 -702,14 +682,18 @@@ static int ioperm_active(struct task_st
+  
+  static int ioperm_get(struct task_struct *target,
+  		      const struct user_regset *regset,
+- 		      unsigned int pos, unsigned int count,
+- 		      void *kbuf, void __user *ubuf)
++ 		      struct membuf to)
+  {
+ -	struct io_bitmap *iobm = target->thread.io_bitmap;
+ -
+ -	if (!iobm)
+ +	if (!target->thread.io_bitmap_ptr)
+  		return -ENXIO;
+  
+++<<<<<<< HEAD
+ +	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+ +				   target->thread.io_bitmap_ptr,
+ +				   0, IO_BITMAP_BYTES);
+++=======
++ 	return membuf_write(&to, iobm->bitmap, IO_BITMAP_BYTES);
+++>>>>>>> 0557d64d983e (x86: switch to ->regset_get())
+  }
+  
+  /*
+diff --git a/arch/x86/include/asm/fpu/regset.h b/arch/x86/include/asm/fpu/regset.h
+index d5bdffb9d27f..4f928d6a367b 100644
+--- a/arch/x86/include/asm/fpu/regset.h
++++ b/arch/x86/include/asm/fpu/regset.h
+@@ -8,8 +8,8 @@
+ #include <linux/regset.h>
+ 
+ extern user_regset_active_fn regset_fpregs_active, regset_xregset_fpregs_active;
+-extern user_regset_get_fn fpregs_get, xfpregs_get, fpregs_soft_get,
+-				xstateregs_get;
++extern user_regset_get2_fn fpregs_get, xfpregs_get, fpregs_soft_get,
++				 xstateregs_get;
+ extern user_regset_set_fn fpregs_set, xfpregs_set, fpregs_soft_set,
+ 				 xstateregs_set;
+ 
+* Unmerged path arch/x86/include/asm/fpu/xstate.h
+diff --git a/arch/x86/kernel/fpu/regset.c b/arch/x86/kernel/fpu/regset.c
+index 91f80aca27fb..c413756ba89f 100644
+--- a/arch/x86/kernel/fpu/regset.c
++++ b/arch/x86/kernel/fpu/regset.c
+@@ -27,8 +27,7 @@ int regset_xregset_fpregs_active(struct task_struct *target, const struct user_r
+ }
+ 
+ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+-		unsigned int pos, unsigned int count,
+-		void *kbuf, void __user *ubuf)
++		struct membuf to)
+ {
+ 	struct fpu *fpu = &target->thread.fpu;
+ 
+@@ -38,8 +37,7 @@ int xfpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	fpu__prepare_read(fpu);
+ 	fpstate_sanitize_xstate(fpu);
+ 
+-	return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+-				   &fpu->state.fxsave, 0, -1);
++	return membuf_write(&to, &fpu->state.fxsave, sizeof(struct fxregs_state));
+ }
+ 
+ int xfpregs_set(struct task_struct *target, const struct user_regset *regset,
+@@ -74,12 +72,10 @@ int xfpregs_set(struct task_struct *target, const struct user_regset *regset,
+ }
+ 
+ int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+-		unsigned int pos, unsigned int count,
+-		void *kbuf, void __user *ubuf)
++		struct membuf to)
+ {
+ 	struct fpu *fpu = &target->thread.fpu;
+ 	struct xregs_state *xsave;
+-	int ret;
+ 
+ 	if (!boot_cpu_has(X86_FEATURE_XSAVE))
+ 		return -ENODEV;
+@@ -89,10 +85,8 @@ int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	fpu__prepare_read(fpu);
+ 
+ 	if (using_compacted_format()) {
+-		if (kbuf)
+-			ret = copy_xstate_to_kernel(kbuf, xsave, pos, count);
+-		else
+-			ret = copy_xstate_to_user(ubuf, xsave, pos, count);
++		copy_xstate_to_kernel(to, xsave);
++		return 0;
+ 	} else {
+ 		fpstate_sanitize_xstate(fpu);
+ 		/*
+@@ -105,9 +99,8 @@ int xstateregs_get(struct task_struct *target, const struct user_regset *regset,
+ 		/*
+ 		 * Copy the xstate memory layout.
+ 		 */
+-		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf, xsave, 0, -1);
++		return membuf_write(&to, xsave, fpu_user_xstate_size);
+ 	}
+-	return ret;
+ }
+ 
+ int xstateregs_set(struct task_struct *target, const struct user_regset *regset,
+@@ -293,8 +286,7 @@ void convert_to_fxsr(struct fxregs_state *fxsave,
+ }
+ 
+ int fpregs_get(struct task_struct *target, const struct user_regset *regset,
+-	       unsigned int pos, unsigned int count,
+-	       void *kbuf, void __user *ubuf)
++	       struct membuf to)
+ {
+ 	struct fpu *fpu = &target->thread.fpu;
+ 	struct user_i387_ia32_struct env;
+@@ -302,23 +294,22 @@ int fpregs_get(struct task_struct *target, const struct user_regset *regset,
+ 	fpu__prepare_read(fpu);
+ 
+ 	if (!boot_cpu_has(X86_FEATURE_FPU))
+-		return fpregs_soft_get(target, regset, pos, count, kbuf, ubuf);
++		return fpregs_soft_get(target, regset, to);
+ 
+-	if (!boot_cpu_has(X86_FEATURE_FXSR))
+-		return user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+-					   &fpu->state.fsave, 0,
+-					   -1);
++	if (!boot_cpu_has(X86_FEATURE_FXSR)) {
++		return membuf_write(&to, &fpu->state.fsave,
++				    sizeof(struct fregs_state));
++	}
+ 
+ 	fpstate_sanitize_xstate(fpu);
+ 
+-	if (kbuf && pos == 0 && count == sizeof(env)) {
+-		convert_from_fxsr(kbuf, target);
++	if (to.left == sizeof(env)) {
++		convert_from_fxsr(to.p, target);
+ 		return 0;
+ 	}
+ 
+ 	convert_from_fxsr(&env, target);
+-
+-	return user_regset_copyout(&pos, &count, &kbuf, &ubuf, &env, 0, -1);
++	return membuf_write(&to, &env, sizeof(env));
+ }
+ 
+ int fpregs_set(struct task_struct *target, const struct user_regset *regset,
+diff --git a/arch/x86/kernel/fpu/signal.c b/arch/x86/kernel/fpu/signal.c
+index 51991f330a26..c6ad4ca2fc45 100644
+--- a/arch/x86/kernel/fpu/signal.c
++++ b/arch/x86/kernel/fpu/signal.c
+@@ -172,7 +172,8 @@ int copy_fpstate_to_sigframe(void __user *buf, void __user *buf_fx, int size)
+ 
+ 	if (!static_cpu_has(X86_FEATURE_FPU)) {
+ 		struct user_i387_ia32_struct fp;
+-		fpregs_soft_get(current, NULL, 0, sizeof(fp), &fp, NULL);
++		fpregs_soft_get(current, NULL, (struct membuf){.p = &fp,
++						.left = sizeof(fp)});
+ 		return copy_to_user(buf, &fp, sizeof(fp)) ? -EFAULT : 0;
+ 	}
+ 
+* Unmerged path arch/x86/kernel/fpu/xstate.c
+* Unmerged path arch/x86/kernel/ptrace.c
+diff --git a/arch/x86/kernel/tls.c b/arch/x86/kernel/tls.c
+index 71d3fef1edc9..64a496a0687f 100644
+--- a/arch/x86/kernel/tls.c
++++ b/arch/x86/kernel/tls.c
+@@ -256,36 +256,16 @@ int regset_tls_active(struct task_struct *target,
+ }
+ 
+ int regset_tls_get(struct task_struct *target, const struct user_regset *regset,
+-		   unsigned int pos, unsigned int count,
+-		   void *kbuf, void __user *ubuf)
++		   struct membuf to)
+ {
+ 	const struct desc_struct *tls;
++	struct user_desc v;
++	int pos;
+ 
+-	if (pos >= GDT_ENTRY_TLS_ENTRIES * sizeof(struct user_desc) ||
+-	    (pos % sizeof(struct user_desc)) != 0 ||
+-	    (count % sizeof(struct user_desc)) != 0)
+-		return -EINVAL;
+-
+-	pos /= sizeof(struct user_desc);
+-	count /= sizeof(struct user_desc);
+-
+-	tls = &target->thread.tls_array[pos];
+-
+-	if (kbuf) {
+-		struct user_desc *info = kbuf;
+-		while (count-- > 0)
+-			fill_user_desc(info++, GDT_ENTRY_TLS_MIN + pos++,
+-				       tls++);
+-	} else {
+-		struct user_desc __user *u_info = ubuf;
+-		while (count-- > 0) {
+-			struct user_desc info;
+-			fill_user_desc(&info, GDT_ENTRY_TLS_MIN + pos++, tls++);
+-			if (__copy_to_user(u_info++, &info, sizeof(info)))
+-				return -EFAULT;
+-		}
++	for (pos = 0, tls = target->thread.tls_array; to.left; pos++, tls++) {
++		fill_user_desc(&v, GDT_ENTRY_TLS_MIN + pos, tls);
++		membuf_write(&to, &v, sizeof(v));
+ 	}
+-
+ 	return 0;
+ }
+ 
+diff --git a/arch/x86/kernel/tls.h b/arch/x86/kernel/tls.h
+index 2f083a2fe216..438435d3f140 100644
+--- a/arch/x86/kernel/tls.h
++++ b/arch/x86/kernel/tls.h
+@@ -15,7 +15,7 @@
+ #include <linux/regset.h>
+ 
+ extern user_regset_active_fn regset_tls_active;
+-extern user_regset_get_fn regset_tls_get;
++extern user_regset_get2_fn regset_tls_get;
+ extern user_regset_set_fn regset_tls_set;
+ 
+ #endif	/* _ARCH_X86_KERNEL_TLS_H */
+diff --git a/arch/x86/math-emu/fpu_entry.c b/arch/x86/math-emu/fpu_entry.c
+index a873da6b46d6..8679a9d6c47f 100644
+--- a/arch/x86/math-emu/fpu_entry.c
++++ b/arch/x86/math-emu/fpu_entry.c
+@@ -689,12 +689,10 @@ int fpregs_soft_set(struct task_struct *target,
+ 
+ int fpregs_soft_get(struct task_struct *target,
+ 		    const struct user_regset *regset,
+-		    unsigned int pos, unsigned int count,
+-		    void *kbuf, void __user *ubuf)
++		    struct membuf to)
+ {
+ 	struct swregs_state *s387 = &target->thread.fpu.state.soft;
+ 	const void *space = s387->st_space;
+-	int ret;
+ 	int offset = (S387->ftop & 7) * 10, other = 80 - offset;
+ 
+ 	RE_ENTRANT_CHECK_OFF;
+@@ -709,18 +707,11 @@ int fpregs_soft_get(struct task_struct *target,
+ 	S387->fos |= 0xffff0000;
+ #endif /* PECULIAR_486 */
+ 
+-	ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf, s387, 0,
+-				  offsetof(struct swregs_state, st_space));
+-
+-	/* Copy all registers in stack order. */
+-	if (!ret)
+-		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+-					  space + offset, 0, other);
+-	if (!ret)
+-		ret = user_regset_copyout(&pos, &count, &kbuf, &ubuf,
+-					  space, 0, offset);
++	membuf_write(&to, s387, offsetof(struct swregs_state, st_space));
++	membuf_write(&to, space + offset, other);
++	membuf_write(&to, space, offset);
+ 
+ 	RE_ENTRANT_CHECK_ON;
+ 
+-	return ret;
++	return 0;
+ }
