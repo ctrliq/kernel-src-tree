@@ -1,0 +1,154 @@
+iommu/arm-smmu: Make arm-smmu explicitly non-modular
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [iommu] arm-smmu: Make arm-smmu explicitly non-modular (Jerry Snitselaar) [1722978]
+Rebuild_FUZZ: 93.88%
+commit-author Paul Gortmaker <paul.gortmaker@windriver.com>
+commit addb672f200f4e99368270da205320b83efe01a0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/addb672f.failed
+
+The Kconfig currently controlling compilation of this code is:
+
+drivers/iommu/Kconfig:config ARM_SMMU
+drivers/iommu/Kconfig:  bool "ARM Ltd. System MMU (SMMU) Support"
+
+...meaning that it currently is not being built as a module by anyone.
+
+Lets remove the modular code that is essentially orphaned, so that
+when reading the driver there is no doubt it is builtin-only.
+
+Since module_platform_driver() uses the same init level priority as
+builtin_platform_driver() the init ordering remains unchanged with
+this commit.
+
+We explicitly disallow a driver unbind, since that doesn't have a
+sensible use case anyway, but unlike most drivers, we can't delete the
+function tied to the ".remove" field.  This is because as of commit
+7aa8619a66ae ("iommu/arm-smmu-v3: Implement shutdown method") the
+.remove function was given a one line wrapper and re-used to provide a
+.shutdown service.  So we delete the wrapper and re-name the function
+from remove to shutdown.
+
+We add a moduleparam.h include since the file does actually declare
+some module parameters, and leaving them as such is the easiest way
+currently to remain backwards compatible with existing use cases.
+
+We also delete the MODULE_LICENSE tag etc. since all that information
+is already contained at the top of the file in the comments.
+
+	Cc: Will Deacon <will.deacon@arm.com>
+	Cc: Joerg Roedel <joro@8bytes.org>
+	Cc: Robin Murphy <robin.murphy@arm.com>
+	Cc: Nate Watterson <nwatters@codeaurora.org>
+	Cc: linux-arm-kernel@lists.infradead.org
+	Cc: iommu@lists.linux-foundation.org
+	Acked-by: Robin Murphy <robin.murphy@arm.com>
+	Signed-off-by: Paul Gortmaker <paul.gortmaker@windriver.com>
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit addb672f200f4e99368270da205320b83efe01a0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/arm-smmu.c
+diff --cc drivers/iommu/arm-smmu.c
+index 6c13ce6d5f9b,4a2e143fdf52..000000000000
+--- a/drivers/iommu/arm-smmu.c
++++ b/drivers/iommu/arm-smmu.c
+@@@ -2025,10 -1967,8 +2030,9 @@@ static const struct of_device_id arm_sm
+  	{ .compatible = "arm,mmu-401", .data = &arm_mmu401 },
+  	{ .compatible = "arm,mmu-500", .data = &arm_mmu500 },
+  	{ .compatible = "cavium,smmu-v2", .data = &cavium_smmuv2 },
+ +	{ .compatible = "qcom,smmu-v2", .data = &qcom_smmuv2 },
+  	{ },
+  };
+- MODULE_DEVICE_TABLE(of, arm_smmu_of_match);
+  
+  #ifdef CONFIG_ACPI
+  static int acpi_smmu_get_data(u32 model, struct arm_smmu_device *smmu)
+@@@ -2316,46 -2238,15 +2320,49 @@@ static void arm_smmu_device_shutdown(st
+  	if (!bitmap_empty(smmu->context_map, ARM_SMMU_MAX_CBS))
+  		dev_err(&pdev->dev, "removing device with active domains!\n");
+  
+ +	arm_smmu_rpm_get(smmu);
+  	/* Turn the thing off */
+  	writel(sCR0_CLIENTPD, ARM_SMMU_GR0_NS(smmu) + ARM_SMMU_GR0_sCR0);
+++<<<<<<< HEAD
+ +	arm_smmu_rpm_put(smmu);
+ +
+ +	if (pm_runtime_enabled(smmu->dev))
+ +		pm_runtime_force_suspend(smmu->dev);
+ +	else
+ +		clk_bulk_disable(smmu->num_clks, smmu->clks);
+ +
+ +	clk_bulk_unprepare(smmu->num_clks, smmu->clks);
+ +
+ +	return 0;
+  }
+  
+ -static int __maybe_unused arm_smmu_pm_resume(struct device *dev)
+ +static void arm_smmu_device_shutdown(struct platform_device *pdev)
+ +{
+ +	arm_smmu_device_remove(pdev);
+++=======
+++>>>>>>> addb672f200f (iommu/arm-smmu: Make arm-smmu explicitly non-modular)
+ +}
+ +
+ +static int __maybe_unused arm_smmu_runtime_resume(struct device *dev)
+  {
+  	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
+ +	int ret;
+ +
+ +	ret = clk_bulk_enable(smmu->num_clks, smmu->clks);
+ +	if (ret)
+ +		return ret;
+  
+  	arm_smmu_device_reset(smmu);
+ +
+ +	return 0;
+ +}
+ +
+ +static int __maybe_unused arm_smmu_runtime_suspend(struct device *dev)
+ +{
+ +	struct arm_smmu_device *smmu = dev_get_drvdata(dev);
+ +
+ +	clk_bulk_disable(smmu->num_clks, smmu->clks);
+ +
+  	return 0;
+  }
+  
+@@@ -2383,23 -2254,12 +2390,27 @@@ static const struct dev_pm_ops arm_smmu
+  
+  static struct platform_driver arm_smmu_driver = {
+  	.driver	= {
+- 		.name		= "arm-smmu",
+- 		.of_match_table	= of_match_ptr(arm_smmu_of_match),
+- 		.pm		= &arm_smmu_pm_ops,
++ 		.name			= "arm-smmu",
++ 		.of_match_table		= of_match_ptr(arm_smmu_of_match),
++ 		.pm			= &arm_smmu_pm_ops,
++ 		.suppress_bind_attrs	= true,
+  	},
+  	.probe	= arm_smmu_device_probe,
+- 	.remove	= arm_smmu_device_remove,
+  	.shutdown = arm_smmu_device_shutdown,
+  };
+++<<<<<<< HEAD
+ +module_platform_driver(arm_smmu_driver);
+ +
+ +IOMMU_OF_DECLARE(arm_smmuv1, "arm,smmu-v1");
+ +IOMMU_OF_DECLARE(arm_smmuv2, "arm,smmu-v2");
+ +IOMMU_OF_DECLARE(arm_mmu400, "arm,mmu-400");
+ +IOMMU_OF_DECLARE(arm_mmu401, "arm,mmu-401");
+ +IOMMU_OF_DECLARE(arm_mmu500, "arm,mmu-500");
+ +IOMMU_OF_DECLARE(cavium_smmuv2, "cavium,smmu-v2");
+ +
+ +MODULE_DESCRIPTION("IOMMU API for ARM architected SMMU implementations");
+ +MODULE_AUTHOR("Will Deacon <will.deacon@arm.com>");
+ +MODULE_LICENSE("GPL v2");
+++=======
++ builtin_platform_driver(arm_smmu_driver);
+++>>>>>>> addb672f200f (iommu/arm-smmu: Make arm-smmu explicitly non-modular)
+* Unmerged path drivers/iommu/arm-smmu.c
