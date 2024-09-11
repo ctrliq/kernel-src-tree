@@ -1,0 +1,202 @@
+locking/lockdep: Fix TRACE_IRQFLAGS vs. NMIs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author peterz@infradead.org <peterz@infradead.org>
+commit ed00495333ccc80fc8fb86fb43773c3c2a499466
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/ed004953.failed
+
+Prior to commit:
+
+  859d069ee1dd ("lockdep: Prepare for NMI IRQ state tracking")
+
+IRQ state tracking was disabled in NMIs due to nmi_enter()
+doing lockdep_off() -- with the obvious requirement that NMI entry
+call nmi_enter() before trace_hardirqs_off().
+
+[ AFAICT, PowerPC and SH violate this order on their NMI entry ]
+
+However, that commit explicitly changed lockdep_hardirqs_*() to ignore
+lockdep_off() and breaks every architecture that has irq-tracing in
+it's NMI entry that hasn't been fixed up (x86 being the only fixed one
+at this point).
+
+The reason for this change is that by ignoring lockdep_off() we can:
+
+  - get rid of 'current->lockdep_recursion' in lockdep_assert_irqs*()
+    which was going to to give header-recursion issues with the
+    seqlock rework.
+
+  - allow these lockdep_assert_*() macros to function in NMI context.
+
+Restore the previous state of things and allow an architecture to
+opt-in to the NMI IRQ tracking support, however instead of relying on
+lockdep_off(), rely on in_nmi(), both are part of nmi_enter() and so
+over-all entry ordering doesn't need to change.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+Link: https://lore.kernel.org/r/20200727124852.GK119549@hirez.programming.kicks-ass.net
+(cherry picked from commit ed00495333ccc80fc8fb86fb43773c3c2a499466)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/Kconfig.debug
+#	kernel/locking/lockdep.c
+diff --cc arch/x86/Kconfig.debug
+index c6dd1d980081,ee1d3c5834c6..000000000000
+--- a/arch/x86/Kconfig.debug
++++ b/arch/x86/Kconfig.debug
+@@@ -4,7 -3,8 +4,12 @@@ menu "Kernel hacking
+  config TRACE_IRQFLAGS_SUPPORT
+  	def_bool y
+  
+++<<<<<<< HEAD
+ +source "lib/Kconfig.debug"
+++=======
++ config TRACE_IRQFLAGS_NMI_SUPPORT
++ 	def_bool y
+++>>>>>>> ed00495333cc (locking/lockdep: Fix TRACE_IRQFLAGS vs. NMIs)
+  
+  config EARLY_PRINTK_USB
+  	bool
+diff --cc kernel/locking/lockdep.c
+index 908dcc016f45,8b0b28b4546b..000000000000
+--- a/kernel/locking/lockdep.c
++++ b/kernel/locking/lockdep.c
+@@@ -3685,17 -3689,77 +3685,79 @@@ __visible void trace_hardirqs_on_caller
+  	if (DEBUG_LOCKS_WARN_ON(current->hardirq_context))
+  		return;
+  
+ -	current->hardirq_chain_key = current->curr_chain_key;
+ -
+  	current->lockdep_recursion++;
+ -	__trace_hardirqs_on_caller();
+ +	__trace_hardirqs_on_caller(ip);
+  	lockdep_recursion_finish();
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on_prepare);
+ +EXPORT_SYMBOL(trace_hardirqs_on_caller);
+  
+ -void noinstr lockdep_hardirqs_on(unsigned long ip)
+ +void trace_hardirqs_on(void)
+  {
+++<<<<<<< HEAD
+ +	trace_hardirqs_on_caller(CALLER_ADDR0);
+++=======
++ 	struct task_struct *curr = current;
++ 
++ 	if (unlikely(!debug_locks))
++ 		return;
++ 
++ 	/*
++ 	 * NMIs can happen in the middle of local_irq_{en,dis}able() where the
++ 	 * tracking state and hardware state are out of sync.
++ 	 *
++ 	 * NMIs must save lockdep_hardirqs_enabled() to restore IRQ state from,
++ 	 * and not rely on hardware state like normal interrupts.
++ 	 */
++ 	if (unlikely(in_nmi())) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 
++ 		/*
++ 		 * Skip:
++ 		 *  - recursion check, because NMI can hit lockdep;
++ 		 *  - hardware state check, because above;
++ 		 *  - chain_key check, see lockdep_hardirqs_on_prepare().
++ 		 */
++ 		goto skip_checks;
++ 	}
++ 
++ 	if (unlikely(current->lockdep_recursion & LOCKDEP_RECURSION_MASK))
++ 		return;
++ 
++ 	if (curr->hardirqs_enabled) {
++ 		/*
++ 		 * Neither irq nor preemption are disabled here
++ 		 * so this is racy by nature but losing one hit
++ 		 * in a stat is not a big deal.
++ 		 */
++ 		__debug_atomic_inc(redundant_hardirqs_on);
++ 		return;
++ 	}
++ 
++ 	/*
++ 	 * We're enabling irqs and according to our state above irqs weren't
++ 	 * already enabled, yet we find the hardware thinks they are in fact
++ 	 * enabled.. someone messed up their IRQ state tracing.
++ 	 */
++ 	if (DEBUG_LOCKS_WARN_ON(!irqs_disabled()))
++ 		return;
++ 
++ 	/*
++ 	 * Ensure the lock stack remained unchanged between
++ 	 * lockdep_hardirqs_on_prepare() and lockdep_hardirqs_on().
++ 	 */
++ 	DEBUG_LOCKS_WARN_ON(current->hardirq_chain_key !=
++ 			    current->curr_chain_key);
++ 
++ skip_checks:
++ 	/* we'll do an OFF -> ON transition: */
++ 	curr->hardirqs_enabled = 1;
++ 	curr->hardirq_enable_ip = ip;
++ 	curr->hardirq_enable_event = ++curr->irq_events;
++ 	debug_atomic_inc(hardirqs_on_events);
+++>>>>>>> ed00495333cc (locking/lockdep: Fix TRACE_IRQFLAGS vs. NMIs)
+  }
+ -EXPORT_SYMBOL_GPL(lockdep_hardirqs_on);
+ +EXPORT_SYMBOL(trace_hardirqs_on);
+  
+  /*
+   * Hardirqs were disabled:
+@@@ -3704,9 -3768,18 +3766,21 @@@ __visible void trace_hardirqs_off_calle
+  {
+  	struct task_struct *curr = current;
+  
+ -	if (unlikely(!debug_locks))
+ -		return;
+ +	time_hardirqs_off(CALLER_ADDR0, ip);
+  
+++<<<<<<< HEAD
+ +	if (unlikely(!debug_locks || current->lockdep_recursion))
+++=======
++ 	/*
++ 	 * Matching lockdep_hardirqs_on(), allow NMIs in the middle of lockdep;
++ 	 * they will restore the software state. This ensures the software
++ 	 * state is consistent inside NMIs as well.
++ 	 */
++ 	if (in_nmi()) {
++ 		if (!IS_ENABLED(CONFIG_TRACE_IRQFLAGS_NMI))
++ 			return;
++ 	} else if (current->lockdep_recursion & LOCKDEP_RECURSION_MASK)
+++>>>>>>> ed00495333cc (locking/lockdep: Fix TRACE_IRQFLAGS vs. NMIs)
+  		return;
+  
+  	/*
+* Unmerged path arch/x86/Kconfig.debug
+* Unmerged path kernel/locking/lockdep.c
+diff --git a/lib/Kconfig.debug b/lib/Kconfig.debug
+index da5a3060bee2..c39089965c4b 100644
+--- a/lib/Kconfig.debug
++++ b/lib/Kconfig.debug
+@@ -1307,11 +1307,17 @@ config WW_MUTEX_SELFTEST
+ endmenu # lock debugging
+ 
+ config TRACE_IRQFLAGS
++	depends on TRACE_IRQFLAGS_SUPPORT
+ 	bool
+ 	help
+ 	  Enables hooks to interrupt enabling and disabling for
+ 	  either tracing or lock debugging.
+ 
++config TRACE_IRQFLAGS_NMI
++	def_bool y
++	depends on TRACE_IRQFLAGS
++	depends on TRACE_IRQFLAGS_NMI_SUPPORT
++
+ config STACKTRACE
+ 	bool "Stack backtrace support"
+ 	depends on STACKTRACE_SUPPORT
