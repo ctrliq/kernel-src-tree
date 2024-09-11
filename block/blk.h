@@ -16,7 +16,6 @@ extern struct dentry *blk_debugfs_root;
 #endif
 
 struct blk_flush_queue {
-	unsigned int		flush_queue_delayed:1;
 	unsigned int		flush_pending_idx:1;
 	unsigned int		flush_running_idx:1;
 	unsigned long		flush_pending_since;
