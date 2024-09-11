@@ -1,0 +1,284 @@
+libnvdimm/security: provide fix for secure-erase to use zero-key
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 037c8489ade669e0f09ad40d5b91e5e1159a14b1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/037c8489.failed
+
+Add a zero key in order to standardize hardware that want a key of 0's to
+be passed. Some platforms defaults to a zero-key with security enabled
+rather than allow the OS to enable the security. The zero key would allow
+us to manage those platform as well. This also adds a fix to secure erase
+so it can use the zero key to do crypto erase. Some other security commands
+already use zero keys. This introduces a standard zero-key to allow
+unification of semantics cross nvdimm security commands.
+
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 037c8489ade669e0f09ad40d5b91e5e1159a14b1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvdimm/security.c
+#	tools/testing/nvdimm/test/nfit.c
+diff --cc tools/testing/nvdimm/test/nfit.c
+index 6c16ac36d482,cad719876ef4..000000000000
+--- a/tools/testing/nvdimm/test/nfit.c
++++ b/tools/testing/nvdimm/test/nfit.c
+@@@ -936,6 -945,247 +938,250 @@@ static int override_return_code(int dim
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int nd_intel_test_cmd_security_status(struct nfit_test *t,
++ 		struct nd_intel_get_security_state *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	nd_cmd->status = 0;
++ 	nd_cmd->state = sec->state;
++ 	nd_cmd->extended_state = sec->ext_state;
++ 	dev_dbg(dev, "security state (%#x) returned\n", nd_cmd->state);
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_unlock_unit(struct nfit_test *t,
++ 		struct nd_intel_unlock_unit *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->state & ND_INTEL_SEC_STATE_LOCKED) ||
++ 			(sec->state & ND_INTEL_SEC_STATE_FROZEN)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "unlock unit: invalid state: %#x\n",
++ 				sec->state);
++ 	} else if (memcmp(nd_cmd->passphrase, sec->passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "unlock unit: invalid passphrase\n");
++ 	} else {
++ 		nd_cmd->status = 0;
++ 		sec->state = ND_INTEL_SEC_STATE_ENABLED;
++ 		dev_dbg(dev, "Unit unlocked\n");
++ 	}
++ 
++ 	dev_dbg(dev, "unlocking status returned: %#x\n", nd_cmd->status);
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_set_pass(struct nfit_test *t,
++ 		struct nd_intel_set_passphrase *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (sec->state & ND_INTEL_SEC_STATE_FROZEN) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "set passphrase: wrong security state\n");
++ 	} else if (memcmp(nd_cmd->old_pass, sec->passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "set passphrase: wrong passphrase\n");
++ 	} else {
++ 		memcpy(sec->passphrase, nd_cmd->new_pass,
++ 				ND_INTEL_PASSPHRASE_SIZE);
++ 		sec->state |= ND_INTEL_SEC_STATE_ENABLED;
++ 		nd_cmd->status = 0;
++ 		dev_dbg(dev, "passphrase updated\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_freeze_lock(struct nfit_test *t,
++ 		struct nd_intel_freeze_lock *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->state & ND_INTEL_SEC_STATE_ENABLED)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "freeze lock: wrong security state\n");
++ 	} else {
++ 		sec->state |= ND_INTEL_SEC_STATE_FROZEN;
++ 		nd_cmd->status = 0;
++ 		dev_dbg(dev, "security frozen\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_disable_pass(struct nfit_test *t,
++ 		struct nd_intel_disable_passphrase *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->state & ND_INTEL_SEC_STATE_ENABLED) ||
++ 			(sec->state & ND_INTEL_SEC_STATE_FROZEN)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "disable passphrase: wrong security state\n");
++ 	} else if (memcmp(nd_cmd->passphrase, sec->passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "disable passphrase: wrong passphrase\n");
++ 	} else {
++ 		memset(sec->passphrase, 0, ND_INTEL_PASSPHRASE_SIZE);
++ 		sec->state = 0;
++ 		dev_dbg(dev, "disable passphrase: done\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_secure_erase(struct nfit_test *t,
++ 		struct nd_intel_secure_erase *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (sec->state & ND_INTEL_SEC_STATE_FROZEN) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "secure erase: wrong security state\n");
++ 	} else if (memcmp(nd_cmd->passphrase, sec->passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "secure erase: wrong passphrase\n");
++ 	} else {
++ 		if (!(sec->state & ND_INTEL_SEC_STATE_ENABLED)
++ 				&& (memcmp(nd_cmd->passphrase, zero_key,
++ 					ND_INTEL_PASSPHRASE_SIZE) != 0)) {
++ 			dev_dbg(dev, "invalid zero key\n");
++ 			return 0;
++ 		}
++ 		memset(sec->passphrase, 0, ND_INTEL_PASSPHRASE_SIZE);
++ 		memset(sec->master_passphrase, 0, ND_INTEL_PASSPHRASE_SIZE);
++ 		sec->state = 0;
++ 		sec->ext_state = ND_INTEL_SEC_ESTATE_ENABLED;
++ 		dev_dbg(dev, "secure erase: done\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_overwrite(struct nfit_test *t,
++ 		struct nd_intel_overwrite *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if ((sec->state & ND_INTEL_SEC_STATE_ENABLED) &&
++ 			memcmp(nd_cmd->passphrase, sec->passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "overwrite: wrong passphrase\n");
++ 		return 0;
++ 	}
++ 
++ 	memset(sec->passphrase, 0, ND_INTEL_PASSPHRASE_SIZE);
++ 	sec->state = ND_INTEL_SEC_STATE_OVERWRITE;
++ 	dev_dbg(dev, "overwrite progressing.\n");
++ 	sec->overwrite_end_time = get_jiffies_64() + 5 * HZ;
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_query_overwrite(struct nfit_test *t,
++ 		struct nd_intel_query_overwrite *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->state & ND_INTEL_SEC_STATE_OVERWRITE)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_OQUERY_SEQUENCE_ERR;
++ 		return 0;
++ 	}
++ 
++ 	if (time_is_before_jiffies64(sec->overwrite_end_time)) {
++ 		sec->overwrite_end_time = 0;
++ 		sec->state = 0;
++ 		sec->ext_state = ND_INTEL_SEC_ESTATE_ENABLED;
++ 		dev_dbg(dev, "overwrite is complete\n");
++ 	} else
++ 		nd_cmd->status = ND_INTEL_STATUS_OQUERY_INPROGRESS;
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_master_set_pass(struct nfit_test *t,
++ 		struct nd_intel_set_master_passphrase *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->ext_state & ND_INTEL_SEC_ESTATE_ENABLED)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_NOT_SUPPORTED;
++ 		dev_dbg(dev, "master set passphrase: in wrong state\n");
++ 	} else if (sec->ext_state & ND_INTEL_SEC_ESTATE_PLIMIT) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "master set passphrase: in wrong security state\n");
++ 	} else if (memcmp(nd_cmd->old_pass, sec->master_passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "master set passphrase: wrong passphrase\n");
++ 	} else {
++ 		memcpy(sec->master_passphrase, nd_cmd->new_pass,
++ 				ND_INTEL_PASSPHRASE_SIZE);
++ 		sec->ext_state = ND_INTEL_SEC_ESTATE_ENABLED;
++ 		dev_dbg(dev, "master passphrase: updated\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int nd_intel_test_cmd_master_secure_erase(struct nfit_test *t,
++ 		struct nd_intel_master_secure_erase *nd_cmd,
++ 		unsigned int buf_len, int dimm)
++ {
++ 	struct device *dev = &t->pdev.dev;
++ 	struct nfit_test_sec *sec = &dimm_sec_info[dimm];
++ 
++ 	if (!(sec->ext_state & ND_INTEL_SEC_ESTATE_ENABLED)) {
++ 		nd_cmd->status = ND_INTEL_STATUS_NOT_SUPPORTED;
++ 		dev_dbg(dev, "master secure erase: in wrong state\n");
++ 	} else if (sec->ext_state & ND_INTEL_SEC_ESTATE_PLIMIT) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_STATE;
++ 		dev_dbg(dev, "master secure erase: in wrong security state\n");
++ 	} else if (memcmp(nd_cmd->passphrase, sec->master_passphrase,
++ 				ND_INTEL_PASSPHRASE_SIZE) != 0) {
++ 		nd_cmd->status = ND_INTEL_STATUS_INVALID_PASS;
++ 		dev_dbg(dev, "master secure erase: wrong passphrase\n");
++ 	} else {
++ 		/* we do not erase master state passphrase ever */
++ 		sec->ext_state = ND_INTEL_SEC_ESTATE_ENABLED;
++ 		memset(sec->passphrase, 0, ND_INTEL_PASSPHRASE_SIZE);
++ 		sec->state = 0;
++ 		dev_dbg(dev, "master secure erase: done\n");
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ 
+++>>>>>>> 037c8489ade6 (libnvdimm/security: provide fix for secure-erase to use zero-key)
+  static int get_dimm(struct nfit_mem *nfit_mem, unsigned int func)
+  {
+  	int i;
+* Unmerged path drivers/nvdimm/security.c
+* Unmerged path drivers/nvdimm/security.c
+* Unmerged path tools/testing/nvdimm/test/nfit.c
