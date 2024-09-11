@@ -1,0 +1,516 @@
+bpf: Support attaching freplace programs to multiple attach points
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit 4a1e7c0c63e02daad751842b7880f9bbcdfb6e89
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/4a1e7c0c.failed
+
+This enables support for attaching freplace programs to multiple attach
+points. It does this by amending the UAPI for bpf_link_Create with a target
+btf ID that can be used to supply the new attachment point along with the
+target program fd. The target must be compatible with the target that was
+supplied at program load time.
+
+The implementation reuses the checks that were factored out of
+check_attach_btf_id() to ensure compatibility between the BTF types of the
+old and new attachment. If these match, a new bpf_tracing_link will be
+created for the new attach target, allowing multiple attachments to
+co-exist simultaneously.
+
+The code could theoretically support multiple-attach of other types of
+tracing programs as well, but since I don't have a use case for any of
+those, there is no API support for doing so.
+
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Andrii Nakryiko <andriin@fb.com>
+Link: https://lore.kernel.org/bpf/160138355169.48470.17165680973640685368.stgit@toke.dk
+(cherry picked from commit 4a1e7c0c63e02daad751842b7880f9bbcdfb6e89)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	include/uapi/linux/bpf.h
+#	kernel/bpf/syscall.c
+#	kernel/bpf/verifier.c
+#	tools/include/uapi/linux/bpf.h
+diff --cc include/linux/bpf.h
+index 53810b02f758,50e5c4b52bd1..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -666,29 -759,37 +666,44 @@@ struct bpf_prog_aux 
+  	u32 stack_depth;
+  	u32 id;
+  	u32 func_cnt; /* used by non-func prog as the number of func progs */
+++<<<<<<< HEAD
+ +	RH_KABI_BROKEN_INSERT(u32 func_idx) /* 0 for non-func prog, the index in func array for func prog */
+ +	RH_KABI_BROKEN_INSERT(u32 attach_btf_id) /* in-kernel BTF type id to attach to */
+ +	RH_KABI_BROKEN_INSERT(struct bpf_prog *linked_prog)
+ +	RH_KABI_BROKEN_INSERT(bool verifier_zext) /* Zero extensions has been inserted by verifier. */
+++=======
++ 	u32 func_idx; /* 0 for non-func prog, the index in func array for func prog */
++ 	u32 attach_btf_id; /* in-kernel BTF type id to attach to */
++ 	u32 ctx_arg_info_size;
++ 	u32 max_rdonly_access;
++ 	u32 max_rdwr_access;
++ 	const struct bpf_ctx_arg_aux *ctx_arg_info;
++ 	struct mutex dst_mutex; /* protects dst_* pointers below, *after* prog becomes visible */
++ 	struct bpf_prog *dst_prog;
++ 	struct bpf_trampoline *dst_trampoline;
++ 	enum bpf_prog_type saved_dst_prog_type;
++ 	enum bpf_attach_type saved_dst_attach_type;
++ 	bool verifier_zext; /* Zero extensions has been inserted by verifier. */
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  	bool offload_requested;
+ -	bool attach_btf_trace; /* true if attaching to BTF-enabled raw tp */
+ -	bool func_proto_unreliable;
+ -	bool sleepable;
+ -	bool tail_call_reachable;
+ -	enum bpf_tramp_prog_type trampoline_prog_type;
+ -	struct hlist_node tramp_hlist;
+ +	RH_KABI_BROKEN_INSERT(bool attach_btf_trace) /* true if attaching to BTF-enabled raw tp */
+ +	RH_KABI_BROKEN_INSERT(bool func_proto_unreliable)
+ +	RH_KABI_BROKEN_INSERT(enum bpf_tramp_prog_type trampoline_prog_type)
+ +	RH_KABI_BROKEN_INSERT(struct bpf_trampoline *trampoline)
+ +	RH_KABI_BROKEN_INSERT(struct hlist_node tramp_hlist)
+  	/* BTF_KIND_FUNC_PROTO for valid attach_btf_id */
+ -	const struct btf_type *attach_func_proto;
+ +	RH_KABI_BROKEN_INSERT(const struct btf_type *attach_func_proto)
+  	/* function name for valid attach_btf_id */
+ -	const char *attach_func_name;
+ +	RH_KABI_BROKEN_INSERT(const char *attach_func_name)
+  	struct bpf_prog **func;
+  	void *jit_data; /* JIT specific data. arch dependent */
+ -	struct bpf_jit_poke_descriptor *poke_tab;
+ -	u32 size_poke_tab;
+ -	struct bpf_ksym ksym;
+ +	RH_KABI_BROKEN_INSERT(struct bpf_jit_poke_descriptor *poke_tab)
+ +	RH_KABI_BROKEN_INSERT(u32 size_poke_tab)
+ +	RH_KABI_BROKEN_REMOVE(struct latch_tree_node ksym_tnode)
+ +	RH_KABI_BROKEN_REMOVE(struct list_head ksym_lnode)
+ +	RH_KABI_BROKEN_INSERT(struct bpf_ksym ksym)
+  	const struct bpf_prog_ops *ops;
+  	struct bpf_map **used_maps;
+ -	struct mutex used_maps_mutex; /* mutex for used_maps and used_map_cnt */
+  	struct bpf_prog *prog;
+  	struct user_struct *user;
+  	u64 load_time; /* ns since boottime */
+diff --cc include/uapi/linux/bpf.h
+index 55fe65639ff2,2b1d3f16cbd1..000000000000
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@@ -603,9 -633,19 +603,19 @@@ union bpf_attr 
+  
+  	struct { /* struct used by BPF_LINK_CREATE command */
+  		__u32		prog_fd;	/* eBPF program to attach */
+ -		union {
+ -			__u32		target_fd;	/* object to attach to */
+ -			__u32		target_ifindex; /* target ifindex */
+ -		};
+ +		__u32		target_fd;	/* object to attach to */
+  		__u32		attach_type;	/* attach type */
+  		__u32		flags;		/* extra flags */
+++<<<<<<< HEAD
+++=======
++ 		union {
++ 			__u32		target_btf_id;	/* btf_id of target to attach to */
++ 			struct {
++ 				__aligned_u64	iter_info;	/* extra bpf_iter_link_info */
++ 				__u32		iter_info_len;	/* iter_info length */
++ 			};
++ 		};
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  	} link_create;
+  
+  	struct { /* struct used by BPF_LINK_UPDATE command */
+diff --cc kernel/bpf/syscall.c
+index 124e66325086,f1528c2a6927..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -2483,10 -2555,15 +2484,19 @@@ static const struct bpf_link_ops bpf_tr
+  	.fill_link_info = bpf_tracing_link_fill_link_info,
+  };
+  
+- static int bpf_tracing_prog_attach(struct bpf_prog *prog)
++ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
++ 				   int tgt_prog_fd,
++ 				   u32 btf_id)
+  {
+  	struct bpf_link_primer link_primer;
+++<<<<<<< HEAD
+ +	struct bpf_tracing_link *link;
+++=======
++ 	struct bpf_prog *tgt_prog = NULL;
++ 	struct bpf_trampoline *tr = NULL;
++ 	struct bpf_tracing_link *link;
++ 	u64 key = 0;
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  	int err;
+  
+  	switch (prog->type) {
+@@@ -2524,20 -2623,100 +2556,108 @@@
+  		      &bpf_tracing_link_lops, prog);
+  	link->attach_type = prog->expected_attach_type;
+  
+++<<<<<<< HEAD
+++=======
++ 	mutex_lock(&prog->aux->dst_mutex);
++ 
++ 	/* There are a few possible cases here:
++ 	 *
++ 	 * - if prog->aux->dst_trampoline is set, the program was just loaded
++ 	 *   and not yet attached to anything, so we can use the values stored
++ 	 *   in prog->aux
++ 	 *
++ 	 * - if prog->aux->dst_trampoline is NULL, the program has already been
++          *   attached to a target and its initial target was cleared (below)
++ 	 *
++ 	 * - if tgt_prog != NULL, the caller specified tgt_prog_fd +
++ 	 *   target_btf_id using the link_create API.
++ 	 *
++ 	 * - if tgt_prog == NULL when this function was called using the old
++          *   raw_tracepoint_open API, and we need a target from prog->aux
++          *
++          * The combination of no saved target in prog->aux, and no target
++          * specified on load is illegal, and we reject that here.
++ 	 */
++ 	if (!prog->aux->dst_trampoline && !tgt_prog) {
++ 		err = -ENOENT;
++ 		goto out_unlock;
++ 	}
++ 
++ 	if (!prog->aux->dst_trampoline ||
++ 	    (key && key != prog->aux->dst_trampoline->key)) {
++ 		/* If there is no saved target, or the specified target is
++ 		 * different from the destination specified at load time, we
++ 		 * need a new trampoline and a check for compatibility
++ 		 */
++ 		struct bpf_attach_target_info tgt_info = {};
++ 
++ 		err = bpf_check_attach_target(NULL, prog, tgt_prog, btf_id,
++ 					      &tgt_info);
++ 		if (err)
++ 			goto out_unlock;
++ 
++ 		tr = bpf_trampoline_get(key, &tgt_info);
++ 		if (!tr) {
++ 			err = -ENOMEM;
++ 			goto out_unlock;
++ 		}
++ 	} else {
++ 		/* The caller didn't specify a target, or the target was the
++ 		 * same as the destination supplied during program load. This
++ 		 * means we can reuse the trampoline and reference from program
++ 		 * load time, and there is no need to allocate a new one. This
++ 		 * can only happen once for any program, as the saved values in
++ 		 * prog->aux are cleared below.
++ 		 */
++ 		tr = prog->aux->dst_trampoline;
++ 		tgt_prog = prog->aux->dst_prog;
++ 	}
++ 
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  	err = bpf_link_prime(&link->link, &link_primer);
+ -	if (err)
+ -		goto out_unlock;
+ +	if (err) {
+ +		kfree(link);
+ +		goto out_put_prog;
+ +	}
+  
+ -	err = bpf_trampoline_link_prog(prog, tr);
+ +	err = bpf_trampoline_link_prog(prog);
+  	if (err) {
+  		bpf_link_cleanup(&link_primer);
+ -		link = NULL;
+ -		goto out_unlock;
+ +		goto out_put_prog;
+  	}
+  
+++<<<<<<< HEAD
+ +	return bpf_link_settle(&link_primer);
+++=======
++ 	link->tgt_prog = tgt_prog;
++ 	link->trampoline = tr;
++ 
++ 	/* Always clear the trampoline and target prog from prog->aux to make
++ 	 * sure the original attach destination is not kept alive after a
++ 	 * program is (re-)attached to another target.
++ 	 */
++ 	if (prog->aux->dst_prog &&
++ 	    (tgt_prog_fd || tr != prog->aux->dst_trampoline))
++ 		/* got extra prog ref from syscall, or attaching to different prog */
++ 		bpf_prog_put(prog->aux->dst_prog);
++ 	if (prog->aux->dst_trampoline && tr != prog->aux->dst_trampoline)
++ 		/* we allocated a new trampoline, so free the old one */
++ 		bpf_trampoline_put(prog->aux->dst_trampoline);
++ 
++ 	prog->aux->dst_prog = NULL;
++ 	prog->aux->dst_trampoline = NULL;
++ 	mutex_unlock(&prog->aux->dst_mutex);
++ 
++ 	return bpf_link_settle(&link_primer);
++ out_unlock:
++ 	if (tr && tr != prog->aux->dst_trampoline)
++ 		bpf_trampoline_put(tr);
++ 	mutex_unlock(&prog->aux->dst_mutex);
++ 	kfree(link);
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  out_put_prog:
++ 	if (tgt_prog_fd && tgt_prog)
++ 		bpf_prog_put(tgt_prog);
+  	bpf_prog_put(prog);
+  	return err;
+  }
+@@@ -3814,7 -4012,21 +3934,25 @@@ err_put
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+ +#define BPF_LINK_CREATE_LAST_FIELD link_create.flags
+++=======
++ static int tracing_bpf_link_attach(const union bpf_attr *attr, struct bpf_prog *prog)
++ {
++ 	if (attr->link_create.attach_type != prog->expected_attach_type)
++ 		return -EINVAL;
++ 
++ 	if (prog->expected_attach_type == BPF_TRACE_ITER)
++ 		return bpf_iter_link_attach(attr, prog);
++ 	else if (prog->type == BPF_PROG_TYPE_EXT)
++ 		return bpf_tracing_prog_attach(prog,
++ 					       attr->link_create.target_fd,
++ 					       attr->link_create.target_btf_id);
++ 	return -EINVAL;
++ }
++ 
++ #define BPF_LINK_CREATE_LAST_FIELD link_create.iter_info_len
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  static int link_create(union bpf_attr *attr)
+  {
+  	enum bpf_prog_type ptype;
+diff --cc kernel/bpf/verifier.c
+index 9fd915b15d99,015a1c074b6b..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -10759,24 -11403,19 +10759,34 @@@ static int check_attach_btf_id(struct b
+  		t = btf_type_by_id(btf, t->type);
+  		if (!btf_type_is_func_proto(t))
+  			return -EINVAL;
+++<<<<<<< HEAD
+ +		tr = bpf_trampoline_lookup(key);
+ +		if (!tr)
+ +			return -ENOMEM;
+ +		/* t is either vmlinux type or another program's type */
+ +		prog->aux->attach_func_proto = t;
+ +		mutex_lock(&tr->mutex);
+ +		if (tr->func.addr) {
+ +			prog->aux->trampoline = tr;
+ +			goto out;
+ +		}
+ +		if (tgt_prog && conservative) {
+ +			prog->aux->attach_func_proto = NULL;
+++=======
++ 
++ 		if ((prog->aux->saved_dst_prog_type || prog->aux->saved_dst_attach_type) &&
++ 		    (!tgt_prog || prog->aux->saved_dst_prog_type != tgt_prog->type ||
++ 		     prog->aux->saved_dst_attach_type != tgt_prog->expected_attach_type))
++ 			return -EINVAL;
++ 
++ 		if (tgt_prog && conservative)
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  			t = NULL;
+ -
+ -		ret = btf_distill_func_proto(log, btf, t, tname, &tgt_info->fmodel);
+ +		}
+ +		ret = btf_distill_func_proto(&env->log, btf, t,
+ +					     tname, &tr->func.model);
+  		if (ret < 0)
+ -			return ret;
+ -
+ +			goto out;
+  		if (tgt_prog) {
+  			if (subprog == 0)
+  				addr = (long) tgt_prog->bpf_func;
+@@@ -10793,23 -11431,130 +10803,69 @@@
+  			}
+  		}
+  
+ -		if (prog->aux->sleepable) {
+ -			ret = -EINVAL;
+ -			switch (prog->type) {
+ -			case BPF_PROG_TYPE_TRACING:
+ -				/* fentry/fexit/fmod_ret progs can be sleepable only if they are
+ -				 * attached to ALLOW_ERROR_INJECTION and are not in denylist.
+ -				 */
+ -				if (!check_non_sleepable_error_inject(btf_id) &&
+ -				    within_error_injection_list(addr))
+ -					ret = 0;
+ -				break;
+ -			case BPF_PROG_TYPE_LSM:
+ -				/* LSM progs check that they are attached to bpf_lsm_*() funcs.
+ -				 * Only some of them are sleepable.
+ -				 */
+ -				if (check_sleepable_lsm_hook(btf_id))
+ -					ret = 0;
+ -				break;
+ -			default:
+ -				break;
+ -			}
+ -			if (ret) {
+ -				bpf_log(log, "%s is not sleepable\n", tname);
+ -				return ret;
+ -			}
+ -		} else if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+ -			if (tgt_prog) {
+ -				bpf_log(log, "can't modify return codes of BPF programs\n");
+ -				return -EINVAL;
+ -			}
+ -			ret = check_attach_modify_return(addr, tname);
+ -			if (ret) {
+ -				bpf_log(log, "%s() is not modifiable\n", tname);
+ -				return ret;
+ -			}
+ +		if (prog->expected_attach_type == BPF_MODIFY_RETURN) {
+ +			ret = check_attach_modify_return(prog, addr);
+ +			if (ret)
+ +				verbose(env, "%s() is not modifiable\n",
+ +					prog->aux->attach_func_name);
+  		}
+  
+ -		break;
+ -	}
+ -	tgt_info->tgt_addr = addr;
+ -	tgt_info->tgt_name = tname;
+ -	tgt_info->tgt_type = t;
+ -	return 0;
+ -}
+ -
+ -static int check_attach_btf_id(struct bpf_verifier_env *env)
+ -{
+ -	struct bpf_prog *prog = env->prog;
+ -	struct bpf_prog *tgt_prog = prog->aux->dst_prog;
+ -	struct bpf_attach_target_info tgt_info = {};
+ -	u32 btf_id = prog->aux->attach_btf_id;
+ -	struct bpf_trampoline *tr;
+ -	int ret;
+ -	u64 key;
+ -
+ -	if (prog->aux->sleepable && prog->type != BPF_PROG_TYPE_TRACING &&
+ -	    prog->type != BPF_PROG_TYPE_LSM) {
+ -		verbose(env, "Only fentry/fexit/fmod_ret and lsm programs can be sleepable\n");
+ -		return -EINVAL;
+ -	}
+ -
+ -	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
+ -		return check_struct_ops_btf_id(env);
+ -
+ -	if (prog->type != BPF_PROG_TYPE_TRACING &&
+ -	    prog->type != BPF_PROG_TYPE_LSM &&
+ -	    prog->type != BPF_PROG_TYPE_EXT)
+ -		return 0;
+ -
+ -	ret = bpf_check_attach_target(&env->log, prog, tgt_prog, btf_id, &tgt_info);
+ -	if (ret)
+ +		if (ret)
+ +			goto out;
+ +		tr->func.addr = (void *)addr;
+ +		prog->aux->trampoline = tr;
+ +out:
+ +		mutex_unlock(&tr->mutex);
+ +		if (ret)
+ +			bpf_trampoline_put(tr);
+  		return ret;
+ -
+ -	if (tgt_prog && prog->type == BPF_PROG_TYPE_EXT) {
+ -		/* to make freplace equivalent to their targets, they need to
+ -		 * inherit env->ops and expected_attach_type for the rest of the
+ -		 * verification
+ -		 */
+ -		env->ops = bpf_verifier_ops[tgt_prog->type];
+ -		prog->expected_attach_type = tgt_prog->expected_attach_type;
+  	}
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* store info about the attachment target that will be used later */
++ 	prog->aux->attach_func_proto = tgt_info.tgt_type;
++ 	prog->aux->attach_func_name = tgt_info.tgt_name;
++ 
++ 	if (tgt_prog) {
++ 		prog->aux->saved_dst_prog_type = tgt_prog->type;
++ 		prog->aux->saved_dst_attach_type = tgt_prog->expected_attach_type;
++ 	}
++ 
++ 	if (prog->expected_attach_type == BPF_TRACE_RAW_TP) {
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	} else if (prog->expected_attach_type == BPF_TRACE_ITER) {
++ 		if (!bpf_iter_prog_supported(prog))
++ 			return -EINVAL;
++ 		return 0;
++ 	}
++ 
++ 	if (prog->type == BPF_PROG_TYPE_LSM) {
++ 		ret = bpf_lsm_verify_prog(&env->log, prog);
++ 		if (ret < 0)
++ 			return ret;
++ 	}
++ 
++ 	key = bpf_trampoline_compute_key(tgt_prog, btf_id);
++ 	tr = bpf_trampoline_get(key, &tgt_info);
++ 	if (!tr)
++ 		return -ENOMEM;
++ 
++ 	prog->aux->dst_trampoline = tr;
++ 	return 0;
++ }
++ 
++ struct btf *bpf_get_btf_vmlinux(void)
++ {
++ 	if (!btf_vmlinux && IS_ENABLED(CONFIG_DEBUG_INFO_BTF)) {
++ 		mutex_lock(&bpf_verifier_lock);
++ 		if (!btf_vmlinux)
++ 			btf_vmlinux = btf_parse_vmlinux();
++ 		mutex_unlock(&bpf_verifier_lock);
++ 	}
++ 	return btf_vmlinux;
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  }
+  
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+diff --cc tools/include/uapi/linux/bpf.h
+index ea046e295337,2b1d3f16cbd1..000000000000
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@@ -586,9 -633,19 +586,19 @@@ union bpf_attr 
+  
+  	struct { /* struct used by BPF_LINK_CREATE command */
+  		__u32		prog_fd;	/* eBPF program to attach */
+ -		union {
+ -			__u32		target_fd;	/* object to attach to */
+ -			__u32		target_ifindex; /* target ifindex */
+ -		};
+ +		__u32		target_fd;	/* object to attach to */
+  		__u32		attach_type;	/* attach type */
+  		__u32		flags;		/* extra flags */
+++<<<<<<< HEAD
+++=======
++ 		union {
++ 			__u32		target_btf_id;	/* btf_id of target to attach to */
++ 			struct {
++ 				__aligned_u64	iter_info;	/* extra bpf_iter_link_info */
++ 				__u32		iter_info_len;	/* iter_info length */
++ 			};
++ 		};
+++>>>>>>> 4a1e7c0c63e0 (bpf: Support attaching freplace programs to multiple attach points)
+  	} link_create;
+  
+  	struct { /* struct used by BPF_LINK_UPDATE command */
+* Unmerged path include/linux/bpf.h
+* Unmerged path include/uapi/linux/bpf.h
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/verifier.c
+* Unmerged path tools/include/uapi/linux/bpf.h
