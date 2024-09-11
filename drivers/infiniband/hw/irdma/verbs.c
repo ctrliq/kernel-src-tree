@@ -836,7 +836,6 @@ static struct ib_qp *irdma_create_qp(struct ib_pd *ibpd,
 
 	qp = &iwqp->sc_qp;
 	qp->qp_uk.back_qp = iwqp;
-	qp->qp_uk.lock = &iwqp->lock;
 	qp->push_idx = IRDMA_INVALID_PUSH_PAGE_INDEX;
 
 	iwqp->iwdev = iwdev;
