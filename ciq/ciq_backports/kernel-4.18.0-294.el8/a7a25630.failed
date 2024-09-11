@@ -1,0 +1,144 @@
+tcp: mitigate scheduling jitter in EDT pacing model
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Eric Dumazet <edumazet@google.com>
+commit a7a2563064e963bc5e3f39f533974f2730c0ff56
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/a7a25630.failed
+
+In commit fefa569a9d4b ("net_sched: sch_fq: account for schedule/timers
+drifts") we added a mitigation for scheduling jitter in fq packet scheduler.
+
+This patch does the same in TCP stack, now it is using EDT model.
+
+Note that this mitigation is valid for both external (fq packet scheduler)
+or internal TCP pacing.
+
+This uses the same strategy than the above commit, allowing
+a time credit of half the packet currently sent.
+
+Consider following case :
+
+An skb is sent, after an idle period of 300 usec.
+The air-time (skb->len/pacing_rate) is 500 usec
+Instead of setting the pacing timer to now+500 usec,
+it will use now+min(500/2, 300) -> now+250usec
+
+This is like having a token bucket with a depth of half
+an skb.
+
+Tested:
+
+tc qdisc replace dev eth0 root pfifo_fast
+
+Before
+netperf -P0 -H remote -- -q 1000000000 # 8000Mbit
+540000 262144 262144    10.00    7710.43
+
+After :
+netperf -P0 -H remote -- -q 1000000000 # 8000 Mbit
+540000 262144 262144    10.00    7999.75   # Much closer to 8000Mbit target
+
+	Signed-off-by: Eric Dumazet <edumazet@google.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit a7a2563064e963bc5e3f39f533974f2730c0ff56)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/ipv4/tcp_output.c
+diff --cc net/ipv4/tcp_output.c
+index 42d3de51dbfe,5474c9854f25..000000000000
+--- a/net/ipv4/tcp_output.c
++++ b/net/ipv4/tcp_output.c
+@@@ -1078,9 -985,30 +1078,35 @@@ static void tcp_internal_pacing(struct 
+  	sock_hold(sk);
+  }
+  
+++<<<<<<< HEAD
+ +static void tcp_update_skb_after_send(struct tcp_sock *tp, struct sk_buff *skb)
+++=======
++ static void tcp_update_skb_after_send(struct sock *sk, struct sk_buff *skb,
++ 				      u64 prior_wstamp)
+++>>>>>>> a7a2563064e9 (tcp: mitigate scheduling jitter in EDT pacing model)
+  {
+ -	struct tcp_sock *tp = tcp_sk(sk);
+ -
+  	skb->skb_mstamp_ns = tp->tcp_wstamp_ns;
+++<<<<<<< HEAD
+++=======
++ 	if (sk->sk_pacing_status != SK_PACING_NONE) {
++ 		unsigned long rate = sk->sk_pacing_rate;
++ 
++ 		/* Original sch_fq does not pace first 10 MSS
++ 		 * Note that tp->data_segs_out overflows after 2^32 packets,
++ 		 * this is a minor annoyance.
++ 		 */
++ 		if (rate != ~0UL && rate && tp->data_segs_out >= 10) {
++ 			u64 len_ns = div64_ul((u64)skb->len * NSEC_PER_SEC, rate);
++ 			u64 credit = tp->tcp_wstamp_ns - prior_wstamp;
++ 
++ 			/* take into account OS jitter */
++ 			len_ns -= min_t(u64, len_ns / 2, credit);
++ 			tp->tcp_wstamp_ns += len_ns;
++ 
++ 			tcp_internal_pacing(sk);
++ 		}
++ 	}
+++>>>>>>> a7a2563064e9 (tcp: mitigate scheduling jitter in EDT pacing model)
+  	list_move_tail(&skb->tcp_tsorted_anchor, &tp->tsorted_sent_queue);
+  }
+  
+@@@ -1126,13 -1055,9 +1153,13 @@@ static int __tcp_transmit_skb(struct so
+  
+  		if (unlikely(!skb))
+  			return -ENOBUFS;
+ +		/* retransmit skbs might have a non zero value in skb->dev
+ +		 * because skb->dev is aliased with skb->rbnode.rb_left
+ +		 */
+ +		skb->dev = NULL;
+  	}
+  
+- 	/* TODO: might take care of jitter here */
++ 	prior_wstamp = tp->tcp_wstamp_ns;
+  	tp->tcp_wstamp_ns = max(tp->tcp_wstamp_ns, tp->tcp_clock_cache);
+  
+  	skb->skb_mstamp_ns = tp->tcp_wstamp_ns;
+@@@ -1252,7 -1176,7 +1279,11 @@@
+  		err = net_xmit_eval(err);
+  	}
+  	if (!err && oskb) {
+++<<<<<<< HEAD
+ +		tcp_update_skb_after_send(tp, oskb);
+++=======
++ 		tcp_update_skb_after_send(sk, oskb, prior_wstamp);
+++>>>>>>> a7a2563064e9 (tcp: mitigate scheduling jitter in EDT pacing model)
+  		tcp_rate_skb_sent(sk, oskb);
+  	}
+  	return err;
+@@@ -2437,7 -2328,7 +2468,11 @@@ static bool tcp_write_xmit(struct sock 
+  
+  		if (unlikely(tp->repair) && tp->repair_queue == TCP_SEND_QUEUE) {
+  			/* "skb_mstamp" is used as a start point for the retransmit timer */
+++<<<<<<< HEAD
+ +			tcp_update_skb_after_send(tp, skb);
+++=======
++ 			tcp_update_skb_after_send(sk, skb, tp->tcp_wstamp_ns);
+++>>>>>>> a7a2563064e9 (tcp: mitigate scheduling jitter in EDT pacing model)
+  			goto repair; /* Skip network transmission */
+  		}
+  
+@@@ -3032,7 -2903,7 +3067,11 @@@ int __tcp_retransmit_skb(struct sock *s
+  		} tcp_skb_tsorted_restore(skb);
+  
+  		if (!err) {
+++<<<<<<< HEAD
+ +			tcp_update_skb_after_send(tp, skb);
+++=======
++ 			tcp_update_skb_after_send(sk, skb, tp->tcp_wstamp_ns);
+++>>>>>>> a7a2563064e9 (tcp: mitigate scheduling jitter in EDT pacing model)
+  			tcp_rate_skb_sent(sk, skb);
+  		}
+  	} else {
+* Unmerged path net/ipv4/tcp_output.c
