@@ -1,0 +1,219 @@
+bpftool: Generate externs datasec in BPF skeleton
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Andrii Nakryiko <andriin@fb.com>
+commit 2ad97d473db57ab866f0756806bb94515f7f2551
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2ad97d47.failed
+
+Add support for generation of mmap()-ed read-only view of libbpf-provided
+extern variables. As externs are not supposed to be provided by user code
+(that's what .data, .bss, and .rodata is for), don't mmap() it initially. Only
+after skeleton load is performed, map .extern contents as read-only memory.
+
+	Signed-off-by: Andrii Nakryiko <andriin@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/20191214014710.3449601-4-andriin@fb.com
+(cherry picked from commit 2ad97d473db57ab866f0756806bb94515f7f2551)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/lib/bpf/libbpf.c
+diff --cc tools/lib/bpf/libbpf.c
+index 0511939b7897,c9f90bfd2f0d..000000000000
+--- a/tools/lib/bpf/libbpf.c
++++ b/tools/lib/bpf/libbpf.c
+@@@ -6567,3 -7430,165 +6567,168 @@@ int libbpf_num_possible_cpus(void
+  	WRITE_ONCE(cpus, tmp_cpus);
+  	return tmp_cpus;
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ int bpf_object__open_skeleton(struct bpf_object_skeleton *s,
++ 			      const struct bpf_object_open_opts *opts)
++ {
++ 	DECLARE_LIBBPF_OPTS(bpf_object_open_opts, skel_opts,
++ 		.object_name = s->name,
++ 	);
++ 	struct bpf_object *obj;
++ 	int i;
++ 
++ 	/* Attempt to preserve opts->object_name, unless overriden by user
++ 	 * explicitly. Overwriting object name for skeletons is discouraged,
++ 	 * as it breaks global data maps, because they contain object name
++ 	 * prefix as their own map name prefix. When skeleton is generated,
++ 	 * bpftool is making an assumption that this name will stay the same.
++ 	 */
++ 	if (opts) {
++ 		memcpy(&skel_opts, opts, sizeof(*opts));
++ 		if (!opts->object_name)
++ 			skel_opts.object_name = s->name;
++ 	}
++ 
++ 	obj = bpf_object__open_mem(s->data, s->data_sz, &skel_opts);
++ 	if (IS_ERR(obj)) {
++ 		pr_warn("failed to initialize skeleton BPF object '%s': %ld\n",
++ 			s->name, PTR_ERR(obj));
++ 		return PTR_ERR(obj);
++ 	}
++ 
++ 	*s->obj = obj;
++ 
++ 	for (i = 0; i < s->map_cnt; i++) {
++ 		struct bpf_map **map = s->maps[i].map;
++ 		const char *name = s->maps[i].name;
++ 		void **mmaped = s->maps[i].mmaped;
++ 
++ 		*map = bpf_object__find_map_by_name(obj, name);
++ 		if (!*map) {
++ 			pr_warn("failed to find skeleton map '%s'\n", name);
++ 			return -ESRCH;
++ 		}
++ 
++ 		/* externs shouldn't be pre-setup from user code */
++ 		if (mmaped && (*map)->libbpf_type != LIBBPF_MAP_EXTERN)
++ 			*mmaped = (*map)->mmaped;
++ 	}
++ 
++ 	for (i = 0; i < s->prog_cnt; i++) {
++ 		struct bpf_program **prog = s->progs[i].prog;
++ 		const char *name = s->progs[i].name;
++ 
++ 		*prog = bpf_object__find_program_by_name(obj, name);
++ 		if (!*prog) {
++ 			pr_warn("failed to find skeleton program '%s'\n", name);
++ 			return -ESRCH;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int bpf_object__load_skeleton(struct bpf_object_skeleton *s)
++ {
++ 	int i, err;
++ 
++ 	err = bpf_object__load(*s->obj);
++ 	if (err) {
++ 		pr_warn("failed to load BPF skeleton '%s': %d\n", s->name, err);
++ 		return err;
++ 	}
++ 
++ 	for (i = 0; i < s->map_cnt; i++) {
++ 		struct bpf_map *map = *s->maps[i].map;
++ 		size_t mmap_sz = bpf_map_mmap_sz(map);
++ 		int prot, map_fd = bpf_map__fd(map);
++ 		void **mmaped = s->maps[i].mmaped;
++ 
++ 		if (!mmaped)
++ 			continue;
++ 
++ 		if (!(map->def.map_flags & BPF_F_MMAPABLE)) {
++ 			*mmaped = NULL;
++ 			continue;
++ 		}
++ 
++ 		if (map->def.map_flags & BPF_F_RDONLY_PROG)
++ 			prot = PROT_READ;
++ 		else
++ 			prot = PROT_READ | PROT_WRITE;
++ 
++ 		/* Remap anonymous mmap()-ed "map initialization image" as
++ 		 * a BPF map-backed mmap()-ed memory, but preserving the same
++ 		 * memory address. This will cause kernel to change process'
++ 		 * page table to point to a different piece of kernel memory,
++ 		 * but from userspace point of view memory address (and its
++ 		 * contents, being identical at this point) will stay the
++ 		 * same. This mapping will be released by bpf_object__close()
++ 		 * as per normal clean up procedure, so we don't need to worry
++ 		 * about it from skeleton's clean up perspective.
++ 		 */
++ 		*mmaped = mmap(map->mmaped, mmap_sz, prot,
++ 				MAP_SHARED | MAP_FIXED, map_fd, 0);
++ 		if (*mmaped == MAP_FAILED) {
++ 			err = -errno;
++ 			*mmaped = NULL;
++ 			pr_warn("failed to re-mmap() map '%s': %d\n",
++ 				 bpf_map__name(map), err);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ int bpf_object__attach_skeleton(struct bpf_object_skeleton *s)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < s->prog_cnt; i++) {
++ 		struct bpf_program *prog = *s->progs[i].prog;
++ 		struct bpf_link **link = s->progs[i].link;
++ 		const struct bpf_sec_def *sec_def;
++ 		const char *sec_name = bpf_program__title(prog, false);
++ 
++ 		sec_def = find_sec_def(sec_name);
++ 		if (!sec_def || !sec_def->attach_fn)
++ 			continue;
++ 
++ 		*link = sec_def->attach_fn(sec_def, prog);
++ 		if (IS_ERR(*link)) {
++ 			pr_warn("failed to auto-attach program '%s': %ld\n",
++ 				bpf_program__name(prog), PTR_ERR(*link));
++ 			return PTR_ERR(*link);
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ void bpf_object__detach_skeleton(struct bpf_object_skeleton *s)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < s->prog_cnt; i++) {
++ 		struct bpf_link **link = s->progs[i].link;
++ 
++ 		if (!IS_ERR_OR_NULL(*link))
++ 			bpf_link__destroy(*link);
++ 		*link = NULL;
++ 	}
++ }
++ 
++ void bpf_object__destroy_skeleton(struct bpf_object_skeleton *s)
++ {
++ 	if (s->progs)
++ 		bpf_object__detach_skeleton(s);
++ 	if (s->obj)
++ 		bpf_object__close(*s->obj);
++ 	free(s->maps);
++ 	free(s->progs);
++ 	free(s);
++ }
+++>>>>>>> 2ad97d473db5 (bpftool: Generate externs datasec in BPF skeleton)
+diff --git a/tools/bpf/bpftool/gen.c b/tools/bpf/bpftool/gen.c
+index 7379dae35dca..a07c80429c7a 100644
+--- a/tools/bpf/bpftool/gen.c
++++ b/tools/bpf/bpftool/gen.c
+@@ -82,6 +82,8 @@ static const char *get_map_ident(const struct bpf_map *map)
+ 		return "rodata";
+ 	else if (str_has_suffix(name, ".bss"))
+ 		return "bss";
++	else if (str_has_suffix(name, ".extern"))
++		return "externs"; /* extern is a C keyword */
+ 	else
+ 		return NULL;
+ }
+@@ -109,6 +111,8 @@ static int codegen_datasec_def(struct bpf_object *obj,
+ 		sec_ident = "bss";
+ 	else if (strcmp(sec_name, ".rodata") == 0)
+ 		sec_ident = "rodata";
++	else if (strcmp(sec_name, ".extern") == 0)
++		sec_ident = "externs"; /* extern is a C keyword */
+ 	else
+ 		return 0;
+ 
+* Unmerged path tools/lib/bpf/libbpf.c
