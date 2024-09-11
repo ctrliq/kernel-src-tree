@@ -1,0 +1,206 @@
+x86/sev-es: Setup an early #VC handler
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] sev-es: Setup an early #VC handler (Vitaly Kuznetsov) [1868080]
+Rebuild_FUZZ: 94.44%
+commit-author Joerg Roedel <jroedel@suse.de>
+commit 74d8d9d531b4cc945a9f75aa2fc21d99ca5a9fe3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/74d8d9d5.failed
+
+Setup an early handler for #VC exceptions. There is no GHCB mapped
+yet, so just re-use the vc_no_ghcb_handler(). It can only handle
+CPUID exit-codes, but that should be enough to get the kernel through
+verify_cpu() and __startup_64() until it runs on virtual addresses.
+
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+	Signed-off-by: Borislav Petkov <bp@suse.de>
+[ boot failure Error: kernel_ident_mapping_init() failed. ]
+	Reported-by: kernel test robot <lkp@intel.com>
+Link: https://lkml.kernel.org/r/20200908123517.GA3764@8bytes.org
+(cherry picked from commit 74d8d9d531b4cc945a9f75aa2fc21d99ca5a9fe3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/sev-es.h
+#	arch/x86/kernel/head64.c
+#	arch/x86/kernel/head_64.S
+diff --cc arch/x86/kernel/head64.c
+index d68a9e3968b3,fc55cc9ccb0f..000000000000
+--- a/arch/x86/kernel/head64.c
++++ b/arch/x86/kernel/head64.c
+@@@ -36,6 -36,11 +36,14 @@@
+  #include <asm/microcode.h>
+  #include <asm/kasan.h>
+  #include <asm/fixmap.h>
+++<<<<<<< HEAD
+++=======
++ #include <asm/realmode.h>
++ #include <asm/desc.h>
++ #include <asm/extable.h>
++ #include <asm/trapnr.h>
++ #include <asm/sev-es.h>
+++>>>>>>> 74d8d9d531b4 (x86/sev-es: Setup an early #VC handler)
+  
+  /*
+   * Manage page tables very early on.
+@@@ -487,3 -521,77 +495,80 @@@ void __init x86_64_start_reservations(c
+  
+  	start_kernel();
+  }
+++<<<<<<< HEAD
+++=======
++ 
++ /*
++  * Data structures and code used for IDT setup in head_64.S. The bringup-IDT is
++  * used until the idt_table takes over. On the boot CPU this happens in
++  * x86_64_start_kernel(), on secondary CPUs in start_secondary(). In both cases
++  * this happens in the functions called from head_64.S.
++  *
++  * The idt_table can't be used that early because all the code modifying it is
++  * in idt.c and can be instrumented by tracing or KASAN, which both don't work
++  * during early CPU bringup. Also the idt_table has the runtime vectors
++  * configured which require certain CPU state to be setup already (like TSS),
++  * which also hasn't happened yet in early CPU bringup.
++  */
++ static gate_desc bringup_idt_table[NUM_EXCEPTION_VECTORS] __page_aligned_data;
++ 
++ static struct desc_ptr bringup_idt_descr = {
++ 	.size		= (NUM_EXCEPTION_VECTORS * sizeof(gate_desc)) - 1,
++ 	.address	= 0, /* Set at runtime */
++ };
++ 
++ static void set_bringup_idt_handler(gate_desc *idt, int n, void *handler)
++ {
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ 	struct idt_data data;
++ 	gate_desc desc;
++ 
++ 	init_idt_data(&data, n, handler);
++ 	idt_init_desc(&desc, &data);
++ 	native_write_idt_entry(idt, n, &desc);
++ #endif
++ }
++ 
++ /* This runs while still in the direct mapping */
++ static void startup_64_load_idt(unsigned long physbase)
++ {
++ 	struct desc_ptr *desc = fixup_pointer(&bringup_idt_descr, physbase);
++ 	gate_desc *idt = fixup_pointer(bringup_idt_table, physbase);
++ 
++ 
++ 	if (IS_ENABLED(CONFIG_AMD_MEM_ENCRYPT)) {
++ 		void *handler;
++ 
++ 		/* VMM Communication Exception */
++ 		handler = fixup_pointer(vc_no_ghcb, physbase);
++ 		set_bringup_idt_handler(idt, X86_TRAP_VC, handler);
++ 	}
++ 
++ 	desc->address = (unsigned long)idt;
++ 	native_load_idt(desc);
++ }
++ 
++ /* This is used when running on kernel addresses */
++ void early_setup_idt(void)
++ {
++ 	bringup_idt_descr.address = (unsigned long)bringup_idt_table;
++ 	native_load_idt(&bringup_idt_descr);
++ }
++ 
++ /*
++  * Setup boot CPU state needed before kernel switches to virtual addresses.
++  */
++ void __head startup_64_setup_env(unsigned long physbase)
++ {
++ 	/* Load GDT */
++ 	startup_gdt_descr.address = (unsigned long)fixup_pointer(startup_gdt, physbase);
++ 	native_load_gdt(&startup_gdt_descr);
++ 
++ 	/* New GDT is live - reload data segment registers */
++ 	asm volatile("movl %%eax, %%ds\n"
++ 		     "movl %%eax, %%ss\n"
++ 		     "movl %%eax, %%es\n" : : "a"(__KERNEL_DS) : "memory");
++ 
++ 	startup_64_load_idt(physbase);
++ }
+++>>>>>>> 74d8d9d531b4 (x86/sev-es: Setup an early #VC handler)
+diff --cc arch/x86/kernel/head_64.S
+index f62d1d12a0aa,6e68bca64ae4..000000000000
+--- a/arch/x86/kernel/head_64.S
++++ b/arch/x86/kernel/head_64.S
+@@@ -324,31 -341,46 +324,64 @@@ early_idt_handler_common
+  	pushq %r15				/* pt_regs->r15 */
+  	UNWIND_HINT_REGS
+  
+ +	cmpq $14,%rsi		/* Page fault? */
+ +	jnz 10f
+ +	GET_CR2_INTO(%rdi)	/* Can clobber any volatile register if pv */
+ +	call early_make_pgtable
+ +	andl %eax,%eax
+ +	jz 20f			/* All good */
+ +
+ +10:
+  	movq %rsp,%rdi		/* RDI = pt_regs; RSI is already trapnr */
+ -	call do_early_exception
+ +	call early_fixup_exception
+  
+ +20:
+  	decl early_recursion_flag(%rip)
+  	jmp restore_regs_and_return_to_kernel
+ -SYM_CODE_END(early_idt_handler_common)
+ +END(early_idt_handler_common)
+  
+++<<<<<<< HEAD
+ +	__INITDATA
+++=======
++ #ifdef CONFIG_AMD_MEM_ENCRYPT
++ /*
++  * VC Exception handler used during very early boot. The
++  * early_idt_handler_array can't be used because it returns via the
++  * paravirtualized INTERRUPT_RETURN and pv-ops don't work that early.
++  *
++  * This handler will end up in the .init.text section and not be
++  * available to boot secondary CPUs.
++  */
++ SYM_CODE_START_NOALIGN(vc_no_ghcb)
++ 	UNWIND_HINT_IRET_REGS offset=8
++ 
++ 	/* Build pt_regs */
++ 	PUSH_AND_CLEAR_REGS
++ 
++ 	/* Call C handler */
++ 	movq    %rsp, %rdi
++ 	movq	ORIG_RAX(%rsp), %rsi
++ 	call    do_vc_no_ghcb
++ 
++ 	/* Unwind pt_regs */
++ 	POP_REGS
++ 
++ 	/* Remove Error Code */
++ 	addq    $8, %rsp
++ 
++ 	/* Pure iret required here - don't use INTERRUPT_RETURN */
++ 	iretq
++ SYM_CODE_END(vc_no_ghcb)
++ #endif
+++>>>>>>> 74d8d9d531b4 (x86/sev-es: Setup an early #VC handler)
+  
+ -#define SYM_DATA_START_PAGE_ALIGNED(name)			\
+ -	SYM_START(name, SYM_L_GLOBAL, .balign PAGE_SIZE)
+ +	.balign 4
+ +GLOBAL(early_recursion_flag)
+ +	.long 0
+ +
+ +#define NEXT_PAGE(name) \
+ +	.balign	PAGE_SIZE; \
+ +GLOBAL(name)
+  
+  #ifdef CONFIG_PAGE_TABLE_ISOLATION
+  /*
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/include/asm/sev-es.h
+* Unmerged path arch/x86/kernel/head64.c
+* Unmerged path arch/x86/kernel/head_64.S
