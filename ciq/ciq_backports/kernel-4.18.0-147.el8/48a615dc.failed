@@ -1,0 +1,202 @@
+IB/hfi1: Integrate OPFN into RC transactions
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Kaike Wan <kaike.wan@intel.com>
+commit 48a615dc00aed68d58244b835b10eb3244aae31d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/48a615dc.failed
+
+OPFN parameter negotiation allows a pair of connected RC QPs to exchange
+a set of parameters in succession. This negotiation does not commence
+till the first ULP request. Because OPFN operations are operations
+private to the driver, they do not generate user completions or put the
+QP into error when they run out of retries. This patch integrates the
+OPFN protocol into the transactions of an RC QP.
+
+	Reviewed-by: Mike Marciniszyn <mike.marciniszyn@intel.com>
+	Signed-off-by: Ashutosh Dixit <ashutosh.dixit@intel.com>
+	Signed-off-by: Mitko Haralanov <mitko.haralanov@intel.com>
+	Signed-off-by: Kaike Wan <kaike.wan@intel.com>
+	Signed-off-by: Dennis Dalessandro <dennis.dalessandro@intel.com>
+	Signed-off-by: Doug Ledford <dledford@redhat.com>
+(cherry picked from commit 48a615dc00aed68d58244b835b10eb3244aae31d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/hw/hfi1/rc.c
+#	drivers/infiniband/hw/hfi1/verbs.c
+diff --cc drivers/infiniband/hw/hfi1/rc.c
+index 3158958b7198,092d5eba980f..000000000000
+--- a/drivers/infiniband/hw/hfi1/rc.c
++++ b/drivers/infiniband/hw/hfi1/rc.c
+@@@ -1049,8 -1059,26 +1058,31 @@@ void hfi1_restart_rc(struct rvt_qp *qp
+  			hfi1_migrate_qp(qp);
+  			qp->s_retry = qp->s_retry_cnt;
+  		} else if (qp->s_last == qp->s_acked) {
+++<<<<<<< HEAD
+ +			hfi1_send_complete(qp, wqe, IB_WC_RETRY_EXC_ERR);
+ +			rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
+++=======
++ 			/*
++ 			 * We need special handling for the OPFN request WQEs as
++ 			 * they are not allowed to generate real user errors
++ 			 */
++ 			if (wqe->wr.opcode == IB_WR_OPFN) {
++ 				struct hfi1_ibport *ibp =
++ 					to_iport(qp->ibqp.device, qp->port_num);
++ 				/*
++ 				 * Call opfn_conn_reply() with capcode and
++ 				 * remaining data as 0 to close out the
++ 				 * current request
++ 				 */
++ 				opfn_conn_reply(qp, priv->opfn.curr);
++ 				wqe = do_rc_completion(qp, wqe, ibp);
++ 				qp->s_flags &= ~RVT_S_WAIT_ACK;
++ 			} else {
++ 				rvt_send_complete(qp, wqe,
++ 						  IB_WC_RETRY_EXC_ERR);
++ 				rvt_error_qp(qp, IB_WC_WR_FLUSH_ERR);
++ 			}
+++>>>>>>> 48a615dc00ae (IB/hfi1: Integrate OPFN into RC transactions)
+  			return;
+  		} else { /* need to handle delayed completion */
+  			return;
+@@@ -2368,10 -2404,11 +2406,11 @@@ send_last
+  		u32 rkey;
+  		u8 next;
+  
+- 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC)))
++ 		if (unlikely(!(qp->qp_access_flags & IB_ACCESS_REMOTE_ATOMIC) &&
++ 			     !opfn))
+  			goto nack_inv;
+  		next = qp->r_head_ack_queue + 1;
+ -		if (next > rvt_size_atomic(ib_to_rvt(qp->ibqp.device)))
+ +		if (next > HFI1_MAX_RDMA_ATOMIC)
+  			next = 0;
+  		spin_lock_irqsave(&qp->s_lock, flags);
+  		if (unlikely(next == qp->s_tail_ack_queue)) {
+diff --cc drivers/infiniband/hw/hfi1/verbs.c
+index 1a8add5b44c9,571bfd549c2a..000000000000
+--- a/drivers/infiniband/hw/hfi1/verbs.c
++++ b/drivers/infiniband/hw/hfi1/verbs.c
+@@@ -1961,6 -1732,11 +1961,14 @@@ int hfi1_register_ib_device(struct hfi1
+  	dd->verbs_dev.rdi.dparms.lkey_table_size = hfi1_lkey_table_size;
+  	dd->verbs_dev.rdi.dparms.nports = dd->num_pports;
+  	dd->verbs_dev.rdi.dparms.npkeys = hfi1_get_npkeys(dd);
+++<<<<<<< HEAD
+++=======
++ 	dd->verbs_dev.rdi.dparms.sge_copy_mode = sge_copy_mode;
++ 	dd->verbs_dev.rdi.dparms.wss_threshold = wss_threshold;
++ 	dd->verbs_dev.rdi.dparms.wss_clean_period = wss_clean_period;
++ 	dd->verbs_dev.rdi.dparms.reserved_operations = 1;
++ 	dd->verbs_dev.rdi.dparms.extra_rdma_atomic = 1;
+++>>>>>>> 48a615dc00ae (IB/hfi1: Integrate OPFN into RC transactions)
+  
+  	/* post send table */
+  	dd->verbs_dev.rdi.post_parms = hfi1_post_parms;
+diff --git a/drivers/infiniband/hw/hfi1/init.c b/drivers/infiniband/hw/hfi1/init.c
+index 1d2bb25fdb85..a43d93c05137 100644
+--- a/drivers/infiniband/hw/hfi1/init.c
++++ b/drivers/infiniband/hw/hfi1/init.c
+@@ -1502,6 +1502,12 @@ static int __init hfi1_mod_init(void)
+ 	/* sanitize link CRC options */
+ 	link_crc_mask &= SUPPORTED_CRCS;
+ 
++	ret = opfn_init();
++	if (ret < 0) {
++		pr_err("Failed to allocate opfn_wq");
++		goto bail_dev;
++	}
++
+ 	/*
+ 	 * These must be called before the driver is registered with
+ 	 * the PCI subsystem.
+@@ -1537,6 +1543,7 @@ module_init(hfi1_mod_init);
+ static void __exit hfi1_mod_cleanup(void)
+ {
+ 	pci_unregister_driver(&hfi1_pci_driver);
++	opfn_exit();
+ 	node_affinity_destroy_all();
+ 	hfi1_wss_exit();
+ 	hfi1_dbg_exit();
+diff --git a/drivers/infiniband/hw/hfi1/qp.c b/drivers/infiniband/hw/hfi1/qp.c
+index 5344e8993b28..f822f92b415f 100644
+--- a/drivers/infiniband/hw/hfi1/qp.c
++++ b/drivers/infiniband/hw/hfi1/qp.c
+@@ -132,6 +132,12 @@ const struct rvt_operation_params hfi1_post_parms[RVT_OPERATION_MAX] = {
+ 	.qpt_support = BIT(IB_QPT_RC),
+ },
+ 
++[IB_WR_OPFN] = {
++	.length = sizeof(struct ib_atomic_wr),
++	.qpt_support = BIT(IB_QPT_RC),
++	.flags = RVT_OPERATION_USE_RESERVE,
++},
++
+ };
+ 
+ static void flush_list_head(struct list_head *l)
+@@ -285,6 +291,8 @@ void hfi1_modify_qp(struct rvt_qp *qp, struct ib_qp_attr *attr,
+ 		priv->s_sendcontext = qp_to_send_context(qp, priv->s_sc);
+ 		qp_set_16b(qp);
+ 	}
++
++	opfn_qp_init(qp, attr, attr_mask);
+ }
+ 
+ /**
+@@ -696,6 +704,7 @@ void qp_priv_free(struct rvt_dev_info *rdi, struct rvt_qp *qp)
+ {
+ 	struct hfi1_qp_priv *priv = qp->priv;
+ 
++	hfi1_qp_priv_tid_free(rdi, qp);
+ 	kfree(priv->s_ahg);
+ 	kfree(priv);
+ }
+@@ -751,6 +760,10 @@ void notify_qp_reset(struct rvt_qp *qp)
+ {
+ 	qp->r_adefered = 0;
+ 	clear_ahg(qp);
++
++	/* Clear any OPFN state */
++	if (qp->ibqp.qp_type == IB_QPT_RC)
++		opfn_conn_error(qp);
+ }
+ 
+ /*
+* Unmerged path drivers/infiniband/hw/hfi1/rc.c
+diff --git a/drivers/infiniband/hw/hfi1/tid_rdma.c b/drivers/infiniband/hw/hfi1/tid_rdma.c
+index a8fd66f31fee..0c9f313d6229 100644
+--- a/drivers/infiniband/hw/hfi1/tid_rdma.c
++++ b/drivers/infiniband/hw/hfi1/tid_rdma.c
+@@ -246,5 +246,16 @@ int hfi1_qp_priv_init(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ 
+ 	qpriv->rcd = qp_to_rcd(rdi, qp);
+ 
++	spin_lock_init(&qpriv->opfn.lock);
++	INIT_WORK(&qpriv->opfn.opfn_work, opfn_send_conn_request);
++
+ 	return 0;
+ }
++
++void hfi1_qp_priv_tid_free(struct rvt_dev_info *rdi, struct rvt_qp *qp)
++{
++	struct hfi1_qp_priv *priv = qp->priv;
++
++	if (qp->ibqp.qp_type == IB_QPT_RC && HFI1_CAP_IS_KSET(TID_RDMA))
++		cancel_work_sync(&priv->opfn.opfn_work);
++}
+diff --git a/drivers/infiniband/hw/hfi1/tid_rdma.h b/drivers/infiniband/hw/hfi1/tid_rdma.h
+index 18c6d4333f1e..ee8151558e3f 100644
+--- a/drivers/infiniband/hw/hfi1/tid_rdma.h
++++ b/drivers/infiniband/hw/hfi1/tid_rdma.h
+@@ -35,5 +35,6 @@ int hfi1_kern_exp_rcv_init(struct hfi1_ctxtdata *rcd, int reinit);
+ 
+ int hfi1_qp_priv_init(struct rvt_dev_info *rdi, struct rvt_qp *qp,
+ 		      struct ib_qp_init_attr *init_attr);
++void hfi1_qp_priv_tid_free(struct rvt_dev_info *rdi, struct rvt_qp *qp);
+ 
+ #endif /* HFI1_TID_RDMA_H */
+* Unmerged path drivers/infiniband/hw/hfi1/verbs.c
