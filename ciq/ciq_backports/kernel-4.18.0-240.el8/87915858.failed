@@ -1,0 +1,285 @@
+KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Sean Christopherson <sean.j.christopherson@intel.com>
+commit 8791585837f659943936b8e1cce9d039436ad1ca
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/87915858.failed
+
+Introduce a new "extended register" type, EXIT_INFO_2 (to pair with the
+nomenclature in .get_exit_info()), and use it to cache VMX's
+vmcs.EXIT_INTR_INFO.  Drop a comment in vmx_recover_nmi_blocking() that
+is obsoleted by the generic caching mechanism.
+
+	Signed-off-by: Sean Christopherson <sean.j.christopherson@intel.com>
+Message-Id: <20200415203454.8296-6-sean.j.christopherson@intel.com>
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 8791585837f659943936b8e1cce9d039436ad1ca)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/include/asm/kvm_host.h
+#	arch/x86/kvm/vmx/nested.c
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/vmx/vmx.h
+diff --cc arch/x86/include/asm/kvm_host.h
+index 10275c160b4e,ceba205d32a2..000000000000
+--- a/arch/x86/include/asm/kvm_host.h
++++ b/arch/x86/include/asm/kvm_host.h
+@@@ -168,6 -170,8 +168,11 @@@ enum kvm_reg 
+  	VCPU_EXREG_CR3,
+  	VCPU_EXREG_RFLAGS,
+  	VCPU_EXREG_SEGMENTS,
+++<<<<<<< HEAD
+++=======
++ 	VCPU_EXREG_EXIT_INFO_1,
++ 	VCPU_EXREG_EXIT_INFO_2,
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  };
+  
+  enum {
+diff --cc arch/x86/kvm/vmx/nested.c
+index 24c45b5f5739,78744c6e4a04..000000000000
+--- a/arch/x86/kvm/vmx/nested.c
++++ b/arch/x86/kvm/vmx/nested.c
+@@@ -5364,8 -5419,8 +5364,13 @@@ static int handle_vmfunc(struct kvm_vcp
+  
+  fail:
+  	nested_vmx_vmexit(vcpu, vmx->exit_reason,
+++<<<<<<< HEAD
+ +			  vmcs_read32(VM_EXIT_INTR_INFO),
+ +			  vmcs_readl(EXIT_QUALIFICATION));
+++=======
++ 			  vmx_get_intr_info(vcpu),
++ 			  vmx_get_exit_qual(vcpu));
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  	return 1;
+  }
+  
+@@@ -5619,17 -5652,72 +5624,79 @@@ bool nested_vmx_exit_reflected(struct k
+  
+  	switch (exit_reason) {
+  	case EXIT_REASON_EXCEPTION_NMI:
+++<<<<<<< HEAD
+++=======
++ 		intr_info = vmx_get_intr_info(vcpu);
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  		if (is_nmi(intr_info))
+ -			return true;
+ +			return false;
+  		else if (is_page_fault(intr_info))
+ -			return vcpu->arch.apf.host_apf_reason || !enable_ept;
+ +			return !vmx->vcpu.arch.apf.host_apf_reason && enable_ept;
+  		else if (is_debug(intr_info) &&
+  			 vcpu->guest_debug &
+  			 (KVM_GUESTDBG_SINGLESTEP | KVM_GUESTDBG_USE_HW_BP))
+ -			return true;
+ +			return false;
+  		else if (is_breakpoint(intr_info) &&
+  			 vcpu->guest_debug & KVM_GUESTDBG_USE_SW_BP)
+++<<<<<<< HEAD
+ +			return false;
+++=======
++ 			return true;
++ 		return false;
++ 	case EXIT_REASON_EXTERNAL_INTERRUPT:
++ 		return true;
++ 	case EXIT_REASON_MCE_DURING_VMENTRY:
++ 		return true;
++ 	case EXIT_REASON_EPT_VIOLATION:
++ 		/*
++ 		 * L0 always deals with the EPT violation. If nested EPT is
++ 		 * used, and the nested mmu code discovers that the address is
++ 		 * missing in the guest EPT table (EPT12), the EPT violation
++ 		 * will be injected with nested_ept_inject_page_fault()
++ 		 */
++ 		return true;
++ 	case EXIT_REASON_EPT_MISCONFIG:
++ 		/*
++ 		 * L2 never uses directly L1's EPT, but rather L0's own EPT
++ 		 * table (shadow on EPT) or a merged EPT table that L0 built
++ 		 * (EPT on EPT). So any problems with the structure of the
++ 		 * table is L0's fault.
++ 		 */
++ 		return true;
++ 	case EXIT_REASON_PREEMPTION_TIMER:
++ 		return true;
++ 	case EXIT_REASON_PML_FULL:
++ 		/* We emulate PML support to L1. */
++ 		return true;
++ 	case EXIT_REASON_VMFUNC:
++ 		/* VM functions are emulated through L2->L0 vmexits. */
++ 		return true;
++ 	case EXIT_REASON_ENCLS:
++ 		/* SGX is never exposed to L1 */
++ 		return true;
++ 	default:
++ 		break;
++ 	}
++ 	return false;
++ }
++ 
++ /*
++  * Return 1 if L1 wants to intercept an exit from L2.  Only call this when in
++  * is_guest_mode (L2).
++  */
++ static bool nested_vmx_l1_wants_exit(struct kvm_vcpu *vcpu, u32 exit_reason)
++ {
++ 	u32 intr_info = vmx_get_intr_info(vcpu);
++ 	struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 	switch (exit_reason) {
++ 	case EXIT_REASON_EXCEPTION_NMI:
++ 		intr_info = vmx_get_intr_info(vcpu);
++ 		if (is_nmi(intr_info))
++ 			return true;
++ 		else if (is_page_fault(intr_info))
++ 			return true;
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  		return vmcs12->exception_bitmap &
+  				(1u << (intr_info & INTR_INFO_VECTOR_MASK));
+  	case EXIT_REASON_EXTERNAL_INTERRUPT:
+@@@ -5762,6 -5823,66 +5829,69 @@@
+  	}
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * Conditionally reflect a VM-Exit into L1.  Returns %true if the VM-Exit was
++  * reflected into L1.
++  */
++ bool nested_vmx_reflect_vmexit(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 	u32 exit_reason = vmx->exit_reason;
++ 	u32 exit_intr_info, exit_qual;
++ 
++ 	WARN_ON_ONCE(vmx->nested.nested_run_pending);
++ 
++ 	/*
++ 	 * Late nested VM-Fail shares the same flow as nested VM-Exit since KVM
++ 	 * has already loaded L2's state.
++ 	 */
++ 	if (unlikely(vmx->fail)) {
++ 		trace_kvm_nested_vmenter_failed(
++ 			"hardware VM-instruction error: ",
++ 			vmcs_read32(VM_INSTRUCTION_ERROR));
++ 		exit_intr_info = 0;
++ 		exit_qual = 0;
++ 		goto reflect_vmexit;
++ 	}
++ 
++ 	exit_intr_info = vmx_get_intr_info(vcpu);
++ 	exit_qual = vmx_get_exit_qual(vcpu);
++ 
++ 	trace_kvm_nested_vmexit(kvm_rip_read(vcpu), exit_reason, exit_qual,
++ 				vmx->idt_vectoring_info, exit_intr_info,
++ 				vmcs_read32(VM_EXIT_INTR_ERROR_CODE),
++ 				KVM_ISA_VMX);
++ 
++ 	/* If L0 (KVM) wants the exit, it trumps L1's desires. */
++ 	if (nested_vmx_l0_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/* If L1 doesn't want the exit, handle it in L0. */
++ 	if (!nested_vmx_l1_wants_exit(vcpu, exit_reason))
++ 		return false;
++ 
++ 	/*
++ 	 * vmcs.VM_EXIT_INTR_INFO is only valid for EXCEPTION_NMI exits.  For
++ 	 * EXTERNAL_INTERRUPT, the value for vmcs12->vm_exit_intr_info would
++ 	 * need to be synthesized by querying the in-kernel LAPIC, but external
++ 	 * interrupts are never reflected to L1 so it's a non-issue.
++ 	 */
++ 	if ((exit_intr_info &
++ 	     (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) ==
++ 	    (INTR_INFO_VALID_MASK | INTR_INFO_DELIVER_CODE_MASK)) {
++ 		struct vmcs12 *vmcs12 = get_vmcs12(vcpu);
++ 
++ 		vmcs12->vm_exit_intr_error_code =
++ 			vmcs_read32(VM_EXIT_INTR_ERROR_CODE);
++ 	}
++ 
++ reflect_vmexit:
++ 	nested_vmx_vmexit(vcpu, exit_reason, exit_intr_info, exit_qual);
++ 	return true;
++ }
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  
+  static int vmx_get_nested_state(struct kvm_vcpu *vcpu,
+  				struct kvm_nested_state __user *user_kvm_nested_state,
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 9c2aa83f6305,50951cdbe76f..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -5708,8 -5634,8 +5708,13 @@@ static const int kvm_vmx_max_exit_handl
+  
+  static void vmx_get_exit_info(struct kvm_vcpu *vcpu, u64 *info1, u64 *info2)
+  {
+++<<<<<<< HEAD
+ +	*info1 = vmcs_readl(EXIT_QUALIFICATION);
+ +	*info2 = vmcs_read32(VM_EXIT_INTR_INFO);
+++=======
++ 	*info1 = vmx_get_exit_qual(vcpu);
++ 	*info2 = vmx_get_intr_info(vcpu);
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  }
+  
+  static void vmx_destroy_pml_buffer(struct vcpu_vmx *vmx)
+diff --cc arch/x86/kvm/vmx/vmx.h
+index 2860db4335ad,edfb739e5907..000000000000
+--- a/arch/x86/kvm/vmx/vmx.h
++++ b/arch/x86/kvm/vmx/vmx.h
+@@@ -456,7 -450,9 +456,13 @@@ static inline void vmx_register_cache_r
+  				  | (1 << VCPU_EXREG_RFLAGS)
+  				  | (1 << VCPU_EXREG_PDPTR)
+  				  | (1 << VCPU_EXREG_SEGMENTS)
+++<<<<<<< HEAD
+ +				  | (1 << VCPU_EXREG_CR3));
+++=======
++ 				  | (1 << VCPU_EXREG_CR3)
++ 				  | (1 << VCPU_EXREG_EXIT_INFO_1)
++ 				  | (1 << VCPU_EXREG_EXIT_INFO_2));
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  	vcpu->arch.regs_dirty = 0;
+  }
+  
+@@@ -500,6 -496,28 +506,31 @@@ static inline struct pi_desc *vcpu_to_p
+  	return &(to_vmx(vcpu)->pi_desc);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static inline unsigned long vmx_get_exit_qual(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (!kvm_register_is_available(vcpu, VCPU_EXREG_EXIT_INFO_1)) {
++ 		kvm_register_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_1);
++ 		vmx->exit_qualification = vmcs_readl(EXIT_QUALIFICATION);
++ 	}
++ 	return vmx->exit_qualification;
++ }
++ 
++ static inline u32 vmx_get_intr_info(struct kvm_vcpu *vcpu)
++ {
++ 	struct vcpu_vmx *vmx = to_vmx(vcpu);
++ 
++ 	if (!kvm_register_is_available(vcpu, VCPU_EXREG_EXIT_INFO_2)) {
++ 		kvm_register_mark_available(vcpu, VCPU_EXREG_EXIT_INFO_2);
++ 		vmx->exit_intr_info = vmcs_read32(VM_EXIT_INTR_INFO);
++ 	}
++ 	return vmx->exit_intr_info;
++ }
++ 
+++>>>>>>> 8791585837f6 (KVM: VMX: Cache vmcs.EXIT_INTR_INFO using arch avail_reg flags)
+  struct vmcs *alloc_vmcs_cpu(bool shadow, int cpu, gfp_t flags);
+  void free_vmcs(struct vmcs *vmcs);
+  int alloc_loaded_vmcs(struct loaded_vmcs *loaded_vmcs);
+* Unmerged path arch/x86/include/asm/kvm_host.h
+* Unmerged path arch/x86/kvm/vmx/nested.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/vmx/vmx.h
