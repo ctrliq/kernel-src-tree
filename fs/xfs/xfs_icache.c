@@ -1118,9 +1118,10 @@ xfs_reclaim_inode(
 {
 	xfs_ino_t		ino = ip->i_ino; /* for radix_tree_delete */
 
-	xfs_ilock(ip, XFS_ILOCK_EXCL);
-	if (!xfs_iflock_nowait(ip))
+	if (!xfs_ilock_nowait(ip, XFS_ILOCK_EXCL))
 		goto out;
+	if (!xfs_iflock_nowait(ip))
+		goto out_iunlock;
 
 	if (XFS_FORCED_SHUTDOWN(ip->i_mount)) {
 		xfs_iunpin_wait(ip);
@@ -1187,8 +1188,9 @@ reclaim:
 
 out_ifunlock:
 	xfs_ifunlock(ip);
-out:
+out_iunlock:
 	xfs_iunlock(ip, XFS_ILOCK_EXCL);
+out:
 	xfs_iflags_clear(ip, XFS_IRECLAIM);
 	return false;
 }
