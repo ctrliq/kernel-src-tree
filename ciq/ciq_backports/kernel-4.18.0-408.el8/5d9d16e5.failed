@@ -1,0 +1,132 @@
+dmaengine: idxd: match type for retries var in idxd_enqcmds()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Dave Jiang <dave.jiang@intel.com>
+commit 5d9d16e5aa0cf023e600bf716239fd9caa2d4148
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/5d9d16e5.failed
+
+wq->enqcmds_retries is defined as unsigned int. However, retries on the
+stack is defined as int. Change retries to unsigned int to compare the same
+type.
+
+Fixes: 7930d8553575 ("dmaengine: idxd: add knob for enqcmds retries")
+	Suggested-by: Thiago Macieira <thiago.macieira@intel.com>
+	Signed-off-by: Dave Jiang <dave.jiang@intel.com>
+Link: https://lore.kernel.org/r/165031747059.3658198.6035308204505664375.stgit@djiang5-desk3.ch.intel.com
+	Signed-off-by: Vinod Koul <vkoul@kernel.org>
+(cherry picked from commit 5d9d16e5aa0cf023e600bf716239fd9caa2d4148)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/dma/idxd/submit.c
+diff --cc drivers/dma/idxd/submit.c
+index 0afcd1322339,554b0602d2e9..000000000000
+--- a/drivers/dma/idxd/submit.c
++++ b/drivers/dma/idxd/submit.c
+@@@ -88,6 -70,99 +88,102 @@@ void idxd_free_desc(struct idxd_wq *wq
+  	sbitmap_queue_clear(&wq->sbq, desc->id, cpu);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct idxd_desc *list_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 					 struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *n;
++ 
++ 	lockdep_assert_held(&ie->list_lock);
++ 	list_for_each_entry_safe(d, n, &ie->work_list, list) {
++ 		if (d == desc) {
++ 			list_del(&d->list);
++ 			return d;
++ 		}
++ 	}
++ 
++ 	/*
++ 	 * At this point, the desc needs to be aborted is held by the completion
++ 	 * handler where it has taken it off the pending list but has not added to the
++ 	 * work list. It will be cleaned up by the interrupt handler when it sees the
++ 	 * IDXD_COMP_DESC_ABORT for completion status.
++ 	 */
++ 	return NULL;
++ }
++ 
++ static void llist_abort_desc(struct idxd_wq *wq, struct idxd_irq_entry *ie,
++ 			     struct idxd_desc *desc)
++ {
++ 	struct idxd_desc *d, *t, *found = NULL;
++ 	struct llist_node *head;
++ 	LIST_HEAD(flist);
++ 
++ 	desc->completion->status = IDXD_COMP_DESC_ABORT;
++ 	/*
++ 	 * Grab the list lock so it will block the irq thread handler. This allows the
++ 	 * abort code to locate the descriptor need to be aborted.
++ 	 */
++ 	spin_lock(&ie->list_lock);
++ 	head = llist_del_all(&ie->pending_llist);
++ 	if (head) {
++ 		llist_for_each_entry_safe(d, t, head, llnode) {
++ 			if (d == desc) {
++ 				found = desc;
++ 				continue;
++ 			}
++ 
++ 			if (d->completion->status)
++ 				list_add_tail(&d->list, &flist);
++ 			else
++ 				list_add_tail(&d->list, &ie->work_list);
++ 		}
++ 	}
++ 
++ 	if (!found)
++ 		found = list_abort_desc(wq, ie, desc);
++ 	spin_unlock(&ie->list_lock);
++ 
++ 	if (found)
++ 		idxd_dma_complete_txd(found, IDXD_COMPLETE_ABORT, false);
++ 
++ 	/*
++ 	 * completing the descriptor will return desc to allocator and
++ 	 * the desc can be acquired by a different process and the
++ 	 * desc->list can be modified.  Delete desc from list so the
++ 	 * list trasversing does not get corrupted by the other process.
++ 	 */
++ 	list_for_each_entry_safe(d, t, &flist, list) {
++ 		list_del_init(&d->list);
++ 		idxd_dma_complete_txd(found, IDXD_COMPLETE_ABORT, true);
++ 	}
++ }
++ 
++ /*
++  * ENQCMDS typically fail when the WQ is inactive or busy. On host submission, the driver
++  * has better control of number of descriptors being submitted to a shared wq by limiting
++  * the number of driver allocated descriptors to the wq size. However, when the swq is
++  * exported to a guest kernel, it may be shared with multiple guest kernels. This means
++  * the likelihood of getting busy returned on the swq when submitting goes significantly up.
++  * Having a tunable retry mechanism allows the driver to keep trying for a bit before giving
++  * up. The sysfs knob can be tuned by the system administrator.
++  */
++ int idxd_enqcmds(struct idxd_wq *wq, void __iomem *portal, const void *desc)
++ {
++ 	unsigned int retries = 0;
++ 	int rc;
++ 
++ 	do {
++ 		rc = enqcmds(portal, desc);
++ 		if (rc == 0)
++ 			break;
++ 		cpu_relax();
++ 	} while (retries++ < wq->enqcmds_retries);
++ 
++ 	return rc;
++ }
++ 
+++>>>>>>> 5d9d16e5aa0c (dmaengine: idxd: match type for retries var in idxd_enqcmds())
+  int idxd_submit_desc(struct idxd_wq *wq, struct idxd_desc *desc)
+  {
+  	struct idxd_device *idxd = wq->idxd;
+* Unmerged path drivers/dma/idxd/submit.c
