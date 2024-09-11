@@ -1266,7 +1266,7 @@ static void dump_read(struct perf_evsel *evsel, union perf_event *event)
 	if (!dump_trace)
 		return;
 
-	printf(": %d %d %s %" PRIu64 "\n", event->read.pid, event->read.tid,
+	printf(": %d %d %s %" PRI_lu64 "\n", event->read.pid, event->read.tid,
 	       perf_evsel__name(evsel),
 	       event->read.value);
 
@@ -1276,13 +1276,13 @@ static void dump_read(struct perf_evsel *evsel, union perf_event *event)
 	read_format = evsel->attr.read_format;
 
 	if (read_format & PERF_FORMAT_TOTAL_TIME_ENABLED)
-		printf("... time enabled : %" PRIu64 "\n", read_event->time_enabled);
+		printf("... time enabled : %" PRI_lu64 "\n", read_event->time_enabled);
 
 	if (read_format & PERF_FORMAT_TOTAL_TIME_RUNNING)
-		printf("... time running : %" PRIu64 "\n", read_event->time_running);
+		printf("... time running : %" PRI_lu64 "\n", read_event->time_running);
 
 	if (read_format & PERF_FORMAT_ID)
-		printf("... id           : %" PRIu64 "\n", read_event->id);
+		printf("... id           : %" PRI_lu64 "\n", read_event->id);
 }
 
 static struct machine *machines__find_for_cpumode(struct machines *machines,
