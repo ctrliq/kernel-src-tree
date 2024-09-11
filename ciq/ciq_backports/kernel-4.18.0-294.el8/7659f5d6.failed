@@ -1,0 +1,182 @@
+powerpc/pseries/cmm: Rip out memory isolate notifier
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author David Hildenbrand <david@redhat.com>
+commit 7659f5d6448095ef436891c33bdd7c8500620a00
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7659f5d6.failed
+
+The memory isolate notifier was added to allow to offline memory
+blocks that contain inflated/"loaned" pages. We can achieve the same
+using the balloon compaction framework.
+
+Get rid of the memory isolate notifier. Also, we can get rid of
+cmm_mem_going_offline(), as we will never reach that code path now
+when we have allocated memory in the balloon (allocated pages are
+unmovable and will no longer be special-cased using the memory
+isolation notifier).
+
+Leave the memory notifier in place, so we can still back off in case
+memory gets offlined.
+
+	Signed-off-by: David Hildenbrand <david@redhat.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20191031142933.10779-7-david@redhat.com
+(cherry picked from commit 7659f5d6448095ef436891c33bdd7c8500620a00)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/cmm.c
+diff --cc arch/powerpc/platforms/pseries/cmm.c
+index 317181692fcb,29416b621189..000000000000
+--- a/arch/powerpc/platforms/pseries/cmm.c
++++ b/arch/powerpc/platforms/pseries/cmm.c
+@@@ -500,142 -443,6 +496,145 @@@ static struct notifier_block cmm_reboot
+  };
+  
+  /**
+++<<<<<<< HEAD
+ + * cmm_count_pages - Count the number of pages loaned in a particular range.
+ + *
+ + * @arg: memory_isolate_notify structure with address range and count
+ + *
+ + * Return value:
+ + *      0 on success
+ + **/
+ +static unsigned long cmm_count_pages(void *arg)
+ +{
+ +	struct memory_isolate_notify *marg = arg;
+ +	struct cmm_page_array *pa;
+ +	unsigned long start = (unsigned long)pfn_to_kaddr(marg->start_pfn);
+ +	unsigned long end = start + (marg->nr_pages << PAGE_SHIFT);
+ +	unsigned long idx;
+ +
+ +	spin_lock(&cmm_lock);
+ +	pa = cmm_page_list;
+ +	while (pa) {
+ +		if ((unsigned long)pa >= start && (unsigned long)pa < end)
+ +			marg->pages_found++;
+ +		for (idx = 0; idx < pa->index; idx++)
+ +			if (pa->page[idx] >= start && pa->page[idx] < end)
+ +				marg->pages_found++;
+ +		pa = pa->next;
+ +	}
+ +	spin_unlock(&cmm_lock);
+ +	return 0;
+ +}
+ +
+ +/**
+ + * cmm_memory_isolate_cb - Handle memory isolation notifier calls
+ + * @self:	notifier block struct
+ + * @action:	action to take
+ + * @arg:	struct memory_isolate_notify data for handler
+ + *
+ + * Return value:
+ + *	NOTIFY_OK or notifier error based on subfunction return value
+ + **/
+ +static int cmm_memory_isolate_cb(struct notifier_block *self,
+ +				 unsigned long action, void *arg)
+ +{
+ +	int ret = 0;
+ +
+ +	if (action == MEM_ISOLATE_COUNT)
+ +		ret = cmm_count_pages(arg);
+ +
+ +	return notifier_from_errno(ret);
+ +}
+ +
+ +static struct notifier_block cmm_mem_isolate_nb = {
+ +	.notifier_call = cmm_memory_isolate_cb,
+ +	.priority = CMM_MEM_ISOLATE_PRI
+ +};
+ +
+ +/**
+ + * cmm_mem_going_offline - Unloan pages where memory is to be removed
+ + * @arg: memory_notify structure with page range to be offlined
+ + *
+ + * Return value:
+ + *	0 on success
+ + **/
+ +static int cmm_mem_going_offline(void *arg)
+ +{
+ +	struct memory_notify *marg = arg;
+ +	unsigned long start_page = (unsigned long)pfn_to_kaddr(marg->start_pfn);
+ +	unsigned long end_page = start_page + (marg->nr_pages << PAGE_SHIFT);
+ +	struct cmm_page_array *pa_curr, *pa_last, *npa;
+ +	unsigned long idx;
+ +	unsigned long freed = 0;
+ +
+ +	cmm_dbg("Memory going offline, searching 0x%lx (%ld pages).\n",
+ +			start_page, marg->nr_pages);
+ +	spin_lock(&cmm_lock);
+ +
+ +	/* Search the page list for pages in the range to be offlined */
+ +	pa_last = pa_curr = cmm_page_list;
+ +	while (pa_curr) {
+ +		for (idx = (pa_curr->index - 1); (idx + 1) > 0; idx--) {
+ +			if ((pa_curr->page[idx] < start_page) ||
+ +			    (pa_curr->page[idx] >= end_page))
+ +				continue;
+ +
+ +			plpar_page_set_active(__pa(pa_curr->page[idx]));
+ +			free_page(pa_curr->page[idx]);
+ +			freed++;
+ +			loaned_pages--;
+ +			totalram_pages++;
+ +			pa_curr->page[idx] = pa_last->page[--pa_last->index];
+ +			if (pa_last->index == 0) {
+ +				if (pa_curr == pa_last)
+ +					pa_curr = pa_last->next;
+ +				pa_last = pa_last->next;
+ +				free_page((unsigned long)cmm_page_list);
+ +				cmm_page_list = pa_last;
+ +			}
+ +		}
+ +		pa_curr = pa_curr->next;
+ +	}
+ +
+ +	/* Search for page list structures in the range to be offlined */
+ +	pa_last = NULL;
+ +	pa_curr = cmm_page_list;
+ +	while (pa_curr) {
+ +		if (((unsigned long)pa_curr >= start_page) &&
+ +				((unsigned long)pa_curr < end_page)) {
+ +			npa = (struct cmm_page_array *)__get_free_page(
+ +					GFP_NOIO | __GFP_NOWARN |
+ +					__GFP_NORETRY | __GFP_NOMEMALLOC);
+ +			if (!npa) {
+ +				spin_unlock(&cmm_lock);
+ +				cmm_dbg("Failed to allocate memory for list "
+ +						"management. Memory hotplug "
+ +						"failed.\n");
+ +				return -ENOMEM;
+ +			}
+ +			memcpy(npa, pa_curr, PAGE_SIZE);
+ +			if (pa_curr == cmm_page_list)
+ +				cmm_page_list = npa;
+ +			if (pa_last)
+ +				pa_last->next = npa;
+ +			free_page((unsigned long) pa_curr);
+ +			freed++;
+ +			pa_curr = npa;
+ +		}
+ +
+ +		pa_last = pa_curr;
+ +		pa_curr = pa_curr->next;
+ +	}
+ +
+ +	spin_unlock(&cmm_lock);
+ +	cmm_dbg("Released %ld pages in the search range.\n", freed);
+ +
+ +	return 0;
+ +}
+ +
+ +/**
+++=======
+++>>>>>>> 7659f5d64480 (powerpc/pseries/cmm: Rip out memory isolate notifier)
+   * cmm_memory_cb - Handle memory hotplug notifier calls
+   * @self:	notifier block struct
+   * @action:	action to take
+* Unmerged path arch/powerpc/platforms/pseries/cmm.c
