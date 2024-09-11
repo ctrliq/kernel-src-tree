@@ -1,0 +1,392 @@
+drm/i915/ttm: fix 32b build
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-448.el8
+commit-author Matthew Auld <matthew.auld@intel.com>
+commit 9306b2b2dfce6931241ef804783692cee526599c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-448.el8/9306b2b2.failed
+
+Since segment_pages is no longer a compile time constant, it looks the
+DIV_ROUND_UP(node->size, segment_pages) breaks the 32b build. Simplest
+is just to use the ULL variant, but really we should need not need more
+than u32 for the page alignment (also we are limited by that due to the
+sg->length type), so also make it all u32.
+
+	Reported-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+Fixes: bc99f1209f19 ("drm/i915/ttm: fix sg_table construction")
+	Signed-off-by: Matthew Auld <matthew.auld@intel.com>
+	Cc: Nirmoy Das <nirmoy.das@linux.intel.com>
+	Reviewed-by: Nirmoy Das <nirmoy.das@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20220712174050.592550-1-matthew.auld@intel.com
+(cherry picked from commit 9306b2b2dfce6931241ef804783692cee526599c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/gem/i915_gem_region.c
+#	drivers/gpu/drm/i915/gem/i915_gem_ttm.c
+#	drivers/gpu/drm/i915/i915_scatterlist.c
+#	drivers/gpu/drm/i915/i915_scatterlist.h
+#	drivers/gpu/drm/i915/intel_region_ttm.c
+#	drivers/gpu/drm/i915/intel_region_ttm.h
+diff --cc drivers/gpu/drm/i915/gem/i915_gem_region.c
+index f25e6646c5b7,a4fb577eceb4..000000000000
+--- a/drivers/gpu/drm/i915/gem/i915_gem_region.c
++++ b/drivers/gpu/drm/i915/gem/i915_gem_region.c
+@@@ -56,7 -51,24 +56,23 @@@ i915_gem_object_create_region(struct in
+  	if (!mem)
+  		return ERR_PTR(-ENODEV);
+  
+++<<<<<<< HEAD
+ +	size = round_up(size, mem->min_page_size);
+++=======
++ 	default_page_size = mem->min_page_size;
++ 	if (page_size)
++ 		default_page_size = page_size;
++ 
++ 	/* We should be able to fit a page within an sg entry */
++ 	GEM_BUG_ON(overflows_type(default_page_size, u32));
++ 	GEM_BUG_ON(!is_power_of_2_u64(default_page_size));
++ 	GEM_BUG_ON(default_page_size < PAGE_SIZE);
++ 
++ 	size = round_up(size, default_page_size);
++ 
++ 	if (default_page_size == size)
++ 		flags |= I915_BO_ALLOC_CONTIGUOUS;
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  
+  	GEM_BUG_ON(!size);
+  	GEM_BUG_ON(!IS_ALIGNED(size, I915_GTT_MIN_ALIGNMENT));
+diff --cc drivers/gpu/drm/i915/i915_scatterlist.c
+index 69e9e6c3135e,dcc081874ec8..000000000000
+--- a/drivers/gpu/drm/i915/i915_scatterlist.c
++++ b/drivers/gpu/drm/i915/i915_scatterlist.c
+@@@ -47,25 -74,31 +47,40 @@@ bool i915_sg_trim(struct sg_table *orig
+   * taking a maximum segment length into account, splitting into segments
+   * if necessary.
+   *
+ - * Return: A pointer to a kmalloced struct i915_refct_sgt on success, negative
+ + * Return: A pointer to a kmalloced struct sg_table on success, negative
+   * error code cast to an error pointer on failure.
+   */
+++<<<<<<< HEAD
+ +struct sg_table *i915_sg_from_mm_node(const struct drm_mm_node *node,
+ +				      u64 region_start)
+ +{
+ +	const u64 max_segment = SZ_1G; /* Do we have a limit on this? */
+ +	u64 segment_pages = max_segment >> PAGE_SHIFT;
+++=======
++ struct i915_refct_sgt *i915_rsgt_from_mm_node(const struct drm_mm_node *node,
++ 					      u64 region_start,
++ 					      u32 page_alignment)
++ {
++ 	const u32 max_segment = round_down(UINT_MAX, page_alignment);
++ 	const u32 segment_pages = max_segment >> PAGE_SHIFT;
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  	u64 block_size, offset, prev_end;
+ -	struct i915_refct_sgt *rsgt;
+  	struct sg_table *st;
+  	struct scatterlist *sg;
+  
+ -	GEM_BUG_ON(!max_segment);
+ -
+ -	rsgt = kmalloc(sizeof(*rsgt), GFP_KERNEL);
+ -	if (!rsgt)
+ +	st = kmalloc(sizeof(*st), GFP_KERNEL);
+ +	if (!st)
+  		return ERR_PTR(-ENOMEM);
+  
+++<<<<<<< HEAD
+ +	if (sg_alloc_table(st, DIV_ROUND_UP(node->size, segment_pages),
+++=======
++ 	i915_refct_sgt_init(rsgt, node->size << PAGE_SHIFT);
++ 	st = &rsgt->table;
++ 	if (sg_alloc_table(st, DIV_ROUND_UP_ULL(node->size, segment_pages),
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  			   GFP_KERNEL)) {
+ -		i915_refct_sgt_put(rsgt);
+ +		kfree(st);
+  		return ERR_PTR(-ENOMEM);
+  	}
+  
+@@@ -101,7 -136,92 +116,96 @@@
+  	sg_mark_end(sg);
+  	i915_sg_trim(st);
+  
+++<<<<<<< HEAD
+ +	return st;
+++=======
++ 	return rsgt;
++ }
++ 
++ /**
++  * i915_rsgt_from_buddy_resource - Create a refcounted sg_table from a struct
++  * i915_buddy_block list
++  * @res: The struct i915_ttm_buddy_resource.
++  * @region_start: An offset to add to the dma addresses of the sg list.
++  * @page_alignment: Required page alignment for each sg entry. Power of two.
++  *
++  * Create a struct sg_table, initializing it from struct i915_buddy_block list,
++  * taking a maximum segment length into account, splitting into segments
++  * if necessary.
++  *
++  * Return: A pointer to a kmalloced struct i915_refct_sgts on success, negative
++  * error code cast to an error pointer on failure.
++  */
++ struct i915_refct_sgt *i915_rsgt_from_buddy_resource(struct ttm_resource *res,
++ 						     u64 region_start,
++ 						     u32 page_alignment)
++ {
++ 	struct i915_ttm_buddy_resource *bman_res = to_ttm_buddy_resource(res);
++ 	const u64 size = res->num_pages << PAGE_SHIFT;
++ 	const u32 max_segment = round_down(UINT_MAX, page_alignment);
++ 	struct drm_buddy *mm = bman_res->mm;
++ 	struct list_head *blocks = &bman_res->blocks;
++ 	struct drm_buddy_block *block;
++ 	struct i915_refct_sgt *rsgt;
++ 	struct scatterlist *sg;
++ 	struct sg_table *st;
++ 	resource_size_t prev_end;
++ 
++ 	GEM_BUG_ON(list_empty(blocks));
++ 	GEM_BUG_ON(!max_segment);
++ 
++ 	rsgt = kmalloc(sizeof(*rsgt), GFP_KERNEL);
++ 	if (!rsgt)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	i915_refct_sgt_init(rsgt, size);
++ 	st = &rsgt->table;
++ 	if (sg_alloc_table(st, res->num_pages, GFP_KERNEL)) {
++ 		i915_refct_sgt_put(rsgt);
++ 		return ERR_PTR(-ENOMEM);
++ 	}
++ 
++ 	sg = st->sgl;
++ 	st->nents = 0;
++ 	prev_end = (resource_size_t)-1;
++ 
++ 	list_for_each_entry(block, blocks, link) {
++ 		u64 block_size, offset;
++ 
++ 		block_size = min_t(u64, size, drm_buddy_block_size(mm, block));
++ 		offset = drm_buddy_block_offset(block);
++ 
++ 		while (block_size) {
++ 			u64 len;
++ 
++ 			if (offset != prev_end || sg->length >= max_segment) {
++ 				if (st->nents)
++ 					sg = __sg_next(sg);
++ 
++ 				sg_dma_address(sg) = region_start + offset;
++ 				GEM_BUG_ON(!IS_ALIGNED(sg_dma_address(sg),
++ 						       page_alignment));
++ 				sg_dma_len(sg) = 0;
++ 				sg->length = 0;
++ 				st->nents++;
++ 			}
++ 
++ 			len = min_t(u64, block_size, max_segment - sg->length);
++ 			sg->length += len;
++ 			sg_dma_len(sg) += len;
++ 
++ 			offset += len;
++ 			block_size -= len;
++ 
++ 			prev_end = offset;
++ 		}
++ 	}
++ 
++ 	sg_mark_end(sg);
++ 	i915_sg_trim(st);
++ 
++ 	return rsgt;
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  }
+  
+  #if IS_ENABLED(CONFIG_DRM_I915_SELFTEST)
+diff --cc drivers/gpu/drm/i915/i915_scatterlist.h
+index 5acca45ea981,9ddb3e743a3e..000000000000
+--- a/drivers/gpu/drm/i915/i915_scatterlist.h
++++ b/drivers/gpu/drm/i915/i915_scatterlist.h
+@@@ -143,6 -144,80 +143,85 @@@ static inline unsigned int i915_sg_segm
+  
+  bool i915_sg_trim(struct sg_table *orig_st);
+  
+++<<<<<<< HEAD
+ +struct sg_table *i915_sg_from_mm_node(const struct drm_mm_node *node,
+ +				      u64 region_start);
+++=======
++ /**
++  * struct i915_refct_sgt_ops - Operations structure for struct i915_refct_sgt
++  */
++ struct i915_refct_sgt_ops {
++ 	/**
++ 	 * release() - Free the memory of the struct i915_refct_sgt
++ 	 * @ref: struct kref that is embedded in the struct i915_refct_sgt
++ 	 */
++ 	void (*release)(struct kref *ref);
++ };
++ 
++ /**
++  * struct i915_refct_sgt - A refcounted scatter-gather table
++  * @kref: struct kref for refcounting
++  * @table: struct sg_table holding the scatter-gather table itself. Note that
++  * @table->sgl = NULL can be used to determine whether a scatter-gather table
++  * is present or not.
++  * @size: The size in bytes of the underlying memory buffer
++  * @ops: The operations structure.
++  */
++ struct i915_refct_sgt {
++ 	struct kref kref;
++ 	struct sg_table table;
++ 	size_t size;
++ 	const struct i915_refct_sgt_ops *ops;
++ };
++ 
++ /**
++  * i915_refct_sgt_put - Put a refcounted sg-table
++  * @rsgt the struct i915_refct_sgt to put.
++  */
++ static inline void i915_refct_sgt_put(struct i915_refct_sgt *rsgt)
++ {
++ 	if (rsgt)
++ 		kref_put(&rsgt->kref, rsgt->ops->release);
++ }
++ 
++ /**
++  * i915_refct_sgt_get - Get a refcounted sg-table
++  * @rsgt the struct i915_refct_sgt to get.
++  */
++ static inline struct i915_refct_sgt *
++ i915_refct_sgt_get(struct i915_refct_sgt *rsgt)
++ {
++ 	kref_get(&rsgt->kref);
++ 	return rsgt;
++ }
++ 
++ /**
++  * __i915_refct_sgt_init - Initialize a refcounted sg-list with a custom
++  * operations structure
++  * @rsgt The struct i915_refct_sgt to initialize.
++  * @size: Size in bytes of the underlying memory buffer.
++  * @ops: A customized operations structure in case the refcounted sg-list
++  * is embedded into another structure.
++  */
++ static inline void __i915_refct_sgt_init(struct i915_refct_sgt *rsgt,
++ 					 size_t size,
++ 					 const struct i915_refct_sgt_ops *ops)
++ {
++ 	kref_init(&rsgt->kref);
++ 	rsgt->table.sgl = NULL;
++ 	rsgt->size = size;
++ 	rsgt->ops = ops;
++ }
++ 
++ void i915_refct_sgt_init(struct i915_refct_sgt *rsgt, size_t size);
++ 
++ struct i915_refct_sgt *i915_rsgt_from_mm_node(const struct drm_mm_node *node,
++ 					      u64 region_start,
++ 					      u32 page_alignment);
++ 
++ struct i915_refct_sgt *i915_rsgt_from_buddy_resource(struct ttm_resource *res,
++ 						     u64 region_start,
++ 						     u32 page_alignment);
++ 
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  #endif
+diff --cc drivers/gpu/drm/i915/intel_region_ttm.c
+index 82a6727ede46,575d67bc6ffe..000000000000
+--- a/drivers/gpu/drm/i915/intel_region_ttm.c
++++ b/drivers/gpu/drm/i915/intel_region_ttm.c
+@@@ -166,19 -160,27 +166,26 @@@ void intel_region_ttm_fini(struct intel
+   *
+   * Return: A malloced sg_table on success, an error pointer on failure.
+   */
+++<<<<<<< HEAD
+ +struct sg_table *intel_region_ttm_node_to_st(struct intel_memory_region *mem,
+ +					     struct ttm_resource *res)
+++=======
++ struct i915_refct_sgt *
++ intel_region_ttm_resource_to_rsgt(struct intel_memory_region *mem,
++ 				  struct ttm_resource *res,
++ 				  u32 page_alignment)
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  {
+ -	if (mem->is_range_manager) {
+ -		struct ttm_range_mgr_node *range_node =
+ -			to_ttm_range_mgr_node(res);
+ -
+ -		return i915_rsgt_from_mm_node(&range_node->mm_nodes[0],
+ -					      mem->region.start,
+ -					      page_alignment);
+ -	} else {
+ -		return i915_rsgt_from_buddy_resource(res, mem->region.start,
+ -						     page_alignment);
+ -	}
+ +	struct ttm_range_mgr_node *range_node =
+ +		container_of(res, typeof(*range_node), base);
+ +
+ +	GEM_WARN_ON(!mem->is_range_manager);
+ +	return i915_sg_from_mm_node(&range_node->mm_nodes[0],
+ +				    mem->region.start);
+  }
+  
+ -#ifdef CONFIG_DRM_I915_SELFTEST
+  /**
+ - * intel_region_ttm_resource_alloc - Allocate memory resources from a region
+ + * intel_region_ttm_node_alloc - Allocate memory resources from a region
+   * @mem: The memory region,
+   * @size: The requested size in bytes
+   * @flags: Allocation flags
+diff --cc drivers/gpu/drm/i915/intel_region_ttm.h
+index 11b0574ab791,5bb8d8b582ae..000000000000
+--- a/drivers/gpu/drm/i915/intel_region_ttm.h
++++ b/drivers/gpu/drm/i915/intel_region_ttm.h
+@@@ -19,16 -20,25 +19,23 @@@ void intel_region_ttm_device_fini(struc
+  
+  int intel_region_ttm_init(struct intel_memory_region *mem);
+  
+ -int intel_region_ttm_fini(struct intel_memory_region *mem);
+ +void intel_region_ttm_fini(struct intel_memory_region *mem);
+  
+++<<<<<<< HEAD
+ +struct sg_table *intel_region_ttm_node_to_st(struct intel_memory_region *mem,
+ +					     struct ttm_resource *res);
+++=======
++ struct i915_refct_sgt *
++ intel_region_ttm_resource_to_rsgt(struct intel_memory_region *mem,
++ 				  struct ttm_resource *res,
++ 				  u32 page_alignment);
+++>>>>>>> 9306b2b2dfce (drm/i915/ttm: fix 32b build)
+  
+ -void intel_region_ttm_resource_free(struct intel_memory_region *mem,
+ -				    struct ttm_resource *res);
+ -
+ -int intel_region_to_ttm_type(const struct intel_memory_region *mem);
+ -
+ -struct ttm_device_funcs *i915_ttm_driver(void);
+ -
+ -#ifdef CONFIG_DRM_I915_SELFTEST
+  struct ttm_resource *
+ -intel_region_ttm_resource_alloc(struct intel_memory_region *mem,
+ -				resource_size_t offset,
+ -				resource_size_t size,
+ -				unsigned int flags);
+ -#endif
+ +intel_region_ttm_node_alloc(struct intel_memory_region *mem,
+ +			    resource_size_t size,
+ +			    unsigned int flags);
+ +
+ +void intel_region_ttm_node_free(struct intel_memory_region *mem,
+ +				struct ttm_resource *node);
+  #endif /* _INTEL_REGION_TTM_H_ */
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_ttm.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_region.c
+* Unmerged path drivers/gpu/drm/i915/gem/i915_gem_ttm.c
+* Unmerged path drivers/gpu/drm/i915/i915_scatterlist.c
+* Unmerged path drivers/gpu/drm/i915/i915_scatterlist.h
+* Unmerged path drivers/gpu/drm/i915/intel_region_ttm.c
+* Unmerged path drivers/gpu/drm/i915/intel_region_ttm.h
