@@ -457,6 +457,7 @@ struct nfp_bpf_subprog_info {
  * @subprog_cnt: number of sub-programs, including main function
  * @map_records: the map record pointers from bpf->maps_neutral
  * @subprog: pointer to an array of objects holding info about sub-programs
+ * @n_insns: number of instructions on @insns list
  * @insns: list of BPF instruction wrappers (struct nfp_insn_meta)
  */
 struct nfp_prog {
@@ -489,6 +490,7 @@ struct nfp_prog {
 	struct nfp_bpf_neutral_map **map_records;
 	struct nfp_bpf_subprog_info *subprog;
 
+	unsigned int n_insns;
 	struct list_head insns;
 };
 
@@ -505,7 +507,7 @@ struct nfp_bpf_vnic {
 };
 
 bool nfp_is_subprog_start(struct nfp_insn_meta *meta);
-void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog, unsigned int cnt);
+void nfp_bpf_jit_prepare(struct nfp_prog *nfp_prog);
 int nfp_bpf_jit(struct nfp_prog *prog);
 bool nfp_bpf_supported_opcode(u8 code);
 
@@ -526,7 +528,7 @@ int nfp_net_bpf_offload(struct nfp_net *nn, struct bpf_prog *prog,
 
 struct nfp_insn_meta *
 nfp_bpf_goto_meta(struct nfp_prog *nfp_prog, struct nfp_insn_meta *meta,
-		  unsigned int insn_idx, unsigned int n_insns);
+		  unsigned int insn_idx);
 
 void *nfp_bpf_relo_for_vnic(struct nfp_prog *nfp_prog, struct nfp_bpf_vnic *bv);
 
