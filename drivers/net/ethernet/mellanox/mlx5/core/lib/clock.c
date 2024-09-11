@@ -441,8 +441,6 @@ static int mlx5_ptp_verify(struct ptp_clock_info *ptp, unsigned int pin,
 	default:
 		return -EOPNOTSUPP;
 	}
-
-	return -EOPNOTSUPP;
 }
 
 static const struct ptp_clock_info mlx5_ptp_clock_info = {
