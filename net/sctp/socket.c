@@ -1695,6 +1695,7 @@ static int sctp_sendmsg_new_asoc(struct sock *sk, __u16 sflags,
 	struct sctp_association *asoc;
 	enum sctp_scope scope;
 	struct cmsghdr *cmsg;
+	__be32 flowinfo = 0;
 	struct sctp_af *af;
 	int err;
 
@@ -1779,6 +1780,9 @@ static int sctp_sendmsg_new_asoc(struct sock *sk, __u16 sflags,
 	if (!cmsgs->addrs_msg)
 		return 0;
 
+	if (daddr->sa.sa_family == AF_INET6)
+		flowinfo = daddr->v6.sin6_flowinfo;
+
 	/* sendv addr list parse */
 	for_each_cmsghdr(cmsg, cmsgs->addrs_msg) {
 		struct sctp_transport *transport;
@@ -1811,6 +1815,7 @@ static int sctp_sendmsg_new_asoc(struct sock *sk, __u16 sflags,
 			}
 
 			dlen = sizeof(struct in6_addr);
+			daddr->v6.sin6_flowinfo = flowinfo;
 			daddr->v6.sin6_family = AF_INET6;
 			daddr->v6.sin6_port = htons(asoc->peer.port);
 			memcpy(&daddr->v6.sin6_addr, CMSG_DATA(cmsg), dlen);
