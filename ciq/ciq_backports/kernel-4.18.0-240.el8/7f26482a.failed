@@ -1,0 +1,437 @@
+locking/percpu-rwsem: Remove the embedded rwsem
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit 7f26482a872c36b2ee87ea95b9dcd96e3d5805df
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/7f26482a.failed
+
+The filesystem freezer uses percpu-rwsem in a way that is effectively
+write_non_owner() and achieves this with a few horrible hacks that
+rely on the rwsem (!percpu) implementation.
+
+When PREEMPT_RT replaces the rwsem implementation with a PI aware
+variant this comes apart.
+
+Remove the embedded rwsem and implement it using a waitqueue and an
+atomic_t.
+
+ - make readers_block an atomic, and use it, with the waitqueue
+   for a blocking test-and-set write-side.
+
+ - have the read-side wait for the 'lock' state to clear.
+
+Have the waiters use FIFO queueing and mark them (reader/writer) with
+a new WQ_FLAG. Use a custom wake_function to wake either a single
+writer or all readers until a writer.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Ingo Molnar <mingo@kernel.org>
+	Reviewed-by: Davidlohr Bueso <dbueso@suse.de>
+	Acked-by: Will Deacon <will@kernel.org>
+	Acked-by: Waiman Long <longman@redhat.com>
+	Tested-by: Juri Lelli <juri.lelli@redhat.com>
+Link: https://lkml.kernel.org/r/20200204092403.GB14879@hirez.programming.kicks-ass.net
+(cherry picked from commit 7f26482a872c36b2ee87ea95b9dcd96e3d5805df)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/percpu-rwsem.h
+#	kernel/locking/percpu-rwsem.c
+#	kernel/locking/rwsem.h
+diff --cc include/linux/percpu-rwsem.h
+index 1b3a8d20c1ca,f5ecf6a8a1dd..000000000000
+--- a/include/linux/percpu-rwsem.h
++++ b/include/linux/percpu-rwsem.h
+@@@ -12,21 -12,37 +12,35 @@@
+  struct percpu_rw_semaphore {
+  	struct rcu_sync		rss;
+  	unsigned int __percpu	*read_count;
+++<<<<<<< HEAD
+ +	struct rw_semaphore	rw_sem; /* slowpath */
+ +	struct rcuwait          writer; /* blocked writer */
+ +	int			readers_block;
+++=======
++ 	struct rcuwait		writer;
++ 	wait_queue_head_t	waiters;
++ 	atomic_t		block;
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	struct lockdep_map	dep_map;
++ #endif
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  };
+  
+ -#ifdef CONFIG_DEBUG_LOCK_ALLOC
+ -#define __PERCPU_RWSEM_DEP_MAP_INIT(lockname)	.dep_map = { .name = #lockname },
+ -#else
+ -#define __PERCPU_RWSEM_DEP_MAP_INIT(lockname)
+ -#endif
+ -
+ -#define __DEFINE_PERCPU_RWSEM(name, is_static)				\
+ +#define DEFINE_STATIC_PERCPU_RWSEM(name)				\
+  static DEFINE_PER_CPU(unsigned int, __percpu_rwsem_rc_##name);		\
+ -is_static struct percpu_rw_semaphore name = {				\
+ -	.rss = __RCU_SYNC_INITIALIZER(name.rss),			\
+ +static struct percpu_rw_semaphore name = {				\
+ +	.rss = __RCU_SYNC_INITIALIZER(name.rss, RCU_SCHED_SYNC),	\
+  	.read_count = &__percpu_rwsem_rc_##name,			\
+- 	.rw_sem = __RWSEM_INITIALIZER(name.rw_sem),			\
+  	.writer = __RCUWAIT_INITIALIZER(name.writer),			\
+++<<<<<<< HEAD
+++=======
++ 	.waiters = __WAIT_QUEUE_HEAD_INITIALIZER(name.waiters),		\
++ 	.block = ATOMIC_INIT(0),					\
++ 	__PERCPU_RWSEM_DEP_MAP_INIT(name)				\
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  }
+  
+ -#define DEFINE_PERCPU_RWSEM(name)		\
+ -	__DEFINE_PERCPU_RWSEM(name, /* not static */)
+ -#define DEFINE_STATIC_PERCPU_RWSEM(name)	\
+ -	__DEFINE_PERCPU_RWSEM(name, static)
+ -
+ -extern bool __percpu_down_read(struct percpu_rw_semaphore *, bool);
+ +extern int __percpu_down_read(struct percpu_rw_semaphore *, int);
+  extern void __percpu_up_read(struct percpu_rw_semaphore *);
+  
+  static inline void percpu_down_read(struct percpu_rw_semaphore *sem)
+@@@ -116,21 -130,13 +130,29 @@@ extern void percpu_free_rwsem(struct pe
+  static inline void percpu_rwsem_release(struct percpu_rw_semaphore *sem,
+  					bool read, unsigned long ip)
+  {
+++<<<<<<< HEAD
+ +	lock_release(&sem->rw_sem.dep_map, 1, ip);
+ +#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ +	if (!read)
+ +		atomic_long_set(&sem->rw_sem.owner, RWSEM_OWNER_UNKNOWN);
+ +#endif
+++=======
++ 	lock_release(&sem->dep_map, ip);
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  }
+  
+  static inline void percpu_rwsem_acquire(struct percpu_rw_semaphore *sem,
+  					bool read, unsigned long ip)
+  {
+++<<<<<<< HEAD
+ +	lock_acquire(&sem->rw_sem.dep_map, 0, 1, read, 1, NULL, ip);
+ +#ifdef CONFIG_RWSEM_SPIN_ON_OWNER
+ +	if (!read)
+ +		atomic_long_set(&sem->rw_sem.owner, (long)current);
+ +#endif
+++=======
++ 	lock_acquire(&sem->dep_map, 0, 1, read, 1, NULL, ip);
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  }
+  
+  #endif
+diff --cc kernel/locking/percpu-rwsem.c
+index eb5134b6ac21,a136677543b4..000000000000
+--- a/kernel/locking/percpu-rwsem.c
++++ b/kernel/locking/percpu-rwsem.c
+@@@ -1,26 -1,29 +1,36 @@@
+ -// SPDX-License-Identifier: GPL-2.0-only
+  #include <linux/atomic.h>
+- #include <linux/rwsem.h>
+  #include <linux/percpu.h>
++ #include <linux/wait.h>
+  #include <linux/lockdep.h>
+  #include <linux/percpu-rwsem.h>
+  #include <linux/rcupdate.h>
+  #include <linux/sched.h>
++ #include <linux/sched/task.h>
+  #include <linux/errno.h>
+  
+- #include "rwsem.h"
+- 
+  int __percpu_init_rwsem(struct percpu_rw_semaphore *sem,
+ -			const char *name, struct lock_class_key *key)
+ +			const char *name, struct lock_class_key *rwsem_key)
+  {
+  	sem->read_count = alloc_percpu(int);
+  	if (unlikely(!sem->read_count))
+  		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	/* ->rw_sem represents the whole percpu_rw_semaphore for lockdep */
+ +	rcu_sync_init(&sem->rss, RCU_SCHED_SYNC);
+ +	__init_rwsem(&sem->rw_sem, name, rwsem_key);
+ +	rcuwait_init(&sem->writer);
+ +	sem->readers_block = 0;
+++=======
++ 	rcu_sync_init(&sem->rss);
++ 	rcuwait_init(&sem->writer);
++ 	init_waitqueue_head(&sem->waiters);
++ 	atomic_set(&sem->block, 0);
++ #ifdef CONFIG_DEBUG_LOCK_ALLOC
++ 	debug_check_no_locks_freed((void *)sem, sizeof(*sem));
++ 	lockdep_init_map(&sem->dep_map, name, key, 0);
++ #endif
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  	return 0;
+  }
+  EXPORT_SYMBOL_GPL(__percpu_init_rwsem);
+@@@ -62,36 -65,115 +72,130 @@@ int __percpu_down_read(struct percpu_rw
+  	smp_mb(); /* A matches D */
+  
+  	/*
+- 	 * If !readers_block the critical section starts here, matched by the
++ 	 * If !sem->block the critical section starts here, matched by the
+  	 * release in percpu_up_write().
+  	 */
+++<<<<<<< HEAD
+ +	if (likely(!smp_load_acquire(&sem->readers_block)))
+ +		return 1;
+ +
+ +	/*
+ +	 * Per the above comment; we still have preemption disabled and
+ +	 * will thus decrement on the same CPU as we incremented.
+ +	 */
+ +	__percpu_up_read(sem);
+++=======
++ 	if (likely(!atomic_read_acquire(&sem->block)))
++ 		return true;
+  
+- 	if (try)
+- 		return 0;
++ 	__this_cpu_dec(*sem->read_count);
+  
+- 	/*
+- 	 * We either call schedule() in the wait, or we'll fall through
+- 	 * and reschedule on the preempt_enable() in percpu_down_read().
+- 	 */
+- 	preempt_enable_no_resched();
++ 	/* Prod writer to re-evaluate readers_active_check() */
++ 	rcuwait_wake_up(&sem->writer);
++ 
++ 	return false;
++ }
++ 
++ static inline bool __percpu_down_write_trylock(struct percpu_rw_semaphore *sem)
++ {
++ 	if (atomic_read(&sem->block))
++ 		return false;
++ 
++ 	return atomic_xchg(&sem->block, 1) == 0;
++ }
++ 
++ static bool __percpu_rwsem_trylock(struct percpu_rw_semaphore *sem, bool reader)
++ {
++ 	if (reader) {
++ 		bool ret;
++ 
++ 		preempt_disable();
++ 		ret = __percpu_down_read_trylock(sem);
++ 		preempt_enable();
++ 
++ 		return ret;
++ 	}
++ 	return __percpu_down_write_trylock(sem);
++ }
++ 
++ /*
++  * The return value of wait_queue_entry::func means:
++  *
++  *  <0 - error, wakeup is terminated and the error is returned
++  *   0 - no wakeup, a next waiter is tried
++  *  >0 - woken, if EXCLUSIVE, counted towards @nr_exclusive.
++  *
++  * We use EXCLUSIVE for both readers and writers to preserve FIFO order,
++  * and play games with the return value to allow waking multiple readers.
++  *
++  * Specifically, we wake readers until we've woken a single writer, or until a
++  * trylock fails.
++  */
++ static int percpu_rwsem_wake_function(struct wait_queue_entry *wq_entry,
++ 				      unsigned int mode, int wake_flags,
++ 				      void *key)
++ {
++ 	struct task_struct *p = get_task_struct(wq_entry->private);
++ 	bool reader = wq_entry->flags & WQ_FLAG_CUSTOM;
++ 	struct percpu_rw_semaphore *sem = key;
++ 
++ 	/* concurrent against percpu_down_write(), can get stolen */
++ 	if (!__percpu_rwsem_trylock(sem, reader))
++ 		return 1;
++ 
++ 	list_del_init(&wq_entry->entry);
++ 	smp_store_release(&wq_entry->private, NULL);
++ 
++ 	wake_up_process(p);
++ 	put_task_struct(p);
++ 
++ 	return !reader; /* wake (readers until) 1 writer */
++ }
++ 
++ static void percpu_rwsem_wait(struct percpu_rw_semaphore *sem, bool reader)
++ {
++ 	DEFINE_WAIT_FUNC(wq_entry, percpu_rwsem_wake_function);
++ 	bool wait;
+  
++ 	spin_lock_irq(&sem->waiters.lock);
+  	/*
+- 	 * Avoid lockdep for the down/up_read() we already have them.
++ 	 * Serialize against the wakeup in percpu_up_write(), if we fail
++ 	 * the trylock, the wakeup must see us on the list.
+  	 */
+- 	__down_read(&sem->rw_sem);
+- 	this_cpu_inc(*sem->read_count);
+- 	__up_read(&sem->rw_sem);
++ 	wait = !__percpu_rwsem_trylock(sem, reader);
++ 	if (wait) {
++ 		wq_entry.flags |= WQ_FLAG_EXCLUSIVE | reader * WQ_FLAG_CUSTOM;
++ 		__add_wait_queue_entry_tail(&sem->waiters, &wq_entry);
++ 	}
++ 	spin_unlock_irq(&sem->waiters.lock);
+  
++ 	while (wait) {
++ 		set_current_state(TASK_UNINTERRUPTIBLE);
++ 		if (!smp_load_acquire(&wq_entry.private))
++ 			break;
++ 		schedule();
++ 	}
++ 	__set_current_state(TASK_RUNNING);
++ }
++ 
++ bool __percpu_down_read(struct percpu_rw_semaphore *sem, bool try)
++ {
++ 	if (__percpu_down_read_trylock(sem))
++ 		return true;
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
++ 
++ 	if (try)
+ -		return false;
+++		return 0;
++ 
++ 	preempt_enable();
++ 	percpu_rwsem_wait(sem, /* .reader = */ true);
+  	preempt_disable();
+++<<<<<<< HEAD
+ +	return 1;
+++=======
++ 
++ 	return true;
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  }
+  EXPORT_SYMBOL_GPL(__percpu_down_read);
+  
+@@@ -146,23 -230,24 +252,26 @@@ void percpu_down_write(struct percpu_rw
+  	/* Notify readers to take the slow path. */
+  	rcu_sync_enter(&sem->rss);
+  
+++<<<<<<< HEAD
+ +	down_write(&sem->rw_sem);
+- 
+++=======
+  	/*
+- 	 * Notify new readers to block; up until now, and thus throughout the
+- 	 * longish rcu_sync_enter() above, new readers could still come in.
++ 	 * Try set sem->block; this provides writer-writer exclusion.
++ 	 * Having sem->block set makes new readers block.
+  	 */
+- 	WRITE_ONCE(sem->readers_block, 1);
++ 	if (!__percpu_down_write_trylock(sem))
++ 		percpu_rwsem_wait(sem, /* .reader = */ false);
+  
+- 	smp_mb(); /* D matches A */
++ 	/* smp_mb() implied by __percpu_down_write_trylock() on success -- D matches A */
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  
+  	/*
+- 	 * If they don't see our writer of readers_block, then we are
+- 	 * guaranteed to see their sem->read_count increment, and therefore
+- 	 * will wait for them.
++ 	 * If they don't see our store of sem->block, then we are guaranteed to
++ 	 * see their sem->read_count increment, and therefore will wait for
++ 	 * them.
+  	 */
+  
+- 	/* Wait for all now active readers to complete. */
++ 	/* Wait for all active readers to complete. */
+  	rcuwait_wait_event(&sem->writer, readers_active_check(sem));
+  }
+  EXPORT_SYMBOL_GPL(percpu_down_write);
+@@@ -179,12 -266,12 +288,16 @@@ void percpu_up_write(struct percpu_rw_s
+  	 * Therefore we force it through the slow path which guarantees an
+  	 * acquire and thereby guarantees the critical section's consistency.
+  	 */
+- 	smp_store_release(&sem->readers_block, 0);
++ 	atomic_set_release(&sem->block, 0);
+  
+  	/*
+- 	 * Release the write lock, this will allow readers back in the game.
++ 	 * Prod any pending reader/writer to make progress.
+  	 */
+++<<<<<<< HEAD
+ +	up_write(&sem->rw_sem);
+++=======
++ 	__wake_up(&sem->waiters, TASK_NORMAL, 1, sem);
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+  
+  	/*
+  	 * Once this completes (at least one RCU-sched grace period hence) the
+diff --cc kernel/locking/rwsem.h
+index 2534ce49f648,e69de29bb2d1..000000000000
+--- a/kernel/locking/rwsem.h
++++ b/kernel/locking/rwsem.h
+@@@ -1,10 -1,0 +1,13 @@@
+++<<<<<<< HEAD
+ +/* SPDX-License-Identifier: GPL-2.0 */
+ +
+ +#ifndef __INTERNAL_RWSEM_H
+ +#define __INTERNAL_RWSEM_H
+ +#include <linux/rwsem.h>
+ +
+ +extern void __down_read(struct rw_semaphore *sem);
+ +extern void __up_read(struct rw_semaphore *sem);
+ +
+ +#endif /* __INTERNAL_RWSEM_H */
+++=======
+++>>>>>>> 7f26482a872c (locking/percpu-rwsem: Remove the embedded rwsem)
+* Unmerged path include/linux/percpu-rwsem.h
+diff --git a/include/linux/wait.h b/include/linux/wait.h
+index f13a97b710eb..eac44d13c3ce 100644
+--- a/include/linux/wait.h
++++ b/include/linux/wait.h
+@@ -20,6 +20,7 @@ int default_wake_function(struct wait_queue_entry *wq_entry, unsigned mode, int
+ #define WQ_FLAG_EXCLUSIVE	0x01
+ #define WQ_FLAG_WOKEN		0x02
+ #define WQ_FLAG_BOOKMARK	0x04
++#define WQ_FLAG_CUSTOM		0x08
+ 
+ /*
+  * A single wait-queue entry structure:
+* Unmerged path kernel/locking/percpu-rwsem.c
+diff --git a/kernel/locking/rwsem.c b/kernel/locking/rwsem.c
+index cd8da9df6e07..fbc541bb8a40 100644
+--- a/kernel/locking/rwsem.c
++++ b/kernel/locking/rwsem.c
+@@ -30,7 +30,6 @@
+ #include <linux/rwsem.h>
+ #include <linux/atomic.h>
+ 
+-#include "rwsem.h"
+ #include "lock_events.h"
+ 
+ #ifndef RWSEM_INIT_ONLY
+@@ -1346,7 +1345,7 @@ static struct rw_semaphore *rwsem_downgrade_wake(struct rw_semaphore *sem)
+ /*
+  * lock for reading
+  */
+-inline void __down_read(struct rw_semaphore *sem)
++static inline void __down_read(struct rw_semaphore *sem)
+ {
+ 	if (!rwsem_read_trylock(sem)) {
+ 		rwsem_down_read_slowpath(sem, TASK_UNINTERRUPTIBLE);
+@@ -1434,7 +1433,7 @@ static inline int __down_write_trylock(struct rw_semaphore *sem)
+ /*
+  * unlock after reading
+  */
+-inline void __up_read(struct rw_semaphore *sem)
++static inline void __up_read(struct rw_semaphore *sem)
+ {
+ 	long tmp;
+ 
+* Unmerged path kernel/locking/rwsem.h
