@@ -1,0 +1,97 @@
+dm ioctl: return UUID in DM_LIST_DEVICES_CMD result
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mikulas Patocka <mpatocka@redhat.com>
+commit 8b638081bd4520f63db1defc660666ec5f65bc15
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/8b638081.failed
+
+When LVM needs to find a device with a particular UUID it needs to ask for
+UUID for each device. This patch returns UUID directly in the list of
+devices, so that LVM doesn't have to query all the devices with an ioctl.
+The UUID is returned if the flag DM_UUID_FLAG is set in the parameters.
+
+Returning UUID is done in backward-compatible way. There's one unused
+32-bit word value after the event number. This patch sets the bit
+DM_NAME_LIST_FLAG_HAS_UUID if UUID is present and
+DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID if it isn't (if none of these bits is
+set, then we have an old kernel that doesn't support returning UUIDs). The
+UUID is stored after this word. The 'next' value is updated to point after
+the UUID, so that old version of libdevmapper will skip the UUID without
+attempting to interpret it.
+
+	Signed-off-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 8b638081bd4520f63db1defc660666ec5f65bc15)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/uapi/linux/dm-ioctl.h
+diff --cc include/uapi/linux/dm-ioctl.h
+index 4933b6b67b85,e5c6e458bdf7..000000000000
+--- a/include/uapi/linux/dm-ioctl.h
++++ b/include/uapi/linux/dm-ioctl.h
+@@@ -272,9 -286,9 +286,15 @@@ enum 
+  #define DM_DEV_SET_GEOMETRY	_IOWR(DM_IOCTL, DM_DEV_SET_GEOMETRY_CMD, struct dm_ioctl)
+  
+  #define DM_VERSION_MAJOR	4
+++<<<<<<< HEAD
+ +#define DM_VERSION_MINOR	43
+ +#define DM_VERSION_PATCHLEVEL	0
+ +#define DM_VERSION_EXTRA	"-ioctl (2020-10-01)"
+++=======
++ #define DM_VERSION_MINOR	45
++ #define DM_VERSION_PATCHLEVEL	0
++ #define DM_VERSION_EXTRA	"-ioctl (2021-03-22)"
+++>>>>>>> 8b638081bd45 (dm ioctl: return UUID in DM_LIST_DEVICES_CMD result)
+  
+  /* Status bits */
+  #define DM_READONLY_FLAG	(1 << 0) /* In/Out */
+diff --git a/drivers/md/dm-ioctl.c b/drivers/md/dm-ioctl.c
+index 00ee0e0b399c..34ab85f701ea 100644
+--- a/drivers/md/dm-ioctl.c
++++ b/drivers/md/dm-ioctl.c
+@@ -558,7 +558,9 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
+ 	for (n = rb_first(&name_rb_tree); n; n = rb_next(n)) {
+ 		hc = container_of(n, struct hash_cell, name_node);
+ 		needed += align_val(offsetof(struct dm_name_list, name) + strlen(hc->name) + 1);
+-		needed += align_val(sizeof(uint32_t));
++		needed += align_val(sizeof(uint32_t) * 2);
++		if (param->flags & DM_UUID_FLAG && hc->uuid)
++			needed += align_val(strlen(hc->uuid) + 1);
+ 	}
+ 
+ 	/*
+@@ -577,6 +579,7 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
+ 	 * Now loop through filling out the names.
+ 	 */
+ 	for (n = rb_first(&name_rb_tree); n; n = rb_next(n)) {
++		void *uuid_ptr;
+ 		hc = container_of(n, struct hash_cell, name_node);
+ 		if (old_nl)
+ 			old_nl->next = (uint32_t) ((void *) nl -
+@@ -588,8 +591,19 @@ static int list_devices(struct file *filp, struct dm_ioctl *param, size_t param_
+ 
+ 		old_nl = nl;
+ 		event_nr = align_ptr(nl->name + strlen(hc->name) + 1);
+-		*event_nr = dm_get_event_nr(hc->md);
+-		nl = align_ptr(event_nr + 1);
++		event_nr[0] = dm_get_event_nr(hc->md);
++		event_nr[1] = 0;
++		uuid_ptr = align_ptr(event_nr + 2);
++		if (param->flags & DM_UUID_FLAG) {
++			if (hc->uuid) {
++				event_nr[1] |= DM_NAME_LIST_FLAG_HAS_UUID;
++				strcpy(uuid_ptr, hc->uuid);
++				uuid_ptr = align_ptr(uuid_ptr + strlen(hc->uuid) + 1);
++			} else {
++				event_nr[1] |= DM_NAME_LIST_FLAG_DOESNT_HAVE_UUID;
++			}
++		}
++		nl = uuid_ptr;
+ 	}
+ 	/*
+ 	 * If mismatch happens, security may be compromised due to buffer
+* Unmerged path include/uapi/linux/dm-ioctl.h
