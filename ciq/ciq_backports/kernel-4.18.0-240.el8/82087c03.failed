@@ -1,0 +1,185 @@
+net/smc: switch smcd_dev_list spinlock to mutex
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ursula Braun <ubraun@linux.ibm.com>
+commit 82087c0330534d18e6db25869871e589d214b7fa
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/82087c03.failed
+
+The similar smc_ib_devices spinlock has been converted to a mutex.
+Protecting the smcd_dev_list by a mutex is possible as well. This
+patch converts the smcd_dev_list spinlock to a mutex.
+
+Fixes: c6ba7c9ba43d ("net/smc: add base infrastructure for SMC-D and ISM")
+	Signed-off-by: Ursula Braun <ubraun@linux.ibm.com>
+	Signed-off-by: Karsten Graul <kgraul@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 82087c0330534d18e6db25869871e589d214b7fa)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/smc/smc_ism.c
+diff --cc net/smc/smc_ism.c
+index 32be2da2cb85,998c525de785..000000000000
+--- a/net/smc/smc_ism.c
++++ b/net/smc/smc_ism.c
+@@@ -317,19 -318,25 +318,25 @@@ EXPORT_SYMBOL_GPL(smcd_alloc_dev)
+  
+  int smcd_register_dev(struct smcd_dev *smcd)
+  {
+- 	spin_lock(&smcd_dev_list.lock);
++ 	mutex_lock(&smcd_dev_list.mutex);
+  	list_add_tail(&smcd->list, &smcd_dev_list.list);
+- 	spin_unlock(&smcd_dev_list.lock);
++ 	mutex_unlock(&smcd_dev_list.mutex);
+  
+ -	pr_warn_ratelimited("smc: adding smcd device %s with pnetid %.16s%s\n",
+ -			    dev_name(&smcd->dev), smcd->pnetid,
+ -			    smcd->pnetid_by_user ? " (user defined)" : "");
+ -
+  	return device_add(&smcd->dev);
+  }
+  EXPORT_SYMBOL_GPL(smcd_register_dev);
+  
+  void smcd_unregister_dev(struct smcd_dev *smcd)
+  {
+++<<<<<<< HEAD
+ +	spin_lock(&smcd_dev_list.lock);
+++=======
++ 	pr_warn_ratelimited("smc: removing smcd device %s\n",
++ 			    dev_name(&smcd->dev));
++ 	mutex_lock(&smcd_dev_list.mutex);
+++>>>>>>> 82087c033053 (net/smc: switch smcd_dev_list spinlock to mutex)
+  	list_del_init(&smcd->list);
+- 	spin_unlock(&smcd_dev_list.lock);
++ 	mutex_unlock(&smcd_dev_list.mutex);
+  	smcd->going_away = 1;
+  	smc_smcd_terminate_all(smcd);
+  	flush_workqueue(smcd->event_wq);
+diff --git a/net/smc/smc_core.c b/net/smc/smc_core.c
+index 399bc3ffb64e..8dcf26e774cf 100644
+--- a/net/smc/smc_core.c
++++ b/net/smc/smc_core.c
+@@ -1614,11 +1614,11 @@ static void smc_core_going_away(void)
+ 	}
+ 	spin_unlock(&smc_ib_devices.lock);
+ 
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	list_for_each_entry(smcd, &smcd_dev_list.list, list) {
+ 		smcd->going_away = 1;
+ 	}
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ }
+ 
+ /* Clean up all SMC link groups */
+@@ -1630,10 +1630,10 @@ static void smc_lgrs_shutdown(void)
+ 
+ 	smc_smcr_terminate_all(NULL);
+ 
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	list_for_each_entry(smcd, &smcd_dev_list.list, list)
+ 		smc_smcd_terminate_all(smcd);
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ }
+ 
+ static int smc_core_reboot_event(struct notifier_block *this,
+* Unmerged path net/smc/smc_ism.c
+diff --git a/net/smc/smc_ism.h b/net/smc/smc_ism.h
+index 4da946cbfa29..81cc4537efd3 100644
+--- a/net/smc/smc_ism.h
++++ b/net/smc/smc_ism.h
+@@ -10,12 +10,13 @@
+ #define SMCD_ISM_H
+ 
+ #include <linux/uio.h>
++#include <linux/mutex.h>
+ 
+ #include "smc.h"
+ 
+ struct smcd_dev_list {	/* List of SMCD devices */
+ 	struct list_head list;
+-	spinlock_t lock;	/* Protects list of devices */
++	struct mutex mutex;	/* Protects list of devices */
+ };
+ 
+ extern struct smcd_dev_list	smcd_dev_list; /* list of smcd devices */
+diff --git a/net/smc/smc_pnet.c b/net/smc/smc_pnet.c
+index ae595dc27284..e014d8623dc4 100644
+--- a/net/smc/smc_pnet.c
++++ b/net/smc/smc_pnet.c
+@@ -139,7 +139,7 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
+ 	}
+ 	spin_unlock(&smc_ib_devices.lock);
+ 	/* remove smcd devices */
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	list_for_each_entry(smcd_dev, &smcd_dev_list.list, list) {
+ 		if (smcd_dev->pnetid_by_user &&
+ 		    (!pnet_name ||
+@@ -149,7 +149,7 @@ static int smc_pnet_remove_by_pnetid(struct net *net, char *pnet_name)
+ 			rc = 0;
+ 		}
+ 	}
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ 	return rc;
+ }
+ 
+@@ -234,13 +234,13 @@ static bool smc_pnet_apply_smcd(struct smcd_dev *smcd_dev, char *pnet_name)
+ 	u8 pnet_null[SMC_MAX_PNETID_LEN] = {0};
+ 	bool applied = false;
+ 
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	if (smc_pnet_match(smcd_dev->pnetid, pnet_null)) {
+ 		memcpy(smcd_dev->pnetid, pnet_name, SMC_MAX_PNETID_LEN);
+ 		smcd_dev->pnetid_by_user = true;
+ 		applied = true;
+ 	}
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ 	return applied;
+ }
+ 
+@@ -296,7 +296,7 @@ static struct smcd_dev *smc_pnet_find_smcd(char *smcd_name)
+ {
+ 	struct smcd_dev *smcd_dev;
+ 
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	list_for_each_entry(smcd_dev, &smcd_dev_list.list, list) {
+ 		if (!strncmp(dev_name(&smcd_dev->dev), smcd_name,
+ 			     IB_DEVICE_NAME_MAX - 1))
+@@ -304,7 +304,7 @@ static struct smcd_dev *smc_pnet_find_smcd(char *smcd_name)
+ 	}
+ 	smcd_dev = NULL;
+ out:
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ 	return smcd_dev;
+ }
+ 
+@@ -883,7 +883,7 @@ static void smc_pnet_find_ism_by_pnetid(struct net_device *ndev,
+ 	    smc_pnet_find_ndev_pnetid_by_table(ndev, ndev_pnetid))
+ 		return; /* pnetid could not be determined */
+ 
+-	spin_lock(&smcd_dev_list.lock);
++	mutex_lock(&smcd_dev_list.mutex);
+ 	list_for_each_entry(ismdev, &smcd_dev_list.list, list) {
+ 		if (smc_pnet_match(ismdev->pnetid, ndev_pnetid) &&
+ 		    !ismdev->going_away) {
+@@ -891,7 +891,7 @@ static void smc_pnet_find_ism_by_pnetid(struct net_device *ndev,
+ 			break;
+ 		}
+ 	}
+-	spin_unlock(&smcd_dev_list.lock);
++	mutex_unlock(&smcd_dev_list.mutex);
+ }
+ 
+ /* PNET table analysis for a given sock:
