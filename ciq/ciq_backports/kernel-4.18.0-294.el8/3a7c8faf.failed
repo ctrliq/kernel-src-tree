@@ -1,0 +1,256 @@
+x86/kvm: Restrict ASYNC_PF to user space
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [x86] kvm: Restrict ASYNC_PF to user space (Vitaly Kuznetsov) [1882793]
+Rebuild_FUZZ: 94.74%
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 3a7c8fafd1b42adea229fd204132f6a2fb3cd2d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/3a7c8faf.failed
+
+The async page fault injection into kernel space creates more problems than
+it solves. The host has absolutely no knowledge about the state of the
+guest if the fault happens in CPL0. The only restriction for the host is
+interrupt disabled state. If interrupts are enabled in the guest then the
+exception can hit arbitrary code. The HALT based wait in non-preemotible
+code is a hacky replacement for a proper hypercall.
+
+For the ongoing work to restrict instrumentation and make the RCU idle
+interaction well defined the required extra work for supporting async
+pagefault in CPL0 is just not justified and creates complexity for a
+dubious benefit.
+
+The CPL3 injection is well defined and does not cause any issues as it is
+more or less the same as a regular page fault from CPL3.
+
+	Suggested-by: Andy Lutomirski <luto@kernel.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Alexandre Chartre <alexandre.chartre@oracle.com>
+	Acked-by: Paolo Bonzini <pbonzini@redhat.com>
+	Acked-by: Peter Zijlstra <peterz@infradead.org>
+Link: https://lkml.kernel.org/r/20200505134059.369802541@linutronix.de
+
+
+(cherry picked from commit 3a7c8fafd1b42adea229fd204132f6a2fb3cd2d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/kvm.c
+diff --cc arch/x86/kernel/kvm.c
+index 34ea59cb4c95,b3d9b0d7a37d..000000000000
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@@ -86,7 -75,6 +86,10 @@@ struct kvm_task_sleep_node 
+  	struct swait_queue_head wq;
+  	u32 token;
+  	int cpu;
+++<<<<<<< HEAD
+ +	bool halted;
+++=======
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  };
+  
+  static struct kvm_task_sleep_head {
+@@@ -109,11 -97,7 +112,15 @@@ static struct kvm_task_sleep_node *_fin
+  	return NULL;
+  }
+  
+++<<<<<<< HEAD
+ +/*
+ + * @interrupt_kernel: Is this called from a routine which interrupts the kernel
+ + * 		      (other than user space)?
+ + */
+ +void kvm_async_pf_task_wait(u32 token, int interrupt_kernel)
+++=======
++ static bool kvm_async_pf_queue_task(u32 token, struct kvm_task_sleep_node *n)
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  {
+  	u32 key = hash_32(token, KVM_TASK_SLEEP_HASHBITS);
+  	struct kvm_task_sleep_head *b = &async_pf_sleepers[key];
+@@@ -127,59 -108,53 +134,103 @@@
+  	if (e) {
+  		/* dummy entry exist -> wake up was delivered ahead of PF */
+  		hlist_del(&e->link);
+ -		raw_spin_unlock(&b->lock);
+  		kfree(e);
+ -		return false;
+ +		raw_spin_unlock(&b->lock);
+ +
+++<<<<<<< HEAD
+ +		rcu_irq_exit();
+ +		return;
+ +	}
+ +
+ +	n.token = token;
+ +	n.cpu = smp_processor_id();
+ +	n.halted = is_idle_task(current) ||
+ +		   (IS_ENABLED(CONFIG_PREEMPT_COUNT)
+ +		    ? preempt_count() > 1 || rcu_preempt_depth()
+ +		    : interrupt_kernel);
+ +	init_swait_queue_head(&n.wq);
+ +	hlist_add_head(&n.link, &b->list);
+ +	raw_spin_unlock(&b->lock);
+ +
+ +	for (;;) {
+ +		if (!n.halted)
+ +			prepare_to_swait_exclusive(&n.wq, &wait, TASK_UNINTERRUPTIBLE);
+ +		if (hlist_unhashed(&n.link))
+ +			break;
+ +
+ +		rcu_irq_exit();
+ +
+ +		if (!n.halted) {
+ +			local_irq_enable();
+ +			schedule();
+ +			local_irq_disable();
+ +		} else {
+ +			/*
+ +			 * We cannot reschedule. So halt.
+ +			 */
+ +			native_safe_halt();
+ +			local_irq_disable();
+ +		}
+ +
+ +		rcu_irq_enter();
+  	}
+ +	if (!n.halted)
+ +		finish_swait(&n.wq, &wait);
+  
+ +	rcu_irq_exit();
+ +	return;
+ +}
+ +EXPORT_SYMBOL_GPL(kvm_async_pf_task_wait);
+++=======
++ 	n->token = token;
++ 	n->cpu = smp_processor_id();
++ 	init_swait_queue_head(&n->wq);
++ 	hlist_add_head(&n->link, &b->list);
++ 	raw_spin_unlock(&b->lock);
++ 	return true;
++ }
++ 
++ /*
++  * kvm_async_pf_task_wait_schedule - Wait for pagefault to be handled
++  * @token:	Token to identify the sleep node entry
++  *
++  * Invoked from the async pagefault handling code or from the VM exit page
++  * fault handler. In both cases RCU is watching.
++  */
++ void kvm_async_pf_task_wait_schedule(u32 token)
++ {
++ 	struct kvm_task_sleep_node n;
++ 	DECLARE_SWAITQUEUE(wait);
++ 
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	if (!kvm_async_pf_queue_task(token, &n))
++ 		return;
++ 
++ 	for (;;) {
++ 		prepare_to_swait_exclusive(&n.wq, &wait, TASK_UNINTERRUPTIBLE);
++ 		if (hlist_unhashed(&n.link))
++ 			break;
++ 
++ 		local_irq_enable();
++ 		schedule();
++ 		local_irq_disable();
++ 	}
++ 	finish_swait(&n.wq, &wait);
++ }
++ EXPORT_SYMBOL_GPL(kvm_async_pf_task_wait_schedule);
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  
+  static void apf_task_wake_one(struct kvm_task_sleep_node *n)
+  {
+  	hlist_del_init(&n->link);
+++<<<<<<< HEAD
+ +	if (n->halted)
+ +		smp_send_reschedule(n->cpu);
+ +	else if (swq_has_sleeper(&n->wq))
+++=======
++ 	if (swq_has_sleeper(&n->wq))
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  		swake_up_one(&n->wq);
+  }
+  
+@@@ -255,29 -232,39 +306,49 @@@ u32 kvm_read_and_reset_pf_reason(void
+  EXPORT_SYMBOL_GPL(kvm_read_and_reset_pf_reason);
+  NOKPROBE_SYMBOL(kvm_read_and_reset_pf_reason);
+  
+ -bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ +dotraplinkage void
+ +do_async_page_fault(struct pt_regs *regs, unsigned long error_code)
+  {
+ -	u32 reason = kvm_read_and_reset_pf_reason();
+ +	enum ctx_state prev_state;
+  
+ -	switch (reason) {
+ +	switch (kvm_read_and_reset_pf_reason()) {
+ +	default:
+++<<<<<<< HEAD
+ +		do_page_fault(regs, error_code);
+ +		break;
+  	case KVM_PV_REASON_PAGE_NOT_PRESENT:
+ -	case KVM_PV_REASON_PAGE_READY:
+ +		/* page is swapped out by the host. */
+ +		prev_state = exception_enter();
+ +		kvm_async_pf_task_wait((u32)read_cr2(), !user_mode(regs));
+ +		exception_exit(prev_state);
+  		break;
+ -	default:
+ +	case KVM_PV_REASON_PAGE_READY:
+++=======
++ 		return false;
++ 	}
++ 
++ 	/*
++ 	 * If the host managed to inject an async #PF into an interrupt
++ 	 * disabled region, then die hard as this is not going to end well
++ 	 * and the host side is seriously broken.
++ 	 */
++ 	if (unlikely(!(regs->flags & X86_EFLAGS_IF)))
++ 		panic("Host injected async #PF in interrupt disabled region\n");
++ 
++ 	if (reason == KVM_PV_REASON_PAGE_NOT_PRESENT) {
++ 		if (unlikely(!(user_mode(regs))))
++ 			panic("Host injected async #PF in kernel mode\n");
++ 		/* Page is swapped out by the host. */
++ 		kvm_async_pf_task_wait_schedule(token);
++ 	} else {
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  		rcu_irq_enter();
+ -		kvm_async_pf_task_wake(token);
+ +		kvm_async_pf_task_wake((u32)read_cr2());
+  		rcu_irq_exit();
+ +		break;
+  	}
+ -	return true;
+  }
+ -NOKPROBE_SYMBOL(__kvm_handle_async_pf);
+ +NOKPROBE_SYMBOL(do_async_page_fault);
+  
+  static void __init paravirt_ops_setup(void)
+  {
+@@@ -323,11 -310,11 +394,19 @@@ static notrace void kvm_guest_apic_eoi_
+  static void kvm_guest_cpu_init(void)
+  {
+  	if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF) && kvmapf) {
+++<<<<<<< HEAD
+ +		u64 pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
+ +
+ +#ifdef CONFIG_PREEMPTION
+ +		pa |= KVM_ASYNC_PF_SEND_ALWAYS;
+ +#endif
+++=======
++ 		u64 pa;
++ 
++ 		WARN_ON_ONCE(!static_branch_likely(&kvm_async_pf_enabled));
++ 
++ 		pa = slow_virt_to_phys(this_cpu_ptr(&apf_reason));
+++>>>>>>> 3a7c8fafd1b4 (x86/kvm: Restrict ASYNC_PF to user space)
+  		pa |= KVM_ASYNC_PF_ENABLED;
+  
+  		if (kvm_para_has_feature(KVM_FEATURE_ASYNC_PF_VMEXIT))
+* Unmerged path arch/x86/kernel/kvm.c
