@@ -1,0 +1,111 @@
+virtiofs: do not use fuse_fill_super_common() for device installation
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Vivek Goyal <vgoyal@redhat.com>
+commit 7fd3abfa8dd7c08ecacd25b2f9f9e1d3fb642440
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/7fd3abfa.failed
+
+fuse_fill_super_common() allocates and installs one fuse_device.  Hence
+virtiofs allocates and install all fuse devices by itself except one.
+
+This makes logic little twisted.  There does not seem to be any real need
+that why virtiofs can't allocate and install all fuse devices itself.
+
+So opt out of fuse device allocation and installation while calling
+fuse_fill_super_common().
+
+Regular fuse still wants fuse_fill_super_common() to install fuse_device.
+It needs to prevent against races where two mounters are trying to mount
+fuse using same fd.  In that case one will succeed while other will get
+-EINVAL.
+
+virtiofs does not have this issue because sget_fc() resolves the race
+w.r.t multiple mounters and only one instance of virtio_fs_fill_super()
+should be in progress for same filesystem.
+
+	Signed-off-by: Vivek Goyal <vgoyal@redhat.com>
+	Signed-off-by: Miklos Szeredi <mszeredi@redhat.com>
+(cherry picked from commit 7fd3abfa8dd7c08ecacd25b2f9f9e1d3fb642440)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/fuse/inode.c
+diff --cc fs/fuse/inode.c
+index 10b75246113a,6fae66cc096a..000000000000
+--- a/fs/fuse/inode.c
++++ b/fs/fuse/inode.c
+@@@ -1122,9 -1111,9 +1122,9 @@@ void fuse_dev_free(struct fuse_dev *fud
+  }
+  EXPORT_SYMBOL_GPL(fuse_dev_free);
+  
+ -int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *ctx)
+ +int fuse_fill_super_common(struct super_block *sb, struct fuse_fs_context *d)
+  {
+- 	struct fuse_dev *fud;
++ 	struct fuse_dev *fud = NULL;
+  	struct fuse_conn *fc = get_fuse_conn_super(sb);
+  	struct inode *root;
+  	struct dentry *root_dentry;
+@@@ -1199,7 -1194,7 +1202,11 @@@
+  
+  	mutex_lock(&fuse_mutex);
+  	err = -EINVAL;
+++<<<<<<< HEAD
+ +	if (*d->fudptr)
+++=======
++ 	if (ctx->fudptr && *ctx->fudptr)
+++>>>>>>> 7fd3abfa8dd7 (virtiofs: do not use fuse_fill_super_common() for device installation)
+  		goto err_unlock;
+  
+  	err = fuse_ctl_add_conn(fc);
+@@@ -1208,7 -1203,8 +1215,12 @@@
+  
+  	list_add_tail(&fc->entry, &fuse_conn_list);
+  	sb->s_root = root_dentry;
+++<<<<<<< HEAD
+ +	*d->fudptr = fud;
+++=======
++ 	if (ctx->fudptr)
++ 		*ctx->fudptr = fud;
+++>>>>>>> 7fd3abfa8dd7 (virtiofs: do not use fuse_fill_super_common() for device installation)
+  	mutex_unlock(&fuse_mutex);
+  	return 0;
+  
+* Unmerged path fs/fuse/inode.c
+diff --git a/fs/fuse/virtio_fs.c b/fs/fuse/virtio_fs.c
+index 63e1997356e1..5740e89db3ac 100644
+--- a/fs/fuse/virtio_fs.c
++++ b/fs/fuse/virtio_fs.c
+@@ -1102,7 +1102,7 @@ static int virtio_fs_fill_super(struct super_block *sb)
+ 
+ 	err = -ENOMEM;
+ 	/* Allocate fuse_dev for hiprio and notification queues */
+-	for (i = 0; i < VQ_REQUEST; i++) {
++	for (i = 0; i < fs->nvqs; i++) {
+ 		struct virtio_fs_vq *fsvq = &fs->vqs[i];
+ 
+ 		fsvq->fud = fuse_dev_alloc();
+@@ -1110,18 +1110,15 @@ static int virtio_fs_fill_super(struct super_block *sb)
+ 			goto err_free_fuse_devs;
+ 	}
+ 
+-	ctx.fudptr = (void **)&fs->vqs[VQ_REQUEST].fud;
++	/* virtiofs allocates and installs its own fuse devices */
++	ctx.fudptr = NULL;
+ 	err = fuse_fill_super_common(sb, &ctx);
+ 	if (err < 0)
+ 		goto err_free_fuse_devs;
+ 
+-	fc = fs->vqs[VQ_REQUEST].fud->fc;
+-
+ 	for (i = 0; i < fs->nvqs; i++) {
+ 		struct virtio_fs_vq *fsvq = &fs->vqs[i];
+ 
+-		if (i == VQ_REQUEST)
+-			continue; /* already initialized */
+ 		fuse_dev_install(fsvq->fud, fc);
+ 	}
+ 
