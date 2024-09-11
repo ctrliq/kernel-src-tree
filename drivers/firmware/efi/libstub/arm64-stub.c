@@ -83,6 +83,10 @@ efi_status_t handle_kernel_image(efi_system_table_t *sys_table_arg,
 	if (preferred_offset < dram_base)
 		preferred_offset += MIN_KIMG_ALIGN;
 
+	if (!IS_ALIGNED((u64)_text, EFI_KIMG_ALIGN))
+		efi_err("FIRMWARE BUG: kernel image not aligned on %ldk boundary\n",
+			EFI_KIMG_ALIGN >> 10);
+
 	kernel_size = _edata - _text;
 	kernel_memsize = kernel_size + (_end - _edata);
 
