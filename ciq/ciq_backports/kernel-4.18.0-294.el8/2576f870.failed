@@ -1,0 +1,107 @@
+bpf, netns: Fix use-after-free in pernet pre_exit callback
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Jakub Sitnicki <jakub@cloudflare.com>
+commit 2576f87066dc08a11cb1c05f11d1eaa02148ef9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/2576f870.failed
+
+Iterating over BPF links attached to network namespace in pre_exit hook is
+not safe, even if there is just one. Once link gets auto-detached, that is
+its back-pointer to net object is set to NULL, the link can be released and
+freed without waiting on netns_bpf_mutex, effectively causing the list
+element we are operating on to be freed.
+
+This leads to use-after-free when trying to access the next element on the
+list, as reported by KASAN. Bug can be triggered by destroying a network
+namespace, while also releasing a link attached to this network namespace.
+
+| ==================================================================
+| BUG: KASAN: use-after-free in netns_bpf_pernet_pre_exit+0xd9/0x130
+| Read of size 8 at addr ffff888119e0d778 by task kworker/u8:2/177
+|
+| CPU: 3 PID: 177 Comm: kworker/u8:2 Not tainted 5.8.0-rc1-00197-ga0c04c9d1008-dirty #776
+| Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS ?-20190727_073836-buildvm-ppc64le-16.ppc.fedoraproject.org-3.fc31 04/01/2014
+| Workqueue: netns cleanup_net
+| Call Trace:
+|  dump_stack+0x9e/0xe0
+|  print_address_description.constprop.0+0x3a/0x60
+|  ? netns_bpf_pernet_pre_exit+0xd9/0x130
+|  kasan_report.cold+0x1f/0x40
+|  ? netns_bpf_pernet_pre_exit+0xd9/0x130
+|  netns_bpf_pernet_pre_exit+0xd9/0x130
+|  cleanup_net+0x30b/0x5b0
+|  ? unregister_pernet_device+0x50/0x50
+|  ? rcu_read_lock_bh_held+0xb0/0xb0
+|  ? _raw_spin_unlock_irq+0x24/0x50
+|  process_one_work+0x4d1/0xa10
+|  ? lock_release+0x3e0/0x3e0
+|  ? pwq_dec_nr_in_flight+0x110/0x110
+|  ? rwlock_bug.part.0+0x60/0x60
+|  worker_thread+0x7a/0x5c0
+|  ? process_one_work+0xa10/0xa10
+|  kthread+0x1e3/0x240
+|  ? kthread_create_on_node+0xd0/0xd0
+|  ret_from_fork+0x1f/0x30
+|
+| Allocated by task 280:
+|  save_stack+0x1b/0x40
+|  __kasan_kmalloc.constprop.0+0xc2/0xd0
+|  netns_bpf_link_create+0xfe/0x650
+|  __do_sys_bpf+0x153a/0x2a50
+|  do_syscall_64+0x59/0x300
+|  entry_SYSCALL_64_after_hwframe+0x44/0xa9
+|
+| Freed by task 198:
+|  save_stack+0x1b/0x40
+|  __kasan_slab_free+0x12f/0x180
+|  kfree+0xed/0x350
+|  process_one_work+0x4d1/0xa10
+|  worker_thread+0x7a/0x5c0
+|  kthread+0x1e3/0x240
+|  ret_from_fork+0x1f/0x30
+|
+| The buggy address belongs to the object at ffff888119e0d700
+|  which belongs to the cache kmalloc-192 of size 192
+| The buggy address is located 120 bytes inside of
+|  192-byte region [ffff888119e0d700, ffff888119e0d7c0)
+| The buggy address belongs to the page:
+| page:ffffea0004678340 refcount:1 mapcount:0 mapping:0000000000000000 index:0x0
+| flags: 0x2fffe0000000200(slab)
+| raw: 02fffe0000000200 ffffea00045ba8c0 0000000600000006 ffff88811a80ea80
+| raw: 0000000000000000 0000000000100010 00000001ffffffff 0000000000000000
+| page dumped because: kasan: bad access detected
+|
+| Memory state around the buggy address:
+|  ffff888119e0d600: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+|  ffff888119e0d680: fb fb fb fb fb fb fb fb fc fc fc fc fc fc fc fc
+| >ffff888119e0d700: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+|                                                                 ^
+|  ffff888119e0d780: fb fb fb fb fb fb fb fb fc fc fc fc fc fc fc fc
+|  ffff888119e0d800: fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb fb
+| ==================================================================
+
+Remove the "fast-path" for releasing a link that got auto-detached by a
+dying network namespace to fix it. This way as long as link is on the list
+and netns_bpf mutex is held, we have a guarantee that link memory can be
+accessed.
+
+An alternative way to fix this issue would be to safely iterate over the
+list of links and ensure there is no access to link object after detaching
+it. But, at the moment, optimizing synchronization overhead on link release
+without a workload in mind seems like an overkill.
+
+Fixes: ab53cad90eb1 ("bpf, netns: Keep a list of attached bpf_link's")
+	Signed-off-by: Jakub Sitnicki <jakub@cloudflare.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+	Acked-by: Yonghong Song <yhs@fb.com>
+Link: https://lore.kernel.org/bpf/20200630164541.1329993-1-jakub@cloudflare.com
+(cherry picked from commit 2576f87066dc08a11cb1c05f11d1eaa02148ef9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/net_namespace.c
+* Unmerged path kernel/bpf/net_namespace.c
+* Unmerged path kernel/bpf/net_namespace.c
