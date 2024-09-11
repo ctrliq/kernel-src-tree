@@ -1,0 +1,373 @@
+bpf: move memory size checks to bpf_map_charge_init()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit c85d69135a9175c50a823d04d62d932312d037b3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c85d6913.failed
+
+Most bpf map types doing similar checks and bytes to pages
+conversion during memory allocation and charging.
+
+Let's unify these checks by moving them into bpf_map_charge_init().
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Acked-by: Song Liu <songliubraving@fb.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+(cherry picked from commit c85d69135a9175c50a823d04d62d932312d037b3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/bpf.h
+#	kernel/bpf/cpumap.c
+#	kernel/bpf/devmap.c
+#	kernel/bpf/hashtab.c
+#	kernel/bpf/local_storage.c
+#	kernel/bpf/lpm_trie.c
+#	kernel/bpf/reuseport_array.c
+#	kernel/bpf/stackmap.c
+#	kernel/bpf/syscall.c
+#	kernel/bpf/xskmap.c
+#	net/core/bpf_sk_storage.c
+#	net/core/sock_map.c
+diff --cc include/linux/bpf.h
+index 987bb6c2e407,e5a309e6a400..000000000000
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@@ -628,9 -650,12 +628,16 @@@ struct bpf_map *__bpf_map_get(struct f
+  struct bpf_map * __must_check bpf_map_inc(struct bpf_map *map, bool uref);
+  void bpf_map_put_with_uref(struct bpf_map *map);
+  void bpf_map_put(struct bpf_map *map);
+ +int bpf_map_precharge_memlock(u32 pages);
+  int bpf_map_charge_memlock(struct bpf_map *map, u32 pages);
+  void bpf_map_uncharge_memlock(struct bpf_map *map, u32 pages);
+++<<<<<<< HEAD
+++=======
++ int bpf_map_charge_init(struct bpf_map_memory *mem, size_t size);
++ void bpf_map_charge_finish(struct bpf_map_memory *mem);
++ void bpf_map_charge_move(struct bpf_map_memory *dst,
++ 			 struct bpf_map_memory *src);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  void *bpf_map_area_alloc(size_t size, int numa_node);
+  void bpf_map_area_free(void *base);
+  void bpf_map_init_from_attr(struct bpf_map *map, union bpf_attr *attr);
+diff --cc kernel/bpf/cpumap.c
+index cf727d77c6c6,b31a71909307..000000000000
+--- a/kernel/bpf/cpumap.c
++++ b/kernel/bpf/cpumap.c
+@@@ -106,12 -106,9 +106,18 @@@ static struct bpf_map *cpu_map_alloc(un
+  	/* make sure page count doesn't overflow */
+  	cost = (u64) cmap->map.max_entries * sizeof(struct bpf_cpu_map_entry *);
+  	cost += cpu_map_bitmap_size(attr) * num_possible_cpus();
+++<<<<<<< HEAD
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		goto free_cmap;
+ +	cmap->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	/* Notice returns -EPERM on if map size is larger than memlock limit */
+ +	ret = bpf_map_precharge_memlock(cmap->map.pages);
+++=======
++ 
++ 	/* Notice returns -EPERM on if map size is larger than memlock limit */
++ 	ret = bpf_map_charge_init(&cmap->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (ret) {
+  		err = ret;
+  		goto free_cmap;
+diff --cc kernel/bpf/devmap.c
+index cd8297b3bdb9,5ae7cce5ef16..000000000000
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@@ -100,13 -108,9 +100,16 @@@ static struct bpf_map *dev_map_alloc(un
+  	/* make sure page count doesn't overflow */
+  	cost = (u64) dtab->map.max_entries * sizeof(struct bpf_dtab_netdev *);
+  	cost += dev_map_bitmap_size(attr) * num_possible_cpus();
+- 	if (cost >= U32_MAX - PAGE_SIZE)
+- 		goto free_dtab;
+  
+++<<<<<<< HEAD
+ +	dtab->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	/* if map size is larger than memlock limit, reject it early */
+ +	err = bpf_map_precharge_memlock(dtab->map.pages);
+++=======
++ 	/* if map size is larger than memlock limit, reject it */
++ 	err = bpf_map_charge_init(&dtab->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (err)
+  		goto free_dtab;
+  
+diff --cc kernel/bpf/hashtab.c
+index 583df5cb302d,d92e05d9979b..000000000000
+--- a/kernel/bpf/hashtab.c
++++ b/kernel/bpf/hashtab.c
+@@@ -352,14 -360,8 +352,19 @@@ static struct bpf_map *htab_map_alloc(u
+  	else
+  	       cost += (u64) htab->elem_size * num_possible_cpus();
+  
+++<<<<<<< HEAD
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		/* make sure page count doesn't overflow */
+ +		goto free_htab;
+ +
+ +	htab->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	/* if map size is larger than memlock limit, reject it early */
+ +	err = bpf_map_precharge_memlock(htab->map.pages);
+++=======
++ 	/* if map size is larger than memlock limit, reject it */
++ 	err = bpf_map_charge_init(&htab->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (err)
+  		goto free_htab;
+  
+diff --cc kernel/bpf/local_storage.c
+index e48302ecb389,addd6fdceec8..000000000000
+--- a/kernel/bpf/local_storage.c
++++ b/kernel/bpf/local_storage.c
+@@@ -272,7 -272,7 +272,11 @@@ static struct bpf_map *cgroup_storage_m
+  {
+  	int numa_node = bpf_map_attr_numa_node(attr);
+  	struct bpf_cgroup_storage_map *map;
+++<<<<<<< HEAD
+ +	u32 pages;
+++=======
++ 	struct bpf_map_memory mem;
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	int ret;
+  
+  	if (attr->key_size != sizeof(struct bpf_cgroup_storage_key))
+@@@ -292,9 -292,7 +296,13 @@@
+  		/* max_entries is not used and enforced to be 0 */
+  		return ERR_PTR(-EINVAL);
+  
+++<<<<<<< HEAD
+ +	pages = round_up(sizeof(struct bpf_cgroup_storage_map), PAGE_SIZE) >>
+ +		PAGE_SHIFT;
+ +	ret = bpf_map_precharge_memlock(pages);
+++=======
++ 	ret = bpf_map_charge_init(&mem, sizeof(struct bpf_cgroup_storage_map));
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (ret < 0)
+  		return ERR_PTR(ret);
+  
+diff --cc kernel/bpf/lpm_trie.c
+index 864e2a496376,09334f13a8a0..000000000000
+--- a/kernel/bpf/lpm_trie.c
++++ b/kernel/bpf/lpm_trie.c
+@@@ -573,14 -573,8 +573,14 @@@ static struct bpf_map *trie_alloc(unio
+  	cost_per_node = sizeof(struct lpm_trie_node) +
+  			attr->value_size + trie->data_size;
+  	cost += (u64) attr->max_entries * cost_per_node;
+- 	if (cost >= U32_MAX - PAGE_SIZE) {
+- 		ret = -E2BIG;
+- 		goto out_err;
+- 	}
+  
+++<<<<<<< HEAD
+ +	trie->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	ret = bpf_map_precharge_memlock(trie->map.pages);
+++=======
++ 	ret = bpf_map_charge_init(&trie->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (ret)
+  		goto out_err;
+  
+diff --cc kernel/bpf/reuseport_array.c
+index 18e225de80ff,50c083ba978c..000000000000
+--- a/kernel/bpf/reuseport_array.c
++++ b/kernel/bpf/reuseport_array.c
+@@@ -151,7 -151,8 +151,12 @@@ static struct bpf_map *reuseport_array_
+  {
+  	int err, numa_node = bpf_map_attr_numa_node(attr);
+  	struct reuseport_array *array;
+++<<<<<<< HEAD
+ +	u64 cost, array_size;
+++=======
++ 	struct bpf_map_memory mem;
++ 	u64 array_size;
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  
+  	if (!capable(CAP_SYS_ADMIN))
+  		return ERR_PTR(-EPERM);
+@@@ -159,13 -160,7 +164,17 @@@
+  	array_size = sizeof(*array);
+  	array_size += (u64)attr->max_entries * sizeof(struct sock *);
+  
+++<<<<<<< HEAD
+ +	/* make sure there is no u32 overflow later in round_up() */
+ +	cost = array_size;
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		return ERR_PTR(-ENOMEM);
+ +	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+ +	err = bpf_map_precharge_memlock(cost);
+++=======
++ 	err = bpf_map_charge_init(&mem, array_size);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (err)
+  		return ERR_PTR(err);
+  
+diff --cc kernel/bpf/stackmap.c
+index 950ab2f28922,3d86072d8e32..000000000000
+--- a/kernel/bpf/stackmap.c
++++ b/kernel/bpf/stackmap.c
+@@@ -116,17 -117,16 +116,24 @@@ static struct bpf_map *stack_map_alloc(
+  	n_buckets = roundup_pow_of_two(attr->max_entries);
+  
+  	cost = n_buckets * sizeof(struct stack_map_bucket *) + sizeof(*smap);
+++<<<<<<< HEAD
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		return ERR_PTR(-E2BIG);
+++=======
++ 	cost += n_buckets * (value_size + sizeof(struct stack_map_bucket));
++ 	err = bpf_map_charge_init(&mem, cost);
++ 	if (err)
++ 		return ERR_PTR(err);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  
+  	smap = bpf_map_area_alloc(cost, bpf_map_attr_numa_node(attr));
+ -	if (!smap) {
+ -		bpf_map_charge_finish(&mem);
+ +	if (!smap)
+  		return ERR_PTR(-ENOMEM);
+ -	}
+ +
+ +	err = -E2BIG;
+ +	cost += n_buckets * (value_size + sizeof(struct stack_map_bucket));
+ +	if (cost >= U32_MAX - PAGE_SIZE)
+ +		goto free_smap;
+  
+  	bpf_map_init_from_attr(&smap->map, attr);
+  	smap->map.value_size = value_size;
+diff --cc kernel/bpf/syscall.c
+index ec2d27382d4b,4c53cbd3329d..000000000000
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@@ -227,15 -201,21 +227,28 @@@ static int bpf_charge_memlock(struct us
+  
+  static void bpf_uncharge_memlock(struct user_struct *user, u32 pages)
+  {
+ -	if (user)
+ -		atomic_long_sub(pages, &user->locked_vm);
+ +	atomic_long_sub(pages, &user->locked_vm);
+  }
+  
+++<<<<<<< HEAD
+ +static int bpf_map_init_memlock(struct bpf_map *map)
+++=======
++ int bpf_map_charge_init(struct bpf_map_memory *mem, size_t size)
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  {
+- 	struct user_struct *user = get_current_user();
++ 	u32 pages = round_up(size, PAGE_SIZE) >> PAGE_SHIFT;
++ 	struct user_struct *user;
+  	int ret;
+  
+++<<<<<<< HEAD
+ +	ret = bpf_charge_memlock(user, map->pages);
+++=======
++ 	if (size >= U32_MAX - PAGE_SIZE)
++ 		return -E2BIG;
++ 
++ 	user = get_current_user();
++ 	ret = bpf_charge_memlock(user, pages);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (ret) {
+  		free_uid(user);
+  		return ret;
+diff --cc kernel/bpf/xskmap.c
+index 686d244e798d,22066c28ba61..000000000000
+--- a/kernel/bpf/xskmap.c
++++ b/kernel/bpf/xskmap.c
+@@@ -37,13 -37,9 +37,15 @@@ static struct bpf_map *xsk_map_alloc(un
+  
+  	cost = (u64)m->map.max_entries * sizeof(struct xdp_sock *);
+  	cost += sizeof(struct list_head) * num_possible_cpus();
+- 	if (cost >= U32_MAX - PAGE_SIZE)
+- 		goto free_m;
+  
+ +	m->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +
+  	/* Notice returns -EPERM on if map size is larger than memlock limit */
+++<<<<<<< HEAD
+ +	err = bpf_map_precharge_memlock(m->map.pages);
+++=======
++ 	err = bpf_map_charge_init(&m->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (err)
+  		goto free_m;
+  
+diff --cc net/core/sock_map.c
+index c7ba68549e60,52d4faeee18b..000000000000
+--- a/net/core/sock_map.c
++++ b/net/core/sock_map.c
+@@@ -46,13 -44,7 +46,17 @@@ static struct bpf_map *sock_map_alloc(u
+  
+  	/* Make sure page count doesn't overflow. */
+  	cost = (u64) stab->map.max_entries * sizeof(struct sock *);
+++<<<<<<< HEAD
+ +	if (cost >= U32_MAX - PAGE_SIZE) {
+ +		err = -EINVAL;
+ +		goto free_stab;
+ +	}
+ +
+ +	stab->map.pages = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ +	err = bpf_map_precharge_memlock(stab->map.pages);
+++=======
++ 	err = bpf_map_charge_init(&stab->map.memory, cost);
+++>>>>>>> c85d69135a91 (bpf: move memory size checks to bpf_map_charge_init())
+  	if (err)
+  		goto free_stab;
+  
+* Unmerged path net/core/bpf_sk_storage.c
+* Unmerged path include/linux/bpf.h
+diff --git a/kernel/bpf/arraymap.c b/kernel/bpf/arraymap.c
+index a5f928e37b32..7e5fd58b85fe 100644
+--- a/kernel/bpf/arraymap.c
++++ b/kernel/bpf/arraymap.c
+@@ -108,14 +108,8 @@ static struct bpf_map *array_map_alloc(union bpf_attr *attr)
+ 
+ 	/* make sure there is no u32 overflow later in round_up() */
+ 	cost = array_size;
+-	if (cost >= U32_MAX - PAGE_SIZE)
+-		return ERR_PTR(-ENOMEM);
+-	if (percpu) {
++	if (percpu)
+ 		cost += (u64)attr->max_entries * elem_size * num_possible_cpus();
+-		if (cost >= U32_MAX - PAGE_SIZE)
+-			return ERR_PTR(-ENOMEM);
+-	}
+-	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ 
+ 	ret = bpf_map_precharge_memlock(cost);
+ 	if (ret < 0)
+* Unmerged path kernel/bpf/cpumap.c
+* Unmerged path kernel/bpf/devmap.c
+* Unmerged path kernel/bpf/hashtab.c
+* Unmerged path kernel/bpf/local_storage.c
+* Unmerged path kernel/bpf/lpm_trie.c
+diff --git a/kernel/bpf/queue_stack_maps.c b/kernel/bpf/queue_stack_maps.c
+index 0b140d236889..f864ea845676 100644
+--- a/kernel/bpf/queue_stack_maps.c
++++ b/kernel/bpf/queue_stack_maps.c
+@@ -72,10 +72,6 @@ static struct bpf_map *queue_stack_map_alloc(union bpf_attr *attr)
+ 
+ 	size = (u64) attr->max_entries + 1;
+ 	cost = queue_size = sizeof(*qs) + size * attr->value_size;
+-	if (cost >= U32_MAX - PAGE_SIZE)
+-		return ERR_PTR(-E2BIG);
+-
+-	cost = round_up(cost, PAGE_SIZE) >> PAGE_SHIFT;
+ 
+ 	ret = bpf_map_precharge_memlock(cost);
+ 	if (ret < 0)
+* Unmerged path kernel/bpf/reuseport_array.c
+* Unmerged path kernel/bpf/stackmap.c
+* Unmerged path kernel/bpf/syscall.c
+* Unmerged path kernel/bpf/xskmap.c
+* Unmerged path net/core/bpf_sk_storage.c
+* Unmerged path net/core/sock_map.c
