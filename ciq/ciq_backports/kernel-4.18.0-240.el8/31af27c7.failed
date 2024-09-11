@@ -1,0 +1,209 @@
+io_uring: don't count rqs failed after current one
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Pavel Begunkov <asml.silence@gmail.com>
+commit 31af27c7cc9f675d93a135dca99e6413f9096f1d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/31af27c7.failed
+
+When checking for draining with __req_need_defer(), it tries to match
+how many requests were sent before a current one with number of already
+completed. Dropped SQEs are included in req->sequence, and they won't
+ever appear in CQ. To compensate for that, __req_need_defer() substracts
+ctx->cached_sq_dropped.
+However, what it should really use is number of SQEs dropped __before__
+the current one. In other words, any submitted request shouldn't
+shouldn't affect dequeueing from the drain queue of previously submitted
+ones.
+
+Instead of saving proper ctx->cached_sq_dropped in each request,
+substract from req->sequence it at initialisation, so it includes number
+of properly submitted requests.
+
+note: it also changes behaviour of timeouts, but
+1. it's already diverge from the description because of using SQ
+2. the description is ambiguous regarding dropped SQEs
+
+	Signed-off-by: Pavel Begunkov <asml.silence@gmail.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 31af27c7cc9f675d93a135dca99e6413f9096f1d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 2afa3b27779e,381d50becd04..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -410,29 -929,44 +410,42 @@@ static struct io_ring_ctx *io_ring_ctx_
+  
+  	ctx->flags = p->flags;
+  	init_waitqueue_head(&ctx->cq_wait);
+ -	INIT_LIST_HEAD(&ctx->cq_overflow_list);
+ -	init_completion(&ctx->completions[0]);
+ -	init_completion(&ctx->completions[1]);
+ -	idr_init(&ctx->io_buffer_idr);
+ -	idr_init(&ctx->personality_idr);
+ +	init_completion(&ctx->ctx_done);
+ +	init_completion(&ctx->sqo_thread_started);
+  	mutex_init(&ctx->uring_lock);
+  	init_waitqueue_head(&ctx->wait);
+ +	for (i = 0; i < ARRAY_SIZE(ctx->pending_async); i++) {
+ +		spin_lock_init(&ctx->pending_async[i].lock);
+ +		INIT_LIST_HEAD(&ctx->pending_async[i].list);
+ +		atomic_set(&ctx->pending_async[i].cnt, 0);
+ +	}
+  	spin_lock_init(&ctx->completion_lock);
+  	INIT_LIST_HEAD(&ctx->poll_list);
+ +	INIT_LIST_HEAD(&ctx->cancel_list);
+  	INIT_LIST_HEAD(&ctx->defer_list);
+ -	INIT_LIST_HEAD(&ctx->timeout_list);
+ -	init_waitqueue_head(&ctx->inflight_wait);
+ -	spin_lock_init(&ctx->inflight_lock);
+ -	INIT_LIST_HEAD(&ctx->inflight_list);
+  	return ctx;
+ -err:
+ -	if (ctx->fallback_req)
+ -		kmem_cache_free(req_cachep, ctx->fallback_req);
+ -	kfree(ctx->completions);
+ -	kfree(ctx->cancel_hash);
+ -	kfree(ctx);
+ -	return NULL;
+  }
+  
+ -static inline bool __req_need_defer(struct io_kiocb *req)
+ +static inline bool io_sequence_defer(struct io_ring_ctx *ctx,
+ +				     struct io_kiocb *req)
+  {
+ -	struct io_ring_ctx *ctx = req->ctx;
+ +	if ((req->flags & (REQ_F_IO_DRAIN|REQ_F_IO_DRAINED)) != REQ_F_IO_DRAIN)
+ +		return false;
+  
+++<<<<<<< HEAD
+ +	return req->sequence != ctx->cached_cq_tail + ctx->sq_ring->dropped;
+++=======
++ 	return req->sequence != ctx->cached_cq_tail
++ 				+ atomic_read(&ctx->cached_cq_overflow);
++ }
++ 
++ static inline bool req_need_defer(struct io_kiocb *req)
++ {
++ 	if (unlikely(req->flags & REQ_F_IO_DRAIN))
++ 		return __req_need_defer(req);
++ 
++ 	return false;
+++>>>>>>> 31af27c7cc9f (io_uring: don't count rqs failed after current one)
+  }
+  
+  static struct io_kiocb *io_get_deferred_req(struct io_ring_ctx *ctx)
+@@@ -2415,27 -5770,88 +2428,97 @@@ static bool io_get_sqring(struct io_rin
+  	 * 2) allows the kernel side to track the head on its own, even
+  	 *    though the application is the one updating it.
+  	 */
+ -	head = READ_ONCE(sq_array[ctx->cached_sq_head & ctx->sq_mask]);
+ -	if (likely(head < ctx->sq_entries))
+ -		return &ctx->sq_sqes[head];
+ +	head = ctx->cached_sq_head;
+ +	/* make sure SQ entry isn't read before tail */
+ +	if (head == smp_load_acquire(&ring->r.tail))
+ +		return false;
+  
+ -	/* drop invalid entries */
+ -	ctx->cached_sq_dropped++;
+ -	WRITE_ONCE(ctx->rings->sq_dropped, ctx->cached_sq_dropped);
+ -	return NULL;
+ -}
+ +	head = READ_ONCE(ring->array[head & ctx->sq_mask]);
+ +	if (head < ctx->sq_entries) {
+ +		s->sqe = &ctx->sq_sqes[head];
+ +		s->sequence = ctx->cached_sq_head;
+ +		ctx->cached_sq_head++;
+ +		return true;
+ +	}
+  
+ -static inline void io_consume_sqe(struct io_ring_ctx *ctx)
+ -{
+ +	/* drop invalid entries */
+  	ctx->cached_sq_head++;
+ +	ring->dropped++;
+ +	return false;
+  }
+  
+++<<<<<<< HEAD
+ +static int io_submit_sqes(struct io_ring_ctx *ctx, struct sqe_submit *sqes,
+ +			  unsigned int nr, bool has_user, bool mm_fault)
+++=======
++ #define SQE_VALID_FLAGS	(IOSQE_FIXED_FILE|IOSQE_IO_DRAIN|IOSQE_IO_LINK|	\
++ 				IOSQE_IO_HARDLINK | IOSQE_ASYNC | \
++ 				IOSQE_BUFFER_SELECT)
++ 
++ static int io_init_req(struct io_ring_ctx *ctx, struct io_kiocb *req,
++ 		       const struct io_uring_sqe *sqe,
++ 		       struct io_submit_state *state, bool async)
++ {
++ 	unsigned int sqe_flags;
++ 	int id, fd;
++ 
++ 	/*
++ 	 * All io need record the previous position, if LINK vs DARIN,
++ 	 * it can be used to mark the position of the first IO in the
++ 	 * link list.
++ 	 */
++ 	req->sequence = ctx->cached_sq_head - ctx->cached_sq_dropped;
++ 	req->opcode = READ_ONCE(sqe->opcode);
++ 	req->user_data = READ_ONCE(sqe->user_data);
++ 	req->io = NULL;
++ 	req->file = NULL;
++ 	req->ctx = ctx;
++ 	req->flags = 0;
++ 	/* one is dropped after submission, the other at completion */
++ 	refcount_set(&req->refs, 2);
++ 	req->task = NULL;
++ 	req->result = 0;
++ 	req->needs_fixed_file = async;
++ 	INIT_IO_WORK(&req->work, io_wq_submit_work);
++ 
++ 	if (unlikely(req->opcode >= IORING_OP_LAST))
++ 		return -EINVAL;
++ 
++ 	if (io_op_defs[req->opcode].needs_mm && !current->mm) {
++ 		if (unlikely(!mmget_not_zero(ctx->sqo_mm)))
++ 			return -EFAULT;
++ 		use_mm(ctx->sqo_mm);
++ 	}
++ 
++ 	sqe_flags = READ_ONCE(sqe->flags);
++ 	/* enforce forwards compatibility on users */
++ 	if (unlikely(sqe_flags & ~SQE_VALID_FLAGS))
++ 		return -EINVAL;
++ 
++ 	if ((sqe_flags & IOSQE_BUFFER_SELECT) &&
++ 	    !io_op_defs[req->opcode].buffer_select)
++ 		return -EOPNOTSUPP;
++ 
++ 	id = READ_ONCE(sqe->personality);
++ 	if (id) {
++ 		req->work.creds = idr_find(&ctx->personality_idr, id);
++ 		if (unlikely(!req->work.creds))
++ 			return -EINVAL;
++ 		get_cred(req->work.creds);
++ 	}
++ 
++ 	/* same numerical values with corresponding REQ_F_*, safe to copy */
++ 	req->flags |= sqe_flags & (IOSQE_IO_DRAIN | IOSQE_IO_HARDLINK |
++ 					IOSQE_ASYNC | IOSQE_FIXED_FILE |
++ 					IOSQE_BUFFER_SELECT | IOSQE_IO_LINK);
++ 
++ 	fd = READ_ONCE(sqe->fd);
++ 	return io_req_set_file(state, req, fd, sqe_flags);
++ }
++ 
++ static int io_submit_sqes(struct io_ring_ctx *ctx, unsigned int nr,
++ 			  struct file *ring_file, int ring_fd, bool async)
+++>>>>>>> 31af27c7cc9f (io_uring: don't count rqs failed after current one)
+  {
+  	struct io_submit_state state, *statep = NULL;
+  	struct io_kiocb *link = NULL;
+* Unmerged path fs/io_uring.c
