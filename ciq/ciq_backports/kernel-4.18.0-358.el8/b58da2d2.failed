@@ -1,0 +1,166 @@
+nvme: update keep alive interval when kato is modified
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Tatsuya Sasaki <tatsuya6.sasaki@kioxia.com>
+commit b58da2d270dbcc67db73f15028774d27c85e16d7
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/b58da2d2.failed
+
+Currently the connection between host and NVMe-oF target gets
+disconnected by keep-alive timeout when a user connects to a target
+with a relatively large kato value and then sets the smaller kato
+with a set features command (e.g. connects with 60 seconds kato value
+and then sets 10 seconds kato value).
+
+The cause is that keep alive command interval on the host, which is
+defined as unsigned int kato in nvme_ctrl structure, does not follow
+the kato value changes.
+
+This patch updates the keep alive interval in the following steps when
+the kato is modified by a set features command: stops the keep alive
+work queue, then sets the kato as new timer value and re-start the queue.
+
+	Signed-off-by: Tatsuya Sasaki <tatsuya6.sasaki@kioxia.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit b58da2d270dbcc67db73f15028774d27c85e16d7)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index e310c0f15679,1c98a2f590ea..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -112,17 -112,13 +112,19 @@@ static struct class *nvme_subsys_class
+  static void nvme_put_subsystem(struct nvme_subsystem *subsys);
+  static void nvme_remove_invalid_namespaces(struct nvme_ctrl *ctrl,
+  					   unsigned nsid);
++ static void nvme_update_keep_alive(struct nvme_ctrl *ctrl,
++ 				   struct nvme_command *cmd);
+  
+ +static void nvme_update_bdev_size(struct gendisk *disk)
+ +{
+ +	struct block_device *bdev = bdget_disk(disk, 0);
+ +
+ +	if (bdev) {
+ +		bd_set_nr_sectors(bdev, get_capacity(disk));
+ +		bdput(bdev);
+ +	}
+ +}
+ +
+  /*
+   * Prepare a queue for teardown.
+   *
+@@@ -1204,80 -1170,45 +1207,106 @@@ static void nvme_passthru_end(struct nv
+  		nvme_queue_scan(ctrl);
+  		flush_work(&ctrl->scan_work);
+  	}
++ 
++ 	switch (cmd->common.opcode) {
++ 	case nvme_admin_set_features:
++ 		switch (le32_to_cpu(cmd->common.cdw10) & 0xFF) {
++ 		case NVME_FEAT_KATO:
++ 			/*
++ 			 * Keep alive commands interval on the host should be
++ 			 * updated when KATO is modified by Set Features
++ 			 * commands.
++ 			 */
++ 			if (!status)
++ 				nvme_update_keep_alive(ctrl, cmd);
++ 			break;
++ 		default:
++ 			break;
++ 		}
++ 		break;
++ 	default:
++ 		break;
++ 	}
+  }
+  
+ -int nvme_execute_passthru_rq(struct request *rq)
+ +void nvme_execute_passthru_rq(struct request *rq)
+  {
+  	struct nvme_command *cmd = nvme_req(rq)->cmd;
+  	struct nvme_ctrl *ctrl = nvme_req(rq)->ctrl;
+  	struct nvme_ns *ns = rq->q->queuedata;
+  	struct gendisk *disk = ns ? ns->disk : NULL;
+  	u32 effects;
+ -	int  ret;
+  
+  	effects = nvme_passthru_start(ctrl, ns, cmd->common.opcode);
+++<<<<<<< HEAD
+ +	blk_execute_rq(rq->q, disk, rq, 0);
+ +	nvme_passthru_end(ctrl, effects);
+ +}
+ +EXPORT_SYMBOL_GPL(nvme_execute_passthru_rq);
+++=======
++ 	ret = nvme_execute_rq(disk, rq, false);
++ 	if (effects) /* nothing to be done for zero cmd effects */
++ 		nvme_passthru_end(ctrl, effects, cmd, ret);
+++>>>>>>> b58da2d270db (nvme: update keep alive interval when kato is modified)
+ +
+ +static int nvme_submit_user_cmd(struct request_queue *q,
+ +		struct nvme_command *cmd, void __user *ubuffer,
+ +		unsigned bufflen, void __user *meta_buffer, unsigned meta_len,
+ +		u32 meta_seed, u64 *result, unsigned timeout)
+ +{
+ +	bool write = nvme_is_write(cmd);
+ +	struct nvme_ns *ns = q->queuedata;
+ +	struct gendisk *disk = ns ? ns->disk : NULL;
+ +	struct request *req;
+ +	struct bio *bio = NULL;
+ +	void *meta = NULL;
+ +	int ret;
+ +
+ +	req = nvme_alloc_request(q, cmd, 0);
+ +	if (IS_ERR(req))
+ +		return PTR_ERR(req);
+ +
+ +	if (timeout)
+ +		req->timeout = timeout;
+ +	nvme_req(req)->flags |= NVME_REQ_USERCMD;
+ +
+ +	if (ubuffer && bufflen) {
+ +		ret = blk_rq_map_user(q, req, NULL, ubuffer, bufflen,
+ +				GFP_KERNEL);
+ +		if (ret)
+ +			goto out;
+ +		bio = req->bio;
+ +		bio->bi_disk = disk;
+ +		if (disk && meta_buffer && meta_len) {
+ +			meta = nvme_add_user_metadata(bio, meta_buffer, meta_len,
+ +					meta_seed, write);
+ +			if (IS_ERR(meta)) {
+ +				ret = PTR_ERR(meta);
+ +				goto out_unmap;
+ +			}
+ +			req->cmd_flags |= REQ_INTEGRITY;
+ +		}
+ +	}
+  
+ +	nvme_execute_passthru_rq(req);
+ +	if (nvme_req(req)->flags & NVME_REQ_CANCELLED)
+ +		ret = -EINTR;
+ +	else
+ +		ret = nvme_req(req)->status;
+ +	if (result)
+ +		*result = le64_to_cpu(nvme_req(req)->result.u64);
+ +	if (meta && !ret && !write) {
+ +		if (copy_to_user(meta_buffer, meta, meta_len))
+ +			ret = -EFAULT;
+ +	}
+ +	kfree(meta);
+ + out_unmap:
+ +	if (bio)
+ +		blk_rq_unmap_user(bio);
+ + out:
+ +	blk_mq_free_request(req);
+  	return ret;
+  }
+ -EXPORT_SYMBOL_NS_GPL(nvme_execute_passthru_rq, NVME_TARGET_PASSTHRU);
+  
+  /*
+   * Recommended frequency for KATO commands per NVMe 1.4 section 7.12.1:
+* Unmerged path drivers/nvme/host/core.c
