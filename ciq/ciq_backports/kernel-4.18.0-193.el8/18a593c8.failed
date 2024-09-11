@@ -1,0 +1,163 @@
+powerpc/pseries: Protect against hogging the cpu while setting up the stats
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [powerpc] pseries: Protect against hogging the cpu while setting up the stats (Gustavo Duarte) [1723870]
+Rebuild_FUZZ: 94.37%
+commit-author Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+commit 18a593c8b5426f6a08bcb353636d761a83f78d9e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/18a593c8.failed
+
+When enabling or disabling the vcpu dispatch statistics, we do a lot of
+work including allocating/deallocating memory across all possible cpus
+for the DTL buffer. In order to guard against hogging the cpu for too
+long, track the time we're taking and yield the processor if necessary.
+
+	Signed-off-by: Naveen N. Rao <naveen.n.rao@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 18a593c8b5426f6a08bcb353636d761a83f78d9e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/lppaca.h
+diff --cc arch/powerpc/include/asm/lppaca.h
+index e45b7293414d,d7952665945a..000000000000
+--- a/arch/powerpc/include/asm/lppaca.h
++++ b/arch/powerpc/include/asm/lppaca.h
+@@@ -178,7 -201,8 +178,12 @@@ extern rwlock_t dtl_access_lock
+  extern void (*dtl_consumer)(struct dtl_entry *entry, u64 index);
+  
+  extern void register_dtl_buffer(int cpu);
+++<<<<<<< HEAD
+ +extern void alloc_dtl_buffers(void);
+++=======
++ extern void alloc_dtl_buffers(unsigned long *time_limit);
++ extern long hcall_vphn(unsigned long cpu, u64 flags, __be32 *associativity);
+++>>>>>>> 18a593c8b542 (powerpc/pseries: Protect against hogging the cpu while setting up the stats)
+  
+  #endif /* CONFIG_PPC_BOOK3S */
+  #endif /* __KERNEL__ */
+* Unmerged path arch/powerpc/include/asm/lppaca.h
+diff --git a/arch/powerpc/platforms/pseries/lpar.c b/arch/powerpc/platforms/pseries/lpar.c
+index fb13bb64bdb2..ebb3e0e5a601 100644
+--- a/arch/powerpc/platforms/pseries/lpar.c
++++ b/arch/powerpc/platforms/pseries/lpar.c
+@@ -76,7 +76,7 @@ static u8 dtl_mask = DTL_LOG_PREEMPT;
+ static u8 dtl_mask;
+ #endif
+ 
+-void alloc_dtl_buffers(void)
++void alloc_dtl_buffers(unsigned long *time_limit)
+ {
+ 	int cpu;
+ 	struct paca_struct *pp;
+@@ -100,6 +100,11 @@ void alloc_dtl_buffers(void)
+ 		pp->dispatch_log = dtl;
+ 		pp->dispatch_log_end = dtl + N_DISPATCH_LOG;
+ 		pp->dtl_curr = dtl;
++
++		if (time_limit && time_after(jiffies, *time_limit)) {
++			cond_resched();
++			*time_limit = jiffies + HZ;
++		}
+ 	}
+ }
+ 
+@@ -169,7 +174,7 @@ static int vcpudispatch_stats_freq = 50;
+ static __be32 *vcpu_associativity, *pcpu_associativity;
+ 
+ 
+-static void free_dtl_buffers(void)
++static void free_dtl_buffers(unsigned long *time_limit)
+ {
+ #ifndef CONFIG_VIRT_CPU_ACCOUNTING_NATIVE
+ 	int cpu;
+@@ -184,6 +189,11 @@ static void free_dtl_buffers(void)
+ 		pp->dispatch_log = 0;
+ 		pp->dispatch_log_end = 0;
+ 		pp->dtl_curr = 0;
++
++		if (time_limit && time_after(jiffies, *time_limit)) {
++			cond_resched();
++			*time_limit = jiffies + HZ;
++		}
+ 	}
+ #endif
+ }
+@@ -443,7 +453,7 @@ static void reset_global_dtl_mask(void)
+ 		lppaca_of(cpu).dtl_enable_mask = dtl_mask;
+ }
+ 
+-static int dtl_worker_enable(void)
++static int dtl_worker_enable(unsigned long *time_limit)
+ {
+ 	int rc = 0, state;
+ 
+@@ -455,13 +465,13 @@ static int dtl_worker_enable(void)
+ 	set_global_dtl_mask(DTL_LOG_ALL);
+ 
+ 	/* Setup dtl buffers and register those */
+-	alloc_dtl_buffers();
++	alloc_dtl_buffers(time_limit);
+ 
+ 	state = cpuhp_setup_state(CPUHP_AP_ONLINE_DYN, "powerpc/dtl:online",
+ 					dtl_worker_online, dtl_worker_offline);
+ 	if (state < 0) {
+ 		pr_err("vcpudispatch_stats: unable to setup workqueue for DTL processing\n");
+-		free_dtl_buffers();
++		free_dtl_buffers(time_limit);
+ 		reset_global_dtl_mask();
+ 		write_unlock(&dtl_access_lock);
+ 		rc = -EINVAL;
+@@ -473,10 +483,10 @@ static int dtl_worker_enable(void)
+ 	return rc;
+ }
+ 
+-static void dtl_worker_disable(void)
++static void dtl_worker_disable(unsigned long *time_limit)
+ {
+ 	cpuhp_remove_state(dtl_worker_state);
+-	free_dtl_buffers();
++	free_dtl_buffers(time_limit);
+ 	reset_global_dtl_mask();
+ 	write_unlock(&dtl_access_lock);
+ }
+@@ -484,6 +494,7 @@ static void dtl_worker_disable(void)
+ static ssize_t vcpudispatch_stats_write(struct file *file, const char __user *p,
+ 		size_t count, loff_t *ppos)
+ {
++	unsigned long time_limit = jiffies + HZ;
+ 	struct vcpu_dispatch_data *disp;
+ 	int rc, cmd, cpu;
+ 	char buf[16];
+@@ -518,13 +529,13 @@ static ssize_t vcpudispatch_stats_write(struct file *file, const char __user *p,
+ 			disp->last_disp_cpu = -1;
+ 		}
+ 
+-		rc = dtl_worker_enable();
++		rc = dtl_worker_enable(&time_limit);
+ 		if (rc) {
+ 			destroy_cpu_associativity();
+ 			goto out;
+ 		}
+ 	} else {
+-		dtl_worker_disable();
++		dtl_worker_disable(&time_limit);
+ 		destroy_cpu_associativity();
+ 	}
+ 
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index ba0eab388a41..20b967fbd06f 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -272,7 +272,7 @@ static int alloc_dispatch_logs(void)
+ 	if (!dtl_cache)
+ 		return 0;
+ 
+-	alloc_dtl_buffers();
++	alloc_dtl_buffers(0);
+ 
+ 	/* Register the DTL for the current (boot) cpu */
+ 	register_dtl_buffer(smp_processor_id());
