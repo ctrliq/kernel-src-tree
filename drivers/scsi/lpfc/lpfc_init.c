@@ -5490,7 +5490,6 @@ lpfc_sli4_async_fip_evt(struct lpfc_hba *phba,
 	int rc;
 	struct lpfc_vport *vport;
 	struct lpfc_nodelist *ndlp;
-	struct Scsi_Host  *shost;
 	int active_vlink_present;
 	struct lpfc_vport **vports;
 	int i;
@@ -5671,7 +5670,6 @@ lpfc_sli4_async_fip_evt(struct lpfc_hba *phba,
 			 */
 			mod_timer(&ndlp->nlp_delayfunc,
 				  jiffies + msecs_to_jiffies(1000));
-			shost = lpfc_shost_from_vport(vport);
 			spin_lock_irq(&ndlp->lock);
 			ndlp->nlp_flag |= NLP_DELAY_TMO;
 			spin_unlock_irq(&ndlp->lock);
