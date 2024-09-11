@@ -1,0 +1,164 @@
+dm: remove legacy code only needed before submit_bio recursion
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mike Snitzer <snitzer@redhat.com>
+commit 77c11720a48cbbd5ee1071e8540d0aa0f26d98f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/77c11720.failed
+
+Commit 8615cb65bd63 ("dm: remove useless loop in
+__split_and_process_bio") showcased that we no longer loop.
+
+Remove the bio_advance() in __split_and_process_bio() that was only
+needed when looping was possible.
+
+Similarly there is no need to advance the bio, using ci->sector
+cursor, in __send_duplicate_bios().
+
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Reviewed-by: Mikulas Patocka <mpatocka@redhat.com>
+	Signed-off-by: Mike Snitzer <snitzer@redhat.com>
+(cherry picked from commit 77c11720a48cbbd5ee1071e8540d0aa0f26d98f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/dm.c
+diff --cc drivers/md/dm.c
+index b06624dd4339,280c17ad5b1e..000000000000
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@@ -1325,69 -1193,17 +1325,75 @@@ static blk_qc_t __map_bio(struct dm_tar
+  		DMWARN("unimplemented target map return value: %d", r);
+  		BUG();
+  	}
+ +
+ +	return ret;
+ +}
+ +
+++<<<<<<< HEAD
+ +static void bio_setup_sector(struct bio *bio, sector_t sector, unsigned len)
+ +{
+ +	bio->bi_iter.bi_sector = sector;
+ +	bio->bi_iter.bi_size = to_bytes(len);
+  }
+  
+ +/*
+ + * Creates a bio that consists of range of complete bvecs.
+ + */
+ +static int clone_bio(struct dm_target_io *tio, struct bio *bio,
+ +		     sector_t sector, unsigned len)
+++=======
++ static void alloc_multiple_bios(struct bio_list *blist, struct clone_info *ci,
++ 				struct dm_target *ti, unsigned num_bios,
++ 				unsigned *len)
+++>>>>>>> 77c11720a48c (dm: remove legacy code only needed before submit_bio recursion)
+  {
+ -	struct bio *bio;
+ +	struct bio *clone = &tio->clone;
+ +
+ +	__bio_clone_fast(clone, bio);
+ +
+ +	if (bio_integrity(bio)) {
+ +		int r;
+ +
+ +		if (unlikely(!dm_target_has_integrity(tio->ti->type) &&
+ +			     !dm_target_passes_integrity(tio->ti->type))) {
+ +			DMWARN("%s: the target %s doesn't support integrity data.",
+ +				dm_device_name(tio->io->md),
+ +				tio->ti->type->name);
+ +			return -EIO;
+ +		}
+ +
+ +		r = bio_integrity_clone(clone, bio, GFP_NOIO);
+ +		if (r < 0)
+ +			return r;
+ +	}
+ +
+ +	bio_advance(clone, to_bytes(sector - clone->bi_iter.bi_sector));
+ +	clone->bi_iter.bi_size = to_bytes(len);
+ +
+ +	if (bio_integrity(bio))
+ +		bio_integrity_trim(clone);
+ +
+ +	return 0;
+ +}
+ +
+ +static void alloc_multiple_bios(struct bio_list *blist, struct clone_info *ci,
+ +				struct dm_target *ti, unsigned num_bios)
+ +{
+ +	struct dm_target_io *tio;
+  	int try;
+  
+ +	if (!num_bios)
+ +		return;
+ +
+ +	if (num_bios == 1) {
+ +		tio = alloc_tio(ci, ti, 0, GFP_NOIO);
+ +		bio_list_add(blist, &tio->clone);
+ +		return;
+ +	}
+ +
+  	for (try = 0; try < 2; try++) {
+  		int bio_nr;
+ +		struct bio *bio;
+  
+  		if (try)
+  			mutex_lock(&ci->io->md->table_devices_lock);
+@@@ -1428,14 -1229,25 +1434,34 @@@ static void __send_duplicate_bios(struc
+  				  unsigned num_bios, unsigned *len)
+  {
+  	struct bio_list blist = BIO_EMPTY_LIST;
+ -	struct bio *clone;
+ +	struct bio *bio;
+ +	struct dm_target_io *tio;
+  
+++<<<<<<< HEAD
+ +	alloc_multiple_bios(&blist, ci, ti, num_bios);
+ +
+ +	while ((bio = bio_list_pop(&blist))) {
+ +		tio = container_of(bio, struct dm_target_io, clone);
+ +		(void) __clone_and_map_simple_bio(ci, tio, len);
+++=======
++ 	switch (num_bios) {
++ 	case 0:
++ 		break;
++ 	case 1:
++ 		clone = alloc_tio(ci, ti, 0, len, GFP_NOIO);
++ 		if (len)
++ 			clone->bi_iter.bi_size = to_bytes(*len);
++ 		__map_bio(clone);
++ 		break;
++ 	default:
++ 		alloc_multiple_bios(&blist, ci, ti, num_bios, len);
++ 		while ((clone = bio_list_pop(&blist))) {
++ 			if (len)
++ 				clone->bi_iter.bi_size = to_bytes(*len);
++ 			__map_bio(clone);
++ 		}
++ 		break;
+++>>>>>>> 77c11720a48c (dm: remove legacy code only needed before submit_bio recursion)
+  	}
+  }
+  
+@@@ -1587,9 -1362,12 +1613,18 @@@ static int __split_and_process_non_flus
+  
+  	len = min_t(sector_t, max_io_len(ti, ci->sector), ci->sector_count);
+  
+++<<<<<<< HEAD
+ +	r = __clone_and_map_data_bio(ci, ti, ci->sector, &len);
+ +	if (r < 0)
+ +		return r;
+++=======
++ 	clone = alloc_tio(ci, ti, 0, &len, GFP_NOIO);
++ 	clone->bi_iter.bi_size = to_bytes(len);
++ 	if (bio_integrity(clone))
++ 		bio_integrity_trim(clone);
++ 
++ 	__map_bio(clone);
+++>>>>>>> 77c11720a48c (dm: remove legacy code only needed before submit_bio recursion)
+  
+  	ci->sector += len;
+  	ci->sector_count -= len;
+* Unmerged path drivers/md/dm.c
