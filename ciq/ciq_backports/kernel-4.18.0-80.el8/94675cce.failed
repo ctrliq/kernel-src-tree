@@ -1,0 +1,143 @@
+powerpc/pseries: Defer the logging of rtas error to irq work queue.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+Rebuild_CHGLOG: - [powerpc] powerpc/pseries: Defer the logging of rtas error to irq work queue (Steve Best) [1633550]
+Rebuild_FUZZ: 99.25%
+commit-author Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+commit 94675cceacaec27a30eefb142c4c59a9d3131742
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/94675cce.failed
+
+rtas_log_buf is a buffer to hold RTAS event data that are communicated
+to kernel by hypervisor. This buffer is then used to pass RTAS event
+data to user through proc fs. This buffer is allocated from
+vmalloc (non-linear mapping) area.
+
+On Machine check interrupt, register r3 points to RTAS extended event
+log passed by hypervisor that contains the MCE event. The pseries
+machine check handler then logs this error into rtas_log_buf. The
+rtas_log_buf is a vmalloc-ed (non-linear) buffer we end up taking up a
+page fault (vector 0x300) while accessing it. Since machine check
+interrupt handler runs in NMI context we can not afford to take any
+page fault. Page faults are not honored in NMI context and causes
+kernel panic. Apart from that, as Nick pointed out,
+pSeries_log_error() also takes a spin_lock while logging error which
+is not safe in NMI context. It may endup in deadlock if we get another
+MCE before releasing the lock. Fix this by deferring the logging of
+rtas error to irq work queue.
+
+Current implementation uses two different buffers to hold rtas error
+log depending on whether extended log is provided or not. This makes
+bit difficult to identify which buffer has valid data that needs to
+logged later in irq work. Simplify this using single buffer, one per
+paca, and copy rtas log to it irrespective of whether extended log is
+provided or not. Allocate this buffer below RMA region so that it can
+be accessed in real mode mce handler.
+
+Fixes: b96672dd840f ("powerpc: Machine check interrupt is a non-maskable interrupt")
+	Cc: stable@vger.kernel.org # v4.14+
+	Reviewed-by: Nicholas Piggin <npiggin@gmail.com>
+	Signed-off-by: Mahesh Salgaonkar <mahesh@linux.vnet.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+(cherry picked from commit 94675cceacaec27a30eefb142c4c59a9d3131742)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/platforms/pseries/ras.c
+diff --cc arch/powerpc/platforms/pseries/ras.c
+index fbd14e570624,14a46b07ab2f..000000000000
+--- a/arch/powerpc/platforms/pseries/ras.c
++++ b/arch/powerpc/platforms/pseries/ras.c
+@@@ -360,24 -367,22 +367,29 @@@ static struct rtas_error_log *fwnmi_get
+  	}
+  
+  	savep = __va(regs->gpr[3]);
+ -	regs->gpr[3] = savep[0];	/* restore original r3 */
+ +	regs->gpr[3] = be64_to_cpu(savep[0]);	/* restore original r3 */
+  
+- 	/* If it isn't an extended log we can use the per cpu 64bit buffer */
+  	h = (struct rtas_error_log *)&savep[1];
++ 	/* Use the per cpu buffer from paca to store rtas error log */
++ 	memset(local_paca->mce_data_buf, 0, RTAS_ERROR_LOG_MAX);
+  	if (!rtas_error_extended(h)) {
+- 		memcpy(this_cpu_ptr(&mce_data_buf), h, sizeof(__u64));
+- 		errhdr = (struct rtas_error_log *)this_cpu_ptr(&mce_data_buf);
++ 		memcpy(local_paca->mce_data_buf, h, sizeof(__u64));
+  	} else {
+  		int len, error_log_length;
+  
+  		error_log_length = 8 + rtas_error_extended_log_length(h);
+++<<<<<<< HEAD
+ +		len = max_t(int, error_log_length, RTAS_ERROR_LOG_MAX);
+ +		memset(global_mce_data_buf, 0, RTAS_ERROR_LOG_MAX);
+ +		memcpy(global_mce_data_buf, h, len);
+ +		errhdr = (struct rtas_error_log *)global_mce_data_buf;
+++=======
++ 		len = min_t(int, error_log_length, RTAS_ERROR_LOG_MAX);
++ 		memcpy(local_paca->mce_data_buf, h, len);
+++>>>>>>> 94675cceacae (powerpc/pseries: Defer the logging of rtas error to irq work queue.)
+  	}
+  
+- 	return errhdr;
++ 	return (struct rtas_error_log *)local_paca->mce_data_buf;
+  }
+  
+  /* Call this when done with the data returned by FWNMI_get_errinfo.
+diff --git a/arch/powerpc/include/asm/paca.h b/arch/powerpc/include/asm/paca.h
+index 4e9cede5a7e7..ad4f16164619 100644
+--- a/arch/powerpc/include/asm/paca.h
++++ b/arch/powerpc/include/asm/paca.h
+@@ -247,6 +247,9 @@ struct paca_struct {
+ 	void *rfi_flush_fallback_area;
+ 	u64 l1d_flush_size;
+ #endif
++#ifdef CONFIG_PPC_PSERIES
++	u8 *mce_data_buf;		/* buffer to hold per cpu rtas errlog */
++#endif /* CONFIG_PPC_PSERIES */
+ } ____cacheline_aligned;
+ 
+ extern void copy_mm_to_paca(struct mm_struct *mm);
+* Unmerged path arch/powerpc/platforms/pseries/ras.c
+diff --git a/arch/powerpc/platforms/pseries/setup.c b/arch/powerpc/platforms/pseries/setup.c
+index 8a4868a3964b..c557f45733bf 100644
+--- a/arch/powerpc/platforms/pseries/setup.c
++++ b/arch/powerpc/platforms/pseries/setup.c
+@@ -41,6 +41,7 @@
+ #include <linux/root_dev.h>
+ #include <linux/of.h>
+ #include <linux/of_pci.h>
++#include <linux/memblock.h>
+ 
+ #include <asm/mmu.h>
+ #include <asm/processor.h>
+@@ -102,6 +103,9 @@ static void pSeries_show_cpuinfo(struct seq_file *m)
+ static void __init fwnmi_init(void)
+ {
+ 	unsigned long system_reset_addr, machine_check_addr;
++	u8 *mce_data_buf;
++	unsigned int i;
++	int nr_cpus = num_possible_cpus();
+ 
+ 	int ibm_nmi_register = rtas_token("ibm,nmi-register");
+ 	if (ibm_nmi_register == RTAS_UNKNOWN_SERVICE)
+@@ -115,6 +119,18 @@ static void __init fwnmi_init(void)
+ 	if (0 == rtas_call(ibm_nmi_register, 2, 1, NULL, system_reset_addr,
+ 				machine_check_addr))
+ 		fwnmi_active = 1;
++
++	/*
++	 * Allocate a chunk for per cpu buffer to hold rtas errorlog.
++	 * It will be used in real mode mce handler, hence it needs to be
++	 * below RMA.
++	 */
++	mce_data_buf = __va(memblock_alloc_base(RTAS_ERROR_LOG_MAX * nr_cpus,
++					RTAS_ERROR_LOG_MAX, ppc64_rma_size));
++	for_each_possible_cpu(i) {
++		paca_ptrs[i]->mce_data_buf = mce_data_buf +
++						(RTAS_ERROR_LOG_MAX * i);
++	}
+ }
+ 
+ static void pseries_8259_cascade(struct irq_desc *desc)
