@@ -1,0 +1,201 @@
+mm/hmm: Remove confusing comment and logic from hmm_release
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [mm] hmm: Remove confusing comment and logic from hmm_release (Jerome Glisse) [1498655 1597758]
+Rebuild_FUZZ: 97.39%
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 14331726a3c47bb1649dab155a84610f509d414e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/14331726.failed
+
+hmm_release() is called exactly once per hmm. ops->release() cannot
+accidentally trigger any action that would recurse back onto
+hmm->mirrors_sem.
+
+This fixes a use after-free race of the form:
+
+       CPU0                                   CPU1
+                                           hmm_release()
+                                             up_write(&hmm->mirrors_sem);
+ hmm_mirror_unregister(mirror)
+  down_write(&hmm->mirrors_sem);
+  up_write(&hmm->mirrors_sem);
+  kfree(mirror)
+                                             mirror->ops->release(mirror)
+
+The only user we have today for ops->release is an empty function, so this
+is unambiguously safe.
+
+As a consequence of plugging this race drivers are not allowed to
+register/unregister mirrors from within a release op.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Tested-by: Philip Yang <Philip.Yang@amd.com>
+(cherry picked from commit 14331726a3c47bb1649dab155a84610f509d414e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hmm.c
+diff --cc mm/hmm.c
+index 2387f409704a,b224ea635a77..000000000000
+--- a/mm/hmm.c
++++ b/mm/hmm.c
+@@@ -158,40 -117,83 +158,52 @@@ static int hmm_invalidate_range(struct 
+  
+  static void hmm_release(struct mmu_notifier *mn, struct mm_struct *mm)
+  {
+ -	struct hmm *hmm = container_of(mn, struct hmm, mmu_notifier);
+  	struct hmm_mirror *mirror;
+ +	struct hmm *hmm = mm->hmm;
+  
+ -	/* Bail out if hmm is in the process of being freed */
+ -	if (!kref_get_unless_zero(&hmm->kref))
+ -		return;
+ -
+ -	/*
+ -	 * Since hmm_range_register() holds the mmget() lock hmm_release() is
+ -	 * prevented as long as a range exists.
+ -	 */
+ -	WARN_ON(!list_empty_careful(&hmm->ranges));
+ -
+++<<<<<<< HEAD
+ +	down_write(&hmm->mirrors_sem);
+ +	mirror = list_first_entry_or_null(&hmm->mirrors, struct hmm_mirror,
+ +					  list);
+ +	while (mirror) {
+ +		list_del_init(&mirror->list);
+ +		if (mirror->ops->release) {
+ +			/*
+ +			 * Drop mirrors_sem so callback can wait on any pending
+ +			 * work that might itself trigger mmu_notifier callback
+ +			 * and thus would deadlock with us.
+ +			 */
+ +			up_write(&hmm->mirrors_sem);
+++=======
++ 	down_read(&hmm->mirrors_sem);
++ 	list_for_each_entry(mirror, &hmm->mirrors, list) {
++ 		/*
++ 		 * Note: The driver is not allowed to trigger
++ 		 * hmm_mirror_unregister() from this thread.
++ 		 */
++ 		if (mirror->ops->release)
+++>>>>>>> 14331726a3c4 (mm/hmm: Remove confusing comment and logic from hmm_release)
+  			mirror->ops->release(mirror);
+- 			down_write(&hmm->mirrors_sem);
+- 		}
+- 		mirror = list_first_entry_or_null(&hmm->mirrors,
+- 						  struct hmm_mirror, list);
+  	}
+++<<<<<<< HEAD
+ +	up_write(&hmm->mirrors_sem);
+++=======
++ 	up_read(&hmm->mirrors_sem);
++ 
++ 	hmm_put(hmm);
+++>>>>>>> 14331726a3c4 (mm/hmm: Remove confusing comment and logic from hmm_release)
+  }
+  
+ -static int hmm_invalidate_range_start(struct mmu_notifier *mn,
+ -			const struct mmu_notifier_range *nrange)
+ +static void hmm_invalidate_range_start(struct mmu_notifier *mn,
+ +				       struct mm_struct *mm,
+ +				       unsigned long start,
+ +				       unsigned long end)
+  {
+ -	struct hmm *hmm = container_of(mn, struct hmm, mmu_notifier);
+ -	struct hmm_mirror *mirror;
+ -	struct hmm_update update;
+ -	struct hmm_range *range;
+ -	int ret = 0;
+ +	struct hmm *hmm = mm->hmm;
+  
+ -	if (!kref_get_unless_zero(&hmm->kref))
+ -		return 0;
+ -
+ -	update.start = nrange->start;
+ -	update.end = nrange->end;
+ -	update.event = HMM_UPDATE_INVALIDATE;
+ -	update.blockable = mmu_notifier_range_blockable(nrange);
+ -
+ -	if (mmu_notifier_range_blockable(nrange))
+ -		mutex_lock(&hmm->lock);
+ -	else if (!mutex_trylock(&hmm->lock)) {
+ -		ret = -EAGAIN;
+ -		goto out;
+ -	}
+ -	hmm->notifiers++;
+ -	list_for_each_entry(range, &hmm->ranges, list) {
+ -		if (update.end < range->start || update.start >= range->end)
+ -			continue;
+ -
+ -		range->valid = false;
+ -	}
+ -	mutex_unlock(&hmm->lock);
+ +	VM_BUG_ON(!hmm);
+  
+ -	if (mmu_notifier_range_blockable(nrange))
+ -		down_read(&hmm->mirrors_sem);
+ -	else if (!down_read_trylock(&hmm->mirrors_sem)) {
+ -		ret = -EAGAIN;
+ -		goto out;
+ -	}
+ -	list_for_each_entry(mirror, &hmm->mirrors, list) {
+ -		int ret;
+ -
+ -		ret = mirror->ops->sync_cpu_device_pagetables(mirror, &update);
+ -		if (!update.blockable && ret == -EAGAIN)
+ -			break;
+ -	}
+ -	up_read(&hmm->mirrors_sem);
+ -
+ -out:
+ -	hmm_put(hmm);
+ -	return ret;
+ +	atomic_inc(&hmm->sequence);
+  }
+  
+  static void hmm_invalidate_range_end(struct mmu_notifier *mn,
+@@@ -266,33 -266,12 +278,37 @@@ EXPORT_SYMBOL(hmm_mirror_register)
+   */
+  void hmm_mirror_unregister(struct hmm_mirror *mirror)
+  {
+ -	struct hmm *hmm = mirror->hmm;
+ +	bool should_unregister = false;
+ +	struct mm_struct *mm;
+ +	struct hmm *hmm;
+ +
+ +	if (mirror->hmm == NULL)
+ +		return;
+  
+ +	hmm = mirror->hmm;
+  	down_write(&hmm->mirrors_sem);
+++<<<<<<< HEAD
+ +	list_del_init(&mirror->list);
+ +	should_unregister = list_empty(&hmm->mirrors);
+ +	mirror->hmm = NULL;
+ +	mm = hmm->mm;
+ +	hmm->mm = NULL;
+++=======
++ 	list_del(&mirror->list);
+++>>>>>>> 14331726a3c4 (mm/hmm: Remove confusing comment and logic from hmm_release)
+  	up_write(&hmm->mirrors_sem);
+ -	hmm_put(hmm);
+ +
+ +	if (!should_unregister || mm == NULL)
+ +		return;
+ +
+ +	mmu_notifier_unregister_no_release(&hmm->mmu_notifier, mm);
+ +
+ +	spin_lock(&mm->page_table_lock);
+ +	if (mm->hmm == hmm)
+ +		mm->hmm = NULL;
+ +	spin_unlock(&mm->page_table_lock);
+ +
+ +	kfree(hmm);
+  }
+  EXPORT_SYMBOL(hmm_mirror_unregister);
+  
+* Unmerged path mm/hmm.c
