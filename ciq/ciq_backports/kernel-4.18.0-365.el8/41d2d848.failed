@@ -1,0 +1,112 @@
+md: improve io stats accounting
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+commit 41d2d848e5c09209bdb57ff9c0ca34075e22783d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/41d2d848.failed
+
+Use generic io accounting functions to manage io stats. There was an
+attempt to do this earlier in commit 18c0b223cf99 ("md: use generic io
+stats accounting functions to simplify io stat accounting"), but it did
+not include a call to generic_end_io_acct() and caused issues with
+tracking in-flight IOs, so it was later removed in commit 74672d069b29
+("md: fix md io stats accounting broken").
+
+This patch attempts to fix this by using both disk_start_io_acct() and
+disk_end_io_acct(). To make it possible, a struct md_io is allocated for
+every new md bio, which includes the io start_time. A new mempool is
+introduced for this purpose. We override bio->bi_end_io with our own
+callback and call disk_start_io_acct() before passing the bio to
+md_handle_request(). When it completes, we call disk_end_io_acct() and
+the original bi_end_io callback.
+
+This adds correct statistics about in-flight IOs and IO processing time,
+interpreted e.g. in iostat as await, svctm, aqu-sz and %util.
+
+It also fixes a situation where too many IOs where reported if a bio was
+re-submitted to the mddev, because io accounting is now performed only
+on newly arriving bios.
+
+	Acked-by: Guoqing Jiang <guoqing.jiang@cloud.ionos.com>
+	Signed-off-by: Artur Paszkiewicz <artur.paszkiewicz@intel.com>
+	Signed-off-by: Song Liu <songliubraving@fb.com>
+(cherry picked from commit 41d2d848e5c09209bdb57ff9c0ca34075e22783d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/md/md.c
+diff --cc drivers/md/md.c
+index 3468a62c3688,07e5b67a2c48..000000000000
+--- a/drivers/md/md.c
++++ b/drivers/md/md.c
+@@@ -471,12 -463,33 +471,37 @@@ check_suspended
+  }
+  EXPORT_SYMBOL(md_handle_request);
+  
+++<<<<<<< HEAD
+ +static blk_qc_t md_make_request(struct request_queue *q, struct bio *bio)
+++=======
++ struct md_io {
++ 	struct mddev *mddev;
++ 	bio_end_io_t *orig_bi_end_io;
++ 	void *orig_bi_private;
++ 	unsigned long start_time;
++ };
++ 
++ static void md_end_io(struct bio *bio)
++ {
++ 	struct md_io *md_io = bio->bi_private;
++ 	struct mddev *mddev = md_io->mddev;
++ 
++ 	disk_end_io_acct(mddev->gendisk, bio_op(bio), md_io->start_time);
++ 
++ 	bio->bi_end_io = md_io->orig_bi_end_io;
++ 	bio->bi_private = md_io->orig_bi_private;
++ 
++ 	mempool_free(md_io, &mddev->md_io_pool);
++ 
++ 	if (bio->bi_end_io)
++ 		bio->bi_end_io(bio);
++ }
++ 
++ static blk_qc_t md_submit_bio(struct bio *bio)
+++>>>>>>> 41d2d848e5c0 (md: improve io stats accounting)
+  {
+  	const int rw = bio_data_dir(bio);
+- 	const int sgrp = op_stat_group(bio_op(bio));
+  	struct mddev *mddev = bio->bi_disk->private_data;
+- 	unsigned int sectors;
+  
+  	if (mddev == NULL || mddev->pers == NULL) {
+  		bio_io_error(bio);
+@@@ -5732,8 -5669,13 +5764,13 @@@ static int md_alloc(dev_t dev, char *na
+  		 */
+  		mddev->hold_active = UNTIL_STOP;
+  
++ 	error = mempool_init_kmalloc_pool(&mddev->md_io_pool, BIO_POOL_SIZE,
++ 					  sizeof(struct md_io));
++ 	if (error)
++ 		goto abort;
++ 
+  	error = -ENOMEM;
+ -	mddev->queue = blk_alloc_queue(NUMA_NO_NODE);
+ +	mddev->queue = blk_alloc_queue_rh(md_make_request, NUMA_NO_NODE);
+  	if (!mddev->queue)
+  		goto abort;
+  
+* Unmerged path drivers/md/md.c
+diff --git a/drivers/md/md.h b/drivers/md/md.h
+index cefaa5a77d25..78b4f5be2a59 100644
+--- a/drivers/md/md.h
++++ b/drivers/md/md.h
+@@ -494,6 +494,7 @@ struct mddev {
+ 	struct bio_set			sync_set; /* for sync operations like
+ 						   * metadata and bitmap writes
+ 						   */
++	mempool_t			md_io_pool;
+ 
+ 	/* Generic flush handling.
+ 	 * The last to finish preflush schedules a worker to submit
