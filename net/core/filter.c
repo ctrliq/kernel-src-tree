@@ -74,6 +74,7 @@
 #include <net/seg6.h>
 #include <net/seg6_local.h>
 #include <net/lwtunnel.h>
+#include <net/ipv6_stubs.h>
 
 #include <linux/rh_features.h>
 
