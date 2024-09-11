@@ -1,0 +1,491 @@
+mm: memcg/slab: deprecate slab_root_caches
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Roman Gushchin <guro@fb.com>
+commit c7094406fcb7cdf4fe1de8893f0613b75349773d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/c7094406.failed
+
+Currently there are two lists of kmem_caches:
+1) slab_caches, which contains all kmem_caches,
+2) slab_root_caches, which contains only root kmem_caches.
+
+And there is some preprocessor magic to have a single list if
+CONFIG_MEMCG_KMEM isn't enabled.
+
+It was required earlier because the number of non-root kmem_caches was
+proportional to the number of memory cgroups and could reach really big
+values.  Now, when it cannot exceed the number of root kmem_caches, there
+is really no reason to maintain two lists.
+
+We never iterate over the slab_root_caches list on any hot paths, so it's
+perfectly fine to iterate over slab_caches and filter out non-root
+kmem_caches.
+
+It allows to remove a lot of config-dependent code and two pointers from
+the kmem_cache structure.
+
+	Signed-off-by: Roman Gushchin <guro@fb.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Reviewed-by: Vlastimil Babka <vbabka@suse.cz>
+	Reviewed-by: Shakeel Butt <shakeelb@google.com>
+	Cc: Christoph Lameter <cl@linux.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Cc: Tejun Heo <tj@kernel.org>
+Link: http://lkml.kernel.org/r/20200623174037.3951353-16-guro@fb.com
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit c7094406fcb7cdf4fe1de8893f0613b75349773d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/slab.c
+#	mm/slab.h
+#	mm/slab_common.c
+#	mm/slub.c
+diff --cc mm/slab.c
+index 98c009baf3ea,f40e5c95e11a..000000000000
+--- a/mm/slab.c
++++ b/mm/slab.c
+@@@ -1279,7 -1249,6 +1279,10 @@@ void __init kmem_cache_init(void
+  				  nr_node_ids * sizeof(struct kmem_cache_node *),
+  				  SLAB_HWCACHE_ALIGN, 0, 0);
+  	list_add(&kmem_cache->list, &slab_caches);
+++<<<<<<< HEAD
+ +	memcg_link_cache(kmem_cache, NULL);
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  	slab_state = PARTIAL;
+  
+  	/*
+diff --cc mm/slab.h
+index 45ad57de9d88,7500a707121b..000000000000
+--- a/mm/slab.h
++++ b/mm/slab.h
+@@@ -30,6 -30,28 +30,31 @@@ struct kmem_cache 
+  	struct list_head list;	/* List of all slab caches on the system */
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #else /* !CONFIG_SLOB */
++ 
++ /*
++  * This is the main placeholder for memcg-related information in kmem caches.
++  * Both the root cache and the child cache will have it. Some fields are used
++  * in both cases, other are specific to root caches.
++  *
++  * @root_cache:	Common to root and child caches.  NULL for root, pointer to
++  *		the root cache for children.
++  *
++  * The following fields are specific to root caches.
++  *
++  * @memcg_cache: pointer to memcg kmem cache, used by all non-root memory
++  *		cgroups.
++  * @work: work struct used to create the non-root cache.
++  */
++ struct memcg_cache_params {
++ 	struct kmem_cache *root_cache;
++ 
++ 	struct kmem_cache *memcg_cache;
++ 	struct work_struct work;
++ };
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  #endif /* CONFIG_SLOB */
+  
+  #ifdef CONFIG_SLAB
+@@@ -210,23 -231,38 +235,26 @@@ int __kmem_cache_alloc_bulk(struct kmem
+  static inline int cache_vmstat_idx(struct kmem_cache *s)
+  {
+  	return (s->flags & SLAB_RECLAIM_ACCOUNT) ?
+ -		NR_SLAB_RECLAIMABLE_B : NR_SLAB_UNRECLAIMABLE_B;
+ +		NR_SLAB_RECLAIMABLE : NR_SLAB_UNRECLAIMABLE;
+  }
+  
+ -#ifdef CONFIG_SLUB_DEBUG
+ -#ifdef CONFIG_SLUB_DEBUG_ON
+ -DECLARE_STATIC_KEY_TRUE(slub_debug_enabled);
+ -#else
+ -DECLARE_STATIC_KEY_FALSE(slub_debug_enabled);
+ -#endif
+ -extern void print_tracking(struct kmem_cache *s, void *object);
+ -#else
+ -static inline void print_tracking(struct kmem_cache *s, void *object)
+ -{
+ -}
+ -#endif
+ +#ifdef CONFIG_MEMCG_KMEM
+++<<<<<<< HEAD
+ +
+ +/* List of all root caches. */
+ +extern struct list_head		slab_root_caches;
+ +#define root_caches_node	memcg_params.__root_caches_node
+  
+  /*
+ - * Returns true if any of the specified slub_debug flags is enabled for the
+ - * cache. Use only for flags parsed by setup_slub_debug() as it also enables
+ - * the static key.
+ + * Iterate over all memcg caches of the given root cache. The caller must hold
+ + * slab_mutex.
+   */
+ -static inline bool kmem_cache_debug_flags(struct kmem_cache *s, slab_flags_t flags)
+ -{
+ -#ifdef CONFIG_SLUB_DEBUG
+ -	VM_WARN_ON_ONCE(!(flags & SLAB_DEBUG_FLAGS));
+ -	if (static_branch_unlikely(&slub_debug_enabled))
+ -		return s->flags & flags;
+ -#endif
+ -	return false;
+ -}
+ +#define for_each_memcg_cache(iter, root) \
+ +	list_for_each_entry(iter, &(root)->memcg_params.children, \
+ +			    memcg_params.children_node)
+  
+ -#ifdef CONFIG_MEMCG_KMEM
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  static inline bool is_root_cache(struct kmem_cache *s)
+  {
+  	return !s->memcg_params.root_cache;
+@@@ -331,32 -390,58 +359,37 @@@ static __always_inline void memcg_uncha
+  	struct lruvec *lruvec;
+  
+  	rcu_read_lock();
+ -	memcg = obj_cgroup_memcg(objcg);
+ -	lruvec = mem_cgroup_lruvec(memcg, pgdat);
+ -	mod_memcg_lruvec_state(lruvec, idx, nr);
+ +	memcg = READ_ONCE(s->memcg_params.memcg);
+ +	if (likely(!mem_cgroup_is_root(memcg))) {
+ +		lruvec = mem_cgroup_lruvec(memcg, page_pgdat(page));
+ +		mod_lruvec_state(lruvec, cache_vmstat_idx(s), -nr_pages);
+ +		memcg_kmem_uncharge(memcg, nr_pages);
+ +	} else {
+ +		mod_node_page_state(page_pgdat(page), cache_vmstat_idx(s),
+ +				    -nr_pages);
+ +	}
+  	rcu_read_unlock();
+ -}
+ -
+ -static inline void memcg_slab_post_alloc_hook(struct kmem_cache *s,
+ -					      struct obj_cgroup *objcg,
+ -					      size_t size, void **p)
+ -{
+ -	struct page *page;
+ -	unsigned long off;
+ -	size_t i;
+  
+ -	for (i = 0; i < size; i++) {
+ -		if (likely(p[i])) {
+ -			page = virt_to_head_page(p[i]);
+ -			off = obj_to_index(s, page, p[i]);
+ -			obj_cgroup_get(objcg);
+ -			page_obj_cgroups(page)[off] = objcg;
+ -			mod_objcg_state(objcg, page_pgdat(page),
+ -					cache_vmstat_idx(s), obj_full_size(s));
+ -		} else {
+ -			obj_cgroup_uncharge(objcg, obj_full_size(s));
+ -		}
+ -	}
+ -	obj_cgroup_put(objcg);
+ +	percpu_ref_put_many(&s->memcg_params.refcnt, nr_pages);
+  }
+  
+ -static inline void memcg_slab_free_hook(struct kmem_cache *s, struct page *page,
+ -					void *p)
+ -{
+ -	struct obj_cgroup *objcg;
+ -	unsigned int off;
+ -
+ -	if (!memcg_kmem_enabled() || is_root_cache(s))
+ -		return;
+ +extern void slab_init_memcg_params(struct kmem_cache *);
+++<<<<<<< HEAD
+ +extern void memcg_link_cache(struct kmem_cache *s, struct mem_cgroup *memcg);
+  
+ -	off = obj_to_index(s, page, p);
+ -	objcg = page_obj_cgroups(page)[off];
+ -	page_obj_cgroups(page)[off] = NULL;
+ +#else /* CONFIG_MEMCG_KMEM */
+  
+ -	obj_cgroup_uncharge(objcg, obj_full_size(s));
+ -	mod_objcg_state(objcg, page_pgdat(page), cache_vmstat_idx(s),
+ -			-obj_full_size(s));
+ +/* If !memcg, all caches are root. */
+ +#define slab_root_caches	slab_caches
+ +#define root_caches_node	list
+  
+ -	obj_cgroup_put(objcg);
+ -}
+ +#define for_each_memcg_cache(iter, root) \
+ +	for ((void)(iter), (void)(root); 0; )
+  
+ -extern void slab_init_memcg_params(struct kmem_cache *);
+++=======
++ 
++ #else /* CONFIG_MEMCG_KMEM */
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  static inline bool is_root_cache(struct kmem_cache *s)
+  {
+  	return true;
+@@@ -398,13 -506,23 +431,16 @@@ static inline void slab_init_memcg_para
+  {
+  }
+  
+ -static inline void slab_init_memcg_params(struct kmem_cache *s)
+++<<<<<<< HEAD
+ +static inline void memcg_link_cache(struct kmem_cache *s,
+ +				    struct mem_cgroup *memcg)
+  {
+  }
+  
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+ -static inline struct kmem_cache *virt_to_cache(const void *obj)
+ -{
+ -	struct page *page;
+ -
+ -	page = virt_to_head_page(obj);
+ -	if (WARN_ONCE(!PageSlab(page), "%s: Object is not a Slab page!\n",
+ -					__func__))
+ -		return NULL;
+ -	return page->slab_cache;
+ -}
+ -
+  static __always_inline int charge_slab_page(struct page *page,
+  					    gfp_t gfp, int order,
+  					    struct kmem_cache *s)
+diff --cc mm/slab_common.c
+index dd4f84ee402c,a9f6ab452ce5..000000000000
+--- a/mm/slab_common.c
++++ b/mm/slab_common.c
+@@@ -131,149 -131,33 +131,157 @@@ int __kmem_cache_alloc_bulk(struct kmem
+  }
+  
+  #ifdef CONFIG_MEMCG_KMEM
+++<<<<<<< HEAD
+ +
+ +LIST_HEAD(slab_root_caches);
+ +static DEFINE_SPINLOCK(memcg_kmem_wq_lock);
+ +
+ +static void kmemcg_cache_shutdown(struct percpu_ref *percpu_ref);
+++=======
++ static void memcg_kmem_cache_create_func(struct work_struct *work)
++ {
++ 	struct kmem_cache *cachep = container_of(work, struct kmem_cache,
++ 						 memcg_params.work);
++ 	memcg_create_kmem_cache(cachep);
++ }
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  
+  void slab_init_memcg_params(struct kmem_cache *s)
+  {
+  	s->memcg_params.root_cache = NULL;
+ -	s->memcg_params.memcg_cache = NULL;
+ -	INIT_WORK(&s->memcg_params.work, memcg_kmem_cache_create_func);
+ +	RCU_INIT_POINTER(s->memcg_params.memcg_caches, NULL);
+ +	INIT_LIST_HEAD(&s->memcg_params.children);
+ +	s->memcg_params.dying = false;
+  }
+  
+ -static void init_memcg_params(struct kmem_cache *s,
+ -			      struct kmem_cache *root_cache)
+ +static int init_memcg_params(struct kmem_cache *s,
+ +			     struct kmem_cache *root_cache)
+  {
+ -	if (root_cache)
+ +	struct memcg_cache_array *arr;
+ +
+ +	if (root_cache) {
+ +		int ret = percpu_ref_init(&s->memcg_params.refcnt,
+ +					  kmemcg_cache_shutdown,
+ +					  0, GFP_KERNEL);
+ +		if (ret)
+ +			return ret;
+ +
+  		s->memcg_params.root_cache = root_cache;
+ -	else
+ -		slab_init_memcg_params(s);
+ +		INIT_LIST_HEAD(&s->memcg_params.children_node);
+ +		INIT_LIST_HEAD(&s->memcg_params.kmem_caches_node);
+ +		return 0;
+ +	}
+ +
+ +	slab_init_memcg_params(s);
+ +
+ +	if (!memcg_nr_cache_ids)
+ +		return 0;
+ +
+ +	arr = kvzalloc(sizeof(struct memcg_cache_array) +
+ +		       memcg_nr_cache_ids * sizeof(void *),
+ +		       GFP_KERNEL);
+ +	if (!arr)
+ +		return -ENOMEM;
+ +
+ +	RCU_INIT_POINTER(s->memcg_params.memcg_caches, arr);
+ +	return 0;
+ +}
+++<<<<<<< HEAD
+ +
+ +static void destroy_memcg_params(struct kmem_cache *s)
+ +{
+ +	if (is_root_cache(s)) {
+ +		kvfree(rcu_access_pointer(s->memcg_params.memcg_caches));
+ +	} else {
+ +		mem_cgroup_put(s->memcg_params.memcg);
+ +		WRITE_ONCE(s->memcg_params.memcg, NULL);
+ +		percpu_ref_exit(&s->memcg_params.refcnt);
+ +	}
+ +}
+ +
+ +static void free_memcg_params(struct rcu_head *rcu)
+ +{
+ +	struct memcg_cache_array *old;
+ +
+ +	old = container_of(rcu, struct memcg_cache_array, rcu);
+ +	kvfree(old);
+ +}
+ +
+ +static int update_memcg_params(struct kmem_cache *s, int new_array_size)
+ +{
+ +	struct memcg_cache_array *old, *new;
+ +
+ +	new = kvzalloc(sizeof(struct memcg_cache_array) +
+ +		       new_array_size * sizeof(void *), GFP_KERNEL);
+ +	if (!new)
+ +		return -ENOMEM;
+ +
+ +	old = rcu_dereference_protected(s->memcg_params.memcg_caches,
+ +					lockdep_is_held(&slab_mutex));
+ +	if (old)
+ +		memcpy(new->entries, old->entries,
+ +		       memcg_nr_cache_ids * sizeof(void *));
+ +
+ +	rcu_assign_pointer(s->memcg_params.memcg_caches, new);
+ +	if (old)
+ +		call_rcu(&old->rcu, free_memcg_params);
+ +	return 0;
+ +}
+ +
+ +int memcg_update_all_caches(int num_memcgs)
+ +{
+ +	struct kmem_cache *s;
+ +	int ret = 0;
+ +
+ +	mutex_lock(&slab_mutex);
+ +	list_for_each_entry(s, &slab_root_caches, root_caches_node) {
+ +		ret = update_memcg_params(s, num_memcgs);
+ +		/*
+ +		 * Instead of freeing the memory, we'll just leave the caches
+ +		 * up to this point in an updated state.
+ +		 */
+ +		if (ret)
+ +			break;
+ +	}
+ +	mutex_unlock(&slab_mutex);
+ +	return ret;
+ +}
+ +
+ +void memcg_link_cache(struct kmem_cache *s, struct mem_cgroup *memcg)
+ +{
+ +	if (is_root_cache(s)) {
+ +		list_add(&s->root_caches_node, &slab_root_caches);
+ +	} else {
+ +		css_get(&memcg->css);
+ +		s->memcg_params.memcg = memcg;
+ +		list_add(&s->memcg_params.children_node,
+ +			 &s->memcg_params.root_cache->memcg_params.children);
+ +		list_add(&s->memcg_params.kmem_caches_node,
+ +			 &s->memcg_params.memcg->kmem_caches);
+ +	}
+ +}
+ +
+ +static void memcg_unlink_cache(struct kmem_cache *s)
+ +{
+ +	if (is_root_cache(s)) {
+ +		list_del(&s->root_caches_node);
+ +	} else {
+ +		list_del(&s->memcg_params.children_node);
+ +		list_del(&s->memcg_params.kmem_caches_node);
+ +	}
+  }
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  #else
+ -static inline void init_memcg_params(struct kmem_cache *s,
+ -				     struct kmem_cache *root_cache)
+ +static inline int init_memcg_params(struct kmem_cache *s,
+ +				    struct kmem_cache *root_cache)
+ +{
+ +	return 0;
+ +}
+ +
+ +static inline void destroy_memcg_params(struct kmem_cache *s)
+  {
+  }
+- 
+- static inline void memcg_unlink_cache(struct kmem_cache *s)
+- {
+- }
+  #endif /* CONFIG_MEMCG_KMEM */
+  
+  /*
+@@@ -420,7 -293,6 +428,10 @@@ static struct kmem_cache *create_cache(
+  
+  	s->refcount = 1;
+  	list_add(&s->list, &slab_caches);
+++<<<<<<< HEAD
+ +	memcg_link_cache(s, memcg);
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  out:
+  	if (err)
+  		return ERR_PTR(err);
+@@@ -1103,7 -730,6 +1113,10 @@@ struct kmem_cache *__init create_kmallo
+  
+  	create_boot_cache(s, name, size, flags, useroffset, usersize);
+  	list_add(&s->list, &slab_caches);
+++<<<<<<< HEAD
+ +	memcg_link_cache(s, NULL);
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  	s->refcount = 1;
+  	return s;
+  }
+@@@ -1613,11 -1250,11 +1627,11 @@@ static int memcg_slabinfo_show(struct s
+  	mutex_lock(&slab_mutex);
+  	seq_puts(m, "# <name> <css_id[:dead|deact]> <active_objs> <num_objs>");
+  	seq_puts(m, " <active_slabs> <num_slabs>\n");
+- 	list_for_each_entry(s, &slab_root_caches, root_caches_node) {
++ 	list_for_each_entry(s, &slab_caches, list) {
+  		/*
+ -		 * Skip kmem caches that don't have the memcg cache.
+ +		 * Skip kmem caches that don't have any memcg children.
+  		 */
+ -		if (!s->memcg_params.memcg_cache)
+ +		if (list_empty(&s->memcg_params.children))
+  			continue;
+  
+  		memset(&sinfo, 0, sizeof(sinfo));
+diff --cc mm/slub.c
+index 135072f4c635,9cd724fe37d8..000000000000
+--- a/mm/slub.c
++++ b/mm/slub.c
+@@@ -4381,7 -4360,6 +4381,10 @@@ static struct kmem_cache * __init boots
+  	}
+  	slab_init_memcg_params(s);
+  	list_add(&s->list, &slab_caches);
+++<<<<<<< HEAD
+ +	memcg_link_cache(s, NULL);
+++=======
+++>>>>>>> c7094406fcb7 (mm: memcg/slab: deprecate slab_root_caches)
+  	return s;
+  }
+  
+* Unmerged path mm/slab.c
+* Unmerged path mm/slab.h
+* Unmerged path mm/slab_common.c
+* Unmerged path mm/slub.c
