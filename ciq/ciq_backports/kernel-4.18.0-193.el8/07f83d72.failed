@@ -1,0 +1,318 @@
+bnxt_en: Discover firmware error recovery capabilities.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [netdrv] bnxt_en: Discover firmware error recovery capabilities (Jonathan Toppins) [1724766]
+Rebuild_FUZZ: 99.08%
+commit-author Michael Chan <michael.chan@broadcom.com>
+commit 07f83d72d238f5d41b03d6142641129e8a7a0ec4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/07f83d72.failed
+
+Call the new firmware API HWRM_ERROR_RECOVERY_QCFG if it is supported
+to discover the firmware health and recovery capabilities and settings.
+This feature allows the driver to reset the chip if firmware crashes and
+becomes unresponsive.
+
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 07f83d72d238f5d41b03d6142641129e8a7a0ec4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.c
+#	drivers/net/ethernet/broadcom/bnxt/bnxt.h
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.c
+index 73747346c6cf,825a7f945e51..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.c
+@@@ -6645,6 -6843,12 +6645,15 @@@ static int __bnxt_hwrm_func_qcaps(struc
+  		bp->flags |= BNXT_FLAG_ROCEV1_CAP;
+  	if (flags & FUNC_QCAPS_RESP_FLAGS_ROCE_V2_SUPPORTED)
+  		bp->flags |= BNXT_FLAG_ROCEV2_CAP;
+++<<<<<<< HEAD
+++=======
++ 	if (flags & FUNC_QCAPS_RESP_FLAGS_PCIE_STATS_SUPPORTED)
++ 		bp->fw_cap |= BNXT_FW_CAP_PCIE_STATS_SUPPORTED;
++ 	if (flags & FUNC_QCAPS_RESP_FLAGS_EXT_STATS_SUPPORTED)
++ 		bp->fw_cap |= BNXT_FW_CAP_EXT_STATS_SUPPORTED;
++ 	if (flags &  FUNC_QCAPS_RESP_FLAGS_ERROR_RECOVERY_CAPABLE)
++ 		bp->fw_cap |= BNXT_FW_CAP_ERROR_RECOVERY;
+++>>>>>>> 07f83d72d238 (bnxt_en: Discover firmware error recovery capabilities.)
+  
+  	bp->tx_push_thresh = 0;
+  	if (flags & FUNC_QCAPS_RESP_FLAGS_PUSH_MODE_SUPPORTED)
+@@@ -6717,6 -6922,102 +6726,105 @@@ static int bnxt_hwrm_func_qcaps(struct 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(struct bnxt *bp)
++ {
++ 	struct hwrm_cfa_adv_flow_mgnt_qcaps_input req = {0};
++ 	struct hwrm_cfa_adv_flow_mgnt_qcaps_output *resp;
++ 	int rc = 0;
++ 	u32 flags;
++ 
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_CFA_ADV_FLOW))
++ 		return 0;
++ 
++ 	resp = bp->hwrm_cmd_resp_addr;
++ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_CFA_ADV_FLOW_MGNT_QCAPS, -1, -1);
++ 
++ 	mutex_lock(&bp->hwrm_cmd_lock);
++ 	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++ 	if (rc)
++ 		goto hwrm_cfa_adv_qcaps_exit;
++ 
++ 	flags = le32_to_cpu(resp->flags);
++ 	if (flags &
++ 	    CFA_ADV_FLOW_MGNT_QCAPS_RESP_FLAGS_RFS_RING_TBL_IDX_SUPPORTED)
++ 		bp->fw_cap |= BNXT_FW_CAP_CFA_RFS_RING_TBL_IDX;
++ 
++ hwrm_cfa_adv_qcaps_exit:
++ 	mutex_unlock(&bp->hwrm_cmd_lock);
++ 	return rc;
++ }
++ 
++ static int bnxt_hwrm_error_recovery_qcfg(struct bnxt *bp)
++ {
++ 	struct hwrm_error_recovery_qcfg_output *resp = bp->hwrm_cmd_resp_addr;
++ 	struct bnxt_fw_health *fw_health = bp->fw_health;
++ 	struct hwrm_error_recovery_qcfg_input req = {0};
++ 	int rc, i;
++ 
++ 	if (!(bp->fw_cap & BNXT_FW_CAP_ERROR_RECOVERY))
++ 		return 0;
++ 
++ 	bnxt_hwrm_cmd_hdr_init(bp, &req, HWRM_ERROR_RECOVERY_QCFG, -1, -1);
++ 	mutex_lock(&bp->hwrm_cmd_lock);
++ 	rc = _hwrm_send_message(bp, &req, sizeof(req), HWRM_CMD_TIMEOUT);
++ 	if (rc)
++ 		goto err_recovery_out;
++ 	if (!fw_health) {
++ 		fw_health = kzalloc(sizeof(*fw_health), GFP_KERNEL);
++ 		bp->fw_health = fw_health;
++ 		if (!fw_health) {
++ 			rc = -ENOMEM;
++ 			goto err_recovery_out;
++ 		}
++ 	}
++ 	fw_health->flags = le32_to_cpu(resp->flags);
++ 	if ((fw_health->flags & ERROR_RECOVERY_QCFG_RESP_FLAGS_CO_CPU) &&
++ 	    !(bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL)) {
++ 		rc = -EINVAL;
++ 		goto err_recovery_out;
++ 	}
++ 	fw_health->polling_dsecs = le32_to_cpu(resp->driver_polling_freq);
++ 	fw_health->master_func_wait_dsecs =
++ 		le32_to_cpu(resp->master_func_wait_period);
++ 	fw_health->normal_func_wait_dsecs =
++ 		le32_to_cpu(resp->normal_func_wait_period);
++ 	fw_health->post_reset_wait_dsecs =
++ 		le32_to_cpu(resp->master_func_wait_period_after_reset);
++ 	fw_health->post_reset_max_wait_dsecs =
++ 		le32_to_cpu(resp->max_bailout_time_after_reset);
++ 	fw_health->regs[BNXT_FW_HEALTH_REG] =
++ 		le32_to_cpu(resp->fw_health_status_reg);
++ 	fw_health->regs[BNXT_FW_HEARTBEAT_REG] =
++ 		le32_to_cpu(resp->fw_heartbeat_reg);
++ 	fw_health->regs[BNXT_FW_RESET_CNT_REG] =
++ 		le32_to_cpu(resp->fw_reset_cnt_reg);
++ 	fw_health->regs[BNXT_FW_RESET_INPROG_REG] =
++ 		le32_to_cpu(resp->reset_inprogress_reg);
++ 	fw_health->fw_reset_inprog_reg_mask =
++ 		le32_to_cpu(resp->reset_inprogress_reg_mask);
++ 	fw_health->fw_reset_seq_cnt = resp->reg_array_cnt;
++ 	if (fw_health->fw_reset_seq_cnt >= 16) {
++ 		rc = -EINVAL;
++ 		goto err_recovery_out;
++ 	}
++ 	for (i = 0; i < fw_health->fw_reset_seq_cnt; i++) {
++ 		fw_health->fw_reset_seq_regs[i] =
++ 			le32_to_cpu(resp->reset_reg[i]);
++ 		fw_health->fw_reset_seq_vals[i] =
++ 			le32_to_cpu(resp->reset_reg_val[i]);
++ 		fw_health->fw_reset_seq_delay_msec[i] =
++ 			resp->delay_after_reset[i];
++ 	}
++ err_recovery_out:
++ 	mutex_unlock(&bp->hwrm_cmd_lock);
++ 	if (rc)
++ 		bp->fw_cap &= ~BNXT_FW_CAP_ERROR_RECOVERY;
++ 	return rc;
++ }
++ 
+++>>>>>>> 07f83d72d238 (bnxt_en: Discover firmware error recovery capabilities.)
+  static int bnxt_hwrm_func_reset(struct bnxt *bp)
+  {
+  	struct hwrm_func_reset_input req = {0};
+@@@ -9687,6 -10082,141 +9795,144 @@@ static void bnxt_init_dflt_coal(struct 
+  	bp->stats_coal_ticks = BNXT_DEF_STATS_COAL_TICKS;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int bnxt_fw_init_one_p1(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	bp->fw_cap = 0;
++ 	rc = bnxt_hwrm_ver_get(bp);
++ 	if (rc)
++ 		return rc;
++ 
++ 	if (bp->fw_cap & BNXT_FW_CAP_KONG_MB_CHNL) {
++ 		rc = bnxt_alloc_kong_hwrm_resources(bp);
++ 		if (rc)
++ 			bp->fw_cap &= ~BNXT_FW_CAP_KONG_MB_CHNL;
++ 	}
++ 
++ 	if ((bp->fw_cap & BNXT_FW_CAP_SHORT_CMD) ||
++ 	    bp->hwrm_max_ext_req_len > BNXT_HWRM_MAX_REQ_LEN) {
++ 		rc = bnxt_alloc_hwrm_short_cmd_req(bp);
++ 		if (rc)
++ 			return rc;
++ 	}
++ 	rc = bnxt_hwrm_func_reset(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_fw_set_time(bp);
++ 	return 0;
++ }
++ 
++ static int bnxt_fw_init_one_p2(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	/* Get the MAX capabilities for this function */
++ 	rc = bnxt_hwrm_func_qcaps(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "hwrm query capability failure rc: %x\n",
++ 			   rc);
++ 		return -ENODEV;
++ 	}
++ 
++ 	rc = bnxt_hwrm_cfa_adv_flow_mgnt_qcaps(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query adv flow mgnt failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_error_recovery_qcfg(bp);
++ 	if (rc)
++ 		netdev_warn(bp->dev, "hwrm query error recovery failure rc: %d\n",
++ 			    rc);
++ 
++ 	rc = bnxt_hwrm_func_drv_rgtr(bp);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	rc = bnxt_hwrm_func_rgtr_async_events(bp, NULL, 0);
++ 	if (rc)
++ 		return -ENODEV;
++ 
++ 	bnxt_hwrm_func_qcfg(bp);
++ 	bnxt_hwrm_vnic_qcaps(bp);
++ 	bnxt_hwrm_port_led_qcaps(bp);
++ 	bnxt_ethtool_init(bp);
++ 	bnxt_dcb_init(bp);
++ 	return 0;
++ }
++ 
++ static void bnxt_set_dflt_rss_hash_type(struct bnxt *bp)
++ {
++ 	bp->flags &= ~BNXT_FLAG_UDP_RSS_CAP;
++ 	bp->rss_hash_cfg = VNIC_RSS_CFG_REQ_HASH_TYPE_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV4 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_IPV6 |
++ 			   VNIC_RSS_CFG_REQ_HASH_TYPE_TCP_IPV6;
++ 	if (BNXT_CHIP_P4(bp) && bp->hwrm_spec_code >= 0x10501) {
++ 		bp->flags |= BNXT_FLAG_UDP_RSS_CAP;
++ 		bp->rss_hash_cfg |= VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV4 |
++ 				    VNIC_RSS_CFG_REQ_HASH_TYPE_UDP_IPV6;
++ 	}
++ }
++ 
++ static void bnxt_set_dflt_rfs(struct bnxt *bp)
++ {
++ 	struct net_device *dev = bp->dev;
++ 
++ 	dev->hw_features &= ~NETIF_F_NTUPLE;
++ 	dev->features &= ~NETIF_F_NTUPLE;
++ 	bp->flags &= ~BNXT_FLAG_RFS;
++ 	if (bnxt_rfs_supported(bp)) {
++ 		dev->hw_features |= NETIF_F_NTUPLE;
++ 		if (bnxt_rfs_capable(bp)) {
++ 			bp->flags |= BNXT_FLAG_RFS;
++ 			dev->features |= NETIF_F_NTUPLE;
++ 		}
++ 	}
++ }
++ 
++ static void bnxt_fw_init_one_p3(struct bnxt *bp)
++ {
++ 	struct pci_dev *pdev = bp->pdev;
++ 
++ 	bnxt_set_dflt_rss_hash_type(bp);
++ 	bnxt_set_dflt_rfs(bp);
++ 
++ 	bnxt_get_wol_settings(bp);
++ 	if (bp->flags & BNXT_FLAG_WOL_CAP)
++ 		device_set_wakeup_enable(&pdev->dev, bp->wol);
++ 	else
++ 		device_set_wakeup_capable(&pdev->dev, false);
++ 
++ 	bnxt_hwrm_set_cache_line_size(bp, cache_line_size());
++ 	bnxt_hwrm_coal_params_qcaps(bp);
++ }
++ 
++ static int bnxt_fw_init_one(struct bnxt *bp)
++ {
++ 	int rc;
++ 
++ 	rc = bnxt_fw_init_one_p1(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 1 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_fw_init_one_p2(bp);
++ 	if (rc) {
++ 		netdev_err(bp->dev, "Firmware init phase 2 failed\n");
++ 		return rc;
++ 	}
++ 	rc = bnxt_approve_mac(bp, bp->dev->dev_addr, false);
++ 	if (rc)
++ 		return rc;
++ 	bnxt_fw_init_one_p3(bp);
++ 	return 0;
++ }
++ 
+++>>>>>>> 07f83d72d238 (bnxt_en: Discover firmware error recovery capabilities.)
+  static int bnxt_init_board(struct pci_dev *pdev, struct net_device *dev)
+  {
+  	int rc;
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt.h
+index 21c36ec4b1cf,ce535e52eaa9..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt.h
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt.h
+@@@ -1560,6 -1616,12 +1595,15 @@@ struct bnxt 
+  	#define BNXT_FW_CAP_KONG_MB_CHNL		0x00000080
+  	#define BNXT_FW_CAP_OVS_64BIT_HANDLE		0x00000400
+  	#define BNXT_FW_CAP_TRUSTED_VF			0x00000800
+++<<<<<<< HEAD
+++=======
++ 	#define BNXT_FW_CAP_ERROR_RECOVERY		0x00002000
++ 	#define BNXT_FW_CAP_PKG_VER			0x00004000
++ 	#define BNXT_FW_CAP_CFA_ADV_FLOW		0x00008000
++ 	#define BNXT_FW_CAP_CFA_RFS_RING_TBL_IDX	0x00010000
++ 	#define BNXT_FW_CAP_PCIE_STATS_SUPPORTED	0x00020000
++ 	#define BNXT_FW_CAP_EXT_STATS_SUPPORTED		0x00040000
+++>>>>>>> 07f83d72d238 (bnxt_en: Discover firmware error recovery capabilities.)
+  
+  #define BNXT_NEW_RM(bp)		((bp)->fw_cap & BNXT_FW_CAP_NEW_RM)
+  	u32			hwrm_spec_code;
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.c
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt.h
