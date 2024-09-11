@@ -1,0 +1,224 @@
+dma-debug: teach add_dma_entry() about DMA_ATTR_SKIP_CPU_SYNC
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author Hamza Mahfooz <someguy@effective-light.com>
+commit c2bbf9d1e9ac7d4fdd503b190bc1ba8a6302bc49
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/c2bbf9d1.failed
+
+Mapping something twice should be possible as long as,
+DMA_ATTR_SKIP_CPU_SYNC is passed to the strictly speaking second relevant
+mapping operation (that attempts to map the same thing). So, don't issue a
+warning if the specified condition is met in add_dma_entry().
+
+	Signed-off-by: Hamza Mahfooz <someguy@effective-light.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit c2bbf9d1e9ac7d4fdd503b190bc1ba8a6302bc49)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/dma/mapping.c
+diff --cc kernel/dma/mapping.c
+index b152e4e4a653,8349a9f2c345..000000000000
+--- a/kernel/dma/mapping.c
++++ b/kernel/dma/mapping.c
+@@@ -202,8 -193,12 +202,17 @@@ int dma_map_sg_attrs(struct device *dev
+  		ents = dma_direct_map_sg(dev, sg, nents, dir, attrs);
+  	else
+  		ents = ops->map_sg(dev, sg, nents, dir, attrs);
+++<<<<<<< HEAD
+ +	BUG_ON(ents < 0);
+ +	debug_dma_map_sg(dev, sg, nents, ents, dir);
+++=======
++ 
++ 	if (ents > 0)
++ 		debug_dma_map_sg(dev, sg, nents, ents, dir, attrs);
++ 	else if (WARN_ON_ONCE(ents != -EINVAL && ents != -ENOMEM &&
++ 			      ents != -EIO))
++ 		return -EIO;
+++>>>>>>> c2bbf9d1e9ac (dma-debug: teach add_dma_entry() about DMA_ATTR_SKIP_CPU_SYNC)
+  
+  	return ents;
+  }
+diff --git a/include/linux/dma-debug.h b/include/linux/dma-debug.h
+index ddbe92e3a69a..21e66d3ee92c 100644
+--- a/include/linux/dma-debug.h
++++ b/include/linux/dma-debug.h
+@@ -35,7 +35,8 @@ extern void debug_dma_map_single(struct device *dev, const void *addr,
+ 
+ extern void debug_dma_map_page(struct device *dev, struct page *page,
+ 			       size_t offset, size_t size,
+-			       int direction, dma_addr_t dma_addr);
++			       int direction, dma_addr_t dma_addr,
++			       unsigned long attrs);
+ 
+ extern void debug_dma_mapping_error(struct device *dev, dma_addr_t dma_addr);
+ 
+@@ -43,20 +44,23 @@ extern void debug_dma_unmap_page(struct device *dev, dma_addr_t addr,
+ 				 size_t size, int direction);
+ 
+ extern void debug_dma_map_sg(struct device *dev, struct scatterlist *sg,
+-			     int nents, int mapped_ents, int direction);
++			     int nents, int mapped_ents, int direction,
++			     unsigned long attrs);
+ 
+ extern void debug_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
+ 			       int nelems, int dir);
+ 
+ extern void debug_dma_alloc_coherent(struct device *dev, size_t size,
+-				     dma_addr_t dma_addr, void *virt);
++				     dma_addr_t dma_addr, void *virt,
++				     unsigned long attrs);
+ 
+ extern void debug_dma_free_coherent(struct device *dev, size_t size,
+ 				    void *virt, dma_addr_t addr);
+ 
+ extern void debug_dma_map_resource(struct device *dev, phys_addr_t addr,
+ 				   size_t size, int direction,
+-				   dma_addr_t dma_addr);
++				   dma_addr_t dma_addr,
++				   unsigned long attrs);
+ 
+ extern void debug_dma_unmap_resource(struct device *dev, dma_addr_t dma_addr,
+ 				     size_t size, int direction);
+@@ -92,7 +96,8 @@ static inline void debug_dma_map_single(struct device *dev, const void *addr,
+ 
+ static inline void debug_dma_map_page(struct device *dev, struct page *page,
+ 				      size_t offset, size_t size,
+-				      int direction, dma_addr_t dma_addr)
++				      int direction, dma_addr_t dma_addr,
++				      unsigned long attrs)
+ {
+ }
+ 
+@@ -107,7 +112,8 @@ static inline void debug_dma_unmap_page(struct device *dev, dma_addr_t addr,
+ }
+ 
+ static inline void debug_dma_map_sg(struct device *dev, struct scatterlist *sg,
+-				    int nents, int mapped_ents, int direction)
++				    int nents, int mapped_ents, int direction,
++				    unsigned long attrs)
+ {
+ }
+ 
+@@ -118,7 +124,8 @@ static inline void debug_dma_unmap_sg(struct device *dev,
+ }
+ 
+ static inline void debug_dma_alloc_coherent(struct device *dev, size_t size,
+-					    dma_addr_t dma_addr, void *virt)
++					    dma_addr_t dma_addr, void *virt,
++					    unsigned long attrs)
+ {
+ }
+ 
+@@ -129,7 +136,8 @@ static inline void debug_dma_free_coherent(struct device *dev, size_t size,
+ 
+ static inline void debug_dma_map_resource(struct device *dev, phys_addr_t addr,
+ 					  size_t size, int direction,
+-					  dma_addr_t dma_addr)
++					  dma_addr_t dma_addr,
++					  unsigned long attrs)
+ {
+ }
+ 
+diff --git a/kernel/dma/debug.c b/kernel/dma/debug.c
+index 341ecca89d72..1a227fa8115a 100644
+--- a/kernel/dma/debug.c
++++ b/kernel/dma/debug.c
+@@ -565,7 +565,7 @@ static void active_cacheline_remove(struct dma_debug_entry *entry)
+  * Wrapper function for adding an entry to the hash.
+  * This function takes care of locking itself.
+  */
+-static void add_dma_entry(struct dma_debug_entry *entry)
++static void add_dma_entry(struct dma_debug_entry *entry, unsigned long attrs)
+ {
+ 	struct hash_bucket *bucket;
+ 	unsigned long flags;
+@@ -579,7 +579,7 @@ static void add_dma_entry(struct dma_debug_entry *entry)
+ 	if (rc == -ENOMEM) {
+ 		pr_err("cacheline tracking ENOMEM, dma-debug disabled\n");
+ 		global_disable = true;
+-	} else if (rc == -EEXIST) {
++	} else if (rc == -EEXIST && !(attrs & DMA_ATTR_SKIP_CPU_SYNC)) {
+ 		err_printk(entry->dev, entry,
+ 			"cacheline tracking EEXIST, overlapping mappings aren't supported\n");
+ 	}
+@@ -1185,7 +1185,8 @@ void debug_dma_map_single(struct device *dev, const void *addr,
+ EXPORT_SYMBOL(debug_dma_map_single);
+ 
+ void debug_dma_map_page(struct device *dev, struct page *page, size_t offset,
+-			size_t size, int direction, dma_addr_t dma_addr)
++			size_t size, int direction, dma_addr_t dma_addr,
++			unsigned long attrs)
+ {
+ 	struct dma_debug_entry *entry;
+ 
+@@ -1216,7 +1217,7 @@ void debug_dma_map_page(struct device *dev, struct page *page, size_t offset,
+ 		check_for_illegal_area(dev, addr, size);
+ 	}
+ 
+-	add_dma_entry(entry);
++	add_dma_entry(entry, attrs);
+ }
+ 
+ void debug_dma_mapping_error(struct device *dev, dma_addr_t dma_addr)
+@@ -1274,7 +1275,8 @@ void debug_dma_unmap_page(struct device *dev, dma_addr_t addr,
+ }
+ 
+ void debug_dma_map_sg(struct device *dev, struct scatterlist *sg,
+-		      int nents, int mapped_ents, int direction)
++		      int nents, int mapped_ents, int direction,
++		      unsigned long attrs)
+ {
+ 	struct dma_debug_entry *entry;
+ 	struct scatterlist *s;
+@@ -1306,7 +1308,7 @@ void debug_dma_map_sg(struct device *dev, struct scatterlist *sg,
+ 
+ 		check_sg_segment(dev, s);
+ 
+-		add_dma_entry(entry);
++		add_dma_entry(entry, attrs);
+ 	}
+ }
+ 
+@@ -1362,7 +1364,8 @@ void debug_dma_unmap_sg(struct device *dev, struct scatterlist *sglist,
+ }
+ 
+ void debug_dma_alloc_coherent(struct device *dev, size_t size,
+-			      dma_addr_t dma_addr, void *virt)
++			      dma_addr_t dma_addr, void *virt,
++			      unsigned long attrs)
+ {
+ 	struct dma_debug_entry *entry;
+ 
+@@ -1392,7 +1395,7 @@ void debug_dma_alloc_coherent(struct device *dev, size_t size,
+ 	else
+ 		entry->pfn = page_to_pfn(virt_to_page(virt));
+ 
+-	add_dma_entry(entry);
++	add_dma_entry(entry, attrs);
+ }
+ 
+ void debug_dma_free_coherent(struct device *dev, size_t size,
+@@ -1423,7 +1426,8 @@ void debug_dma_free_coherent(struct device *dev, size_t size,
+ }
+ 
+ void debug_dma_map_resource(struct device *dev, phys_addr_t addr, size_t size,
+-			    int direction, dma_addr_t dma_addr)
++			    int direction, dma_addr_t dma_addr,
++			    unsigned long attrs)
+ {
+ 	struct dma_debug_entry *entry;
+ 
+@@ -1443,7 +1447,7 @@ void debug_dma_map_resource(struct device *dev, phys_addr_t addr, size_t size,
+ 	entry->direction	= direction;
+ 	entry->map_err_type	= MAP_ERR_NOT_CHECKED;
+ 
+-	add_dma_entry(entry);
++	add_dma_entry(entry, attrs);
+ }
+ 
+ void debug_dma_unmap_resource(struct device *dev, dma_addr_t dma_addr,
+* Unmerged path kernel/dma/mapping.c
