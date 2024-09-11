@@ -1,0 +1,541 @@
+ceph: pass filp to ceph_get_caps()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Yan, Zheng <zyan@redhat.com>
+commit 5e3ded1bb642f2d7a6ded6deeafb155d5b5312f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/5e3ded1b.failed
+
+Also change several other functions' arguments, no logical changes.
+This is preparetion for later patch that checks filp error.
+
+	Signed-off-by: "Yan, Zheng" <zyan@redhat.com>
+	Reviewed-by: Jeff Layton <jlayton@kernel.org>
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+(cherry picked from commit 5e3ded1bb642f2d7a6ded6deeafb155d5b5312f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/ceph/file.c
+diff --cc fs/ceph/file.c
+index 212dcf3021b3,fb007b75fb17..000000000000
+--- a/fs/ceph/file.c
++++ b/fs/ceph/file.c
+@@@ -1801,6 -1808,322 +1802,325 @@@ unlock
+  	return ret;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * This function tries to get FILE_WR capabilities for dst_ci and FILE_RD for
++  * src_ci.  Two attempts are made to obtain both caps, and an error is return if
++  * this fails; zero is returned on success.
++  */
++ static int get_rd_wr_caps(struct file *src_filp, int *src_got,
++ 			  struct file *dst_filp,
++ 			  loff_t dst_endoff, int *dst_got)
++ {
++ 	int ret = 0;
++ 	bool retrying = false;
++ 
++ retry_caps:
++ 	ret = ceph_get_caps(dst_filp, CEPH_CAP_FILE_WR, CEPH_CAP_FILE_BUFFER,
++ 			    dst_endoff, dst_got, NULL);
++ 	if (ret < 0)
++ 		return ret;
++ 
++ 	/*
++ 	 * Since we're already holding the FILE_WR capability for the dst file,
++ 	 * we would risk a deadlock by using ceph_get_caps.  Thus, we'll do some
++ 	 * retry dance instead to try to get both capabilities.
++ 	 */
++ 	ret = ceph_try_get_caps(file_inode(src_filp),
++ 				CEPH_CAP_FILE_RD, CEPH_CAP_FILE_SHARED,
++ 				false, src_got);
++ 	if (ret <= 0) {
++ 		/* Start by dropping dst_ci caps and getting src_ci caps */
++ 		ceph_put_cap_refs(ceph_inode(file_inode(dst_filp)), *dst_got);
++ 		if (retrying) {
++ 			if (!ret)
++ 				/* ceph_try_get_caps masks EAGAIN */
++ 				ret = -EAGAIN;
++ 			return ret;
++ 		}
++ 		ret = ceph_get_caps(src_filp, CEPH_CAP_FILE_RD,
++ 				    CEPH_CAP_FILE_SHARED, -1, src_got, NULL);
++ 		if (ret < 0)
++ 			return ret;
++ 		/*... drop src_ci caps too, and retry */
++ 		ceph_put_cap_refs(ceph_inode(file_inode(src_filp)), *src_got);
++ 		retrying = true;
++ 		goto retry_caps;
++ 	}
++ 	return ret;
++ }
++ 
++ static void put_rd_wr_caps(struct ceph_inode_info *src_ci, int src_got,
++ 			   struct ceph_inode_info *dst_ci, int dst_got)
++ {
++ 	ceph_put_cap_refs(src_ci, src_got);
++ 	ceph_put_cap_refs(dst_ci, dst_got);
++ }
++ 
++ /*
++  * This function does several size-related checks, returning an error if:
++  *  - source file is smaller than off+len
++  *  - destination file size is not OK (inode_newsize_ok())
++  *  - max bytes quotas is exceeded
++  */
++ static int is_file_size_ok(struct inode *src_inode, struct inode *dst_inode,
++ 			   loff_t src_off, loff_t dst_off, size_t len)
++ {
++ 	loff_t size, endoff;
++ 
++ 	size = i_size_read(src_inode);
++ 	/*
++ 	 * Don't copy beyond source file EOF.  Instead of simply setting length
++ 	 * to (size - src_off), just drop to VFS default implementation, as the
++ 	 * local i_size may be stale due to other clients writing to the source
++ 	 * inode.
++ 	 */
++ 	if (src_off + len > size) {
++ 		dout("Copy beyond EOF (%llu + %zu > %llu)\n",
++ 		     src_off, len, size);
++ 		return -EOPNOTSUPP;
++ 	}
++ 	size = i_size_read(dst_inode);
++ 
++ 	endoff = dst_off + len;
++ 	if (inode_newsize_ok(dst_inode, endoff))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (ceph_quota_is_max_bytes_exceeded(dst_inode, endoff))
++ 		return -EDQUOT;
++ 
++ 	return 0;
++ }
++ 
++ static ssize_t __ceph_copy_file_range(struct file *src_file, loff_t src_off,
++ 				      struct file *dst_file, loff_t dst_off,
++ 				      size_t len, unsigned int flags)
++ {
++ 	struct inode *src_inode = file_inode(src_file);
++ 	struct inode *dst_inode = file_inode(dst_file);
++ 	struct ceph_inode_info *src_ci = ceph_inode(src_inode);
++ 	struct ceph_inode_info *dst_ci = ceph_inode(dst_inode);
++ 	struct ceph_cap_flush *prealloc_cf;
++ 	struct ceph_object_locator src_oloc, dst_oloc;
++ 	struct ceph_object_id src_oid, dst_oid;
++ 	loff_t endoff = 0, size;
++ 	ssize_t ret = -EIO;
++ 	u64 src_objnum, dst_objnum, src_objoff, dst_objoff;
++ 	u32 src_objlen, dst_objlen, object_size;
++ 	int src_got = 0, dst_got = 0, err, dirty;
++ 	bool do_final_copy = false;
++ 
++ 	if (src_inode->i_sb != dst_inode->i_sb)
++ 		return -EXDEV;
++ 	if (ceph_snap(dst_inode) != CEPH_NOSNAP)
++ 		return -EROFS;
++ 
++ 	/*
++ 	 * Some of the checks below will return -EOPNOTSUPP, which will force a
++ 	 * fallback to the default VFS copy_file_range implementation.  This is
++ 	 * desirable in several cases (for ex, the 'len' is smaller than the
++ 	 * size of the objects, or in cases where that would be more
++ 	 * efficient).
++ 	 */
++ 
++ 	if (ceph_test_mount_opt(ceph_inode_to_client(src_inode), NOCOPYFROM))
++ 		return -EOPNOTSUPP;
++ 
++ 	if ((src_ci->i_layout.stripe_unit != dst_ci->i_layout.stripe_unit) ||
++ 	    (src_ci->i_layout.stripe_count != dst_ci->i_layout.stripe_count) ||
++ 	    (src_ci->i_layout.object_size != dst_ci->i_layout.object_size))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (len < src_ci->i_layout.object_size)
++ 		return -EOPNOTSUPP; /* no remote copy will be done */
++ 
++ 	prealloc_cf = ceph_alloc_cap_flush();
++ 	if (!prealloc_cf)
++ 		return -ENOMEM;
++ 
++ 	/* Start by sync'ing the source and destination files */
++ 	ret = file_write_and_wait_range(src_file, src_off, (src_off + len));
++ 	if (ret < 0) {
++ 		dout("failed to write src file (%zd)\n", ret);
++ 		goto out;
++ 	}
++ 	ret = file_write_and_wait_range(dst_file, dst_off, (dst_off + len));
++ 	if (ret < 0) {
++ 		dout("failed to write dst file (%zd)\n", ret);
++ 		goto out;
++ 	}
++ 
++ 	/*
++ 	 * We need FILE_WR caps for dst_ci and FILE_RD for src_ci as other
++ 	 * clients may have dirty data in their caches.  And OSDs know nothing
++ 	 * about caps, so they can't safely do the remote object copies.
++ 	 */
++ 	err = get_rd_wr_caps(src_file, &src_got,
++ 			     dst_file, (dst_off + len), &dst_got);
++ 	if (err < 0) {
++ 		dout("get_rd_wr_caps returned %d\n", err);
++ 		ret = -EOPNOTSUPP;
++ 		goto out;
++ 	}
++ 
++ 	ret = is_file_size_ok(src_inode, dst_inode, src_off, dst_off, len);
++ 	if (ret < 0)
++ 		goto out_caps;
++ 
++ 	size = i_size_read(dst_inode);
++ 	endoff = dst_off + len;
++ 
++ 	/* Drop dst file cached pages */
++ 	ret = invalidate_inode_pages2_range(dst_inode->i_mapping,
++ 					    dst_off >> PAGE_SHIFT,
++ 					    endoff >> PAGE_SHIFT);
++ 	if (ret < 0) {
++ 		dout("Failed to invalidate inode pages (%zd)\n", ret);
++ 		ret = 0; /* XXX */
++ 	}
++ 	src_oloc.pool = src_ci->i_layout.pool_id;
++ 	src_oloc.pool_ns = ceph_try_get_string(src_ci->i_layout.pool_ns);
++ 	dst_oloc.pool = dst_ci->i_layout.pool_id;
++ 	dst_oloc.pool_ns = ceph_try_get_string(dst_ci->i_layout.pool_ns);
++ 
++ 	ceph_calc_file_object_mapping(&src_ci->i_layout, src_off,
++ 				      src_ci->i_layout.object_size,
++ 				      &src_objnum, &src_objoff, &src_objlen);
++ 	ceph_calc_file_object_mapping(&dst_ci->i_layout, dst_off,
++ 				      dst_ci->i_layout.object_size,
++ 				      &dst_objnum, &dst_objoff, &dst_objlen);
++ 	/* object-level offsets need to the same */
++ 	if (src_objoff != dst_objoff) {
++ 		ret = -EOPNOTSUPP;
++ 		goto out_caps;
++ 	}
++ 
++ 	/*
++ 	 * Do a manual copy if the object offset isn't object aligned.
++ 	 * 'src_objlen' contains the bytes left until the end of the object,
++ 	 * starting at the src_off
++ 	 */
++ 	if (src_objoff) {
++ 		/*
++ 		 * we need to temporarily drop all caps as we'll be calling
++ 		 * {read,write}_iter, which will get caps again.
++ 		 */
++ 		put_rd_wr_caps(src_ci, src_got, dst_ci, dst_got);
++ 		ret = do_splice_direct(src_file, &src_off, dst_file,
++ 				       &dst_off, src_objlen, flags);
++ 		if (ret < 0) {
++ 			dout("do_splice_direct returned %d\n", err);
++ 			goto out;
++ 		}
++ 		len -= ret;
++ 		err = get_rd_wr_caps(src_file, &src_got,
++ 				     dst_file, (dst_off + len), &dst_got);
++ 		if (err < 0)
++ 			goto out;
++ 		err = is_file_size_ok(src_inode, dst_inode,
++ 				      src_off, dst_off, len);
++ 		if (err < 0)
++ 			goto out_caps;
++ 	}
++ 	object_size = src_ci->i_layout.object_size;
++ 	while (len >= object_size) {
++ 		ceph_calc_file_object_mapping(&src_ci->i_layout, src_off,
++ 					      object_size, &src_objnum,
++ 					      &src_objoff, &src_objlen);
++ 		ceph_calc_file_object_mapping(&dst_ci->i_layout, dst_off,
++ 					      object_size, &dst_objnum,
++ 					      &dst_objoff, &dst_objlen);
++ 		ceph_oid_init(&src_oid);
++ 		ceph_oid_printf(&src_oid, "%llx.%08llx",
++ 				src_ci->i_vino.ino, src_objnum);
++ 		ceph_oid_init(&dst_oid);
++ 		ceph_oid_printf(&dst_oid, "%llx.%08llx",
++ 				dst_ci->i_vino.ino, dst_objnum);
++ 		/* Do an object remote copy */
++ 		err = ceph_osdc_copy_from(
++ 			&ceph_inode_to_client(src_inode)->client->osdc,
++ 			src_ci->i_vino.snap, 0,
++ 			&src_oid, &src_oloc,
++ 			CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL |
++ 			CEPH_OSD_OP_FLAG_FADVISE_NOCACHE,
++ 			&dst_oid, &dst_oloc,
++ 			CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL |
++ 			CEPH_OSD_OP_FLAG_FADVISE_DONTNEED, 0);
++ 		if (err) {
++ 			dout("ceph_osdc_copy_from returned %d\n", err);
++ 			if (!ret)
++ 				ret = err;
++ 			goto out_caps;
++ 		}
++ 		len -= object_size;
++ 		src_off += object_size;
++ 		dst_off += object_size;
++ 		ret += object_size;
++ 	}
++ 
++ 	if (len)
++ 		/* We still need one final local copy */
++ 		do_final_copy = true;
++ 
++ 	file_update_time(dst_file);
++ 	inode_inc_iversion_raw(dst_inode);
++ 
++ 	if (endoff > size) {
++ 		int caps_flags = 0;
++ 
++ 		/* Let the MDS know about dst file size change */
++ 		if (ceph_quota_is_max_bytes_approaching(dst_inode, endoff))
++ 			caps_flags |= CHECK_CAPS_NODELAY;
++ 		if (ceph_inode_set_size(dst_inode, endoff))
++ 			caps_flags |= CHECK_CAPS_AUTHONLY;
++ 		if (caps_flags)
++ 			ceph_check_caps(dst_ci, caps_flags, NULL);
++ 	}
++ 	/* Mark Fw dirty */
++ 	spin_lock(&dst_ci->i_ceph_lock);
++ 	dst_ci->i_inline_version = CEPH_INLINE_NONE;
++ 	dirty = __ceph_mark_dirty_caps(dst_ci, CEPH_CAP_FILE_WR, &prealloc_cf);
++ 	spin_unlock(&dst_ci->i_ceph_lock);
++ 	if (dirty)
++ 		__mark_inode_dirty(dst_inode, dirty);
++ 
++ out_caps:
++ 	put_rd_wr_caps(src_ci, src_got, dst_ci, dst_got);
++ 
++ 	if (do_final_copy) {
++ 		err = do_splice_direct(src_file, &src_off, dst_file,
++ 				       &dst_off, len, flags);
++ 		if (err < 0) {
++ 			dout("do_splice_direct returned %d\n", err);
++ 			goto out;
++ 		}
++ 		len -= err;
++ 		ret += err;
++ 	}
++ 
++ out:
++ 	ceph_free_cap_flush(prealloc_cf);
++ 
++ 	return ret;
++ }
++ 
++ static ssize_t ceph_copy_file_range(struct file *src_file, loff_t src_off,
++ 				    struct file *dst_file, loff_t dst_off,
++ 				    size_t len, unsigned int flags)
++ {
++ 	ssize_t ret;
++ 
++ 	ret = __ceph_copy_file_range(src_file, src_off, dst_file, dst_off,
++ 				     len, flags);
++ 
++ 	if (ret == -EOPNOTSUPP || ret == -EXDEV)
++ 		ret = generic_copy_file_range(src_file, src_off, dst_file,
++ 					      dst_off, len, flags);
++ 	return ret;
++ }
++ 
+++>>>>>>> 5e3ded1bb642 (ceph: pass filp to ceph_get_caps())
+  const struct file_operations ceph_file_fops = {
+  	.open = ceph_open,
+  	.release = ceph_release,
+diff --git a/fs/ceph/addr.c b/fs/ceph/addr.c
+index 41087dff4da6..5410e1f1b3f8 100644
+--- a/fs/ceph/addr.c
++++ b/fs/ceph/addr.c
+@@ -322,7 +322,8 @@ static int start_read(struct inode *inode, struct ceph_rw_context *rw_ctx,
+ 		/* caller of readpages does not hold buffer and read caps
+ 		 * (fadvise, madvise and readahead cases) */
+ 		int want = CEPH_CAP_FILE_CACHE;
+-		ret = ceph_try_get_caps(ci, CEPH_CAP_FILE_RD, want, true, &got);
++		ret = ceph_try_get_caps(inode, CEPH_CAP_FILE_RD, want,
++					true, &got);
+ 		if (ret < 0) {
+ 			dout("start_read %p, error getting cap\n", inode);
+ 		} else if (!(got & want)) {
+@@ -1452,7 +1453,8 @@ static vm_fault_t ceph_filemap_fault(struct vm_fault *vmf)
+ 		want = CEPH_CAP_FILE_CACHE;
+ 
+ 	got = 0;
+-	err = ceph_get_caps(ci, CEPH_CAP_FILE_RD, want, -1, &got, &pinned_page);
++	err = ceph_get_caps(vma->vm_file, CEPH_CAP_FILE_RD, want, -1,
++			    &got, &pinned_page);
+ 	if (err < 0)
+ 		goto out_restore;
+ 
+@@ -1568,7 +1570,7 @@ static vm_fault_t ceph_page_mkwrite(struct vm_fault *vmf)
+ 		want = CEPH_CAP_FILE_BUFFER;
+ 
+ 	got = 0;
+-	err = ceph_get_caps(ci, CEPH_CAP_FILE_WR, want, off + len,
++	err = ceph_get_caps(vma->vm_file, CEPH_CAP_FILE_WR, want, off + len,
+ 			    &got, NULL);
+ 	if (err < 0)
+ 		goto out_free;
+@@ -1988,10 +1990,11 @@ static int __ceph_pool_perm_get(struct ceph_inode_info *ci,
+ 	return err;
+ }
+ 
+-int ceph_pool_perm_check(struct ceph_inode_info *ci, int need)
++int ceph_pool_perm_check(struct inode *inode, int need)
+ {
+-	s64 pool;
++	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	struct ceph_string *pool_ns;
++	s64 pool;
+ 	int ret, flags;
+ 
+ 	if (ci->i_vino.snap != CEPH_NOSNAP) {
+@@ -2003,7 +2006,7 @@ int ceph_pool_perm_check(struct ceph_inode_info *ci, int need)
+ 		return 0;
+ 	}
+ 
+-	if (ceph_test_mount_opt(ceph_inode_to_client(&ci->vfs_inode),
++	if (ceph_test_mount_opt(ceph_inode_to_client(inode),
+ 				NOPOOLPERM))
+ 		return 0;
+ 
+diff --git a/fs/ceph/caps.c b/fs/ceph/caps.c
+index 25654e58a962..e05bc7e75d90 100644
+--- a/fs/ceph/caps.c
++++ b/fs/ceph/caps.c
+@@ -2570,10 +2570,10 @@ static void __take_cap_refs(struct ceph_inode_info *ci, int got,
+  *
+  * FIXME: how does a 0 return differ from -EAGAIN?
+  */
+-static int try_get_cap_refs(struct ceph_inode_info *ci, int need, int want,
++static int try_get_cap_refs(struct inode *inode, int need, int want,
+ 			    loff_t endoff, bool nonblock, int *got)
+ {
+-	struct inode *inode = &ci->vfs_inode;
++	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	struct ceph_mds_client *mdsc = ceph_inode_to_client(inode)->mdsc;
+ 	int ret = 0;
+ 	int have, implemented;
+@@ -2741,18 +2741,18 @@ static void check_max_size(struct inode *inode, loff_t endoff)
+ 		ceph_check_caps(ci, CHECK_CAPS_AUTHONLY, NULL);
+ }
+ 
+-int ceph_try_get_caps(struct ceph_inode_info *ci, int need, int want,
++int ceph_try_get_caps(struct inode *inode, int need, int want,
+ 		      bool nonblock, int *got)
+ {
+ 	int ret;
+ 
+ 	BUG_ON(need & ~CEPH_CAP_FILE_RD);
+ 	BUG_ON(want & ~(CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO|CEPH_CAP_FILE_SHARED));
+-	ret = ceph_pool_perm_check(ci, need);
++	ret = ceph_pool_perm_check(inode, need);
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	ret = try_get_cap_refs(ci, need, want, 0, nonblock, got);
++	ret = try_get_cap_refs(inode, need, want, 0, nonblock, got);
+ 	return ret == -EAGAIN ? 0 : ret;
+ }
+ 
+@@ -2761,21 +2761,23 @@ int ceph_try_get_caps(struct ceph_inode_info *ci, int need, int want,
+  * due to a small max_size, make sure we check_max_size (and possibly
+  * ask the mds) so we don't get hung up indefinitely.
+  */
+-int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
++int ceph_get_caps(struct file *filp, int need, int want,
+ 		  loff_t endoff, int *got, struct page **pinned_page)
+ {
++	struct inode *inode = file_inode(filp);
++	struct ceph_inode_info *ci = ceph_inode(inode);
+ 	int _got, ret;
+ 
+-	ret = ceph_pool_perm_check(ci, need);
++	ret = ceph_pool_perm_check(inode, need);
+ 	if (ret < 0)
+ 		return ret;
+ 
+ 	while (true) {
+ 		if (endoff > 0)
+-			check_max_size(&ci->vfs_inode, endoff);
++			check_max_size(inode, endoff);
+ 
+ 		_got = 0;
+-		ret = try_get_cap_refs(ci, need, want, endoff,
++		ret = try_get_cap_refs(inode, need, want, endoff,
+ 				       false, &_got);
+ 		if (ret == -EAGAIN)
+ 			continue;
+@@ -2783,8 +2785,8 @@ int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+ 			DEFINE_WAIT_FUNC(wait, woken_wake_function);
+ 			add_wait_queue(&ci->i_cap_wq, &wait);
+ 
+-			while (!(ret = try_get_cap_refs(ci, need, want, endoff,
+-							true, &_got))) {
++			while (!(ret = try_get_cap_refs(inode, need, want,
++							endoff, true, &_got))) {
+ 				if (signal_pending(current)) {
+ 					ret = -ERESTARTSYS;
+ 					break;
+@@ -2799,7 +2801,7 @@ int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+ 		if (ret < 0) {
+ 			if (ret == -ESTALE) {
+ 				/* session was killed, try renew caps */
+-				ret = ceph_renew_caps(&ci->vfs_inode);
++				ret = ceph_renew_caps(inode);
+ 				if (ret == 0)
+ 					continue;
+ 			}
+@@ -2808,9 +2810,9 @@ int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+ 
+ 		if (ci->i_inline_version != CEPH_INLINE_NONE &&
+ 		    (_got & (CEPH_CAP_FILE_CACHE|CEPH_CAP_FILE_LAZYIO)) &&
+-		    i_size_read(&ci->vfs_inode) > 0) {
++		    i_size_read(inode) > 0) {
+ 			struct page *page =
+-				find_get_page(ci->vfs_inode.i_mapping, 0);
++				find_get_page(inode->i_mapping, 0);
+ 			if (page) {
+ 				if (PageUptodate(page)) {
+ 					*pinned_page = page;
+@@ -2829,7 +2831,7 @@ int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
+ 			 * getattr request will bring inline data into
+ 			 * page cache
+ 			 */
+-			ret = __ceph_do_getattr(&ci->vfs_inode, NULL,
++			ret = __ceph_do_getattr(inode, NULL,
+ 						CEPH_STAT_CAP_INLINE_DATA,
+ 						true);
+ 			if (ret < 0)
+* Unmerged path fs/ceph/file.c
+diff --git a/fs/ceph/super.h b/fs/ceph/super.h
+index 774941b808c1..2b15cb1001f5 100644
+--- a/fs/ceph/super.h
++++ b/fs/ceph/super.h
+@@ -1039,9 +1039,9 @@ extern int ceph_encode_dentry_release(void **p, struct dentry *dn,
+ 				      struct inode *dir,
+ 				      int mds, int drop, int unless);
+ 
+-extern int ceph_get_caps(struct ceph_inode_info *ci, int need, int want,
++extern int ceph_get_caps(struct file *filp, int need, int want,
+ 			 loff_t endoff, int *got, struct page **pinned_page);
+-extern int ceph_try_get_caps(struct ceph_inode_info *ci,
++extern int ceph_try_get_caps(struct inode *inode,
+ 			     int need, int want, bool nonblock, int *got);
+ 
+ /* for counting open files by mode */
+@@ -1052,7 +1052,7 @@ extern void ceph_put_fmode(struct ceph_inode_info *ci, int mode);
+ extern const struct address_space_operations ceph_aops;
+ extern int ceph_mmap(struct file *file, struct vm_area_struct *vma);
+ extern int ceph_uninline_data(struct file *filp, struct page *locked_page);
+-extern int ceph_pool_perm_check(struct ceph_inode_info *ci, int need);
++extern int ceph_pool_perm_check(struct inode *inode, int need);
+ extern void ceph_pool_perm_destroy(struct ceph_mds_client* mdsc);
+ 
+ /* file.c */
