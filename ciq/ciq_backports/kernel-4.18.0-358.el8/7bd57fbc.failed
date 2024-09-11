@@ -1,0 +1,158 @@
+vsprintf: don't obfuscate NULL and error pointers
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Ilya Dryomov <idryomov@gmail.com>
+commit 7bd57fbc4a4ddedc664cad0bbced1b469e24e921
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/7bd57fbc.failed
+
+I don't see what security concern is addressed by obfuscating NULL
+and IS_ERR() error pointers, printed with %p/%pK.  Given the number
+of sites where %p is used (over 10000) and the fact that NULL pointers
+aren't uncommon, it probably wouldn't take long for an attacker to
+find the hash that corresponds to 0.  Although harder, the same goes
+for most common error values, such as -1, -2, -11, -14, etc.
+
+The NULL part actually fixes a regression: NULL pointers weren't
+obfuscated until commit 3e5903eb9cff ("vsprintf: Prevent crash when
+dereferencing invalid pointers") which went into 5.2.  I'm tacking
+the IS_ERR() part on here because error pointers won't leak kernel
+addresses and printing them as pointers shouldn't be any different
+from e.g. %d with PTR_ERR_OR_ZERO().  Obfuscating them just makes
+debugging based on existing pr_debug and friends excruciating.
+
+Note that the "always print 0's for %pK when kptr_restrict == 2"
+behaviour which goes way back is left as is.
+
+Example output with the patch applied:
+
+                             ptr         error-ptr              NULL
+ %p:            0000000001f8cc5b  fffffffffffffff2  0000000000000000
+ %pK, kptr = 0: 0000000001f8cc5b  fffffffffffffff2  0000000000000000
+ %px:           ffff888048c04020  fffffffffffffff2  0000000000000000
+ %pK, kptr = 1: ffff888048c04020  fffffffffffffff2  0000000000000000
+ %pK, kptr = 2: 0000000000000000  0000000000000000  0000000000000000
+
+Fixes: 3e5903eb9cff ("vsprintf: Prevent crash when dereferencing invalid pointers")
+	Signed-off-by: Ilya Dryomov <idryomov@gmail.com>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Reviewed-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+	Acked-by: Steven Rostedt (VMware) <rostedt@goodmis.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit 7bd57fbc4a4ddedc664cad0bbced1b469e24e921)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	lib/vsprintf.c
+diff --cc lib/vsprintf.c
+index a410f9127c11,7c47ad52ce2f..000000000000
+--- a/lib/vsprintf.c
++++ b/lib/vsprintf.c
+@@@ -817,6 -778,42 +817,45 @@@ static char *ptr_to_id(char *buf, char 
+  #else
+  	hashval = (unsigned long)siphash_1u32((u32)ptr, &ptr_key);
+  #endif
+++<<<<<<< HEAD
+++=======
++ 	*hashval_out = hashval;
++ 	return 0;
++ }
++ 
++ int ptr_to_hashval(const void *ptr, unsigned long *hashval_out)
++ {
++ 	return __ptr_to_hashval(ptr, hashval_out);
++ }
++ 
++ static char *ptr_to_id(char *buf, char *end, const void *ptr,
++ 		       struct printf_spec spec)
++ {
++ 	const char *str = sizeof(ptr) == 8 ? "(____ptrval____)" : "(ptrval)";
++ 	unsigned long hashval;
++ 	int ret;
++ 
++ 	/*
++ 	 * Print the real pointer value for NULL and error pointers,
++ 	 * as they are not actual addresses.
++ 	 */
++ 	if (IS_ERR_OR_NULL(ptr))
++ 		return pointer_string(buf, end, ptr, spec);
++ 
++ 	/* When debugging early boot use non-cryptographically secure hash. */
++ 	if (unlikely(debug_boot_weak_hash)) {
++ 		hashval = hash_long((unsigned long)ptr, 32);
++ 		return pointer_string(buf, end, (const void *)hashval, spec);
++ 	}
++ 
++ 	ret = __ptr_to_hashval(ptr, &hashval);
++ 	if (ret) {
++ 		spec.field_width = 2 * sizeof(ptr);
++ 		/* string length must be less than default_width */
++ 		return error_string(buf, end, str, spec);
++ 	}
++ 
+++>>>>>>> 7bd57fbc4a4d (vsprintf: don't obfuscate NULL and error pointers)
+  	return pointer_string(buf, end, (const void *)hashval, spec);
+  }
+  
+diff --git a/lib/test_printf.c b/lib/test_printf.c
+index 789a78f18794..a6ed15dd06e8 100644
+--- a/lib/test_printf.c
++++ b/lib/test_printf.c
+@@ -216,6 +216,7 @@ test_string(void)
+ #define PTR_STR "ffff0123456789ab"
+ #define PTR_VAL_NO_CRNG "(____ptrval____)"
+ #define ZEROS "00000000"	/* hex 32 zero bits */
++#define ONES "ffffffff"		/* hex 32 one bits */
+ 
+ static int __init
+ plain_format(void)
+@@ -247,6 +248,7 @@ plain_format(void)
+ #define PTR_STR "456789ab"
+ #define PTR_VAL_NO_CRNG "(ptrval)"
+ #define ZEROS ""
++#define ONES ""
+ 
+ static int __init
+ plain_format(void)
+@@ -338,14 +340,28 @@ test_hashed(const char *fmt, const void *p)
+ 	test(buf, fmt, p);
+ }
+ 
++/*
++ * NULL pointers aren't hashed.
++ */
+ static void __init
+ null_pointer(void)
+ {
+-	test_hashed("%p", NULL);
++	test(ZEROS "00000000", "%p", NULL);
+ 	test(ZEROS "00000000", "%px", NULL);
+ 	test("(null)", "%pE", NULL);
+ }
+ 
++/*
++ * Error pointers aren't hashed.
++ */
++static void __init
++error_pointer(void)
++{
++	test(ONES "fffffff5", "%p", ERR_PTR(-11));
++	test(ONES "fffffff5", "%px", ERR_PTR(-11));
++	test("(efault)", "%pE", ERR_PTR(-11));
++}
++
+ #define PTR_INVALID ((void *)0x000000ab)
+ 
+ static void __init
+@@ -729,6 +745,7 @@ test_pointer(void)
+ {
+ 	plain();
+ 	null_pointer();
++	error_pointer();
+ 	invalid_pointer();
+ 	symbol_ptr();
+ 	kernel_ptr();
+* Unmerged path lib/vsprintf.c
