@@ -1,0 +1,115 @@
+nvme: fix potential memory leaks in nvme_cdev_add
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Guoqing Jiang <jgq516@gmail.com>
+commit 3596a06583a16cf7f76d836440dfba5714c9c710
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/3596a065.failed
+
+We need to call put_device if cdev_device_add failed, otherwise
+kmemleak has below report.
+
+[<0000000024c71758>] kmem_cache_alloc_trace+0x233/0x480
+[<00000000ad2813ed>] device_add+0x7ff/0xe10
+[<0000000035bc54c4>] cdev_device_add+0x72/0xa0
+[<000000006c9aa1e8>] nvme_cdev_add+0xa9/0xf0 [nvme_core]
+[<000000003c4d492d>] nvme_mpath_set_live+0x251/0x290 [nvme_core]
+[<00000000889a58da>] nvme_mpath_add_disk+0x268/0x320 [nvme_core]
+[<00000000192e7161>] nvme_alloc_ns+0x669/0xac0 [nvme_core]
+[<000000007a1a6041>] nvme_validate_or_alloc_ns+0x156/0x280 [nvme_core]
+[<000000003a763c35>] nvme_scan_work+0x221/0x3c0 [nvme_core]
+[<000000009ff10706>] process_one_work+0x5cf/0xb10
+[<000000000644ee25>] worker_thread+0x7a/0x680
+[<00000000285ebd2f>] kthread+0x1c6/0x210
+[<00000000e297c6ea>] ret_from_fork+0x22/0x30
+
+Fixes: 2637baed7801 ("nvme: introduce generic per-namespace chardev")
+	Signed-off-by: Guoqing Jiang <jiangguoqing@kylinos.cn>
+	Reviewed-by: Javier González <javier.gonz@samsung.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Chaitanya Kulkarni <chaitanya.kulkarni@wdc.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 3596a06583a16cf7f76d836440dfba5714c9c710)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/nvme/host/core.c
+diff --cc drivers/nvme/host/core.c
+index a6d2912c76ef,66973bb56305..000000000000
+--- a/drivers/nvme/host/core.c
++++ b/drivers/nvme/host/core.c
+@@@ -3890,6 -3465,68 +3890,71 @@@ static int __nvme_check_ids(struct nvme
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void nvme_cdev_del(struct cdev *cdev, struct device *cdev_device)
++ {
++ 	cdev_device_del(cdev, cdev_device);
++ 	ida_simple_remove(&nvme_ns_chr_minor_ida, MINOR(cdev_device->devt));
++ }
++ 
++ int nvme_cdev_add(struct cdev *cdev, struct device *cdev_device,
++ 		const struct file_operations *fops, struct module *owner)
++ {
++ 	int minor, ret;
++ 
++ 	minor = ida_simple_get(&nvme_ns_chr_minor_ida, 0, 0, GFP_KERNEL);
++ 	if (minor < 0)
++ 		return minor;
++ 	cdev_device->devt = MKDEV(MAJOR(nvme_ns_chr_devt), minor);
++ 	cdev_device->class = nvme_ns_chr_class;
++ 	device_initialize(cdev_device);
++ 	cdev_init(cdev, fops);
++ 	cdev->owner = owner;
++ 	ret = cdev_device_add(cdev, cdev_device);
++ 	if (ret) {
++ 		put_device(cdev_device);
++ 		ida_simple_remove(&nvme_ns_chr_minor_ida, minor);
++ 	}
++ 	return ret;
++ }
++ 
++ static int nvme_ns_chr_open(struct inode *inode, struct file *file)
++ {
++ 	return nvme_ns_open(container_of(inode->i_cdev, struct nvme_ns, cdev));
++ }
++ 
++ static int nvme_ns_chr_release(struct inode *inode, struct file *file)
++ {
++ 	nvme_ns_release(container_of(inode->i_cdev, struct nvme_ns, cdev));
++ 	return 0;
++ }
++ 
++ static const struct file_operations nvme_ns_chr_fops = {
++ 	.owner		= THIS_MODULE,
++ 	.open		= nvme_ns_chr_open,
++ 	.release	= nvme_ns_chr_release,
++ 	.unlocked_ioctl	= nvme_ns_chr_ioctl,
++ 	.compat_ioctl	= compat_ptr_ioctl,
++ };
++ 
++ static int nvme_add_ns_cdev(struct nvme_ns *ns)
++ {
++ 	int ret;
++ 
++ 	ns->cdev_device.parent = ns->ctrl->device;
++ 	ret = dev_set_name(&ns->cdev_device, "ng%dn%d",
++ 			   ns->ctrl->instance, ns->head->instance);
++ 	if (ret)
++ 		return ret;
++ 	ret = nvme_cdev_add(&ns->cdev, &ns->cdev_device, &nvme_ns_chr_fops,
++ 			    ns->ctrl->ops->module);
++ 	if (ret)
++ 		kfree_const(ns->cdev_device.kobj.name);
++ 	return ret;
++ }
++ 
+++>>>>>>> 3596a06583a1 (nvme: fix potential memory leaks in nvme_cdev_add)
+  static struct nvme_ns_head *nvme_alloc_ns_head(struct nvme_ctrl *ctrl,
+  		unsigned nsid, struct nvme_ns_ids *ids)
+  {
+* Unmerged path drivers/nvme/host/core.c
