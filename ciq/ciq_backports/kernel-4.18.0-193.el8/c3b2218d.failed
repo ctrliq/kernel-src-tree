@@ -1,0 +1,388 @@
+s390/qeth: remove static cmd buffer infrastructure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Julian Wiedmann <jwi@linux.ibm.com>
+commit c3b2218d3170178b2e5539bca3623f9519386d04
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c3b2218d.failed
+
+Now that all cmds are dynamically allocated, the code for static cmd
+buffers can go away entirely. Resulting in a nice reduction of
+code/data size & complexity, while removing the risk that
+qeth_clear_cmd_buffers() releases cmds that are still in-flight.
+
+	Signed-off-by: Julian Wiedmann <jwi@linux.ibm.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c3b2218d3170178b2e5539bca3623f9519386d04)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/s390/net/qeth_core.h
+#	drivers/s390/net/qeth_core_main.c
+diff --cc drivers/s390/net/qeth_core.h
+index 21a09e1fd4dc,715bff28d48e..000000000000
+--- a/drivers/s390/net/qeth_core.h
++++ b/drivers/s390/net/qeth_core.h
+@@@ -966,8 -968,23 +940,28 @@@ int qeth_send_ipa_cmd(struct qeth_card 
+  		  int (*reply_cb)
+  		  (struct qeth_card *, struct qeth_reply *, unsigned long),
+  		  void *);
+++<<<<<<< HEAD
+ +struct qeth_cmd_buffer *qeth_get_ipacmd_buffer(struct qeth_card *,
+ +			enum qeth_ipa_cmds, enum qeth_prot_versions);
+++=======
++ struct qeth_cmd_buffer *qeth_ipa_alloc_cmd(struct qeth_card *card,
++ 					   enum qeth_ipa_cmds cmd_code,
++ 					   enum qeth_prot_versions prot,
++ 					   unsigned int data_length);
++ struct qeth_cmd_buffer *qeth_alloc_cmd(struct qeth_channel *channel,
++ 				       unsigned int length, unsigned int ccws,
++ 				       long timeout);
++ struct qeth_cmd_buffer *qeth_get_setassparms_cmd(struct qeth_card *card,
++ 						 enum qeth_ipa_funcs ipa_func,
++ 						 u16 cmd_code,
++ 						 unsigned int data_length,
++ 						 enum qeth_prot_versions prot);
++ struct qeth_cmd_buffer *qeth_get_diag_cmd(struct qeth_card *card,
++ 					  enum qeth_diags_cmds sub_cmd,
++ 					  unsigned int data_length);
++ void qeth_put_cmd(struct qeth_cmd_buffer *iob);
++ 
+++>>>>>>> c3b2218d3170 (s390/qeth: remove static cmd buffer infrastructure)
+  struct sk_buff *qeth_core_get_next_skb(struct qeth_card *,
+  		struct qeth_qdio_buffer *, struct qdio_buffer_element **, int *,
+  		struct qeth_hdr **);
+@@@ -976,13 -993,10 +970,11 @@@ int qeth_poll(struct napi_struct *napi
+  void qeth_clear_ipacmd_list(struct qeth_card *);
+  int qeth_qdio_clear_card(struct qeth_card *, int);
+  void qeth_clear_working_pool_list(struct qeth_card *);
+- void qeth_clear_cmd_buffers(struct qeth_channel *);
+  void qeth_drain_output_queues(struct qeth_card *card);
+  void qeth_setadp_promisc_mode(struct qeth_card *);
+ +struct net_device_stats *qeth_get_stats(struct net_device *);
+  int qeth_setadpparms_change_macaddr(struct qeth_card *);
+  void qeth_tx_timeout(struct net_device *);
+- void qeth_release_buffer(struct qeth_cmd_buffer *iob);
+  void qeth_notify_reply(struct qeth_reply *reply, int reason);
+  void qeth_prepare_ipa_cmd(struct qeth_card *card, struct qeth_cmd_buffer *iob,
+  			  u16 cmd_length);
+diff --cc drivers/s390/net/qeth_core_main.c
+index e8cac443e3b9,3875f70118e4..000000000000
+--- a/drivers/s390/net/qeth_core_main.c
++++ b/drivers/s390/net/qeth_core_main.c
+@@@ -760,24 -712,12 +719,28 @@@ static void qeth_cancel_cmd(struct qeth
+  
+  	if (reply)
+  		qeth_notify_reply(reply, rc);
+++<<<<<<< HEAD
+ +	qeth_release_buffer(iob);
+ +}
+ +
+ +struct qeth_cmd_buffer *qeth_get_buffer(struct qeth_channel *channel)
+ +{
+ +	struct qeth_cmd_buffer *buffer = NULL;
+ +	unsigned long flags;
+ +
+ +	spin_lock_irqsave(&channel->iob_lock, flags);
+ +	buffer = __qeth_get_buffer(channel);
+ +	spin_unlock_irqrestore(&channel->iob_lock, flags);
+ +	return buffer;
+++=======
++ 	qeth_put_cmd(iob);
+++>>>>>>> c3b2218d3170 (s390/qeth: remove static cmd buffer infrastructure)
+  }
+ +EXPORT_SYMBOL_GPL(qeth_get_buffer);
+  
+ -struct qeth_cmd_buffer *qeth_alloc_cmd(struct qeth_channel *channel,
+ -				       unsigned int length, unsigned int ccws,
+ -				       long timeout)
+ +static struct qeth_cmd_buffer *qeth_alloc_cmd(struct qeth_channel *channel,
+ +					      unsigned int length,
+ +					      unsigned int ccws, long timeout)
+  {
+  	struct qeth_cmd_buffer *iob;
+  
+@@@ -802,17 -741,8 +764,7 @@@
+  	iob->length = length;
+  	return iob;
+  }
+ -EXPORT_SYMBOL_GPL(qeth_alloc_cmd);
+  
+- void qeth_clear_cmd_buffers(struct qeth_channel *channel)
+- {
+- 	int cnt;
+- 
+- 	for (cnt = 0; cnt < QETH_CMD_BUFFER_NO; cnt++)
+- 		qeth_release_buffer(&channel->iob[cnt]);
+- 	channel->io_buf_no = 0;
+- }
+- EXPORT_SYMBOL_GPL(qeth_clear_cmd_buffers);
+- 
+  static void qeth_issue_next_read_cb(struct qeth_card *card,
+  				    struct qeth_cmd_buffer *iob)
+  {
+@@@ -1288,49 -1186,32 +1230,29 @@@ static void qeth_setup_channel(struct q
+  	spin_lock_irq(get_ccwdev_lock(cdev));
+  	cdev->handler = qeth_irq;
+  	spin_unlock_irq(get_ccwdev_lock(cdev));
+- 
+- 	if (!alloc_buffers)
+- 		return 0;
+- 
+- 	for (cnt = 0; cnt < QETH_CMD_BUFFER_NO; cnt++) {
+- 		channel->iob[cnt].data = kmalloc(QETH_BUFSIZE,
+- 						 GFP_KERNEL | GFP_DMA);
+- 		if (channel->iob[cnt].data == NULL)
+- 			break;
+- 		channel->iob[cnt].state = BUF_STATE_FREE;
+- 		channel->iob[cnt].channel = channel;
+- 	}
+- 	if (cnt < QETH_CMD_BUFFER_NO) {
+- 		qeth_clean_channel(channel);
+- 		return -ENOMEM;
+- 	}
+- 	channel->io_buf_no = 0;
+- 	spin_lock_init(&channel->iob_lock);
+- 
+- 	return 0;
+  }
+  
+ -static int qeth_osa_set_output_queues(struct qeth_card *card, bool single)
+ +static void qeth_set_single_write_queues(struct qeth_card *card)
+  {
+ -	unsigned int count = single ? 1 : card->dev->num_tx_queues;
+ -	int rc;
+ -
+ -	rtnl_lock();
+ -	rc = netif_set_real_num_tx_queues(card->dev, count);
+ -	rtnl_unlock();
+ -
+ -	if (rc)
+ -		return rc;
+ -
+ -	if (card->qdio.no_out_queues == count)
+ -		return 0;
+ -
+ -	if (atomic_read(&card->qdio.state) != QETH_QDIO_UNINITIALIZED)
+ +	if ((atomic_read(&card->qdio.state) != QETH_QDIO_UNINITIALIZED) &&
+ +	    (card->qdio.no_out_queues == 4))
+  		qeth_free_qdio_queues(card);
+  
+ -	if (count == 1)
+ +	card->qdio.no_out_queues = 1;
+ +	if (card->qdio.default_out_queue != 0)
+  		dev_info(&card->gdev->dev, "Priority Queueing not supported\n");
+  
+ -	card->qdio.default_out_queue = single ? 0 : QETH_DEFAULT_QUEUE;
+ -	card->qdio.no_out_queues = count;
+ -	return 0;
+ +	card->qdio.default_out_queue = 0;
+ +}
+ +
+ +static void qeth_set_multiple_write_queues(struct qeth_card *card)
+ +{
+ +	if ((atomic_read(&card->qdio.state) != QETH_QDIO_UNINITIALIZED) &&
+ +	    (card->qdio.no_out_queues == 1)) {
+ +		qeth_free_qdio_queues(card);
+ +		card->qdio.default_out_queue = 2;
+ +	}
+ +	card->qdio.no_out_queues = 4;
+  }
+  
+  static int qeth_update_from_chp_desc(struct qeth_card *card)
+@@@ -1913,8 -1720,9 +1824,14 @@@ static int qeth_send_control_data(struc
+  		return (timeout == -ERESTARTSYS) ? -EINTR : -ETIME;
+  	}
+  
+++<<<<<<< HEAD
+ +	iob->finalize(card, iob, len);
+ +	QETH_DBF_HEX(CTRL, 2, iob->data, min(len, QETH_DBF_CTRL_LEN));
+++=======
++ 	if (iob->finalize)
++ 		iob->finalize(card, iob);
++ 	QETH_DBF_HEX(CTRL, 2, iob->data, min(iob->length, QETH_DBF_CTRL_LEN));
+++>>>>>>> c3b2218d3170 (s390/qeth: remove static cmd buffer infrastructure)
+  
+  	qeth_enqueue_reply(card, reply);
+  
+@@@ -1947,6 -1755,46 +1864,49 @@@
+  	return rc;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void qeth_read_conf_data_cb(struct qeth_card *card,
++ 				   struct qeth_cmd_buffer *iob)
++ {
++ 	unsigned char *prcd = iob->data;
++ 
++ 	QETH_CARD_TEXT(card, 2, "cfgunit");
++ 	card->info.chpid = prcd[30];
++ 	card->info.unit_addr2 = prcd[31];
++ 	card->info.cula = prcd[63];
++ 	card->info.is_vm_nic = ((prcd[0x10] == _ascebc['V']) &&
++ 				(prcd[0x11] == _ascebc['M']));
++ 	card->info.use_v1_blkt = prcd[74] == 0xF0 && prcd[75] == 0xF0 &&
++ 				 prcd[76] >= 0xF1 && prcd[76] <= 0xF4;
++ 
++ 	qeth_notify_reply(iob->reply, 0);
++ 	qeth_put_cmd(iob);
++ }
++ 
++ static int qeth_read_conf_data(struct qeth_card *card)
++ {
++ 	struct qeth_channel *channel = &card->data;
++ 	struct qeth_cmd_buffer *iob;
++ 	struct ciw *ciw;
++ 
++ 	/* scan for RCD command in extended SenseID data */
++ 	ciw = ccw_device_get_ciw(channel->ccwdev, CIW_TYPE_RCD);
++ 	if (!ciw || ciw->cmd == 0)
++ 		return -EOPNOTSUPP;
++ 
++ 	iob = qeth_alloc_cmd(channel, ciw->count, 1, QETH_RCD_TIMEOUT);
++ 	if (!iob)
++ 		return -ENOMEM;
++ 
++ 	iob->callback = qeth_read_conf_data_cb;
++ 	qeth_setup_ccw(__ccw_from_cmd(iob), ciw->cmd, 0, iob->length,
++ 		       iob->data);
++ 
++ 	return qeth_send_control_data(card, iob, NULL, NULL);
++ }
++ 
+++>>>>>>> c3b2218d3170 (s390/qeth: remove static cmd buffer infrastructure)
+  static int qeth_idx_check_activate_response(struct qeth_card *card,
+  					    struct qeth_channel *channel,
+  					    struct qeth_cmd_buffer *iob)
+@@@ -2128,10 -1976,9 +2088,9 @@@ static int qeth_cm_enable_cb(struct qet
+  
+  static int qeth_cm_enable(struct qeth_card *card)
+  {
+- 	int rc;
+  	struct qeth_cmd_buffer *iob;
+  
+ -	QETH_CARD_TEXT(card, 2, "cmenable");
+ +	QETH_DBF_TEXT(SETUP, 2, "cmenable");
+  
+  	iob = qeth_mpc_alloc_cmd(card, CM_ENABLE, CM_ENABLE_SIZE);
+  	if (!iob)
+@@@ -2163,10 -2008,9 +2120,9 @@@ static int qeth_cm_setup_cb(struct qeth
+  
+  static int qeth_cm_setup(struct qeth_card *card)
+  {
+- 	int rc;
+  	struct qeth_cmd_buffer *iob;
+  
+ -	QETH_CARD_TEXT(card, 2, "cmsetup");
+ +	QETH_DBF_TEXT(SETUP, 2, "cmsetup");
+  
+  	iob = qeth_mpc_alloc_cmd(card, CM_SETUP, CM_SETUP_SIZE);
+  	if (!iob)
+@@@ -2518,10 -2355,9 +2468,9 @@@ static int qeth_qdio_activate(struct qe
+  
+  static int qeth_dm_act(struct qeth_card *card)
+  {
+- 	int rc;
+  	struct qeth_cmd_buffer *iob;
+  
+ -	QETH_CARD_TEXT(card, 2, "dmact");
+ +	QETH_DBF_TEXT(SETUP, 2, "dmact");
+  
+  	iob = qeth_mpc_alloc_cmd(card, DM_ACT, DM_ACT_SIZE);
+  	if (!iob)
+@@@ -2835,25 -2643,35 +2756,57 @@@ void qeth_prepare_ipa_cmd(struct qeth_c
+  }
+  EXPORT_SYMBOL_GPL(qeth_prepare_ipa_cmd);
+  
+++<<<<<<< HEAD
+ +struct qeth_cmd_buffer *qeth_get_ipacmd_buffer(struct qeth_card *card,
+ +		enum qeth_ipa_cmds ipacmd, enum qeth_prot_versions prot)
+ +{
+ +	struct qeth_cmd_buffer *iob;
+ +
+ +	iob = qeth_get_buffer(&card->write);
+ +	if (iob) {
+ +		qeth_prepare_ipa_cmd(card, iob, sizeof(struct qeth_ipa_cmd));
+ +		qeth_fill_ipacmd_header(card, __ipa_cmd(iob), ipacmd, prot);
+ +	} else {
+ +		dev_warn(&card->gdev->dev,
+ +			 "The qeth driver ran out of channel command buffers\n");
+ +		QETH_DBF_MESSAGE(1, "device %x ran out of channel command buffers",
+ +				 CARD_DEVID(card));
+ +	}
+ +
+ +	return iob;
+ +}
+ +EXPORT_SYMBOL_GPL(qeth_get_ipacmd_buffer);
+++=======
++ struct qeth_cmd_buffer *qeth_ipa_alloc_cmd(struct qeth_card *card,
++ 					   enum qeth_ipa_cmds cmd_code,
++ 					   enum qeth_prot_versions prot,
++ 					   unsigned int data_length)
++ {
++ 	enum qeth_link_types link_type = card->info.link_type;
++ 	struct qeth_cmd_buffer *iob;
++ 	struct qeth_ipacmd_hdr *hdr;
++ 
++ 	data_length += offsetof(struct qeth_ipa_cmd, data);
++ 	iob = qeth_alloc_cmd(&card->write, IPA_PDU_HEADER_SIZE + data_length, 1,
++ 			     QETH_IPA_TIMEOUT);
++ 	if (!iob)
++ 		return NULL;
++ 
++ 	qeth_prepare_ipa_cmd(card, iob, data_length);
++ 
++ 	hdr = &__ipa_cmd(iob)->hdr;
++ 	hdr->command = cmd_code;
++ 	hdr->initiator = IPA_CMD_INITIATOR_HOST;
++ 	/* hdr->seqno is set by qeth_send_control_data() */
++ 	hdr->adapter_type = (link_type == QETH_LINK_TYPE_HSTR) ? 2 : 1;
++ 	hdr->rel_adapter_no = (u8) card->dev->dev_port;
++ 	hdr->prim_version_no = IS_LAYER2(card) ? 2 : 1;
++ 	hdr->param_count = 1;
++ 	hdr->prot_version = prot;
++ 	return iob;
++ }
++ EXPORT_SYMBOL_GPL(qeth_ipa_alloc_cmd);
+++>>>>>>> c3b2218d3170 (s390/qeth: remove static cmd buffer infrastructure)
+  
+  static int qeth_send_ipa_cmd_cb(struct qeth_card *card,
+  				struct qeth_reply *reply, unsigned long data)
+* Unmerged path drivers/s390/net/qeth_core.h
+* Unmerged path drivers/s390/net/qeth_core_main.c
+diff --git a/drivers/s390/net/qeth_l2_main.c b/drivers/s390/net/qeth_l2_main.c
+index 73849abf4c23..f98a13cf13fe 100644
+--- a/drivers/s390/net/qeth_l2_main.c
++++ b/drivers/s390/net/qeth_l2_main.c
+@@ -308,7 +308,6 @@ static void qeth_l2_stop_card(struct qeth_card *card)
+ 		card->state = CARD_STATE_DOWN;
+ 	}
+ 
+-	qeth_clear_cmd_buffers(&card->write);
+ 	flush_workqueue(card->event_wq);
+ 	card->info.mac_bits &= ~QETH_LAYER2_MAC_REGISTERED;
+ }
+@@ -1039,7 +1038,7 @@ static void qeth_osn_assist_cb(struct qeth_card *card,
+ 			       struct qeth_cmd_buffer *iob)
+ {
+ 	qeth_notify_reply(iob->reply, 0);
+-	qeth_release_buffer(iob);
++	qeth_put_cmd(iob);
+ }
+ 
+ int qeth_osn_assist(struct net_device *dev, void *data, int data_len)
+diff --git a/drivers/s390/net/qeth_l3_main.c b/drivers/s390/net/qeth_l3_main.c
+index 5b94b0ad9e01..ac03de0496be 100644
+--- a/drivers/s390/net/qeth_l3_main.c
++++ b/drivers/s390/net/qeth_l3_main.c
+@@ -1433,7 +1433,6 @@ static void qeth_l3_stop_card(struct qeth_card *card)
+ 		card->state = CARD_STATE_DOWN;
+ 	}
+ 
+-	qeth_clear_cmd_buffers(&card->write);
+ 	flush_workqueue(card->event_wq);
+ }
+ 
