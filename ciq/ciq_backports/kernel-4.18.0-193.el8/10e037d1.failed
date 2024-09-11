@@ -1,0 +1,131 @@
+sunrpc: Add xprt after nfs4_test_session_trunk()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Santosh kumar pradhan <santoshkumar.pradhan@wdc.com>
+commit 10e037d1e0d5d93cc057e4fad6911e481a462407
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/10e037d1.failed
+
+Multipathing: In case of NFSv3, rpc_clnt_test_and_add_xprt() adds
+the xprt to xprt switch (i.e. xps) if rpc_call_null_helper() returns
+success. But in case of NFSv4.1, it needs to do EXCHANGEID to verify
+the path along with check for session trunking.
+
+Add the xprt in nfs4_test_session_trunk() only when
+nfs4_detect_session_trunking() returns success. Also release refcount
+hold by rpc_clnt_setup_test_and_add_xprt().
+
+	Signed-off-by: Santosh kumar pradhan <santoshkumar.pradhan@wdc.com>
+	Tested-by: Suresh Jayaraman <suresh.jayaraman@wdc.com>
+	Reported-by: Aditya Agnihotri <aditya.agnihotri@wdc.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 10e037d1e0d5d93cc057e4fad6911e481a462407)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/nfs/internal.h
+diff --cc fs/nfs/internal.h
+index ecb6d4317ab4,7f80f036ebd9..000000000000
+--- a/fs/nfs/internal.h
++++ b/fs/nfs/internal.h
+@@@ -564,13 -564,13 +564,20 @@@ extern struct nfs_client *nfs4_init_cli
+  			    const struct nfs_client_initdata *);
+  extern int nfs40_walk_client_list(struct nfs_client *clp,
+  				struct nfs_client **result,
+ -				const struct cred *cred);
+ +				struct rpc_cred *cred);
+  extern int nfs41_walk_client_list(struct nfs_client *clp,
+  				struct nfs_client **result,
+++<<<<<<< HEAD
+ +				struct rpc_cred *cred);
+ +extern int nfs4_test_session_trunk(struct rpc_clnt *,
+ +				struct rpc_xprt *,
+ +				void *);
+++=======
++ 				const struct cred *cred);
++ extern void nfs4_test_session_trunk(struct rpc_clnt *clnt,
++ 				struct rpc_xprt *xprt,
++ 				void *data);
+++>>>>>>> 10e037d1e0d5 (sunrpc: Add xprt after nfs4_test_session_trunk())
+  
+  static inline struct inode *nfs_igrab_and_active(struct inode *inode)
+  {
+* Unmerged path fs/nfs/internal.h
+diff --git a/fs/nfs/nfs4_fs.h b/fs/nfs/nfs4_fs.h
+index 4c21a0d27713..1ce2bdaa989c 100644
+--- a/fs/nfs/nfs4_fs.h
++++ b/fs/nfs/nfs4_fs.h
+@@ -65,7 +65,8 @@ struct nfs4_minor_version_ops {
+ 			nfs4_stateid *, struct rpc_cred *);
+ 	struct nfs_seqid *
+ 		(*alloc_seqid)(struct nfs_seqid_counter *, gfp_t);
+-	int	(*session_trunk)(struct rpc_clnt *, struct rpc_xprt *, void *);
++	void	(*session_trunk)(struct rpc_clnt *clnt,
++			struct rpc_xprt *xprt, void *data);
+ 	const struct rpc_call_ops *call_sync_ops;
+ 	const struct nfs4_state_recovery_ops *reboot_recovery_ops;
+ 	const struct nfs4_state_recovery_ops *nograce_recovery_ops;
+diff --git a/fs/nfs/nfs4proc.c b/fs/nfs/nfs4proc.c
+index beb348ede64e..b51c6af29018 100644
+--- a/fs/nfs/nfs4proc.c
++++ b/fs/nfs/nfs4proc.c
+@@ -8099,7 +8099,7 @@ int nfs4_proc_exchange_id(struct nfs_client *clp, struct rpc_cred *cred)
+  * @xprt: the rpc_xprt to test
+  * @data: call data for _nfs4_proc_exchange_id.
+  */
+-int nfs4_test_session_trunk(struct rpc_clnt *clnt, struct rpc_xprt *xprt,
++void nfs4_test_session_trunk(struct rpc_clnt *clnt, struct rpc_xprt *xprt,
+ 			    void *data)
+ {
+ 	struct nfs4_add_xprt_data *adata = (struct nfs4_add_xprt_data *)data;
+@@ -8116,15 +8116,17 @@ int nfs4_test_session_trunk(struct rpc_clnt *clnt, struct rpc_xprt *xprt,
+ 	/* Test connection for session trunking. Async exchange_id call */
+ 	task = nfs4_run_exchange_id(adata->clp, adata->cred, sp4_how, xprt);
+ 	if (IS_ERR(task))
+-		return PTR_ERR(task);
++		return;
+ 
+ 	status = task->tk_status;
+ 	if (status == 0)
+ 		status = nfs4_detect_session_trunking(adata->clp,
+ 				task->tk_msg.rpc_resp, xprt);
+ 
++	if (status == 0)
++		rpc_clnt_xprt_switch_add_xprt(clnt, xprt);
++
+ 	rpc_put_task(task);
+-	return status;
+ }
+ EXPORT_SYMBOL_GPL(nfs4_test_session_trunk);
+ 
+diff --git a/include/linux/sunrpc/clnt.h b/include/linux/sunrpc/clnt.h
+index fc6dfbf77a9d..1c441714d569 100644
+--- a/include/linux/sunrpc/clnt.h
++++ b/include/linux/sunrpc/clnt.h
+@@ -128,8 +128,8 @@ struct rpc_create_args {
+ };
+ 
+ struct rpc_add_xprt_test {
+-	int (*add_xprt_test)(struct rpc_clnt *,
+-		struct rpc_xprt *,
++	void (*add_xprt_test)(struct rpc_clnt *clnt,
++		struct rpc_xprt *xprt,
+ 		void *calldata);
+ 	void *data;
+ };
+diff --git a/net/sunrpc/clnt.c b/net/sunrpc/clnt.c
+index ad758528f586..92e265592fb5 100644
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@ -2667,6 +2667,9 @@ int rpc_clnt_setup_test_and_add_xprt(struct rpc_clnt *clnt,
+ 	/* rpc_xprt_switch and rpc_xprt are deferrenced by add_xprt_test() */
+ 	xtest->add_xprt_test(clnt, xprt, xtest->data);
+ 
++	xprt_put(xprt);
++	xprt_switch_put(xps);
++
+ 	/* so that rpc_clnt_add_xprt does not call rpc_xprt_switch_add_xprt */
+ 	return 1;
+ out_err:
