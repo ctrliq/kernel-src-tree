@@ -1,0 +1,88 @@
+netfilter: nf_tables: fix infinite loop when expr is not available
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Florian Westphal <fw@strlen.de>
+commit 1d305ba40eb8081ff21eeb8ca6ba5c70fd920934
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/1d305ba4.failed
+
+nft will loop forever if the kernel doesn't support an expression:
+
+1. nft_expr_type_get() appends the family specific name to the module list.
+2. -EAGAIN is returned to nfnetlink, nfnetlink calls abort path.
+3. abort path sets ->done to true and calls request_module for the
+   expression.
+4. nfnetlink replays the batch, we end up in nft_expr_type_get() again.
+5. nft_expr_type_get attempts to append family-specific name. This
+   one already exists on the list, so we continue
+6. nft_expr_type_get adds the generic expression name to the module
+   list. -EAGAIN is returned, nfnetlink calls abort path.
+7. abort path encounters the family-specific expression which
+   has 'done' set, so it gets removed.
+8. abort path requests the generic expression name, sets done to true.
+9. batch is replayed.
+
+If the expression could not be loaded, then we will end up back at 1),
+because the family-specific name got removed and the cycle starts again.
+
+Note that userspace can SIGKILL the nft process to stop the cycle, but
+the desired behaviour is to return an error after the generic expr name
+fails to load the expression.
+
+Fixes: eb014de4fd418 ("netfilter: nf_tables: autoload modules from the abort path")
+	Signed-off-by: Florian Westphal <fw@strlen.de>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 1d305ba40eb8081ff21eeb8ca6ba5c70fd920934)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_tables_api.c
+diff --cc net/netfilter/nf_tables_api.c
+index eb8b9258c93a,38c680f28f15..000000000000
+--- a/net/netfilter/nf_tables_api.c
++++ b/net/netfilter/nf_tables_api.c
+@@@ -6791,6 -7380,21 +6791,24 @@@ static int nf_tables_commit(struct net 
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void nf_tables_module_autoload(struct net *net)
++ {
++ 	struct nft_module_request *req, *next;
++ 	LIST_HEAD(module_list);
++ 
++ 	list_splice_init(&net->nft.module_list, &module_list);
++ 	mutex_unlock(&net->nft.commit_mutex);
++ 	list_for_each_entry_safe(req, next, &module_list, list) {
++ 		request_module("%s", req->module);
++ 		req->done = true;
++ 	}
++ 	mutex_lock(&net->nft.commit_mutex);
++ 	list_splice(&module_list, &net->nft.module_list);
++ }
++ 
+++>>>>>>> 1d305ba40eb8 (netfilter: nf_tables: fix infinite loop when expr is not available)
+  static void nf_tables_abort_release(struct nft_trans *trans)
+  {
+  	switch (trans->msg_type) {
+@@@ -7540,12 -8166,13 +7558,13 @@@ static int __net_init nf_tables_init_ne
+  
+  static void __net_exit nf_tables_exit_net(struct net *net)
+  {
+ -	mutex_lock(&net->nft.commit_mutex);
+ +	nfnl_lock(NFNL_SUBSYS_NFTABLES);
+  	if (!list_empty(&net->nft.commit_list))
+ -		__nf_tables_abort(net, false);
+ +		__nf_tables_abort(net);
+  	__nft_release_tables(net);
+ -	mutex_unlock(&net->nft.commit_mutex);
+ +	nfnl_unlock(NFNL_SUBSYS_NFTABLES);
+  	WARN_ON_ONCE(!list_empty(&net->nft.tables));
++ 	WARN_ON_ONCE(!list_empty(&net->nft.module_list));
+  }
+  
+  static struct pernet_operations nf_tables_net_ops = {
+* Unmerged path net/netfilter/nf_tables_api.c
