@@ -6659,6 +6659,8 @@ static int rtl8169_resume(struct device *device)
 	struct net_device *dev = dev_get_drvdata(device);
 	struct rtl8169_private *tp = netdev_priv(dev);
 
+	rtl_rar_set(tp, dev->dev_addr);
+
 	clk_prepare_enable(tp->clk);
 
 	if (netif_running(dev))
@@ -6692,6 +6694,7 @@ static int rtl8169_runtime_resume(struct device *device)
 {
 	struct net_device *dev = dev_get_drvdata(device);
 	struct rtl8169_private *tp = netdev_priv(dev);
+
 	rtl_rar_set(tp, dev->dev_addr);
 
 	if (!tp->TxDescArray)
