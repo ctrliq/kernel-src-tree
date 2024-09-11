@@ -1,0 +1,340 @@
+KVM: s390: protvirt: UV calls in support of diag308 0, 1
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Janosch Frank <frankja@linux.ibm.com>
+commit e0d2773d487c2a41c99d9e256d51cc0a859aa9ab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e0d2773d.failed
+
+diag 308 subcode 0 and 1 require several KVM and Ultravisor interactions.
+Specific to these "soft" reboots are
+
+* The "unshare all" UVC
+* The "prepare for reset" UVC
+
+	Signed-off-by: Janosch Frank <frankja@linux.ibm.com>
+	Acked-by: David Hildenbrand <david@redhat.com>
+	Reviewed-by: Cornelia Huck <cohuck@redhat.com>
+[borntraeger@de.ibm.com: patch merging, splitting, fixing]
+	Signed-off-by: Christian Borntraeger <borntraeger@de.ibm.com>
+(cherry picked from commit e0d2773d487c2a41c99d9e256d51cc0a859aa9ab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/include/asm/uv.h
+#	arch/s390/kvm/kvm-s390.c
+#	include/uapi/linux/kvm.h
+diff --cc arch/s390/include/asm/uv.h
+index 4093a2856929,f149c29ddb84..000000000000
+--- a/arch/s390/include/asm/uv.h
++++ b/arch/s390/include/asm/uv.h
+@@@ -21,16 -23,45 +21,43 @@@
+  #define UVC_RC_INV_STATE	0x0003
+  #define UVC_RC_INV_LEN		0x0005
+  #define UVC_RC_NO_RESUME	0x0007
+ -#define UVC_RC_NEED_DESTROY	0x8000
+  
+  #define UVC_CMD_QUI			0x0001
+++<<<<<<< HEAD
+++=======
++ #define UVC_CMD_INIT_UV			0x000f
++ #define UVC_CMD_CREATE_SEC_CONF		0x0100
++ #define UVC_CMD_DESTROY_SEC_CONF	0x0101
++ #define UVC_CMD_CREATE_SEC_CPU		0x0120
++ #define UVC_CMD_DESTROY_SEC_CPU		0x0121
++ #define UVC_CMD_CONV_TO_SEC_STOR	0x0200
++ #define UVC_CMD_CONV_FROM_SEC_STOR	0x0201
++ #define UVC_CMD_SET_SEC_CONF_PARAMS	0x0300
++ #define UVC_CMD_UNPACK_IMG		0x0301
++ #define UVC_CMD_VERIFY_IMG		0x0302
++ #define UVC_CMD_PREPARE_RESET		0x0320
++ #define UVC_CMD_SET_UNSHARE_ALL		0x0340
++ #define UVC_CMD_PIN_PAGE_SHARED		0x0341
++ #define UVC_CMD_UNPIN_PAGE_SHARED	0x0342
+++>>>>>>> e0d2773d487c (KVM: s390: protvirt: UV calls in support of diag308 0, 1)
+  #define UVC_CMD_SET_SHARED_ACCESS	0x1000
+  #define UVC_CMD_REMOVE_SHARED_ACCESS	0x1001
+  
+  /* Bits in installed uv calls */
+  enum uv_cmds_inst {
+  	BIT_UVC_CMD_QUI = 0,
+ -	BIT_UVC_CMD_INIT_UV = 1,
+ -	BIT_UVC_CMD_CREATE_SEC_CONF = 2,
+ -	BIT_UVC_CMD_DESTROY_SEC_CONF = 3,
+ -	BIT_UVC_CMD_CREATE_SEC_CPU = 4,
+ -	BIT_UVC_CMD_DESTROY_SEC_CPU = 5,
+ -	BIT_UVC_CMD_CONV_TO_SEC_STOR = 6,
+ -	BIT_UVC_CMD_CONV_FROM_SEC_STOR = 7,
+  	BIT_UVC_CMD_SET_SHARED_ACCESS = 8,
+  	BIT_UVC_CMD_REMOVE_SHARED_ACCESS = 9,
+++<<<<<<< HEAD
+++=======
++ 	BIT_UVC_CMD_SET_SEC_PARMS = 11,
++ 	BIT_UVC_CMD_UNPACK_IMG = 13,
++ 	BIT_UVC_CMD_VERIFY_IMG = 14,
++ 	BIT_UVC_CMD_PREPARE_RESET = 18,
++ 	BIT_UVC_CMD_UNSHARE_ALL = 20,
++ 	BIT_UVC_CMD_PIN_PAGE_SHARED = 21,
++ 	BIT_UVC_CMD_UNPIN_PAGE_SHARED = 22,
+++>>>>>>> e0d2773d487c (KVM: s390: protvirt: UV calls in support of diag308 0, 1)
+  };
+  
+  struct uv_cb_header {
+diff --cc arch/s390/kvm/kvm-s390.c
+index af147f0b9f94,16531b251eab..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -2158,6 -2168,194 +2158,197 @@@ out
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int kvm_s390_cpus_from_pv(struct kvm *kvm, u16 *rcp, u16 *rrcp)
++ {
++ 	struct kvm_vcpu *vcpu;
++ 	u16 rc, rrc;
++ 	int ret = 0;
++ 	int i;
++ 
++ 	/*
++ 	 * We ignore failures and try to destroy as many CPUs as possible.
++ 	 * At the same time we must not free the assigned resources when
++ 	 * this fails, as the ultravisor has still access to that memory.
++ 	 * So kvm_s390_pv_destroy_cpu can leave a "wanted" memory leak
++ 	 * behind.
++ 	 * We want to return the first failure rc and rrc, though.
++ 	 */
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		if (kvm_s390_pv_destroy_cpu(vcpu, &rc, &rrc) && !ret) {
++ 			*rcp = rc;
++ 			*rrcp = rrc;
++ 			ret = -EIO;
++ 		}
++ 		mutex_unlock(&vcpu->mutex);
++ 	}
++ 	return ret;
++ }
++ 
++ static int kvm_s390_cpus_to_pv(struct kvm *kvm, u16 *rc, u16 *rrc)
++ {
++ 	int i, r = 0;
++ 	u16 dummy;
++ 
++ 	struct kvm_vcpu *vcpu;
++ 
++ 	kvm_for_each_vcpu(i, vcpu, kvm) {
++ 		mutex_lock(&vcpu->mutex);
++ 		r = kvm_s390_pv_create_cpu(vcpu, rc, rrc);
++ 		mutex_unlock(&vcpu->mutex);
++ 		if (r)
++ 			break;
++ 	}
++ 	if (r)
++ 		kvm_s390_cpus_from_pv(kvm, &dummy, &dummy);
++ 	return r;
++ }
++ 
++ static int kvm_s390_handle_pv(struct kvm *kvm, struct kvm_pv_cmd *cmd)
++ {
++ 	int r = 0;
++ 	u16 dummy;
++ 	void __user *argp = (void __user *)cmd->data;
++ 
++ 	switch (cmd->cmd) {
++ 	case KVM_PV_ENABLE: {
++ 		r = -EINVAL;
++ 		if (kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		/*
++ 		 *  FMT 4 SIE needs esca. As we never switch back to bsca from
++ 		 *  esca, we need no cleanup in the error cases below
++ 		 */
++ 		r = sca_switch_to_extended(kvm);
++ 		if (r)
++ 			break;
++ 
++ 		down_write(&current->mm->mmap_sem);
++ 		r = gmap_mark_unmergeable();
++ 		up_write(&current->mm->mmap_sem);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_pv_init_vm(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			break;
++ 
++ 		r = kvm_s390_cpus_to_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		if (r)
++ 			kvm_s390_pv_deinit_vm(kvm, &dummy, &dummy);
++ 
++ 		/* we need to block service interrupts from now on */
++ 		set_bit(IRQ_PEND_EXT_SERVICE, &kvm->arch.float_int.masked_irqs);
++ 		break;
++ 	}
++ 	case KVM_PV_DISABLE: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = kvm_s390_cpus_from_pv(kvm, &cmd->rc, &cmd->rrc);
++ 		/*
++ 		 * If a CPU could not be destroyed, destroy VM will also fail.
++ 		 * There is no point in trying to destroy it. Instead return
++ 		 * the rc and rrc from the first CPU that failed destroying.
++ 		 */
++ 		if (r)
++ 			break;
++ 		r = kvm_s390_pv_deinit_vm(kvm, &cmd->rc, &cmd->rrc);
++ 
++ 		/* no need to block service interrupts any more */
++ 		clear_bit(IRQ_PEND_EXT_SERVICE, &kvm->arch.float_int.masked_irqs);
++ 		break;
++ 	}
++ 	case KVM_PV_SET_SEC_PARMS: {
++ 		struct kvm_s390_pv_sec_parm parms = {};
++ 		void *hdr;
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&parms, argp, sizeof(parms)))
++ 			break;
++ 
++ 		/* Currently restricted to 8KB */
++ 		r = -EINVAL;
++ 		if (parms.length > PAGE_SIZE * 2)
++ 			break;
++ 
++ 		r = -ENOMEM;
++ 		hdr = vmalloc(parms.length);
++ 		if (!hdr)
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (!copy_from_user(hdr, (void __user *)parms.origin,
++ 				    parms.length))
++ 			r = kvm_s390_pv_set_sec_parms(kvm, hdr, parms.length,
++ 						      &cmd->rc, &cmd->rrc);
++ 
++ 		vfree(hdr);
++ 		break;
++ 	}
++ 	case KVM_PV_UNPACK: {
++ 		struct kvm_s390_pv_unp unp = {};
++ 
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = -EFAULT;
++ 		if (copy_from_user(&unp, argp, sizeof(unp)))
++ 			break;
++ 
++ 		r = kvm_s390_pv_unpack(kvm, unp.addr, unp.size, unp.tweak,
++ 				       &cmd->rc, &cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_VERIFY: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = uv_cmd_nodata(kvm_s390_pv_get_handle(kvm),
++ 				  UVC_CMD_VERIFY_IMG, &cmd->rc, &cmd->rrc);
++ 		KVM_UV_EVENT(kvm, 3, "PROTVIRT VERIFY: rc %x rrc %x", cmd->rc,
++ 			     cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_PREP_RESET: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = uv_cmd_nodata(kvm_s390_pv_get_handle(kvm),
++ 				  UVC_CMD_PREPARE_RESET, &cmd->rc, &cmd->rrc);
++ 		KVM_UV_EVENT(kvm, 3, "PROTVIRT PREP RESET: rc %x rrc %x",
++ 			     cmd->rc, cmd->rrc);
++ 		break;
++ 	}
++ 	case KVM_PV_UNSHARE_ALL: {
++ 		r = -EINVAL;
++ 		if (!kvm_s390_pv_is_protected(kvm))
++ 			break;
++ 
++ 		r = uv_cmd_nodata(kvm_s390_pv_get_handle(kvm),
++ 				  UVC_CMD_SET_UNSHARE_ALL, &cmd->rc, &cmd->rrc);
++ 		KVM_UV_EVENT(kvm, 3, "PROTVIRT UNSHARE: rc %x rrc %x",
++ 			     cmd->rc, cmd->rrc);
++ 		break;
++ 	}
++ 	default:
++ 		r = -ENOTTY;
++ 	}
++ 	return r;
++ }
++ 
+++>>>>>>> e0d2773d487c (KVM: s390: protvirt: UV calls in support of diag308 0, 1)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+diff --cc include/uapi/linux/kvm.h
+index 8e4c64ff9f98,2c354ba3a610..000000000000
+--- a/include/uapi/linux/kvm.h
++++ b/include/uapi/linux/kvm.h
+@@@ -1466,6 -1479,43 +1466,46 @@@ struct kvm_enc_region 
+  /* Available with KVM_CAP_ARM_SVE */
+  #define KVM_ARM_VCPU_FINALIZE	  _IOW(KVMIO,  0xc2, int)
+  
+++<<<<<<< HEAD
+++=======
++ /* Available with  KVM_CAP_S390_VCPU_RESETS */
++ #define KVM_S390_NORMAL_RESET	_IO(KVMIO,   0xc3)
++ #define KVM_S390_CLEAR_RESET	_IO(KVMIO,   0xc4)
++ 
++ struct kvm_s390_pv_sec_parm {
++ 	__u64 origin;
++ 	__u64 length;
++ };
++ 
++ struct kvm_s390_pv_unp {
++ 	__u64 addr;
++ 	__u64 size;
++ 	__u64 tweak;
++ };
++ 
++ enum pv_cmd_id {
++ 	KVM_PV_ENABLE,
++ 	KVM_PV_DISABLE,
++ 	KVM_PV_SET_SEC_PARMS,
++ 	KVM_PV_UNPACK,
++ 	KVM_PV_VERIFY,
++ 	KVM_PV_PREP_RESET,
++ 	KVM_PV_UNSHARE_ALL,
++ };
++ 
++ struct kvm_pv_cmd {
++ 	__u32 cmd;	/* Command to be executed */
++ 	__u16 rc;	/* Ultravisor return code */
++ 	__u16 rrc;	/* Ultravisor return reason code */
++ 	__u64 data;	/* Data or address */
++ 	__u32 flags;    /* flags for future extensions. Must be 0 for now */
++ 	__u32 reserved[3];
++ };
++ 
++ /* Available with KVM_CAP_S390_PROTECTED */
++ #define KVM_S390_PV_COMMAND		_IOWR(KVMIO, 0xc5, struct kvm_pv_cmd)
++ 
+++>>>>>>> e0d2773d487c (KVM: s390: protvirt: UV calls in support of diag308 0, 1)
+  /* Secure Encrypted Virtualization command */
+  enum sev_cmd_id {
+  	/* Guest initialization commands */
+* Unmerged path arch/s390/include/asm/uv.h
+* Unmerged path arch/s390/kvm/kvm-s390.c
+* Unmerged path include/uapi/linux/kvm.h
