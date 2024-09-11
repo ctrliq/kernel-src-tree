@@ -1,0 +1,242 @@
+net/mlx5e: Report and recover from CQE error on ICOSQ
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Aya Levin <ayal@mellanox.com>
+commit be5323c8379f488f1de53206edeaf80fc20d7686
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/be5323c8.failed
+
+Add support for report and recovery from error on completion on ICOSQ.
+Deactivate RQ and flush, then deactivate ICOSQ. Set the queue back to
+ready state (firmware) and reset the ICOSQ and the RQ (software
+resources). Finally, activate the ICOSQ and the RQ.
+
+	Signed-off-by: Aya Levin <ayal@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@mellanox.com>
+(cherry picked from commit be5323c8379f488f1de53206edeaf80fc20d7686)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+index cee840e40a05,8acd9dc520cf..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+@@@ -6,9 -6,36 +6,43 @@@
+  
+  #include "en.h"
+  
+++<<<<<<< HEAD
+ +int mlx5e_tx_reporter_create(struct mlx5e_priv *priv);
+ +void mlx5e_tx_reporter_destroy(struct mlx5e_priv *priv);
+ +void mlx5e_tx_reporter_err_cqe(struct mlx5e_txqsq *sq);
+ +int mlx5e_tx_reporter_timeout(struct mlx5e_txqsq *sq);
+++=======
++ int mlx5e_reporter_tx_create(struct mlx5e_priv *priv);
++ void mlx5e_reporter_tx_destroy(struct mlx5e_priv *priv);
++ void mlx5e_reporter_tx_err_cqe(struct mlx5e_txqsq *sq);
++ int mlx5e_reporter_tx_timeout(struct mlx5e_txqsq *sq);
++ 
++ int mlx5e_reporter_cq_diagnose(struct mlx5e_cq *cq, struct devlink_fmsg *fmsg);
++ int mlx5e_reporter_cq_common_diagnose(struct mlx5e_cq *cq, struct devlink_fmsg *fmsg);
++ int mlx5e_reporter_named_obj_nest_start(struct devlink_fmsg *fmsg, char *name);
++ int mlx5e_reporter_named_obj_nest_end(struct devlink_fmsg *fmsg);
++ 
++ int mlx5e_reporter_rx_create(struct mlx5e_priv *priv);
++ void mlx5e_reporter_rx_destroy(struct mlx5e_priv *priv);
++ void mlx5e_reporter_icosq_cqe_err(struct mlx5e_icosq *icosq);
++ 
++ #define MLX5E_REPORTER_PER_Q_MAX_LEN 256
++ 
++ struct mlx5e_err_ctx {
++ 	int (*recover)(void *ctx);
++ 	void *ctx;
++ };
++ 
++ int mlx5e_health_sq_to_ready(struct mlx5e_channel *channel, u32 sqn);
++ int mlx5e_health_channel_eq_recover(struct mlx5_eq_comp *eq, struct mlx5e_channel *channel);
++ int mlx5e_health_recover_channels(struct mlx5e_priv *priv);
++ int mlx5e_health_report(struct mlx5e_priv *priv,
++ 			struct devlink_health_reporter *reporter, char *err_str,
++ 			struct mlx5e_err_ctx *err_ctx);
++ int mlx5e_health_create_reporters(struct mlx5e_priv *priv);
++ void mlx5e_health_destroy_reporters(struct mlx5e_priv *priv);
++ void mlx5e_health_channels_update(struct mlx5e_priv *priv);
++ 
+++>>>>>>> be5323c8379f (net/mlx5e: Report and recover from CQE error on ICOSQ)
+  
+  #endif
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 84575c0bcca6..8b0ea983c8b0 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -559,6 +559,8 @@ struct mlx5e_icosq {
+ 	/* control path */
+ 	struct mlx5_wq_ctrl        wq_ctrl;
+ 	struct mlx5e_channel      *channel;
++
++	struct work_struct         recover_work;
+ } ____cacheline_aligned_in_smp;
+ 
+ struct mlx5e_wqe_frag_info {
+@@ -1016,6 +1018,12 @@ void mlx5e_set_rx_cq_mode_params(struct mlx5e_params *params,
+ void mlx5e_set_rq_type(struct mlx5_core_dev *mdev, struct mlx5e_params *params);
+ void mlx5e_init_rq_type_params(struct mlx5_core_dev *mdev,
+ 			       struct mlx5e_params *params);
++int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state, int next_state);
++void mlx5e_activate_rq(struct mlx5e_rq *rq);
++void mlx5e_deactivate_rq(struct mlx5e_rq *rq);
++void mlx5e_free_rx_descs(struct mlx5e_rq *rq);
++void mlx5e_activate_icosq(struct mlx5e_icosq *icosq);
++void mlx5e_deactivate_icosq(struct mlx5e_icosq *icosq);
+ 
+ int mlx5e_modify_sq(struct mlx5_core_dev *mdev, u32 sqn,
+ 		    struct mlx5e_modify_sq_param *p);
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/health.h
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index 8d26f32a5c2f..99f172df5f40 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -711,8 +711,7 @@ static int mlx5e_create_rq(struct mlx5e_rq *rq,
+ 	return err;
+ }
+ 
+-static int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state,
+-				 int next_state)
++int mlx5e_modify_rq_state(struct mlx5e_rq *rq, int curr_state, int next_state)
+ {
+ 	struct mlx5_core_dev *mdev = rq->mdev;
+ 
+@@ -823,7 +822,7 @@ int mlx5e_wait_for_min_rx_wqes(struct mlx5e_rq *rq, int wait_time)
+ 	return -ETIMEDOUT;
+ }
+ 
+-static void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
++void mlx5e_free_rx_descs(struct mlx5e_rq *rq)
+ {
+ 	__be16 wqe_ix_be;
+ 	u16 wqe_ix;
+@@ -902,7 +901,7 @@ int mlx5e_open_rq(struct mlx5e_channel *c, struct mlx5e_params *params,
+ 	return err;
+ }
+ 
+-static void mlx5e_activate_rq(struct mlx5e_rq *rq)
++void mlx5e_activate_rq(struct mlx5e_rq *rq)
+ {
+ 	set_bit(MLX5E_RQ_STATE_ENABLED, &rq->state);
+ 	mlx5e_trigger_irq(&rq->channel->icosq);
+@@ -917,6 +916,7 @@ void mlx5e_deactivate_rq(struct mlx5e_rq *rq)
+ void mlx5e_close_rq(struct mlx5e_rq *rq)
+ {
+ 	cancel_work_sync(&rq->dim.work);
++	cancel_work_sync(&rq->channel->icosq.recover_work);
+ 	mlx5e_destroy_rq(rq);
+ 	mlx5e_free_rx_descs(rq);
+ 	mlx5e_free_rq(rq);
+@@ -1033,6 +1033,14 @@ static int mlx5e_alloc_icosq_db(struct mlx5e_icosq *sq, int numa)
+ 	return 0;
+ }
+ 
++static void mlx5e_icosq_err_cqe_work(struct work_struct *recover_work)
++{
++	struct mlx5e_icosq *sq = container_of(recover_work, struct mlx5e_icosq,
++					      recover_work);
++
++	mlx5e_reporter_icosq_cqe_err(sq);
++}
++
+ static int mlx5e_alloc_icosq(struct mlx5e_channel *c,
+ 			     struct mlx5e_sq_param *param,
+ 			     struct mlx5e_icosq *sq)
+@@ -1055,6 +1063,8 @@ static int mlx5e_alloc_icosq(struct mlx5e_channel *c,
+ 	if (err)
+ 		goto err_sq_wq_destroy;
+ 
++	INIT_WORK(&sq->recover_work, mlx5e_icosq_err_cqe_work);
++
+ 	return 0;
+ 
+ err_sq_wq_destroy:
+@@ -1401,12 +1411,12 @@ int mlx5e_open_icosq(struct mlx5e_channel *c, struct mlx5e_params *params,
+ 	return err;
+ }
+ 
+-static void mlx5e_activate_icosq(struct mlx5e_icosq *icosq)
++void mlx5e_activate_icosq(struct mlx5e_icosq *icosq)
+ {
+ 	set_bit(MLX5E_SQ_STATE_ENABLED, &icosq->state);
+ }
+ 
+-static void mlx5e_deactivate_icosq(struct mlx5e_icosq *icosq)
++void mlx5e_deactivate_icosq(struct mlx5e_icosq *icosq)
+ {
+ 	struct mlx5e_channel *c = icosq->channel;
+ 
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+index 1a04987bcf15..365a066bf65f 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_rx.c
+@@ -616,6 +616,8 @@ void mlx5e_poll_ico_cq(struct mlx5e_cq *cq)
+ 		if (unlikely(get_cqe_opcode(cqe) != MLX5_CQE_REQ)) {
+ 			netdev_WARN_ONCE(cq->channel->netdev,
+ 					 "Bad OP in ICOSQ CQE: 0x%x\n", get_cqe_opcode(cqe));
++			if (!test_and_set_bit(MLX5E_SQ_STATE_RECOVERING, &sq->state))
++				queue_work(cq->channel->priv->wq, &sq->recover_work);
+ 			break;
+ 		}
+ 		do {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+index 3d993e2e7bea..79b3ec005f43 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.c
+@@ -161,6 +161,7 @@ static const struct counter_desc sw_stats_desc[] = {
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_cache_waive) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_congst_umr) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_arfs_err) },
++	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, rx_recover) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, ch_events) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, ch_poll) },
+ 	{ MLX5E_DECLARE_STAT(struct mlx5e_sw_stats, ch_arm) },
+@@ -272,6 +273,7 @@ static MLX5E_DECLARE_STATS_GRP_OP_UPDATE_STATS(sw)
+ 		s->rx_cache_waive += rq_stats->cache_waive;
+ 		s->rx_congst_umr  += rq_stats->congst_umr;
+ 		s->rx_arfs_err    += rq_stats->arfs_err;
++		s->rx_recover     += rq_stats->recover;
+ 		s->ch_events      += ch_stats->events;
+ 		s->ch_poll        += ch_stats->poll;
+ 		s->ch_arm         += ch_stats->arm;
+@@ -1484,6 +1486,7 @@ static const struct counter_desc rq_stats_desc[] = {
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, cache_waive) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, congst_umr) },
+ 	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, arfs_err) },
++	{ MLX5E_DECLARE_RX_STAT(struct mlx5e_rq_stats, recover) },
+ };
+ 
+ static const struct counter_desc sq_stats_desc[] = {
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+index a4a43613d026..ab1c3366ff7d 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_stats.h
+@@ -167,6 +167,7 @@ struct mlx5e_sw_stats {
+ 	u64 rx_cache_waive;
+ 	u64 rx_congst_umr;
+ 	u64 rx_arfs_err;
++	u64 rx_recover;
+ 	u64 ch_events;
+ 	u64 ch_poll;
+ 	u64 ch_arm;
+@@ -302,6 +303,7 @@ struct mlx5e_rq_stats {
+ 	u64 cache_waive;
+ 	u64 congst_umr;
+ 	u64 arfs_err;
++	u64 recover;
+ };
+ 
+ struct mlx5e_sq_stats {
