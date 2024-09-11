@@ -218,7 +218,7 @@ static int associativity_to_nid(const __be32 *associativity)
 {
 	int nid = -1;
 
-	if (min_common_depth == -1 || !numa_enabled)
+	if (!numa_enabled)
 		goto out;
 
 	if (of_read_number(associativity, 1) >= min_common_depth)
@@ -634,8 +634,14 @@ static int __init parse_numa_properties(void)
 
 	min_common_depth = find_min_common_depth();
 
-	if (min_common_depth < 0)
+	if (min_common_depth < 0) {
+		/*
+		 * if we fail to parse min_common_depth from device tree
+		 * mark the numa disabled, boot with numa disabled.
+		 */
+		numa_enabled = false;
 		return min_common_depth;
+	}
 
 	dbg("NUMA associativity depth for CPU/Memory: %d\n", min_common_depth);
 
@@ -751,7 +757,7 @@ void __init dump_numa_cpu_topology(void)
 	unsigned int node;
 	unsigned int cpu, count;
 
-	if (min_common_depth == -1 || !numa_enabled)
+	if (!numa_enabled)
 		return;
 
 	for_each_online_node(node) {
@@ -812,7 +818,7 @@ static void __init find_possible_nodes(void)
 	struct device_node *rtas;
 	u32 numnodes, i;
 
-	if (min_common_depth <= 0 || !numa_enabled)
+	if (!numa_enabled)
 		return;
 
 	rtas = of_find_node_by_path("/rtas");
@@ -1014,7 +1020,7 @@ int hot_add_scn_to_nid(unsigned long scn_addr)
 	struct device_node *memory = NULL;
 	int nid;
 
-	if (!numa_enabled || (min_common_depth < 0))
+	if (!numa_enabled)
 		return first_online_node;
 
 	memory = of_find_node_by_path("/ibm,dynamic-reconfiguration-memory");
