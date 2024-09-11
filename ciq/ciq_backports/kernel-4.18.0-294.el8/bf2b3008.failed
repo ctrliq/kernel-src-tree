@@ -1,0 +1,826 @@
+x86/entry: Rename trace_hardirqs_off_prepare()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Peter Zijlstra <peterz@infradead.org>
+commit bf2b3008440072068580c609d79a079656af0588
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/bf2b3008.failed
+
+The typical pattern for trace_hardirqs_off_prepare() is:
+
+  ENTRY
+    lockdep_hardirqs_off(); // because hardware
+    ... do entry magic
+    instrumentation_begin();
+    trace_hardirqs_off_prepare();
+    ... do actual work
+    trace_hardirqs_on_prepare();
+    lockdep_hardirqs_on_prepare();
+    instrumentation_end();
+    ... do exit magic
+    lockdep_hardirqs_on();
+
+which shows that it's named wrong, rename it to
+trace_hardirqs_off_finish(), as it concludes the hardirq_off transition.
+
+Also, given that the above is the only correct order, make the traditional
+all-in-one trace_hardirqs_off() follow suit.
+
+	Signed-off-by: Peter Zijlstra (Intel) <peterz@infradead.org>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+Link: https://lkml.kernel.org/r/20200529213321.415774872@infradead.org
+
+
+
+(cherry picked from commit bf2b3008440072068580c609d79a079656af0588)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/entry/common.c
+#	arch/x86/kernel/cpu/mce/core.c
+#	arch/x86/kernel/nmi.c
+#	arch/x86/kernel/traps.c
+#	include/linux/irqflags.h
+#	kernel/trace/trace_preemptirq.c
+diff --cc arch/x86/entry/common.c
+index 8d71cb468d03,f4d57782c14b..000000000000
+--- a/arch/x86/entry/common.c
++++ b/arch/x86/entry/common.c
+@@@ -39,16 -46,61 +39,33 @@@
+  #include <trace/events/syscalls.h>
+  
+  #ifdef CONFIG_CONTEXT_TRACKING
+ -/**
+ - * enter_from_user_mode - Establish state when coming from user mode
+ - *
+ - * Syscall entry disables interrupts, but user mode is traced as interrupts
+ - * enabled. Also with NO_HZ_FULL RCU might be idle.
+ - *
+ - * 1) Tell lockdep that interrupts are disabled
+ - * 2) Invoke context tracking if enabled to reactivate RCU
+ - * 3) Trace interrupts off state
+ - */
+ -static noinstr void enter_from_user_mode(void)
+ +/* Called on entry from user mode with IRQs off. */
+ +__visible inline void enter_from_user_mode(void)
+  {
+ -	enum ctx_state state = ct_state();
+ -
+ -	lockdep_hardirqs_off(CALLER_ADDR0);
+ +	CT_WARN_ON(ct_state() != CONTEXT_USER);
+  	user_exit_irqoff();
+++<<<<<<< HEAD
+ +}
+ +#else
+ +static inline void enter_from_user_mode(void) {}
+++=======
++ 
++ 	instrumentation_begin();
++ 	CT_WARN_ON(state != CONTEXT_USER);
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
++ #else
++ static __always_inline void enter_from_user_mode(void)
++ {
++ 	lockdep_hardirqs_off(CALLER_ADDR0);
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ }
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  #endif
+  
+ -/**
+ - * exit_to_user_mode - Fixup state when exiting to user mode
+ - *
+ - * Syscall exit enables interrupts, but the kernel state is interrupts
+ - * disabled when this is invoked. Also tell RCU about it.
+ - *
+ - * 1) Trace interrupts on state
+ - * 2) Invoke context tracking if enabled to adjust RCU state
+ - * 3) Clear CPU buffers if CPU is affected by MDS and the migitation is on.
+ - * 4) Tell lockdep that interrupts are enabled
+ - */
+ -static __always_inline void exit_to_user_mode(void)
+ -{
+ -	instrumentation_begin();
+ -	trace_hardirqs_on_prepare();
+ -	lockdep_hardirqs_on_prepare(CALLER_ADDR0);
+ -	instrumentation_end();
+ -
+ -	user_enter_irqoff();
+ -	mds_user_clear_cpu_buffers();
+ -	lockdep_hardirqs_on(CALLER_ADDR0);
+ -}
+ -
+  static void do_audit_syscall_entry(struct pt_regs *regs, u32 arch)
+  {
+  #ifdef CONFIG_X86_64
+@@@ -439,3 -511,250 +456,253 @@@ __visible long do_fast_syscall_32(struc
+  #endif
+  }
+  #endif
+++<<<<<<< HEAD
+++=======
++ 
++ SYSCALL_DEFINE0(ni_syscall)
++ {
++ 	return -ENOSYS;
++ }
++ 
++ /**
++  * idtentry_enter_cond_rcu - Handle state tracking on idtentry with conditional
++  *			     RCU handling
++  * @regs:	Pointer to pt_regs of interrupted context
++  *
++  * Invokes:
++  *  - lockdep irqflag state tracking as low level ASM entry disabled
++  *    interrupts.
++  *
++  *  - Context tracking if the exception hit user mode.
++  *
++  *  - The hardirq tracer to keep the state consistent as low level ASM
++  *    entry disabled interrupts.
++  *
++  * For kernel mode entries RCU handling is done conditional. If RCU is
++  * watching then the only RCU requirement is to check whether the tick has
++  * to be restarted. If RCU is not watching then rcu_irq_enter() has to be
++  * invoked on entry and rcu_irq_exit() on exit.
++  *
++  * Avoiding the rcu_irq_enter/exit() calls is an optimization but also
++  * solves the problem of kernel mode pagefaults which can schedule, which
++  * is not possible after invoking rcu_irq_enter() without undoing it.
++  *
++  * For user mode entries enter_from_user_mode() must be invoked to
++  * establish the proper context for NOHZ_FULL. Otherwise scheduling on exit
++  * would not be possible.
++  *
++  * Returns: True if RCU has been adjusted on a kernel entry
++  *	    False otherwise
++  *
++  * The return value must be fed into the rcu_exit argument of
++  * idtentry_exit_cond_rcu().
++  */
++ bool noinstr idtentry_enter_cond_rcu(struct pt_regs *regs)
++ {
++ 	if (user_mode(regs)) {
++ 		enter_from_user_mode();
++ 		return false;
++ 	}
++ 
++ 	if (!__rcu_is_watching()) {
++ 		/*
++ 		 * If RCU is not watching then the same careful
++ 		 * sequence vs. lockdep and tracing is required
++ 		 * as in enter_from_user_mode().
++ 		 *
++ 		 * This only happens for IRQs that hit the idle
++ 		 * loop, i.e. if idle is not using MWAIT.
++ 		 */
++ 		lockdep_hardirqs_off(CALLER_ADDR0);
++ 		rcu_irq_enter();
++ 		instrumentation_begin();
++ 		trace_hardirqs_off_finish();
++ 		instrumentation_end();
++ 
++ 		return true;
++ 	}
++ 
++ 	/*
++ 	 * If RCU is watching then RCU only wants to check
++ 	 * whether it needs to restart the tick in NOHZ
++ 	 * mode.
++ 	 */
++ 	instrumentation_begin();
++ 	rcu_irq_enter_check_tick();
++ 	/* Use the combo lockdep/tracing function */
++ 	trace_hardirqs_off();
++ 	instrumentation_end();
++ 
++ 	return false;
++ }
++ 
++ static void idtentry_exit_cond_resched(struct pt_regs *regs, bool may_sched)
++ {
++ 	if (may_sched && !preempt_count()) {
++ 		/* Sanity check RCU and thread stack */
++ 		rcu_irq_exit_check_preempt();
++ 		if (IS_ENABLED(CONFIG_DEBUG_ENTRY))
++ 			WARN_ON_ONCE(!on_thread_stack());
++ 		if (need_resched())
++ 			preempt_schedule_irq();
++ 	}
++ 	/* Covers both tracing and lockdep */
++ 	trace_hardirqs_on();
++ }
++ 
++ /**
++  * idtentry_exit_cond_rcu - Handle return from exception with conditional RCU
++  *			    handling
++  * @regs:	Pointer to pt_regs (exception entry regs)
++  * @rcu_exit:	Invoke rcu_irq_exit() if true
++  *
++  * Depending on the return target (kernel/user) this runs the necessary
++  * preemption and work checks if possible and reguired and returns to
++  * the caller with interrupts disabled and no further work pending.
++  *
++  * This is the last action before returning to the low level ASM code which
++  * just needs to return to the appropriate context.
++  *
++  * Counterpart to idtentry_enter_cond_rcu(). The return value of the entry
++  * function must be fed into the @rcu_exit argument.
++  */
++ void noinstr idtentry_exit_cond_rcu(struct pt_regs *regs, bool rcu_exit)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	/* Check whether this returns to user mode */
++ 	if (user_mode(regs)) {
++ 		prepare_exit_to_usermode(regs);
++ 	} else if (regs->flags & X86_EFLAGS_IF) {
++ 		/*
++ 		 * If RCU was not watching on entry this needs to be done
++ 		 * carefully and needs the same ordering of lockdep/tracing
++ 		 * and RCU as the return to user mode path.
++ 		 */
++ 		if (rcu_exit) {
++ 			instrumentation_begin();
++ 			/* Tell the tracer that IRET will enable interrupts */
++ 			trace_hardirqs_on_prepare();
++ 			lockdep_hardirqs_on_prepare(CALLER_ADDR0);
++ 			instrumentation_end();
++ 			rcu_irq_exit();
++ 			lockdep_hardirqs_on(CALLER_ADDR0);
++ 			return;
++ 		}
++ 
++ 		instrumentation_begin();
++ 		idtentry_exit_cond_resched(regs, IS_ENABLED(CONFIG_PREEMPTION));
++ 		instrumentation_end();
++ 	} else {
++ 		/*
++ 		 * IRQ flags state is correct already. Just tell RCU if it
++ 		 * was not watching on entry.
++ 		 */
++ 		if (rcu_exit)
++ 			rcu_irq_exit();
++ 	}
++ }
++ 
++ /**
++  * idtentry_enter_user - Handle state tracking on idtentry from user mode
++  * @regs:	Pointer to pt_regs of interrupted context
++  *
++  * Invokes enter_from_user_mode() to establish the proper context for
++  * NOHZ_FULL. Otherwise scheduling on exit would not be possible.
++  */
++ void noinstr idtentry_enter_user(struct pt_regs *regs)
++ {
++ 	enter_from_user_mode();
++ }
++ 
++ /**
++  * idtentry_exit_user - Handle return from exception to user mode
++  * @regs:	Pointer to pt_regs (exception entry regs)
++  *
++  * Runs the necessary preemption and work checks and returns to the caller
++  * with interrupts disabled and no further work pending.
++  *
++  * This is the last action before returning to the low level ASM code which
++  * just needs to return to the appropriate context.
++  *
++  * Counterpart to idtentry_enter_user().
++  */
++ void noinstr idtentry_exit_user(struct pt_regs *regs)
++ {
++ 	lockdep_assert_irqs_disabled();
++ 
++ 	prepare_exit_to_usermode(regs);
++ }
++ 
++ #ifdef CONFIG_XEN_PV
++ #ifndef CONFIG_PREEMPTION
++ /*
++  * Some hypercalls issued by the toolstack can take many 10s of
++  * seconds. Allow tasks running hypercalls via the privcmd driver to
++  * be voluntarily preempted even if full kernel preemption is
++  * disabled.
++  *
++  * Such preemptible hypercalls are bracketed by
++  * xen_preemptible_hcall_begin() and xen_preemptible_hcall_end()
++  * calls.
++  */
++ DEFINE_PER_CPU(bool, xen_in_preemptible_hcall);
++ EXPORT_SYMBOL_GPL(xen_in_preemptible_hcall);
++ 
++ /*
++  * In case of scheduling the flag must be cleared and restored after
++  * returning from schedule as the task might move to a different CPU.
++  */
++ static __always_inline bool get_and_clear_inhcall(void)
++ {
++ 	bool inhcall = __this_cpu_read(xen_in_preemptible_hcall);
++ 
++ 	__this_cpu_write(xen_in_preemptible_hcall, false);
++ 	return inhcall;
++ }
++ 
++ static __always_inline void restore_inhcall(bool inhcall)
++ {
++ 	__this_cpu_write(xen_in_preemptible_hcall, inhcall);
++ }
++ #else
++ static __always_inline bool get_and_clear_inhcall(void) { return false; }
++ static __always_inline void restore_inhcall(bool inhcall) { }
++ #endif
++ 
++ static void __xen_pv_evtchn_do_upcall(void)
++ {
++ 	irq_enter_rcu();
++ 	inc_irq_stat(irq_hv_callback_count);
++ 
++ 	xen_hvm_evtchn_do_upcall();
++ 
++ 	irq_exit_rcu();
++ }
++ 
++ __visible noinstr void xen_pv_evtchn_do_upcall(struct pt_regs *regs)
++ {
++ 	struct pt_regs *old_regs;
++ 	bool inhcall, rcu_exit;
++ 
++ 	rcu_exit = idtentry_enter_cond_rcu(regs);
++ 	old_regs = set_irq_regs(regs);
++ 
++ 	instrumentation_begin();
++ 	run_on_irqstack_cond(__xen_pv_evtchn_do_upcall, NULL, regs);
++ 	instrumentation_begin();
++ 
++ 	set_irq_regs(old_regs);
++ 
++ 	inhcall = get_and_clear_inhcall();
++ 	if (inhcall && !WARN_ON_ONCE(rcu_exit)) {
++ 		instrumentation_begin();
++ 		idtentry_exit_cond_resched(regs, true);
++ 		instrumentation_end();
++ 		restore_inhcall(inhcall);
++ 	} else {
++ 		idtentry_exit_cond_rcu(regs, rcu_exit);
++ 	}
++ }
++ #endif /* CONFIG_XEN_PV */
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+diff --cc arch/x86/kernel/cpu/mce/core.c
+index df108ae34b27,b9cb381b4019..000000000000
+--- a/arch/x86/kernel/cpu/mce/core.c
++++ b/arch/x86/kernel/cpu/mce/core.c
+@@@ -1805,14 -1903,77 +1805,37 @@@ static void unexpected_machine_check(st
+  }
+  
+  /* Call the installed machine check handler for this CPU setup. */
+ -void (*machine_check_vector)(struct pt_regs *) = unexpected_machine_check;
+ +void (*machine_check_vector)(struct pt_regs *, long error_code) =
+ +						unexpected_machine_check;
+  
+ -static __always_inline void exc_machine_check_kernel(struct pt_regs *regs)
+ +dotraplinkage void do_mce(struct pt_regs *regs, long error_code)
+  {
+++<<<<<<< HEAD
+ +	machine_check_vector(regs, error_code);
+++=======
++ 	/*
++ 	 * Only required when from kernel mode. See
++ 	 * mce_check_crashing_cpu() for details.
++ 	 */
++ 	if (machine_check_vector == do_machine_check &&
++ 	    mce_check_crashing_cpu())
++ 		return;
++ 
++ 	nmi_enter();
++ 	/*
++ 	 * The call targets are marked noinstr, but objtool can't figure
++ 	 * that out because it's an indirect call. Annotate it.
++ 	 */
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	machine_check_vector(regs);
++ 	if (regs->flags & X86_EFLAGS_IF)
++ 		trace_hardirqs_on_prepare();
++ 	instrumentation_end();
++ 	nmi_exit();
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  }
+  
+ -static __always_inline void exc_machine_check_user(struct pt_regs *regs)
+ -{
+ -	idtentry_enter_user(regs);
+ -	instrumentation_begin();
+ -	machine_check_vector(regs);
+ -	instrumentation_end();
+ -	idtentry_exit_user(regs);
+ -}
+ -
+ -#ifdef CONFIG_X86_64
+ -/* MCE hit kernel mode */
+ -DEFINE_IDTENTRY_MCE(exc_machine_check)
+ -{
+ -	unsigned long dr7;
+ -
+ -	dr7 = local_db_save();
+ -	exc_machine_check_kernel(regs);
+ -	local_db_restore(dr7);
+ -}
+ -
+ -/* The user mode variant. */
+ -DEFINE_IDTENTRY_MCE_USER(exc_machine_check)
+ -{
+ -	unsigned long dr7;
+ -
+ -	dr7 = local_db_save();
+ -	exc_machine_check_user(regs);
+ -	local_db_restore(dr7);
+ -}
+ -#else
+ -/* 32bit unified entry point */
+ -DEFINE_IDTENTRY_MCE(exc_machine_check)
+ -{
+ -	unsigned long dr7;
+ -
+ -	dr7 = local_db_save();
+ -	if (user_mode(regs))
+ -		exc_machine_check_user(regs);
+ -	else
+ -		exc_machine_check_kernel(regs);
+ -	local_db_restore(dr7);
+ -}
+ -#endif
+ -
+  /*
+   * Called for each booted CPU to set up machine checks.
+   * Must be called with preempt off:
+diff --cc arch/x86/kernel/nmi.c
+index 086cf1d1d71d,3a98ff36f411..000000000000
+--- a/arch/x86/kernel/nmi.c
++++ b/arch/x86/kernel/nmi.c
+@@@ -333,6 -329,9 +333,12 @@@ static void default_do_nmi(struct pt_re
+  
+  	__this_cpu_write(last_nmi_rip, regs->ip);
+  
+++<<<<<<< HEAD
+++=======
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  	handled = nmi_handle(NMI_LOCAL, regs);
+  	__this_cpu_add(nmi_stats.normal, handled);
+  	if (handled) {
+diff --cc arch/x86/kernel/traps.c
+index 1d1d9da68d9c,79af913e78a3..000000000000
+--- a/arch/x86/kernel/traps.c
++++ b/arch/x86/kernel/traps.c
+@@@ -576,58 -539,110 +576,78 @@@ do_general_protection(struct pt_regs *r
+  	tsk->thread.error_code = error_code;
+  	tsk->thread.trap_nr = X86_TRAP_GP;
+  
+ -	/*
+ -	 * To be potentially processing a kprobe fault and to trust the result
+ -	 * from kprobe_running(), we have to be non-preemptible.
+ -	 */
+ -	if (!preemptible() &&
+ -	    kprobe_running() &&
+ -	    kprobe_fault_handler(regs, X86_TRAP_GP))
+ -		goto exit;
+ -
+ -	ret = notify_die(DIE_GPF, desc, regs, error_code, X86_TRAP_GP, SIGSEGV);
+ -	if (ret == NOTIFY_STOP)
+ -		goto exit;
+ -
+ -	if (error_code)
+ -		snprintf(desc, sizeof(desc), "segment-related " GPFSTR);
+ -	else
+ -		hint = get_kernel_gp_address(regs, &gp_addr);
+ -
+ -	if (hint != GP_NO_HINT)
+ -		snprintf(desc, sizeof(desc), GPFSTR ", %s 0x%lx",
+ -			 (hint == GP_NON_CANONICAL) ? "probably for non-canonical address"
+ -						    : "maybe for address",
+ -			 gp_addr);
+ +	show_signal(tsk, SIGSEGV, "", desc, regs, error_code);
+  
+ -	/*
+ -	 * KASAN is interested only in the non-canonical case, clear it
+ -	 * otherwise.
+ -	 */
+ -	if (hint != GP_NON_CANONICAL)
+ -		gp_addr = 0;
+ -
+ -	die_addr(desc, regs, error_code, gp_addr);
+ -
+ -exit:
+ -	cond_local_irq_disable(regs);
+ +	force_sig(SIGSEGV, tsk);
+  }
+ +NOKPROBE_SYMBOL(do_general_protection);
+  
+ -static bool do_int3(struct pt_regs *regs)
+ +dotraplinkage void notrace do_int3(struct pt_regs *regs, long error_code)
+  {
+ -	int res;
+ +#ifdef CONFIG_DYNAMIC_FTRACE
+ +	/*
+ +	 * ftrace must be first, everything else may cause a recursive crash.
+ +	 * See note by declaration of modifying_ftrace_code in ftrace.c
+ +	 */
+ +	if (unlikely(atomic_read(&modifying_ftrace_code)) &&
+ +	    ftrace_int3_handler(regs))
+ +		return;
+ +#endif
+ +	if (poke_int3_handler(regs))
+ +		return;
+  
+ +	/*
+ +	 * Use ist_enter despite the fact that we don't use an IST stack.
+ +	 * We can be called from a kprobe in non-CONTEXT_KERNEL kernel
+ +	 * mode or even during context tracking state changes.
+ +	 *
+ +	 * This means that we can't schedule.  That's okay.
+ +	 */
+++<<<<<<< HEAD
+ +	ist_enter(regs);
+ +	RCU_LOCKDEP_WARN(!rcu_is_watching(), "entry code didn't wake RCU");
+  #ifdef CONFIG_KGDB_LOW_LEVEL_TRAP
+ -	if (kgdb_ll_trap(DIE_INT3, "int3", regs, 0, X86_TRAP_BP,
+ -			 SIGTRAP) == NOTIFY_STOP)
+ -		return true;
+ +	if (kgdb_ll_trap(DIE_INT3, "int3", regs, error_code, X86_TRAP_BP,
+ +				SIGTRAP) == NOTIFY_STOP)
+ +		goto exit;
+  #endif /* CONFIG_KGDB_LOW_LEVEL_TRAP */
+  
+  #ifdef CONFIG_KPROBES
+  	if (kprobe_int3_handler(regs))
+ -		return true;
+ +		goto exit;
+  #endif
+ -	res = notify_die(DIE_INT3, "int3", regs, 0, X86_TRAP_BP, SIGTRAP);
+ -
+ -	return res == NOTIFY_STOP;
+ -}
+  
+ -static void do_int3_user(struct pt_regs *regs)
+ -{
+ -	if (do_int3(regs))
+ -		return;
+ +	if (notify_die(DIE_INT3, "int3", regs, error_code, X86_TRAP_BP,
+ +			SIGTRAP) == NOTIFY_STOP)
+ +		goto exit;
+  
+  	cond_local_irq_enable(regs);
+ -	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, 0, 0, NULL);
+ +	do_trap(X86_TRAP_BP, SIGTRAP, "int3", regs, error_code, 0, NULL);
+  	cond_local_irq_disable(regs);
+ -}
+  
+ -DEFINE_IDTENTRY_RAW(exc_int3)
+ -{
+ -	/*
+ -	 * poke_int3_handler() is completely self contained code; it does (and
+ -	 * must) *NOT* call out to anything, lest it hits upon yet another
+ -	 * INT3.
+ -	 */
+ -	if (poke_int3_handler(regs))
+ -		return;
+ -
+ -	/*
+ -	 * idtentry_enter_user() uses static_branch_{,un}likely() and therefore
+ -	 * can trigger INT3, hence poke_int3_handler() must be done
+ -	 * before. If the entry came from kernel mode, then use nmi_enter()
+ -	 * because the INT3 could have been hit in any context including
+ -	 * NMI.
+ -	 */
+ +exit:
+ +	ist_exit(regs);
+++=======
++ 	if (user_mode(regs)) {
++ 		idtentry_enter_user(regs);
++ 		instrumentation_begin();
++ 		do_int3_user(regs);
++ 		instrumentation_end();
++ 		idtentry_exit_user(regs);
++ 	} else {
++ 		nmi_enter();
++ 		instrumentation_begin();
++ 		trace_hardirqs_off_finish();
++ 		if (!do_int3(regs))
++ 			die("int3", regs, 0);
++ 		if (regs->flags & X86_EFLAGS_IF)
++ 			trace_hardirqs_on_prepare();
++ 		instrumentation_end();
++ 		nmi_exit();
++ 	}
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  }
+ +NOKPROBE_SYMBOL(do_int3);
+  
+  #ifdef CONFIG_X86_64
+  /*
+@@@ -815,16 -818,103 +835,107 @@@ dotraplinkage void do_debug(struct pt_r
+  		set_tsk_thread_flag(tsk, TIF_SINGLESTEP);
+  		regs->flags &= ~X86_EFLAGS_TF;
+  	}
+ -
+  	si_code = get_si_code(tsk->thread.debugreg6);
+  	if (tsk->thread.debugreg6 & (DR_STEP | DR_TRAP_BITS) || user_icebp)
+ -		send_sigtrap(regs, 0, si_code);
+ -
+ -out:
+ +		send_sigtrap(tsk, regs, error_code, si_code);
+  	cond_local_irq_disable(regs);
+ -	instrumentation_end();
+ +	debug_stack_usage_dec();
+ +
+ +exit:
+ +	ist_exit(regs);
+  }
+++<<<<<<< HEAD
+ +NOKPROBE_SYMBOL(do_debug);
+++=======
++ 
++ static __always_inline void exc_debug_kernel(struct pt_regs *regs,
++ 					     unsigned long dr6)
++ {
++ 	nmi_enter();
++ 	instrumentation_begin();
++ 	trace_hardirqs_off_finish();
++ 	instrumentation_end();
++ 
++ 	/*
++ 	 * The SDM says "The processor clears the BTF flag when it
++ 	 * generates a debug exception."  Clear TIF_BLOCKSTEP to keep
++ 	 * TIF_BLOCKSTEP in sync with the hardware BTF flag.
++ 	 */
++ 	clear_thread_flag(TIF_BLOCKSTEP);
++ 
++ 	/*
++ 	 * Catch SYSENTER with TF set and clear DR_STEP. If this hit a
++ 	 * watchpoint at the same time then that will still be handled.
++ 	 */
++ 	if ((dr6 & DR_STEP) && is_sysenter_singlestep(regs))
++ 		dr6 &= ~DR_STEP;
++ 
++ 	/*
++ 	 * If DR6 is zero, no point in trying to handle it. The kernel is
++ 	 * not using INT1.
++ 	 */
++ 	if (dr6)
++ 		handle_debug(regs, dr6, false);
++ 
++ 	instrumentation_begin();
++ 	if (regs->flags & X86_EFLAGS_IF)
++ 		trace_hardirqs_on_prepare();
++ 	instrumentation_end();
++ 	nmi_exit();
++ }
++ 
++ static __always_inline void exc_debug_user(struct pt_regs *regs,
++ 					   unsigned long dr6)
++ {
++ 	idtentry_enter_user(regs);
++ 	clear_thread_flag(TIF_BLOCKSTEP);
++ 
++ 	/*
++ 	 * If dr6 has no reason to give us about the origin of this trap,
++ 	 * then it's very likely the result of an icebp/int01 trap.
++ 	 * User wants a sigtrap for that.
++ 	 */
++ 	handle_debug(regs, dr6, !dr6);
++ 	idtentry_exit_user(regs);
++ }
++ 
++ #ifdef CONFIG_X86_64
++ /* IST stack entry */
++ DEFINE_IDTENTRY_DEBUG(exc_debug)
++ {
++ 	unsigned long dr6, dr7;
++ 
++ 	debug_enter(&dr6, &dr7);
++ 	exc_debug_kernel(regs, dr6);
++ 	debug_exit(dr7);
++ }
++ 
++ /* User entry, runs on regular task stack */
++ DEFINE_IDTENTRY_DEBUG_USER(exc_debug)
++ {
++ 	unsigned long dr6, dr7;
++ 
++ 	debug_enter(&dr6, &dr7);
++ 	exc_debug_user(regs, dr6);
++ 	debug_exit(dr7);
++ }
++ #else
++ /* 32 bit does not have separate entry points. */
++ DEFINE_IDTENTRY_DEBUG(exc_debug)
++ {
++ 	unsigned long dr6, dr7;
++ 
++ 	debug_enter(&dr6, &dr7);
++ 
++ 	if (user_mode(regs))
++ 		exc_debug_user(regs, dr6);
++ 	else
++ 		exc_debug_kernel(regs, dr6);
++ 
++ 	debug_exit(dr7);
++ }
++ #endif
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  
+  /*
+   * Note that we play around with the 'TS' bit in an attempt to get
+diff --cc include/linux/irqflags.h
+index b53a9f136087,6384d2813ded..000000000000
+--- a/include/linux/irqflags.h
++++ b/include/linux/irqflags.h
+@@@ -15,16 -15,31 +15,21 @@@
+  #include <linux/typecheck.h>
+  #include <asm/irqflags.h>
+  
+ -/* Currently lockdep_softirqs_on/off is used only by lockdep */
+ -#ifdef CONFIG_PROVE_LOCKING
+ -  extern void lockdep_softirqs_on(unsigned long ip);
+ -  extern void lockdep_softirqs_off(unsigned long ip);
+ -  extern void lockdep_hardirqs_on_prepare(unsigned long ip);
+ -  extern void lockdep_hardirqs_on(unsigned long ip);
+ -  extern void lockdep_hardirqs_off(unsigned long ip);
+ -#else
+ -  static inline void lockdep_softirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_softirqs_off(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on_prepare(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_on(unsigned long ip) { }
+ -  static inline void lockdep_hardirqs_off(unsigned long ip) { }
+ -#endif
+ -
+  #ifdef CONFIG_TRACE_IRQFLAGS
+++<<<<<<< HEAD
+ +  extern void trace_softirqs_on(unsigned long ip);
+ +  extern void trace_softirqs_off(unsigned long ip);
+++=======
++   extern void trace_hardirqs_on_prepare(void);
++   extern void trace_hardirqs_off_finish(void);
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+    extern void trace_hardirqs_on(void);
+    extern void trace_hardirqs_off(void);
+ -# define lockdep_hardirq_context(p)	((p)->hardirq_context)
+ -# define lockdep_softirq_context(p)	((p)->softirq_context)
+ -# define lockdep_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ -# define lockdep_softirqs_enabled(p)	((p)->softirqs_enabled)
+ -# define lockdep_hardirq_enter()		\
+ +# define trace_hardirq_context(p)	((p)->hardirq_context)
+ +# define trace_softirq_context(p)	((p)->softirq_context)
+ +# define trace_hardirqs_enabled(p)	((p)->hardirqs_enabled)
+ +# define trace_softirqs_enabled(p)	((p)->softirqs_enabled)
+ +# define trace_hardirq_enter()			\
+  do {						\
+  	if (!current->hardirq_context++)	\
+  		current->hardirq_threaded = 0;	\
+@@@ -85,17 -100,17 +90,22 @@@ do {						
+  	  } while (0)
+  
+  #else
+++<<<<<<< HEAD
+++=======
++ # define trace_hardirqs_on_prepare()		do { } while (0)
++ # define trace_hardirqs_off_finish()		do { } while (0)
+++>>>>>>> bf2b30084400 (x86/entry: Rename trace_hardirqs_off_prepare())
+  # define trace_hardirqs_on()		do { } while (0)
+  # define trace_hardirqs_off()		do { } while (0)
+ -# define lockdep_hardirq_context(p)	0
+ -# define lockdep_softirq_context(p)	0
+ -# define lockdep_hardirqs_enabled(p)	0
+ -# define lockdep_softirqs_enabled(p)	0
+ -# define lockdep_hardirq_enter()	do { } while (0)
+ -# define lockdep_hardirq_threaded()	do { } while (0)
+ -# define lockdep_hardirq_exit()		do { } while (0)
+ +# define trace_softirqs_on(ip)		do { } while (0)
+ +# define trace_softirqs_off(ip)		do { } while (0)
+ +# define trace_hardirq_context(p)	0
+ +# define trace_softirq_context(p)	0
+ +# define trace_hardirqs_enabled(p)	0
+ +# define trace_softirqs_enabled(p)	0
+ +# define trace_hardirq_enter()		do { } while (0)
+ +# define trace_hardirq_threaded()	do { } while (0)
+ +# define trace_hardirq_exit()		do { } while (0)
+  # define lockdep_softirq_enter()	do { } while (0)
+  # define lockdep_softirq_exit()		do { } while (0)
+  # define lockdep_hrtimer_enter(__hrtimer)	false
+* Unmerged path kernel/trace/trace_preemptirq.c
+* Unmerged path arch/x86/entry/common.c
+* Unmerged path arch/x86/kernel/cpu/mce/core.c
+* Unmerged path arch/x86/kernel/nmi.c
+* Unmerged path arch/x86/kernel/traps.c
+* Unmerged path include/linux/irqflags.h
+* Unmerged path kernel/trace/trace_preemptirq.c
