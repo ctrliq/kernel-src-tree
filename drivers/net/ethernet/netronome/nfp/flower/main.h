@@ -42,6 +42,7 @@ struct nfp_app;
 #define NFP_FL_FEATS_GENEVE_OPT		BIT(2)
 #define NFP_FL_FEATS_VLAN_PCP		BIT(3)
 #define NFP_FL_FEATS_FLOW_MOD		BIT(5)
+#define NFP_FL_FEATS_PRE_TUN_RULES	BIT(6)
 #define NFP_FL_FEATS_FLOW_MERGE		BIT(30)
 #define NFP_FL_FEATS_LAG		BIT(31)
 
@@ -256,6 +257,9 @@ struct nfp_fl_payload {
 	char *action_data;
 	struct list_head linked_flows;
 	bool in_hw;
+	struct {
+		struct net_device *dev;
+	} pre_tun_rule;
 };
 
 struct nfp_fl_payload_link {
