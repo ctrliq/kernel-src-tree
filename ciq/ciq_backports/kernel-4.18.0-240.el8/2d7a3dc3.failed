@@ -1,0 +1,218 @@
+USB: drop HCD_LOCAL_MEM flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Laurentiu Tudor <laurentiu.tudor@nxp.com>
+commit 2d7a3dc3e24f43504b1f25eae8195e600f4cce8b
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/2d7a3dc3.failed
+
+With the addition of the local memory allocator, the HCD_LOCAL_MEM
+flag can be dropped and the checks against it replaced with a check
+for the localmem_pool ptr being initialized.
+
+	Signed-off-by: Laurentiu Tudor <laurentiu.tudor@nxp.com>
+	Tested-by: Fredrik Noring <noring@nocrew.org>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+(cherry picked from commit 2d7a3dc3e24f43504b1f25eae8195e600f4cce8b)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/usb/host/ohci-sm501.c
+diff --cc drivers/usb/host/ohci-sm501.c
+index c9233cddf9a2,c158cda9e4b9..000000000000
+--- a/drivers/usb/host/ohci-sm501.c
++++ b/drivers/usb/host/ohci-sm501.c
+@@@ -165,6 -142,25 +165,28 @@@ static int ohci_hcd_sm501_drv_probe(str
+  
+  	ohci_hcd_init(hcd_to_ohci(hcd));
+  
+++<<<<<<< HEAD
+++=======
++ 	/* The sm501 chip is equipped with local memory that may be used
++ 	 * by on-chip devices such as the video controller and the usb host.
++ 	 * This driver uses genalloc so that usb allocations with
++ 	 * gen_pool_dma_alloc() allocate from this local memory. The dma_handle
++ 	 * returned by gen_pool_dma_alloc() will be an offset starting from 0
++ 	 * for the first local memory byte.
++ 	 *
++ 	 * So as long as data is allocated using gen_pool_dma_alloc() all is
++ 	 * fine. This is however not always the case - buffers may be allocated
++ 	 * using kmalloc() - so the usb core needs to be told that it must copy
++ 	 * data into our local memory if the buffers happen to be placed in
++ 	 * regular memory. A non-null hcd->localmem_pool initialized by the
++ 	 * the call to usb_hcd_setup_local_mem() below does just that.
++ 	 */
++ 
++ 	if (usb_hcd_setup_local_mem(hcd, mem->start,
++ 				    mem->start - mem->parent->start,
++ 				    resource_size(mem)) < 0)
++ 		goto err5;
+++>>>>>>> 2d7a3dc3e24f (USB: drop HCD_LOCAL_MEM flag)
+  	retval = usb_add_hcd(hcd, irq, IRQF_SHARED);
+  	if (retval)
+  		goto err5;
+diff --git a/drivers/usb/core/buffer.c b/drivers/usb/core/buffer.c
+index d2064ad7ad14..1359b78a624e 100644
+--- a/drivers/usb/core/buffer.c
++++ b/drivers/usb/core/buffer.c
+@@ -68,7 +68,7 @@ int hcd_buffer_create(struct usb_hcd *hcd)
+ 
+ 	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+ 	    (!is_device_dma_capable(hcd->self.sysdev) &&
+-	     !(hcd->driver->flags & HCD_LOCAL_MEM)))
++	     !hcd->localmem_pool))
+ 		return 0;
+ 
+ 	for (i = 0; i < HCD_BUFFER_POOLS; i++) {
+@@ -130,8 +130,7 @@ void *hcd_buffer_alloc(
+ 
+ 	/* some USB hosts just use PIO */
+ 	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+-	    (!is_device_dma_capable(bus->sysdev) &&
+-	     !(hcd->driver->flags & HCD_LOCAL_MEM))) {
++	    !is_device_dma_capable(bus->sysdev)) {
+ 		*dma = ~(dma_addr_t) 0;
+ 		return kmalloc(size, mem_flags);
+ 	}
+@@ -162,8 +161,7 @@ void hcd_buffer_free(
+ 	}
+ 
+ 	if (!IS_ENABLED(CONFIG_HAS_DMA) ||
+-	    (!is_device_dma_capable(bus->sysdev) &&
+-	     !(hcd->driver->flags & HCD_LOCAL_MEM))) {
++	    !is_device_dma_capable(bus->sysdev)) {
+ 		kfree(addr);
+ 		return;
+ 	}
+diff --git a/drivers/usb/core/hcd.c b/drivers/usb/core/hcd.c
+index c351844f5b2c..2ccbc2f83570 100644
+--- a/drivers/usb/core/hcd.c
++++ b/drivers/usb/core/hcd.c
+@@ -1247,14 +1247,14 @@ EXPORT_SYMBOL_GPL(usb_hcd_unlink_urb_from_ep);
+  * using regular system memory - like pci devices doing bus mastering.
+  *
+  * To support host controllers with limited dma capabilities we provide dma
+- * bounce buffers. This feature can be enabled using the HCD_LOCAL_MEM flag.
++ * bounce buffers. This feature can be enabled by initializing
++ * hcd->localmem_pool using usb_hcd_setup_local_mem().
+  * For this to work properly the host controller code must first use the
+  * function dma_declare_coherent_memory() to point out which memory area
+  * that should be used for dma allocations.
+  *
+- * The HCD_LOCAL_MEM flag then tells the usb code to allocate all data for
+- * dma using dma_alloc_coherent() which in turn allocates from the memory
+- * area pointed out with dma_declare_coherent_memory().
++ * The initialized hcd->localmem_pool then tells the usb code to allocate all
++ * data for dma using the genalloc API.
+  *
+  * So, to summarize...
+  *
+@@ -1264,9 +1264,6 @@ EXPORT_SYMBOL_GPL(usb_hcd_unlink_urb_from_ep);
+  *   (a) "normal" kernel memory is no good, and
+  *   (b) there's not enough to share
+  *
+- * - The only *portable* hook for such stuff in the
+- *   DMA framework is dma_declare_coherent_memory()
+- *
+  * - So we use that, even though the primary requirement
+  *   is that the memory be "local" (hence addressable
+  *   by that device), not "coherent".
+@@ -1433,7 +1430,7 @@ int usb_hcd_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 						urb->setup_dma))
+ 				return -EAGAIN;
+ 			urb->transfer_flags |= URB_SETUP_MAP_SINGLE;
+-		} else if (hcd->driver->flags & HCD_LOCAL_MEM) {
++		} else if (hcd->localmem_pool) {
+ 			ret = hcd_alloc_coherent(
+ 					urb->dev->bus, mem_flags,
+ 					&urb->setup_dma,
+@@ -1503,7 +1500,7 @@ int usb_hcd_map_urb_for_dma(struct usb_hcd *hcd, struct urb *urb,
+ 				else
+ 					urb->transfer_flags |= URB_DMA_MAP_SINGLE;
+ 			}
+-		} else if (hcd->driver->flags & HCD_LOCAL_MEM) {
++		} else if (hcd->localmem_pool) {
+ 			ret = hcd_alloc_coherent(
+ 					urb->dev->bus, mem_flags,
+ 					&urb->transfer_dma,
+diff --git a/drivers/usb/host/ehci-hcd.c b/drivers/usb/host/ehci-hcd.c
+index cdafa97f632d..9da7e22848c9 100644
+--- a/drivers/usb/host/ehci-hcd.c
++++ b/drivers/usb/host/ehci-hcd.c
+@@ -559,7 +559,7 @@ static int ehci_init(struct usb_hcd *hcd)
+ 	ehci->command = temp;
+ 
+ 	/* Accept arbitrarily long scatter-gather lists */
+-	if (!(hcd->driver->flags & HCD_LOCAL_MEM))
++	if (!hcd->localmem_pool)
+ 		hcd->self.sg_tablesize = ~0;
+ 
+ 	/* Prepare for unlinking active QHs */
+diff --git a/drivers/usb/host/fotg210-hcd.c b/drivers/usb/host/fotg210-hcd.c
+index 303d39d1af68..0dbfa5c10703 100644
+--- a/drivers/usb/host/fotg210-hcd.c
++++ b/drivers/usb/host/fotg210-hcd.c
+@@ -5000,7 +5000,7 @@ static int hcd_fotg210_init(struct usb_hcd *hcd)
+ 	fotg210->command = temp;
+ 
+ 	/* Accept arbitrarily long scatter-gather lists */
+-	if (!(hcd->driver->flags & HCD_LOCAL_MEM))
++	if (!hcd->localmem_pool)
+ 		hcd->self.sg_tablesize = ~0;
+ 	return 0;
+ }
+diff --git a/drivers/usb/host/ohci-hcd.c b/drivers/usb/host/ohci-hcd.c
+index d77eff82273c..1fe3deec35cf 100644
+--- a/drivers/usb/host/ohci-hcd.c
++++ b/drivers/usb/host/ohci-hcd.c
+@@ -457,7 +457,7 @@ static int ohci_init (struct ohci_hcd *ohci)
+ 	struct usb_hcd *hcd = ohci_to_hcd(ohci);
+ 
+ 	/* Accept arbitrarily long scatter-gather lists */
+-	if (!(hcd->driver->flags & HCD_LOCAL_MEM))
++	if (!hcd->localmem_pool)
+ 		hcd->self.sg_tablesize = ~0;
+ 
+ 	if (distrust_firmware)
+* Unmerged path drivers/usb/host/ohci-sm501.c
+diff --git a/drivers/usb/host/ohci-tmio.c b/drivers/usb/host/ohci-tmio.c
+index a631dbb369d7..98ecf3e3d74f 100644
+--- a/drivers/usb/host/ohci-tmio.c
++++ b/drivers/usb/host/ohci-tmio.c
+@@ -153,7 +153,7 @@ static const struct hc_driver ohci_tmio_hc_driver = {
+ 
+ 	/* generic hardware linkage */
+ 	.irq =			ohci_irq,
+-	.flags =		HCD_USB11 | HCD_MEMORY | HCD_LOCAL_MEM,
++	.flags =		HCD_USB11 | HCD_MEMORY,
+ 
+ 	/* basic lifecycle operations */
+ 	.start =		ohci_tmio_start,
+diff --git a/drivers/usb/host/uhci-hcd.c b/drivers/usb/host/uhci-hcd.c
+index 6218bfe54f52..b4f4f729e080 100644
+--- a/drivers/usb/host/uhci-hcd.c
++++ b/drivers/usb/host/uhci-hcd.c
+@@ -581,7 +581,7 @@ static int uhci_start(struct usb_hcd *hcd)
+ 
+ 	hcd->uses_new_polling = 1;
+ 	/* Accept arbitrarily long scatter-gather lists */
+-	if (!(hcd->driver->flags & HCD_LOCAL_MEM))
++	if (!hcd->localmem_pool)
+ 		hcd->self.sg_tablesize = ~0;
+ 
+ 	spin_lock_init(&uhci->lock);
+diff --git a/include/linux/usb/hcd.h b/include/linux/usb/hcd.h
+index 127560a4bfa0..bab27ccc8ff5 100644
+--- a/include/linux/usb/hcd.h
++++ b/include/linux/usb/hcd.h
+@@ -256,7 +256,6 @@ struct hc_driver {
+ 
+ 	int	flags;
+ #define	HCD_MEMORY	0x0001		/* HC regs use memory (else I/O) */
+-#define	HCD_LOCAL_MEM	0x0002		/* HC needs local memory */
+ #define	HCD_SHARED	0x0004		/* Two (or more) usb_hcds share HW */
+ #define	HCD_USB11	0x0010		/* USB 1.1 */
+ #define	HCD_USB2	0x0020		/* USB 2.0 */
