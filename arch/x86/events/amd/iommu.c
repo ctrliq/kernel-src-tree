@@ -17,6 +17,7 @@
 #include <linux/init.h>
 #include <linux/cpumask.h>
 #include <linux/slab.h>
+#include <linux/amd-iommu.h>
 
 #include "../perf_event.h"
 #include "iommu.h"
