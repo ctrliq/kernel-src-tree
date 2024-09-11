@@ -1,0 +1,174 @@
+RDMA/core: Introduce IB_MR_TYPE_INTEGRITY and ib_alloc_mr_integrity API
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Israel Rukshin <israelr@mellanox.com>
+commit 26bc7eaee94fd904d1817fee4d864f8526807465
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/26bc7eae.failed
+
+This is a preparation for signature verbs API re-design. In the new
+design a single MR with IB_MR_TYPE_INTEGRITY type will be used to perform
+the needed mapping for data integrity operations.
+
+	Signed-off-by: Israel Rukshin <israelr@mellanox.com>
+	Signed-off-by: Max Gurtovoy <maxg@mellanox.com>
+	Reviewed-by: Sagi Grimberg <sagi@grimberg.me>
+	Reviewed-by: Bart Van Assche <bvanassche@acm.org>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+(cherry picked from commit 26bc7eaee94fd904d1817fee4d864f8526807465)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/core/verbs.c
+#	include/rdma/ib_verbs.h
+diff --cc drivers/infiniband/core/verbs.c
+index 93994714b1cd,82d62bc7af65..000000000000
+--- a/drivers/infiniband/core/verbs.c
++++ b/drivers/infiniband/core/verbs.c
+@@@ -1991,7 -2011,10 +1991,14 @@@ struct ib_mr *ib_alloc_mr(struct ib_pd 
+  	if (!pd->device->ops.alloc_mr)
+  		return ERR_PTR(-EOPNOTSUPP);
+  
+++<<<<<<< HEAD
+ +	mr = pd->device->ops.alloc_mr(pd, mr_type, max_num_sg);
+++=======
++ 	if (WARN_ON_ONCE(mr_type == IB_MR_TYPE_INTEGRITY))
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	mr = pd->device->ops.alloc_mr(pd, mr_type, max_num_sg, udata);
+++>>>>>>> 26bc7eaee94f (RDMA/core: Introduce IB_MR_TYPE_INTEGRITY and ib_alloc_mr_integrity API)
+  	if (!IS_ERR(mr)) {
+  		mr->device  = pd->device;
+  		mr->pd      = pd;
+@@@ -2006,8 -2029,51 +2013,51 @@@
+  
+  	return mr;
+  }
+ -EXPORT_SYMBOL(ib_alloc_mr_user);
+ +EXPORT_SYMBOL(ib_alloc_mr);
+  
++ /**
++  * ib_alloc_mr_integrity() - Allocates an integrity memory region
++  * @pd:                      protection domain associated with the region
++  * @max_num_data_sg:         maximum data sg entries available for registration
++  * @max_num_meta_sg:         maximum metadata sg entries available for
++  *                           registration
++  *
++  * Notes:
++  * Memory registration page/sg lists must not exceed max_num_sg,
++  * also the integrity page/sg lists must not exceed max_num_meta_sg.
++  *
++  */
++ struct ib_mr *ib_alloc_mr_integrity(struct ib_pd *pd,
++ 				    u32 max_num_data_sg,
++ 				    u32 max_num_meta_sg)
++ {
++ 	struct ib_mr *mr;
++ 
++ 	if (!pd->device->ops.alloc_mr_integrity)
++ 		return ERR_PTR(-EOPNOTSUPP);
++ 
++ 	if (!max_num_meta_sg)
++ 		return ERR_PTR(-EINVAL);
++ 
++ 	mr = pd->device->ops.alloc_mr_integrity(pd, max_num_data_sg,
++ 						max_num_meta_sg);
++ 	if (IS_ERR(mr))
++ 		return mr;
++ 
++ 	mr->device = pd->device;
++ 	mr->pd = pd;
++ 	mr->dm = NULL;
++ 	mr->uobject = NULL;
++ 	atomic_inc(&pd->usecnt);
++ 	mr->need_inval = false;
++ 	mr->res.type = RDMA_RESTRACK_MR;
++ 	rdma_restrack_kadd(&mr->res);
++ 	mr->type = IB_MR_TYPE_INTEGRITY;
++ 
++ 	return mr;
++ }
++ EXPORT_SYMBOL(ib_alloc_mr_integrity);
++ 
+  /* "Fast" memory regions */
+  
+  struct ib_fmr *ib_alloc_fmr(struct ib_pd *pd,
+diff --cc include/rdma/ib_verbs.h
+index c2e75b869e71,01bc04c8e220..000000000000
+--- a/include/rdma/ib_verbs.h
++++ b/include/rdma/ib_verbs.h
+@@@ -2321,9 -2363,12 +2324,16 @@@ struct ib_device_ops 
+  	int (*rereg_user_mr)(struct ib_mr *mr, int flags, u64 start, u64 length,
+  			     u64 virt_addr, int mr_access_flags,
+  			     struct ib_pd *pd, struct ib_udata *udata);
+ -	int (*dereg_mr)(struct ib_mr *mr, struct ib_udata *udata);
+ +	int (*dereg_mr)(struct ib_mr *mr);
+  	struct ib_mr *(*alloc_mr)(struct ib_pd *pd, enum ib_mr_type mr_type,
+++<<<<<<< HEAD
+ +				  u32 max_num_sg);
+++=======
++ 				  u32 max_num_sg, struct ib_udata *udata);
++ 	struct ib_mr *(*alloc_mr_integrity)(struct ib_pd *pd,
++ 					    u32 max_num_data_sg,
++ 					    u32 max_num_meta_sg);
+++>>>>>>> 26bc7eaee94f (RDMA/core: Introduce IB_MR_TYPE_INTEGRITY and ib_alloc_mr_integrity API)
+  	int (*advise_mr)(struct ib_pd *pd,
+  			 enum ib_uverbs_advise_mr_advice advice, u32 flags,
+  			 struct ib_sge *sg_list, u32 num_sge,
+@@@ -3687,12 -4022,36 +3697,16 @@@ static inline void ib_dma_free_coherent
+   *
+   * This function can fail, if the memory region has memory windows bound to it.
+   */
+ -int ib_dereg_mr_user(struct ib_mr *mr, struct ib_udata *udata);
+ +int ib_dereg_mr(struct ib_mr *mr);
+  
+ -/**
+ - * ib_dereg_mr - Deregisters a kernel memory region and removes it from the
+ - *   HCA translation table.
+ - * @mr: The memory region to deregister.
+ - *
+ - * This function can fail, if the memory region has memory windows bound to it.
+ - *
+ - * NOTE: for user mr use ib_dereg_mr_user with valid udata!
+ - */
+ -static inline int ib_dereg_mr(struct ib_mr *mr)
+ -{
+ -	return ib_dereg_mr_user(mr, NULL);
+ -}
+ -
+ -struct ib_mr *ib_alloc_mr_user(struct ib_pd *pd, enum ib_mr_type mr_type,
+ -			       u32 max_num_sg, struct ib_udata *udata);
+ -
+ -static inline struct ib_mr *ib_alloc_mr(struct ib_pd *pd,
+ -					enum ib_mr_type mr_type, u32 max_num_sg)
+ -{
+ -	return ib_alloc_mr_user(pd, mr_type, max_num_sg, NULL);
+ -}
+ +struct ib_mr *ib_alloc_mr(struct ib_pd *pd,
+ +			  enum ib_mr_type mr_type,
+ +			  u32 max_num_sg);
+  
++ struct ib_mr *ib_alloc_mr_integrity(struct ib_pd *pd,
++ 				    u32 max_num_data_sg,
++ 				    u32 max_num_meta_sg);
++ 
+  /**
+   * ib_update_fast_reg_key - updates the key portion of the fast_reg MR
+   *   R_Key and L_Key.
+diff --git a/drivers/infiniband/core/device.c b/drivers/infiniband/core/device.c
+index ec96a7b1c811..f22653540b7f 100644
+--- a/drivers/infiniband/core/device.c
++++ b/drivers/infiniband/core/device.c
+@@ -1275,6 +1275,7 @@ void ib_set_device_ops(struct ib_device *dev, const struct ib_device_ops *ops)
+ 	SET_DEVICE_OP(dev_ops, alloc_fmr);
+ 	SET_DEVICE_OP(dev_ops, alloc_hw_stats);
+ 	SET_DEVICE_OP(dev_ops, alloc_mr);
++	SET_DEVICE_OP(dev_ops, alloc_mr_integrity);
+ 	SET_DEVICE_OP(dev_ops, alloc_mw);
+ 	SET_DEVICE_OP(dev_ops, alloc_pd);
+ 	SET_DEVICE_OP(dev_ops, alloc_rdma_netdev);
+* Unmerged path drivers/infiniband/core/verbs.c
+* Unmerged path include/rdma/ib_verbs.h
