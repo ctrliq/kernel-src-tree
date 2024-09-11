@@ -1,0 +1,186 @@
+bnxt_en: Fix devlink fw_activate
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+commit 1278d17a1fb860e7eab4bc3ff4b026a87cbf5105
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/1278d17a.failed
+
+To install a livepatch, first flash the package to NVM, and then
+activate the patch through the "HWRM_FW_LIVEPATCH" fw command.
+To uninstall a patch from NVM, flash the removal package and then
+activate it through the "HWRM_FW_LIVEPATCH" fw command.
+
+The "HWRM_FW_LIVEPATCH" fw command has to consider following scenarios:
+
+1. no patch in NVM and no patch active. Do nothing.
+2. patch in NVM, but not active. Activate the patch currently in NVM.
+3. patch is not in NVM, but active. Deactivate the patch.
+4. patch in NVM and the patch active. Do nothing.
+
+Fix the code to handle these scenarios during devlink "fw_activate".
+
+To install and activate a live patch:
+devlink dev flash pci/0000:c1:00.0 file thor_patch.pkg
+devlink -f dev reload pci/0000:c1:00.0 action fw_activate limit no_reset
+
+To remove and deactivate a live patch:
+devlink dev flash pci/0000:c1:00.0 file thor_patch_rem.pkg
+devlink -f dev reload pci/0000:c1:00.0 action fw_activate limit no_reset
+
+Fixes: 3c4153394e2c ("bnxt_en: implement firmware live patching")
+	Reviewed-by: Vikas Gupta <vikas.gupta@broadcom.com>
+	Reviewed-by: Somnath Kotur <somnath.kotur@broadcom.com>
+	Signed-off-by: Kalesh AP <kalesh-anakkur.purayil@broadcom.com>
+	Signed-off-by: Michael Chan <michael.chan@broadcom.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit 1278d17a1fb860e7eab4bc3ff4b026a87cbf5105)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+diff --cc drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+index 449597f7c74c,f6e21fac0e69..000000000000
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
+@@@ -282,6 -327,134 +282,137 @@@ void bnxt_dl_health_recovery_done(struc
+  static int bnxt_dl_info_get(struct devlink *dl, struct devlink_info_req *req,
+  			    struct netlink_ext_ack *extack);
+  
+++<<<<<<< HEAD
+++=======
++ static void
++ bnxt_dl_livepatch_report_err(struct bnxt *bp, struct netlink_ext_ack *extack,
++ 			     struct hwrm_fw_livepatch_output *resp)
++ {
++ 	int err = ((struct hwrm_err_output *)resp)->cmd_err;
++ 
++ 	switch (err) {
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_OPCODE:
++ 		netdev_err(bp->dev, "Illegal live patch opcode");
++ 		NL_SET_ERR_MSG_MOD(extack, "Invalid opcode");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_SUPPORTED:
++ 		NL_SET_ERR_MSG_MOD(extack, "Live patch operation not supported");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_INSTALLED:
++ 		NL_SET_ERR_MSG_MOD(extack, "Live patch not found");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_NOT_PATCHED:
++ 		NL_SET_ERR_MSG_MOD(extack,
++ 				   "Live patch deactivation failed. Firmware not patched.");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_AUTH_FAIL:
++ 		NL_SET_ERR_MSG_MOD(extack, "Live patch not authenticated");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_HEADER:
++ 		NL_SET_ERR_MSG_MOD(extack, "Incompatible live patch");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_INVALID_SIZE:
++ 		NL_SET_ERR_MSG_MOD(extack, "Live patch has invalid size");
++ 		break;
++ 	case FW_LIVEPATCH_CMD_ERR_CODE_ALREADY_PATCHED:
++ 		NL_SET_ERR_MSG_MOD(extack, "Live patch already applied");
++ 		break;
++ 	default:
++ 		netdev_err(bp->dev, "Unexpected live patch error: %d\n", err);
++ 		NL_SET_ERR_MSG_MOD(extack, "Failed to activate live patch");
++ 		break;
++ 	}
++ }
++ 
++ /* Live patch status in NVM */
++ #define BNXT_LIVEPATCH_NOT_INSTALLED	0
++ #define BNXT_LIVEPATCH_INSTALLED	FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_INSTALL
++ #define BNXT_LIVEPATCH_REMOVED		FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_ACTIVE
++ #define BNXT_LIVEPATCH_MASK		(FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_INSTALL | \
++ 					 FW_LIVEPATCH_QUERY_RESP_STATUS_FLAGS_ACTIVE)
++ #define BNXT_LIVEPATCH_ACTIVATED	BNXT_LIVEPATCH_MASK
++ 
++ #define BNXT_LIVEPATCH_STATE(flags)	((flags) & BNXT_LIVEPATCH_MASK)
++ 
++ static int
++ bnxt_dl_livepatch_activate(struct bnxt *bp, struct netlink_ext_ack *extack)
++ {
++ 	struct hwrm_fw_livepatch_query_output *query_resp;
++ 	struct hwrm_fw_livepatch_query_input *query_req;
++ 	struct hwrm_fw_livepatch_output *patch_resp;
++ 	struct hwrm_fw_livepatch_input *patch_req;
++ 	u16 flags, live_patch_state;
++ 	bool activated = false;
++ 	u32 installed = 0;
++ 	u8 target;
++ 	int rc;
++ 
++ 	if (~bp->fw_cap & BNXT_FW_CAP_LIVEPATCH) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Device does not support live patch");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	rc = hwrm_req_init(bp, query_req, HWRM_FW_LIVEPATCH_QUERY);
++ 	if (rc)
++ 		return rc;
++ 	query_resp = hwrm_req_hold(bp, query_req);
++ 
++ 	rc = hwrm_req_init(bp, patch_req, HWRM_FW_LIVEPATCH);
++ 	if (rc) {
++ 		hwrm_req_drop(bp, query_req);
++ 		return rc;
++ 	}
++ 	patch_req->loadtype = FW_LIVEPATCH_REQ_LOADTYPE_NVM_INSTALL;
++ 	patch_resp = hwrm_req_hold(bp, patch_req);
++ 
++ 	for (target = 1; target <= FW_LIVEPATCH_REQ_FW_TARGET_LAST; target++) {
++ 		query_req->fw_target = target;
++ 		rc = hwrm_req_send(bp, query_req);
++ 		if (rc) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Failed to query packages");
++ 			break;
++ 		}
++ 
++ 		flags = le16_to_cpu(query_resp->status_flags);
++ 		live_patch_state = BNXT_LIVEPATCH_STATE(flags);
++ 
++ 		if (live_patch_state == BNXT_LIVEPATCH_NOT_INSTALLED)
++ 			continue;
++ 
++ 		if (live_patch_state == BNXT_LIVEPATCH_ACTIVATED) {
++ 			activated = true;
++ 			continue;
++ 		}
++ 
++ 		if (live_patch_state == BNXT_LIVEPATCH_INSTALLED)
++ 			patch_req->opcode = FW_LIVEPATCH_REQ_OPCODE_ACTIVATE;
++ 		else if (live_patch_state == BNXT_LIVEPATCH_REMOVED)
++ 			patch_req->opcode = FW_LIVEPATCH_REQ_OPCODE_DEACTIVATE;
++ 
++ 		patch_req->fw_target = target;
++ 		rc = hwrm_req_send(bp, patch_req);
++ 		if (rc) {
++ 			bnxt_dl_livepatch_report_err(bp, extack, patch_resp);
++ 			break;
++ 		}
++ 		installed++;
++ 	}
++ 
++ 	if (!rc && !installed) {
++ 		if (activated) {
++ 			NL_SET_ERR_MSG_MOD(extack, "Live patch already activated");
++ 			rc = -EEXIST;
++ 		} else {
++ 			NL_SET_ERR_MSG_MOD(extack, "No live patches found");
++ 			rc = -ENOENT;
++ 		}
++ 	}
++ 	hwrm_req_drop(bp, query_req);
++ 	hwrm_req_drop(bp, patch_req);
++ 	return rc;
++ }
++ 
+++>>>>>>> 1278d17a1fb8 (bnxt_en: Fix devlink fw_activate)
+  static int bnxt_dl_reload_down(struct devlink *dl, bool netns_change,
+  			       enum devlink_reload_action action,
+  			       enum devlink_reload_limit limit,
+* Unmerged path drivers/net/ethernet/broadcom/bnxt/bnxt_devlink.c
