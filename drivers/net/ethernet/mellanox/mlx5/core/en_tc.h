@@ -94,7 +94,14 @@ void mlx5e_tc_reoffload_flows_work(struct work_struct *work);
 bool mlx5e_is_valid_eswitch_fwd_dev(struct mlx5e_priv *priv,
 				    struct net_device *out_dev);
 
-bool mlx5e_tc_rep_update_skb(struct mlx5_cqe64 *cqe, struct sk_buff *skb);
+struct mlx5e_tc_update_priv {
+	struct net_device *tun_dev;
+};
+
+bool mlx5e_tc_rep_update_skb(struct mlx5_cqe64 *cqe, struct sk_buff *skb,
+			     struct mlx5e_tc_update_priv *tc_priv);
+
+void mlx5_tc_rep_post_napi_receive(struct mlx5e_tc_update_priv *tc_priv);
 
 struct mlx5e_tc_mod_hdr_acts {
 	int num_actions;
