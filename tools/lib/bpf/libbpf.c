@@ -201,6 +201,10 @@ struct bpf_program {
 	__u32 prog_flags;
 };
 
+#define DATA_SEC ".data"
+#define BSS_SEC ".bss"
+#define RODATA_SEC ".rodata"
+
 enum libbpf_map_type {
 	LIBBPF_MAP_UNSPEC,
 	LIBBPF_MAP_DATA,
@@ -209,9 +213,9 @@ enum libbpf_map_type {
 };
 
 static const char * const libbpf_type_to_btf_name[] = {
-	[LIBBPF_MAP_DATA]	= ".data",
-	[LIBBPF_MAP_BSS]	= ".bss",
-	[LIBBPF_MAP_RODATA]	= ".rodata",
+	[LIBBPF_MAP_DATA]	= DATA_SEC,
+	[LIBBPF_MAP_BSS]	= BSS_SEC,
+	[LIBBPF_MAP_RODATA]	= RODATA_SEC,
 };
 
 struct bpf_map {
@@ -742,13 +746,13 @@ int bpf_object__section_size(const struct bpf_object *obj, const char *name,
 	*size = 0;
 	if (!name) {
 		return -EINVAL;
-	} else if (!strcmp(name, ".data")) {
+	} else if (!strcmp(name, DATA_SEC)) {
 		if (obj->efile.data)
 			*size = obj->efile.data->d_size;
-	} else if (!strcmp(name, ".bss")) {
+	} else if (!strcmp(name, BSS_SEC)) {
 		if (obj->efile.bss)
 			*size = obj->efile.bss->d_size;
-	} else if (!strcmp(name, ".rodata")) {
+	} else if (!strcmp(name, RODATA_SEC)) {
 		if (obj->efile.rodata)
 			*size = obj->efile.rodata->d_size;
 	} else {
@@ -1693,10 +1697,10 @@ static int bpf_object__elf_collect(struct bpf_object *obj, bool relaxed_maps,
 						name, obj->path, cp);
 					return err;
 				}
-			} else if (strcmp(name, ".data") == 0) {
+			} else if (strcmp(name, DATA_SEC) == 0) {
 				obj->efile.data = data;
 				obj->efile.data_shndx = idx;
-			} else if (strcmp(name, ".rodata") == 0) {
+			} else if (strcmp(name, RODATA_SEC) == 0) {
 				obj->efile.rodata = data;
 				obj->efile.rodata_shndx = idx;
 			} else {
@@ -1726,7 +1730,8 @@ static int bpf_object__elf_collect(struct bpf_object *obj, bool relaxed_maps,
 
 			obj->efile.reloc_sects[nr_sects].shdr = sh;
 			obj->efile.reloc_sects[nr_sects].data = data;
-		} else if (sh.sh_type == SHT_NOBITS && strcmp(name, ".bss") == 0) {
+		} else if (sh.sh_type == SHT_NOBITS &&
+			   strcmp(name, BSS_SEC) == 0) {
 			obj->efile.bss = data;
 			obj->efile.bss_shndx = idx;
 		} else {
