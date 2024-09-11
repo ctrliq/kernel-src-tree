@@ -1,0 +1,193 @@
+xfs: Add helper function xfs_attr_node_removename_rmt
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Allison Collins <allison.henderson@oracle.com>
+commit 72b97ea40d23b333175323251d6afecb565a0b53
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/72b97ea4.failed
+
+This patch adds another new helper function
+xfs_attr_node_removename_rmt. This will also help modularize
+xfs_attr_node_removename when we add delay ready attributes later.
+
+	Signed-off-by: Allison Collins <allison.henderson@oracle.com>
+	Reviewed-by: Brian Foster <bfoster@redhat.com>
+	Reviewed-by: Chandan Rajendra <chandanrlinux@gmail.com>
+	Reviewed-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Signed-off-by: Darrick J. Wong <darrick.wong@oracle.com>
+	Acked-by: Dave Chinner <dchinner@redhat.com>
+(cherry picked from commit 72b97ea40d23b333175323251d6afecb565a0b53)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/xfs/libxfs/xfs_attr.c
+diff --cc fs/xfs/libxfs/xfs_attr.c
+index 9cb14a5eed33,82f7cc796c26..000000000000
+--- a/fs/xfs/libxfs/xfs_attr.c
++++ b/fs/xfs/libxfs/xfs_attr.c
+@@@ -1014,6 -1109,114 +1014,117 @@@ out
+  }
+  
+  /*
+++<<<<<<< HEAD
+++=======
++  * Shrink an attribute from leaf to shortform
++  */
++ STATIC int
++ xfs_attr_node_shrink(
++ 	struct xfs_da_args	*args,
++ 	struct xfs_da_state     *state)
++ {
++ 	struct xfs_inode	*dp = args->dp;
++ 	int			error, forkoff;
++ 	struct xfs_buf		*bp;
++ 
++ 	/*
++ 	 * Have to get rid of the copy of this dabuf in the state.
++ 	 */
++ 	ASSERT(state->path.active == 1);
++ 	ASSERT(state->path.blk[0].bp);
++ 	state->path.blk[0].bp = NULL;
++ 
++ 	error = xfs_attr3_leaf_read(args->trans, args->dp, 0, &bp);
++ 	if (error)
++ 		return error;
++ 
++ 	forkoff = xfs_attr_shortform_allfit(bp, dp);
++ 	if (forkoff) {
++ 		error = xfs_attr3_leaf_to_shortform(bp, args, forkoff);
++ 		/* bp is gone due to xfs_da_shrink_inode */
++ 	} else
++ 		xfs_trans_brelse(args->trans, bp);
++ 
++ 	return error;
++ }
++ 
++ /*
++  * Mark an attribute entry INCOMPLETE and save pointers to the relevant buffers
++  * for later deletion of the entry.
++  */
++ STATIC int
++ xfs_attr_leaf_mark_incomplete(
++ 	struct xfs_da_args	*args,
++ 	struct xfs_da_state	*state)
++ {
++ 	int			error;
++ 
++ 	/*
++ 	 * Fill in disk block numbers in the state structure
++ 	 * so that we can get the buffers back after we commit
++ 	 * several transactions in the following calls.
++ 	 */
++ 	error = xfs_attr_fillstate(state);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * Mark the attribute as INCOMPLETE
++ 	 */
++ 	return xfs_attr3_leaf_setflag(args);
++ }
++ 
++ /*
++  * Initial setup for xfs_attr_node_removename.  Make sure the attr is there and
++  * the blocks are valid.  Attr keys with remote blocks will be marked
++  * incomplete.
++  */
++ STATIC
++ int xfs_attr_node_removename_setup(
++ 	struct xfs_da_args	*args,
++ 	struct xfs_da_state	**state)
++ {
++ 	int			error;
++ 
++ 	error = xfs_attr_node_hasname(args, state);
++ 	if (error != -EEXIST)
++ 		return error;
++ 
++ 	ASSERT((*state)->path.blk[(*state)->path.active - 1].bp != NULL);
++ 	ASSERT((*state)->path.blk[(*state)->path.active - 1].magic ==
++ 		XFS_ATTR_LEAF_MAGIC);
++ 
++ 	if (args->rmtblkno > 0) {
++ 		error = xfs_attr_leaf_mark_incomplete(args, *state);
++ 		if (error)
++ 			return error;
++ 
++ 		return xfs_attr_rmtval_invalidate(args);
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ STATIC int
++ xfs_attr_node_remove_rmt(
++ 	struct xfs_da_args	*args,
++ 	struct xfs_da_state	*state)
++ {
++ 	int			error = 0;
++ 
++ 	error = xfs_attr_rmtval_remove(args);
++ 	if (error)
++ 		return error;
++ 
++ 	/*
++ 	 * Refill the state structure with buffers, the prior calls released our
++ 	 * buffers.
++ 	 */
++ 	return xfs_attr_refillstate(state);
++ }
++ 
++ /*
+++>>>>>>> 72b97ea40d23 (xfs: Add helper function xfs_attr_node_removename_rmt)
+   * Remove a name from a B-tree attribute list.
+   *
+   * This will involve walking down the Btree, and may involve joining
+@@@ -1055,40 -1243,8 +1166,44 @@@ xfs_attr_node_removename
+  	 * This is done before we remove the attribute so that we don't
+  	 * overflow the maximum size of a transaction and/or hit a deadlock.
+  	 */
+ +	blk = &state->path.blk[ state->path.active-1 ];
+ +	ASSERT(blk->bp != NULL);
+ +	ASSERT(blk->magic == XFS_ATTR_LEAF_MAGIC);
+  	if (args->rmtblkno > 0) {
+++<<<<<<< HEAD
+ +		/*
+ +		 * Fill in disk block numbers in the state structure
+ +		 * so that we can get the buffers back after we commit
+ +		 * several transactions in the following calls.
+ +		 */
+ +		error = xfs_attr_fillstate(state);
+ +		if (error)
+ +			goto out;
+ +
+ +		/*
+ +		 * Mark the attribute as INCOMPLETE, then bunmapi() the
+ +		 * remote value.
+ +		 */
+ +		error = xfs_attr3_leaf_setflag(args);
+ +		if (error)
+ +			goto out;
+ +
+ +		error = xfs_attr_rmtval_invalidate(args);
+ +		if (error)
+ +			return error;
+ +
+ +		error = xfs_attr_rmtval_remove(args);
+ +		if (error)
+ +			goto out;
+ +
+ +		/*
+ +		 * Refill the state structure with buffers, the prior calls
+ +		 * released our buffers.
+ +		 */
+ +		error = xfs_attr_refillstate(state);
+++=======
++ 		error = xfs_attr_node_remove_rmt(args, state);
+++>>>>>>> 72b97ea40d23 (xfs: Add helper function xfs_attr_node_removename_rmt)
+  		if (error)
+  			goto out;
+  	}
+* Unmerged path fs/xfs/libxfs/xfs_attr.c
