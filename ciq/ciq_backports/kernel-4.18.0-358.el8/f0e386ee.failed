@@ -1,0 +1,201 @@
+printk: fix buffer overflow potential for print_text()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author John Ogness <john.ogness@linutronix.de>
+commit f0e386ee0c0b71ea6f7238506a4d0965a2dbef11
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/f0e386ee.failed
+
+Before the commit 896fbe20b4e2333fb55 ("printk: use the lockless
+ringbuffer"), msg_print_text() would only write up to size-1 bytes
+into the provided buffer. Some callers expect this behavior and
+append a terminator to returned string. In particular:
+
+arch/powerpc/xmon/xmon.c:dump_log_buf()
+arch/um/kernel/kmsg_dump.c:kmsg_dumper_stdout()
+
+msg_print_text() has been replaced by record_print_text(), which
+currently fills the full size of the buffer. This causes a
+buffer overflow for the above callers.
+
+Change record_print_text() so that it will only use size-1 bytes
+for text data. Also, for paranoia sakes, add a terminator after
+the text data.
+
+And finally, document this behavior so that it is clear that only
+size-1 bytes are used and a terminator is added.
+
+Fixes: 896fbe20b4e2333fb55 ("printk: use the lockless ringbuffer")
+	Cc: stable@vger.kernel.org # 5.10+
+	Signed-off-by: John Ogness <john.ogness@linutronix.de>
+	Reviewed-by: Petr Mladek <pmladek@suse.com>
+	Acked-by: Sergey Senozhatsky <sergey.senozhatsky@gmail.com>
+	Signed-off-by: Petr Mladek <pmladek@suse.com>
+Link: https://lore.kernel.org/r/20210114170412.4819-1-john.ogness@linutronix.de
+(cherry picked from commit f0e386ee0c0b71ea6f7238506a4d0965a2dbef11)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/printk/printk.c
+diff --cc kernel/printk/printk.c
+index 9c33249065a6,17fa6dc77053..000000000000
+--- a/kernel/printk/printk.c
++++ b/kernel/printk/printk.c
+@@@ -1340,43 -1286,120 +1340,126 @@@ static size_t print_prefix(const struc
+  	return len;
+  }
+  
+++<<<<<<< HEAD
+ +static size_t msg_print_text(const struct printk_log *msg, bool syslog,
+ +			     bool time, char *buf, size_t size)
+++=======
++ /*
++  * Prepare the record for printing. The text is shifted within the given
++  * buffer to avoid a need for another one. The following operations are
++  * done:
++  *
++  *   - Add prefix for each line.
++  *   - Drop truncated lines that no longer fit into the buffer.
++  *   - Add the trailing newline that has been removed in vprintk_store().
++  *   - Add a string terminator.
++  *
++  * Since the produced string is always terminated, the maximum possible
++  * return value is @r->text_buf_size - 1;
++  *
++  * Return: The length of the updated/prepared text, including the added
++  * prefixes and the newline. The terminator is not counted. The dropped
++  * line(s) are not counted.
++  */
++ static size_t record_print_text(struct printk_record *r, bool syslog,
++ 				bool time)
+++>>>>>>> f0e386ee0c0b (printk: fix buffer overflow potential for print_text())
+  {
+ -	size_t text_len = r->info->text_len;
+ -	size_t buf_size = r->text_buf_size;
+ -	char *text = r->text_buf;
+ -	char prefix[PREFIX_MAX];
+ -	bool truncated = false;
+ -	size_t prefix_len;
+ -	size_t line_len;
+ +	const char *text = log_text(msg);
+ +	size_t text_size = msg->text_len;
+  	size_t len = 0;
+ -	char *next;
+ -
+ -	/*
+ -	 * If the message was truncated because the buffer was not large
+ -	 * enough, treat the available text as if it were the full text.
+ -	 */
+ -	if (text_len > buf_size)
+ -		text_len = buf_size;
+ +	char prefix[PREFIX_MAX];
+ +	const size_t prefix_len = print_prefix(msg, syslog, time, prefix);
+  
+ -	prefix_len = info_print_prefix(r->info, syslog, time, prefix);
+ +	do {
+ +		const char *next = memchr(text, '\n', text_size);
+ +		size_t text_len;
+  
+ -	/*
+ -	 * @text_len: bytes of unprocessed text
+ -	 * @line_len: bytes of current line _without_ newline
+ -	 * @text:     pointer to beginning of current line
+ -	 * @len:      number of bytes prepared in r->text_buf
+ -	 */
+ -	for (;;) {
+ -		next = memchr(text, '\n', text_len);
+  		if (next) {
+ -			line_len = next - text;
+ +			text_len = next - text;
+ +			next++;
+ +			text_size -= next - text;
+  		} else {
+ -			/* Drop truncated line(s). */
+ -			if (truncated)
+ +			text_len = text_size;
+ +		}
+ +
+++<<<<<<< HEAD
+ +		if (buf) {
+ +			if (prefix_len + text_len + 1 >= size - len)
+  				break;
+ -			line_len = text_len;
+ +
+ +			memcpy(buf + len, prefix, prefix_len);
+ +			len += prefix_len;
+ +			memcpy(buf + len, text, text_len);
+ +			len += text_len;
+ +			buf[len++] = '\n';
+ +		} else {
+ +			/* SYSLOG_ACTION_* buffer size only calculation */
+ +			len += prefix_len + text_len + 1;
+  		}
+  
+ +		text = next;
+ +	} while (text);
+++=======
++ 		/*
++ 		 * Truncate the text if there is not enough space to add the
++ 		 * prefix and a trailing newline and a terminator.
++ 		 */
++ 		if (len + prefix_len + text_len + 1 + 1 > buf_size) {
++ 			/* Drop even the current line if no space. */
++ 			if (len + prefix_len + line_len + 1 + 1 > buf_size)
++ 				break;
++ 
++ 			text_len = buf_size - len - prefix_len - 1 - 1;
++ 			truncated = true;
++ 		}
++ 
++ 		memmove(text + prefix_len, text, text_len);
++ 		memcpy(text, prefix, prefix_len);
++ 
++ 		/*
++ 		 * Increment the prepared length to include the text and
++ 		 * prefix that were just moved+copied. Also increment for the
++ 		 * newline at the end of this line. If this is the last line,
++ 		 * there is no newline, but it will be added immediately below.
++ 		 */
++ 		len += prefix_len + line_len + 1;
++ 		if (text_len == line_len) {
++ 			/*
++ 			 * This is the last line. Add the trailing newline
++ 			 * removed in vprintk_store().
++ 			 */
++ 			text[prefix_len + line_len] = '\n';
++ 			break;
++ 		}
++ 
++ 		/*
++ 		 * Advance beyond the added prefix and the related line with
++ 		 * its newline.
++ 		 */
++ 		text += prefix_len + line_len + 1;
++ 
++ 		/*
++ 		 * The remaining text has only decreased by the line with its
++ 		 * newline.
++ 		 *
++ 		 * Note that @text_len can become zero. It happens when @text
++ 		 * ended with a newline (either due to truncation or the
++ 		 * original string ending with "\n\n"). The loop is correctly
++ 		 * repeated and (if not truncated) an empty line with a prefix
++ 		 * will be prepared.
++ 		 */
++ 		text_len -= line_len + 1;
++ 	}
+++>>>>>>> f0e386ee0c0b (printk: fix buffer overflow potential for print_text())
++ 
++ 	/*
++ 	 * If a buffer was provided, it will be terminated. Space for the
++ 	 * string terminator is guaranteed to be available. The terminator is
++ 	 * not counted in the return value.
++ 	 */
++ 	if (buf_size > 0)
++ 		text[len] = 0;
+  
+  	return len;
+  }
+* Unmerged path kernel/printk/printk.c
