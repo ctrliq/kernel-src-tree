@@ -1031,7 +1031,7 @@ static void
 nvmet_fc_free_hostport(struct nvmet_fc_hostport *hostport)
 {
 	/* if LLDD not implemented, leave as NULL */
-	if (!hostport->hosthandle)
+	if (!hostport || !hostport->hosthandle)
 		return;
 
 	nvmet_fc_hostport_put(hostport);
