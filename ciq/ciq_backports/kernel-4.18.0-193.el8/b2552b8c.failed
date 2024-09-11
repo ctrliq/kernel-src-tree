@@ -1,0 +1,161 @@
+net: sched: flower: track filter deletion with flag
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [net] sched: flower: track filter deletion with flag (Ivan Vecera) [1751856]
+Rebuild_FUZZ: 94.85%
+commit-author Vlad Buslov <vladbu@mellanox.com>
+commit b2552b8c40fa89210070c6e3487b35f10608d6c5
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/b2552b8c.failed
+
+In order to prevent double deletion of filter by concurrent tasks when rtnl
+lock is not used for synchronization, add 'deleted' filter field. Check
+value of this field when modifying filters and return error if concurrent
+deletion is detected.
+
+Refactor __fl_delete() to accept pointer to 'last' boolean as argument,
+and return error code as function return value instead. This is necessary
+to signal concurrent filter delete to caller.
+
+	Signed-off-by: Vlad Buslov <vladbu@mellanox.com>
+	Reviewed-by: Stefano Brivio <sbrivio@redhat.com>
+	Acked-by: Jiri Pirko <jiri@mellanox.com>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit b2552b8c40fa89210070c6e3487b35f10608d6c5)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sched/cls_flower.c
+diff --cc net/sched/cls_flower.c
+index 714458742961,dd8a65cef6e1..000000000000
+--- a/net/sched/cls_flower.c
++++ b/net/sched/cls_flower.c
+@@@ -104,6 -105,12 +104,15 @@@ struct cls_fl_filter 
+  	u32 in_hw_count;
+  	struct rcu_work rwork;
+  	struct net_device *hw_dev;
+++<<<<<<< HEAD
+++=======
++ 	/* Flower classifier is unlocked, which means that its reference counter
++ 	 * can be changed concurrently without any kind of external
++ 	 * synchronization. Use atomic reference counter to be concurrency-safe.
++ 	 */
++ 	refcount_t refcnt;
++ 	bool deleted;
+++>>>>>>> b2552b8c40fa (net: sched: flower: track filter deletion with flag)
+  };
+  
+  static const struct rhashtable_params mask_ht_params = {
+@@@ -447,8 -454,52 +456,57 @@@ static struct cls_fl_head *fl_head_dere
+  	return rcu_dereference_raw(tp->root);
+  }
+  
+++<<<<<<< HEAD
+ +static bool __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
+ +			struct netlink_ext_ack *extack)
+++=======
++ static void __fl_put(struct cls_fl_filter *f)
++ {
++ 	if (!refcount_dec_and_test(&f->refcnt))
++ 		return;
++ 
++ 	WARN_ON(!f->deleted);
++ 
++ 	if (tcf_exts_get_net(&f->exts))
++ 		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
++ 	else
++ 		__fl_destroy_filter(f);
++ }
++ 
++ static struct cls_fl_filter *__fl_get(struct cls_fl_head *head, u32 handle)
++ {
++ 	struct cls_fl_filter *f;
++ 
++ 	rcu_read_lock();
++ 	f = idr_find(&head->handle_idr, handle);
++ 	if (f && !refcount_inc_not_zero(&f->refcnt))
++ 		f = NULL;
++ 	rcu_read_unlock();
++ 
++ 	return f;
++ }
++ 
++ static struct cls_fl_filter *fl_get_next_filter(struct tcf_proto *tp,
++ 						unsigned long *handle)
++ {
++ 	struct cls_fl_head *head = fl_head_dereference(tp);
++ 	struct cls_fl_filter *f;
++ 
++ 	rcu_read_lock();
++ 	while ((f = idr_get_next_ul(&head->handle_idr, handle))) {
++ 		/* don't return filters that are being deleted */
++ 		if (refcount_inc_not_zero(&f->refcnt))
++ 			break;
++ 		++(*handle);
++ 	}
++ 	rcu_read_unlock();
++ 
++ 	return f;
++ }
++ 
++ static int __fl_delete(struct tcf_proto *tp, struct cls_fl_filter *f,
++ 		       bool *last, struct netlink_ext_ack *extack)
+++>>>>>>> b2552b8c40fa (net: sched: flower: track filter deletion with flag)
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+  	bool async = tcf_exts_get_net(&f->exts);
+@@@ -460,12 -518,9 +525,12 @@@
+  	if (!tc_skip_hw(f->flags))
+  		fl_hw_destroy_filter(tp, f, extack);
+  	tcf_unbind_filter(tp, &f->res);
+ -	__fl_put(f);
+ +	if (async)
+ +		tcf_queue_work(&f->rwork, fl_destroy_filter_work);
+ +	else
+ +		__fl_destroy_filter(f);
+  
+- 	return last;
++ 	return 0;
+  }
+  
+  static void fl_destroy_sleepable(struct work_struct *work)
+@@@ -1385,7 -1454,14 +1452,13 @@@ static int fl_change(struct net *net, s
+  	if (!tc_in_hw(fnew->flags))
+  		fnew->flags |= TCA_CLS_FLAGS_NOT_IN_HW;
+  
+ -	refcount_inc(&fnew->refcnt);
+  	if (fold) {
++ 		/* Fold filter was deleted concurrently. Retry lookup. */
++ 		if (fold->deleted) {
++ 			err = -EAGAIN;
++ 			goto errout_hw;
++ 		}
++ 
+  		fnew->handle = handle;
+  
+  		err = rhashtable_insert_fast(&fnew->mask->ht, &fnew->ht_node,
+@@@ -1460,12 -1544,14 +1534,18 @@@ static int fl_delete(struct tcf_proto *
+  {
+  	struct cls_fl_head *head = fl_head_dereference(tp);
+  	struct cls_fl_filter *f = arg;
++ 	bool last_on_mask;
++ 	int err = 0;
+  
+- 	rhashtable_remove_fast(&f->mask->ht, &f->ht_node,
+- 			       f->mask->filter_ht_params);
+- 	__fl_delete(tp, f, extack);
++ 	err = __fl_delete(tp, f, &last_on_mask, extack);
+  	*last = list_empty(&head->masks);
+++<<<<<<< HEAD
+ +	return 0;
+++=======
++ 	__fl_put(f);
++ 
++ 	return err;
+++>>>>>>> b2552b8c40fa (net: sched: flower: track filter deletion with flag)
+  }
+  
+  static void fl_walk(struct tcf_proto *tp, struct tcf_walker *arg,
+* Unmerged path net/sched/cls_flower.c
