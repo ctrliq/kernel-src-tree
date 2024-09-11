@@ -1,0 +1,300 @@
+SUNRPC: Cleanup xdr_shrink_bufhead()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-326.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit 6707fbd7d3be72da4ebde7f56b46814befd2db19
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-326.el8/6707fbd7.failed
+
+Clean up xdr_shrink_bufhead() to use the new helpers instead of doing
+its own thing.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit 6707fbd7d3be72da4ebde7f56b46814befd2db19)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xdr.c
+diff --cc net/sunrpc/xdr.c
+index 984778f0eee8,19eaa38f7d16..000000000000
+--- a/net/sunrpc/xdr.c
++++ b/net/sunrpc/xdr.c
+@@@ -515,6 -480,272 +515,275 @@@ _zero_pages(struct page **pages, size_
+  	} while ((len -= zero) != 0);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void xdr_buf_try_expand(struct xdr_buf *buf, unsigned int len)
++ {
++ 	struct kvec *head = buf->head;
++ 	struct kvec *tail = buf->tail;
++ 	unsigned int sum = head->iov_len + buf->page_len + tail->iov_len;
++ 	unsigned int free_space;
++ 
++ 	if (sum > buf->len) {
++ 		free_space = min_t(unsigned int, sum - buf->len, len);
++ 		buf->len += free_space;
++ 		len -= free_space;
++ 		if (!len)
++ 			return;
++ 	}
++ 
++ 	if (buf->buflen > sum) {
++ 		/* Expand the tail buffer */
++ 		free_space = min_t(unsigned int, buf->buflen - sum, len);
++ 		tail->iov_len += free_space;
++ 		buf->len += free_space;
++ 	}
++ }
++ 
++ static void xdr_buf_tail_copy_right(const struct xdr_buf *buf,
++ 				    unsigned int base, unsigned int len,
++ 				    unsigned int shift)
++ {
++ 	const struct kvec *tail = buf->tail;
++ 	unsigned int to = base + shift;
++ 
++ 	if (to >= tail->iov_len)
++ 		return;
++ 	if (len + to > tail->iov_len)
++ 		len = tail->iov_len - to;
++ 	memmove(tail->iov_base + to, tail->iov_base + base, len);
++ }
++ 
++ static void xdr_buf_pages_copy_right(const struct xdr_buf *buf,
++ 				     unsigned int base, unsigned int len,
++ 				     unsigned int shift)
++ {
++ 	const struct kvec *tail = buf->tail;
++ 	unsigned int to = base + shift;
++ 	unsigned int pglen = 0;
++ 	unsigned int talen = 0, tato = 0;
++ 
++ 	if (base >= buf->page_len)
++ 		return;
++ 	if (len > buf->page_len - base)
++ 		len = buf->page_len - base;
++ 	if (to >= buf->page_len) {
++ 		tato = to - buf->page_len;
++ 		if (tail->iov_len >= len + tato)
++ 			talen = len;
++ 		else if (tail->iov_len > tato)
++ 			talen = tail->iov_len - tato;
++ 	} else if (len + to >= buf->page_len) {
++ 		pglen = buf->page_len - to;
++ 		talen = len - pglen;
++ 		if (talen > tail->iov_len)
++ 			talen = tail->iov_len;
++ 	} else
++ 		pglen = len;
++ 
++ 	_copy_from_pages(tail->iov_base + tato, buf->pages,
++ 			 buf->page_base + base + pglen, talen);
++ 	_shift_data_right_pages(buf->pages, buf->page_base + to,
++ 				buf->page_base + base, pglen);
++ }
++ 
++ static void xdr_buf_head_copy_right(const struct xdr_buf *buf,
++ 				    unsigned int base, unsigned int len,
++ 				    unsigned int shift)
++ {
++ 	const struct kvec *head = buf->head;
++ 	const struct kvec *tail = buf->tail;
++ 	unsigned int to = base + shift;
++ 	unsigned int pglen = 0, pgto = 0;
++ 	unsigned int talen = 0, tato = 0;
++ 
++ 	if (base >= head->iov_len)
++ 		return;
++ 	if (len > head->iov_len - base)
++ 		len = head->iov_len - base;
++ 	if (to >= buf->page_len + head->iov_len) {
++ 		tato = to - buf->page_len - head->iov_len;
++ 		talen = len;
++ 	} else if (to >= head->iov_len) {
++ 		pgto = to - head->iov_len;
++ 		pglen = len;
++ 		if (pgto + pglen > buf->page_len) {
++ 			talen = pgto + pglen - buf->page_len;
++ 			pglen -= talen;
++ 		}
++ 	} else {
++ 		pglen = len - to;
++ 		if (pglen > buf->page_len) {
++ 			talen = pglen - buf->page_len;
++ 			pglen = buf->page_len;
++ 		}
++ 	}
++ 
++ 	len -= talen;
++ 	base += len;
++ 	if (talen + tato > tail->iov_len)
++ 		talen = tail->iov_len > tato ? tail->iov_len - tato : 0;
++ 	memcpy(tail->iov_base + tato, head->iov_base + base, talen);
++ 
++ 	len -= pglen;
++ 	base -= pglen;
++ 	_copy_to_pages(buf->pages, buf->page_base + pgto, head->iov_base + base,
++ 		       pglen);
++ 
++ 	base -= len;
++ 	memmove(head->iov_base + to, head->iov_base + base, len);
++ }
++ 
++ static void xdr_buf_tail_shift_right(const struct xdr_buf *buf,
++ 				     unsigned int base, unsigned int len,
++ 				     unsigned int shift)
++ {
++ 	const struct kvec *tail = buf->tail;
++ 
++ 	if (base >= tail->iov_len || !shift || !len)
++ 		return;
++ 	xdr_buf_tail_copy_right(buf, base, len, shift);
++ }
++ 
++ static void xdr_buf_pages_shift_right(const struct xdr_buf *buf,
++ 				      unsigned int base, unsigned int len,
++ 				      unsigned int shift)
++ {
++ 	if (!shift || !len)
++ 		return;
++ 	if (base >= buf->page_len) {
++ 		xdr_buf_tail_shift_right(buf, base - buf->page_len, len, shift);
++ 		return;
++ 	}
++ 	if (base + len > buf->page_len)
++ 		xdr_buf_tail_shift_right(buf, 0, base + len - buf->page_len,
++ 					 shift);
++ 	xdr_buf_pages_copy_right(buf, base, len, shift);
++ }
++ 
++ static void xdr_buf_head_shift_right(const struct xdr_buf *buf,
++ 				     unsigned int base, unsigned int len,
++ 				     unsigned int shift)
++ {
++ 	const struct kvec *head = buf->head;
++ 
++ 	if (!shift)
++ 		return;
++ 	if (base >= head->iov_len) {
++ 		xdr_buf_pages_shift_right(buf, head->iov_len - base, len,
++ 					  shift);
++ 		return;
++ 	}
++ 	if (base + len > head->iov_len)
++ 		xdr_buf_pages_shift_right(buf, 0, base + len - head->iov_len,
++ 					  shift);
++ 	xdr_buf_head_copy_right(buf, base, len, shift);
++ }
++ 
++ static void xdr_buf_tail_copy_left(const struct xdr_buf *buf, unsigned int base,
++ 				   unsigned int len, unsigned int shift)
++ {
++ 	const struct kvec *tail = buf->tail;
++ 
++ 	if (base >= tail->iov_len)
++ 		return;
++ 	if (len > tail->iov_len - base)
++ 		len = tail->iov_len - base;
++ 	/* Shift data into head */
++ 	if (shift > buf->page_len + base) {
++ 		const struct kvec *head = buf->head;
++ 		unsigned int hdto =
++ 			head->iov_len + buf->page_len + base - shift;
++ 		unsigned int hdlen = len;
++ 
++ 		if (WARN_ONCE(shift > head->iov_len + buf->page_len + base,
++ 			      "SUNRPC: Misaligned data.\n"))
++ 			return;
++ 		if (hdto + hdlen > head->iov_len)
++ 			hdlen = head->iov_len - hdto;
++ 		memcpy(head->iov_base + hdto, tail->iov_base + base, hdlen);
++ 		base += hdlen;
++ 		len -= hdlen;
++ 		if (!len)
++ 			return;
++ 	}
++ 	/* Shift data into pages */
++ 	if (shift > base) {
++ 		unsigned int pgto = buf->page_len + base - shift;
++ 		unsigned int pglen = len;
++ 
++ 		if (pgto + pglen > buf->page_len)
++ 			pglen = buf->page_len - pgto;
++ 		_copy_to_pages(buf->pages, buf->page_base + pgto,
++ 			       tail->iov_base + base, pglen);
++ 		base += pglen;
++ 		len -= pglen;
++ 		if (!len)
++ 			return;
++ 	}
++ 	memmove(tail->iov_base + base - shift, tail->iov_base + base, len);
++ }
++ 
++ static void xdr_buf_pages_copy_left(const struct xdr_buf *buf,
++ 				    unsigned int base, unsigned int len,
++ 				    unsigned int shift)
++ {
++ 	unsigned int pgto;
++ 
++ 	if (base >= buf->page_len)
++ 		return;
++ 	if (len > buf->page_len - base)
++ 		len = buf->page_len - base;
++ 	/* Shift data into head */
++ 	if (shift > base) {
++ 		const struct kvec *head = buf->head;
++ 		unsigned int hdto = head->iov_len + base - shift;
++ 		unsigned int hdlen = len;
++ 
++ 		if (WARN_ONCE(shift > head->iov_len + base,
++ 			      "SUNRPC: Misaligned data.\n"))
++ 			return;
++ 		if (hdto + hdlen > head->iov_len)
++ 			hdlen = head->iov_len - hdto;
++ 		_copy_from_pages(head->iov_base + hdto, buf->pages,
++ 				 buf->page_base + base, hdlen);
++ 		base += hdlen;
++ 		len -= hdlen;
++ 		if (!len)
++ 			return;
++ 	}
++ 	pgto = base - shift;
++ 	_shift_data_left_pages(buf->pages, buf->page_base + pgto,
++ 			       buf->page_base + base, len);
++ }
++ 
++ static void xdr_buf_tail_shift_left(const struct xdr_buf *buf,
++ 				    unsigned int base, unsigned int len,
++ 				    unsigned int shift)
++ {
++ 	if (!shift || !len)
++ 		return;
++ 	xdr_buf_tail_copy_left(buf, base, len, shift);
++ }
++ 
++ static void xdr_buf_pages_shift_left(const struct xdr_buf *buf,
++ 				     unsigned int base, unsigned int len,
++ 				     unsigned int shift)
++ {
++ 	if (!shift || !len)
++ 		return;
++ 	if (base >= buf->page_len) {
++ 		xdr_buf_tail_shift_left(buf, base - buf->page_len, len, shift);
++ 		return;
++ 	}
++ 	xdr_buf_pages_copy_left(buf, base, len, shift);
++ 	len += base;
++ 	if (len <= buf->page_len)
++ 		return;
++ 	xdr_buf_tail_copy_left(buf, 0, len - buf->page_len, shift);
++ }
++ 
+++>>>>>>> 6707fbd7d3be (SUNRPC: Cleanup xdr_shrink_bufhead())
+  /**
+   * xdr_shrink_bufhead
+   * @buf: xdr_buf
+* Unmerged path net/sunrpc/xdr.c
