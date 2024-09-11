@@ -1,0 +1,97 @@
+fs/dax: Deposit pagetable even when installing zero page
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-147.el8
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 11cf9d863dcb583345723b0ed72173348761e9c0
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-147.el8/11cf9d86.failed
+
+Architectures like ppc64 use the deposited page table to store hardware
+page table slot information. Make sure we deposit a page table when
+using zero page at the pmd level for hash.
+
+Without this we hit
+
+Unable to handle kernel paging request for data at address 0x00000000
+Faulting instruction address: 0xc000000000082a74
+Oops: Kernel access of bad area, sig: 11 [#1]
+....
+
+NIP [c000000000082a74] __hash_page_thp+0x224/0x5b0
+LR [c0000000000829a4] __hash_page_thp+0x154/0x5b0
+Call Trace:
+ hash_page_mm+0x43c/0x740
+ do_hash_page+0x2c/0x3c
+ copy_from_iter_flushcache+0xa4/0x4a0
+ pmem_copy_from_iter+0x2c/0x50 [nd_pmem]
+ dax_copy_from_iter+0x40/0x70
+ dax_iomap_actor+0x134/0x360
+ iomap_apply+0xfc/0x1b0
+ dax_iomap_rw+0xac/0x130
+ ext4_file_write_iter+0x254/0x460 [ext4]
+ __vfs_write+0x120/0x1e0
+ vfs_write+0xd8/0x220
+ SyS_write+0x6c/0x110
+ system_call+0x3c/0x130
+
+Fixes: b5beae5e224f ("powerpc/pseries: Add driver for PAPR SCM regions")
+	Cc: <stable@vger.kernel.org>
+	Reviewed-by: Jan Kara <jack@suse.cz>
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Dan Williams <dan.j.williams@intel.com>
+(cherry picked from commit 11cf9d863dcb583345723b0ed72173348761e9c0)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/dax.c
+diff --cc fs/dax.c
+index a36193b99a5d,e5e54da1715f..000000000000
+--- a/fs/dax.c
++++ b/fs/dax.c
+@@@ -1391,9 -1408,10 +1392,11 @@@ static vm_fault_t dax_pmd_load_hole(str
+  {
+  	struct address_space *mapping = vmf->vma->vm_file->f_mapping;
+  	unsigned long pmd_addr = vmf->address & PMD_MASK;
++ 	struct vm_area_struct *vma = vmf->vma;
+  	struct inode *inode = mapping->host;
++ 	pgtable_t pgtable = NULL;
+  	struct page *zero_page;
+ +	void *ret = NULL;
+  	spinlock_t *ptl;
+  	pmd_t pmd_entry;
+  	pfn_t pfn;
+@@@ -1404,9 -1422,15 +1407,15 @@@
+  		goto fallback;
+  
+  	pfn = page_to_pfn_t(zero_page);
+ -	*entry = dax_insert_entry(xas, mapping, vmf, *entry, pfn,
+ -			DAX_PMD | DAX_ZERO_PAGE, false);
+ +	ret = dax_insert_mapping_entry(mapping, vmf, entry, pfn,
+ +			RADIX_DAX_PMD | RADIX_DAX_ZERO_PAGE, false);
+  
++ 	if (arch_needs_pgtable_deposit()) {
++ 		pgtable = pte_alloc_one(vma->vm_mm);
++ 		if (!pgtable)
++ 			return VM_FAULT_OOM;
++ 	}
++ 
+  	ptl = pmd_lock(vmf->vma->vm_mm, vmf->pmd);
+  	if (!pmd_none(*(vmf->pmd))) {
+  		spin_unlock(ptl);
+@@@ -1421,7 -1449,9 +1434,13 @@@
+  	return VM_FAULT_NOPAGE;
+  
+  fallback:
+++<<<<<<< HEAD
+ +	trace_dax_pmd_load_hole_fallback(inode, vmf, zero_page, ret);
+++=======
++ 	if (pgtable)
++ 		pte_free(vma->vm_mm, pgtable);
++ 	trace_dax_pmd_load_hole_fallback(inode, vmf, zero_page, *entry);
+++>>>>>>> 11cf9d863dcb (fs/dax: Deposit pagetable even when installing zero page)
+  	return VM_FAULT_FALLBACK;
+  }
+  
+* Unmerged path fs/dax.c
