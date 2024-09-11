@@ -1,0 +1,181 @@
+devlink: Allow setting of packet trap group parameters
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Ido Schimmel <idosch@mellanox.com>
+commit c064875a63528e8ebcefc0ae450ed0fd904d08c4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c064875a.failed
+
+The previous patch allowed device drivers to publish their default
+binding between packet trap policers and packet trap groups. However,
+some users might not be content with this binding and would like to
+change it.
+
+In case user space passed a packet trap policer identifier when setting
+a packet trap group, invoke the appropriate device driver callback and
+pass the new policer identifier.
+
+v2:
+* Check for presence of 'DEVLINK_ATTR_TRAP_POLICER_ID' in
+  devlink_trap_group_set() and bail if not present
+* Add extack error message in case trap group was partially modified
+
+	Signed-off-by: Ido Schimmel <idosch@mellanox.com>
+	Reviewed-by: Jiri Pirko <jiri@mellanox.com>
+	Acked-by: Jakub Kicinski <kuba@kernel.org>
+	Signed-off-by: David S. Miller <davem@davemloft.net>
+(cherry picked from commit c064875a63528e8ebcefc0ae450ed0fd904d08c4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/net/devlink.h
+diff --cc include/net/devlink.h
+index e6a7c522300f,8ffc1b5cd89b..000000000000
+--- a/include/net/devlink.h
++++ b/include/net/devlink.h
+@@@ -743,6 -877,47 +743,50 @@@ struct devlink_ops 
+  	 */
+  	int (*trap_group_init)(struct devlink *devlink,
+  			       const struct devlink_trap_group *group);
+++<<<<<<< HEAD
+++=======
++ 	/**
++ 	 * @trap_group_set: Trap group parameters set function.
++ 	 *
++ 	 * Note: @policer can be NULL when a policer is being unbound from
++ 	 * @group.
++ 	 */
++ 	int (*trap_group_set)(struct devlink *devlink,
++ 			      const struct devlink_trap_group *group,
++ 			      const struct devlink_trap_policer *policer);
++ 	/**
++ 	 * @trap_policer_init: Trap policer initialization function.
++ 	 *
++ 	 * Should be used by device drivers to initialize the trap policer in
++ 	 * the underlying device.
++ 	 */
++ 	int (*trap_policer_init)(struct devlink *devlink,
++ 				 const struct devlink_trap_policer *policer);
++ 	/**
++ 	 * @trap_policer_fini: Trap policer de-initialization function.
++ 	 *
++ 	 * Should be used by device drivers to de-initialize the trap policer
++ 	 * in the underlying device.
++ 	 */
++ 	void (*trap_policer_fini)(struct devlink *devlink,
++ 				  const struct devlink_trap_policer *policer);
++ 	/**
++ 	 * @trap_policer_set: Trap policer parameters set function.
++ 	 */
++ 	int (*trap_policer_set)(struct devlink *devlink,
++ 				const struct devlink_trap_policer *policer,
++ 				u64 rate, u64 burst,
++ 				struct netlink_ext_ack *extack);
++ 	/**
++ 	 * @trap_policer_counter_get: Trap policer counter get function.
++ 	 *
++ 	 * Should be used by device drivers to report number of packets dropped
++ 	 * by the policer.
++ 	 */
++ 	int (*trap_policer_counter_get)(struct devlink *devlink,
++ 					const struct devlink_trap_policer *policer,
++ 					u64 *p_drops);
+++>>>>>>> c064875a6352 (devlink: Allow setting of packet trap group parameters)
+  };
+  
+  static inline void *devlink_priv(struct devlink *devlink)
+* Unmerged path include/net/devlink.h
+diff --git a/net/core/devlink.c b/net/core/devlink.c
+index d02f367eb501..a410929e367b 100644
+--- a/net/core/devlink.c
++++ b/net/core/devlink.c
+@@ -5784,7 +5784,7 @@ __devlink_trap_group_action_set(struct devlink *devlink,
+ static int
+ devlink_trap_group_action_set(struct devlink *devlink,
+ 			      struct devlink_trap_group_item *group_item,
+-			      struct genl_info *info)
++			      struct genl_info *info, bool *p_modified)
+ {
+ 	enum devlink_trap_action trap_action;
+ 	int err;
+@@ -5803,6 +5803,47 @@ devlink_trap_group_action_set(struct devlink *devlink,
+ 	if (err)
+ 		return err;
+ 
++	*p_modified = true;
++
++	return 0;
++}
++
++static int devlink_trap_group_set(struct devlink *devlink,
++				  struct devlink_trap_group_item *group_item,
++				  struct genl_info *info)
++{
++	struct devlink_trap_policer_item *policer_item;
++	struct netlink_ext_ack *extack = info->extack;
++	const struct devlink_trap_policer *policer;
++	struct nlattr **attrs = info->attrs;
++	int err;
++
++	if (!attrs[DEVLINK_ATTR_TRAP_POLICER_ID])
++		return 0;
++
++	if (!devlink->ops->trap_group_set)
++		return -EOPNOTSUPP;
++
++	policer_item = group_item->policer_item;
++	if (attrs[DEVLINK_ATTR_TRAP_POLICER_ID]) {
++		u32 policer_id;
++
++		policer_id = nla_get_u32(attrs[DEVLINK_ATTR_TRAP_POLICER_ID]);
++		policer_item = devlink_trap_policer_item_lookup(devlink,
++								policer_id);
++		if (policer_id && !policer_item) {
++			NL_SET_ERR_MSG_MOD(extack, "Device did not register this trap policer");
++			return -ENOENT;
++		}
++	}
++	policer = policer_item ? policer_item->policer : NULL;
++
++	err = devlink->ops->trap_group_set(devlink, group_item->group, policer);
++	if (err)
++		return err;
++
++	group_item->policer_item = policer_item;
++
+ 	return 0;
+ }
+ 
+@@ -5812,6 +5853,7 @@ static int devlink_nl_cmd_trap_group_set_doit(struct sk_buff *skb,
+ 	struct netlink_ext_ack *extack = info->extack;
+ 	struct devlink *devlink = info->user_ptr[0];
+ 	struct devlink_trap_group_item *group_item;
++	bool modified = false;
+ 	int err;
+ 
+ 	if (list_empty(&devlink->trap_group_list))
+@@ -5823,11 +5865,21 @@ static int devlink_nl_cmd_trap_group_set_doit(struct sk_buff *skb,
+ 		return -ENOENT;
+ 	}
+ 
+-	err = devlink_trap_group_action_set(devlink, group_item, info);
++	err = devlink_trap_group_action_set(devlink, group_item, info,
++					    &modified);
+ 	if (err)
+ 		return err;
+ 
++	err = devlink_trap_group_set(devlink, group_item, info);
++	if (err)
++		goto err_trap_group_set;
++
+ 	return 0;
++
++err_trap_group_set:
++	if (modified)
++		NL_SET_ERR_MSG_MOD(extack, "Trap group set failed, but some changes were committed already");
++	return err;
+ }
+ 
+ static const struct nla_policy devlink_nl_policy[DEVLINK_ATTR_MAX + 1] = {
