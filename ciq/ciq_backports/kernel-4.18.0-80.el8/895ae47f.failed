@@ -1,0 +1,178 @@
+x86/kvm: Allow runtime control of L1D flush
+
+jira LE-1907
+cve CVE-2018-3646
+cve CVE-2018-3620
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Thomas Gleixner <tglx@linutronix.de>
+commit 895ae47f9918833c3a880fbccd41e0692b37e7d9
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/895ae47f.failed
+
+All mitigation modes can be switched at run time with a static key now:
+
+ - Use sysfs_streq() instead of strcmp() to handle the trailing new line
+   from sysfs writes correctly.
+ - Make the static key management handle multiple invocations properly.
+ - Set the module parameter file to RW
+
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Tested-by: Jiri Kosina <jkosina@suse.cz>
+	Reviewed-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+	Reviewed-by: Josh Poimboeuf <jpoimboe@redhat.com>
+Link: https://lkml.kernel.org/r/20180713142322.954525119@linutronix.de
+
+(cherry picked from commit 895ae47f9918833c3a880fbccd41e0692b37e7d9)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/cpu/bugs.c
+#	arch/x86/kvm/vmx.c
+diff --cc arch/x86/kernel/cpu/bugs.c
+index 65d7ea159fff,7df7df9a2753..000000000000
+--- a/arch/x86/kernel/cpu/bugs.c
++++ b/arch/x86/kernel/cpu/bugs.c
+@@@ -656,6 -658,12 +656,15 @@@ void x86_spec_ctrl_setup_ap(void
+  
+  #undef pr_fmt
+  #define pr_fmt(fmt)	"L1TF: " fmt
+++<<<<<<< HEAD
+++=======
++ 
++ #if IS_ENABLED(CONFIG_KVM_INTEL)
++ enum vmx_l1d_flush_state l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_AUTO;
++ EXPORT_SYMBOL_GPL(l1tf_vmx_mitigation);
++ #endif
++ 
+++>>>>>>> 895ae47f9918 (x86/kvm: Allow runtime control of L1D flush)
+  static void __init l1tf_select_mitigation(void)
+  {
+  	u64 half_pa;
+diff --cc arch/x86/kvm/vmx.c
+index d9e0ef7725c0,08fcd59342ed..000000000000
+--- a/arch/x86/kvm/vmx.c
++++ b/arch/x86/kvm/vmx.c
+@@@ -192,12 -191,113 +192,105 @@@ module_param(ple_window_max, uint, 0444
+  
+  extern const ulong vmx_return;
+  
+ -static DEFINE_STATIC_KEY_FALSE(vmx_l1d_should_flush);
+ -static DEFINE_STATIC_KEY_FALSE(vmx_l1d_flush_always);
+ -static DEFINE_MUTEX(vmx_l1d_flush_mutex);
+ -
+ -/* Storage for pre module init parameter parsing */
+ -static enum vmx_l1d_flush_state __read_mostly vmentry_l1d_flush_param = VMENTER_L1D_FLUSH_AUTO;
+ -
+ -static const struct {
+ -	const char *option;
+ -	enum vmx_l1d_flush_state cmd;
+ -} vmentry_l1d_param[] = {
+ -	{"auto",	VMENTER_L1D_FLUSH_AUTO},
+ -	{"never",	VMENTER_L1D_FLUSH_NEVER},
+ -	{"cond",	VMENTER_L1D_FLUSH_COND},
+ -	{"always",	VMENTER_L1D_FLUSH_ALWAYS},
+ +enum ept_pointers_status {
+ +	EPT_POINTERS_CHECK = 0,
+ +	EPT_POINTERS_MATCH = 1,
+ +	EPT_POINTERS_MISMATCH = 2
+  };
+  
+++<<<<<<< HEAD
+++=======
++ #define L1D_CACHE_ORDER 4
++ static void *vmx_l1d_flush_pages;
++ 
++ static int vmx_setup_l1d_flush(enum vmx_l1d_flush_state l1tf)
++ {
++ 	struct page *page;
++ 
++ 	/* If set to 'auto' select 'cond' */
++ 	if (l1tf == VMENTER_L1D_FLUSH_AUTO)
++ 		l1tf = VMENTER_L1D_FLUSH_COND;
++ 
++ 	if (!enable_ept) {
++ 		l1tf_vmx_mitigation = VMENTER_L1D_FLUSH_EPT_DISABLED;
++ 		return 0;
++ 	}
++ 
++ 	if (l1tf != VMENTER_L1D_FLUSH_NEVER && !vmx_l1d_flush_pages &&
++ 	    !boot_cpu_has(X86_FEATURE_FLUSH_L1D)) {
++ 		page = alloc_pages(GFP_KERNEL, L1D_CACHE_ORDER);
++ 		if (!page)
++ 			return -ENOMEM;
++ 		vmx_l1d_flush_pages = page_address(page);
++ 	}
++ 
++ 	l1tf_vmx_mitigation = l1tf;
++ 
++ 	if (l1tf != VMENTER_L1D_FLUSH_NEVER)
++ 		static_branch_enable(&vmx_l1d_should_flush);
++ 	else
++ 		static_branch_disable(&vmx_l1d_should_flush);
++ 
++ 	if (l1tf == VMENTER_L1D_FLUSH_ALWAYS)
++ 		static_branch_enable(&vmx_l1d_flush_always);
++ 	else
++ 		static_branch_disable(&vmx_l1d_flush_always);
++ 	return 0;
++ }
++ 
++ static int vmentry_l1d_flush_parse(const char *s)
++ {
++ 	unsigned int i;
++ 
++ 	if (s) {
++ 		for (i = 0; i < ARRAY_SIZE(vmentry_l1d_param); i++) {
++ 			if (sysfs_streq(s, vmentry_l1d_param[i].option))
++ 				return vmentry_l1d_param[i].cmd;
++ 		}
++ 	}
++ 	return -EINVAL;
++ }
++ 
++ static int vmentry_l1d_flush_set(const char *s, const struct kernel_param *kp)
++ {
++ 	int l1tf, ret;
++ 
++ 	if (!boot_cpu_has(X86_BUG_L1TF))
++ 		return 0;
++ 
++ 	l1tf = vmentry_l1d_flush_parse(s);
++ 	if (l1tf < 0)
++ 		return l1tf;
++ 
++ 	/*
++ 	 * Has vmx_init() run already? If not then this is the pre init
++ 	 * parameter parsing. In that case just store the value and let
++ 	 * vmx_init() do the proper setup after enable_ept has been
++ 	 * established.
++ 	 */
++ 	if (l1tf_vmx_mitigation == VMENTER_L1D_FLUSH_AUTO) {
++ 		vmentry_l1d_flush_param = l1tf;
++ 		return 0;
++ 	}
++ 
++ 	mutex_lock(&vmx_l1d_flush_mutex);
++ 	ret = vmx_setup_l1d_flush(l1tf);
++ 	mutex_unlock(&vmx_l1d_flush_mutex);
++ 	return ret;
++ }
++ 
++ static int vmentry_l1d_flush_get(char *s, const struct kernel_param *kp)
++ {
++ 	return sprintf(s, "%s\n", vmentry_l1d_param[l1tf_vmx_mitigation].option);
++ }
++ 
++ static const struct kernel_param_ops vmentry_l1d_flush_ops = {
++ 	.set = vmentry_l1d_flush_set,
++ 	.get = vmentry_l1d_flush_get,
++ };
++ module_param_cb(vmentry_l1d_flush, &vmentry_l1d_flush_ops, NULL, 0644);
++ 
+++>>>>>>> 895ae47f9918 (x86/kvm: Allow runtime control of L1D flush)
+  struct kvm_vmx {
+  	struct kvm kvm;
+  
+* Unmerged path arch/x86/kernel/cpu/bugs.c
+* Unmerged path arch/x86/kvm/vmx.c
