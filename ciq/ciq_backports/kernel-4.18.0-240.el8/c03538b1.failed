@@ -1,0 +1,180 @@
+libperf: Adopt the readn()/writen() functions from tools/perf
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jiri Olsa <jolsa@kernel.org>
+commit c03538b1f1a7e0e996a8d6feb20cf001d4b14939
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c03538b1.failed
+
+Move the readn()/writen() functions into libperf.
+
+Keep those non-namespaced names because they will be shared only between
+perf and libperf.
+
+Again, these are not exported functions.
+
+	Signed-off-by: Jiri Olsa <jolsa@kernel.org>
+	Cc: Alexander Shishkin <alexander.shishkin@linux.intel.com>
+	Cc: Alexey Budankov <alexey.budankov@linux.intel.com>
+	Cc: Andi Kleen <ak@linux.intel.com>
+	Cc: Michael Petlan <mpetlan@redhat.com>
+	Cc: Namhyung Kim <namhyung@kernel.org>
+	Cc: Peter Zijlstra <peterz@infradead.org>
+Link: http://lkml.kernel.org/r/20190721112506.12306-61-jolsa@kernel.org
+	Signed-off-by: Arnaldo Carvalho de Melo <acme@redhat.com>
+(cherry picked from commit c03538b1f1a7e0e996a8d6feb20cf001d4b14939)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	tools/perf/lib/Build
+#	tools/perf/util/lib.h
+diff --cc tools/perf/lib/Build
+index 5196958cec01,c31f1c111f8f..000000000000
+--- a/tools/perf/lib/Build
++++ b/tools/perf/lib/Build
+@@@ -1,1 -1,12 +1,15 @@@
+  libperf-y += core.o
+++<<<<<<< HEAD
+++=======
++ libperf-y += cpumap.o
++ libperf-y += threadmap.o
++ libperf-y += evsel.o
++ libperf-y += evlist.o
++ libperf-y += zalloc.o
++ libperf-y += xyarray.o
++ libperf-y += lib.o
++ 
++ $(OUTPUT)zalloc.o: ../../lib/zalloc.c FORCE
++ 	$(call rule_mkdir)
++ 	$(call if_changed_dep,cc_o_c)
+++>>>>>>> c03538b1f1a7 (libperf: Adopt the readn()/writen() functions from tools/perf)
+* Unmerged path tools/perf/util/lib.h
+* Unmerged path tools/perf/lib/Build
+diff --git a/tools/perf/lib/lib.c b/tools/perf/lib/lib.c
+new file mode 100644
+index 000000000000..2a81819c3b8c
+--- /dev/null
++++ b/tools/perf/lib/lib.c
+@@ -0,0 +1,46 @@
++// SPDX-License-Identifier: GPL-2.0
++#include <unistd.h>
++#include <stdbool.h>
++#include <errno.h>
++#include <linux/kernel.h>
++#include <internal/lib.h>
++
++static ssize_t ion(bool is_read, int fd, void *buf, size_t n)
++{
++	void *buf_start = buf;
++	size_t left = n;
++
++	while (left) {
++		/* buf must be treated as const if !is_read. */
++		ssize_t ret = is_read ? read(fd, buf, left) :
++					write(fd, buf, left);
++
++		if (ret < 0 && errno == EINTR)
++			continue;
++		if (ret <= 0)
++			return ret;
++
++		left -= ret;
++		buf  += ret;
++	}
++
++	BUG_ON((size_t)(buf - buf_start) != n);
++	return n;
++}
++
++/*
++ * Read exactly 'n' bytes or return an error.
++ */
++ssize_t readn(int fd, void *buf, size_t n)
++{
++	return ion(true, fd, buf, n);
++}
++
++/*
++ * Write exactly 'n' bytes or return an error.
++ */
++ssize_t writen(int fd, const void *buf, size_t n)
++{
++	/* ion does not modify buf. */
++	return ion(false, fd, (void *)buf, n);
++}
+* Unmerged path tools/perf/util/lib.h
+diff --git a/tools/perf/util/util.c b/tools/perf/util/util.c
+index a61535cf1bca..9c3c97697387 100644
+--- a/tools/perf/util/util.c
++++ b/tools/perf/util/util.c
+@@ -384,46 +384,6 @@ int copyfile(const char *from, const char *to)
+ 	return copyfile_mode(from, to, 0755);
+ }
+ 
+-static ssize_t ion(bool is_read, int fd, void *buf, size_t n)
+-{
+-	void *buf_start = buf;
+-	size_t left = n;
+-
+-	while (left) {
+-		/* buf must be treated as const if !is_read. */
+-		ssize_t ret = is_read ? read(fd, buf, left) :
+-					write(fd, buf, left);
+-
+-		if (ret < 0 && errno == EINTR)
+-			continue;
+-		if (ret <= 0)
+-			return ret;
+-
+-		left -= ret;
+-		buf  += ret;
+-	}
+-
+-	BUG_ON((size_t)(buf - buf_start) != n);
+-	return n;
+-}
+-
+-/*
+- * Read exactly 'n' bytes or return an error.
+- */
+-ssize_t readn(int fd, void *buf, size_t n)
+-{
+-	return ion(true, fd, buf, n);
+-}
+-
+-/*
+- * Write exactly 'n' bytes or return an error.
+- */
+-ssize_t writen(int fd, const void *buf, size_t n)
+-{
+-	/* ion does not modify buf. */
+-	return ion(false, fd, (void *)buf, n);
+-}
+-
+ size_t hex_width(u64 v)
+ {
+ 	size_t n = 1;
+diff --git a/tools/perf/util/util.h b/tools/perf/util/util.h
+index dc7a469921e9..0dab140c6517 100644
+--- a/tools/perf/util/util.h
++++ b/tools/perf/util/util.h
+@@ -11,6 +11,7 @@
+ #include <stddef.h>
+ #include <linux/compiler.h>
+ #include <sys/types.h>
++#include <internal/lib.h>
+ 
+ /* General helper functions */
+ void usage(const char *err) __noreturn;
+@@ -30,9 +31,6 @@ int copyfile_mode(const char *from, const char *to, mode_t mode);
+ int copyfile_ns(const char *from, const char *to, struct nsinfo *nsi);
+ int copyfile_offset(int ifd, loff_t off_in, int ofd, loff_t off_out, u64 size);
+ 
+-ssize_t readn(int fd, void *buf, size_t n);
+-ssize_t writen(int fd, const void *buf, size_t n);
+-
+ size_t hex_width(u64 v);
+ 
+ extern unsigned int page_size;
