@@ -1,0 +1,126 @@
+hugetlbfs: don't retry when pool page allocations start to fail
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Mike Kravetz <mike.kravetz@oracle.com>
+commit f60858f9d327c4dd0c432abe9ec943a83929c229
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/f60858f9.failed
+
+When allocating hugetlbfs pool pages via /proc/sys/vm/nr_hugepages, the
+pages will be interleaved between all nodes of the system.  If nodes are
+not equal, it is quite possible for one node to fill up before the others.
+When this happens, the code still attempts to allocate pages from the
+full node.  This results in calls to direct reclaim and compaction which
+slow things down considerably.
+
+When allocating pool pages, note the state of the previous allocation for
+each node.  If previous allocation failed, do not use the aggressive retry
+algorithm on successive attempts.  The allocation will still succeed if
+there is memory available, but it will not try as hard to free up memory.
+
+Link: http://lkml.kernel.org/r/20190806014744.15446-5-mike.kravetz@oracle.com
+	Signed-off-by: Mike Kravetz <mike.kravetz@oracle.com>
+	Acked-by: Vlastimil Babka <vbabka@suse.cz>
+	Cc: Hillf Danton <hdanton@sina.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Mel Gorman <mgorman@suse.de>
+	Cc: Michal Hocko <mhocko@kernel.org>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit f60858f9d327c4dd0c432abe9ec943a83929c229)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	mm/hugetlb.c
+diff --cc mm/hugetlb.c
+index 449fb9efecb9,ef37c85423a5..000000000000
+--- a/mm/hugetlb.c
++++ b/mm/hugetlb.c
+@@@ -2342,13 -2373,59 +2396,64 @@@ found
+  }
+  
+  #define persistent_huge_pages(h) (h->nr_huge_pages - h->surplus_huge_pages)
+ -static int set_max_huge_pages(struct hstate *h, unsigned long count, int nid,
+ -			      nodemask_t *nodes_allowed)
+ +static unsigned long set_max_huge_pages(struct hstate *h, unsigned long count,
+ +						nodemask_t *nodes_allowed)
+  {
+  	unsigned long min_count, ret;
++ 	NODEMASK_ALLOC(nodemask_t, node_alloc_noretry, GFP_KERNEL);
++ 
++ 	/*
++ 	 * Bit mask controlling how hard we retry per-node allocations.
++ 	 * If we can not allocate the bit mask, do not attempt to allocate
++ 	 * the requested huge pages.
++ 	 */
++ 	if (node_alloc_noretry)
++ 		nodes_clear(*node_alloc_noretry);
++ 	else
++ 		return -ENOMEM;
+  
+++<<<<<<< HEAD
+ +	if (hstate_is_gigantic(h) && !gigantic_page_supported())
+ +		return h->max_huge_pages;
+++=======
++ 	spin_lock(&hugetlb_lock);
++ 
++ 	/*
++ 	 * Check for a node specific request.
++ 	 * Changing node specific huge page count may require a corresponding
++ 	 * change to the global count.  In any case, the passed node mask
++ 	 * (nodes_allowed) will restrict alloc/free to the specified node.
++ 	 */
++ 	if (nid != NUMA_NO_NODE) {
++ 		unsigned long old_count = count;
++ 
++ 		count += h->nr_huge_pages - h->nr_huge_pages_node[nid];
++ 		/*
++ 		 * User may have specified a large count value which caused the
++ 		 * above calculation to overflow.  In this case, they wanted
++ 		 * to allocate as many huge pages as possible.  Set count to
++ 		 * largest possible value to align with their intention.
++ 		 */
++ 		if (count < old_count)
++ 			count = ULONG_MAX;
++ 	}
++ 
++ 	/*
++ 	 * Gigantic pages runtime allocation depend on the capability for large
++ 	 * page range allocation.
++ 	 * If the system does not provide this feature, return an error when
++ 	 * the user tries to allocate gigantic pages but let the user free the
++ 	 * boottime allocated gigantic pages.
++ 	 */
++ 	if (hstate_is_gigantic(h) && !IS_ENABLED(CONFIG_CONTIG_ALLOC)) {
++ 		if (count > persistent_huge_pages(h)) {
++ 			spin_unlock(&hugetlb_lock);
++ 			NODEMASK_FREE(node_alloc_noretry);
++ 			return -EINVAL;
++ 		}
++ 		/* Fall through to decrease pool */
++ 	}
+++>>>>>>> f60858f9d327 (hugetlbfs: don't retry when pool page allocations start to fail)
+  
+  	/*
+  	 * Increase the pool size
+@@@ -2416,9 -2493,12 +2522,16 @@@
+  			break;
+  	}
+  out:
+ -	h->max_huge_pages = persistent_huge_pages(h);
+ +	ret = persistent_huge_pages(h);
+  	spin_unlock(&hugetlb_lock);
+++<<<<<<< HEAD
+ +	return ret;
+++=======
++ 
++ 	NODEMASK_FREE(node_alloc_noretry);
++ 
++ 	return 0;
+++>>>>>>> f60858f9d327 (hugetlbfs: don't retry when pool page allocations start to fail)
+  }
+  
+  #define HSTATE_ATTR_RO(_name) \
+* Unmerged path mm/hugetlb.c
