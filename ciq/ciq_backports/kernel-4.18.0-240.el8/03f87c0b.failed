@@ -1,0 +1,344 @@
+bpf: Propagate expected_attach_type when verifying freplace programs
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Toke Høiland-Jørgensen <toke@redhat.com>
+commit 03f87c0b45b177ba5f6b4a9bbe9f95e4aba31026
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/03f87c0b.failed
+
+For some program types, the verifier relies on the expected_attach_type of
+the program being verified in the verification process. However, for
+freplace programs, the attach type was not propagated along with the
+verifier ops, so the expected_attach_type would always be zero for freplace
+programs.
+
+This in turn caused the verifier to sometimes make the wrong call for
+freplace programs. For all existing uses of expected_attach_type for this
+purpose, the result of this was only false negatives (i.e., freplace
+functions would be rejected by the verifier even though they were valid
+programs for the target they were replacing). However, should a false
+positive be introduced, this can lead to out-of-bounds accesses and/or
+crashes.
+
+The fix introduced in this patch is to propagate the expected_attach_type
+to the freplace program during verification, and reset it after that is
+done.
+
+Fixes: be8704ff07d2 ("bpf: Introduce dynamic program extensions")
+	Signed-off-by: Toke Høiland-Jørgensen <toke@redhat.com>
+	Signed-off-by: Alexei Starovoitov <ast@kernel.org>
+Link: https://lore.kernel.org/bpf/158773526726.293902.13257293296560360508.stgit@toke.dk
+(cherry picked from commit 03f87c0b45b177ba5f6b4a9bbe9f95e4aba31026)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	kernel/bpf/verifier.c
+diff --cc kernel/bpf/verifier.c
+index a2c1dcade9ad,fa1d8245b925..000000000000
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@@ -9533,6 -10356,298 +9533,301 @@@ static void print_verification_stats(st
+  		env->peak_states, env->longest_mark_read_walk);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int check_struct_ops_btf_id(struct bpf_verifier_env *env)
++ {
++ 	const struct btf_type *t, *func_proto;
++ 	const struct bpf_struct_ops *st_ops;
++ 	const struct btf_member *member;
++ 	struct bpf_prog *prog = env->prog;
++ 	u32 btf_id, member_idx;
++ 	const char *mname;
++ 
++ 	btf_id = prog->aux->attach_btf_id;
++ 	st_ops = bpf_struct_ops_find(btf_id);
++ 	if (!st_ops) {
++ 		verbose(env, "attach_btf_id %u is not a supported struct\n",
++ 			btf_id);
++ 		return -ENOTSUPP;
++ 	}
++ 
++ 	t = st_ops->type;
++ 	member_idx = prog->expected_attach_type;
++ 	if (member_idx >= btf_type_vlen(t)) {
++ 		verbose(env, "attach to invalid member idx %u of struct %s\n",
++ 			member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	member = &btf_type_member(t)[member_idx];
++ 	mname = btf_name_by_offset(btf_vmlinux, member->name_off);
++ 	func_proto = btf_type_resolve_func_ptr(btf_vmlinux, member->type,
++ 					       NULL);
++ 	if (!func_proto) {
++ 		verbose(env, "attach to invalid member %s(@idx %u) of struct %s\n",
++ 			mname, member_idx, st_ops->name);
++ 		return -EINVAL;
++ 	}
++ 
++ 	if (st_ops->check_member) {
++ 		int err = st_ops->check_member(t, member);
++ 
++ 		if (err) {
++ 			verbose(env, "attach to unsupported member %s of struct %s\n",
++ 				mname, st_ops->name);
++ 			return err;
++ 		}
++ 	}
++ 
++ 	prog->aux->attach_func_proto = func_proto;
++ 	prog->aux->attach_func_name = mname;
++ 	env->ops = st_ops->verifier_ops;
++ 
++ 	return 0;
++ }
++ #define SECURITY_PREFIX "security_"
++ 
++ static int check_attach_modify_return(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	unsigned long addr = (unsigned long) prog->aux->trampoline->func.addr;
++ 
++ 	/* This is expected to be cleaned up in the future with the KRSI effort
++ 	 * introducing the LSM_HOOK macro for cleaning up lsm_hooks.h.
++ 	 */
++ 	if (within_error_injection_list(addr) ||
++ 	    !strncmp(SECURITY_PREFIX, prog->aux->attach_func_name,
++ 		     sizeof(SECURITY_PREFIX) - 1))
++ 		return 0;
++ 
++ 	verbose(env, "fmod_ret attach_btf_id %u (%s) is not modifiable\n",
++ 		prog->aux->attach_btf_id, prog->aux->attach_func_name);
++ 
++ 	return -EINVAL;
++ }
++ 
++ static int check_attach_btf_id(struct bpf_verifier_env *env)
++ {
++ 	struct bpf_prog *prog = env->prog;
++ 	bool prog_extension = prog->type == BPF_PROG_TYPE_EXT;
++ 	struct bpf_prog *tgt_prog = prog->aux->linked_prog;
++ 	u32 btf_id = prog->aux->attach_btf_id;
++ 	const char prefix[] = "btf_trace_";
++ 	int ret = 0, subprog = -1, i;
++ 	struct bpf_trampoline *tr;
++ 	const struct btf_type *t;
++ 	bool conservative = true;
++ 	const char *tname;
++ 	struct btf *btf;
++ 	long addr;
++ 	u64 key;
++ 
++ 	if (prog->type == BPF_PROG_TYPE_STRUCT_OPS)
++ 		return check_struct_ops_btf_id(env);
++ 
++ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
++ 	    prog->type != BPF_PROG_TYPE_LSM &&
++ 	    !prog_extension)
++ 		return 0;
++ 
++ 	if (!btf_id) {
++ 		verbose(env, "Tracing programs must provide btf_id\n");
++ 		return -EINVAL;
++ 	}
++ 	btf = bpf_prog_get_target_btf(prog);
++ 	if (!btf) {
++ 		verbose(env,
++ 			"FENTRY/FEXIT program can only be attached to another program annotated with BTF\n");
++ 		return -EINVAL;
++ 	}
++ 	t = btf_type_by_id(btf, btf_id);
++ 	if (!t) {
++ 		verbose(env, "attach_btf_id %u is invalid\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	tname = btf_name_by_offset(btf, t->name_off);
++ 	if (!tname) {
++ 		verbose(env, "attach_btf_id %u doesn't have a name\n", btf_id);
++ 		return -EINVAL;
++ 	}
++ 	if (tgt_prog) {
++ 		struct bpf_prog_aux *aux = tgt_prog->aux;
++ 
++ 		for (i = 0; i < aux->func_info_cnt; i++)
++ 			if (aux->func_info[i].type_id == btf_id) {
++ 				subprog = i;
++ 				break;
++ 			}
++ 		if (subprog == -1) {
++ 			verbose(env, "Subprog %s doesn't exist\n", tname);
++ 			return -EINVAL;
++ 		}
++ 		conservative = aux->func_info_aux[subprog].unreliable;
++ 		if (prog_extension) {
++ 			if (conservative) {
++ 				verbose(env,
++ 					"Cannot replace static functions\n");
++ 				return -EINVAL;
++ 			}
++ 			if (!prog->jit_requested) {
++ 				verbose(env,
++ 					"Extension programs should be JITed\n");
++ 				return -EINVAL;
++ 			}
++ 			env->ops = bpf_verifier_ops[tgt_prog->type];
++ 			prog->expected_attach_type = tgt_prog->expected_attach_type;
++ 		}
++ 		if (!tgt_prog->jited) {
++ 			verbose(env, "Can attach to only JITed progs\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == prog->type) {
++ 			/* Cannot fentry/fexit another fentry/fexit program.
++ 			 * Cannot attach program extension to another extension.
++ 			 * It's ok to attach fentry/fexit to extension program.
++ 			 */
++ 			verbose(env, "Cannot recursively attach\n");
++ 			return -EINVAL;
++ 		}
++ 		if (tgt_prog->type == BPF_PROG_TYPE_TRACING &&
++ 		    prog_extension &&
++ 		    (tgt_prog->expected_attach_type == BPF_TRACE_FENTRY ||
++ 		     tgt_prog->expected_attach_type == BPF_TRACE_FEXIT)) {
++ 			/* Program extensions can extend all program types
++ 			 * except fentry/fexit. The reason is the following.
++ 			 * The fentry/fexit programs are used for performance
++ 			 * analysis, stats and can be attached to any program
++ 			 * type except themselves. When extension program is
++ 			 * replacing XDP function it is necessary to allow
++ 			 * performance analysis of all functions. Both original
++ 			 * XDP program and its program extension. Hence
++ 			 * attaching fentry/fexit to BPF_PROG_TYPE_EXT is
++ 			 * allowed. If extending of fentry/fexit was allowed it
++ 			 * would be possible to create long call chain
++ 			 * fentry->extension->fentry->extension beyond
++ 			 * reasonable stack size. Hence extending fentry is not
++ 			 * allowed.
++ 			 */
++ 			verbose(env, "Cannot extend fentry/fexit\n");
++ 			return -EINVAL;
++ 		}
++ 		key = ((u64)aux->id) << 32 | btf_id;
++ 	} else {
++ 		if (prog_extension) {
++ 			verbose(env, "Cannot replace kernel functions\n");
++ 			return -EINVAL;
++ 		}
++ 		key = btf_id;
++ 	}
++ 
++ 	switch (prog->expected_attach_type) {
++ 	case BPF_TRACE_RAW_TP:
++ 		if (tgt_prog) {
++ 			verbose(env,
++ 				"Only FENTRY/FEXIT progs are attachable to another BPF prog\n");
++ 			return -EINVAL;
++ 		}
++ 		if (!btf_type_is_typedef(t)) {
++ 			verbose(env, "attach_btf_id %u is not a typedef\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (strncmp(prefix, tname, sizeof(prefix) - 1)) {
++ 			verbose(env, "attach_btf_id %u points to wrong type name %s\n",
++ 				btf_id, tname);
++ 			return -EINVAL;
++ 		}
++ 		tname += sizeof(prefix) - 1;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_ptr(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			/* should never happen in valid vmlinux build */
++ 			return -EINVAL;
++ 
++ 		/* remember two read only pointers that are valid for
++ 		 * the life time of the kernel
++ 		 */
++ 		prog->aux->attach_func_name = tname;
++ 		prog->aux->attach_func_proto = t;
++ 		prog->aux->attach_btf_trace = true;
++ 		return 0;
++ 	default:
++ 		if (!prog_extension)
++ 			return -EINVAL;
++ 		/* fallthrough */
++ 	case BPF_MODIFY_RETURN:
++ 	case BPF_LSM_MAC:
++ 	case BPF_TRACE_FENTRY:
++ 	case BPF_TRACE_FEXIT:
++ 		prog->aux->attach_func_name = tname;
++ 		if (prog->type == BPF_PROG_TYPE_LSM) {
++ 			ret = bpf_lsm_verify_prog(&env->log, prog);
++ 			if (ret < 0)
++ 				return ret;
++ 		}
++ 
++ 		if (!btf_type_is_func(t)) {
++ 			verbose(env, "attach_btf_id %u is not a function\n",
++ 				btf_id);
++ 			return -EINVAL;
++ 		}
++ 		if (prog_extension &&
++ 		    btf_check_type_match(env, prog, btf, t))
++ 			return -EINVAL;
++ 		t = btf_type_by_id(btf, t->type);
++ 		if (!btf_type_is_func_proto(t))
++ 			return -EINVAL;
++ 		tr = bpf_trampoline_lookup(key);
++ 		if (!tr)
++ 			return -ENOMEM;
++ 		/* t is either vmlinux type or another program's type */
++ 		prog->aux->attach_func_proto = t;
++ 		mutex_lock(&tr->mutex);
++ 		if (tr->func.addr) {
++ 			prog->aux->trampoline = tr;
++ 			goto out;
++ 		}
++ 		if (tgt_prog && conservative) {
++ 			prog->aux->attach_func_proto = NULL;
++ 			t = NULL;
++ 		}
++ 		ret = btf_distill_func_proto(&env->log, btf, t,
++ 					     tname, &tr->func.model);
++ 		if (ret < 0)
++ 			goto out;
++ 		if (tgt_prog) {
++ 			if (subprog == 0)
++ 				addr = (long) tgt_prog->bpf_func;
++ 			else
++ 				addr = (long) tgt_prog->aux->func[subprog]->bpf_func;
++ 		} else {
++ 			addr = kallsyms_lookup_name(tname);
++ 			if (!addr) {
++ 				verbose(env,
++ 					"The address of function %s cannot be found\n",
++ 					tname);
++ 				ret = -ENOENT;
++ 				goto out;
++ 			}
++ 		}
++ 		tr->func.addr = (void *)addr;
++ 		prog->aux->trampoline = tr;
++ 
++ 		if (prog->expected_attach_type == BPF_MODIFY_RETURN)
++ 			ret = check_attach_modify_return(env);
++ out:
++ 		mutex_unlock(&tr->mutex);
++ 		if (ret)
++ 			bpf_trampoline_put(tr);
++ 		return ret;
++ 	}
++ }
++ 
+++>>>>>>> 03f87c0b45b1 (bpf: Propagate expected_attach_type when verifying freplace programs)
+  int bpf_check(struct bpf_prog **prog, union bpf_attr *attr,
+  	      union bpf_attr __user *uattr)
+  {
+* Unmerged path kernel/bpf/verifier.c
