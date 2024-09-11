@@ -1,0 +1,275 @@
+IB/ipoib: Do not remove child devices from within the ndo_uninit
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-80.el8
+commit-author Jason Gunthorpe <jgg@ziepe.ca>
+commit 25405d98a2aa0b9983bb9c36b0b00815d39394f4
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-80.el8/25405d98.failed
+
+Switching to priv_destructor and needs_free_netdev created a subtle
+ordering problem in ipoib_remove_one.
+
+Now that unregister_netdev frees the netdev and priv we must ensure that
+the children are unregistered before trying to unregister the parent,
+or child unregister will use after free.
+
+The solution is to unregister the children, then parent, in the same batch
+all while holding the rtnl_lock. This closes all the races where a new
+child could have been added and ensures proper ordering.
+
+	Signed-off-by: Jason Gunthorpe <jgg@mellanox.com>
+	Signed-off-by: Leon Romanovsky <leonro@mellanox.com>
+(cherry picked from commit 25405d98a2aa0b9983bb9c36b0b00815d39394f4)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/infiniband/ulp/ipoib/ipoib_main.c
+#	drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_main.c
+index 94512d9e8358,b2fe23d60103..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_main.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_main.c
+@@@ -1832,10 -1835,111 +1832,9 @@@ static void ipoib_parent_unregister_pre
+  	flush_workqueue(ipoib_workqueue);
+  }
+  
+ -static void ipoib_set_dev_features(struct ipoib_dev_priv *priv)
+ -{
+ -	priv->hca_caps = priv->ca->attrs.device_cap_flags;
+ -
+ -	if (priv->hca_caps & IB_DEVICE_UD_IP_CSUM) {
+ -		priv->dev->hw_features |= NETIF_F_IP_CSUM | NETIF_F_RXCSUM;
+ -
+ -		if (priv->hca_caps & IB_DEVICE_UD_TSO)
+ -			priv->dev->hw_features |= NETIF_F_TSO;
+ -
+ -		priv->dev->features |= priv->dev->hw_features;
+ -	}
+ -}
+ -
+ -static int ipoib_parent_init(struct net_device *ndev)
+ -{
+ -	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
+ -	struct ib_port_attr attr;
+ -	int result;
+ -
+ -	result = ib_query_port(priv->ca, priv->port, &attr);
+ -	if (result) {
+ -		pr_warn("%s: ib_query_port %d failed\n", priv->ca->name,
+ -			priv->port);
+ -		return result;
+ -	}
+ -	priv->max_ib_mtu = ib_mtu_enum_to_int(attr.max_mtu);
+ -
+ -	result = ib_query_pkey(priv->ca, priv->port, 0, &priv->pkey);
+ -	if (result) {
+ -		pr_warn("%s: ib_query_pkey port %d failed (ret = %d)\n",
+ -			priv->ca->name, priv->port, result);
+ -		return result;
+ -	}
+ -
+ -	result = rdma_query_gid(priv->ca, priv->port, 0, &priv->local_gid);
+ -	if (result) {
+ -		pr_warn("%s: rdma_query_gid port %d failed (ret = %d)\n",
+ -			priv->ca->name, priv->port, result);
+ -		return result;
+ -	}
+ -	memcpy(priv->dev->dev_addr + 4, priv->local_gid.raw,
+ -	       sizeof(union ib_gid));
+ -
+ -	SET_NETDEV_DEV(priv->dev, priv->ca->dev.parent);
+ -	priv->dev->dev_id = priv->port - 1;
+ -
+ -	return 0;
+ -}
+ -
+ -static void ipoib_child_init(struct net_device *ndev)
+ -{
+ -	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
+ -	struct ipoib_dev_priv *ppriv = ipoib_priv(priv->parent);
+ -
+ -	priv->max_ib_mtu = ppriv->max_ib_mtu;
+ -	set_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags);
+ -	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
+ -	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
+ -}
+ -
+ -static int ipoib_ndo_init(struct net_device *ndev)
+ -{
+ -	struct ipoib_dev_priv *priv = ipoib_priv(ndev);
+ -	int rc;
+ -
+ -	if (priv->parent) {
+ -		ipoib_child_init(ndev);
+ -	} else {
+ -		rc = ipoib_parent_init(ndev);
+ -		if (rc)
+ -			return rc;
+ -	}
+ -
+ -	/* MTU will be reset when mcast join happens */
+ -	ndev->mtu = IPOIB_UD_MTU(priv->max_ib_mtu);
+ -	priv->mcast_mtu = priv->admin_mtu = ndev->mtu;
+ -	ndev->max_mtu = IPOIB_CM_MTU;
+ -
+ -	ndev->neigh_priv_len = sizeof(struct ipoib_neigh);
+ -
+ -	/*
+ -	 * Set the full membership bit, so that we join the right
+ -	 * broadcast group, etc.
+ -	 */
+ -	priv->pkey |= 0x8000;
+ -
+ -	ndev->broadcast[8] = priv->pkey >> 8;
+ -	ndev->broadcast[9] = priv->pkey & 0xff;
+ -	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ -
+ -	ipoib_set_dev_features(priv);
+ -
+ -	rc = ipoib_dev_init(ndev);
+ -	if (rc) {
+ -		pr_warn("%s: failed to initialize device: %s port %d (ret = %d)\n",
+ -			priv->ca->name, priv->dev->name, priv->port, rc);
+ -	}
+ -
+ -	return 0;
+ -}
+ -
+  static void ipoib_ndo_uninit(struct net_device *dev)
+  {
+- 	struct ipoib_dev_priv *priv = ipoib_priv(dev), *cpriv, *tcpriv;
+- 	LIST_HEAD(head);
++ 	struct ipoib_dev_priv *priv = ipoib_priv(dev);
+  
+  	ASSERT_RTNL();
+  
+@@@ -2399,26 -2470,18 +2396,41 @@@ static void ipoib_remove_one(struct ib_
+  		return;
+  
+  	list_for_each_entry_safe(priv, tmp, dev_list, list) {
+++<<<<<<< HEAD
+ +		struct rdma_netdev *parent_rn = netdev_priv(priv->dev);
+ +
+ +		ipoib_parent_unregister_pre(priv->dev);
+ +
+ +		/* Wrap rtnl_lock/unlock with mutex to protect sysfs calls */
+ +		mutex_lock(&priv->sysfs_mutex);
+ +		unregister_netdev(priv->dev);
+ +		mutex_unlock(&priv->sysfs_mutex);
+ +
+ +		parent_rn->free_rdma_netdev(priv->dev);
+ +
+ +		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs, list) {
+ +			struct rdma_netdev *child_rn;
+ +
+ +			child_rn = netdev_priv(cpriv->dev);
+ +			child_rn->free_rdma_netdev(cpriv->dev);
+ +			kfree(cpriv);
+ +		}
+ +
+ +		kfree(priv);
+++=======
++ 		LIST_HEAD(head);
++ 		ipoib_parent_unregister_pre(priv->dev);
++ 
++ 		rtnl_lock();
++ 
++ 		list_for_each_entry_safe(cpriv, tcpriv, &priv->child_intfs,
++ 					 list)
++ 			unregister_netdevice_queue(cpriv->dev, &head);
++ 		unregister_netdevice_queue(priv->dev, &head);
++ 		unregister_netdevice_many(&head);
++ 
++ 		rtnl_unlock();
+++>>>>>>> 25405d98a2aa (IB/ipoib: Do not remove child devices from within the ndo_uninit)
+  	}
+  
+  	kfree(dev_list);
+diff --cc drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+index b62ab85c8ead,fa4dfcee2644..000000000000
+--- a/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
++++ b/drivers/infiniband/ulp/ipoib/ipoib_vlan.c
+@@@ -53,37 -53,44 +53,48 @@@ static DEVICE_ATTR(parent, S_IRUGO, sho
+  int __ipoib_vlan_add(struct ipoib_dev_priv *ppriv, struct ipoib_dev_priv *priv,
+  		     u16 pkey, int type)
+  {
+ -	struct net_device *ndev = priv->dev;
+  	int result;
+  
+++<<<<<<< HEAD
+ +	priv->max_ib_mtu = ppriv->max_ib_mtu;
+ +	/* MTU will be reset when mcast join happens */
+ +	priv->dev->mtu   = IPOIB_UD_MTU(priv->max_ib_mtu);
+ +	priv->mcast_mtu  = priv->admin_mtu = priv->dev->mtu;
+++=======
++ 	ASSERT_RTNL();
++ 
++ 	/*
++ 	 * Racing with unregister of the parent must be prevented by the
++ 	 * caller.
++ 	 */
++ 	WARN_ON(ppriv->dev->reg_state != NETREG_REGISTERED);
++ 
+++>>>>>>> 25405d98a2aa (IB/ipoib: Do not remove child devices from within the ndo_uninit)
+  	priv->parent = ppriv->dev;
+ +	set_bit(IPOIB_FLAG_SUBINTERFACE, &priv->flags);
+ +
+ +	ipoib_set_dev_features(priv, ppriv->ca);
+ +
+  	priv->pkey = pkey;
+ -	priv->child_type = type;
+  
+ -	/* We do not need to touch priv if register_netdevice fails */
+ -	ndev->priv_destructor = ipoib_intf_free;
+ +	memcpy(priv->dev->dev_addr, ppriv->dev->dev_addr, INFINIBAND_ALEN);
+ +	memcpy(&priv->local_gid, &ppriv->local_gid, sizeof(priv->local_gid));
+ +	set_bit(IPOIB_FLAG_DEV_ADDR_SET, &priv->flags);
+ +	priv->dev->broadcast[8] = pkey >> 8;
+ +	priv->dev->broadcast[9] = pkey & 0xff;
+ +
+ +	result = ipoib_dev_init(priv->dev, ppriv->ca, ppriv->port);
+ +	if (result < 0) {
+ +		ipoib_warn(ppriv, "failed to initialize subinterface: "
+ +			   "device %s, port %d",
+ +			   ppriv->ca->name, ppriv->port);
+ +		goto err;
+ +	}
+  
+ -	result = register_netdevice(ndev);
+ +	result = register_netdevice(priv->dev);
+  	if (result) {
+  		ipoib_warn(priv, "failed to initialize; error %i", result);
+ -
+ -		/*
+ -		 * register_netdevice sometimes calls priv_destructor,
+ -		 * sometimes not. Make sure it was done.
+ -		 */
+ -		if (ndev->priv_destructor)
+ -			ndev->priv_destructor(ndev);
+ -		return result;
+ +		goto err;
+  	}
+  
+  	/* RTNL childs don't need proprietary sysfs entries */
+diff --git a/drivers/infiniband/ulp/ipoib/ipoib.h b/drivers/infiniband/ulp/ipoib/ipoib.h
+index 44bce3b18901..3ab55cbfb039 100644
+--- a/drivers/infiniband/ulp/ipoib/ipoib.h
++++ b/drivers/infiniband/ulp/ipoib/ipoib.h
+@@ -329,6 +329,13 @@ struct ipoib_dev_priv {
+ 
+ 	unsigned long flags;
+ 
++	/*
++	 * This protects access to the child_intfs list.
++	 * To READ from child_intfs the RTNL or vlan_rwsem read side must be
++	 * held.  To WRITE RTNL and the vlan_rwsem write side must be held (in
++	 * that order) This lock exists because we have a few contexts where
++	 * we need the child_intfs, but do not want to grab the RTNL.
++	 */
+ 	struct rw_semaphore vlan_rwsem;
+ 	struct mutex mcast_mutex;
+ 	struct mutex sysfs_mutex;
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_main.c
+* Unmerged path drivers/infiniband/ulp/ipoib/ipoib_vlan.c
