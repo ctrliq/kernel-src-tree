@@ -1,0 +1,399 @@
+drm/i915/dp: Fix dsc bpp calculations, v5.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+Rebuild_CHGLOG: - [gpu] drm/i915/dp: Fix dsc bpp calculations, v5 (Lyude Paul) [1771779]
+Rebuild_FUZZ: 98.80%
+commit-author Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+commit ed06efb801bd291e935238d3fba46fa03d098f0e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/ed06efb8.failed
+
+There was a integer wraparound when mode_clock became too high,
+and we didn't correct for the FEC overhead factor when dividing,
+with the calculations breaking at HBR3.
+
+As a result our calculated bpp was way too high, and the link width
+limitation never came into effect.
+
+Print out the resulting bpp calcululations as a sanity check, just
+in case we ever have to debug it later on again.
+
+We also used the wrong factor for FEC. While bspec mentions 2.4%,
+all the calculations use 1/0.972261, and the same ratio should be
+applied to data M/N as well, so use it there when FEC is enabled.
+
+This fixes the FIFO underrun we are seeing with FEC enabled.
+
+Changes since v2:
+- Handle fec_enable in intel_link_compute_m_n, so only data M/N is adjusted. (Ville)
+- Fix initial hardware readout for FEC. (Ville)
+Changes since v3:
+- Remove bogus fec_to_mode_clock. (Ville)
+Changes since v4:
+- Use the correct register for icl. (Ville)
+- Split hw readout to a separate patch.
+
+	Signed-off-by: Maarten Lankhorst <maarten.lankhorst@linux.intel.com>
+Fixes: d9218c8f6cf4 ("drm/i915/dp: Add helpers for Compressed BPP and Slice Count for DSC")
+	Cc: <stable@vger.kernel.org> # v5.0+
+	Cc: Manasi Navare <manasi.d.navare@intel.com>
+Link: https://patchwork.freedesktop.org/patch/msgid/20190925082110.17439-1-maarten.lankhorst@linux.intel.com
+	Reviewed-by: Ville Syrjälä <ville.syrjala@linux.intel.com>
+(cherry picked from commit ed06efb801bd291e935238d3fba46fa03d098f0e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/gpu/drm/i915/display/intel_display.h
+#	drivers/gpu/drm/i915/display/intel_dp.h
+#	drivers/gpu/drm/i915/intel_dp.c
+#	drivers/gpu/drm/i915/intel_dp_mst.c
+diff --cc drivers/gpu/drm/i915/intel_dp.c
+index 48da4a969a0a,893c9807755c..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp.c
++++ b/drivers/gpu/drm/i915/intel_dp.c
+@@@ -2123,35 -2337,20 +2214,46 @@@ intel_dp_compute_config(struct intel_en
+  	if (ret < 0)
+  		return ret;
+  
+ -	pipe_config->limited_color_range =
+ -		intel_dp_limited_color_range(pipe_config, conn_state);
+ +	if (intel_conn_state->broadcast_rgb == INTEL_BROADCAST_RGB_AUTO) {
+ +		/*
+ +		 * See:
+ +		 * CEA-861-E - 5.1 Default Encoding Parameters
+ +		 * VESA DisplayPort Ver.1.2a - 5.1.1.1 Video Colorimetry
+ +		 */
+ +		pipe_config->limited_color_range =
+ +			pipe_config->pipe_bpp != 18 &&
+ +			drm_default_rgb_quant_range(adjusted_mode) ==
+ +			HDMI_QUANTIZATION_RANGE_LIMITED;
+ +	} else {
+ +		pipe_config->limited_color_range =
+ +			intel_conn_state->broadcast_rgb == INTEL_BROADCAST_RGB_LIMITED;
+ +	}
+  
+ -	if (pipe_config->dsc_params.compression_enable)
+ -		output_bpp = pipe_config->dsc_params.compressed_bpp;
+ +	if (!pipe_config->dsc_params.compression_enable)
+ +		intel_link_compute_m_n(pipe_config->pipe_bpp,
+ +				       pipe_config->lane_count,
+ +				       adjusted_mode->crtc_clock,
+ +				       pipe_config->port_clock,
+ +				       &pipe_config->dp_m_n,
+ +				       constant_n);
+  	else
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_dp.c
+ +		intel_link_compute_m_n(pipe_config->dsc_params.compressed_bpp,
+ +				       pipe_config->lane_count,
+ +				       adjusted_mode->crtc_clock,
+ +				       pipe_config->port_clock,
+ +				       &pipe_config->dp_m_n,
+ +				       constant_n);
+++=======
++ 		output_bpp = intel_dp_output_bpp(pipe_config, pipe_config->pipe_bpp);
++ 
++ 	intel_link_compute_m_n(output_bpp,
++ 			       pipe_config->lane_count,
++ 			       adjusted_mode->crtc_clock,
++ 			       pipe_config->port_clock,
++ 			       &pipe_config->dp_m_n,
++ 			       constant_n, pipe_config->fec_enable);
+++>>>>>>> ed06efb801bd (drm/i915/dp: Fix dsc bpp calculations, v5.):drivers/gpu/drm/i915/display/intel_dp.c
+  
+  	if (intel_connector->panel.downclock_mode != NULL &&
+  		dev_priv->drrs.type == SEAMLESS_DRRS_SUPPORT) {
+@@@ -4241,89 -4464,94 +4343,180 @@@ intel_dp_get_sink_irq_esi(struct intel_
+  		DP_DPRX_ESI_LEN;
+  }
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_dp.c
+ +u16 intel_dp_dsc_get_output_bpp(int link_clock, u8 lane_count,
+ +				int mode_clock, int mode_hdisplay)
+ +{
+ +	u16 bits_per_pixel, max_bpp_small_joiner_ram;
+ +	int i;
+ +
+ +	/*
+ +	 * Available Link Bandwidth(Kbits/sec) = (NumberOfLanes)*
+ +	 * (LinkSymbolClock)* 8 * ((100-FECOverhead)/100)*(TimeSlotsPerMTP)
+ +	 * FECOverhead = 2.4%, for SST -> TimeSlotsPerMTP is 1,
+ +	 * for MST -> TimeSlotsPerMTP has to be calculated
+ +	 */
+ +	bits_per_pixel = (link_clock * lane_count * 8 *
+ +			  DP_DSC_FEC_OVERHEAD_FACTOR) /
+ +		mode_clock;
+ +
+ +	/* Small Joiner Check: output bpp <= joiner RAM (bits) / Horiz. width */
+ +	max_bpp_small_joiner_ram = DP_DSC_MAX_SMALL_JOINER_RAM_BUFFER /
+ +		mode_hdisplay;
+ +
+ +	/*
+ +	 * Greatest allowed DSC BPP = MIN (output BPP from avaialble Link BW
+ +	 * check, output bpp from small joiner RAM check)
+ +	 */
+ +	bits_per_pixel = min(bits_per_pixel, max_bpp_small_joiner_ram);
+ +
+ +	/* Error out if the max bpp is less than smallest allowed valid bpp */
+ +	if (bits_per_pixel < valid_dsc_bpp[0]) {
+ +		DRM_DEBUG_KMS("Unsupported BPP %d\n", bits_per_pixel);
+ +		return 0;
+ +	}
+ +
+ +	/* Find the nearest match in the array of known BPPs from VESA */
+ +	for (i = 0; i < ARRAY_SIZE(valid_dsc_bpp) - 1; i++) {
+ +		if (bits_per_pixel < valid_dsc_bpp[i + 1])
+ +			break;
+ +	}
+ +	bits_per_pixel = valid_dsc_bpp[i];
+ +
+ +	/*
+ +	 * Compressed BPP in U6.4 format so multiply by 16, for Gen 11,
+ +	 * fractional part is 0
+ +	 */
+ +	return bits_per_pixel << 4;
+ +}
+ +
+ +u8 intel_dp_dsc_get_slice_count(struct intel_dp *intel_dp,
+ +				int mode_clock,
+ +				int mode_hdisplay)
+ +{
+ +	u8 min_slice_count, i;
+ +	int max_slice_width;
+ +
+ +	if (mode_clock <= DP_DSC_PEAK_PIXEL_RATE)
+ +		min_slice_count = DIV_ROUND_UP(mode_clock,
+ +					       DP_DSC_MAX_ENC_THROUGHPUT_0);
+ +	else
+ +		min_slice_count = DIV_ROUND_UP(mode_clock,
+ +					       DP_DSC_MAX_ENC_THROUGHPUT_1);
+ +
+ +	max_slice_width = drm_dp_dsc_sink_max_slice_width(intel_dp->dsc_dpcd);
+ +	if (max_slice_width < DP_DSC_MIN_SLICE_WIDTH_VALUE) {
+ +		DRM_DEBUG_KMS("Unsupported slice width %d by DP DSC Sink device\n",
+ +			      max_slice_width);
+ +		return 0;
+ +	}
+ +	/* Also take into account max slice width */
+ +	min_slice_count = min_t(u8, min_slice_count,
+ +				DIV_ROUND_UP(mode_hdisplay,
+ +					     max_slice_width));
+ +
+ +	/* Find the closest match to the valid slice count values */
+ +	for (i = 0; i < ARRAY_SIZE(valid_dsc_slicecount); i++) {
+ +		if (valid_dsc_slicecount[i] >
+ +		    drm_dp_dsc_sink_max_slice_count(intel_dp->dsc_dpcd,
+ +						    false))
+ +			break;
+ +		if (min_slice_count  <= valid_dsc_slicecount[i])
+ +			return valid_dsc_slicecount[i];
+ +	}
+ +
+ +	DRM_DEBUG_KMS("Unsupported Slice Count %d\n", min_slice_count);
+ +	return 0;
+++=======
++ static void
++ intel_pixel_encoding_setup_vsc(struct intel_dp *intel_dp,
++ 			       const struct intel_crtc_state *crtc_state)
++ {
++ 	struct intel_digital_port *intel_dig_port = dp_to_dig_port(intel_dp);
++ 	struct dp_sdp vsc_sdp = {};
++ 
++ 	/* Prepare VSC Header for SU as per DP 1.4a spec, Table 2-119 */
++ 	vsc_sdp.sdp_header.HB0 = 0;
++ 	vsc_sdp.sdp_header.HB1 = 0x7;
++ 
++ 	/*
++ 	 * VSC SDP supporting 3D stereo, PSR2, and Pixel Encoding/
++ 	 * Colorimetry Format indication.
++ 	 */
++ 	vsc_sdp.sdp_header.HB2 = 0x5;
++ 
++ 	/*
++ 	 * VSC SDP supporting 3D stereo, + PSR2, + Pixel Encoding/
++ 	 * Colorimetry Format indication (HB2 = 05h).
++ 	 */
++ 	vsc_sdp.sdp_header.HB3 = 0x13;
++ 
++ 	/*
++ 	 * YCbCr 420 = 3h DB16[7:4] ITU-R BT.601 = 0h, ITU-R BT.709 = 1h
++ 	 * DB16[3:0] DP 1.4a spec, Table 2-120
++ 	 */
++ 	vsc_sdp.db[16] = 0x3 << 4; /* 0x3 << 4 , YCbCr 420*/
++ 	/* RGB->YCBCR color conversion uses the BT.709 color space. */
++ 	vsc_sdp.db[16] |= 0x1; /* 0x1, ITU-R BT.709 */
++ 
++ 	/*
++ 	 * For pixel encoding formats YCbCr444, YCbCr422, YCbCr420, and Y Only,
++ 	 * the following Component Bit Depth values are defined:
++ 	 * 001b = 8bpc.
++ 	 * 010b = 10bpc.
++ 	 * 011b = 12bpc.
++ 	 * 100b = 16bpc.
++ 	 */
++ 	switch (crtc_state->pipe_bpp) {
++ 	case 24: /* 8bpc */
++ 		vsc_sdp.db[17] = 0x1;
++ 		break;
++ 	case 30: /* 10bpc */
++ 		vsc_sdp.db[17] = 0x2;
++ 		break;
++ 	case 36: /* 12bpc */
++ 		vsc_sdp.db[17] = 0x3;
++ 		break;
++ 	case 48: /* 16bpc */
++ 		vsc_sdp.db[17] = 0x4;
++ 		break;
++ 	default:
++ 		MISSING_CASE(crtc_state->pipe_bpp);
++ 		break;
++ 	}
++ 
++ 	/*
++ 	 * Dynamic Range (Bit 7)
++ 	 * 0 = VESA range, 1 = CTA range.
++ 	 * all YCbCr are always limited range
++ 	 */
++ 	vsc_sdp.db[17] |= 0x80;
++ 
++ 	/*
++ 	 * Content Type (Bits 2:0)
++ 	 * 000b = Not defined.
++ 	 * 001b = Graphics.
++ 	 * 010b = Photo.
++ 	 * 011b = Video.
++ 	 * 100b = Game
++ 	 * All other values are RESERVED.
++ 	 * Note: See CTA-861-G for the definition and expected
++ 	 * processing by a stream sink for the above contect types.
++ 	 */
++ 	vsc_sdp.db[18] = 0;
++ 
++ 	intel_dig_port->write_infoframe(&intel_dig_port->base,
++ 			crtc_state, DP_SDP_VSC, &vsc_sdp, sizeof(vsc_sdp));
++ }
++ 
++ void intel_dp_ycbcr_420_enable(struct intel_dp *intel_dp,
++ 			       const struct intel_crtc_state *crtc_state)
++ {
++ 	if (crtc_state->output_format != INTEL_OUTPUT_FORMAT_YCBCR420)
++ 		return;
++ 
++ 	intel_pixel_encoding_setup_vsc(intel_dp, crtc_state);
+++>>>>>>> ed06efb801bd (drm/i915/dp: Fix dsc bpp calculations, v5.):drivers/gpu/drm/i915/display/intel_dp.c
+  }
+  
+  static u8 intel_dp_autotest_link_training(struct intel_dp *intel_dp)
+diff --cc drivers/gpu/drm/i915/intel_dp_mst.c
+index fb67cd931117,cf4d851a5139..000000000000
+--- a/drivers/gpu/drm/i915/intel_dp_mst.c
++++ b/drivers/gpu/drm/i915/intel_dp_mst.c
+@@@ -29,6 -27,66 +29,69 @@@
+  #include <drm/drm_edid.h>
+  #include <drm/drm_probe_helper.h>
+  
+++<<<<<<< HEAD:drivers/gpu/drm/i915/intel_dp_mst.c
+++=======
++ #include "i915_drv.h"
++ #include "intel_atomic.h"
++ #include "intel_audio.h"
++ #include "intel_connector.h"
++ #include "intel_ddi.h"
++ #include "intel_display_types.h"
++ #include "intel_dp.h"
++ #include "intel_dp_mst.h"
++ #include "intel_dpio_phy.h"
++ 
++ static int intel_dp_mst_compute_link_config(struct intel_encoder *encoder,
++ 					    struct intel_crtc_state *crtc_state,
++ 					    struct drm_connector_state *conn_state,
++ 					    struct link_config_limits *limits)
++ {
++ 	struct drm_atomic_state *state = crtc_state->base.state;
++ 	struct intel_dp_mst_encoder *intel_mst = enc_to_mst(&encoder->base);
++ 	struct intel_dp *intel_dp = &intel_mst->primary->dp;
++ 	struct intel_connector *connector =
++ 		to_intel_connector(conn_state->connector);
++ 	const struct drm_display_mode *adjusted_mode =
++ 		&crtc_state->base.adjusted_mode;
++ 	void *port = connector->port;
++ 	bool constant_n = drm_dp_has_quirk(&intel_dp->desc,
++ 					   DP_DPCD_QUIRK_CONSTANT_N);
++ 	int bpp, slots = -EINVAL;
++ 
++ 	crtc_state->lane_count = limits->max_lane_count;
++ 	crtc_state->port_clock = limits->max_clock;
++ 
++ 	for (bpp = limits->max_bpp; bpp >= limits->min_bpp; bpp -= 2 * 3) {
++ 		crtc_state->pipe_bpp = bpp;
++ 
++ 		crtc_state->pbn = drm_dp_calc_pbn_mode(adjusted_mode->crtc_clock,
++ 						       crtc_state->pipe_bpp);
++ 
++ 		slots = drm_dp_atomic_find_vcpi_slots(state, &intel_dp->mst_mgr,
++ 						      port, crtc_state->pbn);
++ 		if (slots == -EDEADLK)
++ 			return slots;
++ 		if (slots >= 0)
++ 			break;
++ 	}
++ 
++ 	if (slots < 0) {
++ 		DRM_DEBUG_KMS("failed finding vcpi slots:%d\n", slots);
++ 		return slots;
++ 	}
++ 
++ 	intel_link_compute_m_n(crtc_state->pipe_bpp,
++ 			       crtc_state->lane_count,
++ 			       adjusted_mode->crtc_clock,
++ 			       crtc_state->port_clock,
++ 			       &crtc_state->dp_m_n,
++ 			       constant_n, crtc_state->fec_enable);
++ 	crtc_state->dp_m_n.tu = slots;
++ 
++ 	return 0;
++ }
++ 
+++>>>>>>> ed06efb801bd (drm/i915/dp: Fix dsc bpp calculations, v5.):drivers/gpu/drm/i915/display/intel_dp_mst.c
+  static int intel_dp_mst_compute_config(struct intel_encoder *encoder,
+  				       struct intel_crtc_state *pipe_config,
+  				       struct drm_connector_state *conn_state)
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_dp.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_display.h
+* Unmerged path drivers/gpu/drm/i915/display/intel_dp.h
+diff --git a/drivers/gpu/drm/i915/intel_display.c b/drivers/gpu/drm/i915/intel_display.c
+index 9a6ac3d8208b..d91172c42454 100644
+--- a/drivers/gpu/drm/i915/intel_display.c
++++ b/drivers/gpu/drm/i915/intel_display.c
+@@ -7042,7 +7042,7 @@ static int ironlake_fdi_compute_config(struct intel_crtc *intel_crtc,
+ 	pipe_config->fdi_lanes = lane;
+ 
+ 	intel_link_compute_m_n(pipe_config->pipe_bpp, lane, fdi_dotclock,
+-			       link_bw, &pipe_config->fdi_m_n, false);
++			       link_bw, &pipe_config->fdi_m_n, false, false);
+ 
+ 	ret = ironlake_check_fdi_lanes(dev, intel_crtc->pipe, pipe_config);
+ 	if (ret == -EDEADLK)
+@@ -7284,11 +7284,15 @@ void
+ intel_link_compute_m_n(u16 bits_per_pixel, int nlanes,
+ 		       int pixel_clock, int link_clock,
+ 		       struct intel_link_m_n *m_n,
+-		       bool constant_n)
++		       bool constant_n, bool fec_enable)
+ {
+-	m_n->tu = 64;
++	u32 data_clock = bits_per_pixel * pixel_clock;
++
++	if (fec_enable)
++		data_clock = intel_dp_mode_to_fec_clock(data_clock);
+ 
+-	compute_m_n(bits_per_pixel * pixel_clock,
++	m_n->tu = 64;
++	compute_m_n(data_clock,
+ 		    link_clock * nlanes * 8,
+ 		    &m_n->gmch_m, &m_n->gmch_n,
+ 		    constant_n);
+* Unmerged path drivers/gpu/drm/i915/intel_dp.c
+* Unmerged path drivers/gpu/drm/i915/intel_dp_mst.c
