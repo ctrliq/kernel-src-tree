@@ -2016,7 +2016,7 @@ static const struct net_device_ops qeth_l3_osa_netdev_ops = {
 	.ndo_neigh_setup	= qeth_l3_neigh_setup,
 };
 
-static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
+static int qeth_l3_setup_netdev(struct qeth_card *card)
 {
 	unsigned int headroom;
 	int rc;
@@ -2070,7 +2070,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
 
 		rc = qeth_l3_iqd_read_initial_mac(card);
 		if (rc)
-			goto out;
+			return rc;
 	} else
 		return -ENODEV;
 
@@ -2085,14 +2085,7 @@ static int qeth_l3_setup_netdev(struct qeth_card *card, bool carrier_ok)
 				       PAGE_SIZE * (QETH_MAX_BUFFER_ELEMENTS(card) - 1));
 
 	netif_napi_add(card->dev, &card->napi, qeth_poll, QETH_NAPI_WEIGHT);
-	rc = register_netdev(card->dev);
-	if (!rc && carrier_ok)
-		netif_carrier_on(card->dev);
-
-out:
-	if (rc)
-		card->dev->netdev_ops = NULL;
-	return rc;
+	return register_netdev(card->dev);
 }
 
 static const struct device_type qeth_l3_devtype = {
@@ -2139,7 +2132,7 @@ static void qeth_l3_remove_device(struct ccwgroup_device *cgdev)
 		qeth_l3_set_offline(cgdev);
 
 	cancel_work_sync(&card->close_dev_work);
-	if (qeth_netdev_is_registered(card->dev))
+	if (card->dev->reg_state == NETREG_REGISTERED)
 		unregister_netdev(card->dev);
 
 	flush_workqueue(card->cmd_wq);
@@ -2194,10 +2187,13 @@ static int qeth_l3_set_online(struct ccwgroup_device *gdev)
 	qeth_set_allowed_threads(card, 0xffffffff, 0);
 	qeth_l3_recover_ip(card);
 
-	if (!qeth_netdev_is_registered(dev)) {
-		rc = qeth_l3_setup_netdev(card, carrier_ok);
+	if (dev->reg_state != NETREG_REGISTERED) {
+		rc = qeth_l3_setup_netdev(card);
 		if (rc)
 			goto out_remove;
+
+		if (carrier_ok)
+			netif_carrier_on(dev);
 	} else {
 		rtnl_lock();
 		if (carrier_ok)
