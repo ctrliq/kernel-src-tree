@@ -1,0 +1,389 @@
+video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [video] hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs (Mohammed Gamal) [1816744]
+Rebuild_FUZZ: 94.20%
+commit-author Wei Hu <weh@microsoft.com>
+commit 3a6fb6c4255c3893ab61e2bd4e9ae01ca6bbcd94
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/3a6fb6c4.failed
+
+On Hyper-V, Generation 1 VMs can directly use VM's physical memory for
+their framebuffers. This can improve the efficiency of framebuffer and
+overall performence for VM. The physical memory assigned to framebuffer
+must be contiguous. We use CMA allocator to get contiguouse physicial
+memory when the framebuffer size is greater than 4MB. For size under
+4MB, we use alloc_pages to achieve this.
+
+To enable framebuffer memory allocation from CMA, supply a kernel
+parameter to give enough space to CMA allocator at boot time. For
+example:
+    cma=130m
+This gives 130MB memory to CAM allocator that can be allocated to
+framebuffer. If this fails, we fall back to the old way of using
+mmio for framebuffer.
+
+	Reported-by: kbuild test robot <lkp@intel.com>
+	Signed-off-by: Wei Hu <weh@microsoft.com>
+	Acked-by: Bartlomiej Zolnierkiewicz <b.zolnierkie@samsung.com>
+	Signed-off-by: Sasha Levin <sashal@kernel.org>
+(cherry picked from commit 3a6fb6c4255c3893ab61e2bd4e9ae01ca6bbcd94)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/video/fbdev/Kconfig
+#	drivers/video/fbdev/hyperv_fb.c
+diff --cc drivers/video/fbdev/Kconfig
+index 146ab2c347f8,f65991a67af2..000000000000
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@@ -2289,6 -2214,8 +2289,11 @@@ config FB_HYPER
+  	select FB_CFB_FILLRECT
+  	select FB_CFB_COPYAREA
+  	select FB_CFB_IMAGEBLIT
+++<<<<<<< HEAD
+++=======
++ 	select FB_DEFERRED_IO
++ 	select DMA_CMA if HAVE_DMA_CONTIGUOUS && CMA
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  	help
+  	  This framebuffer driver supports Microsoft Hyper-V Synthetic Video.
+  
+diff --cc drivers/video/fbdev/hyperv_fb.c
+index 5d63e439979f,e2443dbaf3e9..000000000000
+--- a/drivers/video/fbdev/hyperv_fb.c
++++ b/drivers/video/fbdev/hyperv_fb.c
+@@@ -266,7 -267,20 +275,23 @@@ struct hvfb_par 
+  	/* If true, the VSC notifies the VSP on every framebuffer change */
+  	bool synchronous_fb;
+  
++ 	/* If true, need to copy from deferred IO mem to framebuffer mem */
++ 	bool need_docopy;
++ 
+  	struct notifier_block hvfb_panic_nb;
+++<<<<<<< HEAD
+++=======
++ 
++ 	/* Memory for deferred IO and frame buffer itself */
++ 	unsigned char *dio_vp;
++ 	unsigned char *mmio_vp;
++ 	phys_addr_t mmio_pp;
++ 
++ 	/* Dirty rectangle, protected by delayed_refresh_lock */
++ 	int x1, y1, x2, y2;
++ 	bool delayed_refresh;
++ 	spinlock_t delayed_refresh_lock;
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  };
+  
+  static uint screen_width = HVFB_WIDTH;
+@@@ -383,6 -405,59 +408,62 @@@ static int synthvid_update(struct fb_in
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void hvfb_docopy(struct hvfb_par *par,
++ 			unsigned long offset,
++ 			unsigned long size)
++ {
++ 	if (!par || !par->mmio_vp || !par->dio_vp || !par->fb_ready ||
++ 	    size == 0 || offset >= dio_fb_size)
++ 		return;
++ 
++ 	if (offset + size > dio_fb_size)
++ 		size = dio_fb_size - offset;
++ 
++ 	memcpy(par->mmio_vp + offset, par->dio_vp + offset, size);
++ }
++ 
++ /* Deferred IO callback */
++ static void synthvid_deferred_io(struct fb_info *p,
++ 				 struct list_head *pagelist)
++ {
++ 	struct hvfb_par *par = p->par;
++ 	struct page *page;
++ 	unsigned long start, end;
++ 	int y1, y2, miny, maxy;
++ 
++ 	miny = INT_MAX;
++ 	maxy = 0;
++ 
++ 	/*
++ 	 * Merge dirty pages. It is possible that last page cross
++ 	 * over the end of frame buffer row yres. This is taken care of
++ 	 * in synthvid_update function by clamping the y2
++ 	 * value to yres.
++ 	 */
++ 	list_for_each_entry(page, pagelist, lru) {
++ 		start = page->index << PAGE_SHIFT;
++ 		end = start + PAGE_SIZE - 1;
++ 		y1 = start / p->fix.line_length;
++ 		y2 = end / p->fix.line_length;
++ 		miny = min_t(int, miny, y1);
++ 		maxy = max_t(int, maxy, y2);
++ 
++ 		/* Copy from dio space to mmio address */
++ 		if (par->fb_ready && par->need_docopy)
++ 			hvfb_docopy(par, start, PAGE_SIZE);
++ 	}
++ 
++ 	if (par->fb_ready && par->update)
++ 		synthvid_update(p, 0, miny, p->var.xres, maxy + 1);
++ }
++ 
++ static struct fb_deferred_io synthvid_defio = {
++ 	.delay		= HZ / 20,
++ 	.deferred_io	= synthvid_deferred_io,
++ };
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  
+  /*
+   * Actions on received messages from host:
+@@@ -663,12 -738,70 +744,71 @@@ static void hvfb_update_work(struct wor
+  {
+  	struct hvfb_par *par = container_of(w, struct hvfb_par, dwork.work);
+  	struct fb_info *info = par->info;
+ -	unsigned long flags;
+ -	int x1, x2, y1, y2;
+ -	int j;
+  
+ -	spin_lock_irqsave(&par->delayed_refresh_lock, flags);
+ -	/* Reset the request flag */
+ -	par->delayed_refresh = false;
+ +	if (par->fb_ready)
+ +		synthvid_update(info);
+  
+++<<<<<<< HEAD
+ +	if (par->update)
+ +		schedule_delayed_work(&par->dwork, HVFB_UPDATE_DELAY);
+++=======
++ 	/* Store the dirty rectangle to local variables */
++ 	x1 = par->x1;
++ 	x2 = par->x2;
++ 	y1 = par->y1;
++ 	y2 = par->y2;
++ 
++ 	/* Clear dirty rectangle */
++ 	par->x1 = par->y1 = INT_MAX;
++ 	par->x2 = par->y2 = 0;
++ 
++ 	spin_unlock_irqrestore(&par->delayed_refresh_lock, flags);
++ 
++ 	if (x1 > info->var.xres || x2 > info->var.xres ||
++ 	    y1 > info->var.yres || y2 > info->var.yres || x2 <= x1)
++ 		return;
++ 
++ 	/* Copy the dirty rectangle to frame buffer memory */
++ 	if (par->need_docopy)
++ 		for (j = y1; j < y2; j++)
++ 			hvfb_docopy(par,
++ 				    j * info->fix.line_length +
++ 				    (x1 * screen_depth / 8),
++ 				    (x2 - x1) * screen_depth / 8);
++ 
++ 	/* Refresh */
++ 	if (par->fb_ready && par->update)
++ 		synthvid_update(info, x1, y1, x2, y2);
++ }
++ 
++ /*
++  * Control the on-demand refresh frequency. It schedules a delayed
++  * screen update if it has not yet.
++  */
++ static void hvfb_ondemand_refresh_throttle(struct hvfb_par *par,
++ 					   int x1, int y1, int w, int h)
++ {
++ 	unsigned long flags;
++ 	int x2 = x1 + w;
++ 	int y2 = y1 + h;
++ 
++ 	spin_lock_irqsave(&par->delayed_refresh_lock, flags);
++ 
++ 	/* Merge dirty rectangle */
++ 	par->x1 = min_t(int, par->x1, x1);
++ 	par->y1 = min_t(int, par->y1, y1);
++ 	par->x2 = max_t(int, par->x2, x2);
++ 	par->y2 = max_t(int, par->y2, y2);
++ 
++ 	/* Schedule a delayed screen update if not yet */
++ 	if (par->delayed_refresh == false) {
++ 		schedule_delayed_work(&par->dwork,
++ 				      HVFB_ONDEMAND_THROTTLE);
++ 		par->delayed_refresh = true;
++ 	}
++ 
++ 	spin_unlock_irqrestore(&par->delayed_refresh_lock, flags);
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  }
+  
+  static int hvfb_on_panic(struct notifier_block *nb,
+@@@ -680,7 -813,9 +820,13 @@@
+  	par = container_of(nb, struct hvfb_par, hvfb_panic_nb);
+  	par->synchronous_fb = true;
+  	info = par->info;
+++<<<<<<< HEAD
+ +	synthvid_update(info);
+++=======
++ 	if (par->need_docopy)
++ 		hvfb_docopy(par, 0, dio_fb_size);
++ 	synthvid_update(info, 0, 0, INT_MAX, INT_MAX);
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  
+  	return NOTIFY_DONE;
+  }
+@@@ -818,19 -1018,61 +1020,64 @@@ static int hvfb_getmem(struct hv_devic
+  	void __iomem *fb_virt;
+  	int gen2vm = efi_enabled(EFI_BOOT);
+  	resource_size_t pot_start, pot_end;
++ 	phys_addr_t paddr;
+  	int ret;
+  
+- 	if (gen2vm) {
+- 		pot_start = 0;
+- 		pot_end = -1;
+- 	} else {
+++<<<<<<< HEAD
+++=======
++ 	info->apertures = alloc_apertures(1);
++ 	if (!info->apertures)
++ 		return -ENOMEM;
++ 
++ 	if (!gen2vm) {
+  		pdev = pci_get_device(PCI_VENDOR_ID_MICROSOFT,
+- 			      PCI_DEVICE_ID_HYPERV_VIDEO, NULL);
++ 			PCI_DEVICE_ID_HYPERV_VIDEO, NULL);
+  		if (!pdev) {
+  			pr_err("Unable to find PCI Hyper-V video\n");
++ 			kfree(info->apertures);
+  			return -ENODEV;
+  		}
+  
++ 		info->apertures->ranges[0].base = pci_resource_start(pdev, 0);
++ 		info->apertures->ranges[0].size = pci_resource_len(pdev, 0);
++ 
++ 		/*
++ 		 * For Gen 1 VM, we can directly use the contiguous memory
++ 		 * from VM. If we succeed, deferred IO happens directly
++ 		 * on this allocated framebuffer memory, avoiding extra
++ 		 * memory copy.
++ 		 */
++ 		paddr = hvfb_get_phymem(hdev, screen_fb_size);
++ 		if (paddr != (phys_addr_t) -1) {
++ 			par->mmio_pp = paddr;
++ 			par->mmio_vp = par->dio_vp = __va(paddr);
++ 
++ 			info->fix.smem_start = paddr;
++ 			info->fix.smem_len = screen_fb_size;
++ 			info->screen_base = par->mmio_vp;
++ 			info->screen_size = screen_fb_size;
++ 
++ 			par->need_docopy = false;
++ 			goto getmem_done;
++ 		}
++ 		pr_info("Unable to allocate enough contiguous physical memory on Gen 1 VM. Using MMIO instead.\n");
++ 	} else {
++ 		info->apertures->ranges[0].base = screen_info.lfb_base;
++ 		info->apertures->ranges[0].size = screen_info.lfb_size;
++ 	}
++ 
++ 	/*
++ 	 * Cannot use the contiguous physical memory.
++ 	 * Allocate mmio space for framebuffer.
++ 	 */
++ 	dio_fb_size =
++ 		screen_width * screen_height * screen_depth / 8;
++ 
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
++ 	if (gen2vm) {
++ 		pot_start = 0;
++ 		pot_end = -1;
++ 	} else {
+  		if (!(pci_resource_flags(pdev, 0) & IORESOURCE_MEM) ||
+  		    pci_resource_len(pdev, 0) < screen_fb_size) {
+  			pr_err("Resource not available or (0x%lx < 0x%lx)\n",
+@@@ -854,27 -1096,27 +1101,43 @@@
+  	if (!fb_virt)
+  		goto err2;
+  
+++<<<<<<< HEAD
+ +	info->apertures = alloc_apertures(1);
+ +	if (!info->apertures)
+ +		goto err3;
+ +
+ +	if (gen2vm) {
+ +		info->apertures->ranges[0].base = screen_info.lfb_base;
+ +		info->apertures->ranges[0].size = screen_info.lfb_size;
+ +		remove_conflicting_framebuffers(info->apertures,
+ +						KBUILD_MODNAME, false);
+ +	} else {
+ +		info->apertures->ranges[0].base = pci_resource_start(pdev, 0);
+ +		info->apertures->ranges[0].size = pci_resource_len(pdev, 0);
+ +	}
+++=======
++ 	/* Allocate memory for deferred IO */
++ 	par->dio_vp = vzalloc(round_up(dio_fb_size, PAGE_SIZE));
++ 	if (par->dio_vp == NULL)
++ 		goto err3;
++ 
++ 	/* Physical address of FB device */
++ 	par->mmio_pp = par->mem->start;
++ 	/* Virtual address of FB device */
++ 	par->mmio_vp = (unsigned char *) fb_virt;
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  
+  	info->fix.smem_start = par->mem->start;
+ -	info->fix.smem_len = dio_fb_size;
+ -	info->screen_base = par->dio_vp;
+ -	info->screen_size = dio_fb_size;
+ +	info->fix.smem_len = screen_fb_size;
+ +	info->screen_base = fb_virt;
+ +	info->screen_size = screen_fb_size;
+  
++ getmem_done:
++ 	remove_conflicting_framebuffers(info->apertures,
++ 					KBUILD_MODNAME, false);
+  	if (!gen2vm)
+  		pci_dev_put(pdev);
++ 	kfree(info->apertures);
+  
+  	return 0;
+  
+@@@ -895,8 -1138,15 +1159,20 @@@ static void hvfb_putmem(struct hv_devic
+  {
+  	struct hvfb_par *par = info->par;
+  
+++<<<<<<< HEAD
+ +	iounmap(info->screen_base);
+ +	vmbus_free_mmio(par->mem->start, screen_fb_size);
+++=======
++ 	if (par->need_docopy) {
++ 		vfree(par->dio_vp);
++ 		iounmap(info->screen_base);
++ 		vmbus_free_mmio(par->mem->start, screen_fb_size);
++ 	} else {
++ 		hvfb_release_phymem(hdev, info->fix.smem_start,
++ 				    screen_fb_size);
++ 	}
++ 
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  	par->mem = NULL;
+  }
+  
+@@@ -992,7 -1250,8 +1269,12 @@@ static int hvfb_probe(struct hv_device 
+  	return 0;
+  
+  error:
+++<<<<<<< HEAD
+ +	hvfb_putmem(info);
+++=======
++ 	fb_deferred_io_cleanup(info);
++ 	hvfb_putmem(hdev, info);
+++>>>>>>> 3a6fb6c4255c (video: hyperv: hyperv_fb: Use physical memory for fb on HyperV Gen 1 VMs.)
+  error2:
+  	vmbus_close(hdev->channel);
+  error1:
+* Unmerged path drivers/video/fbdev/Kconfig
+* Unmerged path drivers/video/fbdev/hyperv_fb.c
