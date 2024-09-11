@@ -1,0 +1,148 @@
+mm/huge_memory.c: add missing read-only THP checking in transparent_hugepage_enabled()
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Miaohe Lin <linmiaohe@huawei.com>
+commit e6be37b2e7bddfe0c76585ee7c7eee5acc8efeab
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/e6be37b2.failed
+
+Since commit 99cb0dbd47a1 ("mm,thp: add read-only THP support for
+(non-shmem) FS"), read-only THP file mapping is supported.  But it forgot
+to add checking for it in transparent_hugepage_enabled().  To fix it, we
+add checking for read-only THP file mapping and also introduce helper
+transhuge_vma_enabled() to check whether thp is enabled for specified vma
+to reduce duplicated code.  We rename transparent_hugepage_enabled to
+transparent_hugepage_active to make the code easier to follow as suggested
+by David Hildenbrand.
+
+[linmiaohe@huawei.com: define transhuge_vma_enabled next to transhuge_vma_suitable]
+  Link: https://lkml.kernel.org/r/20210514093007.4117906-1-linmiaohe@huawei.com
+
+Link: https://lkml.kernel.org/r/20210511134857.1581273-4-linmiaohe@huawei.com
+Fixes: 99cb0dbd47a1 ("mm,thp: add read-only THP support for (non-shmem) FS")
+	Signed-off-by: Miaohe Lin <linmiaohe@huawei.com>
+	Reviewed-by: Yang Shi <shy828301@gmail.com>
+	Cc: Alexey Dobriyan <adobriyan@gmail.com>
+	Cc: "Aneesh Kumar K . V" <aneesh.kumar@linux.ibm.com>
+	Cc: Anshuman Khandual <anshuman.khandual@arm.com>
+	Cc: David Hildenbrand <david@redhat.com>
+	Cc: Hugh Dickins <hughd@google.com>
+	Cc: Johannes Weiner <hannes@cmpxchg.org>
+	Cc: Kirill A. Shutemov <kirill.shutemov@linux.intel.com>
+	Cc: Matthew Wilcox <willy@infradead.org>
+	Cc: Minchan Kim <minchan@kernel.org>
+	Cc: Ralph Campbell <rcampbell@nvidia.com>
+	Cc: Rik van Riel <riel@surriel.com>
+	Cc: Song Liu <songliubraving@fb.com>
+	Cc: William Kucharski <william.kucharski@oracle.com>
+	Cc: Zi Yan <ziy@nvidia.com>
+	Cc: Mike Kravetz <mike.kravetz@oracle.com>
+	Signed-off-by: Andrew Morton <akpm@linux-foundation.org>
+	Signed-off-by: Linus Torvalds <torvalds@linux-foundation.org>
+(cherry picked from commit e6be37b2e7bddfe0c76585ee7c7eee5acc8efeab)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/huge_mm.h
+diff --cc include/linux/huge_mm.h
+index c6a8a2783a9e,b4e1ebaae825..000000000000
+--- a/include/linux/huge_mm.h
++++ b/include/linux/huge_mm.h
+@@@ -132,13 -146,17 +157,21 @@@ static inline bool transhuge_vma_enable
+   */
+  static inline bool __transparent_hugepage_enabled(struct vm_area_struct *vma)
+  {
+++<<<<<<< HEAD
+ +	if (vma->vm_flags & VM_NOHUGEPAGE)
+++=======
++ 
++ 	/*
++ 	 * If the hardware/firmware marked hugepage support disabled.
++ 	 */
++ 	if (transparent_hugepage_flags & (1 << TRANSPARENT_HUGEPAGE_NEVER_DAX))
+  		return false;
+  
+- 	if (vma_is_temporary_stack(vma))
++ 	if (!transhuge_vma_enabled(vma, vma->vm_flags))
+++>>>>>>> e6be37b2e7bd (mm/huge_memory.c: add missing read-only THP checking in transparent_hugepage_enabled())
+  		return false;
+  
+- 	if (test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
++ 	if (vma_is_temporary_stack(vma))
+  		return false;
+  
+  	if (transparent_hugepage_flags & (1 << TRANSPARENT_HUGEPAGE_FLAG))
+diff --git a/fs/proc/task_mmu.c b/fs/proc/task_mmu.c
+index db7fc47ef2eb..3945b2d54401 100644
+--- a/fs/proc/task_mmu.c
++++ b/fs/proc/task_mmu.c
+@@ -808,7 +808,7 @@ static int show_smap(struct seq_file *m, void *v)
+ 	__show_smap(m, &mss);
+ 
+ 	seq_printf(m, "THPeligible:    %d\n",
+-		   transparent_hugepage_enabled(vma));
++		   transparent_hugepage_active(vma));
+ 
+ 	if (arch_pkeys_enabled())
+ 		seq_printf(m, "ProtectionKey:  %8u\n", vma_pkey(vma));
+* Unmerged path include/linux/huge_mm.h
+diff --git a/mm/huge_memory.c b/mm/huge_memory.c
+index 986de68481dc..3cc047c094cf 100644
+--- a/mm/huge_memory.c
++++ b/mm/huge_memory.c
+@@ -65,7 +65,14 @@ static atomic_t huge_zero_refcount;
+ struct page *huge_zero_page __read_mostly;
+ unsigned long huge_zero_pfn __read_mostly = ~0UL;
+ 
+-bool transparent_hugepage_enabled(struct vm_area_struct *vma)
++static inline bool file_thp_enabled(struct vm_area_struct *vma)
++{
++	return transhuge_vma_enabled(vma, vma->vm_flags) && vma->vm_file &&
++	       !inode_is_open_for_write(vma->vm_file->f_inode) &&
++	       (vma->vm_flags & VM_EXEC);
++}
++
++bool transparent_hugepage_active(struct vm_area_struct *vma)
+ {
+ 	/* The addr is used to check if the vma size fits */
+ 	unsigned long addr = (vma->vm_end & HPAGE_PMD_MASK) - HPAGE_PMD_SIZE;
+@@ -76,6 +83,8 @@ bool transparent_hugepage_enabled(struct vm_area_struct *vma)
+ 		return __transparent_hugepage_enabled(vma);
+ 	if (vma_is_shmem(vma))
+ 		return shmem_huge_enabled(vma);
++	if (IS_ENABLED(CONFIG_READ_ONLY_THP_FOR_FS))
++		return file_thp_enabled(vma);
+ 
+ 	return false;
+ }
+diff --git a/mm/khugepaged.c b/mm/khugepaged.c
+index ce8631ec548c..2faff72ad9ed 100644
+--- a/mm/khugepaged.c
++++ b/mm/khugepaged.c
+@@ -411,9 +411,7 @@ static inline int khugepaged_test_exit(struct mm_struct *mm)
+ static bool hugepage_vma_check(struct vm_area_struct *vma,
+ 			       unsigned long vm_flags)
+ {
+-	/* Explicitly disabled through madvise. */
+-	if ((vm_flags & VM_NOHUGEPAGE) ||
+-	    test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
++	if (!transhuge_vma_enabled(vma, vm_flags))
+ 		return false;
+ 
+ 	/* Enabled via shmem mount options or sysfs settings. */
+diff --git a/mm/shmem.c b/mm/shmem.c
+index 9dbf490f002e..95910fac8858 100644
+--- a/mm/shmem.c
++++ b/mm/shmem.c
+@@ -3961,8 +3961,7 @@ bool shmem_huge_enabled(struct vm_area_struct *vma)
+ 	loff_t i_size;
+ 	pgoff_t off;
+ 
+-	if ((vma->vm_flags & VM_NOHUGEPAGE) ||
+-	    test_bit(MMF_DISABLE_THP, &vma->vm_mm->flags))
++	if (!transhuge_vma_enabled(vma, vma->vm_flags))
+ 		return false;
+ 	if (shmem_huge == SHMEM_HUGE_FORCE)
+ 		return true;
