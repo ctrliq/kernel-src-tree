@@ -1,0 +1,405 @@
+net/mlx5e: Support multiple SKBs in a TX WQE
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Maxim Mikityanskiy <maximmi@mellanox.com>
+commit 338c46c636a790cb22f880435c8c60554c0d50fb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/338c46c6.failed
+
+TX MPWQE support for SKBs is coming in one of the following patches, and
+a single MPWQE can send multiple SKBs. This commit prepares the TX path
+code to handle such cases:
+
+1. An additional FIFO for SKBs is added, just like the FIFO for DMA
+chunks.
+
+2. struct mlx5e_tx_wqe_info will contain num_fifo_pkts. If a given WQE
+contains only one packet, num_fifo_pkts will be zero, and the SKB will
+be stored in mlx5e_tx_wqe_info, as usual. If num_fifo_pkts > 0, the SKB
+pointer will be NULL, and the SKBs will be stored in the FIFO.
+
+This change has no performance impact in TCP single stream test and
+XDP_TX single stream test.
+
+When compiled with a recent GCC, this change shows no visible
+performance impact on UDP pktgen (burst 32) single stream test either:
+  Packet rate: 16.95 Mpps (±0.15 Mpps) -> 16.96 Mpps (±0.12 Mpps)
+  Instructions per packet: 429 -> 421
+  Cycles per packet: 160 -> 156
+  Instructions per cycle: 2.69 -> 2.70
+
+CPU: Intel(R) Xeon(R) CPU E5-2680 v3 @ 2.50GHz (x86_64)
+NIC: Mellanox ConnectX-6 Dx
+GCC 10.2.0
+
+	Signed-off-by: Maxim Mikityanskiy <maximmi@mellanox.com>
+	Reviewed-by: Tariq Toukan <tariqt@mellanox.com>
+	Signed-off-by: Saeed Mahameed <saeedm@nvidia.com>
+(cherry picked from commit 338c46c636a790cb22f880435c8c60554c0d50fb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_txrx.h
+#	drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_txrx.h
+index 7ce6b1c41d9b,7521c9be735b..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_txrx.h
+@@@ -23,12 -29,24 +23,32 @@@ bool mlx5e_ktls_handle_tx_skb(struct tl
+  void mlx5e_ktls_tx_handle_resync_dump_comp(struct mlx5e_txqsq *sq,
+  					   struct mlx5e_tx_wqe_info *wi,
+  					   u32 *dma_fifo_cc);
+++<<<<<<< HEAD
+ +#else
+ +static inline void
+ +mlx5e_ktls_tx_handle_resync_dump_comp(struct mlx5e_txqsq *sq,
+ +				      struct mlx5e_tx_wqe_info *wi,
+ +				      u32 *dma_fifo_cc)
+++=======
++ static inline bool
++ mlx5e_ktls_tx_try_handle_resync_dump_comp(struct mlx5e_txqsq *sq,
++ 					  struct mlx5e_tx_wqe_info *wi,
++ 					  u32 *dma_fifo_cc)
+  {
++ 	if (unlikely(wi->resync_dump_frag_page)) {
++ 		mlx5e_ktls_tx_handle_resync_dump_comp(sq, wi, dma_fifo_cc);
++ 		return true;
++ 	}
++ 	return false;
++ }
++ #else
++ static inline bool
++ mlx5e_ktls_tx_try_handle_resync_dump_comp(struct mlx5e_txqsq *sq,
++ 					  struct mlx5e_tx_wqe_info *wi,
++ 					  u32 *dma_fifo_cc)
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
++ {
++ 	return false;
+  }
+  
+  #endif /* CONFIG_MLX5_EN_TLS */
+diff --cc drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+index d2c9bb371f27,857d1c0397d7..000000000000
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
+@@@ -267,13 -339,14 +267,18 @@@ mlx5e_txwqe_complete(struct mlx5e_txqs
+  
+  	*wi = (struct mlx5e_tx_wqe_info) {
+  		.skb = skb,
+ -		.num_bytes = attr->num_bytes,
+ +		.num_bytes = num_bytes,
+  		.num_dma = num_dma,
+++<<<<<<< HEAD
+ +		.num_wqebbs = num_wqebbs,
+++=======
++ 		.num_wqebbs = wqe_attr->num_wqebbs,
++ 		.num_fifo_pkts = 0,
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  	};
+  
+ -	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | attr->opcode);
+ -	cseg->qpn_ds           = cpu_to_be32((sq->sqn << 8) | wqe_attr->ds_cnt);
+ +	cseg->opmod_idx_opcode = cpu_to_be32((sq->pc << 8) | opcode);
+ +	cseg->qpn_ds           = cpu_to_be32((sq->sqn << 8) | ds_cnt);
+  
+  	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP))
+  		skb_shinfo(skb)->tx_flags |= SKBTX_IN_PROGRESS;
+@@@ -432,6 -449,59 +437,62 @@@ out
+  	return NETDEV_TX_OK;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ void mlx5e_sq_xmit_simple(struct mlx5e_txqsq *sq, struct sk_buff *skb, bool xmit_more)
++ {
++ 	struct mlx5e_tx_wqe_attr wqe_attr;
++ 	struct mlx5e_tx_attr attr;
++ 	struct mlx5e_tx_wqe *wqe;
++ 	u16 pi;
++ 
++ 	mlx5e_sq_xmit_prepare(sq, skb, NULL, &attr);
++ 	mlx5e_sq_calc_wqe_attr(skb, &attr, &wqe_attr);
++ 	pi = mlx5e_txqsq_get_next_pi(sq, wqe_attr.num_wqebbs);
++ 	wqe = MLX5E_TX_FETCH_WQE(sq, pi);
++ 	mlx5e_txwqe_build_eseg_csum(sq, skb, &wqe->eth);
++ 	mlx5e_sq_xmit_wqe(sq, skb, &attr, &wqe_attr, wqe, pi, xmit_more);
++ }
++ 
++ static void mlx5e_tx_wi_dma_unmap(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_info *wi,
++ 				  u32 *dma_fifo_cc)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < wi->num_dma; i++) {
++ 		struct mlx5e_sq_dma *dma = mlx5e_dma_get(sq, (*dma_fifo_cc)++);
++ 
++ 		mlx5e_tx_dma_unmap(sq->pdev, dma);
++ 	}
++ }
++ 
++ static void mlx5e_consume_skb(struct mlx5e_txqsq *sq, struct sk_buff *skb,
++ 			      struct mlx5_cqe64 *cqe, int napi_budget)
++ {
++ 	if (unlikely(skb_shinfo(skb)->tx_flags & SKBTX_HW_TSTAMP)) {
++ 		struct skb_shared_hwtstamps hwts = {};
++ 		u64 ts = get_cqe_ts(cqe);
++ 
++ 		hwts.hwtstamp = mlx5_timecounter_cyc2time(sq->clock, ts);
++ 		skb_tstamp_tx(skb, &hwts);
++ 	}
++ 
++ 	napi_consume_skb(skb, napi_budget);
++ }
++ 
++ static void mlx5e_tx_wi_consume_fifo_skbs(struct mlx5e_txqsq *sq, struct mlx5e_tx_wqe_info *wi,
++ 					  struct mlx5_cqe64 *cqe, int napi_budget)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < wi->num_fifo_pkts; i++) {
++ 		struct sk_buff *skb = mlx5e_skb_fifo_pop(sq);
++ 
++ 		mlx5e_consume_skb(sq, skb, cqe, napi_budget);
++ 	}
++ }
++ 
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  bool mlx5e_poll_tx_cq(struct mlx5e_cq *cq, int napi_budget)
+  {
+  	struct mlx5e_sq_stats *stats;
+@@@ -477,42 -547,33 +538,69 @@@
+  		wqe_counter = be16_to_cpu(cqe->wqe_counter);
+  
+  		do {
+++<<<<<<< HEAD
+ +			struct sk_buff *skb;
+ +			int j;
+ +
+++=======
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  			last_wqe = (sqcc == wqe_counter);
+  
+  			ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
+  			wi = &sq->db.wqe_info[ci];
+- 			skb = wi->skb;
+  
+++<<<<<<< HEAD
+ +			if (unlikely(!skb)) {
+ +				mlx5e_ktls_tx_handle_resync_dump_comp(sq, wi, &dma_fifo_cc);
+ +				sqcc += wi->num_wqebbs;
+ +				continue;
+ +			}
+ +
+ +			if (unlikely(skb_shinfo(skb)->tx_flags &
+ +				     SKBTX_HW_TSTAMP)) {
+ +				struct skb_shared_hwtstamps hwts = {};
+ +
+ +				hwts.hwtstamp =
+ +					mlx5_timecounter_cyc2time(sq->clock,
+ +								  get_cqe_ts(cqe));
+ +				skb_tstamp_tx(skb, &hwts);
+ +			}
+ +
+ +			for (j = 0; j < wi->num_dma; j++) {
+ +				struct mlx5e_sq_dma *dma =
+ +					mlx5e_dma_get(sq, dma_fifo_cc++);
+ +
+ +				mlx5e_tx_dma_unmap(sq->pdev, dma);
+ +			}
+ +
+ +			npkts++;
+ +			nbytes += wi->num_bytes;
+ +			sqcc += wi->num_wqebbs;
+ +			napi_consume_skb(skb, napi_budget);
+++=======
++ 			sqcc += wi->num_wqebbs;
++ 
++ 			if (likely(wi->skb)) {
++ 				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
++ 				mlx5e_consume_skb(sq, wi->skb, cqe, napi_budget);
++ 
++ 				npkts++;
++ 				nbytes += wi->num_bytes;
++ 				continue;
++ 			}
++ 
++ 			if (unlikely(mlx5e_ktls_tx_try_handle_resync_dump_comp(sq, wi,
++ 									       &dma_fifo_cc)))
++ 				continue;
++ 
++ 			if (wi->num_fifo_pkts) {
++ 				mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
++ 				mlx5e_tx_wi_consume_fifo_skbs(sq, wi, cqe, napi_budget);
++ 
++ 				npkts += wi->num_fifo_pkts;
++ 				nbytes += wi->num_bytes;
++ 			}
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  		} while (!last_wqe);
+  
+  		if (unlikely(get_cqe_opcode(cqe) == MLX5_CQE_REQ_ERR)) {
+@@@ -556,8 -625,6 +652,11 @@@ void mlx5e_free_txqsq_descs(struct mlx5
+  	struct mlx5e_tx_wqe_info *wi;
+  	u32 dma_fifo_cc, nbytes = 0;
+  	u16 ci, sqcc, npkts = 0;
+++<<<<<<< HEAD
+ +	struct sk_buff *skb;
+ +	int i;
+++=======
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  
+  	sqcc = sq->cc;
+  	dma_fifo_cc = sq->dma_fifo_cc;
+@@@ -565,25 -632,28 +664,48 @@@
+  	while (sqcc != sq->pc) {
+  		ci = mlx5_wq_cyc_ctr2ix(&sq->wq, sqcc);
+  		wi = &sq->db.wqe_info[ci];
+- 		skb = wi->skb;
+  
+++<<<<<<< HEAD
+ +		if (!skb) {
+ +			mlx5e_ktls_tx_handle_resync_dump_comp(sq, wi, &dma_fifo_cc);
+ +			sqcc += wi->num_wqebbs;
+ +			continue;
+ +		}
+ +
+ +		for (i = 0; i < wi->num_dma; i++) {
+ +			struct mlx5e_sq_dma *dma =
+ +				mlx5e_dma_get(sq, dma_fifo_cc++);
+ +
+ +			mlx5e_tx_dma_unmap(sq->pdev, dma);
+ +		}
+ +
+ +		dev_kfree_skb_any(skb);
+ +		npkts++;
+ +		nbytes += wi->num_bytes;
+ +		sqcc += wi->num_wqebbs;
+++=======
++ 		sqcc += wi->num_wqebbs;
++ 
++ 		if (likely(wi->skb)) {
++ 			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
++ 			dev_kfree_skb_any(wi->skb);
++ 
++ 			npkts++;
++ 			nbytes += wi->num_bytes;
++ 			continue;
++ 		}
++ 
++ 		if (unlikely(mlx5e_ktls_tx_try_handle_resync_dump_comp(sq, wi, &dma_fifo_cc)))
++ 			continue;
++ 
++ 		if (wi->num_fifo_pkts) {
++ 			mlx5e_tx_wi_dma_unmap(sq, wi, &dma_fifo_cc);
++ 			mlx5e_tx_wi_kfree_fifo_skbs(sq, wi);
++ 
++ 			npkts += wi->num_fifo_pkts;
++ 			nbytes += wi->num_bytes;
++ 		}
+++>>>>>>> 338c46c636a7 (net/mlx5e: Support multiple SKBs in a TX WQE)
+  	}
+  
+  	sq->dma_fifo_cc = dma_fifo_cc;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en.h b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+index 7220dce1dd10..2e5eb6c3c1c8 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en.h
+@@ -321,11 +321,13 @@ struct mlx5e_txqsq {
+ 
+ 	/* dirtied @completion */
+ 	u16                        cc;
++	u16                        skb_fifo_cc;
+ 	u32                        dma_fifo_cc;
+ 	struct dim                 dim; /* Adaptive Moderation */
+ 
+ 	/* dirtied @xmit */
+ 	u16                        pc ____cacheline_aligned_in_smp;
++	u16                        skb_fifo_pc;
+ 	u32                        dma_fifo_pc;
+ 
+ 	struct mlx5e_cq            cq;
+@@ -333,9 +335,11 @@ struct mlx5e_txqsq {
+ 	/* read only */
+ 	struct mlx5_wq_cyc         wq;
+ 	u32                        dma_fifo_mask;
++	u16                        skb_fifo_mask;
+ 	struct mlx5e_sq_stats     *stats;
+ 	struct {
+ 		struct mlx5e_sq_dma       *dma_fifo;
++		struct sk_buff           **skb_fifo;
+ 		struct mlx5e_tx_wqe_info  *wqe_info;
+ 	} db;
+ 	void __iomem              *uar_map;
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+index 5bd77669337b..f0cb93e1b239 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/txrx.h
+@@ -67,6 +67,7 @@ struct mlx5e_tx_wqe_info {
+ 	u32 num_bytes;
+ 	u8 num_wqebbs;
+ 	u8 num_dma;
++	u8 num_fifo_pkts;
+ #ifdef CONFIG_MLX5_EN_TLS
+ 	struct page *resync_dump_frag_page;
+ #endif
+@@ -200,6 +201,23 @@ mlx5e_dma_push(struct mlx5e_txqsq *sq, dma_addr_t addr, u32 size,
+ 	dma->type = map_type;
+ }
+ 
++static inline struct sk_buff **mlx5e_skb_fifo_get(struct mlx5e_txqsq *sq, u16 i)
++{
++	return &sq->db.skb_fifo[i & sq->skb_fifo_mask];
++}
++
++static inline void mlx5e_skb_fifo_push(struct mlx5e_txqsq *sq, struct sk_buff *skb)
++{
++	struct sk_buff **skb_item = mlx5e_skb_fifo_get(sq, sq->skb_fifo_pc++);
++
++	*skb_item = skb;
++}
++
++static inline struct sk_buff *mlx5e_skb_fifo_pop(struct mlx5e_txqsq *sq)
++{
++	return *mlx5e_skb_fifo_get(sq, sq->skb_fifo_cc++);
++}
++
+ static inline void
+ mlx5e_tx_dma_unmap(struct device *pdev, struct mlx5e_sq_dma *dma)
+ {
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_accel/ktls_txrx.h
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+index aeed9d29de5b..e79444b98888 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en_main.c
+@@ -1145,6 +1145,7 @@ static void mlx5e_free_icosq(struct mlx5e_icosq *sq)
+ static void mlx5e_free_txqsq_db(struct mlx5e_txqsq *sq)
+ {
+ 	kvfree(sq->db.wqe_info);
++	kvfree(sq->db.skb_fifo);
+ 	kvfree(sq->db.dma_fifo);
+ }
+ 
+@@ -1156,15 +1157,19 @@ static int mlx5e_alloc_txqsq_db(struct mlx5e_txqsq *sq, int numa)
+ 	sq->db.dma_fifo = kvzalloc_node(array_size(df_sz,
+ 						   sizeof(*sq->db.dma_fifo)),
+ 					GFP_KERNEL, numa);
++	sq->db.skb_fifo = kvzalloc_node(array_size(df_sz,
++						   sizeof(*sq->db.skb_fifo)),
++					GFP_KERNEL, numa);
+ 	sq->db.wqe_info = kvzalloc_node(array_size(wq_sz,
+ 						   sizeof(*sq->db.wqe_info)),
+ 					GFP_KERNEL, numa);
+-	if (!sq->db.dma_fifo || !sq->db.wqe_info) {
++	if (!sq->db.dma_fifo || !sq->db.skb_fifo || !sq->db.wqe_info) {
+ 		mlx5e_free_txqsq_db(sq);
+ 		return -ENOMEM;
+ 	}
+ 
+ 	sq->dma_fifo_mask = df_sz - 1;
++	sq->skb_fifo_mask = df_sz - 1;
+ 
+ 	return 0;
+ }
+* Unmerged path drivers/net/ethernet/mellanox/mlx5/core/en_tx.c
