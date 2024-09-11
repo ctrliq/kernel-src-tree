@@ -1,0 +1,156 @@
+KVM: x86: SVM: Prevent MSR passthrough when MSR access is denied
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+commit-author Alexander Graf <graf@amazon.com>
+commit fd6fa73d13377f2bff6ed668c99ca76adcda1336
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/fd6fa73d.failed
+
+We will introduce the concept of MSRs that may not be handled in kernel
+space soon. Some MSRs are directly passed through to the guest, effectively
+making them handled by KVM from user space's point of view.
+
+This patch introduces all logic required to ensure that MSRs that
+user space wants trapped are not marked as direct access for guests.
+
+	Signed-off-by: Alexander Graf <graf@amazon.com>
+Message-Id: <20200925143422.21718-6-graf@amazon.com>
+[Make terminology a bit more similar to VMX. - Paolo]
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit fd6fa73d13377f2bff6ed668c99ca76adcda1336)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/svm/svm.c
+#	arch/x86/kvm/svm/svm.h
+diff --cc arch/x86/kvm/svm/svm.c
+index 5c26e59bd26e,4f401fc6a05d..000000000000
+--- a/arch/x86/kvm/svm/svm.c
++++ b/arch/x86/kvm/svm/svm.c
+@@@ -553,18 -553,44 +553,44 @@@ free_cpu_data
+  
+  }
+  
+- static bool valid_msr_intercept(u32 index)
++ static int direct_access_msr_slot(u32 msr)
+  {
+- 	int i;
++ 	u32 i;
+  
+  	for (i = 0; direct_access_msrs[i].index != MSR_INVALID; i++)
+- 		if (direct_access_msrs[i].index == index)
+- 			return true;
++ 		if (direct_access_msrs[i].index == msr)
++ 			return i;
+  
+- 	return false;
++ 	return -ENOENT;
++ }
++ 
++ static void set_shadow_msr_intercept(struct kvm_vcpu *vcpu, u32 msr, int read,
++ 				     int write)
++ {
++ 	struct vcpu_svm *svm = to_svm(vcpu);
++ 	int slot = direct_access_msr_slot(msr);
++ 
++ 	if (slot == -ENOENT)
++ 		return;
++ 
++ 	/* Set the shadow bitmaps to the desired intercept states */
++ 	if (read)
++ 		set_bit(slot, svm->shadow_msr_intercept.read);
++ 	else
++ 		clear_bit(slot, svm->shadow_msr_intercept.read);
++ 
++ 	if (write)
++ 		set_bit(slot, svm->shadow_msr_intercept.write);
++ 	else
++ 		clear_bit(slot, svm->shadow_msr_intercept.write);
++ }
++ 
++ static bool valid_msr_intercept(u32 index)
++ {
++ 	return direct_access_msr_slot(index) != -ENOENT;
+  }
+  
+ -static bool msr_write_intercepted(struct kvm_vcpu *vcpu, u32 msr)
+ +static bool msr_write_intercepted(struct kvm_vcpu *vcpu, unsigned msr)
+  {
+  	u8 bit_write;
+  	unsigned long tmp;
+@@@ -583,8 -609,8 +609,13 @@@
+  	return !!test_bit(bit_write,  &tmp);
+  }
+  
+++<<<<<<< HEAD
+ +static void set_msr_interception(u32 *msrpm, unsigned msr,
+ +				 int read, int write)
+++=======
++ static void set_msr_interception_bitmap(struct kvm_vcpu *vcpu, u32 *msrpm,
++ 					u32 msr, int read, int write)
+++>>>>>>> fd6fa73d1337 (KVM: x86: SVM: Prevent MSR passthrough when MSR access is denied)
+  {
+  	u8 bit_read, bit_write;
+  	unsigned long tmp;
+@@@ -609,11 -642,17 +647,22 @@@
+  	msrpm[offset] = tmp;
+  }
+  
+++<<<<<<< HEAD
+ +static u32 *svm_vcpu_init_msrpm(void)
+++=======
++ static void set_msr_interception(struct kvm_vcpu *vcpu, u32 *msrpm, u32 msr,
++ 				 int read, int write)
++ {
++ 	set_shadow_msr_intercept(vcpu, msr, read, write);
++ 	set_msr_interception_bitmap(vcpu, msrpm, msr, read, write);
++ }
++ 
++ static u32 *svm_vcpu_alloc_msrpm(void)
+++>>>>>>> fd6fa73d1337 (KVM: x86: SVM: Prevent MSR passthrough when MSR access is denied)
+  {
+ -	struct page *pages = alloc_pages(GFP_KERNEL_ACCOUNT, MSRPM_ALLOC_ORDER);
+ +	int i;
+  	u32 *msrpm;
+ +	struct page *pages = alloc_pages(GFP_KERNEL_ACCOUNT, MSRPM_ALLOC_ORDER);
+  
+  	if (!pages)
+  		return NULL;
+@@@ -4169,9 -4278,11 +4237,11 @@@ static struct kvm_x86_ops svm_x86_ops _
+  	.mem_enc_reg_region = svm_register_enc_region,
+  	.mem_enc_unreg_region = svm_unregister_enc_region,
+  
+ -	.can_emulate_instruction = svm_can_emulate_instruction,
+ +	.need_emulation_on_page_fault = svm_need_emulation_on_page_fault,
+  
+  	.apic_init_signal_blocked = svm_apic_init_signal_blocked,
++ 
++ 	.msr_filter_changed = svm_msr_filter_changed,
+  };
+  
+  static struct kvm_x86_init_ops svm_init_ops __initdata = {
+diff --cc arch/x86/kvm/svm/svm.h
+index 7e2440454c08,a7f997459b87..000000000000
+--- a/arch/x86/kvm/svm/svm.h
++++ b/arch/x86/kvm/svm/svm.h
+@@@ -159,8 -159,11 +160,16 @@@ struct vcpu_svm 
+  	struct list_head ir_list;
+  	spinlock_t ir_list_lock;
+  
+++<<<<<<< HEAD
+ +	/* which host CPU was used for running this vcpu */
+ +	unsigned int last_cpu;
+++=======
++ 	/* Save desired MSR intercept (read: pass-through) state */
++ 	struct {
++ 		DECLARE_BITMAP(read, MAX_DIRECT_ACCESS_MSRS);
++ 		DECLARE_BITMAP(write, MAX_DIRECT_ACCESS_MSRS);
++ 	} shadow_msr_intercept;
+++>>>>>>> fd6fa73d1337 (KVM: x86: SVM: Prevent MSR passthrough when MSR access is denied)
+  };
+  
+  struct svm_cpu_data {
+* Unmerged path arch/x86/kvm/svm/svm.c
+* Unmerged path arch/x86/kvm/svm/svm.h
