@@ -1,0 +1,350 @@
+block: Remove partition support for zoned block devices
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Damien Le Moal <damien.lemoal@wdc.com>
+commit 5eac3eb30c9ab9ee7fe2bd9aa9db6373cabb77f8
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/5eac3eb3.failed
+
+No known partitioning tool supports zoned block devices, especially the
+host managed flavor with strong sequential write constraints.
+Furthermore, there are also no known user nor use cases for partitioned
+zoned block devices.
+
+This patch removes partition device creation for zoned block devices,
+which allows simplifying the processing of zone commands for zoned
+block devices. A warning is added if a partition table is found on the
+device.
+
+For report zones operations no zone sector information remapping is
+necessary anymore, simplifying the code. Of note is that remapping of
+zone reports for DM targets is still necessary as done by
+dm_remap_zone_report().
+
+Similarly, remaping of a zone reset bio is not necessary anymore.
+Testing for the applicability of the zone reset all request also becomes
+simpler and only needs to check that the number of sectors of the
+requested zone range is equal to the disk capacity.
+
+	Reviewed-by: Hannes Reinecke <hare@suse.de>
+	Reviewed-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Damien Le Moal <damien.lemoal@wdc.com>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit 5eac3eb30c9ab9ee7fe2bd9aa9db6373cabb77f8)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-core.c
+#	block/blk-zoned.c
+diff --cc block/blk-core.c
+index aa9f6fb360f4,a1e228752083..000000000000
+--- a/block/blk-core.c
++++ b/block/blk-core.c
+@@@ -838,11 -851,7 +838,15 @@@ static inline int blk_partition_remap(s
+  	if (unlikely(bio_check_ro(bio, p)))
+  		goto out;
+  
+++<<<<<<< HEAD
+ +	/*
+ +	 * Zone reset does not include bi_size so bio_sectors() is always 0.
+ +	 * Include a test for the reset op code and perform the remap if needed.
+ +	 */
+ +	if (bio_sectors(bio) || bio_op(bio) == REQ_OP_ZONE_RESET) {
+++=======
++ 	if (bio_sectors(bio)) {
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  		if (bio_check_eod(bio, part_nr_sects_read(p)))
+  			goto out;
+  		bio->bi_iter.bi_sector += p->start_sect;
+diff --cc block/blk-zoned.c
+index 023c295c4f36,ae665e490858..000000000000
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@@ -93,55 -97,6 +93,58 @@@ unsigned int blkdev_nr_zones(struct blo
+  }
+  EXPORT_SYMBOL_GPL(blkdev_nr_zones);
+  
+++<<<<<<< HEAD
+ +/*
+ + * Check that a zone report belongs to this partition, and if yes, fix its start
+ + * sector and write pointer and return true. Return false otherwise.
+ + */
+ +static bool blkdev_report_zone(struct block_device *bdev, struct blk_zone *rep)
+ +{
+ +	sector_t offset = get_start_sect(bdev);
+ +
+ +	if (rep->start < offset)
+ +		return false;
+ +
+ +	rep->start -= offset;
+ +	if (rep->start + rep->len > bdev->bd_part->nr_sects)
+ +		return false;
+ +
+ +	if (rep->type == BLK_ZONE_TYPE_CONVENTIONAL)
+ +		rep->wp = rep->start + rep->len;
+ +	else
+ +		rep->wp -= offset;
+ +	return true;
+ +}
+ +
+ +static int blk_report_zones(struct gendisk *disk, sector_t sector,
+ +			    struct blk_zone *zones, unsigned int *nr_zones,
+ +			    gfp_t gfp_mask)
+ +{
+ +	struct request_queue *q = disk->queue;
+ +	unsigned int z = 0, n, nrz = *nr_zones;
+ +	sector_t capacity = get_capacity(disk);
+ +	int ret;
+ +
+ +	while (z < nrz && sector < capacity) {
+ +		n = nrz - z;
+ +		ret = disk->fops->report_zones(disk, sector, &zones[z], &n,
+ +					       gfp_mask);
+ +		if (ret)
+ +			return ret;
+ +		if (!n)
+ +			break;
+ +		sector += blk_queue_zone_sectors(q) * n;
+ +		z += n;
+ +	}
+ +
+ +	WARN_ON(z > *nr_zones);
+ +	*nr_zones = z;
+ +
+ +	return 0;
+ +}
+ +
+++=======
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  /**
+   * blkdev_report_zones - Get zones information
+   * @bdev:	Target block device
+@@@ -155,14 -109,16 +158,19 @@@
+   *    The number of zone information reported may be less than the number
+   *    requested by @nr_zones. The number of zones actually reported is
+   *    returned in @nr_zones.
+ - *    The caller must use memalloc_noXX_save/restore() calls to control
+ - *    memory allocations done within this function (zone array and command
+ - *    buffer allocation by the device driver).
+   */
+  int blkdev_report_zones(struct block_device *bdev, sector_t sector,
+ -			struct blk_zone *zones, unsigned int *nr_zones)
+ +			struct blk_zone *zones, unsigned int *nr_zones,
+ +			gfp_t gfp_mask)
+  {
+  	struct request_queue *q = bdev_get_queue(bdev);
+++<<<<<<< HEAD
+ +	unsigned int i, nrz;
+ +	int ret;
+++=======
++ 	struct gendisk *disk = bdev->bd_disk;
++ 	sector_t capacity = get_capacity(disk);
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  
+  	if (!blk_queue_is_zoned(q))
+  		return -EOPNOTSUPP;
+@@@ -172,30 -128,17 +180,26 @@@
+  	 * report_zones method. If it does not have one defined, the device
+  	 * driver has a bug. So warn about that.
+  	 */
+ -	if (WARN_ON_ONCE(!disk->fops->report_zones))
+ +	if (WARN_ON_ONCE(!bdev->bd_disk->fops->report_zones))
+  		return -EOPNOTSUPP;
+  
+- 	if (!*nr_zones || sector >= bdev->bd_part->nr_sects) {
++ 	if (!*nr_zones || sector >= capacity) {
+  		*nr_zones = 0;
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	nrz = min(*nr_zones,
+ +		  __blkdev_nr_zones(q, bdev->bd_part->nr_sects - sector));
+ +	ret = blk_report_zones(bdev->bd_disk, get_start_sect(bdev) + sector,
+ +			       zones, &nrz, gfp_mask);
+ +	if (ret)
+ +		return ret;
+++=======
++ 	*nr_zones = min(*nr_zones, __blkdev_nr_zones(q, capacity - sector));
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  
+- 	for (i = 0; i < nrz; i++) {
+- 		if (!blkdev_report_zone(bdev, zones))
+- 			break;
+- 		zones++;
+- 	}
+- 
+- 	*nr_zones = i;
+- 
+- 	return 0;
++ 	return disk->fops->report_zones(disk, sector, zones, nr_zones);
+  }
+  EXPORT_SYMBOL_GPL(blkdev_report_zones);
+  
+@@@ -225,16 -166,19 +225,21 @@@ static inline bool blkdev_allow_reset_a
+   * @gfp_mask:	Memory allocation flags (for bio_alloc)
+   *
+   * Description:
+ - *    Perform the specified operation on the range of zones specified by
+ + *    Reset the write pointer of the zones contained in the range
+   *    @sector..@sector+@nr_sectors. Specifying the entire disk sector range
+   *    is valid, but the specified range should not contain conventional zones.
+ - *    The operation to execute on each zone can be a zone reset, open, close
+ - *    or finish request.
+   */
+ -int blkdev_zone_mgmt(struct block_device *bdev, enum req_opf op,
+ -		     sector_t sector, sector_t nr_sectors,
+ -		     gfp_t gfp_mask)
+ +int blkdev_reset_zones(struct block_device *bdev,
+ +		       sector_t sector, sector_t nr_sectors,
+ +		       gfp_t gfp_mask)
+  {
+  	struct request_queue *q = bdev_get_queue(bdev);
+++<<<<<<< HEAD
+ +	sector_t zone_sectors;
+++=======
++ 	sector_t zone_sectors = blk_queue_zone_sectors(q);
++ 	sector_t capacity = get_capacity(bdev->bd_disk);
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  	sector_t end_sector = sector + nr_sectors;
+  	struct bio *bio = NULL;
+  	int ret;
+@@@ -245,7 -189,10 +250,14 @@@
+  	if (bdev_read_only(bdev))
+  		return -EPERM;
+  
+++<<<<<<< HEAD
+ +	if (!nr_sectors || end_sector > bdev->bd_part->nr_sects)
+++=======
++ 	if (!op_is_zone_mgmt(op))
++ 		return -EOPNOTSUPP;
++ 
++ 	if (!nr_sectors || end_sector > capacity)
+++>>>>>>> 5eac3eb30c9a (block: Remove partition support for zoned block devices)
+  		/* Out of range */
+  		return -EINVAL;
+  
+* Unmerged path block/blk-core.c
+* Unmerged path block/blk-zoned.c
+diff --git a/block/partition-generic.c b/block/partition-generic.c
+index aee643ce13d1..31bff3fb28af 100644
+--- a/block/partition-generic.c
++++ b/block/partition-generic.c
+@@ -459,56 +459,6 @@ static int drop_partitions(struct gendisk *disk, struct block_device *bdev)
+ 	return 0;
+ }
+ 
+-static bool part_zone_aligned(struct gendisk *disk,
+-			      struct block_device *bdev,
+-			      sector_t from, sector_t size)
+-{
+-	unsigned int zone_sectors = bdev_zone_sectors(bdev);
+-
+-	/*
+-	 * If this function is called, then the disk is a zoned block device
+-	 * (host-aware or host-managed). This can be detected even if the
+-	 * zoned block device support is disabled (CONFIG_BLK_DEV_ZONED not
+-	 * set). In this case, however, only host-aware devices will be seen
+-	 * as a block device is not created for host-managed devices. Without
+-	 * zoned block device support, host-aware drives can still be used as
+-	 * regular block devices (no zone operation) and their zone size will
+-	 * be reported as 0. Allow this case.
+-	 */
+-	if (!zone_sectors)
+-		return true;
+-
+-	/*
+-	 * Check partition start and size alignement. If the drive has a
+-	 * smaller last runt zone, ignore it and allow the partition to
+-	 * use it. Check the zone size too: it should be a power of 2 number
+-	 * of sectors.
+-	 */
+-	if (WARN_ON_ONCE(!is_power_of_2(zone_sectors))) {
+-		u32 rem;
+-
+-		div_u64_rem(from, zone_sectors, &rem);
+-		if (rem)
+-			return false;
+-		if ((from + size) < get_capacity(disk)) {
+-			div_u64_rem(size, zone_sectors, &rem);
+-			if (rem)
+-				return false;
+-		}
+-
+-	} else {
+-
+-		if (from & (zone_sectors - 1))
+-			return false;
+-		if ((from + size) < get_capacity(disk) &&
+-		    (size & (zone_sectors - 1)))
+-			return false;
+-
+-	}
+-
+-	return true;
+-}
+-
+ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+ {
+ 	struct parsed_partitions *state = NULL;
+@@ -544,6 +494,14 @@ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+ 		}
+ 		return -EIO;
+ 	}
++
++	/* Partitions are not supported on zoned block devices */
++	if (bdev_is_zoned(bdev)) {
++		pr_warn("%s: ignoring partition table on zoned block device\n",
++			disk->disk_name);
++		goto out;
++	}
++
+ 	/*
+ 	 * If any partition code tried to read beyond EOD, try
+ 	 * unlocking native capacity even if partition table is
+@@ -607,21 +565,6 @@ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+ 			}
+ 		}
+ 
+-		/*
+-		 * On a zoned block device, partitions should be aligned on the
+-		 * device zone size (i.e. zone boundary crossing not allowed).
+-		 * Otherwise, resetting the write pointer of the last zone of
+-		 * one partition may impact the following partition.
+-		 */
+-		if (bdev_is_zoned(bdev) &&
+-		    !part_zone_aligned(disk, bdev, from, size)) {
+-			printk(KERN_WARNING
+-			       "%s: p%d start %llu+%llu is not zone aligned\n",
+-			       disk->disk_name, p, (unsigned long long) from,
+-			       (unsigned long long) size);
+-			continue;
+-		}
+-
+ 		part = add_partition(disk, p, from, size,
+ 				     state->parts[p].flags,
+ 				     &state->parts[p].info);
+@@ -635,6 +578,7 @@ int rescan_partitions(struct gendisk *disk, struct block_device *bdev)
+ 			md_autodetect_dev(part_to_dev(part)->devt);
+ #endif
+ 	}
++out:
+ 	free_partitions(state);
+ 	return 0;
+ }
+diff --git a/drivers/md/dm.c b/drivers/md/dm.c
+index 37a4e35680f7..de5ebbbef60d 100644
+--- a/drivers/md/dm.c
++++ b/drivers/md/dm.c
+@@ -1219,9 +1219,6 @@ EXPORT_SYMBOL_GPL(dm_accept_partial_bio);
+  * The zone descriptors obtained with a zone report indicate
+  * zone positions within the underlying device of the target. The zone
+  * descriptors must be remapped to match their position within the dm device.
+- * The caller target should obtain the zones information using
+- * blkdev_report_zones() to ensure that remapping for partition offset is
+- * already handled.
+  */
+ void dm_remap_zone_report(struct dm_target *ti, sector_t start,
+ 			  struct blk_zone *zones, unsigned int *nr_zones)
