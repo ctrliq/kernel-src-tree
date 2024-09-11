@@ -1,0 +1,153 @@
+powerpc/kvm/book3s: Use kvm helpers to walk shadow or secondary table
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [powerpc] kvm/book3s: Use kvm helpers to walk shadow or secondary table (Greg Kurz) [1748772]
+Rebuild_FUZZ: 93.85%
+commit-author Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+commit 6cdf30375f82fbc1d30252096440265426c0993c
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/6cdf3037.failed
+
+update kvmppc_hv_handle_set_rc to use find_kvm_nested_guest_pte and
+find_kvm_secondary_pte
+
+	Signed-off-by: Aneesh Kumar K.V <aneesh.kumar@linux.ibm.com>
+	Signed-off-by: Michael Ellerman <mpe@ellerman.id.au>
+Link: https://lore.kernel.org/r/20200505071729.54912-12-aneesh.kumar@linux.ibm.com
+(cherry picked from commit 6cdf30375f82fbc1d30252096440265426c0993c)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/powerpc/include/asm/kvm_book3s_64.h
+diff --cc arch/powerpc/include/asm/kvm_book3s_64.h
+index 21b1ed5df888,2860521992b6..000000000000
+--- a/arch/powerpc/include/asm/kvm_book3s_64.h
++++ b/arch/powerpc/include/asm/kvm_book3s_64.h
+@@@ -645,6 -635,21 +645,24 @@@ extern void kvmhv_remove_nest_rmap_rang
+  				unsigned long gpa, unsigned long hpa,
+  				unsigned long nbytes);
+  
+++<<<<<<< HEAD
+++=======
++ static inline pte_t *find_kvm_secondary_pte(struct kvm *kvm, unsigned long ea,
++ 					    unsigned *hshift)
++ {
++ 	pte_t *pte;
++ 
++ 	VM_WARN(!spin_is_locked(&kvm->mmu_lock),
++ 		"%s called with kvm mmu_lock not held \n", __func__);
++ 	pte = __find_linux_pte(kvm->arch.pgtable, ea, NULL, hshift);
++ 
++ 	return pte;
++ }
++ 
++ extern pte_t *find_kvm_nested_guest_pte(struct kvm *kvm, unsigned long lpid,
++ 					unsigned long ea, unsigned *hshift);
++ 
+++>>>>>>> 6cdf30375f82 (powerpc/kvm/book3s: Use kvm helpers to walk shadow or secondary table)
+  #endif /* CONFIG_KVM_BOOK3S_HV_POSSIBLE */
+  
+  #endif /* __ASM_KVM_BOOK3S_64_H__ */
+diff --git a/arch/powerpc/include/asm/kvm_book3s.h b/arch/powerpc/include/asm/kvm_book3s.h
+index 38f1b879f569..25b3a9375621 100644
+--- a/arch/powerpc/include/asm/kvm_book3s.h
++++ b/arch/powerpc/include/asm/kvm_book3s.h
+@@ -209,7 +209,7 @@ extern void kvmppc_unmap_pte(struct kvm *kvm, pte_t *pte, unsigned long gpa,
+ 			unsigned int shift,
+ 			const struct kvm_memory_slot *memslot,
+ 			unsigned int lpid);
+-extern bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable,
++extern bool kvmppc_hv_handle_set_rc(struct kvm *kvm, bool nested,
+ 				    bool writing, unsigned long gpa,
+ 				    unsigned int lpid);
+ extern int kvmppc_book3s_instantiate_page(struct kvm_vcpu *vcpu,
+* Unmerged path arch/powerpc/include/asm/kvm_book3s_64.h
+diff --git a/arch/powerpc/kvm/book3s_64_mmu_radix.c b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+index d8281fb29d25..0dceae3c9d50 100644
+--- a/arch/powerpc/kvm/book3s_64_mmu_radix.c
++++ b/arch/powerpc/kvm/book3s_64_mmu_radix.c
+@@ -746,7 +746,7 @@ int kvmppc_create_pte(struct kvm *kvm, pgd_t *pgtable, pte_t pte,
+ 	return ret;
+ }
+ 
+-bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable, bool writing,
++bool kvmppc_hv_handle_set_rc(struct kvm *kvm, bool nested, bool writing,
+ 			     unsigned long gpa, unsigned int lpid)
+ {
+ 	unsigned long pgflags;
+@@ -761,12 +761,12 @@ bool kvmppc_hv_handle_set_rc(struct kvm *kvm, pgd_t *pgtable, bool writing,
+ 	pgflags = _PAGE_ACCESSED;
+ 	if (writing)
+ 		pgflags |= _PAGE_DIRTY;
+-	/*
+-	 * We are walking the secondary (partition-scoped) page table here.
+-	 * We can do this without disabling irq because the Linux MM
+-	 * subsystem doesn't do THP splits and collapses on this tree.
+-	 */
+-	ptep = __find_linux_pte(pgtable, gpa, NULL, &shift);
++
++	if (nested)
++		ptep = find_kvm_nested_guest_pte(kvm, lpid, gpa, &shift);
++	else
++		ptep = find_kvm_secondary_pte(kvm, gpa, &shift);
++
+ 	if (ptep && pte_present(*ptep) && (!writing || pte_write(*ptep))) {
+ 		kvmppc_radix_update_pte(kvm, ptep, 0, pgflags, gpa, shift);
+ 		return true;
+@@ -957,8 +957,8 @@ int kvmppc_book3s_radix_page_fault(struct kvm_run *run, struct kvm_vcpu *vcpu,
+ 	/* Failed to set the reference/change bits */
+ 	if (dsisr & DSISR_SET_RC) {
+ 		spin_lock(&kvm->mmu_lock);
+-		if (kvmppc_hv_handle_set_rc(kvm, kvm->arch.pgtable,
+-					    writing, gpa, kvm->arch.lpid))
++		if (kvmppc_hv_handle_set_rc(kvm, false, writing,
++					    gpa, kvm->arch.lpid))
+ 			dsisr &= ~DSISR_SET_RC;
+ 		spin_unlock(&kvm->mmu_lock);
+ 
+diff --git a/arch/powerpc/kvm/book3s_hv_nested.c b/arch/powerpc/kvm/book3s_hv_nested.c
+index 1cc2fc090b46..19de09d99395 100644
+--- a/arch/powerpc/kvm/book3s_hv_nested.c
++++ b/arch/powerpc/kvm/book3s_hv_nested.c
+@@ -750,8 +750,8 @@ static struct kvm_nested_guest *kvmhv_find_nested(struct kvm *kvm, int lpid)
+ 	return kvm->arch.nested_guests[lpid];
+ }
+ 
+-static pte_t *find_kvm_nested_guest_pte(struct kvm *kvm, unsigned long lpid,
+-					unsigned long ea, unsigned *hshift)
++pte_t *find_kvm_nested_guest_pte(struct kvm *kvm, unsigned long lpid,
++				 unsigned long ea, unsigned *hshift)
+ {
+ 	struct kvm_nested_guest *gp;
+ 	pte_t *pte;
+@@ -767,7 +767,6 @@ static pte_t *find_kvm_nested_guest_pte(struct kvm *kvm, unsigned long lpid,
+ 	return pte;
+ }
+ 
+-
+ static inline bool kvmhv_n_rmap_is_equal(u64 rmap_1, u64 rmap_2)
+ {
+ 	return !((rmap_1 ^ rmap_2) & (RMAP_NESTED_LPID_MASK |
+@@ -1226,16 +1225,16 @@ static long kvmhv_handle_nested_set_rc(struct kvm_vcpu *vcpu,
+ 
+ 	spin_lock(&kvm->mmu_lock);
+ 	/* Set the rc bit in the pte of our (L0) pgtable for the L1 guest */
+-	ret = kvmppc_hv_handle_set_rc(kvm, kvm->arch.pgtable, writing,
+-				     gpte.raddr, kvm->arch.lpid);
++	ret = kvmppc_hv_handle_set_rc(kvm, false, writing,
++				      gpte.raddr, kvm->arch.lpid);
+ 	if (!ret) {
+ 		ret = -EINVAL;
+ 		goto out_unlock;
+ 	}
+ 
+ 	/* Set the rc bit in the pte of the shadow_pgtable for the nest guest */
+-	ret = kvmppc_hv_handle_set_rc(kvm, gp->shadow_pgtable, writing, n_gpa,
+-				      gp->shadow_lpid);
++	ret = kvmppc_hv_handle_set_rc(kvm, true, writing,
++				      n_gpa, gp->shadow_lpid);
+ 	if (!ret)
+ 		ret = -EINVAL;
+ 	else
