@@ -1,0 +1,115 @@
+mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx path
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-315.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit 9800462ddc58ace3d96a006156ba6764824992f2
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-315.el8/9800462d.failed
+
+Introduce mt7921_tx_worker routine as mt76 tx worker callback for
+mt7921.
+Rely on mt76_connac_pm_ref/mt76_connac_pm_unref to check PM state and
+increment/decrement wake counter
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Felix Fietkau <nbd@nbd.name>
+(cherry picked from commit 9800462ddc58ace3d96a006156ba6764824992f2)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/wireless/mediatek/mt76/mt7921/init.c
+#	drivers/net/wireless/mediatek/mt76/mt7921/main.c
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/init.c
+index a1cf9d52fcea,ce0e231ab772..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/init.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/init.c
+@@@ -212,6 -219,15 +212,18 @@@ int mt7921_register_device(struct mt792
+  	dev->phy.dev = dev;
+  	dev->phy.mt76 = &dev->mt76.phy;
+  	dev->mt76.phy.priv = &dev->phy;
+++<<<<<<< HEAD
+++=======
++ 	dev->mt76.tx_worker.fn = mt7921_tx_worker;
++ 
++ 	INIT_DELAYED_WORK(&dev->pm.ps_work, mt7921_pm_power_save_work);
++ 	INIT_WORK(&dev->pm.wake_work, mt7921_pm_wake_work);
++ 	spin_lock_init(&dev->pm.wake.lock);
++ 	mutex_init(&dev->pm.mutex);
++ 	init_completion(&dev->pm.wake_cmpl);
++ 	spin_lock_init(&dev->pm.txq_lock);
++ 	set_bit(MT76_STATE_PM, &dev->mphy.state);
+++>>>>>>> 9800462ddc58 (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx path)
+  	INIT_LIST_HEAD(&dev->phy.stats_list);
+  	INIT_DELAYED_WORK(&dev->mphy.mac_work, mt7921_mac_work);
+  	INIT_DELAYED_WORK(&dev->phy.scan_work, mt7921_scan_work);
+diff --cc drivers/net/wireless/mediatek/mt76/mt7921/main.c
+index c3e38909c927,f53a1326d8d8..000000000000
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/main.c
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/main.c
+@@@ -618,6 -721,22 +618,25 @@@ void mt7921_mac_sta_remove(struct mt76_
+  	if (!list_empty(&msta->stats_list))
+  		list_del_init(&msta->stats_list);
+  	spin_unlock_bh(&dev->sta_poll_lock);
+++<<<<<<< HEAD
+++=======
++ 
++ 	mt76_connac_power_save_sched(&dev->mphy, &dev->pm);
++ }
++ 
++ void mt7921_tx_worker(struct mt76_worker *w)
++ {
++ 	struct mt7921_dev *dev = container_of(w, struct mt7921_dev,
++ 					      mt76.tx_worker);
++ 
++ 	if (!mt76_connac_pm_ref(&dev->mphy, &dev->pm)) {
++ 		queue_work(dev->mt76.wq, &dev->pm.wake_work);
++ 		return;
++ 	}
++ 
++ 	mt76_txq_schedule_all(&dev->mphy);
++ 	mt76_connac_pm_unref(&dev->pm);
+++>>>>>>> 9800462ddc58 (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx path)
+  }
+  
+  static void mt7921_tx(struct ieee80211_hw *hw,
+@@@ -644,7 -764,19 +663,23 @@@
+  		wcid = &mvif->sta.wcid;
+  	}
+  
+++<<<<<<< HEAD
+ +	mt76_tx(mphy, control->sta, wcid, skb);
+++=======
++ 	if (mt76_connac_pm_ref(mphy, &dev->pm)) {
++ 		mt76_tx(mphy, control->sta, wcid, skb);
++ 		mt76_connac_pm_unref(&dev->pm);
++ 		return;
++ 	}
++ 
++ 	qid = skb_get_queue_mapping(skb);
++ 	if (qid >= MT_TXQ_PSD) {
++ 		qid = IEEE80211_AC_BE;
++ 		skb_set_queue_mapping(skb, qid);
++ 	}
++ 
++ 	mt76_connac_pm_queue_skb(hw, &dev->pm, wcid, skb);
+++>>>>>>> 9800462ddc58 (mt76: mt7921: rely on mt76_connac_pm_ref/mt76_connac_pm_unref in tx path)
+  }
+  
+  static int mt7921_set_rts_threshold(struct ieee80211_hw *hw, u32 val)
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/init.c
+* Unmerged path drivers/net/wireless/mediatek/mt76/mt7921/main.c
+diff --git a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+index 6e3579d48c30..56cf2f94eb74 100644
+--- a/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
++++ b/drivers/net/wireless/mediatek/mt76/mt7921/mt7921.h
+@@ -312,6 +312,8 @@ int mt7921_tx_prepare_skb(struct mt76_dev *mdev, void *txwi_ptr,
+ 			  enum mt76_txq_id qid, struct mt76_wcid *wcid,
+ 			  struct ieee80211_sta *sta,
+ 			  struct mt76_tx_info *tx_info);
++
++void mt7921_tx_worker(struct mt76_worker *w);
+ void mt7921_tx_complete_skb(struct mt76_dev *mdev, struct mt76_queue_entry *e);
+ int mt7921_init_tx_queues(struct mt7921_phy *phy, int idx, int n_desc);
+ void mt7921_tx_token_put(struct mt7921_dev *dev);
