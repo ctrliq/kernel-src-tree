@@ -1,0 +1,308 @@
+blk: Fix lock inversion between ioc lock and bfqd lock
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-358.el8
+commit-author Jan Kara <jack@suse.cz>
+commit fd2ef39cc9a6b9c4c41864ac506906c52f94b06a
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-358.el8/fd2ef39c.failed
+
+Lockdep complains about lock inversion between ioc->lock and bfqd->lock:
+
+bfqd -> ioc:
+ put_io_context+0x33/0x90 -> ioc->lock grabbed
+ blk_mq_free_request+0x51/0x140
+ blk_put_request+0xe/0x10
+ blk_attempt_req_merge+0x1d/0x30
+ elv_attempt_insert_merge+0x56/0xa0
+ blk_mq_sched_try_insert_merge+0x4b/0x60
+ bfq_insert_requests+0x9e/0x18c0 -> bfqd->lock grabbed
+ blk_mq_sched_insert_requests+0xd6/0x2b0
+ blk_mq_flush_plug_list+0x154/0x280
+ blk_finish_plug+0x40/0x60
+ ext4_writepages+0x696/0x1320
+ do_writepages+0x1c/0x80
+ __filemap_fdatawrite_range+0xd7/0x120
+ sync_file_range+0xac/0xf0
+
+ioc->bfqd:
+ bfq_exit_icq+0xa3/0xe0 -> bfqd->lock grabbed
+ put_io_context_active+0x78/0xb0 -> ioc->lock grabbed
+ exit_io_context+0x48/0x50
+ do_exit+0x7e9/0xdd0
+ do_group_exit+0x54/0xc0
+
+To avoid this inversion we change blk_mq_sched_try_insert_merge() to not
+free the merged request but rather leave that upto the caller similarly
+to blk_mq_sched_try_merge(). And in bfq_insert_requests() we make sure
+to free all the merged requests after dropping bfqd->lock.
+
+Fixes: aee69d78dec0 ("block, bfq: introduce the BFQ-v0 I/O scheduler as an extra scheduler")
+	Reviewed-by: Ming Lei <ming.lei@redhat.com>
+	Acked-by: Paolo Valente <paolo.valente@linaro.org>
+	Signed-off-by: Jan Kara <jack@suse.cz>
+Link: https://lore.kernel.org/r/20210623093634.27879-3-jack@suse.cz
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit fd2ef39cc9a6b9c4c41864ac506906c52f94b06a)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-mq-sched.h
+#	block/blk.h
+#	block/mq-deadline.c
+diff --cc block/blk-mq-sched.h
+index b223a9c9ba3d,5246ae040704..000000000000
+--- a/block/blk-mq-sched.h
++++ b/block/blk-mq-sched.h
+@@@ -9,11 -9,12 +9,19 @@@
+  
+  void blk_mq_sched_assign_ioc(struct request *rq);
+  
+ +void blk_mq_sched_request_inserted(struct request *rq);
+  bool blk_mq_sched_try_merge(struct request_queue *q, struct bio *bio,
+++<<<<<<< HEAD
+ +				struct request **merged_request);
+ +bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio);
+ +bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq);
+++=======
++ 		unsigned int nr_segs, struct request **merged_request);
++ bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio,
++ 		unsigned int nr_segs);
++ bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq,
++ 				   struct list_head *free);
+++>>>>>>> fd2ef39cc9a6 (blk: Fix lock inversion between ioc lock and bfqd lock)
+  void blk_mq_sched_mark_restart_hctx(struct blk_mq_hw_ctx *hctx);
+  void blk_mq_sched_restart(struct blk_mq_hw_ctx *hctx);
+  
+diff --cc block/blk.h
+index ea3cdaf19317,4b885c0f6708..000000000000
+--- a/block/blk.h
++++ b/block/blk.h
+@@@ -233,15 -221,12 +233,22 @@@ ssize_t part_timeout_show(struct devic
+  ssize_t part_timeout_store(struct device *, struct device_attribute *,
+  				const char *, size_t);
+  
+++<<<<<<< HEAD
+ +int ll_back_merge_fn(struct request_queue *q, struct request *req,
+ +		     struct bio *bio);
+ +int ll_front_merge_fn(struct request_queue *q, struct request *req, 
+ +		      struct bio *bio);
+ +struct request *attempt_back_merge(struct request_queue *q, struct request *rq);
+ +struct request *attempt_front_merge(struct request_queue *q, struct request *rq);
+ +int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+++=======
++ void __blk_queue_split(struct bio **bio, unsigned int *nr_segs);
++ int ll_back_merge_fn(struct request *req, struct bio *bio,
++ 		unsigned int nr_segs);
++ bool blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+++>>>>>>> fd2ef39cc9a6 (blk: Fix lock inversion between ioc lock and bfqd lock)
+  				struct request *next);
+ -unsigned int blk_recalc_rq_segments(struct request *rq);
+ +void blk_recalc_rq_segments(struct request *rq);
+  void blk_rq_set_mixed_merge(struct request *rq);
+  bool blk_rq_merge_ok(struct request *rq, struct bio *bio);
+  enum elv_merge blk_try_merge(struct request *rq, struct bio *bio);
+diff --cc block/mq-deadline.c
+index 19fd637b8c25,9db6da9ef4c6..000000000000
+--- a/block/mq-deadline.c
++++ b/block/mq-deadline.c
+@@@ -685,6 -718,8 +685,11 @@@ static void dd_insert_request(struct bl
+  	u8 ioprio_class = IOPRIO_PRIO_CLASS(ioprio);
+  	struct dd_per_prio *per_prio;
+  	enum dd_prio prio;
+++<<<<<<< HEAD:block/mq-deadline.c
+++=======
++ 	struct dd_blkcg *blkcg;
++ 	LIST_HEAD(free);
+++>>>>>>> fd2ef39cc9a6 (blk: Fix lock inversion between ioc lock and bfqd lock):block/mq-deadline-main.c
+  
+  	lockdep_assert_held(&dd->lock);
+  
+@@@ -694,13 -729,26 +699,15 @@@
+  	 */
+  	blk_req_zone_write_unlock(rq);
+  
+ -	/*
+ -	 * If a block cgroup has been associated with the submitter and if an
+ -	 * I/O priority has been set in the associated block cgroup, use the
+ -	 * lowest of the cgroup priority and the request priority for the
+ -	 * request. If no priority has been set in the request, use the cgroup
+ -	 * priority.
+ -	 */
+  	prio = ioprio_class_to_prio[ioprio_class];
+  	dd_count(dd, inserted, prio);
+ -	blkcg = dd_blkcg_from_bio(rq->bio);
+ -	ddcg_count(blkcg, inserted, ioprio_class);
+ -	WARN_ON_ONCE(rq->elv.priv[0]);
+ -	rq->elv.priv[0] = blkcg;
+  
+- 	if (blk_mq_sched_try_insert_merge(q, rq))
++ 	if (blk_mq_sched_try_insert_merge(q, rq, &free)) {
++ 		blk_mq_free_requests(&free);
+  		return;
++ 	}
+  
+ -	trace_block_rq_insert(rq);
+ +	blk_mq_sched_request_inserted(rq);
+  
+  	per_prio = &dd->per_prio[prio];
+  	if (at_head) {
+diff --git a/block/bfq-iosched.c b/block/bfq-iosched.c
+index ff52ad1642e9..9fd1b46cb4e0 100644
+--- a/block/bfq-iosched.c
++++ b/block/bfq-iosched.c
+@@ -2352,9 +2352,9 @@ static bool bfq_bio_merge(struct blk_mq_hw_ctx *hctx, struct bio *bio)
+ 
+ 	ret = blk_mq_sched_try_merge(q, bio, &free);
+ 
++	spin_unlock_irq(&bfqd->lock);
+ 	if (free)
+ 		blk_mq_free_request(free);
+-	spin_unlock_irq(&bfqd->lock);
+ 
+ 	return ret;
+ }
+@@ -5978,14 +5978,16 @@ static void bfq_insert_request(struct blk_mq_hw_ctx *hctx, struct request *rq,
+ 	struct bfq_queue *bfqq;
+ 	bool idle_timer_disabled = false;
+ 	unsigned int cmd_flags;
++	LIST_HEAD(free);
+ 
+ #ifdef CONFIG_BFQ_GROUP_IOSCHED
+ 	if (!cgroup_subsys_on_dfl(io_cgrp_subsys) && rq->bio)
+ 		bfqg_stats_update_legacy_io(q, rq);
+ #endif
+ 	spin_lock_irq(&bfqd->lock);
+-	if (blk_mq_sched_try_insert_merge(q, rq)) {
++	if (blk_mq_sched_try_insert_merge(q, rq, &free)) {
+ 		spin_unlock_irq(&bfqd->lock);
++		blk_mq_free_requests(&free);
+ 		return;
+ 	}
+ 
+diff --git a/block/blk-merge.c b/block/blk-merge.c
+index aec2755e8b9b..3cbff468f6f3 100644
+--- a/block/blk-merge.c
++++ b/block/blk-merge.c
+@@ -820,18 +820,15 @@ struct request *attempt_front_merge(struct request_queue *q, struct request *rq)
+ 	return NULL;
+ }
+ 
+-int blk_attempt_req_merge(struct request_queue *q, struct request *rq,
+-			  struct request *next)
++/*
++ * Try to merge 'next' into 'rq'. Return true if the merge happened, false
++ * otherwise. The caller is responsible for freeing 'next' if the merge
++ * happened.
++ */
++bool blk_attempt_req_merge(struct request_queue *q, struct request *rq,
++			   struct request *next)
+ {
+-	struct request *free;
+-
+-	free = attempt_merge(q, rq, next);
+-	if (free) {
+-		blk_put_request(free);
+-		return 1;
+-	}
+-
+-	return 0;
++	return attempt_merge(q, rq, next);
+ }
+ 
+ bool blk_rq_merge_ok(struct request *rq, struct bio *bio)
+diff --git a/block/blk-mq-sched.c b/block/blk-mq-sched.c
+index 938b66f0ed60..6dc0690f59f1 100644
+--- a/block/blk-mq-sched.c
++++ b/block/blk-mq-sched.c
+@@ -440,9 +440,10 @@ bool __blk_mq_sched_bio_merge(struct request_queue *q, struct bio *bio)
+ 	return ret;
+ }
+ 
+-bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq)
++bool blk_mq_sched_try_insert_merge(struct request_queue *q, struct request *rq,
++				   struct list_head *free)
+ {
+-	return rq_mergeable(rq) && elv_attempt_insert_merge(q, rq);
++	return rq_mergeable(rq) && elv_attempt_insert_merge(q, rq, free);
+ }
+ EXPORT_SYMBOL_GPL(blk_mq_sched_try_insert_merge);
+ 
+* Unmerged path block/blk-mq-sched.h
+diff --git a/block/blk-mq.h b/block/blk-mq.h
+index 5ca0cbb1d1bd..79327dc789a0 100644
+--- a/block/blk-mq.h
++++ b/block/blk-mq.h
+@@ -306,6 +306,17 @@ static inline struct blk_plug *blk_mq_plug(struct request_queue *q,
+ 	return NULL;
+ }
+ 
++/* Free all requests on the list */
++static inline void blk_mq_free_requests(struct list_head *list)
++{
++	while (!list_empty(list)) {
++		struct request *rq = list_entry_rq(list->next);
++
++		list_del_init(&rq->queuelist);
++		blk_mq_free_request(rq);
++	}
++}
++
+ /*
+  * For shared tag users, we track the number of currently active users
+  * and attempt to provide a fair share of the tag depth for each of them.
+* Unmerged path block/blk.h
+diff --git a/block/elevator.c b/block/elevator.c
+index aa39bbc8f7ec..3ffa2917a1f0 100644
+--- a/block/elevator.c
++++ b/block/elevator.c
+@@ -367,9 +367,11 @@ enum elv_merge elv_merge(struct request_queue *q, struct request **req,
+  * we can append 'rq' to an existing request, so we can throw 'rq' away
+  * afterwards.
+  *
+- * Returns true if we merged, false otherwise
++ * Returns true if we merged, false otherwise. 'free' will contain all
++ * requests that need to be freed.
+  */
+-bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq)
++bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq,
++			      struct list_head *free)
+ {
+ 	struct request *__rq;
+ 	bool ret;
+@@ -380,8 +382,10 @@ bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq)
+ 	/*
+ 	 * First try one-hit cache.
+ 	 */
+-	if (q->last_merge && blk_attempt_req_merge(q, q->last_merge, rq))
++	if (q->last_merge && blk_attempt_req_merge(q, q->last_merge, rq)) {
++		list_add(&rq->queuelist, free);
+ 		return true;
++	}
+ 
+ 	if (blk_queue_noxmerges(q))
+ 		return false;
+@@ -395,6 +399,7 @@ bool elv_attempt_insert_merge(struct request_queue *q, struct request *rq)
+ 		if (!__rq || !blk_attempt_req_merge(q, __rq, rq))
+ 			break;
+ 
++		list_add(&rq->queuelist, free);
+ 		/* The merged request could be merged with others, try again */
+ 		ret = true;
+ 		rq = __rq;
+* Unmerged path block/mq-deadline.c
+diff --git a/include/linux/elevator.h b/include/linux/elevator.h
+index 36bb2793de08..b4f3bc81ddd3 100644
+--- a/include/linux/elevator.h
++++ b/include/linux/elevator.h
+@@ -131,7 +131,8 @@ extern void elv_merge_requests(struct request_queue *, struct request *,
+ 			       struct request *);
+ extern void elv_merged_request(struct request_queue *, struct request *,
+ 		enum elv_merge);
+-extern bool elv_attempt_insert_merge(struct request_queue *, struct request *);
++extern bool elv_attempt_insert_merge(struct request_queue *, struct request *,
++				     struct list_head *);
+ extern struct request *elv_former_request(struct request_queue *, struct request *);
+ extern struct request *elv_latter_request(struct request_queue *, struct request *);
+ 
