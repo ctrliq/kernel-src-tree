@@ -1,0 +1,2180 @@
+bpf, devmap: Move drop error path to devmap for XDP_REDIRECT
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-338.el8
+commit-author Lorenzo Bianconi <lorenzo@kernel.org>
+commit fdc13979f91e664717f47eb8c49094e4b7f202e3
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-338.el8/fdc13979.failed
+
+We want to change the current ndo_xdp_xmit drop semantics because it will
+allow us to implement better queue overflow handling. This is working
+towards the larger goal of a XDP TX queue-hook. Move XDP_REDIRECT error
+path handling from each XDP ethernet driver to devmap code. According to
+the new APIs, the driver running the ndo_xdp_xmit pointer, will break tx
+loop whenever the hw reports a tx error and it will just return to devmap
+caller the number of successfully transmitted frames. It will be devmap
+responsibility to free dropped frames.
+
+Move each XDP ndo_xdp_xmit capable driver to the new APIs:
+
+- veth
+- virtio-net
+- mvneta
+- mvpp2
+- socionext
+- amazon ena
+- bnxt
+- freescale (dpaa2, dpaa)
+- xen-frontend
+- qede
+- ice
+- igb
+- ixgbe
+- i40e
+- mlx5
+- ti (cpsw, cpsw-new)
+- tun
+- sfc
+
+	Signed-off-by: Lorenzo Bianconi <lorenzo@kernel.org>
+	Signed-off-by: Daniel Borkmann <daniel@iogearbox.net>
+	Reviewed-by: Ioana Ciornei <ioana.ciornei@nxp.com>
+	Reviewed-by: Ilias Apalodimas <ilias.apalodimas@linaro.org>
+	Reviewed-by: Camelia Groza <camelia.groza@nxp.com>
+	Acked-by: Edward Cree <ecree.xilinx@gmail.com>
+	Acked-by: Jesper Dangaard Brouer <brouer@redhat.com>
+	Acked-by: Shay Agroskin <shayagr@amazon.com>
+Link: https://lore.kernel.org/bpf/ed670de24f951cfd77590decf0229a0ad7fd12f6.1615201152.git.lorenzo@kernel.org
+(cherry picked from commit fdc13979f91e664717f47eb8c49094e4b7f202e3)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+#	drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+#	drivers/net/ethernet/marvell/mvneta.c
+#	drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+#	drivers/net/ethernet/socionext/netsec.c
+#	drivers/net/ethernet/ti/cpsw.c
+#	drivers/net/ethernet/ti/cpsw_new.c
+#	drivers/net/ethernet/ti/cpsw_priv.c
+#	drivers/net/tun.c
+#	drivers/net/virtio_net.c
+#	drivers/net/xen-netfront.c
+diff --cc drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+index 15fe3d780457,177c020bf34a..000000000000
+--- a/drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
++++ b/drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+@@@ -2526,11 -3006,151 +2526,146 @@@ static int dpaa_eth_stop(struct net_dev
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool xdp_validate_mtu(struct dpaa_priv *priv, int mtu)
++ {
++ 	int max_contig_data = priv->dpaa_bp->size - priv->rx_headroom;
++ 
++ 	/* We do not support S/G fragments when XDP is enabled.
++ 	 * Limit the MTU in relation to the buffer size.
++ 	 */
++ 	if (mtu + VLAN_ETH_HLEN + ETH_FCS_LEN > max_contig_data) {
++ 		dev_warn(priv->net_dev->dev.parent,
++ 			 "The maximum MTU for XDP is %d\n",
++ 			 max_contig_data - VLAN_ETH_HLEN - ETH_FCS_LEN);
++ 		return false;
++ 	}
++ 
++ 	return true;
++ }
++ 
++ static int dpaa_change_mtu(struct net_device *net_dev, int new_mtu)
++ {
++ 	struct dpaa_priv *priv = netdev_priv(net_dev);
++ 
++ 	if (priv->xdp_prog && !xdp_validate_mtu(priv, new_mtu))
++ 		return -EINVAL;
++ 
++ 	net_dev->mtu = new_mtu;
++ 	return 0;
++ }
++ 
++ static int dpaa_setup_xdp(struct net_device *net_dev, struct netdev_bpf *bpf)
++ {
++ 	struct dpaa_priv *priv = netdev_priv(net_dev);
++ 	struct bpf_prog *old_prog;
++ 	int err;
++ 	bool up;
++ 
++ 	/* S/G fragments are not supported in XDP-mode */
++ 	if (bpf->prog && !xdp_validate_mtu(priv, net_dev->mtu)) {
++ 		NL_SET_ERR_MSG_MOD(bpf->extack, "MTU too large for XDP");
++ 		return -EINVAL;
++ 	}
++ 
++ 	up = netif_running(net_dev);
++ 
++ 	if (up)
++ 		dpaa_eth_stop(net_dev);
++ 
++ 	old_prog = xchg(&priv->xdp_prog, bpf->prog);
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	if (up) {
++ 		err = dpaa_open(net_dev);
++ 		if (err) {
++ 			NL_SET_ERR_MSG_MOD(bpf->extack, "dpaa_open() failed");
++ 			return err;
++ 		}
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int dpaa_xdp(struct net_device *net_dev, struct netdev_bpf *xdp)
++ {
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return dpaa_setup_xdp(net_dev, xdp);
++ 	default:
++ 		return -EINVAL;
++ 	}
++ }
++ 
++ static int dpaa_xdp_xmit(struct net_device *net_dev, int n,
++ 			 struct xdp_frame **frames, u32 flags)
++ {
++ 	struct xdp_frame *xdpf;
++ 	int i, nxmit = 0;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	if (!netif_running(net_dev))
++ 		return -ENETDOWN;
++ 
++ 	for (i = 0; i < n; i++) {
++ 		xdpf = frames[i];
++ 		if (dpaa_xdp_xmit_frame(net_dev, xdpf))
++ 			break;
++ 		nxmit++;
++ 	}
++ 
++ 	return nxmit;
++ }
++ 
++ static int dpaa_ts_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
++ {
++ 	struct dpaa_priv *priv = netdev_priv(dev);
++ 	struct hwtstamp_config config;
++ 
++ 	if (copy_from_user(&config, rq->ifr_data, sizeof(config)))
++ 		return -EFAULT;
++ 
++ 	switch (config.tx_type) {
++ 	case HWTSTAMP_TX_OFF:
++ 		/* Couldn't disable rx/tx timestamping separately.
++ 		 * Do nothing here.
++ 		 */
++ 		priv->tx_tstamp = false;
++ 		break;
++ 	case HWTSTAMP_TX_ON:
++ 		priv->mac_dev->set_tstamp(priv->mac_dev->fman_mac, true);
++ 		priv->tx_tstamp = true;
++ 		break;
++ 	default:
++ 		return -ERANGE;
++ 	}
++ 
++ 	if (config.rx_filter == HWTSTAMP_FILTER_NONE) {
++ 		/* Couldn't disable rx/tx timestamping separately.
++ 		 * Do nothing here.
++ 		 */
++ 		priv->rx_tstamp = false;
++ 	} else {
++ 		priv->mac_dev->set_tstamp(priv->mac_dev->fman_mac, true);
++ 		priv->rx_tstamp = true;
++ 		/* TS is set for all frame types, not only those requested */
++ 		config.rx_filter = HWTSTAMP_FILTER_ALL;
++ 	}
++ 
++ 	return copy_to_user(rq->ifr_data, &config, sizeof(config)) ?
++ 			-EFAULT : 0;
++ }
++ 
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  static int dpaa_ioctl(struct net_device *net_dev, struct ifreq *rq, int cmd)
+  {
+ -	int ret = -EINVAL;
+ -
+ -	if (cmd == SIOCGMIIREG) {
+ -		if (net_dev->phydev)
+ -			return phy_mii_ioctl(net_dev->phydev, rq, cmd);
+ -	}
+ -
+ -	if (cmd == SIOCSHWTSTAMP)
+ -		return dpaa_ts_ioctl(net_dev, rq, cmd);
+ -
+ -	return ret;
+ +	if (!net_dev->phydev)
+ +		return -EINVAL;
+ +	return phy_mii_ioctl(net_dev->phydev, rq, cmd);
+  }
+  
+  static const struct net_device_ops dpaa_ops = {
+diff --cc drivers/net/ethernet/marvell/mvneta.c
+index aa243112d05c,20307eec8988..000000000000
+--- a/drivers/net/ethernet/marvell/mvneta.c
++++ b/drivers/net/ethernet/marvell/mvneta.c
+@@@ -1894,11 -1976,377 +1894,380 @@@ static void mvneta_rxq_drop_pkts(struc
+  	for (i = 0; i < rxq->size; i++) {
+  		struct mvneta_rx_desc *rx_desc = rxq->descs + i;
+  		void *data = rxq->buf_virt_addr[i];
+ -		if (!data || !(rx_desc->buf_phys_addr))
+ -			continue;
+  
+ -		page_pool_put_full_page(rxq->page_pool, data, false);
+ +		dma_unmap_single(pp->dev->dev.parent, rx_desc->buf_phys_addr,
+ +				 MVNETA_RX_BUF_SIZE(pp->pkt_size), DMA_FROM_DEVICE);
+ +		mvneta_frag_free(pp->frag_size, data);
+  	}
+++<<<<<<< HEAD
+++=======
++ 	if (xdp_rxq_info_is_reg(&rxq->xdp_rxq))
++ 		xdp_rxq_info_unreg(&rxq->xdp_rxq);
++ 	page_pool_destroy(rxq->page_pool);
++ 	rxq->page_pool = NULL;
++ }
++ 
++ static void
++ mvneta_update_stats(struct mvneta_port *pp,
++ 		    struct mvneta_stats *ps)
++ {
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.rx_packets += ps->rx_packets;
++ 	stats->es.ps.rx_bytes += ps->rx_bytes;
++ 	/* xdp */
++ 	stats->es.ps.xdp_redirect += ps->xdp_redirect;
++ 	stats->es.ps.xdp_pass += ps->xdp_pass;
++ 	stats->es.ps.xdp_drop += ps->xdp_drop;
++ 	u64_stats_update_end(&stats->syncp);
++ }
++ 
++ static inline
++ int mvneta_rx_refill_queue(struct mvneta_port *pp, struct mvneta_rx_queue *rxq)
++ {
++ 	struct mvneta_rx_desc *rx_desc;
++ 	int curr_desc = rxq->first_to_refill;
++ 	int i;
++ 
++ 	for (i = 0; (i < rxq->refill_num) && (i < 64); i++) {
++ 		rx_desc = rxq->descs + curr_desc;
++ 		if (!(rx_desc->buf_phys_addr)) {
++ 			if (mvneta_rx_refill(pp, rx_desc, rxq, GFP_ATOMIC)) {
++ 				struct mvneta_pcpu_stats *stats;
++ 
++ 				pr_err("Can't refill queue %d. Done %d from %d\n",
++ 				       rxq->id, i, rxq->refill_num);
++ 
++ 				stats = this_cpu_ptr(pp->stats);
++ 				u64_stats_update_begin(&stats->syncp);
++ 				stats->es.refill_error++;
++ 				u64_stats_update_end(&stats->syncp);
++ 				break;
++ 			}
++ 		}
++ 		curr_desc = MVNETA_QUEUE_NEXT_DESC(rxq, curr_desc);
++ 	}
++ 	rxq->refill_num -= i;
++ 	rxq->first_to_refill = curr_desc;
++ 
++ 	return i;
++ }
++ 
++ static void
++ mvneta_xdp_put_buff(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
++ 		    struct xdp_buff *xdp, struct skb_shared_info *sinfo,
++ 		    int sync_len)
++ {
++ 	int i;
++ 
++ 	for (i = 0; i < sinfo->nr_frags; i++)
++ 		page_pool_put_full_page(rxq->page_pool,
++ 					skb_frag_page(&sinfo->frags[i]), true);
++ 	page_pool_put_page(rxq->page_pool, virt_to_head_page(xdp->data),
++ 			   sync_len, true);
++ }
++ 
++ static int
++ mvneta_xdp_submit_frame(struct mvneta_port *pp, struct mvneta_tx_queue *txq,
++ 			struct xdp_frame *xdpf, bool dma_map)
++ {
++ 	struct mvneta_tx_desc *tx_desc;
++ 	struct mvneta_tx_buf *buf;
++ 	dma_addr_t dma_addr;
++ 
++ 	if (txq->count >= txq->tx_stop_threshold)
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	tx_desc = mvneta_txq_next_desc_get(txq);
++ 
++ 	buf = &txq->buf[txq->txq_put_index];
++ 	if (dma_map) {
++ 		/* ndo_xdp_xmit */
++ 		dma_addr = dma_map_single(pp->dev->dev.parent, xdpf->data,
++ 					  xdpf->len, DMA_TO_DEVICE);
++ 		if (dma_mapping_error(pp->dev->dev.parent, dma_addr)) {
++ 			mvneta_txq_desc_put(txq);
++ 			return MVNETA_XDP_DROPPED;
++ 		}
++ 		buf->type = MVNETA_TYPE_XDP_NDO;
++ 	} else {
++ 		struct page *page = virt_to_page(xdpf->data);
++ 
++ 		dma_addr = page_pool_get_dma_addr(page) +
++ 			   sizeof(*xdpf) + xdpf->headroom;
++ 		dma_sync_single_for_device(pp->dev->dev.parent, dma_addr,
++ 					   xdpf->len, DMA_BIDIRECTIONAL);
++ 		buf->type = MVNETA_TYPE_XDP_TX;
++ 	}
++ 	buf->xdpf = xdpf;
++ 
++ 	tx_desc->command = MVNETA_TXD_FLZ_DESC;
++ 	tx_desc->buf_phys_addr = dma_addr;
++ 	tx_desc->data_size = xdpf->len;
++ 
++ 	mvneta_txq_inc_put(txq);
++ 	txq->pending++;
++ 	txq->count++;
++ 
++ 	return MVNETA_XDP_TX;
++ }
++ 
++ static int
++ mvneta_xdp_xmit_back(struct mvneta_port *pp, struct xdp_buff *xdp)
++ {
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	struct xdp_frame *xdpf;
++ 	int cpu;
++ 	u32 ret;
++ 
++ 	xdpf = xdp_convert_buff_to_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return MVNETA_XDP_DROPPED;
++ 
++ 	cpu = smp_processor_id();
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	ret = mvneta_xdp_submit_frame(pp, txq, xdpf, false);
++ 	if (ret == MVNETA_XDP_TX) {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.ps.tx_bytes += xdpf->len;
++ 		stats->es.ps.tx_packets++;
++ 		stats->es.ps.xdp_tx++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	} else {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->es.ps.xdp_tx_err++;
++ 		u64_stats_update_end(&stats->syncp);
++ 	}
++ 	__netif_tx_unlock(nq);
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvneta_xdp_xmit(struct net_device *dev, int num_frame,
++ 		struct xdp_frame **frames, u32 flags)
++ {
++ 	struct mvneta_port *pp = netdev_priv(dev);
++ 	struct mvneta_pcpu_stats *stats = this_cpu_ptr(pp->stats);
++ 	int i, nxmit_byte = 0, nxmit = 0;
++ 	int cpu = smp_processor_id();
++ 	struct mvneta_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 	u32 ret;
++ 
++ 	if (unlikely(test_bit(__MVNETA_DOWN, &pp->state)))
++ 		return -ENETDOWN;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	txq = &pp->txqs[cpu % txq_number];
++ 	nq = netdev_get_tx_queue(pp->dev, txq->id);
++ 
++ 	__netif_tx_lock(nq, cpu);
++ 	for (i = 0; i < num_frame; i++) {
++ 		ret = mvneta_xdp_submit_frame(pp, txq, frames[i], true);
++ 		if (ret != MVNETA_XDP_TX)
++ 			break;
++ 
++ 		nxmit_byte += frames[i]->len;
++ 		nxmit++;
++ 	}
++ 
++ 	if (unlikely(flags & XDP_XMIT_FLUSH))
++ 		mvneta_txq_pend_desc_add(pp, txq, 0);
++ 	__netif_tx_unlock(nq);
++ 
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->es.ps.tx_bytes += nxmit_byte;
++ 	stats->es.ps.tx_packets += nxmit;
++ 	stats->es.ps.xdp_xmit += nxmit;
++ 	stats->es.ps.xdp_xmit_err += num_frame - nxmit;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	return nxmit;
++ }
++ 
++ static int
++ mvneta_run_xdp(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
++ 	       struct bpf_prog *prog, struct xdp_buff *xdp,
++ 	       u32 frame_sz, struct mvneta_stats *stats)
++ {
++ 	struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
++ 	unsigned int len, data_len, sync;
++ 	u32 ret, act;
++ 
++ 	len = xdp->data_end - xdp->data_hard_start - pp->rx_offset_correction;
++ 	data_len = xdp->data_end - xdp->data;
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	/* Due xdp_adjust_tail: DMA sync for_device cover max len CPU touch */
++ 	sync = xdp->data_end - xdp->data_hard_start - pp->rx_offset_correction;
++ 	sync = max(sync, len);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		stats->xdp_pass++;
++ 		return MVNETA_XDP_PASS;
++ 	case XDP_REDIRECT: {
++ 		int err;
++ 
++ 		err = xdp_do_redirect(pp->dev, xdp, prog);
++ 		if (unlikely(err)) {
++ 			mvneta_xdp_put_buff(pp, rxq, xdp, sinfo, sync);
++ 			ret = MVNETA_XDP_DROPPED;
++ 		} else {
++ 			ret = MVNETA_XDP_REDIR;
++ 			stats->xdp_redirect++;
++ 		}
++ 		break;
++ 	}
++ 	case XDP_TX:
++ 		ret = mvneta_xdp_xmit_back(pp, xdp);
++ 		if (ret != MVNETA_XDP_TX)
++ 			mvneta_xdp_put_buff(pp, rxq, xdp, sinfo, sync);
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(pp->dev, prog, act);
++ 		fallthrough;
++ 	case XDP_DROP:
++ 		mvneta_xdp_put_buff(pp, rxq, xdp, sinfo, sync);
++ 		ret = MVNETA_XDP_DROPPED;
++ 		stats->xdp_drop++;
++ 		break;
++ 	}
++ 
++ 	stats->rx_bytes += frame_sz + xdp->data_end - xdp->data - data_len;
++ 	stats->rx_packets++;
++ 
++ 	return ret;
++ }
++ 
++ static void
++ mvneta_swbm_rx_frame(struct mvneta_port *pp,
++ 		     struct mvneta_rx_desc *rx_desc,
++ 		     struct mvneta_rx_queue *rxq,
++ 		     struct xdp_buff *xdp, int *size,
++ 		     struct page *page)
++ {
++ 	unsigned char *data = page_address(page);
++ 	int data_len = -MVNETA_MH_SIZE, len;
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	struct skb_shared_info *sinfo;
++ 
++ 	if (*size > MVNETA_MAX_RX_BUF_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len += len;
++ 	} else {
++ 		len = *size;
++ 		data_len += len - ETH_FCS_LEN;
++ 	}
++ 	*size = *size - len;
++ 
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 
++ 	rx_desc->buf_phys_addr = 0;
++ 
++ 	/* Prefetch header */
++ 	prefetch(data);
++ 	xdp_prepare_buff(xdp, data, pp->rx_offset_correction + MVNETA_MH_SIZE,
++ 			 data_len, false);
++ 
++ 	sinfo = xdp_get_shared_info_from_buff(xdp);
++ 	sinfo->nr_frags = 0;
++ }
++ 
++ static void
++ mvneta_swbm_add_rx_fragment(struct mvneta_port *pp,
++ 			    struct mvneta_rx_desc *rx_desc,
++ 			    struct mvneta_rx_queue *rxq,
++ 			    struct xdp_buff *xdp, int *size,
++ 			    struct skb_shared_info *xdp_sinfo,
++ 			    struct page *page)
++ {
++ 	struct net_device *dev = pp->dev;
++ 	enum dma_data_direction dma_dir;
++ 	int data_len, len;
++ 
++ 	if (*size > MVNETA_MAX_RX_BUF_SIZE) {
++ 		len = MVNETA_MAX_RX_BUF_SIZE;
++ 		data_len = len;
++ 	} else {
++ 		len = *size;
++ 		data_len = len - ETH_FCS_LEN;
++ 	}
++ 	dma_dir = page_pool_get_dma_dir(rxq->page_pool);
++ 	dma_sync_single_for_cpu(dev->dev.parent,
++ 				rx_desc->buf_phys_addr,
++ 				len, dma_dir);
++ 	rx_desc->buf_phys_addr = 0;
++ 
++ 	if (data_len > 0 && xdp_sinfo->nr_frags < MAX_SKB_FRAGS) {
++ 		skb_frag_t *frag = &xdp_sinfo->frags[xdp_sinfo->nr_frags++];
++ 
++ 		skb_frag_off_set(frag, pp->rx_offset_correction);
++ 		skb_frag_size_set(frag, data_len);
++ 		__skb_frag_set_page(frag, page);
++ 
++ 		/* last fragment */
++ 		if (len == *size) {
++ 			struct skb_shared_info *sinfo;
++ 
++ 			sinfo = xdp_get_shared_info_from_buff(xdp);
++ 			sinfo->nr_frags = xdp_sinfo->nr_frags;
++ 			memcpy(sinfo->frags, xdp_sinfo->frags,
++ 			       sinfo->nr_frags * sizeof(skb_frag_t));
++ 		}
++ 	} else {
++ 		page_pool_put_full_page(rxq->page_pool, page, true);
++ 	}
++ 	*size -= len;
++ }
++ 
++ static struct sk_buff *
++ mvneta_swbm_build_skb(struct mvneta_port *pp, struct mvneta_rx_queue *rxq,
++ 		      struct xdp_buff *xdp, u32 desc_status)
++ {
++ 	struct skb_shared_info *sinfo = xdp_get_shared_info_from_buff(xdp);
++ 	int i, num_frags = sinfo->nr_frags;
++ 	struct sk_buff *skb;
++ 
++ 	skb = build_skb(xdp->data_hard_start, PAGE_SIZE);
++ 	if (!skb)
++ 		return ERR_PTR(-ENOMEM);
++ 
++ 	page_pool_release_page(rxq->page_pool, virt_to_page(xdp->data));
++ 
++ 	skb_reserve(skb, xdp->data - xdp->data_hard_start);
++ 	skb_put(skb, xdp->data_end - xdp->data);
++ 	mvneta_rx_csum(pp, desc_status, skb);
++ 
++ 	for (i = 0; i < num_frags; i++) {
++ 		skb_frag_t *frag = &sinfo->frags[i];
++ 
++ 		skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
++ 				skb_frag_page(frag), skb_frag_off(frag),
++ 				skb_frag_size(frag), PAGE_SIZE);
++ 		page_pool_release_page(rxq->page_pool, skb_frag_page(frag));
++ 	}
++ 
++ 	return skb;
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  }
+  
+  /* Main rx processing when using software buffer management */
+diff --cc drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+index e29e898961a0,ec706d614cac..000000000000
+--- a/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
++++ b/drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+@@@ -2628,6 -3611,234 +2628,237 @@@ static u32 mvpp2_skb_tx_csum(struct mvp
+  	return MVPP2_TXD_L4_CSUM_NOT | MVPP2_TXD_IP_CSUM_DISABLE;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void mvpp2_xdp_finish_tx(struct mvpp2_port *port, u16 txq_id, int nxmit, int nxmit_byte)
++ {
++ 	unsigned int thread = mvpp2_cpu_to_thread(port->priv, smp_processor_id());
++ 	struct mvpp2_tx_queue *aggr_txq;
++ 	struct mvpp2_txq_pcpu *txq_pcpu;
++ 	struct mvpp2_tx_queue *txq;
++ 	struct netdev_queue *nq;
++ 
++ 	txq = port->txqs[txq_id];
++ 	txq_pcpu = per_cpu_ptr(txq->pcpu, thread);
++ 	nq = netdev_get_tx_queue(port->dev, txq_id);
++ 	aggr_txq = &port->priv->aggr_txqs[thread];
++ 
++ 	txq_pcpu->reserved_num -= nxmit;
++ 	txq_pcpu->count += nxmit;
++ 	aggr_txq->count += nxmit;
++ 
++ 	/* Enable transmit */
++ 	wmb();
++ 	mvpp2_aggr_txq_pend_desc_add(port, nxmit);
++ 
++ 	if (txq_pcpu->count >= txq_pcpu->stop_threshold)
++ 		netif_tx_stop_queue(nq);
++ 
++ 	/* Finalize TX processing */
++ 	if (!port->has_tx_irqs && txq_pcpu->count >= txq->done_pkts_coal)
++ 		mvpp2_txq_done(port, txq, txq_pcpu);
++ }
++ 
++ static int
++ mvpp2_xdp_submit_frame(struct mvpp2_port *port, u16 txq_id,
++ 		       struct xdp_frame *xdpf, bool dma_map)
++ {
++ 	unsigned int thread = mvpp2_cpu_to_thread(port->priv, smp_processor_id());
++ 	u32 tx_cmd = MVPP2_TXD_L4_CSUM_NOT | MVPP2_TXD_IP_CSUM_DISABLE |
++ 		     MVPP2_TXD_F_DESC | MVPP2_TXD_L_DESC;
++ 	enum mvpp2_tx_buf_type buf_type;
++ 	struct mvpp2_txq_pcpu *txq_pcpu;
++ 	struct mvpp2_tx_queue *aggr_txq;
++ 	struct mvpp2_tx_desc *tx_desc;
++ 	struct mvpp2_tx_queue *txq;
++ 	int ret = MVPP2_XDP_TX;
++ 	dma_addr_t dma_addr;
++ 
++ 	txq = port->txqs[txq_id];
++ 	txq_pcpu = per_cpu_ptr(txq->pcpu, thread);
++ 	aggr_txq = &port->priv->aggr_txqs[thread];
++ 
++ 	/* Check number of available descriptors */
++ 	if (mvpp2_aggr_desc_num_check(port, aggr_txq, 1) ||
++ 	    mvpp2_txq_reserved_desc_num_proc(port, txq, txq_pcpu, 1)) {
++ 		ret = MVPP2_XDP_DROPPED;
++ 		goto out;
++ 	}
++ 
++ 	/* Get a descriptor for the first part of the packet */
++ 	tx_desc = mvpp2_txq_next_desc_get(aggr_txq);
++ 	mvpp2_txdesc_txq_set(port, tx_desc, txq->id);
++ 	mvpp2_txdesc_size_set(port, tx_desc, xdpf->len);
++ 
++ 	if (dma_map) {
++ 		/* XDP_REDIRECT or AF_XDP */
++ 		dma_addr = dma_map_single(port->dev->dev.parent, xdpf->data,
++ 					  xdpf->len, DMA_TO_DEVICE);
++ 
++ 		if (unlikely(dma_mapping_error(port->dev->dev.parent, dma_addr))) {
++ 			mvpp2_txq_desc_put(txq);
++ 			ret = MVPP2_XDP_DROPPED;
++ 			goto out;
++ 		}
++ 
++ 		buf_type = MVPP2_TYPE_XDP_NDO;
++ 	} else {
++ 		/* XDP_TX */
++ 		struct page *page = virt_to_page(xdpf->data);
++ 
++ 		dma_addr = page_pool_get_dma_addr(page) +
++ 			   sizeof(*xdpf) + xdpf->headroom;
++ 		dma_sync_single_for_device(port->dev->dev.parent, dma_addr,
++ 					   xdpf->len, DMA_BIDIRECTIONAL);
++ 
++ 		buf_type = MVPP2_TYPE_XDP_TX;
++ 	}
++ 
++ 	mvpp2_txdesc_dma_addr_set(port, tx_desc, dma_addr);
++ 
++ 	mvpp2_txdesc_cmd_set(port, tx_desc, tx_cmd);
++ 	mvpp2_txq_inc_put(port, txq_pcpu, xdpf, tx_desc, buf_type);
++ 
++ out:
++ 	return ret;
++ }
++ 
++ static int
++ mvpp2_xdp_xmit_back(struct mvpp2_port *port, struct xdp_buff *xdp)
++ {
++ 	struct mvpp2_pcpu_stats *stats = this_cpu_ptr(port->stats);
++ 	struct xdp_frame *xdpf;
++ 	u16 txq_id;
++ 	int ret;
++ 
++ 	xdpf = xdp_convert_buff_to_frame(xdp);
++ 	if (unlikely(!xdpf))
++ 		return MVPP2_XDP_DROPPED;
++ 
++ 	/* The first of the TX queues are used for XPS,
++ 	 * the second half for XDP_TX
++ 	 */
++ 	txq_id = mvpp2_cpu_to_thread(port->priv, smp_processor_id()) + (port->ntxqs / 2);
++ 
++ 	ret = mvpp2_xdp_submit_frame(port, txq_id, xdpf, false);
++ 	if (ret == MVPP2_XDP_TX) {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->tx_bytes += xdpf->len;
++ 		stats->tx_packets++;
++ 		stats->xdp_tx++;
++ 		u64_stats_update_end(&stats->syncp);
++ 
++ 		mvpp2_xdp_finish_tx(port, txq_id, 1, xdpf->len);
++ 	} else {
++ 		u64_stats_update_begin(&stats->syncp);
++ 		stats->xdp_tx_err++;
++ 		u64_stats_update_end(&stats->syncp);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int
++ mvpp2_xdp_xmit(struct net_device *dev, int num_frame,
++ 	       struct xdp_frame **frames, u32 flags)
++ {
++ 	struct mvpp2_port *port = netdev_priv(dev);
++ 	int i, nxmit_byte = 0, nxmit = 0;
++ 	struct mvpp2_pcpu_stats *stats;
++ 	u16 txq_id;
++ 	u32 ret;
++ 
++ 	if (unlikely(test_bit(0, &port->state)))
++ 		return -ENETDOWN;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	/* The first of the TX queues are used for XPS,
++ 	 * the second half for XDP_TX
++ 	 */
++ 	txq_id = mvpp2_cpu_to_thread(port->priv, smp_processor_id()) + (port->ntxqs / 2);
++ 
++ 	for (i = 0; i < num_frame; i++) {
++ 		ret = mvpp2_xdp_submit_frame(port, txq_id, frames[i], true);
++ 		if (ret != MVPP2_XDP_TX)
++ 			break;
++ 
++ 		nxmit_byte += frames[i]->len;
++ 		nxmit++;
++ 	}
++ 
++ 	if (likely(nxmit > 0))
++ 		mvpp2_xdp_finish_tx(port, txq_id, nxmit, nxmit_byte);
++ 
++ 	stats = this_cpu_ptr(port->stats);
++ 	u64_stats_update_begin(&stats->syncp);
++ 	stats->tx_bytes += nxmit_byte;
++ 	stats->tx_packets += nxmit;
++ 	stats->xdp_xmit += nxmit;
++ 	stats->xdp_xmit_err += num_frame - nxmit;
++ 	u64_stats_update_end(&stats->syncp);
++ 
++ 	return nxmit;
++ }
++ 
++ static int
++ mvpp2_run_xdp(struct mvpp2_port *port, struct mvpp2_rx_queue *rxq,
++ 	      struct bpf_prog *prog, struct xdp_buff *xdp,
++ 	      struct page_pool *pp, struct mvpp2_pcpu_stats *stats)
++ {
++ 	unsigned int len, sync, err;
++ 	struct page *page;
++ 	u32 ret, act;
++ 
++ 	len = xdp->data_end - xdp->data_hard_start - MVPP2_SKB_HEADROOM;
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 
++ 	/* Due xdp_adjust_tail: DMA sync for_device cover max len CPU touch */
++ 	sync = xdp->data_end - xdp->data_hard_start - MVPP2_SKB_HEADROOM;
++ 	sync = max(sync, len);
++ 
++ 	switch (act) {
++ 	case XDP_PASS:
++ 		stats->xdp_pass++;
++ 		ret = MVPP2_XDP_PASS;
++ 		break;
++ 	case XDP_REDIRECT:
++ 		err = xdp_do_redirect(port->dev, xdp, prog);
++ 		if (unlikely(err)) {
++ 			ret = MVPP2_XDP_DROPPED;
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(pp, page, sync, true);
++ 		} else {
++ 			ret = MVPP2_XDP_REDIR;
++ 			stats->xdp_redirect++;
++ 		}
++ 		break;
++ 	case XDP_TX:
++ 		ret = mvpp2_xdp_xmit_back(port, xdp);
++ 		if (ret != MVPP2_XDP_TX) {
++ 			page = virt_to_head_page(xdp->data);
++ 			page_pool_put_page(pp, page, sync, true);
++ 		}
++ 		break;
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 		fallthrough;
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(port->dev, prog, act);
++ 		fallthrough;
++ 	case XDP_DROP:
++ 		page = virt_to_head_page(xdp->data);
++ 		page_pool_put_page(pp, page, sync, true);
++ 		ret = MVPP2_XDP_DROPPED;
++ 		stats->xdp_drop++;
++ 		break;
++ 	}
++ 
++ 	return ret;
++ }
++ 
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  /* Main rx processing */
+  static int mvpp2_rx(struct mvpp2_port *port, struct napi_struct *napi,
+  		    int rx_todo, struct mvpp2_rx_queue *rxq)
+diff --cc drivers/net/ethernet/socionext/netsec.c
+index e080d3e7c582,b9449cf36e31..000000000000
+--- a/drivers/net/ethernet/socionext/netsec.c
++++ b/drivers/net/ethernet/socionext/netsec.c
+@@@ -1401,10 -1752,74 +1401,78 @@@ static int netsec_netdev_set_features(s
+  	return 0;
+  }
+  
+ -static int netsec_xdp_xmit(struct net_device *ndev, int n,
+ -			   struct xdp_frame **frames, u32 flags)
+ +static int netsec_netdev_ioctl(struct net_device *ndev, struct ifreq *ifr,
+ +			       int cmd)
+  {
+++<<<<<<< HEAD
+ +	return phy_mii_ioctl(ndev->phydev, ifr, cmd);
+++=======
++ 	struct netsec_priv *priv = netdev_priv(ndev);
++ 	struct netsec_desc_ring *tx_ring = &priv->desc_ring[NETSEC_RING_TX];
++ 	int i, nxmit = 0;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	spin_lock(&tx_ring->lock);
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdpf = frames[i];
++ 		int err;
++ 
++ 		err = netsec_xdp_queue_one(priv, xdpf, true);
++ 		if (err != NETSEC_XDP_TX)
++ 			break;
++ 
++ 		tx_ring->xdp_xmit++;
++ 		nxmit++;
++ 	}
++ 	spin_unlock(&tx_ring->lock);
++ 
++ 	if (unlikely(flags & XDP_XMIT_FLUSH)) {
++ 		netsec_xdp_ring_tx_db(priv, tx_ring->xdp_xmit);
++ 		tx_ring->xdp_xmit = 0;
++ 	}
++ 
++ 	return nxmit;
++ }
++ 
++ static int netsec_xdp_setup(struct netsec_priv *priv, struct bpf_prog *prog,
++ 			    struct netlink_ext_ack *extack)
++ {
++ 	struct net_device *dev = priv->ndev;
++ 	struct bpf_prog *old_prog;
++ 
++ 	/* For now just support only the usual MTU sized frames */
++ 	if (prog && dev->mtu > 1500) {
++ 		NL_SET_ERR_MSG_MOD(extack, "Jumbo frames not supported on XDP");
++ 		return -EOPNOTSUPP;
++ 	}
++ 
++ 	if (netif_running(dev))
++ 		netsec_netdev_stop(dev);
++ 
++ 	/* Detach old prog, if any */
++ 	old_prog = xchg(&priv->xdp_prog, prog);
++ 	if (old_prog)
++ 		bpf_prog_put(old_prog);
++ 
++ 	if (netif_running(dev))
++ 		netsec_netdev_open(dev);
++ 
++ 	return 0;
++ }
++ 
++ static int netsec_xdp(struct net_device *ndev, struct netdev_bpf *xdp)
++ {
++ 	struct netsec_priv *priv = netdev_priv(ndev);
++ 
++ 	switch (xdp->command) {
++ 	case XDP_SETUP_PROG:
++ 		return netsec_xdp_setup(priv, xdp->prog, xdp->extack);
++ 	default:
++ 		return -EINVAL;
++ 	}
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  }
+  
+  static const struct net_device_ops netsec_netdev_ops = {
+diff --cc drivers/net/ethernet/ti/cpsw.c
+index 3e34cb8ac1d3,074702af3dc6..000000000000
+--- a/drivers/net/ethernet/ti/cpsw.c
++++ b/drivers/net/ethernet/ti/cpsw.c
+@@@ -2119,461 -1099,9 +2119,483 @@@ static int cpsw_ndo_vlan_rx_kill_vid(st
+  	if (cpsw->data.dual_emac) {
+  		int i;
+  
+ -		for (i = 0; i < cpsw->data.slaves; i++) {
+ -			if (vid == cpsw->slaves[i].port_vlan)
+ -				goto err;
+ +		for (i = 0; i < cpsw->data.slaves; i++) {
+ +			if (vid == cpsw->slaves[i].port_vlan)
+ +				goto err;
+ +		}
+ +	}
+ +
+ +	dev_info(priv->dev, "removing vlanid %d from vlan filter\n", vid);
+ +	ret = cpsw_ale_del_vlan(cpsw->ale, vid, 0);
+ +	ret |= cpsw_ale_del_ucast(cpsw->ale, priv->mac_addr,
+ +				  HOST_PORT_NUM, ALE_VLAN, vid);
+ +	ret |= cpsw_ale_del_mcast(cpsw->ale, priv->ndev->broadcast,
+ +				  0, ALE_VLAN, vid);
+ +err:
+ +	pm_runtime_put(cpsw->dev);
+ +	return ret;
+ +}
+ +
+ +static int cpsw_ndo_set_tx_maxrate(struct net_device *ndev, int queue, u32 rate)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+++<<<<<<< HEAD
+ +	struct cpsw_slave *slave;
+ +	u32 min_rate;
+ +	u32 ch_rate;
+ +	int i, ret;
+++=======
+++	struct xdp_frame *xdpf;
+++	int i, nxmit = 0, port;
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+ +
+ +	ch_rate = netdev_get_tx_queue(ndev, queue)->tx_maxrate;
+ +	if (ch_rate == rate)
+ +		return 0;
+ +
+ +	ch_rate = rate * 1000;
+ +	min_rate = cpdma_chan_get_min_rate(cpsw->dma);
+ +	if ((ch_rate < min_rate && ch_rate)) {
+ +		dev_err(priv->dev, "The channel rate cannot be less than %dMbps",
+ +			min_rate);
+ +		return -EINVAL;
+++<<<<<<< HEAD
+ +	}
+ +
+ +	if (rate > cpsw->speed) {
+ +		dev_err(priv->dev, "The channel rate cannot be more than 2Gbps");
+ +		return -EINVAL;
+ +	}
+++=======
+++
+++	for (i = 0; i < n; i++) {
+++		xdpf = frames[i];
+++		if (xdpf->len < CPSW_MIN_PACKET_SIZE)
+++			break;
+++
+++		port = priv->emac_port + cpsw->data.dual_emac;
+++		if (cpsw_xdp_tx_frame(priv, xdpf, NULL, port))
+++			break;
+++		nxmit++;
+++	}
+++
+++	return nxmit;
+++}
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+ +
+ +	ret = pm_runtime_get_sync(cpsw->dev);
+ +	if (ret < 0) {
+ +		pm_runtime_put_noidle(cpsw->dev);
+ +		return ret;
+ +	}
+ +
+ +	ret = cpdma_chan_set_rate(cpsw->txv[queue].ch, ch_rate);
+ +	pm_runtime_put(cpsw->dev);
+ +
+ +	if (ret)
+ +		return ret;
+ +
+ +	/* update rates for slaves tx queues */
+ +	for (i = 0; i < cpsw->data.slaves; i++) {
+ +		slave = &cpsw->slaves[i];
+ +		if (!slave->ndev)
+ +			continue;
+ +
+ +		netdev_get_tx_queue(slave->ndev, queue)->tx_maxrate = rate;
+ +	}
+ +
+ +	cpsw_split_res(ndev);
+ +	return ret;
+ +}
+ +
+ +static const struct net_device_ops cpsw_netdev_ops = {
+ +	.ndo_open		= cpsw_ndo_open,
+ +	.ndo_stop		= cpsw_ndo_stop,
+ +	.ndo_start_xmit		= cpsw_ndo_start_xmit,
+ +	.ndo_set_mac_address	= cpsw_ndo_set_mac_address,
+ +	.ndo_do_ioctl		= cpsw_ndo_ioctl,
+ +	.ndo_validate_addr	= eth_validate_addr,
+ +	.ndo_tx_timeout		= cpsw_ndo_tx_timeout,
+ +	.ndo_set_rx_mode	= cpsw_ndo_set_rx_mode,
+ +	.ndo_set_tx_maxrate	= cpsw_ndo_set_tx_maxrate,
+ +#ifdef CONFIG_NET_POLL_CONTROLLER
+ +	.ndo_poll_controller	= cpsw_ndo_poll_controller,
+ +#endif
+ +	.ndo_vlan_rx_add_vid	= cpsw_ndo_vlan_rx_add_vid,
+ +	.ndo_vlan_rx_kill_vid	= cpsw_ndo_vlan_rx_kill_vid,
+ +};
+ +
+ +static int cpsw_get_regs_len(struct net_device *ndev)
+ +{
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +
+ +	return cpsw->data.ale_entries * ALE_ENTRY_WORDS * sizeof(u32);
+ +}
+ +
+ +static void cpsw_get_regs(struct net_device *ndev,
+ +			  struct ethtool_regs *regs, void *p)
+ +{
+ +	u32 *reg = p;
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +
+ +	/* update CPSW IP version */
+ +	regs->version = cpsw->version;
+ +
+ +	cpsw_ale_dump(cpsw->ale, reg);
+ +}
+ +
+ +static void cpsw_get_drvinfo(struct net_device *ndev,
+ +			     struct ethtool_drvinfo *info)
+ +{
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +	struct platform_device	*pdev = to_platform_device(cpsw->dev);
+ +
+ +	strlcpy(info->driver, "cpsw", sizeof(info->driver));
+ +	strlcpy(info->version, "1.0", sizeof(info->version));
+ +	strlcpy(info->bus_info, pdev->name, sizeof(info->bus_info));
+ +}
+ +
+ +static u32 cpsw_get_msglevel(struct net_device *ndev)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	return priv->msg_enable;
+ +}
+ +
+ +static void cpsw_set_msglevel(struct net_device *ndev, u32 value)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	priv->msg_enable = value;
+ +}
+ +
+ +#if IS_ENABLED(CONFIG_TI_CPTS)
+ +static int cpsw_get_ts_info(struct net_device *ndev,
+ +			    struct ethtool_ts_info *info)
+ +{
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +
+ +	info->so_timestamping =
+ +		SOF_TIMESTAMPING_TX_HARDWARE |
+ +		SOF_TIMESTAMPING_TX_SOFTWARE |
+ +		SOF_TIMESTAMPING_RX_HARDWARE |
+ +		SOF_TIMESTAMPING_RX_SOFTWARE |
+ +		SOF_TIMESTAMPING_SOFTWARE |
+ +		SOF_TIMESTAMPING_RAW_HARDWARE;
+ +	info->phc_index = cpsw->cpts->phc_index;
+ +	info->tx_types =
+ +		(1 << HWTSTAMP_TX_OFF) |
+ +		(1 << HWTSTAMP_TX_ON);
+ +	info->rx_filters =
+ +		(1 << HWTSTAMP_FILTER_NONE) |
+ +		(1 << HWTSTAMP_FILTER_PTP_V1_L4_EVENT) |
+ +		(1 << HWTSTAMP_FILTER_PTP_V2_EVENT);
+ +	return 0;
+ +}
+ +#else
+ +static int cpsw_get_ts_info(struct net_device *ndev,
+ +			    struct ethtool_ts_info *info)
+ +{
+ +	info->so_timestamping =
+ +		SOF_TIMESTAMPING_TX_SOFTWARE |
+ +		SOF_TIMESTAMPING_RX_SOFTWARE |
+ +		SOF_TIMESTAMPING_SOFTWARE;
+ +	info->phc_index = -1;
+ +	info->tx_types = 0;
+ +	info->rx_filters = 0;
+ +	return 0;
+ +}
+ +#endif
+ +
+ +static int cpsw_get_link_ksettings(struct net_device *ndev,
+ +				   struct ethtool_link_ksettings *ecmd)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	int slave_no = cpsw_slave_index(cpsw, priv);
+ +
+ +	if (!cpsw->slaves[slave_no].phy)
+ +		return -EOPNOTSUPP;
+ +
+ +	phy_ethtool_ksettings_get(cpsw->slaves[slave_no].phy, ecmd);
+ +	return 0;
+ +}
+ +
+ +static int cpsw_set_link_ksettings(struct net_device *ndev,
+ +				   const struct ethtool_link_ksettings *ecmd)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	int slave_no = cpsw_slave_index(cpsw, priv);
+ +
+ +	if (cpsw->slaves[slave_no].phy)
+ +		return phy_ethtool_ksettings_set(cpsw->slaves[slave_no].phy,
+ +						 ecmd);
+ +	else
+ +		return -EOPNOTSUPP;
+ +}
+ +
+ +static void cpsw_get_wol(struct net_device *ndev, struct ethtool_wolinfo *wol)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	int slave_no = cpsw_slave_index(cpsw, priv);
+ +
+ +	wol->supported = 0;
+ +	wol->wolopts = 0;
+ +
+ +	if (cpsw->slaves[slave_no].phy)
+ +		phy_ethtool_get_wol(cpsw->slaves[slave_no].phy, wol);
+ +}
+ +
+ +static int cpsw_set_wol(struct net_device *ndev, struct ethtool_wolinfo *wol)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	int slave_no = cpsw_slave_index(cpsw, priv);
+ +
+ +	if (cpsw->slaves[slave_no].phy)
+ +		return phy_ethtool_set_wol(cpsw->slaves[slave_no].phy, wol);
+ +	else
+ +		return -EOPNOTSUPP;
+ +}
+ +
+ +static void cpsw_get_pauseparam(struct net_device *ndev,
+ +				struct ethtool_pauseparam *pause)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +
+ +	pause->autoneg = AUTONEG_DISABLE;
+ +	pause->rx_pause = priv->rx_pause ? true : false;
+ +	pause->tx_pause = priv->tx_pause ? true : false;
+ +}
+ +
+ +static int cpsw_set_pauseparam(struct net_device *ndev,
+ +			       struct ethtool_pauseparam *pause)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	bool link;
+ +
+ +	priv->rx_pause = pause->rx_pause ? true : false;
+ +	priv->tx_pause = pause->tx_pause ? true : false;
+ +
+ +	for_each_slave(priv, _cpsw_adjust_link, priv, &link);
+ +	return 0;
+ +}
+ +
+ +static int cpsw_ethtool_op_begin(struct net_device *ndev)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	int ret;
+ +
+ +	ret = pm_runtime_get_sync(cpsw->dev);
+ +	if (ret < 0) {
+ +		cpsw_err(priv, drv, "ethtool begin failed %d\n", ret);
+ +		pm_runtime_put_noidle(cpsw->dev);
+ +	}
+ +
+ +	return ret;
+ +}
+ +
+ +static void cpsw_ethtool_op_complete(struct net_device *ndev)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	int ret;
+ +
+ +	ret = pm_runtime_put(priv->cpsw->dev);
+ +	if (ret < 0)
+ +		cpsw_err(priv, drv, "ethtool complete failed %d\n", ret);
+ +}
+ +
+ +static void cpsw_get_channels(struct net_device *ndev,
+ +			      struct ethtool_channels *ch)
+ +{
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +
+ +	ch->max_rx = cpsw->quirk_irq ? 1 : CPSW_MAX_QUEUES;
+ +	ch->max_tx = cpsw->quirk_irq ? 1 : CPSW_MAX_QUEUES;
+ +	ch->max_combined = 0;
+ +	ch->max_other = 0;
+ +	ch->other_count = 0;
+ +	ch->rx_count = cpsw->rx_ch_num;
+ +	ch->tx_count = cpsw->tx_ch_num;
+ +	ch->combined_count = 0;
+ +}
+ +
+ +static int cpsw_check_ch_settings(struct cpsw_common *cpsw,
+ +				  struct ethtool_channels *ch)
+ +{
+ +	if (cpsw->quirk_irq) {
+ +		dev_err(cpsw->dev, "Maximum one tx/rx queue is allowed");
+ +		return -EOPNOTSUPP;
+ +	}
+ +
+ +	if (ch->combined_count)
+ +		return -EINVAL;
+ +
+ +	/* verify we have at least one channel in each direction */
+ +	if (!ch->rx_count || !ch->tx_count)
+ +		return -EINVAL;
+ +
+ +	if (ch->rx_count > cpsw->data.channels ||
+ +	    ch->tx_count > cpsw->data.channels)
+ +		return -EINVAL;
+ +
+ +	return 0;
+ +}
+ +
+ +static int cpsw_update_channels_res(struct cpsw_priv *priv, int ch_num, int rx)
+ +{
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	void (*handler)(void *, int, int);
+ +	struct netdev_queue *queue;
+ +	struct cpsw_vector *vec;
+ +	int ret, *ch;
+ +
+ +	if (rx) {
+ +		ch = &cpsw->rx_ch_num;
+ +		vec = cpsw->rxv;
+ +		handler = cpsw_rx_handler;
+ +	} else {
+ +		ch = &cpsw->tx_ch_num;
+ +		vec = cpsw->txv;
+ +		handler = cpsw_tx_handler;
+ +	}
+ +
+ +	while (*ch < ch_num) {
+ +		vec[*ch].ch = cpdma_chan_create(cpsw->dma, *ch, handler, rx);
+ +		queue = netdev_get_tx_queue(priv->ndev, *ch);
+ +		queue->tx_maxrate = 0;
+ +
+ +		if (IS_ERR(vec[*ch].ch))
+ +			return PTR_ERR(vec[*ch].ch);
+ +
+ +		if (!vec[*ch].ch)
+ +			return -EINVAL;
+ +
+ +		cpsw_info(priv, ifup, "created new %d %s channel\n", *ch,
+ +			  (rx ? "rx" : "tx"));
+ +		(*ch)++;
+ +	}
+ +
+ +	while (*ch > ch_num) {
+ +		(*ch)--;
+ +
+ +		ret = cpdma_chan_destroy(vec[*ch].ch);
+ +		if (ret)
+ +			return ret;
+ +
+ +		cpsw_info(priv, ifup, "destroyed %d %s channel\n", *ch,
+ +			  (rx ? "rx" : "tx"));
+ +	}
+ +
+ +	return 0;
+ +}
+ +
+ +static int cpsw_update_channels(struct cpsw_priv *priv,
+ +				struct ethtool_channels *ch)
+ +{
+ +	int ret;
+ +
+ +	ret = cpsw_update_channels_res(priv, ch->rx_count, 1);
+ +	if (ret)
+ +		return ret;
+ +
+ +	ret = cpsw_update_channels_res(priv, ch->tx_count, 0);
+ +	if (ret)
+ +		return ret;
+ +
+ +	return 0;
+ +}
+ +
+ +static void cpsw_suspend_data_pass(struct net_device *ndev)
+ +{
+ +	struct cpsw_common *cpsw = ndev_to_cpsw(ndev);
+ +	struct cpsw_slave *slave;
+ +	int i;
+ +
+ +	/* Disable NAPI scheduling */
+ +	cpsw_intr_disable(cpsw);
+ +
+ +	/* Stop all transmit queues for every network device.
+ +	 * Disable re-using rx descriptors with dormant_on.
+ +	 */
+ +	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++) {
+ +		if (!(slave->ndev && netif_running(slave->ndev)))
+ +			continue;
+ +
+ +		netif_tx_stop_all_queues(slave->ndev);
+ +		netif_dormant_on(slave->ndev);
+ +	}
+ +
+ +	/* Handle rest of tx packets and stop cpdma channels */
+ +	cpdma_ctlr_stop(cpsw->dma);
+ +}
+ +
+ +static int cpsw_resume_data_pass(struct net_device *ndev)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	struct cpsw_slave *slave;
+ +	int i, ret;
+ +
+ +	/* Allow rx packets handling */
+ +	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++)
+ +		if (slave->ndev && netif_running(slave->ndev))
+ +			netif_dormant_off(slave->ndev);
+ +
+ +	/* After this receive is started */
+ +	if (cpsw->usage_count) {
+ +		ret = cpsw_fill_rx_channels(priv);
+ +		if (ret)
+ +			return ret;
+ +
+ +		cpdma_ctlr_start(cpsw->dma);
+ +		cpsw_intr_enable(cpsw);
+ +	}
+ +
+ +	/* Resume transmit for every affected interface */
+ +	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++)
+ +		if (slave->ndev && netif_running(slave->ndev))
+ +			netif_tx_start_all_queues(slave->ndev);
+ +
+ +	return 0;
+ +}
+ +
+ +static int cpsw_set_channels(struct net_device *ndev,
+ +			     struct ethtool_channels *chs)
+ +{
+ +	struct cpsw_priv *priv = netdev_priv(ndev);
+ +	struct cpsw_common *cpsw = priv->cpsw;
+ +	struct cpsw_slave *slave;
+ +	int i, ret;
+ +
+ +	ret = cpsw_check_ch_settings(cpsw, chs);
+ +	if (ret < 0)
+ +		return ret;
+ +
+ +	cpsw_suspend_data_pass(ndev);
+ +	ret = cpsw_update_channels(priv, chs);
+ +	if (ret)
+ +		goto err;
+ +
+ +	for (i = cpsw->data.slaves, slave = cpsw->slaves; i; i--, slave++) {
+ +		if (!(slave->ndev && netif_running(slave->ndev)))
+ +			continue;
+ +
+ +		/* Inform stack about new count of queues */
+ +		ret = netif_set_real_num_tx_queues(slave->ndev,
+ +						   cpsw->tx_ch_num);
+ +		if (ret) {
+ +			dev_err(priv->dev, "cannot set real number of tx queues\n");
+ +			goto err;
+ +		}
+ +
+ +		ret = netif_set_real_num_rx_queues(slave->ndev,
+ +						   cpsw->rx_ch_num);
+ +		if (ret) {
+ +			dev_err(priv->dev, "cannot set real number of rx queues\n");
+ +			goto err;
+  		}
+  	}
+  
+diff --cc drivers/net/tun.c
+index d71c419b64cd,6e55697315de..000000000000
+--- a/drivers/net/tun.c
++++ b/drivers/net/tun.c
+@@@ -1327,10 -1210,10 +1326,16 @@@ resample
+  		void *frame = tun_xdp_to_ptr(xdp);
+  
+  		if (__ptr_ring_produce(&tfile->tx_ring, frame)) {
+++<<<<<<< HEAD
+ +			this_cpu_inc(tun->pcpu_stats->tx_dropped);
+ +			xdp_return_frame_rx_napi(xdp);
+ +			drops++;
+++=======
++ 			atomic_long_inc(&dev->tx_dropped);
++ 			break;
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  		}
++ 		nxmit++;
+  	}
+  	spin_unlock(&tfile->tx_ring.producer_lock);
+  
+diff --cc drivers/net/virtio_net.c
+index 20814dd573ad,254369a41540..000000000000
+--- a/drivers/net/virtio_net.c
++++ b/drivers/net/virtio_net.c
+@@@ -504,10 -497,12 +504,16 @@@ static int virtnet_xdp_xmit(struct net_
+  	struct bpf_prog *xdp_prog;
+  	struct send_queue *sq;
+  	unsigned int len;
+++<<<<<<< HEAD
+ +	int drops = 0;
+++=======
++ 	int packets = 0;
++ 	int bytes = 0;
++ 	int nxmit = 0;
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  	int kicks = 0;
+- 	int ret, err;
+  	void *ptr;
++ 	int ret;
+  	int i;
+  
+  	/* Only allow ndo_xdp_xmit if XDP is loaded on dev, as this
+@@@ -550,8 -550,10 +553,8 @@@
+  	}
+  out:
+  	u64_stats_update_begin(&sq->stats.syncp);
+ -	sq->stats.bytes += bytes;
+ -	sq->stats.packets += packets;
+  	sq->stats.xdp_tx += n;
+- 	sq->stats.xdp_tx_drops += drops;
++ 	sq->stats.xdp_tx_drops += n - nxmit;
+  	sq->stats.kicks += kicks;
+  	u64_stats_update_end(&sq->stats.syncp);
+  
+diff --cc drivers/net/xen-netfront.c
+index c9ad8431e87a,44275908d61a..000000000000
+--- a/drivers/net/xen-netfront.c
++++ b/drivers/net/xen-netfront.c
+@@@ -563,6 -574,64 +563,67 @@@ static u16 xennet_select_queue(struct n
+  	return queue_idx;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static int xennet_xdp_xmit_one(struct net_device *dev,
++ 			       struct netfront_queue *queue,
++ 			       struct xdp_frame *xdpf)
++ {
++ 	struct netfront_info *np = netdev_priv(dev);
++ 	struct netfront_stats *tx_stats = this_cpu_ptr(np->tx_stats);
++ 	int notify;
++ 
++ 	xennet_make_first_txreq(queue, NULL,
++ 				virt_to_page(xdpf->data),
++ 				offset_in_page(xdpf->data),
++ 				xdpf->len);
++ 
++ 	RING_PUSH_REQUESTS_AND_CHECK_NOTIFY(&queue->tx, notify);
++ 	if (notify)
++ 		notify_remote_via_irq(queue->tx_irq);
++ 
++ 	u64_stats_update_begin(&tx_stats->syncp);
++ 	tx_stats->bytes += xdpf->len;
++ 	tx_stats->packets++;
++ 	u64_stats_update_end(&tx_stats->syncp);
++ 
++ 	xennet_tx_buf_gc(queue);
++ 
++ 	return 0;
++ }
++ 
++ static int xennet_xdp_xmit(struct net_device *dev, int n,
++ 			   struct xdp_frame **frames, u32 flags)
++ {
++ 	unsigned int num_queues = dev->real_num_tx_queues;
++ 	struct netfront_info *np = netdev_priv(dev);
++ 	struct netfront_queue *queue = NULL;
++ 	unsigned long irq_flags;
++ 	int nxmit = 0;
++ 	int i;
++ 
++ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
++ 		return -EINVAL;
++ 
++ 	queue = &np->queues[smp_processor_id() % num_queues];
++ 
++ 	spin_lock_irqsave(&queue->tx_lock, irq_flags);
++ 	for (i = 0; i < n; i++) {
++ 		struct xdp_frame *xdpf = frames[i];
++ 
++ 		if (!xdpf)
++ 			continue;
++ 		if (xennet_xdp_xmit_one(dev, queue, xdpf))
++ 			break;
++ 		nxmit++;
++ 	}
++ 	spin_unlock_irqrestore(&queue->tx_lock, irq_flags);
++ 
++ 	return nxmit;
++ }
++ 
++ 
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  #define MAX_XEN_SKB_FRAGS (65536 / XEN_PAGE_SIZE + 1)
+  
+  static netdev_tx_t xennet_start_xmit(struct sk_buff *skb, struct net_device *dev)
+@@@ -781,20 -853,71 +842,70 @@@ static int xennet_get_extras(struct net
+  	return err;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static u32 xennet_run_xdp(struct netfront_queue *queue, struct page *pdata,
++ 		   struct xen_netif_rx_response *rx, struct bpf_prog *prog,
++ 		   struct xdp_buff *xdp, bool *need_xdp_flush)
++ {
++ 	struct xdp_frame *xdpf;
++ 	u32 len = rx->status;
++ 	u32 act;
++ 	int err;
++ 
++ 	xdp_init_buff(xdp, XEN_PAGE_SIZE - XDP_PACKET_HEADROOM,
++ 		      &queue->xdp_rxq);
++ 	xdp_prepare_buff(xdp, page_address(pdata), XDP_PACKET_HEADROOM,
++ 			 len, false);
++ 
++ 	act = bpf_prog_run_xdp(prog, xdp);
++ 	switch (act) {
++ 	case XDP_TX:
++ 		get_page(pdata);
++ 		xdpf = xdp_convert_buff_to_frame(xdp);
++ 		err = xennet_xdp_xmit(queue->info->netdev, 1, &xdpf, 0);
++ 		if (unlikely(!err))
++ 			xdp_return_frame_rx_napi(xdpf);
++ 		else if (unlikely(err < 0))
++ 			trace_xdp_exception(queue->info->netdev, prog, act);
++ 		break;
++ 	case XDP_REDIRECT:
++ 		get_page(pdata);
++ 		err = xdp_do_redirect(queue->info->netdev, xdp, prog);
++ 		*need_xdp_flush = true;
++ 		if (unlikely(err))
++ 			trace_xdp_exception(queue->info->netdev, prog, act);
++ 		break;
++ 	case XDP_PASS:
++ 	case XDP_DROP:
++ 		break;
++ 
++ 	case XDP_ABORTED:
++ 		trace_xdp_exception(queue->info->netdev, prog, act);
++ 		break;
++ 
++ 	default:
++ 		bpf_warn_invalid_xdp_action(act);
++ 	}
++ 
++ 	return act;
++ }
++ 
+++>>>>>>> fdc13979f91e (bpf, devmap: Move drop error path to devmap for XDP_REDIRECT)
+  static int xennet_get_responses(struct netfront_queue *queue,
+  				struct netfront_rx_info *rinfo, RING_IDX rp,
+ -				struct sk_buff_head *list,
+ -				bool *need_xdp_flush)
+ +				struct sk_buff_head *list)
+  {
+  	struct xen_netif_rx_response *rx = &rinfo->rx;
+ -	int max = XEN_NETIF_NR_SLOTS_MIN + (rx->status <= RX_COPY_THRESHOLD);
+ +	struct xen_netif_extra_info *extras = rinfo->extras;
+ +	struct device *dev = &queue->info->netdev->dev;
+  	RING_IDX cons = queue->rx.rsp_cons;
+  	struct sk_buff *skb = xennet_get_rx_skb(queue, cons);
+ -	struct xen_netif_extra_info *extras = rinfo->extras;
+  	grant_ref_t ref = xennet_get_rx_ref(queue, cons);
+ -	struct device *dev = &queue->info->netdev->dev;
+ -	struct bpf_prog *xdp_prog;
+ -	struct xdp_buff xdp;
+ -	unsigned long ret;
+ +	int max = XEN_NETIF_NR_SLOTS_MIN + (rx->status <= RX_COPY_THRESHOLD);
+  	int slots = 1;
+  	int err = 0;
+ -	u32 verdict;
+ +	unsigned long ret;
+  
+  	if (rx->flags & XEN_NETRXF_extra_info) {
+  		err = xennet_get_extras(queue, extras, rp);
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+diff --git a/drivers/net/ethernet/amazon/ena/ena_netdev.c b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+index d7651a4370f4..ba063755c392 100644
+--- a/drivers/net/ethernet/amazon/ena/ena_netdev.c
++++ b/drivers/net/ethernet/amazon/ena/ena_netdev.c
+@@ -302,7 +302,7 @@ static int ena_xdp_xmit_frame(struct ena_ring *xdp_ring,
+ 
+ 	rc = ena_xdp_tx_map_frame(xdp_ring, tx_info, xdpf, &push_hdr, &push_len);
+ 	if (unlikely(rc))
+-		goto error_drop_packet;
++		return rc;
+ 
+ 	ena_tx_ctx.ena_bufs = tx_info->bufs;
+ 	ena_tx_ctx.push_header = push_hdr;
+@@ -332,8 +332,6 @@ static int ena_xdp_xmit_frame(struct ena_ring *xdp_ring,
+ error_unmap_dma:
+ 	ena_unmap_tx_buff(xdp_ring, tx_info);
+ 	tx_info->xdpf = NULL;
+-error_drop_packet:
+-	xdp_return_frame(xdpf);
+ 	return rc;
+ }
+ 
+@@ -341,8 +339,8 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
+ 			struct xdp_frame **frames, u32 flags)
+ {
+ 	struct ena_adapter *adapter = netdev_priv(dev);
+-	int qid, i, err, drops = 0;
+ 	struct ena_ring *xdp_ring;
++	int qid, i, nxmit = 0;
+ 
+ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+ 		return -EINVAL;
+@@ -362,12 +360,9 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
+ 	spin_lock(&xdp_ring->xdp_tx_lock);
+ 
+ 	for (i = 0; i < n; i++) {
+-		err = ena_xdp_xmit_frame(xdp_ring, dev, frames[i], 0);
+-		/* The descriptor is freed by ena_xdp_xmit_frame in case
+-		 * of an error.
+-		 */
+-		if (err)
+-			drops++;
++		if (ena_xdp_xmit_frame(xdp_ring, dev, frames[i], 0))
++			break;
++		nxmit++;
+ 	}
+ 
+ 	/* Ring doorbell to make device aware of the packets */
+@@ -380,7 +375,7 @@ static int ena_xdp_xmit(struct net_device *dev, int n,
+ 	spin_unlock(&xdp_ring->xdp_tx_lock);
+ 
+ 	/* Return number of packets sent */
+-	return n - drops;
++	return nxmit;
+ }
+ 
+ static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
+@@ -417,7 +412,9 @@ static int ena_xdp_execute(struct ena_ring *rx_ring, struct xdp_buff *xdp)
+ 		/* The XDP queues are shared between XDP_TX and XDP_REDIRECT */
+ 		spin_lock(&xdp_ring->xdp_tx_lock);
+ 
+-		ena_xdp_xmit_frame(xdp_ring, rx_ring->netdev, xdpf, XDP_XMIT_FLUSH);
++		if (ena_xdp_xmit_frame(xdp_ring, rx_ring->netdev, xdpf,
++				       XDP_XMIT_FLUSH))
++			xdp_return_frame(xdpf);
+ 
+ 		spin_unlock(&xdp_ring->xdp_tx_lock);
+ 		xdp_stat = &rx_ring->rx_stats.xdp_tx;
+diff --git a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+index 734087fba31c..446155bbf076 100644
+--- a/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
++++ b/drivers/net/ethernet/broadcom/bnxt/bnxt_xdp.c
+@@ -217,7 +217,7 @@ int bnxt_xdp_xmit(struct net_device *dev, int num_frames,
+ 	struct pci_dev *pdev = bp->pdev;
+ 	struct bnxt_tx_ring_info *txr;
+ 	dma_addr_t mapping;
+-	int drops = 0;
++	int nxmit = 0;
+ 	int ring;
+ 	int i;
+ 
+@@ -233,21 +233,17 @@ int bnxt_xdp_xmit(struct net_device *dev, int num_frames,
+ 		struct xdp_frame *xdp = frames[i];
+ 
+ 		if (!txr || !bnxt_tx_avail(bp, txr) ||
+-		    !(bp->bnapi[ring]->flags & BNXT_NAPI_FLAG_XDP)) {
+-			xdp_return_frame_rx_napi(xdp);
+-			drops++;
+-			continue;
+-		}
++		    !(bp->bnapi[ring]->flags & BNXT_NAPI_FLAG_XDP))
++			break;
+ 
+ 		mapping = dma_map_single(&pdev->dev, xdp->data, xdp->len,
+ 					 DMA_TO_DEVICE);
+ 
+-		if (dma_mapping_error(&pdev->dev, mapping)) {
+-			xdp_return_frame_rx_napi(xdp);
+-			drops++;
+-			continue;
+-		}
++		if (dma_mapping_error(&pdev->dev, mapping))
++			break;
++
+ 		__bnxt_xmit_xdp_redirect(bp, txr, mapping, xdp->len, xdp);
++		nxmit++;
+ 	}
+ 
+ 	if (flags & XDP_XMIT_FLUSH) {
+@@ -256,7 +252,7 @@ int bnxt_xdp_xmit(struct net_device *dev, int num_frames,
+ 		bnxt_db_write(bp, &txr->tx_db, txr->tx_prod);
+ 	}
+ 
+-	return num_frames - drops;
++	return nxmit;
+ }
+ 
+ /* Under rtnl_lock */
+* Unmerged path drivers/net/ethernet/freescale/dpaa/dpaa_eth.c
+* Unmerged path drivers/net/ethernet/freescale/dpaa2/dpaa2-eth.c
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_txrx.c b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+index 5747a99122fb..99ec444b45a1 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_txrx.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_txrx.c
+@@ -3835,8 +3835,8 @@ netdev_tx_t i40e_lan_xmit_frame(struct sk_buff *skb, struct net_device *netdev)
+  * @frames: array of XDP buffer pointers
+  * @flags: XDP extra info
+  *
+- * Returns number of frames successfully sent. Frames that fail are
+- * free'ed via XDP return API.
++ * Returns number of frames successfully sent. Failed frames
++ * will be free'ed by XDP core.
+  *
+  * For error cases, a negative errno code is returned and no-frames
+  * are transmitted (caller must handle freeing frames).
+@@ -3849,7 +3849,7 @@ int i40e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 	struct i40e_vsi *vsi = np->vsi;
+ 	struct i40e_pf *pf = vsi->back;
+ 	struct i40e_ring *xdp_ring;
+-	int drops = 0;
++	int nxmit = 0;
+ 	int i;
+ 
+ 	if (test_bit(__I40E_VSI_DOWN, vsi->state))
+@@ -3869,14 +3869,13 @@ int i40e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		int err;
+ 
+ 		err = i40e_xmit_xdp_ring(xdpf, xdp_ring);
+-		if (err != I40E_XDP_TX) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++		if (err != I40E_XDP_TX)
++			break;
++		nxmit++;
+ 	}
+ 
+ 	if (unlikely(flags & XDP_XMIT_FLUSH))
+ 		i40e_xdp_ring_update_tail(xdp_ring);
+ 
+-	return n - drops;
++	return nxmit;
+ }
+diff --git a/drivers/net/ethernet/intel/ice/ice_txrx.c b/drivers/net/ethernet/intel/ice/ice_txrx.c
+index 27e051d04493..525f29e8a295 100644
+--- a/drivers/net/ethernet/intel/ice/ice_txrx.c
++++ b/drivers/net/ethernet/intel/ice/ice_txrx.c
+@@ -576,8 +576,8 @@ ice_run_xdp(struct ice_ring *rx_ring, struct xdp_buff *xdp,
+  * @frames: XDP frames to be transmitted
+  * @flags: transmit flags
+  *
+- * Returns number of frames successfully sent. Frames that fail are
+- * free'ed via XDP return API.
++ * Returns number of frames successfully sent. Failed frames
++ * will be free'ed by XDP core.
+  * For error cases, a negative errno code is returned and no-frames
+  * are transmitted (caller must handle freeing frames).
+  */
+@@ -589,7 +589,7 @@ ice_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 	unsigned int queue_index = smp_processor_id();
+ 	struct ice_vsi *vsi = np->vsi;
+ 	struct ice_ring *xdp_ring;
+-	int drops = 0, i;
++	int nxmit = 0, i;
+ 
+ 	if (test_bit(ICE_VSI_DOWN, vsi->state))
+ 		return -ENETDOWN;
+@@ -606,16 +606,15 @@ ice_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		int err;
+ 
+ 		err = ice_xmit_xdp_ring(xdpf->data, xdpf->len, xdp_ring);
+-		if (err != ICE_XDP_TX) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++		if (err != ICE_XDP_TX)
++			break;
++		nxmit++;
+ 	}
+ 
+ 	if (unlikely(flags & XDP_XMIT_FLUSH))
+ 		ice_xdp_ring_update_tail(xdp_ring);
+ 
+-	return n - drops;
++	return nxmit;
+ }
+ 
+ /**
+diff --git a/drivers/net/ethernet/intel/igb/igb_main.c b/drivers/net/ethernet/intel/igb/igb_main.c
+index f7badd8c36f4..08283196f36e 100644
+--- a/drivers/net/ethernet/intel/igb/igb_main.c
++++ b/drivers/net/ethernet/intel/igb/igb_main.c
+@@ -2936,7 +2936,7 @@ static int igb_xdp_xmit(struct net_device *dev, int n,
+ 	int cpu = smp_processor_id();
+ 	struct igb_ring *tx_ring;
+ 	struct netdev_queue *nq;
+-	int drops = 0;
++	int nxmit = 0;
+ 	int i;
+ 
+ 	if (unlikely(test_bit(__IGB_DOWN, &adapter->state)))
+@@ -2963,10 +2963,9 @@ static int igb_xdp_xmit(struct net_device *dev, int n,
+ 		int err;
+ 
+ 		err = igb_xmit_xdp_ring(adapter, tx_ring, xdpf);
+-		if (err != IGB_XDP_TX) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++		if (err != IGB_XDP_TX)
++			break;
++		nxmit++;
+ 	}
+ 
+ 	__netif_tx_unlock(nq);
+@@ -2974,7 +2973,7 @@ static int igb_xdp_xmit(struct net_device *dev, int n,
+ 	if (unlikely(flags & XDP_XMIT_FLUSH))
+ 		igb_xdp_ring_update_tail(tx_ring);
+ 
+-	return n - drops;
++	return nxmit;
+ }
+ 
+ static const struct net_device_ops igb_netdev_ops = {
+diff --git a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+index 55ad3851213a..146dea45e74a 100644
+--- a/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
++++ b/drivers/net/ethernet/intel/ixgbe/ixgbe_main.c
+@@ -10195,7 +10195,7 @@ static int ixgbe_xdp_xmit(struct net_device *dev, int n,
+ {
+ 	struct ixgbe_adapter *adapter = netdev_priv(dev);
+ 	struct ixgbe_ring *ring;
+-	int drops = 0;
++	int nxmit = 0;
+ 	int i;
+ 
+ 	if (unlikely(test_bit(__IXGBE_DOWN, &adapter->state)))
+@@ -10219,16 +10219,15 @@ static int ixgbe_xdp_xmit(struct net_device *dev, int n,
+ 		int err;
+ 
+ 		err = ixgbe_xmit_xdp_ring(adapter, xdpf);
+-		if (err != IXGBE_XDP_TX) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++		if (err != IXGBE_XDP_TX)
++			break;
++		nxmit++;
+ 	}
+ 
+ 	if (unlikely(flags & XDP_XMIT_FLUSH))
+ 		ixgbe_xdp_ring_update_tail(ring);
+ 
+-	return n - drops;
++	return nxmit;
+ }
+ 
+ static const struct net_device_ops ixgbe_netdev_ops = {
+* Unmerged path drivers/net/ethernet/marvell/mvneta.c
+* Unmerged path drivers/net/ethernet/marvell/mvpp2/mvpp2_main.c
+diff --git a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+index ae90d533a350..15f2e3e50c28 100644
+--- a/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
++++ b/drivers/net/ethernet/mellanox/mlx5/core/en/xdp.c
+@@ -486,7 +486,7 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ {
+ 	struct mlx5e_priv *priv = netdev_priv(dev);
+ 	struct mlx5e_xdpsq *sq;
+-	int drops = 0;
++	int nxmit = 0;
+ 	int sq_num;
+ 	int i;
+ 
+@@ -515,11 +515,8 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		xdptxd.dma_addr = dma_map_single(sq->pdev, xdptxd.data,
+ 						 xdptxd.len, DMA_TO_DEVICE);
+ 
+-		if (unlikely(dma_mapping_error(sq->pdev, xdptxd.dma_addr))) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-			continue;
+-		}
++		if (unlikely(dma_mapping_error(sq->pdev, xdptxd.dma_addr)))
++			break;
+ 
+ 		xdpi.mode           = MLX5E_XDP_XMIT_MODE_FRAME;
+ 		xdpi.frame.xdpf     = xdpf;
+@@ -530,9 +527,9 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		if (unlikely(!ret)) {
+ 			dma_unmap_single(sq->pdev, xdptxd.dma_addr,
+ 					 xdptxd.len, DMA_TO_DEVICE);
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
++			break;
+ 		}
++		nxmit++;
+ 	}
+ 
+ 	if (flags & XDP_XMIT_FLUSH) {
+@@ -541,7 +538,7 @@ int mlx5e_xdp_xmit(struct net_device *dev, int n, struct xdp_frame **frames,
+ 		mlx5e_xmit_xdp_doorbell(sq);
+ 	}
+ 
+-	return n - drops;
++	return nxmit;
+ }
+ 
+ void mlx5e_xdp_rx_poll_complete(struct mlx5e_rq *rq)
+diff --git a/drivers/net/ethernet/qlogic/qede/qede_fp.c b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+index 464820e3f12a..a4e3f417ab89 100644
+--- a/drivers/net/ethernet/qlogic/qede/qede_fp.c
++++ b/drivers/net/ethernet/qlogic/qede/qede_fp.c
+@@ -345,7 +345,7 @@ int qede_xdp_transmit(struct net_device *dev, int n_frames,
+ 	struct qede_tx_queue *xdp_tx;
+ 	struct xdp_frame *xdpf;
+ 	dma_addr_t mapping;
+-	int i, drops = 0;
++	int i, nxmit = 0;
+ 	u16 xdp_prod;
+ 
+ 	if (unlikely(flags & ~XDP_XMIT_FLAGS_MASK))
+@@ -364,18 +364,13 @@ int qede_xdp_transmit(struct net_device *dev, int n_frames,
+ 
+ 		mapping = dma_map_single(dmadev, xdpf->data, xdpf->len,
+ 					 DMA_TO_DEVICE);
+-		if (unlikely(dma_mapping_error(dmadev, mapping))) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-
+-			continue;
+-		}
++		if (unlikely(dma_mapping_error(dmadev, mapping)))
++			break;
+ 
+ 		if (unlikely(qede_xdp_xmit(xdp_tx, mapping, 0, xdpf->len,
+-					   NULL, xdpf))) {
+-			xdp_return_frame_rx_napi(xdpf);
+-			drops++;
+-		}
++					   NULL, xdpf)))
++			break;
++		nxmit++;
+ 	}
+ 
+ 	if (flags & XDP_XMIT_FLUSH) {
+@@ -387,7 +382,7 @@ int qede_xdp_transmit(struct net_device *dev, int n_frames,
+ 
+ 	spin_unlock(&xdp_tx->xdp_tx_lock);
+ 
+-	return n_frames - drops;
++	return nxmit;
+ }
+ 
+ int qede_txq_has_work(struct qede_tx_queue *txq)
+diff --git a/drivers/net/ethernet/sfc/tx.c b/drivers/net/ethernet/sfc/tx.c
+index 1665529a7271..0c6650d2e239 100644
+--- a/drivers/net/ethernet/sfc/tx.c
++++ b/drivers/net/ethernet/sfc/tx.c
+@@ -412,14 +412,6 @@ netdev_tx_t __efx_enqueue_skb(struct efx_tx_queue *tx_queue, struct sk_buff *skb
+ 	return NETDEV_TX_OK;
+ }
+ 
+-static void efx_xdp_return_frames(int n,  struct xdp_frame **xdpfs)
+-{
+-	int i;
+-
+-	for (i = 0; i < n; i++)
+-		xdp_return_frame_rx_napi(xdpfs[i]);
+-}
+-
+ /* Transmit a packet from an XDP buffer
+  *
+  * Returns number of packets sent on success, error code otherwise.
+@@ -492,12 +484,7 @@ int efx_xdp_tx_buffers(struct efx_nic *efx, int n, struct xdp_frame **xdpfs,
+ 	if (flush && i > 0)
+ 		efx_nic_push_buffers(tx_queue);
+ 
+-	if (i == 0)
+-		return -EIO;
+-
+-	efx_xdp_return_frames(n - i, xdpfs + i);
+-
+-	return i;
++	return i == 0 ? -EIO : i;
+ }
+ 
+ /* Initiate a packet transmission.  We use one channel per CPU
+* Unmerged path drivers/net/ethernet/socionext/netsec.c
+* Unmerged path drivers/net/ethernet/ti/cpsw.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_new.c
+* Unmerged path drivers/net/ethernet/ti/cpsw_priv.c
+* Unmerged path drivers/net/tun.c
+diff --git a/drivers/net/veth.c b/drivers/net/veth.c
+index 897be5cafeeb..580b35b3be2a 100644
+--- a/drivers/net/veth.c
++++ b/drivers/net/veth.c
+@@ -492,7 +492,7 @@ static int veth_xdp_xmit(struct net_device *dev, int n,
+ 			 u32 flags, bool ndo_xmit)
+ {
+ 	struct veth_priv *rcv_priv, *priv = netdev_priv(dev);
+-	int i, ret = -ENXIO, drops = 0;
++	int i, ret = -ENXIO, nxmit = 0;
+ 	struct net_device *rcv;
+ 	unsigned int max_len;
+ 	struct veth_rq *rq;
+@@ -521,21 +521,20 @@ static int veth_xdp_xmit(struct net_device *dev, int n,
+ 		void *ptr = veth_xdp_to_ptr(frame);
+ 
+ 		if (unlikely(frame->len > max_len ||
+-			     __ptr_ring_produce(&rq->xdp_ring, ptr))) {
+-			xdp_return_frame_rx_napi(frame);
+-			drops++;
+-		}
++			     __ptr_ring_produce(&rq->xdp_ring, ptr)))
++			break;
++		nxmit++;
+ 	}
+ 	spin_unlock(&rq->xdp_ring.producer_lock);
+ 
+ 	if (flags & XDP_XMIT_FLUSH)
+ 		__veth_xdp_flush(rq);
+ 
+-	ret = n - drops;
++	ret = nxmit;
+ 	if (ndo_xmit) {
+ 		u64_stats_update_begin(&rq->stats.syncp);
+-		rq->stats.vs.peer_tq_xdp_xmit += n - drops;
+-		rq->stats.vs.peer_tq_xdp_xmit_err += drops;
++		rq->stats.vs.peer_tq_xdp_xmit += nxmit;
++		rq->stats.vs.peer_tq_xdp_xmit_err += n - nxmit;
+ 		u64_stats_update_end(&rq->stats.syncp);
+ 	}
+ 
+@@ -562,20 +561,23 @@ static int veth_ndo_xdp_xmit(struct net_device *dev, int n,
+ 
+ static void veth_xdp_flush_bq(struct veth_rq *rq, struct veth_xdp_tx_bq *bq)
+ {
+-	int sent, i, err = 0;
++	int sent, i, err = 0, drops;
+ 
+ 	sent = veth_xdp_xmit(rq->dev, bq->count, bq->q, 0, false);
+ 	if (sent < 0) {
+ 		err = sent;
+ 		sent = 0;
+-		for (i = 0; i < bq->count; i++)
+-			xdp_return_frame(bq->q[i]);
+ 	}
+-	trace_xdp_bulk_tx(rq->dev, sent, bq->count - sent, err);
++
++	for (i = sent; unlikely(i < bq->count); i++)
++		xdp_return_frame(bq->q[i]);
++
++	drops = bq->count - sent;
++	trace_xdp_bulk_tx(rq->dev, sent, drops, err);
+ 
+ 	u64_stats_update_begin(&rq->stats.syncp);
+ 	rq->stats.vs.xdp_tx += sent;
+-	rq->stats.vs.xdp_tx_err += bq->count - sent;
++	rq->stats.vs.xdp_tx_err += drops;
+ 	u64_stats_update_end(&rq->stats.syncp);
+ 
+ 	bq->count = 0;
+* Unmerged path drivers/net/virtio_net.c
+* Unmerged path drivers/net/xen-netfront.c
+diff --git a/kernel/bpf/devmap.c b/kernel/bpf/devmap.c
+index 418ca3a16f80..6f81df3aaa86 100644
+--- a/kernel/bpf/devmap.c
++++ b/kernel/bpf/devmap.c
+@@ -338,7 +338,7 @@ bool dev_map_can_have_prog(struct bpf_map *map)
+ static void bq_xmit_all(struct xdp_dev_bulk_queue *bq, u32 flags)
+ {
+ 	struct net_device *dev = bq->dev;
+-	int sent = 0, drops = 0, err = 0;
++	int sent = 0, err = 0;
+ 	int i;
+ 
+ 	if (unlikely(!bq->count))
+@@ -352,29 +352,23 @@ static void bq_xmit_all(struct xdp_dev_bulk_queue *bq, u32 flags)
+ 
+ 	sent = dev->netdev_ops->ndo_xdp_xmit(dev, bq->count, bq->q, flags);
+ 	if (sent < 0) {
++		/* If ndo_xdp_xmit fails with an errno, no frames have
++		 * been xmit'ed.
++		 */
+ 		err = sent;
+ 		sent = 0;
+-		goto error;
+ 	}
+-	drops = bq->count - sent;
+-out:
+-	bq->count = 0;
+ 
+-	trace_xdp_devmap_xmit(bq->dev_rx, dev, sent, drops, err);
+-	bq->dev_rx = NULL;
+-	__list_del_clearprev(&bq->flush_node);
+-	return;
+-error:
+-	/* If ndo_xdp_xmit fails with an errno, no frames have been
+-	 * xmit'ed and it's our responsibility to them free all.
++	/* If not all frames have been transmitted, it is our
++	 * responsibility to free them
+ 	 */
+-	for (i = 0; i < bq->count; i++) {
+-		struct xdp_frame *xdpf = bq->q[i];
++	for (i = sent; unlikely(i < bq->count); i++)
++		xdp_return_frame_rx_napi(bq->q[i]);
+ 
+-		xdp_return_frame_rx_napi(xdpf);
+-		drops++;
+-	}
+-	goto out;
++	trace_xdp_devmap_xmit(bq->dev_rx, dev, sent, bq->count - sent, err);
++	bq->dev_rx = NULL;
++	bq->count = 0;
++	__list_del_clearprev(&bq->flush_node);
+ }
+ 
+ /* __dev_flush is called from xdp_do_flush() which _must_ be signaled
