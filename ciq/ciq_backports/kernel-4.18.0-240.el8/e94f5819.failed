@@ -1,0 +1,236 @@
+block: allocate the zone bitmaps lazily
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Christoph Hellwig <hch@lst.de>
+commit e94f5819448c5b75829662eaa9c25c17868846cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/e94f5819.failed
+
+Allocate the conventional zone bitmap and the sequential zone locking
+bitmap only when we find a zone of the respective type.  This avoids
+wasting memory on the conventional zone bitmap for devices that only
+have sequential zones, and will also prepare for other future changes.
+
+	Reviewed-by: Javier González <javier@javigon.com>
+	Signed-off-by: Christoph Hellwig <hch@lst.de>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit e94f5819448c5b75829662eaa9c25c17868846cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	block/blk-zoned.c
+diff --cc block/blk-zoned.c
+index dfece77e25b8,0131f9e14bd1..000000000000
+--- a/block/blk-zoned.c
++++ b/block/blk-zoned.c
+@@@ -419,6 -338,81 +419,84 @@@ void blk_queue_free_zone_bitmaps(struc
+  	q->seq_zones_wlock = NULL;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ struct blk_revalidate_zone_args {
++ 	struct gendisk	*disk;
++ 	unsigned long	*conv_zones_bitmap;
++ 	unsigned long	*seq_zones_wlock;
++ 	unsigned int	nr_zones;
++ 	sector_t	sector;
++ };
++ 
++ /*
++  * Helper function to check the validity of zones of a zoned block device.
++  */
++ static int blk_revalidate_zone_cb(struct blk_zone *zone, unsigned int idx,
++ 				  void *data)
++ {
++ 	struct blk_revalidate_zone_args *args = data;
++ 	struct gendisk *disk = args->disk;
++ 	struct request_queue *q = disk->queue;
++ 	sector_t zone_sectors = blk_queue_zone_sectors(q);
++ 	sector_t capacity = get_capacity(disk);
++ 
++ 	/*
++ 	 * All zones must have the same size, with the exception on an eventual
++ 	 * smaller last zone.
++ 	 */
++ 	if (zone->start + zone_sectors < capacity &&
++ 	    zone->len != zone_sectors) {
++ 		pr_warn("%s: Invalid zoned device with non constant zone size\n",
++ 			disk->disk_name);
++ 		return false;
++ 	}
++ 
++ 	if (zone->start + zone->len >= capacity &&
++ 	    zone->len > zone_sectors) {
++ 		pr_warn("%s: Invalid zoned device with larger last zone size\n",
++ 			disk->disk_name);
++ 		return -ENODEV;
++ 	}
++ 
++ 	/* Check for holes in the zone report */
++ 	if (zone->start != args->sector) {
++ 		pr_warn("%s: Zone gap at sectors %llu..%llu\n",
++ 			disk->disk_name, args->sector, zone->start);
++ 		return -ENODEV;
++ 	}
++ 
++ 	/* Check zone type */
++ 	switch (zone->type) {
++ 	case BLK_ZONE_TYPE_CONVENTIONAL:
++ 		if (!args->conv_zones_bitmap) {
++ 			args->conv_zones_bitmap =
++ 				blk_alloc_zone_bitmap(q->node, args->nr_zones);
++ 			if (!args->conv_zones_bitmap)
++ 				return -ENOMEM;
++ 		}
++ 		set_bit(idx, args->conv_zones_bitmap);
++ 		break;
++ 	case BLK_ZONE_TYPE_SEQWRITE_REQ:
++ 	case BLK_ZONE_TYPE_SEQWRITE_PREF:
++ 		if (!args->seq_zones_wlock) {
++ 			args->seq_zones_wlock =
++ 				blk_alloc_zone_bitmap(q->node, args->nr_zones);
++ 			if (!args->seq_zones_wlock)
++ 				return -ENOMEM;
++ 		}
++ 		break;
++ 	default:
++ 		pr_warn("%s: Invalid zone type 0x%x at sectors %llu\n",
++ 			disk->disk_name, (int)zone->type, zone->start);
++ 		return -ENODEV;
++ 	}
++ 
++ 	args->sector += zone->len;
++ 	return 0;
++ }
++ 
+++>>>>>>> e94f5819448c (block: allocate the zone bitmaps lazily)
+  /**
+   * blk_revalidate_disk_zones - (re)allocate and initialize zone bitmaps
+   * @disk:	Target disk
+@@@ -431,13 -425,15 +509,20 @@@
+  int blk_revalidate_disk_zones(struct gendisk *disk)
+  {
+  	struct request_queue *q = disk->queue;
+++<<<<<<< HEAD
+ +	unsigned int nr_zones = __blkdev_nr_zones(q, get_capacity(disk));
+ +	unsigned long *seq_zones_wlock = NULL, *seq_zones_bitmap = NULL;
+ +	unsigned int i, rep_nr_zones = 0, z = 0, nrz;
+ +	struct blk_zone *zones = NULL;
+ +	sector_t sector = 0;
+++=======
++ 	struct blk_revalidate_zone_args args = {
++ 		.disk		= disk,
++ 		.nr_zones	= blkdev_nr_zones(disk),
++ 	};
+++>>>>>>> e94f5819448c (block: allocate the zone bitmaps lazily)
+  	int ret = 0;
+  
+ -	if (WARN_ON_ONCE(!blk_queue_is_zoned(q)))
+ -		return -EIO;
+ -
+  	/*
+  	 * BIO based queues do not use a scheduler so only q->nr_zones
+  	 * needs to be updated so that the sysfs exposed value is correct.
+@@@ -447,71 -443,37 +532,96 @@@
+  		return 0;
+  	}
+  
+++<<<<<<< HEAD
+ +	if (!blk_queue_is_zoned(q) || !nr_zones) {
+ +		nr_zones = 0;
+ +		goto update;
+++=======
++ 	/*
++ 	 * Ensure that all memory allocations in this context are done as
++ 	 * if GFP_NOIO was specified.
++ 	 */
++ 	if (args.nr_zones) {
++ 		unsigned int noio_flag = memalloc_noio_save();
++ 
++ 		ret = disk->fops->report_zones(disk, 0, args.nr_zones,
++ 					       blk_revalidate_zone_cb, &args);
++ 		memalloc_noio_restore(noio_flag);
+++>>>>>>> e94f5819448c (block: allocate the zone bitmaps lazily)
+ +	}
+ +
+ +	/* Allocate bitmaps */
+ +	ret = -ENOMEM;
+ +	seq_zones_wlock = blk_alloc_zone_bitmap(q->node, nr_zones);
+ +	if (!seq_zones_wlock)
+ +		goto out;
+ +	seq_zones_bitmap = blk_alloc_zone_bitmap(q->node, nr_zones);
+ +	if (!seq_zones_bitmap)
+ +		goto out;
+ +
+ +	/* Get zone information and initialize seq_zones_bitmap */
+ +	rep_nr_zones = nr_zones;
+ +	zones = blk_alloc_zones(q->node, &rep_nr_zones);
+ +	if (!zones)
+ +		goto out;
+ +
+ +	while (z < nr_zones) {
+ +		nrz = min(nr_zones - z, rep_nr_zones);
+ +		ret = blk_report_zones(disk, sector, zones, &nrz, GFP_NOIO);
+ +		if (ret)
+ +			goto out;
+ +		if (!nrz)
+ +			break;
+ +		for (i = 0; i < nrz; i++) {
+ +			if (zones[i].type != BLK_ZONE_TYPE_CONVENTIONAL)
+ +				set_bit(z, seq_zones_bitmap);
+ +			z++;
+ +		}
+ +		sector += nrz * blk_queue_zone_sectors(q);
+ +	}
+ +
+ +	if (WARN_ON(z != nr_zones)) {
+ +		ret = -EIO;
+ +		goto out;
+  	}
+  
+ +update:
+  	/*
+  	 * Install the new bitmaps, making sure the queue is stopped and
+  	 * all I/Os are completed (i.e. a scheduler is not referencing the
+  	 * bitmaps).
+  	 */
+  	blk_mq_freeze_queue(q);
+++<<<<<<< HEAD
+ +	q->nr_zones = nr_zones;
+ +	swap(q->seq_zones_wlock, seq_zones_wlock);
+ +	swap(q->seq_zones_bitmap, seq_zones_bitmap);
+++=======
++ 	if (ret >= 0) {
++ 		q->nr_zones = args.nr_zones;
++ 		swap(q->seq_zones_wlock, args.seq_zones_wlock);
++ 		swap(q->conv_zones_bitmap, args.conv_zones_bitmap);
++ 		ret = 0;
++ 	} else {
++ 		pr_warn("%s: failed to revalidate zones\n", disk->disk_name);
++ 		blk_queue_free_zone_bitmaps(q);
++ 	}
+++>>>>>>> e94f5819448c (block: allocate the zone bitmaps lazily)
+  	blk_mq_unfreeze_queue(q);
+  
+ -	kfree(args.seq_zones_wlock);
+ -	kfree(args.conv_zones_bitmap);
+ +out:
+ +	free_pages((unsigned long)zones,
+ +		   get_order(rep_nr_zones * sizeof(struct blk_zone)));
+ +	kfree(seq_zones_wlock);
+ +	kfree(seq_zones_bitmap);
+ +
+ +	if (ret) {
+ +		pr_warn("%s: failed to revalidate zones\n", disk->disk_name);
+ +		blk_mq_freeze_queue(q);
+ +		blk_queue_free_zone_bitmaps(q);
+ +		blk_mq_unfreeze_queue(q);
+ +	}
+ +
+  	return ret;
+  }
+  EXPORT_SYMBOL_GPL(blk_revalidate_disk_zones);
+* Unmerged path block/blk-zoned.c
