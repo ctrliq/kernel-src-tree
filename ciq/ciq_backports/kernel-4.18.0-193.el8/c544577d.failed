@@ -1,0 +1,468 @@
+SUNRPC: Clean up transport write space handling
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Trond Myklebust <trond.myklebust@hammerspace.com>
+commit c544577daddb618c7dd5fa7fb98d6a41782f020e
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/c544577d.failed
+
+Treat socket write space handling in the same way we now treat transport
+congestion: by denying the XPRT_LOCK until the transport signals that it
+has free buffer space.
+
+	Signed-off-by: Trond Myklebust <trond.myklebust@hammerspace.com>
+(cherry picked from commit c544577daddb618c7dd5fa7fb98d6a41782f020e)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	include/linux/sunrpc/xprt.h
+#	net/sunrpc/clnt.c
+#	net/sunrpc/xprt.c
+diff --cc include/linux/sunrpc/xprt.h
+index e7472a422479,5600242ccbf9..000000000000
+--- a/include/linux/sunrpc/xprt.h
++++ b/include/linux/sunrpc/xprt.h
+@@@ -399,6 -415,8 +399,11 @@@ void			xprt_unlock_connect(struct rpc_x
+  #define XPRT_BINDING		(5)
+  #define XPRT_CLOSING		(6)
+  #define XPRT_CONGESTED		(9)
+++<<<<<<< HEAD
+++=======
++ #define XPRT_CWND_WAIT		(10)
++ #define XPRT_WRITE_SPACE	(11)
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  
+  static inline void xprt_set_connected(struct rpc_xprt *xprt)
+  {
+diff --cc net/sunrpc/clnt.c
+index d6ca4ed0e072,0c4b2e7d791f..000000000000
+--- a/net/sunrpc/clnt.c
++++ b/net/sunrpc/clnt.c
+@@@ -1942,40 -1962,16 +1942,50 @@@ call_connect_status(struct rpc_task *ta
+  static void
+  call_transmit(struct rpc_task *task)
+  {
+ +	int is_retrans = RPC_WAS_SENT(task);
+ +
+  	dprint_status(task);
+  
++ 	task->tk_status = 0;
++ 	if (test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate)) {
++ 		if (!xprt_prepare_transmit(task))
++ 			return;
++ 		xprt_transmit(task);
++ 	}
+  	task->tk_action = call_transmit_status;
+++<<<<<<< HEAD
+ +	/* Encode here so that rpcsec_gss can use correct sequence number. */
+ +	if (rpc_task_need_encode(task)) {
+ +		rpc_xdr_encode(task);
+ +		/* Did the encode result in an error condition? */
+ +		if (task->tk_status != 0) {
+ +			/* Was the error nonfatal? */
+ +			if (task->tk_status == -EAGAIN)
+ +				rpc_delay(task, HZ >> 4);
+ +			else
+ +				rpc_exit(task, task->tk_status);
+ +			return;
+ +		}
+ +	}
+ +	if (!xprt_prepare_transmit(task))
+ +		return;
+ +	xprt_transmit(task);
+ +	if (task->tk_status < 0)
+ +		return;
+ +	if (is_retrans)
+ +		task->tk_client->cl_stats->rpcretrans++;
+ +	/*
+ +	 * On success, ensure that we call xprt_end_transmit() before sleeping
+ +	 * in order to allow access to the socket to other RPC requests.
+ +	 */
+ +	call_transmit_status(task);
+ +	if (rpc_reply_expected(task))
+ +		return;
+ +	task->tk_action = rpc_exit_task;
+ +	rpc_wake_up_queued_task(&task->tk_rqstp->rq_xprt->pending, task);
+++=======
++ 	xprt_end_transmit(task);
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  }
+  
+  /*
+@@@ -1991,20 -1987,17 +2001,31 @@@ call_transmit_status(struct rpc_task *t
+  	 * test first.
+  	 */
+  	if (task->tk_status == 0) {
+++<<<<<<< HEAD
+ +		xprt_end_transmit(task);
+++=======
++ 		xprt_request_wait_receive(task);
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  		return;
+  	}
+  
+  	switch (task->tk_status) {
+  	default:
+  		dprint_status(task);
+++<<<<<<< HEAD
+ +		xprt_end_transmit(task);
+ +		break;
+ +	case -EBADMSG:
+ +		clear_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate);
+ +		task->tk_action = call_transmit;
+ +		task->tk_status = 0;
+ +		xprt_end_transmit(task);
+++=======
++ 		break;
++ 	case -EBADMSG:
++ 		task->tk_status = 0;
++ 		task->tk_action = call_encode;
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  		break;
+  		/*
+  		 * Special cases: if we've been waiting on the
+@@@ -2066,9 -2062,6 +2087,12 @@@ call_bc_transmit(struct rpc_task *task
+  
+  	xprt_transmit(task);
+  
+++<<<<<<< HEAD
+ +	if (task->tk_status == -EAGAIN)
+ +		goto out_nospace;
+ +
+++=======
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  	xprt_end_transmit(task);
+  	dprint_status(task);
+  	switch (task->tk_status) {
+diff --cc net/sunrpc/xprt.c
+index 94c01ec0b45e,55dc5c7069b9..000000000000
+--- a/net/sunrpc/xprt.c
++++ b/net/sunrpc/xprt.c
+@@@ -190,9 -199,9 +201,11 @@@ int xprt_reserve_xprt(struct rpc_xprt *
+  			return 1;
+  		goto out_sleep;
+  	}
++ 	if (test_bit(XPRT_WRITE_SPACE, &xprt->state))
++ 		goto out_unlock;
+  	xprt->snd_task = task;
+ +	if (req != NULL)
+ +		req->rq_ntrans++;
+  
+  	return 1;
+  
+@@@ -212,15 -223,29 +227,41 @@@ out_sleep
+  }
+  EXPORT_SYMBOL_GPL(xprt_reserve_xprt);
+  
+++<<<<<<< HEAD
+ +static void xprt_clear_locked(struct rpc_xprt *xprt)
+ +{
+ +	xprt->snd_task = NULL;
+ +	if (!test_bit(XPRT_CLOSE_WAIT, &xprt->state)) {
+ +		smp_mb__before_atomic();
+ +		clear_bit(XPRT_LOCKED, &xprt->state);
+ +		smp_mb__after_atomic();
+ +	} else
+ +		queue_work(xprtiod_workqueue, &xprt->task_cleanup);
+++=======
++ static bool
++ xprt_need_congestion_window_wait(struct rpc_xprt *xprt)
++ {
++ 	return test_bit(XPRT_CWND_WAIT, &xprt->state);
++ }
++ 
++ static void
++ xprt_set_congestion_window_wait(struct rpc_xprt *xprt)
++ {
++ 	if (!list_empty(&xprt->xmit_queue)) {
++ 		/* Peek at head of queue to see if it can make progress */
++ 		if (list_first_entry(&xprt->xmit_queue, struct rpc_rqst,
++ 					rq_xmit)->rq_cong)
++ 			return;
++ 	}
++ 	set_bit(XPRT_CWND_WAIT, &xprt->state);
++ }
++ 
++ static void
++ xprt_test_and_clear_congestion_window_wait(struct rpc_xprt *xprt)
++ {
++ 	if (!RPCXPRT_CONGESTED(xprt))
++ 		clear_bit(XPRT_CWND_WAIT, &xprt->state);
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  }
+  
+  /*
+@@@ -245,15 -271,15 +286,22 @@@ int xprt_reserve_xprt_cong(struct rpc_x
+  		xprt->snd_task = task;
+  		return 1;
+  	}
+++<<<<<<< HEAD
+ +	if (__xprt_get_cong(xprt, task)) {
+++=======
++ 	if (test_bit(XPRT_WRITE_SPACE, &xprt->state))
++ 		goto out_unlock;
++ 	if (!xprt_need_congestion_window_wait(xprt)) {
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  		xprt->snd_task = task;
+ +		req->rq_ntrans++;
+  		return 1;
+  	}
++ out_unlock:
+  	xprt_clear_locked(xprt);
+  out_sleep:
+ +	if (req)
+ +		__xprt_put_cong(xprt, req);
+  	dprintk("RPC: %5u failed to lock transport %p\n", task->tk_pid, xprt);
+  	task->tk_timeout = RPC_IS_SOFT(task) ? req->rq_timeout : 0;
+  	task->tk_status = -EAGAIN;
+@@@ -323,10 -329,12 +373,16 @@@ static void __xprt_lock_write_next_cong
+  {
+  	if (test_and_set_bit(XPRT_LOCKED, &xprt->state))
+  		return;
+++<<<<<<< HEAD
+ +	if (RPCXPRT_CONGESTED(xprt))
+++=======
++ 	if (test_bit(XPRT_WRITE_SPACE, &xprt->state))
++ 		goto out_unlock;
++ 	if (xprt_need_congestion_window_wait(xprt))
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  		goto out_unlock;
+  	if (rpc_wake_up_first_on_wq(xprtiod_workqueue, &xprt->sending,
+ -				__xprt_lock_write_func, xprt))
+ +				__xprt_lock_write_cong_func, xprt))
+  		return;
+  out_unlock:
+  	xprt_clear_locked(xprt);
+@@@ -1064,22 -1307,49 +1128,66 @@@ void xprt_transmit(struct rpc_task *tas
+  	spin_unlock_bh(&xprt->transport_lock);
+  
+  	req->rq_connect_cookie = connect_cookie;
+++<<<<<<< HEAD
+ +	if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +		/*
+ +		 * Sleep on the pending queue if we're expecting a reply.
+ +		 * The spinlock ensures atomicity between the test of
+ +		 * req->rq_reply_bytes_recvd, and the call to rpc_sleep_on().
+ +		 */
+ +		spin_lock(&xprt->recv_lock);
+ +		if (test_bit(RPC_TASK_NEED_RECV, &task->tk_runstate)) {
+ +			rpc_sleep_on(&xprt->pending, task, xprt_timer);
+ +			/* Wake up immediately if the connection was dropped */
+ +			if (!xprt_connected(xprt))
+ +				rpc_wake_up_queued_task_set_status(&xprt->pending,
+ +						task, -ENOTCONN);
+ +		}
+ +		spin_unlock(&xprt->recv_lock);
+++=======
++ out_dequeue:
++ 	xprt_request_dequeue_transmit(task);
++ 	rpc_wake_up_queued_task_set_status(&xprt->sending, task, status);
++ 	return status;
++ }
++ 
++ /**
++  * xprt_transmit - send an RPC request on a transport
++  * @task: controlling RPC task
++  *
++  * Attempts to drain the transmit queue. On exit, either the transport
++  * signalled an error that needs to be handled before transmission can
++  * resume, or @task finished transmitting, and detected that it already
++  * received a reply.
++  */
++ void
++ xprt_transmit(struct rpc_task *task)
++ {
++ 	struct rpc_rqst *next, *req = task->tk_rqstp;
++ 	struct rpc_xprt	*xprt = req->rq_xprt;
++ 	int status;
++ 
++ 	spin_lock(&xprt->queue_lock);
++ 	while (!list_empty(&xprt->xmit_queue)) {
++ 		next = list_first_entry(&xprt->xmit_queue,
++ 				struct rpc_rqst, rq_xmit);
++ 		xprt_pin_rqst(next);
++ 		spin_unlock(&xprt->queue_lock);
++ 		status = xprt_request_transmit(next, task);
++ 		if (status == -EBADMSG && next != req)
++ 			status = 0;
++ 		cond_resched();
++ 		spin_lock(&xprt->queue_lock);
++ 		xprt_unpin_rqst(next);
++ 		if (status == 0) {
++ 			if (!xprt_request_data_received(task) ||
++ 			    test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 				continue;
++ 		} else if (test_bit(RPC_TASK_NEED_XMIT, &task->tk_runstate))
++ 			task->tk_status = status;
++ 		break;
+++>>>>>>> c544577daddb (SUNRPC: Clean up transport write space handling)
+  	}
+ -	spin_unlock(&xprt->queue_lock);
+  }
+  
+  static void xprt_add_backlog(struct rpc_xprt *xprt, struct rpc_task *task)
+diff --git a/include/linux/sunrpc/svc_xprt.h b/include/linux/sunrpc/svc_xprt.h
+index ed9dee308609..b3f9577e17d6 100644
+--- a/include/linux/sunrpc/svc_xprt.h
++++ b/include/linux/sunrpc/svc_xprt.h
+@@ -83,7 +83,6 @@ struct svc_xprt {
+ 	struct sockaddr_storage	xpt_remote;	/* remote peer's address */
+ 	size_t			xpt_remotelen;	/* length of address */
+ 	char			xpt_remotebuf[INET6_ADDRSTRLEN + 10];
+-	struct rpc_wait_queue	xpt_bc_pending;	/* backchannel wait queue */
+ 	struct list_head	xpt_users;	/* callbacks on free */
+ 
+ 	struct net		*xpt_net;
+* Unmerged path include/linux/sunrpc/xprt.h
+* Unmerged path net/sunrpc/clnt.c
+diff --git a/net/sunrpc/svc_xprt.c b/net/sunrpc/svc_xprt.c
+index af966da8870a..6107d7d46510 100644
+--- a/net/sunrpc/svc_xprt.c
++++ b/net/sunrpc/svc_xprt.c
+@@ -171,7 +171,6 @@ void svc_xprt_init(struct net *net, struct svc_xprt_class *xcl,
+ 	mutex_init(&xprt->xpt_mutex);
+ 	spin_lock_init(&xprt->xpt_lock);
+ 	set_bit(XPT_BUSY, &xprt->xpt_flags);
+-	rpc_init_wait_queue(&xprt->xpt_bc_pending, "xpt_bc_pending");
+ 	xprt->xpt_net = get_net(net);
+ 	strcpy(xprt->xpt_remotebuf, "uninitialized");
+ }
+@@ -896,7 +895,6 @@ int svc_send(struct svc_rqst *rqstp)
+ 	else
+ 		len = xprt->xpt_ops->xpo_sendto(rqstp);
+ 	mutex_unlock(&xprt->xpt_mutex);
+-	rpc_wake_up(&xprt->xpt_bc_pending);
+ 	trace_svc_send(rqstp, len);
+ 	svc_xprt_release(rqstp);
+ 
+* Unmerged path net/sunrpc/xprt.c
+diff --git a/net/sunrpc/xprtrdma/rpc_rdma.c b/net/sunrpc/xprtrdma/rpc_rdma.c
+index 5976d9d2af02..37823cfab9f8 100644
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@ -861,7 +861,7 @@ rpcrdma_marshal_req(struct rpcrdma_xprt *r_xprt, struct rpc_rqst *rqst)
+ out_err:
+ 	switch (ret) {
+ 	case -EAGAIN:
+-		xprt_wait_for_buffer_space(rqst->rq_task, NULL);
++		xprt_wait_for_buffer_space(rqst->rq_xprt);
+ 		break;
+ 	case -ENOBUFS:
+ 		break;
+diff --git a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+index d648cd53231c..5528b5e0b155 100644
+--- a/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
++++ b/net/sunrpc/xprtrdma/svc_rdma_backchannel.c
+@@ -220,12 +220,7 @@ xprt_rdma_bc_send_request(struct rpc_rqst *rqst, struct rpc_task *task)
+ 	dprintk("svcrdma: sending bc call with xid: %08x\n",
+ 		be32_to_cpu(rqst->rq_xid));
+ 
+-	if (!mutex_trylock(&sxprt->xpt_mutex)) {
+-		rpc_sleep_on(&sxprt->xpt_bc_pending, task, NULL);
+-		if (!mutex_trylock(&sxprt->xpt_mutex))
+-			return -EAGAIN;
+-		rpc_wake_up_queued_task(&sxprt->xpt_bc_pending, task);
+-	}
++	mutex_lock(&sxprt->xpt_mutex);
+ 
+ 	ret = -ENOTCONN;
+ 	rdma = container_of(sxprt, struct svcxprt_rdma, sc_xprt);
+diff --git a/net/sunrpc/xprtsock.c b/net/sunrpc/xprtsock.c
+index b3c742fe8073..e98f0f638180 100644
+--- a/net/sunrpc/xprtsock.c
++++ b/net/sunrpc/xprtsock.c
+@@ -440,20 +440,12 @@ static int xs_sendpages(struct socket *sock, struct sockaddr *addr, int addrlen,
+ 	return err;
+ }
+ 
+-static void xs_nospace_callback(struct rpc_task *task)
+-{
+-	struct sock_xprt *transport = container_of(task->tk_rqstp->rq_xprt, struct sock_xprt, xprt);
+-
+-	transport->inet->sk_write_pending--;
+-}
+-
+ /**
+- * xs_nospace - place task on wait queue if transmit was incomplete
++ * xs_nospace - handle transmit was incomplete
+  * @req: pointer to RPC request
+- * @task: task to put to sleep
+  *
+  */
+-static int xs_nospace(struct rpc_rqst *req, struct rpc_task *task)
++static int xs_nospace(struct rpc_rqst *req)
+ {
+ 	struct rpc_xprt *xprt = req->rq_xprt;
+ 	struct sock_xprt *transport = container_of(xprt, struct sock_xprt, xprt);
+@@ -461,7 +453,8 @@ static int xs_nospace(struct rpc_rqst *req, struct rpc_task *task)
+ 	int ret = -EAGAIN;
+ 
+ 	dprintk("RPC: %5u xmit incomplete (%u left of %u)\n",
+-			task->tk_pid, req->rq_slen - transport->xmit.offset,
++			req->rq_task->tk_pid,
++			req->rq_slen - transport->xmit.offset,
+ 			req->rq_slen);
+ 
+ 	/* Protect against races with write_space */
+@@ -471,7 +464,7 @@ static int xs_nospace(struct rpc_rqst *req, struct rpc_task *task)
+ 	if (xprt_connected(xprt)) {
+ 		/* wait for more buffer space */
+ 		sk->sk_write_pending++;
+-		xprt_wait_for_buffer_space(task, xs_nospace_callback);
++		xprt_wait_for_buffer_space(xprt);
+ 	} else
+ 		ret = -ENOTCONN;
+ 
+@@ -569,7 +562,7 @@ static int xs_local_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ 	case -ENOBUFS:
+ 		break;
+ 	case -EAGAIN:
+-		status = xs_nospace(req, task);
++		status = xs_nospace(req);
+ 		break;
+ 	default:
+ 		dprintk("RPC:       sendmsg returned unrecognized error %d\n",
+@@ -638,7 +631,7 @@ static int xs_udp_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ 		/* Should we call xs_close() here? */
+ 		break;
+ 	case -EAGAIN:
+-		status = xs_nospace(req, task);
++		status = xs_nospace(req);
+ 		break;
+ 	case -ENETUNREACH:
+ 	case -ENOBUFS:
+@@ -761,7 +754,7 @@ static int xs_tcp_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ 		/* Should we call xs_close() here? */
+ 		break;
+ 	case -EAGAIN:
+-		status = xs_nospace(req, task);
++		status = xs_nospace(req);
+ 		break;
+ 	case -ECONNRESET:
+ 	case -ECONNREFUSED:
+@@ -1679,7 +1672,8 @@ static void xs_write_space(struct sock *sk)
+ 	if (!wq || test_and_clear_bit(SOCKWQ_ASYNC_NOSPACE, &wq->flags) == 0)
+ 		goto out;
+ 
+-	xprt_write_space(xprt);
++	if (xprt_write_space(xprt))
++		sk->sk_write_pending--;
+ out:
+ 	rcu_read_unlock();
+ }
+@@ -2726,12 +2720,7 @@ static int bc_send_request(struct rpc_rqst *req, struct rpc_task *task)
+ 	 * Grab the mutex to serialize data as the connection is shared
+ 	 * with the fore channel
+ 	 */
+-	if (!mutex_trylock(&xprt->xpt_mutex)) {
+-		rpc_sleep_on(&xprt->xpt_bc_pending, task, NULL);
+-		if (!mutex_trylock(&xprt->xpt_mutex))
+-			return -EAGAIN;
+-		rpc_wake_up_queued_task(&xprt->xpt_bc_pending, task);
+-	}
++	mutex_lock(&xprt->xpt_mutex);
+ 	if (test_bit(XPT_DEAD, &xprt->xpt_flags))
+ 		len = -ENOTCONN;
+ 	else
