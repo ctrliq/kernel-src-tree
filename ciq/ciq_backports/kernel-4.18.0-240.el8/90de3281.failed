@@ -1,0 +1,369 @@
+Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+Rebuild_CHGLOG: - [sound] ALSA: Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread (Jaroslav Kysela) [1797509]
+Rebuild_FUZZ: 95.83%
+commit-author Rander Wang <rander.wang@intel.com>
+commit 90de3281c86ae5378e951e84c76c4759390ff34d
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/90de3281.failed
+
+If pci device is in D0, wakeen interrupt will be
+aggregated at cAVS level as interrupt. This commit
+check the wakeen status and process it in irq thread
+
+	Signed-off-by: Pierre-Louis Bossart <pierre-louis.bossart@linux.intel.com>
+	Signed-off-by: Rander Wang <rander.wang@intel.com>
+Link: https://lore.kernel.org/r/20200325215027.28716-11-pierre-louis.bossart@linux.intel.com
+	Signed-off-by: Mark Brown <broonie@kernel.org>
+(cherry picked from commit 90de3281c86ae5378e951e84c76c4759390ff34d)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	sound/soc/sof/intel/hda.c
+#	sound/soc/sof/intel/hda.h
+diff --cc sound/soc/sof/intel/hda.c
+index e20431686d1c,211e91e79eae..000000000000
+--- a/sound/soc/sof/intel/hda.c
++++ b/sound/soc/sof/intel/hda.c
+@@@ -34,6 -38,235 +34,238 @@@
+  
+  #define EXCEPT_MAX_HDR_SIZE	0x400
+  
+++<<<<<<< HEAD
+++=======
++ #if IS_ENABLED(CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE)
++ 
++ /*
++  * The default for SoundWire clock stop quirks is to power gate the IP
++  * and do a Bus Reset, this will need to be modified when the DSP
++  * needs to remain in D0i3 so that the Master does not lose context
++  * and enumeration is not required on clock restart
++  */
++ static int sdw_clock_stop_quirks = SDW_INTEL_CLK_STOP_BUS_RESET;
++ module_param(sdw_clock_stop_quirks, int, 0444);
++ MODULE_PARM_DESC(sdw_clock_stop_quirks, "SOF SoundWire clock stop quirks");
++ 
++ static int sdw_params_stream(struct device *dev,
++ 			     struct sdw_intel_stream_params_data *params_data)
++ {
++ 	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
++ 	struct snd_soc_dai *d = params_data->dai;
++ 	struct sof_ipc_dai_config config;
++ 	struct sof_ipc_reply reply;
++ 	int link_id = params_data->link_id;
++ 	int alh_stream_id = params_data->alh_stream_id;
++ 	int ret;
++ 	u32 size = sizeof(config);
++ 
++ 	memset(&config, 0, size);
++ 	config.hdr.size = size;
++ 	config.hdr.cmd = SOF_IPC_GLB_DAI_MSG | SOF_IPC_DAI_CONFIG;
++ 	config.type = SOF_DAI_INTEL_ALH;
++ 	config.dai_index = (link_id << 8) | (d->id);
++ 	config.alh.stream_id = alh_stream_id;
++ 
++ 	/* send message to DSP */
++ 	ret = sof_ipc_tx_message(sdev->ipc,
++ 				 config.hdr.cmd, &config, size, &reply,
++ 				 sizeof(reply));
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev,
++ 			"error: failed to set DAI hw_params for link %d dai->id %d ALH %d\n",
++ 			link_id, d->id, alh_stream_id);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static int sdw_free_stream(struct device *dev,
++ 			   struct sdw_intel_stream_free_data *free_data)
++ {
++ 	struct snd_sof_dev *sdev = dev_get_drvdata(dev);
++ 	struct snd_soc_dai *d = free_data->dai;
++ 	struct sof_ipc_dai_config config;
++ 	struct sof_ipc_reply reply;
++ 	int link_id = free_data->link_id;
++ 	int ret;
++ 	u32 size = sizeof(config);
++ 
++ 	memset(&config, 0, size);
++ 	config.hdr.size = size;
++ 	config.hdr.cmd = SOF_IPC_GLB_DAI_MSG | SOF_IPC_DAI_CONFIG;
++ 	config.type = SOF_DAI_INTEL_ALH;
++ 	config.dai_index = (link_id << 8) | d->id;
++ 	config.alh.stream_id = 0xFFFF; /* invalid value on purpose */
++ 
++ 	/* send message to DSP */
++ 	ret = sof_ipc_tx_message(sdev->ipc,
++ 				 config.hdr.cmd, &config, size, &reply,
++ 				 sizeof(reply));
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev,
++ 			"error: failed to free stream for link %d dai->id %d\n",
++ 			link_id, d->id);
++ 	}
++ 
++ 	return ret;
++ }
++ 
++ static const struct sdw_intel_ops sdw_callback = {
++ 	.params_stream = sdw_params_stream,
++ 	.free_stream = sdw_free_stream,
++ };
++ 
++ void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable)
++ {
++ 	sdw_intel_enable_irq(sdev->bar[HDA_DSP_BAR], enable);
++ }
++ 
++ static int hda_sdw_acpi_scan(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 	acpi_handle handle;
++ 	int ret;
++ 
++ 	handle = ACPI_HANDLE(sdev->dev);
++ 
++ 	/* save ACPI info for the probe step */
++ 	hdev = sdev->pdata->hw_pdata;
++ 
++ 	ret = sdw_intel_acpi_scan(handle, &hdev->info);
++ 	if (ret < 0) {
++ 		dev_err(sdev->dev, "%s failed\n", __func__);
++ 		return -EINVAL;
++ 	}
++ 
++ 	return 0;
++ }
++ 
++ static int hda_sdw_probe(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 	struct sdw_intel_res res;
++ 	void *sdw;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 
++ 	memset(&res, 0, sizeof(res));
++ 
++ 	res.mmio_base = sdev->bar[HDA_DSP_BAR];
++ 	res.irq = sdev->ipc_irq;
++ 	res.handle = hdev->info.handle;
++ 	res.parent = sdev->dev;
++ 	res.ops = &sdw_callback;
++ 	res.dev = sdev->dev;
++ 	res.clock_stop_quirks = sdw_clock_stop_quirks;
++ 
++ 	/*
++ 	 * ops and arg fields are not populated for now,
++ 	 * they will be needed when the DAI callbacks are
++ 	 * provided
++ 	 */
++ 
++ 	/* we could filter links here if needed, e.g for quirks */
++ 	res.count = hdev->info.count;
++ 	res.link_mask = hdev->info.link_mask;
++ 
++ 	sdw = sdw_intel_probe(&res);
++ 	if (!sdw) {
++ 		dev_err(sdev->dev, "error: SoundWire probe failed\n");
++ 		return -EINVAL;
++ 	}
++ 
++ 	/* save context */
++ 	hdev->sdw = sdw;
++ 
++ 	return 0;
++ }
++ 
++ int hda_sdw_startup(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 
++ 	if (!hdev->sdw)
++ 		return 0;
++ 
++ 	return sdw_intel_startup(hdev->sdw);
++ }
++ 
++ static int hda_sdw_exit(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 
++ 	hda_sdw_int_enable(sdev, false);
++ 
++ 	if (hdev->sdw)
++ 		sdw_intel_exit(hdev->sdw);
++ 	hdev->sdw = NULL;
++ 
++ 	return 0;
++ }
++ 
++ static bool hda_dsp_check_sdw_irq(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 	bool ret = false;
++ 	u32 irq_status;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 
++ 	if (!hdev->sdw)
++ 		return ret;
++ 
++ 	/* store status */
++ 	irq_status = snd_sof_dsp_read(sdev, HDA_DSP_BAR, HDA_DSP_REG_ADSPIS2);
++ 
++ 	/* invalid message ? */
++ 	if (irq_status == 0xffffffff)
++ 		goto out;
++ 
++ 	/* SDW message ? */
++ 	if (irq_status & HDA_DSP_REG_ADSPIS2_SNDW)
++ 		ret = true;
++ 
++ out:
++ 	return ret;
++ }
++ 
++ static irqreturn_t hda_dsp_sdw_thread(int irq, void *context)
++ {
++ 	return sdw_intel_thread(irq, context);
++ }
++ 
++ static bool hda_sdw_check_wakeen_irq(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 	if (hdev->sdw &&
++ 	    snd_sof_dsp_read(sdev, HDA_DSP_BAR,
++ 			     HDA_DSP_REG_SNDW_WAKE_STS))
++ 		return true;
++ 
++ 	return false;
++ }
++ 
++ void hda_sdw_process_wakeen(struct snd_sof_dev *sdev)
++ {
++ 	struct sof_intel_hda_dev *hdev;
++ 
++ 	hdev = sdev->pdata->hw_pdata;
++ 	if (!hdev->sdw)
++ 		return;
++ 
++ 	sdw_intel_process_wakeen_event(hdev->sdw);
++ }
++ 
++ #endif
++ 
+++>>>>>>> 90de3281c86a (Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread)
+  /*
+   * Debug
+   */
+@@@ -531,6 -694,12 +763,15 @@@ static irqreturn_t hda_dsp_interrupt_th
+  	if (hda_dsp_check_ipc_irq(sdev))
+  		sof_ops(sdev)->irq_thread(irq, sdev);
+  
+++<<<<<<< HEAD
+++=======
++ 	if (hda_dsp_check_sdw_irq(sdev))
++ 		hda_dsp_sdw_thread(irq, hdev->sdw);
++ 
++ 	if (hda_sdw_check_wakeen_irq(sdev))
++ 		hda_sdw_process_wakeen(sdev);
++ 
+++>>>>>>> 90de3281c86a (Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread)
+  	/* enable GIE interrupt */
+  	snd_sof_dsp_update_bits(sdev, HDA_DSP_HDA_BAR,
+  				SOF_HDA_INTCTL,
+diff --cc sound/soc/sof/intel/hda.h
+index fc0b6afb3d4f,e9825798de77..000000000000
+--- a/sound/soc/sof/intel/hda.h
++++ b/sound/soc/sof/intel/hda.h
+@@@ -231,6 -232,9 +231,12 @@@
+  #define HDA_DSP_REG_ADSPIC2		(HDA_DSP_GEN_BASE + 0x10)
+  #define HDA_DSP_REG_ADSPIS2		(HDA_DSP_GEN_BASE + 0x14)
+  
+++<<<<<<< HEAD
+++=======
++ #define HDA_DSP_REG_ADSPIS2_SNDW	BIT(5)
++ #define HDA_DSP_REG_SNDW_WAKE_STS      0x2C192
++ 
+++>>>>>>> 90de3281c86a (Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread)
+  /* Intel HD Audio Inter-Processor Communication Registers */
+  #define HDA_DSP_IPC_BASE		0x40
+  #define HDA_DSP_REG_HIPCT		(HDA_DSP_IPC_BASE + 0x00)
+@@@ -633,6 -665,61 +639,64 @@@ int hda_dsp_trace_init(struct snd_sof_d
+  int hda_dsp_trace_release(struct snd_sof_dev *sdev);
+  int hda_dsp_trace_trigger(struct snd_sof_dev *sdev, int cmd);
+  
+++<<<<<<< HEAD
+++=======
++ /*
++  * SoundWire support
++  */
++ #if IS_ENABLED(CONFIG_SND_SOC_SOF_INTEL_SOUNDWIRE)
++ 
++ int hda_sdw_startup(struct snd_sof_dev *sdev);
++ void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable);
++ void hda_sdw_process_wakeen(struct snd_sof_dev *sdev);
++ 
++ #else
++ 
++ static inline int hda_sdw_acpi_scan(struct snd_sof_dev *sdev)
++ {
++ 	return 0;
++ }
++ 
++ static inline int hda_sdw_probe(struct snd_sof_dev *sdev)
++ {
++ 	return 0;
++ }
++ 
++ static inline int hda_sdw_startup(struct snd_sof_dev *sdev)
++ {
++ 	return 0;
++ }
++ 
++ static inline int hda_sdw_exit(struct snd_sof_dev *sdev)
++ {
++ 	return 0;
++ }
++ 
++ static inline void hda_sdw_int_enable(struct snd_sof_dev *sdev, bool enable)
++ {
++ }
++ 
++ static inline bool hda_dsp_check_sdw_irq(struct snd_sof_dev *sdev)
++ {
++ 	return false;
++ }
++ 
++ static inline irqreturn_t hda_dsp_sdw_thread(int irq, void *context)
++ {
++ 	return IRQ_HANDLED;
++ }
++ 
++ static inline bool hda_sdw_check_wakeen_irq(struct snd_sof_dev *sdev)
++ {
++ 	return false;
++ }
++ 
++ static inline void hda_sdw_process_wakeen(struct snd_sof_dev *sdev)
++ {
++ }
++ #endif
++ 
+++>>>>>>> 90de3281c86a (Asoc: SOF: Intel: hda: check SoundWire wakeen interrupt in irq thread)
+  /* common dai driver */
+  extern struct snd_soc_dai_driver skl_dai[];
+  
+* Unmerged path sound/soc/sof/intel/hda.c
+* Unmerged path sound/soc/sof/intel/hda.h
