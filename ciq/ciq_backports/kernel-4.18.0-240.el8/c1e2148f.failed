@@ -1,0 +1,154 @@
+io_uring: free fixed_file_data after RCU grace period
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Jens Axboe <axboe@kernel.dk>
+commit c1e2148f8ecb26863b899d402a823dab8e26efd1
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/c1e2148f.failed
+
+The percpu refcount protects this structure, and we can have an atomic
+switch in progress when exiting. This makes it unsafe to just free the
+struct normally, and can trigger the following KASAN warning:
+
+BUG: KASAN: use-after-free in percpu_ref_switch_to_atomic_rcu+0xfa/0x1b0
+Read of size 1 at addr ffff888181a19a30 by task swapper/0/0
+
+CPU: 0 PID: 0 Comm: swapper/0 Not tainted 5.6.0-rc4+ #5747
+Hardware name: QEMU Standard PC (i440FX + PIIX, 1996), BIOS 1.10.2-1ubuntu1 04/01/2014
+Call Trace:
+ <IRQ>
+ dump_stack+0x76/0xa0
+ print_address_description.constprop.0+0x3b/0x60
+ ? percpu_ref_switch_to_atomic_rcu+0xfa/0x1b0
+ ? percpu_ref_switch_to_atomic_rcu+0xfa/0x1b0
+ __kasan_report.cold+0x1a/0x3d
+ ? percpu_ref_switch_to_atomic_rcu+0xfa/0x1b0
+ percpu_ref_switch_to_atomic_rcu+0xfa/0x1b0
+ rcu_core+0x370/0x830
+ ? percpu_ref_exit+0x50/0x50
+ ? rcu_note_context_switch+0x7b0/0x7b0
+ ? run_rebalance_domains+0x11d/0x140
+ __do_softirq+0x10a/0x3e9
+ irq_exit+0xd5/0xe0
+ smp_apic_timer_interrupt+0x86/0x200
+ apic_timer_interrupt+0xf/0x20
+ </IRQ>
+RIP: 0010:default_idle+0x26/0x1f0
+
+Fix this by punting the final exit and free of the struct to RCU, then
+we know that it's safe to do so. Jann suggested the approach of using a
+double rcu callback to achieve this. It's important that we do a nested
+call_rcu() callback, as otherwise the free could be ordered before the
+atomic switch, even if the latter was already queued.
+
+	Reported-by: syzbot+e017e49c39ab484ac87a@syzkaller.appspotmail.com
+	Suggested-by: Jann Horn <jannh@google.com>
+	Reviewed-by: Paul E. McKenney <paulmck@kernel.org>
+	Signed-off-by: Jens Axboe <axboe@kernel.dk>
+(cherry picked from commit c1e2148f8ecb26863b899d402a823dab8e26efd1)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	fs/io_uring.c
+diff --cc fs/io_uring.c
+index 7842c6de7135,68050b61ad0e..000000000000
+--- a/fs/io_uring.c
++++ b/fs/io_uring.c
+@@@ -197,14 -179,19 +197,26 @@@ struct io_mapped_ubuf 
+  	unsigned int	nr_bvecs;
+  };
+  
+ -struct fixed_file_table {
+ -	struct file		**files;
+ -};
+ +struct async_list {
+ +	spinlock_t		lock;
+ +	atomic_t		cnt;
+ +	struct list_head	list;
+  
+++<<<<<<< HEAD
+ +	struct file		*file;
+ +	off_t			io_start;
+ +	size_t			io_len;
+++=======
++ struct fixed_file_data {
++ 	struct fixed_file_table		*table;
++ 	struct io_ring_ctx		*ctx;
++ 
++ 	struct percpu_ref		refs;
++ 	struct llist_head		put_llist;
++ 	struct work_struct		ref_work;
++ 	struct completion		done;
++ 	struct rcu_head			rcu;
+++>>>>>>> c1e2148f8ecb (io_uring: free fixed_file_data after RCU grace period)
+  };
+  
+  struct io_ring_ctx {
+@@@ -2740,14 -5322,54 +2752,60 @@@ static void __io_sqe_files_unregister(s
+  #endif
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static void io_file_ref_kill(struct percpu_ref *ref)
++ {
++ 	struct fixed_file_data *data;
++ 
++ 	data = container_of(ref, struct fixed_file_data, refs);
++ 	complete(&data->done);
++ }
++ 
++ static void __io_file_ref_exit_and_free(struct rcu_head *rcu)
++ {
++ 	struct fixed_file_data *data = container_of(rcu, struct fixed_file_data,
++ 							rcu);
++ 	percpu_ref_exit(&data->refs);
++ 	kfree(data);
++ }
++ 
++ static void io_file_ref_exit_and_free(struct rcu_head *rcu)
++ {
++ 	/*
++ 	 * We need to order our exit+free call against the potentially
++ 	 * existing call_rcu() for switching to atomic. One way to do that
++ 	 * is to have this rcu callback queue the final put and free, as we
++ 	 * could otherwise have a pre-existing atomic switch complete _after_
++ 	 * the free callback we queued.
++ 	 */
++ 	call_rcu(rcu, __io_file_ref_exit_and_free);
++ }
++ 
+++>>>>>>> c1e2148f8ecb (io_uring: free fixed_file_data after RCU grace period)
+  static int io_sqe_files_unregister(struct io_ring_ctx *ctx)
+  {
+ -	struct fixed_file_data *data = ctx->file_data;
+ -	unsigned nr_tables, i;
+ -
+ -	if (!data)
+ +	if (!ctx->user_files)
+  		return -ENXIO;
+  
+++<<<<<<< HEAD
+ +	__io_sqe_files_unregister(ctx);
+ +	kfree(ctx->user_files);
+ +	ctx->user_files = NULL;
+++=======
++ 	percpu_ref_kill_and_confirm(&data->refs, io_file_ref_kill);
++ 	flush_work(&data->ref_work);
++ 	wait_for_completion(&data->done);
++ 	io_ring_file_ref_flush(data);
++ 
++ 	__io_sqe_files_unregister(ctx);
++ 	nr_tables = DIV_ROUND_UP(ctx->nr_user_files, IORING_MAX_FILES_TABLE);
++ 	for (i = 0; i < nr_tables; i++)
++ 		kfree(data->table[i].files);
++ 	kfree(data->table);
++ 	call_rcu(&data->rcu, io_file_ref_exit_and_free);
++ 	ctx->file_data = NULL;
+++>>>>>>> c1e2148f8ecb (io_uring: free fixed_file_data after RCU grace period)
+  	ctx->nr_user_files = 0;
+  	return 0;
+  }
+* Unmerged path fs/io_uring.c
