@@ -1,0 +1,373 @@
+xprtrdma: Manage MRs in context of a single connection
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Chuck Lever <chuck.lever@oracle.com>
+commit 9d2da4ff00f37de17fc25c23e50463b58b9e8fec
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/9d2da4ff.failed
+
+MRs are now allocated on demand so we can safely throw them away on
+disconnect. This way an idle transport can disconnect and it won't
+pin hardware MR resources.
+
+Two additional changes:
+
+- Now that all MRs are destroyed on disconnect, there's no need to
+  check during header marshaling if a req has MRs to recycle. Each
+  req is sent only once per connection, and now rl_registered is
+  guaranteed to be empty when rpcrdma_marshal_req is invoked.
+
+- Because MRs are now destroyed in a WQ_MEM_RECLAIM context, they
+  also must be allocated in a WQ_MEM_RECLAIM context. This reduces
+  the likelihood that device driver memory allocation will trigger
+  memory reclaim during NFS writeback.
+
+	Signed-off-by: Chuck Lever <chuck.lever@oracle.com>
+	Signed-off-by: Anna Schumaker <Anna.Schumaker@Netapp.com>
+(cherry picked from commit 9d2da4ff00f37de17fc25c23e50463b58b9e8fec)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/sunrpc/xprtrdma/frwr_ops.c
+#	net/sunrpc/xprtrdma/rpc_rdma.c
+#	net/sunrpc/xprtrdma/verbs.c
+#	net/sunrpc/xprtrdma/xprt_rdma.h
+diff --cc net/sunrpc/xprtrdma/frwr_ops.c
+index e504ba4329ef,37ba82dc2474..000000000000
+--- a/net/sunrpc/xprtrdma/frwr_ops.c
++++ b/net/sunrpc/xprtrdma/frwr_ops.c
+@@@ -37,37 -27,17 +37,43 @@@
+  
+  /* Transport recovery
+   *
+ - * frwr_map and frwr_unmap_* cannot run at the same time the transport
+ - * connect worker is running. The connect worker holds the transport
+ - * send lock, just as ->send_request does. This prevents frwr_map and
+ - * the connect worker from running concurrently. When a connection is
+ - * closed, the Receive completion queue is drained before the allowing
+ - * the connect worker to get control. This prevents frwr_unmap and the
+ - * connect worker from running concurrently.
+ + * ->op_map and the transport connect worker cannot run at the same
+ + * time, but ->op_unmap can fire while the transport connect worker
+ + * is running. Thus MR recovery is handled in ->op_map, to guarantee
+ + * that recovered MRs are owned by a sending RPC, and not one where
+ + * ->op_unmap could fire at the same time transport reconnect is
+ + * being done.
+ + *
+++<<<<<<< HEAD
+ + * When the underlying transport disconnects, MRs are left in one of
+ + * four states:
+ + *
+ + * INVALID:	The MR was not in use before the QP entered ERROR state.
+ + *
+ + * VALID:	The MR was registered before the QP entered ERROR state.
+ + *
+ + * FLUSHED_FR:	The MR was being registered when the QP entered ERROR
+ + *		state, and the pending WR was flushed.
+   *
+ + * FLUSHED_LI:	The MR was being invalidated when the QP entered ERROR
+ + *		state, and the pending WR was flushed.
+ + *
+ + * When frwr_map encounters FLUSHED and VALID MRs, they are recovered
+ + * with ib_dereg_mr and then are re-initialized. Because MR recovery
+ + * allocates fresh resources, it is deferred to a workqueue, and the
+ + * recovered MRs are placed back on the rb_mrs list when recovery is
+ + * complete. frwr_map allocates another MR for the current RPC while
+ + * the broken MR is reset.
+ + *
+ + * To ensure that frwr_map doesn't encounter an MR that is marked
+ + * INVALID but that is about to be flushed due to a previous transport
+ + * disconnect, the transport connect worker attempts to drain all
+ + * pending send queue WRs before the transport is reconnected.
+++=======
++  * When the underlying transport disconnects, MRs that are in flight
++  * are flushed and are likely unusable. Thus all MRs are destroyed.
++  * New MRs are created on demand.
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+   */
+  
+  #include <linux/sunrpc/rpc_rdma.h>
+@@@ -144,6 -107,18 +150,21 @@@ frwr_mr_recycle_worker(struct work_stru
+  	frwr_release_mr(mr);
+  }
+  
+++<<<<<<< HEAD
+++=======
++ /* MRs are dynamically allocated, so simply clean up and release the MR.
++  * A replacement MR will subsequently be allocated on demand.
++  */
++ static void
++ frwr_mr_recycle_worker(struct work_struct *work)
++ {
++ 	struct rpcrdma_mr *mr = container_of(work, struct rpcrdma_mr,
++ 					     mr_recycle);
++ 
++ 	frwr_mr_recycle(mr->mr_xprt, mr);
++ }
++ 
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  /* frwr_reset - Place MRs back on the free list
+   * @req: request to reset
+   *
+diff --cc net/sunrpc/xprtrdma/rpc_rdma.c
+index e17f3d670e48,7b1358284242..000000000000
+--- a/net/sunrpc/xprtrdma/rpc_rdma.c
++++ b/net/sunrpc/xprtrdma/rpc_rdma.c
+@@@ -341,6 -342,31 +341,34 @@@ encode_read_segment(struct xdr_stream *
+  	return 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static struct rpcrdma_mr_seg *rpcrdma_mr_prepare(struct rpcrdma_xprt *r_xprt,
++ 						 struct rpcrdma_req *req,
++ 						 struct rpcrdma_mr_seg *seg,
++ 						 int nsegs, bool writing,
++ 						 struct rpcrdma_mr **mr)
++ {
++ 	*mr = rpcrdma_mr_pop(&req->rl_free_mrs);
++ 	if (!*mr) {
++ 		*mr = rpcrdma_mr_get(r_xprt);
++ 		if (!*mr)
++ 			goto out_getmr_err;
++ 		trace_xprtrdma_mr_get(req);
++ 		(*mr)->mr_req = req;
++ 	}
++ 
++ 	rpcrdma_mr_push(*mr, &req->rl_registered);
++ 	return frwr_map(r_xprt, seg, nsegs, writing, req->rl_slot.rq_xid, *mr);
++ 
++ out_getmr_err:
++ 	trace_xprtrdma_nomrs(req);
++ 	xprt_wait_for_buffer_space(&r_xprt->rx_xprt);
++ 	rpcrdma_mrs_refresh(r_xprt);
++ 	return ERR_PTR(-EAGAIN);
++ }
++ 
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  /* Register and XDR encode the Read list. Supports encoding a list of read
+   * segments that belong to a single read chunk.
+   *
+@@@ -836,17 -862,6 +864,20 @@@ rpcrdma_marshal_req(struct rpcrdma_xpr
+  		rtype = rpcrdma_areadch;
+  	}
+  
+++<<<<<<< HEAD
+ +	/* If this is a retransmit, discard previously registered
+ +	 * chunks. Very likely the connection has been replaced,
+ +	 * so these registrations are invalid and unusable.
+ +	 */
+ +	while (unlikely(!list_empty(&req->rl_registered))) {
+ +		struct rpcrdma_mr *mr;
+ +
+ +		mr = rpcrdma_mr_pop(&req->rl_registered);
+ +		rpcrdma_mr_recycle(mr);
+ +	}
+ +
+++=======
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  	/* This implementation supports the following combinations
+  	 * of chunk lists in one RPC-over-RDMA Call message:
+  	 *
+diff --cc net/sunrpc/xprtrdma/verbs.c
+index cfae694214c1,c79d8620d9c8..000000000000
+--- a/net/sunrpc/xprtrdma/verbs.c
++++ b/net/sunrpc/xprtrdma/verbs.c
+@@@ -75,8 -76,9 +75,8 @@@
+   */
+  static void rpcrdma_sendctx_put_locked(struct rpcrdma_sendctx *sc);
+  static void rpcrdma_reqs_reset(struct rpcrdma_xprt *r_xprt);
+ -static void rpcrdma_reps_destroy(struct rpcrdma_buffer *buf);
+  static void rpcrdma_mrs_create(struct rpcrdma_xprt *r_xprt);
+- static void rpcrdma_mrs_destroy(struct rpcrdma_buffer *buf);
++ static void rpcrdma_mrs_destroy(struct rpcrdma_xprt *r_xprt);
+  static struct rpcrdma_regbuf *
+  rpcrdma_regbuf_alloc(size_t size, enum dma_data_direction direction,
+  		     gfp_t flags);
+@@@ -404,10 -406,7 +404,13 @@@ rpcrdma_ia_remove(struct rpcrdma_ia *ia
+  	struct rpcrdma_ep *ep = &r_xprt->rx_ep;
+  	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	struct rpcrdma_req *req;
+ +	struct rpcrdma_rep *rep;
+ +
+++<<<<<<< HEAD
+ +	cancel_delayed_work_sync(&buf->rb_refresh_worker);
+  
+++=======
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  	/* This is similar to rpcrdma_ep_destroy, but:
+  	 * - Don't cancel the connect worker.
+  	 * - Don't call rpcrdma_ep_disconnect, which waits
+@@@ -700,10 -695,11 +701,14 @@@ rpcrdma_ep_connect(struct rpcrdma_ep *e
+  	int rc;
+  
+  retry:
+ -	memcpy(&qp_init_attr, &ep->rep_attr, sizeof(qp_init_attr));
+  	switch (ep->rep_connected) {
+  	case 0:
+++<<<<<<< HEAD
+ +		dprintk("RPC:       %s: connecting...\n", __func__);
+ +		rc = rdma_create_qp(ia->ri_id, ia->ri_pd, &ep->rep_attr);
+++=======
++ 		rc = rdma_create_qp(ia->ri_id, ia->ri_pd, &qp_init_attr);
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  		if (rc) {
+  			rc = -ENETUNREACH;
+  			goto out_noupdate;
+@@@ -1099,15 -1155,11 +1124,13 @@@ int rpcrdma_buffer_create(struct rpcrdm
+  
+  	buf->rb_max_requests = r_xprt->rx_ep.rep_max_requests;
+  	buf->rb_bc_srv_max_requests = 0;
+ +	spin_lock_init(&buf->rb_mrlock);
+  	spin_lock_init(&buf->rb_lock);
+  	INIT_LIST_HEAD(&buf->rb_mrs);
+ -	INIT_LIST_HEAD(&buf->rb_all_mrs);
+ -	INIT_WORK(&buf->rb_refresh_worker, rpcrdma_mr_refresh_worker);
+ +	INIT_LIST_HEAD(&buf->rb_all);
+ +	INIT_DELAYED_WORK(&buf->rb_refresh_worker,
+ +			  rpcrdma_mr_refresh_worker);
+  
+- 	rpcrdma_mrs_create(r_xprt);
+- 
+  	INIT_LIST_HEAD(&buf->rb_send_bufs);
+  	INIT_LIST_HEAD(&buf->rb_allreqs);
+  
+@@@ -1145,48 -1190,58 +1168,75 @@@ static void rpcrdma_rep_destroy(struct 
+   * rpcrdma_req_destroy - Destroy an rpcrdma_req object
+   * @req: unused object to be destroyed
+   *
+-  * This function assumes that the caller prevents concurrent device
+-  * unload and transport tear-down.
++  * Relies on caller holding the transport send lock to protect
++  * removing req->rl_all from buf->rb_all_reqs safely.
+   */
+ -void rpcrdma_req_destroy(struct rpcrdma_req *req)
+ +void
+ +rpcrdma_req_destroy(struct rpcrdma_req *req)
+  {
+ -	struct rpcrdma_mr *mr;
+ -
+  	list_del(&req->rl_all);
+  
+ -	while ((mr = rpcrdma_mr_pop(&req->rl_free_mrs))) {
+ -		struct rpcrdma_buffer *buf = &mr->mr_xprt->rx_buf;
+ -
+ -		spin_lock(&buf->rb_lock);
+ -		list_del(&mr->mr_all);
+ -		spin_unlock(&buf->rb_lock);
+ -
+ -		frwr_release_mr(mr);
+ -	}
+ -
+  	rpcrdma_regbuf_free(req->rl_recvbuf);
+  	rpcrdma_regbuf_free(req->rl_sendbuf);
+  	rpcrdma_regbuf_free(req->rl_rdmabuf);
+  	kfree(req);
+  }
+  
+++<<<<<<< HEAD
+ +static void
+ +rpcrdma_mrs_destroy(struct rpcrdma_buffer *buf)
+++=======
++ /**
++  * rpcrdma_mrs_destroy - Release all of a transport's MRs
++  * @r_xprt: controlling transport instance
++  *
++  * Relies on caller holding the transport send lock to protect
++  * removing mr->mr_list from req->rl_free_mrs safely.
++  */
++ static void rpcrdma_mrs_destroy(struct rpcrdma_xprt *r_xprt)
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  {
+- 	struct rpcrdma_xprt *r_xprt = container_of(buf, struct rpcrdma_xprt,
+- 						   rx_buf);
++ 	struct rpcrdma_buffer *buf = &r_xprt->rx_buf;
+  	struct rpcrdma_mr *mr;
+ +	unsigned int count;
+  
+++<<<<<<< HEAD
+ +	count = 0;
+ +	spin_lock(&buf->rb_mrlock);
+ +	while (!list_empty(&buf->rb_all)) {
+ +		mr = list_entry(buf->rb_all.next, struct rpcrdma_mr, mr_all);
+++=======
++ 	cancel_work_sync(&buf->rb_refresh_worker);
++ 
++ 	spin_lock(&buf->rb_lock);
++ 	while ((mr = list_first_entry_or_null(&buf->rb_all_mrs,
++ 					      struct rpcrdma_mr,
++ 					      mr_all)) != NULL) {
++ 		list_del(&mr->mr_list);
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  		list_del(&mr->mr_all);
+ -		spin_unlock(&buf->rb_lock);
+ +
+ +		spin_unlock(&buf->rb_mrlock);
+ +
+ +		/* Ensure MW is not on any rl_registered list */
+ +		if (!list_empty(&mr->mr_list))
+ +			list_del(&mr->mr_list);
+  
+  		frwr_release_mr(mr);
+++<<<<<<< HEAD
+ +		count++;
+ +		spin_lock(&buf->rb_mrlock);
+ +	}
+ +	spin_unlock(&buf->rb_mrlock);
+ +	r_xprt->rx_stats.mrs_allocated = 0;
+ +
+ +	dprintk("RPC:       %s: released %u MRs\n", __func__, count);
+++=======
++ 
++ 		spin_lock(&buf->rb_lock);
++ 	}
++ 	spin_unlock(&buf->rb_lock);
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  }
+  
+  /**
+@@@ -1200,18 -1255,8 +1250,21 @@@
+  void
+  rpcrdma_buffer_destroy(struct rpcrdma_buffer *buf)
+  {
+++<<<<<<< HEAD
+ +	cancel_delayed_work_sync(&buf->rb_refresh_worker);
+ +
+++=======
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  	rpcrdma_sendctxs_destroy(buf);
+ -	rpcrdma_reps_destroy(buf);
+ +
+ +	while (!list_empty(&buf->rb_recv_bufs)) {
+ +		struct rpcrdma_rep *rep;
+ +
+ +		rep = list_first_entry(&buf->rb_recv_bufs,
+ +				       struct rpcrdma_rep, rr_list);
+ +		list_del(&rep->rr_list);
+ +		rpcrdma_rep_destroy(rep);
+ +	}
+  
+  	while (!list_empty(&buf->rb_send_bufs)) {
+  		struct rpcrdma_req *req;
+diff --cc net/sunrpc/xprtrdma/xprt_rdma.h
+index 2dbd229358d4,a7ef9653bafd..000000000000
+--- a/net/sunrpc/xprtrdma/xprt_rdma.h
++++ b/net/sunrpc/xprtrdma/xprt_rdma.h
+@@@ -491,7 -488,7 +491,11 @@@ struct rpcrdma_sendctx *rpcrdma_sendctx
+  
+  struct rpcrdma_mr *rpcrdma_mr_get(struct rpcrdma_xprt *r_xprt);
+  void rpcrdma_mr_put(struct rpcrdma_mr *mr);
+++<<<<<<< HEAD
+ +void rpcrdma_mr_unmap_and_put(struct rpcrdma_mr *mr);
+++=======
++ void rpcrdma_mrs_refresh(struct rpcrdma_xprt *r_xprt);
+++>>>>>>> 9d2da4ff00f3 (xprtrdma: Manage MRs in context of a single connection)
+  
+  static inline void
+  rpcrdma_mr_recycle(struct rpcrdma_mr *mr)
+* Unmerged path net/sunrpc/xprtrdma/frwr_ops.c
+* Unmerged path net/sunrpc/xprtrdma/rpc_rdma.c
+* Unmerged path net/sunrpc/xprtrdma/verbs.c
+* Unmerged path net/sunrpc/xprtrdma/xprt_rdma.h
