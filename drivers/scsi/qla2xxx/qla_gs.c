@@ -1488,7 +1488,7 @@ qla24xx_prep_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size,
 	return ct_pkt;
 }
 
-static inline ms_iocb_entry_t *
+static void
 qla2x00_update_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size)
 {
 	struct qla_hw_data *ha = vha->hw;
@@ -1502,8 +1502,6 @@ qla2x00_update_ms_fdmi_iocb(scsi_qla_host_t *vha, uint32_t req_size)
 		ms_pkt->req_bytecount = cpu_to_le32(req_size);
 		ms_pkt->dseg_req_length = ms_pkt->req_bytecount;
 	}
-
-	return ms_pkt;
 }
 
 /**
