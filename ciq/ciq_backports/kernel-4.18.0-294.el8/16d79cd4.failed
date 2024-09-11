@@ -1,0 +1,418 @@
+PCI: Use 'pci_channel_state_t' instead of 'enum pci_channel_state'
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-294.el8
+Rebuild_CHGLOG: - [netdrv] sfc: Use 'pci_channel_state_t' instead of 'enum pci_channel_state' (Jarod Wilson) [1856681]
+Rebuild_FUZZ: 96.97%
+commit-author Luc Van Oostenryck <luc.vanoostenryck@gmail.com>
+commit 16d79cd4e23b1964d36c041ab027505ceacbbeeb
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-294.el8/16d79cd4.failed
+
+The method struct pci_error_handlers.error_detected() is defined and
+documented as taking an 'enum pci_channel_state' for the second argument,
+but most drivers use 'pci_channel_state_t' instead.
+
+This 'pci_channel_state_t' is not a typedef for the enum but a typedef for
+a bitwise type in order to have better/stricter typechecking.
+
+Consolidate everything by using 'pci_channel_state_t' in the method's
+definition, in the related helpers and in the drivers.
+
+Enforce use of 'pci_channel_state_t' by replacing 'enum pci_channel_state'
+with an anonymous 'enum'.
+
+Note: Currently, from a typechecking point of view this patch changes
+nothing because only the constants defined by the enum are bitwise, not the
+enum itself (sparse doesn't have the notion of 'bitwise enum'). This may
+change in some not too far future, hence the patch.
+
+[bhelgaas: squash in
+  https://lore.kernel.org/r/20200702162651.49526-3-luc.vanoostenryck@gmail.com
+  https://lore.kernel.org/r/20200702162651.49526-4-luc.vanoostenryck@gmail.com]
+Link: https://lore.kernel.org/r/20200702162651.49526-2-luc.vanoostenryck@gmail.com
+	Signed-off-by: Luc Van Oostenryck <luc.vanoostenryck@gmail.com>
+	Signed-off-by: Bjorn Helgaas <bhelgaas@google.com>
+(cherry picked from commit 16d79cd4e23b1964d36c041ab027505ceacbbeeb)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/net/ethernet/sfc/efx.c
+diff --cc drivers/net/ethernet/sfc/efx.c
+index 8a7e5414bd8c,ed627aff7b36..000000000000
+--- a/drivers/net/ethernet/sfc/efx.c
++++ b/drivers/net/ethernet/sfc/efx.c
+@@@ -1387,6 -1514,97 +1387,100 @@@ static const struct dev_pm_ops efx_pm_o
+  	.restore	= efx_pm_resume,
+  };
+  
+++<<<<<<< HEAD
+++=======
++ /* A PCI error affecting this device was detected.
++  * At this point MMIO and DMA may be disabled.
++  * Stop the software path and request a slot reset.
++  */
++ static pci_ers_result_t efx_io_error_detected(struct pci_dev *pdev,
++ 					      pci_channel_state_t state)
++ {
++ 	pci_ers_result_t status = PCI_ERS_RESULT_RECOVERED;
++ 	struct efx_nic *efx = pci_get_drvdata(pdev);
++ 
++ 	if (state == pci_channel_io_perm_failure)
++ 		return PCI_ERS_RESULT_DISCONNECT;
++ 
++ 	rtnl_lock();
++ 
++ 	if (efx->state != STATE_DISABLED) {
++ 		efx->state = STATE_RECOVERY;
++ 		efx->reset_pending = 0;
++ 
++ 		efx_device_detach_sync(efx);
++ 
++ 		efx_stop_all(efx);
++ 		efx_disable_interrupts(efx);
++ 
++ 		status = PCI_ERS_RESULT_NEED_RESET;
++ 	} else {
++ 		/* If the interface is disabled we don't want to do anything
++ 		 * with it.
++ 		 */
++ 		status = PCI_ERS_RESULT_RECOVERED;
++ 	}
++ 
++ 	rtnl_unlock();
++ 
++ 	pci_disable_device(pdev);
++ 
++ 	return status;
++ }
++ 
++ /* Fake a successful reset, which will be performed later in efx_io_resume. */
++ static pci_ers_result_t efx_io_slot_reset(struct pci_dev *pdev)
++ {
++ 	struct efx_nic *efx = pci_get_drvdata(pdev);
++ 	pci_ers_result_t status = PCI_ERS_RESULT_RECOVERED;
++ 
++ 	if (pci_enable_device(pdev)) {
++ 		netif_err(efx, hw, efx->net_dev,
++ 			  "Cannot re-enable PCI device after reset.\n");
++ 		status =  PCI_ERS_RESULT_DISCONNECT;
++ 	}
++ 
++ 	return status;
++ }
++ 
++ /* Perform the actual reset and resume I/O operations. */
++ static void efx_io_resume(struct pci_dev *pdev)
++ {
++ 	struct efx_nic *efx = pci_get_drvdata(pdev);
++ 	int rc;
++ 
++ 	rtnl_lock();
++ 
++ 	if (efx->state == STATE_DISABLED)
++ 		goto out;
++ 
++ 	rc = efx_reset(efx, RESET_TYPE_ALL);
++ 	if (rc) {
++ 		netif_err(efx, hw, efx->net_dev,
++ 			  "efx_reset failed after PCI error (%d)\n", rc);
++ 	} else {
++ 		efx->state = STATE_READY;
++ 		netif_dbg(efx, hw, efx->net_dev,
++ 			  "Done resetting and resuming IO after PCI error.\n");
++ 	}
++ 
++ out:
++ 	rtnl_unlock();
++ }
++ 
++ /* For simplicity and reliability, we always require a slot reset and try to
++  * reset the hardware when a pci error affecting the device is detected.
++  * We leave both the link_reset and mmio_enabled callback unimplemented:
++  * with our request for slot reset the mmio_enabled callback will never be
++  * called, and the link_reset callback is not used by AER or EEH mechanisms.
++  */
++ static const struct pci_error_handlers efx_err_handlers = {
++ 	.error_detected = efx_io_error_detected,
++ 	.slot_reset	= efx_io_slot_reset,
++ 	.resume		= efx_io_resume,
++ };
++ 
+++>>>>>>> 16d79cd4e23b (PCI: Use 'pci_channel_state_t' instead of 'enum pci_channel_state')
+  static struct pci_driver efx_pci_driver = {
+  	.name		= KBUILD_MODNAME,
+  	.id_table	= efx_pci_table,
+diff --git a/Documentation/PCI/pci-error-recovery.rst b/Documentation/PCI/pci-error-recovery.rst
+index 83db42092935..f658264364c5 100644
+--- a/Documentation/PCI/pci-error-recovery.rst
++++ b/Documentation/PCI/pci-error-recovery.rst
+@@ -79,7 +79,7 @@ This structure has the form::
+ 
+ 	struct pci_error_handlers
+ 	{
+-		int (*error_detected)(struct pci_dev *dev, enum pci_channel_state);
++		int (*error_detected)(struct pci_dev *dev, pci_channel_state_t);
+ 		int (*mmio_enabled)(struct pci_dev *dev);
+ 		int (*slot_reset)(struct pci_dev *dev);
+ 		void (*resume)(struct pci_dev *dev);
+@@ -87,11 +87,11 @@ This structure has the form::
+ 
+ The possible channel states are::
+ 
+-	enum pci_channel_state {
++	typedef enum {
+ 		pci_channel_io_normal,  /* I/O channel is in normal state */
+ 		pci_channel_io_frozen,  /* I/O to channel is blocked */
+ 		pci_channel_io_perm_failure, /* PCI card is dead */
+-	};
++	} pci_channel_state_t;
+ 
+ Possible return values are::
+ 
+@@ -348,7 +348,7 @@ STEP 6: Permanent Failure
+ -------------------------
+ A "permanent failure" has occurred, and the platform cannot recover
+ the device.  The platform will call error_detected() with a
+-pci_channel_state value of pci_channel_io_perm_failure.
++pci_channel_state_t value of pci_channel_io_perm_failure.
+ 
+ The device driver should, at this point, assume the worst. It should
+ cancel all pending I/O, refuse all new I/O, returning -EIO to
+diff --git a/arch/powerpc/kernel/eeh_driver.c b/arch/powerpc/kernel/eeh_driver.c
+index d51c28684cec..70ffd14d6835 100644
+--- a/arch/powerpc/kernel/eeh_driver.c
++++ b/arch/powerpc/kernel/eeh_driver.c
+@@ -230,7 +230,7 @@ static void eeh_dev_save_state(struct eeh_dev *edev, void *userdata)
+ 	pci_save_state(pdev);
+ }
+ 
+-static void eeh_set_channel_state(struct eeh_pe *root, enum pci_channel_state s)
++static void eeh_set_channel_state(struct eeh_pe *root, pci_channel_state_t s)
+ {
+ 	struct eeh_pe *pe;
+ 	struct eeh_dev *edev, *tmp;
+diff --git a/drivers/block/rsxx/core.c b/drivers/block/rsxx/core.c
+index c092f5e3da1f..0f70b0c05a69 100644
+--- a/drivers/block/rsxx/core.c
++++ b/drivers/block/rsxx/core.c
+@@ -638,7 +638,7 @@ static int rsxx_eeh_fifo_flush_poll(struct rsxx_cardinfo *card)
+ }
+ 
+ static pci_ers_result_t rsxx_error_detected(struct pci_dev *dev,
+-					    enum pci_channel_state error)
++					    pci_channel_state_t error)
+ {
+ 	int st;
+ 
+diff --git a/drivers/dma/ioat/init.c b/drivers/dma/ioat/init.c
+index 58d13564f88b..089893f2bbb8 100644
+--- a/drivers/dma/ioat/init.c
++++ b/drivers/dma/ioat/init.c
+@@ -1267,7 +1267,7 @@ static void ioat_resume(struct ioatdma_device *ioat_dma)
+ #define DRV_NAME "ioatdma"
+ 
+ static pci_ers_result_t ioat_pcie_error_detected(struct pci_dev *pdev,
+-						 enum pci_channel_state error)
++						 pci_channel_state_t error)
+ {
+ 	dev_dbg(&pdev->dev, "%s: PCIe AER error %d\n", DRV_NAME, error);
+ 
+diff --git a/drivers/media/pci/ngene/ngene-cards.c b/drivers/media/pci/ngene/ngene-cards.c
+index 7a106bc11a2b..c6a06bb7be59 100644
+--- a/drivers/media/pci/ngene/ngene-cards.c
++++ b/drivers/media/pci/ngene/ngene-cards.c
+@@ -1199,7 +1199,7 @@ MODULE_DEVICE_TABLE(pci, ngene_id_tbl);
+ /****************************************************************************/
+ 
+ static pci_ers_result_t ngene_error_detected(struct pci_dev *dev,
+-					     enum pci_channel_state state)
++					     pci_channel_state_t state)
+ {
+ 	dev_err(&dev->dev, "PCI error\n");
+ 	if (state == pci_channel_io_perm_failure)
+diff --git a/drivers/misc/genwqe/card_base.c b/drivers/misc/genwqe/card_base.c
+index c7cd3675bcd1..65cbac46b997 100644
+--- a/drivers/misc/genwqe/card_base.c
++++ b/drivers/misc/genwqe/card_base.c
+@@ -1249,7 +1249,7 @@ static void genwqe_remove(struct pci_dev *pci_dev)
+  * error is detected.
+  */
+ static pci_ers_result_t genwqe_err_error_detected(struct pci_dev *pci_dev,
+-						 enum pci_channel_state state)
++						 pci_channel_state_t state)
+ {
+ 	struct genwqe_dev *cd;
+ 
+diff --git a/drivers/net/ethernet/intel/i40e/i40e_main.c b/drivers/net/ethernet/intel/i40e/i40e_main.c
+index bcabe3c8ac82..59b703fcf0a4 100644
+--- a/drivers/net/ethernet/intel/i40e/i40e_main.c
++++ b/drivers/net/ethernet/intel/i40e/i40e_main.c
+@@ -15597,7 +15597,7 @@ static void i40e_remove(struct pci_dev *pdev)
+  * remediation.
+  **/
+ static pci_ers_result_t i40e_pci_error_detected(struct pci_dev *pdev,
+-						enum pci_channel_state error)
++						pci_channel_state_t error)
+ {
+ 	struct i40e_pf *pf = pci_get_drvdata(pdev);
+ 
+diff --git a/drivers/net/ethernet/intel/ice/ice_main.c b/drivers/net/ethernet/intel/ice/ice_main.c
+index 61730692b097..0620e6f88134 100644
+--- a/drivers/net/ethernet/intel/ice/ice_main.c
++++ b/drivers/net/ethernet/intel/ice/ice_main.c
+@@ -4437,7 +4437,7 @@ static int __maybe_unused ice_resume(struct device *dev)
+  * is in progress.  Allows the driver to gracefully prepare/handle PCI errors.
+  */
+ static pci_ers_result_t
+-ice_pci_err_detected(struct pci_dev *pdev, enum pci_channel_state err)
++ice_pci_err_detected(struct pci_dev *pdev, pci_channel_state_t err)
+ {
+ 	struct ice_pf *pf = pci_get_drvdata(pdev);
+ 
+diff --git a/drivers/net/ethernet/intel/ixgb/ixgb_main.c b/drivers/net/ethernet/intel/ixgb/ixgb_main.c
+index 29e479b62992..eae67b3e011b 100644
+--- a/drivers/net/ethernet/intel/ixgb/ixgb_main.c
++++ b/drivers/net/ethernet/intel/ixgb/ixgb_main.c
+@@ -87,7 +87,7 @@ static void ixgb_netpoll(struct net_device *dev);
+ #endif
+ 
+ static pci_ers_result_t ixgb_io_error_detected (struct pci_dev *pdev,
+-                             enum pci_channel_state state);
++                             pci_channel_state_t state);
+ static pci_ers_result_t ixgb_io_slot_reset (struct pci_dev *pdev);
+ static void ixgb_io_resume (struct pci_dev *pdev);
+ 
+@@ -2222,7 +2222,7 @@ static void ixgb_netpoll(struct net_device *dev)
+  * a PCI bus error is detected.
+  */
+ static pci_ers_result_t ixgb_io_error_detected(struct pci_dev *pdev,
+-                                               enum pci_channel_state state)
++                                               pci_channel_state_t state)
+ {
+ 	struct net_device *netdev = pci_get_drvdata(pdev);
+ 	struct ixgb_adapter *adapter = netdev_priv(netdev);
+diff --git a/drivers/net/ethernet/qlogic/qlge/qlge_main.c b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+index 8758f134eaac..34a61a35f7a5 100644
+--- a/drivers/net/ethernet/qlogic/qlge/qlge_main.c
++++ b/drivers/net/ethernet/qlogic/qlge/qlge_main.c
+@@ -4864,7 +4864,7 @@ static void ql_eeh_close(struct net_device *ndev)
+  * a PCI bus error is detected.
+  */
+ static pci_ers_result_t qlge_io_error_detected(struct pci_dev *pdev,
+-					       enum pci_channel_state state)
++					       pci_channel_state_t state)
+ {
+ 	struct net_device *ndev = pci_get_drvdata(pdev);
+ 	struct ql_adapter *qdev = netdev_priv(ndev);
+* Unmerged path drivers/net/ethernet/sfc/efx.c
+diff --git a/drivers/net/ethernet/sfc/falcon/efx.c b/drivers/net/ethernet/sfc/falcon/efx.c
+index 78a03a0f1ef6..cf18c7fedf84 100644
+--- a/drivers/net/ethernet/sfc/falcon/efx.c
++++ b/drivers/net/ethernet/sfc/falcon/efx.c
+@@ -3144,7 +3144,7 @@ static const struct dev_pm_ops ef4_pm_ops = {
+  * Stop the software path and request a slot reset.
+  */
+ static pci_ers_result_t ef4_io_error_detected(struct pci_dev *pdev,
+-					      enum pci_channel_state state)
++					      pci_channel_state_t state)
+ {
+ 	pci_ers_result_t status = PCI_ERS_RESULT_RECOVERED;
+ 	struct ef4_nic *efx = pci_get_drvdata(pdev);
+diff --git a/drivers/pci/pci.h b/drivers/pci/pci.h
+index 7b211b816a08..8153656ff8a9 100644
+--- a/drivers/pci/pci.h
++++ b/drivers/pci/pci.h
+@@ -565,7 +565,7 @@ static inline int pci_dev_specific_disable_acs_redir(struct pci_dev *dev)
+ 
+ /* PCI error reporting and recovery */
+ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+-			enum pci_channel_state state,
++			pci_channel_state_t state,
+ 			pci_ers_result_t (*reset_link)(struct pci_dev *pdev));
+ 
+ bool pcie_wait_for_link(struct pci_dev *pdev, bool active);
+diff --git a/drivers/pci/pcie/err.c b/drivers/pci/pcie/err.c
+index f0cfd3df376b..c543f419d8f9 100644
+--- a/drivers/pci/pcie/err.c
++++ b/drivers/pci/pcie/err.c
+@@ -46,7 +46,7 @@ static pci_ers_result_t merge_result(enum pci_ers_result orig,
+ }
+ 
+ static int report_error_detected(struct pci_dev *dev,
+-				 enum pci_channel_state state,
++				 pci_channel_state_t state,
+ 				 enum pci_ers_result *result)
+ {
+ 	pci_ers_result_t vote;
+@@ -147,7 +147,7 @@ static int report_resume(struct pci_dev *dev, void *data)
+ }
+ 
+ pci_ers_result_t pcie_do_recovery(struct pci_dev *dev,
+-			enum pci_channel_state state,
++			pci_channel_state_t state,
+ 			pci_ers_result_t (*reset_link)(struct pci_dev *pdev))
+ {
+ 	pci_ers_result_t status = PCI_ERS_RESULT_CAN_RECOVER;
+diff --git a/drivers/pci/pcie/portdrv_pci.c b/drivers/pci/pcie/portdrv_pci.c
+index 3acf151ae015..3a3ce40ae1ab 100644
+--- a/drivers/pci/pcie/portdrv_pci.c
++++ b/drivers/pci/pcie/portdrv_pci.c
+@@ -146,7 +146,7 @@ static void pcie_portdrv_remove(struct pci_dev *dev)
+ }
+ 
+ static pci_ers_result_t pcie_portdrv_error_detected(struct pci_dev *dev,
+-					enum pci_channel_state error)
++					pci_channel_state_t error)
+ {
+ 	/* Root Port has no impact. Always recovers. */
+ 	return PCI_ERS_RESULT_CAN_RECOVER;
+diff --git a/drivers/scsi/aacraid/linit.c b/drivers/scsi/aacraid/linit.c
+index ab0f6d51b1fe..09300fe11187 100644
+--- a/drivers/scsi/aacraid/linit.c
++++ b/drivers/scsi/aacraid/linit.c
+@@ -1918,7 +1918,7 @@ static void aac_flush_ios(struct aac_dev *aac)
+ }
+ 
+ static pci_ers_result_t aac_pci_error_detected(struct pci_dev *pdev,
+-					enum pci_channel_state error)
++					pci_channel_state_t error)
+ {
+ 	struct Scsi_Host *shost = pci_get_drvdata(pdev);
+ 	struct aac_dev *aac = shost_priv(shost);
+diff --git a/drivers/scsi/sym53c8xx_2/sym_glue.c b/drivers/scsi/sym53c8xx_2/sym_glue.c
+index 5f10aa9bad9b..e8a62e8745b3 100644
+--- a/drivers/scsi/sym53c8xx_2/sym_glue.c
++++ b/drivers/scsi/sym53c8xx_2/sym_glue.c
+@@ -1757,7 +1757,7 @@ static void sym2_remove(struct pci_dev *pdev)
+  * @state: current state of the PCI slot
+  */
+ static pci_ers_result_t sym2_io_error_detected(struct pci_dev *pdev,
+-                                         enum pci_channel_state state)
++                                         pci_channel_state_t state)
+ {
+ 	/* If slot is permanently frozen, turn everything off */
+ 	if (state == pci_channel_io_perm_failure) {
+diff --git a/include/linux/pci.h b/include/linux/pci.h
+index 9cb00f3cfca3..eebab8e0cfb4 100644
+--- a/include/linux/pci.h
++++ b/include/linux/pci.h
+@@ -181,7 +181,7 @@ static inline const char *pci_power_name(pci_power_t state)
+  */
+ typedef unsigned int __bitwise pci_channel_state_t;
+ 
+-enum pci_channel_state {
++enum {
+ 	/* I/O channel is in normal state */
+ 	pci_channel_io_normal = (__force pci_channel_state_t) 1,
+ 
+@@ -825,7 +825,7 @@ enum pci_ers_result {
+ struct pci_error_handlers {
+ 	/* PCI bus error detected on this device */
+ 	pci_ers_result_t (*error_detected)(struct pci_dev *dev,
+-					   enum pci_channel_state error);
++					   pci_channel_state_t error);
+ 
+ 	/* MMIO has been re-enabled, but not DMA */
+ 	pci_ers_result_t (*mmio_enabled)(struct pci_dev *dev);
