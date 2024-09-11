@@ -2010,7 +2010,6 @@ static int sd_done(struct scsi_cmnd *SCpnt)
 				} else {
 					sdkp->device->no_write_same = 1;
 					sd_config_write_same(sdkp);
-					req->__data_len = blk_rq_bytes(req);
 					req->rq_flags |= RQF_QUIET;
 				}
 				break;
