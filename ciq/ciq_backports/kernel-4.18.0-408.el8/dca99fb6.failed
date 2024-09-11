@@ -1,0 +1,126 @@
+x86: Snapshot thread flags
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Mark Rutland <mark.rutland@arm.com>
+commit dca99fb643a2e9bc2e67a0f626b09d4f177f0f09
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/dca99fb6.failed
+
+Some thread flags can be set remotely, and so even when IRQs are disabled,
+the flags can change under our feet. Generally this is unlikely to cause a
+problem in practice, but it is somewhat unsound, and KCSAN will
+legitimately warn that there is a data race.
+
+To avoid such issues, a snapshot of the flags has to be taken prior to
+using them. Some places already use READ_ONCE() for that, others do not.
+
+Convert them all to the new flag accessor helpers.
+
+	Signed-off-by: Mark Rutland <mark.rutland@arm.com>
+	Signed-off-by: Thomas Gleixner <tglx@linutronix.de>
+	Reviewed-by: Thomas Gleixner <tglx@linutronix.de>
+	Acked-by: Paul E. McKenney <paulmck@kernel.org>
+Link: https://lore.kernel.org/r/20211129130653.2037928-12-mark.rutland@arm.com
+
+(cherry picked from commit dca99fb643a2e9bc2e67a0f626b09d4f177f0f09)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kernel/process.c
+#	arch/x86/mm/tlb.c
+diff --cc arch/x86/kernel/process.c
+index 4872353b9865,5d481038fe0b..000000000000
+--- a/arch/x86/kernel/process.c
++++ b/arch/x86/kernel/process.c
+@@@ -624,17 -638,25 +624,24 @@@ void speculation_ctrl_update_current(vo
+  	preempt_enable();
+  }
+  
+ -static inline void cr4_toggle_bits_irqsoff(unsigned long mask)
+ -{
+ -	unsigned long newval, cr4 = this_cpu_read(cpu_tlbstate.cr4);
+ -
+ -	newval = cr4 ^ mask;
+ -	if (newval != cr4) {
+ -		this_cpu_write(cpu_tlbstate.cr4, newval);
+ -		__write_cr4(newval);
+ -	}
+ -}
+ -
+  void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p)
+  {
+ +	struct thread_struct *prev, *next;
+  	unsigned long tifp, tifn;
+  
+++<<<<<<< HEAD
+ +	prev = &prev_p->thread;
+ +	next = &next_p->thread;
+ +
+ +	tifn = READ_ONCE(task_thread_info(next_p)->flags);
+ +	tifp = READ_ONCE(task_thread_info(prev_p)->flags);
+ +	switch_to_bitmap(prev, next, tifp, tifn);
+++=======
++ 	tifn = read_task_thread_flags(next_p);
++ 	tifp = read_task_thread_flags(prev_p);
++ 
++ 	switch_to_bitmap(tifp);
+++>>>>>>> dca99fb643a2 (x86: Snapshot thread flags)
+  
+  	propagate_user_return_notify(prev_p, next_p);
+  
+diff --cc arch/x86/mm/tlb.c
+index 31f76714db7a,92bb03b9ceb5..000000000000
+--- a/arch/x86/mm/tlb.c
++++ b/arch/x86/mm/tlb.c
+@@@ -187,16 -359,24 +187,21 @@@ static void sync_current_stack_to_mm(st
+  	}
+  }
+  
+ -static unsigned long mm_mangle_tif_spec_bits(struct task_struct *next)
+ +static inline unsigned long mm_mangle_tif_spec_ib(struct task_struct *next)
+  {
+++<<<<<<< HEAD
+ +	unsigned long next_tif = task_thread_info(next)->flags;
+ +	unsigned long ibpb = (next_tif >> TIF_SPEC_IB) & LAST_USER_MM_IBPB;
+++=======
++ 	unsigned long next_tif = read_task_thread_flags(next);
++ 	unsigned long spec_bits = (next_tif >> TIF_SPEC_IB) & LAST_USER_MM_SPEC_MASK;
+++>>>>>>> dca99fb643a2 (x86: Snapshot thread flags)
+  
+ -	/*
+ -	 * Ensure that the bit shift above works as expected and the two flags
+ -	 * end up in bit 0 and 1.
+ -	 */
+ -	BUILD_BUG_ON(TIF_SPEC_L1D_FLUSH != TIF_SPEC_IB + 1);
+ -
+ -	return (unsigned long)next->mm | spec_bits;
+ +	return (unsigned long)next->mm | ibpb;
+  }
+  
+ -static void cond_mitigation(struct task_struct *next)
+ +static void cond_ibpb(struct task_struct *next)
+  {
+ -	unsigned long prev_mm, next_mm;
+ -
+  	if (!next || !next->mm)
+  		return;
+  
+* Unmerged path arch/x86/kernel/process.c
+diff --git a/arch/x86/kernel/process.h b/arch/x86/kernel/process.h
+index 320ab978fb1f..3cbbbd89e17e 100644
+--- a/arch/x86/kernel/process.h
++++ b/arch/x86/kernel/process.h
+@@ -13,8 +13,8 @@ void __switch_to_xtra(struct task_struct *prev_p, struct task_struct *next_p);
+ static inline void switch_to_extra(struct task_struct *prev,
+ 				   struct task_struct *next)
+ {
+-	unsigned long next_tif = task_thread_info(next)->flags;
+-	unsigned long prev_tif = task_thread_info(prev)->flags;
++	unsigned long next_tif = read_task_thread_flags(next);
++	unsigned long prev_tif = read_task_thread_flags(prev);
+ 
+ 	if (IS_ENABLED(CONFIG_SMP)) {
+ 		/*
+* Unmerged path arch/x86/mm/tlb.c
