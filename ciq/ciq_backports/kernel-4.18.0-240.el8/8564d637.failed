@@ -1,0 +1,175 @@
+KVM: arm64: Support stolen time reporting via shared structure
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Steven Price <steven.price@arm.com>
+commit 8564d6372a7d8a6d440441b8ed8020f97f744450
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/8564d637.failed
+
+Implement the service call for configuring a shared structure between a
+VCPU and the hypervisor in which the hypervisor can write the time
+stolen from the VCPU's execution time by other tasks on the host.
+
+User space allocates memory which is placed at an IPA also chosen by user
+space. The hypervisor then updates the shared structure using
+kvm_put_guest() to ensure single copy atomicity of the 64-bit value
+reporting the stolen time in nanoseconds.
+
+Whenever stolen time is enabled by the guest, the stolen time counter is
+reset.
+
+The stolen time itself is retrieved from the sched_info structure
+maintained by the Linux scheduler code. We enable SCHEDSTATS when
+selecting KVM Kconfig to ensure this value is meaningful.
+
+	Signed-off-by: Steven Price <steven.price@arm.com>
+	Signed-off-by: Marc Zyngier <maz@kernel.org>
+(cherry picked from commit 8564d6372a7d8a6d440441b8ed8020f97f744450)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/arm/include/asm/kvm_host.h
+#	arch/arm64/include/asm/kvm_host.h
+#	virt/kvm/arm/hypercalls.c
+#	virt/kvm/arm/pvtime.c
+diff --cc arch/arm/include/asm/kvm_host.h
+index e5c90cf571a6,5a077f85813f..000000000000
+--- a/arch/arm/include/asm/kvm_host.h
++++ b/arch/arm/include/asm/kvm_host.h
+@@@ -316,6 -325,29 +317,32 @@@ static inline int kvm_arch_vm_ioctl_che
+  int kvm_perf_init(void);
+  int kvm_perf_teardown(void);
+  
+++<<<<<<< HEAD
+++=======
++ static inline long kvm_hypercall_pv_features(struct kvm_vcpu *vcpu)
++ {
++ 	return SMCCC_RET_NOT_SUPPORTED;
++ }
++ 
++ static inline gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu)
++ {
++ 	return GPA_INVALID;
++ }
++ 
++ static inline void kvm_update_stolen_time(struct kvm_vcpu *vcpu)
++ {
++ }
++ 
++ static inline void kvm_arm_pvtime_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ }
++ 
++ static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ 	return false;
++ }
++ 
+++>>>>>>> 8564d6372a7d (KVM: arm64: Support stolen time reporting via shared structure)
+  void kvm_mmu_wp_memory_region(struct kvm *kvm, int slot);
+  
+  struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr);
+diff --cc arch/arm64/include/asm/kvm_host.h
+index 4dd101adad0d,75ef37f79633..000000000000
+--- a/arch/arm64/include/asm/kvm_host.h
++++ b/arch/arm64/include/asm/kvm_host.h
+@@@ -494,6 -486,20 +502,23 @@@ void handle_exit_early(struct kvm_vcpu 
+  int kvm_perf_init(void);
+  int kvm_perf_teardown(void);
+  
+++<<<<<<< HEAD
+++=======
++ long kvm_hypercall_pv_features(struct kvm_vcpu *vcpu);
++ gpa_t kvm_init_stolen_time(struct kvm_vcpu *vcpu);
++ void kvm_update_stolen_time(struct kvm_vcpu *vcpu);
++ 
++ static inline void kvm_arm_pvtime_vcpu_init(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ 	vcpu_arch->steal.base = GPA_INVALID;
++ }
++ 
++ static inline bool kvm_arm_is_pvtime_enabled(struct kvm_vcpu_arch *vcpu_arch)
++ {
++ 	return (vcpu_arch->steal.base != GPA_INVALID);
++ }
++ 
+++>>>>>>> 8564d6372a7d (KVM: arm64: Support stolen time reporting via shared structure)
+  void kvm_set_sei_esr(struct kvm_vcpu *vcpu, u64 syndrome);
+  
+  struct kvm_vcpu *kvm_mpidr_to_vcpu(struct kvm *kvm, unsigned long mpidr);
+* Unmerged path virt/kvm/arm/hypercalls.c
+* Unmerged path virt/kvm/arm/pvtime.c
+* Unmerged path arch/arm/include/asm/kvm_host.h
+* Unmerged path arch/arm64/include/asm/kvm_host.h
+diff --git a/arch/arm64/kvm/Kconfig b/arch/arm64/kvm/Kconfig
+index 47b23bf617c7..92676920d671 100644
+--- a/arch/arm64/kvm/Kconfig
++++ b/arch/arm64/kvm/Kconfig
+@@ -40,6 +40,7 @@ config KVM
+ 	select IRQ_BYPASS_MANAGER
+ 	select HAVE_KVM_IRQ_BYPASS
+ 	select HAVE_KVM_VCPU_RUN_PID_CHANGE
++	select SCHEDSTATS
+ 	---help---
+ 	  Support hosting virtualized guest machines.
+ 	  We don't support KVM with 16K page tables yet, due to the multiple
+diff --git a/include/linux/kvm_types.h b/include/linux/kvm_types.h
+index a38729c8296f..1e5d734a2948 100644
+--- a/include/linux/kvm_types.h
++++ b/include/linux/kvm_types.h
+@@ -49,6 +49,8 @@ typedef unsigned long  gva_t;
+ typedef u64            gpa_t;
+ typedef u64            gfn_t;
+ 
++#define GPA_INVALID	(~(gpa_t)0)
++
+ typedef unsigned long  hva_t;
+ typedef u64            hpa_t;
+ typedef u64            hfn_t;
+diff --git a/virt/kvm/arm/arm.c b/virt/kvm/arm/arm.c
+index 56a004995e0e..dc64ebd421c5 100644
+--- a/virt/kvm/arm/arm.c
++++ b/virt/kvm/arm/arm.c
+@@ -52,6 +52,10 @@
+ #include <asm/kvm_coproc.h>
+ #include <asm/sections.h>
+ 
++#include <kvm/arm_hypercalls.h>
++#include <kvm/arm_pmu.h>
++#include <kvm/arm_psci.h>
++
+ #ifdef REQUIRES_VIRT
+ __asm__(".arch_extension	virt");
+ #endif
+@@ -358,6 +362,8 @@ int kvm_arch_vcpu_init(struct kvm_vcpu *vcpu)
+ 
+ 	kvm_arm_reset_debug_ptr(vcpu);
+ 
++	kvm_arm_pvtime_vcpu_init(&vcpu->arch);
++
+ 	return kvm_vgic_vcpu_init(vcpu);
+ }
+ 
+@@ -386,6 +392,8 @@ void kvm_arch_vcpu_load(struct kvm_vcpu *vcpu, int cpu)
+ 	kvm_vcpu_load_sysregs(vcpu);
+ 	kvm_arch_vcpu_load_fp(vcpu);
+ 	kvm_vcpu_pmu_restore_guest(vcpu);
++	if (kvm_arm_is_pvtime_enabled(&vcpu->arch))
++		kvm_make_request(KVM_REQ_RECORD_STEAL, vcpu);
+ 
+ 	if (single_task_running())
+ 		vcpu_clear_wfe_traps(vcpu);
+@@ -649,6 +657,9 @@ static void check_vcpu_requests(struct kvm_vcpu *vcpu)
+ 		 * that a VCPU sees new virtual interrupts.
+ 		 */
+ 		kvm_check_request(KVM_REQ_IRQ_PENDING, vcpu);
++
++		if (kvm_check_request(KVM_REQ_RECORD_STEAL, vcpu))
++			kvm_update_stolen_time(vcpu);
+ 	}
+ }
+ 
+* Unmerged path virt/kvm/arm/hypercalls.c
+* Unmerged path virt/kvm/arm/pvtime.c
