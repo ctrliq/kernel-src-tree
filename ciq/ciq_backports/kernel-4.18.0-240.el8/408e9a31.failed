@@ -1,0 +1,270 @@
+KVM: CPUID: add support for supervisor states
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-240.el8
+commit-author Paolo Bonzini <pbonzini@redhat.com>
+commit 408e9a318f57ba8be82ba01e98cc271b97392187
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-240.el8/408e9a31.failed
+
+Current CPUID 0xd enumeration code does not support supervisor
+states, because KVM only supports setting IA32_XSS to zero.
+Change it instead to use a new variable supported_xss, to be
+set from the hardware_setup callback which is in charge of CPU
+capabilities.
+
+	Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+(cherry picked from commit 408e9a318f57ba8be82ba01e98cc271b97392187)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/x86/kvm/cpuid.c
+#	arch/x86/kvm/svm.c
+#	arch/x86/kvm/vmx/vmx.c
+#	arch/x86/kvm/x86.c
+#	arch/x86/kvm/x86.h
+diff --cc arch/x86/kvm/cpuid.c
+index 6cc407efd815,78d461be2102..000000000000
+--- a/arch/x86/kvm/cpuid.c
++++ b/arch/x86/kvm/cpuid.c
+@@@ -666,18 -640,24 +666,34 @@@ static inline int __do_cpuid_func(struc
+  		if (!entry)
+  			goto out;
+  
+ -		cpuid_entry_override(entry, CPUID_D_1_EAX);
+ +		entry->eax &= kvm_cpuid_D_1_eax_x86_features;
+ +		cpuid_mask(&entry->eax, CPUID_D_1_EAX);
+  		if (entry->eax & (F(XSAVES)|F(XSAVEC)))
+++<<<<<<< HEAD
+ +			entry->ebx = xstate_required_size(supported, true);
+ +		else
+++=======
++ 			entry->ebx = xstate_required_size(supported_xcr0 | supported_xss,
++ 							  true);
++ 		else {
++ 			WARN_ON_ONCE(supported_xss != 0);
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  			entry->ebx = 0;
+- 		/* Saving XSS controlled state via XSAVES isn't supported. */
+- 		entry->ecx = 0;
+- 		entry->edx = 0;
++ 		}
++ 		entry->ecx &= supported_xss;
++ 		entry->edx &= supported_xss >> 32;
+  
+  		for (i = 2; i < 64; ++i) {
+++<<<<<<< HEAD
+ +			if (!(supported & BIT_ULL(i)))
+++=======
++ 			bool s_state;
++ 			if (supported_xcr0 & BIT_ULL(i))
++ 				s_state = false;
++ 			else if (supported_xss & BIT_ULL(i))
++ 				s_state = true;
++ 			else
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  				continue;
+  
+  			entry = do_host_cpuid(array, function, i);
+@@@ -685,13 -665,14 +701,20 @@@
+  				goto out;
+  
+  			/*
+++<<<<<<< HEAD
+ +			 * The @supported check above should have filtered out
+ +			 * invalid sub-leafs as well as sub-leafs managed by
+ +			 * IA32_XSS MSR.  Only XCR0-managed sub-leafs should
+++=======
++ 			 * The supported check above should have filtered out
++ 			 * invalid sub-leafs.  Only valid sub-leafs should
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  			 * reach this point, and they should have a non-zero
+- 			 * save state size.
++ 			 * save state size.  Furthermore, check whether the
++ 			 * processor agrees with supported_xcr0/supported_xss
++ 			 * on whether this is an XCR0- or IA32_XSS-managed area.
+  			 */
+- 			if (WARN_ON_ONCE(!entry->eax || (entry->ecx & 1))) {
++ 			if (WARN_ON_ONCE(!entry->eax || (entry->ecx & 0x1) != s_state)) {
+  				--array->nent;
+  				continue;
+  			}
+diff --cc arch/x86/kvm/svm.c
+index 720353d5a356,4dca3579e740..000000000000
+--- a/arch/x86/kvm/svm.c
++++ b/arch/x86/kvm/svm.c
+@@@ -1372,6 -1367,29 +1372,32 @@@ static void svm_hardware_teardown(void
+  	iopm_base = 0;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static __init void svm_set_cpu_caps(void)
++ {
++ 	kvm_set_cpu_caps();
++ 
++ 	supported_xss = 0;
++ 
++ 	/* CPUID 0x80000001 and 0x8000000A (SVM features) */
++ 	if (nested) {
++ 		kvm_cpu_cap_set(X86_FEATURE_SVM);
++ 
++ 		if (nrips)
++ 			kvm_cpu_cap_set(X86_FEATURE_NRIPS);
++ 
++ 		if (npt_enabled)
++ 			kvm_cpu_cap_set(X86_FEATURE_NPT);
++ 	}
++ 
++ 	/* CPUID 0x80000008 */
++ 	if (boot_cpu_has(X86_FEATURE_LS_CFG_SSBD) ||
++ 	    boot_cpu_has(X86_FEATURE_AMD_SSBD))
++ 		kvm_cpu_cap_set(X86_FEATURE_VIRT_SSBD);
++ }
++ 
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  static __init int svm_hardware_setup(void)
+  {
+  	int cpu;
+diff --cc arch/x86/kvm/vmx/vmx.c
+index 81f81c6fe900,8001070b209c..000000000000
+--- a/arch/x86/kvm/vmx/vmx.c
++++ b/arch/x86/kvm/vmx/vmx.c
+@@@ -7250,10 -7102,37 +7250,42 @@@ static void vmx_cpuid_update(struct kvm
+  	}
+  }
+  
+ -static __init void vmx_set_cpu_caps(void)
+ +static void vmx_set_supported_cpuid(u32 func, struct kvm_cpuid_entry2 *entry)
+  {
+++<<<<<<< HEAD
+ +	if (func == 1 && nested)
+ +		entry->ecx |= feature_bit(VMX);
+++=======
++ 	kvm_set_cpu_caps();
++ 
++ 	/* CPUID 0x1 */
++ 	if (nested)
++ 		kvm_cpu_cap_set(X86_FEATURE_VMX);
++ 
++ 	/* CPUID 0x7 */
++ 	if (kvm_mpx_supported())
++ 		kvm_cpu_cap_check_and_set(X86_FEATURE_MPX);
++ 	if (cpu_has_vmx_invpcid())
++ 		kvm_cpu_cap_check_and_set(X86_FEATURE_INVPCID);
++ 	if (vmx_pt_mode_is_host_guest())
++ 		kvm_cpu_cap_check_and_set(X86_FEATURE_INTEL_PT);
++ 
++ 	/* PKU is not yet implemented for shadow paging. */
++ 	if (enable_ept && boot_cpu_has(X86_FEATURE_OSPKE))
++ 		kvm_cpu_cap_check_and_set(X86_FEATURE_PKU);
++ 
++ 	if (vmx_umip_emulated())
++ 		kvm_cpu_cap_set(X86_FEATURE_UMIP);
++ 
++ 	/* CPUID 0xD.1 */
++ 	supported_xss = 0;
++ 	if (!vmx_xsaves_supported())
++ 		kvm_cpu_cap_clear(X86_FEATURE_XSAVES);
++ 
++ 	/* CPUID 0x80000001 */
++ 	if (!cpu_has_vmx_rdtscp())
++ 		kvm_cpu_cap_clear(X86_FEATURE_RDTSCP);
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  }
+  
+  static void vmx_request_immediate_exit(struct kvm_vcpu *vcpu)
+diff --cc arch/x86/kvm/x86.c
+index d84116c1b5a2,96e897d38a63..000000000000
+--- a/arch/x86/kvm/x86.c
++++ b/arch/x86/kvm/x86.c
+@@@ -181,7 -181,17 +181,9 @@@ struct kvm_shared_msrs 
+  static struct kvm_shared_msrs_global __read_mostly shared_msrs_global;
+  static struct kvm_shared_msrs __percpu *shared_msrs;
+  
+ -#define KVM_SUPPORTED_XCR0     (XFEATURE_MASK_FP | XFEATURE_MASK_SSE \
+ -				| XFEATURE_MASK_YMM | XFEATURE_MASK_BNDREGS \
+ -				| XFEATURE_MASK_BNDCSR | XFEATURE_MASK_AVX512 \
+ -				| XFEATURE_MASK_PKRU)
+ -
+ -u64 __read_mostly host_efer;
+ -EXPORT_SYMBOL_GPL(host_efer);
+ -
+  static u64 __read_mostly host_xss;
++ u64 __read_mostly supported_xss;
++ EXPORT_SYMBOL_GPL(supported_xss);
+  
+  struct kvm_stats_debugfs_item debugfs_entries[] = {
+  	{ "pf_fixed", VCPU_STAT(pf_fixed) },
+@@@ -2781,6 -2820,19 +2783,22 @@@ int kvm_set_msr_common(struct kvm_vcpu 
+  	case MSR_IA32_TSC:
+  		kvm_write_tsc(vcpu, msr_info);
+  		break;
+++<<<<<<< HEAD
+++=======
++ 	case MSR_IA32_XSS:
++ 		if (!msr_info->host_initiated &&
++ 		    !guest_cpuid_has(vcpu, X86_FEATURE_XSAVES))
++ 			return 1;
++ 		/*
++ 		 * KVM supports exposing PT to the guest, but does not support
++ 		 * IA32_XSS[bit 8]. Guests have to use RDMSR/WRMSR rather than
++ 		 * XSAVES/XRSTORS to save/restore PT MSRs.
++ 		 */
++ 		if (data & ~supported_xss)
++ 			return 1;
++ 		vcpu->arch.ia32_xss = data;
++ 		break;
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  	case MSR_SMI_COUNT:
+  		if (!msr_info->host_initiated)
+  			return 1;
+@@@ -9392,6 -9617,11 +9410,14 @@@ int kvm_arch_hardware_setup(void
+  {
+  	int r;
+  
+++<<<<<<< HEAD
+++=======
++ 	rdmsrl_safe(MSR_EFER, &host_efer);
++ 
++ 	if (boot_cpu_has(X86_FEATURE_XSAVES))
++ 		rdmsrl(MSR_IA32_XSS, host_xss);
++ 
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  	r = kvm_x86_ops->hardware_setup();
+  	if (r != 0)
+  		return r;
+diff --cc arch/x86/kvm/x86.h
+index 916e17e33414,c1954e216b41..000000000000
+--- a/arch/x86/kvm/x86.h
++++ b/arch/x86/kvm/x86.h
+@@@ -270,13 -270,15 +270,18 @@@ int x86_emulate_instruction(struct kvm_
+  			    int emulation_type, void *insn, int insn_len);
+  enum exit_fastpath_completion handle_fastpath_set_msr_irqoff(struct kvm_vcpu *vcpu);
+  
+ +#define KVM_SUPPORTED_XCR0     (XFEATURE_MASK_FP | XFEATURE_MASK_SSE \
+ +				| XFEATURE_MASK_YMM | XFEATURE_MASK_BNDREGS \
+ +				| XFEATURE_MASK_BNDCSR | XFEATURE_MASK_AVX512 \
+ +				| XFEATURE_MASK_PKRU)
+  extern u64 host_xcr0;
+++<<<<<<< HEAD
+++=======
++ extern u64 supported_xcr0;
++ extern u64 supported_xss;
+++>>>>>>> 408e9a318f57 (KVM: CPUID: add support for supervisor states)
+  
+ -static inline bool kvm_mpx_supported(void)
+ -{
+ -	return (supported_xcr0 & (XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR))
+ -		== (XFEATURE_MASK_BNDREGS | XFEATURE_MASK_BNDCSR);
+ -}
+ +extern u64 kvm_supported_xcr0(void);
+  
+  extern unsigned int min_timer_period_us;
+  
+* Unmerged path arch/x86/kvm/cpuid.c
+* Unmerged path arch/x86/kvm/svm.c
+* Unmerged path arch/x86/kvm/vmx/vmx.c
+* Unmerged path arch/x86/kvm/x86.c
+* Unmerged path arch/x86/kvm/x86.h
