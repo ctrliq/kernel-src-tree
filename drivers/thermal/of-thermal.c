@@ -37,7 +37,6 @@ struct __thermal_bind_params {
 
 /**
  * struct __thermal_zone - internal representation of a thermal zone
- * @mode: current thermal zone device mode (enabled/disabled)
  * @passive_delay: polling interval while passive cooling is activated
  * @polling_delay: zone polling interval
  * @slope: slope of the temperature adjustment curve
@@ -51,7 +50,6 @@ struct __thermal_bind_params {
  */
 
 struct __thermal_zone {
-	enum thermal_device_mode mode;
 	int passive_delay;
 	int polling_delay;
 	int slope;
@@ -246,9 +244,7 @@ static int of_thermal_unbind(struct thermal_zone_device *thermal,
 static int of_thermal_get_mode(struct thermal_zone_device *tz,
 			       enum thermal_device_mode *mode)
 {
-	struct __thermal_zone *data = tz->devdata;
-
-	*mode = data->mode;
+	*mode = tz->mode;
 
 	return 0;
 }
@@ -270,7 +266,7 @@ static int of_thermal_set_mode(struct thermal_zone_device *tz,
 
 	mutex_unlock(&tz->lock);
 
-	data->mode = mode;
+	tz->mode = mode;
 	thermal_zone_device_update(tz, THERMAL_EVENT_UNSPECIFIED);
 
 	return 0;
@@ -898,7 +894,6 @@ __init *thermal_of_build_thermal_zone(struct device_node *np)
 
 finish:
 	of_node_put(child);
-	tz->mode = THERMAL_DEVICE_DISABLED;
 
 	return tz;
 
@@ -1005,6 +1000,7 @@ int __init of_parse_thermal_zones(void)
 			of_thermal_free_zone(tz);
 			/* attempting to build remaining zones still */
 		}
+		zone->mode = THERMAL_DEVICE_DISABLED;
 	}
 	of_node_put(np);
 
