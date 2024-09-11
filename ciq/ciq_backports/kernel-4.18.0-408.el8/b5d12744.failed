@@ -1,0 +1,136 @@
+KVM: s390: Fix lockdep issue in vm memop
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-408.el8
+commit-author Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+commit b5d1274409d0eec6d826f65d6dafebf9d77a1b99
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-408.el8/b5d12744.failed
+
+Issuing a memop on a protected vm does not make sense,
+neither is the memory readable/writable, nor does it make sense to check
+storage keys. This is why the ioctl will return -EINVAL when it detects
+the vm to be protected. However, in order to ensure that the vm cannot
+become protected during the memop, the kvm->lock would need to be taken
+for the duration of the ioctl. This is also required because
+kvm_s390_pv_is_protected asserts that the lock must be held.
+Instead, don't try to prevent this. If user space enables secure
+execution concurrently with a memop it must accecpt the possibility of
+the memop failing.
+Still check if the vm is currently protected, but without locking and
+consider it a heuristic.
+
+Fixes: ef11c9463ae0 ("KVM: s390: Add vm IOCTL for key checked guest absolute memory access")
+	Signed-off-by: Janis Schoetterl-Glausch <scgl@linux.ibm.com>
+	Reviewed-by: Janosch Frank <frankja@linux.ibm.com>
+	Reviewed-by: Claudio Imbrenda <imbrenda@linux.ibm.com>
+Link: https://lore.kernel.org/r/20220322153204.2637400-1-scgl@linux.ibm.com
+	Signed-off-by: Christian Borntraeger <borntraeger@linux.ibm.com>
+	Signed-off-by: Heiko Carstens <hca@linux.ibm.com>
+(cherry picked from commit b5d1274409d0eec6d826f65d6dafebf9d77a1b99)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	arch/s390/kvm/kvm-s390.c
+diff --cc arch/s390/kvm/kvm-s390.c
+index d74a232fd87a,76ad6408cb2c..000000000000
+--- a/arch/s390/kvm/kvm-s390.c
++++ b/arch/s390/kvm/kvm-s390.c
+@@@ -2358,6 -2366,92 +2358,95 @@@ static int kvm_s390_handle_pv(struct kv
+  	return r;
+  }
+  
+++<<<<<<< HEAD
+++=======
++ static bool access_key_invalid(u8 access_key)
++ {
++ 	return access_key > 0xf;
++ }
++ 
++ static int kvm_s390_vm_mem_op(struct kvm *kvm, struct kvm_s390_mem_op *mop)
++ {
++ 	void __user *uaddr = (void __user *)mop->buf;
++ 	u64 supported_flags;
++ 	void *tmpbuf = NULL;
++ 	int r, srcu_idx;
++ 
++ 	supported_flags = KVM_S390_MEMOP_F_SKEY_PROTECTION
++ 			  | KVM_S390_MEMOP_F_CHECK_ONLY;
++ 	if (mop->flags & ~supported_flags || !mop->size)
++ 		return -EINVAL;
++ 	if (mop->size > MEM_OP_MAX_SIZE)
++ 		return -E2BIG;
++ 	/*
++ 	 * This is technically a heuristic only, if the kvm->lock is not
++ 	 * taken, it is not guaranteed that the vm is/remains non-protected.
++ 	 * This is ok from a kernel perspective, wrongdoing is detected
++ 	 * on the access, -EFAULT is returned and the vm may crash the
++ 	 * next time it accesses the memory in question.
++ 	 * There is no sane usecase to do switching and a memop on two
++ 	 * different CPUs at the same time.
++ 	 */
++ 	if (kvm_s390_pv_get_handle(kvm))
++ 		return -EINVAL;
++ 	if (mop->flags & KVM_S390_MEMOP_F_SKEY_PROTECTION) {
++ 		if (access_key_invalid(mop->key))
++ 			return -EINVAL;
++ 	} else {
++ 		mop->key = 0;
++ 	}
++ 	if (!(mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY)) {
++ 		tmpbuf = vmalloc(mop->size);
++ 		if (!tmpbuf)
++ 			return -ENOMEM;
++ 	}
++ 
++ 	srcu_idx = srcu_read_lock(&kvm->srcu);
++ 
++ 	if (kvm_is_error_gpa(kvm, mop->gaddr)) {
++ 		r = PGM_ADDRESSING;
++ 		goto out_unlock;
++ 	}
++ 
++ 	switch (mop->op) {
++ 	case KVM_S390_MEMOP_ABSOLUTE_READ: {
++ 		if (mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY) {
++ 			r = check_gpa_range(kvm, mop->gaddr, mop->size, GACC_FETCH, mop->key);
++ 		} else {
++ 			r = access_guest_abs_with_key(kvm, mop->gaddr, tmpbuf,
++ 						      mop->size, GACC_FETCH, mop->key);
++ 			if (r == 0) {
++ 				if (copy_to_user(uaddr, tmpbuf, mop->size))
++ 					r = -EFAULT;
++ 			}
++ 		}
++ 		break;
++ 	}
++ 	case KVM_S390_MEMOP_ABSOLUTE_WRITE: {
++ 		if (mop->flags & KVM_S390_MEMOP_F_CHECK_ONLY) {
++ 			r = check_gpa_range(kvm, mop->gaddr, mop->size, GACC_STORE, mop->key);
++ 		} else {
++ 			if (copy_from_user(tmpbuf, uaddr, mop->size)) {
++ 				r = -EFAULT;
++ 				break;
++ 			}
++ 			r = access_guest_abs_with_key(kvm, mop->gaddr, tmpbuf,
++ 						      mop->size, GACC_STORE, mop->key);
++ 		}
++ 		break;
++ 	}
++ 	default:
++ 		r = -EINVAL;
++ 	}
++ 
++ out_unlock:
++ 	srcu_read_unlock(&kvm->srcu, srcu_idx);
++ 
++ 	vfree(tmpbuf);
++ 	return r;
++ }
++ 
+++>>>>>>> b5d1274409d0 (KVM: s390: Fix lockdep issue in vm memop)
+  long kvm_arch_vm_ioctl(struct file *filp,
+  		       unsigned int ioctl, unsigned long arg)
+  {
+* Unmerged path arch/s390/kvm/kvm-s390.c
