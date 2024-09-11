@@ -1,0 +1,93 @@
+iommu/dma: Account for min_align_mask w/swiotlb
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-365.el8
+commit-author David Stevens <stevensd@chromium.org>
+commit 2cbc61a1b1665c84282dbf2b1747ffa0b6248639
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-365.el8/2cbc61a1.failed
+
+Pass the non-aligned size to __iommu_dma_map when using swiotlb bounce
+buffers in iommu_dma_map_page, to account for min_align_mask.
+
+To deal with granule alignment, __iommu_dma_map maps iova_align(size +
+iova_off) bytes starting at phys - iova_off. If iommu_dma_map_page
+passes aligned size when using swiotlb, then this becomes
+iova_align(iova_align(orig_size) + iova_off). Normally iova_off will be
+zero when using swiotlb. However, this is not the case for devices that
+set min_align_mask. When iova_off is non-zero, __iommu_dma_map ends up
+mapping an extra page at the end of the buffer. Beyond just being a
+security issue, the extra page is not cleaned up by __iommu_dma_unmap.
+This causes problems when the IOVA is reused, due to collisions in the
+iommu driver.  Just passing the original size is sufficient, since
+__iommu_dma_map will take care of granule alignment.
+
+Fixes: 1f221a0d0dbf ("swiotlb: respect min_align_mask")
+	Signed-off-by: David Stevens <stevensd@chromium.org>
+Link: https://lore.kernel.org/r/20210929023300.335969-8-stevensd@google.com
+	Signed-off-by: Joerg Roedel <jroedel@suse.de>
+(cherry picked from commit 2cbc61a1b1665c84282dbf2b1747ffa0b6248639)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	drivers/iommu/dma-iommu.c
+diff --cc drivers/iommu/dma-iommu.c
+index 5899c384b30a,342359727a59..000000000000
+--- a/drivers/iommu/dma-iommu.c
++++ b/drivers/iommu/dma-iommu.c
+@@@ -870,9 -802,47 +870,53 @@@ static dma_addr_t iommu_dma_map_page(st
+  {
+  	phys_addr_t phys = page_to_phys(page) + offset;
+  	bool coherent = dev_is_dma_coherent(dev);
+++<<<<<<< HEAD
+ +
+ +	return __iommu_dma_map_swiotlb(dev, phys, size, dma_get_mask(dev),
+ +			coherent, dir, attrs);
+++=======
++ 	int prot = dma_info_to_prot(dir, coherent, attrs);
++ 	struct iommu_domain *domain = iommu_get_dma_domain(dev);
++ 	struct iommu_dma_cookie *cookie = domain->iova_cookie;
++ 	struct iova_domain *iovad = &cookie->iovad;
++ 	dma_addr_t iova, dma_mask = dma_get_mask(dev);
++ 
++ 	/*
++ 	 * If both the physical buffer start address and size are
++ 	 * page aligned, we don't need to use a bounce page.
++ 	 */
++ 	if (dev_use_swiotlb(dev) && iova_offset(iovad, phys | size)) {
++ 		void *padding_start;
++ 		size_t padding_size, aligned_size;
++ 
++ 		aligned_size = iova_align(iovad, size);
++ 		phys = swiotlb_tbl_map_single(dev, phys, size, aligned_size,
++ 					      iova_mask(iovad), dir, attrs);
++ 
++ 		if (phys == DMA_MAPPING_ERROR)
++ 			return DMA_MAPPING_ERROR;
++ 
++ 		/* Cleanup the padding area. */
++ 		padding_start = phys_to_virt(phys);
++ 		padding_size = aligned_size;
++ 
++ 		if (!(attrs & DMA_ATTR_SKIP_CPU_SYNC) &&
++ 		    (dir == DMA_TO_DEVICE || dir == DMA_BIDIRECTIONAL)) {
++ 			padding_start += size;
++ 			padding_size -= size;
++ 		}
++ 
++ 		memset(padding_start, 0, padding_size);
++ 	}
++ 
++ 	if (!coherent && !(attrs & DMA_ATTR_SKIP_CPU_SYNC))
++ 		arch_sync_dma_for_device(phys, size, dir);
++ 
++ 	iova = __iommu_dma_map(dev, phys, size, prot, dma_mask);
++ 	if (iova == DMA_MAPPING_ERROR && is_swiotlb_buffer(dev, phys))
++ 		swiotlb_tbl_unmap_single(dev, phys, size, dir, attrs);
++ 	return iova;
+++>>>>>>> 2cbc61a1b166 (iommu/dma: Account for min_align_mask w/swiotlb)
+  }
+  
+  static void iommu_dma_unmap_page(struct device *dev, dma_addr_t dma_handle,
+* Unmerged path drivers/iommu/dma-iommu.c
