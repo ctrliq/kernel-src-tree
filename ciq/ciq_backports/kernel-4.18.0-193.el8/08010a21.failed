@@ -1,0 +1,468 @@
+netfilter: add API to manage NAT helpers.
+
+jira LE-1907
+Rebuild_History Non-Buildable kernel-4.18.0-193.el8
+commit-author Flavio Leitner <fbl@redhat.com>
+commit 08010a21602678932894c5e87014a282af0079cf
+Empty-Commit: Cherry-Pick Conflicts during history rebuild.
+Will be included in final tarball splat. Ref for failed cherry-pick at:
+ciq/ciq_backports/kernel-4.18.0-193.el8/08010a21.failed
+
+The API allows a conntrack helper to indicate its corresponding
+NAT helper which then can be loaded and reference counted.
+
+	Signed-off-by: Flavio Leitner <fbl@redhat.com>
+	Signed-off-by: Pablo Neira Ayuso <pablo@netfilter.org>
+(cherry picked from commit 08010a21602678932894c5e87014a282af0079cf)
+	Signed-off-by: Jonathan Maple <jmaple@ciq.com>
+
+# Conflicts:
+#	net/netfilter/nf_conntrack_helper.c
+diff --cc net/netfilter/nf_conntrack_helper.c
+index a75b11c39312,918df7f71c8f..000000000000
+--- a/net/netfilter/nf_conntrack_helper.c
++++ b/net/netfilter/nf_conntrack_helper.c
+@@@ -43,66 -42,8 +43,71 @@@ module_param_named(nf_conntrack_helper
+  MODULE_PARM_DESC(nf_conntrack_helper,
+  		 "Enable automatic conntrack helper assignment (default 0)");
+  
+++<<<<<<< HEAD
+ +#ifdef CONFIG_SYSCTL
+ +static struct ctl_table helper_sysctl_table[] = {
+ +	{
+ +		.procname	= "nf_conntrack_helper",
+ +		.data		= &init_net.ct.sysctl_auto_assign_helper,
+ +		.maxlen		= sizeof(unsigned int),
+ +		.mode		= 0644,
+ +		.proc_handler	= proc_dointvec,
+ +	},
+ +	{}
+ +};
+ +
+ +static int nf_conntrack_helper_init_sysctl(struct net *net)
+ +{
+ +	struct ctl_table *table;
+ +
+ +	table = kmemdup(helper_sysctl_table, sizeof(helper_sysctl_table),
+ +			GFP_KERNEL);
+ +	if (!table)
+ +		goto out;
+ +
+ +	table[0].data = &net->ct.sysctl_auto_assign_helper;
+ +
+ +	/* Don't export sysctls to unprivileged users */
+ +	if (net->user_ns != &init_user_ns)
+ +		table[0].procname = NULL;
+ +
+ +	net->ct.helper_sysctl_header =
+ +		register_net_sysctl(net, "net/netfilter", table);
+ +
+ +	if (!net->ct.helper_sysctl_header) {
+ +		pr_err("nf_conntrack_helper: can't register to sysctl.\n");
+ +		goto out_register;
+ +	}
+ +	return 0;
+ +
+ +out_register:
+ +	kfree(table);
+ +out:
+ +	return -ENOMEM;
+ +}
+ +
+ +static void nf_conntrack_helper_fini_sysctl(struct net *net)
+ +{
+ +	struct ctl_table *table;
+ +
+ +	table = net->ct.helper_sysctl_header->ctl_table_arg;
+ +	unregister_net_sysctl_table(net->ct.helper_sysctl_header);
+ +	kfree(table);
+ +}
+ +#else
+ +static int nf_conntrack_helper_init_sysctl(struct net *net)
+ +{
+ +	return 0;
+ +}
+ +
+ +static void nf_conntrack_helper_fini_sysctl(struct net *net)
+ +{
+ +}
+ +#endif /* CONFIG_SYSCTL */
+++=======
++ static DEFINE_MUTEX(nf_ct_nat_helpers_mutex);
++ static struct list_head nf_ct_nat_helpers __read_mostly;
+++>>>>>>> 08010a216026 (netfilter: add API to manage NAT helpers.)
+  
+  /* Stupid hash, but collision free for the default registrations of the
+   * helpers currently in the kernel. */
+@@@ -192,9 -133,72 +197,73 @@@ void nf_conntrack_helper_put(struct nf_
+  }
+  EXPORT_SYMBOL_GPL(nf_conntrack_helper_put);
+  
++ static struct nf_conntrack_nat_helper *
++ nf_conntrack_nat_helper_find(const char *mod_name)
++ {
++ 	struct nf_conntrack_nat_helper *cur;
++ 	bool found = false;
++ 
++ 	list_for_each_entry_rcu(cur, &nf_ct_nat_helpers, list) {
++ 		if (!strcmp(cur->mod_name, mod_name)) {
++ 			found = true;
++ 			break;
++ 		}
++ 	}
++ 	return found ? cur : NULL;
++ }
++ 
++ int
++ nf_nat_helper_try_module_get(const char *name, u16 l3num, u8 protonum)
++ {
++ 	struct nf_conntrack_helper *h;
++ 	struct nf_conntrack_nat_helper *nat;
++ 	char mod_name[NF_CT_HELPER_NAME_LEN];
++ 	int ret = 0;
++ 
++ 	rcu_read_lock();
++ 	h = __nf_conntrack_helper_find(name, l3num, protonum);
++ 	if (!h) {
++ 		rcu_read_unlock();
++ 		return -ENOENT;
++ 	}
++ 
++ 	nat = nf_conntrack_nat_helper_find(h->nat_mod_name);
++ 	if (!nat) {
++ 		snprintf(mod_name, sizeof(mod_name), "%s", h->nat_mod_name);
++ 		rcu_read_unlock();
++ 		request_module(mod_name);
++ 
++ 		rcu_read_lock();
++ 		nat = nf_conntrack_nat_helper_find(mod_name);
++ 		if (!nat) {
++ 			rcu_read_unlock();
++ 			return -ENOENT;
++ 		}
++ 	}
++ 
++ 	if (!try_module_get(nat->module))
++ 		ret = -ENOENT;
++ 
++ 	rcu_read_unlock();
++ 	return ret;
++ }
++ EXPORT_SYMBOL_GPL(nf_nat_helper_try_module_get);
++ 
++ void nf_nat_helper_put(struct nf_conntrack_helper *helper)
++ {
++ 	struct nf_conntrack_nat_helper *nat;
++ 
++ 	nat = nf_conntrack_nat_helper_find(helper->nat_mod_name);
++ 	if (WARN_ON_ONCE(!nat))
++ 		return;
++ 
++ 	module_put(nat->module);
++ }
++ EXPORT_SYMBOL_GPL(nf_nat_helper_put);
++ 
+  struct nf_conn_help *
+ -nf_ct_helper_ext_add(struct nf_conn *ct, gfp_t gfp)
+ +nf_ct_helper_ext_add(struct nf_conn *ct,
+ +		     struct nf_conntrack_helper *helper, gfp_t gfp)
+  {
+  	struct nf_conn_help *help;
+  
+@@@ -562,9 -578,10 +649,10 @@@ int nf_conntrack_helper_init(void
+  		goto out_extend;
+  	}
+  
++ 	INIT_LIST_HEAD(&nf_ct_nat_helpers);
+  	return 0;
+  out_extend:
+ -	kvfree(nf_ct_helper_hash);
+ +	nf_ct_free_hashtable(nf_ct_helper_hash, nf_ct_helper_hsize);
+  	return ret;
+  }
+  
+diff --git a/include/net/netfilter/nf_conntrack_helper.h b/include/net/netfilter/nf_conntrack_helper.h
+index fdec7607c635..f03da4063a07 100644
+--- a/include/net/netfilter/nf_conntrack_helper.h
++++ b/include/net/netfilter/nf_conntrack_helper.h
+@@ -15,7 +15,8 @@
+ #include <net/netfilter/nf_conntrack_extend.h>
+ #include <net/netfilter/nf_conntrack_expect.h>
+ 
+-#define NF_NAT_HELPER_NAME(name)	"ip_nat_" name
++#define NF_NAT_HELPER_PREFIX		"ip_nat_"
++#define NF_NAT_HELPER_NAME(name)	NF_NAT_HELPER_PREFIX name
+ #define MODULE_ALIAS_NF_NAT_HELPER(name) \
+ 	MODULE_ALIAS(NF_NAT_HELPER_NAME(name))
+ 
+@@ -58,6 +59,8 @@ struct nf_conntrack_helper {
+ 	unsigned int queue_num;
+ 	/* length of userspace private data stored in nf_conn_help->data */
+ 	u16 data_len;
++	/* name of NAT helper module */
++	char nat_mod_name[NF_CT_HELPER_NAME_LEN];
+ };
+ 
+ /* Must be kept in sync with the classes defined by helpers */
+@@ -160,4 +163,21 @@ nf_ct_helper_expectfn_find_by_symbol(const void *symbol);
+ extern struct hlist_head *nf_ct_helper_hash;
+ extern unsigned int nf_ct_helper_hsize;
+ 
++struct nf_conntrack_nat_helper {
++	struct list_head list;
++	char mod_name[NF_CT_HELPER_NAME_LEN];	/* module name */
++	struct module *module;			/* pointer to self */
++};
++
++#define NF_CT_NAT_HELPER_INIT(name) \
++	{ \
++	.mod_name = NF_NAT_HELPER_NAME(name), \
++	.module = THIS_MODULE \
++	}
++
++void nf_nat_helper_register(struct nf_conntrack_nat_helper *nat);
++void nf_nat_helper_unregister(struct nf_conntrack_nat_helper *nat);
++int nf_nat_helper_try_module_get(const char *name, u16 l3num,
++				 u8 protonum);
++void nf_nat_helper_put(struct nf_conntrack_helper *helper);
+ #endif /*_NF_CONNTRACK_HELPER_H*/
+diff --git a/net/netfilter/nf_conntrack_amanda.c b/net/netfilter/nf_conntrack_amanda.c
+index 20edd589fe06..9c322a6ec288 100644
+--- a/net/netfilter/nf_conntrack_amanda.c
++++ b/net/netfilter/nf_conntrack_amanda.c
+@@ -28,11 +28,13 @@
+ static unsigned int master_timeout __read_mostly = 300;
+ static char *ts_algo = "kmp";
+ 
++#define HELPER_NAME "amanda"
++
+ MODULE_AUTHOR("Brian J. Murrell <netfilter@interlinx.bc.ca>");
+ MODULE_DESCRIPTION("Amanda connection tracking module");
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS("ip_conntrack_amanda");
+-MODULE_ALIAS_NFCT_HELPER("amanda");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ module_param(master_timeout, uint, 0600);
+ MODULE_PARM_DESC(master_timeout, "timeout for the master connection");
+@@ -174,13 +176,14 @@ static const struct nf_conntrack_expect_policy amanda_exp_policy = {
+ 
+ static struct nf_conntrack_helper amanda_helper[2] __read_mostly = {
+ 	{
+-		.name			= "amanda",
++		.name			= HELPER_NAME,
+ 		.me			= THIS_MODULE,
+ 		.help			= amanda_help,
+ 		.tuple.src.l3num	= AF_INET,
+ 		.tuple.src.u.udp.port	= cpu_to_be16(10080),
+ 		.tuple.dst.protonum	= IPPROTO_UDP,
+ 		.expect_policy		= &amanda_exp_policy,
++		.nat_mod_name		= NF_NAT_HELPER_NAME(HELPER_NAME),
+ 	},
+ 	{
+ 		.name			= "amanda",
+@@ -190,6 +193,7 @@ static struct nf_conntrack_helper amanda_helper[2] __read_mostly = {
+ 		.tuple.src.u.udp.port	= cpu_to_be16(10080),
+ 		.tuple.dst.protonum	= IPPROTO_UDP,
+ 		.expect_policy		= &amanda_exp_policy,
++		.nat_mod_name		= NF_NAT_HELPER_NAME(HELPER_NAME),
+ 	},
+ };
+ 
+diff --git a/net/netfilter/nf_conntrack_ftp.c b/net/netfilter/nf_conntrack_ftp.c
+index a11c304fb771..32aeac1c4760 100644
+--- a/net/netfilter/nf_conntrack_ftp.c
++++ b/net/netfilter/nf_conntrack_ftp.c
+@@ -29,11 +29,13 @@
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <linux/netfilter/nf_conntrack_ftp.h>
+ 
++#define HELPER_NAME "ftp"
++
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Rusty Russell <rusty@rustcorp.com.au>");
+ MODULE_DESCRIPTION("ftp connection tracking helper");
+ MODULE_ALIAS("ip_conntrack_ftp");
+-MODULE_ALIAS_NFCT_HELPER("ftp");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ /* This is slow, but it's simple. --RR */
+ static char *ftp_buffer;
+@@ -588,12 +590,14 @@ static int __init nf_conntrack_ftp_init(void)
+ 	/* FIXME should be configurable whether IPv4 and IPv6 FTP connections
+ 		 are tracked or not - YK */
+ 	for (i = 0; i < ports_c; i++) {
+-		nf_ct_helper_init(&ftp[2 * i], AF_INET, IPPROTO_TCP, "ftp",
+-				  FTP_PORT, ports[i], ports[i], &ftp_exp_policy,
+-				  0, help, nf_ct_ftp_from_nlattr, THIS_MODULE);
+-		nf_ct_helper_init(&ftp[2 * i + 1], AF_INET6, IPPROTO_TCP, "ftp",
+-				  FTP_PORT, ports[i], ports[i], &ftp_exp_policy,
+-				  0, help, nf_ct_ftp_from_nlattr, THIS_MODULE);
++		nf_ct_helper_init(&ftp[2 * i], AF_INET, IPPROTO_TCP,
++				  HELPER_NAME, FTP_PORT, ports[i], ports[i],
++				  &ftp_exp_policy, 0, help,
++				  nf_ct_ftp_from_nlattr, THIS_MODULE);
++		nf_ct_helper_init(&ftp[2 * i + 1], AF_INET6, IPPROTO_TCP,
++				  HELPER_NAME, FTP_PORT, ports[i], ports[i],
++				  &ftp_exp_policy, 0, help,
++				  nf_ct_ftp_from_nlattr, THIS_MODULE);
+ 	}
+ 
+ 	ret = nf_conntrack_helpers_register(ftp, ports_c * 2);
+* Unmerged path net/netfilter/nf_conntrack_helper.c
+diff --git a/net/netfilter/nf_conntrack_irc.c b/net/netfilter/nf_conntrack_irc.c
+index 4099f4d79bae..79e5014b3b0d 100644
+--- a/net/netfilter/nf_conntrack_irc.c
++++ b/net/netfilter/nf_conntrack_irc.c
+@@ -42,11 +42,13 @@ unsigned int (*nf_nat_irc_hook)(struct sk_buff *skb,
+ 				struct nf_conntrack_expect *exp) __read_mostly;
+ EXPORT_SYMBOL_GPL(nf_nat_irc_hook);
+ 
++#define HELPER_NAME "irc"
++
+ MODULE_AUTHOR("Harald Welte <laforge@netfilter.org>");
+ MODULE_DESCRIPTION("IRC (DCC) connection tracking helper");
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS("ip_conntrack_irc");
+-MODULE_ALIAS_NFCT_HELPER("irc");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ module_param_array(ports, ushort, &ports_c, 0400);
+ MODULE_PARM_DESC(ports, "port numbers of IRC servers");
+@@ -259,7 +261,7 @@ static int __init nf_conntrack_irc_init(void)
+ 		ports[ports_c++] = IRC_PORT;
+ 
+ 	for (i = 0; i < ports_c; i++) {
+-		nf_ct_helper_init(&irc[i], AF_INET, IPPROTO_TCP, "irc",
++		nf_ct_helper_init(&irc[i], AF_INET, IPPROTO_TCP, HELPER_NAME,
+ 				  IRC_PORT, ports[i], i, &irc_exp_policy,
+ 				  0, help, NULL, THIS_MODULE);
+ 	}
+diff --git a/net/netfilter/nf_conntrack_sane.c b/net/netfilter/nf_conntrack_sane.c
+index 5072ff96ab33..83306648dd0f 100644
+--- a/net/netfilter/nf_conntrack_sane.c
++++ b/net/netfilter/nf_conntrack_sane.c
+@@ -30,10 +30,12 @@
+ #include <net/netfilter/nf_conntrack_expect.h>
+ #include <linux/netfilter/nf_conntrack_sane.h>
+ 
++#define HELPER_NAME "sane"
++
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Michal Schmidt <mschmidt@redhat.com>");
+ MODULE_DESCRIPTION("SANE connection tracking helper");
+-MODULE_ALIAS_NFCT_HELPER("sane");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ static char *sane_buffer;
+ 
+@@ -195,12 +197,12 @@ static int __init nf_conntrack_sane_init(void)
+ 	/* FIXME should be configurable whether IPv4 and IPv6 connections
+ 		 are tracked or not - YK */
+ 	for (i = 0; i < ports_c; i++) {
+-		nf_ct_helper_init(&sane[2 * i], AF_INET, IPPROTO_TCP, "sane",
+-				  SANE_PORT, ports[i], ports[i],
++		nf_ct_helper_init(&sane[2 * i], AF_INET, IPPROTO_TCP,
++				  HELPER_NAME, SANE_PORT, ports[i], ports[i],
+ 				  &sane_exp_policy, 0, help, NULL,
+ 				  THIS_MODULE);
+-		nf_ct_helper_init(&sane[2 * i + 1], AF_INET6, IPPROTO_TCP, "sane",
+-				  SANE_PORT, ports[i], ports[i],
++		nf_ct_helper_init(&sane[2 * i + 1], AF_INET6, IPPROTO_TCP,
++				  HELPER_NAME, SANE_PORT, ports[i], ports[i],
+ 				  &sane_exp_policy, 0, help, NULL,
+ 				  THIS_MODULE);
+ 	}
+diff --git a/net/netfilter/nf_conntrack_sip.c b/net/netfilter/nf_conntrack_sip.c
+index c8d2b6688a2a..5e1cd0a60f80 100644
+--- a/net/netfilter/nf_conntrack_sip.c
++++ b/net/netfilter/nf_conntrack_sip.c
+@@ -28,11 +28,13 @@
+ #include <net/netfilter/nf_conntrack_zones.h>
+ #include <linux/netfilter/nf_conntrack_sip.h>
+ 
++#define HELPER_NAME "sip"
++
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("Christian Hentschel <chentschel@arnet.com.ar>");
+ MODULE_DESCRIPTION("SIP connection tracking helper");
+ MODULE_ALIAS("ip_conntrack_sip");
+-MODULE_ALIAS_NFCT_HELPER("sip");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ #define MAX_PORTS	8
+ static unsigned short ports[MAX_PORTS];
+@@ -1632,21 +1634,21 @@ static int __init nf_conntrack_sip_init(void)
+ 		ports[ports_c++] = SIP_PORT;
+ 
+ 	for (i = 0; i < ports_c; i++) {
+-		nf_ct_helper_init(&sip[4 * i], AF_INET, IPPROTO_UDP, "sip",
+-				  SIP_PORT, ports[i], i, sip_exp_policy,
+-				  SIP_EXPECT_MAX, sip_help_udp,
++		nf_ct_helper_init(&sip[4 * i], AF_INET, IPPROTO_UDP,
++				  HELPER_NAME, SIP_PORT, ports[i], i,
++				  sip_exp_policy, SIP_EXPECT_MAX, sip_help_udp,
+ 				  NULL, THIS_MODULE);
+-		nf_ct_helper_init(&sip[4 * i + 1], AF_INET, IPPROTO_TCP, "sip",
+-				  SIP_PORT, ports[i], i, sip_exp_policy,
+-				  SIP_EXPECT_MAX, sip_help_tcp,
++		nf_ct_helper_init(&sip[4 * i + 1], AF_INET, IPPROTO_TCP,
++				  HELPER_NAME, SIP_PORT, ports[i], i,
++				  sip_exp_policy, SIP_EXPECT_MAX, sip_help_tcp,
+ 				  NULL, THIS_MODULE);
+-		nf_ct_helper_init(&sip[4 * i + 2], AF_INET6, IPPROTO_UDP, "sip",
+-				  SIP_PORT, ports[i], i, sip_exp_policy,
+-				  SIP_EXPECT_MAX, sip_help_udp,
++		nf_ct_helper_init(&sip[4 * i + 2], AF_INET6, IPPROTO_UDP,
++				  HELPER_NAME, SIP_PORT, ports[i], i,
++				  sip_exp_policy, SIP_EXPECT_MAX, sip_help_udp,
+ 				  NULL, THIS_MODULE);
+-		nf_ct_helper_init(&sip[4 * i + 3], AF_INET6, IPPROTO_TCP, "sip",
+-				  SIP_PORT, ports[i], i, sip_exp_policy,
+-				  SIP_EXPECT_MAX, sip_help_tcp,
++		nf_ct_helper_init(&sip[4 * i + 3], AF_INET6, IPPROTO_TCP,
++				  HELPER_NAME, SIP_PORT, ports[i], i,
++				  sip_exp_policy, SIP_EXPECT_MAX, sip_help_tcp,
+ 				  NULL, THIS_MODULE);
+ 	}
+ 
+diff --git a/net/netfilter/nf_conntrack_tftp.c b/net/netfilter/nf_conntrack_tftp.c
+index 548b673b3625..6977cb91ae9a 100644
+--- a/net/netfilter/nf_conntrack_tftp.c
++++ b/net/netfilter/nf_conntrack_tftp.c
+@@ -20,11 +20,13 @@
+ #include <net/netfilter/nf_conntrack_helper.h>
+ #include <linux/netfilter/nf_conntrack_tftp.h>
+ 
++#define HELPER_NAME "tftp"
++
+ MODULE_AUTHOR("Magnus Boden <mb@ozaba.mine.nu>");
+ MODULE_DESCRIPTION("TFTP connection tracking helper");
+ MODULE_LICENSE("GPL");
+ MODULE_ALIAS("ip_conntrack_tftp");
+-MODULE_ALIAS_NFCT_HELPER("tftp");
++MODULE_ALIAS_NFCT_HELPER(HELPER_NAME);
+ 
+ #define MAX_PORTS 8
+ static unsigned short ports[MAX_PORTS];
+@@ -119,12 +121,14 @@ static int __init nf_conntrack_tftp_init(void)
+ 		ports[ports_c++] = TFTP_PORT;
+ 
+ 	for (i = 0; i < ports_c; i++) {
+-		nf_ct_helper_init(&tftp[2 * i], AF_INET, IPPROTO_UDP, "tftp",
+-				  TFTP_PORT, ports[i], i, &tftp_exp_policy,
+-				  0, tftp_help, NULL, THIS_MODULE);
+-		nf_ct_helper_init(&tftp[2 * i + 1], AF_INET6, IPPROTO_UDP, "tftp",
+-				  TFTP_PORT, ports[i], i, &tftp_exp_policy,
+-				  0, tftp_help, NULL, THIS_MODULE);
++		nf_ct_helper_init(&tftp[2 * i], AF_INET, IPPROTO_UDP,
++				  HELPER_NAME, TFTP_PORT, ports[i], i,
++				  &tftp_exp_policy, 0, tftp_help, NULL,
++				  THIS_MODULE);
++		nf_ct_helper_init(&tftp[2 * i + 1], AF_INET6, IPPROTO_UDP,
++				  HELPER_NAME, TFTP_PORT, ports[i], i,
++				  &tftp_exp_policy, 0, tftp_help, NULL,
++				  THIS_MODULE);
+ 	}
+ 
+ 	ret = nf_conntrack_helpers_register(tftp, ports_c * 2);
