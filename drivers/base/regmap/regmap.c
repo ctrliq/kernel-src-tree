@@ -35,6 +35,16 @@
  */
 #undef LOG_DEVICE
 
+#ifdef LOG_DEVICE
+static inline bool regmap_should_log(struct regmap *map)
+{
+	return (map->dev && strcmp(dev_name(map->dev), LOG_DEVICE) == 0);
+}
+#else
+static inline bool regmap_should_log(struct regmap *map) { return false; }
+#endif
+
+
 static int _regmap_update_bits(struct regmap *map, unsigned int reg,
 			       unsigned int mask, unsigned int val,
 			       bool *change, bool force_write);
@@ -1741,10 +1751,8 @@ int _regmap_write(struct regmap *map, unsigned int reg,
 		}
 	}
 
-#ifdef LOG_DEVICE
-	if (map->dev && strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
+	if (regmap_should_log(map))
 		dev_info(map->dev, "%x <= %x\n", reg, val);
-#endif
 
 	trace_regmap_reg_write(map, reg, val);
 
@@ -2436,10 +2444,8 @@ static int _regmap_read(struct regmap *map, unsigned int reg,
 
 	ret = map->reg_read(context, reg, val);
 	if (ret == 0) {
-#ifdef LOG_DEVICE
-		if (map->dev && strcmp(dev_name(map->dev), LOG_DEVICE) == 0)
+		if (regmap_should_log(map))
 			dev_info(map->dev, "%x => %x\n", reg, *val);
-#endif
 
 		trace_regmap_reg_read(map, reg, *val);
 
